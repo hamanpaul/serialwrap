@@ -23,7 +23,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -206,16 +206,17 @@ def _junit_provenance_errors(root: ET.Element, expected_head: str | None) -> lis
     return errs
 
 
-def _junit_totals(path: Path | None) -> dict[str, int] | None:
-    """JUnit 第一個 testsuite 的合計（tests／failures／errors／skipped）；缺檔或不可解析回 None。"""
-    if path is None or not path.is_file():
+def _junit_totals(path: Path | None, count: Callable[[Path], dict[str, int]] | None) -> dict[str, int] | None:
+    """JUnit 的 testcase 層合計（tests／failures／errors／skipped），計數實作為 P2 `check_evidence_index._junit_counts`。
+
+    不讀 testsuite 的 tests 屬性：pytest 9 的 subtests 會計入屬性（tests=N+k）但不產生 testcase 元素，
+    與報告列數永遠不符（P2-T13 審查修正；與 l1_judge 的逐列比對採同一計數慣例）。
+    缺檔、不可解析，或計數函式未載入（count 為 None，即 P2 模組缺席）一律回 None（fail-closed）。
+    """
+    if path is None or not path.is_file() or count is None:
         return None
     try:
-        root = ET.parse(path).getroot()
-        ts = root.find(".//testsuite")
-        if ts is None:
-            ts = root
-        return {key: int(ts.attrib.get(key, 0)) for key in ("tests", "failures", "errors", "skipped")}
+        return count(path)
     except (ET.ParseError, ValueError, OSError):
         return None
 
@@ -543,6 +544,10 @@ def judge_stage1a(
             if not isinstance(report_data, dict):
                 errors.append(f"{platform} l15-report 格式錯誤: {report_path}")
                 continue
+            # F7：部分報告（逾時或崩潰留下、每案中途寫出）不得與完整報告等同；缺 complete=true 即證據不足。
+            if report_data.get("complete") is not True:
+                errors.append(f"{platform} l15-report 不完整（complete 非 true，視為證據不足）: {report_path}")
+                continue
             l15_reports.append((platform, report_data))
         except Exception as e:
             errors.append(f"讀取 {platform} l15-report 失敗: {e}")
@@ -824,6 +829,20 @@ def judge_stage1a(
                     errors.append(f"載入 l1_judge.py 失敗: {e}")
                     judge_mod = None
 
+            # junit 計數唯一實作：P2 check_evidence_index._junit_counts（testcase 層）；依路徑載入、不另寫一份。
+            # 載入失敗記入 errors（整體 FAIL）；junit_counter 為 None 時 pytest-full 與黑箱計數一律 fail-closed。
+            junit_counter: Callable[[Path], dict[str, int]] | None = None
+            index_script = acc_dir / "check_evidence_index.py"
+            try:
+                spec = importlib.util.spec_from_file_location("check_evidence_index", index_script)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"無法建立模組規格: {index_script}")
+                index_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(index_mod)
+                junit_counter = index_mod._junit_counts
+            except Exception as e:
+                errors.append(f"載入 check_evidence_index.py（junit 計數）失敗: {e}")
+
             check_targets = [
                 ("s1a_blackbox", "linux", "blackbox"),
                 ("s1a_blackbox", "windows", "blackbox"),
@@ -903,24 +922,11 @@ def judge_stage1a(
                 if judge_mod and hasattr(judge_mod, "judge"):
                     junit_dict = None
                     if subfolder == "blackbox":
-                        junit_file = l1_results_dir / platform / subfolder / "junit.xml"
-                        if junit_file.is_file():
-                            try:
-                                root = ET.parse(junit_file).getroot()
-                                ts = root.find(".//testsuite")
-                                if ts is None:
-                                    ts = root
-                                junit_dict = {
-                                    "tests": int(ts.attrib.get("tests", 0)),
-                                    "failures": int(ts.attrib.get("failures", 0)),
-                                    "errors": int(ts.attrib.get("errors", 0)),
-                                    "skipped": int(ts.attrib.get("skipped", 0)),
-                                }
-                            except Exception:
-                                pass
+                        # 與 pytest-full 同一計數慣例（testcase 層）；缺檔或不可解析為 None，維持原本「不做 junit 交叉核對」的語意。
+                        junit_dict = _junit_totals(l1_results_dir / platform / subfolder / "junit.xml", junit_counter)
                     elif subfolder == "pytest-full":
                         # OD-17：與 --pytest-junit-report（同一次全套執行）對帳，見下方 strict 規則。
-                        junit_dict = _junit_totals(pytest_junit_path)
+                        junit_dict = _junit_totals(pytest_junit_path, junit_counter)
                     judged = judge_mod.judge(rep, required_nodes, platform=platform, junit=junit_dict, selector=lock_sel)
                     v_raw = judged.get("verdict", "INVALID")
                     # OD-17：s1_pytest_full 的 INSUFFICIENT／INVALID 與缺 JUnit 一律為證據不足（不得 PASS）；

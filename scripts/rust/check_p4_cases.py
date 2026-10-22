@@ -56,6 +56,7 @@ ERROR_CODES = REPO_ROOT / "contracts" / "error_codes.yaml"
 EVIDENCE_DIR = REPO_ROOT / "target" / "p4-evidence"
 L1_LOCK = REPO_ROOT / "tests" / "acceptance" / "l1_required.lock.json"
 L1_JUDGE = REPO_ROOT / "tests" / "acceptance" / "l1_judge.py"
+P2_EVIDENCE_INDEX = REPO_ROOT / "tests" / "acceptance" / "check_evidence_index.py"
 EVIDENCE_LABELS = REPO_ROOT / "tests" / "acceptance" / "evidence_labels.py"
 # P4 必須完整判定的 L1 集合（R5-F3）→ 報告子目錄名稱。
 P4_L1_SETS = {"s1b_20groups": "20groups", "s1b_cargo": "cargo"}
@@ -102,6 +103,11 @@ def _load_module(name: str, path: Path) -> ModuleType | None:
 
 def load_l1_judge() -> ModuleType | None:
     return _load_module("l1_judge", L1_JUDGE)
+
+
+def load_junit_counter() -> ModuleType | None:
+    """P2 `check_evidence_index` 模組（junit testcase 層計數的唯一實作）；缺席回傳 None。"""
+    return _load_module("check_evidence_index", P2_EVIDENCE_INDEX)
 
 
 def load_evidence_labels() -> ModuleType | None:
@@ -497,17 +503,21 @@ def check_case_evidence(
 
 
 def _junit_counts(path: Path) -> dict[str, int] | None:
-    """讀 pytest junit.xml 根 testsuite 的 tests／failures／errors／skipped（與報告交叉核對用）。"""
+    """讀 pytest junit.xml 的 testcase 層計數（與報告交叉核對用）。
+
+    計數實作為 P2 `tests/acceptance/check_evidence_index.py::_junit_counts`（依路徑載入、不另寫一份）。
+    不讀 testsuite 的 tests 屬性：pytest 9 的 subtests 會計入屬性但不產生 testcase 元素（P2-T13 審查修正）。
+    檔案缺席或不可解析回 None；P2 模組缺席由 check_l1 轉為 BLOCKED-PREREQ（fail-closed）。
+    """
     if not path.is_file():
         return None
+    p2 = load_junit_counter()
+    if p2 is None:
+        return None
     try:
-        root = ET.parse(path).getroot()
+        return p2._junit_counts(path)
     except ET.ParseError:
         return None
-    suite = root if root.tag == "testsuite" else root.find("testsuite")
-    if suite is None:
-        return None
-    return {key: int(suite.get(key, "0")) for key in ("tests", "failures", "errors", "skipped")}
 
 
 def check_l1(
@@ -551,7 +561,14 @@ def check_l1(
                 row.update(verdict="INSUFFICIENT", reasons=[f"報告無法解析：{exc}"])
                 rows.append(row)
                 continue
-            junit = None if set_name in JUNIT_OPTIONAL_SETS else _junit_counts(report_dir / "junit.xml")
+            if set_name in JUNIT_OPTIONAL_SETS:
+                junit = None
+            elif load_junit_counter() is None:
+                row.update(verdict="INSUFFICIENT", reasons=["BLOCKED-PREREQ：缺 tests/acceptance/check_evidence_index.py（junit 計數唯一實作）"])
+                rows.append(row)
+                continue
+            else:
+                junit = _junit_counts(report_dir / "junit.xml")
             try:
                 required = judge.required_for(lock, set_name, platform_name)
             except KeyError:

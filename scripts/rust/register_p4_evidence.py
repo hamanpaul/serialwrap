@@ -191,14 +191,15 @@ def _load_l1_judge() -> Any | None:
 
 
 def _junit_counts(path: Path | None) -> dict[str, int] | None:
+    """junit 的 testcase 層計數：委派 `check_p4_cases`（其再委派 P2 `check_evidence_index._junit_counts`，唯一實作）。
+
+    不讀 testsuite 的 tests 屬性：pytest 9 的 subtests 會計入屬性但不產生 testcase 元素（G4 修正，本檔為同一陷阱之登記路徑）。
+    檔案缺席或不可解析回 None，由呼叫端 fail-closed。
+    """
     if path is None or not path.is_file():
         return None
     try:
-        root = ET.parse(path).getroot()
-        suite = root if root.tag == "testsuite" else root.find("testsuite")
-        if suite is None:
-            return None
-        return {key: int(suite.get(key, "0")) for key in ("tests", "failures", "errors", "skipped")}
+        return p4_rule._junit_counts(path)
     except (OSError, ET.ParseError, ValueError):
         return None
 

@@ -564,10 +564,12 @@ def _write_l1_fixture(root: Path) -> Path:
             base.mkdir(parents=True, exist_ok=True)
             (base / "resource-report.json").write_text(json.dumps(report), encoding="utf-8")
             if set_name == "s1b_20groups":
+                # 計數以 testcase 元素為準（P2 慣例）：每個節點一個 testcase，屬性與元素數一致。
                 n = len(entry["nodeids"])
+                cases = "".join(f'<testcase classname="tests.x" name="{set_name}_{plat}_{i}"/>' for i in range(n))
                 (base / "junit.xml").write_text(
                     f'<?xml version="1.0"?><testsuites><testsuite name="pytest" tests="{n}" failures="0" '
-                    f'errors="0" skipped="0"/></testsuites>',
+                    f'errors="0" skipped="0">{cases}</testsuite></testsuites>',
                     encoding="utf-8",
                 )
     return lock_path

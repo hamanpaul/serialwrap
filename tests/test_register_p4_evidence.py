@@ -889,3 +889,23 @@ def test_unrelated_copy_outside_bundle_bin_is_still_rejected(tmp_path: Path) -> 
 
     assert bundle is None
     assert error == "release manifest CLI path 與受測 artifact 不符"
+
+
+def test_register_junit_counts_are_testcase_level_not_suite_attributes(tmp_path: Path, monkeypatch) -> None:
+    """F6：登記路徑之 junit 計數與檢查路徑同一（testcase 層）；tests 屬性含 subtests（6）但 testcase 僅 3 個 → 合計 3。"""
+    monkeypatch.syspath_prepend(str(SCRIPT.parent))
+    spec = importlib.util.spec_from_file_location("register_p4_evidence_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuites><testsuite tests="6" failures="0" errors="0" skipped="1">'
+        '<testcase classname="tests.a" name="t1"/>'
+        '<testcase classname="tests.a" name="t2"><failure message="x"/></testcase>'
+        '<testcase classname="tests.a" name="t3"><skipped message="x"/></testcase>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    assert module._junit_counts(path) == {"tests": 3, "failures": 1, "errors": 0, "skipped": 1}
+    assert module._junit_counts(tmp_path / "missing.xml") is None

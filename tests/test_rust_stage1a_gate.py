@@ -157,8 +157,11 @@ def _default_l1_reports() -> dict[tuple[str, str], dict[str, Any]]:
     return reports
 
 
-def _pytest_full_junit_xml(outcomes: dict[str, str] | None = None) -> str:
-    """與 s1_pytest_full 報告對應的 pytest JUnit（passed／failed／skipped 依 outcomes；預設兩筆皆 passed）。"""
+def _pytest_full_junit_xml(outcomes: dict[str, str] | None = None, *, subtests: int = 0) -> str:
+    """與 s1_pytest_full 報告對應的 pytest JUnit（passed／failed／skipped 依 outcomes；預設兩筆皆 passed）。
+
+    subtests：模擬 pytest 9 的 subtests——testsuite 的 tests 屬性多計這些數量，但不產生對應的 testcase 元素。
+    """
     outcomes = outcomes or {PYT_MKBUNDLE: "passed", PYT_MANIFEST: "passed"}
     failed = sum(1 for o in outcomes.values() if o == "failed")
     skipped = sum(1 for o in outcomes.values() if o == "skipped")
@@ -168,7 +171,7 @@ def _pytest_full_junit_xml(outcomes: dict[str, str] | None = None) -> str:
         cls = "tests." + classname.replace("/", ".").removesuffix(".py")
         body = {"failed": '<failure message="x"/>', "skipped": '<skipped message="x"/>'}.get(outcome, "")
         cases.append(f'<testcase classname="{cls}" name="{name}">{body}</testcase>')
-    n = len(outcomes)
+    n = len(outcomes) + subtests
     attrs = f'tests="{n}" failures="{failed}" errors="0" skipped="{skipped}"'
     return f"<testsuites {attrs}><testsuite {attrs}>{''.join(cases)}</testsuite></testsuites>"
 
@@ -267,6 +270,8 @@ class GateTree:
         acc.mkdir(parents=True, exist_ok=True)
         if (ACC / "l1_judge.py").exists():  # P2 Task 13 唯一判定實作；未合併時閘門的 L1 判定無法執行
             shutil.copy2(ACC / "l1_judge.py", acc / "l1_judge.py")
+        # junit 計數的唯一實作（P2 check_evidence_index._junit_counts）；閘門依路徑載入，缺檔即 fail-closed。
+        shutil.copy2(ACC / "check_evidence_index.py", acc / "check_evidence_index.py")
         (acc / "cases.yaml").write_text(yaml.safe_dump({"schema_version": 1, "cases": self.cases}, allow_unicode=True),
                                         encoding="utf-8")
         if self.lock is not None:
@@ -283,16 +288,20 @@ class GateTree:
             d.mkdir(parents=True, exist_ok=True)
             (d / "resource-report.json").write_text(json.dumps(rep, ensure_ascii=False), encoding="utf-8")
             if kind == "blackbox":
+                # 計數以 testcase 元素為準（P2 慣例）：每個結果列對應一個 testcase；屬性與元素數一致。
                 n = len(rep["results"])
+                cases = "".join(f'<testcase classname="tests.contract_blackbox" name="case{i}"/>' for i in range(n))
                 (d / "junit.xml").write_text(
-                    f'<testsuites><testsuite tests="{n}" failures="0" errors="0" skipped="0"/></testsuites>',
+                    f'<testsuites><testsuite tests="{n}" failures="0" errors="0" skipped="0">{cases}</testsuite></testsuites>',
                     encoding="utf-8")
         if self.ab_report is not None:
             (out / "ab-report.json").write_text(json.dumps(self.ab_report, ensure_ascii=False), encoding="utf-8")
         if self.win_report is not None:
             (out / "win-report.json").write_text(json.dumps(self.win_report, ensure_ascii=False), encoding="utf-8")
         for index, (_, report) in enumerate(self.l15_reports):
-            (out / f"l15-report-{index}.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+            # F7：fixture 預設為完整報告（complete=true）；不完整報告的判定由 test_incomplete_l15_report_is_rejected 覆蓋。
+            doc = {"complete": True, **report}
+            (out / f"l15-report-{index}.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
         if self.pytest_junit_xml is not None:
             props = self.junit_props if self.junit_props is not None else self.default_junit_props()
             (out / "pytest-junit.xml").write_text(_with_properties(self.pytest_junit_xml, props), encoding="utf-8")
@@ -629,6 +638,77 @@ def test_pytest_full_complete_evidence_is_pass(tree):
     assert rep["overall"] == "IMPLEMENTED"
 
 
+PYT_SUBTEST_NODE = "tests/test_rust_subtests_fixture.py::test_parametrized_with_subtests"
+
+
+def _pytest_full_three_nodes(tree) -> list[str]:
+    """s1_pytest_full 凍結 3 個 nodeid（含一個以 subtests 執行的節點），報告同為 3 列。"""
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_SUBTEST_NODE])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    return nodes
+
+
+def test_pytest_full_subtests_in_tests_attr_are_not_junit_mismatch(tree):
+    """G4-junit-subtest-count-mismatch：testsuite tests=6、testcase 元素 3 個（subtests 計入屬性、不產生 testcase），
+    報告 3 列 → 計數以 testcase 元素為準（P2 check_evidence_index 慣例），不得出現 junit mismatch，逐列 PASS。"""
+    nodes = _pytest_full_three_nodes(tree)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({n: "passed" for n in nodes}, subtests=3)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert not any("junit/l1-results mismatch" in r for r in row["reasons"]), row["reasons"]
+    assert row["verdict"] == "PASS", row
+    assert rep["overall"] == "IMPLEMENTED"
+
+
+def test_pytest_full_testcase_count_mismatch_is_still_evidence_insufficient(tree):
+    """真正不一致不得因改用 testcase 計數而放行：屬性 tests=3（與報告 3 列相符）但 testcase 元素僅 2 個 → 判證據不足。"""
+    _pytest_full_three_nodes(tree)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({PYT_MKBUNDLE: "passed", PYT_MANIFEST: "passed"}, subtests=1)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("junit/l1-results mismatch" in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def _p2_junit_counter():
+    """依路徑載入 P2 `check_evidence_index._junit_counts`（與閘門同一實作）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("p2_check_evidence_index_for_test", ACC / "check_evidence_index.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._junit_counts
+
+
+def test_junit_totals_counts_testcase_elements_not_suite_attributes(tmp_path):
+    """黑箱與 pytest-full 共用的計數：tests 屬性含 subtests（6）但 testcase 僅 3 個 → 合計以 testcase 為準。"""
+    gate = _load_gate_module()
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuites><testsuite tests="6" failures="0" errors="0" skipped="1">'
+        '<testcase classname="tests.a" name="t1"/>'
+        '<testcase classname="tests.a" name="t2"><failure message="x"/></testcase>'
+        '<testcase classname="tests.a" name="t3"><skipped message="x"/></testcase>'
+        '</testsuite></testsuites>', encoding="utf-8")
+    assert gate._junit_totals(path, _p2_junit_counter()) == {"tests": 3, "failures": 1, "errors": 0, "skipped": 1}
+
+
+def test_junit_totals_without_counter_or_file_is_none(tmp_path):
+    """計數函式未載入（P2 缺席）或檔案缺漏／不可解析 → None（閘門 fail-closed，不得以屬性放行）。"""
+    gate = _load_gate_module()
+    junit = tmp_path / "junit.xml"
+    junit.write_text('<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0"/></testsuites>', encoding="utf-8")
+    assert gate._junit_totals(junit, None) is None
+    assert gate._junit_totals(tmp_path / "missing.xml", _p2_junit_counter()) is None
+    bad = tmp_path / "bad.xml"
+    bad.write_text("<testsuites>", encoding="utf-8")
+    assert gate._junit_totals(bad, _p2_junit_counter()) is None
+
+
 def test_l1_cargo_argv_not_matching_selector_invalid(tree):
     tree.l1_reports[("linux", "cargo")] = _report(
         "linux", runner="cargo", argv=["--workspace"], markexpr="", nodeids=[CARGO1])
@@ -803,6 +883,22 @@ def test_unprefixed_l15_report_path_is_linux_compatible(tree):
     _, rep = tree.run(legacy_l15_report=True)
 
     assert _case_row(rep, cid)["status"] == "PASS"
+
+
+def test_incomplete_l15_report_is_rejected(tree):
+    """F7：每案中途寫出的部分報告（complete=false）不得作為 L1.5 證據；gate 須判證據不足並記錄錯誤。"""
+    cid = "l15-incomplete-report"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"complete": False, "results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    rc, rep = tree.run()
+
+    assert rc != 0
+    assert _case_row(rep, cid)["status"] != "PASS"
+    assert any("complete" in str(e) for e in rep["errors"])
 
 
 def _set_evidence_insufficient_invariant_cases(tree, cases: list[str]) -> None:

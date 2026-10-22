@@ -213,3 +213,20 @@ def test_pass_for_node_outside_every_selector_is_rejected(gate) -> None:
     assert gate.freeze(add_only=False) == 0
     _write_evidence(gate, "sc-a", [_pass_record(gate, "sc-a", platform="linux", test_id=PIDNS_NODE)])
     assert gate.check() == 1
+
+
+def test_junit_counts_are_testcase_level_not_suite_attributes(tmp_path) -> None:
+    """P4 junit 計數與 P2 `check_evidence_index._junit_counts`、stage1a gate 同一慣例：tests 屬性含 subtests（6）
+    但 testcase 元素僅 3 個 → 合計 3；failure／skipped 依 testcase 子元素計算。"""
+    gate = _load_gate()
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuites><testsuite tests="6" failures="0" errors="0" skipped="1">'
+        '<testcase classname="tests.a" name="t1"/>'
+        '<testcase classname="tests.a" name="t2"><failure message="x"/></testcase>'
+        '<testcase classname="tests.a" name="t3"><skipped message="x"/></testcase>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    assert gate._junit_counts(path) == {"tests": 3, "failures": 1, "errors": 0, "skipped": 1}
+    assert gate._junit_counts(tmp_path / "missing.xml") is None
