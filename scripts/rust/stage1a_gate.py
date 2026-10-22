@@ -9,6 +9,7 @@ S1X 規則（計畫 04 Task 18、§3 B3；owner_gated.py 為擁有者機台列�
 - 擁有者機台相依列（`cap_*` 與登記列）在 cargo 報告中為 skipped → 列為 BLOCKED-OWNER（不論是否仍在鎖內），整體至多 IMPLEMENTED。
 - 登記列在 selector 涵蓋且本平台會編譯卻整列缺席於報告 → evidence-insufficient（FAIL）。
 - pytest JUnit 必須帶 provenance：HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/ 且不縮小範圍；否則整份拒收。
+- s1_pytest_full（linux，OD-17）：`<l1>/linux/pytest-full/resource-report.json` 與 `--pytest-junit-report` 對帳；缺檔、集合不存在、INSUFFICIENT 或 INVALID → evidence-insufficient，FAIL → FAIL；不新增放行規則。
 - spike3（`scripts/stage0/spike3_win_wal.py`）證據依 `spike3_evidence.schema.json` 驗證、case_id 相符、git_head＝受測 HEAD；EDR 未知一律 BLOCKED-OWNER，不得 PASS。
 - Windows COM（OD-15、計畫 04 §3 B1）：可執行 gate。`--windows-com` 缺席、目錄無 `windows-com.json` 或任何驗證不符 → evidence-insufficient（整體 FAIL）；明示 `windows_com: FAIL` → FAIL。不再列為 BLOCKED-OWNER。
 """
@@ -205,6 +206,20 @@ def _junit_provenance_errors(root: ET.Element, expected_head: str | None) -> lis
     return errs
 
 
+def _junit_totals(path: Path | None) -> dict[str, int] | None:
+    """JUnit 第一個 testsuite 的合計（tests／failures／errors／skipped）；缺檔或不可解析回 None。"""
+    if path is None or not path.is_file():
+        return None
+    try:
+        root = ET.parse(path).getroot()
+        ts = root.find(".//testsuite")
+        if ts is None:
+            ts = root
+        return {key: int(ts.attrib.get(key, 0)) for key in ("tests", "failures", "errors", "skipped")}
+    except (ET.ParseError, ValueError, OSError):
+        return None
+
+
 def _pytest_junit_cases(path: Path | None, errors: list[str],
                         expected_head: str | None = None) -> dict[str, list[str]]:
     cases: dict[str, list[str]] = {}
@@ -260,6 +275,26 @@ def _pytest_junit_cases(path: Path | None, errors: list[str],
     return cases
 
 
+def _pytest_junit_key(nodeid: str) -> str:
+    """與 `_pytest_junit_cases` 相同的 case_id 正規化（去除 `tests/` 前綴），供凍結 nodeid 與 JUnit 對應。"""
+    case_id = _normalize_case_id(nodeid)
+    if case_id.startswith("tests/"):
+        case_id = case_id[len("tests/"):]
+    return case_id
+
+
+def _pytest_nodes_junit_problems(nodes: list[str], pytest_cases: dict[str, list[str]]) -> list[str]:
+    """凍結 pytest 節點與 provenance 驗證後 JUnit 的逐列對帳；每個節點須恰出現一次且結果為 passed。"""
+    if not nodes:
+        return ["s1_pytest_full 凍結 nodeids 為空，無法與 pytest JUnit 逐列對帳"]
+    problems: list[str] = []
+    for nodeid in nodes:
+        outcomes = pytest_cases.get(_pytest_junit_key(nodeid), [])
+        if outcomes != ["passed"]:
+            problems.append(f"pytest JUnit 逐列對帳失敗：{nodeid} 出現 {len(outcomes)} 次，結果 {outcomes}（須恰一次且 passed）")
+    return problems
+
+
 WINDOWS_COM_FORMAT = "windows-com-evidence.v1"
 WINDOWS_COM_SEQUENCE_FORMAT = "windows-com-sequence.v1"
 WINDOWS_COM_PAIR = "COM20:COM21"
@@ -268,6 +303,8 @@ WINDOWS_COM_SEQUENCE = (
     "python-daemon-start", "session-list-ready", "cmd-submit", "cmd-status-poll",
     "device-release", "session-list-released", "device-attach", "session-list-ready",
 )
+# OD-17：完整 pytest 全套（linux）的 L1 列；報告為 `<l1>/linux/pytest-full/resource-report.json`，junit 為 --pytest-junit-report。
+PYTEST_FULL_SET = "s1_pytest_full"
 
 
 def _dedupe_consecutive(names: list[str]) -> list[str]:
@@ -794,6 +831,7 @@ def judge_stage1a(
                 ("s1a_delegation", "windows", "blackbox"),
                 ("s1a_cargo", "linux", "cargo"),
                 ("s1a_cargo", "windows", "cargo"),
+                (PYTEST_FULL_SET, "linux", "pytest-full"),
             ]
 
             for set_id, platform, subfolder in check_targets:
@@ -880,17 +918,31 @@ def judge_stage1a(
                                 }
                             except Exception:
                                 pass
+                    elif subfolder == "pytest-full":
+                        # OD-17：與 --pytest-junit-report（同一次全套執行）對帳，見下方 strict 規則。
+                        junit_dict = _junit_totals(pytest_junit_path)
                     judged = judge_mod.judge(rep, required_nodes, platform=platform, junit=junit_dict, selector=lock_sel)
                     v_raw = judged.get("verdict", "INVALID")
-                    if v_raw == "PASS":
+                    # OD-17：s1_pytest_full 的 INSUFFICIENT／INVALID 與缺 JUnit 一律為證據不足（不得 PASS）；
+                    # 本列不新增放行規則，FAIL 仍為 FAIL。其他列維持原映射。
+                    strict = set_id == PYTEST_FULL_SET
+                    # 逐列對帳：totals 相同的過期報告不得與新 JUnit 湊成 PASS；每個必要 nodeid 須在通過 provenance
+                    # 驗證的 JUnit（pytest_cases，已排除 provenance 不符者）中恰出現一次且為 passed。
+                    junit_row_problems: list[str] = []
+                    if strict and v_raw == "PASS" and junit_dict is not None:
+                        junit_row_problems = _pytest_nodes_junit_problems(required_nodes, pytest_cases)
+                    if v_raw == "PASS" and (junit_dict is not None or not strict) and not junit_row_problems:
                         verdict = "PASS"
                     elif v_raw == "FAIL":
                         verdict = "FAIL"
-                    elif v_raw == "INSUFFICIENT":
+                    elif v_raw == "INSUFFICIENT" and not strict:
                         verdict = "INSUFFICIENT"
                     else:
                         verdict = "evidence-insufficient"
                     reasons = list(judged.get("reasons", []))
+                    if strict and v_raw == "PASS" and junit_dict is None:
+                        reasons.append("pytest JUnit 缺漏或不可解析（s1_pytest_full 須與 --pytest-junit-report 對帳）")
+                    reasons.extend(junit_row_problems)
                     missing = list(judged.get("missing", []))
                     skipped_required = list(judged.get("skipped_required", []))
                     duplicates = list(judged.get("duplicates", []))

@@ -3767,6 +3767,26 @@
         }
       }
     },
+    "s1_pytest_full": {
+      "linux": {
+        "nodeids": [
+          "tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override",
+          "tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "tests/",
+            "-p",
+            "junit_provenance"
+          ],
+          "markexpr": "",
+          "paths": [
+            "tests/"
+          ]
+        }
+      }
+    },
     "s1a_blackbox": {
       "linux": {
         "nodeids": [
@@ -4947,7 +4967,6 @@
           "cargo:sw-cli::mgmt_layout::install_root_windows_default",
           "cargo:sw-cli::mgmt_layout::locate_manifest_env_override_first",
           "cargo:sw-cli::mgmt_layout::manifest_optional_metadata_rejects_non_strings",
-          "cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
           "cargo:sw-cli::mgmt_layout::pairing_daemon_absent_skips_daemon_field",
           "cargo:sw-cli::mgmt_layout::pairing_exact_all_ok",
           "cargo:sw-cli::mgmt_layout::pairing_item_matches_p1_shape",
@@ -4957,7 +4976,6 @@
           "cargo:sw-cli::mgmt_layout::pairing_reports_daemon_version_mismatch",
           "cargo:sw-cli::mgmt_layout::pairing_undeclared_digest_never_matches_missing_evidence",
           "cargo:sw-cli::mgmt_layout::posix_symlink_switch_atomic",
-          "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
           "cargo:sw-cli::mgmt_layout::revert_entries_attempts_remaining_entries_after_one_failure",
           "cargo:sw-cli::mgmt_layout::stage_version_existing_corrupt_refused",
           "cargo:sw-cli::mgmt_layout::stage_version_idempotent",
@@ -6880,7 +6898,6 @@
           "cargo:sw-cli::mgmt_layout::pairing_reports_daemon_version_mismatch",
           "cargo:sw-cli::mgmt_layout::pairing_undeclared_digest_never_matches_missing_evidence",
           "cargo:sw-cli::mgmt_layout::posix_symlink_switch_atomic",
-          "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
           "cargo:sw-cli::mgmt_layout::revert_entries_attempts_remaining_entries_after_one_failure",
           "cargo:sw-cli::mgmt_layout::stage_version_existing_corrupt_refused",
           "cargo:sw-cli::mgmt_layout::stage_version_idempotent",
@@ -7783,7 +7800,6 @@
           "cargo:sw-cli::mgmt_layout::pairing_reports_daemon_version_mismatch",
           "cargo:sw-cli::mgmt_layout::pairing_undeclared_digest_never_matches_missing_evidence",
           "cargo:sw-cli::mgmt_layout::posix_symlink_switch_atomic",
-          "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
           "cargo:sw-cli::mgmt_layout::revert_entries_attempts_remaining_entries_after_one_failure",
           "cargo:sw-cli::mgmt_layout::stage_version_existing_corrupt_refused",
           "cargo:sw-cli::mgmt_layout::stage_version_idempotent",

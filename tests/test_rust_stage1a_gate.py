@@ -56,6 +56,11 @@ CARGO_LINUX = {"argv": ["--workspace", "--all-features"], "paths": [], "markexpr
 CARGO_WIN = {"argv": ["--package", "sw-proto", "--package", "sw-pal", "--package", "sw-cli"],
              "paths": [], "markexpr": ""}
 
+# OD-17：mkbundle ignored cargo 列的替換登記（Stage 1 pytest 全套，Linux）。
+PYT_MKBUNDLE = "tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override"
+PYT_MANIFEST = "tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields"
+PYT_FULL_SEL = {"argv": ["-q", "tests/", "-p", "junit_provenance"], "paths": ["tests/"], "markexpr": ""}
+
 
 def _l1_lock() -> dict[str, Any]:
     return {
@@ -74,6 +79,9 @@ def _l1_lock() -> dict[str, Any]:
             "s1a_cargo": {
                 "linux": {"selector": CARGO_LINUX, "nodeids": [CARGO1]},
                 "windows": {"selector": CARGO_WIN, "nodeids": [CARGO1]},
+            },
+            "s1_pytest_full": {
+                "linux": {"selector": PYT_FULL_SEL, "nodeids": sorted([PYT_MKBUNDLE, PYT_MANIFEST])},
             },
         },
     }
@@ -143,7 +151,26 @@ def _default_l1_reports() -> dict[tuple[str, str], dict[str, Any]]:
         owner = _owner_nodeids(platform, list(sel_cargo["argv"]))
         reports[(platform, "cargo")] = _report(
             platform, runner="cargo", argv=list(sel_cargo["argv"]), markexpr="", nodeids=[CARGO1, *owner])
+    reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="",
+        nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]))
     return reports
+
+
+def _pytest_full_junit_xml(outcomes: dict[str, str] | None = None) -> str:
+    """與 s1_pytest_full 報告對應的 pytest JUnit（passed／failed／skipped 依 outcomes；預設兩筆皆 passed）。"""
+    outcomes = outcomes or {PYT_MKBUNDLE: "passed", PYT_MANIFEST: "passed"}
+    failed = sum(1 for o in outcomes.values() if o == "failed")
+    skipped = sum(1 for o in outcomes.values() if o == "skipped")
+    cases = []
+    for nid, outcome in outcomes.items():
+        classname, name = nid.split("::")
+        cls = "tests." + classname.replace("/", ".").removesuffix(".py")
+        body = {"failed": '<failure message="x"/>', "skipped": '<skipped message="x"/>'}.get(outcome, "")
+        cases.append(f'<testcase classname="{cls}" name="{name}">{body}</testcase>')
+    n = len(outcomes)
+    attrs = f'tests="{n}" failures="{failed}" errors="0" skipped="{skipped}"'
+    return f"<testsuites {attrs}><testsuite {attrs}>{''.join(cases)}</testsuite></testsuites>"
 
 
 def _synthetic_coverage() -> dict[str, Any]:
@@ -220,7 +247,8 @@ class GateTree:
         # OD-15：Windows COM 為可執行 gate，預設為完整通過的證據（與「只缺 L2／L3」情境一致）；None＝不傳 --windows-com。
         self.windows_com: str | None = "valid"
         self.l15_reports: list[tuple[str, dict[str, Any]]] = []
-        self.pytest_junit_xml: str | None = None
+        # 預設與 s1_pytest_full 報告同一次執行的 JUnit（provenance 由 write() 自動帶入）。
+        self.pytest_junit_xml: str | None = _pytest_full_junit_xml()
 
     def default_junit_props(self) -> dict[str, str]:
         return {"HEAD": self.head or "", "SW_REQUIRE_CARGO": "1", "git_clean": "1",
@@ -503,8 +531,102 @@ def test_l1_full_sets_pass(tree):
     code, rep = tree.run()
     assert rep["overall"] == "IMPLEMENTED"
     rows = rep["l1"]
-    assert len(rows) == 6
+    # 六列（s1a_blackbox／s1a_delegation／s1a_cargo × 平台）＋ s1_pytest_full（linux，OD-17 替換登記）
+    assert len(rows) == 7
     assert all(r["verdict"] == "PASS" for r in rows)
+
+
+def _pytest_full_row(rep: dict[str, Any]) -> dict[str, Any]:
+    return _l1_row(rep, "s1_pytest_full", "linux")
+
+
+def test_pytest_full_missing_report_is_evidence_insufficient(tree):
+    tree.l1_reports.pop(("linux", "pytest-full"))
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_required_skip_is_not_pass(tree):
+    outcomes = {PYT_MKBUNDLE: "skipped", PYT_MANIFEST: "passed"}
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="",
+        nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]), outcomes=outcomes)
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(x["nodeid"] == PYT_MKBUNDLE for x in row["skipped_required"]), row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_selector_mismatch_is_not_pass(tree):
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv({"argv": ["-q", "tests/test_rust_mkbundle.py"]}),
+        markexpr="", nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]))
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("selector mismatch" in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_without_junit_is_not_pass(tree):
+    tree.pytest_junit_xml = None
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_failed_required_is_fail(tree):
+    outcomes = {PYT_MKBUNDLE: "failed", PYT_MANIFEST: "passed"}
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="",
+        nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]), outcomes=outcomes)
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "FAIL", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_junit_with_matching_totals_but_missing_required_nodeid_is_not_pass(tree):
+    """計數相同的過期 JUnit（必要 nodeid 缺席、以他案補足筆數）不得與報告湊成 PASS（逐列對帳）。"""
+    outcomes = {PYT_MKBUNDLE: "passed", "tests/test_unrelated.py::test_unrelated": "passed"}
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(PYT_MANIFEST in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_junit_required_nodeid_not_passed_is_not_pass(tree):
+    """必要 nodeid 在 JUnit 中為 skipped → 不得 PASS（由 judge 的 totals 對帳先行攔下，逐列對帳亦不放行）。"""
+    outcomes = {PYT_MKBUNDLE: "passed", PYT_MANIFEST: "skipped"}
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert row["reasons"], row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_set_missing_from_lock_is_evidence_insufficient(tree):
+    tree.l1_lock["sets"].pop("s1_pytest_full")
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_complete_evidence_is_pass(tree):
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "PASS", row
+    assert rep["overall"] == "IMPLEMENTED"
 
 
 def test_l1_cargo_argv_not_matching_selector_invalid(tree):
@@ -713,6 +835,7 @@ def test_evidence_insufficient_invariant_accepts_passing_pytest_junit(tree):
 def test_evidence_insufficient_invariant_fails_without_pytest_junit(tree):
     cases = ["test_rust_ab_compare.py::test_classification"]
     _set_evidence_insufficient_invariant_cases(tree, cases)
+    tree.pytest_junit_xml = None  # 不提供 --pytest-junit-report（預設 fixture 會帶入 s1_pytest_full 的 JUnit）
 
     _, rep = tree.run()
 

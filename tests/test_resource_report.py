@@ -1047,6 +1047,8 @@ def test_workflow_ci_l1_gates() -> None:
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
     allowed_removals = (
+        "cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
         "cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
         "cargo:sw-cli::mgmt_service::service_non_string_mode_date_is_typeerror_exit1_without_stdout",
         "cargo:sw-cli::mgmt_service::service_non_string_mode_mixed_keys_is_typeerror_exit1_without_stdout",
