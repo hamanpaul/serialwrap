@@ -258,6 +258,30 @@ def test_win_staging_covers_contract_blackbox_scripts_refs():
     assert not missing, f"win-blackbox.ps1 staging 清單未涵蓋：{missing}"
 
 
+def test_win_staging_covers_imports_of_staged_scripts_rust():
+    """已列入 win-blackbox.ps1 staging 的 scripts/rust/*.py，其對 scripts/rust 同層模組的 import 亦須遞迴列入。
+
+    回歸：check_p4_cases.py `import owner_gated`，但 owner_gated.py 未列入 staging，Windows 原生 A 輪
+    以 ModuleNotFoundError: owner_gated 中止（僅測 contract_blackbox 的引用不足以涵蓋間接依賴）。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    staged = set(re.findall(r"'(scripts/rust/[A-Za-z0-9_]+\.py)'", ps1))
+    queue = sorted(staged)
+    closure: set[str] = set()
+    while queue:
+        ref = queue.pop()
+        if ref in closure:
+            continue
+        closure.add(ref)
+        text = (ROOT / ref).read_text(encoding="utf-8")
+        for match in re.finditer(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.MULTILINE):
+            candidate = f"scripts/rust/{match.group(1)}.py"
+            if (ROOT / candidate).is_file():
+                queue.append(candidate)
+    missing = sorted(ref for ref in closure if f"'{ref}'" not in ps1)
+    assert not missing, f"win-blackbox.ps1 staging 清單未涵蓋間接 import 的腳本：{missing}"
+
+
 def _ps_function(source: str, name: str) -> str:
     """取出 win-blackbox.ps1 中指定 function 的本體（到下一個 function 或頂層 `$sourceRoot =` 為止）。"""
     head = source.split(f"function {name}", 1)

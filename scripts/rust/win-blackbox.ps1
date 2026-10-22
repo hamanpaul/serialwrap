@@ -282,7 +282,7 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
     Write-Json (Join-Path $versionRoot 'release-manifest.json') $manifest
     Write-Json (Join-Path $binRoot 'current-release.json') ([ordered]@{
         bundle_version = $version
-        dir = "versions\$version"
+        dir = "..\versions\$version"
     })
     return $BundleRoot
 }
@@ -781,7 +781,8 @@ try {
     # scripts/rust 三檔為 tests/contract_blackbox 的 A/B 與 P4 執行器所需（惰性載入）；缺漏即視為 snapshot 不完整。
     $requiredPaths = @('serialwrap.py', 'serialwrapd.py', 'sw_core', 'tests/contract_blackbox',
                        'tests/ab_env.py', 'VERSION', 'contracts',
-                       'scripts/rust/ab_blackbox_1b.py', 'scripts/rust/ab_compare.py', 'scripts/rust/check_p4_cases.py')
+                       'scripts/rust/ab_blackbox_1b.py', 'scripts/rust/ab_compare.py', 'scripts/rust/check_p4_cases.py',
+                       'scripts/rust/owner_gated.py')
     foreach ($relative in $requiredPaths) { $null = Copy-RepoPath $sourceRoot $relative $stagingRepo $true }
     if ($ComPair) { $null = Copy-RepoPath $sourceRoot 'tools/uart_stdio_bridge' $stagingRepo $true }
     # P4-T16：test_cli_mgmt_ab_suite 由凍結鎖讀 AB_CASES 並收集每個凍結 pytest 節點；
