@@ -642,8 +642,8 @@ def _emit_error(error: HarnessError) -> None:
     ))
 
 
-def main(argv: list[str] | None = None) -> int:
-    """`python -m tools.stage3 retirement ...` 的本 Task CLI 入口。"""
+def build_parser() -> argparse.ArgumentParser:
+    """`retirement` 子命令的 argparse 結構；`main` 與 Stage 3 程序文件的命令驗證共用，不改變任何既有命令形狀。"""
     parser = argparse.ArgumentParser(prog="python -m tools.stage3")
     parent = parser.add_subparsers(dest="command", required=True)
     retirement_parser = parent.add_parser("retirement")
@@ -672,14 +672,20 @@ def main(argv: list[str] | None = None) -> int:
     pack_parser = actions.add_parser("pack")
     pack_parser.add_argument("--bundle-dir", type=Path, required=True)
     pack_parser.add_argument("--out", type=Path, required=True)
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m tools.stage3 retirement ...` 的本 Task CLI 入口。"""
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.action == "pack":
         try:
             pack_bundle(args.bundle_dir, args.out)
         except HarnessError as exc:
-            print(exc)
-            return 1
+            # 統一錯誤契約（P9-T17 §2）：HarnessError → stdout 單行 JSON 且 exit 2，不以純文字與 exit 1 離開。
+            _emit_error(exc)
+            return 2
         return 0
 
     try:

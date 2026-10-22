@@ -226,7 +226,7 @@ def derive_freeze_report(report_path: Path, *, acceptance_path: Path, index: dic
 
 
 def add_check_arguments(parser: argparse.ArgumentParser) -> None:
-    """`od09 check` 的引數定義；`check_main` 與 `tools.stage3` 主入口（`__main__.build_parser`）共用同一份。"""
+    """`od09 check` 的引數定義，供 `check_main` 自行解析使用。`tools.stage3` 主入口不共用此函式：`__main__._add_od09_check_arguments` 為同形的本地複本（避免 `build_parser()` 匯入本模組），由 `tests/test_stage3_cli.py::test_od09_check_arguments_match_consumer` 核對兩者一致。"""
     parser.add_argument("--acceptance", required=True, type=Path)
     parser.add_argument("--run-started-at", required=True)
 
