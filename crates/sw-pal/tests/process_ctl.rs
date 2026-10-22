@@ -250,16 +250,25 @@ fn poll_treats_echild_as_exited_when_sigchld_is_ignored() {
         return;
     }
 
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    // 以 output() 擷取子行程的 stdout／stderr：子 libtest 會印出 `running 1 test`、`.`、
+    // `test result:` 等列，若繼承父行程 stdout，會與父行程並行的 `test … ok` 結果列交錯，
+    // 造成 L1 結果解析漏判。輸出僅在斷言失敗時放入訊息，不改變判定條件。
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "poll_treats_echild_as_exited_when_sigchld_is_ignored",
             "--quiet",
         ])
         .env(HELPER_ENV, "1")
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success());
+    assert!(
+        output.status.success(),
+        "ECHILD helper 子行程失敗（status={:?}）\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[cfg(windows)]

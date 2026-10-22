@@ -32,12 +32,20 @@ fn exec_or_wait_propagates_exit_code_and_env() {
             .exec_or_wait(&argv, &[("SW_X".into(), "ok".into())]);
         panic!("exec_or_wait 返回錯誤：{e:?}");
     }
-    let st = std::process::Command::new(std::env::current_exe().unwrap())
+    // 以 output() 擷取子行程 stdout／stderr：子 libtest 的 `running 1 test`、`test result:` 等列若繼承父行程
+    // stdout，會與父行程並行輸出的結果列交錯（L1 結果解析漏判）。輸出僅在斷言失敗時放入訊息。
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "exec_or_wait_propagates_exit_code_and_env", "--nocapture"])
         .env("SW_PAL_EXEC_CHILD", "1")
-        .status()
+        .output()
         .unwrap();
-    assert_eq!(st.code(), Some(37));
+    assert_eq!(
+        out.status.code(),
+        Some(37),
+        "exec_or_wait 子行程結束碼不符\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }
 
 #[test]
