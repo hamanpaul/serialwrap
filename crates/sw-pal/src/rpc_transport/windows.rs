@@ -2,11 +2,29 @@
 
 use crate::traits::{
     timed_out, windows_gai_error, windows_wsa_error, EndpointSpec, PalError, PalErrorKind,
-    PalResult, RpcConnector, RpcStream, SockTimeout,
+    PalResult, RpcConnector, RpcServerStream, RpcStream, SockTimeout,
 };
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+impl RpcServerStream for std::net::TcpStream {
+    fn shutdown_read(&mut self) -> PalResult<()> {
+        self.shutdown(std::net::Shutdown::Read)
+            .map_err(map_std_io_error)
+    }
+
+    fn set_read_timeout(&mut self, duration: Option<std::time::Duration>) -> PalResult<()> {
+        std::net::TcpStream::set_read_timeout(self, duration).map_err(map_std_io_error)
+    }
+}
+
+fn map_std_io_error(error: std::io::Error) -> PalError {
+    error
+        .raw_os_error()
+        .map(windows_wsa_error)
+        .unwrap_or_else(|| PalError::plain(PalErrorKind::Io, error.to_string()))
+}
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, connect, getsockopt, ioctlsocket, recv, send, socket, WSAGetLastError, WSAStartup,
     AF_INET, AF_INET6, FIONBIO, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET, IN_ADDR, IN_ADDR_0,

@@ -276,28 +276,120 @@ impl<'a> Params<'a> {
     pub fn new(raw: &'a crate::pyjson::PyDict) -> Params<'a> {
         Params { raw }
     }
-    /// `str(params.get(k, default))` 等價。
-    pub fn str_or(&self, _k: &str, _default: &str) -> String {
-        crate::s21_todo!("T0c", "Params::str_or")
+    /// `str(params.get(k) or default)` 等價。
+    pub fn str_or(&self, k: &str, default: &str) -> Result<String, crate::pycompat::PyErr> {
+        Ok(self
+            .raw(k)
+            .filter(|value| value.is_truthy())
+            .map(crate::pyfmt::py_str)
+            .unwrap_or_else(|| default.to_string()))
     }
-    /// `int(params.get(k, default))` 等價（Python `int()` 規則）。
-    pub fn int_or(&self, _k: &str, _default: i64) -> Result<i64, crate::pycompat::PyErr> {
-        crate::s21_todo!("T0c", "Params::int_or")
+    /// `int(params.get(k) or default)` 等價（Python `int()` 規則）。
+    pub fn int_or(&self, k: &str, default: i128) -> Result<i128, crate::pycompat::PyErr> {
+        use crate::pyjson::{PyInt, PyValue};
+
+        let Some(value) = self.raw(k).filter(|value| value.is_truthy()) else {
+            return Ok(default);
+        };
+        match value {
+            PyValue::Bool(value) => Ok(if *value { 1 } else { 0 }),
+            PyValue::Int(PyInt::Small(value)) => Ok(*value),
+            PyValue::Int(PyInt::Big(value)) => value
+                .parse::<i128>()
+                .map_err(|_| crate::pycompat::PyErr::value_error("int too large to convert")),
+            PyValue::Float(value) if value.is_nan() => Err(crate::pycompat::PyErr::value_error(
+                "cannot convert float NaN to integer",
+            )),
+            PyValue::Float(value) if value.is_infinite() => Err(
+                crate::pycompat::PyErr::value_error("cannot convert float infinity to integer"),
+            ),
+            PyValue::Float(value) => {
+                let truncated = value.trunc();
+                if truncated < i128::MIN as f64 || truncated >= -(i128::MIN as f64) {
+                    Err(crate::pycompat::PyErr::value_error(
+                        "int too large to convert",
+                    ))
+                } else {
+                    Ok(truncated as i128)
+                }
+            }
+            PyValue::Str(value) => crate::pycompat::py_int_parse(value)
+                .and_then(|value| match value {
+                    PyInt::Small(value) => Some(value),
+                    PyInt::Big(value) => value.parse::<i128>().ok(),
+                })
+                .ok_or_else(|| {
+                    crate::pycompat::PyErr::value_error(format!(
+                        "invalid literal for int() with base 10: {}",
+                        crate::pyfmt::py_repr_str(value)
+                    ))
+                }),
+            other => Err(crate::pycompat::PyErr::value_error(format!(
+                "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+                py_type_name(other)
+            ))),
+        }
     }
-    /// `float(params.get(k, default))` 等價。
-    pub fn float_or(&self, _k: &str, _default: f64) -> Result<f64, crate::pycompat::PyErr> {
-        crate::s21_todo!("T0c", "Params::float_or")
+    /// `float(params.get(k) or default)` 等價。
+    pub fn float_or(&self, k: &str, default: f64) -> Result<f64, crate::pycompat::PyErr> {
+        use crate::pyjson::{PyInt, PyValue};
+
+        let Some(value) = self.raw(k).filter(|value| value.is_truthy()) else {
+            return Ok(default);
+        };
+        match value {
+            PyValue::Bool(value) => Ok(if *value { 1.0 } else { 0.0 }),
+            PyValue::Int(PyInt::Small(value)) => Ok(*value as f64),
+            PyValue::Int(PyInt::Big(value)) => value
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    crate::pycompat::PyErr::value_error("int too large to convert to float")
+                }),
+            PyValue::Float(value) => Ok(*value),
+            PyValue::Str(value) => crate::pycompat::py_float_parse(value).ok_or_else(|| {
+                crate::pycompat::PyErr::value_error(format!(
+                    "could not convert string to float: {}",
+                    crate::pyfmt::py_repr_str(value)
+                ))
+            }),
+            other => Err(crate::pycompat::PyErr::value_error(format!(
+                "float() argument must be a string or a real number, not '{}'",
+                py_type_name(other)
+            ))),
+        }
     }
-    /// Python 真值語意（`coerce_rpc_bool`）。
-    pub fn truthy(&self, _k: &str) -> bool {
-        crate::s21_todo!("T0c", "Params::truthy")
+    /// Python `bool(params.get(k))` 真值語意。
+    pub fn truthy(&self, k: &str) -> bool {
+        self.raw(k).is_some_and(|value| value.is_truthy())
     }
     /// 原始值（未轉型）。
-    pub fn raw(&self, _k: &str) -> Option<&crate::pyjson::PyValue> {
-        crate::s21_todo!("T0c", "Params::raw")
+    pub fn raw(&self, k: &str) -> Option<&crate::pyjson::PyValue> {
+        self.raw.get(k)
     }
     /// `selector` 鏈（`session`／`selector` 等欄位的 fallback 順序）。
     pub fn selector_chain(&self) -> Vec<String> {
-        crate::s21_todo!("T0c", "Params::selector_chain")
+        ["selector", "session_id", "com", "alias"]
+            .into_iter()
+            .filter_map(|key| {
+                self.raw(key)
+                    .filter(|value| value.is_truthy())
+                    .map(crate::pyfmt::py_str)
+            })
+            .collect()
+    }
+}
+
+fn py_type_name(value: &crate::pyjson::PyValue) -> &'static str {
+    use crate::pyjson::PyValue;
+    match value {
+        PyValue::Null => "NoneType",
+        PyValue::Bool(_) => "bool",
+        PyValue::Int(_) => "int",
+        PyValue::Float(_) => "float",
+        PyValue::Str(_) => "str",
+        PyValue::List(_) => "list",
+        PyValue::Dict(_) => "dict",
     }
 }

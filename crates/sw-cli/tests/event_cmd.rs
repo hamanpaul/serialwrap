@@ -60,12 +60,8 @@ impl sw_pal::FsRead for DummyFs {
 
 struct DummyClock;
 impl sw_pal::Clock for DummyClock {
-    fn wall_unix_us(&self) -> i64 {
-        sw_pal::s21_todo!("T0c", "DummyClock::wall_unix_us")
-    }
-    fn local_utc_offset_s(&self) -> i32 {
-        sw_pal::s21_todo!("T0c", "DummyClock::local_utc_offset_s")
-    }
+    fn wall_unix_us(&self) -> i64 { 0 }
+    fn local_utc_offset_s(&self) -> i32 { 0 }
     fn mono_ns(&self) -> u64 { 0 }
     fn sleep(&self, _: std::time::Duration) {}
 }

@@ -455,7 +455,8 @@ pub trait Clock: Send + Sync {
     fn sleep(&self, d: Duration);
     /// Unix wall clock（微秒，Task 0c）。無預設實作：每個 `impl Clock` 必須明確覆寫，漏實作即編譯失敗（P5 Task 0 雙審修正）。
     fn wall_unix_us(&self) -> i64;
-    /// 本地 UTC offset（秒，Task 0c）。無預設實作，理由同 `wall_unix_us`。
+    /// 本地 UTC offset（秒，Task 0c）；呼叫端應與 `wall_unix_us()` 在同一時刻取值。
+    /// 無預設實作，漏實作即編譯失敗。
     fn local_utc_offset_s(&self) -> i32;
 }
 

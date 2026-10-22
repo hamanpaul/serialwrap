@@ -416,7 +416,7 @@ pub struct CmdOutput { pub rc: i32, pub stdout: String, pub stderr: String }
 pub trait Clock: Send + Sync {
     fn mono_ns(&self) -> u64;                  // CLOCK_MONOTONIC ｜ QueryPerformanceCounter（WAL mono_ts_ns 用）
     fn wall_unix_us(&self) -> i64;             // UTC 微秒
-    fn local_utc_offset_s(&self, unix_s: i64) -> i32; // localtime_r ｜ SystemTimeToTzSpecificLocalTime
+    fn local_utc_offset_s(&self) -> i32;        // localtime_r ｜ GetTimeZoneInformation；呼叫端應與 wall_unix_us 同時取值
     fn sleep(&self, d: Duration);              // FakeClock：推進虛擬時間並喚醒等待者
 }
 // 決定性測試：SessionCore 只吃 `now: Mono` 參數；runtime loop 才呼叫 Clock。FakeClock 提供 advance(d)。

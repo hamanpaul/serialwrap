@@ -10,6 +10,7 @@ use crate::pyfmt::py_repr_str;
 use crate::pyjson::{PyInt, PyValue};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 
 /// Python `str.isspace` 的 ASCII 與 Unicode 空白集合（與 `Py_UNICODE_ISSPACE` 一致，含 U+001C..U+001F）。
 pub fn py_is_space(c: char) -> bool {
@@ -843,8 +844,10 @@ pub struct PyErr {
 
 impl PyErr {
     /// Python `ValueError(msg)`。
-    pub fn value_error(_msg: &str) -> PyErr {
-        crate::s21_todo!("T0c", "PyErr::value_error")
+    pub fn value_error(msg: impl Into<String>) -> PyErr {
+        PyErr {
+            message: msg.into(),
+        }
     }
 }
 
@@ -865,71 +868,632 @@ pub struct ShlexError {
 }
 
 /// RPC 參數的 bool 強制轉換（Python 真值語意；`"yes"`、`"0"`、`0`、`null`）。
-pub fn coerce_rpc_bool(_v: &crate::pyjson::PyValue) -> bool {
-    crate::s21_todo!("T0c", "coerce_rpc_bool")
+pub fn coerce_rpc_bool(v: &crate::pyjson::PyValue) -> bool {
+    use crate::pyjson::{PyInt, PyValue};
+
+    match v {
+        PyValue::Null => false,
+        PyValue::Bool(value) => *value,
+        PyValue::Int(PyInt::Small(value)) => *value != 0,
+        PyValue::Int(PyInt::Big(value)) => value != "0" && !value.is_empty(),
+        PyValue::Str(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        other => other.is_truthy(),
+    }
 }
 
 /// Python 3 `round(x, ndigits)`（banker's rounding）。
-pub fn py_round(_x: f64, _ndigits: i32) -> f64 {
-    crate::s21_todo!("T0c", "py_round")
+pub fn py_round(x: f64, ndigits: i32) -> f64 {
+    if !x.is_finite() || ndigits > 308 {
+        return x;
+    }
+    if ndigits < -308 {
+        return if x.is_sign_negative() { -0.0 } else { 0.0 };
+    }
+    if ndigits >= 0 {
+        return format!("{:.*}", ndigits as usize, x)
+            .parse::<f64>()
+            .unwrap_or(x);
+    }
+    let scale = 10f64.powi(-ndigits);
+    let rounded = format!("{:.0}", x / scale)
+        .parse::<f64>()
+        .unwrap_or(x / scale);
+    rounded * scale
 }
 
 /// `datetime.now(timezone.utc).isoformat()`（微秒；`.000000` 省略）。
-pub fn iso_utc_now(_unix_us: i64) -> String {
-    crate::s21_todo!("T0c", "iso_utc_now")
+pub fn iso_utc_now(unix_us: i64) -> String {
+    let parts = calendar_time(unix_us, 0);
+    let mut out = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second
+    );
+    if parts.microsecond != 0 {
+        let _ = write!(out, ".{:06}", parts.microsecond);
+    }
+    out.push_str("+00:00");
+    out
 }
 
 /// `time.strftime(fmt, time.gmtime(...))`。
-pub fn strftime_utc(_unix_us: i64, _fmt: &str) -> String {
-    crate::s21_todo!("T0c", "strftime_utc")
+pub fn strftime_utc(unix_us: i64, fmt: &str) -> String {
+    format_strftime(calendar_time(unix_us, 0), fmt)
 }
 
 /// `time.strftime(fmt, time.localtime(...))`（`offset_s` 為本地 UTC offset）。
-pub fn strftime_local(_unix_us: i64, _offset_s: i32, _fmt: &str) -> String {
-    crate::s21_todo!("T0c", "strftime_local")
+pub fn strftime_local(unix_us: i64, offset_s: i32, fmt: &str) -> String {
+    format_strftime(calendar_time(unix_us, offset_s), fmt)
 }
 
 /// `uuid.uuid4().hex`（隨機來源由呼叫端注入）。
-pub fn uuid4_hex(_rng: &mut dyn FnMut(&mut [u8])) -> String {
-    crate::s21_todo!("T0c", "uuid4_hex")
+pub fn uuid4_hex(rng: &mut dyn FnMut(&mut [u8])) -> String {
+    let bytes = uuid4_bytes(rng);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// `str(uuid.uuid4())`（含連字號）。
-pub fn uuid4_dashed(_rng: &mut dyn FnMut(&mut [u8])) -> String {
-    crate::s21_todo!("T0c", "uuid4_dashed")
+pub fn uuid4_dashed(rng: &mut dyn FnMut(&mut [u8])) -> String {
+    let hex = uuid4_hex(rng);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// WAL mirror 的可列印化規則。
-pub fn to_printable(_s: &str) -> String {
-    crate::s21_todo!("T0c", "to_printable")
+pub fn to_printable(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if (0x20..=0x7e).contains(&byte) {
+            out.push(byte as char);
+        } else if matches!(byte, b'\t' | b'\n' | b'\r') {
+            out.push(byte as char);
+        } else {
+            let _ = write!(out, "\\x{byte:02x}");
+        }
+    }
+    out
 }
 
 /// console 文字清理（`clean_text`，Python 基線）。
-pub fn clean_text(_s: &str) -> String {
-    crate::s21_todo!("T0c", "clean_text")
+pub fn clean_text(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "");
+    let mut out = String::with_capacity(normalized.len());
+    let mut index = 0;
+    while index < normalized.len() {
+        if let Some(end) = ansi_sequence_end(&normalized, index, AnsiMode::CleanText) {
+            index = end;
+            continue;
+        }
+        let ch = normalized[index..].chars().next().expect("字元邊界");
+        index += ch.len_utf8();
+        match ch {
+            '\u{08}' | '\u{7f}' => {
+                out.pop();
+            }
+            '\u{07}' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// 移除 ANSI escape 序列（Python 基線 regex 語意）。
-pub fn strip_ansi(_s: &str) -> String {
-    crate::s21_todo!("T0c", "strip_ansi")
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if let Some(end) = ansi_sequence_end(text, index, AnsiMode::StripAnsi) {
+            index = end;
+            continue;
+        }
+        let ch = text[index..].chars().next().expect("字元邊界");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
 }
 
-/// `binascii.a2b_base64` 非 strict 版本（忽略非法字元）。
-pub fn a2b_base64_lenient(_s: &[u8]) -> Vec<u8> {
-    crate::s21_todo!("T0c", "a2b_base64_lenient")
+/// 非 strict Base64 解碼的 padding 錯誤。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum B64Error {
+    /// 有效資料字元數除以四餘一。
+    InvalidDataCharacters(usize),
+    /// padding 缺漏或不完整。
+    IncorrectPadding,
+}
+
+impl std::fmt::Display for B64Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            B64Error::InvalidDataCharacters(count) => write!(
+                f,
+                "Invalid base64-encoded string: number of data characters ({count}) cannot be 1 more than a multiple of 4"
+            ),
+            B64Error::IncorrectPadding => f.write_str("Incorrect padding"),
+        }
+    }
+}
+
+impl std::error::Error for B64Error {}
+
+/// `binascii.a2b_base64` 非 strict 版本：忽略非法字元，但保留 Python 的 padding 錯誤。
+pub fn a2b_base64_lenient(input: &[u8]) -> Result<Vec<u8>, B64Error> {
+    let mut values = Vec::new();
+    let mut padding_started = false;
+    let mut padding_count = 0usize;
+    let mut padding_complete = false;
+    for &byte in input {
+        if padding_complete {
+            break;
+        }
+        if let Some(value) = base64_value(byte) {
+            if padding_started {
+                return Err(B64Error::IncorrectPadding);
+            }
+            values.push(value);
+        } else if byte == b'=' {
+            if padding_started {
+                padding_count += 1;
+            } else {
+                let remainder = values.len() % 4;
+                if values.is_empty() || remainder == 1 {
+                    continue;
+                }
+                padding_started = true;
+                padding_count = 1;
+            }
+            let required = match values.len() % 4 {
+                2 => 2,
+                3 | 0 => 1,
+                _ => unreachable!("餘數 1 的等號不會開始 padding"),
+            };
+            padding_complete = padding_count >= required;
+        }
+    }
+    let remainder = values.len() % 4;
+    if remainder == 1 {
+        return Err(B64Error::InvalidDataCharacters(values.len()));
+    }
+    if (padding_started && !padding_complete) || (!padding_started && remainder != 0) {
+        return Err(B64Error::IncorrectPadding);
+    }
+    let mut out = Vec::with_capacity(values.len() * 3 / 4);
+    let mut chunks = values.chunks_exact(4);
+    for group in &mut chunks {
+        out.push((group[0] << 2) | (group[1] >> 4));
+        out.push((group[1] << 4) | (group[2] >> 2));
+        out.push((group[2] << 6) | group[3]);
+    }
+    match chunks.remainder() {
+        [a, b] => out.push((a << 2) | (b >> 4)),
+        [a, b, c] => {
+            out.push((a << 2) | (b >> 4));
+            out.push((b << 4) | (c >> 2));
+        }
+        _ => {}
+    }
+    Ok(out)
 }
 
 /// `base64.b64encode(...).decode()`。
-pub fn b2a_base64(_b: &[u8]) -> String {
-    crate::s21_todo!("T0c", "b2a_base64")
+pub fn b2a_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = *chunk.get(1).unwrap_or(&0);
+        let c = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(a >> 2) as usize] as char);
+        out.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(c & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// `shlex.quote`（09 §4.3 逐字）。
-pub fn shlex_quote(_s: &str) -> String {
-    crate::s21_todo!("T0c", "shlex_quote")
+pub fn shlex_quote(text: &str) -> String {
+    if text.is_empty() {
+        return "''".to_string();
+    }
+    if text
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
 /// `shlex.split`（POSIX 模式）。
-pub fn shlex_split(_s: &str) -> Result<Vec<String>, ShlexError> {
-    crate::s21_todo!("T0c", "shlex_split")
+pub fn shlex_split(text: &str) -> Result<Vec<String>, ShlexError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = Quote::None;
+    let mut started = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if escaped {
+            if quote == Quote::Double {
+                if ch == '\n' {
+                    token.push('\\');
+                    token.push('\n');
+                } else if matches!(ch, '\\' | '"') {
+                    token.push(ch);
+                } else {
+                    token.push('\\');
+                    token.push(ch);
+                }
+            } else {
+                token.push(ch);
+            }
+            started = true;
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    token.push(ch);
+                }
+                started = true;
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => escaped = true,
+                _ => token.push(ch),
+            },
+            Quote::None => match ch {
+                '\'' => {
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    escaped = true;
+                }
+                ' ' | '\t' | '\r' | '\n' => {
+                    if started {
+                        tokens.push(std::mem::take(&mut token));
+                        started = false;
+                    }
+                }
+                _ => {
+                    token.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+    if escaped {
+        return Err(ShlexError {
+            message: "No escaped character".to_string(),
+        });
+    }
+    if quote != Quote::None {
+        return Err(ShlexError {
+            message: "No closing quotation".to_string(),
+        });
+    }
+    if started {
+        tokens.push(token);
+    }
+    Ok(tokens)
+}
+
+fn uuid4_bytes(rng: &mut dyn FnMut(&mut [u8])) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    rng(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AnsiMode {
+    CleanText,
+    StripAnsi,
+}
+
+fn ansi_sequence_end(text: &str, start: usize, mode: AnsiMode) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&0x1b) {
+        return None;
+    }
+    let next = *bytes.get(start + 1)?;
+    if next == b'[' {
+        let mut i = start + 2;
+        match mode {
+            AnsiMode::CleanText => {
+                while bytes
+                    .get(i)
+                    .is_some_and(|b| b.is_ascii_digit() || matches!(b, b';' | b'?'))
+                {
+                    i += 1;
+                }
+                if bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
+                    return Some(i + 1);
+                }
+            }
+            AnsiMode::StripAnsi => {
+                while bytes.get(i).is_some_and(|b| (0x30..=0x3f).contains(b)) {
+                    i += 1;
+                }
+                while bytes.get(i).is_some_and(|b| (0x20..=0x2f).contains(b)) {
+                    i += 1;
+                }
+                if bytes.get(i).is_some_and(|b| (0x40..=0x7e).contains(b)) {
+                    return Some(i + 1);
+                }
+            }
+        }
+        return None;
+    }
+    if next == b']' {
+        let mut i = start + 2;
+        let mut last_string_terminator = None;
+        while i < bytes.len() {
+            if bytes[i] == 0x07 {
+                return Some(i + 1);
+            }
+            if matches!(mode, AnsiMode::CleanText)
+                && bytes[i] == 0x1b
+                && bytes.get(i + 1) == Some(&b'\\')
+            {
+                last_string_terminator = Some(i + 2);
+            }
+            i += 1;
+        }
+        return match mode {
+            AnsiMode::CleanText => last_string_terminator,
+            AnsiMode::StripAnsi => Some(start + 2),
+        };
+    }
+    if matches!(mode, AnsiMode::StripAnsi) && (b'@'..=b'Z').contains(&next) {
+        return Some(start + 2);
+    }
+    if matches!(mode, AnsiMode::StripAnsi) && (b'\\'..=b'_').contains(&next) {
+        return Some(start + 2);
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct CalendarTime {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    microsecond: i64,
+    weekday_sun: i64,
+    yearday: i64,
+}
+
+fn calendar_time(unix_us: i64, offset_s: i32) -> CalendarTime {
+    let second = unix_us
+        .div_euclid(1_000_000)
+        .saturating_add(i64::from(offset_s));
+    let microsecond = unix_us.rem_euclid(1_000_000);
+    let days = second.div_euclid(86_400);
+    let day_seconds = second.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    CalendarTime {
+        year,
+        month,
+        day,
+        hour: day_seconds / 3_600,
+        minute: day_seconds / 60 % 60,
+        second: day_seconds % 60,
+        microsecond,
+        weekday_sun: (days + 4).rem_euclid(7),
+        yearday: days - days_from_civil(year, 1, 1) + 1,
+    }
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    (year, month, day)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 }.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn format_strftime(parts: CalendarTime, fmt: &str) -> String {
+    const WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const WEEKDAYS_SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const MONTHS_SHORT: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let mut out = String::with_capacity(fmt.len() + 24);
+    let mut chars = fmt.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let Some(specifier) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        let week_day = parts.weekday_sun as usize;
+        let month = parts.month.saturating_sub(1).clamp(0, 11) as usize;
+        let iso_weekday = (parts.weekday_sun + 6).rem_euclid(7) + 1;
+        let year_day_zero = parts.yearday - 1;
+        let iso_thursday = days_from_civil(parts.year, parts.month, parts.day) + (4 - iso_weekday);
+        let (iso_year, _, _) = civil_from_days(iso_thursday);
+        let jan4 = days_from_civil(iso_year, 1, 4);
+        let jan4_weekday = (jan4 + 3).rem_euclid(7);
+        let iso_week1_monday = jan4 - jan4_weekday;
+        let current_day = days_from_civil(parts.year, parts.month, parts.day);
+        let iso_week = (current_day - iso_week1_monday).div_euclid(7) + 1;
+        let value = match specifier {
+            '%' => "%".to_string(),
+            'a' => WEEKDAYS_SHORT[week_day].to_string(),
+            'A' => WEEKDAYS[week_day].to_string(),
+            'b' | 'h' => MONTHS_SHORT[month].to_string(),
+            'B' => MONTHS[month].to_string(),
+            'c' => format!(
+                "{} {} {:2} {:02}:{:02}:{:02} {:04}",
+                WEEKDAYS_SHORT[week_day],
+                MONTHS_SHORT[month],
+                parts.day,
+                parts.hour,
+                parts.minute,
+                parts.second,
+                parts.year
+            ),
+            'C' => format!("{:02}", parts.year.div_euclid(100)),
+            'd' => format!("{:02}", parts.day),
+            'D' => format!(
+                "{:02}/{:02}/{:02}",
+                parts.month,
+                parts.day,
+                parts.year.rem_euclid(100)
+            ),
+            'e' => format!("{:2}", parts.day),
+            'F' => format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day),
+            'g' => format!("{:02}", iso_year.rem_euclid(100)),
+            'G' => format!("{:04}", iso_year),
+            'H' => format!("{:02}", parts.hour),
+            'I' => format!(
+                "{:02}",
+                if parts.hour % 12 == 0 {
+                    12
+                } else {
+                    parts.hour % 12
+                }
+            ),
+            'j' => format!("{:03}", parts.yearday),
+            'k' => format!("{:2}", parts.hour),
+            'l' => format!(
+                "{:2}",
+                if parts.hour % 12 == 0 {
+                    12
+                } else {
+                    parts.hour % 12
+                }
+            ),
+            'm' => format!("{:02}", parts.month),
+            'M' => format!("{:02}", parts.minute),
+            'n' => "\n".to_string(),
+            'p' => if parts.hour < 12 { "AM" } else { "PM" }.to_string(),
+            'r' => format!(
+                "{:02}:{:02}:{:02} {}",
+                if parts.hour % 12 == 0 {
+                    12
+                } else {
+                    parts.hour % 12
+                },
+                parts.minute,
+                parts.second,
+                if parts.hour < 12 { "AM" } else { "PM" }
+            ),
+            'R' => format!("{:02}:{:02}", parts.hour, parts.minute),
+            'S' => format!("{:02}", parts.second),
+            't' => "\t".to_string(),
+            'T' | 'X' => format!("{:02}:{:02}:{:02}", parts.hour, parts.minute, parts.second),
+            'u' => iso_weekday.to_string(),
+            'U' => format!("{:02}", (year_day_zero + 7 - parts.weekday_sun) / 7),
+            'V' => format!("{:02}", iso_week),
+            'w' => parts.weekday_sun.to_string(),
+            'W' => format!(
+                "{:02}",
+                (year_day_zero + 7 - ((parts.weekday_sun + 6) % 7)) / 7
+            ),
+            'x' => format!(
+                "{:02}/{:02}/{:02}",
+                parts.month,
+                parts.day,
+                parts.year.rem_euclid(100)
+            ),
+            'y' => format!("{:02}", parts.year.rem_euclid(100)),
+            'Y' => format!("{:04}", parts.year),
+            'z' => "+0000".to_string(),
+            'Z' => "GMT".to_string(),
+            _ => format!("%{specifier}"),
+        };
+        out.push_str(&value);
+    }
+    out
 }

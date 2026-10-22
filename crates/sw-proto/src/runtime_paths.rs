@@ -371,6 +371,100 @@ pub struct DaemonDirs {
 }
 
 /// 解析 daemon 目錄（Task 0c）。
-pub fn resolve_daemon_dirs(_env: &EnvSnapshot) -> DaemonDirs {
-    crate::s21_todo!("T0c", "resolve_daemon_dirs")
+pub fn resolve_daemon_dirs(env: &EnvSnapshot) -> DaemonDirs {
+    let flavor = if std::path::MAIN_SEPARATOR == '\\' {
+        PathFlavor::Windows
+    } else {
+        PathFlavor::Posix
+    };
+    resolve_daemon_dirs_for_flavor(env, flavor)
+}
+
+fn resolve_daemon_dirs_for_flavor(env: &EnvSnapshot, flavor: PathFlavor) -> DaemonDirs {
+    let home = daemon_home(env, flavor);
+    let home_root = home.as_deref().unwrap_or("~");
+    let state_home_default = pypath::join(flavor, home_root, &[".local", "state"]);
+    let state_home = env
+        .get("XDG_STATE_HOME")
+        .filter(|path| !py_strip(path).is_empty())
+        .unwrap_or(&state_home_default);
+    let state_default = pypath::join(flavor, state_home, &["serialwrap"]);
+    let state_dir = daemon_env_path(env, "SERIALWRAP_STATE_DIR", &state_default, flavor);
+    let events_default = pypath::join(flavor, home_root, &[".serialwrap", "events.d"]);
+    let events_dir = daemon_env_path(env, "SERIALWRAP_EVENTS_DIR", &events_default, flavor);
+    let events_runtime_default = pypath::join(flavor, &state_dir, &["events"]);
+    let events_runtime_dir = daemon_env_path(
+        env,
+        "SERIALWRAP_EVENTS_RUNTIME_DIR",
+        &events_runtime_default,
+        flavor,
+    );
+    DaemonDirs {
+        by_id_dir: daemon_env_path(env, "SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id", flavor),
+        by_path_dir: daemon_env_path(env, "SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path", flavor),
+        events_dir,
+        events_runtime_dir,
+    }
+}
+
+struct NoDaemonHome;
+
+impl HomeLookup for NoDaemonHome {
+    fn current_user_home(&self) -> Option<String> {
+        None
+    }
+
+    fn user_home(&self, _user: &str) -> Option<String> {
+        None
+    }
+}
+
+fn daemon_home(env: &EnvSnapshot, flavor: PathFlavor) -> Option<String> {
+    let home = pypath::expanduser(flavor, "~", env, &NoDaemonHome);
+    (home != "~").then_some(home)
+}
+
+fn daemon_env_path(env: &EnvSnapshot, key: &str, default: &str, flavor: PathFlavor) -> String {
+    let value = env
+        .get(key)
+        .filter(|value| !py_strip(value).is_empty())
+        .unwrap_or(default);
+    pypath::expanduser(flavor, value, env, &NoDaemonHome)
+}
+
+#[cfg(test)]
+mod daemon_dirs_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_dirs_windows_home_matches_ntpath_precedence() {
+        let env = EnvSnapshot::from_pairs_fold_upper([
+            ("HOME".into(), r"C:\other".into()),
+            ("USERPROFILE".into(), r"C:\Users\p".into()),
+            ("HOMEDRIVE".into(), "D:".into()),
+            ("HOMEPATH".into(), r"\u\me".into()),
+            ("XDG_STATE_HOME".into(), "~/state-root".into()),
+            ("SERIALWRAP_BY_ID_DIR".into(), "~/serial".into()),
+        ]);
+        let dirs = resolve_daemon_dirs_for_flavor(&env, PathFlavor::Windows);
+        assert_eq!(dirs.by_id_dir, r"C:\Users\p/serial");
+        assert_eq!(dirs.events_dir, r"C:\Users\p\.serialwrap\events.d");
+        assert_eq!(
+            dirs.events_runtime_dir,
+            r"C:\Users\p/state-root\serialwrap\events"
+        );
+
+        let fallback = EnvSnapshot::from_pairs_fold_upper([
+            ("HOME".into(), r"C:\ignored".into()),
+            ("HOMEDRIVE".into(), "D:".into()),
+            ("HOMEPATH".into(), r"\u\me".into()),
+        ]);
+        let dirs = resolve_daemon_dirs_for_flavor(&fallback, PathFlavor::Windows);
+        assert_eq!(dirs.events_dir, r"D:\u\me\.serialwrap\events.d");
+
+        let no_home = EnvSnapshot::from_pairs_fold_upper([]);
+        let dirs = resolve_daemon_dirs_for_flavor(&no_home, PathFlavor::Windows);
+        assert_eq!(dirs.events_dir, r"~\.serialwrap\events.d");
+        assert_eq!(dirs.events_runtime_dir, r"~\.local\state\serialwrap\events");
+    }
 }

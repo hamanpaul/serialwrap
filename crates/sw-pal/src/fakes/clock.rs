@@ -1,13 +1,15 @@
 //! 假單調時鐘。
 
 use crate::traits::Clock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 #[derive(Debug, Default)]
 pub struct FakeClock {
     pub now_ns: AtomicU64,
+    pub wall_us: AtomicI64,
+    pub local_offset_s: AtomicI32,
     pub sleeps: Mutex<Vec<Duration>>,
 }
 
@@ -62,10 +64,10 @@ impl FakeClock {
 
 impl Clock for FakeClock {
     fn wall_unix_us(&self) -> i64 {
-        crate::s21_todo!("T0c", "FakeClock::wall_unix_us")
+        self.wall_us.load(Ordering::SeqCst)
     }
     fn local_utc_offset_s(&self) -> i32 {
-        crate::s21_todo!("T0c", "FakeClock::local_utc_offset_s")
+        self.local_offset_s.load(Ordering::SeqCst)
     }
     fn mono_ns(&self) -> u64 {
         self.now_ns.load(Ordering::SeqCst)

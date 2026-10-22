@@ -2,7 +2,7 @@
 
 use crate::traits::{
     posix_errno, posix_io_error, timed_out, EndpointSpec, PalError, PalErrorKind, PalResult,
-    RpcConnector, RpcStream, SockTimeout,
+    RpcConnector, RpcServerStream, RpcStream, SockTimeout,
 };
 use std::ffi::{CStr, CString, OsStr};
 use std::io;
@@ -11,6 +11,28 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 use std::time::{Duration, Instant};
+
+impl RpcServerStream for std::net::TcpStream {
+    fn shutdown_read(&mut self) -> PalResult<()> {
+        self.shutdown(std::net::Shutdown::Read)
+            .map_err(posix_io_error)
+    }
+
+    fn set_read_timeout(&mut self, duration: Option<Duration>) -> PalResult<()> {
+        std::net::TcpStream::set_read_timeout(self, duration).map_err(posix_io_error)
+    }
+}
+
+impl RpcServerStream for std::os::unix::net::UnixStream {
+    fn shutdown_read(&mut self) -> PalResult<()> {
+        self.shutdown(std::net::Shutdown::Read)
+            .map_err(posix_io_error)
+    }
+
+    fn set_read_timeout(&mut self, duration: Option<Duration>) -> PalResult<()> {
+        std::os::unix::net::UnixStream::set_read_timeout(self, duration).map_err(posix_io_error)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeRpcConnector;
