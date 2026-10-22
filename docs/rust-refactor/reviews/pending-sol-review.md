@@ -53,6 +53,10 @@ Codex 帳號額度於 2026-10-21 約 18:28（台北）用完，恢復時間 2026
 | feature/rust-refactor | 11b1fd4 | 1 Stage 1 exit closure G4-junit-testcase-counts-and-l15-complete-gate | Sonnet max | 待補審 |
 | feature/rust-refactor | 4a6feaf | 1 Stage 1 exit closure G5-sc20-posix-only-l1-add | Sonnet max | 待補審 |
 | feature/rust-refactor | e6d0fac | 1 Stage 1 exit closure G6-coexist-reader-race | Sonnet max | 待補審 |
+| feature/rust-refactor | 26473bd | 1 Stage 1 exit closure G3-win-serial-peer-gate-scope | Sonnet max | 待補審 |
+| feature/rust-refactor | 896ce0c | 1 Stage 1 exit closure G3-status-peer-open-capability | Sonnet max | 待補審 |
+| feature/rust-refactor | 264182f | 1 Stage 1 exit closure G4-spike1-shared-evidence-dir | Sonnet max | 待補審 |
+| feature/rust-refactor | 21c694d | 1 Stage 1 exit closure G2-ab-rust-only-release-check | Sonnet max | 待補審 |
 
 後續新增的單審 commit 一律追加於此表。
 
