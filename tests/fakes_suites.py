@@ -109,6 +109,17 @@ class EngineRunner(fakes.RecordingRunner):
         res = super().__call__(argv, env=env, timeout=timeout, cwd=cwd)
         last = self.calls[-1]
         side = last.get("side")
+        if last["kind"] == "functest" and res.rc == 1:
+            report_value = _flag(argv, "--report-dir")
+            if report_value:
+                for comparison_path in Path(report_value).glob("*/bridge/*/comparison.json"):
+                    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+                    if comparison.get("verdict") == "PASS":
+                        comparison["verdict"] = "FAIL"
+                        comparison_path.write_text(
+                            json.dumps(comparison, ensure_ascii=False, sort_keys=True, indent=1) + "\n",
+                            encoding="utf-8",
+                        )
         if last["kind"] == "cli" and last["sub"] == "daemon status" and side in self.daemon_pids:
             body = json.dumps({"ok": True, "pid": self.daemon_pids[side], "version": DAEMON_VERSION,
                                "state": "running"}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -157,10 +168,14 @@ class Knobs:
     between: Callable[[int], None] | None = None  # 每組 start／end 量測之間呼叫，參數為本 knobs 內第幾組（從 0 起）
     pinned: bool = True                   # CLI 身分 pinned 欄位
     case_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)  # L1.5 每案覆寫：closed_cleanly、dut_generation
+    testpilot_verdicts: dict[str, str] = field(default_factory=dict)  # L2 依側覆寫逐案判定
     testpilot_new_dirs: int = 1           # TestPilot 每次呼叫新增的 tp-* 目錄數
     testpilot_authorization_override: dict[str, Any] | None = None
     baseline_gate_result: str = "NOT_APPLICABLE_BASELINE"
     candidate_gate_result: str = "PASS"
+    baseline_engine_verdict: str = "PASS"
+    candidate_engine_verdict: str = "PASS"
+    baseline_result: str = "PASS"
     omit_realhw_report: bool = False
     pair_count: int = 0                   # 內部計數：已執行的 start／end 量測組數
 
@@ -320,7 +335,7 @@ def _identity_meta(knobs: Knobs, cli_cfg_str: str, cli_run: Path,
             "daemon_identity": daemon_identity}
 
 
-def testpilot(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
+def testpilot(sides: Mapping[str, Any], knobs: Knobs, case_ids: Sequence[str] = ()) -> Callable[..., None]:
     """TestPilot `serialwrap_regression`：在 ~/b-log/regression-reports/ 新增 tp-<n>/report.json。"""
 
     def effect(argv: Sequence[str], env: Mapping[str, str]) -> None:
@@ -355,7 +370,21 @@ def testpilot(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
             if bracket is not None:
                 meta["deployed_content"] = bracket
             (new_dir / "report.json").write_text(
-                json.dumps({"marker": "new", "meta": meta, "results": []}, ensure_ascii=False, indent=1),
+                json.dumps({
+                    "marker": "new",
+                    "meta": meta,
+                    "results": [
+                        {
+                            "id": case_id,
+                            "verdict": knobs.testpilot_verdicts.get(label, "PASS"),
+                            "reason": None,
+                            "category": None,
+                            "reason_code": None,
+                            "evidence": {},
+                        }
+                        for case_id in case_ids
+                    ],
+                }, ensure_ascii=False, indent=1),
                 encoding="utf-8")
 
     return effect
@@ -384,7 +413,7 @@ def realhw(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
     return effect
 
 
-def gate(knobs: Knobs) -> Callable[..., None]:
+def gate(knobs: Knobs, *, platform: str = "linux") -> Callable[..., None]:
     """`realhw.acceptance.gate`：依同目錄 report.json 寫出 release-gate.v1（run.cli_identity／deployed_content）。"""
 
     def effect(argv: Sequence[str], env: Mapping[str, str]) -> None:
@@ -398,15 +427,27 @@ def gate(knobs: Knobs) -> Callable[..., None]:
             meta = json.loads(report_json.read_text(encoding="utf-8"))["meta"]
             mode = _flag(argv, "--mode")
             verdict = knobs.baseline_gate_result if mode == "baseline" else knobs.candidate_gate_result
+            engine_verdict = (knobs.baseline_engine_verdict if mode == "baseline"
+                              else knobs.candidate_engine_verdict)
             doc = {
                 "schema_version": "release-gate.v1",
+                "platform": platform,
+                "mode": mode,
+                "engine_result": {"verdict": engine_verdict},
                 "release_gate_result": verdict,
+                "baseline_result": knobs.baseline_result,
+                "acceptance": {"revision": "2026-10-15.1"},
                 "run": {
                     "cli_identity": meta.get("cli_identity"),
                     "deployed_content": meta.get("deployed_content"),
                     "daemon_version": (meta.get("daemon_identity") or {}).get("version"),
                 },
-                "checks": [],
+                "checks": [
+                    {"id": "evidence_present", "group": "evidence", "result": "PASS"},
+                    {"id": "safety", "group": "safety", "result": "PASS"},
+                    *([{"id": "baseline_compatible", "group": "evidence", "result": "PASS"}]
+                      if mode == "candidate" else []),
+                ],
             }
         out.write_text(json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
 
@@ -417,9 +458,9 @@ def register_engines(runner: EngineRunner, m: Any, knobs: Knobs) -> None:
     """把各引擎的 effect 掛到 runner；effect 讀取同一個 knobs，測試可於 run 前修改。"""
     sides = _sides_by_label(m)
     runner.on("functest:", l15_functest(tuple(m.case_ids), sides, knobs))
-    runner.on("testpilot:", testpilot(sides, knobs))
+    runner.on("testpilot:", testpilot(sides, knobs, tuple(m.case_ids)))
     runner.on("realhw:", realhw(sides, knobs))
-    runner.on("realhw.acceptance.gate:", gate(knobs))
+    runner.on("realhw.acceptance.gate:", gate(knobs, platform=m.platform))
 
 
 def default_script(layer: str, platform: str) -> dict[str, list[dict]]:
@@ -550,11 +591,31 @@ def ab_env(root: Path, *, layer: str = "l1.5", a_functest_rc: int = 0, b_functes
         raise ValueError(f"unknown functest_identity: {functest_identity}")
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
+    manifest_overrides.setdefault("reverify.enabled", False)
+    if layer == "l3":
+        manifest_overrides.setdefault("authorization.allow_destructive", True)
+        manifest_overrides.setdefault("authorization.decision_ref", "FAKE-L3-TEST-AUTH")
+        manifest_overrides.setdefault("authorization.boards", ["TEST0", "TEST1"])
     manifest_path = fakes.write_ab_manifest(root, layer=layer, **manifest_overrides)
+    normalization = root / "contracts" / "ab_normalization.yaml"
+    normalization.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO / "contracts" / "ab_normalization.yaml", normalization)
     m = ab_manifest.load_manifest(manifest_path)
     knobs = Knobs(python_default=(functest_identity == "python_default"))
-    runner = EngineRunner({"functest:": [rc_entry(a_functest_rc), rc_entry(b_functest_rc)]},
-                          daemon_pids={"A": a_pid, "B": b_pid})
+    script = default_script(layer, m.platform)
+    script["cli:session list"] = [_ok(json.dumps({
+        "ok": True,
+        "sessions": [{"com": board, "state": "READY", "bridge_generation": 1}
+                     for board in m.dut.boards],
+    }, ensure_ascii=False, separators=(",", ":"), sort_keys=True))]
+    script.update({
+        # verify_frozen 與 ab-report 都會查 Git revision；合成 repo 不含 .git，故以
+        # manifest 的凍結契約 revision 與固定 40 位測試 revision 回應。
+        "git:rev-parse HEAD:contracts": [{"rc": 0, "stdout": m.contract_revision, "stderr": ""}],
+        "git:rev-parse HEAD": [{"rc": 0, "stdout": "1" * 40, "stderr": ""}],
+        "functest:": [rc_entry(a_functest_rc), rc_entry(b_functest_rc)],
+    })
+    runner = EngineRunner(script, daemon_pids={"A": a_pid, "B": b_pid})
     register_engines(runner, m, knobs)
     return AbEnv(repo=root, manifest=manifest_path, m=m, runner=runner, a_daemon_pid=a_pid,
                  b_daemon_pid=b_pid, knobs=knobs)
