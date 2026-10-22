@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Stage 1A gate 判定器（P3-T18）。
 
-彙整 A/B 比較報告、Windows 測試報告、L1.5 功能測試報告與 L1 完整性報告，
+彙整 A/B 比較報告、Windows 測試報告、L1.5 功能測試報告、spike3 Windows WAL 證據與 L1 完整性報告，
 對照 cases.lock.json、l1_required.lock.json 與 coverage_1a.json，
 判定 Stage 1A 是否滿足 IMPLEMENTED 或 VERIFIED 出口門檻。
+
+S1X 規則（計畫 04 Task 18、§3 B3；owner_gated.py 為擁有者機台列的共用登記）：
+- 擁有者機台相依列（`cap_*` 與登記列）在 cargo 報告中為 skipped → 列為 BLOCKED-OWNER（不論是否仍在鎖內），整體至多 IMPLEMENTED。
+- 登記列在 selector 涵蓋且本平台會編譯卻整列缺席於報告 → evidence-insufficient（FAIL）。
+- pytest JUnit 必須帶 provenance：HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/ 且不縮小範圍；否則整份拒收。
+- spike3（`scripts/stage0/spike3_win_wal.py`）證據依 `spike3_evidence.schema.json` 驗證、case_id 相符、git_head＝受測 HEAD；EDR 未知一律 BLOCKED-OWNER，不得 PASS。
+- Windows COM（OD-15、計畫 04 §3 B1）：可執行 gate。`--windows-com` 缺席、目錄無 `windows-com.json` 或任何驗證不符 → evidence-insufficient（整體 FAIL）；明示 `windows_com: FAIL` → FAIL。不再列為 BLOCKED-OWNER。
 """
 from __future__ import annotations
 
@@ -11,12 +18,16 @@ import argparse
 import base64
 import importlib.util
 import json
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import owner_gated  # noqa: E402  同目錄登記模組（擁有者機台相依 cargo 列）
 
 
 def _normalize_case_id(cid: str) -> str:
@@ -58,18 +69,51 @@ def _l15_case_rows(
         results = report.get("results")
         if isinstance(results, list):
             rows.extend(
-                row for row in results
+                {**row, "platform": platform} for row in results
                 if isinstance(row, dict) and row.get("case_id") == case_id
             )
     return rows
 
 
-def _l15_case_status(rows: list[dict[str, Any]]) -> str:
+def _l15_platforms(meta: dict[str, Any]) -> list[str] | None:
+    """案例宣告的平台清單（`meta.platforms`）；未宣告回 None，不套用逐平台覆蓋要求。"""
+    platforms = meta.get("platforms")
+    return [str(p) for p in platforms] if isinstance(platforms, list) and platforms else None
+
+
+def _l15_row_na_only(row: dict[str, Any]) -> bool:
+    """列的唯一缺口是「平台不適用的 not_applicable 段」（其餘條件皆成立）：不阻擋 gate，但也不計為 PASS。"""
+    return (
+        row.get("verdict") == "INSUFFICIENT_EVIDENCE"
+        and row.get("na_only_gap") is True
+        and bool(row.get("not_applicable_steps"))
+    )
+
+
+def _l15_case_status(rows: list[dict[str, Any]], platforms: list[str] | None = None) -> str:
+    """L15 案例的 gate 狀態（計畫 04 §5c）。
+
+    - 無列 → evidence-insufficient。
+    - 傳入 `platforms`（案例宣告的平台）時，每個宣告平台都必須至少有一列（即該平台的報告確實含此案例）；
+      缺任一平台 → evidence-insufficient。Linux 列不得替代 Windows 列（S1X：Windows L1.5 producer 須獨立產出）。
+      僅 not_applicable 缺口的列仍計入「該平台有列」，其 PASS 與否由下列規則判定。
+    - 排除「僅因 not_applicable 段缺口」的列後：任一列 FAIL（或未知 verdict）→ FAIL；
+      任一列 INSUFFICIENT_EVIDENCE／SKIP → evidence-insufficient（不得記為 FAIL）。
+    - 其餘列全部 PASS 且 gate_eligible，且至少一列 → PASS；否則 evidence-insufficient。
+      例如 l15-wal-interference：POSIX 列僅缺 segment (c)（windows 專屬）時，必須由 Windows 列 PASS＋eligible 才成立。
+    """
     if not rows:
         return "evidence-insufficient"
-    if any(row.get("verdict") != "PASS" for row in rows):
+    if platforms:
+        present = {row.get("platform") for row in rows}
+        if any(platform not in present for platform in platforms):
+            return "evidence-insufficient"
+    blocking = [row for row in rows if not _l15_row_na_only(row)]
+    if any(row.get("verdict") not in ("PASS", "INSUFFICIENT_EVIDENCE", "SKIP") for row in blocking):
         return "FAIL"
-    if any(row.get("gate_eligible") is not True for row in rows):
+    if any(row.get("verdict") != "PASS" for row in blocking):
+        return "evidence-insufficient"
+    if not blocking or any(row.get("gate_eligible") is not True for row in blocking):
         return "evidence-insufficient"
     return "PASS"
 
@@ -79,7 +123,90 @@ def _is_rust_pytest_case(case_id: str) -> bool:
     return bool(separator) and Path(path).name.startswith("test_rust_") and path.endswith(".py")
 
 
-def _pytest_junit_cases(path: Path | None, errors: list[str]) -> dict[str, list[str]]:
+PYTEST_PROVENANCE_KEYS = ("HEAD", "SW_REQUIRE_CARGO", "argv", "git_clean", "effective")
+# 縮小 pytest 範圍或提早終止的參數；JUnit 若帶其中之一，即非「完整 tests/」執行，整份拒收。
+PYTEST_FORBIDDEN_TOKENS = frozenset({
+    "-k", "-m", "-x", "--exitfirst", "--lf", "--last-failed", "--ff", "--failed-first",
+    "--co", "--collect-only", "--deselect", "--ignore", "--ignore-glob", "--maxfail",
+})
+PYTEST_FORBIDDEN_PREFIXES = ("-k", "-m", "--deselect=", "--ignore=", "--ignore-glob=", "--maxfail=")
+TESTS_TREE_TOKENS = ("tests", "tests/", "./tests", "./tests/")
+
+SPIKE3_CASES = (
+    "win-wal-av-rotate", "win-wal-av-unlink", "win-wal-av-reader-handle", "win-wal-f12-progress",
+)
+SPIKE3_SCHEMA_REL = Path("scripts/stage0/spike3_evidence.schema.json")
+
+
+def _git_head(repo_root: Path) -> str | None:
+    """受測 revision＝repo_root 的 HEAD；非 git 或無 HEAD 回 None（呼叫端 fail-closed）。"""
+    try:
+        res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True,
+                             text=True, check=False)
+    except OSError:
+        return None
+    head = res.stdout.strip()
+    return head if res.returncode == 0 and head else None
+
+
+def _junit_provenance_errors(root: ET.Element, expected_head: str | None) -> list[str]:
+    """驗證 pytest JUnit 的 provenance properties（由 scripts/rust/junit_provenance.py 寫入）。"""
+    props: dict[str, str] = {}
+    for prop in root.iter("property"):
+        name = prop.get("name")
+        if name in PYTEST_PROVENANCE_KEYS and name not in props:
+            props[name] = prop.get("value", "")
+    errs: list[str] = []
+    if not expected_head:
+        errs.append("無法取得受測 HEAD（repo_root 非 git 或無 HEAD），pytest JUnit 無法對帳")
+    if "HEAD" not in props:
+        errs.append("pytest JUnit 缺 HEAD provenance")
+    elif expected_head and props["HEAD"] != expected_head:
+        errs.append(f"pytest JUnit HEAD 與受測 HEAD 不符：{props['HEAD']!r}")
+    if props.get("SW_REQUIRE_CARGO") != "1":
+        errs.append(f"pytest JUnit 缺 SW_REQUIRE_CARGO=1 provenance（實得 {props.get('SW_REQUIRE_CARGO')!r}）")
+    if props.get("git_clean") != "1":
+        errs.append(f"pytest JUnit 非乾淨工作樹（git_clean={props.get('git_clean')!r}）：正式證據須於 commit 後、無未提交或未追蹤變更時執行")
+    argv: list[str] | None = None
+    if "argv" in props:
+        try:
+            parsed = json.loads(props["argv"])
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+            argv = parsed
+    if argv is None:
+        errs.append("pytest JUnit argv provenance 缺漏或格式不符（須為 JSON 字串陣列）")
+    else:
+        if not any(tok in TESTS_TREE_TOKENS for tok in argv):
+            errs.append(f"pytest JUnit argv 未涵蓋 tests/：{argv}")
+        bad = [tok for tok in argv if tok in PYTEST_FORBIDDEN_TOKENS or tok.startswith(PYTEST_FORBIDDEN_PREFIXES)]
+        if bad:
+            errs.append(f"pytest JUnit argv 含縮小範圍或提早終止的參數：{bad}")
+    effective: dict[str, Any] | None = None
+    if "effective" in props:
+        try:
+            parsed_eff = json.loads(props["effective"])
+        except ValueError:
+            parsed_eff = None
+        if isinstance(parsed_eff, dict):
+            effective = parsed_eff
+    if effective is None:
+        errs.append("pytest JUnit effective provenance 缺漏或格式不符（須為 JSON 物件）")
+    else:
+        # 以 pytest 實際生效設定判定（涵蓋 addopts、PYTEST_ADDOPTS、合併短旗標）。
+        narrowed = [key for key in ("keyword", "markexpr") if effective.get(key)]
+        narrowed += [key for key in ("deselect", "ignore", "ignore_glob") if effective.get(key)]
+        narrowed += [key for key in ("collectonly", "lf", "ff") if effective.get(key)]
+        if effective.get("maxfail"):
+            narrowed.append("maxfail")
+        if narrowed:
+            errs.append(f"pytest JUnit 生效設定含縮小範圍或提早終止者：{narrowed}")
+    return errs
+
+
+def _pytest_junit_cases(path: Path | None, errors: list[str],
+                        expected_head: str | None = None) -> dict[str, list[str]]:
     cases: dict[str, list[str]] = {}
     if path is None:
         return cases
@@ -90,6 +217,11 @@ def _pytest_junit_cases(path: Path | None, errors: list[str]) -> dict[str, list[
         root = ET.parse(path).getroot()
     except Exception as e:
         errors.append(f"讀取 pytest JUnit 報告失敗: {e}")
+        return cases
+    provenance = _junit_provenance_errors(root, expected_head)
+    if provenance:
+        # provenance 不符即整份拒收（不採信其中任何案例結果），避免非 HEAD、非完整 tests/ 的 JUnit 放行安全不變量。
+        errors.extend(f"{msg}（{path.name}）" for msg in provenance)
         return cases
 
     report_failed = False
@@ -158,11 +290,11 @@ def _windows_com_verdict(evidence_dir: Path) -> tuple[str, list[str]]:
     """只接受 `<evidence_dir>/windows-com.json`（與 win-blackbox.ps1 的 OutDir 同層）並逐項驗證。
 
     不採信任何 `verdict`／`windows_com` 頂層欄位以外的後門（`report.json`、`com-selftest.json` 不再參與判定）。
-    回傳 (狀態, 原因清單)；狀態為 PASS、FAIL（doc 明示失敗）或 BLOCKED-OWNER（證據缺漏或不符）。
+    回傳 (狀態, 原因清單)；狀態為 PASS、FAIL（doc 明示失敗）或 evidence-insufficient（證據缺漏或不符；OD-15 起不再是 BLOCKED-OWNER）。
     """
     doc = _read_json_dict(evidence_dir / "windows-com.json")
     if doc is None:
-        return "BLOCKED-OWNER", ["缺少或無法解析 windows-com.json"]
+        return "evidence-insufficient", ["缺少或無法解析 windows-com.json"]
     if doc.get("windows_com") == "FAIL":
         return "FAIL", ["windows-com.json 明示 FAIL"]
     reasons: list[str] = []
@@ -233,7 +365,50 @@ def _windows_com_verdict(evidence_dir: Path) -> tuple[str, list[str]]:
     if not found_tx:
         reasons.append("wire.ndjson 缺少 dut_stdin_write TX（echo hi）或檔案不存在")
 
-    return ("PASS" if not reasons else "BLOCKED-OWNER"), reasons
+    return ("PASS" if not reasons else "evidence-insufficient"), reasons
+
+
+def _unknown_text(value: Any) -> bool:
+    return not isinstance(value, str) or value.strip() in ("", "unknown")
+
+
+def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
+                   head: str | None) -> tuple[str, list[str]]:
+    """spike3 證據 → (狀態, 原因)。PASS 僅在 schema 合格、case_id 相符、git_head＝HEAD、verdict PASS 且 EDR 已知時成立。"""
+    if spike_dir is None:
+        return "evidence-insufficient", ["未提供 --spike3-evidence"]
+    path = spike_dir / f"{cid}.json"
+    if not path.is_file():
+        return "evidence-insufficient", [f"缺少 spike3 證據 {path.name}"]
+    doc = _read_json_dict(path)
+    if doc is None:
+        return "evidence-insufficient", ["spike3 證據無法解析"]
+    try:
+        import jsonschema
+
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=doc, schema=schema)
+    except ImportError:
+        return "evidence-insufficient", ["缺 jsonschema，無法驗證 spike3 證據"]
+    except Exception as exc:  # noqa: BLE001 — 任何驗證失敗都只能是證據不足
+        return "evidence-insufficient", [f"spike3 schema 驗證失敗：{getattr(exc, 'message', exc)}"]
+    if doc.get("case_id") != cid:
+        return "evidence-insufficient", [f"spike3 case_id 不符：{doc.get('case_id')!r}"]
+    git_head = (doc.get("artifact") or {}).get("git_head")
+    if head is None or git_head != head:
+        return "evidence-insufficient", [f"spike3 git_head 與受測 HEAD 不符：{git_head!r}"]
+    if (doc.get("artifact") or {}).get("git_clean") is not True:
+        return "evidence-insufficient", ["spike3 證據非乾淨工作樹產出（artifact.git_clean 非 true）"]
+    verdict = doc.get("verdict")
+    if verdict == "FAIL":
+        return "FAIL", ["spike3 verdict 為 FAIL"]
+    if verdict != "PASS":
+        return "evidence-insufficient", [f"spike3 verdict={verdict!r}，非 PASS"]
+    edr = doc.get("edr") or {}
+    if _unknown_text(edr.get("product")) or _unknown_text(edr.get("status")):
+        # EDR 產品或狀態需擁有者於 EDR 主控台查得；未知時不得 PASS（§13、§11.3）。
+        return "BLOCKED-OWNER", ["EDR 產品或狀態未知：待擁有者於 EDR 主控台查得後重跑（不得以 PASS 放行）"]
+    return "PASS", []
 
 
 def judge_stage1a(
@@ -245,9 +420,11 @@ def judge_stage1a(
     pytest_junit_path: Path | None = None,
     windows_com_dir: Path | None = None,
     repo_root: Path | None = None,
+    spike3_dir: Path | None = None,
 ) -> int:
     if repo_root is None:
         repo_root = Path(__file__).resolve().parents[2]
+    head = _git_head(repo_root)
 
     acc_dir = repo_root / "tests" / "acceptance"
     cases_yaml_path = acc_dir / "cases.yaml"
@@ -333,14 +510,15 @@ def judge_stage1a(
         except Exception as e:
             errors.append(f"讀取 {platform} l15-report 失敗: {e}")
 
-    pytest_cases = _pytest_junit_cases(pytest_junit_path, errors)
+    pytest_cases = _pytest_junit_cases(pytest_junit_path, errors, head)
 
     # 5. Windows COM：--windows-com 指向 OutDir；逐項驗證 windows-com.json 與其引用的子證據。
+    # OD-15：Windows COM 為可執行 gate，缺席即證據不足（FAIL），不是 BLOCKED-OWNER。
     windows_com_reasons: list[str] = []
     if windows_com_dir and windows_com_dir.is_dir():
         windows_com, windows_com_reasons = _windows_com_verdict(windows_com_dir)
     else:
-        windows_com = "BLOCKED-OWNER"
+        windows_com = "evidence-insufficient"
         windows_com_reasons = ["未提供 Windows COM 證據目錄（--windows-com）"]
 
     # 6. Windows L1
@@ -418,9 +596,13 @@ def judge_stage1a(
                     evidence = matching_rows
             else:
                 status = "evidence-insufficient"
+        elif layer == "L1.5" and cid in SPIKE3_CASES:
+            # spike3 產物不是 func-test 報告；只接受 spike3_evidence.schema.json 合格、git_head＝HEAD 的證據。
+            status, spike_reasons = _spike3_status(cid, spike3_dir, repo_root / SPIKE3_SCHEMA_REL, head)
+            evidence = {"source": "spike3", "reasons": spike_reasons}
         elif layer == "L1.5":
             case_l15 = _l15_case_rows(cid, meta, l15_reports)
-            status = _l15_case_status(case_l15)
+            status = _l15_case_status(case_l15, _l15_platforms(meta))
             evidence = case_l15 or None
         elif layer in ("L2", "L3"):
             has_l15_docker_row = any(
@@ -486,7 +668,7 @@ def judge_stage1a(
                 if not has_e2e_or_l15:
                     for lc in l15:
                         l15_meta = case_meta.get(lc, {})
-                        if _l15_case_status(_l15_case_rows(lc, l15_meta, l15_reports)) == "PASS":
+                        if _l15_case_status(_l15_case_rows(lc, l15_meta, l15_reports), _l15_platforms(l15_meta)) == "PASS":
                             has_e2e_or_l15 = True
                             break
 
@@ -552,7 +734,9 @@ def judge_stage1a(
                     passed = True
                 elif any(node.endswith(c) or ("::" in c and node.endswith(c.split("::")[-1])) for node in cargo_pass_nodes):
                     passed = True
-                elif _l15_case_status(_l15_case_rows(c, case_meta.get(c, {}), l15_reports)) == "PASS":
+                elif _l15_case_status(
+                    _l15_case_rows(c, case_meta.get(c, {}), l15_reports), _l15_platforms(case_meta.get(c, {}))
+                ) == "PASS":
                     passed = True
                 if not passed:
                     missing_or_failed.append(c)
@@ -576,6 +760,8 @@ def judge_stage1a(
     # 10. L1 完整性檢查（R5-F3）
     l1_rows: list[dict[str, Any]] = []
     l1_ok = True
+    l1_blocked = False
+    owner_rows: list[dict[str, Any]] = []
 
     if not l1_lock_path.is_file():
         errors.append(f"l1_required.lock.json 不存在: {l1_lock_path}")
@@ -665,6 +851,17 @@ def judge_stage1a(
                 required_nodes = list(set_info.get("nodeids", []))
                 lock_sel = set_info.get("selector", {})
 
+                # S1X：cargo 報告的擁有者機台相依列（cap_*／登記列）→ BLOCKED-OWNER 列舉；不因不在鎖內而消失。
+                owner_info: dict[str, Any] | None = None
+                if subfolder == "cargo" and rep.get("runner") == "cargo":
+                    owner_info = owner_gated.scan_cargo_report(rep, platform)
+                    for nid in owner_info["owner_gated_skipped"]:
+                        owner_rows.append({
+                            "set_id": set_id, "platform": platform, "nodeid": nid,
+                            "in_lock": nid in set(required_nodes),
+                        })
+
+                judged: dict[str, Any] = {}
                 if judge_mod and hasattr(judge_mod, "judge"):
                     junit_dict = None
                     if subfolder == "blackbox":
@@ -706,7 +903,24 @@ def judge_stage1a(
                     skipped_required = []
                     duplicates = []
 
-                if verdict != "PASS":
+                if owner_info is not None:
+                    owner_skipped = owner_info["owner_gated_skipped"]
+                    if verdict == "INSUFFICIENT" and owner_gated.insufficiency_owner_only(judged, owner_skipped):
+                        # judge 的 INSUFFICIENT 僅因擁有者列未執行（鎖內 cap 列）→ BLOCKED-OWNER（非 PASS）。
+                        verdict = "BLOCKED-OWNER"
+                        reasons = reasons + ["僅因擁有者機台相依列未執行（BLOCKED-OWNER）"]
+                    elif verdict == "PASS" and owner_skipped:
+                        verdict = "BLOCKED-OWNER"
+                        reasons = reasons + [f"擁有者機台相依列未執行：{owner_skipped}"]
+                    if owner_info["absent_expected"]:
+                        # 登記列在 selector 涵蓋範圍內卻整列缺席 → 收集失效，不得以 BLOCKED-OWNER 帶過。
+                        if verdict in ("PASS", "BLOCKED-OWNER"):
+                            verdict = "evidence-insufficient"
+                        reasons = reasons + [f"owner-gated 登記列缺席於報告：{owner_info['absent_expected']}"]
+
+                if verdict == "BLOCKED-OWNER":
+                    l1_blocked = True
+                elif verdict != "PASS":
                     l1_ok = False
 
                 l1_rows.append(
@@ -733,11 +947,11 @@ def judge_stage1a(
         or not l1_ok
         or windows_l1 != "PASS"
         or ab_result != "pass"
-        or windows_com == "FAIL"
+        or windows_com in ("FAIL", "evidence-insufficient")
     ):
         overall = "FAIL"
     else:
-        if windows_com == "BLOCKED-OWNER" or any(
+        if l1_blocked or any(
             r["status"] == "BLOCKED-OWNER" for r in case_rows
         ):
             overall = "IMPLEMENTED"
@@ -750,6 +964,7 @@ def judge_stage1a(
         "invariants": invariant_rows,
         "coverage": coverage_rows,
         "l1": l1_rows,
+        "owner_gated": owner_rows,
         "windows_com": windows_com,
         "windows_com_reasons": windows_com_reasons,
         "windows_l1": windows_l1,
@@ -800,6 +1015,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Windows COM 證據 OutDir（須含 windows-com.json；win-blackbox.ps1 的輸出根目錄）",
     )
     parser.add_argument(
+        "--spike3-evidence", type=Path, default=None,
+        help="spike3 證據目錄（含 <case_id>.json；scripts/stage0/spike3_win_wal.py 的 --evidence-dir）",
+    )
+    parser.add_argument(
         "--repo", type=Path, default=None, help="Repo 根目錄（預設自動推算）"
     )
 
@@ -813,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
         pytest_junit_path=args.pytest_junit_report,
         windows_com_dir=args.windows_com,
         repo_root=args.repo,
+        spike3_dir=args.spike3_evidence,
     )
 
 

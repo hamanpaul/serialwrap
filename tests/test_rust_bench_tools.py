@@ -679,3 +679,138 @@ def test_check_p4_cases_l1_cli_scenarios(tmp_path: Path, scenario: str) -> None:
     )
     assert res.returncode == 1, res.stdout + res.stderr
     assert "L1 s1b_20groups linux" in res.stdout, res.stdout
+
+
+# ---------------------------------------------------------------------------
+# S1X-gate-accounting：check_p4_cases 的 s1b_cargo 擁有者機台相依列（cap_*／登記列）
+# 須列為 BLOCKED-OWNER（不因不在鎖內而消失）；登記列缺席於報告 → INSUFFICIENT。
+# ---------------------------------------------------------------------------
+
+_CARGO_PLAIN = {"linux": ["cargo:sw-cli::delegate_route::routes_native_groups"],
+                "windows": ["cargo:sw-cli::delegate_route::routes_native_groups"]}
+_LINUX_GUI = "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem"
+
+
+_OWNER_TARGET = {  # 登記列所在的 test target（與 crates/*/tests 的實際檔名一致）
+    "cap_interactive_desktop__exec_or_wait_ctrl_c": "exec_delegate",
+    "cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure": "service_ctl",
+    "cap_supervisor_runtime__windows_task_roundtrip": "service_ctl",
+    "cap_windows_native__launcher_parent_kill_kills_child": "launcher",
+    "cap_windows_native__launcher_gui_subsystem": "launcher",
+    "windows_switch_running_exe_rename": "mgmt_layout",
+}
+
+
+def _owner_expected_rows(platform: str, argv: list[str], skipped: set[str], omit: set[str]) -> dict[str, str]:
+    """與 owner_gated.expected_names 同範圍的擁有者登記列：預設 passed；skipped 者記 skipped；omit 者整列缺席。"""
+    sys.path.insert(0, str(CHECK_SCRIPT.parent))
+    try:
+        import owner_gated
+    finally:
+        sys.path.pop(0)
+    out: dict[str, str] = {}
+    for crate, name in owner_gated.expected_names(platform, argv):
+        nid = f"cargo:{crate}::{_OWNER_TARGET[name]}::{name}"
+        if nid in omit:
+            continue
+        out[nid] = "skipped" if nid in skipped else "passed"
+    return out
+
+
+def _cargo_l1_report(platform: str, argv: list[str], outcomes: dict[str, str]) -> dict:
+    rows = [
+        {"nodeid": nid, "outcome": outcome,
+         "skip_kind": (("capability" if nid.rsplit("::", 1)[-1].startswith("cap_") else "other")
+                       if outcome == "skipped" else None),
+         "phases": {"setup": "passed", "call": ("skipped" if outcome == "skipped" else "passed"),
+                    "teardown": "passed"}}
+        for nid, outcome in outcomes.items()
+    ]
+    return {
+        "schema_version": 2, "format": "l1-results.v1", "runner": "cargo", "platform": platform,
+        "argv": list(argv), "markexpr": "", "counts": {"all": {"passed": 0, "failed": 0, "skipped": 0}},
+        "resources": {}, "not_collected_platform": [], "core_portable_platform_skips": [],
+        "collected": list(outcomes), "deselected": [], "results": rows, "exit_code": 0, "finished": True,
+        "deployed_content": None,
+    }
+
+
+def _write_cargo_owner_fixture(root: Path, lock_extra_gui: bool = False) -> tuple[Path, Path]:
+    """s1b_cargo：linux selector=--workspace（鎖內僅一般測試，可選擇加入 GUI 列）；報告為 cargo runner。"""
+    argv = ["--workspace"]
+    lock_nodes = {"linux": sorted(_CARGO_PLAIN["linux"] + ([_LINUX_GUI] if lock_extra_gui else [])),
+                  "windows": sorted(_CARGO_PLAIN["windows"])}
+    sets = {
+        "s1b_20groups": {p: {"selector": {"argv": ["x", p], "paths": [], "markexpr": ""},
+                             "nodeids": [f"tests/x.py::g_{p}"]} for p in ("linux", "windows")},
+        "s1b_cargo": {p: {"selector": {"argv": argv, "paths": [], "markexpr": ""},
+                          "nodeids": lock_nodes[p]} for p in ("linux", "windows")},
+    }
+    lock_path = root / "lock.json"
+    lock_path.write_text(json.dumps({"schema_version": 1, "sets": sets}), encoding="utf-8")
+    l1 = root / "l1"
+    outcomes = {nid: "passed" for nid in _CARGO_PLAIN["linux"]}
+    return lock_path, l1
+
+
+def _place_cargo_report(l1: Path, platform: str, outcomes: dict[str, str]) -> None:
+    base = l1 / platform / "cargo"
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "resource-report.json").write_text(
+        json.dumps(_cargo_l1_report(platform, ["--workspace"], outcomes)), encoding="utf-8")
+
+
+def _cargo_row(mod, lock_path: Path, l1: Path) -> dict:
+    rows = mod.check_l1(l1, lock_path)
+    return next(r for r in rows if r["set"] == "s1b_cargo" and r["platform"] == "linux")
+
+
+def test_check_p4_owner_gated_row_absent_from_lock_is_blocked_owner(tmp_path: Path) -> None:
+    """鎖內不含 GUI 列、報告以 skipped 呈現 → s1b_cargo linux 為 BLOCKED-OWNER 且列出該列（非 PASS、非靜默）。"""
+    _require_l1_judge()
+    mod = _load_check_module()
+    lock_path, l1 = _write_cargo_owner_fixture(tmp_path)
+    outcomes = {nid: "passed" for nid in _CARGO_PLAIN["linux"]}
+    outcomes.update(_owner_expected_rows("linux", ["--workspace"], skipped={_LINUX_GUI}, omit=set()))
+    _place_cargo_report(l1, "linux", outcomes)
+    row = _cargo_row(mod, lock_path, l1)
+    assert row["verdict"] == "BLOCKED-OWNER", row
+    assert _LINUX_GUI in row["owner_gated"], row
+    assert row["verdict"] != "PASS"
+
+
+def test_check_p4_owner_gated_expected_row_absent_from_report_is_insufficient(tmp_path: Path) -> None:
+    """登記列在 selector 涵蓋範圍且本平台會編譯，報告整列缺席 → INSUFFICIENT（收集失效，不得 BLOCKED-OWNER）。"""
+    _require_l1_judge()
+    mod = _load_check_module()
+    lock_path, l1 = _write_cargo_owner_fixture(tmp_path)
+    outcomes = {nid: "passed" for nid in _CARGO_PLAIN["linux"]}
+    outcomes.update(_owner_expected_rows("linux", ["--workspace"], skipped=set(), omit={_LINUX_GUI}))
+    _place_cargo_report(l1, "linux", outcomes)
+    row = _cargo_row(mod, lock_path, l1)
+    assert row["verdict"] == "INSUFFICIENT", row
+    assert any("launcher_gui_subsystem" in r for r in row["reasons"]), row["reasons"]
+
+
+def test_check_p4_owner_gated_locked_skip_is_blocked_owner_not_fail(tmp_path: Path) -> None:
+    """過渡期：GUI 仍在鎖內且 skipped → judge INSUFFICIENT 僅由擁有者列造成 → BLOCKED-OWNER（exit 2 類，非 FAIL）。"""
+    _require_l1_judge()
+    mod = _load_check_module()
+    lock_path, l1 = _write_cargo_owner_fixture(tmp_path, lock_extra_gui=True)
+    outcomes = {nid: "passed" for nid in _CARGO_PLAIN["linux"]}
+    outcomes.update(_owner_expected_rows("linux", ["--workspace"], skipped={_LINUX_GUI}, omit=set()))
+    _place_cargo_report(l1, "linux", outcomes)
+    row = _cargo_row(mod, lock_path, l1)
+    assert row["verdict"] == "BLOCKED-OWNER", row
+
+
+def test_check_p4_owner_skip_does_not_hide_other_missing_required(tmp_path: Path) -> None:
+    """鎖內必要的一般測試缺席＋GUI skipped → 仍 INSUFFICIENT（擁有者列不得掩蓋其他缺口）。"""
+    _require_l1_judge()
+    mod = _load_check_module()
+    lock_path, l1 = _write_cargo_owner_fixture(tmp_path, lock_extra_gui=True)
+    outcomes: dict[str, str] = {}  # 一般測試 CARGO 列整列缺席
+    outcomes.update(_owner_expected_rows("linux", ["--workspace"], skipped={_LINUX_GUI}, omit=set()))
+    _place_cargo_report(l1, "linux", outcomes)
+    row = _cargo_row(mod, lock_path, l1)
+    assert row["verdict"] == "INSUFFICIENT", row

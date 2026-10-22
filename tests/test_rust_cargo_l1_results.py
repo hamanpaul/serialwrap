@@ -275,11 +275,6 @@ def test_duplicate_nodeid_preserved(tmp_path: Path) -> None:
 def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     _assert_script()
     exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
-    ignored = exe.parent / "list_ignored.txt"
-    ignored.write_text(
-        ignored.read_text(encoding="utf-8") + "windows_switch_running_exe_rename: test\n",
-        encoding="utf-8",
-    )
     bin_dir = tmp_path / "bin"
     _write_cargo(bin_dir, [_artifact(exe, TARGET)])
     collect = tmp_path / "collect.json"
@@ -294,10 +289,9 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
     data = json.loads(collect.read_text(encoding="utf-8"))
     assert set(data) == {"collected"}                              # 只含 collected，不含執行結果
-    assert sorted(data["collected"]) == sorted([A, B])             # 凍結分母只收可執行的非 cap_* 案例
-    assert all(not nodeid.rsplit("::", 1)[-1].startswith("cap_") for nodeid in data["collected"])
+    assert sorted(data["collected"]) == sorted([A, B, C])
 
-    # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記兩筆
+    # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記三筆
     regen = ACCEPTANCE / "regen_lock.py"
     assert regen.is_file(), "tests/acceptance/regen_lock.py 不存在：P2 Task 13 尚未合併（前置缺口，見 plan §0.2）"
     acc = tmp_path / "tests" / "acceptance"
@@ -321,4 +315,58 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     )
     assert rr.returncode == 0, rr.stderr[-2000:]
     got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
-    assert got == sorted([A, B])
+    assert got == sorted([A, B, C])
+
+
+@pytest.mark.process_rpc
+def test_list_only_keeps_ignored_non_cap_in_denominator(tmp_path: Path) -> None:
+    """plan 04 Task 17：--list-only 必須收入 ignored 的非 cap_* 測試（與 cap_* 同樣保留），
+    否則既有鎖列會被 regen_lock 誤判為移除、分母被無聲縮小。"""
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    ignored = exe.parent / "list_ignored.txt"
+    ignored.write_text(
+        ignored.read_text(encoding="utf-8") + "windows_switch_running_exe_rename: test\n",
+        encoding="utf-8",
+    )
+    w = f"cargo:{CRATE}::{TARGET}::windows_switch_running_exe_rename"
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    collect = tmp_path / "collect.json"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--list-only", "--out", str(collect), "--", "--workspace"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
+    data = json.loads(collect.read_text(encoding="utf-8"))
+    assert set(data) == {"collected"}
+    assert sorted(data["collected"]) == sorted([A, B, C, w])       # ignored 非 cap_* 的 W 必須在分母內
+
+    regen = ACCEPTANCE / "regen_lock.py"
+    assert regen.is_file(), "tests/acceptance/regen_lock.py 不存在：P2 Task 13 尚未合併（前置缺口，見 plan §0.2）"
+    acc = tmp_path / "tests" / "acceptance"
+    shutil.copytree(ACCEPTANCE, acc)
+    lock = acc / "l1_required.lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sets": {"t": {"linux": {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""}, "nodeids": []}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rr = subprocess.run(
+        [sys.executable, str(acc / "regen_lock.py"), "--l1-add-only", "--set", "t", "--platform", "linux", "--collect", str(collect)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rr.returncode == 0, rr.stderr[-2000:]
+    got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
+    assert got == sorted([A, B, C, w])

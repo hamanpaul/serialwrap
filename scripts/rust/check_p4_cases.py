@@ -20,6 +20,7 @@
   8. L1 完整性（R5-F3）：`--l1-results <dir>`（預設 `<evidence-dir>/l1`）；對 `s1b_20groups`、`s1b_cargo` 的每個平台，
      **唯一判定實作為 P2 `tests/acceptance/l1_judge.py`**（依路徑以 importlib 載入，本檔不另寫判定規則）；
      verdict 非 `PASS` 一律失敗。P2 模組缺席即 `BLOCKED-PREREQ`（L1 證據不足，exit 1），不得放行。
+  9. S1X 擁有者機台相依列（`owner_gated.py`）：`s1b_cargo` 的 cargo 報告中 `cap_*`／登記列為 skipped → BLOCKED-OWNER（列出，exit 2 類，不因不在鎖內而消失）；登記列於 selector 涵蓋範圍內缺席 → INSUFFICIENT。
 - 判定結果：任一硬性失敗 → exit 1（「證據不足不得轉為 PASS」，不變量 `insufficient_evidence_not_pass`）。
   若唯一的缺口是 `evidence_status: BLOCKED-OWNER` 的 L2／L3／manual 案例證據（擁有者機台待補） → exit 2（BLOCKED-OWNER）。
   全部通過 → exit 0。失敗列同時輸出到 stdout 與 stderr 的摘要行。
@@ -41,6 +42,9 @@ from types import ModuleType
 from typing import Any
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import owner_gated  # noqa: E402  擁有者機台相依 cargo 列的共用登記（S1X）
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CASE_MAP = REPO_ROOT / "tests" / "acceptance" / "p4_case_map.yaml"
@@ -458,7 +462,25 @@ def check_l1(
                 junit=junit,
                 selector=entry.get("selector"),
             )
-            row.update(verdict=result["verdict"], reasons=list(result.get("reasons", [])))
+            verdict = result["verdict"]
+            reasons = list(result.get("reasons", []))
+            if subdir == "cargo" and report.get("runner") == "cargo":
+                # S1X：擁有者機台相依列（cap_*／登記列）未執行 → BLOCKED-OWNER（非 PASS、非靜默）；
+                # 登記列缺席於報告 → INSUFFICIENT。判定本身仍只來自 P2 judge。
+                owner = owner_gated.scan_cargo_report(report, platform_name)
+                owner_skipped = owner["owner_gated_skipped"]
+                row["owner_gated"] = owner_skipped
+                if verdict == "INSUFFICIENT" and owner_gated.insufficiency_owner_only(result, owner_skipped):
+                    verdict = "BLOCKED-OWNER"
+                    reasons.append("僅因擁有者機台相依列未執行（BLOCKED-OWNER）")
+                elif verdict == "PASS" and owner_skipped:
+                    verdict = "BLOCKED-OWNER"
+                    reasons.append(f"擁有者機台相依列未執行：{owner_skipped}")
+                if owner["absent_expected"]:
+                    if verdict in ("PASS", "BLOCKED-OWNER"):
+                        verdict = "INSUFFICIENT"
+                    reasons.append(f"owner-gated 登記列缺席於報告：{owner['absent_expected']}")
+            row.update(verdict=verdict, reasons=reasons)
             rows.append(row)
     return rows
 
@@ -547,7 +569,10 @@ def check(
 
     l1_rows = check_l1(l1_dir, l1_lock)
     for row in l1_rows:
-        if row["verdict"] != "PASS":
+        if row["verdict"] == "BLOCKED-OWNER":
+            # 擁有者機台相依列（不論是否在鎖內）須列出為 BLOCKED-OWNER，整體 exit 2，不得靜默或記 PASS。
+            owner_gaps.append(f"L1 {row['set']} {row['platform']}: BLOCKED-OWNER — " + "；".join(row["reasons"]))
+        elif row["verdict"] != "PASS":
             failures.append(f"L1 {row['set']} {row['platform']}: {row['verdict']} — " + "；".join(row["reasons"]))
 
     overall = "FAIL" if failures else ("BLOCKED-OWNER" if owner_gaps else "PASS")
@@ -559,7 +584,9 @@ def check(
         "blocked_owner_count": len(owner_gaps),
         "cases": summary_cases,
         "l1": {
-            "status": "PASS" if all(r["verdict"] == "PASS" for r in l1_rows) else "FAIL",
+            "status": ("PASS" if all(r["verdict"] == "PASS" for r in l1_rows)
+                       else "BLOCKED-OWNER" if all(r["verdict"] in ("PASS", "BLOCKED-OWNER") for r in l1_rows)
+                       else "FAIL"),
             "l1_dir": str(l1_dir),
             "sets": l1_rows,
         },

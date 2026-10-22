@@ -104,7 +104,9 @@ def _report(platform: str, *, runner: str, argv: list[str], markexpr: str, nodei
         "collected": list(nodeids),
         "deselected": [],
         "results": [
-            {"nodeid": n, "outcome": o, "skip_kind": ("other" if o == "skipped" else None),
+            {"nodeid": n, "outcome": o,
+             "skip_kind": (("capability" if n.rsplit("::", 1)[-1].startswith("cap_") else "other")
+                           if o == "skipped" else None),
              "phases": {"setup": "passed", "call": ("skipped" if o in ("skipped", "xfailed") else
                                                            "failed" if o in ("failed", "error", "xpassed") else "passed"),
                         "teardown": "passed"}}
@@ -121,6 +123,16 @@ def _pytest_argv(sel: dict[str, Any]) -> list[str]:
     return ["/usr/lib/python3/dist-packages/pytest/__main__.py", *sel["argv"], "--junitxml=/x/junit.xml"]
 
 
+def _owner_nodeids(platform: str, argv: list[str]) -> list[str]:
+    """selector 涵蓋且本平台會編譯進來的擁有者機台登記列（與 owner_gated.expected_names 同範圍）。"""
+    sys.path.insert(0, str(ROOT / "scripts" / "rust"))
+    try:
+        import owner_gated
+    finally:
+        sys.path.pop(0)
+    return [f"cargo:{crate}::t::{name}" for crate, name in owner_gated.expected_names(platform, argv)]
+
+
 def _default_l1_reports() -> dict[tuple[str, str], dict[str, Any]]:
     lock = _l1_lock()["sets"]
     reports: dict[tuple[str, str], dict[str, Any]] = {}
@@ -128,8 +140,9 @@ def _default_l1_reports() -> dict[tuple[str, str], dict[str, Any]]:
         nodes = lock["s1a_blackbox"][platform]["nodeids"]
         reports[(platform, "blackbox")] = _report(
             platform, runner="pytest", argv=_pytest_argv(sel_bb), markexpr=sel_bb["markexpr"], nodeids=nodes)
+        owner = _owner_nodeids(platform, list(sel_cargo["argv"]))
         reports[(platform, "cargo")] = _report(
-            platform, runner="cargo", argv=list(sel_cargo["argv"]), markexpr="", nodeids=[CARGO1])
+            platform, runner="cargo", argv=list(sel_cargo["argv"]), markexpr="", nodeids=[CARGO1, *owner])
     return reports
 
 
@@ -147,11 +160,47 @@ def _synthetic_coverage() -> dict[str, Any]:
     return cov
 
 
+_PROVENANCE_ARGV = ["-q", "tests/", "-p", "junit_provenance", "--junitxml=/x/j.xml"]
+
+_PROVENANCE_EFFECTIVE: dict[str, Any] = {
+    "keyword": "", "markexpr": "", "deselect": [], "ignore": [], "ignore_glob": [],
+    "maxfail": 0, "collectonly": False, "lf": False, "ff": False,
+}
+
+
+def _init_git_head(root: Path) -> str:
+    """建立含一個 commit 的暫存 git repo，回傳 HEAD（gate 以 repo_root 的 HEAD 作為受測 revision）。"""
+    root.mkdir(parents=True, exist_ok=True)
+    git = ["git", "-c", "user.name=gate-test", "-c", "user.email=gate-test@invalid", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], cwd=root, check=True)
+    res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True)
+    return res.stdout.strip()
+
+
+def _with_properties(xml: str, props: dict[str, str] | None) -> str:
+    """把 pytest `record_testsuite_property` 形式的 `<properties>` 插入第一個 testsuite 開頭標籤之後。"""
+    if props is None:
+        return xml
+    from html import escape
+    block = "<properties>" + "".join(
+        f'<property name="{escape(k)}" value="{escape(v)}"/>' for k, v in props.items()
+    ) + "</properties>"
+    start = xml.index("<testsuite ")
+    end = xml.index(">", start) + 1
+    return xml[:end] + block + xml[end:]
+
+
 class GateTree:
     """暫存 repo 樹；預設為「只缺 L2／L3」的完整情境（應判 IMPLEMENTED）。"""
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.head: str | None = None
+        # None：依樹的 HEAD 與 PASS 所需的 provenance 自動帶入；dict：照原樣寫入（負向測試用）。
+        self.junit_props: dict[str, str] | None = None
+        # None：不提供 spike3 證據目錄；dict：寫入 <case_id>.json 並以 --spike3-evidence 傳入。
+        self.spike3: dict[str, dict[str, Any]] | None = None
         self.cases: list[dict[str, Any]] = [
             {"case_id": A1, "layer": "L1", "cli_stage": "1A"},
             {"case_id": Z, "layer": "L2", "cli_stage": "1A"},
@@ -168,13 +217,24 @@ class GateTree:
         }
         self.win_report: dict[str, Any] | None = {"exe": "bin/serialwrap.exe", "passed": 3, "failed": 0,
                                                   "ignored": 0, "exit": 0}
-        self.windows_com: str | None = None
+        # OD-15：Windows COM 為可執行 gate，預設為完整通過的證據（與「只缺 L2／L3」情境一致）；None＝不傳 --windows-com。
+        self.windows_com: str | None = "valid"
         self.l15_reports: list[tuple[str, dict[str, Any]]] = []
         self.pytest_junit_xml: str | None = None
 
+    def default_junit_props(self) -> dict[str, str]:
+        return {"HEAD": self.head or "", "SW_REQUIRE_CARGO": "1", "git_clean": "1",
+                "effective": json.dumps(_PROVENANCE_EFFECTIVE, sort_keys=True), "argv": json.dumps(_PROVENANCE_ARGV)}
+
     def write(self) -> None:
+        if self.head is None:
+            self.head = _init_git_head(self.root)
         (self.root / "scripts" / "rust").mkdir(parents=True, exist_ok=True)
         shutil.copy2(GATE, self.root / "scripts" / "rust" / "stage1a_gate.py")
+        shutil.copy2(ROOT / "scripts" / "rust" / "owner_gated.py", self.root / "scripts" / "rust" / "owner_gated.py")
+        (self.root / "scripts" / "stage0").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json",
+                     self.root / "scripts" / "stage0" / "spike3_evidence.schema.json")
         acc = self.root / "tests" / "acceptance"
         acc.mkdir(parents=True, exist_ok=True)
         if (ACC / "l1_judge.py").exists():  # P2 Task 13 唯一判定實作；未合併時閘門的 L1 判定無法執行
@@ -206,9 +266,14 @@ class GateTree:
         for index, (_, report) in enumerate(self.l15_reports):
             (out / f"l15-report-{index}.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
         if self.pytest_junit_xml is not None:
-            (out / "pytest-junit.xml").write_text(self.pytest_junit_xml, encoding="utf-8")
+            props = self.junit_props if self.junit_props is not None else self.default_junit_props()
+            (out / "pytest-junit.xml").write_text(_with_properties(self.pytest_junit_xml, props), encoding="utf-8")
         if self.windows_com is not None:
             _write_windows_com_fixture(out, self.windows_com)
+        if self.spike3 is not None:
+            (out / "spike3").mkdir(parents=True, exist_ok=True)
+            for cid, doc in self.spike3.items():
+                (out / "spike3" / f"{cid}.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
     def run(self, *, legacy_l15_report: bool = False) -> tuple[int, dict[str, Any]]:
         self.write()
@@ -226,6 +291,8 @@ class GateTree:
             argv += ["--pytest-junit-report", str(out / "pytest-junit.xml")]
         if self.windows_com is not None:
             argv += ["--windows-com", str(out)]
+        if self.spike3 is not None:
+            argv += ["--spike3-evidence", str(out / "spike3")]
         r = subprocess.run(argv, capture_output=True, text=True, check=False)
         assert (out / "gate.json").exists(), f"閘門未產生報告（rc={r.returncode}，stderr={r.stderr.strip()!r}）"
         return r.returncode, json.loads((out / "gate.json").read_text(encoding="utf-8"))
@@ -245,11 +312,17 @@ def _write_windows_com_fixture(out: Path, mode: str) -> None:
     """依 win-blackbox.ps1 的 OutDir 佈局寫入 Windows COM 證據。
 
     mode：valid（完整通過）、forged（僅有 verdict／windows_com 後門欄位）、
-    no-wire（缺 dut_stdin_write TX）、bad-order（序列步驟對調）。
+    no-wire（缺 dut_stdin_write TX）、bad-order（序列步驟對調）、
+    absent（OutDir 內不寫任何 windows-com.json）、explicit-fail（doc 明示 windows_com: FAIL）。
     """
     if mode == "forged":
         for name in ("windows-com.json", "report.json", "com-selftest.json"):
             (out / name).write_text(json.dumps({"verdict": "PASS", "windows_com": "PASS"}), encoding="utf-8")
+        return
+    if mode == "absent":
+        return
+    if mode == "explicit-fail":
+        (out / "windows-com.json").write_text(json.dumps({"windows_com": "FAIL"}), encoding="utf-8")
         return
     com = out / "windows-com"
     (com / "bridge-selftest").mkdir(parents=True, exist_ok=True)
@@ -292,11 +365,12 @@ def test_windows_com_valid_fixture_passes(tree):
 
 
 @pytest.mark.parametrize("mode", ["forged", "no-wire", "bad-order"])
-def test_windows_com_invalid_evidence_is_not_pass(tree, mode):
+def test_windows_com_invalid_evidence_is_insufficient_and_fails(tree, mode):
+    """OD-15：不合格的 Windows COM 證據為證據不足（非 BLOCKED-OWNER），整體 FAIL。"""
     tree.windows_com = mode
     code, rep = tree.run()
-    assert rep["windows_com"] != "PASS"
-    assert rep["overall"] != "VERIFIED"
+    assert rep["windows_com"] == "evidence-insufficient", rep["windows_com_reasons"]
+    assert rep["overall"] == "FAIL"
     assert rep["windows_com_reasons"]
 
 
@@ -355,10 +429,25 @@ def test_invariant_case_missing_fails(tree):
     assert "test_missing.py::test_nope" in json.dumps(rep["invariants"], ensure_ascii=False)
 
 
-def test_windows_com_missing_is_blocked_owner_not_verified(tree):
+@pytest.mark.parametrize("mode", ["none", "absent"])
+def test_windows_com_missing_is_evidence_insufficient_and_fails(tree, mode):
+    """OD-15：Windows COM 為可執行 gate。未帶 --windows-com（none）或目錄內無 windows-com.json（absent）
+    皆為證據不足（不得 BLOCKED-OWNER、不得 IMPLEMENTED），整體 FAIL。"""
+    tree.windows_com = None if mode == "none" else "absent"
     code, rep = tree.run()
-    assert rep["windows_com"] == "BLOCKED-OWNER"
-    assert rep["overall"] != "VERIFIED"
+    assert rep["windows_com"] == "evidence-insufficient", rep["windows_com_reasons"]
+    assert rep["windows_com_reasons"]
+    assert rep["overall"] == "FAIL"
+    assert code != 0
+
+
+def test_windows_com_explicit_fail_stays_fail(tree):
+    """明示 FAIL 維持 FAIL（不降為證據不足）。"""
+    tree.windows_com = "explicit-fail"
+    code, rep = tree.run()
+    assert rep["windows_com"] == "FAIL"
+    assert rep["overall"] == "FAIL"
+    assert code != 0
 
 
 def test_win_report_missing_is_insufficient(tree):
@@ -493,9 +582,14 @@ def test_l15_cases_are_found_across_repeated_reports(tree):
         {"case_id": second, "layer": "L1.5", "platforms": ["linux", "windows"]},
     ])
     tree.lock["sets"]["cli_1A"] = sorted([A1, first, second, Z])
+    # 宣告 linux+windows 的案例須兩平台各有列（Linux 列不得替代 Windows）；本測試重點仍是跨多份報告找列。
     tree.l15_reports = [
         ("linux", {"results": [{"case_id": first, "verdict": "PASS", "gate_eligible": True}]}),
         ("linux", {"results": [{"case_id": second, "verdict": "PASS", "gate_eligible": True}]}),
+        ("windows", {"results": [
+            {"case_id": first, "verdict": "PASS", "gate_eligible": True},
+            {"case_id": second, "verdict": "PASS", "gate_eligible": True},
+        ]}),
     ]
 
     _, rep = tree.run()
@@ -550,6 +644,30 @@ def test_windows_l15_case_cannot_use_linux_evidence(tree):
     _, rep = tree.run()
 
     assert _case_row(rep, cid)["status"] == "PASS"
+
+
+def test_l15_case_declared_on_windows_is_not_satisfied_by_linux_rows(tree):
+    """宣告 linux+windows 的 L1.5 案例：只有 Linux 列（Windows 報告缺席）→ evidence-insufficient，不得 PASS。"""
+    cid = "l15-needs-windows-producer"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+
+def test_l15_status_requires_each_declared_platform_row():
+    """單元層：platforms 宣告時每個平台都要有列；未宣告時行為不變（既有 PASS 判定保留）。"""
+    gate = _load_gate_module()
+    lin = {"case_id": "c", "verdict": "PASS", "gate_eligible": True, "platform": "linux"}
+    win = {"case_id": "c", "verdict": "PASS", "gate_eligible": True, "platform": "windows"}
+    assert gate._l15_case_status([dict(lin)], ["linux", "windows"]) == "evidence-insufficient"
+    assert gate._l15_case_status([dict(lin), dict(win)], ["linux", "windows"]) == "PASS"
+    assert gate._l15_case_status([dict(lin)]) == "PASS"
 
 
 def test_unprefixed_l15_report_path_is_linux_compatible(tree):
@@ -639,3 +757,319 @@ def test_evidence_insufficient_invariant_fails_when_junit_suite_has_other_error(
     invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
     assert invariant["status"] == "FAIL"
     assert invariant["missing_or_failed"] == [case]
+
+
+
+# ---------------------------------------------------------------------------
+# S1X-gate-accounting：擁有者機台相依列（cap_*／登記列）不得靜默消失（BLOCKED-OWNER）；
+# pytest JUnit 必須帶 provenance（HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/）；
+# spike3 證據依 schema 與 git_head 判定，未知 EDR 不得 PASS。
+# ---------------------------------------------------------------------------
+
+LINUX_OWNER_OUTCOMES = {
+    "cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename": "passed",
+    "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem": "passed",
+    "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child": "passed",
+    "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c": "passed",
+    "cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure": "passed",
+}
+GUI = "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem"
+
+
+def _cargo_report(platform: str, owner: dict[str, str], *, omit: tuple[str, ...] = ()) -> dict[str, Any]:
+    """cargo 報告：CARGO1 必為 passed；owner 為登記列的結果；omit 內的 nodeid 整列自報告中移除（不收集）。"""
+    argv = list(CARGO_LINUX["argv"]) if platform == "linux" else list(CARGO_WIN["argv"])
+    outcomes = {CARGO1: "passed", **owner}
+    for nid in omit:
+        outcomes.pop(nid, None)
+    return _report(platform, runner="cargo", argv=argv, markexpr="", nodeids=list(outcomes), outcomes=outcomes)
+
+
+def test_owner_gated_row_absent_from_lock_is_blocked_owner_not_verified(tree):
+    """鎖內不含 cap 列、報告以 skipped 呈現 → 列為 BLOCKED-OWNER，整體不得 VERIFIED（不得因不在鎖內而消失）。"""
+    owner = dict(LINUX_OWNER_OUTCOMES, **{GUI: "skipped"})
+    tree.l1_reports[("linux", "cargo")] = _cargo_report("linux", owner)
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] == "BLOCKED-OWNER", row
+    assert GUI in json.dumps(rep["owner_gated"], ensure_ascii=False)
+    assert rep["overall"] == "IMPLEMENTED", rep["overall"]
+
+
+def test_owner_gated_expected_row_absent_from_report_is_insufficient(tree):
+    """登記列在 selector 涵蓋範圍內且本平台會編譯，卻在報告中完全缺席 → INSUFFICIENT，整體 FAIL。"""
+    tree.l1_reports[("linux", "cargo")] = _cargo_report("linux", LINUX_OWNER_OUTCOMES, omit=(GUI,))
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("launcher_gui_subsystem" in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def test_owner_gated_locked_skip_maps_to_blocked_owner_not_fail(tree):
+    """過渡期：cap 列仍在鎖內且為 skipped → judge 的 INSUFFICIENT 僅由擁有者列造成時，列為 BLOCKED-OWNER（非 PASS）。"""
+    tree.l1_lock["sets"]["s1a_cargo"]["linux"]["nodeids"] = sorted([CARGO1, GUI])
+    tree.l1_reports[("linux", "cargo")] = _cargo_report("linux", dict(LINUX_OWNER_OUTCOMES, **{GUI: "skipped"}))
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] == "BLOCKED-OWNER", row
+    assert rep["overall"] == "IMPLEMENTED", rep["overall"]
+
+
+def test_owner_gated_skip_is_not_hidden_by_non_owner_gap(tree):
+    """必要的非擁有者案例 CARGO1 缺席，同時 cap 列 skipped → 仍 FAIL（擁有者列不得掩蓋其他缺口）。"""
+    tree.l1_lock["sets"]["s1a_cargo"]["linux"]["nodeids"] = sorted([CARGO1, GUI])
+    report = _cargo_report("linux", dict(LINUX_OWNER_OUTCOMES, **{GUI: "skipped"}), omit=(CARGO1,))
+    tree.l1_reports[("linux", "cargo")] = report
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] != "BLOCKED-OWNER", row
+    assert rep["overall"] == "FAIL"
+
+
+def _junit_case_xml(case_id: str, *, failure: bool = False) -> str:
+    classname, name = case_id.split("::")
+    cls = classname.replace("/", ".").removesuffix(".py")
+    body = '<failure message="x"/>' if failure else ""
+    n = 1 if failure else 0
+    return (
+        f'<testsuites tests="1" failures="{n}" errors="0" skipped="0">'
+        f'<testsuite tests="1" failures="{n}" errors="0" skipped="0">'
+        f'<testcase classname="tests.{cls}" name="{name}">{body}</testcase>'
+        "</testsuite></testsuites>"
+    )
+
+
+_PROVENANCE_CASE = "test_rust_ab_compare.py::test_classification"
+
+
+def _provenance_invariant(tree: GateTree, props: dict[str, str] | None) -> dict[str, Any]:
+    """以單一案例的 pytest JUnit 驅動安全不變量；props 為 None 時自動帶入正確 provenance。"""
+    if tree.head is None:
+        tree.head = _init_git_head(tree.root)
+    _set_evidence_insufficient_invariant_cases(tree, [_PROVENANCE_CASE])
+    tree.pytest_junit_xml = _junit_case_xml(_PROVENANCE_CASE)
+    tree.junit_props = props
+    _, rep = tree.run()
+    return next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+
+
+def test_pytest_junit_with_full_provenance_is_accepted(tree):
+    inv = _provenance_invariant(tree, None)
+    assert inv["status"] == "PASS", inv
+
+
+def test_pytest_junit_without_provenance_is_rejected(tree):
+    inv = _provenance_invariant(tree, {})
+    assert inv["status"] == "FAIL", inv
+
+
+def test_pytest_junit_head_mismatch_is_rejected(tree):
+    _provenance_invariant(tree, None)  # 先取得 tree.head
+    inv = _provenance_invariant(tree, {**tree.default_junit_props(), "HEAD": "0" * 40})
+    assert inv["status"] == "FAIL"
+    assert inv["missing_or_failed"] == [_PROVENANCE_CASE]
+
+
+def _eff(**changes: Any) -> str:
+    return json.dumps({**_PROVENANCE_EFFECTIVE, **changes}, sort_keys=True)
+
+
+@pytest.mark.parametrize("override", [
+    {"SW_REQUIRE_CARGO": "0"},
+    {"SW_REQUIRE_CARGO": None},
+    {"HEAD": None},
+    {"argv": json.dumps(["-q", "tests/test_rust_stage1a_gate.py", "-p", "junit_provenance"])},
+    {"argv": json.dumps(["-q", "tests/", "-k", "rust"])},
+    {"argv": json.dumps(["-q", "tests/", "-m", "core_portable"])},
+    {"argv": json.dumps(["-q", "tests/", "--deselect", "tests/x.py::y"])},
+    {"argv": "not-json"},
+    # 髒樹：同 HEAD 但工作樹有未提交／未追蹤變更，不得作為正式證據
+    {"git_clean": "0"},
+    {"git_clean": None},
+    # 生效設定縮小範圍（argv 看不出，例如 addopts／PYTEST_ADDOPTS 或合併短旗標 -xq）
+    {"effective": _eff(keyword="rust")},
+    {"effective": _eff(markexpr="core_portable")},
+    {"effective": _eff(deselect=["tests/x.py::y"])},
+    {"effective": _eff(ignore=["tests/acceptance"])},
+    {"effective": _eff(maxfail=1)},
+    {"effective": _eff(collectonly=True)},
+    {"effective": "not-json"},
+    {"effective": None},
+], ids=["require-cargo-0", "require-cargo-missing", "head-missing", "argv-not-tests-tree", "argv-k",
+        "argv-m", "argv-deselect", "argv-unparseable", "dirty-tree", "git-clean-missing",
+        "effective-keyword-via-addopts", "effective-markexpr", "effective-deselect", "effective-ignore",
+        "effective-maxfail-via-xq", "effective-collectonly", "effective-unparseable", "effective-missing"])
+def test_pytest_junit_provenance_violations_rejected(tree, override):
+    _provenance_invariant(tree, None)  # 先取得 tree.head
+    base = tree.default_junit_props()
+    props = {k: v for k, v in {**base, **override}.items() if v is not None}
+    inv = _provenance_invariant(tree, props)
+    assert inv["status"] == "FAIL", (override, inv)
+
+
+SP = "win-wal-av-rotate"  # spike3 產物 scripts/stage0/spike3_win_wal.py 的 case_id（L1.5、cli_1A）
+
+
+def _enable_spike3(tree: GateTree, *, mutate=None, **doc_kwargs: Any) -> dict[str, Any]:
+    """啟用 win-wal-av-rotate（L1.5、cli_1A）；spike3 證據的 git_head 預設為受測 HEAD。"""
+    tree.head = _init_git_head(tree.root)
+    tree.cases.append({"case_id": SP, "layer": "L1.5", "cli_stage": "1A"})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, Z, SP])
+    doc = _spike3_doc(tree.head, **doc_kwargs)
+    if mutate is not None:
+        mutate(doc)
+    tree.spike3 = {SP: doc}
+    return doc
+
+
+def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor EDR",
+                status: str = "enabled", case_id: str = SP, drop_edr: bool = False) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "case_id": case_id,
+        "run_at": "2026-10-22T00:00:00Z",
+        "env": {"os": "Windows 10"},
+        "artifact": {"binary": "sw_core (Python 基線)", "revision": "a" * 40, "tree_sha256": "b" * 64,
+                     "git_head": git_head, "git_clean": True},
+        "steps": [{"op": "case", "ts": "2026-10-22T00:00:01Z", "result": "ok"}],
+        "observations": {},
+        "edr": {"product": product, "status": status, "interceptions": 0},
+        "verdict": verdict,
+        "fallback": "none",
+    }
+    if drop_edr:
+        del doc["edr"]
+    return doc
+
+
+def test_spike3_dirty_tree_evidence_is_insufficient_never_pass(tree):
+    """spike3 證據產出於髒樹（artifact.git_clean 非 true）即使 HEAD 相符也不得 PASS。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["artifact"].__setitem__("git_clean", False))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] != "PASS", _case_row(rep, SP)
+
+
+def test_spike3_pass_with_known_edr_is_pass(tree):
+    _enable_spike3(tree)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert code == 0
+
+
+def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
+    _enable_spike3(tree, product="unknown")
+    code, rep = tree.run()
+    row = _case_row(rep, SP)
+    assert row["status"] == "BLOCKED-OWNER", row
+    assert rep["overall"] != "VERIFIED"
+
+
+def test_spike3_git_head_mismatch_is_insufficient(tree):
+    _enable_spike3(tree, mutate=lambda d: d["artifact"].__setitem__("git_head", "0" * 40))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_missing_evidence_file_is_insufficient(tree):
+    _enable_spike3(tree)
+    tree.spike3 = {}
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_schema_invalid_is_insufficient(tree):
+    _enable_spike3(tree, drop_edr=True)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_verdict_fail_is_fail(tree):
+    _enable_spike3(tree, verdict="FAIL")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "FAIL"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_insufficient_verdict_is_not_pass(tree):
+    _enable_spike3(tree, verdict="INSUFFICIENT_EVIDENCE")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_junit_provenance_plugin_records_head_require_cargo_and_argv(tmp_path):
+    """scripts/rust/junit_provenance.py 寫出的 properties 須能被 gate 的 provenance 檢查接受（HEAD／SW_REQUIRE_CARGO／argv）。"""
+    import os
+    import xml.etree.ElementTree as ET
+
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_probe.py").write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+    junit = tmp_path / "junit.xml"
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts" / "rust"), "SW_REQUIRE_CARGO": "1"}
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests", "-p", "junit_provenance",
+         f"--junitxml={junit}"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=False,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    root = ET.parse(junit).getroot()
+    props = {p.get("name"): p.get("value") for p in root.iter("property")}
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                          check=True).stdout.strip()
+    assert props["HEAD"] == head
+    assert props["SW_REQUIRE_CARGO"] == "1"
+    argv = json.loads(props["argv"])
+    assert "tests" in argv and "junit_provenance" in " ".join(argv)
+    assert "--junitxml" in " ".join(argv)
+
+
+# ---- L15 gate accounting（計畫 04 §5c）：not_applicable 缺口與 verdict 對應 ----
+
+def _load_gate_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("stage1a_gate_under_test", GATE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_NA_LINUX_ROW = {
+    "verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": True,
+    "not_applicable_steps": [{"step": 8, "action": "cli"}], "platform": "linux",
+}
+_WIN_PASS_ROW = {"verdict": "PASS", "gate_eligible": True, "not_applicable_steps": [], "platform": "windows"}
+
+
+def test_l15_linux_na_only_plus_windows_pass_is_pass():
+    gate = _load_gate_module()
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW), dict(_WIN_PASS_ROW)]) == "PASS"
+
+
+def test_l15_linux_na_only_alone_is_evidence_insufficient():
+    gate = _load_gate_module()
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW)]) == "evidence-insufficient"
+
+
+def test_l15_insufficient_row_is_evidence_insufficient_not_fail():
+    gate = _load_gate_module()
+    row = {"verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": False, "not_applicable_steps": []}
+    assert gate._l15_case_status([row, dict(_WIN_PASS_ROW)]) == "evidence-insufficient"
+
+
+def test_l15_real_fail_still_fails_even_with_na_gap():
+    gate = _load_gate_module()
+    fail = {"verdict": "FAIL", "gate_eligible": False, "na_only_gap": False, "not_applicable_steps": []}
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW), fail]) == "FAIL"
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW), dict(_WIN_PASS_ROW), fail]) == "FAIL"
+
+
+def test_l15_na_flag_without_structured_steps_does_not_exempt_row():
+    gate = _load_gate_module()
+    forged = {"verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": True, "not_applicable_steps": []}
+    assert gate._l15_case_status([forged, dict(_WIN_PASS_ROW)]) == "evidence-insufficient"

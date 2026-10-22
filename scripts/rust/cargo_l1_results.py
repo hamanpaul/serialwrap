@@ -249,14 +249,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         collected.extend(_nodeid(target, name) for name in target.collected_names)
 
     if args.list_only:
-        # 凍結分母只收正常執行的非 cap_* 測試；ignored 案例仍留在完整報告供 judge 對帳。
-        lock_collected = [
-            _nodeid(target, name)
-            for target in targets
-            for name in target.collected_names
-            if name not in target.ignored_names and not name.startswith("cap_")
-        ]
-        _read_report(args.out, {"collected": lock_collected})
+        # plan 04 Task 17：--list-only 輸出每個收集到的測試，ignored 與 cap_* 皆保留，
+        # 使 regen_lock 不會把既有 ignored／cap_* 列誤判為移除。任何排除須在 freeze 輸入之外明示處理，不得經由此處縮小分母。
+        _read_report(args.out, {"collected": collected})
         return 0 if finished else 1
 
     summaries: list[dict[str, Any]] = []
