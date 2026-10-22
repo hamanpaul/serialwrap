@@ -10,5 +10,5 @@ pub fn posix_scan(
     _dirs: &[PathBuf],
     _allowlist: Option<&[String]>,
 ) -> PalResult<Vec<(String, DeviceInfo)>> {
-    todo!("slice21 T5 posix_scan 尚未實作")
+    s21_todo!("T5", "posix_scan")
 }

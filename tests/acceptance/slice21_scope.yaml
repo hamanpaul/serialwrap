@@ -1,0 +1,45 @@
+schema_version: 1
+slice: "2.1"
+served_methods: [health.ping, health.status, daemon.stop, mcu.patterns, mcu.status, device.list, device.release,
+  device.attach, session.list, session.get_state, session.activity, session.log_status, session.self_test,
+  session.recover, session.clear, session.bind, session.pin, session.unpin, session.attach,
+  session.interactive_open, session.interactive_send, session.interactive_status, session.interactive_close,
+  session.log_start, session.log_stop, alias.list, alias.set, alias.assign, alias.unassign, command.submit,
+  command.get, command.result_tail, command.cancel, result.tail, log.tail_raw, log.tail_text, wal.range,
+  wal.reset, wal.current_seq]
+deferred_response: {ok: false, error_code: METHOD_NOT_FOUND, keys: [method, version]}
+# P5 Task 0 補記：Rust 方法目錄（rpc_types.rs KNOWN，55 項）＝ served_methods ∪ deferred_methods ∪ unsupported_catalog_methods。
+# daemon.handoff_stop 為 Python 基線服務（sw_core/daemon.py）但不屬 2.1 served／deferred 兩表；歸屬 P1-T8／P8-T14（SC-11 原子交接，2.4）。
+# 2.1 fail-closed 回 deferred_response 同形狀（不改 deferred_methods，計畫測試鎖定 15 項）。
+unsupported_catalog_methods:
+  - {method: daemon.handoff_stop, slice: "2.4", response: METHOD_NOT_FOUND, owner: "P8-T14（SC-11 原子交接）"}
+deferred_methods:
+  - {method: session.console_attach, slice: "2.2"}
+  - {method: session.console_detach, slice: "2.2"}
+  - {method: session.console_list, slice: "2.2"}
+  - {method: event.rule_set, slice: "2.3"}
+  - {method: event.rule_delete, slice: "2.3"}
+  - {method: event.rule_list, slice: "2.3"}
+  - {method: event.rule_get, slice: "2.3"}
+  - {method: event.com_enable, slice: "2.3"}
+  - {method: event.com_disable, slice: "2.3"}
+  - {method: event.com_status, slice: "2.3"}
+  - {method: event.reset, slice: "2.3"}
+  - {method: event.reload, slice: "2.3"}
+  - {method: event.tail, slice: "2.3"}
+  - {method: file.push, slice: "2.4"}
+  - {method: file.pull, slice: "2.4"}
+unsupported_profile_features: [post_login_cmd, console_unlock_env]
+unsupported_profile_behavior: {auto_tx: false, state: ATTACHED, last_error: null, submit_error_code: SESSION_NOT_READY}
+sentinel_console_input: discard        # POSIX 哨兵 PTY 收到的 human bytes 在 2.1 丟棄（2.2 承接 Raw／Line）
+session_public_deferred_fields:
+  - {field: console_endpoint, platform: windows, value_in_2_1: null, slice: "2.2"}
+cross_slice_cases:
+  - {suite: tests/test_human_agent_coexist.py, items: [t1, t5, t6, t7, t8], slice: "2.2"}
+  - {suite: func-test, items: [co-01-line-buffering, cowork-01-agent-bad-cmd, ha-01-human-then-agent, hk-01-special-keys-raw, hk-02-agent-preempt-human, hk-03-deferred-input-flush, hk-04-minicom-exit-cleanup, rc-01-interactive-mode-switch], slice: "2.2"}
+  - {suite: func-test, items: [brcm-01-login-flow, ev-01-spawn-handler], slice: "2.3"}
+  - {suite: regression, items: [F5, F6, F8], slice: "2.2"}
+  - {suite: regression, items: [F9, F10, F11], slice: "2.3"}
+  - {suite: regression, items: [F7], slice: "2.4"}
+early_evidence_cases:                  # cases.lock 屬較晚切片、本 Phase 已能提供證據者；不計入 slice_2.1 分母
+  - {case_id: f4-interactive-line-cmd-defined, lock_slice: "2.2", reason: "agent-only lease 已於 Task 14 承接"}

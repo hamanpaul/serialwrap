@@ -18,10 +18,15 @@ use crate::service_ctl::{
     SupervisionMode, SupervisorDefinition, TaskQuery,
 };
 use crate::traits::{
-    ChildHandle, Clock, CmdOutput, CmdOutputRaw, EndpointSpec, InterruptScope, PalError, PalResult,
-    ProcessCtl, RpcConnector, RpcStream, SockTimeout, SysEnv,
+    ChildHandle, Clock, CmdOutput, CmdOutputRaw, DeviceSelection, DeviceSource, EndpointSpec,
+    InterruptScope, ListenOptions, PalError, PalResult, ProcessCtl, RpcConnector, RpcListener,
+    RpcListenerFactory, RpcStream, SignalWait, SockTimeout, SysEnv,
 };
-use crate::{BackendKind, Capabilities, ConsoleKind, PalPathFlavor, Platform, SkillPlatform};
+use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, PtyPair};
+use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard};
+use crate::DeviceFactory;
+use std::collections::HashSet;
+use crate::{BackendKind, Capabilities, ConsoleKind, DeviceBackendKind, PalPathFlavor, Platform, SkillPlatform};
 
 /// POSIX 能力包（替身預設；對應 `native()` 的 POSIX 分支）。
 pub fn posix_caps() -> Capabilities {
@@ -34,6 +39,7 @@ pub fn posix_caps() -> Capabilities {
         exec_replace: true,
         on_demand_autostart: false,
         console_kind: ConsoleKind::Pty,
+        native_device: DeviceBackendKind::Posix,
     }
 }
 
@@ -48,6 +54,7 @@ pub fn windows_caps() -> Capabilities {
         exec_replace: false,
         on_demand_autostart: true,
         console_kind: ConsoleKind::TcpTelnet,
+        native_device: DeviceBackendKind::Win,
     }
 }
 
@@ -62,6 +69,11 @@ pub struct FakePlatformBuilder {
     tunnel: Option<Arc<dyn ProcessTunnel>>,
     service: Option<Arc<dyn ServiceCtl>>,
     registry: Option<Arc<dyn RegistryView + Sync>>,
+    devices: Option<DeviceFactory>,
+    instance_lock: Option<Arc<dyn InstanceLockFactory>>,
+    rpc_listen: Option<Arc<dyn RpcListenerFactory>>,
+    console: Option<Arc<dyn ConsoleTransportFactory>>,
+    signals: Option<Arc<dyn SignalWait>>,
     caps: Capabilities,
 }
 
@@ -77,6 +89,11 @@ pub fn platform() -> FakePlatformBuilder {
         tunnel: None,
         service: None,
         registry: None,
+        devices: None,
+        instance_lock: None,
+        rpc_listen: None,
+        console: None,
+        signals: None,
         caps: posix_caps(),
     }
 }
@@ -118,6 +135,26 @@ impl FakePlatformBuilder {
         self.clock = Some(v);
         self
     }
+    pub fn devices(mut self, v: DeviceFactory) -> Self {
+        self.devices = Some(v);
+        self
+    }
+    pub fn instance_lock(mut self, v: Arc<dyn InstanceLockFactory>) -> Self {
+        self.instance_lock = Some(v);
+        self
+    }
+    pub fn rpc_listen(mut self, v: Arc<dyn RpcListenerFactory>) -> Self {
+        self.rpc_listen = Some(v);
+        self
+    }
+    pub fn console(mut self, v: Arc<dyn ConsoleTransportFactory>) -> Self {
+        self.console = Some(v);
+        self
+    }
+    pub fn signals(mut self, v: Arc<dyn SignalWait>) -> Self {
+        self.signals = Some(v);
+        self
+    }
     pub fn caps(mut self, v: Capabilities) -> Self {
         self.caps = v;
         self
@@ -147,6 +184,23 @@ impl FakePlatformBuilder {
                 .registry
                 .unwrap_or_else(|| Arc::new(Unconfigured("registry"))),
             serial: crate::fakes::serial::FakeSerialBackend::new(),
+            uart_excl: Arc::new(crate::fakes::serial::FakeUartExclusive {
+                report: Default::default(),
+            }),
+            devices: self.devices.unwrap_or_else(unconfigured_devices),
+            instance_lock: self
+                .instance_lock
+                .unwrap_or_else(|| Arc::new(Unconfigured("instance_lock"))),
+            wal_fs: crate::fakes::wal_fs::FakeWalFs::new(),
+            rpc_listen: self
+                .rpc_listen
+                .unwrap_or_else(|| Arc::new(Unconfigured("rpc_listen"))),
+            console: self
+                .console
+                .unwrap_or_else(|| Arc::new(Unconfigured("console"))),
+            signals: self
+                .signals
+                .unwrap_or_else(|| Arc::new(Unconfigured("signals"))),
             caps: self.caps,
         }
     }
@@ -299,7 +353,61 @@ impl FsOps for Unconfigured {
     }
 }
 
+/// 未設定 `devices` 工廠時的占位：建立裝置來源即 panic（訊息含 `devices`）。
+pub fn unconfigured_devices() -> DeviceFactory {
+    Box::new(|_sel: DeviceSelection| -> Box<dyn DeviceSource> { not_configured("devices") })
+}
+
+impl InstanceLockFactory for Unconfigured {
+    fn acquire(
+        &self,
+        _lock_path: &Path,
+        _endpoint: &EndpointSpec,
+    ) -> Result<Box<dyn InstanceLockGuard>, InstanceLockError> {
+        not_configured(self.0)
+    }
+}
+
+impl RpcListenerFactory for Unconfigured {
+    fn bind(&self, _ep: &EndpointSpec, _opts: &ListenOptions) -> PalResult<Box<dyn RpcListener>> {
+        not_configured(self.0)
+    }
+}
+
+impl SignalWait for Unconfigured {
+    fn install(&self) -> PalResult<()> {
+        not_configured(self.0)
+    }
+    fn wait_stop(&self, _extra: crossbeam_channel::Receiver<()>) {
+        not_configured(self.0)
+    }
+}
+
+impl ConsoleTransportFactory for Unconfigured {
+    fn kind(&self) -> ConsoleKind {
+        not_configured(self.0)
+    }
+    fn create_pty(&self) -> PalResult<PtyPair> {
+        not_configured(self.0)
+    }
+    fn bind_tcp_console(&self) -> PalResult<Box<dyn ConsoleListener>> {
+        not_configured(self.0)
+    }
+    fn open_com0com_console(&self, _port: &str) -> PalResult<Box<dyn ConsoleIo>> {
+        not_configured(self.0)
+    }
+    fn held_slave_paths(&self) -> Option<HashSet<String>> {
+        not_configured(self.0)
+    }
+}
+
 impl Clock for Unconfigured {
+    fn wall_unix_us(&self) -> i64 {
+        not_configured(self.0)
+    }
+    fn local_utc_offset_s(&self) -> i32 {
+        not_configured(self.0)
+    }
     fn mono_ns(&self) -> u64 {
         not_configured(self.0)
     }

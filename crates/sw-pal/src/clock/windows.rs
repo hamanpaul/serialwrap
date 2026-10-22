@@ -14,6 +14,12 @@ unsafe extern "system" {
 pub struct NativeClock;
 
 impl Clock for NativeClock {
+    fn wall_unix_us(&self) -> i64 {
+        crate::s21_todo!("T0c", "NativeClock::wall_unix_us")
+    }
+    fn local_utc_offset_s(&self) -> i32 {
+        crate::s21_todo!("T0c", "NativeClock::local_utc_offset_s")
+    }
     fn mono_ns(&self) -> u64 {
         static FREQUENCY: OnceLock<i64> = OnceLock::new();
         let frequency = *FREQUENCY.get_or_init(|| {

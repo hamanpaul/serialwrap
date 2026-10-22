@@ -265,3 +265,39 @@ impl Method {
         LONG_RPC_METHODS.contains(&self.as_str())
     }
 }
+
+/// RPC 參數讀取器（Task 0c；對應 Python `params.get(...)` 的轉型規則，02 §5.2）。
+#[allow(dead_code)] // Task 0c 實作前 `raw` 尚未被讀取。
+pub struct Params<'a> {
+    raw: &'a crate::pyjson::PyDict,
+}
+
+impl<'a> Params<'a> {
+    pub fn new(raw: &'a crate::pyjson::PyDict) -> Params<'a> {
+        Params { raw }
+    }
+    /// `str(params.get(k, default))` 等價。
+    pub fn str_or(&self, _k: &str, _default: &str) -> String {
+        crate::s21_todo!("T0c", "Params::str_or")
+    }
+    /// `int(params.get(k, default))` 等價（Python `int()` 規則）。
+    pub fn int_or(&self, _k: &str, _default: i64) -> Result<i64, crate::pycompat::PyErr> {
+        crate::s21_todo!("T0c", "Params::int_or")
+    }
+    /// `float(params.get(k, default))` 等價。
+    pub fn float_or(&self, _k: &str, _default: f64) -> Result<f64, crate::pycompat::PyErr> {
+        crate::s21_todo!("T0c", "Params::float_or")
+    }
+    /// Python 真值語意（`coerce_rpc_bool`）。
+    pub fn truthy(&self, _k: &str) -> bool {
+        crate::s21_todo!("T0c", "Params::truthy")
+    }
+    /// 原始值（未轉型）。
+    pub fn raw(&self, _k: &str) -> Option<&crate::pyjson::PyValue> {
+        crate::s21_todo!("T0c", "Params::raw")
+    }
+    /// `selector` 鏈（`session`／`selector` 等欄位的 fallback 順序）。
+    pub fn selector_chain(&self) -> Vec<String> {
+        crate::s21_todo!("T0c", "Params::selector_chain")
+    }
+}

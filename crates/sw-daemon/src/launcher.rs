@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use sw_pal::process::ExecOpts;
+use sw_pal::traits::PalErrorKind;
 use sw_pal::FsRead;
 use sw_proto::pyjson::PyValue;
 use sw_proto::release_manifest::{ManifestError, ReleaseManifest};
@@ -12,6 +13,9 @@ use sw_proto::release_manifest::{ManifestError, ReleaseManifest};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LauncherError {
     ManifestNotFound(String),
+    /// 開發 build（P5 Task 0 雙審修正）：`current-release.json` 不存在，且版本 manifest 讀取為 `NotFound`。
+    /// 只有此變體由 `manifest_absent` 視為開發 build；其餘 `ManifestNotFound` 一律 fail-closed（exit 2）。
+    DevBuildNoManifest,
     ManifestInvalid(String),
     ProcessStart { program: String, reason: String },
     UnsupportedImplementation(String),
@@ -21,6 +25,7 @@ impl LauncherError {
     fn message(&self) -> String {
         match self {
             Self::ManifestNotFound(path) => format!("release manifest 不存在：{path}"),
+            Self::DevBuildNoManifest => "release manifest 不存在（開發 build）".to_string(),
             Self::ManifestInvalid(reason) => format!("release manifest 無效：{reason}"),
             Self::ProcessStart { program, reason } => {
                 format!("無法啟動 daemon 程序 {program}：{reason}")
@@ -195,7 +200,9 @@ pub fn run(argv: Vec<OsString>, platform: &sw_pal::Platform) -> i32 {
     }
 }
 
-fn launch(argv: Vec<OsString>, platform: &sw_pal::Platform) -> Result<i32, LauncherError> {
+/// 定位並解析目前版本的 release manifest（`launch` 與 `manifest_selects_python` 共用）。
+/// 回傳 `(manifest 所在目錄, 解析後的 manifest)`；行為與 P4 launcher 原路徑逐字相同。
+fn load_manifest(platform: &sw_pal::Platform) -> Result<(PathBuf, ReleaseManifest), LauncherError> {
     let current_exe = platform
         .env
         .current_exe()
@@ -203,30 +210,51 @@ fn launch(argv: Vec<OsString>, platform: &sw_pal::Platform) -> Result<i32, Launc
     let exe_dir = current_exe.parent().ok_or_else(|| {
         LauncherError::ManifestNotFound(format!("{} 上層目錄不足", current_exe.display()))
     })?;
-    let manifest_path = match current_release_manifest_path(platform.fs.as_ref(), exe_dir)? {
-        Some(path) => path,
-        None => {
-            let real_exe = platform.env.realpath(&current_exe).map_err(|error| {
-                LauncherError::ManifestNotFound(error.py_message)
-            })?;
-            let version_dir = real_exe.parent().and_then(Path::parent).ok_or_else(|| {
-                LauncherError::ManifestNotFound(format!("{} 上層目錄不足", real_exe.display()))
-            })?;
-            version_dir.join("release-manifest.json")
+    // 開發 build 判定（P5 Task 0 雙審修正）：只有「指標不存在」且「版本 manifest 讀取為 NotFound」同時成立才是開發 build。
+    let (manifest_path, pointer_absent) =
+        match current_release_manifest_path(platform.fs.as_ref(), exe_dir)? {
+            Some(path) => (path, false),
+            None => {
+                let real_exe = platform.env.realpath(&current_exe).map_err(|error| {
+                    LauncherError::ManifestNotFound(error.py_message)
+                })?;
+                let version_dir = real_exe.parent().and_then(Path::parent).ok_or_else(|| {
+                    LauncherError::ManifestNotFound(format!("{} 上層目錄不足", real_exe.display()))
+                })?;
+                (version_dir.join("release-manifest.json"), true)
+            }
+        };
+    let manifest_dir = manifest_path
+        .parent()
+        .ok_or_else(|| LauncherError::ManifestNotFound(manifest_path.display().to_string()))?
+        .to_path_buf();
+    let manifest_bytes = platform.fs.read(&manifest_path).map_err(|error| {
+        if pointer_absent && error.kind == PalErrorKind::NotFound {
+            LauncherError::DevBuildNoManifest
+        } else {
+            LauncherError::ManifestNotFound(manifest_path.to_string_lossy().into_owned())
         }
-    };
-    let manifest_dir = manifest_path.parent().ok_or_else(|| {
-        LauncherError::ManifestNotFound(manifest_path.display().to_string())
-    })?;
-    let manifest_bytes = platform.fs.read(&manifest_path).map_err(|_| {
-        LauncherError::ManifestNotFound(manifest_path.to_string_lossy().into_owned())
     })?;
     let manifest_text = std::str::from_utf8(&manifest_bytes)
         .map_err(|error| LauncherError::ManifestInvalid(format!("manifest 不是 UTF-8：{error}")))?;
     let manifest = sw_proto::release_manifest::parse_manifest(manifest_text)
         .map_err(|error| LauncherError::ManifestInvalid(manifest_error_detail(error)))?;
+    Ok((manifest_dir, manifest))
+}
+
+/// `serialwrapd` 入口的分派判斷（P5-T0 起由 `main.rs` 使用）：回傳 `true` 只表示開發 build
+/// （`DevBuildNoManifest`：指標 `current-release.json` 不存在且版本 manifest 讀取為 NotFound），此時交 Rust daemon 本體（`daemon_main::run`）。
+/// 指標存在但目標缺失、manifest 不可讀（EACCES／EIO 等）、realpath 或目錄解析失敗、manifest 解析失敗，一律回 `false`，交 launcher 走 exit 2（fail-closed）。
+/// manifest 存在（任何 implementation，含 `rust`）一律維持 P4 launcher 既有路徑：
+/// `implementation=rust` 的 Stage 1 拒絕（`launcher_rejects_rust_implementation_in_stage1`）保留到 P5-T19 才由該 Task 切換。
+pub fn manifest_absent(platform: &sw_pal::Platform) -> bool {
+    matches!(load_manifest(platform), Err(LauncherError::DevBuildNoManifest))
+}
+
+fn launch(argv: Vec<OsString>, platform: &sw_pal::Platform) -> Result<i32, LauncherError> {
+    let (manifest_dir, manifest) = load_manifest(platform)?;
     let tail = argv.get(1..).unwrap_or_default();
-    let child_argv = launcher_argv(manifest_dir, &manifest, tail)?;
+    let child_argv = launcher_argv(&manifest_dir, &manifest, tail)?;
     let error = platform.process.exec_or_wait_opts(
         &child_argv,
         &[],

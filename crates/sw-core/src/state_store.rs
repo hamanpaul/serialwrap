@@ -2,6 +2,7 @@
 //!
 //! `StateStore`／`StateModel`／`load_state` 等由 Task 15 實作者補上。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,6 +52,14 @@ pub struct StateLoadError {
     pub message: String,
 }
 
+impl std::fmt::Display for StateLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StateLoadError {}
+
 /// 讀取 `state.json`；損毀時回 `(LoadedState::default(), Some(.corrupt 路徑))`。
 pub fn load_state(
     _path: &Path,
@@ -59,7 +68,35 @@ pub fn load_state(
     s21_todo!("T15", "load_state")
 }
 
-/// `state.json` 的 `StateStore`（thread `serialwrap-state-store`；Task 15 Produces 的骨架形式）。
+/// `state.json` 的序列化位元組（`DISK_STABLE` ＋ `\n`；未知鍵於存檔時丟棄，WAL-D14）。
+pub fn serialize_state(_s: &LoadedState) -> Vec<u8> {
+    s21_todo!("T15", "serialize_state")
+}
+
+/// 記憶體狀態模型：`LoadedState` ＋ 已載入但未實體化的 released 列（DF-04）。
+pub struct StateModel {
+    _stub: (),
+}
+
+impl StateModel {
+    pub fn new(_loaded: LoadedState) -> StateModel {
+        s21_todo!("T15", "StateModel::new")
+    }
+
+    pub fn apply(&mut self, _d: StateDelta) {
+        s21_todo!("T15", "StateModel::apply")
+    }
+
+    pub fn snapshot(&self) -> LoadedState {
+        s21_todo!("T15", "StateModel::snapshot")
+    }
+
+    pub fn released_by_ids(&self) -> HashSet<String> {
+        s21_todo!("T15", "StateModel::released_by_ids")
+    }
+}
+
+/// `state.json` 的 `StateStore`（thread `serialwrap-state-store`，bounded(64)；Task 15 Produces）。
 pub struct StateStore {
     _stub: (),
 }
@@ -67,6 +104,22 @@ pub struct StateStore {
 impl StateStore {
     pub fn spawn(_path: PathBuf, _fs: Arc<dyn FsOps>) -> StateStore {
         s21_todo!("T15", "StateStore::spawn")
+    }
+
+    /// 測試掛鉤（Review Focus 1）：`before_commit`／`after_commit` 於 store thread 中、`atomic_write` 前後呼叫。
+    #[cfg(feature = "test-fakes")]
+    pub fn spawn_with_hooks(
+        _path: PathBuf,
+        _fs: Arc<dyn FsOps>,
+        _before_commit: Option<Box<dyn Fn() + Send + Sync>>,
+        _after_commit: Option<Box<dyn Fn() + Send + Sync>>,
+    ) -> StateStore {
+        s21_todo!("T15", "StateStore::spawn_with_hooks")
+    }
+
+    /// 非同步提交：結果經 `done` 回傳（actor 以 `ControlEvent::StateCommitted` 收斂）。
+    pub fn commit(&self, _snap: LoadedState, _done: crossbeam_channel::Sender<Result<(), PalError>>) {
+        s21_todo!("T15", "StateStore::commit")
     }
 
     /// 同步提交；失敗回 `Err`（管理操作以此轉 `Err(PyErr)`）。

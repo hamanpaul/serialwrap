@@ -1,4 +1,13 @@
 //! `sw-proto`：協定型別與 Python 相容語意層（P3-T3～P3-T8 stub，行為尚未實作）。
+
+/// Slice 2.1 骨架未實作函式的統一 panic（與 `sw_core::s21_todo!` 同格式）。
+#[macro_export]
+macro_rules! s21_todo {
+    ($t:literal, $sym:literal) => {
+        unimplemented!(concat!("slice21 ", $t, " ", $sym))
+    };
+}
+
 pub mod bench_registry;
 pub mod config_types;
 pub mod constants;

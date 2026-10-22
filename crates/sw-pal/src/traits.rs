@@ -453,6 +453,10 @@ pub trait FsRead: Send + Sync {
 pub trait Clock: Send + Sync {
     fn mono_ns(&self) -> u64;
     fn sleep(&self, d: Duration);
+    /// Unix wall clock（微秒，Task 0c）。無預設實作：每個 `impl Clock` 必須明確覆寫，漏實作即編譯失敗（P5 Task 0 雙審修正）。
+    fn wall_unix_us(&self) -> i64;
+    /// 本地 UTC offset（秒，Task 0c）。無預設實作，理由同 `wall_unix_us`。
+    fn local_utc_offset_s(&self) -> i32;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -787,6 +791,17 @@ pub trait SerialHandle: Send {
         CloseToken,
     );
     fn set_baud(&self, baud: u32) -> PalResult<()>;
+    /// arch §4.2：`/dev/ttyMCU`（2.4）專用。本 Phase 兩平台皆回 `Unsupported`（預設實作，不破壞既有替身）。
+    fn mirror_termios_from(
+        &self,
+        _pty: &crate::console_pty::PtySlaveRef,
+        _fallback_baud: Option<u32>,
+    ) -> PalResult<()> {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "mirror_termios_from 於 Slice 2.1 未支援（/dev/ttyMCU 屬 2.4）",
+        ))
+    }
     fn is_alive(&self) -> bool;
 }
 
@@ -854,6 +869,8 @@ pub trait WalFs: Send + Sync {
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
     fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;
+    /// 讀取整檔（Task 0 修訂 arch §4.5；Task 7 讀取 API 使用）。`None` = 路徑不存在。
+    fn read_all(&self, path: &Path) -> PalResult<Option<Vec<u8>>>;
     /// DF-03：優先原子 no-replace；不支援時降級；同名加 `.1` `.2` …。
     fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>;
     fn sync_dir(&self, dir: &Path) -> PalResult<()>;
@@ -883,12 +900,156 @@ pub struct WalWriteError {
 }
 
 // ---------------------------------------------------------------------------
-// P5-T16 Step 0 最小骨架：`ConsoleTransportFactory`（arch §4.7）。
-// 完整宣告（create_pty／bind_tcp_console／open_com0com_console／held_slave_paths 與 PtyPair 等型別）
-// 由 P5 Task 2 補齊；本段只讓 SessionManager 的 `ManagerDeps.console` 可編譯。
+// ConsoleTransportFactory（arch §4.7）：完整宣告位於 `crate::console_pty`，此處再匯出以保留既有路徑。
 // ---------------------------------------------------------------------------
 
-/// human console 承接工廠（arch §4.7，最小形式）。
-pub trait ConsoleTransportFactory: Send + Sync {
-    fn kind(&self) -> crate::ConsoleKind;
+pub use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, KeepAlive, PtyPair, PtySlaveRef};
+// 實例鎖型別（arch §4.4）：實際定義於 `crate::lock`，此處再匯出，使 `use sw_pal::*` 可直接取得（Task 4 測試與 Task 19 使用）。
+pub use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard};
+
+// ---------------------------------------------------------------------------
+// Slice 2.1 介面（arch §4.4、§4.6、§4.9；Task 0 Produces）。實作由 Task 2／4／17 交付。
+// ---------------------------------------------------------------------------
+
+/// daemon 停止訊號等待（arch §4.9）。`install` 必須在 main 第一個動作、建立任何 thread 之前呼叫；重複呼叫回 `Ok(())`。
+pub trait SignalWait: Send + Sync {
+    fn install(&self) -> PalResult<()>;
+    fn wait_stop(&self, extra: crossbeam_channel::Receiver<()>);
+}
+
+/// RPC 伺服端連線（arch §4.6；P3 `RpcStream` 維持 client 專用）。
+pub trait RpcServerStream: std::io::Read + std::io::Write + Send {
+    fn shutdown_read(&mut self) -> PalResult<()>;
+    fn set_read_timeout(&mut self, d: Option<Duration>) -> PalResult<()>;
+}
+
+/// RPC listener 建立參數（arch §4.6）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenOptions {
+    pub mode: u32,
+    pub group: Option<String>,
+    pub ensure_dir_mode: Option<u32>,
+}
+
+/// RPC listener 工廠（arch §4.6）。
+pub trait RpcListenerFactory: Send + Sync {
+    fn bind(&self, ep: &EndpointSpec, opts: &ListenOptions) -> PalResult<Box<dyn RpcListener>>;
+}
+
+/// RPC listener（arch §4.6）。
+pub trait RpcListener: Send {
+    /// 有界等待，供 stop 檢查。
+    fn accept(&mut self, timeout: Duration) -> PalResult<Option<Box<dyn RpcServerStream>>>;
+    /// Unix：移除 socket 檔。
+    fn close(self: Box<Self>);
+}
+
+impl PalError {
+    /// 由 errno 建立錯誤（P5 Task 0 交付純建構子）：沿用同檔 `posix_errno`／`windows_crt_error` 的 strerror 與 kind 對映，
+    /// `py_message` 為 `[Errno N] <strerror>`。Task 1 的替身與 Task 7 的 `py_exc_name` 依賴此實作，不得再為 stub。
+    pub fn from_errno(e: i32) -> PalError {
+        #[cfg(unix)]
+        {
+            posix_errno(e)
+        }
+        #[cfg(windows)]
+        {
+            windows_crt_error(e)
+        }
+    }
+    /// 使用者取消（`CancelToken` 觸發的 OS 操作中止）：kind `Cancelled`，os_code 125（ECANCELED）。
+    pub fn cancelled() -> PalError {
+        PalError::new(
+            PalErrorKind::Cancelled,
+            Some(125),
+            None,
+            "Operation canceled",
+            "[Errno 125] Operation canceled",
+        )
+    }
+    /// 找不到目標：kind `NotFound`，os_code 2（ENOENT）；`py_message` 原樣保留（Python `str(OSError)` 格式由呼叫端給定）。
+    pub fn not_found(py_message: &str) -> PalError {
+        PalError::new(
+            PalErrorKind::NotFound,
+            Some(2),
+            None,
+            "No such file or directory",
+            py_message,
+        )
+    }
+    /// 參數不合法：kind `InvalidInput`，os_code 22（EINVAL）。
+    pub fn invalid(msg: &str) -> PalError {
+        PalError::new(PalErrorKind::InvalidInput, Some(22), None, "Invalid argument", msg)
+    }
+    /// Python 例外類別名（計畫 06 Task 0 對照表）：ENOENT→FileNotFoundError、EACCES/EPERM→PermissionError、
+    /// EEXIST→FileExistsError、ETIMEDOUT→TimeoutError、其他→OSError。
+    /// `os_code` 缺席時依 kind 補判（NotFound→FileNotFoundError、PermissionDenied／AccessDenied→PermissionError、TimedOut→TimeoutError）。
+    pub fn py_exc_name(&self) -> &'static str {
+        match self.os_code {
+            Some(2) => "FileNotFoundError",
+            Some(1) | Some(13) => "PermissionError",
+            Some(17) => "FileExistsError",
+            Some(110) => "TimeoutError",
+            Some(_) => "OSError",
+            None => match self.kind {
+                PalErrorKind::NotFound => "FileNotFoundError",
+                PalErrorKind::PermissionDenied | PalErrorKind::AccessDenied => "PermissionError",
+                PalErrorKind::TimedOut => "TimeoutError",
+                _ => "OSError",
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod pal_error_ctor_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_uses_cancelled_kind_and_ecanceled_code() {
+        let e = PalError::cancelled();
+        assert_eq!(e.kind, PalErrorKind::Cancelled);
+        assert_eq!(e.os_code, Some(125));
+        assert_eq!(e.py_exc_name(), "OSError");
+    }
+
+    #[test]
+    fn not_found_keeps_py_message_and_maps_to_file_not_found() {
+        let e = PalError::not_found("[Errno 2] No such file or directory");
+        assert_eq!(e.kind, PalErrorKind::NotFound);
+        assert_eq!(e.os_code, Some(2));
+        assert_eq!(e.py_message, "[Errno 2] No such file or directory");
+        assert_eq!(e.py_exc_name(), "FileNotFoundError");
+    }
+
+    #[test]
+    fn invalid_uses_invalid_input_kind_and_einval_code() {
+        let e = PalError::invalid("path contains NUL");
+        assert_eq!(e.kind, PalErrorKind::InvalidInput);
+        assert_eq!(e.os_code, Some(22));
+        assert_eq!(e.py_message, "path contains NUL");
+        assert_eq!(e.py_exc_name(), "OSError");
+    }
+
+    #[test]
+    fn from_errno_keeps_code_and_maps_python_exception_names() {
+        for (code, name) in [
+            (2, "FileNotFoundError"),
+            (1, "PermissionError"),
+            (13, "PermissionError"),
+            (17, "FileExistsError"),
+            (110, "TimeoutError"),
+            (5, "OSError"),
+        ] {
+            let e = PalError::from_errno(code);
+            assert_eq!(e.os_code, Some(code), "errno {code}");
+            assert!(e.py_message.starts_with(&format!("[Errno {code}] ")), "errno {code}: {}", e.py_message);
+            assert_eq!(e.py_exc_name(), name, "errno {code}");
+        }
+    }
+
+    #[test]
+    fn timed_out_without_code_maps_to_timeout_error() {
+        assert_eq!(timed_out().py_exc_name(), "TimeoutError");
+    }
 }

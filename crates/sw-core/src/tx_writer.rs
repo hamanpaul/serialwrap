@@ -99,26 +99,26 @@ pub struct Fence(Mutex<FenceState>);
 
 impl Fence {
     pub fn new() -> Arc<Fence> {
-        unimplemented!("slice21 T9 Fence::new")
+        s21_todo!("T9", "Fence::new")
     }
 
     pub fn with<R>(&self, _f: impl FnOnce(&mut FenceState) -> R) -> R {
-        unimplemented!("slice21 T9 Fence::with")
+        s21_todo!("T9", "Fence::with")
     }
 
     pub fn admit(_st: &FenceState, _p: &TxPermit) -> Result<(), FenceReject> {
-        unimplemented!("slice21 T9 Fence::admit")
+        s21_todo!("T9", "Fence::admit")
     }
 
     /// try_lock；鎖被持有時回 `None`（鎖持有斷言用）。
     pub fn try_with<R>(&self, _f: impl FnOnce(&mut FenceState) -> R) -> Option<R> {
-        unimplemented!("slice21 T9 Fence::try_with")
+        s21_todo!("T9", "Fence::try_with")
     }
 }
 
 impl WalHealthSink for Fence {
     fn set_wal_unhealthy(&self, _unhealthy: bool) {
-        unimplemented!("slice21 T9 Fence::set_wal_unhealthy")
+        s21_todo!("T9", "Fence::set_wal_unhealthy")
     }
 }
 
@@ -134,7 +134,7 @@ impl SubmitGate for FenceSubmitGate<'_> {
         &self,
         _os_submit: &mut dyn FnMut() -> SubmitStep,
     ) -> Result<SubmitStep, SubmitRevoked> {
-        unimplemented!("slice21 T9 FenceSubmitGate::submit")
+        s21_todo!("T9", "FenceSubmitGate::submit")
     }
 }
 
@@ -220,11 +220,11 @@ pub struct TxWriterHandle {
 impl TxWriterHandle {
     /// 非阻塞（actor executor 呼叫）：try_send；Full 時回 false 並 settle_dropped+=1。
     pub fn settle(&self, _op_id: OpId) -> bool {
-        unimplemented!("slice21 T9 TxWriterHandle::settle")
+        s21_todo!("T9", "TxWriterHandle::settle")
     }
 
     pub fn ledger_gauge(&self) -> TxLedgerGauge {
-        unimplemented!("slice21 T9 TxWriterHandle::ledger_gauge")
+        s21_todo!("T9", "TxWriterHandle::ledger_gauge")
     }
 }
 
@@ -234,7 +234,7 @@ pub struct TxWriterStop(crossbeam_channel::Sender<()>);
 
 impl TxWriterStop {
     pub fn send(&self) {
-        unimplemented!("slice21 T9 TxWriterStop::send")
+        s21_todo!("T9", "TxWriterStop::send")
     }
 }
 
@@ -252,5 +252,5 @@ pub fn spawn_tx_writer(
     TxWriterStop,
     JoinHandle<(Box<dyn SerialWriter>, TxLedger)>,
 ) {
-    unimplemented!("slice21 T9 spawn_tx_writer")
+    s21_todo!("T9", "spawn_tx_writer")
 }

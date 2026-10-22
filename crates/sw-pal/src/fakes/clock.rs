@@ -32,22 +32,22 @@ impl FakeClock {
 
     /// Slice 2.1（threaded 模式）：建立 mono／wall 皆可控的假時鐘（骨架，Task 1 實作）。
     pub fn at(_mono_ns: u64, _wall_unix_us: i64) -> std::sync::Arc<FakeClock> {
-        unimplemented!("slice21 T1 FakeClock::at")
+        s21_todo!("T1", "FakeClock::at")
     }
 
     /// Slice 2.1：只改 wall 時間，不動 mono（Review Focus 4）。
     pub fn set_wall_us(&self, _wall_unix_us: i64) {
-        unimplemented!("slice21 T1 FakeClock::set_wall_us")
+        s21_todo!("T1", "FakeClock::set_wall_us")
     }
 
     /// Slice 2.1：本地時區偏移（秒）。
     pub fn set_local_offset_s(&self, _s: i32) {
-        unimplemented!("slice21 T1 FakeClock::set_local_offset_s")
+        s21_todo!("T1", "FakeClock::set_local_offset_s")
     }
 
     /// Slice 2.1：每次 `advance` 送一個 `()`（容量 1，滿則略過）。
     pub fn subscribe(&self) -> crossbeam_channel::Receiver<()> {
-        unimplemented!("slice21 T1 FakeClock::subscribe")
+        s21_todo!("T1", "FakeClock::subscribe")
     }
 
     pub fn sleeps_s(&self) -> Vec<f64> {
@@ -61,6 +61,12 @@ impl FakeClock {
 }
 
 impl Clock for FakeClock {
+    fn wall_unix_us(&self) -> i64 {
+        crate::s21_todo!("T0c", "FakeClock::wall_unix_us")
+    }
+    fn local_utc_offset_s(&self) -> i32 {
+        crate::s21_todo!("T0c", "FakeClock::local_utc_offset_s")
+    }
     fn mono_ns(&self) -> u64 {
         self.now_ns.load(Ordering::SeqCst)
     }

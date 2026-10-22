@@ -565,6 +565,7 @@ pub trait WalFs: Send + Sync {
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;  // None = 不存在
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
     fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;
+    fn read_all(&self, path: &Path) -> PalResult<Option<Vec<u8>>>;   // P5 Task 0 修訂（雙審）：讀取整檔；None = 不存在；Task 7 讀取 API 使用，Task 6 conformance 涵蓋
     fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> PalResult<PathBuf>; // DF-03：優先原子 no-replace；不支援時降級；同名加 .1 .2 …
     fn sync_dir(&self, dir: &Path) -> PalResult<()>;
     fn ensure_dir(&self, dir: &Path) -> PalResult<()>;
@@ -609,8 +610,13 @@ pub trait RpcListenerFactory: Send + Sync {
     /// TCP：只允許 LOOPBACK_TCP_HOSTS，否則回錯，訊息逐字照 rpc_win.py
     fn bind(&self, ep: &EndpointSpec, opts: &ListenOptions) -> PalResult<Box<dyn RpcListener>>;
 }
+/// P5 Task 0 修訂（雙審）：server 端連線；P3 `RpcStream` 維持 client 專用。
+pub trait RpcServerStream: Read + Write + Send {
+    fn shutdown_read(&mut self) -> PalResult<()>;
+    fn set_read_timeout(&mut self, d: Option<Duration>) -> PalResult<()>;
+}
 pub trait RpcListener: Send {
-    fn accept(&mut self, timeout: Duration) -> PalResult<Option<Box<dyn RpcStream>>>;  // 有界等待，供 stop 檢查
+    fn accept(&mut self, timeout: Duration) -> PalResult<Option<Box<dyn RpcServerStream>>>;  // 有界等待，供 stop 檢查；P5 Task 0 修訂回傳型別
     fn close(self: Box<Self>);                                                          // Unix：移除 socket 檔
 }
 ```

@@ -5,8 +5,17 @@
 //! P4-T1：`Platform` 為 `ClientPlatform` 的超集（P3 呼叫端不改型別名稱，`ClientPlatform = Platform`、`ClientCaps = Capabilities`）。
 use std::sync::Arc;
 
+/// Slice 2.1 骨架未實作函式的統一 panic（與 `sw_core::s21_todo!` 同格式：`not implemented: slice21 <Task> <symbol>`）。
+#[macro_export]
+macro_rules! s21_todo {
+    ($t:literal, $sym:literal) => {
+        unimplemented!(concat!("slice21 ", $t, " ", $sym))
+    };
+}
+
 pub mod clock;
 pub mod com0com;
+pub mod console_pty;
 #[cfg(feature = "test-fakes")]
 pub mod conformance;
 pub mod device_source;
@@ -14,7 +23,9 @@ pub mod device_watcher;
 #[cfg(feature = "test-fakes")]
 pub mod fakes;
 pub mod fs_ops;
+pub mod lock;
 pub mod osstr;
+pub mod path_norm;
 pub mod proc_scan;
 pub mod process;
 pub mod process_tunnel;
@@ -22,8 +33,10 @@ pub mod rpc_transport;
 pub mod select;
 pub mod serial;
 pub mod service_ctl;
+pub mod signal;
 pub mod sysenv;
 pub mod traits;
+pub mod wal_fs;
 
 #[cfg(feature = "test-fakes")]
 pub use conformance::PeerEnd;
@@ -56,6 +69,13 @@ pub enum ConsoleKind {
     TcpTelnet,
 }
 
+/// 裝置來源後端（arch §4 `Capabilities.native_device`；Task 0 只凍結型別，欄位接線見 Task 5／Task 19）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceBackendKind {
+    Posix,
+    Win,
+}
+
 /// 業務碼唯一可見的平台能力值（arch §2.1：不得比較 OS 名稱）。
 ///
 /// P3 `ClientCaps` 的全部欄位保留；P4-T1 新增 `on_demand_autostart`（SC-18，僅 Windows native 為 true）與 `console_kind`。
@@ -72,6 +92,8 @@ pub struct Capabilities {
     /// SC-18：on-demand 首次需求是否允許自動拉起（僅 Windows native 為 true）。
     pub on_demand_autostart: bool,
     pub console_kind: ConsoleKind,
+    /// 裝置來源後端（arch §4 `Capabilities.native_device`；Task 5 的 `devices` 工廠與 Task 19 組裝點讀取）。
+    pub native_device: DeviceBackendKind,
 }
 
 /// P3 名稱保留（`ClientCaps` 為 `Capabilities` 的別名）。
@@ -90,7 +112,31 @@ pub struct Platform {
     pub registry: Arc<dyn RegistryView + Sync>,
     /// 序列埠後端（arch §4.2）：POSIX 為 `PosixSerialBackend`，Windows 為 Task 3 骨架。
     pub serial: Arc<dyn SerialBackend>,
+    /// holder 診斷（arch §4.2；`/proc` 掃描或 Windows 的 `holder_unknown`）。
+    pub uart_excl: Arc<dyn UartExclusive>,
+    /// 裝置來源工廠（arch §4.3；Task 5 實作，Task 19 呼叫）。
+    pub devices: DeviceFactory,
+    /// 實例鎖工廠（arch §4.4；Task 4）。
+    pub instance_lock: Arc<dyn InstanceLockFactory>,
+    /// WAL 檔案層（arch §4.5；Task 6）。
+    pub wal_fs: Arc<dyn WalFs>,
+    /// RPC listener 工廠（arch §4.6；Task 17）。
+    pub rpc_listen: Arc<dyn RpcListenerFactory>,
+    /// human console 承接工廠（arch §4.7；Task 2 的 POSIX `create_pty`）。
+    pub console: Arc<dyn ConsoleTransportFactory>,
+    /// 停止訊號等待（arch §4.9；Task 4）。
+    pub signals: Arc<dyn SignalWait>,
     pub caps: Capabilities,
+}
+
+/// 裝置來源工廠的型別（arch §4.3 `Platform.devices`）。
+pub type DeviceFactory = Box<dyn Fn(DeviceSelection) -> Box<dyn DeviceSource> + Send + Sync>;
+
+/// 裝置來源工廠的骨架（Task 5 交付；本 Phase 骨架回傳未實作的工廠）。
+pub fn native_devices() -> DeviceFactory {
+    Box::new(|_sel: DeviceSelection| -> Box<dyn DeviceSource> {
+        s21_todo!("T5", "native_devices")
+    })
 }
 
 /// P3 名稱保留（`ClientPlatform` 為 `Platform` 的別名）。
@@ -127,6 +173,13 @@ pub fn native() -> Platform {
             tunnel: Arc::new(NativeProcessTunnel),
             registry: Arc::new(NullRegistryView),
             serial: Arc::new(crate::serial::posix::PosixSerialBackend::new()),
+            uart_excl: Arc::new(crate::serial::posix::PosixUartExclusive),
+            devices: native_devices(),
+            instance_lock: crate::lock::native_instance_lock(),
+            wal_fs: Arc::new(crate::wal_fs::NativeWalFs),
+            rpc_listen: Arc::new(crate::rpc_transport::NativeRpcListenerFactory),
+            console: Arc::new(crate::console_pty::NativeConsoleFactory),
+            signals: Arc::new(crate::signal::NativeSignalWait),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Posix,
                 af_unix: true,
@@ -136,6 +189,7 @@ pub fn native() -> Platform {
                 exec_replace: true,
                 on_demand_autostart: false,
                 console_kind: ConsoleKind::Pty,
+                native_device: DeviceBackendKind::Posix,
             },
         }
     }
@@ -169,6 +223,13 @@ pub fn native() -> Platform {
             tunnel: Arc::new(NativeProcessTunnel),
             registry: Arc::new(WinRegistryView),
             serial: Arc::new(crate::serial::WindowsSerialStub),
+            uart_excl: Arc::new(crate::serial::WindowsUartExclusive),
+            devices: native_devices(),
+            instance_lock: crate::lock::native_instance_lock(),
+            wal_fs: Arc::new(crate::wal_fs::NativeWalFs),
+            rpc_listen: Arc::new(crate::rpc_transport::NativeRpcListenerFactory),
+            console: Arc::new(crate::console_pty::NativeConsoleFactory),
+            signals: Arc::new(crate::signal::NativeSignalWait),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Windows,
                 af_unix: false,
@@ -178,6 +239,7 @@ pub fn native() -> Platform {
                 exec_replace: false,
                 on_demand_autostart: true,
                 console_kind: ConsoleKind::TcpTelnet,
+                native_device: DeviceBackendKind::Win,
             },
         }
     }

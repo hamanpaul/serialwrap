@@ -55,6 +55,12 @@ impl sw_pal::FsRead for DummyFs {
 
 struct DummyClock;
 impl sw_pal::Clock for DummyClock {
+    fn wall_unix_us(&self) -> i64 {
+        sw_pal::s21_todo!("T0c", "DummyClock::wall_unix_us")
+    }
+    fn local_utc_offset_s(&self) -> i32 {
+        sw_pal::s21_todo!("T0c", "DummyClock::local_utc_offset_s")
+    }
     fn mono_ns(&self) -> u64 { 0 }
     fn sleep(&self, _: std::time::Duration) {}
 }
@@ -82,6 +88,7 @@ fn skill_default_windows_outputs_skill_windows() {
         exec_replace: false,
         on_demand_autostart: true,
         console_kind: sw_pal::ConsoleKind::TcpTelnet,
+        native_device: sw_pal::DeviceBackendKind::Win,
     };
     let p = sw_pal::ClientPlatform {
         env: std::sync::Arc::new(DummySysEnv),
@@ -94,6 +101,13 @@ fn skill_default_windows_outputs_skill_windows() {
         service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
         registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
         serial: sw_pal::fakes::serial::FakeSerialBackend::new(),
+        uart_excl: std::sync::Arc::new(sw_pal::fakes::serial::FakeUartExclusive { report: Default::default() }),
+        devices: sw_pal::fakes::platform::unconfigured_devices(),
+        instance_lock: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("instance_lock")),
+        wal_fs: sw_pal::fakes::wal_fs::FakeWalFs::new(),
+        rpc_listen: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("rpc_listen")),
+        console: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("console")),
+        signals: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("signals")),
         caps,
     };
     let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs(std::iter::empty());

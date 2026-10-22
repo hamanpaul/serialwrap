@@ -30,13 +30,13 @@ impl PosixSerialBackend {
     /// test-fakes only：TIOCEXCL 成功後立即回傳注入的錯誤（模擬 termios／eventfd 失敗）。
     #[cfg(feature = "test-fakes")]
     pub fn with_post_excl_fault(err: PalError) -> Self {
-        unimplemented!("slice21 T2 PosixSerialBackend::with_post_excl_fault")
+        s21_todo!("T2", "PosixSerialBackend::with_post_excl_fault")
     }
 
     /// test-fakes only：替換鎖後重掃所用的 holder 掃描（僅供需預持 fd 的測試情境，正式路徑不得使用）。
     #[cfg(feature = "test-fakes")]
     pub fn with_uart_exclusive(excl: Arc<dyn UartExclusive>) -> Self {
-        unimplemented!("slice21 T2 PosixSerialBackend::with_uart_exclusive")
+        s21_todo!("T2", "PosixSerialBackend::with_uart_exclusive")
     }
 }
 
@@ -46,7 +46,7 @@ impl SerialBackend for PosixSerialBackend {
         dev: &DevicePath,
         cfg: &SerialConfig,
     ) -> Result<Box<dyn SerialHandle>, OpenError> {
-        unimplemented!("slice21 T2 PosixSerialBackend::open_exclusive")
+        s21_todo!("T2", "PosixSerialBackend::open_exclusive")
     }
 }
 
@@ -62,7 +62,7 @@ impl UartExclusive for PosixUartExclusive {
 /// 掃描 `proc_root/<pid>/fd/*`，排除自身 pid；readlink 等於 `path` 的 fd 其 pid 收入 `pids`（升冪）。
 /// `proc_root` 不可列 → `{pids:[], holder_unknown:true, status:Unknown}`；任一 fd 目錄 EACCES → `status:Permission`（保留已收集的 pids）。
 pub fn probe_holders_in(proc_root: &Path, path: &str) -> HolderReport {
-    unimplemented!("slice21 T2 probe_holders_in")
+    s21_todo!("T2", "probe_holders_in")
 }
 
 /// 鎖後重掃的判定（規格 §6.2；P1 T10 凍結規則）。
@@ -75,23 +75,23 @@ pub enum PostLockVerdict {
 
 /// 依 `pids` 與 `status` 判定鎖後重掃結果：`pids` 非空即 Reject（不論 status）。
 pub fn post_lock_holder_verdict(rep: &HolderReport) -> PostLockVerdict {
-    unimplemented!("slice21 T2 post_lock_holder_verdict")
+    s21_todo!("T2", "post_lock_holder_verdict")
 }
 
 /// P1 T10 凍結規則：`holder_unknown` 只由 `pids` 是否為空決定，`status` 只作診斷。
 pub fn finalize_holder_report(rep: HolderReport) -> HolderReport {
-    unimplemented!("slice21 T2 finalize_holder_report")
+    s21_todo!("T2", "finalize_holder_report")
 }
 
 /// 由 `SerialConfig` 建出 termios：`c_iflag=c_oflag=c_lflag=0`、`c_cflag` 覆寫為
 /// `CREAD|CLOCAL|CSx[|PARENB[|PARODD]][|CSTOPB][|CRTSCTS]`，`c_cc` 不動（arch §4.2）。
 pub fn build_termios(input: libc::termios, cfg: &SerialConfig) -> libc::termios {
-    unimplemented!("slice21 T2 build_termios")
+    s21_todo!("T2", "build_termios")
 }
 
 /// 未知 baud 回退 `B115200`（UIO-12.1 KEEP）。
 pub fn speed_for_baud(baud: u32) -> libc::speed_t {
-    unimplemented!("slice21 T2 speed_for_baud")
+    s21_todo!("T2", "speed_for_baud")
 }
 
 /// `set_baud` 的 termios 存取抽象（測試以錄製替身取代 libc）。
@@ -102,7 +102,7 @@ pub trait TtyTermiosOps {
 
 /// 依 baud 設定速率；未知 baud 規則見 `unknown_baud_falls_back_115200` 單元測試。
 pub fn set_baud_with(ops: &mut dyn TtyTermiosOps, baud: u32) -> PalResult<()> {
-    unimplemented!("slice21 T2 set_baud_with")
+    s21_todo!("T2", "set_baud_with")
 }
 
 /// `CloseToken::close` 的系統呼叫序列（記錄順序即為 `CloseOp` 順序）。
@@ -131,7 +131,7 @@ pub trait TtyCloseOps {
 /// 關閉序純邏輯核心：`Nxcl` 回 `EIO`／`ENXIO`／`ENODEV` 視為已解除（`excl_cleared=true`、不警告）；
 /// 其他 errno 照序繼續關閉、`excl_cleared=false`、`error` 為該 errno、警告一筆；`has_wake=false` 時略過 wake fd 兩步。
 pub fn close_sequence(ops: &mut dyn TtyCloseOps, dev: &str, has_wake: bool) -> CloseReceipt {
-    unimplemented!("slice21 T2 close_sequence")
+    s21_todo!("T2", "close_sequence")
 }
 
 /// 開啟序的 OS 操作抽象（arch §4.2；`open_sequence` 的純邏輯核心）。
@@ -165,7 +165,7 @@ pub trait TtyOpenOps {
 /// 開啟序純邏輯核心：步驟順序為 open → flock → TIOCEXCL → 鎖後重掃 → termios；
 /// TIOCEXCL 之後的任何失敗必先 TIOCNXCL 再 close(fd)，TIOCEXCL 之前的失敗不得出現 TIOCNXCL。
 pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenError> {
-    unimplemented!("slice21 T2 open_sequence")
+    s21_todo!("T2", "open_sequence")
 }
 
 #[cfg(test)]

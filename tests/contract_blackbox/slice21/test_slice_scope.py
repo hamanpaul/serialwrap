@@ -1,7 +1,8 @@
-"""Slice 2.1 範圍清單（黑箱）：延後 method 一律回 METHOD_NOT_FOUND 且無副作用。
+"""Slice 2.1 範圍清單（黑箱）：延後與未支援 method 一律回 METHOD_NOT_FOUND 且無副作用。
 
 僅在 `SERIALWRAP_AB_LABEL` 以 `rust-s21` 開頭（Rust Slice 2.1 輪）時執行；Python 基線 skip。
-deferred method 清單取自 `tests/acceptance/slice21_scope.yaml`（Task 0 凍結）。
+deferred method 清單取自 `tests/acceptance/slice21_scope.yaml`（Task 0 凍結）；
+P5 Task 0 雙審修正：同時涵蓋 `unsupported_catalog_methods`（`daemon.handoff_stop`，P8-T14 靠它讓更新與回滾 fail-closed）。
 """
 import os
 from pathlib import Path
@@ -21,8 +22,10 @@ def test_deferred_methods(shell_daemon):
     import yaml
 
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
-    methods = [row["method"] for row in scope["deferred_methods"]]
-    assert len(methods) == 15
+    deferred = [row["method"] for row in scope["deferred_methods"]]
+    assert len(deferred) == 15
+    unsupported = [row["method"] for row in scope["unsupported_catalog_methods"]]
+    methods = deferred + unsupported
     seq0 = shell_daemon.sw("wal", "current-seq")["seq"]
     for method in methods:
         r = shell_daemon.rpc(method, {})

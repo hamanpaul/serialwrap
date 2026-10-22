@@ -23,22 +23,22 @@ pub struct FakeDeviceScript {
 
 impl FakeDeviceSource {
     pub fn new(_initial: Vec<(String, DeviceInfo)>) -> (FakeDeviceSource, FakeDeviceScript) {
-        todo!("slice21 T1 FakeDeviceSource::new 尚未實作")
+        s21_todo!("T1", "FakeDeviceSource::new")
     }
 }
 
 impl FakeDeviceScript {
     pub fn set(&self, _snapshot: Vec<(String, DeviceInfo)>) {
-        todo!("slice21 T1 FakeDeviceScript::set 尚未實作")
+        s21_todo!("T1", "FakeDeviceScript::set")
     }
 
     pub fn fail_next(&self, _err: PalError) {
-        todo!("slice21 T1 FakeDeviceScript::fail_next 尚未實作")
+        s21_todo!("T1", "FakeDeviceScript::fail_next")
     }
 }
 
 impl DeviceSource for FakeDeviceSource {
     fn scan(&mut self) -> PalResult<Vec<(String, DeviceInfo)>> {
-        todo!("slice21 T1 FakeDeviceSource::scan 尚未實作")
+        s21_todo!("T1", "FakeDeviceSource::scan")
     }
 }

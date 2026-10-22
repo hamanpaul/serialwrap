@@ -844,7 +844,7 @@ pub struct PyErr {
 impl PyErr {
     /// Python `ValueError(msg)`。
     pub fn value_error(_msg: &str) -> PyErr {
-        unimplemented!("slice21 T0c PyErr::value_error")
+        crate::s21_todo!("T0c", "PyErr::value_error")
     }
 }
 
@@ -852,4 +852,84 @@ impl std::fmt::Display for PyErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2.1 Task 0c 符號（上游補齊；Task 0 只凍結簽章，本體由 Task 0c 實作）。
+// ---------------------------------------------------------------------------
+
+/// `shlex.split` 失敗（引號未閉合等）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShlexError {
+    pub message: String,
+}
+
+/// RPC 參數的 bool 強制轉換（Python 真值語意；`"yes"`、`"0"`、`0`、`null`）。
+pub fn coerce_rpc_bool(_v: &crate::pyjson::PyValue) -> bool {
+    crate::s21_todo!("T0c", "coerce_rpc_bool")
+}
+
+/// Python 3 `round(x, ndigits)`（banker's rounding）。
+pub fn py_round(_x: f64, _ndigits: i32) -> f64 {
+    crate::s21_todo!("T0c", "py_round")
+}
+
+/// `datetime.now(timezone.utc).isoformat()`（微秒；`.000000` 省略）。
+pub fn iso_utc_now(_unix_us: i64) -> String {
+    crate::s21_todo!("T0c", "iso_utc_now")
+}
+
+/// `time.strftime(fmt, time.gmtime(...))`。
+pub fn strftime_utc(_unix_us: i64, _fmt: &str) -> String {
+    crate::s21_todo!("T0c", "strftime_utc")
+}
+
+/// `time.strftime(fmt, time.localtime(...))`（`offset_s` 為本地 UTC offset）。
+pub fn strftime_local(_unix_us: i64, _offset_s: i32, _fmt: &str) -> String {
+    crate::s21_todo!("T0c", "strftime_local")
+}
+
+/// `uuid.uuid4().hex`（隨機來源由呼叫端注入）。
+pub fn uuid4_hex(_rng: &mut dyn FnMut(&mut [u8])) -> String {
+    crate::s21_todo!("T0c", "uuid4_hex")
+}
+
+/// `str(uuid.uuid4())`（含連字號）。
+pub fn uuid4_dashed(_rng: &mut dyn FnMut(&mut [u8])) -> String {
+    crate::s21_todo!("T0c", "uuid4_dashed")
+}
+
+/// WAL mirror 的可列印化規則。
+pub fn to_printable(_s: &str) -> String {
+    crate::s21_todo!("T0c", "to_printable")
+}
+
+/// console 文字清理（`clean_text`，Python 基線）。
+pub fn clean_text(_s: &str) -> String {
+    crate::s21_todo!("T0c", "clean_text")
+}
+
+/// 移除 ANSI escape 序列（Python 基線 regex 語意）。
+pub fn strip_ansi(_s: &str) -> String {
+    crate::s21_todo!("T0c", "strip_ansi")
+}
+
+/// `binascii.a2b_base64` 非 strict 版本（忽略非法字元）。
+pub fn a2b_base64_lenient(_s: &[u8]) -> Vec<u8> {
+    crate::s21_todo!("T0c", "a2b_base64_lenient")
+}
+
+/// `base64.b64encode(...).decode()`。
+pub fn b2a_base64(_b: &[u8]) -> String {
+    crate::s21_todo!("T0c", "b2a_base64")
+}
+
+/// `shlex.quote`（09 §4.3 逐字）。
+pub fn shlex_quote(_s: &str) -> String {
+    crate::s21_todo!("T0c", "shlex_quote")
+}
+
+/// `shlex.split`（POSIX 模式）。
+pub fn shlex_split(_s: &str) -> Result<Vec<String>, ShlexError> {
+    crate::s21_todo!("T0c", "shlex_split")
 }

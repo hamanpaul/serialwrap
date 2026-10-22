@@ -79,7 +79,7 @@
 | P1-OC | `02b-stage0-owner-confirmations.md`（OD-14）：Python A 側基線已實作 SC-34（attach／recover 回 `SESSION_NOT_READY`＋頂層 `last_error`／`last_error_detail`）、SC-35（passthrough 30 s 安靜轉 READY 與命令路徑、`PASSTHROUGH_READY_QUIET_S`）、SC-04 修訂（release drain 逾時 `DRAIN_STALLED`）、SC-08 撤回（socket 維持 `0o660` 基線）；OD-14 確認簿記（DF-02、SC-26、SC-27 `confirmed`、`pending_owner_confirmations: []`）；P1-OC 重新擷取的 `contracts/golden/rpc/*.json` 為本 Phase 比對基準 |
 | P2 | `tests/acceptance/{cases.yaml, cases.schema.json, cases.lock.json, regen_lock.py}`（P2 Task 12；欄位 `case_id`、`daemon_slice`、`necessity`、`prerequisites`、`invariants`、`behavior_changes`、`cross_slice_reason`；`lock["sets"]["slice_2.1"]`＝`necessity=="required"` 且 `daemon_slice ≤ 2.1`）；`func-test/runner.py`（`--mode pty|bridge|both`、`--dut-mode`、`--report-dir`、`--selftest-report`、`--scenarios`；`--case` 為**單值**，每次一個 case）與其 bridge／scenario 動作集合（`op_begin`／`op_end`、`bridge_control`（`pause_pump`／`resume_pump`／`transport_disconnect`／`transport_reconnect`）、`dut_control`（`emit`／`pause_responding`／`logical_reboot`）、`wait_wire_marker`、`assert_zero_tx`、`assert_wire_contiguous`、`assert_compare`、`wal_control`（`unlink_current`／`hold_reader`／`reset`）、`assert_wal_meta`、`assert_wal_marker`、`assert_command_resolved`，加上既有 `cli`／`wait_state`／`target_emit`）；DUT plan（`delay_reply`、`half_prompt`、`silent`、`stop_stdin`、`flood`）；`func-test/scenarios/l15-*.yaml`（§15.7.1 情境 11 筆，其中 `daemon_slice=2.1` 者 8 筆）；`func-test/lib/daemon_harness.py::{resolve_cli_exe, resolve_daemon_argv}`（只供 func-test）；bridge 資格報告 `selftest-report.json`（`uart-stdio-bridge selftest`） |
 | P3 | `tests/ab_env.py::AB_ENV`（root conftest pop 之前擷取 `SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE`／`SERIALWRAP_AB_LABEL`）；`tests/contract_blackbox/bb_harness.py::{repo_root, ab_label, is_rust, cli_prefix, daemon_prefix, isolated_env(tmp, **overrides), run_cli, CliResult, NL}`、`bb_faketarget.FakeTarget(workdir, *, prompt, user, password)`（`.start(by_id_dir, name) -> Path`、`.rx_log() -> bytes`、`.stop()`；只模擬 `login:`／`Password:`／`echo X`／`^C`）、`bb_daemon.PyDaemon`、`bin/py-serialwrapd`；`sw_proto::{constants, error_codes::ErrorCode, session_last_errors::SessionLastError, pyjson::{PyValue, PyInt, PyDict, DumpOpts, Sep, loads, dumps, CLI_STDOUT, RPC_WIRE, RPC_EARLY, DISK_STABLE}, pydict!}`；`sw_proto::pycompat::{py_int_parse, py_float_parse, py_strip, py_bytes_strip, splitlines, universal_newlines, decode_utf8_replace, decode_utf8_strict, py_len_chars, py_truthy, PyOsError, sha256_hex}`、`sw_proto::pyfmt::{py_str, py_repr_str, py_repr_float}`；`sw_proto::pyre::{compile, PyFlags, PyRegex, valid_completion_regex}`；`sw_proto::config_types::{load_profiles(dir: &str, fs: &dyn ProfileFs), ProfileFs, LoadResult{profiles, templates, max_sessions}, ProfileTemplate, SessionProfile{com, act_no, alias, device_by_id, template}, UartProfile, RuntimeConfig{data}::{from_text, mode, socket_path}}`；`sw_proto::rpc_types::Method`；`sw_proto::runtime_paths::{RuntimePaths（String 欄位：config_dir, state_dir, run_dir, data_dir, lock_path, socket_path, default_tcp_port, default_endpoint, profile_dir, wal_dir, log_dir, config_yaml）::resolve, EnvSnapshot, NativeTraits, PathsError, resolve_config_path}`；`sw_proto::endpoint::{Endpoint{Unix(String), Tcp{host, port}}, parse_endpoint(&str) -> Result<Endpoint, EndpointError>, is_loopback_tcp}`；`sw_proto::version::{version, version_line}`；`sw_pal::traits::{PalError{kind, os_code, winerror, strerror, py_message}, PalErrorKind, SysEnv, Clock{mono_ns, sleep}, EndpointSpec{Unix(OsString), Tcp}, RpcConnector, RpcStream{send_all, recv}}`；`scripts/rust/check_cfg_boundary.py`、`scripts/rust/win-test.sh`、`scripts/rust/win-runner.sh`、`scripts/rust/win-blackbox.ps1`、`scripts/rust/mkbundle.sh` |
-| P4 | `sw_pal::FsOps: FsRead`（`atomic_write(p, data, mode: Option<u32>)`、`write_file`、`mkdirs`、`replace`、`remove_file`、`sync_dir`、`set_mode`、`file_lock_exclusive`）；`sw_pal::ProcScan::{serialwrapd_instances() -> PalResult<Vec<DaemonProc>>, serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus), pid_alive}（`HolderScanStatus` 由 P4 05 Task 1 依 arch §4.2 定義，本 Phase 沿用）`；`ProcessCtl`；`sw_proto::config_types::RuntimeConfig::{set_mode, set_socket(&mut self, &str), to_yaml}`；`sw_pal::native() -> Platform`；`crates/sw-daemon/src/launcher.rs`（`components.daemon.implementation` 判斷） |
+| P4 | `sw_pal::FsOps: FsRead`（`atomic_write(p, data, mode: Option<u32>)`、`write_file`、`mkdirs`、`replace`、`remove_file`、`sync_dir`、`set_mode`、`file_lock_exclusive`）；`sw_pal::ProcScan::{serialwrapd_instances() -> Result<Vec<DaemonProc>, ScanFailure>（P4 實際簽章，P5 Task 0 雙審修正）, serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus), pid_alive}（`HolderScanStatus` 由 P4 05 Task 1 依 arch §4.2 定義，本 Phase 沿用）`；`ProcessCtl`；`sw_proto::config_types::RuntimeConfig::{set_mode, set_socket(&mut self, &str), to_yaml}`；`sw_pal::native() -> Platform`；`crates/sw-daemon/src/launcher.rs`（`components.daemon.implementation` 判斷） |
 | 本 Phase 補齊（Task 0c；上游未交付者） | `sw_proto::pycompat::{PyErr{message}::value_error, coerce_rpc_bool, py_round, iso_utc_now(us), strftime_utc(us, fmt), strftime_local(us, offset_s, fmt), uuid4_hex(rng), uuid4_dashed(rng), to_printable, clean_text, strip_ansi, a2b_base64_lenient, b2a_base64, shlex_quote, shlex_split(&str) -> Result<Vec<String>, ShlexError>}`（Python 產生 golden：`contracts/golden/pycompat_s21.tsv`；`contracts/golden/pycompat.tsv` 屬 P3 04 Task 4，不覆寫；`shlex_quote`／`b2a_base64` 供 P8 09 Task 3，`shlex_split` 供 P6 07 Task 3）；`sw_proto::rpc_types::Params<'a>::{str_or, int_or, float_or, truthy, raw, selector_chain}`；`sw_proto::config_types::RuntimeConfig::{windows_exclude_coms(&self) -> Vec<String>, windows_test_device_allowlist(&self) -> Result<Option<Vec<String>>, ()>}`；`sw_proto::runtime_paths::{DaemonDirs{by_id_dir, by_path_dir, events_dir, events_runtime_dir}, resolve_daemon_dirs(env: &EnvSnapshot) -> DaemonDirs}`；`sw_pal::traits::Clock` 擴充 `wall_unix_us(&self) -> i64`、`local_utc_offset_s(&self) -> i32`（native 與既有 fake 一併實作）；`sw_pal::traits::RpcServerStream: Read + Write + Send { shutdown_read, set_read_timeout }`（server 端；P3 `RpcStream{send_all, recv}` 維持 client 專用，arch §4.6 同步修訂）；`sw_proto::wal_types::crc32_hex(&[u8]) -> String`（`crc32fast` 只留在 sw-proto，arch §1.2） |
 
 Task 0 的 `crates/sw-core/tests/slice21_prereqs.rs` 與 `tests/test_slice21_prereqs.py` 對**上表每一個符號**各寫一行 `use`／`import`（比照 07 計畫 Task 1 的逐項 grep），缺任一項即編譯／collection 失敗；P3／P4 列缺漏屬上游缺陷，停止並回報，不在本 Phase 自行補；「本 Phase 補齊」列由 Task 0c 交付後才轉綠。
@@ -164,6 +164,8 @@ Task 0 的 `crates/sw-core/tests/slice21_prereqs.rs` 與 `tests/test_slice21_pre
 - Create: `crates/sw-daemon/src/{daemon_main.rs,framing.rs,service.rs,health.rs}`
 - Modify: `crates/sw-pal/src/traits.rs`（加入本 Phase 型別）、`crates/sw-pal/src/lib.rs`、`crates/sw-pal/Cargo.toml`（feature `test-fakes`）、`crates/sw-core/src/lib.rs`、`crates/sw-core/Cargo.toml`、`crates/sw-daemon/src/main.rs`、`crates/sw-daemon/Cargo.toml`
 - Test: `crates/sw-core/tests/slice21_prereqs.rs`
+- Test（P5 Task 0 雙審修正補列）：`tests/test_slice21_skeleton_guards.py`（untracked，新增）、`crates/sw-pal/tests/fakes_selftest.rs`（未設定原生元件 panic 自測）、`crates/sw-daemon/tests/launcher.rs`（`manifest_absent` 四案）、`tests/contract_blackbox/slice21/test_slice_scope.py`（§10.4 測試資產變更：延後＋未支援 method 同形狀，需獨立審閱）
+- Modify（P5 Task 0 雙審修正補列）：`Cargo.lock`（骨架依賴；`scripts/rust/check_dep_direction.py` 的 `cargo metadata --locked` 需要）、`crates/sw-pal/src/clock/{posix.rs,windows.rs}`（`wall_unix_us`／`local_utc_offset_s` 必實作，T0c）、`crates/sw-pal/src/fakes/{platform.rs,mod.rs}`（五個原生元件改 `Unconfigured` 占位，builder 加 setter）、`crates/sw-proto/src/constants.rs`（`CMD_PENDING_MAX`、`DEFAULT_WAL_ROTATE_BYTES`、`CMD_HISTORY_MAX`、`PASSTHROUGH_READY_QUIET_S`）、`crates/sw-daemon/src/launcher.rs`（`LauncherError::DevBuildNoManifest`；`manifest_absent` 僅此變體為開發 build；分派判定計畫原列於 Task 19，本 Task 先行）、`crates/sw-cli/tests/{event_add_document,event_cmd,event_params,profile_checks,skill_cmd}.rs`（測試組裝點改用 `Unconfigured`；`DummyClock` 補 T0c 本體）、`docs/rust-refactor/plans/rust-architecture.md`（§4.5 補 `WalFs::read_all`；§4.6 補 `RpcServerStream` 與 `RpcListener::accept -> Box<dyn RpcServerStream>`）、`docs/rust-refactor/plans/07-slice22-console.md` 第 156 行 `CoreDeps` 副本（與本計畫 Task 11 Produces 同步）
 
 **Interfaces:**
 - Consumes：§0.3 全部。
@@ -445,17 +447,28 @@ early_evidence_cases:                  # cases.lock 屬較晚切片、本 Phase 
 
 Rust 骨架：依**本計畫 Task 0～19（含 0c、12b）各自 Interfaces 的 Produces 區塊**與 §0.3「本 Phase 補齊」列建立所有檔案、型別、trait 與函式簽章（含 Task 11 的 `ControlEvent`／`DataEvent`／`Effect`，讓 Task 10 等先於 Task 11 的紅燈測試可以編譯；含 Task 0c 的 `PyErr`、`Params`、`Clock::wall_unix_us` 等，讓骨架本身可編譯）；函式本體 `s21_todo!("T<該型別所屬 Task 編號>", "<Type>::<fn>")`（0c 的符號用 `"T0c"`）。`crates/sw-pal/Cargo.toml` 加 `[features] test-fakes = []`；`crates/sw-core/Cargo.toml`、`crates/sw-daemon/Cargo.toml` 的 dev-dependencies 以 `sw-pal = { path = "../sw-pal", features = ["test-fakes"] }` 啟用 fakes，並宣告 `[features] test-fakes = ["sw-pal/test-fakes"]`。`crates/sw-core/src/lib.rs` 宣告全部模組與 `SLICE`、`Mono`、`s21_todo!`。
 
+- P5 Task 0 雙審修正（Step 3 補充，已實作）：
+  - `PalError::{from_errno, cancelled, not_found, invalid, py_exc_name}` 於 Task 0 實作為純建構子（不做 I/O；`from_errno` 沿用 `posix_errno`／`windows_crt_error`），以 `pal_error_ctor_tests` 單元測試覆蓋；Task 1 與 Task 7 不再依賴 T2 stub。
+  - `Clock::{wall_unix_us, local_utc_offset_s}` 無預設實作，所有 `impl Clock`（NativeClock、FakeClock、`Unconfigured`、sw-cli 測試 dummy）以 `s21_todo!("T0c", …)` 明確覆寫。`local_utc_offset_s` 依本計畫 Produces 簽章為 `(&self) -> i32`；arch §4.1 寫為 `(&self, unix_s: i64) -> i32`，兩者不一致，待 Task 0c 裁定（Task 0 未擅自改 arch §4.1）。
+  - 替身組裝點（`fakes::platform::platform()`、`fakes::fake_platform()`）的 `devices`、`instance_lock`、`rpc_listen`、`console`、`signals` 一律以 `Unconfigured` 占位（呼叫即 panic `fake component not configured: <name>`），不得接原生 PAL 元件；`fakes_selftest.rs::unconfigured_native_components_panic_not_real_os` 守此條。
+  - `sw_proto::constants` 補 `CMD_HISTORY_MAX`（sw-core `resources` 改 `pub use`）與 `PASSTHROUGH_READY_QUIET_S = 30.0`（arch §5.12）；`prereq_symbols_exist` 斷言兩者。
+  - `tests/test_slice21_skeleton_guards.py`：`resource_limits.yaml` 的 20 列與 Rust 鏡像雙向完全相同（`cmd_pending_max` 納入）；`.write(…cancel…)` 守衛改整檔比對（容許 rustfmt 換行與 `cancel_token` 類變數名），並以自我測試確認樣式有效。
+  - `manifest_absent`（launcher 分派判定，Task 19 前先行）：僅「`current-release.json` 不存在且版本 manifest 讀取為 NotFound」為開發 build（`LauncherError::DevBuildNoManifest`）；指標存在但目標缺失、manifest 不可讀、realpath 失敗一律 fail-closed（exit 2）。
+- **待擁有者裁決（開工前，未解）**：`contracts/resource_limits.yaml` 的 `rx_rate_window_entries` 標 `owner_decision: NC-P5-01`（overflow `merge_oldest` 與 Python 基線「丟棄最舊」衝突；反例見該列）。裁決前不得作為 Task 10／20 A/B 比對基準；§5.3 凍結測試因此維持 skip（INSUFFICIENT_EVIDENCE）。
+
 - [ ] **Step 4：執行並確認 PASS**
 
-Run：`python3 -m pytest -q tests/test_slice21_scope.py tests/test_slice21_prereqs.py && cargo test -p sw-core --test slice21_prereqs && cargo build --workspace --features test-fakes && python3 scripts/rust/check_cfg_boundary.py`
-Expected：全部 PASS（`test_slice21_scope.py` 6 項、`test_slice21_prereqs.py` 全部 import 與檔案存在檢查）；`check_cfg_boundary.py` exit 0。
+Run：`python3 -m pytest -q tests/test_slice21_scope.py tests/test_slice21_prereqs.py tests/test_slice21_skeleton_guards.py tests/test_resource_markers.py && cargo test -p sw-core --test slice21_prereqs && cargo build --workspace --features test-fakes && python3 scripts/rust/check_cfg_boundary.py`（P5 Task 0 雙審修正：補入標記稽核與骨架守衛；`test_resource_markers.py` 為既有 pytest 標記稽核，新增測試檔必須通過它）
+Expected：PASS（`test_slice21_scope.py` 的範圍與資源契約測試、`test_slice21_prereqs.py` 全部 import 與檔案存在檢查、`test_slice21_skeleton_guards.py`）；`test_event_latency_contract_frozen_before_slice_start` 在 §5.3 獨立審閱紀錄與 NC-P5-01 裁決前為 **skip（INSUFFICIENT_EVIDENCE）**，不計為 PASS；`check_cfg_boundary.py` exit 0。
 
 - [ ] **Step 5：Commit**
 
 ```bash
-git add tests/acceptance/slice21_scope.yaml contracts/resource_limits.yaml tests/test_slice21_scope.py tests/test_slice21_prereqs.py crates changelog.d/rust-s21-skeleton.md
+git add tests/acceptance/slice21_scope.yaml contracts/resource_limits.yaml tests/test_slice21_scope.py tests/test_slice21_prereqs.py tests/test_slice21_skeleton_guards.py tests/contract_blackbox/slice21/test_slice_scope.py Cargo.lock crates changelog.d/rust-s21-skeleton.md docs/rust-refactor/plans/rust-architecture.md
 git commit -m "chore(rust): 建立 Slice 2.1 範圍清單、資源上限契約與 crate 骨架" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+P5 Task 0 雙審修正（staging）：`crates` 僅限本 Task 0 骨架與修正檔（其他 Task 的中途實作由 orchestrator 依 per-task staging 分開處理）。`docs/rust-refactor/plans/00-master-plan.md`、`08-slice23-login-events.md`、`spec-reconciliation.md` 的文字修訂，以及 `07-slice22-console.md` 中 CoreDeps 以外的修改，不屬 Task 0，應另行提交或併入 Task 0b。
 
 ---
 
@@ -2640,7 +2653,9 @@ pub enum Effect {
 pub struct Effects(pub Vec<Effect>);
 pub struct OpGrant { pub op_id: OpId, pub epoch: u64, pub owner_gen: u64, pub fsm_gen: u64, pub cmd_id: Option<String> }
 pub struct CoreDeps { pub fence: Arc<Fence>, pub registry: Arc<CommandRegistry>, pub wal: Arc<WalWriter>, pub rx: Arc<RxShared>,
-    pub epochs: Arc<EpochAllocator>, pub wall_iso: Arc<dyn Fn() -> String + Send + Sync>, pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync> }
+    pub epochs: Arc<EpochAllocator>, pub wall_iso: Arc<dyn Fn() -> String + Send + Sync>, pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync>,
+    pub env: Arc<dyn SysEnv>, pub read_env_file: Arc<dyn Fn(&str) -> Option<std::io::Result<String>> + Send + Sync> }
+    // P5 Task 0 雙審修正（補記，07 計畫副本同步）：env／read_env_file 供 Task 13 `resolve_session_auth(p, env, read)`（本計畫 Task 13 Interfaces）於 attach／recover 時讀取；`read_env_file` 回 None＝檔案不存在。
 pub struct PublicCtx { pub console_count: i128, pub vtty: Option<String>, pub console_endpoint: Option<Option<String>> }
 pub struct SessionCore { /* 欄位見本 Task Step 3 第一點（05 §1.6 SessionRuntime 對應＋queue／foreground／stop／quiet／leases／queue_registered） */ }
 impl SessionCore {
@@ -3960,7 +3975,7 @@ git commit -m "feat(sw-daemon): RPC listener 與 Python 相容 framing" -m "Co-a
 - Test: `crates/sw-daemon/tests/dispatch.rs`
 
 **Interfaces:**
-- Consumes：Task 16 `SessionManager`（含 `route_interactive`）；Task 7 `WalWriter`；Task 8 `CommandRegistry`；P4 `ProcScan::{serialwrapd_instances() -> PalResult<Vec<DaemonProc>>, serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus)}`（02 §7.1 的 `foreign_holders` 為 path→pids 對照時，對 `attached_real_paths()` 逐一呼叫組出；掃描失敗形狀見 Step 3）；`sw_proto::rpc_types::Params`、`sw_proto::pycompat::coerce_rpc_bool`（Task 0c）；`sw_core::mcu_patterns::McuPatternRegistry`（本 Task 實作 `default()` 與 `to_rpc_rows()`，06 §9.9）。
+- Consumes：Task 16 `SessionManager`（含 `route_interactive`）；Task 7 `WalWriter`；Task 8 `CommandRegistry`；P4 `ProcScan::{serialwrapd_instances() -> Result<Vec<DaemonProc>, ScanFailure>, serialwrapd_tty_holders(&[PathBuf]) -> (Vec<u32>, HolderScanStatus)}`（02 §7.1 的 `foreign_holders` 為 path→pids 對照時，對 `attached_real_paths()` 逐一呼叫組出；掃描失敗形狀見 Step 3）；`sw_proto::rpc_types::Params`、`sw_proto::pycompat::coerce_rpc_bool`（Task 0c）；`sw_core::mcu_patterns::McuPatternRegistry`（本 Task 實作 `default()` 與 `to_rpc_rows()`，06 §9.9）。
 - Produces：
 
 ```rust
@@ -4492,6 +4507,8 @@ git commit -m "test(contract): Slice 2.1 黑箱案例並修正 Rust daemon 差�
 
 **BLOCKED-OWNER：** 實機 A/B（§15.9.2）。
 
+**§5.3 開工前凍結檢查（P5 Task 0 雙審修正，gate 開頭執行）：** `contracts/resource_limits.yaml` 的 `event_latency` 必須 `freeze_status: frozen`，且 `reviewed_by`（≠ `owner`）、`reviewed_at`、`review_conclusion` 皆已附入；`limits` 內無 `owner_decision.status: pending_owner_decision` 列（NC-P5-01）。任一不成立即拒絕開跑，回報 INSUFFICIENT_EVIDENCE，不得以 skip 或 PASS 代替。
+
 **Files:**
 - Create: `func-test/scenarios/{s21-wire-equals-wal,s21-quiet-zero-tx,s21-partial-tx-abort,s21-release-attach-handoff,s21-exclusive-conflict,s21-exclusive-conflict-plain-open,s21-credentials-unresolved,s21-wal-unlink-under-traffic,s21-reboot-minimal-guard,s21-event-latency}.yaml`（P2 scenario YAML 格式，`meta.scenario.revision`、`invariants`、`behavior_changes` 必填）
 - Create: `tests/acceptance/l15/test_slice21_l15.py`
@@ -4593,6 +4610,8 @@ git commit -m "test(l15): Slice 2.1 bridge 回歸、安全情境與事件延遲�
 **Test author model:** haiku-xhigh　**Implementer model:** agy-gemini-3.8-flash-high
 **Changelog fragment:** `changelog.d/rust-s21-gate.md`（front matter `type: feat`、`scope: rust-s21`；本文：「新增 Slice 2.1 出口 gate 腳本與報告 schema：彙整 Linux／Windows 原生 L1、黑箱 A/B、L1.5 與 policy 結果，並把需擁有者執行的證據明列為 BLOCKED-OWNER、不得標 PASS。」）
 **BLOCKED-OWNER：** 本 Task 彙整全 Phase 的 BLOCKED-OWNER（見 §結尾總表），自身新增：(1) `scripts/rust/slice21_gate.sh --with-com-pair` 的完整執行——OD-15 起在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21` 由 orchestrator 代跑（可執行 gate，非 BLOCKED-OWNER；`com.status` 須為實際 PASS／FAIL，`EVIDENCE_MISSING` 只在 host 不可用時允許）；(2) Spike 3（第三方 EDR 開啟時的 WAL 寫入／rotate／unlink／外部 reader）以 Rust `WalFs` 重跑並與 Stage 0 Python 結果並列。
+
+**§5.3 開工前凍結檢查（P5 Task 0 雙審修正，gate 開頭執行）：** `contracts/resource_limits.yaml` 的 `event_latency` 必須 `freeze_status: frozen`，且 `reviewed_by`（≠ `owner`）、`reviewed_at`、`review_conclusion` 皆已附入；`limits` 內無 `owner_decision.status: pending_owner_decision` 列（NC-P5-01）。任一不成立即拒絕開跑，回報 INSUFFICIENT_EVIDENCE，不得以 skip 或 PASS 代替。
 
 **Files:**
 - Create: `scripts/rust/slice21_gate.sh`、`scripts/rust/slice21_gate_judge.py`、`tests/acceptance/slice21_gate_report.schema.json`、`tests/acceptance/slice21_gate_expect.yaml`、`tests/acceptance/slice21_bo.yaml`（BO 清單＋`case_ids`，與本計畫結尾總表同序）、`tests/test_slice21_gate_report.py`、`tests/test_slice21_gate_judge.py`、`tests/contract_blackbox/slice21/test_windows_nocom.py`、`docs/rust-refactor/slice21-owner-runbook.md`、`crates/sw-core/examples/wal_s1w.rs`（規格 §1.2 WAL 指標的 Rust 量測器：以 P1 T19 `scripts/stage0/wal_microbench.py` 凍結的 S1-W 資料混合與取樣口徑驅動 Task 7 `WalWriter`＋Task 6 原生 `WalFs`，輸出單筆寫入 p50／p95／p99 與每次 rotate 停頓；只量測、不改 WAL 行為）

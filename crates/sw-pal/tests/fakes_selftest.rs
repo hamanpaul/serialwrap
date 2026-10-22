@@ -50,6 +50,65 @@ fn fake_platform_unconfigured_component_panics_not_real_os() {
     assert!(r.is_err());
 }
 
+/// 收集 panic 訊息（無 panic 回 `None`）。
+fn panic_text(f: impl FnOnce()) -> Option<String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .err()
+        .map(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        })
+}
+
+/// P5 Task 0 雙審修正：原生 PAL 元件不得出現在替身組裝點；未設定即 panic 並帶元件名稱。
+#[test]
+fn unconfigured_native_components_panic_not_real_os() {
+    use sw_pal::console_pty::ConsoleTransportFactory;
+    use sw_pal::lock::InstanceLockFactory;
+    use sw_pal::traits::{DeviceSelection, EndpointSpec, ListenOptions, RpcListenerFactory, SignalWait};
+
+    let pf = platform().build();
+    let sel = DeviceSelection {
+        by_id_dir: std::path::PathBuf::from("/nonexistent/by-id"),
+        by_path_dir: std::path::PathBuf::from("/nonexistent/by-path"),
+        exclude_coms: Vec::new(),
+        test_allowlist: None,
+    };
+    let ep = EndpointSpec::Unix(std::ffi::OsString::from("/nonexistent/serialwrapd.sock"));
+    let opts = ListenOptions {
+        mode: 0o660,
+        group: None,
+        ensure_dir_mode: None,
+    };
+    let cases: [(&str, Option<String>); 5] = [
+        ("devices", panic_text(|| {
+            let _ = (pf.devices)(sel);
+        })),
+        ("instance_lock", panic_text(|| {
+            let _ = pf.instance_lock.acquire(Path::new("/nonexistent/lock"), &ep);
+        })),
+        ("rpc_listen", panic_text(|| {
+            let _ = pf.rpc_listen.bind(&ep, &opts);
+        })),
+        ("console", panic_text(|| {
+            let _ = pf.console.create_pty();
+        })),
+        ("signals", panic_text(|| {
+            let _ = pf.signals.install();
+        })),
+    ];
+    for (name, msg) in cases {
+        let msg = msg.unwrap_or_else(|| panic!("{name} 未 panic：可能走到原生實作"));
+        assert!(
+            msg.contains(&format!("fake component not configured: {name}")),
+            "{name}: {msg}"
+        );
+    }
+}
+
 #[test]
 fn p3_alias_still_compiles() {
     let _: fn() -> sw_pal::ClientPlatform = sw_pal::native_client;

@@ -12,12 +12,15 @@ path = "src/main.rs"
 
 [features]
 # 測試替身與 in-process 測試掛鉤（P5-T19）：只供 `run_with_hooks`／`DaemonHooks`／`TraceEvent` 與測試使用，產品碼不讀任何測試 env。
-test-fakes = ["sw-pal/test-fakes"]
+# 同時啟用 sw-core 的 test-fakes：`run_with_hooks` 經 `StateStore::spawn_with_hooks` 傳入 commit hook（Task 19）。
+test-fakes = ["sw-pal/test-fakes", "sw-core/test-fakes"]
 
 [dependencies]
 sw-core = { path = "../sw-core" }
 sw-proto = { path = "../sw-proto" }
 sw-pal = { path = "../sw-pal" }
+# Slice 2.1（framing／ServiceHandler 的停止通道，arch §6.2、§6.3）。
+crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 sw-pal = { path = "../sw-pal", features = ["test-fakes"] }

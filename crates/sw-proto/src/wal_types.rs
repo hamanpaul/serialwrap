@@ -99,3 +99,8 @@ pub fn wal_recreated_meta(
         ("range_known".into(), PyValue::Bool(known.is_some())),
     ])
 }
+
+/// WAL 列的 CRC32（小寫 8 位十六進位；Task 0c，arch §1.2）。
+pub fn crc32_hex(_bytes: &[u8]) -> String {
+    crate::s21_todo!("T0c", "crc32_hex")
+}

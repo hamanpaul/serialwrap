@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sw_daemon::launcher::{launcher_argv, LauncherError};
+use sw_daemon::launcher::{launcher_argv, manifest_absent, LauncherError};
+use std::sync::Arc;
+use sw_pal::fakes::{platform, FakeSysEnv, MemFs};
+use sw_pal::traits::{PalError, SysEnv};
 use sw_pal::proc_scan::{is_serialwrapd_argv, ArgvFlavor};
 use sw_pal::BackendKind;
 use sw_proto::release_manifest::parse_manifest;
@@ -491,4 +494,90 @@ fn cap_windows_native__launcher_gui_subsystem() {
         "無 console 啟動時子行程 GetConsoleWindow() 必須為 NULL；stderr={:?}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ---- P5 Task 0 雙審修正：manifest_absent 分派判定（只有「指標不存在＋版本 manifest NotFound」為開發 build）。----
+
+/// 暫存 bundle 根目錄下建立真實存在的假 exe（`realpath` 走真實 canonicalize），回傳 (暫存目錄, 規範化 exe 路徑, 注入的 SysEnv)。
+fn dispatch_fixture(tag: &str) -> (TempTree, PathBuf, Arc<dyn SysEnv>) {
+    let root = TempTree::new(tag);
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("建立 bin 目錄");
+    let exe = bin.join("serialwrapd");
+    std::fs::write(&exe, b"").expect("建立假 exe");
+    let canonical_exe = std::fs::canonicalize(&exe).expect("規範化假 exe");
+    let env: Arc<dyn SysEnv> = FakeSysEnv::builder().current_exe(&canonical_exe).build();
+    (root, canonical_exe, env)
+}
+
+/// 以 MemFs 作為檔案層的組裝點（只有 env 與 fs 參與 `manifest_absent`）。
+fn dispatch_platform(env: Arc<dyn SysEnv>, fs: MemFs) -> sw_pal::Platform {
+    platform().env(env).fs(Arc::new(fs)).build()
+}
+
+/// `exe` 為 `<root>/bin/serialwrapd`，回傳 `<root>`（已規範化）。
+fn bundle_root_of(exe: &Path) -> PathBuf {
+    exe.parent()
+        .and_then(Path::parent)
+        .expect("bundle 根目錄")
+        .to_path_buf()
+}
+
+#[test]
+fn manifest_absent_true_only_for_dev_build_without_pointer_or_manifest() {
+    let (_root, exe, env) = dispatch_fixture("dispatch-dev");
+    let p = dispatch_platform(env, MemFs::default());
+    assert!(
+        manifest_absent(&p),
+        "指標與版本 manifest 皆不存在應為開發 build：{}",
+        exe.display()
+    );
+}
+
+#[test]
+fn manifest_absent_false_when_pointer_exists_but_target_missing() {
+    let (_root, exe, env) = dispatch_fixture("dispatch-dangling");
+    let fs = MemFs::default();
+    let bin = exe.parent().expect("bin 目錄");
+    fs.files.lock().unwrap().insert(
+        bin.join("current-release.json"),
+        Ok(br#"{"bundle_version":"0.4.0","dir":"versions/0.4.0"}"#.to_vec()),
+    );
+    let p = dispatch_platform(env, fs);
+    assert!(
+        !manifest_absent(&p),
+        "指標存在但目標 manifest 缺失必須 fail-closed（交 launcher exit 2）"
+    );
+}
+
+#[test]
+fn manifest_absent_false_when_manifest_unreadable() {
+    let (_root, exe, env) = dispatch_fixture("dispatch-eacces");
+    let fs = MemFs::default();
+    fs.files.lock().unwrap().insert(
+        bundle_root_of(&exe).join("release-manifest.json"),
+        Err(PalError::io(13, "[Errno 13] Permission denied")),
+    );
+    let p = dispatch_platform(env, fs);
+    assert!(
+        !manifest_absent(&p),
+        "manifest 不可讀（EACCES）不得被當成開發 build"
+    );
+}
+
+#[test]
+fn manifest_absent_false_when_manifest_present_for_python_and_rust() {
+    for implementation in ["python", "rust"] {
+        let (_root, exe, env) = dispatch_fixture(&format!("dispatch-{implementation}"));
+        let fs = MemFs::default();
+        fs.files.lock().unwrap().insert(
+            bundle_root_of(&exe).join("release-manifest.json"),
+            Ok(manifest_text(implementation, &["py/bin/python3"]).into_bytes()),
+        );
+        let p = dispatch_platform(env, fs);
+        assert!(
+            !manifest_absent(&p),
+            "manifest 存在（implementation={implementation}）須維持 launcher 路徑"
+        );
+    }
 }

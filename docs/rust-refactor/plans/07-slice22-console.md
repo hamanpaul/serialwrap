@@ -154,7 +154,8 @@ pub enum Effect { Reply(Reply, Result<PyDict, PyErr>), OpenBridge{..}, BeginDrai
     Schedule { at: Mono, ev: TimerEvent }, WalMeta{..}, Persist{..}, Notify(ManagerNote), Warn(String) }
 pub struct Effects(pub Vec<Effect>);
 pub struct CoreDeps { pub fence: Arc<Fence>, pub registry: Arc<CommandRegistry>, pub wal: Arc<WalWriter>, pub rx: Arc<RxShared>,
-                      pub epochs: Arc<EpochAllocator>, pub wall_iso: Arc<dyn Fn() -> String + Send + Sync>, pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync> }
+                      pub epochs: Arc<EpochAllocator>, pub wall_iso: Arc<dyn Fn() -> String + Send + Sync>, pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync>,
+                      pub env: Arc<dyn SysEnv>, pub read_env_file: Arc<dyn Fn(&str) -> Option<std::io::Result<String>> + Send + Sync> }   /* P5 Task 0 雙審修正：與 06 Task 11 Produces 同步 */
 pub struct PublicCtx { pub console_count: i128, pub vtty: Option<String>, pub console_endpoint: Option<Option<String>> }
 impl SessionCore { pub fn new(..) -> SessionCore; pub fn on_event(&mut self, ev: MailboxItem, now: Mono) -> Effects;
                    pub fn public(&self, now: Mono, ctx: &PublicCtx) -> PyDict; pub fn state(&self) -> SessionState; pub fn generations(&self) -> &Generations;

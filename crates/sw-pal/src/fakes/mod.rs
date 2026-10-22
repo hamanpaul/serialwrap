@@ -68,6 +68,15 @@ pub fn fake_platform(
         service: service::FakeServiceCtl::new(Vec::new()),
         registry: registry::FakeRegistry::new(Vec::new(), &[]),
         serial: serial::FakeSerialBackend::new(),
+        uart_excl: Arc::new(serial::FakeUartExclusive {
+            report: Default::default(),
+        }),
+        devices: platform::unconfigured_devices(),
+        instance_lock: Arc::new(platform::Unconfigured("instance_lock")),
+        wal_fs: wal_fs::FakeWalFs::new(),
+        rpc_listen: Arc::new(platform::Unconfigured("rpc_listen")),
+        console: Arc::new(platform::Unconfigured("console")),
+        signals: Arc::new(platform::Unconfigured("signals")),
         caps: platform::posix_caps(),
     };
     (platform, connector, clock)

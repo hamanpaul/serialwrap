@@ -22,11 +22,11 @@ impl DeviceWatcher {
         _tx: Sender<WatcherEvent>,
         _clock: Arc<dyn Clock>,
     ) -> WatcherHandle {
-        todo!("slice21 T5 DeviceWatcher::start 尚未實作")
+        s21_todo!("T5", "DeviceWatcher::start")
     }
 
     pub fn initial_scan(_src: &mut dyn DeviceSource) -> PalResult<Vec<(String, DeviceInfo)>> {
-        todo!("slice21 T5 DeviceWatcher::initial_scan 尚未實作")
+        s21_todo!("T5", "DeviceWatcher::initial_scan")
     }
 
     /// 差異演算法照 07 §1.4：`added` 先 sorted(cur−prev)、`changed` 的 cur 接在後；`removed` 先 sorted(prev−cur)、`changed` 的 prev 接在後。
@@ -34,12 +34,12 @@ impl DeviceWatcher {
         _prev: &[(String, DeviceInfo)],
         _cur: &[(String, DeviceInfo)],
     ) -> (Vec<DeviceInfo>, Vec<DeviceInfo>) {
-        todo!("slice21 T5 DeviceWatcher::diff 尚未實作")
+        s21_todo!("T5", "DeviceWatcher::diff")
     }
 }
 
 impl WatcherHandle {
     pub fn stop(self) {
-        todo!("slice21 T5 WatcherHandle::stop 尚未實作")
+        s21_todo!("T5", "WatcherHandle::stop")
     }
 }

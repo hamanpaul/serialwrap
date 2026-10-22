@@ -288,12 +288,14 @@ dependencies = [
  "indexmap",
  "sw-pal",
  "sw-proto",
+ "tempfile",
 ]
 
 [[package]]
 name = "sw-daemon"
 version = "0.3.2"
 dependencies = [
+ "crossbeam-channel",
  "sw-core",
  "sw-pal",
  "sw-proto",

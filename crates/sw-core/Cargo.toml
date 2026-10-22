@@ -13,6 +13,12 @@ sw-pal = { path = "../sw-pal" }
 crossbeam-channel = { workspace = true }
 indexmap = { workspace = true }
 
+[dev-dependencies]
+# 測試以 fakes 驅動 sans-IO 核心（Task 0 骨架，arch §9.1）。
+sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
+# 暫存目錄（Task 15 的 state.json 測試；workspace 釘版）。
+tempfile = { workspace = true }
+
 [features]
 # 記憶體替身（arch §4）；僅供測試，不得在產品路徑啟用。
 test-fakes = ["sw-pal/test-fakes"]

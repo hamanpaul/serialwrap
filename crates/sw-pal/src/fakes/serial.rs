@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::traits::{DevicePath, OpenError, PalError, SerialBackend, SerialConfig, SerialHandle};
-use crate::traits::{CancelToken, SubmitGate, TxResult};
+use crate::traits::{CancelToken, HolderReport, SubmitGate, TxResult, UartExclusive};
 
 /// 寫入腳本（依序消耗；耗盡後恢復 `Accept(全部)`）。
 #[derive(Debug, Clone)]
@@ -50,6 +50,7 @@ pub(crate) struct FakeDeviceInner {
     removed: AtomicBool,
 }
 
+#[allow(dead_code)] // Task 1 實作前尚未被讀取。
 impl FakeDeviceInner {
     fn new() -> Self {
         Self {
@@ -70,6 +71,7 @@ impl FakeDeviceInner {
 
 /// 記憶體序列埠後端：以路徑鍵控的虛擬裝置表。
 pub struct FakeSerialBackend {
+    #[allow(dead_code)] // Task 1 實作前尚未被讀取。
     devices: Mutex<HashMap<String, Arc<FakeDeviceInner>>>,
 }
 
@@ -81,22 +83,22 @@ impl FakeSerialBackend {
     }
 
     pub fn add_device(&self, _path: &str) -> FakeDevice {
-        unimplemented!("slice21 T1 FakeSerialBackend::add_device")
+        s21_todo!("T1", "FakeSerialBackend::add_device")
     }
 
     /// 下次 `open_exclusive` → `Held(HolderReport{pids, holder_unknown: pids.is_empty()})`。
     pub fn hold_externally(&self, _path: &str, _pids: Vec<u32>) {
-        unimplemented!("slice21 T1 FakeSerialBackend::hold_externally")
+        s21_todo!("T1", "FakeSerialBackend::hold_externally")
     }
 
     /// → `AccessDenied{holder: pids [] / holder_unknown true / Unsupported}`。
     pub fn deny_access(&self, _path: &str) {
-        unimplemented!("slice21 T1 FakeSerialBackend::deny_access")
+        s21_todo!("T1", "FakeSerialBackend::deny_access")
     }
 
     /// → 之後 open 回 `NotFound`；已開 handle 的 read 回 `Err(kind=Io, "[Errno 5] Input/output error")`。
     pub fn remove_device(&self, _path: &str) {
-        unimplemented!("slice21 T1 FakeSerialBackend::remove_device")
+        s21_todo!("T1", "FakeSerialBackend::remove_device")
     }
 }
 
@@ -106,80 +108,81 @@ impl SerialBackend for FakeSerialBackend {
         _dev: &DevicePath,
         _cfg: &SerialConfig,
     ) -> Result<Box<dyn SerialHandle>, OpenError> {
-        unimplemented!("slice21 T1 FakeSerialBackend::open_exclusive")
+        s21_todo!("T1", "FakeSerialBackend::open_exclusive")
     }
 }
 
 /// 單一虛擬裝置的操作面（與 `FakeSerialBackend` 共享狀態）。
 #[derive(Clone)]
 pub struct FakeDevice {
+    #[allow(dead_code)] // Task 1 實作前尚未被讀取。
     inner: Arc<FakeDeviceInner>,
 }
 
 impl FakeDevice {
     /// 注入 RX bytes（reader 可讀）。
     pub fn push_rx(&self, _bytes: &[u8]) {
-        unimplemented!("slice21 T1 FakeDevice::push_rx")
+        s21_todo!("T1", "FakeDevice::push_rx")
     }
 
     /// 只含已「確認寫出」的 bytes；讀後清空。
     pub fn take_tx(&self) -> Vec<u8> {
-        unimplemented!("slice21 T1 FakeDevice::take_tx")
+        s21_todo!("T1", "FakeDevice::take_tx")
     }
 
     /// 依序消耗寫入腳本；耗盡後恢復 `Accept(全部)`。
     pub fn script_write(&self, _steps: Vec<FakeWriteStep>) {
-        unimplemented!("slice21 T1 FakeDevice::script_write")
+        s21_todo!("T1", "FakeDevice::script_write")
     }
 
     pub fn release_block(&self) {
-        unimplemented!("slice21 T1 FakeDevice::release_block")
+        s21_todo!("T1", "FakeDevice::release_block")
     }
 
     /// 之後 `close` 回 `closed:false, excl_cleared:false, error:Some(err)`。
     pub fn fail_close(&self, _err: PalError) {
-        unimplemented!("slice21 T1 FakeDevice::fail_close")
+        s21_todo!("T1", "FakeDevice::fail_close")
     }
 
     pub fn open_count(&self) -> usize {
-        unimplemented!("slice21 T1 FakeDevice::open_count")
+        s21_todo!("T1", "FakeDevice::open_count")
     }
 
     pub fn close_count(&self) -> usize {
-        unimplemented!("slice21 T1 FakeDevice::close_count")
+        s21_todo!("T1", "FakeDevice::close_count")
     }
 
     pub fn is_open(&self) -> bool {
-        unimplemented!("slice21 T1 FakeDevice::is_open")
+        s21_todo!("T1", "FakeDevice::is_open")
     }
 
     /// `write_gated`／`write` 被呼叫的次數（TxWriter 出列快速拒絕的零 TX 斷言用）。
     pub fn write_calls(&self) -> usize {
-        unimplemented!("slice21 T1 FakeDevice::write_calls")
+        s21_todo!("T1", "FakeDevice::write_calls")
     }
 
     /// `os_submit` 閉包實際執行（bytes 交給假 OS）的次數；gate 撤銷不計。
     pub fn os_submits(&self) -> usize {
-        unimplemented!("slice21 T1 FakeDevice::os_submits")
+        s21_todo!("T1", "FakeDevice::os_submits")
     }
 
     /// 每次 `os_submit` 閉包內（持 Fence 鎖時）呼叫；鎖持有斷言用。
     pub fn on_os_submit(&self, _hook: Box<dyn Fn() + Send + Sync>) {
-        unimplemented!("slice21 T1 FakeDevice::on_os_submit")
+        s21_todo!("T1", "FakeDevice::on_os_submit")
     }
 
     /// 等 writer 抵達 `Pause*`／`AcceptThenWouldBlock` 的暫停點。
     pub fn wait_paused(&self, _timeout: Duration) -> bool {
-        unimplemented!("slice21 T1 FakeDevice::wait_paused")
+        s21_todo!("T1", "FakeDevice::wait_paused")
     }
 
     pub fn release_pause(&self) {
-        unimplemented!("slice21 T1 FakeDevice::release_pause")
+        s21_todo!("T1", "FakeDevice::release_pause")
     }
 
     /// 已確認 TX 累積緩衝出現 `trigger` 時推一次 `reply`。
     pub fn on_tx_reply(&self, _trigger: &[u8], _reply: &[u8]) {
-        unimplemented!("slice21 T1 FakeDevice::on_tx_reply")
+        s21_todo!("T1", "FakeDevice::on_tx_reply")
     }
 
     /// `pattern` 對每個已確認 TX 行比對；`reply` 取得命中的行（random nonce probe 用）。
@@ -189,7 +192,18 @@ impl FakeDevice {
         _pattern: &str,
         _reply: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>,
     ) {
-        unimplemented!("slice21 T1 FakeDevice::on_tx_match")
+        s21_todo!("T1", "FakeDevice::on_tx_match")
+    }
+}
+
+/// 替身的 `UartExclusive`（Task 1 Produces）：`report` 由測試預先注入，`probe_holders` 回傳對應報告。
+pub struct FakeUartExclusive {
+    pub report: Mutex<HashMap<String, HolderReport>>,
+}
+
+impl UartExclusive for FakeUartExclusive {
+    fn probe_holders(&self, _real_path: &str) -> HolderReport {
+        s21_todo!("T1", "FakeUartExclusive::probe_holders")
     }
 }
 

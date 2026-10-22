@@ -93,3 +93,14 @@ pub const ENV_COLUMNS: &str = "COLUMNS";
 pub const METAVAR_ENDPOINT: &str = "ENDPOINT";
 /// `--bench` 的 argparse metavar（`cli.py` 的 `metavar="CODE"`）。
 pub const METAVAR_CODE: &str = "CODE";
+
+// Slice 2.1 P5-T0 補記（上游 P3-T7 漏列；數值照 `rust-architecture.md` §3.1 與 `sw_core/constants.py`）：
+/// 每 session 進行中（accepted／running）命令的硬上限（`sw_core/constants.py::CMD_PENDING_MAX`，SC-06）。
+pub const CMD_PENDING_MAX: usize = 256;
+/// WAL rotate 門檻（位元組；`sw_core/constants.py::DEFAULT_WAL_ROTATE_BYTES = 64 * 1024 * 1024`，條件 `size >= R`）。
+pub const DEFAULT_WAL_ROTATE_BYTES: u64 = 67_108_864;
+/// 命令 history 上限（`sw_core/constants.py::CMD_HISTORY_MAX`；淘汰最舊已完成者，arch §5.10）。
+/// Task 8 Consumes 自本模組；sw-core `resources` 以 `pub use` 再匯出，不另定義。
+pub const CMD_HISTORY_MAX: usize = 512;
+/// passthrough 安靜升 READY 的安靜秒數（`sw_core/constants.py::PASSTHROUGH_READY_QUIET_S`，SC-35；arch §5.12）。
+pub const PASSTHROUGH_READY_QUIET_S: f64 = 30.0;

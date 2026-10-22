@@ -2,4 +2,7 @@
 //! P5-T19：新增 `daemon_main`（daemon 本體組裝、有序關機、exit code）。
 
 pub mod daemon_main;
+pub mod framing;
+pub mod health;
 pub mod launcher;
+pub mod service;

@@ -1,0 +1,48 @@
+# Slice 2.1 有界資源上限與事件延遲契約（P5 Task 0，計畫 06 Task 0；依 rust-architecture.md §5.10 與規格 §5.4）。
+# 數值改動等同改契約：須同步更新 tests/test_slice21_scope.py::test_resource_limits_contract_values 並重新審閱。
+schema_version: 1
+limits:
+  - {name: mailbox_control, value: 256, unit: messages, overflow: block_sender, source: "arch §5.10 control lane；RPC 送端逾時回 timeout"}
+  - {name: mailbox_data_chunks, value: 1024, unit: chunks, overflow: block_sender, source: "arch §5.10 data lane"}
+  - {name: mailbox_data_chunk_bytes, value: 8192, unit: bytes, overflow: reject, source: "arch §5.2／§5.10；reader 依此切分，超過則拒絕"}
+  - {name: mailbox_stash_max, value: 16, unit: messages, overflow: block_sender, source: "arch §5.2 stash"}
+  - {name: tx_writer_jobs, value: 64, unit: jobs, overflow: block_sender, source: "arch §5.10 TxWriter job queue；OpRunner 阻塞"}
+  - {name: cmd_pending_max, value: 256, unit: commands, overflow: reject, source: "arch §5.10 arbiter pending；SESSION_QUEUE_FULL（SC-06）"}
+  - {name: cmd_history_max, value: 512, unit: records, overflow: evict_oldest_done, source: "arch §5.10 history"}
+  - {name: bg_capture_max_count, value: 64, unit: captures, overflow: evict_oldest_done, source: "arch §5.10 BackgroundCapture 數量"}
+  - {name: bg_capture_max_chars, value: 4194304, unit: chars, overflow: truncate_head, source: "arch §5.10 BackgroundCapture 字元上限（每筆）"}
+  - {name: rx_window_max_chars, value: 131072, unit: chars, overflow: truncate_head, source: "arch §5.10 RxWindow；_rx_trimmed 累計"}
+  # NC-P5-01（P5 Task 0 雙審修正）：overflow 與 Python 基線（丟棄最舊）衝突，尚未由擁有者裁決；裁決前不得視為凍結、不得作為 Task 10／20 A/B 比對基準。
+  - {name: rx_rate_window_entries, value: 4096, unit: entries, overflow: merge_oldest, source: "arch §5.10 RX 速率視窗；合併最舊兩筆、保留 bytes 總和（flood 下不低估 RX_FLOOD 判定）", python_baseline_deviation: "NC-P5-01（spec-reconciliation §7，待擁有者裁決登記類別）", owner_decision: {id: NC-P5-01, status: pending_owner_decision, python_baseline: "丟棄最舊（collections.deque(maxlen=4096)）", counterexample: "10 s 內先收 3 筆 8192 B，再收 4096 筆 1 B：Python 統計 4096 B；merge_oldest 統計 28672 B（RX_FLOOD 判定不一致）"}}
+  - {name: deferred_input_max_bytes, value: 262144, unit: bytes, overflow: clear_all, source: "arch §5.10 DeferredBuffer（BC-02）；整段清空並 WARNING"}
+  - {name: rpc_connections, value: 128, unit: connections, overflow: pause_accept, source: "arch §5.10 RPC 連線上限"}
+  - {name: rpc_request_line_bytes, value: 65536, unit: bytes, overflow: close_connection, source: "arch §5.10 RPC 請求行（RPC-H-02）"}
+  - {name: interactive_tombstones, value: 16, unit: entries, overflow: drop_oldest, source: "arch §5.10 interactive tombstone；每 session FIFO"}
+  - {name: drain_timeout_ms, value: 3000, unit: ms, overflow: timeout, source: "arch §5.2.5 Two-Phase Drain；SC-04"}
+  - {name: tx_ledger_live_ops, value: 256, unit: ops, overflow: reject_new_and_drain, source: "arch §5.7／§5.10：新 op 不提交、送 UartIoError{reason:TX_LEDGER_SATURATED}；不淘汰在途項目（R1-F8）"}
+  - {name: tx_ledger_unresolved_gaps, value: 256, unit: gaps, overflow: merge_oldest, source: "arch §5.7／§5.10：合併為 GapOverflow{gaps, bytes, first_op, last_op}（R1-F8）"}
+  - {name: tx_op_wal_gaps, value: 16, unit: gaps, overflow: merge_oldest, source: "arch §5.7／§5.10：單一 op 缺口合併（R1-F8）"}
+  - {name: tx_settle_queue, value: 256, unit: entries, overflow: retain_entry, source: "arch §5.10：try_send 滿時該 op 留在帳本，settle_dropped 計數（R1-F8）"}
+
+# §5.3 事件延遲契約：開工前凍結。owner 與 reviewed_by 必須不同。
+event_latency:
+  method_revision: "2026-10-15.1"
+  owner: codex-gpt-6-luna-max          # PAL／Actor 實作負責人
+  # 獨立審閱紀錄（P5 Task 0 雙審修正）：尚未附入。Task 0 測試作者不得自填為審閱者（前版誤填 agy-gemini-3.8-flash-high，已清除）。
+  reviewed_by: null                    # 獨立審閱者姓名（附入時填）
+  reviewed_at: null                    # 審閱日期 YYYY-MM-DD（附入時填）
+  review_conclusion: null              # 審閱結論（附入時填，例如 approved）
+  # 凍結狀態：pending_review_record。附入上列三欄（且 reviewed_by != owner）並消除 NC-P5-01 後，才改 freeze_status: frozen。
+  # 未凍結時 tests/test_slice21_scope.py 的凍結測試 skip 並標 INSUFFICIENT_EVIDENCE；Task 21／22 gate 開頭同樣拒絕開跑。
+  freeze_status: pending_review_record
+  repeats: 3
+  samples_per_run: 500
+  gate_rule: every_run_max_le_max_ms   # 每輪樣本最大值都 ≤ 上限才通過；p99 只作診斷值，不作判定
+  flood_load: {bytes_per_s: 20000, seconds: 30, chunk_bytes: 256}   # = 規格門檻 20000 B／10 s 的 10 倍
+  host_load: "量測期間記錄 /proc/loadavg 與 CPU 數；loadavg 1min > CPU 數時該輪作廢重跑"
+  events:
+    - {event: stop_request, accept_point: "daemon.stop 回應 stopping:true 寫出", complete_point: "actor 收到 Shutdown 並送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
+    - {event: command_cancel, accept_point: "command.cancel RPC 收到", complete_point: "在途命令的 CancelToken::cancel 被呼叫", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
+    - {event: lease_expiry, accept_point: "lease 期限到達（mono）", complete_point: "lease 移入 tombstone", max_ms_idle: 1100, max_ms_flood: 1200, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
+    - {event: drain_receipt, accept_point: "finisher 送出 WorkerStopped", complete_point: "actor 處理該 receipt 完成", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
+    - {event: release_request, accept_point: "device.release RPC 收到", complete_point: "actor 送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}

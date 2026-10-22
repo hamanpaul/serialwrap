@@ -360,3 +360,17 @@ pub fn resolve_config_path(
     }
     paths.config_yaml.clone()
 }
+
+/// daemon 目錄集合（Task 0c；依 `EnvSnapshot` 解析，arch §3.x／規格 §3.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonDirs {
+    pub by_id_dir: String,
+    pub by_path_dir: String,
+    pub events_dir: String,
+    pub events_runtime_dir: String,
+}
+
+/// 解析 daemon 目錄（Task 0c）。
+pub fn resolve_daemon_dirs(_env: &EnvSnapshot) -> DaemonDirs {
+    crate::s21_todo!("T0c", "resolve_daemon_dirs")
+}

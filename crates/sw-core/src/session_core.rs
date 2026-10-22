@@ -119,9 +119,9 @@ pub struct CoreDeps {
     pub epochs: Arc<EpochAllocator>,
     pub wall_iso: Arc<dyn Fn() -> String + Send + Sync>,
     pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync>,
-    /// 帳密解析用 env（T13 增補：`resolve_session_auth` 於 attach／recover 時重新讀取）。
+    /// 帳密解析用 env（P5 Task 0 雙審修正：計畫 Task 11 Produces 補記；供 Task 13 `resolve_session_auth(p, env, read)` 於 attach／recover 時重新讀取）。
     pub env: Arc<dyn SysEnv>,
-    /// 帳密解析用 env 檔讀取（T13 增補；`None`＝檔案不存在，`Some(Err)`＝不可讀）。
+    /// 帳密解析用 env 檔讀取（P5 Task 0 雙審修正：計畫 Task 11 Produces 補記；`None`＝檔案不存在，`Some(Err)`＝不可讀）。
     pub read_env_file: Arc<dyn Fn(&str) -> Option<std::io::Result<String>> + Send + Sync>,
 }
 
@@ -176,5 +176,22 @@ impl SessionCore {
     #[cfg(feature = "test-fakes")]
     pub fn arm_panic_on_next_event(&mut self) {
         s21_todo!("T11", "SessionCore::arm_panic_on_next_event")
+    }
+}
+
+impl SessionCore {
+    /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
+    pub fn begin_stop(
+        &mut self,
+        _kind: crate::drain::StopKind,
+        _waiter: Option<Reply>,
+        _now: Mono,
+    ) -> Effects {
+        crate::s21_todo!("T12", "SessionCore::begin_stop")
+    }
+
+    /// Drain 進行中（SC-05 attach 與 manager 的 open 前檢查用；Task 12）。
+    pub fn drain_in_progress(&self) -> bool {
+        crate::s21_todo!("T12", "SessionCore::drain_in_progress")
     }
 }

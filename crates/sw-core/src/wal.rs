@@ -2,7 +2,7 @@
 //!
 //! 紅燈階段骨架：公開型別與簽章依 `06-slice21-daemon-core.md` Task 7 Produces 全部宣告（含 T9 已使用的
 //! `WalConfig`、`WalHealthSink`、`WalAppendReq`、`WalAppend`、`WalWriter::{open, append}`，簽章保持不變），
-//! 本體皆為 `todo!()`／`unimplemented!()`，由 Task 7 實作者補上。
+//! 本體皆為 `s21_todo!`（即 `unimplemented!`），由 Task 7 實作者補上。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,21 +28,21 @@ pub struct WalHealthFanout {
 
 impl WalHealthFanout {
     pub fn new() -> Arc<WalHealthFanout> {
-        unimplemented!("slice21 T7 WalHealthFanout::new")
+        s21_todo!("T7", "WalHealthFanout::new")
     }
 
     pub fn register(&self, _sink: Arc<dyn WalHealthSink>) {
-        unimplemented!("slice21 T7 WalHealthFanout::register")
+        s21_todo!("T7", "WalHealthFanout::register")
     }
 
     pub fn current(&self) -> bool {
-        unimplemented!("slice21 T7 WalHealthFanout::current")
+        s21_todo!("T7", "WalHealthFanout::current")
     }
 }
 
 impl WalHealthSink for WalHealthFanout {
     fn set_wal_unhealthy(&self, _unhealthy: bool) {
-        unimplemented!("slice21 T7 WalHealthFanout::set_wal_unhealthy")
+        s21_todo!("T7", "WalHealthFanout::set_wal_unhealthy")
     }
 }
 
@@ -81,7 +81,7 @@ pub struct WalHealth {
 impl WalHealth {
     /// key 順序照 04 §1.10 ＋ P1 T05 第 11 鍵 `unhealthy_reason`。
     pub fn to_pydict(&self) -> PyDict {
-        unimplemented!("slice21 T7 WalHealth::to_pydict")
+        s21_todo!("T7", "WalHealth::to_pydict")
     }
 }
 
@@ -98,28 +98,28 @@ pub struct WalWriter {
 impl WalWriter {
     /// 不回錯；失敗反映在 health（WAL 檔案 lazy open）。
     pub fn open(_cfg: WalConfig, _fs: Arc<dyn WalFs>, _clock: Arc<dyn Clock>) -> WalWriter {
-        unimplemented!("slice21 T7 WalWriter::open")
+        s21_todo!("T7", "WalWriter::open")
     }
 
     /// 只呼叫一次（SessionManager 建立時）。
     pub fn set_health_sink(&self, _sink: Arc<WalHealthFanout>) {
-        unimplemented!("slice21 T7 WalWriter::set_health_sink")
+        s21_todo!("T7", "WalWriter::set_health_sink")
     }
 
     pub fn append(&self, _req: WalAppendReq<'_>) -> WalAppend {
-        unimplemented!("slice21 T7 WalWriter::append")
+        s21_todo!("T7", "WalWriter::append")
     }
 
     pub fn current_seq(&self) -> u64 {
-        unimplemented!("slice21 T7 WalWriter::current_seq")
+        s21_todo!("T7", "WalWriter::current_seq")
     }
 
     pub fn health(&self) -> WalHealth {
-        unimplemented!("slice21 T7 WalWriter::health")
+        s21_todo!("T7", "WalWriter::health")
     }
 
     pub fn reset(&self) -> Result<WalReset, PalError> {
-        unimplemented!("slice21 T7 WalWriter::reset")
+        s21_todo!("T7", "WalWriter::reset")
     }
 
     pub fn tail_raw_with_meta(
@@ -128,27 +128,27 @@ impl WalWriter {
         _com: Option<&str>,
         _limit: i128,
     ) -> PalResult<(Vec<PyDict>, bool)> {
-        unimplemented!("slice21 T7 WalWriter::tail_raw_with_meta")
+        s21_todo!("T7", "WalWriter::tail_raw_with_meta")
     }
 
     pub fn available_from_seq(&self) -> Option<i128> {
-        unimplemented!("slice21 T7 WalWriter::available_from_seq")
+        s21_todo!("T7", "WalWriter::available_from_seq")
     }
 
     pub fn wal_path(&self) -> PathBuf {
-        unimplemented!("slice21 T7 WalWriter::wal_path")
+        s21_todo!("T7", "WalWriter::wal_path")
     }
 
     pub fn mirror_path(&self) -> PathBuf {
-        unimplemented!("slice21 T7 WalWriter::mirror_path")
+        s21_todo!("T7", "WalWriter::mirror_path")
     }
 
     pub fn shutdown(&self) -> PalResult<()> {
-        unimplemented!("slice21 T7 WalWriter::shutdown")
+        s21_todo!("T7", "WalWriter::shutdown")
     }
 }
 
 /// 把 WAL 紀錄列解碼為人類可讀文字行（WAL-1.11 KEEP：partial 尾段保留為最後一行）。
 pub fn rows_to_text_lines(_rows: &[PyDict]) -> Vec<String> {
-    unimplemented!("slice21 T7 rows_to_text_lines")
+    s21_todo!("T7", "rows_to_text_lines")
 }

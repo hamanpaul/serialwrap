@@ -521,3 +521,11 @@ OD-14 對上表的影響（2026-10-16）：RPC-D-02、ERR-7.2-b、ERR-7.3-1、SE
 | NC-04 | `ntpath.normpath`（Windows）：Windows CPython 3.12.10 改用 C 實作 `nt._path_normpath`，與純 Python 語意對病態輸入不同：`C:.\foo`→`C:.\foo`（Rust `C:foo`）、`C:./`→`C:.`（Rust `C:`）、`D:.\`→`D:.`（Rust `D:`）、`\\?\UNC\server\share\..\..\x`→`\\?\UNC\x`（Rust `\\?\UNC\server\share\x`）、`\\?\UNC\server\share\\`→`\\?\UNC\server\share`（Rust 保留尾端 `\`）。Linux 3.12.3 無 `nt._path_normpath`，純 Python 結果一致 | — | IMPL（Rust 保留純 Python 語意，與 `contracts/golden/pypath.windows.tsv` 的產生方式一致；`pypath.rs` 的 `normpath_windows_c_impl_difference_recorded_nc04` 記錄差異）。若要改為 C 語意，需移植 `_Py_normpath`，並以 Windows 3.12.10 重生 golden P3 golden 語料未涵蓋上列輸入；這些輸入是否可由 config、環境變數或 RPC 參數到達，待 T7（`RuntimePaths`）與 T10 確認 | P3 | yes（是否移植 C 語意，待擁有者裁決） |
 | NC-05 | `repr()`（`sw-proto::pyfmt::py_repr`）：CPython 深層巢狀 repr 於約 1000 層擲 `RecursionError`；Rust 以顯式堆疊迭代輸出完整字串，不擲錯 | — | IMPL（Rust-only：迭代實作；深度由 `pyjson::loads` 的 `JSON_MAX_DEPTH`（NC-02）約束） | 遞迴實作在 2900 層（`JSON_MAX_DEPTH`）時，release 約需 1.3～1.5 MiB 堆疊（Windows GNU 預設 2 MiB，餘裕有限）、debug 版超過 2 MiB；stack overflow 會 abort 整個程序，無法轉為錯誤碼 | P3 | no |
 | NC-06 | 主機名小寫化（`endpoint.rs::hostname_of`，對應 `urllib.parse` 的 `hostname`）：Python 3.12.3 的 `str.lower()` 採 Unicode 15.0.0，Rust 1.96.1 的 `str::to_lowercase()` 採 Unicode 17.0.0；兩版對少數非 ASCII 碼位的大小寫對映不同（例：`U+10D50`、`U+1C89`、`U+A7CE`，Python 保留原字元、Rust 轉為小寫）。ASCII 主機名完全一致 | — | IMPL（Rust-only：不另建 Unicode 15 對照表；差異僅限非 ASCII 主機名的大小寫對映） | 只影響非 ASCII 字元的 tcp 主機名；loopback 判定（`LOOPBACK_TCP_HOSTS` 皆為 ASCII）與實際 DUT／daemon endpoint 不受影響 | P3 | no |
+
+## 7. P5 登記：Slice 2.1 Task 0 偏離 Python 基線的項目（待擁有者裁決類別）
+
+由 `06-slice21-daemon-core.md` Task 0 雙審回報（2026-10-21）寫入。以下差異**已由計畫明文採用**，但 Python 基線不同；在擁有者裁決為 SC／DF／Rust-only 之前，不得視為已登記的契約變更，也不得以「與 Python 一致」宣稱通過。
+
+| ID | 事實（現況） | 規格 | 裁決 | 理由 | 階段 | 需擁有者 |
+|---|---|---|---|---|---|---|
+| NC-P5-01 | RX 速率視窗（RX_FLOOD 判定用）：Python `deque(maxlen=4096)` 超量時**丟最舊項目**，視窗內 bytes 總和會被低估；Rust 採 `merge_oldest`（合併最舊兩筆、保留 bytes 總和） | §5.4 RX_FLOOD（`RX_FLOOD_BYTES_PER_10S=20000`，10 s 視窗） | 暫定 IMPL（計畫 06 Task 0 `contracts/resource_limits.yaml` `rx_rate_window_entries`）；**未登記** `contracts/behavior_changes.yaml` | 洪泛下不低估 RX_FLOOD 判定；可觀測於 flood 情境的錯誤分類，屬 A/B 比較範圍內的潛在差異 | P5 | yes（決定 SC／DF／Rust-only；若為 SC 需補 `behavior_changes.yaml`） |

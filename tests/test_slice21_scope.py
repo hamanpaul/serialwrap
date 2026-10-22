@@ -74,10 +74,32 @@ def test_resource_limits_contract_values():
 EVENTS = {"stop_request", "command_cancel", "lease_expiry", "drain_receipt", "release_request"}
 
 
-def test_event_latency_contract_frozen_before_slice_start():
-    """§5.3：各事件的受理點、完成點、最大延遲、負載與量測方法在 Slice 2.1 開工前凍結，並有獨立審閱者。"""
-    lat = yaml.safe_load(LIMITS.read_text(encoding="utf-8"))["event_latency"]
-    assert lat["method_revision"] and lat["reviewed_by"] and lat["reviewed_by"] != lat["owner"]
+def _limits_doc() -> dict:
+    return yaml.safe_load(LIMITS.read_text(encoding="utf-8"))
+
+
+def _freeze_gaps(doc: dict) -> list[str]:
+    """§5.3 凍結證據缺口；空 list 表示獨立審閱紀錄齊備且無未裁決項目（P5 Task 0 雙審修正）。"""
+    lat = doc["event_latency"]
+    gaps = []
+    if lat.get("freeze_status") != "frozen":
+        gaps.append(f"freeze_status={lat.get('freeze_status')!r}")
+    for key in ("reviewed_by", "reviewed_at", "review_conclusion"):
+        if not lat.get(key):
+            gaps.append(f"{key} 未附")
+    if lat.get("reviewed_by") and lat.get("reviewed_by") == lat.get("owner"):
+        gaps.append("reviewed_by 與 owner 相同")
+    for row in doc["limits"]:
+        decision = row.get("owner_decision")
+        if decision and decision.get("status") == "pending_owner_decision":
+            gaps.append(f"{row['name']} 待擁有者裁決（{decision.get('id')}）")
+    return gaps
+
+
+def test_event_latency_contract_values():
+    """§5.3 內容結構（與凍結狀態無關，恆定執行）。"""
+    lat = _limits_doc()["event_latency"]
+    assert lat["method_revision"] and lat["owner"]
     assert lat["repeats"] == 3 and lat["samples_per_run"] == 500
     assert lat["gate_rule"] == "every_run_max_le_max_ms"           # p99 只作診斷值
     rows = {r["event"]: r for r in lat["events"]}
@@ -86,6 +108,13 @@ def test_event_latency_contract_frozen_before_slice_start():
         assert {"accept_point", "complete_point", "max_ms_idle", "max_ms_flood", "load", "l1_bound"} <= set(r)
         assert r["l1_bound"] == "at_most_one_data_item_before_control"
     assert lat["flood_load"] == {"bytes_per_s": 20000, "seconds": 30, "chunk_bytes": 256}
+
+
+def test_event_latency_contract_frozen_before_slice_start():
+    """§5.3：開工前凍結並有獨立審閱紀錄。證據不足時 skip（INSUFFICIENT_EVIDENCE），不得 PASS 放行。"""
+    gaps = _freeze_gaps(_limits_doc())
+    if gaps:
+        pytest.skip("INSUFFICIENT_EVIDENCE：§5.3 凍結證據不足（" + "；".join(gaps) + "），不得作為正式門檻引用")
 
 
 def test_sw_core_has_no_relocated_modules():

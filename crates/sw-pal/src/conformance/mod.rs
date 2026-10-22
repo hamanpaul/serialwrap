@@ -4,7 +4,14 @@
 //! T2 測試作者交付：PTY 測試夾具（`posix_pty_pair`、`PtyPeer`、子程序輔助）為可執行的測試基礎設施，
 //! 讓測試能走到被測行為；被測的 PAL 行為（`PosixSerialBackend` 等）仍為 `unimplemented!` 骨架。
 
+pub mod lock_suite;
+pub mod rpc_suite;
 pub mod serial_suite;
+pub mod wal_fs_suite;
+
+pub use lock_suite::lock_suite;
+pub use rpc_suite::rpc_suite;
+pub use wal_fs_suite::{wal_fs_suite, ExternalFsOps, FakeExternalFs, NativeExternalFs};
 
 use std::ffi::CStr;
 use std::io::{BufRead, BufReader};
@@ -299,6 +306,6 @@ pub fn fake_pair_factory(
 ) -> impl Fn() -> (DevicePath, Box<dyn PeerEnd>) {
     move || {
         let _ = &be;
-        unimplemented!("slice21 T1 FakeSerialBackend::add_device（conformance fake pair）")
+        s21_todo!("T1", "FakeSerialBackend::add_device（conformance fake pair）")
     }
 }

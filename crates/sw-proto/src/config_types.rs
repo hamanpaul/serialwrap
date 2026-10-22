@@ -935,3 +935,14 @@ fn upsert_str_key(map: &mut YMap, key: &str, value: &str) {
         None => map.0.push((YValue::Str(key.to_string()), value)),
     }
 }
+
+impl RuntimeConfig {
+    /// `windows.exclude_coms` 讀取（Task 0c；Windows 裝置排除清單）。
+    pub fn windows_exclude_coms(&self) -> Vec<String> {
+        crate::s21_todo!("T0c", "RuntimeConfig::windows_exclude_coms")
+    }
+    /// `windows.test_device_allowlist` 讀取（Task 0c；OD-11 allowlist，`Err(())` 表示型別不合法）。
+    pub fn windows_test_device_allowlist(&self) -> Result<Option<Vec<String>>, ()> {
+        crate::s21_todo!("T0c", "RuntimeConfig::windows_test_device_allowlist")
+    }
+}

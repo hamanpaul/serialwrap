@@ -27,12 +27,12 @@ impl WindowsDeviceSource {
         _exclude: HashSet<String>,
         _allowlist: Option<Vec<String>>,
     ) -> Self {
-        todo!("slice21 T5 WindowsDeviceSource::new 尚未實作")
+        s21_todo!("T5", "WindowsDeviceSource::new")
     }
 }
 
 impl DeviceSource for WindowsDeviceSource {
     fn scan(&mut self) -> PalResult<Vec<(String, DeviceInfo)>> {
-        todo!("slice21 T5 WindowsDeviceSource::scan 尚未實作")
+        s21_todo!("T5", "WindowsDeviceSource::scan")
     }
 }
