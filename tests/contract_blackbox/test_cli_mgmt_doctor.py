@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from bb_harness import (
     python_baseline_prefix,
     repo_root,
 )
+from bb_l15 import in_isolated_pidns
 
 if os.environ.get("SERIALWRAP_CLI_EXE") == "/bin/serialwrap":
     sw_bundle = os.environ.get("SW_BUNDLE")
@@ -91,6 +93,42 @@ def _bundle_has_python_oracle(bundle_root: Path) -> bool:
     return res.returncode == 0
 
 
+def _serialwrapd_pids() -> list[int]:
+    """/proc 內 cmdline 基名為 serialwrapd（或 serialwrapd.py）的行程，與 ab_blackbox.sh preflight 同一判準。"""
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            parts = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        names = {Path(p.decode("utf-8", errors="replace")).name for p in parts if p}
+        if names & {"serialwrapd", "serialwrapd.py"}:
+            found.append(int(entry.name))
+    return found
+
+
+def _wait_no_serialwrapd(timeout_s: float = 15.0) -> None:
+    """隔離 pid namespace 內，doctor 比對前輪詢至 /proc 無 serialwrapd。
+
+    preflight 已保證隔離 namespace 內無非本 run 的 serialwrapd，故殘留即為前序測試的 daemon 延遲退出
+    （例如 handoff 排空窗口，PENDING-OD-S1X-HANDOFF-WINDOW）；py 與 Rust 兩輪若一輪見到、一輪未見，
+    single_daemon 的 detail 即不一致。逾時 fail 並列出殘留 pid，不得以「flaky」略過。
+    非隔離執行（一般 pytest，機器上可能有生產 daemon）不輪詢，single_daemon 維持即時比對。
+    """
+    if not in_isolated_pidns():
+        return
+    deadline = time.monotonic() + timeout_s
+    while True:
+        pids = _serialwrapd_pids()
+        if not pids:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(f"隔離 pid namespace 內 doctor 比對前仍有殘留 serialwrapd：pid={pids}")
+        time.sleep(0.2)
+
+
 @pytest.mark.case("sc25-release-manifest-version-pairing")
 def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
     work_py = tmp_path / "py"
@@ -111,6 +149,7 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
         shutil.copy2(exe, standalone)
         cli_argv = [str(standalone)]
 
+    _wait_no_serialwrapd()
     py_proc = subprocess.run(
         python_baseline_prefix() + ["doctor"],
         env=env_py,
@@ -118,6 +157,7 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
         text=True,
         timeout=30,
     )
+    _wait_no_serialwrapd()
     cli_proc = subprocess.run(
         cli_argv + ["doctor"],
         env=env_cli,

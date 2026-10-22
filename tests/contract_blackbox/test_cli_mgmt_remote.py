@@ -1,8 +1,10 @@
 """P4-T8 `remote`（-R／-L／status／close／stop 別名）黑箱契約（SC-21、BC-05）。
 
 A/B 案例（`status`／`close` 空集合、stub ssh 開通）同時執行 Python 基線與受測 CLI，比對輸出。
-`test_remote_topologies_docker` 使用 P4-T1 的 `mgmt_bundle`（`mkbundle.sh --dev --delegate-sentinel`）
-驗證 Rust CLI 在四種容器拓樸的遠端行為。fixture 延遲載入，避免本檔在夾具未就緒時影響整體收集。
+`test_remote_topologies_docker` 在 A 輪（Python 基線）與 B 輪（Rust）執行同一組四種容器拓樸斷言
+（BC-05 `scope: both`，凍結案例 `bc05-three-topologies` 無 Python 輪 skip 登記）。B 輪以 P4-T1 的
+`mgmt_bundle`（`mkbundle.sh --dev --delegate-sentinel`）注入容器；A 輪不建立 Rust bundle，改沿用映像內
+pip 安裝的 Python 基線 `serialwrap`。fixture 延遲載入，避免本檔在夾具未就緒時影響整體收集。
 """
 from __future__ import annotations
 
@@ -18,7 +20,9 @@ from pathlib import Path
 import pytest
 
 from bb_harness import (
+    ab_env,
     cli_prefix,
+    is_rust,
     isolated_env,
     python_baseline_prefix,
     repo_root,
@@ -203,15 +207,23 @@ def test_remote_sigint_cleans_spawned_tunnel(tmp_path: Path) -> None:
 
 
 @pytest.mark.case("bc05-three-topologies")
-@pytest.mark.rust_only
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
-def test_remote_topologies_docker(tmp_path: Path, mgmt_bundle) -> None:
+def test_remote_topologies_docker(tmp_path: Path, request: pytest.FixtureRequest) -> None:
     if shutil.which("docker") is None:
         pytest.skip("cap docker：本機沒有 docker 指令")
 
+    rust = is_rust()
+    if not rust and ab_env().get("SERIALWRAP_CLI_EXE") not in (None, ""):
+        # A 輪（Python 基線）若已指定非基線的 CLI，腳本仍會在映像內執行 Python 基線並 PASS，形成假證據。
+        if cli_prefix() != python_baseline_prefix():
+            pytest.fail("A 輪標籤非 rust*，但 SERIALWRAP_CLI_EXE 指向非 Python 基線的 CLI；拒絕以映像內 Python 基線代替")
     env = isolated_env(tmp_path)
-    env["SERIALWRAP_CLI_BUNDLE_DIR"] = str(mgmt_bundle.root)
+    if rust:
+        # B 輪：以 Rust bundle 注入容器（/opt/sw-bundle/bin/serialwrap）。
+        mgmt_bundle = request.getfixturevalue("mgmt_bundle")
+        env["SERIALWRAP_CLI_BUNDLE_DIR"] = str(mgmt_bundle.root)
+    # A 輪：不設 bundle，腳本沿用映像內 pip 安裝的 Python 基線 `serialwrap`（PATH 解析）。
     script = repo_root() / "tools" / "docker" / "remote_tunnel_test.sh"
     # bash -x 把每個 docker exec 的展開命令寫到 stderr，用以核對 serialwrap 的呼叫路徑。
     proc = subprocess.run(
@@ -221,11 +233,20 @@ def test_remote_topologies_docker(tmp_path: Path, mgmt_bundle) -> None:
         text=True,
         timeout=1800,
     )
+    if "SKIP：" in proc.stdout:
+        # docker CLI 存在但 daemon 不可連：腳本以 exit 0 印 SKIP（非靜默略過）；此處轉為 pytest SKIP，
+        # 避免預設 pytest（A 輪）在無 docker daemon 的環境誤判為斷言失敗。A/B 執行器仍把 skip 判為未核准。
+        pytest.skip(proc.stdout.strip().splitlines()[-1])
     assert proc.returncode == 0, (proc.stdout + proc.stderr)[-4000:]
 
     trace = proc.stderr.splitlines()
     bare_calls = [
         line for line in trace if "docker exec" in line and re.search(r"\sserialwrap(\s|$)", line)
     ]
-    assert not bare_calls, bare_calls[:3]
-    assert any("/opt/sw-bundle/bin/serialwrap" in line for line in trace)
+    if rust:
+        assert not bare_calls, bare_calls[:3]
+        assert any("/opt/sw-bundle/bin/serialwrap" in line for line in trace)
+    else:
+        # A 輪的呼叫路徑必須是映像內 Python 基線（bare `serialwrap`），且不得混入 Rust bundle 路徑。
+        assert bare_calls, "A 輪應以映像內 PATH 上的 Python 基線 serialwrap 呼叫"
+        assert not any("/opt/sw-bundle/bin/serialwrap" in line for line in trace)
