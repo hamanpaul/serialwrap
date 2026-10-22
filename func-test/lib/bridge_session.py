@@ -138,12 +138,16 @@ class BridgeSession:
         )
         log_path = self.evidence_dir / "bridge.log"
         self._log_stream = log_path.open("ab", buffering=0)
+        # bridge 的 stdout 為 UTF-8（JSON 行）；明確指定解碼，不依系統 locale（Windows 為 cp950）。
+        # 解碼錯誤以 replace 處理，避免讀取執行緒因單一位元組例外而結束、遺失 BRIDGE_READY。
         self.process = subprocess.Popen(
             command,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         self._reader_thread = threading.Thread(target=self._read_output, name=f"bridge-ready-{self.run_id}", daemon=True)

@@ -580,7 +580,7 @@ def test_compare_full_still_requires_comparator_pass():
 
 
 def _run_bridge_case(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, steps: list[dict[str, Any]],
-                     *, host: str = "linux") -> dict[str, Any]:
+                     *, host: str = "linux", stop_error: BaseException | None = None) -> dict[str, Any]:
     """以假 harness 跑一個 bridge／compare:none 案例，回傳 runner.last_result（並附 run 的回傳值）。"""
     import realhw.deployed_content
     import runner
@@ -608,6 +608,8 @@ def _run_bridge_case(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, st
     def fake_stop(self: Any) -> None:
         if getattr(self, "_tmpdir", None) is not None:
             self._tmpdir.cleanup()
+        if stop_error is not None:
+            raise stop_error
 
     monkeypatch.setattr(daemon_harness.DaemonHarness, "start", fake_start)
     monkeypatch.setattr(daemon_harness.DaemonHarness, "stop", fake_stop)
@@ -675,3 +677,229 @@ def test_runner_windows_host_runs_segment_and_can_be_eligible(tmp_path, monkeypa
     ], host="windows")
     assert res["verdict"] == "PASS", res
     assert res["gate_eligible"] is True
+
+
+def _harness_with_tmpdir(tmp_path: pathlib.Path):
+    """建立已具 root／證據目錄的 DaemonHarness（不啟動任何行程），供 stop() 的關閉階段測試使用。"""
+    from lib import daemon_harness
+
+    h = daemon_harness.DaemonHarness()
+    tmpdir = tempfile.TemporaryDirectory(prefix="sw-func-test-")
+    h._tmpdir = tmpdir
+    h._root = pathlib.Path(tmpdir.name)
+    h._evidence_dir = tmp_path / "evidence"
+    h._evidence_dir.mkdir(parents=True, exist_ok=True)
+    (h._root / "wal").mkdir()
+    return h, tmpdir
+
+
+@pytest.mark.memory_only
+def test_stop_retries_tmpdir_removal_without_failing_the_case(monkeypatch, tmp_path):
+    """S1X G3 (a)：臨時目錄回收遇 WinError 32 時有界重試；重試成功即無診斷，stop() 不拋出。"""
+    from lib import daemon_harness
+
+    monkeypatch.setattr(daemon_harness, "_TMPDIR_REMOVE_DELAY_S", 0.0)
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    real_cleanup = tmpdir.cleanup
+    calls = {"n": 0}
+
+    def flaky_cleanup() -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(32, "程序無法存取檔案（模擬 WinError 32）")
+        real_cleanup()
+
+    monkeypatch.setattr(tmpdir, "cleanup", flaky_cleanup)
+    h.stop()
+    assert calls["n"] == 3
+    assert h.cleanup_diagnostics == []
+    assert not os.path.exists(tmpdir.name)
+    assert (tmp_path / "evidence" / "wal").is_dir(), "WAL 複本仍須保存於證據目錄"
+
+
+@pytest.mark.memory_only
+def test_stop_records_diagnostic_when_tmpdir_stays_locked(monkeypatch, tmp_path):
+    """重試用盡仍無法回收：只寫入 cleanup_diagnostics，不改變案例結果（stop() 不拋出）。"""
+    import shutil
+
+    from lib import daemon_harness
+
+    monkeypatch.setattr(daemon_harness, "_TMPDIR_REMOVE_DELAY_S", 0.0)
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    leftover = tmpdir.name
+
+    def always_locked() -> None:
+        raise PermissionError(32, "仍被占用（模擬）")
+
+    monkeypatch.setattr(tmpdir, "cleanup", always_locked)
+    try:
+        h.stop()
+        diagnostics = h.cleanup_diagnostics
+        assert [item["kind"] for item in diagnostics] == ["tmpdir_remove_failed"], diagnostics
+        assert diagnostics[0]["attempts"] == daemon_harness._TMPDIR_REMOVE_ATTEMPTS
+        assert "PermissionError" in diagnostics[0]["error"]
+        assert diagnostics[0]["path"] == leftover
+    finally:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+@pytest.mark.memory_only
+def test_stop_waits_for_registered_handle_holder(tmp_path):
+    """S1X G3 (a)：案例自建的 WAL 讀取 handle 持有者須於回收臨時目錄前結束。"""
+    import shutil
+    import threading
+
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    leftover = tmpdir.name
+    finished = threading.Event()
+
+    def hold() -> None:
+        time.sleep(0.3)
+        finished.set()
+
+    holder = threading.Thread(target=hold, name="test-wal-holder", daemon=True)
+    holder.start()
+    h.register_handle_holder(holder)
+    try:
+        h.stop()
+        assert finished.is_set(), "stop() 必須等待持有者結束後才回收"
+        assert h.cleanup_diagnostics == []
+        assert not os.path.exists(leftover)
+    finally:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+@pytest.mark.memory_only
+def test_stop_raises_when_daemon_exit_is_unconfirmed(tmp_path):
+    """S1X G3 (a)：kill 後仍無法確認 daemon 行程結束 → 以 StepError 拋出（證據完整性不明）；臨時目錄仍嘗試回收。"""
+    import shutil
+
+    from lib import daemon_harness
+
+    class StuckProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired(cmd="daemon", timeout=timeout or 0)
+
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    leftover = tmpdir.name
+    h._daemon = StuckProc()
+    try:
+        with pytest.raises(daemon_harness.StepError, match="未確認結束"):
+            h.stop()
+        assert h._daemon is None
+        assert h._tmpdir is None
+        assert not os.path.exists(leftover)
+    finally:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+@pytest.mark.memory_only
+def test_runner_harness_stop_failure_is_insufficient_and_not_eligible(tmp_path, monkeypatch):
+    """關閉失敗的案例：原本 PASS 者判為 INSUFFICIENT_EVIDENCE、不得 gate_eligible，失敗原因寫入診斷。"""
+    from lib import daemon_harness
+
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+    ], stop_error=daemon_harness.StepError("daemon pid=1 未確認結束"))
+    assert res["verdict"] == "INSUFFICIENT_EVIDENCE", res
+    assert res["gate_eligible"] is False
+    assert res["returned_ok"] is False
+    assert [item["kind"] for item in res["harness_diagnostics"]] == ["harness_stop_failed"], res
+
+
+@pytest.mark.memory_only
+def test_runner_harness_stop_failure_keeps_case_fail(tmp_path, monkeypatch):
+    """關閉失敗不得覆寫既有 FAIL：案例判定與訊息保留，失敗原因僅記入診斷。"""
+    from lib import daemon_harness
+
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "READY"}},
+    ], stop_error=daemon_harness.StepError("daemon pid=1 未確認結束"))
+    assert res["verdict"] == "FAIL", res
+    assert res["gate_eligible"] is False
+    assert "harness" not in res["message"]
+    assert [item["kind"] for item in res["harness_diagnostics"]] == ["harness_stop_failed"], res
+
+
+@pytest.mark.memory_only
+def test_main_continues_after_runner_exception_and_writes_report(tmp_path, monkeypatch):
+    """S1X G3 (a)：單一案例的 runner 例外不得中止整次執行；每案結束後都寫出報告。"""
+    import json
+
+    import runner
+    from lib.yaml_loader import TestCase
+
+    def make(name: str) -> TestCase:
+        return TestCase(name=name, category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *a, **k: [make("boom-case"), make("ok-case")])
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
+
+    def fake_run(self: Any) -> tuple[bool, str]:
+        if self.tc.name == "boom-case":
+            raise RuntimeError("synthetic crash")
+        self.last_result = self._result("PASS", "OK")
+        return True, "OK"
+
+    monkeypatch.setattr(runner.TestRunner, "run", fake_run)
+    report_dir = tmp_path / "reports"
+    rc = runner.main(["--report-dir", str(report_dir)])
+    report = json.loads((report_dir / "func-test-report.json").read_text(encoding="utf-8"))
+    assert [row["verdict"] for row in report["results"]] == ["INSUFFICIENT_EVIDENCE", "PASS"], report
+    assert "synthetic crash" in report["results"][0]["message"]
+    assert rc == 1
+
+
+@pytest.mark.memory_only
+def test_bridge_stdout_is_decoded_explicitly_as_utf8():
+    """S1X G3 (c)：bridge 的 stdout 明確以 UTF-8 解碼並 replace，不依系統 locale，且解碼錯誤不終止讀取執行緒。"""
+    text = (FUNC_TEST_DIR / "lib" / "bridge_session.py").read_text(encoding="utf-8")
+    start = text.index("self.process = subprocess.Popen(")
+    call = text[start:text.index(")\n", start)]
+    assert 'encoding="utf-8"' in call and 'errors="replace"' in call, call
+
+
+@pytest.mark.memory_only
+def test_func_report_complete_flag_false_midrun_true_only_at_end(tmp_path, monkeypatch):
+    """F7：每案中途寫出的報告 complete=false，僅最後一次寫出為 complete=true；逾時或崩潰留下的部分報告不得與完整報告外觀相同。"""
+    import json
+
+    import runner
+    from lib.yaml_loader import TestCase
+
+    def make(name: str) -> TestCase:
+        return TestCase(name=name, category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *a, **k: [make("a-case"), make("b-case")])
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
+
+    def fake_run(self: Any) -> tuple[bool, str]:
+        self.last_result = self._result("PASS", "OK")
+        return True, "OK"
+
+    monkeypatch.setattr(runner.TestRunner, "run", fake_run)
+    seen: list[bool] = []
+    real_write = runner._write_summary_report
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(bool(kwargs.get("complete", False)))
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_write_summary_report", spy)
+    report_dir = tmp_path / "reports"
+    runner.main(["--report-dir", str(report_dir)])
+    report = json.loads((report_dir / "func-test-report.json").read_text(encoding="utf-8"))
+    assert seen == [False, False, True], seen
+    assert report["complete"] is True
+    assert runner.build_summary_report([])["complete"] is False

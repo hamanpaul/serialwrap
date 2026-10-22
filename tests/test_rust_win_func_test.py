@@ -65,6 +65,12 @@ def _print_argv(script: Path, *args: str) -> list:
     return json.loads(out.stdout)
 
 
+def _print_basic_argv(script: Path) -> list:
+    out = _run(script, "--print-basic-argv")
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
 def _fake_bundle(root: Path) -> Path:
     (root / "bin").mkdir(parents=True)
     (root / "bin" / "serialwrap.exe").write_bytes(b"not-a-real-exe")
@@ -74,11 +80,13 @@ def _fake_bundle(root: Path) -> Path:
 
 @needs_bash
 @pytest.mark.parametrize("script", [FUNC, SPIKE3, LIB])
+@pytest.mark.process_rpc
 def test_scripts_parse(script: Path) -> None:
     out = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True, check=False)
     assert out.returncode == 0, out.stderr
 
 
+@pytest.mark.memory_only
 def test_com_tokens_limited_to_com20_com21() -> None:
     found: set[str] = set()
     for path in (FUNC, SPIKE3, LIB):
@@ -88,6 +96,7 @@ def test_com_tokens_limited_to_com20_com21() -> None:
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_func_test_argv_matches_plan_step5() -> None:
     assert _print_argv(FUNC) == EXPECTED_FUNC_ARGV
     plan = PLAN04.read_text(encoding="utf-8")
@@ -97,6 +106,7 @@ def test_func_test_argv_matches_plan_step5() -> None:
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_spike3_argv_per_case_is_exact() -> None:
     rows = _print_argv(SPIKE3)
     assert [row[row.index("--case") + 1] for row in rows] == SPIKE3_CASES
@@ -108,6 +118,7 @@ def test_spike3_argv_per_case_is_exact() -> None:
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_spike3_edr_values_are_pass_through_only() -> None:
     for row in _print_argv(SPIKE3):
         assert not any(arg.startswith("--edr-") for arg in row), row
@@ -117,6 +128,7 @@ def test_spike3_edr_values_are_pass_through_only() -> None:
         assert row[-4:] == ["--edr-product", "Example EDR", "--edr-interceptions", "7"]
 
 
+@pytest.mark.memory_only
 def test_no_throwaway_scheduler_or_name_based_kill() -> None:
     for path in (FUNC, SPIKE3, LIB):
         text = path.read_text(encoding="utf-8")
@@ -127,6 +139,7 @@ def test_no_throwaway_scheduler_or_name_based_kill() -> None:
         assert "-Name serialwrap" not in text, path.name
 
 
+@pytest.mark.memory_only
 def test_lib_kills_only_by_pid_and_start_identity() -> None:
     text = LIB.read_text(encoding="utf-8")
     assert "taskkill.exe /PID $proc.Id /T /F" in text
@@ -135,6 +148,7 @@ def test_lib_kills_only_by_pid_and_start_identity() -> None:
     assert "StartTime.ToUniversalTime().Ticks" in text
 
 
+@pytest.mark.memory_only
 def test_lib_subset_covers_runner_and_spike3_dependencies() -> None:
     text = LIB.read_text(encoding="utf-8")
     block = re.search(r"SW_WIN_SUBSET=\((.*?)\n\)", text, re.DOTALL)
@@ -144,6 +158,7 @@ def test_lib_subset_covers_runner_and_spike3_dependencies() -> None:
     assert REQUIRED_SUBSET <= entries
 
 
+@pytest.mark.memory_only
 def test_lib_stages_head_archive_not_worktree() -> None:
     text = LIB.read_text(encoding="utf-8")
     assert 'git -C "$ROOT" archive --format=tar HEAD' in text
@@ -151,6 +166,7 @@ def test_lib_stages_head_archive_not_worktree() -> None:
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_func_refuses_incomplete_bundle_before_interop(tmp_path: Path) -> None:
     selftest = tmp_path / "selftest-report.json"
     selftest.write_text("{}\n", encoding="utf-8")
@@ -161,6 +177,7 @@ def test_func_refuses_incomplete_bundle_before_interop(tmp_path: Path) -> None:
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_func_refuses_mismatched_selftest_before_interop(tmp_path: Path) -> None:
     bundle = _fake_bundle(tmp_path / "bundle")
     selftest = tmp_path / "selftest-report.json"
@@ -175,6 +192,7 @@ def test_func_refuses_mismatched_selftest_before_interop(tmp_path: Path) -> None
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_func_rejects_com_arguments(tmp_path: Path) -> None:
     out = _run(FUNC, "--daemon-com", "COM22", "--bridge-com", "COM23")
     assert out.returncode == 2
@@ -182,7 +200,38 @@ def test_func_rejects_com_arguments(tmp_path: Path) -> None:
 
 
 @needs_bash
+@pytest.mark.process_rpc
 def test_spike3_requires_evidence_dir_before_interop() -> None:
     out = _run(SPIKE3)
     assert out.returncode == 2
     assert "缺少 --evidence-dir" in out.stderr
+
+
+@needs_bash
+@pytest.mark.process_rpc
+def test_basic_argv_omits_scenarios_and_keeps_com_pair() -> None:
+    """S1X G3 (d)：基本案例與情境使用同一 COM pair／transport，只差 --scenarios 與報告目錄。"""
+    argv = _print_basic_argv(FUNC)
+    assert "--scenarios" not in argv
+    assert argv[:4] == ["-3.12", "func-test/runner.py", "--mode", "bridge"]
+    assert argv[argv.index("--daemon-com") + 1] == "COM20"
+    assert argv[argv.index("--bridge-com") + 1] == "COM21"
+    assert argv[argv.index("--transport-mode") + 1] == "virtual_com0com"
+    assert argv[argv.index("--report-dir") + 1] == "<RUN>\\report-basic"
+
+
+@pytest.mark.memory_only
+def test_wrapper_does_not_force_pythonutf8_and_sets_io_encoding() -> None:
+    """S1X G3 (c)：不全域強制 PYTHONUTF8（bridge 子行程需依系統 locale 解碼）；runner 自身的 stdio 以 PYTHONIOENCODING 設定。"""
+    text = FUNC.read_text(encoding="utf-8")
+    assert '"PYTHONUTF8=1"' not in text, "PYTHONUTF8 會使 bridge 子行程的 cp950 輸出解碼失敗"
+    assert '"PYTHONIOENCODING=utf-8"' in text
+
+
+@pytest.mark.memory_only
+def test_wrapper_runs_basic_cases_into_separate_report_and_driver_gates_it() -> None:
+    """S1X G3 (d)：wrapper 於同一 staging 另跑基本案例並輸出 basic/ 報告；驅動以第二個 windows= 報告交給 gate。"""
+    text = FUNC.read_text(encoding="utf-8")
+    assert "report-basic" in text and "basic/func-test-report.json" in text
+    driver = (ROOT / "scripts" / "rust" / "stage1_exit_driver.sh").read_text(encoding="utf-8")
+    assert '"windows=$EV/func-test-windows/basic/func-test-report.json"' in driver

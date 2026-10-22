@@ -161,6 +161,23 @@ def test_gate_receives_windows_l15_spike3_and_explicit_ab_report():
     assert "win_l15_func_test" in text and "spike3_win_wal" in text
 
 
+def test_gate_receives_basic_windows_l15_report():
+    """S1X G3 (d)：gate 5c-iv 要求 cases.lock 宣告的 windows 平台都有列，驅動須以第二個 windows= 報告（基本案例）傳入。"""
+    text = _joined()
+    assert '"windows=$EV/func-test-windows/basic/func-test-report.json"' in text
+
+
+def test_env_overridable_variables_are_not_declared_local():
+    """S1X G3 (f)：RUN_ID、WIN_L15_WRAPPER、SPIKE3_WRAPPER 可由環境覆寫，不得列於 local 宣告（local 會遮蔽環境值，
+    其後的 ${VAR:-預設} 永遠取到預設值）。"""
+    text = _driver_text()
+    local_lines = [ln for ln in text.splitlines() if re.match(r"^\s*local\b", ln)]
+    assert local_lines, "驅動的 main 應仍有 local 宣告"
+    for name in ("RUN_ID", "WIN_L15_WRAPPER", "SPIKE3_WRAPPER"):
+        assert not any(re.search(rf"\b{name}\b", ln) for ln in local_lines), f"{name} 被 local 遮蔽"
+        assert f'{name}="${{{name}:-' in text, f"{name} 缺少環境覆寫的預設值寫法"
+
+
 def _driver_wrapper_default(var: str) -> Path:
     m = re.search(rf'^\s*{var}="\$\{{{var}:-\$REPO/([^}}]+)\}}"', _driver_text(), re.M)
     assert m, f"驅動缺少 {var} 的預設值"

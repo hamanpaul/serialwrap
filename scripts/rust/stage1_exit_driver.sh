@@ -217,10 +217,12 @@ main() {
   set -uo pipefail
   cd "$REPO" || exit 1
 
-  local RUN_ID EV LOG DEV_BUNDLE P4 HEAD_SHA DIRTY BENCH_BASE
+  # 注意：RUN_ID、WIN_L15_WRAPPER、SPIKE3_WRAPPER 為可由環境覆寫的變數，不得列入 local（local 宣告會遮蔽環境值，
+  # 其後的 ${VAR:-預設} 將永遠取到預設值；已以 bash 驗證）。
+  local EV LOG DEV_BUNDLE P4 HEAD_SHA DIRTY BENCH_BASE
   local SELFTEST_LINUX_PATH SELFTEST_WINDOWS_PATH
   local AB_REPORT WT1A_REPORT WT1B_REPORT WB_REPORT WB_DIR WIN_CLI WIN_UNIT_JUNIT
-  local WIN_L15_WRAPPER SPIKE3_WRAPPER GATE_ARGS=() c rc_fail
+  local GATE_ARGS=() c rc_fail
 
   RUN_ID="${RUN_ID:-s1exit-$(date +%Y%m%dT%H%M%S)}"
   EV="$REPO/target/stage1a-evidence/$RUN_ID"
@@ -365,9 +367,10 @@ main() {
       || log "WARN p4 windows 20groups 複製失敗"
   fi
 
-  # Windows L1.5（win-func-test.sh，COM20:COM21，argv 依 plan 04 Step 5 Windows 形式、不帶 --case）與 spike3
-  # （win-spike3.sh 一次跑四案，證據寫入 $EV/spike3/<case>.json）。兩者需要 G4 匯出的 Windows dev bundle（$WB_DIR/bundle）；
-  # bundle 缺漏時 wrapper 直接失敗，gate 判為證據不足。
+  # Windows L1.5（win-func-test.sh，COM20:COM21）與 spike3（win-spike3.sh 一次跑四案，證據寫入 $EV/spike3/<case>.json）。
+  # 兩者需要 G4 匯出的 Windows dev bundle（$WB_DIR/bundle）；bundle 缺漏時 wrapper 直接失敗，gate 判為證據不足。
+  # win-func-test.sh 於同一 staging 內執行兩次：情境（報告於 $EV/func-test-windows/）與基本案例（報告於
+  # $EV/func-test-windows/basic/，S1X 修訂：gate 5c-iv 要求 cases.lock 宣告的 windows 平台都有列）。
   step win_l15_func_test "$WIN_L15_WRAPPER" --bundle "$WB_DIR/bundle" \
     --selftest-report "$SELFTEST_WINDOWS_PATH" --report-dir "$EV/func-test-windows"
   step spike3_win_wal "$SPIKE3_WRAPPER" --evidence-dir "$EV" \
@@ -394,6 +397,7 @@ main() {
     --l15-report "linux=$EV/func-test/func-test-report.json"
     --l15-report "linux=$EV/func-test-scenarios/func-test-report.json"
     --l15-report "windows=$EV/func-test-windows/func-test-report.json"
+    --l15-report "windows=$EV/func-test-windows/basic/func-test-report.json"
     --spike3-evidence "$EV/spike3"
     --win-report "$WB_REPORT" --windows-com "$WB_DIR")
   log "GATE_ARGS=${GATE_ARGS[*]}"
