@@ -163,14 +163,23 @@ def _markers(nodeid: str) -> set[str]:
 
 
 def _applicable_nodes(nodes: list[str], platform: str) -> list[str]:
-    selected: list[str] = []
-    excluded_marker = "posix_only" if platform == "windows" else "windows_native"
+    """該平台要執行的凍結 pytest 節點。
+
+    - windows：凍結 s1b_20groups selector（markexpr）收集到者，與 register／check 共用 `platform_applicability`
+      規則；不收集者（例如依賴 /proc 與 sh 的 test_daemon_restart_ab）不在 Windows 執行。
+    - linux：維持 HEAD 的負向標記過濾（僅排除 windows_native）。pidns_rig 標記不得把 test_daemon_restart_ab
+      排出 Linux A/B，否則 Linux A/B 覆蓋縮減（Stage 1 收尾審查回報，見 CHG-S1X-P4-APPL-01）。
+    """
     for node in nodes:
         if not (ROOT / node.split("::", 1)[0]).is_file():
             raise ValueError(f"凍結 pytest 來源不存在：{node}")
-        if excluded_marker in _markers(node):
-            continue
-        selected.append(node)
+    if platform == "windows":
+        from scripts.rust.check_p4_cases import platform_applicability
+
+        applicability = platform_applicability(nodes, cwd=ROOT, platforms=("windows",))
+        selected = [node for node in nodes if "windows" in applicability[node]]
+    else:
+        selected = [node for node in nodes if "windows_native" not in _markers(node)]
     if not selected:
         raise ValueError(f"平台 {platform} 沒有可執行的凍結 pytest 案例")
     return selected
@@ -183,14 +192,46 @@ def _run(argv: list[str], *, env: dict[str, str], timeout: int) -> subprocess.Co
     )
 
 
+def _host_pid_ns() -> str | None:
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
+def _pid_ns_of(pid: int) -> str | None:
+    try:
+        return os.readlink(f"/proc/{pid}/ns/pid")
+    except OSError:
+        return None
+
+
+def _namespace_members(namespace: str) -> list[int]:
+    """host /proc 上屬於指定 pid namespace 的行程（只計可讀取者；殭屍行程已無 ns 連結，視為已結束）。"""
+    members: list[int] = []
+    for proc_dir in Path("/proc").iterdir():
+        if proc_dir.name.isdigit() and _pid_ns_of(int(proc_dir.name)) == namespace:
+            members.append(int(proc_dir.name))
+    return sorted(members)
+
+
 def _release_check(pidlog: Path, out: Path, timeout_s: float = 10.0) -> dict[str, Any]:
+    """A 輪釋放檢查（POSIX）。
+
+    pidns_rig 子行程（位於外層 unshare 建立的不同 pid namespace）寫入的 pid 為 namespace 內部編號，不得拿去查
+    host 的 /proc/<pid>（回歸：host 恰有同號行程時 B 輪被誤判而未啟動）。因此列上 `pid_ns` 與 host 不同者，改以
+    「host /proc 上無任何行程屬於該 namespace」判定釋放；仍有成員即 unreaped，並列出其 host pid。
+    與 host 同 namespace 的列（含未附 pid_ns 的舊格式列）照原邏輯檢查 /proc/<pid>；外層 wrapper 的 host pid 屬此類。
+    """
     if os.name == "nt":
         return _release_check_windows(pidlog, out, timeout_s)
 
     import fcntl
 
+    host_ns = _host_pid_ns()
     parse_errors: list[str] = []
     pids: list[int] = []
+    foreign_namespaces: set[str] = set()
     sockets: list[str] = []
     locks: list[str] = []
     workdirs: list[str] = []
@@ -204,15 +245,19 @@ def _release_check(pidlog: Path, out: Path, timeout_s: float = 10.0) -> dict[str
                 row = json.loads(line)
                 if not isinstance(row, dict):
                     raise ValueError("不是 JSON 物件")
-                if row.get("pid"):
-                    pids.append(int(row["pid"]))
-                pids.extend(int(pid) for pid in row.get("children", []) if pid)
+                row_ns = str(row["pid_ns"]) if row.get("pid_ns") else None
+                if row_ns and host_ns and row_ns != host_ns:
+                    foreign_namespaces.add(row_ns)
+                else:
+                    if row.get("pid"):
+                        pids.append(int(row["pid"]))
+                    pids.extend(int(pid) for pid in row.get("children", []) if pid)
                 sockets.extend(str(value) for value in (row.get("socket"),) if value)
                 locks.extend(str(value) for value in (row.get("lock"),) if value)
                 workdirs.extend(str(row[key]) for key in ("run_dir", "state_dir") if row.get(key))
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 parse_errors.append(f"PID 日誌第 {number} 行無效：{exc}")
-    if not pids and not parse_errors:
+    if not pids and not foreign_namespaces and not parse_errors:
         parse_errors.append("A 輪 PID 日誌沒有受測行程")
 
     deadline = time.monotonic() + timeout_s
@@ -229,6 +274,16 @@ def _release_check(pidlog: Path, out: Path, timeout_s: float = 10.0) -> dict[str
             time.sleep(0.05)
         else:
             alive.append(pid)
+
+    namespace_members: set[int] = set()
+    for namespace in sorted(foreign_namespaces):
+        members_deadline = time.monotonic() + timeout_s
+        members = _namespace_members(namespace)
+        while members and time.monotonic() < members_deadline:
+            time.sleep(0.05)
+            members = _namespace_members(namespace)
+        namespace_members.update(members)
+    alive.extend(sorted(namespace_members))
 
     remaining_sockets = [
         socket[7:] if socket.startswith("unix://") else socket
@@ -251,6 +306,7 @@ def _release_check(pidlog: Path, out: Path, timeout_s: float = 10.0) -> dict[str
 
     held_fds: list[str] = []
     normalized_dirs = [os.path.realpath(path) for path in set(workdirs) if Path(path).exists()]
+    tracked_pids = set(pids) | namespace_members
     for proc_dir in Path("/proc").iterdir():
         if not proc_dir.name.isdigit() or int(proc_dir.name) == os.getpid():
             continue
@@ -267,7 +323,7 @@ def _release_check(pidlog: Path, out: Path, timeout_s: float = 10.0) -> dict[str
             if any(target.startswith(path) for path in normalized_dirs):
                 held_fds.append(f"pid {proc_dir.name} 持有 {target}")
                 break
-            if int(proc_dir.name) in pids and target.startswith("/dev/pts/"):
+            if int(proc_dir.name) in tracked_pids and target.startswith("/dev/pts/"):
                 held_fds.append(f"A 輪 pid {proc_dir.name} 仍持有 {target}")
                 break
     result = {
@@ -281,6 +337,8 @@ def _release_check(pidlog: Path, out: Path, timeout_s: float = 10.0) -> dict[str
         "remaining_sockets": remaining_sockets,
         "held_locks": held_locks,
         "held_fds": held_fds,
+        "pidns_foreign_namespaces": sorted(foreign_namespaces),
+        "pidns_unreaped_pids": sorted(namespace_members),
     }
     out.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     return result

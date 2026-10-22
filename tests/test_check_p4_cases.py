@@ -183,3 +183,33 @@ def test_placeholder_only_case_is_not_evidence(gate) -> None:
     assert gate.freeze(add_only=False) == 0
     _write_evidence(gate, "sc-a", [_pass_record(gate, "sc-a")])
     assert gate.check() == 1
+
+
+POSIX_NODE = "sw-pal::process_tunnel::posix_terminate_kills_whole_group_including_grandchild"
+PIDNS_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"
+
+
+def test_pass_on_platform_outside_cargo_selector_does_not_count(gate) -> None:
+    """平台適用性（G4-(e)）：cfg posix 節點的 windows PASS 不計入；linux PASS 足以放行 linux。"""
+    _write_map(gate, [_case("sc-a", platforms=["linux", "windows"], tests=[POSIX_NODE])])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, "sc-a", [
+        _pass_record(gate, "sc-a", platform="linux", test_id=f"cargo:{POSIX_NODE}"),
+        _pass_record(gate, "sc-a", platform="windows", test_id=f"cargo:{POSIX_NODE}"),
+    ])
+    assert gate.check() == 1
+
+
+def test_pass_on_applicable_platform_only_is_accepted(gate) -> None:
+    _write_map(gate, [_case("sc-a", platforms=["linux"], tests=[POSIX_NODE])])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, "sc-a", [_pass_record(gate, "sc-a", platform="linux", test_id=f"cargo:{POSIX_NODE}")])
+    assert gate.check() == 0
+
+
+def test_pass_for_node_outside_every_selector_is_rejected(gate) -> None:
+    """兩個平台的凍結 selector 都不收集的 contract_blackbox 節點（test_daemon_restart_ab 型態）即使有 PASS 亦 FAIL。"""
+    _write_map(gate, [_case("sc-a", platforms=["linux"], tests=[PIDNS_NODE])])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, "sc-a", [_pass_record(gate, "sc-a", platform="linux", test_id=PIDNS_NODE)])
+    assert gate.check() == 1

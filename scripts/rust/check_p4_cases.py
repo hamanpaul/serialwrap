@@ -21,6 +21,9 @@
      **唯一判定實作為 P2 `tests/acceptance/l1_judge.py`**（依路徑以 importlib 載入，本檔不另寫判定規則）；
      verdict 非 `PASS` 一律失敗。P2 模組缺席即 `BLOCKED-PREREQ`（L1 證據不足，exit 1），不得放行。
   9. S1X 擁有者機台相依列（`owner_gated.py`）：`s1b_cargo` 的 cargo 報告中 `cap_*`／登記列為 skipped → BLOCKED-OWNER（列出，exit 2 類，不因不在鎖內而消失）；登記列於 selector 涵蓋範圍內缺席 → INSUFFICIENT。
+- 平台適用性（G4）：受測 HEAD 且帶 `test_id` 的紀錄，若節點屬 cargo／contract_blackbox pytest 範圍，須其 platform
+  在 `platform_applicability` 算出的適用集合內（cargo 依 s1b_cargo 鎖；pytest 依該平台 s1b_20groups selector 的 markexpr 收集）；
+  不適用或兩平台皆不適用者不計入／FAIL。與 register_p4_evidence、ab_blackbox_1b 共用同一實作。
 - 判定結果：任一硬性失敗 → exit 1（「證據不足不得轉為 PASS」，不變量 `insufficient_evidence_not_pass`）。
   若唯一的缺口是 `evidence_status: BLOCKED-OWNER` 的 L2／L3／manual 案例證據（擁有者機台待補） → exit 2（BLOCKED-OWNER）。
   全部通過 → exit 0。失敗列同時輸出到 stdout 與 stderr 的摘要行。
@@ -330,13 +333,101 @@ def _layer_problem(labels: ModuleType | None, record: dict[str, Any], case_layer
     return None
 
 
+# ── P4 平台適用性規則（Stage 1 收尾 G4-(d)(e)）─────────────────────────────────────────────────────
+# register_p4_evidence、check_p4_cases、ab_blackbox_1b 共用本節同一條規則（不得各自實作）：
+# - cargo 節點（`sw-…::…`）：該平台 s1b_cargo 凍結鎖的 nodeids 含 `cargo:<節點>`。
+# - contract_blackbox pytest 節點（`tests/contract_blackbox/…::…`）：該平台 s1b_20groups 凍結 selector 的 markexpr
+#   收集得到該節點（pytest --collect-only -m <markexpr>，與凍結 selector 同一收集語意）。
+# 不適用者不產生記錄、也不在該平台執行；每個 case.platforms 平台至少要有一筆適用且 PASS 的記錄；
+# 兩個平台都不適用的節點一律 FAIL。不屬於上述兩類的節點（例如 tests/ 下的單元節點）不在本規則內。
+CARGO_SELECTOR_SET = "s1b_cargo"
+PYTEST_SELECTOR_SET = "s1b_20groups"
+CARGO_LOCK_PREFIX = "cargo:"
+WINDOWS_TARGET_TRIPLE = "x86_64-pc-windows-gnu"
+# pytest 收集結果為「沒有任何測試被收集」（全數被 -m 取消選取）時的退出碼。
+PYTEST_NO_TESTS_COLLECTED = 5
+
+
+def applicability_rule_applies(node: str) -> bool:
+    text = str(node)
+    if text.startswith("sw-") and "::" in text:
+        return True
+    return text.startswith("tests/contract_blackbox/") and "::" in text
+
+
+def _rule_node_id(test_id: Any) -> str | None:
+    """紀錄的 test_id → 適用性規則的節點名（cargo 紀錄帶 `cargo:` 前綴）；不在規則範圍者回 None。"""
+    if not isinstance(test_id, str):
+        return None
+    node = test_id.removeprefix(CARGO_LOCK_PREFIX)
+    return node if applicability_rule_applies(node) else None
+
+
+def load_l1_lock(path: Path | None = None) -> dict[str, Any]:
+    lock_path = L1_LOCK if path is None else path
+    return json.loads(lock_path.read_text(encoding="utf-8"))
+
+
+def pytest_markexpr(lock: dict[str, Any], platform: str) -> str:
+    return str(lock["sets"][PYTEST_SELECTOR_SET][platform]["selector"]["markexpr"])
+
+
+def cargo_selector_argv(lock: dict[str, Any], platform: str) -> list[str]:
+    return [str(item) for item in lock["sets"][CARGO_SELECTOR_SET][platform]["selector"]["argv"]]
+
+
+def pytest_collected(nodes: list[str], markexpr: str, cwd: Path) -> set[str]:
+    """以 `pytest --collect-only -m <markexpr>` 取得被凍結 selector 收集的節點（逐字 nodeid）。"""
+    argv = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", markexpr, *nodes]
+    res = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
+    if res.returncode not in (0, PYTEST_NO_TESTS_COLLECTED):
+        raise RuntimeError(f"pytest --collect-only 失敗（rc={res.returncode}）：{(res.stderr or res.stdout)[-400:]}")
+    return {line.strip() for line in res.stdout.splitlines() if "::" in line}
+
+
+def platform_applicability(
+    nodes: list[str],
+    *,
+    cwd: Path,
+    lock: dict[str, Any] | None = None,
+    platforms: tuple[str, ...] = PLATFORMS,
+) -> dict[str, frozenset[str]]:
+    """每個節點可執行的平台集合（依上述共用規則）。來源檔不存在的 pytest 節點視為未被收集（不適用）。"""
+    lock_data = load_l1_lock() if lock is None else lock
+    unsupported = sorted(node for node in nodes if not applicability_rule_applies(node))
+    if unsupported:
+        raise ValueError(f"節點不在平台適用性規則內：{unsupported}")
+    result: dict[str, set[str]] = {str(node): set() for node in nodes}
+    cargo_nodes = [node for node in result if str(node).startswith("sw-")]
+    pytest_nodes = [
+        node for node in result
+        if not str(node).startswith("sw-") and (cwd / str(node).split("::", 1)[0]).is_file()
+    ]
+    for platform in platforms:
+        frozen = set(lock_data["sets"][CARGO_SELECTOR_SET][platform]["nodeids"])
+        for node in cargo_nodes:
+            if f"{CARGO_LOCK_PREFIX}{node}" in frozen:
+                result[node].add(platform)
+        if pytest_nodes:
+            collected = pytest_collected(pytest_nodes, pytest_markexpr(lock_data, platform), cwd)
+            for node in pytest_nodes:
+                if node in collected:
+                    result[node].add(platform)
+    return {node: frozenset(values) for node, values in result.items()}
+
+
 def check_case_evidence(
     case: dict[str, Any],
     head: str,
     evidence_dir: Path,
     labels: ModuleType | None,
+    applicability: dict[str, frozenset[str]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], str]:
-    """回傳（問題列, 通過紀錄, 證據檔路徑字串）。"""
+    """回傳（問題列, 通過紀錄, 證據檔路徑字串）。
+
+    `applicability`：節點 → 適用平台集合（見 `platform_applicability`）。受測 HEAD 的紀錄若帶 `test_id` 且屬適用性規則
+    範圍，須該紀錄的 platform 在適用集合內；適用集合為空（兩平台皆不在凍結 selector）即 FAIL。
+    """
     cid = case["case_id"]
     problems: list[str] = []
     if all(is_placeholder(t) for t in case.get("tests", [])):
@@ -370,6 +461,18 @@ def check_case_evidence(
         if record["commit"] != head:
             stale += 1
             continue
+        node_id = _rule_node_id(record.get("test_id"))
+        if applicability is not None and node_id is not None and node_id in applicability:
+            platforms_for_node = applicability[node_id]
+            if not platforms_for_node:
+                problems.append(f"{cid}#{idx}: 節點 {node_id} 不在 linux／windows 任一凍結 selector 中，一律 FAIL")
+                continue
+            if record["platform"] not in platforms_for_node:
+                problems.append(
+                    f"{cid}#{idx}: 節點 {node_id} 不適用於 {record['platform']}"
+                    f"（僅適用 {sorted(platforms_for_node)}），不計入"
+                )
+                continue
         if record["result"] == "FAIL":
             problems.append(f"{cid}: {record['platform']}／{record['round']} 證據 FAIL")
             continue
@@ -485,6 +588,67 @@ def check_l1(
     return rows
 
 
+def _evidence_test_ids(cases: list[dict[str, Any]], evidence_dir: Path, head: str) -> set[str]:
+    """必要案例證據中、受測 HEAD、屬適用性規則範圍（cargo／contract_blackbox pytest）的 test_id。"""
+    ids: set[str] = set()
+    for case in cases:
+        if case.get("necessity") != "required":
+            continue
+        try:
+            data = json.loads((evidence_dir / f"{case['case_id']}.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            continue
+        records = data.get("records") if isinstance(data, dict) else None
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict) or record.get("commit") != head:
+                continue
+            node_id = _rule_node_id(record.get("test_id"))
+            if node_id is not None:
+                ids.add(node_id)
+    return ids
+
+
+def _case_rule_nodes(cases: list[dict[str, Any]]) -> set[str]:
+    """必要案例映射（tests）中屬適用性規則範圍的節點（cargo 去除前綴）。"""
+    nodes: set[str] = set()
+    for case in cases:
+        if case.get("necessity") != "required":
+            continue
+        for test in case.get("tests", []):
+            node = _rule_node_id(test)
+            if node is not None:
+                nodes.add(node)
+    return nodes
+
+
+def _not_applicable_pairs(cases: list[dict[str, Any]], applicability: dict[str, frozenset[str]]) -> list[dict[str, str]]:
+    """必要案例中「節點適用於其他平台、不適用於本案例某平台」的（案例, 平台, 節點）組合。
+
+    這些組合不產生紀錄、也不在該平台執行，因此須在 summary.json 逐列列出（不得靜默縮小分母）。
+    兩平台皆不適用者不在此列，一律 FAIL（見 check_case_evidence）。
+    """
+    rows: list[dict[str, str]] = []
+    for case in cases:
+        if case.get("necessity") != "required":
+            continue
+        for test in case.get("tests", []):
+            node = _rule_node_id(test)
+            if node is None or not applicability.get(node):
+                continue
+            for plat in case.get("platforms", []):
+                if plat not in applicability[node]:
+                    rows.append({
+                        "case_id": case["case_id"],
+                        "platform": plat,
+                        "node": node,
+                        "reason": f"節點僅適用於 {sorted(applicability[node])}（platform_applicability），{plat} 不產生紀錄",
+                    })
+    rows.sort(key=lambda r: (r["case_id"], r["platform"], r["node"]))
+    return rows
+
+
 def check(
     evidence_dir: Path | None = None,
     l1_dir: Path | None = None,
@@ -523,6 +687,17 @@ def check(
         if gone:
             failures.append(f"{cid}: 凍結時的承接節點已不存在於映射表：{gone}")
 
+    applicability: dict[str, frozenset[str]] = {}
+    evidence_test_ids = _evidence_test_ids(cases, evidence_dir, head)
+    # 適用性須涵蓋全部必要案例的規則節點（不只有證據節點），才能逐列列出不適用的（案例, 平台, 節點）組合。
+    rule_nodes = sorted(evidence_test_ids | _case_rule_nodes(cases))
+    if rule_nodes:
+        try:
+            applicability = platform_applicability(rule_nodes, cwd=REPO_ROOT)
+        except (RuntimeError, ValueError, OSError, KeyError) as exc:
+            failures.append(f"平台適用性收集失敗（fail-closed，不得放行）：{exc}")
+    not_applicable = _not_applicable_pairs(cases, applicability)
+
     summary_cases: list[dict[str, Any]] = []
     for cid, case in current.items():
         if case.get("necessity") != "required":
@@ -530,7 +705,9 @@ def check(
         case_problems: list[str] = []
         if cid not in frozen_ids:
             case_problems.append(f"{cid}: 必要案例未凍結（請以 --freeze --add-only 登記）")
-        problems, passing, evidence_file = check_case_evidence(case, head, evidence_dir, labels)
+        problems, passing, evidence_file = check_case_evidence(
+            case, head, evidence_dir, labels, applicability
+        )
         case_problems.extend(problems)
         owner = case.get("evidence_status") == BLOCKED_OWNER and case.get("layer") in BLOCKED_OWNER_LAYERS
         status = "PASS"
@@ -583,6 +760,7 @@ def check(
         "failure_count": len(failures),
         "blocked_owner_count": len(owner_gaps),
         "cases": summary_cases,
+        "not_applicable": not_applicable,
         "l1": {
             "status": ("PASS" if all(r["verdict"] == "PASS" for r in l1_rows)
                        else "BLOCKED-OWNER" if all(r["verdict"] in ("PASS", "BLOCKED-OWNER") for r in l1_rows)
@@ -601,6 +779,9 @@ def check(
 
     for line in list(failures) + [f"BLOCKED-OWNER（僅擁有者機台證據待補，exit 2）：{g}" for g in owner_gaps]:
         print(line)
+    print(f"not_applicable：{len(not_applicable)} 筆（不產生紀錄、不在該平台執行；逐列見 summary.json）")
+    for row in not_applicable:
+        print(f"  not_applicable {row['case_id']} {row['platform']} {row['node']}：{row['reason']}")
     if failures:
         print(f"FAIL：{len(failures)} 項", file=sys.stderr)
         return 1

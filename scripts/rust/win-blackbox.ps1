@@ -282,7 +282,7 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
     Write-Json (Join-Path $versionRoot 'release-manifest.json') $manifest
     Write-Json (Join-Path $binRoot 'current-release.json') ([ordered]@{
         bundle_version = $version
-        dir = "..\versions\$version"
+        dir = "versions\$version"
     })
     return $BundleRoot
 }
@@ -761,6 +761,39 @@ finally:
 $sourceRoot = (Resolve-Path -LiteralPath $RepoSnapshot).ProviderPath
 $rustExecutable = (Resolve-Path -LiteralPath $RustExe).ProviderPath
 if (-not (Test-Path -LiteralPath $rustExecutable -PathType Leaf)) { throw "Rust CLI 不存在：$RustExe" }
+function Copy-BlackboxDiagnostics([string]$StagingRepo, [string]$BundleRoot, [string]$OutputRoot) {
+    # ab-suite 輸出（A/B 執行器）位於 staging 的 l1\windows\blackbox\ab-suite\（與 SW_RESOURCE_REPORT 同層）；
+    # Windows dev bundle 亦只存在於 scratch。staging 於 finally 刪除前必須複製回 OutDir，否則失敗時無法診斷，
+    # register 也拿不到 --windows-cli（plan 04 Task 17）。
+    $abSource = Join-Path $StagingRepo 'l1\windows\blackbox\ab-suite'
+    if (Test-Path -LiteralPath $abSource -PathType Container) {
+        $abDestination = Join-Path $OutputRoot 'l1\windows\blackbox\ab-suite'
+        if (Test-Path -LiteralPath $abDestination) { Remove-Item -LiteralPath $abDestination -Recurse -Force }
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $abDestination) -Force
+        Copy-Item -LiteralPath $abSource -Destination $abDestination -Recurse -Force
+    }
+    # 匯出 Windows dev bundle 到 OutDir\bundle\。versions\<V>\bin\serialwrap.exe 為 release-manifest 的 cli.path 所指，
+    # register 的 Rust CLI artifact 必須是它（與 manifest 路徑相符），bin\serialwrap.exe 為同一位元內容的入口複本。
+    if (Test-Path -LiteralPath (Join-Path $BundleRoot 'bin\serialwrap.exe') -PathType Leaf) {
+        $bundleVersion = (Get-Content -LiteralPath (Join-Path $StagingRepo 'VERSION') -Raw).Trim()
+        $bundleFiles = @('bin\serialwrap.exe', 'bin\current-release.json',
+                         "versions\$bundleVersion\release-manifest.json",
+                         "versions\$bundleVersion\bin\serialwrap.exe")
+        $bundleDestination = Join-Path $OutputRoot 'bundle'
+        foreach ($relative in $bundleFiles) {
+            # 組裝中途失敗時（例如 current-release.json 尚未寫出）逐檔檢查來源，缺者只警告略過。
+            $source = Join-Path $BundleRoot $relative
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                Write-Warning "bundle 檔案不存在，略過匯出：$relative"
+                continue
+            }
+            $destination = Join-Path $bundleDestination $relative
+            $null = New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+}
+
 $outputRoot = [System.IO.Path]::GetFullPath($OutDir)
 $null = New-Item -ItemType Directory -Path $outputRoot -Force
 $runId = '{0}-{1}' -f [DateTime]::UtcNow.ToString('yyMMdd-HHmmss'), $PID
@@ -1031,5 +1064,13 @@ try {
             }
         }
     }
-    Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    # 診斷輸出與 Windows dev bundle 必須在 staging 刪除前複製回 OutDir（失敗路徑亦然）。
+    # 複製失敗（例如 bundle 尚未組完）只記錄警告，不得覆蓋原錯誤；scratch 一定要刪除（巢狀 finally）。
+    try {
+        Copy-BlackboxDiagnostics $stagingRepo $bundleRoot $outputRoot
+    } catch {
+        Write-Warning "診斷複製失敗（不覆蓋原錯誤）：$($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

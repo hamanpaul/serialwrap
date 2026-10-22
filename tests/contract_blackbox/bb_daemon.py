@@ -88,6 +88,18 @@ def _collect_pids(pid: int) -> list[int]:
     return pids
 
 
+def _current_pid_ns() -> str | None:
+    """本行程所屬 pid namespace 的連結字串（`pid:[inode]`）；非 POSIX 或無法讀取回 None。
+
+    釋放檢查（scripts/rust/ab_blackbox_1b.py）以此區分「與 host 同 namespace」與「pidns_rig 子行程的內部 pid」：
+    後者的 pid 數字是 namespace 內編號，不得拿去查 host 的 /proc/<pid>。
+    """
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
 class PyDaemon:
     def __init__(self, env: Mapping[str, str], *, profile_dir: Path, socket: str, lock: Path) -> None:
         self.env = dict(env)
@@ -123,6 +135,7 @@ class PyDaemon:
         if pidlog:
             record = {
                 "pid": self.proc.pid,
+                "pid_ns": _current_pid_ns(),
                 "children": [],
                 "socket": self.socket,
                 "lock": str(self.lock),
@@ -150,6 +163,7 @@ class PyDaemon:
         if pidlog and len(self._pids) > 1:
             record = {
                 "pid": self.proc.pid,
+                "pid_ns": _current_pid_ns(),
                 "children": [p for p in self._pids if p != self.proc.pid],
                 "socket": self.socket,
                 "lock": str(self.lock),

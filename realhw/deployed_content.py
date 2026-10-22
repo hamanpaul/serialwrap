@@ -69,7 +69,11 @@ def tree_digests(bundle_dir: pathlib.Path) -> tuple[str, str]:
 
 
 def install_dir(cli_exe: pathlib.Path) -> pathlib.Path | None:
-    """依 POSIX symlink bundle 或 Windows current-release sidecar 尋找安裝。"""
+    """依 POSIX symlink bundle 或 Windows current-release sidecar 尋找安裝。
+
+    Windows 的 `dir` 為相對安裝根（`bin` 的上一層）的 `versions\\<V>`（plan 04 Task 17；rollback.rs 寫入 `versions/<V>`），
+    故以 `cli.parent.parent` 為基準；反斜線分隔先正規化為 `/`，絕對路徑照舊。
+    """
     cli = _path(cli_exe).resolve()
     if os.name == "nt":
         pointer = cli.parent / "current-release.json"
@@ -77,9 +81,9 @@ def install_dir(cli_exe: pathlib.Path) -> pathlib.Path | None:
             return None
         try:
             data = json.loads(pointer.read_text(encoding="utf-8"))
-            candidate = _path(data["dir"])
+            candidate = _path(str(data["dir"]).replace("\\", "/"))
             if not candidate.is_absolute():
-                candidate = cli.parent / candidate
+                candidate = cli.parent.parent / candidate
             candidate = candidate.resolve()
         except (OSError, ValueError, KeyError, TypeError):
             return None

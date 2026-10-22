@@ -18,6 +18,9 @@ from typing import Any, Iterable
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_p4_cases as p4_rule  # noqa: E402  平台適用性規則的唯一實作（G4-(d)(e)）
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CASE_MAP = ROOT / "tests" / "acceptance" / "p4_case_map.yaml"
@@ -281,21 +284,47 @@ def _l1_outcome(
     return True, None
 
 
-def _rust_manifest(cli: Path, commit: str) -> tuple[dict[str, Any] | None, str | None]:
-    """驗證 Rust CLI 位於標示受測 HEAD 的 bundle，且 manifest SHA 對應實際執行檔。"""
-    if not cli.is_file():
-        return None, "Rust CLI artifact 不存在"
+def _manifest_candidates(cli: Path) -> tuple[list[Path], str | None]:
+    """依 bundle 佈局列出 release-manifest.json 候選路徑（指標優先，之後為安裝根）。
+
+    指標 `current-release.json` 的 `dir` 為相對安裝根（`cli.parent.parent`）的 `versions\\<V>`（plan 04 Task 17），
+    反斜線先正規化為 `/`；絕對路徑照舊。指標存在但無法解析即回報錯誤，不得靜默略過。
+    """
     candidates = [cli.parent.parent / "release-manifest.json"]
     pointer = cli.parent / "current-release.json"
     if pointer.is_file():
         try:
             data = json.loads(pointer.read_text(encoding="utf-8"))
-            directory = Path(data["dir"])
+            directory = Path(str(data["dir"]).replace("\\", "/"))
             if not directory.is_absolute():
-                directory = cli.parent / directory
+                directory = cli.parent.parent / directory
             candidates.insert(0, directory / "release-manifest.json")
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            return None, "current-release.json 無法解析"
+            return [], "current-release.json 無法解析"
+    return candidates, None
+
+
+def _windows_stable_entry_of(cli: Path, manifest_path: Path, relative: str) -> bool:
+    """Windows 穩定入口 `<根>\\bin\\<name>` 是 `<根>\\versions\\<V>\\<relative>` 的 byte 複本（無 symlink，`resolve()` 無法對應）。
+
+    僅在下列條件同時成立時視為同一受測 CLI：入口位於 `bin\\`，同目錄指標 current-release.json 解析到此 manifest 所在
+    版本目錄，且 manifest 所指檔案存在。內容相同由呼叫端既有的 sha256 比對（manifest 的 cli.sha256 == 實際 artifact）保證。
+    """
+    if cli.parent.name != "bin":
+        return False
+    candidates, error = _manifest_candidates(cli)
+    if error or not candidates or candidates[0].parent.resolve() != manifest_path.parent.resolve():
+        return False
+    return (manifest_path.parent / relative).is_file()
+
+
+def _rust_manifest(cli: Path, commit: str) -> tuple[dict[str, Any] | None, str | None]:
+    """驗證 Rust CLI 位於標示受測 HEAD 的 bundle，且 manifest SHA 對應實際執行檔。"""
+    if not cli.is_file():
+        return None, "Rust CLI artifact 不存在"
+    candidates, candidate_error = _manifest_candidates(cli)
+    if candidate_error:
+        return None, candidate_error
     manifest_path = next((path for path in candidates if path.is_file()), None)
     if manifest_path is None:
         return None, "Rust CLI bundle 缺少 release-manifest.json"
@@ -321,7 +350,7 @@ def _rust_manifest(cli: Path, commit: str) -> tuple[dict[str, Any] | None, str |
         manifest_cli.relative_to(root)
     except ValueError:
         return None, "release manifest CLI path 超出 bundle"
-    if manifest_cli != cli.resolve():
+    if manifest_cli != cli.resolve() and not _windows_stable_entry_of(cli, manifest_path, relative):
         return None, "release manifest CLI path 與受測 artifact 不符"
     actual_sha = _sha256(cli)
     if component.get("sha256") != actual_sha:
@@ -454,41 +483,95 @@ def _listed_tests(path: Path, platform: str, win_runner: Path) -> set[str] | Non
     return names
 
 
+def _package_name(package_id: str) -> str:
+    """cargo JSON 的 package_id：`path+file://…/<dir>#<version>`（名稱即目錄名）或 `…#<name>@<version>`。"""
+    url, _, fragment = package_id.partition("#")
+    if "@" in fragment:
+        return fragment.split("@", 1)[0]
+    return url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _parse_cargo_artifacts(stdout: str) -> dict[tuple[str, str], list[Path]]:
+    """解析 `cargo test --no-run --message-format=json`：(package, target 名稱) → 測試執行檔（去重、排序）。"""
+    found: dict[tuple[str, str], set[str]] = {}
+    for line in stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
+            continue
+        profile = message.get("profile") or {}
+        executable = message.get("executable")
+        target = message.get("target") or {}
+        if not isinstance(profile, dict) or not profile.get("test") or not executable:
+            continue
+        key = (_package_name(str(message.get("package_id", ""))), str(target.get("name", "")))
+        found.setdefault(key, set()).add(str(executable))
+    return {key: [Path(item) for item in sorted(values)] for key, values in found.items()}
+
+
+def _cargo_artifact_index(
+    args: argparse.Namespace,
+    platform: str,
+    cache: dict[Any, Any],
+) -> tuple[dict[tuple[str, str], list[Path]], str | None]:
+    """以凍結 s1b_cargo selector 的 argv 執行 `cargo test --no-run --message-format=json`（每平台至多一次）。
+
+    Windows 加 `--target x86_64-pc-windows-gnu`（與 selector 建置目標一致）；失敗即 fail-closed。
+    """
+    key = ("cargo-index", platform)
+    if key in cache:
+        return cache[key]
+    lock = p4_rule.load_l1_lock(L1_LOCK)
+    argv = ["cargo", "test", "--no-run", "--message-format=json",
+            "--target-dir", str(args.cargo_target_dir), *p4_rule.cargo_selector_argv(lock, platform)]
+    env = os.environ.copy()
+    if platform == "windows":
+        argv.extend(["--target", p4_rule.WINDOWS_TARGET_TRIPLE])
+        env.setdefault("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER", "x86_64-w64-mingw32-gcc")
+    try:
+        proc = subprocess.run(argv, cwd=args.repo_root, capture_output=True, text=True, check=False, env=env)
+    except OSError as exc:
+        result: tuple[dict[tuple[str, str], list[Path]], str | None] = ({}, f"cargo 無法執行：{type(exc).__name__}")
+    else:
+        if proc.returncode != 0:
+            result = ({}, f"cargo test --no-run 失敗（rc={proc.returncode}）")
+        else:
+            result = (_parse_cargo_artifacts(proc.stdout), None)
+    cache[key] = result
+    return result
+
+
+def _listed_tests_cached(path: Path, platform: str, win_runner: Path, cache: dict[Any, Any]) -> set[str]:
+    key = ("listed", platform, str(path))
+    if key not in cache:
+        cache[key] = _listed_tests(path, platform, win_runner) or set()
+    return cache[key]
+
+
 def _cargo_executable(
-    cargo_target_dir: Path,
+    args: argparse.Namespace,
     platform: str,
     nodeid: str,
-    win_runner: Path,
-    cache: dict[tuple[str, str, str, str], Path | None],
+    cache: dict[Any, Any],
 ) -> tuple[Path | None, str | None]:
     parts = _test_exe_parts(nodeid)
     if parts is None:
         return None, "Cargo nodeid 格式無法解析"
     crate, target, test_name = parts
-    cache_key = (platform, crate, target, test_name)
-    if cache_key in cache:
-        path = cache[cache_key]
-        return (path, None) if path is not None else (None, "找不到唯一包含必要測試的 Cargo test executable")
-
-    platform_dir = cargo_target_dir / "debug" / "deps"
-    if platform == "windows":
-        platform_dir = cargo_target_dir / "x86_64-pc-windows-gnu" / "debug" / "deps"
-    candidates = [
-        path
-        for path in sorted(platform_dir.glob(target + "-*"))
-        if path.is_file()
-        and (path.suffix.lower() == ".exe" if platform == "windows" else os.access(path, os.X_OK))
-    ]
-    matches = [
-        path
-        for path in candidates
-        if test_name in (_listed_tests(path, platform, win_runner) or set())
-    ]
-    resolved = matches[0] if len(matches) == 1 else None
-    cache[cache_key] = resolved
-    if resolved is None:
+    index, index_error = _cargo_artifact_index(args, platform, cache)
+    if index_error:
+        return None, index_error
+    matches = index.get((crate, target), [])
+    if len(matches) != 1:
         return None, "找不到唯一包含必要測試的 Cargo test executable"
-    return resolved, None
+    executable = matches[0]
+    if not executable.is_file():
+        return None, "找不到唯一包含必要測試的 Cargo test executable"
+    if test_name not in _listed_tests_cached(executable, platform, args.windows_runner, cache):
+        return None, "找不到唯一包含必要測試的 Cargo test executable"
+    return executable, None
 
 
 def _artifact(path: Path | None) -> tuple[str | None, str | None]:
@@ -535,7 +618,7 @@ def _cargo_records(
     platform: str,
     commit: str,
     args: argparse.Namespace,
-    executable_cache: dict[tuple[str, str, str, str], Path | None],
+    executable_cache: dict[Any, Any],
 ) -> list[dict[str, Any]]:
     case_id = str(case["case_id"])
     report_path = args.l1_dir / platform / "cargo" / "resource-report.json"
@@ -553,10 +636,9 @@ def _cargo_records(
         ]
         if len(matching) == 1:
             exe, exe_reason = _cargo_executable(
-                args.cargo_target_dir,
+                args,
                 platform,
                 matching[0].removeprefix("cargo:"),
-                args.windows_runner,
                 executable_cache,
             )
             if exe_reason:
@@ -749,6 +831,21 @@ def _merge_records(path: Path, case_id: str, generated: list[dict[str, Any]]) ->
     return merged, appended
 
 
+def _applicability(cases: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, frozenset[str]]:
+    """待登錄案例中、屬平台適用性規則範圍的節點 → 適用平台集合（與 check_p4_cases 共用同一實作）。"""
+    nodes = sorted({
+        str(node)
+        for case in cases
+        for node in case.get("tests", [])
+        if p4_rule.applicability_rule_applies(str(node))
+    })
+    if not nodes:
+        return {}
+    return p4_rule.platform_applicability(
+        nodes, cwd=args.source_root, lock=p4_rule.load_l1_lock(L1_LOCK)
+    )
+
+
 def register(args: argparse.Namespace) -> dict[str, Any]:
     _assert_clean_tree(args.repo_root)
     commit = _head(args.repo_root)
@@ -757,7 +854,9 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
     generated_records = 0
     failed_records = 0
     skipped_cases: list[str] = []
-    executable_cache: dict[tuple[str, str, str, str], Path | None] = {}
+    executable_cache: dict[Any, Any] = {}
+    registrable = [case for case in cases if str(case.get("case_id", "")) and not _is_owner_case(case)]
+    applicable = _applicability(registrable, args)
 
     for case in cases:
         case_id = str(case.get("case_id", ""))
@@ -769,6 +868,18 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
         for platform in case.get("platforms", []):
             for nodeid in case.get("tests", []):
                 node = str(nodeid)
+                if p4_rule.applicability_rule_applies(node):
+                    platforms_for_node = applicable.get(node, frozenset())
+                    if not platforms_for_node:
+                        # 兩個平台的凍結鎖（s1b_20groups／s1b_cargo）都不含此節點：一律 FAIL（每個案例平台各一筆）。
+                        records.append(_record(
+                            case_id, "rust", platform, commit, None, "FAIL", node, str(args.l1_dir),
+                            "節點不在 linux／windows 任一凍結 selector（s1b_20groups／s1b_cargo）中，一律 FAIL",
+                        ))
+                        continue
+                    if platform not in platforms_for_node:
+                        # 不適用於此平台：不產生記錄，也不在此平台執行。
+                        continue
                 if node.startswith("tests/contract_blackbox/") and "::" in node:
                     records.extend(_pytest_records(case, node, platform, commit, args))
                 elif node.startswith("sw-") and "::" in node:
@@ -828,7 +939,7 @@ def main(argv: list[str] | None = None) -> int:
             if value:
                 setattr(args, name, str(Path(value).resolve()))
         summary = register(args)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, ValueError, RuntimeError, yaml.YAMLError) as exc:
         print(f"register_p4_evidence: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))

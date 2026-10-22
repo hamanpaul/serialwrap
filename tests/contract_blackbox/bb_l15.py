@@ -202,6 +202,29 @@ def unshare_pidns_argv() -> list[str] | None:
     return argv if probe.returncode == 0 else None
 
 
+def record_wrapper_pid(proc_pid: int, nodeid: str, outer_ns: str | None = None) -> None:
+    """將外層 unshare wrapper 的 host pid 寫入 SW_AB_PIDLOG（未設定即略過）。
+
+    子 pytest 內的 daemon 列只能記 namespace 內部 pid；wrapper 行程位於外層（host）namespace，釋放檢查
+    以 host /proc 核對其已被回收（scripts/rust/ab_blackbox_1b.py `_release_check`）。
+    """
+    pidlog = os.environ.get("SW_AB_PIDLOG")
+    if not pidlog:
+        return
+    row = {
+        "pid": int(proc_pid),
+        "children": [],
+        "socket": None,
+        "lock": None,
+        "run_dir": None,
+        "pid_ns": outer_ns if outer_ns is not None else current_pidns_link(),
+        "wrapper": "unshare",
+        "nodeid": nodeid,
+    }
+    with open(pidlog, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
 def run_nodeid_in_pidns(nodeid: str, rootpath: Path) -> tuple[str, str]:
     """於新 pid namespace 內重跑單一 pytest nodeid；回傳 (outcome, message)。
 
@@ -234,6 +257,7 @@ def run_nodeid_in_pidns(nodeid: str, rootpath: Path) -> tuple[str, str]:
                 cmd, cwd=str(rootpath), env=env, stdin=subprocess.DEVNULL,
                 stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
             )
+            record_wrapper_pid(proc.pid, nodeid, outer)
             try:
                 returncode = proc.wait(timeout=PIDNS_CHILD_TIMEOUT_S)
             except subprocess.TimeoutExpired:

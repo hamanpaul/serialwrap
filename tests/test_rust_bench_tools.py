@@ -14,9 +14,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -814,3 +817,172 @@ def test_check_p4_owner_skip_does_not_hide_other_missing_required(tmp_path: Path
     _place_cargo_report(l1, "linux", outcomes)
     row = _cargo_row(mod, lock_path, l1)
     assert row["verdict"] == "INSUFFICIENT", row
+
+
+# ── P4 A 輪資源釋放檢查：pidns_rig 行程的 namespace 感知（Stage 1 收尾 G4-(b)）─────────────────────────────
+AB_BLACKBOX_1B = ROOT / "scripts" / "rust" / "ab_blackbox_1b.py"
+_POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="pid namespace 與 /proc 僅 POSIX")
+
+
+def _load_ab_blackbox_1b():
+    spec = importlib.util.spec_from_file_location("ab_blackbox_1b_release_under_test", AB_BLACKBOX_1B)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _host_pid_ns() -> str:
+    return os.readlink("/proc/self/ns/pid")
+
+
+def _write_pidlog(path: Path, rows: list[dict]) -> Path:
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+@_POSIX_ONLY
+def test_release_check_never_probes_host_pid_of_foreign_namespace_row(tmp_path: Path) -> None:
+    """pidns_rig 子行程寫入的 pid 為 namespace 內部編號（回歸：B 輪因 pid 120 被誤查 host /proc/120 而未啟動）。
+
+    不同 namespace 的列不得以該數字查 host 行程；此處 host 上恰有一個同號行程存活，釋放檢查仍須判定為已釋放。
+    """
+    ab = _load_ab_blackbox_1b()
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        pidlog = _write_pidlog(tmp_path / "a.pids", [
+            {"pid": sleeper.pid, "children": [], "socket": None, "lock": None, "run_dir": None,
+             "pid_ns": "pid:[4026539999]"},
+        ])
+        result = ab._release_check(pidlog, tmp_path / "release.json", timeout_s=1.0)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert sleeper.pid not in result["unreaped_pids"], result
+    assert result["ok"] is True, result
+
+
+@_POSIX_ONLY
+def test_release_check_still_flags_live_pid_in_host_namespace(tmp_path: Path) -> None:
+    """嚴格度不降低：與 host 同 namespace 的存活行程仍為 unreaped。"""
+    ab = _load_ab_blackbox_1b()
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        pidlog = _write_pidlog(tmp_path / "a.pids", [
+            {"pid": sleeper.pid, "children": [], "socket": None, "lock": None, "run_dir": None,
+             "pid_ns": _host_pid_ns()},
+        ])
+        result = ab._release_check(pidlog, tmp_path / "release.json", timeout_s=0.5)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert sleeper.pid in result["unreaped_pids"], result
+    assert result["ok"] is False, result
+
+
+@_POSIX_ONLY
+def test_release_check_flags_populated_foreign_namespace_until_it_empties(tmp_path: Path) -> None:
+    """namespace 仍有行程即 unreaped（列出其 host pid）；全數結束後才釋放。宿主無非特權 unshare 時 SKIP（非 PASS）。"""
+    if shutil.which("unshare") is None:
+        pytest.skip("缺 unshare，無法建立 PID namespace（環境能力不足，非 PASS）")
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount", "--mount-proc", "true"],
+        capture_output=True, timeout=30, check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip("此宿主無法以非特權 unshare 建立 PID namespace（環境能力不足，非 PASS）")
+
+    ab = _load_ab_blackbox_1b()
+    host_ns = _host_pid_ns()
+    wrapper = subprocess.Popen(
+        ["unshare", "--user", "--map-current-user", "--pid", "--fork", "--mount", "--mount-proc",
+         sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        inner = None
+        deadline = time.monotonic() + 15
+        while inner is None and time.monotonic() < deadline:
+            for proc_dir in Path("/proc").iterdir():
+                if not proc_dir.name.isdigit():
+                    continue
+                try:
+                    stat = (proc_dir / "stat").read_text(encoding="ascii")
+                except OSError:
+                    continue
+                fields = stat[stat.rfind(")") + 2:].split()
+                if fields and fields[1] == str(wrapper.pid) and os.readlink(proc_dir / "ns" / "pid") != host_ns:
+                    inner = int(proc_dir.name)
+                    break
+            time.sleep(0.05)
+        assert inner is not None, "未找到 unshare 子行程"
+        namespace = os.readlink(f"/proc/{inner}/ns/pid")
+        rows = [
+            {"pid": 1, "children": [], "socket": None, "lock": None, "run_dir": None, "pid_ns": namespace},
+            {"pid": wrapper.pid, "children": [], "socket": None, "lock": None, "run_dir": None, "pid_ns": host_ns},
+        ]
+        pidlog = _write_pidlog(tmp_path / "a.pids", rows)
+        held = ab._release_check(pidlog, tmp_path / "held.json", timeout_s=1.0)
+        assert held["ok"] is False, held
+        assert inner in held["unreaped_pids"], held
+    finally:
+        try:
+            os.killpg(wrapper.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        wrapper.wait(timeout=30)
+
+    released = ab._release_check(pidlog, tmp_path / "released.json", timeout_s=5.0)
+    assert released["ok"] is True, released
+
+
+def test_pidns_pidlog_rows_carry_namespace_and_wrapper_host_pid(tmp_path: Path, monkeypatch) -> None:
+    """bb_daemon 寫入的 pidlog 列附 pid_ns；bb_l15 記錄 unshare 外層行程的 host pid（僅 POSIX 有意義）。
+
+    (b) 回歸：PyDaemon 的兩處 pidlog 列（AST 核對字典含 "pid_ns"）與 bb_l15.record_wrapper_pid 實際寫入的列內容。
+    """
+    if os.name != "posix":
+        pytest.skip("pid namespace 僅 POSIX")
+    import ast
+
+    contract = ROOT / "tests" / "contract_blackbox"
+    for entry in (str(contract), str(ROOT / "tests")):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+    import bb_daemon
+    import bb_l15
+
+    assert bb_daemon._current_pid_ns() == os.readlink("/proc/self/ns/pid")
+    tree = ast.parse((contract / "bb_daemon.py").read_text(encoding="utf-8"))
+    pidlog_rows = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Dict)
+        and any(isinstance(k, ast.Constant) and k.value == "pid_ns" for k in node.keys)
+    ]
+    assert len(pidlog_rows) >= 2, "PyDaemon 的兩處 pidlog 列都須附 pid_ns"
+
+    log = tmp_path / "pidlog.ndjson"
+    monkeypatch.setenv("SW_AB_PIDLOG", str(log))
+    bb_l15.record_wrapper_pid(424242, "tests/x.py::t", outer_ns="pid:[4026531836]")
+    row = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["pid"] == 424242
+    assert row["pid_ns"] == "pid:[4026531836]"
+    assert row["wrapper"] == "unshare"
+    assert row["nodeid"] == "tests/x.py::t"
+
+
+def test_ab_selection_follows_frozen_selector_per_platform() -> None:
+    """(e)：Windows A/B 只執行該平台凍結 selector（markexpr）收集到的節點；Linux 維持 HEAD 的負向標記過濾。
+
+    回歸：Windows 巢狀 ab-suite 曾直接執行 test_daemon_restart_ab（pidns_rig、無平台標記，Windows selector 不收集），
+    其 A 輪因此失敗。Windows 不適用者不在該平台執行（與 register／check 共用 platform_applicability）。
+    """
+    ab = _load_ab_blackbox_1b()
+    daemon = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"
+    autostart = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
+    connect = "tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_benches_ab"
+    nodes = sorted([daemon, autostart, connect])
+
+    assert ab._applicable_nodes(nodes, "windows") == [autostart]
+    # Linux 維持 HEAD 的負向標記過濾：pidns_rig 的 test_daemon_restart_ab 仍在 Linux A/B 內（覆蓋不縮減）。
+    assert ab._applicable_nodes(nodes, "linux") == [connect, daemon]

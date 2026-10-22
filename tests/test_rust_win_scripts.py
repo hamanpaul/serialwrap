@@ -356,3 +356,35 @@ def test_windows_blackbox_ps1_parses_under_windows_powershell():
     out = subprocess.run([powershell, "-NoProfile", "-Command", script], capture_output=True, text=True,
                          timeout=120, check=False).stdout
     assert "parse_errors=0" in out, out
+
+
+def test_win_dev_bundle_pointer_is_install_root_relative():
+    """bin\\current-release.json 的 `dir` 必須為相對安裝根的 `versions\\<V>`（plan 04 Task 17 的 `"dir":"versions\\<V>"`）。
+
+    理由：Rust 端以安裝根為基準（delegate.rs 以 exe_dir.parent() 接 `dir`；rollback.rs 寫入 `versions/<V>`），
+    plan 04 Task 17 為權威。1e470cd 改成 `..\\versions\\<V>`（以 bin\\ 為基準）與之不一致，予以回復。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    assert 'dir = "versions\\$version"' in ps1
+    assert '"..\\versions' not in ps1
+
+
+def test_windows_blackbox_copies_ab_suite_and_dev_bundle_to_outdir():
+    """ab-suite 輸出與 Windows dev bundle 必須在 staging 刪除前複製回 OutDir（否則 A/B 失敗無法診斷，register 拿不到 --windows-cli）。
+
+    ab-suite 位於 `<staging>\\l1\\windows\\blackbox\\ab-suite\\`（SW_RESOURCE_REPORT 同層）；bundle 匯出到 `<OutDir>\\bundle\\`，
+    內含 bin\\serialwrap.exe、bin\\current-release.json、versions\\<V>\\release-manifest.json，以及 manifest 所指的
+    versions\\<V>\\bin\\serialwrap.exe（register 的 Rust CLI artifact 必須與 manifest 的 cli.path 相符）。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    assert "function Copy-BlackboxDiagnostics" in ps1
+    assert "Join-Path $StagingRepo 'l1\\windows\\blackbox\\ab-suite'" in ps1
+    assert "Join-Path $OutputRoot 'l1\\windows\\blackbox\\ab-suite'" in ps1
+    assert "Join-Path $OutputRoot 'bundle'" in ps1
+    assert "'bin\\serialwrap.exe'" in ps1
+    assert "'bin\\current-release.json'" in ps1
+    assert '"versions\\$bundleVersion\\release-manifest.json"' in ps1
+    assert '"versions\\$bundleVersion\\bin\\serialwrap.exe"' in ps1
+    finally_block = ps1.split("} finally {", 1)[1]
+    assert "Copy-BlackboxDiagnostics $stagingRepo $bundleRoot $outputRoot" in finally_block
+    assert finally_block.index("Copy-BlackboxDiagnostics") < finally_block.index("Remove-Item -LiteralPath $scratchRoot")
