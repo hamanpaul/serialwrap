@@ -1518,7 +1518,7 @@ fn remote_stop_is_alias_of_close() {
 | `remote_close_empty_selector_closes_nothing` | 兩條 alive 隧道、`remote close ""` → `{"closed":[],"ok":true}`、無 terminate；`remote stop ""` 同 |
 | `test_remote_ab_status_close_empty`（黑箱 A/B） | 空 run_dir：`remote` → `{"ok":true,"tunnels":[]}`；`remote close` → `{"closed":[],"ok":true}`；Python 與 Rust 相同 |
 | `test_remote_ab_open_with_stub_ssh`（黑箱 A/B） | stub `ssh`（`-O check` rc 0；長駐模式 sleep）＋ stub `ss` 回 loopback → 兩實作輸出經 pid 正規化後相同 |
-| `test_remote_topologies_docker`（cap `docker`、`process_rpc`；`bc05-three-topologies` 的 Linux 面） | `SERIALWRAP_CLI_BUNDLE_DIR=$SW_BUNDLE bash tools/docker/remote_tunnel_test.sh all` exit 0：`direct`、`nat_host`、`dual_nat`、`agent_pull` 四拓樸加 `gwports` fail-closed 全過；log 中每次 `serialwrap` 呼叫路徑皆為 `/opt/sw-bundle/bin/serialwrap` |
+| `test_remote_topologies_docker`（cap `docker`、`process_rpc`；`bc05-three-topologies` 的 Linux 面） | `SERIALWRAP_CLI_BUNDLE_DIR=$SW_BUNDLE bash tools/docker/remote_tunnel_test.sh all` exit 0：`direct`、`nat_host`、`dual_nat`、`agent_pull` 四拓樸加 `gwports` fail-closed 全過；log 中每次 `serialwrap` 呼叫路徑皆為 `/opt/sw-bundle/bin/serialwrap`；**修正輪補記**：A 輪（Python 基線，不設 bundle）亦執行同一拓樸斷言，並斷言 bare `serialwrap` 呼叫、不得出現 `/opt/sw-bundle` 路徑（見 addenda `CHG-S1X-REMOTE-AB-01`，待非實作者審查） |
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_remote` → `not implemented: P4-T8`；黑箱 Rust → 97。
 - [ ] **步驟 3：實作**：依「行為」；`open_tunnel` 的「鎖內讀判定→spawn→寫 spawning」、「鎖外 wait_ready」、「任何錯誤（含 panic，以 `catch_unwind` 包住）→ terminate＋鎖內 remove＋原錯誤回傳」順序逐字照 07 §8.4。
