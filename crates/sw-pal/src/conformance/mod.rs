@@ -16,7 +16,7 @@ pub use wal_fs_suite::{wal_fs_suite, ExternalFsOps, FakeExternalFs, NativeExtern
 use std::ffi::CStr;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -304,8 +304,47 @@ pub fn tcgetattr_snapshot(dev: &DevicePath) -> Vec<u8> {
 pub fn fake_pair_factory(
     be: Arc<FakeSerialBackend>,
 ) -> impl Fn() -> (DevicePath, Box<dyn PeerEnd>) {
+    let counter = Arc::new(AtomicUsize::new(0));
     move || {
-        let _ = &be;
-        s21_todo!("T1", "FakeSerialBackend::add_device（conformance fake pair）")
+        let id = counter.fetch_add(1, Ordering::SeqCst);
+        let path = format!("/dev/ttyFAKEPAIR{id}");
+        let dev = be.add_device(&path);
+        (DevicePath(path), Box::new(FakePeer { dev }))
+    }
+}
+
+struct FakePeer {
+    dev: crate::fakes::serial::FakeDevice,
+}
+
+impl PeerEnd for FakePeer {
+    fn read_available(&mut self, timeout: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let data = self.dev.take_tx();
+            if !data.is_empty() {
+                return data;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Vec::new();
+            }
+            let remaining = (deadline - now).min(Duration::from_millis(5));
+            thread::sleep(remaining);
+        }
+    }
+
+    fn write(&mut self, b: &[u8]) {
+        self.dev.push_rx(b);
+    }
+
+    fn stop_reading(&mut self) {}
+
+    fn resume_reading(&mut self) {}
+}
+
+impl Drop for FakePeer {
+    fn drop(&mut self) {
+        self.dev.close_peer();
     }
 }

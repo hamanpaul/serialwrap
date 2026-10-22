@@ -714,7 +714,7 @@ fn block_until_cancel_returns_bytes_before_cancel() {
     let tok = CancelToken::new(waker);
     let t2 = tok.clone();
     let j = thread::spawn(move || w.write(b"abcdefgh", &t2));
-    thread::sleep(Duration::from_millis(20));
+    while dev.os_submits() == 0 { thread::yield_now(); }
     tok.cancel();
     let res = j.join().unwrap();
     assert_eq!(res.outcome, TxOutcome::Completed(4));
@@ -748,7 +748,7 @@ fn fake_clock_sleep_wakes_on_advance_and_wall_jump_keeps_mono() {
     let c = FakeClock::at(1_000, 1_760_000_000_000_000);
     let c2: Arc<dyn Clock> = c.clone();
     let j = thread::spawn(move || { c2.sleep(Duration::from_millis(500)); c2.mono_ns() });
-    thread::sleep(Duration::from_millis(10));
+    while c.sleeps_s().is_empty() { thread::yield_now(); }
     c.set_wall_us(1_759_996_400_000_000);
     c.advance(Duration::from_millis(500));
     assert_eq!(j.join().unwrap(), 1_000 + 500_000_000);
@@ -784,7 +784,7 @@ Expected：FAIL，`not implemented: slice21 T1 FakeSerialBackend::add_device`。
 - `FakeDeviceInner { rx: Mutex<VecDeque<u8>>, tx: Mutex<Vec<u8>>, steps: Mutex<VecDeque<FakeWriteStep>>, cond: Condvar, open: AtomicBool, opens: AtomicUsize, closes: AtomicUsize, writes: AtomicUsize, blocked_release: AtomicBool, close_err: Mutex<Option<PalError>>, removed: AtomicBool }`。
 - `open_exclusive`：`removed` → `NotFound(PalError::not_found("[Errno 2] No such file or directory"))`；`deny_access` 標記 → `AccessDenied`；外部 hold → `Held(HolderReport{pids, holder_unknown: pids.is_empty(), status: Ok})`；已 open → `Held(HolderReport{pids: vec![], holder_unknown: true, status: HolderScanStatus::Ok})`（與 POSIX flock 自身持有、排除自身 pid 後為空一致）；否則 `open=true`、`opens+=1`。
 - `split`：reader/writer 共用 inner；waker 以 `Condvar::notify_all` 加 `woken` 旗標實作。
-- writer.write_gated：`writes+=1`；`cancel.is_cancelled()` 已為真 → `TxResult{outcome: NotSubmitted, error: Some(Cancelled)}`（**只有** fake 在呼叫前取消時才回 NotSubmitted；真實 PAL 由 TxWriter 在呼叫前決定）；依 steps 處理。**所有**「接受 bytes」的動作都放在傳給 `gate.submit` 的 `os_submit` 閉包內（閉包內 `os_submits+=1`、呼叫 `on_os_submit` hook、把 bytes 推入 `tx`）；`gate.submit` 回 `Err(SubmitRevoked)` 時依 arch §4.2 回 `NotSubmitted` 或 `Completed(k)`＋`cancelled`，不再提交。`BlockUntilCancel`／`BlockForever` 先經 gate 提交 `accept_before_cancel`／全部 bytes，再於**閉包外**以 `cond.wait_while(!cancelled)`／等 `blocked_release`（不持 Fence 鎖）；`PauseBeforeSubmit` 在第一次 `gate.submit` 前、`PauseInsideSubmit` 在閉包內、`AcceptThenWouldBlock(n)` 在閉包回 `WouldBlock` 後於閉包外等待 `release_pause`。`write`（無 gate）＝`write_gated(.., &AlwaysOpen)`，供既有 PAL 自測沿用。
+- writer.write_gated：`writes+=1`；`cancel.is_cancelled()` 已為真 → `TxResult{outcome: Completed(0), error: Some(Cancelled)}`（依 conformance 契約 line 964）；依 steps 處理。`gate.submit` 遇 `Err(SubmitRevoked)` 則回 `NotSubmitted` 或 `Completed(k)`＋`cancelled`（不再提交）。**所有**「接受 bytes」的動作都放在傳給 `gate.submit` 的 `os_submit` 閉包內（閉包內 `os_submits+=1`、呼叫 `on_os_submit` hook、把 bytes 推入 `tx`）；`BlockUntilCancel`／`BlockForever` 先經 gate 提交 `accept_before_cancel`／全部 bytes，再於**閉包外**以 `cond.wait_while(!cancelled)`／等 `blocked_release`（不持 Fence 鎖）；`PauseBeforeSubmit` 在第一次 `gate.submit` 前、`PauseInsideSubmit` 在閉包內、`AcceptThenWouldBlock(n)` 在閉包回 `WouldBlock` 後於閉包外等待 `release_pause`。`write`（無 gate）＝`write_gated(.., &AlwaysOpen)`，供既有 PAL 自測沿用。
 - reader.read：有資料 → 複製最多 `buf.len()`；`woken` → 清旗標回 `Woken`；逾時回 `TimedOut`。
 - FakeWalFs identity 以遞增 `u128` 產生，`FileIdentity(1, id)`。
 - FakeWalFs 寫入失敗佇列（per path，`fail_next_writes` 與 `fail_next_write_partial` 依呼叫順序排入）：每次 `write_all_flush` 先記入 `write_calls`，佇列首項為 `Full(err)` → 不附加、回 `WalWriteError{sent:0, error}`；`Partial(accept, err)` → 附加 `bytes[..min(accept, len-1)]`、回 `WalWriteError{sent:<附加數>, error}`；佇列空 → 全部附加、回 `Ok(())`。`sent` 必須等於實際附加到檔案的 bytes 數（arch §4.5 `WalWriteError`）。

@@ -188,7 +188,13 @@ fn block_until_cancel_returns_bytes_before_cancel() {
     let tok = CancelToken::new(waker);
     let t2 = tok.clone();
     let j = thread::spawn(move || w.write(b"abcdefgh", &t2));
-    thread::sleep(Duration::from_millis(20));
+    let start = std::time::Instant::now();
+    while dev.os_submits() == 0 {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("os_submits not reached in time");
+        }
+        thread::yield_now();
+    }
     tok.cancel();
     let res = j.join().unwrap();
     assert_eq!(res.outcome, TxOutcome::Completed(4));
@@ -233,7 +239,13 @@ fn fake_clock_sleep_wakes_on_advance_and_wall_jump_keeps_mono() {
         c2.sleep(Duration::from_millis(500));
         c2.mono_ns()
     });
-    thread::sleep(Duration::from_millis(10));
+    let start = std::time::Instant::now();
+    while c.sleeps_s().is_empty() {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("sleeper did not register in time");
+        }
+        thread::yield_now();
+    }
     c.set_wall_us(1_759_996_400_000_000);
     c.advance(Duration::from_millis(500));
     assert_eq!(j.join().unwrap(), 1_000 + 500_000_000);
@@ -469,4 +481,185 @@ fn fake_revoke_after_partial_stops_tail() {
     assert_eq!(res.error.unwrap().kind, PalErrorKind::Cancelled);
     assert_eq!(dev.take_tx(), b"ab");
     assert_eq!(dev.os_submits(), 1);
+}
+
+#[test]
+fn fake_writer_revoking_gate_with_error_and_unknown() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![
+        FakeWriteStep::Error(PalError::io(5, IO_ERR)),
+        FakeWriteStep::Unknown {
+            confirmed: 2,
+            error: PalError::io(5, IO_ERR),
+        },
+    ]);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+
+    // Revoking gate: Error step returns NotSubmitted
+    let res1 = w.write_gated(b"abc", &tok, &RevokeAll);
+    assert_eq!(res1.outcome, TxOutcome::NotSubmitted);
+    assert!(res1.error.is_none());
+    assert_eq!(dev.os_submits(), 0);
+    assert!(dev.take_tx().is_empty());
+
+    // Revoking gate: Unknown step returns NotSubmitted
+    let res2 = w.write_gated(b"abc", &tok, &RevokeAll);
+    assert_eq!(res2.outcome, TxOutcome::NotSubmitted);
+    assert!(res2.error.is_none());
+    assert_eq!(dev.os_submits(), 0);
+    assert!(dev.take_tx().is_empty());
+
+    // Count gate: Unknown { confirmed: 0 } calls the gate exactly once
+    struct CountGate(AtomicUsize);
+    impl SubmitGate for CountGate {
+        fn submit(
+            &self,
+            os_submit: &mut dyn FnMut() -> SubmitStep,
+        ) -> Result<SubmitStep, SubmitRevoked> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(os_submit())
+        }
+    }
+    dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 0,
+        error: PalError::io(5, IO_ERR),
+    }]);
+    let gate = CountGate(AtomicUsize::new(0));
+    let res3 = w.write_gated(b"abc", &tok, &gate);
+    assert_eq!(res3.outcome, TxOutcome::Unknown { confirmed: 0 });
+    assert_eq!(gate.0.load(Ordering::SeqCst), 1);
+    assert_eq!(dev.os_submits(), 1);
+}
+
+#[test]
+fn on_tx_match_handles_chunked_write_and_no_premature_reply() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.on_tx_match(
+        r"^echo __READY__([0-9a-f]{8})$",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line);
+            let nonce = text
+                .trim_end()
+                .trim_start_matches("echo __READY__")
+                .to_string();
+            format!("__READY__{nonce}\r\n# ").into_bytes()
+        }),
+    );
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (mut r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+
+    // 第一筆不含換行：不得提前回覆
+    w.write(b"echo __READY__1234", &tok);
+    let mut buf = [0u8; 128];
+    assert_eq!(
+        r.read(&mut buf, Some(Duration::from_millis(50))),
+        Ok(ReadOutcome::TimedOut)
+    );
+
+    // 第二筆補上剩餘內容與換行：此時才觸發完整行比對並回覆
+    w.write(b"5678\n", &tok);
+    match r.read(&mut buf, Some(Duration::from_secs(1))) {
+        Ok(ReadOutcome::Data(n)) => {
+            let text = String::from_utf8_lossy(&buf[..n]);
+            assert!(text.contains("__READY__12345678"), "got {text:?}");
+        }
+        other => panic!("expected reply after full line, got {other:?}"),
+    }
+}
+
+#[test]
+fn on_tx_match_panics_on_unsupported_regex() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    assert!(std::panic::catch_unwind(|| {
+        dev.on_tx_match("foo|bar", Box::new(|_| Vec::new()));
+    })
+    .is_err());
+    assert!(std::panic::catch_unwind(|| {
+        dev.on_tx_match(r"\bword\b", Box::new(|_| Vec::new()));
+    })
+    .is_err());
+    assert!(std::panic::catch_unwind(|| {
+        dev.on_tx_match("colou?r", Box::new(|_| Vec::new()));
+    })
+    .is_err());
+}
+
+#[test]
+fn fail_close_leaves_held() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (r, w, _waker, close) = h.split();
+    dev.fail_close(PalError::io(5, IO_ERR));
+    let rc = close.close(r, w);
+    assert!(!rc.closed && !rc.excl_cleared);
+    // 關閉失敗時独占狀態不釋放，後續 open_exclusive 必須回 Held
+    match be.open_exclusive(&dev_path(), &cfg()) {
+        Err(OpenError::Held(_)) => {}
+        Err(e) => panic!("expected Held after failed close, got Err({e:?})"),
+        Ok(_) => panic!("expected Held after failed close, got Ok"),
+    }
+}
+
+#[test]
+fn drop_without_close_clears_open() {
+    let be = FakeSerialBackend::new();
+    be.add_device(TTY);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    drop(h);
+    // 未呼叫 CloseToken::close 直接 drop 時，OpenGuard 自動釋放
+    assert!(be.open_exclusive(&dev_path(), &cfg()).is_ok());
+
+    // split 後各端未呼叫 close 亦同
+    let h2 = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (r, w, _waker, close) = h2.split();
+    drop(r);
+    drop(w);
+    drop(close);
+    assert!(be.open_exclusive(&dev_path(), &cfg()).is_ok());
+}
+
+#[test]
+fn mem_stream_write_to_closed_peer_fails() {
+    use std::io::Write;
+    let (mut a, b) = MemStream::pair();
+    drop(b);
+    let res = a.write(b"hello");
+    assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn wal_fs_non_writable_dir_prevents_file_creation() {
+    let fs = FakeWalFs::new();
+    let dir = Path::new("/wal");
+    fs.set_dir_writable(dir, false);
+    let new_path = Path::new("/wal/new.wal");
+    match fs.open_append(new_path) {
+        Err(e) => assert_eq!(e.py_message, "[Errno 13] Permission denied"),
+        Ok(_) => panic!("expected permission denied on new file in non-writable dir"),
+    }
+
+    // 已存在的檔案不受目錄不可寫影響（模擬唯讀目錄下已開啟/既有檔案追加）
+    let existing = Path::new("/wal/existing.wal");
+    fs.seed(existing, b"hello\n");
+    assert!(fs.open_append(existing).is_ok());
+
+    // 重新命名至不可寫目錄亦失敗
+    let from = Path::new("/wal/existing.wal");
+    let to = Path::new("/wal/archived.wal");
+    let rres = fs.rename_noreplace_or_suffix(from, to);
+    assert_eq!(rres.unwrap_err().py_message, "[Errno 13] Permission denied");
+}
+
+#[test]
+fn clock_advance_saturates_at_max() {
+    let c = FakeClock::at(u64::MAX - 5, 0);
+    c.advance(Duration::from_nanos(10));
+    assert_eq!(c.mono_ns(), u64::MAX);
 }

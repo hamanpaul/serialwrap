@@ -26,15 +26,18 @@ pub use clock::FakeClock;
 pub use device::{FakeDeviceScript, FakeDeviceSource};
 pub use env::FakeEnv;
 pub use fs::{FaultFs, MemFs};
+pub use mem_stream::MemStream;
 pub use platform::{platform, posix_caps, windows_caps, FakePlatformBuilder};
 pub use proc::FakeProcScan;
 pub use process::{FakeProcessCtl, RecordingProcess};
 pub use realfs::{file_mode, real_fs};
 pub use registry::FakeRegistry;
 pub use rpc::{FakeConn, FakeRpcConnector, ScriptedConnector, StreamStep};
+pub use serial::{FakeDevice, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
 pub use service::FakeServiceCtl;
 pub use sysenv::{FakeSysEnv, FakeSysEnvBuilder};
 pub use tunnel::FakeTunnel;
+pub use wal_fs::{ExternalHandle, FakeWalFs};
 
 static EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
