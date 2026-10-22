@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -224,8 +224,10 @@ impl ProcessCtl for NativeProcessCtl {
                 return error;
             }
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            // 只設 KILL_ON_JOB_CLOSE，不設 SILENT_BREAKAWAY_OK：實測（Windows 11 26200）該旗標會讓
+            // 一般 CreateProcess 建立的孫行程靜默脫離 Job（即使未要求 breakaway），launcher 被終止後孫行程仍存活，
+            // 違反委派的終止傳遞不變式。正常結束時的背景子行程保留由 release_kill_on_close 處理。
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             // SAFETY: limits 為正確大小且完整初始化的 Job Object 結構。
             let configured = unsafe {
                 SetInformationJobObject(
@@ -277,6 +279,13 @@ impl ProcessCtl for NativeProcessCtl {
         let got_code = unsafe { GetExitCodeProcess(process_info.hProcess, &mut exit_code) };
         let exit_error = (got_code == 0).then(last_error);
         restore_ctrl_handler();
+        // 子行程已正常結束：先解除 KILL_ON_JOB_CLOSE 再關閉 Job，使背景啟動的孫行程（例如 daemon start 建立的 daemon）
+        // 照常存活，與 Python 基線一致。launcher 若被 TerminateProcess 終止，此步驟不會執行，Job 仍會連帶結束所有子孫。
+        let release_error = if job.is_null() {
+            None
+        } else {
+            release_kill_on_close(job)
+        };
         // SAFETY: thread 與 process handle 各關閉一次；Job Object 若建立也只關閉一次。
         unsafe {
             CloseHandle(process_info.hThread);
@@ -284,6 +293,9 @@ impl ProcessCtl for NativeProcessCtl {
             if !job.is_null() {
                 CloseHandle(job);
             }
+        }
+        if let Some(error) = release_error {
+            return error;
         }
         if let Some(error) = exit_error {
             return error;
@@ -382,6 +394,21 @@ fn process_io_error(error: std::io::Error) -> PalError {
 fn last_error() -> PalError {
     // SAFETY: GetLastError 讀取目前執行緒最近一次 Win32 錯誤。
     unsafe { windows_win32_error(GetLastError()) }
+}
+
+/// 解除 Job 的 KILL_ON_JOB_CLOSE（清空 LimitFlags）。失敗時回傳錯誤；呼叫端仍會關閉 Job，不留下狀態不明的 Job。
+fn release_kill_on_close(job: HANDLE) -> Option<PalError> {
+    let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: limits 為正確大小且完整初始化（LimitFlags 為 0）的 Job Object 結構；job 由呼叫端持有且有效。
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    (configured == 0).then(last_error)
 }
 
 fn restore_ctrl_handler() {
