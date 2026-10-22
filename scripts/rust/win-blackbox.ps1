@@ -289,10 +289,17 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
 
 function Invoke-BridgeSelftest([string]$StagingRepo, [string]$ScratchRoot, [string]$OutputRoot,
                                [string]$ComPair, [int]$TimeoutSeconds) {
+    # selftest 的 --out、stdout 與 stderr 一律放在 Windows 本機 scratch（$ScratchRoot），不得指向 OutputRoot 或網路路徑。
+    # 理由：ST-04 會對 --out 持續寫入 50 MB stderr 證據；網路路徑上的寫入曾發生截斷（dut.stderr.log 僅 48431104 bytes）
+    # 與 HARNESS_EVIDENCE_WRITE_FAILED（bridge rc=3）。行程結束後才整份回寫 OutputRoot\windows-com\bridge-selftest，
+    # 並逐檔比對 SHA256。資格判定（is_qualified、verdict、tree_sha256）仍只讀本機報告，回寫結果不參與放行。
     $evidenceRoot = Join-Path $OutputRoot 'windows-com'
-    $selftestRoot = Join-Path $evidenceRoot 'bridge-selftest'
+    $selftestRoot = Join-Path $ScratchRoot 'bridge-selftest'
     $reportPath = Join-Path $selftestRoot 'selftest-report.json'
+    $copyRoot = Join-Path $evidenceRoot 'bridge-selftest'
+    $copyReportPath = Join-Path $copyRoot 'selftest-report.json'
     $null = New-Item -ItemType Directory -Path $evidenceRoot -Force
+    $null = New-Item -ItemType Directory -Path $selftestRoot -Force
     $bridgeSource = Join-Path $StagingRepo 'tools/uart_stdio_bridge/src'
     $verifyScript = Join-Path $ScratchRoot 'verify-bridge-selftest.py'
     $verifyCode = @'
@@ -321,8 +328,8 @@ raise SystemExit(0 if qualified else 1)
     $selftestExit = 1
     $qualifiedExit = 1
     $qualificationOutput = @()
-    $selftestLog = Join-Path $evidenceRoot 'bridge-selftest.stdout.log'
-    $selftestError = Join-Path $evidenceRoot 'bridge-selftest.stderr.log'
+    $selftestLog = Join-Path $ScratchRoot 'bridge-selftest.stdout.log'
+    $selftestError = Join-Path $ScratchRoot 'bridge-selftest.stderr.log'
     if ($TimeoutSeconds -lt 1) { throw 'SelftestTimeoutSeconds 必須是正整數秒數' }
     $timeoutSeconds = $TimeoutSeconds
     $timedOut = $false
@@ -367,22 +374,78 @@ raise SystemExit(0 if qualified else 1)
         $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
     }
     $ok = ($exitStatusKnown -and $selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')
+    # 行程結束後回寫（逾時或失敗路徑亦然，保留部分工作證據）。回寫只產生證據副本，不改寫報告內容，也不參與上面的判定。
+    # F8：有界重試（最多 3 次；每次整份重新複製再逐檔比對），任一次全部相符即止；仍不符只會使證據不足，不會放行。
+    # 比對範圍：selftest 工作目錄與報告，以及 stdout／stderr 兩份 log（副本位於 evidenceRoot 同名檔）。
+    $copyErrors = [System.Collections.Generic.List[string]]::new()
+    for ($copyAttempt = 1; $copyAttempt -le 3; $copyAttempt++) {
+        $copyErrors = [System.Collections.Generic.List[string]]::new()
+        try {
+            $null = New-Item -ItemType Directory -Path $copyRoot -Force
+            $copyWork = Join-Path $copyRoot 'work'
+            if (Test-Path -LiteralPath $copyWork) { Remove-Item -LiteralPath $copyWork -Recurse -Force }
+            if (Test-Path -LiteralPath (Join-Path $selftestRoot 'work') -PathType Container) {
+                Copy-Item -LiteralPath (Join-Path $selftestRoot 'work') -Destination $copyWork -Recurse -Force
+            }
+            if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
+                Copy-Item -LiteralPath $reportPath -Destination $copyReportPath -Force
+            }
+            foreach ($log in @($selftestLog, $selftestError)) {
+                if (Test-Path -LiteralPath $log -PathType Leaf) {
+                    $logCopy = Join-Path $evidenceRoot (Split-Path -Leaf $log)
+                    Copy-Item -LiteralPath $log -Destination $logCopy -Force
+                    if (-not (Test-Path -LiteralPath $logCopy -PathType Leaf)) {
+                        $copyErrors.Add("回寫缺檔：$(Split-Path -Leaf $log)")
+                    } elseif ((Get-Sha256 $log) -ne (Get-Sha256 $logCopy)) {
+                        $copyErrors.Add("回寫 SHA256 不符：$(Split-Path -Leaf $log)")
+                    }
+                }
+            }
+            # 逐檔比對：本機來源與回寫副本的 SHA256 必須一致；不一致即視為回寫失敗，只會使證據不足，不會放行。
+            if (Test-Path -LiteralPath $selftestRoot -PathType Container) {
+                foreach ($file in @(Get-ChildItem -LiteralPath $selftestRoot -Recurse -File -Force)) {
+                    $relative = $file.FullName.Substring($selftestRoot.Length).TrimStart('\', '/')
+                    $copied = Join-Path $copyRoot $relative
+                    if (-not (Test-Path -LiteralPath $copied -PathType Leaf)) {
+                        $copyErrors.Add("回寫缺檔：$relative")
+                    } elseif ((Get-Sha256 $file.FullName) -ne (Get-Sha256 $copied)) {
+                        $copyErrors.Add("回寫 SHA256 不符：$relative")
+                    }
+                }
+            }
+        } catch {
+            $copyErrors.Add("回寫例外：$($_.Exception.Message)")
+        }
+        if ($copyErrors.Count -eq 0) { break }
+        if ($copyAttempt -lt 3) { Start-Sleep -Milliseconds 500 }
+    }
+    $copyOk = ($copyErrors.Count -eq 0)
+    $status = if (-not $ok) { if ($report) { 'FAIL' } else { 'EVIDENCE-INSUFFICIENT' } } elseif ($copyOk) { 'PASS' } else { 'EVIDENCE-INSUFFICIENT' }
+    $reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $exitStatusKnown) { 'S0 selftest 行程 ExitCode 不可得（null），視為失敗' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } elseif (-not $copyOk) { 'S0 selftest 報告已產生，但回寫 OutDir 證據不完整：' + ($copyErrors -join '；') } else { $null }
     return [ordered]@{
-        status = if ($ok) { 'PASS' } elseif ($report) { 'FAIL' } else { 'EVIDENCE-INSUFFICIENT' }
+        status = $status
         exit = $selftestExit
         exit_status_known = $exitStatusKnown
         qualification_exit = $qualifiedExit
         timeout_seconds = $timeoutSeconds
         timed_out = $timedOut
         process_id = $selftestProcessId
-        reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $exitStatusKnown) { 'S0 selftest 行程 ExitCode 不可得（null），視為失敗' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } else { $null }
+        reason = $reason
         qualification_output = @($qualificationOutput)
-        report = $reportPath
+        report = $copyReportPath
+        local_out = $selftestRoot
+        local_report = $reportPath
+        evidence_copy = $copyRoot
+        evidence_copy_ok = $copyOk
+        evidence_copy_errors = @($copyErrors)
+        evidence_dir_note = '報告 checks[].evidence_dir 為執行當下的 Windows 本機路徑（原樣保留、未改寫）；可取用副本位於 evidence_copy 的 work 子目錄'
         endpoint = 'win-serial'
         com_pair = $ComPair
         transport_mode = 'virtual_com0com'
-        stdout = $selftestLog
-        stderr = $selftestError
+        stdout = Join-Path $evidenceRoot 'bridge-selftest.stdout.log'
+        stderr = Join-Path $evidenceRoot 'bridge-selftest.stderr.log'
+        local_stdout = $selftestLog
+        local_stderr = $selftestError
     }
 }
 
@@ -1043,6 +1106,7 @@ try {
         windows_com = $comStatus
         com_pair = $ComPair
         selftest = $selftest
+        selftest_paths = if ($selftest) { [ordered]@{ local_out = $selftest.local_out; evidence_copy = $selftest.evidence_copy; report = $selftest.report } } else { $null }
         sequence = $comSequence
         bridge_stop = $bridgeStop
         p4_case = [ordered]@{ nodeid = $p4CaseNode; outcome = $p4CaseOutcome }

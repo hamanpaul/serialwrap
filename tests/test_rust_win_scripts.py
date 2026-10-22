@@ -388,3 +388,62 @@ def test_windows_blackbox_copies_ab_suite_and_dev_bundle_to_outdir():
     finally_block = ps1.split("} finally {", 1)[1]
     assert "Copy-BlackboxDiagnostics $stagingRepo $bundleRoot $outputRoot" in finally_block
     assert finally_block.index("Copy-BlackboxDiagnostics") < finally_block.index("Remove-Item -LiteralPath $scratchRoot")
+
+
+def test_windows_selftest_out_is_local_scratch_with_verified_copy_back():
+    """bridge selftest 的 --out 必須位於 Windows 本機 scratch，不得位於 OutputRoot 或網路路徑之下；
+    行程結束後須整份回寫 OutputRoot\\windows-com\\bridge-selftest 並逐檔比對 SHA256，資格判定行維持不變。
+
+    回歸：ST-04 把 50 MB stderr 證據寫到 \\\\wsl.localhost（9P）時曾截斷（dut.stderr.log 僅 48431104 bytes）並出現
+    HARNESS_EVIDENCE_WRITE_FAILED（bridge rc=3），連鎖使 windows-com 判 FAIL、B 輪 COM pair 缺席。
+    """
+    raw = WIN_BLACKBOX_PS1.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "win-blackbox.ps1 必須維持 UTF-8 BOM"
+    ps1 = raw.decode("utf-8-sig")
+    fn = _ps_function(ps1, "Invoke-BridgeSelftest")
+    # 只檢查程式行（略過註解），避免說明文字干擾斷言。
+    code = "\n".join(line for line in fn.splitlines() if not line.strip().startswith("#"))
+
+    # 1. selftest 的 --out、stdout 與 stderr 只能來自本機 scratch。
+    assert "$selftestRoot = Join-Path $ScratchRoot 'bridge-selftest'" in code
+    assert "$selftestLog = Join-Path $ScratchRoot 'bridge-selftest.stdout.log'" in code
+    assert "$selftestError = Join-Path $ScratchRoot 'bridge-selftest.stderr.log'" in code
+    assert '--out "{1}"\' -f $ComPair, $selftestRoot' in code
+    for assignment in re.findall(r"^\s*\$selftestRoot = (.+)$", code, re.MULTILINE):
+        assert "$OutputRoot" not in assignment and "$evidenceRoot" not in assignment, assignment
+    assert "wsl.localhost" not in code.lower(), "selftest 不得以 \\\\wsl.localhost 路徑作為 --out"
+
+    # 2. 行程結束之後才回寫 OutputRoot，並逐檔比對 SHA256。
+    wait_index = code.index("$process.WaitForExit($timeoutSeconds * 1000)")
+    copy_index = code.index("$copyWork = Join-Path $copyRoot 'work'")
+    assert wait_index < copy_index, "回寫必須在 selftest 行程結束之後"
+    assert "$copyRoot = Join-Path $evidenceRoot 'bridge-selftest'" in code
+    assert "Copy-Item -LiteralPath (Join-Path $selftestRoot 'work') -Destination $copyWork -Recurse -Force" in code
+    assert "Copy-Item -LiteralPath $reportPath -Destination $copyReportPath -Force" in code
+    assert "Get-Sha256 $file.FullName" in code and "Get-Sha256 $copied" in code
+    assert "$copyOk = ($copyErrors.Count -eq 0)" in code
+
+    # 3. 資格判定不變：判定行、verify 腳本與 is_qualified 呼叫維持原樣；回寫只會使證據不足，不會放行。
+    assert "$ok = ($exitStatusKnown -and $selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')" in code
+    assert "& py -3.12 $verifyScript $reportPath" in code
+    assert "is_qualified(" in ps1
+    assert "$status = if (-not $ok)" in code
+    assert "elseif ($copyOk) { 'PASS' }" in code
+
+    # 4. 回傳物件記錄本機 --out 與 OutDir 副本兩個路徑。
+    for key in ("local_out", "evidence_copy", "evidence_copy_ok", "report"):
+        assert re.search(rf"^\s*{key} = ", code, re.MULTILINE), key
+
+    # 5. windows-com.json 明列兩個路徑。
+    assert "selftest_paths = if ($selftest)" in ps1
+    assert "local_out = $selftest.local_out" in ps1 and "evidence_copy = $selftest.evidence_copy" in ps1
+
+
+def test_windows_selftest_writeback_retries_and_compares_both_logs():
+    """F8：selftest 回寫最多 3 次有界重試；stdout／stderr 兩份 log 併入 SHA256 逐檔比對（不一致只使證據不足）。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    block = ps1.split("function Invoke-BridgeSelftest", 1)[1].split("\nfunction ", 1)[0]
+    assert "$copyAttempt -le 3" in block
+    assert "foreach ($log in @($selftestLog, $selftestError))" in block
+    assert "(Get-Sha256 $log) -ne (Get-Sha256 $logCopy)" in block
+    assert "if ($copyErrors.Count -eq 0) { break }" in block
