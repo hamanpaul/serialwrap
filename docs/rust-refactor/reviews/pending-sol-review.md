@@ -47,6 +47,12 @@ Codex 帳號額度於 2026-10-21 約 18:28（台北）用完，恢復時間 2026
 | feature/rust-refactor | 3f05797 | 1 Stage 1 exit closure G4-p4-evidence-pipeline-applicability-and-bundle | Sonnet max | 待補審 |
 | feature/rust-refactor | 3750453 | 1 Stage 1 exit closure G2-driver-and-G3-wrappers | Sonnet max | 待補審 |
 | feature/rust-refactor | afe7142 | 1 Stage 1 exit closure addenda-CHG-OPEN-rows | Sonnet max | 待補審 |
+| feature/rust-refactor | 5545974 | 1 Stage 1 exit closure G1-sentinel-checksum-owner-marker | Sonnet max | 待補審 |
+| feature/rust-refactor | 2880127 | 1 Stage 1 exit closure G2-win-selftest-local-scratch-writeback | Sonnet max | 待補審 |
+| feature/rust-refactor | 38fdbd2 | 1 Stage 1 exit closure G3-win-l15-producer-and-report-complete | Sonnet max | 待補審 |
+| feature/rust-refactor | 11b1fd4 | 1 Stage 1 exit closure G4-junit-testcase-counts-and-l15-complete-gate | Sonnet max | 待補審 |
+| feature/rust-refactor | 4a6feaf | 1 Stage 1 exit closure G5-sc20-posix-only-l1-add | Sonnet max | 待補審 |
+| feature/rust-refactor | e6d0fac | 1 Stage 1 exit closure G6-coexist-reader-race | Sonnet max | 待補審 |
 
 後續新增的單審 commit 一律追加於此表。
 
