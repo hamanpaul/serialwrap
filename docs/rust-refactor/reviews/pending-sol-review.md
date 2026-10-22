@@ -36,6 +36,12 @@ Codex 帳號額度於 2026-10-21 約 18:28（台北）用完，恢復時間 2026
 | feature/rust-refactor | 1e470cd | 1 Stage 1 exit closure 修正輪：Windows staging 與 bundle 指標 | Sonnet max | 待補審 |
 | feature/rust-refactor | 0b0ff27 | 1 Stage 1 exit closure 修正輪：bc05 A/B 雙輪（oracle 變更）與 doctor 等待 | Sonnet max | 待補審 |
 | feature/rust-refactor | 82fe648 | 1 Stage 1 exit closure 修正輪：待裁決項目與 G1 文件修正 | Sonnet max | 待補審 |
+| feature/rust-refactor | d82d146 | 1 Stage 1 exit closure OD-16 (1)(2) L1 凍結鎖修訂（add-only＋逐名移除） | Sonnet max | 待補審 |
+| feature/rust-refactor | 4736927 | 1 Stage 1 exit closure OD-16 (3) 交接排空窗口接受（SC-11）與 L1.5 證據缺口登記 | Sonnet max | 待補審 |
+| feature/rust-refactor | 300f383 | 1 Stage 1 exit closure OD-16 (4)(5) systemd 基底 Ubuntu 24.04 與 harness 修正 | Sonnet max | 待補審 |
+| feature/rust-refactor | 1af76d2 | 1 Stage 1 exit closure 20groups 委派 sentinel 扁平佈局與 doctor pidns 隔離 | Sonnet max | 待補審 |
+| feature/rust-refactor | a87a0d6 | 1 Stage 1 exit closure Windows 委派 terminate 測試競態修正（test-side） | Sonnet max | 待補審 |
+| feature/rust-refactor | 7098a97 | bridge 工具 revision c4c22c0e369e 核准（單審） | Sonnet max | 待補審 |
 
 後續新增的單審 commit 一律追加於此表。
 
