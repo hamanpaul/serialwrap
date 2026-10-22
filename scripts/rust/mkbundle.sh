@@ -16,7 +16,7 @@ usage() {
   --version-override <v>   以同一編譯輸入覆寫 CLI 與 daemon bundle 版本
   --with-com0com <zip>     驗證上游簽章套件雜湊並抽取 x64 driver payload
   --with-com0com-fixture <zip> 僅供測試：略過上游雜湊驗證，仍檢查完整 x64 payload
-  --out <目錄>             指定輸出目錄
+  --out <目錄>             指定輸出目錄；非空且非 mkbundle 建立者拒絕（exit 2，不寫入）；mkbundle 建立者每次整個重建
   --print-dir              保留後續階段介面；成功時 stdout 一律輸出絕對目錄
   -h, --help               顯示此說明
 EOF
@@ -108,6 +108,22 @@ if [[ "$SENTINEL" -eq 1 && -n "$COM0COM_ZIP" ]]; then
   exit 2
 fi
 
+# 輸出目錄所有權：mkbundle 建立的目錄會寫入 OWNER_MARKER。非空且無該 marker 的目錄一律拒絕，
+# 且在任何寫入前即退出；否則 sentinel（頂層 release-manifest.json／py／bin）與 dev（versions/）佈局會混在同一目錄，
+# 使 bundle 定位取到過期的頂層 manifest。
+OWNER_MARKER=".mkbundle-owner"
+refuse_foreign_out() {
+  if [[ -e "$OUT" && ! -d "$OUT" ]]; then
+    echo "mkbundle.sh: --out 已存在且不是目錄：$OUT" >&2
+    exit 2
+  fi
+  if [[ -d "$OUT" && ! -f "$OUT/$OWNER_MARKER" && -n "$(ls -A -- "$OUT")" ]]; then
+    echo "mkbundle.sh: 拒絕寫入非空且非 mkbundle 建立的目錄：$OUT（請改用新目錄，或先自行移除後重試）" >&2
+    exit 2
+  fi
+}
+refuse_foreign_out
+
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 if [[ -z "$TARGET" ]]; then
   TARGET="$HOST_TRIPLE"
@@ -165,8 +181,16 @@ if [[ ! -x "$BIN_SRC" || ! -x "$DAEMON_SRC" ]]; then
   echo "mkbundle.sh: cargo build 後仍找不到 $BIN_SRC" >&2
   exit 1
 fi
+# cargo 建置成功後才動輸出目錄（cargo 失敗時既有輸出不受影響）。再檢一次所有權，通過後清空 mkbundle 自有目錄，
+# 確保每次只留下單一佈局（sentinel 或 dev），不殘留另一種佈局或過期檔案。組裝階段失敗會留下帶 owner marker 的半成品，下次執行會重建。
+refuse_foreign_out
+if [[ -d "$OUT" ]]; then
+  OUT="$(cd "$OUT" && pwd -P)"
+  find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+fi
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd -P)"
+printf 'mkbundle.sh 建立的輸出目錄；非空且無此檔案者會被拒絕覆寫\n' > "$OUT/$OWNER_MARKER"
 
 sha256_file() {
   sha256sum -- "$1" | awk '{print $1}'

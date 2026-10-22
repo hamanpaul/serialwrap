@@ -573,6 +573,92 @@ def test_bundle_daemon_components_and_sha256sums(bundle):
     assert not missing, f"SHA256SUMS 漏列部署檔：{missing[:10]}"
 
 
+def _build_layout(out: Path, *, sentinel: bool) -> None:
+    """以 `mkbundle.sh --dev`（可選 `--delegate-sentinel`）建立或重建 `out`；失敗以 AssertionError 呈現（含 stderr）。"""
+    _require_cargo()
+    args = [str(MKBUNDLE), "--dev"]
+    if sentinel:
+        args.append("--delegate-sentinel")
+    args += ["--out", str(out)]
+    res = subprocess.run(args, capture_output=True, text=True, timeout=900, cwd=str(REPO), check=False)
+    assert res.returncode == 0, f"mkbundle.sh {' '.join(args[1:])} 失敗（rc={res.returncode}）：{res.stderr.strip()}"
+
+
+def test_refuses_nonempty_out_not_created_by_mkbundle(tmp_path):
+    """非空且非 mkbundle 建立的目錄：exit 2、不寫入任何檔案（於 cargo 建置前即拒絕，不需 cargo）。"""
+    out = tmp_path / "foreign"
+    out.mkdir()
+    notes = out / "operator-notes.txt"
+    notes.write_text("keep", encoding="utf-8")
+    res = subprocess.run(
+        [str(MKBUNDLE), "--dev", "--out", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert res.returncode == 2, res.stderr
+    assert "拒絕" in res.stderr
+    assert sorted(p.name for p in out.iterdir()) == ["operator-notes.txt"]
+    assert notes.read_text(encoding="utf-8") == "keep"
+
+
+def test_refuses_legacy_layout_without_owner_marker(tmp_path):
+    """無 owner marker 的舊版 sentinel 頂層 manifest 同樣視為非 mkbundle 建立：拒絕並原樣保留。"""
+    out = tmp_path / "legacy"
+    out.mkdir()
+    stale = out / "release-manifest.json"
+    stale.write_text("{}", encoding="utf-8")
+    res = subprocess.run(
+        [str(MKBUNDLE), "--dev", "--out", str(out)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert res.returncode == 2, res.stderr
+    assert stale.read_text(encoding="utf-8") == "{}"
+    assert not (out / ".mkbundle-owner").exists()
+
+
+def test_refuses_out_path_that_is_a_regular_file(tmp_path):
+    target = tmp_path / "not-a-dir"
+    target.write_text("x", encoding="utf-8")
+    res = subprocess.run(
+        [str(MKBUNDLE), "--dev", "--out", str(target)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert res.returncode == 2, res.stderr
+    assert target.read_text(encoding="utf-8") == "x"
+
+
+def test_sentinel_then_dev_into_same_out_leaves_single_layout(tmp_path):
+    """sentinel 與 dev 建到同一目錄：第二次建置須整個重建，最終只剩單一佈局（不殘留頂層 manifest／py／前次檔案）。"""
+    out = tmp_path / "shared out"
+    _build_layout(out, sentinel=True)
+    assert (out / "release-manifest.json").is_file(), "前置條件：sentinel 佈局應寫入頂層 manifest"
+    stale = out / "stale-from-sentinel.txt"
+    stale.write_text("stale", encoding="utf-8")
+
+    _build_layout(out, sentinel=False)
+
+    assert not stale.exists(), "mkbundle 自有目錄須整個重建，不得保留前次檔案"
+    assert not (out / "release-manifest.json").exists(), "dev 建置後殘留 sentinel 頂層 manifest（bundle 定位會取到過期清單）"
+    assert not (out / "py").exists(), "dev 建置後殘留 sentinel 的頂層 py/"
+    assert (out / "versions" / VERSION / "release-manifest.json").is_file()
+    assert (out / "bin" / "serialwrap").is_symlink()
+    assert sorted(p.name for p in (out / "versions").iterdir()) == [VERSION]
+
+    _build_layout(out, sentinel=True)
+
+    assert not (out / "versions").exists(), "sentinel 建置後殘留 dev 的 versions/"
+    manifest = json.loads((out / "release-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["stage"] == "rust-1b-dev"
+
+
 def test_bundle_launcher_starts_python_daemon(bundle, tmp_path):
     out = bundle.out()
     launcher = out / "bin" / "serialwrapd"

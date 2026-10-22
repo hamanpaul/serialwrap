@@ -101,6 +101,11 @@ def _approved_python_skips(
     platform: str,
     selected_nodes: list[str],
 ) -> dict[str, str]:
+    """登記的 Python 輪 skip 只核准給帶 `rust_only` marker 的節點。
+
+    `skip_registered` 不得整案套用：同一登記案例內的共用節點（無 `rust_only`）必須在 A 輪實際執行，
+    並與 B 輪一併由比較器判定。共用節點若被 skip 或 xfail，`_junit_required` 會判為失敗。
+    """
     current = {case["case_id"]: case for case in case_map}
     selected = set(selected_nodes)
     approved: dict[str, str] = {}
@@ -110,10 +115,8 @@ def _approved_python_skips(
         if "python" not in registered and platform not in registered:
             continue
         for node in frozen.get("tests", []):
-            if node not in selected:
+            if node not in selected or "rust_only" not in _markers(node):
                 continue
-            if "rust_only" not in _markers(node):
-                raise ValueError(f"Python skip 已登記但節點沒有 rust_only marker：{node}")
             approved[node] = "rust-only contract"
     return approved
 

@@ -6,6 +6,22 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 PROFILE="debug"
 L1_OUT=""
 
+# ── PID namespace 隔離（#s1x）──────────────────────────────────────────────
+# 宿主上的生產 serialwrapd（pipx／systemd）與容器 daemon 會被 CLI 的 /proc 多開偵測看見，
+# 使 rig 誤判 DEVICE_STILL_HELD／DAEMON_ALREADY_RUNNING_ELSEWHERE。故整段 A 輪、釋放確認、B 輪
+# 於同一個 user+pid+mount namespace 內執行（SW_PIDNS_OUTER 記錄外層 pid namespace 供內層比對）。
+# 不可用時以 exit 3 拒絕（判定 INVALID，不以 PASS 放行，也不退回 --force-spawn）。
+if [[ -z "${SW_PIDNS_OUTER:-}" ]]; then
+  if ! command -v unshare >/dev/null 2>&1 || ! unshare -Upf --mount-proc --map-current-user true >/dev/null 2>&1; then
+    echo "ab_blackbox.sh: INVALID（環境能力不足）：無法以非特權 unshare 建立 user+pid+mount namespace；本次 run 不得作為 A/B 證據" >&2
+    exit 3
+  fi
+  OUTER_PIDNS="$(readlink "/proc/$$/ns/pid")"
+  # RUN_ID 的 pid 後綴須取外層 pid：進入 namespace 後 $$ 恆為 1，會使所有 run 都以 _1 結尾。
+  SW_RUN_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+  exec env SW_PIDNS_OUTER="$OUTER_PIDNS" SW_RUN_STAMP="$SW_RUN_STAMP" unshare -Upf --mount-proc --map-current-user bash "$0" "$@"
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
@@ -32,7 +48,12 @@ if [[ -n "${SW_TEST_COM_PAIR:-}" && "$SW_TEST_COM_PAIR" != "COM20:COM21" ]]; the
   exit 2
 fi
 
-BUNDLE_OUT="$REPO_ROOT/target/mkbundle-dev"
+# 每次 run 於自己的目錄建 bundle（不使用共享的 target/mkbundle-dev）：舊版留下的無標記目錄不會讓 A/B 腳本中途 exit 2，
+# 且 A/B 身分檔（identity）所記的 bundle 必與本次 run 同源。
+RUN_ID="${SW_RUN_STAMP:-$(date +%Y%m%d_%H%M%S)_$$}"
+RUN_DIR="$REPO_ROOT/target/ab-runs/$RUN_ID"
+mkdir -p "$RUN_DIR" "$REPO_ROOT/target/ab-report"
+BUNDLE_OUT="$RUN_DIR/bundle"
 "$REPO_ROOT/scripts/rust/mkbundle.sh" --dev --profile "$PROFILE" --out "$BUNDLE_OUT"
 
 BUNDLE_CLI="$BUNDLE_OUT/bin/serialwrap"
@@ -42,10 +63,6 @@ if [[ ! -f "$BUNDLE_CLI" ]]; then
 fi
 
 cd "$REPO_ROOT"
-
-RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
-RUN_DIR="$REPO_ROOT/target/ab-runs/$RUN_ID"
-mkdir -p "$RUN_DIR" "$REPO_ROOT/target/ab-report"
 
 # 1. 產生必要案例清單 (required) - 僅保留黑箱 pytest 案例
 REQUIRED_CASES="$RUN_DIR/required_cases.txt"
@@ -83,6 +100,57 @@ if [[ -n "$L1_OUT" ]]; then
 else
   B_XML="$RUN_DIR/b.xml"
   B_RESOURCE_REPORT="$RUN_DIR/b-resource-report.json"
+fi
+
+# 1.5 preflight（#s1x）：必須位於隔離 pid namespace，且此 namespace 內不得看見任何非本 run 的 serialwrapd。
+#     任一不成立即判定 INVALID（preflight.json 記錄 result／原因），不進入 A／B 輪。
+PREFLIGHT="$RUN_DIR/preflight.json"
+set +e
+python3 -I - "$PREFLIGHT" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+outer = os.environ.get("SW_PIDNS_OUTER", "")
+try:
+    current = os.readlink("/proc/self/ns/pid")
+except OSError:
+    current = None
+isolated = bool(outer) and current is not None and current != outer
+foreign = []
+me = {os.getpid(), os.getppid()}
+for entry in Path("/proc").iterdir():
+    if not entry.name.isdigit() or int(entry.name) in me:
+        continue
+    try:
+        parts = (entry / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        continue
+    names = {os.path.basename(p.decode("utf-8", errors="replace")) for p in parts if p}
+    if names & {"serialwrapd", "serialwrapd.py"}:
+        foreign.append({"pid": int(entry.name), "cmdline": b" ".join(p for p in parts if p).decode("utf-8", errors="replace")[:200]})
+problems = []
+if not isolated:
+    problems.append("未位於隔離 pid namespace（SW_PIDNS_OUTER 缺漏或與目前相同）")
+if foreign:
+    problems.append("隔離 namespace 內仍可見非本 run 的 serialwrapd")
+result = {
+    "result": "INVALID" if problems else "OK",
+    "pid_namespace_isolated": isolated,
+    "outer_pidns": outer,
+    "current_pidns": current,
+    "foreign_serialwrapd": foreign,
+    "problems": problems,
+}
+out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(result, ensure_ascii=False))
+sys.exit(4 if problems else 0)
+PY
+preflight_rc=$?
+set -e
+if [[ "$preflight_rc" -ne 0 ]]; then
+  echo "preflight INVALID（見 $PREFLIGHT）：本 run 不得作為 A/B 證據" >&2
+  exit "$preflight_rc"
 fi
 
 # 2. 執行 A 輪（Python 基線）
@@ -253,6 +321,7 @@ B_PIDS="$RUN_DIR/b.pids"
 touch "$B_PIDS"
 b_env=(
   SERIALWRAP_CLI_EXE="$BUNDLE_CLI"
+  SW_BUNDLE="$BUNDLE_OUT"   # test_cli_mgmt_update／doctor 以 SW_BUNDLE 找本次 run 的 bundle（不得回退到未建置的 target/mkbundle-pytest）
   SERIALWRAP_AB_LABEL="rust-1a"
   SW_AB_PIDLOG="$B_PIDS"
 )
@@ -273,10 +342,12 @@ fi
 
 # 5. 產生身分 JSON (identity-a and identity-b)
 python3 -c "
-import hashlib, json, subprocess, sys
+import hashlib, json, os, subprocess, sys
 from pathlib import Path
 
 root = Path('$REPO_ROOT')
+_outer_pidns = os.environ.get('SW_PIDNS_OUTER', '')
+PIDNS_ISOLATED = bool(_outer_pidns) and os.readlink('/proc/self/ns/pid') != _outer_pidns
 version = (root / 'VERSION').read_text(encoding='utf-8').strip()
 
 def file_sha256(p: Path) -> str:
@@ -297,10 +368,10 @@ def dir_sha256(p: Path) -> str:
     return h.hexdigest()
 
 # 讀取 manifest
-version_dir = root / 'target' / 'mkbundle-dev' / 'versions' / version
+version_dir = Path('$BUNDLE_OUT') / 'versions' / version
 manifest_path = version_dir / 'release-manifest.json'
 if not manifest_path.is_file():
-    manifest_path = root / 'target' / 'mkbundle-dev' / 'release-manifest.json'
+    manifest_path = Path('$BUNDLE_OUT') / 'release-manifest.json'
 
 manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
 
@@ -320,7 +391,7 @@ rust_sha = file_sha256(Path(rust_cli))
 # 計算 tool_revision 與 config_digest
 bb_tree_sha = dir_sha256(root / 'tests' / 'contract_blackbox')
 tool_rev = f'{git_rev}+{bb_tree_sha}'
-cfg_digest = dir_sha256(root / 'target' / 'mkbundle-dev')
+cfg_digest = dir_sha256(Path('$BUNDLE_OUT'))
 
 # 建立 evidence_files 清單
 evidence_files = []
@@ -342,6 +413,7 @@ id_a = {
     'platform': 'linux',
     'config_digest': cfg_digest,
     'dut_identity': 'FakeTarget',
+    'pid_namespace_isolated': PIDNS_ISOLATED,
     'evidence_files': evidence_files,
 }
 Path('$ID_A').write_text(json.dumps(id_a, indent=2) + '\n', encoding='utf-8')
@@ -360,6 +432,7 @@ id_b = {
     'platform': 'linux',
     'config_digest': cfg_digest,
     'dut_identity': 'FakeTarget',
+    'pid_namespace_isolated': PIDNS_ISOLATED,
     'evidence_files': evidence_files,
 }
 Path('$ID_B').write_text(json.dumps(id_b, indent=2) + '\n', encoding='utf-8')
