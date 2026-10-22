@@ -401,11 +401,15 @@ class TestSpike1NativeCom:
         import jsonschema
         from realhw.acceptance.spike1_remaining import main
 
-        args = [action, "--pair", com_pair, "--out", str(tmp_path)]
+        # 三項須寫入同一持久化 evidence 目錄，工具才會合併既有項目（同目錄重測會拒絕）。
+        # 未設定 SW_TEST_SPIKE1_OUT_DIR 時維持逐測試 tmp_path（單項報告，僅供本機除錯）。
+        spike_out = os.environ.get("SW_TEST_SPIKE1_OUT_DIR")
+        out_dir = Path(spike_out) if spike_out else tmp_path
+        args = [action, "--pair", com_pair, "--out", str(out_dir)]
         if console_pair:
             args.extend(["--console-pair", console_pair])
         exit_code = main(args)
-        report_path = tmp_path / "spike1-remaining.json"
+        report_path = out_dir / "spike1-remaining.json"
         assert report_path.exists(), "原生工具未產生合併報告"
         report = json.loads(report_path.read_text(encoding="utf-8"))
         schema_path = REPO_ROOT / "realhw" / "acceptance" / "spike1_report.schema.json"
