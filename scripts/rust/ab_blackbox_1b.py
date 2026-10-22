@@ -581,6 +581,24 @@ def _write_identity(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
+def _junit_matches(cases: dict[str, dict[str, str]], node: str) -> list[dict[str, str]]:
+    """JUnit 中與凍結 pytest 節點對應的列；呼叫端須確認恰為一列才可判定結果。"""
+    path_text, *segments = node.split("::")
+    module = path_text.removesuffix(".py").replace("/", ".")
+    expected_class = ".".join([module, *segments[:-1]])
+    expected_name = segments[-1].split("[", 1)[0] if segments else ""
+    exact_name = bool(segments and "[" in segments[-1])
+    matches = []
+    for cid, info in cases.items():
+        actual_class, separator, actual_name = cid.rpartition("::")
+        if not separator or actual_class != expected_class:
+            continue
+        name_matches = actual_name == segments[-1] if exact_name else actual_name.split("[", 1)[0] == expected_name
+        if name_matches:
+            matches.append(info)
+    return matches
+
+
 def _junit_required(
     junit: Path,
     required: list[str],
@@ -593,19 +611,7 @@ def _junit_required(
     failures = list(errors)
     approved_skips = approved_skips or {}
     for node in sorted(set(required)):
-        path_text, *segments = node.split("::")
-        module = path_text.removesuffix(".py").replace("/", ".")
-        expected_class = ".".join([module, *segments[:-1]])
-        expected_name = segments[-1].split("[", 1)[0] if segments else ""
-        exact_name = bool(segments and "[" in segments[-1])
-        matches = []
-        for cid, info in cases.items():
-            actual_class, separator, actual_name = cid.rpartition("::")
-            if not separator or actual_class != expected_class:
-                continue
-            name_matches = actual_name == segments[-1] if exact_name else actual_name.split("[", 1)[0] == expected_name
-            if name_matches:
-                matches.append(info)
+        matches = _junit_matches(cases, node)
         if len(matches) != 1:
             failures.append(f"必要節點 {node} 執行次數為 {len(matches)}")
             continue
@@ -619,6 +625,79 @@ def _junit_required(
         elif outcome != "pass":
             failures.append(f"必要節點 {node} 結果不是 pass：{outcome}")
     return failures
+
+
+_RUST_ONLY_RELEASE_REASON = "全部選取節點為 rust_only，A 輪僅收集並 skip，未啟動受測行程"
+
+
+def _a_round_spawned_nothing(
+    a_junit: Path,
+    a_pidlog: Path,
+    a_returncode: int,
+    selected: list[str],
+    approved: dict[str, str],
+) -> bool:
+    """A 輪是否可證明「未啟動任何受測行程」（fail-closed：任一條件不成立即 False）。
+
+    條件：每個選取節點皆為 `_approved_python_skips` 核准的 rust_only；A 輪 exit 0；JUnit 可解析且每個
+    選取節點恰一列，結果為核准理由的 skip（不得為 pass、xfail 或其他理由的 skip）；PID 日誌不存在或無任何非空白列。
+    """
+    from scripts.rust.ab_compare import _parse_junit
+
+    if a_returncode != 0 or not all(node in approved for node in selected):
+        return False
+    if not a_junit.is_file():
+        return False
+    try:
+        if a_pidlog.is_file() and any(line.strip() for line in a_pidlog.read_text(encoding="utf-8").splitlines()):
+            return False
+    except (OSError, UnicodeError):
+        return False
+    cases, errors = _parse_junit(a_junit)
+    if errors:
+        return False
+    for node in selected:
+        matches = _junit_matches(cases, node)
+        if len(matches) != 1:
+            return False
+        if matches[0]["outcome"] != "skip" or matches[0]["message"] != approved[node]:
+            return False
+    return True
+
+
+def _a_round_release(
+    *,
+    a_junit: Path,
+    a_pidlog: Path,
+    a_returncode: int,
+    selected: list[str],
+    approved: dict[str, str],
+    out: Path,
+) -> dict[str, Any]:
+    """A 輪釋放前置判斷（Linux 與 Windows 共用；平台差異仍在 `_release_check` 內）。
+
+    依 plan 05 Task 16（第 3523 行）：rust_only 案例只跑 B 並驗絕對契約。全 rust_only 選取時 A 輪沒有受測行程需要
+    釋放，`_release_check` 的「缺 PID 日誌即失敗」不適用，此時記為 ok 並照常啟動 B 輪。其餘情況一律沿用 `_release_check`。
+    """
+    if not _a_round_spawned_nothing(a_junit, a_pidlog, a_returncode, selected, approved):
+        return _release_check(a_pidlog, out)
+    result: dict[str, Any] = {
+        "ok": True,
+        "a_round_spawned": False,
+        "reason": _RUST_ONLY_RELEASE_REASON,
+        "selected_nodes": sorted(selected),
+        "pids_reaped": True,
+        "sockets_cleaned": True,
+        "locks_free": True,
+        "fds_released": True,
+        "parse_errors": [],
+        "unreaped_pids": [],
+        "remaining_sockets": [],
+        "held_locks": [],
+        "held_fds": [],
+    }
+    out.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return result
 
 
 def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
@@ -672,7 +751,10 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
         else ["A 輪缺少 JUnit"]
     )
 
-    release = _release_check(a_pidlog, release_path)
+    release = _a_round_release(
+        a_junit=a_junit, a_pidlog=a_pidlog, a_returncode=a_result.returncode,
+        selected=selected_nodes, approved=approved_a_skips, out=release_path,
+    )
     if not release.get("ok"):
         report = {
             "result": "fail", "reason": "A 輪資源釋放檢查失敗", "a_exit_code": a_result.returncode,

@@ -409,3 +409,178 @@ def test_outer_ab_run_fails_when_executor_leaves_no_summary(tmp_path: Path, monk
     with pytest.raises(AssertionError):
         test_cli_mgmt_ab_suite_execution(tmp_path)
     assert len(calls) == 1
+
+
+_RUST_ONLY_REASON = "rust-only contract"
+
+
+def _write_suite_junit(path: Path, rows: list[tuple[str, str, str]]) -> None:
+    """依 (nodeid, outcome, message) 產生多列 testcase 的 JUnit；outcome 為 pass 或 skip。"""
+    suite = ET.Element("testsuite", tests=str(len(rows)), failures="0", errors="0", skipped="0")
+    for nodeid, outcome, message in rows:
+        path_text, *segments = nodeid.split("::")
+        classname = ".".join([path_text.removesuffix(".py").replace("/", "."), *segments[:-1]])
+        testcase = ET.SubElement(suite, "testcase", classname=classname, name=segments[-1])
+        if outcome == "skip":
+            ET.SubElement(testcase, "skipped", message=message)
+    ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def _stage_release_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    selected: list[str],
+    rust_only: set[str],
+    a_rows: list[tuple[str, str, str]],
+    a_returncode: int = 0,
+    a_pidlog: str | None = None,
+) -> dict:
+    """以假的 pytest 子行程驅動 `execute()`，只觀察 A 輪釋放前置判斷與 B 輪是否啟動。
+
+    節點檔為暫存目錄內的 `t_release.py`，`rust_only` 節點帶 marker，其餘為共用節點；
+    不啟動真實 pytest、daemon 或比較器，平台以本機為準（Windows 與 Linux 共用同一判斷）。
+    """
+    executor = _load_ab_executor()
+    platform = "windows" if os.name == "nt" else "linux"
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    body = ["import pytest", ""]
+    for node in selected:
+        name = node.split("::", 1)[1]
+        if node in rust_only:
+            body.append("@pytest.mark.rust_only")
+        body.extend([f"def {name}():", "    pass", "", ""])
+    (fake_root / "t_release.py").write_text("\n".join(body), encoding="utf-8")
+    daemon = tmp_path / "py-serialwrapd"
+    daemon.write_text("stub\n", encoding="utf-8")
+    cli = tmp_path / "serialwrap"
+    cli.write_bytes(b"rust cli")
+    manifest = tmp_path / "release-manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    out = tmp_path / "ab"
+    a_junit, b_junit = out / "a-python.xml", out / "b-rust.xml"
+    lock_cases = [{"case_id": "c-release", "tests": list(selected)}]
+    case_map = [{"case_id": "c-release", "skip_registered": {"python": "rust-only 契約（behavior_changes 已登記）"}}]
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if "--collect-only" in argv:
+            return subprocess.CompletedProcess(argv, 0, "\n".join(selected) + "\n", "")
+        if f"--junitxml={a_junit}" in argv:
+            _write_suite_junit(a_junit, a_rows)
+            if a_pidlog is not None:
+                (out / "a.pids").write_text(a_pidlog, encoding="utf-8")
+            return subprocess.CompletedProcess(argv, a_returncode, "", "")
+        if f"--junitxml={b_junit}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    monkeypatch.setattr(executor, "ROOT", fake_root)
+    monkeypatch.setattr(executor, "PY_DAEMON", daemon)
+    monkeypatch.setattr(executor, "_frozen_cases", lambda: (lock_cases, sorted(selected)))
+    monkeypatch.setattr(executor, "_frozen_case_map", lambda _lock: case_map)
+    monkeypatch.setattr(executor, "_applicable_nodes", lambda nodes, _platform: list(nodes))
+    monkeypatch.setattr(executor, "_baseline_identity", lambda *_a, **_k: {})
+    monkeypatch.setattr(executor, "_bundle_identity", lambda *_a, **_k: {})
+    monkeypatch.setattr(executor, "resolve_manifest", lambda _cli: manifest)
+    monkeypatch.setattr(executor, "_run", fake_run)
+    rc = executor.execute(cli=cli, out_dir=out, platform=platform, timeout=60)
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    return {"rc": rc, "out": out, "calls": calls, "summary": summary, "b_junit": b_junit}
+
+
+def _b_round_started(run: dict) -> bool:
+    return any(f"--junitxml={run['b_junit']}" in argv for argv in run["calls"])
+
+
+def test_all_rust_only_selection_without_pids_records_release_ok_and_starts_b(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """plan 05 Task 16：全 rust_only 選取時 A 輪只收集並 skip、不啟動行程；release 記 ok，且照常啟動 B 輪。"""
+    selected = ["t_release.py::test_rust_one", "t_release.py::test_rust_two"]
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=selected, rust_only=set(selected),
+        a_rows=[(node, "skip", _RUST_ONLY_REASON) for node in selected],
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is True, release
+    assert release["a_round_spawned"] is False, release
+    assert "未啟動受測行程" in release["reason"], release
+    assert (run["out"] / "release-check.json").is_file()
+    assert _b_round_started(run), "release 通過後 B 輪必須照常啟動"
+
+
+def test_mixed_selection_with_shared_node_still_fails_release_without_pid_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """選取含一個共用（非 rust_only）節點時，即使 A 輪無 PID 日誌，release 仍為 ok:false 且 B 輪不啟動。"""
+    rust_node, shared_node = "t_release.py::test_rust_one", "t_release.py::test_shared"
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=[rust_node, shared_node], rust_only={rust_node},
+        a_rows=[(rust_node, "skip", _RUST_ONLY_REASON), (shared_node, "pass", "")],
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is False, release
+    assert "A 輪沒有產生 PID 資源日誌" in release["parse_errors"], release
+    assert not _b_round_started(run)
+    assert run["rc"] == 1
+
+
+@pytest.mark.parametrize(
+    ("a_rows", "a_returncode"),
+    [
+        pytest.param(
+            [("t_release.py::test_rust_one", "pass", ""), ("t_release.py::test_rust_two", "skip", _RUST_ONLY_REASON)],
+            0,
+            id="a-round-passed-node",
+        ),
+        pytest.param(
+            [("t_release.py::test_rust_one", "skip", "other reason"), ("t_release.py::test_rust_two", "skip", _RUST_ONLY_REASON)],
+            0,
+            id="unapproved-skip-reason",
+        ),
+        pytest.param(
+            [("t_release.py::test_rust_one", "skip", _RUST_ONLY_REASON), ("t_release.py::test_rust_two", "skip", _RUST_ONLY_REASON)],
+            1,
+            id="a-round-exit-nonzero",
+        ),
+    ],
+)
+def test_all_rust_only_release_stays_failed_unless_a_round_is_pure_registered_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, a_rows: list[tuple[str, str, str]], a_returncode: int
+) -> None:
+    """全 rust_only 但 A 輪 JUnit 含 passed、未核准 skip，或 A 輪 exit 非 0 → 不得豁免，維持 ok:false。"""
+    selected = ["t_release.py::test_rust_one", "t_release.py::test_rust_two"]
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=selected, rust_only=set(selected), a_rows=a_rows, a_returncode=a_returncode,
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is False, release
+    assert "a_round_spawned" not in release, release
+    assert not _b_round_started(run)
+    assert run["rc"] == 1
+
+
+def test_all_rust_only_release_falls_back_to_real_check_when_pid_log_has_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 輪 PID 日誌含任一列即沿用現行檢查：殘留 socket 仍判 ok:false，不得因全 rust_only 而豁免。"""
+    selected = ["t_release.py::test_rust_one", "t_release.py::test_rust_two"]
+    stale_socket = tmp_path / "stale.sock"
+    stale_socket.write_text("leftover", encoding="utf-8")
+    row = json.dumps({"pid": None, "children": [], "socket": str(stale_socket), "lock": None, "run_dir": None})
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=selected, rust_only=set(selected),
+        a_rows=[(node, "skip", _RUST_ONLY_REASON) for node in selected],
+        a_pidlog=row + "\n",
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is False, release
+    assert release["remaining_sockets"] == [str(stale_socket)], release
+    assert not _b_round_started(run)
