@@ -21,6 +21,17 @@ Codex 帳號額度於 2026-10-21 約 18:28（台北）用完，恢復時間 2026
 | feature/rust-refactor | 5283883 | 1 Stage 1 exit closure 第 2 輪：P4 登記拒絕髒樹 | Sonnet max | 待補審 |
 | feature/rust-refactor | 03d101a | 1 Stage 1 exit closure 第 2 輪：L15 延遲回覆與 runner fail-closed | Sonnet max | 待補審 |
 | feature/rust-refactor | c0c3c29 | 1 Stage 1 exit closure 第 2 輪：Windows COM 閘門 schema | Sonnet max | 待補審 |
+| feature/rust-refactor | 99e5db3 | 1 Stage 1 exit closure D-python-handoff-drain-window-baseline-change（oracle 變更） | Sonnet max | 待補審 |
+| feature/rust-refactor | ccf29ce | 1 Stage 1 exit closure B-windows-com-gate-and-l15-coverage | Sonnet max | 待補審 |
+| feature/rust-refactor | 72a887e | 1 Stage 1 exit closure sw-cli-handoff-ran-rollback | Sonnet max | 待補審 |
+| feature/rust-refactor | 6273337 | 1 Stage 1 exit closure B/E-win-delegate-job | Sonnet max | 待補審 |
+| feature/rust-refactor | ca0106f | 1 Stage 1 exit closure A-bridge-tool-revision-and-windows-selftest（工具 revision 未核准） | Sonnet max | 待補審 |
+| feature/rust-refactor | d063fa5 | 1 Stage 1 exit closure E-win-cli-help-golden | Sonnet max | 待補審 |
+| feature/rust-refactor | 6bff431 | 1 Stage 1 exit closure E-ab-blackbox-bundle-identity | Sonnet max | 待補審 |
+| feature/rust-refactor | 1f55cb2 | 1 Stage 1 exit closure C-test-oracle-edits（test oracle 變更） | Sonnet max | 待補審 |
+| feature/rust-refactor | afc1ec0 | 1 Stage 1 exit closure C-l1-lock-registration-add-only | Sonnet max | 待補審 |
+| feature/rust-refactor | 2c4eedf | 1 Stage 1 exit closure B-spike3-git-clean | Sonnet max | 待補審 |
+| feature/rust-refactor | 16a69da | 1 Stage 1 exit closure C-plan-and-owner-queue-text | Sonnet max | 待補審 |
 
 後續新增的單審 commit 一律追加於此表。
 
