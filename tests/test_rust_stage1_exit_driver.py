@@ -1,0 +1,237 @@
+"""Stage 1 出口驅動腳本的靜態與記憶體內檢查（S1X G2）。
+
+檢查 scripts/rust/stage1_exit_driver.sh 的順序與參數契約：自測報告以核准 tree 挑選、SW_BUNDLE 有 export、
+register 與 check 位於唯一一次完整 pytest 之前、gate 帶 Windows L1.5 與 spike3、報告路徑取工具 run_id 而非 ls -t。
+自測報告選擇邏輯以 exec 其內嵌的 python 區段，於 tmp_path 內執行（不啟動子行程、不開 socket／PTY／裝置）。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DRIVER = REPO_ROOT / "scripts" / "rust" / "stage1_exit_driver.sh"
+APPROVED_JSON = REPO_ROOT / "tools" / "uart_stdio_bridge" / "APPROVED_REVISION.json"
+STALE_TREE = "9eaed6de5abd3d75d18929b6fdb3bdac7e1929fe32f666c3193c9983005ecd1c"
+
+
+def _driver_text() -> str:
+    return DRIVER.read_text(encoding="utf-8")
+
+
+def _joined() -> str:
+    """把 bash 行尾續行（反斜線換行）併為單行，便於以子字串比對完整命令。"""
+    return re.sub(r"[ \t]*\\\n[ \t]*", " ", _driver_text())
+
+
+def _step_index(text: str, needle: str) -> int:
+    idx = text.find(needle)
+    assert idx >= 0, f"驅動腳本缺少：{needle}"
+    return idx
+
+
+def _approved_tree() -> str:
+    return json.loads(APPROVED_JSON.read_text(encoding="utf-8"))["tree_sha256"]
+
+
+def _selection_source() -> str:
+    m = re.search(r"^select_selftest\(\) \{\n  python3 - [^\n]*<<'PY'\n(.*?)\nPY\n\}", _driver_text(),
+                  re.S | re.M)
+    assert m, "找不到 select_selftest 的內嵌 python 區段"
+    return m.group(1)
+
+
+def _write_report(home: Path, name: str, tree: str, verdict: str = "PASS",
+                  created: str = "2026-10-22T00:00:00Z") -> Path:
+    d = home / "b-log" / "rust-refactor" / "p2" / name
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / "selftest-report.json"
+    path.write_text(json.dumps({"verdict": verdict, "created_at": created, "tool": {"tree_sha256": tree}}),
+                    encoding="utf-8")
+    return path
+
+
+def _run_selection(monkeypatch, capsys, home: Path, kind: str, override: str = "") -> tuple[int, str]:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(sys, "argv", ["select_selftest", str(APPROVED_JSON), kind, override])
+    code = compile(_selection_source(), "<select_selftest>", "exec")
+    rc = 0
+    try:
+        exec(code, {"__name__": "__main__"})
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 1
+    return rc, capsys.readouterr().out.strip()
+
+
+# ── 自測報告選擇：核准 tree ───────────────────────────────────────────────
+
+def test_selection_rejects_stale_tree_only(monkeypatch, capsys, tmp_path):
+    _write_report(tmp_path, "selftest-linux", STALE_TREE)
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "linux")
+    assert rc == 1
+    assert out == "", "找不到核准 tree 時不得輸出任何（舊）報告路徑"
+
+
+def test_selection_prefers_approved_pass_over_stale(monkeypatch, capsys, tmp_path):
+    _write_report(tmp_path, "selftest-linux", STALE_TREE)
+    approved = _write_report(tmp_path, "selftest-linux-20261022", _approved_tree())
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "linux")
+    assert rc == 0
+    assert out == str(approved)
+
+
+def test_selection_requires_pass_verdict(monkeypatch, capsys, tmp_path):
+    _write_report(tmp_path, "selftest-linux-20261022", _approved_tree(), verdict="FAIL")
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "linux")
+    assert rc == 1
+    assert out == ""
+
+
+def test_selection_override_must_match_approved_tree(monkeypatch, capsys, tmp_path):
+    stale = _write_report(tmp_path, "selftest-linux", STALE_TREE)
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "linux", str(stale))
+    assert rc == 1
+    assert out == "", "SELFTEST_LINUX 覆寫仍須核對核准 tree"
+
+
+def test_selection_override_accepts_approved_tree(monkeypatch, capsys, tmp_path):
+    approved = _write_report(tmp_path, "selftest-linux-20261022", _approved_tree())
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "linux", str(approved))
+    assert rc == 0
+    assert out == str(approved)
+
+
+def test_windows_selection_uses_windows_glob_only(monkeypatch, capsys, tmp_path):
+    approved = _write_report(tmp_path, "selftest-windows-20261022", _approved_tree())
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "windows")
+    assert rc == 0 and out == str(approved)
+    rc, out = _run_selection(monkeypatch, capsys, tmp_path, "linux")
+    assert rc == 1 and out == "", "Linux 挑選不得取到 Windows 目錄的報告"
+
+
+# ── 驅動腳本靜態契約 ──────────────────────────────────────────────────────
+
+def test_driver_selftest_paths_follow_approved_tree_not_old_report():
+    text = _driver_text()
+    assert "tools/uart_stdio_bridge/APPROVED_REVISION.json" in text
+    assert 'f"selftest-{kind}*"' in text, "自測報告以 kind 組出 selftest-linux*／selftest-windows* 樣式"
+    assert "select_selftest windows" in text and "select_selftest linux" in text
+    assert "p2/selftest-linux/selftest-report.json" not in text, "不得寫死舊 tree 9eaed6de 的報告路徑"
+
+
+def test_sw_bundle_is_exported():
+    assert re.search(r"^\s*export SW_BUNDLE=", _driver_text(), re.M), "plan 05 Step 4 要求 export SW_BUNDLE"
+
+
+def test_full_pytest_runs_exactly_once_after_register_and_check():
+    text = _joined()
+    full = "env PYTHONPATH=scripts/rust SW_REQUIRE_CARGO=1 " \
+           'SW_RESOURCE_REPORT="$EV/l1/linux/pytest-full/resource-report.json" ' \
+           "python3 -m pytest -q tests/ -p junit_provenance --junitxml=\"$EV/pytest-full.xml\""
+    assert text.count(full) == 1, "完整 pytest 的 argv 必須與 G1 selector 所述命令一致，且只出現一次"
+    assert text.count("pytest -q tests/ ") == 1, "完整 pytest 之外不得再有 tests/ 全套執行"
+    assert "pytest_final" not in text, "pytest_final 已刪除（同一 HEAD 的完整 pytest 承擔）"
+    reg = _step_index(text, "register_p4_evidence.py")
+    chk = _step_index(text, "check_p4_cases.py --check")
+    pyt = _step_index(text, full)
+    assert reg < chk < pyt, "register 與 check_p4_cases 必須先於完整 pytest（測試讀取 target/p4-evidence）"
+
+
+def test_register_carries_windows_cli_and_junit():
+    text = _joined()
+    assert '--windows-cli "$WIN_CLI"' in text
+    assert '--windows-unit-junit "$WIN_UNIT_JUNIT"' in text
+    assert 'WIN_CLI="$WB_DIR/bundle/bin/serialwrap.exe"' in text
+    assert 'WIN_UNIT_JUNIT="$WB_DIR/l1/windows/blackbox/junit.xml"' in text
+
+
+def test_gate_receives_windows_l15_spike3_and_explicit_ab_report():
+    text = _joined()
+    assert '"windows=$EV/func-test-windows/func-test-report.json"' in text
+    assert '--spike3-evidence "$EV/spike3"' in text
+    assert "--ab-report" in text
+    assert "win_l15_func_test" in text and "spike3_win_wal" in text
+
+
+def _driver_wrapper_default(var: str) -> Path:
+    m = re.search(rf'^\s*{var}="\$\{{{var}:-\$REPO/([^}}]+)\}}"', _driver_text(), re.M)
+    assert m, f"驅動缺少 {var} 的預設值"
+    return REPO_ROOT / m.group(1)
+
+
+def _driver_wrapper_options() -> dict[str, list[str]]:
+    """驅動呼叫 Windows wrapper 的命令（續行已併為單行）：變數名 → 其傳入的長選項。"""
+    out: dict[str, list[str]] = {}
+    for line in _joined().splitlines():
+        for var in ("WIN_L15_WRAPPER", "SPIKE3_WRAPPER"):
+            if f'"${var}"' in line:
+                out.setdefault(var, []).extend(re.findall(r"(--[a-z][a-z0-9-]*)", line))
+    return out
+
+
+def test_driver_windows_wrappers_exist_and_accept_every_option_it_passes():
+    """F1 回歸：驅動傳給 wrapper 的每個長選項，都必須出現在該 wrapper 的參數解析（case 分支）中。"""
+    invocations = _driver_wrapper_options()
+    assert set(invocations) == {"WIN_L15_WRAPPER", "SPIKE3_WRAPPER"}, invocations
+    for var, opts in invocations.items():
+        wrapper = _driver_wrapper_default(var)
+        assert wrapper.is_file(), f"驅動呼叫的 wrapper 不存在：{wrapper}"
+        src = wrapper.read_text(encoding="utf-8")
+        for opt in opts:
+            assert re.search(rf"^\s*{re.escape(opt)}\)", src, re.M), f"{wrapper.name} 的參數解析不接受 {opt}"
+
+
+def test_driver_windows_l15_passes_bundle_and_spike3_runs_once_for_all_cases():
+    text = _joined()
+    assert '--bundle "$WB_DIR/bundle"' in text, "win-func-test.sh 必須帶 --bundle（G4 匯出的 Windows dev bundle）"
+    executable = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    assert not any("--case" in ln for ln in executable), "win-spike3.sh 不接受 --case（單次執行四案）"
+    assert text.count("spike3_win_wal") == 1
+    assert '--evidence-dir "$EV" ' in text, "spike3 證據根目錄為 $EV，wrapper 寫入 $EV/spike3/<case>.json"
+    assert "win-l15-producer" not in text, "win-l15-producer.sh 不存在；L1.5 由 win-func-test.sh 交付"
+
+
+def test_p4_evidence_is_quarantined_before_first_step():
+    """F3 回歸：既有 target/p4-evidence 與 p4-bench 報告在第一步前隔離（搬不刪），且有 mtime 新鮮度檢查。"""
+    text = _driver_text()
+    move = _step_index(text, 'mv "$P4" "$EV/p4-prev/p4-evidence"')
+    first_step = _step_index(text, "step ci_workflow_test")
+    assert move < first_step, "既有 p4-evidence 須於第一個步驟前隔離"
+    assert 'mv "$f" "$EV/p4-prev/"' in text, "p4-bench-*.json 亦須隔離"
+    assert "RUN_START_EPOCH=" in text and "fresh_or_fail()" in text
+    assert 'rm -rf "$P4"' not in text and 'rm -rf "$EV' not in text, "驅動不得刪除既有證據目錄（只搬移）"
+
+
+def test_edr_unknown_is_documented_as_fail_not_blocked_owner():
+    """F2 回歸：未設 SW_EDR_* 時 spike3 為 evidence-insufficient（FAIL），文件與警示不得宣稱 BLOCKED-OWNER。"""
+    text = _driver_text()
+    assert "不是 BLOCKED-OWNER" in text or "而非 BLOCKED-OWNER" in text
+    assert "WARN EDR" in text
+
+
+def test_both_bench_steps_run_with_isolated_daemon_and_stub():
+    text = _driver_text()
+    assert "bench_cli_roundtrip.py" in text
+    assert "--platform linux" in text
+    assert "--cli-only-stub" in text
+    assert "bb_stubd.py" in text, "stub 端點須以 bb_stubd 提供"
+
+
+def test_report_paths_come_from_tool_run_id_not_ls_t():
+    executable = [ln for ln in _driver_text().splitlines() if not ln.lstrip().startswith("#")]
+    assert not any(re.search(r"\bls -t\b", ln) for ln in executable), "可執行行不得以 ls -t 猜測報告"
+    assert "printed_path" in _driver_text()
+
+
+def test_driver_checks_clean_tree_at_start_and_records_head():
+    text = _driver_text()
+    assert "git status --porcelain" in text
+    assert 'git rev-parse HEAD' in text
