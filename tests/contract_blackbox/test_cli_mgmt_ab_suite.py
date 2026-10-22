@@ -340,3 +340,72 @@ def test_resolve_manifest_uses_pointer_and_never_falls_back(tmp_path: Path) -> N
     manifest.unlink()
     with pytest.raises(ValueError, match="release-manifest"):
         executor.resolve_manifest(cli)
+
+
+def test_registered_python_skip_is_approved_only_for_rust_only_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一登記案例內，只有 rust_only 節點可被核准為 Python 輪 skip；共用節點即使被 skip 也必須判失敗。"""
+    executor = _load_ab_executor()
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    (fake_root / "t_mixed.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.mark.rust_only\n"
+        "def test_rust_side():\n"
+        "    pass\n\n\n"
+        "def test_shared():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(executor, "ROOT", fake_root)
+    rust_node = "t_mixed.py::test_rust_side"
+    shared_node = "t_mixed.py::test_shared"
+    selected = [rust_node, shared_node]
+    lock_cases = [{"case_id": "mixed", "tests": selected}]
+    case_map = [{"case_id": "mixed", "skip_registered": {"python": "rust-only 契約（behavior_changes 已登記）"}}]
+
+    approved = executor._approved_python_skips(lock_cases, case_map, "linux", selected)
+    assert approved == {rust_node: "rust-only contract"}
+
+    junit = tmp_path / "junit.xml"
+    _write_status_junit(junit, shared_node, outcome="skip", message="rust-only contract")
+    assert executor._junit_required(junit, [shared_node], approved_skips=approved), "共用節點 skip 不得因案例登記而放行"
+
+    _write_status_junit(junit, rust_node, outcome="skip", message="rust-only contract")
+    assert executor._junit_required(junit, [rust_node], approved_skips=approved) == []
+    assert executor._junit_required(junit, [rust_node], approved_skips={}), "未登記的 rust_only skip 仍須失敗"
+
+    _write_status_junit(junit, rust_node, outcome="xfail", message="P4 regression")
+    assert executor._junit_required(junit, [rust_node], approved_skips=approved), "xfail 不得因登記而放行"
+
+
+def test_frozen_registry_keeps_shared_doctor_node_out_of_python_skip_allowlist() -> None:
+    """真實凍結資料：sc25 的共用節點不得進入 Python skip allowlist，執行器也不得因此拋出 ValueError。"""
+    executor = _load_ab_executor()
+    lock_cases, nodes = executor._frozen_cases()
+    case_map = executor._frozen_case_map(lock_cases)
+    selected = executor._applicable_nodes(nodes, "linux")
+    approved = executor._approved_python_skips(lock_cases, case_map, "linux", selected)
+    shared = "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks"
+    assert shared in selected
+    assert shared not in approved
+    assert approved and all("rust_only" in executor._markers(node) for node in approved)
+
+
+def test_outer_ab_run_fails_when_executor_leaves_no_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """外層 A/B 測試不得因子行程回傳 0 而通過；執行器未產生 summary.json 即失敗（不得零執行器產出即 PASS）。"""
+    cli = tmp_path / "serialwrap"
+    cli.write_bytes(b"rust cli")
+    monkeypatch.setattr(sys.modules[__name__], "cli_prefix", lambda: [str(cli)])
+    monkeypatch.delenv("SW_RESOURCE_REPORT", raising=False)
+    calls: list[list[str]] = []
+
+    def silent_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", silent_run)
+    with pytest.raises(AssertionError):
+        test_cli_mgmt_ab_suite_execution(tmp_path)
+    assert len(calls) == 1
