@@ -328,6 +328,44 @@ def test_resource_report_deployed_content(tmp_path: Path) -> None:
 
 
 @pytest.mark.process_rpc
+def test_resource_report_contract_blackbox_measures_deployed_content(tmp_path: Path) -> None:
+    """回歸（B 輪 L1 證據）：pytest 目標為 tests/contract_blackbox 且設 SW_RESOURCE_REPORT 時，
+    報告 deployed_content.start／end 必須為 error is None 的量測結果（非 null）。
+
+    修正前：contract_blackbox conftest 另載 plugin 副本，其 env 快照為 None 而根 conftest 已清除 env，
+    deployed_content 恆為 null，P4 登記會把所有 pytest 型案例判為 FAIL。
+    """
+    import realhw.deployed_content as deployed_content
+
+    layout = _install_layout(tmp_path, "case3")
+    inst = layout["inst"]
+    expected_tree_sha, _ = deployed_content.tree_digests(inst)
+
+    report_file = tmp_path / "rb.json"
+    env = dict(os.environ)
+    env["SERIALWRAP_CLI_EXE"] = str(layout["cli"])
+    env["SERIALWRAP_DAEMON_EXE"] = str(layout["daemon"])
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    # 只做收集（-k 不命中任何案例，exit 5 為 no tests collected）；目的是 sessionstart／sessionfinish 的量測
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/contract_blackbox", "-k", "no_such_case_zz_regression"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode in (0, 5), f"pytest failed: {res.stdout}\n{res.stderr}"
+    assert report_file.exists()
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    dc = data.get("deployed_content")
+    assert isinstance(dc, dict), f"deployed_content 不得為 null：{dc!r}"
+    for side in ("start", "end"):
+        measured = dc[side]
+        assert measured["error"] is None, measured
+        assert measured["bundle_tree_sha256"] == expected_tree_sha
+        assert measured["release_manifest_sha256"] == layout["manifest_sha"]
+
+
+@pytest.mark.process_rpc
 def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> None:
     """同上但不設 SERIALWRAP_DAEMON_EXE → start／end.error == "daemon_env_missing"、digest 皆 None；
     daemon 設為安裝樹外的檔案 → error == "daemon_outside_install"。

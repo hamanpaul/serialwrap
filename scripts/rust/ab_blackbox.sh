@@ -61,6 +61,13 @@ if [[ ! -f "$BUNDLE_CLI" ]]; then
   echo "錯誤: bundle CLI 不存在: $BUNDLE_CLI" >&2
   exit 1
 fi
+# B 輪 daemon 必須明定為本 run bundle 的 serialwrapd（未設時 harness 退回 repo Python daemon，
+# deployed_content 記 daemon_env_missing，L1 證據不可用）
+BUNDLE_DAEMON="$BUNDLE_OUT/bin/serialwrapd"
+if [[ ! -f "$BUNDLE_DAEMON" ]]; then
+  echo "錯誤: bundle daemon 不存在: $BUNDLE_DAEMON" >&2
+  exit 1
+fi
 
 cd "$REPO_ROOT"
 
@@ -321,6 +328,7 @@ B_PIDS="$RUN_DIR/b.pids"
 touch "$B_PIDS"
 b_env=(
   SERIALWRAP_CLI_EXE="$BUNDLE_CLI"
+  SERIALWRAP_DAEMON_EXE="$BUNDLE_DAEMON"
   SW_BUNDLE="$BUNDLE_OUT"   # test_cli_mgmt_update／doctor 以 SW_BUNDLE 找本次 run 的 bundle（不得回退到未建置的 target/mkbundle-pytest）
   SERIALWRAP_AB_LABEL="rust-1a"
   SW_AB_PIDLOG="$B_PIDS"

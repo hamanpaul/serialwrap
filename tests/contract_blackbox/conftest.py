@@ -54,19 +54,27 @@ def pytest_configure(config: pytest.Config) -> None:
     for name, desc in _STANDARD_MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
 
-    # L1 報告 plugin：不經 tests 套件 import，直接從路徑載入
+    # L1 報告 plugin：不經 tests 套件 import，直接從路徑載入。
+    # 重用已載入的 sys.modules["resource_report_plugin"]（根 conftest 的 import 或先前的載入）：
+    # 另載一份副本會讓 deployed_content 的 env 快照（根 conftest 於清除 env 前擷取）留在別的 module 物件，
+    # 註冊的副本 _ENV_SNAPSHOT 為 None 且 env 已被清除，報告 deployed_content 恆為 null（B 輪 L1 證據失效）。
     if not config.pluginmanager.has_plugin("sw_resource_report"):
         rpt_env = os.environ.get("SW_RESOURCE_REPORT")
         if rpt_env:
-            plugin_path = Path(__file__).resolve().parent.parent / "resource_report_plugin.py"
-            if not plugin_path.exists():
-                raise pytest.UsageError(f"SW_RESOURCE_REPORT 已指定但缺少 plugin: {plugin_path}")
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("resource_report_plugin", plugin_path)
-            if not (spec and spec.loader):
-                raise pytest.UsageError(f"無法載入 plugin spec: {plugin_path}")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            mod = sys.modules.get("resource_report_plugin")
+            if mod is None:
+                plugin_path = Path(__file__).resolve().parent.parent / "resource_report_plugin.py"
+                if not plugin_path.exists():
+                    raise pytest.UsageError(f"SW_RESOURCE_REPORT 已指定但缺少 plugin: {plugin_path}")
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("resource_report_plugin", plugin_path)
+                if not (spec and spec.loader):
+                    raise pytest.UsageError(f"無法載入 plugin spec: {plugin_path}")
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["resource_report_plugin"] = mod
+                spec.loader.exec_module(mod)
+                # 獨立執行（無根 conftest）時 env 尚未被清除，於此擷取 deployed_content 所需的 CLI／daemon 變數
+                mod.capture_deployed_env(os.environ)
             config.pluginmanager.register(mod, "sw_resource_report")
 
 
