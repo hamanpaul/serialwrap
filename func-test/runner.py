@@ -1897,7 +1897,9 @@ def main(argv: list[str] | None = None) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
     parser = argparse.ArgumentParser(description="serialwrap 功能測試執行器")
     parser.add_argument("--category", "-c", help="只執行指定分類")
-    parser.add_argument("--case", "-t", help="只執行指定 test case（stem 名）")
+    parser.add_argument("--case", "-t", action="append", help="選取 test case（stem 名；可重複指定）")
+    parser.add_argument("--scenario-case", action="append",
+                        help="選取 scenario case（stem 名；可與 --case 一起指定）")
     parser.add_argument("--repeat", "-r", type=int, default=0, help="覆寫重複次數")
     parser.add_argument("--verbose", "-v", action="store_true", help="詳細輸出")
     parser.add_argument("--list", "-l", action="store_true", help="只列出測試案例")
@@ -1915,6 +1917,8 @@ def main(argv: list[str] | None = None) -> int:
     modes = ["pty", "bridge"] if args.mode == "both" else [args.mode]
     if args.scenarios and "bridge" not in modes:
         parser.error("--scenarios 僅支援 bridge 模式")
+    if args.scenarios and args.scenario_case:
+        parser.error("--scenarios 不得與 --scenario-case 同時指定")
     if "bridge" in modes and args.selftest_report is None and not args.scenarios:
         parser.error("bridge 模式必須提供 --selftest-report")
     if "bridge" in modes and os.name == "nt":
@@ -1931,7 +1935,11 @@ def main(argv: list[str] | None = None) -> int:
 
     cases_dir = FUNC_TEST_DIR / "cases"
     scenarios_dir = FUNC_TEST_DIR / "scenarios"
-    if args.scenarios:
+    if args.scenario_case:
+        test_cases = discover_test_cases(cases_dir, category=args.category, case_name=args.case)
+        test_cases.extend(discover_test_cases(
+            scenarios_dir, category=args.category, case_name=args.scenario_case))
+    elif args.scenarios:
         test_cases = discover_test_cases(scenarios_dir, category=args.category, case_name=args.case)
         if not test_cases:
             test_cases = discover_test_cases(cases_dir, category=args.category, case_name=args.case)

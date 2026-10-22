@@ -486,7 +486,7 @@ def write_ab_manifest(root: Path, *, layer: str = "l1.5", platform: str = "linux
                         "testbed_template": frozen_file("regression/testbed.template.yaml"), "realhw_config_template": None,
                         "tier": None, "extra_args": []}
     else:
-        doc["suite"] = {"adapter": "l3_realhw", "timeout_s": 3600, "selftest_report": None,
+        doc["suite"] = {"adapter": "l3_realhw", "timeout_s": 180000, "selftest_report": None,
                         "testbed_template": None, "realhw_config_template": frozen_file("realhw/config.json"),
                         "tier": "longrun", "extra_args": []}
     dut_kind = "local-process" if layer == "l1.5" else "hardware"

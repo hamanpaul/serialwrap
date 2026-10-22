@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
@@ -39,7 +38,7 @@ def _result(rc: int, stdout: str, stderr: str = "") -> Any:
     """建立 `tools.stage3.proc.CmdResult`（Task 1）；延遲 import，缺模組時於呼叫點失敗。"""
     from tools.stage3.proc import CmdResult
 
-    return CmdResult(rc=rc, stdout=stdout, stderr=stderr)
+    return CmdResult(rc=rc, stdout=stdout, stderr=stderr, elapsed_s=0.0, timed_out=False)
 
 
 def _ok(stdout: str) -> dict[str, Any]:
@@ -53,6 +52,11 @@ def _flag(argv: Sequence[str], flag: str) -> str | None:
         return None
     idx = items.index(flag)
     return items[idx + 1] if idx + 1 < len(items) else None
+
+
+def _flag_values(argv: Sequence[str], flag: str) -> list[str]:
+    items = list(argv)
+    return [items[index + 1] for index, token in enumerate(items[:-1]) if token == flag]
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +118,22 @@ class EngineRunner(fakes.RecordingRunner):
     def spawn(self, argv: Sequence[str], *, env: Mapping[str, str] | None = None,
               cwd: Path | None = None) -> _TracedProc:
         proc = super().spawn(argv, env=env, cwd=cwd)
-        return _TracedProc(proc, self, list(argv), dict(env or {}))
+        kind, _ = self._classify(argv)
+        if kind == "realhw.acceptance.observer":
+            header_path = Path(_flag(argv, "--out") or "")
+            boards = [item for item in (_flag(argv, "--boards") or "").split(",") if item]
+            is_windows = "--excl-dir" in argv
+            binding = {board: (f"COM{index + 20}" if is_windows else f"/dev/fake/{board}")
+                       for index, board in enumerate(boards)}
+            header_path.parent.mkdir(parents=True, exist_ok=True)
+            header_path.write_text(json.dumps({"kind": "header", "device_binding": binding}) + "\n",
+                                   encoding="utf-8")
+        call_env = dict(env or {})
+        kind, sub = self._classify(argv)
+        self.calls.append({"kind": kind, "sub": sub, "argv": list(argv), "env": call_env,
+                           "side": call_env.get("SW_STAGE3_SIDE"),
+                           "round": call_env.get("SW_STAGE3_ROUND"), "cwd": cwd})
+        return _TracedProc(proc, self, list(argv), call_env)
 
     def _note_proc(self, sub: str, argv: list[str], env: Mapping[str, str]) -> None:
         self.calls.append({"kind": "proc", "sub": sub, "argv": list(argv), "env": dict(env),
@@ -133,15 +152,21 @@ class Knobs:
     python_default: bool = False          # True：不論實際部署一律回報 Python 基線身分（R5 負向測試）
     deployed: str = "measure"             # "measure" | "omit"（不寫 deployed_content）| "unresolved" | "end_none"
     sideload_root: Path | None = None     # 設定時：該側 bundle 複製到 <root>/versions/v 並加寫旁載檔，量測該安裝
+    sideload_side: str = "B"               # 只在指定側模擬旁載安裝
     sideload_extra: bytes = b"MZ"         # 旁載檔內容（bin/version.dll）
     between: Callable[[int], None] | None = None  # 每組 start／end 量測之間呼叫，參數為本 knobs 內第幾組（從 0 起）
     pinned: bool = True                   # CLI 身分 pinned 欄位
     case_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)  # L1.5 每案覆寫：closed_cleanly、dut_generation
     testpilot_new_dirs: int = 1           # TestPilot 每次呼叫新增的 tp-* 目錄數
+    testpilot_authorization_override: dict[str, Any] | None = None
+    baseline_gate_result: str = "NOT_APPLICABLE_BASELINE"
+    candidate_gate_result: str = "PASS"
+    omit_realhw_report: bool = False
     pair_count: int = 0                   # 內部計數：已執行的 start／end 量測組數
 
 
-def _pair(knobs: Knobs, cli: Path) -> dict[str, Any] | None:
+def _pair(knobs: Knobs, cli: Path, *,
+          daemon_live: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any] | None:
     """以 P2 deployed_content.bracket 的形狀回傳 start／end 量測；deployed="omit" 時回 None。"""
     if knobs.deployed == "omit":
         return None
@@ -153,12 +178,12 @@ def _pair(knobs: Knobs, cli: Path) -> dict[str, Any] | None:
     if knobs.between is not None:
         knobs.between(idx)
     end = None if knobs.deployed == "end_none" else dc.measure(cli)
-    return {"start": start, "end": end, "daemon_live": []}
+    return {"start": start, "end": end, "daemon_live": [dict(item) for item in daemon_live]}
 
 
 def _cli_to_run(knobs: Knobs, label: str, sides: Mapping[str, Any], cli_cfg: Path) -> Path:
     """回傳引擎實際執行的 CLI 路徑。sideload 時為複製到 <sideload_root>/versions/v 的安裝。"""
-    if knobs.sideload_root is None:
+    if knobs.sideload_root is None or label != knobs.sideload_side:
         return cli_cfg
     src = sides[label].bundle_dir
     dest = Path(knobs.sideload_root) / "versions" / "v"
@@ -176,21 +201,23 @@ def _cli_identity(configured: str, resolved: Path, pinned: bool) -> dict[str, An
 
 def _artifacts(label: str, cli_run: Path, daemon: Path, sides: Mapping[str, Any], knobs: Knobs) -> dict[str, Any]:
     """L1.5 每案 manifest.json 的 `artifacts` 區塊（欄位名取自 func-test/lib/artifact_identity.py）。"""
-    side = sides[label]
-    impl = "python" if knobs.python_default else side.manifest_doc["components"]["daemon"]["implementation"]
-    if impl == "python":
-        pkg = side.bundle_dir / "py"
+    if knobs.python_default:
+        # 模擬外層環境退回 Python repo daemon（非本側 bundle launcher）。
+        actual_daemon = Path(__file__).resolve().parents[1] / "serialwrapd.py"
         daemon_block = {
-            "argv": [str(daemon)],
+            "argv": [sys.executable, str(actual_daemon)],
             "sha256": None,
             "implementation": "python",
-            "package_tree_sha256": fakes.tree_sha256(pkg) if pkg.is_dir() else "0" * 64,
-            "repo_tree_sha256": "0" * 64,
+            "package_tree_sha256": "f" * 64,
+            "repo_tree_sha256": "e" * 64,
         }
     else:
+        actual_daemon = daemon
+        # func-test 只辨識 serialwrapd.py／-m sw_core.daemon；bundle Python launcher
+        # 會走 executable 分支，實際輸出 implementation=rust 與 launcher SHA。
         daemon_block = {
-            "argv": [str(daemon)],
-            "sha256": dc.file_sha256(daemon),
+            "argv": [str(actual_daemon)],
+            "sha256": dc.file_sha256(actual_daemon),
             "implementation": "rust",
             "package_tree_sha256": None,
             "repo_tree_sha256": None,
@@ -217,10 +244,12 @@ def l15_functest(case_ids: Sequence[str], sides: Mapping[str, Any], knobs: Knobs
     def effect(argv: Sequence[str], env: Mapping[str, str]) -> None:
         report = Path(_flag(argv, "--report-dir") or "")
         label = env["SW_STAGE3_SIDE"]
-        run_dir = env["SERIALWRAP_RUN_DIR"]
         cli_run = _cli_to_run(knobs, label, sides, Path(env["SERIALWRAP_CLI_EXE"]))
         artifacts = _artifacts(label, cli_run, Path(env["SERIALWRAP_DAEMON_EXE"]), sides, knobs)
-        for case in case_ids:
+        selected_ids = [*_flag_values(argv, "--case"), *_flag_values(argv, "--scenario-case")]
+        if not selected_ids:
+            selected_ids = list(case_ids)
+        for case in selected_ids:
             ov = dict(knobs.case_overrides.get(case, {}))
             case_artifacts = dict(artifacts)
             bracket = _pair(knobs, cli_run)
@@ -238,7 +267,7 @@ def l15_functest(case_ids: Sequence[str], sides: Mapping[str, Any], knobs: Knobs
                 "topology": "dut_local_process_daemon_native",
                 "transport": {
                     "mode": "virtual_pty",
-                    "port_id": os.path.join(run_dir, f"{case}.sock"),
+                    "port_id": "uart0",
                     "daemon_side": None,
                     "bridge_side": None,
                 },
@@ -262,23 +291,33 @@ def l15_functest(case_ids: Sequence[str], sides: Mapping[str, Any], knobs: Knobs
             (case_dir / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=1), encoding="utf-8")
             (case_dir / "comparison.json").write_text(
-                json.dumps({"schema_version": "comparison.v1", "verdict": "PASS", "streams": [],
+                json.dumps({"schema_version": "comparison.v1", "verdict": ov.get("verdict", "PASS"), "streams": [],
                             "invariants": []}, sort_keys=True), encoding="utf-8")
             (case_dir / "bridge-manifest.json").write_text(
                 json.dumps({"closed_cleanly": bool(ov.get("closed_cleanly", True)), "failure": None},
                            sort_keys=True), encoding="utf-8")
             wire_lines = [json.dumps({"dut_generation": gen, "seq": seq}, sort_keys=True) for seq in (1, 2)]
             (case_dir / "wire.ndjson").write_text("\n".join(wire_lines) + "\n", encoding="utf-8")
-            (case_dir / "cli.ndjson").write_text("", encoding="utf-8")
+            if not ov.get("omit_cli_log"):
+                endpoint = str(case_dir / "run" / "serialwrapd.sock")
+                (case_dir / "cli.ndjson").write_text(
+                    json.dumps({"argv": [env["SERIALWRAP_CLI_EXE"], "--socket", endpoint,
+                                        "daemon", "stop"], "rc": 0}, sort_keys=True) + "\n",
+                    encoding="utf-8")
             (case_dir / "daemon.log").write_text("", encoding="utf-8")
             (case_dir / "wal").mkdir(exist_ok=True)
 
     return effect
 
 
-def _identity_meta(knobs: Knobs, cli_cfg_str: str, cli_run: Path) -> dict[str, Any]:
+def _identity_meta(knobs: Knobs, cli_cfg_str: str, cli_run: Path,
+                   daemon_image: Path | None = None) -> dict[str, Any]:
+    daemon_identity: dict[str, Any] = {"version": DAEMON_VERSION}
+    if daemon_image is not None:
+        daemon_identity.update({"image_path": str(daemon_image),
+                                "image_sha256": dc.file_sha256(daemon_image)})
     return {"cli_identity": _cli_identity(cli_cfg_str, cli_run, knobs.pinned),
-            "daemon_identity": {"version": DAEMON_VERSION}}
+            "daemon_identity": daemon_identity}
 
 
 def testpilot(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
@@ -286,10 +325,10 @@ def testpilot(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
 
     def effect(argv: Sequence[str], env: Mapping[str, str]) -> None:
         label = env["SW_STAGE3_SIDE"]
-        tb = yaml.safe_load(Path(_flag(argv, "--testbed") or "").read_text(encoding="utf-8")) or {}
+        tb = yaml.safe_load(Path(env["SERIALWRAP_REGRESSION_TESTBED"]).read_text(encoding="utf-8")) or {}
         cli_cfg = Path(tb["serialwrap_exe"])
         cli_run = _cli_to_run(knobs, label, sides, cli_cfg)
-        base = Path.home() / "b-log" / "regression-reports"
+        base = Path(env["HOME"]) / "b-log" / "regression-reports"
         base.mkdir(parents=True, exist_ok=True)
         for _ in range(knobs.testpilot_new_dirs):
             existing = [int(p.name.split("-", 1)[1]) for p in base.glob("tp-*")
@@ -297,7 +336,22 @@ def testpilot(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
             new_dir = base / f"tp-{(max(existing) + 1) if existing else 0}"
             new_dir.mkdir()
             meta = _identity_meta(knobs, str(cli_cfg), cli_run)
-            bracket = _pair(knobs, cli_run)
+            meta["allow_destructive"] = bool(tb.get("allow_destructive"))
+            meta["authorized_boards"] = list(tb.get("authorized_boards") or [])
+            if knobs.testpilot_authorization_override is not None:
+                meta.update(knobs.testpilot_authorization_override)
+            daemon_component = sides[label].manifest_doc.get("components", {}).get("daemon", {})
+            live: list[dict[str, Any]] = []
+            if daemon_component.get("implementation") == "rust":
+                daemon_image = cli_run.parent / Path(sides[label].daemon_exe).name
+                live = [{
+                    "pid": 4101 if label == "A" else 4202,
+                    "image_path": str(daemon_image.resolve()),
+                    "image_sha256": dc.file_sha256(daemon_image),
+                    "in_install": True,
+                    "error": None,
+                }]
+            bracket = _pair(knobs, cli_run, daemon_live=live)
             if bracket is not None:
                 meta["deployed_content"] = bracket
             (new_dir / "report.json").write_text(
@@ -317,7 +371,9 @@ def realhw(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
         cli_run = _cli_to_run(knobs, label, sides, cli_cfg)
         report_dir = Path(_flag(argv, "--report-dir") or "")
         report_dir.mkdir(parents=True, exist_ok=True)
-        meta = _identity_meta(knobs, str(cli_cfg), cli_run)
+        if knobs.omit_realhw_report:
+            return
+        meta = _identity_meta(knobs, str(cli_cfg), cli_run, sides[label].daemon_exe)
         meta["started_at_utc"] = NOW
         bracket = _pair(knobs, cli_run)
         if bracket is not None:
@@ -328,7 +384,7 @@ def realhw(sides: Mapping[str, Any], knobs: Knobs) -> Callable[..., None]:
     return effect
 
 
-def gate() -> Callable[..., None]:
+def gate(knobs: Knobs) -> Callable[..., None]:
     """`realhw.acceptance.gate`：依同目錄 report.json 寫出 release-gate.v1（run.cli_identity／deployed_content）。"""
 
     def effect(argv: Sequence[str], env: Mapping[str, str]) -> None:
@@ -340,9 +396,11 @@ def gate() -> Callable[..., None]:
                    "run": {}}
         else:
             meta = json.loads(report_json.read_text(encoding="utf-8"))["meta"]
+            mode = _flag(argv, "--mode")
+            verdict = knobs.baseline_gate_result if mode == "baseline" else knobs.candidate_gate_result
             doc = {
                 "schema_version": "release-gate.v1",
-                "release_gate_result": "PASS",
+                "release_gate_result": verdict,
                 "run": {
                     "cli_identity": meta.get("cli_identity"),
                     "deployed_content": meta.get("deployed_content"),
@@ -361,7 +419,7 @@ def register_engines(runner: EngineRunner, m: Any, knobs: Knobs) -> None:
     runner.on("functest:", l15_functest(tuple(m.case_ids), sides, knobs))
     runner.on("testpilot:", testpilot(sides, knobs))
     runner.on("realhw:", realhw(sides, knobs))
-    runner.on("realhw.acceptance.gate:", gate())
+    runner.on("realhw.acceptance.gate:", gate(knobs))
 
 
 def default_script(layer: str, platform: str) -> dict[str, list[dict]]:
@@ -369,12 +427,13 @@ def default_script(layer: str, platform: str) -> dict[str, list[dict]]:
     script: dict[str, list[dict]] = {}
     if layer == "l3":
         script["cli:supervision-mode"] = [_ok("on-demand\n")]
-        script["cli:service status"] = [_ok(json.dumps(
-            {"ok": True, "mode": "on-demand", "registered": False, "units": []}, sort_keys=True))]
+        script["cli:service status"] = [{"rc": 2, "stdout": json.dumps(
+            {"ok": False, "error_code": "NO_SYSTEMD", "mode": "on-demand"}, sort_keys=True),
+            "stderr": ""}]
+        # RecordingRunner 分類略過 `--user` 旗標：system 與 user 查詢共用此鍵
+        script["systemctl:list-unit-files"] = [_ok("")]
         if platform == "windows":
-            not_found = {"rc": 1, "stdout": "", "stderr": "ERROR: The system cannot find the file specified."}
-            script["schtasks:serialwrap*"] = [not_found]
-            script["schtasks:"] = [not_found]
+            script["schtasks:"] = [_ok("")]
     return script
 
 
@@ -413,6 +472,7 @@ class SuiteEnv:
             self.m, self.m.sides[idx], inst,
             run=self.runner, spawn=self.runner.spawn, now=lambda: NOW,
             probe=probe if probe is not None else fakes.FakeProbe(),
+            repo_root=self.root,
         )
         return inst, suite_run
 

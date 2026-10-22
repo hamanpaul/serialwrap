@@ -4,7 +4,7 @@ from __future__ import annotations
 import pathlib
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import yaml
 
@@ -97,14 +97,15 @@ def discover_test_cases(
     cases_dir: pathlib.Path,
     *,
     category: str | None = None,
-    case_name: str | None = None,
+    case_name: str | Sequence[str] | None = None,
 ) -> list[TestCase]:
-    """掃描 cases 目錄，載入所有 .yaml 測試案例。"""
+    """掃描 cases 目錄，依分類與一個或多個案例名稱載入 YAML 測試案例。"""
     results: list[TestCase] = []
     if not cases_dir.is_dir():
         return results
+    case_names = ({case_name} if isinstance(case_name, str) else set(case_name or ()))
     for yaml_path in sorted(cases_dir.glob("*.yaml")):
-        if case_name and yaml_path.stem != case_name:
+        if case_names and yaml_path.stem not in case_names:
             continue
         try:
             tc = load_test_case(yaml_path)
