@@ -514,8 +514,9 @@ for directory, names, files in os.walk(root, followlinks=False):
     for name in files:
         path = pathlib.Path(directory) / name
         relative = path.relative_to(root).as_posix()
-        # .mkbundle-owner 為組裝期所有權標記（sentinel 扁平佈局才會落在根目錄），不屬產品內容，排除於校驗清單。
-        if relative in {"release-manifest.json", "SHA256SUMS", ".mkbundle-owner"}:
+        # 僅 release-manifest.json 與 SHA256SUMS 本身豁免；其餘每個檔案（含 sentinel 扁平佈局根目錄的 .mkbundle-owner）都必須列入，
+        # 與 Rust 驗證器 verify_bundle 的不變量一致（缺列即 CHECKSUM_VERIFY_FAILED）。owner marker 仍由 OWNER_MARKER 守護覆寫拒絕。
+        if relative in {"release-manifest.json", "SHA256SUMS"}:
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         rows.append((relative, digest))

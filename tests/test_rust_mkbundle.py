@@ -38,18 +38,23 @@ def _require_cargo() -> None:
 
 
 class _LazyBundle:
-    """模組內共用的 dev bundle；第一次 `out()` 時以 mkbundle.sh 建立。"""
+    """模組內共用的 dev bundle（`sentinel=True` 時為 `--delegate-sentinel` 扁平佈局）；第一次 `out()` 時以 mkbundle.sh 建立。"""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, sentinel: bool = False) -> None:
         self._root = root
+        self._sentinel = sentinel
         self._out: Path | None = None
 
     def out(self) -> Path:
         _require_cargo()
         if self._out is None:
-            out = self._root / "dev bundle"
+            out = self._root / ("sentinel bundle" if self._sentinel else "dev bundle")
+            args = [str(MKBUNDLE), "--dev"]
+            if self._sentinel:
+                args.append("--delegate-sentinel")
+            args += ["--out", str(out)]
             res = subprocess.run(
-                [str(MKBUNDLE), "--dev", "--out", str(out)],
+                args,
                 capture_output=True,
                 text=True,
                 timeout=900,
@@ -57,7 +62,7 @@ class _LazyBundle:
                 check=False,
             )
             assert res.returncode == 0, (
-                f"mkbundle.sh --dev --out 失敗（rc={res.returncode}）：{res.stderr.strip()}"
+                f"mkbundle.sh {' '.join(args[1:])} 失敗（rc={res.returncode}）：{res.stderr.strip()}"
             )
             self._out = out
         return self._out
@@ -66,6 +71,11 @@ class _LazyBundle:
 @pytest.fixture(scope="module")
 def bundle(tmp_path_factory) -> _LazyBundle:
     return _LazyBundle(tmp_path_factory.mktemp("mkbundle", numbered=False))
+
+
+@pytest.fixture(scope="module")
+def sentinel_bundle(tmp_path_factory) -> _LazyBundle:
+    return _LazyBundle(tmp_path_factory.mktemp("mkbundle-sentinel", numbered=False), sentinel=True)
 
 
 def _sha256(path: Path) -> str:
@@ -696,3 +706,73 @@ def test_bundle_launcher_starts_python_daemon(bundle, tmp_path):
             proc.kill()
             proc.wait(timeout=10)
         shutil.rmtree(sockdir, ignore_errors=True)
+
+
+_CHECKSUM_EXEMPT = frozenset({"release-manifest.json", "SHA256SUMS"})
+
+
+def _assert_sha256sums_lists_every_file(root: Path) -> None:
+    """除 release-manifest.json 與 SHA256SUMS 外，`root` 下每個一般檔都必須有 checksum 列且數值相符。
+
+    與 Rust 端 `verify_bundle`（crates/sw-cli/src/install_layout.rs）採同一不變量：缺列即
+    CHECKSUM_VERIFY_FAILED（`sha256:<檔名> missing`）。`.mkbundle-owner` 於 sentinel 扁平佈局落在根目錄，
+    不得以排除清單豁免。
+    """
+    sums = root / "SHA256SUMS"
+    assert sums.is_file(), f"缺少 SHA256SUMS：{sums}"
+    listed: dict[str, str] = {}
+    for line in sums.read_text(encoding="utf-8").splitlines():
+        digest, sep, rel = line.partition("  ")
+        assert sep and len(digest) == 64, f"SHA256SUMS 列格式須為 `<sha256>  <relpath>`：{line!r}"
+        listed[rel] = digest
+    actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+    unlisted = sorted(actual - set(listed) - _CHECKSUM_EXEMPT)
+    assert not unlisted, f"SHA256SUMS 漏列檔案（Rust 驗證器將回 CHECKSUM_VERIFY_FAILED）：{unlisted[:10]}"
+    stale = sorted(set(listed) - actual)
+    assert not stale, f"SHA256SUMS 列出不存在的檔案：{stale[:10]}"
+    mismatched = sorted(rel for rel, digest in listed.items() if _sha256(root / rel) != digest)
+    assert not mismatched, f"SHA256SUMS 與實際檔案不符：{mismatched[:10]}"
+
+
+def test_sha256sums_lists_every_file_dev(bundle):
+    _assert_sha256sums_lists_every_file(_vdir(bundle.out()))
+
+
+def test_sha256sums_lists_every_file_sentinel(sentinel_bundle):
+    out = sentinel_bundle.out()
+    assert (out / ".mkbundle-owner").is_file(), "前置條件：sentinel 扁平佈局的 owner marker 應位於根目錄"
+    _assert_sha256sums_lists_every_file(out)
+
+
+def _isolated_pidns_prefix() -> list[str]:
+    """`setup` 的 safety check 以 `/proc` 掃描 serialwrapd；無 `--socket` 的宿主生產 daemon 會被視為占用（DEVICE_STILL_HELD）。
+
+    本測試只驗證 bundle 的組裝與 setup 本身，故與 contract_blackbox 的 `pidns_rig` 採同一隔離手段：
+    以非特權 user+pid+mount namespace 執行，宿主行程不可見。能力不足時 skip（絕不 PASS）。
+    """
+    harness_dir = str(REPO / "tests" / "contract_blackbox")
+    if harness_dir not in sys.path:
+        sys.path.insert(0, harness_dir)
+    from bb_l15 import unshare_pidns_argv
+
+    prefix = unshare_pidns_argv()
+    if prefix is None:
+        pytest.skip("無法以非特權 unshare 建立 pid namespace（環境能力不足，非 PASS）")
+    return prefix
+
+
+def test_setup_on_demand_from_sentinel_bundle_isolated_home(sentinel_bundle, tmp_path):
+    out = sentinel_bundle.out()
+    env = _harness_env(tmp_path / "iso")
+    res = subprocess.run(
+        [*_isolated_pidns_prefix(), str(out / "bin" / "serialwrap"), "setup", "--on-demand"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert res.returncode == 0, (
+        f"sentinel bundle 的 setup --on-demand 失敗（rc={res.returncode}）：{res.stdout}{res.stderr}"
+    )
+    assert (Path(env["SERIALWRAP_CONFIG_DIR"]) / "config.yaml").is_file()
