@@ -282,6 +282,8 @@ def test_type_share_cap(tmp_path):
     )
     gate = _ledger().gate(recs, pol, platform="linux", artifact_id="art-1", **_tree())
     assert gate.tally.cycles_total == 40
+    assert gate.tally.cycles_truncated.get("recovery") == 20
+    assert gate.tally.cycles_truncated.get("dut_reboot", 0) == 0
 
 
 def test_unknown_result_not_counted(tmp_path):
@@ -362,10 +364,17 @@ def test_harvest_anomaly_blocks(tmp_path):
 def test_closed_not_product_defect_unblocks(tmp_path):
     fakes = _fakes()
     pol = _pol(tmp_path)
+    cycles = {
+        "handoff_release_attach": 10,
+        "hotplug_reattach": 5,
+        "dut_reboot": 10,
+        "recovery": 10,
+        "human_agent_coexist": 15,
+    }
     recs = fakes.synthetic_canary(
         days=14,
         submits_per_day=360,
-        cycles={"recovery": 20, "dut_reboot": 15, "handoff_release_attach": 15},
+        cycles=cycles,
         platform="linux",
         artifact="art-1",
         policy_sha256=pol.sha256,
@@ -379,15 +388,23 @@ def test_closed_not_product_defect_unblocks(tmp_path):
 def test_gate_reports_ledger_version(tmp_path):
     fakes = _fakes()
     pol = _pol(tmp_path)
+    full_cycles = {
+        "handoff_release_attach": 10,
+        "hotplug_reattach": 5,
+        "dut_reboot": 10,
+        "recovery": 10,
+        "human_agent_coexist": 15,
+    }
     recs = fakes.synthetic_canary(
         days=14,
         submits_per_day=360,
-        cycles={"recovery": 20, "dut_reboot": 15, "handoff_release_attach": 15},
+        cycles=full_cycles,
         platform="linux",
         artifact="art-1",
         policy_sha256=pol.sha256,
     )
     gate = _ledger().gate(recs, pol, platform="linux", artifact_id="art-1", **_tree())
+    assert gate.result == "PASS"
     assert (gate.ledger_through, gate.ledger_records) == _ledger_version(recs, "linux")
 
     recs.extend(_pid_change_pair())
@@ -396,6 +413,7 @@ def test_gate_reports_ledger_version(tmp_path):
     assert later_gate.ledger_through > earlier_time
     assert later_gate.ledger_records == earlier_records + 2
     assert later_gate.result == "INCOMPLETE"
+    assert any("open incidents:" in r for r in later_gate.reasons)
 
     windows = _rehash(
         {
@@ -415,6 +433,7 @@ def test_gate_reports_ledger_version(tmp_path):
 
     close_record = _close_detected(recs, tmp_path, resolution="environment")
     closed_gate = _ledger().gate(recs, pol, platform="linux", artifact_id="art-1", **_tree())
+    assert closed_gate.result == "PASS"
     assert closed_gate.ledger_through == close_record["closed_at"]
     assert closed_gate.ledger_records == later_gate.ledger_records + 1
 
@@ -439,20 +458,60 @@ def test_fixed_in_artifact_fails_same_artifact(tmp_path):
     assert gate.result == "FAIL"
 
 
-def test_safety_violation_fails(tmp_path):
+@pytest.mark.parametrize("scenario", ["auto_unclosed", "manual_open", "auto_closed"])
+def test_safety_violation_fails(tmp_path, scenario):
     fakes = _fakes()
     base_fakes = _base_fakes()
     pol = _pol(tmp_path)
     recs = fakes.synthetic_canary(
         days=14,
         submits_per_day=360,
-        cycles={"recovery": 20, "dut_reboot": 15, "handoff_release_attach": 15},
+        cycles={
+            "handoff_release_attach": 10,
+            "hotplug_reattach": 5,
+            "dut_reboot": 10,
+            "recovery": 10,
+            "human_agent_coexist": 15,
+        },
         platform="linux",
         artifact="art-1",
         policy_sha256=pol.sha256,
     )
-    recs.append(
-        _rehash(
+    if scenario == "auto_unclosed":
+        recs.append(
+            _rehash(
+                {
+                    "type": "wal_signal",
+                    "host_id": "h1",
+                    "platform": "linux",
+                    "kind": "unauthorized_tx",
+                    "com": "COM0",
+                    "wall_ts": base_fakes.ts(10, 12),
+                    "seq": 99999,
+                    "source": "agent:unauthorized",
+                    "detail": {},
+                }
+            )
+        )
+    elif scenario == "manual_open":
+        incidents_module = importlib.import_module("tools.stage3.canary_incidents")
+        jsonio = importlib.import_module("tools.stage3.jsonio")
+        inc_dir = tmp_path / "manual-inc"
+        inc_dir.mkdir(parents=True, exist_ok=True)
+        incidents_module.open_manual(
+            inc_dir,
+            kind="safety_violation",
+            platform="linux",
+            host_id="h1",
+            artifact_id="art-1",
+            summary="手動通報安全違規",
+            evidence=["wal:42"],
+            now=base_fakes.ts(10, 12),
+        )
+        open_rows, _ = jsonio.read_ndjson(inc_dir / "ledger.ndjson")
+        recs.extend(open_rows)
+    elif scenario == "auto_closed":
+        sig = _rehash(
             {
                 "type": "wal_signal",
                 "host_id": "h1",
@@ -465,7 +524,23 @@ def test_safety_violation_fails(tmp_path):
                 "detail": {},
             }
         )
-    )
+        recs.append(sig)
+        incidents_module = importlib.import_module("tools.stage3.canary_incidents")
+        policy = _policy_module().load_policy(base_fakes.write_policy(tmp_path / "inc-policy.json"))
+        detected = incidents_module.detect([], [sig], [], policy, anomalies=[])
+        inc = next(i for i in detected if i.kind == "safety_violation")
+        close_rec = incidents_module.close(
+            tmp_path / "close-inc",
+            inc.incident_id,
+            resolution="duplicate",
+            issue_ref="issue-dup",
+            note="重複結案",
+            closed_by="owner",
+            now=base_fakes.ts(10, 15),
+            known={inc.incident_id: inc},
+        )
+        recs.append(close_rec)
+
     gate = _ledger().gate(recs, pol, platform="linux", artifact_id="art-1", **_tree())
     assert gate.result == "FAIL"
 
@@ -491,7 +566,7 @@ def test_gate_asserts_frozen_before_first_counted(tmp_path, monkeypatch):
     fakes = _fakes()
     policy_module = _policy_module()
     ledger = _ledger()
-    pol = _pol(tmp_path)
+    pol = _pol(tmp_path, frozen_at=fakes.ts(3, 0))
     first_counted = fakes.ts(2, 0)
     calls: list[str] = []
     original = policy_module.assert_frozen_before
@@ -583,10 +658,17 @@ def test_carryover_without_approval_ignored(tmp_path):
 def test_windows_independent(tmp_path):
     fakes = _fakes()
     pol = _pol(tmp_path)
+    cycles = {
+        "handoff_release_attach": 10,
+        "hotplug_reattach": 5,
+        "dut_reboot": 10,
+        "recovery": 10,
+        "human_agent_coexist": 15,
+    }
     linux = fakes.synthetic_canary(
         days=14,
         submits_per_day=360,
-        cycles={"recovery": 20, "dut_reboot": 15, "handoff_release_attach": 15},
+        cycles=cycles,
         platform="linux",
         artifact="art-1",
         policy_sha256=pol.sha256,
@@ -712,6 +794,7 @@ def test_report_md_lists_reasons(tmp_path):
     for reason in gate.reasons:
         assert reason in report
     assert "submits_unknown_result" in report
+    assert "pre_freeze_ignored" in report
 
 
 def test_freeze_policy_writes_and_appends(tmp_path):
@@ -765,3 +848,415 @@ def test_freeze_policy_refuses_refreeze(tmp_path):
             now=fakes.ts(2, 0),
         )
     assert error.value.code == "HARNESS_CANARY_POLICY_INVALID"
+
+
+def test_safety_violation_before_first_policy_ref_fails(tmp_path):
+    fakes = _fakes()
+    base_fakes = _base_fakes()
+    pol = _pol(tmp_path)
+    cyc = {
+        "handoff_release_attach": 10,
+        "hotplug_reattach": 5,
+        "dut_reboot": 10,
+        "recovery": 10,
+        "human_agent_coexist": 15,
+    }
+    recs = fakes.synthetic_canary(
+        days=14,
+        submits_per_day=360,
+        cycles=cyc,
+        platform="linux",
+        artifact="art-1",
+        policy_sha256=pol.sha256,
+    )
+    # unauthorized_tx with timestamp before the first policy_ref (day 2 05:00 vs day 2 06:00)
+    sig = _rehash(
+        {
+            "type": "wal_signal",
+            "host_id": "h1",
+            "platform": "linux",
+            "kind": "unauthorized_tx",
+            "com": "COM0",
+            "wall_ts": base_fakes.ts(2, 5, 0),
+            "seq": 424242,
+            "source": "agent:evil",
+            "detail": {},
+        }
+    )
+    gate = _ledger().gate(recs + [sig], pol, platform="linux", artifact_id="art-1", **_tree())
+    assert gate.result == "FAIL"
+    assert any("failing incidents:" in r for r in gate.reasons)
+
+
+def test_wal_loss_before_first_policy_ref_incomplete(tmp_path):
+    fakes = _fakes()
+    base_fakes = _base_fakes()
+    pol = _pol(tmp_path)
+    cyc = {
+        "handoff_release_attach": 10,
+        "hotplug_reattach": 5,
+        "dut_reboot": 10,
+        "recovery": 10,
+        "human_agent_coexist": 15,
+    }
+    recs = fakes.synthetic_canary(
+        days=14,
+        submits_per_day=360,
+        cycles=cyc,
+        platform="linux",
+        artifact="art-1",
+        policy_sha256=pol.sha256,
+    )
+    sig = _rehash(
+        {
+            "type": "wal_signal",
+            "host_id": "h1",
+            "platform": "linux",
+            "kind": "wal_loss",
+            "com": "COM0",
+            "wall_ts": base_fakes.ts(2, 5, 0),
+            "seq": 424242,
+            "source": "daemon",
+            "detail": {},
+        }
+    )
+    gate = _ledger().gate(recs + [sig], pol, platform="linux", artifact_id="art-1", **_tree())
+    assert gate.result == "INCOMPLETE"
+    assert any("open incidents:" in r for r in gate.reasons)
+
+
+def test_harvest_anomaly_before_first_policy_ref_incomplete(tmp_path):
+    fakes = _fakes()
+    base_fakes = _base_fakes()
+    pol = _pol(tmp_path)
+    cyc = {
+        "handoff_release_attach": 10,
+        "hotplug_reattach": 5,
+        "dut_reboot": 10,
+        "recovery": 10,
+        "human_agent_coexist": 15,
+    }
+    recs = fakes.synthetic_canary(
+        days=14,
+        submits_per_day=360,
+        cycles=cyc,
+        platform="linux",
+        artifact="art-1",
+        policy_sha256=pol.sha256,
+    )
+    an = _rehash(
+        {
+            "type": "harvest_anomaly",
+            "host_id": "h1",
+            "platform": "linux",
+            "detail": "crc_mismatch:raw.wal.ndjson:120",
+            "t_wall": base_fakes.ts(2, 5, 0),
+        }
+    )
+    gate = _ledger().gate(recs + [an], pol, platform="linux", artifact_id="art-1", **_tree())
+    assert gate.result == "INCOMPLETE"
+    assert any("open incidents:" in r for r in gate.reasons)
+
+
+def test_missing_ledger_path_rejected(tmp_path):
+    from tools.stage3.reason_codes import HarnessError
+
+    missing = tmp_path / "non_existent.ndjson"
+    with pytest.raises(HarnessError) as exc:
+        _ledger().load_records([missing])
+    assert exc.value.code == "HARNESS_LEDGER_CORRUPT"
+    assert "ledger not found" in exc.value.detail
+
+    existing = tmp_path / "existing.ndjson"
+    existing.write_text("", encoding="utf-8")
+    with pytest.raises(HarnessError) as exc2:
+        _ledger().load_records([existing, missing])
+    assert exc2.value.code == "HARNESS_LEDGER_CORRUPT"
+
+
+def test_self_carryover_rejected(tmp_path):
+    fakes = _fakes()
+    base_fakes = _base_fakes()
+    pol = _pol(tmp_path)
+    half = {
+        "handoff_release_attach": 5,
+        "hotplug_reattach": 3,
+        "dut_reboot": 5,
+        "recovery": 5,
+        "human_agent_coexist": 7,
+    }
+    recs = fakes.synthetic_canary(
+        days=14,
+        submits_per_day=190,
+        cycles=half,
+        platform="linux",
+        artifact="art-1",
+        policy_sha256=pol.sha256,
+    )
+    base_g = _ledger().gate(recs, pol, platform="linux", artifact_id="art-1", **_tree())
+    assert base_g.result == "INCOMPLETE"
+
+    co = _rehash(
+        {
+            "type": "carryover",
+            "host_id": "h1",
+            "platform": "linux",
+            "from_artifact": "art-1",
+            "to_artifact": "art-1",
+            "counters": ["submits", "cycles"],
+            "approved_by": "owner",
+            "decision_ref": "OD-TEST-SELF",
+            "approved_at": base_fakes.ts(30, 0),
+        }
+    )
+    g = _ledger().gate(recs, pol, platform="linux", artifact_id="art-1", carryovers=[co], **_tree())
+    assert g.result == "INCOMPLETE"
+    assert g.tally.submits == base_g.tally.submits
+    assert g.tally.carried_over == {}
+
+
+def test_duplicate_carryover_deduplicated(tmp_path):
+    fakes = _fakes()
+    base_fakes = _base_fakes()
+    pol = _pol(tmp_path)
+    old_recs = fakes.synthetic_canary(
+        days=7,
+        submits_per_day=100,
+        cycles={},
+        platform="linux",
+        artifact="art-old",
+        policy_sha256=pol.sha256,
+    )
+    new_recs = fakes.synthetic_canary(
+        days=7,
+        submits_per_day=100,
+        cycles={},
+        platform="linux",
+        artifact="art-new",
+        policy_sha256=pol.sha256,
+    )
+    co1 = _rehash(
+        {
+            "type": "carryover",
+            "host_id": "h1",
+            "platform": "linux",
+            "from_artifact": "art-old",
+            "to_artifact": "art-new",
+            "counters": ["submits"],
+            "approved_by": "owner",
+            "decision_ref": "OD-TEST-DUP",
+            "approved_at": base_fakes.ts(30, 0),
+        }
+    )
+    co2 = _rehash(
+        {
+            "type": "carryover",
+            "host_id": "h1",
+            "platform": "linux",
+            "from_artifact": "art-old",
+            "to_artifact": "art-new",
+            "counters": ["submits"],
+            "approved_by": "owner",
+            "decision_ref": "OD-TEST-DUP2",
+            "approved_at": base_fakes.ts(30, 1),
+        }
+    )
+    g_single = _ledger().gate(old_recs + new_recs, pol, platform="linux", artifact_id="art-new", carryovers=[co1], **_tree())
+    g_dup = _ledger().gate(old_recs + new_recs, pol, platform="linux", artifact_id="art-new", carryovers=[co1, co2], **_tree())
+    assert g_dup.tally.submits == g_single.tally.submits
+    assert g_dup.tally.carried_over["submits"] == g_single.tally.carried_over["submits"]
+
+
+def test_carryover_different_trees_succeeds(tmp_path):
+    fakes = _fakes()
+    base_fakes = _base_fakes()
+    pol = _pol(tmp_path)
+    old_trees = {"bundle_tree": "1" * 64, "runtime_tree": "2" * 64}
+    old_recs = fakes.synthetic_canary(
+        days=5,
+        submits_per_day=100,
+        cycles={},
+        platform="linux",
+        artifact="art-old",
+        policy_sha256=pol.sha256,
+        host="h1",
+        start_day=2,
+        **old_trees,
+    )
+    new_recs = fakes.synthetic_canary(
+        days=5,
+        submits_per_day=100,
+        cycles={},
+        platform="linux",
+        artifact="art-new",
+        policy_sha256=pol.sha256,
+        host="h2",
+        start_day=7,
+    )
+    co = _rehash(
+        {
+            "type": "carryover",
+            "host_id": "h1",
+            "platform": "linux",
+            "from_artifact": "art-old",
+            "to_artifact": "art-new",
+            "from_bundle_tree_sha256": "1" * 64,
+            "from_runtime_tree_sha256": "2" * 64,
+            "counters": ["submits"],
+            "approved_by": "owner",
+            "decision_ref": "OD-DIFF-TREE",
+            "approved_at": base_fakes.ts(30, 0),
+        }
+    )
+    g = _ledger().gate(old_recs + new_recs, pol, platform="linux", artifact_id="art-new", carryovers=[co], **_tree())
+    assert g.tally.carried_over.get("submits") == 500
+    assert g.tally.submits == 500 + 500
+
+
+def test_freeze_policy_missing_addenda_leaves_draft(tmp_path):
+    from tools.stage3.reason_codes import HarnessError
+
+    fakes = _base_fakes()
+    policy_module = _policy_module()
+    policy_path = fakes.write_policy(
+        tmp_path / "policy.json",
+        status="draft",
+        frozen_at=None,
+        frozen_by=None,
+        decision_ref=None,
+        **{"platforms.linux.evidence_owner": None, "platforms.windows.evidence_owner": None},
+    )
+    missing_addenda = tmp_path / "missing-addenda.md"
+    with pytest.raises(HarnessError) as error:
+        policy_module.freeze_policy(
+            policy_path,
+            decision_id="OD-10-C1",
+            frozen_by="owner",
+            evidence_owners={"linux": "owner-linux", "windows": "owner-windows"},
+            addenda_path=missing_addenda,
+            now=fakes.ts(2, 0),
+        )
+    assert error.value.code == "HARNESS_CANARY_POLICY_INVALID"
+    doc = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert doc["status"] == "draft"
+
+
+def test_freeze_policy_unwritable_policy_rolls_back_addenda(tmp_path, monkeypatch):
+    from pathlib import Path
+    from tools.stage3.reason_codes import HarnessError
+    from tools.stage3 import jsonio
+
+    fakes = _base_fakes()
+    policy_module = _policy_module()
+    policy_path = fakes.write_policy(
+        tmp_path / "policy.json",
+        status="draft",
+        frozen_at=None,
+        frozen_by=None,
+        decision_ref=None,
+        **{"platforms.linux.evidence_owner": None, "platforms.windows.evidence_owner": None},
+    )
+    addenda = tmp_path / "owner-decisions-addenda.md"
+    original_text = "| OD-09-C1 | 既有決策 | 2026-10-01 | 已凍結 |\n"
+    addenda.write_text(original_text, encoding="utf-8")
+
+    real_atomic = jsonio.atomic_write_text
+
+    def mock_atomic(path, content):
+        if Path(path) == policy_path:
+            raise OSError("disk full simulated")
+        return real_atomic(path, content)
+
+    monkeypatch.setattr(jsonio, "atomic_write_text", mock_atomic)
+    with pytest.raises(HarnessError) as error:
+        policy_module.freeze_policy(
+            policy_path,
+            decision_id="OD-10-FAIL",
+            frozen_by="owner",
+            evidence_owners={"linux": "owner-linux", "windows": "owner-windows"},
+            addenda_path=addenda,
+            now=fakes.ts(2, 0),
+        )
+    assert error.value.code == "HARNESS_CANARY_POLICY_INVALID"
+    assert addenda.read_text(encoding="utf-8") == original_text
+    doc = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert doc["status"] == "draft"
+
+
+def test_freeze_policy_sanitizes_strings(tmp_path):
+    from tools.stage3.reason_codes import HarnessError
+
+    fakes = _base_fakes()
+    policy_module = _policy_module()
+    policy_path = fakes.write_policy(
+        tmp_path / "policy.json",
+        status="draft",
+        frozen_at=None,
+        frozen_by=None,
+        decision_ref=None,
+        **{"platforms.linux.evidence_owner": None, "platforms.windows.evidence_owner": None},
+    )
+    addenda = tmp_path / "owner-decisions-addenda.md"
+    addenda.write_text("| OD-09-C1 | 既有決策 | 2026-10-01 | 已凍結 |\n", encoding="utf-8")
+
+    with pytest.raises(HarnessError) as err1:
+        policy_module.freeze_policy(
+            policy_path,
+            decision_id="OD/invalid/id",
+            frozen_by="owner",
+            evidence_owners={"linux": "owner-linux", "windows": "owner-windows"},
+            addenda_path=addenda,
+            now=fakes.ts(2, 0),
+        )
+    assert err1.value.code == "HARNESS_CANARY_POLICY_INVALID"
+
+    with pytest.raises(HarnessError) as err2:
+        policy_module.freeze_policy(
+            policy_path,
+            decision_id="OD-10-SAFE",
+            frozen_by="owner\n| FORGED | row |",
+            evidence_owners={"linux": "owner-linux", "windows": "owner-windows"},
+            addenda_path=addenda,
+            now=fakes.ts(2, 0),
+        )
+    assert err2.value.code == "HARNESS_CANARY_POLICY_INVALID"
+
+    with pytest.raises(HarnessError) as err3:
+        policy_module.freeze_policy(
+            policy_path,
+            decision_id="OD-10-SAFE",
+            frozen_by="owner",
+            evidence_owners={"linux": "owner|pipe", "windows": "owner-windows"},
+            addenda_path=addenda,
+            now=fakes.ts(2, 0),
+        )
+    assert err3.value.code == "HARNESS_CANARY_POLICY_INVALID"
+
+
+def test_freeze_policy_duplicate_decision_rejected(tmp_path):
+    from tools.stage3.reason_codes import HarnessError
+
+    fakes = _base_fakes()
+    policy_module = _policy_module()
+    policy_path = fakes.write_policy(
+        tmp_path / "policy.json",
+        status="draft",
+        frozen_at=None,
+        frozen_by=None,
+        decision_ref=None,
+        **{"platforms.linux.evidence_owner": None, "platforms.windows.evidence_owner": None},
+    )
+    addenda = tmp_path / "owner-decisions-addenda.md"
+    addenda.write_text("| OD-EXISTING | 既有決策 | 2026-10-01 | 已凍結 |\n", encoding="utf-8")
+
+    with pytest.raises(HarnessError) as error:
+        policy_module.freeze_policy(
+            policy_path,
+            decision_id="OD-EXISTING",
+            frozen_by="owner",
+            evidence_owners={"linux": "owner-linux", "windows": "owner-windows"},
+            addenda_path=addenda,
+            now=fakes.ts(2, 0),
+        )
+    assert error.value.code == "HARNESS_CANARY_POLICY_INVALID"
+    assert "already recorded" in error.value.detail

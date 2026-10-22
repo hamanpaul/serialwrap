@@ -13,6 +13,10 @@ from tools.stage3 import jsonio
 
 BTREE = fakes.BTREE
 RTREE = fakes.RTREE
+ts = fakes.ts
+snapshot = fakes.snapshot
+uuid_cmd_id = fakes.uuid_cmd_id
+write_policy = fakes.write_policy
 _UTC = timezone.utc
 _DAY_S = 24 * 60 * 60
 _ACTIVE_S = 12 * 60 * 60
