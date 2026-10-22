@@ -204,6 +204,7 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
 
 
 @pytest.mark.case("sc25-release-manifest-version-pairing")
+@pytest.mark.pidns_rig
 def test_doctor_ab_version_pairing_in_bundle(tmp_path: Path) -> None:
     # 受測 artifact：有指定 SERIALWRAP_CLI_EXE（Rust）時即為該 bundle（不另行重建）；否則建置自含 bundle。
     artifact = _specified_rust_bundle()

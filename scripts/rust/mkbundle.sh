@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 建立 Stage 1A 自含式開發 bundle；`--delegate-sentinel` 保留後續管理面測試用的精簡 bundle。
+# 建立 Stage 1A 自含式開發 bundle；`--delegate-sentinel` 產生組成相同（含 bin/serialwrapd 與 py/sw_core）、委派入口改為 P4 sentinel 的扁平 bundle。
 set -euo pipefail
 
 usage() {
@@ -10,7 +10,7 @@ usage() {
 
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
-  --delegate-sentinel      將委派入口改為 P4 測試 sentinel
+  --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
   --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
   --version-override <v>   以同一編譯輸入覆寫 CLI 與 daemon bundle 版本
@@ -196,49 +196,19 @@ sha256_file() {
   sha256sum -- "$1" | awk '{print $1}'
 }
 
-if [[ "$SENTINEL" -eq 1 ]]; then
-  # P4 管理面測試需要在 bundle bin 下直接執行 sentinel，維持既有精簡格式。
-  mkdir -p "$OUT/bin" "$OUT/py/bin"
-  # 輸出位置可能是指向版本檔的 symlink；先移除 symlink，避免覆寫其目標。
-  cp --remove-destination "$BIN_SRC" "$OUT/bin/$CLI_NAME"
-  chmod +x "$OUT/bin/$CLI_NAME"
-  PY_SRC="$(command -v python3)"
-  ln -sf "$(readlink -f "$PY_SRC")" "$OUT/py/bin/python3"
-
-  SENTINEL_PATH="$REPO_ROOT/tests/contract_blackbox/delegate_sentinel.py"
-  CLI_SHA="$(sha256_file "$OUT/bin/$CLI_NAME")"
-  REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-  python3 - "$OUT/release-manifest.json" "$VERSION" "$REVISION" "$TARGET" "$CLI_SHA" "$CLI_NAME" "$SENTINEL_PATH" <<'PY'
-import json
-import sys
-
-path, version, revision, target, cli_sha, cli_name, sentinel = sys.argv[1:8]
-manifest = {
-    "schema_version": 1,
-    "bundle_version": version,
-    "stage": "rust-1b-dev",
-    "target": target,
-    "git_revision": revision,
-    "components": {
-        "cli": {
-            "implementation": "rust",
-            "version": version,
-            "path": f"bin/{cli_name}",
-            "sha256": cli_sha,
-        },
-        "python_cli_delegate": {
-            "entry": ["py/bin/python3", "-I", sentinel],
-        },
-    },
-}
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
-else
-  VERSION_DIR="$OUT/versions/$VERSION"
-  if [[ -e "$VERSION_DIR" ]]; then
-    rm -rf -- "$VERSION_DIR"
+# 組裝 bundle 根目錄：dev 與 sentinel 共用同一組成（bin/serialwrapd、py/sw_core、SHA256SUMS、release-manifest.json）。
+# dev：實體目錄為 versions/<V>/，bin/ 內以 symlink 指向之；sentinel：扁平佈局直接組裝於 --out 根目錄，bin/ 為實體檔。
+# sentinel 僅將 python_cli_delegate.entry 改為 P4 測試 sentinel（非委派守門：任何漏網委派都會寫入 DELEGATED marker 並 exit 97）。
+assemble_bundle() {
+  SENTINEL_ENTRY=""
+  if [[ "$SENTINEL" -eq 1 ]]; then
+    VERSION_DIR="$OUT"
+    SENTINEL_ENTRY="$REPO_ROOT/tests/contract_blackbox/delegate_sentinel.py"
+  else
+    VERSION_DIR="$OUT/versions/$VERSION"
+    if [[ -e "$VERSION_DIR" ]]; then
+      rm -rf -- "$VERSION_DIR"
+    fi
   fi
   mkdir -p "$VERSION_DIR/bin" "$OUT/bin"
   cp "$BIN_SRC" "$VERSION_DIR/bin/$CLI_NAME"
@@ -399,7 +369,7 @@ PY
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
-    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" <<'PY'
+    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" <<'PY'
 import datetime
 import json
 import sys
@@ -424,7 +394,8 @@ import sys
     com0com_sha,
     com0com_helper,
     com0com_helper_sha,
-) = sys.argv[1:20]
+    sentinel_entry,
+) = sys.argv[1:21]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -499,20 +470,27 @@ if com0com_sha:
         "helper": {"path": com0com_helper, "sha256": com0com_helper_sha},
         "default_pair": ["COM20", "COM21"],
     }
+if sentinel_entry:
+    # sentinel 佈局：組成與 dev 相同，僅委派入口改為 sentinel；stage 標示 rust-1b-dev 供管理面測試辨識。
+    manifest["stage"] = "rust-1b-dev"
+    manifest["components"]["python_cli_delegate"]["entry"] = ["py/bin/python3", "-I", sentinel_entry]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
     handle.write("\n")
 PY
 
-  ln -sfn "../versions/$VERSION/bin/$CLI_NAME" "$OUT/bin/$CLI_NAME"
-  ln -sfn "../versions/$VERSION/bin/$DAEMON_NAME" "$OUT/bin/$DAEMON_NAME"
-  if [[ "$(realpath "$OUT/bin/$CLI_NAME")" != "$(realpath "$VERSION_DIR/bin/$CLI_NAME")" ]]; then
-    echo "mkbundle.sh: bin/$CLI_NAME symlink 未指向 versions/$VERSION/bin/$CLI_NAME" >&2
-    exit 1
-  fi
-  if [[ "$(realpath "$OUT/bin/$DAEMON_NAME")" != "$(realpath "$VERSION_DIR/bin/$DAEMON_NAME")" ]]; then
-    echo "mkbundle.sh: bin/$DAEMON_NAME symlink 未指向 versions/$VERSION/bin/$DAEMON_NAME" >&2
-    exit 1
+  # sentinel 的 bin/ 為實體檔，不建立指向 versions/ 的 symlink。
+  if [[ "$SENTINEL" -eq 0 ]]; then
+    ln -sfn "../versions/$VERSION/bin/$CLI_NAME" "$OUT/bin/$CLI_NAME"
+    ln -sfn "../versions/$VERSION/bin/$DAEMON_NAME" "$OUT/bin/$DAEMON_NAME"
+    if [[ "$(realpath "$OUT/bin/$CLI_NAME")" != "$(realpath "$VERSION_DIR/bin/$CLI_NAME")" ]]; then
+      echo "mkbundle.sh: bin/$CLI_NAME symlink 未指向 versions/$VERSION/bin/$CLI_NAME" >&2
+      exit 1
+    fi
+    if [[ "$(realpath "$OUT/bin/$DAEMON_NAME")" != "$(realpath "$VERSION_DIR/bin/$DAEMON_NAME")" ]]; then
+      echo "mkbundle.sh: bin/$DAEMON_NAME symlink 未指向 versions/$VERSION/bin/$DAEMON_NAME" >&2
+      exit 1
+    fi
   fi
 
   if find "$VERSION_DIR" -type l -print -quit | grep -q .; then
@@ -536,7 +514,8 @@ for directory, names, files in os.walk(root, followlinks=False):
     for name in files:
         path = pathlib.Path(directory) / name
         relative = path.relative_to(root).as_posix()
-        if relative in {"release-manifest.json", "SHA256SUMS"}:
+        # .mkbundle-owner 為組裝期所有權標記（sentinel 扁平佈局才會落在根目錄），不屬產品內容，排除於校驗清單。
+        if relative in {"release-manifest.json", "SHA256SUMS", ".mkbundle-owner"}:
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         rows.append((relative, digest))
@@ -568,6 +547,8 @@ if errors:
         print(f"{list(error.absolute_path)}: {error.message}", file=sys.stderr)
     raise SystemExit(1)
 PY
-fi
+}
+
+assemble_bundle
 
 printf '%s\n' "$OUT"
