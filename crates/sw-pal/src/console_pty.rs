@@ -1,4 +1,4 @@
-//! human console 承接工廠（arch §4.7，P5-T2 骨架）。
+//! human console 承接工廠（arch §4.7）。
 //!
 //! 本檔只宣告型別與簽章；POSIX `create_pty`（哨兵 PTY）由 Task 2 實作，其餘方法於本 Phase 回 `Unsupported`
 //! （`bind_tcp_console`、`open_com0com_console` 屬 2.2；`held_slave_paths` 於 2.2 承接，本 Phase 回 `None`）。
@@ -10,6 +10,9 @@ use std::time::Duration;
 use crate::traits::{IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome};
 use crate::ConsoleKind;
 
+#[cfg(unix)]
+pub mod posix;
+
 /// PTY slave 的參照（`mirror_termios_from`、`tty_setraw`、`tcgetattr_speed` 的輸入；arch §4.2、§4.7）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PtySlaveRef {
@@ -17,6 +20,12 @@ pub struct PtySlaveRef {
 }
 
 /// 保持 PTY slave 開啟的 keepalive（daemon 同時持有 master 與 slave，避免閒置時 master 一直 EOF；arch §4.7）。
+#[cfg(unix)]
+pub struct KeepAlive {
+    _fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(not(unix))]
 pub struct KeepAlive {
     _priv: (),
 }
@@ -50,7 +59,7 @@ pub trait ConsoleListener: Send {
 /// human console 承接工廠（arch §4.7）。
 ///
 /// 除 `kind` 外的方法於本 Phase 提供預設實作（回 `Unsupported`／`None`），使只實作 `kind` 的既有替身仍可編譯；
-/// POSIX 原生實作在 `NativeConsoleFactory::create_pty` 覆寫（Task 2）。
+/// POSIX 原生實作在 `NativeConsoleFactory::create_pty` 建立哨兵 PTY。
 pub trait ConsoleTransportFactory: Send + Sync {
     fn kind(&self) -> ConsoleKind;
     /// POSIX openpty：master 設 O_NONBLOCK；slave raw（iflag=oflag=lflag=0、CREAD|CLOCAL|CS8、VMIN=1、VTIME=0）。
@@ -72,7 +81,10 @@ pub trait ConsoleTransportFactory: Send + Sync {
 }
 
 fn unsupported(name: &str) -> PalError {
-    PalError::plain(PalErrorKind::Unsupported, format!("{name} 於 Slice 2.1 未支援"))
+    PalError::plain(
+        PalErrorKind::Unsupported,
+        format!("{name} 於 Slice 2.1 未支援"),
+    )
 }
 
 /// 原生 console 工廠（P5-T2）：`kind` 依目標平台（POSIX 為 PTY，無 PTY 平台為 TCP）。
@@ -91,6 +103,13 @@ impl ConsoleTransportFactory for NativeConsoleFactory {
     }
 
     fn create_pty(&self) -> PalResult<PtyPair> {
-        crate::s21_todo!("T2", "NativeConsoleFactory::create_pty")
+        #[cfg(unix)]
+        {
+            posix::create_pty()
+        }
+        #[cfg(not(unix))]
+        {
+            Err(unsupported("create_pty"))
+        }
     }
 }

@@ -39,7 +39,11 @@ fn roundtrip_tx(be: &dyn SerialBackend, pair: Pair) {
     let (r, mut w, waker, close) = open_split(be, &dev, "roundtrip_tx");
     let cancel = CancelToken::new(waker);
     let res = w.write(b"hello\n", &cancel);
-    assert_eq!(res.outcome, TxOutcome::Completed(6), "[roundtrip_tx] outcome");
+    assert_eq!(
+        res.outcome,
+        TxOutcome::Completed(6),
+        "[roundtrip_tx] outcome"
+    );
     assert!(res.error.is_none(), "[roundtrip_tx] error {:?}", res.error);
     assert_eq!(
         peer.read_available(Duration::from_millis(500)),
@@ -116,7 +120,11 @@ fn cancel_before_write(be: &dyn SerialBackend, pair: Pair) {
     let cancel = CancelToken::new(waker);
     cancel.cancel();
     let res = w.write(b"never\n", &cancel);
-    assert_eq!(res.outcome, TxOutcome::Completed(0), "[cancel_before_write] outcome");
+    assert_eq!(
+        res.outcome,
+        TxOutcome::Completed(0),
+        "[cancel_before_write] outcome"
+    );
     assert_eq!(
         res.error.as_ref().map(|e| e.kind),
         Some(PalErrorKind::Cancelled),
@@ -196,9 +204,7 @@ fn gate_revoked_never_reaches_os(be: &dyn SerialBackend, pair: Pair) {
     close.close(r, w);
 }
 
-/// 計數 gate 放行寫 64 KiB：`Completed(65536)`、無 error；`os_submit` 閉包至少執行一次；peer 收齊完整 bytes。
-/// 計畫要求的「閉包次數等於 PAL 實際 syscall／WriteFile 次數」需要 PAL 內 debug 計數器（尚未定義 seam），
-/// 目前未在此斷言；實作者須補上該 seam 後再加入相等斷言。
+/// 計數 gate 放行寫 64 KiB：`Completed(65536)`、無 error；POSIX 原生執行時核對閉包與 syscall 計數。
 fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
     let (dev, mut peer) = pair();
     let (r, mut w, waker, close) = open_split(be, &dev, "gate_wraps_every_os_submit");
@@ -209,9 +215,16 @@ fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
     };
     let payload = vec![b'Z'; 65536];
     let mut got: Vec<u8> = Vec::new();
-    let res = thread::scope(|s| {
+    let (res, syscalls) = thread::scope(|s| {
         // 寫端與讀端必須並行：PTY buffer 遠小於 64 KiB
-        let j = s.spawn(|| w.write_gated(&payload, &cancel, &gate));
+        let j = s.spawn(|| {
+            let result = w.write_gated(&payload, &cancel, &gate);
+            #[cfg(all(unix, any(test, feature = "test-fakes")))]
+            let syscalls = crate::serial::posix::take_debug_tx_write_count();
+            #[cfg(not(all(unix, any(test, feature = "test-fakes"))))]
+            let syscalls: Option<usize> = None;
+            (result, syscalls)
+        });
         let deadline = Instant::now() + Duration::from_secs(10);
         while got.len() < payload.len() && Instant::now() < deadline {
             got.extend(peer.read_available(Duration::from_millis(100)));
@@ -232,6 +245,18 @@ fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
         gate.os_runs.load(Ordering::SeqCst) >= 1,
         "[gate_wraps_every_os_submit] os_submit 閉包應至少執行一次"
     );
+    assert_eq!(
+        gate.calls.load(Ordering::SeqCst),
+        gate.os_runs.load(Ordering::SeqCst),
+        "[gate_wraps_every_os_submit] 每次 gate 呼叫都必須恰好提交一次"
+    );
+    if let Some(syscalls) = syscalls {
+        assert_eq!(
+            gate.os_runs.load(Ordering::SeqCst),
+            syscalls,
+            "[gate_wraps_every_os_submit] gate 呼叫數須等於 POSIX write(2) 次數"
+        );
+    }
     assert_eq!(
         got.len(),
         payload.len(),

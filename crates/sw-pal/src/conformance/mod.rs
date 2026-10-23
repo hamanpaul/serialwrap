@@ -181,16 +181,22 @@ pub fn posix_pty_pair() -> (DevicePath, PtyPeer) {
         )
     };
     assert_eq!(rc, 0, "openpty 失敗: {}", std::io::Error::last_os_error());
-    // SAFETY: slave 為 openpty 回傳的有效 fd；ttyname 回傳的指標由 libc 持有，立即複製成 String。
+    // SAFETY: slave 為 openpty 回傳的有效 fd；ttyname_r 將路徑寫入此呼叫專屬緩衝區。
     let path = unsafe {
         let mut t: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(slave, &mut t) == 0 {
             libc::cfmakeraw(&mut t);
             libc::tcsetattr(slave, libc::TCSANOW, &t);
         }
-        let name = libc::ttyname(slave);
-        assert!(!name.is_null(), "ttyname 失敗");
-        let s = CStr::from_ptr(name).to_string_lossy().into_owned();
+        let mut name = vec![0 as libc::c_char; 4096];
+        let rc = libc::ttyname_r(slave, name.as_mut_ptr(), name.len());
+        assert_eq!(
+            rc,
+            0,
+            "ttyname_r 失敗: {}",
+            std::io::Error::from_raw_os_error(rc)
+        );
+        let s = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
         libc::close(slave);
         // master 設 O_NONBLOCK（讀寫皆不阻塞）
         let flags = libc::fcntl(master, libc::F_GETFL);
@@ -266,7 +272,9 @@ pub fn spawn_plain_holder(dev: &DevicePath) -> PlainHolder {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = reader.read_line(&mut line).expect("read plain holder stdout");
+            let n = reader
+                .read_line(&mut line)
+                .expect("read plain holder stdout");
             assert!(n > 0, "plain holder 在 READY 前結束（見上方子程序 stderr）");
             if line.contains("S21_READY") {
                 break;
@@ -287,7 +295,12 @@ pub fn tcgetattr_snapshot(dev: &DevicePath) -> Vec<u8> {
             c.as_ptr(),
             libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
         );
-        assert!(fd >= 0, "open {} 失敗: {}", dev.0, std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "open {} 失敗: {}",
+            dev.0,
+            std::io::Error::last_os_error()
+        );
         let mut t: libc::termios = std::mem::zeroed();
         let rc = libc::tcgetattr(fd, &mut t);
         libc::close(fd);

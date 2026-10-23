@@ -15,9 +15,9 @@ macro_rules! s21_todo {
 
 pub mod clock;
 pub mod com0com;
-pub mod console_pty;
 #[cfg(feature = "test-fakes")]
 pub mod conformance;
+pub mod console_pty;
 pub mod device_source;
 pub mod device_watcher;
 #[cfg(feature = "test-fakes")]
@@ -29,6 +29,11 @@ pub mod path_norm;
 pub mod proc_scan;
 pub mod process;
 pub mod process_tunnel;
+#[cfg(unix)]
+pub mod proc_holders {
+    #[path = "posix.rs"]
+    pub mod posix;
+}
 pub mod rpc_transport;
 pub mod select;
 pub mod serial;
@@ -134,9 +139,7 @@ pub type DeviceFactory = Box<dyn Fn(DeviceSelection) -> Box<dyn DeviceSource> + 
 
 /// 裝置來源工廠的骨架（Task 5 交付；本 Phase 骨架回傳未實作的工廠）。
 pub fn native_devices() -> DeviceFactory {
-    Box::new(|_sel: DeviceSelection| -> Box<dyn DeviceSource> {
-        s21_todo!("T5", "native_devices")
-    })
+    Box::new(|_sel: DeviceSelection| -> Box<dyn DeviceSource> { s21_todo!("T5", "native_devices") })
 }
 
 /// P3 名稱保留（`ClientPlatform` 為 `Platform` 的別名）。
@@ -173,7 +176,7 @@ pub fn native() -> Platform {
             tunnel: Arc::new(NativeProcessTunnel),
             registry: Arc::new(NullRegistryView),
             serial: Arc::new(crate::serial::posix::PosixSerialBackend::new()),
-            uart_excl: Arc::new(crate::serial::posix::PosixUartExclusive),
+            uart_excl: Arc::new(crate::proc_holders::posix::PosixUartExclusive),
             devices: native_devices(),
             instance_lock: crate::lock::native_instance_lock(),
             wal_fs: Arc::new(crate::wal_fs::NativeWalFs),

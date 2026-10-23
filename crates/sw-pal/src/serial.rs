@@ -1,4 +1,4 @@
-//! 序列埠後端（arch §4.2）。POSIX 實作在 `posix`（P5 Task 2）；Windows 後端為 Task 3 的骨架。
+//! 序列埠後端（arch §4.2）。POSIX 實作在 `posix`；Windows 後端由 Task 3 承接。
 //!
 //! 跨平台 trait（`SerialBackend`、`SerialHandle`、`UartExclusive` 等）定義於 `crate::traits`。
 
