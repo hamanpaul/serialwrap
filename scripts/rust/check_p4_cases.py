@@ -21,6 +21,11 @@
      **唯一判定實作為 P2 `tests/acceptance/l1_judge.py`**（依路徑以 importlib 載入，本檔不另寫判定規則）；
      verdict 非 `PASS` 一律失敗。P2 模組缺席即 `BLOCKED-PREREQ`（L1 證據不足，exit 1），不得放行。
   9. S1X 擁有者機台相依列（`owner_gated.py`）：`s1b_cargo` 的 cargo 報告中 `cap_*`／登記列為 skipped → BLOCKED-OWNER（列出，exit 2 類，不因不在鎖內而消失）；登記列於 selector 涵蓋範圍內缺席 → INSUFFICIENT。
+  10. judge_spike2 案例（`JUDGE_SPIKE2_CASES`，計畫 05 L3733、附錄 B-17）：證據檔缺席 → BLOCKED-OWNER（exit 2，不得 PASS）；
+      證據檔存在時照一般規則判定（FAIL 紀錄、無效紀錄（含 INSUFFICIENT_EVIDENCE）皆 FAIL；僅有非受測 HEAD 之 PASS 與其他 owner 案例相同為 BLOCKED-OWNER）。
+      justification：`p1-rst-daemon` 的 windows-task 面證據須以擁有者 throwaway Windows 工作實跑（`spike2 -Phase restart`）產生；該實跑不得於 73 h 長跑進行中執行，
+      且 stage1 driver 不執行 judge_spike2，故缺席屬擁有者待補而非 FAIL。本項為 owner 分類修正，**不是 lock amendment**：未改動 `p4_case_map.yaml`、
+      `p4_required.lock.json`、`FROZEN_FIELDS`、case 之 layer 或 evidence_status。
 - 平台適用性（G4）：受測 HEAD 且帶 `test_id` 的紀錄，若節點屬 cargo／contract_blackbox pytest 範圍，須其 platform
   在 `platform_applicability` 算出的適用集合內（cargo 依 s1b_cargo 鎖；pytest 依該平台 s1b_20groups selector 的 markexpr 收集）；
   不適用或兩平台皆不適用者不計入／FAIL。與 register_p4_evidence、ab_blackbox_1b 共用同一實作。
@@ -28,7 +33,7 @@
   略過該平台的 rust PASS 要求；案例至少一個平台須有 rust PASS。實算 `not_applicable` 與核准清單逐列比對，
   新增或缺少任一列一律 FAIL（待擁有者核准）。
 - 判定結果：任一硬性失敗 → exit 1（「證據不足不得轉為 PASS」，不變量 `insufficient_evidence_not_pass`）。
-  若唯一的缺口是 `evidence_status: BLOCKED-OWNER` 的 L2／L3／manual 案例證據（擁有者機台待補） → exit 2（BLOCKED-OWNER）。
+  若唯一的缺口是 `evidence_status: BLOCKED-OWNER` 的 L2／L3／manual 案例證據，或 judge_spike2 案例（第 10 項）的證據檔缺席（擁有者機台待補） → exit 2（BLOCKED-OWNER）。
   全部通過 → exit 0。失敗列同時輸出到 stdout 與 stderr 的摘要行。
 - `--check` 同時寫 `<evidence-dir>/summary.json`：逐案的 證據檔、受測 HEAD commit、通過紀錄的 `artifact_sha256`；
   L1 段為各 set／平台的 P2 判定結果與理由。
@@ -71,6 +76,16 @@ RESULTS = ("PASS", "FAIL", "SKIP")
 NECESSITIES = ("required", "optional")
 BLOCKED_OWNER = "BLOCKED-OWNER"
 BLOCKED_OWNER_LAYERS = ("L2", "L3", "manual")
+# judge_spike2 案例（計畫 05 L3733、附錄 B-17）：證據須由 judge_spike2 產生（含擁有者機台實跑），不得由一般 L1 報告代替。
+# 本常數為 check 與 register_p4_evidence 共用之單一來源；register 不登錄這些案例。
+JUDGE_SPIKE2_CASES = frozenset({
+    "win-task-logon-trigger",
+    "win-task-single-instance",
+    "win-task-restart-on-failure",
+    "win-task-72h",
+    "p1-rst-daemon",
+    "rm-live-e2e",
+})
 REAL_BOARD_LAYERS = ("L2", "L3")
 DOCKER_EVIDENCE_LAYERS = ("L1.5-docker", "host-throwaway")
 # 凍結欄位：這些欄位變動即視為案例被改寫（evidence_status 為狀態欄，不凍結）。
@@ -743,6 +758,16 @@ def not_applicable_approval_problems(
     return problems
 
 
+def owner_pending_case(case: dict[str, Any]) -> bool:
+    """擁有者機台相依案例：`evidence_status: BLOCKED-OWNER`（layer ∈ L2／L3／manual），或 judge_spike2 案例（計畫 05 L3733、B-17）。
+
+    只決定「缺口」是否歸類為 BLOCKED-OWNER（exit 2）；FAIL、無效或 SKIP 紀錄不因此放行（見 check_case_evidence）。
+    """
+    if case.get("evidence_status") == BLOCKED_OWNER and case.get("layer") in BLOCKED_OWNER_LAYERS:
+        return True
+    return str(case.get("case_id")) in JUDGE_SPIKE2_CASES
+
+
 def check(
     evidence_dir: Path | None = None,
     l1_dir: Path | None = None,
@@ -808,7 +833,7 @@ def check(
             case, head, evidence_dir, labels, applicability
         )
         case_problems.extend(problems)
-        owner = case.get("evidence_status") == BLOCKED_OWNER and case.get("layer") in BLOCKED_OWNER_LAYERS
+        owner = owner_pending_case(case)
         status = "PASS"
         if case_problems:
             if owner and all(

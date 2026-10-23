@@ -29,15 +29,6 @@ L1_LOCK = ROOT / "tests" / "acceptance" / "l1_required.lock.json"
 L1_JUDGE = ROOT / "tests" / "acceptance" / "l1_judge.py"
 PRODUCER = "register_p4_evidence.py"
 BLOCKED_LAYERS = {"L2", "L3", "manual"}
-# 這些案例須由 judge_spike2 寫入；其中包含 owner／硬體證據，不得由一般 L1 報告代替。
-JUDGE_SPIKE2_CASES = {
-    "win-task-logon-trigger",
-    "win-task-single-instance",
-    "win-task-restart-on-failure",
-    "win-task-72h",
-    "p1-rst-daemon",
-    "rm-live-e2e",
-}
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 
 
@@ -802,8 +793,9 @@ def _unit_python_records(
 
 
 def _is_owner_case(case: dict[str, Any]) -> bool:
+    # judge_spike2 案例（含擁有者硬體證據）不得由一般 L1 報告代替；集合與 check_p4_cases 共用同一常數。
     return (
-        str(case.get("case_id")) in JUDGE_SPIKE2_CASES
+        str(case.get("case_id")) in p4_rule.JUDGE_SPIKE2_CASES
         or case.get("evidence_status") == "BLOCKED-OWNER"
         or case.get("layer") in BLOCKED_LAYERS
     )
