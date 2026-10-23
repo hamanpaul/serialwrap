@@ -385,6 +385,10 @@ def _reuse_ok(
     by_id: Mapping[str, Mapping[str, Any]],
     evidence_root: Path,
     *,
+    index: Mapping[str, Any],
+    catalog: Mapping[str, ExitItem],
+    cases: Mapping[str, dict],
+    l1_lock: Mapping[str, Any] | None,
     visiting: frozenset[str] = frozenset(),
 ) -> tuple[bool, str | None]:
     source_id = entry.get("reuse_of")
@@ -398,28 +402,45 @@ def _reuse_ok(
         return False, "reused entry missing"
     if source.get("result") != "PASS":
         return False, "reused entry not PASS"
+    source_item = catalog.get(str(source.get("item_id", "")))
+    source_platform = source.get("platform")
+    if source_item is None or not isinstance(source_platform, str):
+        return False, "reused entry item or platform invalid"
     files_ok, _ = _files_status(source, evidence_root)
     if not files_ok:
         return False, "reused entry files invalid"
-    if source.get("reuse_of") is not None:
-        ok, detail = _reuse_ok(
-            source,
-            by_id,
-            evidence_root,
-            visiting=visiting | {str(source_id), str(current_id)},
-        )
-        if not ok:
-            return False, detail
     identity_fields = (
         "runtime_digest", "runtime_tree_sha256", "contract_revision", "tool_revision",
         "case_list_sha256", "workload_sha256", "environment_id",
     )
+    identity_error: str | None = None
     for field in identity_fields:
         left, right = entry.get(field), source.get(field)
         if field == "runtime_tree_sha256" and (left is None or right is None):
-            return False, f"reuse identity differs: {field}"
+            identity_error = f"reuse identity differs: {field}"
+            break
         if left != right:
-            return False, f"reuse identity differs: {field}"
+            identity_error = f"reuse identity differs: {field}"
+            break
+    source_l1 = _load_l1_lock(l1_lock) if source_item.required_l1_set is not None else None
+    source_status, source_reasons, satisfying = _platform_status(
+        index,
+        source_item,
+        source_platform,
+        evidence_root=evidence_root,
+        cases=cases,
+        l1_lock=source_l1,
+        catalog=catalog,
+        reuse_chain=visiting | {str(source_id), str(current_id)},
+    )
+    if source_status != "SATISFIED" or str(source_id) not in satisfying:
+        if any("reuse cycle" in reason for reason in source_reasons):
+            return False, "reuse cycle"
+        if identity_error is not None:
+            return False, identity_error
+        return False, "reused entry not PASS"
+    if identity_error is not None:
+        return False, identity_error
     return True, None
 
 
@@ -443,6 +464,8 @@ def _platform_status(
     evidence_root: Path,
     cases: Mapping[str, dict],
     l1_lock: Mapping[str, Any] | None,
+    catalog: Mapping[str, ExitItem],
+    reuse_chain: frozenset[str] = frozenset(),
 ) -> tuple[str, list[str], list[str]]:
     stage_rows = index.get("stage_targets", {}).get(item.stage, {})
     target = stage_rows.get(platform) if isinstance(stage_rows, dict) else None
@@ -519,7 +542,16 @@ def _platform_status(
         if not files_ok:
             hash_mismatch.append(f"{file_reason}: {row.get('entry_id')}")
             continue
-        reuse_ok, reuse_reason = _reuse_ok(row, by_id, evidence_root)
+        reuse_ok, reuse_reason = _reuse_ok(
+            row,
+            by_id,
+            evidence_root,
+            index=index,
+            catalog=catalog,
+            cases=cases,
+            l1_lock=l1_lock,
+            visiting=reuse_chain,
+        )
         if not reuse_ok:
             stale_reuse.append(str(reuse_reason))
             continue
@@ -540,13 +572,21 @@ def _item_status_full(
     evidence_root: Path,
     cases: Mapping[str, dict],
     l1_lock: Mapping[str, Any] | None,
+    catalog: Mapping[str, ExitItem] | None = None,
 ) -> tuple[str, list[str], list[str]]:
+    resolved_catalog = catalog if catalog is not None else load_exit_catalog()
     item_l1 = _load_l1_lock(l1_lock) if item.required_l1_set is not None else None
     platforms = PLATFORMS if item.platform == "both" else (item.platform,)
     results: list[tuple[str, str, list[str], list[str]]] = []
     for platform in platforms:
         status, reasons, satisfying = _platform_status(
-            index, item, platform, evidence_root=Path(evidence_root), cases=cases, l1_lock=item_l1
+            index,
+            item,
+            platform,
+            evidence_root=Path(evidence_root),
+            cases=cases,
+            l1_lock=item_l1,
+            catalog=resolved_catalog,
         )
         results.append((platform, status, reasons, satisfying))
     for platform, status, reasons, _ in results:
@@ -592,7 +632,7 @@ def stage_status(
         if item.stage != stage:
             continue
         status, reasons, satisfying = _item_status_full(
-            index, item, evidence_root=evidence_root, cases=cases, l1_lock=l1_lock
+            index, item, evidence_root=evidence_root, cases=cases, l1_lock=l1_lock, catalog=catalog
         )
         items[item.item_id] = {
             "status": status,

@@ -127,7 +127,6 @@ def _reuse_fixture(
         previous_result,
         platform="linux",
         n=1,
-        artifact_id="a" * 64,
         bundle_tree_sha256=previous_target.get("bundle_tree_sha256"),
         runtime_tree_sha256=(
             None
@@ -761,10 +760,88 @@ def test_reuse_of_failed_or_missing_entry_stale(tmp_path):
     )[0] == "STALE"
 
 
+def test_reuse_refuses_source_item_with_sticky_fail(tmp_path):
+    root = tmp_path / "source-fail"
+    idx, cat, _previous, _current = _reuse_fixture(root)
+    evidence_index = _evidence_api()
+    evidence_index.add_entry(
+        idx,
+        fakes_evidence.entry(
+            root,
+            "S24-L3-LRMIXED-48H-LINUX",
+            "FAIL",
+            platform="linux",
+            n=3,
+        ),
+        catalog=cat,
+    )
+
+    assert _status(idx, root, cat, "S24-L3-LRMIXED-48H-LINUX")[0] == "FAIL"
+    assert _status(idx, root, cat, "S3-L3-AB-48H-LINUX")[0] == "STALE"
+
+
+def test_reuse_refuses_source_after_stage_target_reset(tmp_path):
+    """來源 stage 的 target 重設後，舊來源 entry 不再符合目前 target，沿用須為 STALE（5a038a1）。"""
+    root = tmp_path / "retarget"
+    idx, cat, _previous, _current = _reuse_fixture(root)
+    assert _status(idx, root, cat, "S3-L3-AB-48H-LINUX")[0] == "SATISFIED"
+    evidence_index = _evidence_api()
+    reset_bundle = fakes_evidence.make_bundle(
+        root / "bundles" / "stage-2.4-reset" / "linux",
+        stage="2.4",
+        target="x86_64-unknown-linux-gnu",
+    )
+    evidence_index.set_target(
+        idx,
+        stage="2.4",
+        platform="linux",
+        release_manifest=reset_bundle / "release-manifest.json",
+        contract_revision="c" * 40,
+        tool_revision="t" * 40,
+        case_list_sha256="0" * 64,
+        set_by="test",
+        now=fakes.ts(30, 1),
+        bundle_dir=reset_bundle,
+    )
+
+    assert _status(idx, root, cat, "S3-L3-AB-48H-LINUX")[0] == "STALE"
+
+
+def test_reuse_refuses_source_when_its_stage_has_no_target(tmp_path):
+    """來源 entry 所屬 stage 沒有目前 target 時不得沿用（5a038a1）。"""
+    root = tmp_path / "no-source-target"
+    idx, cat, _previous, _current = _reuse_fixture(root)
+    assert _status(idx, root, cat, "S3-L3-AB-48H-LINUX")[0] == "SATISFIED"
+    data = json.loads(idx.read_text(encoding="utf-8"))
+    del data["stage_targets"]["2.4"]
+    idx.write_text(
+        json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    assert _status(idx, root, cat, "S3-L3-AB-48H-LINUX")[0] == "STALE"
+
+
 def test_reuse_cycle_stale(tmp_path):
     evidence_index = _evidence_api()
     idx = fakes_evidence.evidence_index(tmp_path, stage="3", contract="c" * 40)
     cat = evidence_index.load_exit_catalog()
+    previous_bundle = fakes_evidence.make_bundle(
+        tmp_path / "bundles" / "stage-2.4" / "linux",
+        stage="2.4",
+        target="x86_64-unknown-linux-gnu",
+    )
+    evidence_index.set_target(
+        idx,
+        stage="2.4",
+        platform="linux",
+        release_manifest=previous_bundle / "release-manifest.json",
+        contract_revision="c" * 40,
+        tool_revision="t" * 40,
+        case_list_sha256="0" * 64,
+        set_by="test",
+        now=fakes.ts(30, 0),
+    )
     a = fakes_evidence.entry(
         tmp_path, "S3-L3-AB-48H-LINUX", "PASS", platform="linux", n=1, reuse_of="entry-b"
     )
