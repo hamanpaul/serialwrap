@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -232,3 +233,170 @@ def test_junit_counts_are_testcase_level_not_suite_attributes(tmp_path) -> None:
     )
     assert gate._junit_counts(path) == {"tests": 3, "failures": 1, "errors": 0, "skipped": 1}
     assert gate._junit_counts(tmp_path / "missing.xml") is None
+
+
+# ── OD-18 (1)(2)：平台不適用核准清單（CHG-S1X-P4-APPL-01，15 列）────────────────────────────────
+# justification：OD-18 (1) 核准 CHG-S1X-P4-APPL-01 之不適用組合不產生紀錄、不要求該平台 rust PASS；
+# OD-18 (2) 明列 sc20 與 bc05-three-topologies 之 windows 列依 (1) 記為 not_applicable。
+# 本段測試以合成 applicability 與 monkeypatch 的核准清單驗證 fail-closed 行為，不依賴真實收集結果。
+BC05_THREE = "bc05-three-topologies"
+BC05_THREE_NODE = "tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_topologies_docker"
+SC20_NODE = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"
+
+
+def _bc05_case(**over) -> dict:
+    base = _case(
+        BC05_THREE,
+        platforms=["linux", "windows"],
+        layer="L1.5",
+        capabilities=["docker"],
+        artifact="rust-cli-bundle",
+        tests=[BC05_THREE_NODE],
+    )
+    base.update(over)
+    return base
+
+
+def test_od18_approval_list_is_the_fifteen_listed_rows(gate) -> None:
+    """OD-18 (1)(2) 對帳：核准清單恰為 CHG-S1X-P4-APPL-01 逐列之 15 列（含 sc20／bc05 windows 與 sc36 六筆）。"""
+    rows = gate.APPROVED_NOT_APPLICABLE
+    assert len(rows) == 15
+    assert (BC05_THREE, "windows", BC05_THREE_NODE) in rows
+    assert ("sc20-daemon-restart", "windows", SC20_NODE) in rows
+    assert len([r for r in rows if r[0] == "sc36-win-installer-com0com-optional"]) == 6
+
+
+@pytest.mark.skipif(os.name == "nt", reason="真實適用性以 POSIX 收集為準；OD-18 真實資料對帳於 Linux 執行")
+def test_od18_real_map_not_applicable_rows_equal_approved_list() -> None:
+    """OD-18 對帳（真實資料）：以實際映射與實際 pytest 收集求得適用性，實算不適用列須逐列等於核准清單。
+
+    不以合成適用性代替，故不使用 `gate` fixture（其會改指向暫存映射）；新增或移除任一不適用列時，此測試即指出（待擁有者核准）。
+    """
+    gate = _load_gate()
+    cases = gate.load_cases()
+    nodes = sorted(gate._case_rule_nodes(cases))
+    applicability = gate.platform_applicability(nodes, cwd=gate.REPO_ROOT)
+    pairs = gate._not_applicable_pairs(cases, applicability)
+    assert gate.not_applicable_approval_problems(cases, pairs) == []
+
+
+def test_od18_bc05_windows_not_required_when_node_only_applies_to_linux(gate) -> None:
+    """OD-18 (1)：bc05-three-topologies 唯一節點僅適用 linux，windows 不要求 rust PASS（已核准列）。
+
+    修改前此案例 windows 必缺 rust PASS → FAIL（PENDING-OD-S1X-P4-BC05-WIN）。"""
+    case = _bc05_case()
+    _write_evidence(gate, BC05_THREE, [_pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE)])
+    applicability = {BC05_THREE_NODE: frozenset({"linux"})}
+
+    problems, passing, _ = gate.check_case_evidence(case, HEAD, gate.EVIDENCE_DIR, None, applicability)
+
+    assert problems == []
+    assert [r["platform"] for r in passing] == ["linux"]
+
+
+def test_od18_skip_requires_each_pair_to_be_approved(gate, monkeypatch) -> None:
+    """未列入核准清單的 (案例, 平台, 節點) 不得略過該平台 rust PASS 要求（fail-closed）。"""
+    monkeypatch.setattr(gate, "APPROVED_NOT_APPLICABLE", frozenset())
+    case = _bc05_case()
+    _write_evidence(gate, BC05_THREE, [_pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE)])
+    applicability = {BC05_THREE_NODE: frozenset({"linux"})}
+
+    problems, _, _ = gate.check_case_evidence(case, HEAD, gate.EVIDENCE_DIR, None, applicability)
+
+    assert any("windows" in p and "缺少" in p for p in problems), problems
+
+
+def test_od18_skip_refused_when_node_absent_from_applicability(gate) -> None:
+    """適用性未對節點計算（例如收集失敗回傳空 dict）時不得視為不適用而略過（guard，fail-closed）。"""
+    case = _bc05_case()
+    _write_evidence(gate, BC05_THREE, [_pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE)])
+
+    problems, _, _ = gate.check_case_evidence(case, HEAD, gate.EVIDENCE_DIR, None, {})
+
+    assert any("windows" in p for p in problems), problems
+
+
+def test_od18_node_not_applicable_on_any_platform_still_fails(gate) -> None:
+    """兩平台皆不適用的節點不在核准清單內，任一平台皆不得放行（guard）。"""
+    case = _bc05_case()
+    _write_evidence(gate, BC05_THREE, [_pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE)])
+
+    problems, passing, _ = gate.check_case_evidence(case, HEAD, gate.EVIDENCE_DIR, None, {BC05_THREE_NODE: frozenset()})
+
+    assert passing == []
+    assert any("一律 FAIL" in p for p in problems), problems
+    assert any("缺少 linux 的 rust 輪 PASS" in p for p in problems), problems
+
+
+def test_od18_all_platforms_skipped_still_requires_a_rust_pass(gate, monkeypatch) -> None:
+    """所有平台皆經核准略過時，仍須至少一個平台有 rust PASS（另加檢查；無任一 PASS 即 FAIL）。"""
+    monkeypatch.setattr(gate, "APPROVED_NOT_APPLICABLE", frozenset({
+        (BC05_THREE, "linux", BC05_THREE_NODE),
+        (BC05_THREE, "windows", BC05_THREE_NODE),
+    }))
+    case = _bc05_case()
+    _write_evidence(gate, BC05_THREE, [])
+
+    problems, passing, _ = gate.check_case_evidence(case, HEAD, gate.EVIDENCE_DIR, None, {BC05_THREE_NODE: frozenset()})
+
+    assert passing == []
+    assert any("無任一平台" in p for p in problems), problems
+
+
+def test_od18_not_applicable_row_with_record_is_rejected(gate) -> None:
+    """不適用組合不產生紀錄；若仍出現 windows PASS 紀錄，不計入且 FAIL（guard）。"""
+    case = _bc05_case()
+    _write_evidence(gate, BC05_THREE, [
+        _pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE),
+        _pass_record(gate, BC05_THREE, platform="windows", test_id=BC05_THREE_NODE),
+    ])
+    applicability = {BC05_THREE_NODE: frozenset({"linux"})}
+
+    problems, _, _ = gate.check_case_evidence(case, HEAD, gate.EVIDENCE_DIR, None, applicability)
+
+    assert any("不適用於 windows" in p for p in problems), problems
+
+
+def test_od18_unapproved_or_missing_not_applicable_row_is_owner_pending(gate) -> None:
+    """實算 not_applicable 與核准清單不一致（新增或缺少任一列）一律 FAIL，訊息為待擁有者核准。"""
+    cases = [_bc05_case()]
+    approved = {"case_id": BC05_THREE, "platform": "windows", "node": BC05_THREE_NODE, "reason": "x"}
+    extra = {"case_id": BC05_THREE, "platform": "linux", "node": BC05_THREE_NODE, "reason": "x"}
+
+    assert gate.not_applicable_approval_problems(cases, [approved]) == []
+    added = gate.not_applicable_approval_problems(cases, [approved, extra])
+    missing = gate.not_applicable_approval_problems(cases, [])
+
+    assert added and all("待擁有者核准" in p for p in added), added
+    assert missing and all("待擁有者核准" in p for p in missing), missing
+
+
+def _patch_applicability(gate, monkeypatch, mapping: dict[str, frozenset[str]]) -> None:
+    """以合成適用性取代真實 pytest 收集（測試不依賴收集結果）。"""
+    monkeypatch.setattr(
+        gate,
+        "platform_applicability",
+        lambda nodes, **_kw: {n: frozenset(mapping.get(n, frozenset())) for n in nodes},
+    )
+
+
+def test_od18_check_passes_with_bc05_windows_not_applicable(gate, monkeypatch) -> None:
+    """整體 gate：bc05-three-topologies 僅 linux PASS、windows 為核准之不適用列 → 本案例通過。"""
+    _write_map(gate, [_bc05_case()])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, BC05_THREE, [_pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE)])
+    _patch_applicability(gate, monkeypatch, {BC05_THREE_NODE: frozenset({"linux"})})
+
+    assert gate.check() == 0
+
+
+def test_od18_check_fails_when_a_not_applicable_row_is_unapproved(gate, monkeypatch, capsys) -> None:
+    """整體 gate：核准清單缺少 bc05 windows 列時，實算之不適用列未核准 → FAIL，訊息為待擁有者核准。"""
+    _write_map(gate, [_bc05_case()])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, BC05_THREE, [_pass_record(gate, BC05_THREE, platform="linux", test_id=BC05_THREE_NODE)])
+    _patch_applicability(gate, monkeypatch, {BC05_THREE_NODE: frozenset({"linux"})})
+    monkeypatch.setattr(gate, "APPROVED_NOT_APPLICABLE", frozenset())
+
+    assert gate.check() == 1
+    assert "待擁有者核准" in capsys.readouterr().out

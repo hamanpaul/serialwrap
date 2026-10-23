@@ -359,13 +359,16 @@ def test_windows_blackbox_ps1_parses_under_windows_powershell():
 
 
 def test_win_dev_bundle_pointer_is_install_root_relative():
-    """bin\\current-release.json 的 `dir` 必須為相對安裝根的 `versions\\<V>`（plan 04 Task 17 的 `"dir":"versions\\<V>"`）。
+    """bin\\current-release.json 的 `dir` 必須為相對安裝根的 `versions/<V>`（正斜線）。
 
-    理由：Rust 端以安裝根為基準（delegate.rs 以 exe_dir.parent() 接 `dir`；rollback.rs 寫入 `versions/<V>`），
-    plan 04 Task 17 為權威。1e470cd 改成 `..\\versions\\<V>`（以 bin\\ 為基準）與之不一致，予以回復。
+    justification（OD-18 (3)）：`dir` 一律以正斜線表示，與 launcher／`delegate.rs` 安全路徑規則一致；
+    `crates/sw-daemon/src/launcher.rs` 拒絕含 `\\` 的 `dir`（`current.dir.contains('\\\\')`），故 JSON 指標字串不得使用反斜線。
+    Rust 端以安裝根為基準（delegate.rs 以 exe_dir.parent() 接 `dir`；rollback.rs 寫入 `versions/<V>`）。
+    1e470cd 曾改成 `..\\versions\\<V>`（以 bin\\ 為基準）與之不一致，予以回復；本測試只改 JSON 指標字串，檔案系統的 Join-Path 維持原樣。
     """
     ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
-    assert 'dir = "versions\\$version"' in ps1
+    assert 'dir = "versions/$version"' in ps1
+    assert 'dir = "versions\\$version"' not in ps1
     assert '"..\\versions' not in ps1
 
 

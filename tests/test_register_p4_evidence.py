@@ -772,7 +772,10 @@ def _load_register():
 
 
 def test_manifest_pointer_dir_resolves_from_install_root_not_bin(tmp_path: Path) -> None:
-    """Windows 指標 `dir`（plan 04 Task 17 的 `versions\\<V>`）相對安裝根（cli.parent.parent）解析，不得以 bin\\ 為基準。"""
+    """Windows 指標 `dir` 的舊版反斜線寫法（`versions\\<V>`）相對安裝根（cli.parent.parent）解析，不得以 bin\\ 為基準。
+
+    保留為反斜線正規化的回歸案例（讀取端相容舊指標）；現行寫法為正斜線，見 OD-18 (3) 與下方正斜線案例。
+    """
     register = _load_register()
     root = tmp_path / "install"
     cli = root / "bin" / "serialwrap.exe"
@@ -821,7 +824,13 @@ def test_manifest_pointer_unparseable_is_reported_not_ignored(tmp_path: Path) ->
     assert error == "current-release.json 無法解析"
 
 
-def _windows_bundle_layout(tmp_path: Path, commit: str, *, entry_bytes: bytes | None = None) -> tuple[Path, Path, Path]:
+def _windows_bundle_layout(
+    tmp_path: Path,
+    commit: str,
+    *,
+    entry_bytes: bytes | None = None,
+    pointer_dir: str = "versions\\0.4.0",
+) -> tuple[Path, Path, Path]:
     """Windows dev bundle 佈局：`bin\\serialwrap.exe` 為 `versions\\<V>\\bin\\serialwrap.exe` 的 byte 複本（無 symlink）。
 
     回傳 (入口 bin\\serialwrap.exe, manifest 路徑, manifest 所指的 versions\\<V>\\bin\\serialwrap.exe)。
@@ -836,7 +845,7 @@ def _windows_bundle_layout(tmp_path: Path, commit: str, *, entry_bytes: bytes | 
     entry = root / "bin" / "serialwrap.exe"
     entry.write_bytes(payload if entry_bytes is None else entry_bytes)
     (root / "bin" / "current-release.json").write_text(
-        json.dumps({"bundle_version": "0.4.0", "dir": "versions\\0.4.0"}), encoding="utf-8"
+        json.dumps({"bundle_version": "0.4.0", "dir": pointer_dir}), encoding="utf-8"
     )
     manifest = version_dir / "release-manifest.json"
     manifest.write_text(json.dumps({
@@ -909,3 +918,33 @@ def test_register_junit_counts_are_testcase_level_not_suite_attributes(tmp_path:
     )
     assert module._junit_counts(path) == {"tests": 3, "failures": 1, "errors": 0, "skipped": 1}
     assert module._junit_counts(tmp_path / "missing.xml") is None
+
+
+def test_manifest_pointer_forward_slash_dir_resolves_from_install_root(tmp_path: Path) -> None:
+    """OD-18 (3)：現行指標 `dir` 為正斜線 `versions/<V>`，與舊版反斜線寫法相同以安裝根（cli.parent.parent）為基準解析。"""
+    register = _load_register()
+    root = tmp_path / "install"
+    cli = root / "bin" / "serialwrap.exe"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"rust-cli")
+    (root / "bin" / "current-release.json").write_text(
+        json.dumps({"bundle_version": "0.4.0", "dir": "versions/0.4.0"}), encoding="utf-8"
+    )
+
+    candidates, error = register._manifest_candidates(cli)
+
+    assert error is None
+    assert candidates[0] == root / "versions" / "0.4.0" / "release-manifest.json"
+    assert root / "bin" / "versions" / "0.4.0" / "release-manifest.json" not in candidates
+
+
+def test_windows_stable_entry_with_forward_slash_pointer_is_the_manifest_cli(tmp_path: Path) -> None:
+    """OD-18 (3)：指標 `dir` 為 `versions/<V>` 時，穩定入口複本與 manifest 所指 CLI 同 byte 即為受測 artifact。"""
+    register = _load_register()
+    commit = _head()
+    entry, manifest, _ = _windows_bundle_layout(tmp_path, commit, pointer_dir="versions/0.4.0")
+
+    bundle, error = register._rust_manifest(entry, commit)
+
+    assert error is None, error
+    assert bundle is not None and bundle["path"] == manifest

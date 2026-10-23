@@ -317,35 +317,37 @@ def test_deployed_content_live_daemon_image(tmp_path: pathlib.Path) -> None:
 def test_deployed_content_windows_relative_dir_resolves_from_install_root(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Windows dev bundle 的 current-release.json `dir` 為相對安裝根的 `versions\\<V>`（plan 04 Task 17；rollback.rs 同）。
+    """Windows dev bundle 的 current-release.json `dir` 為相對安裝根的 `versions/<V>`（OD-18 (3)，正斜線為新寫入形式）。
 
+    讀取端須同時接受舊版反斜線形式 `versions\\<V>`（既有 sidecar 相容），兩種形式皆須解析到同一安裝根。
     回歸：若以 bin\\（cli.parent）為基準解析，會得到 bin\\versions\\<V>（不存在）而 install_dir 為 None（unresolved）。
     POSIX 行為不變：本測試只在 os.name 偽裝為 nt 時走 sidecar 分支。
     """
     import realhw.deployed_content as dc
     monkeypatch.setattr(os, "name", "nt")
 
-    root = tmp_path / "root"
-    bin_dir = root / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    ver_dir = root / "versions" / "0.4.0"
-    (ver_dir / "bin").mkdir(parents=True, exist_ok=True)
-    cli_bytes = b"sw-cli-relative"
+    for form in ("versions\\0.4.0", "versions/0.4.0"):
+        root = tmp_path / ("root-" + ("bs" if "\\" in form else "fs"))
+        bin_dir = root / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        ver_dir = root / "versions" / "0.4.0"
+        (ver_dir / "bin").mkdir(parents=True, exist_ok=True)
+        cli_bytes = b"sw-cli-relative"
 
-    (bin_dir / "serialwrap.exe").write_bytes(cli_bytes)
-    (bin_dir / "current-release.json").write_text(
-        json.dumps({"bundle_version": "0.4.0", "dir": "versions\\0.4.0"}), encoding="utf-8"
-    )
-    (ver_dir / "bin" / "serialwrap.exe").write_bytes(cli_bytes)
-    (ver_dir / "release-manifest.json").write_text(json.dumps({
-        "schema_version": "release-manifest.v1",
-        "components": {"cli": {"path": "bin/serialwrap.exe", "sha256": _sha256_bytes(cli_bytes)}},
-    }), encoding="utf-8")
+        (bin_dir / "serialwrap.exe").write_bytes(cli_bytes)
+        (bin_dir / "current-release.json").write_text(
+            json.dumps({"bundle_version": "0.4.0", "dir": form}), encoding="utf-8"
+        )
+        (ver_dir / "bin" / "serialwrap.exe").write_bytes(cli_bytes)
+        (ver_dir / "release-manifest.json").write_text(json.dumps({
+            "schema_version": "release-manifest.v1",
+            "components": {"cli": {"path": "bin/serialwrap.exe", "sha256": _sha256_bytes(cli_bytes)}},
+        }), encoding="utf-8")
 
-    m = dc.measure(bin_dir / "serialwrap.exe")
-    assert m["install_dir"] == str(ver_dir.resolve())
-    assert m["error"] is None
-    assert len(m["bundle_tree_sha256"]) == 64
+        m = dc.measure(bin_dir / "serialwrap.exe")
+        assert m["install_dir"] == str(ver_dir.resolve()), form
+        assert m["error"] is None, form
+        assert len(m["bundle_tree_sha256"]) == 64, form
 
 
 @pytest.mark.memory_only
