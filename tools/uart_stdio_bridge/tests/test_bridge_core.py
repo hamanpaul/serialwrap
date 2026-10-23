@@ -638,9 +638,10 @@ class _WinPeerFakeSerial:
         self.closed = True
 
 
-def test_win_serial_status_reports_peer_open_null(tmp_path: Path):
-    """Windows 端點不宣告 peer_state：對外 status 的 peer_open 必須為 None，即使 DSR 已為高。
-    內部 peer gate 仍照常取樣並於 DSR 高後寫出 banner。"""
+def test_win_serial_status_reports_peer_open_when_peer_gated(tmp_path: Path):
+    """S1X 修訂：com0com 且 peer gate 啟用時 win-serial 宣告 peer_state，對外 status.peer_open 為 DSR 即時取樣
+    （關閉時 False、DSR 高後 True）；內部 peer gate 仍照常取樣並於 DSR 高後寫出 banner。
+    舊斷言「Windows 恆為 None」已依 COM20:COM21 原生實測修訂（非 gate 情境見 test_win_serial_status_peer_open_null_without_peer_gate）。"""
     from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
     from uart_stdio_bridge.evidence.writer import EvidenceWriter
@@ -666,14 +667,47 @@ def test_win_serial_status_reports_peer_open_null(tmp_path: Path):
     bridge.start()
     try:
         time.sleep(0.3)
-        assert bridge.handle_action("status", {}, "act_status_closed")["peer_open"] is None
+        assert bridge.handle_action("status", {}, "act_status_closed")["peer_open"] is False
 
         serials[0].dsr_on = True
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and b"".join(serials[0].writes) != banner:
             time.sleep(0.01)
         assert b"".join(serials[0].writes) == banner
-        assert bridge.handle_action("status", {}, "act_status_open")["peer_open"] is None
+        assert bridge.handle_action("status", {}, "act_status_open")["peer_open"] is True
+    finally:
+        bridge.handle_action("shutdown", {}, "act_shutdown")
+        assert bridge.wait() == 0
+
+
+def test_win_serial_status_peer_open_null_without_peer_gate(tmp_path: Path):
+    """未啟用 peer gate 的 win-serial 不宣告 peer_state：即使 DSR 已為高，對外 status.peer_open 仍為 None。"""
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    serials: list[_WinPeerFakeSerial] = []
+
+    def factory(**kwargs: object) -> _WinPeerFakeSerial:
+        fake = _WinPeerFakeSerial(**kwargs)
+        serials.append(fake)
+        return fake
+
+    endpoint = WinSerialEndpoint("COMb", serial_factory=factory)
+    dut = StubDutProcess()
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson", run_id="r-status-off", case_id="c-status-off", clock_id="clk-status-off"
+    )
+    cfg = BridgeConfig(run_id="r-status-off", case_id="c-status-off", port_id="COM0", evidence_dir=evidence_dir)
+    bridge = Bridge(cfg, endpoint, dut, writer, dut_control=None)
+    bridge.start()
+    try:
+        time.sleep(0.3)
+        serials[0].dsr_on = True
+        time.sleep(0.2)
+        assert bridge.handle_action("status", {}, "act_status_nogate")["peer_open"] is None
     finally:
         bridge.handle_action("shutdown", {}, "act_shutdown")
         assert bridge.wait() == 0

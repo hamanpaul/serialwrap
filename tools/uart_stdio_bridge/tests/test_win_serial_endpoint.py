@@ -642,8 +642,10 @@ def test_peer_open_none_without_handle(fake_serial_module):
     assert ep.peer_open() is None
 
 
-def test_peer_gate_keeps_capabilities_undeclared(fake_serial_module):
-    """peer_gate 不得讓 capabilities 宣告 peer_state；該能力待 G4 peer-close 實測寫回後才可宣告。"""
+def test_peer_gate_declares_peer_state_capability(fake_serial_module):
+    """S1X 修訂（PENDING-OD-S1X-WIN-BANNER）：com0com 且 peer_gate 啟用時宣告 peer_state（DSR 已於 COM20:COM21 原生實測，
+    g3-peer-gate/261023-061416-2646662）；transport_disconnect 與 by_id_link 仍為 False。
+    舊斷言「peer_gate 不得宣告 peer_state」已依實測結果修訂。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
     ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(PeerFakeSerial()))
@@ -652,9 +654,59 @@ def test_peer_gate_keeps_capabilities_undeclared(fake_serial_module):
         assert ep.capabilities() == {
             "transport_disconnect": False,
             "by_id_link": False,
-            "peer_state": False,
+            "peer_state": True,
         }
         assert ep.describe()["peer_gate"] is True
+    finally:
+        ep.close()
+
+
+def test_peer_state_undeclared_without_peer_gate(fake_serial_module):
+    """未啟用 peer gate 時 DSR 不被取樣，故不得宣告 peer_state（對外 status.peer_open 維持 null）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(PeerFakeSerial()))
+    ep.open()
+    try:
+        assert ep.capabilities() == {
+            "transport_disconnect": False,
+            "by_id_link": False,
+            "peer_state": False,
+        }
+        assert ep.peer_open() is None
+    finally:
+        ep.close()
+
+
+def test_peer_state_undeclared_for_physical_usb_uart(fake_serial_module):
+    """physical_usb_uart 無 DSR 映射實測，peer_gate 於建構時被拒絕，故 peer_state 不得宣告。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    ep = WinSerialEndpoint(
+        "COMb",
+        transport_mode="physical_usb_uart",
+        serial_factory=RecordingFactory(PeerFakeSerial()),
+    )
+    ep.open()
+    try:
+        assert ep.capabilities()["peer_state"] is False
+        assert ep.capabilities()["transport_disconnect"] is False
+    finally:
+        ep.close()
+
+
+def test_peer_state_capability_matches_peer_open_sampling(fake_serial_module):
+    """宣告 peer_state 時 peer_open 必為布林值（DSR 低為 False、高為 True），不得回 None。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        assert ep.capabilities()["peer_state"] is True
+        assert ep.peer_open() is False
+        fake.dsr_on = True
+        assert ep.peer_open() is True
     finally:
         ep.close()
 
