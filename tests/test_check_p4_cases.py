@@ -385,3 +385,103 @@ def test_od18_check_fails_when_a_not_applicable_row_is_unapproved(gate, monkeypa
 
     assert gate.check() == 1
     assert "待擁有者核准" in capsys.readouterr().out
+
+
+# ── judge_spike2 案例（計畫 05 L3733、附錄 B-17）：證據檔缺席為 BLOCKED-OWNER（exit 2），不得 PASS ──────────────
+# justification：`p1-rst-daemon` 的 windows-task 面須以擁有者 throwaway Windows 工作實跑（spike2 -Phase restart）產生證據；
+# 該實跑不得於 73 h 長跑進行中執行，且 stage1 driver 不執行 judge_spike2。本段只調整 owner 分類，不改映射表、lock 或 layer。
+P1_RST_CASE = "p1-rst-daemon"
+P1_RST_TESTS = [
+    "tests/test_rust_spike2_tools.py::test_judge_restart_120s_fails",
+    "tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections",
+]
+JUDGE_SPIKE2_IDS = {
+    "win-task-logon-trigger",
+    "win-task-single-instance",
+    "win-task-restart-on-failure",
+    "win-task-72h",
+    "p1-rst-daemon",
+    "rm-live-e2e",
+}
+
+
+def _p1_rst_case(**over) -> dict:
+    """與 p4_case_map.yaml 之 p1-rst-daemon 同形（L1.5、無 evidence_status；承接節點僅取不屬適用性規則範圍者）。"""
+    base = _case(
+        P1_RST_CASE,
+        platforms=["windows"],
+        layer="L1.5",
+        capabilities=["windows_native", "supervisor_runtime"],
+        tests=list(P1_RST_TESTS),
+    )
+    base.update(over)
+    return base
+
+
+def _summary_status(gate, case_id: str) -> list[str]:
+    summary = json.loads((gate.EVIDENCE_DIR / "summary.json").read_text(encoding="utf-8"))
+    return [c["status"] for c in summary["cases"] if c["case_id"] == case_id]
+
+
+def test_judge_spike2_case_without_evidence_is_blocked_owner_exit_2(gate, capsys) -> None:
+    """p1-rst-daemon 證據檔缺席 → BLOCKED-OWNER、exit 2，且列於 BLOCKED-OWNER 清單（不得判為 FAIL）。"""
+    _write_map(gate, [_p1_rst_case()])
+    assert gate.freeze(add_only=False) == 0
+
+    assert gate.check() == 2
+    out = capsys.readouterr().out
+    assert "BLOCKED-OWNER（僅擁有者機台證據待補，exit 2）：p1-rst-daemon: 缺少證據檔" in out, out
+    assert _summary_status(gate, P1_RST_CASE) == ["BLOCKED-OWNER"]
+    summary = json.loads((gate.EVIDENCE_DIR / "summary.json").read_text(encoding="utf-8"))
+    assert summary["overall"] == "BLOCKED-OWNER"
+
+
+@pytest.mark.parametrize("bad_result", ["FAIL", "INSUFFICIENT_EVIDENCE"])
+def test_judge_spike2_case_with_fail_or_invalid_evidence_stays_fail_exit_1(gate, bad_result) -> None:
+    """judge 判 FAIL，或紀錄為 INSUFFICIENT_EVIDENCE（非合法 result，屬無效紀錄）→ 仍為 FAIL、exit 1，不得轉為 BLOCKED-OWNER。"""
+    _write_map(gate, [_p1_rst_case()])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, P1_RST_CASE, [_pass_record(gate, P1_RST_CASE, platform="windows", result=bad_result)])
+
+    assert gate.check() == 1
+    assert _summary_status(gate, P1_RST_CASE) == ["FAIL"]
+
+
+def test_judge_spike2_case_with_only_stale_evidence_is_blocked_owner_exit_2(gate) -> None:
+    """證據檔存在但僅有非受測 HEAD 的 PASS：與其他 owner 案例相同，視為待擁有者補證（BLOCKED-OWNER），不因過期而 FAIL。"""
+    _write_map(gate, [_p1_rst_case()])
+    assert gate.freeze(add_only=False) == 0
+    _write_evidence(gate, P1_RST_CASE, [_pass_record(gate, P1_RST_CASE, platform="windows", commit=OLD)])
+
+    assert gate.check() == 2
+    assert _summary_status(gate, P1_RST_CASE) == ["BLOCKED-OWNER"]
+
+
+def test_non_judge_l15_case_without_evidence_still_fails_exit_1(gate) -> None:
+    """非 judge_spike2 的 L1.5 案例缺證據 → FAIL、exit 1（owner 分類不得擴及一般 L1.5）。"""
+    _write_map(gate, [_case(
+        "sc-l15-example",
+        layer="L1.5",
+        platforms=["windows"],
+        tests=["tests/test_rust_spike2_tools.py::test_deploy_docs_have_five_sections"],
+    )])
+    assert gate.freeze(add_only=False) == 0
+
+    assert gate.check() == 1
+    assert _summary_status(gate, "sc-l15-example") == ["FAIL"]
+
+
+def test_judge_spike2_case_set_is_one_shared_constant_with_register(gate) -> None:
+    """JUDGE_SPIKE2_CASES 為 check 與 register 共用之單一常數：兩支腳本對 judge 案例的 owner 判定必須一致。"""
+    spec = importlib.util.spec_from_file_location(
+        "register_p4_evidence_under_test",
+        REPO_ROOT / "scripts" / "rust" / "register_p4_evidence.py",
+    )
+    register = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(register)
+
+    assert gate.JUDGE_SPIKE2_CASES == frozenset(JUDGE_SPIKE2_IDS)
+    assert register.p4_rule.JUDGE_SPIKE2_CASES == gate.JUDGE_SPIKE2_CASES
+    for cid in JUDGE_SPIKE2_IDS:
+        assert register._is_owner_case({"case_id": cid, "layer": "L1.5"}), cid
