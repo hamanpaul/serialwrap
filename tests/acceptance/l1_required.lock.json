@@ -6564,6 +6564,7 @@
           "tests/contract_blackbox/test_cli_mgmt_terminal.py::test_minicom_wrapper_sigterm_still_detaches",
           "tests/contract_blackbox/test_cli_mgmt_update.py::test_fresh_install_blackbox",
           "tests/contract_blackbox/test_cli_mgmt_update.py::test_revert_new_daemon_push_not_aborted_l15",
+          "tests/contract_blackbox/test_cli_mgmt_update.py::test_update_background_triggers_zero_tx_in_drain_window_l15",
           "tests/contract_blackbox/test_cli_mgmt_update.py::test_update_busy_l15_zero_tx",
           "tests/contract_blackbox/test_cli_mgmt_update.py::test_update_file_push_after_last_probe_l15",
           "tests/contract_blackbox/test_cli_mgmt_update.py::test_update_push_after_freeze_zero_tx_l15",
