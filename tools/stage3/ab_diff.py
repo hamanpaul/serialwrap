@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
+import itertools
 import json
+import math
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,9 @@ _DECIDED_VERDICTS = frozenset({_PASS, _FAIL})
 _ENDPOINT_FLAGS = ("--socket", "--endpoint")
 _CMD_ID_FLAG = "--cmd-id"
 _CMD_ID_PLACEHOLDER = "<ID>"
+# host /proc 掃描快照：成功的 daemon status（CLI `daemon status` 對應 RPC `health.status`）回應最上層的 foreign_holders
+# 每次掃描都可能不同，僅忽略該欄位；其他子命令、錯誤回應與巢狀同名欄位仍嚴格比較。
+_SCAN_SNAPSHOT_COMMAND = ("daemon", "status")
 _PTY_PATH = re.compile(r"/dev/pts/[0-9]+")
 # 路徑片段字元：根目錄取代時，前一字元不得屬於此集合（避免 `/tmp/x` 誤中 `/tmp/xy`）。
 _PATH_SEGMENT_CHARS = "A-Za-z0-9._-"
@@ -339,18 +344,94 @@ def _text(value: str, ctx: _NormCtx) -> str:
     return _PTY_PATH.sub(lambda _match: ctx.pty_placeholder, value)
 
 
-def _strip(value: Any, ctx: _NormCtx, *, path: tuple[str, ...] = (), pid_field: bool = False) -> Any:
-    """遞迴複製並套用 volatile 刪除、G1 刪除 message、實例根目錄與 PTY 路徑佔位替換。
+def _collect_pid_paths(
+    value: Any,
+    ctx: _NormCtx,
+    occurrences: dict[int, list[tuple[str, ...]]],
+    *,
+    path: tuple[str, ...] = (),
+    pid_field: bool = False,
+) -> None:
+    """收集 PID 的正規化路徑；清單索引統一視為同一位置，避免清單順序影響 PID 標籤。"""
+    if pid_field and isinstance(value, int) and not isinstance(value, bool):
+        occurrences.setdefault(value, []).append(path)
+        return
+    if isinstance(value, Mapping):
+        exception_message = ctx.g1 and value.get("error_code") == _EXCEPTION
+        for key, child in sorted(value.items(), key=lambda item: str(item[0])):
+            if key in ctx.volatile or (exception_message and key == "message"):
+                continue
+            new_key = _text(key, ctx) if isinstance(key, str) else key
+            child_path = path + (str(new_key),)
+            is_pid_field = pid_field or (isinstance(key, str) and key in ctx.pid_fields)
+            _collect_pid_paths(
+                child,
+                ctx,
+                occurrences,
+                path=child_path,
+                pid_field=is_pid_field,
+            )
+        return
+    if isinstance(value, list):
+        unordered_pid_list = pid_field and all(
+            isinstance(item, int) and not isinstance(item, bool) for item in value
+        )
+        for index, item in enumerate(value):
+            index_path = "*" if unordered_pid_list else str(index)
+            _collect_pid_paths(item, ctx, occurrences, path=path + (index_path,), pid_field=pid_field)
+
+
+# 所有同簽章群組的排列數乘積上限。超過時退回排序後的單一標籤，不再保證與走訪順序及 PID 數值無關；
+# 此為理論邊界，實際 L1.5 報告中單一 holder 的 pids 清單皆僅 1 筆。
+_MAX_TIE_LABELINGS = 720
+
+
+def _pid_tie_classes(obj: Any, ctx: _NormCtx) -> list[list[int]]:
+    """依各 PID 的正規化路徑多重集合分群：群組依簽章排序，群內 PID 依數值排序，結果與走訪順序無關。"""
+    occurrences: dict[int, list[tuple[str, ...]]] = {}
+    _collect_pid_paths(obj, ctx, occurrences)
+    groups: dict[tuple[tuple[str, ...], ...], list[int]] = {}
+    for pid, paths in occurrences.items():
+        groups.setdefault(tuple(sorted(paths)), []).append(pid)
+    return [sorted(groups[signature]) for signature in sorted(groups)]
+
+
+def _assign_labels(ordered_classes: Iterable[Iterable[int]]) -> dict[int, str]:
+    """依群組順序與群內順序編號為 `<PID:n>`。"""
+    labels: dict[int, str] = {}
+    for members in ordered_classes:
+        for pid in members:
+            labels[pid] = f"<PID:{len(labels)}>"
+    return labels
+
+
+def _pid_labelings(classes: Sequence[Sequence[int]]) -> Iterator[dict[int, str]]:
+    """列舉同簽章群內的所有標籤排列。
+
+    同簽章 PID 的正規化路徑完全相同，無法僅由路徑區分；它們之間的關聯（是否同屬一個 holder 群組）
+    只能由渲染後的結構體現，故由 `_normalize` 逐一渲染並取最小者。排列數超過上限時只產生單一標籤。
+    """
+    if math.prod(math.factorial(len(members)) for members in classes) > _MAX_TIE_LABELINGS:
+        yield _assign_labels(classes)
+        return
+    for orderings in itertools.product(*(itertools.permutations(members) for members in classes)):
+        yield _assign_labels(orderings)
+
+
+def _render_with_labels(obj: Any, ctx: _NormCtx, labels: Mapping[int, str]) -> Any:
+    ctx.pid_aliases.clear()
+    ctx.pid_aliases.update(labels)
+    return _strip(obj, ctx)
+
+
+def _strip(value: Any, ctx: _NormCtx, *, pid_field: bool = False) -> Any:
+    """遞迴複製並套用 volatile 刪除、G1 刪除 message、實例根目錄與 PTY 路徑佔位替換，PID 以 ctx.pid_aliases 取代。
 
     PTY 路徑改名後若與同層其他鍵碰撞（例如兩個 `/dev/pts/N` 持有者），保留全部值（排序清單），
-    使持有者數量差異不致被靜默吞掉。
+    使持有者數量與 PID 關係差異不致被靜默吞掉。
     """
     if pid_field and isinstance(value, int) and not isinstance(value, bool):
-        alias = ctx.pid_aliases.get(value)
-        if alias is None:
-            alias = f"<PID:{'.'.join(path)}>"
-            ctx.pid_aliases[value] = alias
-        return alias
+        return ctx.pid_aliases[value]
     if isinstance(value, Mapping):
         exception_message = ctx.g1 and value.get("error_code") == _EXCEPTION
         grouped: dict[Any, list[Any]] = {}
@@ -360,22 +441,19 @@ def _strip(value: Any, ctx: _NormCtx, *, path: tuple[str, ...] = (), pid_field: 
             if exception_message and key == "message":
                 continue
             new_key = _text(key, ctx) if isinstance(key, str) else key
-            child_path = path + (str(new_key),)
             # pid_field 沿子樹傳遞：foreign_holders 的值為 {tty 路徑: 持有者 PID}，PID 位於其直接子值。
             # 子樹內只有 PID 欄位（schema 對 holder 物件 additionalProperties:false），故不會誤佔位非 PID 整數。
             is_pid_field = pid_field or (isinstance(key, str) and key in ctx.pid_fields)
-            grouped.setdefault(new_key, []).append(
-                _strip(child, ctx, path=child_path, pid_field=is_pid_field)
-            )
+            grouped.setdefault(new_key, []).append(_strip(child, ctx, pid_field=is_pid_field))
         return {
             key: children[0] if len(children) == 1 else sorted(children, key=_canonical)
             for key, children in grouped.items()
         }
     if isinstance(value, list):
-        return [
-            _strip(item, ctx, path=path + (str(index),), pid_field=pid_field)
-            for index, item in enumerate(value)
-        ]
+        items = [_strip(item, ctx, pid_field=pid_field) for item in value]
+        if pid_field and all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+            return sorted(items, key=_canonical)
+        return items
     if isinstance(value, str):
         return _text(value, ctx)
     return value
@@ -391,7 +469,9 @@ def _normalize(obj: Any, *, rules: Mapping[str, Any], roots: Iterable[str]) -> A
         root_placeholder=str(rules.get("instance_root_placeholder") or _DEFAULT_ROOT_PLACEHOLDER),
         pty_placeholder=str(rules.get("pty_path_placeholder") or _DEFAULT_PTY_PLACEHOLDER),
     )
-    normalized = _strip(obj, ctx)
+    classes = _pid_tie_classes(obj, ctx)
+    candidates = (_render_with_labels(obj, ctx, labels) for labels in _pid_labelings(classes))
+    normalized = min(candidates, key=_canonical)
     for _, json_path in _g2_entries(rules):
         normalized = _sort_at(normalized, json_path.split("."))
     return normalized
@@ -402,7 +482,8 @@ def normalize_response(obj: Any, *, rules: Mapping[str, Any], instance_root: str
 
     - G1：error_code 為 EXCEPTION 時刪除 message（rules.g1_exception_message）。
     - G2：rules.g2_set_paths 指向的清單排序後比較；呼叫端須先依子命令過濾 rules（見 `_rules_for_call`）。
-    - volatile_keys 任意巢狀層級刪除；pid_fields 中的整數 PID 依首次出現路徑建立具名佔位映射，保留數量與關聯。
+    - volatile_keys 任意巢狀層級刪除；pid_fields 中的整數 PID 依正規化路徑多重集合分群，同群內取各排列的最小渲染結果編號，
+      保留數量與跨欄位關聯，與走訪順序及 PID 數值無關。
     - 字串中的 instance_root 換成 rules.instance_root_placeholder；`/dev/pts/N` 換成 pty_path_placeholder。
     """
     return _normalize(obj, rules=rules, roots=(instance_root,))
@@ -586,7 +667,18 @@ def _first_difference(a: Any, b: Any, path: str) -> str | None:
 
 
 def _normalized_payload(record: Mapping[str, Any], *, rules: Mapping[str, Any], roots: Iterable[str]) -> Any:
-    return _normalize(_payload_of(record), rules=rules, roots=roots)
+    payload = _payload_of(record)
+    tail = _argv_tail(record)
+    if (
+        tail[:len(_SCAN_SNAPSHOT_COMMAND)] == _SCAN_SNAPSHOT_COMMAND
+        and _poll_succeeded(record)
+        and isinstance(payload, Mapping)
+        and payload.get("ok") is True
+    ):
+        # health.status 的契約將 foreign_holders 放在回應最上層；只移除此 /proc 快照，
+        # 不把其他巢狀位置或其他命令中的同名欄位擴大成易變欄位。
+        payload = {key: value for key, value in payload.items() if key != "foreign_holders"}
+    return _normalize(payload, rules=rules, roots=roots)
 
 
 def _difference(case: str, path: str, kind: str, case_changes: Mapping[str, str]) -> dict[str, Any]:

@@ -312,75 +312,46 @@ def test_poll_status_transition_is_not_collapsed(tmp_path):
     assert result["differences"]
 
 
-def test_foreign_holder_pid_mapping_preserves_identity_relations(tmp_path):
-    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
-    _equalize_reports(a_dir, b_dir)
-    case_id = _case_ids(a_dir)[0]
-    _set_cli_calls(
-        a_dir,
-        case_id,
-        [{"argv": ["daemon", "status"], "rc": 0, "response": {
-            "foreign_holders": {
-                "COM0": {"device": "COM0", "holder_unknown": True, "pids": [101, 202]},
-                "COM1": {"device": "COM1", "holder_unknown": True, "pids": [202]},
-            },
-        }}],
-    )
-    _set_cli_calls(
-        b_dir,
-        case_id,
-        [{"argv": ["daemon", "status"], "rc": 0, "response": {
-            "foreign_holders": {
-                "COM0": {"device": "COM0", "holder_unknown": True, "pids": [301, 402]},
-                "COM1": {"device": "COM1", "holder_unknown": True, "pids": [402]},
-            },
-        }}],
-    )
-
-    equivalent = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
-    assert equivalent["differences"] == []
-
-    _set_cli_calls(
-        b_dir,
-        case_id,
-        [{"argv": ["daemon", "status"], "rc": 0, "response": {
-            "foreign_holders": {
-                "COM0": {"device": "COM0", "holder_unknown": True, "pids": [301, 402]},
-                "COM1": {"device": "COM1", "holder_unknown": True, "pids": [301]},
-            },
-        }}],
-    )
-    different_relation = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
-
-    assert different_relation["differences"]
-
-
 @pytest.mark.parametrize(
     "a_holders,b_holders",
     [
-        ({"COM0": {"device": "COM0", "holder_unknown": True, "pids": []}}, {}),
-        ({}, {"COM0": {"device": "COM0", "holder_unknown": True, "pids": []}}),
         (
-            {"COM0": {"device": "COM0", "holder_unknown": True, "pids": []}},
-            {"COM0": {"device": "COM0", "holder_unknown": False, "pids": []}},
+            {},
+            {"/dev/pts/20": {"device": "/dev/pts/20", "holder_unknown": True}},
+        ),
+        (
+            {"/dev/pts/20": {"device": "/dev/pts/20", "holder_unknown": True}},
+            {"/dev/pts/24": {"device": "/dev/pts/24", "holder_unknown": True, "pids": [4102]}},
+        ),
+        (
+            {"/dev/pts/20": {"device": "/dev/pts/20", "holder_unknown": True, "pids": [4102]}},
+            {"/dev/pts/24": {"device": "/dev/pts/24", "holder_unknown": True, "pids": [5203, 5204]}},
         ),
     ],
-    ids=["missing-holder", "extra-holder", "holder-unknown-changed"],
+    ids=["empty-to-holder", "no-pids-to-pids", "pid-scan-changes"],
 )
-def test_foreign_holder_structure_changes_are_differences(tmp_path, a_holders, b_holders):
+def test_foreign_holders_scan_snapshot_flapping_is_ignored(tmp_path, a_holders, b_holders):
+    """A/A 的 /proc 快照可在空值、無 pids 與含 pids 間變動，不得形成產品差異。
+
+    欄位形狀取自 261023 的 l15-reject-zero-tx 與 l15-release-inflight 報告。
+    """
     ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
     _equalize_reports(a_dir, b_dir)
     case_id = _case_ids(a_dir)[0]
     _set_cli_calls(a_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0, "response": {
+        "ok": True,
+        "pid": 4100,
         "foreign_holders": a_holders,
     }}])
     _set_cli_calls(b_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0, "response": {
+        "ok": True,
+        "pid": 4100,
         "foreign_holders": b_holders,
     }}])
 
     result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
 
-    assert result["differences"]
+    assert result["differences"] == []
 
 
 def _device_still_held(pids: list[int], *, holder_unknown: bool = True) -> dict[str, Any]:
@@ -421,6 +392,56 @@ def test_device_still_held_pid_identity_relation_is_difference(tmp_path):
     assert result["differences"]
 
 
+def test_device_still_held_missing_pids_differs_from_empty_list(tmp_path):
+    """DEVICE_STILL_HELD 的 pids 欄位結構保留；缺欄不得與空清單相等。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["device", "attach", "--selector", "COM0"], "rc": 1}
+    a_response = _device_still_held([])
+    b_response = _device_still_held([])
+    b_response.pop("pids")
+    _set_cli_calls(a_dir, case_id, [{**call, "response": a_response}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": b_response}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_device_still_held_distinct_pids_differ_from_duplicate_pid(tmp_path):
+    """DEVICE_STILL_HELD 的兩個不同 holder PID 不得與重複同一 PID 正規化成相同結果。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["device", "attach", "--selector", "COM0"], "rc": 1}
+    _set_cli_calls(a_dir, case_id, [{**call, "response": _device_still_held([101, 202])}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": _device_still_held([101, 101])}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+@pytest.mark.parametrize(
+    "a_pids,b_pids",
+    [([101, 202], [303, 404]), ([101, 202], [202, 101])],
+    ids=["different-runtime-pids", "pids-list-permutation"],
+)
+def test_device_still_held_same_pid_relation_is_equal(tmp_path, a_pids, b_pids):
+    """A/A 的 PID 數量與重複關係相同時，實際 PID 值及清單順序不構成差異。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["device", "attach", "--selector", "COM0"], "rc": 1}
+    _set_cli_calls(a_dir, case_id, [{**call, "response": _device_still_held(a_pids)}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": _device_still_held(b_pids)}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"] == []
+
+
 def test_device_still_held_holder_unknown_flip_is_difference(tmp_path):
     """回歸（24f42d0 Medium）：holder_unknown 由 true 變 false 須判為差異。"""
     ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
@@ -435,17 +456,16 @@ def test_device_still_held_holder_unknown_flip_is_difference(tmp_path):
     assert result["differences"]
 
 
-def test_foreign_holder_daemon_pid_value_is_aliased(tmp_path):
-    """foreign_holders 的一般值為持有者整數 PID（RPC-D-10，含 daemon 自身 pid）；每次執行 PID 變動，
-    但與 pid 的關聯不變時不得判為差異。"""
+def test_health_status_daemon_pid_value_is_aliased(tmp_path):
+    """health.status 的 daemon PID 是每次執行都會變動的數值，不應單獨形成差異。"""
     ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
     _equalize_reports(a_dir, b_dir)
     case_id = _case_ids(a_dir)[0]
     _set_cli_calls(a_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
-        "ok": True, "pid": 10, "foreign_holders": {"/dev/pts/1": 10},
+        "ok": True, "pid": 10,
     }}])
     _set_cli_calls(b_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
-        "ok": True, "pid": 20, "foreign_holders": {"/dev/pts/2": 20},
+        "ok": True, "pid": 20,
     }}])
 
     result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
@@ -453,21 +473,102 @@ def test_foreign_holder_daemon_pid_value_is_aliased(tmp_path):
     assert result["differences"] == []
 
 
-def test_foreign_holder_pid_relation_to_daemon_pid_is_difference(tmp_path):
-    """foreign_holders 的整數 PID 與 daemon pid 的關聯改變（B 的持有者不是 daemon 自身）須判為差異。"""
+def test_foreign_holder_pid_relation_in_scan_snapshot_is_volatile(tmp_path):
+    """掃描快照中 holder PID 與 daemon PID 的關係隨 /proc 掃描變動，不是差分契約。"""
     ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
     _equalize_reports(a_dir, b_dir)
     case_id = _case_ids(a_dir)[0]
-    _set_cli_calls(a_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
+    _set_cli_calls(a_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0, "response": {
         "ok": True, "pid": 10, "foreign_holders": {"/dev/pts/1": 10},
     }}])
-    _set_cli_calls(b_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
+    _set_cli_calls(b_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0, "response": {
         "ok": True, "pid": 10, "foreign_holders": {"/dev/pts/1": 30},
     }}])
 
     result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
 
+    assert result["differences"] == []
+
+
+def test_device_still_held_foreign_holders_are_compared_strictly(tmp_path):
+    """foreign_holders 只在成功的 daemon status 快照中易變；DEVICE_STILL_HELD 回應中持有者與空值不得相等。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["device", "attach", "--selector", "COM0"], "rc": 1}
+    _set_cli_calls(a_dir, case_id, [{**call, "response": {
+        **_device_still_held([101]), "foreign_holders": {"/dev/pts/20": 101},
+    }}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": {
+        **_device_still_held([101]), "foreign_holders": {},
+    }}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
     assert result["differences"]
+
+
+def test_daemon_status_error_response_compares_foreign_holders_strictly(tmp_path):
+    """daemon status 的錯誤回應不屬於掃描快照情境，其 foreign_holders 仍須嚴格比較。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    _set_cli_calls(a_dir, case_id, [{"argv": ["daemon", "status"], "rc": 1, "response": {
+        "ok": False, "error_code": "EXCEPTION", "message": "x", "foreign_holders": {},
+    }}])
+    _set_cli_calls(b_dir, case_id, [{"argv": ["daemon", "status"], "rc": 1, "response": {
+        "ok": False, "error_code": "EXCEPTION", "message": "x",
+        "foreign_holders": {"/dev/pts/24": 4102},
+    }}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_daemon_status_nested_foreign_holders_remain_strict(tmp_path):
+    """成功 daemon status 僅忽略回應最上層的掃描欄位，巢狀同名欄位仍須比較。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["daemon", "status"], "rc": 0}
+    _set_cli_calls(a_dir, case_id, [{**call, "response": {
+        "ok": True,
+        "foreign_holders": {"/dev/pts/20": 4102},
+        "metadata": {"foreign_holders": {"source": "A"}},
+    }}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": {
+        "ok": True,
+        "foreign_holders": {"/dev/pts/24": 5203},
+        "metadata": {"foreign_holders": {"source": "B"}},
+    }}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_daemon_status_polls_with_flapping_snapshot_collapse(tmp_path):
+    """連續成功的 daemon status 輪詢若只有 foreign_holders 不同，應收斂為單筆，與另一側單次輪詢的呼叫數一致。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    status = {"argv": ["daemon", "status"], "rc": 0}
+    _set_cli_calls(a_dir, case_id, [
+        {**status, "response": {"ok": True, "pid": 4100, "foreign_holders": {}}},
+        {**status, "response": {"ok": True, "pid": 4100, "foreign_holders": {
+            "/dev/pts/24": {"device": "/dev/pts/24", "holder_unknown": True, "pids": [4102]},
+        }}},
+    ])
+    _set_cli_calls(b_dir, case_id, [
+        {**status, "response": {"ok": True, "pid": 4100, "foreign_holders": {
+            "/dev/pts/9": {"device": "/dev/pts/9", "holder_unknown": True},
+        }}},
+    ])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"] == []
 
 
 def test_difference_attributed_to_case_change(tmp_path):

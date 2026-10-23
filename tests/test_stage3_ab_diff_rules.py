@@ -100,6 +100,66 @@ def _sides(tmp_path: Path) -> tuple[Path, Path]:
     return tmp_path / "reports" / "A", tmp_path / "reports" / "B"
 
 
+def _pid_test_rules() -> dict[str, Any]:
+    """直接以正規化器驗證 PID 佔位；foreign_holders 不在 volatile_keys 中，仍逐一參與 PID 佔位。"""
+    return ab_diff.load_rules(RULES_PATH)
+
+
+def test_pid_identity_survives_normalized_tty_key_collision(tmp_path):
+    """兩個 PTY key 取代成同一鍵後，兩個 PID 仍須與重複同一 PID 不同。"""
+    rules = _pid_test_rules()
+    distinct = ab_diff.normalize_response(
+        {"foreign_holders": {"/dev/pts/20": 101, "/dev/pts/24": 202}},
+        rules=rules,
+        instance_root=str(tmp_path / "instance"),
+    )
+    repeated = ab_diff.normalize_response(
+        {"foreign_holders": {"/dev/pts/24": 101, "/dev/pts/20": 101}},
+        rules=rules,
+        instance_root=str(tmp_path / "instance"),
+    )
+
+    assert distinct != repeated
+
+
+def test_pid_aliases_are_invariant_to_runtime_values_and_list_order(tmp_path):
+    """PID 數值、dict 插入次序與 pids 陣列次序改變時，相同 PID 關係仍須正規化相同。"""
+    rules = _pid_test_rules()
+    a = {
+        "pid": 101,
+        "pids": [101, 202],
+        "foreign_holders": {"COM0": 101, "COM1": 202},
+    }
+    b = {
+        "foreign_holders": {"COM1": 404, "COM0": 303},
+        "pids": [404, 303],
+        "pid": 303,
+    }
+
+    normalized_a = ab_diff.normalize_response(a, rules=rules, instance_root=str(tmp_path / "instance"))
+    normalized_b = ab_diff.normalize_response(b, rules=rules, instance_root=str(tmp_path / "instance"))
+
+    assert normalized_a == normalized_b
+
+
+def test_pid_labels_are_canonical_under_tty_key_collision(tmp_path):
+    """同簽章 PID 因 PTY 鍵碰撞合併時，相同持有者關聯（兩人同群一人獨立）與 PTY 編號不同，正規化結果須相同。"""
+    rules = _pid_test_rules()
+    a = {"foreign_holders": {
+        "/dev/pts/1": {"device": "/dev/pts/1", "holder_unknown": True, "pids": [101, 202]},
+        "/dev/pts/2": {"device": "/dev/pts/2", "holder_unknown": True, "pids": [303]},
+    }}
+    b = {"foreign_holders": {
+        "/dev/pts/1": {"device": "/dev/pts/1", "holder_unknown": True, "pids": [9001]},
+        "/dev/pts/2": {"device": "/dev/pts/2", "holder_unknown": True, "pids": [9002, 9003]},
+    }}
+
+    normalized_a = ab_diff.normalize_response(a, rules=rules, instance_root=str(tmp_path / "instance"))
+    normalized_b = ab_diff.normalize_response(b, rules=rules, instance_root=str(tmp_path / "instance"))
+
+    assert normalized_a == normalized_b
+
+
 def test_identical_fixture_is_ok(tmp_path):
     a_dir, b_dir = _sides(tmp_path)
     _write_run(a_dir)

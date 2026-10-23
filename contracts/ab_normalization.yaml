@@ -25,8 +25,10 @@ reviewed_by: null
 # 套用於任何 error_code == "EXCEPTION" 的 JSON 物件（例：RPC-H-08、RPC-H-11）。
 g1_exception_message: true
 
-# PID 值在不同執行間會變動；依首次出現的 JSON 路徑替每個不同整數 PID 建立佔位名稱，保留數量與跨欄位關聯。
+# PID 值在不同執行間會變動；以各 PID 在正規化路徑（PTY 鍵與清單索引視為同位置）上的多重集合分群編號，
+# 同群內取各排列的最小渲染結果，保留數量與跨欄位關聯，與走訪順序及 PID 數值無關（所有同簽章群組的排列數乘積超過 720 時此保證不適用）。
 # foreign_holders 的一般值為以 tty 路徑為鍵、持有者 PID 為值的整數（RPC-D-10，含 daemon 自身 pid），整個子樹視為 PID 欄位。
+# foreign_holders 同時為情境易變欄位（僅成功 daemon status／RPC health.status 回應的最上層欄位）；其餘情境與巢狀同名欄位仍嚴格比較。
 pid_fields: [pid, pids, foreign_holders]
 
 # G2（spec-reconciliation.md 通則 G2）：Python 中順序未定義的集合，比較時以集合（排序後）比對。
@@ -71,8 +73,10 @@ volatile_keys:
   - rx_rate_bps
   - boot_quiet_remaining_s
   - ready_reconfirm_remaining_s
-  # host /proc 掃描觀測（非 DUT 行為）：foreign_holders 可能受掃描時序影響，但保留結構供差分，
-  # 以免遮蔽 holder 數量與未知狀態；multi_open_detail 列出當下同機其他 serialwrapd 行程，仍視為易變資訊。
+  # host /proc 掃描觀測（非 DUT 行為）：multi_open_detail 列出同機其他 serialwrapd 行程，取決於當下 host 上跑什麼。
+  # foreign_holders 不在此列：其存在與否隨掃描時序變動（相鄰 run 會一次有、一次無），僅忽略成功 daemon status／RPC health.status
+  # 回應最上層的欄位；DEVICE_STILL_HELD 等錯誤回應及其他巢狀同名欄位仍嚴格比較。
+  # 注意：L1.5 A/B 不比較 multi_open_detail 與成功 status 回應最上層的 foreign_holders；若要比較前者，須另以不依賴 host 掃描時序的確定性案例覆蓋。
   - multi_open_detail
   # daemon status 首次快照的 WAL 序號：啟動期寫入的非同步時序決定快照值（相鄰 run 為 0／4／5），
   # 最終 WAL 內容每次皆為 11 筆；WAL 內容由 comparison.v1 逐筆比對，不由此欄位判定。
