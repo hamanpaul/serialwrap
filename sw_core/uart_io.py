@@ -1412,33 +1412,47 @@ class UARTBridge:
         with self._state_lock:
             return self._console_endpoint
 
-    def _enumerate_all_held_paths(self) -> set[str] | None:
-        """掃描 /proc，回傳所有外部 process 持有的 fd readlink 目標集合（排除自身 pid）。
+    def _enumerate_all_held_paths(self, *, proc_root: str = "/proc") -> set[str] | None:
+        """掃描 procfs，回傳外部 process 持有的 tty 路徑字串集合（排除自身 pid）。
 
-        procfs 不可用時回傳 None（呼叫端據此採保守策略）。本函式不取任何鎖，純讀 /proc；
+        #R2：fd 的 readlink 字串只是「該行程 mount namespace 內」的路徑，不足以代表本 daemon 所見的 tty。
+        一條 fd 只有在「該字串於本 daemon 命名空間中 stat 到的 inode」與「fd 實際指向的 inode」相同時才計入；
+        因此容器內獨立 devpts instance 的 /dev/pts/N（與主機同名）不會被誤判為本 daemon console 的 peer。
+        procfs 不可用時回傳 None（呼叫端據此採保守策略）。本函式不取任何鎖，純讀 procfs；
         呼叫端自行決定是否在 _state_lock 內外呼叫（reaper 走鎖外、_client_has_external_peer_locked
         既有行為走鎖內，均不變）。
         """
         held: set[str] = set()
         self_pid = os.getpid()
         try:
-            pids = os.listdir("/proc")
+            pids = os.listdir(proc_root)
         except OSError:
             return None
         for pid_text in pids:
             if not pid_text.isdigit() or int(pid_text) == self_pid:
                 continue
-            fd_dir = os.path.join("/proc", pid_text, "fd")
+            fd_dir = os.path.join(proc_root, pid_text, "fd")
             try:
                 fd_names = os.listdir(fd_dir)
             except OSError:
                 continue
             for fd_name in fd_names:
+                fd_path = os.path.join(fd_dir, fd_name)
                 try:
-                    target = os.readlink(os.path.join(fd_dir, fd_name))
+                    target = os.readlink(fd_path)
                 except OSError:
                     continue
-                held.add(target)
+                # 先以字串篩掉非 tty 的 link（pipe:／socket:／anon_inode:／一般檔案），只對 /dev/ 下的
+                # 路徑才做 stat，避免 reaper 週期性地對 NFS／FUSE／9p 等 inode 做多餘 syscall（#R2 效能）。
+                if not target.startswith("/dev/"):
+                    continue
+                try:
+                    fd_stat = os.stat(fd_path)
+                    tgt_stat = os.stat(target)
+                except OSError:
+                    continue
+                if serial_port_mod.same_tty(fd_stat, tgt_stat):
+                    held.add(target)
         return held
 
     def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:
