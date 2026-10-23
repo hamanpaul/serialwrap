@@ -959,8 +959,9 @@ conformance `serial_suite` 內含下列斷言（每列一個子檢查，失敗�
 | `roundtrip_tx` | `write(b"hello\n")` → `Completed(6)`、`error None`；peer 讀到 `b"hello\n"` |
 | `roundtrip_rx` | peer 寫 `b"\x00\xff\r\n"` → `read` 回 `Data(4)` 且內容相同 |
 | `read_timeout` | 無資料 `read(Some(200ms))` 回 `TimedOut`，耗時 ∈ [180, 400] ms |
+| `read_timeout_respects_caller_deadline` | 無資料 `read(Some(500ms))` 回 `TimedOut`，耗時 ∈ [480, 700] ms；Windows 的 200 ms COM idle timeout 不得提早返回 |
 | `close_once` | `CloseToken::close(r, w)` 回 `closed:true`、`excl_cleared:true`、`error:None`；**peer 端（PTY master／COM pair 對端）全程保持開啟**下，之後同一路徑可再次 `open_exclusive` 成功（POSIX 若關閉前未 TIOCNXCL，此處得 `Held`，R0-F3） |
-| `eof_not_bridge_down` | peer 關閉後 `read` 回 `Ok(Eof)`（呼叫端不得當成 I/O error，UIO-12.10-d KEEP） |
+| `eof_not_bridge_down` | 由測試 pair capability 決定：POSIX PTY／fake 關閉後回 `Ok(Eof)`；Windows COM 對端關閉後仍存活，回 `Ok(TimedOut)`。不得依編譯目標判斷，因 Windows host 上的 fake 仍回 EOF |
 | `cancel_before_write` | 寫前已 cancel：`write` 回 `Completed(0)` 且 `error.kind == Cancelled`，peer 讀不到任何 byte |
 | `gate_revoked_never_reaches_os`（R0-F1） | 以永遠回 `Err(SubmitRevoked)` 的計數 gate 呼叫 `write_gated(b"zz\n", ..)` → `NotSubmitted`、`error None`、gate 被呼叫恰 1 次、peer 於 300 ms 內讀不到任何 byte |
 | `gate_wraps_every_os_submit`（R0-F1） | 計數 gate（放行並記錄閉包執行次數）寫 64 KiB → `Completed(65536)`；閉包執行次數 ≥ 1 且等於 PAL 實際 syscall／`WriteFile` 發出次數（PAL 內 debug 計數器）；peer 讀到完整 bytes |
@@ -1134,7 +1135,8 @@ pub fn comm_timeouts_model() -> CommTimeoutsModel;
 pub fn win_device_name(path: &str) -> String;                         // _win_device_name
 pub fn map_open_error(win32: u32, py_message: String) -> OpenErrorKind; // 純映射
 pub enum OpenErrorKind { NotFound, AccessDenied, Other }
-pub fn map_overlapped_completion(get_result_ok: bool, transferred: u32, win32: u32) -> (TxOutcome, Option<PalErrorKind>);
+pub fn map_overlapped_completion(get_result_ok: bool, transferred: u32, win32: u32) -> (TxOutcome, Option<PalErrorKind>); // 無本地取消資訊；995 保守回 Unknown + Io
+pub fn map_overlapped_write_completion(get_result_ok: bool, transferred: u32, requested: usize, win32: u32, cancel_requested: bool) -> (TxOutcome, Option<PalErrorKind>); // 只有本地 CancelIoEx 成功才能把 995 分類為取消
 ```
 
 - [ ] **Step 1：寫失敗測試**
@@ -1181,8 +1183,10 @@ fn access_denied_is_not_a_holder_claim() {
 #[test]
 fn overlapped_completion_mapping() {
     assert_eq!(map_overlapped_completion(true, 10, 0), (TxOutcome::Completed(10), None));
-    assert_eq!(map_overlapped_completion(false, 4, 995), (TxOutcome::Completed(4), Some(PalErrorKind::Cancelled))); // ERROR_OPERATION_ABORTED
+    assert_eq!(map_overlapped_completion(false, 4, 995), (TxOutcome::Unknown { confirmed: 0 }, Some(PalErrorKind::Io))); // 995 來源不明，禁止推定為本地取消
     assert_eq!(map_overlapped_completion(true, 3, 1460), (TxOutcome::Completed(3), Some(PalErrorKind::TimedOut))); // 寫逾時：部分完成
+    assert_eq!(map_overlapped_write_completion(true, 3, 10, 0, false), (TxOutcome::Completed(3), Some(PalErrorKind::TimedOut))); // 成功短寫不可重送餘段
+    assert_eq!(map_overlapped_write_completion(false, 4, 10, 995, true), (TxOutcome::Completed(4), Some(PalErrorKind::Cancelled))); // 本地取消成功且 bytes 已確認
     assert_eq!(map_overlapped_completion(false, 0, 1617), (TxOutcome::Unknown { confirmed: 0 }, Some(PalErrorKind::Io))); // ERROR_DEVICE_REMOVED：長度不可信
     assert_eq!(map_overlapped_completion(false, 0, 22), (TxOutcome::Unknown { confirmed: 0 }, Some(PalErrorKind::Io)));   // ERROR_BAD_COMMAND
 }
@@ -1195,28 +1199,29 @@ Windows 原生（`#[cfg(windows)]` 區段，經 `scripts/rust/win-test.sh` 執�
 | `nonexistent_com_is_not_found` | memory_only（原生） | `open_exclusive(DevicePath("COM250"))` → `Err(OpenError::NotFound(e))`，`e.py_message` 以 `"[WinError 2] "` 開頭 |
 | `share_mode_zero_requested` | memory_only（原生） | 以內部 `create_file_args(&dev)` 取得旗標：`share_mode == 0`、`disposition == OPEN_EXISTING`、`flags & FILE_FLAG_OVERLAPPED != 0`、`access == GENERIC_READ|GENERIC_WRITE` |
 | `cap_windows_com__second_open_access_denied` | windows_com | 已開 COMa 時再 `open_exclusive(COMa)` → `AccessDenied{holder: {pids: [], holder_unknown: true, status: Unsupported}}` |
-| `cap_windows_com__cancel_pending_read_returns_woken` | windows_com | reader 等待中 `waker.wake()` → `Woken`，且同一 OVERLAPPED 於回傳前已 `GetOverlappedResult(bWait=TRUE)`（內部計數 `pending_ops == 0`） |
+| `cap_windows_com__cancel_pending_read_returns_woken` | windows_com | reader 等待中 `waker.wake()` → `Woken`；`read(None)` 經過 200 ms COM idle timeout 仍持續等待；且同一 OVERLAPPED 於回傳前已 `GetOverlappedResult(bWait=TRUE)`（內部計數 `pending_ops == 0`） |
 | `cap_windows_com__cancel_blocked_write_partial` | windows_com | 對端停止讀、RTS/CTS 流控下寫 1 MiB → cancel → `Completed(n)`，`0 < n < 1 MiB`，`error.kind == Cancelled` |
+| `cap_windows_com__gate_revoke_after_pending_write_reaps_and_accounts` | windows_com | gate 在 OS 回報 `Pending` 後撤銷：收斂 OVERLAPPED，結果不得為 `NotSubmitted`，並保留先前已確認 bytes |
 | `cap_windows_com__conformance_suite` | windows_com | `serial_suite(native().serial, com_pair_factory("SW_TEST_COM_PAIR"))` |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
-Run：`cargo test -p sw-pal --features test-fakes --test serial_windows` 與 `scripts/rust/win-test.sh --package sw-pal`
+Run：`cargo test -p sw-pal --features test-fakes --test serial_windows` 與 `scripts/rust/win-test.sh --package sw-pal -- --features test-fakes --lib --test serial_windows`
 Expected：FAIL，`not implemented: slice21 T3 dcb_model`。
 
 - [ ] **Step 3：實作**
 
 - 開啟：`CreateFileW(win_device_name, GENERIC_READ|GENERIC_WRITE, 0, null, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0)`；失敗依 `map_open_error`：`AccessDenied` → `OpenError::AccessDenied{os, holder: HolderReport{pids: vec![], holder_unknown: true, status: Unsupported}}`；成功後 `GetCommState` → 套 `dcb_model` → `SetCommState`；`SetCommTimeouts(comm_timeouts_model())`；`SetupComm(4096, 4096)`；`PurgeComm` **不呼叫**（對齊 POSIX 不 tcflush）。
 - I/O 執行緒模型（arch §1.4）：reader 與 writer 各自持有專屬 `OVERLAPPED`＋manual-reset event 與 buffer，生命週期綁在物件上，`Drop` 前保證無在途 I/O。
-- reader：`ReadFile(h, buf, len, null, &ov)` → `ERROR_IO_PENDING` 時 `WaitForMultipleObjects([ov.hEvent, wake_event], FALSE, timeout)`；wake → `CancelIoEx(h, &ov)` → `GetOverlappedResult(h, &ov, &n, TRUE)` → n>0 回 `Data(n)`（已完成 bytes 不丟），否則 `Woken`；io event → `GetOverlappedResult(..., FALSE)`，`n==0` 回 `TimedOut`（COMMTIMEOUTS 200 ms 到期）。
-- writer（`write_gated`）：`WriteFile(..., &ov)` 的**發出**放在 `gate.submit` 閉包內（同步完成 → `Accepted(n)`；`ERROR_IO_PENDING` → `Pending`；其他錯誤 → `Failed`），gate 撤銷時不呼叫 `WriteFile`（R0-F1）；閉包返回、放鎖後才在 gate 外等 `[ov.hEvent, wake_event]`（無逾時，寫逾時由 COMMTIMEOUTS 5000 ms 處理）；wake 且已 cancel → `CancelIoEx` → `GetOverlappedResult(bWait=TRUE)` → `map_overlapped_completion`；完成後若 `transferred < len` 且無錯 → 剩餘 bytes 以新的 `gate.submit` 重驗後再發出（撤銷則 `Completed(sent)`＋`cancelled`，累計 sent）。
+- reader：`ReadFile(h, buf, len, null, &ov)` → `ERROR_IO_PENDING` 時 `WaitForMultipleObjects([ov.hEvent, wake_event], FALSE, caller_remaining_timeout)`；wake → `CancelIoEx(h, &ov)` → `GetOverlappedResult(h, &ov, &n, TRUE)` → n>0 回 `Data(n)`（已完成 bytes 不丟），否則 `Woken`；io event 的 `n==0` 是 COMMTIMEOUTS 200 ms idle timeout，若呼叫端期限尚未到（或 timeout 為 `None`）就重發 `ReadFile`；只有呼叫端期限到達才回 `TimedOut`。
+- writer（`write_gated`）：每次至多提交 64 bytes（對齊 Python 基線 `PYSERIAL_SUBMIT_CHUNK`），每個 `WriteFile(..., &ov)` 的**發出**都在 `gate.submit` 閉包內（同步完成 → `Accepted(n)`；`ERROR_IO_PENDING` → `Pending`；其他錯誤 → `Failed`），gate 撤銷時不呼叫 `WriteFile`（R0-F1）；閉包返回、放鎖後才在 gate 外等 `[ov.hEvent, wake_event]`（無逾時，寫逾時由 COMMTIMEOUTS 5000 ms 處理）；wake 且已 cancel → `CancelIoEx` → `GetOverlappedResult(bWait=TRUE)` → `map_overlapped_write_completion`。任何已確認的成功短寫或 timeout 部分完成都是終止結果，不重送同一 chunk 的餘段；只有整個 chunk 完成後才用新的 `gate.submit` 重驗並提交下一個 chunk。gate 撤銷後不再送尾段，已確認 bytes 計入 `Completed(sent)`；尚有在途操作時先 CancelIoEx 並收斂，無法確認長度則回 `Unknown{confirmed: sent}`。
 - `CloseToken::close`：確認 reader／writer 已 drop（無在途 OVERLAPPED）→ `CloseHandle`；成功 → `closed:true, excl_cleared:true`（`dwShareMode=0` 的限制隨 handle 關閉解除）；失敗 → `closed:false, excl_cleared:false`。
 - `probe_holders` 恆回 `{pids: [], holder_unknown: true, status: Unsupported}`。
 - `set_baud`：`GetCommState`／改 `BaudRate`／`SetCommState`。
 
 - [ ] **Step 4：執行並確認 PASS**
 
-Run：`cargo test -p sw-pal --features test-fakes --test serial_windows && scripts/rust/win-test.sh --package sw-pal`
+Run：`cargo test -p sw-pal --features test-fakes --test serial_windows && scripts/rust/win-test.sh --package sw-pal -- --features test-fakes --lib --test serial_windows`
 Expected：PASS；`target/win-test-report/<run_id>.json` 中 `cap_windows_com__*` 為 `ignored`（未提供 `SW_TEST_COM_PAIR`），報告欄 `caps` 標「證據不足」。
 
 擁有者 host 第二段（OD-15，orchestrator 代跑）：同一指令加 `SW_TEST_COM_PAIR=COM20:COM21` 重跑，Expected：`cap_windows_com__*` 全部實際執行（非 `ignored`），`cap_windows_com__open_exclusive_*` 斷言第二次開啟 `ERROR_ACCESS_DENIED`；報告 `caps.windows_com` 記 `pair:"COM20:COM21"`、Windows build、HVCI 狀態。結果為 FAIL 時屬真實缺陷，不得改標「證據不足」。

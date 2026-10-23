@@ -15,6 +15,12 @@ use crate::traits::{
 
 type Pair<'a> = &'a dyn Fn() -> (DevicePath, Box<dyn PeerEnd>);
 
+#[derive(Clone, Copy)]
+pub struct SerialPairCaps {
+    /// 對端關閉時，後端是否會以 `ReadOutcome::Eof` 回報 EOF。
+    pub eof_on_peer_close: bool,
+}
+
 type Parts = (
     Box<dyn SerialReader>,
     Box<dyn SerialWriter>,
@@ -87,6 +93,25 @@ fn read_timeout(be: &dyn SerialBackend, pair: Pair) {
     close.close(r, w);
 }
 
+/// Windows 200 ms COM idle timeout 不得提早結束呼叫端的 500 ms 期限。
+fn read_timeout_respects_caller_deadline(be: &dyn SerialBackend, pair: Pair) {
+    let (dev, _peer) = pair();
+    let (mut r, w, _waker, close) = open_split(be, &dev, "read_timeout_respects_caller_deadline");
+    let mut buf = [0u8; 8];
+    let start = Instant::now();
+    let outcome = r.read(&mut buf, Some(Duration::from_millis(500)));
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(outcome, Ok(ReadOutcome::TimedOut)),
+        "[read_timeout_respects_caller_deadline] 應回 TimedOut，實際 {outcome:?}"
+    );
+    assert!(
+        (Duration::from_millis(480)..=Duration::from_millis(700)).contains(&elapsed),
+        "[read_timeout_respects_caller_deadline] 期限提前或超時：{elapsed:?}"
+    );
+    close.close(r, w);
+}
+
 /// `close` 回 `closed:true`、`excl_cleared:true`、`error:None`；peer 保持開啟，之後同一路徑可再次 `open_exclusive`。
 fn close_once(be: &dyn SerialBackend, pair: Pair) {
     let (dev, _peer) = pair();
@@ -100,16 +125,22 @@ fn close_once(be: &dyn SerialBackend, pair: Pair) {
     close2.close(r2, w2);
 }
 
-/// peer 關閉後 `read` 回 `Ok(Eof)`（呼叫端不得當成 I/O error，UIO-12.10-d KEEP）。
-fn eof_not_bridge_down(be: &dyn SerialBackend, pair: Pair) {
+/// peer 關閉後 POSIX PTY 回 `Eof`；Windows COM 仍存在，依序列埠 timeout 回 `TimedOut`。
+fn eof_not_bridge_down(be: &dyn SerialBackend, pair: Pair, caps: SerialPairCaps) {
     let (dev, peer) = pair();
     let (mut r, w, _waker, close) = open_split(be, &dev, "eof_not_bridge_down");
     drop(peer);
     let mut buf = [0u8; 8];
-    match r.read(&mut buf, Some(Duration::from_millis(500))) {
-        Ok(ReadOutcome::Eof) => {}
-        other => panic!("[eof_not_bridge_down] peer 關閉後應為 Ok(Eof)，實際 {other:?}"),
-    }
+    let outcome = r.read(&mut buf, Some(Duration::from_millis(500)));
+    let expected = if caps.eof_on_peer_close {
+        ReadOutcome::Eof
+    } else {
+        ReadOutcome::TimedOut
+    };
+    assert!(
+        matches!(&outcome, Ok(actual) if *actual == expected),
+        "[eof_not_bridge_down] peer 關閉後預期 {expected:?}，實際 {outcome:?}"
+    );
     close.close(r, w);
 }
 
@@ -204,7 +235,7 @@ fn gate_revoked_never_reaches_os(be: &dyn SerialBackend, pair: Pair) {
     close.close(r, w);
 }
 
-/// 計數 gate 放行寫 64 KiB：`Completed(65536)`、無 error；POSIX 原生執行時核對閉包與 syscall 計數。
+/// 計數 gate 放行寫 64 KiB：`Completed(65536)`、無 error；原生執行時核對閉包與 syscall 計數。
 fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
     let (dev, mut peer) = pair();
     let (r, mut w, waker, close) = open_split(be, &dev, "gate_wraps_every_os_submit");
@@ -221,7 +252,12 @@ fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
             let result = w.write_gated(&payload, &cancel, &gate);
             #[cfg(all(unix, any(test, feature = "test-fakes")))]
             let syscalls = crate::serial::posix::take_debug_tx_write_count();
-            #[cfg(not(all(unix, any(test, feature = "test-fakes"))))]
+            #[cfg(all(windows, any(test, feature = "test-fakes")))]
+            let syscalls = crate::serial::windows::take_debug_tx_write_count();
+            #[cfg(not(any(
+                all(unix, any(test, feature = "test-fakes")),
+                all(windows, any(test, feature = "test-fakes"))
+            )))]
             let syscalls: Option<usize> = None;
             (result, syscalls)
         });
@@ -254,7 +290,7 @@ fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
         assert_eq!(
             gate.os_runs.load(Ordering::SeqCst),
             syscalls,
-            "[gate_wraps_every_os_submit] gate 呼叫數須等於 POSIX write(2) 次數"
+            "[gate_wraps_every_os_submit] gate 呼叫數須等於 PAL syscall 次數"
         );
     }
     assert_eq!(
@@ -270,13 +306,14 @@ fn gate_wraps_every_os_submit(be: &dyn SerialBackend, pair: Pair) {
 }
 
 /// serial conformance 全套（順序即計畫表列順序）。
-pub fn serial_suite(backend: Arc<dyn SerialBackend>, pair: Pair) {
+pub fn serial_suite(backend: Arc<dyn SerialBackend>, pair: Pair, caps: SerialPairCaps) {
     let be: &dyn SerialBackend = &*backend;
     roundtrip_tx(be, pair);
     roundtrip_rx(be, pair);
     read_timeout(be, pair);
+    read_timeout_respects_caller_deadline(be, pair);
     close_once(be, pair);
-    eof_not_bridge_down(be, pair);
+    eof_not_bridge_down(be, pair, caps);
     cancel_before_write(be, pair);
     gate_revoked_never_reaches_os(be, pair);
     gate_wraps_every_os_submit(be, pair);

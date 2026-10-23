@@ -115,7 +115,7 @@ pub struct Platform {
     pub tunnel: Arc<dyn ProcessTunnel>,
     pub service: Arc<dyn ServiceCtl>,
     pub registry: Arc<dyn RegistryView + Sync>,
-    /// 序列埠後端（arch §4.2）：POSIX 為 `PosixSerialBackend`，Windows 為 Task 3 骨架。
+    /// 序列埠後端（arch §4.2）：依平台組裝 POSIX 或 Windows overlapped 實作。
     pub serial: Arc<dyn SerialBackend>,
     /// holder 診斷（arch §4.2；`/proc` 掃描或 Windows 的 `holder_unknown`）。
     pub uart_excl: Arc<dyn UartExclusive>,
@@ -225,7 +225,7 @@ pub fn native() -> Platform {
             procs: Arc::new(WindowsProcScan::new()),
             tunnel: Arc::new(NativeProcessTunnel),
             registry: Arc::new(WinRegistryView),
-            serial: Arc::new(crate::serial::WindowsSerialStub),
+            serial: Arc::new(crate::serial::windows::WindowsSerialBackend::new()),
             uart_excl: Arc::new(crate::serial::WindowsUartExclusive),
             devices: native_devices(),
             instance_lock: crate::lock::native_instance_lock(),

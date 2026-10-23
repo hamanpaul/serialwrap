@@ -813,6 +813,7 @@ pub trait UartExclusive: Send + Sync {
 
 pub trait SerialReader: Send {
     /// 逾時以 `None` 表示無限等待；被 waker 喚醒回 `Woken`。
+    /// Windows COM 的 200 ms `COMMTIMEOUTS` idle timeout 只作內部輪詢；無資料時重發讀取，直到呼叫端期限到達。
     fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
 }
 

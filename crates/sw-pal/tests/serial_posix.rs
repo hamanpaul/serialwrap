@@ -219,10 +219,16 @@ fn cap_posix_pty__reader_woken_within_50ms() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__conformance_suite() {
-    sw_pal::conformance::serial_suite(sw_pal::native().serial.clone(), &|| {
-        let (d, p) = posix_pty_pair();
-        (d, Box::new(p) as Box<dyn PeerEnd>)
-    });
+    sw_pal::conformance::serial_suite(
+        sw_pal::native().serial.clone(),
+        &|| {
+            let (d, p) = posix_pty_pair();
+            (d, Box::new(p) as Box<dyn PeerEnd>)
+        },
+        sw_pal::conformance::SerialPairCaps {
+            eof_on_peer_close: true,
+        },
+    );
 }
 
 #[test]
@@ -231,6 +237,9 @@ fn fakes_conformance_suite() {
     sw_pal::conformance::serial_suite(
         be.clone(),
         &sw_pal::conformance::fake_pair_factory(be.clone()),
+        sw_pal::conformance::SerialPairCaps {
+            eof_on_peer_close: true,
+        },
     );
 }
 

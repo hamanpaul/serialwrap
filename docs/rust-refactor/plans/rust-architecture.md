@@ -473,6 +473,7 @@ pub trait SerialHandle: Send {
 pub enum ReadOutcome { Data(usize), Eof, Woken, TimedOut }
 pub trait SerialReader: Send {
     /// POSIX：poll([fd, wake_fd], timeout) 後 read；Windows：overlapped ReadFile + WaitForMultipleObjects([io_event, wake_event])。
+    /// Windows COM 的 200 ms idle timeout 只供內部輪詢；無資料時重發 ReadFile，直到呼叫端期限到達或被喚醒，`None` 為無限等待。
     /// 被喚醒時 Windows 先 CancelIoEx(h,&ov) 再 GetOverlappedResult(bWait=TRUE)，已完成的 bytes 照實回報，不丟棄。
     fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
 }
@@ -491,7 +492,7 @@ pub struct SubmitRevoked;                       // 原因由 gate 實作自行�
 pub struct AlwaysOpen;                          // impl SubmitGate：直接呼叫 os_submit；只供 PAL conformance 與 PAL 單元測試
 pub trait SerialWriter: Send {
     /// 寫一段 payload，直到完成、取消、失敗或被 gate 撤銷。POSIX：每次 write(2) 都經 `gate.submit`，EAGAIN 時於 gate 外
-    /// poll(POLLOUT, wake) 後再經 gate 提交下一段（每段重驗，不再無限 sleep 重試）；Windows：overlapped WriteFile 經 `gate.submit`
+    /// poll(POLLOUT, wake) 後再經 gate 提交下一段（每段重驗，不再無限 sleep 重試）；Windows：每次最多 64 bytes 的 overlapped WriteFile 經 `gate.submit`
     /// 發出，於 gate 外等 [ov.hEvent, wake]；cancel 時 CancelIoEx 後 GetOverlappedResult(bWait=TRUE)，n=已傳 bytes。
     /// 回傳值必須能區分「從未提交 OS」「OS 確認 n bytes」「結果不明」（BC-03、§5.1.4）。gate 撤銷：尚未提交任何 bytes →
     /// `NotSubmitted`；已確認 k≥1 bytes 後撤銷 → `Completed(k)`＋`PalError::cancelled()`，未提交的尾段不得再交 OS。

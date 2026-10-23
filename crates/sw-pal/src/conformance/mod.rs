@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::fakes::serial::FakeSerialBackend;
 use crate::traits::{DevicePath, HolderReport, HolderScanStatus, UartExclusive};
 
-pub use serial_suite::serial_suite;
+pub use serial_suite::{serial_suite, SerialPairCaps};
 
 /// 對端（PTY master／COM pair 對端）：測試用來讀寫 UART 的另一端。
 pub trait PeerEnd: Send {
