@@ -151,6 +151,24 @@ def _bundle_fixture(path: Path) -> Path:
     return path
 
 
+def _copy_present_artifacts(index_data: dict, root: Path) -> None:
+    """夾具：把正式索引中既有 present 項目的 artifact（及 .evidence.json 標記，若有）複製到暫存根目錄。
+
+    checker 對 present 項目一律檢查檔案存在與 sha256；暫存根若只放合成項目，其餘 present 項目
+    （例如 S0-SPIKE1-REMAINING）會判 artifact_missing（exit 1，非本測試預期的 exit 5）。
+    只複製既有檔案，不改動索引、合成項目或任何斷言；目錄型 artifact（L1 set）不在此複製。
+    """
+    for item in index_data.get("items") or []:
+        rel = item.get("artifact_path")
+        if item.get("status") != "present" or not rel:
+            continue
+        for name in (rel, f"{rel}.evidence.json"):
+            src = REPO / name
+            if src.is_file() and not (root / name).exists():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, root / name)
+
+
 def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> subprocess.CompletedProcess:
     """保留 Stage 0 正式索引，只追加不承接 case 覆蓋的合成標記項目。"""
     import yaml  # noqa: PLC0415
@@ -177,6 +195,7 @@ def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> su
         item["required_layer"] = required_layer
     # 保留正式 Stage 0 分母與 case 覆蓋，只追加單一合成項目供層級規則測試。
     index = yaml.safe_load((repo / "tests" / "acceptance" / "stage0_evidence_index.yaml").read_text(encoding="utf-8"))
+    _copy_present_artifacts(index, evidence)
     index["items"].append(item)
     (repo / "tests" / "acceptance" / "stage0_evidence_index.yaml").write_text(
         yaml.safe_dump(index, allow_unicode=True, sort_keys=False), encoding="utf-8")

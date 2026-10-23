@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 from xml.sax.saxutils import quoteattr
@@ -207,6 +208,24 @@ def _load_index() -> dict:
     return yaml.safe_load(INDEX_PATH.read_text(encoding="utf-8"))
 
 
+def _copy_present_artifacts(index_data: dict, root: pathlib.Path, repo_root: pathlib.Path = REPO) -> None:
+    """夾具：把索引中既有 present 項目的 artifact（及其 .evidence.json 標記，若有）複製到暫存根目錄。
+
+    checker 對 present 項目一律檢查檔案存在與 sha256；暫存根若只放本測試自行設定的項目，
+    其餘 present 項目（例如 S0-SPIKE1-REMAINING）會判 artifact_missing（exit 1，非本測試預期的 exit 5）。
+    此函式只複製既有檔案，不改動索引、案例或任何斷言；目錄型 artifact（L1 set）不在此複製。
+    """
+    for item in index_data.get("items") or []:
+        rel = item.get("artifact_path")
+        if item.get("status") != "present" or not rel:
+            continue
+        for name in (rel, f"{rel}.evidence.json"):
+            src = repo_root / name
+            if src.is_file() and not (root / name).exists():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, root / name)
+
+
 def _checker_root(tmp_path: pathlib.Path, index_data: dict) -> pathlib.Path:
     """建立僅含索引與 cases.yaml 副本的暫存根目錄（checker 的 --root 語意＝含 tests/acceptance 的目錄）。"""
     root = tmp_path / "root"
@@ -216,6 +235,7 @@ def _checker_root(tmp_path: pathlib.Path, index_data: dict) -> pathlib.Path:
     (acc / "stage0_evidence_index.yaml").write_text(
         yaml.safe_dump(index_data, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
+    _copy_present_artifacts(index_data, root)
     return root
 
 
@@ -312,6 +332,7 @@ def test_evidence_index_rejects_missing_func_test_attachment(tmp_path: pathlib.P
 @pytest.mark.process_rpc
 def test_evidence_index_explicit_index_and_cases_paths(tmp_path: pathlib.Path):
     """--index／--cases 可獨立於 --root 指定：索引與 artifact 根目錄分離；指定路徑不存在時回 2。"""
+    _copy_present_artifacts(_load_index(), tmp_path / "evidence-only")
     cases_path = REPO / "tests/acceptance/cases.yaml"
     proc = subprocess.run(
         [sys.executable, str(REPO / "tests/acceptance/check_evidence_index.py"), "--stage", "0",

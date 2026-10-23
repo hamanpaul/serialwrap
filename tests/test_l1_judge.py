@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -516,6 +517,24 @@ def test_l1_lock_shape_and_add_only(tmp_path: Path) -> None:
     assert extra_nid in updated_lock["sets"]["s0_bc"]["linux"]["nodeids"]
 
 
+def _copy_present_artifacts(index_data: dict, root: Path) -> None:
+    """夾具：把基底索引中既有 present 項目的 artifact（及 .evidence.json 標記，若有）複製到暫存根目錄。
+
+    checker 對 present 項目一律檢查檔案存在與 sha256；暫存根若只放本測試自行設定的項目，
+    其餘 present 項目（例如 S0-SPIKE1-REMAINING）會判 artifact_missing，使本測試的 exit 斷言失真。
+    只複製既有檔案，不改動索引、案例或任何斷言；目錄型 artifact（L1 set）不在此複製。
+    """
+    for item in index_data.get("items") or []:
+        rel = item.get("artifact_path")
+        if item.get("status") != "present" or not rel:
+            continue
+        for name in (rel, f"{rel}.evidence.json"):
+            src = REPO_ROOT / name
+            if src.is_file() and not (root / name).exists():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, root / name)
+
+
 @pytest.mark.process_rpc
 def test_evidence_index_l1_item_judged(tmp_path: Path) -> None:
     """check_evidence_index.py 對帶 l1_set 的項目進行完整 l1_judge 判定，而非僅驗證 sha256。
@@ -563,6 +582,7 @@ def test_evidence_index_l1_item_judged(tmp_path: Path) -> None:
     digest = checker.l1_artifact_digest(base, ["linux", "windows"])
 
     index_data = _yaml.safe_load((REPO_ROOT / "tests/acceptance/stage0_evidence_index.yaml").read_text(encoding="utf-8"))
+    _copy_present_artifacts(index_data, root)
     for item in index_data["items"]:
         if item["id"] == "S0-L1-BC":
             item.update(status="present", artifact_path="artifacts/s0_bc", sha256=digest)
@@ -840,6 +860,7 @@ def test_evidence_index_l1_item_phases_2_and_3(tmp_path: Path) -> None:
 
     def build(fail: bool) -> Path:
         root = tmp_path / ("fail" if fail else "pass")
+        _copy_present_artifacts(index_data, root)
         base = root / "artifacts" / "s0_bc"
         plats = {}
         for plat in ("linux", "windows"):
