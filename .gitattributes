@@ -8,3 +8,5 @@ realhw/acceptance/longrun_acceptance.yaml text eol=lf
 realhw/acceptance/candidate_longrun_starts.ndjson text eol=lf
 docs/rust-refactor/owner-decisions-addenda.md text eol=lf
 crates/sw-pal/tests/golden/serialwrap.task.xml -text
+# 證據檔以位元組雜湊登錄（stage0_evidence_index.yaml 之 sha256），跨平台檢出不得做 EOL 轉換（CRLF 原樣保留）
+evidence/** -text
