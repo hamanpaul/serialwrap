@@ -149,4 +149,28 @@ impl Clock for FakeClock {
             self.advance(d);
         }
     }
+
+    fn wait_until_or_cancel(
+        &self,
+        deadline_ns: u64,
+        cancel: &crossbeam_channel::Receiver<()>,
+    ) -> bool {
+        let advanced = self.subscribe();
+        loop {
+            let now = self.mono_ns();
+            if now >= deadline_ns {
+                return true;
+            }
+
+            let remaining = Duration::from_nanos(deadline_ns - now);
+            self.sleeps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(remaining);
+            crossbeam_channel::select! {
+                recv(cancel) -> _ => return false,
+                recv(advanced) -> _ => {}
+            }
+        }
+    }
 }

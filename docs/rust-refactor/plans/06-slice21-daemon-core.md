@@ -1353,7 +1353,8 @@ git commit -m "feat(sw-pal): Tier 1 實例鎖與停止訊號等待" -m "Co-autho
 
 **Files:**
 - Create: `crates/sw-pal/src/device_source/posix.rs`、`crates/sw-pal/src/device_source/windows.rs`
-- Modify: `crates/sw-pal/src/device_source/mod.rs`、`crates/sw-pal/src/device_source/windows_model.rs`（P4 05 Task 1／2 已建立並實作 `RegistryView`（`Send + Sync`）、`read_bt_ports`、`exclude_bluetooth`、`SERIALCOMM_KEY`；本 Task 沿用，只新增 `WindowsDeviceSource`）、`crates/sw-pal/src/device_watcher.rs`
+- Modify: `crates/sw-pal/src/device_source/mod.rs`、`crates/sw-pal/src/device_watcher.rs`、`crates/sw-pal/src/lib.rs`、`crates/sw-pal/src/traits.rs`、`crates/sw-pal/src/fakes/clock.rs`、`docs/rust-refactor/plans/rust-architecture.md`
+- Consumes unchanged: `crates/sw-pal/src/device_source/windows_model.rs`（P4 05 Task 1／2 已建立並實作 `RegistryView`（`Send + Sync`）、`read_bt_ports`、`exclude_bluetooth`、`SERIALCOMM_KEY`）
 - Test: `crates/sw-pal/tests/device_source.rs`
 
 **Interfaces:**
@@ -1365,7 +1366,10 @@ pub fn sw_pal::device_source::posix_scan(dirs: &[PathBuf], allowlist: Option<&[S
 // 沿用 P4 05 Task 1／2（不重新定義）：RegistryView: Send + Sync、windows_model::{read_bt_ports, exclude_bluetooth, SERIALCOMM_KEY}
 pub struct WindowsDeviceSource { view: Box<dyn RegistryView>, clock: Arc<dyn Clock>, exclude: HashSet<String>, allowlist: Option<Vec<String>>, bt_cache: Option<(u64, HashSet<String>)> }
 impl DeviceWatcher { pub fn initial_scan(src: &mut dyn DeviceSource) -> PalResult<Vec<(String, DeviceInfo)>>; pub fn diff(prev: &[(String, DeviceInfo)], cur: &[(String, DeviceInfo)]) -> (Vec<DeviceInfo>, Vec<DeviceInfo>); }
+impl DeviceWatcher { pub fn start(src: Box<dyn DeviceSource>, poll: Duration, tx: Sender<WatcherEvent>, clock: Arc<dyn Clock>) -> WatcherHandle; }
 pub struct WatcherHandle; impl WatcherHandle { pub fn stop(self); }
+impl DeviceWatcher { pub fn start_with_baseline(src: Box<dyn DeviceSource>, poll: Duration, tx: Sender<WatcherEvent>, clock: Arc<dyn Clock>, baseline: Vec<(String, DeviceInfo)>) -> WatcherHandle; }
+Clock::wait_until_or_cancel(deadline_ns: u64, cancel: &Receiver<()>) -> bool;
 ```
 
 - [ ] **Step 1：寫失敗測試**
@@ -1428,6 +1432,13 @@ fn watcher_diff_appends_changed_after_added_and_removed() {
 | `serialcomm_missing_key_is_empty` | `enum_values` 回 `NotFound` → scan 回 `Ok(vec![])` |
 | `watcher_scan_failure_does_not_stop_thread` | FakeDeviceSource 第 2 輪 `fail_next` → 收到 `WatcherEvent::ScanFailed`，第 3 輪仍收到 `Tick`；thread 名 `serialwrap-device-watcher` |
 | `watcher_emits_delta_only_when_changed` | 無變化只送 `Tick`；有變化送 `Delta{added, removed, snapshot}` 後才送 `Tick` |
+| `watcher_uses_initial_snapshot_as_baseline`、`watcher_reports_device_removed_after_initial_scan` | 未變化的初始快照不重複送 Delta；初始掃描後拔除的裝置在第一輪回報 `removed` |
+| `watcher_initial_scan_returns_snapshot_or_source_error` | `initial_scan` 原樣回傳來源快照與掃描錯誤 |
+| `watcher_poll_wait_uses_fake_clock_and_stop_interrupts_it` | 時鐘未前進時不再掃描；單調期限到達才輪詢；長輪詢等待可由 stop 取消 |
+| `watcher_stop_is_bounded_when_scan_is_slow` | scan 超過 2 s 時 stop 仍於 2 s 上限附近返回，並輸出 WARNING |
+| `windows_scan_applies_bthenum_exclude_coms_and_bthmodem`、`windows_allowlist_cannot_resurrect_excluded_com` | 假 SERIALCOMM 經完整 WindowsDeviceSource.scan，藍牙／exclude_coms 先排除，OD-11 allowlist 不得復活 |
+| `native_device_factory_prefers_by_id_for_shared_real_path` | 同一 realpath 由 by-id／by-path 同時列出時，native 工廠只回 by-id key |
+| `native_windows_factory_applies_empty_allowlist`（Windows） | 原生 Windows 工廠的空 allowlist 回空集合 |
 | `watcher_tick_panic_isolated` | FakeDeviceSource 第 2 輪 scan panic → WARNING 一行，第 3 輪仍收到 `Tick` |
 | `windows_live_serialcomm_read_ok`（windows 原生） | 真實 HKLM 唯讀列舉回 `Ok(_)`（內容不斷言） |
 
@@ -1440,11 +1451,11 @@ Expected：FAIL，`not implemented: slice21 T5 posix_scan`。
 
 - `posix_scan`：依 dirs 順序；`read_dir` → 收集名稱 `sort()`（code point 序）→ `fs::metadata(path)`（跟隨 symlink）失敗略過 → `canonicalize` → `seen_real` 去重 → allowlist 存在時 `by_id ∉ allowlist` 略過（allowlist 在去重**之後**套用，避免 by-path 補位）。
 - Windows：`HARDWARE\DEVICEMAP\SERIALCOMM` 以 `RegEnumValueW` 依序列舉 `(value_name, data)`；`read_bt_ports` 遞迴 `SYSTEM\CurrentControlSet\Enum\BTHENUM`；`exclude_bluetooth`：`com ∈ bt || com ∈ exclude || value_name.to_lowercase().contains("bthmodem")` 剔除。`exclude_coms` 由呼叫端（daemon_main 讀 `config.yaml` 的 `windows.exclude_coms`，任何錯誤視為空集合，PLT-O-16 只讀一次）傳入。
-- `DeviceWatcher::start`：thread `serialwrap-device-watcher`；每輪以 `catch_unwind` 包住（panic → WARNING `device watcher tick 例外，略過本輪`、thread 續行）；每輪 `scan` → 失敗送 `ScanFailed(e)` 並 log WARNING `device watcher tick 失敗，略過本輪` → 成功時 `diff`，有變化送 `Delta` → 送 `Tick` → `clock.sleep(poll)`（可被 `WatcherHandle::stop` 打斷）。`diff` 照 07 §1.4：`added_keys = sorted(cur−prev)`、`removed_keys = sorted(prev−cur)`、`changed = sorted(both, real_path 不同)`，changed 依序把 prev 接在 removed 後、cur 接在 added 後。
+- `DeviceWatcher::start` 以空快照啟動；DF-14 呼叫端先做 `initial_scan`、rank、`update_devices`，再用 `start_with_baseline(..., initial)` 啟動，避免重複公告既有裝置或漏報啟動間拔除的裝置。每輪以 `catch_unwind` 包住（panic → WARNING 含錯誤訊息、thread 續行）；每輪 `scan` → 失敗送 `ScanFailed(e)` 並 log 含 `e.py_message` 的 WARNING → 成功時 `diff`，有變化送 `Delta` → 送 `Tick` → 以 `clock.wait_until_or_cancel(monotonic_deadline, stop_rx)` 等待下一輪。`WatcherHandle::stop` 發停止訊號後最多等 2 s；完成則 join，逾時輸出 WARNING 並 detach。`diff` 照 07 §1.4：`added_keys = sorted(cur−prev)`、`removed_keys = sorted(prev−cur)`、`changed = sorted(both, real_path 不同)`，changed 依序把 prev 接在 removed 後、cur 接在 added 後。
 
 - [ ] **Step 4：執行並確認 PASS**
 
-Run：`cargo test -p sw-pal --features test-fakes --test device_source && scripts/rust/win-test.sh --package sw-pal`
+Run：`cargo test -p sw-pal --features test-fakes --test device_source && scripts/rust/win-test.sh --package sw-pal -- --features test-fakes --test device_source`
 Expected：PASS。
 
 - [ ] **Step 5：Commit**
@@ -4276,7 +4287,7 @@ fn run_inner(argv: Vec<String>, p: sw_pal::Platform, hooks: &Hooks) -> i32 {
     manager.prepare_dynamic_rank(&initial.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());  // 再排 COM
     manager.update_devices(&initial);
     manager.bootstrap_attach();                                                                 // P1 DF-14：bootstrap 在 watcher.start 之前
-    let watcher = DeviceWatcher::start(src, Duration::from_secs(1), manager.watcher_sender(), p.clock.clone());
+    let watcher = DeviceWatcher::start_with_baseline(src, Duration::from_secs(1), manager.watcher_sender(), p.clock.clone(), initial.clone());
     let svc = Arc::new(Service::new(ServiceDeps { manager: manager.clone(), wal: wal.clone(), registry: registry.clone(),
         procs: p.procs.clone(), version: sw_proto::version::version().to_string(),
         started_at: sw_proto::pycompat::iso_utc_now(p.clock.wall_unix_us()), explicit_target_count: explicit_targets,

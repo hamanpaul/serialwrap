@@ -137,9 +137,35 @@ pub struct Platform {
 /// 裝置來源工廠的型別（arch §4.3 `Platform.devices`）。
 pub type DeviceFactory = Box<dyn Fn(DeviceSelection) -> Box<dyn DeviceSource> + Send + Sync>;
 
-/// 裝置來源工廠的骨架（Task 5 交付；本 Phase 骨架回傳未實作的工廠）。
+/// 依平台建立裝置來源工廠。
 pub fn native_devices() -> DeviceFactory {
-    Box::new(|_sel: DeviceSelection| -> Box<dyn DeviceSource> { s21_todo!("T5", "native_devices") })
+    #[cfg(unix)]
+    {
+        Box::new(|selection: DeviceSelection| -> Box<dyn DeviceSource> {
+            Box::new(crate::device_source::PosixDeviceSource::new(
+                vec![selection.by_id_dir, selection.by_path_dir],
+                selection.test_allowlist,
+            ))
+        })
+    }
+
+    #[cfg(windows)]
+    {
+        use std::collections::HashSet;
+
+        use crate::clock::windows::NativeClock;
+        use crate::device_source::windows_registry::WinRegistryView;
+
+        let clock: Arc<dyn Clock> = Arc::new(NativeClock);
+        Box::new(move |selection: DeviceSelection| -> Box<dyn DeviceSource> {
+            Box::new(crate::device_source::WindowsDeviceSource::new(
+                Box::new(WinRegistryView),
+                Arc::clone(&clock),
+                selection.exclude_coms.into_iter().collect::<HashSet<_>>(),
+                selection.test_allowlist,
+            ))
+        })
+    }
 }
 
 /// P3 名稱保留（`ClientPlatform` 為 `Platform` 的別名）。

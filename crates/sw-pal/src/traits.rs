@@ -453,6 +453,26 @@ pub trait FsRead: Send + Sync {
 pub trait Clock: Send + Sync {
     fn mono_ns(&self) -> u64;
     fn sleep(&self, d: Duration);
+    /// 等到單調時鐘期限或取消；回 `true` 表示期限已到，`false` 表示取消。
+    /// 預設實作使用真實經過時間，需支援可控時間的替身應覆寫此方法。
+    fn wait_until_or_cancel(
+        &self,
+        deadline_ns: u64,
+        cancel: &crossbeam_channel::Receiver<()>,
+    ) -> bool {
+        loop {
+            let now = self.mono_ns();
+            if now >= deadline_ns {
+                return true;
+            }
+
+            let remaining = Duration::from_nanos(deadline_ns - now);
+            crossbeam_channel::select! {
+                recv(cancel) -> _ => return false,
+                recv(crossbeam_channel::after(remaining)) -> _ => {}
+            }
+        }
+    }
     /// Unix wall clock（微秒，Task 0c）。無預設實作：每個 `impl Clock` 必須明確覆寫，漏實作即編譯失敗（P5 Task 0 雙審修正）。
     fn wall_unix_us(&self) -> i64;
     /// 本地 UTC offset（秒，Task 0c）；呼叫端應與 `wall_unix_us()` 在同一時刻取值。

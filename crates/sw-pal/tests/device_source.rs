@@ -3,9 +3,8 @@
 //! 涵蓋 POSIX by-id／by-path 掃描（realpath 去重、allowlist 完整比對）、Windows SERIALCOMM＋藍牙雙重排除（經
 //! `RegistryView` 替身，Linux 上也可跑）、BTHENUM 快取 TTL 5 s，以及 watcher 的差異演算法與「單輪失敗不終止 thread」。
 //!
-//! TDD 紅燈階段：`posix_scan`、`WindowsDeviceSource`、`DeviceWatcher`、`FakeDeviceSource` 目前皆為 `todo!()` stub，
-//! 因此依賴它們的測試會在執行期以 `not implemented` 失敗。`exclude_bluetooth`／`read_bt_ports` 已由 P4 05 實作，
-//! 對應測試為既有行為的回歸鎖定，預期直接通過。
+//! 測試 POSIX／Windows 裝置掃描、原生來源工廠接線、watcher 初始快照與停止行為；
+//! `exclude_bluetooth`／`read_bt_ports` 沿用 P4 05 的實作。
 //!
 //! 替身語意約定（計畫 Task 1）：`FakeDeviceScript::set` 之後每輪掃描都回傳該快照，直到下一次 `set`。
 #![cfg(feature = "test-fakes")]
@@ -130,6 +129,79 @@ fn allowlist_filters_by_id_exactly() {
     assert!(none.is_empty(), "allowlist 必須完整比對 by_id，片段不得命中：{none:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn allowlist_does_not_let_by_path_replace_deduplicated_by_id() {
+    let f = posix_fixture();
+    let allow = vec![f.bypath.join("pci-0").display().to_string()];
+    let got = posix_scan(&[f.byid.clone(), f.bypath.clone()], Some(allow.as_slice())).unwrap();
+
+    assert!(
+        got.is_empty(),
+        "by-id 先占用同一 realpath 後，即使 allowlist 僅含 by-path 也不得補位：{got:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_device_factory_uses_selection_and_exact_allowlist() {
+    let d = tempfile::tempdir().unwrap();
+    let by_id = d.path().join("by-id");
+    let by_path = d.path().join("by-path");
+    std::fs::create_dir_all(&by_id).unwrap();
+    std::fs::create_dir_all(&by_path).unwrap();
+    std::fs::write(by_id.join("usb-A"), b"").unwrap();
+    std::fs::write(by_path.join("pci-0"), b"").unwrap();
+
+    let allowed = by_id.join("usb-A").display().to_string();
+    let mut source = (sw_pal::native_devices())(sw_pal::traits::DeviceSelection {
+        by_id_dir: by_id.clone(),
+        by_path_dir: by_path,
+        exclude_coms: Vec::new(),
+        test_allowlist: Some(vec![allowed.clone()]),
+    });
+    let got = source.scan().unwrap();
+
+    assert_eq!(
+        got,
+        vec![(
+            allowed.clone(),
+            DeviceInfo {
+                by_id: allowed.clone(),
+                real_path: std::fs::canonicalize(by_id.join("usb-A"))
+                    .unwrap()
+                    .display()
+                    .to_string(),
+            },
+        )]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_device_factory_prefers_by_id_for_shared_real_path() {
+    let d = tempfile::tempdir().unwrap();
+    let by_id = d.path().join("by-id");
+    let by_path = d.path().join("by-path");
+    let tty = d.path().join("ttyX");
+    std::fs::create_dir_all(&by_id).unwrap();
+    std::fs::create_dir_all(&by_path).unwrap();
+    std::fs::write(&tty, b"").unwrap();
+    symlink(&tty, by_id.join("usb-A")).unwrap();
+    symlink(&tty, by_path.join("pci-0")).unwrap();
+
+    let mut source = (sw_pal::native_devices())(sw_pal::traits::DeviceSelection {
+        by_id_dir: by_id.clone(),
+        by_path_dir: by_path,
+        exclude_coms: Vec::new(),
+        test_allowlist: None,
+    });
+
+    let got = source.scan().unwrap();
+    assert_eq!(got.len(), 1, "同一實體 tty 只能列舉一次：{got:?}");
+    assert_eq!(got[0].0, by_id.join("usb-A").display().to_string());
+}
+
 // ---------------------------------------------------------------------------
 // Windows 模型（SERIALCOMM／BTHENUM／藍牙排除）
 // ---------------------------------------------------------------------------
@@ -240,6 +312,105 @@ fn windows_scan_maps_real_path() {
 }
 
 #[test]
+fn windows_allowlist_matches_complete_com_name() {
+    let view = FakeView {
+        serialcomm: vec![
+            (r"\Device\Serial0".into(), "COM3".into()),
+            (r"\Device\Serial1".into(), "COM30".into()),
+        ],
+        ..Default::default()
+    };
+    let mut src = WindowsDeviceSource::new(
+        Box::new(view),
+        FakeClock::new(),
+        HashSet::new(),
+        Some(vec!["COM3".into()]),
+    );
+
+    let got = src.scan().unwrap();
+    assert_eq!(
+        got.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+        vec!["COM3"],
+        "OD-11 allowlist 必須完整比對 COM 名稱"
+    );
+}
+
+fn windows_filter_fixture() -> FakeView {
+    let bt_device = format!("{BTHENUM}\\PairedDevice");
+    let mut view = FakeView {
+        serialcomm: vec![
+            (r"\Device\Serial0".into(), "COM3".into()),
+            (r"\Device\VCP0".into(), "COM5".into()),
+            (r"\Device\VCP1".into(), "COM10".into()),
+            (r"\Device\bThMoDeM0".into(), "COM7".into()),
+            (r"\Device\Serial1".into(), "COM4".into()),
+        ],
+        ..Default::default()
+    };
+    view.children
+        .insert(BTHENUM.to_string(), vec!["PairedDevice".into()]);
+    view.port_names
+        .insert(format!("{bt_device}\\Device Parameters"), "COM5".into());
+    view
+}
+
+#[test]
+fn windows_scan_applies_bthenum_exclude_coms_and_bthmodem() {
+    let exclude: HashSet<String> = ["COM10".to_string()].into();
+    let mut source = WindowsDeviceSource::new(
+        Box::new(windows_filter_fixture()),
+        FakeClock::new(),
+        exclude,
+        None,
+    );
+
+    let got = source.scan().unwrap();
+    assert_eq!(
+        got.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+        vec!["COM3", "COM4"],
+        "BTHENUM、exclude_coms 與 bthmodem 排除後應保留 SERIALCOMM 順序"
+    );
+}
+
+#[test]
+fn windows_allowlist_cannot_resurrect_excluded_com() {
+    let exclude: HashSet<String> = ["COM10".to_string()].into();
+    let allowlist = vec!["COM3", "COM5", "COM7", "COM10"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut source = WindowsDeviceSource::new(
+        Box::new(windows_filter_fixture()),
+        FakeClock::new(),
+        exclude,
+        Some(allowlist),
+    );
+
+    let got = source.scan().unwrap();
+    assert_eq!(
+        got.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+        vec!["COM3"],
+        "OD-11 allowlist 不得重新加入已排除的藍牙或 exclude_coms 埠"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_factory_applies_empty_allowlist() {
+    let mut source = (sw_pal::native_devices())(sw_pal::traits::DeviceSelection {
+        by_id_dir: std::path::PathBuf::new(),
+        by_path_dir: std::path::PathBuf::new(),
+        exclude_coms: Vec::new(),
+        test_allowlist: Some(Vec::new()),
+    });
+
+    assert!(
+        source.scan().unwrap().is_empty(),
+        "原生 Windows 工廠也必須套用空 allowlist"
+    );
+}
+
+#[test]
 fn bt_cache_ttl_5s() {
     let view = FakeView::default();
     let calls = Arc::clone(&view.calls_bthenum_root);
@@ -339,6 +510,15 @@ struct RoundGate {
     threads: Arc<Mutex<Vec<String>>>,
 }
 
+struct CountingSource(Arc<AtomicUsize>);
+
+impl DeviceSource for CountingSource {
+    fn scan(&mut self) -> PalResult<Vec<(String, DeviceInfo)>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}
+
 impl DeviceSource for RoundGate {
     fn scan(&mut self) -> PalResult<Vec<(String, DeviceInfo)>> {
         let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
@@ -363,6 +543,69 @@ fn start_watcher(
     let (tx, rx) = crossbeam_channel::unbounded();
     let clock = sw_pal::native().clock;
     (DeviceWatcher::start(src, POLL, tx, clock), rx)
+}
+
+fn start_watcher_with_baseline(
+    src: Box<dyn DeviceSource>,
+    baseline: Vec<(String, DeviceInfo)>,
+) -> (sw_pal::WatcherHandle, crossbeam_channel::Receiver<WatcherEvent>) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let clock = sw_pal::native().clock;
+    (
+        DeviceWatcher::start_with_baseline(src, POLL, tx, clock, baseline),
+        rx,
+    )
+}
+
+#[test]
+fn watcher_initial_scan_returns_snapshot_or_source_error() {
+    let (mut source, script) = FakeDeviceSource::new(vec![dev(A, TTY0)]);
+    assert_eq!(
+        DeviceWatcher::initial_scan(&mut source).unwrap(),
+        vec![dev(A, TTY0)]
+    );
+
+    script.fail_next(PalError::plain(PalErrorKind::Busy, "初始化掃描失敗"));
+    let error = DeviceWatcher::initial_scan(&mut source).unwrap_err();
+    assert_eq!(error.kind, PalErrorKind::Busy);
+    assert_eq!(error.py_message, "初始化掃描失敗");
+}
+
+#[test]
+fn watcher_uses_initial_snapshot_as_baseline() {
+    let (mut source, _script) = FakeDeviceSource::new(vec![dev(A, TTY0)]);
+    let initial = DeviceWatcher::initial_scan(&mut source).unwrap();
+    let (handle, rx) = start_watcher_with_baseline(Box::new(source), initial);
+
+    let first = rx.recv_timeout(WAIT).expect("初始掃描後應收到 Tick");
+    assert!(
+        matches!(first, WatcherEvent::Tick),
+        "未變化的初始快照不可重複發送 Delta：{first:?}"
+    );
+    handle.stop();
+}
+
+#[test]
+fn watcher_reports_device_removed_after_initial_scan() {
+    let (mut source, script) = FakeDeviceSource::new(vec![dev(A, TTY0)]);
+    let initial = DeviceWatcher::initial_scan(&mut source).unwrap();
+    script.set(Vec::new());
+    let (handle, rx) = start_watcher_with_baseline(Box::new(source), initial);
+
+    match rx.recv_timeout(WAIT).expect("初始掃描後拔除裝置應送出 Delta") {
+        WatcherEvent::Delta {
+            added,
+            removed,
+            snapshot,
+        } => {
+            assert!(added.is_empty());
+            assert_eq!(removed, vec![DeviceInfo { by_id: A.into(), real_path: TTY0.into() }]);
+            assert!(snapshot.is_empty());
+        }
+        other => panic!("預期首輪送出移除 Delta，實際：{other:?}"),
+    }
+    assert!(matches!(rx.recv_timeout(WAIT).unwrap(), WatcherEvent::Tick));
+    handle.stop();
 }
 
 /// 讀取事件直到符合 `pred`，其餘事件略過；逾時即 panic。
@@ -482,6 +725,17 @@ fn watcher_emits_delta_only_when_changed() {
         "Delta 之後應為 Tick，實際：{after:?}"
     );
 
+    // 若 previous 未更新成 B，後續每輪都會重複送出相同 Delta。
+    for i in 0..5 {
+        let ev = rx
+            .recv_timeout(WAIT)
+            .expect("Delta 後無變化時仍應持續送出 Tick");
+        assert!(
+            matches!(ev, WatcherEvent::Tick),
+            "Delta 後第 {i} 輪應只有 Tick，實際：{ev:?}"
+        );
+    }
+
     handle.stop();
 }
 
@@ -514,4 +768,119 @@ fn watcher_tick_panic_isolated() {
     );
 
     handle.stop();
+}
+
+#[test]
+fn watcher_stop_interrupts_full_event_queue() {
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let handle = DeviceWatcher::start(
+        Box::new(CountingSource(Arc::clone(&rounds))),
+        Duration::from_millis(1),
+        tx,
+        sw_pal::native().clock,
+    );
+
+    wait_until("watcher 在滿佇列上進入第二輪", || {
+        rounds.load(Ordering::SeqCst) >= 2
+    });
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let stopper = std::thread::spawn(move || {
+        handle.stop();
+        let _ = done_tx.send(());
+    });
+
+    if done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+        // 釋放接收端可讓舊版阻塞 send 退出，避免失敗測試遺留 watcher thread。
+        drop(rx);
+        stopper.join().unwrap();
+        panic!("停止必須中斷滿佇列上的事件傳送並有限時間內返回");
+    }
+    drop(rx);
+    stopper.join().unwrap();
+}
+
+#[test]
+fn watcher_poll_wait_uses_fake_clock_and_stop_interrupts_it() {
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let clock = FakeClock::at(0, 0);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let poll = Duration::from_secs(60);
+    let handle = DeviceWatcher::start(
+        Box::new(CountingSource(Arc::clone(&rounds))),
+        poll,
+        tx,
+        clock.clone(),
+    );
+
+    assert!(matches!(rx.recv_timeout(WAIT).unwrap(), WatcherEvent::Tick));
+    wait_until("FakeClock 註冊第一個 watcher 等待", || {
+        clock.sleeps.lock().unwrap().len() >= 1
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(rounds.load(Ordering::SeqCst), 1, "假時鐘未前進時不得再次掃描");
+
+    clock.advance(poll - Duration::from_millis(1));
+    wait_until("FakeClock 註冊剩餘 1 ms 等待", || {
+        clock.sleeps.lock().unwrap().len() >= 2
+    });
+    assert_eq!(rounds.load(Ordering::SeqCst), 1, "期限前不得再次掃描");
+
+    clock.advance(Duration::from_millis(1));
+    assert!(matches!(rx.recv_timeout(WAIT).unwrap(), WatcherEvent::Tick));
+    assert_eq!(rounds.load(Ordering::SeqCst), 2, "期限到達後應再掃描一次");
+    wait_until("FakeClock 註冊下一輪 watcher 等待", || {
+        clock.sleeps.lock().unwrap().len() >= 3
+    });
+
+    let started = Instant::now();
+    handle.stop();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "stop 應能在假時鐘未前進時取消輪詢等待"
+    );
+}
+
+struct SlowSource {
+    started: Arc<std::sync::atomic::AtomicBool>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DeviceSource for SlowSource {
+    fn scan(&mut self) -> PalResult<Vec<(String, DeviceInfo)>> {
+        self.started.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(2_300));
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn watcher_stop_is_bounded_when_scan_is_slow() {
+    use std::sync::atomic::AtomicBool;
+
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let handle = DeviceWatcher::start(
+        Box::new(SlowSource {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        }),
+        Duration::from_secs(60),
+        tx,
+        sw_pal::native().clock,
+    );
+    wait_until("慢速掃描開始", || started.load(Ordering::SeqCst));
+
+    let before = Instant::now();
+    handle.stop();
+    let elapsed = before.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "scan 受阻時 stop 應在 2 s 上限後返回，實際耗時 {elapsed:?}"
+    );
+    wait_until("逾時後 detached watcher 完成目前掃描", || {
+        finished.load(Ordering::SeqCst)
+    });
 }

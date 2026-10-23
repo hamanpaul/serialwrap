@@ -9,4 +9,5 @@ pub mod windows_model;
 pub mod windows_registry;
 
 pub use posix::posix_scan;
+pub(crate) use posix::PosixDeviceSource;
 pub use windows::WindowsDeviceSource;

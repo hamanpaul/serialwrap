@@ -418,6 +418,7 @@ pub trait Clock: Send + Sync {
     fn wall_unix_us(&self) -> i64;             // UTC 微秒
     fn local_utc_offset_s(&self) -> i32;        // localtime_r ｜ GetTimeZoneInformation；呼叫端應與 wall_unix_us 同時取值
     fn sleep(&self, d: Duration);              // FakeClock：推進虛擬時間並喚醒等待者
+    fn wait_until_or_cancel(&self, deadline_ns: u64, cancel: &Receiver<()>) -> bool; // 單調期限；取消時回 false；FakeClock 等待 advance
 }
 // 決定性測試：SessionCore 只吃 `now: Mono` 參數；runtime loop 才呼叫 Clock。FakeClock 提供 advance(d)。
 
@@ -535,10 +536,13 @@ pub trait DeviceSource: Send {
 pub struct DeviceWatcher;  // thread "serialwrap-device-watcher"
 impl DeviceWatcher {
     pub fn start(src: Box<dyn DeviceSource>, poll: Duration, tx: crossbeam_channel::Sender<WatcherEvent>, clock: Arc<dyn Clock>) -> WatcherHandle;
+    pub fn start_with_baseline(src: Box<dyn DeviceSource>, poll: Duration, tx: crossbeam_channel::Sender<WatcherEvent>, clock: Arc<dyn Clock>, baseline: Vec<(String, DeviceInfo)>) -> WatcherHandle;
 }
+// `start` 以空快照為基線；daemon 完成 initial_scan、rank、update_devices 後，必須以該快照呼叫 `start_with_baseline`。
+// watcher 以注入 Clock 的單調期限等待下一輪；stop 可取消等待，並最多 join 2 s，逾時輸出 WARNING 後 detach。
 pub enum WatcherEvent { Delta { added: Vec<DeviceInfo>, removed: Vec<DeviceInfo>, snapshot: Vec<(String, DeviceInfo)> }, Tick, ScanFailed(PalError) }
 // 差異演算法照 device_watcher.py:52-68（含 changed 的 append 順序）。單輪失敗只記 log，不終止 thread。
-// 呼叫端必須先做一次 initial_scan()，完成 rank 後才 start（DF-14）。
+// 呼叫端必須先做一次 initial_scan()、完成 rank 與 update_devices，再以該快照呼叫 start_with_baseline（DF-14）。
 ```
 
 ### 4.4 `InstanceLock`（Tier 1）
@@ -1023,7 +1027,7 @@ OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallbac
 
 1. server.stop（P8 起拆為 `stop_accept`，handler join 移到 Phase 1 之後）。
    - 1a. `manager.begin_shutdown()`：stopping gate。之後熱插 Delta／Tick reattach、`RequestAttach`、bootstrap、bind／clear／recover／device.attach 重開一律不開 UART、不建 session 或 worker；已越過 gate 的在途 attach 納入第 2 步的 drain 集合（R1-F2）。
-   - 1b. `watcher.stop()`：停 DeviceWatcher thread 並 join；channel 殘留的 Delta 由 gate 丟棄（P1 順序：watcher 在 drain 前停止）。
+   - 1b. `watcher.stop()`：送停止訊號並最多等待 2 s；thread 收斂則 join，逾時輸出 WARNING 並 detach；channel 殘留的 Delta 由 gate 丟棄（P1 順序：watcher 在 drain 前停止）。
    - 1c. `engine.close_intake()`：matcher 停止、dispatcher 不再 spawn handler；已在跑的 handler 與 drain 並行（P7 起）。
    - P8 起 flash endpoint stop 位於 1c 之後、第 2 步之前（P8 Task 12）。
 2. 所有 session 依 Phase 1／2 drain，總上限 5 s（`SC-11`）。
