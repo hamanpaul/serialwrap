@@ -54,3 +54,11 @@
 - B-4：歸檔 Windows selftest 的原始 log。
 
 BRIDGE VERDICT: APPROVE（tree c4c22c0e369e4c593e3b4a6a9a0ebb21c37259cc63b0394d295948568e60b030）
+
+## 2026-10-23 延後紀錄（Stage 1 出口修正輪）
+
+- 本段為記錄，不是新的審查結論，不改變上方 `BRIDGE VERDICT`（該結論僅適用 tree `c4c22c0e…`）。
+- 目前工具 tree（`tool_tree_sha256()`）為 `8643bd00…`，與核准值 `c4c22c0e…` 不同；`APPROVED_REVISION.json` 本輪未變更，新 tree 尚未核准。
+- **B-1、B-2 本輪延後，未實作。** 理由：工具 src 已因 `endpoints/win_serial.py` 的 `peer_state` 宣告修正而變動，需重審與兩平台 selftest；於此時併入未經實機驗證的 `write_timeout` 與 I/O 鎖內 setter 變更，風險高於收益。B-1、B-2 併入下一次工具修改，與 B-3、B-4 一併處理。
+- `bridge/core.py` 的註解變更保留（描述 `peer_state` 宣告條件，與 `win_serial.py` 修正同一判準）。
+- 登記對應：`owner-decisions-addenda.md` 之 `CHG-S1X-BRIDGE-PEER-STATE-01`。
