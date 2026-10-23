@@ -29,6 +29,17 @@ class StatResultWithoutRdev:
         self.st_mode = mode
 
 
+class StatIdentity:
+    """以 (st_dev, st_ino) 描述 inode 身分的 stat 替身（#R2：holder 判定依此，不依 st_rdev）。"""
+
+    def __init__(self, dev: int, ino: int, rdev: int | None = None, mode: int = 0o20666) -> None:
+        self.st_dev = dev
+        self.st_ino = ino
+        self.st_mode = mode
+        if rdev is not None:
+            self.st_rdev = rdev
+
+
 def _probe_posix_branch(mgr: SessionManager, path: str, proc: str) -> dict:
     """以 POSIX procfs 分支呼叫 _probe_external_holder。
 
@@ -59,14 +70,14 @@ class TestHolderProbePortability(unittest.TestCase):
         )
 
     def test_missing_endpoint_st_rdev_tolerated(self) -> None:
-        """當 endpoint stat 缺乏 st_rdev 時，不拋 AttributeError，且同 path 仍能正確匹配。"""
+        """當 endpoint stat 缺乏 st_rdev 時，不拋 AttributeError，且同一 inode 仍能正確匹配（#R2：身分改以 st_dev／st_ino）。"""
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
         os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "3")
 
         with mock.patch("sw_core.session_manager.os.stat") as mock_stat:
-            mock_stat.return_value = StatResultWithoutRdev()
+            mock_stat.return_value = StatIdentity(dev=60, ino=17)
             res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [1234])
@@ -90,21 +101,63 @@ class TestHolderProbePortability(unittest.TestCase):
         self.assertEqual(res["pids"], [])
         self.assertIsNone(res["holder"])
 
-    def test_posix_char_device_rdev_matching(self) -> None:
-        """正常 POSIX 環境下，即使 path 字串不同，但 char-device 的 st_rdev 相同仍能正確識別 holder。"""
+    def test_alias_path_same_inode_matched(self) -> None:
+        """fd 經由不同路徑（by-id 別名）指向同一 inode 時仍是 holder（#199 別名正面案例，改以 inode 身分判定）。"""
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
         os.symlink("/dev/serial/by-id/usb-device-part", proc / "1234" / "fd" / "3")
 
         def _stat_side_effect(path: str, *args, **kwargs):
-            return StatResultWithRdev(rdev=500)
+            return StatIdentity(dev=60, ino=17, rdev=500)
 
         with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
             res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
 
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
+
+    def test_posix_char_device_rdev_matching(self) -> None:
+        """非 devpts 字元裝置：fd 經由不同 mknod 節點（st_dev／st_ino 皆不同）但 st_rdev 相同（major 4，非 136–143）
+        仍為同一實體 UART 的 holder（#R2／Codex P1：容器以 mknod 掛入同一 UART 節點）。
+        此 nodeid 為凍結清單既有項（l1_required.lock.json），名稱與語意保持一致，不得改名。"""
+        mgr = self._mgr()
+        proc = Path(self._tmp.name) / "proc"
+        (proc / "1234" / "fd").mkdir(parents=True)
+        os.symlink("/dev/ttyS0", proc / "1234" / "fd" / "3")
+        fd_path = str(proc / "1234" / "fd" / "3")
+        rdev = (4 << 8) | 64  # major 4（ttyS），非 devpts
+
+        def _stat_side_effect(path: str, *args, **kwargs):
+            if path == fd_path:
+                return StatIdentity(dev=140, ino=99, rdev=rdev)
+            return StatIdentity(dev=60, ino=17, rdev=rdev)
+
+        with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
+            res = _probe_posix_branch(mgr, "/dev/ttyS0", str(proc))
+
+        self.assertEqual(res["pids"], [1234])
+        self.assertEqual(res["holder"], 1234)
+
+    def test_same_rdev_different_devpts_instance_not_matched(self) -> None:
+        """#R2 回歸：st_rdev 相同（同為 136:N）但 st_dev 不同（另一 devpts instance，例如 docker 容器內的
+        /dev/pts/N）不得判為 holder；改用 rdev 會在此誤判，導致 attach 回 DeviceHeldError。"""
+        mgr = self._mgr()
+        proc = Path(self._tmp.name) / "proc"
+        (proc / "1234" / "fd").mkdir(parents=True)
+        os.symlink("/dev/pts/7", proc / "1234" / "fd" / "3")
+
+        def _stat_side_effect(path: str, *args, **kwargs):
+            if path == "/dev/pts/7":
+                return StatIdentity(dev=60, ino=10, rdev=34823)
+            return StatIdentity(dev=148, ino=10, rdev=34823)
+
+        with mock.patch("sw_core.session_manager.os.stat", side_effect=_stat_side_effect):
+            res = _probe_posix_branch(mgr, "/dev/pts/7", str(proc))
+
+        self.assertEqual(res["pids"], [])
+        self.assertIsNone(res["holder"])
+        self.assertFalse(res["holder_unknown"])
 
     def test_posix_char_device_different_rdev_not_matched(self) -> None:
         """當 path 不同且有效 st_rdev 亦不同時，不誤判為 holder。"""
@@ -141,13 +194,16 @@ class TestHolderProbePortability(unittest.TestCase):
         self.assertIsNone(res["holder"])
 
     def test_same_path_matched(self) -> None:
-        """同 path 仍能正確匹配 holder。"""
+        """同一實體 tty（同 inode）仍能正確匹配 holder（#R2：以 inode 身分判定，不以路徑字串）。"""
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "3")
+        dev = Path(self._tmp.name) / "dev" / "ttyUSB0"
+        dev.parent.mkdir(parents=True)
+        dev.write_bytes(b"")
+        os.symlink(dev, proc / "1234" / "fd" / "3")
 
-        res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
+        res = _probe_posix_branch(mgr, str(dev), str(proc))
 
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)

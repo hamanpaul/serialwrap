@@ -458,6 +458,38 @@ fn posix_tty_holder_scan_reports_matching_pid_and_ok_status() {
 
 #[cfg(unix)]
 #[test]
+fn posix_tty_holder_scan_ignores_unrelated_tty_file() {
+    // #R2：不同 inode（非同一 tty）即使路徑形態相近，也不得判為 holder。
+    let tmp = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let process_dir = tmp.path().join(pid.to_string());
+    std::fs::create_dir_all(process_dir.join("fd")).unwrap();
+    std::fs::write(process_dir.join("cmdline"), b"serialwrapd\0").unwrap();
+    let held = tmp.path().join("tty-held");
+    let wanted = tmp.path().join("tty-wanted");
+    std::fs::write(&held, b"").unwrap();
+    std::fs::write(&wanted, b"").unwrap();
+    std::os::unix::fs::symlink(&held, process_dir.join("fd/7")).unwrap();
+
+    let (holders, status) =
+        PosixProcScan::with_root(tmp.path()).serialwrapd_tty_holders(std::slice::from_ref(&wanted));
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Ok);
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_tty_holder_scan_reports_unknown_when_target_unstatable() {
+    // #R2／Codex P2：目標 tty 無法取得身分時，不得回「無 holder、Ok」（那會被當成已確認可安全開啟）。
+    let tmp = tempfile::tempdir().unwrap();
+    let (holders, status) = PosixProcScan::with_root(tmp.path())
+        .serialwrapd_tty_holders(&[tmp.path().join("tty-missing")]);
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Unknown);
+}
+
+#[cfg(unix)]
+#[test]
 fn posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let process_dir = tmp.path().join("205");

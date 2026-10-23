@@ -42,9 +42,15 @@ SERIALWRAPD_ARGV = [AB_ENV["SERIALWRAP_DAEMON_EXE"]] if AB_ENV.get("SERIALWRAP_D
 def _external_holders(path: str, *, exclude_pid: int) -> list[str]:
     """掃 /proc，回傳持有 path 的 pid（排除 exclude_pid）。
 
-    與 daemon 端 `UARTBridge._enumerate_all_held_paths` 使用同一信號來源（fd readlink），
-    讓測試的等待條件與 daemon 的孤兒回收判準一致。
+    判準為 inode 身分（fd 經 os.stat 跟隨後的 (st_dev, st_ino) 等於 path 的身分；#R2），與 daemon 端
+    `UARTBridge._enumerate_all_held_paths` 使用同一判準，讓測試的等待條件與 daemon 的孤兒回收判準一致。
+    不以 readlink 字串比對：容器內獨立 devpts instance 的 /dev/pts/N 會與本測試的 pty 同名，造成假 holder。
     """
+    try:
+        target = os.stat(path)
+    except OSError:
+        return []
+    target_id = (target.st_dev, target.st_ino)
     holders: list[str] = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit() or int(pid) == exclude_pid:
@@ -56,11 +62,12 @@ def _external_holders(path: str, *, exclude_pid: int) -> list[str]:
             continue
         for name in names:
             try:
-                if os.readlink(os.path.join(fd_dir, name)) == path:
-                    holders.append(pid)
-                    break
+                st = os.stat(os.path.join(fd_dir, name))
             except OSError:
                 continue
+            if (st.st_dev, st.st_ino) == target_id:
+                holders.append(pid)
+                break
     return holders
 
 
