@@ -275,6 +275,201 @@ def test_volatile_and_root_normalized(tmp_path):
     assert result["differences"] == []
 
 
+def test_poll_failure_is_not_collapsed_with_following_success(tmp_path):
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    success = {"argv": ["daemon", "status"], "rc": 0, "response": {"ok": True, "running": True}}
+    _set_cli_calls(a_dir, case_id, [success])
+    _set_cli_calls(
+        b_dir,
+        case_id,
+        [
+            {"argv": ["daemon", "status"], "rc": 1,
+             "response": {"ok": False, "error_code": "INTERNAL_ERROR"}},
+            success,
+        ],
+    )
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_poll_status_transition_is_not_collapsed(tmp_path):
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    running = {"argv": ["cmd", "status", "--cmd-id", "a" * 32], "rc": 0,
+               "response": {"ok": True, "command": {"status": "running"}}}
+    done = {"argv": ["cmd", "status", "--cmd-id", "b" * 32], "rc": 0,
+            "response": {"ok": True, "command": {"status": "done"}}}
+    _set_cli_calls(a_dir, case_id, [running, done])
+    _set_cli_calls(b_dir, case_id, [done])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_foreign_holder_pid_mapping_preserves_identity_relations(tmp_path):
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    _set_cli_calls(
+        a_dir,
+        case_id,
+        [{"argv": ["daemon", "status"], "rc": 0, "response": {
+            "foreign_holders": {
+                "COM0": {"device": "COM0", "holder_unknown": True, "pids": [101, 202]},
+                "COM1": {"device": "COM1", "holder_unknown": True, "pids": [202]},
+            },
+        }}],
+    )
+    _set_cli_calls(
+        b_dir,
+        case_id,
+        [{"argv": ["daemon", "status"], "rc": 0, "response": {
+            "foreign_holders": {
+                "COM0": {"device": "COM0", "holder_unknown": True, "pids": [301, 402]},
+                "COM1": {"device": "COM1", "holder_unknown": True, "pids": [402]},
+            },
+        }}],
+    )
+
+    equivalent = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+    assert equivalent["differences"] == []
+
+    _set_cli_calls(
+        b_dir,
+        case_id,
+        [{"argv": ["daemon", "status"], "rc": 0, "response": {
+            "foreign_holders": {
+                "COM0": {"device": "COM0", "holder_unknown": True, "pids": [301, 402]},
+                "COM1": {"device": "COM1", "holder_unknown": True, "pids": [301]},
+            },
+        }}],
+    )
+    different_relation = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert different_relation["differences"]
+
+
+@pytest.mark.parametrize(
+    "a_holders,b_holders",
+    [
+        ({"COM0": {"device": "COM0", "holder_unknown": True, "pids": []}}, {}),
+        ({}, {"COM0": {"device": "COM0", "holder_unknown": True, "pids": []}}),
+        (
+            {"COM0": {"device": "COM0", "holder_unknown": True, "pids": []}},
+            {"COM0": {"device": "COM0", "holder_unknown": False, "pids": []}},
+        ),
+    ],
+    ids=["missing-holder", "extra-holder", "holder-unknown-changed"],
+)
+def test_foreign_holder_structure_changes_are_differences(tmp_path, a_holders, b_holders):
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    _set_cli_calls(a_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0, "response": {
+        "foreign_holders": a_holders,
+    }}])
+    _set_cli_calls(b_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0, "response": {
+        "foreign_holders": b_holders,
+    }}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def _device_still_held(pids: list[int], *, holder_unknown: bool = True) -> dict[str, Any]:
+    return {"ok": False, "error_code": "DEVICE_STILL_HELD", "pids": pids, "holder_unknown": holder_unknown}
+
+
+@pytest.mark.parametrize(
+    "a_pids,b_pids",
+    [([100, 200], []), ([100, 200], [100]), ([100], [100, 200])],
+    ids=["pids-vs-empty", "pids-count-shrunk", "pids-count-grown"],
+)
+def test_device_still_held_pid_list_changes_are_differences(tmp_path, a_pids, b_pids):
+    """回歸（24f42d0 Medium）：DEVICE_STILL_HELD 的 pids 數量不得被正規化吞掉。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["device", "attach", "--selector", "COM0"], "rc": 1}
+    _set_cli_calls(a_dir, case_id, [{**call, "response": _device_still_held(a_pids)}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": _device_still_held(b_pids)}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_device_still_held_pid_identity_relation_is_difference(tmp_path):
+    """回歸（24f42d0 Medium）：pid 與 pids 的關聯改變（A 的 pid 屬於 pids，B 不屬於）須判為差異。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    _set_cli_calls(a_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0,
+                                     "response": {"ok": True, "pid": 100, "pids": [100, 200]}}])
+    _set_cli_calls(b_dir, case_id, [{"argv": ["daemon", "status"], "rc": 0,
+                                     "response": {"ok": True, "pid": 300, "pids": [100, 200]}}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_device_still_held_holder_unknown_flip_is_difference(tmp_path):
+    """回歸（24f42d0 Medium）：holder_unknown 由 true 變 false 須判為差異。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    call = {"argv": ["device", "attach", "--selector", "COM0"], "rc": 1}
+    _set_cli_calls(a_dir, case_id, [{**call, "response": _device_still_held([100], holder_unknown=True)}])
+    _set_cli_calls(b_dir, case_id, [{**call, "response": _device_still_held([100], holder_unknown=False)}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
+def test_foreign_holder_daemon_pid_value_is_aliased(tmp_path):
+    """foreign_holders 的一般值為持有者整數 PID（RPC-D-10，含 daemon 自身 pid）；每次執行 PID 變動，
+    但與 pid 的關聯不變時不得判為差異。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    _set_cli_calls(a_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
+        "ok": True, "pid": 10, "foreign_holders": {"/dev/pts/1": 10},
+    }}])
+    _set_cli_calls(b_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
+        "ok": True, "pid": 20, "foreign_holders": {"/dev/pts/2": 20},
+    }}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"] == []
+
+
+def test_foreign_holder_pid_relation_to_daemon_pid_is_difference(tmp_path):
+    """foreign_holders 的整數 PID 與 daemon pid 的關聯改變（B 的持有者不是 daemon 自身）須判為差異。"""
+    ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
+    _equalize_reports(a_dir, b_dir)
+    case_id = _case_ids(a_dir)[0]
+    _set_cli_calls(a_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
+        "ok": True, "pid": 10, "foreign_holders": {"/dev/pts/1": 10},
+    }}])
+    _set_cli_calls(b_dir, case_id, [{"argv": ["health", "status"], "rc": 0, "response": {
+        "ok": True, "pid": 10, "foreign_holders": {"/dev/pts/1": 30},
+    }}])
+
+    result = _diff(ab_diff, a_dir, b_dir, required_case_ids=set(_case_ids(a_dir)))
+
+    assert result["differences"]
+
+
 def test_difference_attributed_to_case_change(tmp_path):
     ab_diff, a_dir, b_dir = _prepare_reports(tmp_path)
     template_case_id = _case_ids(a_dir)[0]

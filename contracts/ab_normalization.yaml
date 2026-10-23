@@ -14,8 +14,8 @@
 #   併入時同步擴充 ab_diff.py 的 _RULE_KEYS 白名單。
 # - 本次追加段（P9-T7B）：g1_exception_message、g2_set_paths、volatile_keys（計畫原列 14 項）、
 #   instance_root_placeholder。
-# - 審查修正追加（P9-T7B review fix）：volatile_keys 中標示「審查追加」的項目（時間類、計數類與 PID 類）、
-#   pty_path_placeholder、poll_commands。以上同樣尚未獨立審閱。
+# - 審查修正追加（P9-T7B review fix）：volatile_keys 中標示「審查追加」的項目（時間類與計數類）、
+#   pid_fields、pty_path_placeholder、poll_commands。以上同樣尚未獨立審閱。
 #
 # 審閱狀態：尚未獨立審閱，以下兩欄保留為 null，不得視為已核准。
 approved_revision: null
@@ -24,6 +24,10 @@ reviewed_by: null
 # G1（spec-reconciliation.md 通則 G1）：EXCEPTION 的 message 文字不屬契約，只比對 error_code。
 # 套用於任何 error_code == "EXCEPTION" 的 JSON 物件（例：RPC-H-08、RPC-H-11）。
 g1_exception_message: true
+
+# PID 值在不同執行間會變動；依首次出現的 JSON 路徑替每個不同整數 PID 建立佔位名稱，保留數量與跨欄位關聯。
+# foreign_holders 的一般值為以 tty 路徑為鍵、持有者 PID 為值的整數（RPC-D-10，含 daemon 自身 pid），整個子樹視為 PID 欄位。
+pid_fields: [pid, pids, foreign_holders]
 
 # G2（spec-reconciliation.md 通則 G2）：Python 中順序未定義的集合，比較時以集合（排序後）比對。
 # command 為 argv 中必須連續出現的子命令片段；json_path 為回應物件內的點路徑。
@@ -41,9 +45,8 @@ g2_set_paths:
 
 # 比較前刪除的鍵（不影響判定的易變欄位，任意巢狀層級）。
 # 第一段為計畫原列的 14 項；「審查追加」段為 P9-T7B 審查依真實 L1.5 報告（261021-*）統計出的
-# 時間戳、計時器與 PID 欄位，屬行程或時序觀測值，不是產品契約。
+# 時間戳、計時器與計數欄位，屬行程或時序觀測值，不是產品契約。
 volatile_keys:
-  - pid
   - cmd_id
   - wall_ts
   - elapsed_ms
@@ -68,11 +71,8 @@ volatile_keys:
   - rx_rate_bps
   - boot_quiet_remaining_s
   - ready_reconfirm_remaining_s
-  - pids
-  # host /proc 掃描觀測（非 DUT 行為）：foreign_holders 的存在與否隨掃描時序變動（同一程式的相鄰 run
-  # 會一次有、一次無）；multi_open_detail 列出同機其他 serialwrapd 行程，取決於當下 host 上跑什麼。
-  # 注意：這使 L1.5 A/B 不再比對 foreign_holders 與 multi_open_detail；若要比對，須另以不依賴 host 掃描時序的確定性案例覆蓋（待審閱決定）。
-  - foreign_holders
+  # host /proc 掃描觀測（非 DUT 行為）：foreign_holders 可能受掃描時序影響，但保留結構供差分，
+  # 以免遮蔽 holder 數量與未知狀態；multi_open_detail 列出當下同機其他 serialwrapd 行程，仍視為易變資訊。
   - multi_open_detail
   # daemon status 首次快照的 WAL 序號：啟動期寫入的非同步時序決定快照值（相鄰 run 為 0／4／5），
   # 最終 WAL 內容每次皆為 11 筆；WAL 內容由 comparison.v1 逐筆比對，不由此欄位判定。
@@ -85,8 +85,9 @@ instance_root_placeholder: "<ROOT>"
 # 持有者 PTY 編號每次執行都會不同，不是產品行為；但 PTY 的存在與數量仍被比對。
 pty_path_placeholder: "<PTY>"
 
-# 審查追加（尚未獨立審閱）：輪詢型 CLI 呼叫的子命令前綴。連續且 argv 尾端相同者只比最後一筆，
-# 因為輪詢次數隨時序變動（同一 run 內 session list 的次數兩側可能不同）。
+# 審查追加（尚未獨立審閱）：輪詢型 CLI 呼叫的子命令前綴。連續且 argv 尾端相同、回應成功（rc 為 0 且未明示 RPC 錯誤）、
+# 正規化後內容相同者才收斂為最後一筆，因為輪詢次數隨時序變動（同一 run 內 session list 的次數兩側可能不同）。
+# 錯誤回應與語意狀態轉換（例如 running → done）一律保留，不得被收斂掉。
 poll_commands:
   - [session, list]
   - [cmd, status]

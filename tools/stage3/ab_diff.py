@@ -11,8 +11,8 @@
   未知、缺漏、非字串或 INSUFFICIENT_EVIDENCE 一律不視為通過（§11.3、§11.4）。
 - 安全：任一側任一 run 的 comparison.json invariants 有 verdict 為 FAIL。
 - 差異：兩側 comparison.json verdict；各次 CLI 呼叫的 argv 尾端（去除 CLI 路徑、endpoint 旗標與值、
-  `--cmd-id` 的值）、rc 與正規化後的 stdout JSON 是否一致。連續且 argv 相同的輪詢呼叫（contracts 的
-  poll_commands）只比最後一筆，因為輪詢次數隨時序變動，不屬產品行為。
+  `--cmd-id` 的值）、rc 與正規化後的 stdout JSON 是否一致。連續且 argv 相同、回應成功且正規化結果
+  相同的輪詢呼叫（contracts 的 poll_commands）才收斂；錯誤回應與狀態轉換皆保留。
   實例根目錄（func-test 以 `sw-func-*` 暫存目錄建立，不在報告目錄之下）取自各 run 自身的證據
   （socket／endpoint 旗標、manifest 的 daemon_side、daemon status 的 wal_dir／mirror_path），
   不假設位於報告目錄之下；Windows 以 tcp endpoint 與 COM 裝置名執行時，仍由 wal 路徑取得根目錄。
@@ -57,6 +57,7 @@ _RULE_KEYS = frozenset({
     "reviewed_by",
     "g1_exception_message",
     "g2_set_paths",
+    "pid_fields",
     "volatile_keys",
     "instance_root_placeholder",
     "pty_path_placeholder",
@@ -323,6 +324,8 @@ def _root_patterns(roots: Iterable[str]) -> tuple[re.Pattern[str], ...]:
 @dataclass(frozen=True)
 class _NormCtx:
     volatile: frozenset[str]
+    pid_fields: frozenset[str]
+    pid_aliases: dict[int, str]
     g1: bool
     roots: tuple[re.Pattern[str], ...]
     root_placeholder: str
@@ -336,28 +339,43 @@ def _text(value: str, ctx: _NormCtx) -> str:
     return _PTY_PATH.sub(lambda _match: ctx.pty_placeholder, value)
 
 
-def _strip(value: Any, ctx: _NormCtx) -> Any:
+def _strip(value: Any, ctx: _NormCtx, *, path: tuple[str, ...] = (), pid_field: bool = False) -> Any:
     """遞迴複製並套用 volatile 刪除、G1 刪除 message、實例根目錄與 PTY 路徑佔位替換。
 
     PTY 路徑改名後若與同層其他鍵碰撞（例如兩個 `/dev/pts/N` 持有者），保留全部值（排序清單），
     使持有者數量差異不致被靜默吞掉。
     """
+    if pid_field and isinstance(value, int) and not isinstance(value, bool):
+        alias = ctx.pid_aliases.get(value)
+        if alias is None:
+            alias = f"<PID:{'.'.join(path)}>"
+            ctx.pid_aliases[value] = alias
+        return alias
     if isinstance(value, Mapping):
         exception_message = ctx.g1 and value.get("error_code") == _EXCEPTION
         grouped: dict[Any, list[Any]] = {}
-        for key, child in value.items():
+        for key, child in sorted(value.items(), key=lambda item: str(item[0])):
             if key in ctx.volatile:
                 continue
             if exception_message and key == "message":
                 continue
             new_key = _text(key, ctx) if isinstance(key, str) else key
-            grouped.setdefault(new_key, []).append(_strip(child, ctx))
+            child_path = path + (str(new_key),)
+            # pid_field 沿子樹傳遞：foreign_holders 的值為 {tty 路徑: 持有者 PID}，PID 位於其直接子值。
+            # 子樹內只有 PID 欄位（schema 對 holder 物件 additionalProperties:false），故不會誤佔位非 PID 整數。
+            is_pid_field = pid_field or (isinstance(key, str) and key in ctx.pid_fields)
+            grouped.setdefault(new_key, []).append(
+                _strip(child, ctx, path=child_path, pid_field=is_pid_field)
+            )
         return {
             key: children[0] if len(children) == 1 else sorted(children, key=_canonical)
             for key, children in grouped.items()
         }
     if isinstance(value, list):
-        return [_strip(item, ctx) for item in value]
+        return [
+            _strip(item, ctx, path=path + (str(index),), pid_field=pid_field)
+            for index, item in enumerate(value)
+        ]
     if isinstance(value, str):
         return _text(value, ctx)
     return value
@@ -366,6 +384,8 @@ def _strip(value: Any, ctx: _NormCtx) -> Any:
 def _normalize(obj: Any, *, rules: Mapping[str, Any], roots: Iterable[str]) -> Any:
     ctx = _NormCtx(
         volatile=frozenset(_str_list(rules.get("volatile_keys"), "volatile_keys")),
+        pid_fields=frozenset(_str_list(rules.get("pid_fields"), "pid_fields")),
+        pid_aliases={},
         g1=bool(rules.get("g1_exception_message")),
         roots=_root_patterns(roots),
         root_placeholder=str(rules.get("instance_root_placeholder") or _DEFAULT_ROOT_PLACEHOLDER),
@@ -382,7 +402,7 @@ def normalize_response(obj: Any, *, rules: Mapping[str, Any], instance_root: str
 
     - G1：error_code 為 EXCEPTION 時刪除 message（rules.g1_exception_message）。
     - G2：rules.g2_set_paths 指向的清單排序後比較；呼叫端須先依子命令過濾 rules（見 `_rules_for_call`）。
-    - volatile_keys 任意巢狀層級刪除。
+    - volatile_keys 任意巢狀層級刪除；pid_fields 中的整數 PID 依首次出現路徑建立具名佔位映射，保留數量與關聯。
     - 字串中的 instance_root 換成 rules.instance_root_placeholder；`/dev/pts/N` 換成 pty_path_placeholder。
     """
     return _normalize(obj, rules=rules, roots=(instance_root,))
@@ -399,6 +419,7 @@ def load_rules(rules_path: Path) -> dict[str, Any]:
             raise ValueError(f"未知的 A/B 正規化規則鍵 {unknown}（新增鍵須經獨立審閱並同步本白名單）")
         if not isinstance(document.get("g1_exception_message", False), bool):
             raise ValueError("g1_exception_message 必須為布林值")
+        _str_list(document.get("pid_fields"), "pid_fields")
         _str_list(document.get("volatile_keys"), "volatile_keys")
         _g2_entries(document)
         _poll_commands(document)
@@ -440,18 +461,41 @@ def _is_poll(tail: tuple[str, ...], poll_commands: Sequence[tuple[str, ...]]) ->
 
 
 def _collapse_polls(calls: Sequence[Mapping[str, Any]],
-                    poll_commands: Sequence[tuple[str, ...]]) -> list[Mapping[str, Any]]:
-    """連續且 argv 尾端相同的輪詢呼叫收斂為最後一筆；非輪詢呼叫與其他呼叫原樣保留。"""
+                    poll_commands: Sequence[tuple[str, ...]], *, rules: Mapping[str, Any],
+                    roots: Iterable[str]) -> list[Mapping[str, Any]]:
+    """只收斂正規化後相同的連續成功輪詢；錯誤與語意狀態轉換原樣保留。"""
     collapsed: list[Mapping[str, Any]] = []
-    previous: tuple[str, ...] | None = None
     for call in calls:
         tail = _argv_tail(call)
-        if previous is not None and tail == previous and _is_poll(tail, poll_commands):
-            collapsed[-1] = call
-        else:
-            collapsed.append(call)
-        previous = tail
+        if collapsed:
+            previous = collapsed[-1]
+            previous_tail = _argv_tail(previous)
+            if (
+                tail == previous_tail
+                and _is_poll(tail, poll_commands)
+                and _poll_succeeded(previous)
+                and _poll_succeeded(call)
+                and previous.get("rc") == call.get("rc")
+            ):
+                call_rules = _rules_for_call(rules, (_argv_of(previous), _argv_of(call)))
+                previous_value = _normalized_payload(previous, rules=call_rules, roots=roots)
+                call_value = _normalized_payload(call, rules=call_rules, roots=roots)
+                if _first_difference(previous_value, call_value, "poll") is None:
+                    collapsed[-1] = call
+                    continue
+        collapsed.append(call)
     return collapsed
+
+
+def _poll_succeeded(call: Mapping[str, Any]) -> bool:
+    """只把 CLI 正常退出且回應未明示 RPC 錯誤的輪詢視為成功。"""
+    rc = call.get("rc")
+    if not isinstance(rc, int) or isinstance(rc, bool) or rc != 0:
+        return False
+    payload = _payload_of(call)
+    return not isinstance(payload, Mapping) or (
+        payload.get("ok") is not False and not payload.get("error_code")
+    )
 
 
 def _rules_for_call(rules: Mapping[str, Any], argvs: Sequence[Sequence[str]]) -> dict[str, Any]:
@@ -557,10 +601,10 @@ def _compare_run(case: str, a_run: Path, b_run: Path, *, rules: Mapping[str, Any
         found.append(_difference(case, "comparison.verdict", "verdict", case_changes))
     a_calls, _ = _read_calls(a_run)
     b_calls, _ = _read_calls(b_run)
-    a_seq = _collapse_polls(a_calls, poll_commands)
-    b_seq = _collapse_polls(b_calls, poll_commands)
     a_roots = _instance_roots(a_run, a_root, a_calls)
     b_roots = _instance_roots(b_run, b_root, b_calls)
+    a_seq = _collapse_polls(a_calls, poll_commands, rules=rules, roots=a_roots)
+    b_seq = _collapse_polls(b_calls, poll_commands, rules=rules, roots=b_roots)
     if len(a_seq) != len(b_seq):
         found.append(_difference(case, "calls.length", "value", case_changes))
     for index, (a_call, b_call) in enumerate(zip(a_seq, b_seq)):
