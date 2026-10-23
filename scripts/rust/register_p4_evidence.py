@@ -288,8 +288,8 @@ def _l1_outcome(
 def _manifest_candidates(cli: Path) -> tuple[list[Path], str | None]:
     """依 bundle 佈局列出 release-manifest.json 候選路徑（指標優先，之後為安裝根）。
 
-    指標 `current-release.json` 的 `dir` 為相對安裝根（`cli.parent.parent`）的 `versions\\<V>`（plan 04 Task 17），
-    反斜線先正規化為 `/`；絕對路徑照舊。指標存在但無法解析即回報錯誤，不得靜默略過。
+    指標 `current-release.json` 的 `dir` 為相對安裝根（`cli.parent.parent`）的 `versions/<V>`（plan 04 Task 17，OD-18 (3)
+    一律正斜線）。讀取端仍接受舊版反斜線指標，先正規化為 `/`；絕對路徑照舊。指標存在但無法解析即回報錯誤，不得靜默略過。
     """
     candidates = [cli.parent.parent / "release-manifest.json"]
     pointer = cli.parent / "current-release.json"

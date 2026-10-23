@@ -282,7 +282,8 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
     Write-Json (Join-Path $versionRoot 'release-manifest.json') $manifest
     Write-Json (Join-Path $binRoot 'current-release.json') ([ordered]@{
         bundle_version = $version
-        dir = "versions\$version"
+        # OD-18 (3)：指標 `dir` 一律正斜線（launcher.rs 拒收含 `\` 的 dir）；僅改 JSON 字串，上方 Join-Path 檔案系統路徑不變。
+        dir = "versions/$version"
     })
     return $BundleRoot
 }

@@ -71,8 +71,8 @@ def tree_digests(bundle_dir: pathlib.Path) -> tuple[str, str]:
 def install_dir(cli_exe: pathlib.Path) -> pathlib.Path | None:
     """依 POSIX symlink bundle 或 Windows current-release sidecar 尋找安裝。
 
-    Windows 的 `dir` 為相對安裝根（`bin` 的上一層）的 `versions\\<V>`（plan 04 Task 17；rollback.rs 寫入 `versions/<V>`），
-    故以 `cli.parent.parent` 為基準；反斜線分隔先正規化為 `/`，絕對路徑照舊。
+    Windows 的 `dir` 為相對安裝根（`bin` 的上一層）的 `versions/<V>`（plan 04 Task 17，OD-18 (3) 一律正斜線；rollback.rs 寫入 `versions/<V>`），
+    故以 `cli.parent.parent` 為基準；讀取端仍接受舊版反斜線分隔並先正規化為 `/`，絕對路徑照舊。
     """
     cli = _path(cli_exe).resolve()
     if os.name == "nt":

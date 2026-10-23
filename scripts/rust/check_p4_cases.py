@@ -24,6 +24,9 @@
 - 平台適用性（G4）：受測 HEAD 且帶 `test_id` 的紀錄，若節點屬 cargo／contract_blackbox pytest 範圍，須其 platform
   在 `platform_applicability` 算出的適用集合內（cargo 依 s1b_cargo 鎖；pytest 依該平台 s1b_20groups selector 的 markexpr 收集）；
   不適用或兩平台皆不適用者不計入／FAIL。與 register_p4_evidence、ab_blackbox_1b 共用同一實作。
+- OD-18 (1)(2)：某平台若案例每個節點皆不適用於該平台，且 (案例, 平台, 節點) 皆列於 `APPROVED_NOT_APPLICABLE`，
+  略過該平台的 rust PASS 要求；案例至少一個平台須有 rust PASS。實算 `not_applicable` 與核准清單逐列比對，
+  新增或缺少任一列一律 FAIL（待擁有者核准）。
 - 判定結果：任一硬性失敗 → exit 1（「證據不足不得轉為 PASS」，不變量 `insufficient_evidence_not_pass`）。
   若唯一的缺口是 `evidence_status: BLOCKED-OWNER` 的 L2／L3／manual 案例證據（擁有者機台待補） → exit 2（BLOCKED-OWNER）。
   全部通過 → exit 0。失敗列同時輸出到 stdout 與 stderr 的摘要行。
@@ -344,7 +347,8 @@ def _layer_problem(labels: ModuleType | None, record: dict[str, Any], case_layer
 # - cargo 節點（`sw-…::…`）：該平台 s1b_cargo 凍結鎖的 nodeids 含 `cargo:<節點>`。
 # - contract_blackbox pytest 節點（`tests/contract_blackbox/…::…`）：該平台 s1b_20groups 凍結 selector 的 markexpr
 #   收集得到該節點（pytest --collect-only -m <markexpr>，與凍結 selector 同一收集語意）。
-# 不適用者不產生記錄、也不在該平台執行；每個 case.platforms 平台至少要有一筆適用且 PASS 的記錄；
+# 不適用者不產生記錄、也不在該平台執行；每個 case.platforms 平台至少要有一筆適用且 PASS 的記錄（OD-18 (1)：
+# 僅當該平台每個節點皆列於 APPROVED_NOT_APPLICABLE 時可略過，且案例至少一個平台須有 rust PASS）；
 # 兩個平台都不適用的節點一律 FAIL。不屬於上述兩類的節點（例如 tests/ 下的單元節點）不在本規則內。
 CARGO_SELECTOR_SET = "s1b_cargo"
 PYTEST_SELECTOR_SET = "s1b_20groups"
@@ -352,6 +356,27 @@ CARGO_LOCK_PREFIX = "cargo:"
 WINDOWS_TARGET_TRIPLE = "x86_64-pc-windows-gnu"
 # pytest 收集結果為「沒有任何測試被收集」（全數被 -m 取消選取）時的退出碼。
 PYTEST_NO_TESTS_COLLECTED = 5
+# OD-18 (1)(2) 核准之平台不適用（案例, 平台, 節點）清單，逐列對應 CHG-S1X-P4-APPL-01（共 15 列）。
+# 核准依據：OD-18 (1) 核准 CHG-S1X-P4-APPL-01（sc20／bc05-three-topologies windows 列依 (2) 記為 not_applicable）。
+# 本清單只縮小「不適用節點」的 rust PASS 分母；不適用節點若出現紀錄仍計為 FAIL（見 check_case_evidence）。
+# 新增或移除任一列須以 OD-18 之後的擁有者裁決（addenda）為依據，並同步更新 summary 比對（not_applicable_approval_problems）。
+APPROVED_NOT_APPLICABLE: frozenset[tuple[str, str, str]] = frozenset({
+    ("bc05-process-lifecycle-stop-restart", "linux", "sw-pal::process_tunnel::windows_terminate_tree_kills_child_and_grandchild"),
+    ("bc05-process-lifecycle-stop-restart", "windows", "sw-pal::process_tunnel::posix_terminate_kills_whole_group_including_grandchild"),
+    ("bc05-three-topologies", "windows", "tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_topologies_docker"),
+    ("sc12-reconcile-wait-old-daemon", "windows", "tests/contract_blackbox/test_cli_mgmt_setup.py::test_setup_ab_reconcile_timeout"),
+    ("sc20-daemon-restart", "windows", "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_daemon_restart_ab"),
+    ("sc23-setup-rollback", "windows", "tests/contract_blackbox/test_cli_mgmt_update.py::test_fresh_install_blackbox"),
+    ("sc25-release-manifest-version-pairing", "windows", "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks"),
+    ("sc25-release-manifest-version-pairing", "windows", "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle"),
+    ("sc27-windows-connect-benches", "windows", "tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_benches_ab"),
+    ("sc36-win-installer-com0com-optional", "windows", "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_bundle_license_files_present"),
+    ("sc36-win-installer-com0com-optional", "windows", "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_cli_schema_flags_rust_only"),
+    ("sc36-win-installer-com0com-optional", "windows", "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_incomplete_installer_payload_fails_closed"),
+    ("sc36-win-installer-com0com-optional", "windows", "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_installer_only_zip_extracts_complete_x64_payload"),
+    ("sc36-win-installer-com0com-optional", "windows", "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_readme_com0com_both_languages"),
+    ("sc36-win-installer-com0com-optional", "windows", "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_signed_zip_hash_mismatch_fails_before_extraction"),
+})
 
 
 def applicability_rule_applies(node: str) -> bool:
@@ -494,12 +519,42 @@ def check_case_evidence(
             continue
         passing.append(record)
 
-    for plat in case.get("platforms", []):
+    platforms = list(case.get("platforms", []))
+    for plat in platforms:
+        if _approved_not_applicable_platform(case, plat, applicability):
+            # OD-18 (1)(2)：本平台每個節點皆經核准為不適用，不產生紀錄、不要求該平台 rust PASS。
+            continue
         ok = [r for r in passing if r["round"] == "rust" and r["platform"] == plat and r["result"] == "PASS"]
         if not ok:
             detail = f"（另有 {stale} 筆證據 commit 非受測 HEAD，不計入）" if stale else ""
             problems.append(f"{cid}: 缺少 {plat} 的 rust 輪 PASS（受測 HEAD、artifact 已驗）{detail}")
+    # OD-18 另加檢查：全部平台皆經核准略過時，仍須至少一個平台有 rust PASS（否則所有平台皆不適用的案例會被放行）。
+    if platforms and all(_approved_not_applicable_platform(case, plat, applicability) for plat in platforms):
+        if not any(r["round"] == "rust" and r["result"] == "PASS" and r["platform"] in platforms for r in passing):
+            problems.append(f"{cid}: 所有平台皆經核准為不適用，但無任一平台具 rust 輪 PASS（至少須一個平台有 rust PASS）")
     return problems, passing, str(path)
+
+
+def _approved_not_applicable_platform(
+    case: dict[str, Any],
+    plat: str,
+    applicability: dict[str, frozenset[str]] | None,
+) -> bool:
+    """OD-18 (1)：案例每個節點皆不適用於 `plat`，且 (案例, 平台, 節點) 皆列於 APPROVED_NOT_APPLICABLE → True。
+
+    fail-closed：適用性為 None、節點未出現在適用性結果（未計算）、或案例含非規則節點時一律回 False（不略過）。
+    """
+    if applicability is None:
+        return False
+    nodes = [_rule_node_id(test) for test in case.get("tests", [])]
+    if not nodes or any(node is None for node in nodes):
+        return False
+    for node in nodes:
+        if node not in applicability or plat in applicability[node]:
+            return False
+        if (case["case_id"], plat, node) not in APPROVED_NOT_APPLICABLE:
+            return False
+    return True
 
 
 def _junit_counts(path: Path) -> dict[str, int] | None:
@@ -666,6 +721,28 @@ def _not_applicable_pairs(cases: list[dict[str, Any]], applicability: dict[str, 
     return rows
 
 
+def not_applicable_approval_problems(
+    cases: list[dict[str, Any]],
+    not_applicable: list[dict[str, str]],
+) -> list[str]:
+    """實算 `not_applicable` 與 APPROVED_NOT_APPLICABLE 逐列比對（OD-18）；新增或缺少任一列皆為問題（待擁有者核准）。
+
+    只比對目前映射表內的必要案例；凍結案例之刪除或降級由 lock 檢查（--freeze --add-only／--check）負責。
+    """
+    required_ids = {c["case_id"] for c in cases if c.get("necessity") == "required"}
+    computed = {(r["case_id"], r["platform"], r["node"]) for r in not_applicable}
+    expected = {row for row in APPROVED_NOT_APPLICABLE if row[0] in required_ids}
+    problems = [
+        f"{cid}: 實算不適用列 {plat}／{node} 未列入 OD-18 核准清單（待擁有者核准）"
+        for cid, plat, node in sorted(computed - expected)
+    ]
+    problems += [
+        f"{cid}: OD-18 核准之不適用列 {plat}／{node} 實算未出現（待擁有者核准）"
+        for cid, plat, node in sorted(expected - computed)
+    ]
+    return problems
+
+
 def check(
     evidence_dir: Path | None = None,
     l1_dir: Path | None = None,
@@ -705,6 +782,7 @@ def check(
             failures.append(f"{cid}: 凍結時的承接節點已不存在於映射表：{gone}")
 
     applicability: dict[str, frozenset[str]] = {}
+    applicability_ok = True
     evidence_test_ids = _evidence_test_ids(cases, evidence_dir, head)
     # 適用性須涵蓋全部必要案例的規則節點（不只有證據節點），才能逐列列出不適用的（案例, 平台, 節點）組合。
     rule_nodes = sorted(evidence_test_ids | _case_rule_nodes(cases))
@@ -712,8 +790,12 @@ def check(
         try:
             applicability = platform_applicability(rule_nodes, cwd=REPO_ROOT)
         except (RuntimeError, ValueError, OSError, KeyError) as exc:
+            applicability_ok = False
             failures.append(f"平台適用性收集失敗（fail-closed，不得放行）：{exc}")
     not_applicable = _not_applicable_pairs(cases, applicability)
+    if applicability_ok:
+        # OD-18：實算不適用列須與核准清單逐列相符；新增或缺少任一列一律 FAIL（待擁有者核准）。
+        failures.extend(not_applicable_approval_problems(cases, not_applicable))
 
     summary_cases: list[dict[str, Any]] = []
     for cid, case in current.items():
