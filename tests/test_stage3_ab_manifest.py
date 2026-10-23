@@ -136,6 +136,34 @@ def test_stage3_requires_python_baseline_daemon(tmp_path):
     assert ei.value.code == "HARNESS_MANIFEST_INVALID"
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["device_open_probe", "accept_unreadable_holders"],
+)
+def test_load_rejects_non_boolean_release_flags(tmp_path, field):
+    path = _fk().write_ab_manifest(tmp_path)
+    _edit_manifest(path, lambda d: d["release"].__setitem__(field, "false"))
+
+    with pytest.raises(_he()) as ei:
+        _load(path)
+
+    assert ei.value.code == "HARNESS_MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["device_open_probe", "accept_unreadable_holders"],
+)
+def test_load_rejects_missing_release_flags(tmp_path, field):
+    path = _fk().write_ab_manifest(tmp_path)
+    _edit_manifest(path, lambda d: d["release"].pop(field))
+
+    with pytest.raises(_he()) as ei:
+        _load(path)
+
+    assert ei.value.code == "HARNESS_MANIFEST_INVALID"
+
+
 # ---- load_manifest 拒絕規則（參數化表）----
 LOAD_REJECT_CASES = [
     ("a_not_baseline", {"sides.0.role": "candidate"}),

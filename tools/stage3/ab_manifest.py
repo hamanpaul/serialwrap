@@ -339,13 +339,19 @@ def load_manifest(path: Path) -> AbManifest:
                       tier, _strings(suite_doc.get("extra_args"), "suite.extra_args"))
 
     release_doc = _mapping(root.get("release"), "release")
+    device_open_probe = release_doc.get("device_open_probe")
+    if not isinstance(device_open_probe, bool):
+        raise _invalid("release.device_open_probe must be boolean")
+    accept_unreadable_holders = release_doc.get("accept_unreadable_holders")
+    if not isinstance(accept_unreadable_holders, bool):
+        raise _invalid("release.accept_unreadable_holders must be boolean")
     release = ReleaseSpec(_number(release_doc.get("timeout_s"), "release.timeout_s"),
                           _number(release_doc.get("poll_s"), "release.poll_s"),
                           _strings(release_doc.get("endpoints"), "release.endpoints"),
                           _strings(release_doc.get("device_paths"), "release.device_paths"),
                           _strings(release_doc.get("lock_paths"), "release.lock_paths"),
-                          bool(release_doc.get("device_open_probe")),
-                          bool(release_doc.get("accept_unreadable_holders")))
+                          device_open_probe,
+                          accept_unreadable_holders)
     reverify_doc = _mapping(root.get("reverify"), "reverify")
     if not isinstance(reverify_doc.get("enabled"), bool):
         raise _invalid("reverify.enabled must be boolean")
