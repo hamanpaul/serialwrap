@@ -18,6 +18,7 @@ from bb_harness import isolated_env, repo_root
 from bb_l15 import (
     BridgeTarget,
     RaisingThread,
+    assert_no_tx_after,
     current_release_path,
     daemon_pid,
     finish_test_rig,
@@ -53,6 +54,11 @@ BUSY_PUSH_BYTES = 16 * 1024
 # 該 TX 會落在拒絕視窗內、破壞零 TX 斷言；故另以 `chunk_timeout_s` 放寬（見 BUSY_CHUNK_TIMEOUT_S）。
 BUSY_FIRST_ACK_DELAY_MS = 20000
 BUSY_CHUNK_TIMEOUT_S = BUSY_FIRST_ACK_DELAY_MS / 1000 + 40
+# 交接排空窗口長度（sw_core/daemon.py `HANDOFF_DRAIN_GRACE_S`）；黑箱不得 import sw_core，故於此重述。
+HANDOFF_DRAIN_GRACE_S = 3.0
+# DeviceWatcher 預設輪詢間隔 1.0 s（sw_core/device_watcher.py）。每次連結變動後等待略大於一個週期，
+# 確保至少一次重探已看見該變動（連結移除與復原皆然）。
+DEVICE_RESCAN_WAIT_S = 1.1
 
 
 def _install_old(tmp_path: Path, env: dict[str, str], bundle: Path) -> tuple[Path, Path]:
@@ -365,6 +371,91 @@ def test_update_push_after_freeze_zero_tx_l15(tmp_path: Path, env: dict[str, str
         assert installed_version(env) == "0.4.1"
         assert wait_session(env)["state"] == "READY"
     finally:
+        if update_thread.is_alive():
+            resume_pause(pause_dir, "handoff_stop:replied")
+            update_thread.join(15.0)
+        env.pop("SW_TEST_UPDATE_PAUSE_AFTER", None)
+        env.pop("SW_TEST_UPDATE_PAUSE_DIR", None)
+        _stop_rig(bridge, daemon, new_cli, env)
+
+
+@pytest.mark.rust_only
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+@pytest.mark.pidns_rig
+def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, env: dict[str, str]) -> None:
+    """handoff_stop 回 ok 後的排空窗口內，背景來源不得產生 DUT TX（OD-16 (3) 所需之 L1.5 證據）。
+
+    與 `test_update_push_after_freeze_zero_tx_l15`（只驗 file.push 路徑）不同：本案例窗口內不送任何 RPC，
+    觸發全部來自背景引擎，依序為既有 console 輸入一行、DeviceWatcher 重探（by-id 連結移除後等待一次重探、
+    復原後再等待一次重探）。
+
+    時序與窗口邊界：窗口自 daemon 寫出 `handoff_stop` 回覆起算，長度為 HANDOFF_DRAIN_GRACE_S；CLI 於收到回覆後
+    才寫出暫停點，故暫停點觀察到的時刻不早於窗口起點。斷言分兩段：
+    1) 窗口仍開啟的證明：觸發後舊 daemon 尚未停止、`health.ping` 成功，且此時 TX 仍與凍結時一致；
+    2) 整段零 TX：舊 daemon 停止（即窗口結束）後，以 bridge mark 作為擷取排空的屏障，TX 須與凍結時一致，
+       且 console marker 不得出現於 TX（`assert_no_tx_after`）。
+
+    console 前提：update 的 `update_safety_check` 階段會拒絕持有 interactive lease 的 console（`SESSION_BUSY`）；
+    daemon 的 lease 自癒則會在外部程序持有 vtty 時授予 human lease（`_HUMAN_PEER_GRACE_S`）。因此本案例只讀取
+    `primary["vtty"]` 路徑，於 `handoff_stop:replied` 暫停點之後才 `os.open`（凍結期間 lease 自癒 tick 停用），
+    不得於 update 啟動前開啟。human console（`session.console_attach`）同樣會開啟 interactive lease，
+    使 handoff 回 `SESSION_BUSY`，故不作為觸發來源。
+    """
+    old, new = update_bundles()
+    old_cli, _root = _install_old(tmp_path, env, old)
+    bridge, daemon = _start_rig(tmp_path, env)
+    new_cli = select_bundle(env, new)
+    pause_dir = tmp_path / "pause-drain-window"
+    env.update({"SW_TEST_UPDATE_PAUSE_AFTER": "handoff_stop:replied", "SW_TEST_UPDATE_PAUSE_DIR": str(pause_dir)})
+    update_rows = []
+    update_thread = RaisingThread(
+        lambda: update_rows.append(run_cli(new_cli, ["setup", "--on-demand"], env, timeout_s=240.0)),
+    )
+    console_fd: int | None = None
+    try:
+        consoles = rpc(env, "session.console_list", {"selector": "COM0"}).get("consoles") or []
+        primary = next((row for row in consoles if row.get("label") == "primary"), None)
+        assert primary is not None and primary.get("vtty"), consoles
+        vtty = primary["vtty"]
+        update_thread.start()
+        wait_pause(pause_dir, "handoff_stop:replied")
+        bridge.mark("handoff-frozen", os.getpid())
+        tx_at_freeze = tx_bytes(bridge.evidence_dir)
+        frozen_pid = daemon.proc.pid
+        console_fd = os.open(vtty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        # 1) 既有 console 輸入一行（不經 RPC）。
+        marker = f"DRAIN_WINDOW_{time.time_ns()}"
+        os.write(console_fd, f"echo {marker}\n".encode())
+        # 2) by-id 連結移除後等待一次重探，復原後再等待一次重探。
+        bridge.control.call("by_id_link_remove", {})
+        time.sleep(DEVICE_RESCAN_WAIT_S)
+        bridge.control.call("by_id_link_add", {})
+        time.sleep(DEVICE_RESCAN_WAIT_S)
+        # 3) 窗口仍開啟的證明：舊 daemon 尚未停止且仍回應 health.ping（不經 service lock）。
+        assert daemon.proc.pid == frozen_pid and daemon.proc.poll() is None, (
+            f"{HANDOFF_DRAIN_GRACE_S:g} s 排空窗口已結束，背景觸發未位於窗口內，須調整時序"
+        )
+        ping = rpc(env, "health.ping")
+        assert ping.get("ok") is True and ping.get("pong") is True, ping
+        assert tx_bytes(bridge.evidence_dir) == tx_at_freeze, "排空窗口內背景觸發產生 DUT TX"
+        # 4) 整段窗口：舊 daemon 停止即窗口結束；以 bridge mark 作為擷取排空屏障後，全段 TX 須零增量。
+        deadline = time.monotonic() + HANDOFF_DRAIN_GRACE_S + 10.0
+        while daemon.proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert daemon.proc.poll() is not None, "舊 daemon 未於排空窗口結束後停止"
+        bridge.mark("handoff-window-end", os.getpid())
+        assert_no_tx_after(bridge.evidence_dir, tx_at_freeze, marker.encode())
+        resume_pause(pause_dir, "handoff_stop:replied")
+        update_thread.join(120.0)
+        assert not update_thread.is_alive(), "setup update 未在 120 秒內結束"
+        update = update_rows[0]
+        assert update.returncode == 0, update.stdout + update.stderr
+        assert installed_version(env) == "0.4.1"
+        assert wait_session(env)["state"] == "READY"
+    finally:
+        if console_fd is not None:
+            os.close(console_fd)
         if update_thread.is_alive():
             resume_pause(pause_dir, "handoff_stop:replied")
             update_thread.join(15.0)

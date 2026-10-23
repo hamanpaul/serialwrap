@@ -500,6 +500,13 @@ def tx_bytes(evidence_dir: Path) -> bytes:
     return b"".join(tx_payloads(evidence_dir))
 
 
+def assert_no_tx_after(evidence_dir: Path, baseline: bytes, marker: bytes) -> None:
+    """凍結基準（`baseline`，凍結當下的累計 TX）之後不得新增任何 DUT TX，且 console `marker` 不得出現於 TX。"""
+    current = tx_bytes(evidence_dir)
+    assert current == baseline, f"凍結後 DUT TX 有增量（{len(current)} 對基準 {len(baseline)} bytes）"
+    assert marker not in current, "凍結期間 console 輸入的 marker 出現於 DUT TX"
+
+
 def rx_bytes(evidence_dir: Path) -> bytes:
     return b"".join(wire_payloads(evidence_dir, "RX"))
 
