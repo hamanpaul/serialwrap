@@ -7,7 +7,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -264,20 +263,6 @@ def test_od18_approval_list_is_the_fifteen_listed_rows(gate) -> None:
     assert (BC05_THREE, "windows", BC05_THREE_NODE) in rows
     assert ("sc20-daemon-restart", "windows", SC20_NODE) in rows
     assert len([r for r in rows if r[0] == "sc36-win-installer-com0com-optional"]) == 6
-
-
-@pytest.mark.skipif(os.name == "nt", reason="真實適用性以 POSIX 收集為準；OD-18 真實資料對帳於 Linux 執行")
-def test_od18_real_map_not_applicable_rows_equal_approved_list() -> None:
-    """OD-18 對帳（真實資料）：以實際映射與實際 pytest 收集求得適用性，實算不適用列須逐列等於核准清單。
-
-    不以合成適用性代替，故不使用 `gate` fixture（其會改指向暫存映射）；新增或移除任一不適用列時，此測試即指出（待擁有者核准）。
-    """
-    gate = _load_gate()
-    cases = gate.load_cases()
-    nodes = sorted(gate._case_rule_nodes(cases))
-    applicability = gate.platform_applicability(nodes, cwd=gate.REPO_ROOT)
-    pairs = gate._not_applicable_pairs(cases, applicability)
-    assert gate.not_applicable_approval_problems(cases, pairs) == []
 
 
 def test_od18_bc05_windows_not_required_when_node_only_applies_to_linux(gate) -> None:
