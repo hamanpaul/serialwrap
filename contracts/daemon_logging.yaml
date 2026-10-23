@@ -47,14 +47,14 @@ messages:
     level: WARNING
     template: "serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥"
     args: [self._device_path, report.status]
-    source: "sw_core/serial_port.py:379"
+    source: "sw_core/serial_port.py:403"
 
   - id: uart_tiocncl_failed
     logger: serialwrap
     level: WARNING
     template: "serialwrap: TIOCNXCL failed on %s: %s"
     args: [self._device_path, exc]
-    source: "sw_core/serial_port.py:421"
+    source: "sw_core/serial_port.py:445"
 
   - id: device_watcher_tick_failed
     logger: serialwrap
@@ -160,7 +160,7 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1909"
+    source: "sw_core/uart_io.py:1923"
 
   - id: rx_handler_exception_posix
     logger: serialwrap
@@ -168,7 +168,7 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1956"
+    source: "sw_core/uart_io.py:1970"
 
   - id: deferred_invalidation
     logger: serialwrap
@@ -197,7 +197,7 @@ messages:
     level: WARNING
     template: "tx account evicted (cmd_id=%s)"
     args: [oldest_cmd]
-    source: "sw_core/uart_io.py:2243"
+    source: "sw_core/uart_io.py:2257"
 
   - id: drain_pending_write_cancel_failed
     logger: serialwrap
@@ -366,7 +366,7 @@ messages:
     level: WARNING
     template: "serialwrap: console 行超過 %d bytes 已丟棄（client=%s）"
     args: [CONSOLE_LINE_MAX_BYTES, client.client_id]
-    source: "sw_core/uart_io.py:1723"
+    source: "sw_core/uart_io.py:1737"
 
   - id: reboot_recovery_ensure_ready_tx_exception
     logger: serialwrap
