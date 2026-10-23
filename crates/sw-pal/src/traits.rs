@@ -887,7 +887,7 @@ pub trait SerialWriter: Send {
 pub trait WalFs: Send + Sync {
     /// POSIX：`O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC`；Windows：share-delete 常駐 handle。
     fn open_append(&self, path: &Path) -> PalResult<Box<dyn WalFile>>;
-    /// `None` = 路徑不存在。
+    /// `None` = 路徑不存在；Windows classic DeletePending 的 `ERROR_ACCESS_DENIED` 以 `(0, 0)` identity 哨兵回報。
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
     fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;

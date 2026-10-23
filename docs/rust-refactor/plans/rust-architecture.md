@@ -567,7 +567,7 @@ pub trait WalFs: Send + Sync {
     /// POSIX：open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666 & ~umask)
     /// Windows：CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS)
     fn open_append(&self, path: &Path) -> PalResult<Box<dyn WalFile>>;
-    fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;  // None = 不存在
+    fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>>;  // None = 不存在；Windows classic DeletePending 的 ACCESS_DENIED = Some((0,0)) 哨兵
     fn size(&self, path: &Path) -> PalResult<Option<u64>>;
     fn tail_needs_termination(&self, path: &Path) -> PalResult<bool>;
     fn read_all(&self, path: &Path) -> PalResult<Option<Vec<u8>>>;   // P5 Task 0 修訂（雙審）：讀取整檔；None = 不存在；Task 7 讀取 API 使用，Task 6 conformance 涵蓋
@@ -586,7 +586,7 @@ pub trait WalFile: Send {
     fn unlinked(&self) -> PalResult<bool>;                         // POSIX st_nlink==0 ｜ Windows FileStandardInfo.DeletePending
     fn close(self: Box<Self>) -> PalResult<()>;
 }
-#[derive(PartialEq, Eq, Clone, Debug)] pub struct FileIdentity(pub u128, pub u128);
+#[derive(PartialEq, Eq, Clone, Debug)] pub struct FileIdentity(pub u128, pub u128); // Windows classic DeletePending 查詢哨兵為 (0,0)
 /// WAL／mirror 寫入錯誤：`sent` 為失敗前已交 OS 且確認的 bytes；`error` 為最後一次 OS 錯誤（py_message 照 str(OSError)）。
 /// 開檔失敗等「未呼叫 write」的錯誤由呼叫端視為 `sent == 0`。
 #[derive(Debug, Clone)] pub struct WalWriteError { pub sent: usize, pub error: PalError }

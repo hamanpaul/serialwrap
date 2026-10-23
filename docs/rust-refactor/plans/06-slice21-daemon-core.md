@@ -1521,15 +1521,17 @@ POSIX 原生專屬（部分寫入進度，R2-F3；規格 §15.7.1：OS 內部的
 | 測試名 | 精確斷言 |
 |---|---|
 | `posix_rlimit_fsize_partial_write_reports_sent` | 以 `std::env::current_exe()` re-exec 本測試 binary 為子行程（env `SW_PAL_FSIZE_CHILD=1`，避免 rlimit 影響其他測試 thread）；子行程 `signal(SIGXFSZ, SIG_IGN)`＋`setrlimit(RLIMIT_FSIZE, 10)` 後 `open_append(p)`、`write_all_flush(&[b'x'; 64])` → `Err(e)`、`e.sent == 10`、`e.error.os_code == Some(libc::EFBIG)`、`e.error.py_message == "[Errno 27] File too large"`；檔案大小恰 10；子行程以 exit 0 回報、父行程斷言 exit status 與檔案內容 `== [b'x'; 10]` |
+| `posix_dir_writable_respects_real_permissions` | 非 root 測試行程以 `chmod 0o500` 驗證不可寫目錄回 false，再還原權限；root 下標記「證據不足」 |
 
 Windows 原生專屬：
 
 | 測試名 | 精確斷言 |
 |---|---|
 | `windows_share_flags_allow_external_delete_and_rename` | 外部行程（`cmd /c del <path>`）刪除成功；外部 `ren` 成功 |
-| `windows_delete_pending_with_external_reader_reported` | 外部 `py -3.12` 以 `open(p,'rb')` 持有 handle 後 `del`：`file.unlinked() == Ok(true)`（`FileStandardInfo.DeletePending`）；同名 `open_append` 在外部 handle 關閉前回 `Err(kind=AccessDenied)`，關閉後成功 |
+| `windows_classic_delete_pending_blocks_recreate_until_last_handle_closes` | 外部 `py -3.12` 以 share-delete 開啟 reader，另以 `SetFileInformationByHandle(FileDispositionInfo{DeleteFile:true})` 觸發 classic DeletePending；名稱仍存在、`file.unlinked() == Ok(true)`、`path_identity == Ok(Some(FileIdentity(0,0)))`；外部 reader 關閉前同名 `open_append` 回 `Err(kind=AccessDenied)`，關閉後成功 |
 | `windows_posix_semantics_delete` | 以 `SetFileInformationByHandle(FileDispositionInfoEx, FILE_DISPOSITION_FLAG_DELETE|FILE_DISPOSITION_FLAG_POSIX_SEMANTICS)` 刪除後，`path_identity == Ok(None)` 且可立即 `open_append` 新檔 |
 | `windows_identity_uses_fileid128` | `identity()` 回 `FileIdentity(volume_serial, file_id_128)`，與 `GetFileInformationByHandleEx(FileIdInfo)` 相同 |
+| `windows_dir_writable_ignores_readonly_directory_attribute` | 設目錄 `FILE_ATTRIBUTE_READONLY` 後，`dir_writable == true` 且仍可在目錄建立檔案，符合 CPython `os.access(W_OK|X_OK)` |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
@@ -1538,14 +1540,14 @@ Expected：`fake_conformance` PASS，`native_conformance` FAIL：`not implemente
 
 - [ ] **Step 3：實作**
 
-- POSIX：`open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666)`（umask 生效）；`write_all_flush` 迴圈 `write(bytes[sent..])` 直到全寫（EINTR 重試），無 user-space buffer；每次成功 `write` 累加 `sent`，`write` 回 0 → `WalWriteError{sent, error: PalError::io(EIO, "[Errno 5] Input/output error")}`、回 -1（非 EINTR）→ `WalWriteError{sent, error: <errno 對應 PalError>}`，**不得**丟棄已累加的 `sent`（arch §4.5，R2-F3）；`sync` = `fsync`；`identity` = `fstat (st_dev, st_ino)` → `FileIdentity(dev as u128, ino as u128)`；`unlinked` = `st_nlink == 0`；`path_identity` = `stat`（ENOENT → `None`）；`tail_needs_termination` 以唯讀 handle 檢查最後一個 byte，非空且不是 `\\n` 時回 true；`rename_noreplace_or_suffix`：Linux `renameat2(RENAME_NOREPLACE)`，`EEXIST` → 依序試 `.1`、`.2`…；`EINVAL`／`ENOSYS` → `link(from,to)` + `unlink(from)`；`sync_dir` = `open(dir, O_RDONLY)` + `fsync`；`dir_writable` = `access(W_OK|X_OK)`。
-- Windows：`CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL)`；`write_all_flush` 迴圈 `WriteFile`，以每次 `lpNumberOfBytesWritten` 累加 `sent`，失敗時同樣回 `WalWriteError{sent, error}`；`sync` = `FlushFileBuffers`；`identity` = `FileIdInfo`；`unlinked` = `FileStandardInfo.DeletePending`；`path_identity`：`CreateFileW(0 access, share RWD, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)`，`ERROR_FILE_NOT_FOUND|ERROR_PATH_NOT_FOUND` → `None`，其他查詢錯誤（含 `ERROR_ACCESS_DENIED`）維持未知；`tail_needs_termination` 以可共享讀取的 handle 檢查最後一個 byte；`rename_noreplace_or_suffix` 用 `MoveFileExW(flags=0)`，`ERROR_ALREADY_EXISTS` → 下一個後綴；`sync_dir` 回 `Ok(())`；`dir_writable` = 目錄存在且無 `FILE_ATTRIBUTE_READONLY`。
+- POSIX：`open(O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0o666)`（umask 生效）；`write_all_flush` 迴圈 `write(bytes[sent..])` 直到全寫（EINTR 重試），無 user-space buffer；每次成功 `write` 累加 `sent`，`write` 回 0 → `WalWriteError{sent, error: PalError::io(EIO, "[Errno 5] Input/output error")}`、回 -1（非 EINTR）→ `WalWriteError{sent, error: <errno 對應 PalError>}`，**不得**丟棄已累加的 `sent`（arch §4.5，R2-F3）；`sync` = `fsync`；`identity` = `fstat (st_dev, st_ino)` → `FileIdentity(dev as u128, ino as u128)`；`unlinked` = `st_nlink == 0`；`path_identity` = `stat`（ENOENT → `None`）；`tail_needs_termination` 以唯讀 handle 檢查最後一個 byte，非空且不是 `\\n` 時回 true；`rename_noreplace_or_suffix`：Linux `renameat2(RENAME_NOREPLACE)`，`EEXIST` → 依序試 `.1`、`.2`…；`EINVAL`／`ENOSYS` → `link(from,to)` + `unlink(from)`；link 若因非 `EEXIST` 失敗，先以 `lexists(to)` 判定碰撞（存在回 `EEXIST` 供後綴重試），否則降級一般 `rename(from,to)`；來源 unlink 失敗時只在確認目的仍是同一 inode 後回滾新硬連結；`sync_dir` = `open(dir, O_RDONLY)` + `fsync`；`dir_writable` = `access(W_OK|X_OK)`。
+- Windows：`CreateFileW(FILE_APPEND_DATA|SYNCHRONIZE, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL)`；`write_all_flush` 迴圈 `WriteFile`，以每次 `lpNumberOfBytesWritten` 累加 `sent`，失敗時同樣回 `WalWriteError{sent, error}`，Win32 錯誤先轉 Python CRT errno 格式；`sync` = `FlushFileBuffers`；`identity` = `FileIdInfo`；`unlinked` = `FileStandardInfo.DeletePending`；`path_identity`：`CreateFileW(0 access, share RWD, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS)`，`ERROR_FILE_NOT_FOUND|ERROR_PATH_NOT_FOUND` → `None`，classic DeletePending 查詢的 `ERROR_ACCESS_DENIED` → `Some(FileIdentity(0,0))`，其他錯誤維持未知；`tail_needs_termination` 以可共享讀取的 handle 檢查最後一個 byte；`rename_noreplace_or_suffix` 用 `MoveFileExW(flags=0)`，`ERROR_ALREADY_EXISTS` → 下一個後綴；`sync_dir` 回 `Ok(())`；`dir_writable` = 路徑是目錄（忽略目錄的 `FILE_ATTRIBUTE_READONLY`，符合 CPython `os.access`）。
 - 每個 `WalFile` 的 `close` 只能呼叫一次（`self: Box<Self>`），`Drop` 未 close 時也關 handle（唯一關閉點，規格 §8.2）。
 
 - [ ] **Step 4：執行並確認 PASS**
 
-Run：`cargo test -p sw-pal --features test-fakes --test wal_fs && scripts/rust/win-test.sh --package sw-pal`
-Expected：PASS（Windows 四個專屬測試原生執行通過）。
+Run：`cargo test -p sw-pal --features test-fakes --test wal_fs && scripts/rust/win-test.sh --package sw-pal -- --features test-fakes --test wal_fs`
+Expected：PASS（Windows 五個專屬測試原生執行通過）。
 
 - [ ] **Step 5：Commit**
 

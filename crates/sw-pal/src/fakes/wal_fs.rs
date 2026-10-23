@@ -433,6 +433,13 @@ impl WalFs for FakeWalFs {
 
     fn dir_writable(&self, dir: &Path) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.dir_writable.get(dir).copied().unwrap_or(true)
+        if inner.files.contains_key(dir) {
+            return false;
+        }
+        inner
+            .dir_writable
+            .get(dir)
+            .copied()
+            .unwrap_or_else(|| inner.dirs.contains(dir))
     }
 }
