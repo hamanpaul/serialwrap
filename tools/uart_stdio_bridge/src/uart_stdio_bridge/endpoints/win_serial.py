@@ -22,8 +22,8 @@ class WinSerialEndpoint:
 
     peer 開啟狀態以 COM-B 的 DSR 取樣：com0com 將對端（COM-A）開啟後拉起的 DTR 映射到本端 DSR。
     `peer_gate=True` 時，peer 未開啟（或剛開啟、仍在 settle 窗口）不寫入，寫入串流長度為 0，
-    對應 POSIX PTY 的 peer gate。`capabilities()` 仍全為 False：`peer_state` 與 `transport_disconnect`
-    須待 peer-close 實測結果寫回後才得宣告，不得由本取樣推論。
+    對應 POSIX PTY 的 peer gate。`capabilities()` 僅於 com0com 且 `peer_gate=True` 時宣告 `peer_state`
+    （DSR 取樣已於 COM20:COM21 原生實測）；`transport_disconnect` 恆為 False，不由本取樣推論。
     """
 
     kind = "win-serial"
@@ -179,7 +179,11 @@ class WinSerialEndpoint:
             return self._peer_dsr_locked(serial_obj)
 
     def capabilities(self) -> dict[str, bool]:
-        return {"transport_disconnect": False, "by_id_link": False, "peer_state": False}
+        # peer_state 僅於 com0com 且 peer gate 啟用時宣告：peer 關閉後 DSR 於 1 s 內拉低，寫入回 0，
+        # 已於 COM20:COM21 原生實測（b-log/rust-refactor/g3-peer-gate/261023-061416-2646662）。
+        # transport_disconnect 恆為 False：com0com 無不需管理員權限的斷線原語，peer 關閉僅標示為 peer_close。
+        peer_state = self.peer_gate and self.transport_mode == "virtual_com0com"
+        return {"transport_disconnect": False, "by_id_link": False, "peer_state": peer_state}
 
     def disconnect(self, *, remove_link: bool) -> None:
         with self._lock:
