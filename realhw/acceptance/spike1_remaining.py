@@ -373,6 +373,15 @@ def _line_mapping(values: dict[str, bool | None], *, rts: bool, dtr: bool) -> bo
     return values == {"cts": rts, "dsr": dtr, "cd": dtr}
 
 
+def _all_lines_low(values: dict[str, bool | None] | None) -> bool:
+    return values == {"cts": False, "dsr": False, "cd": False}
+
+
+def _consoles_idle(phase: dict[str, Any]) -> bool:
+    """該階段兩個 console 埠的輸入線（CTS／DSR／CD）皆為低電位。"""
+    return _all_lines_low(phase["console_a"]["values"]) and _all_lines_low(phase["console_b"]["values"])
+
+
 def _sample_control_lines(dut_b: Any, console_a: Any | None, console_b: Any | None) -> dict[str, Any]:
     sample = {"dut_b": _read_lines(dut_b)}
     if console_a is not None:
@@ -414,17 +423,18 @@ def _measure_control_lines(pair: str, console_pair: str | None) -> dict[str, Any
         }
 
     try:
-        dut_a.rts = False
-        dut_a.dtr = False
-        if console_a is not None:
-            console_a.rts = False
-            console_a.dtr = False
+        # 基線前先把所有已開埠的輸出線拉低。pyserial 開埠預設 RTS／DTR 為 True，
+        # 未拉低的 COM23 會把 COM22 的 CTS／DSR／CD 釘在 true，使隔離比較失去鑑別力（P2-T18 修正）。
+        for endpoint in opened:
+            endpoint.rts = False
+            endpoint.dtr = False
         time.sleep(0.1)
         baseline = _sample_control_lines(dut_b, console_a, console_b)
         dut_phases: dict[str, dict[str, Any]] = {}
         console_phases: dict[str, dict[str, Any]] = {}
 
         if console_a is not None:
+            # 正向對照（A→B）：確認 COM23 的輸入線確實由 COM22 驅動。
             console_a.rts = True
             time.sleep(0.1)
             console_rts = _read_lines(console_b)
@@ -444,6 +454,27 @@ def _measure_control_lines(pair: str, console_pair: str | None) -> dict[str, Any
             }
             console_a.dtr = False
             time.sleep(0.1)
+            # 反向對照（B→A）：確認 COM22 的輸入線確實由 COM23 驅動。
+            # 缺此方向時，COM22 的恆低讀值無法證明隔離（只是線路斷路或讀值凍結）。
+            console_b.rts = True
+            time.sleep(0.1)
+            reverse_rts = _read_lines(console_a)
+            console_phases["reverse_rts_only"] = {
+                "observed": reverse_rts["values"],
+                "errors": reverse_rts["errors"],
+                "mapping_consistent": _line_mapping(reverse_rts["values"], rts=True, dtr=False),
+            }
+            console_b.rts = False
+            console_b.dtr = True
+            time.sleep(0.1)
+            reverse_dtr = _read_lines(console_a)
+            console_phases["reverse_dtr_only"] = {
+                "observed": reverse_dtr["values"],
+                "errors": reverse_dtr["errors"],
+                "mapping_consistent": _line_mapping(reverse_dtr["values"], rts=False, dtr=True),
+            }
+            console_b.dtr = False
+            time.sleep(0.1)
 
         dut_a.rts = True
         time.sleep(0.1)
@@ -459,10 +490,9 @@ def _measure_control_lines(pair: str, console_pair: str | None) -> dict[str, Any
         if console_a is not None:
             for phase in (baseline, dut_rts, dut_dtr):
                 known_samples.extend((phase["console_a"], phase["console_b"]))
-            known_samples.extend((
-                {"values": console_phases["rts_only"]["observed"], "errors": console_phases["rts_only"]["errors"]},
-                {"values": console_phases["dtr_only"]["observed"], "errors": console_phases["dtr_only"]["errors"]},
-            ))
+            known_samples.extend(
+                {"values": phase["observed"], "errors": phase["errors"]} for phase in console_phases.values()
+            )
         readings_known = _all_lines_known(known_samples)
 
         baseline_values = baseline["dut_b"]["values"]
@@ -474,11 +504,10 @@ def _measure_control_lines(pair: str, console_pair: str | None) -> dict[str, Any
         positive_control_ok = console_a is not None and all(
             phase["mapping_consistent"] for phase in console_phases.values()
         )
-        console_baseline = baseline.get("console_a", {}).get("values")
+        # 隔離判定：基線與各 DUT 階段，兩個 console 埠的輸入線皆須全低。
+        # 不再以「與基線相同」比對——基線若已飽和，console 端的洩漏將無從偵測（P2-T18 修正）。
         isolation_ok = console_a is not None and all(
-            phase["console_a"]["values"] == console_baseline
-            and phase["console_b"]["values"] == baseline["console_b"]["values"]
-            for phase in (dut_rts, dut_dtr)
+            _consoles_idle(phase) for phase in (baseline, dut_rts, dut_dtr)
         )
 
         errors_present = any(
@@ -507,6 +536,7 @@ def _measure_control_lines(pair: str, console_pair: str | None) -> dict[str, Any
         return {
             "verdict": verdict,
             **({"blocked_reason": blocked_reason} if blocked_reason else {}),
+            "outputs_cleared_before_baseline": [dut_a_name, dut_b_name, *console_names],
             "dut_side": {
                 "port_a": dut_a_name,
                 "port_b": dut_b_name,
