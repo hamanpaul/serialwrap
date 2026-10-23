@@ -403,7 +403,13 @@ def test_l2_empty_required_set_is_incomplete_not_pass():
 )
 def test_sentinel_expires_forms(expires, expected_accepted: bool):
     cases = {"x": _sentinel_case(expires=expires)}
-    diff = _compare(_report(_result("x")), _report(_result("x", "FAIL", "tail mismatch")), {"x"}, cases=cases)
+    # 計畫第 3 條：XFAIL 案例兩側結果不同一律審查，因此哨兵接受路徑的 A 側須與 B 側一致（皆 FAIL）。
+    diff = _compare(
+        _report(_result("x", "FAIL", "tail mismatch")),
+        _report(_result("x", "FAIL", "tail mismatch")),
+        {"x"},
+        cases=cases,
+    )
     if expected_accepted:
         assert diff["xfail_accepted"] == ["x"]
         assert diff["expired_sentinels"] == []
@@ -424,7 +430,7 @@ def test_b_xfail_on_expected_pass_case_is_failure():
 def test_b_xfail_with_valid_sentinel_is_accepted():
     cases = {"x": _sentinel_case("tail mismatch")}
     diff = _compare(
-        _report(_result("x", "FAIL")),
+        _report(_result("x", "XFAIL", "tail mismatch observed")),
         _report(_result("x", "XFAIL", "tail mismatch observed")),
         {"x"},
         cases=cases,

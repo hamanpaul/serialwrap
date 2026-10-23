@@ -344,7 +344,7 @@ def _needs_review(
     b_verdict: str | None,
     registered: Mapping[str, str],
 ) -> bool:
-    """B 結果非 FAIL／XFAIL 時是否列入審查（B 的 FAIL／XFAIL 由呼叫端的哨兵路徑處理）。"""
+    """判斷是否需人工審查，包括 XFAIL 案例的兩側結果差異。"""
     if b_verdict == _XPASS:
         # 既有哨兵未再重現：須確認真修復與行為變更，不得自動刪除哨兵（§11.4）。
         return True
@@ -393,7 +393,7 @@ def compare_l2_reports(
                 expired_sentinels.append(case_id)
             else:
                 b_failures.append(case_id)
-        elif _needs_review(case_id, case, a_verdict, b_verdict, registered_case_changes):
+        if _needs_review(case_id, case, a_verdict, b_verdict, registered_case_changes):
             needs_review.append({"case": case_id, "a": a_verdict or "MISSING", "b": b_verdict or "MISSING"})
 
     integrity = {"a": a_side["integrity"], "b": b_side["integrity"]}

@@ -520,7 +520,11 @@ def test_l2_xfail_requires_sentinel_and_signature():
         cases={xfail_id: xfail_case},
     )
     assert accepted["xfail_accepted"] == [xfail_id]
-    assert accepted["verdict"] == "PASS"
+    assert accepted["needs_review"] == [{"case": xfail_id, "a": "PASS", "b": "FAIL"}]
+    assert accepted["verdict"] == "FAIL"
+    assert ab_verdict.combine(
+        "l2", a_status="PASS", b_status="FAIL", diff=accepted, registered={}
+    )[0] == "FAIL"
 
     expired_case = copy.deepcopy(xfail_case)
     expired_case["sentinel"]["expires"] = "2026-10-20T00:00:00+00:00"
