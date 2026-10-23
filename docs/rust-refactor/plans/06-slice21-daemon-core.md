@@ -31,7 +31,7 @@
 - repo 政策：不得 commit 到 `main`；本 Phase 在 `wt/rust-refactor/slice21-daemon-core` 分支工作，PR base 為 `feature/rust-refactor`（R-12）；每個 code PR 附 `changelog.d/<issue>-<slug>.md`，本 Phase 以追蹤鍵 `rust-s21` 命名（比照既有 `st06-*` 非數字鍵）；commit 用 Conventional Commits 繁中 subject，含 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer；完成前跑 `python3 -m pytest -q tests/` 與 `python3 -m policy_check --repo .`。
 - changelog fragment 格式：`policy_check.changelog.parse_fragment` 要求 YAML front matter，每個 fragment 一律寫成 `---\ntype: feat\nscope: <crate 或 tests>\n---\n<繁中本文>`（比照既有 `changelog.d/224-brcm-leading-whitespace.md`）；各 Task 標頭「Changelog fragment」只列檔名、`scope` 與本文。不得使用 `### Added` 標題格式（`collate` 會 raise `FragmentError`）。
 - 測試資產修改（既有 `tests/*.py`、`func-test/` runner／scenario、`tests/contract_blackbox/bb_*.py`、P2 bridge 工具）依規格 §10.4 必須由非實作者獨立審閱並在 PR 描述列出；本計畫凡標「測試資產變更（§10.4）」的步驟皆適用。
-- 需要 root 才會改變語意的測試（`TIOCEXCL` 在 `CAP_SYS_ADMIN` 下不生效、`chmod 000` 對 root 無效）：一律以 `geteuid()==0` 或具 `CAP_SYS_ADMIN` 判定後 skip，並在報告列為「證據不足」而非 PASS；另有一個專門的 `cap_sys_admin__tiocexcl_bypass_documented` 測試記錄 root 下的實際行為（§6.2 例外）。
+- 需要非 root 才會改變語意的測試（`TIOCEXCL` 在 `CAP_SYS_ADMIN` 下不生效、`chmod 000` 對 root 無效）：在被測子行程確認有效 UID／能力；無法取得所需身分時列為「證據不足」而非 PASS。`socket_probe_eacces_is_socket_unavailable` 在 root runner 下以降權子行程實跑；另有 `cap_sys_admin__tiocexcl_bypass_documented` 記錄 root 下的實際行為（§6.2 例外）。
 
 ## Review Focus
 
@@ -1244,7 +1244,9 @@ git commit -m "feat(sw-pal): Windows 序列埠 overlapped 獨占開啟與可收�
 **Files:**
 - Create: `crates/sw-pal/src/lock/posix.rs`、`crates/sw-pal/src/lock/windows.rs`、`crates/sw-pal/src/signal/posix.rs`、`crates/sw-pal/src/signal/windows.rs`、`crates/sw-pal/src/path_norm.rs`
 - Modify: `crates/sw-pal/src/lock.rs`、`crates/sw-pal/src/signal.rs`、`crates/sw-pal/src/conformance/lock_suite.rs`
-- Test: `crates/sw-pal/tests/lock.rs`
+- Test: `crates/sw-pal/tests/lock.rs`、`crates/sw-pal/src/test_support/signal_wait_harness.rs`、`crates/sw-pal/src/signal/posix.rs` 單元測試
+- Modify: `crates/sw-pal/Cargo.toml`（以 `test-fakes` feature 限定的 harness-free 訊號子行程）
+- Modify: `scripts/rust/win-test.sh`、`scripts/rust/win-runner.sh`（提供 harness-free 訊號子行程，並讓 collect-only 列舉略過不需要的測試資料複製）
 
 **Interfaces:**
 - Consumes：`sw_pal::traits::EndpointSpec`（P3：`Unix(OsString) | Tcp{host, port}`；sw-pal 不依賴 sw-proto，arch §1.3——`sw_proto::endpoint::parse_endpoint` 的 `Endpoint` 只在 `daemon_main` 轉成 `EndpointSpec`）。
@@ -1277,9 +1279,10 @@ fn second_acquire_same_lock_is_already_running_and_pid_written() {
 #[test]
 fn live_socket_under_other_lock_path_is_already_running_even_via_unix_url() {
     let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir(d.path().join("x")).unwrap();
     let sock = d.path().join("s.sock");
     let _l = UnixListener::bind(&sock).unwrap();
-    let ep = EndpointSpec::Unix(OsString::from(format!("{}/x/../s.sock", d.path().display())));
+    let ep = EndpointSpec::Unix(OsString::from(format!("unix://{}/x/../s.sock", d.path().display())));
     let r = sw_pal::native().instance_lock.acquire(&d.path().join("other.lock"), &ep);
     assert!(matches!(r, Err(InstanceLockError::AlreadyRunning)));
 }
@@ -1300,38 +1303,43 @@ fn stale_socket_is_unlinked_then_acquired() {
 
 | 測試名 | 平台／資源 | 精確斷言 |
 |---|---|---|
-| `socket_probe_eacces_is_socket_unavailable` | unix（root 下 skip，報告「證據不足」） | socket 檔所在目錄 `chmod 000` → `Err(InstanceLockError::SocketUnavailable)`，lock fd 已關（同一 lock 立即可再 acquire） |
+| `socket_probe_eacces_is_socket_unavailable` | unix | socket 檔所在目錄 `chmod 000` → `Err(InstanceLockError::SocketUnavailable)`，lock fd 已關（同一 lock 立即可再 acquire）；root runner 以 UID 65534 子行程實跑 |
+| `dangling_socket_symlink_is_not_unlinked` | unix | dangling symlink 依 `os.path.exists`／`stat` 視為不存在，取得鎖後 symlink 仍存在 |
+| `lock_path_alias_matches_python_home_expansion_and_unix_url` | unix | 隔離 `HOME` 下 Rust `unix://~/...` 與 Python 展開後絕對路徑互斥 |
 | `lock_file_mode_0600` | unix | 新建 lock 檔 `st_mode & 0o777 == 0o600` |
-| `normalize_for_compare_cases` | 全平台（純函式） | `normalize_for_compare("unix:///a/b/../c.sock", "/", None) == "/a/c.sock"`；`normalize_for_compare("rel/x.sock", "/w", None) == "/w/rel/x.sock"`；`normalize_for_compare("~/s.sock", "/w", Some("/h")) == "/h/s.sock"` |
+| `normalize_for_compare_cases` | 全平台（純函式） | `normalize_for_compare("unix:///a/b/../c.sock", "/", None) == "/a/c.sock"`；`normalize_for_compare("rel/x.sock", "/w", None) == "/w/rel/x.sock"`；`normalize_for_compare("~/s.sock", "/w", Some("/h")) == "/h/s.sock"`；POSIX 保留恰有兩個前導 `/`；Windows `C:s.sock` 依同磁碟 cwd 解析 |
 | `windows_live_tcp_endpoint_checked_before_lock` | windows 原生 | 先 `TcpListener::bind("127.0.0.1:0")`，以其 port 作 endpoint → `AlreadyRunning`，且 lock 檔**未被建立** |
 | `windows_lockfileex_conflicts_with_python_msvcrt_holder` | windows 原生（需 Windows Python） | 以 `py -3.12 -c "import msvcrt,os,time;fd=os.open(p,os.O_RDWR|os.O_CREAT,0o600);msvcrt.locking(fd,msvcrt.LK_NBLCK,1);print('held',flush=True);time.sleep(30)"` 持鎖後 `acquire` → `AlreadyRunning`（SC-10 互斥相容） |
 | `windows_second_acquire_in_process` | windows 原生 | 同 lock 第二次 → `AlreadyRunning`；`release` 後可再取得 |
-| `signal_extra_channel_stops_wait` | 全平台 | `wait_stop(rx)` 於另一 thread，`tx.send(())` 後 100 ms 內返回 |
-| `posix_sigterm_stops_wait_in_child` | unix | **在子程序內**執行（`current_exe --exact` 重入，`S21_CHILD=sigterm`）：子程序第一個動作 `install()`，之後才 spawn 4 個 worker thread 並 `wait_stop`；父程序對子程序送 `SIGTERM` → 子程序 exit 0（`wait_stop` 返回後正常結束，未被訊號殺死）；cargo test 主程序從不對自己送訊號 |
+| `windows_lock_path_strips_unix_url_prefix` | windows 原生 | `unix://<絕對鎖路徑>` 與絕對路徑互斥並建立同一檔案 |
+| `signal_extra_channel_stops_wait` | 全平台 | 不呼叫 `install()`；`wait_stop(rx)` 於另一 thread，`tx.send(())` 後 100 ms 內返回 |
+| `posix_sigterm_stops_wait_in_child` | unix | 由無 libtest harness helper 的子行程 `main()` 先 `install()`、重複呼叫確認冪等，再建立四個保持存活的 worker 並 `wait_stop`；父行程送 `SIGTERM` 後子行程 exit 0，所有等待皆有 5 秒期限並逾時回收 |
 | `posix_threads_spawned_after_install_inherit_mask` | unix（子程序） | `install()` 後建立的 thread 呼叫 `pthread_sigmask(SIG_BLOCK, NULL, &old)` → `old` 含 `SIGTERM|SIGINT` |
+| `windows_signal_install_is_idempotent_in_child` | windows 原生 | 獨立子行程重複 `install()` 兩次皆成功 |
+| `failed_signal_thread_spawn_restores_previous_mask` | unix unit | sigwait thread 建立失敗後，呼叫執行緒的 `SIGINT`／`SIGTERM` mask 與呼叫前一致 |
 | `cap_interactive_desktop__ctrl_break_stops_wait` | windows＋interactive_desktop | 子行程以 `CREATE_NEW_PROCESS_GROUP` 啟動並 `wait_stop`，父行程 `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` → 子行程 exit 0 |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
-Run：`cargo test -p sw-pal --features test-fakes --test lock && scripts/rust/win-test.sh --package sw-pal`
+Run：`cargo test -p sw-pal --features test-fakes --test lock && scripts/rust/win-test.sh --package sw-pal -- --features test-fakes --test lock`
 Expected：FAIL，`not implemented: slice21 T4 PosixInstanceLock::acquire`。
 
 - [ ] **Step 3：實作**
 
-- POSIX（07 §2.1 逐步）：`create_dir_all(parent)` → `open(O_RDWR|O_CREAT|O_CLOEXEC, 0o600)` → `flock(LOCK_EX|LOCK_NB)`，`EWOULDBLOCK` → close、`AlreadyRunning` → endpoint 為 `Unix(p)` 且 `p` 存在：`UnixStream::connect_timeout` 等價（非阻塞 connect＋poll 200 ms）：成功 → close、`AlreadyRunning`；`ENOENT|ECONNREFUSED` → `unlink`（錯誤忽略）；其他（含逾時）→ close、`SocketUnavailable` → `ftruncate(0)` → 寫 `"{pid}\n"` → `fsync`。`Tcp` endpoint 在 POSIX 不探測（Python 以 `os.path.exists("tcp://…")` 恆假）。
+- POSIX（07 §2.1 逐步）：lock 與 Unix socket 都先套 `endpoint_path_for_io`（去 `unix://`、展開 `~`、相對路徑接 cwd，保留 `..`／symlink OS 解析順序）→ `create_dir_all(parent)` → `open(O_RDWR|O_CREAT|O_CLOEXEC, 0o600)` → `flock(LOCK_EX|LOCK_NB)`，`EWOULDBLOCK` → close、`AlreadyRunning` → endpoint 為 `Unix(p)` 且 `stat(p)` 成功：`UnixStream::connect_timeout` 等價（非阻塞 connect＋poll 200 ms）：成功 → close、`AlreadyRunning`；`ENOENT|ECONNREFUSED` → `unlink`（錯誤忽略）；connect 其他錯誤（含逾時）→ close、`SocketUnavailable`。`stat` 的 `EACCES` → close、`SocketUnavailable`；`ENOENT` 與其他 stat 錯誤視為不存在。之後 `ftruncate(0)` → 寫 `"{pid}\n"` → `fsync`。`Tcp` endpoint 在 POSIX 不探測（Python 以 `os.path.exists("tcp://…")` 恆假）。
 - Windows（07 §2.2，SC-10）：endpoint 為 `Tcp` → `TcpStream::connect_timeout(200 ms)` 成功 → `AlreadyRunning`；`create_dir_all(parent)`；`CreateFileW(GENERIC_READ|GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE, OPEN_ALWAYS)`；`LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov offset 0)` 失敗 → `AlreadyRunning`；`SetEndOfFile` 於 offset 0、寫 pid、`FlushFileBuffers`。`release`：`UnlockFileEx` → `CloseHandle`。
 - 比較用路徑一律經 `normalize_for_compare`；寫入 config 的仍是原字串（RPC-D-07）。
-- SignalWait POSIX：`install()` 以 `pthread_sigmask(SIG_BLOCK, {SIGINT,SIGTERM})`（不得用 `sigprocmask`：多 thread 下語意未定義）擋下訊號後啟動專屬 thread `sigwait`，收到即送 internal channel；之後建立的所有 thread 繼承 mask，因此 `install()` 必須在 `main` 建立任何 thread 之前呼叫（Task 19）。`wait_stop` 以 `select!` 等 internal 或 `extra`。Windows：`install()` 以 `SetConsoleCtrlHandler` 處理 `CTRL_C_EVENT|CTRL_BREAK_EVENT|CTRL_CLOSE_EVENT` → 送 channel 並回 TRUE；`wait_stop` 同上。
+- SignalWait POSIX：`install()` 以 `pthread_sigmask(SIG_BLOCK, {SIGINT,SIGTERM})`（不得用 `sigprocmask`：多 thread 下語意未定義）擋下訊號後啟動專屬 thread `sigwait`，收到即送 internal channel；thread 建立失敗須還原舊 mask，`sigwait` 錯誤不得重試迴圈；之後建立的所有 thread 繼承 mask，因此 `install()` 必須在 `main` 建立任何 thread 之前呼叫（Task 19）。`wait_stop` 以 `select!` 等 internal 或 `extra`，extra sender 全數 drop 也會結束等待。Windows：`install()` 以 `SetConsoleCtrlHandler` 處理 `CTRL_C_EVENT|CTRL_BREAK_EVENT|CTRL_CLOSE_EVENT` → 送 channel 並回 TRUE；`CTRL_CLOSE_EVENT` handler 立即返回，console 關閉時的有序清理盡力完成；`wait_stop` 同上。
 
 - [ ] **Step 4：執行並確認 PASS**
 
-Run：`cargo test -p sw-pal --features test-fakes --test lock && scripts/rust/win-test.sh --package sw-pal`
+Run：`cargo test -p sw-pal --features test-fakes --test lock && scripts/rust/win-test.sh --package sw-pal -- --features test-fakes --test lock`
 Expected：PASS；`cap_interactive_desktop__*` 為 ignored。
 
 - [ ] **Step 5：Commit**
 
 ```bash
-git add crates/sw-pal changelog.d/rust-s21-pal-lock.md
+git add crates/sw-pal changelog.d/rust-s21-pal-lock.md tests/acceptance/l1_required.lock.json
 git commit -m "feat(sw-pal): Tier 1 實例鎖與停止訊號等待" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 

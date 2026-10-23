@@ -16,6 +16,7 @@
 
 - 平台相依 production code 只在 `sw-pal`；其他 crate 禁止 `#[cfg(unix)]`／`#[cfg(windows)]`／`target_os`／`cfg!`／`cfg_attr` 平台分支與 build script 間接分支（§3.1）；允許 `#[cfg(test)]` 與 `#[cfg(feature = "test-fakes")]`。`/dev/ttyMCU` 是否存在只看 `Capabilities.flash_endpoint`。
 - 需要 `sw_pal::fakes` 的 integration test 一律在該 crate `Cargo.toml` 以 `[[test]] name=… required-features=["test-fakes"]` 宣告；本計畫所有 `cargo test` 命令對這些測試一律帶 `--features test-fakes`（紅燈與綠燈步驟相同）。
+- P5-T4 的 POSIX `SignalWait::install()` 會讓後續執行緒繼承封鎖的 `SIGINT`／`SIGTERM`；本 Phase 所有 PAL 子行程 `pre_exec` 必須先以 `pthread_sigmask(SIG_UNBLOCK, ...)` 解除這兩個訊號，再執行 `exec`，避免 transfer／flash child 忽略 daemon 停止及逾時終止。
 - RPC／CLI `error_code` 與 session `last_error` 為兩個獨立命名空間（ADR-07、§9.3）。本切片新增輸出的碼全部是既有碼：`TRANSFER_*`、`TARGET_*`、`CHECKSUM_*`、`MOVE_*`、`PULL_PARSE_FAILED`、`BASE64_DECODE_FAILED`、`ECHO_ACK_UNSUPPORTED`、`CONSOLE_LINE_LIMIT_TOO_SMALL`、`LOCAL_FILE_NOT_FOUND`、`FLASHING_BUSY`、`DEVICE_STILL_HELD`、`DEVICE_NOT_PRESENT`、`SESSION_BUSY`、`AUTOBOOT_QUIET`（傳輸中途拒絕，SC-33）；更新／回滾守衛沿用 P4 的 `SESSION_BUSY`／`FLASHING_BUSY`；不得新增錯誤碼。
 - 錯誤碼計數由 `contracts/error_codes.yaml` 資料產生，不得硬編碼 78（§9.2、OD-06）。
 - `--retries` 只對 11 個唯讀方法重試：`health.ping`、`health.status`、`session.list`、`session.get_state`、`session.activity`、`session.console_list`、`session.log_status`、`device.list`、`alias.list`、`mcu.patterns`、`mcu.status`（§4.2）；`file.push`／`file.pull`／`device.release`／`device.attach` 絕不重試。

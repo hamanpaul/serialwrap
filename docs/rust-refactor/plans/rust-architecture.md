@@ -699,6 +699,7 @@ pub enum ProcGroupRef { Pgid(i32), WinTree }   // Windows 終止時以 Toolhelp3
 pub trait ProcessTunnel: Send + Sync {
     /// stdin=NUL，stdout 與 stderr 都導到 log 檔（append）。POSIX setsid；Windows CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW。
     /// 全程不使用 pipe（BC-05：拿掉 POSIX-only 的轉接依賴）
+    /// POSIX 子行程的 pre_exec 須解除從 daemon 繼承的 SIGINT／SIGTERM mask，再 exec。
     fn spawn_detached(&self, argv: &[String], log: &Path) -> PalResult<TunnelProc>;
     /// POSIX kill(pid,0) 加 start_ticks 比對；Windows OpenProcess＋GetExitCodeProcess＋CreationTime。
     /// Windows 上絕不可用 os.kill(pid,0)：在 Windows 那等於終止目標行程
@@ -710,7 +711,8 @@ pub trait ProcessTunnel: Send + Sync {
 }
 pub trait ProcessCtl: Send + Sync {
     fn spawn_daemon(&self, argv: &[String], env: &[(String,String)], detached: bool) -> PalResult<ChildRef>;
-    // POSIX：start_new_session、stdout/stderr→DEVNULL、stdin 繼承；Windows：DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP
+    // POSIX：start_new_session、stdout/stderr→DEVNULL、stdin 繼承；Windows：DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP。
+    // POSIX 的所有子行程 pre_exec 都須解除從 daemon 繼承的 SIGINT／SIGTERM mask，再 exec。
     fn poll(&self, c: &ChildRef) -> Option<i64>; // Windows 保留完整 DWORD exit code
     fn call_foreground(&self, argv: &[String], env: &[(String,String)]) -> PalResult<i64>;   // subprocess.call
     /// Stage 1A 委派：POSIX 用 execve（行程被取代，stdio、exit code、訊號天然一致）；
@@ -727,7 +729,10 @@ pub trait ProcScan: Send + Sync {
     fn serialwrapd_tty_holders(&self, tty_paths: &[String]) -> (IndexMapLike<String, u32>, HolderScanStatus);
 }
 pub trait SignalWait: Send + Sync {
-    /// daemon：SIGINT/SIGTERM（以 signalfd 或 sigwait thread）｜ SetConsoleCtrlHandler（CTRL_C/CTRL_BREAK/CLOSE），再加 Task Scheduler 的 /End
+    /// POSIX install 必須在 main 建立任何 thread 前封鎖 SIGINT／SIGTERM；重複 install 為 no-op。
+    fn install(&self) -> PalResult<()>;
+    /// daemon：SIGINT/SIGTERM（以 signalfd 或 sigwait thread）｜ SetConsoleCtrlHandler（CTRL_C/CTRL_BREAK/CLOSE），再加 Task Scheduler 的 /End。
+    /// extra sender 全數 drop 視為停止；CTRL_CLOSE_EVENT handler 立即返回，console 關閉時的有序清理盡力完成。
     fn wait_stop(&self, extra: crossbeam_channel::Receiver<()>);
 }
 ```

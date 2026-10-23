@@ -66,6 +66,24 @@ if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-daemon "* ]]; then
   fi
 fi
 
+if [[ "$is_wsl" == "1" && " ${PACKAGES[*]} " == *" sw-pal "* ]]; then
+  needs_test_fakes=0
+  for arg in "${CARGO_ARGS[@]}"; do
+    if [[ "$arg" == *test-fakes* ]]; then
+      needs_test_fakes=1
+      break
+    fi
+  done
+  if [[ "$needs_test_fakes" == "1" ]]; then
+    signal_harness="$ROOT/target/x86_64-pc-windows-gnu/debug/signal_wait_harness.exe"
+    if [[ -n "${SW_WIN_EXTRA_FILES:-}" ]]; then
+      export SW_WIN_EXTRA_FILES="$SW_WIN_EXTRA_FILES:$signal_harness"
+    else
+      export SW_WIN_EXTRA_FILES="$signal_harness"
+    fi
+  fi
+fi
+
 collector_args=(--platform windows)
 if [[ "$is_wsl" == "1" ]]; then
   collector_args+=(--runner "$RUNNER")

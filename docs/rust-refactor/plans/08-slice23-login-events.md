@@ -30,6 +30,7 @@
 - 本切片必要案例集合以 `tests/acceptance/cases.yaml`＋`cases.lock.json` 的 `slice_2.3` 集合為準（P2 `03-stage0-test-infra.md` Task 12），新增案例只能經 `regen_lock.py --add-only` 進鎖，且在 Stage I 開始前完成（§11.3「開工前凍結」）。
 - 每個 Task 的 Step 4 只要求「本 Task 的測試由紅轉綠＋既有已綠套件不退化」；其他 Task 尚在紅燈的 P7 測試 binary 以 `--test` 明列排除。整個 workspace 全綠只在 Stage I 結束（Task 17 Step 4）與 Task 19 要求。
 - 在 fakes 上通過的 PAL 測試**不得**計為原生 gate（arch §4、§9.1）；需要資源的測試命名 `cap_<resource>__<name>` 並 `#[ignore = "cap:<resource>"]`。
+- P5-T4 的 POSIX `SignalWait::install()` 會讓後續執行緒繼承封鎖的 `SIGINT`／`SIGTERM`；本 Phase 所有 PAL 子行程 `pre_exec` 必須先以 `pthread_sigmask(SIG_UNBLOCK, ...)` 解除這兩個訊號，再執行 `exec`，避免 handler child 無法被逾時或 daemon 停止訊號終止。
 
 ## Review Focus
 

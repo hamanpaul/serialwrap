@@ -41,5 +41,12 @@ windows-sys = { workspace = true, features = [
 # 記憶體替身（arch §4）；僅供測試，不得在產品路徑啟用。
 test-fakes = []
 
+[[bin]]
+name = "signal_wait_harness"
+path = "src/test_support/signal_wait_harness.rs"
+test = false
+bench = false
+required-features = ["test-fakes"]
+
 [dev-dependencies]
 tempfile = { workspace = true }

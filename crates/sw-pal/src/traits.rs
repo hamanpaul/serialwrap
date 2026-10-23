@@ -916,6 +916,8 @@ pub use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard}
 /// daemon 停止訊號等待（arch §4.9）。`install` 必須在 main 第一個動作、建立任何 thread 之前呼叫；重複呼叫回 `Ok(())`。
 pub trait SignalWait: Send + Sync {
     fn install(&self) -> PalResult<()>;
+    /// 等待 OS 停止訊號或 `extra` 通知；`extra` sender 全數 drop 也視為停止。
+    /// Windows `CTRL_CLOSE_EVENT` handler 只排入通知並立即返回，console 關閉時的有序清理盡力完成。
     fn wait_stop(&self, extra: crossbeam_channel::Receiver<()>);
 }
 
