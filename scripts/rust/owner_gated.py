@@ -5,8 +5,10 @@
 - 名稱以 `cap_` 開頭的測試是資源相依測試（`#[ignore = "cap:<resource>"]`）；它們在一般 CI／WSL 上為 skipped，
   代表「擁有者機台尚未執行」。這類 skipped 列必須以 BLOCKED-OWNER 列出，不得因為不在凍結鎖內就被靜默忽略。
 - `OWNER_GATED` 另登記不以 `cap_` 開頭、但同屬擁有者機台的 ignored 測試（`windows_switch_running_exe_rename`）。
-- 登記表內的列，若在目前 selector 涵蓋的 crate 中、且該平台會編譯進來，卻在報告的 results 與 collected 皆缺席，
-  代表收集失效（例如 selector 寫錯或測試被刪），判 INSUFFICIENT，不得以 BLOCKED-OWNER 帶過。
+- 登記表內的列，若在目前 selector 涵蓋的 crate 中、且該平台會編譯進來，卻在報告中「不存在」（results 無列，且 collected
+  缺席或僅以 deselected 出現），代表收集失效（例如 selector 寫錯或測試被刪），判 INSUFFICIENT，不得以 BLOCKED-OWNER 帶過。
+- deselected 且無結果列的擁有者機台節點（不論是否在登記表）不得靜默消失（sol ccf29ce）：一律列入 `owner_gated_skipped`
+  （BLOCKED-OWNER 待補並附原因）；登記列另列入 `absent_expected`（收集失效，判 INSUFFICIENT）。
 
 本模組只做「列舉與分類」，不做 PASS 判定；判定仍由 `tests/acceptance/l1_judge.py` 負責（不改其規則）。
 """
@@ -90,25 +92,41 @@ def scan_cargo_report(report: Mapping[str, Any], platform: str) -> dict[str, Any
     """掃描一份 `l1-results.v1`（runner=cargo）報告。
 
     回傳：
-    - `owner_gated_skipped`：報告中 skipped（或 xfailed）且屬擁有者機台相依的 nodeid（已排序）。
-    - `absent_expected`：登記中應存在卻在 results 與 collected 皆缺席的 `crate::name`。
+    - `owner_gated_skipped`：擁有者機台相依且「未執行」的 nodeid（已排序）。包含兩類：
+      (a) results 中 outcome 為 skipped／xfailed 者；
+      (b) 列於 `deselected` 且 results 無對應列者（即 `owner_gated_deselected`）。
+      (b) 不因仍在 collected 而視為已執行；否則未執行的擁有者能力會靜默消失。
+    - `owner_gated_deselected`：上列 (b) 類（已排序）。
+    - `absent_expected`：登記中應存在卻不存在的 `crate::name`。「存在」指 results 有列，或已收集且未被 deselected；
+      故登記列若 results 與 collected 皆缺席，或僅以 deselected 出現而無結果，皆列於此（收集失效）。
     """
     argv = [str(x) for x in (report.get("argv") or [])]
     results = [row for row in (report.get("results") or []) if isinstance(row, Mapping)]
     collected = [str(x) for x in (report.get("collected") or [])]
-    present = {str(row.get("nodeid")) for row in results} | set(collected)
+    deselected = [str(x) for x in (report.get("deselected") or [])]
+    result_ids = {str(row.get("nodeid")) for row in results}
+    present = result_ids | (set(collected) - set(deselected))
 
-    owner_skipped = sorted({
+    owner_skipped_results = {
         str(row.get("nodeid"))
         for row in results
         if row.get("outcome") in _SKIP_OUTCOMES and is_owner_gated_name(name_of_nodeid(str(row.get("nodeid"))))
+    }
+    owner_deselected = sorted({
+        nid for nid in deselected
+        if nid not in result_ids and is_owner_gated_name(name_of_nodeid(nid))
     })
+    owner_skipped = sorted(owner_skipped_results | set(owner_deselected))
 
     absent: list[str] = []
     for crate, name in expected_names(platform, argv):
         if not any(crate_of(nid) == crate and name_of_nodeid(nid) == name for nid in present):
             absent.append(f"{crate}::{name}")
-    return {"owner_gated_skipped": owner_skipped, "absent_expected": absent}
+    return {
+        "owner_gated_skipped": owner_skipped,
+        "owner_gated_deselected": owner_deselected,
+        "absent_expected": absent,
+    }
 
 
 def insufficiency_owner_only(judged: Mapping[str, Any], owner_skipped: Sequence[str]) -> bool:
