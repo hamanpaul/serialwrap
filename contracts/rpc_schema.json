@@ -3163,6 +3163,9 @@
               "write_failures",
               "last_write_error",
               "recreated_count",
+              "rotate_retry",
+              "rotate_deferred",
+              "deferred_delete_pending",
               "healthy",
               "unhealthy_reason"
             ],
@@ -3197,6 +3200,15 @@
               "recreated_count": {
                 "type": "integer"
               },
+              "rotate_retry": {
+                "type": "integer"
+              },
+              "rotate_deferred": {
+                "type": "integer"
+              },
+              "deferred_delete_pending": {
+                "type": "integer"
+              },
               "healthy": {
                 "type": "boolean"
               },
@@ -3222,6 +3234,9 @@
               "write_failures",
               "last_write_error",
               "recreated_count",
+              "rotate_retry",
+              "rotate_deferred",
+              "deferred_delete_pending",
               "healthy",
               "unhealthy_reason"
             ],

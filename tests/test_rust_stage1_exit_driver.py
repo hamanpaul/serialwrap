@@ -212,7 +212,7 @@ def test_driver_windows_l15_passes_bundle_and_spike3_runs_once_for_all_cases():
     executable = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
     assert not any("--case" in ln for ln in executable), "win-spike3.sh 不接受 --case（單次執行四案）"
     assert text.count("spike3_win_wal") == 1
-    assert '--evidence-dir "$EV" ' in text, "spike3 證據根目錄為 $EV，wrapper 寫入 $EV/spike3/<case>.json"
+    assert '"$SPIKE3_WRAPPER" --evidence-dir "$EV"' in text, "spike3 證據根目錄為 $EV，wrapper 寫入 $EV/spike3/<case>.json"
     assert "win-l15-producer" not in text, "win-l15-producer.sh 不存在；L1.5 由 win-func-test.sh 交付"
 
 
@@ -227,11 +227,13 @@ def test_p4_evidence_is_quarantined_before_first_step():
     assert 'rm -rf "$P4"' not in text and 'rm -rf "$EV' not in text, "驅動不得刪除既有證據目錄（只搬移）"
 
 
-def test_edr_unknown_is_documented_as_fail_not_blocked_owner():
-    """F2 回歸：未設 SW_EDR_* 時 spike3 為 evidence-insufficient（FAIL），文件與警示不得宣稱 BLOCKED-OWNER。"""
+def test_edr_gate_removed_spike3_takes_no_edr_arguments():
+    """OD-19（oracle 變更，見 commit 的兩位審查者註記）：driver 不再有 SW_EDR_* 或 --edr-* 自填，亦無 EDR 未知警示。"""
     text = _driver_text()
-    assert "不是 BLOCKED-OWNER" in text or "而非 BLOCKED-OWNER" in text
-    assert "WARN EDR" in text
+    assert "SW_EDR_" not in text
+    assert "--edr-" not in text
+    assert "WARN EDR" not in text
+    assert "--evidence-dir \"$EV\"" in text
 
 
 def test_both_bench_steps_run_with_isolated_daemon_and_stub():

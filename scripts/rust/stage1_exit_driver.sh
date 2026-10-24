@@ -24,10 +24,7 @@
 #   SELFTEST_WINDOWS     Windows 自測報告（仍須核對核准 tree）
 #   WIN_L15_WRAPPER      Windows L1.5 wrapper（預設 scripts/rust/win-func-test.sh，G3 交付；需 --bundle）
 #   SPIKE3_WRAPPER       spike3 Windows WAL wrapper（預設 scripts/rust/win-spike3.sh，G3 交付；一次跑四案）
-#   SW_EDR_PRODUCT／SW_EDR_STATUS／SW_EDR_INTERCEPTIONS
-#                        EDR 資料由擁有者主控台查得。未設即 unknown：spike3 工具將 PASS 降為 INSUFFICIENT_EVIDENCE
-#                        （edr_downgrade），gate 判為 evidence-insufficient（整體 FAIL），而非 BLOCKED-OWNER；
-#                        擁有者查得後設定 SW_EDR_* 重跑 spike3 方可 PASS（stage1a_gate._spike3_status 只對 PASS＋EDR 未知回 BLOCKED-OWNER）。
+#                        （OD-19）spike3 不再接受 EDR 自填；防毒產品名與狀態由工具唯讀查詢，僅作資訊欄位，不影響判定。
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 APPROVED_JSON="$REPO/tools/uart_stdio_bridge/APPROVED_REVISION.json"
@@ -233,9 +230,6 @@ main() {
   export SW_BUNDLE="$REPO/target/dev-bundle-sentinel"
   WIN_L15_WRAPPER="${WIN_L15_WRAPPER:-$REPO/scripts/rust/win-func-test.sh}"
   SPIKE3_WRAPPER="${SPIKE3_WRAPPER:-$REPO/scripts/rust/win-spike3.sh}"
-  export SW_EDR_PRODUCT="${SW_EDR_PRODUCT:-unknown}"
-  export SW_EDR_STATUS="${SW_EDR_STATUS:-unknown}"
-  export SW_EDR_INTERCEPTIONS="${SW_EDR_INTERCEPTIONS:-unknown}"
 
   mkdir -p "$EV/l1/linux/blackbox" "$EV/l1/linux/cargo" "$EV/l1/linux/pytest-full" \
            "$EV/l1/windows/blackbox" "$EV/l1/windows/cargo" "$EV/spike3" "$EV/bench"
@@ -269,12 +263,6 @@ main() {
     log "隔離既有 bench 報告 → $EV/p4-prev/$(basename "$f")"
   done
   mkdir -p "$P4/l1/linux/cargo" "$P4/l1/windows/cargo" "$P4/l1/linux/20groups" "$P4/l1/windows/20groups"
-
-  # EDR 未知警示（F2）：spike3 四列在 EDR 未知時為 evidence-insufficient（整體 FAIL），不是 BLOCKED-OWNER。
-  if [[ "$SW_EDR_PRODUCT" == unknown || "$SW_EDR_STATUS" == unknown ]]; then
-    log "WARN EDR 產品或狀態未知：spike3 將 PASS 降為 INSUFFICIENT_EVIDENCE，gate 判為 evidence-insufficient（FAIL），須擁有者查得 SW_EDR_* 後重跑"
-    echo "WARN EDR 未知：spike3 四列將為 evidence-insufficient（整體 FAIL）" >&2
-  fi
 
   # 自測報告：核准 tree 對應者；找不到即結束，不退回舊報告（S1X：舊 tree 9eaed6de 的報告不得進證據）。
   SELFTEST_LINUX_PATH="$(select_selftest linux "${SELFTEST_LINUX:-}" 2>>"$LOG")" || {
@@ -373,8 +361,7 @@ main() {
   # $EV/func-test-windows/basic/，S1X 修訂：gate 5c-iv 要求 cases.lock 宣告的 windows 平台都有列）。
   step win_l15_func_test "$WIN_L15_WRAPPER" --bundle "$WB_DIR/bundle" \
     --selftest-report "$SELFTEST_WINDOWS_PATH" --report-dir "$EV/func-test-windows"
-  step spike3_win_wal "$SPIKE3_WRAPPER" --evidence-dir "$EV" \
-    --edr-product "$SW_EDR_PRODUCT" --edr-status "$SW_EDR_STATUS" --edr-interceptions "$SW_EDR_INTERCEPTIONS"
+  step spike3_win_wal "$SPIKE3_WRAPPER" --evidence-dir "$EV"
 
   # 登記與核對（register 要求乾淨工作樹；Windows CLI 與 junit 取自 win-blackbox 的 OutDir 佈局）。
   WIN_CLI="$WB_DIR/bundle/bin/serialwrap.exe"

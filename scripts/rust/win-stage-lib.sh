@@ -19,6 +19,7 @@ SW_WIN_SUBSET=(
   tests/acceptance
   scripts/stage0/spike3_win_wal.py
   scripts/stage0/spike3_evidence.schema.json
+  scripts/stage0/av_sim.py
   scripts/stage0/wal_microbench.py
   serialwrap.py
   serialwrapd.py

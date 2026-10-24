@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://serialwrap.local/schemas/stage0/spike3_evidence.schema.json",
   "title": "Stage 0 Spike 3 Windows WAL／EDR 證據",
-  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。edr 缺欄即不合格（EDR 攔截查詢結果必須記錄，查不到寫 unknown）。",
+  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。OD-19（2026-10-23）：判定依 av_sim 注入（av_sim 必填）與 binary_integrity（必填）；edr 為工具唯讀查詢的選填資訊欄，查不到寫 unknown，不影響 verdict。",
   "type": "object",
-  "required": ["case_id", "run_at", "env", "artifact", "steps", "observations", "edr", "verdict", "fallback"],
+  "required": ["case_id", "run_at", "env", "artifact", "steps", "observations", "av_sim", "binary_integrity", "verdict", "fallback"],
   "additionalProperties": false,
   "properties": {
     "case_id": {
@@ -60,11 +60,67 @@
       }
     },
     "observations": {
-      "type": "object"
+      "type": "object",
+      "required": ["append_count", "append_latency_ms"],
+      "properties": {
+        "append_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "由 Spike 3 writer proxy 計數的 WalWriter.append 呼叫次數；gate 會與延遲樣本數逐一核對。"
+        },
+        "append_latency_ms": {
+          "type": "array",
+          "description": "實際 WalWriter.append 呼叫耗時（毫秒）；Spike 3 gate 要求非空有效樣本，數值上限另待 owner 裁決。",
+          "minItems": 1,
+          "items": {"type": "number", "minimum": 0}
+        }
+      }
+    },
+    "av_sim": {
+      "type": "object",
+      "description": "OD-19 (2)：模擬端點防毒干擾的參數與觀察結果（scripts/stage0/av_sim.py）；Spike 3 以允許 delete 的 overlapped handle 申請 RH oplock，記錄實際狀態。",
+      "required": ["mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs", "helper_exit"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["share_no_delete", "oplock"]},
+        "share_mode": {"type": "string"},
+        "hold_ms_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+        "seed": {"type": "integer"},
+        "oplock": {"type": "string", "enum": ["pending", "not_requested", "unavailable", "granted", "denied"]},
+        "launch_error": {"type": "string"},
+        "grabs": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "open_errors": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+      }
+    },
+    "binary_integrity": {
+      "type": "object",
+      "description": "OD-19 (3)：測試前後執行檔存在、sha256 不變、啟動未被拒；unchanged 與 launch_refused 為判定依據。",
+      "required": ["subjects", "unchanged", "launch_refused", "launch_error"],
+      "properties": {
+        "subjects": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "exists_before", "exists_after", "sha256_before", "sha256_after", "unchanged"],
+            "properties": {
+              "path": {"type": "string"},
+              "exists_before": {"type": "boolean"},
+              "exists_after": {"type": "boolean"},
+              "sha256_before": {"type": "string"},
+              "sha256_after": {"type": "string"},
+              "unchanged": {"type": "boolean"}
+            }
+          }
+        },
+        "unchanged": {"type": "boolean"},
+        "launch_refused": {"type": "boolean"},
+        "launch_error": {"type": "string"}
+      }
     },
     "edr": {
       "type": "object",
-      "description": "EDR 產品與狀態（OD-05 代表機台為第三方企業 EDR）；攔截查詢結果需 EDR 主控台權限，查不到寫 unknown。",
+      "description": "OD-19 (3)：防毒產品名與狀態由工具以 SecurityCenter2 唯讀查詢取得，僅作資訊欄位（選填）；查不到寫 unknown，不參與 verdict。",
       "required": ["product", "status", "interceptions"],
       "additionalProperties": false,
       "properties": {

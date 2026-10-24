@@ -304,7 +304,7 @@ class SerialwrapService:
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
-            on_tick=self._sessions.reconcile_readiness,
+            on_tick=self._on_watcher_tick,
             source=_source,
         )
         self._mcu_registry = McuPatternRegistry.load(None)
@@ -898,6 +898,25 @@ class SerialwrapService:
             session = self._sessions.get_session(by_id)
             return session.profile.com if session is not None else None
         return None
+
+    def _on_watcher_tick(self) -> None:
+        """DeviceWatcher 每輪（約 1 Hz）呼叫：先非阻塞服務 WAL 延後輪替，再做 readiness reconcile。
+
+        OD-19：延後輪替的完成不得依賴後續 append（無新流量時 append 不會發生），故由 watcher 週期 tick 推進。
+        兩者各自含住例外、互不遮蔽；第一個例外於最後重新拋出，由 DeviceWatcher._loop 既有的 tick 失敗處理記錄。
+        """
+        first_error: Exception | None = None
+        try:
+            self._wal.tick()
+        except Exception as exc:  # noqa: BLE001 — 互不遮蔽：WAL tick 失敗仍須執行 readiness reconcile
+            first_error = exc
+        try:
+            self._sessions.reconcile_readiness()
+        except Exception as exc:  # noqa: BLE001 — 同上；第一個例外重新拋出
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def _reconcile_interactive_admission_tickets(self) -> None:
         tickets = getattr(self, "_interactive_admission_tickets", None)

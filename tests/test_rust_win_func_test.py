@@ -40,7 +40,7 @@ EXPECTED_FUNC_ARGV = [
 REQUIRED_SUBSET = {
     "func-test", "realhw", "sw_core", "tools/uart_stdio_bridge", "contracts", "tests/acceptance",
     "scripts/stage0/spike3_win_wal.py", "scripts/stage0/spike3_evidence.schema.json",
-    "scripts/stage0/wal_microbench.py",
+    "scripts/stage0/av_sim.py", "scripts/stage0/wal_microbench.py",
     "serialwrap.py", "serialwrapd.py", "VERSION",
 }
 
@@ -119,13 +119,13 @@ def test_spike3_argv_per_case_is_exact() -> None:
 
 @needs_bash
 @pytest.mark.process_rpc
-def test_spike3_edr_values_are_pass_through_only() -> None:
+def test_spike3_takes_no_edr_arguments_and_rejects_them() -> None:
+    """OD-19（oracle 變更，見 commit 的兩位審查者註記）：wrapper 不傳遞 EDR 值，亦不接受 --edr-* 自填。"""
     for row in _print_argv(SPIKE3):
         assert not any(arg.startswith("--edr-") for arg in row), row
-    rows = _print_argv(SPIKE3, "--edr-product", "Example EDR", "--edr-interceptions", "7")
-    for row in rows:
-        assert "--edr-status" not in row
-        assert row[-4:] == ["--edr-product", "Example EDR", "--edr-interceptions", "7"]
+    out = _run(SPIKE3, "--edr-product", "Example EDR", "--print-argv")
+    assert out.returncode != 0
+    assert "未知參數 --edr-product" in (out.stdout + out.stderr)
 
 
 @pytest.mark.memory_only

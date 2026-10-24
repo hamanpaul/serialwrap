@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""Stage 0 Spike 3：Windows 原生 WAL 與端點防毒（EDR）實機驗證腳本（規格 §13；P2 case_id 指派給本計畫）。
+"""Stage 0 Spike 3：Windows 原生 WAL 與端點防護（OD-19，與防毒產品無關）實機驗證腳本（規格 §13；P2 case_id 指派給本計畫）。
 
 entry: py -3.12 scripts/stage0/spike3_win_wal.py --case <case-id> --evidence-dir <dir> [--unlink-mode classic|posix]
-       [--edr-product <名稱>] [--edr-status <狀態>] [--edr-interceptions <N|unknown>]
        py -3.12 scripts/stage0/spike3_win_wal.py --list
        執行前請以 win-pytest.sh 相同方式將 sw_core/ 與 scripts/、realhw/ 一併 staging 到 Windows 本機磁碟（或於 Windows 端 clone repo）。
 revision: 本檔 git blob sha1（執行時由腳本計算並寫入證據 artifact.revision；等同 git rev-parse HEAD:scripts/stage0/spike3_win_wal.py）；
   被測 sw_core 以 artifact.tree_sha256（sw_core.release_manifest.tree_sha256）與 artifact.git_head（git rev-parse HEAD）記錄。
-expected: win-wal-av-rotate：常駐 handle 下 rotate 成功、總筆數與 seq 連續（1..N）；win-wal-av-unlink：classic／POSIX delete 後
-  WAL_RECREATED_AFTER_EXTERNAL_UNLINK META 正確、range_known 依實況（未知時 potentially_lost_seq_range 為 null）；
-  win-wal-av-reader-handle：無 FILE_SHARE_DELETE 的外部 reader 期間 rotation_failed 為真、write_failures 為 0 且不遺失紀錄；
-  win-wal-f12-progress：T17 oracle（wait_for_marker，常駐 handle 存活中讀取，跨 rotate）判定 PASS。
+expected: 各案皆在 scripts/stage0/av_sim.py helper（允許 FILE_SHARE_DELETE 並申請 overlapped RH oplock、seeded 持有 10–500 ms）注入下執行；
+  一般不含 FILE_SHARE_DELETE 共用模式另由 av_sim Windows-native 測試涵蓋：
+  每次 WalWriter.append 實際耗時（毫秒）記入 observations.append_latency_ms；gate 以最大值比對 owner 核准上限，上限未裁決前維持 BLOCKED-OWNER；
+  win-wal-av-rotate：輪替最終完成、總筆數與 seq 連續（1..N）、干擾實際觀察到（grabs≥1、rotate_retry≥1）、延後佇列清空；
+  win-wal-av-unlink：外部 unlink 有界重試至成功，WAL_RECREATED_AFTER_EXTERNAL_UNLINK META 正確、range_known 依實況；
+  win-wal-av-reader-handle：無 FILE_SHARE_DELETE 的外部 reader 期間 rotation_failed 為真、紀錄不遺失、write_failures 為 0、延後佇列清空；
+  win-wal-f12-progress：T17 oracle（wait_for_marker，常駐 handle 存活中讀取，跨 rotate）於 av_sim 持有中判定 PASS。
   每次執行必寫一份 spike3_evidence.schema.json 合格的證據 JSON（verdict PASS／FAIL／INSUFFICIENT_EVIDENCE）。
-  EDR 產品或狀態為 unknown 時 PASS 一律降為 INSUFFICIENT_EVIDENCE（§13 結果只對指定環境有效；§11.3 證據不足不得 PASS）。
-owner: 擁有者（Windows host 實機；EDR 主控台查詢權限；OD-08）。EDR 攔截查詢結果由擁有者以 --edr-* 參數帶入，查不到寫 unknown。
+  PASS 另須 binary_integrity 成立：測試前後直譯器、av_sim、本工具的存在與 sha256 不變，且 helper 啟動未被拒；否則降為 FAIL。
+edr: 防毒產品名與狀態由工具以 PowerShell Get-CimInstance -Namespace root/SecurityCenter2 AntiVirusProduct 唯讀查詢，
+  只寫入 edr 資訊欄位；查不到寫 unknown，**不影響 verdict**（OD-19 (3)：驗收與防毒產品無關，不需要攔截次數或主控台資料）。
+owner: 擁有者（Windows host 實機；OD-08）。不再接受 --edr-* 自填參數。
 evidence_dir: ~/b-log/rust-refactor/p1/<case-id>/<YYMMDD-HHMMSS>/（證據 JSON 寫為 <case-id>.json）
 rollback: 腳本建立的暫存目錄為 %TEMP%\\swspike3-<case-id>-*。verdict 為 PASS 時刪除本次建立的該目錄；FAIL／INSUFFICIENT_EVIDENCE 保留供檢視。
   只刪除本腳本以 mkdtemp 建立且名稱以 swspike3- 開頭的目錄，不得刪除既有 WAL 或 %USERPROFILE% 下任何檔案。
-  EDR 誤攔截或 handle 卡住時：記錄 EDR 事件 ID 與 verdict，停止本 case；不得關閉防護或變更 EDR 排除清單後宣稱符合。
+  干擾導致 handle 卡住時：保留 av_sim 日誌與 verdict 後停止本 case；不得關閉防護或變更排除清單後宣稱符合。
 """
 from __future__ import annotations
 
@@ -54,6 +58,22 @@ ROTATE_CASE_RECORDS = 400
 UNLINK_META_TIMEOUT_S = 10.0  # 外部 unlink 後 WAL 身分檢查受 WAL_IDENTITY_CHECK_INTERVAL_S 節流，需有界輪詢
 UNLINK_POLL_S = 0.2
 WORKDIR_PREFIX = "swspike3-"
+SPIKE3_SEED = 20261023  # av_sim 持有時長序列的種子（同 seed 可重現）
+AV_SIM_PATH = Path(__file__).resolve().with_name("av_sim.py")
+AV_HELPER_DURATION_S = 900.0
+AV_HELPER_READY_TIMEOUT_S = 15.0
+AV_HELPER_STOP_TIMEOUT_S = 60.0
+DRAIN_TIMEOUT_S = 20.0
+DRAIN_SETTLE_S = 0.5
+CONTINUITY_META_EVENT = "WAL_ROTATED_AFTER_DEFERRAL"
+# 與 daemon 的 DeviceWatcher 預設 poll_interval_s（sw_core/device_watcher.py，1.0 s）相同節奏；
+# 不得以更密的 tick 替代 daemon 的服務頻率，否則 PASS 會高估延後輪替的實際完成速度。
+DAEMON_TICK_INTERVAL_S = 1.0
+UNLINK_RETRY_TIMEOUT_S = 20.0
+EDR_QUERY_PS = (
+    "Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct "
+    "| Select-Object displayName,productState | ConvertTo-Json -Compress"
+)
 
 
 class Recorder:
@@ -65,6 +85,28 @@ class Recorder:
 
     def step(self, op: str, result: str) -> None:
         self.steps.append({"op": op, "ts": _now(), "result": result})
+
+
+class _MeasuredWalWriter:
+    """轉送 WAL writer 呼叫，並記錄每次 append 的實際耗時（毫秒）。"""
+
+    def __init__(self, writer: Any, rec: Recorder) -> None:
+        self._writer = writer
+        self._rec = rec
+        self._rec.observations["append_latency_ms"] = []
+        self._rec.observations["append_count"] = 0
+
+    def append(self, *args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter_ns()
+        try:
+            return self._writer.append(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+            self._rec.observations["append_latency_ms"].append(elapsed_ms)
+            self._rec.observations["append_count"] += 1
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._writer, name)
 
 
 def _now() -> str:
@@ -232,6 +274,14 @@ def _seq_continuous(records: list[dict[str, Any]]) -> bool:
     return bool(seqs) and seqs == list(range(seqs[0], seqs[0] + len(seqs)))
 
 
+def _continuity_meta_count(records: list[dict[str, Any]]) -> int:
+    """計算 tick 完成延後輪替時補入的連續性 META；此列不是資料 append。"""
+    return sum(
+        1 for row in records
+        if row.get("dir") == "META" and (row.get("meta") or {}).get("event") == CONTINUITY_META_EVENT
+    )
+
+
 def _safe_read_records(wal_dir: Path, rec: Recorder) -> list[dict[str, Any]]:
     """外部 unlink 後 classic delete 可能暫時無法開檔（DeletePending）；讀失敗記錄後回空集合，不得拋出。"""
     try:
@@ -241,32 +291,275 @@ def _safe_read_records(wal_dir: Path, rec: Recorder) -> list[dict[str, Any]]:
         return []
 
 
+def _av_sim_module() -> Any:
+    """延遲匯入 scripts/stage0/av_sim.py（同目錄，與 gather_env 匯入 wal_microbench 的方式相同）。"""
+    sys.path.insert(0, str(AV_SIM_PATH.parent))
+    try:
+        import av_sim  # noqa: PLC0415 — 同目錄工具，延遲匯入
+    finally:
+        sys.path.pop(0)
+    return av_sim
+
+
+def decode_product_state(value: Any) -> str:
+    """SecurityCenter2 productState 常見十六進位版面：第二個位元組 0x10／0x11 為啟用、0x00 為停用，其餘 unknown。
+
+    僅供資訊欄位使用，不參與 verdict（OD-19 (3)）。
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    middle = (number >> 8) & 0xFF
+    if middle in (0x10, 0x11):
+        return "enabled"
+    if middle == 0x00:
+        return "disabled"
+    return "unknown"
+
+
+def query_edr(runner: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+    """唯讀查詢 SecurityCenter2 的防毒產品名與狀態，只寫入 info 欄位；查不到一律 unknown，不影響 verdict。
+
+    工具自動查詢，不接受呼叫者自填（OD-19 (3)）；擁有者主控台查詢不再是驗收前提。
+    """
+    result: dict[str, Any] = {
+        "product": "unknown",
+        "status": "unknown",
+        "interceptions": "unknown",
+        "source": "SecurityCenter2/AntiVirusProduct (read-only)",
+        "product_state_raw": "unknown",
+    }
+    try:
+        cp = runner(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", EDR_QUERY_PS],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return result
+    if cp.returncode != 0 or not (cp.stdout or "").strip():
+        return result
+    try:
+        data = json.loads(cp.stdout)
+    except ValueError:
+        return result
+    rows = data if isinstance(data, list) else [data]
+    rows = [r for r in rows if isinstance(r, dict) and str(r.get("displayName") or "").strip()]
+    if not rows:
+        return result
+    names = sorted({str(r["displayName"]).strip() for r in rows})
+    first = rows[0]
+    result.update(
+        product="；".join(names),
+        status=decode_product_state(first.get("productState")),
+        product_state_raw=str(first.get("productState", "unknown")),
+    )
+    return result
+
+
+def _file_sha256(path: str) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def binary_subject_paths() -> list[str]:
+    """binary_integrity 檢查的執行檔：本次直譯器、av_sim helper 與本工具自身。"""
+    return [sys.executable, str(AV_SIM_PATH), str(Path(__file__).resolve())]
+
+
+def snapshot_binaries(paths: list[str]) -> dict[str, dict[str, Any]]:
+    return {p: {"exists": os.path.isfile(p), "sha256": _file_sha256(p)} for p in paths}
+
+
+def binary_integrity_report(
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+    launch_error: str | None,
+) -> dict[str, Any]:
+    """測試前後執行檔存在、sha256 不變、啟動未被拒（OD-19 (3)「執行檔被誤判」的可觀察事實判定）。"""
+    subjects: list[dict[str, Any]] = []
+    unchanged = True
+    for path, snap in before.items():
+        post = after.get(path, {"exists": False, "sha256": None})
+        same = bool(snap["exists"]) and bool(post["exists"]) and snap["sha256"] is not None and snap["sha256"] == post["sha256"]
+        unchanged = unchanged and same
+        subjects.append({
+            "path": path,
+            "exists_before": bool(snap["exists"]),
+            "exists_after": bool(post["exists"]),
+            "sha256_before": snap["sha256"] or "unknown",
+            "sha256_after": post["sha256"] or "unknown",
+            "unchanged": same,
+        })
+    return {
+        "subjects": subjects,
+        "unchanged": unchanged,
+        "launch_refused": launch_error != "none",
+        "launch_error": launch_error or "none",
+    }
+
+
+class AvHelper:
+    """以子行程啟動 scripts/stage0/av_sim.py（Windows helper）監看 WAL 目錄，對新檔套用持有模型（OD-19 注入）。
+
+    旗標與日誌置於 WAL 目錄內，檔名不符 raw.wal.ndjson／raw.mirror.log 前綴，不會被 helper 自己持有；
+    PASS 時隨 swspike3-* 目錄一併清除。
+    """
+
+    def __init__(self, wal_dir: Path, seed: int, rec: Recorder) -> None:
+        self._wal_dir = wal_dir
+        self._seed = seed
+        self._rec = rec
+        self._ready = wal_dir / "av-helper.ready"
+        self._stop = wal_dir / "av-helper.stop"
+        self._log = wal_dir / "av-helper.jsonl"
+        self._proc: subprocess.Popen[bytes] | None = None
+        self.launch_error: str | None = None
+        self._rec.observations["av_sim"] = {
+            **_av_sim_module().describe(seed, oplock=True),
+            "launch_error": "not_started",
+            "grabs": None,
+            "open_errors": None,
+            "helper_exit": None,
+        }
+
+    def start(self) -> bool:
+        try:
+            self._proc = subprocess.Popen([
+                sys.executable, str(AV_SIM_PATH),
+                "--watch-dir", str(self._wal_dir),
+                "--seed", str(self._seed),
+                "--duration-s", str(AV_HELPER_DURATION_S),
+                "--ready-file", str(self._ready),
+                "--stop-file", str(self._stop),
+                "--log-file", str(self._log),
+                "--oplock",
+            ])
+        except OSError as exc:
+            return self._fail(f"{type(exc).__name__}: {exc}")
+        deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._ready.exists():
+                self._rec.observations["av_sim"]["launch_error"] = "none"
+                self._rec.step("av_sim_helper_ready", "ok")
+                return True
+            if self._proc.poll() is not None:
+                return self._fail(f"helper 提前結束（exit={self._proc.returncode}）")
+            time.sleep(0.05)
+        return self._fail("helper 就緒逾時")
+
+    def _fail(self, message: str) -> bool:
+        self.launch_error = message
+        self._rec.observations["av_sim"]["launch_error"] = message
+        self._rec.step("av_sim_helper_ready", "refused")
+        return False
+
+    def stop(self) -> None:
+        try:
+            self._stop.write_text("stop\n", encoding="utf-8")
+        except OSError:
+            pass
+        exit_code: int | None = None
+        if self._proc is not None:
+            try:
+                exit_code = self._proc.wait(timeout=AV_HELPER_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                exit_code = self._proc.wait()
+        summary: dict[str, Any] = {}
+        try:
+            for line in self._log.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    row = json.loads(line)
+                    if row.get("event") == "summary":
+                        summary = row
+        except (OSError, ValueError):
+            summary = {}
+        self._rec.observations["av_sim"].update({
+            "grabs": summary.get("grabs"),
+            "open_errors": summary.get("open_errors"),
+            "helper_exit": exit_code,
+            "oplock": summary.get("oplock", "unavailable"),
+        })
+
+
+def _grabs(rec: Recorder) -> int:
+    value = (rec.observations.get("av_sim") or {}).get("grabs")
+    return value if isinstance(value, int) else 0
+
+
+def _drain_writer(writer: Any, rec: Recorder | None = None) -> None:
+    """干擾期間延後的輪替須於有界時間內完成：以 daemon 同節奏（DAEMON_TICK_INTERVAL_S）呼叫 tick，直到清空或逾時。
+
+    驅動方式（tick 間隔、次數、是否清空）記入 observations["drain"]，供 gate 與人工核對。
+    """
+    deadline = time.monotonic() + DRAIN_TIMEOUT_S
+    settle_until = time.monotonic() + DRAIN_SETTLE_S
+    ticks = 0
+    drained = False
+    while time.monotonic() < deadline:
+        writer.tick()
+        ticks += 1
+        if time.monotonic() >= settle_until and writer.health()["deferred_delete_pending"] == 0:
+            drained = True
+            break
+        time.sleep(DAEMON_TICK_INTERVAL_S)
+    if rec is not None:
+        rec.observations["drain"] = {
+            "tick_interval_s": DAEMON_TICK_INTERVAL_S,
+            "ticks": ticks,
+            "drained": drained,
+        }
+
+
 def case_rotate(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
     from sw_core.wal import WalWriter
 
     wal_dir = _work_dir("win-wal-av-rotate")
     rec.observations["wal_dir"] = str(wal_dir)
-    writer = WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES)
+    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
+    if not helper.start():
+        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
+    writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     try:
         for _ in range(ROTATE_CASE_RECORDS):
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
-        rec.step("append_until_rotate", "ok")
+        _drain_writer(writer, rec)
+        rec.step("append_until_rotate_under_av_hold", "ok")
     finally:
         writer.close()
+        helper.stop()
+    health = writer.health()
     archives = [p for p in glob.glob(str(wal_dir / "raw.wal.ndjson*")) if not p.endswith("raw.wal.ndjson")]
     records = _read_records(wal_dir)
     seqs = _seqs(records)
+    continuity_meta_count = _continuity_meta_count(records)
     continuous = _seq_continuous(records)
-    complete = len(records) == ROTATE_CASE_RECORDS and seqs[:1] == [1] and seqs[-1:] == [ROTATE_CASE_RECORDS]
+    complete = (
+        len(records) - continuity_meta_count == ROTATE_CASE_RECORDS
+        and seqs[:1] == [1]
+        and seqs[-1:] == [len(records)]
+    )
+    interference = _grabs(rec) >= 1 and health["rotate_retry"] >= 1
     rec.observations.update({
-        "archives": len(archives), "records": len(records), "expected_records": ROTATE_CASE_RECORDS,
+        "archives": len(archives), "records": len(records),
+        "continuity_meta_count": continuity_meta_count, "expected_records": ROTATE_CASE_RECORDS,
         "first_seq": seqs[0] if seqs else None, "last_seq": seqs[-1] if seqs else None,
         "seq_continuous": continuous,
+        "rotate_retry": health["rotate_retry"], "rotate_deferred": health["rotate_deferred"],
+        "deferred_delete_pending": health["deferred_delete_pending"],
+        "interference_observed": interference,
     })
     rec.step("verify_seq_continuity", "ok" if continuous and complete else "gap_or_count_mismatch")
-    if archives and continuous and complete:
+    if archives and continuous and complete and interference and health["deferred_delete_pending"] == 0:
         return "PASS", "none"
-    return "FAIL", "改以 --unlink-mode 或縮小 rotate 門檻重跑；仍失敗則記錄 EDR 事件後停止"
+    return "FAIL", "輪替未完成、紀錄不連續或未觀察到 av_sim 干擾；保留 WAL 目錄與 av_sim 日誌後停止"
 
 
 def _find_recreate_meta(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -280,38 +573,73 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
 
     wal_dir = _work_dir("win-wal-av-unlink")
     rec.observations["wal_dir"] = str(wal_dir)
-    writer = WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES)
+    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
+    if not helper.start():
+        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
+    writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     metas: list[dict[str, Any]] = []
+    unlinked = False
+    unlink_attempts = 0
+    sharing_violation_attempts = 0
     try:
         for _ in range(10):
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
         rec.step("prefill", "ok")
         wal_path = str(wal_dir / "raw.wal.ndjson")
-        if args.unlink_mode == "posix":
-            win32_files.delete_posix_semantics(wal_path)
-        else:
-            win32_files.delete_classic(wal_path)
-        rec.step(f"external_unlink:{args.unlink_mode}", "ok")
-        # 身分檢查受 WAL_IDENTITY_CHECK_INTERVAL_S 節流（且 classic 刪除為 DeletePending），
-        # 故 unlink 後不能只 append 一次就斷言；改為有界輪詢直到 META 出現或逾時。
-        time.sleep(UNLINK_POLL_S)
-        attempts = 0
-        deadline = time.monotonic() + UNLINK_META_TIMEOUT_S
+        # 防毒持有期間外部 unlink 會因共用違規失敗；有界重試直到成功（unlink 須最終完成）。
+        unlink_error: str | None = None
+        deadline = time.monotonic() + UNLINK_RETRY_TIMEOUT_S
         while True:
-            writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
-            attempts += 1
-            metas = _find_recreate_meta(_safe_read_records(wal_dir, rec))
-            if metas or time.monotonic() >= deadline:
+            unlink_attempts += 1
+            try:
+                if args.unlink_mode == "posix":
+                    win32_files.delete_posix_semantics(wal_path)
+                else:
+                    win32_files.delete_classic(wal_path)
+                unlinked = True
                 break
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 32:  # ERROR_SHARING_VIOLATION
+                    sharing_violation_attempts += 1
+                unlink_error = f"{type(exc).__name__}: {exc}"
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(UNLINK_POLL_S)
+        rec.observations.update({
+            "unlink_attempts": unlink_attempts,
+            "sharing_violation_attempts": sharing_violation_attempts,
+            "unlink_last_error": unlink_error or "none",
+            "unlinked": unlinked,
+        })
+        rec.step(f"external_unlink:{args.unlink_mode}", "ok" if unlinked else "blocked_until_timeout")
+        if unlinked:
+            # 身分檢查受 WAL_IDENTITY_CHECK_INTERVAL_S 節流（且 classic 刪除為 DeletePending），
+            # 故 unlink 後改為有界輪詢直到 META 出現或逾時。
             time.sleep(UNLINK_POLL_S)
-        rec.observations["append_attempts_until_meta"] = attempts
-        rec.step("poll_recreate_meta", "found" if metas else "timeout")
+            attempts = 0
+            deadline = time.monotonic() + UNLINK_META_TIMEOUT_S
+            while True:
+                writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
+                attempts += 1
+                metas = _find_recreate_meta(_safe_read_records(wal_dir, rec))
+                if metas or time.monotonic() >= deadline:
+                    break
+                time.sleep(UNLINK_POLL_S)
+            rec.observations["append_attempts_until_meta"] = attempts
+            rec.step("poll_recreate_meta", "found" if metas else "timeout")
     finally:
         writer.close()
+        helper.stop()
+    interference = _grabs(rec) >= 1 and sharing_violation_attempts >= 1
+    rec.observations["interference_observed"] = interference
+    if not unlinked:
+        return "FAIL", "外部 unlink 在有界時間內未完成（防毒持有期間）；保留 WAL 目錄與 av_sim 日誌後停止"
+    if not interference:
+        return "FAIL", "未觀察到 av_sim 持有期間的 ERROR_SHARING_VIOLATION 與重試；不得判為 PASS"
     rec.observations["meta_count"] = len(metas)
     if not metas:
         rec.step("verify_meta", "missing")
-        return "FAIL", "未見 WAL_RECREATED_AFTER_EXTERNAL_UNLINK META；記錄 EDR 攔截與 unlink 錯誤後停止"
+        return "FAIL", "未見 WAL_RECREATED_AFTER_EXTERNAL_UNLINK META；保留 WAL 目錄與 av_sim 日誌後停止"
     meta = metas[0]
     loss = bool(meta.get("loss_flag"))
     rng = (meta.get("meta") or {}).get("potentially_lost_seq_range")
@@ -333,7 +661,10 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
     wal_dir = _work_dir("win-wal-av-reader-handle")
     rec.observations["wal_dir"] = str(wal_dir)
     wal_path = str(wal_dir / "raw.wal.ndjson")
-    writer = WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES)
+    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
+    if not helper.start():
+        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
+    writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
@@ -344,13 +675,14 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
     kernel32.CloseHandle.restype = wintypes.BOOL
     GENERIC_READ = 0x80000000
     FILE_SHARE_READ = 0x00000001
-    FILE_SHARE_WRITE = 0x00000002  # 與常駐 writer 共存；刻意不給 FILE_SHARE_DELETE
+    FILE_SHARE_WRITE = 0x00000002  # 與常駐 writer 共存；刻意不給 FILE_SHARE_DELETE（防毒同形）
     OPEN_EXISTING = 3
     invalid_handle = ctypes.c_void_p(-1).value
     reader: Any = None
     appended = 0
     seen_rotation_failed = False
     write_failures = -1
+    health: dict[str, Any] = {}
     try:
         # WalWriter.__init__ 不開檔，第一次 append 才建立 raw.wal.ndjson；必須先寫一筆，reader 才有檔可開。
         writer.append(com="COM0", direction="TX", source="spike3", payload=b"prefill", cmd_id="spike3-prefill")
@@ -371,21 +703,35 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
         try:
             if reader not in (None, invalid_handle):
                 kernel32.CloseHandle(reader)
-            write_failures = int(writer.health().get("write_failures", -1))
+            _drain_writer(writer, rec)
+            health = writer.health()
+            write_failures = int(health.get("write_failures", -1))
         finally:
             writer.close()
+            helper.stop()
     records = _read_records(wal_dir)
     seqs = _seqs(records)
+    continuity_meta_count = _continuity_meta_count(records)
     continuous = _seq_continuous(records)
-    complete = len(records) == appended
+    complete = (
+        len(records) - continuity_meta_count == appended
+        and seqs[:1] == [1]
+        and seqs[-1:] == [len(records)]
+    )
+    interference = _grabs(rec) >= 1 and seen_rotation_failed
     rec.observations.update({
         "rotation_failed_seen": seen_rotation_failed, "appended": appended, "records": len(records),
+        "continuity_meta_count": continuity_meta_count,
+        "first_seq": seqs[0] if seqs else None, "last_seq": seqs[-1] if seqs else None,
         "seq_continuous": continuous, "write_failures": write_failures,
+        "rotate_retry": health.get("rotate_retry"), "deferred_delete_pending": health.get("deferred_delete_pending"),
+        "interference_observed": interference,
     })
     rec.step("verify_no_loss", "ok" if continuous and complete else "gap_or_count_mismatch")
-    if seen_rotation_failed and continuous and complete and write_failures == 0:
+    if (interference and continuous and complete and write_failures == 0
+            and health.get("deferred_delete_pending") == 0):
         return "PASS", "none"
-    return "FAIL", "rotation_failed 未出現、紀錄不連續、筆數不符或 write_failures 非 0；保留 WAL 目錄並記錄 EDR 攔截後停止"
+    return "FAIL", "rotation_failed 未出現、紀錄不連續、筆數不符、write_failures 非 0 或延後佇列未清空；保留 WAL 目錄後停止"
 
 
 def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
@@ -398,7 +744,10 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
     marker_pre = b"SPIKE3-F12-MARKER-PRE"
     marker_post = b"SPIKE3-F12-MARKER-POST"
     wal_path = str(wal_dir / "raw.wal.ndjson")
-    writer = WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES)
+    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
+    if not helper.start():
+        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
+    writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     res_pre = res_post = None
     try:
         # 常駐 writer 不關閉：先寫一筆使檔案與 handle 存在，再以外部游標讀取（與 F12 實機路徑相同）。
@@ -413,9 +762,23 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
         writer.append(com="COM0", direction="TX", source="spike3", payload=marker_post, cmd_id="spike3-f12-post")
         res_post = wal_oracle.wait_for_marker(cursor, marker=marker_post, cmd_id="spike3-f12-post", timeout_s=10.0)
         rec.step("wait_marker_post_rotate", "ok" if res_post.ok else res_post.reason_code)
+        _drain_writer(writer, rec)
     finally:
         writer.close()
+        helper.stop()
     records = _read_records(wal_dir)
+    seqs = _seqs(records)
+    continuity_meta_count = _continuity_meta_count(records)
+    health = writer.health()
+    archives = [p for p in glob.glob(str(wal_dir / "raw.wal.ndjson*")) if not p.endswith("raw.wal.ndjson")]
+    append_count = rec.observations["append_count"]
+    complete = (
+        len(records) - continuity_meta_count == append_count
+        and seqs[:1] == [1]
+        and seqs[-1:] == [len(records)]
+        and _seq_continuous(records)
+    )
+    interference = _grabs(rec) >= 1 and health.get("rotate_retry", 0) >= 1
     crc_errors = [e for e in (verify_record(r) for r in records) if e is not None]
     rec.observations.update({
         "pre_rotate": {"ok": res_pre.ok if res_pre else None,
@@ -424,11 +787,20 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
         "post_rotate": {"ok": res_post.ok if res_post else None,
                         "reason_code": res_post.reason_code if res_post else None,
                         "diagnostics": res_post.diagnostics if res_post else None},
+        "archives": len(archives), "records": len(records),
+        "continuity_meta_count": continuity_meta_count,
+        "first_seq": seqs[0] if seqs else None, "last_seq": seqs[-1] if seqs else None,
+        "seq_continuous": _seq_continuous(records),
+        "rotate_retry": health.get("rotate_retry"),
+        "deferred_delete_pending": health.get("deferred_delete_pending"),
         "crc_errors": crc_errors,
+        "interference_observed": interference,
     })
-    if res_pre is not None and res_post is not None and res_pre.ok and res_post.ok and not crc_errors:
+    if (res_pre is not None and res_post is not None and res_pre.ok and res_post.ok
+            and complete and archives and interference
+            and health.get("deferred_delete_pending") == 0 and not crc_errors):
         return "PASS", "none"
-    return "FAIL", "T17 oracle（常駐 handle 存活中讀取、跨 rotate）未通過；保留 WAL 目錄，回報 observations 與 EDR 紀錄"
+    return "FAIL", "T17 oracle（常駐 handle 存活中讀取、跨 rotate、av_sim 持有中）未通過；保留 WAL 目錄與 av_sim 日誌"
 
 
 CASE_FUNCS: dict[str, Callable[[Recorder, argparse.Namespace], tuple[str, str]]] = {
@@ -450,14 +822,8 @@ def run_case(args: argparse.Namespace) -> int:
     case_id = args.case
     rec = Recorder()
     run_at = _now()
-    edr_product = args.edr_product or "unknown"
-    edr_status = args.edr_status or "unknown"
-    edr = {
-        "product": edr_product,
-        "status": edr_status,
-        "interceptions": (int(args.edr_interceptions) if str(args.edr_interceptions).isdigit()
-                          else "unknown"),
-    }
+    # OD-19 (3)：防毒名稱與狀態由工具唯讀查詢，僅作資訊欄位；非 Windows 主機不發出任何 Windows 端查詢。
+    edr = query_edr() if os.name == "nt" else {"product": "unknown", "status": "unknown", "interceptions": "unknown"}
     artifact = {
         "binary": "sw_core (Python 基線)",
         "revision": _git_blob_sha1(Path(__file__).resolve()),
@@ -465,6 +831,8 @@ def run_case(args: argparse.Namespace) -> int:
         "git_head": _git_head(),
         "git_clean": _git_clean(),
     }
+    subjects = binary_subject_paths()
+    before = snapshot_binaries(subjects)
     fallback = "none"
     if os.name != "nt":
         verdict, fallback, code = "INSUFFICIENT_EVIDENCE", "在 Windows host 以 py -3.12 重跑", EXIT_NOT_WINDOWS
@@ -478,24 +846,29 @@ def run_case(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 — 實機腳本：任何異常都必須落證據，不得靜默
             verdict, fallback, code = "INSUFFICIENT_EVIDENCE", "檢視 observations.exception 後重跑", 1
             rec.observations["exception"] = f"{type(exc).__name__}: {exc}"
-    if verdict == "PASS" and (edr_product == "unknown" or edr_status == "unknown"):
-        # 未記錄 EDR 產品或狀態時，結果不足以代表端點防護環境（§13、§11.3）。
-        verdict, fallback, code = (
-            "INSUFFICIENT_EVIDENCE",
-            "EDR 產品或狀態為 unknown：於擁有者 EDR 主控台查得後以 --edr-product／--edr-status 重跑",
-            1,
-        )
-        rec.observations["edr_downgrade"] = True
+    after = snapshot_binaries(subjects)
+    av_sim = dict(rec.observations.get("av_sim") or {
+        **_av_sim_module().describe(SPIKE3_SEED, oplock=True),
+        "launch_error": "not_started", "grabs": None, "open_errors": None, "helper_exit": None,
+    })
+    integrity = binary_integrity_report(before, after, av_sim.get("launch_error"))
+    if verdict == "PASS" and not (integrity["unchanged"] and not integrity["launch_refused"]):
+        # 執行檔前後不一致或啟動被拒＝端點防護干預的可觀察事實；不得以 PASS 放行。
+        verdict, fallback, code = "FAIL", "執行檔前後不一致或啟動被拒（端點防護干預）；保留證據，不得判為 PASS", 1
+        rec.observations["binary_integrity_downgrade"] = True
     wal_dir_str = str(rec.observations.get("wal_dir", ""))
-    env = gather_env(Path(wal_dir_str) if wal_dir_str else env_dir, edr_product)
+    env = gather_env(Path(wal_dir_str) if wal_dir_str else env_dir, edr["product"])
+    observations = {k: v for k, v in rec.observations.items() if k != "av_sim"}
     evidence = {
         "case_id": case_id,
         "run_at": run_at,
         "env": env,
         "artifact": artifact,
         "steps": rec.steps or [{"op": "host_check", "ts": run_at, "result": "no_case_steps_executed"}],
-        "observations": rec.observations,
-        "edr": edr,
+        "observations": observations,
+        "av_sim": av_sim,
+        "binary_integrity": integrity,
+        "edr": {"product": edr["product"], "status": edr["status"], "interceptions": edr["interceptions"]},
         "verdict": verdict,
         "fallback": fallback,
     }
@@ -511,14 +884,11 @@ def run_case(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Stage 0 Spike 3：Windows WAL／EDR 實機證據腳本")
+    p = argparse.ArgumentParser(description="Stage 0 Spike 3：Windows WAL 與端點防護（OD-19）實機證據腳本")
     p.add_argument("--list", action="store_true", help="列出 case_id（JSON 陣列）後結束")
     p.add_argument("--case", choices=CASE_IDS, help="要執行的 case_id")
     p.add_argument("--evidence-dir", help="證據輸出目錄")
     p.add_argument("--unlink-mode", choices=("classic", "posix"), default="classic")
-    p.add_argument("--edr-product", default="", help="EDR 產品名（主控台查得；查不到留空即 unknown）")
-    p.add_argument("--edr-status", default="", help="EDR 防護狀態（查不到留空即 unknown，PASS 會降級）")
-    p.add_argument("--edr-interceptions", default="unknown", help="攔截次數（整數）或 unknown")
     return p
 
 
