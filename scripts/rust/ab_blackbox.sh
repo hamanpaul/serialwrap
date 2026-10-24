@@ -97,6 +97,8 @@ Path('$REQUIRED_CASES').write_text('\n'.join(req) + '\n', encoding='utf-8')
 
 A_PIDS="$RUN_DIR/a.pids"
 A_XML="$RUN_DIR/a.xml"
+A_CONFIG="$RUN_DIR/a-config.jsonl"
+B_CONFIG="$RUN_DIR/b-config.jsonl"
 ID_A="$RUN_DIR/id-a.json"
 ID_B="$RUN_DIR/id-b.json"
 
@@ -165,7 +167,7 @@ echo "=== 開始 A 輪（Python 基線）==="
 touch "$A_PIDS"
 set +e
 env -u SERIALWRAP_CLI_EXE -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_AB_LABEL \
-  SW_AB_PIDLOG="$A_PIDS" python3 -m pytest tests/contract_blackbox \
+  SW_AB_PIDLOG="$A_PIDS" SW_AB_CONFIGLOG="$A_CONFIG" python3 -m pytest tests/contract_blackbox \
   -m "core_portable or posix_only" \
   --junitxml="$A_XML"
 a_rc=$?
@@ -332,6 +334,7 @@ b_env=(
   SW_BUNDLE="$BUNDLE_OUT"   # test_cli_mgmt_update／doctor 以 SW_BUNDLE 找本次 run 的 bundle（不得回退到未建置的 target/mkbundle-pytest）
   SERIALWRAP_AB_LABEL="rust-1a"
   SW_AB_PIDLOG="$B_PIDS"
+  SW_AB_CONFIGLOG="$B_CONFIG"
 )
 if [[ -n "$L1_OUT" ]]; then
   b_env+=(SW_RESOURCE_REPORT="$B_RESOURCE_REPORT")
@@ -350,7 +353,7 @@ fi
 
 # 5. 產生身分 JSON (identity-a and identity-b)
 python3 -c "
-import hashlib, json, os, subprocess, sys
+import hashlib, importlib.util, json, os, subprocess, sys
 from pathlib import Path
 
 root = Path('$REPO_ROOT')
@@ -396,16 +399,25 @@ py_sha = file_sha256(Path(py_cli))
 rust_cli = str(Path('$BUNDLE_CLI').resolve())
 rust_sha = file_sha256(Path(rust_cli))
 
-# 計算 tool_revision 與 config_digest
+# 計算 tool_revision；config_digest 由各輪實際建立的設定紀錄彙整（config_digest.py，逐案例摘要）
 bb_tree_sha = dir_sha256(root / 'tests' / 'contract_blackbox')
 tool_rev = f'{git_rev}+{bb_tree_sha}'
-cfg_digest = dir_sha256(Path('$BUNDLE_OUT'))
+bundle_tree = dir_sha256(Path('$BUNDLE_OUT'))
+cd_spec = importlib.util.spec_from_file_location('ab_config_digest', root / 'tests' / 'contract_blackbox' / 'config_digest.py')
+cd_mod = importlib.util.module_from_spec(cd_spec)
+cd_spec.loader.exec_module(cd_mod)
+cfg_a = cd_mod.aggregate(Path('$A_CONFIG'))
+cfg_b = cd_mod.aggregate(Path('$B_CONFIG'))
+Path('$RUN_DIR/config-digest-a.json').write_text(json.dumps(cfg_a, ensure_ascii=False, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+Path('$RUN_DIR/config-digest-b.json').write_text(json.dumps(cfg_b, ensure_ascii=False, sort_keys=True, indent=2) + '\n', encoding='utf-8')
 
-# 建立 evidence_files 清單
-evidence_files = []
+# 建立 evidence_files 清單（共用部分；設定紀錄與摘要檔依輪分列）
+evidence_common = []
 for p in (Path('$A_XML'), Path('$B_XML'), Path('$RELEASE_CHECK'), Path('$REQUIRED_CASES')):
     if p.is_file():
-        evidence_files.append({'path': str(p.resolve()), 'sha256': file_sha256(p)})
+        evidence_common.append({'path': str(p.resolve()), 'sha256': file_sha256(p)})
+evidence_a = evidence_common + [{'path': str(p.resolve()), 'sha256': file_sha256(p)} for p in (Path('$A_CONFIG'), Path('$RUN_DIR/config-digest-a.json'))]
+evidence_b = evidence_common + [{'path': str(p.resolve()), 'sha256': file_sha256(p)} for p in (Path('$B_CONFIG'), Path('$RUN_DIR/config-digest-b.json'))]
 
 id_a = {
     'cli_path': py_cli,
@@ -419,10 +431,11 @@ id_a = {
     'case_list_sha256': '',
     'tool_revision': tool_rev,
     'platform': 'linux',
-    'config_digest': cfg_digest,
+    'config_digest': cfg_a['digest'],
+    'bundle_tree_sha256': bundle_tree,
     'dut_identity': 'FakeTarget',
     'pid_namespace_isolated': PIDNS_ISOLATED,
-    'evidence_files': evidence_files,
+    'evidence_files': evidence_a,
 }
 Path('$ID_A').write_text(json.dumps(id_a, indent=2) + '\n', encoding='utf-8')
 
@@ -438,10 +451,11 @@ id_b = {
     'case_list_sha256': '',
     'tool_revision': tool_rev,
     'platform': 'linux',
-    'config_digest': cfg_digest,
+    'config_digest': cfg_b['digest'],
+    'bundle_tree_sha256': bundle_tree,
     'dut_identity': 'FakeTarget',
     'pid_namespace_isolated': PIDNS_ISOLATED,
-    'evidence_files': evidence_files,
+    'evidence_files': evidence_b,
 }
 Path('$ID_B').write_text(json.dumps(id_b, indent=2) + '\n', encoding='utf-8')
 "
