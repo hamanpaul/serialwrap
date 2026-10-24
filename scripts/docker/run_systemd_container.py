@@ -95,26 +95,58 @@ def _main_pid(mode: str) -> int:
 
 _PROC_FD_SCAN = r'''
 import json, os, pathlib, sys
-target = os.path.realpath(sys.argv[1])
-pids, readable, holders = [], [], []
-for proc in pathlib.Path("/proc").iterdir():
-    if not proc.name.isdigit():
-        continue
-    pid = int(proc.name)
-    pids.append(pid)
-    try:
-        fds = list((proc / "fd").iterdir())
-    except OSError:
-        continue
-    readable.append(pid)
-    for fd in fds:
-        try:
-            if os.path.realpath(os.readlink(fd)) == target:
-                holders.append(pid)
-                break
-        except OSError:
+
+
+def scan(proc_root, target, readlink=os.readlink):
+    """掃描 proc_root 下各行程的 fd 表（fail-closed）。
+
+    readable：fd 表已完整解析（或無 fd 表、fd／行程於讀取期間消失，皆無可持有的 fd）。
+    holders：至少一個 fd 解析後指向 target。
+    unresolved：fd 目錄可列舉但有 fd 無法 readlink（例如 PermissionError），且未找到 target，判定不足。
+    fd 目錄無法列舉（PermissionError 等）同樣計為 unresolved，不得視為已覆蓋。
+    """
+    pids, readable, holders, unresolved = [], [], [], []
+    for proc in pathlib.Path(proc_root).iterdir():
+        if not proc.name.isdigit():
             continue
-print(json.dumps({"pids": sorted(pids), "readable": sorted(readable), "holders": sorted(holders)}))
+        pid = int(proc.name)
+        pids.append(pid)
+        try:
+            fds = list((proc / "fd").iterdir())
+        except FileNotFoundError:
+            readable.append(pid)
+            continue
+        except OSError:
+            unresolved.append(pid)
+            continue
+        held = False
+        blind = False
+        for fd in fds:
+            try:
+                if os.path.realpath(readlink(fd)) == target:
+                    held = True
+                    break
+            except FileNotFoundError:
+                continue
+            except OSError:
+                blind = True
+        if held:
+            holders.append(pid)
+            readable.append(pid)
+        elif blind:
+            unresolved.append(pid)
+        else:
+            readable.append(pid)
+    return {
+        "pids": sorted(pids),
+        "readable": sorted(readable),
+        "holders": sorted(holders),
+        "unresolved": sorted(unresolved),
+    }
+
+
+if __name__ == "__main__":
+    print(json.dumps(scan("/proc", os.path.realpath(sys.argv[1]))))
 '''
 
 
@@ -145,21 +177,28 @@ def _holder_pids(device_path: pathlib.Path) -> list[int]:
     """回報持有裝置的行程 PID：root 與 daemon 使用者兩輪掃描取聯集。
 
     容器內 root 不具 CAP_SYS_PTRACE，讀不到 swtest 行程的 fd 表，故另以 daemon 使用者掃描。
-    仍無法讀取 fd 表、且屬於兩輪掃描權限所及 uid（root／swtest）的現存行程會使判定失效（拋出 RuntimeError），
-    不得回傳「無持有者」（fail-closed）。其他 uid 的行程（例如 messagebus、systemd-timesync）不在兩輪權限內，
-    不計入 uncovered，以免容器內存在此類行程即誤報。殘留風險：其他 uid 行程若持有 usb-fake PTY 會被漏判；
+    行程只要其 fd 表被任一身分完整解析即視為已覆蓋；兩個身分皆無法完整解析（fd 目錄列舉或 readlink 失敗）
+    且行程仍存在、屬於兩輪掃描權限所及 uid（root／swtest）時拋出 RuntimeError（證據不足，fail-closed），
+    不得回傳「無持有者」。其他 uid 的行程（例如 messagebus、systemd-timesync）不在兩輪權限內，
+    不計入判定不足，以免容器內存在此類行程即誤報。殘留風險：其他 uid 行程若持有 usb-fake PTY 會被漏判；
     本 harness 的 PTY 持有者僅為 serialwrapd 與 swtest 行程。
     """
     target = os.path.realpath(device_path)
     root_scan = _scan_proc_fds(target, as_user=None)
     user_scan = _scan_proc_fds(target, as_user=systemd_container.USER)
     covered = set(root_scan["readable"]) | set(user_scan["readable"])
+    # 判定範圍以 root 掃描時已存在的行程為準；兩輪之間新出現者（例如 runuser 父行程）不在 root 清單內，
+    # 不因 daemon 使用者無法讀取其 fd 表而誤報。殘留風險：兩輪之間新出現且持有 PTY 的 root 行程不在判定範圍內。
     uncovered = sorted(
         pid for pid in root_scan["pids"]
         if pid not in covered and _proc_uid(pid) in _HOLDER_SCAN_UIDS
     )
     if uncovered:
-        raise RuntimeError(f"holder 掃描無法讀取現存行程 fd：{uncovered}")
+        raise RuntimeError(
+            f"holder 掃描無法解析現存行程 fd：{uncovered}"
+            f"（root 未解析 {root_scan.get('unresolved', [])}，"
+            f"{systemd_container.USER} 未解析 {user_scan.get('unresolved', [])}）"
+        )
     return sorted(set(root_scan["holders"]) | set(user_scan["holders"]))
 
 
