@@ -968,7 +968,7 @@ def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) ->
     assert refused.returncode == 1, refused.stdout + refused.stderr
     assert lock_path.read_bytes() == original_bytes
 
-    allowed = subprocess.run([*regen, "--allow-removal", "cargo:sw-cli::target::old_placeholder"],
+    allowed = subprocess.run([*regen, "--allow-removal", "s1b_cargo:linux:cargo:sw-cli::target::old_placeholder"],
                              capture_output=True, text=True, cwd=REPO_ROOT)
     assert allowed.returncode == 0, allowed.stdout + allowed.stderr
     revised = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -977,7 +977,7 @@ def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) ->
     ]
 
     revised_bytes = lock_path.read_bytes()
-    overapproved = subprocess.run([*regen, "--allow-removal", "cargo:sw-cli::target::missing"],
+    overapproved = subprocess.run([*regen, "--allow-removal", "s1b_cargo:linux:cargo:sw-cli::target::missing"],
                                   capture_output=True, text=True, cwd=REPO_ROOT)
     assert overapproved.returncode == 1, overapproved.stdout + overapproved.stderr
     assert lock_path.read_bytes() == revised_bytes
