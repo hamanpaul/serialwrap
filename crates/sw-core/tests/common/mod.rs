@@ -6,3 +6,6 @@ use std::path::{Path, PathBuf};
 pub fn repo_path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
 }
+
+/// P6 golden TSV 工具（07 Task 2）。
+pub mod golden;
