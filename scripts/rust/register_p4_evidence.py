@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""依凍結 P4 對照表與實際測試報告登錄逐案例證據。"""
+"""依凍結 P4 對照表與實際測試報告登錄逐案例證據。
+
+cargo 測試執行檔只依 L1 報告內的 provenance 核對（sha256、受測 HEAD、工作樹乾淨狀態），不重建、不重跑、不以 --list 推定身分。
+"""
 
 from __future__ import annotations
 
@@ -8,7 +11,6 @@ import ast
 import hashlib
 import importlib.util
 import json
-import os
 import re
 import subprocess
 import sys
@@ -28,6 +30,7 @@ EVIDENCE_DIR = ROOT / "target" / "p4-evidence"
 L1_LOCK = ROOT / "tests" / "acceptance" / "l1_required.lock.json"
 L1_JUDGE = ROOT / "tests" / "acceptance" / "l1_judge.py"
 PRODUCER = "register_p4_evidence.py"
+CARGO_PROVENANCE_SCHEMA = "cargo-l1-provenance.v1"  # 與 cargo_l1_results.PROVENANCE_SCHEMA 同值
 BLOCKED_LAYERS = {"L2", "L3", "manual"}
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 
@@ -135,6 +138,9 @@ def _pytest_node_path(classname: str, name: str, source_root: Path | None = None
 def _junit_rows(path: Path | None, source_root: Path | None = None) -> dict[str, list[str]] | None:
     if path is None or not path.is_file():
         return None
+    # testsuite 宣告的 failures／errors 超出 testcase 層即整份 junit 視為不可用（fail-closed；計數唯一實作為 P2）。
+    if _junit_counts(path) is None:
+        return None
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError):
@@ -230,7 +236,7 @@ def _l1_outcome(
         return False, f"L1 凍結集合不可用：{type(exc).__name__}"
     junit = _junit_counts(junit_path) if runner == "pytest" else None
     if runner == "pytest" and junit is None:
-        return False, f"pytest junit 不存在或無法解析：{junit_path}"
+        return False, f"pytest junit 不存在、無法解析或 suite 宣告值與 testcase 層不一致：{junit_path}"
     verdict = judge.judge(report, required, platform=platform, junit=junit, selector=selector)
     if verdict.get("verdict") != "PASS":
         reasons = verdict.get("reasons") or []
@@ -276,23 +282,37 @@ def _l1_outcome(
     return True, None
 
 
+def _safe_bundle_relative(value: str) -> bool:
+    """`current-release.json` 的 dir 必須是安全的 bundle 相對路徑（與 Rust launcher 同一規則）：
+    非空、非絕對路徑、無磁碟代號，且無空段、`.` 或 `..`。
+    """
+    if not value or value.startswith("/") or ":" in value:
+        return False
+    return all(segment not in ("", ".", "..") for segment in value.split("/"))
+
+
 def _manifest_candidates(cli: Path) -> tuple[list[Path], str | None]:
     """依 bundle 佈局列出 release-manifest.json 候選路徑（指標優先，之後為安裝根）。
 
     指標 `current-release.json` 的 `dir` 為相對安裝根（`cli.parent.parent`）的 `versions/<V>`（plan 04 Task 17，OD-18 (3)
-    一律正斜線）。讀取端仍接受舊版反斜線指標，先正規化為 `/`；絕對路徑照舊。指標存在但無法解析即回報錯誤，不得靜默略過。
+    一律正斜線）。讀取端仍接受舊版反斜線指標，先正規化為 `/`。`dir` 為絕對路徑、含 `..`、空段或磁碟代號即拒收，
+    與 launcher（`current_release_manifest_path`）一致，不得讓指標把 manifest 導到 bundle 之外。
+    指標存在但無法解析或不安全即回報錯誤，不得靜默略過。
     """
     candidates = [cli.parent.parent / "release-manifest.json"]
     pointer = cli.parent / "current-release.json"
     if pointer.is_file():
         try:
             data = json.loads(pointer.read_text(encoding="utf-8"))
-            directory = Path(str(data["dir"]).replace("\\", "/"))
-            if not directory.is_absolute():
-                directory = cli.parent.parent / directory
-            candidates.insert(0, directory / "release-manifest.json")
+            value = data["dir"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             return [], "current-release.json 無法解析"
+        if not isinstance(value, str):
+            return [], "current-release.json 無法解析"
+        raw = value.replace("\\", "/")
+        if not _safe_bundle_relative(raw):
+            return [], "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
+        candidates.insert(0, cli.parent.parent.joinpath(*raw.split("/")) / "release-manifest.json")
     return candidates, None
 
 
@@ -443,129 +463,6 @@ def _case_marker_matches(source_root: Path, nodeid: str, case_id: str) -> tuple[
     return False, f"@pytest.mark.case({case_id!r}) 不存在於測試或其所屬層級"
 
 
-def _test_exe_parts(nodeid: str) -> tuple[str, str, str] | None:
-    parts = nodeid.split("::")
-    if len(parts) < 3:
-        return None
-    crate, target = parts[0], parts[1]
-    test_name = "::".join(parts[2:])
-    if not crate.startswith("sw-"):
-        return None
-    return crate, target, test_name
-
-
-def _listed_tests(path: Path, platform: str, win_runner: Path) -> set[str] | None:
-    argv = [str(path), "--list", "--format", "terse"]
-    if platform == "windows":
-        argv = [str(win_runner), str(path), "--list", "--format", "terse"]
-    env = os.environ.copy()
-    for name in ("SW_TEST_COM_PAIR", "SW_TEST_CAPS", "SW_TEST_SERIALWRAPD"):
-        env.pop(name, None)
-    try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=90, env=env, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    names: set[str] = set()
-    for line in result.stdout.splitlines():
-        matched = LIST_LINE.match(line.strip())
-        if matched:
-            names.add(matched.group(1))
-    return names
-
-
-def _package_name(package_id: str) -> str:
-    """cargo JSON 的 package_id：`path+file://…/<dir>#<version>`（名稱即目錄名）或 `…#<name>@<version>`。"""
-    url, _, fragment = package_id.partition("#")
-    if "@" in fragment:
-        return fragment.split("@", 1)[0]
-    return url.rstrip("/").rsplit("/", 1)[-1]
-
-
-def _parse_cargo_artifacts(stdout: str) -> dict[tuple[str, str], list[Path]]:
-    """解析 `cargo test --no-run --message-format=json`：(package, target 名稱) → 測試執行檔（去重、排序）。"""
-    found: dict[tuple[str, str], set[str]] = {}
-    for line in stdout.splitlines():
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
-            continue
-        profile = message.get("profile") or {}
-        executable = message.get("executable")
-        target = message.get("target") or {}
-        if not isinstance(profile, dict) or not profile.get("test") or not executable:
-            continue
-        key = (_package_name(str(message.get("package_id", ""))), str(target.get("name", "")))
-        found.setdefault(key, set()).add(str(executable))
-    return {key: [Path(item) for item in sorted(values)] for key, values in found.items()}
-
-
-def _cargo_artifact_index(
-    args: argparse.Namespace,
-    platform: str,
-    cache: dict[Any, Any],
-) -> tuple[dict[tuple[str, str], list[Path]], str | None]:
-    """以凍結 s1b_cargo selector 的 argv 執行 `cargo test --no-run --message-format=json`（每平台至多一次）。
-
-    Windows 加 `--target x86_64-pc-windows-gnu`（與 selector 建置目標一致）；失敗即 fail-closed。
-    """
-    key = ("cargo-index", platform)
-    if key in cache:
-        return cache[key]
-    lock = p4_rule.load_l1_lock(L1_LOCK)
-    argv = ["cargo", "test", "--no-run", "--message-format=json",
-            "--target-dir", str(args.cargo_target_dir), *p4_rule.cargo_selector_argv(lock, platform)]
-    env = os.environ.copy()
-    if platform == "windows":
-        argv.extend(["--target", p4_rule.WINDOWS_TARGET_TRIPLE])
-        env.setdefault("CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER", "x86_64-w64-mingw32-gcc")
-    try:
-        proc = subprocess.run(argv, cwd=args.repo_root, capture_output=True, text=True, check=False, env=env)
-    except OSError as exc:
-        result: tuple[dict[tuple[str, str], list[Path]], str | None] = ({}, f"cargo 無法執行：{type(exc).__name__}")
-    else:
-        if proc.returncode != 0:
-            result = ({}, f"cargo test --no-run 失敗（rc={proc.returncode}）")
-        else:
-            result = (_parse_cargo_artifacts(proc.stdout), None)
-    cache[key] = result
-    return result
-
-
-def _listed_tests_cached(path: Path, platform: str, win_runner: Path, cache: dict[Any, Any]) -> set[str]:
-    key = ("listed", platform, str(path))
-    if key not in cache:
-        cache[key] = _listed_tests(path, platform, win_runner) or set()
-    return cache[key]
-
-
-def _cargo_executable(
-    args: argparse.Namespace,
-    platform: str,
-    nodeid: str,
-    cache: dict[Any, Any],
-) -> tuple[Path | None, str | None]:
-    parts = _test_exe_parts(nodeid)
-    if parts is None:
-        return None, "Cargo nodeid 格式無法解析"
-    crate, target, test_name = parts
-    index, index_error = _cargo_artifact_index(args, platform, cache)
-    if index_error:
-        return None, index_error
-    matches = index.get((crate, target), [])
-    if len(matches) != 1:
-        return None, "找不到唯一包含必要測試的 Cargo test executable"
-    executable = matches[0]
-    if not executable.is_file():
-        return None, "找不到唯一包含必要測試的 Cargo test executable"
-    if test_name not in _listed_tests_cached(executable, platform, args.windows_runner, cache):
-        return None, "找不到唯一包含必要測試的 Cargo test executable"
-    return executable, None
-
-
 def _artifact(path: Path | None) -> tuple[str | None, str | None]:
     if path is None or not path.is_file():
         return None, None
@@ -604,13 +501,65 @@ def _pytest_artifact(args: argparse.Namespace, platform: str, round_name: str) -
     return Path(value).resolve() if value else None
 
 
+def _cargo_artifact_from_report(
+    report: dict[str, Any], nodeid: str, commit: str, platform: str
+) -> tuple[Path | None, str | None]:
+    """依 L1 報告內的 provenance 核對受測執行檔（只讀紀錄與磁碟上的檔案，不重建、不重跑）。
+
+    回傳 (執行檔路徑, 拒收原因)。核對項目：provenance 存在且 schema 相符；報告開始與結束時的 git HEAD 皆等於受測 HEAD
+    且工作樹乾淨；rustc -vV 與 RUSTFLAGS 摘要有紀錄；恰有一個 executable 的 nodeids 含此測試；其 sha256 有紀錄，
+    且與磁碟上目前的檔案相符（改寫或重建後未重跑即拒收）。
+    """
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("schema") != CARGO_PROVENANCE_SCHEMA:
+        return None, "L1 報告缺少 provenance（非 cargo_l1_results.py 產出或為舊版），請重跑 cargo L1"
+    if provenance.get("platform") != platform:
+        return None, "L1 報告 provenance 的 platform 與登錄平台不符，請重跑 cargo L1"
+    git = provenance.get("git")
+    if not isinstance(git, dict) or not isinstance(git.get("end"), dict):
+        return None, "L1 報告缺少 git revision 紀錄，請重跑 cargo L1"
+    for state in (git, git["end"]):
+        if state.get("head") != commit:
+            return None, "L1 報告的 git HEAD 與受測 HEAD 不符（或執行期間 HEAD 改變），請於受測 HEAD 重跑 cargo L1"
+        if state.get("clean") is not True:
+            return None, "L1 報告產生或執行期間工作樹不乾淨，拒收，請於乾淨 HEAD 重跑 cargo L1"
+    toolchain = provenance.get("toolchain")
+    if not isinstance(toolchain, dict) or not isinstance(toolchain.get("rustc_vv"), str) or not toolchain["rustc_vv"].strip():
+        return None, "L1 報告缺少 rustc -vV 紀錄，請重跑 cargo L1"
+    if not isinstance(provenance.get("rustflags"), dict):
+        return None, "L1 報告缺少 RUSTFLAGS 摘要，請重跑 cargo L1"
+    rows = provenance.get("executables")
+    if not isinstance(rows, list):
+        return None, "L1 報告缺少 executables 紀錄，請重跑 cargo L1"
+    full = f"cargo:{nodeid}"
+    owners = [
+        row for row in rows
+        if isinstance(row, dict) and isinstance(row.get("nodeids"), list) and full in row["nodeids"]
+    ]
+    if len(owners) != 1:
+        return None, "找不到唯一包含必要測試的 Cargo test executable（L1 報告內）"
+    owner = owners[0]
+    recorded = owner.get("sha256")
+    if not isinstance(recorded, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded):
+        return None, "L1 報告的 executable 缺 sha256 紀錄，拒收，請重跑 cargo L1"
+    path = owner.get("path")
+    if not isinstance(path, str) or not path:
+        return None, "L1 報告的 executable 缺 path 紀錄，拒收，請重跑 cargo L1"
+    executable = Path(path)
+    actual = _sha256(executable) if executable.is_file() else None
+    if actual is None:
+        return None, "L1 報告所列 executable 不存在，請重跑 cargo L1"
+    if actual != recorded:
+        return None, "executable sha256 與 L1 報告不符（已改寫或重建，未經此 binary 之測試），請重跑 cargo L1"
+    return executable, None
+
+
 def _cargo_records(
     case: dict[str, Any],
     nodeid: str,
     platform: str,
     commit: str,
     args: argparse.Namespace,
-    executable_cache: dict[Any, Any],
 ) -> list[dict[str, Any]]:
     case_id = str(case["case_id"])
     report_path = args.l1_dir / platform / "cargo" / "resource-report.json"
@@ -627,12 +576,7 @@ def _cargo_records(
             and _node_matches(row["nodeid"].removeprefix("cargo:"), nodeid)
         ]
         if len(matching) == 1:
-            exe, exe_reason = _cargo_executable(
-                args,
-                platform,
-                matching[0].removeprefix("cargo:"),
-                executable_cache,
-            )
+            exe, exe_reason = _cargo_artifact_from_report(report, nodeid, commit, platform)
             if exe_reason:
                 passed = False
                 reason = exe_reason
@@ -847,7 +791,6 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
     generated_records = 0
     failed_records = 0
     skipped_cases: list[str] = []
-    executable_cache: dict[Any, Any] = {}
     registrable = [case for case in cases if str(case.get("case_id", "")) and not _is_owner_case(case)]
     applicable = _applicability(registrable, args)
 
@@ -876,7 +819,7 @@ def register(args: argparse.Namespace) -> dict[str, Any]:
                 if node.startswith("tests/contract_blackbox/") and "::" in node:
                     records.extend(_pytest_records(case, node, platform, commit, args))
                 elif node.startswith("sw-") and "::" in node:
-                    records.extend(_cargo_records(case, node, platform, commit, args, executable_cache))
+                    records.extend(_cargo_records(case, node, platform, commit, args))
                 elif node.startswith("tests/") and "::" in node:
                     records.extend(_unit_python_records(case, node, platform, commit, args))
 
@@ -905,8 +848,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-root", type=Path, default=ROOT)
     parser.add_argument("--l1-dir", type=Path, default=EVIDENCE_DIR / "l1")
     parser.add_argument("--out-dir", type=Path, default=EVIDENCE_DIR)
-    parser.add_argument("--cargo-target-dir", type=Path, default=ROOT / "target")
-    parser.add_argument("--windows-runner", type=Path, default=ROOT / "scripts" / "rust" / "win-runner.sh")
     parser.add_argument("--linux-cli", help="Linux Rust CLI bundle 執行檔")
     parser.add_argument("--windows-cli", help="Windows Rust CLI bundle 執行檔")
     parser.add_argument("--python-cli", default=str(ROOT / "serialwrap.py"), help="Python 基線 CLI 執行檔")
@@ -925,8 +866,6 @@ def main(argv: list[str] | None = None) -> int:
         args.source_root = args.source_root.resolve()
         args.l1_dir = args.l1_dir.resolve()
         args.out_dir = args.out_dir.resolve()
-        args.cargo_target_dir = args.cargo_target_dir.resolve()
-        args.windows_runner = args.windows_runner.resolve()
         for name in ("linux_cli", "windows_cli", "python_cli", "linux_python_junit", "windows_python_junit", "linux_unit_junit", "windows_unit_junit"):
             value = getattr(args, name)
             if value:

@@ -346,3 +346,85 @@ def test_evidence_index_explicit_index_and_cases_paths(tmp_path: pathlib.Path):
         cwd=REPO, capture_output=True, text=True, encoding="utf-8",
     )
     assert proc.returncode == 2, f"expected usage error (2), got {proc.returncode}:\n{proc.stderr}"
+
+
+def _junit_file(tmp_path: pathlib.Path, body: str, name: str = "junit.xml") -> pathlib.Path:
+    path = tmp_path / name
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+@pytest.mark.memory_only
+def test_junit_counts_rejects_suite_declared_failures_above_testcase_level(tmp_path: pathlib.Path) -> None:
+    """testsuite 宣告的 failures 大於 testcase 層計數 → ValueError（fail-closed，不得判 PASS）。"""
+    checker = _load_checker_module()
+    path = _junit_file(
+        tmp_path,
+        '<testsuites><testsuite tests="2" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.a" name="t1"/><testcase classname="tests.a" name="t2"/>'
+        '</testsuite></testsuites>',
+    )
+    with pytest.raises(ValueError, match="failures=1"):
+        checker._junit_counts(path)
+
+
+@pytest.mark.memory_only
+def test_junit_counts_rejects_suite_declared_errors_above_testcase_level(tmp_path: pathlib.Path) -> None:
+    checker = _load_checker_module()
+    path = _junit_file(
+        tmp_path,
+        '<testsuites><testsuite tests="1" failures="0" errors="2" skipped="0">'
+        '<testcase classname="tests.a" name="t1"/></testsuite></testsuites>',
+    )
+    with pytest.raises(ValueError, match="errors=2"):
+        checker._junit_counts(path)
+
+
+@pytest.mark.memory_only
+def test_junit_counts_accepts_suite_declaration_matching_testcase_level(tmp_path: pathlib.Path) -> None:
+    """對照組：宣告值與 testcase 層一致時照常回傳 testcase 層計數。"""
+    checker = _load_checker_module()
+    path = _junit_file(
+        tmp_path,
+        '<testsuites><testsuite tests="2" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.a" name="t1"><failure message="x"/></testcase>'
+        '<testcase classname="tests.a" name="t2"/></testsuite></testsuites>',
+    )
+    assert checker._junit_counts(path) == {"tests": 2, "failures": 1, "errors": 0, "skipped": 0}
+
+
+@pytest.mark.memory_only
+def test_junit_counts_rejects_non_integer_suite_declaration(tmp_path: pathlib.Path) -> None:
+    checker = _load_checker_module()
+    path = _junit_file(
+        tmp_path,
+        '<testsuites><testsuite tests="1" failures="none" errors="0" skipped="0">'
+        '<testcase classname="tests.a" name="t1"/></testsuite></testsuites>',
+    )
+    with pytest.raises(ValueError, match="不是整數"):
+        checker._junit_counts(path)
+
+
+@pytest.mark.memory_only
+def test_l1_item_with_suite_inconsistent_junit_is_blocked_not_pass(tmp_path: pathlib.Path) -> None:
+    """l1_set 項目中某平台的 junit suite 宣告值超出 testcase 層：該平台記為 l1_invalid（BLOCKED），不得放行。"""
+    checker = _load_checker_module()
+    base = tmp_path / "artifacts" / "s1b"
+    _write_l1_pass_artifacts(base, "s1b_20groups", ["linux", "windows"])
+    junit = base / "windows" / "junit.xml"
+    junit.write_text(junit.read_text(encoding="utf-8").replace('failures="0"', 'failures="1"', 1), encoding="utf-8")
+    digest = checker.l1_artifact_digest(base, ["linux", "windows"])
+    lock = json.loads((REPO / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    item = {
+        "id": "S1B-JUNIT-TEST",
+        "artifact_path": "artifacts/s1b",
+        "sha256": digest,
+        "l1_set": {"set_id": "s1b_20groups", "platforms": ["linux", "windows"]},
+    }
+    fails: list[str] = []
+    blocked: list[str] = []
+
+    checker._check_l1_item("S1B-JUNIT-TEST", item, tmp_path, lock, fails, blocked)
+
+    assert fails == [], fails
+    assert any(line.startswith("l1_invalid S1B-JUNIT-TEST windows") and "junit" in line for line in blocked), blocked

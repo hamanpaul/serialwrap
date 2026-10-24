@@ -10,7 +10,7 @@ S1X 規則（計畫 04 Task 18、§3 B3；owner_gated.py 為擁有者機台列�
 - 登記列在 selector 涵蓋且本平台會編譯卻整列缺席於報告 → evidence-insufficient（FAIL）。
 - pytest JUnit 必須帶 provenance：HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/ 且不縮小範圍；否則整份拒收。
 - s1_pytest_full（linux，OD-17）：`<l1>/linux/pytest-full/resource-report.json` 與 `--pytest-junit-report` 對帳；缺檔、集合不存在、INSUFFICIENT 或 INVALID → evidence-insufficient，FAIL → FAIL；不新增放行規則。
-- spike3（`scripts/stage0/spike3_win_wal.py`）證據依 `spike3_evidence.schema.json` 驗證、case_id 相符、git_head＝受測 HEAD；EDR 未知一律 BLOCKED-OWNER，不得 PASS。
+- spike3（`scripts/stage0/spike3_win_wal.py`）證據依 `spike3_evidence.schema.json` 驗證、case_id 相符、git_head＝受測 HEAD、git_clean、verdict PASS 與 binary_integrity 成立才 PASS；防毒產品名與狀態只是資訊欄位（OD-19），不參與判定。
 - Windows COM（OD-15、計畫 04 §3 B1）：可執行 gate。`--windows-com` 缺席、目錄無 `windows-com.json` 或任何驗證不符 → evidence-insufficient（整體 FAIL）；明示 `windows_com: FAIL` → FAIL。不再列為 BLOCKED-OWNER。
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ import argparse
 import base64
 import importlib.util
 import json
+import math
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -137,6 +138,8 @@ SPIKE3_CASES = (
     "win-wal-av-rotate", "win-wal-av-unlink", "win-wal-av-reader-handle", "win-wal-f12-progress",
 )
 SPIKE3_SCHEMA_REL = Path("scripts/stage0/spike3_evidence.schema.json")
+# OD-19 (2) 要求寫入延遲有上限；此值須由 owner 裁決後設定，目前不得自行推定。
+OD19_AVSIM_WRITE_LATENCY_BOUND_MS: float | None = None
 
 
 def _git_head(repo_root: Path) -> str | None:
@@ -217,7 +220,7 @@ def _junit_totals(path: Path | None, count: Callable[[Path], dict[str, int]] | N
         return None
     try:
         return count(path)
-    except (ET.ParseError, ValueError, OSError):
+    except (ET.ParseError, OSError):
         return None
 
 
@@ -406,13 +409,164 @@ def _windows_com_verdict(evidence_dir: Path) -> tuple[str, list[str]]:
     return ("PASS" if not reasons else "evidence-insufficient"), reasons
 
 
-def _unknown_text(value: Any) -> bool:
-    return not isinstance(value, str) or value.strip() in ("", "unknown")
+def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any]) -> list[str]:
+    """驗證各 Spike 3 案例的必要觀察，避免 verdict 或通用摘要欄位單獨放行。"""
+    if not isinstance(observations, dict):
+        return ["spike3 observations 非物件"]
+
+    reasons: list[str] = []
+
+    def int_at_least(key: str, minimum: int) -> int | None:
+        value = observations.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            reasons.append(f"observations.{key} 須為 ≥{minimum} 的整數")
+            return None
+        return value
+
+    def int_equals(key: str, expected: int) -> None:
+        value = observations.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+            reasons.append(f"observations.{key} 須為整數 {expected}")
+
+    def verify_record_sequence(data_append_count: int | None) -> None:
+        records = int_at_least("records", 1)
+        meta_count = observations.get("continuity_meta_count")
+        if not isinstance(meta_count, int) or isinstance(meta_count, bool) or meta_count < 0:
+            reasons.append("observations.continuity_meta_count 須為非負整數")
+        elif data_append_count is not None and records is not None and records != data_append_count + meta_count:
+            reasons.append("observations.records 須等於資料 append 數加 continuity META 數")
+        if observations.get("seq_continuous") is not True:
+            reasons.append("observations.seq_continuous 非 true")
+        first_seq = observations.get("first_seq")
+        if not isinstance(first_seq, int) or isinstance(first_seq, bool) or first_seq != 1:
+            reasons.append("observations.first_seq 必須為 1")
+        last_seq = observations.get("last_seq")
+        if records is not None and (
+            not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq != records
+        ):
+            reasons.append("observations.last_seq 必須等於 records")
+
+    def drain_must_match_daemon() -> None:
+        drain = observations.get("drain")
+        if not isinstance(drain, dict):
+            reasons.append("observations.drain 缺少 daemon 節奏 tick 記錄")
+            return
+        interval = drain.get("tick_interval_s")
+        finite_interval = (
+            isinstance(interval, (int, float))
+            and not isinstance(interval, bool)
+            and (not isinstance(interval, float) or math.isfinite(interval))
+        )
+        if not finite_interval or interval != 1.0:
+            reasons.append("observations.drain.tick_interval_s 必須等於 daemon 的 1.0 秒週期")
+        ticks = drain.get("ticks")
+        if not isinstance(ticks, int) or isinstance(ticks, bool) or ticks < 1:
+            reasons.append("observations.drain.ticks 須為正整數")
+        if drain.get("drained") is not True:
+            reasons.append("observations.drain.drained 非 true")
+
+    if cid == "win-wal-av-rotate":
+        expected = int_at_least("expected_records", 1)
+        archives = int_at_least("archives", 1)
+        retries = int_at_least("rotate_retry", 1)
+        append_count = observations.get("append_count")
+        if not isinstance(append_count, int) or isinstance(append_count, bool) or append_count < 1:
+            reasons.append("observations.append_count 須為正整數")
+            append_count = None
+        if expected is not None and append_count is not None and append_count != expected:
+            reasons.append("observations.append_count 與 expected_records 不相等")
+        if expected is not None and len(samples) != expected:
+            reasons.append("append_latency_ms 樣本數與 expected_records 不相等")
+        verify_record_sequence(append_count)
+        int_equals("deferred_delete_pending", 0)
+        if observations.get("interference_observed") is not True:
+            reasons.append("observations.interference_observed 非 true")
+        if archives is not None and retries is not None:
+            drain_must_match_daemon()
+    elif cid == "win-wal-av-unlink":
+        attempts = int_at_least("unlink_attempts", 2)
+        sharing_violations = int_at_least("sharing_violation_attempts", 1)
+        append_attempts = int_at_least("append_attempts_until_meta", 1)
+        metas = int_at_least("meta_count", 1)
+        if attempts is not None and sharing_violations is not None and attempts <= sharing_violations:
+            reasons.append("observations.unlink_attempts 須包含共享違規後的成功重試")
+        if observations.get("interference_observed") is not True:
+            reasons.append("observations.interference_observed 非 true")
+        if observations.get("unlinked") is not True:
+            reasons.append("observations.unlinked 非 true")
+        if observations.get("loss_flag") is not True:
+            reasons.append("observations.loss_flag 非 true")
+        range_known = observations.get("range_known")
+        lost_range = observations.get("potentially_lost_seq_range")
+        if not isinstance(range_known, bool):
+            reasons.append("observations.range_known 必須為 boolean")
+        elif range_known:
+            if (
+                not isinstance(lost_range, list)
+                or len(lost_range) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in lost_range)
+                or lost_range[0] > lost_range[1]
+            ):
+                reasons.append("observations.potentially_lost_seq_range 須是遞增的正整數二元組")
+        elif lost_range is not None:
+            reasons.append("range_known=false 時 potentially_lost_seq_range 必須為 null")
+        if append_attempts is not None and len(samples) != 10 + append_attempts:
+            reasons.append("append_latency_ms 樣本數與 unlink 前置及 META 重建 append 次數不符")
+        if metas is not None and metas < 1:
+            reasons.append("observations.meta_count 須至少一筆")
+    elif cid == "win-wal-av-reader-handle":
+        appended = int_at_least("appended", 2)
+        append_count = observations.get("append_count")
+        if not isinstance(append_count, int) or isinstance(append_count, bool) or append_count < 1:
+            reasons.append("observations.append_count 須為正整數")
+            append_count = None
+        if appended is not None and append_count is not None and appended != append_count:
+            reasons.append("observations.appended 與 append_count 不相等")
+        if appended is not None and len(samples) != appended:
+            reasons.append("append_latency_ms 樣本數與 appended 不相等")
+        verify_record_sequence(append_count)
+        if observations.get("rotation_failed_seen") is not True:
+            reasons.append("observations.rotation_failed_seen 非 true")
+        int_equals("write_failures", 0)
+        int_equals("deferred_delete_pending", 0)
+        if observations.get("interference_observed") is not True:
+            reasons.append("observations.interference_observed 非 true")
+        drain_must_match_daemon()
+    elif cid == "win-wal-f12-progress":
+        if len(samples) < 3:
+            reasons.append("append_latency_ms 樣本數不足以涵蓋 F12 前後 marker 與寫入")
+        append_count = observations.get("append_count")
+        if not isinstance(append_count, int) or isinstance(append_count, bool) or append_count < 1:
+            reasons.append("observations.append_count 須為正整數")
+            append_count = None
+        if append_count is not None and len(samples) != append_count:
+            reasons.append("append_latency_ms 樣本數與 append_count 不相等")
+        archives = int_at_least("archives", 1)
+        retries = int_at_least("rotate_retry", 1)
+        verify_record_sequence(append_count)
+        int_equals("deferred_delete_pending", 0)
+        for key in ("pre_rotate", "post_rotate"):
+            result = observations.get(key)
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                reasons.append(f"observations.{key}.ok 非 true")
+        if observations.get("crc_errors") != []:
+            reasons.append("observations.crc_errors 必須是空陣列")
+        if observations.get("interference_observed") is not True:
+            reasons.append("observations.interference_observed 非 true")
+        if archives is not None and retries is not None:
+            drain_must_match_daemon()
+    else:
+        reasons.append(f"未知的 spike3 case_id：{cid!r}")
+    return reasons
 
 
 def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
                    head: str | None) -> tuple[str, list[str]]:
-    """spike3 證據 → (狀態, 原因)。PASS 僅在 schema 合格、case_id 相符、git_head＝HEAD、verdict PASS 且 EDR 已知時成立。"""
+    """spike3 證據 → (狀態, 原因)。
+
+    PASS 還要求有有效 append 延遲樣本，且 owner 已裁決的上限未超出；缺樣本為 evidence-insufficient，
+    上限未裁決時為 BLOCKED-OWNER。EDR 名稱與狀態只是資訊欄位，不參與判定。
+    """
     if spike_dir is None:
         return "evidence-insufficient", ["未提供 --spike3-evidence"]
     path = spike_dir / f"{cid}.json"
@@ -442,10 +596,85 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
         return "FAIL", ["spike3 verdict 為 FAIL"]
     if verdict != "PASS":
         return "evidence-insufficient", [f"spike3 verdict={verdict!r}，非 PASS"]
-    edr = doc.get("edr") or {}
-    if _unknown_text(edr.get("product")) or _unknown_text(edr.get("status")):
-        # EDR 產品或狀態需擁有者於 EDR 主控台查得；未知時不得 PASS（§13、§11.3）。
-        return "BLOCKED-OWNER", ["EDR 產品或狀態未知：待擁有者於 EDR 主控台查得後重跑（不得以 PASS 放行）"]
+    integrity = doc.get("binary_integrity") or {}
+    subjects = integrity.get("subjects")
+    if not isinstance(subjects, list) or not subjects:
+        return "evidence-insufficient", ["spike3 binary_integrity.subjects 為空：無執行檔前後比對證據"]
+    bad_subjects: list[str] = []
+    for item in subjects:
+        if not isinstance(item, dict):
+            bad_subjects.append("非物件")
+            continue
+        sha_b = item.get("sha256_before")
+        sha_a = item.get("sha256_after")
+        hex_ok = (isinstance(sha_b, str) and len(sha_b) == 64 and all(c in "0123456789abcdef" for c in sha_b)
+                  and isinstance(sha_a, str) and len(sha_a) == 64 and all(c in "0123456789abcdef" for c in sha_a))
+        if item.get("exists_before") is not True or item.get("exists_after") is not True:
+            bad_subjects.append(f"{item.get('path')!r} 前後存在性非 true")
+        elif not hex_ok or sha_b != sha_a or item.get("unchanged") is not True:
+            bad_subjects.append(f"{item.get('path')!r} sha256 前後不一致或格式不合")
+    if bad_subjects:
+        return "evidence-insufficient", ["spike3 binary_integrity.subjects 不合格：" + "；".join(bad_subjects)]
+    if integrity.get("unchanged") is not True:
+        return "evidence-insufficient", ["spike3 binary_integrity.unchanged 非 true（執行檔前後不一致）"]
+    if integrity.get("launch_refused") is not False:
+        return "evidence-insufficient", ["spike3 binary_integrity.launch_refused 非 false（啟動被拒）"]
+    av = doc.get("av_sim") or {}
+    if av.get("launch_error") != "none":
+        return "evidence-insufficient", [f"spike3 av_sim.launch_error={av.get('launch_error')!r}，非 none（模擬防毒 helper 未成功啟動）"]
+    helper_exit = av.get("helper_exit")
+    if not isinstance(helper_exit, int) or isinstance(helper_exit, bool) or helper_exit != 0:
+        return "evidence-insufficient", [f"spike3 av_sim.helper_exit={helper_exit!r}，helper 須以 exit 0 完成"]
+    grabs = av.get("grabs")
+    if not isinstance(grabs, int) or isinstance(grabs, bool) or grabs < 1:
+        return "evidence-insufficient", [f"spike3 av_sim.grabs={grabs!r}，須為 ≥1 的整數（模擬防毒未實際佔用任何檔案）"]
+    # OD-19 (2) 明文要求含 oplock 變體；未實作（not_implemented）即不得讀成驗收全數滿足。
+    oplock = av.get("oplock")
+    if oplock not in ("granted", "denied", "unavailable"):
+        return "evidence-insufficient", [
+            f"oplock_not_covered：av_sim.oplock={oplock!r}，OD-19 (2) 之 oplock 變體未涵蓋（PENDING-OD-S1X-AVSIM-OPLOCK）"
+        ]
+    samples = (doc.get("observations") or {}).get("append_latency_ms")
+    if not isinstance(samples, list) or not samples:
+        return "evidence-insufficient", ["spike3 缺少 append 延遲樣本（observations.append_latency_ms）"]
+    if any(
+        isinstance(sample, bool)
+        or not isinstance(sample, (int, float))
+        or (isinstance(sample, float) and not math.isfinite(sample))
+        or sample < 0
+        for sample in samples
+    ):
+        return "evidence-insufficient", ["spike3 append 延遲樣本須為有限且非負的毫秒數"]
+    for sample in samples:
+        if isinstance(sample, int):
+            try:
+                finite_sample = math.isfinite(float(sample))
+            except OverflowError:
+                finite_sample = False
+            if not finite_sample:
+                return "evidence-insufficient", ["spike3 append 延遲樣本超出有限數值範圍"]
+    observations = doc.get("observations")
+    append_count = observations.get("append_count") if isinstance(observations, dict) else None
+    if not isinstance(append_count, int) or isinstance(append_count, bool) or append_count < 1:
+        return "evidence-insufficient", ["spike3 observations.append_count 須為正整數"]
+    if append_count != len(samples):
+        return "evidence-insufficient", [
+            f"spike3 append_count={append_count} 與 append_latency_ms 樣本數 {len(samples)} 不符"
+        ]
+    observation_reasons = _spike3_observation_reasons(cid, observations, samples)
+    if observation_reasons:
+        return "evidence-insufficient", observation_reasons
+    max_latency_ms = max(samples)
+    if OD19_AVSIM_WRITE_LATENCY_BOUND_MS is None:
+        return "BLOCKED-OWNER", [
+            "PENDING-OD-S1X-AVSIM-LATENCY：owner 尚未裁決最大 append 延遲上限 "
+            f"（本次最大值 {max_latency_ms:.6f} ms）"
+        ]
+    if max_latency_ms > OD19_AVSIM_WRITE_LATENCY_BOUND_MS:
+        return "FAIL", [
+            f"最大 append 延遲 {max_latency_ms:.6f} ms 超過 owner 上限 "
+            f"{OD19_AVSIM_WRITE_LATENCY_BOUND_MS:.6f} ms"
+        ]
     return "PASS", []
 
 
@@ -921,12 +1150,19 @@ def judge_stage1a(
                 judged: dict[str, Any] = {}
                 if judge_mod and hasattr(judge_mod, "judge"):
                     junit_dict = None
+                    junit_error: str | None = None
                     if subfolder == "blackbox":
                         # 與 pytest-full 同一計數慣例（testcase 層）；缺檔或不可解析為 None，維持原本「不做 junit 交叉核對」的語意。
-                        junit_dict = _junit_totals(l1_results_dir / platform / subfolder / "junit.xml", junit_counter)
+                        try:
+                            junit_dict = _junit_totals(l1_results_dir / platform / subfolder / "junit.xml", junit_counter)
+                        except ValueError as exc:
+                            junit_error = str(exc)
                     elif subfolder == "pytest-full":
                         # OD-17：與 --pytest-junit-report（同一次全套執行）對帳，見下方 strict 規則。
-                        junit_dict = _junit_totals(pytest_junit_path, junit_counter)
+                        try:
+                            junit_dict = _junit_totals(pytest_junit_path, junit_counter)
+                        except ValueError as exc:
+                            junit_error = str(exc)
                     judged = judge_mod.judge(rep, required_nodes, platform=platform, junit=junit_dict, selector=lock_sel)
                     v_raw = judged.get("verdict", "INVALID")
                     # OD-17：s1_pytest_full 的 INSUFFICIENT／INVALID 與缺 JUnit 一律為證據不足（不得 PASS）；
@@ -937,7 +1173,7 @@ def judge_stage1a(
                     junit_row_problems: list[str] = []
                     if strict and v_raw == "PASS" and junit_dict is not None:
                         junit_row_problems = _pytest_nodes_junit_problems(required_nodes, pytest_cases)
-                    if v_raw == "PASS" and (junit_dict is not None or not strict) and not junit_row_problems:
+                    if v_raw == "PASS" and junit_error is None and (junit_dict is not None or not strict) and not junit_row_problems:
                         verdict = "PASS"
                     elif v_raw == "FAIL":
                         verdict = "FAIL"
@@ -946,6 +1182,8 @@ def judge_stage1a(
                     else:
                         verdict = "evidence-insufficient"
                     reasons = list(judged.get("reasons", []))
+                    if junit_error is not None:
+                        reasons.append(f"JUnit suite 宣告與 testcase 計數不一致：{junit_error}")
                     if strict and v_raw == "PASS" and junit_dict is None:
                         reasons.append("pytest JUnit 缺漏或不可解析（s1_pytest_full 須與 --pytest-junit-report 對帳）")
                     reasons.extend(junit_row_problems)

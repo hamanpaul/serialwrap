@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 import pytest
 import yaml
@@ -485,3 +486,98 @@ def test_judge_spike2_case_set_is_one_shared_constant_with_register(gate) -> Non
     assert register.p4_rule.JUDGE_SPIKE2_CASES == gate.JUDGE_SPIKE2_CASES
     for cid in JUDGE_SPIKE2_IDS:
         assert register._is_owner_case({"case_id": cid, "layer": "L1.5"}), cid
+
+
+REAL_L1_LOCK = REPO_ROOT / "tests" / "acceptance" / "l1_required.lock.json"
+
+
+def _write_pytest_l1(l1_dir: Path, platform: str, *, declared_failures: str = "0", omit_junit: bool = False) -> None:
+    """為 s1b_20groups 的指定平台寫出全部必要 nodeid 皆 passed 的 pytest 報告與 junit（形狀同 test_evidence_index 的夾具）。
+
+    `declared_failures` 為 testsuite 宣告的 failures；testcase 層仍全數無 failure 子元素。
+    """
+    lock = json.loads(REAL_L1_LOCK.read_text(encoding="utf-8"))
+    spec = lock["sets"]["s1b_20groups"][platform]
+    nodeids = list(spec["nodeids"])
+    out = l1_dir / platform / "20groups"
+    out.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema_version": 2,
+        "format": "l1-results.v1",
+        "runner": "pytest",
+        "platform": platform,
+        "argv": ["/x/pytest/__main__.py", *spec["selector"]["argv"]],
+        "markexpr": spec["selector"]["markexpr"],
+        "counts": {},
+        "resources": {},
+        "uart_kind": "native",
+        "not_collected_platform": [],
+        "collected": nodeids,
+        "deselected": [],
+        "results": [
+            {"nodeid": nid, "outcome": "passed", "skip_kind": None,
+             "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}
+            for nid in nodeids
+        ],
+        "core_portable_platform_skips": [],
+        "exit_code": 0,
+        "finished": True,
+        "deployed_content": None,
+    }
+    (out / "resource-report.json").write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    if omit_junit:
+        (out / "junit.xml").unlink(missing_ok=True)
+        return
+    cases = "".join(f'<testcase classname="pytest" name={quoteattr(nid)}/>' for nid in nodeids)
+    (out / "junit.xml").write_text(
+        f'<?xml version="1.0"?><testsuite name="pytest" tests="{len(nodeids)}" failures="{declared_failures}" '
+        f'errors="0" skipped="0">{cases}</testsuite>\n',
+        encoding="utf-8",
+    )
+
+
+def test_junit_counts_suite_declared_failures_above_testcase_level_is_invalid(gate, tmp_path) -> None:
+    """suite 宣告 failures=1 但 testcase 無 failure 子元素（例如 subtests 失敗未留 testcase）→ 計數拋出 ValueError（fail-closed）。"""
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuites><testsuite tests="1" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.a" name="t1"/>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="大於 testcase 層計數"):
+        gate._junit_counts(path)
+
+
+def test_check_l1_junit_suite_inconsistency_is_invalid_and_missing_junit_insufficient(tmp_path) -> None:
+    """P4 selector 維持來源樹相對 nodeid；suite 計數矛盾 → INVALID，junit 缺席 → INSUFFICIENT。
+
+    巢狀來源樹回歸驗證 selector 的 collect-only 輸出不受外層 checkout rootdir 影響；JUnit 對照組則證明
+    矛盾失敗來自宣告計數，而不是其他夾具缺陷。
+    """
+    gate = _load_gate()
+    nodeid = "tests/contract_blackbox/test_selected.py::test_selected"
+    test_file = tmp_path / "source" / "tests" / "contract_blackbox" / "test_selected.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        "import pytest\npytestmark = pytest.mark.core_portable\ndef test_selected(): pass\n",
+        encoding="utf-8",
+    )
+    assert gate.pytest_collected([nodeid], "core_portable or posix_only", test_file.parents[2]) == {nodeid}
+
+    l1_dir = tmp_path / "l1"
+    _write_pytest_l1(l1_dir, "linux")
+    rows = {(row["set"], row["platform"]): row for row in gate.check_l1(l1_dir, REAL_L1_LOCK)}
+    assert rows[("s1b_20groups", "linux")]["verdict"] == "PASS", rows[("s1b_20groups", "linux")]
+
+    _write_pytest_l1(l1_dir, "linux", declared_failures="1")
+    rows = {(row["set"], row["platform"]): row for row in gate.check_l1(l1_dir, REAL_L1_LOCK)}
+    inconsistent = rows[("s1b_20groups", "linux")]
+    assert inconsistent["verdict"] == "INVALID", inconsistent
+    assert any("junit" in reason for reason in inconsistent["reasons"]), inconsistent
+
+    _write_pytest_l1(l1_dir, "linux", omit_junit=True)
+    rows = {(row["set"], row["platform"]): row for row in gate.check_l1(l1_dir, REAL_L1_LOCK)}
+    missing = rows[("s1b_20groups", "linux")]
+    assert missing["verdict"] == "INSUFFICIENT", missing
+    assert any("junit 缺失" in reason for reason in missing["reasons"]), missing

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -17,18 +16,45 @@ pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "rust" / "register_p4_evidence.py"
+TEST_NODE = "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present"
+LINUX_ONLY_NODE = "tests/contract_blackbox/test_cli_mgmt_remote.py::test_remote_sigint_cleans_spawned_tunnel"
 
 
 def _head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
 
-def _make_inputs(tmp_path: Path, *, case_id: str = "sc18-example") -> dict[str, Path]:
+GIT_ID = ["-c", "user.email=register-test@example.invalid", "-c", "user.name=register-test"]
+
+
+def _clean_repo(tmp_path: Path) -> Path:
+    """每個測試自備的乾淨 git repo。登錄器的髒樹守門只檢查受測 repo；以獨立 repo 取代開發中的工作樹，
+    使登錄結果不受同時進行中的其他變更影響（工作樹不乾淨時仍可重現）。"""
+    repo = tmp_path / "clean-repo"
+    if not (repo / ".git").is_dir():
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "README.md").write_text("clean fixture\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(["git", *GIT_ID, "commit", "-q", "-m", "fixture"], cwd=repo, check=True)
+    return repo
+
+
+def _repo_head(repo: Path) -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+
+def _make_inputs(
+    tmp_path: Path, *, case_id: str = "sc18-example", nodeid: str = TEST_NODE
+) -> dict[str, Path]:
     source_root = tmp_path / "source"
-    test_file = source_root / "tests" / "contract_blackbox" / "test_registration.py"
+    module, test_name = nodeid.split("::", maxsplit=1)
+    test_name = test_name.split("[", maxsplit=1)[0]
+    test_file = source_root / module
     test_file.parent.mkdir(parents=True)
     test_file.write_text(
-        'import pytest\n\npytestmark = [pytest.mark.core_portable]\n\n@pytest.mark.case("sc18-example")\ndef test_case():\n    pass\n',
+        'import pytest\n\npytestmark = [pytest.mark.core_portable]\n\n'
+        f'@pytest.mark.case("sc18-example")\ndef {test_name}():\n    pass\n',
         encoding="utf-8",
     )
 
@@ -43,7 +69,7 @@ def _make_inputs(tmp_path: Path, *, case_id: str = "sc18-example") -> dict[str, 
                         "layer": "L1",
                         "platforms": ["linux"],
                         "artifact": "rust-cli-bundle",
-                        "tests": ["tests/contract_blackbox/test_registration.py::test_case"],
+                        "tests": [nodeid],
                         "skip_registered": {},
                     }
                 ],
@@ -64,12 +90,12 @@ def _make_inputs(tmp_path: Path, *, case_id: str = "sc18-example") -> dict[str, 
             {
                 "schema_version": 1,
                 "stage": "rust-1b-dev",
-                "git_revision": _head(),
+                "git_revision": _repo_head(_clean_repo(tmp_path)),
                 "target": "x86_64-unknown-linux-gnu",
                 "components": {
                     "cli": {
                         "implementation": "rust",
-                        "git_revision": _head(),
+                        "git_revision": _repo_head(_clean_repo(tmp_path)),
                         "path": "bin/serialwrap",
                         "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
                     }
@@ -80,7 +106,6 @@ def _make_inputs(tmp_path: Path, *, case_id: str = "sc18-example") -> dict[str, 
     )
     python_cli = tmp_path / "serialwrap.py"
     python_cli.write_text("# python baseline\n", encoding="utf-8")
-    nodeid = "tests/contract_blackbox/test_registration.py::test_case"
     junit = _write_l1_report(l1_dir, nodeid, bundle, runner="pytest")
     return {
         "case_map": case_map,
@@ -101,6 +126,7 @@ def _write_l1_report(
     *,
     runner: str = "pytest",
     platform: str = "linux",
+    provenance: dict | None = None,
 ) -> Path:
     lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     set_name = "s1b_20groups" if runner == "pytest" else "s1b_cargo"
@@ -148,6 +174,9 @@ def _write_l1_report(
         }
         report["deployed_content"] = {"start": deployed, "end": dict(deployed)}
 
+    if provenance is not None:
+        report["provenance"] = provenance
+
     report_dir = l1_dir / platform / ("20groups" if runner == "pytest" else "cargo")
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "resource-report.json").write_text(json.dumps(report), encoding="utf-8")
@@ -163,8 +192,9 @@ def _write_l1_report(
         )
         for index, current in enumerate(collected):
             if current == nodeid:
-                classname = "tests.contract_blackbox.test_registration"
-                name = "test_case"
+                module, selected_name = nodeid.split("::", maxsplit=1)
+                classname = module[:-3].replace("/", ".")
+                name = selected_name.split("[", maxsplit=1)[0]
             else:
                 classname = "fixture.required"
                 name = f"test_{index}"
@@ -173,12 +203,12 @@ def _write_l1_report(
     return junit_path
 
 
-def _run(tmp_path: Path, inputs: dict[str, Path], *, extra: list[str] | None = None, repo_root: Path = ROOT) -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, inputs: dict[str, Path], *, extra: list[str] | None = None, repo_root: Path | None = None) -> subprocess.CompletedProcess[str]:
     argv = [
         sys.executable,
         str(SCRIPT),
         "--repo-root",
-        str(repo_root),
+        str(_clean_repo(tmp_path) if repo_root is None else repo_root),
         "--case-map",
         str(inputs["case_map"]),
         "--source-root",
@@ -210,12 +240,13 @@ def test_registers_only_reported_passes_with_head_and_actual_artifact_hash(tmp_p
     rust = next(item for item in records if item["round"] == "rust")
     python = next(item for item in records if item["round"] == "python")
     assert rust["case_id"] == "sc18-example"
-    assert rust["commit"] == _head()
+    # 受測 HEAD 為登錄所針對的乾淨 repo（與 _make_inputs 的 manifest revision 相同）。
+    assert rust["commit"] == _repo_head(_clean_repo(tmp_path))
     assert rust["platform"] == "linux"
     assert rust["result"] == "PASS"
     assert rust["artifact_path"] == str(inputs["bundle"])
     assert rust["artifact_sha256"] == hashlib.sha256(inputs["bundle"].read_bytes()).hexdigest()
-    assert rust["test_id"] == "tests/contract_blackbox/test_registration.py::test_case"
+    assert rust["test_id"] == TEST_NODE
     assert python["result"] == "PASS"
     assert python["artifact_path"] == str(inputs["python_cli"])
     assert python["artifact_sha256"] == hashlib.sha256(inputs["python_cli"].read_bytes()).hexdigest()
@@ -226,7 +257,7 @@ def test_missing_or_nonpassing_test_never_gets_a_pass(tmp_path: Path, failure: s
     inputs = _make_inputs(tmp_path)
     report_path = inputs["l1_dir"] / "linux" / "20groups" / "resource-report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    nodeid = "tests/contract_blackbox/test_registration.py::test_case"
+    nodeid = TEST_NODE
     if failure == "missing":
         report["results"] = [row for row in report["results"] if row["nodeid"] != nodeid]
     elif failure == "failed":
@@ -238,8 +269,8 @@ def test_missing_or_nonpassing_test_never_gets_a_pass(tmp_path: Path, failure: s
         testcase = next(
             item
             for item in junit.getroot().findall("testcase")
-            if item.get("classname") == "tests.contract_blackbox.test_registration"
-            and item.get("name") == "test_case"
+            if item.get("classname") == TEST_NODE.split("::", maxsplit=1)[0][:-3].replace("/", ".")
+            and item.get("name") == TEST_NODE.split("::", maxsplit=1)[1]
         )
         ET.SubElement(testcase, "failure", message="fixture failure")
         junit.getroot().set("failures", "1")
@@ -286,59 +317,32 @@ def _make_class_test(inputs: dict[str, Path], *, class_marker: bool) -> str:
         "        pass\n"
     )
     (inputs["source_root"] / "tests/contract_blackbox/test_registration.py").write_text(source, encoding="utf-8")
-    case_map = yaml.safe_load(inputs["case_map"].read_text(encoding="utf-8"))
-    case_map["cases"][0]["tests"] = [nodeid]
-    inputs["case_map"].write_text(yaml.safe_dump(case_map, sort_keys=False), encoding="utf-8")
-    report_path = inputs["l1_dir"] / "linux" / "20groups" / "resource-report.json"
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    old_nodeid = "tests/contract_blackbox/test_registration.py::test_case"
-    report["collected"] = [nodeid if item == old_nodeid else item for item in report["collected"]]
-    for row in report["results"]:
-        if row["nodeid"] == old_nodeid:
-            row["nodeid"] = nodeid
-    report_path.write_text(json.dumps(report), encoding="utf-8")
-    suite = ET.Element(
-        "testsuite",
-        tests=str(len(report["collected"])),
-        failures="0",
-        errors="0",
-        skipped="0",
-    )
+    junit = ET.Element("testsuite", tests="1", failures="0", errors="0", skipped="0")
     ET.SubElement(
-        suite,
+        junit,
         "testcase",
         classname="tests.contract_blackbox.test_registration.TestSuite",
         name="test_case",
     )
-    for index, _ in enumerate(report["collected"][1:], 1):
-        ET.SubElement(suite, "testcase", classname="fixture.required", name=f"test_{index}")
-    ET.ElementTree(suite).write(inputs["junit"], encoding="utf-8", xml_declaration=True)
+    ET.ElementTree(junit).write(inputs["junit"], encoding="utf-8", xml_declaration=True)
     return nodeid
 
 
 def test_class_junit_node_and_class_case_marker_are_resolved(tmp_path: Path) -> None:
     inputs = _make_inputs(tmp_path)
     nodeid = _make_class_test(inputs, class_marker=True)
+    register = _load_register()
 
-    result = _run(tmp_path, inputs)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    records = json.loads((inputs["out_dir"] / "sc18-example.json").read_text(encoding="utf-8"))["records"]
-    assert all(record["test_id"] == nodeid for record in records)
-    assert all(record["result"] == "PASS" for record in records)
+    assert register._junit_rows(inputs["junit"], inputs["source_root"]) == {nodeid: ["passed"]}
+    assert register._case_marker_matches(inputs["source_root"], nodeid, "sc18-example") == (True, None)
 
 
 def test_case_marker_on_sibling_test_does_not_mark_target(tmp_path: Path) -> None:
     inputs = _make_inputs(tmp_path)
-    _make_class_test(inputs, class_marker=False)
+    nodeid = _make_class_test(inputs, class_marker=False)
+    register = _load_register()
 
-    result = _run(tmp_path, inputs)
-
-    assert result.returncode != 0
-    records = json.loads((inputs["out_dir"] / "sc18-example.json").read_text(encoding="utf-8"))["records"]
-    assert records
-    assert all(record["result"] == "FAIL" for record in records)
-    assert not any(record["result"] == "PASS" for record in records)
+    assert register._case_marker_matches(inputs["source_root"], nodeid, "sc18-example")[0] is False
 
 
 def test_later_pass_does_not_overwrite_same_head_fail(tmp_path: Path) -> None:
@@ -408,75 +412,56 @@ def test_registered_python_skip_with_absent_node_emits_no_python_pass(tmp_path: 
     assert [record["round"] for record in records] == ["rust"]
 
 
-FAKE_CARGO = """#!/usr/bin/env python3
-import json
-import os
-import sys
-from pathlib import Path
-
-Path(os.environ["FAKE_CARGO_ARGV_LOG"]).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
-key = "windows" if "--target" in sys.argv else "linux"
-table = json.loads(Path(os.environ["FAKE_CARGO_TABLE"]).read_text(encoding="utf-8"))
-for artifact in table.get(key, []):
-    print(json.dumps({"reason": "compiler-artifact", **artifact}))
-print(json.dumps({"reason": "build-finished", "success": True}))
-sys.exit(int(os.environ.get("FAKE_CARGO_RC", "0")))
-"""
-
-FAKE_RUNNER = '#!/bin/sh\nexec "$@"\n'
-
-
 def _fake_test_exe(path: Path, test_names: list[str]) -> Path:
-    """可執行的假測試 executable：`--list --format terse` 只列出 test_names（與 cargo test 二進位行為相同的最小替身）。"""
+    """測試執行檔的替身：只是內容固定的檔案，供 sha256 核對使用。
+
+    登錄器不重建、不重跑、不執行任何測試執行檔（只核對 L1 報告內的紀錄），故替身不需可執行，
+    也因此本測試模組不依賴 shebang 腳本，可在原生 Windows 執行（core_portable）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "#!/usr/bin/env python3\nimport sys\nNAMES = %r\nif '--list' in sys.argv:\n"
-        "    for name in NAMES:\n        print(name + ': test')\n" % (test_names,),
-        encoding="utf-8",
-    )
-    path.chmod(0o755)
+    path.write_bytes(("fake test executable: " + ",".join(test_names) + "\n").encode("utf-8"))
     return path
 
 
-def _artifact(package: str, target: str, executable: Path) -> dict:
+def _exe_row(exe: Path, nodeids: list[str], *, crate: str = "sw-cli", target: str = "cli_trace") -> dict:
+    """L1 報告 provenance 的一列：執行檔路徑、報告產生當下的 sha256，以及其所含的 cargo nodeid。"""
     return {
-        "package_id": f"path+file:///repo/crates/{package}#0.1.0",
-        "target": {"name": target, "kind": ["test"]},
-        "profile": {"test": True},
-        "executable": str(executable),
+        "crate": crate,
+        "target": target,
+        "path": str(exe.resolve()),
+        "sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
+        "nodeids": [f"cargo:{node}" for node in nodeids],
     }
 
 
-def _fake_cargo(tmp_path: Path, table: dict, *, rc: int = 0) -> tuple[dict[str, str], Path, Path]:
-    """建立假 cargo（置於 PATH 最前）與 runner；回傳 (環境變數, argv 紀錄檔, runner 路徑)。"""
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir(parents=True, exist_ok=True)
-    cargo = fake_bin / "cargo"
-    cargo.write_text(FAKE_CARGO, encoding="utf-8")
-    cargo.chmod(0o755)
-    runner = fake_bin / "win-runner"
-    runner.write_text(FAKE_RUNNER, encoding="utf-8")
-    runner.chmod(0o755)
-    table_path = tmp_path / "cargo-table.json"
-    table_path.write_text(json.dumps(table), encoding="utf-8")
-    argv_log = tmp_path / "cargo-argv.json"
-    env = {
-        **os.environ,
-        "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-        "FAKE_CARGO_TABLE": str(table_path),
-        "FAKE_CARGO_ARGV_LOG": str(argv_log),
-        "FAKE_CARGO_RC": str(rc),
+def _cargo_provenance(commit: str, rows: list[dict], *, platform: str = "linux", clean: bool = True) -> dict:
+    """與 cargo_l1_results.py 同形狀的 provenance（cargo-l1-provenance.v1）；開始與結束的 git 狀態相同。"""
+    state = {"head": commit, "clean": clean}
+    return {
+        "schema": "cargo-l1-provenance.v1",
+        "platform": platform,
+        "build_target": None,
+        "git": {**state, "end": dict(state)},
+        "toolchain": {
+            "rustc_vv": "rustc 1.90.0 (test)\nhost: x86_64-unknown-linux-gnu\n",
+            "rustc_vv_sha256": "0" * 64,
+            "error": None,
+        },
+        "rustflags": {
+            "RUSTFLAGS": {"set": False, "sha256": None},
+            "CARGO_ENCODED_RUSTFLAGS": {"set": False, "sha256": None},
+        },
+        "executables": rows,
     }
-    return env, argv_log, runner
 
 
 def _register_cargo(
     tmp_path: Path,
     case_map_cases: list[dict],
     l1_dir: Path,
-    env: dict[str, str],
-    runner: Path,
     out_dir: Path,
+    *,
+    repo_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     case_map = tmp_path / "p4_case_map.yaml"
     case_map.write_text(yaml.safe_dump({"schema_version": 1, "cases": case_map_cases}, sort_keys=False), encoding="utf-8")
@@ -485,15 +470,11 @@ def _register_cargo(
             sys.executable,
             str(SCRIPT),
             "--repo-root",
-            str(ROOT),
+            str(_clean_repo(tmp_path) if repo_root is None else repo_root),
             "--case-map",
             str(case_map),
             "--l1-dir",
             str(l1_dir),
-            "--cargo-target-dir",
-            str(tmp_path / "cargo-target"),
-            "--windows-runner",
-            str(runner),
             "--out-dir",
             str(out_dir),
         ],
@@ -501,7 +482,6 @@ def _register_cargo(
         capture_output=True,
         text=True,
         check=False,
-        env=env,
     )
 
 
@@ -509,53 +489,56 @@ def _cargo_records_of(out_dir: Path, case_id: str) -> list[dict]:
     return json.loads((out_dir / f"{case_id}.json").read_text(encoding="utf-8"))["records"]
 
 
-def test_cargo_case_uses_the_matching_test_executable_sha256(tmp_path: Path) -> None:
-    """官方 selector（`cargo test --no-run --message-format=json --workspace`）建出的執行檔，依 package＋target 唯一對應。
+def _cargo_case(case_id: str, nodes: list[str], platforms: list[str] | None = None) -> dict:
+    return {
+        "case_id": case_id,
+        "layer": "L1",
+        "platforms": platforms or ["linux"],
+        "artifact": "sw-pal-test-bin",
+        "tests": nodes,
+    }
 
-    同名 target 的他套件執行檔（decoy）不得被選中；selector argv 必須逐字使用凍結鎖的 argv。
+
+def test_cargo_case_uses_the_matching_test_executable_sha256(tmp_path: Path) -> None:
+    """L1 報告 provenance 內，依 crate＋target 唯一對應的執行檔；同 target 名的他套件執行檔（decoy）不得被選中。
+
+    登錄以報告內所列執行檔的 sha256 為準（即實際受測的 binary），且記錄的 artifact 即該檔。
     """
     node = "sw-cli::cli_trace::trace_line_exact"
+    decoy_node = "sw-other::cli_trace::trace_line_exact"
     trace_exe = _fake_test_exe(tmp_path / "exe" / "cli_trace-aaa", ["trace_line_exact"])
     decoy_exe = _fake_test_exe(tmp_path / "exe" / "cli_trace-decoy", ["trace_line_exact"])
-    env, argv_log, runner = _fake_cargo(tmp_path, {"linux": [
-        _artifact("sw-other", "cli_trace", decoy_exe),
-        _artifact("sw-cli", "cli_trace", trace_exe),
-    ]})
+    commit = _repo_head(_clean_repo(tmp_path))
     l1_dir = tmp_path / "l1"
-    _write_l1_report(l1_dir, node, runner="cargo")
+    _write_l1_report(l1_dir, node, runner="cargo", provenance=_cargo_provenance(commit, [
+        _exe_row(decoy_exe, [decoy_node], crate="sw-other"),
+        _exe_row(trace_exe, [node]),
+    ]))
     out_dir = tmp_path / "out"
-    case = {"case_id": "sc20-example", "layer": "L1", "platforms": ["linux"], "artifact": "sw-pal-test-bin", "tests": [node]}
 
-    result = _register_cargo(tmp_path, [case], l1_dir, env, runner, out_dir)
+    result = _register_cargo(tmp_path, [_cargo_case("sc20-example", [node])], l1_dir, out_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
     rust = [record for record in _cargo_records_of(out_dir, "sc20-example") if record["round"] == "rust"]
     assert [record["result"] for record in rust] == ["PASS"], rust
     assert rust[0]["artifact_path"] == str(trace_exe.resolve())
     assert rust[0]["artifact_sha256"] == hashlib.sha256(trace_exe.read_bytes()).hexdigest()
-    argv = json.loads(argv_log.read_text(encoding="utf-8"))
-    selector = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
-    selector_argv = selector["sets"]["s1b_cargo"]["linux"]["selector"]["argv"]
-    assert argv[:3] == ["test", "--no-run", "--message-format=json"]
-    assert argv[-len(selector_argv):] == selector_argv
-    assert "--target" not in argv
 
 
 def test_cargo_executable_must_be_unique_for_crate_and_target(tmp_path: Path) -> None:
-    """同一 package＋target 出現兩個 test 執行檔即無法唯一對應 → FAIL，不得以先到者放行。"""
+    """同一 package＋target 在報告內出現兩個含此測試的執行檔即無法唯一對應 → FAIL，不得以先到者放行。"""
     node = "sw-cli::cli_trace::trace_line_exact"
     first = _fake_test_exe(tmp_path / "exe" / "cli_trace-1", ["trace_line_exact"])
     second = _fake_test_exe(tmp_path / "exe" / "cli_trace-2", ["trace_line_exact"])
-    env, _, runner = _fake_cargo(tmp_path, {"linux": [
-        _artifact("sw-cli", "cli_trace", first),
-        _artifact("sw-cli", "cli_trace", second),
-    ]})
+    commit = _repo_head(_clean_repo(tmp_path))
     l1_dir = tmp_path / "l1"
-    _write_l1_report(l1_dir, node, runner="cargo")
+    _write_l1_report(l1_dir, node, runner="cargo", provenance=_cargo_provenance(commit, [
+        _exe_row(first, [node]),
+        _exe_row(second, [node]),
+    ]))
     out_dir = tmp_path / "out"
-    case = {"case_id": "sc20-example", "layer": "L1", "platforms": ["linux"], "artifact": "sw-pal-test-bin", "tests": [node]}
 
-    result = _register_cargo(tmp_path, [case], l1_dir, env, runner, out_dir)
+    result = _register_cargo(tmp_path, [_cargo_case("sc20-example", [node])], l1_dir, out_dir)
 
     assert result.returncode != 0, result.stdout + result.stderr
     rust = [record for record in _cargo_records_of(out_dir, "sc20-example") if record["round"] == "rust"]
@@ -563,15 +546,90 @@ def test_cargo_executable_must_be_unique_for_crate_and_target(tmp_path: Path) ->
 
 
 def test_cargo_no_run_failure_fails_closed(tmp_path: Path) -> None:
+    """建置失敗（cargo test --no-run 失敗）時報告為 finished=false、無結果列 → FAIL，不得以舊報告或重建補上。"""
     node = "sw-cli::cli_trace::trace_line_exact"
     exe = _fake_test_exe(tmp_path / "exe" / "cli_trace-1", ["trace_line_exact"])
-    env, _, runner = _fake_cargo(tmp_path, {"linux": [_artifact("sw-cli", "cli_trace", exe)]}, rc=1)
+    commit = _repo_head(_clean_repo(tmp_path))
     l1_dir = tmp_path / "l1"
-    _write_l1_report(l1_dir, node, runner="cargo")
+    _write_l1_report(l1_dir, node, runner="cargo", provenance=_cargo_provenance(commit, [_exe_row(exe, [node])]))
+    report_path = l1_dir / "linux" / "cargo" / "resource-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report.update(finished=False, exit_code=101, results=[])
+    report_path.write_text(json.dumps(report), encoding="utf-8")
     out_dir = tmp_path / "out"
-    case = {"case_id": "sc20-example", "layer": "L1", "platforms": ["linux"], "artifact": "sw-pal-test-bin", "tests": [node]}
 
-    result = _register_cargo(tmp_path, [case], l1_dir, env, runner, out_dir)
+    result = _register_cargo(tmp_path, [_cargo_case("sc20-example", [node])], l1_dir, out_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    rust = [record for record in _cargo_records_of(out_dir, "sc20-example") if record["round"] == "rust"]
+    assert rust and not any(record["result"] == "PASS" for record in rust), rust
+
+
+def test_cargo_executable_rebuilt_after_report_is_rejected(tmp_path: Path) -> None:
+    """報告產生後改寫（或重建）執行檔、未重跑即登錄：sha256 與報告不符 → FAIL，理由要求重跑，不得以新 binary 記為 PASS。"""
+    node = "sw-cli::cli_trace::trace_line_exact"
+    exe = _fake_test_exe(tmp_path / "exe" / "cli_trace-1", ["trace_line_exact"])
+    commit = _repo_head(_clean_repo(tmp_path))
+    l1_dir = tmp_path / "l1"
+    _write_l1_report(l1_dir, node, runner="cargo", provenance=_cargo_provenance(commit, [_exe_row(exe, [node])]))
+    exe.write_bytes(b"rebuilt executable with different bytes\n")
+    out_dir = tmp_path / "out"
+
+    result = _register_cargo(tmp_path, [_cargo_case("sc20-example", [node])], l1_dir, out_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    rust = [record for record in _cargo_records_of(out_dir, "sc20-example") if record["round"] == "rust"]
+    assert rust and all(record["result"] == "FAIL" for record in rust), rust
+    assert all(record.get("artifact_path") is None for record in rust), rust
+    assert all("重跑" in str(record.get("reason")) for record in rust), rust
+
+
+def test_cargo_report_executable_without_sha256_is_rejected(tmp_path: Path) -> None:
+    """報告的 executable 缺 sha256 紀錄 → 拒收（不得退回以磁碟上目前的檔案補算後放行）。"""
+    node = "sw-cli::cli_trace::trace_line_exact"
+    exe = _fake_test_exe(tmp_path / "exe" / "cli_trace-1", ["trace_line_exact"])
+    commit = _repo_head(_clean_repo(tmp_path))
+    row = _exe_row(exe, [node])
+    del row["sha256"]
+    l1_dir = tmp_path / "l1"
+    _write_l1_report(l1_dir, node, runner="cargo", provenance=_cargo_provenance(commit, [row]))
+    out_dir = tmp_path / "out"
+
+    result = _register_cargo(tmp_path, [_cargo_case("sc20-example", [node])], l1_dir, out_dir)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    rust = [record for record in _cargo_records_of(out_dir, "sc20-example") if record["round"] == "rust"]
+    assert rust and all(record["result"] == "FAIL" for record in rust), rust
+    assert all("sha256" in str(record.get("reason")) for record in rust), rust
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["head-mismatch", "dirty-tree", "end-head-changed", "no-provenance", "no-rustc-vv"],
+)
+def test_cargo_report_provenance_must_match_tested_revision(tmp_path: Path, mutation: str) -> None:
+    """報告的 git HEAD、工作樹乾淨狀態、執行期間 HEAD、provenance 本身或 rustc -vV 紀錄不符／缺席 → 全數 FAIL。"""
+    node = "sw-cli::cli_trace::trace_line_exact"
+    exe = _fake_test_exe(tmp_path / "exe" / "cli_trace-1", ["trace_line_exact"])
+    commit = _repo_head(_clean_repo(tmp_path))
+    rows = [_exe_row(exe, [node])]
+    if mutation == "head-mismatch":
+        provenance: dict | None = _cargo_provenance("f" * 40, rows)
+    elif mutation == "dirty-tree":
+        provenance = _cargo_provenance(commit, rows, clean=False)
+    elif mutation == "end-head-changed":
+        provenance = _cargo_provenance(commit, rows)
+        provenance["git"]["end"]["head"] = "e" * 40
+    elif mutation == "no-rustc-vv":
+        provenance = _cargo_provenance(commit, rows)
+        provenance["toolchain"]["rustc_vv"] = None
+    else:
+        provenance = None
+    l1_dir = tmp_path / "l1"
+    _write_l1_report(l1_dir, node, runner="cargo", provenance=provenance)
+    out_dir = tmp_path / "out"
+
+    result = _register_cargo(tmp_path, [_cargo_case("sc20-example", [node])], l1_dir, out_dir)
 
     assert result.returncode != 0, result.stdout + result.stderr
     rust = [record for record in _cargo_records_of(out_dir, "sc20-example") if record["round"] == "rust"]
@@ -586,21 +644,20 @@ def test_cargo_nodes_apply_per_platform_only_for_bc05_style_case(tmp_path: Path)
     windows_exe = _fake_test_exe(
         tmp_path / "exe" / "process_tunnel-windows.exe", ["windows_terminate_tree_kills_child_and_grandchild"]
     )
-    env, _, runner = _fake_cargo(tmp_path, {
-        "linux": [_artifact("sw-pal", "process_tunnel", posix_exe)],
-        "windows": [_artifact("sw-pal", "process_tunnel", windows_exe)],
-    })
+    commit = _repo_head(_clean_repo(tmp_path))
     l1_dir = tmp_path / "l1"
-    _write_l1_report(l1_dir, posix_node, runner="cargo", platform="linux")
-    _write_l1_report(l1_dir, windows_node, runner="cargo", platform="windows")
+    _write_l1_report(l1_dir, posix_node, runner="cargo", platform="linux", provenance=_cargo_provenance(
+        commit, [_exe_row(posix_exe, [posix_node], crate="sw-pal", target="process_tunnel")], platform="linux",
+    ))
+    _write_l1_report(l1_dir, windows_node, runner="cargo", platform="windows", provenance=_cargo_provenance(
+        commit, [_exe_row(windows_exe, [windows_node], crate="sw-pal", target="process_tunnel")], platform="windows",
+    ))
     out_dir = tmp_path / "out"
-    case = {
-        "case_id": "bc05-process-lifecycle-stop-restart", "layer": "L1",
-        "platforms": ["linux", "windows"], "artifact": "sw-pal-test-bin",
-        "tests": [posix_node, windows_node],
-    }
+    case = _cargo_case(
+        "bc05-process-lifecycle-stop-restart", [posix_node, windows_node], ["linux", "windows"],
+    )
 
-    result = _register_cargo(tmp_path, [case], l1_dir, env, runner, out_dir)
+    result = _register_cargo(tmp_path, [case], l1_dir, out_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
     records = _cargo_records_of(out_dir, "bc05-process-lifecycle-stop-restart")
@@ -614,28 +671,31 @@ def test_cargo_nodes_apply_per_platform_only_for_bc05_style_case(tmp_path: Path)
 
 
 def test_cargo_node_in_neither_platform_lock_fails_on_every_case_platform(tmp_path: Path) -> None:
-    """兩個平台的 s1b_cargo 鎖都不含的節點一律 FAIL（每個 case 平台各一筆），不呼叫 cargo。"""
+    """兩個平台的 s1b_cargo 鎖都不含的節點一律 FAIL（每個 case 平台各一筆），不讀取任何 L1 報告。"""
     node = "sw-cli::p4_case_placeholders::df07_bad_config_yaml"
-    env, argv_log, runner = _fake_cargo(tmp_path, {})
     l1_dir = tmp_path / "l1"
     out_dir = tmp_path / "out"
-    case = {"case_id": "df07-example", "layer": "L1", "platforms": ["linux", "windows"], "artifact": "sw-pal-test-bin", "tests": [node]}
+    case = _cargo_case("df07-example", [node], ["linux", "windows"])
 
-    result = _register_cargo(tmp_path, [case], l1_dir, env, runner, out_dir)
+    result = _register_cargo(tmp_path, [case], l1_dir, out_dir)
 
     assert result.returncode != 0, result.stdout + result.stderr
     records = _cargo_records_of(out_dir, "df07-example")
     assert sorted(record["platform"] for record in records) == ["linux", "windows"]
     assert all(record["result"] == "FAIL" and "凍結" in str(record.get("reason")) for record in records), records
-    assert not argv_log.exists()
+    assert not l1_dir.exists()
 
 
 def _pytest_fixture_with_marker(tmp_path: Path, marker: str | None) -> dict[str, Path]:
     """以指定 pytestmark（None 表示無任何平台標記）重建 `_make_inputs` 的來源檔，並同步 L1 報告。"""
-    inputs = _make_inputs(tmp_path)
-    test_file = inputs["source_root"] / "tests" / "contract_blackbox" / "test_registration.py"
-    body = 'import pytest\n\n' + (f"pytestmark = [pytest.mark.{marker}]\n\n" if marker else "") + (
-        '@pytest.mark.case("sc18-example")\ndef test_case():\n    pass\n'
+    nodeid = LINUX_ONLY_NODE if marker == "posix_only" else TEST_NODE
+    inputs = _make_inputs(tmp_path, nodeid=nodeid)
+    test_file = inputs["source_root"] / nodeid.split("::", maxsplit=1)[0]
+    platform_mark = f"pytestmark = [pytest.mark.{marker}]\n\n" if marker else ""
+    body = (
+        'import pytest\n\n'
+        f"{platform_mark}"
+        f'@pytest.mark.case("sc18-example")\ndef {nodeid.split("::", maxsplit=1)[1]}():\n    pass\n'
     )
     test_file.write_text(body, encoding="utf-8")
     return inputs
@@ -793,7 +853,29 @@ def test_manifest_pointer_dir_resolves_from_install_root_not_bin(tmp_path: Path)
     assert root / "release-manifest.json" in candidates
 
 
-def test_manifest_pointer_absolute_dir_is_used_as_is(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "dir_value",
+    ["../../outside", "versions/../../outside", "versions//0.4.0", "versions/0.4.0/", ".", "C:/outside", "/abs/outside"],
+)
+def test_manifest_pointer_dir_must_stay_inside_bundle(tmp_path: Path, dir_value: str) -> None:
+    """指標 `dir` 含 `..`、空段、`.`、磁碟代號或為絕對路徑即拒收，與 Rust launcher 同一規則。"""
+    register = _load_register()
+    root = tmp_path / "install"
+    cli = root / "bin" / "serialwrap.exe"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"rust-cli")
+    (root / "bin" / "current-release.json").write_text(
+        json.dumps({"bundle_version": "0.4.0", "dir": dir_value}), encoding="utf-8"
+    )
+
+    candidates, error = register._manifest_candidates(cli)
+
+    assert candidates == []
+    assert error == "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
+
+
+def test_manifest_pointer_absolute_dir_is_rejected(tmp_path: Path) -> None:
+    """絕對路徑 `dir` 不得把 manifest 導到 bundle 之外（原『絕對路徑照用』行為已依 (4) 收緊為拒收）。"""
     register = _load_register()
     root = tmp_path / "install"
     cli = root / "bin" / "serialwrap.exe"
@@ -806,8 +888,37 @@ def test_manifest_pointer_absolute_dir_is_used_as_is(tmp_path: Path) -> None:
 
     candidates, error = register._manifest_candidates(cli)
 
-    assert error is None
-    assert candidates[0] == absolute / "release-manifest.json"
+    assert candidates == []
+    assert error == "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
+
+
+def test_manifest_pointer_escape_never_accepts_outside_manifest(tmp_path: Path) -> None:
+    """指標 `dir` 指向 bundle 外、且該處 manifest 內容完全相符時，仍須拒收（不得因內容相符而放行）。"""
+    register = _load_register()
+    commit = _head()
+    root = tmp_path / "install"
+    cli = root / "bin" / "serialwrap.exe"
+    cli.parent.mkdir(parents=True)
+    payload = b"rust-cli"
+    cli.write_bytes(payload)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "release-manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "git_revision": commit,
+        "components": {"cli": {
+            "implementation": "rust", "git_revision": commit,
+            "path": "bin/serialwrap.exe", "sha256": hashlib.sha256(payload).hexdigest(),
+        }},
+    }), encoding="utf-8")
+    (root / "bin" / "current-release.json").write_text(
+        json.dumps({"bundle_version": "0.4.0", "dir": "../outside"}), encoding="utf-8"
+    )
+
+    bundle, error = register._rust_manifest(cli, commit)
+
+    assert bundle is None
+    assert error == "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
 
 
 def test_manifest_pointer_unparseable_is_reported_not_ignored(tmp_path: Path) -> None:
@@ -948,3 +1059,39 @@ def test_windows_stable_entry_with_forward_slash_pointer_is_the_manifest_cli(tmp
 
     assert error is None, error
     assert bundle is not None and bundle["path"] == manifest
+
+
+@pytest.mark.parametrize("key", ["failures", "errors"])
+def test_suite_declared_failures_above_testcase_level_fail_both_pytest_rounds(tmp_path: Path, key: str) -> None:
+    """testsuite 宣告的 failures／errors 大於 testcase 層計數（例如 subtests 失敗而無 testcase 元素）→ rust 與 python 兩輪皆 FAIL。"""
+    inputs = _make_inputs(tmp_path)
+    junit = inputs["junit"]
+    tree = ET.parse(junit)
+    tree.getroot().set(key, "1")
+    tree.write(junit, encoding="utf-8", xml_declaration=True)
+
+    result = _run(tmp_path, inputs)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    records = json.loads((inputs["out_dir"] / "sc18-example.json").read_text(encoding="utf-8"))["records"]
+    rust = [record for record in records if record["round"] == "rust"]
+    python = [record for record in records if record["round"] == "python"]
+    assert rust and python, records
+    assert all(record["result"] == "FAIL" for record in rust + python), records
+    assert not any(record["result"] == "PASS" for record in records), records
+
+
+def test_register_junit_helpers_reject_suite_declared_failures_above_testcase_level(tmp_path: Path) -> None:
+    """登錄端 junit 計數與列表皆 fail-closed：宣告的 failures 大於 testcase 層即整份不可用（None）。"""
+    register = _load_register()
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuites><testsuite tests="2" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.a" name="t1"/>'
+        '<testcase classname="tests.a" name="t2"/>'
+        '</testsuite></testsuites>',
+        encoding="utf-8",
+    )
+
+    assert register._junit_counts(path) is None
+    assert register._junit_rows(path) is None

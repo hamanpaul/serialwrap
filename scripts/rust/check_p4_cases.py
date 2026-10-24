@@ -424,7 +424,20 @@ def cargo_selector_argv(lock: dict[str, Any], platform: str) -> list[str]:
 
 def pytest_collected(nodes: list[str], markexpr: str, cwd: Path) -> set[str]:
     """以 `pytest --collect-only -m <markexpr>` 取得被凍結 selector 收集的節點（逐字 nodeid）。"""
-    argv = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", markexpr, *nodes]
+    argv = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "--collect-only",
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--rootdir",
+        str(cwd.resolve()),
+        "-m",
+        markexpr,
+        *nodes,
+    ]
     res = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
     if res.returncode not in (0, PYTEST_NO_TESTS_COLLECTED):
         raise RuntimeError(f"pytest --collect-only 失敗（rc={res.returncode}）：{(res.stderr or res.stdout)[-400:]}")
@@ -578,6 +591,7 @@ def _junit_counts(path: Path) -> dict[str, int] | None:
     計數實作為 P2 `tests/acceptance/check_evidence_index.py::_junit_counts`（依路徑載入、不另寫一份）。
     不讀 testsuite 的 tests 屬性：pytest 9 的 subtests 會計入屬性但不產生 testcase 元素（P2-T13 審查修正）。
     檔案缺席或不可解析回 None；P2 模組缺席由 check_l1 轉為 BLOCKED-PREREQ（fail-closed）。
+    testsuite 宣告的 failures／errors 超出 testcase 層計數時，P2 會拋出 ValueError，本函式不吞掉，由 check_l1 判為 INVALID。
     """
     if not path.is_file():
         return None
@@ -638,7 +652,18 @@ def check_l1(
                 rows.append(row)
                 continue
             else:
-                junit = _junit_counts(report_dir / "junit.xml")
+                # pytest 集合必須有可解析的 junit 且 testsuite 宣告值與 testcase 層一致；缺席即證據不足，不得略過交叉核對放行。
+                junit_path = report_dir / "junit.xml"
+                try:
+                    junit = _junit_counts(junit_path)
+                except ValueError as exc:
+                    row.update(verdict="INVALID", reasons=[f"junit suite 宣告值與 testcase 層不一致（fail-closed）：{exc}"])
+                    rows.append(row)
+                    continue
+                if junit is None:
+                    row.update(verdict="INSUFFICIENT", reasons=[f"junit 缺失或無法解析（pytest 集合需交叉核對）：{junit_path}"])
+                    rows.append(row)
+                    continue
             try:
                 required = judge.required_for(lock, set_name, platform_name)
             except KeyError:

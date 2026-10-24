@@ -252,6 +252,7 @@ class GateTree:
         self.l15_reports: list[tuple[str, dict[str, Any]]] = []
         # 預設與 s1_pytest_full 報告同一次執行的 JUnit（provenance 由 write() 自動帶入）。
         self.pytest_junit_xml: str | None = _pytest_full_junit_xml()
+        self.blackbox_junit_xml: str | None = None
 
     def default_junit_props(self) -> dict[str, str]:
         return {"HEAD": self.head or "", "SW_REQUIRE_CARGO": "1", "git_clean": "1",
@@ -292,6 +293,7 @@ class GateTree:
                 n = len(rep["results"])
                 cases = "".join(f'<testcase classname="tests.contract_blackbox" name="case{i}"/>' for i in range(n))
                 (d / "junit.xml").write_text(
+                    self.blackbox_junit_xml or
                     f'<testsuites><testsuite tests="{n}" failures="0" errors="0" skipped="0">{cases}</testsuite></testsuites>',
                     encoding="utf-8")
         if self.ab_report is not None:
@@ -543,6 +545,22 @@ def test_l1_full_sets_pass(tree):
     # 六列（s1a_blackbox／s1a_delegation／s1a_cargo × 平台）＋ s1_pytest_full（linux，OD-17 替換登記）
     assert len(rows) == 7
     assert all(r["verdict"] == "PASS" for r in rows)
+
+
+def test_l1_blackbox_inconsistent_suite_junit_is_not_pass(tree):
+    """黑箱 JUnit 宣告失敗數高於 testcase 層時，不能因非 strict 集合而忽略解析錯誤。"""
+    tree.blackbox_junit_xml = (
+        '<testsuites><testsuite tests="3" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.contract_blackbox" name="case0"/>'
+        '<testcase classname="tests.contract_blackbox" name="case1"/>'
+        '<testcase classname="tests.contract_blackbox" name="case2"/>'
+        '</testsuite></testsuites>'
+    )
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_blackbox", "linux")
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("JUnit" in reason and "failures=1" in reason for reason in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
 
 
 def _pytest_full_row(rep: dict[str, Any]) -> dict[str, Any]:
@@ -1128,22 +1146,93 @@ def test_pytest_junit_provenance_violations_rejected(tree, override):
 
 
 SP = "win-wal-av-rotate"  # spike3 產物 scripts/stage0/spike3_win_wal.py 的 case_id（L1.5、cli_1A）
+SP_CASES = (
+    "win-wal-av-rotate",
+    "win-wal-av-unlink",
+    "win-wal-av-reader-handle",
+    "win-wal-f12-progress",
+)
 
 
-def _enable_spike3(tree: GateTree, *, mutate=None, **doc_kwargs: Any) -> dict[str, Any]:
-    """啟用 win-wal-av-rotate（L1.5、cli_1A）；spike3 證據的 git_head 預設為受測 HEAD。"""
+def _enable_spike3_case(tree: GateTree, case_id: str = SP, *, mutate=None, **doc_kwargs: Any) -> dict[str, Any]:
+    """啟用一個 Spike 3 案例（L1.5、cli_1A）；證據的 git_head 預設為受測 HEAD。"""
     tree.head = _init_git_head(tree.root)
-    tree.cases.append({"case_id": SP, "layer": "L1.5", "cli_stage": "1A"})
-    tree.lock["sets"]["cli_1A"] = sorted([A1, Z, SP])
-    doc = _spike3_doc(tree.head, **doc_kwargs)
+    tree.cases.append({"case_id": case_id, "layer": "L1.5", "cli_stage": "1A"})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, Z, case_id])
+    doc = _spike3_doc(tree.head, case_id=case_id, **doc_kwargs)
     if mutate is not None:
         mutate(doc)
-    tree.spike3 = {SP: doc}
+    tree.spike3 = {case_id: doc}
     return doc
 
 
+def _enable_spike3(tree: GateTree, *, mutate=None, **doc_kwargs: Any) -> dict[str, Any]:
+    """維持既有 rotate 測試 helper 的呼叫介面。"""
+    return _enable_spike3_case(tree, SP, mutate=mutate, **doc_kwargs)
+
+
+def _spike3_observations(case_id: str) -> dict[str, Any]:
+    """各 Spike 3 案例的有效觀察替身，避免只用自報 verdict 走過 gate。"""
+    append_count = {
+        "win-wal-av-rotate": 400,
+        "win-wal-av-unlink": 11,
+        "win-wal-av-reader-handle": 401,
+        "win-wal-f12-progress": 403,
+    }[case_id]
+    common = {"append_count": append_count, "append_latency_ms": [1.0] * append_count}
+    if case_id == "win-wal-av-rotate":
+        return {
+            **common,
+            "archives": 1, "records": 400, "continuity_meta_count": 0,
+            "expected_records": 400, "first_seq": 1, "last_seq": 400,
+            "seq_continuous": True, "rotate_retry": 1, "deferred_delete_pending": 0,
+            "interference_observed": True,
+            "drain": {"tick_interval_s": 1.0, "ticks": 1, "drained": True},
+        }
+    if case_id == "win-wal-av-unlink":
+        return {
+            **common,
+            "unlink_attempts": 2, "sharing_violation_attempts": 1,
+            "interference_observed": True, "unlinked": True, "append_attempts_until_meta": 1,
+            "meta_count": 1, "loss_flag": True, "range_known": True,
+            "potentially_lost_seq_range": [1, 2],
+        }
+    if case_id == "win-wal-av-reader-handle":
+        return {
+            **common,
+            "rotation_failed_seen": True, "appended": 401, "records": 401,
+            "continuity_meta_count": 0, "first_seq": 1, "last_seq": 401,
+            "seq_continuous": True, "write_failures": 0, "deferred_delete_pending": 0,
+            "interference_observed": True,
+            "drain": {"tick_interval_s": 1.0, "ticks": 1, "drained": True},
+        }
+    if case_id == "win-wal-f12-progress":
+        return {
+            **common,
+            "archives": 1, "records": 403, "continuity_meta_count": 0,
+            "first_seq": 1, "last_seq": 403, "seq_continuous": True,
+            "rotate_retry": 1, "deferred_delete_pending": 0,
+            "pre_rotate": {"ok": True, "reason_code": "none", "diagnostics": {}},
+            "post_rotate": {"ok": True, "reason_code": "none", "diagnostics": {}},
+            "crc_errors": [], "interference_observed": True,
+            "drain": {"tick_interval_s": 1.0, "ticks": 1, "drained": True},
+        }
+    raise AssertionError(f"unknown Spike 3 case: {case_id}")
+
+
 def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor EDR",
-                status: str = "enabled", case_id: str = SP, drop_edr: bool = False) -> dict[str, Any]:
+                status: str = "enabled", case_id: str = SP, drop_integrity: bool = False,
+                drop_av: bool = False, unchanged: bool = True, launch_refused: bool = False,
+                oplock: str = "granted", grabs: Any = 3, launch_error: str = "none",
+                subjects: Any = None, sha_after: str | None = None) -> dict[str, Any]:
+    """spike3 證據替身（OD-19 形態）：edr 為選填資訊欄；av_sim 與 binary_integrity 為必填。
+
+    oplock 預設 granted 僅為替身，用來走通 PASS 路徑（gate 只接受 granted／denied／unavailable）；
+    真實值必須由原生 Windows 執行產生，不得以替身代替證據。
+    """
+    if subjects is None:
+        subjects = [{"path": "python.exe", "exists_before": True, "exists_after": True,
+                     "sha256_before": "c" * 64, "sha256_after": sha_after or "c" * 64, "unchanged": unchanged}]
     doc: dict[str, Any] = {
         "case_id": case_id,
         "run_at": "2026-10-22T00:00:00Z",
@@ -1151,13 +1240,22 @@ def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor 
         "artifact": {"binary": "sw_core (Python 基線)", "revision": "a" * 40, "tree_sha256": "b" * 64,
                      "git_head": git_head, "git_clean": True},
         "steps": [{"op": "case", "ts": "2026-10-22T00:00:01Z", "result": "ok"}],
-        "observations": {},
-        "edr": {"product": product, "status": status, "interceptions": 0},
+        "observations": _spike3_observations(case_id),
+        "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
+                   "hold_ms_range": [10, 500], "seed": 20261023, "oplock": oplock,
+                   "launch_error": launch_error, "grabs": grabs, "open_errors": 0, "helper_exit": 0},
+        "binary_integrity": {
+            "subjects": subjects,
+            "unchanged": unchanged, "launch_refused": launch_refused, "launch_error": "none",
+        },
+        "edr": {"product": product, "status": status, "interceptions": "unknown"},
         "verdict": verdict,
         "fallback": "none",
     }
-    if drop_edr:
-        del doc["edr"]
+    if drop_integrity:
+        del doc["binary_integrity"]
+    if drop_av:
+        del doc["av_sim"]
     return doc
 
 
@@ -1169,18 +1267,206 @@ def test_spike3_dirty_tree_evidence_is_insufficient_never_pass(tree):
 
 
 def test_spike3_pass_with_known_edr_is_pass(tree):
+    """EDR 欄位不影響判定；有效延遲樣本仍因 owner 未裁決上限而 BLOCKED-OWNER。"""
     _enable_spike3(tree)
     code, rep = tree.run()
-    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
+    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
     assert code == 0
 
 
 def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
-    _enable_spike3(tree, product="unknown")
+    """OD-19 (3)：未知 EDR 不影響結果；此列只因尚無 owner latency 上限而 BLOCKED-OWNER。"""
+    _enable_spike3(tree, product="unknown", status="unknown")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
+    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+def test_spike3_unknown_edr_is_info_only_and_does_not_block_pass(tree):
+    """保留已登記 nodeid；未知 EDR 不參與判定，上限未裁決仍明確 BLOCKED-OWNER。"""
+    _enable_spike3(tree, product="unknown", status="unknown")
     code, rep = tree.run()
     row = _case_row(rep, SP)
     assert row["status"] == "BLOCKED-OWNER", row
-    assert rep["overall"] != "VERIFIED"
+    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in row["evidence"]["reasons"])
+    assert not any("EDR" in reason or "edr" in reason for reason in row["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+def test_spike3_missing_append_latency_measurements_is_insufficient(tree):
+    """OD-19 (2)：缺少實際 append 延遲樣本時，不得用其他 WAL 結果代替延遲證據。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["observations"].pop("append_latency_ms"))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert any("append 延遲" in reason or "schema" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_owner_latency_bound_not_decided_cannot_pass(tree):
+    """OD-19 (2)：有量測值但 owner 尚未核准上限時，延遲驗收仍須保持 BLOCKED-OWNER。"""
+    def set_valid_latency_samples(doc: dict[str, Any]) -> None:
+        doc["observations"]["append_latency_ms"] = [2.0, *([1.0] * 399)]
+
+    _enable_spike3(tree, mutate=set_valid_latency_samples)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
+    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+
+
+def test_spike3_invalid_append_latency_measurement_is_insufficient(tree):
+    """OD-19 (2)：非數值、負數或非有限值不能充當 append 延遲證據。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["observations"].update({"append_latency_ms": [1.0, "fast"]}))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_nonzero_helper_exit_is_insufficient_never_owner_pending(tree):
+    """helper 有非零退出碼時證據不足；不可只靠先前 grabs 和自報 PASS 進入 owner pending。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["av_sim"].__setitem__("helper_exit", 1))
+    code, rep = tree.run()
+    row = _case_row(rep, SP)
+    assert row["status"] == "evidence-insufficient", row
+    assert any("helper" in reason.lower() for reason in row["evidence"]["reasons"])
+    assert rep["overall"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    ("case_id", "field"),
+    [
+        ("win-wal-av-rotate", "seq_continuous"),
+        ("win-wal-av-unlink", "meta_count"),
+        ("win-wal-av-unlink", "sharing_violation_attempts"),
+        ("win-wal-av-unlink", "interference_observed"),
+        ("win-wal-av-reader-handle", "write_failures"),
+        ("win-wal-f12-progress", "post_rotate"),
+        ("win-wal-f12-progress", "rotate_retry"),
+        ("win-wal-f12-progress", "records"),
+    ],
+)
+def test_spike3_each_case_requires_its_own_observations(tree, case_id: str, field: str):
+    """四個 Spike 3 case 均須提交能支撐 PASS 的案例專屬觀察，不得以 verdict 欄位代替。"""
+    def remove_required_observation(doc: dict[str, Any]) -> None:
+        doc["observations"].pop(field)
+
+    _enable_spike3_case(tree, case_id, mutate=remove_required_observation)
+    code, rep = tree.run()
+    row = _case_row(rep, case_id)
+    assert row["status"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_rotate_counts_continuity_meta_without_calling_it_data_loss(tree):
+    """tick 完成延後輪替時會新增連續性 META；仍須保留 400 筆資料 append 與完整 seq。"""
+    def add_continuity_meta(doc: dict[str, Any]) -> None:
+        obs = doc["observations"]
+        obs.update({"records": 401, "continuity_meta_count": 1, "last_seq": 401})
+
+    _enable_spike3(tree, mutate=add_continuity_meta)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+def test_spike3_f12_requires_proven_rotate_and_complete_sequence(tree):
+    """F12 marker 成功不能替代跨輪替資料完整性與實際輪替干擾證據。"""
+    def remove_rotation_evidence(doc: dict[str, Any]) -> None:
+        obs = doc["observations"]
+        obs.pop("rotate_retry")
+        obs["last_seq"] = 402
+
+    _enable_spike3_case(tree, "win-wal-f12-progress", mutate=remove_rotation_evidence)
+    code, rep = tree.run()
+    assert _case_row(rep, "win-wal-f12-progress")["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+    assert code == 1
+
+
+def test_spike3_unlink_without_observed_sharing_violation_is_insufficient(tree):
+    """外部 unlink 未遇到 FILE_SHARE_DELETE 衝突時，即使 helper 抓到檔案也不能算干擾驗收。"""
+    def no_sharing_violation(doc: dict[str, Any]) -> None:
+        doc["observations"].update({"sharing_violation_attempts": 0, "interference_observed": False})
+
+    _enable_spike3_case(tree, "win-wal-av-unlink", mutate=no_sharing_violation)
+    code, rep = tree.run()
+    assert _case_row(rep, "win-wal-av-unlink")["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+    assert code == 1
+
+
+def test_spike3_binary_changed_is_insufficient_never_pass(tree):
+    """OD-19 (3)：測試前後執行檔 sha256 不一致即不得 PASS。"""
+    _enable_spike3(tree, unchanged=False)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_launch_refused_is_insufficient_never_pass(tree):
+    """OD-19 (3)：helper 或執行檔啟動被拒（launch_refused）即不得 PASS。"""
+    _enable_spike3(tree, launch_refused=True)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_zero_grabs_is_insufficient_never_pass(tree):
+    """OD-19 (2)：模擬防毒未實際佔用任何檔案（grabs=0）即不得 PASS（僅有自報 verdict 不足）。"""
+    _enable_spike3(tree, grabs=0)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_empty_subjects_is_insufficient_never_pass(tree):
+    """OD-19 (3)：binary_integrity.subjects 為空＝無前後比對證據，不得以 unchanged=true 過閘（schema minItems）。"""
+    _enable_spike3(tree, subjects=[])
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_sha_mismatch_with_unchanged_true_is_insufficient(tree):
+    """OD-19 (3)：sha256 前後不一致但自報 unchanged=true，gate 逐 subject 重算判定，仍不得 PASS。"""
+    subjects = [{"path": "python.exe", "exists_before": True, "exists_after": True,
+                 "sha256_before": "c" * 64, "sha256_after": "d" * 64, "unchanged": True}]
+    _enable_spike3(tree, subjects=subjects, sha_after="d" * 64)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
+    """OD-19 (2)：oplock 變體為驗收必要項；未實作（not_implemented）即標示 oplock_not_covered，不得 PASS。"""
+    _enable_spike3(tree, oplock="not_implemented")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_helper_launch_error_is_insufficient_never_pass(tree):
+    """OD-19 (2)：模擬防毒 helper 啟動失敗（launch_error 非 none）不得 PASS。"""
+    _enable_spike3(tree, launch_error="helper_spawn_failed")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_missing_av_sim_parameters_is_insufficient(tree):
+    """OD-19 (2)：av_sim 參數為必填；缺漏即不合格（schema 驗證失敗）。"""
+    _enable_spike3(tree, drop_av=True)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
 
 
 def test_spike3_git_head_mismatch_is_insufficient(tree):
@@ -1199,7 +1485,7 @@ def test_spike3_missing_evidence_file_is_insufficient(tree):
 
 
 def test_spike3_schema_invalid_is_insufficient(tree):
-    _enable_spike3(tree, drop_edr=True)
+    _enable_spike3(tree, drop_integrity=True)
     code, rep = tree.run()
     assert _case_row(rep, SP)["status"] == "evidence-insufficient"
     assert rep["overall"] == "FAIL"

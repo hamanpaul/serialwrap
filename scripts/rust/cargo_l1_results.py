@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""收集 Cargo/libtest 的逐案結果並輸出 l1-results.v1（P3-T17、R5-F3）。"""
+"""收集 Cargo/libtest 的逐案結果並輸出 l1-results.v1（P3-T17、R5-F3）。
+
+報告頂層另寫入 `provenance`（schema `cargo-l1-provenance.v1`），供 `register_p4_evidence.py` 核對、不重建：
+- 受測 git HEAD 與工作樹乾淨狀態（執行開始與結束各記錄一次，排除 `target/`）；
+- `rustc -vV` 的逐字輸出與其 sha256；
+- RUSTFLAGS／CARGO_ENCODED_RUSTFLAGS 的設定狀態與 sha256（旗標文字本身不落盤）；
+- 每個測試執行檔的路徑、**實際執行前**的 sha256，以及其所含的 nodeid。執行結束後若檔案已改寫或移除，報告即 `finished: false`。
+Windows 與 Linux 皆由本收集器產出（`win-test.sh` 呼叫同一支程式），不另寫一份。
+"""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,6 +27,11 @@ from typing import Any, Sequence
 TEST_LINE = re.compile(r"^test (.*?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 CAPABILITY_TEST = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__")
+# 與 `git status` 的守門範圍一致：repo 根（本檔上兩層）。
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROVENANCE_SCHEMA = "cargo-l1-provenance.v1"
+WINDOWS_TARGET_TRIPLE = "x86_64-pc-windows-gnu"
+RUSTFLAGS_ENV = ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")
 
 
 @dataclass
@@ -29,6 +43,8 @@ class TargetRun:
     ignored_names: set[str] = field(default_factory=set)
     results: list[dict[str, Any]] = field(default_factory=list)
     exit_codes: list[int] = field(default_factory=list)
+    # 建置完成後、任何測試執行之前的執行檔 sha256；執行結束後須與磁碟上的檔案相符。
+    sha256: str | None = None
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -113,10 +129,127 @@ def _capture_text(value: str | bytes | None) -> str:
     return value or ""
 
 
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str | None:
+    """執行檔的 sha256；檔案缺席或無法讀取回 None（由呼叫端 fail-closed）。"""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _git_state() -> dict[str, Any]:
+    """受測原始碼的 revision 與工作樹乾淨狀態（範圍同 register 的髒樹守門：排除 target/）。"""
+    try:
+        head_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", check=False,
+        )
+        status_proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal", "--", ".", ":(exclude)target"],
+            cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+        )
+    except OSError:
+        return {"head": None, "clean": False}
+    head = head_proc.stdout.strip() if head_proc.returncode == 0 else ""
+    clean = status_proc.returncode == 0 and not status_proc.stdout.strip()
+    return {"head": head or None, "clean": clean}
+
+
+def _manifest_error(cargo_args: Sequence[str]) -> str | None:
+    """拒絕把其他 Cargo workspace 的 binary 與本 repo 的 Git provenance 綁在一起。"""
+    root_manifest = (REPO_ROOT / "Cargo.toml").resolve()
+    index = 0
+    while index < len(cargo_args):
+        arg = cargo_args[index]
+        raw_path: str | None = None
+        if arg == "--manifest-path":
+            if index + 1 >= len(cargo_args):
+                return "--manifest-path 缺少路徑"
+            index += 1
+            raw_path = cargo_args[index]
+        elif arg.startswith("--manifest-path="):
+            raw_path = arg.partition("=")[2]
+        if raw_path is not None:
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = REPO_ROOT / candidate
+            try:
+                manifest = candidate.resolve(strict=True)
+            except OSError:
+                return f"Cargo manifest 不存在或不可讀：{raw_path!r}"
+            if manifest != root_manifest:
+                return f"拒絕 repo 外 Cargo manifest：{manifest}（預期 {root_manifest}）"
+        index += 1
+    return None
+
+
+def _toolchain() -> dict[str, Any]:
+    """`rustc -vV` 的逐字輸出與摘要；無法取得時記錄原因（register 會拒收）。"""
+    rustc = os.environ.get("RUSTC") or shutil.which("rustc") or "rustc"
+    try:
+        proc = subprocess.run(
+            [rustc, "-vV"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"rustc_vv": None, "rustc_vv_sha256": None, "error": type(exc).__name__}
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {"rustc_vv": None, "rustc_vv_sha256": None, "error": f"rustc -vV rc={proc.returncode}"}
+    return {"rustc_vv": proc.stdout, "rustc_vv_sha256": _sha256_text(proc.stdout), "error": None}
+
+
+def _rustflags_summary() -> dict[str, Any]:
+    """RUSTFLAGS 摘要：記錄是否設定與其 sha256；旗標文字本身不寫入報告。
+
+    注意：`.cargo/config.toml` 內的 rustflags 不在此摘要內；實際建出的執行檔以 sha256 綁定，為真正的受測依據。
+    """
+    summary: dict[str, Any] = {}
+    for name in RUSTFLAGS_ENV:
+        value = os.environ.get(name)
+        summary[name] = {"set": value is not None, "sha256": None if value is None else _sha256_text(value)}
+    return summary
+
+
+def _provenance(
+    args: argparse.Namespace,
+    git_start: dict[str, Any],
+    toolchain: dict[str, Any],
+    rustflags: dict[str, Any],
+    targets: Sequence[TargetRun],
+) -> dict[str, Any]:
+    """組出 `cargo-l1-provenance.v1`；`git.end` 於呼叫當下重新取得，故須在所有測試執行之後呼叫。"""
+    return {
+        "schema": PROVENANCE_SCHEMA,
+        "platform": args.platform,
+        "build_target": WINDOWS_TARGET_TRIPLE if args.platform == "windows" else None,
+        "git": {"head": git_start["head"], "clean": git_start["clean"], "end": _git_state()},
+        "toolchain": toolchain,
+        "rustflags": rustflags,
+        "executables": [
+            {
+                "crate": target.crate,
+                "target": target.target,
+                "path": str(Path(target.executable).resolve()),
+                "sha256": target.sha256,
+                "nodeids": [_nodeid(target, name) for name in target.collected_names],
+            }
+            for target in targets
+        ],
+    }
+
+
 def _run(argv: list[str], timeout_s: float) -> tuple[int, str, str, bool]:
     try:
         proc = subprocess.run(
             argv,
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -174,19 +307,31 @@ def _read_report(path: str, value: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     out_path = Path(args.out)
+    manifest_error = _manifest_error(args.cargo_args)
+    if manifest_error is not None:
+        print(f"cargo_l1_results.py: {manifest_error}", file=sys.stderr)
+        return 2
     cargo = shutil.which("cargo")
     if cargo is None:
         print("cargo_l1_results.py: cargo 不存在，證據不足", file=sys.stderr)
         return 2
 
+    # 受測 revision 與工具鏈於建置前記錄：描述的是即將被建置的原始碼與環境。
+    git_start = _git_state()
+    toolchain = _toolchain()
+    rustflags = _rustflags_summary()
+
     build_argv = [cargo, "test", "--no-run", "--message-format=json"]
     if args.platform == "windows":
-        build_argv.extend(["--target", "x86_64-pc-windows-gnu"])
+        build_argv.extend(["--target", WINDOWS_TARGET_TRIPLE])
     build_argv.extend(args.cargo_args)
     build_rc, build_stdout, build_stderr, build_complete = _run(build_argv, args.timeout)
     targets = _test_targets(_json_lines(build_stdout))
+    # 建置完成、任何測試執行之前記下每個執行檔的 sha256；執行結束後須與磁碟上的檔案相符（見下方）。
+    for target in targets:
+        target.sha256 = _sha256_file(Path(target.executable))
     collected: list[str] = []
-    finished = build_rc == 0 and build_complete and bool(targets)
+    finished = build_rc == 0 and build_complete and bool(targets) and all(t.sha256 for t in targets)
     exit_code = build_rc
 
     if build_rc != 0 or not build_complete or not targets:
@@ -215,6 +360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "exit_code": exit_code,
                     "finished": False,
                     "core_portable_platform_skips": [],
+                    "provenance": _provenance(args, git_start, toolchain, rustflags, targets),
                     "deployed_content": None,
                 },
             )
@@ -306,6 +452,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
 
+    # 執行結束後重新核對執行檔：若測試執行期間被改寫、重建或移除，報告即不完整，不得作為該 binary 的證據。
+    changed = [target.executable for target in targets if _sha256_file(Path(target.executable)) != target.sha256]
+    if changed:
+        finished = False
+        print(f"cargo_l1_results.py: 測試執行檔於執行期間被改寫或移除，拒絕視為完整證據：{changed}", file=sys.stderr)
+
     results = [row for target in targets for row in target.results]
     tally = {"passed": 0, "failed": 0, "skipped": 0}
     for result in results:
@@ -331,6 +483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "exit_code": exit_code,
         "finished": finished,
         "core_portable_platform_skips": [],
+        "provenance": _provenance(args, git_start, toolchain, rustflags, targets),
         "deployed_content": None,
     }
     _read_report(args.out, report)
