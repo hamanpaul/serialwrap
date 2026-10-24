@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use indexmap::IndexMap;
 use sw_core::actor::{spawn_actor, ActorHandle, EffectExecutor};
-use sw_core::arbiter::{CommandRegistry, SubmitReq};
+use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
 use sw_core::drain::{StopId, WorkerStoppedReceipt};
 use sw_core::generations::EpochAllocator;
 use sw_core::login_fsm::LoginOutcome;
@@ -70,6 +70,7 @@ pub fn agent_submit(cmd: &str) -> SubmitReq {
         priority: 10,
         expected_duration_s: None,
         completion_regex: None,
+        origin: SubmitOrigin::Rpc,
     }
 }
 
@@ -164,6 +165,7 @@ impl CoreHarness {
             }),
             env: Arc::new(FakeEnv::default()),
             read_env_file: Arc::new(|_: &str| -> Option<std::io::Result<String>> { None }),
+            input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
 
@@ -658,6 +660,14 @@ impl EffectExecutor for RigExec {
             }
             Effect::StartOp { .. } => sw_core::s21_todo!("T14", "ActorRig StartOp executor"),
             Effect::SettleTx { .. } => sw_core::s21_todo!("T12", "ActorRig SettleTx executor"),
+            // P6 Task 1：Slice 2.2 新增的 effect 變體（executor 行為由 Task 6／7／9／10 交付）。
+            Effect::ConsoleOut { .. }
+            | Effect::ConsoleClose { .. }
+            | Effect::ConsoleCloseAll
+            | Effect::ConsoleAdopt { .. }
+            | Effect::ConsoleDiscard { .. } => todo!("P6 Task 9"),
+            Effect::HumanTx { .. } => todo!("P6 Task 6"),
+            Effect::LeaseIndex(_) => todo!("P6 Task 7"),
         }
     }
 }
@@ -724,6 +734,7 @@ impl ActorRig {
                     .get(p)
                     .map(|t| Ok(t.clone()))
             }),
+            input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
         let mailbox = Mailbox::new(256, 1024);
@@ -1783,5 +1794,144 @@ impl ManagerRig {
             warnings,
             shared: self.shared.clone(),
         }
+    }
+}
+
+// ── P6 Slice 2.2 harness 簽章（07 Task 1；本體由 Task 6／7／9／10 的測試作者補齊）────────────────────────
+pub mod hub;
+
+use sw_core::human_console::{ConsoleTransportKind, ReplayHold};
+use sw_core::session_core::LeaseIndexOp;
+use sw_core::tx_writer::{FenceReject, TxClass, TxPermit, TxReport};
+use sw_pal::traits::TxOutcome;
+
+impl CoreHarness {
+    /// `SessionRequest::ConsoleAttach`（harness 配 `PtyInfo` token；cid 由固定 rng 決定時以回傳值為準）＋`ConsoleScan`。
+    pub fn attach_pty_console(&mut self, _cid: &str, _peer: bool) -> PyDict {
+        todo!("P6 Task 6")
+    }
+    /// `ControlEvent::ConsoleConnected`；回 lifetime。
+    pub fn connect_stream_console(&mut self, _cid: &str, _kind: ConsoleTransportKind) -> u64 {
+        todo!("P6 Task 6")
+    }
+    /// `DataEvent::ConsoleInputBytes`（目前 `input_epoch` 與 lifetime）。
+    pub fn input(&mut self, _cid: &str, _bytes: &[u8]) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    pub fn input_with(&mut self, _cid: &str, _lifetime: u64, _epoch: u64, _bytes: &[u8]) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// `DataEvent::ConsoleDisconnected`。
+    pub fn disconnect(&mut self, _cid: &str) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// `ControlEvent::ConsoleScan{source: Hub}`。
+    pub fn scan(&mut self, _held: Option<&[&str]>) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// true（預設）：每筆 `Effect::HumanTx` 立即回 `Completed(len)`。
+    pub fn set_auto_complete_human_tx(&mut self, _on: bool) {
+        todo!("P6 Task 6")
+    }
+    /// 對尚未結算的那筆 human TX 回報結果。
+    pub fn complete_human_tx(&mut self, _outcome: TxOutcome, _reject: Option<FenceReject>) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// 已發出的 HumanTx：(class, source, payload)。
+    pub fn human_tx(&self) -> Vec<(TxClass, String, Vec<u8>)> {
+        todo!("P6 Task 6")
+    }
+    /// 最近一筆 HumanTx 的 permit（斷言 replay_hold／input_epoch）。
+    pub fn last_human_permit(&self) -> Option<TxPermit> {
+        todo!("P6 Task 6")
+    }
+    /// `SessionCore::foreground_busy()`（07 D-22(2)）。
+    pub fn foreground_busy(&self) -> bool {
+        todo!("P6 Task 6")
+    }
+    /// `HumanConsoleState.replay_hold`。
+    pub fn replay_hold(&self) -> Option<ReplayHold> {
+        todo!("P6 Task 6")
+    }
+    /// `FenceState.replay_auth`。
+    pub fn fence_replay_auth(&self) -> Option<u64> {
+        todo!("P6 Task 6")
+    }
+    /// 私有 DeferredBuffer 的 `len_for`（test-fakes 讀取器）。
+    pub fn deferred_len(&self, _cid: &str) -> usize {
+        todo!("P6 Task 6")
+    }
+    /// 依 effect 發出順序：HumanTx 的 (class, payload) 與 StartOp 會送 UART 的 (class, 預定 bytes)。
+    pub fn tx_order(&self) -> Vec<(TxClass, Vec<u8>)> {
+        todo!("P6 Task 6")
+    }
+    /// HumanTx＋StartOp 中會送 UART 的 spec 數。
+    pub fn tx_effect_count(&self) -> usize {
+        todo!("P6 Task 6")
+    }
+    /// `Effect::Warn` 的文字。
+    pub fn warns(&self) -> Vec<String> {
+        todo!("P6 Task 6")
+    }
+    pub fn lease_index_ops(&self) -> Vec<LeaseIndexOp> {
+        todo!("P6 Task 7")
+    }
+    /// 依序的 Effect 變體名稱（驗證 LeaseIndex 在 Reply 前）。
+    pub fn effect_kinds(&self) -> Vec<&'static str> {
+        todo!("P6 Task 7")
+    }
+    /// `pyjson::dumps(RPC_WIRE)`，不含尾端換行。
+    pub fn wire(&self, _d: &PyDict) -> String {
+        todo!("P6 Task 7")
+    }
+    /// 固定 seed rng 依序產生的 32-hex。
+    pub fn ids(&self) -> Vec<String> {
+        todo!("P6 Task 7")
+    }
+    /// `= advance(Duration::from_secs_f64(s))`（投遞 Tick 與到期 timer）。
+    pub fn advance_s(&mut self, _s: f64) -> Vec<Effect> {
+        todo!("P6 Task 7")
+    }
+}
+
+pub fn open_req(owner: &str, timeout_s: f64, command: &str, allow_attached: bool) -> SessionRequest {
+    SessionRequest::InteractiveOpen { owner: owner.into(), timeout_s, command: command.into(), allow_attached }
+}
+
+pub fn status_req(id: &str, screen_chars: i128) -> SessionRequest {
+    SessionRequest::InteractiveStatus { interactive_id: id.into(), screen_chars }
+}
+
+pub fn send_req(id: &str, data: &str, encoding: &str) -> SessionRequest {
+    SessionRequest::InteractiveSend { interactive_id: id.into(), data: data.into(), encoding: encoding.into() }
+}
+
+pub fn close_req(id: &str) -> SessionRequest {
+    SessionRequest::InteractiveClose { interactive_id: id.into() }
+}
+
+/// TxWriter＋Fence 的 human permit 測試台（06 Task 1 的 FakeDevice；`spawn_tx_writer`＋`FakeWalFs`）。
+pub struct TxRig {
+    pub fence: Arc<Fence>,
+    pub dev: FakeDevice,
+}
+
+impl TxRig {
+    pub fn new() -> TxRig {
+        todo!("P6 Task 6")
+    }
+    /// `replay_hold` 一律 `None`。
+    pub fn permit(&self, _class: TxClass, _owner_gen: u64, _input_epoch: Option<u64>, _source: &str) -> TxPermit {
+        todo!("P6 Task 6")
+    }
+    /// class HumanReplay、`input_epoch` Some、`replay_hold` Some(hold)（07 D-22）。
+    pub fn replay_permit(&self, _owner_gen: u64, _input_epoch: u64, _hold: u64, _source: &str) -> TxPermit {
+        todo!("P6 Task 6")
+    }
+    pub fn submit(&self, _p: TxPermit, _payload: &[u8]) -> Receiver<TxReport> {
+        todo!("P6 Task 6")
+    }
+    pub fn wal_tx(&self) -> Vec<PyDict> {
+        todo!("P6 Task 6")
     }
 }

@@ -25,12 +25,14 @@ pub const RX_WINDOW_MAX_CHARS: usize = 131_072;
 /// RX 速率視窗項目上限（溢位合併最舊兩筆）。
 pub const RX_RATE_WINDOW_ENTRIES: usize = 4096;
 /// DeferredBuffer 每 client 上限（bytes；整段清空，BC-02）。
-pub const DEFERRED_INPUT_MAX_BYTES: usize = 262_144;
+/// P6 Task 1：定義移至 `sw_proto::constants`（比照 `CMD_HISTORY_MAX`），此處只再匯出。
+pub use sw_proto::constants::DEFERRED_INPUT_MAX_BYTES;
 /// RPC 連線上限（超過時 acceptor 暫停 accept）。
 pub const RPC_CONNECTIONS_MAX: usize = 128;
 /// RPC 請求行上限（bytes；超過斷線不回應，RPC-H-02）。
 pub const RPC_REQUEST_LINE_BYTES: usize = 65_536;
 /// 每 session interactive tombstone 上限（FIFO）。
-pub const INTERACTIVE_TOMBSTONES_MAX: usize = 16;
+/// P6 Task 1：定義移至 `sw_proto::constants::INTERACTIVE_TOMBSTONE_MAX`，此處以 06 名稱再匯出。
+pub use sw_proto::constants::INTERACTIVE_TOMBSTONE_MAX as INTERACTIVE_TOMBSTONES_MAX;
 /// Two-Phase Drain 完成時限（毫秒；逾時 → RECOVERING＋drain_stalled，SC-04）。
 pub const DRAIN_TIMEOUT_MS: u64 = 3000;

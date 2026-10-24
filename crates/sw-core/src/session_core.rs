@@ -3,6 +3,7 @@
 //! 型別與公開簽章依 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 11「Produces」與 Task 0 骨架凍結；
 //! 函式本體為 `s21_todo!`（`unimplemented!`），由 Task 11 實作者補上。
 
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use sw_pal::traits::{DevicePath, SerialConfig, SysEnv};
@@ -12,12 +13,15 @@ use sw_proto::pyjson::{PyDict, PyValue};
 
 use crate::arbiter::{CommandRegistry, SubmitReq};
 use crate::drain::StopId;
+use crate::deferred::InvalidateReason;
 use crate::generations::{EpochAllocator, Generations};
+use crate::human_console::human_tx::HumanTxTag;
+use crate::human_console::out_ring::OutItem;
 use crate::login_fsm::LoginPlan;
 use crate::mailbox::{MailboxItem, Reply, TimerEvent};
 use crate::op_runner::OpSpec;
 use crate::state_store::StateDelta;
-use crate::tx_writer::{Fence, OpId};
+use crate::tx_writer::{Fence, OpId, TxPermit};
 use crate::uart_bridge::RxShared;
 use crate::wal::WalWriter;
 use crate::Mono;
@@ -72,6 +76,12 @@ pub enum SessionRequest {
     LogStatus,
     ResultTail { cmd_id: String, from_chunk: i128, limit: i128 },
     CancelQueued { cmd_id: String },
+    /// P6 增補 #9（07 Task 10）：`pty` 為 RPC thread 預建 PTY 的資料（實際 `PtyPair` 留在 executor）。
+    ConsoleAttach { label: Option<String>, pty: Option<PtyInfo> },
+    /// P6 增補 #9。
+    ConsoleDetach { client_id: String },
+    /// P6 增補 #9。
+    ConsoleList,
 }
 
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
@@ -89,6 +99,20 @@ pub enum Effect {
     Warn(String),
     /// R1-F8：op 終態處理點產生；executor 只對現行 worker epoch 呼叫 `tx().settle`（非阻塞）。
     SettleTx { epoch: u64, op_id: OpId },
+    /// P6 增補 #10：送往某 console 的出向資料（hub `try_send`，Display 滿載丟棄）。
+    ConsoleOut { client_id: String, item: OutItem },
+    /// P6 增補 #10：關閉單一 console（channel 滿時走 `HubCritical`）。
+    ConsoleClose { client_id: String },
+    /// P6 增補 #10：release 時關閉全部 console。
+    ConsoleCloseAll,
+    /// P6 增補 #10（07 Task 10）：executor 把 `pending_pty[token]` 交給 hub（`HubCmd::AdoptPty`）。
+    ConsoleAdopt { token: u64, client_id: String, client_lifetime: u64, label: String },
+    /// P6 增補 #10：executor drop `pending_pty[token]`。
+    ConsoleDiscard { token: u64 },
+    /// P6 增補 #10（07 D-15）：交給 human TX pump（`try_send`）。
+    HumanTx { tag: HumanTxTag, permit: TxPermit, payload: Vec<u8> },
+    /// P6 增補 #10（07 Task 7）：全域 `interactive_id → session_id` 索引；同批 Effects 中一律排在 `Reply` 之前。
+    LeaseIndex(LeaseIndexOp),
 }
 
 /// `Effect` 的有序容器。
@@ -123,6 +147,8 @@ pub struct CoreDeps {
     pub env: Arc<dyn SysEnv>,
     /// 帳密解析用 env 檔讀取（P5 Task 0 雙審修正：計畫 Task 11 Produces 補記；`None`＝檔案不存在，`Some(Err)`＝不可讀）。
     pub read_env_file: Arc<dyn Fn(&str) -> Option<std::io::Result<String>> + Send + Sync>,
+    /// P6 增補 #2（07 D-02）：hub 讀取用的 `input_epoch`；只在 `Fence::with` 內寫入。
+    pub input_epoch_pub: Arc<AtomicU64>,
 }
 
 /// `public()` 需要由 actor 外部提供的欄位（console 計數與 endpoint）。
@@ -193,5 +219,57 @@ impl SessionCore {
     /// Drain 進行中（SC-05 attach 與 manager 的 open 前檢查用；Task 12）。
     pub fn drain_in_progress(&self) -> bool {
         crate::s21_todo!("T12", "SessionCore::drain_in_progress")
+    }
+}
+
+/// P6 增補 #9（07 Task 7／10）：actor 層持有實際 `PtyPair`，core 只見資料。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PtyInfo {
+    pub token: u64,
+    pub slave_path: String,
+}
+
+/// P6 增補 #10（07 Task 7）：全域 LeaseIndex 的異動。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseIndexOp {
+    Insert { interactive_id: String },
+    Remove { interactive_id: String },
+}
+
+/// P6 Task 6：`fg_begin` 的結果（`fg_finish` 依此決定是否 resume）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FgAdmission {
+    pub suspended_human: bool,
+}
+
+impl SessionCore {
+    /// P6 Task 6：admission 關；agent 且有 human lease 時 suspend；先撤銷 `replay_auth`（07 D-22(4)）。
+    pub fn fg_begin(&mut self, _source_is_agent: bool, _fx: &mut Effects) -> FgAdmission {
+        todo!("P6 Task 6")
+    }
+
+    /// P6 Task 6：resume（若 suspend）→ admission 開；依序回放（建立 07 D-22 hold）。
+    pub fn fg_finish(&mut self, _adm: FgAdmission, _fx: &mut Effects) {
+        todo!("P6 Task 6")
+    }
+
+    /// P6 Task 6：只 suspend（self-test、P8 file transfer）；先撤銷 `replay_auth`（07 D-22(4)）。
+    pub fn human_suspend_begin(&mut self, _fx: &mut Effects) -> bool {
+        todo!("P6 Task 6")
+    }
+
+    /// P6 Task 6：回放時建立 07 D-22 hold。
+    pub fn human_suspend_end(&mut self, _suspended: bool, _fx: &mut Effects) {
+        todo!("P6 Task 6")
+    }
+
+    /// P6 Task 6：BC-02 唯一入口（07 D-02）。
+    pub fn invalidate_human_input(&mut self, _reason: InvalidateReason, _fx: &mut Effects) {
+        todo!("P6 Task 6")
+    }
+
+    /// P6 Task 6（增補 #26）：`foreground.is_some()` 或存在未撤銷的 `replay_hold`（07 D-22(2)）。
+    pub fn foreground_busy(&self) -> bool {
+        todo!("P6 Task 6")
     }
 }

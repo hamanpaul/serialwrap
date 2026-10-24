@@ -104,3 +104,92 @@ pub const DEFAULT_WAL_ROTATE_BYTES: u64 = 67_108_864;
 pub const CMD_HISTORY_MAX: usize = 512;
 /// passthrough 安靜升 READY 的安靜秒數（`sw_core/constants.py::PASSTHROUGH_READY_QUIET_S`，SC-35；arch §5.12）。
 pub const PASSTHROUGH_READY_QUIET_S: f64 = 30.0;
+
+// ── Slice 2.2（P6 Task 1，計畫 07）────────────────────────────────────────────────────────────
+// arch §3.1 列為 sw-proto 常數、但 P3／P5 尚未定義者（數值照 `sw_core/constants.py`、`uart_io.py`、`session_manager.py`）。
+/// soft preempt／ATTACHED 救援 lease 上限秒數（`sw_core/constants.py::MAX_RECOVERY_LEASE_S`）。
+pub const MAX_RECOVERY_LEASE_S: f64 = 120.0;
+/// bootloader prompt 判定取用的 RX 尾端位元組數（`sw_core/constants.py::BOOTLOADER_RX_TAIL_BYTES`）。
+pub const BOOTLOADER_RX_TAIL_BYTES: usize = 512;
+/// human「近期活躍」視窗（`sw_core/constants.py::HUMAN_ACTIVE_WINDOW_S`）。
+pub const HUMAN_ACTIVE_WINDOW_S: f64 = 60.0;
+/// human lease peer-loss grace（`sw_core/constants.py::_HUMAN_PEER_GRACE_S`；07 D-09 hub 掃描週期）。
+pub const HUMAN_PEER_GRACE_S: f64 = 3.0;
+/// 無 peer 的 PTY console 被 reap 前的 grace（`uart_io.py::_STALE_CONSOLE_GRACE_S`）。
+pub const STALE_CONSOLE_GRACE_S: f64 = 2.0;
+/// ATTACHED 狀態 human console lease 的 timeout（`session_manager.py::_ATTACHED_CONSOLE_LEASE_TIMEOUT_S`）。
+pub const ATTACHED_CONSOLE_LEASE_TIMEOUT_S: f64 = 86400.0;
+/// DeferredBuffer 每 client 上限（bytes；BC-02 超過時刪除該 client 整段，07 D-07；`sw_core/constants.py`）。
+/// P6 Task 1 自 sw-core `resources` 移入（比照 `CMD_HISTORY_MAX` 先例），sw-core 以 `pub use` 再匯出。
+pub const DEFERRED_INPUT_MAX_BYTES: usize = 262_144;
+/// 每 session interactive tombstone 上限（FIFO；arch §5.10）。sw-core `resources::INTERACTIVE_TOMBSTONES_MAX` 為其再匯出。
+pub const INTERACTIVE_TOMBSTONE_MAX: usize = 16;
+
+// 07 Task 1 Produces（值即契約；`contracts/resource_limits.yaml` 07 D-18 列的 Rust 鏡像）。
+/// line editor 緩衝上限（SC-16、07 D-06）。
+pub const CONSOLE_LINE_BUFFER_MAX: usize = 16385;
+/// 每 console 出向 ring 的 Display 上限（SC-15、07 D-05）。
+pub const CONSOLE_OUT_RING_BYTES: usize = 1_048_576;
+/// 每 console 尚未寫出的 Control（greeting、協商回覆）上限；超過即關閉該 console（07 D-05、SC-31(c)）。
+pub const CONSOLE_CONTROL_MAX_BYTES: usize = 65_536;
+/// reader→hub 顯示佇列（chunk 數，07 D-18）。
+pub const CONSOLE_HUB_RX_QUEUE: usize = 256;
+/// actor→hub 控制佇列（07 D-18）。
+pub const CONSOLE_HUB_CTRL_QUEUE: usize = 64;
+/// hub→mailbox 暫存（07 D-17）。
+pub const CONSOLE_HUB_PENDING_EVENTS: usize = 64;
+/// hub 每輪每 channel 最多處理筆數（07 D-17）。
+pub const CONSOLE_HUB_LOOP_QUOTA: usize = 64;
+/// 每 session Telnet console 上限（07 D-18、SC-31(d)）。
+pub const TELNET_CONSOLES_PER_SESSION: usize = 32;
+/// human TX lane backlog 上限（07 D-15）。
+pub const HUMAN_TX_BACKLOG_MAX_BYTES: usize = 262_144;
+/// com0com reader→mux 有界 channel（07 D-04、D-18；PAL 不依賴 sw-proto，實作端另以相同值定義並由測試比對）。
+pub const COM0COM_READER_CHANNEL: usize = 64;
+/// `session.interactive_open` 預設 timeout（`service.py:843`）。
+pub const DEFAULT_INTERACTIVE_TIMEOUT_S: f64 = 60.0;
+/// `session.interactive_status` 預設 screen_chars（`service.py:860`）。
+pub const DEFAULT_SCREEN_CHARS: i128 = 2048;
+/// human console line 命令的 timeout（`service.py:313-322`）。
+pub const HUMAN_CONSOLE_CMD_TIMEOUT_S: f64 = 30.0;
+/// human console line 命令的 priority（與 `SubmitReq.priority: i128` 同型別）。
+pub const HUMAN_CONSOLE_CMD_PRIORITY: i128 = 100;
+/// 視為互動式全螢幕程式的命令 basename（`service.py::_HUMAN_INTERACTIVE_COMMANDS`，維持字母序）。
+pub const HUMAN_INTERACTIVE_COMMANDS: [&str; 18] = [
+    "alsamixer", "btop", "htop", "less", "menuconfig", "more", "most", "nano", "nmtui", "screen", "tig", "tmux",
+    "top", "vi", "view", "vim", "vimdiff", "watch",
+];
+/// `sudo` 後會吃掉下一個 token 的選項（`service.py::_human_console_mode`）。
+pub const SUDO_VALUE_OPTS: [&str; 8] = ["-u", "-g", "-h", "-p", "-C", "-T", "-r", "-t"];
+/// `interactive_send` 的 `encoding=key` 對照表（`session_manager.py::_encode_interactive_payload` 的 `key_map`）。
+pub const INTERACTIVE_KEY_MAP: [(&str, &[u8]); 9] = [
+    ("enter", b"\n"),
+    ("tab", b"\t"),
+    ("escape", b"\x1b"),
+    ("ctrl-c", b"\x03"),
+    ("ctrl-d", b"\x04"),
+    ("up", b"\x1b[A"),
+    ("down", b"\x1b[B"),
+    ("right", b"\x1b[C"),
+    ("left", b"\x1b[D"),
+];
+/// 哨兵 primary console 的 label。
+pub const CONSOLE_PRIMARY_LABEL: &str = "primary";
+/// console `client_id` 的 hex 長度（`uuid4().hex[:12]`）。
+pub const CONSOLE_CLIENT_ID_HEX: usize = 12;
+
+/// Telnet 常數（`sw_core/telnet_console.py`；上游未定義，本 Phase 唯一定義處）。
+pub mod telnet {
+    pub const IAC: u8 = 0xFF;
+    pub const SE: u8 = 0xF0;
+    pub const SB: u8 = 0xFA;
+    pub const WILL: u8 = 0xFB;
+    pub const WONT: u8 = 0xFC;
+    pub const DO: u8 = 0xFD;
+    pub const DONT: u8 = 0xFE;
+    pub const OPT_BINARY: u8 = 0x00;
+    pub const OPT_ECHO: u8 = 0x01;
+    pub const OPT_SGA: u8 = 0x03;
+    /// `IAC WILL ECHO, IAC WILL SGA, IAC DO SGA, IAC WILL BINARY`（12 bytes）。
+    pub const TELNET_GREETING: [u8; 12] = [0xFF, 0xFB, 0x01, 0xFF, 0xFB, 0x03, 0xFF, 0xFD, 0x03, 0xFF, 0xFB, 0x00];
+}

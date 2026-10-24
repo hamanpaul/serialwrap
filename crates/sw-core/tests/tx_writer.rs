@@ -107,6 +107,8 @@ fn job(
                 source: "agent:x".into(),
                 cmd_id: Some("c".into()),
                 log,
+                input_epoch: None,
+                replay_hold: None,
             },
             payload: payload.to_vec(),
             reply: tx,
@@ -128,6 +130,8 @@ fn send(r: &Rig, class: TxClass, op: u64, epoch: u64, payload: &[u8]) -> TxRepor
                 source: "agent:x".into(),
                 cmd_id: Some("c".into()),
                 log: true,
+                input_epoch: None,
+                replay_hold: None,
             },
             payload: payload.to_vec(),
             reply: tx,
@@ -564,6 +568,8 @@ fn gate_rules() {
                 source: "agent:x".into(),
                 cmd_id: None,
                 log: true,
+                input_epoch: None,
+                replay_hold: None,
             };
             let got = f.with(|s| Fence::admit(s, &p));
             assert_eq!(got, row.expect, "列={} class={class:?}", row.name);

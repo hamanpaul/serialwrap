@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub mod clock;
+pub mod console;
 pub mod device;
 pub mod env;
 pub mod fs;

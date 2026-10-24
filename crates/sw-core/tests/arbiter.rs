@@ -4,7 +4,7 @@
 //! 逐列展開 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 8 的 Step 1 程式碼案例與表格。
 //! 實作前每個測試應於執行期因 `not implemented: slice21 T8 ...` 失敗（缺行為，非編譯錯誤）。
 
-use sw_core::arbiter::{AbortClass, CmdOutcome, CommandRegistry, RunDecision, SessionQueue, SubmitReq};
+use sw_core::arbiter::{AbortClass, CmdOutcome, CommandRegistry, RunDecision, SessionQueue, SubmitOrigin, SubmitReq};
 use sw_proto::pyjson::{dumps, dumps_dict, PyDict, PyValue, RPC_WIRE};
 
 const T: &str = "2026-10-15T03:06:17.663778+00:00";
@@ -20,6 +20,7 @@ fn req(cmd: &str) -> SubmitReq {
         priority: 10,
         expected_duration_s: None,
         completion_regex: None,
+        origin: SubmitOrigin::Rpc,
     }
 }
 

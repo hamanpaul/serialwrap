@@ -23,7 +23,7 @@ SCOPE = ROOT / "tests" / "acceptance" / "slice21_scope.yaml"
 RPC_TYPES = ROOT / "crates" / "sw-proto" / "src" / "rpc_types.rs"
 RUST_SRC_DIRS = [ROOT / "crates" / "sw-core" / "src", ROOT / "crates" / "sw-daemon" / "src"]
 
-# YAML 名稱 → (Rust 常數所在檔, 常數名)。涵蓋 `contracts/resource_limits.yaml` 全部 20 列（P5 Task 0 雙審修正：含 cmd_pending_max）。
+# YAML 名稱 → (Rust 常數所在檔, 常數名)。涵蓋 `contracts/resource_limits.yaml` 全部列（P5 Task 0 雙審修正：含 cmd_pending_max；P6 Task 1 追加 07 D-18 九列）。
 MIRROR = {
     "mailbox_control": ("resources.rs", "MAILBOX_CONTROL_CAP"),
     "mailbox_data_chunks": ("resources.rs", "MAILBOX_DATA_CHUNKS_CAP"),
@@ -36,15 +36,26 @@ MIRROR = {
     "bg_capture_max_chars": ("resources.rs", "BG_CAPTURE_MAX_CHARS"),
     "rx_window_max_chars": ("resources.rs", "RX_WINDOW_MAX_CHARS"),
     "rx_rate_window_entries": ("resources.rs", "RX_RATE_WINDOW_ENTRIES"),
-    "deferred_input_max_bytes": ("resources.rs", "DEFERRED_INPUT_MAX_BYTES"),
+    # P6 Task 1：DEFERRED_INPUT_MAX_BYTES／INTERACTIVE_TOMBSTONE_MAX 定義移至 sw_proto::constants（resources.rs 以 pub use 再匯出）。
+    "deferred_input_max_bytes": ("constants.rs", "DEFERRED_INPUT_MAX_BYTES"),
     "rpc_connections": ("resources.rs", "RPC_CONNECTIONS_MAX"),
     "rpc_request_line_bytes": ("resources.rs", "RPC_REQUEST_LINE_BYTES"),
-    "interactive_tombstones": ("resources.rs", "INTERACTIVE_TOMBSTONES_MAX"),
+    "interactive_tombstones": ("constants.rs", "INTERACTIVE_TOMBSTONE_MAX"),
     "drain_timeout_ms": ("resources.rs", "DRAIN_TIMEOUT_MS"),
     "tx_ledger_live_ops": ("tx_writer.rs", "TX_LEDGER_LIVE_MAX"),
     "tx_ledger_unresolved_gaps": ("tx_writer.rs", "TX_LEDGER_UNRESOLVED_GAPS_MAX"),
     "tx_op_wal_gaps": ("tx_writer.rs", "TX_OP_WAL_GAPS_MAX"),
     "tx_settle_queue": ("tx_writer.rs", "TX_SETTLE_QUEUE_MAX"),
+    # Slice 2.2（P6 Task 0／Task 1，07 D-18）：console／human TX 有界資源，鏡像於 sw_proto::constants。
+    "console_hub_rx_queue": ("constants.rs", "CONSOLE_HUB_RX_QUEUE"),
+    "console_hub_ctrl_queue": ("constants.rs", "CONSOLE_HUB_CTRL_QUEUE"),
+    "console_hub_pending_events": ("constants.rs", "CONSOLE_HUB_PENDING_EVENTS"),
+    "console_out_ring_display_bytes": ("constants.rs", "CONSOLE_OUT_RING_BYTES"),
+    "console_control_max_bytes": ("constants.rs", "CONSOLE_CONTROL_MAX_BYTES"),
+    "console_line_buffer_bytes": ("constants.rs", "CONSOLE_LINE_BUFFER_MAX"),
+    "human_tx_backlog_bytes": ("constants.rs", "HUMAN_TX_BACKLOG_MAX_BYTES"),
+    "telnet_consoles_per_session": ("constants.rs", "TELNET_CONSOLES_PER_SESSION"),
+    "com0com_reader_channel": ("constants.rs", "COM0COM_READER_CHANNEL"),
 }
 MIRROR_FILES = {
     "resources.rs": ROOT / "crates" / "sw-core" / "src" / "resources.rs",

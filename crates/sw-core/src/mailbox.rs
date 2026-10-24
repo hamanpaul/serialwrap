@@ -10,10 +10,12 @@ use sw_proto::pycompat::PyErr;
 use sw_proto::pyjson::PyDict;
 
 use crate::drain::{StopId, WorkerStoppedReceipt};
+use crate::human_console::human_tx::HumanTxTag;
+use crate::human_console::{ConsoleScanSnapshot, ConsoleTransportKind, ScanSource};
 use crate::login_fsm::LoginOutcome;
 use crate::op_runner::OpOutcome;
 use crate::session_core::SessionRequest;
-use crate::tx_writer::OpId;
+use crate::tx_writer::{OpId, TxReport};
 use crate::uart_bridge::IoWorker;
 use crate::Mono;
 
@@ -24,6 +26,10 @@ pub type Reply = Sender<Result<PyDict, PyErr>>;
 #[derive(Debug)]
 pub enum DataEvent {
     UartRxChunk { epoch: u64, rx_seq: u64, wal_seq: u64, bytes: Vec<u8> },
+    /// P6 增補 #7（07 D-02、D-17(5)）：console 輸入；`input_epoch` 為 hub 每輪 `mux.wait` 前取的快照。不帶 `rx_seq`。
+    ConsoleInputBytes { client_id: String, client_lifetime: u64, input_epoch: u64, bytes: Vec<u8> },
+    /// P6 增補 #7（07 D-17(3)）：與同 client 輸入走同一條 data lane，不得超車尚未處理的輸入。
+    ConsoleDisconnected { client_id: String, client_lifetime: u64 },
 }
 
 /// 控制 lane 事件。
@@ -43,6 +49,14 @@ pub enum ControlEvent {
     StateCommitted { commit_id: u64, result: Result<(), PalError> },
     Tick,
     Shutdown { reply: Reply },
+    /// P6 增補 #8：stream console（TCP／com0com）accept 或 hub 註冊完成。
+    ConsoleConnected { client_id: String, client_lifetime: u64, label: String, vtty: String, kind: ConsoleTransportKind },
+    /// P6 增補 #8（07 D-09）：actor thread 之外取得的 `/proc` 掃描快照。
+    ConsoleScan { scan: ConsoleScanSnapshot, source: ScanSource },
+    /// P6 增補 #8（07 D-15(5)）：human TX pump 的結算。
+    HumanTxCompleted { tag: HumanTxTag, report: TxReport },
+    /// P6 增補 #8（07 Task 10）：actor 層 envelope；`PtyPair` 由 executor 保管，不進 `SessionCore`。
+    ConsoleAttachReq { label: Option<String>, pty: Option<sw_pal::PtyPair>, reply: Reply },
 }
 
 /// 到期 timer（`Effect::Schedule` 的內容）。

@@ -18,6 +18,15 @@ pub struct SubmitReq {
     pub priority: i128,
     pub expected_duration_s: Option<f64>,
     pub completion_regex: Option<String>,
+    /// P6 增補 #6（07 D-10，DF-02）：只有 line editor 產生的 `HumanConsole` 會被視為 human；06 既有建構點一律 `Rpc`。
+    pub origin: SubmitOrigin,
+}
+
+/// 命令來源（07 D-10）：`Rpc` 即使 `source` 以 `human:` 開頭也一律以 agent 對待（OD-14 #5）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmitOrigin {
+    Rpc,
+    HumanConsole { client_id: String },
 }
 
 /// 已進入佇列的命令；排序鍵為 `(priority, counter)`，數值小者先出列。

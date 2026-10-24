@@ -52,6 +52,10 @@ pub struct TxPermit {
     pub source: String,
     pub cmd_id: Option<String>,
     pub log: bool,
+    /// P6 增補 #3（07 D-03）：只有 HumanRaw／HumanReplay 為 `Some`（擷取當下的 `input_epoch`），06 既有建構點一律 `None`。
+    pub input_epoch: Option<u64>,
+    /// P6 增補 #3（07 D-22）：只有 HumanReplay 為 `Some(hold_id)`，其餘一律 `None`。
+    pub replay_hold: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +83,12 @@ pub struct FenceState {
     pub wal_unhealthy: bool,
     pub cancelled: HashSet<OpId>,
     pub in_flight: Option<InFlight>,
+    /// P6 增補 #4（07 D-03）：human admission 關閉（前景操作期間）；HumanRaw 被擋為 `HumanAdmissionClosed`。
+    pub human_admission_blocked: bool,
+    /// P6 增補 #4（07 D-02）：與 `Generations.input_epoch` 同一次 `Fence::with` 內更新。
+    pub input_epoch: u64,
+    /// P6 增補 #4（07 D-22）：目前有效的回放授權（`ReplayHold.hold_id`）。
+    pub replay_auth: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +102,12 @@ pub enum FenceReject {
     OwnerMismatch,
     FsmMismatch,
     Cancelled,
+    /// P6 增補 #4（07 D-03）：HumanRaw 遇 `human_admission_blocked`。
+    HumanAdmissionClosed,
+    /// P6 增補 #4（07 D-03）：HumanRaw／HumanReplay 的 `input_epoch` 不等於現值。
+    InputStale,
+    /// P6 增補 #4（07 D-22）：HumanReplay 的 `replay_hold` 不等於 `replay_auth`（已被撤銷）。
+    ReplayRevoked,
 }
 
 #[allow(dead_code)]

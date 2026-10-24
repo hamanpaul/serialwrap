@@ -17,7 +17,10 @@ pub mod clock;
 pub mod com0com;
 #[cfg(feature = "test-fakes")]
 pub mod conformance;
+pub mod console_com0com;
+pub mod console_mux;
 pub mod console_pty;
+pub mod console_tcp;
 pub mod device_source;
 pub mod device_watcher;
 #[cfg(feature = "test-fakes")]
@@ -40,6 +43,8 @@ pub mod serial;
 pub mod service_ctl;
 pub mod signal;
 pub mod sysenv;
+#[cfg(feature = "test-fakes")]
+pub mod testutil;
 pub mod traits;
 pub mod wal_fs;
 

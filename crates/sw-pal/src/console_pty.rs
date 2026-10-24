@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::console_mux::{ConsoleMux, MuxHandle};
 use crate::traits::{IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome};
 use crate::ConsoleKind;
 
@@ -38,6 +39,8 @@ pub trait ConsoleIo: Send {
     fn waker(&self) -> Arc<dyn IoWaker>;
     fn has_external_peer(&self, held: Option<&HashSet<String>>) -> bool;
     fn close(self: Box<Self>);
+    /// P6（07 D-04）：`ConsoleMux` 用的底層 handle（PAL 私有建構）。
+    fn mux_handle(&self) -> MuxHandle;
 }
 
 /// `create_pty` 的結果（arch §4.7）。
@@ -54,6 +57,8 @@ pub trait ConsoleListener: Send {
     fn endpoint(&self) -> String;
     /// `peer` 為 `"ip:port"`。
     fn accept(&mut self, timeout: Duration) -> PalResult<Option<(Box<dyn ConsoleIo>, String)>>;
+    /// P6（07 D-04）：`ConsoleMux` 用的底層 handle（PAL 私有建構）。
+    fn mux_handle(&self) -> MuxHandle;
 }
 
 /// human console 承接工廠（arch §4.7）。
@@ -77,6 +82,10 @@ pub trait ConsoleTransportFactory: Send + Sync {
     /// /proc 掃描外部持有的 pts 路徑；Windows 或不可讀時回 `None`。2.2 承接，本 Phase 回 `None`。
     fn held_slave_paths(&self) -> Option<HashSet<String>> {
         None
+    }
+    /// P6（07 D-04，Task 8）：建立此 PAL 的 `ConsoleMux`；預設 `Unsupported`（既有只實作 `kind` 的替身仍可編譯）。
+    fn new_mux(&self) -> PalResult<Box<dyn ConsoleMux>> {
+        Err(unsupported("new_mux"))
     }
 }
 
