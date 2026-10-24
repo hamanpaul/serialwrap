@@ -1,14 +1,17 @@
-//! 第二 console 起的 line-buffer 編輯（P6 Task 3；`uart_io.py:712-750` `_pop_last_console_char`／`_consume_console_input`＋SC-16）。
+//! 第二 console 起的 line-buffer 編輯（P6 Task 3；`uart_io.py` `_pop_last_console_char`／`_consume_console_input`＋SC-16）。
 //!
 //! 本地回顯、backspace 刪一個 UTF-8 字元、CR／LF 摺疊（每次呼叫重設，UIO-12.10-a）、16385 bytes 行上限（07 D-06）。
-//! Task 1 骨架：型別與簽章凍結，函式本體為 `todo!("P6 Task 3")`。
+//! 溢位語意以 P1 Python 產生的 golden（`contracts/golden/line_editor.tsv`）為準：緩衝已滿時再收到非終止、非 backspace 的
+//! byte 即清空緩衝並進入 discarding（該 byte 不回顯）；discarding 期間所有非終止 byte（含 backspace）丟棄且不回顯；
+//! 下一個 CR／LF 結束 discarding，不回顯 `\r`、不送 arbiter，`overflowed_lines` 加一（呼叫端據此寫 WARNING）。
+
+use sw_proto::constants::CONSOLE_LINE_BUFFER_MAX;
+use sw_proto::pycompat::decode_utf8_replace;
 
 /// 每個 line-mode console 的半行緩衝（07 D-21：BC-02 失效時不清除）。
 #[derive(Debug, Default, Clone)]
 pub struct LineEditor {
-    #[allow(dead_code)]
     buf: Vec<u8>,
-    #[allow(dead_code)]
     discarding: bool,
 }
 
@@ -22,20 +25,76 @@ pub struct LineOutput {
 
 impl LineEditor {
     pub fn new() -> Self {
-        todo!("P6 Task 3")
+        LineEditor::default()
     }
 
-    /// `_consume_console_input`（`uart_io.py:721-750`）＋SC-16。
-    pub fn consume(&mut self, _data: &[u8]) -> LineOutput {
-        todo!("P6 Task 3")
+    /// `_consume_console_input`＋SC-16。
+    pub fn consume(&mut self, data: &[u8]) -> LineOutput {
+        let mut o = LineOutput::default();
+        // 每次呼叫重設（CR 與 LF 分在兩個 chunk 時多送一個空行，UIO-12.10-a KEEP）。
+        let mut last_term: Option<u8> = None;
+        for &b in data {
+            let is_term = b == 0x0A || b == 0x0D;
+            if self.discarding && !is_term {
+                last_term = None;
+                continue;
+            }
+            match b {
+                0x08 | 0x7F => {
+                    last_term = None;
+                    if pop_last_utf8_char(&mut self.buf) {
+                        o.echo.extend_from_slice(b"\x08 \x08");
+                    }
+                }
+                0x0A | 0x0D => {
+                    if matches!(last_term, Some(t) if t != b) && self.buf.is_empty() {
+                        last_term = None;
+                        continue;
+                    }
+                    if self.discarding {
+                        self.buf.clear();
+                        self.discarding = false;
+                        last_term = Some(b);
+                        o.overflowed_lines += 1;
+                        continue;
+                    }
+                    o.lines.push(decode_utf8_replace(&self.buf));
+                    self.buf.clear();
+                    o.echo.push(b'\r');
+                    last_term = Some(b);
+                }
+                _ => {
+                    last_term = None;
+                    if self.buf.len() >= CONSOLE_LINE_BUFFER_MAX {
+                        self.buf.clear();
+                        self.discarding = true;
+                        continue;
+                    }
+                    self.buf.push(b);
+                    if b == 0x09 || (0x20..=0x7E).contains(&b) || b >= 0x80 {
+                        o.echo.push(b);
+                    }
+                }
+            }
+        }
+        o
     }
 
     pub fn buffered_len(&self) -> usize {
-        todo!("P6 Task 3")
+        self.buf.len()
     }
 }
 
-/// `_pop_last_console_char`（`uart_io.py:712-719`）：刪掉最後一個 UTF-8 字元；緩衝為空時回 false。
-pub fn pop_last_utf8_char(_buf: &mut Vec<u8>) -> bool {
-    todo!("P6 Task 3")
+/// `_pop_last_console_char`：刪掉最後一個 UTF-8 字元；緩衝為空時回 false。
+/// 與 Python 相同：往前跳過 continuation byte 但停在 index 0（只剩 continuation 時整段刪除）。
+pub fn pop_last_utf8_char(buf: &mut Vec<u8>) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    let mut idx = buf.len() - 1;
+    while idx > 0 && (buf[idx] & 0xC0) == 0x80 {
+        idx -= 1;
+    }
+    buf.truncate(idx);
+    true
 }
