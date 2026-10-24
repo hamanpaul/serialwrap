@@ -25,6 +25,8 @@ from mgmt_fixtures import (  # noqa: E402,F401
     stub_log,
     stub_path,
 )
+from bb_harness import ISOLATED_ROOTS  # noqa: E402  isolated_env 登記的隔離根（config_digest 紀錄用）
+import config_digest as _config_digest  # noqa: E402
 
 _STANDARD_MARKERS = {
     "core_portable": "Linux 與 Windows 都必跑；禁止以平台原因 SKIP；不得宣稱測到原生 UART",
@@ -99,7 +101,22 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     return True
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    """夾具（setup）與測試本體建立設定之後，逐案例記錄各隔離根的 config_digest（G4-ab1b-config-digest）。
+
+    僅在 `SW_AB_CONFIGLOG` 有值（A／B 身分執行）時計算摘要；一般 pytest 執行只清空登記表。
+    """
+    yield
+    log = os.environ.get(_config_digest.LOG_ENV)
+    if log:
+        _config_digest.record_items(Path(log), item.nodeid, list(ISOLATED_ROOTS))
+    ISOLATED_ROOTS.clear()
+
+
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    # 每個案例的隔離根由本案例的 setup 與 call 階段登記；開頭清空，避免承接前一案例（含 setup 失敗者）的殘留。
+    ISOLATED_ROOTS.clear()
     # 獨立執行（--confcutdir）不載入 root conftest 的平台 skip；Windows 上 posix_only 案例以
     # applicability.json 的鍵 "posix_only" 為原因 SKIP，比較器才會判為合法的不適用。
     if item.get_closest_marker("posix_only") and os.name == "nt":

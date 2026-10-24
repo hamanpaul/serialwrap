@@ -24,6 +24,7 @@ LOCK = ROOT / "tests/acceptance/p4_required.lock.json"
 CASE_MAP = ROOT / "tests/acceptance/p4_case_map.yaml"
 COMPARE = ROOT / "scripts/rust/ab_compare.py"
 APPLICABILITY = ROOT / "tests/contract_blackbox/data/applicability.json"
+CONFIG_DIGEST = ROOT / "tests/contract_blackbox/config_digest.py"
 PY_DAEMON = ROOT / ("serialwrapd.py" if os.name == "nt" else "tests/contract_blackbox/bin/py-serialwrapd")
 
 
@@ -502,7 +503,33 @@ def resolve_manifest(cli: Path) -> Path:
     raise ValueError(f"找不到 release-manifest.json（bundle={bundle}）；不得以 git HEAD 代替")
 
 
-def _bundle_identity(cli: Path, platform: str, cases_sha: str, evidence: list[Path]) -> dict[str, Any]:
+def _config_digest_module() -> Any:
+    """以路徑載入 tests/contract_blackbox/config_digest.py（stdlib-only；不經 sys.path，避免與 harness 同名模組衝突）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ab_config_digest", CONFIG_DIGEST)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"無法載入設定摘要模組：{CONFIG_DIGEST}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _config_summary(log: Path, out: Path) -> dict[str, Any]:
+    """彙整單一輪（A 或 B）的設定紀錄，逐案例摘要寫入 `out`；紀錄缺失或為空即 ValueError（fail-closed）。"""
+    summary = _config_digest_module().aggregate(log)
+    out.write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def _lock_applicability_sha256() -> str:
+    """凍結 lock 與 applicability 檔的雜湊（與設定內容無關，獨立保留於身分）。"""
+    return hashlib.sha256(LOCK.read_bytes() + APPLICABILITY.read_bytes()).hexdigest()
+
+
+def _bundle_identity(
+    cli: Path, platform: str, cases_sha: str, evidence: list[Path], *, config_digest: str,
+) -> dict[str, Any]:
     from sw_core.release_manifest import package_tree_sha256
 
     manifest_path = resolve_manifest(cli)
@@ -532,7 +559,8 @@ def _bundle_identity(cli: Path, platform: str, cases_sha: str, evidence: list[Pa
         "case_list_sha256": cases_sha,
         "tool_revision": f"{git_revision}+{_tree_sha256(ROOT / 'tests/contract_blackbox')}",
         "platform": platform,
-        "config_digest": hashlib.sha256((LOCK.read_bytes() + APPLICABILITY.read_bytes())).hexdigest(),
+        "config_digest": config_digest,
+        "lock_applicability_sha256": _lock_applicability_sha256(),
         "dut_identity": "P2 黑箱測試目標",
         "evidence_files": [
             {"path": str(path.resolve()), "sha256": _sha256_file(path)}
@@ -541,7 +569,9 @@ def _bundle_identity(cli: Path, platform: str, cases_sha: str, evidence: list[Pa
     }
 
 
-def _baseline_identity(cli: Path, platform: str, cases_sha: str, evidence: list[Path]) -> dict[str, Any]:
+def _baseline_identity(
+    cli: Path, platform: str, cases_sha: str, evidence: list[Path], *, config_digest: str,
+) -> dict[str, Any]:
     """A 輪（Python 基線）身分：基線不是 bundle，不要求 release-manifest；git_revision 取 HEAD。"""
     from sw_core.release_manifest import package_tree_sha256
 
@@ -561,7 +591,8 @@ def _baseline_identity(cli: Path, platform: str, cases_sha: str, evidence: list[
         "case_list_sha256": cases_sha,
         "tool_revision": f"{git_head}+{_tree_sha256(ROOT / 'tests/contract_blackbox')}",
         "platform": platform,
-        "config_digest": hashlib.sha256((LOCK.read_bytes() + APPLICABILITY.read_bytes())).hexdigest(),
+        "config_digest": config_digest,
+        "lock_applicability_sha256": _lock_applicability_sha256(),
         "dut_identity": "P2 黑箱測試目標",
         "evidence_files": [
             {"path": str(path.resolve()), "sha256": _sha256_file(path)}
@@ -717,6 +748,8 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
     release_path = out_dir / "release-check.json"
     compare_path = out_dir / "ab-report.json"
     identity_a_path, identity_b_path = out_dir / "identity-a.json", out_dir / "identity-b.json"
+    a_config_log, b_config_log = out_dir / "a-config.jsonl", out_dir / "b-config.jsonl"
+    config_a_path, config_b_path = out_dir / "config-digest-a.json", out_dir / "config-digest-b.json"
 
     lock_cases, frozen_nodes = _frozen_cases()
     case_map = _frozen_case_map(lock_cases)
@@ -742,6 +775,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
         "SERIALWRAP_AB_LABEL": "python-baseline",
         "SW_AB_PIDLOG": str(a_pidlog),
         "SW_RESOURCE_REPORT": str(a_resource),
+        "SW_AB_CONFIGLOG": str(a_config_log),
     })
     a_command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selected_nodes, f"--junitxml={a_junit}"]
     a_result = _run(a_command, env=a_env, timeout=timeout)
@@ -783,6 +817,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
         "SERIALWRAP_AB_LABEL": "rust-1b",
         "SW_AB_PIDLOG": str(b_pidlog),
         "SW_RESOURCE_REPORT": str(b_resource),
+        "SW_AB_CONFIGLOG": str(b_config_log),
     })
     b_command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *selected_nodes, f"--junitxml={b_junit}"]
     b_result = _run(b_command, env=b_env, timeout=timeout)
@@ -797,8 +832,23 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
     cases_sha_b = hashlib.sha256("\n".join(sorted(parsed_b)).encode("utf-8")).hexdigest()
     identity_evidence = [required_path, release_path, a_junit, b_junit, a_resource, b_resource]
     identity_a_cli = ROOT / ("serialwrap.py" if platform == "windows" else "serialwrap")
-    identity_a = _baseline_identity(identity_a_cli, platform, cases_sha_a, identity_evidence)
-    identity_b = _bundle_identity(cli, platform, cases_sha_b, identity_evidence)
+    # 設定摘要缺失（紀錄不存在或為空）不以例外中止：記入 config_errors、整體判 fail，summary 仍照常產生。
+    config_errors: list[str] = []
+    config_digests: dict[str, str] = {}
+    for side, log, summary_path in (("a", a_config_log, config_a_path), ("b", b_config_log, config_b_path)):
+        try:
+            config_digests[side] = _config_summary(log, summary_path)["digest"]
+        except ValueError as exc:
+            config_errors.append(f"{side.upper()} 輪設定摘要缺失：{exc}")
+            config_digests[side] = ""
+    identity_a = _baseline_identity(
+        identity_a_cli, platform, cases_sha_a,
+        identity_evidence + [config_a_path, a_config_log], config_digest=config_digests["a"],
+    )
+    identity_b = _bundle_identity(
+        cli, platform, cases_sha_b,
+        identity_evidence + [config_b_path, b_config_log], config_digest=config_digests["b"],
+    )
     identity_b["cli_implementation"] = "rust"
     identity_b["daemon_tree_sha256"] = package_tree
     identity_b["daemon_runtime_sha256"] = _sha256_file(Path(sys.executable).resolve())
@@ -820,7 +870,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
             comparison = {}
     success = (
         a_result.returncode == 0 and b_result.returncode == 0 and not a_status_errors
-        and not b_status_errors and not parse_errors_a and not parse_errors_b
+        and not b_status_errors and not parse_errors_a and not parse_errors_b and not config_errors
         and compare_result.returncode == 0
         and comparison.get("result") == "pass"
         and not comparison.get("errors")
@@ -838,6 +888,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
         "exit_codes": {"a": a_result.returncode, "b": b_result.returncode, "compare": compare_result.returncode},
         "a_status_errors": a_status_errors,
         "b_status_errors": b_status_errors,
+        "config_errors": config_errors,
         "release_check": release,
         "counts": comparison.get("counts", {}),
         "ab_report": comparison,
