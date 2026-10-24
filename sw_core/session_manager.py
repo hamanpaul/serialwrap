@@ -1019,7 +1019,7 @@ class SessionManager:
         with self._lock:
             self._shutting_down = True
 
-    def freeze_for_handoff(self) -> None:
+    def freeze_for_handoff(self) -> list[str]:
         """交接停止成功後凍結背景引擎與既有 bridge 的 TX（SC-11 `daemon.handoff_stop`，R1-F1）。
 
         RPC admission 只擋新進的 RPC；DeviceWatcher 重探 tick、重新 attach、login 與人工 console 行
@@ -1031,9 +1031,15 @@ class SessionManager:
         3. 對所有已掛載 bridge（session、attach、probe）呼叫 `freeze_tx()`：此後任何來源的 TX
            都由 bridge 拒絕（零 TX）。
 
-        reader 與埠保持開啟；實際排空仍由 stop 的 `shutdown_drain()` 於窗口結束後完成。冪等。
+        回傳 TX fence 未在期限內收斂的 COM 清單（空清單＝凍結成立，回覆前已授權的寫入段皆已結束）。
+        收斂失敗且本次為新凍結時，撤銷上述三項（flag 還原、bridge 凍結撤銷），daemon 回到可正常運作的狀態，
+        由 `handoff_stop` 回 SESSION_BUSY（SC-11：忙碌不凍結、不停止）。已凍結者保持凍結（冪等）。
+
+        reader 與埠保持開啟；實際排空仍由 stop 的 `shutdown_drain()` 於窗口結束後完成。
         """
         with self._lock:
+            was_frozen = self._handoff_frozen
+            was_shutting_down = self._shutting_down
             self._handoff_frozen = True
             self._shutting_down = True
             bridges: dict[int, UARTBridge] = {}
@@ -1046,10 +1052,20 @@ class SessionManager:
                 for op in table.values():
                     if op.probe_bridge is not None:
                         bridges[id(op.probe_bridge)] = op.probe_bridge
+            unconverged: list[str] = []
             for bridge in bridges.values():
                 freeze_tx = getattr(bridge, "freeze_tx", None)
-                if callable(freeze_tx):
-                    freeze_tx()
+                if callable(freeze_tx) and freeze_tx() is False:
+                    unconverged.append(str(getattr(bridge, "com", "") or ""))
+            if unconverged and not was_frozen:
+                # 交接未成立：撤銷本次新建立的凍結。drain 已開始的 bridge 由 thaw_tx 自行保留凍結。
+                self._handoff_frozen = False
+                self._shutting_down = was_shutting_down
+                for bridge in bridges.values():
+                    thaw_tx = getattr(bridge, "thaw_tx", None)
+                    if callable(thaw_tx):
+                        thaw_tx()
+            return sorted(set(unconverged))
 
     def shutdown_drain(self, *, total_timeout_s: float = 5.0) -> dict[str, Any]:
         """以一個共用期限等待 attach 收尾並取得所有 bridge 關閉回條。"""
@@ -2230,6 +2246,9 @@ class SessionManager:
                     session = self._sessions.get(session_id)
                     if session is None or session.bridge is not bridge:
                         return
+                    # 交接凍結後不再開始 readiness probe（SC-11，零 TX、零登入世代產生）。
+                    if self._handoff_frozen:
+                        return
                     if not self._reprobe_target_still_valid_locked(session, bridge, start):
                         return
                 try:
@@ -2279,6 +2298,9 @@ class SessionManager:
         post_actions: list[tuple[str, _PostCloseAction]] = []
         expired_count = 0
         with self._lock:
+            # SC-11：交接凍結後 tick 不改動 lease（也不排還原／回放）；鎖內重新檢查，覆蓋頂部無鎖檢查之後的凍結。
+            if self._handoff_frozen:
+                return 0
             for interactive_id, lease in list(self._interactive.items()):
                 if lease.status != "active" or lease.owner.startswith("human:"):
                     continue
@@ -2360,8 +2382,13 @@ class SessionManager:
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []
         promoted: list[str] = []
         with self._lock:
+            # 頂部無鎖檢查之後、取得鎖之前，交接可能已完成凍結：鎖內重新檢查（SC-11，零狀態改寫）。
+            if self._handoff_frozen:
+                return
             promoted = self._promote_quiet_passthrough_locked(now)
             for session in list(self._sessions.values()):
+                if self._handoff_frozen:
+                    break
                 prepared = self._prepare_reprobe_locked(session, now)
                 if prepared is None:
                     continue
@@ -2387,7 +2414,12 @@ class SessionManager:
         if now - self._last_console_reap_at >= _HUMAN_PEER_GRACE_S:
             self._last_console_reap_at = now
             with self._lock:
-                bridges = [s.bridge for s in self._sessions.values() if s.bridge is not None]
+                # 交接凍結後 tick 不再回收或授予任何 console／lease（SC-11）。
+                bridges = (
+                    []
+                    if self._handoff_frozen
+                    else [s.bridge for s in self._sessions.values() if s.bridge is not None]
+                )
             if bridges:
                 # 取第一個 bridge 做全域 /proc 掃描（結果對所有 bridge 共用）；
                 # procfs 不可用時回 None，各 bridge 的 reap 自行 fallback 至本身保守掃描（不誤剪）。
@@ -2426,6 +2458,9 @@ class SessionManager:
                         elif not bridge.console_has_external_peer(primary_cid):
                             continue  # procfs 不可用 / vtty 未知時的保守 fallback
                         with self._lock:
+                            # 鎖外判定（snapshot／外部 peer）期間可能已完成交接凍結：鎖內重新檢查，凍結後不授予 lease。
+                            if self._handoff_frozen:
+                                continue
                             session = self._session_for_bridge_locked(bridge)
                             if session is None or session.state not in {"READY", "ATTACHED"}:
                                 continue
@@ -3869,11 +3904,23 @@ class SessionManager:
         for by_id in keys:
             self._spawn_attach(by_id)
 
+    def _revert_pre_marked_attaching_locked(self, by_id: str) -> None:
+        """attach 因交接凍結／停止而早退時，還原鎖內預先標記的 ATTACHING 為 DETACHED（須持有 self._lock）。
+
+        只處理尚未開啟 bridge 的 ATTACHING；否則凍結被撤銷（交接未成立）後該 session 會永久卡在 ATTACHING，
+        `_prepare_reprobe_locked` 不再排它。呼叫端須確認沒有其他 attach 本體正在處理同一 by_id。
+        """
+        session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
+        if session is not None and session.state == "ATTACHING" and session.bridge is None:
+            session.state = "DETACHED"
+
     def _spawn_attach(self, by_id: str) -> None:
         with self._lock:
             if self._shutting_down:
                 import logging
                 logging.getLogger("serialwrap").info("shutdown 中，略過 attach %s", by_id)
+                if by_id not in self._attach_inflight:
+                    self._revert_pre_marked_attaching_locked(by_id)
                 return
             if by_id in self._released_by_ids:
                 return
@@ -4465,6 +4512,16 @@ class SessionManager:
             self._on_detached(session.session_id)
             self._await_drain(job)
 
+    @staticmethod
+    def _handoff_frozen_probe_result_locked(session: SessionRuntime) -> dict[str, Any]:
+        """交接凍結後 probe 的拒絕結果：零 TX、零狀態改寫（須持有 self._lock，且不得修改 session）。"""
+        return {
+            "ok": False,
+            "error_code": "FLUSHED_BY_SHUTDOWN",
+            "reason": "handoff_frozen",
+            "session": session.to_public_dict(),
+        }
+
     def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
         if session.profile.platform == "passthrough":
             current = self._sessions.get(session.session_id)
@@ -4488,6 +4545,9 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            if self._handoff_frozen:
+                # SC-11：交接已凍結，不得再開始 probe（登入世代與 probe 授權亦不得在凍結後產生）。
+                return self._handoff_frozen_probe_result_locked(current)
             if self._boot_quiet_blocks_probe(current):
                 # #162：READY（再確認 pending）走到這裡＝quiet 又被 re-arm——不得以
                 # 合成 PROMPT_UNAVAILABLE 覆寫 READY 的 last_error（名義 READY 的
@@ -4537,6 +4597,10 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # SC-11：probe 於鎖外執行期間可能已完成交接凍結。凍結檢查位於同一把 manager lock 內、
+            # 任何狀態修改（含下方 READY 寫入點與 ATTACHED 錯誤寫入）之前；凍結後 probe 結果不得改寫 session。
+            if self._handoff_frozen:
+                return self._handoff_frozen_probe_result_locked(current)
             # probe 在 lock 外阻塞期間，session 可能被 flash broker 搶進 FLASHING、或被 device
             # handoff 釋放成 RELEASED。此時不得用 probe 結果覆寫狀態，否則會把 FLASHING 打回
             # ATTACHED → flasher 結束時 exit_flashing 見 state≠FLASHING 提早 return、bridge 永久
@@ -4583,6 +4647,7 @@ class SessionManager:
             if self._shutting_down:
                 import logging
                 logging.getLogger("serialwrap").info("shutdown 中，略過 attach %s", by_id)
+                self._revert_pre_marked_attaching_locked(by_id)
                 return
             if by_id in self._draining_by_ids:
                 return

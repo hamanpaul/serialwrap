@@ -953,7 +953,29 @@ class SerialwrapService:
                 return {"ok": False, "error_code": error_code, "busy": rows}
             # 回覆前先凍結背景引擎與 bridge TX（SC-11 排空窗口零 TX）：RPC admission 之外的
             # 重探 tick、重 attach、login、console 行原本不經 admission。
-            self._sessions.freeze_for_handoff()
+            unconverged = self._sessions.freeze_for_handoff()
+            if unconverged:
+                # fail-closed：TX fence 逾時，仍有已通過提交檢查的寫入段在進行中，交接不得成立（不回 ok:true）。
+                # SC-11「忙碌回 SESSION_BUSY＋busy，不凍結、不停止」：撤銷本次新建立的 admission 凍結；
+                # 背景凍結由 freeze_for_handoff 已於內部撤銷。已凍結者（重複呼叫）不在此撤銷。
+                # thaw 僅撤銷本次呼叫新建立的凍結（AdmissionGate 以建立者 token 判定），
+                # 因此與 stop() 等並行建立的凍結不會被誤撤。
+                if token is not None:
+                    self.admission.thaw(token)
+                tx_rows: list[dict[str, Any]] = []
+                for com in unconverged:
+                    session = next((item for item in sessions if item.profile.com == com), None)
+                    public = session.to_public_dict() if session is not None else {}
+                    tx_rows.append({
+                        "com": com,
+                        "state": public.get("state", "UNKNOWN"),
+                        "foreground_busy": bool(public.get("foreground_busy", False)),
+                        "outstanding_commands": int(public.get("outstanding_commands", 0)),
+                        "interactive_session_id": public.get("interactive_session_id"),
+                        "recovering": bool(public.get("recovering", False)),
+                        "ops": ["tx.in_flight"],
+                    })
+                return {"ok": False, "error_code": "SESSION_BUSY", "busy": tx_rows}
         return {"ok": True, "stopping": True, "handoff_token": token}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:

@@ -923,25 +923,40 @@ class UARTBridge:
                     "UART pending write 取消失敗（com=%s）", self.com, exc_info=True
                 )
 
-    def freeze_tx(self) -> None:
+    def freeze_tx(self) -> bool:
         """凍結此後所有來源的新 TX，但不啟動 drain（reader、埠與 console 保持開啟）。
 
         交接停止（SC-11 `daemon.handoff_stop`）成功後由 SessionManager.freeze_for_handoff 呼叫：
         與 `begin_drain` 共用 `_tx_frozen` 閘門，故 `_send_bytes_locked` 與 TX fence 內的提交檢查
         都會拒絕之後的寫入（含背景 probe、login、human raw 與 console 行）。旗標在 state lock 下設定；
-        隨後以短期限等待 TX fence，使回覆前已授權的寫入段多半已結束。逾時不另記 log（見函式內註解）：
-        旗標已設定，之後新開始的寫入段仍一律拒絕，但已在進行中的段無法由此保證已完成。冪等。
+        隨後以短期限等待 TX fence。
+
+        回傳 True：fence 已在期限內取得並釋放，回覆前已通過提交檢查的寫入段皆已結束，之後新開始的段
+        一律被拒絕，故交接成立時 TX 為零可保證。回傳 False：逾時，仍有已通過提交檢查的寫入段在進行中，
+        呼叫端不得回報交接成立，須以 `thaw_tx` 撤銷（SC-11：忙碌不凍結、不停止）。冪等。
         """
         with self._lifecycle_lock:
             with self._state_lock:
                 self._tx_frozen = True
         fence = getattr(self, "_tx_fence_lock", None)
         if fence is None:
-            return
+            return True
         # 逾時不呼叫 logger：daemon logging 基線（contracts/daemon_logging.yaml）未列此訊息，新增 logger
-        # 呼叫需經契約變更與審查（已列為 reviewer 待辦）。逾時時已授權段可能仍在進行，但之後新開始的段一律拒絕。
+        # 呼叫需經契約變更與審查。逾時的結果由回傳值交給呼叫端處理，不以 log 取代。
         if fence.acquire(timeout=_constants.DRAIN_FENCE_ACQUIRE_S):
             fence.release()
+            return True
+        return False
+
+    def thaw_tx(self) -> None:
+        """撤銷尚未成立的 `freeze_tx`（交接因 TX fence 逾時而未成立時）。
+
+        drain 已開始者不解除：`_tx_frozen` 由 `begin_drain` 設定，不得被交接撤銷覆寫。冪等。
+        """
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if not self._drain_started:
+                    self._tx_frozen = False
 
     def _on_drain_invalidate(self) -> None:
         """Drain 開始時使所有已擷取的 deferred 輸入失效。"""

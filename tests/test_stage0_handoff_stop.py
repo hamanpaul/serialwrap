@@ -344,6 +344,69 @@ def test_handoff_recovering_flag_is_busy(tmp_path):
     assert r.get("busy", [{}])[0].get("recovering") is True
 
 
+class _GuardHeldPort(FakePort):
+    """模擬 OS write 進行中：寫入通過 submit_guard（持 TX fence）後阻塞，放行後才落地。"""
+
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self._release = release
+
+    def write(self, payload: bytes, *, cancel: Any = None, submit_guard: Any = None) -> Any:
+        from sw_core.serial_port import TxResult
+
+        data = bytes(payload)
+        with submit_guard() as reason:
+            if reason is not None:
+                return TxResult("not_submitted", 0, len(data), reason)
+            self.entered.set()
+            assert self._release.wait(5.0), "測試未放行進行中的寫入"
+            with self._mu:
+                self.writes.append(data)
+        return TxResult("completed", len(data), len(data))
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_handoff_refused_when_background_write_holds_tx_fence(tmp_path):
+    """(a) 背景寫入已通過提交檢查並停在 TX fence 內：freeze_tx 逾時，交接必須回 ok:false（fail-closed）。
+
+    - 不得回 ok:true；回覆當下 DUT TX 為零（進行中的寫入尚未落地）；
+    - 逾時後撤銷凍結（SC-11：忙碌不凍結、不停止）：daemon 不停止、admission 與 bridge 恢復接受寫入；
+    - 放行後寫入照常落地（交接未成立，不構成窗口違規）；之後交接成功，成功回覆起 TX 維持為零。
+    """
+    release = threading.Event()
+    port = _GuardHeldPort(release)
+    svc = make_service(tmp_path, ready=["COM0"], port=port)
+    bridge = svc._sessions.get_session("COM0").bridge
+    background = threading.Thread(
+        target=lambda: bridge.send_bytes(b"probe\n", source="system:probe"), daemon=True,
+    )
+    background.start()
+    assert port.entered.wait(2.0), "背景寫入未進入 TX fence"
+
+    r = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
+    assert r.get("ok") is False, r
+    assert r.get("error_code") == "SESSION_BUSY", r
+    assert any(row.get("com") == "COM0" and "tx.in_flight" in row.get("ops", []) for row in r.get("busy", [])), r
+    assert port.writes == [], "回覆當下不得有 TX 落地"
+    assert svc.stop_requested is False and svc.admission.frozen is False
+    assert bridge._tx_frozen is False and svc._sessions._handoff_frozen is False
+
+    release.set()
+    background.join(2.0)
+    assert not background.is_alive()
+    assert port.writes == [b"probe\n"], "交接未成立，已通過提交檢查的寫入照常完成"
+
+    ok = _rpc(svc, "daemon.handoff_stop", {"reason": "update"})
+    assert ok.get("ok") is True and ok.get("stopping") is True, ok
+    at_reply = list(port.writes)
+    refused = _rpc(svc, "file.push", {"selector": "COM0", "data_b64": "eA=="})
+    assert (refused.get("error_code"), refused.get("reason")) == ("FLUSHED_BY_SHUTDOWN", "handoff_frozen"), refused
+    assert port.writes == at_reply, "交接成功回覆後不得再有 TX"
+    svc.close_for_test()
+
+
 def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
     """以隔離目錄啟動真實 sw_core.daemon 子行程，等待 Unix socket 出現；回傳 (proc, socket_path)。"""
     isolated = tmp_path / "daemon"
@@ -365,7 +428,11 @@ def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
         (path.parent if key == "SERIALWRAP_TTYMCU_PATH" else path).mkdir(
             parents=True, exist_ok=True
         )
-    socket_path = isolated / "run" / "serialwrapd.sock"
+    repo = Path(__file__).resolve().parents[1]
+    short_run_dir = repo / "target"
+    short_run_dir.mkdir(parents=True, exist_ok=True)
+    socket_path = short_run_dir / f"s-{os.getpid()}-{time.time_ns()}.sock"
+    assert len(os.fsencode(socket_path)) < 107, socket_path
     lock_path = isolated / "run" / "serialwrapd.lock"
     env = os.environ.copy()
     for key in list(env):
@@ -383,7 +450,6 @@ def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
         "XDG_DATA_HOME": str(isolated / "xdg-data"),
         "XDG_RUNTIME_DIR": str(isolated / "xdg-runtime"),
     })
-    repo = Path(__file__).resolve().parents[1]
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "sw_core.daemon",
@@ -406,12 +472,12 @@ def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
             time.sleep(0.02)
         assert socket_path.exists(), "隔離 daemon 未在期限內建立 Unix socket"
     except BaseException:
-        _terminate_daemon(proc)
+        _terminate_daemon(proc, socket_path)
         raise
     return proc, socket_path
 
 
-def _terminate_daemon(proc: subprocess.Popen) -> None:
+def _terminate_daemon(proc: subprocess.Popen, socket_path: Path | None = None) -> None:
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -421,6 +487,8 @@ def _terminate_daemon(proc: subprocess.Popen) -> None:
             proc.wait(timeout=3.0)
     if proc.stderr is not None:
         proc.stderr.close()
+    if socket_path is not None:
+        socket_path.unlink(missing_ok=True)
 
 
 def _rpc_over_socket(socket_path: Path, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -444,7 +512,7 @@ def test_handoff_ok_then_sc11_stop_order(tmp_path):
         assert "version" not in response
         assert proc.wait(timeout=HANDOFF_DRAIN_GRACE_S + 10.0) == 0
     finally:
-        _terminate_daemon(proc)
+        _terminate_daemon(proc, socket_path)
 
 
 @pytest.mark.posix_only
@@ -479,7 +547,7 @@ def test_handoff_drain_window_flushes_mutating_answers_ping_and_exits_bounded(tm
         assert exited_after >= HANDOFF_DRAIN_GRACE_S - 0.5, exited_after
         assert exited_after <= HANDOFF_DRAIN_GRACE_S + 10.0, exited_after
     finally:
-        _terminate_daemon(proc)
+        _terminate_daemon(proc, socket_path)
 
 
 @pytest.mark.core_portable
