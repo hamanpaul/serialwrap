@@ -6,9 +6,13 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 from tools.contracts.catalog import load_catalogs
+
+# repo 規則（tests/test_resource_markers.py）：每個 item 恰一個平台 marker 與資源 marker。
+pytestmark = [pytest.mark.core_portable]
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NEW_SC = {"SC-28": "sc28-console-backend-env", "SC-29": "sc29-com0com-serial-console", "SC-31": "sc31-console-stale-context-rust"}
@@ -19,10 +23,12 @@ def _changes() -> dict[str, dict]:
     return {row["id"]: row for row in doc["changes"]}
 
 
+@pytest.mark.memory_only
 def test_catalog_still_loads() -> None:
     load_catalogs(ROOT)                                     # P0 loader：任一結構錯誤即 CatalogError
 
 
+@pytest.mark.memory_only
 def test_new_sc_rows_follow_p0_schema() -> None:
     rows = _changes()
     for sc, case_id in NEW_SC.items():
@@ -35,18 +41,21 @@ def test_new_sc_rows_follow_p0_schema() -> None:
     assert "windows.serial_console" in rows["SC-29"]["title"] and "OD-01" in rows["SC-29"]["related_decisions"]
 
 
+@pytest.mark.memory_only
 def test_sc30_reserved_for_p7() -> None:
     ids = {i for i in _changes() if i.startswith("SC-")}
     # SC-34／SC-35 由 P1-OC 登記；SC-36 由 P4 Task 19 登記（OD-15）；SC-08 依 OD-14 #3 撤回（編號不重用）
     assert ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36"}) - {"SC-08"}
 
 
+@pytest.mark.memory_only
 def test_p1_rows_not_rewritten() -> None:
     rows = _changes()
     for i in ("BC-02", "SC-13", "SC-15", "SC-16"):
         assert rows[i]["status"] in {"APPROVED", "IMPLEMENTED", "VERIFIED"}, i
 
 
+@pytest.mark.memory_only
 def test_reconciliation_and_architecture_refined() -> None:
     recon = (ROOT / "docs/rust-refactor/plans/spec-reconciliation.md").read_text(encoding="utf-8")
     for token in ("| SC-28 |", "| SC-29 |", "| SC-31 |", "| CON-EVT-01 |", "| CON-LINE-01 |"):
@@ -62,6 +71,7 @@ def test_reconciliation_and_architecture_refined() -> None:
     assert "clear_all_and_bump_owner_gen" not in p8 and "invalidate_human_input" in p8
 
 
+@pytest.mark.memory_only
 def test_resource_limits_slice22_rows() -> None:
     rows = {r["name"]: r for r in yaml.safe_load((ROOT / "contracts/resource_limits.yaml").read_text(encoding="utf-8"))["limits"]}
     expect = {"console_hub_rx_queue": (256, "reject"), "console_hub_ctrl_queue": (64, "reject"),
@@ -72,11 +82,13 @@ def test_resource_limits_slice22_rows() -> None:
     assert {k: (rows[k]["value"], rows[k]["overflow"]) for k in expect} == expect
 
 
+@pytest.mark.memory_only
 def test_conftest_and_harness_isolate_console_backend_env() -> None:
     assert '"SERIALWRAP_CONSOLE_BACKEND"' in (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
     assert '"SERIALWRAP_CONSOLE_BACKEND"' in (ROOT / "tests/contract_blackbox/bb_harness.py").read_text(encoding="utf-8")
 
 
+@pytest.mark.process_rpc
 def test_slice22_case_set_frozen_and_mapped() -> None:
     subprocess.run([sys.executable, str(ROOT / "tests/acceptance/regen_lock.py"), "--check"], check=True)
     lock = set(json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))["sets"]["slice_2.2"])
