@@ -12,7 +12,7 @@
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-21.1
+revision: 2026-10-24.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -3519,4 +3519,363 @@ cases:
   evidence:
   - tests/contract_blackbox/test_bb_daemon_e2e.py
   implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+# --- P6 Slice 2.2 Task 0（07-slice22-console.md）追加：behavior_changes phases 含 P6 的案例、SC-28／SC-29／SC-31 與 Windows Telnet 四案（add-only） ---
+- case_id: bc02-deferred-overflow-clear
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/deferred_bc02.rs::overflow_deletes_whole_entry_then_new_bytes_kept
+  family: L15
+  title: DeferredBuffer 單一 client 超過 262144 bytes 時刪除整個 entry，之後的 bytes 開新 entry 保留
+  contract: BC-02（07 D-07，P1 T09 規則 1）：附加後長度 > 262144 即刪除該 entry（連同本次 bytes）並寫 WARNING；之後同 client 的 bytes 開新 entry 照常保留，無 poison 狀態。
+  invariants: [no_stale_context_replay]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/deferred_bc02.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: bc02-deferred-context-switch-clear
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_bc02.py::test_banner_during_suspend_drops_deferred
+  family: L15
+  title: agent 命令期間出現 boot banner 時 deferred 按鍵整段失效、不回放
+  contract: BC-02（07 D-02）：BootBannerDetected／quiet 重新 arm／reboot／drain Phase 1／release／FlashSyncMatched 之後 input_epoch 遞增，失效前的 deferred 按鍵不得到達 UART。
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_bc02.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: bc02-mailbox-stale-input-not-replayed
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/session_core_console.rs::stale_epoch_input_dropped_and_diagnosed
+  family: L15
+  title: mailbox 內帶舊 input_epoch 的 console 輸入一律丟棄並可診斷
+  contract: BC-02（07 D-02、D-19）：ConsoleInputBytes 帶擷取當下的 input_epoch，不等於現值即丟棄並寫限速 WARNING（reason=stale_epoch），不進 deferred、不產生 HumanTx。
+  invariants: [no_stale_context_replay, zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/session_core_console.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: bc02-normal-replay-53
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke
+  family: L15
+  title: 沒有上下文失效時 suspend／resume 不遺失、不重排任何按鍵（#53）
+  contract: BC-02（07 Review Focus 1）：沒有失效的 suspend／resume 與 soft preempt 不得遺失或重排任何按鍵；agent 命令結束後 deferred 依序回放。
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_bc02.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc13-lease-expiry-tick
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access
+  family: L15
+  title: interactive lease 到期由 1 s tick 主動處理並保留可重複讀的 tombstone
+  contract: SC-13（07 D-08）：tick 到期後不需任何 RPC 存取即還原 stash 與回放；send／status／close 對 tombstone 一律回 INTERACTIVE_EXPIRED，FIFO 16 擠出後才是 INTERACTIVE_NOT_FOUND。
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-13]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_interactive_lease.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc15-console-ring-drop-oldest
+  suite: contract-blackbox
+  source_ref: crates/sw-core/tests/out_ring.rs::drop_oldest_keeps_newest_within_cap
+  family: L15
+  title: 每 console 1 MiB 出向 ring 對慢速 console drop-oldest，不阻塞 UART／WAL
+  contract: SC-15（07 D-05）：Display 合計超過 1048576 bytes 時丟最舊整個 Display 元素（已部分寫出的 front 不丟、不切開 IAC IAC）；Control 不被丟棄。
+  invariants: []
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_pty]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-15]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-core/tests/out_ring.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc16-console-line-reject-log
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_pty.py::test_line_overflow_warning
+  family: L15
+  title: console line 超過 16385 bytes 或被 arbiter 拒絕時整行丟棄並寫 WARNING
+  contract: SC-16（07 D-06）：line editor 緩衝上限 16385 bytes；超過即整行丟棄且不回顯並寫 WARNING；arbiter 拒絕 CMD_TOO_LONG／SESSION_QUEUE_FULL／SESSION_NOT_READY 時寫 WARNING。
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-16]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_pty.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc28-console-backend-env
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_telnet.py::test_greeting_and_attach_shape
+  family: L15
+  title: SERIALWRAP_CONSOLE_BACKEND 選擇 console backend（auto／pty／tcp）
+  contract: SC-28（07 D-11）：auto／空／未知值有 PTY 用 Pty，否則 TcpTelnet；tcp 一律 TcpTelnet；pty 但平台無 PTY 退回 tcp 並寫 WARNING。
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: Rust-only 契約；Linux L1.5 以 SERIALWRAP_CONSOLE_BACKEND 驗證，Windows 原生由 07 Task 12 對應案例承接。
+  capabilities: [posix_pty]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-28]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_telnet.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc31-console-stale-context-rust
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/slice22/test_console_bc02.py::test_input_during_recovery_not_replayed
+  family: L15
+  title: Console 失效上下文與資源上限的 Rust-only 細化
+  contract: SC-31（07 D-13、D-16、D-05、D-18）：無 active epoch 的輸入丟棄並診斷；lease 上下文未還原時不回放該 client；Control 超過 64 KiB 關閉 console；Telnet console 達 32 暫停 accept。
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: Rust-only 契約；Linux L1.5 以 SERIALWRAP_CONSOLE_BACKEND 驗證，Windows 原生由 07 Task 12 對應案例承接。
+  capabilities: [posix_pty]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [deferred_buffer, lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-31]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [tests/contract_blackbox/slice22/test_console_bc02.py, tests/contract_blackbox/slice22/test_interactive_lease.py]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: sc29-com0com-serial-console
+  suite: windows-native
+  source_ref: crates/sw-pal/tests/console_conformance.rs::cap_windows_com__console_com0com_roundtrip
+  family: WIN
+  title: OD-01 選配 com0com Serial console（windows.serial_console）
+  contract: SC-29（07 D-12）：console-side 埠以 share mode 0 開啟並自動排除於裝置列舉；ownership 規則同 TCP accept；虛擬端控制線不轉送 DUT；開啟失敗只寫 WARNING。
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-29]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-test-report/<run_id>.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-raw-owner
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-raw-owner
+  family: WIN
+  title: Windows Telnet console：第一個連線取得 raw ownership 並即時透傳
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：Windows 原生 Telnet console 第一個連線為 raw owner，Python 與 Rust daemon Sequential A/B 一致。'
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-linebuffer
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-linebuffer
+  family: WIN
+  title: Windows Telnet console：第二個連線走 line-buffer（本地回顯與 backspace）
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：第二個 Telnet console 走 line-buffer，本地回顯與 backspace 編輯與 Python 位元組相同。'
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, raw_line_mode]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-suspend-resume
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-suspend-resume
+  family: WIN
+  title: Windows Telnet console：agent 命令期間 suspend raw、結束後 resume
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：agent 命令期間 human raw 暫停，結束後恢復 ownership，不遺失按鍵。'
+  invariants: [no_forbidden_interleave]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, suspend_resume]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+- case_id: win-telnet-deferred
+  suite: windows-native
+  source_ref: scripts/rust/win-blackbox.ps1 -Subset console::win-telnet-deferred
+  family: WIN
+  title: Windows Telnet console：agent 命令期間的按鍵 deferred 後依序回放，失效上下文不回放
+  contract: '07 Task 12（BLOCKED-OWNER 總表 #1）：DeferredBuffer 依 BC-02 回放與失效，Python 與 Rust A/B 一致。'
+  invariants: [no_stale_context_replay]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_telnet, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
   cross_slice_reason: null

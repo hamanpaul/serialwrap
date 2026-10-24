@@ -124,6 +124,7 @@ for _k in (
     "SERIALWRAP_DAEMON_EXE",
     "SERIALWRAP_TEST_KILL_AFTER_SAVE",
     "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE",
+    "SERIALWRAP_CONSOLE_BACKEND",  # SC-28（P6 Task 0，07 D-11）：console backend 選擇 env 不得穿透隔離
 ):
     os.environ.pop(_k, None)
 

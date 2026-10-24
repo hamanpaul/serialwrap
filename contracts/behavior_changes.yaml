@@ -5,7 +5,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 4
+revision: 5
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -837,6 +837,84 @@ changes:
     compatibility_impact: "BC-05 的 Windows remote 範圍延伸到 connect 與 benches；兩者在 Windows 上移除 REMOTE_NOT_SUPPORTED。"
     approval_conditions: "依調和表 PLT-D-08（BC-05 範圍）：延伸到 connect 與 benches，移除兩者在 Windows 上的 REMOTE_NOT_SUPPORTED（擁有者確認 #7，預設涵蓋）。"
     related_decisions: ["OD-14"]
+  - id: "SC-28"
+    kind: "SC"
+    title: "Console backend 選擇 env `SERIALWRAP_CONSOLE_BACKEND`（auto／pty／tcp）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-24"
+      decision_ref: "spec-reconciliation.md §1.1 SC-28"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 5
+    spec_refs: ["§7.2", "§11.5"]
+    reconciliation_refs: ["SC-28"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P6"]
+    case_ids: ["sc28-console-backend-env"]
+    compatibility_impact: "07 D-11：env `SERIALWRAP_CONSOLE_BACKEND` ∈ {`auto`,`pty`,`tcp`}（不分大小寫、strip），只由 `sw_pal::native()` 讀取。`auto`／空／未知值：有 PTY 能力就用 `Pty`，否則 `TcpTelnet`；`tcp`：一律 `TcpTelnet`；`pty` 但平台無 PTY：退回 `TcpTelnet` 並寫 WARNING `SERIALWRAP_CONSOLE_BACKEND=pty 在此平台不支援，改用 tcp`。用途是讓 Linux L1.5 能測 Telnet backend；名稱加入 `tests/conftest.py` 的 pop 清單與 `bb_harness.isolated_env` 的刪除清單。Python 沒有此 env，所以 Linux 上的 Telnet 黑箱只能對 Rust 執行（信心較低）；Windows 上兩版 daemon 原生都是 Telnet，同一批案例做 A/B（Task 12）。"
+    approval_conditions: "依 07 D-11：env 只由 `sw_pal::native()` 讀取，未設定或 `auto` 時行為與 Python 預設相同（有 PTY 用 PTY，否則 Telnet）；`pty` 在無 PTY 平台退回 `tcp` 並寫 WARNING；測試隔離清單（`tests/conftest.py`、`bb_harness.isolated_env`）必須涵蓋此 env。"
+    related_decisions: []
+  - id: "SC-29"
+    kind: "SC"
+    title: "OD-01 選配 com0com Serial console（`windows.serial_console`）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-24"
+      decision_ref: "spec-reconciliation.md §1.1 SC-29"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 5
+    spec_refs: ["§7.3", "§7.4"]
+    reconciliation_refs: ["SC-29"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P6"]
+    case_ids: ["sc29-com0com-serial-console"]
+    compatibility_impact: "07 D-12：`config.yaml` 新鍵 `windows.serial_console`，型別為 mapping：`<DUT 的 by_id（Windows COM 名，如 COM5）>: {console_port: COM40, peer_port: COM41}`（埠名僅為範例；擁有者 host 的 COM20／COM21 已作 DUT-side pair，Console-side pair 須另建不衝突的埠，OD-15）。只在 `caps.com0com_console=true`（Windows）時生效；兩個埠名自動併入 `DeviceSelection.exclude_coms`，永不被列舉成受管 UART（§7.1、§7.4）。session 的 bridge 起來後，`ConsoleHub` 以 `open_com0com_console(console_port)` 開啟（share mode 0），註冊為 `ConsoleTransportKind::Com0com`（`label=serial:<console_port>`、`vtty=<console_port>`、ownership 規則同 TCP accept、`has_external_peer` 恆 true、不被 reaper 回收）。虛擬端的 DTR／RTS／baud 變更不轉送到 DUT UART（不呼叫任何 `set_baud`／modem 控制）。開啟失敗只寫 WARNING，session 照常運作；非 Windows 平台出現此鍵時寫一次 WARNING 後忽略。"
+    approval_conditions: "依 07 D-12 與 OD-01（選配）、OD-08：鍵缺省時行為不變；console-side 埠以 share mode 0 開啟且自動排除於裝置列舉；虛擬端控制線不轉送 DUT；開啟失敗不影響 session；非 Windows 平台只寫一次 WARNING 後忽略。Console-side pair 屬 Spike 1 剩餘項，結果未知前不得預標 PASS（OD-15）。"
+    related_decisions: ["OD-01", "OD-08"]
+  - id: "SC-31"
+    kind: "SC"
+    title: "Console 失效上下文與資源上限的 Rust-only 細化（無 active epoch 丟棄輸入、lease 上下文失效不回放、Control 溢位關閉、Telnet console 上限暫停 accept）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-24"
+      decision_ref: "spec-reconciliation.md §1.1 SC-31"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 5
+    spec_refs: ["§5.3", "§11.3", "§5.4"]
+    reconciliation_refs: ["SC-31", "CON-EVT-01"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P6"]
+    case_ids: ["sc31-console-stale-context-rust"]
+    compatibility_impact: "(a) 07 D-13：沒有 active `conn_epoch`（`DETACHED`／`RECOVERING`／`RELEASED`／drain 中，即 `fence.active_epoch == None`）時收到的 console 輸入一律丟棄，並寫 D-19 的限速 WARNING。Python（含 P1）會把這段輸入留在 kernel PTY buffer，等新 bridge 讀入後以新的 `_owner_gen` 處理，違反 §11.3「Recovery 不得回放失效上下文的輸入」。(b) 07 D-16：lease close 或 expire 時，若 stash 的 human lease 沒有還原（stash 已過期或 peer 不在），`PostClose.replay_allowed=false`：先刪除 stash client 的 deferred entry（WARNING reason `lease_dropped`），再 `resume()`，不回放該 client 的輸入；其他 client 的回放不受影響。(c) 07 D-05：Control 合計上限 `CONSOLE_CONTROL_MAX_BYTES=65536`，超過上限時 hub 關閉該 console（依一般斷線流程送 `ConsoleDisconnected`）並寫 WARNING，不靜默丟棄。(d) 07 D-18：`telnet_consoles_per_session` 32（pause_accept：達上限時 listener 不加入 mux 讀取，超過 backlog 8 由 OS 拒絕；console 數降下即恢復）。"
+    approval_conditions: "依 07 D-13、D-16、D-05 Control 上限與 D-18 accept 上限：失效上下文的輸入一律丟棄並可診斷（§5.3）；lease 上下文未還原時不回放該 client；Control 溢位關閉 console 而非靜默丟棄；Telnet console 達 32 暫停 accept、數量降下即恢復。OD-04 核准的 BC-02 範圍未涵蓋以上情形，故另登記，不併入 BC-02。"
+    related_decisions: ["OD-04"]
   - id: "SC-34"
     kind: "SC"
     title: "session.attach／recover 的 error_code 與 last_error 分離"

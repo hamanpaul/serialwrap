@@ -61,6 +61,9 @@
 | SC-25 | release manifest，以及 doctor 的 `version_pairing` 檢查 | §9.5、OD-13 | 雙邊（Python 僅在 bundle 內偵測到 manifest 時） |
 | SC-26 | Windows event handler：`exec` 走 CreateProcess 加 Job；`shell` 走 `cmd.exe /d /s /c`；timeout 時 TerminateJobObject；env 白名單另加 `SYSTEMROOT`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE` | §5.5 | Rust-only（OD-14 #6 確認） |
 | SC-27 | BC-05 的 Windows remote 範圍延伸到 `connect` 與 `benches`，移除這兩者的 `REMOTE_NOT_SUPPORTED` | BC-05 | 雙邊（OD-14 #7 確認） |
+| SC-28 | env SERIALWRAP_CONSOLE_BACKEND（auto／pty／tcp）選擇 console backend，只由 sw_pal::native() 讀取 | §7.2、§11.5 | Rust-only |
+| SC-29 | OD-01 選配 com0com Serial console：config.yaml windows.serial_console，兩端埠自動排除於裝置列舉 | §7.3、§7.4、OD-01 | Rust-only |
+| SC-31 | Console 失效上下文與資源上限：無 active epoch 時丟棄輸入；lease close／expire 未還原 stash 時不回放該 client；Control 超過 64 KiB 關閉 console；Telnet console 達 32 暫停 accept | §5.3、§11.3、§5.4 | Rust-only |
 | SC-34 | `session.attach`／`session.recover` 的 `error_code` 不再放 `last_error` 值（含 `CREDENTIALS_UNRESOLVED`）：attach 於 command-capable 且 state ∉ {READY, ATTACHING, FLASHING, RECOVERING} 時（含 human lease 分支、bridge 存在的其他分支與同步 probe 之後）回 `{"ok":false,"error_code":"SESSION_NOT_READY","last_error":<str\|null>,"last_error_detail":<str\|null>,"session":…}`（原 `last_error or "NOT_READY"` 一併取代，`NOT_READY` 改 `reachable:false`）；recover 的 REPROBE 未恢復時回 `{"ok":true,"recovering":false,"action":"REPROBE","recovered":false,"session":…,"error_code":"SESSION_NOT_READY","last_error":…,"last_error_detail":…}`，其後照舊可附 `classification`／`recommended_action`／`matched_prompt`（BOOTLOADER 判定改看 `last_error == "BOOTLOADER_STUCK"`）。`error_codes.yaml` 的 `last_error_passthrough` meta 項與 `code_extraction.yaml` 的對應抽取規則移除；`session_last_errors.yaml` 的 `promoted_via` 改指「出現在該方法回應頂層 `last_error` 欄位」 | §9.3、§15.2「不新增為 RPC error_code」、OD-14 #1 | 雙邊（P1-OC T2；Rust P5、P7） |
 | SC-35 | `platform=passthrough` 啟用送命令：attach 不跑 Login FSM、不送 ready_probe、不做 boot quiet gate，bridge 起來即 `ATTACHED`、零 TX；`ATTACHED` 連續 `PASSTHROUGH_READY_QUIET_S = 30` 秒無 RX（`quiet_since = max(進入 ATTACHED, 最後 RX)`，任何 RX 重新起算，TX 不算；1 s tick 判定；drain／flash 臨界／RELEASED 時不升）即自動轉 `READY`，之後依一般 `READY` 流程進 Arbiter（DF-02 照樣適用）；passthrough 不 arm boot-banner quiet、不跑 READY reconfirm。`ATTACHED` 時 `command.submit` 回 `SESSION_NOT_READY`＋`passthrough_ready_in_s`（不再回 `PROFILE_NOT_COMMAND_CAPABLE`）；`file.push`／`file.pull` 對 passthrough 任何狀態回 `PROFILE_NOT_COMMAND_CAPABLE`。line／background 完成條件：有 `completion_regex` → #230 producer 完成；否則 profile `prompt_regex` 符合 `valid_completion_regex`（可編譯、非空、不匹配空串）→ 既有 prompt 完成；否則（如 others-template 的 `.*`）沿用既有等待迴圈後回 `{"ok":false,"error_code":"PROMPT_TIMEOUT","partial":true,"recovery_action":"NONE"}`。passthrough 未命中時不送 CTRL_C／CTRL_D、不轉 `ATTACHED`、不 force recover；reboot 命令不套特例。self-test 永不 TX（READY → `PASSTHROUGH`＋`recommended_action:"none"`；ATTACHED 加 `passthrough_ready_in_s`）；recover 的 REPROBE 不 probe。斷線等 drain 路徑走一般恢復（ATTACHING → ATTACHED → 重新累計 30 s）。`command_capable` 定義不變（flash 偵測候選依賴它）。不新增錯誤碼與 WAL META | §5.3、§5.2.1「核准的例外」、OD-14 #2 | 雙邊（P1-OC T5／T6；Rust P5 核心、P7 登入／Quiet 排除、P8 file.* 與 flash 交互） |
 | SC-36 | Windows 安裝的 com0com 選用元件（OD-15 新增範圍）：release bundle 附 `optional/com0com/`（簽章 driver 3.0.0.0、`LICENSE-GPLv2.txt`、`SOURCE.md` 原始碼取得方式、`PROVENANCE.json`）；manifest `components.com0com{optional:true, default_selected:false, requires_elevation:true, experimental}`；基本安裝維持使用者身分（`%LOCALAPPDATA%`）不需管理員，只有新增的 `setup --with-com0com`／`--remove-com0com` 以 `runas` 啟動 helper 提權；UAC 拒絕或 helper 失敗時基本安裝仍 `ok:true`、`optional_components.com0com.installed:false`＋`reason`；本體移除／回滾不移除 driver；Spike 1 剩餘項在 HVCI 開啟機台通過前 `experimental:true`；不新增錯誤碼 | OD-15 (1)、OD-01、OD-08 | Rust-only（P4 Task 19；P8 整合） |
@@ -236,7 +239,7 @@
 
 | ID | 事實 | 規格 | 裁決 | 理由 | 階段 | 需擁有者 |
 |---|---|---|---|---|---|---|
-| SES-16.1 | DeferredBuffer 截頭留尾；跨上下文時不清 | BC-02 | BC | 加上下文標記（owner_gen） | P1/P6 | no |
+| SES-16.1 | DeferredBuffer 截頭留尾；跨上下文時不清 | BC-02 | BC | 加上下文標記（Python `_owner_gen`＝Rust `input_epoch`，07 D-02） | P1/P6 | no |
 | SES-16.2 | 沒有三態 TX 結果；`n<=0` 時記整段 payload | BC-03、§8.1 | BC＋SPEC SC-07 | — | P1/P5 | no |
 | SES-16.3a | 沒有 drain barrier、receipt、3000 ms timeout | §5.2 | SPEC SC-04 | ADR-06 安全骨架；「release 遇 drain 逾時」的回應依 OD-14 #4 改為新碼 `DRAIN_STALLED`（P1-OC T4） | P1/P1-OC/P5 | **yes #4（已裁決 OD-14）** |
 | SES-16.3b | self-test、recover、reprobe、interactive_open 送 TX 不取前景 token | ADR-06 | KEEP | 單一 writer 保證每次寫入不被切開；命令層級的並行維持基線 | P5 | no |
@@ -287,9 +290,9 @@
 | UIO-12.4-a | RX 先寫 WAL 再分送（順序正確），但非常駐 handle | BC-01 | BC | — | P1/P5 | no |
 | UIO-12.4-b | observer 拿到的 `wal_seq` 不精確 | — | FIX DF-15 | 改用精確值，且仍落在 Python 可能產生的值域內 | P1/P5 | no |
 | UIO-12.4-c | 非 OSError 例外會跳過 fan-out | — | IMPL | — | P5 | no |
-| UIO-12.5 | DeferredBuffer 截頭留尾 | BC-02 | BC | — | P1/P6 | no |
+| UIO-12.5 | DeferredBuffer 截頭留尾 | BC-02 | BC | 加上下文標記（Python `_owner_gen`＝Rust `input_epoch`，07 D-02）；溢位刪除整個 entry（07 D-07） | P1/P6 | no |
 | UIO-12.6 | 沒有 ring queue（丟尾） | §5.4 | SPEC SC-15（Rust-only） | 顯示資料本就允許丟棄 | P6 | no |
-| UIO-12.7 | console PTY 沒有 symlink | §7.1「穩定 symlink」 | KEEP＋DOC | 規格的 symlink 只指 ttyMCU；console 的穩定性靠 PreservedConsoles | P0 | no |
+| UIO-12.7 | console PTY 沒有 symlink | §7.1「穩定 symlink」 | KEEP＋DOC | 規格的 symlink 只指 ttyMCU；console 的穩定性靠 PreservedConsoles；P6 scope 的 stable symlink 依 07 D-01（console PTY 不建 symlink，`vtty` 即 `/dev/pts/N`，穩定性來自每 session 一條 ConsoleHub 跨 `conn_epoch` 保留 console） | P0 | no |
 | UIO-12.8-a | greeting 另含 `DO SGA` | §7.2 | KEEP | 12 bytes 位元組級保留 | P6 | no |
 | UIO-12.8-b | 對所有非 SGA 的 WILL 回 DONT | §7.2 | KEEP | 符合「拒絕入向 Binary」 | P6 | no |
 | UIO-12.8-c | Telnet port 為 ephemeral | — | KEEP | 基線 | P6 | no |
@@ -307,6 +310,9 @@
 | UIO-12.10-e | dead code | — | IMPL | — | — | no |
 | UIO-12.10-f | `mcu.patterns` 不輸出 `timeout_ms` | — | KEEP | 基線 | P8 | no |
 | UIO-12.10-g | 不設 VMIN／VTIME、不做 tcflush | — | KEEP | 基線 | P5 | no |
+| CON-EVT-01 | 規格 §5.1.3 console 事件與 Rust 事件的對照：`ConsoleIdleTimeout` 在 Python 基線不存在；`ConsolePeerGraceExpired`、`InteractiveExpired` 另有對應 | §5.1.3 | KEEP＋DOC | `ConsoleIdleTimeout` 保留為規格事件、Rust 不產生，不新增 console 閒置斷線政策；`ConsolePeerGraceExpired` 是 `ConsoleScan` 處理中 human lease 的 peer-loss grace（3.0 s）判定；`InteractiveExpired` 對應 06 的 `ControlEvent::Tick`／`TimerEvent::LeaseExpiry`（07 D-14） | P6 | no |
+| CON-LINE-01 | line editor 的半行緩衝（第二個 console 尚未送出的編輯行）在 BC-02 失效時不清除 | §11.3 | KEEP＋DOC | 與 Python／P1 相同：半行緩衝不屬 deferred 回放，`ConsoleRecord.line` 不隨 `input_epoch` 失效（07 D-21） | P6 | no |
+| CON-REPLAY-01 | resume／admission flush 在 `_foreground_operation` token 釋放前同步完成，下一操作看不到舊按鍵（`session_manager.py:3699-3703`、`:1104-1120`） | §5.2.6、§11.3 | KEEP＋DOC | Rust 回放走非同步 human lane，以回放保留（`ReplayHold`）＋`replay_auth` 撤銷重現同一區間：hold 存在期間 `foreground_busy()` 為 true，新操作取得 ownership 時撤銷授權，未進 OS 的回放 `ReplayRevoked`、零 TX、放回 deferred 前端（07 D-22） | P6 | no |
 
 ### 2.7 盤點 07（平台與管理面）
 
@@ -490,11 +496,11 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 
 ## 5. 統計
 
-第 2 節共 299 列（ID 不重複），依「裁決」欄的第一個代號歸類：
+第 2 節共 302 列（ID 不重複），依「裁決」欄的第一個代號歸類：
 
 | 裁決 | 列數 |
 |---|---|
-| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 148 |
+| KEEP（保留基線並凍結；含 KEEP＋DOC 等以保留為主者） | 151 |
 | SPEC（依定稿規格變更，SC） | 35 |
 | NEW（規格要求的新功能，SC） | 14 |
 | FIX（缺陷／安全修正，DF） | 26 |
@@ -502,11 +508,13 @@ Rust 依基線逐字承接以上行為。要修正時另開 issue，並登記新
 | DOC（只修文件或勘誤） | 26 |
 | TEST（修測試資產） | 12 |
 | IMPL（內部實作差異） | 19 |
-| **合計** | **299** |
+| **合計** | **302** |
 
-登記項目：SC-01～SC-27 扣除已撤回的 SC-08，加上 OD-14 新增的 SC-34、SC-35（共 28 項；SC-28～SC-33 由 P6～P8 另行登記，OD-15 的 SC-36 由 P4 Task 19 登記）、DF-01～DF-17 與 DF-19（18 項；DF-18 保留給 P7 `08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），已全數由 OD-14 裁決。
+登記項目：SC-01～SC-27 扣除已撤回的 SC-08，加上 OD-14 新增的 SC-34、SC-35（共 28 項；SC-28～SC-33 由 P6～P8 另行登記，OD-15 的 SC-36 由 P4 Task 19 登記；P6 已登記 SC-28、SC-29、SC-31，SC-30 保留給 P7）、DF-01～DF-17 與 DF-19（18 項；DF-18 保留給 P7 `08` §0.5），另有既有核准的 BC-01～05。7 列標為需擁有者確認，對應第 3 節的 7 項（第 1 項含 3 列交叉引用），已全數由 OD-14 裁決。
 
 OD-14 對上表的影響（2026-10-16）：RPC-D-02、ERR-7.2-b、ERR-7.3-1、SES-16.5-02 由 KEEP 改 SPEC（SC-34）；SES-16.4-03 由 KEEP 改 SPEC（SC-35）；RPC-D-05 由 SPEC（SC-08）改 KEEP。上表已依此重算：KEEP 由 152 列減為 148 列、SPEC 由 31 列增為 35 列，合計仍 299 列。
+
+P6 Task 0 對上表的影響（2026-10-24）：§2.6 新增 KEEP＋DOC 三列 CON-EVT-01（07 D-14）、CON-LINE-01（07 D-21）、CON-REPLAY-01（07 D-22），KEEP 由 148 列增為 151 列，合計 302 列。
 
 ## 6. P3 登記：Rust-only 非契約差異（arch §0.7）
 

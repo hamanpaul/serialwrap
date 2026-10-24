@@ -97,6 +97,9 @@ def isolated_env(tmp: Path, **overrides: str | None) -> dict[str, str]:
     for k in list(e.keys()):
         if k.startswith("SERIALWRAP_"):
             del e[k]
+    # SC-28（P6 Task 0，07 D-11）：console backend 選擇 env 明列於刪除清單，前綴規則日後若放寬仍不得穿透
+    for k in ("SERIALWRAP_CONSOLE_BACKEND",):
+        e.pop(k, None)
 
     # 設置 9 個目錄變數
     dirs = {

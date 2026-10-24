@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-21.1",
+  "cases_revision": "2026-10-24.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -187,6 +187,10 @@
       "bb-no-version-warning",
       "bb-recover-release-attach-no-replay",
       "bb-session-reaches-ready",
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "brcm-01-login-flow",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
@@ -293,6 +297,12 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc31-console-stale-context-rust",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
@@ -304,6 +314,10 @@
       "win-task-logon-trigger",
       "win-task-restart-on-failure",
       "win-task-single-instance",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
@@ -361,6 +375,10 @@
       "win-wal-f12-progress"
     ],
     "slice_2.2": [
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
       "f1-cmdid-survives-timeout",
@@ -433,17 +451,31 @@
       "p1-wal-fullrun",
       "p1-wal-reset",
       "rc-01-interactive-mode-switch",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc31-console-stale-context-rust",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
       "win-com-open-exclusive",
       "win-com-txrx-bridge",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
       "win-wal-f12-progress"
     ],
     "slice_2.3": [
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "brcm-01-login-flow",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
@@ -537,17 +569,31 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc31-console-stale-context-rust",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
       "win-com-open-exclusive",
       "win-com-txrx-bridge",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
       "win-wal-f12-progress"
     ],
     "slice_2.4": [
+      "bc02-deferred-context-switch-clear",
+      "bc02-deferred-overflow-clear",
+      "bc02-mailbox-stale-input-not-replayed",
+      "bc02-normal-replay-53",
       "brcm-01-login-flow",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
@@ -646,6 +692,12 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "sc13-lease-expiry-tick",
+      "sc15-console-ring-drop-oldest",
+      "sc16-console-line-reject-log",
+      "sc28-console-backend-env",
+      "sc29-com0com-serial-console",
+      "sc31-console-stale-context-rust",
       "sm-01-attach-to-ready",
       "sm-04-device-unplug",
       "win-com-cancel-close",
@@ -655,6 +707,10 @@
       "win-task-logon-trigger",
       "win-task-restart-on-failure",
       "win-task-single-instance",
+      "win-telnet-deferred",
+      "win-telnet-linebuffer",
+      "win-telnet-raw-owner",
+      "win-telnet-suspend-resume",
       "win-wal-av-reader-handle",
       "win-wal-av-rotate",
       "win-wal-av-unlink",
@@ -804,6 +860,58 @@
       "necessity": "required",
       "daemon_slice": null,
       "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bc02-deferred-context-switch-clear": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "bc02-deferred-overflow-clear": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "bc02-mailbox-stale-input-not-replayed": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "bc02-normal-replay-53": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
       "stage0_required": false
     },
     "brcm-01-login-flow": {
@@ -2183,6 +2291,81 @@
       "cli_stage": "1B",
       "stage0_required": false
     },
+    "sc13-lease-expiry-tick": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc15-console-ring-drop-oldest": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc16-console-line-reject-log": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc28-console-backend-env": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc29-com0com-serial-console": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "sc31-console-stale-context-rust": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
     "sm-01-attach-to-ready": {
       "suite": "func-test",
       "layer": "L1.5",
@@ -2314,6 +2497,54 @@
       "expected": "PASS",
       "necessity": "required",
       "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-deferred": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-linebuffer": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-raw-owner": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "win-telnet-suspend-resume": {
+      "suite": "windows-native",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.2",
       "cli_stage": "1B",
       "stage0_required": false
     },

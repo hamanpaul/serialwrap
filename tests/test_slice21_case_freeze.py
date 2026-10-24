@@ -54,7 +54,9 @@ def test_freeze_matches_lock():
     assert fr["schema_version"] == 1 and fr["slice"] == "2.1" and fr["denominator_set"] == "slice_2.1"
     assert fr["window"] == {"start": fr["frozen_at"], "weeks": 3}
     assert fr["stage2_started_at"] == fr["frozen_at"]
-    assert fr["cases_revision"] == cases_doc["revision"]
+    # P6 Task 0：後續切片以 add-only 追加案例時 cases.yaml revision 會前進（YYYY-MM-DD.N，字串序即時間序）；
+    # 凍結時的 revision 不得晚於現行值。位元組指紋只在 revision 相同時比對（見下方 if）。
+    assert fr["cases_revision"] <= cases_doc["revision"]
     recomputed = _load("regen_lock", "tests/acceptance/regen_lock.py").compute_sets(cases_doc)["slice_2.1"]
     assert fr["required_case_ids"] == recomputed
     if fr["cases_revision"] == lock["cases_revision"]:

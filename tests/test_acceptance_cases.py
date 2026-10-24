@@ -41,7 +41,16 @@ def test_contract_blackbox_cases_match_test_functions():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name.startswith("test_")
     }
-    cases = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
+    all_bb = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
+    # P6 Task 0（07-slice22-console.md）：下游切片以 add-only 登記的 contract-blackbox 案例（implemented_by 為該切片計畫）
+    # 不屬 Stage 1A daemon black-box；Stage 1A 案例仍須與 test_bb_daemon_e2e.py 一一對應，切片案例另驗來源路徑。
+    cases = [c for c in all_bb if c.get("implemented_by") == "04-stage1a-rust-cli.md"]
+    later = [c for c in all_bb if c.get("implemented_by") != "04-stage1a-rust-cli.md"]
+    for c in later:
+        assert str(c.get("implemented_by", "")).startswith(("07-slice22-console.md", "08-slice23", "09-slice24")), c["case_id"]
+        assert str(c["source_ref"]).startswith(("tests/contract_blackbox/", "crates/")), c["case_id"]
+        assert "::" in c["source_ref"], c["case_id"]
+    assert len({c["source_ref"] for c in later}) == len(later), "切片 contract-blackbox source_ref 不得重複"
     expected_refs = {
         f"tests/contract_blackbox/test_bb_daemon_e2e.py::{name}" for name in names
     }

@@ -1,26 +1,26 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-21.1",
-  "total": 133,
+  "cases_revision": "2026-10-24.1",
+  "total": 147,
   "by_suite": {
-    "contract-blackbox": 12,
+    "contract-blackbox": 21,
     "func-test": 13,
     "l15-scenario": 15,
     "manual-procedure": 1,
     "realhw": 37,
     "regression": 42,
-    "windows-native": 13
+    "windows-native": 18
   },
   "by_layer": {
-    "L1": 13,
-    "L1.5": 34,
+    "L1": 16,
+    "L1.5": 45,
     "L2": 43,
     "L3": 42,
     "manual": 1
   },
   "by_slice": {
     "2.1": 49,
-    "2.2": 32,
+    "2.2": 46,
     "2.3": 27,
     "2.4": 11,
     "None": 14

@@ -23,6 +23,16 @@ limits:
   - {name: tx_ledger_unresolved_gaps, value: 256, unit: gaps, overflow: merge_oldest, source: "arch §5.7／§5.10：合併為 GapOverflow{gaps, bytes, first_op, last_op}（R1-F8）"}
   - {name: tx_op_wal_gaps, value: 16, unit: gaps, overflow: merge_oldest, source: "arch §5.7／§5.10：單一 op 缺口合併（R1-F8）"}
   - {name: tx_settle_queue, value: 256, unit: entries, overflow: retain_entry, source: "arch §5.10：try_send 滿時該 op 留在帳本，settle_dropped 計數（R1-F8）"}
+  # Slice 2.2（P6 Task 0，計畫 07 D-18）：console／human TX 有界資源。
+  - {name: console_hub_rx_queue, value: 256, unit: chunks, overflow: reject, source: "07 D-18：reader→hub 顯示佇列；滿載計數＋WARNING"}
+  - {name: console_hub_ctrl_queue, value: 64, unit: events, overflow: reject, source: "07 D-18：actor→hub 控制佇列；Display 丟棄，Close／CloseAll／Shutdown 走 critical 旁路"}
+  - {name: console_hub_pending_events, value: 64, unit: events, overflow: block_sender, source: "07 D-17／D-18：hub→mailbox 暫存；滿載暫停讀取 console io"}
+  - {name: console_out_ring_display_bytes, value: 1048576, unit: bytes, overflow: drop_oldest, source: "07 D-05／D-18：每 console 出向 ring Display（SC-15）"}
+  - {name: console_control_max_bytes, value: 65536, unit: bytes, overflow: close_connection, source: "07 D-05／D-18：Telnet 協商回覆與 greeting 累積上限；超過即關閉該 console（SC-31(c)）"}
+  - {name: console_line_buffer_bytes, value: 16385, unit: bytes, overflow: reject, source: "07 D-06／D-18：line editor 緩衝上限（SC-16）"}
+  - {name: human_tx_backlog_bytes, value: 262144, unit: bytes, overflow: clear_all, source: "07 D-15／D-18：human TX lane backlog；溢位清空該 client 並 WARNING"}
+  - {name: telnet_consoles_per_session, value: 32, unit: consoles, overflow: pause_accept, source: "07 D-18：達上限時 listener 不加入 mux 讀取（SC-31(d)）"}
+  - {name: com0com_reader_channel, value: 64, unit: events, overflow: block_sender, source: "07 D-04／D-18：com0com reader→mux 有界 channel"}
 
 # §5.3 事件延遲契約：開工前凍結。owner 與 reviewed_by 必須不同。
 event_latency:
