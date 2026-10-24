@@ -17,7 +17,10 @@ import pytest
 from bb_harness import cli_prefix
 from bb_l15 import (
     BridgeTarget,
+    HolderObserver,
+    HolderObservationUnavailable,
     RaisingThread,
+    assert_holder_handoff,
     current_release_path,
     control_marks,
     daemon_pid,
@@ -26,6 +29,7 @@ from bb_l15 import (
     finish_test_rig,
     json_stdout,
     prepare_profile,
+    replay_holder_edges,
     rx_bytes,
     rpc,
     run_cli,
@@ -349,28 +353,29 @@ def test_restart_no_stale_console_replay(tmp_path: Path, env: dict[str, str]) ->
         assert tx_bytes(bridge.evidence_dir) == tx_before_partial
         assert stale_marker.encode() not in rx_bytes(bridge.evidence_dir)
 
+        # 只追蹤本次 restart 的舊／新 daemon PID；不掃描其他系統行程或正式 daemon。
         old_pid = daemon_pid(env)
-        wait_holder(bridge.slave_path, old_pid, present=True)
-        bridge.mark("opened", old_pid)
-        restarted = run_cli(cli, ["daemon", "restart"], env, timeout_s=120.0)
-        assert restarted.returncode == 0, restarted.stdout + restarted.stderr
-        new_pid = daemon_pid(env)
-        assert new_pid != old_pid
-        wait_holder(bridge.slave_path, old_pid, present=False)
-        bridge.mark("closed", old_pid)
-        wait_holder(bridge.slave_path, new_pid, present=True)
-        bridge.mark("opened", new_pid)
-        wait_session(env)
+        observer = HolderObserver(bridge.slave_path, pids=[old_pid])
+        try:
+            with observer:
+                wait_holder(bridge.slave_path, old_pid, present=True)
+                restarted = run_cli(cli, ["daemon", "restart"], env, timeout_s=120.0)
+                assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+                new_pid = daemon_pid(env)
+                assert new_pid != old_pid
+                observer.watch_pid(new_pid)
+                wait_holder(bridge.slave_path, old_pid, present=False)
+                wait_holder(bridge.slave_path, new_pid, present=True)
+                wait_session(env)
+        except HolderObservationUnavailable as exc:
+            pytest.skip(f"候選 PID fd 不可讀，未形成通過證據（evidence-insufficient）：{exc}")
+        replay_holder_edges(bridge, observer.timeline, (old_pid, new_pid))
+        assert_holder_handoff(observer.timeline, old_pid, new_pid)
         tx_after_restart = tx_bytes(bridge.evidence_dir)
         time.sleep(0.25)
         assert tx_bytes(bridge.evidence_dir) == tx_after_restart
         assert stale_marker.encode() not in tx_bytes(bridge.evidence_dir)
         assert stale_marker.encode() not in rx_bytes(bridge.evidence_dir)
-
-        marks = control_marks(bridge.evidence_dir)
-        old_closed = next(i for i, row in enumerate(marks) if row.get("params", {}).get("label") == "closed" and row.get("params", {}).get("op_id") == str(old_pid))
-        new_opened = next(i for i, row in enumerate(marks) if row.get("params", {}).get("label") == "opened" and row.get("params", {}).get("op_id") == str(new_pid))
-        assert old_closed < new_opened, marks
     finally:
         for fd in console_fds:
             try:
@@ -390,36 +395,31 @@ def test_restart_no_stale_console_replay(tmp_path: Path, env: dict[str, str]) ->
 @pytest.mark.rust_only
 @pytest.mark.pidns_rig
 def test_restart_no_reopen_before_handoff(tmp_path: Path, env: dict[str, str]) -> None:
-    """P2 control marks 配對每個 daemon PID，並證明舊 tty 關閉後新 daemon 才開啟。"""
+    """restart 期間於背景取樣 tty holder：新舊 holder 不得同時存在，且舊 holder 釋放不晚於新 holder 開啟。
+
+    取樣自 restart 操作開始前即進行（判準見 `bb_l15.assert_holder_handoff`），不再以操作後的探測順序判定，
+    故新舊 holder 若曾重疊，本案例必須為 FAIL。
+    """
     prepare_profile(env)
     bridge, daemon = _start_test_rig(tmp_path, env)
     cli = Path(cli_prefix()[-1])
     try:
         old_pid = daemon_pid(env)
-        wait_holder(bridge.slave_path, old_pid, present=True)
-        bridge.mark("opened", old_pid)
-
-        restarted = run_cli(cli, ["daemon", "restart"], env, timeout_s=120.0)
-        assert restarted.returncode == 0, restarted.stdout + restarted.stderr
-        new_pid = daemon_pid(env)
-        assert new_pid != old_pid
-        wait_holder(bridge.slave_path, old_pid, present=False)
-        bridge.mark("closed", old_pid)
-        wait_holder(bridge.slave_path, new_pid, present=True)
-        bridge.mark("opened", new_pid)
-
-        marks = control_marks(bridge.evidence_dir)
-        old_open = next((i for i, row in enumerate(marks)
-                         if row.get("params", {}).get("label") == "opened"
-                         and row.get("params", {}).get("op_id") == str(old_pid)), None)
-        old_close = next((i for i, row in enumerate(marks)
-                          if row.get("params", {}).get("label") == "closed"
-                          and row.get("params", {}).get("op_id") == str(old_pid)), None)
-        new_open = next((i for i, row in enumerate(marks)
-                         if row.get("params", {}).get("label") == "opened"
-                         and row.get("params", {}).get("op_id") == str(new_pid)), None)
-        assert old_open is not None and old_close is not None and new_open is not None, marks
-        assert old_open < old_close < new_open, marks
-        assert wait_session(env)["state"] == "READY"
+        observer = HolderObserver(bridge.slave_path, pids=[old_pid])
+        try:
+            with observer:
+                wait_holder(bridge.slave_path, old_pid, present=True)
+                restarted = run_cli(cli, ["daemon", "restart"], env, timeout_s=120.0)
+                assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+                new_pid = daemon_pid(env)
+                assert new_pid != old_pid
+                observer.watch_pid(new_pid)
+                wait_holder(bridge.slave_path, old_pid, present=False)
+                wait_holder(bridge.slave_path, new_pid, present=True)
+                assert wait_session(env)["state"] == "READY"
+        except HolderObservationUnavailable as exc:
+            pytest.skip(f"候選 PID fd 不可讀，未形成通過證據（evidence-insufficient）：{exc}")
+        replay_holder_edges(bridge, observer.timeline, (old_pid, new_pid))
+        assert_holder_handoff(observer.timeline, old_pid, new_pid)
     finally:
         _finish_test_rig(bridge, daemon, cli, env)

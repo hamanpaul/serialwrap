@@ -11,12 +11,13 @@ import select
 import shlex
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -230,6 +231,8 @@ def run_nodeid_in_pidns(nodeid: str, rootpath: Path) -> tuple[str, str]:
 
     outcome：``passed``／``skipped``／``failed``，或能力不足時 ``unavailable``（呼叫端 skip，絕不視為 PASS）。
     子行程以 junit 回報結果，避免 skip 被誤判為通過；SW_RESOURCE_REPORT 不傳入子行程，不覆寫外層 L1 報告。
+    子行程 exit status 非零一律回 ``failed``（即使 junit 僅有一筆 passed；例如 conftest live guard 以
+    ``session.exitstatus=1`` 回報的失敗），診斷訊息保留 exit code 與 stderr／stdout 尾段。
     """
     import xml.etree.ElementTree as ElementTree
 
@@ -252,10 +255,11 @@ def run_nodeid_in_pidns(nodeid: str, rootpath: Path) -> tuple[str, str]:
         # namespace 內的 init（即子 pytest）忽略未註冊的 SIGTERM，且 unshare 本身被殺時 init 會殘留；
         # 故以獨立 session 啟動，逾時時對整個行程群組 SIGKILL，確保 namespace 內的 daemon／bridge 一併回收。
         out_file = work / "child.out"
-        with out_file.open("wb") as out:
+        err_file = work / "child.err"
+        with out_file.open("wb") as out, err_file.open("wb") as err:
             proc = subprocess.Popen(
                 cmd, cwd=str(rootpath), env=env, stdin=subprocess.DEVNULL,
-                stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                stdout=out, stderr=err, start_new_session=True,
             )
             record_wrapper_pid(proc.pid, nodeid, outer)
             try:
@@ -267,11 +271,16 @@ def run_nodeid_in_pidns(nodeid: str, rootpath: Path) -> tuple[str, str]:
                     pass
                 proc.wait(timeout=30)
                 return "failed", f"namespace 子行程逾時（{PIDNS_CHILD_TIMEOUT_S:.0f} s）：{nodeid}"
-        text = out_file.read_text(encoding="utf-8", errors="replace")
-        tail = text[-4000:]
-        del returncode
+        tail = out_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+        err_tail = err_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+        # 子行程 exit status 為權威：非零一律 failed，不得因 junit 單筆 passed 而放行。
+        if returncode != 0:
+            return "failed", (
+                f"namespace 子行程以非零 exit code 結束（rc={returncode}）：{nodeid}\n"
+                f"--- stderr 尾段 ---\n{err_tail}\n--- stdout 尾段 ---\n{tail}"
+            )
         if not junit.is_file():
-            return "failed", f"namespace 子行程未產生 junit（rc={proc.returncode}）：\n{tail}"
+            return "failed", f"namespace 子行程未產生 junit（rc={returncode}）：\n--- stderr 尾段 ---\n{err_tail}\n--- stdout 尾段 ---\n{tail}"
         root = ElementTree.parse(junit).getroot()
         cases = list(root.iter("testcase"))
         if len(cases) != 1:
@@ -756,6 +765,231 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
         row for row in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
         if row.get("action") == "mark" and row.get("phase") == "completed"
     ]
+
+
+# ── 持有者取樣觀測器（restart 交接判準）────────────────────────────────────────
+# 舊判準於操作「完成之後」才以 wait_holder 逐一探測，並依測試自身的呼叫順序寫入 closed／opened 標記；
+# 因此即使新舊 holder 曾經重疊，`old_close < new_open` 也必然成立（假綠）。
+# 本區段改於操作開始前即於背景以固定週期取樣 tty 的持有者集合，記錄每個 pid 的 opened／closed 邊緣，
+# 並以 (st_dev, st_ino) 比對 tty 身分（與 sw_core `same_tty` 同一判準；測試端不得 import sw_core，故於此重述）。
+# 限制：取樣為 polling，短於取樣週期的瞬時重疊無法被觀測；判準為「已取樣到的重疊不得存在」，不宣稱完備。
+
+HOLDER_SAMPLE_PERIOD_S = 0.005
+_DEVPTS_MAJORS = frozenset(range(136, 144))
+
+
+def _same_tty(fd_st: os.stat_result, tty_st: os.stat_result) -> bool:
+    """fd 所指 inode 與 tty 是否為同一裝置。主判準為 (st_dev, st_ino)；字串與 st_rdev 皆不足為憑。
+
+    非 devpts 的字元裝置另允許 rdev 相同之別名（同 sw_core `same_tty`）。
+    """
+    if (fd_st.st_dev, fd_st.st_ino) == (tty_st.st_dev, tty_st.st_ino):
+        return True
+    if not (stat.S_ISCHR(fd_st.st_mode) and stat.S_ISCHR(tty_st.st_mode)):
+        return False
+    rdev = tty_st.st_rdev
+    if not rdev or fd_st.st_rdev != rdev:
+        return False
+    return os.major(rdev) not in _DEVPTS_MAJORS
+
+
+def observe_holders(tty_st: os.stat_result, *, pids: Iterable[int]) -> list[int]:
+    """只掃描呼叫者明確指定的候選行程，回傳持有 `tty_st` 的 pid（已排序）。
+
+    候選集合須由測試 rig 的行程 handle 提供，避免掃描無關系統行程或正式 daemon。掃描途中消失的行程／fd 略過；
+    無權讀取或其他觀測錯誤向上傳遞，避免把未知 holder 當成空集合。
+    """
+    result: list[int] = []
+    supplied = tuple(pids)
+    if not supplied or any(type(pid) is not int or pid <= 0 for pid in supplied):
+        raise ValueError("持有者觀測必須提供非空、正整數 PID 集合")
+    candidates = sorted(set(supplied))
+    for pid in candidates:
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        for fd in fds:
+            try:
+                fd_st = os.stat(f"{fd_dir}/{fd}")
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if _same_tty(fd_st, tty_st):
+                result.append(pid)
+                break
+    return sorted(result)
+
+
+@dataclass(frozen=True)
+class HolderEdge:
+    kind: str     # "opened"（本次取樣首次出現）或 "closed"（本次取樣首次消失）
+    pid: int
+    sample: int   # 取樣序號；排序依據（不採牆上時鐘）
+    t_ns: int     # 該取樣的 time.monotonic_ns()，僅供診斷
+
+
+@dataclass
+class HolderTimeline:
+    """背景取樣的結果：每筆為 (time.monotonic_ns(), 當時持有 tty 的 pid 集合)。"""
+
+    samples: list[tuple[int, frozenset[int]]]
+
+    def edges(self, pid: int) -> list[HolderEdge]:
+        out: list[HolderEdge] = []
+        previous = False
+        for index, (t_ns, holders) in enumerate(self.samples):
+            current = pid in holders
+            if current and not previous:
+                out.append(HolderEdge("opened", pid, index, t_ns))
+            elif previous and not current:
+                out.append(HolderEdge("closed", pid, index, t_ns))
+            previous = current
+        return out
+
+    def overlap_samples(self, first: int, second: int) -> list[int]:
+        """兩個 pid 於同一取樣中同時持有 tty 的取樣序號。"""
+        return [index for index, (_, holders) in enumerate(self.samples) if first in holders and second in holders]
+
+
+class HolderObservationUnavailable(PermissionError):
+    """候選 PID 的 fd 不可讀；此觀測不能計為交接通過。"""
+
+
+def assert_holder_handoff(timeline: HolderTimeline, old_pid: int, new_pid: int) -> None:
+    """斷言 restart 交接：全部取樣中新舊 holder 不得同時存在；舊 holder 最後一次 closed 不晚於新 holder 首次 opened。
+
+    判準只採用取樣時間線（操作期間取樣），不採用事後探測的呼叫順序。取樣起點須已見舊 holder，否則無法證明
+    舊 holder 確實曾持有 tty（取樣起點缺口）。
+    """
+    assert old_pid != new_pid, "新舊 pid 相同，無法判定交接"
+    assert timeline.samples, "持有者觀測器無任何取樣"
+    assert old_pid in timeline.samples[0][1], f"取樣起點未見舊 holder（取樣起點缺口）：{old_pid}"
+    overlap = timeline.overlap_samples(old_pid, new_pid)
+    assert not overlap, f"新舊 holder 同時持有 tty（取樣序號 {overlap[:5]}）：old={old_pid} new={new_pid}"
+    old_closes = [edge for edge in timeline.edges(old_pid) if edge.kind == "closed"]
+    assert old_closes, f"舊 holder 於取樣結束前未釋放 tty：{old_pid}"
+    new_opens = [edge for edge in timeline.edges(new_pid) if edge.kind == "opened"]
+    assert new_opens, f"取樣中未見新 holder 開啟 tty：{new_pid}"
+    assert old_closes[-1].sample <= new_opens[0].sample, (
+        f"新 holder 早於舊 holder 釋放前開啟：old_close={old_closes[-1]} new_open={new_opens[0]}"
+    )
+    assert new_pid in timeline.samples[-1][1], f"取樣結束時新 holder 未持有 tty：{new_pid}"
+
+
+class HolderObserver:
+    """於背景以固定週期取樣指定 PID 的 tty 持有狀態；`stop()` 後以 `timeline` 取得結果。
+
+    `start()` 會等到首次取樣完成才返回，故時間線起點必定反映呼叫者開始操作前所見的狀態。
+    候選 PID 由呼叫者以 `watch_pid()` 增補；tty 身分於 `start()` 時取得。背景例外於 `start()`／`stop()` 重新拋出。
+    取樣為 polling（單次掃描時間依指定 PID 的 fd 數量與負載而定）；
+    短於一次掃描週期的瞬時重疊無法被觀測。
+    """
+
+    def __init__(
+        self,
+        slave_path: str,
+        *,
+        pids: Iterable[int],
+        period_s: float = HOLDER_SAMPLE_PERIOD_S,
+    ) -> None:
+        self._slave_path = slave_path
+        self._period_s = period_s
+        supplied = tuple(pids)
+        if not supplied or any(type(pid) is not int or pid <= 0 for pid in supplied):
+            raise ValueError("持有者觀測必須提供非空、正整數 PID 集合")
+        self._pids = set(supplied)
+        self._pid_lock = threading.Lock()
+        self._tty_st: os.stat_result | None = None
+        self._samples: list[tuple[int, frozenset[int]]] = []
+        self._stop_event = threading.Event()
+        self._first_sample = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+        self.timeline: HolderTimeline | None = None
+
+    def watch_pid(self, pid: int) -> None:
+        """將新啟動且屬本次交接的行程加入後續取樣。"""
+        if not isinstance(pid, int) or pid <= 0:
+            raise ValueError("持有者觀測 PID 必須為正整數")
+        with self._pid_lock:
+            self._pids.add(pid)
+
+    def _candidate_pids(self) -> tuple[int, ...]:
+        with self._pid_lock:
+            return tuple(sorted(self._pids))
+
+    def start(self) -> "HolderObserver":
+        self._tty_st = os.stat(self._slave_path)
+        self._thread = threading.Thread(target=self._run, name="holder-observer", daemon=True)
+        self._thread.start()
+        # 等待首次取樣：否則呼叫者可能在背景尚未取樣前就開始操作，使時間線起點缺漏舊 holder。
+        if not self._first_sample.wait(timeout=30.0):
+            self._stop_event.set()
+            raise RuntimeError("持有者觀測器未於 30 秒內完成首次取樣")
+        if self._error is not None:
+            if isinstance(self._error, HolderObservationUnavailable):
+                raise self._error
+            raise RuntimeError(f"持有者觀測器啟動失敗：{self._error!r}") from self._error
+        return self
+
+    def _run(self) -> None:
+        try:
+            assert self._tty_st is not None
+            while True:
+                holders = frozenset(observe_holders(self._tty_st, pids=self._candidate_pids()))
+                self._samples.append((time.monotonic_ns(), holders))
+                self._first_sample.set()
+                # 停止後仍會再取樣一次，使時間線終點反映操作結束時的實際狀態。
+                if self._stop_event.is_set():
+                    return
+                self._stop_event.wait(self._period_s)
+        except PermissionError as exc:
+            unavailable = HolderObservationUnavailable(
+                f"候選 PID fd 權限不足，持有狀態未知：{exc}"
+            )
+            unavailable.__cause__ = exc
+            self._error = unavailable
+        except BaseException as exc:  # noqa: BLE001 - 於 start()／stop() 端重新拋出
+            self._error = exc
+        finally:
+            self._first_sample.set()
+
+    def stop(self) -> HolderTimeline:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30.0)
+            if self._thread.is_alive():
+                raise RuntimeError("持有者觀測器未於 30 秒內結束")
+        if self._error is not None:
+            if isinstance(self._error, HolderObservationUnavailable):
+                raise self._error
+            raise RuntimeError(f"持有者觀測器失敗：{self._error!r}") from self._error
+        self.timeline = HolderTimeline(list(self._samples))
+        return self.timeline
+
+    def __enter__(self) -> "HolderObserver":
+        return self.start()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            self.stop()
+        except BaseException as stop_exc:
+            if exc_type is None:
+                raise
+            # 操作本身已失敗時保留原始例外，觀測器錯誤僅附註。
+            exc.add_note(f"持有者觀測器亦失敗：{stop_exc!r}")
+
+
+def replay_holder_edges(bridge: "BridgeTarget", timeline: HolderTimeline, pids: Iterable[int]) -> None:
+    """將觀測器邊緣依取樣序回放為 bridge `opened`／`closed` 標記，僅供 control.ndjson 留存。
+
+    判準不採用此處的標記順序或時間；同一取樣內 closed 先於 opened。
+    """
+    wanted = list(pids)
+    edges = [edge for pid in wanted for edge in timeline.edges(pid)]
+    for edge in sorted(edges, key=lambda e: (e.sample, 0 if e.kind == "closed" else 1)):
+        bridge.mark(edge.kind, edge.pid)
 
 
 class RaisingThread(threading.Thread):
