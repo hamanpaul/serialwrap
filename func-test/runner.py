@@ -301,6 +301,20 @@ def build_summary_report(
     }
 
 
+# 未解析樣板的形式：裸 {var} 或 {var.field}（前面不得緊接 $），以及誤加 $ 前綴的點號形式 ${var.field}。
+# 不匹配 ${NAME}（NAME 為不含點號的識別字，如 DUT 端 ${HOME}、${A:-b}），那是字面字串、須原樣送出，不是樣板；
+# 點號不是合法 shell 識別字，因此 ${var.field} 必為 harness 樣板，仍須 fail-closed。
+_UNRESOLVED_TEMPLATE_RE = re.compile(r"(?<!\$)\{[a-zA-Z0-9_.]+\}|\$\{[a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]*\}")
+# ${NAME}（不含點號）僅在 NAME 為本案例宣告的 save_as 名稱時仍視為未解析樣板（審查 sol 7：避免未就緒變數被靜默當字面字串送出）。
+_SHELL_BRACE_NAME_RE = re.compile(r"\$\{([a-zA-Z0-9_]+)\}")
+
+
+def _declared_save_as_names(tc: Any) -> frozenset[str]:
+    """案例宣告的全部 save_as 名稱（``_SHELL_BRACE_NAME_RE`` 命中時的樣板判定依據）。"""
+    steps = getattr(tc, "steps", None) or []
+    return frozenset(str(step["save_as"]) for step in steps if isinstance(step, dict) and step.get("save_as"))
+
+
 class TestRunner:
     """執行單一 TestCase 的引擎。"""
 
@@ -1212,12 +1226,15 @@ class TestRunner:
 
         原本未解析的樣板會被字面字串送進 CLI／wait，導致錯誤的 cmd_id 或 argv 被當成真實失敗，掩蓋變數未就緒的真因。
         此處改為 StepError，並附上對應 save_as 變數的實際 CLI 回應，方便判讀。
+        DUT 端 shell 參數展開（如 ``${HOME}``）不視為樣板，見 ``_UNRESOLVED_TEMPLATE_RE``。
         """
         leftovers: list[str] = []
+        declared = _declared_save_as_names(getattr(self, "tc", None))
 
         def _scan(item: Any) -> None:
             if isinstance(item, str):
-                leftovers.extend(m.group(0) for m in re.finditer(r"\{([a-zA-Z0-9_.]+)\}", item))
+                leftovers.extend(m.group(0) for m in _UNRESOLVED_TEMPLATE_RE.finditer(item))
+                leftovers.extend(m.group(0) for m in _SHELL_BRACE_NAME_RE.finditer(item) if m.group(1) in declared)
             elif isinstance(item, list):
                 for entry in item:
                     _scan(entry)
@@ -1228,7 +1245,7 @@ class TestRunner:
         _scan(value)
         if not leftovers:
             return
-        roots = sorted({token.strip("{}").split(".")[0] for token in leftovers})
+        roots = sorted({token.lstrip("$").strip("{}").split(".")[0] for token in leftovers})
         context = {root: self.variables.get(root) for root in roots}
         raise StepError(
             f"步驟 {idx}: {what} 含未解析的樣板 {leftovers}；對應變數的實際 CLI 回應：{context}"
@@ -1259,7 +1276,7 @@ class TestRunner:
                     else:
                         return m.group(0)
                 return str(current) if current is not None else m.group(0)
-            return re.sub(r"\{([a-zA-Z0-9_.]+)\}", _replace, value)
+            return re.sub(r"(?<!\$)\{([a-zA-Z0-9_.]+)\}", _replace, value)
         if isinstance(value, list):
             return [self._expand(v) for v in value]
         if isinstance(value, dict):

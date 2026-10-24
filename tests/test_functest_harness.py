@@ -538,6 +538,76 @@ def test_unresolved_template_fails_closed_with_variable_context():
     )
 
 
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cmd", "submit", "--cmd", "echo ${HOME}"],
+        ["cmd", "submit", "--cmd", "echo $HOME"],
+        ["cmd", "submit", "--cmd", "echo ${A:-b}"],
+    ],
+)
+def test_shell_dollar_brace_forms_are_not_unresolved_templates(argv):
+    """DUT 端 shell 參數展開（${HOME}、$HOME、${A:-b}）是字面字串，不是未解析的 harness 樣板，不得被 _require_resolved 提前拒絕。"""
+    import runner
+    from types import SimpleNamespace
+
+    runner.TestRunner._require_resolved(SimpleNamespace(variables={}), argv, 3, "cli argv")
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["cmd", "status", "--cmd-id", "{after_cmd.cmd_id}"],
+        ["cmd", "status", "--cmd-id", "${after_cmd.cmd_id}"],
+        ["cmd", "status", "--cmd-id", "{after_cmd}"],
+        ["cmd", "submit", "--cmd", "echo ${HOME}", "--x", "{after_cmd.cmd_id}"],
+        "{after_cmd.cmd_id}",
+    ],
+)
+def test_unresolved_harness_template_still_fails_closed_next_to_shell_forms(value):
+    """修正 ${HOME} 誤判後，未解析的 harness 樣板（含誤加 $ 前綴的點號形式）仍須 StepError；錯誤訊息不得把合法的 shell 形式列為樣板。"""
+    import runner
+    from types import SimpleNamespace
+
+    with pytest.raises(runner.StepError, match="after_cmd") as excinfo:
+        runner.TestRunner._require_resolved(SimpleNamespace(variables={}), value, 7, "cli argv")
+    assert "${HOME}" not in str(excinfo.value)
+
+
+@pytest.mark.memory_only
+def test_shell_brace_name_matching_declared_save_as_stays_unresolved():
+    """審查 sol 7：${NAME} 若 NAME 為本案例宣告的 save_as，仍是未解析樣板（fail-closed），不得當字面字串送出。"""
+    import runner
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(
+        variables={"after_cmd": {"ok": False, "error_code": "SESSION_NOT_READY"}},
+        tc=SimpleNamespace(steps=[{"save_as": "after_cmd"}]),
+    )
+    with pytest.raises(runner.StepError, match="after_cmd"):
+        runner.TestRunner._require_resolved(fake, ["cmd", "submit", "--cmd", "echo ${after_cmd}"], 3, "cli argv")
+    # 未宣告為 save_as 的 ${NAME}（DUT 端 shell 展開）仍為字面字串
+    runner.TestRunner._require_resolved(fake, ["cmd", "submit", "--cmd", "echo ${HOME}"], 3, "cli argv")
+
+
+@pytest.mark.memory_only
+def test_expand_does_not_consume_declared_shell_brace_name():
+    """`${NAME}` 即使撞到既有 save_as 值，也要保留給 DUT shell 再由 fail-closed 檢查拒絕。"""
+    import runner
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(
+        variables={"after_cmd": {"ok": False, "error_code": "SESSION_NOT_READY"}},
+        tc=SimpleNamespace(steps=[{"save_as": "after_cmd"}]),
+    )
+    expanded = runner.TestRunner._expand(fake, "echo ${after_cmd}")
+    assert expanded == "echo ${after_cmd}"
+    with pytest.raises(runner.StepError, match="after_cmd"):
+        runner.TestRunner._require_resolved(fake, expanded, 4, "shell command")
+
+
 # ---------------------------------------------------------------------------
 # S1X-gate-accounting（計畫 03 §15.5／I10）：compare:none 的 gate_eligible 定義與 not_applicable 段。
 # ---------------------------------------------------------------------------
