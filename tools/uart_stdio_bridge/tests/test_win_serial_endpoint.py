@@ -388,12 +388,22 @@ class _HookedIoLock:
         self._hook = hook
         self._fired = False
 
-    def __enter__(self) -> _HookedIoLock:
+    def _run_hook_once(self) -> None:
         if not self._fired:
             self._fired = True
             self._hook()
+
+    def __enter__(self) -> _HookedIoLock:
+        self._run_hook_once()
         self._inner.acquire()
         return self
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        self._run_hook_once()
+        return self._inner.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._inner.release()
 
     def __exit__(self, *_exc: object) -> bool:
         self._inner.release()
@@ -723,6 +733,341 @@ def test_open_endpoint_forwards_peer_gate(fake_serial_module):
     finally:
         gated.close()
         ungated.close()
+
+
+# ---------------------------------------------------------------- 並行期限與雙向靜止（G9：sol ca0106f Medium，failing-first）
+
+
+class TimedSerial(FakeSerial):
+    """記錄每次 I/O 實際使用期限的替身，並偵測「I/O 進行中」時呼叫期限 setter 的情形。
+
+    pySerial 的期限 setter 會重設整個 COM handle，故只能在讀寫雙向皆靜止時呼叫；`violations` 記錄任何
+    違反此條件的 setter 呼叫。`read_gate`／`write_gate` 可使 I/O 阻塞於 pySerial 呼叫中，以確定性地重現交錯。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        # RecordingFactory 會回傳同一個替身而不套用 open() 傳入的參數，故預設值與 `_open_locked` 的初始值一致。
+        kwargs.setdefault("timeout", 0.05)
+        kwargs.setdefault("write_timeout", None)
+        super().__init__(**kwargs)
+        self._guard = threading.Lock()
+        self._active: set[str] = set()
+        self.read_timeouts_at_call: list[float | None] = []
+        self.write_timeouts_at_call: list[float | None] = []
+        self.violations: list[str] = []
+        self.read_gate: threading.Event | None = None
+        self.write_gate: threading.Event | None = None
+        self.read_entered = threading.Event()
+        self.write_entered = threading.Event()
+
+    @property
+    def timeout(self) -> float | None:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: float | None) -> None:
+        self._note_setter("timeout")
+        self.timeout_assignments += 1
+        self._timeout = value
+
+    @property
+    def write_timeout(self) -> float | None:
+        return self._write_timeout
+
+    @write_timeout.setter
+    def write_timeout(self, value: float | None) -> None:
+        self._note_setter("write_timeout")
+        self.write_timeout_assignments += 1
+        self._write_timeout = value
+
+    def _note_setter(self, name: str) -> None:
+        with self._guard:
+            if self._active:
+                self.violations.append(f"{name} during {sorted(self._active)}")
+
+    def read(self, size: int = 1) -> bytes:
+        with self._guard:
+            self._active.add("read")
+            self.read_timeouts_at_call.append(self._timeout)
+        try:
+            self.read_entered.set()
+            if self.read_gate is not None:
+                self.read_gate.wait(5)
+            return super().read(size)
+        finally:
+            with self._guard:
+                self._active.discard("read")
+
+    def write(self, data: bytes) -> int:
+        with self._guard:
+            self._active.add("write")
+            self.write_timeouts_at_call.append(self._write_timeout)
+        try:
+            self.write_entered.set()
+            if self.write_gate is not None:
+                self.write_gate.wait(5)
+            return super().write(data)
+        finally:
+            with self._guard:
+                self._active.discard("write")
+
+
+def test_concurrent_writes_each_use_own_deadline(fake_serial_module):
+    """第一筆寫入（5 s）進行中，第二筆（0.001 s）並行呼叫：第二筆不得在第一筆 I/O 進行中改寫期限；
+    兩筆實際送進 pySerial 的 write_timeout 各自為自己的期限。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    results: dict[str, int] = {}
+    fake.write_gate = threading.Event()
+    first = threading.Thread(target=lambda: results.__setitem__("A", ep.write_some(b"AAAA", 5.0)))
+    second = threading.Thread(target=lambda: results.__setitem__("B", ep.write_some(b"B", 0.001)))
+    try:
+        first.start()
+        assert fake.write_entered.wait(2)
+        second.start()
+        time.sleep(0.05)
+        assert fake.violations == [], "第一筆寫入進行中不得改寫期限"
+        fake.write_gate.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+        assert results == {"A": 4, "B": 1}
+        assert fake.write_timeouts_at_call == [5.0, 0.001]
+        assert fake.writes == [b"AAAA", b"B"]
+        assert fake.violations == []
+    finally:
+        fake.write_gate.set()
+        first.join(1)
+        second.join(1)
+        ep.close()
+
+
+def test_write_deadline_survives_interleaved_call_before_io_lock(fake_serial_module):
+    """第一筆（5 s）已取得期限快照、尚未取得寫入串行鎖時，另一筆（0.001 s）完整執行：
+    第一筆仍須以自己的 5 s 寫入，不得沿用被改寫的期限（sol ca0106f 之原始交錯）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    interleaved: dict[str, int] = {}
+    ep._write_io_lock = _HookedIoLock(ep._write_io_lock, lambda: interleaved.__setitem__("B", ep.write_some(b"B", 0.001)))
+    try:
+        assert ep.write_some(b"AAAA", 5.0) == 4
+        assert interleaved == {"B": 1}
+        assert fake.write_timeouts_at_call == [0.001, 5.0]
+        assert fake.writes == [b"B", b"AAAA"]
+        assert fake.violations == []
+    finally:
+        ep.close()
+
+
+def test_concurrent_reads_each_use_own_deadline(fake_serial_module):
+    """短期限讀取不得等候較早的讀取鎖；讀取 timeout 固定 50 ms，由呼叫端累計期限。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    results: dict[str, bytes] = {}
+    elapsed: dict[str, float] = {}
+    fake.read_gate = threading.Event()
+    second_done = threading.Event()
+
+    def _read(label: str, timeout: float, done: threading.Event | None = None) -> None:
+        started = time.monotonic()
+        results[label] = ep.read(16, timeout)
+        elapsed[label] = time.monotonic() - started
+        if done is not None:
+            done.set()
+
+    first = threading.Thread(target=lambda: _read("A", 0.2))
+    second = threading.Thread(target=lambda: _read("B", 0.01, second_done))
+    try:
+        first.start()
+        assert fake.read_entered.wait(2)
+        second.start()
+        assert second_done.wait(0.1), "短期限讀取在等待讀取鎖時超過自己的期限"
+        assert fake.violations == [], "第一筆讀取進行中不得改寫期限"
+        fake.read_gate.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+        assert results == {"A": b"", "B": b""}
+        assert elapsed["B"] < 0.1 and 0.15 <= elapsed["A"] < 0.4
+        assert fake.read_timeouts_at_call and all(value == 0.05 for value in fake.read_timeouts_at_call)
+        assert fake.violations == []
+    finally:
+        fake.read_gate.set()
+        first.join(1)
+        second.join(1)
+        ep.close()
+
+
+def test_read_deadline_survives_interleaved_call_before_io_lock(fake_serial_module):
+    """讀取端交錯版本：先執行的短呼叫不改寫固定 50 ms pySerial timeout，也不改變外層期限。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    interleaved: dict[str, bytes] = {}
+    ep._read_io_lock = _HookedIoLock(ep._read_io_lock, lambda: interleaved.__setitem__("B", ep.read(16, 0.01)))
+    try:
+        started = time.monotonic()
+        assert ep.read(16, 0.2) == b""
+        elapsed = time.monotonic() - started
+        assert interleaved == {"B": b""}
+        assert 0.15 <= elapsed < 0.4
+        assert fake.read_timeouts_at_call and all(value == 0.05 for value in fake.read_timeouts_at_call)
+        assert fake.violations == []
+    finally:
+        ep.close()
+
+
+def test_read_timeout_setter_waits_for_inflight_write(fake_serial_module):
+    """寫入進行中（阻塞於 pySerial write）時，短讀取仍能排空 bytes，且不呼叫期限 setter。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.write_gate = threading.Event()
+    fake.read_data.extend(b"R")
+    writer = threading.Thread(target=lambda: ep.write_some(b"W", 5.0))
+    result: dict[str, bytes] = {}
+    reader = threading.Thread(target=lambda: result.__setitem__("data", ep.read(16, 0.2)))
+    try:
+        writer.start()
+        assert fake.write_entered.wait(2)
+        reader.start()
+        reader.join(0.5)
+        assert not reader.is_alive(), "讀取不得等待被阻塞的寫入鎖"
+        assert fake.violations == [], "寫入進行中不得改寫讀取期限"
+        assert result == {"data": b"R"}
+        assert fake.read_timeouts_at_call == [0.05]
+        assert writer.is_alive(), "讀取結果不得以解除寫入阻塞為前提"
+        fake.write_gate.set()
+        writer.join(5)
+        reader.join(5)
+        assert not writer.is_alive() and not reader.is_alive()
+        assert fake.violations == []
+        assert fake.writes == [b"W"]
+    finally:
+        fake.write_gate.set()
+        writer.join(1)
+        reader.join(1)
+        ep.close()
+
+
+def test_write_timeout_setter_waits_for_inflight_read(fake_serial_module):
+    """讀取進行中（阻塞於 pySerial read）時，寫入端需改期限者不得呼叫 setter（對稱版本）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.read_gate = threading.Event()
+    reader = threading.Thread(target=lambda: ep.read(16, 0.05))
+    writer = threading.Thread(target=lambda: ep.write_some(b"W", 1.0))
+    try:
+        reader.start()
+        assert fake.read_entered.wait(2)
+        writer.start()
+        time.sleep(0.05)
+        assert fake.violations == [], "讀取進行中不得改寫寫入期限"
+        fake.read_gate.set()
+        reader.join(5)
+        writer.join(5)
+        assert not reader.is_alive() and not writer.is_alive()
+        assert fake.violations == []
+        assert fake.writes == [b"W"]
+    finally:
+        fake.read_gate.set()
+        reader.join(1)
+        writer.join(1)
+        ep.close()
+
+
+def test_blocked_write_does_not_stall_default_read(fake_serial_module):
+    """寫入阻塞（對端不讀）時，長期限讀取仍須以固定短讀取期限排空資料（ST-03(a) 雙向獨立）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.write_gate = threading.Event()
+    writer = threading.Thread(target=lambda: ep.write_some(b"W", 5.0))
+    try:
+        writer.start()
+        assert fake.write_entered.wait(2)
+        fake.read_data.extend(b"R")
+        start = time.monotonic()
+        assert ep.read(16, 0.5) == b"R"
+        assert time.monotonic() - start < 0.25
+        assert fake.read_timeouts_at_call == [0.05], "read 的呼叫期限不得重設 pySerial 的 COM 期限"
+        assert fake.violations == []
+    finally:
+        fake.write_gate.set()
+        writer.join(5)
+        ep.close()
+
+
+def test_long_read_deadline_uses_fixed_short_pyserial_timeout(fake_serial_module):
+    """長讀取期限由外層輪詢累計；pySerial 使用固定 50 ms timeout，不等待寫入期限 setter。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.write_gate = threading.Event()
+    writer = threading.Thread(target=lambda: ep.write_some(b"W", 5.0))
+    reader = threading.Thread(target=lambda: ep.read(16, 0.2))
+    try:
+        writer.start()
+        assert fake.write_entered.wait(2)
+        started = time.monotonic()
+        reader.start()
+        reader.join(0.5)
+        elapsed = time.monotonic() - started
+        assert not reader.is_alive() and 0.15 <= elapsed < 0.4
+        assert fake.read_timeouts_at_call and all(value == 0.05 for value in fake.read_timeouts_at_call)
+        assert fake.violations == []
+        assert writer.is_alive(), "讀取期限不得等待寫入結束"
+    finally:
+        fake.write_gate.set()
+        writer.join(5)
+        reader.join(5)
+        ep.close()
+
+
+def test_first_write_reconfig_not_starved_by_busy_reader(fake_serial_module):
+    """讀取端緊密迴圈時，寫入端首次改期限（None→1.0）仍須在合理時間內完成（不得因讀取端搶佔而餓死）。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    stop = threading.Event()
+
+    def spin_read() -> None:
+        while not stop.is_set():
+            ep.read(16, 0.05)
+
+    reader = threading.Thread(target=spin_read, daemon=True)
+    reader.start()
+    try:
+        started = time.monotonic()
+        assert ep.write_some(b"W", 1.0) == 1
+        assert time.monotonic() - started < 2.0
+        assert fake.violations == []
+    finally:
+        stop.set()
+        reader.join(5)
+        ep.close()
 
 
 # ---------------------------------------------------------------- 真實 COM pair 測試（擁有者 host，OD-15）
