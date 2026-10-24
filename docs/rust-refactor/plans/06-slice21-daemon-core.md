@@ -1430,9 +1430,12 @@ git commit -m "feat(sw-pal): 裝置來源掃描、藍牙排除、測試裝置 al
 
 ## Task 6：PAL WalFs（常駐 handle、identity、share-delete、不覆蓋 rename）
 
+> **OD-19 交叉引用（2026-10-23）**：Rust `sw-pal` `WalFs` 與 `sw-core` `WalWriter` 須實作與 Python 基線相同的輪替干擾語意：rotate 與 unlink 遇共用違規（ERROR_SHARING_VIOLATION＝32）或存取拒絕（ERROR_ACCESS_DENIED＝5）做有上限的退避重試（`WAL_ROTATE_RETRY_BACKOFF_S`＝10／50／200 ms），刪不掉的段落進延遲佇列（`WAL_DEFERRED_DELETE_INTERVAL_S`＝1 s）並以非阻塞方式於後續 append 或 tick 重試，寫入路徑不持鎖睡眠，干擾計數 `rotate_retry`、`rotate_deferred`、`deferred_delete_pending` 入 health 快照；首次失敗與轉入 deferred 時告警，持續 deferred 每 60 s 最多再告警一次。OD-19 Spike 3 必須記錄實際 `WalWriter.append` 延遲樣本；上限未經 owner 裁決前 gate 保持 BLOCKED-OWNER。驗收以 `scripts/stage0/av_sim.py` 的注入式與原生 helper 判定（見 `docs/rust-refactor/plans/spec-reconciliation.md` §1.4）。
+> **OD-19 接線補充（2026-10-23）**：Rust daemon 須於週期回呼（對應 Python `DeviceWatcher` 的 1.0 s tick）呼叫等價於 `WalWriter.tick()` 的非阻塞輪替推進，且與 readiness reconcile 互不遮蔽；tick 驅動的現行檔輪替完成時須寫入 `WAL_ROTATED_AFTER_DEFERRAL` META（`archived_through_seq`），維持現行檔存在與 seq 續接。Rust 對等項以相同 contract（`contracts/wal_meta_events.schema.json`）驗收。
+
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-pal-walfs.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust PAL WAL 檔案層：常駐 append handle、檔案 identity 與 unlink／DeletePending 偵測、Windows FILE_SHARE_DELETE、不覆蓋既有歸檔的 rename（DF-03）。」）
-**BLOCKED-OWNER：** 無（Windows 部分在擁有者本機經 WSL interop 原生執行，屬本環境可產出；第三方 EDR 影響併入 Spike 3 結果比對，見 Task 22）。
+**BLOCKED-OWNER：** OD-19 寫入延遲上限尚待 owner 裁決；在裁決前即使有實測樣本，Spike 3 latency verdict 仍為 BLOCKED-OWNER。Windows 原生 Spike 3 artifact 仍須 owner host 產生；EDR 欄位只作參考資訊。
 
 **Files:**
 - Create: `crates/sw-pal/src/wal_fs/posix.rs`、`crates/sw-pal/src/wal_fs/windows.rs`

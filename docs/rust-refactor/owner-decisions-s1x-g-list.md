@@ -6,7 +6,7 @@
 - OD-S1X-01（Windows）（已由 OD-16 裁決，見 :210 起）：Windows 集合的 add-only 登記須以真機收集輸出完成（WSL 無法產生）。另見下節「G1-l1-lock-vs-selector」之「OD-S1X-01（Windows）」（placeholder 12 筆、cfg 不可編譯 58 筆、posix_only 委派列、cap 列之移除裁決，以及 add-only 登記替換測試）。
 - OD-S1X-02（已由 OD-16 裁決，見 :210 起）：Windows golden 採 (i) 依 plan 04 Task 10 的 12 情境並縮減分母（實作目前擷取 14 情境，含 2 boundary），或 (ii) 改 plan 擷取鎖定的全部 test_bb_cli_help 節點（432 筆）。
 - OD-S1X-03（已由 OD-16 裁決，見 :210 起）：docker Rust-CLI L1.5 是否屬 Stage 1 範圍；目前一律 BLOCKED-PREREQ，非 PASS。
-- EDR 資料（spike3）：win-wal-av-* 與 win-wal-f12-progress 的 `--edr-product`／`--edr-status`，由擁有者 EDR 主控台查得；未知即 BLOCKED-OWNER，不得 PASS。
+- EDR 資料（spike3）：OD-19 已裁決防毒產品無關。工具以 SecurityCenter2 唯讀查詢產品名稱與狀態，僅作參考欄位；查不到記 `unknown`，不影響 verdict，也不要求主控台輸入或攔截次數。
 - BLOCKED-PREREQ-S1X-04（已由 OD-16 裁決，見 :210 起）：systemd 實跑的基底 glibc（debian:12-slim／2.36 vs 二進位 GLIBC_2.39）；三個候選見 addenda 列，須擇一裁決後才能 pin 新映像。
 - Windows cli_help oracle（`tests/contract_blackbox/test_bb_cli_help.py::test_platform_oracle_exists_and_boundary_values_are_native` 與 windows golden）：屬新 oracle，須非實作者單審通過後才可凍結。
 
@@ -185,10 +185,10 @@ cargo:sw-pal::sysenv_mgmt::which_uses_default_path_when_path_is_unset
 1. 擁有者逐項核准上列各表；未核准項目維持原狀，不得部分套用。
 2. 收集輸入：`scripts/rust/cargo_l1_results.py --list-only` 依設計保留 ignored 與 `cap_*`（見該檔註解）。移除必須由收集檔**明示排除**核准名單，不得由工具自動排除，排除清單須寫入 commit 訊息。
 2a. **替換前置（修正輪補記，須先於步驟 3）**：L-1、L-2 的替換 pytest（`tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override`、`tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields`）目前未被任何凍結集合或不變量點名，僅隱含於 pytest-full。須先以 `--l1-add-only` 將兩個替換 nodeid 登記為必要集合（或加入 stage1a coverage 不變量），之後才可 `--allow-removal` 移除舊名。W-1 至 W-5 的替換測試同此處理。
-3. Linux（`s1a`：`-- --workspace --all-features`；`s1b`：`-- --workspace`）：`python3 scripts/rust/cargo_l1_results.py --platform linux --list-only --out <收集檔> -- …` → 排除核准項 → `python3 tests/acceptance/regen_lock.py --l1-add-only --set <s1a_cargo|s1b_cargo> --platform linux --collect <收集檔> --allow-removal <逐名>`（集合已存在，不需 selector）。
-4. Windows cargo 收集**必須於 Windows 原生執行**（WSL 以 `--platform windows` 做的是交叉編譯，不得代替）：`s1a` 為 `-- --package sw-proto --package sw-pal --package sw-cli`，`s1b` 為 `-- --package sw-pal --package sw-cli`。排除核准項後執行 `regen_lock.py --l1-add-only --set <s1a_cargo|s1b_cargo> --platform windows --collect <收集檔> --allow-removal <逐名>`。`--allow-removal` 須與實際消失集合完全相符，工具會拒絕未列名或未消失的項目。
-5. Windows pytest（原生）：`py -3.12 -m pytest --collect-only -q tests/contract_blackbox -m "core_portable or windows_native"`（`s1a_delegation` 收集範圍限 `test_bb_delegation.py`）→ `regen_lock.py --l1-add-only --set <s1a_blackbox|s1a_delegation> --platform windows --collect <收集檔> --allow-removal tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child`。新增替換測試於同一次收集中出現，即為 add-only 登記。
-6. 驗證：`python3 tests/acceptance/regen_lock.py --check`；`python3 tests/acceptance/regen_lock.py --check --base HEAD --allow-removal <全部核准名>`；`python3 -m pytest -q tests/test_l1_judge.py`（預期 `test_l1_lock_frozen_set_excludes_capability_gated` 轉綠）。CI 的 `--allow-removal` 清單同步屬 `PENDING-OD-S1X-L1-REMOVAL` 未提交部分，須另案處理。
+3. Linux（`s1a`：`-- --workspace --all-features`；`s1b`：`-- --workspace`）：`python3 scripts/rust/cargo_l1_results.py --list-only --out <收集檔> -- …` → 排除核准項 → `python3 tests/acceptance/regen_lock.py --l1-add-only --set <s1a_cargo|s1b_cargo> --platform linux --collect <收集檔> --allow-removal <set_id:linux:nodeid>`（集合已存在，不需 selector）。
+4. Windows cargo 收集**必須於 Windows 原生執行**（WSL 以 `--platform windows` 做的是交叉編譯，不得代替）：`s1a` 為 `-- --package sw-proto --package sw-pal --package sw-cli`，`s1b` 為 `-- --package sw-pal --package sw-cli`。排除核准項後執行 `regen_lock.py --l1-add-only --set <s1a_cargo|s1b_cargo> --platform windows --collect <收集檔> --allow-removal <set_id:windows:nodeid>`。`--allow-removal` 須與實際消失集合完全相符，工具會拒絕未列名或未消失的項目。
+5. Windows pytest（原生）：`py -3.12 -m pytest --collect-only -q tests/contract_blackbox -m "core_portable or windows_native"`（`s1a_delegation` 收集範圍限 `test_bb_delegation.py`）→ `regen_lock.py --l1-add-only --set <s1a_blackbox|s1a_delegation> --platform windows --collect <收集檔> --allow-removal <set_id:windows:tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child>`。新增替換測試於同一次收集中出現，即為 add-only 登記。
+6. 驗證：`python3 tests/acceptance/regen_lock.py --check`；`python3 tests/acceptance/regen_lock.py --check --base HEAD --allow-removal <set_id:platform:nodeid 三元組清單>`；`python3 -m pytest -q tests/test_l1_judge.py`（預期 `test_l1_lock_frozen_set_excludes_capability_gated` 轉綠）。CI 的 `--allow-removal` 清單同步屬 `PENDING-OD-S1X-L1-REMOVAL` 未提交部分，須另案處理。
 
 ### 本輪狀態（2026-10-22）
 

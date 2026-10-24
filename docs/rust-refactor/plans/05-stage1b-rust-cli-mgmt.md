@@ -905,7 +905,7 @@ scripts/rust/win-test.sh --package sw-pal -- proc_scan process_ctl
 - [ ] **步驟 5：commit**：`feat(sw-pal): 實作 daemon spawn 與 serialwrapd 行程掃描（含 Windows launcher 去重）`
 
 **BLOCKED-OWNER：**
-- 以正式 Windows artifact（原生 build 的 launcher＋bundled Python）在 OD-05 機台實測 Stage 1 daemon 只被計為 1 個實例；受 EDR 限制時 `NtQueryInformationProcess` 是否可讀命令列需實機確認。
+- 以正式 Windows artifact（原生 build 的 launcher＋bundled Python）在 OD-05 機台實測 Stage 1 daemon 只被計為 1 個實例；受端點防毒影響時（OD-19，與防毒產品無關）`NtQueryInformationProcess` 是否可讀命令列需實機確認。
 - OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
 
 ---
@@ -1404,7 +1404,7 @@ python3 scripts/rust/check_cfg_boundary.py
 - [ ] **步驟 5：commit**：`feat(rust-cli): 原生承接 daemon start/stop/status/restart 與多開預檢`
 
 **BLOCKED-OWNER：**
-- Windows on-demand 首次需求啟動在 OD-05 機台以正式 artifact（原生 build）實跑，含 EDR 開啟下 `DETACHED_PROCESS` spawn 不被攔截的證據；`test_autostart_l15_tx_once` 的原生 Windows COM 版本依 OD-08（com0com 或實體 USB-UART）。
+- Windows on-demand 首次需求啟動在 OD-05 機台以正式 artifact（原生 build）實跑，含 OD-19 `binary_integrity` 的啟動未被拒與執行檔前後 sha256 相同證據；`test_autostart_l15_tx_once` 的原生 Windows COM 版本依 OD-08（com0com 或實體 USB-UART）。
 - `daemon restart` 在實體 UART 上確認舊 daemon 釋放 tty 後新 daemon 才取得（Spike 6 實機部分）。
 
 ---
@@ -1935,7 +1935,7 @@ python3 -m pytest -q tests/test_rust_release_manifest_schema.py
 
 **BLOCKED-OWNER：**
 - 正式 Windows release artifact 必須在擁有者 Windows 自架 runner 原生 build/link（arch §1.1），並以該 artifact 驗證安裝佈局與 `windows_switch_running_exe_rename`。
-- EDR 開啟下 `bin\*.old.*` 改名與新 exe 首次執行不被攔截的證據（§1.2 端點防毒列）。
+- OD-19 下 `bin\*.old.*` 改名與新 exe 首次執行未被拒的證據（以執行結果與執行檔完整性判定，不要求 EDR 資料；§1.2 端點防毒列）。
 
 ---
 
@@ -3522,7 +3522,7 @@ def test_p4_required_cases_have_passing_evidence():
 
 `tests/contract_blackbox/test_cli_mgmt_ab_suite.py`：`AB_CASES` **由 `tests/acceptance/p4_required.lock.json` 讀取**（凍結於紅燈 commit，§0.1），不得以 pytest collection 反推；對每個案例以 P2 比較器在「Python CLI＋Python daemon」與「Rust CLI＋Python daemon」兩輪依序執行（先停 A、確認資源釋放、再起 B，新模擬器實例），斷言比較器結果 `equal`；`rust_only` 案例只跑 B 並驗絕對契約。凍結清單中任一案例的測試節點不存在或被 SKIP（未登記）→ FAIL。
 
-`tests/contract_blackbox/test_cli_mgmt_l15.py`（L1.5，P2 bridge＋DUT 模擬器，`posix_pty`；§0.4 不變量）：`test_autostart_l15_tx_once`（POSIX 以 `caps` 覆寫 env 模擬不可行，故本檔只收 Linux 可跑者；Windows 版本在 `win-blackbox.ps1` 原生執行）、`test_update_busy_l15_zero_tx`、`test_update_file_push_after_last_probe_l15`、`test_update_push_after_freeze_zero_tx_l15`（R1-F1，見 Task 12 表）、`test_reject_conflict_l15_zero_tx`（`DAEMON_ALREADY_RUNNING_ELSEWHERE` 時 DUT 無 TX）、`test_restart_no_stale_console_replay`（restart 前 human console 緩衝未送出的行，新 daemon 起來後 DUT RX 中不出現）、`test_restart_no_reopen_before_handoff`（新 daemon 開 tty 時舊 daemon 的 fd 已關：bridge `control.ndjson` 中舊 holder `closed` 早於新 holder `opened`）。
+`tests/contract_blackbox/test_cli_mgmt_l15.py`（L1.5，P2 bridge＋DUT 模擬器，`posix_pty`；§0.4 不變量）：`test_autostart_l15_tx_once`（POSIX 以 `caps` 覆寫 env 模擬不可行，故本檔只收 Linux 可跑者；Windows 版本在 `win-blackbox.ps1` 原生執行）、`test_update_busy_l15_zero_tx`、`test_update_file_push_after_last_probe_l15`、`test_update_push_after_freeze_zero_tx_l15`（R1-F1，見 Task 12 表）、`test_reject_conflict_l15_zero_tx`（`DAEMON_ALREADY_RUNNING_ELSEWHERE` 時 DUT 無 TX）、`test_restart_no_stale_console_replay`（restart 前 human console 緩衝未送出的行，新 daemon 起來後 DUT RX 中不出現）、`test_restart_no_reopen_before_handoff`（`HolderObserver` 僅掃描本次測試 rig 的舊／新 daemon PID，於操作期間取樣；`assert_holder_handoff` 要求新 holder 出現前曾觀測到舊 holder 已結束，並接受兩個檢視來源回報的事件時間順序差異；取樣無法證明兩次取樣之間從未重疊，不得外推為連續無重疊證明。若候選 PID 的 `/proc/<pid>/fd` 權限不足，holder 狀態未知，案例為 `evidence-insufficient`／SKIP，不得當成 PASS；操作本身的失敗仍須保留為 FAIL）。
 
 `tests/test_rust_bench_tools.py` 表列案例：
 
@@ -3580,7 +3580,7 @@ python3 scripts/rust/check_cfg_boundary.py && PYTHONPATH=scripts/rust SW_REQUIRE
 **unshare 包裝（B，S1X 修訂）**：PID 隔離分三層。(1) pytest 標記 `pidns_rig`（`tests/contract_blackbox/conftest.py` 的 `pytest_pyfunc_call` hook）：被標記的 nodeid 於子 pytest 內以 `unshare -Upf --mount-proc --map-current-user` 重跑同一 nodeid，判定只取子行程 junit；`bb_l15.in_isolated_pidns()` 比對 `/proc/self/ns/pid` 與 `SW_PIDNS_OUTER` 確認已隔離；unshare 不可用時 skip 並附原因（非 PASS，不退回無隔離執行，不設 `--force-spawn`）。(2) `scripts/rust/ab_blackbox.sh` 整段（A 輪、釋放確認、B 輪）於同一 user+pid+mount namespace 重新 exec；不可用時 exit 3（INVALID，不得作為 A/B 證據）；執行前寫 `preflight.json`，若不隔離或可見外部 `serialwrapd` 即 exit 4（INVALID）；身分檔記錄 `pid_namespace_isolated`（僅為記錄，真正的守門是 preflight）。(3) `tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_close_with_non_reaping_pid1` 以 `_unshare_pidns_argv()` 建立非特權 PID／mount namespace（`unshare --user --map-current-user --pid --fork --mount --mount-proc`）。Step 4 的 pytest 命令在 unshare 不可用時上述案例 skip 並記「環境能力不足，非 PASS」，證據須記錄 `unshare` 可用與否；不得因 skip 而記為 PASS（理由：該案例為 PID 1 不回收孤兒的回歸，Rust PAL zombie 誤判即由此抓出）。（T-2 例外：`tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle` 亦標 `pidns_rig`，host 上其他 serialwrapd 會使 pid 計數不穩，故由子 pytest 於隔離 namespace 執行；Step 4 不需外層 unshare。）
 
 **BLOCKED-OWNER：**
-- §1.2 CLI 暖快取往返 p50／p95／p99 在 §1.1.1 標準量測環境（Linux 原生、Windows OD-05 機台原生 artifact）正式量測（`bench_cli_roundtrip.py` gate 必須為 `PASS`）；Windows 連續 100 次 CLI 不產生解壓檔案或目錄的正式證據；EDR 無新增攔截證據（查詢權限不足時列證據不足）。
+- §1.2 CLI 暖快取往返 p50／p95／p99 在 §1.1.1 標準量測環境（Linux 原生、Windows OD-05 機台原生 artifact）正式量測（`bench_cli_roundtrip.py` gate 必須為 `PASS`）；Windows 連續 100 次 CLI 不產生解壓檔案或目錄的正式證據；OD-19 模擬防毒干擾、每次 WAL append 延遲樣本與 binary integrity 證據。寫入延遲上限待 owner 裁決，未裁決前 gate 保持 BLOCKED-OWNER；防毒產品資料僅作參考，不是 gate 條件。
 - §11.6 Stage 1B L2：以 Rust CLI 作為 pinned `serialwrap_exe` 在 live bench 跑全部適用 TestPilot `serialwrap_regression` 案例，含已授權破壞集。
 - §11.6 Stage 1B L3：`realhw` P0＋P1＋remote 以 Rust CLI 執行。
 - §11.6／OD-10：Rust CLI＋Python daemon 混合組合 48 小時長跑（至少 Windows 生產目標環境；bench 依序排程，約佔 3 天）——程序與 gate 判定沿用 P2 `longrun_acceptance.yaml`，本 Phase 只把 Rust CLI artifact 填入 manifest。這是最早的 Rust 候選長跑（`S1B-L3-MIXED-48H-WINDOWS`）：前置為 OD-09 延後項已於正式 Stage 0 出口以 P2 Task 16 凍結（工具屬 P2，不需等待 P9，R4-F2）；啟動 `python3 -m realhw --tier longrun` 前必須先執行 `py -3.12 -m realhw.acceptance.od09_freeze register-candidate --acceptance realhw/acceptance/longrun_acceptance.yaml --item S1B-L3-MIXED-48H-WINDOWS --platform windows --run-id <run_id> --started-at <now>`，exit 非 0（未凍結 → 5，`HARNESS_OD09_NOT_FROZEN`）即不得開跑；gate 的 `pre_frozen` 仍為最後防線。
@@ -3866,14 +3866,14 @@ pub fn run_optional_step(ctx: &Ctx, bundle: &Path, step: OptionalStep) -> PyDict
 | B-05 | Spike 6：混合版本實機更新／回滾的 L2 bench 部分。Windows 側真實串口釋放與重新取得自 OD-15 起在擁有者 host 以 `COM20`／`COM21`＋OD-11 隔離實例（allowlist `COM20`）執行，為可執行 gate | §12.1、§13、OD-08、OD-15 | 7、12 |
 | B-06 | BC-05 Windows：Win32-OpenSSH 對真實 relay 的三拓樸、生命週期、停止／重啟；L3 remote | §9.1 BC-05、§11.6 | 5、8、9 |
 | B-07 | 正式 Windows release artifact 原生 build/link（自架 runner）與 DLL 匯入檢查 | arch §1.1、ADR-01 | 11、16 |
-| B-08 | EDR 開啟下 spawn、改名切換、首次執行不被攔截；100 次 CLI 執行期間無任何暫存檔／目錄建立（含建立後刪除） | §1.2、OD-05 | 7、11、16 |
+| B-08 | OD-19 產品無關驗收：模擬干擾下 WAL 正確性與活性成立，binary integrity 前後一致；100 次 CLI 執行期間無任何暫存檔／目錄建立（含建立後刪除） | §1.2、OD-05、OD-19 | 7、11、16 |
 | B-09 | §1.2 CLI 往返效能在標準量測環境正式量測（Linux 原生、Windows 原生） | §1.1、§1.2 | 16 |
 | B-10 | Stage 1B L2：Rust CLI 為 pinned `serialwrap_exe` 跑全部適用案例含已授權破壞集 | §11.6 | 16 |
 | B-11 | Stage 1B L3：`realhw` P0＋P1＋remote | §11.6 | 16 |
 | B-12 | Rust CLI＋Python daemon 混合組合 48 h 長跑（Windows 生產目標環境，OD-10 依序排程）；前置：OD-09 延後項已於 Stage 0 出口以 P2 Task 16 凍結，開跑前 `od09_freeze register-candidate --item S1B-L3-MIXED-48H-WINDOWS`（R4-F2） | §11.6、OD-10、OD-09、§14.2 | 16 |
 | B-13 | §10.3 身分清單由部署負責人提供，並以一般任務 Agent 實際身分取得 `verify_agent_perms.py` `verdict:"blocked"`（exit 0；restore_checks 全 `possible:false`）證據；`not_blocked`／`unknown` 不計，同帳號部署只能登錄流程約束 | §10.3 | 12、15 |
 | B-14 | 測試團隊工作站 `doctor` 全項、`connect`／`--bench` 經真實 relay、TeraTerm／PuTTY 連 `console_endpoint` 實機操作 | §11.6 | 9、13、14 |
-| B-15 | Windows 實機 SERIALCOMM（藍牙＋USB-UART 混合）與 `NtQueryInformationProcess` 在 EDR 下可讀性 | SC-17、07 §1.6 | 2、4 |
+| B-15 | Windows 實機 SERIALCOMM（藍牙＋USB-UART 混合）與 `NtQueryInformationProcess` 在端點防毒存在下的可讀性（OD-19：實機判定，不依賴防毒產品資料） | SC-17、07 §1.6 | 2、4 |
 | B-16 | ~~OD-08 原生 Windows COM handle 證據~~ **OD-15 起不再 BLOCKED**：動到 PAL 的 PR（Task 2、3、4、5、17、19）在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例（allowlist `COM20`）由 orchestrator 代跑取得；擁有者 host 不可用時記「證據不足」 | OD-08、OD-15 | 2、3、4、5、17、19 |
 | B-17 | P2 指派本 Phase 的 `win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`、windows-task 版 `p1-rst-daemon`、Windows 版 `rm-live-e2e` 實跑（程序與判定器由 Task 18 交付） | P2 L1855、L1869、L1906-1909、L2493 | 18 |
 | B-18 | 正式 Windows bundle 的 bundled Python runtime 與 launcher（GUI subsystem）於自架 runner 原生產生 | arch §1.1、§6.1 | 17 |

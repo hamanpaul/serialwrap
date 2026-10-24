@@ -88,9 +88,30 @@
 | DF-17 | WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行；部分寫入後只補寫剩餘 bytes（依已寫長度 `sent`），補寫再失敗則於下一筆前以 `\n` 終結殘行，不產生被串接的 NDJSON 行（P1 T02 第 3 點、Rust arch §4.5 `WalWriteError`／§5.8 第 5 點，R2-F3） |
 | DF-19 | `session.self_test` 的 nonce probe（`source:"system:self_test"`）在每次 OS 提交前重驗 boot quiet（任何 profile，含 console unlock；與 pre-check `boot_quiet_active()` 同義）與 bridge 世代／epoch：pre-check 通過後才 arm 的 quiet 使 probe 零 TX，回應改為與 pre-check 同形的 `{"ok":true,"classification":"AUTOBOOT_QUIET","session":…,"recommended_action":"wait",<lease ctx>,"command_capable":…}`，不等 nonce、不 `confirm_ready`。不受 ready reconfirm 擋（self-test 是 `READY_UNCONFIRMED` 的建議出口）、不與 login run 世代掛鉤；FLASHING 中照舊 `TARGET_UNRESPONSIVE`（RPC-H-07）。來源 SES-16.6-08（R5-F2）。DF-18 號保留給 P7（`08` §0.5） |
 
+### P5-T7 P1 WAL 位元組 golden 缺口補充
+
+P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生這些檔案；`wal_line.tsv` 只覆蓋單列序列化，不能替代 WalWriter 寫檔輸出。依本 Task 的補充決議，新增 `scripts/stage0/capture_wal_golden.py`，以固定單調時鐘、wall 時間及空白初始 WAL 目錄驅動 Python `sw_core.wal.WalWriter`，記錄輸入與 WAL／mirror 實際位元組；`tests/test_rust_goldens_fresh.py` 重跑擷取器並逐位元組比對，Rust `wal_contract_golden_matches_p1` 逐案重播同一輸入並比對兩個輸出檔。補充的 JSON golden 不取代 `contracts/golden/wal_line.tsv`。`contracts/captures/wal/*` 未包含在此補充範圍，仍待 P1 上游交付或後續明確處理；P5-T7 的 Rust 重播測試不消費該目錄。提交說明需指出此上游缺口與本補充。
+
 ### 1.3 既有核准：BC-01～BC-05
 
 照規格 §9.1 實作，各列以 **BC** 標示。
+
+### 1.4 OD-19 登記：端點防毒驗收與防毒產品無關（2026-10-23）
+
+依 `owner-decisions-2026-10-15.md` OD-19（取代 PENDING-OD-S1X-EDR-SEMANTICS），下列登記規格原文與裁決後寫法的差異。規格原文本段不改；驗收與實作以本段裁決為準，規格定稿時統一更新。
+
+| ID | 規格原文（現況） | OD-19 裁決後寫法 | 處置 | 影響範圍 |
+|---|---|---|---|---|
+| OD-19-SPIKE3 | Spike 3（規格 §13，Spike 表 Spike 3 列）：實際端點防毒開啟下驗一般寫入、rotate、unlink、外部 reader 持有 handle、重建 timeout、F12 實際進展 | Spike 3 各案於 `scripts/stage0/av_sim.py` 的 overlapped RH oplock 變體下判定（`FILE_SHARE_DELETE`、seed 可重現、持有 10～500 ms）；不含 `FILE_SHARE_DELETE` 的一般 reader 變體由獨立 Windows-native WAL 測試覆蓋。防毒產品名與狀態由工具以 SecurityCenter2 唯讀查詢，只作 `edr` 資訊欄，查不到寫 `unknown`，不影響 verdict。PASS 另需 `binary_integrity`（測試前後執行檔存在、sha256 不變、啟動未被拒） | DOC＋TEST（oracle 變更，需兩位審查者） | `scripts/stage0/spike3_win_wal.py`、`spike3_evidence.schema.json`、`scripts/rust/win-spike3.sh`、`stage1a_gate._spike3_status`、plan 02、04、05 |
+| OD-19-QUALITY-AV | 品質門檻「端點防毒」列（規格 §品質門檻）：實際端點防毒沒有新增攔截；查詢權限不足列證據不足、不得填零 | 與防毒產品無關：以可觀察事實判定（WAL 干擾由 av_sim 注入驗收；Spike 3 `binary_integrity` 記錄執行檔測試前後 sha256 與啟動是否被拒；`startup-100.json` 只記 100 次啟動結果與單次 exe sha256，不宣稱自身完成前後比對）；不需 EDR 攔截次數或主控台資料 | DOC | plan 04 B4、plan 05 B-08 與 §1.2「端點防毒」列 |
+| OD-19-WAL-ACCEPT | WAL 驗收列（規格 §驗收表「WAL」列）與 Spike 3 的 WAL 項：實際端點防毒開啟下跨 rotate、外部 unlink、外部 reader 持有 handle 及活性檢查 | Windows WAL 以 `FILE_SHARE_READ｜FILE_SHARE_WRITE｜FILE_SHARE_DELETE` 開檔（既有 `FILE_SHARE_ALL`）。rotate 與 unlink 遇 ERROR_SHARING_VIOLATION（32）或 ERROR_ACCESS_DENIED（5）做有上限的退避重試（`WAL_ROTATE_RETRY_BACKOFF_S`＝0.01／0.05／0.2 s）；刪不掉的段落進延遲佇列（`WAL_DEFERRED_DELETE_INTERVAL_S`＝1 s），於後續 append 或 `tick()` 以非阻塞方式重試直到完成。寫入路徑不持寫鎖睡眠，退避以下一次嘗試時間戳判定。干擾不改變 `healthy`。daemon 接線（2026-10-23）：`SerialwrapService._on_watcher_tick` 於 DeviceWatcher 每 1.0 s 週期回呼中先呼叫 `WalWriter.tick()` 再 `reconcile_readiness()`（互不遮蔽）；tick 驅動的現行檔輪替完成時寫入一筆 `WAL_ROTATED_AFTER_DEFERRAL` META（新 seq，`archived_through_seq`；登記於 `contracts/wal_meta_events.schema.json`），使無後續 append 時現行檔仍存在、`healthy` 不受干擾影響，且重啟後 seq 續接。Rust 須承接相同行為 | SPEC（新行為）；Rust `sw-pal` wal_fs 與 arch §5.8 須承接（plan 06 P5 交叉引用） | `sw_core/wal.py`、`contracts/daemon_logging.yaml`（wal.py 行號同步）、`contracts/rpc_schema.json` |
+| OD-19-HEALTH-KEYS | `health.status` 的 `wal` 物件現有 `write_failures`、`recreated_count` 等，無輪替干擾計數 | 新增 `rotate_retry`（暫時性輪替失敗次數）、`rotate_deferred`（轉入延遲佇列次數）、`deferred_delete_pending`（目前延後中的段落數）；皆為整數、僅供觀測，不改 `healthy` | SPEC（對外契約新增欄位，`required` 同步）；BC 基線與 A/B golden 不含此欄，正規化未放寬 | `contracts/rpc_schema.json`、`sw_core/wal.py` `health()`；doctor `wal_writable` 不消費新鍵 |
+| OD-19-UNLINK-SCOPE | 規格 §8.2 與 WAL-D5、WAL-1.4b 的「unlink」指外部刪除偵測（BC-01） | 產品 WAL 目前不主動刪除段落。本裁決的「unlink」指 rotate 收尾的名稱移除（POSIX link＋unlink 降級路徑）與外部 unlink 後的重建；延遲佇列承接這兩類被干擾的名稱操作。本裁決不新增段落刪除，稽核紀錄保留 | IMPL（註記，待審查確認） | `sw_core/wal.py`、`sw_core/wal_fs.py` |
+| OD-19-ORACLE | 既有測試釘住「rotation_failed 下一筆即清除、輪替即時完成」與「EDR 未知即 BLOCKED-OWNER」等舊語意 | 保留不弱化的斷言；Windows 原生案例改為有界等待「最終完成」；gate 判準改為 binary_integrity；EDR 相關測試改寫。皆為 oracle 變更，需兩位審查者審查（見 commit 的 justification）；另增 `av_sim --oplock` 原生 Windows 測試，仍待擁有者機台實跑與登錄證據 | TEST（oracle 變更） | `tests/test_stage0_wal_rotate.py`、`tests/test_rust_stage1a_gate.py`、`tests/test_stage0_hw_cases.py`、`tests/test_rust_win_func_test.py`、`tests/test_stage0_wal_av_sim.py` |
+| OD-19-LATENCY | 規格 §1.2、§13 的 WAL 寫入延遲上限 | Spike 3 producer 對每次 `WalWriter.append` 記錄毫秒樣本；gate 驗證樣本存在、有限且非負，並以最大值對照 owner 核准上限。上限未裁決前即使樣本有效也回 BLOCKED-OWNER；注入式單元測試的 50 ms 只作本機 sanity check，不構成正式門檻 | DOC＋TEST；數值待 owner 決議 | `scripts/stage0/spike3_win_wal.py`、`spike3_evidence.schema.json`、`stage1a_gate.py`、plan 04、06 |
+| OD-19-SPIKE3-ACCOUNTING | Spike 3 rotate／reader／F12 的 append 計數、總 WAL 列與連續 seq；unlink 的干擾事實 | 延後輪替產生的 `WAL_ROTATED_AFTER_DEFERRAL` META 計入總列／seq，不計入資料 append；gate 對帳 `records = append_count + continuity_meta_count`，要求從 seq 1 至總列數連續。unlink 只有在 helper grabs、實際 `ERROR_SHARING_VIOLATION` 與成功重試皆有觀察時才可進入 latency owner gate；缺少任一項為 evidence-insufficient。此為新增 evidence oracle，尚待獨立審查。 | TEST（oracle 收緊，待審） | `scripts/stage0/spike3_win_wal.py`、`scripts/rust/stage1a_gate.py`、`tests/test_rust_stage1a_gate.py`、`tests/test_stage0_wal_av_sim.py` |
+
+**不在本段範圍**：`tests/acceptance/cases.yaml` 與 `cases.lock.json` 的 `win-wal-av-*` 案例 ID 維持不變（凍結鎖未修訂）；新 nodeid 的 `s0_bc` add-only 登記與 addenda 的 RESOLVED 標記由 G8 處理。
 
 ---
 
