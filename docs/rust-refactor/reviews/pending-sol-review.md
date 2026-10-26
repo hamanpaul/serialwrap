@@ -71,11 +71,11 @@ Reviewer A（Sonnet max）對上一輪提交提出 8 項 finding，處置如下�
 | Finding | 處置 |
 |---|---|
 | #1 holder overlap oracle | **fixed `77c4c8f`，退場競態補強 `6c9f73b`**：隔離 `pidns_rig` 每筆樣本重掃 `/proc`；zombie／已退出 PID 不再因 EACCES 形成 skip，存活 PID 權限錯誤重試 40×5 ms 後仍 fail-closed。`test_restart_no_stale_console_replay` 隔離 PID namespace 實跑 `1 passed`；Rust-only restart 測試仍未實跑。 |
-| #2 Spike 3 AV share mode | **fixed `19bcc16`、`92cadf4`；第三輪 helper barriers／ready repair `183212a`、normative docs `0ab19ba`**：主注入使用 no-delete share；oplock 獨立記錄。舊四份 Windows producer artifact 是在 `92cadf4` 產生，不能代表目前 HEAD；須 Windows 原生重採。Stage 1A 單案 gate 仍維持 BLOCKED-OWNER（延遲上限待裁決），oracle 尚待獨立複審。 |
+| #2 Spike 3 AV share mode | **fixed `19bcc16`、`92cadf4`；第三輪 helper barriers／ready repair `183212a`、normative docs `0ab19ba`**：主注入使用 no-delete share；oplock 獨立記錄。舊四份 Windows producer artifact 是在 `92cadf4` 產生，不能代表目前 HEAD；須 Windows 原生重採。OD-22 已解除延遲上限待裁決；四案仍須在目前 HEAD 重採 Windows producer artifacts，oracle 尚待獨立複審。 |
 | #3 P4 pointer slash rule | **fixed `bb791b4`**：註冊器先驗 raw `dir`，反斜線與絕對路徑拒絕；恢復原 `test_manifest_pointer_absolute_dir_is_used_as_is` nodeid 並用 OD-18 (3) 期望驗證。 |
 | #4 handoff contract/docs | **fixed `41d4914`、`aa51b4c`**：SC-11、RPC side_effects、P8 plan 與 addenda 同步記錄 TX fence timeout、`SESSION_BUSY`／`tx.in_flight` 與凍結 rollback 語意；待非實作者審查。 |
 | #5 AF_UNIX long path | **fixed `41d4914`**：handoff child socket 使用 `/tmp/sw-*` 並清理，POSIX pytest 預設 basetemp 採短路徑。 |
-| #6 latency bound branches | **fixed `19bcc16`**：新增 owner bound 高於／低於最大樣本的 PASS／FAIL 定點測試；owner 數值仍未裁決，正式列保持 BLOCKED-OWNER。 |
+| #6 latency bound branches | **fixed `19bcc16`，OD-22 本輪完成**：保留超限 FAIL 分支，新增主案例與 oplock 變體的 p99／最大值 boundary 測試；門檻為 p99 ≤100 ms、最大值 ≤600 ms。 |
 | #7 Cargo provenance | **fixed `19bcc16`**：`rustc -vV` 使用 repo cwd；Stage 1A gate 核對 provenance 起訖 HEAD 與 clean 狀態。 |
 | #8 scope／carry-over／oracle inventory | OD-20 超出 OD-14..OD-19 範圍，未改文件消費者或 verdict；36 筆既有未由 OD-16／17 授權的 removal 保持原樣、待 owner；凍結 `test_spike3_pass_with_known_edr_is_pass` nodeid 保留且明確斷言 BLOCKED-OWNER；absolute-dir 原 nodeid 已恢復；handoff infrastructure、addenda count 與 G-REG 鎖數已補正。Bridge 核准 tree `c4c22c0e…` 與目前 `d44a761a…` 不同，保持 OPEN，不改核准值；full pytest 的 docker bridge case 為 INSUFFICIENT_EVIDENCE。 |
 

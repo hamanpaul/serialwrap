@@ -1437,7 +1437,7 @@ git commit -m "feat(sw-pal): 裝置來源掃描、藍牙排除、測試裝置 al
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-pal-walfs.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust PAL WAL 檔案層：常駐 append handle、檔案 identity 與 unlink／DeletePending 偵測、Windows FILE_SHARE_DELETE、不覆蓋既有歸檔的 rename（DF-03）。」）
-**BLOCKED-OWNER：** OD-19 寫入延遲上限尚待 owner 裁決；在裁決前即使有實測樣本，Spike 3 latency verdict 仍為 BLOCKED-OWNER。Windows 原生 Spike 3 artifact 仍須 owner host 產生；EDR 欄位只作參考資訊。
+**Windows Spike 3 evidence（本輪）：** 四案 artifacts 已於 HEAD `42e6d6c` 重採但均為 `INSUFFICIENT_EVIDENCE`，因首次 rotation 完成晚於 lease 到期 12 ms。OD-22 已核准主案例與 oplock 變體的 p99 ≤100 ms、最大值 ≤600 ms 門檻；EDR 欄位只作參考資訊。
 
 **Files:**
 - Create: `crates/sw-pal/src/wal_fs/posix.rs`、`crates/sw-pal/src/wal_fs/windows.rs`
