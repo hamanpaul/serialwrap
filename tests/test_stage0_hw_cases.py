@@ -488,6 +488,10 @@ def test_spike3_evidence_schema_rejects_missing_edr():
     without_av = {k: v for k, v in base.items() if k != "av_sim"}
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=without_av, schema=schema)
+    without_oplock_workload = json.loads(json.dumps(base))
+    without_oplock_workload["observations"].pop("oplock_variant")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_oplock_workload, schema=schema)
     without_integrity = {k: v for k, v in base.items() if k != "binary_integrity"}
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=without_integrity, schema=schema)
