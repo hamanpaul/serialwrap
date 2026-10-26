@@ -738,7 +738,7 @@ pub trait SignalWait: Send + Sync {
 - **`IoWorker`**（`uart_bridge.rs`）：每個 `conn_epoch` 一組，包含：
   - **Reader thread**：read → `WalWriter::append(RX)` → 推送到 ConsoleHub → `UartRxChunk` 送進 data lane。
   - **TxWriter thread**（`tx_writer.rs`）：唯一呼叫 `SerialWriter::write_gated` 的地方（一律帶 `FenceSubmitGate`，§5.4）。
-- **`OpRunner`**：執行前景長操作的 thread，包括 command execute、file transfer、self-test probe、recover 送按鍵與等待、login FSM、force recover 輪詢。一個 session 同時只有一個前景槽（`ForegroundSlot`），對應 Python 的 `_ForegroundOperation`。OpRunner 送 TX 只能向 actor 取得 `TxPermit`，再交給 TxWriter；等待 RX 使用共享的 `RxWindow`（`Arc<Mutex<RxWindow>> + Condvar`，語意照 06 §4.2 的絕對偏移與 `_rx_trimmed`）。
+- **`OpRunner`**：執行前景長操作的 thread，包括 command execute、file transfer、self-test probe、recover 送按鍵與等待、login FSM、force recover 輪詢。一個 session 同時只有一個前景槽（`ForegroundSlot`），對應 Python 的 `_ForegroundOperation`；例外：READY 路徑的 recover 送鍵與 self-test probe 不占前景槽（SES-16.3b KEEP，Python 不取前景 token），只受 TxWriter 單寫入者與 slice 邊界約束（parity-amendments-2026-10-26 #58）。OpRunner 送 TX 只能向 actor 取得 `TxPermit`，再交給 TxWriter；等待 RX 使用共享的 `RxWindow`（`Arc<Mutex<RxWindow>> + Condvar`，語意照 06 §4.2 的絕對偏移與 `_rx_trimmed`）。
 - **`ConsoleHub`**（`human_console.rs`、`telnet_console.rs`）：每 session 一個 thread，處理 PTY master／TCP socket 的入出向；每個 console 有自己的出向 ring（§5.10）。
 
 全域元件：
@@ -1003,7 +1003,7 @@ OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallbac
 4. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
 5. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
 6. 建 Service（帶入步驟 1 的 allowlist 判定）；`StateLoadError` 時 exit 3。
-7. 依序 initial scan → rank → watcher.start（`DF-14`）→ bootstrap attach → flash endpoint。
+7. 依序 initial scan → rank → bootstrap attach → watcher.start（`DF-14`；與 Python `service.start()` 及 P5-T19 `run_inner` 相同，bootstrap 在 watcher.start 之前）→ flash endpoint（parity-amendments-2026-10-26 #66）。
 8. 綁定 RPC，再寫入 config.yaml 的 `socket_path`；寫入失敗印 stderr，視為非致命。
 9. `signals.wait_stop`。
 

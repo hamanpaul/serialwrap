@@ -295,7 +295,7 @@ P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生�
 | UIO-12.1-a | 沒有 flock 與 TIOCEXCL | BC-04 | BC | 加 flock＋TIOCEXCL；因 TIOCEXCL 不撤銷既有 handle，另加鎖後 holder 重掃以拒絕未取 flock 的外部 holder（含 `--force`）；TIOCEXCL 是 tty 物件旗標、不隨 fd 關閉清除，故正常關閉（I/O 收斂後）與 TIOCEXCL 之後的所有失敗路徑都先 `TIOCNXCL` 再 `LOCK_UN`／close（R0-F3；arch §4.2 關閉序） | P1/P5 | no |
 | UIO-12.1-b | `/proc` 不可讀時無法與「無 holder」區分 | BC-04 | BC | `holder_unknown` | P1/P5 | no |
 | UIO-12.1-c | Windows 開檔失敗沒有對應錯誤碼 | BC-04 | BC | ACCESS_DENIED → `DEVICE_STILL_HELD` 加 `holder_unknown:true` | P1/P5 | no |
-| UIO-12.1-d | PROBE bridge 與正式 bridge 之間無鎖交接 | BC-04 | BC | 依序 open、close 並取得 receipt（receipt 須 `excl_cleared:true`，即 PROBE 關閉前已 TIOCNXCL；否則 PTY master 仍開啟時正式 open 得 EBUSY） | P5 | no |
+| UIO-12.1-d | PROBE bridge 與正式 bridge 之間無鎖交接 | BC-04 | BC | **改依 Python P1 T10 凍結（parity-amendments-2026-10-26 #51）**：PROBE 與正式 bridge 共用同一預開 handle，命中後原樣交接、不 close／reopen（`tests/test_stage0_uart_exclusive.py::test_dynamic_probe_and_bridge_share_preopened_port`）；只有 PROBE 未命中而關閉時才需 receipt `excl_cleared:true`（原「依序 open、close 並取得 receipt」為 P1 T10 之前的舊設計，作廢） | P5 | no |
 | UIO-12.1-e | POSIX 忽略 `xonxoff` | — | KEEP | 兩平台的差異收在 PAL 內 | P5 | no |
 | UIO-12.2-a | 沒有 drain | §5.2 | SPEC SC-04 | — | P1/P5 | no |
 | UIO-12.2-b | `_write_all` 遇 EAGAIN 無限重試、無法取消 | §5.2.3 | SPEC SC-04 | 改為可喚醒、可取消 | P1/P5 | no |
@@ -542,3 +542,37 @@ OD-14 對上表的影響（2026-10-16）：RPC-D-02、ERR-7.2-b、ERR-7.3-1、SE
 | NC-04 | `ntpath.normpath`（Windows）：Windows CPython 3.12.10 改用 C 實作 `nt._path_normpath`，與純 Python 語意對病態輸入不同：`C:.\foo`→`C:.\foo`（Rust `C:foo`）、`C:./`→`C:.`（Rust `C:`）、`D:.\`→`D:.`（Rust `D:`）、`\\?\UNC\server\share\..\..\x`→`\\?\UNC\x`（Rust `\\?\UNC\server\share\x`）、`\\?\UNC\server\share\\`→`\\?\UNC\server\share`（Rust 保留尾端 `\`）。Linux 3.12.3 無 `nt._path_normpath`，純 Python 結果一致 | — | IMPL（Rust 保留純 Python 語意，與 `contracts/golden/pypath.windows.tsv` 的產生方式一致；`pypath.rs` 的 `normpath_windows_c_impl_difference_recorded_nc04` 記錄差異）。若要改為 C 語意，需移植 `_Py_normpath`，並以 Windows 3.12.10 重生 golden P3 golden 語料未涵蓋上列輸入；這些輸入是否可由 config、環境變數或 RPC 參數到達，待 T7（`RuntimePaths`）與 T10 確認 | P3 | yes（是否移植 C 語意，待擁有者裁決） |
 | NC-05 | `repr()`（`sw-proto::pyfmt::py_repr`）：CPython 深層巢狀 repr 於約 1000 層擲 `RecursionError`；Rust 以顯式堆疊迭代輸出完整字串，不擲錯 | — | IMPL（Rust-only：迭代實作；深度由 `pyjson::loads` 的 `JSON_MAX_DEPTH`（NC-02）約束） | 遞迴實作在 2900 層（`JSON_MAX_DEPTH`）時，release 約需 1.3～1.5 MiB 堆疊（Windows GNU 預設 2 MiB，餘裕有限）、debug 版超過 2 MiB；stack overflow 會 abort 整個程序，無法轉為錯誤碼 | P3 | no |
 | NC-06 | 主機名小寫化（`endpoint.rs::hostname_of`，對應 `urllib.parse` 的 `hostname`）：Python 3.12.3 的 `str.lower()` 採 Unicode 15.0.0，Rust 1.96.1 的 `str::to_lowercase()` 採 Unicode 17.0.0；兩版對少數非 ASCII 碼位的大小寫對映不同（例：`U+10D50`、`U+1C89`、`U+A7CE`，Python 保留原字元、Rust 轉為小寫）。ASCII 主機名完全一致 | — | IMPL（Rust-only：不另建 Unicode 15 對照表；差異僅限非 ASCII 主機名的大小寫對映） | 只影響非 ASCII 字元的 tcp 主機名；loopback 判定（`LOOPBACK_TCP_HOSTS` 皆為 ASCII）與實際 DUT／daemon endpoint 不受影響 | P3 | no |
+
+## 7. parity-amendments-2026-10-26 登記：刻意但無編號的差異與 1:1 改正（稽核 A／B）
+
+來源：`plans/parity-amendments-2026-10-26.md`（稽核 A `parity-audit-a-external.md`、稽核 B `parity-audit-b-daemon.md`）。本節只登記，不改 `contracts/behavior_changes.yaml`；SC 編號為**候選**（SC-32／SC-33 已保留給 P8），由承接 Task 寫入 `behavior_changes.yaml` 時確認（`approval.owner` 依 `tools/contracts/catalog.py` 規則為 `spec-reconciliation`）。`NC-` 前綴沿用 §6：Rust-only 非契約差異，不參與 A/B 差分、只驗絕對契約。凡會改變外部可觀察行為的 Rust-only 列（SC-37、SC-38、NC-07、NC-08）另列入 parity-amendments OWNER-DECISION **PA-OD-1**，擁有者確認前不得在 A/B 報告中以「已登記」為由放行。
+
+### 7.1 SC 候選（外部可觀察、Rust-only）
+
+| ID | 事實（Python 基線） | Rust | 裁決 | 承接 | 需擁有者 |
+|---|---|---|---|---|---|
+| SC-37（候選）（parity-amendments-2026-10-26 #6；A:D-1、B:A-91） | daemon 端 `SERIALWRAP_RPC_BACKEND`／`_LOCK_BACKEND`／`_DEVICE_BACKEND` 可在 POSIX 強制 `win`（`platform_backends.py:24-76`，測試用途） | P5-T19 `check_backend_env`：合法但非本 build 原生後端 → stderr `serialwrapd: backend '<v>' is not available in this build`、exit 1；CLI 端仍依 `RPC_BACKEND=win` 改用 `tcp://127.0.0.1:48700`（P3 Q-17，與 Python 同） | SPEC（Rust-only；後端於編譯期決定，§3.1）；README／CLAUDE.md 標明 Rust daemon 不支援 | P5-T19 | yes（PA-OD-1） |
+| SC-38（候選）（#1；A:G-1、B:F-S01） | `SERIALWRAP_SERIAL_BACKEND`（auto／posix／termios／pyserial／windows／win32；`serial_port.py:772-803`）可在 Linux 強制 pyserial | 外顯語意照 Python：未知值視為 auto；Windows 強選 posix 時建立 port 失敗（`ATTACH_FAILED:OSError`）；**唯一差異**：POSIX 上 `pyserial` 類值改用原生後端並寫一次 WARNING（Rust 無 pyserial 後端） | SPEC（Rust-only，僅後端替換；RPC／state 輸出不變） | P5-T2／T3 | yes（PA-OD-1） |
+
+### 7.2 NC（Rust-only 非契約差異；內部或僅於資源上限／錯誤路徑可見）
+
+| ID | 事實（Python 基線） | Rust | 裁決 | 承接 | 需擁有者 |
+|---|---|---|---|---|---|
+| NC-07（#72；B:A-94） | Windows 無訊號 handler（`daemon.py:293-301` 只掛 SIGINT／SIGTERM） | Windows `SetConsoleCtrlHandler`（CTRL_C／CTRL_BREAK／CLOSE）＋Task Scheduler /End 走有序停機；POSIX 與 Python 同 | IMPL（Rust-only 新增；arch rust-architecture.md「Windows 停止」、P5-T4） | P5-T4 | yes（PA-OD-1，僅確認「新增」屬可接受） |
+| NC-08（#73；B:A-103） | RPC 連線數無上限（`rpc_posix.py:94-100`） | 上限 128，超過暫停 accept（不拒絕） | IMPL（`resource_limits.yaml`、arch 資源表） | P5-T17 | yes（PA-OD-1） |
+| NC-09（#74；B:E-36） | 速率視窗 4096 筆上限丟最舊（`uart_io.py:33-35`） | merge_oldest（保留 bytes 總和） | IMPL（arch §5.10／resource_limits；對外統計值較 Python 準確，非外部契約欄位） | P5-T10 | no |
+| NC-10（#75；B:E-85） | baud 鏡射原樣複製（含 B0，`uart_io.py:2338-2351`） | B0 視為未設改用 registry baud fallback；Windows `Unsupported` | IMPL（安全理由：B0 會拉低 DTR、重置 MCU；P8-T7） | P8-T7 | no |
+| NC-11（#65；B:F-S07） | `holder_unknown = not pids and status != "ok"`；衝突路徑 `_conflict_holder_report` 在 pids 空時強制 `holder_unknown:true`（`serial_port.py:208-209,429-435`） | 衝突路徑 `finalize_holder_report`：pids 空 → `holder_unknown:true`；鎖後重掃沿用 Python 規則 | 註記（P1 T10 凍結；兩邊輸出等價，非差異）；測試 `conflict_holder_unknown_when_no_pids` | P5-T2 | no |
+| NC-12（#7；A:D-16） | 無 | Rust-only env：`SERIALWRAP_INSTALL_ROOT`（`install_layout.rs`）、`SERIALWRAP_TEST_DELEGATE_GROUP`（`lib.rs`）；`SERIALWRAP_DELEGATE_DEPTH`／`_ARGV_SHA` 已於 NC-03 | IMPL（新增，不改 Python 既有 env）；建議由 P0 契約維護者 add-only 補登 `cli_schema.json` `x-env`（`x-rust-only: true`） | P3／P4（已實作） | no |
+| NC-13（#50、#52、#53；B:C-59、C-69、C-90） | `_spawn_attach` 收尾自動再 spawn（`:3938-3953`）；`revoke_tx_op` 512 筆已取消 cmd tombstone（`:4400-4421`）；watcher 先更新快照再 callback，callback 例外時變化遺失（`device_watcher.py:66-68`） | actor reconcile 再送 `OpenBridge`；`CancelQueued`／`CancelToken` 取代 tombstone；channel Delta 不遺失 | IMPL（架構差異；以對外等價測試 `attach_finish_respawns_when_state_requires`、`cancelled_inflight_command_later_tx_refused`、`watcher_delta_not_lost_when_consumer_rejects` 驗證；C-90 Python 的遺失屬既有缺陷，Rust 不承接遺失） | P5-T16／T9／T5 | no |
+
+### 7.3 改判為 1:1（ALIGN-TO-PYTHON），不登記 SC
+
+稽核列為「刻意但無編號」或「計畫內設計」、但依 OD-14 #1 屬外部可觀察而改回 Python 的項目，記於此處以免日後重複登記：
+
+| ID | 原 Rust 計畫 | 改正（以 Python 為準） | 承接 |
+|---|---|---|---|
+| F-S02（#62） | POSIX `open` 的 `ENODEV`／`ENXIO` → `NotFound`、`EACCES`／`EPERM` → `AccessDenied{holder}`（06 Task 2 原 L1004） | 只有 `ENOENT` → `NotFound`、`EBUSY` → `Held`，其餘一律 `Other`（Python 原樣 raise OSError，`last_error` 為 `ATTACH_FAILED:<類別名>`）；`AccessDenied` 只屬 Windows 後端 | P5-T2；p5 已實作追加修正 |
+| F-S03（#63） | `flock` 只有 `EWOULDBLOCK`／`EAGAIN` → `Held` | `EACCES` 一併 → `Held`（`serial_port.py:387`） | P5-T2；p5 已實作追加修正 |
+| E-42（#59） | Rust 不使用 select，永不產生 `SELECT:<errno>` | 讀取等待階段（poll／WaitForMultipleObjects）錯誤 → `SELECT:<errno>`，與契約 `reason_forms` 一致 | P5-T10 |
+| UIO-12.1-d（#51；B:C-61） | PROBE 關閉取得 receipt 後再開正式 bridge | 共用同一預開 handle（Python P1 T10 凍結），見 §2.6 UIO-12.1-d 列更新 | P5-T16 |
