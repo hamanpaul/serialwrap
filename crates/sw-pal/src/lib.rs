@@ -104,6 +104,8 @@ pub struct Capabilities {
     pub console_kind: ConsoleKind,
     /// 裝置來源後端（arch §4 `Capabilities.native_device`；Task 5 的 `devices` 工廠與 Task 19 組裝點讀取）。
     pub native_device: DeviceBackendKind,
+    /// OD-01 選配 com0com Serial console（SC-29；只在 Windows native 為 true，arch §4）。
+    pub com0com_console: bool,
 }
 
 /// P3 名稱保留（`ClientCaps` 為 `Capabilities` 的別名）。
@@ -224,6 +226,7 @@ pub fn native() -> Platform {
                 on_demand_autostart: false,
                 console_kind: ConsoleKind::Pty,
                 native_device: DeviceBackendKind::Posix,
+                com0com_console: false,
             },
         }
     }
@@ -274,6 +277,7 @@ pub fn native() -> Platform {
                 on_demand_autostart: true,
                 console_kind: ConsoleKind::TcpTelnet,
                 native_device: DeviceBackendKind::Win,
+                com0com_console: false,
             },
         }
     }

@@ -90,6 +90,7 @@ fn event_params_and_dispatch_fail_until_implemented() {
         on_demand_autostart: false,
         console_kind: sw_pal::ConsoleKind::Pty,
         native_device: sw_pal::DeviceBackendKind::Posix,
+        com0com_console: false,
     };
     let p = sw_pal::ClientPlatform {
         env: std::sync::Arc::new(DummySysEnv),

@@ -16,6 +16,13 @@ pub struct TermiosView {
     pub lflag: u64,
     pub vmin: u8,
     pub vtime: u8,
+    /// 平台 `CREAD`／`CLOCAL`／`CS8` 位元值（讓斷言不必直接碰 `libc`）。
+    #[allow(non_snake_case)]
+    pub CREAD: u64,
+    #[allow(non_snake_case)]
+    pub CLOCAL: u64,
+    #[allow(non_snake_case)]
+    pub CS8: u64,
 }
 
 pub fn tcgetattr_path(_p: &str) -> PalResult<TermiosView> {
@@ -44,5 +51,26 @@ pub fn nodelay(_io: &dyn ConsoleIo) -> bool {
 }
 
 pub fn reuseaddr(_l: &dyn ConsoleListener) -> bool {
+    todo!("P6 Task 8")
+}
+
+/// 連線到已關閉 loopback port 的錯誤（`winsock_error_message_format`）。
+pub fn tcp_connect_closed_port_error() -> crate::traits::PalError {
+    todo!("P6 Task 8")
+}
+
+/// com0com console handle 上的設定 API 呼叫計數（SC-29 控制線隔離證據）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommApiCalls {
+    pub set_comm_state: u32,
+    pub escape_comm_function: u32,
+}
+
+pub fn comm_api_calls(_io: &dyn ConsoleIo) -> CommApiCalls {
+    todo!("P6 Task 8")
+}
+
+/// 對 peer 端（COMb）改 baud 並切換 DTR／RTS。
+pub fn toggle_peer_modem_lines(_port: &str) {
     todo!("P6 Task 8")
 }

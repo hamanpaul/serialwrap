@@ -2,6 +2,13 @@
 //! 替身不得冒充原生 gate（arch §11.2、OD-08）。
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::console_mux::{ConsoleMux, MuxHandle};
+use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, PtyPair};
+use crate::traits::{IoWaker, PalResult, ReadOutcome};
+use crate::ConsoleKind;
 
 /// 記憶體 console 工廠（`ConsoleTransportFactory` 替身；Task 8 實作 trait）。
 pub struct FakeConsoleFactory {
@@ -35,6 +42,10 @@ impl FakeIo {
     pub fn failing_read() -> FakeIo {
         todo!("P6 Task 8")
     }
+    /// 測試端參照（與此 io 共用狀態）。
+    pub fn reference(&self) -> FakeConsoleRef {
+        todo!("P6 Task 8")
+    }
 }
 
 impl FakeConsoleRef {
@@ -56,6 +67,10 @@ impl FakeConsoleRef {
 }
 
 impl FakeConsoleFactory {
+    /// 指定 `kind` 的替身工廠。
+    pub fn new(_kind: ConsoleKind) -> FakeConsoleFactory {
+        todo!("P6 Task 8")
+    }
     /// 模擬一個 TCP client 連入 listener。
     pub fn connect(&self) -> FakeConsoleRef {
         todo!("P6 Task 8")
@@ -66,6 +81,48 @@ impl FakeConsoleFactory {
     }
     /// `held_slave_paths` 的回傳值。
     pub fn set_held(&self, _held: Option<HashSet<String>>) {
+        todo!("P6 Task 8")
+    }
+}
+
+impl ConsoleIo for FakeIo {
+    fn read(&mut self, _buf: &mut [u8], _timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+        todo!("P6 Task 8")
+    }
+    fn try_write(&mut self, _data: &[u8]) -> PalResult<usize> {
+        todo!("P6 Task 8")
+    }
+    fn waker(&self) -> Arc<dyn IoWaker> {
+        todo!("P6 Task 8")
+    }
+    fn has_external_peer(&self, _held: Option<&HashSet<String>>) -> bool {
+        todo!("P6 Task 8")
+    }
+    fn close(self: Box<Self>) {
+        todo!("P6 Task 8")
+    }
+    fn mux_handle(&self) -> MuxHandle {
+        todo!("P6 Task 8")
+    }
+}
+
+impl ConsoleTransportFactory for FakeConsoleFactory {
+    fn kind(&self) -> ConsoleKind {
+        todo!("P6 Task 8")
+    }
+    fn create_pty(&self) -> PalResult<PtyPair> {
+        todo!("P6 Task 8")
+    }
+    fn bind_tcp_console(&self) -> PalResult<Box<dyn ConsoleListener>> {
+        todo!("P6 Task 8")
+    }
+    fn open_com0com_console(&self, _port: &str) -> PalResult<Box<dyn ConsoleIo>> {
+        todo!("P6 Task 8")
+    }
+    fn held_slave_paths(&self) -> Option<HashSet<String>> {
+        todo!("P6 Task 8")
+    }
+    fn new_mux(&self) -> PalResult<Box<dyn ConsoleMux>> {
         todo!("P6 Task 8")
     }
 }
