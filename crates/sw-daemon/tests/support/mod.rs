@@ -594,3 +594,32 @@ pub fn child_daemon_abort_before_commit() {
 pub fn process_vars() -> BTreeMap<String, String> {
     std::env::vars().collect()
 }
+
+/// `slice21_scope.yaml` 的 `deferred_methods` 中，`slice` 不在 `delivered`（已交付切片）內的方法名，依檔案順序
+/// （07 增補 #24；parity-amendments-2026-10-26 #186）。只認 `deferred_methods:` 區段內的
+/// `- {method: <名>, slice: "<X.Y>"}` 流式列（該檔唯一格式），遇下一個頂層鍵即停止；不依賴 `ServiceRig`。
+pub fn deferred_methods(yaml: &str, delivered: &[&str]) -> Vec<String> {
+    fn field<'a>(item: &'a str, key: &str) -> Option<&'a str> {
+        item.split(',').find_map(|kv| {
+            let (k, v) = kv.split_once(':')?;
+            (k.trim() == key).then(|| v.trim().trim_matches(|c| c == '"' || c == '\''))
+        })
+    }
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in yaml.lines() {
+        if !line.starts_with([' ', '-', '#']) && !line.is_empty() {
+            in_section = line.trim_end().starts_with("deferred_methods:");
+            continue;
+        }
+        let Some(item) = in_section.then(|| line.trim().strip_prefix("- {")).flatten() else { continue };
+        let item = item.split('}').next().unwrap_or_default();
+        let (Some(method), Some(slice)) = (field(item, "method"), field(item, "slice")) else {
+            panic!("deferred_methods 列格式不符：{line}");
+        };
+        if !delivered.contains(&slice) {
+            out.push(method.to_string());
+        }
+    }
+    out
+}

@@ -549,7 +549,7 @@ pub fn nodelay(io: &dyn ConsoleIo) -> bool; pub fn reuseaddr(l: &dyn ConsoleList
 // crates/sw-daemon/tests/support/mod.rs（06 既有，P6 追加）
 impl ServiceRig { pub fn with_console_backend(kind: &str) -> ServiceRig; pub fn uart_writes(&self) -> Vec<Vec<u8>>;
                  pub fn console_ring_stats(&self, client_id: &str) -> (usize /* display_bytes */, u64 /* dropped_total */); }
-pub fn deferred_methods(yaml: &str, delivered: &str) -> Vec<String>;      // 只回 slice 晚於 delivered 的列（增補清單 #24）
+pub fn deferred_methods(yaml: &str, delivered: &[&str]) -> Vec<String>; // 只回 slice 不在已交付切片 delivered 內的列（增補清單 #24；簽章依 parity-amendments-2026-10-26 #186）
 ```
 
 骨架中 Task 2～10 的公開函式先以 `todo!("P6 Task N")` 實作，型別與簽章照各 Task 的 Produces 段落逐字建立；06 既有函式**不得**改成 `todo!`。新增的 enum 變體在 06 既有 `match` 中以 `todo!("P6 Task N")` 分支補齊，使 workspace 可編譯。
