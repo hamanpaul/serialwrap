@@ -804,6 +804,7 @@ def test_l1_cargo_provenance_does_not_overwrite_a_real_fail(tree):
     _, gate_report = tree.run()
     row = _l1_row(gate_report, "s1a_cargo", "linux")
     assert row["verdict"] == "FAIL", row
+    assert any("provenance" in reason.lower() for reason in row["reasons"]), row
     assert gate_report["overall"] == "FAIL"
 
 
@@ -1249,7 +1250,17 @@ def _spike3_observations(case_id: str) -> dict[str, Any]:
         "win-wal-av-reader-handle": 401,
         "win-wal-f12-progress": 403,
     }[case_id]
-    common = {"append_count": append_count, "append_latency_ms": [1.0] * append_count}
+    common = {
+        "append_count": append_count, "append_latency_ms": [1.0] * append_count,
+        "oplock_variant": {
+            "append_count": 403, "append_latency_ms": [0.5] * 403,
+            "archives": 1, "records": 403, "continuity_meta_count": 0,
+            "first_seq": 1, "last_seq": 403, "seq_continuous": True,
+            "rotate_retry": 0, "deferred_delete_pending": 0, "write_failures": 0,
+            "pre_rotate": {"ok": True}, "post_rotate": {"ok": True}, "crc_errors": [],
+            "interference_observed": True,
+        },
+    }
     if case_id == "win-wal-av-rotate":
         return {
             **common,
@@ -1550,6 +1561,27 @@ def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
     code, rep = tree.run()
     assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
     assert rep["overall"] == "FAIL"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "no_archive", "marker", "sequence"])
+def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
+    """具備 helper grabs 仍不足：oplock 變體須證明寫入、輪替、F12 marker 與連續 WAL。"""
+    def damage(doc: dict[str, Any]) -> None:
+        workload = doc["observations"]["oplock_variant"]
+        if mutation == "missing":
+            doc["observations"].pop("oplock_variant")
+        elif mutation == "no_archive":
+            workload["archives"] = 0
+        elif mutation == "marker":
+            workload["post_rotate"]["ok"] = False
+        else:
+            workload["seq_continuous"] = False
+
+    _enable_spike3(tree, mutate=damage)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+    assert code == 1
 
 
 def test_spike3_oplock_helper_cannot_replace_no_delete_injection(tree):

@@ -255,7 +255,7 @@ def test_av_sim_oplock_variant_is_wired(monkeypatch):
     monkeypatch.setattr(av, "run_helper", fake_helper)
     rc = av.main(
         ["--watch-dir", ".", "--seed", "1", "--duration-s", "0", "--ready-file", "r",
-         "--stop-file", "s", "--log-file", "l", "--oplock"]
+         "--stop-file", "s", "--log-file", "l", "--go-file", "g", "--ack-file", "a", "--oplock"]
     )
     assert rc == 0
     assert seen["oplock"] is True
@@ -297,6 +297,9 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
         def ready_holds(self, name):
             return name == "raw.wal.ndjson"
 
+        def arm_hold(self, _name):
+            return True
+
         def stop(self):
             self.rec.observations["av_sim"]["variants"][self.variant].update(
                 {"grabs": 1, "helper_exit": 0, "oplock": "granted"}
@@ -309,6 +312,110 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
     assert recorder.observations["av_sim"]["variants"]["oplock"]["share_mode"] == (
         "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"
     )
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_path):
+    """oplock 持有期間須實際 append、跨 rotate，並由 F12 oracle 讀到前後 marker。"""
+    import importlib.util
+    from sw_core import wal
+    from realhw import wal_oracle
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_oplock_workload_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    events: list[tuple[str, int]] = []
+
+    class FakeWriter:
+        def __init__(self, *, wal_dir, rotate_bytes):
+            self.wal_dir = Path(wal_dir)
+            self.wal_dir.mkdir(parents=True, exist_ok=True)
+            self.index = 0
+
+        def append(self, *, payload, **_kwargs):
+            self.index += 1
+            if self.index == 1:
+                (self.wal_dir / "raw.wal.ndjson").write_bytes(b"prefill\n")
+            events.append(("append", self.index))
+            return {"seq": self.index}
+
+        def health(self):
+            return {"rotate_retry": 1, "rotate_deferred": 0, "deferred_delete_pending": 0,
+                    "write_failures": 0}
+
+        def close(self):
+            pass
+
+        def tick(self):
+            pass
+
+    class FakeHelper:
+        def __init__(self, wal_dir, seed, rec, *, oplock=False, variant=None):
+            rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = {
+                **module._av_sim_module().describe(seed, oplock=oplock),
+                "launch_error": "not_started", "grabs": None, "open_errors": None,
+                "helper_exit": None,
+            }
+            self.rec = rec
+            self.variant = variant
+
+        def start(self):
+            events.append(("helper_start", 0))
+            self.rec.observations["av_sim"]["variants"][self.variant]["launch_error"] = "none"
+            return True
+
+        def ready_holds(self, _name):
+            return True
+
+        def arm_hold(self, _name):
+            events.append(("helper_rearm", 0))
+            return True
+
+        def stop(self):
+            self.rec.observations["av_sim"]["variants"][self.variant].update(
+                {"grabs": 1, "open_errors": 0, "helper_exit": 0, "oplock": "granted"}
+            )
+
+    class OracleResult:
+        ok = True
+        reason_code = "none"
+        diagnostics = {}
+
+    monkeypatch.setattr(wal, "WalWriter", FakeWriter)
+    monkeypatch.setattr(module, "AvHelper", FakeHelper)
+    monkeypatch.setattr(module, "_work_dir", lambda _name: tmp_path / "oplock-work")
+    monkeypatch.setattr(module, "_drain_writer", lambda *_args: None)
+    monkeypatch.setattr(module.glob, "glob", lambda _pattern: [
+        str(tmp_path / "oplock-work" / "raw.wal.ndjson"),
+        str(tmp_path / "oplock-work" / "raw.wal.ndjson.1"),
+    ])
+    monkeypatch.setattr(module, "_read_records", lambda _path: [{"seq": i} for i in range(1, 404)])
+    monkeypatch.setattr(module, "_continuity_meta_count", lambda _records: 0)
+    monkeypatch.setattr(module, "_seq_continuous", lambda _records: True)
+    monkeypatch.setattr(wal_oracle, "open_cursor", lambda _path: object())
+    monkeypatch.setattr(wal_oracle, "wait_for_marker", lambda *_args, **_kwargs: OracleResult())
+    monkeypatch.setattr(wal_oracle, "verify_record", lambda _row: None)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    recorder = module.Recorder()
+    recorder.observations["av_sim"] = {
+        **module._av_sim_module().describe(SEED),
+        "launch_error": "none", "grabs": 1, "open_errors": 0, "helper_exit": 0,
+        "variants": {},
+    }
+
+    assert module._collect_oplock_variant(tmp_path, recorder) is True
+
+    workload = recorder.observations["oplock_variant"]
+    assert events.index(("append", 1)) < events.index(("helper_start", 0))
+    assert events.index(("helper_start", 0)) < events.index(("helper_rearm", 0))
+    assert events.index(("helper_rearm", 0)) < events.index(("append", 2))
+    assert workload["append_count"] == 403
+    assert workload["archives"] == 1
+    assert workload["pre_rotate"]["ok"] is True and workload["post_rotate"]["ok"] is True
+    assert workload["seq_continuous"] is True and workload["crc_errors"] == []
 
 
 @pytest.mark.core_portable
@@ -367,7 +474,8 @@ def test_av_sim_helper_rejects_non_windows_host(tmp_path):
     rc = av.main(
         ["--watch-dir", str(tmp_path), "--seed", "1", "--duration-s", "0",
          "--ready-file", str(tmp_path / "r"), "--stop-file", str(tmp_path / "s"),
-         "--log-file", str(tmp_path / "l")]
+         "--log-file", str(tmp_path / "l"), "--go-file", str(tmp_path / "g"),
+         "--ack-file", str(tmp_path / "a")]
     )
     assert rc == av.EXIT_NOT_WINDOWS
     assert not (tmp_path / "r").exists(), "非 Windows 不得產生 ready 旗標（不得偽裝為已佔用）"
@@ -388,7 +496,8 @@ def test_native_av_sim_helper_holds_wal_and_writer_completes(tmp_path):
     proc = subprocess.Popen(
         [sys.executable, str(AV_SIM_PATH), "--watch-dir", str(wal_dir), "--seed", str(SEED),
          "--duration-s", "120", "--ready-file", str(ready), "--stop-file", str(stop),
-         "--log-file", str(log)]
+         "--log-file", str(log), "--go-file", str(tmp_path / "helper.go"),
+         "--ack-file", str(tmp_path / "helper.ack")]
     )
     try:
         ready_record = _wait_ready_record(ready, 10.0)
@@ -442,7 +551,8 @@ def test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live(tmp_pat
     proc = subprocess.Popen(
         [sys.executable, str(AV_SIM_PATH), "--watch-dir", str(wal_dir), "--seed", str(SEED),
          "--duration-s", "30", "--ready-file", str(ready), "--stop-file", str(stop),
-         "--log-file", str(log), "--oplock"]
+         "--log-file", str(log), "--go-file", str(tmp_path / "oplock.go"),
+         "--ack-file", str(tmp_path / "oplock.ack"), "--oplock"]
     )
     writer = None
     try:
@@ -539,10 +649,37 @@ def test_spike3_writes_insufficient_evidence_when_schema_validation_fails(monkey
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    real_os = module.os
+    case_called = False
+    edr_called = False
+
+    class WindowsOSProxy:
+        name = "nt"
+
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+    def fake_case(rec, _args):
+        nonlocal case_called
+        case_called = True
+        rec.observations["av_sim"] = {
+            **module._av_sim_module().describe(module.SPIKE3_SEED),
+            "launch_error": "none", "grabs": 1, "open_errors": 0, "helper_exit": 0,
+        }
+        return "PASS", "none"
+
+    def fake_query_edr():
+        nonlocal edr_called
+        edr_called = True
+        return {"product": "test", "status": "unknown", "interceptions": "unknown"}
 
     def fail_validation(_evidence):
         raise jsonschema.ValidationError("injected schema failure")
 
+    monkeypatch.setattr(module, "os", WindowsOSProxy())
+    monkeypatch.setattr(module, "query_edr", fake_query_edr)
+    monkeypatch.setattr(module, "gather_env", lambda *_args: {"os": "Windows 11"})
+    monkeypatch.setitem(module.CASE_FUNCS, module.CASE_IDS[0], fake_case)
     monkeypatch.setattr(module, "_validate", fail_validation)
     evidence_dir = tmp_path / "evidence"
     rc = module.run_case(module.argparse.Namespace(
@@ -551,6 +688,7 @@ def test_spike3_writes_insufficient_evidence_when_schema_validation_fails(monkey
 
     evidence = json.loads((evidence_dir / f"{module.CASE_IDS[0]}.json").read_text(encoding="utf-8"))
     assert rc != 0
+    assert case_called and edr_called
     assert evidence["verdict"] == "INSUFFICIENT_EVIDENCE"
     assert "injected schema failure" in evidence["observations"]["evidence_validation_error"]
 
@@ -627,6 +765,69 @@ def test_av_sim_ready_record_uses_atomic_replace(monkeypatch, tmp_path):
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_av_sim_ready_publication_retries_permission_errors(monkeypatch, tmp_path):
+    """Windows scanner 短暫佔用暫存檔時，有界重試後仍須完整發布 ready。"""
+    av = _av()
+    ready = tmp_path / "ready.flag"
+    real_replace = av.os.replace
+    attempts = 0
+
+    def flaky_replace(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise PermissionError("injected sharing violation")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(av.os, "replace", flaky_replace)
+    av._publish_ready_record(ready, ["raw.wal.ndjson"])
+
+    assert attempts == 3
+    assert json.loads(ready.read_text(encoding="utf-8")) == {
+        "ready": True, "held_files": ["raw.wal.ndjson"],
+    }
+    assert not list(tmp_path.glob(".ready.flag.*.tmp"))
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_av_sim_rearm_request_reopens_seen_wal_and_acks_live_lease(monkeypatch, tmp_path):
+    """已在首次掃描 seen 集合中的 WAL 仍可由 go 握手重新開啟並回傳 lease。"""
+    av = _av()
+    wal_path = tmp_path / "raw.wal.ndjson"
+    wal_path.write_bytes(b"prefill\n")
+    go_file = tmp_path / "helper.go"
+    ack_file = tmp_path / "helper.ack"
+    go_file.write_text(json.dumps({"request_id": "test-1", "name": wal_path.name}), encoding="utf-8")
+    opened: list[str] = []
+    monkeypatch.setattr(av, "_open_share_hold", lambda path: opened.append(path) or 123)
+    holds = []
+    seen_request_ids: set[str] = set()
+    counts = {"grabs": 0, "open_errors": 0}
+    events: list[dict[str, Any]] = []
+
+    av._process_rearm_request(
+        watch_dir=str(tmp_path), go_file=str(go_file), ack_file=str(ack_file),
+        seen_request_ids=seen_request_ids, holds=holds, schedule=av.HoldSchedule(SEED), now=10.0,
+        counts=counts, events=events, oplock=False,
+    )
+    av._process_rearm_request(
+        watch_dir=str(tmp_path), go_file=str(go_file), ack_file=str(ack_file),
+        seen_request_ids=seen_request_ids, holds=holds, schedule=av.HoldSchedule(SEED), now=10.0,
+        counts=counts, events=events, oplock=False,
+    )
+
+    ack = json.loads(ack_file.read_text(encoding="utf-8"))
+    assert opened == [str(wal_path)]
+    assert ack["request_id"] == "test-1" and ack["held_file"] == wal_path.name
+    assert 10 <= ack["hold_ms"] <= 500
+    assert len(holds) == 1 and holds[0].lease.handle == 123 and len(events) == 1
+    assert holds[0].until > 10.0 and counts["grabs"] == 1
+    assert events[0]["event"] == "rearm"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_spike3_helper_requires_existing_wal_and_confirmed_handle(monkeypatch, tmp_path):
     """Spike 3 helper 僅能在 WAL 已存在且 ready 確認持有後回傳。"""
     import importlib.util
@@ -651,6 +852,10 @@ def test_spike3_helper_requires_existing_wal_and_confirmed_handle(monkeypatch, t
             events.append(("ready_holds", name == "raw.wal.ndjson" and self.wal_path.is_file()))
             return self.wal_path.is_file() and name == "raw.wal.ndjson"
 
+        def arm_hold(self, name):
+            events.append(("arm_hold", name == "raw.wal.ndjson" and self.wal_path.is_file()))
+            return self.wal_path.is_file() and name == "raw.wal.ndjson"
+
         def stop(self):
             events.append(("stop", self.wal_path.is_file()))
 
@@ -664,8 +869,195 @@ def test_spike3_helper_requires_existing_wal_and_confirmed_handle(monkeypatch, t
     helper = module._start_av_helper_with_wal(tmp_path, rec)
     assert isinstance(helper, FakeHelper)
     assert events == [
-        ("constructed", True), ("start", True), ("ready_holds", True),
+        ("constructed", True), ("start", True), ("ready_holds", True), ("arm_hold", True),
     ]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_helper_stops_when_ready_does_not_hold_wal(monkeypatch, tmp_path):
+    """沒有取得既存 WAL 的 helper 必須先停止，再拒絕讓案例開始。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_helper_failed_barrier_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
+    events: list[str] = []
+
+    class FakeHelper:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            events.append("start")
+            return True
+
+        def ready_holds(self, _name):
+            events.append("ready_holds")
+            return False
+
+        def stop(self):
+            events.append("stop")
+
+    monkeypatch.setattr(module, "AvHelper", FakeHelper)
+    with pytest.raises(RuntimeError, match="首次掃描未持有"):
+        module._start_av_helper_with_wal(tmp_path, module.Recorder())
+    assert events == ["start", "ready_holds", "stop"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_helper_rearms_after_delayed_ready(monkeypatch, tmp_path):
+    """ready 讀取延遲超過最長 lease 後，刺激前必須重新取得有效持有。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_delayed_ready_rearm_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
+    events: list[str] = []
+    real_sleep = time.sleep
+
+    class FakeHelper:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            real_sleep(0.55)
+            return True
+
+        def ready_holds(self, name):
+            events.append(("ready_holds", name))
+            return name == "raw.wal.ndjson"
+
+        def arm_hold(self, name):
+            events.append(("arm_hold", name))
+            return True
+
+        def stop(self):
+            events.append(("stop", ""))
+
+    monkeypatch.setattr(module, "AvHelper", FakeHelper)
+    module._start_av_helper_with_wal(tmp_path, module.Recorder())
+    assert events == [
+        ("ready_holds", "raw.wal.ndjson"),
+        ("arm_hold", "raw.wal.ndjson"),
+    ]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
+    """case_rotate 先建 WAL、啟動並重新武裝 helper，再執行剩餘 399 次 append。"""
+    import importlib.util
+    from sw_core import wal
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_rotate_case_order_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    events: list[tuple[str, int]] = []
+
+    class FakeWriter:
+        def __init__(self, *, wal_dir, rotate_bytes):
+            self.wal_dir = Path(wal_dir)
+            self.wal_dir.mkdir(parents=True, exist_ok=True)
+            self.index = 0
+
+        def append(self, **_kwargs):
+            self.index += 1
+            if self.index == 1:
+                (self.wal_dir / "raw.wal.ndjson").write_bytes(b"prefill\n")
+            events.append(("append", self.index))
+            return {}
+
+        def health(self):
+            return {"rotate_retry": 1, "rotate_deferred": 0, "deferred_delete_pending": 0}
+
+        def close(self):
+            pass
+
+        def tick(self):
+            pass
+
+    class FakeHelper:
+        def __init__(self, _wal_dir, _seed, rec, **_kwargs):
+            self.rec = rec
+
+        def start(self):
+            events.append(("helper_start", 0))
+            self.rec.observations["av_sim"] = {"grabs": 1, "launch_error": "none"}
+            return True
+
+        def ready_holds(self, _name):
+            events.append(("ready", 0))
+            return True
+
+        def arm_hold(self, _name):
+            events.append(("rearm", 0))
+            return True
+
+        def stop(self):
+            events.append(("helper_stop", 0))
+
+    monkeypatch.setattr(wal, "WalWriter", FakeWriter)
+    monkeypatch.setattr(module, "AvHelper", FakeHelper)
+    monkeypatch.setattr(module, "_work_dir", lambda _name: tmp_path)
+    monkeypatch.setattr(module, "_drain_writer", lambda *_args: None)
+    monkeypatch.setattr(module.glob, "glob", lambda _pattern: [
+        str(tmp_path / "raw.wal.ndjson"), str(tmp_path / "raw.wal.ndjson.1"),
+    ])
+    monkeypatch.setattr(module, "_read_records", lambda _path: [{"seq": i} for i in range(1, 401)])
+    monkeypatch.setattr(module, "_continuity_meta_count", lambda _records: 0)
+    monkeypatch.setattr(module, "_seq_continuous", lambda _records: True)
+    rec = module.Recorder()
+
+    status, _reason = module.case_rotate(rec, module.argparse.Namespace())
+
+    assert status == "PASS"
+    assert events[0] == ("append", 1)
+    assert events.index(("append", 1)) < events.index(("helper_start", 0))
+    assert events.index(("helper_start", 0)) < events.index(("rearm", 0))
+    assert events.index(("rearm", 0)) < events.index(("append", 2))
+    assert len([event for event in events if event[0] == "append"]) == 400
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_case_barriers_and_atomic_ready_call_sites_are_wired():
+    """四案共用預填 WAL／helper barrier，helper ready 使用原子發布函式。"""
+    import ast
+
+    source = (REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    case_names = ("case_rotate", "case_unlink", "case_reader_handle", "case_f12_progress")
+    for name in case_names:
+        calls = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Call)]
+        assert any(isinstance(call.func, ast.Name) and call.func.id == "_start_av_helper_with_wal" for call in calls)
+        assert not any(isinstance(call.func, ast.Name) and call.func.id == "AvHelper" for call in calls)
+        append_lines = [call.lineno for call in calls if isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "append" and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "writer"]
+        helper_lines = [call.lineno for call in calls if isinstance(call.func, ast.Name)
+                        and call.func.id == "_start_av_helper_with_wal"]
+        assert append_lines and helper_lines and min(append_lines) < min(helper_lines)
+
+    av_source = (REPO_ROOT / "scripts" / "stage0" / "av_sim.py").read_text(encoding="utf-8")
+    av_tree = ast.parse(av_source)
+    av_run_helper = next(node for node in ast.walk(av_tree)
+                         if isinstance(node, ast.FunctionDef) and node.name == "run_helper")
+    helper_calls = [node for node in ast.walk(av_run_helper) if isinstance(node, ast.Call)]
+    assert any(isinstance(call.func, ast.Name) and call.func.id == "_publish_ready_record" for call in helper_calls)
 
 
 @pytest.mark.core_portable
@@ -696,6 +1088,9 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
             return True
 
         def ready_holds(self, name: str) -> bool:
+            return name == "raw.wal.ndjson"
+
+        def arm_hold(self, name: str) -> bool:
             return name == "raw.wal.ndjson"
 
         def stop(self):

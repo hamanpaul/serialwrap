@@ -425,7 +425,16 @@ def test_spike3_evidence_schema_rejects_missing_edr():
         "env": {"os": "windows"},
         "artifact": {"binary": "sw-core.exe"},
         "steps": [{"op": "rotate", "ts": "2026-10-16T12:00:01Z", "result": "ok"}],
-        "observations": {"append_count": 1, "append_latency_ms": [0.1], "rotated": True},
+        "observations": {
+            "append_count": 1, "append_latency_ms": [0.1], "rotated": True,
+            "oplock_variant": {
+                "append_count": 1, "append_latency_ms": [0.1], "archives": 1, "records": 1,
+                "continuity_meta_count": 0, "first_seq": 1, "last_seq": 1,
+                "seq_continuous": True, "rotate_retry": 0, "deferred_delete_pending": 0,
+                "write_failures": 0, "pre_rotate": {"ok": True}, "post_rotate": {"ok": True},
+                "crc_errors": [], "interference_observed": True,
+            },
+        },
         "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
                    "hold_ms_range": [10, 500], "seed": 1, "oplock": "not_requested",
                    "launch_error": "none", "grabs": 1, "helper_exit": 0,

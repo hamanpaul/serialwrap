@@ -491,6 +491,60 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
         if drain.get("drained") is not True:
             reasons.append("observations.drain.drained 非 true")
 
+    oplock_workload = observations.get("oplock_variant")
+    if not isinstance(oplock_workload, dict):
+        reasons.append("observations.oplock_variant 缺少獨立 append／rotate／F12 workload")
+    else:
+        variant_count = oplock_workload.get("append_count")
+        variant_samples = oplock_workload.get("append_latency_ms")
+        if not isinstance(variant_count, int) or isinstance(variant_count, bool) or variant_count < 1:
+            reasons.append("observations.oplock_variant.append_count 須為正整數")
+            variant_count = None
+        if not isinstance(variant_samples, list) or not variant_samples:
+            reasons.append("observations.oplock_variant.append_latency_ms 須為非空陣列")
+        elif any(
+            isinstance(sample, bool) or not isinstance(sample, (int, float))
+            or (isinstance(sample, float) and not math.isfinite(sample)) or sample < 0
+            for sample in variant_samples
+        ):
+            reasons.append("observations.oplock_variant.append_latency_ms 須為有限非負數")
+        elif variant_count is not None and len(variant_samples) != variant_count:
+            reasons.append("observations.oplock_variant append_count 與 latency 樣本數不符")
+        variant_archives = oplock_workload.get("archives")
+        if not isinstance(variant_archives, int) or isinstance(variant_archives, bool) or variant_archives < 1:
+            reasons.append("observations.oplock_variant.archives 須至少為 1")
+        variant_records = oplock_workload.get("records")
+        if not isinstance(variant_records, int) or isinstance(variant_records, bool) or variant_records < 1:
+            reasons.append("observations.oplock_variant.records 須為正整數")
+            variant_records = None
+        variant_meta = oplock_workload.get("continuity_meta_count")
+        if not isinstance(variant_meta, int) or isinstance(variant_meta, bool) or variant_meta < 0:
+            reasons.append("observations.oplock_variant.continuity_meta_count 須為非負整數")
+        elif variant_count is not None and variant_records is not None and variant_records != variant_count + variant_meta:
+            reasons.append("observations.oplock_variant.records 須等於 append 數加 continuity META")
+        if oplock_workload.get("first_seq") != 1:
+            reasons.append("observations.oplock_variant.first_seq 必須為 1")
+        if variant_records is not None and oplock_workload.get("last_seq") != variant_records:
+            reasons.append("observations.oplock_variant.last_seq 必須等於 records")
+        if oplock_workload.get("seq_continuous") is not True:
+            reasons.append("observations.oplock_variant.seq_continuous 非 true")
+        for key in ("rotate_retry", "deferred_delete_pending", "write_failures"):
+            value = oplock_workload.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                reasons.append(f"observations.oplock_variant.{key} 須為非負整數")
+        if oplock_workload.get("deferred_delete_pending") != 0:
+            reasons.append("observations.oplock_variant.deferred_delete_pending 非 0")
+        if oplock_workload.get("write_failures") != 0:
+            reasons.append("observations.oplock_variant.write_failures 非 0")
+        for key in ("pre_rotate", "post_rotate"):
+            result = oplock_workload.get(key)
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                reasons.append(f"observations.oplock_variant.{key}.ok 非 true")
+        if oplock_workload.get("crc_errors") != []:
+            reasons.append("observations.oplock_variant.crc_errors 必須是空陣列")
+        if oplock_workload.get("interference_observed") is not True:
+            reasons.append("observations.oplock_variant.interference_observed 非 true")
+
     if cid == "win-wal-av-rotate":
         expected = int_at_least("expected_records", 1)
         archives = int_at_least("archives", 1)
@@ -1249,9 +1303,10 @@ def judge_stage1a(
 
                 if subfolder == "cargo":
                     cargo_provenance = _cargo_provenance_errors(rep, head)
-                    if cargo_provenance and verdict != "FAIL":
-                        verdict = "evidence-insufficient"
+                    if cargo_provenance:
                         reasons.extend(cargo_provenance)
+                        if verdict != "FAIL":
+                            verdict = "evidence-insufficient"
 
                 if owner_info is not None:
                     owner_skipped = owner_info["owner_gated_skipped"]

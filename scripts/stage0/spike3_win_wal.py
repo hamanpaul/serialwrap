@@ -422,8 +422,11 @@ class AvHelper:
         suffix = f"-{variant}" if variant else ""
         self._ready = wal_dir / f"av-helper{suffix}.ready"
         self._stop = wal_dir / f"av-helper{suffix}.stop"
+        self._go = wal_dir / f"av-helper{suffix}.go"
+        self._ack = wal_dir / f"av-helper{suffix}.ack"
         self._log = wal_dir / f"av-helper{suffix}.jsonl"
         self._proc: subprocess.Popen[bytes] | None = None
+        self._arm_serial = 0
         self.launch_error: str | None = None
         self._ready_files: frozenset[str] = frozenset()
         self._evidence_key = variant
@@ -455,6 +458,8 @@ class AvHelper:
             "--ready-file", str(self._ready),
             "--stop-file", str(self._stop),
             "--log-file", str(self._log),
+            "--go-file", str(self._go),
+            "--ack-file", str(self._ack),
         ]
         if self._oplock:
             argv.append("--oplock")
@@ -493,6 +498,40 @@ class AvHelper:
     def ready_holds(self, name: str) -> bool:
         """首次目錄掃描完成時，確認指定 WAL 檔已取得持有 handle。"""
         return name in self._ready_files
+
+    def arm_hold(self, name: str) -> bool:
+        """以 go/ack 握手重新取得 seeded lease，避免首次 ready 到刺激間持有已到期。"""
+        self._arm_serial += 1
+        request_id = f"{os.getpid()}-{time.monotonic_ns()}-{self._arm_serial}"
+        try:
+            self._ack.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self._go.write_text(json.dumps({"request_id": request_id, "name": name}, sort_keys=True) + "\n",
+                                encoding="utf-8")
+        except OSError as exc:
+            return self._fail(f"helper rearm request 無法寫入：{type(exc).__name__}: {exc}")
+        deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._ack.exists():
+                try:
+                    response = json.loads(self._ack.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    response = None
+                if isinstance(response, dict) and response.get("request_id") == request_id:
+                    hold_ms = response.get("hold_ms")
+                    if (response.get("held_file") == name and isinstance(hold_ms, int)
+                            and not isinstance(hold_ms, bool) and 10 <= hold_ms <= 500):
+                        self._rec.step(
+                            f"av_sim_helper_rearmed{':' + self._variant if self._variant else ''}", "ok",
+                        )
+                        return True
+                    return self._fail(f"helper rearm 未取得 {name} 的有效 seeded lease：{response!r}")
+            if self._proc is not None and self._proc.poll() is not None:
+                return self._fail(f"helper rearm 前提前結束（exit={self._proc.returncode}）")
+            time.sleep(0.01)
+        return self._fail("helper rearm 握手逾時")
 
     def _fail(self, message: str) -> bool:
         self.launch_error = message
@@ -542,24 +581,104 @@ def _start_av_helper_with_wal(
     if not helper.ready_holds("raw.wal.ndjson"):
         helper.stop()
         raise RuntimeError("av_sim helper 首次掃描未持有 raw.wal.ndjson；不得開始 Spike 3 操作")
+    if not helper.arm_hold("raw.wal.ndjson"):
+        helper.stop()
+        raise RuntimeError(f"av_sim helper 未能在刺激前重新持有 raw.wal.ndjson：{helper.launch_error}")
     return helper
 
 
 def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
-    """在主案例結束後於既有 WAL 檔執行獨立 oplock 變體，結果分開記錄。"""
+    """在隔離 WAL 目錄執行獨立 append／rotate／F12 workload，結果與主案例分開記錄。"""
+    from realhw import wal_oracle
+    from realhw.wal_oracle import verify_record
+    from sw_core.wal import WalWriter
+
+    oplock_dir = wal_dir / "oplock-variant"
+    oplock_dir.mkdir(parents=True, exist_ok=True)
+    variant_rec = Recorder()
+    writer: _MeasuredWalWriter | None = None
+    helper: AvHelper | None = None
+    res_pre = res_post = None
     try:
-        helper = _start_av_helper_with_wal(wal_dir, rec, oplock=True, variant="oplock")
-    except RuntimeError:
-        return False
-    try:
-        # ready 標記先於掃描迴圈；留出多個 5 ms poll 週期讓 helper 實際開啟現存 WAL。
-        time.sleep(0.1)
+        writer = _MeasuredWalWriter(
+            WalWriter(wal_dir=str(oplock_dir), rotate_bytes=SMALL_ROTATE_BYTES), variant_rec,
+        )
+        wal_path = str(oplock_dir / "raw.wal.ndjson")
+        writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=b"prefill",
+                      cmd_id="spike3-oplock-prefill")
+        cursor = wal_oracle.open_cursor(wal_path)
+        helper = _start_av_helper_with_wal(oplock_dir, rec, oplock=True, variant="oplock")
+        marker_pre = b"SPIKE3-OPLOCK-MARKER-PRE"
+        marker_post = b"SPIKE3-OPLOCK-MARKER-POST"
+        writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=marker_pre,
+                      cmd_id="spike3-oplock-f12")
+        res_pre = wal_oracle.wait_for_marker(
+            cursor, marker=marker_pre, cmd_id="spike3-oplock-f12", timeout_s=10.0,
+        )
+        for _ in range(ROTATE_CASE_RECORDS):
+            writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=RECORD_PAYLOAD,
+                          cmd_id="spike3-oplock-bulk")
+        writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=marker_post,
+                      cmd_id="spike3-oplock-f12-post")
+        res_post = wal_oracle.wait_for_marker(
+            cursor, marker=marker_post, cmd_id="spike3-oplock-f12-post", timeout_s=10.0,
+        )
+        _drain_writer(writer, variant_rec)
+    except Exception as exc:  # noqa: BLE001 — 任一子變體失敗均保留主案例與不足診斷
+        rec.observations["oplock_variant_error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        helper.stop()
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as exc:  # noqa: BLE001 — 收尾錯誤同樣不能放行
+                rec.observations["oplock_variant_close_error"] = f"{type(exc).__name__}: {exc}"
+        if helper is not None:
+            helper.stop()
+    if writer is None:
+        return False
+    records = _read_records(oplock_dir)
+    seqs = _seqs(records)
+    continuity_meta_count = _continuity_meta_count(records)
+    health = writer.health()
+    archives = [p for p in glob.glob(str(oplock_dir / "raw.wal.ndjson*")) if not p.endswith("raw.wal.ndjson")]
+    append_count = variant_rec.observations["append_count"]
+    continuous = _seq_continuous(records)
+    complete = (
+        len(records) - continuity_meta_count == append_count
+        and seqs[:1] == [1]
+        and seqs[-1:] == [len(records)]
+        and continuous
+    )
+    crc_errors = [error for error in (verify_record(record) for record in records) if error is not None]
     evidence = rec.observations["av_sim"]["variants"]["oplock"]
-    return (evidence.get("helper_exit") == 0 and isinstance(evidence.get("grabs"), int)
-            and not isinstance(evidence.get("grabs"), bool) and evidence["grabs"] >= 1
-            and evidence.get("oplock") in {"granted", "denied", "unavailable"})
+    workload = {
+        "append_count": append_count,
+        "append_latency_ms": variant_rec.observations["append_latency_ms"],
+        "archives": len(archives), "records": len(records),
+        "continuity_meta_count": continuity_meta_count,
+        "first_seq": seqs[0] if seqs else None, "last_seq": seqs[-1] if seqs else None,
+        "seq_continuous": continuous,
+        "rotate_retry": health.get("rotate_retry"),
+        "deferred_delete_pending": health.get("deferred_delete_pending"),
+        "write_failures": health.get("write_failures"),
+        "pre_rotate": {"ok": res_pre.ok if res_pre else None,
+                       "reason_code": res_pre.reason_code if res_pre else None},
+        "post_rotate": {"ok": res_post.ok if res_post else None,
+                        "reason_code": res_post.reason_code if res_post else None},
+        "crc_errors": crc_errors,
+        "interference_observed": isinstance(evidence.get("grabs"), int)
+        and not isinstance(evidence.get("grabs"), bool) and evidence["grabs"] >= 1,
+    }
+    rec.observations["oplock_variant"] = workload
+    return (
+        evidence.get("helper_exit") == 0
+        and isinstance(evidence.get("grabs"), int) and not isinstance(evidence.get("grabs"), bool)
+        and evidence["grabs"] >= 1 and evidence.get("oplock") in {"granted", "denied", "unavailable"}
+        and append_count == ROTATE_CASE_RECORDS + 3 and len(archives) >= 1 and complete
+        and res_pre is not None and res_pre.ok and res_post is not None and res_post.ok
+        and health.get("deferred_delete_pending") == 0 and health.get("write_failures") == 0
+        and not crc_errors and workload["interference_observed"]
+    )
 
 
 def _grabs(rec: Recorder) -> int:

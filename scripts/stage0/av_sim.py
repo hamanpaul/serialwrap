@@ -21,7 +21,7 @@ overlapped Read-Handle（RH）oplock request；helper 記錄 granted、denied �
 
 用法（Windows helper）：
   py -3.12 scripts/stage0/av_sim.py --watch-dir <WAL 目錄> --seed <N> --duration-s <秒> \\
-      --ready-file <檔> --stop-file <檔> --log-file <檔>
+      --ready-file <檔> --stop-file <檔> --log-file <檔> --go-file <檔> --ack-file <檔>
 """
 
 from __future__ import annotations
@@ -44,6 +44,8 @@ HOLD_MS_MIN = 10
 HOLD_MS_MAX = 500
 WATCH_PREFIXES: tuple[str, ...] = ("raw.wal.ndjson", "raw.mirror.log")
 WATCH_POLL_S = 0.005
+READY_REPLACE_RETRIES = 40
+READY_REPLACE_RETRY_S = 0.025
 MODE = "share_no_delete"
 SHARE_MODE_TEXT = "FILE_SHARE_READ|FILE_SHARE_WRITE"
 OPLOCK_STATUS = "not_requested"
@@ -333,16 +335,22 @@ def _close_lease(lease: OplockLease) -> None:
         _close_handle(lease.event)
 
 
-def _publish_ready_record(ready_file: str | Path, held_files: list[str]) -> None:
-    """先完整寫入同目錄暫存檔，再原子發布首次掃描結果。"""
-    destination = Path(ready_file)
+def _publish_atomic_record(destination: str | Path, record: dict[str, Any]) -> None:
+    """同目錄完整寫入後原子發布；Windows 暫時共用拒絕時做有界重試。"""
+    destination = Path(destination)
     fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
     temp_path = Path(temp_name)
     try:
-        record = {"ready": True, "held_files": held_files}
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
-        os.replace(temp_path, destination)
+        for attempt in range(READY_REPLACE_RETRIES):
+            try:
+                os.replace(temp_path, destination)
+                break
+            except PermissionError:
+                if attempt + 1 >= READY_REPLACE_RETRIES:
+                    raise
+                time.sleep(READY_REPLACE_RETRY_S)
     finally:
         try:
             temp_path.unlink()
@@ -350,8 +358,57 @@ def _publish_ready_record(ready_file: str | Path, held_files: list[str]) -> None
             pass
 
 
+def _publish_ready_record(ready_file: str | Path, held_files: list[str]) -> None:
+    """先完整寫入同目錄暫存檔，再原子發布首次掃描結果。"""
+    _publish_atomic_record(ready_file, {"ready": True, "held_files": held_files})
+
+
+def _process_rearm_request(
+    *, watch_dir: str, go_file: str, ack_file: str, seen_request_ids: set[str],
+    holds: list[HeldFile], schedule: HoldSchedule, now: float, counts: dict[str, int],
+    events: list[dict[str, Any]], oplock: bool,
+) -> None:
+    """依 consumer 握手重新開啟既存 WAL，直接忽略首次掃描的 seen 去重。"""
+    try:
+        request = json.loads(Path(go_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return
+    request_id = request.get("request_id") if isinstance(request, dict) else None
+    name = request.get("name") if isinstance(request, dict) else None
+    if (not isinstance(request_id, str) or not request_id or request_id in seen_request_ids
+            or not isinstance(name, str) or not is_watched(name)):
+        return
+    seen_request_ids.add(request_id)
+    full = os.path.join(watch_dir, name)
+    response: dict[str, Any] = {"request_id": request_id, "held_file": None, "hold_ms": None}
+    try:
+        key = _file_key(full)
+        if key[0] != name:
+            raise FileNotFoundError(name)
+        for entry in list(holds):
+            if entry.name == name:
+                _close_lease(entry.lease)
+                holds.remove(entry)
+        hold = schedule.next_hold_s()
+        if oplock:
+            lease, oplock_result = _request_oplock(full)
+        else:
+            lease, oplock_result = OplockLease(_open_share_hold(full)), OPLOCK_STATUS
+        holds.append(HeldFile(now + hold, lease, name))
+        counts["grabs"] += 1
+        events.append({"event": "rearm", "name": name, "hold_ms": int(round(hold * 1000)),
+                       "oplock": oplock_result, "request_id": request_id})
+        response.update({"held_file": name, "hold_ms": int(round(hold * 1000))})
+    except OSError as exc:
+        counts["open_errors"] += 1
+        events.append({"event": "rearm_error", "name": name, "error": str(exc), "request_id": request_id})
+        response["error"] = f"{type(exc).__name__}: {exc}"
+    _publish_atomic_record(ack_file, response)
+
+
 def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
-               stop_file: str, log_file: str, oplock: bool = False) -> int:
+               stop_file: str, log_file: str, go_file: str, ack_file: str,
+               oplock: bool = False) -> int:
     """Windows helper：監看 WAL 目錄並對新檔套用持有模型，直到逾時或 stop_file 出現。"""
     if os.name != "nt":
         print("av_sim helper 只能在原生 Windows 執行（需 CreateFileW 共用模式）", file=sys.stderr)
@@ -362,6 +419,7 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
     seen: set[tuple[str, int, int]] = set()
     counts = {"grabs": 0, "open_errors": 0}
     oplock_results: list[str] = []
+    seen_request_ids: set[str] = set()
     ready_written = False
     deadline = time.monotonic() + duration_s
     while time.monotonic() < deadline and not os.path.exists(stop_file):
@@ -404,6 +462,11 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
             # ready 是首次掃描完成的確認；既有 WAL 也已在此之前取得 seeded handle。
             _publish_ready_record(ready_file, sorted({entry.name for entry in holds}))
             ready_written = True
+        _process_rearm_request(
+            watch_dir=watch_dir, go_file=go_file, ack_file=ack_file,
+            seen_request_ids=seen_request_ids, holds=holds, schedule=schedule,
+            now=time.monotonic(), counts=counts, events=events, oplock=oplock,
+        )
         time.sleep(WATCH_POLL_S)
     for entry in holds:
         _close_lease(entry.lease)
@@ -429,6 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ready-file", required=True)
     p.add_argument("--stop-file", required=True)
     p.add_argument("--log-file", required=True)
+    p.add_argument("--go-file", required=True)
+    p.add_argument("--ack-file", required=True)
     p.add_argument("--oplock", action="store_true",
                    help="以允許 delete 的 overlapped handle 申請 FSCTL_REQUEST_OPLOCK RH 變體")
     return p
@@ -443,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
         ready_file=args.ready_file,
         stop_file=args.stop_file,
         log_file=args.log_file,
+        go_file=args.go_file,
+        ack_file=args.ack_file,
         oplock=args.oplock,
     )
 
