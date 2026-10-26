@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +66,15 @@ _rrp.capture_deployed_env(os.environ)
 
 # ---- 第 1 層：強制 env 隔離（硬覆寫——外層 shell 可能 export 指向 live 的值）----
 _ISO_ROOT = tempfile.mkdtemp(prefix="sw-pytest-iso-")
+_SHORT_BASETEMP: str | None = None
+
+
+def pytest_unconfigure(config):
+    """只清除本次 pytest 建立的短 basetemp。"""
+    global _SHORT_BASETEMP
+    if _SHORT_BASETEMP is not None:
+        shutil.rmtree(_SHORT_BASETEMP, ignore_errors=True)
+        _SHORT_BASETEMP = None
 
 
 def _iso(name: str) -> str:
@@ -223,6 +233,14 @@ _MARKERS = {
 
 
 def pytest_configure(config):
+    """POSIX 使用唯一短 pytest 暫存根，避免巢狀 Unix socket 超過 sun_path。"""
+    global _SHORT_BASETEMP
+    if os.name == "posix" and config.option.basetemp is None:
+        _SHORT_BASETEMP = tempfile.mkdtemp(prefix="sw-", dir="/tmp")
+        config.option.basetemp = _SHORT_BASETEMP
+        factory = getattr(config, "_tmp_path_factory", None)
+        if factory is not None:
+            factory._given_basetemp = Path(_SHORT_BASETEMP)
     for name, desc in _MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
     # 報告 hook 的唯一宿主；同名只註冊一次（完整 pytest tests/ 與黑箱 conftest 可能同時載入）

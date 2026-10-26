@@ -9,6 +9,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -407,8 +408,34 @@ def test_handoff_refused_when_background_write_holds_tx_fence(tmp_path):
     svc.close_for_test()
 
 
-def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
-    """以隔離目錄啟動真實 sw_core.daemon 子行程，等待 Unix socket 出現；回傳 (proc, socket_path)。"""
+def _short_socket_location() -> tuple[Path, Path]:
+    """配置短於 AF_UNIX sun_path 上限的暫存 socket 路徑，供深層 checkout 使用。"""
+    socket_dir = Path(tempfile.mkdtemp(prefix="sw-", dir="/tmp"))
+    socket_path = socket_dir / f"s-{os.getpid()}-{time.time_ns()}.sock"
+    return socket_dir, socket_path
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_isolated_socket_path_is_short_and_temporary() -> None:
+    socket_dir, socket_path = _short_socket_location()
+    try:
+        assert socket_path.parent == socket_dir
+        assert len(os.fsencode(socket_path)) < 107
+    finally:
+        socket_path.unlink(missing_ok=True)
+        socket_dir.rmdir()
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_pytest_tmp_path_stays_short_for_unix_socket_children(tmp_path: Path) -> None:
+    """長 checkout 下 tmp_path 仍需為深層 Unix socket 子路徑留出 sun_path 空間。"""
+    assert len(os.fsencode(tmp_path)) < 64, tmp_path
+
+
+def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path, Path]:
+    """以隔離目錄啟動真實 sw_core.daemon 子行程，等待 Unix socket；回傳行程與 socket 暫存位置。"""
     isolated = tmp_path / "daemon"
     dirs = {
         "SERIALWRAP_CONFIG_DIR": isolated / "config",
@@ -429,9 +456,7 @@ def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
             parents=True, exist_ok=True
         )
     repo = Path(__file__).resolve().parents[1]
-    short_run_dir = repo / "target"
-    short_run_dir.mkdir(parents=True, exist_ok=True)
-    socket_path = short_run_dir / f"s-{os.getpid()}-{time.time_ns()}.sock"
+    socket_dir, socket_path = _short_socket_location()
     assert len(os.fsencode(socket_path)) < 107, socket_path
     lock_path = isolated / "run" / "serialwrapd.lock"
     env = os.environ.copy()
@@ -472,12 +497,14 @@ def _spawn_isolated_daemon(tmp_path: Path) -> tuple[subprocess.Popen, Path]:
             time.sleep(0.02)
         assert socket_path.exists(), "隔離 daemon 未在期限內建立 Unix socket"
     except BaseException:
-        _terminate_daemon(proc, socket_path)
+        _terminate_daemon(proc, socket_path, socket_dir)
         raise
-    return proc, socket_path
+    return proc, socket_path, socket_dir
 
 
-def _terminate_daemon(proc: subprocess.Popen, socket_path: Path | None = None) -> None:
+def _terminate_daemon(
+    proc: subprocess.Popen, socket_path: Path | None = None, socket_dir: Path | None = None,
+) -> None:
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -489,6 +516,8 @@ def _terminate_daemon(proc: subprocess.Popen, socket_path: Path | None = None) -
         proc.stderr.close()
     if socket_path is not None:
         socket_path.unlink(missing_ok=True)
+    if socket_dir is not None:
+        socket_dir.rmdir()
 
 
 def _rpc_over_socket(socket_path: Path, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -504,7 +533,7 @@ def _rpc_over_socket(socket_path: Path, method: str, params: dict[str, Any]) -> 
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_handoff_ok_then_sc11_stop_order(tmp_path):
-    proc, socket_path = _spawn_isolated_daemon(tmp_path)
+    proc, socket_path, socket_dir = _spawn_isolated_daemon(tmp_path)
     try:
         response = _rpc_over_socket(socket_path, "daemon.handoff_stop", {"reason": "update"})
         assert response.get("ok") is True and response.get("stopping") is True
@@ -512,7 +541,7 @@ def test_handoff_ok_then_sc11_stop_order(tmp_path):
         assert "version" not in response
         assert proc.wait(timeout=HANDOFF_DRAIN_GRACE_S + 10.0) == 0
     finally:
-        _terminate_daemon(proc, socket_path)
+        _terminate_daemon(proc, socket_path, socket_dir)
 
 
 @pytest.mark.posix_only
@@ -524,7 +553,7 @@ def test_handoff_drain_window_flushes_mutating_answers_ping_and_exits_bounded(tm
     - `health.ping` 仍可回應（監聽仍在）；
     - 行程於窗口結束後才退出，且在 窗口＋餘裕 內結束（不殘留）。
     """
-    proc, socket_path = _spawn_isolated_daemon(tmp_path)
+    proc, socket_path, socket_dir = _spawn_isolated_daemon(tmp_path)
     try:
         response = _rpc_over_socket(socket_path, "daemon.handoff_stop", {"reason": "update"})
         assert response.get("ok") is True and response.get("stopping") is True
@@ -547,7 +576,7 @@ def test_handoff_drain_window_flushes_mutating_answers_ping_and_exits_bounded(tm
         assert exited_after >= HANDOFF_DRAIN_GRACE_S - 0.5, exited_after
         assert exited_after <= HANDOFF_DRAIN_GRACE_S + 10.0, exited_after
     finally:
-        _terminate_daemon(proc, socket_path)
+        _terminate_daemon(proc, socket_path, socket_dir)
 
 
 @pytest.mark.core_portable
@@ -559,6 +588,9 @@ def test_handoff_stop_contract_merged():
     assert schema["x-methods"]["daemon.handoff_stop"]["status"] == "NEW"
     assert not any(p.get("adds_method") == "daemon.handoff_stop" for p in schema.get("x-pending", []))
     assert "daemon.handoff_stop" in schema.get("x-wire", {}).get("version_absent_for", [])
+    side_effects = schema["x-methods"]["daemon.handoff_stop"]["side_effects"]
+    assert any("tx.in_flight" in item.get("what", "") or "TX fence" in item.get("what", "")
+               for item in side_effects)
 
     error_codes_path = Path(__file__).resolve().parents[1] / "contracts" / "error_codes.yaml"
     import yaml
