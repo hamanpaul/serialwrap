@@ -88,6 +88,10 @@
 | DF-17 | WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行；部分寫入後只補寫剩餘 bytes（依已寫長度 `sent`），補寫再失敗則於下一筆前以 `\n` 終結殘行，不產生被串接的 NDJSON 行（P1 T02 第 3 點、Rust arch §4.5 `WalWriteError`／§5.8 第 5 點，R2-F3） |
 | DF-19 | `session.self_test` 的 nonce probe（`source:"system:self_test"`）在每次 OS 提交前重驗 boot quiet（任何 profile，含 console unlock；與 pre-check `boot_quiet_active()` 同義）與 bridge 世代／epoch：pre-check 通過後才 arm 的 quiet 使 probe 零 TX，回應改為與 pre-check 同形的 `{"ok":true,"classification":"AUTOBOOT_QUIET","session":…,"recommended_action":"wait",<lease ctx>,"command_capable":…}`，不等 nonce、不 `confirm_ready`。不受 ready reconfirm 擋（self-test 是 `READY_UNCONFIRMED` 的建議出口）、不與 login run 世代掛鉤；FLASHING 中照舊 `TARGET_UNRESPONSIVE`（RPC-H-07）。來源 SES-16.6-08（R5-F2）。DF-18 號保留給 P7（`08` §0.5） |
 
+### P5-T7 P1 WAL 位元組 golden 缺口補充
+
+P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生這些檔案；`wal_line.tsv` 只覆蓋單列序列化，不能替代 WalWriter 寫檔輸出。依本 Task 的補充決議，新增 `scripts/stage0/capture_wal_golden.py`，以固定單調時鐘、wall 時間及空白初始 WAL 目錄驅動 Python `sw_core.wal.WalWriter`，記錄輸入與 WAL／mirror 實際位元組；`tests/test_rust_goldens_fresh.py` 重跑擷取器並逐位元組比對，Rust `wal_contract_golden_matches_p1` 逐案重播同一輸入並比對兩個輸出檔。補充的 JSON golden 不取代 `contracts/golden/wal_line.tsv`。`contracts/captures/wal/*` 未包含在此補充範圍，仍待 P1 上游交付或後續明確處理；P5-T7 的 Rust 重播測試不消費該目錄。提交說明需指出此上游缺口與本補充。
+
 ### 1.3 既有核准：BC-01～BC-05
 
 照規格 §9.1 實作，各列以 **BC** 標示。

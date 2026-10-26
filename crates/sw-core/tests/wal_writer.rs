@@ -1,13 +1,14 @@
-//! slice21 Task 7：sw-core `WalWriter` 紅燈測試（BC-01、DF-03、DF-17；R2-F3 部分寫入協定）。
+//! slice21 Task 7：sw-core `WalWriter` 行為測試（BC-01、DF-03、DF-17；R2-F3 部分寫入協定）。
 //!
-//! 斷言來源：`docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 7（Step 1）。
-//! 本檔只描述行為；`WalWriter`、`FakeWalFs`、`FakeClock` 尚為骨架（`todo!()`），
-//! 因此所有案例應在執行期因未實作而失敗，而非語法或收集錯誤。
+//! 斷言來源：`docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 7 與凍結的 WAL 契約。
+//! 以 `FakeWalFs`、`FakeClock` 驗證序列化、重建、輪替、失敗復原與讀取語意。
 
 #![cfg(feature = "test-fakes")]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 mod common;
@@ -19,8 +20,8 @@ use sw_core::wal::{
 };
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::wal_fs::FakeWalFs;
-use sw_pal::{FileIdentity, PalError};
-use sw_proto::pyjson::{loads, PyDict, PyValue};
+use sw_pal::{FileIdentity, PalError, WalFs};
+use sw_proto::pyjson::{loads, PyDict, PyInt, PyValue};
 
 const DIR: &str = "/w";
 const WAL: &str = "/w/raw.wal.ndjson";
@@ -56,6 +57,65 @@ fn writer(rotate: u64) -> (WalWriter, Arc<FakeWalFs>, Arc<FakeClock>) {
         clock.clone(),
     );
     (w, fs, clock)
+}
+
+/// 模擬目錄身分初次查詢失敗，之後恢復，再確認目錄確實消失。
+struct TransientDirIdentityFs {
+    inner: Arc<FakeWalFs>,
+    dir_identity_state: AtomicUsize,
+    fail_next_read: AtomicUsize,
+}
+
+impl WalFs for TransientDirIdentityFs {
+    fn open_append(&self, path: &Path) -> sw_pal::PalResult<Box<dyn sw_pal::WalFile>> {
+        self.inner.open_append(path)
+    }
+
+    fn path_identity(&self, path: &Path) -> sw_pal::PalResult<Option<FileIdentity>> {
+        if path == p(DIR) {
+            return match self.dir_identity_state.load(Ordering::SeqCst) {
+                0 => Err(PalError::io(5, "[Errno 5] Input/output error")),
+                1 => Ok(Some(FileIdentity(1, 2))),
+                _ => Ok(None),
+            };
+        }
+        self.inner.path_identity(path)
+    }
+
+    fn size(&self, path: &Path) -> sw_pal::PalResult<Option<u64>> {
+        self.inner.size(path)
+    }
+
+    fn tail_needs_termination(&self, path: &Path) -> sw_pal::PalResult<bool> {
+        Ok(self.inner.tail_needs_termination(path))
+    }
+
+    fn read_all(&self, path: &Path) -> sw_pal::PalResult<Option<Vec<u8>>> {
+        if self.fail_next_read.swap(0, Ordering::SeqCst) != 0 {
+            return Err(PalError::io(5, "[Errno 5] Input/output error"));
+        }
+        self.inner.read_all(path)
+    }
+
+    fn rename_noreplace_or_suffix(
+        &self,
+        from: &Path,
+        base_to: &Path,
+    ) -> sw_pal::PalResult<PathBuf> {
+        self.inner.rename_noreplace_or_suffix(from, base_to)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> sw_pal::PalResult<()> {
+        self.inner.sync_dir(dir)
+    }
+
+    fn ensure_dir(&self, dir: &Path) -> sw_pal::PalResult<()> {
+        self.inner.ensure_dir(dir)
+    }
+
+    fn dir_writable(&self, dir: &Path) -> bool {
+        self.inner.dir_writable(dir)
+    }
 }
 
 fn req<'a>(dir: &'a str, source: &'a str, payload: &'a [u8]) -> WalAppendReq<'a> {
@@ -239,11 +299,24 @@ fn meta_empty_payload_and_sorted_meta_keys() {
     assert!(lines[1].contains("\"payload_b64\":\"\","), "{}", lines[1]);
     // META（空 payload）不寫 mirror
     assert_eq!(read_bytes(&fs, MIRROR), b"\\xc3\\xa9".to_vec());
+
+    let (empty_writer, empty_fs, _) = writer(DEFAULT_ROTATE);
+    assert!(empty_writer.append(req("META", "system", b"")).ok);
+    assert_eq!(
+        empty_fs.contents(p(MIRROR)),
+        Some(Vec::new()),
+        "空 payload 也要 best-effort 建立 mirror handle"
+    );
 }
 
 #[test]
 fn external_unlink_writes_recreate_meta_then_record() {
     let (w, fs, clock) = writer(DEFAULT_ROTATE);
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let warning_sink = warnings.clone();
+    w.set_warn_sink(Arc::new(move |line| {
+        warning_sink.lock().unwrap().push(line.to_string());
+    }));
     for _ in 0..3 {
         w.append(req("RX", "device", b"x"));
     }
@@ -271,6 +344,28 @@ fn external_unlink_writes_recreate_meta_then_record() {
     );
     assert_eq!(meta.get("range_known"), Some(&PyValue::Bool(true)));
     assert_eq!(w.health().recreated_count, 1);
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &["WAL 目錄 /w 消失，已重建並續寫（原因：[Errno 2] WAL 檔案路徑消失: '/w'）；消失期間的紀錄無法復原"]
+    );
+
+    let (failed_writer, failed_fs, failed_clock) = writer(DEFAULT_ROTATE);
+    failed_fs.fail_next_writes(p(WAL), 2, eio());
+    let failed = failed_writer.append(req("RX", "device", b"not-written"));
+    assert!(!failed.ok && failed.seq == 1);
+    failed_fs.external_unlink(p(WAL));
+    failed_clock.advance(MS_60);
+    failed_writer.append(req("RX", "device", b"after-unlink"));
+    let unknown = first_meta_line(&read_text(&failed_fs, WAL));
+    assert_eq!(
+        meta_of(&unknown).get("potentially_lost_seq_range"),
+        Some(&PyValue::Null),
+        "從未成功寫入的 seq 不得成為遺失範圍起點"
+    );
+    assert_eq!(
+        meta_of(&unknown).get("range_known"),
+        Some(&PyValue::Bool(false))
+    );
 }
 
 #[test]
@@ -284,6 +379,11 @@ fn reopen_failure_marks_unhealthy_and_trips_sink() {
     let (w, fs, clock) = writer(DEFAULT_ROTATE);
     let fan = WalHealthFanout::new();
     w.set_health_sink(fan.clone());
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let warning_sink = warnings.clone();
+    w.set_warn_sink(Arc::new(move |line| {
+        warning_sink.lock().unwrap().push(line.to_string());
+    }));
     let sink = Arc::new(Recorder(Mutex::new(Vec::new())));
     fan.register(sink.clone());
     w.append(req("RX", "device", b"x"));
@@ -301,6 +401,10 @@ fn reopen_failure_marks_unhealthy_and_trips_sink() {
     );
     // register 時初始化為 false，之後轉為 true
     assert_eq!(*sink.0.lock().unwrap(), vec![false, true]);
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &["WAL 重建失敗（best-effort 延後重試）：[Errno 28] No space left on device"]
+    );
 }
 
 #[test]
@@ -430,6 +534,11 @@ fn rotate_collision_adds_numeric_suffix() {
 #[test]
 fn rotate_rename_failure_marks_record() {
     let (w, fs, _) = writer(ROTATE_200);
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let warning_sink = warnings.clone();
+    w.set_warn_sink(Arc::new(move |line| {
+        warning_sink.lock().unwrap().push(line.to_string());
+    }));
     w.append(req("RX", "uart", b"x")); // seq 1，達門檻
     fs.fail_next_renames(1, eacces());
     let a = w.append(req("RX", "uart", b"x")); // 輪替 rename 失敗 → best-effort 續用原檔
@@ -443,9 +552,16 @@ fn rotate_rename_failure_marks_record() {
     );
     assert!(!has_archive(&fs, WAL, SUFFIX_1), "rename 失敗不得產生歸檔");
     let cur = read_text(&fs, WAL);
-    let last = dict_lines(&cur).into_iter().last().expect("現行檔應含 seq 2");
+    let last = dict_lines(&cur)
+        .into_iter()
+        .last()
+        .expect("現行檔應含 seq 2");
     assert_eq!(seq_of(&last), Some(2));
     assert_eq!(last.get("rotation_failed"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &["WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：/w/raw.wal.ndjson：[Errno 13] Permission denied"]
+    );
     // 續用原路徑：後續 append 仍寫入，歸檔＋現行合計無遺失
     w.append(req("RX", "uart", b"x"));
     let mut all = if has_archive(&fs, WAL, SUFFIX_1) {
@@ -475,6 +591,11 @@ fn mirror_failure_retries_only_mirror() {
 #[test]
 fn mirror_retry_failure_counts_write_failure() {
     let (w, fs, _) = writer(DEFAULT_ROTATE);
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let warning_sink = warnings.clone();
+    w.set_warn_sink(Arc::new(move |line| {
+        warning_sink.lock().unwrap().push(line.to_string());
+    }));
     fs.fail_next_writes(p(MIRROR), 2, eacces()); // 首次＋重試皆失敗
     w.append(req("RX", "uart", b"hello"));
     // WAL 仍寫入
@@ -484,6 +605,10 @@ fn mirror_retry_failure_counts_write_failure() {
     assert_eq!(
         h.last_write_error.as_deref(),
         Some("PermissionError: [Errno 13] Permission denied")
+    );
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &["WAL append 寫入失敗（best-effort 略過）：[Errno 13] Permission denied"]
     );
 }
 
@@ -500,6 +625,17 @@ fn mirror_identity_reopened_without_meta() {
     let text = read_text(&fs, WAL);
     assert!(!text.contains("\"dir\":\"META\""), "{text}");
     assert_eq!(w.health().recreated_count, 0);
+}
+
+#[test]
+fn mirror_unlink_is_checked_without_waiting_for_identity_interval() {
+    let (w, fs, _) = writer(DEFAULT_ROTATE);
+    w.append(req("RX", "uart", b"before"));
+    fs.external_unlink(p(MIRROR));
+    w.append(req("RX", "uart", b"after"));
+
+    assert_eq!(read_bytes(&fs, MIRROR), b"after".to_vec());
+    assert_eq!(fs.open_calls(p(MIRROR)), 2);
 }
 
 #[test]
@@ -559,7 +695,7 @@ fn replacement_at_rotate_threshold_keeps_meta_current() {
     fs.external_replace(p(WAL), &replacement);
     clock.advance(MS_60);
     w.append(req("RX", "device", b"b")); // META seq 2（replaced，範圍 [1,1]）＋紀錄 seq 3
-    // 替換證據在輪替前確認：替換檔歸檔
+                                         // 替換證據在輪替前確認：替換檔歸檔
     assert_eq!(read_bytes(&fs, &format!("{WAL}.{SUFFIX_1}")), replacement);
     let cur = read_text(&fs, WAL);
     let m = first_meta_line(&cur);
@@ -587,6 +723,27 @@ fn replacement_unterminated_tail_keeps_meta_parseable() {
     assert_eq!(seq_of(&rows[0]), Some(2));
     assert_eq!(str_of(&rows[0], "dir"), Some("META"));
     assert_eq!(seq_of(&rows[1]), Some(3));
+
+    let (retry_writer, retry_fs, retry_clock) = writer(DEFAULT_ROTATE);
+    retry_writer.append(req("RX", "device", b"a"));
+    retry_fs.external_replace(p(WAL), b"replacement\n");
+    retry_clock.advance(MS_60);
+    retry_fs.fail_next_write_partial(p(WAL), 10, eio());
+    retry_fs.fail_next_writes(p(WAL), 1, eio());
+    let failed = retry_writer.append(req("RX", "device", b"first-recreate"));
+    assert!(!failed.ok && failed.loss_flag);
+    retry_clock.advance(Duration::from_millis(20));
+    assert!(
+        retry_writer
+            .append(req("RX", "device", b"second-recreate"))
+            .ok
+    );
+    let bytes = read_bytes(&retry_fs, WAL);
+    assert!(!bytes.windows(2).any(|pair| pair == b"\n\n"));
+    let (rows, _) = retry_writer.tail_raw_with_meta(None, None, 10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(str_of(&rows[0], "dir"), Some("META"));
+    assert_eq!(seq_of(&rows[1]), Some(5));
 }
 
 #[test]
@@ -628,12 +785,25 @@ fn zero_identity_and_unlinked_handle_classify_external_unlink() {
     {
         let (w, fs, clock) = writer(DEFAULT_ROTATE);
         w.append(req("RX", "device", b"a"));
-        let _pending = fs.hold_external_reader(p(WAL));
+        let pending = fs.hold_external_reader(p(WAL));
         fs.external_unlink(p(WAL));
         clock.advance(MS_60);
-        w.append(req("RX", "device", b"b"));
+        let a = w.append(req("RX", "device", b"b"));
+        assert!(
+            !a.ok && a.loss_flag,
+            "DeletePending 仍被外部 reader 持有時不得重建"
+        );
+        assert_eq!(w.health().unhealthy_reason, Some("recreate_failed"));
+        assert_eq!(fs.open_attempts(p(WAL)), 2, "應辨識刪除並嘗試重建一次");
+        drop(pending);
+        clock.advance(Duration::from_millis(20));
+        w.append(req("RX", "device", b"c"));
         let m = first_meta_line(&read_text(&fs, WAL));
-        assert_eq!(str_of(meta_of(&m), "reason"), Some("external_unlink"));
+        assert_eq!(
+            str_of(meta_of(&m), "reason"),
+            Some("external_unlink"),
+            "pending-delete reader 關閉後應保留原失效原因"
+        );
     }
 }
 
@@ -642,11 +812,12 @@ fn recreate_retry_schedule_uses_monotonic_gaps() {
     let (w, fs, clock) = writer(DEFAULT_ROTATE);
     w.append(req("RX", "device", b"a")); // seq 1
     fs.external_unlink(p(WAL));
+    let opened_before_recreate = fs.open_attempts(p(WAL));
     fs.fail_next_opens(p(WAL), 12, enospc()); // 之後所有開檔嘗試皆失敗
     clock.advance(MS_60);
     let a = w.append(req("RX", "device", b"b")); // 首次偵測 → 開檔嘗試 #1
     assert!(!a.ok);
-    assert_eq!(fs.open_attempts(p(WAL)), 1);
+    assert_eq!(fs.open_attempts(p(WAL)), opened_before_recreate + 1);
     // 前三次失敗後 10／50／200 ms，之後 1／2／5／5 s（上限 5 s）
     let gaps_ms: [u64; 8] = [10, 50, 200, 1_000, 2_000, 5_000, 5_000, 5_000];
     for (i, gap) in gaps_ms.iter().enumerate() {
@@ -654,14 +825,14 @@ fn recreate_retry_schedule_uses_monotonic_gaps() {
         w.append(req("RX", "device", b"x"));
         assert_eq!(
             fs.open_attempts(p(WAL)),
-            1 + i,
+            opened_before_recreate + 1 + i,
             "未到期（間隔 {gap} ms 內）不得開檔"
         );
         clock.advance(Duration::from_millis(1));
         w.append(req("RX", "device", b"x"));
         assert_eq!(
             fs.open_attempts(p(WAL)),
-            2 + i,
+            opened_before_recreate + 2 + i,
             "到期 append 恰嘗試一次（第 {} 次間隔 {gap} ms）",
             i + 1
         );
@@ -669,7 +840,10 @@ fn recreate_retry_schedule_uses_monotonic_gaps() {
     // 到期 append 最多嘗試一次：一次跨越多個期限也只開一次
     clock.advance(Duration::from_secs(30));
     w.append(req("RX", "device", b"x"));
-    assert_eq!(fs.open_attempts(p(WAL)), 2 + gaps_ms.len());
+    assert_eq!(
+        fs.open_attempts(p(WAL)),
+        opened_before_recreate + 2 + gaps_ms.len()
+    );
 }
 
 #[test]
@@ -752,9 +926,9 @@ fn meta_not_in_com0_tail() {
 
 #[test]
 fn wal_contract_golden_matches_p1() {
-    // 上游缺漏（§0.3 P1 T02–T05）：本分支尚無 contracts/golden/wal/，不得以空集合假通過。
+    // P1 沒有產出 WAL golden；本 Task 以 Python 基線擷取檔補齊，空集合仍須失敗。
     let dir = repo_path("contracts/golden/wal");
-    let cases: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+    let mut cases: Vec<PathBuf> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .map(|e| e.expect("read_dir entry").path())
             .filter(|f| f.extension().is_some_and(|x| x == "json"))
@@ -765,15 +939,341 @@ fn wal_contract_golden_matches_p1() {
         ),
     };
     assert!(!cases.is_empty(), "{} 不得為空", dir.display());
-    unimplemented!(
-        "逐案重放待 P1 golden 格式確定（{} 件，上游缺漏）",
-        cases.len()
+    cases.sort();
+
+    for case_path in cases {
+        let document = std::fs::read_to_string(&case_path).expect("Python WAL golden 應可讀");
+        let golden = match loads(&document) {
+            Ok(PyValue::Dict(d)) => d,
+            other => panic!("Python WAL golden 應為 JSON object：{other:?}"),
+        };
+        let case_name = str_of(&golden, "case").expect("golden case 名稱");
+        assert_eq!(
+            golden.get("initial_seq").and_then(PyValue::as_i64),
+            Some(0),
+            "Python golden 必須由空 WAL 目錄開始：{case_name}"
+        );
+        let mono_ns = golden
+            .get("mono_ts_ns")
+            .and_then(PyValue::as_i64)
+            .expect("golden mono_ts_ns") as u64;
+        let wall_us = golden
+            .get("wall_unix_us")
+            .and_then(PyValue::as_i64)
+            .expect("golden wall_unix_us");
+        let requests = golden
+            .get("requests")
+            .and_then(PyValue::as_array)
+            .expect("golden requests 陣列");
+
+        let fs = FakeWalFs::new();
+        let clock = FakeClock::at(mono_ns, wall_us);
+        let w = WalWriter::open(
+            WalConfig {
+                dir: PathBuf::from(DIR),
+                rotate_bytes: DEFAULT_ROTATE,
+            },
+            fs.clone(),
+            clock,
+        );
+
+        for (index, request) in requests.iter().enumerate() {
+            let request = match request {
+                PyValue::Dict(d) => d,
+                other => panic!("{case_name} request {index} 應為 object：{other:?}"),
+            };
+            let com = str_of(request, "com").expect("request com");
+            let dir = str_of(request, "dir").expect("request dir");
+            let source = str_of(request, "source").expect("request source");
+            let payload = decode_hex(str_of(request, "payload_hex").expect("request payload_hex"));
+            let cmd_id = match request.get("cmd_id") {
+                Some(PyValue::Null) => None,
+                Some(PyValue::Str(value)) => Some(value.as_str()),
+                other => panic!("{case_name} request {index} cmd_id 格式錯誤：{other:?}"),
+            };
+            let loss_flag = request
+                .get("loss_flag")
+                .and_then(PyValue::as_bool)
+                .expect("request loss_flag");
+            let meta = match request.get("meta") {
+                Some(PyValue::Null) => None,
+                Some(PyValue::Dict(value)) => Some(value.clone()),
+                other => panic!("{case_name} request {index} meta 格式錯誤：{other:?}"),
+            };
+            let result = w.append(WalAppendReq {
+                com,
+                dir,
+                source,
+                payload: &payload,
+                cmd_id,
+                loss_flag,
+                meta,
+            });
+            assert!(
+                result.ok,
+                "Python golden {case_name} request {index} append 失敗"
+            );
+        }
+
+        let expected_wal = decode_hex(str_of(&golden, "wal_hex").expect("golden wal_hex"));
+        let expected_mirror = decode_hex(str_of(&golden, "mirror_hex").expect("golden mirror_hex"));
+        w.shutdown().expect("golden WalWriter shutdown");
+        assert_eq!(
+            read_bytes(&fs, WAL),
+            expected_wal,
+            "Python WAL bytes：{case_name}"
+        );
+        assert_eq!(
+            read_bytes(&fs, MIRROR),
+            expected_mirror,
+            "Python mirror bytes：{case_name}"
+        );
+    }
+}
+
+#[test]
+fn wal_writer_replays_python_line_fixtures() {
+    let path = repo_path("contracts/golden/wal_line.tsv");
+    let tsv = std::fs::read_to_string(&path).expect("Python WAL 位元組 golden 應可讀");
+    let rows = tsv
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let eligible = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, columns)| {
+            if columns.len() != 4 || columns[1] != "to_line" {
+                return None;
+            }
+            let input = String::from_utf8(decode_hex(columns[2])).ok()?;
+            let fields = input.split('\u{1f}').collect::<Vec<_>>();
+            if fields.len() != 13 || fields[3].is_empty() || !fields[12].is_empty() {
+                return None;
+            }
+            let payload = sw_proto::pycompat::a2b_base64_lenient(fields[9].as_bytes()).ok()?;
+            let len_matches = fields[7].parse::<usize>().ok() == Some(payload.len());
+            let crc_matches = fields[8] == sw_proto::wal_types::crc32_hex(&payload);
+            (len_matches && crc_matches).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 50, "Python WAL TSV fixture 總列數");
+    assert_eq!(
+        eligible.len(),
+        4,
+        "符合 WalAppendReq 的 Python 位元組 fixtures"
     );
+
+    for index in eligible {
+        let columns = &rows[index];
+        let fixture_name = columns[0];
+        let input = String::from_utf8(decode_hex(columns[2])).expect("輸入應為 UTF-8");
+        let fields = input.split('\u{1f}').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 13, "WAL 輸入欄位數：{fixture_name}");
+        assert!(
+            !fields[3].is_empty(),
+            "WalAppendReq 必須有 COM：{fixture_name}"
+        );
+        assert!(
+            fields[12].is_empty(),
+            "此 fixture 不要求輪替失敗：{fixture_name}"
+        );
+
+        let fs = FakeWalFs::new();
+        let seq = fields[0].parse::<u64>().expect("seq 應為 u64");
+        if seq > 1 {
+            fs.seed(p(WAL), format!("{{\"seq\":{}}}\n", seq - 1).as_bytes());
+        }
+        let mono_ns = fields[1].parse().expect("mono_ts_ns 應為 u64");
+        let clock = FakeClock::at(mono_ns, WALL_1);
+        let w = WalWriter::open(
+            WalConfig {
+                dir: PathBuf::from(DIR),
+                rotate_bytes: DEFAULT_ROTATE,
+            },
+            fs.clone(),
+            clock,
+        );
+        let payload = sw_proto::pycompat::a2b_base64_lenient(fields[9].as_bytes())
+            .expect("payload_b64 應為合法 base64");
+        assert_eq!(
+            fields[7].parse::<usize>().unwrap(),
+            payload.len(),
+            "{fixture_name}"
+        );
+        assert_eq!(
+            fields[8],
+            sw_proto::wal_types::crc32_hex(&payload),
+            "{fixture_name}"
+        );
+        let meta = match loads(fields[11]).expect("meta_json 應為合法 JSON") {
+            PyValue::Dict(dict) => dict,
+            other => panic!("meta_json 應為 object，實得 {other:?}"),
+        };
+        let loss_flag = fields[10] == "true";
+        let append = w.append(WalAppendReq {
+            com: fields[3],
+            dir: fields[4],
+            source: fields[5],
+            payload: &payload,
+            cmd_id: (!fields[6].is_empty()).then_some(fields[6]),
+            loss_flag,
+            meta: Some(meta),
+        });
+        assert!(append.ok, "WalWriter append 應成功：{fixture_name}");
+        assert_eq!(append.seq.to_string(), fields[0], "{fixture_name}");
+        assert_eq!(append.loss_flag, loss_flag, "{fixture_name}");
+
+        let mut expected =
+            String::from_utf8(decode_hex(columns[3])).expect("golden 輸出應為 UTF-8");
+        expected = expected.replace(fields[2], &sw_proto::pycompat::iso_utc_now(WALL_1));
+        let mut expected = expected.into_bytes();
+        expected.push(b'\n');
+        let actual = read_text(&fs, WAL);
+        assert_eq!(
+            actual.lines().last().unwrap_or_default().as_bytes(),
+            &expected[..expected.len() - 1],
+            "Python WAL golden：{fixture_name}"
+        );
+    }
+}
+
+fn decode_hex(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0, "hex 長度應為偶數");
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("hex 內容應為 ASCII");
+            u8::from_str_radix(pair, 16).expect("hex 位元組應合法")
+        })
+        .collect()
+}
+
+#[test]
+fn startup_unterminated_wal_tail_is_terminated_before_append() {
+    let fs = FakeWalFs::new();
+    fs.seed(p(WAL), b"partial-record");
+    let clock = FakeClock::at(MONO_1, WALL_1);
+    let w = WalWriter::open(
+        WalConfig {
+            dir: PathBuf::from(DIR),
+            rotate_bytes: DEFAULT_ROTATE,
+        },
+        fs.clone(),
+        clock,
+    );
+
+    let appended = w.append(req("RX", "uart", b"recovered"));
+    assert!(appended.ok);
+    assert!(read_bytes(&fs, WAL).starts_with(b"partial-record\n{"));
+    let (rows, _) = w.tail_raw_with_meta(None, None, 100).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(seq_of(&rows[0]), Some(1));
+}
+
+#[test]
+fn damaged_first_nonempty_line_keeps_recreate_range_unknown() {
+    let fs = FakeWalFs::new();
+    fs.seed(p(WAL), b"damaged\n{\"seq\":7}\n");
+    let clock = FakeClock::at(MONO_1, WALL_1);
+    let w = WalWriter::open(
+        WalConfig {
+            dir: PathBuf::from(DIR),
+            rotate_bytes: DEFAULT_ROTATE,
+        },
+        fs.clone(),
+        clock.clone(),
+    );
+    assert_eq!(w.current_seq(), 7);
+
+    fs.external_unlink(p(WAL));
+    clock.advance(MS_60);
+    w.append(req("RX", "uart", b"next"));
+    let meta = first_meta_line(&read_text(&fs, WAL));
+    let event = meta_of(&meta);
+    assert_eq!(event.get("range_known"), Some(&PyValue::Bool(false)));
+    assert_eq!(
+        event.get("potentially_lost_seq_range"),
+        Some(&PyValue::Null)
+    );
+}
+
+#[test]
+fn health_query_does_not_republish_an_old_fanout_snapshot() {
+    let (w, fs, _) = writer(DEFAULT_ROTATE);
+    let fence = Arc::new(Fence::default());
+    let fanout = WalHealthFanout::new();
+    fanout.register(fence.clone());
+    w.set_health_sink(fanout);
+    fs.fail_next_writes(p(WAL), 2, eio());
+    w.append(req("RX", "uart", b"fail"));
+    assert!(fence.flag());
+
+    let _ = w.health();
+    assert!(fence.flag(), "健康查詢不得解除 WAL 寫入失敗的 fence");
+}
+
+#[test]
+fn health_fanout_serializes_register_and_status_notifications() {
+    struct BlockingSink {
+        events: Mutex<Vec<bool>>,
+        initial_seen: mpsc::Sender<()>,
+        release_initial: Mutex<mpsc::Receiver<()>>,
+        unhealthy_seen: mpsc::Sender<()>,
+    }
+    impl WalHealthSink for BlockingSink {
+        fn set_wal_unhealthy(&self, unhealthy: bool) {
+            self.events.lock().unwrap().push(unhealthy);
+            if unhealthy {
+                let _ = self.unhealthy_seen.send(());
+            } else {
+                let _ = self.initial_seen.send(());
+                self.release_initial.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+
+    let fanout = WalHealthFanout::new();
+    let (initial_tx, initial_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (unhealthy_tx, unhealthy_rx) = mpsc::channel();
+    let sink = Arc::new(BlockingSink {
+        events: Mutex::new(Vec::new()),
+        initial_seen: initial_tx,
+        release_initial: Mutex::new(release_rx),
+        unhealthy_seen: unhealthy_tx,
+    });
+
+    let register_fanout = fanout.clone();
+    let register_sink: Arc<dyn WalHealthSink> = sink.clone();
+    let register = thread::spawn(move || register_fanout.register(register_sink));
+    initial_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("register 應先送出初始健康狀態");
+
+    let update_fanout = fanout.clone();
+    let update = thread::spawn(move || update_fanout.set_wal_unhealthy(true));
+    let update_overtook_register = unhealthy_rx.recv_timeout(Duration::from_millis(25)).is_ok();
+    release_tx.send(()).unwrap();
+    register.join().unwrap();
+    update.join().unwrap();
+
+    assert!(
+        !update_overtook_register,
+        "較新的狀態不得越過註冊初始化通知"
+    );
+    assert_eq!(*sink.events.lock().unwrap(), vec![false, true]);
 }
 
 #[test]
 fn wal_write_failure_twice_sets_loss_flag_and_consumes_seq() {
     let (w, fs, _) = writer(DEFAULT_ROTATE);
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let warning_sink = warnings.clone();
+    w.set_warn_sink(Arc::new(move |line| {
+        warning_sink.lock().unwrap().push(line.to_string());
+    }));
     fs.fail_next_writes(p(WAL), 2, eio()); // 首次＋重試皆失敗
     let a = w.append(req("RX", "device", b"x"));
     assert_eq!(
@@ -785,6 +1285,10 @@ fn wal_write_failure_twice_sets_loss_flag_and_consumes_seq() {
         }
     );
     assert_eq!(w.health().write_failures, 1);
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &["WAL append 寫入失敗（best-effort 略過）：[Errno 5] Input/output error"]
+    );
     // seq 缺口保留（04 §1.7）
     let b = w.append(req("RX", "device", b"y"));
     assert_eq!(b.seq, 2);
@@ -837,6 +1341,48 @@ fn wal_zero_sent_failure_rewrites_whole_line_after_reopen() {
     assert_eq!(fs.open_calls(p(WAL)), 2);
     assert_eq!(read_bytes(&fs, WAL), calls[0]);
     assert_eq!(w.health().write_failures, 0);
+
+    let (retry_writer, retry_fs, _) = writer(DEFAULT_ROTATE);
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let warning_sink = warnings.clone();
+    retry_writer.set_warn_sink(Arc::new(move |line| {
+        warning_sink.lock().unwrap().push(line.to_string());
+    }));
+    retry_fs.fail_next_opens(
+        p(WAL),
+        1,
+        PalError::io(2, "[Errno 2] No such file or directory"),
+    );
+    let first = retry_writer.append(req("RX", "device", b"recovered"));
+    assert!(first.ok && first.seq == 1);
+    assert_eq!(retry_writer.health().recreated_count, 1);
+    assert_eq!(seqs(&read_text(&retry_fs, WAL)), vec![1]);
+    assert_eq!(
+        warnings.lock().unwrap().as_slice(),
+        &["WAL 目錄 /w 消失，已重建並續寫（原因：[Errno 2] No such file or directory）；消失期間的紀錄無法復原"]
+    );
+
+    let second = retry_writer.append(req("RX", "device", b"after-meta"));
+    assert!(second.ok && second.seq == 3);
+    assert_eq!(retry_writer.health().recreated_count, 1);
+    let rows = dict_lines(&read_text(&retry_fs, WAL));
+    assert_eq!(seq_of(&rows[0]), Some(1));
+    assert_eq!(seq_of(&rows[1]), Some(2));
+    assert_eq!(str_of(meta_of(&rows[1]), "reason"), Some("dir_missing"));
+    assert_eq!(seq_of(&rows[2]), Some(3));
+
+    let (mirror_writer, mirror_fs, _) = writer(DEFAULT_ROTATE);
+    mirror_fs.fail_next_opens(
+        p(MIRROR),
+        1,
+        PalError::io(2, "[Errno 2] No such file or directory"),
+    );
+    let first = mirror_writer.append(req("RX", "device", b"mirror-recovered"));
+    assert!(first.ok && first.seq == 1);
+    assert_eq!(mirror_writer.health().recreated_count, 1);
+    let second = mirror_writer.append(req("RX", "device", b"no-wal-meta"));
+    assert!(second.ok && second.seq == 2);
+    assert_eq!(seqs(&read_text(&mirror_fs, WAL)), vec![1, 2]);
 }
 
 #[test]
@@ -902,7 +1448,7 @@ fn startup_seq_is_max_int_seq_in_current_file() {
     let fs = FakeWalFs::new();
     fs.seed(
         p(WAL),
-        b"{\"seq\":5,\"dir\":\"RX\"}\n{\"seq\":9,\"dir\":\"RX\"}\n{\"seq\":7,\"dir\":\"RX\"}\nnot json\n{\"seq\":\"x\"}\n",
+        b"{\"seq\":5,\"dir\":\"RX\"}\n{\"seq\":9,\"dir\":\"RX\"}\n{\"seq\":7,\"dir\":\"RX\"}\n{\"seq\":9223372036854775808,\"dir\":\"RX\"}\nnot json\n{\"seq\":\"x\"}\n",
     );
     let clock = FakeClock::at(MONO_1, WALL_1);
     let w = WalWriter::open(
@@ -913,10 +1459,46 @@ fn startup_seq_is_max_int_seq_in_current_file() {
         fs.clone(),
         clock.clone(),
     );
-    assert_eq!(w.current_seq(), 9);
+    let beyond_i64 = i64::MAX as u64 + 1;
+    assert_eq!(w.current_seq(), beyond_i64);
     let a = w.append(req("RX", "device", b"a"));
-    assert_eq!(a.seq, 10);
+    assert_eq!(a.seq, beyond_i64 + 1);
     assert_eq!(w.available_from_seq(), Some(5));
+    let rows = w
+        .tail_raw_with_meta(Some(i128::from(i64::MAX)), None, 10)
+        .unwrap()
+        .0;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get("seq"),
+        Some(&PyValue::Int(PyInt::Small(i128::from(beyond_i64))))
+    );
+    assert_eq!(
+        rows[1].get("seq"),
+        Some(&PyValue::Int(PyInt::Small(i128::from(beyond_i64 + 1))))
+    );
+
+    let overflow_fs = FakeWalFs::new();
+    overflow_fs.seed(p(WAL), b"{\"seq\":18446744073709551616,\"dir\":\"RX\"}\n");
+    let overflow_writer = WalWriter::open(
+        WalConfig {
+            dir: PathBuf::from(DIR),
+            rotate_bytes: DEFAULT_ROTATE,
+        },
+        overflow_fs.clone(),
+        clock,
+    );
+    assert_eq!(overflow_writer.current_seq(), u64::MAX);
+    assert_eq!(
+        overflow_writer.health().unhealthy_reason,
+        Some("write_failed"),
+        "無法表示的既有 seq 應使 writer fail closed"
+    );
+    let before = read_bytes(&overflow_fs, WAL);
+    let overflow = overflow_writer.append(req("RX", "device", b"must-not-duplicate"));
+    assert!(!overflow.ok && overflow.loss_flag);
+    assert_eq!(overflow.seq, u64::MAX);
+    assert_eq!(read_bytes(&overflow_fs, WAL), before);
 }
 
 #[test]
@@ -924,7 +1506,7 @@ fn reset_renames_nonempty_files_independent_suffix() {
     let (w, fs, _) = writer(DEFAULT_ROTATE);
     w.append(req("RX", "uart", b"a"));
     w.append(req("RX", "uart", b"b")); // seq 1、2；WAL 與 mirror 皆非空
-    // 同秒既有 WAL 歸檔 → WAL 後綴取 .1
+                                       // 同秒既有 WAL 歸檔 → WAL 後綴取 .1
     fs.seed(p(&format!("{WAL}.{SUFFIX_1}")), b"old\n");
     let r = w.reset().expect("reset 應成功");
     assert_eq!(r.previous_seq, 2);
@@ -940,6 +1522,24 @@ fn reset_renames_nonempty_files_independent_suffix() {
     let r2 = w2.reset().expect("空檔 reset 應成功");
     assert_eq!(r2.previous_seq, 0);
     assert!(fs2.list_dir(p(DIR)).is_empty(), "空檔不得改名");
+
+    let (w3, fs3, clock3) = writer(DEFAULT_ROTATE);
+    w3.append(req("RX", "uart", b"before-reset"));
+    fs3.external_unlink(p(WAL));
+    fs3.fail_next_opens(p(WAL), 1, enospc());
+    clock3.advance(MS_60);
+    assert!(!w3.append(req("RX", "uart", b"recreate-pending")).ok);
+    w3.reset().expect("pending recreate 時 reset 仍應完成");
+    clock3.advance(Duration::from_millis(20));
+    assert!(w3.append(req("RX", "uart", b"after-reset")).ok);
+    let pending_rows = dict_lines(&read_text(&fs3, WAL));
+    assert_eq!(str_of(&pending_rows[0], "dir"), Some("META"));
+    assert_eq!(
+        str_of(meta_of(&pending_rows[0]), "reason"),
+        Some("external_unlink")
+    );
+    assert_eq!(seq_of(&pending_rows[0]), Some(1));
+    assert_eq!(seq_of(&pending_rows[1]), Some(2));
 }
 
 #[test]
@@ -986,6 +1586,35 @@ fn health_missing_file_after_writes_unhealthy() {
 }
 
 #[test]
+fn directory_identity_recovers_after_transient_startup_error() {
+    let fs = FakeWalFs::new();
+    let faulted_fs = Arc::new(TransientDirIdentityFs {
+        inner: fs.clone(),
+        dir_identity_state: AtomicUsize::new(0),
+        fail_next_read: AtomicUsize::new(0),
+    });
+    let clock = FakeClock::at(MONO_1, WALL_1);
+    let w = WalWriter::open(
+        WalConfig {
+            dir: PathBuf::from(DIR),
+            rotate_bytes: DEFAULT_ROTATE,
+        },
+        faulted_fs.clone(),
+        clock,
+    );
+
+    faulted_fs.dir_identity_state.store(1, Ordering::SeqCst);
+    assert!(w.append(req("RX", "device", b"alive")).ok);
+    assert!(w.health().wal_dir_exists);
+
+    faulted_fs.dir_identity_state.store(2, Ordering::SeqCst);
+    fs.set_dir_writable(p(DIR), false);
+    fs.external_unlink(p(WAL));
+    fs.external_unlink(p(MIRROR));
+    assert!(!w.health().wal_dir_exists);
+}
+
+#[test]
 fn open_failure_at_startup_marks_unhealthy() {
     let fs = FakeWalFs::new();
     fs.set_dir_writable(p(DIR), false);
@@ -1010,9 +1639,39 @@ fn open_failure_at_startup_marks_unhealthy() {
     assert!(fs.contents(p(WAL)).is_none());
     let a = w.append(req("RX", "device", b"a"));
     assert!(!a.ok && a.loss_flag);
-    assert_eq!(w.health().write_failures, 1);
+    // WAL 與 mirror 是兩條獨立路徑；此處兩者的開檔都失敗，應各計一次。
+    assert_eq!(w.health().write_failures, 2);
     // 記憶體不保留未寫紀錄
     assert!(fs.contents(p(WAL)).is_none());
+
+    let read_fs = FakeWalFs::new();
+    read_fs.seed(p(WAL), b"{\"seq\":7,\"dir\":\"RX\"}\n");
+    let faulted_fs = Arc::new(TransientDirIdentityFs {
+        inner: read_fs.clone(),
+        dir_identity_state: AtomicUsize::new(1),
+        fail_next_read: AtomicUsize::new(1),
+    });
+    let read_fence = Arc::new(Fence::default());
+    let read_fanout = WalHealthFanout::new();
+    read_fanout.register(read_fence.clone());
+    let read_writer = WalWriter::open(
+        WalConfig {
+            dir: PathBuf::from(DIR),
+            rotate_bytes: DEFAULT_ROTATE,
+        },
+        faulted_fs,
+        FakeClock::at(MONO_1, WALL_1),
+    );
+    read_writer.set_health_sink(read_fanout);
+    assert!(!read_writer.health().healthy);
+    assert_eq!(read_writer.health().unhealthy_reason, Some("write_failed"));
+    assert!(read_fence.flag(), "啟動 WAL 讀取失敗應通知所有 fence");
+    assert_eq!(read_writer.current_seq(), 0);
+    let recovered = read_writer.append(req("RX", "device", b"after-read"));
+    assert!(recovered.ok);
+    assert_eq!(recovered.seq, 8, "重讀既有 WAL 後才可繼續序號");
+    assert!(!read_fence.flag(), "成功重讀後應清除 unhealthy 狀態");
+    assert_eq!(seqs(&read_text(&read_fs, WAL)), vec![7, 8]);
 }
 
 #[test]
@@ -1107,7 +1766,9 @@ fn recreate_meta_matches_contract_schema() {
         .expect("oneOf 應為陣列");
     let entry = entries
         .iter()
-        .find(|e| e.get("title").and_then(PyValue::as_str) == Some("WAL_RECREATED_AFTER_EXTERNAL_UNLINK"))
+        .find(|e| {
+            e.get("title").and_then(PyValue::as_str) == Some("WAL_RECREATED_AFTER_EXTERNAL_UNLINK")
+        })
         .expect("schema 應含 WAL_RECREATED_AFTER_EXTERNAL_UNLINK");
     let entry = pv_dict(entry);
 
@@ -1137,7 +1798,10 @@ fn recreate_meta_matches_contract_schema() {
         Some(&PyValue::Bool(false))
     );
     for k in meta.0.keys() {
-        assert!(props.get(k).is_some(), "額外鍵 {k} 違反 additionalProperties:false");
+        assert!(
+            props.get(k).is_some(),
+            "額外鍵 {k} 違反 additionalProperties:false"
+        );
     }
 
     // event const

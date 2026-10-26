@@ -62,3 +62,23 @@ def test_pyre_limits_is_fresh(tmp_path):
         check=True,
     )
     assert (tmp_path / "pyre.limits.json").read_bytes() == (ROOT / "contracts/golden/pyre.limits.json").read_bytes()
+
+
+def test_wal_record_goldens_are_fresh(tmp_path):
+    target = tmp_path / "wal"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/stage0/capture_wal_golden.py"),
+            "--out-dir",
+            str(target),
+        ],
+        check=True,
+        cwd=ROOT,
+    )
+    expected = sorted((ROOT / "contracts/golden/wal").glob("*.json"))
+    generated = sorted(target.glob("*.json"))
+    assert expected, "contracts/golden/wal/*.json 不得為空"
+    assert [p.name for p in generated] == [p.name for p in expected]
+    for generated_file, expected_file in zip(generated, expected):
+        assert generated_file.read_bytes() == expected_file.read_bytes(), generated_file.name
