@@ -137,6 +137,15 @@ def faketarget(tmp_path: Path):
     ft.stop()
 
 
+@pytest.fixture
+def p7(tmp_path: Path):
+    """P7（Slice 2.3）黑箱 rig（Task 18A）：``p7.start(profile, [FakeTarget(...)])`` 後以 ``p7.cli(...)`` 操作。"""
+    from bb_p7 import P7Rig
+    rig = P7Rig(tmp_path / "p7")
+    yield rig
+    rig.stop()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _no_system_config() -> None:
     if os.name == "nt":

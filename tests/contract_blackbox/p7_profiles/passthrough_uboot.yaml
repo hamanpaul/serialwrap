@@ -1,0 +1,19 @@
+# P7 黑箱（Task 18A）：passthrough＋U-Boot prompt；不做 login／ready gating，停在 ATTACHED。
+# ready_probe 省略＝採 config 預設（echo __READY__ 接 nonce 佔位）；代換後檔案不得殘留任何佔位語法。
+profiles:
+  p7-uboot:
+    platform: passthrough
+    prompt_regex: "(?mi)^(=>|u-boot>|cfe>) $"
+    login_regex: "$^"
+    password_regex: "$^"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-uboot
+    com: COM0
+    device_by_id: "${BY_ID}"

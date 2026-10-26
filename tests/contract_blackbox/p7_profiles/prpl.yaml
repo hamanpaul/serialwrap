@@ -1,0 +1,26 @@
+# P7 黑箱（Task 18A）：prplOS；prompt_regex 只比對 prefix。對應 FakeTarget(prompt="root@prplOS:~# ")。
+# ready_probe 省略＝採 config 預設（echo __READY__ 接 nonce 佔位）；代換後檔案不得殘留任何佔位語法。
+profiles:
+  p7-prpl:
+    platform: prpl
+    prompt_regex: "(?m)^root@prplOS:.*# "
+    login_regex: "(?mi)^login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: SW_P7_USER
+    pass_env: SW_P7_PASS
+    env_file: "${ENV_FILE}"
+    timeout_s: 10
+    bootloader_prompts:
+      - "^=> $"
+      - "^U-Boot> $"
+    uart:
+      baud: 115200
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      flow_control: none
+      xonxoff: false
+targets:
+  - profile: p7-prpl
+    com: COM0
+    device_by_id: "${BY_ID}"

@@ -40,3 +40,11 @@ scripts/rust/win-blackbox.sh
 ```cmd
 py -3.12 -m pytest -q -m "core_portable or windows_native" tests\contract_blackbox --confcutdir=tests\contract_blackbox -p no:cacheprovider
 ```
+
+`scripts/rust/win-blackbox.ps1` 另接受選用參數 `-Tests <逗號分隔的 pytest 路徑>`（P7 Task 18A），只跑指定案例（如 `-Tests tests\contract_blackbox\test_p7_events.py`）；未給時維持整個 `tests/contract_blackbox`。
+
+## P7（Slice 2.3）測試工具
+
+- `bb_faketarget.FakeTarget` 新增 keyword-only 參數 `login_steps`、`commands`（`overrides`）、`delay_ms`、`noise`、`console_lock`、`boot_on_start`，與方法 `emit`、`freeze_rx`／`thaw_rx`、`boot`、`rx_mark`／`rx_log_since`；全部未給時逐位元組維持 P3 行為（語意見模組 docstring）。
+- `bb_p7.py`：`p7_profile_dir(tmp, name, **subst)` 複製 `p7_profiles/<name>.yaml` 並代換 `${BY_ID}`、`${ENV_FILE}` 等大寫佔位（缺值 → `KeyError`）；`cli_json`、`wait_state`；fixture `p7` 回傳 `P7Rig`（`start(profile, targets)`、`cli(...)`、`wal_records(sel)`、`stop()`）。
+- 自測：`tests/contract_blackbox/test_bb_faketarget_p7_selftest.py`。

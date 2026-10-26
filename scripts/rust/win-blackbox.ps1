@@ -6,7 +6,9 @@
     [string]$GitRevision,
     [string]$ContractRevision,
     [string]$ComPair,
-    [string]$Label = 'rust-1a-win'
+    [string]$Label = 'rust-1a-win',
+    # P7 Task 18A：逗號分隔的 pytest 路徑（如 tests\contract_blackbox\test_p7_events.py,…）；未給時維持 P3 行為＝整個 tests/contract_blackbox。
+    [string]$Tests
 )
 
 $ErrorActionPreference = 'Stop'
@@ -298,7 +300,9 @@ function Invoke-Blackbox([string]$Name, [string]$JunitPath, [string]$CliPath, [s
     }
     # A、B 兩輪使用同一 selector（＝ s1a_blackbox windows selector，與 Linux ab_blackbox.sh 對稱），
     # 否則 A 多出的 posix_only 案例會在比較器判 case-set-mismatch。
-    $arguments = @('-3.12', '-m', 'pytest', 'tests/contract_blackbox', '-m', 'core_portable or windows_native',
+    $testPaths = @('tests/contract_blackbox')
+    if ($Tests) { $testPaths = @($Tests -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    $arguments = @('-3.12', '-m', 'pytest') + $testPaths + @('-m', 'core_portable or windows_native',
                    '--confcutdir=tests/contract_blackbox', '-p', 'no:cacheprovider', '-o', 'xfail_strict=true',
                    "--junitxml=$JunitPath")
     if ($RuntimeMissing) { $arguments += @('-k', 'not test_bb_cli_help and not test_bb_delegation') }
