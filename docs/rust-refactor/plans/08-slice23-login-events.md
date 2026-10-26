@@ -2604,6 +2604,20 @@ def test_full_required_set_passes(tmp_path):
 
 ---
 
+## 審查 p6t8-p7front（Sonnet）L5 待辦
+
+> 來源：`origin/review/p6t8-p7front:docs/rust-refactor/reviews/p6t8-p7front-sonnet-review.md`。M2、M3 已由 `0d0ccff`、`37d4d29` 修正；L1、L2、L5-4 已於 `feature/rust-refactor-p7` 修正（各附 golden 回歸）。以下為無法或不宜以程式碼在本批解決者：
+
+| 項 | 狀態 | 處置 |
+|---|---|---|
+| L5-1 T18A 未獨立 PR | 待辦（流程） | 合併 P7 時將 `5af6c15`（T18A）拆為獨立 PR，或於 P7 PR 描述註明 §10.4 測試工具變更已取得獨立審閱。 |
+| L5-2 T18A 時序案例 CI 穩定性 | 已取證，不改門檻 | 2026-10-26 本機（4 cores，CPython 3.12.3）`-k "test_d_boot or test_e_noise"` 閒置 15/15、12 個 busy-loop（3× 超訂）15/15 通過；`bb_faketarget` boot／noise 已用絕對 monotonic 期限（無累積漂移）。保留 ±100 ms／±20%；若 CI 紅燈，依 CLAUDE.md 先當真實回歸，主張環境問題須附「同範圍連跑兩次、失敗集合不同」實測。 |
+| L5-3 (a) 案例自寫互動 | 無需處置 | 審查以 base／HEAD 差分補驗逐位元組相同。 |
+| L5-4 golden 版本 | 已修 | `capture_p7_goldens.py` 非 CPython 3.12 一律 exit 2；L1 的 `event_schema:078` 於 3.11 結果不同，計畫 Task 1「3.11／3.12 逐位元組相同」改以 3.12 為唯一基準（待擁有者確認）。 |
+| L5-5 SC-30 與 PA-OD-1 | 待擁有者 | PA-OD-1 裁決後回調 SC-30 狀態／`absolute_only`。 |
+| L5-6 `check_p7_prereqs.py` exit 1 | 已解除前提 | `15d3240` 已補 `pyre::escape`（UP-P7-01）；2026-10-26 重跑 exit 0。 |
+| （上游）M1 `held_slave_paths` 改 `same_tty` | P6 範圍 | 屬 07 Task 8（#40／#64），須在本 Phase Task 9 ConsoleHub reaper 消費前由 P6 補齊；本 Phase 不改 sw-pal。 |
+
 ## BLOCKED-OWNER 總表（本環境無法產出；交付可執行程序與判定器，證據到位前不得標 PASS）
 
 | ID | 項目 | 需要的資源／授權 | 本 Phase 提供的程序 | 對應 Task |
