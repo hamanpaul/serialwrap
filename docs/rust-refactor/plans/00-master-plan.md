@@ -31,6 +31,7 @@
 - 雙軌同步上限（§12.2「契約先行的雙軌開發」）：Stage 2 期間 Python／Rust 雙軌同步（含測試工具同步、實機重跑、缺陷處理）超過當雙週重構投入的 30% 時，暫停開立下一切片並重新排程；各切片校準報告（06 Task 23 起，07／08／09 出口報告沿用同格式）須列出當期雙軌投入比例。
 - 斷路器（§12.2、OD-02／OD-13）每個切片都適用：2.1～2.4 各自在切片開始時以 `scripts/rust/slice_breaker.py`（06 Task 0b 唯一建立者）凍結必要案例分母與觀測窗口（`tests/acceptance/breaker/slice_2.{1,2,3,4}.json`），出口 gate 判定；不得拆案例或改分母。
 - Spike 9（多使用者 IPC 信任邊界，§13）不在本計畫交付範圍：OD-12 限定單人工作站部署，多使用者部署（含 `windows-service` bench）前須另案交付 RPC token＋ACL 與 Spike 9 證據；P9 退役裁決不得宣稱多使用者隔離。
+- **1:1 parity 修訂（parity-amendments-2026-10-26 #0，具約束力）**：稽核 A（對外介面）與稽核 B（daemon 行為 725 項）的每一個 GAP、非刻意 DIVERGENT 與未測項，已依 `plans/parity-amendments-2026-10-26.md` 判定並寫入 06～10 各 Task 的「parity-amendments-2026-10-26 追加」段。原則（OD-14 #1，2026-10-26 擁有者重申）：外部可觀察行為（CLI 指令格式與輸出、RPC 方法、回應欄位與 `error_code`、檔案格式）與 Python 1:1，只可新增、不可修改；內部實作可調整。各切片出口 gate（06 Task 22、07 Task 13、08 Task 19、09 Task 15）須逐列標記該 Phase 承接的 parity 列；Python 基線 parity 測試另以 add-only 登記於 `s21_gate:py_parity`、`s22_gate:py_parity`、`p7_gate:py_parity`、`s24_py_parity`。已實作分支（p5／p6／`feature/rust-refactor`）的追加修正與 OWNER-DECISION（PA-OD-1～3）清單見該檔。
 
 ## Review Focus
 
