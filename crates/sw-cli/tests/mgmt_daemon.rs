@@ -484,6 +484,32 @@ fn start_manifest_relative_path_returns_absolute_launcher() {
 }
 
 #[test]
+fn start_windows_python_launcher_uses_manifest_runtime() {
+    let t = TestEnv::windows().with_process();
+    let launcher = t.bundle_dir().join("serialwrapd.py");
+    let runtime = t.bundle_dir().join("py").join("python.exe");
+    let manifest = t.bundle_dir().join("release-manifest.json");
+    let body = r#"{"schema_version":1,"bundle_version":"test","stage":"rust-1b-test","target":"x86_64-pc-windows-gnu","git_revision":"test","components":{"cli":{"implementation":"rust","version":"test","path":"bin/serialwrap.exe","sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"python_cli_delegate":{"entry":["py/python.exe","-I","delegate_sentinel.py"]},"daemon":{"launcher":{"path":"serialwrapd.py"},"runtime":{"path":"py/python.exe","python_version":"3.12"}}}}"#;
+    t.write_file(&launcher, b"python daemon shim");
+    t.write_file(&runtime, b"python runtime");
+    t.write_file(&manifest, body.as_bytes());
+
+    let argv = t.with_cli_ctx(|ctx| {
+        sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx).expect("Windows Python launcher")
+    });
+    let expected_path = |path: &PathBuf| path.to_string_lossy().replace('/', "\\");
+    assert_eq!(
+        argv,
+        vec![
+            expected_path(&runtime),
+            "-I".to_string(),
+            "-B".to_string(),
+            expected_path(&launcher),
+        ]
+    );
+}
+
+#[test]
 fn start_binary_not_found() {
     let t = TestEnv::posix().with_process();
     let (rc, out, err) = t.run(&["daemon", "start"]);

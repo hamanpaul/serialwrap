@@ -539,7 +539,26 @@ pub fn locate_daemon_argv(ctx: &CliCtx<'_>) -> Result<Vec<String>, DaemonLocateE
         if let Some(relative) = manifest_component_path(&parsed.raw, "launcher") {
             let candidate = resolve_component_path(path, relative);
             if ctx.p.fs.is_file(&candidate) {
-                return Ok(vec![absolute_path(ctx, &candidate)]);
+                let windows_python_script = path_flavor(ctx) == PathFlavor::Windows
+                    && Path::new(relative).extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("py")
+                    });
+                if windows_python_script {
+                    if let Some(runtime_relative) = manifest_component_path(&parsed.raw, "runtime")
+                    {
+                        let runtime = resolve_component_path(path, runtime_relative);
+                        if ctx.p.fs.is_file(&runtime) {
+                            return Ok(vec![
+                                absolute_path(ctx, &runtime),
+                                "-I".to_string(),
+                                "-B".to_string(),
+                                absolute_path(ctx, &candidate),
+                            ]);
+                        }
+                    }
+                } else {
+                    return Ok(vec![absolute_path(ctx, &candidate)]);
+                }
             }
         }
     }
