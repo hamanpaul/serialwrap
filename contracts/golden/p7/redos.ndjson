@@ -1,0 +1,40 @@
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:001","pattern":"Kernel panic","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:002","pattern":"temp=(\\d+)C","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:003","pattern":"root@.*#","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:004","pattern":"a+b+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:005","pattern":"(a+)+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:006","pattern":"(a|aa)+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":true,"id":"redos:007","pattern":"(a*)\\1","score":1,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:008","pattern":"a.*a.*","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:009","pattern":"(?:ab|abab)*","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:010","pattern":"a{0,4096}","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:011","pattern":"a{0,4096}b{0,4096}","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:012","pattern":"(a?){30}a{30}","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:013","pattern":"(a|aa){5}","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:014","pattern":"(foo|bar)(baz|qux)","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:015","pattern":"\\d+\\.\\d+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"i","has_backref":false,"id":"redos:016","pattern":"[0-9a-f]{2}(:[0-9a-f]{2}){5}","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:017","pattern":"a++b","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:018","pattern":"a*+b*","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:019","pattern":"(?>a+)+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:020","pattern":"(?>a+)b+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:021","pattern":"a{2}","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:022","pattern":"(ab){3}","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:023","pattern":"x*?y","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:024","pattern":"x*?y*?","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:025","pattern":"(?=a+)b","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:026","pattern":"(?!a+)b+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:027","pattern":"(?<=a)b+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:028","pattern":"(a)(?(1)b+|c)","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:029","pattern":"(a)?(?(1)(a+)+b|c)","score":3,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:030","pattern":"(?i:a+)b+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"m","has_backref":false,"id":"redos:031","pattern":"^.*$","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"s","has_backref":false,"id":"redos:032","pattern":".*","score":1,"suspicious":false}
+{"compile_ok":false,"error":"missing ), unterminated subpattern at position 0","flags":"","has_backref":null,"id":"redos:033","pattern":"(","score":null,"suspicious":null}
+{"compile_ok":false,"error":"multiple repeat at position 2","flags":"","has_backref":null,"id":"redos:034","pattern":"a**","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unterminated character set at position 0","flags":"","has_backref":null,"id":"redos:035","pattern":"[","score":null,"suspicious":null}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:036","pattern":"a|b|c","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:037","pattern":"(a|b)c+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":true,"id":"redos:038","pattern":"(?P<x>a+)(?P=x)","score":1,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:039","pattern":"\\bword\\b","score":0,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:040","pattern":"","score":0,"suspicious":false}
