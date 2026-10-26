@@ -433,6 +433,8 @@ def test_spike3_evidence_schema_rejects_missing_edr():
                 "seq_continuous": True, "rotate_retry": 0, "deferred_delete_pending": 0,
                 "write_failures": 0, "pre_rotate": {"ok": True}, "post_rotate": {"ok": True},
                 "crc_errors": [], "interference_observed": True,
+                "lease_acquired_ns": 1, "stimulus_started_ns": 2,
+                "rotation_completed_ns": 3, "lease_until_ns": 4,
             },
         },
         "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
@@ -464,6 +466,17 @@ def test_spike3_evidence_schema_rejects_missing_edr():
     without_integrity = {k: v for k, v in base.items() if k != "binary_integrity"}
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=without_integrity, schema=schema)
+    without_oplock = json.loads(json.dumps(base))
+    without_oplock["observations"].pop("oplock_variant")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_oplock, schema=schema)
+    for field in (
+        "lease_acquired_ns", "stimulus_started_ns", "rotation_completed_ns", "lease_until_ns",
+    ):
+        without_live_lease = json.loads(json.dumps(base))
+        without_live_lease["observations"]["oplock_variant"].pop(field)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=without_live_lease, schema=schema)
 
 
 def test_kill_hook_ignored_on_non_isolated_instance(tmp_path, monkeypatch, caplog):

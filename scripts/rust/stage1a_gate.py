@@ -138,8 +138,9 @@ SPIKE3_CASES = (
     "win-wal-av-rotate", "win-wal-av-unlink", "win-wal-av-reader-handle", "win-wal-f12-progress",
 )
 SPIKE3_SCHEMA_REL = Path("scripts/stage0/spike3_evidence.schema.json")
-# OD-19 (2) 要求寫入延遲有上限；此值須由 owner 裁決後設定，目前不得自行推定。
-OD19_AVSIM_WRITE_LATENCY_BOUND_MS: float | None = None
+# OD-22：主案例與獨立 oplock 變體都必須同時符合 p99 與最大 append 延遲上限。
+OD22_AVSIM_WRITE_LATENCY_P99_BOUND_MS = 100.0
+OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS = 600.0
 
 
 def _git_head(repo_root: Path) -> str | None:
@@ -492,6 +493,9 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
             reasons.append("observations.drain.drained 非 true")
 
     oplock_workload = observations.get("oplock_variant")
+    for key in ("oplock_variant_error", "oplock_variant_close_error"):
+        if key in observations:
+            reasons.append(f"observations.{key} 存在：{observations[key]!r}")
     if not isinstance(oplock_workload, dict):
         reasons.append("observations.oplock_variant 缺少獨立 append／rotate／F12 workload")
     else:
@@ -544,6 +548,22 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
             reasons.append("observations.oplock_variant.crc_errors 必須是空陣列")
         if oplock_workload.get("interference_observed") is not True:
             reasons.append("observations.oplock_variant.interference_observed 非 true")
+        lease_times = [
+            oplock_workload.get("lease_acquired_ns"),
+            oplock_workload.get("stimulus_started_ns"),
+            oplock_workload.get("rotation_completed_ns"),
+            oplock_workload.get("lease_until_ns"),
+        ]
+        if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in lease_times):
+            reasons.append("oplock 變體 lease／stimulus／rotation 時間戳須為非負單調時鐘整數")
+        else:
+            acquired_ns, stimulus_ns, rotation_ns, until_ns = lease_times
+            if not acquired_ns <= stimulus_ns <= rotation_ns < until_ns:
+                reasons.append("rotation_completed_ns 必須位於 lease 有效區間，且 stimulus 必須在 lease 取得後")
+            if oplock_workload.get("interference_observed") is not (
+                acquired_ns <= stimulus_ns <= rotation_ns < until_ns
+            ):
+                reasons.append("oplock_variant.interference_observed 與 lease／rotation 時間戳不一致")
 
     if cid == "win-wal-av-rotate":
         expected = int_at_least("expected_records", 1)
@@ -644,8 +664,8 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
                    head: str | None) -> tuple[str, list[str]]:
     """spike3 證據 → (狀態, 原因)。
 
-    PASS 還要求有有效 append 延遲樣本，且 owner 已裁決的上限未超出；缺樣本為 evidence-insufficient，
-    上限未裁決時為 BLOCKED-OWNER。EDR 名稱與狀態只是資訊欄位，不參與判定。
+    PASS 還要求主案例與 oplock 變體都有有效 append 延遲樣本，且兩組都符合 OD-22；缺樣本為
+    evidence-insufficient，超出 p99 或最大值上限為 FAIL。EDR 名稱與狀態只是資訊欄位。
     """
     if spike_dir is None:
         return "evidence-insufficient", ["未提供 --spike3-evidence"]
@@ -766,17 +786,32 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
     observation_reasons = _spike3_observation_reasons(cid, observations, samples)
     if observation_reasons:
         return "evidence-insufficient", observation_reasons
-    max_latency_ms = max(samples)
-    if OD19_AVSIM_WRITE_LATENCY_BOUND_MS is None:
-        return "BLOCKED-OWNER", [
-            "PENDING-OD-S1X-AVSIM-LATENCY：owner 尚未裁決最大 append 延遲上限 "
-            f"（本次最大值 {max_latency_ms:.6f} ms）"
-        ]
-    if max_latency_ms > OD19_AVSIM_WRITE_LATENCY_BOUND_MS:
-        return "FAIL", [
-            f"最大 append 延遲 {max_latency_ms:.6f} ms 超過 owner 上限 "
-            f"{OD19_AVSIM_WRITE_LATENCY_BOUND_MS:.6f} ms"
-        ]
+    oplock_samples = observations["oplock_variant"]["append_latency_ms"]
+    latency_failures: list[str] = []
+    for label, values in (("主案例", samples), ("oplock 變體", oplock_samples)):
+        try:
+            finite = all(math.isfinite(float(value)) for value in values)
+        except (OverflowError, TypeError, ValueError):
+            finite = False
+        count = observations["append_count"] if label == "主案例" else observations["oplock_variant"]["append_count"]
+        if (not isinstance(values, list) or not values or not finite
+                or not isinstance(count, int) or isinstance(count, bool) or len(values) != count):
+            return "evidence-insufficient", [f"{label} append 延遲樣本缺失、無效或數量不符"]
+        p99_index = math.ceil(0.99 * len(values)) - 1
+        p99_ms = sorted(values)[p99_index]
+        max_latency_ms = max(values)
+        if p99_ms > OD22_AVSIM_WRITE_LATENCY_P99_BOUND_MS:
+            latency_failures.append(
+                f"{label} append 延遲 p99 {p99_ms:.6f} ms 超過 OD-22 上限 "
+                f"{OD22_AVSIM_WRITE_LATENCY_P99_BOUND_MS:.6f} ms"
+            )
+        if max_latency_ms > OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:
+            latency_failures.append(
+                f"{label} append 延遲最大值 {max_latency_ms:.6f} ms 超過 OD-22 上限 "
+                f"{OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:.6f} ms"
+            )
+    if latency_failures:
+        return "FAIL", latency_failures
     return "PASS", []
 
 

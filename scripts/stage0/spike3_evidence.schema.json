@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://serialwrap.local/schemas/stage0/spike3_evidence.schema.json",
   "title": "Stage 0 Spike 3 Windows WAL／EDR 證據",
-  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。OD-19（2026-10-23）：判定依 av_sim 注入（av_sim 必填）與 binary_integrity（必填）；edr 為工具唯讀查詢的選填資訊欄，查不到寫 unknown，不影響 verdict。",
+  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。OD-19／OD-22：判定依 av_sim 注入、binary_integrity 與主案例／oplock append 樣本；兩組延遲須符合 p99 ≤100 ms、最大 ≤600 ms。edr 為唯讀資訊欄。",
   "type": "object",
   "required": ["case_id", "run_at", "env", "artifact", "steps", "observations", "av_sim", "binary_integrity", "verdict", "fallback"],
   "additionalProperties": false,
@@ -70,7 +70,7 @@
         },
         "append_latency_ms": {
           "type": "array",
-          "description": "實際 WalWriter.append 呼叫耗時（毫秒）；Spike 3 gate 要求非空有效樣本，數值上限另待 owner 裁決。",
+          "description": "實際 WalWriter.append 呼叫耗時（毫秒）；OD-22 要求 p99 ≤100 ms 且最大值 ≤600 ms。",
           "minItems": 1,
           "items": {"type": "number", "minimum": 0}
         },
@@ -80,7 +80,8 @@
           "required": [
             "append_count", "append_latency_ms", "archives", "records", "continuity_meta_count",
             "first_seq", "last_seq", "seq_continuous", "rotate_retry", "deferred_delete_pending",
-            "write_failures", "pre_rotate", "post_rotate", "crc_errors", "interference_observed"
+            "write_failures", "pre_rotate", "post_rotate", "crc_errors", "interference_observed",
+            "lease_acquired_ns", "stimulus_started_ns", "rotation_completed_ns", "lease_until_ns"
           ],
           "properties": {
             "append_count": {"type": "integer", "minimum": 1},
@@ -103,7 +104,11 @@
               "properties": {"ok": {"type": ["boolean", "null"]}, "reason_code": {"type": ["string", "null"]}}
             },
             "crc_errors": {"type": "array"},
-            "interference_observed": {"type": "boolean"}
+            "interference_observed": {"type": "boolean"},
+            "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
+            "stimulus_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+            "lease_until_ns": {"type": ["integer", "null"], "minimum": 0}
           },
           "additionalProperties": false
         }

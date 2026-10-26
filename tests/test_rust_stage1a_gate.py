@@ -1259,6 +1259,8 @@ def _spike3_observations(case_id: str) -> dict[str, Any]:
             "rotate_retry": 0, "deferred_delete_pending": 0, "write_failures": 0,
             "pre_rotate": {"ok": True}, "post_rotate": {"ok": True}, "crc_errors": [],
             "interference_observed": True,
+            "lease_acquired_ns": 100, "stimulus_started_ns": 110,
+            "rotation_completed_ns": 150, "lease_until_ns": 200,
         },
     }
     if case_id == "win-wal-av-rotate":
@@ -1354,29 +1356,28 @@ def test_spike3_dirty_tree_evidence_is_insufficient_never_pass(tree):
 
 
 def test_spike3_pass_with_known_edr_is_pass(tree):
-    """EDR 欄位不影響判定；有效延遲樣本仍因 owner 未裁決上限而 BLOCKED-OWNER。"""
+    """OD-22 有效延遲樣本通過時，EDR 欄位仍只供資訊記錄。"""
     _enable_spike3(tree)
     code, rep = tree.run()
-    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
-    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert rep["overall"] == "IMPLEMENTED"
     assert code == 0
 
 
 @pytest.mark.parametrize("bound_mode,expected", [("above", "PASS"), ("below", "FAIL")])
-def test_spike3_latency_bound_pass_and_fail_paths(tmp_path, monkeypatch, bound_mode, expected):
-    """owner 設定上限後，最大 append 樣本分別走 PASS 與超限 FAIL 分支。"""
+def test_spike3_latency_bound_pass_and_fail_paths(tmp_path, bound_mode, expected):
+    """OD-22 最大 append 樣本分別走 PASS 與超限 FAIL 分支。"""
     gate = _load_gate_module()
     head = "a" * 40
     doc = _spike3_doc(head)
     samples = doc["observations"]["append_latency_ms"]
-    observed_max = max(samples)
-    bound = observed_max + 1.0 if bound_mode == "above" else observed_max / 2.0
+    samples[:] = [1.0] * len(samples)
+    samples[-1] = 600.0 if bound_mode == "above" else 600.1
     evidence_dir = tmp_path / "spike3"
     evidence_dir.mkdir()
     (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
-    monkeypatch.setattr(gate, "OD19_AVSIM_WRITE_LATENCY_BOUND_MS", bound)
 
     status, reasons = gate._spike3_status(
         SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
@@ -1384,27 +1385,123 @@ def test_spike3_latency_bound_pass_and_fail_paths(tmp_path, monkeypatch, bound_m
 
     assert status == expected, reasons
     if expected == "FAIL":
-        assert any("超過 owner 上限" in reason for reason in reasons)
+        assert any("OD-22 上限" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    "sample_set,distribution,expected",
+    [
+        ("main", "p99_over", "FAIL"),
+        ("main", "max_over", "FAIL"),
+        ("oplock", "p99_over", "FAIL"),
+        ("oplock", "max_over", "FAIL"),
+        ("both", "within", "PASS"),
+        ("main", "missing", "evidence-insufficient"),
+        ("oplock", "missing", "evidence-insufficient"),
+        ("main", "count_mismatch", "evidence-insufficient"),
+        ("oplock", "count_mismatch", "evidence-insufficient"),
+    ],
+)
+def test_spike3_od22_latency_limits_apply_to_both_sample_sets(
+    tmp_path, sample_set, distribution, expected,
+):
+    """OD-22 同時檢查主案例與 oplock 的 p99 ≤100 ms、最大值 ≤600 ms。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    observations = doc["observations"]
+    sample_sets = (
+        ("main", observations["append_latency_ms"]),
+        ("oplock", observations["oplock_variant"]["append_latency_ms"]),
+    )
+    for name, field in sample_sets:
+        count = len(field)
+        if distribution == "p99_over" and sample_set in ("both", name):
+            field[:] = [1.0] * count
+            field[-5:] = [101.0] * 5
+        elif distribution == "max_over" and sample_set in ("both", name):
+            field[:] = [1.0] * count
+            field[-1] = 601.0
+        elif distribution == "missing" and sample_set == name:
+            field.clear()
+        elif distribution == "count_mismatch" and sample_set == name:
+            field.pop()
+        elif distribution == "within":
+            field[:] = [100.0] * count
+            field[-1] = 600.0
+
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == expected, reasons
+    if expected == "FAIL":
+        assert any("p99" in reason or "最大" in reason for reason in reasons), reasons
+
+
+@pytest.mark.parametrize("error_key", ["oplock_variant_error", "oplock_variant_close_error"])
+def test_spike3_oplock_variant_errors_are_insufficient(tmp_path, error_key):
+    """oplock 子變體執行或收尾例外不得被有效 grabs 與 workload 掩蓋。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    doc["observations"][error_key] = "OSError: injected failure"
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "evidence-insufficient", reasons
+    assert any(error_key in reason for reason in reasons), reasons
+
+
+def test_spike3_oplock_grabs_without_live_rotation_are_insufficient(tmp_path):
+    """歷史 grabs 不可替代與 lease 同時發生的 append／rotation 刺激。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    doc["observations"]["oplock_variant"].update({
+        "lease_acquired_ns": 100,
+        "stimulus_started_ns": 110,
+        "lease_until_ns": 200,
+        "rotation_completed_ns": 201,
+    })
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "evidence-insufficient", reasons
+    assert any("rotation_completed_ns 必須位於 lease 有效區間" in reason for reason in reasons), reasons
 
 
 def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
-    """OD-19 (3)：未知 EDR 不影響結果；此列只因尚無 owner latency 上限而 BLOCKED-OWNER。"""
+    """保留凍結 nodeid：未知 EDR 不影響 OD-22 延遲合格的 PASS。"""
     _enable_spike3(tree, product="unknown", status="unknown")
     code, rep = tree.run()
-    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
-    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert rep["overall"] == "IMPLEMENTED"
     assert code == 0
 
 
 def test_spike3_unknown_edr_is_info_only_and_does_not_block_pass(tree):
-    """保留已登記 nodeid；未知 EDR 不參與判定，上限未裁決仍明確 BLOCKED-OWNER。"""
+    """保留已登記 nodeid；未知 EDR 不參與 OD-22 延遲判定。"""
     _enable_spike3(tree, product="unknown", status="unknown")
     code, rep = tree.run()
     row = _case_row(rep, SP)
-    assert row["status"] == "BLOCKED-OWNER", row
-    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in row["evidence"]["reasons"])
+    assert row["status"] == "PASS", row
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in row["evidence"]["reasons"])
     assert not any("EDR" in reason or "edr" in reason for reason in row["evidence"]["reasons"])
     assert rep["overall"] == "IMPLEMENTED"
     assert code == 0
@@ -1420,14 +1517,14 @@ def test_spike3_missing_append_latency_measurements_is_insufficient(tree):
 
 
 def test_spike3_owner_latency_bound_not_decided_cannot_pass(tree):
-    """OD-19 (2)：有量測值但 owner 尚未核准上限時，延遲驗收仍須保持 BLOCKED-OWNER。"""
+    """保留凍結 nodeid：OD-22 核准後，合格延遲樣本應解除原 owner block。"""
     def set_valid_latency_samples(doc: dict[str, Any]) -> None:
         doc["observations"]["append_latency_ms"] = [2.0, *([1.0] * 399)]
 
     _enable_spike3(tree, mutate=set_valid_latency_samples)
     code, rep = tree.run()
-    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
-    assert any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert rep["overall"] == "IMPLEMENTED"
 
 
@@ -1482,7 +1579,7 @@ def test_spike3_rotate_counts_continuity_meta_without_calling_it_data_loss(tree)
 
     _enable_spike3(tree, mutate=add_continuity_meta)
     code, rep = tree.run()
-    assert _case_row(rep, SP)["status"] == "BLOCKED-OWNER", _case_row(rep, SP)
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
     assert rep["overall"] == "IMPLEMENTED"
     assert code == 0
 
@@ -1563,19 +1660,75 @@ def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
     assert rep["overall"] == "FAIL"
 
 
-@pytest.mark.parametrize("mutation", ["missing", "no_archive", "marker", "sequence"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing", "append_count_invalid", "append_samples_missing", "append_sample_count",
+        "no_archive", "records_invalid", "records_math", "meta_invalid", "first_seq", "last_seq",
+        "sequence", "rotate_retry_invalid", "deferred_pending_invalid", "write_failures_invalid",
+        "deferred_pending", "write_failures", "pre_marker", "post_marker", "crc_errors",
+        "interference_false", "lease_acquired_ns_missing",
+        "stimulus_started_ns_missing", "rotation_completed_ns_missing", "lease_until_ns_missing",
+        "lease_timestamp_invalid", "stimulus_before_lease", "rotation_after_expiry", "interference_mismatch",
+    ],
+)
 def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
     """具備 helper grabs 仍不足：oplock 變體須證明寫入、輪替、F12 marker 與連續 WAL。"""
     def damage(doc: dict[str, Any]) -> None:
         workload = doc["observations"]["oplock_variant"]
         if mutation == "missing":
             doc["observations"].pop("oplock_variant")
+        elif mutation == "append_count_invalid":
+            workload["append_count"] = 0
+        elif mutation == "append_samples_missing":
+            workload["append_latency_ms"] = []
+        elif mutation == "append_sample_count":
+            workload["append_latency_ms"].pop()
         elif mutation == "no_archive":
             workload["archives"] = 0
+        elif mutation == "records_invalid":
+            workload["records"] = 0
+        elif mutation == "records_math":
+            workload["records"] = 404
+            workload["last_seq"] = 404
+        elif mutation == "meta_invalid":
+            workload["continuity_meta_count"] = -1
+        elif mutation == "first_seq":
+            workload["first_seq"] = 2
+        elif mutation == "last_seq":
+            workload["last_seq"] = workload["records"] + 1
         elif mutation == "marker":
             workload["post_rotate"]["ok"] = False
-        else:
+        elif mutation == "sequence":
             workload["seq_continuous"] = False
+        elif mutation == "rotate_retry_invalid":
+            workload["rotate_retry"] = -1
+        elif mutation == "deferred_pending_invalid":
+            workload["deferred_delete_pending"] = -1
+        elif mutation == "write_failures_invalid":
+            workload["write_failures"] = -1
+        elif mutation == "deferred_pending":
+            workload["deferred_delete_pending"] = 1
+        elif mutation == "write_failures":
+            workload["write_failures"] = 1
+        elif mutation == "pre_marker":
+            workload["pre_rotate"]["ok"] = False
+        elif mutation == "post_marker":
+            workload["post_rotate"]["ok"] = False
+        elif mutation == "crc_errors":
+            workload["crc_errors"].append("bad CRC")
+        elif mutation == "interference_false":
+            workload["interference_observed"] = False
+        elif mutation.endswith("_missing"):
+            workload.pop(mutation.removesuffix("_missing"))
+        elif mutation == "lease_timestamp_invalid":
+            workload["lease_acquired_ns"] = "100"
+        elif mutation == "stimulus_before_lease":
+            workload["stimulus_started_ns"] = workload["lease_acquired_ns"] - 1
+        elif mutation == "rotation_after_expiry":
+            workload["rotation_completed_ns"] = workload["lease_until_ns"]
+        else:
+            workload["interference_observed"] = False
 
     _enable_spike3(tree, mutate=damage)
     code, rep = tree.run()

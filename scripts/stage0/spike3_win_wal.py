@@ -8,7 +8,7 @@ revision: 本檔 git blob sha1（執行時由腳本計算並寫入證據 artifac
   被測 sw_core 以 artifact.tree_sha256（sw_core.release_manifest.tree_sha256）與 artifact.git_head（git rev-parse HEAD）記錄。
 expected: 各案主測皆由 scripts/stage0/av_sim.py helper 以不含 FILE_SHARE_DELETE 的共用模式
   （seeded 持有 10–500 ms）注入；另在相同 WAL 目錄執行獨立的 FILE_SHARE_DELETE + RH oplock 變體：
-  每次 WalWriter.append 實際耗時（毫秒）記入 observations.append_latency_ms；gate 以最大值比對 owner 核准上限，上限未裁決前維持 BLOCKED-OWNER；
+  每次 WalWriter.append 實際耗時（毫秒）記入主案例及 oplock 變體樣本；兩組都須符合 OD-22 p99 ≤ 100 ms、最大值 ≤ 600 ms；
   win-wal-av-rotate：輪替最終完成、總筆數與 seq 連續（1..N）、干擾實際觀察到（grabs≥1、rotate_retry≥1）、延後佇列清空；
   win-wal-av-unlink：外部 unlink 有界重試至成功，WAL_RECREATED_AFTER_EXTERNAL_UNLINK META 正確、range_known 依實況；
   win-wal-av-reader-handle：無 FILE_SHARE_DELETE 的外部 reader 期間 rotation_failed 為真、紀錄不遺失、write_failures 為 0、延後佇列清空；
@@ -31,6 +31,7 @@ import datetime as _dt
 import glob
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -66,6 +67,9 @@ AV_HELPER_STOP_TIMEOUT_S = 60.0
 DRAIN_TIMEOUT_S = 20.0
 DRAIN_SETTLE_S = 0.5
 CONTINUITY_META_EVENT = "WAL_ROTATED_AFTER_DEFERRAL"
+OD22_AVSIM_WRITE_LATENCY_P99_BOUND_MS = 100.0
+OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS = 600.0
+AV_HELPER_LEASE_SAFETY_NS = 5_000_000
 # 與 daemon 的 DeviceWatcher 預設 poll_interval_s（sw_core/device_watcher.py，1.0 s）相同節奏；
 # 不得以更密的 tick 替代 daemon 的服務頻率，否則 PASS 會高估延後輪替的實際完成速度。
 DAEMON_TICK_INTERVAL_S = 1.0
@@ -430,6 +434,8 @@ class AvHelper:
         self.launch_error: str | None = None
         self._ready_files: frozenset[str] = frozenset()
         self._evidence_key = variant
+        self.lease_acquired_ns: int | None = None
+        self.lease_until_ns: int | None = None
         evidence = self._evidence()
         if variant is None:
             self._rec.observations["av_sim"] = evidence
@@ -501,36 +507,58 @@ class AvHelper:
 
     def arm_hold(self, name: str) -> bool:
         """以 go/ack 握手重新取得 seeded lease，避免首次 ready 到刺激間持有已到期。"""
-        self._arm_serial += 1
-        request_id = f"{os.getpid()}-{time.monotonic_ns()}-{self._arm_serial}"
-        try:
-            self._ack.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            self._go.write_text(json.dumps({"request_id": request_id, "name": name}, sort_keys=True) + "\n",
-                                encoding="utf-8")
-        except OSError as exc:
-            return self._fail(f"helper rearm request 無法寫入：{type(exc).__name__}: {exc}")
         deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
         while time.monotonic() < deadline:
-            if self._ack.exists():
-                try:
-                    response = json.loads(self._ack.read_text(encoding="utf-8"))
-                except (OSError, ValueError, TypeError):
-                    response = None
-                if isinstance(response, dict) and response.get("request_id") == request_id:
-                    hold_ms = response.get("hold_ms")
-                    if (response.get("held_file") == name and isinstance(hold_ms, int)
-                            and not isinstance(hold_ms, bool) and 10 <= hold_ms <= 500):
+            self._arm_serial += 1
+            request_id = f"{os.getpid()}-{time.monotonic_ns()}-{self._arm_serial}"
+            try:
+                self._ack.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                return self._fail(f"helper rearm ACK 無法清除：{type(exc).__name__}: {exc}")
+            try:
+                self._go.write_text(json.dumps({"request_id": request_id, "name": name}, sort_keys=True) + "\n",
+                                    encoding="utf-8")
+            except OSError as exc:
+                return self._fail(f"helper rearm request 無法寫入：{type(exc).__name__}: {exc}")
+            retry_expired_lease = False
+            while time.monotonic() < deadline:
+                if self._ack.exists():
+                    try:
+                        response = json.loads(self._ack.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, TypeError):
+                        response = None
+                    if isinstance(response, dict) and response.get("request_id") == request_id:
+                        if response.get("error") is not None:
+                            return self._fail(f"helper rearm 開啟 WAL 失敗：{response['error']!r}")
+                        hold_ms = response.get("hold_ms")
+                        acquired_ns = response.get("acquired_ns")
+                        until_ns = response.get("until_ns")
+                        valid_int = lambda value: isinstance(value, int) and not isinstance(value, bool)
+                        if (response.get("held_file") != name or not valid_int(hold_ms)
+                                or not 10 <= hold_ms <= 500 or not valid_int(acquired_ns)
+                                or not valid_int(until_ns) or acquired_ns < 0 or until_ns <= acquired_ns
+                                or abs((until_ns - acquired_ns) - hold_ms * 1_000_000) > 1_000_000):
+                            return self._fail(f"helper rearm 未取得 {name} 的有效 seeded lease：{response!r}")
+                        if time.monotonic_ns() + AV_HELPER_LEASE_SAFETY_NS >= until_ns:
+                            retry_expired_lease = True
+                            self._rec.step(
+                                f"av_sim_helper_rearm_expired{':' + self._variant if self._variant else ''}",
+                                "retry",
+                            )
+                            break
+                        self.lease_acquired_ns = acquired_ns
+                        self.lease_until_ns = until_ns
                         self._rec.step(
                             f"av_sim_helper_rearmed{':' + self._variant if self._variant else ''}", "ok",
                         )
                         return True
-                    return self._fail(f"helper rearm 未取得 {name} 的有效 seeded lease：{response!r}")
-            if self._proc is not None and self._proc.poll() is not None:
-                return self._fail(f"helper rearm 前提前結束（exit={self._proc.returncode}）")
-            time.sleep(0.01)
+                if self._proc is not None and self._proc.poll() is not None:
+                    return self._fail(f"helper rearm 前提前結束（exit={self._proc.returncode}）")
+                time.sleep(0.01)
+            if not retry_expired_lease:
+                break
         return self._fail("helper rearm 握手逾時")
 
     def _fail(self, message: str) -> bool:
@@ -587,7 +615,7 @@ def _start_av_helper_with_wal(
     return helper
 
 
-def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
+def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
     """在隔離 WAL 目錄執行獨立 append／rotate／F12 workload，結果與主案例分開記錄。"""
     from realhw import wal_oracle
     from realhw.wal_oracle import verify_record
@@ -599,25 +627,40 @@ def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
     writer: _MeasuredWalWriter | None = None
     helper: AvHelper | None = None
     res_pre = res_post = None
+    lease_acquired_ns = lease_until_ns = stimulus_started_ns = rotation_completed_ns = None
     try:
         writer = _MeasuredWalWriter(
             WalWriter(wal_dir=str(oplock_dir), rotate_bytes=SMALL_ROTATE_BYTES), variant_rec,
         )
         wal_path = str(oplock_dir / "raw.wal.ndjson")
-        writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=b"prefill",
+        writer.append(com="COM0", direction="TX", source="spike3-oplock",
+                      payload=b"x" * SMALL_ROTATE_BYTES,
                       cmd_id="spike3-oplock-prefill")
         cursor = wal_oracle.open_cursor(wal_path)
         helper = _start_av_helper_with_wal(oplock_dir, rec, oplock=True, variant="oplock")
+        if not helper.arm_hold("raw.wal.ndjson"):
+            raise RuntimeError(f"oplock helper lease expired before workload: {helper.launch_error}")
+        lease_acquired_ns = helper.lease_acquired_ns
+        lease_until_ns = helper.lease_until_ns
         marker_pre = b"SPIKE3-OPLOCK-MARKER-PRE"
         marker_post = b"SPIKE3-OPLOCK-MARKER-POST"
+        archive_pattern = str(oplock_dir / "raw.wal.ndjson*")
+        archive_paths_before = set(glob.glob(archive_pattern))
+        stimulus_started_ns = time.monotonic_ns()
         writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=marker_pre,
                       cmd_id="spike3-oplock-f12")
+        rotation_completed_ns = None
+        current_archives = set(glob.glob(archive_pattern))
+        if current_archives - archive_paths_before:
+            rotation_completed_ns = time.monotonic_ns()
         res_pre = wal_oracle.wait_for_marker(
             cursor, marker=marker_pre, cmd_id="spike3-oplock-f12", timeout_s=10.0,
         )
         for _ in range(ROTATE_CASE_RECORDS):
             writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=RECORD_PAYLOAD,
                           cmd_id="spike3-oplock-bulk")
+            if rotation_completed_ns is None and set(glob.glob(archive_pattern)) - archive_paths_before:
+                rotation_completed_ns = time.monotonic_ns()
         writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=marker_post,
                       cmd_id="spike3-oplock-f12-post")
         res_post = wal_oracle.wait_for_marker(
@@ -666,12 +709,23 @@ def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
         "post_rotate": {"ok": res_post.ok if res_post else None,
                         "reason_code": res_post.reason_code if res_post else None},
         "crc_errors": crc_errors,
-        "interference_observed": isinstance(evidence.get("grabs"), int)
-        and not isinstance(evidence.get("grabs"), bool) and evidence["grabs"] >= 1,
+        "lease_acquired_ns": lease_acquired_ns if helper is not None else None,
+        "stimulus_started_ns": stimulus_started_ns if helper is not None else None,
+        "rotation_completed_ns": rotation_completed_ns if helper is not None else None,
+        "lease_until_ns": lease_until_ns if helper is not None else None,
+        "interference_observed": (
+            isinstance(lease_acquired_ns, int) and not isinstance(lease_acquired_ns, bool)
+            and isinstance(stimulus_started_ns, int) and not isinstance(stimulus_started_ns, bool)
+            and isinstance(rotation_completed_ns, int) and not isinstance(rotation_completed_ns, bool)
+            and isinstance(lease_until_ns, int) and not isinstance(lease_until_ns, bool)
+            and lease_acquired_ns <= stimulus_started_ns <= rotation_completed_ns < lease_until_ns
+        ),
     }
     rec.observations["oplock_variant"] = workload
     return (
         evidence.get("helper_exit") == 0
+        and "oplock_variant_error" not in rec.observations
+        and "oplock_variant_close_error" not in rec.observations
         and isinstance(evidence.get("grabs"), int) and not isinstance(evidence.get("grabs"), bool)
         and evidence["grabs"] >= 1 and evidence.get("oplock") in {"granted", "denied", "unavailable"}
         and append_count == ROTATE_CASE_RECORDS + 3 and len(archives) >= 1 and complete
@@ -679,6 +733,48 @@ def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
         and health.get("deferred_delete_pending") == 0 and health.get("write_failures") == 0
         and not crc_errors and workload["interference_observed"]
     )
+
+
+def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
+    """子變體任一階段例外都轉為明確不足證據，不能中斷主案例證據輸出。"""
+    try:
+        return _collect_oplock_variant_impl(wal_dir, rec)
+    except Exception as exc:  # noqa: BLE001 — evidence producer 必須保留例外並 fail closed
+        rec.observations["oplock_variant_error"] = f"{type(exc).__name__}: {exc}"
+        return False
+
+
+def _od22_latency_assessment(samples: Any, append_count: Any) -> dict[str, Any]:
+    """以最近秩定義 p99，對一組實測 append 樣本套用 OD-22。"""
+    if (not isinstance(samples, list) or not samples
+            or not isinstance(append_count, int) or isinstance(append_count, bool)
+            or append_count < 1 or len(samples) != append_count):
+        return {"status": "INSUFFICIENT_EVIDENCE", "reason": "append latency sample count is missing or inconsistent"}
+    try:
+        valid = all(
+            not isinstance(sample, bool) and isinstance(sample, (int, float))
+            and math.isfinite(float(sample)) and sample >= 0
+            for sample in samples
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        return {"status": "INSUFFICIENT_EVIDENCE", "reason": "append latency samples must be finite non-negative numbers"}
+    ordered = sorted(samples)
+    p99_ms = ordered[math.ceil(0.99 * len(ordered)) - 1]
+    max_ms = ordered[-1]
+    status = "FAIL" if (
+        p99_ms > OD22_AVSIM_WRITE_LATENCY_P99_BOUND_MS
+        or max_ms > OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS
+    ) else "PASS"
+    return {
+        "status": status,
+        "sample_count": len(ordered),
+        "p99_ms_nearest_rank": p99_ms,
+        "max_ms": max_ms,
+        "p99_limit_ms": OD22_AVSIM_WRITE_LATENCY_P99_BOUND_MS,
+        "max_limit_ms": OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS,
+    }
 
 
 def _grabs(rec: Recorder) -> int:
@@ -1044,10 +1140,29 @@ def run_case(args: argparse.Namespace) -> int:
             rec.observations["exception"] = f"{type(exc).__name__}: {exc}"
         wal_dir_value = rec.observations.get("wal_dir")
         if "exception" not in rec.observations and isinstance(wal_dir_value, str) and Path(wal_dir_value).is_dir():
-            if not _collect_oplock_variant(Path(wal_dir_value), rec) and verdict == "PASS":
+            try:
+                oplock_ok = _collect_oplock_variant(Path(wal_dir_value), rec)
+            except Exception as exc:  # noqa: BLE001 —子變體不得阻止 case evidence 落盤
+                rec.observations["oplock_variant_error"] = f"{type(exc).__name__}: {exc}"
+                oplock_ok = False
+            if not oplock_ok and verdict == "PASS":
                 verdict, fallback, code = (
                     "INSUFFICIENT_EVIDENCE", "獨立 oplock 變體未取得有效 helper 證據", 1,
                 )
+        main_latency = _od22_latency_assessment(
+            rec.observations.get("append_latency_ms"), rec.observations.get("append_count"),
+        )
+        variant_workload = rec.observations.get("oplock_variant")
+        oplock_latency = _od22_latency_assessment(
+            variant_workload.get("append_latency_ms") if isinstance(variant_workload, dict) else None,
+            variant_workload.get("append_count") if isinstance(variant_workload, dict) else None,
+        )
+        rec.observations["od22_latency"] = {"main": main_latency, "oplock_variant": oplock_latency}
+        latency_statuses = {main_latency["status"], oplock_latency["status"]}
+        if "FAIL" in latency_statuses:
+            verdict, fallback, code = "FAIL", "OD-22 append 延遲上限超出；保留樣本與 WAL 證據", 1
+        elif "INSUFFICIENT_EVIDENCE" in latency_statuses and verdict == "PASS":
+            verdict, fallback, code = "INSUFFICIENT_EVIDENCE", "OD-22 append 延遲樣本缺失或數量不符", 1
     after = snapshot_binaries(subjects)
     av_sim = dict(rec.observations.get("av_sim") or {
         **_av_sim_module().describe(SPIKE3_SEED),

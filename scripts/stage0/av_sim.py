@@ -365,7 +365,7 @@ def _publish_ready_record(ready_file: str | Path, held_files: list[str]) -> None
 
 def _process_rearm_request(
     *, watch_dir: str, go_file: str, ack_file: str, seen_request_ids: set[str],
-    holds: list[HeldFile], schedule: HoldSchedule, now: float, counts: dict[str, int],
+    holds: list[HeldFile], schedule: HoldSchedule, counts: dict[str, int],
     events: list[dict[str, Any]], oplock: bool,
 ) -> None:
     """依 consumer 握手重新開啟既存 WAL，直接忽略首次掃描的 seen 去重。"""
@@ -380,7 +380,10 @@ def _process_rearm_request(
         return
     seen_request_ids.add(request_id)
     full = os.path.join(watch_dir, name)
-    response: dict[str, Any] = {"request_id": request_id, "held_file": None, "hold_ms": None}
+    response: dict[str, Any] = {
+        "request_id": request_id, "held_file": None, "hold_ms": None,
+        "acquired_ns": None, "until_ns": None,
+    }
     try:
         key = _file_key(full)
         if key[0] != name:
@@ -394,11 +397,15 @@ def _process_rearm_request(
             lease, oplock_result = _request_oplock(full)
         else:
             lease, oplock_result = OplockLease(_open_share_hold(full)), OPLOCK_STATUS
-        holds.append(HeldFile(now + hold, lease, name))
+        acquired_ns = time.monotonic_ns()
+        until_ns = acquired_ns + int(round(hold * 1_000_000_000))
+        holds.append(HeldFile(until_ns / 1_000_000_000, lease, name))
         counts["grabs"] += 1
         events.append({"event": "rearm", "name": name, "hold_ms": int(round(hold * 1000)),
-                       "oplock": oplock_result, "request_id": request_id})
-        response.update({"held_file": name, "hold_ms": int(round(hold * 1000))})
+                       "oplock": oplock_result, "request_id": request_id,
+                       "acquired_ns": acquired_ns, "until_ns": until_ns})
+        response.update({"held_file": name, "hold_ms": int(round(hold * 1000)),
+                         "acquired_ns": acquired_ns, "until_ns": until_ns})
     except OSError as exc:
         counts["open_errors"] += 1
         events.append({"event": "rearm_error", "name": name, "error": str(exc), "request_id": request_id})
@@ -465,7 +472,7 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
         _process_rearm_request(
             watch_dir=watch_dir, go_file=go_file, ack_file=ack_file,
             seen_request_ids=seen_request_ids, holds=holds, schedule=schedule,
-            now=time.monotonic(), counts=counts, events=events, oplock=oplock,
+            counts=counts, events=events, oplock=oplock,
         )
         time.sleep(WATCH_POLL_S)
     for entry in holds:

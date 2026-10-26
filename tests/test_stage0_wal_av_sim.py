@@ -285,6 +285,8 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
         def __init__(self, wal_dir, seed, rec, *, oplock=False, variant=None):
             self.rec = rec
             self.variant = variant
+            self.lease_acquired_ns = None
+            self.lease_until_ns = None
             self.rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = {
                 **module._av_sim_module().describe(seed, oplock=oplock),
                 "launch_error": "not_started", "grabs": None, "open_errors": None, "helper_exit": None,
@@ -298,6 +300,8 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             return name == "raw.wal.ndjson"
 
         def arm_hold(self, _name):
+            self.lease_acquired_ns = time.monotonic_ns()
+            self.lease_until_ns = self.lease_acquired_ns + 500_000_000
             return True
 
         def stop(self):
@@ -316,7 +320,8 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure_point", [None, "drain", "close"])
+def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_path, failure_point):
     """oplock 持有期間須實際 append、跨 rotate，並由 F12 oracle 讀到前後 marker。"""
     import importlib.util
     from sw_core import wal
@@ -339,6 +344,8 @@ def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_pat
             self.index += 1
             if self.index == 1:
                 (self.wal_dir / "raw.wal.ndjson").write_bytes(b"prefill\n")
+            elif self.index == 2:
+                (self.wal_dir / "raw.wal.ndjson.1").write_bytes(b"archive\n")
             events.append(("append", self.index))
             return {"seq": self.index}
 
@@ -347,7 +354,8 @@ def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_pat
                     "write_failures": 0}
 
         def close(self):
-            pass
+            if failure_point == "close":
+                raise OSError("injected close failure")
 
         def tick(self):
             pass
@@ -372,6 +380,8 @@ def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_pat
 
         def arm_hold(self, _name):
             events.append(("helper_rearm", 0))
+            self.lease_acquired_ns = time.monotonic_ns()
+            self.lease_until_ns = self.lease_acquired_ns + 500_000_000
             return True
 
         def stop(self):
@@ -387,11 +397,13 @@ def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_pat
     monkeypatch.setattr(wal, "WalWriter", FakeWriter)
     monkeypatch.setattr(module, "AvHelper", FakeHelper)
     monkeypatch.setattr(module, "_work_dir", lambda _name: tmp_path / "oplock-work")
-    monkeypatch.setattr(module, "_drain_writer", lambda *_args: None)
-    monkeypatch.setattr(module.glob, "glob", lambda _pattern: [
-        str(tmp_path / "oplock-work" / "raw.wal.ndjson"),
-        str(tmp_path / "oplock-work" / "raw.wal.ndjson.1"),
-    ])
+    real_glob = module.glob.glob
+    def drain_writer(*_args):
+        if failure_point == "drain":
+            raise OSError("injected drain failure")
+
+    monkeypatch.setattr(module, "_drain_writer", drain_writer)
+    monkeypatch.setattr(module.glob, "glob", real_glob)
     monkeypatch.setattr(module, "_read_records", lambda _path: [{"seq": i} for i in range(1, 404)])
     monkeypatch.setattr(module, "_continuity_meta_count", lambda _records: 0)
     monkeypatch.setattr(module, "_seq_continuous", lambda _records: True)
@@ -406,9 +418,13 @@ def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_pat
         "variants": {},
     }
 
-    assert module._collect_oplock_variant(tmp_path, recorder) is True
+    assert module._collect_oplock_variant(tmp_path, recorder) is (failure_point is None)
 
     workload = recorder.observations["oplock_variant"]
+    if failure_point is not None:
+        error_key = "oplock_variant_error" if failure_point == "drain" else "oplock_variant_close_error"
+        assert error_key in recorder.observations
+        return
     assert events.index(("append", 1)) < events.index(("helper_start", 0))
     assert events.index(("helper_start", 0)) < events.index(("helper_rearm", 0))
     assert events.index(("helper_rearm", 0)) < events.index(("append", 2))
@@ -695,6 +711,69 @@ def test_spike3_writes_insufficient_evidence_when_schema_validation_fails(monkey
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_spike3_oplock_variant_exception_still_writes_evidence(monkeypatch, tmp_path):
+    """oplock 子變體的 prefill 失敗時，run_case 仍須落下不足證據 JSON。"""
+    import importlib.util
+    import json
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_variant_exception_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    real_os = module.os
+
+    class WindowsOSProxy:
+        name = "nt"
+
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+    def fake_case(rec, _args):
+        (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
+        rec.observations["wal_dir"] = str(tmp_path)
+        rec.observations["av_sim"] = {
+            **module._av_sim_module().describe(module.SPIKE3_SEED),
+            "launch_error": "none", "grabs": 1, "open_errors": 0, "helper_exit": 0,
+        }
+        return "PASS", "none"
+
+    monkeypatch.setattr(module, "os", WindowsOSProxy())
+    monkeypatch.setattr(
+        module, "query_edr",
+        lambda: {"product": "test", "status": "unknown", "interceptions": "unknown"},
+    )
+    monkeypatch.setattr(module, "gather_env", lambda *_args: {"os": "Windows 11"})
+    monkeypatch.setitem(module.CASE_FUNCS, module.CASE_IDS[0], fake_case)
+    monkeypatch.setattr(
+        module, "_collect_oplock_variant",
+        lambda *_args: (_ for _ in ()).throw(OSError("injected oplock prefill failure")),
+    )
+    snapshots = {"test-binary": {"exists": True, "sha256": "a" * 64}}
+    monkeypatch.setattr(module, "binary_subject_paths", lambda: ["test-binary"])
+    monkeypatch.setattr(module, "snapshot_binaries", lambda _paths: snapshots)
+    evidence_dir = tmp_path / "evidence"
+
+    raised = None
+    try:
+        rc = module.run_case(module.argparse.Namespace(
+            case=module.CASE_IDS[0], evidence_dir=str(evidence_dir), unlink_mode="classic",
+        ))
+    except Exception as exc:  # 保持 assertion failure，而非讓目前外拋變成 pytest error。
+        raised = exc
+        rc = None
+
+    evidence_path = evidence_dir / f"{module.CASE_IDS[0]}.json"
+    assert raised is None, f"run_case 不得讓 oplock 子變體例外穿出：{raised!r}"
+    assert rc == 1
+    assert evidence_path.is_file()
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert "injected oplock prefill failure" in evidence["observations"]["oplock_variant_error"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_spike3_helper_retries_until_partial_ready_record_is_complete(monkeypatch, tmp_path):
     """ready 檔短暫可見但尚未完整時，consumer 應重試而非立即拒絕。"""
     import importlib.util
@@ -808,12 +887,12 @@ def test_av_sim_rearm_request_reopens_seen_wal_and_acks_live_lease(monkeypatch, 
 
     av._process_rearm_request(
         watch_dir=str(tmp_path), go_file=str(go_file), ack_file=str(ack_file),
-        seen_request_ids=seen_request_ids, holds=holds, schedule=av.HoldSchedule(SEED), now=10.0,
+        seen_request_ids=seen_request_ids, holds=holds, schedule=av.HoldSchedule(SEED),
         counts=counts, events=events, oplock=False,
     )
     av._process_rearm_request(
         watch_dir=str(tmp_path), go_file=str(go_file), ack_file=str(ack_file),
-        seen_request_ids=seen_request_ids, holds=holds, schedule=av.HoldSchedule(SEED), now=10.0,
+        seen_request_ids=seen_request_ids, holds=holds, schedule=av.HoldSchedule(SEED),
         counts=counts, events=events, oplock=False,
     )
 
@@ -952,6 +1031,170 @@ def test_spike3_helper_rearms_after_delayed_ready(monkeypatch, tmp_path):
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_spike3_arm_hold_rearms_expired_ack_before_accepting(monkeypatch, tmp_path):
+    """ACK 送達 consumer 前 lease 已過期時，必須重送 go 並取得仍有效的 lease。"""
+    import importlib.util
+    import json
+    import threading
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_expired_ack_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorder = module.Recorder()
+    helper = module.AvHelper(tmp_path, SEED, recorder)
+    (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
+
+    class RunningProcess:
+        @staticmethod
+        def poll():
+            return None
+
+    helper._proc = RunningProcess()
+    stop = threading.Event()
+    request_ids: set[str] = set()
+
+    def serve_go_requests():
+        while not stop.is_set():
+            try:
+                request = json.loads(helper._go.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                time.sleep(0.001)
+                continue
+            request_id = request.get("request_id")
+            if not isinstance(request_id, str) or request_id in request_ids:
+                time.sleep(0.001)
+                continue
+            request_ids.add(request_id)
+            now_ns = time.monotonic_ns()
+            if len(request_ids) == 1:
+                acquired_ns, until_ns = now_ns - 200_000_000, now_ns - 1
+            else:
+                acquired_ns, until_ns = now_ns, now_ns + 200_000_000
+            helper._ack.write_text(
+                json.dumps({
+                    "request_id": request_id, "held_file": "raw.wal.ndjson", "hold_ms": 200,
+                    "acquired_ns": acquired_ns, "until_ns": until_ns,
+                }),
+                encoding="utf-8",
+            )
+
+    server = threading.Thread(target=serve_go_requests, daemon=True)
+    server.start()
+    try:
+        assert helper.arm_hold("raw.wal.ndjson") is True
+        assert len(request_ids) >= 2
+        assert helper.lease_acquired_ns <= time.monotonic_ns() < helper.lease_until_ns
+    finally:
+        stop.set()
+        server.join(1)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "response_mode",
+    ["wrong_request_id", "wrong_held_file", "hold_too_short", "helper_error", "invalid_times", "helper_exited", "timeout"],
+)
+def test_spike3_arm_hold_rejects_invalid_acknowledgements(monkeypatch, tmp_path, response_mode):
+    """go／ack 不符、helper 錯誤、無效 lease、提前退出或逾時都不得取得成功。"""
+    import importlib.util
+    import json
+    import threading
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_invalid_ack_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.AV_HELPER_READY_TIMEOUT_S = 0.05
+    real_sleep = time.sleep
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: real_sleep(0.001))
+    helper = module.AvHelper(tmp_path, SEED, module.Recorder())
+
+    class RunningProcess:
+        returncode = 1 if response_mode == "helper_exited" else None
+
+        @staticmethod
+        def poll():
+            return 1 if response_mode == "helper_exited" else None
+
+    helper._proc = RunningProcess()
+    stop = threading.Event()
+
+    def write_response():
+        while not stop.is_set() and not helper._go.exists():
+            time.sleep(0.001)
+        if response_mode in ("timeout", "helper_exited") or stop.is_set():
+            return
+        request = json.loads(helper._go.read_text(encoding="utf-8"))
+        now_ns = time.monotonic_ns()
+        response = {
+            "request_id": request["request_id"], "held_file": "raw.wal.ndjson", "hold_ms": 200,
+            "acquired_ns": now_ns, "until_ns": now_ns + 200_000_000,
+        }
+        if response_mode == "wrong_request_id":
+            response["request_id"] += "-wrong"
+        elif response_mode == "wrong_held_file":
+            response["held_file"] = "other.wal.ndjson"
+        elif response_mode == "hold_too_short":
+            response["hold_ms"] = 9
+        elif response_mode == "helper_error":
+            response["error"] = "PermissionError: injected"
+        elif response_mode == "invalid_times":
+            response["until_ns"] = response["acquired_ns"]
+        helper._ack.write_text(json.dumps(response), encoding="utf-8")
+
+    server = threading.Thread(target=write_response, daemon=True)
+    server.start()
+    try:
+        assert helper.arm_hold("raw.wal.ndjson") is False
+        assert helper.launch_error
+    finally:
+        stop.set()
+        server.join(1)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_av_sim_rearm_ack_records_monotonic_lease_bounds(monkeypatch, tmp_path):
+    """av_sim ACK 必須記錄實際取得 handle 後的單調時鐘 lease 起訖。"""
+    av = _av()
+    wal_path = tmp_path / "raw.wal.ndjson"
+    wal_path.write_bytes(b"prefill\n")
+    go_file = tmp_path / "go.json"
+    ack_file = tmp_path / "ack.json"
+    go_file.write_text(json.dumps({"request_id": "request-1", "name": wal_path.name}), encoding="utf-8")
+
+    class Schedule:
+        @staticmethod
+        def next_hold_s():
+            return 0.2
+
+    class Handle:
+        @staticmethod
+        def close():
+            pass
+
+    monkeypatch.setattr(av, "_open_share_hold", lambda _path: Handle())
+    holds = []
+    av._process_rearm_request(
+        watch_dir=str(tmp_path), go_file=str(go_file), ack_file=str(ack_file),
+        seen_request_ids=set(), holds=holds, schedule=Schedule(),
+        counts={"grabs": 0, "open_errors": 0}, events=[], oplock=False,
+    )
+
+    ack = json.loads(ack_file.read_text(encoding="utf-8"))
+    assert ack["held_file"] == wal_path.name
+    assert isinstance(ack.get("acquired_ns"), int)
+    assert isinstance(ack.get("until_ns"), int)
+    assert 199_000_000 <= ack["until_ns"] - ack["acquired_ns"] <= 201_000_000
+    assert holds and holds[0].until >= ack["acquired_ns"] / 1_000_000_000
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
     """case_rotate 先建 WAL、啟動並重新武裝 helper，再執行剩餘 399 次 append。"""
     import importlib.util
@@ -1058,6 +1301,54 @@ def test_spike3_case_barriers_and_atomic_ready_call_sites_are_wired():
                          if isinstance(node, ast.FunctionDef) and node.name == "run_helper")
     helper_calls = [node for node in ast.walk(av_run_helper) if isinstance(node, ast.Call)]
     assert any(isinstance(call.func, ast.Name) and call.func.id == "_publish_ready_record" for call in helper_calls)
+    assert any(isinstance(call.func, ast.Name) and call.func.id == "_process_rearm_request" for call in helper_calls)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_av_sim_run_helper_processes_go_request_and_publishes_live_ack(monkeypatch, tmp_path):
+    """run_helper 執行 go／ack 重取路徑並發布有效單調時鐘 lease。"""
+    av = _av()
+    wal_path = tmp_path / "raw.wal.ndjson"
+    wal_path.write_bytes(b"prefill\n")
+    go_file = tmp_path / "helper.go"
+    ack_file = tmp_path / "helper.ack"
+    ready_file = tmp_path / "helper.ready"
+    stop_file = tmp_path / "helper.stop"
+    log_file = tmp_path / "helper.jsonl"
+    go_file.write_text(json.dumps({"request_id": "run-helper-1", "name": wal_path.name}), encoding="utf-8")
+
+    class WindowsOSProxy:
+        name = "nt"
+        path = os.path
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+    class Handle:
+        @staticmethod
+        def close():
+            pass
+
+    real_exists = av.os.path.exists
+    monkeypatch.setattr(av, "os", WindowsOSProxy())
+    monkeypatch.setattr(av.os.path, "exists", lambda path: ack_file.is_file() if path == str(stop_file) else real_exists(path))
+    monkeypatch.setattr(av, "_open_share_hold", lambda _path: Handle())
+    monkeypatch.setattr(av, "_close_lease", lambda _lease: None)
+    monkeypatch.setattr(av.time, "sleep", lambda _seconds: None)
+
+    assert av.run_helper(
+        watch_dir=str(tmp_path), seed=SEED, duration_s=10.0,
+        ready_file=str(ready_file), stop_file=str(stop_file), log_file=str(log_file),
+        go_file=str(go_file), ack_file=str(ack_file),
+    ) == 0
+
+    ack = json.loads(ack_file.read_text(encoding="utf-8"))
+    assert ack["request_id"] == "run-helper-1"
+    assert ack["held_file"] == wal_path.name
+    assert ack["until_ns"] - ack["acquired_ns"] == ack["hold_ms"] * 1_000_000
+    rows = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert any(row.get("event") == "rearm" and row.get("request_id") == "run-helper-1" for row in rows)
 
 
 @pytest.mark.core_portable
