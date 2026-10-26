@@ -58,3 +58,14 @@
 {"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:058","pattern":"(?x) a + b +","score":2,"suspicious":true}
 {"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:059","pattern":"(?#c)a+","score":1,"suspicious":false}
 {"compile_ok":true,"error":null,"flags":"i","has_backref":false,"id":"redos:060","pattern":"a+","score":1,"suspicious":false}
+{"compile_ok":false,"error":"unknown extension ?P> at position 1","flags":"","has_backref":null,"id":"redos:061","pattern":"(?P>x)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unexpected end of pattern at position 3","flags":"","has_backref":null,"id":"redos:062","pattern":"(?P","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P\\d at position 1","flags":"","has_backref":null,"id":"redos:063","pattern":"(?P\\d)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"bad escape (end of pattern) at position 3","flags":"","has_backref":null,"id":"redos:064","pattern":"(?P\\","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P) at position 1","flags":"","has_backref":null,"id":"redos:065","pattern":"(?P)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P- at position 2","flags":"","has_backref":null,"id":"redos:066","pattern":"a(?P-x)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?Pé at position 1","flags":"","has_backref":null,"id":"redos:067","pattern":"(?Pé)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P😀 at position 1","flags":"","has_backref":null,"id":"redos:068","pattern":"(?P😀)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P\n at position 1 (line 1, column 2)","flags":"","has_backref":null,"id":"redos:069","pattern":"(?P\n)","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P' at position 2","flags":"","has_backref":null,"id":"redos:070","pattern":"((?P'))","score":null,"suspicious":null}
+{"compile_ok":false,"error":"unknown extension ?P  at position 5","flags":"","has_backref":null,"id":"redos:071","pattern":"(?x)(?P x)","score":null,"suspicious":null}

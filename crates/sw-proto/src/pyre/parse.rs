@@ -506,7 +506,16 @@ impl Parser<'_> {
                 }
                 Ok((Expr::Backreference { index }, true))
             }
-            _ => Err(self.error("unknown extension ?P", Some(open + 1))),
+            // sre_parse：`char = sourceget()`（跳脫為兩字元）；EOF 報 unexpected end of pattern，
+            // 否則 `"unknown extension ?P" + char`，位置為 `?`。
+            None => Err(self.error("unexpected end of pattern", Some(self.pos))),
+            Some('\\') => match self.chars.get(self.pos + 1) {
+                None => Err(self.error("bad escape (end of pattern)", Some(self.pos))),
+                Some(&ch) => {
+                    Err(self.error(&format!("unknown extension ?P\\{ch}"), Some(open + 1)))
+                }
+            },
+            Some(ch) => Err(self.error(&format!("unknown extension ?P{ch}"), Some(open + 1))),
         }
     }
 

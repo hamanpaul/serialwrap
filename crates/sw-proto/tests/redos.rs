@@ -5,7 +5,7 @@
 mod common;
 
 use sw_proto::pyjson::{self, PyValue};
-use sw_proto::pyre::{redos, PyFlags};
+use sw_proto::pyre::{redos, CompileError, PyFlags};
 
 fn golden_rows(name: &str) -> Vec<sw_proto::pyjson::PyDict> {
     let path = common::data_root().join(format!("contracts/golden/p7/{name}.ndjson"));
@@ -55,6 +55,25 @@ fn redos_golden() {
             Err(_) => assert!(!compile_ok, "case {id}：Python 編譯成功但 Rust 失敗"),
         }
     }
+}
+
+/// 審查 L2：編譯失敗列的 `str(re.error)`（含 position 與 line/column）須逐字一致。
+#[test]
+fn redos_golden_error_messages_match_python() {
+    let mut checked = 0;
+    for row in golden_rows("redos") {
+        let Some(want) = row.get("error").and_then(PyValue::as_str) else {
+            continue;
+        };
+        let id = s(&row, "id");
+        let flags = PyFlags::from_rule_flags(s(&row, "flags")).unwrap();
+        match redos::maybe_redos_suspicious(s(&row, "pattern"), flags) {
+            Err(CompileError::Re(e)) => assert_eq!(e.to_string(), want, "case {id}"),
+            other => panic!("case {id}：預期 re.error {want:?}，實得 {other:?}"),
+        }
+        checked += 1;
+    }
+    assert!(checked >= 14, "golden 至少 14 列錯誤訊息（實得 {checked}）");
 }
 
 #[test]

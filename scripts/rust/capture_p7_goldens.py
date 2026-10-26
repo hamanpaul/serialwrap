@@ -349,6 +349,8 @@ def gen_event_schema() -> list[dict[str, Any]]:
         _rule(cooldown_ms=" -" + "9" * 4301 + " "), _rule(cooldown_ms="1" + "_1" * 4300), _rule(cooldown_ms="\uff19" * 4301),
         _rule(cooldown_ms="9" * 5000 + "x"), _rule(cooldown_ms="9" * 4301 + "_"), _rule(max_fires="9" * 4301),
         _rule(timeout_ms="+0" + "0" * 4300),
+        # 審查 L2：regex `(?P>x)` 錯誤訊息經 schema 外露
+        _rule(pattern={"kind": "regex", "value": "(?P>x)"}), _rule(pattern={"kind": "regex", "value": "(?P"}),
     ]
     rows = []
     for obj in inputs:
@@ -382,6 +384,9 @@ def gen_redos() -> list[dict[str, Any]]:
         ("\\D|x", ""), ("(?:(a)|(a))", ""), ("(?:a+b|a+c)", ""), ("(?:^a|^b)", ""), ("(?:[ab]c|[ab]d)", ""),
         ("(a)(?:\\1x|\\1y)", ""), ("(?:ab+|ab+c)", ""), ("(?:xa+|xa+)+", ""), ("(?:[a]|b)+", ""), ("(?:a|b|c)+", ""),
         ("(?:a|bc)+", ""), ("(?x) a + b +", ""), ("(?#c)a+", ""), ("a+", "i"),
+        # 審查 L2：`(?P` 後非 `<`／`=` 的 unknown extension 訊息（含下一字元／跳脫）與 EOF
+        ("(?P>x)", ""), ("(?P", ""), ("(?P\\d)", ""), ("(?P\\", ""), ("(?P)", ""), ("a(?P-x)", ""), ("(?P\u00e9)", ""),
+        ("(?P\U0001F600)", ""), ("(?P\n)", ""), ("((?P'))", ""), ("(?x)(?P x)", ""),
     ]
     rows = []
     for pat, flags in samples:
