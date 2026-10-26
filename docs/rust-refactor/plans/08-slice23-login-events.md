@@ -110,7 +110,7 @@
 | `LOGIN_FSM_DETAIL_ERRORS` | 06 T13 已定義（12 值） | 沿用，不重複定義 |
 | `FsOps::is_file` | P3 `FsRead::is_file` 已存在 | 沿用 `FsRead::is_file`，`FsOps` 不重複定義 |
 | `pyre::sre::SubPattern`、`pyre::parse::parse`、`PyReError` | P3：`pyre::parse` 為私有模組（`parse()` 回 `ParsedPattern`）、`compile` 回 `CompileError` | `redos.rs` 置於 `pyre/` 下以 `super::parse` 取用；公開 API 為 `ambiguity_score／has_backref／maybe_redos_suspicious(pattern, flags) -> Result<_, CompileError>` |
-| `pyre::escape` | P3 未定義 | **BLOCKED-UPSTREAM（P3）**：Task 3 需要（`_finalize_ready` 的 nonce 樣式）；P7 不自行補 |
+| `pyre::escape` | P3 未定義 | ~~BLOCKED-UPSTREAM（P3）~~ → **已宣告上游補件（P3 缺口，2026-10-26）**：擁有者指派於 P7 分支補 `sw_proto::pyre::escape(&str) -> String`，語意＝CPython 3.12 `re.escape(str)`；golden `contracts/golden/pyre_escape.tsv`（`scripts/rust/goldens/gen_pyre_escape.py`，新鮮度列於 `tests/test_rust_goldens_fresh.py`）＋ `crates/sw-proto/tests/pyre_escape_golden.rs`；登記於 `spec-reconciliation.md` §8 UP-P7-01 |
 
 上游行為仍為骨架（`SKELETON`，依 P5／P6 實作進度阻擋對應 P7 Task）：06 T13 `session_auth::*`、`login_fsm::*`、`quiet_gate::*`（阻擋 Task 2～4）；06 T10 `RxShared::*`、`spawn_reader`（Task 3、10）；06 T7 `WalWriter::append`（Task 6）；06 T8／T9／T11／T12／T14 `flush_session`、`Fence::admit`、`SessionCore::on_event`／`begin_stop`、`Mailbox::recv_next`、`spawn_actor`、`OpRunner::spawn`、`classify_pre_probe`（Task 7～10）；07 T6／T7 `invalidate_human_input`、`fg_begin`／`fg_finish`、`lease_context`（Task 4、8）。
 

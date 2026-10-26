@@ -199,6 +199,25 @@ impl LargeLiteralRepeat {
     }
 }
 
+/// CPython 3.7+ `re._special_chars_map` 的跳脫字元集合（`re.escape` 只在這些字元前加反斜線）。
+const ESCAPE_SPECIAL: &[char] = &[
+    '(', ')', '[', ']', '{', '}', '?', '*', '+', '-', '|', '^', '$', '\\', '.', '&', '~', '#', ' ', '\t', '\n', '\r',
+    '\x0b', '\x0c',
+];
+
+/// 對應 Python `re.escape(str)`（CPython 3.12）：僅跳脫 `_special_chars_map` 內的 ASCII 字元，
+/// 其餘（含 NUL、非 ASCII）原樣保留。
+pub fn escape(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    for ch in pattern.chars() {
+        if ESCAPE_SPECIAL.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// 以 Python re 語法接受集合編譯 pattern。
 pub fn compile(pat: &str, flags: PyFlags) -> Result<PyRegex, CompileError> {
     if estimated_group_depth(pat) > 64 {

@@ -32,6 +32,8 @@ GENERATORS = [
     ("gen_line_editor.py", "line_editor.tsv"),
     ("gen_human_line_mode.py", "human_console_mode.tsv"),
     ("gen_shlex.py", "shlex_split.tsv"),
+    # P7 Task 3 上游補件（P3 缺口）：sw_proto::pyre::escape
+    ("gen_pyre_escape.py", "pyre_escape.tsv"),
 ]
 
 

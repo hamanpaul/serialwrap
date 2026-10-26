@@ -542,3 +542,11 @@ P7 Task 0 對本節的影響（2026-10-26）：§1.1 新增 SC-30、§1.2 新增
 |---|---|---|---|---|---|---|
 | NC-P5-01 | RX 速率視窗（RX_FLOOD 判定用）：Python `deque(maxlen=4096)` 超量時**丟最舊項目**，視窗內 bytes 總和會被低估；Rust 採 `merge_oldest`（合併最舊兩筆、保留 bytes 總和） | §5.4 RX_FLOOD（`RX_FLOOD_BYTES_PER_10S=20000`，10 s 視窗） | 暫定 IMPL（計畫 06 Task 0 `contracts/resource_limits.yaml` `rx_rate_window_entries`）；**未登記** `contracts/behavior_changes.yaml` | 洪泛下不低估 RX_FLOOD 判定；可觀測於 flood 情境的錯誤分類，屬 A/B 比較範圍內的潛在差異 | P5 | yes（決定 SC／DF／Rust-only；若為 SC 需補 `behavior_changes.yaml`） |
 | NC-P5-02 | 承接率斷路器觀測窗口語意：規格 §12.2 寫「連續三週內」且「觀測窗口起訖於切片開始時固定」；計畫 09 原寫「觀測窗口內任一連續三週」（滾動解讀）。Slice 2.1 實作採單一固定窗口（`[start, start+3w]`），窗口結束後的停滯不納入判定 | §12.2「校準與斷路器」、OD-02、OD-13（須定義分母與起訖） | 暫定 IMPL（固定窗口，依 §12.2 起訖固定句）；計畫 09 斷路器段改為沿用固定窗口 | 固定窗口對窗口外的停滯無感；改為滾動窗口會改變 P6～P8 的觸發語意，需重寫 `slice_breaker.evaluate` 並重審 P8 出口 | P5／P8 | yes（確認固定或滾動窗口；若改滾動需重審 P8 出口 gate） |
+
+## 8. P7 登記：上游補件（producer Phase 缺口，於消費 Phase 補上）
+
+由 `08-slice23-login-events.md` Task 0 前置核對（`scripts/rust/check_p7_prereqs.py`）回報 MISSING、經擁有者指派於 P7 分支補上的上游符號。補件只新增 producer 公開 API，語意以 Python 基線 golden 鎖定；不改既有 producer 行為、不登記 `contracts/behavior_changes.yaml`（非行為變更）。
+
+| ID | 缺口（producer） | 補件 | 驗證 | 消費者 | 需擁有者 |
+|---|---|---|---|---|---|
+| UP-P7-01 | `sw_proto::pyre::escape`（P3 未定義；`08` §0.3「其餘沿用」宣告、Task 3 `_finalize_ready` nonce 樣式需要） | `pub fn escape(pattern: &str) -> String`：僅在 CPython 3.12 `re._special_chars_map` 的 24 個 ASCII 字元（`()[]{}?*+-\|^$\\.&~#`、空白、`\t\n\r\v\f`）前加反斜線，其餘（含 NUL、非 ASCII）原樣 | `contracts/golden/pyre_escape.tsv`（471 列：空字串、U+0000..U+007F 逐字元、非 ASCII 代表字元、seed 20261026 隨機組合；`gen_pyre_escape.py`，3.12.3 新鮮度測試）＋ `crates/sw-proto/tests/pyre_escape_golden.rs` | P7 Task 3 | no（擁有者已指派，2026-10-26） |
