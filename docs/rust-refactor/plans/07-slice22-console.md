@@ -253,7 +253,7 @@ pub struct Tombstones { /* VecDeque<(String id, &'static str status)> cap 16 */ 
 | 5 | 每 console 出向 ring（SC-15） | haiku-xhigh | agy-gemini-3.8-flash-high | 已交付（2070017；#178 追加修正） |
 | 6 | Ownership 狀態機、human TX lane 與 Fence 整合 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：SessionCore／Effects／actor／EpochAllocator（06 T11）、begin_stop（06 T12）、quiet_gate（06 T13）、op_runner SelfTestProbe（06 T14）仍為 s21_todo! |
 | 7 | Interactive lease 差量（tombstone、soft preempt、ATTACHED 救援、stash） | haiku-xhigh | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T11／T14（SessionCore、lease、op_runner） |
-| 8 | PAL console backends（PTY／TCP／ConsoleMux／com0com） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | Linux 已交付（ccd90bd；Windows 原生待驗）；#40／#64 待 06 T2 #64 `same_tty` 與 Python holder 身分修正同步 |
+| 8 | PAL console backends（PTY／TCP／ConsoleMux／com0com） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | Linux 已交付（ccd90bd；Windows 原生待驗，待辦見 Task 8「LOCAL-WINDOWS-TODO」段）；#40／#64 已於 P6 端以 `sw_pal::tty_identity::same_tty` 修正（ee9088b），P5 `proc_holders` 合併時改共用此函式 |
 | 9 | ConsoleHub runtime 與 RX fan-out | haiku-xhigh | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T10（uart_bridge）、T11 |
 | 10 | RPC 表面、LeaseIndex 路由與 SessionPublic 欄位 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T18 ServiceRig、T11、T14 |
 | 11 | 黑箱契約與既有測試改指 Rust（Linux L1.5） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T15a FakeTarget emit／written、06 T15／T20 shell_daemon |
@@ -2035,6 +2035,22 @@ git commit -m "feat(rust-pal): 新增 PTY／TCP console、ConsoleMux 與選配 c
 |---|---|---|---|
 | #40／#64 | B:E-109 | 步驟 2 console reaper／`held_slave_paths()` | 必須使用 06 Task 2 #64 的 PAL `same_tty`（`(st_dev,st_ino)` 身分；devpts 不以 rdev 判定），跨 mount namespace 同名 `/dev/pts/N` 不計為 peer；移植 `TestUartBridgeHeldPathsNamespace` 5 案為 `console_reaper_ignores_other_namespace_same_name_pts` 等（`uart_io.py:1430-1471`） |
 | #109 | B:E-15 | `tcp_accept_sets_nodelay_and_label_shape` | TCP accept 設 `TCP_NODELAY`；label／`vtty` 形狀照 `uart_io.py:1327-1344`（`tcp://127.0.0.1:<port>#<n>` 等以 Python 實測為準） |
+
+#### LOCAL-WINDOWS-TODO（Windows 原生／com0com 骨架待辦集中清單）
+
+> 來源：p6t8-p7front 審查 L3。Linux 本體已於 `ccd90bd` 交付；下列 Windows 入口仍為 `todo!("P6 Task 8")` 骨架或回傳佔位值，**只能在擁有者 Windows host 實作與驗證**（OD-15；`scripts/rust/win-test.sh`）。程式碼內的 `LOCAL-WINDOWS-TODO` 註解以本表為準；新增或關閉任一項須同步更新本表。結果未知前不得預標 PASS。
+
+| # | 位置 | 現況 | 完成條件（對照本 Task 步驟） |
+|---|---|---|---|
+| W-1 | `crates/sw-pal/src/console_tcp/windows.rs` `bind()` | `todo!` | Winsock `127.0.0.1:0`、bind 前 `SO_REUSEADDR`、`listen(8)`、nonblocking；accept 後 `TCP_NODELAY`（失敗忽略）；`WSAEWOULDBLOCK` → `Ok(0)`；錯誤映射 `[WinError N] …`（步驟 3、7） |
+| W-2 | `crates/sw-pal/src/console_mux/windows.rs` `WinConsoleMux::create()` | `todo!` | `WSAPoll`；listener 以 `POLLRDNORM` 回 `Acceptable`；loopback socket pair waker（`wake()` 連呼叫只留 1 byte、`wait` 讀乾）；com0com reader thread＋有界 channel（64）回 `Readable(id)`（步驟 4、7） |
+| W-3 | `crates/sw-pal/src/console_com0com/windows.rs` `open()` | `todo!` | `CreateFileW(\\.\COMn, …, share 0, OPEN_EXISTING, FILE_FLAG_OVERLAPPED)`、`SetCommState` 一次（115200 8N1）、`SetCommTimeouts`；不呼叫 `EscapeCommFunction`；`has_external_peer` 恆 true（步驟 5） |
+| W-4 | `crates/sw-pal/src/testutil.rs` `nodelay()`／`reuseaddr()` | Windows 分支回 `false` | WinSocket handle 的 `getsockopt(TCP_NODELAY／SO_REUSEADDR)`；否則 `tcp_accepted_socket_has_nodelay`、`tcp_listener_reuseaddr`、`tcp_accept_sets_nodelay_and_label_shape` 在 Windows 必紅 |
+| W-5 | `crates/sw-pal/src/testutil.rs` `comm_api_calls()` | `todo!` | 讀 com0com console io 的 Win32 API 呼叫計數（`SetCommState`／`EscapeCommFunction` 次數），供 `cap_windows_com__console_com0com_no_modem_forward` |
+| W-6 | `crates/sw-pal/src/testutil.rs` `toggle_peer_modem_lines()` | `todo!` | 對 peer 端（COMb）改 baud 並切換 DTR／RTS，供同上案 |
+| W-7 | `crates/sw-pal/src/lib.rs` Windows `native()` 的 `Capabilities.com0com_console: true` | 已宣告可用，但 W-3 未實作 | W-3 完成前，任何依 caps 走 com0com 的路徑（Task 12 `windows.serial_console`）會 panic；Task 12 開工前須先完成 W-3，或先改回 `false`／讓入口回 `Unsupported` |
+
+受影響測試（Windows 原生執行時，W-1～W-6 完成前會 panic 或失敗）：`crates/sw-pal/tests/console_conformance.rs` 的 `tcp_console_binds_loopback_ephemeral_and_peer_eof`、`tcp_accepted_socket_has_nodelay`、`tcp_listener_reuseaddr`、`tcp_try_write_never_blocks`、`tcp_wouldblock_maps_to_zero`、`tcp_accept_sets_nodelay_and_label_shape`、`mux_waker_wakes_wait`、`mux_reports_readable_and_hangup`、`mux_write_interest_toggles`、`listener_readable_reports_acceptable`、`mux_handle_from_foreign_pal_rejected`，以及 `cap_windows_com__console_com0com_{roundtrip,exclusive,no_modem_forward}`（另需 Console-side pair 與 `SW_TEST_CONSOLE_PAIR`，見本 Task 開頭 OD-15 段）。`cargo check --target x86_64-pc-windows-gnu` 只證明可編譯，不構成上述任一項的證據。
 
 ---
 
