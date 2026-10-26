@@ -720,6 +720,112 @@ def test_peer_gate_rechecks_dsr_after_timeout_setter(fake_serial_module, monkeyp
         ep.close()
 
 
+@pytest.mark.parametrize("timeout_path", ["reconfigure", "already-configured"])
+@pytest.mark.parametrize(("advance_s", "expected_count"), [(0.1, 0), (0.025, 4)])
+def test_peer_gate_final_dsr_sample_respects_remaining_deadline(
+    fake_serial_module, monkeypatch, timeout_path, advance_s, expected_count,
+):
+    """最後 DSR 查詢用盡期限時不寫；只耗部分預算時重設到剩餘期限後才寫。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class DeadlineAdvancingPeerSerial(PeerFakeSerial):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.dsr_reads = 0
+            self.advance_on_read = 0
+            self.write_timeouts_at_call: list[float | None] = []
+
+        @property
+        def dsr(self) -> bool:
+            self.dsr_reads += 1
+            if self.dsr_reads == self.advance_on_read:
+                clock.advance(advance_s)
+            return self.dsr_on
+
+        def write(self, data: bytes) -> int:
+            self.write_timeouts_at_call.append(self.write_timeout)
+            return super().write(data)
+
+    fake = DeadlineAdvancingPeerSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.dsr_on = True
+    if timeout_path == "already-configured":
+        fake._write_timeout = 0.05
+        fake.advance_on_read = 2  # write_some 前置樣本後的最後 peer gate
+    else:
+        fake._write_timeout = None
+        fake.advance_on_read = 3  # setter 前 gate 後，寫入前的最後 peer gate
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            ep._peer_on_since = clock() - 0.25
+            assert ep.write_some(b"late", 0.05) == expected_count
+        if expected_count == 0:
+            assert clock() == pytest.approx(0.1)
+            assert fake.writes == []
+            assert fake.write_timeouts_at_call == []
+        else:
+            assert fake.writes == [b"late"]
+            assert fake.write_timeouts_at_call == pytest.approx([0.015])
+    finally:
+        ep.close()
+
+
+@pytest.mark.parametrize("timeout_path", ["reconfigure", "already-configured"])
+@pytest.mark.parametrize("timeout_s", [0.05, 0.2, 5.0])
+def test_peer_gate_repeated_dsr_cost_preserves_write_liveness(
+    fake_serial_module, monkeypatch, timeout_path, timeout_s,
+):
+    """連續有界 DSR 成本不得讓穩定開啟的 peer 永遠無法寫入。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class RepeatedCostPeerSerial(PeerFakeSerial):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.write_samples: list[tuple[float, float | None, float]] = []
+            self.call_deadline = 0.0
+
+        @property
+        def dsr(self) -> bool:
+            clock.advance(0.002)
+            return self.dsr_on
+
+        def write(self, data: bytes) -> int:
+            self.write_samples.append((clock(), self.write_timeout, self.call_deadline))
+            return super().write(data)
+
+    fake = RepeatedCostPeerSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.dsr_on = True
+    if timeout_path == "already-configured":
+        fake._write_timeout = timeout_s
+    ep._peer_on_since = clock() - 0.25
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            for _ in range(3):
+                fake.call_deadline = clock() + timeout_s
+                assert ep.write_some(b"live", timeout_s) == len(b"live")
+
+        assert fake.writes == [b"live"] * 3
+        assert len(fake.write_samples) == 3
+        for written_at, configured_timeout, deadline in fake.write_samples:
+            assert configured_timeout is not None
+            assert written_at + configured_timeout <= deadline + 1e-9
+    finally:
+        ep.close()
+
+
 def test_peer_gate_settle_window_before_first_write(fake_serial_module):
     """DSR 剛轉高時（pySerial open 的 PurgeComm 可能尚未執行）不立即寫入，須過 settle 窗口。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint

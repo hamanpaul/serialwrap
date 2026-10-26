@@ -67,7 +67,10 @@ class WinSerialEndpoint:
         self._serial_timeout_exception: type[BaseException] | None = None
         # DSR 首次被觀測為高的時間點（monotonic）；DSR 為低時清為 None。受 `_peer_state_lock` 保護。
         self._peer_on_since: float | None = None
+        self._last_peer_sample_elapsed_s = 0.0
         self._peer_state_lock = threading.Lock()
+        # 最近一次量測的 timeout setter 成本；預留於下次期限設定，突增則由寫入前 guard 拒絕。
+        self._last_timeout_set_elapsed_s = 0.0
         self.generation = 0
         self.last_fault: str | None = None
         # `_lock` 保護 handle、generation 與 closed 狀態。控制面可能持有它等待在途 I/O 鎖；
@@ -256,7 +259,7 @@ class WinSerialEndpoint:
                 return None
             effective_timeout = self._effective_write_timeout(write_timeout, remaining)
             if serial_obj.write_timeout == effective_timeout:
-                return self._write_peer_gated_locked(serial_obj, data)
+                return self._write_peer_gated_locked(serial_obj, data, deadline)
         finally:
             self._write_io_lock.release()
         # 期限不符：需於雙向靜止時設定，並於同一臨界區內寫入。
@@ -267,9 +270,9 @@ class WinSerialEndpoint:
             configured_timeout = serial_obj.write_timeout
             # 設定 COM timeout 本身也會耗時；若設定後的 timeout 比呼叫剩餘預算多出 driver 解析度，
             # 即使 deadline 尚未完全到期也不得送出，避免把設定前的完整預算帶進 write。
-            if configured_timeout is None or configured_timeout > remaining + _WRITE_TIMEOUT_RESOLUTION_S:
+            if configured_timeout is None or configured_timeout > remaining + 1e-9:
                 return 0
-            return self._write_peer_gated_locked(serial_obj, data)
+            return self._write_peer_gated_locked(serial_obj, data, deadline)
 
     @contextmanager
     def _timeout_section(
@@ -295,9 +298,19 @@ class WinSerialEndpoint:
                 if remaining <= 0 or not self._peer_writable_locked(serial_obj):
                     held = False
                 else:
-                    effective_timeout = self._effective_write_timeout(write_timeout, remaining)
-                    if serial_obj.write_timeout != effective_timeout:
-                        serial_obj.write_timeout = effective_timeout
+                    remaining = deadline - _clock()
+                    reserve = self._last_peer_sample_elapsed_s + self._last_timeout_set_elapsed_s
+                    timeout_budget = remaining - reserve
+                    if timeout_budget < _WRITE_TIMEOUT_RESOLUTION_S:
+                        held = False
+                    else:
+                        effective_timeout = self._effective_write_timeout(write_timeout, timeout_budget)
+                        if serial_obj.write_timeout != effective_timeout:
+                            set_started = _clock()
+                            serial_obj.write_timeout = effective_timeout
+                            self._last_timeout_set_elapsed_s = max(0.0, _clock() - set_started)
+                        else:
+                            self._last_timeout_set_elapsed_s = 0.0
         except BaseException:
             if read_acquired:
                 self._read_io_lock.release()
@@ -376,9 +389,17 @@ class WinSerialEndpoint:
             raise EndpointWriteUncertain(len(data), f"unexpected write count {count}")
         return count
 
-    def _write_peer_gated_locked(self, serial_obj: Any, data: bytes) -> int | None:
-        """持寫入串行鎖再次取樣 peer；等待鎖期間 DSR 關閉時不送出 bytes。"""
+    def _write_peer_gated_locked(self, serial_obj: Any, data: bytes, deadline: float) -> int | None:
+        """持寫入串行鎖再次取樣 peer，並確認取樣後剩餘期限足以容納已設定 timeout。"""
         if not self._peer_writable_locked(serial_obj):
+            return None
+        remaining = deadline - _clock()
+        if remaining <= 0:
+            return None
+        configured_timeout = serial_obj.write_timeout
+        remaining = deadline - _clock()
+        if (remaining <= 0 or configured_timeout is None
+                or configured_timeout > remaining + 1e-9):
             return None
         return self._write_locked(serial_obj, data)
 
@@ -437,10 +458,13 @@ class WinSerialEndpoint:
     def _peer_dsr_locked(self, serial_obj: Any) -> bool | None:
         """讀取本端 DSR 並維護 settle 起點；只持 peer 狀態鎖，不等待控制面鎖或 I/O。"""
         with self._peer_state_lock:
+            sample_started = _clock()
             try:
                 dsr_on = bool(serial_obj.dsr)
             except Exception:
                 return None
+            finally:
+                self._last_peer_sample_elapsed_s = max(0.0, _clock() - sample_started)
             if not dsr_on:
                 self._peer_on_since = None
             elif self._peer_on_since is None:
@@ -451,11 +475,19 @@ class WinSerialEndpoint:
         """peer gate 判定：關閉時恆允許；開啟時需 DSR 為高且已過 settle 窗口。"""
         if not self.peer_gate:
             return True
-        dsr_on = self._peer_dsr_locked(serial_obj)
+        # 先複製目前已確認的 settle 起點，再取樣 DSR。取樣期間可能有其他路徑清除
+        # `_peer_on_since`；本次判定必須使用取樣前鎖內取得的值，不因取樣後狀態清除而改變。
         with self._peer_state_lock:
             peer_on_since = self._peer_on_since
+        dsr_on = self._peer_dsr_locked(serial_obj)
         if not dsr_on or peer_on_since is None:
-            return False
+            if not dsr_on:
+                return False
+            # 首次觀測為高時，取樣函式已設立 settle 起點；取得該新值作為本次起算值。
+            with self._peer_state_lock:
+                peer_on_since = self._peer_on_since
+            if peer_on_since is None:
+                return False
         return _clock() - peer_on_since >= _PEER_OPEN_SETTLE_S
 
     def _release_serial_locked(self) -> None:
