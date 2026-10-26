@@ -1,6 +1,6 @@
 //! 規則 schema 驗證（P7 Task 11；`event_engine/schema.py`，09 §3.1）。
 
-use sw_proto::pycompat::{py_int_parse, py_truthy};
+use sw_proto::pycompat::{py_int_parse_checked, py_truthy};
 use sw_proto::pyfmt::{py_repr_str, py_str};
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{self, redos, CompileError, PyFlags};
@@ -150,12 +150,7 @@ fn py_int(v: &PyValue) -> Result<PyInt, RuleError> {
         PyValue::Int(i) => Ok(i.clone()),
         PyValue::Bool(b) => Ok(PyInt::Small(i128::from(*b))),
         PyValue::Float(f) => float_to_int(*f),
-        PyValue::Str(s) => py_int_parse(s).ok_or_else(|| {
-            RuleError::Value(format!(
-                "invalid literal for int() with base 10: {}",
-                py_repr_str(s)
-            ))
-        }),
+        PyValue::Str(s) => py_int_parse_checked(s).map_err(|e| RuleError::Value(e.py_message(s))),
         other => Err(RuleError::Type(format!(
             "int() argument must be a string, a bytes-like object or a real number, not '{}'",
             type_name(other)

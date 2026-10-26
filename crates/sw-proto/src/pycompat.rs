@@ -256,9 +256,41 @@ fn normalize_numeric(s: &str) -> Option<String> {
 /// CPython `sys.get_int_max_str_digits()` 預設值（十進位字串位數上限）。
 pub const INT_MAX_STR_DIGITS: usize = 4300;
 
+/// [`py_int_parse_checked`] 失敗原因（對應 CPython 3.12 `int(str)` 的兩種 `ValueError`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PyIntParseError {
+    /// `invalid literal for int() with base 10: ...`
+    InvalidLiteral,
+    /// 語法合法但十進位位數（含前導零、不含底線與符號）超過 [`INT_MAX_STR_DIGITS`]；值為位數。
+    ExceedsDigitLimit(usize),
+}
+
+impl PyIntParseError {
+    /// CPython 3.12 `str(ValueError)`；`s` 為原始輸入（invalid literal 以 `%.200R` 截斷 repr）。
+    pub fn py_message(&self, s: &str) -> String {
+        match self {
+            Self::InvalidLiteral => {
+                let repr: String = py_repr_str(s).chars().take(200).collect();
+                format!("invalid literal for int() with base 10: {repr}")
+            }
+            Self::ExceedsDigitLimit(n) => format!(
+                "Exceeds the limit ({INT_MAX_STR_DIGITS} digits) for integer string conversion: \
+                 value has {n} digits; use sys.set_int_max_str_digits() to increase the limit"
+            ),
+        }
+    }
+}
+
 /// `int(str)`：strip、正負號、底線、Unicode 十進位數字；拒絕 `"3.5"`、`"0x10"` 等；位數超過 [`INT_MAX_STR_DIGITS`] 回傳 `None`。
 pub fn py_int_parse(s: &str) -> Option<PyInt> {
-    let norm = normalize_numeric(s)?;
+    py_int_parse_checked(s).ok()
+}
+
+/// 同 [`py_int_parse`]，但區分失敗原因。CPython 3.12 先驗完整語法再檢查位數上限，
+/// 故 `"9"*5000 + "x"` 為 [`PyIntParseError::InvalidLiteral`]（3.11 則先報位數上限）。
+pub fn py_int_parse_checked(s: &str) -> Result<PyInt, PyIntParseError> {
+    use PyIntParseError::InvalidLiteral;
+    let norm = normalize_numeric(s).ok_or(InvalidLiteral)?;
     let t = norm.trim_matches(is_ascii_numeric_space);
     let (neg, body) = match t.as_bytes().first() {
         Some(b'-') => (true, &t[1..]),
@@ -274,15 +306,18 @@ pub fn py_int_parse(s: &str) -> Option<PyInt> {
                 let prev_ok = i > 0 && bytes[i - 1].is_ascii_digit();
                 let next_ok = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
                 if !(prev_ok && next_ok) {
-                    return None;
+                    return Err(InvalidLiteral);
                 }
             }
-            _ => return None,
+            _ => return Err(InvalidLiteral),
         }
     }
+    if digits.is_empty() {
+        return Err(InvalidLiteral);
+    }
     // CPython 3.12 int 位數上限：十進位位數（含前導零、不含底線與符號）超過 4300 即 ValueError。
-    if digits.is_empty() || digits.len() > INT_MAX_STR_DIGITS {
-        return None;
+    if digits.len() > INT_MAX_STR_DIGITS {
+        return Err(PyIntParseError::ExceedsDigitLimit(digits.len()));
     }
     let trimmed = digits.trim_start_matches('0');
     let mag = if trimmed.is_empty() { "0" } else { trimmed };
@@ -291,7 +326,7 @@ pub fn py_int_parse(s: &str) -> Option<PyInt> {
     } else {
         mag.to_string()
     };
-    Some(match signed.parse::<i128>() {
+    Ok(match signed.parse::<i128>() {
         Ok(v) => PyInt::Small(v),
         Err(_) => PyInt::Big(signed),
     })

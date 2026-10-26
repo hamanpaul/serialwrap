@@ -344,6 +344,11 @@ def gen_event_schema() -> list[dict[str, Any]]:
         _rule(handler={"shell": "echo hi"}),
         _rule(auto_enable_com_on_load=0), _rule(debug="yes"),
         _rule(extra_key={"nested": [1, 2]}),
+        # 審查 L1：int() 十進位位數上限（4300）訊息與 invalid literal 的 %.200R 截斷
+        _rule(cooldown_ms="9" * 5000), _rule(cooldown_ms="9" * 4300), _rule(cooldown_ms="0" * 4301),
+        _rule(cooldown_ms=" -" + "9" * 4301 + " "), _rule(cooldown_ms="1" + "_1" * 4300), _rule(cooldown_ms="\uff19" * 4301),
+        _rule(cooldown_ms="9" * 5000 + "x"), _rule(cooldown_ms="9" * 4301 + "_"), _rule(max_fires="9" * 4301),
+        _rule(timeout_ms="+0" + "0" * 4300),
     ]
     rows = []
     for obj in inputs:
