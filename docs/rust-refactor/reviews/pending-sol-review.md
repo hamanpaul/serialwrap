@@ -107,11 +107,11 @@ Reviewer A 提出 10 項 finding；Reviewer B/Sol round-r2、round-r3 的四項 
 
 | Finding | 處置 |
 |---|---|
-| Reviewer A #1 portable socket test | **fixed `4ad9b39`**：移除 `/tmp` 假設，使用平台 temp root；cleanup 只依 `SW_G5_TEMP_RUN_DIR`，不會從 socket path 推導並刪除 parent。 |
+| Reviewer A #1 portable socket test | **fixed `4ad9b39`**：移除 `/tmp` 假設，使用平台 temp root；cleanup 只依 `SW_G5_TEMP_RUN_DIR`，不會從 socket path 推導並刪除 parent。修改後定點原生 Windows runner `1 passed`。 |
 | Reviewer A #2 expired ready lease | **fixed `317add5`**：新增 go/ack 握手，在刺激前對既有 WAL 重新取得 seeded lease；延遲超過 500 ms 的案例測試要求重新武裝後才放行。 |
-| Reviewer A #3 missing case-level regression | **fixed `317add5`**：新增 ready 失敗即 stop/error、case_rotate 首筆 append/helper/rearm/其餘 399 筆順序，以及四案 barrier 與 atomic ready AST 檢查。 |
+| Reviewer A #3 missing case-level regression | **fixed `317add5`**：新增 ready 失敗即 stop/error、case_rotate 首筆 append/helper/rearm/其餘 399 筆順序，以及四案 barrier 與 atomic ready AST 檢查；7 個新 Spike 3 cases 已在原生 Windows runner 通過。 |
 | Reviewer A #4 review record | **fixed in this docs(reviews) commit**：修正 round-r2 `.last`、round-r3 Sol findings 與非獨立 approve 的記錄；補上第四輪逐項處置。 |
-| Reviewer A #5 oplock has no workload | **fixed `317add5`**：每案在獨立 oplock lease 期間執行 append、rotate、F12 前後 marker；schema 與 gate 驗證記錄數、連續 seq、rotation health、CRC、interference。CHG 保持 OPEN 等待獨立複審與 Windows 重採。 |
+| Reviewer A #5 oplock has no workload | **fixed `317add5`**：每案在獨立 oplock lease 期間執行 append、rotate、F12 前後 marker；schema 與 gate 驗證記錄數、連續 seq、rotation health、CRC、interference。4 個 gate 反例已在原生 Windows runner 通過；CHG 保持 OPEN 等待獨立複審與四案 producer artifacts 重採。 |
 | Reviewer A #6 ready replace PermissionError | **fixed `317add5`**：ready 同目錄原子發布遇 PermissionError 有界重試 40 次、25 ms 間隔；新增注入兩次後成功測試。 |
 | Reviewer A #7 zombie leader with live thread | **fixed `4ad9b39`**：只有所有 `/proc/<pid>/task/*/stat` 都終止或消失才把 EACCES 視為無 holder；增加 pthread leader-exit、live sibling 與 PTY 回歸。 |
 | Reviewer A #8 Cargo provenance reason | **fixed `317add5`**：即使 verdict 是真實 FAIL 仍附 provenance reasons，FAIL 優先序不變；owner addenda 新增 OPEN oracle change。 |
@@ -122,7 +122,7 @@ Reviewer A 提出 10 項 finding；Reviewer B/Sol round-r2、round-r3 的四項 
 | Sol round-r3 #1 `/tmp` portability | **fixed `4ad9b39`**：使用可攜 temp root，POSIX socket byte limit 僅在 POSIX 斷言。 |
 | Sol round-r3 #2 expired lease | **fixed `317add5`**：go/ack 在案例刺激前重新武裝 live seeded lease，過期的首次 ready 不再足以通過 barrier。 |
 
-第四輪驗證：觸及測試 `180 passed, 2 skipped`；`tests/test_resource_markers.py` 為 `9 passed, 11 warnings`；Rust-only `test_restart_no_reopen_before_handoff` 在隔離 PID namespace 實跑 `1 passed`。全套 `python3 -m pytest -q tests/` 僅執行一次：`5093 passed, 109 skipped, 1 xfailed, 2 failed`（92 subtests passed）。失敗為 `tests/test_docker_l15.py::test_docker_smoke_two_container`（bridge exact-revision qualification 回 `INSUFFICIENT_EVIDENCE`）及 `tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`（正式 P4/L1 evidence 缺檔）；兩者都在 `target/baseline-3684f06-r3` 以相同 nodeid 與相同失敗類型重現。基線快照中的兩個測試檔及 Docker runner 與 `git show 3684f06:<path>` 的 SHA-256 相同。`cargo test --workspace` exit 0；`tools.contracts check` 為 0 findings；policy check `25 pass／0 fail／2 warn`（R-19、R-22）；frozen lock `--check --base HEAD` 與 `git diff --check` 通過。未執行 Stage 1 exit driver；沒有 Windows 原生 Spike 3 重採或 COM／硬體執行。
+第四輪驗證：觸及測試 `180 passed, 2 skipped`；`tests/test_resource_markers.py` 為 `9 passed, 11 warnings`；Rust-only `test_restart_no_reopen_before_handoff` 在隔離 PID namespace 實跑 `1 passed`。原生 Windows runner：portable memory-only selector `8 passed, 4 deselected`，另 4 個 core_portable gate 參數 `4 passed`；11 個本輪新加 L1 nodeid 與修改後短 socket regression 均通過，未開 COM。全套 `python3 -m pytest -q tests/` 僅執行一次：`5093 passed, 109 skipped, 1 xfailed, 2 failed`（92 subtests passed）。失敗為 `tests/test_docker_l15.py::test_docker_smoke_two_container`（bridge exact-revision qualification 回 `INSUFFICIENT_EVIDENCE`）及 `tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`（正式 P4/L1 evidence 缺檔）；兩者都在 `target/baseline-3684f06-r3` 以相同 nodeid 與相同失敗類型重現。基線快照中的兩個測試檔、P4 checker 與 Docker runner 與 `git show 3684f06:<path>` 的 SHA-256 相同。`cargo test --workspace` exit 0；`tools.contracts check` 為 0 findings；policy check `25 pass／0 fail／2 warn`（R-19、R-22）；frozen lock `--check --base HEAD` 與 `git diff --check` 通過。未執行 Stage 1 exit driver；四案 Spike 3 producer artifact 未於目前 HEAD 重採，COM／硬體未執行。
 
 ## 額度用完後未完成、需重新實作（原 implementer 為 codex gpt-6-luna）
 
