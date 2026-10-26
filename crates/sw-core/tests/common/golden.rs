@@ -46,9 +46,16 @@ pub fn unhex_utf8(s: &str) -> String {
 }
 
 /// xorshift64*（固定 seed 的可重現隨機序列）。
-pub struct XorShift(pub u64);
+///
+/// 全零狀態是 xorshift 的不動點（`SW_TEST_SEED=0` 會讓序列恆為 0），因此只能經 `new` 建構，
+/// 並以 `seed | 1` 避開（parity-amendments-2026-10-26 #181，P6 審查 F8）；奇數 seed（含預設 0x5EED）序列不變。
+pub struct XorShift(u64);
 
 impl XorShift {
+    pub fn new(seed: u64) -> Self {
+        XorShift(seed | 1)
+    }
+
     pub fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;

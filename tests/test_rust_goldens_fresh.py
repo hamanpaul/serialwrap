@@ -87,3 +87,32 @@ def test_wal_record_goldens_are_fresh(tmp_path):
     assert [p.name for p in generated] == [p.name for p in expected]
     for generated_file, expected_file in zip(generated, expected):
         assert generated_file.read_bytes() == expected_file.read_bytes(), generated_file.name
+
+
+# parity-amendments-2026-10-26 #181（P6 審查 F8）：golden 以位元組比對（本檔與 Rust include_str!），
+# Windows 檢出若被 core.autocrlf 改成 CRLF 會整批失效，故 contracts/golden/** 必須宣告 eol=lf；
+# 刻意保存 CRLF 的 profiles fixture（37_bom_crlf）必須宣告 -text，避免被正規化。
+_CRLF_FIXTURES = ("contracts/golden/profiles_fixtures/37_bom_crlf/",)
+
+
+def _git(*args: str) -> str:
+    return subprocess.run(["git", "-C", str(ROOT), *args], check=True, capture_output=True, text=True).stdout
+
+
+def test_golden_gitattributes_force_lf():
+    try:
+        files = [f for f in _git("ls-files", "-z", "contracts/golden").split("\0") if f]
+    except (OSError, subprocess.CalledProcessError) as exc:  # 非 git 檢出（例如 sdist）
+        pytest.skip(f"無法列出 git 追蹤檔：{exc}")
+    assert files, "contracts/golden 應有追蹤檔"
+    out = subprocess.run(["git", "-C", str(ROOT), "check-attr", "-z", "--stdin", "text", "eol"],
+                         input="\0".join(files) + "\0", check=True, capture_output=True, text=True).stdout
+    parts = out.split("\0")
+    attrs: dict[str, dict[str, str]] = {}
+    for i in range(0, len(parts) - 2, 3):
+        attrs.setdefault(parts[i], {})[parts[i + 1]] = parts[i + 2]
+    for f in files:
+        if f.startswith(_CRLF_FIXTURES):
+            assert attrs[f]["text"] == "unset", f"{f} 需 -text 以保存 CRLF 位元組"
+        else:
+            assert attrs[f] == {"text": "set", "eol": "lf"}, f"{f} 的 git 屬性 {attrs[f]}，應為 text eol=lf"

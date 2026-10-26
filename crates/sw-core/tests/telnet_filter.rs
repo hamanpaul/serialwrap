@@ -51,7 +51,7 @@ const PICK: [u8; 17] = [IAC, WILL, WONT, DO, DONT, SB, SE, 0x00, 0x0A, 0x0D, ECH
 #[test] fn chunking_is_invisible() {
     // 同一串 bytes，任意切割後的 uart／reply 串接必須等於一次餵入的結果（SW_TEST_SEED 決定序列，預設 0x5EED）
     let seed: u64 = std::env::var("SW_TEST_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x5EED);
-    let mut rng = XorShift(seed);
+    let mut rng = XorShift::new(seed);
     for _ in 0..5000 {
         let data: Vec<u8> = (0..rng.below(64)).map(|_| PICK[rng.below(PICK.len() as u64) as usize]).collect();
         let whole = TelnetFilter::new().feed(&data);
@@ -141,4 +141,21 @@ fn cat(parts: &[&[u8]]) -> Vec<u8> { parts.concat() }
     assert_eq!(a.feed(&[IAC]), f(b"", b""));
     assert_eq!(b.feed(b"z"), f(b"z", b""));
     assert_eq!(a.feed(&[IAC]), f(&[0xFF], b""));
+}
+
+/// parity-amendments-2026-10-26 #181（P6 審查 F8）：`SW_TEST_SEED=0` 時 xorshift 狀態恆為 0、`below()` 恆回 0，
+/// chunking_is_invisible 會退化成只測空輸入；建構時必須避開全零狀態。
+#[test] fn xorshift_zero_seed_does_not_stall() {
+    let mut rng = XorShift::new(0);
+    let vals: Vec<u64> = (0..8).map(|_| rng.next()).collect();
+    assert!(vals.iter().all(|&v| v != 0), "seed 0 不得產生全零序列：{vals:?}");
+    let mut uniq = vals.clone(); uniq.sort_unstable(); uniq.dedup();
+    assert_eq!(uniq.len(), vals.len(), "序列不得停滯：{vals:?}");
+    let mut rng = XorShift::new(0);
+    assert!((0..64).any(|_| rng.below(64) != 0), "below() 不得恆為 0");
+}
+#[test] fn xorshift_nonzero_seed_is_reproducible() {
+    let a: Vec<u64> = { let mut r = XorShift::new(0x5EED); (0..4).map(|_| r.next()).collect() };
+    let b: Vec<u64> = { let mut r = XorShift::new(0x5EED); (0..4).map(|_| r.next()).collect() };
+    assert_eq!(a, b);
 }
