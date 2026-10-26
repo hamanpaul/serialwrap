@@ -618,3 +618,182 @@ fn fake_io_modes_and_refs() {
     assert!(f.open_com0com_console("COM40").is_err());
     assert!(f.open_com0com_console("COM40").is_ok());
 }
+// ---------------------------------------------------------------------------
+// console reaper 的 holder 身分判定（#40／#64，B:E-109；Python `TestUartBridgeHeldPathsNamespace` 5 案）
+// ---------------------------------------------------------------------------
+//
+// 背景（#R2）：容器內獨立 devpts instance 的 `/dev/pts/N` readlink 字串與主機相同、`st_rdev`（136:N）
+// 亦相同，但 `(st_dev, st_ino)` 不同。`held_slave_paths()` 只在「fd 實際指向的 inode」與「該字串於本
+// daemon 所見的 inode」相同時才計入。以假 `/proc` ＋注入的 readlink／stat 固定此情境（真機依 pty 配號而定）。
+
+#[cfg(unix)]
+mod reaper_ns {
+    use std::collections::HashMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use sw_pal::tty_identity::TtyIdentity;
+
+    // 主機 devpts（st_dev=0:60）與容器 devpts（0:140、0:148）：同名 /dev/pts/7 實為不同裝置。
+    pub const HOST_DEV: u64 = 60;
+    pub const CONTAINER_DEV_A: u64 = 140;
+    pub const CONTAINER_DEV_B: u64 = 148;
+    pub const PTS7_RDEV: u64 = (136 << 8) | 7;
+    pub const TTY: &str = "/dev/pts/7";
+
+    pub enum FakeStat {
+        Id(TtyIdentity),
+        /// 被 stat 即 panic（驗證未對該路徑做 stat）。
+        MustNotStat,
+    }
+
+    /// 假 /proc：每條 fd 的 readlink 字串與 stat 身分各自可控（對照 Python `FakeProcNs`）。
+    pub struct FakeProcNs {
+        pub root: PathBuf,
+        links: HashMap<PathBuf, String>,
+        stats: HashMap<PathBuf, FakeStat>,
+    }
+
+    pub fn chr(dev: u64, ino: u64, rdev: u64) -> TtyIdentity {
+        TtyIdentity {
+            dev,
+            ino,
+            rdev,
+            is_char_device: true,
+        }
+    }
+
+    impl FakeProcNs {
+        pub fn new() -> FakeProcNs {
+            let root = super::tempfile_dir("sw-p6-fakeproc").join("proc");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut fake = FakeProcNs {
+                root,
+                links: HashMap::new(),
+                stats: HashMap::new(),
+            };
+            // 主機 tty 的身分（TTY 不存在於 CI 主機，故一律由假表提供）。
+            fake.set_path(TTY, FakeStat::Id(chr(HOST_DEV, 10, PTS7_RDEV)));
+            fake
+        }
+
+        pub fn add_fd(&mut self, pid: u32, fd: u32, link: &str, stat: FakeStat) {
+            let fd_dir = self.root.join(pid.to_string()).join("fd");
+            std::fs::create_dir_all(&fd_dir).unwrap();
+            let path = fd_dir.join(fd.to_string());
+            std::fs::write(&path, b"").unwrap();
+            self.links.insert(path.clone(), link.to_string());
+            self.stats.insert(path, stat);
+        }
+
+        pub fn set_path(&mut self, path: &str, stat: FakeStat) {
+            self.stats.insert(PathBuf::from(path), stat);
+        }
+
+        pub fn held(&self) -> Option<std::collections::HashSet<String>> {
+            let readlink = |p: &Path| -> io::Result<PathBuf> {
+                self.links
+                    .get(p)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            };
+            let stat = |p: &Path| -> io::Result<TtyIdentity> {
+                match self.stats.get(p) {
+                    Some(FakeStat::Id(id)) => Ok(*id),
+                    Some(FakeStat::MustNotStat) => {
+                        panic!(
+                            "stat must not be called for non-/dev links: {}",
+                            p.display()
+                        )
+                    }
+                    None => Err(io::Error::from(io::ErrorKind::NotFound)),
+                }
+            };
+            sw_pal::proc_scan::posix::held_tty_paths_with(&self.root, &readlink, &stat)
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_ignores_other_namespace_same_name_pts() {
+    use reaper_ns::*;
+    let mut ns = FakeProcNs::new();
+    ns.add_fd(
+        4411,
+        3,
+        TTY,
+        FakeStat::Id(chr(CONTAINER_DEV_B, 10, PTS7_RDEV)),
+    );
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(
+        !held.contains(TTY),
+        "他 namespace 同名 pts（rdev 相同、inode 不同）不得計為 peer"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_counts_same_inode_pts() {
+    use reaper_ns::*;
+    let mut ns = FakeProcNs::new();
+    ns.add_fd(4412, 3, TTY, FakeStat::Id(chr(HOST_DEV, 10, PTS7_RDEV)));
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(held.contains(TTY));
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_counts_non_devpts_mknod_alias() {
+    use reaper_ns::*;
+    let uart = "/dev/ttyS0";
+    let uart_rdev = (4 << 8) | 64;
+    let mut ns = FakeProcNs::new();
+    ns.set_path(uart, FakeStat::Id(chr(HOST_DEV, 11, uart_rdev)));
+    ns.add_fd(
+        4413,
+        3,
+        uart,
+        FakeStat::Id(chr(CONTAINER_DEV_A, 55, uart_rdev)),
+    );
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(
+        held.contains(uart),
+        "非 devpts 字元裝置的 mknod 別名（inode 不同、rdev 相同）仍計為 held"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_does_not_stat_non_dev_links() {
+    use reaper_ns::*;
+    let mut ns = FakeProcNs::new();
+    ns.add_fd(4414, 4, "pipe:[12345]", FakeStat::MustNotStat);
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(!held.contains("pipe:[12345]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_missing_proc_returns_none() {
+    let root = tempfile_dir("sw-p6-noproc").join("no-such-proc");
+    let readlink = |p: &std::path::Path| std::fs::read_link(p);
+    let stat = |p: &std::path::Path| sw_pal::tty_identity::stat_identity(p);
+    assert!(sw_pal::proc_scan::posix::held_tty_paths_with(&root, &readlink, &stat).is_none());
+}
+
+/// 真實檔案系統：`/dev/` 下但本 namespace 無法 stat 的 link（身分取不到）不計入，
+/// 舊版以 readlink 字串直接收錄（對照 Python #R2：stat 失敗即略過該 fd）。
+#[cfg(unix)]
+#[test]
+fn console_reaper_skips_dev_link_without_identity() {
+    let root = tempfile_dir("sw-p6-realproc");
+    let fd_dir = root.join("4415").join("fd");
+    std::fs::create_dir_all(&fd_dir).unwrap();
+    let ghost = "/dev/pts/987654321";
+    std::os::unix::fs::symlink(ghost, fd_dir.join("3")).unwrap();
+    let held = sw_pal::proc_scan::PosixProcScan::with_root(&root)
+        .held_fd_targets()
+        .expect("假 /proc 可列舉");
+    assert!(!held.contains(ghost), "無身分的同名字串不得計為 peer");
+}

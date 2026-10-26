@@ -46,6 +46,7 @@ pub mod sysenv;
 #[cfg(feature = "test-fakes")]
 pub mod testutil;
 pub mod traits;
+pub mod tty_identity;
 pub mod wal_fs;
 
 #[cfg(feature = "test-fakes")]

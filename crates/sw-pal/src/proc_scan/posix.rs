@@ -48,28 +48,61 @@ impl PosixProcScan {
         <Self as ProcScan>::identity_alive(self, id)
     }
 
-    /// 所有外部行程持有的 fd readlink 目標（排除自身 pid）；`proc_root` 不可列舉時回 `None`
-    /// （P6 Task 8；uart_io.py `_enumerate_all_held_paths`：個別 pid／fd 讀取失敗略過）。
+    /// 外部行程持有、且與本 daemon 所見為同一 tty 的路徑字串集合（排除自身 pid）；`proc_root` 不可列舉時回
+    /// `None`（P6 Task 8；uart_io.py `_enumerate_all_held_paths` #R2 版）。見 [`held_tty_paths_with`]。
     pub fn held_fd_targets(&self) -> Option<std::collections::HashSet<String>> {
-        let self_pid = std::process::id().to_string();
-        let mut held = std::collections::HashSet::new();
-        for entry in fs::read_dir(&self.proc_root).ok()?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) || name == self_pid {
-                continue;
-            }
-            let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+        held_tty_paths_with(
+            &self.proc_root,
+            &|path: &Path| fs::read_link(path),
+            &|path: &Path| crate::tty_identity::stat_identity(path),
+        )
+    }
+}
+
+/// console reaper 的 held 集合（#40／#64，Python `_enumerate_all_held_paths` #R2 版逐步對照）。
+///
+/// fd 的 readlink 字串只是「該行程 mount namespace 內」的路徑：一條 fd 只有在「fd 實際指向的 inode」
+/// （`stat(/proc/<pid>/fd/N)`）與「該字串於本 daemon 命名空間 stat 到的 inode」為同一 tty
+/// （`tty_identity::same_tty`）時才計入。非 `/dev/` 開頭的 link（pipe:／socket:／一般檔）不做 stat；
+/// 個別 pid／fd 讀取或任一 stat 失敗即略過該 fd（身分取不到不得計為 peer）。`proc_root` 不可列舉回 `None`。
+/// `readlink`／`stat` 以參數注入，使「字串相同、inode 不同」的他 namespace 情境可測。
+pub fn held_tty_paths_with(
+    proc_root: &Path,
+    readlink: &dyn Fn(&Path) -> std::io::Result<PathBuf>,
+    stat: &dyn Fn(&Path) -> std::io::Result<crate::tty_identity::TtyIdentity>,
+) -> Option<std::collections::HashSet<String>> {
+    let self_pid = std::process::id().to_string();
+    let mut held = std::collections::HashSet::new();
+    for entry in fs::read_dir(proc_root).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) || name == self_pid {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let fd_path = fd.path();
+            let Ok(target) = readlink(&fd_path) else {
                 continue;
             };
-            for fd in fds.flatten() {
-                if let Ok(target) = fs::read_link(fd.path()) {
-                    held.insert(target.to_string_lossy().into_owned());
-                }
+            let target = target.to_string_lossy().into_owned();
+            if !target.starts_with("/dev/") {
+                continue;
+            }
+            let Ok(fd_id) = stat(&fd_path) else {
+                continue;
+            };
+            let Ok(target_id) = stat(Path::new(&target)) else {
+                continue;
+            };
+            if crate::tty_identity::same_tty(&fd_id, &target_id) {
+                held.insert(target);
             }
         }
-        Some(held)
     }
+    Some(held)
 }
 
 impl ProcScan for PosixProcScan {
