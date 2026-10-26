@@ -329,7 +329,7 @@ def prepare_profile(env: dict[str, str]) -> Path:
 def start_python_daemon(env: dict[str, str], profile_dir: Path, *, state: str = "READY"):
     from bb_daemon import PyDaemon
 
-    run_dir = Path(tempfile.mkdtemp(prefix="sw-", dir="/tmp"))
+    run_dir = Path(tempfile.mkdtemp(prefix="sw-"))
     env["SERIALWRAP_RUN_DIR"] = str(run_dir)
     env["SW_G5_TEMP_RUN_DIR"] = str(run_dir)
     daemon = PyDaemon(
@@ -809,8 +809,33 @@ def _proc_pid_state(pid: int) -> str | None:
     return tail[0] if tail else "?"
 
 
+def _proc_pid_all_threads_terminal(pid: int) -> bool:
+    """只有行程所有執行緒皆退出或已終止，才確認該 PID 不再有可用 fd。"""
+    task_dir = Path(f"/proc/{pid}/task")
+    try:
+        tids = os.listdir(task_dir)
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except OSError:
+        return False
+    for tid in tids:
+        if not tid.isdecimal():
+            continue
+        try:
+            line = Path(f"/proc/{pid}/task/{tid}/stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return False
+        tail = line.rsplit(")", 1)[-1].strip()
+        state = tail[0] if tail else "?"
+        if state not in ("Z", "X"):
+            return False
+    return True
+
+
 def _retry_proc_fd_access(pid: int, operation: Callable[[], Any]) -> Any | None:
-    """短暫 EACCES 時重試；確認行程已消失或成為 zombie 後視為無 fd。"""
+    """短暫 EACCES 時重試；僅在行程消失或所有執行緒皆終止時視為無 fd。"""
     for attempt in range(PROC_FD_PERMISSION_RETRIES):
         try:
             return operation()
@@ -819,8 +844,14 @@ def _retry_proc_fd_access(pid: int, operation: Callable[[], Any]) -> Any | None:
                 state = _proc_pid_state(pid)
             except OSError:
                 state = "?"
-            if state in (None, "Z", "X"):
+            if state is None:
                 return None
+            if state in ("Z", "X"):
+                try:
+                    if _proc_pid_all_threads_terminal(pid):
+                        return None
+                except OSError:
+                    pass
             if attempt + 1 == PROC_FD_PERMISSION_RETRIES:
                 raise
             time.sleep(PROC_FD_PERMISSION_RETRY_S)

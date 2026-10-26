@@ -107,8 +107,9 @@ def test_discover_all_requires_isolated_pid_namespace(monkeypatch) -> None:
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_start_python_daemon_uses_short_socket_path(tmp_path: Path, monkeypatch) -> None:
-    """深 checkout 下的 Python daemon socket 必須使用短暫存路徑。"""
+    """深 checkout 下的 Python daemon socket 使用可攜且可安全清理的短暫存路徑。"""
     from types import SimpleNamespace
+    import tempfile
 
     bb = _bb_l15()
     monkeypatch.setattr(bb, "ROOT", tmp_path / ("long-checkout-" * 12))
@@ -125,15 +126,28 @@ def test_start_python_daemon_uses_short_socket_path(tmp_path: Path, monkeypatch)
 
     monkeypatch.setitem(__import__("sys").modules, "bb_daemon", SimpleNamespace(PyDaemon=FakeDaemon))
     monkeypatch.setattr(bb, "wait_session", lambda *_args, **_kwargs: {})
+    real_tempfile = bb.tempfile
+
+    class PortableTempFactory:
+        @staticmethod
+        def mkdtemp(*, prefix, dir=None):
+            assert dir is None, "temp directory selection must not hard-code a POSIX path"
+            return real_tempfile.mkdtemp(prefix=prefix, dir=dir)
+
+    monkeypatch.setattr(bb, "tempfile", PortableTempFactory)
     profile_dir = tmp_path / "profiles"
-    daemon = bb.start_python_daemon({"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, profile_dir)
+    env = {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}
+    daemon = bb.start_python_daemon(env, profile_dir)
     socket_path = Path(captured["socket"])
     try:
-        assert socket_path.parent == Path("/tmp") or socket_path.parent.as_posix().startswith("/tmp/sw-")
-        assert len(os.fsencode(socket_path)) < 108
+        assert socket_path.parent == Path(env["SW_G5_TEMP_RUN_DIR"])
+        assert socket_path.parent.parent == Path(tempfile.gettempdir())
+        assert socket_path.parent.name.startswith("sw-")
+        if os.name != "nt":
+            assert len(os.fsencode(socket_path)) < 108
         assert daemon is not None
     finally:
-        bb._cleanup_short_run_dir({"SW_G5_TEMP_RUN_DIR": str(socket_path.parent)})
+        bb._cleanup_short_run_dir(env)
 
 
 @pytest.mark.core_portable
@@ -269,6 +283,56 @@ def _spawn_holder(slave_path: str) -> subprocess.Popen:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_observer_does_not_ignore_zombie_leader_with_live_thread() -> None:
+    """主執行緒退出時若兄弟執行緒仍存活，fd 權限錯誤不可被當成無 holder。"""
+    bb = _bb_l15()
+    master, slave_path = _open_pty()
+    code = (
+        "import ctypes, os, sys, threading, time; "
+        "fd = os.open(sys.argv[1], os.O_RDWR); "
+        "threading.Thread(target=lambda: (print('thread-ready', flush=True), time.sleep(120))).start(); "
+        "time.sleep(0.05); ctypes.CDLL(None).pthread_exit(None)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, slave_path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "thread-ready"
+        deadline = time.monotonic() + 5.0
+        task_dir = Path(f"/proc/{child.pid}/task")
+        while time.monotonic() < deadline:
+            stat_path = Path(f"/proc/{child.pid}/stat")
+            if stat_path.exists():
+                tail = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[-1].strip()
+                tids = [path.name for path in task_dir.iterdir()] if task_dir.exists() else []
+                if tail and tail[0] == "Z" and any(tid != str(child.pid) for tid in tids):
+                    break
+            time.sleep(0.005)
+        else:
+            pytest.fail("未形成 zombie leader 與存活兄弟執行緒的行程狀態")
+
+        with pytest.raises(PermissionError):
+            bb.observe_holders(os.stat(slave_path), pids=[child.pid])
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5.0)
+        if child.stdout is not None:
+            child.stdout.close()
+        if child.stderr is not None:
+            child.stderr.close()
+        os.close(master)
 
 
 def _stop(proc: subprocess.Popen | None) -> None:
