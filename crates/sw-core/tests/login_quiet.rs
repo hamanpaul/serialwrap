@@ -27,7 +27,8 @@ use sw_core::session_auth::{
     credentials_declared_but_unresolved, parse_env_file, resolve_session_auth, AuthResolution,
     SessionAuth,
 };
-use sw_core::session_core::SessionRequest;
+use sw_core::mailbox::ControlEvent;
+use sw_core::session_core::{Effect, SessionRequest, SessionState};
 use sw_core::tx_writer::TxClass;
 use sw_core::Mono;
 use sw_pal::fakes::clock::FakeClock;
@@ -943,4 +944,45 @@ fn produced_constants_are_frozen() {
     );
     assert_eq!(LOGIN_FSM_DETAIL_ERRORS.len(), 12);
     assert!(detect_boot_banner("xx U-Boot 2024"));
+}
+
+// ---------------------------------------------------------------------------
+// P7 擴充（08 Task 4，parity-amendments-2026-10-26 #49，B:B-33）——紅燈先行：
+// 行為由 P7 Task 4／Task 7 實作；在此之前失敗應為 `not implemented: …`（執行期 panic）。
+// ---------------------------------------------------------------------------
+
+const CONSOLE_UNLOCK_PROFILE: &str = "profiles:\n  c:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    console_unlock_env: SW_T_UNLOCK\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: c, act_no: 1, alias: c+1, device_by_id: /s/by-id/usb-A}\n";
+
+/// console unlock profile 的 quiet arm 不使在途 unlock run 失效：Python `_update_boot_quiet_locked`
+/// 不遞增 `login_gen`（`session_manager.py:597-598`），run 結束仍套用結果。Rust 端 arm 會遞增 core 的
+/// `fsm_gen`（08 Task 4 Step 3），故 `active_login` 必須以 run 自身的 `(epoch, fsm_gen)` 比對。
+#[test]
+fn console_unlock_arm_mid_login_finish_applied() {
+    let mut h = CoreHarness::new(CONSOLE_UNLOCK_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    let (epoch, run_gen) = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("console unlock profile 開 bridge 後應啟動 login run");
+
+    // 在途 unlock run 期間收到 boot banner → quiet arm（console unlock 只遞增 fsm_gen、不推 floor、不擋 probe）。
+    h.rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+    assert_eq!(h.public()["boot_quiet_remaining_s"], PyValue::Float(180.0));
+    assert!(h.core.generations().fsm_gen > run_gen, "arm 應遞增 core fsm_gen（run 的世代已非現值）");
+
+    // run 以自身世代回報 Ready → 必須套用（與 Python 不遞增 login_gen 同結果）。
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready, "在途 unlock run 的 LoginFinished 不得因 quiet arm 被丟棄");
 }
