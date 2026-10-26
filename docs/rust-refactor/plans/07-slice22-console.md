@@ -599,7 +599,7 @@ Expected: `check_p6_prereqs.py` exit 0（否則停止並回報上游缺陷，不
 - [ ] **Step 4：執行並確認 PASS**
 
 Run: `scripts/rust/cargo_nonzero.sh -p sw-proto --test constants_slice22 && cargo check --workspace --all-targets --features test-fakes && cargo check --workspace --target x86_64-pc-windows-gnu && scripts/rust/cargo_nonzero.sh --workspace --features test-fakes && python3 scripts/rust/check_cfg_boundary.py`
-Expected: PASS；兩個 target 皆可編譯；06 既有測試全部仍綠燈（骨架只加變體、不改既有行為）；cfg 邊界檢查 exit 0。
+Expected: PASS；兩個 target 皆可編譯；06 既有測試**與 P5 基線逐 test binary 結果相同**（骨架只加變體、不改既有行為；P5 基線本身含 `s21_todo!` 紅燈，故不以「全部綠燈」判定）：`python3 scripts/rust/compare_test_baseline.py run --dir <p5 worktree> --out base.log`、同指令對 p6 產生 `head.log`，再 `python3 scripts/rust/compare_test_baseline.py compare base.log head.log` exit 0（parity-amendments-2026-10-26 #179）；cfg 邊界檢查 exit 0。
 
 - [ ] **Step 5：commit**
 
