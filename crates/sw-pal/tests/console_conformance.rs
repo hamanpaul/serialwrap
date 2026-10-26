@@ -61,6 +61,10 @@ fn wait_for(
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__pty_slave_is_raw_and_master_nonblocking() {
+    // D-01：console PTY 不建 symlink。掃 PAL 實際可能落 symlink 的目錄（run dir／XDG runtime／temp／/dev／cwd），
+    // 比對 create_pty 前後的快照，只看「新增且指向 slave_path」者（不受他人既有 symlink 干擾）。
+    let dirs = sw_pal::testutil::d01_scan_dirs();
+    let before = sw_pal::testutil::symlink_snapshot(&dirs);
     let p = sw_pal::native();
     let pair = p.console.create_pty().unwrap();
     assert!(sw_pal::testutil::is_dev_pts_path(&pair.slave_path));
@@ -72,11 +76,36 @@ fn cap_posix_pty__pty_slave_is_raw_and_master_nonblocking() {
     );
     assert_eq!((t.vmin, t.vtime), (1, 0));
     assert!(sw_pal::testutil::master_is_nonblocking(&pair));
-    let run_dir = tempfile_dir("sw-p6-run"); // 測試自建暫存目錄，不依賴外部 env
-    assert!(sw_pal::testutil::no_symlink_points_to(
-        &pair.slave_path,
-        &[run_dir.as_path()]
-    )); // D-01
+    let added = sw_pal::testutil::new_symlinks_to(&pair.slave_path, &dirs, &before);
+    assert!(
+        added.is_empty(),
+        "D-01：PAL 不得為 console 建 symlink：{added:?}"
+    );
+}
+
+/// L4：D-01 掃描必須在違規時紅——在掃描目錄（temp）植入一條指向目標的 symlink，偵測須報出；
+/// 舊斷言只掃測試自建的空目錄，對同一違規恆真。
+#[cfg(unix)]
+#[test]
+fn d01_symlink_scan_detects_planted_violation() {
+    let dirs = sw_pal::testutil::d01_scan_dirs();
+    let tmp = std::env::temp_dir();
+    assert!(
+        dirs.iter().any(|d| d == &tmp),
+        "D-01 掃描須涵蓋 temp 目錄：{dirs:?}"
+    );
+    let work = tempfile_dir("sw-p6-d01");
+    let target = work.join("fake-pts");
+    std::fs::write(&target, b"").unwrap();
+    let target = target.to_string_lossy().into_owned();
+    let before = sw_pal::testutil::symlink_snapshot(&dirs);
+    assert!(sw_pal::testutil::new_symlinks_to(&target, &dirs, &before).is_empty());
+    let planted = tmp.join(format!("sw-p6-d01-link-{}", std::process::id()));
+    let _ = std::fs::remove_file(&planted);
+    std::os::unix::fs::symlink(&target, &planted).unwrap();
+    let added = sw_pal::testutil::new_symlinks_to(&target, &dirs, &before);
+    let _ = std::fs::remove_file(&planted);
+    assert_eq!(added, vec![planted], "植入的 console symlink 必須被偵測到");
 }
 
 #[test]

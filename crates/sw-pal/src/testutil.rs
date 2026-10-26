@@ -1,7 +1,7 @@
 //! console 測試工具（P6 Task 8；feature `test-fakes`）。
 //! 平台 cfg 只在 sw-pal 內，讓 sw-core／sw-daemon 測試不需自行分支。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg_attr(not(unix), allow(unused_imports))]
@@ -99,6 +99,81 @@ pub fn no_symlink_points_to(target: &str, dirs: &[&Path]) -> bool {
     }
     let target = Path::new(target);
     dirs.iter().all(|d| walk(d, target))
+}
+
+/// D-01 掃描的目錄：PAL 實際可能落 console symlink 之處（`SERIALWRAP_RUN_DIR`、`XDG_RUNTIME_DIR`、
+/// 系統 temp、cwd、unix 的 `/dev`）。與 `symlink_snapshot`／`new_symlinks_to` 搭配做前後差分。
+pub fn d01_scan_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for key in ["SERIALWRAP_RUN_DIR", "XDG_RUNTIME_DIR"] {
+        if let Some(v) = std::env::var_os(key).filter(|v| !v.is_empty()) {
+            dirs.push(PathBuf::from(v));
+        }
+    }
+    dirs.push(std::env::temp_dir());
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if cfg!(unix) {
+        dirs.push(PathBuf::from("/dev"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs
+}
+
+/// D-01 掃描深度（目錄本身為 1）；temp／`/dev` 可能很大，只看 PAL 可能直接落檔的淺層。
+const D01_SCAN_DEPTH: usize = 3;
+
+fn walk_symlinks(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, PathBuf)>) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            if let Ok(dest) = std::fs::read_link(&path) {
+                let dest = if dest.is_absolute() { dest } else { dir.join(dest) };
+                let dest = std::fs::canonicalize(&dest).unwrap_or(dest);
+                out.push((path, dest));
+            }
+        } else if meta.is_dir() {
+            walk_symlinks(&path, depth - 1, out);
+        }
+    }
+}
+
+/// `dirs` 內（淺層遞迴、不跟隨目錄 symlink）所有 symlink 的 `(link, 解析後目的地)`。
+pub fn symlink_snapshot(dirs: &[PathBuf]) -> std::collections::HashSet<(PathBuf, PathBuf)> {
+    let mut out = Vec::new();
+    for d in dirs {
+        walk_symlinks(d, D01_SCAN_DEPTH, &mut out);
+    }
+    out.into_iter().collect()
+}
+
+/// 相對 `before` 快照新增、且指向 `target` 的 symlink（排序後回傳）。
+pub fn new_symlinks_to(
+    target: &str,
+    dirs: &[PathBuf],
+    before: &std::collections::HashSet<(PathBuf, PathBuf)>,
+) -> Vec<PathBuf> {
+    let target = Path::new(target);
+    let canon = std::fs::canonicalize(target).ok();
+    let mut added: Vec<PathBuf> = symlink_snapshot(dirs)
+        .into_iter()
+        .filter(|entry| !before.contains(entry))
+        .filter(|(_, dest)| dest == target || canon.as_deref() == Some(dest.as_path()))
+        .map(|(link, _)| link)
+        .collect();
+    added.sort();
+    added
 }
 
 /// `^/dev/pts/\d+$` 手寫判斷（不引入 regex）。
