@@ -38,7 +38,7 @@
 1. **daemon 在 release 的 `state.json` 提交完成後、回覆送出前被 kill -9**：重啟後該 session 必須仍是 `RELEASED`、不自動 attach、不開 tty；提交前被 kill 則依最後有效 `state.json` 恢復，該 session 不是 `RELEASED`、release 從未被確認（§6.2 交接）。測試加在 Task 19（`kill_between_commit_and_reply_keeps_released_after_restart`、`kill_before_commit_restores_previous_state`；hook 經 `DaemonHooks.{before_state_commit, after_state_commit}` 傳入 `StateStore::spawn_with_hooks`）。
 2. **同一實體 tty 同時出現在 by-id 與 by-path，或 by-id symlink 在 session 已 attach 時改指到另一個 tty**：只能有一個 session、一個 handle；改指時先完整 drain 舊 handle（收到回條）才 `open_exclusive` 新路徑，drain 收尾時 session `last_error=DEVICE_REBOUND_REQUIRED`。測試加在 Task 5（realpath 去重）與 Task 16（`rebind_drains_before_reopen`，含 `last_error` 斷言）。
 3. **WAL 目錄在 daemon 啟動時唯讀或磁碟滿**：daemon 仍啟動、`health.status.wal.healthy=false`、`unhealthy_reason` 非 null、`write_failures` 遞增、**所有** session 的登入 probe 等自動 TX 停止（全域 `WalHealthFanout` 同步每個 fence 的 `wal_unhealthy`，新建 session 繼承目前值），agent 命令 TX 照常寫出且 WAL 回傳 `loss_flag:true`，不得在記憶體堆積待寫紀錄。磁碟滿以「已開啟 handle 上連續兩次 append（含一次重試）失敗」判定，下一次成功即恢復。測試加在 Task 7（`open_failure_at_startup_marks_unhealthy`、`enospc_on_open_handle_trips_all_fences`、`new_session_inherits_wal_unhealthy`）、Task 13（`disk_full_blocks_login_probe_but_not_agent_cmd`）與 Task 19（`wal_dir_readonly_at_start_blocks_login_probe`、`wal_fault_after_ready_splits_agent_and_auto_tx`）。
-4. **系統時間（wall clock）在執行中倒退或跳前一小時**：Quiet window、Ready Reconfirm deadline、Lease 到期、Drain 3000 ms、命令逾時、WAL identity 檢查節流全部只依 monotonic；只有 `wall_ts`／`*_at` 字串反映新 wall time，history 淘汰仍照 Python 以 `done_at` 字串排序（KEEP）。測試加在 Task 11（`wall_clock_jump_does_not_move_deadlines`；`wall_clock_jump_param` 參數化 wall ±1 h，分別斷言 quiet、reconfirm、lease、drain、command timeout 五個期限）與 Task 7（`identity_throttle_ignores_wall_jump`）。
+4. **系統時間（wall clock）在執行中倒退或跳前一小時**：Quiet window、Ready Reconfirm deadline、Lease 到期、Drain 3000 ms、命令逾時、WAL identity 檢查節流全部只依 monotonic；只有 `wall_ts`／`*_at` 字串反映新 wall time，history 淘汰仍照 Python 以 `done_at` 字串排序（KEEP）。測試加在 Task 11（`wall_clock_jump_does_not_move_deadlines`；`wall_clock_jump_param` 參數化 wall ±1 h，分別斷言 quiet、reconfirm、lease、drain、RX wait deadline 五種期限；OpRunner 端到端 timeout 留待 Task 14）與 Task 7（`identity_throttle_ignores_wall_jump`）。
 5. **同一 RPC 連線 pipelining `session.recover --force`（最長約 10 s）後緊接 `daemon.stop`，且 client 在中途斷線**：handler 不因斷線取消；回應依請求順序寫出；`daemon.stop` 觸發的關機要等前一個 handler 收斂後依 SC-11 drain，不得在 handler 持有 session 時關閉 WAL；閒置連線不得阻擋 `RpcServer::stop`。測試加在 Task 17（`pipelined_stop_after_long_call`、`idle_connection_does_not_block_stop`、`half_line_and_unread_response_do_not_block_stop`）與 Task 19（`daemon_stop_during_force_recover_with_client_gone`，以真 daemon 驗證 WAL 只在 handler 結束後關閉且 exit 0 於上限內）。
 6. **授權通過後、OS 提交前發生 Quiet／drain／lease 換手（R0-F1，規格 §5.2.2）**：授權重驗與 OS 提交必須在同一 Fence 臨界區（`FenceSubmitGate`，arch §4.2／§5.4 第 3 點），不得「鎖內驗證、放鎖、再 write」；鎖只跨非阻塞提交（POSIX 單次 `write(2)`、Windows `WriteFile` 發出），不跨 POLLOUT／`GetOverlappedResult` 等待。驗收：Task 9 `authorized_then_quiet_before_os_submit_is_zero_tx`、`authorized_then_drain_freeze_before_os_submit_is_zero_tx`、`authorized_then_lease_owner_gen_bump_before_os_submit_is_zero_tx`、`quiet_during_os_submit_waits_for_submit_and_counts_committed`、`quiet_between_partial_submits_stops_tail`、`os_submit_always_inside_fence_critical_section`。
 7. **Passthrough 安靜升 READY 與命令路徑（SC-35，OD-14 #2）**：安靜視窗只以 monotonic 計、任何同 epoch RX 重新起算、TX 不重算；drain／flash／RELEASED 期間不得升 READY；升 READY 與命令執行全程不得送任何 probe、login、CTRL_C／CTRL_D；`prompt_regex` 可匹配空串（`.*`）時不得把它當完成條件（否則命令會在零輸出時「成功」）；passthrough 逾時不得轉 ATTACHED 或 flush 佇列。
@@ -2647,7 +2647,7 @@ git commit -m "feat(sw-core): UART reader 先落 WAL 再分送與絕對偏移 RX
 ## Task 11：sw-core SessionCore／Mailbox／Generations／Actor（§5.3 的 2.1 列）
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-session-actor.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust SessionActor：sans-IO 狀態機、control 優先且不越過依賴 RX 的有界 mailbox、conn_epoch／fsm_gen／owner_gen 世代隔離，RECOVERING／FLASHING 下的提交改回 SESSION_RECOVERING／FLASHING_BUSY（SC-01、SC-02）；passthrough 不登入、ATTACHED 連續 30 s 無 RX 由 tick 轉 READY，未滿時 submit 回 SESSION_NOT_READY＋passthrough_ready_in_s（SC-35）。」）
+**Changelog fragment:** `changelog.d/rust-s21-session-actor.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust SessionActor：sans-IO 狀態機、control 優先且不越過依賴 RX 的有界 mailbox、conn_epoch／fsm_gen／owner_gen 世代隔離，RECOVERING／FLASHING 下的提交改回 SESSION_RECOVERING／FLASHING_BUSY（SC-01、SC-02）；passthrough 不登入、ATTACHED 連續 30 s 無 RX 由 tick 轉 READY，未滿時 submit 回 SESSION_NOT_READY＋passthrough_ready_in_s（SC-35）。帳密 env 檔解析對齊 Python 的 export／註解／引號規則，empty value 不再誤判為已解析；AccessDenied 記為 ATTACH_FAILED:PermissionError。」）
 **BLOCKED-OWNER：** 無（延遲上限的外部量測在 Task 21）。
 
 **Files:**
@@ -2686,10 +2686,11 @@ pub enum ControlEvent {
 }
 pub enum TimerEvent { BootQuietExpired { epoch: u64, fsm_gen: u64 }, LeaseExpiry { lease_id: String, deadline: Mono }, DrainTimeout { epoch: u64, stop_id: StopId } }
 pub enum DetachReason { Removed, Rebound }                                  // → DEVICE_REMOVED／DEVICE_REBOUND_REQUIRED
-pub struct Mailbox { /* control: bounded(256), data: bounded(1024), stash: ArrayVec<ControlEvent, 16>（mailbox_stash_max） */ }
+pub struct Mailbox { /* control／safety: 各 bounded(256), data: bounded(1024), stash: ArrayVec<ControlEvent, 16>（mailbox_stash_max） */ }
 impl Mailbox {
     pub fn new(control_cap: usize, data_cap: usize) -> Mailbox;
     pub fn control_sender(&self) -> crossbeam_channel::Sender<ControlEvent>;
+    pub fn safety_sender(&self) -> crossbeam_channel::Sender<ControlEvent>;
     pub fn data_sender(&self) -> crossbeam_channel::Sender<DataEvent>;
     /// deadline 以 Mono 表示；實作以 recv_timeout(min(deadline - clock.mono_ns(), 50 ms)) 迴圈並在每次醒來重讀 clock，
     /// 另 select FakeClock::subscribe（test-fakes）使 advance 立即喚醒。current_epoch 用於丟棄舊 epoch 依賴。
@@ -2714,6 +2715,7 @@ pub enum SessionRequest {
 pub enum Effect {
     Reply(Reply, Result<PyDict, PyErr>),
     OpenBridge { dev: DevicePath, cfg: SerialConfig, precheck_holders: bool },
+    AdoptBridge { epoch: u64, worker: IoWorker, real_path: String },
     BeginDrain { stop_id: StopId, epoch: u64 },
     StartLogin { epoch: u64, fsm_gen: u64, plan: LoginPlan },
     StartOp { grant: OpGrant, spec: OpSpec },
@@ -2742,9 +2744,9 @@ impl SessionCore {
 }
 
 // actor.rs
-pub struct ActorHandle { pub control: crossbeam_channel::Sender<ControlEvent>, pub data: crossbeam_channel::Sender<DataEvent>, pub join: std::thread::JoinHandle<()> }
-impl ActorHandle { pub fn request(&self, req: SessionRequest, timeout: Duration) -> Result<PyDict, PyErr>; }
-pub trait EffectExecutor: Send { fn execute(&mut self, e: Effect, tx: &crossbeam_channel::Sender<ControlEvent>); }
+pub struct ActorHandle { pub control: crossbeam_channel::Sender<ControlEvent>, pub safety: crossbeam_channel::Sender<ControlEvent>, pub data: crossbeam_channel::Sender<DataEvent>, pub join: std::thread::JoinHandle<()> }
+impl ActorHandle { pub fn request(&self, req: SessionRequest, timeout: Duration) -> Result<PyDict, PyErr>; } // Release request 走 safety sender
+pub trait EffectExecutor: Send { fn execute(&mut self, e: Effect, tx: &crossbeam_channel::Sender<ControlEvent>, safety: &crossbeam_channel::Sender<ControlEvent>); }
 pub fn spawn_actor(core: SessionCore, mailbox: Mailbox, exec: Box<dyn EffectExecutor>, clock: Arc<dyn Clock>) -> ActorHandle;   // thread "serialwrap-session-<COM>"，1 s Tick
 ```
 
@@ -2859,10 +2861,29 @@ fn wall_clock_jump_does_not_move_deadlines() {            // Review Focus 4
 | `public_dict_key_order_with_sc04_fields` | READY 時 `public()` | key 依 02 §6.1 順序，`capture` 之後依序為 `drain_stalled`（false）、`drain_timeout_epoch`（null）；POSIX ctx 不含 `console_endpoint` |
 | `public_console_endpoint_null_when_ctx_requests` | `PublicCtx{console_endpoint: Some(None)}` | 末尾出現 `"console_endpoint":null`（Windows 2.1 範圍清單） |
 | `activity_classification_thresholds` | `max(last_rx, last_tx)` 距今 4.9 s／5.0 s／59.9 s／60 s；只有 TX 沒有 RX（以 TX 時間計）；RX 與 TX 都從未發生；非 READY/ATTACHED | `active`／`idle-healthy`／`idle-healthy`／`quiet-suspicious`／依 TX 時間分類／`newly-attached`／`offline`（`SessionRuntime.classify_activity`：idle 取 `max(last_rx_mono, last_tx_mono)`，兩者皆 0 才 `newly-attached`） |
-| `last_error_change_clears_detail` | 設 detail 後改 last_error | `last_error_detail` 變 null |
+| `last_error_change_clears_detail` | 先建立非空 `last_error_detail`，再改變 `last_error` | 舊 detail 被清除；另由 `empty_env_file_values_remain_unresolved` 驗證 `CREDENTIALS_UNRESOLVED` 的 detail 為 null（contracts/session_last_errors.yaml） |
 | `tick_expires_reconfirm_without_tx` | READY＋pending，advance 301 s | `ready_reconfirm_failed:true`、`ready_reconfirm_pending:false`，Effects 不含 `StartOp`／`StartLogin` |
-| `wall_clock_jump_param`（Review Focus 4；參數化 wall `-3600 s`／`+3600 s`） | 分別建立 quiet、reconfirm、lease（20 s）、drain（3000 ms）、命令逾時（10 s）五種期限後跳 wall | 每種期限的剩餘值不變；只推進 mono 到期限前 1 ms 不觸發、到期限後觸發；`*_at` 字串反映新 wall |
+| `wall_clock_jump_param`（Review Focus 4；參數化 wall `-3600 s`／`+3600 s`） | 分別建立 quiet、reconfirm、lease（20 s）、drain（3000 ms）、命令 grant 的 RX wait（10 s）期限後跳 wall | reconfirm deadline 從首次 banner arm 起算 300 s（重臂不延長）；每種期限的剩餘值不因 wall 跳動而變；只推進 mono 到各期限前 1 ms 不觸發、到期限時觸發；RX wait 使用 command grant 的 timeout。T14 `OpRunner` 尚未實作，故此處不宣稱命令端到端完成驗證；`*_at` 字串反映新 wall |
 | `actor_event_panic_isolated` | 注入會 panic 的 `Request` 處理 | 該請求收 `Err(PyErr("internal error: <panic msg>"))`（framing 轉 `EXCEPTION`）、stderr WARNING `session actor 事件處理例外（com=COM0），略過此事件`、actor 續行；後續 `GetState` 正常 |
+| `release_while_bridge_open_is_pending_waits_for_drain_receipt` | ATTACHING 時 Release，之後 `BridgeOpened(ok)` | 保持 RECOVERING，交出 worker 並立刻 drain；只在相符 receipt 後回覆並進 RELEASED |
+| `interactive_open_rejects_foreground_and_existing_lease` | READY 前景忙或已有 lease 時再次 open | 前景忙回 `SESSION_BUSY`＋selector；已有 lease 回 `SESSION_INTERACTIVE_BUSY`＋目前 interactive id；不覆蓋 lease、不啟第二個 op |
+| `boot_banner_invalidates_old_fsm_and_owner_generations` | ATTACHING 收到 boot banner，再送舊世代登入結果／permit | `fsm_gen`、`owner_gen` 各遞增；舊登入結果無效果；舊 LeaseOwner permit 為 `OwnerMismatch` |
+| `reconfirm_deadline_is_300s_from_first_banner_and_does_not_extend` | 首個 banner 後 100 s 再收 banner，推進到首個 banner +300 s | reconfirm deadline 不延長，期限到達即 failed |
+| `queued_commands_do_not_increase_outstanding_count` | 前景一筆執行中且另有兩筆排隊 | `outstanding_commands == 1` |
+| `aborted_op_is_settled_only_from_worker_receipt` | drain 中先到 aborted op 的 `OpFinished`，再到含部分 TX 的 receipt | `OpFinished` 不結案也不 `SettleTx`；receipt 依帳本回 `COMMAND_ABORTED_IN_FLIGHT` 並寫 META |
+| `credentials_env_file_accepts_export_comments_and_quotes` | env_file 含註解、`export`、單／雙引號的 user/pass 值 | 解析結果與 Python `parse_env_file` 一致，不標記 `CREDENTIALS_UNRESOLVED` |
+| `empty_env_file_values_remain_unresolved` | env_file 的 user/pass 值為空 | 回報 `CREDENTIALS_UNRESOLVED` 且 `last_error_detail:null` |
+| `access_denied_maps_to_permission_error` | bridge open 回 `OpenFailure::AccessDenied` | `last_error == "ATTACH_FAILED:PermissionError"` |
+| `credentials_warning_uses_python_missing_path_placeholder` | env_file 未設定且宣告帳密 key 缺失 | WARNING 的 `env_file` 顯示 `-` |
+| `env_file_without_login_requirement_does_not_block_probe` | 宣告 env_file，但 `ready_probe: ''` 令 profile 不具 command capability | 不解析 env_file、不產生 `CREDENTIALS_UNRESOLVED`，也不啟動 login/probe；符合 Python command-capability gate |
+| `console_unlock_env_is_a_credential_source` | 只宣告 console unlock key；分別測缺值與 env_file 有值 | 缺值阻擋登入；有效解鎖值不要求 user/pass 並允許登入 |
+| `credential_gate_follows_command_capability_and_boot_quiet` | command-incapable profile 與 attach 前仍有效的 boot-quiet deadline，兩者 env_file 都未解析 | 不因未解析帳密產生 `CREDENTIALS_UNRESOLVED`；quiet case 回 `PROMPT_UNAVAILABLE` 且不啟動 login |
+| `credentials_warning_is_deduplicated_until_manual_recover` | 同 session 自動重掛兩次，再手動 recover 後重掛 | 自動重掛只寫一次 WARNING／WAL META；手動介入後可再寫一次 |
+| `device_removed_during_attach_uses_python_last_error` | ATTACHING 時收到 Removed | `last_error == DEVICE_REMOVED_DURING_ATTACH` |
+| `release_during_nonrelease_drain_returns_session_recovering` | Removed drain 進行中送 Release，再送原 receipt | Release 立即回 `SESSION_RECOVERING` 且帶 session；receipt 不得令 session 轉 RELEASED |
+| `release_while_flashing_includes_selector` | FLASHING 時送 Release | 回 `FLASHING_BUSY` 並附 `selector` |
+| `interactive_open_allows_non_agent_owner` | READY 時以 `human:operator` 作為 owner 開 lease | 回成功及非空 `interactive_id`；owner 不限 `agent` 前綴 |
+| `actor_repeated_panics_begin_io_error_drain` | 同一事件型別連續注入三次 panic | 每次 request 回內部錯誤；第三次後 actor 仍回應並進 `RECOVERING` |
 
 `mailbox.rs` 測試：
 
@@ -2874,10 +2895,15 @@ fn wall_clock_jump_does_not_move_deadlines() {            // Review Focus 4
 | `stale_epoch_dependency_released_immediately` | stash 項目 `epoch` 已非 `current_epoch` → 立即回該 control（舊 epoch 的 data 不再等待） |
 | `dependency_released_on_worker_stopped` | 依賴的 rx_seq 永遠不會到（reader 已結束）時收到 `WorkerStopped` → stash 全部依序釋放在 receipt 之前 |
 | `stash_bounded_16` | 第 17 個需 stash 的 control → 送端阻塞（`mailbox_stash_max: block_sender`），不丟棄 |
-| `fake_clock_advance_wakes_timer_promptly` | `spawn_actor`＋FakeClock：排 `DrainTimeout` 於 +3000 ms；`advance(3001 ms)` 後 200 ms（實時）內處理（不等下一個 1 s Tick） |
-| `control_lane_bounded_256` | 第 257 個 `try_send` 回 `Full` |
+| `fake_clock_advance_wakes_timer_promptly` | `spawn_actor`＋FakeClock：排 `DrainTimeout` 於 +3000 ms；`advance(3001 ms)` 後 200 ms（實時）內處理（不等下一個 1 s Tick） | `GetState` 回覆的 `session.drain_stalled == true` |
+| `fake_clock_advance_observes_drain_timeout_in_session` | actor 收到 DeviceDetached 後只推進 FakeClock 3001 ms | 200 ms 內 `GetState.session.drain_stalled == true` |
+| `control_lane_bounded_256` | 一般 control 與獨立 safety lane 各送 256 筆，再送第 257 筆 | 兩 lane 第 257 個 `try_send` 都回 `Full` |
 | `data_lane_bounded_1024` | 第 1025 個 `try_send` 回 `Full` |
 | `request_timeout_returns_internal_timeout` | executor 永不回覆的請求 → `request(_, 100ms)` 回 `Err(PyErr)`，message `"internal timeout"` |
+| `full_dependency_stash_does_not_block_worker_receipt` | 16 stash＋1 pending＋256 deferred 全滿後送同 epoch `WorkerStopped`，沒有後續 RX | 全部 273 筆同 epoch 依賴先釋放，receipt 最後取出 |
+| `full_dependency_stash_does_not_block_independent_release` | 16 stash＋1 pending＋256 deferred 全滿後送 Release | Release 經 safety lane 立即回傳，不等待依賴釋放 |
+| `zero_rx_dependency_is_ready_on_current_epoch` | 現行 epoch 的依賴事件 `after_rx_seq: Some(0)`、watermark 尚未切至該 epoch | 立即回傳 control，不等第一個 RX chunk |
+| `actor_ticks_passthrough_ready_without_followup_event` | actor 進入 passthrough ATTACHED 後只推進 FakeClock 31 s | 無後續 control/data 事件仍由 1 s Tick 轉 READY 並送 `SessionReady` |
 
 - [ ] **Step 2：執行並確認 FAIL**
 
@@ -2894,8 +2920,14 @@ Expected：FAIL，`not implemented: slice21 T11 SessionCore::new`。
   4. `registry.admit(req, queue_registered, uuid4_hex, wall_iso())`；成功 push 進 `queue`，前景空閒則出列（見 Task 14）。
 - Passthrough 安靜升 READY（SC-35，arch §5.12）：`SessionCore` 記 `quiet_since: Option<MonoNs>`；進入 `ATTACHED`（`platform == "passthrough"` 的 `BridgeOpened(ok)` 直接採用 bridge、`LoginPlan::None`、不產生 `StartLogin`／probe TX）時設為 `now`，同 epoch 的每個 `UartRxChunk` 設為 `now`（TX 不更新）。`ControlEvent::Tick` 處理：state `ATTACHED`、`conn_epoch` 有值、`stop.is_none()`、非 RELEASED、非 flash 臨界（Probe／FLASHING）且 `now - quiet_since >= PASSTHROUGH_READY_QUIET_S`（`sw_proto::constants::PASSTHROUGH_READY_QUIET_S = 30.0`）→ 轉 `READY`（`last_error=None`、`queue_registered=true`、`Notify(SessionReady)`，零 TX）。passthrough 的 RX 不觸發 boot banner quiet 與 READY reconfirm；離開 READY 只經 drain 路徑，回條後依一般恢復回 `ATTACHED` 並重新累計。不新增錯誤碼、不新增 WAL META。
 - `public()`：依 02 §6.1 逐欄產生；`boot_quiet_remaining_s` 等用 `py_round(x, 1)`；`next_reprobe_at` 輸出 monotonic 秒原值（2.1 恆 null，因無 reprobe）；`console_count`／`vtty` 由 `PublicCtx` 提供（哨兵存在時 1 與 `/dev/pts/N`）。
-- Mailbox：`recv_next` 先看 stash（`epoch != current_epoch` 或 `(epoch, after_rx_seq) <= processed` 者依序可出）→ `select_biased!{ recv(control) → 帶 after_rx_seq 且尚未滿足者入 stash（滿 16 則阻塞送端），其餘 control 立即回傳；recv(data) }`；stash 非空時仍持續 select 兩條 lane，獨立 control（release／cancel／stop／lease expiry／receipt）不受依賴阻擋。`WorkerStopped` 到達時先釋放 stash 中同 epoch 的全部項目再回 receipt。
-- actor 迴圈：`recv_next(deadline=下一個 timer 或 1 s Tick（Mono）)` → `catch_unwind(core.on_event(item, clock.mono_ns()))`（panic → 對該事件的 reply 回 `Err(PyErr("internal error: …"))`、WARNING、續行；同一事件型別連續 panic 3 次 → 以 `StopKind::IoError` 進 drain（`last_error` 沿用既有 IoError 規則，不新增任何 `error_code`／`last_error` 值））→ 逐一 `exec.execute(effect)`；`Effect::Reply` 以 `try_send` 送出（reply channel 容量 1，接收端已離開時丟棄）。actor thread 本身結束（不應發生）時 `ActorHandle::request` 回 `Err(PyErr("session actor stopped"))`。
+- Mailbox：一般 control 與 safety control 各為 `control_cap` 有界 lane，data 為 `data_cap`；依賴 RX 的 control 另由 16 項 stash、1 項 pending 與容量等於 control lane 的 deferred queue 有界暫存。`recv_next` 先釋放已滿足／舊 epoch 依賴，再 biased select safety、一般 control、data；Release request 由 `ActorHandle::request` 送 safety lane，worker finisher 以 safety sender 送 `WorkerStopped`。WorkerStopped 進入時先排入 bounded receipt queue；已暫存的同 epoch 依賴全部釋放後才回 receipt。安全 lane 容量等於一般 control lane，不增加 deferred queue 上限。
+- actor 迴圈：`recv_next(deadline=Some(min(下一個 timer, 1 s Tick（Mono）)))`，沒有 timer 時仍以 Tick 為 deadline → `catch_unwind(core.on_event(item, clock.mono_ns()))`（panic → 對該事件的 reply 回 `Err(PyErr("internal error: …"))`、WARNING、續行；同一事件型別連續 panic 3 次 → 以 `StopKind::IoError` 進 drain（`last_error` 沿用既有 IoError 規則，不新增任何 `error_code`／`last_error` 值））→ 逐一 `exec.execute(effect)`。executor 收到 `AdoptBridge` 後依 epoch 持有 worker，`BeginDrain` 取回同 epoch worker；ATTACHING 時先記 pending stop，`BridgeOpened` 成功後交出 worker 並立刻 drain；遲到的成功開啟也必須交給 executor 並 drain，不得 drop worker。`Effect::Reply` 以 `try_send` 送出（reply channel 容量 1，接收端已離開時丟棄）。executor 未回覆但 actor thread 仍在執行時 `ActorHandle::request` 回 `Err(PyErr("internal timeout"))`；thread 已結束才回 `session actor stopped`。
+
+**T11 review addendum：**T10 `RxShared` 與 `spawn_reader` 已依 Task 10 實作；T12 `IoWorker` 收尾仍未實作，`test-fakes` 的 `IoWorker::start` 仍是 no-op seam。`CoreHarness` 註冊的裝置只存在於 `FakeSerialBackend`；T11 的 SessionCore／Mailbox 狀態測試會使用真正的 `RxShared`，但不驗證 reader thread、T12 drain 或真 UART。
+
+**T11 parity disposition（2026-10-26）：**狀態機維持 OD-14 #1 的 Python 回應形狀。核對後修正三個既有測試 oracle，保留 nodeid 與期限／狀態斷言：`CREDENTIALS_UNRESOLVED` 依 `contracts/session_last_errors.yaml` 不附 detail；ready-reconfirm 的 300 s deadline 從首次 banner 起算，不等 boot quiet 結束；`GetState` 的 `drain_stalled` 位於 `session` 子 dict。`SessionCore::public` 接受 `PublicCtx`；目前獨立 actor 的 `GetState` 使用空 context，manager／RPC 整合仍須傳入哨兵的 `console_count`／`vtty`，此欄位整合不屬本 Task。
+
+**T11 雙審 findings disposition（2026-10-26）：**A1／B2 的 command-capability、boot-quiet 順序及 `console_unlock_env` 漏判有效，已修正並補案例；「profile 沒有明寫 `login_regex`」的反例不成立，因 `ProfileTemplate` 會補 Python 相同的預設 login regex，且測試現用 `ready_probe: ''` 驗證 command-capability gate。A2 warning／WAL META per-session 去重與手動 attach／recover reset 有效，已修正。A3 人類 owner 不限 `agent` 前綴有效，已修正。A4 非 Release drain 中應立即回 `SESSION_RECOVERING`、不得留下延遲 release，以及 FLASHING response 的 selector 有效，已修正。A5 attach 期間移除錯誤碼、A6 detail 清除覆蓋、A7 三次同型 panic 轉 IoError drain 均有效，已補回歸。B1 的滿載安全事件阻塞有效；新增與一般 control 同容量的 safety lane、Release／WorkerStopped 路由及完整 273 項依賴 backlog 測試。B3 的期限斷言不足有效；測試現建立 drain 後跳 wall，並以 command grant 的 timeout 實際驅動 `RxShared` 單調等待，在 9.999 s／10 s 前後斷言；OpRunner 仍屬 T14，故未宣稱端到端 command executor 驗證。A8 的「非 T11 Windows nodeid 不得收錄」拒絕：完整 selector collect-only 收到 Linux 1326、Windows 554 個 nodeid；鎖檔與兩平台收集結果一致，沒有既有 nodeid 消失。相對 HEAD 的 47 個 Windows 新增 nodeid（含 `sw-pal`、`sw-daemon`、`arbiter`）均在完整 selector 輸出中，因此是完整 set 新發現，不是 T11 範圍手選；另以 add-only collector 登記每平台新發現的 9 個 nodeid。A9 的三個 `sw-pal` 檔為本地既有排版差異，未改動且不納入本 Task stage。
 
 - [ ] **Step 4：執行並確認 PASS**
 
@@ -2926,6 +2958,7 @@ git commit -m "feat(sw-core): SessionActor 狀態機、世代隔離與有界 mai
 
 **Interfaces:**
 - Consumes：Tasks 7～11；Task 15 `StateDelta`（Task 0 骨架型別；本 Task 起統一為 `StateDelta::Released { sid: String, row: ReleasedRow }`）。
+- T11 所增 `Effect::AdoptBridge { epoch, worker, real_path }` 是成功 open 後 worker 的所有權交接；本 Task 的 executor 必須按 epoch 持有 worker，`BeginDrain` 取回同 epoch worker，並在 handle 關閉後以 receipt 結束其生命週期。
 - Produces：
 
 ```rust
@@ -3098,7 +3131,7 @@ fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Ef
 }
 ```
 
-- executor 的 `BeginDrain`：`worker.begin_stop()` 後 `worker.finish_async(stop_id, control)`；finisher thread（不設逾時）：join writer thread 取得 `(writer, TxLedger)` → join reader thread 取得 `ReaderExit` → WAL 失敗彙整為 `unrecorded`（reader 缺口＋`ledger.unresolved_gaps`＋仍在 `ledger.ops` 的各 op `wal_gaps`；合併計數留在 `ledger.gaps_overflow` 與各 op `wal_gaps_overflow`，隨 receipt 交回，R1-F8）→ `CloseToken::close(reader, writer)` → 送 `WorkerStopped(receipt{ledger, ..})`。`TxWriter` 結束不依賴 Sender 數量（Task 9 `TxWriterStop`）。
+- executor 的 `BeginDrain`：`worker.begin_stop()` 後 `worker.finish_async(stop_id, safety)`；finisher thread（不設逾時）：join writer thread 取得 `(writer, TxLedger)` → join reader thread 取得 `ReaderExit` → WAL 失敗彙整為 `unrecorded`（reader 缺口＋`ledger.unresolved_gaps`＋仍在 `ledger.ops` 的各 op `wal_gaps`；合併計數留在 `ledger.gaps_overflow` 與各 op `wal_gaps_overflow`，隨 receipt 交回，R1-F8）→ `CloseToken::close(reader, writer)` → 送 `WorkerStopped(receipt{ledger, ..})` 到 safety lane。`TxWriter` 結束不依賴 Sender 數量（Task 9 `TxWriterStop`）。
 - `OpFinished` 優先序：`stop` 進行中且 `OpFinished.epoch == stop.epoch` 且 op 為 `stop.aborted_op` → 不呼叫 `registry.complete`（保留 stdout 於 debug log），最終結果只由 receipt 帳本決定；其他 op 照常處理。
 - TX 帳本結算（R1-F8，Task 9 結算／退休協定）：`SessionCore::settle_tx(op_id, fx)` 是唯一產生 `Effect::SettleTx{epoch: conn_epoch, op_id}` 的地方，每個 op 恰呼叫一次，位置是該 op 的終態處理點且在 `registry.complete` 之後——`OpFinished`（非 aborted_op 時）、`LoginFinished`（login run 的 op）、lease close／expiry（`LeaseOwner`／`InteractiveOpenCmd` op）、self-test 的 `OpFinished(SelfTest)`；`stop.aborted_op` 與尚未終態的 op 一律不結算（其證據只隨 receipt 帳本交回）。`conn_epoch` 為 None 時不產生。executor：`SettleTx.epoch` 等於現行 worker epoch 才呼叫 `worker.tx().settle(op_id)`（非阻塞），否則丟棄。`UartIoError{reason:"TX_LEDGER_SATURATED"}` 走既有 IoError drain，另發 `Effect::Warn("session <sid> TX 帳本未結算 op 達 256 上限，以 IoError drain 收斂（R1-F8）")`。後續 Phase 新增 op 種類（07 human TX、08 reprobe／reconfirm、09 transfer／flash）須在各自終態處理點呼叫 `settle_tx`。
 - 收到 receipt：`epoch`／`stop_id` 不符 → 只對帳本中仍未終態的舊 op 命令紀錄套 BC-03，不改狀態；相符且 `handle_closed` → 對 `aborted_op` 依帳本 `registry.complete(cmd, CmdOutcome::Aborted(class))`（`confirmed_bytes ≥ 1`→InFlight、`0` 且非 unknown→NotSubmitted、`unknown`→Unknown），InFlight 另產生 `Effect::WalMeta{cmd_id, meta:{"event":"command_aborted_in_flight","confirmed_tx_bytes":N,"tx_outcome":"complete"|"partial"}}`（`complete`＝確認 bytes 等於 payload 長度；P1 T08）→ `conn_epoch=None`、`queue_registered=false`、`Notify(SessionDetached)` → 依 kind（`post_kind` 只在 kind 非 Release 時覆寫裝置存在判斷）：Release → `Persist{delta: StateDelta::Released{sid, row: ReleasedRow{by_id, released_by, released_at, reason}}}`，等 `StateCommitted` 成功才 `RELEASED` 並回覆所有 waiters；失敗 → 狀態仍設 `RELEASED`、waiters 收 `Err(PyErr("state.json commit failed: …"))`；Recover／IoError → 裝置在 `ATTACHING`＋`OpenBridge`，否則 `DETACHED`；Removed → `DETACHED`、`last_error:"DEVICE_REMOVED"`；Rebound → `last_error:"DEVICE_REBOUND_REQUIRED"` 後 `OpenBridge`（Task 16）；Shutdown → 回覆 waiter。`handle_closed:false` → `stalled=true`、維持 RECOVERING、Release waiters 收 `DRAIN_STALLED` 形狀（下列逾時同形；OD-14 #4）。收尾時 `drain_stalled=false`，`drain_timeout_epoch` 保留最後一次逾時值（P1 T08 凍結）。

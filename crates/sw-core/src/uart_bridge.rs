@@ -3,7 +3,7 @@
 //! T10 提供 reader thread、RX 視窗及哨兵 fan-out；IoWorker 的啟停與 TX 組裝由 T12 完成。
 
 use std::collections::VecDeque;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -13,11 +13,11 @@ use sw_pal::traits::{Clock, PalError, ReadError, ReadOutcome, SerialHandle, Seri
 use sw_proto::pycompat::decode_utf8_replace;
 use sw_proto::pyre::PyRegex;
 
-use crate::Mono;
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
 use crate::tx_writer::{Fence, TxWriterHandle};
 use crate::wal::{WalAppendReq, WalWriter};
+use crate::Mono;
 
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
@@ -517,6 +517,12 @@ pub struct IoWorker {
 }
 
 impl IoWorker {
+    #[cfg(feature = "test-fakes")]
+    pub fn start(_handle: Box<dyn SerialHandle>, _args: IoWorkerArgs) -> IoWorker {
+        IoWorker { _stub: () }
+    }
+
+    #[cfg(not(feature = "test-fakes"))]
     pub fn start(_handle: Box<dyn SerialHandle>, _args: IoWorkerArgs) -> IoWorker {
         s21_todo!("T12", "IoWorker::start")
     }

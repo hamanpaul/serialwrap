@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -102,11 +102,13 @@ pub struct CoreHarness {
     pub clock: Arc<FakeClock>,
     pub fence: Arc<Fence>,
     pub reg: Arc<CommandRegistry>,
+    pub env: Arc<FakeEnv>,
     pub wal: Arc<WalWriter>,
     pub wfs: Arc<FakeWalFs>,
     pub rx: Arc<RxShared>,
     pub epochs: Arc<EpochAllocator>,
     serial: Arc<FakeSerialBackend>,
+    credential_files: Arc<Mutex<BTreeMap<String, String>>>,
     wall_us: Arc<AtomicI64>,
     scheduled: Vec<(Mono, TimerEvent)>,
     rx_seq: u64,
@@ -145,6 +147,10 @@ impl CoreHarness {
         let rx = RxShared::new(131_072, clock.mono_ns());
         let epochs = EpochAllocator::new();
         let serial = FakeSerialBackend::new();
+        let _dev = serial.add_device(REAL_PATH);
+        let env = Arc::new(FakeEnv::default());
+        let credential_files = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+        let files_for_read = Arc::clone(&credential_files);
         let wall_us = Arc::new(AtomicI64::new(START_WALL_US));
         let (data_tx, data_rx) = bounded::<DataEvent>(1024);
         let (ctl_tx, ctl_rx) = bounded::<ControlEvent>(256);
@@ -162,8 +168,15 @@ impl CoreHarness {
                     *b = i as u8;
                 }
             }),
-            env: Arc::new(FakeEnv::default()),
-            read_env_file: Arc::new(|_: &str| -> Option<std::io::Result<String>> { None }),
+            env: env.clone(),
+            read_env_file: Arc::new(move |path: &str| -> Option<std::io::Result<String>> {
+                files_for_read
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(path)
+                    .cloned()
+                    .map(Ok)
+            }),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
 
@@ -172,11 +185,13 @@ impl CoreHarness {
             clock,
             fence,
             reg,
+            env,
             wal,
             wfs,
             rx,
             epochs,
             serial,
+            credential_files,
             wall_us,
             scheduled: Vec::new(),
             rx_seq: 0,
@@ -185,6 +200,23 @@ impl CoreHarness {
             ctl_tx,
             _keep: (data_rx, ctl_rx),
         }
+    }
+
+    /// 設定測試用 process env。
+    pub fn set_env(&self, key: &str, value: &str) {
+        self.env
+            .vars
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), value.to_string());
+    }
+
+    /// 設定測試用 env 檔內容；路徑需與 profile 的 `env_file` 相同。
+    pub fn set_env_file(&self, path: &str, contents: &str) {
+        self.credential_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_string(), contents.to_string());
     }
 
     /// 目前 bridge 的 conn_epoch（尚未開出 bridge 時 panic）。
@@ -419,7 +451,7 @@ impl CoreHarness {
 pub struct ReplyExec;
 
 impl sw_core::actor::EffectExecutor for ReplyExec {
-    fn execute(&mut self, e: Effect, _tx: &Sender<ControlEvent>) {
+    fn execute(&mut self, e: Effect, _tx: &Sender<ControlEvent>, _safety: &Sender<ControlEvent>) {
         if let Effect::Reply(reply, result) = e {
             let _ = reply.try_send(result);
         }
@@ -430,7 +462,7 @@ impl sw_core::actor::EffectExecutor for ReplyExec {
 pub struct SilentExec;
 
 impl sw_core::actor::EffectExecutor for SilentExec {
-    fn execute(&mut self, _e: Effect, _tx: &Sender<ControlEvent>) {}
+    fn execute(&mut self, _e: Effect, _tx: &Sender<ControlEvent>, _safety: &Sender<ControlEvent>) {}
 }
 
 /// 以指定 reason 組成 `WorkerStopped` 收據（BC-03 帳本為空、handle 已關閉）。
@@ -575,10 +607,11 @@ struct RigExec {
     data: Sender<DataEvent>,
     stderr: Arc<Mutex<Vec<String>>>,
     state: FakeStateStore,
+    workers: HashMap<u64, IoWorker>,
 }
 
 impl EffectExecutor for RigExec {
-    fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>) {
+    fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, _safety: &Sender<ControlEvent>) {
         match e {
             Effect::Reply(reply, result) => {
                 let _ = reply.try_send(result);
@@ -615,6 +648,9 @@ impl EffectExecutor for RigExec {
                         real_path: dev.0.clone(),
                     }),
                 });
+            }
+            Effect::AdoptBridge { epoch, worker, .. } => {
+                self.workers.insert(epoch, worker);
             }
             Effect::WalMeta { cmd_id, meta } => {
                 let _ = self.wal.append(WalAppendReq {
@@ -740,6 +776,7 @@ impl ActorRig {
             data,
             stderr: stderr.clone(),
             state: state_store.clone(),
+            workers: HashMap::new(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -891,10 +928,12 @@ impl ActorRig {
     /// 非同步 RPC：回傳接收端（之後以 `try_recv`／`recv_timeout` 取回）。
     pub fn request_async(&self, req: SessionRequest) -> Receiver<Result<PyDict, PyErr>> {
         let (tx, rx) = bounded::<Result<PyDict, PyErr>>(1);
-        let _ = self
-            .actor
-            .control
-            .send(ControlEvent::Request { req, reply: tx });
+        let sender = if matches!(&req, SessionRequest::Release { .. }) {
+            &self.actor.safety
+        } else {
+            &self.actor.control
+        };
+        let _ = sender.send(ControlEvent::Request { req, reply: tx });
         rx
     }
 
@@ -990,7 +1029,7 @@ impl ActorRig {
 // - UART 獨占診斷與 console 工廠：固定回傳無持有者（測試只需要 PTY 形式）。
 // ===========================================================================
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Condvar;
 
@@ -1188,7 +1227,11 @@ impl ConsoleTransportFactory for RigConsole {
 struct NoopReader;
 
 impl SerialReader for NoopReader {
-    fn read(&mut self, _buf: &mut [u8], _timeout: Option<Duration>) -> Result<ReadOutcome, ReadError> {
+    fn read(
+        &mut self,
+        _buf: &mut [u8],
+        _timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError> {
         unreachable!("NoopReader 只用於 drop")
     }
 }
