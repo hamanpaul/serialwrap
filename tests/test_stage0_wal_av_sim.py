@@ -320,8 +320,18 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.parametrize("failure_point", [None, "drain", "close"])
-def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_path, failure_point):
+def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_path):
+    _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point=None)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("failure_point", ["drain", "close"])
+def test_spike3_oplock_variant_failures_write_evidence(monkeypatch, tmp_path, failure_point):
+    _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point)
+
+
+def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
     """oplock 持有期間須實際 append、跨 rotate，並由 F12 oracle 讀到前後 marker。"""
     import importlib.util
     from sw_core import wal

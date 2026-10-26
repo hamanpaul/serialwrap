@@ -1664,7 +1664,7 @@ def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
     "mutation",
     [
         "missing", "append_count_invalid", "append_samples_missing", "append_sample_count",
-        "no_archive", "records_invalid", "records_math", "meta_invalid", "first_seq", "last_seq",
+        "no_archive", "marker", "records_invalid", "records_math", "meta_invalid", "first_seq", "last_seq",
         "sequence", "rotate_retry_invalid", "deferred_pending_invalid", "write_failures_invalid",
         "deferred_pending", "write_failures", "pre_marker", "post_marker", "crc_errors",
         "interference_false", "lease_acquired_ns_missing",
