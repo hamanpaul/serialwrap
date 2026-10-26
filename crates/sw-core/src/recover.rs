@@ -14,8 +14,10 @@ pub enum RecoverPlan {
     Reply(PyDict),
     /// 無 bridge 且裝置在、且無 drain 進行中：ATTACHING＋RequestAttach。
     Reattach,
-    /// drain（RECOVERING）進行中：加入 06 StopOp waiters，回條到達後再重新 plan。
-    AwaitDrain,
+    /// drain（RECOVERING）進行中：立即回 `{ok:false, error_code:"SESSION_RECOVERING", drain_stalled,
+    /// drain_timeout_epoch, session}`，不掛 StopOp waiter、不 reattach（parity-amendments-2026-10-26 #57；
+    /// 形狀照鎖內 `test_release_drain_timeout_shape`）。
+    DrainBusy,
     /// ATTACHED 非 force：ExistingBridgeProbe{RecoverReprobe}。
     Reprobe,
     /// ATTACHED／非 READY 的 force：begin_stop(Clear) 後輪詢。

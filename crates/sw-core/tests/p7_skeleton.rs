@@ -13,6 +13,8 @@ fn p7_public_items_are_reachable() {
     let _: fn(usize) -> line_buffer::LineBuffer = line_buffer::LineBuffer::new;
     let _: fn(f64) -> sw_core::Mono = mono::from_secs_f64;
     let _ = tx_writer::FenceReject::FsmMismatch;
+    // parity-amendments-2026-10-26 #57：drain 中 recover 立即回 SESSION_RECOVERING（原 AwaitDrain 作廢）。
+    let _ = recover::RecoverPlan::DrainBusy;
     let _ = std::any::type_name::<(
         reprobe::ReprobeState,
         self_test::SelfTestFinal,
