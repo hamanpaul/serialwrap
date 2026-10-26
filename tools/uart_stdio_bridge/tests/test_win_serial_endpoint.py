@@ -909,6 +909,45 @@ def test_peer_gate_rechecks_after_peer_close(fake_serial_module):
         ep.close()
 
 
+def test_peer_gate_does_not_reuse_pre_reopen_settle_time(fake_serial_module, monkeypatch):
+    """DSR 在舊狀態快照後經低→高重開時，不得沿用重開前已完成的 settle 時間送出 banner。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    clock.advance(1.0)
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.dsr_on = True
+    ep._peer_on_since = 0.0
+    original_sample = ep._peer_dsr_locked
+    sample_count = 0
+
+    def reopen_before_last_gate_sample(serial_obj: Any) -> bool | None:
+        nonlocal sample_count
+        sample_count += 1
+        if sample_count == 3:
+            # write_some 與 timeout 設定各自通過前置 gate 後，在最後寫入 gate 的 DSR
+            # 取樣前插入 low→high；用真實狀態更新函式確認重開 lease 從此刻重新起算。
+            fake.dsr_on = False
+            assert original_sample(serial_obj) is False
+            fake.dsr_on = True
+            assert original_sample(serial_obj) is True
+        return original_sample(serial_obj)
+
+    monkeypatch.setattr(ep, "_peer_dsr_locked", reopen_before_last_gate_sample)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(endpoint_module, "_clock", clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            assert ep.write_some(b"BANNER\r\n", 0.05) == 0
+        assert ep._peer_on_since == pytest.approx(1.0)
+        assert fake.writes == [], "重開後 settle 未完成，不得把 banner 寫入 COM"
+    finally:
+        ep.close()
+
+
 def test_peer_open_none_without_handle(fake_serial_module):
     """無 handle（未開啟或已關閉）時 peer_open 回 None，不回 False 以免被誤判為對端已關閉。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
@@ -1894,23 +1933,49 @@ def test_acquire_until_rejects_lock_granted_at_deadline(fake_serial_module, monk
 
 
 def test_peer_gate_uses_captured_settle_time_if_dsr_clears_state(fake_serial_module, monkeypatch):
-    """取樣後 DSR 狀態可被另一執行緒清除；本次判定只使用鎖內複製的時間值。"""
+    """配對的 DSR／settle 快照完成後狀態才清除時，本次判定可用快照，下一次必須重新 settle。"""
     import uart_stdio_bridge.endpoints.win_serial as endpoint_module
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
     fake = FakeSerial()
     ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
     ep._peer_on_since = 0.0
+    clock = _ControlledClock()
+    clock.advance(1000.0)
+    original_lock = ep._peer_state_lock
 
-    def clear_after_capture() -> float:
-        ep._peer_on_since = None
-        return 1000.0
+    class ClearAfterSnapshotLock:
+        """在 DSR 與 settle 起點都讀取後，再模擬另一執行緒清除狀態。"""
+
+        releases = 0
+
+        def acquire(self) -> bool:
+            return original_lock.acquire()
+
+        def release(self) -> None:
+            original_lock.release()
+            self.releases += 1
+            if self.releases == 2:
+                ep._peer_on_since = None
+
+        def __enter__(self) -> "ClearAfterSnapshotLock":
+            self.acquire()
+            return self
+
+        def __exit__(self, *_exc: object) -> bool:
+            self.release()
+            return False
+
+    ep._peer_state_lock = ClearAfterSnapshotLock()
 
     with monkeypatch.context() as patch:
-        patch.setattr(endpoint_module.time, "monotonic", clear_after_capture)
-        patch.setattr(endpoint_module, "_clock", clear_after_capture, raising=False)
-        assert ep._peer_writable_locked(type("Peer", (), {"dsr": True})())
+        patch.setattr(endpoint_module, "_clock", clock, raising=False)
+        peer = type("Peer", (), {"dsr": True})()
+        assert ep._peer_writable_locked(peer)
     assert ep._peer_on_since is None
+    with monkeypatch.context() as patch:
+        patch.setattr(endpoint_module, "_clock", clock, raising=False)
+        assert not ep._peer_writable_locked(type("Peer", (), {"dsr": True})())
 
 
 # ---------------------------------------------------------------- 真實 COM pair 測試（擁有者 host，OD-15）

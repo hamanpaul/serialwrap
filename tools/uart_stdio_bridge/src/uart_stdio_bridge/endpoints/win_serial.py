@@ -475,19 +475,15 @@ class WinSerialEndpoint:
         """peer gate 判定：關閉時恆允許；開啟時需 DSR 為高且已過 settle 窗口。"""
         if not self.peer_gate:
             return True
-        # 先複製目前已確認的 settle 起點，再取樣 DSR。取樣期間可能有其他路徑清除
-        # `_peer_on_since`；本次判定必須使用取樣前鎖內取得的值，不因取樣後狀態清除而改變。
+        dsr_on = self._peer_dsr_locked(serial_obj)
+        if not dsr_on:
+            return False
+        # DSR 取樣會在同一個 peer state lock 內清除低電位狀態或建立首次高電位起點。
+        # 取樣後才讀最新起點，避免在此之前複製舊值，並於並發 low→high 後沿用舊 settle 時間。
         with self._peer_state_lock:
             peer_on_since = self._peer_on_since
-        dsr_on = self._peer_dsr_locked(serial_obj)
-        if not dsr_on or peer_on_since is None:
-            if not dsr_on:
-                return False
-            # 首次觀測為高時，取樣函式已設立 settle 起點；取得該新值作為本次起算值。
-            with self._peer_state_lock:
-                peer_on_since = self._peer_on_since
-            if peer_on_since is None:
-                return False
+        if peer_on_since is None:
+            return False
         return _clock() - peer_on_since >= _PEER_OPEN_SETTLE_S
 
     def _release_serial_locked(self) -> None:
