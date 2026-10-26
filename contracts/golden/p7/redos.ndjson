@@ -69,3 +69,15 @@
 {"compile_ok":false,"error":"unknown extension ?P\n at position 1 (line 1, column 2)","flags":"","has_backref":null,"id":"redos:069","pattern":"(?P\n)","score":null,"suspicious":null}
 {"compile_ok":false,"error":"unknown extension ?P' at position 2","flags":"","has_backref":null,"id":"redos:070","pattern":"((?P'))","score":null,"suspicious":null}
 {"compile_ok":false,"error":"unknown extension ?P  at position 5","flags":"","has_backref":null,"id":"redos:071","pattern":"(?x)(?P x)","score":null,"suspicious":null}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:072","pattern":"(?:(?:a)|b)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:073","pattern":"(?:(?:ab)|(?:ac))+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:074","pattern":"(?:(?:a|b)c|(?:a|b)d)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:075","pattern":"(?:[aa]|b)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:076","pattern":"(?:a(?:b)|ac)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:077","pattern":"(?:(?i:a)|b)+","score":2,"suspicious":true}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:078","pattern":"(?:(?:)a|b)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:079","pattern":"(?:(?:a|b)|c)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:080","pattern":"(?:[ab]|(?:c|d))+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:081","pattern":"(?:(?:ab)c|abd)+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:082","pattern":"(?:\\d|(?:x))+","score":1,"suspicious":false}
+{"compile_ok":true,"error":null,"flags":"","has_backref":false,"id":"redos:083","pattern":"(?:(?:a)b|(?:a)c)+","score":1,"suspicious":false}
