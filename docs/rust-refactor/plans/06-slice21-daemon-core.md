@@ -154,6 +154,8 @@ Task 0 的 `crates/sw-core/tests/slice21_prereqs.rs` 與 `tests/test_slice21_pre
 **Changelog fragment:** `changelog.d/rust-s21-skeleton.md`（front matter `type: feat`、`scope: rust-s21`；本文：「新增 Slice 2.1 Rust daemon 範圍清單、有界資源契約與 crate 骨架（尚無行為）。」）
 **BLOCKED-OWNER：** 無。
 
+**SC-11 `daemon.handoff_stop` 承接（R1-F1；與 Python 基線 TX fence 語意一致）：** AdmissionGate 閒置凍結成功後，SessionManager 必須在同一把 manager lock 內重查 session／bridge，凍結背景來源與各 bridge 的新 TX，並等待已通過提交檢查的 TX fence 於有界期限內收斂。任一 fence 逾時即不得回成功或停止 daemon；回 `SESSION_BUSY`，對應 `busy[].ops` 含 `tx.in_flight`，並只撤銷本次新建的 AdmissionGate 與背景／bridge 凍結。若 `daemon.stop` 已接手凍結，handoff 失敗路徑不得撤銷其凍結。Rust 回歸須涵蓋 timeout 拒絕、session／bridge 在 lock 內重查，以及 shutdown 凍結與 handoff rollback 的競態；此項只規定實作與測試，不替代 Stage 1 正式 gate 證據。
+
 **Files:**
 - Create: `tests/acceptance/slice21_scope.yaml`
 - Create: `contracts/resource_limits.yaml`
