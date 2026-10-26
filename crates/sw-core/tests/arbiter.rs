@@ -574,6 +574,25 @@ fn history_never_evicts_in_flight_canceled() {
 }
 
 #[test]
+fn mark_running_registers_in_flight_before_cancel() {
+    let r = CommandRegistry::new();
+
+    r.admit(req("fg"), true, "fg".into(), &ts(0)).expect("admit");
+    assert!(matches!(r.mark_running("fg", &ts(0)), RunDecision::Run));
+    r.cancel("fg", &ts(0));
+
+    for i in 1..=600 {
+        let id = format!("c{i}");
+        r.admit(req("x"), true, id.clone(), &ts(i)).expect("admit");
+        r.mark_running(&id, &ts(i));
+        r.complete(&id, ok_result_for_test(), &ts(i));
+    }
+
+    assert!(r.get("fg").is_some(), "取消中的在途命令紀錄不得被淘汰");
+    assert_eq!(r.pending(SID), 1, "取消中的在途命令仍須計入 pending");
+}
+
+#[test]
 fn submit_cancel_loop_keeps_queue_bounded() {
     let r = CommandRegistry::new();
     let mut q = SessionQueue::new();

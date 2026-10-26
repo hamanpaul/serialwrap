@@ -8824,6 +8824,7 @@
           "cargo:sw-core::arbiter::history_never_evicts_in_flight_canceled",
           "cargo:sw-core::arbiter::invalid_completion_regex_first",
           "cargo:sw-core::arbiter::length_counts_utf8_replace_bytes",
+          "cargo:sw-core::arbiter::mark_running_registers_in_flight_before_cancel",
           "cargo:sw-core::arbiter::mark_running_skips_canceled_or_done",
           "cargo:sw-core::arbiter::newline_rejected_cr_allowed_empty_allowed",
           "cargo:sw-core::arbiter::pending_excludes_interactive",
