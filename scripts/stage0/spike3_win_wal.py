@@ -6,8 +6,8 @@ entry: py -3.12 scripts/stage0/spike3_win_wal.py --case <case-id> --evidence-dir
        執行前請以 win-pytest.sh 相同方式將 sw_core/ 與 scripts/、realhw/ 一併 staging 到 Windows 本機磁碟（或於 Windows 端 clone repo）。
 revision: 本檔 git blob sha1（執行時由腳本計算並寫入證據 artifact.revision；等同 git rev-parse HEAD:scripts/stage0/spike3_win_wal.py）；
   被測 sw_core 以 artifact.tree_sha256（sw_core.release_manifest.tree_sha256）與 artifact.git_head（git rev-parse HEAD）記錄。
-expected: 各案皆在 scripts/stage0/av_sim.py helper（允許 FILE_SHARE_DELETE 並申請 overlapped RH oplock、seeded 持有 10–500 ms）注入下執行；
-  一般不含 FILE_SHARE_DELETE 共用模式另由 av_sim Windows-native 測試涵蓋：
+expected: 各案主測皆由 scripts/stage0/av_sim.py helper 以不含 FILE_SHARE_DELETE 的共用模式
+  （seeded 持有 10–500 ms）注入；另在相同 WAL 目錄執行獨立的 FILE_SHARE_DELETE + RH oplock 變體：
   每次 WalWriter.append 實際耗時（毫秒）記入 observations.append_latency_ms；gate 以最大值比對 owner 核准上限，上限未裁決前維持 BLOCKED-OWNER；
   win-wal-av-rotate：輪替最終完成、總筆數與 seq 連續（1..N）、干擾實際觀察到（grabs≥1、rotate_retry≥1）、延後佇列清空；
   win-wal-av-unlink：外部 unlink 有界重試至成功，WAL_RECREATED_AFTER_EXTERNAL_UNLINK META 正確、range_known 依實況；
@@ -412,42 +412,63 @@ class AvHelper:
     PASS 時隨 swspike3-* 目錄一併清除。
     """
 
-    def __init__(self, wal_dir: Path, seed: int, rec: Recorder) -> None:
+    def __init__(self, wal_dir: Path, seed: int, rec: Recorder, *,
+                 oplock: bool = False, variant: str | None = None) -> None:
         self._wal_dir = wal_dir
         self._seed = seed
         self._rec = rec
-        self._ready = wal_dir / "av-helper.ready"
-        self._stop = wal_dir / "av-helper.stop"
-        self._log = wal_dir / "av-helper.jsonl"
+        self._oplock = oplock
+        self._variant = variant
+        suffix = f"-{variant}" if variant else ""
+        self._ready = wal_dir / f"av-helper{suffix}.ready"
+        self._stop = wal_dir / f"av-helper{suffix}.stop"
+        self._log = wal_dir / f"av-helper{suffix}.jsonl"
         self._proc: subprocess.Popen[bytes] | None = None
         self.launch_error: str | None = None
-        self._rec.observations["av_sim"] = {
-            **_av_sim_module().describe(seed, oplock=True),
+        self._evidence_key = variant
+        evidence = self._evidence()
+        if variant is None:
+            self._rec.observations["av_sim"] = evidence
+        else:
+            self._rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = evidence
+
+    def _evidence(self) -> dict[str, Any]:
+        return {
+            **_av_sim_module().describe(self._seed, oplock=self._oplock),
             "launch_error": "not_started",
             "grabs": None,
             "open_errors": None,
             "helper_exit": None,
         }
 
+    def _payload(self) -> dict[str, Any]:
+        root = self._rec.observations["av_sim"]
+        return root if self._evidence_key is None else root["variants"][self._evidence_key]
+
+    def _argv(self) -> list[str]:
+        argv = [
+            sys.executable, str(AV_SIM_PATH),
+            "--watch-dir", str(self._wal_dir),
+            "--seed", str(self._seed),
+            "--duration-s", str(AV_HELPER_DURATION_S),
+            "--ready-file", str(self._ready),
+            "--stop-file", str(self._stop),
+            "--log-file", str(self._log),
+        ]
+        if self._oplock:
+            argv.append("--oplock")
+        return argv
+
     def start(self) -> bool:
         try:
-            self._proc = subprocess.Popen([
-                sys.executable, str(AV_SIM_PATH),
-                "--watch-dir", str(self._wal_dir),
-                "--seed", str(self._seed),
-                "--duration-s", str(AV_HELPER_DURATION_S),
-                "--ready-file", str(self._ready),
-                "--stop-file", str(self._stop),
-                "--log-file", str(self._log),
-                "--oplock",
-            ])
+            self._proc = subprocess.Popen(self._argv())
         except OSError as exc:
             return self._fail(f"{type(exc).__name__}: {exc}")
         deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
         while time.monotonic() < deadline:
             if self._ready.exists():
-                self._rec.observations["av_sim"]["launch_error"] = "none"
-                self._rec.step("av_sim_helper_ready", "ok")
+                self._payload()["launch_error"] = "none"
+                self._rec.step(f"av_sim_helper_ready{':' + self._variant if self._variant else ''}", "ok")
                 return True
             if self._proc.poll() is not None:
                 return self._fail(f"helper 提前結束（exit={self._proc.returncode}）")
@@ -456,8 +477,8 @@ class AvHelper:
 
     def _fail(self, message: str) -> bool:
         self.launch_error = message
-        self._rec.observations["av_sim"]["launch_error"] = message
-        self._rec.step("av_sim_helper_ready", "refused")
+        self._payload()["launch_error"] = message
+        self._rec.step(f"av_sim_helper_ready{':' + self._variant if self._variant else ''}", "refused")
         return False
 
     def stop(self) -> None:
@@ -481,12 +502,29 @@ class AvHelper:
                         summary = row
         except (OSError, ValueError):
             summary = {}
-        self._rec.observations["av_sim"].update({
+        self._payload().update({
             "grabs": summary.get("grabs"),
             "open_errors": summary.get("open_errors"),
             "helper_exit": exit_code,
             "oplock": summary.get("oplock", "unavailable"),
         })
+
+
+def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
+    """在主案例結束後於既有 WAL 檔執行獨立 oplock 變體，結果分開記錄。"""
+    helper = AvHelper(wal_dir, SPIKE3_SEED, rec, oplock=True, variant="oplock")
+    if not helper.start():
+        helper.stop()
+        return False
+    try:
+        # ready 標記先於掃描迴圈；留出多個 5 ms poll 週期讓 helper 實際開啟現存 WAL。
+        time.sleep(0.1)
+    finally:
+        helper.stop()
+    evidence = rec.observations["av_sim"]["variants"]["oplock"]
+    return (evidence.get("helper_exit") == 0 and isinstance(evidence.get("grabs"), int)
+            and not isinstance(evidence.get("grabs"), bool) and evidence["grabs"] >= 1
+            and evidence.get("oplock") in {"granted", "denied", "unavailable"})
 
 
 def _grabs(rec: Recorder) -> int:
@@ -525,6 +563,7 @@ def case_rotate(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
     rec.observations["wal_dir"] = str(wal_dir)
     helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
     if not helper.start():
+        helper.stop()
         raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     try:
@@ -575,6 +614,7 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
     rec.observations["wal_dir"] = str(wal_dir)
     helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
     if not helper.start():
+        helper.stop()
         raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     metas: list[dict[str, Any]] = []
@@ -663,6 +703,7 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
     wal_path = str(wal_dir / "raw.wal.ndjson")
     helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
     if not helper.start():
+        helper.stop()
         raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -746,6 +787,7 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
     wal_path = str(wal_dir / "raw.wal.ndjson")
     helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
     if not helper.start():
+        helper.stop()
         raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
     res_pre = res_post = None
@@ -846,8 +888,18 @@ def run_case(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 — 實機腳本：任何異常都必須落證據，不得靜默
             verdict, fallback, code = "INSUFFICIENT_EVIDENCE", "檢視 observations.exception 後重跑", 1
             rec.observations["exception"] = f"{type(exc).__name__}: {exc}"
+        wal_dir_value = rec.observations.get("wal_dir")
+        if "exception" not in rec.observations and isinstance(wal_dir_value, str) and Path(wal_dir_value).is_dir():
+            if not _collect_oplock_variant(Path(wal_dir_value), rec) and verdict == "PASS":
+                verdict, fallback, code = (
+                    "INSUFFICIENT_EVIDENCE", "獨立 oplock 變體未取得有效 helper 證據", 1,
+                )
     after = snapshot_binaries(subjects)
     av_sim = dict(rec.observations.get("av_sim") or {
+        **_av_sim_module().describe(SPIKE3_SEED),
+        "launch_error": "not_started", "grabs": None, "open_errors": None, "helper_exit": None,
+    })
+    av_sim.setdefault("variants", {}).setdefault("oplock", {
         **_av_sim_module().describe(SPIKE3_SEED, oplock=True),
         "launch_error": "not_started", "grabs": None, "open_errors": None, "helper_exit": None,
     })

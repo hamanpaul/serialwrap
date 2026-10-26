@@ -427,8 +427,14 @@ def test_spike3_evidence_schema_rejects_missing_edr():
         "steps": [{"op": "rotate", "ts": "2026-10-16T12:00:01Z", "result": "ok"}],
         "observations": {"append_count": 1, "append_latency_ms": [0.1], "rotated": True},
         "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
-                   "hold_ms_range": [10, 500], "seed": 1, "oplock": "unavailable",
-                   "launch_error": "none", "grabs": 1, "helper_exit": 0},
+                   "hold_ms_range": [10, 500], "seed": 1, "oplock": "not_requested",
+                   "launch_error": "none", "grabs": 1, "helper_exit": 0,
+                   "variants": {"oplock": {
+                       "mode": "oplock",
+                       "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE",
+                       "hold_ms_range": [10, 500], "seed": 1, "oplock": "unavailable",
+                       "launch_error": "none", "grabs": 1, "helper_exit": 0,
+                   }}},
         "binary_integrity": {
             "subjects": [{"path": "sw-core.exe", "exists_before": True, "exists_after": True,
                           "sha256_before": "c" * 64, "sha256_after": "c" * 64, "unchanged": True}],

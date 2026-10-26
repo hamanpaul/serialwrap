@@ -153,6 +153,32 @@ def _git_head(repo_root: Path) -> str | None:
     return head if res.returncode == 0 and head else None
 
 
+def _cargo_provenance_errors(report: dict[str, Any], expected_head: str | None) -> list[str]:
+    """Cargo L1 報告須來自當前 HEAD，且收集／執行前後工作樹乾淨。"""
+    provenance = report.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("schema") != "cargo-l1-provenance.v1":
+        return ["Cargo L1 報告缺少 cargo-l1-provenance.v1"]
+    git = provenance.get("git")
+    if not isinstance(git, dict):
+        return ["Cargo L1 provenance 缺 git 物件"]
+    end = git.get("end")
+    errors: list[str] = []
+    if not expected_head:
+        errors.append("無法取得受測 HEAD，Cargo L1 provenance 無法對帳")
+    elif git.get("head") != expected_head:
+        errors.append(f"Cargo L1 provenance HEAD 與受測 HEAD 不符：{git.get('head')!r}")
+    if git.get("clean") is not True:
+        errors.append("Cargo L1 provenance 執行前工作樹非乾淨")
+    if not isinstance(end, dict):
+        errors.append("Cargo L1 provenance 缺執行結束 git 狀態")
+    else:
+        if expected_head and end.get("head") != expected_head:
+            errors.append(f"Cargo L1 provenance 結束 HEAD 與受測 HEAD 不符：{end.get('head')!r}")
+        if end.get("clean") is not True:
+            errors.append("Cargo L1 provenance 執行後工作樹非乾淨")
+    return errors
+
+
 def _junit_provenance_errors(root: ET.Element, expected_head: str | None) -> list[str]:
     """驗證 pytest JUnit 的 provenance properties（由 scripts/rust/junit_provenance.py 寫入）。"""
     props: dict[str, str] = {}
@@ -620,6 +646,12 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
     if integrity.get("launch_refused") is not False:
         return "evidence-insufficient", ["spike3 binary_integrity.launch_refused 非 false（啟動被拒）"]
     av = doc.get("av_sim") or {}
+    if av.get("mode") != "share_no_delete" or av.get("share_mode") != "FILE_SHARE_READ|FILE_SHARE_WRITE":
+        return "evidence-insufficient", [
+            "spike3 主 helper 必須使用不含 FILE_SHARE_DELETE 的 share_no_delete 共用模式"
+        ]
+    if av.get("oplock") != "not_requested":
+        return "evidence-insufficient", ["spike3 主 helper 不得以 oplock 變體取代 no-delete 注入"]
     if av.get("launch_error") != "none":
         return "evidence-insufficient", [f"spike3 av_sim.launch_error={av.get('launch_error')!r}，非 none（模擬防毒 helper 未成功啟動）"]
     helper_exit = av.get("helper_exit")
@@ -628,11 +660,27 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
     grabs = av.get("grabs")
     if not isinstance(grabs, int) or isinstance(grabs, bool) or grabs < 1:
         return "evidence-insufficient", [f"spike3 av_sim.grabs={grabs!r}，須為 ≥1 的整數（模擬防毒未實際佔用任何檔案）"]
-    # OD-19 (2) 明文要求含 oplock 變體；未實作（not_implemented）即不得讀成驗收全數滿足。
-    oplock = av.get("oplock")
+    # OD-19 (2) 的 oplock 是獨立變體，不可替代 rotate／unlink 所需的 no-delete 主注入。
+    oplock_variant = (av.get("variants") or {}).get("oplock")
+    if not isinstance(oplock_variant, dict):
+        return "evidence-insufficient", ["oplock_not_covered：缺少獨立 av_sim.variants.oplock 證據"]
+    if (oplock_variant.get("mode") != "oplock"
+            or oplock_variant.get("share_mode") != "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"):
+        return "evidence-insufficient", ["oplock 變體必須以允許 FILE_SHARE_DELETE 的獨立 helper 執行"]
+    if oplock_variant.get("launch_error") != "none":
+        return "evidence-insufficient", [
+            f"oplock 變體 launch_error={oplock_variant.get('launch_error')!r}，helper 未成功啟動"
+        ]
+    variant_exit = oplock_variant.get("helper_exit")
+    if not isinstance(variant_exit, int) or isinstance(variant_exit, bool) or variant_exit != 0:
+        return "evidence-insufficient", [f"oplock 變體 helper_exit={variant_exit!r}，helper 須以 exit 0 完成"]
+    variant_grabs = oplock_variant.get("grabs")
+    if not isinstance(variant_grabs, int) or isinstance(variant_grabs, bool) or variant_grabs < 1:
+        return "evidence-insufficient", [f"oplock 變體 grabs={variant_grabs!r}，須實際佔用至少一個 WAL 檔案"]
+    oplock = oplock_variant.get("oplock")
     if oplock not in ("granted", "denied", "unavailable"):
         return "evidence-insufficient", [
-            f"oplock_not_covered：av_sim.oplock={oplock!r}，OD-19 (2) 之 oplock 變體未涵蓋（PENDING-OD-S1X-AVSIM-OPLOCK）"
+            f"oplock_not_covered：av_sim.variants.oplock.oplock={oplock!r}，OD-19 (2) 之 oplock 變體未涵蓋（PENDING-OD-S1X-AVSIM-OPLOCK）"
         ]
     samples = (doc.get("observations") or {}).get("append_latency_ms")
     if not isinstance(samples, list) or not samples:
@@ -1198,6 +1246,12 @@ def judge_stage1a(
                     missing = []
                     skipped_required = []
                     duplicates = []
+
+                if subfolder == "cargo":
+                    cargo_provenance = _cargo_provenance_errors(rep, head)
+                    if cargo_provenance:
+                        verdict = "evidence-insufficient"
+                        reasons.extend(cargo_provenance)
 
                 if owner_info is not None:
                     owner_skipped = owner_info["owner_gated_skipped"]

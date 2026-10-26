@@ -285,6 +285,15 @@ class GateTree:
         out = self.root / "out"
         out.mkdir(parents=True, exist_ok=True)
         for (platform, kind), rep in self.l1_reports.items():
+            if kind == "cargo" and "provenance" not in rep:
+                rep["provenance"] = {
+                    "schema": "cargo-l1-provenance.v1",
+                    "git": {
+                        "head": self.head,
+                        "clean": True,
+                        "end": {"head": self.head, "clean": True},
+                    },
+                }
             d = out / "l1" / platform / kind
             d.mkdir(parents=True, exist_ok=True)
             (d / "resource-report.json").write_text(json.dumps(rep, ensure_ascii=False), encoding="utf-8")
@@ -735,6 +744,28 @@ def test_l1_cargo_argv_not_matching_selector_invalid(tree):
     assert row["verdict"] == "evidence-insufficient"
     assert any("selector mismatch" in r for r in row["reasons"])
     assert rep["overall"] == "FAIL"
+
+
+def test_l1_cargo_provenance_head_and_clean_tree_are_required(tree):
+    """Stage 1A cargo 報告必須綁定受測 HEAD，且執行前後工作樹皆乾淨。"""
+    tree.write()
+    report = tree.l1_reports[("linux", "cargo")]
+    for mutation in (
+        lambda git: git.__setitem__("head", "0" * 40),
+        lambda git: git.__setitem__("clean", False),
+        lambda git: git["end"].__setitem__("head", "0" * 40),
+        lambda git: git["end"].__setitem__("clean", False),
+    ):
+        report["provenance"] = {
+            "schema": "cargo-l1-provenance.v1",
+            "git": {"head": tree.head, "clean": True,
+                    "end": {"head": tree.head, "clean": True}},
+        }
+        mutation(report["provenance"]["git"])
+        _, gate_report = tree.run()
+        row = _l1_row(gate_report, "s1a_cargo", "linux")
+        assert row["verdict"] == "evidence-insufficient", row
+        assert gate_report["overall"] == "FAIL"
 
 
 def test_l1_delegation_judged_from_blackbox_report(tree):
@@ -1242,8 +1273,14 @@ def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor 
         "steps": [{"op": "case", "ts": "2026-10-22T00:00:01Z", "result": "ok"}],
         "observations": _spike3_observations(case_id),
         "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
-                   "hold_ms_range": [10, 500], "seed": 20261023, "oplock": oplock,
-                   "launch_error": launch_error, "grabs": grabs, "open_errors": 0, "helper_exit": 0},
+                   "hold_ms_range": [10, 500], "seed": 20261023, "oplock": "not_requested",
+                   "launch_error": launch_error, "grabs": grabs, "open_errors": 0, "helper_exit": 0,
+                   "variants": {"oplock": {
+                       "mode": "oplock",
+                       "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE",
+                       "hold_ms_range": [10, 500], "seed": 20261023, "oplock": oplock,
+                       "launch_error": "none", "grabs": 1, "open_errors": 0, "helper_exit": 0,
+                   }}},
         "binary_integrity": {
             "subjects": subjects,
             "unchanged": unchanged, "launch_refused": launch_refused, "launch_error": "none",
@@ -1275,6 +1312,29 @@ def test_spike3_pass_with_known_edr_is_pass(tree):
     assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert rep["overall"] == "IMPLEMENTED"
     assert code == 0
+
+
+@pytest.mark.parametrize("bound_mode,expected", [("above", "PASS"), ("below", "FAIL")])
+def test_spike3_latency_bound_pass_and_fail_paths(tmp_path, monkeypatch, bound_mode, expected):
+    """owner 設定上限後，最大 append 樣本分別走 PASS 與超限 FAIL 分支。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    samples = doc["observations"]["append_latency_ms"]
+    observed_max = max(samples)
+    bound = observed_max + 1.0 if bound_mode == "above" else observed_max / 2.0
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+    monkeypatch.setattr(gate, "OD19_AVSIM_WRITE_LATENCY_BOUND_MS", bound)
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == expected, reasons
+    if expected == "FAIL":
+        assert any("超過 owner 上限" in reason for reason in reasons)
 
 
 def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
@@ -1447,7 +1507,17 @@ def test_spike3_sha_mismatch_with_unchanged_true_is_insufficient(tree):
 
 def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
     """OD-19 (2)：oplock 變體為驗收必要項；未實作（not_implemented）即標示 oplock_not_covered，不得 PASS。"""
-    _enable_spike3(tree, oplock="not_implemented")
+    _enable_spike3(tree, mutate=lambda doc: doc["av_sim"]["variants"]["oplock"].__setitem__("oplock", "not_implemented"))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_oplock_helper_cannot_replace_no_delete_injection(tree):
+    """OD-19 (2)：允許 delete 的 oplock helper 不得取代主案例 no-delete 干擾證據。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["av_sim"].update(
+        {"mode": "oplock", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"}
+    ))
     code, rep = tree.run()
     assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
     assert rep["overall"] == "FAIL"

@@ -196,7 +196,8 @@ def _toolchain() -> dict[str, Any]:
     rustc = os.environ.get("RUSTC") or shutil.which("rustc") or "rustc"
     try:
         proc = subprocess.run(
-            [rustc, "-vV"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=60,
+            [rustc, "-vV"], cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False, timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"rustc_vv": None, "rustc_vv_sha256": None, "error": type(exc).__name__}

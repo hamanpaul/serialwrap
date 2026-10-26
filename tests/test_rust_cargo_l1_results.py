@@ -488,6 +488,29 @@ def test_provenance_binds_executable_sha_head_and_toolchain(tmp_path: Path) -> N
     assert prov["rustflags"]["CARGO_ENCODED_RUSTFLAGS"] == {"set": False, "sha256": None}
 
 
+def test_rustc_version_probe_uses_repo_toolchain_cwd(monkeypatch) -> None:
+    """rustc -vV 必須在 repo cwd 執行，套用該 repo 的 rust-toolchain.toml。"""
+    _assert_script()
+    spec = importlib.util.spec_from_file_location("cargo_l1_toolchain_cwd_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "rustc 1.96.1\n", "")
+
+    monkeypatch.setenv("RUSTC", "rustc-shim")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module._toolchain()
+
+    assert result["rustc_vv"].startswith("rustc 1.96.1")
+    assert calls and calls[0][1].get("cwd") == ROOT
+
+
 @pytest.mark.process_rpc
 def test_rustflags_recorded_as_digest_without_flag_text(tmp_path: Path) -> None:
     """RUSTFLAGS 只記錄是否設定與 sha256；旗標文字本身不寫入報告。"""

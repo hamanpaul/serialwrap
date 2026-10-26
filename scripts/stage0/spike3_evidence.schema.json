@@ -78,19 +78,43 @@
     },
     "av_sim": {
       "type": "object",
-      "description": "OD-19 (2)：模擬端點防毒干擾的參數與觀察結果（scripts/stage0/av_sim.py）；Spike 3 以允許 delete 的 overlapped handle 申請 RH oplock，記錄實際狀態。",
-      "required": ["mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs", "helper_exit"],
+      "description": "OD-19 (2)：主案例以不含 FILE_SHARE_DELETE 的 share_no_delete helper 驗證 rotate／unlink 干擾；獨立 variants.oplock 記錄允許 delete 的 overlapped RH oplock 變體。",
+      "required": ["mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs", "helper_exit", "variants"],
       "properties": {
-        "mode": {"type": "string", "enum": ["share_no_delete", "oplock"]},
-        "share_mode": {"type": "string"},
+        "mode": {"type": "string", "const": "share_no_delete"},
+        "share_mode": {"type": "string", "const": "FILE_SHARE_READ|FILE_SHARE_WRITE"},
         "hold_ms_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
         "seed": {"type": "integer"},
-        "oplock": {"type": "string", "enum": ["pending", "not_requested", "unavailable", "granted", "denied"]},
+        "oplock": {"type": "string", "const": "not_requested"},
         "launch_error": {"type": "string"},
         "grabs": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
         "open_errors": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
-        "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
-      }
+        "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "variants": {
+          "type": "object",
+          "required": ["oplock"],
+          "properties": {
+            "oplock": {
+              "type": "object",
+              "required": ["mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs", "helper_exit"],
+              "properties": {
+                "mode": {"type": "string", "const": "oplock"},
+                "share_mode": {"type": "string", "const": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"},
+                "hold_ms_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                "seed": {"type": "integer"},
+                "oplock": {"type": "string", "enum": ["pending", "unavailable", "granted", "denied"]},
+                "launch_error": {"type": "string"},
+                "grabs": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+                "open_errors": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+                "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     },
     "binary_integrity": {
       "type": "object",

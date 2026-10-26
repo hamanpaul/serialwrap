@@ -247,6 +247,52 @@ def test_av_sim_oplock_variant_is_wired(monkeypatch):
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypatch, tmp_path):
+    """Spike 3 主 helper 不帶 --oplock；oplock 只記入獨立變體。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_helper_modes_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    recorder = module.Recorder()
+    primary = module.AvHelper(tmp_path, SEED, recorder)
+    variant = module.AvHelper(tmp_path, SEED, recorder, oplock=True, variant="oplock")
+
+    assert "--oplock" not in primary._argv()
+    assert "--oplock" in variant._argv()
+    assert primary._evidence()["mode"] == "share_no_delete"
+    assert variant._evidence()["mode"] == "oplock"
+
+    class StubHelper:
+        def __init__(self, wal_dir, seed, rec, *, oplock=False, variant=None):
+            self.rec = rec
+            self.variant = variant
+            self.rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = {
+                **module._av_sim_module().describe(seed, oplock=oplock),
+                "launch_error": "not_started", "grabs": None, "open_errors": None, "helper_exit": None,
+            }
+
+        def start(self):
+            self.rec.observations["av_sim"]["variants"][self.variant]["launch_error"] = "none"
+            return True
+
+        def stop(self):
+            self.rec.observations["av_sim"]["variants"][self.variant].update(
+                {"grabs": 1, "helper_exit": 0, "oplock": "granted"}
+            )
+
+    monkeypatch.setattr(module, "AvHelper", StubHelper)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    assert module._collect_oplock_variant(tmp_path, recorder) is True
+    assert recorder.observations["av_sim"]["variants"]["oplock"]["share_mode"] == (
+        "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"
+    )
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_oplock_request_uses_overlapped_fsctl_and_records_grant(monkeypatch):
     """FSCTL_REQUEST_OPLOCK 以 overlapped I/O 提出 RH request，ERROR_IO_PENDING 表示已取得。"""
     av = _av()
