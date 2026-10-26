@@ -7,8 +7,11 @@ entry: py -3.12 scripts/stage0/spike3_win_wal.py --case <case-id> --evidence-dir
 revision: 本檔 git blob sha1（執行時由腳本計算並寫入證據 artifact.revision；等同 git rev-parse HEAD:scripts/stage0/spike3_win_wal.py）；
   被測 sw_core 以 artifact.tree_sha256（sw_core.release_manifest.tree_sha256）與 artifact.git_head（git rev-parse HEAD）記錄。
 expected: 各案主測皆由 scripts/stage0/av_sim.py helper 以不含 FILE_SHARE_DELETE 的共用模式
-  （seeded 持有 10–500 ms）注入；另在相同 WAL 目錄執行獨立的 FILE_SHARE_DELETE + RH oplock 變體：
+  （seeded 持有 10–500 ms）注入；另在隔離的 oplock-variant WAL 目錄執行獨立的
+  FILE_SHARE_DELETE + RH oplock 變體：
   每次 WalWriter.append 實際耗時（毫秒）記入主案例及 oplock 變體樣本；兩組都須符合 OD-22 p99 ≤ 100 ms、最大值 ≤ 600 ms；
+  變體另記錄 lease 內實際 rename request 與完成時間、兩者所屬 append 時間窗及耗時；request 必須在 lease 內，
+  completion 可晚於 lease 到期但仍須落在完成它的 append 時間窗內，且 request 至 completion 不得超過 600 ms；
   win-wal-av-rotate：輪替最終完成、總筆數與 seq 連續（1..N）、干擾實際觀察到（grabs≥1、rotate_retry≥1）、延後佇列清空；
   win-wal-av-unlink：外部 unlink 有界重試至成功，WAL_RECREATED_AFTER_EXTERNAL_UNLINK META 正確、range_known 依實況；
   win-wal-av-reader-handle：無 FILE_SHARE_DELETE 的外部 reader 期間 rotation_failed 為真、紀錄不遺失、write_failures 為 0、延後佇列清空；
@@ -94,23 +97,75 @@ class Recorder:
 class _MeasuredWalWriter:
     """轉送 WAL writer 呼叫，並記錄每次 append 的實際耗時（毫秒）。"""
 
-    def __init__(self, writer: Any, rec: Recorder) -> None:
+    def __init__(self, writer: Any, rec: Recorder, *, rename_probe: Any | None = None) -> None:
         self._writer = writer
         self._rec = rec
+        self._rename_probe = rename_probe
         self._rec.observations["append_latency_ms"] = []
         self._rec.observations["append_count"] = 0
+        self.last_append_index = 0
+        self.last_append_started_ns: int | None = None
+        self.last_append_completed_ns: int | None = None
 
     def append(self, *args: Any, **kwargs: Any) -> Any:
-        started = time.perf_counter_ns()
+        self.last_append_started_ns = time.monotonic_ns()
+        self.last_append_index = self._rec.observations["append_count"] + 1
+        event_start = len(self._rename_probe.events) if self._rename_probe is not None else 0
         try:
-            return self._writer.append(*args, **kwargs)
+            result = self._writer.append(*args, **kwargs)
+            if (isinstance(result, dict) and result.get("rotation_failed") is True
+                    and self._rec.observations.get("stimulus_started_ns") is None
+                    and "lease_acquired_ns" in self._rec.observations):
+                # WalWriter 回報首次真實 rotate retry；記 append 進入點，不等後續成功 archive。
+                self._rec.observations["stimulus_started_ns"] = self.last_append_started_ns
+            return result
         finally:
-            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+            self.last_append_completed_ns = time.monotonic_ns()
+            elapsed_ms = (self.last_append_completed_ns - self.last_append_started_ns) / 1_000_000
             self._rec.observations["append_latency_ms"].append(elapsed_ms)
             self._rec.observations["append_count"] += 1
+            if self._rename_probe is not None:
+                for event in self._rename_probe.events[event_start:]:
+                    event.update({
+                        "append_index": self.last_append_index,
+                        "append_started_ns": self.last_append_started_ns,
+                        "append_completed_ns": self.last_append_completed_ns,
+                    })
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._writer, name)
+
+
+class _WalRenameProbe:
+    """記錄現行 WAL 歸檔的實際 rename 呼叫起點與完成點。"""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+
+class _TimedWalFs:
+    """保留平台 WalFs 行為，並分開量測 raw.wal.ndjson rename 區間。"""
+
+    def __init__(self, delegate: Any, probe: _WalRenameProbe) -> None:
+        self._delegate = delegate
+        self._probe = probe
+
+    def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str:
+        event = None
+        if Path(src).name == "raw.wal.ndjson":
+            event = {"requested_ns": time.monotonic_ns(), "completed_ns": None, "succeeded": False}
+            self._probe.events.append(event)
+        try:
+            result = self._delegate.rename_noreplace_or_suffix(src, base_dst)
+            if event is not None:
+                event["succeeded"] = True
+            return result
+        finally:
+            if event is not None:
+                event["completed_ns"] = time.monotonic_ns()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
 
 
 def _now() -> str:
@@ -436,6 +491,7 @@ class AvHelper:
         self._evidence_key = variant
         self.lease_acquired_ns: int | None = None
         self.lease_until_ns: int | None = None
+        self.lease_request_id: str | None = None
         evidence = self._evidence()
         if variant is None:
             self._rec.observations["av_sim"] = evidence
@@ -443,13 +499,16 @@ class AvHelper:
             self._rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = evidence
 
     def _evidence(self) -> dict[str, Any]:
-        return {
+        evidence = {
             **_av_sim_module().describe(self._seed, oplock=self._oplock),
             "launch_error": "not_started",
             "grabs": None,
             "open_errors": None,
             "helper_exit": None,
         }
+        if self._oplock:
+            evidence.update({"lease_request_id": None, "oplock_breaks": []})
+        return evidence
 
     def _payload(self) -> dict[str, Any]:
         root = self._rec.observations["av_sim"]
@@ -550,6 +609,9 @@ class AvHelper:
                             break
                         self.lease_acquired_ns = acquired_ns
                         self.lease_until_ns = until_ns
+                        self.lease_request_id = request_id
+                        if self._oplock:
+                            self._payload()["lease_request_id"] = request_id
                         self._rec.step(
                             f"av_sim_helper_rearmed{':' + self._variant if self._variant else ''}", "ok",
                         )
@@ -580,12 +642,15 @@ class AvHelper:
                 self._proc.kill()
                 exit_code = self._proc.wait()
         summary: dict[str, Any] = {}
+        oplock_breaks: list[dict[str, Any]] = []
         try:
             for line in self._log.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     row = json.loads(line)
                     if row.get("event") == "summary":
                         summary = row
+                    elif row.get("event") == "oplock_break":
+                        oplock_breaks.append(row)
         except (OSError, ValueError):
             summary = {}
         self._payload().update({
@@ -594,6 +659,8 @@ class AvHelper:
             "helper_exit": exit_code,
             "oplock": summary.get("oplock", "unavailable" if self._oplock else "not_requested"),
         })
+        if self._oplock:
+            self._payload()["oplock_breaks"] = oplock_breaks
 
 
 def _start_av_helper_with_wal(
@@ -615,11 +682,27 @@ def _start_av_helper_with_wal(
     return helper
 
 
+def _record_main_lease(rec: Recorder, helper: AvHelper) -> None:
+    """保留主案例刺激開始時的 seeded lease 區間；缺時間戳必須由 schema 拒絕。"""
+    rec.observations.update({
+        "lease_acquired_ns": helper.lease_acquired_ns,
+        "stimulus_started_ns": None,
+        "lease_until_ns": helper.lease_until_ns,
+    })
+
+
+def _record_append_stimulus(rec: Recorder, writer: _MeasuredWalWriter) -> None:
+    """將刺激時間綁定到實際觸發 WAL append 的 monotonic 起點。"""
+    if rec.observations.get("stimulus_started_ns") is None:
+        rec.observations["stimulus_started_ns"] = writer.last_append_started_ns
+
+
 def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
     """在隔離 WAL 目錄執行獨立 append／rotate／F12 workload，結果與主案例分開記錄。"""
     from realhw import wal_oracle
     from realhw.wal_oracle import verify_record
     from sw_core.wal import WalWriter
+    from sw_core.wal_fs import default_wal_fs
 
     oplock_dir = wal_dir / "oplock-variant"
     oplock_dir.mkdir(parents=True, exist_ok=True)
@@ -627,10 +710,17 @@ def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
     writer: _MeasuredWalWriter | None = None
     helper: AvHelper | None = None
     res_pre = res_post = None
-    lease_acquired_ns = lease_until_ns = stimulus_started_ns = rotation_completed_ns = None
+    lease_acquired_ns = lease_until_ns = stimulus_started_ns = None
+    archive_scan_elapsed_ms = 0.0
+    oracle_wait_elapsed_ms = 0.0
+    rotation_probe = _WalRenameProbe()
     try:
         writer = _MeasuredWalWriter(
-            WalWriter(wal_dir=str(oplock_dir), rotate_bytes=SMALL_ROTATE_BYTES), variant_rec,
+            WalWriter(
+                wal_dir=str(oplock_dir), rotate_bytes=SMALL_ROTATE_BYTES,
+                fs=_TimedWalFs(default_wal_fs(), rotation_probe),
+            ),
+            variant_rec, rename_probe=rotation_probe,
         )
         wal_path = str(oplock_dir / "raw.wal.ndjson")
         writer.append(com="COM0", direction="TX", source="spike3-oplock",
@@ -645,25 +735,40 @@ def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
         marker_pre = b"SPIKE3-OPLOCK-MARKER-PRE"
         marker_post = b"SPIKE3-OPLOCK-MARKER-POST"
         archive_pattern = str(oplock_dir / "raw.wal.ndjson*")
-        archive_paths_before = set(glob.glob(archive_pattern))
-        stimulus_started_ns = time.monotonic_ns()
+        def scan_archives() -> set[str]:
+            nonlocal archive_scan_elapsed_ms
+            started = time.perf_counter_ns()
+            try:
+                return set(glob.glob(archive_pattern))
+            finally:
+                archive_scan_elapsed_ms += (time.perf_counter_ns() - started) / 1_000_000
+
+        def wait_for_marker(*args: Any, **kwargs: Any) -> Any:
+            nonlocal oracle_wait_elapsed_ms
+            started = time.perf_counter_ns()
+            try:
+                return wal_oracle.wait_for_marker(*args, **kwargs)
+            finally:
+                oracle_wait_elapsed_ms += (time.perf_counter_ns() - started) / 1_000_000
+
+        archive_paths_before = scan_archives()
         writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=marker_pre,
                       cmd_id="spike3-oplock-f12")
-        rotation_completed_ns = None
-        current_archives = set(glob.glob(archive_pattern))
+        current_archives = scan_archives()
         if current_archives - archive_paths_before:
-            rotation_completed_ns = time.monotonic_ns()
-        res_pre = wal_oracle.wait_for_marker(
+            archive_paths_before = current_archives
+        res_pre = wait_for_marker(
             cursor, marker=marker_pre, cmd_id="spike3-oplock-f12", timeout_s=10.0,
         )
         for _ in range(ROTATE_CASE_RECORDS):
             writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=RECORD_PAYLOAD,
                           cmd_id="spike3-oplock-bulk")
-            if rotation_completed_ns is None and set(glob.glob(archive_pattern)) - archive_paths_before:
-                rotation_completed_ns = time.monotonic_ns()
+            current_archives = scan_archives()
+            if current_archives - archive_paths_before:
+                archive_paths_before = current_archives
         writer.append(com="COM0", direction="TX", source="spike3-oplock", payload=marker_post,
                       cmd_id="spike3-oplock-f12-post")
-        res_post = wal_oracle.wait_for_marker(
+        res_post = wait_for_marker(
             cursor, marker=marker_post, cmd_id="spike3-oplock-f12-post", timeout_s=10.0,
         )
         _drain_writer(writer, variant_rec)
@@ -694,6 +799,30 @@ def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
     )
     crc_errors = [error for error in (verify_record(record) for record in records) if error is not None]
     evidence = rec.observations["av_sim"]["variants"]["oplock"]
+    request_event = None
+    if rotation_probe.events:
+        request_event = next((event for event in rotation_probe.events
+                              if isinstance(lease_acquired_ns, int)
+                              and isinstance(lease_until_ns, int)
+                              and lease_acquired_ns <= event["requested_ns"] < lease_until_ns),
+                             rotation_probe.events[0])
+    completion_event = None
+    if request_event is not None:
+        completion_event = next((event for event in rotation_probe.events
+                                 if event["succeeded"]
+                                 and event["requested_ns"] >= request_event["requested_ns"]
+                                 and isinstance(event.get("completed_ns"), int)
+                                 and event["completed_ns"] >= request_event["requested_ns"]), None)
+    rotation_requested_ns = request_event.get("requested_ns") if request_event is not None else None
+    rotation_completed_ns = completion_event.get("completed_ns") if completion_event is not None else None
+    request_in_lease = (
+        isinstance(lease_acquired_ns, int) and not isinstance(lease_acquired_ns, bool)
+        and isinstance(rotation_requested_ns, int) and not isinstance(rotation_requested_ns, bool)
+        and isinstance(lease_until_ns, int) and not isinstance(lease_until_ns, bool)
+        and lease_acquired_ns <= rotation_requested_ns < lease_until_ns
+    )
+    if request_in_lease:
+        stimulus_started_ns = rotation_requested_ns
     workload = {
         "append_count": append_count,
         "append_latency_ms": variant_rec.observations["append_latency_ms"],
@@ -708,40 +837,84 @@ def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
                        "reason_code": res_pre.reason_code if res_pre else None},
         "post_rotate": {"ok": res_post.ok if res_post else None,
                         "reason_code": res_post.reason_code if res_post else None},
+        "archive_scan_elapsed_ms": archive_scan_elapsed_ms,
+        "oracle_wait_elapsed_ms": oracle_wait_elapsed_ms,
         "crc_errors": crc_errors,
         "lease_acquired_ns": lease_acquired_ns if helper is not None else None,
         "stimulus_started_ns": stimulus_started_ns if helper is not None else None,
+        "rotation_requested_ns": rotation_requested_ns if helper is not None else None,
         "rotation_completed_ns": rotation_completed_ns if helper is not None else None,
         "lease_until_ns": lease_until_ns if helper is not None else None,
+        "lease_request_id": evidence.get("lease_request_id"),
+        "oplock_breaks": evidence.get("oplock_breaks", []),
+        "rotation_attempt_count": len(rotation_probe.events),
+        "rotation_request_succeeded": request_event.get("succeeded") if request_event is not None else None,
+        "rotation_append_index": request_event.get("append_index") if request_event is not None else None,
+        "rotation_append_started_ns": request_event.get("append_started_ns") if request_event is not None else None,
+        "rotation_append_completed_ns": request_event.get("append_completed_ns") if request_event is not None else None,
+        "rotation_completion_succeeded": completion_event.get("succeeded") if completion_event is not None else None,
+        "rotation_completion_append_index": completion_event.get("append_index") if completion_event is not None else None,
+        "rotation_completion_append_started_ns": (
+            completion_event.get("append_started_ns") if completion_event is not None else None
+        ),
+        "rotation_completion_append_completed_ns": (
+            completion_event.get("append_completed_ns") if completion_event is not None else None
+        ),
         "interference_observed": (
-            isinstance(lease_acquired_ns, int) and not isinstance(lease_acquired_ns, bool)
-            and isinstance(stimulus_started_ns, int) and not isinstance(stimulus_started_ns, bool)
-            and isinstance(rotation_completed_ns, int) and not isinstance(rotation_completed_ns, bool)
-            and isinstance(lease_until_ns, int) and not isinstance(lease_until_ns, bool)
-            and lease_acquired_ns <= stimulus_started_ns <= rotation_completed_ns < lease_until_ns
+            request_in_lease
         ),
     }
     rec.observations["oplock_variant"] = workload
-    return (
-        evidence.get("helper_exit") == 0
-        and "oplock_variant_error" not in rec.observations
-        and "oplock_variant_close_error" not in rec.observations
+    helper_completed = (
+        evidence.get("launch_error") == "none" and evidence.get("helper_exit") == 0
         and isinstance(evidence.get("grabs"), int) and not isinstance(evidence.get("grabs"), bool)
         and evidence["grabs"] >= 1 and evidence.get("oplock") in {"granted", "denied", "unavailable"}
-        and append_count == ROTATE_CASE_RECORDS + 3 and len(archives) >= 1 and complete
-        and res_pre is not None and res_pre.ok and res_post is not None and res_post.ok
-        and health.get("deferred_delete_pending") == 0 and health.get("write_failures") == 0
-        and not crc_errors and workload["interference_observed"]
     )
+    if not helper_completed:
+        return "INSUFFICIENT_EVIDENCE"
+    if "oplock_variant_error" in rec.observations or "oplock_variant_close_error" in rec.observations:
+        return "INSUFFICIENT_EVIDENCE"
+    workload_failed = (
+        append_count != ROTATE_CASE_RECORDS + 3 or len(archives) < 1 or not complete
+        or res_pre is None or res_post is None or not res_pre.ok or not res_post.ok
+        or health.get("deferred_delete_pending") != 0 or health.get("write_failures") != 0
+        or bool(crc_errors) or completion_event is None
+    )
+    if workload_failed:
+        return "FAIL"
+    if not request_in_lease:
+        return "INSUFFICIENT_EVIDENCE"
+    lease_request_id = workload.get("lease_request_id")
+    break_rows = workload.get("oplock_breaks")
+    matching_breaks = [
+        row for row in break_rows if isinstance(row, dict) and row.get("request_id") == lease_request_id
+    ] if isinstance(break_rows, list) else []
+    if len(matching_breaks) != 1:
+        return "INSUFFICIENT_EVIDENCE"
+    break_row = matching_breaks[0]
+    break_notified_ns = break_row.get("break_notified_ns")
+    break_acknowledged_ns = break_row.get("acknowledged_ns")
+    if (
+        break_row.get("name") != "raw.wal.ndjson"
+        or break_row.get("break_completed") is not True
+        or break_row.get("ack_required") is not True
+        or break_row.get("ack_method") != "close_handle"
+        or not isinstance(break_notified_ns, int) or isinstance(break_notified_ns, bool)
+        or not isinstance(break_acknowledged_ns, int) or isinstance(break_acknowledged_ns, bool)
+        or not lease_acquired_ns <= rotation_requested_ns <= break_notified_ns <= break_acknowledged_ns
+        or not lease_until_ns <= break_acknowledged_ns <= rotation_completed_ns
+    ):
+        return "INSUFFICIENT_EVIDENCE"
+    return "PASS"
 
 
-def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
+def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> str:
     """子變體任一階段例外都轉為明確不足證據，不能中斷主案例證據輸出。"""
     try:
         return _collect_oplock_variant_impl(wal_dir, rec)
     except Exception as exc:  # noqa: BLE001 — evidence producer 必須保留例外並 fail closed
         rec.observations["oplock_variant_error"] = f"{type(exc).__name__}: {exc}"
-        return False
+        return "INSUFFICIENT_EVIDENCE"
 
 
 def _od22_latency_assessment(samples: Any, append_count: Any) -> dict[str, Any]:
@@ -818,8 +991,15 @@ def case_rotate(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
         writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
         rec.step("prefill_create_resident_wal", "ok")
         helper = _start_av_helper_with_wal(wal_dir, rec)
+        _record_main_lease(rec, helper)
+        archive_pattern = str(wal_dir / "raw.wal.ndjson*")
+        archive_paths_before = set(glob.glob(archive_pattern))
         for _ in range(ROTATE_CASE_RECORDS - 1):
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
+            current_archives = set(glob.glob(archive_pattern))
+            if current_archives - archive_paths_before:
+                _record_append_stimulus(rec, writer)
+                archive_paths_before = current_archives
         _drain_writer(writer, rec)
         rec.step("append_until_rotate_under_av_hold", "ok")
     finally:
@@ -876,12 +1056,15 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
         rec.step("prefill", "ok")
         # 先建立 WAL，再啟動 helper；ready 只在首次掃描完成後寫入，並帶回已持有檔名。
         helper = _start_av_helper_with_wal(wal_dir, rec)
+        _record_main_lease(rec, helper)
         wal_path = str(wal_dir / "raw.wal.ndjson")
         # 防毒持有期間外部 unlink 會因共用違規失敗；有界重試直到成功（unlink 須最終完成）。
         unlink_error: str | None = None
         deadline = time.monotonic() + UNLINK_RETRY_TIMEOUT_S
         while True:
             unlink_attempts += 1
+            if rec.observations.get("stimulus_started_ns") is None:
+                rec.observations["stimulus_started_ns"] = time.monotonic_ns()
             try:
                 if args.unlink_mode == "posix":
                     win32_files.delete_posix_semantics(wal_path)
@@ -979,6 +1162,7 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
         appended += 1
         rec.step("prefill_create_resident_wal", "ok")
         helper = _start_av_helper_with_wal(wal_dir, rec)
+        _record_main_lease(rec, helper)
         reader = kernel32.CreateFileW(wal_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                       None, OPEN_EXISTING, 0, None)
         if reader in (None, invalid_handle):
@@ -989,6 +1173,7 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
             appended += 1
             if out.get("rotation_failed"):
                 seen_rotation_failed = True
+                _record_append_stimulus(rec, writer)
         rec.step("append_during_reader_hold", "ok")
     finally:
         try:
@@ -1043,13 +1228,24 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
         # 先建立現行 WAL，再確認 helper 持有；常駐 writer 後續維持開啟供 F12 游標讀取。
         writer.append(com="COM0", direction="TX", source="spike3", payload=b"prefill", cmd_id="spike3-f12-prefill")
         helper = _start_av_helper_with_wal(wal_dir, rec)
+        _record_main_lease(rec, helper)
         cursor = wal_oracle.open_cursor(wal_path)
+        archive_pattern = str(Path(wal_path).parent / "raw.wal.ndjson*")
+        archive_paths_before = set(glob.glob(archive_pattern))
         rec.step("open_cursor_while_writer_resident", "ok")
         writer.append(com="COM0", direction="TX", source="spike3", payload=marker_pre, cmd_id="spike3-f12")
+        current_archives = set(glob.glob(archive_pattern))
+        if current_archives - archive_paths_before:
+            _record_append_stimulus(rec, writer)
+            archive_paths_before = current_archives
         res_pre = wal_oracle.wait_for_marker(cursor, marker=marker_pre, cmd_id="spike3-f12", timeout_s=10.0)
         rec.step("wait_marker_pre_rotate", "ok" if res_pre.ok else res_pre.reason_code)
         for _ in range(ROTATE_CASE_RECORDS):
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3-f12-bulk")
+            current_archives = set(glob.glob(archive_pattern))
+            if current_archives - archive_paths_before:
+                _record_append_stimulus(rec, writer)
+                archive_paths_before = current_archives
         writer.append(com="COM0", direction="TX", source="spike3", payload=marker_post, cmd_id="spike3-f12-post")
         res_post = wal_oracle.wait_for_marker(cursor, marker=marker_post, cmd_id="spike3-f12-post", timeout_s=10.0)
         rec.step("wait_marker_post_rotate", "ok" if res_post.ok else res_post.reason_code)
@@ -1141,11 +1337,14 @@ def run_case(args: argparse.Namespace) -> int:
         wal_dir_value = rec.observations.get("wal_dir")
         if "exception" not in rec.observations and isinstance(wal_dir_value, str) and Path(wal_dir_value).is_dir():
             try:
-                oplock_ok = _collect_oplock_variant(Path(wal_dir_value), rec)
+                oplock_status = _collect_oplock_variant(Path(wal_dir_value), rec)
             except Exception as exc:  # noqa: BLE001 —子變體不得阻止 case evidence 落盤
                 rec.observations["oplock_variant_error"] = f"{type(exc).__name__}: {exc}"
-                oplock_ok = False
-            if not oplock_ok and verdict == "PASS":
+                oplock_status = "INSUFFICIENT_EVIDENCE"
+            rec.observations["oplock_variant_status"] = oplock_status
+            if oplock_status == "FAIL":
+                verdict, fallback, code = "FAIL", "oplock 變體觀察到 WAL／rotation／F12 不變量失敗", 1
+            elif oplock_status != "PASS" and verdict == "PASS":
                 verdict, fallback, code = (
                     "INSUFFICIENT_EVIDENCE", "獨立 oplock 變體未取得有效 helper 證據", 1,
                 )

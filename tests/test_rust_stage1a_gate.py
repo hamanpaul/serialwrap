@@ -1252,15 +1252,32 @@ def _spike3_observations(case_id: str) -> dict[str, Any]:
     }[case_id]
     common = {
         "append_count": append_count, "append_latency_ms": [1.0] * append_count,
+        "lease_acquired_ns": 50, "stimulus_started_ns": 100, "lease_until_ns": 1000,
+        "oplock_variant_status": "PASS",
         "oplock_variant": {
             "append_count": 403, "append_latency_ms": [0.5] * 403,
             "archives": 1, "records": 403, "continuity_meta_count": 0,
             "first_seq": 1, "last_seq": 403, "seq_continuous": True,
             "rotate_retry": 0, "deferred_delete_pending": 0, "write_failures": 0,
             "pre_rotate": {"ok": True}, "post_rotate": {"ok": True}, "crc_errors": [],
+            "archive_scan_elapsed_ms": 0.2, "oracle_wait_elapsed_ms": 1.5,
             "interference_observed": True,
-            "lease_acquired_ns": 100, "stimulus_started_ns": 110,
-            "rotation_completed_ns": 150, "lease_until_ns": 200,
+            "lease_request_id": "oplock-lease-1",
+            "oplock_breaks": [{
+                "event": "oplock_break", "request_id": "oplock-lease-1", "name": "raw.wal.ndjson",
+                "lease_acquired_ns": 100, "lease_until_ns": 200,
+                "break_notified_ns": 150, "break_completed": True,
+                "ack_required": True, "ack_method": "close_handle",
+                "acknowledged_ns": 210, "observation_error": None,
+            }],
+            "lease_acquired_ns": 100, "stimulus_started_ns": 120,
+            "rotation_requested_ns": 120, "rotation_completed_ns": 250, "lease_until_ns": 200,
+            "rotation_attempt_count": 1, "rotation_request_succeeded": True,
+            "rotation_append_index": 1, "rotation_append_started_ns": 100,
+            "rotation_append_completed_ns": 500100,
+            "rotation_completion_succeeded": True, "rotation_completion_append_index": 1,
+            "rotation_completion_append_started_ns": 100,
+            "rotation_completion_append_completed_ns": 500100,
         },
     }
     if case_id == "win-wal-av-rotate":
@@ -1332,6 +1349,15 @@ def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor 
                        "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE",
                        "hold_ms_range": [10, 500], "seed": 20261023, "oplock": oplock,
                        "launch_error": "none", "grabs": 1, "open_errors": 0, "helper_exit": 0,
+                       "lease_request_id": "oplock-lease-1",
+                       "oplock_breaks": [{
+                           "event": "oplock_break", "request_id": "oplock-lease-1",
+                           "name": "raw.wal.ndjson", "lease_acquired_ns": 100,
+                           "lease_until_ns": 200, "break_notified_ns": 150,
+                           "break_completed": True, "ack_required": True,
+                           "ack_method": "close_handle", "acknowledged_ns": 210,
+                           "observation_error": None,
+                       }],
                    }}},
         "binary_integrity": {
             "subjects": subjects,
@@ -1462,16 +1488,45 @@ def test_spike3_oplock_variant_errors_are_insufficient(tmp_path, error_key):
 
 
 def test_spike3_oplock_grabs_without_live_rotation_are_insufficient(tmp_path):
-    """歷史 grabs 不可替代與 lease 同時發生的 append／rotation 刺激。"""
+    """rotation 必須在 lease 內提出；oplock break ACK 可使完成時間晚於 lease。"""
     gate = _load_gate_module()
     head = "a" * 40
     doc = _spike3_doc(head)
     doc["observations"]["oplock_variant"].update({
         "lease_acquired_ns": 100,
-        "stimulus_started_ns": 110,
+        "stimulus_started_ns": 120,
+        "rotation_requested_ns": 120,
         "lease_until_ns": 200,
-        "rotation_completed_ns": 201,
+        "rotation_completed_ns": 250,
     })
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    evidence_path = evidence_dir / f"{SP}.json"
+    evidence_path.write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "PASS", reasons
+
+    doc["observations"]["oplock_variant"]["rotation_requested_ns"] = 200
+    doc["observations"]["oplock_variant"]["stimulus_started_ns"] = 200
+    evidence_path.write_text(json.dumps(doc), encoding="utf-8")
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+    assert status == "evidence-insufficient", reasons
+    assert any("rotation_requested_ns 必須位於 lease 有效區間" in reason for reason in reasons), reasons
+
+
+def test_spike3_oplock_unbounded_completion_cannot_pass(tmp_path):
+    """rename 完成時間須與實際 append 樣本相符並受 OD-22 上限涵蓋。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    workload = doc["observations"]["oplock_variant"]
+    workload["rotation_completed_ns"] = workload["rotation_requested_ns"] + 10_000_000_000
     evidence_dir = tmp_path / "spike3"
     evidence_dir.mkdir()
     (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
@@ -1481,7 +1536,8 @@ def test_spike3_oplock_grabs_without_live_rotation_are_insufficient(tmp_path):
     )
 
     assert status == "evidence-insufficient", reasons
-    assert any("rotation_completed_ns 必須位於 lease 有效區間" in reason for reason in reasons), reasons
+    assert any("rotation completion 須落在完成它的 WalWriter.append 時間窗內" in reason
+               for reason in reasons), reasons
 
 
 def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
@@ -1517,12 +1573,30 @@ def test_spike3_missing_append_latency_measurements_is_insufficient(tree):
 
 
 def test_spike3_owner_latency_bound_not_decided_cannot_pass(tree):
-    """保留凍結 nodeid：OD-22 核准後，合格延遲樣本應解除原 owner block。"""
+    """保留凍結 nodeid：主案例缺 lease 時間戳不足；有效樣本與 lease 證據可通過。"""
     def set_valid_latency_samples(doc: dict[str, Any]) -> None:
         doc["observations"]["append_latency_ms"] = [2.0, *([1.0] * 399)]
 
-    _enable_spike3(tree, mutate=set_valid_latency_samples)
+    def missing_main_lease(doc: dict[str, Any]) -> None:
+        set_valid_latency_samples(doc)
+        doc["observations"].pop("lease_acquired_ns")
+
+    _enable_spike3(tree, mutate=missing_main_lease)
     code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+
+    def expired_main_stimulus(doc: dict[str, Any]) -> None:
+        set_valid_latency_samples(doc)
+        doc["observations"]["stimulus_started_ns"] = doc["observations"]["lease_until_ns"]
+
+    expired_tree = GateTree(tree.root.parent / "expired")
+    _enable_spike3(expired_tree, mutate=expired_main_stimulus)
+    code, rep = expired_tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+
+    valid_tree = GateTree(tree.root.parent / "valid")
+    _enable_spike3(valid_tree, mutate=set_valid_latency_samples)
+    code, rep = valid_tree.run()
     assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
     assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
     assert rep["overall"] == "IMPLEMENTED"
@@ -1667,9 +1741,17 @@ def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
         "no_archive", "marker", "records_invalid", "records_math", "meta_invalid", "first_seq", "last_seq",
         "sequence", "rotate_retry_invalid", "deferred_pending_invalid", "write_failures_invalid",
         "deferred_pending", "write_failures", "pre_marker", "post_marker", "crc_errors",
-        "interference_false", "lease_acquired_ns_missing",
+        "interference_false", "lease_acquired_ns_missing", "lease_request_id_missing",
+        "oplock_breaks_missing", "oplock_break_not_completed", "oplock_break_no_ack",
+        "oplock_break_ack_before_lease_expiry", "oplock_break_ack_after_rotation",
+        "oplock_break_request_mismatch",
         "stimulus_started_ns_missing", "rotation_completed_ns_missing", "lease_until_ns_missing",
-        "lease_timestamp_invalid", "stimulus_before_lease", "rotation_after_expiry", "interference_mismatch",
+        "rotation_attempt_count_missing", "rotation_request_succeeded_missing", "rotation_append_index_missing",
+        "rotation_append_started_ns_missing", "rotation_append_completed_ns_missing",
+        "rotation_completion_succeeded_missing", "rotation_completion_append_index_missing",
+        "rotation_completion_append_started_ns_missing", "rotation_completion_append_completed_ns_missing",
+        "lease_timestamp_invalid", "stimulus_before_lease", "rotation_after_expiry",
+        "stimulus_request_mismatch", "rotation_completion_after_append_window", "interference_mismatch",
     ],
 )
 def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
@@ -1719,6 +1801,16 @@ def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
             workload["crc_errors"].append("bad CRC")
         elif mutation == "interference_false":
             workload["interference_observed"] = False
+        elif mutation == "oplock_break_not_completed":
+            workload["oplock_breaks"][0]["break_completed"] = False
+        elif mutation == "oplock_break_no_ack":
+            workload["oplock_breaks"][0]["ack_required"] = False
+        elif mutation == "oplock_break_ack_before_lease_expiry":
+            workload["oplock_breaks"][0]["acknowledged_ns"] = workload["lease_until_ns"] - 1
+        elif mutation == "oplock_break_ack_after_rotation":
+            workload["oplock_breaks"][0]["acknowledged_ns"] = workload["rotation_completed_ns"] + 1
+        elif mutation == "oplock_break_request_mismatch":
+            workload["oplock_breaks"][0]["request_id"] = "different-lease"
         elif mutation.endswith("_missing"):
             workload.pop(mutation.removesuffix("_missing"))
         elif mutation == "lease_timestamp_invalid":
@@ -1726,7 +1818,12 @@ def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
         elif mutation == "stimulus_before_lease":
             workload["stimulus_started_ns"] = workload["lease_acquired_ns"] - 1
         elif mutation == "rotation_after_expiry":
-            workload["rotation_completed_ns"] = workload["lease_until_ns"]
+            workload["rotation_requested_ns"] = workload["lease_until_ns"]
+            workload["stimulus_started_ns"] = workload["lease_until_ns"]
+        elif mutation == "stimulus_request_mismatch":
+            workload["stimulus_started_ns"] = workload["rotation_requested_ns"] - 1
+        elif mutation == "rotation_completion_after_append_window":
+            workload["rotation_completed_ns"] = workload["rotation_requested_ns"] + 10_000_000_000
         else:
             workload["interference_observed"] = False
 

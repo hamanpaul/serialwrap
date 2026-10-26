@@ -266,6 +266,7 @@ def test_av_sim_oplock_variant_is_wired(monkeypatch):
 def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypatch, tmp_path):
     """Spike 3 主 helper 不帶 --oplock；oplock 只記入獨立變體。"""
     import importlib.util
+    from sw_core import wal_fs
 
     script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
     spec = importlib.util.spec_from_file_location("spike3_helper_modes_test", script)
@@ -290,6 +291,7 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             self.rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = {
                 **module._av_sim_module().describe(seed, oplock=oplock),
                 "launch_error": "not_started", "grabs": None, "open_errors": None, "helper_exit": None,
+                "lease_request_id": None, "oplock_breaks": [],
             }
 
         def start(self):
@@ -301,18 +303,50 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
 
         def arm_hold(self, _name):
             self.lease_acquired_ns = time.monotonic_ns()
-            self.lease_until_ns = self.lease_acquired_ns + 500_000_000
+            self.lease_until_ns = self.lease_acquired_ns + 50_000_000
+            self.lease_request_id = "stub-oplock-lease"
+            self.rec.observations["av_sim"]["variants"][self.variant]["lease_request_id"] = self.lease_request_id
             return True
 
         def stop(self):
             self.rec.observations["av_sim"]["variants"][self.variant].update(
-                {"grabs": 1, "helper_exit": 0, "oplock": "granted"}
+                {"grabs": 1, "helper_exit": 0, "oplock": "granted", "oplock_breaks": [{
+                    "event": "oplock_break", "request_id": self.lease_request_id, "name": "raw.wal.ndjson",
+                    "lease_acquired_ns": self.lease_acquired_ns, "lease_until_ns": self.lease_until_ns,
+                    "break_notified_ns": self.lease_acquired_ns + 25_000_000,
+                    "break_completed": True, "ack_required": True,
+                    "ack_method": "close_handle", "acknowledged_ns": self.lease_until_ns + 1,
+                }]}
             )
 
     monkeypatch.setattr(module, "AvHelper", StubHelper)
+    real_sleep = time.sleep
+    real_default_wal_fs = wal_fs.default_wal_fs
+
+    class DelayedRenameFs:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def rename_noreplace_or_suffix(self, src, base_dst):
+            real_sleep(0.06)
+            return self.delegate.rename_noreplace_or_suffix(src, base_dst)
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+    monkeypatch.setattr(wal_fs, "default_wal_fs", lambda: DelayedRenameFs(real_default_wal_fs()))
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
-    assert module._collect_oplock_variant(tmp_path, recorder) is True
+    status = module._collect_oplock_variant(tmp_path, recorder)
+    workload = recorder.observations.get("oplock_variant", {})
+    assert status == "PASS", {
+        "status": status,
+        "error": recorder.observations.get("oplock_variant_error"),
+        "rotation_requested_ns": workload.get("rotation_requested_ns"),
+        "rotation_completed_ns": workload.get("rotation_completed_ns"),
+        "lease_until_ns": workload.get("lease_until_ns"),
+        "oplock_breaks": workload.get("oplock_breaks"),
+    }
     assert recorder.observations["av_sim"]["variants"]["oplock"]["share_mode"] == (
         "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"
     )
@@ -331,10 +365,17 @@ def test_spike3_oplock_variant_failures_write_evidence(monkeypatch, tmp_path, fa
     _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_oplock_workload_failure_is_fail_not_missing_evidence(monkeypatch, tmp_path):
+    _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point="records")
+
+
 def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
     """oplock 持有期間須實際 append、跨 rotate，並由 F12 oracle 讀到前後 marker。"""
     import importlib.util
     from sw_core import wal
+    from sw_core import wal_fs
     from realhw import wal_oracle
 
     script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
@@ -345,17 +386,21 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
     events: list[tuple[str, int]] = []
 
     class FakeWriter:
-        def __init__(self, *, wal_dir, rotate_bytes):
+        def __init__(self, *, wal_dir, rotate_bytes, fs=None):
             self.wal_dir = Path(wal_dir)
             self.wal_dir.mkdir(parents=True, exist_ok=True)
             self.index = 0
+            self.fs = fs
 
         def append(self, *, payload, **_kwargs):
             self.index += 1
             if self.index == 1:
                 (self.wal_dir / "raw.wal.ndjson").write_bytes(b"prefill\n")
             elif self.index == 2:
-                (self.wal_dir / "raw.wal.ndjson.1").write_bytes(b"archive\n")
+                wal_path = self.wal_dir / "raw.wal.ndjson"
+                wal_path.write_bytes(b"rotation request\n")
+                assert self.fs is not None
+                self.fs.rename_noreplace_or_suffix(str(wal_path), f"{wal_path}.1")
             events.append(("append", self.index))
             return {"seq": self.index}
 
@@ -375,7 +420,7 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
             rec.observations.setdefault("av_sim", {}).setdefault("variants", {})[variant] = {
                 **module._av_sim_module().describe(seed, oplock=oplock),
                 "launch_error": "not_started", "grabs": None, "open_errors": None,
-                "helper_exit": None,
+                "helper_exit": None, "lease_request_id": None, "oplock_breaks": [],
             }
             self.rec = rec
             self.variant = variant
@@ -391,12 +436,20 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
         def arm_hold(self, _name):
             events.append(("helper_rearm", 0))
             self.lease_acquired_ns = time.monotonic_ns()
-            self.lease_until_ns = self.lease_acquired_ns + 500_000_000
+            self.lease_until_ns = self.lease_acquired_ns + 10_000_000
+            self.lease_request_id = "fake-oplock-lease"
+            self.rec.observations["av_sim"]["variants"][self.variant]["lease_request_id"] = self.lease_request_id
             return True
 
         def stop(self):
             self.rec.observations["av_sim"]["variants"][self.variant].update(
-                {"grabs": 1, "open_errors": 0, "helper_exit": 0, "oplock": "granted"}
+                {"grabs": 1, "open_errors": 0, "helper_exit": 0, "oplock": "granted", "oplock_breaks": [{
+                    "event": "oplock_break", "request_id": self.lease_request_id, "name": "raw.wal.ndjson",
+                    "lease_acquired_ns": self.lease_acquired_ns, "lease_until_ns": self.lease_until_ns,
+                    "break_notified_ns": self.lease_acquired_ns + 5_000_000,
+                    "break_completed": True, "ack_required": True,
+                    "ack_method": "close_handle", "acknowledged_ns": self.lease_until_ns + 1,
+                }]}
             )
 
     class OracleResult:
@@ -414,12 +467,32 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
 
     monkeypatch.setattr(module, "_drain_writer", drain_writer)
     monkeypatch.setattr(module.glob, "glob", real_glob)
-    monkeypatch.setattr(module, "_read_records", lambda _path: [{"seq": i} for i in range(1, 404)])
+    monkeypatch.setattr(
+        module, "_read_records",
+        lambda _path: [] if failure_point == "records" else [{"seq": i} for i in range(1, 404)],
+    )
     monkeypatch.setattr(module, "_continuity_meta_count", lambda _records: 0)
-    monkeypatch.setattr(module, "_seq_continuous", lambda _records: True)
+    monkeypatch.setattr(module, "_seq_continuous", lambda records: bool(records))
     monkeypatch.setattr(wal_oracle, "open_cursor", lambda _path: object())
     monkeypatch.setattr(wal_oracle, "wait_for_marker", lambda *_args, **_kwargs: OracleResult())
     monkeypatch.setattr(wal_oracle, "verify_record", lambda _row: None)
+    real_sleep = time.sleep
+
+    real_default_wal_fs = wal_fs.default_wal_fs
+
+    class DelayedRenameFs:
+        def __init__(self, delegate):
+            self.delegate = delegate
+
+        def rename_noreplace_or_suffix(self, src, base_dst):
+            # 模擬 oplock break 要等 lease 到期／handle close 才完成 ACK。
+            real_sleep(0.02)
+            return self.delegate.rename_noreplace_or_suffix(src, base_dst)
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+    monkeypatch.setattr(wal_fs, "default_wal_fs", lambda: DelayedRenameFs(real_default_wal_fs()))
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
     recorder = module.Recorder()
     recorder.observations["av_sim"] = {
@@ -428,9 +501,15 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
         "variants": {},
     }
 
-    assert module._collect_oplock_variant(tmp_path, recorder) is (failure_point is None)
+    expected_status = "PASS" if failure_point is None else (
+        "FAIL" if failure_point == "records" else "INSUFFICIENT_EVIDENCE"
+    )
+    assert module._collect_oplock_variant(tmp_path, recorder) == expected_status
 
     workload = recorder.observations["oplock_variant"]
+    if failure_point == "records":
+        assert workload["seq_continuous"] is False
+        return
     if failure_point is not None:
         error_key = "oplock_variant_error" if failure_point == "drain" else "oplock_variant_close_error"
         assert error_key in recorder.observations
@@ -442,15 +521,24 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
     assert workload["archives"] == 1
     assert workload["pre_rotate"]["ok"] is True and workload["post_rotate"]["ok"] is True
     assert workload["seq_continuous"] is True and workload["crc_errors"] == []
+    assert workload["rotation_requested_ns"] < workload["lease_until_ns"]
+    assert workload["rotation_completed_ns"] > workload["lease_until_ns"]
+    assert workload["interference_observed"] is True
+    assert workload["rotation_append_index"] <= workload["rotation_completion_append_index"]
+    assert workload["rotation_append_started_ns"] <= workload["rotation_requested_ns"]
+    assert workload["rotation_append_completed_ns"] >= workload["rotation_requested_ns"]
+    assert workload["rotation_completion_append_started_ns"] <= workload["rotation_completed_ns"]
+    assert workload["rotation_completion_append_completed_ns"] >= workload["rotation_completed_ns"]
 
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_oplock_request_uses_overlapped_fsctl_and_records_grant(monkeypatch):
-    """FSCTL_REQUEST_OPLOCK 以 overlapped I/O 提出 RH request，ERROR_IO_PENDING 表示已取得。"""
+    """FSCTL_REQUEST_OPLOCK 需記錄 break 通知，並以關閉 handle 確認 ACK 時點。"""
     av = _av()
     calls = {}
     closed = []
+    clock = iter((111, 222))
 
     class FakeFunction:
         def __init__(self, callback):
@@ -469,12 +557,20 @@ def test_oplock_request_uses_overlapped_fsctl_and_records_grant(monkeypatch):
 
     def device_io_control(*args):
         calls["device_io_control"] = args
+        args[4]._obj.Flags = av.REQUEST_OPLOCK_OUTPUT_FLAG_ACK_REQUIRED
         return 0
+
+    def get_overlapped_result(*args):
+        calls["get_overlapped_result"] = args
+        args[2]._obj.value = 0
+        return 1
 
     fake_kernel32 = type("FakeKernel32", (), {})()
     fake_kernel32.CreateFileW = FakeFunction(create_file)
     fake_kernel32.CreateEventW = FakeFunction(create_event)
     fake_kernel32.DeviceIoControl = FakeFunction(device_io_control)
+    fake_kernel32.WaitForSingleObject = FakeFunction(lambda *_args: av.WAIT_OBJECT_0)
+    fake_kernel32.GetOverlappedResult = FakeFunction(get_overlapped_result)
     fake_kernel32.CloseHandle = FakeFunction(lambda handle: closed.append(handle) or 1)
 
     lease, status = av._request_oplock(
@@ -491,6 +587,13 @@ def test_oplock_request_uses_overlapped_fsctl_and_records_grant(monkeypatch):
     assert calls["create_file"][2] & av._FILE_SHARE_DELETE
     assert calls["create_file"][5] & av._FILE_FLAG_OVERLAPPED
     assert closed == []
+    assert av._observe_oplock_break(lease, kernel32=fake_kernel32, monotonic_ns=lambda: next(clock))
+    assert lease.break_notified_ns == 111
+    assert lease.break_completed is True and lease.break_ack_required is True
+    av._close_lease(lease, kernel32=fake_kernel32, monotonic_ns=lambda: next(clock))
+    assert lease.break_ack_method == "close_handle"
+    assert lease.break_acknowledged_ns == 222
+    assert len(closed) == 2, "確認 oplock break 後須關閉檔案 handle，再關 notification event"
 
 
 @pytest.mark.posix_only
@@ -565,7 +668,7 @@ def test_native_av_sim_helper_holds_wal_and_writer_completes(tmp_path):
 @pytest.mark.windows_native
 @pytest.mark.process_rpc
 def test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live(tmp_path):
-    """原生 Windows 檔案系統上請求 oplock，並驗證 WAL 寫入、輪替及 seq 連續性。"""
+    """原生 Windows 檔案系統記錄 RH break 通知與 close ACK，並驗證 WAL 寫入／輪替。"""
     from sw_core.wal import WalWriter
     from sw_core.wal_fs import WindowsWalFs
 
@@ -606,9 +709,20 @@ def test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live(tmp_pat
         assert [path for path in wal_dir.iterdir() if path.name.startswith("raw.wal.ndjson.")]
         seqs = _read_all_seqs(wal_dir)
         assert seqs == list(range(1, len(seqs) + 1)), "oplock 變體期間 WAL seq 必須連續"
-        summary = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()][-1]
+        log_rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        summary = log_rows[-1]
         assert summary["event"] == "summary" and summary["grabs"] >= 1
-        assert summary["oplock"] in {"granted", "denied", "unavailable"}
+        assert summary["oplock"] == "granted"
+        break_rows = [row for row in log_rows if row.get("event") == "oplock_break"]
+        assert break_rows, "rotation 應觸發並記錄實際 RH oplock break 通知"
+        assert any(
+            row["break_completed"] is True and row["ack_required"] is True
+            and row["ack_method"] == "close_handle"
+            and isinstance(row["break_notified_ns"], int)
+            and isinstance(row["acknowledged_ns"], int)
+            and row["acknowledged_ns"] >= row["break_notified_ns"]
+            for row in break_rows
+        ), "oplock break 必須完成，並記錄關閉 handle 的隱含 ACK"
     finally:
         if writer is not None:
             writer.close()
@@ -629,7 +743,7 @@ def test_spike3_measured_writer_records_append_latency(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     ticks = iter([1_000_000, 3_500_000, 10_000_000, 13_250_000])
-    monkeypatch.setattr(module.time, "perf_counter_ns", lambda: next(ticks))
+    monkeypatch.setattr(module.time, "monotonic_ns", lambda: next(ticks))
     rec = module.Recorder()
 
     class FakeWriter:
@@ -1105,7 +1219,7 @@ def test_spike3_arm_hold_rearms_expired_ack_before_accepting(monkeypatch, tmp_pa
 @pytest.mark.memory_only
 @pytest.mark.parametrize(
     "response_mode",
-    ["wrong_request_id", "wrong_held_file", "hold_too_short", "helper_error", "invalid_times", "helper_exited", "timeout"],
+    ["wrong_request_id", "wrong_held_file", "hold_too_short", "hold_too_long", "helper_error", "invalid_times", "helper_exited", "timeout"],
 )
 def test_spike3_arm_hold_rejects_invalid_acknowledgements(monkeypatch, tmp_path, response_mode):
     """go／ack 不符、helper 錯誤、無效 lease、提前退出或逾時都不得取得成功。"""
@@ -1150,6 +1264,9 @@ def test_spike3_arm_hold_rejects_invalid_acknowledgements(monkeypatch, tmp_path,
             response["held_file"] = "other.wal.ndjson"
         elif response_mode == "hold_too_short":
             response["hold_ms"] = 9
+        elif response_mode == "hold_too_long":
+            response["hold_ms"] = 501
+            response["until_ns"] = response["acquired_ns"] + 501_000_000
         elif response_mode == "helper_error":
             response["error"] = "PermissionError: injected"
         elif response_mode == "invalid_times":
@@ -1216,8 +1333,18 @@ def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     events: list[tuple[str, int]] = []
+    clock_ns = [1_000_000_000]
+
+    def monotonic_ns() -> int:
+        value = clock_ns[0]
+        clock_ns[0] += 40_000_000
+        return value
+
+    monkeypatch.setattr(module.time, "monotonic_ns", monotonic_ns)
 
     class FakeWriter:
+        archive_created = False
+
         def __init__(self, *, wal_dir, rotate_bytes):
             self.wal_dir = Path(wal_dir)
             self.wal_dir.mkdir(parents=True, exist_ok=True)
@@ -1227,8 +1354,11 @@ def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
             self.index += 1
             if self.index == 1:
                 (self.wal_dir / "raw.wal.ndjson").write_bytes(b"prefill\n")
+            if self.index == 3:
+                # 首次 lease 內 rotation request 受阻；下一次 append 才成功建立 archive。
+                type(self).archive_created = True
             events.append(("append", self.index))
-            return {}
+            return {"rotation_failed": self.index == 2}
 
         def health(self):
             return {"rotate_retry": 1, "rotate_deferred": 0, "deferred_delete_pending": 0}
@@ -1242,10 +1372,14 @@ def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
     class FakeHelper:
         def __init__(self, _wal_dir, _seed, rec, **_kwargs):
             self.rec = rec
+            self.lease_acquired_ns = 0
+            self.lease_until_ns = 0
 
         def start(self):
             events.append(("helper_start", 0))
             self.rec.observations["av_sim"] = {"grabs": 1, "launch_error": "none"}
+            self.lease_acquired_ns = clock_ns[0]
+            self.lease_until_ns = self.lease_acquired_ns + 20_000_000
             return True
 
         def ready_holds(self, _name):
@@ -1264,11 +1398,12 @@ def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_work_dir", lambda _name: tmp_path)
     monkeypatch.setattr(module, "_drain_writer", lambda *_args: None)
     monkeypatch.setattr(module.glob, "glob", lambda _pattern: [
-        str(tmp_path / "raw.wal.ndjson"), str(tmp_path / "raw.wal.ndjson.1"),
+        str(tmp_path / "raw.wal.ndjson"),
+        *([str(tmp_path / "raw.wal.ndjson.1")] if FakeWriter.archive_created else []),
     ])
     monkeypatch.setattr(module, "_read_records", lambda _path: [{"seq": i} for i in range(1, 401)])
     monkeypatch.setattr(module, "_continuity_meta_count", lambda _records: 0)
-    monkeypatch.setattr(module, "_seq_continuous", lambda _records: True)
+    monkeypatch.setattr(module, "_seq_continuous", lambda records: bool(records))
     rec = module.Recorder()
 
     status, _reason = module.case_rotate(rec, module.argparse.Namespace())
@@ -1279,6 +1414,8 @@ def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
     assert events.index(("helper_start", 0)) < events.index(("rearm", 0))
     assert events.index(("rearm", 0)) < events.index(("append", 2))
     assert len([event for event in events if event[0] == "append"]) == 400
+    assert rec.observations["lease_acquired_ns"] <= rec.observations["stimulus_started_ns"]
+    assert rec.observations["stimulus_started_ns"] < rec.observations["lease_until_ns"]
 
 
 @pytest.mark.core_portable
@@ -1363,6 +1500,51 @@ def test_av_sim_run_helper_processes_go_request_and_publishes_live_ack(monkeypat
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_av_sim_rearm_oplock_result_updates_summary(monkeypatch, tmp_path):
+    """go/ack 重新取得的 RH oplock 結果須納入 helper 摘要。"""
+    av = _av()
+    wal_path = tmp_path / "raw.wal.ndjson"
+    wal_path.write_bytes(b"prefill\n")
+    go_file = tmp_path / "helper.go"
+    ack_file = tmp_path / "helper.ack"
+    ready_file = tmp_path / "helper.ready"
+    stop_file = tmp_path / "helper.stop"
+    log_file = tmp_path / "helper.jsonl"
+    go_file.write_text(json.dumps({"request_id": "oplock-rearm-1", "name": wal_path.name}), encoding="utf-8")
+    results = iter(["denied", "granted"])
+
+    class WindowsOSProxy:
+        name = "nt"
+        path = os.path
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+    class Handle:
+        @staticmethod
+        def close():
+            pass
+
+    real_exists = av.os.path.exists
+    monkeypatch.setattr(av, "os", WindowsOSProxy())
+    monkeypatch.setattr(av.os.path, "exists", lambda path: ack_file.is_file() if path == str(stop_file) else real_exists(path))
+    monkeypatch.setattr(av, "_request_oplock", lambda _path: (Handle(), next(results)))
+    monkeypatch.setattr(av, "_close_lease", lambda _lease: None)
+    monkeypatch.setattr(av.time, "sleep", lambda _seconds: None)
+
+    assert av.run_helper(
+        watch_dir=str(tmp_path), seed=SEED, duration_s=10.0,
+        ready_file=str(ready_file), stop_file=str(stop_file), log_file=str(log_file),
+        go_file=str(go_file), ack_file=str(ack_file), oplock=True,
+    ) == 0
+
+    rows = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert rows[-1]["event"] == "summary"
+    assert rows[-1]["oplock"] == "granted"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 @pytest.mark.parametrize("sharing_violation_first", [False, True])
 def test_spike3_unlink_verdict_requires_observed_sharing_violation(
     monkeypatch, tmp_path, sharing_violation_first: bool
@@ -1392,6 +1574,8 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
             return name == "raw.wal.ndjson"
 
         def arm_hold(self, name: str) -> bool:
+            self.lease_acquired_ns = time.monotonic_ns()
+            self.lease_until_ns = self.lease_acquired_ns + 500_000_000
             return name == "raw.wal.ndjson"
 
         def stop(self):

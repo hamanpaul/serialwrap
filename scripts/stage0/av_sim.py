@@ -66,8 +66,12 @@ _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 FSCTL_REQUEST_OPLOCK = (9 << 16) | (144 << 2)
 REQUEST_OPLOCK_CURRENT_VERSION = 1
 REQUEST_OPLOCK_INPUT_FLAG_REQUEST = 0x00000001
+REQUEST_OPLOCK_OUTPUT_FLAG_ACK_REQUIRED = 0x00000001
 OPLOCK_LEVEL_CACHE_READ = 0x00000001
 OPLOCK_LEVEL_CACHE_HANDLE = 0x00000002
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
+WAIT_FAILED = 0xFFFFFFFF
 
 
 class REQUEST_OPLOCK_INPUT_BUFFER(ctypes.Structure):
@@ -103,12 +107,18 @@ class _OVERLAPPED(ctypes.Structure):
 
 @dataclass
 class OplockLease:
-    """保持 overlapped oplock request 所需的 handle 與結構存活。"""
+    """保持 overlapped oplock request 與實際 break／acknowledgement 時點。"""
 
     handle: int
     event: int | None = None
     overlapped: _OVERLAPPED | None = None
     output: REQUEST_OPLOCK_OUTPUT_BUFFER | None = None
+    break_notified_ns: int | None = None
+    break_completed: bool | None = None
+    break_ack_required: bool | None = None
+    break_observation_error: int | None = None
+    break_ack_method: str | None = None
+    break_acknowledged_ns: int | None = None
 
 
 @dataclass
@@ -118,6 +128,9 @@ class HeldFile:
     until: float
     lease: OplockLease
     name: str
+    request_id: str | None = None
+    acquired_ns: int | None = None
+    until_ns: int | None = None
 
 
 class HoldSchedule:
@@ -262,18 +275,18 @@ def _open_share_hold(path: str) -> int:
     return int(handle)
 
 
-def _close_handle(handle: int) -> None:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
-    kernel32.CloseHandle(ctypes.c_void_p(handle))
+def _close_handle(handle: int, *, kernel32: Any | None = None) -> bool:
+    api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    api.CloseHandle.argtypes = [ctypes.c_void_p]
+    api.CloseHandle.restype = ctypes.c_int
+    return bool(api.CloseHandle(ctypes.c_void_p(handle)))
 
 
 def _request_oplock(path: str, *, kernel32: Any | None = None,
                     last_error: Callable[[], int] | None = None) -> tuple[OplockLease, str]:
     """以允許 delete 的 overlapped handle 申請 RH oplock，回傳 lease 與明確結果。"""
     api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
-    get_error = last_error or ctypes.get_last_error
+    get_error = last_error or getattr(ctypes, "get_last_error", lambda: 0)
     create = api.CreateFileW
     create.argtypes = [
         ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
@@ -328,11 +341,86 @@ def _request_oplock(path: str, *, kernel32: Any | None = None,
     return OplockLease(file_handle), "unavailable"
 
 
-def _close_lease(lease: OplockLease) -> None:
-    """先關閉檔案以結束 oplock request，再關閉其 notification event。"""
-    _close_handle(lease.handle)
+def _observe_oplock_break(
+    lease: OplockLease, *, kernel32: Any | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+    last_error: Callable[[], int] | None = None,
+) -> bool:
+    """輪詢 overlapped request event，讀取真實 break completion 與 ACK 要求旗標。"""
+    if lease.event is None or lease.overlapped is None or lease.break_notified_ns is not None:
+        return lease.break_notified_ns is not None
+    api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    get_error = last_error or getattr(ctypes, "get_last_error", lambda: 0)
+    now_ns = monotonic_ns or time.monotonic_ns
+    wait = api.WaitForSingleObject
+    wait.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    wait.restype = ctypes.c_uint32
+    status = int(wait(ctypes.c_void_p(lease.event), 0))
+    if status == WAIT_TIMEOUT:
+        return False
+    if status == WAIT_FAILED:
+        lease.break_observation_error = int(get_error())
+        return False
+    if status != WAIT_OBJECT_0:
+        lease.break_observation_error = status
+        return False
+
+    lease.break_notified_ns = int(now_ns())
+    if lease.output is None:
+        lease.break_completed = False
+        return True
+    transferred = ctypes.c_uint32()
+    get_result = api.GetOverlappedResult
+    get_result.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_OVERLAPPED), ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
+    ]
+    get_result.restype = ctypes.c_int
+    completed = bool(get_result(
+        ctypes.c_void_p(lease.handle), ctypes.byref(lease.overlapped), ctypes.byref(transferred), 0,
+    ))
+    lease.break_completed = completed
+    if completed:
+        lease.break_ack_required = bool(lease.output.Flags & REQUEST_OPLOCK_OUTPUT_FLAG_ACK_REQUIRED)
+    else:
+        lease.break_observation_error = int(get_error())
+    return True
+
+
+def _close_lease(
+    lease: OplockLease, *, kernel32: Any | None = None,
+    monotonic_ns: Callable[[], int] | None = None,
+) -> None:
+    """記錄 pending break，再關閉檔案 handle（Windows 隱含 ACK），最後關閉 event。"""
+    api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
+    now_ns = monotonic_ns or time.monotonic_ns
+    _observe_oplock_break(lease, kernel32=api, monotonic_ns=now_ns)
+    handle_closed = _close_handle(lease.handle, kernel32=api)
+    if lease.break_notified_ns is not None and handle_closed:
+        lease.break_ack_method = (
+            "close_handle" if lease.break_ack_required else "not_required"
+        )
+        lease.break_acknowledged_ns = int(now_ns())
     if lease.event is not None:
-        _close_handle(lease.event)
+        _close_handle(lease.event, kernel32=api)
+
+
+def _release_held_file(entry: HeldFile, events: list[dict[str, Any]]) -> None:
+    """關閉 helper lease 並保存可與 producer rename request 關聯的 break／ack 證據。"""
+    _close_lease(entry.lease)
+    lease = entry.lease
+    break_notified_ns = getattr(lease, "break_notified_ns", None)
+    break_observation_error = getattr(lease, "break_observation_error", None)
+    if break_notified_ns is not None or break_observation_error is not None:
+        events.append({
+            "event": "oplock_break", "name": entry.name, "request_id": entry.request_id,
+            "lease_acquired_ns": entry.acquired_ns, "lease_until_ns": entry.until_ns,
+            "break_notified_ns": break_notified_ns,
+            "break_completed": getattr(lease, "break_completed", None),
+            "ack_required": getattr(lease, "break_ack_required", None),
+            "ack_method": getattr(lease, "break_ack_method", None),
+            "acknowledged_ns": getattr(lease, "break_acknowledged_ns", None),
+            "observation_error": break_observation_error,
+        })
 
 
 def _publish_atomic_record(destination: str | Path, record: dict[str, Any]) -> None:
@@ -366,7 +454,7 @@ def _publish_ready_record(ready_file: str | Path, held_files: list[str]) -> None
 def _process_rearm_request(
     *, watch_dir: str, go_file: str, ack_file: str, seen_request_ids: set[str],
     holds: list[HeldFile], schedule: HoldSchedule, counts: dict[str, int],
-    events: list[dict[str, Any]], oplock: bool,
+    events: list[dict[str, Any]], oplock: bool, oplock_results: list[str] | None = None,
 ) -> None:
     """依 consumer 握手重新開啟既存 WAL，直接忽略首次掃描的 seen 去重。"""
     try:
@@ -390,21 +478,25 @@ def _process_rearm_request(
             raise FileNotFoundError(name)
         for entry in list(holds):
             if entry.name == name:
-                _close_lease(entry.lease)
+                _release_held_file(entry, events)
                 holds.remove(entry)
         hold = schedule.next_hold_s()
         if oplock:
             lease, oplock_result = _request_oplock(full)
+            if oplock_results is not None:
+                oplock_results.append(oplock_result)
         else:
             lease, oplock_result = OplockLease(_open_share_hold(full)), OPLOCK_STATUS
         acquired_ns = time.monotonic_ns()
-        until_ns = acquired_ns + int(round(hold * 1_000_000_000))
-        holds.append(HeldFile(until_ns / 1_000_000_000, lease, name))
+        hold_ms = int(round(hold * 1000))
+        until_ns = acquired_ns + hold_ms * 1_000_000
+        holds.append(HeldFile(until_ns / 1_000_000_000, lease, name,
+                              request_id=request_id, acquired_ns=acquired_ns, until_ns=until_ns))
         counts["grabs"] += 1
-        events.append({"event": "rearm", "name": name, "hold_ms": int(round(hold * 1000)),
+        events.append({"event": "rearm", "name": name, "hold_ms": hold_ms,
                        "oplock": oplock_result, "request_id": request_id,
                        "acquired_ns": acquired_ns, "until_ns": until_ns})
-        response.update({"held_file": name, "hold_ms": int(round(hold * 1000)),
+        response.update({"held_file": name, "hold_ms": hold_ms,
                          "acquired_ns": acquired_ns, "until_ns": until_ns})
     except OSError as exc:
         counts["open_errors"] += 1
@@ -432,8 +524,10 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
     while time.monotonic() < deadline and not os.path.exists(stop_file):
         now = time.monotonic()
         for entry in list(holds):
+            if oplock:
+                _observe_oplock_break(entry.lease)
             if now >= entry.until:
-                _close_lease(entry.lease)
+                _release_held_file(entry, events)
                 holds.remove(entry)
         try:
             names = os.listdir(watch_dir)
@@ -461,9 +555,14 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
                 counts["open_errors"] += 1
                 events.append({"event": "open_error", "name": name, "error": str(exc)})
                 continue
-            holds.append(HeldFile(now + hold, lease, name))
+            acquired_ns = time.monotonic_ns()
+            hold_ms = int(round(hold * 1000))
+            until_ns = acquired_ns + hold_ms * 1_000_000
+            holds.append(HeldFile(until_ns / 1_000_000_000, lease, name,
+                                  acquired_ns=acquired_ns, until_ns=until_ns))
             counts["grabs"] += 1
-            events.append({"event": "grab", "name": name, "hold_ms": int(round(hold * 1000)),
+            events.append({"event": "grab", "name": name, "hold_ms": hold_ms,
+                           "acquired_ns": acquired_ns, "until_ns": until_ns,
                            "oplock": oplock_result if oplock else OPLOCK_STATUS})
         if not ready_written:
             # ready 是首次掃描完成的確認；既有 WAL 也已在此之前取得 seeded handle。
@@ -472,17 +571,18 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
         _process_rearm_request(
             watch_dir=watch_dir, go_file=go_file, ack_file=ack_file,
             seen_request_ids=seen_request_ids, holds=holds, schedule=schedule,
-            counts=counts, events=events, oplock=oplock,
+            counts=counts, events=events, oplock=oplock, oplock_results=oplock_results,
         )
         time.sleep(WATCH_POLL_S)
     for entry in holds:
-        _close_lease(entry.lease)
+        _release_held_file(entry, events)
     oplock_status = (
         "granted" if "granted" in oplock_results else
         "denied" if "denied" in oplock_results else
         "unavailable" if oplock else OPLOCK_STATUS
     )
-    summary = {"event": "summary", "seed": int(seed), **counts, "oplock": oplock_status}
+    summary = {"event": "summary", "seed": int(seed), **counts, "oplock": oplock_status,
+               "oplock_break_count": sum(event.get("event") == "oplock_break" for event in events)}
     events.append(summary)
     Path(log_file).write_text(
         "".join(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n" for e in events),

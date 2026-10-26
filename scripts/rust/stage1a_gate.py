@@ -492,6 +492,21 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
         if drain.get("drained") is not True:
             reasons.append("observations.drain.drained 非 true")
 
+    main_lease_times = [
+        observations.get("lease_acquired_ns"),
+        observations.get("stimulus_started_ns"),
+        observations.get("lease_until_ns"),
+    ]
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+           for value in main_lease_times):
+        reasons.append("主案例 lease／stimulus 時間戳須為非負單調時鐘整數")
+    else:
+        acquired_ns, stimulus_ns, until_ns = main_lease_times
+        if not acquired_ns <= stimulus_ns < until_ns:
+            reasons.append("主案例 stimulus_started_ns 必須位於 lease 有效區間")
+    if observations.get("oplock_variant_status") != "PASS":
+        reasons.append("oplock_variant_status 須為 PASS 才能使 Spike 3 通過")
+
     oplock_workload = observations.get("oplock_variant")
     for key in ("oplock_variant_error", "oplock_variant_close_error"):
         if key in observations:
@@ -546,24 +561,105 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
                 reasons.append(f"observations.oplock_variant.{key}.ok 非 true")
         if oplock_workload.get("crc_errors") != []:
             reasons.append("observations.oplock_variant.crc_errors 必須是空陣列")
+        for key in ("archive_scan_elapsed_ms", "oracle_wait_elapsed_ms"):
+            value = oplock_workload.get(key)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or (isinstance(value, float) and not math.isfinite(value)) or value < 0):
+                reasons.append(f"observations.oplock_variant.{key} 須為有限非負毫秒數")
         if oplock_workload.get("interference_observed") is not True:
             reasons.append("observations.oplock_variant.interference_observed 非 true")
         lease_times = [
             oplock_workload.get("lease_acquired_ns"),
             oplock_workload.get("stimulus_started_ns"),
+            oplock_workload.get("rotation_requested_ns"),
             oplock_workload.get("rotation_completed_ns"),
             oplock_workload.get("lease_until_ns"),
+            oplock_workload.get("rotation_append_started_ns"),
+            oplock_workload.get("rotation_append_completed_ns"),
+            oplock_workload.get("rotation_completion_append_started_ns"),
+            oplock_workload.get("rotation_completion_append_completed_ns"),
         ]
         if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in lease_times):
             reasons.append("oplock 變體 lease／stimulus／rotation 時間戳須為非負單調時鐘整數")
         else:
-            acquired_ns, stimulus_ns, rotation_ns, until_ns = lease_times
-            if not acquired_ns <= stimulus_ns <= rotation_ns < until_ns:
-                reasons.append("rotation_completed_ns 必須位於 lease 有效區間，且 stimulus 必須在 lease 取得後")
-            if oplock_workload.get("interference_observed") is not (
-                acquired_ns <= stimulus_ns <= rotation_ns < until_ns
+            (acquired_ns, stimulus_ns, requested_ns, completed_ns, until_ns,
+             request_append_started_ns, request_append_completed_ns,
+             completion_append_started_ns, completion_append_completed_ns) = lease_times
+            if not acquired_ns <= stimulus_ns == requested_ns < until_ns:
+                reasons.append("rotation_requested_ns 必須位於 lease 有效區間，且 stimulus 必須在 lease 取得後")
+            if completed_ns < requested_ns:
+                reasons.append("rotation_completed_ns 不得早於 rotation_requested_ns")
+            if not request_append_started_ns <= requested_ns <= request_append_completed_ns:
+                reasons.append("rotation request 須落在提出它的 WalWriter.append 時間窗內")
+            if not completion_append_started_ns <= completed_ns <= completion_append_completed_ns:
+                reasons.append("rotation completion 須落在完成它的 WalWriter.append 時間窗內")
+            request_index = oplock_workload.get("rotation_append_index")
+            completion_index = oplock_workload.get("rotation_completion_append_index")
+            if (not isinstance(request_index, int) or isinstance(request_index, bool)
+                    or variant_count is None or request_index < 1 or request_index > variant_count):
+                reasons.append("rotation_append_index 須指向有效的 request append 樣本")
+            if (not isinstance(completion_index, int) or isinstance(completion_index, bool)
+                    or variant_count is None or completion_index < 1 or completion_index > variant_count):
+                reasons.append("rotation_completion_append_index 須指向有效的完成 append 樣本")
+            if (isinstance(request_index, int) and not isinstance(request_index, bool)
+                    and isinstance(completion_index, int) and not isinstance(completion_index, bool)
+                    and request_index > completion_index):
+                reasons.append("rotation completion append 不得早於 request append")
+            if oplock_workload.get("rotation_attempt_count", 0) < 1:
+                reasons.append("rotation_attempt_count 須至少一個實際 WalFs rename 呼叫")
+            if not isinstance(oplock_workload.get("rotation_request_succeeded"), bool):
+                reasons.append("rotation_request_succeeded 須記錄 request rename 呼叫結果")
+            if oplock_workload.get("rotation_completion_succeeded") is not True:
+                reasons.append("rotation_completion_succeeded 須為 true")
+            for append_index, started_ns, ended_ns, role in (
+                (request_index, request_append_started_ns, request_append_completed_ns, "request"),
+                (completion_index, completion_append_started_ns, completion_append_completed_ns, "completion"),
             ):
-                reasons.append("oplock_variant.interference_observed 與 lease／rotation 時間戳不一致")
+                if (isinstance(append_index, int) and not isinstance(append_index, bool)
+                        and isinstance(variant_samples, list) and 1 <= append_index <= len(variant_samples)):
+                    append_window_ms = (ended_ns - started_ns) / 1_000_000
+                    append_sample_ms = variant_samples[append_index - 1]
+                    if (isinstance(append_sample_ms, (int, float)) and not isinstance(append_sample_ms, bool)
+                            and math.isfinite(float(append_sample_ms))
+                            and append_window_ms > append_sample_ms + 1e-9):
+                        reasons.append(f"rotation {role} 時間窗超過其 append 延遲樣本，證據互相矛盾")
+            if oplock_workload.get("interference_observed") is not (
+                acquired_ns <= stimulus_ns == requested_ns < until_ns
+            ):
+                reasons.append("oplock_variant.interference_observed 與 lease／rotation request 時間戳不一致")
+            lease_request_id = oplock_workload.get("lease_request_id")
+            if not isinstance(lease_request_id, str) or not lease_request_id:
+                reasons.append("oplock_variant.lease_request_id 須為非空字串")
+            break_rows = oplock_workload.get("oplock_breaks")
+            matching_breaks = [
+                row for row in break_rows
+                if isinstance(row, dict) and row.get("request_id") == lease_request_id
+            ] if isinstance(break_rows, list) else []
+            if len(matching_breaks) != 1:
+                reasons.append("oplock lease 必須有且僅有一筆相符的實際 break 通知／ACK 記錄")
+            else:
+                break_row = matching_breaks[0]
+                break_notified_ns = break_row.get("break_notified_ns")
+                acknowledged_ns = break_row.get("acknowledged_ns")
+                break_times = (
+                    break_row.get("lease_acquired_ns"), break_row.get("lease_until_ns"),
+                    break_notified_ns, acknowledged_ns,
+                )
+                if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                       for value in break_times):
+                    reasons.append("oplock break／ACK 時間戳須為非負單調時鐘整數")
+                else:
+                    break_acquired_ns, break_until_ns, notified_ns, ack_ns = break_times
+                    if (break_row.get("event") != "oplock_break"
+                            or break_row.get("name") != "raw.wal.ndjson"
+                            or break_row.get("break_completed") is not True
+                            or break_row.get("ack_required") is not True
+                            or break_row.get("ack_method") != "close_handle"):
+                        reasons.append("oplock break 必須是實際完成且需要以關閉 handle 隱含 ACK 的記錄")
+                    if (break_acquired_ns != acquired_ns or break_until_ns != until_ns
+                            or not requested_ns <= notified_ns <= ack_ns
+                            or not until_ns <= ack_ns <= completed_ns):
+                        reasons.append("oplock break 通知／close ACK 須關聯同一 lease 並落在 rotation 完成區間")
 
     if cid == "win-wal-av-rotate":
         expected = int_at_least("expected_records", 1)
@@ -810,6 +906,16 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
                 f"{label} append 延遲最大值 {max_latency_ms:.6f} ms 超過 OD-22 上限 "
                 f"{OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:.6f} ms"
             )
+    oplock_observations = observations["oplock_variant"]
+    rotation_wait_ms = (
+        oplock_observations["rotation_completed_ns"]
+        - oplock_observations["rotation_requested_ns"]
+    ) / 1_000_000
+    if rotation_wait_ms > OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:
+        latency_failures.append(
+            f"oplock rotation completion 延遲 {rotation_wait_ms:.6f} ms 超過 OD-22 有界上限 "
+            f"{OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:.6f} ms"
+        )
     if latency_failures:
         return "FAIL", latency_failures
     return "PASS", []

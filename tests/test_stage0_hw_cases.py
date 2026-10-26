@@ -427,15 +427,31 @@ def test_spike3_evidence_schema_rejects_missing_edr():
         "steps": [{"op": "rotate", "ts": "2026-10-16T12:00:01Z", "result": "ok"}],
         "observations": {
             "append_count": 1, "append_latency_ms": [0.1], "rotated": True,
+            "oplock_variant_status": "PASS",
             "oplock_variant": {
                 "append_count": 1, "append_latency_ms": [0.1], "archives": 1, "records": 1,
                 "continuity_meta_count": 0, "first_seq": 1, "last_seq": 1,
                 "seq_continuous": True, "rotate_retry": 0, "deferred_delete_pending": 0,
                 "write_failures": 0, "pre_rotate": {"ok": True}, "post_rotate": {"ok": True},
+                "archive_scan_elapsed_ms": 0.1, "oracle_wait_elapsed_ms": 0.2,
                 "crc_errors": [], "interference_observed": True,
+                "lease_request_id": "oplock-lease-1",
+                "oplock_breaks": [{
+                    "event": "oplock_break", "request_id": "oplock-lease-1", "name": "raw.wal.ndjson",
+                    "lease_acquired_ns": 1, "lease_until_ns": 4,
+                    "break_notified_ns": 4, "break_completed": True,
+                    "ack_required": True, "ack_method": "close_handle",
+                    "acknowledged_ns": 5, "observation_error": None,
+                }],
+                "rotation_attempt_count": 1, "rotation_request_succeeded": True,
                 "lease_acquired_ns": 1, "stimulus_started_ns": 2,
-                "rotation_completed_ns": 3, "lease_until_ns": 4,
+                "rotation_requested_ns": 3, "rotation_completed_ns": 5, "lease_until_ns": 4,
+                "rotation_append_index": 1, "rotation_append_started_ns": 2,
+                "rotation_append_completed_ns": 6, "rotation_completion_succeeded": True,
+                "rotation_completion_append_index": 1, "rotation_completion_append_started_ns": 2,
+                "rotation_completion_append_completed_ns": 6,
             },
+            "lease_acquired_ns": 1, "stimulus_started_ns": 2, "lease_until_ns": 10,
         },
         "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
                    "hold_ms_range": [10, 500], "seed": 1, "oplock": "not_requested",
@@ -445,6 +461,15 @@ def test_spike3_evidence_schema_rejects_missing_edr():
                        "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE",
                        "hold_ms_range": [10, 500], "seed": 1, "oplock": "unavailable",
                        "launch_error": "none", "grabs": 1, "helper_exit": 0,
+                       "lease_request_id": "oplock-lease-1", "oplock_breaks": [
+                           {
+                               "event": "oplock_break", "request_id": "oplock-lease-1",
+                               "name": "raw.wal.ndjson", "lease_acquired_ns": 1, "lease_until_ns": 4,
+                               "break_notified_ns": 4, "break_completed": True,
+                               "ack_required": True, "ack_method": "close_handle",
+                               "acknowledged_ns": 5, "observation_error": None,
+                           }
+                       ],
                    }}},
         "binary_integrity": {
             "subjects": [{"path": "sw-core.exe", "exists_before": True, "exists_after": True,
@@ -466,10 +491,30 @@ def test_spike3_evidence_schema_rejects_missing_edr():
     without_integrity = {k: v for k, v in base.items() if k != "binary_integrity"}
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=without_integrity, schema=schema)
-    without_oplock = json.loads(json.dumps(base))
-    without_oplock["observations"].pop("oplock_variant")
+    for field in (
+        "append_count", "append_latency_ms", "archives", "records", "continuity_meta_count",
+        "first_seq", "last_seq", "seq_continuous", "rotate_retry", "deferred_delete_pending",
+        "write_failures", "pre_rotate", "post_rotate", "crc_errors", "interference_observed",
+        "lease_request_id", "oplock_breaks",
+        "archive_scan_elapsed_ms", "oracle_wait_elapsed_ms", "lease_acquired_ns",
+        "stimulus_started_ns", "rotation_requested_ns", "rotation_completed_ns", "lease_until_ns",
+        "rotation_attempt_count", "rotation_request_succeeded", "rotation_append_index",
+        "rotation_append_started_ns", "rotation_append_completed_ns", "rotation_completion_succeeded",
+        "rotation_completion_append_index", "rotation_completion_append_started_ns",
+        "rotation_completion_append_completed_ns",
+    ):
+        incomplete = json.loads(json.dumps(base))
+        incomplete["observations"]["oplock_variant"].pop(field)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=incomplete, schema=schema)
+    without_oplock_status = json.loads(json.dumps(base))
+    without_oplock_status["observations"].pop("oplock_variant_status")
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(instance=without_oplock, schema=schema)
+        jsonschema.validate(instance=without_oplock_status, schema=schema)
+    without_main_lease = json.loads(json.dumps(base))
+    without_main_lease["observations"].pop("lease_acquired_ns")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_main_lease, schema=schema)
     for field in (
         "lease_acquired_ns", "stimulus_started_ns", "rotation_completed_ns", "lease_until_ns",
     ):
@@ -477,6 +522,14 @@ def test_spike3_evidence_schema_rejects_missing_edr():
         without_live_lease["observations"]["oplock_variant"].pop(field)
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(instance=without_live_lease, schema=schema)
+    for field in (
+        "event", "request_id", "name", "lease_acquired_ns", "lease_until_ns", "break_notified_ns",
+        "break_completed", "ack_required", "ack_method", "acknowledged_ns", "observation_error",
+    ):
+        without_break_evidence = json.loads(json.dumps(base))
+        without_break_evidence["observations"]["oplock_variant"]["oplock_breaks"][0].pop(field)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=without_break_evidence, schema=schema)
 
 
 def test_kill_hook_ignored_on_non_isolated_instance(tmp_path, monkeypatch, caplog):

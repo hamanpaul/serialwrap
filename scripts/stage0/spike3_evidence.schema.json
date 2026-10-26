@@ -61,7 +61,10 @@
     },
     "observations": {
       "type": "object",
-      "required": ["append_count", "append_latency_ms", "oplock_variant"],
+      "required": [
+        "append_count", "append_latency_ms", "lease_acquired_ns", "stimulus_started_ns",
+        "lease_until_ns", "oplock_variant_status", "oplock_variant"
+      ],
       "properties": {
         "append_count": {
           "type": "integer",
@@ -74,6 +77,10 @@
           "minItems": 1,
           "items": {"type": "number", "minimum": 0}
         },
+        "lease_acquired_ns": {"type": "integer", "minimum": 0},
+        "stimulus_started_ns": {"type": "integer", "minimum": 0},
+        "lease_until_ns": {"type": "integer", "minimum": 0},
+        "oplock_variant_status": {"enum": ["PASS", "FAIL", "INSUFFICIENT_EVIDENCE"]},
         "oplock_variant": {
           "type": "object",
           "description": "OD-19 (2)：獨立 oplock helper 持有期間實際 append、rotate，並由 F12 oracle 證明前後 marker 進展。",
@@ -81,7 +88,12 @@
             "append_count", "append_latency_ms", "archives", "records", "continuity_meta_count",
             "first_seq", "last_seq", "seq_continuous", "rotate_retry", "deferred_delete_pending",
             "write_failures", "pre_rotate", "post_rotate", "crc_errors", "interference_observed",
-            "lease_acquired_ns", "stimulus_started_ns", "rotation_completed_ns", "lease_until_ns"
+            "archive_scan_elapsed_ms", "oracle_wait_elapsed_ms", "lease_acquired_ns",
+            "stimulus_started_ns", "rotation_requested_ns", "rotation_completed_ns", "lease_until_ns",
+            "rotation_attempt_count", "rotation_request_succeeded", "rotation_append_index",
+            "rotation_append_started_ns", "rotation_append_completed_ns", "rotation_completion_succeeded",
+            "rotation_completion_append_index", "rotation_completion_append_started_ns",
+            "rotation_completion_append_completed_ns", "lease_request_id", "oplock_breaks"
           ],
           "properties": {
             "append_count": {"type": "integer", "minimum": 1},
@@ -103,12 +115,49 @@
               "type": "object", "required": ["ok"], "additionalProperties": false,
               "properties": {"ok": {"type": ["boolean", "null"]}, "reason_code": {"type": ["string", "null"]}}
             },
+            "archive_scan_elapsed_ms": {"type": "number", "minimum": 0},
+            "oracle_wait_elapsed_ms": {"type": "number", "minimum": 0},
             "crc_errors": {"type": "array"},
             "interference_observed": {"type": "boolean"},
             "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
             "stimulus_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_requested_ns": {"type": ["integer", "null"], "minimum": 0},
             "rotation_completed_ns": {"type": ["integer", "null"], "minimum": 0},
-            "lease_until_ns": {"type": ["integer", "null"], "minimum": 0}
+            "lease_until_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_append_index": {"type": ["integer", "null"], "minimum": 1},
+            "rotation_append_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_append_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_attempt_count": {"type": "integer", "minimum": 0},
+            "rotation_request_succeeded": {"type": ["boolean", "null"]},
+            "rotation_completion_succeeded": {"type": ["boolean", "null"]},
+            "rotation_completion_append_index": {"type": ["integer", "null"], "minimum": 1},
+            "rotation_completion_append_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_completion_append_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+            "lease_request_id": {"type": ["string", "null"], "minLength": 1},
+            "oplock_breaks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "event", "request_id", "name", "lease_acquired_ns", "lease_until_ns", "break_notified_ns",
+                  "break_completed", "ack_required", "ack_method", "acknowledged_ns", "observation_error"
+                ],
+                "properties": {
+                  "event": {"type": "string", "const": "oplock_break"},
+                  "request_id": {"type": ["string", "null"]},
+                  "name": {"type": "string"},
+                  "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "lease_until_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "break_notified_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "break_completed": {"type": ["boolean", "null"]},
+                  "ack_required": {"type": ["boolean", "null"]},
+                  "ack_method": {"type": ["string", "null"], "enum": ["close_handle", "not_required", null]},
+                  "acknowledged_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "observation_error": {"type": ["integer", "null"], "minimum": 0}
+                },
+                "additionalProperties": false
+              }
+            }
           },
           "additionalProperties": false
         }
@@ -134,7 +183,10 @@
           "properties": {
             "oplock": {
               "type": "object",
-              "required": ["mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs", "helper_exit"],
+              "required": [
+                "mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs",
+                "helper_exit", "lease_request_id", "oplock_breaks"
+              ],
               "properties": {
                 "mode": {"type": "string", "const": "oplock"},
                 "share_mode": {"type": "string", "const": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"},
@@ -144,7 +196,33 @@
                 "launch_error": {"type": "string"},
                 "grabs": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
                 "open_errors": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
-                "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "lease_request_id": {"type": ["string", "null"], "minLength": 1},
+                "oplock_breaks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "event", "name", "request_id", "lease_acquired_ns", "lease_until_ns",
+                      "break_notified_ns", "break_completed", "ack_required", "ack_method",
+                      "acknowledged_ns", "observation_error"
+                    ],
+                    "properties": {
+                      "event": {"type": "string", "const": "oplock_break"},
+                      "request_id": {"type": ["string", "null"]},
+                      "name": {"type": "string"},
+                      "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "lease_until_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "break_notified_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "break_completed": {"type": ["boolean", "null"]},
+                      "ack_required": {"type": ["boolean", "null"]},
+                      "ack_method": {"type": ["string", "null"], "enum": ["close_handle", "not_required", null]},
+                      "acknowledged_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "observation_error": {"type": ["integer", "null"], "minimum": 0}
+                    },
+                    "additionalProperties": false
+                  }
+                }
               },
               "additionalProperties": false
             }
