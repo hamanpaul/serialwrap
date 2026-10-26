@@ -2655,7 +2655,7 @@ cases:
   layer: L1.5
   platforms: [linux, windows]
   windows_status: gap
-  windows_gap_reason: assert_peer_closed 需 peer_state；Windows 由 win-com-cancel-close 承接
+  windows_gap_reason: Windows L1.5 案例尚未重跑；virtual com0com 啟用 peer_gate 時可提供 peer_state，win-com-cancel-close 仍是既有補充實測
   capabilities: [posix_pty, process_rpc]
   cli_stage: 1A
   daemon_slice: '2.1'

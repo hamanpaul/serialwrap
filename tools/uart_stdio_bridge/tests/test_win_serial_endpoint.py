@@ -71,6 +71,10 @@ class FakeSerial:
         del self.read_data[:size]
         return chunk
 
+    @property
+    def in_waiting(self) -> int:
+        return len(self.read_data)
+
     def close(self) -> None:
         self.closed = True
 
@@ -117,6 +121,65 @@ def _read_serial_n(ser: Any, n: int, timeout_s: float) -> bytes:
     while len(buf) < n and time.monotonic() < deadline:
         buf.extend(ser.read(n - len(buf)))
     return bytes(buf)
+
+
+class _ControlledClock:
+    """可明確推進的單調時鐘，供期限邊界測試避免毫秒級排程抖動。"""
+
+    def __init__(self) -> None:
+        self._now = 0.0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self._now
+
+    def advance(self, duration_s: float) -> None:
+        with self._lock:
+            self._now += max(0.0, duration_s)
+
+    def sleep(self, duration_s: float) -> None:
+        self.advance(duration_s)
+
+
+def _patch_endpoint_clock(patch: pytest.MonkeyPatch, clock: _ControlledClock) -> None:
+    """同時支援切換前後的 endpoint clock，讓期限案例固定在可重現時間線。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+
+    patch.setattr(endpoint_module.time, "monotonic", clock)
+    patch.setattr(endpoint_module, "_clock", clock, raising=False)
+
+
+class _AdvancingLock:
+    """持鎖前推進指定時間，確定性地模擬串行鎖等待。"""
+
+    def __init__(self, inner: Any, clock: _ControlledClock, delays_s: list[float]) -> None:
+        self._inner = inner
+        self._clock = clock
+        self._delays_s = list(delays_s)
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self._delays_s:
+            self._clock.advance(self._delays_s.pop(0))
+        if not blocking:
+            return self._inner.acquire(False)
+        if timeout == -1:
+            return self._inner.acquire(True)
+        return self._inner.acquire(True, timeout)
+
+    def release(self) -> None:
+        self._inner.release()
+
+    def locked(self) -> bool:
+        return self._inner.locked()
+
+    def __enter__(self) -> _AdvancingLock:
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.release()
+        return False
 
 
 # ---------------------------------------------------------------- 假 serial 測試（Linux／hosted CI 皆跑）
@@ -172,25 +235,32 @@ def test_write_some_rejects_impossible_accepted_lengths(fake_serial_module, acce
         ep.close()
 
 
-def test_io_does_not_reconfigure_unchanged_timeouts(fake_serial_module):
+def test_io_does_not_reconfigure_unchanged_timeouts(fake_serial_module, monkeypatch):
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
+    clock = _ControlledClock()
     fake = FakeSerial()
     ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
     ep.open()
     try:
-        ep.read(8, 0.01)
-        first_read_set_count = fake.timeout_assignments
-        ep.read(8, 0.01)
-        assert fake.timeout_assignments == first_read_set_count
+        with pytest.MonkeyPatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            ep.read(8, 0.01)
+            first_read_set_count = fake.timeout_assignments
+            ep.read(8, 0.01)
+            assert fake.timeout_assignments == first_read_set_count
 
-        ep.write_some(b"x", 0.01)
-        first_write_set_count = fake.write_timeout_assignments
-        ep.write_some(b"x", 0.01)
-        assert fake.write_timeout_assignments == first_write_set_count
+            ep.write_some(b"x", 0.01)
+            first_write_set_count = fake.write_timeout_assignments
+            ep.write_some(b"x", 0.01)
+            assert fake.write_timeout_assignments == first_write_set_count
 
-        ep.write_some(b"x", 0)
+            # 1 ms 是 Windows pySerial 可回報寫入長度的最短期限；受控時鐘避免系統計時粒度使期限先行到期。
+            assert ep.write_some(b"x", 0) == 1
         assert fake.write_timeout == pytest.approx(0.001)
+        assert fake.writes[-1] == b"x"
     finally:
         ep.close()
 
@@ -272,9 +342,11 @@ def test_reconnect_requires_peer_close_permission_for_open_handle(fake_serial_mo
         ep.close()
 
 
-def test_disconnected_endpoint_waits_then_reconnects(fake_serial_module):
+def test_disconnected_endpoint_waits_then_reconnects(fake_serial_module, monkeypatch):
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
+    clock = _ControlledClock()
     serials: list[FakeSerial] = []
 
     def factory(**kwargs: Any) -> FakeSerial:
@@ -285,15 +357,18 @@ def test_disconnected_endpoint_waits_then_reconnects(fake_serial_module):
     ep = WinSerialEndpoint("COMb", allow_peer_close=True, serial_factory=factory)
     ep.open()
     try:
-        ep.disconnect(remove_link=False)
+        with monkeypatch.context() as patch:
+            patch.setattr(endpoint_module, "_clock", clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            ep.disconnect(remove_link=False)
 
-        start = time.monotonic()
-        assert ep.read(16, 0.05) == b""
-        assert time.monotonic() - start >= 0.05
+            start = clock()
+            assert ep.read(16, 0.05) == b""
+            assert clock() - start == pytest.approx(0.05)
 
-        start = time.monotonic()
-        assert ep.write_some(b"x", 0.05) == 0
-        assert time.monotonic() - start >= 0.05
+            start = clock()
+            assert ep.write_some(b"x", 0.05) == 0
+            assert clock() - start == pytest.approx(0.05)
 
         assert ep.reconnect() == 2
         assert len(serials) == 2
@@ -331,7 +406,8 @@ def test_io_and_reconnect_are_serialized(fake_serial_module):
 
     def read_one() -> None:
         try:
-            ep.read(1, 0.01)
+            # 預留至少一個完整 pySerial 50 ms 量子，才能確定進入阻塞讀取。
+            ep.read(1, 0.1)
         except BaseException as exc:
             failures.append(exc)
 
@@ -557,6 +633,93 @@ def test_peer_gate_no_write_before_open(fake_serial_module):
         ep.close()
 
 
+@pytest.mark.parametrize("timeout_path", ["reconfigure", "already-configured"])
+def test_peer_gate_rechecks_dsr_after_waiting_for_write_lock(fake_serial_module, monkeypatch, timeout_path):
+    """等待寫入鎖期間 peer 關閉時，已通過前置 DSR 檢查的 bytes 仍不得送出。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    fake = PeerFakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.dsr_on = True
+    ep._peer_on_since = clock() - 0.25
+    assert ep.peer_open() is True
+    if timeout_path == "already-configured":
+        fake.write_timeout = 0.5
+        monkeypatch.setattr(ep, "_effective_write_timeout", lambda _requested, _remaining: 0.5)
+
+    waiting_for_write_lock = threading.Event()
+    original_acquire_until = ep._acquire_until
+
+    def observe_write_lock_wait(lock, deadline):
+        if lock is ep._write_io_lock:
+            waiting_for_write_lock.set()
+        return original_acquire_until(lock, deadline)
+
+    monkeypatch.setattr(ep, "_acquire_until", observe_write_lock_wait)
+    ep._write_io_lock.acquire()
+    result: list[int] = []
+    writer = threading.Thread(target=lambda: result.append(ep.write_some(b"B", 0.5)), daemon=True)
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            # _peer_on_since 與期限時鐘同源，避免 Windows 兩種時鐘原點差異影響 settle 判斷。
+            ep._peer_on_since = clock() - 0.25
+            assert ep.peer_open() is True
+            writer.start()
+            assert waiting_for_write_lock.wait(1.0)
+            fake.dsr_on = False
+            assert ep.peer_open() is False
+            ep._write_io_lock.release()
+            writer.join(2.0)
+        assert not writer.is_alive()
+        assert result == [0]
+        assert fake.writes == []
+        if timeout_path == "reconfigure":
+            assert fake.write_timeout_assignments == 0, "DSR 已低時不應再改寫會重設 COM handle 的 timeout"
+    finally:
+        if ep._write_io_lock.locked():
+            ep._write_io_lock.release()
+        writer.join(1.0)
+        ep.close()
+
+
+def test_peer_gate_rechecks_dsr_after_timeout_setter(fake_serial_module, monkeypatch):
+    """期限 setter 期間 peer 關閉時，setter 後的寫入閘仍須阻止 payload 進入 COM。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class PeerClosesDuringTimeoutSetter(PeerFakeSerial):
+        @property
+        def write_timeout(self) -> float | None:
+            return self._write_timeout
+
+        @write_timeout.setter
+        def write_timeout(self, value: float | None) -> None:
+            FakeSerial.write_timeout.fset(self, value)
+            self.dsr_on = False
+
+    fake = PeerClosesDuringTimeoutSetter()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        fake.dsr_on = True
+        ep._peer_on_since = clock() - 0.25
+        with monkeypatch.context() as patch:
+            patch.setattr(endpoint_module, "_clock", clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            assert ep.write_some(b"late", 0.5) == 0
+        assert fake.write_timeout_assignments == 1
+        assert fake.writes == []
+    finally:
+        ep.close()
+
+
 def test_peer_gate_settle_window_before_first_write(fake_serial_module):
     """DSR 剛轉高時（pySerial open 的 PurgeComm 可能尚未執行）不立即寫入，須過 settle 窗口。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
@@ -738,6 +901,13 @@ def test_open_endpoint_forwards_peer_gate(fake_serial_module):
 # ---------------------------------------------------------------- 並行期限與雙向靜止（G9：sol ca0106f Medium，failing-first）
 
 
+def test_endpoint_deadlines_use_high_resolution_counter(fake_serial_module):
+    """Windows 的期限時鐘必須使用 QPC-backed perf_counter，避免 monotonic 的粗粒度跳變。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+
+    assert endpoint_module._clock is time.perf_counter
+
+
 class TimedSerial(FakeSerial):
     """記錄每次 I/O 實際使用期限的替身，並偵測「I/O 進行中」時呼叫期限 setter 的情形。
 
@@ -812,30 +982,221 @@ class TimedSerial(FakeSerial):
                 self._active.discard("write")
 
 
-def test_concurrent_writes_each_use_own_deadline(fake_serial_module):
-    """第一筆寫入（5 s）進行中，第二筆（0.001 s）並行呼叫：第二筆不得在第一筆 I/O 進行中改寫期限；
+def test_read_recomputes_buffer_only_budget_after_read_lock_wait(fake_serial_module, monkeypatch):
+    """70 ms 讀取鎖等待後只剩 30 ms 時，不得再進入固定 50 ms 阻塞讀取。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class SlowEmptyReadSerial(FakeSerial):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = 1) -> bytes:
+            self.read_sizes.append(size)
+            clock.advance(float(self.timeout or 0.05))
+            return super().read(size)
+
+    fake = SlowEmptyReadSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    inner = ep._read_io_lock
+    ep._read_io_lock = _AdvancingLock(inner, clock, [0.07])
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            assert ep.read(16, 0.1) == b""
+        assert fake.read_sizes == [], "鎖等待後剩餘期限小於 50 ms，必須只檢查 driver buffer"
+    finally:
+        ep._read_io_lock = inner
+        ep.close()
+
+
+def test_write_recomputes_fast_path_budget_after_write_lock_wait(fake_serial_module, monkeypatch):
+    """200 ms 寫入等鎖 150 ms 後，pySerial write_timeout 只能使用剩下的 50 ms。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake._write_timeout = 0.2
+    lock_waiting = threading.Event()
+    original_acquire_until = ep._acquire_until
+
+    def observe_wait(lock: Any, deadline: float) -> bool:
+        if lock is ep._write_io_lock:
+            lock_waiting.set()
+        return original_acquire_until(lock, deadline)
+
+    monkeypatch.setattr(ep, "_acquire_until", observe_wait)
+    ep._write_io_lock.acquire()
+    result: list[int] = []
+    writer = threading.Thread(target=lambda: result.append(ep.write_some(b"B", 0.2)), daemon=True)
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            writer.start()
+            assert lock_waiting.wait(1.0)
+            clock.advance(0.15)
+            ep._write_io_lock.release()
+            writer.join(2.0)
+        assert not writer.is_alive()
+        assert result == [1]
+        assert fake.write_timeouts_at_call == pytest.approx([0.05], abs=0.001)
+        assert fake.writes == [b"B"]
+    finally:
+        if ep._write_io_lock.locked():
+            ep._write_io_lock.release()
+        writer.join(1.0)
+        ep.close()
+
+
+def test_write_reconfiguration_recomputes_budget_after_read_lock_wait(fake_serial_module, monkeypatch):
+    """寫入期限設定等讀取鎖 50 ms 後，setter 必須採用縮短後的 150 ms。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    inner = ep._read_io_lock
+    ep._read_io_lock = _AdvancingLock(inner, clock, [0.05])
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            assert ep.write_some(b"W", 0.2) == 1
+        assert fake.write_timeouts_at_call == pytest.approx([0.15], abs=0.001)
+        assert fake.writes == [b"W"]
+    finally:
+        ep._read_io_lock = inner
+        ep.close()
+
+
+def test_expired_deadline_after_write_timeout_setter_does_not_send(fake_serial_module, monkeypatch):
+    """pySerial setter 推進時間跨過 deadline 後，不得送出任何 bytes。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class AdvancingSetterSerial(TimedSerial):
+        @property
+        def write_timeout(self) -> float | None:
+            return self._write_timeout
+
+        @write_timeout.setter
+        def write_timeout(self, value: float | None) -> None:
+            TimedSerial.write_timeout.fset(self, value)
+            clock.advance(0.101)
+
+    fake = AdvancingSetterSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            assert ep.write_some(b"late", 0.1) == 0
+        assert fake.writes == []
+    finally:
+        ep.close()
+
+
+def test_partial_setter_deadline_consumption_does_not_send_with_stale_timeout(fake_serial_module, monkeypatch):
+    """setter 消耗 150/200 ms 後，剩餘期限不足以沿用原 200 ms write_timeout。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class PartialBudgetSetterSerial(TimedSerial):
+        @property
+        def write_timeout(self) -> float | None:
+            return self._write_timeout
+
+        @write_timeout.setter
+        def write_timeout(self, value: float | None) -> None:
+            TimedSerial.write_timeout.fset(self, value)
+            clock.advance(0.15)
+
+    fake = PartialBudgetSetterSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            assert ep.write_some(b"late", 0.2) == 0
+        assert clock() == pytest.approx(0.15)
+        assert fake.write_timeout == pytest.approx(0.2)
+        assert fake.writes == [], "setter 後剩 50 ms，不可使用舊的 200 ms timeout 傳送 payload"
+    finally:
+        ep.close()
+
+
+def test_write_timeout_quantization_prevents_setter_churn(fake_serial_module, monkeypatch):
+    """期限剩餘量的亞毫秒抖動量化後不應每次寫入都重設 COM timeout。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake._write_timeout = 4.997  # 前一次合法設定；每次鎖等待後仍有 4.997 秒以上預算。
+    setter_count = fake.write_timeout_assignments
+    inner = ep._write_io_lock
+    ep._write_io_lock = _AdvancingLock(inner, clock, [0.0021, 0.0024, 0.0022, 0.0023, 0.0021, 0.0024])
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            for _ in range(6):
+                assert ep.write_some(b"x", 5.0) == 1
+        assert fake.write_timeout_assignments == setter_count
+        assert fake.write_timeouts_at_call == pytest.approx([4.997] * 6)
+        assert fake.writes == [b"x"] * 6
+    finally:
+        ep._write_io_lock = inner
+        ep.close()
+
+
+def test_concurrent_writes_each_use_own_deadline(fake_serial_module, monkeypatch):
+    """第一筆寫入（5 s）進行中，第二筆（0.2 s）並行呼叫：第二筆不得在第一筆 I/O 進行中改寫期限；
     兩筆實際送進 pySerial 的 write_timeout 各自為自己的期限。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    clock = _ControlledClock()
     fake = TimedSerial()
     ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
     ep.open()
     results: dict[str, int] = {}
+    second_waiting_for_write_lock = threading.Event()
+    original_acquire_until = ep._acquire_until
+
+    def observe_second_writer_wait(lock: Any, deadline: float) -> bool:
+        if lock is ep._write_io_lock and threading.current_thread().name == "second-writer":
+            second_waiting_for_write_lock.set()
+        return original_acquire_until(lock, deadline)
+
+    monkeypatch.setattr(ep, "_acquire_until", observe_second_writer_wait)
     fake.write_gate = threading.Event()
-    first = threading.Thread(target=lambda: results.__setitem__("A", ep.write_some(b"AAAA", 5.0)))
-    second = threading.Thread(target=lambda: results.__setitem__("B", ep.write_some(b"B", 0.001)))
+    first = threading.Thread(target=lambda: results.__setitem__("A", ep.write_some(b"AAAA", 5.0)), name="first-writer")
+    second = threading.Thread(target=lambda: results.__setitem__("B", ep.write_some(b"B", 0.2)), name="second-writer")
     try:
-        first.start()
-        assert fake.write_entered.wait(2)
-        second.start()
-        time.sleep(0.05)
-        assert fake.violations == [], "第一筆寫入進行中不得改寫期限"
-        fake.write_gate.set()
-        first.join(5)
-        second.join(5)
+        with monkeypatch.context() as patch:
+            patch.setattr(endpoint_module, "_clock", clock)
+            first.start()
+            assert fake.write_entered.wait(2)
+            second.start()
+            assert second_waiting_for_write_lock.wait(2)
+            assert fake.violations == [], "第一筆寫入進行中不得改寫期限"
+            fake.write_gate.set()
+            first.join(5)
+            second.join(5)
         assert not first.is_alive() and not second.is_alive()
         assert results == {"A": 4, "B": 1}
-        assert fake.write_timeouts_at_call == [5.0, 0.001]
+        assert fake.write_timeouts_at_call == pytest.approx([5.0, 0.2])
         assert fake.writes == [b"AAAA", b"B"]
         assert fake.violations == []
     finally:
@@ -845,18 +1206,151 @@ def test_concurrent_writes_each_use_own_deadline(fake_serial_module):
         ep.close()
 
 
-def test_write_deadline_survives_interleaved_call_before_io_lock(fake_serial_module):
-    """第一筆（5 s）已取得期限快照、尚未取得寫入串行鎖時，另一筆（0.001 s）完整執行：
-    第一筆仍須以自己的 5 s 寫入，不得沿用被改寫的期限（sol ca0106f 之原始交錯）。"""
+def test_write_timeout_is_reduced_by_time_spent_waiting_for_write_lock(fake_serial_module, monkeypatch):
+    """200 ms 呼叫先等寫入鎖 150 ms，pySerial 只能再等剩餘期限，不可重新取得完整 200 ms。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.base import EndpointWriteUncertain
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
+    clock = _ControlledClock()
+
+    class BudgetSerial(TimedSerial):
+        def write(self, data: bytes) -> int:
+            if data == b"B":
+                with self._guard:
+                    self._active.add("write")
+                    self.write_timeouts_at_call.append(self.write_timeout)
+                self.write_entered.set()
+                try:
+                    clock.advance(float(self.write_timeout or 0))
+                    raise fake_serial_module.SerialTimeoutException("write timeout")
+                finally:
+                    with self._guard:
+                        self._active.discard("write")
+            return super().write(data)
+
+    fake = BudgetSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    inner = ep._write_io_lock
+    ep._write_io_lock = _AdvancingLock(inner, clock, [0.15])
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(endpoint_module, "_clock", clock)
+            with pytest.raises(EndpointWriteUncertain):
+                ep.write_some(b"B", 0.2)
+        assert clock() == pytest.approx(0.2)
+        assert fake.write_timeouts_at_call == pytest.approx([0.05])
+    finally:
+        ep._write_io_lock = inner
+        ep.close()
+
+
+def test_peer_open_does_not_wait_for_close_blocked_by_write(fake_serial_module, monkeypatch):
+    """DSR 取樣不得等待控制面 close 因在途 write 而持有狀態鎖。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    class PeerSerial(TimedSerial):
+        dsr = True
+
+    fake = PeerSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.write_gate = threading.Event()
+    writer = threading.Thread(target=lambda: ep.write_some(b"A", 1.0))
+    closer = threading.Thread(target=ep.close)
+    peer_result: dict[str, bool | None] = {}
+    peer_done = threading.Event()
+
+    def sample_peer() -> None:
+        peer_result["open"] = ep.peer_open()
+        peer_done.set()
+
+    peer = threading.Thread(target=sample_peer)
+    try:
+        with monkeypatch.context() as patch:
+            # settle 起點與端點期限使用同一受控時鐘，避開 Windows monotonic/perf_counter 的不同原點。
+            patch.setattr(endpoint_module, "_clock", clock)
+            ep._peer_on_since = endpoint_module._clock() - 1.0
+            writer.start()
+            assert fake.write_entered.wait(2)
+            closer.start()
+            deadline = time.monotonic() + 2
+            while not ep._closed and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert ep._closed, "close 未進入等待在途 I/O 的區段"
+            peer.start()
+            assert peer_done.wait(0.1), "peer_open 不得等待阻塞寫入完成"
+            assert peer_result == {"open": True}
+            assert not fake.write_gate.is_set()
+            fake.write_gate.set()
+            writer.join(2)
+            closer.join(2)
+            peer.join(2)
+    finally:
+        fake.write_gate.set()
+        if writer.ident is not None:
+            writer.join(2)
+        if closer.ident is not None:
+            closer.join(2)
+        if peer.ident is not None:
+            peer.join(2)
+        ep.close()
+
+
+def test_write_expired_while_waiting_for_lock_is_not_sent(fake_serial_module):
+    """取得寫入鎖時期限已過，必須回 0 且不得送出任何 bytes。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = TimedSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    results: dict[str, int] = {}
+    second_done = threading.Event()
+    fake.write_gate = threading.Event()
+    first = threading.Thread(target=lambda: results.__setitem__("A", ep.write_some(b"A", 1.0)))
+    def _write_second() -> None:
+        results["B"] = ep.write_some(b"B", 0.05)
+        second_done.set()
+
+    second = threading.Thread(target=_write_second)
+    try:
+        first.start()
+        assert fake.write_entered.wait(2)
+        second.start()
+        assert second_done.wait(0.2), "期限到期後第二筆寫入必須在第一筆釋放鎖前返回"
+        assert fake.write_gate.is_set() is False
+        fake.write_gate.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive() and not second.is_alive()
+        assert results == {"A": 1, "B": 0}
+        assert fake.writes == [b"A"]
+    finally:
+        fake.write_gate.set()
+        first.join(1)
+        second.join(1)
+        ep.close()
+
+
+def test_write_deadline_survives_interleaved_call_before_io_lock(fake_serial_module, monkeypatch):
+    """第一筆（5 s）已取得期限快照、尚未取得寫入串行鎖時，另一筆（1 ms）完整執行：
+    第一筆仍須以自己的期限寫入，不得沿用被改寫的期限（sol ca0106f 之原始交錯）。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
     fake = TimedSerial()
     ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
     ep.open()
     interleaved: dict[str, int] = {}
     ep._write_io_lock = _HookedIoLock(ep._write_io_lock, lambda: interleaved.__setitem__("B", ep.write_some(b"B", 0.001)))
     try:
-        assert ep.write_some(b"AAAA", 5.0) == 4
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            assert ep.write_some(b"AAAA", 5.0) == 4
         assert interleaved == {"B": 1}
         assert fake.write_timeouts_at_call == [0.001, 5.0]
         assert fake.writes == [b"B", b"AAAA"]
@@ -971,7 +1465,8 @@ def test_write_timeout_setter_waits_for_inflight_read(fake_serial_module):
     ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
     ep.open()
     fake.read_gate = threading.Event()
-    reader = threading.Thread(target=lambda: ep.read(16, 0.05))
+    # 預留至少一個完整 pySerial 50 ms 量子，才能確定 setter 與讀取 I/O 重疊。
+    reader = threading.Thread(target=lambda: ep.read(16, 0.1))
     writer = threading.Thread(target=lambda: ep.write_some(b"W", 1.0))
     try:
         reader.start()
@@ -1045,7 +1540,7 @@ def test_long_read_deadline_uses_fixed_short_pyserial_timeout(fake_serial_module
 
 
 def test_first_write_reconfig_not_starved_by_busy_reader(fake_serial_module):
-    """讀取端緊密迴圈時，寫入端首次改期限（None→1.0）仍須在合理時間內完成（不得因讀取端搶佔而餓死）。"""
+    """讀取端緊密迴圈時，首次寫入期限設定仍須成功送出並於合理時間內完成。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
 
     fake = TimedSerial()
@@ -1055,7 +1550,7 @@ def test_first_write_reconfig_not_starved_by_busy_reader(fake_serial_module):
 
     def spin_read() -> None:
         while not stop.is_set():
-            ep.read(16, 0.05)
+            ep.read(16, 0.1)
 
     reader = threading.Thread(target=spin_read, daemon=True)
     reader.start()
@@ -1063,11 +1558,253 @@ def test_first_write_reconfig_not_starved_by_busy_reader(fake_serial_module):
         started = time.monotonic()
         assert ep.write_some(b"W", 1.0) == 1
         assert time.monotonic() - started < 2.0
+        assert fake.writes == [b"W"]
         assert fake.violations == []
     finally:
         stop.set()
         reader.join(5)
         ep.close()
+
+
+def test_first_write_reconfig_preempts_second_reader(fake_serial_module, monkeypatch):
+    """期限設定已等待讀取鎖時，第二個 reader 必須讓路到 setter 完成。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    class BlockingSetterSerial(TimedSerial):
+        def __init__(self):
+            super().__init__()
+            self.setter_entered = threading.Event()
+            self.setter_gate = threading.Event()
+
+        @property
+        def write_timeout(self):
+            return self._write_timeout
+
+        @write_timeout.setter
+        def write_timeout(self, value):
+            if value != self._write_timeout:
+                self.setter_entered.set()
+                self.setter_gate.wait(5)
+            TimedSerial.write_timeout.fset(self, value)
+
+    fake = BlockingSetterSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    fake.read_gate = threading.Event()
+    first_reader = threading.Thread(target=lambda: ep.read(16, 1.0), name="first-reader")
+    writer = threading.Thread(target=lambda: ep.write_some(b"W", 1.0), name="writer")
+    second_read_once = threading.Event()
+    original_read_once = ep._read_once
+
+    def tracked_read_once(*args, **kwargs):
+        if threading.current_thread().name == "second-reader":
+            second_read_once.set()
+        return original_read_once(*args, **kwargs)
+
+    monkeypatch.setattr(ep, "_read_once", tracked_read_once)
+    second_reader = threading.Thread(target=lambda: ep.read(16, 0.5), name="second-reader")
+    try:
+        first_reader.start()
+        assert fake.read_entered.wait(2)
+        writer.start()
+        deadline = time.monotonic() + 2
+        while ep._reconfig_waiters != 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert ep._reconfig_waiters == 1, "writer 未進入雙向靜止期限設定等待"
+        fake.read_gate.set()
+        assert fake.setter_entered.wait(2), "writer 未取得讀取鎖以設定 write_timeout"
+        second_reader.start()
+        time.sleep(0.05)
+        assert second_read_once.is_set() is False, "期限設定期間第二個 reader 不得進入 pySerial read"
+        fake.setter_gate.set()
+        first_reader.join(2)
+        second_reader.join(2)
+        writer.join(2)
+        assert not first_reader.is_alive() and not second_reader.is_alive() and not writer.is_alive()
+        assert second_read_once.is_set()
+        assert fake.violations == []
+    finally:
+        fake.read_gate.set()
+        fake.setter_gate.set()
+        first_reader.join(1)
+        if second_reader.ident is not None:
+            second_reader.join(1)
+        writer.join(1)
+        ep.close()
+
+
+def test_short_read_timeout_does_not_block_for_fixed_pyserial_quantum(fake_serial_module, monkeypatch):
+    """10 ms read timeout 不得因固定 50 ms pySerial timeout 而多阻塞 40 ms。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class SlowEmptyReadSerial(TimedSerial):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = 1) -> bytes:
+            self.read_sizes.append(size)
+            time.sleep(float(self.timeout or 0))
+            return super().read(size)
+
+    fake = SlowEmptyReadSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(endpoint_module, "_clock", clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            assert ep.read(8, 0.01) == b""
+        assert clock() == pytest.approx(0.01)
+        assert fake.read_sizes == [], "10 ms read 不得呼叫會等待固定 50 ms 的 pySerial read"
+    finally:
+        ep.close()
+
+
+class PySerialReadSemanticsSerial(FakeSerial):
+    """模擬 pySerial：read(size) 不完整時等待至設定期限，並記錄實際要求的 size。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = 1) -> bytes:
+        self.read_sizes.append(size)
+        if len(self.read_data) < size:
+            time.sleep(float(self.timeout or 0))
+        return super().read(size)
+
+
+def test_short_read_with_partial_buffer_requests_only_available_bytes(fake_serial_module):
+    """短期限且 buffer 有部分資料時，read 不等待 pySerial 補滿呼叫者要求的 bytes。"""
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = PySerialReadSemanticsSerial()
+    fake._timeout = 0.05
+    fake.read_data.extend(b"abc")
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        assert ep.read(8, 0.01) == b"abc"
+        assert fake.read_sizes == [3]
+    finally:
+        ep.close()
+
+
+def test_zero_timeout_read_returns_buffered_bytes(fake_serial_module, monkeypatch):
+    """零期限可讀取已緩衝資料；空 buffer 也由受控時鐘保證在 1 ms 內回傳。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+    fake = PySerialReadSemanticsSerial()
+    fake._timeout = 0.05
+    fake.read_data.extend(b"abc")
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            patch.setattr(endpoint_module.time, "sleep", clock.sleep)
+            assert ep.read(8, 0) == b"abc"
+        assert fake.read_sizes == [3]
+    finally:
+        ep.close()
+
+    empty_clock = _ControlledClock()
+    empty_fake = PySerialReadSemanticsSerial()
+    empty_fake._timeout = 0.05
+    empty_ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(empty_fake))
+    empty_ep.open()
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, empty_clock)
+            patch.setattr(endpoint_module.time, "sleep", empty_clock.sleep)
+            assert empty_ep.read(8, 0) == b""
+        assert empty_clock() == pytest.approx(0.001)
+        assert empty_fake.read_sizes == []
+    finally:
+        empty_ep.close()
+
+
+def test_read_uses_available_only_after_remaining_deadline_falls_below_quantum(fake_serial_module):
+    """70 ms 呼叫只得進行一次固定 50 ms 阻塞讀取，尾端不得再進一個 50 ms 量子。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock_now = [0.0]
+
+    class OneQuantumSerial(FakeSerial):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int = 1) -> bytes:
+            self.read_sizes.append(size)
+            if len(self.read_data) < size:
+                clock_now[0] += float(self.timeout or 0)
+            return super().read(size)
+
+    fake = OneQuantumSerial()
+    fake._timeout = 0.05
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(endpoint_module.time, "monotonic", lambda: clock_now[0])
+            patch.setattr(endpoint_module, "_clock", lambda: clock_now[0], raising=False)
+            patch.setattr(endpoint_module.time, "sleep", lambda duration: clock_now.__setitem__(0, clock_now[0] + duration))
+            assert ep.read(8, 0.07) == b""
+        assert fake.read_sizes == [8]
+    finally:
+        ep.close()
+
+
+def test_acquire_until_rejects_lock_granted_at_deadline(fake_serial_module, monkeypatch):
+    """鎖成功但取得時呼叫期限已到，必須放回鎖並回報失敗。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    class GrantedLock:
+        released = False
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            assert timeout == 10.0
+            return True
+
+        def release(self) -> None:
+            self.released = True
+
+    clock_values = iter((0.0, 10.0))
+    lock = GrantedLock()
+    with monkeypatch.context() as patch:
+        patch.setattr(endpoint_module.time, "monotonic", lambda: next(clock_values))
+        patch.setattr(endpoint_module, "_clock", lambda: next(clock_values), raising=False)
+        assert not WinSerialEndpoint._acquire_until(lock, 10.0)
+    assert lock.released
+
+
+def test_peer_gate_uses_captured_settle_time_if_dsr_clears_state(fake_serial_module, monkeypatch):
+    """取樣後 DSR 狀態可被另一執行緒清除；本次判定只使用鎖內複製的時間值。"""
+    import uart_stdio_bridge.endpoints.win_serial as endpoint_module
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    fake = FakeSerial()
+    ep = WinSerialEndpoint("COMb", peer_gate=True, serial_factory=RecordingFactory(fake))
+    ep._peer_on_since = 0.0
+
+    def clear_after_capture() -> float:
+        ep._peer_on_since = None
+        return 1000.0
+
+    with monkeypatch.context() as patch:
+        patch.setattr(endpoint_module.time, "monotonic", clear_after_capture)
+        patch.setattr(endpoint_module, "_clock", clear_after_capture, raising=False)
+        assert ep._peer_writable_locked(type("Peer", (), {"dsr": True})())
+    assert ep._peer_on_since is None
 
 
 # ---------------------------------------------------------------- 真實 COM pair 測試（擁有者 host，OD-15）

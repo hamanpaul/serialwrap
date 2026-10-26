@@ -17,6 +17,9 @@ from .base import EndpointError, EndpointWriteUncertain
 # 兩向緩衝；DSR 轉高到 PurgeComm 之間的極短窗口若寫入，bytes 會被清掉。peer 首次被觀測到開啟後，
 # 延後此時間才允許寫入，以跨過該窗口。0.2 s 為未經量測的選值，待 G3 原生實測（PENDING-OD-S1X-WIN-BANNER）校準。
 _PEER_OPEN_SETTLE_S = 0.2
+_WRITE_TIMEOUT_RESOLUTION_S = 0.001
+_READ_TIMEOUT_QUANTUM_S = 0.05
+_clock = time.perf_counter
 
 
 class WinSerialEndpoint:
@@ -62,11 +65,13 @@ class WinSerialEndpoint:
         self._serial_factory = serial_factory
         self._serial_obj: Any | None = None
         self._serial_timeout_exception: type[BaseException] | None = None
-        # DSR 首次被觀測為高的時間點（monotonic）；DSR 為低時清為 None。受 `_lock` 保護。
+        # DSR 首次被觀測為高的時間點（monotonic）；DSR 為低時清為 None。受 `_peer_state_lock` 保護。
         self._peer_on_since: float | None = None
+        self._peer_state_lock = threading.Lock()
         self.generation = 0
         self.last_fault: str | None = None
-        # `_lock` 只保護狀態（handle、generation、closed 與 peer 取樣狀態），絕不在阻塞 I/O 期間持有。
+        # `_lock` 保護 handle、generation 與 closed 狀態。控制面可能持有它等待在途 I/O 鎖；
+        # read/write 會在呼叫 pySerial 前釋放它。
         self._lock = threading.RLock()
         # 讀與寫各自串行化、彼此並行：寫入阻塞（對端不讀、緩衝區滿）時，讀取端仍須可前進，
         # 否則 bridge 無法持續排空接收端，會形成 ST-03(a) 所描述的雙向死鎖。
@@ -92,7 +97,10 @@ class WinSerialEndpoint:
             return b""
 
         timeout = self._normalized_timeout(timeout_s)
-        deadline = time.monotonic() + timeout
+        # 呼叫期限或讀取鎖等待後的剩餘期限小於 pySerial 50 ms polling quantum 時，
+        # 只讀已在 driver buffer 的 bytes，避免多等一個固定讀取量子。
+        deadline = _clock() + max(timeout, 0.001)
+        available_only = timeout < _READ_TIMEOUT_QUANTUM_S
         while True:
             with self._lock:
                 self._ensure_io_allowed_locked()
@@ -101,11 +109,13 @@ class WinSerialEndpoint:
                 serial_obj = self._serial_obj
             # 無 handle，或有期限設定等待中（讓出給設定端）時，本輪不進行 I/O，落到下方等待。
             if serial_obj is not None and not self._reconfig_requested():
-                data = self._read_once(serial_obj, start_generation, max_bytes, deadline)
+                data = self._read_once(
+                    serial_obj, start_generation, max_bytes, deadline, available_only=available_only,
+                )
                 if data:
                     return data
 
-            remaining = deadline - time.monotonic()
+            remaining = deadline - _clock()
             if remaining <= 0:
                 return b""
             time.sleep(min(0.01, remaining))
@@ -121,8 +131,9 @@ class WinSerialEndpoint:
         timeout = self._normalized_timeout(timeout_s)
         # pySerial 3.5 的 Windows backend 在 write_timeout=0 時無法確認
         # overlapped write 的實際接受長度，因此禁止使用該非阻塞回報路徑。
-        write_timeout = max(timeout, 0.001)
-        deadline = time.monotonic() + timeout
+        write_timeout = max(timeout, _WRITE_TIMEOUT_RESOLUTION_S)
+        # 1 ms 是 pySerial 可回報寫入長度的最小期限；若鎖等待或時鐘前進已耗盡預算，仍不送出資料。
+        deadline = _clock() + write_timeout
         while True:
             with self._lock:
                 self._ensure_io_allowed_locked()
@@ -136,7 +147,7 @@ class WinSerialEndpoint:
                 if count is not None:
                     return count
 
-            remaining = deadline - time.monotonic()
+            remaining = deadline - _clock()
             if remaining <= 0:
                 return 0
             time.sleep(min(0.01, remaining))
@@ -149,11 +160,11 @@ class WinSerialEndpoint:
         """
         if not self.peer_gate:
             return None
-        with self._lock:
-            serial_obj = self._serial_obj
-            if serial_obj is None:
-                return None
-            return self._peer_dsr_locked(serial_obj)
+        # 直接複製目前 handle 參照，避免與 close/reconnect 等待在途 I/O 時持有的 `_lock` 相互阻塞。
+        serial_obj = self._serial_obj
+        if serial_obj is None:
+            return None
+        return self._peer_dsr_locked(serial_obj)
 
     def capabilities(self) -> dict[str, bool]:
         # peer_state 僅於 com0com 且 peer gate 啟用時宣告：peer 關閉後 DSR 於 1 s 內拉低，寫入回 0，
@@ -216,7 +227,7 @@ class WinSerialEndpoint:
             return description
 
     def _read_once(
-        self, serial_obj: Any, generation: int, max_bytes: int, deadline: float
+        self, serial_obj: Any, generation: int, max_bytes: int, deadline: float, *, available_only: bool = False,
     ) -> bytes | None:
         """以固定短讀取期限讀取一次；handle 已換掉時回 None（由呼叫端等待後重試）。"""
         if not self._acquire_until(self._read_io_lock, deadline):
@@ -224,25 +235,41 @@ class WinSerialEndpoint:
         try:
             if not self._handle_is_current(serial_obj, generation):
                 return None
-            return self._read_locked(serial_obj, max_bytes)
+            remaining = deadline - _clock()
+            read_available_only = available_only or remaining < _READ_TIMEOUT_QUANTUM_S
+            return self._read_locked(serial_obj, max_bytes, available_only=read_available_only)
         finally:
             self._read_io_lock.release()
 
     def _write_once(
         self, serial_obj: Any, generation: int, data: bytes, write_timeout: float, deadline: float
     ) -> int | None:
-        """以 `write_timeout` 寫入一次；handle 已換掉時回 None（不寫入，故不產生不確定寫入）。"""
+        """以鎖等待後的剩餘期限寫入一次；handle 已換掉或期限到時回 None。"""
         # 常態路徑：期限已符合時，於寫入串行鎖內直接寫入（期限與 I/O 同一臨界區）。
-        with self._write_io_lock:
+        if not self._acquire_until(self._write_io_lock, deadline):
+            return None
+        try:
+            remaining = deadline - _clock()
+            if remaining <= 0:
+                return None
             if not self._handle_is_current(serial_obj, generation):
                 return None
-            if serial_obj.write_timeout == write_timeout:
-                return self._write_locked(serial_obj, data)
+            effective_timeout = self._effective_write_timeout(write_timeout, remaining)
+            if serial_obj.write_timeout == effective_timeout:
+                return self._write_peer_gated_locked(serial_obj, data)
+        finally:
+            self._write_io_lock.release()
         # 期限不符：需於雙向靜止時設定，並於同一臨界區內寫入。
         with self._timeout_section(serial_obj, generation, write_timeout, deadline) as held:
-            if not held:
+            if not held or _clock() >= deadline:
                 return None
-            return self._write_locked(serial_obj, data)
+            remaining = deadline - _clock()
+            configured_timeout = serial_obj.write_timeout
+            # 設定 COM timeout 本身也會耗時；若設定後的 timeout 比呼叫剩餘預算多出 driver 解析度，
+            # 即使 deadline 尚未完全到期也不得送出，避免把設定前的完整預算帶進 write。
+            if configured_timeout is None or configured_timeout > remaining + _WRITE_TIMEOUT_RESOLUTION_S:
+                return 0
+            return self._write_peer_gated_locked(serial_obj, data)
 
     @contextmanager
     def _timeout_section(
@@ -252,7 +279,7 @@ class WinSerialEndpoint:
 
         取得順序固定為寫入串行鎖 → 讀取串行鎖：設定期間兩把鎖皆持有，確保無任一方向 I/O 進行中；
         設定後釋放另一方向的鎖，只保留本方向的鎖執行 I/O，因此寫入阻塞時讀取端仍可前進。
-        回傳 False 表示取得鎖後 handle 已換掉（斷線或重開），呼叫端不得 I/O。
+        回傳 False 表示期限已到、handle 已換掉，或 peer gate 已關閉；呼叫端不得設定期限或進行 I/O。
         """
         if not self._acquire_until(self._write_io_lock, deadline):
             yield False
@@ -264,8 +291,13 @@ class WinSerialEndpoint:
             read_acquired = self._acquire_until(self._read_io_lock, deadline)
             held = read_acquired and self._handle_is_current(serial_obj, generation)
             if held:
-                if serial_obj.write_timeout != write_timeout:
-                    serial_obj.write_timeout = write_timeout
+                remaining = deadline - _clock()
+                if remaining <= 0 or not self._peer_writable_locked(serial_obj):
+                    held = False
+                else:
+                    effective_timeout = self._effective_write_timeout(write_timeout, remaining)
+                    if serial_obj.write_timeout != effective_timeout:
+                        serial_obj.write_timeout = effective_timeout
         except BaseException:
             if read_acquired:
                 self._read_io_lock.release()
@@ -296,11 +328,34 @@ class WinSerialEndpoint:
     @staticmethod
     def _acquire_until(lock: Any, deadline: float) -> bool:
         """依呼叫期限取得串行鎖；鎖等待不得超過該次 read/write 的 deadline。"""
-        return lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+        remaining = deadline - _clock()
+        if remaining <= 0:
+            return False
+        if not lock.acquire(timeout=remaining):
+            return False
+        if _clock() >= deadline:
+            lock.release()
+            return False
+        return True
 
-    def _read_locked(self, serial_obj: Any, max_bytes: int) -> bytes:
+    @staticmethod
+    def _effective_write_timeout(requested: float, remaining: float) -> float:
+        """扣除鎖等待並向下量化至 pySerial 1 ms 精度，避免 setter 隨時鐘抖動反覆重設。"""
+        effective = min(requested, remaining)
+        if effective <= _WRITE_TIMEOUT_RESOLUTION_S:
+            return _WRITE_TIMEOUT_RESOLUTION_S
+        # 極小 epsilon 只抵銷浮點除法誤差；向下取整使設定值不超過剩餘期限。
+        quanta = math.floor((effective + 1e-9) / _WRITE_TIMEOUT_RESOLUTION_S)
+        return max(_WRITE_TIMEOUT_RESOLUTION_S, quanta * _WRITE_TIMEOUT_RESOLUTION_S)
+
+    def _read_locked(self, serial_obj: Any, max_bytes: int, *, available_only: bool = False) -> bytes:
         """於讀取串行鎖內執行一次 pySerial 讀取；呼叫端須已持有讀取串行鎖且 handle 已驗證。"""
         try:
+            if available_only:
+                available = int(serial_obj.in_waiting)
+                if available <= 0:
+                    return b""
+                max_bytes = min(max_bytes, available)
             return bytes(serial_obj.read(max_bytes))
         except Exception as exc:
             raise EndpointError(f"HARNESS_ENDPOINT_IO_ERROR: 讀取 {self.com} 失敗：{exc}") from exc
@@ -320,6 +375,12 @@ class WinSerialEndpoint:
         if not 0 <= count <= len(data):
             raise EndpointWriteUncertain(len(data), f"unexpected write count {count}")
         return count
+
+    def _write_peer_gated_locked(self, serial_obj: Any, data: bytes) -> int | None:
+        """持寫入串行鎖再次取樣 peer；等待鎖期間 DSR 關閉時不送出 bytes。"""
+        if not self._peer_writable_locked(serial_obj):
+            return None
+        return self._write_locked(serial_obj, data)
 
     def _handle_is_current(self, serial_obj: Any, generation: int) -> bool:
         """取得串行鎖後重驗 handle：斷線或重開會換掉 `_serial_obj` 並遞增 generation。"""
@@ -358,7 +419,7 @@ class WinSerialEndpoint:
                 bytesize=8,
                 parity="N",
                 stopbits=1,
-                timeout=0.05,
+                timeout=_READ_TIMEOUT_QUANTUM_S,
                 write_timeout=None,
                 exclusive=None,
             )
@@ -366,32 +427,36 @@ class WinSerialEndpoint:
             raise EndpointError(f"HARNESS_ENDPOINT_OPEN_FAILED: 無法開啟 {self.com}：{exc}") from exc
 
         self._serial_obj = serial_obj
-        self._peer_on_since = None
+        with self._peer_state_lock:
+            self._peer_on_since = None
         timeout_exception = getattr(module, "SerialTimeoutException", None)
         if isinstance(timeout_exception, type):
             self._serial_timeout_exception = timeout_exception
         self.generation += 1
 
     def _peer_dsr_locked(self, serial_obj: Any) -> bool | None:
-        """讀取本端 DSR（pySerial 的 `dsr` 以 GetCommModemStatus 實作）並維護 settle 起點；讀不到回 None。"""
-        try:
-            dsr_on = bool(serial_obj.dsr)
-        except Exception:
-            return None
-        if not dsr_on:
-            self._peer_on_since = None
-        elif self._peer_on_since is None:
-            self._peer_on_since = time.monotonic()
-        return dsr_on
+        """讀取本端 DSR 並維護 settle 起點；只持 peer 狀態鎖，不等待控制面鎖或 I/O。"""
+        with self._peer_state_lock:
+            try:
+                dsr_on = bool(serial_obj.dsr)
+            except Exception:
+                return None
+            if not dsr_on:
+                self._peer_on_since = None
+            elif self._peer_on_since is None:
+                self._peer_on_since = _clock()
+            return dsr_on
 
     def _peer_writable_locked(self, serial_obj: Any) -> bool:
         """peer gate 判定：關閉時恆允許；開啟時需 DSR 為高且已過 settle 窗口。"""
         if not self.peer_gate:
             return True
         dsr_on = self._peer_dsr_locked(serial_obj)
-        if not dsr_on or self._peer_on_since is None:
+        with self._peer_state_lock:
+            peer_on_since = self._peer_on_since
+        if not dsr_on or peer_on_since is None:
             return False
-        return time.monotonic() - self._peer_on_since >= _PEER_OPEN_SETTLE_S
+        return _clock() - peer_on_since >= _PEER_OPEN_SETTLE_S
 
     def _release_serial_locked(self) -> None:
         # 控制面（關閉、重開）必須等待進行中的讀取與寫入結束才換掉 handle：阻塞中的 I/O 不被半途關閉。
@@ -400,7 +465,8 @@ class WinSerialEndpoint:
         with self._write_io_lock, self._read_io_lock:
             serial_obj = self._serial_obj
             self._serial_obj = None
-            self._peer_on_since = None
+            with self._peer_state_lock:
+                self._peer_on_since = None
             if serial_obj is not None:
                 try:
                     serial_obj.close()

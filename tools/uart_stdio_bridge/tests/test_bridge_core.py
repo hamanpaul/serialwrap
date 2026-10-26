@@ -625,6 +625,11 @@ class _WinPeerFakeSerial:
     def dsr(self) -> bool:
         return self.dsr_on
 
+    @property
+    def in_waiting(self) -> int:
+        """此替身沒有 DUT→bridge 資料佇列，符合 pySerial 的可讀位元組計數介面。"""
+        return 0
+
     def write(self, data: bytes) -> int:
         self.writes.append(bytes(data))
         return len(data)

@@ -1574,7 +1574,7 @@ class TestRunner:
 
         peer_open = at_snap.get("peer_open")
         if peer_open is None:
-            raise StepError("cap_missing:peer_state: 端點不支援 peer_state 觀測（如 Windows）")
+            raise StepError("cap_missing:peer_state: 端點未提供 peer_state 觀測（例如 peer_gate 未啟用的 COM 端點）")
         if peer_open is True:
             raise StepError(f"assert_peer_closed: '{at_op}' op_end 快照 peer_open 為 True（端點未及時關閉）")
 
