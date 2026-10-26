@@ -243,22 +243,22 @@ pub struct Tombstones { /* VecDeque<(String id, &'static str status)> cap 16 */ 
 4. 每個 Task 實作完成後，依 master plan 做雙審（審查 A：Claude Sonnet effort max；審查 B：Codex `gpt-6.1-sol` medium），審查者不得是該 Task 的實作者。
 5. **Windows 執行步驟**（`scripts/rust/win-test.sh`、`win-runner.sh`、`win-blackbox.ps1`）需要寫入 `/mnt/c` 並呼叫 `cmd.exe`／`powershell.exe`。Codex 的 `-s workspace-write` 沙箱可能擋下這些操作，所以一律由 orchestrator 執行，並把 `target/win-test-report/<run_id>.json` 路徑交給實作者；Codex 實作者只改程式碼。
 
-| Task | 標題 | 測試作者 | 實作者 |
-|---|---|---|---|
-| 0 | 契約登記、案例凍結與架構細化 | agy-gemini-3.8-flash-high | haiku-xhigh |
-| 1 | 常數、模組骨架與 harness 簽章 | agy-gemini-3.8-flash-high | haiku-xhigh |
-| 2 | Telnet 協定層 | haiku-xhigh | codex-gpt-6-luna-max |
-| 3 | Line editor、shlex 與 human line mode | haiku-xhigh | agy-gemini-3.8-flash-high |
-| 4 | DeferredBuffer（BC-02） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
-| 5 | 每 console 出向 ring（SC-15） | haiku-xhigh | agy-gemini-3.8-flash-high |
-| 6 | Ownership 狀態機、human TX lane 與 Fence 整合 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
-| 7 | Interactive lease 差量（tombstone、soft preempt、ATTACHED 救援、stash） | haiku-xhigh | codex-gpt-6-luna-max |
-| 8 | PAL console backends（PTY／TCP／ConsoleMux／com0com） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
-| 9 | ConsoleHub runtime 與 RX fan-out | haiku-xhigh | codex-gpt-6-luna-max |
-| 10 | RPC 表面、LeaseIndex 路由與 SessionPublic 欄位 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
-| 11 | 黑箱契約與既有測試改指 Rust（Linux L1.5） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max |
-| 12 | Windows 原生 console 與選配 com0com | haiku-xhigh | codex-gpt-6-luna-max |
-| 13 | 案例證據對照、文件、全套 gate | agy-gemini-3.8-flash-high | haiku-xhigh |
+| Task | 標題 | 測試作者 | 實作者 | 進度（2026-10-26；parity-amendments #179／#180） |
+|---|---|---|---|---|
+| 0 | 契約登記、案例凍結與架構細化 | agy-gemini-3.8-flash-high | haiku-xhigh | 已交付（ae33e28；T0 單獨為紅燈、終態綠燈，#185 不重寫歷史） |
+| 1 | 常數、模組骨架與 harness 簽章 | agy-gemini-3.8-flash-high | haiku-xhigh | 已交付（5516137） |
+| 2 | Telnet 協定層 | haiku-xhigh | codex-gpt-6-luna-max | 已交付（f2b7d25） |
+| 3 | Line editor、shlex 與 human line mode | haiku-xhigh | agy-gemini-3.8-flash-high | 已交付（7e86934；#177 追加修正） |
+| 4 | DeferredBuffer（BC-02） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | 已交付（dcad8d0） |
+| 5 | 每 console 出向 ring（SC-15） | haiku-xhigh | agy-gemini-3.8-flash-high | 已交付（2070017；#178 追加修正） |
+| 6 | Ownership 狀態機、human TX lane 與 Fence 整合 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：SessionCore／Effects／actor／EpochAllocator（06 T11）、begin_stop（06 T12）、quiet_gate（06 T13）、op_runner SelfTestProbe（06 T14）仍為 s21_todo! |
+| 7 | Interactive lease 差量（tombstone、soft preempt、ATTACHED 救援、stash） | haiku-xhigh | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T11／T14（SessionCore、lease、op_runner） |
+| 8 | PAL console backends（PTY／TCP／ConsoleMux／com0com） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | Linux 已交付（ccd90bd；Windows 原生待驗）；#40／#64 待 06 T2 #64 `same_tty` 與 Python holder 身分修正同步 |
+| 9 | ConsoleHub runtime 與 RX fan-out | haiku-xhigh | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T10（uart_bridge）、T11 |
+| 10 | RPC 表面、LeaseIndex 路由與 SessionPublic 欄位 | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T18 ServiceRig、T11、T14 |
+| 11 | 黑箱契約與既有測試改指 Rust（Linux L1.5） | agy-gemini-3.8-flash-high | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：06 T15a FakeTarget emit／written、06 T15／T20 shell_daemon |
+| 12 | Windows 原生 console 與選配 com0com | haiku-xhigh | codex-gpt-6-luna-max | BLOCKED-UPSTREAM：依 Task 8～11 |
+| 13 | 案例證據對照、文件、全套 gate | agy-gemini-3.8-flash-high | haiku-xhigh | BLOCKED-UPSTREAM：依 Task 6～12 |
 
 Task 10 改由 Codex 實作：它涵蓋 `session_manager.rs` 的 LeaseIndex、RPC thread 的 PTY 預建與跨 thread 交接（`ConsoleAttachReq` envelope、`ConsoleAdopt`／`ConsoleDiscard` 的 fd 生命週期），屬 master plan §2 的高風險並行項。
 
