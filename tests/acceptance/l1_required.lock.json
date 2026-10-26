@@ -10019,6 +10019,49 @@
           "paths": []
         }
       }
+    },
+    "s22_gate:py_parity": {
+      "linux": {
+        "nodeids": [
+          "tests/test_agent_defer_tx.py::TestUARTBridgeConsoles::test_console_input_supports_backspace_and_local_echo",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_existing_human_owner_window_is_deferred_before_suspend",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_during_command_is_line_buffered_and_restored",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_during_file_pull_is_line_buffered_and_restored",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_during_transfer_does_not_send_raw",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_gate_reopens_after_operation_exception",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_operation_finish_replays_raw_bytes_without_manager_lease",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_raw_write_rechecks_admission_at_actual_write",
+          "tests/test_refine_ownership.py::TestRefineOwnership::test_secondary_console_raw_bytes_use_line_broker_without_uart_tx",
+          "tests/test_stage0_bridge_drain.py::test_concurrent_stop_delivers_preserved_consoles_once",
+          "tests/test_stage0_bridge_drain.py::test_drain_timeout_closes_preserved_consoles_that_cannot_be_returned",
+          "tests/test_stage0_bridge_drain.py::test_unsafe_stop_receipt_closes_preserved_consoles"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "-m",
+            "core_portable or posix_only",
+            "tests/test_stage0_bridge_drain.py::test_drain_timeout_closes_preserved_consoles_that_cannot_be_returned",
+            "tests/test_stage0_bridge_drain.py::test_unsafe_stop_receipt_closes_preserved_consoles",
+            "tests/test_stage0_bridge_drain.py::test_concurrent_stop_delivers_preserved_consoles_once",
+            "tests/test_agent_defer_tx.py::TestUARTBridgeConsoles::test_console_input_supports_backspace_and_local_echo",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_existing_human_owner_window_is_deferred_before_suspend",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_during_command_is_line_buffered_and_restored",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_during_file_pull_is_line_buffered_and_restored",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_during_transfer_does_not_send_raw",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_new_console_gate_reopens_after_operation_exception",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_operation_finish_replays_raw_bytes_without_manager_lease",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_raw_write_rechecks_admission_at_actual_write",
+            "tests/test_refine_ownership.py::TestRefineOwnership::test_secondary_console_raw_bytes_use_line_broker_without_uart_tx"
+          ],
+          "markexpr": "core_portable or posix_only",
+          "paths": [
+            "tests/test_agent_defer_tx.py",
+            "tests/test_refine_ownership.py",
+            "tests/test_stage0_bridge_drain.py"
+          ]
+        }
+      }
     }
   }
 }
