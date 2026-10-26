@@ -315,6 +315,17 @@ def test_slice23_cases_frozen_before_implementation():
 - [ ] **Step 4：執行，預期 PASS**：上兩條命令；`python3 -m pytest -q tests/test_contracts_catalog.py tests/test_acceptance_cases.py tests/test_slice21_scope.py`；`cargo test --workspace --features test-fakes`（06／07 既有測試全綠，證明骨架沒有覆寫 P5 實作）；`python3 scripts/rust/check_cfg_boundary.py` exit 0；`cargo build --workspace --target x86_64-pc-windows-gnu` 成功。
 - [ ] **Step 5：commit**：`chore(rust-p7): 凍結 Slice 2.3 介面、登記 SC-30 與 DF-18 並凍結案例集合`
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+**新增 Step（Python 基線 parity 測試入鎖）**：建立 `p7_gate:py_parity`（linux／windows），add-only 登記：
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #111 | B:F-16、F-19、F-20、F-22 | `tests/test_console_unlock.py` 17 筆行為測試（含 `test_echoed_nonce_command_is_not_ready_evidence`、`test_cfe_prompt_blocks_all_tx`、`test_existing_shell_prompt_skips_unlock`、`test_unlock_timing_log_contains_only_safe_metadata`） | `passed` |
+| #112 | B:F-E19、F-E22、F-E31 | `tests/test_event_dispatcher.py::{test_per_rule_concurrency_drops_oldest,test_timeout_kills_handler}`、`tests/test_event_engine.py::test_disable_clears_counter` | `passed` |
+
 ---
 
 ## Task 1：Python 基線 golden 擷取
@@ -651,6 +662,16 @@ fn console_unlock_is_not_blocked_by_cfe_banner_history() {
 - [ ] **Step 4：執行，預期 PASS**：`cargo test -p sw-core --features test-fakes --test login_fsm_full --test login_quiet`；`python3 -m pytest -q tests/test_slice21_scope.py`；06 其他 sw-core 測試 binary 不退化。
 - [ ] **Step 5：commit**：`feat(rust-login): 承接全平台 Login FSM 與 console unlock`
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #113 | B:F-20 | `existing_shell_prompt_skips_unlock_blank_line_1s` | 已有 shell prompt 時跳過 unlock；空行辨識等待 1 s（`login_fsm.py:295-303`） |
+| #114 | B:F-25 | `invalid_regex_raises_immediately` | 無效 regex 立即以 `Raised` 結束（與 Python 立即拋例外同結果，`login_fsm.py:87-90`）；Python 側新增特性測試（`p7_gate:py_parity`） |
+| #115 | B:F-16、F-19、F-22 | 既有 `console_unlock_nonce_anchored_pattern`、`console_unlock_idle_timeout_and_bootloader`；GAP-G-01 | Python oracle 見 Task 0 #111；F-22 依 GAP-G-01 不輸出 INFO（已登記刻意差異） |
+
 ---
 
 ## Task 4：`quiet_gate.rs`：Autoboot Quiet＋Ready Reconfirm
@@ -758,6 +779,15 @@ fn console_unlock_profile_is_not_probe_blocked() {
 - [ ] **Step 3：實作**：照 05 §1.6 與 `_update_boot_quiet_locked`（`session_manager.py:2327-2368`）核對 06 本體；`QuietTransition::Armed` → 在同一次 `Fence::with` 內設 `quiet_active=true`、`auto_probe_blocked=boot_quiet_blocks_probe(..)`、`fsm_gen+=1`，且 `boot_quiet_blocks_probe` 為真時 `fence.fsm_gen_floor = fsm_gen`、清 `active_login`（線性化點，Review Focus 1；console unlock 只遞增 `fsm_gen`、不推 floor），鎖外再 `invalidate_human_input(BootBanner|QuietRearm, fx)`、對進行中且被擋的 login run 發 `Effect::CancelLogin{epoch, fsm_gen: 舊值}`（Task 7）；`Cleared` → 同鎖清 `quiet_active`、`auto_probe_blocked`，**不**動 `fsm_gen`。`submit_gate_reject`／`execute_gate_reject` 依 `gate_responses` golden 的 key 順序以 `pydict!` 建構。
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test login_quiet`（06）不退化。
 - [ ] **Step 5：commit**：`feat(rust-quiet): 完成 Ready Reconfirm 有界化與 Quiet gate 回應`
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #17 | B:B-36 | `passthrough_reattach_clears_previous_profile_quiet_and_reconfirm` | profile 由 prpl 改為 passthrough 後重掛：清除前一 profile 的 quiet／reconfirm pending，對外欄位（`quiet_until`、`ready_reconfirm_pending` 等）不殘留（`session_manager.py:644-654`）；Python oracle `test_p1oc_sc35_state.py`（06 Task 0b #77） |
+| #49 | B:B-33 | `console_unlock_arm_mid_login_finish_applied` | console unlock profile 的 quiet arm 不使在途 unlock run 失效：其 `LoginFinished` 必須套用（`active_login` 以 run 自身的 `(epoch,fsm_gen)` 比對，不以 core 現值），結果與 Python 不遞增 `login_gen`（`session_manager.py:597-598`）相同；quiet timer 隔離仍成立 |
 
 ---
 
@@ -1155,6 +1185,16 @@ fn op_login_routes_secret_with_log_false_and_login_probe_class() {
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test login_quiet --test drain_release`（06 既有，不退化）。
 - [ ] **Step 5：commit**：`feat(rust-login): 承接 login run 收斂、SC-30 取消與 fence fsm_gen`
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #33 | B:D-28 | `reboot_console_unlock_clears_rx_before_send` | 對 `console_unlock_env` profile 送 reboot 前清 RX window，重開前殘留的 root prompt 不得作為 unlock 證據（`session_manager.py:6178-6180`；inventory 05 §5.4 step 2） |
+| #18 | B:B-82 | `io_error_pending_auto_login_converges_via_reboot_recovery` | 承接 06 Task 12 #18：reboot recovery 期間 bridge down → RECOVERING，由本 Task 的 recovery 迴圈收斂（狀態序與 TX 與 Python 同） |
+| #116 | B:D-18（cap）、D-19、D-20、D-23 | `reboot_recovery_deadline_capped_at_start_180_timeout`、`reboot_recovery_drain_pending_breaks`、`reboot_recovery_credentials_terminal_breaks`、`reboot_recovery_no_bridge_spawns_attach_each_second` | `deadline_cap = start+180+timeout`，boot-loop banner 不得延長超過；迴圈遇 drain pending 結束；帳密終態 break（#140 NIT-1）；無 bridge 時每秒 `_spawn_attach` 等價（`:5981-6089`）；Python 側新增特性測試（`p7_gate:py_parity`） |
+
 ---
 
 ## Task 8：`self_test.rs`：self-test 分類與 nonce probe 整合
@@ -1257,6 +1297,14 @@ fn banner_during_self_test_suspend_does_not_replay_stale_human_input() {
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test command_exec`（06）不退化。
 - [ ] **Step 5：commit**：`feat(rust-selftest): 承接 self-test 完整分類與 Python 相容回應`
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #70 | B:D-78（BC-04） | `st_released_holder_unknown`（既有）＋ Python 基線追補 | BC-04 `scope: both`：Python `self_test` 未跟上 BC-04（RELEASED 且 holder 掃描不明時仍 `reclaimable:true`）屬 Python 基線缺陷，**本 Task 追加 Python 修正子步驟**（`sw_core/session_manager.py` self-test：`holder_unknown` → `reclaimable:false`、`recommended_action:"wait_external_flash"`），附 Python 測試 `tests/test_stage0_uart_exclusive.py::test_self_test_released_holder_unknown_not_reclaimable` 與 `changelog.d/` fragment；A/B 比較於修正後方可為 diff 參與 |
+
 ---
 
 ## Task 9：`recover.rs`：session recover／force recover
@@ -1280,7 +1328,7 @@ pub struct RecoverRequest { pub timeout_s: f64, pub force: bool }
 pub enum RecoverPlan {
     Reply(PyDict),        // RELEASED／FLASHING_BUSY／SESSION_NOT_READY 等立即回覆
     Reattach,             // 無 bridge 且裝置在、且無 drain 進行中：ATTACHING＋RequestAttach
-    AwaitDrain,           // drain（RECOVERING）進行中：加入 06 StopOp waiters，回條到達後再重新 plan（不得在 handle 關閉前開新 bridge，§11.3-4、arch §5.5）
+    DrainBusy,            // drain（RECOVERING）進行中：立即 Reply {ok:false, error_code:"SESSION_RECOVERING", drain_stalled, drain_timeout_epoch, session}，不掛 waiter、不 reattach（00-master-plan Global Constraints、02 L1394、鎖內 test_release_drain_timeout_shape）（parity-amendments-2026-10-26 #57；原 AwaitDrain 作廢）
     Reprobe,              // ATTACHED 非 force：ExistingBridgeProbe{RecoverReprobe}（與 auto reprobe 互斥：auto 跳過、recover 等待）
     Force,                // ATTACHED／非 READY 的 force：begin_stop(StopKind::Clear) 後輪詢 FORCE_RECOVER_POLLS×FORCE_RECOVER_POLL_S
     ReadyKeys,            // READY（force 與否皆同）：06 recover_after_failure(source="system:recover", cmd_id="")，兩鍵失敗後自動 Force
@@ -1337,13 +1385,14 @@ fn ready_force_runs_keys_then_auto_force_and_returns_prompt_timeout() {
 }
 
 #[test]
-fn recover_during_drain_does_not_open_before_receipt() {
+fn recover_during_drain_returns_session_recovering_immediately() {   // parity-amendments-2026-10-26 #57（原 recover_during_drain_does_not_open_before_receipt）
     let mut h = support::core_draining();                            // RECOVERING、Phase 2 等待 handle 關閉回條
     let reply = h.rpc_recover(RecoverRequest { timeout_s: 2.0, force: false });
+    let r = reply.take().expect("drain 中 recover 立即回覆，不等回條");
+    assert_eq!((r.bool("ok"), r.str("error_code")), (false, "SESSION_RECOVERING"));
+    assert!(r.contains_key("drain_stalled") && r.contains_key("drain_timeout_epoch"));   // 形狀照鎖內 test_release_drain_timeout_shape
     assert_eq!(h.open_bridge_calls(), 0, "回條前不得重開同一端點（§11.3-4）");
-    h.deliver_worker_stopped_receipt();
-    assert_eq!(h.open_bridge_calls(), 1);
-    assert_eq!(reply.take().unwrap().str("action"), "REATTACH");
+    assert!(!h.has_stop_waiter_from_recover(), "recover 不掛 StopOp waiter；回條後是否 reattach 只依該 drain 的 kind 決定（與 recover 無關）");
 }
 
 #[test]
@@ -1381,9 +1430,19 @@ fn reprobe_unrecovered_reports_last_error_field_with_ok_true() {   // SC-34（OD
 | `recover_ready_quiet_skips_keys`（回歸 06 `quiet_rechecked_before_each_recover_key`） | quiet active → 不送任何 key → ATTACHED → 自動 Force |
 
 - [ ] **Step 2：執行，預期 FAIL**：`cargo test -p sw-core --features test-fakes --test recover_p7`（06 既有 `command_exec` 的 recover_* 五項為回歸，維持 PASS）。
-- [ ] **Step 3：實作**：`plan_recover` 照上方順序；`plan_resets_progress` 為真時才 reset reprobe 與 `credentials_warned`；`AwaitDrain` 經 06 StopOp waiters；force 輪詢以 actor timer `ForceRecoverPoll{stop_id, n}` 每 `FORCE_RECOVER_POLL_S` 檢查 READY（不阻塞 mailbox；過期 `stop_id` 丟棄；呼叫端 RPC 經 reply channel 等待，LONG_RPC 上限 600 s）；Reprobe 與 auto reprobe 互斥（auto 遇 recover 進行中跳過、recover 遇 auto 進行中等待其完成事件）。
+- [ ] **Step 3：實作**：`plan_recover` 照上方順序；`plan_resets_progress` 為真時才 reset reprobe 與 `credentials_warned`；`DrainBusy` 立即回 `SESSION_RECOVERING`＋drain 欄位（不經 StopOp waiters，#57）；force 輪詢以 actor timer `ForceRecoverPoll{stop_id, n}` 每 `FORCE_RECOVER_POLL_S` 檢查 READY（不阻塞 mailbox；過期 `stop_id` 丟棄；呼叫端 RPC 經 reply channel 等待，LONG_RPC 上限 600 s）；Reprobe 與 auto reprobe 互斥（auto 遇 recover 進行中跳過、recover 遇 auto 進行中等待其完成事件）。
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test command_exec --test drain_release`（06）不退化。
 - [ ] **Step 5：commit**：`feat(rust-recover): 承接 session recover 完整分支與 force recover`
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #57 | B:D-87 | `recover_during_drain_returns_session_recovering_immediately`（本 Task 程式碼區已改） | 見上；`RecoverPlan::DrainBusy` |
+| #34 | B:D-54 | `ReadyKeys` 提交點拒絕 | 映射同 06 Task 14 #34（`FLUSHED_BY_RECOVERY`） |
+| #117 | B:D-89、D-91 | `recover_resets_credentials_warned`、`recover_not_ready_non_force_returns_not_ready` | recover 重置 `credentials_warned`（`:7666`）；非 READY 且非 force → 依 Python `:7681-7684` 回應；Python 側新增特性測試（`p7_gate:py_parity`） |
 
 ---
 
@@ -1674,6 +1733,14 @@ fn queue_overflow_drops_oldest_and_emits_event_dropped() {
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2。
 - [ ] **Step 5：commit**：`feat(rust-event): 承接 LineBuffer 與有界 matcher`
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #118 | B:F-E05 | `matcher_exception_converges_and_stop_warns_after_2s` | matcher 例外收斂（不終止 engine）；stop 等待超過 2 s 寫 WARNING（`matcher.py:138-157,202-231`）；Python 側新增特性測試 |
+
 ---
 
 ## Task 13：`counter.rs`＋`registry.rs`＋`event_log.rs`（含 Python DF-18）
@@ -1801,6 +1868,14 @@ def test_registry_upsert_uses_replace(tmp_path):
 - [ ] **Step 3：實作**：照 09 §3.4、§3.5、§3.8；tmp→正式檔一律 `FsOps::replace`；JSON 讀取 `read_bytes`→UTF-8 解碼（失敗依 DF-09 golden 的 reason 格式）→`pyjson::loads`（失敗 reason＝`"read/parse failed: " + py_message()`）；OSError reason 用 `PalError.py_message`；counter write-through cache（同一 daemon 唯一寫入者）。Python：兩處 `os.rename` 改 `os.replace`，同步更新 `tests/test_event_counter.py`／`test_event_registry.py` 不受影響。
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`python3 -m pytest -q tests/`；`scripts/rust/win-test.sh --package sw-core --test event_store`（以 `--test` 選 binary；核對報告該 exe `passed >= 1`）；13-py 另以 Windows Python 執行 `py -3.12 -m pytest -q tests/test_event_replace_df18.py`（WSL interop，於 Windows 本機目錄）。
 - [ ] **Step 5：commit**：`feat(rust-event): 承接規則、counter 與事件 log 儲存並修正 Windows 覆寫改名`
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #5 | A:G-5 | `events_log_path_env_override`（`crates/sw-proto/tests/runtime_paths_golden.rs`）＋ event_log 消費端 | `DaemonDirs` 新增 `events_log_path`：`SERIALWRAP_EVENTS_LOG_PATH` 依 `_env_path` 語意（strip 後空 → 預設 `<EVENTS_RUNTIME_DIR>/events.ndjson`；`expanduser`），`contracts/golden/runtime_paths.{posix,windows}.tsv` 由 P2 add-only 加欄；`EngineDeps.log_path`（Task 16）取自此欄 |
 
 ---
 
@@ -2001,6 +2076,15 @@ fn per_rule_busy_then_saturation_drop_new() {
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2。
 - [ ] **Step 5：commit**：`feat(rust-event): 承接事件 dispatcher 子程序池`
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #119 | B:F-E19、F-E22、F-E23 | `per_rule_busy_and_per_daemon_saturated`、`timeout_kills_process_group`、`spawn_failure_reports_fire_failed` | 對照 Task 0 #112 的 Python oracle；spawn 失敗回 `fire_failed`（`dispatcher.py:180-188`） |
+| #120 | B:F-E25、F-E26 | 既有 SC-26／SC-11 細化列 | Python 側無對應（Rust-only）；只驗絕對契約，A/B 排除 |
+
 ---
 
 ## Task 16：EventEngine 組裝與 10 個 `event.*` RPC
@@ -2117,6 +2201,15 @@ fn rule_set_response_spreads_raw_with_ok_first() {
 - [ ] **Step 3：實作**：照 09 §3.7、§3.9、§3.10；event RPC 在 RPC 連線 thread 上執行（不經 session actor），engine 內部鎖只保護規則集合與 enabled set，檔案 I/O 在鎖外；退役 `slice21_scope.yaml` 的 event.* deferred 列。測試以 stub `BridgeQueries` 驅動，不依賴 16-wire。
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；06 T18 `deferred_methods_return_method_not_found_without_side_effects` 仍綠（只剩 file.*）。
 - [ ] **Step 5：commit**：`feat(rust-event): 組裝 Event Engine 並接線 event RPC`
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #121 | B:F-E31、F-E34 | `com_disable_clears_counter_then_emits_in_order`、`engine_started_before_bootstrap_attach` | `event.com_disable` 先清 counter 再發事件（`engine.py:198-212`）；daemon 啟動時 engine 先於 bootstrap attach 啟動（`service.py:575-591`），Task 16-wire 的啟停順序同步 |
+| #5 | A:G-5 | `EngineDeps.log_path` | 取自 Task 13 #5 的 `DaemonDirs.events_log_path` |
 
 ---
 
@@ -2484,6 +2577,14 @@ def test_full_required_set_passes(tmp_path):
   2. `p7_gate.sh`：建立 `target/p7-gate/<run_id>/`，依序執行並把每個子程序的 argv、rc、時間、log（落檔並算 sha256）、測試計數寫入 `results.json`；`TEST_ROWS` 每列另寫 `required_set`（`p7_gate:<列名 slug>`）與 `l1_results`（cargo 列改以 P3 `cargo_l1_results.py --out <run>/<slug>/resource-report.json -- <原 cargo 參數>` 執行；pytest／`run_p7_ab.sh` 內的 pytest 帶 `SW_RESOURCE_REPORT` 與 `--junitxml`；Windows 列取 `win-test` 報告的 `l1_results`），各 `p7_gate:*` 集合以 P2 `regen_lock.py --l1-add-only` 凍結（R5-F3；時點依 P2 Task 13：P7 自 Task 0 起每個 Task 在自己的紅燈 commit 登記新增 nodeid，與 `cases.lock` 於 Task 0 凍結同一原則，本 Task 只登記 gate 自身測試，R5 審查後續）：`check_cfg_boundary.py`；`cargo test --workspace --features test-fakes`；`scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon`（non-COM 列）；`scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7`（未設 `SW_TEST_COM_PAIR` → `caps_missing` 加 `windows_com`）；`scripts/rust/run_p7_ab.sh`（p7 A／B、slice21／slice22／l15 回歸、func-test 兩案各自成列，取其 evidence md 的逐案結果）；`python3 tests/acceptance/regen_lock.py --check`；`cases.lock slice_2.3 coverage`（逐一核對 `slice_2.3` 集合每個 `case_id` 在本次結果中為 PASS，或為 BLOCKED-OWNER 且附 B 編號；任何缺漏 → FAIL）；`python3 -m pytest -q tests/`；`python3 -m policy_check --repo .`。全部子程序結束後才呼叫 `p7_gate_report.py build`，寫出綁定本次 `run_id`、`git rev-parse HEAD`、artifact sha256 的 md，最後 `p7_gate_report.py verify` 必須回空清單。
 - [ ] **Step 4：執行，預期 PASS**：`python3 -m pytest -q tests/test_p7_gate_report.py`；`scripts/rust/p7_gate.sh`（exit 0 ⇔ 所有 REQUIRED_ROWS 為 PASS 或計算得出的 BLOCKED-OWNER，且 verify 無不一致）。
 - [ ] **Step 5：commit**：`chore(rust-p7): 產出 Slice 2.3 出口證據與 Windows 原生 COM 案例`
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #188 | 稽核 A／B 全體 | Phase gate 條件 | `p7_gate_report.py` 新增 `parity_amendments` 段，逐列標記承接 Phase 為 P7 的列；`p7_gate:py_parity`（Task 0）為必要集合 |
 
 ---
 

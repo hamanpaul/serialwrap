@@ -54,7 +54,7 @@
 | D-05 | 出向 ring（SC-15，Rust-only）：每 console 一個 `OutRing`，元素為 `OutItem::Control`（greeting、協商回覆；不被 drop-oldest 丟）或 `OutItem::Display { bytes, iac_escaped }`（RX fan-out、本地回顯；可丟）。Display 合計超過 1,048,576 bytes 時，丟最舊的整個 Display 元素（已部分寫出的 front 元素不丟）；單一元素本身超過上限時只保留尾端 1,048,576 bytes，起點落在 `FF FF` 對中間時再後移 1 byte。Control 合計上限 `CONSOLE_CONTROL_MAX_BYTES=65536`：Telnet 對每個未支援的 `WILL x` 都回 `DONT x` 而不去重（`telnet_console.py:113-118`），只送不讀的 client 會讓 Control 無限累積，所以超過上限時 hub 關閉該 console（依一般斷線流程送 `ConsoleDisconnected`）並寫 WARNING，不靜默丟棄（SC-31(c)）。PTY console 在 peer 掃描判定「無外部 holder 且已過 2.0 s grace」時清空其 Display，避免新開 minicom 時灌入最多 1 MiB 舊資料；Python 只會留 kernel buffer 內容 | §5.4、SC-15、06 §7.6 |
 | D-06 | SC-16 依 P1 T12 規則 4～5（Python 基線，A/B 一致）：line editor 緩衝上限 `CONSOLE_LINE_BUFFER_MAX=16385` bytes。緩衝已滿 16385 bytes 時再收到非終止、非 backspace 的 byte，就清空緩衝、進入 discarding 並寫一次 WARNING；discarding 期間後續 byte（含 backspace 與可列印字元）一律丟棄**且不回顯**；下一個 CR／LF 結束 discarding、不送 arbiter。discarding 結束時終止字元是否回顯 `\r`，以 P1 實作後 Python `_consume_console_input` 產生的 golden 為準（Task 3 golden 含 ≥16386 bytes 的案例）。恰 16385 bytes 的行照送 arbiter，由 arbiter 回 `CMD_TOO_LONG`。arbiter 拒絕 `CMD_TOO_LONG`、`SESSION_QUEUE_FULL`、`SESSION_NOT_READY`（P1 T12 規則 5 的集合）時寫 WARNING | SC-16、G-02、02 T12 |
 | D-07 | BC-02 溢位語意逐字照 P1 T09 規則 1：某 client 的 deferred entry 附加後長度 > 262144，就刪除該 entry（連同本次 bytes）並寫 WARNING；之後同一 client 的 bytes 開新 entry 照常保留（沒有 poison 狀態）。回放只送 `input_epoch` 等於現值、且 `client_id`＋`client_lifetime` 仍存活的 entry（P1 T09 規則 4）；stale prune、detach、drop、reap 一併刪除該 client 的 entry（規則 5） | BC-02、arch §5.11、02 T09 |
-| D-08 | SC-13 依 P1 T12 規則 1～2 與 06 T14 既有 tick：重用 06 的 `ControlEvent::Tick`（1.0 s）與 `TimerEvent::LeaseExpiry`，**不**新增事件。tick 只處理非 human lease 的 timeout 到期（human lease 只看 peer）；到期時 status 設為 `"expired"`，走 `_close_interactive_locked` 等價流程（stash 還原與回放受 D-16 限制），lease 進 06 的 `Tombstones`（每 session FIFO 16）。tombstone 可重複讀：`interactive_send`／`interactive_status`／`interactive_close` 遇 tombstone 一律回 `{"ok":false,"error_code":"INTERACTIVE_EXPIRED","interactive_id":…}`，且**不移除**；被 FIFO 擠出後才是 `INTERACTIVE_NOT_FOUND`。存取時判定（lazy）的到期維持 Python 現況：第一次回 `INTERACTIVE_EXPIRED` 並關閉、移出表，之後回 `INTERACTIVE_NOT_FOUND`（06 `send_expired_closes`）。06 `tick_expires_lease_sc13` 期望 tick 後 `status` 回 `NOT_FOUND`，與 P1 不符，由本 Phase Task 7 改正 | SC-13、SES-16.4-07、05 §10.2～§10.5、02 T12 |
+| D-08 | SC-13 依 P1 T12 規則 1～2 與 06 T14 既有 tick：重用 06 的 `ControlEvent::Tick`（1.0 s）與 `TimerEvent::LeaseExpiry`，**不**新增事件。tick 只處理非 human lease 的 timeout 到期（human lease 只看 peer）；到期時 status 設為 `"expired"`，走 `_close_interactive_locked` 等價流程（stash 還原與回放受 D-16 限制），lease 進 06 的 `Tombstones`（每 session FIFO 16）。tombstone 可重複讀：`interactive_send`／`interactive_status`／`interactive_close` 遇 tombstone 一律回 `{"ok":false,"error_code":"INTERACTIVE_EXPIRED","interactive_id":…}`，且**不移除**；被 FIFO 擠出後才是 `INTERACTIVE_NOT_FOUND`。存取時判定（lazy）的到期與 tick 相同進 tombstone（Python Stage 0 T12 起 `keep_tombstone=True`，`session_manager.py:5865-5875,7183-7197`，02 T12）：第一次回 `INTERACTIVE_EXPIRED` 並關閉、移出 active、`tombstones.push(id,"expired")`，之後持續回 `INTERACTIVE_EXPIRED`，被 FIFO 擠出後才 `INTERACTIVE_NOT_FOUND`（06 `send_expired_closes` 已同步改正）（parity-amendments-2026-10-26 #54）。06 `tick_expires_lease_sc13` 期望 tick 後 `status` 回 `NOT_FOUND`，與 P1 不符，由本 Phase Task 7 改正 | SC-13、SES-16.4-07、05 §10.2～§10.5、02 T12 |
 | D-09 | `/proc` 掃描（`held_slave_paths()`）不得在 actor thread 執行，來源有三：(a) RPC handler thread 處理 `session.console_attach`／`console_detach`／`console_list`／`interactive_open`，以及 `session.list`／`session.get_state`／`session.activity`／`health.status` 的 session 摘要時，先取一次快照，並以 `ControlEvent::ConsoleScan{scan, source: ScanSource::Rpc}` 從**同一個 sender thread、緊接在該 request 之前**送進 control lane（同 sender FIFO），core 先 prune 再處理 request，prune 時點與 Python 相同，06 的 `SessionRequest` 變體因此不必加欄位；(b) `ConsoleHub` 每 `HUMAN_PEER_GRACE_S=3.0` s 掃一次並送 `ConsoleScan{source: Hub}`，供 reaper 與 self-heal 使用；(c) 命令執行路徑的 lease refresh 用最近一次快照（≤3.0 s）。peer 判定時點不屬位元組契約 | UIO-12.10-c（IMPL）、06 §7.5、05 §10.5 |
 | D-10 | DF-02：06 `SubmitReq` 新增 `pub origin: SubmitOrigin`（`enum SubmitOrigin { Rpc, HumanConsole { client_id: String } }`，06 既有建構點一律 `Rpc`）。只有 `SubmitOrigin::HumanConsole`（line editor 產生）會跳過 agent gate、在 lease 判定時視為 human、逾時升格 `PROMOTE_HUMAN_INTERACTIVE`、reboot 命令走 human 分支開 lease。`SubmitOrigin::Rpc` 即使 `source` 以 `human:` 開頭也一律以 agent 對待（OD-14 #5 確認原預設） | DF-02、RPC-H-05 |
 | D-11 | SC-28（新登記，Rust-only）：env `SERIALWRAP_CONSOLE_BACKEND` ∈ {`auto`,`pty`,`tcp`}（不分大小寫、strip），只由 `sw_pal::native()` 讀取。`auto`／空／未知值：有 PTY 能力就用 `Pty`，否則 `TcpTelnet`；`tcp`：一律 `TcpTelnet`；`pty` 但平台無 PTY：退回 `TcpTelnet` 並寫 WARNING `SERIALWRAP_CONSOLE_BACKEND=pty 在此平台不支援，改用 tcp`。用途是讓 Linux L1.5 能測 Telnet backend；名稱加入 `tests/conftest.py` 的 pop 清單與 `bb_harness.isolated_env` 的刪除清單。Python 沒有此 env，所以 Linux 上的 Telnet 黑箱只能對 Rust 執行（信心較低）；Windows 上兩版 daemon 原生都是 Telnet，同一批案例做 A/B（Task 12） | Python `_select_backend` 慣例（06 §10.4） |
@@ -68,7 +68,7 @@
 | D-19 | 「失效則丟棄並可診斷」（§5.3 Console 輸入列）：stale `input_epoch`、未知 client 或舊 lifetime、無 active epoch（SC-31(a)）、flash 期間的輸入丟棄，各寫一條 WARNING，限速為每 `(client_id, reason, input_epoch)` 至多一筆 | §5.3 |
 | D-20 | SessionPublic 的 `vtty` 重現 Python `session.vtty_path` 的**快取**語意，不即時計算 primary：只在 Python 的更新點改值，包括 attach 完成（`session_manager.py:2706`、`:3130`、`:3306`）、`console_attach` 時若為 None 才設為新 console 的 vtty（`:3957`、`:3961`）、`detach_console`（`:3994`）、`_set_retained_consoles`（`:1750-1753`），以及清為 None 的位置（`:3096`、`:3116`、`:3126`、`:3169`）。`console_count` 與 `console_endpoint` 即時取自 `HumanConsoleState`。`PublicCtx` 在 `session_core.rs` 由 `HumanConsoleState` 產生，不放在 `sw-proto` | 02 §6.1、`to_public_dict` |
 | D-21 | line editor 的半行緩衝（`ConsoleRecord.line`）在 BC-02 失效時**不清除**，與 Python／P1 相同：它是第二個 console 尚未送出的編輯行，不屬 deferred 回放。Task 0 在 recon 登記 `CON-LINE-01`（KEEP＋DOC） | §11.3、02 T09 |
-| D-22 | **回放保留（Replay hold，R2-F4）**：Python 的 `resume_interactive()` flush 與 `_finish_foreground_operation` 的 admission flush 都在 `_foreground_operation` token 仍持有時同步寫完，token 在回放完成後才清（`session_manager.py:3699-3703`、`:1104-1120`），所以下一個命令、`interactive_open`／`send`、self-test 或 file transfer 不可能在舊按鍵寫出前取得 UART。Rust 的回放是非同步 lane，必須顯式保留同一段區間：(1) 每個回放點（`fg_finish` 最外層 resume 與 admission 開放、`human_suspend_end`、lease close／expire 的 `PostClose` resume、D-15(4) 的立即回放）在 `take_replay` 有非空結果時建立 `ReplayHold { hold_id, remaining }`（`HumanConsoleState.replay_hold`），並在**同一次** `Fence::with` 內設 `st.replay_auth = Some(hold_id)`；該批每筆 HumanReplay 的 permit 帶 `replay_hold: Some(hold_id)`。已有 hold 時新增的回放併入同一 hold（`remaining += n`）。`take_replay` 結果為空時不建立 hold。(2) 未撤銷的 hold 存在期間 `SessionCore::foreground_busy()` 為 true（`foreground.is_some() \|\| human.replay_hold.as_ref().is_some_and(\|h\| !h.revoked)`），所有 06／07／09 的「前景忙」判定一律改用它：佇列不出列（命令維持 accepted，不回錯，對應 Python 每 session 單一 arbiter worker 要等 `execute_command` 連同 flush 返回才取下一筆）；READY `interactive_open`、`interactive_send` 回 `SESSION_BUSY`；`console_attach` 回 `"interactive_owner":false`；SessionPublic `foreground_busy` 為 true；P8 push／pull 回 `SESSION_BUSY`、FlashSyncProbeStart 依 SC-14 拒絕。(3) 該 hold 最後一筆回放結算（`Completed`、partial、`Unknown`、`NotSubmitted` 皆算）時，在同一次 `Fence::with` 內清 `replay_auth = None`、`replay_hold = None`，然後依 06「前景空閒則出列」取下一筆命令。(4) **撤銷（OS 提交點的後備）**：任何不經佇列的新操作取得 ownership 時——`fg_begin`、`human_suspend_begin`、`StartOp` 任一前景 op、`interactive_open`（含 ATTACHED 救援分支：Python 該分支不檢查前景，`session_manager.py:4027` 只在 READY 判 `SESSION_BUSY`）、`set_interactive_owner` 改為非 human owner、`begin_stop`——先在同一次 `Fence::with` 內設 `replay_auth = None` 並把 hold 標為 revoked，再做自己的 ownership／admission 變更。revoked hold 在 backlog 中尚未送出的回放立即 `restore_front` 回 deferred；在途那一筆若尚未通過 `FenceSubmitGate`，OS 提交點回 `ReplayRevoked`、零 TX，結算時 `restore_front`（D-15(3)）；若已通過，它在 TxWriter 單寫入者順序上早於新操作的任何 TX，照實記錄。被撤銷的 bytes 在新操作的回放點（例如其 `fg_finish`）以新 hold 重新回放；若該點依 D-16 不允許回放，依 D-16 丟棄。revoked hold 保留到其在途那一筆結算為止（期間不算前景忙，`foreground_busy()` 只計未撤銷的 hold）；若新回放點在此之前到達，先記 `replay_after_revoked=true`、不 `take_replay`，待在途那筆結算並 `restore_front` 後才執行該次回放並建立新 hold，避免較新的 bytes 先於被撤銷的舊 bytes 寫出。hold 本身沒有逾時：UART 寫入卡住時 hold 一直存在，與 Python token 被背壓中的 `send_bytes` 卡住相同；drain Phase 1 由 `begin_stop` 撤銷並 `invalidate_human_input` 結束。(5) human 之間的 owner 變更（self-heal grant、detach、drop、pending human promote）不撤銷：回放 bytes 仍經單筆在途的 human lane，在新 owner 的 HumanRaw 之前寫出，順序與 Python 同步 flush 相同 | §5.2.6、§5.3 Console 輸入列、§11.3；`session_manager.py:1048-1120`、`:3699-3703`、`:4027`、`:4232`；`uart_io.py:1378-1400` |
+| D-22 | **回放保留（Replay hold，R2-F4）**：Python 的 `resume_interactive()` flush 與 `_finish_foreground_operation` 的 admission flush 都在 `_foreground_operation` token 仍持有時同步寫完，token 在回放完成後才清（`session_manager.py:3699-3703`、`:1104-1120`），所以下一個命令、`interactive_open`／`send`、self-test 或 file transfer 不可能在舊按鍵寫出前取得 UART。Rust 的回放是非同步 lane，必須顯式保留同一段區間：(1) 每個回放點（`fg_finish` 最外層 resume 與 admission 開放、`human_suspend_end`、lease close／expire 的 `PostClose` resume、D-15(4) 的立即回放）在 `take_replay` 有非空結果時建立 `ReplayHold { hold_id, remaining }`（`HumanConsoleState.replay_hold`），並在**同一次** `Fence::with` 內設 `st.replay_auth = Some(hold_id)`；該批每筆 HumanReplay 的 permit 帶 `replay_hold: Some(hold_id)`。已有 hold 時新增的回放併入同一 hold（`remaining += n`）。`take_replay` 結果為空時不建立 hold。(2) 未撤銷的 hold 存在期間 `SessionCore::foreground_busy()` 為 true（`foreground.is_some() \|\| human.replay_hold.as_ref().is_some_and(\|h\| !h.revoked)`），所有 06／07／09 的「前景忙」判定一律改用它：佇列不出列（命令維持 accepted，不回錯，對應 Python 每 session 單一 arbiter worker 要等 `execute_command` 連同 flush 返回才取下一筆）；READY `interactive_open`、`interactive_send` 回 `SESSION_BUSY`；`console_attach` 回 `"interactive_owner":false`；SessionPublic `foreground_busy` 為 true；例外（parity-amendments-2026-10-26 #56，對齊 Python `_interactive_post_close`）：hold 來源為 lease **tick 到期**的 `PostClose` 還原（`ReplayHold.origin == LeaseTickClose`）時，還原結算前 `interactive_open`、interactive 模式 `command.submit`、human 救援與 `console_attach` 一律回 `{"ok":false,"error_code":"SESSION_INTERACTIVE_BUSY"}`（`console_attach` 另帶 `"selector":<COM>`，`session_manager.py:6236,6514,6692,6853,6949,7045`），與鎖內 `tests/test_stage0_lease_flash_console.py::test_tick_blocks_new_lease_until_owner_restore_finishes` 相同；P8 push／pull 回 `SESSION_BUSY`、FlashSyncProbeStart 依 SC-14 拒絕。(3) 該 hold 最後一筆回放結算（`Completed`、partial、`Unknown`、`NotSubmitted` 皆算）時，在同一次 `Fence::with` 內清 `replay_auth = None`、`replay_hold = None`，然後依 06「前景空閒則出列」取下一筆命令。(4) **撤銷（OS 提交點的後備）**：任何不經佇列的新操作取得 ownership 時——`fg_begin`、`human_suspend_begin`、`StartOp` 任一前景 op、`interactive_open`（含 ATTACHED 救援分支：Python 該分支不檢查前景，`session_manager.py:4027` 只在 READY 判 `SESSION_BUSY`）、`set_interactive_owner` 改為非 human owner、`begin_stop`——先在同一次 `Fence::with` 內設 `replay_auth = None` 並把 hold 標為 revoked，再做自己的 ownership／admission 變更。revoked hold 在 backlog 中尚未送出的回放立即 `restore_front` 回 deferred；在途那一筆若尚未通過 `FenceSubmitGate`，OS 提交點回 `ReplayRevoked`、零 TX，結算時 `restore_front`（D-15(3)）；若已通過，它在 TxWriter 單寫入者順序上早於新操作的任何 TX，照實記錄。被撤銷的 bytes 在新操作的回放點（例如其 `fg_finish`）以新 hold 重新回放；若該點依 D-16 不允許回放，依 D-16 丟棄。revoked hold 保留到其在途那一筆結算為止（期間不算前景忙，`foreground_busy()` 只計未撤銷的 hold）；若新回放點在此之前到達，先記 `replay_after_revoked=true`、不 `take_replay`，待在途那筆結算並 `restore_front` 後才執行該次回放並建立新 hold，避免較新的 bytes 先於被撤銷的舊 bytes 寫出。hold 本身沒有逾時：UART 寫入卡住時 hold 一直存在，與 Python token 被背壓中的 `send_bytes` 卡住相同；drain Phase 1 由 `begin_stop` 撤銷並 `invalidate_human_input` 結束。(5) human 之間的 owner 變更（self-heal grant、detach、drop、pending human promote）不撤銷：回放 bytes 仍經單筆在途的 human lane，在新 owner 的 HumanRaw 之前寫出，順序與 Python 同步 flush 相同 | §5.2.6、§5.3 Console 輸入列、§11.3；`session_manager.py:1048-1120`、`:3699-3703`、`:4027`、`:4232`；`uart_io.py:1378-1400` |
 
 **WARNING log 模板**（daemon stderr、`%(message)s`、只輸出 WARNING 以上，arch §6.1；以 06 `Effect::Warn(String)` 輸出；日誌文字不是位元組契約，黑箱只斷言 `client_id` 與 reason／code 子字串；P1 Python 的模板文字不同，A/B 不比對日誌全文）：
 
@@ -423,6 +423,22 @@ git add contracts/behavior_changes.yaml contracts/resource_limits.yaml tests/tes
 git commit -m "chore(contracts): 登記 Slice 2.2 Rust-only 契約並凍結案例集合" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+**新增 Step（Python 基線 parity 測試入鎖）**：建立 `s22_gate:py_parity`（linux／windows，規則同 06 Task 0b #76），add-only 登記：
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #105 | B:E-109 | `tests/test_holder_probe_namespace.py::TestUartBridgeHeldPathsNamespace` 5 筆 | `passed`（posix_only） |
+| #106 | B:E-26 | `tests/test_stage0_bridge_drain.py::{test_drain_timeout_closes_preserved_consoles_that_cannot_be_returned,test_unsafe_stop_receipt_closes_preserved_consoles,test_concurrent_stop_delivers_preserved_consoles_once}` | `passed`；Rust 側為刻意架構差異（console 歸 ConsoleHub，arch §5.1、D-01），斷言改為「drain 失敗不關閉 hub 內 console、交還恰一次」的絕對契約 |
+| #107 | B:E-87 | `tests/test_agent_defer_tx.py::test_console_input_supports_backspace_and_local_echo` | `passed`；Task 11 L1.5 func-test 另加 0x08／0x7F 輸入案例 |
+| #108 | B:D-61、D-101 | `tests/test_refine_ownership.py` 中 Windows TCP `attach_console` 不開 lease 與 `test_existing_human_owner_window_is_deferred_before_suspend` 等未鎖 nodeid（逐名列入 PR） | `passed` |
+| #183 | P6 審查 F4 | `tests/test_slice21_case_freeze.py:57` | **已實作追加修正**（p6）：revision 解析為 `(YYYY,MM,DD,N)` 整數 tuple 比較；凍結檔新增 `case_fingerprints`（每個必要案例完整 YAML 的 sha256）並逐案驗證，取代已失效的整檔位元組指紋（補強，非削弱） |
+| #184 | P6 審查 F5 | `tests/test_acceptance_cases.py:44-54` | **已實作追加修正**（p6）：Stage 1A 群組改以 `case_id.startswith("bb-")` 或 `source_ref` 前綴判定，並斷言所有 `bb-*` 的 `implemented_by == "04-stage1a-rust-cli.md"` |
+| #185 | P6 審查 F3 | T0 commit `ae33e28` 單獨紅燈 | 合併前把 `e5e2c56` 的 marker 修補與 `5516137` 的 MIRROR 九列 fixup 進 T0 commit；不重寫歷史時，PR 描述須明載「T0 單獨為紅燈、終態綠燈」 |
+
 ---
 
 ## Task 1：常數、模組骨架與 harness 簽章
@@ -591,6 +607,16 @@ Expected: PASS；兩個 target 皆可編譯；06 既有測試全部仍綠燈（�
 git add crates/ scripts/rust/check_p6_prereqs.py scripts/rust/cargo_nonzero.sh changelog.d/rust-s22-console-skeleton.md
 git commit -m "feat(rust-console): 新增 Slice 2.2 console 常數、模組骨架與 harness 簽章" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #179 | P6 審查 F1 | Step 4 gate 改寫 | 「06 既有測試全部仍綠燈」改為「與 P5 基線逐 test binary 結果相同」（以 `cargo test --workspace --features test-fakes --no-fail-fast` 於 p5 與 p6 各跑並比對，腳本化為 `scripts/rust/compare_test_baseline.py`）；計畫進度欄明列「上游 06 T8～T14 未交付，本 Phase Task 6～13 為 BLOCKED-UPSTREAM」 |
+| #180 | P6 審查 F2 | `scripts/rust/check_p6_prereqs.py` | `--max-task` 輸出末行固定印「仍有 N 項後續缺漏」；新增 `--strict`（全表模式、非零 exit）；`s22_gate_check.py` 只以全表模式呼叫並斷言 exit 0；登記 T10／T11 為 BLOCKED-UPSTREAM |
+| #186 | P6 審查偏離 (h) | `crates/sw-daemon/tests/support/mod.rs` | 補 `pub fn deferred_methods(yaml: &str, delivered: &[&str]) -> Vec<String>`（`todo!` 本體亦可），不依賴 `ServiceRig`（Low，T10 前任一 commit） |
 
 ---
 
@@ -793,6 +819,15 @@ Expected: 全數 PASS（含 `golden_matches_python_byte_for_byte` ≥2000 案例
 git add crates/sw-core/src/telnet_console.rs crates/sw-core/tests/telnet_filter.rs crates/sw-core/tests/common/ scripts/rust/goldens/gen_telnet_filter.py contracts/golden/telnet_filter.tsv tests/test_rust_goldens_fresh.py changelog.d/rust-s22-telnet-filter.md
 git commit -m "feat(rust-console): 移植 Telnet greeting、NVT filter 與 IAC 逸出" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #181 | P6 審查 F8 | `crates/sw-core/tests/common/golden.rs`；`.gitattributes` | **已實作追加修正**（p6）：`XorShift` 建構時 `seed \| 1`（或 splitmix64 初始化），`SW_TEST_SEED=0` 不再空轉；`.gitattributes` 加 `contracts/golden/** text eol=lf` |
+| #182 | P6 審查 F9 | `scripts/rust/goldens/_tsv.py` | **已實作追加修正**（p6）：`write_raw_tsv` 收進 `_tsv.py`（含唯一性檢查），`read_tsv` 支援 raw 與 hex(UTF-8) 兩種模式並於 docstring 註明 |
 
 ---
 
@@ -1002,6 +1037,14 @@ Expected: PASS。
 git add crates/sw-core/src/human_console/line_editor.rs crates/sw-core/src/human_console/line_mode.rs crates/sw-proto/src/pycompat.rs crates/sw-core/tests/line_editor.rs crates/sw-core/tests/human_line_mode.rs crates/sw-proto/tests/shlex_golden.rs scripts/rust/goldens/ contracts/golden/line_editor.tsv contracts/golden/human_console_mode.tsv contracts/golden/shlex_split.tsv tests/test_rust_goldens_fresh.py changelog.d/rust-s22-line-editor.md
 git commit -m "feat(rust-console): 新增 line-buffer 編輯、本地回顯與 human line mode 判定" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #177 | P6 審查 F6（SC-16 WARNING 時機） | `overflow_warning_at_trigger_byte`、`overflow_without_terminator_still_warns`、`overflow_across_chunks_warns_once` | **已實作追加修正**（p6 `crates/sw-core/src/human_console/line_editor.rs:46-52`）：新增 `LineEditor::take_overflow_started(&mut self) -> bool`（discarding 由 false→true 時設旗標），hub／core 在第 16386 個 byte 到達當下寫 WARNING（與 `uart_io.py:1706-1711` 同時機）；`LineOutput` 三欄不變；golden 產生器加「未終止」「跨 chunk 終止」兩情境 |
 
 ---
 
@@ -1251,6 +1294,14 @@ Expected: PASS。
 git add crates/sw-core/src/human_console/out_ring.rs crates/sw-core/tests/out_ring.rs changelog.d/rust-s22-console-ring.md
 git commit -m "feat(rust-console): 新增每 console 1 MiB 出向 ring（drop-oldest）" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #178 | P6 審查 F7 | `partially_written_front_drops_newest_reported` | **已實作追加修正**（p6 `out_ring.rs:92-100`）：保護部分寫出的 front 時，若被丟的是剛推入的新項，回 `PushOutcome::DroppedNewest{bytes}`（新增變體）並在 WARNING 文字註明；斷言 `back()` 仍為舊項、回報為 `DroppedNewest{bytes:4}`。SC-15 語意（可丟、不阻塞）不變 |
 
 ---
 
@@ -1754,7 +1805,7 @@ fn lease_index_insert_precedes_reply() {
 | `status_expired_closes_restores` | 過期 recovery lease＋stash（peer 在） | `INTERACTIVE_EXPIRED`；stash 還原、HumanReplay 送出 |
 | `close_unknown` | close 不存在 id | `{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND","interactive_id":…}` |
 | `tombstone_fifo_16` | 17 個 agent lease 依序 tick 到期 | 第 1 個 id 存取 → `INTERACTIVE_NOT_FOUND`、`LeaseIndex(Remove)`；第 17 個 → `INTERACTIVE_EXPIRED` |
-| `lazy_expiry_then_not_found`（回歸，06 `send_expired_closes`） | timeout 1、advance 1.001 s（Tick 前）、send | `INTERACTIVE_EXPIRED`；再 send → `INTERACTIVE_NOT_FOUND` |
+| `lazy_expiry_keeps_tombstone_expired`（回歸，06 `send_expired_closes`；原名 `lazy_expiry_then_not_found`）（parity-amendments-2026-10-26 #54） | timeout 1、advance 1.001 s（Tick 前）、send；再 send、status、close；之後再開 16 個 lease 並讓其到期 | 第一次 `INTERACTIVE_EXPIRED`；再 send／status／close 皆 `INTERACTIVE_EXPIRED`、tombstone 不移除；第 17 個 tombstone 擠出後原 id → `INTERACTIVE_NOT_FOUND` |
 | `human_lease_not_expired_by_tick` | c1 human lease（timeout 86400）、時間推進 10^6 s | lease 仍 active |
 | `stash_dropped_when_peer_gone_sc31` | soft preempt 後 c1 輸入 `b"Q"` 進 deferred；c1 peer 消失；close | `interactive_session_id` 為 null；`human_tx()` 不含 `Q`；WARNING `reason=lease_dropped`；resume 後 owner None（`clear_owner_after_resume`）（D-16） |
 | `stash_dropped_when_expired_sc31` | stash lease 已過期；c1 有 deferred；close | 同上 |
@@ -1789,7 +1840,7 @@ Expected: P6 新行為 FAIL（`not yet implemented: P6 Task 7`、tombstone 斷�
 
 1. `interactive_open`：在 06 的實作上加入 human 分支，逐字依 session_manager.py:4009-4189（05 §10.1）。外層 retry 迴圈：refresh 回傳 `PostClose{needs_resume:true}` 時，先在 core 內執行 resume 效果（受 `replay_allowed` 限制），再重新評估一次，最多兩輪（Python `while True` 實際只會因 resume 重來一次）。soft preempt：human lease、`lease_context(..)["human_active"]==false`、`!owner.starts_with("human:")` → `stashed_human = active.take()`、`ownership.suspend()`、開 lease（`suspended_human:true`）、回應加 `"soft_preempted":true`。ATTACHED 分支：`running`（IoWorker 存活）、`serial_alive`（06 worker 回報）、`vtty_alive`（Task 9 hub 狀態）任一 false → `SESSION_NOT_READY`；`rx_tail(BOOTLOADER_RX_TAIL_BYTES)` 交給 `rescue::classify_attached_rescue`；`timeout = timeout_s.min(MAX_RECOVERY_LEASE_S)`。狀態矩陣依 `open_state_matrix`。READY 分支與 `interactive_send` 的前景忙判定用 `foreground_busy()`（回放 hold 期間回 `SESSION_BUSY`，D-22(2)）；ATTACHED 救援分支不判前景（Python parity），改在開 lease 前 `revoke_replay`（D-22(4)）。
 2. `_open_interactive_locked` 等價：`interactive_id` 取自 `deps.rng`（06 既有）、`created_at = wall_iso`、先 `revoke_replay`（D-22(4)；owner 為 `human:` 時不撤銷，D-22(5)）再 `ownership.set_interactive_owner(Some(owner))`、`Effect::LeaseIndex(Insert)` 放在 `Reply` 之前。`_close_interactive_locked` 等價（05 §10.4）回傳 `PostClose`，由同一 handler 立即執行：stash 還原條件為 `!stash.expired(now) && peer_present(stash client)`；成立時 `replay_allowed=true`，resume 的回放依 D-22(1) 建立 hold（lease tick／lazy 到期的 close 同）；不成立時 `replay_allowed=false`、`dropped_stash_client=Some(cid)`，先 `deferred.remove_client(cid)` 並寫 D-16 WARNING，再 `ownership.resume()`（不回放該 client），最後依 `clear_owner_after_resume` 執行 `set_interactive_owner(None)`。
-3. 到期：沿用 06 的 `ControlEvent::Tick` 與 `TimerEvent::LeaseExpiry`（deadline 以處理當下的 `last_activity` 重算）。tick 到期時 status 設 `"expired"`、執行 close 流程、`tombstones.push(id, "expired")`；超過 16 時 pop 最舊者並發 `LeaseIndex(Remove)`。`send`／`status`／`close` 先查 `active`，再查 tombstones：命中就回 `INTERACTIVE_EXPIRED`，**不移除**。lazy 到期（存取時判定）維持 06 現況：回 `INTERACTIVE_EXPIRED`、關閉並 `LeaseIndex(Remove)`、不進 tombstone。
+3. 到期：沿用 06 的 `ControlEvent::Tick` 與 `TimerEvent::LeaseExpiry`（deadline 以處理當下的 `last_activity` 重算）。tick 到期時 status 設 `"expired"`、執行 close 流程、`tombstones.push(id, "expired")`；超過 16 時 pop 最舊者並發 `LeaseIndex(Remove)`。`send`／`status`／`close` 先查 `active`，再查 tombstones：命中就回 `INTERACTIVE_EXPIRED`，**不移除**。lazy 到期（存取時判定）與 tick 相同：回 `INTERACTIVE_EXPIRED`、執行 close 流程、`tombstones.push(id, "expired")`，`LeaseIndex(Remove)` 延到被 FIFO 擠出時才發（parity-amendments-2026-10-26 #54）。
 4. `refresh`（`_refresh_interactive_locked`，05 §10.5）：human lease 以 `human.peer_present`（D-09 最近一次 `ConsoleScan`）判 peer；超過 grace → `ConsoleClose{cid}` 並移除 console（等同 `detach_console`）後 close。
 5. Self-heal（`ConsoleScan{source: Hub}` 處理內）：條件逐字照 session_manager.py:1638-1690；成立時 `ownership.try_grant_if_idle(...)` 回 true 才記 lease（不呼叫 `set_interactive_owner`）。同一事件內先 reap（Task 9 的規則），後 self-heal（Python 順序）。
 6. Retained human：新 epoch 的 attach 結果為 READY **或** ATTACHED 時，都執行 `_restore_retained_human_console_locked` 等價（`session_manager.py:2728`）。
@@ -1807,6 +1858,18 @@ Expected: PASS。
 git add crates/sw-core/src/lease.rs crates/sw-core/src/rescue.rs crates/sw-core/src/session_core.rs crates/sw-core/src/uart_bridge.rs crates/sw-core/src/session_manager.rs crates/sw-core/tests/ changelog.d/rust-s22-interactive-lease.md
 git commit -m "feat(rust-console): interactive lease 承接 human lease、stash 與可重複讀 tombstone" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #35 | B:D-71 | `open_with_command_reply_waits_tx_and_expired_maps` | `interactive_open` 帶 `command`：回覆等該 TX 結算後才送出；TX 提交前 lease 已失效（permit `lease`）→ `{"ok":false,"error_code":"INTERACTIVE_EXPIRED",…}`、零 TX（`session_manager.py:7135-7146`，對照鎖內 `test_interactive_open_command_expired_before_submit_zero_tx`）；延伸 `open_command_sent_after_open` |
+| #36 | B:D-74 | `send_checks_order` 延伸至提交點拒絕 | 映射同 06 Task 14 #36（`INTERACTIVE_EXPIRED`／`AUTOBOOT_QUIET`／`SESSION_BUSY`） |
+| #56 | B:D-60、D-66 | `tick_close_restore_returns_session_interactive_busy` | D-22(2) 例外：tick 到期 PostClose 還原結算前，`interactive_open`／interactive 命令／human 救援回 `SESSION_INTERACTIVE_BUSY`、`console_attach` 回 `{"ok":false,"error_code":"SESSION_INTERACTIVE_BUSY","selector":<COM>}`；還原結算後 open 成功、`interactive_owner=="agent:new"`（逐字對照鎖內 `test_tick_blocks_new_lease_until_owner_restore_finishes`）；fg_finish 來源的 hold 仍回 `SESSION_BUSY`（`interactive_rpc_busy_during_replay_hold` 不變） |
+| #41 | B:E-115 | `attached_unhealthy_not_ready` 消費端 | 使用 06 Task 12 #41 定義的 `serial_alive`／`running` |
+| #108 | B:D-61、D-101 | `windows_tcp_attach_console_does_not_open_lease`、`transfer_suspend_defers_existing_human_window` | Windows TCP `attach_console` 不開 lease（`:6855-6864`）；file 傳輸 suspend human 時既有 human owner 視窗先 defer（`:7970,8001`） |
 
 ---
 
@@ -1964,6 +2027,15 @@ git add crates/sw-pal/ scripts/rust/win-runner.sh docs/rust-refactor/plans/rust-
 git commit -m "feat(rust-pal): 新增 PTY／TCP console、ConsoleMux 與選配 com0com console" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #40／#64 | B:E-109 | 步驟 2 console reaper／`held_slave_paths()` | 必須使用 06 Task 2 #64 的 PAL `same_tty`（`(st_dev,st_ino)` 身分；devpts 不以 rdev 判定），跨 mount namespace 同名 `/dev/pts/N` 不計為 peer；移植 `TestUartBridgeHeldPathsNamespace` 5 案為 `console_reaper_ignores_other_namespace_same_name_pts` 等（`uart_io.py:1430-1471`） |
+| #109 | B:E-15 | `tcp_accept_sets_nodelay_and_label_shape` | TCP accept 設 `TCP_NODELAY`；label／`vtty` 形狀照 `uart_io.py:1327-1344`（`tcp://127.0.0.1:<port>#<n>` 等以 Python 實測為準） |
+
 ---
 
 ## Task 9：ConsoleHub runtime 與 RX fan-out
@@ -2113,6 +2185,16 @@ Expected: PASS。
 git add crates/sw-core/src/human_console/hub.rs crates/sw-core/src/uart_bridge.rs crates/sw-core/src/actor.rs crates/sw-core/tests/ changelog.d/rust-s22-console-hub.md
 git commit -m "feat(rust-console): 新增不阻塞的 ConsoleHub thread、RX fan-out 與 peer 掃描" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #37 | B:E-18 | `hub_mux_wait_error_backoff_20ms_then_rebuild` | `mux.wait` 回 Err：stop 已設 → 離開；否則 20 ms 退避後重整 fd 集合、不結束 hub（`uart_io.py:1386-1390`） |
+| #89 | B:E-19 | `console_rx_handler_panic_isolated` | 單一 console 處理 panic 寫 WARNING、其他 console 照常 |
+| #110 | B:E-117、E-118、E-119 | 既有 SC-31 列 | Python 側無測試；Rust 依 SC-31(a)(c)(d) 只驗絕對契約（`absolute_only`），A/B 比較器排除；不另立 Python 特性測試 |
 
 ---
 
@@ -2607,6 +2689,14 @@ git commit -m "docs(rust-console): 完成 Slice 2.2 案例證據對照並更新 
 ```
 
 PR（`wt/rust-refactor/p6-slice22` → `feature/rust-refactor`）描述（R-11／R-17／#155）：勾選 Policy Checklist；`Closes` 只在有對應 issue 時使用，無 issue 時上 `policy-exempt:issue-link`；記錄 #155 評估結論（同上第 5 點）；附 Task 0 的 `cases.lock.json` sha1；列出本 Phase 全部 BLOCKED-OWNER 項目與其程序及證據 schema 位置。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #187 | 稽核 A／B 全體 | 切片出口條件 | `s22_gate_check.py` 另讀 `parity-amendments-2026-10-26.md` 中承接 Phase 為 P6 的列，逐列標 `PASS`／`BLOCKED-OWNER`／`OWNER-DECISION-PENDING`；`s22_gate:py_parity`（Task 0）納入 gate 必要集合；P6 審查 F1～F9、(h) 的已實作追加修正須在進入 Task 6 前完成（F1／F2 至少已明文化 BLOCKED-UPSTREAM） |
 
 ---
 

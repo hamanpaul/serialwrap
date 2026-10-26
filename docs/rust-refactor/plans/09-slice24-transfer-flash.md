@@ -358,6 +358,20 @@ def test_breaker_trips_on_lt_10pp_over_three_weeks(tmp_path):
 
 **BLOCKED-OWNER：** SC-33、XFER-ABORT-01（BC-03 適用性）、EVT-D-F4／F7 三項 needs-owner 裁決（未裁決前依預設往下做；EVT-D-F4 未裁決則 `f7-larger-file-not-truncated` 阻擋出口）。
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+**新增 Step（Python 基線 parity 測試入鎖）**：建立 `s24_py_parity`（linux／windows），add-only 登記：
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #122 | B:F-M08～F-M11、F-M21 | `tests/test_flash_endpoint.py` 6 筆、`tests/test_flash_pump.py` 6 筆 | `passed`（CLAUDE.md MCU 三坑的 Python 自動化證據，取代只靠 manual p2-1） |
+| #123 | B:F-M17、A-46 | `tests/test_flash_service_wiring.py` 未鎖 nodeid（含 `test_on_flash_open_no_candidates_is_silent`） | `passed` |
+| #124 | B:D-111 | `tests/test_transfer_portability.py::TestTransferOpenSSLRoundtrip`、`tests/test_refine_transfer_integration.py::test_openssl_roundtrip_with_505_byte_budget` | `passed` |
+| #125 | B:B-99 | `tests/test_p1oc_sc35_commands.py::test_file_push_pull_passthrough_rejected` | `passed` |
+| #126 | B:A-35 | `tests/test_stage0_handoff_stop.py::test_handoff_drain_window_flushes_mutating_answers_ping_and_exits_bounded`、`::test_handoff_flash_races_prepare` | `passed` |
+
 ---
 
 ## Task 2：`mcu_patterns` registry 與 hex 語意
@@ -482,6 +496,15 @@ const GOLDEN_ROWS: usize = 23;
 **Changelog fragment：** `changelog.d/rust-p8-mcu-patterns.md`（`type: feat`、`scope: rust-core`）。
 
 **BLOCKED-OWNER：** 無。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #44 | B:F-M06 | 註記 | `McuPatternRegistry.render_support_list` 無 production 呼叫端，刻意不移植（非 daemon 行為）；ttyMCU 端點沉默規則見 Task 9 #128 |
+| #127 | B:F-M02 | `contracts/golden/mcu_patterns.ndjson` 補 hex 解析邊界列 | 奇數長度、空白分隔、大小寫、`0x` 前綴等邊界依 `mcu_patterns.py:9-11` 實測 |
 
 ---
 
@@ -848,6 +871,15 @@ fn pull_roundtrip_openssl_keeps_newlines_and_writes_basename_in_cwd() {
 
 **BLOCKED-OWNER：** 無（真機 encoder/decoder 組合見 Task 15 的 L2 F7）。
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #124 | B:D-111 | `push_pull_openssl_fallback_roundtrip` | 無 base64 時以 openssl encoder／decoder fallback 往返成功（`file_transfer.py:455-469`），含 505-byte line budget |
+| #60 | B:E-80 | echo 等待遇 tx_cancel | **OWNER-DECISION PA-OD-3 待裁決**：裁決前維持現列；建議值為 Python 1:1（回部分進度、`ok:false`，`uart_io.py:2507-2509`） |
+
 ---
 
 ## Task 5：`OpTransferPort`：echo-ACK 節流、TX 證據聚合與中止
@@ -966,7 +998,7 @@ fn drain_during_echo_paced_records_confirmed_slices_before_receipt() {
 | `shutdown_during_paced_push_wal_has_confirmed_slices` | paced 中送 shutdown（Phase 1＋2） | `wal.sync_close` 前 WAL 已有確認 bytes 的 TX；`unrecorded` 為空 |
 | `aggregate_flush_wal_failure_listed_unrecorded` | flush 時 `fail_next_writes(wal, 1)` | receipt `unrecorded` 列出該 op 的確認 bytes 範圍 |
 | `selftest_probe_between_paced_slices_never_splits_slice` | paced 進行中送 `TxClass::SelfTestProbe`（SES-16.3b KEEP：self-test 不取前景 token） | 外部 byte 序列中 probe 只出現在 slice 邊界、從不切開單一 slice；WAL 順序與外部序列一致 |
-| `system_recover_key_refused_while_foreground_held` | ForegroundSlot 由 FileTransfer 持有時嘗試 `SystemRecoverKey` | 依 P5 ForegroundSlot 規則不出列；外部零寫入（no_forbidden_interleave） |
+| `system_recover_key_not_gated_by_foreground_slot`（原 `system_recover_key_refused_while_foreground_held`；SES-16.3b KEEP：READY 路徑 recover 送 CTRL_C／CTRL_D 不取前景 token）（parity-amendments-2026-10-26 #58） | ForegroundSlot 由 FileTransfer 持有時送 `SystemRecoverKey` | 送鍵照常出列，只出現在 paced slice 邊界、從不切開單一 slice（比照 `selftest_probe_between_paced_slices_never_splits_slice`）；WAL 順序與外部序列一致 |
 
 - [ ] **Step 2：執行並確認 FAIL**：`cargo test -p sw-core --features test-fakes --test echo_paced` → `not yet implemented: P8-T5`。
 - [ ] **Step 3：commit 測試**：`test(uart): 新增 echo-ACK 節流與傳輸 TX 證據失敗測試`
@@ -1015,7 +1047,7 @@ fn drain_during_echo_paced_records_confirmed_slices_before_receipt() {
 **語意：**
 - RPC 層（`service.py:1069-1131`）：`selector`／`local_path`／`remote_path` 用 `str(x or "")`；`chunk_size = max(1, int(params.get("chunk_size") or 512))`；`chunk_timeout_s = float(raw) if raw is not None else None`；轉型失敗 → `{"ok":false,"error_code":"INVALID_ARGS"}`；`ack_mode=str(x or "auto")` 不在白名單 → `INVALID_ARGS`；`source=str(x or "agent")`；必填缺 → `INVALID_ARGS`；再走 `_resolve_session_id` 等價順序（P1 凍結優先序，P1-OC 補 SC-35）：查無 → `SESSION_NOT_FOUND`；`platform=passthrough`（任何 state，含 SC-35 安靜轉入的 READY）→ `{"ok":false,"error_code":"PROFILE_NOT_COMMAND_CAPABLE","hint":…,"session":…}`（passthrough 沒有 shell 傳輸契約，零 TX；位置照 P1-OC Python 實作凍結）；`RECOVERING` → `{"ok":false,"error_code":"SESSION_RECOVERING","session":…}`；`FLASHING` → `{"ok":false,"error_code":"FLASHING_BUSY","session":…}`（SC-02，三個方法共用）；其餘非 READY → `PROFILE_NOT_COMMAND_CAPABLE`／`SESSION_NOT_READY`；READY → `submit_gate_reject`（DF-02：`human:` 開頭一律以 agent 對待）。`file.pull` 的 `local_path` 只有 truthy 時 `str()`，否則 None；`ack_mode` 只驗不傳。
 - Manager 層（`session_manager.py:4843-5011`）在 actor 內原子執行：session 不在／無 bridge／非 READY → `{"ok":false,"error_code":"SESSION_NOT_READY"}`（無其他欄位）；`execute_gate_reject` → `READY_UNCONFIRMED`（`selector`、`hint`、`recommended_action:"self_test"`）或 `AUTOBOOT_QUIET`（`selector`、`retry_after_s`，SC-03）；`recovering` → `SESSION_RECOVERING`；lease：agent 對 human lease → suspend human、結束 resume；其他 lease → `SESSION_INTERACTIVE_BUSY`；前景槽已占 → `{"ok":false,"error_code":"SESSION_BUSY","selector":<com>}`（不排隊，EVT-D-F6）。
-- 傳輸中途（SC-33）：Quiet／Reconfirm 在傳輸中被 arm → 下一個尚未開始的寫入被 fence 拒絕 → 回 `AUTOBOOT_QUIET` 形狀；不送 cleanup；已送 chunk 的遠端暫存檔保留（不重送、不補救）。Python 基線在此情境繼續傳完（A/B 已登記差異，比較器對 SC-33 案例只跑 Rust 側）。
+- 傳輸中途（SC-33）：Quiet／Reconfirm 在傳輸中被 arm → 下一個尚未開始的寫入被 fence 拒絕 → 回 `AUTOBOOT_QUIET` 形狀；不送 cleanup；已送 chunk 的遠端暫存檔保留（不重送、不補救）。Python 基線實際行為（parity-amendments-2026-10-26 #67 更正原「繼續傳完」）：agent 來源下一筆 send 被 bridge TX gate（`agent` class＋`_gate_quiet`）拒絕 → `TxIncompleteError` 穿出 → RPC `EXCEPTION`、不 cleanup；human 來源傳完（`session_manager.py:7959-7961`）。A/B 已登記差異，比較器對 SC-33 案例只跑 Rust 側；SC-33 本身仍待擁有者 item 8（見 parity-amendments OWNER-DECISION PA-OD-2）。
 - timeout：push chunk `chunk_timeout_s` 或 `max(profile.timeout_s, 5.0)`；push echo `max(profile.timeout_s, 5.0)`；pull `chunk_timeout_s` 或 `max(profile.timeout_s, 30.0)`；`chunk_timeout_s=0`（或負值）照收，每段不檢查即逾時（EVT-D-F1、Task 5 `wait_regex_timeout_zero_returns_false_even_if_matched`）。`prompt_regex=profile.prompt_regex`、`max_console_line_chars=profile.max_console_line_chars`。
 - finally：resume human（若曾 suspend）→ 釋放 ForegroundSlot（重放 deferred human bytes；`input_epoch` 已因 release／recovery／quiet 遞增者依 BC-02 丟棄，P6 D-02）。
 - 中止（XFER-ABORT-01）：OpRunner 收到 `TransferAbort::SerialNotReady` → RPC 回 framing `EXCEPTION`；session 不另行重送。
@@ -1123,6 +1155,16 @@ Session gate 族（`s24-xfer-session-gates`，`file_transfer_session.rs` 以 `su
 **Changelog fragment：** `changelog.d/rust-p8-file-transfer-rpc.md`（`type: feat`、`scope: rust-daemon`）：含 XFER-ABORT-01 與 SC-33 的說明。
 
 **BLOCKED-OWNER：** L2 F7（`f7-binary-roundtrip-md5`、`f7-larger-file-not-truncated` 1 MB；後者 pull 端受 EVT-D-F4 影響必為 SKIP，待擁有者就 §0.4 EVT-D-F4 裁決）與 realhw `p1-cmd-file` 對 Rust bundle 實機執行（交 bench 前先以 `scripts/docker/run-l15.sh` 跑 `L1.5-docker`，不計 L2／L3）。Windows 原生 COM 上的 push/pull（`windows_com`）OD-15 起為擁有者 host 可執行 gate（`COM20:COM21`）。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #125 | B:B-99 | `passthrough_file_push_pull_rejected_any_state` | passthrough 任何狀態 `file.push`／`file.pull` → `PROFILE_NOT_COMMAND_CAPABLE`（SC-35）；Python oracle Task 1 #125 |
+| #67 | B:D-103 | 本 Task L1018 已更正 Python 基線描述 | A/B 依實際 `EXCEPTION` 判定；SC-33 待 PA-OD-2 |
+| #128 | B:D-104 | XFER-ABORT-01 | **OWNER-DECISION PA-OD-3 待裁決**（與 #60 同案） |
 
 ---
 
@@ -1250,6 +1292,15 @@ fn cap_posix_pty__holder_probe_sees_flasher_then_none() {
 **Changelog fragment：** `changelog.d/rust-p8-pal-flash.md`（`type: feat`、`scope: rust-pal`）。
 
 **BLOCKED-OWNER：** 無（Windows 無 flash 端點，不在本 Task 範圍）。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #75 | B:E-85 | `baud_mirror_b0_uses_fallback` | RECORD：spec-reconciliation §7 NC-10（B0 會拉低 DTR，刻意以 registry baud fallback 取代） |
+| #129 | B:F-M20 | `baud_mirror_copies_flasher_termios` | flasher 設定的 baud 鏡射到 UART，registry baud fallback 僅在無法讀取時使用（`uart_io.py:2318-2352`） |
 
 ---
 
@@ -1798,6 +1849,17 @@ def test_two_flashes_same_daemon(sw_env, fake_mcu):
 
 **BLOCKED-OWNER：** P2-1 MCU flash 手動程序（真機，CLAUDE.md「MCU flash 真機驗證手法」）：擁有者以 Rust bundle 啟動 throwaway daemon（`SERIALWRAP_RUN_DIR`／`_STATE_DIR`／`_BY_ID_DIR` 只含 FTDI MCU 線 symlink，prod daemon 不停），於 DUT console 逐行短指令進 BSL，執行 `ocp-mcu-upgrade -d <RUN_DIR>/dev/ttyMCU -b 115200 -t 8 -e -s -i <fw.bin>`，證據：`Return error code : 0x0`、燒後 session 回 `ATTACHED`、daemon 不死、其他 COM 不受影響、WAL `source:"flash"` 紀錄與 `mcu status` 輸出。程序 revision、執行入口、層級、責任人依規格 §11.6 由 Stage 0 清單提供。
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #130 | B:F-M09、F-M17（MCU 坑 1） | `endpoint_silent_when_unbridged`、`on_flash_open_no_candidates_is_silent` | 端點未 bridge 時對 flasher 零 bytes 輸出（含 idle 期間）；未命中候選時靜默 |
+| #131 | B:F-M19（MCU 坑 2） | `ack_replayed_first_bytes_not_resent` | 以 flasher 自身 sync 探測，MCU 的 ACK 回放給 flasher；不重送 first_bytes、不另注入 sync（`service.py:520-529`） |
+| #132 | B:F-M22、A-49（MCU 坑 3） | `holder_probe_disconnect_ends_pump`、`holder_probe_cap_1800s` | holder-probe 每 0.5 s；曾 armed 後歸零即停 pump、離開 FLASHING 恢復 ATTACHED；上限 1800 s（`service.py:541-556`） |
+| #133 | B:F-M10、F-M11、F-M21 | `endpoint_loop_survives_on_flash_open_panic`、`endpoint_stop_removes_link`、`pump_eof_and_error_converge` | 對照 Task 1 #122 的 Python oracle；L1.5 案例 `s24-flash-*` 由本 Task 登記 cases（P2 add-only） |
+
 ---
 
 ## Task 10：`mcu.patterns`／`mcu.status` RPC 與 daemon 組裝
@@ -1964,6 +2026,14 @@ def test_released_survives_two_restarts_and_replug(sw_env, shell_target):
 
 **擁有者 host 可執行 gate（OD-15）：** `windows_access_denied_holder_unknown`、`windows_external_flasher_cycle`（OD-08 原生 COM）以 `SW_TEST_COM_PAIR=COM20:COM21`（或 SC-36 元件安裝的 pair）由 orchestrator 經 WSL interop 執行；Spike 1 已證實 COM20 第二次開啟得 `ERROR_ACCESS_DENIED`，本 Task 以 Rust daemon 重驗。
 **BLOCKED-OWNER：** realhw `p1-ho-cycle`（外部 tmux `minicom -D <attached_real_path> -b 115200`；`device attach` 與 `device attach --force` 都須回 `DEVICE_STILL_HELD`，kill minicom 後才收回 READY）、`p1-ho-persist`（RELEASED 跨 `sudo systemctl restart`）、L2 `f10-creds-fixed-then-ready`（ThrowawayDaemon 交接）於 live bench 以 Rust bundle 執行。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #90 | B:C-13、C-16 | `test_release_response_fields_blackbox` | 黑箱 A/B：release 回應 `closed_consoles`／`aborted_cmd` 值與 Python 相同（一般路徑與 attach-op 路徑各一） |
 
 ---
 
@@ -2255,6 +2325,19 @@ P4 已交付 §12.1 七步與 `safety_check`（05 L1617-1654：`mcu.status`(0.5 
 
 **擁有者 host 可執行（OD-15，原 BLOCKED-OWNER）：** Windows 版本目錄的實機回滾（真實 COM 釋放與重新取得，規格 §12.1 末段「回滾驗收須包括真實串口釋放與重新取得」）於擁有者 Windows 主機以原生 COM `COM20`（peer `COM21` 驗證外部可開／daemon 收回）由 orchestrator 執行；daemon 一律為 OD-11 隔離實例。實體 USB-UART 上的同一流程仍屬 Spike 6（P4 B-05）。
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #9 | B:A-33、B-19 | `handoff_refused_when_tx_fence_in_flight` | 已過提交檢查的背景寫入仍在途時 `daemon.handoff_stop` fail-closed：撤銷**本次**凍結（只撤銷本次 `freeze_if_idle` 建立的 token）、回 `{"ok":false,"error_code":"SESSION_BUSY","busy":[{…,"ops":["tx.in_flight"]}]}`，之後新命令照常受理（`service.py:975-997`、`admission.py:69-81`、`session_manager.py:1022-1068` 的 TX fence 收斂與回滾）；arch §6.2 第 7 步補 `tx.in_flight` |
+| #10 | B:A-37 | `crates/sw-core/tests/admission.rs`：`shutdown_freeze_clears_idle_token`、`thaw_only_revokes_own_freeze`、`repeated_handoff_returns_existing_token`、`flash_ticket_counts_as_flashing` | 對照鎖內 `tests/test_admission_thaw_owner.py` 5 筆（CHG-S1X-OD19-HANDOFF-THAW-01） |
+| #16 | B:B-20 | `handoff_window_background_zero_tx` | 3 秒排空窗口內 reprobe、lease tick、self-heal、DeviceWatcher 重探與 console 行零 TX，在途 probe 結果不改寫 session（`session_manager.py:2148,2250,2302,2378,2462`）；同時取得 Rust 版 L1.5 證據（`PENDING-EVID-S1X-HANDOFF-WINDOW-L15`） |
+| #29 | B:C-57 | `handoff_freeze_restores_preattaching_to_detached` | 交接凍結早退時預標 ATTACHING 還原 DETACHED |
+| #134 | B:A-29 | `handoff_busy_row_com_resolved_from_interactive_id_and_by_id` | busy 列 `com` 由 selector／interactive_id（lease 所屬 session）／device_by_id 解出，皆無時 `"*"`（`service.py:875-900`）；Python 側新增特性測試 `tests/test_stage0_handoff_stop.py::test_busy_com_resolution_chain`（`s24_py_parity`） |
+| #135 | B:A-35 | `HANDOFF_DRAIN_GRACE_S` | 常數 3.0 s 由 sw-proto 常數登記並以 Python 擷取值同步（`daemon.py:128-134`）；Python oracle Task 1 #126 |
+
 ---
 
 ## Task 15：全部凍結契約的最終覆蓋判定與切片出口腳本
@@ -2471,6 +2554,15 @@ def test_cargo_results_import_roundtrip(tmp_path):
 **Changelog fragment：** `changelog.d/rust-p8-contract-coverage.md`（`type: change`、`scope: contracts`）。
 
 **BLOCKED-OWNER：** 見下節彙總（本 Task 只負責把它們列出並阻擋出口，不得計為 PASS）。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #136 | 稽核 A／B 全體 | 切片出口條件 | `parity-amendments-2026-10-26.md` 中承接 Phase 為 P8 的每一列在 Task 15 報告逐列標 `PASS`／`BLOCKED-OWNER`／`OWNER-DECISION-PENDING`；`OWNER-DECISION-PENDING` 列不得標 PASS |
+| #8 | A:觀察 | `cli_schema.json` `stage` 歷史值與 README 未列命令 | 文件 Task 同步：README 中英兩段補 `alias *`、`cmd cancel`、`daemon restart`、`daemon stop`、`session activity`、`stream tail`（R-18）；`stage: delegate-1a` 由 P0 契約維護者以 add-only 註記 `x-note: historical`（本計畫不改契約檔） |
 
 ---
 

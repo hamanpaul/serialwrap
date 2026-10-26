@@ -1010,6 +1010,14 @@ def test_stage3_requires_python_baseline_daemon(tmp_path):
 - [ ] **Step 4：Run** 同上 → Expected: PASS。
 - [ ] **Step 5：commit** `feat(stage3): 新增 A/B manifest 載入、凍結與案例涵蓋檢查`。
 
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #137 | 稽核 A／B 全體 | `test_manifest_marks_parity_amendment_rows` | A/B manifest 對 `parity-amendments-2026-10-26.md` 中 RECORD-SC（SC-37／SC-38 候選、NC-07～NC-13）與 OWNER-DECISION-PENDING 列標為 `absolute_only`／`excluded`，其餘 ALIGN-TO-PYTHON 列一律 `diff`；未在 manifest 標記的 parity 列 → manifest 載入失敗 |
+
 ---
 
 ## Task 4：A→B 資源釋放驗證（`tools/stage3/release_check.py`）
@@ -2999,6 +3007,14 @@ def test_sideloaded_file_retarget_cannot_reuse_pass(tmp_path):              # R3
 - [ ] **Step 3：實作**（agy）依規則；index 寫入用 `atomic_write_text(dumps_report(...))`；依 P0 T14 在測試檔頭寫 `pytestmark`。
 - [ ] **Step 4：Run** 同上 → Expected: PASS。
 - [ ] **Step 5：commit** `feat(stage3): 新增 Stage 0～3 出口證據索引與分平台判定`（files 含 `tests/fakes_evidence.py`）。
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #138 | 稽核 A／B 全體 | 出口證據索引 | 證據索引新增 `parity_amendments` 段：逐列引用 P5～P8 gate 報告中的狀態；任一 ALIGN-TO-PYTHON／ADD-TO-PLAN／REGISTER-IN-LOCK 列未 PASS → Stage 3 退役裁決不得開始；OWNER-DECISION 列須附裁決編號 |
 
 ---
 
