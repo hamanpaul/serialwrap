@@ -7,9 +7,14 @@
 內建 seed ``20261015``、1000 個隨機案例，並固定加入 SC-16 溢位案例（07 D-06）：恰 16385 bytes＋``\\r``、
 16386 bytes＋``\\r``、16386 bytes＋backspace＋可列印字元＋``\\r\\n``、溢位行跨 chunk 結束、溢位後下一行正常、
 16386 bytes＋``z\\x7f\\r``。
+parity-amendments-2026-10-26 #177（P6 審查 F6）：另加「未終止」（溢位後始終無 CR／LF）與「跨 chunk 觸發／終止」情境，
+並對每個固定案例多寫一列 ``line_warn``：``expected`` 為每 chunk 的溢位 WARNING 次數（以 ``,`` 分隔），
+由攔截 ``serialwrap`` logger 的 WARNING 取得——Python 在第 16386 個 byte 到達當下寫 WARNING（``uart_io.py:1706-1711``），
+與該行之後有無終止字元無關。
 
 四欄 TSV（沿用 P3 ``_tsv.py`` 檔案慣例；``input``／``expected`` 欄為 ASCII 原字串，不經 hex(UTF-8) 包裝）：
-``<case_id>\\tline_consume\\t<chunk hex,…>\\t<行數>:<line1 hex>+<line2 hex>…/<echo hex>,…``（行為 UTF-8 hex，可含 U+FFFD）。
+``<case_id>\\tline_consume\\t<chunk hex,…>\\t<行數>:<line1 hex>+<line2 hex>…/<echo hex>,…``（行為 UTF-8 hex，可含 U+FFFD）；
+``<case_id>\\tline_warn\\t<chunk hex,…>\\t<WARNING 次數>,…``（僅固定案例）。
 
 用法::
 
@@ -45,15 +50,40 @@ def _new_client() -> ConsoleClient:
     return ConsoleClient(client_id="g", label="g", master_fd=-1, slave_fd=-1, slave_path="", attached_at=0.0)
 
 
-def run_case(chunks: list[bytes]) -> str:
+class _WarnCounter(logging.Handler):
+    """計數 ``serialwrap`` logger 的 WARNING（溢位 WARNING 的唯一來源為 ``_consume_console_input``）。"""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno == logging.WARNING:
+            self.count += 1
+
+
+def run_case_with_warns(chunks: list[bytes]) -> tuple[str, str]:
     bridge = _new_bridge()
     client = _new_client()
+    logger = logging.getLogger("serialwrap")
+    counter = _WarnCounter()
+    logger.addHandler(counter)
     outs = []
-    for c in chunks:
-        lines, echo = bridge._consume_console_input(client, c)
-        joined = "+".join(line.encode("utf-8").hex() for line in lines)
-        outs.append(f"{len(lines)}:{joined}/{echo.hex()}")
-    return ",".join(outs)
+    warns = []
+    try:
+        for c in chunks:
+            before = counter.count
+            lines, echo = bridge._consume_console_input(client, c)
+            warns.append(str(counter.count - before))
+            joined = "+".join(line.encode("utf-8").hex() for line in lines)
+            outs.append(f"{len(lines)}:{joined}/{echo.hex()}")
+    finally:
+        logger.removeHandler(counter)
+    return ",".join(outs), ",".join(warns)
+
+
+def run_case(chunks: list[bytes]) -> str:
+    return run_case_with_warns(chunks)[0]
 
 
 def split_chunks(rng: random.Random, data: bytes) -> list[bytes]:
@@ -77,6 +107,12 @@ def fixed_cases() -> list[tuple[str, list[bytes]]]:
         ("le-ovf-then-normal-same-chunk", [a * 16390 + b"\rok\r"]),
         ("le-ovf-lf-terminated", [a * 16386 + b"\n", b"\r"]),
         ("le-ovf-two-lines", [a * 16386 + b"\r" + a * 16386 + b"\r", b"x\r"]),
+        # parity-amendments-2026-10-26 #177：未終止（溢位後無 CR／LF）
+        ("le-ovf-unterminated", [a * 16386]),
+        ("le-ovf-unterminated-more", [a * 16386, b"bb\x7f", b"cc"]),
+        # 跨 chunk 觸發（第 16386 個 byte 單獨一個 chunk）與跨 chunk 終止
+        ("le-ovf-trigger-own-chunk", [a * 16385, b"a", b"\r"]),
+        ("le-ovf-trigger-then-term-next", [a * 16385, b"ab", b"c\r", b"ok\r"]),
     ]
 
 
@@ -91,7 +127,9 @@ def build_rows() -> list[tuple[str, str, str, str]]:
         chunks = split_chunks(rng, data)
         rows.append((f"le-{i:04d}", "line_consume", ",".join(c.hex() for c in chunks), run_case(chunks)))
     for case_id, chunks in fixed_cases():
-        rows.append((case_id, "line_consume", ",".join(c.hex() for c in chunks), run_case(chunks)))
+        consumed, warns = run_case_with_warns(chunks)
+        rows.append((case_id, "line_consume", ",".join(c.hex() for c in chunks), consumed))
+        rows.append((case_id, "line_warn", ",".join(c.hex() for c in chunks), warns))
     return rows
 
 
