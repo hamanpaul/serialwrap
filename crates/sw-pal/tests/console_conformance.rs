@@ -826,3 +826,35 @@ fn console_reaper_skips_dev_link_without_identity() {
         .expect("假 /proc 可列舉");
     assert!(!held.contains(ghost), "無身分的同名字串不得計為 peer");
 }
+
+// ---------------------------------------------------------------------------
+// Windows 未實作 backend 不得 panic（sol 補審 P6 #4）
+// ---------------------------------------------------------------------------
+
+/// `NativeConsoleFactory` 在 Windows 接線的 TCP listener／ConsoleMux／com0com 尚未實作（LOCAL-WINDOWS-TODO），
+/// 實作完成前必須回 `Unsupported` 類錯誤，不得落到 `todo!` 而 panic。主機（Linux）上以原始碼掃描守門，
+/// 使 Windows 專屬檔案的回歸在非 Windows CI 也會紅。
+#[test]
+fn windows_console_backends_have_no_panicking_stubs() {
+    let sources = [
+        ("console_tcp/windows.rs", include_str!("../src/console_tcp/windows.rs")),
+        ("console_mux/windows.rs", include_str!("../src/console_mux/windows.rs")),
+        ("console_com0com/windows.rs", include_str!("../src/console_com0com/windows.rs")),
+        ("console_pty/windows.rs", include_str!("../src/console_pty/windows.rs")),
+    ];
+    for (name, src) in sources {
+        for mac in ["todo!(", "unimplemented!(", "panic!(", "s21_todo!("] {
+            assert!(!src.contains(mac), "{name} 含 `{mac}`：Windows factory 呼叫會 panic，須回 Unsupported");
+        }
+    }
+}
+
+/// Windows 原生：factory 的未實作 backend 回 `PalErrorKind::Unsupported`（不 panic）。
+#[cfg(windows)]
+#[test]
+fn windows_unimplemented_console_backends_return_unsupported() {
+    let p = sw_pal::native();
+    assert_eq!(p.console.bind_tcp_console().err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
+    assert_eq!(p.console.new_mux().err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
+    assert_eq!(p.console.open_com0com_console("COM250").err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
+}
