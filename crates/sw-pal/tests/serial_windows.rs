@@ -138,6 +138,19 @@ fn missing_com_error_code_maps_to_not_found() {
     );
 }
 
+#[test]
+fn read_wait_and_operation_errors_keep_distinct_sources() {
+    let error = PalError::io(5, "[Errno 5] Input/output error");
+    match classify_wait_error(error.clone()) {
+        ReadError::Wait(mapped) => assert_eq!(mapped.os_code, Some(5)),
+        other => panic!("等待失敗應保留為 ReadError::Wait，得到 {other:?}"),
+    }
+    match classify_read_error(error) {
+        ReadError::Read(mapped) => assert_eq!(mapped.os_code, Some(5)),
+        other => panic!("讀取失敗應保留為 ReadError::Read，得到 {other:?}"),
+    }
+}
+
 #[cfg(windows)]
 mod windows_native {
     #![allow(non_snake_case)]

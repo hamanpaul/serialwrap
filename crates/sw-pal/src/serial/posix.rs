@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 #[cfg(any(test, feature = "test-fakes"))]
 use std::cell::Cell;
 
-pub use crate::proc_holders::posix::{probe_holders_in, PosixUartExclusive};
+pub use crate::proc_holders::posix::{PosixUartExclusive, probe_holders_in};
 use crate::traits::{
     CloseImpl, CloseReceipt, CloseToken, DevicePath, HolderReport, HolderScanStatus, IoWaker,
-    OpenError, PalError, PalResult, ReadOutcome, SerialBackend, SerialConfig, SerialHandle,
-    SerialReader, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep, TxOutcome, TxResult,
-    UartExclusive,
+    OpenError, PalError, PalResult, ReadError, ReadOutcome, SerialBackend, SerialConfig,
+    SerialHandle, SerialReader, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep, TxOutcome,
+    TxResult, UartExclusive,
 };
 
 /// POSIX 序列埠後端。`post_excl_fault` 只供 test-fakes 注入「TIOCEXCL 成功後」的失敗。
@@ -946,7 +946,11 @@ struct PosixSerialReader {
 }
 
 impl SerialReader for PosixSerialReader {
-    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError> {
         if buf.is_empty() {
             return Ok(ReadOutcome::Data(0));
         }
@@ -981,7 +985,7 @@ impl SerialReader for PosixSerialReader {
                 if code == libc::EINTR {
                     continue;
                 }
-                return Err(PalError::from_errno(code));
+                return Err(ReadError::Wait(PalError::from_errno(code)));
             }
             if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 drain_fd(self.wake_fd, self.wake_eventfd);
@@ -990,13 +994,15 @@ impl SerialReader for PosixSerialReader {
             if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 // SAFETY: buf 是有效輸出緩衝區，fd 由共用的關閉狀態持有。
                 let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-                match classify_read_result(n, (n < 0).then(errno), self.eio_is_pty_hangup)? {
+                match classify_read_result(n, (n < 0).then(errno), self.eio_is_pty_hangup)
+                    .map_err(ReadError::Read)?
+                {
                     Some(outcome) => return Ok(outcome),
                     None => continue,
                 }
             }
             if fds[0].revents & libc::POLLNVAL != 0 {
-                return Err(PalError::from_errno(libc::EBADF));
+                return Err(ReadError::Wait(PalError::from_errno(libc::EBADF)));
             }
         }
     }
@@ -1346,6 +1352,45 @@ mod tests {
             Some(ReadOutcome::Eof),
             "PTY 對端關閉時的 EIO 代表 EOF"
         );
+    }
+
+    #[test]
+    fn invalid_serial_fd_is_a_poll_wait_error() {
+        let mut wake_fds = [-1; 2];
+        // SAFETY: wake_fds 提供兩個有效輸出欄位。
+        assert_eq!(unsafe { libc::pipe(wake_fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe 回傳的 fd 由 OwnedFd 接管。
+        let wake_read = unsafe { OwnedFd::from_raw_fd(wake_fds[0]) };
+        // SAFETY: pipe 回傳的 fd 由 OwnedFd 接管。
+        let _wake_write = unsafe { OwnedFd::from_raw_fd(wake_fds[1]) };
+
+        let mut serial_fds = [-1; 2];
+        // SAFETY: serial_fds 提供兩個有效輸出欄位。
+        assert_eq!(unsafe { libc::pipe(serial_fds.as_mut_ptr()) }, 0);
+        let serial_fd = serial_fds[0];
+        // SAFETY: serial_fds[1] 是 pipe 回傳的唯一寫入 fd，交由 OwnedFd 關閉。
+        let _serial_write = unsafe { OwnedFd::from_raw_fd(serial_fds[1]) };
+        // SAFETY: serial_fd 是 pipe 回傳的有效讀取 fd；刻意關閉以重現 poll(POLLNVAL)。
+        assert_eq!(unsafe { libc::close(serial_fd) }, 0);
+
+        let close = Arc::new(Mutex::new(PosixClose {
+            fd: None,
+            path: "<closed-test-fd>".to_string(),
+            wake_r: None,
+            wake_w: None,
+            waker: Arc::new(PosixIoWaker::new(None, None)),
+        }));
+        let mut reader = PosixSerialReader {
+            fd: serial_fd,
+            wake_fd: wake_read.as_raw_fd(),
+            wake_eventfd: false,
+            eio_is_pty_hangup: false,
+            _close: close,
+        };
+        match reader.read(&mut [0u8; 8], Some(Duration::from_millis(100))) {
+            Err(ReadError::Wait(error)) => assert_eq!(error.os_code, Some(libc::EBADF)),
+            other => panic!("poll(POLLNVAL) 應回 ReadError::Wait(EBADF)，得到 {other:?}"),
+        }
     }
 
     #[test]

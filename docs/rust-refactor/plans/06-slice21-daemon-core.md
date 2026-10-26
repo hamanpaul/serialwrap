@@ -2453,12 +2453,16 @@ git commit -m "feat(sw-core): 單一 TX 寫入者、fence 線性化與確認長�
 ## Task 10：sw-core IoWorker reader＋RxWindow＋哨兵 fan-out
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
-**Changelog fragment:** `changelog.d/rust-s21-reader.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust UART reader：RX 先落 WAL（精確 seq，DF-15）再更新絕對偏移 RX 視窗、哨兵 console 與 actor；讀取錯誤以 SERIAL_READ:<errno> 回報，EOF 不視為斷線。」）
+**Changelog fragment:** `changelog.d/rust-s21-reader.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust UART reader：RX 先落 WAL（精確 seq，DF-15）再更新絕對偏移 RX 視窗、哨兵 console 與 actor；等待錯誤以 SELECT:<errno>、讀取錯誤以 SERIAL_READ:<errno> 回報，EOF 不視為斷線。」）
 **BLOCKED-OWNER：** 無。
 
 **Files:**
 - Modify: `crates/sw-core/src/uart_bridge.rs`
+- Modify: `crates/sw-pal/src/{traits.rs,serial/posix.rs,serial/windows.rs,fakes/serial.rs}`（#59 區分等待錯誤與讀取錯誤）
 - Test: `crates/sw-core/tests/rx_reader.rs`
+- Test: `tests/test_uart_io.py::test_rx_handler_exception_isolated`（#89 Python 基線）
+- Compatibility: `crates/sw-pal/tests/{fakes_selftest.rs,serial_posix_process.rs}`（#59 僅調整讀取結果型別／分支，保留既有斷言）
+- Changelog: `changelog.d/rust-s21-reader.md`
 
 **Interfaces:**
 - Consumes：Task 7 `WalWriter::append`；Task 2 `ConsoleIo`（哨兵）；Task 11 `DataEvent`、`ControlEvent`（Task 0 骨架已有型別）；`sw_proto::pyre::PyRegex`、`sw_proto::pycompat::decode_utf8_replace`。
@@ -2543,21 +2547,28 @@ fn rx_window_trims_head_and_keeps_absolute_offsets() {
 | `wait_for_regex_zero_timeout_is_false` | 視窗已含 match 但 `timeout=0` → `None`（Python `while now < deadline` 不進迴圈） |
 | `wait_for_regex_from_wakes_on_append` | 另一 thread 50 ms 後 `append("# ", epoch 3, rx_seq 7)` → `wait_for_regex_from(r"# $", off, 1s)` 於 < 200 ms 回 `Some(RxMatch{epoch:3, rx_seq:7})`（condvar，非 50 ms 輪詢） |
 | `match_watermark_is_atomic_with_text` | 兩個 thread 交錯 append（rx_seq 1..1000）與 wait：每次命中回傳的 `rx_seq` 都 ≥ 含有命中文字的那個 chunk 的 rx_seq（watermark 與文字同鎖更新） |
-| `completion_cannot_overtake_its_rx_chunk` | reader 已 `rx.append(rx_seq=5)` 但 data lane 的 Data(5) 尚未被 actor 處理時，OpRunner 回 `OpFinished{after_rx_seq: Some(5)}` → actor 先處理 Data(5) 再處理 completion（與 Task 11 `control_waits_for_dependent_rx` 串接） |
+| `completion_cannot_overtake_its_rx_chunk` | 真實 reader 送出 Data(1) 並由 `wait_for_regex` 取得 `RxMatch(3,1)`；completion 的 `after_rx_seq` 必須等於該 Data 的 `rx_seq`。此處驗 T10 水位契約；mailbox 的 actor 處理順序由 Task 11 驗證 |
 | `rx_rate_window_capped_4096` | 1 ms 內 append 10000 個 1-byte chunk → 內部 rate deque 長度 ≤ 4096（`resource_limits.rx_rate_window_entries`，`merge_oldest`）；`rx_stats(now).0` 不小於未設上限時的值（合併 bucket 保留 bytes 總和並取較新時間戳，只可能延後剔除，flood 下不低估） |
-| `rx_handler_panic_skips_chunk_keeps_reader` | 哨兵 `try_write` panic（測試注入）→ stderr WARNING `uart reader RX handler 例外（com=COM0），略過此塊、reader 續行`，下一 chunk 照常送 actor（#79 STA-1） |
+| `rx_handler_panic_skips_chunk_keeps_reader` | 主 RX chunk 處理在視窗更新後 panic（測試注入）→ 精確 WARNING `uart reader RX handler 例外（com=COM0），略過此塊、reader 續行`、略過該 chunk 的 actor fan-out，下一 chunk 仍送達（#79 STA-1） |
 | `wait_for_regex_from_recomputes_rel_after_trim` | 等待中發生修剪，仍只在 `from` 之後的文字中搜尋 |
 | `read_error_reports_serial_read_errno` | fake `remove_device` → control 收到 `ControlEvent::UartIoError{epoch:3, reason:"SERIAL_READ:5"}`，reader thread 結束並交回 reader（`ReaderExit.error` 為 `Some`） |
 | `eof_does_not_report_bridge_down` | reader 回 `Eof` 連續 5 次 → 無 `UartIoError`，期間每次 `Eof` 後等待 200 ms（FakeClock 推進）不空轉 |
 | `woken_and_stop_flag_exits` | `stop=true` 後 `waker.wake()` → thread 結束，`ReaderExit.error == None` |
 | `sentinel_receives_raw_bytes_and_eagain_drops` | 哨兵 `ConsoleIo::try_write` 回 `Ok(0)` 時 RX 不阻塞、下一 chunk 照常送 actor |
-| `data_lane_backpressure_blocks_reader_after_wal` | data channel 容量 1 且不消費：第 2 個 chunk 已寫入 WAL（`current_seq` 前進）但 reader 阻塞於 send（arch §5.2：背壓不丟 RX 證據） |
+| `data_lane_backpressure_blocks_reader_after_wal` | data channel 容量 1 且不消費：第二個 chunk 已寫入 WAL、reader 未讀第三塊且第三塊未進 WAL；lane 滿時設定 stop 後 reader 仍須在有界時間內結束（arch §5.2：背壓不丟 RX 證據） |
 | `sentinel_input_discarded` | 哨兵 master 有 human 輸入 bytes → reader 讀出後丟棄、不寫 WAL、不送 UART（`dev.take_tx()` 為空） |
+| `reader_wait_error_reason_is_select_errno` | POSIX poll／Windows 等待錯誤以 `SELECT:<errno>` 回報；讀取錯誤維持 `SERIAL_READ:<errno>` |
+| `rx_observer_panic_isolated_reader_continues` | 哨兵 RX fan-out panic 時寫精確 WARNING；該 chunk 與後續 chunk 都送達 actor，並且不送 bridge-down |
+| `rate_window_merge_oldest_keeps_byte_sum` | rate deque 超過 4096 時合併最舊兩筆，保留 byte 總和與較新的時間戳 |
+| `wait_for_regex_does_not_hold_rx_mutex_during_search` | 搜尋 closure 阻塞時另一 thread 仍可 append；命中回傳與被搜尋文字同一快照的 watermark |
+| `op_finished_waits_for_reader_rx_match_watermark` | 真正 reader 收到五塊 RX、regex 命中第五塊並取 `RxMatch(3,5)`；驗證 data lane 依序送達 Data(1..5)，完成事件使用 `OpFinished{after_rx_seq: Some(5)}`。mailbox 釋放順序由 Task 11 驗證 |
+
+**實作紀錄：**此 worktree 的起點 `50345ea` 沒有追蹤 `crates/sw-core/tests/rx_reader.rs`；首次執行 Task 10 命令回報沒有 `rx_reader` test target。依本節案例表與上游 parity 修訂補回 21 個案例後，首次編譯紅燈指出 `ReadError` 與 rate window 測試介面尚未實作；未改寫既有測試案例。#59 要求 `SerialReader` 區分等待／讀取錯誤，因此更新兩個既有 PAL 測試的型別及錯誤分支，保留原本 `py_message`、`Woken` 斷言；另補 POSIX invalid-fd `POLLNVAL` → `ReadError::Wait(EBADF)` 測試與 Windows error-source model 測試。
 
 - [ ] **Step 2：執行並確認 FAIL**
 
 Run：`cargo test -p sw-core --features test-fakes --test rx_reader`
-Expected：FAIL，`not implemented: slice21 T10 RxShared::new`。
+Expected：FAIL，`not implemented: slice21 T10 RxShared::new`。實際起點缺少 test target；建立計畫所列案例後，首次紅燈為尚未實作的 `ReadError`／rate-window 測試介面。
 
 - [ ] **Step 3：實作**
 
@@ -2569,28 +2580,46 @@ loop {
     match reader.read(&mut buf, Some(IO_POLL)) {
         Ok(ReadOutcome::Data(n)) => {
             let data = &buf[..n];
-            let a = ctx.wal.append(WalAppendReq { com: &ctx.com, dir: "RX", source: "device", payload: data, cmd_id: None, loss_flag: false, meta: None });
-            let now = ctx.clock.mono_ns();
-            rx_seq += 1;
-            ctx.rx.append(data, now, ctx.epoch, rx_seq);                                      // watermark 與文字同鎖
-            if let Some(s) = sentinel.as_mut() {
-                if std::panic::catch_unwind(AssertUnwindSafe(|| s.try_write(data))).is_err() { warn_rx_handler_panic(&ctx.com); }
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let a = ctx.wal.append(WalAppendReq { com: &ctx.com, dir: "RX", source: "device", payload: data, cmd_id: None, loss_flag: false, meta: None });
+                let now = ctx.clock.mono_ns();
+                rx_seq += 1;
+                ctx.rx.append(data, now, ctx.epoch, rx_seq);                                  // watermark 與文字同鎖
+                if let Some(s) = sentinel.as_mut() {
+                    if std::panic::catch_unwind(AssertUnwindSafe(|| s.try_write(data))).is_err() { warn_rx_handler_panic(&ctx.com); }
+                }
+                let mut event = DataEvent::UartRxChunk { epoch: ctx.epoch, rx_seq, wal_seq: a.seq, bytes: data.to_vec() };
+                loop {
+                    if stop.load(Acquire) { return true; }
+                    match ctx.data.send_timeout(event, Duration::from_millis(50)) {
+                        Ok(()) => return false,
+                        Err(Timeout(retry)) => event = retry,
+                        Err(Disconnected(_)) => return true,
+                    }
+                }
+            }));
+            match result {
+                Ok(true) => break exit(None),
+                Ok(false) => {},
+                Err(_) => warn_rx_handler_panic(&ctx.com),
             }
-            if ctx.data.send(DataEvent::UartRxChunk { epoch: ctx.epoch, rx_seq, wal_seq: a.seq, bytes: data.to_vec() }).is_err() { break exit(None); }
         }
         Ok(ReadOutcome::Eof) => { ctx.clock.sleep(IO_POLL); }                       // UIO-12.10-d：不視為斷線
         Ok(ReadOutcome::Woken) | Ok(ReadOutcome::TimedOut) => { drain_sentinel_input(&mut sentinel); }
-        Err(e) => { let _ = ctx.control.send(ControlEvent::UartIoError { epoch: ctx.epoch, reason: format!("SERIAL_READ:{}", e.os_code.map(|c| c.to_string()).unwrap_or_else(|| e.py_exc_name().to_string())) }); break exit(Some(e)); }
+        Err(ReadError::Wait(e)) => { let _ = ctx.control.send(ControlEvent::UartIoError { epoch: ctx.epoch, reason: format!("SELECT:{}", e.os_code.map(|c| c.to_string()).unwrap_or_else(|| e.py_exc_name().to_string())) }); break exit(Some(e)); }
+        Err(ReadError::Read(e)) => { let _ = ctx.control.send(ControlEvent::UartIoError { epoch: ctx.epoch, reason: format!("SERIAL_READ:{}", e.os_code.map(|c| c.to_string()).unwrap_or_else(|| e.py_exc_name().to_string())) }); break exit(Some(e)); }
     }
 }
 ```
 
-`RxShared::append`：鎖內 `total_bytes += n`、`last_rx_mono = now`、`watermark = (epoch, rx_seq)`、window push `(now, n)` 後剔除 `now - t > 10 s`，長度超過 4096 時把最舊兩個 entry 合併（保留 bytes 總和與較新的時間戳），`text.push_str(&decode_utf8_replace(data))`，`chars(text) > max` 時截頭並 `trimmed += overflow`（以 code point 計），`cond.notify_all()`。wait 系列：`deadline = clock.mono_ns() + timeout`；`while clock.mono_ns() < deadline { 檢查; cond.wait_timeout(剩餘) }`（FakeClock 的 advance 也 notify 同一 condvar：RxShared 註冊為 FakeClock waiter，透過 `Clock::sleep` 等價機制；實作上以 `cond.wait_timeout(min(剩餘, 50 ms))` 搭配重算 deadline，確保 FakeClock 下可前進）。
+`RxShared::append`：鎖內 `total_bytes += n`、`last_rx_mono = now`、`watermark = (epoch, rx_seq)`、window push `(now, n)` 後剔除 `now - t > 10 s`，長度超過 4096 時把最舊兩個 entry 合併（保留 bytes 總和與較新的時間戳），`text.push_str(&decode_utf8_replace(data))`，`chars(text) > max` 時截頭並 `trimmed += overflow`（以 code point 計），`cond.notify_all()`。wait 系列：鎖內複製 `text_from(from)`、watermark 與 revision 後即釋鎖，再執行 regex；未命中時重新取得鎖，若 revision 已變就立刻重試，避免搜尋期間 append 被阻塞或漏掉喚醒。FakeClock advance 後以 `cond.wait_timeout(min(剩餘, 50 ms))` 重算 deadline。
+
+reader chunk 處理（WAL append、RX 視窗更新、哨兵 fan-out、data lane 傳送）整段以 `catch_unwind` 隔離；primary handler panic 寫 WARNING 並略過該 chunk，下一輪繼續。哨兵 observer panic 單獨攔截並告警，仍把該 chunk 傳給 actor。data lane 用有界 channel 的 `send_timeout(50 ms)`；每次 timeout 檢查 stop，確保滿載下停止仍有界。
 
 - [ ] **Step 4：執行並確認 PASS**
 
 Run：`cargo test -p sw-core --features test-fakes --test rx_reader`
-Expected：PASS（18 項）。
+Expected：PASS（23 項，含 parity-amendments 與兩個審查回歸案例；PAL 層錯誤分類案例另計）。
 
 - [ ] **Step 5：Commit**
 
@@ -2598,6 +2627,20 @@ Expected：PASS（18 項）。
 git add crates/sw-core/src/uart_bridge.rs crates/sw-core/tests/rx_reader.rs changelog.d/rust-s21-reader.md
 git commit -m "feat(sw-core): UART reader 先落 WAL 再分送與絕對偏移 RX 視窗" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的必要測試列與完成條件；斷言值以 Python 基線為準。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #59 | B:E-42 | `reader_wait_error_reason_is_select_errno` | PAL 讀取等待階段（POSIX `poll`、Windows `WaitForMultipleObjects`）失敗 → bridge-down reason `SELECT:<errno>`（`uart_io.py:1947-1949`，契約 `reason_forms` 已列）；`read` 本身失敗才是 `SERIAL_READ:<errno>`。若 P5 `SerialReader` 未區分兩者，追加 `ReadError::{Wait,Read}`。 |
+| #89 | B:E-19、E-39 | `rx_observer_panic_isolated_reader_continues` | RX handler（console fan-out／serial RX observer）panic 時寫 WARNING、reader 繼續、後續 chunk 仍送達（`uart_io.py:1413-1423,1934-1941,1983-1988`）；Python 側測試為 `tests/test_uart_io.py::test_rx_handler_exception_isolated`。 |
+| #74 | B:E-36 | `rate_window_merge_oldest_keeps_byte_sum` | RECORD：`spec-reconciliation.md` §7 NC-09；rate deque 達 4096 筆上限時合併最舊兩筆，bytes 總和不變且 timestamp 取較新者。 |
+| 審查 A2 | Sonnet | `wait_for_regex_does_not_hold_rx_mutex_during_search` | regex 搜尋必須在 RX mutex 外執行；append 在搜尋阻塞期間仍可完成，命中 watermark 與文字快照一致。 |
+| 審查 B2 | Codex | `op_finished_waits_for_reader_rx_match_watermark` | 由真實 reader／regex 命中取得 `RxMatch(3,5)`，驗證 data lane 送達 Data(1..5)，並以 `OpFinished{after_rx_seq: Some(5)}` 表示 completion 相依水位；mailbox 先後順序由 Task 11 驗證。 |
+
+`rx_reader` 測試總數由基礎 18 項加上 parity 3 項及審查回歸 2 項為 23 項；另有 POSIX 與 Windows PAL 錯誤分類案例。Slice 2.1 的 Rust 必要測試以完整 Linux／Windows collect 輸出呼叫 `regen_lock.py --l1-add-only --set s21_core` 登記，不移除既有 nodeid。Python #89 以 `python3 -m pytest -q tests/test_uart_io.py::test_rx_handler_exception_isolated` 驗證。
 
 ---
 

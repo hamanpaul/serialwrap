@@ -34,7 +34,7 @@ use sw_pal::fakes::env::FakeEnv;
 use sw_pal::fakes::serial::{FakeDevice, FakeSerialBackend};
 use sw_pal::fakes::wal_fs::FakeWalFs;
 use sw_pal::traits::{
-    Clock, DevicePath, FlowControl, PalError, Parity, SerialBackend, SerialConfig,
+    Clock, DevicePath, FlowControl, PalError, Parity, ReadError, SerialBackend, SerialConfig,
 };
 use sw_proto::config_types::{load_profiles, ProfileFs, SessionProfile};
 use sw_proto::pycompat::{PyErr, PyOsError};
@@ -1188,7 +1188,7 @@ impl ConsoleTransportFactory for RigConsole {
 struct NoopReader;
 
 impl SerialReader for NoopReader {
-    fn read(&mut self, _buf: &mut [u8], _timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+    fn read(&mut self, _buf: &mut [u8], _timeout: Option<Duration>) -> Result<ReadOutcome, ReadError> {
         unreachable!("NoopReader 只用於 drop")
     }
 }

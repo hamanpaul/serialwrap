@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -243,6 +245,50 @@ class TestConsoleClientInternalFlag(unittest.TestCase):
             os.close(slave_fd)
             tmpdir.cleanup()
 
+
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
+def test_rx_handler_exception_isolated(caplog) -> None:
+    """#89：單一 RX observer 例外不得終止 reader，後續 chunk 仍須送達。"""
+    calls = 0
+    first_called = threading.Event()
+    later_called = threading.Event()
+    received: list[bytes] = []
+
+    def on_rx_data(data: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_called.set()
+            raise RuntimeError("observer failed")
+        received.append(data)
+        later_called.set()
+
+    tmpdir = tempfile.TemporaryDirectory()
+    wal = WalWriter(wal_dir=tmpdir.name)
+    master_fd, slave_fd = os.openpty()
+    bridge = UARTBridge(
+        com="COM0",
+        device_path=os.ttyname(slave_fd),
+        profile=UartProfile(),
+        wal=wal,
+        on_rx_data=on_rx_data,
+    )
+    try:
+        bridge.start()
+        with caplog.at_level(logging.WARNING, logger="serialwrap"):
+            os.write(master_fd, b"first")
+            assert first_called.wait(2), "第一個 RX chunk 未送到 observer"
+            os.write(master_fd, b"second")
+            assert later_called.wait(2), "observer 例外後 reader 未送達下一個 chunk"
+        assert received == [b"second"]
+        assert any("RX handler 例外" in row.getMessage() for row in caplog.records)
+        assert bridge._thread is not None and bridge._thread.is_alive()
+    finally:
+        bridge.stop()
+        os.close(master_fd)
+        os.close(slave_fd)
+        tmpdir.cleanup()
 
 @pytest.mark.posix_only
 @pytest.mark.posix_pty

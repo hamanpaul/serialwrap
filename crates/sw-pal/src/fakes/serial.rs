@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use crate::traits::{
     CancelToken, CloseReceipt, CloseToken, DevicePath, HolderReport, HolderScanStatus, OpenError,
-    PalError, PalResult, ReadOutcome, SerialBackend, SerialConfig, SerialHandle, SerialReader,
+    PalError, PalResult, ReadError, ReadOutcome, SerialBackend, SerialConfig, SerialHandle,
+    SerialReader,
     SerialWriter, SubmitGate, SubmitRevoked, SubmitStep, TxOutcome, TxResult, UartExclusive,
 };
 
@@ -766,12 +767,19 @@ struct FakeSerialReader {
 }
 
 impl SerialReader for FakeSerialReader {
-    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError> {
         let start = std::time::Instant::now();
         let mut guard = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if self.inner.removed.load(Ordering::SeqCst) {
-                return Err(PalError::io(5, "[Errno 5] Input/output error"));
+                return Err(ReadError::Read(PalError::io(
+                    5,
+                    "[Errno 5] Input/output error",
+                )));
             }
             if self.inner.woken.swap(false, Ordering::SeqCst) {
                 return Ok(ReadOutcome::Woken);

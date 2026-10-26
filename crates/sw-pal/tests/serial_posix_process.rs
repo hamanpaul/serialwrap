@@ -325,7 +325,7 @@ fn cap_posix_pty__concurrent_wake_reaches_reader_and_writer() {
         let tok = CancelToken::new(waker.clone());
         let t_w = tok.clone();
         let payload = vec![b'B'; 1 << 20];
-        let (tx_r, rx_r) = mpsc::channel::<PalResult<ReadOutcome>>();
+        let (tx_r, rx_r) = mpsc::channel::<Result<ReadOutcome, ReadError>>();
         let (tx_w, rx_w) = mpsc::channel::<TxResult>();
         thread::spawn(move || {
             let mut b = [0u8; 64];
