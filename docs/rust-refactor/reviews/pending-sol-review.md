@@ -97,7 +97,7 @@ Reviewer A（Sonnet max）對第二輪修正提出 9 項補審 finding。每列�
 | #8 Python daemon long socket | **fixed `6c9f73b`**：`start_python_daemon` 改用 `/tmp/sw-*` run directory 並清理；隔離 restart 測試實跑通過。 |
 | #9 Spike 3 timing barriers | **fixed `183212a`**：rotate、reader-handle、F12 都在 helper 確認持有既存 WAL 後才開始刺激；現行 Linux 定點測試 `211 passed, 2 skipped`，Windows 原生 cases 未在本機執行。 |
 
-Reviewer B（Codex gpt-6.1-sol）仍未實際執行；其 round-r2 `.last` 為空，不能視為 clean review。
+Reviewer B round-r2 `.last` 為空，不構成 clean review。本輪已重新執行 Reviewer B（Codex gpt-6.1-sol）對 `507565f..HEAD` 的唯讀審查，結果 `approve`、0 findings；它只表示未發現新增 code finding，不等同 Stage 1 出口通過。該 reviewer 未跑測試、Docker、COM／硬體或 Stage 1 exit driver。
 
 本輪驗證：定點測試 `211 passed, 2 skipped`；全套 `python3 -m pytest -q tests/` 執行一次，`5081 passed, 109 skipped, 1 xfailed, 2 failed`（92 subtests passed）。失敗 nodeid 為 `tests/test_docker_l15.py::test_docker_smoke_two_container`（bridge 自測不符合核准 revision/tree）與 `tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`（正式 P4/L1 evidence 缺檔）；兩案均於 `3684f06` archive 副本以同一 nodeid 重現相同失敗類型。`cargo test --workspace` exit 0；`tools.contracts check` 為 0 findings；policy check 為 25 pass／0 fail／2 warn（R-19、R-22）；`regen_lock.py --check --base HEAD` 通過。Stage 1 exit driver 未執行。
 
