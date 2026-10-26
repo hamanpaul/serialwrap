@@ -127,3 +127,49 @@ def test_cli_compare_exit_codes(tmp_path, capsys):
     empty = tmp_path / "empty.log"
     empty.write_text("   Compiling x\n", encoding="utf-8")
     assert m.main(["compare", str(empty), str(empty)]) == 2
+
+
+def test_failed_to_ignored_is_a_reduction_and_fails():
+    """sol 補審 #5：基線 `FAILED` 的測試在待測加上 `#[ignore]` 變成 `ignored`，等於縮減實際執行量，預設即須 FAIL。"""
+    m = _mod()
+    base = m.parse_cargo_log(BASE_LOG)
+    head = json.loads(json.dumps(base))
+    head["tests/arbiter.rs (arbiter)"]["admit_red"] = "ignored"
+    report = m.compare(base, head)
+    assert report["ok"] is False
+    assert report["reductions"] == [("tests/arbiter.rs (arbiter)", "admit_red", "FAILED", "ignored")]
+
+
+def test_ignored_staying_ignored_and_ignored_to_failed_are_not_reductions():
+    m = _mod()
+    base = m.parse_cargo_log(BASE_LOG)
+    head = json.loads(json.dumps(base))
+    head["tests/arbiter.rs (arbiter)"]["slow_case"] = "FAILED"
+    report = m.compare(base, head)
+    assert report["reductions"] == [] and report["ok"] is True
+
+
+def test_approved_ignore_is_allowed_only_by_exact_name():
+    """核准的平台排除須逐名記錄（`binary::測試名`），其他 `FAILED → ignored` 仍 FAIL。"""
+    m = _mod()
+    base = m.parse_cargo_log(BASE_LOG)
+    head = json.loads(json.dumps(base))
+    head["tests/arbiter.rs (arbiter)"]["admit_red"] = "ignored"
+    head["unittests src/lib.rs (sw_core)"]["unit_b"] = "ignored"
+    allow = {"tests/arbiter.rs (arbiter)::admit_red"}
+    report = m.compare(base, head, allow_ignored=allow)
+    assert report["ok"] is False
+    assert report["reductions"] == [("unittests src/lib.rs (sw_core)", "unit_b", "FAILED", "ignored")]
+    allow.add("unittests src/lib.rs (sw_core)::unit_b")
+    assert m.compare(base, head, allow_ignored=allow)["ok"] is True
+
+
+def test_cli_failed_to_ignored_exits_nonzero(tmp_path, capsys):
+    m = _mod()
+    base = tmp_path / "base.log"
+    base.write_text(BASE_LOG, encoding="utf-8")
+    head = tmp_path / "head.log"
+    head.write_text(BASE_LOG.replace("test admit_red ... FAILED", "test admit_red ... ignored"), encoding="utf-8")
+    assert m.main(["compare", str(base), str(head)]) == 1
+    assert "REDUCED tests/arbiter.rs (arbiter)::admit_red FAILED→ignored" in capsys.readouterr().out
+    assert m.main(["compare", str(base), str(head), "--allow-ignored", "tests/arbiter.rs (arbiter)::admit_red"]) == 0

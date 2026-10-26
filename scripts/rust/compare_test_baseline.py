@@ -7,6 +7,8 @@ P5 基線本身有骨架紅燈（`s21_todo!`），「06 既有測試全部仍綠
 判定（預設）：
   - 基線 `ok` 而待測非 `ok`（FAILED、ignored 或消失）→ REGRESSION，exit 1。
   - 基線有、待測沒有的 binary 或測試（不論基線結果）→ MISSING，exit 1（不得以刪測試縮小分母）。
+  - 基線非 `ignored`（`FAILED`）而待測 `ignored` → REDUCED，exit 1（以 `#[ignore]` 縮減實際執行量；sol 補審 #5）。
+    核准的平台排除須以 `--allow-ignored '<binary 鍵>::<測試名>'` 逐名記錄才放行。
   - 基線非 `ok` 而待測 `ok` → 改善，只列出。
   - 只在待測出現的測試（P6 新增，含 TDD 紅燈）→ 只列出，由各 Task 的 Step 判定。
   - `--strict`：任何狀態變化（含改善）都 exit 1。
@@ -16,6 +18,7 @@ P5 基線本身有骨架紅燈（`s21_todo!`），「06 既有測試全部仍綠
   python3 scripts/rust/compare_test_baseline.py run --dir <worktree> --out <log>
       # 在 <worktree> 執行 `cargo test --workspace --features test-fakes --no-fail-fast`，輸出存到 <log>
   python3 scripts/rust/compare_test_baseline.py compare <基線 log> <待測 log> [--strict] [--json <報告>]
+      [--allow-ignored '<binary 鍵>::<測試名>' ...]
 
 stdlib only；比對只讀 cargo 的人類可讀輸出（`Running …`／`Doc-tests …`／`test <名> ... <結果>`）。
 """
@@ -63,8 +66,9 @@ def parse_cargo_log(text: str) -> Results:
     return out
 
 
-def compare(base: Results, head: Results, *, strict: bool = False) -> dict:
+def compare(base: Results, head: Results, *, strict: bool = False, allow_ignored: set[str] | frozenset[str] = frozenset()) -> dict:
     regressions: list[tuple[str, str, str, str]] = []
+    reductions: list[tuple[str, str, str, str]] = []
     missing: list[tuple[str, str]] = []
     improvements: list[tuple[str, str, str, str]] = []
     changed: list[tuple[str, str, str, str]] = []
@@ -80,6 +84,8 @@ def compare(base: Results, head: Results, *, strict: bool = False) -> dict:
                 missing.append((binary, name))
             elif before == "ok" and after != "ok":
                 regressions.append((binary, name, before, after))
+            elif before != "ignored" and after == "ignored" and f"{binary}::{name}" not in allow_ignored:
+                reductions.append((binary, name, before, after))
             elif before != "ok" and after == "ok":
                 improvements.append((binary, name, before, after))
             elif before != after:
@@ -88,10 +94,11 @@ def compare(base: Results, head: Results, *, strict: bool = False) -> dict:
         for name in sorted(head[binary]):
             if name not in base.get(binary, {}):
                 head_only.append((binary, name, head[binary][name]))
-    ok = not regressions and not missing and not (strict and (improvements or changed))
+    ok = not regressions and not reductions and not missing and not (strict and (improvements or changed))
     return {
         "ok": ok,
         "regressions": regressions,
+        "reductions": reductions,
         "missing": missing,
         "improvements": improvements,
         "changed": changed,
@@ -121,9 +128,11 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         print(f"[compare_test_baseline] FAIL：解析到的測試數 base={_count(base)} head={_count(head)}"
               "（是否漏了 --features test-fakes 或編譯失敗？）")
         return 2
-    report = compare(base, head, strict=args.strict)
+    report = compare(base, head, strict=args.strict, allow_ignored=set(args.allow_ignored))
     for b, n, x, y in report["regressions"]:
         print(f"REGRESSION {b}::{n} {x}→{y}")
+    for b, n, x, y in report["reductions"]:
+        print(f"REDUCED {b}::{n} {x}→{y}")
     for b, n in report["missing"]:
         print(f"MISSING {b}::{n}")
     for b, n, x, y in report["changed"]:
@@ -132,7 +141,7 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         print(f"IMPROVED {b}::{n} {x}→{y}")
     head_red = [t for t in report["head_only"] if t[2] != "ok"]
     print(f"[compare_test_baseline] base {_count(base)} 個、head {_count(head)} 個；"
-          f"回歸 {len(report['regressions'])}、消失 {len(report['missing'])}、改善 {len(report['improvements'])}、"
+          f"回歸 {len(report['regressions'])}、縮減 {len(report['reductions'])}、消失 {len(report['missing'])}、改善 {len(report['improvements'])}、"
           f"head 新增 {len(report['head_only'])}（其中非 ok {len(head_red)}）")
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(report, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
@@ -151,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     cmp_.add_argument("head")
     cmp_.add_argument("--strict", action="store_true", help="任何狀態變化（含改善）皆視為失敗")
     cmp_.add_argument("--json", default=None, help="另寫出 JSON 報告")
+    cmp_.add_argument("--allow-ignored", action="append", default=[], metavar="BINARY::NAME",
+                      help="核准的平台排除（逐名；可重複）：此測試由非 ignored 變 ignored 不視為縮減")
     args = ap.parse_args(argv)
     return _cmd_run(args) if args.cmd == "run" else _cmd_compare(args)
 
