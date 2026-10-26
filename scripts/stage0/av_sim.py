@@ -344,7 +344,7 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
     seen: set[tuple[str, int, int]] = set()
     counts = {"grabs": 0, "open_errors": 0}
     oplock_results: list[str] = []
-    Path(ready_file).write_text("ready\n", encoding="utf-8")
+    ready_written = False
     deadline = time.monotonic() + duration_s
     while time.monotonic() < deadline and not os.path.exists(stop_file):
         now = time.monotonic()
@@ -382,6 +382,13 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
             counts["grabs"] += 1
             events.append({"event": "grab", "name": name, "hold_ms": int(round(hold * 1000)),
                            "oplock": oplock_result if oplock else OPLOCK_STATUS})
+        if not ready_written:
+            # ready 是首次掃描完成的確認；既有 WAL 也已在此之前取得 seeded handle。
+            Path(ready_file).write_text(json.dumps({
+                "ready": True,
+                "held_files": sorted({entry.name for entry in holds}),
+            }, sort_keys=True) + "\n", encoding="utf-8")
+            ready_written = True
         time.sleep(WATCH_POLL_S)
     for entry in holds:
         _close_lease(entry.lease)

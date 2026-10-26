@@ -361,6 +361,7 @@ def test_native_av_sim_helper_holds_wal_and_writer_completes(tmp_path):
 
     wal_dir = tmp_path / "wal"
     wal_dir.mkdir()
+    (wal_dir / "raw.wal.ndjson").write_bytes(b"")
     ready = tmp_path / "ready.flag"
     stop = tmp_path / "stop.flag"
     log = tmp_path / "helper.jsonl"
@@ -374,6 +375,10 @@ def test_native_av_sim_helper_holds_wal_and_writer_completes(tmp_path):
         while not ready.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert ready.exists(), "av_sim helper 未就緒（啟動被拒或逾時）"
+        ready_record = json.loads(ready.read_text(encoding="utf-8"))
+        assert "raw.wal.ndjson" in ready_record.get("held_files", []), (
+            "ready 必須表示首次目錄掃描已實際持有啟動前存在的 WAL"
+        )
         w = WalWriter(wal_dir=str(wal_dir), rotate_bytes=8192, fs=WindowsWalFs())
         started = time.monotonic()
         count = 0
@@ -505,14 +510,19 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     attempts = 0
+    events: list[tuple[str, int]] = []
 
     class FakeHelper:
         def __init__(self, _wal_dir, _seed, rec):
             self.rec = rec
 
         def start(self):
+            events.append(("helper_start", len(events)))
             self.rec.observations["av_sim"] = {"grabs": 1, "launch_error": "none"}
             return True
+
+        def ready_holds(self, name: str) -> bool:
+            return name == "raw.wal.ndjson"
 
         def stop(self):
             self.rec.observations["av_sim"].update({"helper_exit": 0, "oplock": "granted"})
@@ -523,6 +533,7 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
 
         def append(self, **_kwargs):
             self.calls += 1
+            events.append(("append", self.calls))
             return {"seq": self.calls}
 
         def close(self):
@@ -531,6 +542,7 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
     def delete(_path):
         nonlocal attempts
         attempts += 1
+        events.append(("unlink", attempts))
         if sharing_violation_first and attempts == 1:
             error = PermissionError("sharing violation")
             error.winerror = 32
@@ -553,3 +565,7 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
     assert rec.observations.get("sharing_violation_attempts") == int(sharing_violation_first)
     assert rec.observations.get("interference_observed") is sharing_violation_first
     assert verdict == ("PASS" if sharing_violation_first else "FAIL")
+    helper_start = next(i for i, item in enumerate(events) if item[0] == "helper_start")
+    prefill_done = next(i for i, item in enumerate(events) if item == ("append", 10))
+    first_unlink = next(i for i, item in enumerate(events) if item[0] == "unlink")
+    assert prefill_done < helper_start < first_unlink, events

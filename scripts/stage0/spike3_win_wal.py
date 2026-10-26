@@ -425,6 +425,7 @@ class AvHelper:
         self._log = wal_dir / f"av-helper{suffix}.jsonl"
         self._proc: subprocess.Popen[bytes] | None = None
         self.launch_error: str | None = None
+        self._ready_files: frozenset[str] = frozenset()
         self._evidence_key = variant
         evidence = self._evidence()
         if variant is None:
@@ -467,6 +468,16 @@ class AvHelper:
         deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
         while time.monotonic() < deadline:
             if self._ready.exists():
+                try:
+                    ready = json.loads(self._ready.read_text(encoding="utf-8"))
+                    held_files = ready.get("held_files") if isinstance(ready, dict) else None
+                    if (not isinstance(ready, dict) or ready.get("ready") is not True
+                            or not isinstance(held_files, list)
+                            or any(not isinstance(name, str) for name in held_files)):
+                        return self._fail("helper ready 記錄格式錯誤")
+                except (OSError, ValueError, TypeError) as exc:
+                    return self._fail(f"helper ready 記錄無法解析：{type(exc).__name__}")
+                self._ready_files = frozenset(held_files)
                 self._payload()["launch_error"] = "none"
                 self._rec.step(f"av_sim_helper_ready{':' + self._variant if self._variant else ''}", "ok")
                 return True
@@ -474,6 +485,10 @@ class AvHelper:
                 return self._fail(f"helper 提前結束（exit={self._proc.returncode}）")
             time.sleep(0.05)
         return self._fail("helper 就緒逾時")
+
+    def ready_holds(self, name: str) -> bool:
+        """首次目錄掃描完成時，確認指定 WAL 檔已取得持有 handle。"""
+        return name in self._ready_files
 
     def _fail(self, message: str) -> bool:
         self.launch_error = message
@@ -612,11 +627,8 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
 
     wal_dir = _work_dir("win-wal-av-unlink")
     rec.observations["wal_dir"] = str(wal_dir)
-    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
-    if not helper.start():
-        helper.stop()
-        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
+    helper: AvHelper | None = None
     metas: list[dict[str, Any]] = []
     unlinked = False
     unlink_attempts = 0
@@ -625,6 +637,12 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
         for _ in range(10):
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
         rec.step("prefill", "ok")
+        # 先建立 WAL，再啟動 helper；ready 只在首次掃描完成後寫入，並帶回已持有檔名。
+        helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
+        if not helper.start():
+            raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
+        if not helper.ready_holds("raw.wal.ndjson"):
+            raise RuntimeError("av_sim helper 首次掃描未持有 raw.wal.ndjson；不得執行外部 unlink")
         wal_path = str(wal_dir / "raw.wal.ndjson")
         # 防毒持有期間外部 unlink 會因共用違規失敗；有界重試直到成功（unlink 須最終完成）。
         unlink_error: str | None = None
@@ -669,7 +687,8 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
             rec.step("poll_recreate_meta", "found" if metas else "timeout")
     finally:
         writer.close()
-        helper.stop()
+        if helper is not None:
+            helper.stop()
     interference = _grabs(rec) >= 1 and sharing_violation_attempts >= 1
     rec.observations["interference_observed"] = interference
     if not unlinked:
