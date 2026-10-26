@@ -138,6 +138,10 @@ pub struct Platform {
     pub console: Arc<dyn ConsoleTransportFactory>,
     /// 停止訊號等待（arch §4.9；Task 4）。
     pub signals: Arc<dyn SignalWait>,
+    /// event handler 子行程產生器（arch §4.9，P7 Task 14，SC-26）。
+    pub handlers: Arc<dyn HandlerSpawner>,
+    /// USB busid 解析（arch §4.3，P7 Task 6，GAP-G-09）。
+    pub usb: Arc<dyn UsbTopology>,
     pub caps: Capabilities,
 }
 
@@ -217,6 +221,8 @@ pub fn native() -> Platform {
             rpc_listen: Arc::new(crate::rpc_transport::NativeRpcListenerFactory),
             console: Arc::new(crate::console_pty::NativeConsoleFactory::new(console_kind)),
             signals: Arc::new(crate::signal::NativeSignalWait),
+            handlers: Arc::new(crate::process::NativeHandlerSpawner),
+            usb: Arc::new(crate::device_source::NativeUsbTopology),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Posix,
                 af_unix: true,
@@ -269,6 +275,8 @@ pub fn native() -> Platform {
             rpc_listen: Arc::new(crate::rpc_transport::NativeRpcListenerFactory),
             console: Arc::new(crate::console_pty::NativeConsoleFactory::new(console_kind)),
             signals: Arc::new(crate::signal::NativeSignalWait),
+            handlers: Arc::new(crate::process::NativeHandlerSpawner),
+            usb: Arc::new(crate::device_source::NativeUsbTopology),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Windows,
                 af_unix: false,

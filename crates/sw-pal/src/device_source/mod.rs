@@ -11,3 +11,17 @@ pub mod windows_registry;
 pub use posix::posix_scan;
 pub(crate) use posix::PosixDeviceSource;
 pub use windows::WindowsDeviceSource;
+
+/// `/dev/serial/by-id` 實體路徑 → USB busid（`resolve_usb_busid`；P7 Task 0 凍結、Task 6 實作）。
+pub trait UsbTopology: Send + Sync {
+    fn usb_busid(&self, real_path: &str) -> Option<String>;
+}
+
+/// 原生 `UsbTopology`（POSIX 讀 sysfs；Windows 回 `None`；Task 6 實作）。
+pub struct NativeUsbTopology;
+
+impl UsbTopology for NativeUsbTopology {
+    fn usb_busid(&self, _real_path: &str) -> Option<String> {
+        todo!("P7 Task 6")
+    }
+}

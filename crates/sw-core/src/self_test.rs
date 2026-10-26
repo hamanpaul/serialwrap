@@ -31,3 +31,44 @@ pub struct NeedProbe {
 pub fn classify_pre_probe(_core: &SessionCore, _ctx: &SelfTestCtx) -> Result<PyDict, NeedProbe> {
     crate::s21_todo!("T14", "classify_pre_probe")
 }
+
+// ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
+
+/// self-test 最終回覆組裝器命名空間（P7 Task 8）。
+pub struct SelfTestFinal;
+
+impl SelfTestFinal {
+    /// 依 `self_test_responses` golden 的分支模板插入 session 與 lease ctx（各分支 key 序不同）。
+    pub fn assemble(
+        _classification: &str,
+        _extra: PyDict,
+        _session_public: PyDict,
+        _lease_ctx: PyDict,
+        _command_capable: bool,
+    ) -> PyDict {
+        todo!("P7 Task 8")
+    }
+}
+
+/// 分類順序 16（含 flood → `RX_FLOOD`／`wait`）。
+pub fn nonce_probe_result(
+    _probe_ok: bool,
+    _rx_bytes_last_10s: Option<u64>,
+    _attached_real_path: Option<&str>,
+    _current_real_path: Option<&str>,
+    _attached_vtty: Option<&str>,
+    _bridge_generation: u64,
+) -> PyDict {
+    todo!("P7 Task 8")
+}
+
+/// RELEASED 分支；`holder_unknown=true` → `external_holder:"none"`、`reclaimable:false`、`wait_external_flash`（BC-04）。
+pub fn released_result(
+    _released_by: Option<&str>,
+    _released_at: Option<&str>,
+    _reason: Option<&str>,
+    _holder_pids: &[u32],
+    _holder_unknown: bool,
+) -> PyDict {
+    todo!("P7 Task 8")
+}

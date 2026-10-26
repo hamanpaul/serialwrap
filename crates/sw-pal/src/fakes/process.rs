@@ -201,3 +201,22 @@ impl ProcessCtl for FakeProcessCtl {
         Ok(*self.foreground_rc.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
+
+/// 假 `HandlerSpawner`（P7 Task 0 凍結；Task 14／15 使用）：依序回放腳本結果並記錄每次 `run` 的規格。
+#[derive(Debug, Default)]
+pub struct FakeHandlerSpawner {
+    pub script: Mutex<VecDeque<crate::traits::HandlerOutcome>>,
+    pub calls: Mutex<Vec<crate::traits::HandlerSpec>>,
+}
+
+impl crate::traits::HandlerSpawner for FakeHandlerSpawner {
+    fn shell_argv(&self, _shell: &str) -> Vec<String> {
+        todo!("P7 Task 14")
+    }
+    fn inherited_env_keys(&self) -> &'static [&'static str] {
+        todo!("P7 Task 14")
+    }
+    fn run(&self, _spec: &crate::traits::HandlerSpec, _abort: &crate::traits::HandlerAbort) -> crate::traits::HandlerOutcome {
+        todo!("P7 Task 14")
+    }
+}

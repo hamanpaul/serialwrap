@@ -99,6 +99,21 @@
 
 其餘沿用（簽章以 producer 為準）：`sw_proto::pyre::{compile, PyRegex, PyMatch, PyFlags, PyReError, escape}`、`pyre::parse::parse`（P3）；`sw_proto::pyjson::{PyValue, PyInt, PyDict, DumpOpts, Sep, loads, dumps, JsonDecodeError::py_message}`；`sw_proto::config_types::{SessionProfile, ProfileTemplate}`；`sw_proto::constants::*`；`sw_pal::{Platform, SysEnv, Clock, FsOps, FsRead, PalError, PalResult}`（`FsRead` 為 P3 T9 唯讀介面：`read`、`list_dir`）；06 T13 `login_fsm::{LoginIo, LoginOutcome, LoginPlan, choose_login_plan, probe_ready, ensure_ready, prompt_timeout_error}`、`session_auth::{SessionAuth, AuthResolution, parse_env_file, resolve_session_auth, credentials_declared_but_unresolved}`、`quiet_gate::{QuietState, QuietTransition, detect_boot_banner, is_reboot_command, valid_completion_regex, slice21_unsupported_feature}`；06 T14 `op_runner::{OpSpec, OpOutcome, OpRunner, OpCtx}`、`self_test::classify_pre_probe`、`capture::{BackgroundCapture, AgentLogCapture}`。
 
+**Task 0 核對註記（2026-10-26，`scripts/rust/check_p7_prereqs.py`）**：§0.3 與實際 producer 的差異及處置（依本節規則：改本表與 producer 計畫／arch，不在業務碼起別名）：
+
+| 項目 | 實際 producer | 處置 |
+|---|---|---|
+| `FenceReject::StaleFsmGen`、`TxPermit.fsm_gen: Option<u64>`、`FenceState.{fsm_gen_floor, auto_probe_blocked}` | 06 T9 已有 `TxPermit.fsm_gen: u64`、`FenceState.fsm_gen: u64`、`FenceReject::FsmMismatch`（相等比對） | 本計畫一律改稱 `FenceReject::FsmMismatch`（`p7_skeleton.rs` 同步）；`Option`／floor／`auto_probe_blocked` 由 Task 7 在 06 T9 實作後修訂，Task 0 不改 06 型別 |
+| `LoginIo.tx` 回 `TxReport`、`LoginIo.{cancel, class}`、`LoginOutcome::{Aborted, Raised}` | 06 T13：`tx` 回 `sw_pal::TxResult`、無 `cancel`／`class` | 延後到 Task 3（06 T13 尚為骨架）；Task 0 只新增獨立型別 `LoginAbort` |
+| `Effect::{CancelLogin, CaptureOpen, CaptureClose}`、`StartLogin.kind`、`LoginFinished.report`、`ControlEvent::{CaptureOpened, CaptureClosed}`、`ReaderCtx.observers` | 06 T10／T11 尚為骨架 | 延後到 Task 7／10／16-wire；`RxObserver` trait、`RunCancel`、`WaitOutcome`、`wait_for_regex_cancellable`、`last_rx_seq` 已於 Task 0 落地（本體 `todo!`） |
+| `ManagerNote::RequestAttach` | 06 T11 未定義 | Task 0 補上 `RequestAttach { by_id: String }` |
+| `LOGIN_FSM_DETAIL_ERRORS` | 06 T13 已定義（12 值） | 沿用，不重複定義 |
+| `FsOps::is_file` | P3 `FsRead::is_file` 已存在 | 沿用 `FsRead::is_file`，`FsOps` 不重複定義 |
+| `pyre::sre::SubPattern`、`pyre::parse::parse`、`PyReError` | P3：`pyre::parse` 為私有模組（`parse()` 回 `ParsedPattern`）、`compile` 回 `CompileError` | `redos.rs` 置於 `pyre/` 下以 `super::parse` 取用；公開 API 為 `ambiguity_score／has_backref／maybe_redos_suspicious(pattern, flags) -> Result<_, CompileError>` |
+| `pyre::escape` | P3 未定義 | **BLOCKED-UPSTREAM（P3）**：Task 3 需要（`_finalize_ready` 的 nonce 樣式）；P7 不自行補 |
+
+上游行為仍為骨架（`SKELETON`，依 P5／P6 實作進度阻擋對應 P7 Task）：06 T13 `session_auth::*`、`login_fsm::*`、`quiet_gate::*`（阻擋 Task 2～4）；06 T10 `RxShared::*`、`spawn_reader`（Task 3、10）；06 T7 `WalWriter::append`（Task 6）；06 T8／T9／T11／T12／T14 `flush_session`、`Fence::admit`、`SessionCore::on_event`／`begin_stop`、`Mailbox::recv_next`、`spawn_actor`、`OpRunner::spawn`、`classify_pre_probe`（Task 7～10）；07 T6／T7 `invalidate_human_input`、`fg_begin`／`fg_finish`、`lease_context`（Task 4、8）。
+
 ### 0.4 承接的已登記項目（不得自行擴張）
 
 | ID | 本 Phase 行為 | Task |

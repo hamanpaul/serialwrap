@@ -114,6 +114,14 @@ sw-pal ────────────────────────�
 
 `sw-pal` 不依賴 `sw-proto`，平台型別在 PAL 內自行定義。`sw-cli` 不連結 `sw-core`，避免 CLI 夾帶 daemon 邏輯並維持啟動成本。`sw-com0com-helper` 只依賴 `sw-pal`，確保提權後的 setupc 與登錄操作仍經 PAL。CLI 需要的純資料語意（regex 驗證、profile 載入、bench registry）放在 `sw-proto`。
 
+**P7 Task 0 修訂（08-slice23-login-events.md，2026-10-26）**：
+- 新增檔：`crates/sw-core/src/{login_run,reprobe,recover,transport_stall,mono}.rs`、`crates/sw-core/src/event_engine/{mod,schema,matcher,line_buffer,counter,registry,dispatcher,event_log}.rs`、`crates/sw-proto/src/pyre/redos.rs`（`pyre` 子模組，經 `super::parse` 取用私有 AST；公開 API 以 `(pattern, flags)` 為輸入、錯誤型別為 `CompileError`）、`crates/sw-pal/src/fakes/usb.rs`。
+- §3.1 常數：`FORCE_RECOVER_POLLS = 10`、`FORCE_RECOVER_POLL_S = 1.0`（`session_manager._force_recover`）。
+- §4 `Platform` 增欄位 `handlers: Arc<dyn HandlerSpawner>`（§4.9，`process.rs`：`HandlerSpec`／`HandlerOutcome`／`HandlerAbort`／`NativeHandlerSpawner`）與 `usb: Arc<dyn UsbTopology>`（§4.3，`device_source/mod.rs`：`NativeUsbTopology`）；替身 `fakes::{FakeHandlerSpawner, FakeUsb}`，`FakePlatformBuilder` 未設定時為 `Unconfigured`。
+- §4.1 `FsOps` 寫入側增補（trait 預設方法，本體由 08 Task 6 交付）：`open_append -> Box<dyn AppendFile>`、`create_truncate`、`file_size`、`remove_file_if_exists`；`AppendFile { write_all_flush, sync }`。`is_file` 沿用既有 `FsRead::is_file`，不重複定義。
+- §5.4：06 已有 `TxPermit.fsm_gen: u64` 與 `FenceReject::FsmMismatch`（相等比對）；08 原稿的 `Option<u64>`、`fsm_gen_floor`、`auto_probe_blocked`、`StaleFsmGen` 改由 08 Task 7 在 06 Task 9 實作後一併修訂（沿用 `FsmMismatch` 名稱，不另起別名）。
+- §5.8 `append` 簽章以 06 T7 的 `WalAppendReq` 為準（已同步）；§5.10 不新增列（capture 不經佇列）；§6.1 停止序已含 `engine.close_intake()`／`engine.stop(deadline)`。
+
 ### 1.4 執行緒模型：std thread＋有界 crossbeam channel（不採用 tokio）
 
 | 規格要求 | 為何以 thread 滿足、tokio 不合適 |
@@ -804,7 +812,7 @@ pub trait SignalWait: Send + Sync {
 | 名稱 | 遞增的唯一線性化位置 | 隔離對象 |
 |---|---|---|
 | `conn_epoch: u64` | `SerialBackend::open_exclusive` 成功、建立 IoWorker 的那一刻（全域單調）。對外的 `bridge_generation` 另依 Python 規則維護（attach 成功才 +1） | 舊 worker 的 completion、receipt、RX；TxPermit |
-| `fsm_gen: u64` | (a) boot banner arm quiet；(b) 啟動一次 login／probe／ready-reconfirm run；(c) quiet 被清除 | login step timer、quiet timer、`ReadyProbeVerified` |
+| `fsm_gen: u64` | (a) boot banner arm quiet；(b) 啟動一次 login／probe／ready-reconfirm run（08 P7 Task 0：刪除原「(c) quiet 被清除」——console unlock run 跨 quiet 清除仍須有效；清除後的過期 `BootQuietExpired` timer 由 `until` 比對自然失效）。`fsm_gen` 亦進 `TxPermit`（06 既有 `TxPermit.fsm_gen: u64`／`FenceReject::FsmMismatch`；floor 語意由 08 Task 7 修訂） | login step timer、quiet timer、`ReadyProbeVerified`、`LoginProbe`／`ReadyReconfirm` permit |
 | `owner_gen: u64` | owner 變更：lease 開或關、human raw 授予或撤銷、suspend depth 0→1 或 1→0、soft preempt、self-heal grant（**admission 切換不遞增**，07 D-02） | HumanRaw permit、lease timer（不用於 DeferredBuffer 回放判定） |
 | `input_epoch: u64` | BC-02 上下文失效（07 D-02；即 P1 Python `UARTBridge._owner_gen` 的 Rust 名稱，原稱 `deferred_epoch`）：BootBannerDetected、quiet 重新 arm、reboot 命令偵測、drain Phase 1（recovery／io_error／release／clear／bind／shutdown）、FlashSyncMatched。唯一入口 `SessionCore::invalidate_human_input(reason, fx)`；遞增、`FenceState.input_epoch` 與 `CoreDeps.input_epoch_pub` 寫入在同一次 `Fence::with` 內完成（線性化點） | DeferredBuffer 回放、`ConsoleInputBytes` mailbox 輸入、human `TxPermit.input_epoch`（之後才進 OS 的 human job 一律 `InputStale`） |
 

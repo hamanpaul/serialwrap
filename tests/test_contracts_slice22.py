@@ -43,9 +43,13 @@ def test_new_sc_rows_follow_p0_schema() -> None:
 
 @pytest.mark.memory_only
 def test_sc30_reserved_for_p7() -> None:
-    ids = {i for i in _changes() if i.startswith("SC-")}
-    # SC-34／SC-35 由 P1-OC 登記；SC-36 由 P4 Task 19 登記（OD-15）；SC-08 依 OD-14 #3 撤回（編號不重用）
-    assert ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36"}) - {"SC-08"}
+    rows = _changes()
+    ids = {i for i in rows if i.startswith("SC-")}
+    # SC-34／SC-35 由 P1-OC 登記；SC-36 由 P4 Task 19 登記（OD-15）；SC-08 依 OD-14 #3 撤回（編號不重用）。
+    # P7 Task 0（08 §0.5）登記 SC-30 後：保留號確實由 P7 取用（phases 只有 P7），P6 未搶號。
+    assert ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36"}) - {"SC-08"}
+    assert rows["SC-30"]["phases"] == ["P7"]
+    assert rows["SC-30"]["scope"] == "rust_only"
 
 
 @pytest.mark.memory_only

@@ -34,6 +34,8 @@ pub enum ManagerNote {
     StickyCandidate { sid: String, by_id: String, profile: String, real_path: String },
     InteractiveOpened { sid: String, interactive_id: String },
     InteractiveClosed { interactive_id: String },
+    /// P7 Task 0（08 §0.3）：請 manager 對 `by_id` 排 attach（依 06 T16 inflight 去重；Task 5 reprobe 使用）。
+    RequestAttach { by_id: String },
 }
 
 /// session 狀態（02 §6.1 `state` 欄位）。

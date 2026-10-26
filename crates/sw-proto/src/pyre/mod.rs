@@ -3,6 +3,7 @@
 //! 語法接受集合、re.error 訊息與 code point 位置依 CPython 3.12.3；執行引擎為 fancy-regex（ADR-01）。
 
 mod parse;
+pub mod redos;
 mod translate;
 mod unicode_tables;
 

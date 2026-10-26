@@ -93,3 +93,36 @@ pub fn is_reboot_command(_cmd: &str) -> bool {
 pub fn slice21_unsupported_feature(_p: &SessionProfile) -> Option<&'static str> {
     s21_todo!("T13", "slice21_unsupported_feature")
 }
+
+// ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
+
+/// `quiet_active && console_unlock_env.is_none()`（`session_manager.py:1193`）；passthrough 恆 false（SC-35）。
+pub fn boot_quiet_blocks_probe(_q: &QuietState, _sp: &SessionProfile, _now: Mono) -> bool {
+    todo!("P7 Task 4")
+}
+
+impl QuietState {
+    /// 先 `expire(now, false)`，再 `quiet_active || pending`。
+    pub fn agent_gate_active(&mut self, _now: Mono) -> bool {
+        todo!("P7 Task 4")
+    }
+}
+
+/// `service._resolve_session_id` 的 gate 段。
+pub fn submit_gate_reject(
+    _public_session: &sw_proto::pyjson::PyDict,
+    _source: &str,
+) -> Option<sw_proto::pyjson::PyDict> {
+    todo!("P7 Task 4")
+}
+
+/// `_agent_gate_reject_locked`＋SC-03 `retry_after_s`。
+pub fn execute_gate_reject(_q: &mut QuietState, _com: &str, _now: Mono) -> Option<sw_proto::pyjson::PyDict> {
+    todo!("P7 Task 4")
+}
+
+/// READY 確認逾 300 s／5 次的提示文字（字面量；測試另以常數值核對 300／5）。
+pub const READY_UNCONFIRMED_HINT: &str = concat!(
+    "READY 已逾 300s／5 次未能經 nonce probe 再確認（可能卡在 bootloader）；",
+    "請 session self-test 取分類後 interactive-open 處理"
+);

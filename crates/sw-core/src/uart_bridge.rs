@@ -164,3 +164,54 @@ impl IoWorker {
         s21_todo!("T12", "IoWorker::finish_async")
     }
 }
+
+// ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
+
+/// login run 的取消旗標（SC-30）：`Arc<AtomicBool>`＋喚醒所屬 `RxShared` 的等待者；不得使用 PAL `CancelToken`。
+#[derive(Clone)]
+pub struct RunCancel {
+    _flag: Arc<AtomicBool>,
+}
+
+impl RunCancel {
+    pub fn new(_rx: &Arc<RxShared>) -> Self {
+        todo!("P7 Task 7")
+    }
+    pub fn trigger(&self) {
+        todo!("P7 Task 7")
+    }
+    pub fn is_triggered(&self) -> bool {
+        todo!("P7 Task 7")
+    }
+}
+
+/// `wait_for_regex_cancellable` 的結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Matched,
+    TimedOut,
+    Cancelled,
+}
+
+impl RxShared {
+    pub fn wait_for_regex_cancellable(
+        &self,
+        _re: &PyRegex,
+        _from: Option<u64>,
+        _timeout: Duration,
+        _clock: &dyn Clock,
+        _cancel: &RunCancel,
+    ) -> WaitOutcome {
+        todo!("P7 Task 7")
+    }
+    /// 最後一個 append 的 `rx_seq`（`LoginFinished.after_rx_seq` 來源）。
+    pub fn last_rx_seq(&self) -> u64 {
+        todo!("P7 Task 7")
+    }
+}
+
+/// reader 在 WAL append 後依序呼叫的 RX 觀察者（DF-15）；不得阻塞於跨 thread 等待、不得回呼 SessionManager。
+/// `ReaderCtx.observers` 欄位隨 Task 16-wire 接線時加入（Task 0 不改 06 `ReaderCtx`）。
+pub trait RxObserver: Send + Sync {
+    fn on_rx(&self, com: &str, data: &[u8], wal_seq: u64);
+}

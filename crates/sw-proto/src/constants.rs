@@ -105,6 +105,12 @@ pub const CMD_HISTORY_MAX: usize = 512;
 /// passthrough 安靜升 READY 的安靜秒數（`sw_core/constants.py::PASSTHROUGH_READY_QUIET_S`，SC-35；arch §5.12）。
 pub const PASSTHROUGH_READY_QUIET_S: f64 = 30.0;
 
+// ── Slice 2.3（P7 Task 0，計畫 08）────────────────────────────────────────────────────────────
+/// force recover 的輪詢次數（`session_manager._force_recover`：`for _ in range(10)`）。
+pub const FORCE_RECOVER_POLLS: u32 = 10;
+/// force recover 的每次輪詢間隔秒數（`_force_recover`：`time.sleep(1.0)`）。
+pub const FORCE_RECOVER_POLL_S: f64 = 1.0;
+
 // ── Slice 2.2（P6 Task 1，計畫 07）────────────────────────────────────────────────────────────
 // arch §3.1 列為 sw-proto 常數、但 P3／P5 尚未定義者（數值照 `sw_core/constants.py`、`uart_io.py`、`session_manager.py`）。
 /// soft preempt／ATTACHED 救援 lease 上限秒數（`sw_core/constants.py::MAX_RECOVERY_LEASE_S`）。

@@ -1,5 +1,7 @@
 # P5 Slice 2.1：Rust Daemon Core 實作計畫
 
+> **P7 修訂（08-slice23-login-events.md §0.6，Task 0 核對 2026-10-26）**：P7 對本計畫介面的增補一律以 08 §0.6 為唯一範圍。Task 0 已落地：`ManagerNote::RequestAttach { by_id }`（T11）與 `uart_bridge.rs` 的新增項 `RunCancel`／`WaitOutcome`／`RxShared::{wait_for_regex_cancellable, last_rx_seq}`／`RxObserver`（T10，本體 `todo!("P7 Task 7／16-wire")`）。下列修訂**延後**到消費它的 P7 Task、於本計畫對應 Task 實作完成後再改（避免與進行中的 06 實作衝突）：T9 `TxPermit.fsm_gen` 型別／`FenceState.{fsm_gen_floor, auto_probe_blocked}`／floor 拒絕語意（沿用既有 `FenceReject::FsmMismatch`，08 Task 7）；T10 `ReaderCtx.observers`（08 Task 16-wire）；T11 `Effect::{CancelLogin, CaptureOpen, CaptureClose}`、`StartLogin.kind`、`ControlEvent::{LoginFinished.report, CaptureOpened, CaptureClosed}`（08 Task 7、10）；T13 `LoginIo`（`cancel`、`class`、`tx` 回 `TxReport`）與 `LoginOutcome::{Aborted, Raised}`（08 Task 3）。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付可取代 Python daemon 承接 F1／F2／F3／F4／F12 的 Rust `serialwrapd`（Slice 2.1）：PAL serial／UART 獨占／實例鎖／裝置來源／WAL 檔案層／RPC listener，sw-core 的 WAL（BC-01）、Arbiter、SessionActor 最小狀態機、Passthrough／Shell 最小登入與 `CREDENTIALS_UNRESOLVED` 終態、最小 Quiet Gate、TX 三態（BC-03）、Two-Phase Drain＋Release／Attach＋RELEASED 持久化、有界 mailbox／佇列、`state.json` 雙向相容、alias registry，以及 sw-daemon 的 framing／分派／daemon main。

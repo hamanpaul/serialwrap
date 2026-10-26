@@ -1,11 +1,11 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34、SC-35、DF-01～DF-17、DF-19 依定稿規格、調和表與 OD-14 推導（DF-18 保留給 P7）。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34、SC-35、DF-01～DF-17、DF-19 依定稿規格、調和表與 OD-14 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 5
+revision: 6
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -889,6 +889,32 @@ changes:
     compatibility_impact: "07 D-12：`config.yaml` 新鍵 `windows.serial_console`，型別為 mapping：`<DUT 的 by_id（Windows COM 名，如 COM5）>: {console_port: COM40, peer_port: COM41}`（埠名僅為範例；擁有者 host 的 COM20／COM21 已作 DUT-side pair，Console-side pair 須另建不衝突的埠，OD-15）。只在 `caps.com0com_console=true`（Windows）時生效；兩個埠名自動併入 `DeviceSelection.exclude_coms`，永不被列舉成受管 UART（§7.1、§7.4）。session 的 bridge 起來後，`ConsoleHub` 以 `open_com0com_console(console_port)` 開啟（share mode 0），註冊為 `ConsoleTransportKind::Com0com`（`label=serial:<console_port>`、`vtty=<console_port>`、ownership 規則同 TCP accept、`has_external_peer` 恆 true、不被 reaper 回收）。虛擬端的 DTR／RTS／baud 變更不轉送到 DUT UART（不呼叫任何 `set_baud`／modem 控制）。開啟失敗只寫 WARNING，session 照常運作；非 Windows 平台出現此鍵時寫一次 WARNING 後忽略。"
     approval_conditions: "依 07 D-12 與 OD-01（選配）、OD-08：鍵缺省時行為不變；console-side 埠以 share mode 0 開啟且自動排除於裝置列舉；虛擬端控制線不轉送 DUT；開啟失敗不影響 session；非 Windows 平台只寫一次 WARNING 後忽略。Console-side pair 屬 Spike 1 剩餘項，結果未知前不得預標 PASS（OD-15）。"
     related_decisions: ["OD-01", "OD-08"]
+  - id: "SC-30"
+    kind: "SC"
+    title: "自動 login／probe／ready-reconfirm／reboot-recovery 進行中偵測到 boot banner 時立即取消該 run（Rust-only）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-26"
+      decision_ref: "spec-reconciliation.md §1.1 SC-30"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 6
+    spec_refs: ["§5.2.1", "§5.3", "§11.3"]
+    reconciliation_refs: ["SC-30"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P7"]
+    case_ids: ["sc30-quiet-mid-login-aborts"]
+    compatibility_impact: "08 §0.5：run 進行中偵測到 boot banner（quiet arm、fsm_gen++）且 boot_quiet_blocks_probe 為真（profile 無 console_unlock_env）時，Rust 立即取消該 run：Fence 自 arm 那一刻起以 fsm_gen 拒絕所有帶舊 fsm_gen 的 permit（已排入 TxWriter queue 但未進 OS 者 → NotSubmitted；arm 前已標 in-flight 者算已提交、照實記 WAL），RX 等待以 Cancelled 結束。收斂：attach probe 或既有 bridge probe 且非 READY → ATTACHED＋last_error=PROMPT_UNAVAILABLE（不經 transport 精煉、last_error_detail=null）；READY → 狀態不變（由 reconfirm gate 接手）；reboot recovery → 回到 quiet blocks 延長 deadline 的等待迴圈。console unlock profile 不取消。Python（P1 T20 後）同樣 arm 之後 0 byte，但於下一個提交點或等待逾時才結束 run；只有「arm 當下立即取消 run、RX 等待以 Cancelled 結束」為 Rust-only。"
+    approval_conditions: "依 08 §0.5：只在 boot_quiet_blocks_probe 為真時取消；收斂結果與 Python P1 T20 被拒時相同（ATTACHED＋PROMPT_UNAVAILABLE／READY 不變／reboot recovery 回等待迴圈）；不參與 A/B 差分，只驗絕對契約。"
+    related_decisions: []
   - id: "SC-31"
     kind: "SC"
     title: "Console 失效上下文與資源上限的 Rust-only 細化（無 active epoch 丟棄輸入、lease 上下文失效不回放、Control 溢位關閉、Telnet console 上限暫停 accept）"
@@ -1453,6 +1479,33 @@ changes:
     case_ids: ["df17-wal-mirror-retry-no-dup-seq"]
     compatibility_impact: "WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行；部分寫入後只補寫剩餘 bytes，補寫再失敗則於下一筆前以換行終結殘行。"
     approval_conditions: "資料正確性"
+    related_decisions: []
+  - id: "DF-18"
+    kind: "DF"
+    title: "event registry 與 counter 的 tmp→正式檔改名改用 replace（Windows 目的檔已存在時不再失敗）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-26"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.3.3"
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 6
+    spec_refs: ["§5.5"]
+    reconciliation_refs: ["DF-18"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P7"]
+    case_ids: ["df18-event-replace-overwrite"]
+    compatibility_impact: "event registry 與 counter 的 tmp→正式檔改名改用 FsOps::replace（Windows MoveFileExW(MOVEFILE_REPLACE_EXISTING)）。Python 現況 os.rename 在 Windows 目的檔已存在時拋 FileExistsError：第二次 event.rule_set 同一規則回 EXCEPTION、counter 永遠存不進第二次。Python 側同步改 os.replace（08 Task 13-py）；POSIX 行為不變。"
+    approval_conditions: "雙邊同改為覆寫式取代；Windows 可觀測、POSIX 不變；applies_to.python.min_version 於 Task 13 commit 時依當下 VERSION 的下一個 patch 校正。"
     related_decisions: []
   - id: "DF-19"
     kind: "DF"

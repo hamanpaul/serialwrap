@@ -35,3 +35,71 @@ pub struct AgentLogCapture {
     pub byte_count: u64,
     pub status: &'static str,
 }
+
+// ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
+
+/// agent log capture 的行數／位元組計數（reader 端 observer 更新）。
+pub struct CaptureStats {
+    pub line_count: std::sync::atomic::AtomicU64,
+    pub byte_count: std::sync::atomic::AtomicU64,
+}
+
+/// reader 端 agent log 寫入者（DF-15、EVT-D-L1；不經 actor 佇列、無丟棄）。
+pub struct CaptureObserver {
+    _todo: (),
+}
+
+impl CaptureObserver {
+    pub fn new() -> std::sync::Arc<Self> {
+        todo!("P7 Task 10")
+    }
+    /// actor 在前景開始／結束時發布（EVT-D-L1）。
+    pub fn set_foreground_busy(&self, _busy: bool) {
+        todo!("P7 Task 10")
+    }
+    /// executor 呼叫。
+    pub fn install(
+        &self,
+        _capture_id: String,
+        _file: Box<dyn sw_pal::traits::AppendFile>,
+    ) -> std::sync::Arc<CaptureStats> {
+        todo!("P7 Task 10")
+    }
+    /// executor 呼叫；取鎖保證先前寫入完成；回 `(line_count, byte_count)`。
+    pub fn remove(&self, _capture_id: &str) -> Option<(u64, u64)> {
+        todo!("P7 Task 10")
+    }
+}
+
+impl crate::uart_bridge::RxObserver for CaptureObserver {
+    fn on_rx(&self, _com: &str, _data: &[u8], _wal_seq: u64) {
+        todo!("P7 Task 10")
+    }
+}
+
+/// `"{log_dir}/{com}_{%y%m%d-%H%M%S}.log"`（本地時間）。
+pub fn log_path_for(_log_dir: &str, _com: &str, _unix_s: i64, _offset_s: i32) -> String {
+    todo!("P7 Task 10")
+}
+
+pub fn log_start_reply(_cap: &AgentLogCapture, _already_active: bool, _session: PyDict) -> PyDict {
+    todo!("P7 Task 10")
+}
+
+/// `{"ok":false,"error_code":"LOG_OPEN_FAILED","detail":<str(OSError)>}`。
+pub fn log_open_failed_reply(_err: &sw_pal::traits::PalError) -> PyDict {
+    todo!("P7 Task 10")
+}
+
+/// 無 session。
+pub fn log_stop_reply(_cap: &AgentLogCapture, _line_count: u64, _byte_count: u64) -> PyDict {
+    todo!("P7 Task 10")
+}
+
+pub fn no_active_capture_reply(_session: PyDict) -> PyDict {
+    todo!("P7 Task 10")
+}
+
+pub fn log_status_reply(_cap: Option<(&AgentLogCapture, u64, u64)>, _session: PyDict) -> PyDict {
+    todo!("P7 Task 10")
+}

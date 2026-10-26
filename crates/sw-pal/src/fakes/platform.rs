@@ -24,6 +24,7 @@ use crate::traits::{
 };
 use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, PtyPair};
 use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard};
+use crate::traits::{HandlerAbort, HandlerOutcome, HandlerSpawner, HandlerSpec, UsbTopology};
 use crate::DeviceFactory;
 use std::collections::HashSet;
 use crate::{BackendKind, Capabilities, ConsoleKind, DeviceBackendKind, PalPathFlavor, Platform, SkillPlatform};
@@ -76,6 +77,8 @@ pub struct FakePlatformBuilder {
     rpc_listen: Option<Arc<dyn RpcListenerFactory>>,
     console: Option<Arc<dyn ConsoleTransportFactory>>,
     signals: Option<Arc<dyn SignalWait>>,
+    handlers: Option<Arc<dyn HandlerSpawner>>,
+    usb: Option<Arc<dyn UsbTopology>>,
     caps: Capabilities,
 }
 
@@ -96,6 +99,8 @@ pub fn platform() -> FakePlatformBuilder {
         rpc_listen: None,
         console: None,
         signals: None,
+        handlers: None,
+        usb: None,
         caps: posix_caps(),
     }
 }
@@ -157,6 +162,14 @@ impl FakePlatformBuilder {
         self.signals = Some(v);
         self
     }
+    pub fn handlers(mut self, v: Arc<dyn HandlerSpawner>) -> Self {
+        self.handlers = Some(v);
+        self
+    }
+    pub fn usb(mut self, v: Arc<dyn UsbTopology>) -> Self {
+        self.usb = Some(v);
+        self
+    }
     pub fn caps(mut self, v: Capabilities) -> Self {
         self.caps = v;
         self
@@ -203,6 +216,10 @@ impl FakePlatformBuilder {
             signals: self
                 .signals
                 .unwrap_or_else(|| Arc::new(Unconfigured("signals"))),
+            handlers: self
+                .handlers
+                .unwrap_or_else(|| Arc::new(Unconfigured("handlers"))),
+            usb: self.usb.unwrap_or_else(|| Arc::new(Unconfigured("usb"))),
             caps: self.caps,
         }
     }
@@ -582,6 +599,24 @@ impl RegistryView for Unconfigured {
         not_configured(self.0)
     }
     fn query_string(&self, _key: &str, _name: &str) -> PalResult<Option<String>> {
+        not_configured(self.0)
+    }
+}
+
+impl HandlerSpawner for Unconfigured {
+    fn shell_argv(&self, _shell: &str) -> Vec<String> {
+        not_configured(self.0)
+    }
+    fn inherited_env_keys(&self) -> &'static [&'static str] {
+        not_configured(self.0)
+    }
+    fn run(&self, _spec: &HandlerSpec, _abort: &HandlerAbort) -> HandlerOutcome {
+        not_configured(self.0)
+    }
+}
+
+impl UsbTopology for Unconfigured {
+    fn usb_busid(&self, _real_path: &str) -> Option<String> {
         not_configured(self.0)
     }
 }

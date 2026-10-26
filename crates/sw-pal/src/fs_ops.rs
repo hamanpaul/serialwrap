@@ -62,6 +62,12 @@ impl Drop for FileLockGuard {
     }
 }
 
+/// `FsOps::open_append` 的寫入端（P7 Task 0 凍結；Task 6 實作）。
+pub trait AppendFile: Send {
+    fn write_all_flush(&mut self, b: &[u8]) -> PalResult<()>;
+    fn sync(&mut self) -> PalResult<()>;
+}
+
 /// 寫入面（P4-T1 補齊簽章；P3 呼叫端僅使用 `FsRead` 方法，`FsOps: FsRead` 為 supertrait）。
 #[allow(unused_variables)]
 pub trait FsOps: FsRead {
@@ -124,5 +130,24 @@ pub trait FsOps: FsRead {
     /// 取得跨行程獨占鎖：POSIX `flock`，Windows `LockFileEx`；非阻塞取不到回 `WouldBlock`。
     fn file_lock_exclusive(&self, p: &Path, blocking: bool) -> PalResult<FileLockGuard> {
         unimplemented!("P4-T5")
+    }
+
+    // ---- P7 Task 6（08 Task 0 凍結）：寫入側增補；原生實作由 Task 6 交付 ----
+    /// `open(p, "ab")`：append 模式開啟（不存在則建立）；錯誤 `py_message` 照 `str(OSError)`（含 `: '<path>'`）。
+    fn open_append(&self, p: &Path) -> PalResult<Box<dyn AppendFile>> {
+        todo!("P7 Task 6")
+    }
+    /// `open(p, "w")` 截斷後寫入並 close（counter／registry 的 `<path>.tmp`：殘留 tmp 必須被覆寫，不得續寫）。
+    fn create_truncate(&self, p: &Path, bytes: &[u8]) -> PalResult<()> {
+        todo!("P7 Task 6")
+    }
+    // `os.path.isfile` 沿用既有 `FsRead::is_file`（P3），不在 FsOps 重複定義（08 Task 0 核對註記）。
+    /// 檔案大小；`None`＝不存在。
+    fn file_size(&self, p: &Path) -> PalResult<Option<u64>> {
+        todo!("P7 Task 6")
+    }
+    /// 刪除單一檔案；`false`＝不存在（P4 `remove_file` 簽章不變）。
+    fn remove_file_if_exists(&self, p: &Path) -> PalResult<bool> {
+        todo!("P7 Task 6")
     }
 }

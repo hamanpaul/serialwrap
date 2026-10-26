@@ -1368,15 +1368,16 @@ def test_bc_real_bc_case_ids_frozen() -> None:
 
 
 def test_bc_real_sc_df_ranges() -> None:
-    """SC 範圍合併 OD-14、P4 的 SC-36 與 P6 的 SC-28／SC-29／SC-31，且撤回 SC-08。"""
+    """SC 範圍合併 OD-14、P4 的 SC-36、P6 的 SC-28／SC-29／SC-31 與 P7 的 SC-30，且撤回 SC-08。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    # SC-30 保留給 P7（08 §0.5）；SC-34／SC-35 由 P1-OC（02b）登記；SC-36 由 P4 Task 19 登記（OD-15）；
+    # SC-30 由 P7 Task 0 登記（08 §0.5）；SC-34／SC-35 由 P1-OC（02b）登記；SC-36 由 P4 Task 19 登記（OD-15）；
     # SC-08 依 OD-14 #3 撤回、編號不重用。
-    assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36"}) - {"SC-08"}
+    assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36"}) - {"SC-08"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19"}
+    # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記後區間連續。
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 20)}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
@@ -1393,7 +1394,7 @@ def test_bc_real_rust_only_python_null() -> None:
     for c in changes:
         if c.scope == "rust_only":
             assert c.applies_python_min is None, f"{c.id} applies_python_min 應為 None"
-    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-28", "SC-29", "SC-31", "SC-36"):
+    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-28", "SC-29", "SC-30", "SC-31", "SC-36"):
         assert by_id[sc_id].scope == "rust_only", f"{sc_id} scope 應為 rust_only"
     assert by_id["SC-25"].scope in {"rust_only", "python_when_manifest_present"}
 

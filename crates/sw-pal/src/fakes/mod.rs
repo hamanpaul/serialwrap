@@ -20,6 +20,7 @@ pub mod serial;
 pub mod service;
 pub mod sysenv;
 pub mod tunnel;
+pub mod usb;
 pub mod wal_fs;
 
 // 測試以 `sw_pal::fakes::<Type>` 直接引用（計畫 Task 1／9／13 的 import 路徑）。
@@ -30,7 +31,7 @@ pub use fs::{FaultFs, MemFs};
 pub use mem_stream::MemStream;
 pub use platform::{platform, posix_caps, windows_caps, FakePlatformBuilder};
 pub use proc::FakeProcScan;
-pub use process::{FakeProcessCtl, RecordingProcess};
+pub use process::{FakeHandlerSpawner, FakeProcessCtl, RecordingProcess};
 pub use realfs::{file_mode, real_fs};
 pub use registry::FakeRegistry;
 pub use rpc::{FakeConn, FakeRpcConnector, ScriptedConnector, StreamStep};
@@ -38,6 +39,7 @@ pub use serial::{FakeDevice, FakeSerialBackend, FakeUartExclusive, FakeWriteStep
 pub use service::FakeServiceCtl;
 pub use sysenv::{FakeSysEnv, FakeSysEnvBuilder};
 pub use tunnel::FakeTunnel;
+pub use usb::FakeUsb;
 pub use wal_fs::{ExternalHandle, FakeWalFs};
 
 static EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -81,6 +83,8 @@ pub fn fake_platform(
         rpc_listen: Arc::new(platform::Unconfigured("rpc_listen")),
         console: Arc::new(platform::Unconfigured("console")),
         signals: Arc::new(platform::Unconfigured("signals")),
+        handlers: Arc::new(platform::Unconfigured("handlers")),
+        usb: Arc::new(platform::Unconfigured("usb")),
         caps: platform::posix_caps(),
     };
     (platform, connector, clock)

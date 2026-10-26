@@ -110,6 +110,8 @@ fn event_params_and_dispatch_fail_until_implemented() {
         rpc_listen: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("rpc_listen")),
         console: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("console")),
         signals: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("signals")),
+        handlers: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("handlers")),
+        usb: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("usb")),
         caps,
     };
     let env = sw_proto::runtime_paths::EnvSnapshot::from_pairs(std::iter::empty());

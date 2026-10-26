@@ -926,6 +926,10 @@ pub struct WalWriteError {
 // ---------------------------------------------------------------------------
 
 pub use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, KeepAlive, PtyPair, PtySlaveRef};
+// P7 Task 0（08）：event handler 產生器、USB busid 解析與 append 檔案，此處再匯出。
+pub use crate::device_source::UsbTopology;
+pub use crate::fs_ops::AppendFile;
+pub use crate::process::{HandlerAbort, HandlerOutcome, HandlerSpawner, HandlerSpec};
 // 實例鎖型別（arch §4.4）：實際定義於 `crate::lock`，此處再匯出，使 `use sw_pal::*` 可直接取得（Task 4 測試與 Task 19 使用）。
 pub use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard};
 

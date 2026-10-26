@@ -98,3 +98,44 @@ pub const LOGIN_FSM_DETAIL_ERRORS: [&str; 12] = [
     "READY_PROMPT_TIMEOUT",
     "LOGIN_REQUIRED",
 ];
+
+// ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
+
+/// `LoginOutcome::Aborted` 的原因（P7 Task 3；`LoginOutcome` 新 variant 隨 Task 3 一併加入，Task 0 不改 06 enum）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoginAbort {
+    Refused(crate::tx_writer::FenceReject),
+    Cancelled,
+    TxIncomplete,
+}
+
+/// `err.endswith("_PROMPT_TIMEOUT")`（`login_fsm.py:57`）。
+pub fn is_prompt_timeout_error(_err: &str) -> bool {
+    todo!("P7 Task 3")
+}
+
+pub fn matches_login_or_password(_text: &str, _sp: &SessionProfile) -> bool {
+    todo!("P7 Task 3")
+}
+
+pub fn maybe_reclassify_flood(_io: &LoginIo, _err: Option<String>) -> Option<String> {
+    todo!("P7 Task 3")
+}
+
+pub fn detect_template<'t>(
+    _io: &LoginIo,
+    _templates: &'t [sw_proto::config_types::ProfileTemplate],
+    _probe_timeout_s: f64,
+) -> Result<Option<&'t sw_proto::config_types::ProfileTemplate>, LoginOutcome> {
+    todo!("P7 Task 3")
+}
+
+/// `session_manager._matches_any_bootloader_prompt`：`pycompat::splitlines` 取最後一個非空白行；無效 regex 略過。
+pub fn matches_any_bootloader_prompt(_text: &str, _prompts: &[String]) -> Option<String> {
+    todo!("P7 Task 3")
+}
+
+/// `login_fsm._console_at_bootloader`：尾行＝`clean_text(tail).rstrip("\r\n").split("\n")[-1]`；無效 regex → `Err(Raised("error"))`。
+pub fn console_at_bootloader(_rx_tail: &str, _prompts: &[String]) -> Result<bool, LoginOutcome> {
+    todo!("P7 Task 3")
+}

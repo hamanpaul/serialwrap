@@ -52,6 +52,8 @@ fn platform(
         rpc_listen: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("rpc_listen")),
         console: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("console")),
         signals: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("signals")),
+        handlers: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("handlers")),
+        usb: std::sync::Arc::new(sw_pal::fakes::platform::Unconfigured("usb")),
         caps: ClientCaps {
             path_flavor: PalPathFlavor::Posix,
             af_unix: true,
