@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 
 import pytest
@@ -54,14 +55,59 @@ def test_freeze_matches_lock():
     assert fr["schema_version"] == 1 and fr["slice"] == "2.1" and fr["denominator_set"] == "slice_2.1"
     assert fr["window"] == {"start": fr["frozen_at"], "weeks": 3}
     assert fr["stage2_started_at"] == fr["frozen_at"]
-    # P6 Task 0：後續切片以 add-only 追加案例時 cases.yaml revision 會前進（YYYY-MM-DD.N，字串序即時間序）；
-    # 凍結時的 revision 不得晚於現行值。位元組指紋只在 revision 相同時比對（見下方 if）。
-    assert fr["cases_revision"] <= cases_doc["revision"]
+    # P6 Task 0：後續切片以 add-only 追加案例時 cases.yaml revision 會前進（YYYY-MM-DD.N）；凍結時的 revision 不得晚於現行值。
+    # parity-amendments-2026-10-26 #183（P6 審查 F4）：以 (YYYY,MM,DD,N) 整數 tuple 比較（字串序在 N≥10 時錯：".10" < ".9"）。
+    # 位元組指紋只在 revision 相同時比對（見下方 if）；revision 前進後改由 case_fingerprints 逐案驗證。
+    assert _revision_key(fr["cases_revision"]) <= _revision_key(cases_doc["revision"])
     recomputed = _load("regen_lock", "tests/acceptance/regen_lock.py").compute_sets(cases_doc)["slice_2.1"]
     assert fr["required_case_ids"] == recomputed
     if fr["cases_revision"] == lock["cases_revision"]:
         assert fr["cases_lock_sha256"] == hashlib.sha256(LOCK.read_bytes()).hexdigest()
         assert fr["cases_yaml_sha256"] == hashlib.sha256(CASES.read_bytes()).hexdigest()
+
+
+def _revision_key(rev: str) -> tuple[int, int, int, int]:
+    """cases.yaml revision ``YYYY-MM-DD.N`` → (YYYY, MM, DD, N)；格式不符即 AssertionError。"""
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\.(\d+)", str(rev))
+    assert m, f"revision 格式必須為 YYYY-MM-DD.N：{rev!r}"
+    return tuple(int(g) for g in m.groups())  # type: ignore[return-value]
+
+
+def test_revision_key_orders_numerically():
+    assert _revision_key("2026-10-24.9") < _revision_key("2026-10-24.10")
+    assert _revision_key("2026-10-24.10") < _revision_key("2026-10-25.1")
+    assert _revision_key("2026-09-30.99") < _revision_key("2026-10-01.1")
+    for bad in ("2026-10-24", "2026-10-24.x", "20261024.1", "2026-10-24.1 "):
+        with pytest.raises(AssertionError):
+            _revision_key(bad)
+
+
+def _case_fingerprint(case: dict) -> str:
+    return hashlib.sha256(json.dumps(case, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                          .encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("slice_id", ["2.1", "2.2"])
+def test_freeze_case_fingerprints_match_current_cases(slice_id):
+    """parity-amendments-2026-10-26 #183（P6 審查 F4）：revision 前進後整檔位元組指紋（cases_yaml_sha256）不再比對，
+    必要案例的非 case_attrs 欄位（source_ref、title、implemented_by…）被改動會無聲通過；凍結檔因此記錄每個必要案例
+    完整 YAML 映射的 sha256（canonical JSON），此處逐案重算比對（補強，非削弱）。"""
+    fr = json.loads((ACC / "breaker" / f"slice_{slice_id}.json").read_text(encoding="utf-8"))
+    cases = {c["case_id"]: c for c in yaml.safe_load(CASES.read_text(encoding="utf-8"))["cases"]}
+    fps = fr.get("case_fingerprints")
+    assert isinstance(fps, dict), f"slice_{slice_id}.json 缺 case_fingerprints"
+    assert sorted(fps) == sorted(fr["required_case_ids"])
+    changed = [cid for cid in fr["required_case_ids"] if _case_fingerprint(cases[cid]) != fps[cid]]
+    assert not changed, f"凍結後必要案例內容被改動：{changed}"
+
+
+def test_freeze_writes_case_fingerprints(tmp_path):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    out = tmp_path / "slice_2.1.json"
+    assert freeze.main(["--slice", "2.1", "--date", "2026-10-21", "--out", str(out)]) == 0
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    cases = {c["case_id"]: c for c in yaml.safe_load(CASES.read_text(encoding="utf-8"))["cases"]}
+    assert doc["case_fingerprints"] == {cid: _case_fingerprint(cases[cid]) for cid in doc["required_case_ids"]}
 
 
 def test_freeze_precedes_any_gate_run():

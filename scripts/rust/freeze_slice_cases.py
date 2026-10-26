@@ -10,6 +10,8 @@
 分母指紋 `denominator_sha256` 為 required 案例的 `case_attrs`（依凍結時原序）canonical JSON 的 sha256。
 lock 為 add-only，後續切片只會新增案例，既有案例屬性不得改動，因此指紋在 P6～P8 重算 lock 後仍成立；
 `cases_lock_sha256` 僅作為 provenance 記錄。
+`case_fingerprints`（parity-amendments-2026-10-26 #183）為 {case_id: 該必要案例完整 YAML 映射之 canonical JSON sha256}；
+revision 前進後整檔指紋 `cases_yaml_sha256` 不再可比，改由此逐案驗證必要案例內容未被改動。
 
 Stage 2 起算日（OD-02 的 24 週上限起點）全案只有一個：Slice 2.1 的 `stage2_started_at`。
 2.1 以開工日（`--date`）為起算日；2.2～2.4 必須沿用 `breaker/slice_2.1.json` 的值（缺檔、不一致或晚於開工日 → exit 2）。
@@ -85,6 +87,17 @@ def denominator_sha256(lock: dict, required: list[str]) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
+def case_fingerprint(case: dict) -> str:
+    """單一案例完整映射（cases.yaml 的一個元素）之 canonical JSON sha256。"""
+    canon = json.dumps(case, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def case_fingerprints(cases_doc: dict, required: list[str]) -> dict[str, str]:
+    by_id = {c["case_id"]: c for c in cases_doc.get("cases", [])}
+    return {cid: case_fingerprint(by_id[cid]) for cid in required}
+
+
 def resolve_stage2_started_at(slice_id: str, date: str, requested: str | None,
                               breaker_dir: pathlib.Path) -> str:
     """決定 Stage 2 起算日：2.1 以開工日為預設；其餘切片必須沿用 2.1 凍結檔的值。"""
@@ -133,6 +146,7 @@ def build_freeze(*, slice_id: str, date: str, stage2_started_at: str,
         "required_case_ids": required,
         "denominator": len(required),
         "denominator_sha256": denominator_sha256(lock, required),
+        "case_fingerprints": case_fingerprints(cases_doc, required),
         "stage2_started_at": stage2_started_at,
     }
 
