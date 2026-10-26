@@ -9,7 +9,8 @@
   python3 scripts/rust/capture_p7_goldens.py [--out contracts/golden/p7] [--check]
   --check：不寫檔，只比對既有檔是否與重新擷取結果相同（不同 exit 1）。
 
-前置：無 google-re2（`import re2` 成功即 exit 2，EVT-D-S15 以無 re2 的 Python 為基準）；Python 3.12（re 錯誤訊息與 sre AST 依版本）。
+前置：無 google-re2（`import re2` 成功即 exit 2，EVT-D-S15 以無 re2 的 Python 為基準）；CPython 3.12（re 錯誤訊息、sre AST
+與 int() 位數檢查順序依版本而異，其他版本 exit 2）。
 """
 from __future__ import annotations
 
@@ -708,7 +709,15 @@ def render(name: str) -> bytes:
     return "".join(dumps_line(r) + "\n" for r in rows).encode("utf-8")
 
 
+def _python_version() -> tuple[int, int]:
+    return sys.version_info[:2]
+
+
 def main(out_dir: str = "contracts/golden/p7", check: bool = False) -> int:
+    if _python_version() != (3, 12):
+        # 3.11 int() 先查位數上限（event_schema:078）、3.13 login_fsm_scenarios 不同；以 CI 的 CPython 3.12 為準
+        print(f"[capture_p7_goldens] golden 必須以 CPython 3.12 擷取（目前 {sys.version.split()[0]}）", file=sys.stderr)
+        return 2
     try:
         import re2  # noqa: F401
     except ImportError:

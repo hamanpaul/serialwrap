@@ -49,3 +49,17 @@ def test_event_engine_order_golden_distinguishes_start_and_rule_set():
     rows = {r["id"]: r for r in map(json.loads, (GOLDEN / "event_engine_order.ndjson").read_text(encoding="utf-8").splitlines())}
     assert rows["event_engine_order:rule_set"]["types"][:2] == ["com_enabled", "rule_loaded"]   # engine.py:107-114
     assert rows["event_engine_order:start"]["types"][:2] == ["rule_loaded", "com_enabled"]
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("version", [(3, 11, 9), (3, 13, 0), (3, 14, 1)])
+def test_capture_refuses_non_312_python(version, monkeypatch, capsys):
+    """審查 L5-4：re 錯誤訊息／sre AST／int() 位數檢查順序依版本而異，golden 只能以 CPython 3.12 擷取（exit 2）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("capture_p7_goldens_under_test", ROOT / "scripts/rust/capture_p7_goldens.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "_python_version", lambda: version[:2])
+    assert mod.main(check=True) == 2
+    assert "CPython 3.12" in capsys.readouterr().err
