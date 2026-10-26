@@ -43,3 +43,31 @@ Codex 原始 BRIDGE 段：
 ## 裁定狀態
 
 兩位非實作者均對候選 tree 明確寫下 `BRIDGE: APPROVE`。本輪不改 `tools/uart_stdio_bridge/APPROVED_REVISION.json`；依本輪指示，下一輪才以此文件作為 `review_ref` 更新 tree hash、reviewer 與日期並另行提交。核准檔更新前，Windows qualification、bridge revision 測試及依賴該資格的 Docker smoke 仍須按原判定保持 FAIL／INSUFFICIENT。
+
+## 2026-10-27 Round 2 複審
+
+候選工具樹：`dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`。審查範圍為 `7098a97..cc7e30d` 中 `tools/uart_stdio_bridge` 的完整差異，共 8 個檔案、2207 行新增、119 行刪除。兩位審查者皆未參與實作，並對此 tree 明確核准。
+
+### Claude Sonnet 原始審查段
+
+> 非實作者複審：未發現尚未修復的阻擋缺陷。
+>
+> 審查範圍為 `7098a97..cc7e30d` 的完整 bridge 差異：8 檔、2207 行新增、119 行刪除。實算候選 tree 為 `dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`。
+>
+> `win_serial.py:392` 最後 DSR 取樣後重新驗證 deadline 與已設定 timeout；`win_serial.py:474` 改為取樣後讀取最新 settle 起點。low→high 重開反例現在正確拒寫。保留舊測試 nodeid，分別驗證快照前重開與快照完成後狀態清除，後續呼叫必須重新 settle。
+>
+> 獨立定點測試 12 passed。Linux raw selftest 14 PASS、complete；Windows COM20:COM21 raw selftest 13 PASS、ST-12 NOT_RUN（`cap_missing:transport_disconnect`），raw verdict PASS、complete；`com_driver` metadata 仍不足。外層 `qualification_exit=1` 保持，核准並不代表 qualification 或 Stage 1 出口通過。
+>
+> BRIDGE: APPROVE
+
+### Codex gpt-6.1-sol 原始審查段
+
+> 未發現阻擋性缺陷。核准候選 tree：`dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`。
+>
+> 先前兩項阻擋均已修復：持續 2 ms DSR 成本仍能寫入；觀察到 low→high 重開後不會沿用舊 settle 時間。最後寫入期限保護仍保留。既有 snapshot 測試保留原斷言，並增加下一次須 fail-closed 的檢查，未實質削弱。
+>
+> 獨立定點測試 12 passed。已核對匹配候選 tree 的最終 artifacts：Linux 14 PASS、complete；Windows COM20:COM21 13 PASS、ST-12 NOT_RUN（缺 `transport_disconnect` 能力），raw PASS、complete；COM driver metadata 不足仍保留。核准檔仍為 `c4c22c0e…`，外層 qualification 維持失敗。
+>
+> BRIDGE: APPROVE
+
+本輪 Linux raw selftest 為 14/14 PASS；Windows COM20:COM21 raw selftest 為 13 PASS、ST-12 NOT_RUN。Windows 外層 `selftest-result.json` 記 `exit=0`、`qualification_exit=1`，因核准 tree `c4c22c0e…` 尚未更新。`APPROVED_REVISION.json` 保持不變。
