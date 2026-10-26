@@ -352,6 +352,8 @@ def gen_event_schema() -> list[dict[str, Any]]:
         _rule(timeout_ms="+0" + "0" * 4300),
         # 審查 L2：regex `(?P>x)` 錯誤訊息經 schema 外露
         _rule(pattern={"kind": "regex", "value": "(?P>x)"}), _rule(pattern={"kind": "regex", "value": "(?P"}),
+        # sol 補審 #3：名稱允許尾端換行，`rule_id must equal '…'` 以 f-string 直接嵌入（非 repr）
+        _rule(name="n\n", rule_id="x.y"), _rule(owner="o\n", rule_id="x.y"),
     ]
     rows = []
     for obj in inputs:

@@ -1,7 +1,7 @@
 //! 規則 schema 驗證（P7 Task 11；`event_engine/schema.py`，09 §3.1）。
 
 use sw_proto::pycompat::{py_int_parse_checked, py_truthy};
-use sw_proto::pyfmt::{py_repr_str, py_str};
+use sw_proto::pyfmt::py_str;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{self, redos, CompileError, PyFlags};
 
@@ -274,10 +274,8 @@ pub fn validate_rule_dict(obj: &PyValue) -> Result<Rule, RuleError> {
         None => true,
         Some(v) => *v == derived_id,
     };
-    require(
-        rid_ok,
-        format!("rule_id must equal {}", py_repr_str(&derived_id)),
-    )?;
+    // Python 以 f-string `'{derived_id}'` 直接嵌入（非 repr）：名稱允許的尾端換行原樣出現在訊息中。
+    require(rid_ok, format!("rule_id must equal '{derived_id}'"))?;
 
     require(
         in_str_set(d.get("kind"), &VALID_KIND)?,
