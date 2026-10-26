@@ -42,15 +42,9 @@ def test_contract_blackbox_cases_match_test_functions():
         and node.name.startswith("test_")
     }
     all_bb = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
-    # P6 Task 0（07-slice22-console.md）：下游切片以 add-only 登記的 contract-blackbox 案例（implemented_by 為該切片計畫）
-    # 不屬 Stage 1A daemon black-box；Stage 1A 案例仍須與 test_bb_daemon_e2e.py 一一對應，切片案例另驗來源路徑。
-    cases = [c for c in all_bb if c.get("implemented_by") == "04-stage1a-rust-cli.md"]
-    later = [c for c in all_bb if c.get("implemented_by") != "04-stage1a-rust-cli.md"]
-    for c in later:
-        assert str(c.get("implemented_by", "")).startswith(("07-slice22-console.md", "08-slice23", "09-slice24")), c["case_id"]
-        assert str(c["source_ref"]).startswith(("tests/contract_blackbox/", "crates/")), c["case_id"]
-        assert "::" in c["source_ref"], c["case_id"]
-    assert len({c["source_ref"] for c in later}) == len(later), "切片 contract-blackbox source_ref 不得重複"
+    # P6 Task 0（07-slice22-console.md）：下游切片以 add-only 登記的 contract-blackbox 案例不屬 Stage 1A daemon black-box；
+    # Stage 1A 案例仍須與 test_bb_daemon_e2e.py 一一對應，切片案例另驗來源路徑。分群見 _split_contract_blackbox。
+    cases, later = _split_contract_blackbox(all_bb)
     expected_refs = {
         f"tests/contract_blackbox/test_bb_daemon_e2e.py::{name}" for name in names
     }
@@ -63,6 +57,55 @@ def test_contract_blackbox_cases_match_test_functions():
     )
     assert len(actual_refs) == len(cases), "contract-blackbox source_ref 不得重複"
     assert {c["case_id"] for c in cases} == expected_ids
+
+
+_STAGE1A_PLAN = "04-stage1a-rust-cli.md"
+_STAGE1A_SOURCE = "tests/contract_blackbox/test_bb_daemon_e2e.py::"
+
+
+def _split_contract_blackbox(all_bb: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """contract-blackbox 案例分成 Stage 1A 與下游切片兩群，並驗證各群的結構不變量。
+
+    parity-amendments-2026-10-26 #184（P6 審查 F5）：分群鍵改為結構欄位（``case_id`` 的 ``bb-`` 前綴或
+    ``source_ref`` 指向 ``test_bb_daemon_e2e.py``），不再依自由文字 ``implemented_by``；任一 Stage 1A 案例的
+    ``implemented_by`` 必須恰為 ``04-stage1a-rust-cli.md``，下游案例不得使用 ``bb-`` 前綴或 Stage 1A 來源。
+    """
+    stage1a = [c for c in all_bb
+               if c["case_id"].startswith("bb-") or str(c.get("source_ref", "")).startswith(_STAGE1A_SOURCE)]
+    later = [c for c in all_bb if c not in stage1a]
+    for c in stage1a:
+        assert c["case_id"].startswith("bb-"), f"{c['case_id']}：source_ref 屬 Stage 1A，case_id 必須以 bb- 開頭"
+        assert c.get("implemented_by") == _STAGE1A_PLAN, f"{c['case_id']}：Stage 1A 案例 implemented_by 必須為 {_STAGE1A_PLAN}"
+        assert str(c.get("source_ref", "")).startswith(_STAGE1A_SOURCE), f"{c['case_id']}：Stage 1A 案例來源必須為 {_STAGE1A_SOURCE}"
+    for c in later:
+        assert c.get("implemented_by") != _STAGE1A_PLAN, f"{c['case_id']}：非 bb- 案例不得標為 Stage 1A"
+        assert str(c.get("implemented_by", "")).startswith(("07-slice22-console.md", "08-slice23", "09-slice24")), c["case_id"]
+        assert str(c["source_ref"]).startswith(("tests/contract_blackbox/", "crates/")), c["case_id"]
+        assert "::" in c["source_ref"], c["case_id"]
+    assert len({c["source_ref"] for c in later}) == len(later), "切片 contract-blackbox source_ref 不得重複"
+    return stage1a, later
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("bad", [
+    # bb- 案例被標成切片計畫（舊邏輯會把它歸入切片群而無聲通過）
+    {"case_id": "bb-new-case", "implemented_by": "07-slice22-console.md",
+     "source_ref": "tests/contract_blackbox/slice22/test_x.py::test_new_case"},
+    # Stage 1A 案例 implemented_by 文字漂移
+    {"case_id": "bb-drift", "implemented_by": "04-stage1a-rust-cli.md ",
+     "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_drift"},
+    # 指向 Stage 1A 測試檔、卻不是 bb- 案例
+    {"case_id": "sc99-x", "implemented_by": "07-slice22-console.md",
+     "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_x"},
+    # 非 bb- 案例宣稱屬 Stage 1A
+    {"case_id": "sc98-y", "implemented_by": "04-stage1a-rust-cli.md",
+     "source_ref": "tests/contract_blackbox/slice22/test_y.py::test_y"},
+])
+def test_contract_blackbox_grouping_is_structural(bad):
+    ok = {"case_id": "bb-ok", "implemented_by": _STAGE1A_PLAN, "source_ref": _STAGE1A_SOURCE + "test_ok"}
+    assert _split_contract_blackbox([ok]) == ([ok], [])
+    with pytest.raises(AssertionError):
+        _split_contract_blackbox([ok, dict(bad, suite="contract-blackbox")])
 
 
 def _slice_to_tuple(s: str) -> tuple[int, ...]:
