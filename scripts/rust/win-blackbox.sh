@@ -84,9 +84,12 @@ repo_win="$(wslpath -w "$ROOT")"
 out_win="$(wslpath -w "$out_dir")"
 git_revision="$(git -C "$ROOT" rev-parse HEAD)"
 contract_revision="$(git -C "$ROOT" rev-parse HEAD:contracts)"
+git_bundle="$out_dir/source-revision.bundle"
+git -C "$ROOT" bundle create "$git_bundle" HEAD
+git_bundle_win="$(wslpath -w "$git_bundle")"
 python3123="$local_appdata\sw-rust-test\py-3.12.3"
 ps_args=(-NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$ROOT/scripts/rust/win-blackbox.ps1")"
-  -RustExe "$rust_win" -RepoSnapshot "$repo_win" -OutDir "$out_win"
+  -RustExe "$rust_win" -RepoSnapshot "$repo_win" -GitBundle "$git_bundle_win" -OutDir "$out_win"
   -SelftestTimeoutSeconds "$selftest_timeout"
   -GitRevision "$git_revision" -ContractRevision "$contract_revision")
 if [[ -d "$(wslpath -u "$python3123" 2>/dev/null)" ]]; then

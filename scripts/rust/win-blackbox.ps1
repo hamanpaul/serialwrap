@@ -1,6 +1,7 @@
 ﻿param(
     [Parameter(Mandatory = $true)][string]$RustExe,
     [Parameter(Mandatory = $true)][string]$RepoSnapshot,
+    [Parameter(Mandatory = $true)][string]$GitBundle,
     [Parameter(Mandatory = $true)][string]$OutDir,
     [string]$Python3123,
     [string]$GitRevision,
@@ -62,6 +63,24 @@ function Copy-RepoPath([string]$RepoRoot, [string]$RelativePath, [string]$Destin
         Copy-Item -LiteralPath $source -Destination $destination -Force
     }
     return $true
+}
+
+function Initialize-StagingGit([string]$GitBundle, [string]$StagingRepo, [string]$Revision, [string]$ScratchRoot) {
+    if (-not (Test-Path -LiteralPath $GitBundle -PathType Leaf)) { throw "Git bundle 不存在：$GitBundle" }
+    $localBundle = Join-Path $ScratchRoot 'source-revision.bundle'
+    Copy-Item -LiteralPath $GitBundle -Destination $localBundle -Force
+    & git -C $StagingRepo init --quiet
+    if ($LASTEXITCODE -ne 0) { throw '無法初始化 Windows staging repo 的 Git metadata' }
+    & git -C $StagingRepo fetch --quiet --no-tags $localBundle HEAD
+    if ($LASTEXITCODE -ne 0) { throw "無法從本機 Git bundle 取得 revision：$Revision" }
+    $fetchedRevision = (& git -C $StagingRepo rev-parse FETCH_HEAD | Select-Object -Last 1).Trim()
+    if ($LASTEXITCODE -ne 0 -or $fetchedRevision -cne $Revision) {
+        throw "Git bundle revision 不符：預期 $Revision，實際 $fetchedRevision"
+    }
+    & git -C $StagingRepo update-ref refs/heads/sw-staging $fetchedRevision
+    if ($LASTEXITCODE -ne 0) { throw "無法設定 staging repo HEAD：$Revision" }
+    & git -C $StagingRepo symbolic-ref HEAD refs/heads/sw-staging
+    if ($LASTEXITCODE -ne 0) { throw '無法將 staging repo HEAD 指向測試 revision' }
 }
 
 function Get-LoopbackListenerSnapshot() {
@@ -912,6 +931,7 @@ try {
     if ($revision -notmatch '^[0-9a-f]{40}$' -or $contractsRevision -notmatch '^[0-9a-f]{40}$') {
         throw '無法取得 Git 與 contracts revision，拒絕產生不完整 dev bundle'
     }
+    Initialize-StagingGit $GitBundle $stagingRepo $revision $scratchRoot
 
     $runtimeExe = $null
     $runtimeRoot = Get-VerifiedPython3123 $Python3123 $sourceRoot $scratchRoot

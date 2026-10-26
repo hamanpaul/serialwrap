@@ -341,6 +341,24 @@ def test_windows_blackbox_l1_is_staged_then_copied_to_outdir():
     assert "Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $l1Directory $_.Name) -Force" in ps1
 
 
+def test_windows_blackbox_staging_repo_has_exact_git_revision():
+    """staging repo 從 Windows 本機 bundle 匯入 exact HEAD，供 P4-T16 身分驗證使用。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    initialize = _ps_function(ps1, "Initialize-StagingGit")
+    assert "git -C $StagingRepo init --quiet" in initialize
+    assert "Copy-Item -LiteralPath $GitBundle -Destination $localBundle -Force" in initialize
+    assert "git -C $StagingRepo fetch --quiet --no-tags $localBundle HEAD" in initialize
+    assert "git -C $StagingRepo rev-parse FETCH_HEAD" in initialize
+    assert "Initialize-StagingGit $GitBundle $stagingRepo $revision $scratchRoot" in ps1
+    assert "git -C $StagingRepo fetch --quiet --no-tags $SourceRoot $Revision" not in initialize
+    assert "refs/heads/sw-staging $fetchedRevision" in initialize
+    assert "git -C $StagingRepo symbolic-ref HEAD refs/heads/sw-staging" in initialize
+
+    shell = WIN_BLACKBOX_SH.read_text(encoding="utf-8")
+    assert 'git -C "$ROOT" bundle create "$git_bundle" HEAD' in shell
+    assert '-GitBundle "$git_bundle_win"' in shell
+
+
 def test_windows_blackbox_ps1_parses_under_windows_powershell():
     """以 Windows PowerShell 解析器語法檢查 win-blackbox.ps1（不執行）；無 powershell.exe 時 SKIP。"""
     powershell = shutil.which("powershell.exe")
