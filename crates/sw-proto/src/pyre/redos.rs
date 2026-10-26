@@ -14,7 +14,9 @@ use super::parse::{self, ClassItem, Expr, RepeatMode};
 use super::{CompileError, PyFlags};
 
 /// sre AST 的歧義分數（`_ambiguity_score`）：可變量詞與 alternation 為來源，固定 `{N>=2}` 重複有歧義的 body 計兩倍。
-pub fn ambiguity_score(pattern: &str, flags: PyFlags) -> Result<u32, CompileError> {
+///
+/// Python 為任意精度整數；此處以飽和運算封頂於 `u64::MAX`（巢狀 `{2}` 每層倍增，64 層即超過），超大分數仍判可疑。
+pub fn ambiguity_score(pattern: &str, flags: PyFlags) -> Result<u64, CompileError> {
     Ok(score(&parse::parse(pattern, flags)?.expression))
 }
 
@@ -45,7 +47,7 @@ impl PyFlags {
     }
 }
 
-fn score(e: &Expr) -> u32 {
+fn score(e: &Expr) -> u64 {
     score_items(&sub_pattern(e))
 }
 
@@ -109,19 +111,24 @@ fn alternation<'a>(branches: &'a [Expr], out: &mut Vec<Item<'a>>) {
     out.push(Item::Atom(Atom::In(uniq(set))));
 }
 
-fn score_items(items: &[Item<'_>]) -> u32 {
-    items.iter().map(item_score).sum()
+fn score_items(items: &[Item<'_>]) -> u64 {
+    items.iter().map(item_score).fold(0, u64::saturating_add)
 }
 
-fn item_score(item: &Item<'_>) -> u32 {
+fn item_score(item: &Item<'_>) -> u64 {
     match item {
         Item::Atom(_) => 0,
-        Item::Branch(branches) => 1 + branches.iter().map(|b| score_items(b)).max().unwrap_or(0),
+        Item::Branch(branches) => branches
+            .iter()
+            .map(|b| score_items(b))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
         Item::Node(e) => node_score(e),
     }
 }
 
-fn node_score(e: &Expr) -> u32 {
+fn node_score(e: &Expr) -> u64 {
     match e {
         Expr::Capture { body, .. } | Expr::ScopedFlags { body, .. } | Expr::Atomic(body) => {
             score(body)
@@ -142,9 +149,9 @@ fn node_score(e: &Expr) -> u32 {
             let variable = max.is_none_or(|mx| mx != *min);
             let at_least_twice = max.is_none_or(|mx| mx >= 2);
             if variable {
-                1 + body_score
+                body_score.saturating_add(1)
             } else if at_least_twice {
-                2 * body_score
+                body_score.saturating_mul(2)
             } else {
                 body_score
             }

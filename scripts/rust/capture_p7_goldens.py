@@ -369,6 +369,14 @@ def gen_event_schema() -> list[dict[str, Any]]:
 
 # ── redos ───────────────────────────────────────────────────────────────────
 
+def _nested_fixed_repeat(depth: int) -> str:
+    """`a?` 外包 `depth` 層 `(?:…){2}`：分數為 `2**depth`。"""
+    p = "a?"
+    for _ in range(depth):
+        p = "(?:" + p + "){2}"
+    return p
+
+
 def gen_redos() -> list[dict[str, Any]]:
     from sw_core.event_engine import schema as s
 
@@ -392,6 +400,8 @@ def gen_redos() -> list[dict[str, Any]]:
         ("(?:(?:a)|b)+", ""), ("(?:(?:ab)|(?:ac))+", ""), ("(?:(?:a|b)c|(?:a|b)d)+", ""), ("(?:[aa]|b)+", ""),
         ("(?:a(?:b)|ac)+", ""), ("(?:(?i:a)|b)+", ""), ("(?:(?:)a|b)+", ""), ("(?:(?:a|b)|c)+", ""),
         ("(?:[ab]|(?:c|d))+", ""), ("(?:(?:ab)c|abd)+", ""), ("(?:\\d|(?:x))+", ""), ("(?:(?:a)b|(?:a)c)+", ""),
+        # sol 補審 #2：固定 {2} 巢狀使分數倍增，32 層（226 字元）＝2**32、64 層＝2**64，皆須判可疑（Python 無溢位）
+        (_nested_fixed_repeat(32), ""), (_nested_fixed_repeat(64), ""),
     ]
     rows = []
     for pat, flags in samples:
