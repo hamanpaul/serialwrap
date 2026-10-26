@@ -1,6 +1,22 @@
 {
   "schema_version": 1,
   "sets": {
+    "p7_gate:cargo-test-workspace": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-core::login_quiet::console_unlock_arm_mid_login_finish_applied"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
     "p7_gate:py_parity": {
       "linux": {
         "nodeids": [

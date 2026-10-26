@@ -69,3 +69,16 @@ def test_p7_py_parity_set_registered_add_only():
         assert nid in ids, nid
     behaviour = {n for n in ids if n.startswith("tests/test_console_unlock.py::")}
     assert len({n.split("[")[0] for n in behaviour}) >= 17, "test_console_unlock.py 行為測試應全數入鎖"
+
+
+@pytest.mark.memory_only
+def test_p7_cargo_parity_set_registers_console_unlock_mid_login():
+    """sol 補審 #4（parity #49，08 Task 4 追加段）：Rust 必要 parity 測試入 P7 cargo 必要集合 `p7_gate:cargo-test-workspace`。
+
+    selector 為 Task 19 gate 列 `cargo test --workspace --features test-fakes`；nodeid 以 `cargo_l1_results.py --list-only`
+    實際收集結果登記。Windows 平台需以 Windows 原生收集結果登記（§2.1），由 Windows runner 補；此處只要求 linux 已登記。
+    """
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    spec = lock["sets"]["p7_gate:cargo-test-workspace"]["linux"]
+    assert spec["selector"]["argv"] == ["--workspace", "--features", "test-fakes"]
+    assert "cargo:sw-core::login_quiet::console_unlock_arm_mid_login_finish_applied" in spec["nodeids"]
