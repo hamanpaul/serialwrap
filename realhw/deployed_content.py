@@ -72,7 +72,7 @@ def install_dir(cli_exe: pathlib.Path) -> pathlib.Path | None:
     """依 POSIX symlink bundle 或 Windows current-release sidecar 尋找安裝。
 
     Windows 的 `dir` 為相對安裝根（`bin` 的上一層）的 `versions/<V>`（plan 04 Task 17，OD-18 (3) 一律正斜線；rollback.rs 寫入 `versions/<V>`），
-    故以 `cli.parent.parent` 為基準；讀取端仍接受舊版反斜線分隔並先正規化為 `/`，絕對路徑照舊。
+    故以 `cli.parent.parent` 為基準；只接受 Rust launcher 可啟動的安全正斜線相對路徑。
     """
     cli = _path(cli_exe).resolve()
     if os.name == "nt":
@@ -81,10 +81,14 @@ def install_dir(cli_exe: pathlib.Path) -> pathlib.Path | None:
             return None
         try:
             data = json.loads(pointer.read_text(encoding="utf-8"))
-            candidate = _path(str(data["dir"]).replace("\\", "/"))
-            if not candidate.is_absolute():
-                candidate = cli.parent.parent / candidate
-            candidate = candidate.resolve()
+            value = data["dir"]
+            if not isinstance(value, str):
+                return None
+            segments = value.split("/")
+            if (not value or "\\" in value or ":" in value or value.startswith("/")
+                    or any(segment in ("", ".", "..") for segment in segments)):
+                return None
+            candidate = cli.parent.parent.joinpath(*segments).resolve()
         except (OSError, ValueError, KeyError, TypeError):
             return None
         return candidate if (candidate / "release-manifest.json").is_file() else None

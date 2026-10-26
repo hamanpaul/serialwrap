@@ -284,9 +284,9 @@ def _l1_outcome(
 
 def _safe_bundle_relative(value: str) -> bool:
     """`current-release.json` 的 dir 必須是安全的 bundle 相對路徑（與 Rust launcher 同一規則）：
-    非空、非絕對路徑、無磁碟代號，且無空段、`.` 或 `..`。
+    非空、非絕對路徑、無反斜線或磁碟代號，且無空段、`.` 或 `..`。
     """
-    if not value or value.startswith("/") or ":" in value:
+    if not value or value.startswith("/") or "\\" in value or ":" in value:
         return False
     return all(segment not in ("", ".", "..") for segment in value.split("/"))
 
@@ -295,9 +295,9 @@ def _manifest_candidates(cli: Path) -> tuple[list[Path], str | None]:
     """依 bundle 佈局列出 release-manifest.json 候選路徑（指標優先，之後為安裝根）。
 
     指標 `current-release.json` 的 `dir` 為相對安裝根（`cli.parent.parent`）的 `versions/<V>`（plan 04 Task 17，OD-18 (3)
-    一律正斜線）。讀取端仍接受舊版反斜線指標，先正規化為 `/`。`dir` 為絕對路徑、含 `..`、空段或磁碟代號即拒收，
-    與 launcher（`current_release_manifest_path`）一致，不得讓指標把 manifest 導到 bundle 之外。
-    指標存在但無法解析或不安全即回報錯誤，不得靜默略過。
+    一律正斜線）。讀取端依 Rust launcher 規則拒絕反斜線、絕對路徑、`..`、空段或磁碟代號，
+    不得讓指標把 manifest 導到 bundle 之外。
+    指標存在但無法解析或不安全即回報錯誤，不得靜默略過；在驗證前不得將反斜線正規化成正斜線。
     """
     candidates = [cli.parent.parent / "release-manifest.json"]
     pointer = cli.parent / "current-release.json"
@@ -309,10 +309,9 @@ def _manifest_candidates(cli: Path) -> tuple[list[Path], str | None]:
             return [], "current-release.json 無法解析"
         if not isinstance(value, str):
             return [], "current-release.json 無法解析"
-        raw = value.replace("\\", "/")
-        if not _safe_bundle_relative(raw):
+        if not _safe_bundle_relative(value):
             return [], "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
-        candidates.insert(0, cli.parent.parent.joinpath(*raw.split("/")) / "release-manifest.json")
+        candidates.insert(0, cli.parent.parent.joinpath(*value.split("/")) / "release-manifest.json")
     return candidates, None
 
 

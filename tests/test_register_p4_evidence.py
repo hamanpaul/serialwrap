@@ -832,17 +832,14 @@ def _load_register():
 
 
 def test_manifest_pointer_dir_resolves_from_install_root_not_bin(tmp_path: Path) -> None:
-    """Windows 指標 `dir` 的舊版反斜線寫法（`versions\\<V>`）相對安裝根（cli.parent.parent）解析，不得以 bin\\ 為基準。
-
-    保留為反斜線正規化的回歸案例（讀取端相容舊指標）；現行寫法為正斜線，見 OD-18 (3) 與下方正斜線案例。
-    """
+    """正斜線指標相對安裝根解析；Rust launcher 拒絕的反斜線形式亦須拒收。"""
     register = _load_register()
     root = tmp_path / "install"
     cli = root / "bin" / "serialwrap.exe"
     cli.parent.mkdir(parents=True)
     cli.write_bytes(b"rust-cli")
     (root / "bin" / "current-release.json").write_text(
-        json.dumps({"bundle_version": "0.4.0", "dir": "versions\\0.4.0"}), encoding="utf-8"
+        json.dumps({"bundle_version": "0.4.0", "dir": "versions/0.4.0"}), encoding="utf-8"
     )
 
     candidates, error = register._manifest_candidates(cli)
@@ -851,6 +848,33 @@ def test_manifest_pointer_dir_resolves_from_install_root_not_bin(tmp_path: Path)
     assert candidates[0] == root / "versions" / "0.4.0" / "release-manifest.json"
     assert root / "bin" / "versions" / "0.4.0" / "release-manifest.json" not in candidates
     assert root / "release-manifest.json" in candidates
+
+    (root / "bin" / "current-release.json").write_text(
+        json.dumps({"bundle_version": "0.4.0", "dir": "versions\\0.4.0"}), encoding="utf-8"
+    )
+    candidates, error = register._manifest_candidates(cli)
+    assert candidates == []
+    assert error == "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
+
+
+def test_manifest_pointer_absolute_dir_is_used_as_is(tmp_path: Path) -> None:
+    """保留既有案例 nodeid；絕對 dir 依 Rust launcher／OD-18 (3) 規則拒絕。"""
+    register = _load_register()
+    root = tmp_path / "install"
+    cli = root / "bin" / "serialwrap.exe"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"rust-cli")
+    outside = tmp_path / "outside" / "versions" / "0.4.0"
+    outside.mkdir(parents=True)
+    (outside / "release-manifest.json").write_text("{}", encoding="utf-8")
+    (root / "bin" / "current-release.json").write_text(
+        json.dumps({"bundle_version": "0.4.0", "dir": str(outside)}), encoding="utf-8"
+    )
+
+    candidates, error = register._manifest_candidates(cli)
+
+    assert candidates == []
+    assert error == "current-release.json 的 dir 必須是安全的 bundle 相對路徑"
 
 
 @pytest.mark.parametrize(
@@ -940,7 +964,7 @@ def _windows_bundle_layout(
     commit: str,
     *,
     entry_bytes: bytes | None = None,
-    pointer_dir: str = "versions\\0.4.0",
+    pointer_dir: str = "versions/0.4.0",
 ) -> tuple[Path, Path, Path]:
     """Windows dev bundle 佈局：`bin\\serialwrap.exe` 為 `versions\\<V>\\bin\\serialwrap.exe` 的 byte 複本（無 symlink）。
 
