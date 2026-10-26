@@ -1330,7 +1330,7 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 2. 建立 staging 目錄 `…/Temp/sw-rust-test/<run_id>/`，`run_id = $(date +%y%m%d-%H%M%S)-$$`。
 3. 把 exe 與 `$SW_WIN_EXTRA_FILES` 複製進去。工作目錄**必須**在 Windows 本機磁碟，避免 9P／UNC 改變檔案分享與鎖的語意。
 4. `cd` 到 staging 目錄。
-5. 匯出 `WSLENV=SW_TEST_CAPS:SW_TEST_COM_PAIR:SW_TEST_SEED:RUST_BACKTRACE:RUST_TEST_THREADS:SERIALWRAP_*/u`，並把 `TMP` 與 `TEMP` 設為 staging 內的 `tmp`（以 `/p` 轉換）。
+5. 匯出 `WSLENV=SW_TEST_CAPS:SW_TEST_COM_PAIR:SW_TEST_CONSOLE_PAIR:SW_TEST_SEED:RUST_BACKTRACE:RUST_TEST_THREADS:SERIALWRAP_*/u`，並把 `TMP` 與 `TEMP` 設為 staging 內的 `tmp`（以 `/p` 轉換）。
 6. 以 `timeout ${SW_WIN_TIMEOUT:-900}` 執行 `./<exe>.exe "$@"`，exit code 原樣回傳。
 7. `SW_WIN_KEEP=1` 時保留 staging，否則刪除。
 
@@ -1343,6 +1343,8 @@ A/B 程序照規格 §15.9：先停 A 並確認資源釋放，才啟動 B；兩�
 5. 任何一個 exe 失敗即 exit 1。
 
 **COM pair**：`SW_TEST_COM_PAIR=COMa:COMb`。OD-15：擁有者 host 已通過 Spike 1 基本資格（com0com 3.0.0.0 簽章套件、HVCI 執行中、Secure Boot 關閉；pair `CNCA0=COM20`（DUT-side A，serialwrap 開）／`CNCB0=COM21`（DUT-side B，bridge／測試端開）；全值域 A→B、B→A、COM20 第二次開啟 `ERROR_ACCESS_DENIED`、關閉後重開皆已驗證；證據在擁有者 host 的 `b-log` 下 `rust-refactor/spike1/`），因此在該 host 一律以 `SW_TEST_COM_PAIR=COM20:COM21` 執行 `windows_com` 測試，原「待 Spike 1」的原生 Windows COM handle 證據（OD-08）改為可執行 gate。daemon 必須以 OD-11 隔離實例啟動（`SERIALWRAP_STATE_DIR`／`_RUN_DIR`／`_CONFIG_DIR` 三者明確設定且非預設）並設 `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM20`；由 orchestrator 經 WSL interop 代跑，報告附 Windows build、HVCI 狀態與 pair 對應。Spike 1 剩餘三項（控制線隔離、Console-side pair、peer-close 語意）仍待測，相關案例結果未知前不得預標 PASS。只有擁有者 host 不可用（未提供 `SW_TEST_COM_PAIR`）時，`windows_com` 測試保持 ignored，並在報告中標為「證據不足」，不是 PASS。
+
+**Console-side pair（P6 Task 8，OD-01 選配）**：`SW_TEST_CONSOLE_PAIR=COMa:COMb` 是與 DUT-side `SW_TEST_COM_PAIR` 分開的第二組 com0com pair：`COMa` 由 serialwrap 以 `open_com0com_console` 開成 human console（share mode 0），`COMb` 由測試端模擬 TeraTerm／PuTTY。只供 `crates/sw-pal/tests/console_conformance.rs` 的 `cap_windows_com__console_com0com_*` 使用，win-runner 第 5 步一併轉送；未提供時這些案例保持 ignored 並標「證據不足」。
 
 **Windows 黑箱**：Windows Python 3.12 以 `py -3.12 -m pytest tests/contract_blackbox`，搭配 `SERIALWRAP_CLI_EXE=…\serialwrap.exe`、`SERIALWRAP_DAEMON_EXE=…\serialwrapd.exe`，同樣在 Windows 本機目錄執行。入口腳本為 `scripts/rust/win-blackbox.ps1`，由 P3 建立。
 

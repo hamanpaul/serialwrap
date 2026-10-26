@@ -149,7 +149,7 @@ append_wsl_env() {
   wsl_env="${wsl_env//::/:}"
 }
 
-for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD RUST_BACKTRACE RUST_TEST_THREADS; do
+for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_CONSOLE_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD RUST_BACKTRACE RUST_TEST_THREADS; do
   [[ -v "$name" ]] && append_wsl_env "${name}"
 done
 while IFS= read -r name; do

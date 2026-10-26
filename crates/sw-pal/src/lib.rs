@@ -192,6 +192,7 @@ pub fn native() -> Platform {
         use crate::sysenv::posix::NativeSysEnv;
 
         let env: Arc<dyn SysEnv> = Arc::new(NativeSysEnv);
+        let console_kind = native_console_kind(&*env);
         let clock: Arc<dyn Clock> = Arc::new(NativeClock);
         let fs: Arc<dyn FsOps> = Arc::new(NativeFsOps);
         Platform {
@@ -214,7 +215,7 @@ pub fn native() -> Platform {
             instance_lock: crate::lock::native_instance_lock(),
             wal_fs: Arc::new(crate::wal_fs::NativeWalFs),
             rpc_listen: Arc::new(crate::rpc_transport::NativeRpcListenerFactory),
-            console: Arc::new(crate::console_pty::NativeConsoleFactory),
+            console: Arc::new(crate::console_pty::NativeConsoleFactory::new(console_kind)),
             signals: Arc::new(crate::signal::NativeSignalWait),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Posix,
@@ -224,7 +225,7 @@ pub fn native() -> Platform {
                 text_newline: "\n",
                 exec_replace: true,
                 on_demand_autostart: false,
-                console_kind: ConsoleKind::Pty,
+                console_kind,
                 native_device: DeviceBackendKind::Posix,
                 com0com_console: false,
             },
@@ -243,6 +244,7 @@ pub fn native() -> Platform {
         use crate::sysenv::windows::NativeSysEnv;
 
         let env: Arc<dyn SysEnv> = Arc::new(NativeSysEnv);
+        let console_kind = native_console_kind(&*env);
         let clock: Arc<dyn Clock> = Arc::new(NativeClock);
         let fs: Arc<dyn FsOps> = Arc::new(NativeFsOps);
         Platform {
@@ -265,7 +267,7 @@ pub fn native() -> Platform {
             instance_lock: crate::lock::native_instance_lock(),
             wal_fs: Arc::new(crate::wal_fs::NativeWalFs),
             rpc_listen: Arc::new(crate::rpc_transport::NativeRpcListenerFactory),
-            console: Arc::new(crate::console_pty::NativeConsoleFactory),
+            console: Arc::new(crate::console_pty::NativeConsoleFactory::new(console_kind)),
             signals: Arc::new(crate::signal::NativeSignalWait),
             caps: Capabilities {
                 path_flavor: PalPathFlavor::Windows,
@@ -275,12 +277,23 @@ pub fn native() -> Platform {
                 text_newline: "\r\n",
                 exec_replace: false,
                 on_demand_autostart: true,
-                console_kind: ConsoleKind::TcpTelnet,
+                console_kind,
                 native_device: DeviceBackendKind::Win,
-                com0com_console: false,
+                com0com_console: true,
             },
         }
     }
+}
+
+/// SC-28（07 D-11）：`SERIALWRAP_CONSOLE_BACKEND` 只在此讀取；回 WARNING 時寫 stderr 一行。
+fn native_console_kind(env: &dyn SysEnv) -> ConsoleKind {
+    let raw = env.var("SERIALWRAP_CONSOLE_BACKEND");
+    let (kind, warning) =
+        console_mux::select_console_kind(raw.as_deref(), console_pty::native_has_pty());
+    if let Some(w) = warning {
+        eprintln!("{w}");
+    }
+    kind
 }
 
 /// P3 名稱保留：`native_client()` 與 `native()` 相同（P4-T1 起的 client 組裝點）。

@@ -241,7 +241,7 @@ impl ConsoleIo for PtyMaster {
     fn close(self: Box<Self>) {}
 
     fn mux_handle(&self) -> crate::console_mux::MuxHandle {
-        todo!("P6 Task 8")
+        crate::console_mux::MuxHandle(crate::console_mux::MuxHandleInner::Posix(self.fd))
     }
 }
 
@@ -298,7 +298,7 @@ pub(crate) fn create_pty() -> PalResult<PtyPair> {
             waker,
             slave_path: slave_path.clone(),
         }),
-        slave_keepalive: KeepAlive { _fd: keepalive },
+        slave_keepalive: KeepAlive { _fd: Some(keepalive) },
         slave_ref: PtySlaveRef {
             path: slave_path.clone(),
         },

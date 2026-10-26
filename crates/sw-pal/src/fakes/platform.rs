@@ -56,7 +56,7 @@ pub fn windows_caps() -> Capabilities {
         on_demand_autostart: true,
         console_kind: ConsoleKind::TcpTelnet,
         native_device: DeviceBackendKind::Win,
-        com0com_console: false,
+        com0com_console: true,
     }
 }
 

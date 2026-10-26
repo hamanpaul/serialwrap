@@ -2,7 +2,7 @@
 //! listener 與 waker。POSIX 用 `poll(2)`＋eventfd（非 Linux 用 self-pipe）；Windows 用 `WSAPoll`＋loopback socket pair；
 //! com0com handle 由 PAL 內部 reader thread（有界 channel 64）轉成 mux 事件。
 //!
-//! Task 1 骨架：型別與簽章凍結，函式本體為 `todo!("P6 Task 8")`。
+//! POSIX 本體在 `posix.rs`；Windows 在 `windows.rs`。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +72,16 @@ pub trait ConsoleMux: Send {
 
 /// SC-28（07 D-11）：`SERIALWRAP_CONSOLE_BACKEND` ∈ {auto, pty, tcp}（不分大小寫、strip）。
 /// 回傳選定的 kind 與（`pty` 但平台無 PTY 時的）WARNING 文字。
-pub fn select_console_kind(_env: Option<&str>, _has_pty: bool) -> (ConsoleKind, Option<&'static str>) {
-    todo!("P6 Task 8")
+pub fn select_console_kind(env: Option<&str>, has_pty: bool) -> (ConsoleKind, Option<&'static str>) {
+    let auto = if has_pty { ConsoleKind::Pty } else { ConsoleKind::TcpTelnet };
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("tcp") => (ConsoleKind::TcpTelnet, None),
+        Some("pty") if has_pty => (ConsoleKind::Pty, None),
+        Some("pty") => (ConsoleKind::TcpTelnet, Some(PTY_UNSUPPORTED_WARNING)),
+        // auto／空／未知值。
+        _ => (auto, None),
+    }
 }
+
+/// D-11 WARNING 文字。
+pub const PTY_UNSUPPORTED_WARNING: &str = "SERIALWRAP_CONSOLE_BACKEND=pty 在此平台不支援，改用 tcp";

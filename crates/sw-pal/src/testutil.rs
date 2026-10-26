@@ -1,14 +1,19 @@
-//! console 測試工具（P6 Task 1 骨架；feature `test-fakes`；本體由 Task 8 交付）。
+//! console 測試工具（P6 Task 8；feature `test-fakes`）。
 //! 平台 cfg 只在 sw-pal 內，讓 sw-core／sw-daemon 測試不需自行分支。
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+#[cfg_attr(not(unix), allow(unused_imports))]
+use crate::console_mux::MuxHandleInner;
 use crate::console_pty::{ConsoleIo, ConsoleListener, PtyPair};
-use crate::traits::PalResult;
+use crate::traits::{PalError, PalResult};
+#[cfg(not(unix))]
+use crate::traits::PalErrorKind;
 
 /// `tcgetattr` 的可比較摘要（raw 模式斷言用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_snake_case)]
 pub struct TermiosView {
     pub iflag: u64,
     pub oflag: u64,
@@ -17,46 +22,142 @@ pub struct TermiosView {
     pub vmin: u8,
     pub vtime: u8,
     /// 平台 `CREAD`／`CLOCAL`／`CS8` 位元值（讓斷言不必直接碰 `libc`）。
-    #[allow(non_snake_case)]
     pub CREAD: u64,
-    #[allow(non_snake_case)]
     pub CLOCAL: u64,
-    #[allow(non_snake_case)]
     pub CS8: u64,
 }
 
-pub fn tcgetattr_path(_p: &str) -> PalResult<TermiosView> {
-    todo!("P6 Task 8")
+pub fn tcgetattr_path(p: &str) -> PalResult<TermiosView> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(p)
+            .map_err(crate::traits::posix_io_error)?;
+        // SAFETY: t 為 tcgetattr 輸出位置，fd 在 f 存活期間有效。
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(f.as_raw_fd(), &mut t) } != 0 {
+            return Err(PalError::from_errno(crate::console_mux::posix::errno()));
+        }
+        Ok(TermiosView {
+            iflag: t.c_iflag as u64,
+            oflag: t.c_oflag as u64,
+            cflag: t.c_cflag as u64,
+            lflag: t.c_lflag as u64,
+            vmin: t.c_cc[libc::VMIN],
+            vtime: t.c_cc[libc::VTIME],
+            CREAD: libc::CREAD as u64,
+            CLOCAL: libc::CLOCAL as u64,
+            CS8: libc::CS8 as u64,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Err(PalError::plain(PalErrorKind::Unsupported, format!("tcgetattr 在此平台不支援：{p}")))
+    }
 }
 
-pub fn master_is_nonblocking(_p: &PtyPair) -> bool {
-    todo!("P6 Task 8")
+pub fn master_is_nonblocking(p: &PtyPair) -> bool {
+    match p.master.mux_handle().0 {
+        #[cfg(unix)]
+        MuxHandleInner::Posix(fd) => {
+            // SAFETY: fcntl 不保留指標，fd 由 p.master 保持開啟。
+            let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            fl >= 0 && fl & libc::O_NONBLOCK != 0
+        }
+        _ => false,
+    }
 }
 
-pub fn no_symlink_points_to(_target: &str, _dirs: &[&Path]) -> bool {
-    todo!("P6 Task 8")
+/// `dirs` 內（遞迴）沒有任何 symlink 指向 `target`（D-01：console PTY 不建 symlink）。
+pub fn no_symlink_points_to(target: &str, dirs: &[&Path]) -> bool {
+    fn walk(dir: &Path, target: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return true;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                if let Ok(dest) = std::fs::read_link(&path) {
+                    let dest = if dest.is_absolute() { dest } else { dir.join(dest) };
+                    if dest == target || std::fs::canonicalize(&dest).is_ok_and(|c| c == target) {
+                        return false;
+                    }
+                }
+            } else if meta.is_dir() && !walk(&path, target) {
+                return false;
+            }
+        }
+        true
+    }
+    let target = Path::new(target);
+    dirs.iter().all(|d| walk(d, target))
 }
 
 /// `^/dev/pts/\d+$` 手寫判斷（不引入 regex）。
-pub fn is_dev_pts_path(_p: &str) -> bool {
-    todo!("P6 Task 8")
+pub fn is_dev_pts_path(p: &str) -> bool {
+    p.strip_prefix("/dev/pts/")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-pub fn wait_accept(_l: &mut dyn ConsoleListener, _timeout: Duration) -> (Box<dyn ConsoleIo>, String) {
-    todo!("P6 Task 8")
+pub fn wait_accept(l: &mut dyn ConsoleListener, timeout: Duration) -> (Box<dyn ConsoleIo>, String) {
+    let start = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if let Some(v) = l.accept(remaining).expect("accept") {
+            return v;
+        }
+        assert!(!remaining.is_zero(), "wait_accept：{timeout:?} 內無連線");
+    }
 }
 
-pub fn nodelay(_io: &dyn ConsoleIo) -> bool {
-    todo!("P6 Task 8")
+pub fn nodelay(io: &dyn ConsoleIo) -> bool {
+    match io.mux_handle().0 {
+        #[cfg(unix)]
+        MuxHandleInner::Posix(fd) => {
+            crate::console_tcp::posix::get_int_opt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY).is_some_and(|v| v != 0)
+        }
+        // LOCAL-WINDOWS-TODO（P6 Task 8）：WinSocket 的 getsockopt(TCP_NODELAY)。
+        _ => false,
+    }
 }
 
-pub fn reuseaddr(_l: &dyn ConsoleListener) -> bool {
-    todo!("P6 Task 8")
+pub fn reuseaddr(l: &dyn ConsoleListener) -> bool {
+    match l.mux_handle().0 {
+        #[cfg(unix)]
+        MuxHandleInner::Posix(fd) => {
+            crate::console_tcp::posix::get_int_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR).is_some_and(|v| v != 0)
+        }
+        // LOCAL-WINDOWS-TODO（P6 Task 8）：WinSocket 的 getsockopt(SO_REUSEADDR)。
+        _ => false,
+    }
 }
 
 /// 連線到已關閉 loopback port 的錯誤（`winsock_error_message_format`）。
-pub fn tcp_connect_closed_port_error() -> crate::traits::PalError {
-    todo!("P6 Task 8")
+pub fn tcp_connect_closed_port_error() -> PalError {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 暫用 port");
+        l.local_addr().expect("local_addr").port()
+    };
+    let err = std::net::TcpStream::connect(("127.0.0.1", port)).expect_err("已關閉 port 應拒絕連線");
+    #[cfg(unix)]
+    {
+        crate::traits::posix_io_error(err)
+    }
+    #[cfg(windows)]
+    {
+        match err.raw_os_error() {
+            Some(code) => crate::traits::windows_wsa_error(code),
+            None => PalError::plain(PalErrorKind::Io, err.to_string()),
+        }
+    }
 }
 
 /// com0com console handle 上的設定 API 呼叫計數（SC-29 控制線隔離證據）。
@@ -66,11 +167,12 @@ pub struct CommApiCalls {
     pub escape_comm_function: u32,
 }
 
+/// LOCAL-WINDOWS-TODO（P6 Task 8）：讀 Windows com0com console io 的 API 計數器。
 pub fn comm_api_calls(_io: &dyn ConsoleIo) -> CommApiCalls {
     todo!("P6 Task 8")
 }
 
-/// 對 peer 端（COMb）改 baud 並切換 DTR／RTS。
+/// 對 peer 端（COMb）改 baud 並切換 DTR／RTS。LOCAL-WINDOWS-TODO（P6 Task 8）。
 pub fn toggle_peer_modem_lines(_port: &str) {
     todo!("P6 Task 8")
 }

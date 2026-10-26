@@ -47,6 +47,29 @@ impl PosixProcScan {
     pub fn identity_alive(&self, id: &ProcIdentity) -> bool {
         <Self as ProcScan>::identity_alive(self, id)
     }
+
+    /// 所有外部行程持有的 fd readlink 目標（排除自身 pid）；`proc_root` 不可列舉時回 `None`
+    /// （P6 Task 8；uart_io.py `_enumerate_all_held_paths`：個別 pid／fd 讀取失敗略過）。
+    pub fn held_fd_targets(&self) -> Option<std::collections::HashSet<String>> {
+        let self_pid = std::process::id().to_string();
+        let mut held = std::collections::HashSet::new();
+        for entry in fs::read_dir(&self.proc_root).ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) || name == self_pid {
+                continue;
+            }
+            let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+                continue;
+            };
+            for fd in fds.flatten() {
+                if let Ok(target) = fs::read_link(fd.path()) {
+                    held.insert(target.to_string_lossy().into_owned());
+                }
+            }
+        }
+        Some(held)
+    }
 }
 
 impl ProcScan for PosixProcScan {
