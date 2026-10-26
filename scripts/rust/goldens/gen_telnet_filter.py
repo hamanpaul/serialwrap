@@ -28,6 +28,12 @@ if str(ROOT) not in sys.path:
 
 from sw_core.telnet_console import TelnetFilter  # noqa: E402
 
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from _tsv import write_raw_tsv  # noqa: E402  （raw 四欄寫入器單一來源，parity-amendments-2026-10-26 #182）
+
 SEED = 20261015
 CASES = 2000
 IAC, WILL, WONT, DO, DONT, SB, SE = 0xFF, 0xFB, 0xFC, 0xFD, 0xFE, 0xFA, 0xF0
@@ -58,17 +64,6 @@ def build_rows() -> list[tuple[str, str, str, str]]:
             outs.append(f"{uart.hex()}/{reply.hex()}")
         rows.append((f"tf-{i:04d}", "telnet_feed", ",".join(c.hex() for c in chunks), ",".join(outs)))
     return rows
-
-
-def write_raw_tsv(path: Path, rows: list[tuple[str, str, str, str]]) -> None:
-    seen: set[tuple[str, str]] = set()
-    for case_id, op, _i, _e in rows:
-        if (case_id, op) in seen:
-            raise ValueError(f"golden 列重複：case_id={case_id!r} op={op!r}")
-        seen.add((case_id, op))
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        for row in rows:
-            fh.write("\t".join(row) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
