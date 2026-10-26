@@ -33,6 +33,7 @@ import json
 import os
 import random
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -332,6 +333,23 @@ def _close_lease(lease: OplockLease) -> None:
         _close_handle(lease.event)
 
 
+def _publish_ready_record(ready_file: str | Path, held_files: list[str]) -> None:
+    """先完整寫入同目錄暫存檔，再原子發布首次掃描結果。"""
+    destination = Path(ready_file)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    temp_path = Path(temp_name)
+    try:
+        record = {"ready": True, "held_files": held_files}
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+        os.replace(temp_path, destination)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
                stop_file: str, log_file: str, oplock: bool = False) -> int:
     """Windows helper：監看 WAL 目錄並對新檔套用持有模型，直到逾時或 stop_file 出現。"""
@@ -384,10 +402,7 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
                            "oplock": oplock_result if oplock else OPLOCK_STATUS})
         if not ready_written:
             # ready 是首次掃描完成的確認；既有 WAL 也已在此之前取得 seeded handle。
-            Path(ready_file).write_text(json.dumps({
-                "ready": True,
-                "held_files": sorted({entry.name for entry in holds}),
-            }, sort_keys=True) + "\n", encoding="utf-8")
+            _publish_ready_record(ready_file, sorted({entry.name for entry in holds}))
             ready_written = True
         time.sleep(WATCH_POLL_S)
     for entry in holds:

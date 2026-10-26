@@ -466,6 +466,7 @@ class AvHelper:
         except OSError as exc:
             return self._fail(f"{type(exc).__name__}: {exc}")
         deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
+        ready_error: str | None = None
         while time.monotonic() < deadline:
             if self._ready.exists():
                 try:
@@ -474,17 +475,20 @@ class AvHelper:
                     if (not isinstance(ready, dict) or ready.get("ready") is not True
                             or not isinstance(held_files, list)
                             or any(not isinstance(name, str) for name in held_files)):
-                        return self._fail("helper ready 記錄格式錯誤")
+                        ready_error = "helper ready 記錄格式錯誤"
+                    else:
+                        self._ready_files = frozenset(held_files)
+                        self._payload()["launch_error"] = "none"
+                        self._rec.step(f"av_sim_helper_ready{':' + self._variant if self._variant else ''}", "ok")
+                        return True
                 except (OSError, ValueError, TypeError) as exc:
-                    return self._fail(f"helper ready 記錄無法解析：{type(exc).__name__}")
-                self._ready_files = frozenset(held_files)
-                self._payload()["launch_error"] = "none"
-                self._rec.step(f"av_sim_helper_ready{':' + self._variant if self._variant else ''}", "ok")
-                return True
+                    ready_error = f"helper ready 記錄無法解析：{type(exc).__name__}"
             if self._proc.poll() is not None:
+                if ready_error is not None:
+                    return self._fail(ready_error)
                 return self._fail(f"helper 提前結束（exit={self._proc.returncode}）")
             time.sleep(0.05)
-        return self._fail("helper 就緒逾時")
+        return self._fail(ready_error or "helper 就緒逾時")
 
     def ready_holds(self, name: str) -> bool:
         """首次目錄掃描完成時，確認指定 WAL 檔已取得持有 handle。"""
@@ -521,15 +525,31 @@ class AvHelper:
             "grabs": summary.get("grabs"),
             "open_errors": summary.get("open_errors"),
             "helper_exit": exit_code,
-            "oplock": summary.get("oplock", "unavailable"),
+            "oplock": summary.get("oplock", "unavailable" if self._oplock else "not_requested"),
         })
+
+
+def _start_av_helper_with_wal(
+    wal_dir: Path, rec: Recorder, *, oplock: bool = False, variant: str | None = None,
+) -> AvHelper:
+    """只在現行 WAL 已存在、helper 首次掃描確認持有後回傳。"""
+    if not (wal_dir / "raw.wal.ndjson").is_file():
+        raise RuntimeError("Spike 3 helper 啟動前 WAL 必須先存在")
+    helper = AvHelper(wal_dir, SPIKE3_SEED, rec, oplock=oplock, variant=variant)
+    if not helper.start():
+        helper.stop()
+        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
+    if not helper.ready_holds("raw.wal.ndjson"):
+        helper.stop()
+        raise RuntimeError("av_sim helper 首次掃描未持有 raw.wal.ndjson；不得開始 Spike 3 操作")
+    return helper
 
 
 def _collect_oplock_variant(wal_dir: Path, rec: Recorder) -> bool:
     """在主案例結束後於既有 WAL 檔執行獨立 oplock 變體，結果分開記錄。"""
-    helper = AvHelper(wal_dir, SPIKE3_SEED, rec, oplock=True, variant="oplock")
-    if not helper.start():
-        helper.stop()
+    try:
+        helper = _start_av_helper_with_wal(wal_dir, rec, oplock=True, variant="oplock")
+    except RuntimeError:
         return False
     try:
         # ready 標記先於掃描迴圈；留出多個 5 ms poll 週期讓 helper 實際開啟現存 WAL。
@@ -576,19 +596,21 @@ def case_rotate(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
 
     wal_dir = _work_dir("win-wal-av-rotate")
     rec.observations["wal_dir"] = str(wal_dir)
-    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
-    if not helper.start():
-        helper.stop()
-        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
+    helper: AvHelper | None = None
     try:
-        for _ in range(ROTATE_CASE_RECORDS):
+        # WalWriter 延遲開檔；先建立現行 WAL，再確認 helper 已持有後才開始輪替壓力。
+        writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
+        rec.step("prefill_create_resident_wal", "ok")
+        helper = _start_av_helper_with_wal(wal_dir, rec)
+        for _ in range(ROTATE_CASE_RECORDS - 1):
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
         _drain_writer(writer, rec)
         rec.step("append_until_rotate_under_av_hold", "ok")
     finally:
         writer.close()
-        helper.stop()
+        if helper is not None:
+            helper.stop()
     health = writer.health()
     archives = [p for p in glob.glob(str(wal_dir / "raw.wal.ndjson*")) if not p.endswith("raw.wal.ndjson")]
     records = _read_records(wal_dir)
@@ -638,11 +660,7 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
             writer.append(com="COM0", direction="TX", source="spike3", payload=RECORD_PAYLOAD, cmd_id="spike3")
         rec.step("prefill", "ok")
         # 先建立 WAL，再啟動 helper；ready 只在首次掃描完成後寫入，並帶回已持有檔名。
-        helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
-        if not helper.start():
-            raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
-        if not helper.ready_holds("raw.wal.ndjson"):
-            raise RuntimeError("av_sim helper 首次掃描未持有 raw.wal.ndjson；不得執行外部 unlink")
+        helper = _start_av_helper_with_wal(wal_dir, rec)
         wal_path = str(wal_dir / "raw.wal.ndjson")
         # 防毒持有期間外部 unlink 會因共用違規失敗；有界重試直到成功（unlink 須最終完成）。
         unlink_error: str | None = None
@@ -720,11 +738,8 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
     wal_dir = _work_dir("win-wal-av-reader-handle")
     rec.observations["wal_dir"] = str(wal_dir)
     wal_path = str(wal_dir / "raw.wal.ndjson")
-    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
-    if not helper.start():
-        helper.stop()
-        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
+    helper: AvHelper | None = None
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
         wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
@@ -748,6 +763,7 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
         writer.append(com="COM0", direction="TX", source="spike3", payload=b"prefill", cmd_id="spike3-prefill")
         appended += 1
         rec.step("prefill_create_resident_wal", "ok")
+        helper = _start_av_helper_with_wal(wal_dir, rec)
         reader = kernel32.CreateFileW(wal_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                       None, OPEN_EXISTING, 0, None)
         if reader in (None, invalid_handle):
@@ -768,7 +784,8 @@ def case_reader_handle(rec: Recorder, args: argparse.Namespace) -> tuple[str, st
             write_failures = int(health.get("write_failures", -1))
         finally:
             writer.close()
-            helper.stop()
+            if helper is not None:
+                helper.stop()
     records = _read_records(wal_dir)
     seqs = _seqs(records)
     continuity_meta_count = _continuity_meta_count(records)
@@ -804,15 +821,13 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
     marker_pre = b"SPIKE3-F12-MARKER-PRE"
     marker_post = b"SPIKE3-F12-MARKER-POST"
     wal_path = str(wal_dir / "raw.wal.ndjson")
-    helper = AvHelper(wal_dir, SPIKE3_SEED, rec)
-    if not helper.start():
-        helper.stop()
-        raise RuntimeError(f"av_sim helper 無法啟動：{helper.launch_error}")
     writer = _MeasuredWalWriter(WalWriter(wal_dir=str(wal_dir), rotate_bytes=SMALL_ROTATE_BYTES), rec)
+    helper: AvHelper | None = None
     res_pre = res_post = None
     try:
-        # 常駐 writer 不關閉：先寫一筆使檔案與 handle 存在，再以外部游標讀取（與 F12 實機路徑相同）。
+        # 先建立現行 WAL，再確認 helper 持有；常駐 writer 後續維持開啟供 F12 游標讀取。
         writer.append(com="COM0", direction="TX", source="spike3", payload=b"prefill", cmd_id="spike3-f12-prefill")
+        helper = _start_av_helper_with_wal(wal_dir, rec)
         cursor = wal_oracle.open_cursor(wal_path)
         rec.step("open_cursor_while_writer_resident", "ok")
         writer.append(com="COM0", direction="TX", source="spike3", payload=marker_pre, cmd_id="spike3-f12")
@@ -826,7 +841,8 @@ def case_f12_progress(rec: Recorder, args: argparse.Namespace) -> tuple[str, str
         _drain_writer(writer, rec)
     finally:
         writer.close()
-        helper.stop()
+        if helper is not None:
+            helper.stop()
     records = _read_records(wal_dir)
     seqs = _seqs(records)
     continuity_meta_count = _continuity_meta_count(records)
@@ -943,7 +959,19 @@ def run_case(args: argparse.Namespace) -> int:
         "verdict": verdict,
         "fallback": fallback,
     }
-    _validate(evidence)
+    try:
+        _validate(evidence)
+    except Exception as exc:  # noqa: BLE001 - schema 錯誤也須留下不通過的診斷證據
+        import jsonschema
+
+        if not isinstance(exc, jsonschema.ValidationError):
+            raise
+        verdict = "INSUFFICIENT_EVIDENCE"
+        fallback = "證據 schema 驗證失敗；檢視 observations.evidence_validation_error 後重跑"
+        code = 1
+        evidence["verdict"] = verdict
+        evidence["fallback"] = fallback
+        evidence.setdefault("observations", {})["evidence_validation_error"] = str(exc)
     out_dir = Path(args.evidence_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{case_id}.json").write_text(

@@ -80,6 +80,22 @@ def _read_all_rows(wal_dir: Path) -> list[dict]:
     return sorted(rows, key=lambda r: int(r["seq"]))
 
 
+def _wait_ready_record(path: Path, timeout_s: float) -> dict[str, Any]:
+    """ready 檔可見但內容尚未完成時重試至期限，避免把短暫解析競態當成證據不足。"""
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(record, dict) and record.get("ready") is True:
+                return record
+            last_error = ValueError("ready 記錄格式錯誤")
+        except (OSError, ValueError, TypeError) as exc:
+            last_error = exc
+        time.sleep(0.01)
+    raise AssertionError(f"ready 記錄未於期限內完成：{last_error}")
+
+
 # OD-19（tick 補寫連續性 META）：延後輪替於無新寫入的 tick 內完成時，會寫入一筆 WAL_ROTATED_AFTER_DEFERRAL META，
 # 其佔用一個 seq。資料記錄數＝總 seq 數扣除此類 META；seq 仍必須無缺號（不遺失、不重複）。
 _CONTINUITY_META = "WAL_ROTATED_AFTER_DEFERRAL"
@@ -278,6 +294,9 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             self.rec.observations["av_sim"]["variants"][self.variant]["launch_error"] = "none"
             return True
 
+        def ready_holds(self, name):
+            return name == "raw.wal.ndjson"
+
         def stop(self):
             self.rec.observations["av_sim"]["variants"][self.variant].update(
                 {"grabs": 1, "helper_exit": 0, "oplock": "granted"}
@@ -285,6 +304,7 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
 
     monkeypatch.setattr(module, "AvHelper", StubHelper)
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
     assert module._collect_oplock_variant(tmp_path, recorder) is True
     assert recorder.observations["av_sim"]["variants"]["oplock"]["share_mode"] == (
         "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"
@@ -371,11 +391,7 @@ def test_native_av_sim_helper_holds_wal_and_writer_completes(tmp_path):
          "--log-file", str(log)]
     )
     try:
-        deadline = time.monotonic() + 10.0
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert ready.exists(), "av_sim helper 未就緒（啟動被拒或逾時）"
-        ready_record = json.loads(ready.read_text(encoding="utf-8"))
+        ready_record = _wait_ready_record(ready, 10.0)
         assert "raw.wal.ndjson" in ready_record.get("held_files", []), (
             "ready 必須表示首次目錄掃描已實際持有啟動前存在的 WAL"
         )
@@ -430,10 +446,7 @@ def test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live(tmp_pat
     )
     writer = None
     try:
-        deadline = time.monotonic() + 10.0
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert ready.exists(), "oplock helper 未就緒"
+        _wait_ready_record(ready, 10.0)
         writer = WalWriter(wal_dir=str(wal_dir), rotate_bytes=8192, fs=WindowsWalFs())
         samples_ms: list[float] = []
         _timed_append(writer, samples_ms, com="COM0", direction="TX", source="av_sim_oplock", payload=b"first")
@@ -496,6 +509,167 @@ def test_spike3_measured_writer_records_append_latency(monkeypatch):
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_spike3_main_helper_start_failure_records_not_requested_oplock(tmp_path):
+    """主 helper 啟動失敗時仍須符合 schema 的 not_requested oplock 欄位。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_helper_failure_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    rec = module.Recorder()
+    helper = module.AvHelper(tmp_path, module.SPIKE3_SEED, rec)
+    helper._fail("PermissionError: helper launch refused")
+
+    helper.stop()
+
+    assert rec.observations["av_sim"]["oplock"] == "not_requested"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_writes_insufficient_evidence_when_schema_validation_fails(monkeypatch, tmp_path):
+    """證據 schema 驗證異常須留下 INSUFFICIENT_EVIDENCE 檔供診斷。"""
+    import importlib.util
+    import jsonschema
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_validation_failure_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def fail_validation(_evidence):
+        raise jsonschema.ValidationError("injected schema failure")
+
+    monkeypatch.setattr(module, "_validate", fail_validation)
+    evidence_dir = tmp_path / "evidence"
+    rc = module.run_case(module.argparse.Namespace(
+        case=module.CASE_IDS[0], evidence_dir=str(evidence_dir), unlink_mode="classic",
+    ))
+
+    evidence = json.loads((evidence_dir / f"{module.CASE_IDS[0]}.json").read_text(encoding="utf-8"))
+    assert rc != 0
+    assert evidence["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert "injected schema failure" in evidence["observations"]["evidence_validation_error"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_helper_retries_until_partial_ready_record_is_complete(monkeypatch, tmp_path):
+    """ready 檔短暫可見但尚未完整時，consumer 應重試而非立即拒絕。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_partial_ready_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    rec = module.Recorder()
+    helper = module.AvHelper(tmp_path, module.SPIKE3_SEED, rec)
+    helper._ready.write_text("{", encoding="utf-8")
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda _argv: FakeProcess())
+    original_sleep = module.time.sleep
+    published = False
+
+    def publish_complete_record(delay):
+        nonlocal published
+        if not published:
+            published = True
+            helper._ready.write_text(json.dumps({
+                "ready": True, "held_files": ["raw.wal.ndjson"],
+            }), encoding="utf-8")
+        original_sleep(min(delay, 0.001))
+
+    monkeypatch.setattr(module.time, "sleep", publish_complete_record)
+    assert helper.start()
+    assert helper.ready_holds("raw.wal.ndjson")
+    helper.stop()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_av_sim_ready_record_uses_atomic_replace(monkeypatch, tmp_path):
+    """ready JSON 先完整寫入同目錄暫存檔，再以 replace 發布。"""
+    av = _av()
+    ready = tmp_path / "ready.flag"
+    replace = av.os.replace
+    published: list[tuple[Path, Path]] = []
+
+    def checked_replace(source, destination):
+        source_path, destination_path = Path(source), Path(destination)
+        assert source_path.parent == destination_path.parent == tmp_path
+        assert json.loads(source_path.read_text(encoding="utf-8")) == {
+            "ready": True, "held_files": ["raw.wal.ndjson"],
+        }
+        assert not destination_path.exists()
+        published.append((source_path, destination_path))
+        replace(source, destination)
+
+    monkeypatch.setattr(av.os, "replace", checked_replace)
+    av._publish_ready_record(ready, ["raw.wal.ndjson"])
+
+    assert len(published) == 1
+    assert json.loads(ready.read_text(encoding="utf-8"))["ready"] is True
+    assert not published[0][0].exists()
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_spike3_helper_requires_existing_wal_and_confirmed_handle(monkeypatch, tmp_path):
+    """Spike 3 helper 僅能在 WAL 已存在且 ready 確認持有後回傳。"""
+    import importlib.util
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_helper_barrier_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    events: list[tuple[str, bool]] = []
+
+    class FakeHelper:
+        def __init__(self, wal_dir, _seed, _rec, *, oplock=False, variant=None):
+            self.wal_path = Path(wal_dir) / "raw.wal.ndjson"
+            events.append(("constructed", self.wal_path.is_file()))
+
+        def start(self):
+            events.append(("start", self.wal_path.is_file()))
+            return True
+
+        def ready_holds(self, name):
+            events.append(("ready_holds", name == "raw.wal.ndjson" and self.wal_path.is_file()))
+            return self.wal_path.is_file() and name == "raw.wal.ndjson"
+
+        def stop(self):
+            events.append(("stop", self.wal_path.is_file()))
+
+    monkeypatch.setattr(module, "AvHelper", FakeHelper)
+    rec = module.Recorder()
+    with pytest.raises(RuntimeError, match="WAL 必須先存在"):
+        module._start_av_helper_with_wal(tmp_path, rec)
+    assert events == []
+
+    (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
+    helper = module._start_av_helper_with_wal(tmp_path, rec)
+    assert isinstance(helper, FakeHelper)
+    assert events == [
+        ("constructed", True), ("start", True), ("ready_holds", True),
+    ]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 @pytest.mark.parametrize("sharing_violation_first", [False, True])
 def test_spike3_unlink_verdict_requires_observed_sharing_violation(
     monkeypatch, tmp_path, sharing_violation_first: bool
@@ -513,7 +687,7 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
     events: list[tuple[str, int]] = []
 
     class FakeHelper:
-        def __init__(self, _wal_dir, _seed, rec):
+        def __init__(self, _wal_dir, _seed, rec, *, oplock=False, variant=None):
             self.rec = rec
 
         def start(self):
@@ -528,11 +702,13 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
             self.rec.observations["av_sim"].update({"helper_exit": 0, "oplock": "granted"})
 
     class FakeWriter:
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
             self.calls = 0
+            self.wal_path = Path(kwargs["wal_dir"]) / "raw.wal.ndjson"
 
         def append(self, **_kwargs):
             self.calls += 1
+            self.wal_path.touch(exist_ok=True)
             events.append(("append", self.calls))
             return {"seq": self.calls}
 
