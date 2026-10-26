@@ -440,10 +440,13 @@ raise SystemExit(0 if qualified else 1)
         if ($copyAttempt -lt 3) { Start-Sleep -Milliseconds 500 }
     }
     $copyOk = ($copyErrors.Count -eq 0)
+    # raw selftest 成功即可執行診斷；qualification（含核准 tree）仍由 status 單獨決定。
+    $diagnosticReady = ($exitStatusKnown -and $selftestExit -eq 0 -and $report -and $report.verdict -eq 'PASS' -and $report.complete -eq $true)
     $status = if (-not $ok) { if ($report) { 'FAIL' } else { 'EVIDENCE-INSUFFICIENT' } } elseif ($copyOk) { 'PASS' } else { 'EVIDENCE-INSUFFICIENT' }
     $reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $exitStatusKnown) { 'S0 selftest 行程 ExitCode 不可得（null），視為失敗' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } elseif (-not $copyOk) { 'S0 selftest 報告已產生，但回寫 OutDir 證據不完整：' + ($copyErrors -join '；') } else { $null }
     return [ordered]@{
         status = $status
+        diagnostic_ready = $diagnosticReady
         exit = $selftestExit
         exit_status_known = $exitStatusKnown
         qualification_exit = $qualifiedExit
@@ -1002,7 +1005,7 @@ try {
     $releaseCheck = Confirm-BlackboxRelease $stagingRepo $scratchRoot $baselineListeners
     Write-Json (Join-Path $outputRoot 'release-check.json') $releaseCheck
     if ($releaseCheck.ok) {
-        if ($ComPair -and $selftest -and $selftest.status -ne 'FAIL') {
+        if ($ComPair -and $selftest -and $selftest.diagnostic_ready) {
             try {
                 $bridge = Start-WindowsComBridge $stagingRepo $scratchRoot $outputRoot $ComPair $runId
                 $comSequence = Invoke-WindowsComSequence $stagingRepo $scratchRoot $outputRoot `
@@ -1027,7 +1030,7 @@ try {
         $activePair = $null
         $activeWire = $null
         $pidLog = $null
-        if ($ComPair -and $selftest -and $selftest.status -ne 'FAIL' -and $bridge) {
+        if ($ComPair -and $selftest -and $selftest.diagnostic_ready -and $bridge) {
             $activePair = $ComPair
             $activeWire = $bridge.wire
             $pidLog = Join-Path $outputRoot 'b.pids'

@@ -448,7 +448,7 @@ def test_windows_selftest_out_is_local_scratch_with_verified_copy_back():
     assert "Get-Sha256 $file.FullName" in code and "Get-Sha256 $copied" in code
     assert "$copyOk = ($copyErrors.Count -eq 0)" in code
 
-    # 3. 資格判定不變：判定行、verify 腳本與 is_qualified 呼叫維持原樣；回寫只會使證據不足，不會放行。
+    # 3. 資格判定不變：verify 腳本與 is_qualified 呼叫維持原樣；回寫只會使證據不足，不會放行。
     assert "$ok = ($exitStatusKnown -and $selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')" in code
     assert "& py -3.12 $verifyScript $reportPath" in code
     assert "is_qualified(" in ps1
@@ -463,6 +463,35 @@ def test_windows_selftest_out_is_local_scratch_with_verified_copy_back():
     assert "selftest_paths = if ($selftest)" in ps1
     assert "local_out = $selftest.local_out" in ps1 and "evidence_copy = $selftest.evidence_copy" in ps1
 
+
+def test_windows_com_diagnostics_run_after_raw_pass_without_qualification():
+    """raw selftest PASS 可啟動診斷，但 bridge qualification 仍是最終 PASS 必要條件。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    selftest = _ps_function(ps1, "Invoke-BridgeSelftest")
+
+    diagnostic = re.search(r"\$diagnosticReady = ([^\r\n]+)", selftest)
+    assert diagnostic, "selftest 應分開輸出 raw 診斷可執行狀態與 qualification status"
+    assert "$exitStatusKnown" in diagnostic.group(1)
+    assert "$selftestExit -eq 0" in diagnostic.group(1)
+    assert "$report.verdict -eq 'PASS'" in diagnostic.group(1)
+    assert "$report.complete -eq $true" in diagnostic.group(1)
+    assert "$qualifiedExit" not in diagnostic.group(1), "revision qualification 不得阻止診斷案例執行"
+    assert "diagnostic_ready = $diagnosticReady" in selftest
+
+    assert "$selftest.diagnostic_ready" in ps1, "raw PASS 時應執行 COM bridge 與 B 輪診斷案例"
+    assert "elseif (-not $selftest -or $selftest.status -ne 'PASS' -or" in ps1, (
+        "qualification 未通過時不得把診斷執行結果提升為 COM PASS"
+    )
+
+
+def test_windows_com_autostart_case_supplies_release_manifest():
+    """隔離 fixture 會清除 SERIALWRAP_*；Windows Rust autostart 須明確傳入 staging bundle manifest。"""
+    case_file = ROOT / "tests/contract_blackbox/test_cli_mgmt_daemon.py"
+    source = case_file.read_text(encoding="utf-8")
+    body = source.split("def test_autostart_l15_tx_once(", 1)[1]
+    assert "bundle_manifest_path(" in body
+    assert 'env["SERIALWRAP_RELEASE_MANIFEST"]' in body
+    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("run_cli([\"cmd\", \"submit\"")
 
 def test_windows_selftest_writeback_retries_and_compares_both_logs():
     """F8：selftest 回寫最多 3 次有界重試；stdout／stderr 兩份 log 併入 SHA256 逐檔比對（不一致只使證據不足）。"""

@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from bb_l15 import bundle_manifest_path
 from bb_harness import cli_prefix, is_rust, python_baseline_prefix, repo_root, run_cli
 
 FAKE_SERIALWRAPD = repo_root() / "tests" / "contract_blackbox" / "bin" / "fake-serialwrapd"
@@ -253,6 +254,13 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
     """
     if os.name != "nt":
         pytest.skip("windows_native：僅原生 Windows 執行")
+    if is_rust():
+        bundle_root = os.environ.get("SW_WIN_DEV_BUNDLE")
+        assert bundle_root, "Windows Rust COM 案例需要隔離 staging bundle"
+        manifest = bundle_manifest_path(Path(bundle_root))
+        assert manifest.is_file(), f"Windows Rust COM bundle manifest 不存在：{manifest}"
+        # env fixture 清除外層 SERIALWRAP_*；明確傳入測試 bundle，避免誤查宿主安裝目錄。
+        env["SERIALWRAP_RELEASE_MANIFEST"] = str(manifest)
     com_pair = os.environ.get("SW_TEST_COM_PAIR")
     if not com_pair:
         pytest.skip("BLOCKED-OWNER：需 SW_TEST_COM_PAIR（OD-08／OD-15 擁有者 host 的 com0com 配對）")
