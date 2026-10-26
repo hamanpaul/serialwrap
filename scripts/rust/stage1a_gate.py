@@ -1249,7 +1249,7 @@ def judge_stage1a(
 
                 if subfolder == "cargo":
                     cargo_provenance = _cargo_provenance_errors(rep, head)
-                    if cargo_provenance:
+                    if cargo_provenance and verdict != "FAIL":
                         verdict = "evidence-insufficient"
                         reasons.extend(cargo_provenance)
 

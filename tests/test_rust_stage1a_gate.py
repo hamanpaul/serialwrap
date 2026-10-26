@@ -240,6 +240,7 @@ class GateTree:
         self.coverage: dict[str, Any] | None = _synthetic_coverage()
         self.l1_lock = _l1_lock()
         self.l1_reports = _default_l1_reports()
+        self.auto_cargo_provenance = True
         self.ab_report: dict[str, Any] | None = {
             "result": "pass",
             "errors": [],
@@ -285,7 +286,7 @@ class GateTree:
         out = self.root / "out"
         out.mkdir(parents=True, exist_ok=True)
         for (platform, kind), rep in self.l1_reports.items():
-            if kind == "cargo" and "provenance" not in rep:
+            if kind == "cargo" and self.auto_cargo_provenance and "provenance" not in rep:
                 rep["provenance"] = {
                     "schema": "cargo-l1-provenance.v1",
                     "git": {
@@ -766,6 +767,44 @@ def test_l1_cargo_provenance_head_and_clean_tree_are_required(tree):
         row = _l1_row(gate_report, "s1a_cargo", "linux")
         assert row["verdict"] == "evidence-insufficient", row
         assert gate_report["overall"] == "FAIL"
+
+
+@pytest.mark.parametrize("damage", ["missing", "schema", "git_end"])
+def test_l1_cargo_missing_or_malformed_provenance_is_rejected(tree, damage):
+    """Cargo provenance 缺漏、schema 錯誤或缺少結束狀態時，均不得被 fixture 自動補成有效證據。"""
+    tree.write()
+    report = tree.l1_reports[("linux", "cargo")]
+    tree.auto_cargo_provenance = False
+    report.pop("provenance", None)
+    if damage != "missing":
+        report["provenance"] = {
+            "schema": "cargo-l1-provenance.v1" if damage == "git_end" else "wrong-schema",
+            "git": {"head": tree.head, "clean": True,
+                    "end": {"head": tree.head, "clean": True}},
+        }
+        if damage == "git_end":
+            report["provenance"]["git"].pop("end")
+
+    _, gate_report = tree.run()
+    row = _l1_row(gate_report, "s1a_cargo", "linux")
+    assert row["verdict"] == "evidence-insufficient", row
+    assert gate_report["overall"] == "FAIL"
+
+
+def test_l1_cargo_provenance_does_not_overwrite_a_real_fail(tree):
+    """provenance 缺漏只能補強不足判定，不得把 Cargo 的真實 FAIL 改成 evidence-insufficient。"""
+    tree.write()
+    report = tree.l1_reports[("linux", "cargo")]
+    tree.auto_cargo_provenance = False
+    report.pop("provenance", None)
+    report["results"][0]["outcome"] = "failed"
+    report["counts"]["all"]["failed"] = 1
+    report["exit_code"] = 1
+
+    _, gate_report = tree.run()
+    row = _l1_row(gate_report, "s1a_cargo", "linux")
+    assert row["verdict"] == "FAIL", row
+    assert gate_report["overall"] == "FAIL"
 
 
 def test_l1_delegation_judged_from_blackbox_report(tree):
