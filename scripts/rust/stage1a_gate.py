@@ -436,7 +436,7 @@ def _windows_com_verdict(evidence_dir: Path) -> tuple[str, list[str]]:
     return ("PASS" if not reasons else "evidence-insufficient"), reasons
 
 
-def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any]) -> list[str]:
+def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any], av: Any) -> list[str]:
     """驗證各 Spike 3 案例的必要觀察，避免 verdict 或通用摘要欄位單獨放行。"""
     if not isinstance(observations, dict):
         return ["spike3 observations 非物件"]
@@ -514,6 +514,14 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
     if not isinstance(oplock_workload, dict):
         reasons.append("observations.oplock_variant 缺少獨立 append／rotate／F12 workload")
     else:
+        helper_variant = (av.get("variants") or {}).get("oplock") if isinstance(av, dict) else None
+        if not isinstance(helper_variant, dict):
+            reasons.append("av_sim.variants.oplock 缺少 helper 原始 lease／break 證據")
+        else:
+            if helper_variant.get("lease_request_id") != oplock_workload.get("lease_request_id"):
+                reasons.append("observations.oplock_variant.lease_request_id 與 av_sim helper 記錄不一致")
+            if helper_variant.get("oplock_breaks") != oplock_workload.get("oplock_breaks"):
+                reasons.append("observations.oplock_variant.oplock_breaks 與 av_sim helper 原始記錄不一致")
         variant_count = oplock_workload.get("append_count")
         variant_samples = oplock_workload.get("append_latency_ms")
         if not isinstance(variant_count, int) or isinstance(variant_count, bool) or variant_count < 1:
@@ -640,26 +648,35 @@ def _spike3_observation_reasons(cid: str, observations: Any, samples: list[Any])
             else:
                 break_row = matching_breaks[0]
                 break_notified_ns = break_row.get("break_notified_ns")
+                close_started_ns = break_row.get("close_started_ns")
+                close_completed_ns = break_row.get("close_completed_ns")
+                close_succeeded = break_row.get("close_succeeded")
                 acknowledged_ns = break_row.get("acknowledged_ns")
                 break_times = (
                     break_row.get("lease_acquired_ns"), break_row.get("lease_until_ns"),
-                    break_notified_ns, acknowledged_ns,
+                    break_notified_ns, close_started_ns, close_completed_ns, acknowledged_ns,
                 )
                 if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
                        for value in break_times):
                     reasons.append("oplock break／ACK 時間戳須為非負單調時鐘整數")
                 else:
-                    break_acquired_ns, break_until_ns, notified_ns, ack_ns = break_times
+                    (break_acquired_ns, break_until_ns, notified_ns, close_start_ns,
+                     close_end_ns, ack_ns) = break_times
                     if (break_row.get("event") != "oplock_break"
                             or break_row.get("name") != "raw.wal.ndjson"
                             or break_row.get("break_completed") is not True
                             or break_row.get("ack_required") is not True
-                            or break_row.get("ack_method") != "close_handle"):
+                            or break_row.get("ack_method") != "close_handle"
+                            or close_succeeded is not True):
                         reasons.append("oplock break 必須是實際完成且需要以關閉 handle 隱含 ACK 的記錄")
                     if (break_acquired_ns != acquired_ns or break_until_ns != until_ns
-                            or not requested_ns <= notified_ns <= ack_ns
-                            or not until_ns <= ack_ns <= completed_ns):
-                        reasons.append("oplock break 通知／close ACK 須關聯同一 lease 並落在 rotation 完成區間")
+                            or not requested_ns <= notified_ns < until_ns
+                            or not notified_ns <= close_start_ns
+                            or close_start_ns < until_ns or close_end_ns < close_start_ns
+                            or ack_ns != close_end_ns or completed_ns < close_start_ns):
+                        reasons.append(
+                            "oplock break 須在同一 lease 內通知；CloseHandle ACK 區間須覆蓋到期後的 rotation 完成"
+                        )
 
     if cid == "win-wal-av-rotate":
         expected = int_at_least("expected_records", 1)
@@ -879,7 +896,7 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
         return "evidence-insufficient", [
             f"spike3 append_count={append_count} 與 append_latency_ms 樣本數 {len(samples)} 不符"
         ]
-    observation_reasons = _spike3_observation_reasons(cid, observations, samples)
+    observation_reasons = _spike3_observation_reasons(cid, observations, samples, av)
     if observation_reasons:
         return "evidence-insufficient", observation_reasons
     oplock_samples = observations["oplock_variant"]["append_latency_ms"]

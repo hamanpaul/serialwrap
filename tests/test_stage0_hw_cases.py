@@ -422,7 +422,11 @@ def test_spike3_evidence_schema_rejects_missing_edr():
     base = {
         "case_id": "win-wal-av-rotate",
         "run_at": "2026-10-16T12:00:00Z",
-        "env": {"os": "windows"},
+        "env": {
+            "os": "windows", "timing_method": "time.perf_counter_ns",
+            "timing_clock": "QueryPerformanceCounter", "timing_resolution_ns": 100,
+            "timing_monotonic": True, "timing_adjustable": False,
+        },
         "artifact": {"binary": "sw-core.exe"},
         "steps": [{"op": "rotate", "ts": "2026-10-16T12:00:01Z", "result": "ok"}],
         "observations": {
@@ -441,7 +445,8 @@ def test_spike3_evidence_schema_rejects_missing_edr():
                     "lease_acquired_ns": 1, "lease_until_ns": 4,
                     "break_notified_ns": 4, "break_completed": True,
                     "ack_required": True, "ack_method": "close_handle",
-                    "acknowledged_ns": 5, "observation_error": None,
+                    "close_started_ns": 5, "close_completed_ns": 6, "close_succeeded": True,
+                    "acknowledged_ns": 6, "observation_error": None,
                 }],
                 "rotation_attempt_count": 1, "rotation_request_succeeded": True,
                 "lease_acquired_ns": 1, "stimulus_started_ns": 2,
@@ -467,7 +472,8 @@ def test_spike3_evidence_schema_rejects_missing_edr():
                                "name": "raw.wal.ndjson", "lease_acquired_ns": 1, "lease_until_ns": 4,
                                "break_notified_ns": 4, "break_completed": True,
                                "ack_required": True, "ack_method": "close_handle",
-                               "acknowledged_ns": 5, "observation_error": None,
+                               "close_started_ns": 5, "close_completed_ns": 6, "close_succeeded": True,
+                               "acknowledged_ns": 6, "observation_error": None,
                            }
                        ],
                    }}},
@@ -495,6 +501,18 @@ def test_spike3_evidence_schema_rejects_missing_edr():
     without_integrity = {k: v for k, v in base.items() if k != "binary_integrity"}
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=without_integrity, schema=schema)
+    without_clock_method = json.loads(json.dumps(base))
+    without_clock_method["env"].pop("timing_method")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_clock_method, schema=schema)
+    coarse_clock = json.loads(json.dumps(base))
+    coarse_clock["env"]["timing_resolution_ns"] = 15_625_000
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=coarse_clock, schema=schema)
+    without_close_interval = json.loads(json.dumps(base))
+    without_close_interval["observations"]["oplock_variant"]["oplock_breaks"][0].pop("close_started_ns")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_close_interval, schema=schema)
     for field in (
         "append_count", "append_latency_ms", "archives", "records", "continuity_meta_count",
         "first_seq", "last_seq", "seq_continuous", "rotate_retry", "deferred_delete_pending",

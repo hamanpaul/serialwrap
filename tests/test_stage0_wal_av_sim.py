@@ -302,20 +302,23 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             return name == "raw.wal.ndjson"
 
         def arm_hold(self, _name):
-            self.lease_acquired_ns = time.monotonic_ns()
+            self.lease_acquired_ns = time.perf_counter_ns()
             self.lease_until_ns = self.lease_acquired_ns + 50_000_000
             self.lease_request_id = "stub-oplock-lease"
             self.rec.observations["av_sim"]["variants"][self.variant]["lease_request_id"] = self.lease_request_id
             return True
 
         def stop(self):
+            close_completed_ns = time.perf_counter_ns()
             self.rec.observations["av_sim"]["variants"][self.variant].update(
                 {"grabs": 1, "helper_exit": 0, "oplock": "granted", "oplock_breaks": [{
                     "event": "oplock_break", "request_id": self.lease_request_id, "name": "raw.wal.ndjson",
                     "lease_acquired_ns": self.lease_acquired_ns, "lease_until_ns": self.lease_until_ns,
                     "break_notified_ns": self.lease_acquired_ns + 25_000_000,
                     "break_completed": True, "ack_required": True,
-                    "ack_method": "close_handle", "acknowledged_ns": self.lease_until_ns + 1,
+                    "ack_method": "close_handle", "close_started_ns": self.lease_until_ns,
+                    "close_completed_ns": close_completed_ns, "close_succeeded": True,
+                    "acknowledged_ns": close_completed_ns,
                 }]}
             )
 
@@ -360,7 +363,7 @@ def test_spike3_oplock_variant_runs_append_rotation_and_f12(monkeypatch, tmp_pat
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
-@pytest.mark.parametrize("failure_point", ["drain", "close"])
+@pytest.mark.parametrize("failure_point", ["drain", "close", "break-after-expiry"])
 def test_spike3_oplock_variant_failures_write_evidence(monkeypatch, tmp_path, failure_point):
     _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point)
 
@@ -435,20 +438,26 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
 
         def arm_hold(self, _name):
             events.append(("helper_rearm", 0))
-            self.lease_acquired_ns = time.monotonic_ns()
-            self.lease_until_ns = self.lease_acquired_ns + 10_000_000
+            self.lease_acquired_ns = time.perf_counter_ns()
+            hold_ns = 500_000_000 if failure_point == "break-after-expiry" else 10_000_000
+            self.lease_until_ns = self.lease_acquired_ns + hold_ns
             self.lease_request_id = "fake-oplock-lease"
             self.rec.observations["av_sim"]["variants"][self.variant]["lease_request_id"] = self.lease_request_id
             return True
 
         def stop(self):
+            close_started_ns = self.lease_until_ns + 2 if failure_point == "break-after-expiry" else self.lease_until_ns
+            close_completed_ns = max(time.perf_counter_ns(), close_started_ns + 1)
             self.rec.observations["av_sim"]["variants"][self.variant].update(
                 {"grabs": 1, "open_errors": 0, "helper_exit": 0, "oplock": "granted", "oplock_breaks": [{
                     "event": "oplock_break", "request_id": self.lease_request_id, "name": "raw.wal.ndjson",
                     "lease_acquired_ns": self.lease_acquired_ns, "lease_until_ns": self.lease_until_ns,
-                    "break_notified_ns": self.lease_acquired_ns + 5_000_000,
+                    "break_notified_ns": self.lease_until_ns + 1 if failure_point == "break-after-expiry"
+                    else self.lease_acquired_ns + 5_000_000,
                     "break_completed": True, "ack_required": True,
-                    "ack_method": "close_handle", "acknowledged_ns": self.lease_until_ns + 1,
+                    "ack_method": "close_handle", "close_started_ns": close_started_ns,
+                    "close_completed_ns": close_completed_ns, "close_succeeded": True,
+                    "acknowledged_ns": close_completed_ns,
                 }]}
             )
 
@@ -486,7 +495,7 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
 
         def rename_noreplace_or_suffix(self, src, base_dst):
             # 模擬 oplock break 要等 lease 到期／handle close 才完成 ACK。
-            real_sleep(0.02)
+            real_sleep(0.52 if failure_point == "break-after-expiry" else 0.02)
             return self.delegate.rename_noreplace_or_suffix(src, base_dst)
 
         def __getattr__(self, name):
@@ -511,6 +520,9 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
         assert workload["seq_continuous"] is False
         return
     if failure_point is not None:
+        if failure_point == "break-after-expiry":
+            assert workload["oplock_breaks"][0]["break_notified_ns"] >= workload["lease_until_ns"]
+            return
         error_key = "oplock_variant_error" if failure_point == "drain" else "oplock_variant_close_error"
         assert error_key in recorder.observations
         return
@@ -538,7 +550,7 @@ def test_oplock_request_uses_overlapped_fsctl_and_records_grant(monkeypatch):
     av = _av()
     calls = {}
     closed = []
-    clock = iter((111, 222))
+    clock = iter((111, 333, 444))
 
     class FakeFunction:
         def __init__(self, callback):
@@ -587,13 +599,45 @@ def test_oplock_request_uses_overlapped_fsctl_and_records_grant(monkeypatch):
     assert calls["create_file"][2] & av._FILE_SHARE_DELETE
     assert calls["create_file"][5] & av._FILE_FLAG_OVERLAPPED
     assert closed == []
-    assert av._observe_oplock_break(lease, kernel32=fake_kernel32, monotonic_ns=lambda: next(clock))
+    assert av._observe_oplock_break(lease, kernel32=fake_kernel32, perf_counter_ns=lambda: next(clock))
     assert lease.break_notified_ns == 111
     assert lease.break_completed is True and lease.break_ack_required is True
-    av._close_lease(lease, kernel32=fake_kernel32, monotonic_ns=lambda: next(clock))
+    av._close_lease(lease, kernel32=fake_kernel32, perf_counter_ns=lambda: next(clock))
     assert lease.break_ack_method == "close_handle"
-    assert lease.break_acknowledged_ns == 222
+    assert lease.break_ack_close_started_ns == 333
+    assert lease.break_ack_close_completed_ns == 444
+    assert lease.break_ack_close_succeeded is True
+    assert lease.break_acknowledged_ns == 444
     assert len(closed) == 2, "確認 oplock break 後須關閉檔案 handle，再關 notification event"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_oplock_close_failure_does_not_claim_ack(monkeypatch):
+    """CloseHandle 失敗時不得留下成功 ACK 區間。"""
+    av = _av()
+    lease = av.OplockLease(
+        handle=123, event=456, overlapped=av._OVERLAPPED(), output=av.REQUEST_OPLOCK_OUTPUT_BUFFER(),
+        break_notified_ns=150, break_completed=True, break_ack_required=True,
+    )
+    clock = iter((220, 230))
+
+    class FakeClose:
+        argtypes = None
+        restype = None
+
+        @staticmethod
+        def __call__(_handle):
+            return 0
+
+    api = type("FakeKernel32", (), {"CloseHandle": FakeClose()})()
+    av._close_lease(lease, kernel32=api, perf_counter_ns=lambda: next(clock))
+
+    assert lease.break_ack_close_started_ns == 220
+    assert lease.break_ack_close_completed_ns == 230
+    assert lease.break_ack_close_succeeded is False
+    assert lease.break_ack_method is None
+    assert lease.break_acknowledged_ns is None
 
 
 @pytest.mark.posix_only
@@ -719,8 +763,12 @@ def test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live(tmp_pat
             row["break_completed"] is True and row["ack_required"] is True
             and row["ack_method"] == "close_handle"
             and isinstance(row["break_notified_ns"], int)
+            and row["close_succeeded"] is True
+            and isinstance(row["close_started_ns"], int)
+            and isinstance(row["close_completed_ns"], int)
+            and row["close_started_ns"] <= row["close_completed_ns"]
             and isinstance(row["acknowledged_ns"], int)
-            and row["acknowledged_ns"] >= row["break_notified_ns"]
+            and row["acknowledged_ns"] == row["close_completed_ns"]
             for row in break_rows
         ), "oplock break 必須完成，並記錄關閉 handle 的隱含 ACK"
     finally:
@@ -734,7 +782,7 @@ def test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live(tmp_pat
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_spike3_measured_writer_records_append_latency(monkeypatch):
-    """Spike 3 writer wrapper records each append duration in milliseconds."""
+    """append 延遲量測使用高解析計時器，避免 15.625 ms clock 將短寫入量化為零。"""
     import importlib.util
 
     script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
@@ -742,8 +790,10 @@ def test_spike3_measured_writer_records_append_latency(monkeypatch):
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    ticks = iter([1_000_000, 3_500_000, 10_000_000, 13_250_000])
-    monkeypatch.setattr(module.time, "monotonic_ns", lambda: next(ticks))
+    perf_ticks = iter([1_000_000, 3_500_000, 10_000_000, 13_250_000])
+    coarse_ticks = iter([1_000_000_000, 1_015_625_000, 1_031_250_000, 1_046_875_000])
+    monkeypatch.setattr(module.time, "perf_counter_ns", lambda: next(perf_ticks))
+    monkeypatch.setattr(module.time, "monotonic_ns", lambda: next(coarse_ticks))
     rec = module.Recorder()
 
     class FakeWriter:
@@ -831,6 +881,12 @@ def test_spike3_writes_insufficient_evidence_when_schema_validation_fails(monkey
     assert case_called and edr_called
     assert evidence["verdict"] == "INSUFFICIENT_EVIDENCE"
     assert "injected schema failure" in evidence["observations"]["evidence_validation_error"]
+    timing = evidence["env"]
+    clock_info = time.get_clock_info("perf_counter")
+    assert timing["timing_method"] == "time.perf_counter_ns"
+    assert timing["timing_clock"] == clock_info.implementation
+    assert timing["timing_resolution_ns"] == max(1, math.ceil(clock_info.resolution * 1_000_000_000))
+    assert timing["timing_monotonic"] is True and timing["timing_adjustable"] is False
 
 
 @pytest.mark.core_portable
@@ -1025,7 +1081,8 @@ def test_av_sim_rearm_request_reopens_seen_wal_and_acks_live_lease(monkeypatch, 
     assert ack["request_id"] == "test-1" and ack["held_file"] == wal_path.name
     assert 10 <= ack["hold_ms"] <= 500
     assert len(holds) == 1 and holds[0].lease.handle == 123 and len(events) == 1
-    assert holds[0].until > 10.0 and counts["grabs"] == 1
+    assert (holds[0].until_ns - holds[0].acquired_ns > 10_000_000
+            and counts["grabs"] == 1)
     assert events[0]["event"] == "rearm"
 
 
@@ -1191,7 +1248,7 @@ def test_spike3_arm_hold_rearms_expired_ack_before_accepting(monkeypatch, tmp_pa
                 time.sleep(0.001)
                 continue
             request_ids.add(request_id)
-            now_ns = time.monotonic_ns()
+            now_ns = time.perf_counter_ns()
             if len(request_ids) == 1:
                 acquired_ns, until_ns = now_ns - 200_000_000, now_ns - 1
             else:
@@ -1209,7 +1266,7 @@ def test_spike3_arm_hold_rearms_expired_ack_before_accepting(monkeypatch, tmp_pa
     try:
         assert helper.arm_hold("raw.wal.ndjson") is True
         assert len(request_ids) >= 2
-        assert helper.lease_acquired_ns <= time.monotonic_ns() < helper.lease_until_ns
+        assert helper.lease_acquired_ns <= time.perf_counter_ns() < helper.lease_until_ns
     finally:
         stop.set()
         server.join(1)
@@ -1253,7 +1310,7 @@ def test_spike3_arm_hold_rejects_invalid_acknowledgements(monkeypatch, tmp_path,
         if response_mode in ("timeout", "helper_exited") or stop.is_set():
             return
         request = json.loads(helper._go.read_text(encoding="utf-8"))
-        now_ns = time.monotonic_ns()
+        now_ns = time.perf_counter_ns()
         response = {
             "request_id": request["request_id"], "held_file": "raw.wal.ndjson", "hold_ms": 200,
             "acquired_ns": now_ns, "until_ns": now_ns + 200_000_000,
@@ -1317,7 +1374,32 @@ def test_av_sim_rearm_ack_records_monotonic_lease_bounds(monkeypatch, tmp_path):
     assert isinstance(ack.get("acquired_ns"), int)
     assert isinstance(ack.get("until_ns"), int)
     assert 199_000_000 <= ack["until_ns"] - ack["acquired_ns"] <= 201_000_000
-    assert holds and holds[0].until >= ack["acquired_ns"] / 1_000_000_000
+    assert holds and holds[0].until_ns == ack["until_ns"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_av_sim_hold_expiration_uses_qpc_deadline(monkeypatch):
+    """粗時鐘已超過 hold 秒數時，helper 仍須持有到 QPC ACK 截止時間。"""
+    av = _av()
+    qpc_now_ns = [125_600_000]
+    monotonic_now = [0.1256]
+    monkeypatch.setattr(av.time, "perf_counter_ns", lambda: qpc_now_ns[0])
+    monkeypatch.setattr(av.time, "monotonic", lambda: monotonic_now[0])
+    held = av.HeldFile(
+        until_ns=128_600_000, lease=av.OplockLease(handle=123), name="raw.wal.ndjson",
+        acquired_ns=15_600_000,
+    )
+    holds = [held]
+    released = []
+    monkeypatch.setattr(av, "_release_held_file", lambda entry, _events: released.append(entry))
+
+    av._release_expired_holds(holds, [], oplock=False)
+    assert holds == [held] and released == []
+
+    qpc_now_ns[0] = 128_600_000
+    av._release_expired_holds(holds, [], oplock=False)
+    assert holds == [] and released == [held]
 
 
 @pytest.mark.core_portable
@@ -1335,12 +1417,12 @@ def test_case_rotate_runs_only_after_live_helper_rearm(monkeypatch, tmp_path):
     events: list[tuple[str, int]] = []
     clock_ns = [1_000_000_000]
 
-    def monotonic_ns() -> int:
+    def perf_counter_ns() -> int:
         value = clock_ns[0]
         clock_ns[0] += 40_000_000
         return value
 
-    monkeypatch.setattr(module.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(module.time, "perf_counter_ns", perf_counter_ns)
 
     class FakeWriter:
         archive_created = False
@@ -1574,7 +1656,7 @@ def test_spike3_unlink_verdict_requires_observed_sharing_violation(
             return name == "raw.wal.ndjson"
 
         def arm_hold(self, name: str) -> bool:
-            self.lease_acquired_ns = time.monotonic_ns()
+            self.lease_acquired_ns = time.perf_counter_ns()
             self.lease_until_ns = self.lease_acquired_ns + 500_000_000
             return name == "raw.wal.ndjson"
 

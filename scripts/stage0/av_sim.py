@@ -107,7 +107,7 @@ class _OVERLAPPED(ctypes.Structure):
 
 @dataclass
 class OplockLease:
-    """保持 overlapped oplock request 與實際 break／acknowledgement 時點。"""
+    """保持 overlapped oplock request 與 break／CloseHandle ACK 時間區間。"""
 
     handle: int
     event: int | None = None
@@ -119,18 +119,20 @@ class OplockLease:
     break_observation_error: int | None = None
     break_ack_method: str | None = None
     break_acknowledged_ns: int | None = None
+    break_ack_close_started_ns: int | None = None
+    break_ack_close_completed_ns: int | None = None
+    break_ack_close_succeeded: bool | None = None
 
 
 @dataclass
 class HeldFile:
     """helper 暫時持有的 WAL 檔與其 seeded 到期時間。"""
 
-    until: float
+    until_ns: int
     lease: OplockLease
     name: str
     request_id: str | None = None
     acquired_ns: int | None = None
-    until_ns: int | None = None
 
 
 class HoldSchedule:
@@ -343,7 +345,7 @@ def _request_oplock(path: str, *, kernel32: Any | None = None,
 
 def _observe_oplock_break(
     lease: OplockLease, *, kernel32: Any | None = None,
-    monotonic_ns: Callable[[], int] | None = None,
+    perf_counter_ns: Callable[[], int] | None = None,
     last_error: Callable[[], int] | None = None,
 ) -> bool:
     """輪詢 overlapped request event，讀取真實 break completion 與 ACK 要求旗標。"""
@@ -351,7 +353,7 @@ def _observe_oplock_break(
         return lease.break_notified_ns is not None
     api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
     get_error = last_error or getattr(ctypes, "get_last_error", lambda: 0)
-    now_ns = monotonic_ns or time.monotonic_ns
+    now_ns = perf_counter_ns or time.perf_counter_ns
     wait = api.WaitForSingleObject
     wait.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     wait.restype = ctypes.c_uint32
@@ -388,18 +390,23 @@ def _observe_oplock_break(
 
 def _close_lease(
     lease: OplockLease, *, kernel32: Any | None = None,
-    monotonic_ns: Callable[[], int] | None = None,
+    perf_counter_ns: Callable[[], int] | None = None,
 ) -> None:
-    """記錄 pending break，再關閉檔案 handle（Windows 隱含 ACK），最後關閉 event。"""
+    """記錄 pending break 與 CloseHandle ACK 區間，最後關閉 notification event。"""
     api = kernel32 or ctypes.WinDLL("kernel32", use_last_error=True)
-    now_ns = monotonic_ns or time.monotonic_ns
-    _observe_oplock_break(lease, kernel32=api, monotonic_ns=now_ns)
+    now_ns = perf_counter_ns or time.perf_counter_ns
+    _observe_oplock_break(lease, kernel32=api, perf_counter_ns=now_ns)
+    close_started_ns = int(now_ns())
     handle_closed = _close_handle(lease.handle, kernel32=api)
-    if lease.break_notified_ns is not None and handle_closed:
-        lease.break_ack_method = (
-            "close_handle" if lease.break_ack_required else "not_required"
-        )
-        lease.break_acknowledged_ns = int(now_ns())
+    close_completed_ns = int(now_ns())
+    if lease.break_notified_ns is not None:
+        lease.break_ack_close_started_ns = close_started_ns
+        lease.break_ack_close_completed_ns = close_completed_ns
+        lease.break_ack_close_succeeded = handle_closed
+        if handle_closed:
+            lease.break_ack_method = "close_handle" if lease.break_ack_required else "not_required"
+            # CloseHandle return is the ACK completion upper bound, not the kernel ACK instant.
+            lease.break_acknowledged_ns = close_completed_ns
     if lease.event is not None:
         _close_handle(lease.event, kernel32=api)
 
@@ -418,9 +425,22 @@ def _release_held_file(entry: HeldFile, events: list[dict[str, Any]]) -> None:
             "break_completed": getattr(lease, "break_completed", None),
             "ack_required": getattr(lease, "break_ack_required", None),
             "ack_method": getattr(lease, "break_ack_method", None),
+            "close_started_ns": getattr(lease, "break_ack_close_started_ns", None),
+            "close_completed_ns": getattr(lease, "break_ack_close_completed_ns", None),
+            "close_succeeded": getattr(lease, "break_ack_close_succeeded", None),
             "acknowledged_ns": getattr(lease, "break_acknowledged_ns", None),
             "observation_error": break_observation_error,
         })
+
+
+def _release_expired_holds(holds: list[HeldFile], events: list[dict[str, Any]], *, oplock: bool) -> None:
+    """以與 ACK 相同的 QPC 時間域關閉到期 handle，避免粗時鐘提早終止 lease。"""
+    for entry in list(holds):
+        if oplock:
+            _observe_oplock_break(entry.lease)
+        if time.perf_counter_ns() >= entry.until_ns:
+            _release_held_file(entry, events)
+            holds.remove(entry)
 
 
 def _publish_atomic_record(destination: str | Path, record: dict[str, Any]) -> None:
@@ -487,11 +507,13 @@ def _process_rearm_request(
                 oplock_results.append(oplock_result)
         else:
             lease, oplock_result = OplockLease(_open_share_hold(full)), OPLOCK_STATUS
-        acquired_ns = time.monotonic_ns()
+        acquired_ns = time.perf_counter_ns()
         hold_ms = int(round(hold * 1000))
         until_ns = acquired_ns + hold_ms * 1_000_000
-        holds.append(HeldFile(until_ns / 1_000_000_000, lease, name,
-                              request_id=request_id, acquired_ns=acquired_ns, until_ns=until_ns))
+        holds.append(HeldFile(
+            until_ns=until_ns, lease=lease, name=name,
+            request_id=request_id, acquired_ns=acquired_ns,
+        ))
         counts["grabs"] += 1
         events.append({"event": "rearm", "name": name, "hold_ms": hold_ms,
                        "oplock": oplock_result, "request_id": request_id,
@@ -522,13 +544,7 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
     ready_written = False
     deadline = time.monotonic() + duration_s
     while time.monotonic() < deadline and not os.path.exists(stop_file):
-        now = time.monotonic()
-        for entry in list(holds):
-            if oplock:
-                _observe_oplock_break(entry.lease)
-            if now >= entry.until:
-                _release_held_file(entry, events)
-                holds.remove(entry)
+        _release_expired_holds(holds, events, oplock=oplock)
         try:
             names = os.listdir(watch_dir)
         except OSError:
@@ -555,11 +571,12 @@ def run_helper(*, watch_dir: str, seed: int, duration_s: float, ready_file: str,
                 counts["open_errors"] += 1
                 events.append({"event": "open_error", "name": name, "error": str(exc)})
                 continue
-            acquired_ns = time.monotonic_ns()
+            acquired_ns = time.perf_counter_ns()
             hold_ms = int(round(hold * 1000))
             until_ns = acquired_ns + hold_ms * 1_000_000
-            holds.append(HeldFile(until_ns / 1_000_000_000, lease, name,
-                                  acquired_ns=acquired_ns, until_ns=until_ns))
+            holds.append(HeldFile(
+                until_ns=until_ns, lease=lease, name=name, acquired_ns=acquired_ns,
+            ))
             counts["grabs"] += 1
             events.append({"event": "grab", "name": name, "hold_ms": hold_ms,
                            "acquired_ns": acquired_ns, "until_ns": until_ns,

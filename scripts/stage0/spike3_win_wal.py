@@ -108,7 +108,7 @@ class _MeasuredWalWriter:
         self.last_append_completed_ns: int | None = None
 
     def append(self, *args: Any, **kwargs: Any) -> Any:
-        self.last_append_started_ns = time.monotonic_ns()
+        self.last_append_started_ns = time.perf_counter_ns()
         self.last_append_index = self._rec.observations["append_count"] + 1
         event_start = len(self._rename_probe.events) if self._rename_probe is not None else 0
         try:
@@ -120,7 +120,7 @@ class _MeasuredWalWriter:
                 self._rec.observations["stimulus_started_ns"] = self.last_append_started_ns
             return result
         finally:
-            self.last_append_completed_ns = time.monotonic_ns()
+            self.last_append_completed_ns = time.perf_counter_ns()
             elapsed_ms = (self.last_append_completed_ns - self.last_append_started_ns) / 1_000_000
             self._rec.observations["append_latency_ms"].append(elapsed_ms)
             self._rec.observations["append_count"] += 1
@@ -153,7 +153,7 @@ class _TimedWalFs:
     def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str:
         event = None
         if Path(src).name == "raw.wal.ndjson":
-            event = {"requested_ns": time.monotonic_ns(), "completed_ns": None, "succeeded": False}
+            event = {"requested_ns": time.perf_counter_ns(), "completed_ns": None, "succeeded": False}
             self._probe.events.append(event)
         try:
             result = self._delegate.rename_noreplace_or_suffix(src, base_dst)
@@ -162,7 +162,7 @@ class _TimedWalFs:
             return result
         finally:
             if event is not None:
-                event["completed_ns"] = time.monotonic_ns()
+                event["completed_ns"] = time.perf_counter_ns()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._delegate, name)
@@ -569,7 +569,7 @@ class AvHelper:
         deadline = time.monotonic() + AV_HELPER_READY_TIMEOUT_S
         while time.monotonic() < deadline:
             self._arm_serial += 1
-            request_id = f"{os.getpid()}-{time.monotonic_ns()}-{self._arm_serial}"
+            request_id = f"{os.getpid()}-{time.perf_counter_ns()}-{self._arm_serial}"
             try:
                 self._ack.unlink()
             except FileNotFoundError:
@@ -600,7 +600,7 @@ class AvHelper:
                                 or not valid_int(until_ns) or acquired_ns < 0 or until_ns <= acquired_ns
                                 or abs((until_ns - acquired_ns) - hold_ms * 1_000_000) > 1_000_000):
                             return self._fail(f"helper rearm 未取得 {name} 的有效 seeded lease：{response!r}")
-                        if time.monotonic_ns() + AV_HELPER_LEASE_SAFETY_NS >= until_ns:
+                        if time.perf_counter_ns() + AV_HELPER_LEASE_SAFETY_NS >= until_ns:
                             retry_expired_lease = True
                             self._rec.step(
                                 f"av_sim_helper_rearm_expired{':' + self._variant if self._variant else ''}",
@@ -893,16 +893,24 @@ def _collect_oplock_variant_impl(wal_dir: Path, rec: Recorder) -> bool:
         return "INSUFFICIENT_EVIDENCE"
     break_row = matching_breaks[0]
     break_notified_ns = break_row.get("break_notified_ns")
-    break_acknowledged_ns = break_row.get("acknowledged_ns")
+    close_started_ns = break_row.get("close_started_ns")
+    close_completed_ns = break_row.get("close_completed_ns")
+    acknowledged_ns = break_row.get("acknowledged_ns")
     if (
         break_row.get("name") != "raw.wal.ndjson"
         or break_row.get("break_completed") is not True
         or break_row.get("ack_required") is not True
         or break_row.get("ack_method") != "close_handle"
+        or break_row.get("close_succeeded") is not True
         or not isinstance(break_notified_ns, int) or isinstance(break_notified_ns, bool)
-        or not isinstance(break_acknowledged_ns, int) or isinstance(break_acknowledged_ns, bool)
-        or not lease_acquired_ns <= rotation_requested_ns <= break_notified_ns <= break_acknowledged_ns
-        or not lease_until_ns <= break_acknowledged_ns <= rotation_completed_ns
+        or not isinstance(close_started_ns, int) or isinstance(close_started_ns, bool)
+        or not isinstance(close_completed_ns, int) or isinstance(close_completed_ns, bool)
+        or not isinstance(acknowledged_ns, int) or isinstance(acknowledged_ns, bool)
+        or not lease_acquired_ns <= rotation_requested_ns <= break_notified_ns <= close_started_ns
+        or not rotation_requested_ns <= break_notified_ns < lease_until_ns
+        or not lease_until_ns <= close_started_ns <= rotation_completed_ns
+        or close_completed_ns < close_started_ns
+        or acknowledged_ns != close_completed_ns
     ):
         return "INSUFFICIENT_EVIDENCE"
     return "PASS"
@@ -1064,7 +1072,7 @@ def case_unlink(rec: Recorder, args: argparse.Namespace) -> tuple[str, str]:
         while True:
             unlink_attempts += 1
             if rec.observations.get("stimulus_started_ns") is None:
-                rec.observations["stimulus_started_ns"] = time.monotonic_ns()
+                rec.observations["stimulus_started_ns"] = time.perf_counter_ns()
             try:
                 if args.unlink_mode == "posix":
                     win32_files.delete_posix_semantics(wal_path)
@@ -1378,6 +1386,14 @@ def run_case(args: argparse.Namespace) -> int:
         rec.observations["binary_integrity_downgrade"] = True
     wal_dir_str = str(rec.observations.get("wal_dir", ""))
     env = gather_env(Path(wal_dir_str) if wal_dir_str else env_dir, edr["product"])
+    perf_clock = time.get_clock_info("perf_counter")
+    env.update({
+        "timing_method": "time.perf_counter_ns",
+        "timing_clock": perf_clock.implementation,
+        "timing_resolution_ns": max(1, math.ceil(perf_clock.resolution * 1_000_000_000)),
+        "timing_monotonic": perf_clock.monotonic,
+        "timing_adjustable": perf_clock.adjustable,
+    })
     observations = {k: v for k, v in rec.observations.items() if k != "av_sim"}
     evidence = {
         "case_id": case_id,

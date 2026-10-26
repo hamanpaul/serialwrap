@@ -18,9 +18,17 @@
     "env": {
       "type": "object",
       "description": "同 T19 env（§1.1.1）；查不到的值一律為 unknown，不得填 0 或空字串。",
-      "required": ["os"],
+      "required": [
+        "os", "timing_method", "timing_clock", "timing_resolution_ns",
+        "timing_monotonic", "timing_adjustable"
+      ],
       "properties": {
         "os": {"type": "string"},
+        "timing_method": {"type": "string", "const": "time.perf_counter_ns"},
+        "timing_clock": {"type": "string", "minLength": 1},
+        "timing_resolution_ns": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "timing_monotonic": {"type": "boolean", "const": true},
+        "timing_adjustable": {"type": "boolean", "const": false},
         "os_build": {"type": "string"},
         "python": {"type": "string"},
         "platform": {"type": "string"},
@@ -140,7 +148,8 @@
                 "type": "object",
                 "required": [
                   "event", "request_id", "name", "lease_acquired_ns", "lease_until_ns", "break_notified_ns",
-                  "break_completed", "ack_required", "ack_method", "acknowledged_ns", "observation_error"
+                  "break_completed", "ack_required", "ack_method", "close_started_ns", "close_completed_ns",
+                  "close_succeeded", "acknowledged_ns", "observation_error"
                 ],
                 "properties": {
                   "event": {"type": "string", "const": "oplock_break"},
@@ -152,6 +161,9 @@
                   "break_completed": {"type": ["boolean", "null"]},
                   "ack_required": {"type": ["boolean", "null"]},
                   "ack_method": {"type": ["string", "null"], "enum": ["close_handle", "not_required", null]},
+                  "close_started_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "close_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "close_succeeded": {"type": ["boolean", "null"]},
                   "acknowledged_ns": {"type": ["integer", "null"], "minimum": 0},
                   "observation_error": {"type": ["integer", "null"], "minimum": 0}
                 },
@@ -205,6 +217,7 @@
                     "required": [
                       "event", "name", "request_id", "lease_acquired_ns", "lease_until_ns",
                       "break_notified_ns", "break_completed", "ack_required", "ack_method",
+                      "close_started_ns", "close_completed_ns", "close_succeeded",
                       "acknowledged_ns", "observation_error"
                     ],
                     "properties": {
@@ -217,6 +230,9 @@
                       "break_completed": {"type": ["boolean", "null"]},
                       "ack_required": {"type": ["boolean", "null"]},
                       "ack_method": {"type": ["string", "null"], "enum": ["close_handle", "not_required", null]},
+                      "close_started_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "close_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "close_succeeded": {"type": ["boolean", "null"]},
                       "acknowledged_ns": {"type": ["integer", "null"], "minimum": 0},
                       "observation_error": {"type": ["integer", "null"], "minimum": 0}
                     },

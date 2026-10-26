@@ -1268,7 +1268,8 @@ def _spike3_observations(case_id: str) -> dict[str, Any]:
                 "lease_acquired_ns": 100, "lease_until_ns": 200,
                 "break_notified_ns": 150, "break_completed": True,
                 "ack_required": True, "ack_method": "close_handle",
-                "acknowledged_ns": 210, "observation_error": None,
+                "close_started_ns": 220, "close_completed_ns": 260,
+                "close_succeeded": True, "acknowledged_ns": 260, "observation_error": None,
             }],
             "lease_acquired_ns": 100, "stimulus_started_ns": 120,
             "rotation_requested_ns": 120, "rotation_completed_ns": 250, "lease_until_ns": 200,
@@ -1336,7 +1337,11 @@ def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor 
     doc: dict[str, Any] = {
         "case_id": case_id,
         "run_at": "2026-10-22T00:00:00Z",
-        "env": {"os": "Windows 10"},
+        "env": {
+            "os": "Windows 10", "timing_method": "time.perf_counter_ns",
+            "timing_clock": "QueryPerformanceCounter", "timing_resolution_ns": 100,
+            "timing_monotonic": True, "timing_adjustable": False,
+        },
         "artifact": {"binary": "sw_core (Python 基線)", "revision": "a" * 40, "tree_sha256": "b" * 64,
                      "git_head": git_head, "git_clean": True},
         "steps": [{"op": "case", "ts": "2026-10-22T00:00:01Z", "result": "ok"}],
@@ -1355,7 +1360,9 @@ def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor 
                            "name": "raw.wal.ndjson", "lease_acquired_ns": 100,
                            "lease_until_ns": 200, "break_notified_ns": 150,
                            "break_completed": True, "ack_required": True,
-                           "ack_method": "close_handle", "acknowledged_ns": 210,
+                           "ack_method": "close_handle", "close_started_ns": 220,
+                           "close_completed_ns": 260, "close_succeeded": True,
+                           "acknowledged_ns": 260,
                            "observation_error": None,
                        }],
                    }}},
@@ -1743,8 +1750,10 @@ def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
         "deferred_pending", "write_failures", "pre_marker", "post_marker", "crc_errors",
         "interference_false", "lease_acquired_ns_missing", "lease_request_id_missing",
         "oplock_breaks_missing", "oplock_break_not_completed", "oplock_break_no_ack",
+        "oplock_break_notified_after_lease",
         "oplock_break_ack_before_lease_expiry", "oplock_break_ack_after_rotation",
-        "oplock_break_request_mismatch",
+        "oplock_break_request_mismatch", "helper_break_mismatch", "oplock_close_failed",
+        "coarse_timing_clock", "wrong_timing_method",
         "stimulus_started_ns_missing", "rotation_completed_ns_missing", "lease_until_ns_missing",
         "rotation_attempt_count_missing", "rotation_request_succeeded_missing", "rotation_append_index_missing",
         "rotation_append_started_ns_missing", "rotation_append_completed_ns_missing",
@@ -1805,12 +1814,26 @@ def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
             workload["oplock_breaks"][0]["break_completed"] = False
         elif mutation == "oplock_break_no_ack":
             workload["oplock_breaks"][0]["ack_required"] = False
+        elif mutation == "oplock_break_notified_after_lease":
+            row = workload["oplock_breaks"][0]
+            row["break_notified_ns"] = row["close_started_ns"] - 1
+            doc["av_sim"]["variants"]["oplock"]["oplock_breaks"][0]["break_notified_ns"] = row[
+                "break_notified_ns"
+            ]
         elif mutation == "oplock_break_ack_before_lease_expiry":
-            workload["oplock_breaks"][0]["acknowledged_ns"] = workload["lease_until_ns"] - 1
+            workload["oplock_breaks"][0]["close_started_ns"] = workload["lease_until_ns"] - 1
         elif mutation == "oplock_break_ack_after_rotation":
-            workload["oplock_breaks"][0]["acknowledged_ns"] = workload["rotation_completed_ns"] + 1
+            workload["oplock_breaks"][0]["close_started_ns"] = workload["rotation_completed_ns"] + 1
         elif mutation == "oplock_break_request_mismatch":
             workload["oplock_breaks"][0]["request_id"] = "different-lease"
+        elif mutation == "helper_break_mismatch":
+            doc["av_sim"]["variants"]["oplock"]["oplock_breaks"][0]["request_id"] = "other-helper-lease"
+        elif mutation == "oplock_close_failed":
+            workload["oplock_breaks"][0]["close_succeeded"] = False
+        elif mutation == "coarse_timing_clock":
+            doc["env"]["timing_resolution_ns"] = 15_625_000
+        elif mutation == "wrong_timing_method":
+            doc["env"]["timing_method"] = "time.monotonic_ns"
         elif mutation.endswith("_missing"):
             workload.pop(mutation.removesuffix("_missing"))
         elif mutation == "lease_timestamp_invalid":
