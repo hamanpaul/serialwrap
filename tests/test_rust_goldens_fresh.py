@@ -31,6 +31,7 @@ GENERATORS = [
     ("gen_telnet_filter.py", "telnet_filter.tsv"),
     ("gen_line_editor.py", "line_editor.tsv"),
     ("gen_human_line_mode.py", "human_console_mode.tsv"),
+    ("gen_human_line_mode.py", "human_console_mode.windows.tsv"),
     ("gen_shlex.py", "shlex_split.tsv"),
 ]
 
