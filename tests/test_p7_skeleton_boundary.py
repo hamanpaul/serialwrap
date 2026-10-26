@@ -45,3 +45,27 @@ def test_slice23_cases_frozen_before_implementation():
         assert cid in s23, cid
     r = subprocess.run([sys.executable, str(ROOT / "tests/acceptance/regen_lock.py"), "--check"], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.memory_only
+def test_p7_py_parity_set_registered_add_only():
+    """parity-amendments-2026-10-26 #111／#112（08 Task 0 新增 Step）：Python 基線 parity 測試入 `p7_gate:py_parity`。
+
+    Windows 平台需以 Windows 原生收集結果登記（§2.1），由 Windows runner 補；此處只要求 linux 已登記。
+    """
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    spec = lock["sets"]["p7_gate:py_parity"]["linux"]
+    ids = set(spec["nodeids"])
+    required = [
+        "tests/test_console_unlock.py::test_echoed_nonce_command_is_not_ready_evidence",
+        "tests/test_console_unlock.py::test_cfe_prompt_blocks_all_tx",
+        "tests/test_console_unlock.py::test_existing_shell_prompt_skips_unlock",
+        "tests/test_console_unlock.py::test_unlock_timing_log_contains_only_safe_metadata",
+        "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
+        "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
+        "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter",
+    ]
+    for nid in required:
+        assert nid in ids, nid
+    behaviour = {n for n in ids if n.startswith("tests/test_console_unlock.py::")}
+    assert len({n.split("[")[0] for n in behaviour}) >= 17, "test_console_unlock.py 行為測試應全數入鎖"

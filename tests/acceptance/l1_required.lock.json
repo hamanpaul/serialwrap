@@ -1,6 +1,76 @@
 {
   "schema_version": 1,
   "sets": {
+    "p7_gate:py_parity": {
+      "linux": {
+        "nodeids": [
+          "tests/test_console_unlock.py::test_boot_rx_resets_idle_before_any_tx_and_unlock_is_not_logged",
+          "tests/test_console_unlock.py::test_cfe_boot_banner_is_detected",
+          "tests/test_console_unlock.py::test_cfe_prompt_blocks_all_tx",
+          "tests/test_console_unlock.py::test_cfe_split_chunks_arm_boot_quiet",
+          "tests/test_console_unlock.py::test_config_inherits_and_overrides_unlock_fields",
+          "tests/test_console_unlock.py::test_continuous_rx_timeout_never_transmits",
+          "tests/test_console_unlock.py::test_dynamic_detection_skips_unlock_template",
+          "tests/test_console_unlock.py::test_echoed_nonce_command_is_not_ready_evidence",
+          "tests/test_console_unlock.py::test_exact_sysrq_reboot_is_recovery_command[echo 'b' >/proc/sysrq-trigger]",
+          "tests/test_console_unlock.py::test_exact_sysrq_reboot_is_recovery_command[echo b > /proc/sysrq-trigger]",
+          "tests/test_console_unlock.py::test_existing_bridge_attach_and_recover_unlock_inside_boot_quiet[attach]",
+          "tests/test_console_unlock.py::test_existing_bridge_attach_and_recover_unlock_inside_boot_quiet[recover]",
+          "tests/test_console_unlock.py::test_existing_shell_prompt_skips_unlock",
+          "tests/test_console_unlock.py::test_fresh_unlocked_attach_never_sends_secret_as_shell_command",
+          "tests/test_console_unlock.py::test_history_prompt_before_boot_cannot_skip_unlock",
+          "tests/test_console_unlock.py::test_initial_attach_unlocks_after_cfe_boot_without_generic_cr",
+          "tests/test_console_unlock.py::test_invalid_idle_is_rejected[-1]",
+          "tests/test_console_unlock.py::test_invalid_idle_is_rejected[0]",
+          "tests/test_console_unlock.py::test_invalid_idle_is_rejected[True]",
+          "tests/test_console_unlock.py::test_invalid_idle_is_rejected[inf]",
+          "tests/test_console_unlock.py::test_invalid_idle_is_rejected[nan]",
+          "tests/test_console_unlock.py::test_missing_unlock_is_declared_terminal",
+          "tests/test_console_unlock.py::test_missing_unlock_never_probes_or_sends",
+          "tests/test_console_unlock.py::test_other_commands_do_not_broaden_reboot_detection[echo b > /tmp/sysrq-trigger]",
+          "tests/test_console_unlock.py::test_other_commands_do_not_broaden_reboot_detection[echo c > /proc/sysrq-trigger]",
+          "tests/test_console_unlock.py::test_other_commands_do_not_broaden_reboot_detection[sync; echo b > /proc/sysrq-trigger]",
+          "tests/test_console_unlock.py::test_other_commands_do_not_broaden_reboot_detection[sync; reboot]",
+          "tests/test_console_unlock.py::test_packaged_marker_command_finishes_without_recovery_keys_on_async_log",
+          "tests/test_console_unlock.py::test_packaged_nonce_accepts_prompt_and_async_log_in_same_write",
+          "tests/test_console_unlock.py::test_packaged_prompt_keeps_hostname_line_start_boundary[CFE> ]",
+          "tests/test_console_unlock.py::test_packaged_prompt_keeps_hostname_line_start_boundary[log root@Speedport Smart 4 Typ B:~# ]",
+          "tests/test_console_unlock.py::test_packaged_prompt_keeps_hostname_line_start_boundary[root@Speedport Smart 4 Typ C:~# ]",
+          "tests/test_console_unlock.py::test_packaged_prompt_keeps_hostname_line_start_boundary[root@unrelated-host:~# ]",
+          "tests/test_console_unlock.py::test_packaged_smart4_profile_declares_no_literal_secret",
+          "tests/test_console_unlock.py::test_prompt_arriving_during_second_idle_wait_skips_unlock[False]",
+          "tests/test_console_unlock.py::test_prompt_arriving_during_second_idle_wait_skips_unlock[True]",
+          "tests/test_console_unlock.py::test_reboot_recovery_uses_unlock_inside_boot_quiet",
+          "tests/test_console_unlock.py::test_reprobe_can_schedule_passive_unlock_inside_boot_quiet",
+          "tests/test_console_unlock.py::test_smart4_unlock_can_pass_boot_quiet_but_other_profiles_cannot",
+          "tests/test_console_unlock.py::test_template_materialization_preserves_unlock_settings",
+          "tests/test_console_unlock.py::test_unlock_auth_only_resolves_and_repr_hides_secrets",
+          "tests/test_console_unlock.py::test_unlock_env_file_precedes_environment",
+          "tests/test_console_unlock.py::test_unlock_timing_log_contains_only_safe_metadata",
+          "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
+          "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
+          "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "-m",
+            "core_portable or posix_only",
+            "tests/test_console_unlock.py",
+            "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
+            "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
+            "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter"
+          ],
+          "markexpr": "core_portable or posix_only",
+          "paths": [
+            "tests/test_console_unlock.py",
+            "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
+            "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
+            "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter"
+          ]
+        }
+      }
+    },
     "s0_bc": {
       "linux": {
         "nodeids": [
