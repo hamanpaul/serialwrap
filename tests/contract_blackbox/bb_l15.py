@@ -793,6 +793,11 @@ def _same_tty(fd_st: os.stat_result, tty_st: os.stat_result) -> bool:
     return os.major(rdev) not in _DEVPTS_MAJORS
 
 
+def numeric_proc_pids() -> tuple[int, ...]:
+    """回傳當前 PID namespace 的全部數字 PID；讀取失敗時不得縮成部分候選集合。"""
+    return tuple(sorted({int(name) for name in os.listdir("/proc") if name.isdecimal() and int(name) > 0}))
+
+
 def observe_holders(tty_st: os.stat_result, *, pids: Iterable[int]) -> list[int]:
     """只掃描呼叫者明確指定的候選行程，回傳持有 `tty_st` 的 pid（已排序）。
 
@@ -881,7 +886,9 @@ class HolderObserver:
     """於背景以固定週期取樣指定 PID 的 tty 持有狀態；`stop()` 後以 `timeline` 取得結果。
 
     `start()` 會等到首次取樣完成才返回，故時間線起點必定反映呼叫者開始操作前所見的狀態。
-    候選 PID 由呼叫者以 `watch_pid()` 增補；tty 身分於 `start()` 時取得。背景例外於 `start()`／`stop()` 重新拋出。
+    預設只掃描呼叫者提供的 PID；`discover_all=True` 時每筆取樣重新列舉目前 `/proc` 的數字 PID，
+    適用於 `pidns_rig` 中只包含本次隔離測試行程的命名空間。tty 身分於 `start()` 時取得。
+    背景例外於 `start()`／`stop()` 重新拋出。
     取樣為 polling（單次掃描時間依指定 PID 的 fd 數量與負載而定）；
     短於一次掃描週期的瞬時重疊無法被觀測。
     """
@@ -892,9 +899,11 @@ class HolderObserver:
         *,
         pids: Iterable[int],
         period_s: float = HOLDER_SAMPLE_PERIOD_S,
+        discover_all: bool = False,
     ) -> None:
         self._slave_path = slave_path
         self._period_s = period_s
+        self._discover_all = bool(discover_all)
         supplied = tuple(pids)
         if not supplied or any(type(pid) is not int or pid <= 0 for pid in supplied):
             raise ValueError("持有者觀測必須提供非空、正整數 PID 集合")
@@ -917,7 +926,10 @@ class HolderObserver:
 
     def _candidate_pids(self) -> tuple[int, ...]:
         with self._pid_lock:
-            return tuple(sorted(self._pids))
+            candidates = set(self._pids)
+        if self._discover_all:
+            candidates.update(numeric_proc_pids())
+        return tuple(sorted(candidates))
 
     def start(self) -> "HolderObserver":
         self._tty_st = os.stat(self._slave_path)

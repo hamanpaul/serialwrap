@@ -353,22 +353,27 @@ def test_restart_no_stale_console_replay(tmp_path: Path, env: dict[str, str]) ->
         assert tx_bytes(bridge.evidence_dir) == tx_before_partial
         assert stale_marker.encode() not in rx_bytes(bridge.evidence_dir)
 
-        # 只追蹤本次 restart 的舊／新 daemon PID；不掃描其他系統行程或正式 daemon。
+        # pidns_rig 只含本次隔離測試行程；每筆取樣重掃 namespace，避免在 restart 回傳後才登記新 PID。
         old_pid = daemon_pid(env)
-        observer = HolderObserver(bridge.slave_path, pids=[old_pid])
+        observer = HolderObserver(bridge.slave_path, pids=[old_pid], discover_all=True)
         try:
             with observer:
                 wait_holder(bridge.slave_path, old_pid, present=True)
                 restarted = run_cli(cli, ["daemon", "restart"], env, timeout_s=120.0)
                 assert restarted.returncode == 0, restarted.stdout + restarted.stderr
-                new_pid = daemon_pid(env)
-                assert new_pid != old_pid
-                observer.watch_pid(new_pid)
+                expected_new_pid = daemon_pid(env)
+                assert expected_new_pid != old_pid
                 wait_holder(bridge.slave_path, old_pid, present=False)
-                wait_holder(bridge.slave_path, new_pid, present=True)
+                wait_holder(bridge.slave_path, expected_new_pid, present=True)
                 wait_session(env)
         except HolderObservationUnavailable as exc:
             pytest.skip(f"候選 PID fd 不可讀，未形成通過證據（evidence-insufficient）：{exc}")
+        observed_new = {
+            pid for _, holders in observer.timeline.samples for pid in holders if pid != old_pid
+        }
+        assert len(observed_new) == 1, f"時間線須恰有一個新 holder，實際為 {observed_new}"
+        new_pid = next(iter(observed_new))
+        assert new_pid == expected_new_pid, f"時間線 holder {new_pid} 與 daemon PID {expected_new_pid} 不符"
         replay_holder_edges(bridge, observer.timeline, (old_pid, new_pid))
         assert_holder_handoff(observer.timeline, old_pid, new_pid)
         tx_after_restart = tx_bytes(bridge.evidence_dir)
@@ -405,20 +410,25 @@ def test_restart_no_reopen_before_handoff(tmp_path: Path, env: dict[str, str]) -
     cli = Path(cli_prefix()[-1])
     try:
         old_pid = daemon_pid(env)
-        observer = HolderObserver(bridge.slave_path, pids=[old_pid])
+        observer = HolderObserver(bridge.slave_path, pids=[old_pid], discover_all=True)
         try:
             with observer:
                 wait_holder(bridge.slave_path, old_pid, present=True)
                 restarted = run_cli(cli, ["daemon", "restart"], env, timeout_s=120.0)
                 assert restarted.returncode == 0, restarted.stdout + restarted.stderr
-                new_pid = daemon_pid(env)
-                assert new_pid != old_pid
-                observer.watch_pid(new_pid)
+                expected_new_pid = daemon_pid(env)
+                assert expected_new_pid != old_pid
                 wait_holder(bridge.slave_path, old_pid, present=False)
-                wait_holder(bridge.slave_path, new_pid, present=True)
+                wait_holder(bridge.slave_path, expected_new_pid, present=True)
                 assert wait_session(env)["state"] == "READY"
         except HolderObservationUnavailable as exc:
             pytest.skip(f"候選 PID fd 不可讀，未形成通過證據（evidence-insufficient）：{exc}")
+        observed_new = {
+            pid for _, holders in observer.timeline.samples for pid in holders if pid != old_pid
+        }
+        assert len(observed_new) == 1, f"時間線須恰有一個新 holder，實際為 {observed_new}"
+        new_pid = next(iter(observed_new))
+        assert new_pid == expected_new_pid, f"時間線 holder {new_pid} 與 daemon PID {expected_new_pid} 不符"
         replay_holder_edges(bridge, observer.timeline, (old_pid, new_pid))
         assert_holder_handoff(observer.timeline, old_pid, new_pid)
     finally:

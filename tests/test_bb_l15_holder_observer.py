@@ -177,7 +177,7 @@ def _stop(proc: subprocess.Popen | None) -> None:
 @pytest.mark.posix_only
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
-def test_observer_flags_concurrent_holders_and_oracle_rejects_them() -> None:
+def test_observer_flags_concurrent_holders_and_oracle_rejects_them(monkeypatch) -> None:
     """刻意重疊：第二個 holder 在舊 holder 仍持有 PTY 時開啟；觀測器必須判定重疊，oracle 必須拒絕。"""
     bb = _bb_l15()
     master, slave_path = _open_pty()
@@ -186,11 +186,13 @@ def test_observer_flags_concurrent_holders_and_oracle_rejects_them() -> None:
     try:
         old = _spawn_holder(slave_path)
         bb.wait_holder(slave_path, old.pid, present=True)
-        observer = bb.HolderObserver(slave_path, pids=[old.pid])
+        candidates = [os.getpid(), old.pid]
+        monkeypatch.setattr(bb, "numeric_proc_pids", lambda: tuple(candidates), raising=False)
+        observer = bb.HolderObserver(slave_path, pids=[old.pid], discover_all=True)
         try:
             with observer:
                 new = _spawn_holder(slave_path)
-                observer.watch_pid(new.pid)
+                candidates.append(new.pid)
                 bb.wait_holder(slave_path, new.pid, present=True)
                 time.sleep(0.2)
                 _stop(old)
@@ -212,7 +214,7 @@ def test_observer_flags_concurrent_holders_and_oracle_rejects_them() -> None:
 @pytest.mark.posix_only
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
-def test_observer_sequential_handoff_passes_oracle() -> None:
+def test_observer_sequential_handoff_passes_oracle(monkeypatch) -> None:
     """循序交接（舊 holder 完全釋放後才開啟新 holder）為正向對照：觀測器不得產生假重疊，oracle 必須通過。"""
     bb = _bb_l15()
     master, slave_path = _open_pty()
@@ -221,13 +223,15 @@ def test_observer_sequential_handoff_passes_oracle() -> None:
     try:
         old = _spawn_holder(slave_path)
         bb.wait_holder(slave_path, old.pid, present=True)
-        observer = bb.HolderObserver(slave_path, pids=[old.pid])
+        candidates = [os.getpid(), old.pid]
+        monkeypatch.setattr(bb, "numeric_proc_pids", lambda: tuple(candidates), raising=False)
+        observer = bb.HolderObserver(slave_path, pids=[old.pid], discover_all=True)
         try:
             with observer:
                 _stop(old)
                 bb.wait_holder(slave_path, old.pid, present=False)
                 new = _spawn_holder(slave_path)
-                observer.watch_pid(new.pid)
+                candidates.append(new.pid)
                 bb.wait_holder(slave_path, new.pid, present=True)
                 time.sleep(0.05)
         except bb.HolderObservationUnavailable as exc:
