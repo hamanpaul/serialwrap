@@ -280,11 +280,24 @@ def _write_junit(path: Path, nodes: list[str]) -> None:
     ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
 
 
+def _write_junit_skipped(path: Path, nodes: list[str], message: str) -> None:
+    import xml.etree.ElementTree as ET
+
+    suite = ET.Element("testsuite", tests=str(len(nodes)), failures="0", errors="0", skipped=str(len(nodes)))
+    for node in nodes:
+        path_text, *segments = node.split("::")
+        classname = ".".join([path_text.removesuffix(".py").replace("/", "."), *segments[:-1]])
+        case = ET.SubElement(suite, "testcase", classname=classname, name=segments[-1])
+        ET.SubElement(case, "skipped", type="pytest.skip", message=message)
+    ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
+
+
 def _execute_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     write_config: dict[str, str] | None,
+    approved_a_skips: bool = False,
 ) -> tuple[ModuleType, Path, int]:
     """以假的 pytest 子行程驅動 `execute()`。`write_config` 為 {"a": timeout, "b": timeout}；None 表示兩輪都不寫設定紀錄。"""
     cd = _cd()
@@ -313,8 +326,11 @@ def _execute_harness(
             is_a = f"--junitxml={a_junit}" in argv
             side = "a" if is_a else "b"
             seen_env[side] = dict(env)
-            _write_junit(a_junit if is_a else b_junit, nodes)
-            if write_config is not None:
+            if is_a and approved_a_skips:
+                _write_junit_skipped(a_junit, nodes, "rust-only contract")
+            else:
+                _write_junit(a_junit if is_a else b_junit, nodes)
+            if write_config is not None and side in write_config:
                 root = tmp_path / f"{side}-root"
                 _write_config(root, config_yaml=f"timeout_s: {write_config[side]}\n")
                 cd.record_items(Path(env["SW_AB_CONFIGLOG"]), nodes[0], [(root, _env_for(root))])
@@ -326,6 +342,10 @@ def _execute_harness(
     monkeypatch.setattr(executor, "_frozen_cases", lambda: (lock_cases, sorted(nodes)))
     monkeypatch.setattr(executor, "_frozen_case_map", lambda _lock: [{"case_id": "c-cfg"}])
     monkeypatch.setattr(executor, "_applicable_nodes", lambda found, _platform: list(found))
+    monkeypatch.setattr(
+        executor, "_approved_python_skips",
+        lambda *_args: ({node: "rust-only contract" for node in nodes} if approved_a_skips else {}),
+    )
     monkeypatch.setattr(executor, "resolve_manifest", lambda _cli: manifest)
     monkeypatch.setattr(executor, "_release_check", lambda *_a, **_k: {"ok": True})
     monkeypatch.setattr(executor, "_run", fake_run)
@@ -366,6 +386,27 @@ def test_execute_records_missing_config_logs_as_failure_without_raising(
     assert summary["config_errors"], summary
     assert all("設定摘要" in message for message in summary["config_errors"])
     assert not (out / "summary.error.json").exists()
+
+
+def test_execute_records_runner_environment_when_all_a_nodes_are_approved_rust_only_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 輪全為核准 rust_only skip 時，記錄 runner 環境；不得把無 fixture 誤報為摘要缺失。"""
+    cd = _cd()
+    _executor_mod, out, rc = _execute_harness(
+        tmp_path, monkeypatch, write_config={"b": "9"}, approved_a_skips=True,
+    )
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    config_a = json.loads((out / "config-digest-a.json").read_text(encoding="utf-8"))
+    identity_a = json.loads((out / "identity-a.json").read_text(encoding="utf-8"))
+    log_rows = [json.loads(line) for line in (out / "a-config.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert rc == 1, "比較器未被 stub 通過；本測試只驗 A 輪摘要處理"
+    assert summary["config_errors"] == []
+    assert config_a["scope"] == "runner-environment-only"
+    assert config_a["reason"] == "A 輪所有必要節點均為核准的 rust-only skip，沒有隔離夾具"
+    assert identity_a["config_digest"] == cd.aggregate(out / "a-config.jsonl")["digest"]
+    assert len(log_rows) == 1 and log_rows[0]["nodeid"] == "__runner_environment__:approved-rust-only-skips"
 
 
 def test_1a_identity_uses_config_records_instead_of_bundle_directory() -> None:

@@ -522,6 +522,35 @@ def _config_summary(log: Path, out: Path) -> dict[str, Any]:
     return summary
 
 
+def _record_approved_a_skip_environment(
+    *, log: Path, summary_path: Path, out_dir: Path, env: dict[str, str],
+    selected: list[str], approved: dict[str, str], junit: Path, pidlog: Path, returncode: int,
+) -> dict[str, Any] | None:
+    """A 輪所有必要節點皆為核准 rust_only skip 時，摘要實際 runner 環境而非虛構隔離夾具。"""
+    if log.exists() and (not log.is_file() or log.stat().st_size != 0):
+        return None
+    if not _a_round_spawned_nothing(junit, pidlog, returncode, selected, approved):
+        return None
+
+    module = _config_digest_module()
+    root_without_fixtures = out_dir / ".a-approved-skip-environment"
+    rows = module.record_items(
+        log,
+        "__runner_environment__:approved-rust-only-skips",
+        [(root_without_fixtures, env)],
+    )
+    if rows != 1:
+        return None
+    summary = module.aggregate(log)
+    summary.update({
+        "scope": "runner-environment-only",
+        "reason": "A 輪所有必要節點均為核准的 rust-only skip，沒有隔離夾具",
+        "skipped_nodes": sorted(selected),
+    })
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
 def _lock_applicability_sha256() -> str:
     """凍結 lock 與 applicability 檔的雜湊（與設定內容無關，獨立保留於身分）。"""
     return hashlib.sha256(LOCK.read_bytes() + APPLICABILITY.read_bytes()).hexdigest()
@@ -835,10 +864,25 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
     # 設定摘要缺失（紀錄不存在或為空）不以例外中止：記入 config_errors、整體判 fail，summary 仍照常產生。
     config_errors: list[str] = []
     config_digests: dict[str, str] = {}
-    for side, log, summary_path in (("a", a_config_log, config_a_path), ("b", b_config_log, config_b_path)):
+    for side, log, summary_path, side_env in (
+        ("a", a_config_log, config_a_path, a_env),
+        ("b", b_config_log, config_b_path, b_env),
+    ):
         try:
             config_digests[side] = _config_summary(log, summary_path)["digest"]
         except ValueError as exc:
+            if side == "a":
+                try:
+                    skip_summary = _record_approved_a_skip_environment(
+                        log=log, summary_path=summary_path, out_dir=out_dir, env=side_env,
+                        selected=selected_nodes, approved=approved_a_skips,
+                        junit=a_junit, pidlog=a_pidlog, returncode=a_result.returncode,
+                    )
+                except (OSError, ValueError, TypeError):
+                    skip_summary = None
+                if skip_summary is not None:
+                    config_digests[side] = skip_summary["digest"]
+                    continue
             config_errors.append(f"{side.upper()} 輪設定摘要缺失：{exc}")
             config_digests[side] = ""
     identity_a = _baseline_identity(
