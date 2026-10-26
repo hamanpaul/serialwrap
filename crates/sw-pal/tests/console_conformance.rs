@@ -247,6 +247,25 @@ fn tcp_accepted_socket_has_nodelay() {
     assert!(sw_pal::testutil::nodelay(&*io));
 }
 
+/// parity-amendments-2026-10-26 #109（B:E-15）：accept 設 TCP_NODELAY；PAL 回傳的 peer 字串即 Python
+/// `_accept_console_conn` 的 `label`（`f"{addr[0]}:{addr[1]}"`，client 端位址，非 `tcp://…`），listener
+/// `endpoint()` 即 Python `_console_endpoint`（`f"{host}:{port}"`，hub 以它作 TCP console 的 `vtty`／`slave_path`，
+/// `uart_io.py:1278-1305`）。hub 端的 label／vtty 組裝屬 Task 9。
+#[test]
+fn tcp_accept_sets_nodelay_and_label_shape() {
+    let p = sw_pal::native();
+    let mut l = p.console.bind_tcp_console().unwrap();
+    let ep = l.endpoint();
+    let c = std::net::TcpStream::connect(&ep).unwrap();
+    let (io, peer) = sw_pal::testutil::wait_accept(&mut *l, Duration::from_secs(2));
+    assert!(sw_pal::testutil::nodelay(&*io), "accept 後必須設 TCP_NODELAY");
+    let local = c.local_addr().unwrap();
+    assert_eq!(peer, format!("{}:{}", local.ip(), local.port()), "label 形狀與 Python 相同（client 的 ip:port）");
+    let server = c.peer_addr().unwrap();
+    assert_eq!(ep, format!("127.0.0.1:{}", server.port()), "endpoint 形狀與 Python 相同（host:port，無 scheme）");
+    assert!(!peer.contains("://") && !ep.contains("://"));
+}
+
 #[test]
 fn tcp_listener_reuseaddr() {
     let l = sw_pal::native().console.bind_tcp_console().unwrap();
