@@ -858,7 +858,7 @@ def test_manifest_pointer_dir_resolves_from_install_root_not_bin(tmp_path: Path)
 
 
 def test_manifest_pointer_absolute_dir_is_used_as_is(tmp_path: Path) -> None:
-    """保留既有案例 nodeid；絕對 dir 依 Rust launcher／OD-18 (3) 規則拒絕。"""
+    """保留凍結 nodeid；依 OD-18 (3) 拒絕絕對 dir，本案例不增加新覆蓋。"""
     register = _load_register()
     root = tmp_path / "install"
     cli = root / "bin" / "serialwrap.exe"

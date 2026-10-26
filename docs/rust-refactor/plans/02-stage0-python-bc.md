@@ -459,7 +459,7 @@
 - **範圍**：BC-01 Windows 部分：WAL／mirror handle 帶 `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`，`open_osfhandle` 所有權轉移、失敗清理、唯一 close；`DeletePending` 與 FileId 查詢。另提供 SC-10 所需 `LockFileEx` 包裝（由 T15 使用）。依據：規格 §8.2「常駐開檔」第二段、§6.2 Tier 1；arch §4.4、§4.5。
 - **Test author model**：agy-gemini-3.8-flash-high　**Implementer model**：codex-gpt-6-luna-max
 - **Changelog fragment**：`changelog.d/rust-p1-bc01-windows-share-delete.md`（`type: fix`，`scope: wal`）：Windows WAL 以 `CreateFileW` 取得含 share-delete 的常駐 handle，外部改名或刪除不再被 daemon 阻擋。
-- **OD-19 更正（2026-10-23）**：端點防毒驗收與防毒產品無關。常駐 handle 與 rename 的干擾改以 `scripts/stage0/av_sim.py` 模擬防毒持有驗收（seed 可重現、10～500 ms）：一般 Windows-native 測試以不含 FILE_SHARE_DELETE 的 reader 覆蓋共用違規，Spike 3 以允許 delete 的 overlapped RH oplock 變體覆蓋 oplock 路徑。不再需要 EDR 攔截紀錄；防毒產品名與狀態由工具唯讀查詢，只作資訊欄位，查不到寫 `unknown`。本 Task 的正式實跑仍為 BLOCKED-OWNER（Windows host，OD-08）。
+- **OD-19 更正（2026-10-26）**：端點防毒驗收與防毒產品無關。`scripts/stage0/av_sim.py` 以 seed 可重現、10～500 ms 的持有模型注入共用違規；Spike 3 四案主注入一律使用不含 `FILE_SHARE_DELETE` 的 `share_no_delete`，`FILE_SHARE_DELETE` + RH oplock 僅為獨立記錄的第二變體，不能代替主注入。Oplock WAL 寫入及 rotation liveness 由 `test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live` 覆蓋。不再需要 EDR 攔截紀錄；防毒產品名與狀態由工具唯讀查詢，只作資訊欄位，查不到寫 `unknown`。本 Task 的正式實跑仍為 BLOCKED-OWNER（Windows host，OD-08）。
 
 **Files**
 - Create: `sw_core/win32_files.py`、`tests/test_stage0_wal_winfs.py`
