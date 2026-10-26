@@ -493,6 +493,31 @@ def test_windows_com_autostart_case_supplies_release_manifest():
     assert 'env["SERIALWRAP_RELEASE_MANIFEST"]' in body
     assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("run_cli([\"cmd\", \"submit\"")
 
+
+def test_windows_com_autostart_case_pins_com20_profile():
+    """SC-18 綁定唯一核准 DUT 埠，避免依賴空目錄的動態 fallback profile。"""
+    case_file = ROOT / "tests/contract_blackbox/test_cli_mgmt_daemon.py"
+    source = case_file.read_text(encoding="utf-8")
+    body = source.split("def test_autostart_l15_tx_once(", 1)[1]
+    assert 'profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"' in body
+    assert "device_by_id: COM20" in body
+    assert "com: COM0" in body
+    assert body.index("device_by_id: COM20") < body.index("run_cli([\"cmd\", \"submit\"")
+
+
+def test_windows_dev_bundle_keeps_daemon_inside_install_tree():
+    """Windows B 輪 manifest launcher 與執行程序須落在同一版本安裝樹。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    bundle = _ps_function(ps1, "New-WindowsDevBundle")
+    assert "$daemonScript = Join-Path $versionRoot 'serialwrapd.py'" in bundle
+    assert "Copy-Item -LiteralPath (Join-Path $RepoRoot 'serialwrapd.py') -Destination $daemonScript -Force" in bundle
+    assert "Copy-RepoTree (Join-Path $RepoRoot 'sw_core') (Join-Path $versionRoot 'sw_core')" in bundle
+    assert "$launcherPath = 'serialwrapd.py'" in bundle
+    assert "path = $launcherPath; sha256 = Get-Sha256 $daemonScript" in bundle
+    assert "$bundleDaemon = Join-Path $bundleRoot \"versions\\$bundleVersion\\serialwrapd.py\"" in ps1
+    assert "$bundleDaemon $runtimeExe $Label $true" in ps1
+    assert "$pythonDaemon $runtimeExe $Label $true" not in ps1
+
 def test_windows_selftest_writeback_retries_and_compares_both_logs():
     """F8：selftest 回寫最多 3 次有界重試；stdout／stderr 兩份 log 併入 SHA256 逐檔比對（不一致只使證據不足）。"""
     ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")

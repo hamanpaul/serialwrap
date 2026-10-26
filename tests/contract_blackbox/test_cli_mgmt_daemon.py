@@ -270,6 +270,19 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
 
     # fixture 會清除外層 SERIALWRAP_*；重新只放行受測端 COM20，避免掃描其他主機序列埠。
     env["SERIALWRAP_TEST_DEVICE_ALLOWLIST"] = "COM20"
+    # 本案例驗證 on-demand 自動啟動；固定 COM0 → COM20，避免空 profile 目錄落入動態偵測 fallback。
+    profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "windows-com.yaml").write_text(
+        "profiles:\n"
+        "  live-passthrough:\n"
+        "    platform: passthrough\n"
+        "targets:\n"
+        "  - com: COM0\n"
+        "    profile: live-passthrough\n"
+        "    device_by_id: COM20\n",
+        encoding="utf-8",
+    )
     # 使用本案例獨有的 loopback endpoint，避免連到主機既有 daemon 或其他 throwaway run。
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))

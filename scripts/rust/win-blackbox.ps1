@@ -238,6 +238,9 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
     Copy-Item -LiteralPath $RustExecutable -Destination (Join-Path $binRoot 'serialwrap.exe') -Force
     Copy-Item -LiteralPath $RustExecutable -Destination (Join-Path $versionBinRoot 'serialwrap.exe') -Force
     Copy-RepoTree $RuntimeRoot $pythonRoot
+    $daemonScript = Join-Path $versionRoot 'serialwrapd.py'
+    Copy-Item -LiteralPath (Join-Path $RepoRoot 'serialwrapd.py') -Destination $daemonScript -Force
+    Copy-RepoTree (Join-Path $RepoRoot 'sw_core') (Join-Path $versionRoot 'sw_core')
 
     $pythonRelative = if (Test-Path -LiteralPath (Join-Path $pythonRoot 'python.exe')) {
         'py\python.exe'
@@ -247,7 +250,7 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
     $runtimeExe = Join-Path $pythonRoot $pythonRelative.Substring(3)
     $runtimeHash = Get-Sha256 $runtimeExe
     $cliHash = Get-Sha256 (Join-Path $versionBinRoot 'serialwrap.exe')
-    $launcherPath = Join-Path $RepoRoot 'serialwrapd.py'
+    $launcherPath = 'serialwrapd.py'
     $skillPath = Join-Path $RepoRoot 'sw_core/assets/skill/SKILL.md'
     $windowsSkillPath = Join-Path $RepoRoot 'sw_core/assets/skill/SKILL_WINDOWS.md'
     $profilesPath = Join-Path $RepoRoot 'sw_core/assets/profiles'
@@ -283,7 +286,7 @@ function New-WindowsDevBundle([string]$BundleRoot, [string]$RustExecutable, [str
                 implementation = 'python'
                 version = $version
                 git_revision = $Revision
-                launcher = [ordered]@{ path = $launcherPath; sha256 = Get-Sha256 $launcherPath }
+                launcher = [ordered]@{ path = $launcherPath; sha256 = Get-Sha256 $daemonScript }
                 entry = @($pythonRelative, '-I', '-B', $launcherPath)
                 runtime = [ordered]@{ path = $pythonRelative.Replace('\', '/'); python_version = ($runtimeVersion | Select-Object -Last 1).Trim(); sha256 = $runtimeHash }
                 package = [ordered]@{ name = 'serialwrap'; version = $version; wheel_sha256 = $null; tree_sha256 = $packageTreeHash.Trim() }
@@ -973,6 +976,7 @@ try {
     $bundleBin = Join-Path $bundleRoot 'bin'
     # 供 WSL 端 win-blackbox.sh 產生 A/B identity（daemon tree／runtime sha256 取自此 manifest）。
     $bundleVersion = (Get-Content -LiteralPath (Join-Path $stagingRepo 'VERSION') -Raw).Trim()
+    $bundleDaemon = Join-Path $bundleRoot "versions\$bundleVersion\serialwrapd.py"
     Copy-Item -LiteralPath (Join-Path $bundleRoot "versions\$bundleVersion\release-manifest.json") `
         -Destination (Join-Path $outputRoot 'windows-release-manifest.json') -Force
 
@@ -1038,7 +1042,7 @@ try {
             $missing.Add('B 輪未帶 COM pair：selftest 實際失敗或 COM bridge 未啟動')
         }
         $b = Invoke-Blackbox 'b-rust-win' $bStagingJunit (Join-Path $bundleBin 'serialwrap.exe') `
-            $pythonDaemon $runtimeExe $Label $true $stagingResourceReport $bundleRoot `
+            $bundleDaemon $runtimeExe $Label $true $stagingResourceReport $bundleRoot `
             $activePair $activeWire $pidLog
         # B 輪 L1 產物（junit 與 resource-report）自 staging 複製到 OutDir\l1\windows\blackbox\。
         Get-ChildItem -LiteralPath $stagingL1Directory -File -ErrorAction SilentlyContinue | ForEach-Object {
