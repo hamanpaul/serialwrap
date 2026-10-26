@@ -1569,7 +1569,7 @@ git commit -m "feat(sw-pal): WAL 常駐 handle、identity 偵測與不覆蓋歸�
 - Test: `crates/sw-core/tests/wal_writer.rs`
 
 **Interfaces:**
-- Consumes：Task 6 `WalFs`；`sw_proto::pyjson`（`DISK_STABLE`）、`sw_proto::pycompat::{to_printable, iso_utc_now, strftime_utc}`（Task 0c）、`sw_proto::wal_types::{WalRecord, crc32_hex}`（`crc32fast` 只在 sw-proto，arch §1.2）；P1 T02～T05 凍結契約（`contracts/wal_meta_events.schema.json`、`contracts/golden/wal/*`、`contracts/captures/wal/*`）；Task 1 `FakeWalFs`、`FakeClock`。
+- Consumes：Task 6 `WalFs`；`sw_proto::pyjson`（`DISK_STABLE`）、`sw_proto::pycompat::{to_printable, iso_utc_now, strftime_utc}`（Task 0c）、`sw_proto::wal_types::{WalRecord, crc32_hex}`（`crc32fast` 只在 sw-proto，arch §1.2）；P1 T02～T05 凍結契約（`contracts/wal_meta_events.schema.json`、`contracts/golden/wal/*`、`contracts/captures/wal/*`）；Task 1 `FakeWalFs`、`FakeClock`。P1 T02～T05 未產出 `contracts/golden/wal/*.json`（跨計畫缺口）；本 Task 依補充決議加入 Python 基線擷取器與 Rust 重播測試。`contracts/captures/wal/*` 仍未提供；`contracts/golden/wal_line.tsv` 是 P3 的既有補充 fixture，不取代 P1 golden。
 - Produces：
 
 ```rust
@@ -1760,7 +1760,8 @@ fn wal_partial_write_suffix_failure_terminates_tail_next_record_parses() {   // 
 | `new_session_inherits_wal_unhealthy` | unhealthy 期間 `fan.register(new_fence)` → 新 fence 立即 `wal_unhealthy == true` |
 | `identity_throttle_ignores_wall_jump`（Review Focus 4） | `set_wall_us` 倒退 1 h 後 append → 不因 wall 倒退而跳過或重複 identity 檢查（節流只看 mono） |
 | `meta_not_in_com0_tail` | 重建 META 後 `tail_raw_with_meta(None, Some("COM0"), 100)` 不含 META；`com=None` 時含 |
-| `wal_contract_golden_matches_p1` | 讀 P1 `contracts/golden/wal/*.json`（Python 擷取的紀錄位元組）逐案以同輸入重放，輸出位元組相同 |
+| `wal_contract_golden_matches_p1` | 讀 `contracts/golden/wal/*.json`（由 `scripts/stage0/capture_wal_golden.py` 驅動 Python 基線 WalWriter 擷取），逐案以同輸入重放並比對 WAL／mirror 位元組；`tests/test_rust_goldens_fresh.py` 驗證產生結果與 golden 逐位元組相同 |
+| `wal_writer_replays_python_line_fixtures` | 從 `contracts/golden/wal_line.tsv` 動態選取可映射為 `WalAppendReq`、且 payload 長度與 CRC 相符的 rows；目前總列數 50、符合條件 4 列，逐列比對 Python 位元組輸出。此補充測試不取代 P1 golden |
 | `wal_write_failure_twice_sets_loss_flag_and_consumes_seq` | WAL 寫入連續失敗 2 次 → 回 `WalAppend{seq:1, ok:false, loss_flag:true}`、`write_failures==1`；下一筆成功 `seq==2`（seq 缺口保留，04 §1.7） |
 | `wal_partial_write_then_failure_completes_suffix_only`（R2-F3；對應 P1 `test_partial_write_then_eio_completes_suffix_only`） | `fail_next_write_partial(wal, 10, PalError::io(5, "[Errno 5] Input/output error"))`、補寫成功 → `WalAppend{seq:1, ok:true, loss_flag:false}`；`write_calls(wal) == [line, line[10..]]`；`open_calls(wal) == 1`（同 handle 補寫、不重開）；`contents(wal) == line`（恰一行、`loads` 成功、全檔 `"seq":1` 只出現一次，且不含 `line[..10] ++ line`）；`write_failures == 0`、`healthy == true` |
 | `wal_zero_sent_failure_rewrites_whole_line_after_reopen`（R2-F3） | `fail_next_writes(wal, 1, EIO)`（`sent == 0`）→ `ok:true`；`write_calls(wal) == [line, line]`、`open_calls(wal) == 2`（關閉→`ensure_dir`→重開後整行重寫一次）；`contents(wal) == line`；`write_failures == 0` |
@@ -1771,11 +1772,13 @@ fn wal_partial_write_suffix_failure_terminates_tail_next_record_parses() {   // 
 | `reset_rename_error_propagates_and_keeps_seq` | rename 失敗 → `Err(_)`，`current_seq()` 不變（呼叫端轉 `EXCEPTION`） |
 | `health_keys_order` | `to_pydict()` key 依序 `wal_dir, wal_path, wal_dir_exists, wal_file_exists, wal_dir_writable, current_seq, write_failures, last_write_error, recreated_count, healthy, unhealthy_reason`（11 鍵，P1 T05） |
 | `health_missing_file_after_writes_unhealthy` | seq>0 且檔案被刪（尚未 append 觸發重建）→ `healthy==false`、`wal_file_exists==false` |
-| `open_failure_at_startup_marks_unhealthy`（Review Focus 3） | `set_dir_writable("/w", false)` → `WalWriter::open` 不 panic、不開檔（lazy），但於啟動時評估 `dir_writable` → `health().healthy==false`、`unhealthy_reason=="dir_unwritable"`、fanout 註冊的 fence 收到 `true`；append 回 `loss_flag:true`、`write_failures` +1，記憶體不保留未寫紀錄（`fs.contents` 仍為 None、內部無 queue） |
+| `open_failure_at_startup_marks_unhealthy`（Review Focus 3） | `set_dir_writable("/w", false)` → `WalWriter::open` 不 panic、不開檔（lazy），但於啟動時評估 `dir_writable` → `health().healthy==false`、`unhealthy_reason=="dir_unwritable"`、fanout 註冊的 fence 收到 `true`；append 回 `loss_flag:true`、`write_failures` +2（WAL 與 mirror 開檔各計一次），記憶體不保留未寫紀錄（`fs.contents` 仍為 None、內部無 queue）。同一測試另覆蓋啟動時 `read_all` 暫時失敗後先重讀既有 WAL、再從最大序號續寫；失敗未排除前不得以 seq 0 寫入 |
 | `tail_latest_and_range_semantics` | 檔含 seq 1..5：`(None, None, 2)` → seq [4,5]、truncated true；`(Some(2), None, 2)` → [3,4]、truncated true；`(Some(4), None, 2)` → [5]、false；`limit=0` latest → `([], true)`；com 過濾只回該 com |
 | `rows_to_text_lines_keeps_crlf_quirk` | rows payload `b"hello\r\n\x1b[0m\x0b\x7f\xff"` 與 `"é"` → `["hello", "\\x1b[0m\\x0b\\x7f\\xff\\xc3\\xa9", "9"]`（WAL-1.11 KEEP） |
 | `shutdown_syncs_then_closes` | `shutdown()` 後 `fs.sync_calls(wal) >= 1` 且之後 append 回 `ok:false`（SC-11） |
 | `recreate_meta_matches_contract_schema` | 讀 `contracts/wal_meta_events.schema.json`（P1 T05），以手寫最小驗證（`required` 鍵集合、`reason` enum、`previous_identity` pattern、`additionalProperties:false`）通過 |
+
+讀取端逐行解析並限制保留的 decoded rows；目前 `WalFs::read_all` 仍會一次載入原始檔案位元組，真正的串流 I/O 需另行擴充 `WalFs` 介面。§1.2 append 熱路徑預算由 Task 22 `wal_s1w_perf` 實測；Task 7 未執行效能基準或改寫序列化熱路徑。
 
 - [ ] **Step 2：執行並確認 FAIL**
 
