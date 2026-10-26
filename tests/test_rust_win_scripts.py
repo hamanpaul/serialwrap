@@ -358,6 +358,10 @@ def test_windows_blackbox_staging_repo_has_exact_git_revision():
     assert 'git -C "$ROOT" bundle create "$git_bundle" HEAD' in shell
     assert '-GitBundle "$git_bundle_win"' in shell
 
+    workflow = (ROOT / ".github" / "workflows" / "rust.yml").read_text(encoding="utf-8")
+    assert "git -C $root bundle create $gitBundle HEAD" in workflow
+    assert "-GitBundle $gitBundle" in workflow
+
 
 def test_windows_blackbox_ps1_parses_under_windows_powershell():
     """以 Windows PowerShell 解析器語法檢查 win-blackbox.ps1（不執行）；無 powershell.exe 時 SKIP。"""
