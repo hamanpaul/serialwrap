@@ -105,7 +105,7 @@ def scan(proc_root, target, readlink=os.readlink):
     unresolved：fd 目錄可列舉但有 fd 無法 readlink（例如 PermissionError），且未找到 target，判定不足。
     fd 目錄無法列舉（PermissionError 等）同樣計為 unresolved，不得視為已覆蓋。
     """
-    pids, readable, holders, unresolved = [], [], [], []
+    pids, readable, holders, unresolved, unresolved_details = [], [], [], [], []
     for proc in pathlib.Path(proc_root).iterdir():
         if not proc.name.isdigit():
             continue
@@ -116,11 +116,14 @@ def scan(proc_root, target, readlink=os.readlink):
         except FileNotFoundError:
             readable.append(pid)
             continue
-        except OSError:
+        except OSError as exc:
             unresolved.append(pid)
+            unresolved_details.append({"pid": pid, "fd": None, "stage": "listdir",
+                                      "errno": exc.errno, "error": type(exc).__name__})
             continue
         held = False
         blind = False
+        failures = []
         for fd in fds:
             try:
                 if os.path.realpath(readlink(fd)) == target:
@@ -128,13 +131,16 @@ def scan(proc_root, target, readlink=os.readlink):
                     break
             except FileNotFoundError:
                 continue
-            except OSError:
+            except OSError as exc:
                 blind = True
+                failures.append({"pid": pid, "fd": fd.name, "stage": "readlink",
+                                 "errno": exc.errno, "error": type(exc).__name__})
         if held:
             holders.append(pid)
             readable.append(pid)
         elif blind:
             unresolved.append(pid)
+            unresolved_details.extend(failures)
         else:
             readable.append(pid)
     return {
@@ -142,6 +148,7 @@ def scan(proc_root, target, readlink=os.readlink):
         "readable": sorted(readable),
         "holders": sorted(holders),
         "unresolved": sorted(unresolved),
+        "unresolved_details": sorted(unresolved_details, key=lambda item: (item["pid"], item["stage"], str(item["fd"]))),
     }
 
 
@@ -150,7 +157,7 @@ if __name__ == "__main__":
 '''
 
 
-def _scan_proc_fds(target: str, *, as_user: str | None) -> dict[str, list[int]]:
+def _scan_proc_fds(target: str, *, as_user: str | None) -> dict[str, Any]:
     if as_user is None:
         argv = [sys.executable, "-I", "-c", _PROC_FD_SCAN, target]
     else:
@@ -194,10 +201,14 @@ def _holder_pids(device_path: pathlib.Path) -> list[int]:
         if pid not in covered and _proc_uid(pid) in _HOLDER_SCAN_UIDS
     )
     if uncovered:
+        uncovered_set = set(uncovered)
+        root_details = [item for item in root_scan.get("unresolved_details", []) if item.get("pid") in uncovered_set]
+        user_details = [item for item in user_scan.get("unresolved_details", []) if item.get("pid") in uncovered_set]
         raise RuntimeError(
             f"holder 掃描無法解析現存行程 fd：{uncovered}"
             f"（root 未解析 {root_scan.get('unresolved', [])}，"
-            f"{systemd_container.USER} 未解析 {user_scan.get('unresolved', [])}）"
+            f"{systemd_container.USER} 未解析 {user_scan.get('unresolved', [])}；"
+            f"root 詳情 {root_details}；{systemd_container.USER} 詳情 {user_details}）"
         )
     return sorted(set(root_scan["holders"]) | set(user_scan["holders"]))
 

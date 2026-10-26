@@ -91,6 +91,9 @@ def test_unreadable_fd_is_not_counted_as_readable(tmp_path):
     out = _run_scan(root, dev, _readlink_faults({(200, "3"): PermissionError(errno.EACCES, "denied")}))
     assert 200 not in out["readable"], out
     assert out["unresolved"] == [200], out
+    assert out["unresolved_details"] == [
+        {"pid": 200, "fd": "3", "stage": "readlink", "errno": errno.EACCES, "error": "PermissionError"},
+    ], out
     assert out["holders"] == [], out
 
 

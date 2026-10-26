@@ -231,6 +231,15 @@ def test_compose_two_app_containers():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_systemd_holder_scanner_has_only_ptrace_capability():
+    """systemd L1 holder scanner 需 SYS_PTRACE 讀取非-dumpable process fd；其他 service 不得取得額外 capability。"""
+    services = _compose_services()
+    assert services["systemd"].get("cap_add") == ["SYS_PTRACE"]
+    assert all("cap_add" not in svc for name, svc in services.items() if name != "systemd")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_compose_no_real_serial_devices():
     services = _compose_services()
     for name, svc in services.items():
@@ -240,13 +249,15 @@ def test_compose_no_real_serial_devices():
                 for bad in FORBIDDEN_DEVICES:
                     assert bad not in text, f"{name}.{key} 含真實裝置路徑 {bad}"
         assert svc.get("privileged", False) is False, f"{name} 不得 privileged"
-        assert "cap_add" not in svc, f"{name} 不得新增超出 systemd 容器政策的 capabilities"
         # systemd profile 的例外只允許 cgroup: host 與 /sys/fs/cgroup 掛載；其他服務一律不得使用
         systemd = any(str(p).startswith("systemd") for p in (svc.get("profiles") or []))
         if systemd:
+            assert svc.get("cap_add") == ["SYS_PTRACE"], \
+                f"{name} 只允許 holder scanner 所需的 SYS_PTRACE capability"
             if "cgroup" in svc:
                 assert svc["cgroup"] == "host", f"{name} 的 cgroup 只允許 host"
         else:
+            assert "cap_add" not in svc, f"{name} 不得新增 capabilities"
             assert "cgroup" not in svc, f"{name} 非 systemd profile 不得設定 cgroup"
             assert "/sys/fs/cgroup" not in json.dumps(svc.get("volumes") or []), \
                 f"{name} 非 systemd profile 不得掛載 /sys/fs/cgroup"
