@@ -20,3 +20,11 @@ pub fn has_backref(_pattern: &str, _flags: PyFlags) -> Result<bool, CompileError
 pub fn maybe_redos_suspicious(_pattern: &str, _flags: PyFlags) -> Result<bool, CompileError> {
     todo!("P7 Task 11")
 }
+
+impl PyFlags {
+    /// 事件規則 `pattern.flags` 字串（`i`／`s`／`m`）→ 旗標；其他字元回 `Err(ch)`（`_flags_from_string`）。
+    pub fn from_rule_flags(s: &str) -> Result<PyFlags, char> {
+        let _ = s;
+        todo!("P7 Task 11")
+    }
+}

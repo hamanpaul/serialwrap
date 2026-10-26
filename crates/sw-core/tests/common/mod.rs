@@ -9,3 +9,6 @@ pub fn repo_path(rel: &str) -> PathBuf {
 
 /// P6 golden TSV 工具（07 Task 2）。
 pub mod golden;
+
+/// P7 golden 與規則 JSON 工具（08）。
+pub mod p7;
