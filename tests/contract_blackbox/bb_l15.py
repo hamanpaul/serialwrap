@@ -329,8 +329,7 @@ def prepare_profile(env: dict[str, str]) -> Path:
 def start_python_daemon(env: dict[str, str], profile_dir: Path, *, state: str = "READY"):
     from bb_daemon import PyDaemon
 
-    run_dir = ROOT / "target" / f"g5r-{os.getpid() % 100000:05d}-{time.time_ns() % 1000000:06d}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir = Path(tempfile.mkdtemp(prefix="sw-", dir="/tmp"))
     env["SERIALWRAP_RUN_DIR"] = str(run_dir)
     env["SW_G5_TEMP_RUN_DIR"] = str(run_dir)
     daemon = PyDaemon(
@@ -775,6 +774,8 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
 # 限制：取樣為 polling，短於取樣週期的瞬時重疊無法被觀測；判準為「已取樣到的重疊不得存在」，不宣稱完備。
 
 HOLDER_SAMPLE_PERIOD_S = 0.005
+PROC_FD_PERMISSION_RETRIES = 40
+PROC_FD_PERMISSION_RETRY_S = 0.005
 _DEVPTS_MAJORS = frozenset(range(136, 144))
 
 
@@ -798,6 +799,34 @@ def numeric_proc_pids() -> tuple[int, ...]:
     return tuple(sorted({int(name) for name in os.listdir("/proc") if name.isdecimal() and int(name) > 0}))
 
 
+def _proc_pid_state(pid: int) -> str | None:
+    """回傳 `/proc/<pid>/stat` 的 state；行程消失時回傳 None。"""
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    tail = stat_line.rsplit(")", 1)[-1].strip()
+    return tail[0] if tail else "?"
+
+
+def _retry_proc_fd_access(pid: int, operation: Callable[[], Any]) -> Any | None:
+    """短暫 EACCES 時重試；確認行程已消失或成為 zombie 後視為無 fd。"""
+    for attempt in range(PROC_FD_PERMISSION_RETRIES):
+        try:
+            return operation()
+        except PermissionError:
+            try:
+                state = _proc_pid_state(pid)
+            except OSError:
+                state = "?"
+            if state in (None, "Z", "X"):
+                return None
+            if attempt + 1 == PROC_FD_PERMISSION_RETRIES:
+                raise
+            time.sleep(PROC_FD_PERMISSION_RETRY_S)
+    return None
+
+
 def observe_holders(tty_st: os.stat_result, *, pids: Iterable[int]) -> list[int]:
     """只掃描呼叫者明確指定的候選行程，回傳持有 `tty_st` 的 pid（已排序）。
 
@@ -812,14 +841,18 @@ def observe_holders(tty_st: os.stat_result, *, pids: Iterable[int]) -> list[int]
     for pid in candidates:
         fd_dir = f"/proc/{pid}/fd"
         try:
-            fds = os.listdir(fd_dir)
+            fds = _retry_proc_fd_access(pid, lambda: os.listdir(fd_dir))
         except (FileNotFoundError, ProcessLookupError):
+            continue
+        if fds is None:
             continue
         for fd in fds:
             try:
-                fd_st = os.stat(f"{fd_dir}/{fd}")
+                fd_st = _retry_proc_fd_access(pid, lambda: os.stat(f"{fd_dir}/{fd}"))
             except (FileNotFoundError, ProcessLookupError):
                 continue
+            if fd_st is None:
+                break
             if _same_tty(fd_st, tty_st):
                 result.append(pid)
                 break
@@ -904,6 +937,8 @@ class HolderObserver:
         self._slave_path = slave_path
         self._period_s = period_s
         self._discover_all = bool(discover_all)
+        if self._discover_all:
+            assert in_isolated_pidns(), "discover_all 須在隔離 PID namespace 中使用"
         supplied = tuple(pids)
         if not supplied or any(type(pid) is not int or pid <= 0 for pid in supplied):
             raise ValueError("持有者觀測必須提供非空、正整數 PID 集合")

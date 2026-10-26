@@ -89,6 +89,55 @@ def test_oracle_rejects_new_holder_absent_at_end() -> None:
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_numeric_proc_pids_returns_sorted_unique_positive_pids(monkeypatch) -> None:
+    bb = _bb_l15()
+    monkeypatch.setattr(bb.os, "listdir", lambda path: ["7", "0042", "self", "0", "-3", "7"])
+    assert bb.numeric_proc_pids() == (7, 42)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_discover_all_requires_isolated_pid_namespace(monkeypatch) -> None:
+    bb = _bb_l15()
+    monkeypatch.setattr(bb, "in_isolated_pidns", lambda: False)
+    with pytest.raises(AssertionError, match="discover_all.*隔離 PID namespace"):
+        bb.HolderObserver("unused", pids=[4242], discover_all=True)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_start_python_daemon_uses_short_socket_path(tmp_path: Path, monkeypatch) -> None:
+    """深 checkout 下的 Python daemon socket 必須使用短暫存路徑。"""
+    from types import SimpleNamespace
+
+    bb = _bb_l15()
+    monkeypatch.setattr(bb, "ROOT", tmp_path / ("long-checkout-" * 12))
+    captured: dict[str, str] = {}
+
+    class FakeDaemon:
+        proc = None
+
+        def __init__(self, _env, *, profile_dir, socket, lock):
+            captured.update(socket=socket, lock=str(lock), profile_dir=str(profile_dir))
+
+        def start(self, *, timeout_s):
+            captured["timeout_s"] = str(timeout_s)
+
+    monkeypatch.setitem(__import__("sys").modules, "bb_daemon", SimpleNamespace(PyDaemon=FakeDaemon))
+    monkeypatch.setattr(bb, "wait_session", lambda *_args, **_kwargs: {})
+    profile_dir = tmp_path / "profiles"
+    daemon = bb.start_python_daemon({"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, profile_dir)
+    socket_path = Path(captured["socket"])
+    try:
+        assert socket_path.parent == Path("/tmp") or socket_path.parent.as_posix().startswith("/tmp/sw-")
+        assert len(os.fsencode(socket_path)) < 108
+        assert daemon is not None
+    finally:
+        bb._cleanup_short_run_dir({"SW_G5_TEMP_RUN_DIR": str(socket_path.parent)})
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 @pytest.mark.parametrize("denial", ["fd_directory", "fd_stat"])
 def test_holder_observer_fails_closed_when_fd_access_is_denied(tmp_path: Path, monkeypatch, denial: str) -> None:
     """不可讀的 fd 可能是持有 tty 的 holder；目錄與項目權限錯誤都不得轉成空集合。"""
@@ -107,9 +156,69 @@ def test_holder_observer_fails_closed_when_fd_access_is_denied(tmp_path: Path, m
         raise AssertionError(f"unexpected fd path: {path}")
 
     monkeypatch.setattr(bb, "os", type("ProcOS", (), {"listdir": staticmethod(listdir), "stat": staticmethod(denied_stat)}))
+    monkeypatch.setattr(bb, "_proc_pid_state", lambda _pid: "S")
     expected = "fd directory permission denied" if denial == "fd_directory" else "permission denied"
     with pytest.raises(PermissionError, match=expected):
         bb.observe_holders(tty_st, pids=[4242])
+
+
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_observer_ignores_unreaped_zombie_holder(tmp_path: Path) -> None:
+    """真實未回收 zombie 已無 fd；/proc 拒絕列舉時仍須將其視為已釋放。"""
+    bb = _bb_l15()
+    master, slave_path = _open_pty()
+    child = _spawn_holder(slave_path)
+    try:
+        bb.wait_holder(slave_path, child.pid, present=True)
+        child.terminate()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            stat_path = Path(f"/proc/{child.pid}/stat")
+            if stat_path.exists():
+                tail = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[-1].strip()
+                if tail and tail[0] == "Z":
+                    break
+            time.sleep(0.005)
+        else:
+            pytest.fail("被終止的 holder 未進入可觀測的 zombie 狀態")
+        assert bb.observe_holders(os.stat(slave_path), pids=[child.pid]) == []
+    finally:
+        child.wait(timeout=5.0)
+        os.close(master)
+
+
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_observer_survives_holder_killed_during_sampling() -> None:
+    """取樣期間 child 終止並成為未回收 zombie 時，觀測器須完成而不回報權限盲點。"""
+    bb = _bb_l15()
+    master, slave_path = _open_pty()
+    child = _spawn_holder(slave_path)
+    observer = bb.HolderObserver(slave_path, pids=[child.pid], period_s=0.005)
+    try:
+        observer.start()
+        child.terminate()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            stat_path = Path(f"/proc/{child.pid}/stat")
+            if stat_path.exists():
+                tail = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[-1].strip()
+                if tail and tail[0] == "Z":
+                    break
+            time.sleep(0.005)
+        else:
+            pytest.fail("取樣中的 holder 未進入可觀測的 zombie 狀態")
+        time.sleep(0.02)
+        timeline = observer.stop()
+        assert timeline.samples[-1][1] == frozenset()
+    finally:
+        if observer._thread is not None and observer._thread.is_alive():
+            observer.stop()
+        child.wait(timeout=5.0)
+        os.close(master)
 
 
 @pytest.mark.core_portable
@@ -188,6 +297,7 @@ def test_observer_flags_concurrent_holders_and_oracle_rejects_them(monkeypatch) 
         bb.wait_holder(slave_path, old.pid, present=True)
         candidates = [os.getpid(), old.pid]
         monkeypatch.setattr(bb, "numeric_proc_pids", lambda: tuple(candidates), raising=False)
+        monkeypatch.setattr(bb, "in_isolated_pidns", lambda: True)
         observer = bb.HolderObserver(slave_path, pids=[old.pid], discover_all=True)
         try:
             with observer:
@@ -225,6 +335,7 @@ def test_observer_sequential_handoff_passes_oracle(monkeypatch) -> None:
         bb.wait_holder(slave_path, old.pid, present=True)
         candidates = [os.getpid(), old.pid]
         monkeypatch.setattr(bb, "numeric_proc_pids", lambda: tuple(candidates), raising=False)
+        monkeypatch.setattr(bb, "in_isolated_pidns", lambda: True)
         observer = bb.HolderObserver(slave_path, pids=[old.pid], discover_all=True)
         try:
             with observer:
