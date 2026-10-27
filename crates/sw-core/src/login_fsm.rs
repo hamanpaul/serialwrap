@@ -283,9 +283,9 @@ pub fn login_tx_sender(
         if handle.jobs.send(job).is_err() {
             return not_submitted;
         }
-        let result = match report.recv() {
-            Ok(report) => report.result,
-            Err(_) => not_submitted,
+        let result = match handle.wait_report(&report) {
+            Some(report) => report.result,
+            None => not_submitted,
         };
         let _ = handle.settle(op_id);
         result

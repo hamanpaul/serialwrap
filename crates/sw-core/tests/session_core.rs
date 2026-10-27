@@ -1518,23 +1518,30 @@ fn credentials_warning_is_deduplicated_until_manual_recover() {
         0
     );
 
-    let _ = h.rpc(SessionRequest::Recover {
+    // Python 基線（P5-T14 實作 recover 後）：`recover_session` 先清 `credentials_warned`，ATTACHED 分支再經
+    // `_probe_existing_bridge` 重新解析帳密並告警一次——「手動 recover 後恰再告警一次」發生在 recover 本身，
+    // 其後的 attach 又回到去重（0 次）。兩者合計仍恰 1 次 Warn＋1 次 WalMeta。
+    let (_, recover_effects) = h.rpc_full(SessionRequest::Recover {
         timeout_s: 1.0,
         force: false,
     });
     let third = retry_attach(&mut h);
-    assert_eq!(
-        third
+    let warns = |effects: &[Effect]| {
+        effects
             .iter()
             .filter(|e| matches!(e, Effect::Warn(_)))
-            .count(),
-        1
-    );
-    assert_eq!(
-        third
+            .count()
+    };
+    let metas = |effects: &[Effect]| {
+        effects
             .iter()
             .filter(|e| matches!(e, Effect::WalMeta { .. }))
-            .count(),
-        1
-    );
+            .count()
+    };
+    assert_eq!(warns(&recover_effects), 1, "手動 recover 應再告警一次");
+    assert_eq!(metas(&recover_effects), 1);
+    assert_eq!(warns(&third), 0, "recover 已告警，之後 attach 恢復去重");
+    assert_eq!(metas(&third), 0);
+    assert_eq!(warns(&recover_effects) + warns(&third), 1);
+    assert_eq!(metas(&recover_effects) + metas(&third), 1);
 }

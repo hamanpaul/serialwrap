@@ -3,32 +3,46 @@
 //! 型別與公開簽章依 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 11「Produces」與 Task 0 骨架凍結；
 //! 事件處理只更新 session 狀態並產生效果，I/O 由 actor executor 執行。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use sw_pal::traits::{DevicePath, PalError, SerialConfig, SysEnv};
 use sw_proto::config_types::SessionProfile;
 use sw_proto::constants::PASSTHROUGH_READY_QUIET_S;
-use sw_proto::pycompat::{PyErr, clean_text, py_round, uuid4_hex};
+use sw_proto::pycompat::{PyErr, clean_text, py_round, strftime_local, uuid4_dashed, uuid4_hex};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
+use sw_proto::pyre::valid_completion_regex;
 
 use crate::Mono;
-use crate::arbiter::{CmdOutcome, CommandRegistry, RunDecision, SessionQueue, SubmitReq};
+use crate::arbiter::{
+    CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitReq,
+};
+use crate::capture::{
+    AgentLogCapture, BG_CAPTURE_MAX_BYTES, BG_CAPTURE_MAX_COUNT, BackgroundCapture, CaptureEnv,
+    LogFile,
+};
+use crate::lease::{InteractiveLease, Tombstones};
 use crate::drain::{StopId, StopKind, StopOp, WorkerStoppedReceipt};
 use crate::generations::{EpochAllocator, Generations};
-use crate::login_fsm::{LoginPlan, choose_login_plan, login_error_detail};
+use crate::login_fsm::{
+    LoginPlan, choose_login_plan, detect_boot_banner, login_error_detail,
+    matches_login_or_password,
+};
 use crate::mailbox::{
     ControlEvent, DataEvent, DetachReason, MailboxItem, OpenFailure, OpenedBridge, Reply,
     TimerEvent,
 };
-use crate::op_runner::{OpOutcome, OpSpec};
+use crate::op_runner::{OpOutcome, OpSpec, encode_interactive_payload, reject_reason};
 use crate::quiet_gate::{
-    QuietState, QuietTransition, is_reboot_command, slice21_unsupported_feature,
+    QuietState, QuietTransition, is_reboot_command, matches_any_bootloader_prompt,
+    slice21_unsupported_feature,
 };
+use crate::self_test::{NeedProbe, SelfTestBase, SelfTestCtx, SelfTestProbes};
 use crate::session_auth::resolve_session_auth;
 use crate::state_store::{ReleasedRow, StateDelta};
-use crate::tx_writer::{Fence, FlashMode, OpId, TX_LEDGER_LIVE_MAX};
+use crate::tx_writer::{Fence, FenceReject, FlashMode, OpId, TX_LEDGER_LIVE_MAX};
 use crate::uart_bridge::RxShared;
 use crate::wal::WalWriter;
 
@@ -283,9 +297,28 @@ pub struct SessionCore {
     released_by: Option<String>,
     released_at: Option<String>,
     released_reason: Option<String>,
-    interactive_session_id: Option<String>,
-    interactive_owner: Option<String>,
-    interactive_deadline: Option<Mono>,
+    /// agent Interactive Lease（P5-T14；`interactive_session_id` 由此導出）。
+    lease: Option<InteractiveLease>,
+    /// 已到期 lease 的 tombstone（每 session FIFO 16，#54）。
+    tombstones: Tombstones,
+    /// 前景 op 的待辦（以 op_id 索引；回覆與狀態副作用於 `OpFinished` 套用）。
+    pending_ops: HashMap<OpId, PendingOp>,
+    /// background capture（`command.result_tail`；05 §1.1）。
+    background: IndexMap<String, BackgroundCapture>,
+    background_cmd_ids: Vec<String>,
+    background_seq: u64,
+    /// agent log capture（`session.log_start`）。
+    log_capture: Option<AgentLogCapture>,
+    log_file: Option<Box<dyn LogFile>>,
+    capture_env: CaptureEnv,
+    /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 actor 驅動版）。
+    reboot_recovery: Option<RebootRecovery>,
+    /// force recover（clear＋reattach＋等待 READY 10 s）的等待者。
+    force_recover: Option<ForceRecover>,
+    /// self-test 的外部觀測注入（RELEASED holder 掃描、哨兵 PTY 存活）。
+    self_test_probes: SelfTestProbes,
+    /// 最近一筆 RX 的 WAL seq（capture `last_seq`）。
+    last_rx_wal_seq: u64,
     pending_release: Option<PendingRelease>,
     pending_auto_login: bool,
     shutdown_requested: bool,
@@ -309,8 +342,8 @@ struct PendingOpenStop {
 struct LoginRun {
     epoch: u64,
     kind: LoginRunKind,
-    /// `SessionAttach` 再探的等待者（attach 路徑無）。
-    waiters: Vec<Reply>,
+    /// `SessionAttach`／`Recover` 再探的等待者（attach 路徑無）。
+    waiters: Vec<(Reply, ReprobeWaiter)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +352,17 @@ enum LoginRunKind {
     Attach,
     /// 既有 bridge 再探（`_probe_existing_bridge`）。
     Reprobe,
+    /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 `ensure_ready`）。
+    RebootRecovery,
+}
+
+/// 再探等待者的回應形狀。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReprobeWaiter {
+    /// `attach_session`：`_attach_state_result`。
+    Attach,
+    /// `recover_session` ATTACHED 分支：REPROBE payload（SC-34）。
+    Recover { force: bool },
 }
 
 struct PendingRelease {
@@ -411,9 +455,19 @@ impl SessionCore {
             released_by: None,
             released_at: None,
             released_reason: None,
-            interactive_session_id: None,
-            interactive_owner: None,
-            interactive_deadline: None,
+            lease: None,
+            tombstones: Tombstones::new(),
+            pending_ops: HashMap::new(),
+            background: IndexMap::new(),
+            background_cmd_ids: Vec::new(),
+            background_seq: 0,
+            log_capture: None,
+            log_file: None,
+            capture_env: CaptureEnv::default(),
+            reboot_recovery: None,
+            force_recover: None,
+            self_test_probes: SelfTestProbes::default(),
+            last_rx_wal_seq: 0,
             pending_release: None,
             pending_auto_login: false,
             shutdown_requested: false,
@@ -550,12 +604,13 @@ impl SessionCore {
             MailboxItem::Data(DataEvent::UartRxChunk {
                 epoch,
                 rx_seq: _,
-                wal_seq: _,
+                wal_seq,
                 bytes,
             }) => {
-                effects.0.extend(self.rx_chunk(epoch, &bytes, now));
+                effects.0.extend(self.rx_chunk(epoch, &bytes, wal_seq, now));
             }
         }
+        effects.0.extend(self.poll_force_recover(now));
         effects
     }
 
@@ -640,7 +695,7 @@ impl SessionCore {
         out.insert("recovering", PyValue::from(self.recovering));
         out.insert(
             "interactive_session_id",
-            option_string(self.interactive_session_id.as_deref()),
+            option_string(self.lease.as_ref().map(|l| l.interactive_id.as_str())),
         );
         out.insert("foreground_busy", PyValue::from(self.foreground.is_some()));
         out.insert("fg_cmd_expected_duration_s", expected_duration);
@@ -690,7 +745,21 @@ impl SessionCore {
             "released_reason",
             option_string(self.released_reason.as_deref()),
         );
-        out.insert("capture", PyValue::Null);
+        out.insert(
+            "capture",
+            match &self.log_capture {
+                Some(cap) => {
+                    let mut d = PyDict::new();
+                    d.insert("capture_id", PyValue::from(cap.capture_id.clone()));
+                    d.insert("log_path", PyValue::from(cap.log_path.clone()));
+                    d.insert("status", PyValue::from(cap.status));
+                    d.insert("line_count", py_int(cap.line_count as i128));
+                    d.insert("byte_count", py_int(cap.byte_count as i128));
+                    PyValue::Dict(d)
+                }
+                None => PyValue::Null,
+            },
+        );
         out.insert("drain_stalled", PyValue::from(self.drain_stalled));
         out.insert(
             "drain_timeout_epoch",
@@ -753,10 +822,11 @@ impl SessionCore {
         let mut effects = Effects(Vec::new());
         // 再探進行中被 drain 搶進：等待者照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
         if let Some(run) = self.login_run.take() {
-            for waiter in run.waiters {
+            for (waiter, _) in run.waiters {
                 effects.push(Effect::Reply(waiter, Ok(self.session_recovering_reply(now))));
             }
         }
+        self.reboot_recovery = None;
         let already_released = kind == StopKind::Release && self.state == SessionState::Released;
         if kind == StopKind::Shutdown {
             self.shutdown_requested = true;
@@ -932,6 +1002,7 @@ impl SessionCore {
             self.foreground_reboot = false;
             self.login_run = None;
             self.clear_interactive();
+            self.detach_captures();
             match &kind {
                 StopKind::Clear => self.set_last_error(Some("CLEARED".into()), None),
                 StopKind::Removed => {
@@ -959,6 +1030,18 @@ impl SessionCore {
     /// Drain 進行中（SC-05 attach 與 manager 的 open 前檢查用；Task 12）。
     pub fn drain_in_progress(&self) -> bool {
         self.stop.is_some() || self.pending_open_stop.is_some()
+    }
+
+    /// 只供測試（test-fakes）：session 的 `background_cmd_ids`（#45 D-94 淘汰同步）。
+    #[cfg(feature = "test-fakes")]
+    pub fn background_cmd_ids_for_test(&self) -> Vec<String> {
+        self.background_cmd_ids.clone()
+    }
+
+    /// 只供測試（test-fakes）：`pending_auto_login` 旗標（reboot 進 RECOVERING 斷言）。
+    #[cfg(feature = "test-fakes")]
+    pub fn pending_auto_login_for_test(&self) -> bool {
+        self.pending_auto_login
     }
 
     #[cfg(feature = "test-fakes")]
@@ -1352,31 +1435,15 @@ impl SessionCore {
                 allow_attached,
             } => self.interactive_open(owner, timeout_s, command, allow_attached, reply, now),
             SessionRequest::InteractiveClose { interactive_id } => {
-                if self.interactive_session_id.as_deref() == Some(interactive_id.as_str()) {
-                    self.clear_interactive();
-                    vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
-                } else {
-                    vec![Effect::Reply(
-                        reply,
-                        Ok(self.error_session("INTERACTIVE_NOT_FOUND", now)),
-                    )]
-                }
+                vec![Effect::Reply(reply, Ok(self.interactive_close(&interactive_id)))]
             }
             SessionRequest::CancelQueued { cmd_id } => {
                 self.queue.remove(&cmd_id);
                 vec![Effect::Reply(reply, Ok(pydict! { "ok" => true }))]
             }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
-            SessionRequest::Recover { .. } => {
-                self.credentials_warned = false;
-                if self.state == SessionState::Recovering {
-                    vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
-                } else {
-                    vec![Effect::Reply(
-                        reply,
-                        Ok(self.error_session("SESSION_NOT_READY", now)),
-                    )]
-                }
+            SessionRequest::Recover { timeout_s, force } => {
+                self.recover_request(timeout_s, force, reply, now)
             }
             SessionRequest::DeviceAttach { force } => {
                 self.credentials_warned = false;
@@ -1390,17 +1457,33 @@ impl SessionCore {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
             SessionRequest::Bind { .. } => s21_todo!("T15", "bind request"),
-            SessionRequest::InteractiveSend { .. } => {
-                s21_todo!("T14", "interactive send request")
-            }
-            SessionRequest::InteractiveStatus { .. } => {
-                s21_todo!("T14", "interactive status request")
-            }
-            SessionRequest::SelfTest { .. } => s21_todo!("T15", "self-test request"),
-            SessionRequest::LogStart | SessionRequest::LogStop | SessionRequest::LogStatus => {
-                s21_todo!("T15", "log capture request")
-            }
-            SessionRequest::ResultTail { .. } => s21_todo!("T14", "result-tail request"),
+            SessionRequest::InteractiveSend {
+                interactive_id,
+                data,
+                encoding,
+            } => self.interactive_send(interactive_id, &data, &encoding, reply, now),
+            SessionRequest::InteractiveStatus {
+                interactive_id,
+                screen_chars,
+            } => vec![Effect::Reply(
+                reply,
+                Ok(self.interactive_status(&interactive_id, screen_chars, now)),
+            )],
+            SessionRequest::SelfTest {
+                timeout_s,
+                strict_human_lock,
+            } => self.self_test_request(timeout_s, strict_human_lock, reply, now),
+            SessionRequest::LogStart => vec![Effect::Reply(reply, self.log_start(now))],
+            SessionRequest::LogStop => vec![Effect::Reply(reply, Ok(self.log_stop(now)))],
+            SessionRequest::LogStatus => vec![Effect::Reply(reply, Ok(self.log_status(now)))],
+            SessionRequest::ResultTail {
+                cmd_id,
+                from_chunk,
+                limit,
+            } => vec![Effect::Reply(
+                reply,
+                self.result_tail(&cmd_id, from_chunk, limit, now),
+            )],
         }
     }
 
@@ -1560,7 +1643,7 @@ impl SessionCore {
             };
         self.queue.push(admitted.queued, &self.deps.registry);
         let mut effects = vec![Effect::Reply(reply, Ok(admitted.response))];
-        effects.extend(self.start_next());
+        effects.extend(self.start_next(now));
         effects
     }
 
@@ -1616,12 +1699,9 @@ impl SessionCore {
                 if self.is_passthrough() && self.state == SessionState::Attached {
                     return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
                 }
-                let human_lease = self
-                    .interactive_owner
-                    .as_deref()
-                    .is_some_and(|owner| owner.starts_with("human:"));
+                let human_lease = self.lease.as_ref().is_some_and(InteractiveLease::is_human);
                 if !human_lease && self.state == SessionState::Attached {
-                    return self.reprobe_existing_bridge(reply, now);
+                    return self.reprobe_existing_bridge(reply, ReprobeWaiter::Attach, now);
                 }
                 if self.is_passthrough() {
                     return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
@@ -2104,6 +2184,13 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
+        if self
+            .login_run
+            .as_ref()
+            .is_some_and(|run| run.epoch == epoch && run.kind == LoginRunKind::RebootRecovery)
+        {
+            return self.reboot_login_finished(epoch, result, now);
+        }
         let reprobe = self
             .login_run
             .as_ref()
@@ -2167,8 +2254,8 @@ impl SessionCore {
                 }
             }
         }
-        for waiter in waiters {
-            effects.push(Effect::Reply(waiter, Ok(self.attach_state_result(now))));
+        for (waiter, kind) in waiters {
+            effects.extend(self.reprobe_reply(waiter, kind, now));
         }
         effects
     }
@@ -2210,18 +2297,23 @@ impl SessionCore {
     }
 
     /// `attach_session` 的 ATTACHED 分支：`_probe_existing_bridge`（quiet 單點 gate、重新解析帳密、同步 probe）。
-    fn reprobe_existing_bridge(&mut self, reply: Reply, now: Mono) -> Vec<Effect> {
+    fn reprobe_existing_bridge(
+        &mut self,
+        reply: Reply,
+        kind: ReprobeWaiter,
+        now: Mono,
+    ) -> Vec<Effect> {
         let Some(epoch) = self.generations.conn_epoch else {
-            return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+            return self.reprobe_reply(reply, kind, now);
         };
         if let Some(run) = self.login_run.as_mut() {
             if run.kind == LoginRunKind::Reprobe && run.epoch == epoch {
-                run.waiters.push(reply);
+                run.waiters.push((reply, kind));
                 return Vec::new();
             }
         }
         if self.is_passthrough() || !self.profile.template.command_capable() {
-            return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+            return self.reprobe_reply(reply, kind, now);
         }
         let quiet_blocks = self.quiet.quiet_active(now);
         if quiet_blocks {
@@ -2229,7 +2321,7 @@ impl SessionCore {
             if self.state != SessionState::Ready {
                 self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
             }
-            return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+            return self.reprobe_reply(reply, kind, now);
         }
         // `_begin_login_run_locked`：新登入世代，舊 run 的 TX 由 fence FsmMismatch 撤銷。
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
@@ -2244,20 +2336,20 @@ impl SessionCore {
                 self.set_last_error(Some("CREDENTIALS_UNRESOLVED".into()), None);
                 self.pending_auto_login = false;
                 self.set_state(SessionState::Attached, now);
-                effects.push(Effect::Reply(reply, Ok(self.attach_state_result(now))));
+                effects.extend(self.reprobe_reply(reply, kind, now));
                 effects
             }
             LoginPlan::None => {
                 // Slice 2.1 能力閘：不自動送 TX，誠實回報現況。
                 let mut effects = self.unsupported_warning();
-                effects.push(Effect::Reply(reply, Ok(self.attach_state_result(now))));
+                effects.extend(self.reprobe_reply(reply, kind, now));
                 effects
             }
             plan => {
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Reprobe,
-                    waiters: vec![reply],
+                    waiters: vec![(reply, kind)],
                 });
                 vec![Effect::StartLogin {
                     epoch,
@@ -2268,24 +2360,30 @@ impl SessionCore {
         }
     }
 
-    fn rx_chunk(&mut self, epoch: u64, bytes: &[u8], now: Mono) -> Vec<Effect> {
+    fn rx_chunk(&mut self, epoch: u64, bytes: &[u8], wal_seq: u64, now: Mono) -> Vec<Effect> {
         if self.generations.conn_epoch != Some(epoch) || bytes.is_empty() {
             return Vec::new();
         }
         self.last_rx_mono = now;
         self.last_rx_at = Some(self.wall_iso());
+        self.last_rx_wal_seq = wal_seq;
+        let chunk = clean_text(&String::from_utf8_lossy(bytes));
         if self.is_passthrough() {
             // SC-35：passthrough 不 arm quiet，只重設安靜視窗。
             if self.state == SessionState::Attached {
                 self.quiet_since = Some(now);
             }
+            if !chunk.is_empty() {
+                self.capture_rx(&chunk, wal_seq, now);
+            }
             return Vec::new();
         }
-        let chunk = clean_text(&String::from_utf8_lossy(bytes));
         if chunk.is_empty() {
             return Vec::new();
         }
-        match self.quiet.on_rx_text(&chunk, &self.profile, now) {
+        let transition = self.quiet.on_rx_text(&chunk, &self.profile, now);
+        self.capture_rx(&chunk, wal_seq, now);
+        match transition {
             QuietTransition::Armed => self.apply_quiet_armed(now),
             QuietTransition::Cleared => {
                 // 只解除 TX 靜默維度；reconfirm pending 保留（#162）。
@@ -2358,11 +2456,13 @@ impl SessionCore {
                 Vec::new()
             }
             TimerEvent::LeaseExpiry { lease_id, deadline }
-                if self.interactive_session_id.as_deref() == Some(lease_id.as_str())
-                    && self.interactive_deadline == Some(deadline)
-                    && now >= deadline =>
+                if self.lease.as_ref().is_some_and(|lease| {
+                    lease.interactive_id == lease_id
+                        && !lease.is_human()
+                        && lease.deadline() == deadline
+                }) && now >= deadline =>
             {
-                self.clear_interactive();
+                self.close_lease(true);
                 Vec::new()
             }
             TimerEvent::DrainTimeout { epoch, stop_id } => {
@@ -2375,6 +2475,15 @@ impl SessionCore {
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.expire_reconfirm(now);
+        // SC-13：1 s tick 主動收回到期的 agent lease（`_expire_interactive_leases_tick`，留 tombstone）。
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_human() && lease.expired(now))
+        {
+            self.close_lease(true);
+        }
+        effects.extend(self.reboot_recovery_tick(now));
         let flash_off = self.deps.fence.with(|f| f.flash_mode == FlashMode::Off);
         if self.is_passthrough()
             && self.state == SessionState::Attached
@@ -2510,6 +2619,7 @@ impl SessionCore {
         self.queue_registered = false;
         self.queue = SessionQueue::new();
         self.clear_interactive();
+        self.detach_captures();
         self.quiet = QuietState::default();
         self.login_run = None;
         self.foreground_reboot = false;
@@ -2719,6 +2829,114 @@ impl SessionCore {
         self.set_state(SessionState::Released, now);
     }
 
+    // -----------------------------------------------------------------------
+    // P5-T14：命令執行（出列 execute-time gate、OpFinished 結算）、agent Interactive Lease、
+    // recover／force recover、reboot recovery、self-test、background／agent log capture。
+    // -----------------------------------------------------------------------
+
+    fn session_value(&self, now: Mono) -> PyValue {
+        PyValue::Dict(self.public(
+            now,
+            &PublicCtx {
+                console_count: 0,
+                vtty: None,
+                console_endpoint: None,
+            },
+        ))
+    }
+
+    fn selector_error(&self, code: &str) -> PyDict {
+        pydict! {
+            "ok" => false,
+            "error_code" => code,
+            "selector" => self.profile.com.clone(),
+        }
+    }
+
+    /// `_lease_context`：4 個 LeaseContext 鍵（Slice 2.1 無 human 鍵入追蹤，`human_active` 恆 false）。
+    fn lease_ctx(&self) -> Vec<(&'static str, PyValue)> {
+        let owner = self.lease.as_ref().map(|lease| lease.owner.clone());
+        let human_attached = owner.as_deref().is_some_and(|o| o.starts_with("human:"));
+        vec![
+            (
+                "interactive_owner",
+                owner.map(PyValue::from).unwrap_or(PyValue::Null),
+            ),
+            ("human_attached", PyValue::Bool(human_attached)),
+            ("human_active", PyValue::Bool(false)),
+            (
+                "recovery_mode",
+                PyValue::Bool(self.lease.as_ref().is_some_and(|lease| lease.recovery_mode)),
+            ),
+        ]
+    }
+
+    fn extend_pairs(out: &mut PyDict, pairs: Vec<(&'static str, PyValue)>) {
+        for (key, value) in pairs {
+            out.insert(key, value);
+        }
+    }
+
+    // ---------------- lease ----------------
+
+    /// 開新 lease：owner_gen 遞增（舊 LeaseOwner job 由 fence `OwnerMismatch` 撤銷）。
+    fn open_lease(&mut self, owner: &str, timeout_s: f64, recovery_mode: bool, now: Mono) -> String {
+        let id = self.next_uuid();
+        let lease = InteractiveLease::new(
+            id.clone(),
+            owner.to_string(),
+            self.wall_iso(),
+            timeout_s,
+            now,
+            recovery_mode,
+        );
+        self.lease = Some(lease);
+        self.bump_owner_gen();
+        id
+    }
+
+    fn bump_owner_gen(&mut self) {
+        self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
+        self.deps
+            .fence
+            .with(|f| f.owner_gen = self.generations.owner_gen);
+    }
+
+    /// 關閉目前 lease；`expired` 時留 tombstone（`keep_tombstone=True`）。
+    fn close_lease(&mut self, expired: bool) {
+        if let Some(lease) = self.lease.take() {
+            if expired {
+                self.tombstones.push(lease.interactive_id, "expired");
+            }
+            self.bump_owner_gen();
+        }
+    }
+
+    fn clear_interactive(&mut self) {
+        self.close_lease(false);
+    }
+
+    /// `_refresh_interactive_locked`：agent lease lazy 到期 → expired tombstone。
+    fn refresh_lease(&mut self, now: Mono) {
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_human() && lease.expired(now))
+        {
+            self.close_lease(true);
+        }
+    }
+
+    fn lease_expiry_timer(&self) -> Option<Effect> {
+        self.lease.as_ref().filter(|l| !l.is_human()).map(|lease| Effect::Schedule {
+            at: lease.deadline(),
+            ev: TimerEvent::LeaseExpiry {
+                lease_id: lease.interactive_id.clone(),
+                deadline: lease.deadline(),
+            },
+        })
+    }
+
     fn interactive_open(
         &mut self,
         owner: String,
@@ -2729,166 +2947,317 @@ impl SessionCore {
         now: Mono,
     ) -> Vec<Effect> {
         if self.state == SessionState::Recovering {
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "SESSION_RECOVERING",
-                    "selector" => self.profile.com.clone(),
-                }),
-            )];
+            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_RECOVERING")))];
         }
         if self.state == SessionState::Flashing {
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "FLASHING_BUSY",
-                    "selector" => self.profile.com.clone(),
-                }),
-            )];
+            return vec![Effect::Reply(reply, Ok(self.selector_error("FLASHING_BUSY")))];
         }
-        if self.state != SessionState::Ready
-            && !(allow_attached && self.state == SessionState::Attached)
-        {
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "SESSION_NOT_READY",
-                    "selector" => self.profile.com.clone(),
-                }),
-            )];
+        if self.generations.conn_epoch.is_none() {
+            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
         }
-        if self.foreground.is_some() {
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "SESSION_BUSY",
-                    "selector" => self.profile.com.clone(),
-                }),
-            )];
-        }
-        if self.interactive_session_id.is_some() {
-            let mut result = pydict! {
-                "ok" => false,
-                "error_code" => "SESSION_INTERACTIVE_BUSY",
+        let mut result;
+        if self.state == SessionState::Ready {
+            if self.foreground.is_some() {
+                return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
+            }
+            self.refresh_lease(now);
+            let mut soft_preempted = false;
+            if let Some(existing) = self.lease.as_ref() {
+                // #53 soft preempt：human lease 閒置時 agent 可取得控制權（Slice 2.1 無 human console 回放，直接替換）。
+                if existing.is_human() && !owner.starts_with("human:") {
+                    self.lease = None;
+                    soft_preempted = true;
+                } else {
+                    let mut busy = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
+                    busy.insert(
+                        "interactive_session_id",
+                        PyValue::from(existing.interactive_id.clone()),
+                    );
+                    return vec![Effect::Reply(reply, Ok(busy))];
+                }
+            }
+            let id = self.open_lease(&owner, timeout_s, false, now);
+            result = pydict! {
+                "ok" => true,
+                "interactive_id" => id,
+                "session" => self.session_value(now),
+                "recovery_mode" => false,
             };
-            result.insert(
-                "interactive_session_id",
-                option_string(self.interactive_session_id.as_deref()),
-            );
-            return vec![Effect::Reply(reply, Ok(result))];
-        }
-        let lease_id = self.next_uuid();
-        let duration_ns = (timeout_s.max(0.0) * 1_000_000_000.0) as u64;
-        let deadline = now.saturating_add(duration_ns);
-        self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
-        self.deps
-            .fence
-            .with(|f| f.owner_gen = self.generations.owner_gen);
-        self.interactive_session_id = Some(lease_id.clone());
-        self.interactive_owner = Some(owner.clone());
-        self.interactive_deadline = Some(deadline);
-        let start_op = if !command.is_empty() {
-            self.next_op_id = self.next_op_id.saturating_add(1);
-            let epoch = self.generations.conn_epoch.unwrap_or_default();
-            let grant = OpGrant {
-                op_id: OpId(self.next_op_id),
-                epoch,
-                owner_gen: self.generations.owner_gen,
-                fsm_gen: self.generations.fsm_gen,
-                cmd_id: None,
+            if soft_preempted {
+                result.insert("soft_preempted", PyValue::Bool(true));
+            }
+        } else if !allow_attached {
+            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
+        } else if self.state == SessionState::Attached {
+            if self.vtty_alive() == Some(false) {
+                return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
+            }
+            let tail = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
+            let matched =
+                matches_any_bootloader_prompt(&tail, &self.profile.template.bootloader_prompts);
+            let mut boot_interrupt = false;
+            let mut login_required = false;
+            if matched.is_none() {
+                if detect_boot_banner(&tail) {
+                    boot_interrupt = true;
+                } else if matches_login_or_password(&tail, &self.profile) {
+                    login_required = true;
+                } else {
+                    let mut out = self.selector_error("SESSION_NOT_READY");
+                    out.insert("error_detail", PyValue::from("NOT_BOOTLOADER"));
+                    return vec![Effect::Reply(reply, Ok(out))];
+                }
+            }
+            self.refresh_lease(now);
+            let clamped = timeout_s.min(MAX_RECOVERY_LEASE_S);
+            if let Some(existing) = self.lease.as_ref() {
+                if existing.is_human() {
+                    self.lease = None;
+                } else {
+                    let mut busy = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
+                    busy.insert(
+                        "interactive_session_id",
+                        PyValue::from(existing.interactive_id.clone()),
+                    );
+                    return vec![Effect::Reply(reply, Ok(busy))];
+                }
+            }
+            let id = self.open_lease(&owner, clamped, true, now);
+            result = pydict! {
+                "ok" => true,
+                "interactive_id" => id,
+                "session" => self.session_value(now),
+                "recovery_mode" => true,
             };
-            self.foreground = Some(grant.clone());
-            Some((grant, OpSpec::InteractiveOpenCmd { command, owner }))
+            if boot_interrupt {
+                result.insert("boot_interrupt", PyValue::Bool(true));
+            }
+            if login_required {
+                result.insert("login_required", PyValue::Bool(true));
+            }
+        } else {
+            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
+        }
+        let interactive_id = self
+            .lease
+            .as_ref()
+            .map(|lease| lease.interactive_id.clone())
+            .unwrap_or_default();
+        let mut effects = vec![Effect::Notify(ManagerNote::InteractiveOpened {
+            sid: self.sid.clone(),
+            interactive_id,
+        })];
+        effects.extend(self.lease_expiry_timer());
+        if command.is_empty() || self.foreground.is_some() {
+            effects.push(Effect::Reply(reply, Ok(result)));
+            return effects;
+        }
+        let grant = self.new_grant(None);
+        self.pending_ops.insert(
+            grant.op_id,
+            PendingOp::InteractiveOpen {
+                reply,
+                result,
+            },
+        );
+        self.foreground = Some(grant.clone());
+        effects.push(Effect::StartOp {
+            grant,
+            spec: OpSpec::InteractiveOpenCmd { command, owner },
+        });
+        effects
+    }
+
+    fn new_grant(&mut self, cmd_id: Option<String>) -> OpGrant {
+        self.next_op_id = self.next_op_id.saturating_add(1);
+        OpGrant {
+            op_id: OpId(self.next_op_id),
+            epoch: self.generations.conn_epoch.unwrap_or_default(),
+            owner_gen: self.generations.owner_gen,
+            fsm_gen: self.generations.fsm_gen,
+            cmd_id,
+        }
+    }
+
+    fn lease_lookup_error(&self, interactive_id: &str) -> PyDict {
+        let code = if self.tombstones.status_of(interactive_id) == Some("expired") {
+            "INTERACTIVE_EXPIRED"
+        } else {
+            "INTERACTIVE_NOT_FOUND"
+        };
+        pydict! { "ok" => false, "error_code" => code, "interactive_id" => interactive_id }
+    }
+
+    fn lease_matches(&self, interactive_id: &str) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.interactive_id == interactive_id)
+    }
+
+    fn interactive_send(
+        &mut self,
+        interactive_id: String,
+        data: &str,
+        encoding: &str,
+        reply: Reply,
+        now: Mono,
+    ) -> Vec<Effect> {
+        if !self.lease_matches(&interactive_id) {
+            return vec![Effect::Reply(reply, Ok(self.lease_lookup_error(&interactive_id)))];
+        }
+        let id = interactive_id.as_str();
+        let expired = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_human() && lease.expired(now));
+        if expired {
+            self.close_lease(true);
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED", "interactive_id" => id }),
+            )];
+        }
+        let code = if self.generations.conn_epoch.is_none() {
+            Some("SESSION_NOT_READY")
+        } else if self.state == SessionState::Flashing {
+            Some("FLASHING_BUSY")
+        } else if self.foreground.is_some() {
+            Some("SESSION_BUSY")
         } else {
             None
         };
-        let mut effects = vec![
-            Effect::Reply(
+        if let Some(code) = code {
+            return vec![Effect::Reply(
                 reply,
-                Ok(pydict! {
-                    "ok" => true,
-                    "interactive_id" => lease_id.clone(),
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
-                }),
-            ),
-            Effect::Schedule {
-                at: deadline,
-                ev: TimerEvent::LeaseExpiry {
-                    lease_id: lease_id.clone(),
-                    deadline,
-                },
-            },
-        ];
-        if let Some((grant, spec)) = start_op {
-            effects.push(Effect::StartOp { grant, spec });
+                Ok(pydict! { "ok" => false, "error_code" => code, "interactive_id" => id }),
+            )];
         }
-        effects
-    }
-
-    fn clear_interactive(&mut self) {
-        if self.interactive_session_id.take().is_some() {
-            self.interactive_owner = None;
-            self.interactive_deadline = None;
-            self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
-            self.deps
-                .fence
-                .with(|f| f.owner_gen = self.generations.owner_gen);
-        }
-    }
-
-    fn op_finished(
-        &mut self,
-        op_id: OpId,
-        epoch: u64,
-        outcome: OpOutcome,
-        _now: Mono,
-    ) -> Vec<Effect> {
-        if self.stop.as_ref().is_some_and(|stop| {
-            stop.epoch == epoch
-                && stop
-                    .aborted_op
-                    .as_ref()
-                    .is_some_and(|(aborted_id, _)| *aborted_id == op_id)
-        }) {
-            return Vec::new();
-        }
-        let Some(grant) = self.foreground.as_ref() else {
-            return Vec::new();
+        let payload = match encode_interactive_payload(data, encoding) {
+            Ok(payload) => payload,
+            Err(error) => return vec![Effect::Reply(reply, Err(error))],
         };
-        if grant.op_id != op_id || grant.epoch != epoch {
-            return Vec::new();
-        }
-        let cmd_id = grant.cmd_id.clone();
-        self.foreground = None;
-        self.foreground_reboot = false;
-        if let Some(cmd_id) = cmd_id {
-            let result = match outcome {
-                OpOutcome::CommandResult(result) | OpOutcome::SelfTest(result) => {
-                    CmdOutcome::Result(result)
-                }
-                OpOutcome::SendFailed => CmdOutcome::SendFailed,
-                _ => CmdOutcome::Aborted(crate::arbiter::AbortClass::Unknown),
-            };
-            self.deps
-                .registry
-                .complete(&cmd_id, result, &self.wall_iso());
-        }
-        let mut effects = vec![Effect::SettleTx { epoch, op_id }];
-        effects.extend(self.start_next());
-        effects
+        let owner = self
+            .lease
+            .as_ref()
+            .map(|lease| lease.owner.clone())
+            .unwrap_or_default();
+        let grant = self.new_grant(None);
+        self.pending_ops.insert(
+            grant.op_id,
+            PendingOp::InteractiveSend {
+                reply,
+                interactive_id: interactive_id.clone(),
+            },
+        );
+        self.foreground = Some(grant.clone());
+        vec![Effect::StartOp {
+            grant,
+            spec: OpSpec::InteractiveSend { payload, owner },
+        }]
     }
 
-    fn start_next(&mut self) -> Vec<Effect> {
+    fn interactive_status(&mut self, interactive_id: &str, screen_chars: i128, now: Mono) -> PyDict {
+        if !self.lease_matches(interactive_id) {
+            return self.lease_lookup_error(interactive_id);
+        }
+        if self.generations.conn_epoch.is_none() {
+            return pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY", "interactive_id" => interactive_id };
+        }
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_human() && lease.expired(now))
+        {
+            self.close_lease(true);
+            return pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED", "interactive_id" => interactive_id };
+        }
+        let lease = self.lease.as_mut().expect("已確認 lease");
+        lease.touch(now);
+        let (owner, status, recovery_mode) =
+            (lease.owner.clone(), lease.status, lease.recovery_mode);
+        let screen = clean_text(&py_tail(&self.deps.rx.tail(0), screen_chars));
+        pydict! {
+            "ok" => true,
+            "interactive_id" => interactive_id,
+            "owner" => owner,
+            "status" => status,
+            "recovery_mode" => recovery_mode,
+            "screen" => screen,
+            "session" => self.session_value(now),
+        }
+    }
+
+    fn interactive_close(&mut self, interactive_id: &str) -> PyDict {
+        if !self.lease_matches(interactive_id) {
+            return self.lease_lookup_error(interactive_id);
+        }
+        self.close_lease(false);
+        pydict! { "ok" => true, "interactive_id" => interactive_id }
+    }
+
+    // ---------------- 出列與 execute-time gate ----------------
+
+    /// 05 §5.1 execute-time 順序（completion regex → FLASHING → 非 READY → gate → recovering → lease）。
+    fn execute_time_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
+        let completion = command
+            .req
+            .completion_regex
+            .as_ref()
+            .map(|pattern| PyValue::from(pattern.clone()));
+        if !valid_completion_regex(completion.as_ref()) {
+            return Some(pydict! { "ok" => false, "error_code" => "INVALID_COMPLETION_REGEX" });
+        }
+        let mode = normalized_mode(&command.req.mode);
+        if self.state == SessionState::Flashing {
+            return Some(self.selector_error("FLASHING_BUSY"));
+        }
+        if self.state != SessionState::Ready || self.generations.conn_epoch.is_none() {
+            return Some(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY" });
+        }
+        let human = command.req.source.starts_with("human:");
+        if !human && !self.is_passthrough() {
+            self.expire_reconfirm(now);
+            if self.quiet.failed {
+                let mut out = self.selector_error("READY_UNCONFIRMED");
+                out.insert(
+                    "hint",
+                    PyValue::from("READY 已逾 300s／5 次未能經 nonce probe 再確認（可能卡在 bootloader）；請 session self-test 取分類後 interactive-open 處理"),
+                );
+                out.insert("recommended_action", PyValue::from("self_test"));
+                return Some(out);
+            }
+            if self.quiet.quiet_active(now) || self.quiet.pending {
+                let retry = self.quiet.remaining_s(now).unwrap_or(READY_RECONFIRM_RETRY_S);
+                let mut out = self.selector_error("AUTOBOOT_QUIET");
+                out.insert("retry_after_s", PyValue::from(retry));
+                return Some(out);
+            }
+        }
+        if self.recovering {
+            return Some(pydict! { "ok" => false, "error_code" => "SESSION_RECOVERING" });
+        }
+        self.refresh_lease(now);
+        if let Some(lease) = self.lease.as_ref() {
+            if mode != "interactive" && !(!human && lease.is_human()) {
+                let mut out = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
+                out.insert(
+                    "interactive_session_id",
+                    PyValue::from(lease.interactive_id.clone()),
+                );
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    fn start_next(&mut self, now: Mono) -> Vec<Effect> {
+        let mut effects = Vec::new();
         if self.foreground.is_some() || self.state != SessionState::Ready {
-            return Vec::new();
+            return effects;
         }
         loop {
             let Some(command) = self.queue.pop() else {
-                return Vec::new();
+                return effects;
             };
             if matches!(
                 self.deps
@@ -2898,25 +3267,1354 @@ impl SessionCore {
             ) {
                 continue;
             }
-            let Some(epoch) = self.generations.conn_epoch else {
-                return Vec::new();
-            };
-            self.next_op_id = self.next_op_id.saturating_add(1);
-            let grant = OpGrant {
-                op_id: OpId(self.next_op_id),
-                epoch,
-                owner_gen: self.generations.owner_gen,
-                fsm_gen: self.generations.fsm_gen,
-                cmd_id: Some(command.cmd_id.clone()),
-            };
+            if let Some(reject) = self.execute_time_reject(&command, now) {
+                self.deps.registry.complete(
+                    &command.cmd_id,
+                    CmdOutcome::Result(reject),
+                    &self.wall_iso(),
+                );
+                continue;
+            }
+            let mode = normalized_mode(&command.req.mode).to_string();
+            // #45 D-44：同 session 非 background 命令開始前，終結既有 background capture。
+            if mode != "background" {
+                for id in self.background_cmd_ids.clone() {
+                    if let Some(capture) = self.background.get_mut(&id) {
+                        capture.status = "done";
+                    }
+                }
+            }
+            let grant_cmd = Some(command.cmd_id.clone());
+            if mode == "interactive" {
+                let timeout = command
+                    .req
+                    .timeout_s
+                    .max(self.profile.template.hard_timeout_s);
+                let lease_id = self.open_lease(&command.req.source, timeout, false, now);
+                effects.push(Effect::Notify(ManagerNote::InteractiveOpened {
+                    sid: self.sid.clone(),
+                    interactive_id: lease_id.clone(),
+                }));
+                effects.extend(self.lease_expiry_timer());
+                let result = pydict! {
+                    "ok" => true,
+                    "execution_mode" => "interactive",
+                    "interactive_session_id" => lease_id.clone(),
+                    "stdout" => "",
+                    "status" => "interactive",
+                };
+                if command.req.command.is_empty() {
+                    self.deps.registry.complete(
+                        &command.cmd_id,
+                        CmdOutcome::Result(result),
+                        &self.wall_iso(),
+                    );
+                    continue;
+                }
+                let grant = self.new_grant(grant_cmd);
+                self.pending_ops.insert(
+                    grant.op_id,
+                    PendingOp::InteractiveCmd {
+                        cmd_id: command.cmd_id.clone(),
+                        result,
+                    },
+                );
+                self.foreground = Some(grant.clone());
+                let owner = command.req.source.clone();
+                effects.push(Effect::StartOp {
+                    grant,
+                    spec: OpSpec::InteractiveOpenCmd {
+                        command: command.req.command.clone(),
+                        owner,
+                    },
+                });
+                return effects;
+            }
+            if mode == "background" {
+                self.create_background_capture(&command.cmd_id, now);
+                self.background_cmd_ids.push(command.cmd_id.clone());
+            }
+            let reboot = !self.is_passthrough() && is_reboot_command(&command.req.command);
+            let grant = self.new_grant(grant_cmd);
+            self.pending_ops.insert(
+                grant.op_id,
+                PendingOp::Command {
+                    cmd_id: command.cmd_id.clone(),
+                    mode,
+                    reboot,
+                },
+            );
             self.foreground = Some(grant.clone());
-            self.foreground_reboot =
-                !self.is_passthrough() && is_reboot_command(&command.req.command);
-            return vec![Effect::StartOp {
+            self.foreground_reboot = reboot;
+            effects.push(Effect::StartOp {
                 grant,
                 spec: OpSpec::Command(command),
-            }];
+            });
+            return effects;
         }
+    }
+
+    // ---------------- background capture ----------------
+
+    fn create_background_capture(&mut self, cmd_id: &str, now: Mono) {
+        self.background_seq = self.background_seq.saturating_add(1);
+        let current = self.deps.wal.current_seq();
+        let capture = BackgroundCapture::new(
+            cmd_id.to_string(),
+            self.sid.clone(),
+            current.saturating_add(1),
+            current,
+            self.profile.template.quiet_window_s,
+            self.wall_iso(),
+            now,
+            self.background_seq,
+        );
+        self.background.insert(cmd_id.to_string(), capture);
+        self.evict_background();
+    }
+
+    /// `_evict_background_locked`：淘汰最舊的已終結 capture，並同步移除 `background_cmd_ids`（#45 D-94）。
+    fn evict_background(&mut self) {
+        if self.background.len() <= BG_CAPTURE_MAX_COUNT {
+            return;
+        }
+        let mut finalized: Vec<(String, String, u64)> = self
+            .background
+            .values()
+            .filter(|cap| cap.status != "active")
+            .map(|cap| (cap.created_at.clone(), cap.cmd_id.clone(), cap.seq_no))
+            .collect();
+        finalized.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        let excess = self.background.len() - BG_CAPTURE_MAX_COUNT;
+        for (_, id, _) in finalized.into_iter().take(excess) {
+            self.background.shift_remove(&id);
+            self.background_cmd_ids.retain(|existing| *existing != id);
+        }
+    }
+
+    /// `_set_terminal_capture_locked`：未掛載者建立並回填 chunks；設定終態。
+    fn set_terminal_capture(
+        &mut self,
+        cmd_id: &str,
+        chunk: Option<String>,
+        error_code: Option<&str>,
+        now: Mono,
+    ) {
+        if cmd_id.is_empty() {
+            return;
+        }
+        if !self.background.contains_key(cmd_id) {
+            self.create_background_capture(cmd_id, now);
+            if let Some(chunk) = chunk.filter(|c| !c.is_empty()) {
+                if let Some(capture) = self.background.get_mut(cmd_id) {
+                    capture.add_chunk(&chunk, BG_CAPTURE_MAX_BYTES);
+                }
+            }
+        }
+        let current = self.deps.wal.current_seq();
+        if let Some(capture) = self.background.get_mut(cmd_id) {
+            capture.last_seq = current;
+            capture.last_activity = now;
+            capture.status = if error_code.is_some() { "error" } else { "done" };
+            capture.error_code = error_code.map(str::to_string);
+        }
+    }
+
+    /// RX 進入 background capture 與 agent log（`_on_bridge_rx`；前景執行中不寫 agent log，EVT-D-L1）。
+    fn capture_rx(&mut self, chunk: &str, wal_seq: u64, now: Mono) {
+        for id in &self.background_cmd_ids {
+            if let Some(capture) = self.background.get_mut(id) {
+                if capture.status != "active" {
+                    continue;
+                }
+                capture.add_chunk(chunk, BG_CAPTURE_MAX_BYTES);
+                capture.last_activity = now;
+                capture.last_seq = wal_seq;
+            }
+        }
+        if self.foreground.is_some() {
+            return;
+        }
+        let Some(cap) = self.log_capture.as_mut() else {
+            return;
+        };
+        if cap.status != "active" {
+            return;
+        }
+        if let Some(file) = self.log_file.as_mut() {
+            if file.append_flush(chunk.as_bytes()).is_ok() {
+                cap.byte_count = cap.byte_count.saturating_add(chunk.len() as u64);
+                cap.line_count = cap
+                    .line_count
+                    .saturating_add(chunk.matches('\n').count() as u64);
+            }
+        }
+    }
+
+    fn result_tail(
+        &mut self,
+        cmd_id: &str,
+        from_chunk: i128,
+        limit: i128,
+        now: Mono,
+    ) -> Result<PyDict, PyErr> {
+        if let Some(capture) = self.background.get_mut(cmd_id) {
+            return capture.result(from_chunk, limit, now);
+        }
+        let not_found = pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id };
+        let Some(record) = self.deps.registry.get(cmd_id) else {
+            return Ok(not_found);
+        };
+        if record.get("execution_mode").and_then(PyValue::as_str) != Some("background") {
+            return Ok(not_found);
+        }
+        let status = record
+            .get("status")
+            .cloned()
+            .unwrap_or(PyValue::Null);
+        if status.as_str() == Some("done") {
+            return Ok(not_found);
+        }
+        if status.as_str() == Some("canceled")
+            && record.get("started_at").is_some_and(|v| !v.is_null())
+        {
+            return Ok(not_found);
+        }
+        Ok(pydict! {
+            "ok" => true,
+            "cmd_id" => cmd_id,
+            "status" => status,
+            "error_code" => record.get("error_code").cloned().unwrap_or(PyValue::Null),
+            "from_seq" => py_int(0),
+            "last_seq" => py_int(0),
+            "from_chunk" => py_int(from_chunk),
+            "next_chunk" => py_int(from_chunk),
+            "chunks" => PyValue::List(Vec::new()),
+        })
+    }
+
+    /// session detach：停止 agent log、終結 background capture、清除 `background_cmd_ids`。
+    fn detach_captures(&mut self) {
+        self.stop_log_capture();
+        for id in std::mem::take(&mut self.background_cmd_ids) {
+            if let Some(capture) = self.background.get_mut(&id) {
+                capture.status = "done";
+            }
+        }
+    }
+
+    // ---------------- agent log capture ----------------
+
+    /// 測試／manager 注入 log 檔系統、時鐘與預設目錄。
+    pub fn set_capture_env(&mut self, env: CaptureEnv) {
+        self.capture_env = env;
+    }
+
+    /// self-test 的外部觀測注入（RELEASED holder 掃描、哨兵 PTY 存活）。
+    pub fn set_self_test_probes(&mut self, probes: SelfTestProbes) {
+        self.self_test_probes = probes;
+    }
+
+    fn vtty_alive(&self) -> Option<bool> {
+        self.self_test_probes.vtty_alive.as_ref().and_then(|f| f())
+    }
+
+    fn resolve_log_dir(&self) -> String {
+        if let Some(dir) = self.profile.template.log_dir.as_deref().filter(|d| !d.is_empty()) {
+            return dir.to_string();
+        }
+        if let Some(dir) = self.capture_env.default_log_dir.as_deref() {
+            return dir.to_string();
+        }
+        if let Some(dir) = self.deps.env.var("SERIALWRAP_LOG_DIR").filter(|d| !d.is_empty()) {
+            return dir;
+        }
+        let home = self
+            .deps
+            .env
+            .var("HOME")
+            .or_else(|| self.deps.env.var("USERPROFILE"))
+            .unwrap_or_else(|| ".".into());
+        std::path::Path::new(&home)
+            .join("b-log")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn log_timestamp(&self) -> String {
+        let (wall_us, offset) = match &self.capture_env.clock {
+            Some(clock) => (clock.wall_unix_us(), clock.local_utc_offset_s()),
+            None => (
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(0),
+                0,
+            ),
+        };
+        strftime_local(wall_us, offset, "%y%m%d-%H%M%S")
+    }
+
+    fn log_start(&mut self, now: Mono) -> Result<PyDict, PyErr> {
+        if let Some(cap) = self.log_capture.as_ref().filter(|c| c.status == "active") {
+            return Ok(pydict! {
+                "ok" => true,
+                "already_active" => true,
+                "capture_id" => cap.capture_id.clone(),
+                "log_path" => cap.log_path.clone(),
+                "session" => self.session_value(now),
+            });
+        }
+        let log_dir = self.resolve_log_dir();
+        // Python `os.makedirs` 在 try 之外：失敗為例外（framing EXCEPTION），不是 LOG_OPEN_FAILED。
+        self.capture_env
+            .fs
+            .makedirs(&log_dir)
+            .map_err(|error| PyErr::value_error(os_error_text(&error, &log_dir)))?;
+        let filename = format!("{}_{}.log", self.profile.com, self.log_timestamp());
+        let log_path = std::path::Path::new(&log_dir)
+            .join(filename)
+            .to_string_lossy()
+            .into_owned();
+        let rng = self.deps.rng.clone();
+        let mut fill = |bytes: &mut [u8]| rng(bytes);
+        let capture_id = uuid4_dashed(&mut fill);
+        let file = match self.capture_env.fs.open_append(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "LOG_OPEN_FAILED",
+                    "detail" => os_error_text(&error, &log_path),
+                });
+            }
+        };
+        self.log_capture = Some(AgentLogCapture {
+            capture_id: capture_id.clone(),
+            log_path: log_path.clone(),
+            started_at: self.wall_iso(),
+            line_count: 0,
+            byte_count: 0,
+            status: "active",
+        });
+        self.log_file = Some(file);
+        Ok(pydict! {
+            "ok" => true,
+            "capture_id" => capture_id,
+            "log_path" => log_path,
+            "session" => self.session_value(now),
+        })
+    }
+
+    fn stop_log_capture(&mut self) {
+        self.log_file = None;
+        self.log_capture = None;
+    }
+
+    fn log_stop(&mut self, now: Mono) -> PyDict {
+        let Some(cap) = self.log_capture.clone() else {
+            return pydict! {
+                "ok" => false,
+                "error_code" => "NO_ACTIVE_CAPTURE",
+                "session" => self.session_value(now),
+            };
+        };
+        self.stop_log_capture();
+        pydict! {
+            "ok" => true,
+            "capture_id" => cap.capture_id,
+            "log_path" => cap.log_path,
+            "line_count" => py_int(cap.line_count as i128),
+            "byte_count" => py_int(cap.byte_count as i128),
+            "started_at" => cap.started_at,
+        }
+    }
+
+    fn log_status(&self, now: Mono) -> PyDict {
+        let Some(cap) = self.log_capture.as_ref() else {
+            return pydict! { "ok" => true, "active" => false, "session" => self.session_value(now) };
+        };
+        pydict! {
+            "ok" => true,
+            "active" => cap.status == "active",
+            "capture_id" => cap.capture_id.clone(),
+            "log_path" => cap.log_path.clone(),
+            "line_count" => py_int(cap.line_count as i128),
+            "byte_count" => py_int(cap.byte_count as i128),
+            "started_at" => cap.started_at.clone(),
+            "session" => self.session_value(now),
+        }
+    }
+
+    // ---------------- OpFinished ----------------
+
+    fn op_finished(
+        &mut self,
+        op_id: OpId,
+        epoch: u64,
+        outcome: OpOutcome,
+        now: Mono,
+    ) -> Vec<Effect> {
+        if self.stop.as_ref().is_some_and(|stop| {
+            stop.epoch == epoch
+                && stop
+                    .aborted_op
+                    .as_ref()
+                    .is_some_and(|(aborted_id, _)| *aborted_id == op_id)
+        }) {
+            self.pending_ops.remove(&op_id);
+            return Vec::new();
+        }
+        let pending = self.pending_ops.remove(&op_id);
+        let is_current = self
+            .foreground
+            .as_ref()
+            .is_some_and(|grant| grant.op_id == op_id && grant.epoch == epoch);
+        if !is_current {
+            // 前景已被 drain／重連清除：只回覆仍在等待的 RPC，不再套用 session 副作用。
+            return match pending {
+                Some(pending) => self.answer_stale_op(pending, outcome, now),
+                None => Vec::new(),
+            };
+        }
+        let grant = self.foreground.take().expect("已確認前景");
+        self.foreground_reboot = false;
+        let mut effects = Vec::new();
+        match pending {
+            Some(PendingOp::Command {
+                cmd_id,
+                mode,
+                reboot,
+            }) => effects.extend(self.finish_command(&cmd_id, &mode, reboot, outcome, now)),
+            Some(PendingOp::InteractiveCmd { cmd_id, result }) => {
+                let outcome = match outcome {
+                    OpOutcome::Sent { .. } => CmdOutcome::Result(result),
+                    OpOutcome::SendRefused(reject) => CmdOutcome::Result(pydict! {
+                        "ok" => false,
+                        "error_code" => lease_refused_command_code(reject),
+                    }),
+                    _ => CmdOutcome::SendFailed,
+                };
+                self.deps.registry.complete(&cmd_id, outcome, &self.wall_iso());
+            }
+            Some(PendingOp::Recover { reply }) => {
+                effects.extend(self.finish_recover(reply, outcome, now));
+            }
+            Some(other) => effects.extend(self.answer_op(other, outcome, now, true)),
+            None => {
+                if let Some(cmd_id) = grant.cmd_id {
+                    let result = match outcome {
+                        OpOutcome::CommandResult(result) | OpOutcome::SelfTest(result) => {
+                            CmdOutcome::Result(result)
+                        }
+                        OpOutcome::SendFailed => CmdOutcome::SendFailed,
+                        _ => CmdOutcome::Aborted(crate::arbiter::AbortClass::Unknown),
+                    };
+                    self.deps
+                        .registry
+                        .complete(&cmd_id, result, &self.wall_iso());
+                }
+            }
+        }
+        effects.push(Effect::SettleTx { epoch, op_id });
+        effects.extend(self.start_next(now));
+        effects
+    }
+
+    fn answer_stale_op(&mut self, pending: PendingOp, outcome: OpOutcome, now: Mono) -> Vec<Effect> {
+        match pending {
+            PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. } => Vec::new(),
+            PendingOp::Recover { reply } => {
+                let result = match outcome {
+                    OpOutcome::Recovered { key, stdout } => Ok(pydict! {
+                        "ok" => true,
+                        "error_code" => "PROMPT_TIMEOUT_RECOVERED",
+                        "stdout" => stdout,
+                        "partial" => true,
+                        "recovery_action" => key,
+                    }),
+                    OpOutcome::CommandResult(result) => Ok(result),
+                    OpOutcome::Error(error) => Err(error),
+                    _ => Ok(prompt_timeout_none()),
+                };
+                vec![Effect::Reply(reply, result)]
+            }
+            other => self.answer_op(other, outcome, now, false),
+        }
+    }
+
+    /// 回覆 self-test／interactive send／interactive open 的 op 結果。
+    fn answer_op(
+        &mut self,
+        pending: PendingOp,
+        outcome: OpOutcome,
+        now: Mono,
+        current: bool,
+    ) -> Vec<Effect> {
+        match pending {
+            PendingOp::InteractiveSend {
+                reply,
+                interactive_id,
+            } => {
+                let id = interactive_id.as_str();
+                let result = match outcome {
+                    OpOutcome::Sent { bytes } => {
+                        if let Some(lease) = self.lease.as_mut().filter(|l| l.interactive_id == id) {
+                            lease.touch(now);
+                        }
+                        Ok(pydict! { "ok" => true, "interactive_id" => id, "bytes" => py_int(bytes as i128) })
+                    }
+                    OpOutcome::SendRefused(reject) => match lease_refused_send_code(reject) {
+                        Some(code) => Ok(pydict! { "ok" => false, "error_code" => code, "interactive_id" => id }),
+                        None => Err(PyErr::value_error(format!(
+                            "tx incomplete: not_submitted 0/0 {}",
+                            reject_reason(reject)
+                        ))),
+                    },
+                    OpOutcome::Error(error) => Err(error),
+                    _ => Err(PyErr::value_error("interactive send 未完成")),
+                };
+                vec![Effect::Reply(reply, result)]
+            }
+            PendingOp::InteractiveOpen { reply, result } => {
+                let result = match outcome {
+                    OpOutcome::Sent { .. } => Ok(result),
+                    OpOutcome::SendRefused(FenceReject::OwnerMismatch) => {
+                        Ok(pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED" })
+                    }
+                    OpOutcome::SendRefused(reject) => Err(PyErr::value_error(format!(
+                        "tx incomplete: not_submitted 0/0 {}",
+                        reject_reason(reject)
+                    ))),
+                    OpOutcome::Error(error) => Err(error),
+                    _ => Err(PyErr::value_error("interactive open 命令未完成")),
+                };
+                vec![Effect::Reply(reply, result)]
+            }
+            PendingOp::SelfTest {
+                reply,
+                probe_len,
+                base,
+                lease_ctx,
+            } => {
+                let result = match outcome {
+                    OpOutcome::SelfTestRefused(FenceReject::Quiet | FenceReject::ReconfirmPending) => {
+                        Ok(self.finish_self_test(self.autoboot_quiet_self_test(now)))
+                    }
+                    OpOutcome::SelfTestRefused(reject) => Err(PyErr::value_error(format!(
+                        "tx incomplete: not_submitted 0/{probe_len} {}",
+                        reject_reason(reject)
+                    ))),
+                    OpOutcome::SelfTest(probe) => {
+                        let ok = probe.get("probe_ok").and_then(PyValue::as_bool) == Some(true);
+                        if ok && current {
+                            self.confirm_ready();
+                        }
+                        Ok(self.finish_self_test(self.probe_self_test_result(ok, &probe, &base, lease_ctx, now)))
+                    }
+                    OpOutcome::Error(error) => Err(error),
+                    _ => Err(PyErr::value_error("self-test probe 未完成")),
+                };
+                vec![Effect::Reply(reply, result)]
+            }
+            PendingOp::Recover { reply } => vec![Effect::Reply(reply, Ok(prompt_timeout_none()))],
+            PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. } => Vec::new(),
+        }
+    }
+
+    /// 命令 op 的結算（registry 終態＋session 副作用）。
+    fn finish_command(
+        &mut self,
+        cmd_id: &str,
+        mode: &str,
+        reboot: bool,
+        outcome: OpOutcome,
+        now: Mono,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let result = match outcome {
+            OpOutcome::CommandResult(result) => {
+                if reboot && result.get_truthy("ok") {
+                    // #139／#162：prompt 2 s 內回來只清 TX 靜默維度，reconfirm pending 保留。
+                    self.quiet.clear_quiet();
+                    self.deps.fence.with(|f| f.quiet_active = false);
+                }
+                CmdOutcome::Result(result)
+            }
+            OpOutcome::SendFailed => CmdOutcome::SendFailed,
+            OpOutcome::Recovered { key, stdout } => {
+                self.set_terminal_capture(
+                    cmd_id,
+                    Some(stdout.clone()),
+                    Some("PROMPT_TIMEOUT_RECOVERED"),
+                    now,
+                );
+                self.flush_queue();
+                CmdOutcome::Result(pydict! {
+                    "ok" => true,
+                    "error_code" => "PROMPT_TIMEOUT_RECOVERED",
+                    "stdout" => stdout,
+                    "partial" => true,
+                    "recovery_action" => key,
+                })
+            }
+            OpOutcome::PromptTimeout { stdout } => {
+                self.set_terminal_capture(cmd_id, Some(stdout), Some("PROMPT_TIMEOUT"), now);
+                if !self.is_passthrough() {
+                    self.transition_to_attached("PROMPT_TIMEOUT", now);
+                }
+                CmdOutcome::Result(prompt_timeout_none())
+            }
+            OpOutcome::RebootExpected => {
+                self.pending_auto_login = true;
+                self.recovering = true;
+                self.set_state(SessionState::Recovering, now);
+                self.set_last_error(None, None);
+                self.on_detached_flush();
+                let timeout_ns = secs_ns(self.profile.template.hard_timeout_s);
+                self.reboot_recovery = Some(RebootRecovery {
+                    deadline: now.saturating_add(timeout_ns),
+                    cap: now
+                        .saturating_add(BOOT_QUIET_WINDOW_NS)
+                        .saturating_add(timeout_ns),
+                    timeout_ns,
+                    next_attempt: now,
+                });
+                CmdOutcome::Result(pydict! {
+                    "ok" => true,
+                    "execution_mode" => mode,
+                    "stdout" => "",
+                    "partial" => true,
+                    "status" => "recovering",
+                    "recovery_action" => "EXPECT_REBOOT",
+                })
+            }
+            // Python：救援路徑例外穿出 → `_map_aborted_result` → SEND_FAILED。
+            OpOutcome::Error(_) => CmdOutcome::Result(pydict! { "ok" => false, "error_code" => "SEND_FAILED" }),
+            _ => CmdOutcome::SendFailed,
+        };
+        self.deps.registry.complete(cmd_id, result, &self.wall_iso());
+        if self.reboot_recovery.is_some() {
+            effects.extend(self.reboot_recovery_tick(now));
+        }
+        effects
+    }
+
+    /// `_on_command_flush`／`_on_detached` 的佇列終結（FLUSHED_BY_RECOVERY）。
+    fn flush_queue(&mut self) {
+        let _ = self.queue.drain_all();
+        self.deps
+            .registry
+            .flush_session(&self.sid, "FLUSHED_BY_RECOVERY", &self.wall_iso());
+    }
+
+    /// `_on_detached`：arbiter `unregister_session`（佇列 flush＋解除註冊直到重新 READY）。
+    fn on_detached_flush(&mut self) {
+        self.flush_queue();
+        self.queue_registered = false;
+    }
+
+    /// `_transition_to_attached`：READY → ATTACHED（drain 中或 FLASHING／RELEASED 不覆寫）。
+    fn transition_to_attached(&mut self, reason: &str, now: Mono) {
+        if self.stop.is_some() || self.pending_open_stop.is_some() {
+            return;
+        }
+        if matches!(self.state, SessionState::Flashing | SessionState::Released) {
+            return;
+        }
+        let was_ready = self.state == SessionState::Ready;
+        self.set_state(SessionState::Attached, now);
+        self.set_last_error(Some(reason.to_string()), None);
+        self.recovering = false;
+        self.pending_auto_login = false;
+        if was_ready {
+            self.on_detached_flush();
+        }
+    }
+
+    // ---------------- recover ----------------
+
+    fn recover_request(&mut self, timeout_s: f64, force: bool, reply: Reply, now: Mono) -> Vec<Effect> {
+        if self.drain_in_progress() {
+            return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
+        if self.state == SessionState::Released {
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => true,
+                    "released" => true,
+                    "recommended_action" => "device_attach",
+                    "session" => self.session_value(now),
+                }),
+            )];
+        }
+        let flash_busy = self.state == SessionState::Flashing
+            || self.deps.fence.with(|f| f.flash_mode != FlashMode::Off);
+        if flash_busy {
+            let mut out = self.selector_error("FLASHING_BUSY");
+            out.insert("session", self.session_value(now));
+            return vec![Effect::Reply(reply, Ok(out))];
+        }
+        self.credentials_warned = false;
+        if self.generations.conn_epoch.is_none() {
+            if self.device_present && self.open_real_path.is_none() && self.pending_attach.is_none()
+            {
+                let real_path = self
+                    .known_real_path
+                    .clone()
+                    .unwrap_or_else(|| self.profile.device_by_id.clone());
+                self.set_last_error(None, None);
+                self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+                self.open_generation = self.generations.fsm_gen;
+                self.open_real_path = Some(real_path.clone());
+                self.set_state(SessionState::Attaching, now);
+                return vec![
+                    Effect::OpenBridge {
+                        dev: DevicePath(real_path),
+                        cfg: self.serial_config(),
+                        precheck_holders: false,
+                    },
+                    Effect::Reply(
+                        reply,
+                        Ok(pydict! {
+                            "ok" => true,
+                            "recovering" => false,
+                            "action" => "REATTACH",
+                            "session" => self.session_value(now),
+                        }),
+                    ),
+                ];
+            }
+            return vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))];
+        }
+        match self.state {
+            SessionState::Attached => {
+                if force {
+                    return self.start_force_recover(reply, ForceKind::Direct, now);
+                }
+                self.reprobe_existing_bridge(reply, ReprobeWaiter::Recover { force: false }, now)
+            }
+            SessionState::Ready => {
+                if self.foreground.is_some() {
+                    // Slice 2.1 單一前景槽：前景忙時不併行送救援鍵（Python 會與在途命令並行寫入）。
+                    return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
+                }
+                let grant = self.new_grant(None);
+                self.pending_ops
+                    .insert(grant.op_id, PendingOp::Recover { reply });
+                self.foreground = Some(grant.clone());
+                vec![Effect::StartOp {
+                    grant,
+                    spec: OpSpec::Recover { timeout_s, force },
+                }]
+            }
+            _ => {
+                if force {
+                    return self.start_force_recover(reply, ForceKind::Direct, now);
+                }
+                vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))]
+            }
+        }
+    }
+
+    /// READY recover 的 `_recover_after_failure` 結算（source `system:recover`、cmd_id 空）。
+    fn finish_recover(&mut self, reply: Reply, outcome: OpOutcome, now: Mono) -> Vec<Effect> {
+        match outcome {
+            OpOutcome::Recovered { key, stdout } => {
+                self.flush_queue();
+                vec![Effect::Reply(
+                    reply,
+                    Ok(pydict! {
+                        "ok" => true,
+                        "error_code" => "PROMPT_TIMEOUT_RECOVERED",
+                        "stdout" => stdout,
+                        "partial" => true,
+                        "recovery_action" => key,
+                    }),
+                )]
+            }
+            OpOutcome::PromptTimeout { .. } => {
+                if self.is_passthrough() {
+                    return vec![Effect::Reply(reply, Ok(prompt_timeout_none()))];
+                }
+                self.transition_to_attached("PROMPT_TIMEOUT", now);
+                self.start_force_recover(reply, ForceKind::AfterPromptTimeout, now)
+            }
+            OpOutcome::CommandResult(result) => vec![Effect::Reply(reply, Ok(result))],
+            OpOutcome::Error(error) => vec![Effect::Reply(reply, Err(error))],
+            _ => vec![Effect::Reply(reply, Ok(prompt_timeout_none()))],
+        }
+    }
+
+    /// `_force_recover`：clear＋reattach，最多等 10 s READY。
+    fn start_force_recover(&mut self, reply: Reply, kind: ForceKind, now: Mono) -> Vec<Effect> {
+        if let Some(previous) = self.force_recover.take() {
+            // 既有等待者以逾時收尾（同一 session 不疊加 force recover）。
+            let mut effects = self.answer_force_recover(previous, false, now);
+            effects.extend(self.start_force_recover(reply, kind, now));
+            return effects;
+        }
+        self.force_recover = Some(ForceRecover {
+            reply,
+            deadline: now.saturating_add(FORCE_RECOVER_WAIT_NS),
+            kind,
+        });
+        self.begin_stop(StopKind::Clear, None, now).0
+    }
+
+    fn answer_force_recover(&mut self, pending: ForceRecover, recovered: bool, now: Mono) -> Vec<Effect> {
+        let session = self.session_value(now);
+        let result = match (pending.kind, recovered) {
+            (ForceKind::Direct, true) => pydict! {
+                "ok" => true,
+                "recovering" => false,
+                "action" => "FORCE_CLEAR_REATTACH",
+                "recovered" => true,
+                "session" => session,
+            },
+            (ForceKind::Direct, false) => pydict! {
+                "ok" => false,
+                "error_code" => "FORCE_RECOVER_TIMEOUT",
+                "action" => "FORCE_CLEAR_REATTACH",
+                "recovered" => false,
+                "session" => session,
+            },
+            (ForceKind::AfterPromptTimeout, true) => pydict! {
+                "ok" => true,
+                "error_code" => "PROMPT_TIMEOUT_FORCE_RECOVERED",
+                "partial" => true,
+                "recovery_action" => "FORCE_CLEAR_REATTACH",
+                "session" => session,
+            },
+            (ForceKind::AfterPromptTimeout, false) => prompt_timeout_none(),
+        };
+        vec![Effect::Reply(pending.reply, Ok(result))]
+    }
+
+    /// 每個事件後檢查 force recover 等待者（READY 或 10 s 到期）。
+    fn poll_force_recover(&mut self, now: Mono) -> Vec<Effect> {
+        let Some(pending) = self.force_recover.as_ref() else {
+            return Vec::new();
+        };
+        let ready = self.state == SessionState::Ready && !self.drain_in_progress();
+        if !ready && now < pending.deadline {
+            return Vec::new();
+        }
+        let pending = self.force_recover.take().expect("已確認等待者");
+        self.answer_force_recover(pending, ready, now)
+    }
+
+    /// 再探等待者的回應（attach：`_attach_state_result`；recover：REPROBE payload，SC-34）。
+    fn reprobe_reply(&mut self, reply: Reply, kind: ReprobeWaiter, now: Mono) -> Vec<Effect> {
+        match kind {
+            ReprobeWaiter::Attach => vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))],
+            ReprobeWaiter::Recover { force } => {
+                if matches!(self.state, SessionState::Flashing | SessionState::Released) {
+                    if force {
+                        return self.start_force_recover(reply, ForceKind::Direct, now);
+                    }
+                    let mut out = pydict! { "ok" => false, "error_code" => "STATE_CHANGED" };
+                    out.insert("session", self.session_value(now));
+                    return vec![Effect::Reply(reply, Ok(out))];
+                }
+                let recovered = self.state == SessionState::Ready;
+                let mut payload = pydict! {
+                    "ok" => true,
+                    "recovering" => false,
+                    "action" => "REPROBE",
+                    "recovered" => recovered,
+                    "session" => self.session_value(now),
+                };
+                if !recovered {
+                    payload.insert("error_code", PyValue::from("SESSION_NOT_READY"));
+                    payload.insert("last_error", option_string(self.last_error.as_deref()));
+                    payload.insert(
+                        "last_error_detail",
+                        option_string(self.last_error_detail.as_deref()),
+                    );
+                    let matched = if self.is_passthrough() {
+                        None
+                    } else {
+                        self.bootloader_evidence()
+                    };
+                    if matched.is_some() || self.last_error.as_deref() == Some("BOOTLOADER_STUCK") {
+                        payload.insert("classification", PyValue::from("BOOTLOADER"));
+                        payload.insert("recommended_action", PyValue::from("recover_interactive"));
+                        if let Some(matched) = matched {
+                            payload.insert("matched_prompt", PyValue::from(matched));
+                        }
+                    }
+                    if force {
+                        return self.start_force_recover(reply, ForceKind::Direct, now);
+                    }
+                }
+                vec![Effect::Reply(reply, Ok(payload))]
+            }
+        }
+    }
+
+    /// `_bootloader_evidence`：RX tail 尾行命中 bootloader prompt（缺配置時退回 `UBOOT_FALLBACK_PROMPTS`）。
+    fn bootloader_evidence(&self) -> Option<String> {
+        self.generations.conn_epoch?;
+        let tail = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
+        matches_any_bootloader_prompt(&tail, &self.bootloader_patterns())
+    }
+
+    fn bootloader_patterns(&self) -> Vec<String> {
+        if self.profile.template.bootloader_prompts.is_empty() {
+            UBOOT_FALLBACK_PROMPTS.iter().map(|p| p.to_string()).collect()
+        } else {
+            self.profile.template.bootloader_prompts.clone()
+        }
+    }
+
+    // ---------------- reboot recovery ----------------
+
+    /// `_spawn_reboot_recovery` 的 actor 驅動版：quiet 期間被動等待（延伸期限至 cap）、其後每 1 s 以
+    /// `ensure_ready` 嘗試；期限到 → ATTACHED／`RECOVERY_TIMEOUT`。
+    fn reboot_recovery_tick(&mut self, now: Mono) -> Vec<Effect> {
+        let Some(rr) = self.reboot_recovery.as_mut() else {
+            return Vec::new();
+        };
+        if self.state != SessionState::Recovering || !self.recovering {
+            self.reboot_recovery = None;
+            return Vec::new();
+        }
+        if self.stop.is_some() || self.pending_open_stop.is_some() || self.login_run.is_some() {
+            return Vec::new();
+        }
+        if self.quiet.quiet_active(now) {
+            let extended = rr
+                .deadline
+                .max(self.quiet.boot_quiet_until.saturating_add(rr.timeout_ns));
+            rr.deadline = extended.min(rr.cap);
+        }
+        if now >= rr.deadline {
+            return self.finish_reboot_recovery_timeout(now);
+        }
+        if self.quiet.quiet_active(now) || now < rr.next_attempt {
+            return Vec::new();
+        }
+        rr.next_attempt = now.saturating_add(1_000_000_000);
+        let Some(epoch) = self.generations.conn_epoch else {
+            return Vec::new();
+        };
+        let auth = resolve_session_auth(
+            &self.profile,
+            self.deps.env.as_ref(),
+            self.deps.read_env_file.as_ref(),
+        );
+        if crate::session_auth::credentials_declared_but_unresolved(&self.profile, &auth.1) {
+            let reason = auth.1.reason;
+            let env_file = auth.1.env_file_path.clone().unwrap_or_default();
+            let mut effects = self.credentials_warning(reason, &env_file);
+            self.set_last_error(Some("CREDENTIALS_UNRESOLVED".into()), None);
+            effects.extend(self.finish_reboot_recovery_timeout(now));
+            return effects;
+        }
+        if slice21_unsupported_feature(&self.profile).is_some() {
+            // Slice 2.1 能力閘：不自動送 TX，等期限收尾。
+            return Vec::new();
+        }
+        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+        self.deps.fence.with(|f| {
+            f.fsm_gen = self.generations.fsm_gen;
+            f.quiet_active = false;
+        });
+        self.login_run = Some(LoginRun {
+            epoch,
+            kind: LoginRunKind::RebootRecovery,
+            waiters: Vec::new(),
+        });
+        vec![Effect::StartLogin {
+            epoch,
+            fsm_gen: self.generations.fsm_gen,
+            plan: LoginPlan::EnsureReady { auth: auth.0 },
+        }]
+    }
+
+    fn reboot_login_finished(
+        &mut self,
+        epoch: u64,
+        result: crate::login_fsm::LoginOutcome,
+        now: Mono,
+    ) -> Vec<Effect> {
+        self.login_run = None;
+        if self.generations.conn_epoch != Some(epoch) || self.state != SessionState::Recovering {
+            return Vec::new();
+        }
+        match result {
+            crate::login_fsm::LoginOutcome::Ready => {
+                self.set_state(SessionState::Ready, now);
+                self.confirm_ready();
+                self.set_last_error(None, None);
+                self.last_ready_at = Some(self.wall_iso());
+                self.last_probe_at = Some(self.wall_iso());
+                self.recovering = false;
+                self.pending_auto_login = false;
+                self.queue_registered = true;
+                self.reboot_recovery = None;
+                vec![Effect::Notify(ManagerNote::SessionReady {
+                    sid: self.sid.clone(),
+                })]
+            }
+            // ensure_ready 的 NotReady 只來自 TX 被 quiet／新世代撤銷（Python `continue`，不記錯）。
+            crate::login_fsm::LoginOutcome::NotReady(_) => Vec::new(),
+            crate::login_fsm::LoginOutcome::Failed(error) => {
+                self.set_last_error(Some(error), None);
+                Vec::new()
+            }
+        }
+    }
+
+    fn finish_reboot_recovery_timeout(&mut self, now: Mono) -> Vec<Effect> {
+        self.reboot_recovery = None;
+        self.recovering = false;
+        self.pending_auto_login = false;
+        if self.generations.conn_epoch.is_none() {
+            self.set_state(SessionState::Detached, now);
+            self.set_last_error(Some("RECOVERY_TIMEOUT".into()), None);
+        } else {
+            self.set_state(SessionState::Attached, now);
+            if self.last_error.is_none() {
+                self.set_last_error(Some("RECOVERY_TIMEOUT".into()), None);
+            }
+        }
+        Vec::new()
+    }
+
+    // ---------------- self-test ----------------
+
+    fn finish_self_test(&self, mut result: PyDict) -> PyDict {
+        if result.get("command_capable").is_none() {
+            result.insert(
+                "command_capable",
+                PyValue::from(self.profile.template.command_capable()),
+            );
+        }
+        result
+    }
+
+    fn autoboot_quiet_self_test(&self, now: Mono) -> PyDict {
+        let mut out = pydict! {
+            "ok" => true,
+            "classification" => "AUTOBOOT_QUIET",
+            "session" => self.session_value(now),
+            "recommended_action" => "wait",
+        };
+        Self::extend_pairs(&mut out, self.lease_ctx());
+        out
+    }
+
+    fn probe_self_test_result(
+        &self,
+        ok: bool,
+        probe: &PyDict,
+        base: &SelfTestBase,
+        lease_ctx: Vec<(&'static str, PyValue)>,
+        now: Mono,
+    ) -> PyDict {
+        let attached = option_string(base.attached_real_path.as_deref());
+        let current = option_string(base.current_real_path.as_deref());
+        let mut out;
+        if ok {
+            out = pydict! {
+                "ok" => true,
+                "classification" => "OK",
+                "session" => self.session_value(now),
+                "attached_real_path" => attached,
+                "current_real_path" => current,
+                "attached_vtty" => PyValue::Null,
+                "bridge_generation" => py_int(base.bridge_generation as i128),
+                "probe_ok" => true,
+                "recommended_action" => "none",
+            };
+        } else {
+            let flood = probe
+                .get("rx_bytes_last_10s")
+                .cloned()
+                .unwrap_or(PyValue::Null);
+            let flooded = matches!(&flood, PyValue::Int(PyInt::Small(n)) if *n >= RX_FLOOD_BYTES_PER_10S as i128);
+            if flooded {
+                out = pydict! {
+                    "ok" => true,
+                    "classification" => "RX_FLOOD",
+                    "session" => self.session_value(now),
+                    "attached_real_path" => attached,
+                    "current_real_path" => current,
+                    "probe_ok" => false,
+                    "rx_bytes_last_10s" => flood,
+                    "recommended_action" => "wait",
+                };
+            } else {
+                out = pydict! {
+                    "ok" => true,
+                    "classification" => "TARGET_UNRESPONSIVE",
+                    "session" => self.session_value(now),
+                    "attached_real_path" => attached,
+                    "current_real_path" => current,
+                    "probe_ok" => false,
+                    "recommended_action" => "recover",
+                };
+            }
+        }
+        Self::extend_pairs(&mut out, lease_ctx);
+        out
+    }
+
+    fn self_test_request(
+        &mut self,
+        timeout_s: f64,
+        strict_human_lock: bool,
+        reply: Reply,
+        now: Mono,
+    ) -> Vec<Effect> {
+        if self.state != SessionState::Released && !self.recovering && self.state != SessionState::Recovering {
+            self.refresh_lease(now);
+        }
+        let holder = if self.state == SessionState::Released {
+            match (&self.self_test_probes.holders, self.known_real_path.as_deref()) {
+                (Some(probe), Some(path)) => Some(probe.probe_holders(path)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let ctx = SelfTestCtx {
+            device_present: self.device_present,
+            holder,
+            by_id_realpath: self.known_real_path.clone(),
+            vtty_alive: self.vtty_alive(),
+            strict_human_lock,
+            now,
+        };
+        match self.self_test_pre_probe(&ctx) {
+            Ok(result) => vec![Effect::Reply(reply, Ok(self.finish_self_test(result)))],
+            Err(need) => {
+                if self.foreground.is_some() {
+                    // Slice 2.1 單一前景槽：前景忙時不併行送 nonce probe。
+                    return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
+                }
+                let rng = self.deps.rng.clone();
+                let sequence = self.next_op_id;
+                let mut fill = |bytes: &mut [u8]| {
+                    rng(bytes);
+                    for (index, byte) in bytes.iter_mut().take(8).enumerate() {
+                        *byte ^= ((sequence >> (index * 8)) & 0xff) as u8;
+                    }
+                };
+                let nonce: String = uuid4_hex(&mut fill).chars().take(8).collect();
+                let probe = self.profile.template.ready_probe.replace("${nonce}", &nonce);
+                self.last_probe_at = Some(self.wall_iso());
+                let probe_len = probe.len() + usize::from(!probe.ends_with('\n'));
+                let grant = self.new_grant(None);
+                self.pending_ops.insert(
+                    grant.op_id,
+                    PendingOp::SelfTest {
+                        reply,
+                        probe_len,
+                        base: need.base,
+                        lease_ctx: self.lease_ctx(),
+                    },
+                );
+                self.foreground = Some(grant.clone());
+                vec![Effect::StartOp {
+                    grant,
+                    spec: OpSpec::SelfTestProbe {
+                        timeout_s,
+                        probe,
+                        nonce,
+                    },
+                }]
+            }
+        }
+    }
+
+    /// 05 §11 順序 0–15 的 probe 前分類（`classify_pre_probe` 的本體）。
+    pub(crate) fn self_test_pre_probe(&self, ctx: &SelfTestCtx) -> Result<PyDict, NeedProbe> {
+        let now = ctx.now;
+        let session = self.session_value(now);
+        if self.state == SessionState::Released {
+            let (pids, unknown) = match &ctx.holder {
+                Some(holder) => (holder.pids.clone(), holder.holder_unknown),
+                None => (Vec::new(), false),
+            };
+            // BC-04：holder 不明不得當作安全證明。
+            let reclaimable = pids.is_empty() && !unknown;
+            let external = if pids.is_empty() {
+                PyValue::from("none")
+            } else {
+                PyValue::List(pids.iter().map(|p| py_int(*p as i128)).collect())
+            };
+            let mut out = pydict! {
+                "ok" => true,
+                "classification" => "RELEASED",
+                "session" => session,
+                "released_by" => option_string(self.released_by.as_deref()),
+                "released_at" => option_string(self.released_at.as_deref()),
+                "reason" => option_string(self.released_reason.as_deref()),
+                "external_holder" => external,
+                "reclaimable" => reclaimable,
+                "recommended_action" => if reclaimable { "device_attach" } else { "wait_external_flash" },
+            };
+            Self::extend_pairs(&mut out, Self::empty_lease_ctx());
+            return Ok(out);
+        }
+        let lease_ctx = self.lease_ctx();
+        let simple = |classification: &str, action: &str, extra: Vec<(&'static str, PyValue)>| {
+            let mut out = pydict! {
+                "ok" => true,
+                "classification" => classification,
+                "session" => session.clone(),
+            };
+            Self::extend_pairs(&mut out, extra);
+            out.insert("recommended_action", PyValue::from(action));
+            Self::extend_pairs(&mut out, lease_ctx.clone());
+            out
+        };
+        if self.recovering || self.state == SessionState::Recovering {
+            return Ok(simple("SESSION_RECOVERING", "wait", Vec::new()));
+        }
+        if ctx.strict_human_lock {
+            if let Some(lease) = self.lease.as_ref().filter(|l| l.is_human()) {
+                let mut out = pydict! {
+                    "ok" => true,
+                    "classification" => "HUMAN_INTERACTIVE_ACTIVE",
+                    "interactive_id" => lease.interactive_id.clone(),
+                    "session" => session.clone(),
+                    "recommended_action" => "wait_or_detach_console",
+                };
+                Self::extend_pairs(&mut out, lease_ctx.clone());
+                return Ok(out);
+            }
+        }
+        if !ctx.device_present {
+            return Ok(simple("DEVICE_MISSING", "check_cable_or_bind", Vec::new()));
+        }
+        let current = option_string(ctx.by_id_realpath.as_deref());
+        if let Some(attached) = self.attached_real_path.as_deref() {
+            if ctx.by_id_realpath.as_deref() != Some(attached) {
+                return Ok(simple(
+                    "DEVICE_REBOUND_REQUIRED",
+                    "reattach",
+                    vec![
+                        ("attached_real_path", PyValue::from(attached)),
+                        ("current_real_path", current),
+                    ],
+                ));
+            }
+        }
+        if self.generations.conn_epoch.is_none() {
+            return Ok(simple(
+                "BRIDGE_DOWN",
+                "attach",
+                vec![("current_real_path", current)],
+            ));
+        }
+        if ctx.vtty_alive == Some(false) {
+            return Ok(simple(
+                "VTTY_STALE",
+                "console_attach",
+                vec![("attached_vtty", PyValue::Null)],
+            ));
+        }
+        let attached = option_string(self.attached_real_path.as_deref());
+        let bridge_generation = py_int(self.generations.bridge_generation as i128);
+        let bridge_keys = || {
+            vec![
+                ("attached_real_path", attached.clone()),
+                ("current_real_path", current.clone()),
+                ("attached_vtty", PyValue::Null),
+                ("bridge_generation", bridge_generation.clone()),
+            ]
+        };
+        if self.is_passthrough() && self.state == SessionState::Ready {
+            return Ok(simple("PASSTHROUGH", "none", bridge_keys()));
+        }
+        if self.state == SessionState::Attached {
+            let mut extra: Vec<(&'static str, PyValue)> = Vec::new();
+            let (classification, action) = if self.is_passthrough() {
+                let elapsed = self
+                    .quiet_since
+                    .map(|t| now.saturating_sub(t) as f64 / 1_000_000_000.0)
+                    .unwrap_or(0.0);
+                extra.push((
+                    "passthrough_ready_in_s",
+                    PyValue::from(py_round((PASSTHROUGH_READY_QUIET_S - elapsed).max(0.0), 1)),
+                ));
+                ("PASSTHROUGH", "console_attach")
+            } else if self.last_error.as_deref() == Some("LOGIN_REQUIRED") {
+                ("LOGIN_REQUIRED", "console_attach")
+            } else if self.last_error.as_deref() == Some("REBOOTING") {
+                ("REBOOTING", "wait_or_console_attach")
+            } else {
+                let tail = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
+                let mut matched = matches_any_bootloader_prompt(&tail, &self.bootloader_patterns());
+                if matched.is_none() && self.last_error.as_deref() == Some("BOOTLOADER_STUCK") {
+                    let detail = self
+                        .last_error_detail
+                        .as_deref()
+                        .unwrap_or("")
+                        .strip_prefix("matched_prompt=")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| self.last_error_detail.clone().unwrap_or_default());
+                    matched = Some(if detail.is_empty() {
+                        "BOOTLOADER_STUCK".to_string()
+                    } else {
+                        detail
+                    });
+                }
+                if let Some(matched) = matched {
+                    extra.push(("matched_prompt", PyValue::from(matched)));
+                    extra.push(("rx_tail", PyValue::from(tail)));
+                    ("BOOTLOADER", "recover_interactive")
+                } else {
+                    let (flood, _) = self.deps.rx.rx_stats(now);
+                    if self.last_error.as_deref() == Some("RX_FLOOD")
+                        || flood >= RX_FLOOD_BYTES_PER_10S
+                    {
+                        extra.push(("rx_bytes_last_10s", py_int(flood as i128)));
+                        ("RX_FLOOD", "wait")
+                    } else {
+                        ("ATTACHED_NOT_READY", "console_attach")
+                    }
+                }
+            };
+            let mut out = pydict! {
+                "ok" => true,
+                "classification" => classification,
+                "session" => session.clone(),
+            };
+            Self::extend_pairs(&mut out, bridge_keys());
+            out.insert("recommended_action", PyValue::from(action));
+            Self::extend_pairs(&mut out, extra);
+            Self::extend_pairs(&mut out, lease_ctx.clone());
+            return Ok(out);
+        }
+        if self.quiet.quiet_active(now) {
+            return Ok(simple("AUTOBOOT_QUIET", "wait", Vec::new()));
+        }
+        Err(NeedProbe {
+            probe: String::new(),
+            nonce: String::new(),
+            timeout_s: 0.0,
+            partial: PyDict::new(),
+            base: SelfTestBase {
+                attached_real_path: self.attached_real_path.clone(),
+                current_real_path: ctx.by_id_realpath.clone(),
+                bridge_generation: self.generations.bridge_generation,
+            },
+        })
+    }
+
+    fn empty_lease_ctx() -> Vec<(&'static str, PyValue)> {
+        vec![
+            ("interactive_owner", PyValue::Null),
+            ("human_attached", PyValue::Bool(false)),
+            ("human_active", PyValue::Bool(false)),
+            ("recovery_mode", PyValue::Bool(false)),
+        ]
     }
 
     fn next_uuid(&mut self) -> String {
@@ -2951,6 +4649,147 @@ impl SessionCore {
         } else {
             "quiet-suspicious"
         }
+    }
+}
+
+/// 前景 op 的待辦（`pending_ops`；`OpFinished` 時依種類結算）。
+enum PendingOp {
+    Command {
+        cmd_id: String,
+        mode: String,
+        reboot: bool,
+    },
+    /// `mode == "interactive"` 的命令：lease 已開，命令 TX 完成後以 `result` 終結紀錄。
+    InteractiveCmd {
+        cmd_id: String,
+        result: PyDict,
+    },
+    Recover {
+        reply: Reply,
+    },
+    SelfTest {
+        reply: Reply,
+        probe_len: usize,
+        base: SelfTestBase,
+        lease_ctx: Vec<(&'static str, PyValue)>,
+    },
+    InteractiveSend {
+        reply: Reply,
+        interactive_id: String,
+    },
+    InteractiveOpen {
+        reply: Reply,
+        result: PyDict,
+    },
+}
+
+/// reboot 後自動恢復的期限（`_spawn_reboot_recovery`：`deadline_cap = start + 180 + timeout`）。
+struct RebootRecovery {
+    deadline: Mono,
+    cap: Mono,
+    timeout_ns: u64,
+    next_attempt: Mono,
+}
+
+/// force recover 的等待者（`_force_recover`：clear 後最多 10 次 × 1 s 等 READY）。
+struct ForceRecover {
+    reply: Reply,
+    deadline: Mono,
+    kind: ForceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForceKind {
+    /// `recover_session` 直接呼叫 `_force_recover`。
+    Direct,
+    /// `_recover_after_failure` 救援鍵失敗後的 auto-fallback（`PROMPT_TIMEOUT_FORCE_RECOVERED`）。
+    AfterPromptTimeout,
+}
+
+/// `READY_RECONFIRM_RETRY_S`。
+const READY_RECONFIRM_RETRY_S: f64 = 5.0;
+/// `MAX_RECOVERY_LEASE_S`。
+const MAX_RECOVERY_LEASE_S: f64 = 120.0;
+/// `BOOTLOADER_RX_TAIL_BYTES`（`rx_tail` 以字元計）。
+const BOOTLOADER_RX_TAIL_CHARS: usize = 512;
+/// `RX_FLOOD_BYTES_PER_10S`。
+const RX_FLOOD_BYTES_PER_10S: u64 = 20_000;
+/// `UBOOT_FALLBACK_PROMPTS`。
+const UBOOT_FALLBACK_PROMPTS: [&str; 3] = ["^=> $", "^U-Boot> $", "^CFE> $"];
+/// `_force_recover` 的等待上限（10 × 1 s）。
+const FORCE_RECOVER_WAIT_NS: Mono = 10_000_000_000;
+/// `BOOT_QUIET_WINDOW_S`。
+const BOOT_QUIET_WINDOW_NS: Mono = 180_000_000_000;
+
+fn normalized_mode(mode: &str) -> &str {
+    match mode {
+        "fg" => "line",
+        "bg" => "background",
+        other => other,
+    }
+}
+
+fn prompt_timeout_none() -> PyDict {
+    pydict! {
+        "ok" => false,
+        "error_code" => "PROMPT_TIMEOUT",
+        "partial" => true,
+        "recovery_action" => "NONE",
+    }
+}
+
+fn secs_ns(value: f64) -> u64 {
+    (value.max(0.0) * 1_000_000_000.0) as u64
+}
+
+/// `interactive_send` 提交點拒絕碼（#36；`session_manager.py:7224-7233`）；`None` 表示例外穿出。
+fn lease_refused_send_code(reject: FenceReject) -> Option<&'static str> {
+    match reject {
+        FenceReject::OwnerMismatch => Some("INTERACTIVE_EXPIRED"),
+        FenceReject::Quiet | FenceReject::ReconfirmPending => Some("AUTOBOOT_QUIET"),
+        FenceReject::Frozen
+        | FenceReject::Cancelled
+        | FenceReject::StaleEpoch
+        | FenceReject::Flash => Some("SESSION_BUSY"),
+        _ => None,
+    }
+}
+
+/// interactive 模式命令的 TX 被拒：`execute_command` 的 `_map_aborted_result` 映射。
+fn lease_refused_command_code(reject: FenceReject) -> &'static str {
+    match reject {
+        FenceReject::Quiet | FenceReject::ReconfirmPending => "AUTOBOOT_QUIET",
+        FenceReject::Cancelled | FenceReject::StaleEpoch | FenceReject::Frozen => {
+            "FLUSHED_BY_RECOVERY"
+        }
+        _ => "SEND_FAILED",
+    }
+}
+
+/// Python `text[-n:]`（n == 0 → 全部；n < 0 → 去掉前 |n| 字元）。
+fn py_tail(text: &str, n: i128) -> String {
+    let count = text.chars().count() as i128;
+    let skip = if n > 0 {
+        (count - n).max(0)
+    } else if n < 0 {
+        (-n).min(count)
+    } else {
+        0
+    };
+    text.chars().skip(skip as usize).collect()
+}
+
+/// Python `str(OSError)`：`[Errno N] strerror: 'path'`。
+fn os_error_text(error: &std::io::Error, path: &str) -> String {
+    let message = error.to_string();
+    let strerror = message
+        .split(" (os error")
+        .next()
+        .unwrap_or(message.as_str())
+        .to_string();
+    match error.raw_os_error() {
+        Some(code) => format!("[Errno {code}] {strerror}: '{path}'"),
+        None => format!("{strerror}: '{path}'"),
     }
 }
 

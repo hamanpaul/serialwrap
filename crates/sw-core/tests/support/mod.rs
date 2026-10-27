@@ -24,11 +24,12 @@ use sw_core::login_fsm::LoginOutcome;
 use sw_core::mailbox::{
     ControlEvent, DataEvent, Mailbox, MailboxItem, OpenFailure, OpenedBridge, TimerEvent,
 };
+use sw_core::op_runner::{OpCtx, OpOutcome, OpRunner};
 use sw_core::session_core::{
     CoreDeps, Effect, PublicCtx, SessionCore, SessionRequest, SessionState,
 };
 use sw_core::state_store::StateDelta;
-use sw_core::tx_writer::{Fence, TxLedger};
+use sw_core::tx_writer::{Fence, TxLedger, TxLedgerGauge, TxWriterHandle};
 use sw_core::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use sw_core::wal::{WalAppendReq, WalConfig, WalHealthFanout, WalWriter};
 use sw_pal::fakes::clock::FakeClock;
@@ -891,6 +892,10 @@ struct RigExec {
     /// Task 13：login FSM 執行所需（profile、帳密 fallback env）。
     profile: SessionProfile,
     env: Arc<FakeEnv>,
+    /// Task 14：每個 epoch 一個 OpRunner（ForegroundSlot）。
+    runners: HashMap<u64, OpRunner>,
+    /// Task 14：現行 worker 的 TX 入口（`tx_ledger_gauge()` 用）。
+    current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
 }
 
 /// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
@@ -946,6 +951,8 @@ impl EffectExecutor for RigExec {
                 });
             }
             Effect::AdoptBridge { epoch, worker, .. } => {
+                *self.current_tx.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(worker.tx().clone());
                 self.workers.insert(epoch, worker);
             }
             Effect::WalMeta { cmd_id, meta } => {
@@ -1031,7 +1038,40 @@ impl EffectExecutor for RigExec {
                     });
                 });
             }
-            Effect::StartOp { .. } => sw_core::s21_todo!("T14", "ActorRig StartOp executor"),
+            Effect::StartOp { grant, spec } => {
+                // Task 14：op 於該 epoch 的 OpRunner thread 執行（TX 一律經該 epoch 的 TxWriter）。
+                let epoch = grant.epoch;
+                if !self.runners.contains_key(&epoch) {
+                    let Some(worker) = self.workers.get(&epoch) else {
+                        let _ = tx.send(ControlEvent::OpFinished {
+                            op_id: grant.op_id,
+                            epoch,
+                            outcome: OpOutcome::SendFailed,
+                            after_rx_seq: None,
+                        });
+                        return;
+                    };
+                    let runner = OpRunner::spawn(OpCtx {
+                        com: "COM0".into(),
+                        sid: String::new(),
+                        profile: self.profile.clone(),
+                        rx: self.rx.clone(),
+                        tx: worker.tx().clone(),
+                        wal: self.wal.clone(),
+                        clock: self.clock.clone(),
+                        control: tx.clone(),
+                        rng: Arc::new(|buf: &mut [u8]| {
+                            for (i, b) in buf.iter_mut().enumerate() {
+                                *b = i as u8;
+                            }
+                        }),
+                    });
+                    self.runners.insert(epoch, runner);
+                }
+                if let Some(runner) = self.runners.get(&epoch) {
+                    runner.run(grant, spec);
+                }
+            }
             Effect::SettleTx { epoch, op_id } => {
                 if let Some(worker) = self.workers.get(&epoch) {
                     let _ = worker.tx().settle(op_id);
@@ -1047,6 +1087,11 @@ pub struct ActorRig {
     pub clock: Arc<FakeClock>,
     pub state_store: FakeStateStore,
     pub env: Arc<FakeEnv>,
+    /// Task 14：TX fence（`quiet_active` 等斷言用）。
+    pub fence: Arc<Fence>,
+    /// Task 14：RX 視窗（`screen` 等斷言用）。
+    pub rx: Arc<RxShared>,
+    current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
     wal: Arc<WalWriter>,
     wfs: Arc<FakeWalFs>,
     reg: Arc<CommandRegistry>,
@@ -1062,6 +1107,11 @@ const WAL_FAIL_FOREVER: usize = 4096;
 impl ActorRig {
     /// 以 profiles YAML 建立 actor（尚未 attach；bridge 未開）。
     pub fn new(profile_yaml: &str) -> ActorRig {
+        ActorRig::new_with(profile_yaml, |_| {})
+    }
+
+    /// 同 `new`，但在 actor 啟動前可調整 `SessionCore`（Task 14：capture env、self-test 觀測注入）。
+    pub fn new_with(profile_yaml: &str, setup: impl FnOnce(&mut SessionCore)) -> ActorRig {
         let profile = profile_of(profile_yaml);
         let clock = FakeClock::new();
         let fence = Fence::new();
@@ -1107,11 +1157,15 @@ impl ActorRig {
             }),
         };
         let exec_profile = profile.clone();
-        let core = SessionCore::new(profile, "yaml-target", deps);
+        let mut core = SessionCore::new(profile, "yaml-target", deps);
+        setup(&mut core);
+        let current_tx: Arc<Mutex<Option<TxWriterHandle>>> = Arc::new(Mutex::new(None));
         let mailbox = Mailbox::new(256, 1024);
         let data = mailbox.data_sender();
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let state_store = FakeStateStore::new();
+        let rig_fence = fence.clone();
+        let rig_rx = rx.clone();
         let exec = RigExec {
             serial,
             wal: wal.clone(),
@@ -1125,6 +1179,8 @@ impl ActorRig {
             workers: HashMap::new(),
             profile: exec_profile,
             env: env.clone(),
+            runners: HashMap::new(),
+            current_tx: current_tx.clone(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -1132,6 +1188,9 @@ impl ActorRig {
             clock,
             state_store,
             env,
+            fence: rig_fence,
+            rx: rig_rx,
+            current_tx,
             wal,
             wfs,
             reg,
@@ -1185,6 +1244,39 @@ impl ActorRig {
     /// WAL 累計寫入失敗次數（`WalWriter::health().write_failures`；Review Focus 3 同步點）。
     pub fn wal_write_failures(&self) -> u64 {
         self.wal.health().write_failures
+    }
+
+    /// Task 14：直接投遞 control 事件（例如另一路徑的 `DeviceAttached`）。
+    pub fn send_control(&self, ev: ControlEvent) {
+        let _ = self.actor.control.send(ev);
+    }
+
+    /// Task 14（R1-F8）：現行 worker 的 TX 帳本 gauge。
+    pub fn tx_ledger_gauge(&self) -> TxLedgerGauge {
+        self.current_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|handle| handle.ledger_gauge())
+            .expect("尚未開出 bridge")
+    }
+
+    /// Task 14：WAL 全部紀錄（dict）。
+    pub fn wal_all_rows(&self) -> Vec<PyDict> {
+        self.wal_rows()
+    }
+
+    /// Task 14：以 RPC 等待條件成立（每輪送一次 GetState，讓 actor 處理積壓事件）。
+    pub fn wait_for(&self, what: &str, mut cond: impl FnMut(&ActorRig) -> bool) {
+        let deadline = Instant::now() + RIG_WAIT;
+        loop {
+            let _ = self.get_state();
+            if cond(self) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "等待逾時：{what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// 只送 `DeviceAttached`，不等 READY。
@@ -1243,7 +1335,7 @@ impl ActorRig {
         let deadline = Instant::now() + RIG_WAIT;
         loop {
             let cur = self.command_get(cmd_id);
-            if cur.get("state").and_then(|v| v.as_str()) == Some("running") {
+            if cur.get("status").and_then(|v| v.as_str()) == Some("running") {
                 return;
             }
             assert!(

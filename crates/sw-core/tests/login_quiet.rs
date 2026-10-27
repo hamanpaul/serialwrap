@@ -413,7 +413,11 @@ fn execute_time_gate_has_retry_after_sc03() {
     h.wait_running(&hold);
     let queued = h.submit_ok("ls");
     h.inject_rx(BANNER.as_bytes());
-    h.advance(Duration::from_secs(120)); // hold 逾時，佇列中的 ls 出列
+    // Python 基線：hold 若逾時，`_recover_after_failure`（quiet 中不送救援鍵）→ `_transition_to_attached`
+    // → `_on_detached` 以 FLUSHED_BY_RECOVERY 終結佇列，ls 永遠走不到 execute-time gate。故改以 prompt 回來
+    // 讓 hold 正常完成：prompt 只清 TX 靜默維度、reconfirm pending 保留（#162），ls 出列時仍被 gate 擋下。
+    h.inject_rx(b"root@t:/# ");
+    let _ = h.wait_done(&hold);
     let done = h.wait_done(&queued);
     assert_eq!(
         done.get("error_code"),
