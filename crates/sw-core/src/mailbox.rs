@@ -48,6 +48,10 @@ pub enum ControlEvent {
         by_id: String,
         reason: DetachReason,
     },
+    /// Console 擁有者更新目前附掛在 session 的 console 數量；供 release 回報實際關閉數。
+    ConsoleCountChanged {
+        count: usize,
+    },
     BridgeOpened {
         epoch_hint: u64,
         result: Result<OpenedBridge, OpenFailure>,

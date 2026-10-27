@@ -4,7 +4,7 @@
 //! `catch_unwind(core.on_event(..))` 隔離 panic，效果交 `EffectExecutor` 執行；1 s `Tick`。
 //! I/O 效果交給注入的 executor；定時事件與單調時鐘 tick 由 actor 排程。
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -148,7 +148,6 @@ pub fn spawn_actor(
                 else {
                     continue;
                 };
-                let stop = matches!(item, MailboxItem::Control(ControlEvent::Shutdown { .. }));
                 let data_mark = match &item {
                     MailboxItem::Data(DataEvent::UartRxChunk { epoch, rx_seq, .. }) => {
                         Some((*epoch, *rx_seq))
@@ -173,7 +172,7 @@ pub fn spawn_actor(
                         processed = processed.max(mark);
                     }
                 }
-                if done || stop {
+                if done {
                     break;
                 }
             }
@@ -201,7 +200,6 @@ fn dispatch(
     panic_type: &mut Option<&'static str>,
     panic_count: &mut u8,
 ) -> bool {
-    let is_shutdown = matches!(item, MailboxItem::Control(ControlEvent::Shutdown { .. }));
     let (reply, event_name) = match &item {
         MailboxItem::Control(ControlEvent::Request { reply, .. })
         | MailboxItem::Control(ControlEvent::Shutdown { reply }) => {
@@ -209,6 +207,9 @@ fn dispatch(
         }
         MailboxItem::Control(ControlEvent::DeviceAttached { .. }) => (None, "DeviceAttached"),
         MailboxItem::Control(ControlEvent::DeviceDetached { .. }) => (None, "DeviceDetached"),
+        MailboxItem::Control(ControlEvent::ConsoleCountChanged { .. }) => {
+            (None, "ConsoleCountChanged")
+        }
         MailboxItem::Control(ControlEvent::BridgeOpened { .. }) => (None, "BridgeOpened"),
         MailboxItem::Control(ControlEvent::UartIoError { .. }) => (None, "UartIoError"),
         MailboxItem::Control(ControlEvent::UartTxCompleted { .. }) => (None, "UartTxCompleted"),
@@ -285,5 +286,5 @@ fn dispatch(
             }
         }
     }
-    is_shutdown
+    core.shutdown_complete()
 }

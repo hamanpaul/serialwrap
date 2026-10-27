@@ -159,17 +159,17 @@ mod windows_native {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use sw_pal::conformance::{serial_suite, PeerEnd};
+    use sw_pal::conformance::{PeerEnd, serial_suite};
     use sw_pal::serial::windows::WindowsSerialBackend;
     use sw_pal::*;
     use windows_sys::Win32::Devices::Communication::{
-        GetCommState, SetCommState, SetCommTimeouts, SetupComm, COMMTIMEOUTS, DCB,
+        COMMTIMEOUTS, DCB, GetCommState, SetCommState, SetCommTimeouts, SetupComm,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
     };
 
     static COM_TEST_LOCK: Mutex<()> = Mutex::new(());

@@ -2954,6 +2954,7 @@ git commit -m "feat(sw-core): SessionActor 狀態機、世代隔離與有界 mai
 **Files:**
 - Modify: `crates/sw-core/src/drain.rs`、`crates/sw-core/src/session_core.rs`、`crates/sw-core/src/uart_bridge.rs`（`IoWorker`、finisher）、`crates/sw-core/src/actor.rs`（executor 的 `OpenBridge`／`BeginDrain`）
 - Modify: `crates/sw-core/tests/support/mod.rs`（Step 0：`FakeStateStore`）
+- Modify: `tests/test_stage0_session_drain.py`（parity amendment #23：RELEASED 持久化失敗後的重試 oracle）
 - Test: `crates/sw-core/tests/drain_release.rs`、`crates/sw-core/tests/io_worker.rs`
 
 **Interfaces:**
@@ -3131,7 +3132,7 @@ fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Ef
 }
 ```
 
-- executor 的 `BeginDrain`：`worker.begin_stop()` 後 `worker.finish_async(stop_id, safety)`；finisher thread（不設逾時）：join writer thread 取得 `(writer, TxLedger)` → join reader thread 取得 `ReaderExit` → WAL 失敗彙整為 `unrecorded`（reader 缺口＋`ledger.unresolved_gaps`＋仍在 `ledger.ops` 的各 op `wal_gaps`；合併計數留在 `ledger.gaps_overflow` 與各 op `wal_gaps_overflow`，隨 receipt 交回，R1-F8）→ `CloseToken::close(reader, writer)` → 送 `WorkerStopped(receipt{ledger, ..})` 到 safety lane。`TxWriter` 結束不依賴 Sender 數量（Task 9 `TxWriterStop`）。
+- executor 的 `BeginDrain`：`worker.begin_stop()` 後 `worker.finish_async(stop_id, control)`；finisher thread（不設逾時）：join writer thread 取得 `(writer, TxLedger)` → join reader thread 取得 `ReaderExit` → WAL 失敗彙整為 `unrecorded`（reader 缺口＋`ledger.unresolved_gaps`＋仍在 `ledger.ops` 的各 op `wal_gaps`；合併計數留在 `ledger.gaps_overflow` 與各 op `wal_gaps_overflow`，隨 receipt 交回，R1-F8）→ `CloseToken::close(reader, writer)` → 送 `WorkerStopped(receipt{ledger, ..})`。`TxWriter` 結束不依賴 Sender 數量（Task 9 `TxWriterStop`）。
 - `OpFinished` 優先序：`stop` 進行中且 `OpFinished.epoch == stop.epoch` 且 op 為 `stop.aborted_op` → 不呼叫 `registry.complete`（保留 stdout 於 debug log），最終結果只由 receipt 帳本決定；其他 op 照常處理。
 - TX 帳本結算（R1-F8，Task 9 結算／退休協定）：`SessionCore::settle_tx(op_id, fx)` 是唯一產生 `Effect::SettleTx{epoch: conn_epoch, op_id}` 的地方，每個 op 恰呼叫一次，位置是該 op 的終態處理點且在 `registry.complete` 之後——`OpFinished`（非 aborted_op 時）、`LoginFinished`（login run 的 op）、lease close／expiry（`LeaseOwner`／`InteractiveOpenCmd` op）、self-test 的 `OpFinished(SelfTest)`；`stop.aborted_op` 與尚未終態的 op 一律不結算（其證據只隨 receipt 帳本交回）。`conn_epoch` 為 None 時不產生。executor：`SettleTx.epoch` 等於現行 worker epoch 才呼叫 `worker.tx().settle(op_id)`（非阻塞），否則丟棄。`UartIoError{reason:"TX_LEDGER_SATURATED"}` 走既有 IoError drain，另發 `Effect::Warn("session <sid> TX 帳本未結算 op 達 256 上限，以 IoError drain 收斂（R1-F8）")`。後續 Phase 新增 op 種類（07 human TX、08 reprobe／reconfirm、09 transfer／flash）須在各自終態處理點呼叫 `settle_tx`。
 - 收到 receipt：`epoch`／`stop_id` 不符 → 只對帳本中仍未終態的舊 op 命令紀錄套 BC-03，不改狀態；相符且 `handle_closed` → 對 `aborted_op` 依帳本 `registry.complete(cmd, CmdOutcome::Aborted(class))`（`confirmed_bytes ≥ 1`→InFlight、`0` 且非 unknown→NotSubmitted、`unknown`→Unknown），InFlight 另產生 `Effect::WalMeta{cmd_id, meta:{"event":"command_aborted_in_flight","confirmed_tx_bytes":N,"tx_outcome":"complete"|"partial"}}`（`complete`＝確認 bytes 等於 payload 長度；P1 T08）→ `conn_epoch=None`、`queue_registered=false`、`Notify(SessionDetached)` → 依 kind（`post_kind` 只在 kind 非 Release 時覆寫裝置存在判斷）：Release → `Persist{delta: StateDelta::Released{sid, row: ReleasedRow{by_id, released_by, released_at, reason}}}`，等 `StateCommitted` 成功才 `RELEASED` 並回覆所有 waiters；失敗 → 狀態仍設 `RELEASED`、waiters 收 `Err(PyErr("state.json commit failed: …"))`；Recover／IoError → 裝置在 `ATTACHING`＋`OpenBridge`，否則 `DETACHED`；Removed → `DETACHED`、`last_error:"DEVICE_REMOVED"`；Rebound → `last_error:"DEVICE_REBOUND_REQUIRED"` 後 `OpenBridge`（Task 16）；Shutdown → 回覆 waiter。`handle_closed:false` → `stalled=true`、維持 RECOVERING、Release waiters 收 `DRAIN_STALLED` 形狀（下列逾時同形；OD-14 #4）。收尾時 `drain_stalled=false`，`drain_timeout_epoch` 保留最後一次逾時值（P1 T08 凍結）。
@@ -3141,8 +3142,8 @@ fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Ef
 
 - [ ] **Step 4：執行並確認 PASS**
 
-Run：`cargo test -p sw-core --features test-fakes --test drain_release --test io_worker`
-Expected：PASS（`drain_release` 36 項：2 個程式碼案例＋34 列，含 R1-F8 四列；`io_worker` 6 項）。
+Run：`cargo test -p sw-core --features test-fakes --test drain_release --test io_worker`；Python oracle：`python3 -m pytest -q tests/test_stage0_session_drain.py::test_release_persist_failure_retried`
+Expected：PASS（`drain_release` 64 項：原列 52 項，加 12 個雙審有效發現及其 shutdown／commit 邊界案例；`io_worker` 9 項：原列 8 項，另驗 EOF／讀取錯誤不會冒充 handle 關閉；Python oracle 驗證失敗後 pending、第二次 release 接手持久化）。
 
 - [ ] **Step 5：Commit**
 
@@ -3150,6 +3151,25 @@ Expected：PASS（`drain_release` 36 項：2 個程式碼案例＋34 列，含 R
 git add crates/sw-core changelog.d/rust-s21-drain-release.md
 git commit -m "feat(sw-core): 兩階段 drain、release 回條與獨占收回" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
+
+---
+
+#### parity-amendments-2026-10-26 追加（Python 1:1 承接）
+
+> 來源：`docs/rust-refactor/plans/parity-amendments-2026-10-26.md`（稽核 A／B 與 P6 審查）。依 OD-14 #1（外部可觀察行為與 Python 1:1，只可新增、不可修改），下列為本 Task 的**必要**測試列與完成條件：紅燈先行，新增 nodeid 於本 Task 紅燈 commit 以 P2 `regen_lock.py --l1-add-only` 登記到所列集合；斷言值以 Python 基線實測為準（不得自訂）。
+
+| # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
+|---|---|---|---|
+| #21 | B:C-09、C-62 | `release_during_pending_open_bridge_closes_late_handle` | Release 落在 `OpenBridge` 未返回或 PROBE 期間：記 release_request、共用第一次 3000 ms deadline、cancel op；`BridgeOpened` 遲到時立即關閉該 handle（等 `CloseReceipt`）並維持 `RELEASED`，不回 `ATTACHING`；close 失敗（receipt `closed:false`）時持續阻擋重開（`session_manager.py:2984-3017,3070-3088,4130-4175`） |
+| #22 | B:C-10 | `release_during_pending_open_drain_stalled` | 上項逾時回 `DRAIN_STALLED`＋`drain_stalled:true`＋`drain_timeout_epoch`（epoch 取 `bridge_generation`），session `RECOVERING`；Python oracle `tests/test_p1oc_drain_stalled.py`（#77） |
+| #23 | B:C-11、B-86、B-85 | `release_retry_persists_after_commit_failure`、`late_receipt_persist_failure_sets_pending_and_retries`、`single_release_persister_waiters_take_over` | RELEASED 寫 state.json 失敗 → 回應依 Python 形狀、`release_persist_pending=true`；下一次 release（或遲到回條後）重試寫入；同時多個 release 只有一個 persister，其餘等待者接手結果（`session_manager.py:2752-2769,2871,3018-3023,3098-3101`）；Python 側新增特性測試 `tests/test_stage0_session_drain.py::test_release_persist_failure_retried`（#81） |
+| #24 | B:C-28 | `device_attach_dedup_same_by_id_inflight` | 同 by_id 已有 attach／preopen 時第二個 `device.attach` 回 `SESSION_RECOVERING`，`FakeSerial.open_calls==1`（`:3293-3305,3320-3327`） |
+| #25 | B:C-30 | `stale_bridge_opened_after_rebind_closed`、`stale_bridge_opened_after_real_path_change_closed` | `BridgeOpened` 遲到時 session 已換、bind 已換綁、generation 已變或 real_path 已變 → 關閉該 handle、只保留 I/O 證據（比照 `stale_receipt_after_reattach_keeps_evidence_only`）（`:3336-3361,3414-3474`） |
+| #18 | B:B-82 | `io_error_with_pending_auto_login_goes_recovering_not_attach` | `UartIoError` 時 `pending_auto_login` 為真 → `RECOVERING`、不送 `OpenBridge`、不登入，由 reboot recovery（P7-T7）收斂（`session_manager.py:2853-2859`） |
+| #90 | B:C-13、C-16 | `release_response_closed_consoles_and_aborted_cmd` | 一般路徑 `closed_consoles`＝實際關閉的 console 數、`aborted_cmd`＝是否中止在途命令；attach-op 路徑恆 `closed_consoles:0, aborted_cmd:false`（`:3039-3057,3092-3097`）；黑箱 A/B 於 P8-T11 |
+| #91 | B:C-63 | `probe_stop_timeout_waits_late_receipt` | PROBE 停止逾時後仍等遲到回條，回條前不重開（`:4196-4209`） |
+| #41 | B:E-115 | `snapshot_serial_alive_and_running_semantics` | `serial_alive`＝IoWorker handle 有效且最近一次 fstat 等價檢查成功；`running`＝reader thread 存活（`uart_io.py:2838-2847,2864`）；P6-T7 ATTACHED 救援判定消費此值 |
+| #92 | B:C-44 | `session_attach_with_release_request_session_recovering` | release_request 存在時 `session.attach` 回 `SESSION_RECOVERING`（`:3703-3718`）；Python oracle 為 p1oc（#77） |
 
 ---
 

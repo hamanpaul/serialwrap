@@ -3,21 +3,26 @@
 //! T10 提供 reader thread、RX 視窗及哨兵 fan-out；IoWorker 的啟停與 TX 組裝由 T12 完成。
 
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
-use sw_pal::traits::{Clock, PalError, ReadError, ReadOutcome, SerialHandle, SerialReader};
+use sw_pal::traits::{
+    CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
+    SerialReader, SerialWriter,
+};
 use sw_proto::pycompat::decode_utf8_replace;
 use sw_proto::pyre::PyRegex;
 
+use crate::Mono;
 use crate::drain::StopId;
 use crate::mailbox::{ControlEvent, DataEvent};
-use crate::tx_writer::{Fence, TxWriterHandle};
+use crate::tx_writer::{
+    EvidenceGap, Fence, TxLedger, TxWriterHandle, TxWriterStop, spawn_tx_writer,
+};
 use crate::wal::{WalAppendReq, WalWriter};
-use crate::Mono;
 
 const IO_POLL: Duration = Duration::from_millis(200);
 const RX_RATE_WINDOW_NS: u64 = 10_000_000_000;
@@ -332,6 +337,7 @@ pub struct ReaderExit {
     pub sentinel: Option<Box<dyn ConsoleIo>>,
     pub error: Option<PalError>,
     pub rx_seq: u64,
+    pub unrecorded: Vec<EvidenceGap>,
 }
 
 /// 啟動 reader thread（Task 10）：讀取 → WAL → RX 視窗 → data lane；`stop` 為協作式停止旗標。
@@ -374,6 +380,7 @@ fn spawn_reader_inner(
             let mut rx_seq = 0u64;
             let mut buf = [0u8; 8192];
             let mut error = None;
+            let mut unrecorded = Vec::new();
 
             loop {
                 if stop.load(Ordering::Acquire) {
@@ -396,6 +403,23 @@ fn spawn_reader_inner(
                                 loss_flag: false,
                                 meta: None,
                             });
+                            if wal_entry.loss_flag {
+                                let message = ctx
+                                    .wal
+                                    .health()
+                                    .last_write_error
+                                    .unwrap_or_else(|| "RX WAL append failed".to_string());
+                                if unrecorded.len()
+                                    < crate::tx_writer::TX_LEDGER_UNRESOLVED_GAPS_MAX
+                                {
+                                    unrecorded.push(EvidenceGap {
+                                        op_id: None,
+                                        dir: "RX",
+                                        len: data.len(),
+                                        error: PalError::plain(PalErrorKind::Io, message),
+                                    });
+                                }
+                            }
                             let now = ctx.clock.mono_ns();
                             rx_seq = rx_seq.saturating_add(1);
                             ctx.rx.append(data, now, ctx.epoch, rx_seq);
@@ -469,6 +493,7 @@ fn spawn_reader_inner(
                 sentinel,
                 error,
                 rx_seq,
+                unrecorded,
             }
         })
         .expect("建立 UART reader thread")
@@ -513,31 +538,165 @@ pub struct IoWorkerArgs {
 
 /// 單一 bridge 的 I/O worker（reader thread＋TxWriter thread）。
 pub struct IoWorker {
-    _stub: (),
+    tx: TxWriterHandle,
+    tx_stop: TxWriterStop,
+    reader_stop: Arc<AtomicBool>,
+    cancel: CancelToken,
+    reader: std::thread::JoinHandle<ReaderExit>,
+    writer: std::thread::JoinHandle<(Box<dyn SerialWriter>, TxLedger)>,
+    close: CloseToken,
+    wal: Arc<WalWriter>,
+    epoch: u64,
+}
+
+/// IoWorker 對外快照（P5-T12 parity-amendments #41）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerSnapshot {
+    pub serial_alive: bool,
+    pub running: bool,
 }
 
 impl IoWorker {
-    #[cfg(feature = "test-fakes")]
-    pub fn start(_handle: Box<dyn SerialHandle>, _args: IoWorkerArgs) -> IoWorker {
-        IoWorker { _stub: () }
-    }
-
-    #[cfg(not(feature = "test-fakes"))]
-    pub fn start(_handle: Box<dyn SerialHandle>, _args: IoWorkerArgs) -> IoWorker {
-        s21_todo!("T12", "IoWorker::start")
+    pub fn start(handle: Box<dyn SerialHandle>, args: IoWorkerArgs) -> IoWorker {
+        let (reader, writer, waker, close) = handle.split();
+        let cancel = CancelToken::new(waker.clone());
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let reader = spawn_reader(
+            reader,
+            ReaderCtx {
+                com: args.com.clone(),
+                epoch: args.epoch,
+                wal: args.wal.clone(),
+                rx: args.rx.clone(),
+                sentinel: args.sentinel,
+                data: args.data,
+                control: args.control.clone(),
+                clock: args.clock,
+            },
+            reader_stop.clone(),
+        );
+        let wal = args.wal.clone();
+        let epoch = args.epoch;
+        let (tx, tx_stop, writer) = spawn_tx_writer(
+            args.com,
+            writer,
+            cancel.clone(),
+            args.fence,
+            args.wal,
+            args.epoch,
+            args.control,
+        );
+        IoWorker {
+            tx,
+            tx_stop,
+            reader_stop,
+            cancel,
+            reader,
+            writer,
+            close,
+            wal,
+            epoch,
+        }
     }
 
     pub fn tx(&self) -> &TxWriterHandle {
-        s21_todo!("T12", "IoWorker::tx")
+        &self.tx
     }
 
     /// reader stop flag＋TxWriterStop::send＋cancel.cancel()＋waker.wake()。
     pub fn begin_stop(&self) {
-        s21_todo!("T12", "IoWorker::begin_stop")
+        self.reader_stop.store(true, Ordering::Release);
+        self.tx_stop.send();
+        self.cancel.cancel();
+    }
+
+    /// 回報目前仍由 worker 持有的 serial handle 與 reader thread 狀態。
+    pub fn snapshot(&self) -> WorkerSnapshot {
+        WorkerSnapshot {
+            serial_alive: self.close.is_alive(),
+            running: !self.reader.is_finished(),
+        }
     }
 
     /// thread：join writer（取 TxLedger）→ join reader → close → `WorkerStopped`。
-    pub fn finish_async(self, _stop_id: StopId, _control: Sender<ControlEvent>) {
-        s21_todo!("T12", "IoWorker::finish_async")
+    pub fn finish_async(self, stop_id: StopId, control: Sender<ControlEvent>) {
+        self.begin_stop();
+        let Self {
+            tx: _,
+            tx_stop: _,
+            reader_stop: _,
+            cancel: _,
+            reader,
+            writer,
+            close,
+            wal,
+            epoch,
+        } = self;
+        std::thread::Builder::new()
+            .name(format!("serialwrap-drain-{}", stop_id.0))
+            .spawn(move || {
+                let writer_result = writer.join();
+                let reader_result = reader.join();
+                let (ledger, reader_exit, close_receipt) = match (writer_result, reader_result) {
+                    (Ok((writer, ledger)), Ok(reader_exit)) => {
+                        let ReaderExit {
+                            reader,
+                            sentinel,
+                            error: _,
+                            rx_seq: _,
+                            unrecorded,
+                        } = reader_exit;
+                        drop(sentinel);
+                        let close_receipt = close.close(reader, writer);
+                        (ledger, Some(unrecorded), Some(close_receipt))
+                    }
+                    _ => {
+                        let error = PalError::plain(
+                            PalErrorKind::Io,
+                            "UART worker thread panicked before returning its handle",
+                        );
+                        let receipt = crate::drain::WorkerStoppedReceipt {
+                            epoch,
+                            stop_id,
+                            ledger: TxLedger::default(),
+                            unrecorded: Vec::new(),
+                            wal_error: Some(error.clone()),
+                            handle_closed: false,
+                            close_error: Some(error),
+                        };
+                        let _ = control.send(ControlEvent::WorkerStopped(receipt));
+                        return;
+                    }
+                };
+
+                let mut unrecorded = reader_exit.unwrap_or_default();
+                for gap in &ledger.unresolved_gaps {
+                    unrecorded.push(gap.clone());
+                }
+                for entry in ledger.ops.values() {
+                    unrecorded.extend(entry.wal_gaps.iter().cloned());
+                }
+                let close_receipt = close_receipt.expect("成功 join 後必有 close receipt");
+                let health = wal.health();
+                let wal_error = (!health.healthy).then(|| {
+                    PalError::plain(
+                        PalErrorKind::Io,
+                        health
+                            .last_write_error
+                            .unwrap_or_else(|| "WAL unhealthy during UART drain".to_string()),
+                    )
+                });
+                let receipt = crate::drain::WorkerStoppedReceipt {
+                    epoch,
+                    stop_id,
+                    ledger,
+                    unrecorded,
+                    wal_error,
+                    handle_closed: close_receipt.closed,
+                    close_error: close_receipt.error,
+                };
+                let _ = control.send(ControlEvent::WorkerStopped(receipt));
+            })
+            .expect("建立 UART drain finisher thread");
     }
 }

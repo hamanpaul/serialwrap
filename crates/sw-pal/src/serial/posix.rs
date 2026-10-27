@@ -830,6 +830,19 @@ struct PosixCloseToken {
 }
 
 impl CloseImpl for PosixCloseToken {
+    fn is_alive(&self) -> bool {
+        let close = self
+            .close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fd) = close.fd else {
+            return false;
+        };
+        // SAFETY：`fd` 由共用 close 狀態持有，close token 仍有效時不會被重用。
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        unsafe { libc::fstat(fd, &mut st) == 0 }
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         let mut close = self
             .close
@@ -1041,11 +1054,7 @@ impl SerialWriter for PosixSerialWriter {
             let fd = self.fd;
             let step = gate.submit(&mut || match retry_eintr(|| {
                 let n = raw_tx_write(fd, &data[sent..]);
-                if n < 0 {
-                    Err(errno())
-                } else {
-                    Ok(n)
-                }
+                if n < 0 { Err(errno()) } else { Ok(n) }
             }) {
                 Ok(n) if n > 0 => SubmitStep::Accepted(n as usize),
                 Ok(0) => SubmitStep::Failed(PalError::io(0, "write returned 0")),

@@ -772,6 +772,8 @@ impl CancelToken {
 
 /// `close` 的實作端（各後端與替身各自實作）。
 pub trait CloseImpl: Send {
+    /// 回報底層 serial handle 是否仍有效；不以 EOF 或讀取錯誤推斷 handle 已關閉。
+    fn is_alive(&self) -> bool;
     fn close(self: Box<Self>) -> CloseReceipt;
 }
 
@@ -783,6 +785,10 @@ pub struct CloseToken {
 impl CloseToken {
     pub fn new(inner: Box<dyn CloseImpl>) -> CloseToken {
         CloseToken { inner }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
     }
 
     pub fn close(self, r: Box<dyn SerialReader>, w: Box<dyn SerialWriter>) -> CloseReceipt {

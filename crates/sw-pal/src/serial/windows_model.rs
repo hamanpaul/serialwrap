@@ -211,10 +211,7 @@ pub fn map_overlapped_write_completion(
         } else {
             PalErrorKind::TimedOut
         };
-        return (
-            TxOutcome::Completed(transferred),
-            Some(kind),
-        );
+        return (TxOutcome::Completed(transferred), Some(kind));
     }
     map_overlapped_completion(get_result_ok, transferred as u32, win32)
 }

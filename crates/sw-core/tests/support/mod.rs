@@ -13,14 +13,17 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use indexmap::IndexMap;
-use sw_core::actor::{spawn_actor, ActorHandle, EffectExecutor};
+use sw_core::Mono;
+use sw_core::actor::{ActorHandle, EffectExecutor, spawn_actor};
 use sw_core::arbiter::{CommandRegistry, SubmitReq};
 use sw_core::drain::{StopId, WorkerStoppedReceipt};
 use sw_core::generations::EpochAllocator;
 use sw_core::login_fsm::LoginOutcome;
-use sw_core::mailbox::{ControlEvent, DataEvent, Mailbox, MailboxItem, OpenedBridge, TimerEvent};
+use sw_core::mailbox::{
+    ControlEvent, DataEvent, Mailbox, MailboxItem, OpenFailure, OpenedBridge, TimerEvent,
+};
 use sw_core::session_core::{
     CoreDeps, Effect, PublicCtx, SessionCore, SessionRequest, SessionState,
 };
@@ -28,17 +31,17 @@ use sw_core::state_store::StateDelta;
 use sw_core::tx_writer::{Fence, TxLedger};
 use sw_core::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use sw_core::wal::{WalAppendReq, WalConfig, WalHealthFanout, WalWriter};
-use sw_core::Mono;
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::env::FakeEnv;
 use sw_pal::fakes::serial::{FakeDevice, FakeSerialBackend};
 use sw_pal::fakes::wal_fs::FakeWalFs;
 use sw_pal::traits::{
-    Clock, DevicePath, FlowControl, PalError, Parity, ReadError, SerialBackend, SerialConfig,
+    Clock, DevicePath, FlowControl, OpenError, PalError, Parity, ReadError, SerialBackend,
+    SerialConfig,
 };
-use sw_proto::config_types::{load_profiles, ProfileFs, SessionProfile};
+use sw_proto::config_types::{ProfileFs, SessionProfile, load_profiles};
 use sw_proto::pycompat::{PyErr, PyOsError};
-use sw_proto::pyjson::{loads, PyDict, PyValue};
+use sw_proto::pyjson::{PyDict, PyValue, loads};
 use sw_proto::pypath::PathFlavor;
 
 /// 測試用 profile 目錄（只存在於記憶體 ProfileFs）。
@@ -107,6 +110,8 @@ pub struct CoreHarness {
     pub wfs: Arc<FakeWalFs>,
     pub rx: Arc<RxShared>,
     pub epochs: Arc<EpochAllocator>,
+    pub state_store: FakeStateStore,
+    pub fake_device: FakeDevice,
     serial: Arc<FakeSerialBackend>,
     credential_files: Arc<Mutex<BTreeMap<String, String>>>,
     wall_us: Arc<AtomicI64>,
@@ -116,6 +121,50 @@ pub struct CoreHarness {
     data_tx: Sender<DataEvent>,
     ctl_tx: Sender<ControlEvent>,
     _keep: (Receiver<DataEvent>, Receiver<ControlEvent>),
+    workers: HarnessWorkers,
+    finish_tx: Sender<ControlEvent>,
+    finish_rx: Receiver<ControlEvent>,
+    last_stop: Option<(u64, StopId)>,
+    wal_metas: Vec<PyDict>,
+    defer_state_commits: bool,
+    pending_state_commits: Vec<(u64, StateDelta)>,
+}
+
+struct HarnessWorkers {
+    items: HashMap<u64, IoWorker>,
+    finish_tx: Sender<ControlEvent>,
+}
+
+impl HarnessWorkers {
+    fn new(finish_tx: Sender<ControlEvent>) -> HarnessWorkers {
+        HarnessWorkers {
+            items: HashMap::new(),
+            finish_tx,
+        }
+    }
+
+    fn insert(&mut self, epoch: u64, worker: IoWorker) {
+        self.items.insert(epoch, worker);
+    }
+
+    fn get(&self, epoch: &u64) -> Option<&IoWorker> {
+        self.items.get(epoch)
+    }
+
+    fn remove(&mut self, epoch: u64) -> Option<IoWorker> {
+        self.items.remove(&epoch)
+    }
+}
+
+impl Drop for HarnessWorkers {
+    fn drop(&mut self) {
+        for (epoch, worker) in std::mem::take(&mut self.items) {
+            worker.finish_async(
+                StopId(u64::MAX.saturating_sub(epoch)),
+                self.finish_tx.clone(),
+            );
+        }
+    }
 }
 
 impl CoreHarness {
@@ -147,13 +196,15 @@ impl CoreHarness {
         let rx = RxShared::new(131_072, clock.mono_ns());
         let epochs = EpochAllocator::new();
         let serial = FakeSerialBackend::new();
-        let _dev = serial.add_device(REAL_PATH);
+        let fake_device = serial.add_device(REAL_PATH);
+        let state_store = FakeStateStore::new();
         let env = Arc::new(FakeEnv::default());
         let credential_files = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
         let files_for_read = Arc::clone(&credential_files);
         let wall_us = Arc::new(AtomicI64::new(START_WALL_US));
         let (data_tx, data_rx) = bounded::<DataEvent>(1024);
         let (ctl_tx, ctl_rx) = bounded::<ControlEvent>(256);
+        let (finish_tx, finish_rx) = bounded::<ControlEvent>(16);
 
         let wall_for_iso = Arc::clone(&wall_us);
         let deps = CoreDeps {
@@ -190,6 +241,8 @@ impl CoreHarness {
             wfs,
             rx,
             epochs,
+            state_store,
+            fake_device,
             serial,
             credential_files,
             wall_us,
@@ -199,7 +252,42 @@ impl CoreHarness {
             data_tx,
             ctl_tx,
             _keep: (data_rx, ctl_rx),
+            workers: HarnessWorkers::new(finish_tx.clone()),
+            finish_tx,
+            finish_rx,
+            last_stop: None,
+            wal_metas: Vec::new(),
+            defer_state_commits: false,
+            pending_state_commits: Vec::new(),
         }
+    }
+
+    /// 暫扣 state.json commit，讓測試可插入並行 waiter 再完成或失敗 commit。
+    pub fn defer_state_commits(&mut self) {
+        self.defer_state_commits = true;
+    }
+
+    /// 尚未完成的 commit 識別碼。
+    pub fn pending_state_commit_ids(&self) -> Vec<u64> {
+        self.pending_state_commits
+            .iter()
+            .map(|(commit_id, _)| *commit_id)
+            .collect()
+    }
+
+    /// 執行一筆暫扣 commit，並將結果交回 SessionCore。
+    pub fn complete_state_commit(&mut self, commit_id: u64) -> Vec<Effect> {
+        let position = self
+            .pending_state_commits
+            .iter()
+            .position(|(id, _)| *id == commit_id)
+            .expect("暫扣 state commit 應存在");
+        let (_, delta) = self.pending_state_commits.remove(position);
+        let result = self.state_store.apply(delta);
+        self.deliver(MailboxItem::Control(ControlEvent::StateCommitted {
+            commit_id,
+            result,
+        }))
     }
 
     /// 設定測試用 process env。
@@ -308,7 +396,64 @@ impl CoreHarness {
         })
     }
 
+    /// 由 admission 出列並取得正式 `StartOp` grant，供 drain BC-03 案例使用。
+    pub fn start_foreground_command(&mut self, cmd: &str) -> StartedCmd {
+        let (response, effects) = self.rpc_full(SessionRequest::Submit(agent_submit(cmd)));
+        let response = response.expect("命令 admission 應成功");
+        let cmd_id = response
+            .get("cmd_id")
+            .and_then(PyValue::as_str)
+            .expect("admission 回應含 cmd_id")
+            .to_string();
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StartOp { grant, .. } => Some(grant.op_id),
+                _ => None,
+            })
+            .expect("前景命令應產生 StartOp");
+        StartedCmd { op_id, cmd_id }
+    }
+
+    /// 最近一次 Phase 1 的 `(epoch, stop_id)`。
+    pub fn pending_stop(&self) -> (u64, StopId) {
+        self.last_stop.expect("尚未產生 BeginDrain")
+    }
+
+    /// 建立可鏈式修改的 WorkerStopped receipt。
+    pub fn receipt(&mut self, epoch: u64, stop_id: StopId) -> ReceiptBuilder<'_> {
+        ReceiptBuilder {
+            harness: self,
+            receipt: WorkerStoppedReceipt {
+                epoch,
+                stop_id,
+                ledger: TxLedger {
+                    epoch,
+                    ..TxLedger::default()
+                },
+                unrecorded: Vec::new(),
+                wal_error: None,
+                handle_closed: true,
+                close_error: None,
+            },
+        }
+    }
+
+    /// harness 已執行並寫入 WAL 的 META 效果。
+    pub fn wal_meta_events(&self) -> Vec<PyDict> {
+        self.wal_metas.clone()
+    }
+
+    /// 丟棄無需斷言的 worker 控制回報，供大量 TX 測試避免填滿測試 mailbox。
+    pub fn drain_control_events(&self) {
+        while self._keep.1.try_recv().is_ok() {}
+    }
+
     fn start_worker(&self, epoch: u64) -> IoWorker {
+        self.start_worker_at(epoch, REAL_PATH)
+    }
+
+    fn start_worker_at(&self, epoch: u64, real_path: &str) -> IoWorker {
         let cfg = SerialConfig {
             baud: 115_200,
             data_bits: 8,
@@ -319,7 +464,7 @@ impl CoreHarness {
         };
         let handle = self
             .serial
-            .open_exclusive(&DevicePath(REAL_PATH.into()), &cfg)
+            .open_exclusive(&DevicePath(real_path.into()), &cfg)
             .expect("fake serial open");
         IoWorker::start(
             handle,
@@ -335,6 +480,18 @@ impl CoreHarness {
                 clock: self.clock.clone(),
             },
         )
+    }
+
+    /// 建立指定 fake 路徑的 opened bridge，用於延遲／過期開啟回歸案例。
+    pub fn opened_bridge(&mut self, real_path: &str) -> OpenedBridge {
+        let _ = self.serial.add_device(real_path);
+        let epoch = self.epochs.next();
+        let worker = self.start_worker_at(epoch, real_path);
+        OpenedBridge {
+            epoch,
+            worker,
+            real_path: real_path.to_string(),
+        }
     }
 
     /// 送出 RPC 並回傳 (回應, 同次事件產生的其他效果)；未同步回覆時 panic。
@@ -431,19 +588,136 @@ impl CoreHarness {
 
     /// 送入事件並處理效果：Reply 立即送回、Schedule 內部排程，其餘回傳。
     fn deliver(&mut self, item: MailboxItem) -> Vec<Effect> {
-        let now = self.clock.mono_ns();
-        let effects = self.core.on_event(item, now).0;
         let mut rest = Vec::new();
-        for e in effects {
-            match e {
-                Effect::Reply(tx, result) => {
-                    let _ = tx.try_send(result);
+        if let MailboxItem::Control(ControlEvent::WorkerStopped(receipt)) = &item {
+            if let Some(worker) = self.workers.remove(receipt.epoch) {
+                worker.finish_async(receipt.stop_id, self.finish_tx.clone());
+                let deadline = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < deadline {
+                    match self.finish_rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(ControlEvent::WorkerStopped(actual))
+                            if actual.epoch == receipt.epoch
+                                && actual.stop_id == receipt.stop_id =>
+                        {
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
                 }
-                Effect::Schedule { at, ev } => self.scheduled.push((at, ev)),
-                other => rest.push(other),
+            }
+        }
+        let mut pending = vec![item];
+        while let Some(item) = pending.pop() {
+            let effects = self.core.on_event(item, self.clock.mono_ns()).0;
+            for effect in effects {
+                match effect {
+                    Effect::Reply(tx, result) => {
+                        let _ = tx.try_send(result);
+                    }
+                    Effect::Schedule { at, ev } => {
+                        if let TimerEvent::DrainTimeout { epoch, stop_id } = &ev {
+                            self.last_stop = Some((*epoch, *stop_id));
+                        }
+                        self.scheduled.push((at, ev));
+                    }
+                    Effect::AdoptBridge { epoch, worker, .. } => {
+                        self.workers.insert(epoch, worker);
+                    }
+                    Effect::BeginDrain { stop_id, epoch } => {
+                        self.last_stop = Some((epoch, stop_id));
+                        if let Some(worker) = self.workers.get(&epoch) {
+                            worker.begin_stop();
+                        }
+                        rest.push(Effect::BeginDrain { stop_id, epoch });
+                    }
+                    Effect::Persist { commit_id, delta } => {
+                        if self.defer_state_commits {
+                            self.pending_state_commits.push((commit_id, delta));
+                        } else {
+                            let result = self.state_store.apply(delta);
+                            pending.push(MailboxItem::Control(ControlEvent::StateCommitted {
+                                commit_id,
+                                result,
+                            }));
+                        }
+                    }
+                    Effect::WalMeta { cmd_id, meta } => {
+                        let _ = self.wal.append(WalAppendReq {
+                            com: "COM0",
+                            dir: "META",
+                            source: "system",
+                            payload: &[],
+                            cmd_id: cmd_id.as_deref(),
+                            loss_flag: false,
+                            meta: Some(meta.clone()),
+                        });
+                        self.wal_metas.push(meta.clone());
+                        rest.push(Effect::WalMeta { cmd_id, meta });
+                    }
+                    Effect::SettleTx { epoch, op_id } => {
+                        if let Some(worker) = self.workers.get(&epoch) {
+                            let _ = worker.tx().settle(op_id);
+                        }
+                        rest.push(Effect::SettleTx { epoch, op_id });
+                    }
+                    other => rest.push(other),
+                }
             }
         }
         rest
+    }
+}
+
+pub struct StartedCmd {
+    pub op_id: sw_core::tx_writer::OpId,
+    pub cmd_id: String,
+}
+
+pub struct ReceiptBuilder<'a> {
+    harness: &'a mut CoreHarness,
+    receipt: WorkerStoppedReceipt,
+}
+
+impl ReceiptBuilder<'_> {
+    pub fn confirmed(mut self, op_id: sw_core::tx_writer::OpId, bytes: usize) -> Self {
+        let entry = self.receipt.ledger.ops.entry(op_id).or_default();
+        entry.confirmed_bytes = bytes;
+        entry.unknown = false;
+        self
+    }
+
+    pub fn unknown(mut self, op_id: sw_core::tx_writer::OpId) -> Self {
+        let entry = self.receipt.ledger.ops.entry(op_id).or_default();
+        entry.unknown = true;
+        self
+    }
+
+    pub fn handle_closed(mut self, closed: bool) -> Self {
+        self.receipt.handle_closed = closed;
+        self
+    }
+
+    pub fn gap(
+        mut self,
+        op_id: Option<sw_core::tx_writer::OpId>,
+        dir: &'static str,
+        len: usize,
+    ) -> Self {
+        self.receipt
+            .unrecorded
+            .push(sw_core::tx_writer::EvidenceGap {
+                op_id,
+                dir,
+                len,
+                error: PalError::io(28, "injected WAL write failure"),
+            });
+        self
+    }
+
+    pub fn feed(self) -> Vec<Effect> {
+        let Self { harness, receipt } = self;
+        harness.feed(ControlEvent::WorkerStopped(receipt))
     }
 }
 
@@ -584,13 +858,19 @@ impl FakeStateStore {
             return Err(e);
         }
         g.commits += 1;
-        if let StateDelta::Released { sid, row } = delta {
-            let mut d = PyDict::default();
-            d.insert("by_id", row.by_id.clone());
-            d.insert("released_by", row.released_by.clone());
-            d.insert("released_at", row.released_at.clone());
-            d.insert("reason", row.reason.clone());
-            g.released.insert(sid, d);
+        match delta {
+            StateDelta::Released { sid, row } => {
+                let mut d = PyDict::default();
+                d.insert("by_id", row.by_id.clone());
+                d.insert("released_by", row.released_by.clone());
+                d.insert("released_at", row.released_at.clone());
+                d.insert("reason", row.reason.clone());
+                g.released.insert(sid, d);
+            }
+            StateDelta::Unreleased { sid } => {
+                g.released.shift_remove(&sid);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -621,32 +901,39 @@ impl EffectExecutor for RigExec {
                 cfg,
                 precheck_holders: _,
             } => {
-                let epoch = self.epochs.next();
-                let handle = self
-                    .serial
-                    .open_exclusive(&dev, &cfg)
-                    .expect("fake serial open");
-                let worker = IoWorker::start(
-                    handle,
-                    IoWorkerArgs {
-                        com: "COM0".into(),
-                        epoch,
-                        wal: self.wal.clone(),
-                        rx: self.rx.clone(),
-                        fence: self.fence.clone(),
-                        sentinel: None,
-                        data: self.data.clone(),
-                        control: tx.clone(),
-                        clock: self.clock.clone(),
-                    },
-                );
+                let result = match self.serial.open_exclusive(&dev, &cfg) {
+                    Ok(handle) => {
+                        let epoch = self.epochs.next();
+                        let worker = IoWorker::start(
+                            handle,
+                            IoWorkerArgs {
+                                com: "COM0".into(),
+                                epoch,
+                                wal: self.wal.clone(),
+                                rx: self.rx.clone(),
+                                fence: self.fence.clone(),
+                                sentinel: None,
+                                data: self.data.clone(),
+                                control: tx.clone(),
+                                clock: self.clock.clone(),
+                            },
+                        );
+                        Ok(OpenedBridge {
+                            epoch,
+                            worker,
+                            real_path: dev.0.clone(),
+                        })
+                    }
+                    Err(OpenError::Held(holder)) => Err(OpenFailure::Held(holder)),
+                    Err(OpenError::AccessDenied { holder, .. }) => {
+                        Err(OpenFailure::AccessDenied(holder))
+                    }
+                    Err(OpenError::NotFound(_)) => Err(OpenFailure::NotFound),
+                    Err(OpenError::Other(error)) => Err(OpenFailure::Other(error)),
+                };
                 let _ = tx.send(ControlEvent::BridgeOpened {
                     epoch_hint: 0,
-                    result: Ok(OpenedBridge {
-                        epoch,
-                        worker,
-                        real_path: dev.0.clone(),
-                    }),
+                    result,
                 });
             }
             Effect::AdoptBridge { epoch, worker, .. } => {
@@ -685,7 +972,11 @@ impl EffectExecutor for RigExec {
                     let _ = tx.send(ControlEvent::Timer(ev));
                 });
             }
-            Effect::BeginDrain { .. } => sw_core::s21_todo!("T12", "ActorRig BeginDrain executor"),
+            Effect::BeginDrain { stop_id, epoch } => {
+                if let Some(worker) = self.workers.remove(&epoch) {
+                    worker.finish_async(stop_id, tx.clone());
+                }
+            }
             Effect::StartLogin { .. } => {
                 sw_core::s21_todo!(
                     "T13",
@@ -693,7 +984,11 @@ impl EffectExecutor for RigExec {
                 )
             }
             Effect::StartOp { .. } => sw_core::s21_todo!("T14", "ActorRig StartOp executor"),
-            Effect::SettleTx { .. } => sw_core::s21_todo!("T12", "ActorRig SettleTx executor"),
+            Effect::SettleTx { epoch, op_id } => {
+                if let Some(worker) = self.workers.get(&epoch) {
+                    let _ = worker.tx().settle(op_id);
+                }
+            }
         }
     }
 }
@@ -1034,13 +1329,13 @@ use std::path::Path;
 use std::sync::Condvar;
 
 use sw_core::session_manager::{ManagerDeps, SessionManager};
-use sw_core::state_store::{load_state, LoadedState, StateStore};
+use sw_core::state_store::{LoadedState, StateStore, load_state};
+use sw_pal::ConsoleKind;
 use sw_pal::traits::{
     CancelToken, CloseImpl, CloseReceipt, CloseToken, ConsoleTransportFactory, DeviceInfo, FsOps,
-    FsRead, HolderReport, HolderScanStatus, IoWaker, OpenError, PalErrorKind, PalResult,
-    ReadOutcome, SerialHandle, SerialReader, SerialWriter, SubmitGate, TxResult, UartExclusive,
+    FsRead, HolderReport, HolderScanStatus, IoWaker, PalErrorKind, PalResult, ReadOutcome,
+    SerialHandle, SerialReader, SerialWriter, SubmitGate, TxResult, UartExclusive,
 };
-use sw_pal::ConsoleKind;
 
 /// 管理者測試的 state.json 路徑（只存在於 RigFs）。
 pub const STATE_PATH: &str = "/fake/state/state.json";
@@ -1259,6 +1554,10 @@ struct LoggedClose {
 }
 
 impl CloseImpl for LoggedClose {
+    fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         let me = *self;
         me.log

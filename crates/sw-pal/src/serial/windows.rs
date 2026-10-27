@@ -450,6 +450,10 @@ struct WindowsClose {
 }
 
 impl CloseImpl for WindowsClose {
+    fn is_alive(&self) -> bool {
+        self.port.is_open()
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         match self.port.close_once() {
             Ok(()) => CloseReceipt {
