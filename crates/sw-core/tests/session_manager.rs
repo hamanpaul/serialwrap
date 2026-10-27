@@ -1939,3 +1939,32 @@ fn manager_startup_always_rewrites_state_json() {
     let text = m.state_text();
     assert!(text.contains("\"aliases\"") && text.ends_with('\n'), "{text:?}");
 }
+
+#[test]
+fn reattach_redetect_to_ready_does_not_write_sticky() {
+    // 審查 F65（manager 層）：sticky 只由「動態 attach 本身」到 READY 時寫入（Python `_attach_by_id_dynamic`）。
+    // 既有 fallback session 重插經 `_reresolve_profile_on_reattach` 再偵測命中 `t` 並到 READY，Python 不寫
+    // `profile_detected`。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let dev = m.device(&real);
+    install_shell_replies(&dev);
+    // 第一次偵測已送過 `\n`：重插後的再偵測（第二個 `\n`）與登入 probe（第三個 `\n`）各需一次 prompt。
+    dev.on_tx_reply(b"\n\n", b"root@t:/# ");
+    dev.on_tx_reply(b"\n\n\n", b"root@t:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測命中 t 並 READY", || {
+        m.mgr.resolve("COM0").as_deref() == Some("t:COM0")
+            && m.state_of("COM0").as_deref() == Some("READY")
+    });
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile_source").as_deref(),
+        Some("detected")
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        m.load_state_now().profile_detected.is_empty(),
+        "重新 attach 的再偵測到 READY 不得寫 sticky：{}",
+        m.state_text()
+    );
+}

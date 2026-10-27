@@ -9181,6 +9181,7 @@
           "cargo:sw-core::session_manager::probe_bridge_closed_with_receipt_before_real_open",
           "cargo:sw-core::session_manager::rank_assigns_com_by_sorted_by_id_before_watcher_start",
           "cargo:sw-core::session_manager::rank_excludes_released_explicit_bound",
+          "cargo:sw-core::session_manager::reattach_redetect_to_ready_does_not_write_sticky",
           "cargo:sw-core::session_manager::rebind_drains_before_reopen",
           "cargo:sw-core::session_manager::recover_released_during_stopping_returns_released",
           "cargo:sw-core::session_manager::release_persist_point_failure_fails_release_commit",

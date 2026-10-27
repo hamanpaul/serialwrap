@@ -632,6 +632,9 @@ fn allowlist_rejected_reasons_exact() {
         out.stderr,
         "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: not an isolated instance: SERIALWRAP_RUN_DIR equals default\n"
     );
+    // 拒絕前不得以未 strip 的值建立目錄（舊實作在 cwd 下留下 `  /tmp/.../run /serialwrapd.lock`，曾被誤提交）。
+    let stray = std::env::current_dir().unwrap().join("  ");
+    assert!(!stray.exists(), "未 strip 的 RUN_DIR 被當成相對路徑建立：{}", stray.display());
 
     // (3) config windows.test_device_allowlist 非 list。
     fs::write(
