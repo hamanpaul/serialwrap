@@ -892,6 +892,43 @@ fn systemd_hold_verify_mismatch_reverts_and_fails() {
 }
 
 #[test]
+fn systemd_user_hold_rollback_removes_empty_dropin_dir() {
+    // hold 驗證不符時的撤銷路徑與 release 一致：空的 `<unit>.service.d` 一併移除。
+    let home = tempfile::tempdir().unwrap();
+    let env = user_env(home.path(), "UnitFileState=enabled\nRefuseManualStart=no\nRestart=on-failure\n", RELEASE_OK);
+    let ctl = SystemdCtl::new(env, real_fs(), FakeClock::new());
+    let dropin_dir = user_dropin(home.path()).parent().unwrap().to_path_buf();
+    ctl.hold_autostart(&sm("systemd-user"), false).expect_err("驗證不符必須回 Err");
+    assert!(!user_dropin(home.path()).exists(), "撤銷後 drop-in 不得殘留");
+    assert!(!dropin_dir.exists(), "撤銷後空的 drop-in 目錄必須移除：{}", dropin_dir.display());
+}
+
+#[test]
+fn systemd_system_hold_rollback_rmdirs_dropin_dir_best_effort() {
+    // system 模式撤銷：`sudo rm -f` 之後 `sudo rmdir --ignore-fail-on-non-empty`；rmdir 失敗不新增撤銷失敗。
+    let home = tempfile::tempdir().unwrap();
+    let dir = "/etc/systemd/system/serialwrap.service.d";
+    let dropin = format!("{dir}/90-serialwrap-update-hold.conf");
+    let env = FakeSysEnv::builder()
+        .home(home.path())
+        .command(&["sudo", "rmdir", "--ignore-fail-on-non-empty", dir], 1, "", "rmdir: failed")
+        .build();
+    let ctl = SystemdCtl::new(env.clone(), isolated_systemd_fs(), FakeClock::new());
+    let e = ctl
+        .hold_autostart(&sm("systemd-system"), true)
+        .expect_err("驗證輸出為空必須回 Err");
+    assert_eq!(e.phase, Some("autostart_hold"));
+    let hint = e.hint.clone().unwrap_or_default();
+    assert!(!hint.contains("rmdir"), "rmdir 為 best-effort，不得列為撤銷失敗：{hint}");
+    let calls = env.calls();
+    let rm = argv(&["sudo", "rm", "-f", &dropin]);
+    let rmdir = argv(&["sudo", "rmdir", "--ignore-fail-on-non-empty", dir]);
+    let rm_at = calls.iter().position(|c| c == &rm).unwrap_or_else(|| panic!("calls={calls:?}"));
+    let rmdir_at = calls.iter().position(|c| c == &rmdir).unwrap_or_else(|| panic!("calls={calls:?}"));
+    assert!(rm_at < rmdir_at, "rmdir 必須在移除 drop-in 之後：{calls:?}");
+}
+
+#[test]
 fn systemd_hold_over_existing_dropin_does_not_record_post_hold_values() {
     let home = tempfile::tempdir().unwrap();
     let path = user_dropin(home.path());
@@ -1026,8 +1063,15 @@ fn systemd_user_release_removes_empty_dropin_dir_but_keeps_foreign_dropins() {
 #[test]
 fn systemd_system_release_rmdirs_dropin_dir_ignoring_non_empty() {
     let dropin = PathBuf::from("/etc/systemd/system/serialwrap.service.d/90-serialwrap-update-hold.conf");
+    // rmdir 回非零（例如目錄已不存在）屬 best-effort，不得讓 release 失敗。
     let env = FakeSysEnv::builder()
         .command(&["systemctl", "show", "serialwrap", "-p", "Restart", "-p", "RefuseManualStart"], 0, RELEASE_OK, "")
+        .command(
+            &["sudo", "rmdir", "--ignore-fail-on-non-empty", "/etc/systemd/system/serialwrap.service.d"],
+            1,
+            "",
+            "rmdir: failed to remove '/etc/systemd/system/serialwrap.service.d': No such file or directory",
+        )
         .build();
     let ctl = SystemdCtl::new(env.clone(), isolated_systemd_fs(), FakeClock::new());
     let hold = AutostartHoldRecord {

@@ -146,6 +146,8 @@ impl SystemdCtl {
         ran: &mut Vec<CmdRecord>,
     ) -> Vec<String> {
         let mut failures = Vec::new();
+        // 與 release 相同：drop-in 移除後，已空的 `<unit>.service.d` best-effort 一併移除（失敗不列入撤銷失敗）。
+        let dropin_dir = path.parent();
         if matches!(mode, SupervisionMode::SystemdSystem) {
             let remove = vec![
                 "rm".to_string(),
@@ -156,9 +158,22 @@ impl SystemdCtl {
             if let Err(error) = self.run_recorded(argv, None, ran) {
                 failures.push(error);
             }
-        } else if self.fs.exists(path) {
-            if let Err(error) = self.fs.remove_file(path) {
-                failures.push(format!("drop-in 移除失敗：{}", error_summary(&error)));
+            if let Some(dir) = dropin_dir {
+                let rmdir = prepend_sudo(vec![
+                    "rmdir".into(),
+                    "--ignore-fail-on-non-empty".into(),
+                    dir.display().to_string(),
+                ]);
+                let _ = self.run_recorded(rmdir, None, ran);
+            }
+        } else {
+            if self.fs.exists(path) {
+                if let Err(error) = self.fs.remove_file(path) {
+                    failures.push(format!("drop-in 移除失敗：{}", error_summary(&error)));
+                }
+            }
+            if let Some(dir) = dropin_dir {
+                let _ = self.fs.remove_dir(dir);
             }
         }
 
