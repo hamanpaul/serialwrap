@@ -51,6 +51,9 @@ use crate::wal::WalWriter;
 pub enum ManagerNote {
     SessionReady {
         sid: String,
+        /// 由 attach 登入 run 本身到 READY（Python `_attach_by_id_dynamic` 的 sticky 寫入點；reprobe／passthrough
+        /// 安靜升 READY／reboot recovery 為 false，審查 F65）。
+        via_attach: bool,
     },
     SessionDetached {
         sid: String,
@@ -2505,6 +2508,7 @@ impl SessionCore {
                 self.confirm_ready();
                 effects.push(Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
+                    via_attach: !reprobe,
                 }));
             }
             crate::login_fsm::LoginOutcome::NotReady(error) => {
@@ -2785,6 +2789,7 @@ impl SessionCore {
             self.queue_registered = true;
             effects.push(Effect::Notify(ManagerNote::SessionReady {
                 sid: self.sid.clone(),
+                via_attach: false,
             }));
         }
         effects
@@ -4626,6 +4631,7 @@ impl SessionCore {
                 self.reboot_recovery = None;
                 vec![Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
+                    via_attach: false,
                 })]
             }
             // ensure_ready 的 NotReady 只來自 TX 被 quiet／新世代撤銷（Python `continue`，不記錯）。

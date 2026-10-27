@@ -1138,7 +1138,8 @@ impl Shared {
     /// PROBE bridge 的 `send`：經 TxWriter／Fence（單一寫入者、OS 提交於 Fence 鎖內重驗），TX WAL 由 TxWriter 以
     /// `com=PROBE` 寫入（Python PROBE bridge 的 send 同樣走 TX gate 與 WAL）。writer 於送出後原樣交回 `parts`，
     /// 維持 #51「PROBE 與正式 bridge 共用同一預開 handle」。自動 TX（`LoginProbe` 類）：WAL 不健康時由 Fence 拒絕、零 TX。
-    fn probe_send(&self, parts: &mut HandleParts, payload: &[u8]) {
+    /// 回傳是否完整送出（Python `send_command` 未拋例外；被拒或未完整時 `detect_template` 的呼叫端視為偵測失敗）。
+    fn probe_send(&self, parts: &mut HandleParts, payload: &[u8]) -> bool {
         let fence = Fence::new();
         let frozen = self.probe_tx_frozen.load(Ordering::SeqCst);
         let wal_unhealthy = self.fanout.current();
@@ -1174,13 +1175,15 @@ impl Shared {
             payload: payload.to_vec(),
             reply: reply_tx,
         };
-        if handle.jobs.send(job).is_ok() {
-            let _ = handle.wait_report(&reply_rx);
-        }
+        let sent = handle.jobs.send(job).is_ok()
+            && handle.wait_report(&reply_rx).is_some_and(|report| {
+                matches!(report.result.outcome, TxOutcome::Completed(n) if n >= payload.len())
+            });
         stop.send();
         if let Ok((writer, _ledger)) = join.join() {
             parts.writer = writer;
         }
+        sent
     }
 
     /// `detect_template`：送 `\n`、等待 3.0 s（Clock）、以 RX 快照依序比對候選模板的 prompt（再以 login regex 備選）。
@@ -1189,7 +1192,10 @@ impl Shared {
         let mut buf = vec![0u8; 8192];
         // `clear_rx_buffer`：丟棄開埠後已到的舊資料（仍寫 WAL）。
         let _ = self.probe_drain(parts, &mut buf);
-        self.probe_send(parts, b"\n");
+        if !self.probe_send(parts, b"\n") {
+            // Python：`send_command("")` 拋例外 → 呼叫端 `except: detected = None`，不睡、不比對（審查 F71）。
+            return None;
+        }
         self.clock.sleep(DETECT_PROBE);
         let bytes = self.probe_drain(parts, &mut buf);
         let snapshot = clean_text(&String::from_utf8_lossy(&bytes));
@@ -1325,7 +1331,7 @@ impl Shared {
                     real_path: real.clone(),
                     parts,
                 });
-                lock(&self.inner).probe_paths.insert(sid_now, real);
+                // Python `_attach_by_id` 的再偵測不寫 sticky（`_maybe_persist_sticky` 只在動態 attach；審查 F65）。
                 self.send_attached(by_id);
             }
             None => {
@@ -1437,9 +1443,16 @@ impl Shared {
 
     fn handle_note(&self, note: ManagerNote) {
         match note {
-            ManagerNote::SessionReady { sid } => self.maybe_persist_sticky(&sid),
+            ManagerNote::SessionReady { sid, via_attach } => {
+                if via_attach {
+                    self.maybe_persist_sticky(&sid);
+                }
+            }
             ManagerNote::SessionDetached { sid, .. } => {
-                lock(&self.inner).interactive.retain(|_, v| *v != sid);
+                let mut inner = lock(&self.inner);
+                inner.interactive.retain(|_, v| *v != sid);
+                // 動態 attach 的偵測紀錄只屬該次 attach（審查 F65）：bridge 結束即失效。
+                inner.probe_paths.remove(&sid);
             }
             ManagerNote::InteractiveOpened {
                 sid,
@@ -1454,19 +1467,20 @@ impl Shared {
         }
     }
 
-    /// `_maybe_persist_sticky`：只有 READY 的正向偵測（`detected`）且 real_path 與偵測當時相同才寫入。
+    /// `_maybe_persist_sticky`：只有動態 attach 本身到 READY 的正向偵測（`detected`）且 real_path 與偵測當時相同
+    /// 才寫入；偵測紀錄只消費一次（Python 只在 `_attach_by_id_dynamic` 呼叫，審查 F65）。
     fn maybe_persist_sticky(&self, sid: &str) {
         let (by_id, name) = {
-            let inner = lock(&self.inner);
+            let mut inner = lock(&self.inner);
+            let Some(probe) = inner.probe_paths.remove(sid) else {
+                return;
+            };
             let Some(e) = inner.sessions.get(sid) else {
                 return;
             };
             if e.profile_source != "detected" {
                 return;
             }
-            let Some(probe) = inner.probe_paths.get(sid) else {
-                return;
-            };
             if inner.device_path(&e.profile.device_by_id) != Some(probe.as_str()) {
                 return;
             }

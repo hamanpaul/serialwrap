@@ -876,9 +876,14 @@ fn reboot_prompt_returns_quickly_ok_not_partial() {
 #[test]
 fn reboot_flushes_commands_queued_behind_it() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
+    // reboot 的 TX 停在提交前，確保 q1／q2 於 reboot 結算（quiet arm → RECOVERING）前已排入佇列；
+    // 否則 reboot 已結算時 submit 即被 SESSION_RECOVERING 拒絕（測試競態，與受測語意無關）。
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
     let reboot = h.submit_ok("reboot");
+    assert!(h.dev.wait_paused(Duration::from_secs(5)), "reboot TX 應停在提交前");
     let q1 = h.submit_ok("echo a");
     let q2 = h.submit_ok("echo b");
+    h.dev.release_pause();
     wait_tx(&h, b"reboot\n");
     advance_until(&h, Duration::from_millis(200), "reboot 收尾", |h| {
         is_done(h, &reboot)

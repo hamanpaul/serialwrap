@@ -1776,3 +1776,42 @@ fn boot_quiet_survives_clear_drain_and_blocks_reattach_probe() {
     assert_eq!(pget(&h.public(), "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
     assert!(h.fence.with(|f| f.quiet_active), "新 bridge 的 TX fence 須帶回 quiet");
 }
+
+fn ready_note(effs: &[Effect]) -> Option<bool> {
+    effs.iter().find_map(|e| match e {
+        Effect::Notify(ManagerNote::SessionReady { via_attach, .. }) => Some(*via_attach),
+        _ => None,
+    })
+}
+
+#[test]
+fn session_ready_note_marks_attach_run_only() {
+    // 審查 F65（Medium，73634db）：Python `_maybe_persist_sticky` 只在 `_attach_by_id_dynamic` 的 attach 本身到
+    // READY 時呼叫；reprobe（`session.attach` 於 ATTACHED）、passthrough 安靜升 READY、reboot recovery 不寫 sticky。
+    // core 以 `SessionReady.via_attach` 區分，manager 只對 true 寫 sticky。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    h.bridge_ok();
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(ready_note(&effs), Some(true), "attach run 到 READY");
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(None);
+    let (_resp, effs) = h.rpc_deferred(SessionRequest::SessionAttach);
+    assert!(has_start_login(&effs), "ATTACHED 再探應啟動登入 run");
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(ready_note(&effs), Some(false), "reprobe 到 READY 不得標為 attach");
+}

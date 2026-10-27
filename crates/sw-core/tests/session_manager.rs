@@ -1544,6 +1544,13 @@ fn detect_probe_tx_goes_through_fence() {
     assert_eq!(m.wait_profile_source("COM0"), "fallback");
     assert_eq!(m.device(&real).os_submits(), 0, "PROBE Fence 凍結時不得提交任何 bytes 給 OS");
     assert_eq!(tx_rows(&m), 0, "未送出的 PROBE TX 不得寫 WAL");
+    // 審查 F71：Python `detect_template` 的 `send_command("")` 被拒即拋例外，呼叫端 `except` → `detected=None`，
+    // 不睡 3 s、不比對 RX（否則 DUT 在視窗內自吐的 prompt 會被誤判為 detected）。
+    assert!(
+        !m.clock.sleeps_s().contains(&3.0),
+        "PROBE 被拒後不得再等偵測視窗：{:?}",
+        m.clock.sleeps_s()
+    );
 
     // 未凍結：恰一次 OS 提交、恰一筆 PROBE TX WAL（由 TxWriter 寫），PROBE 與正式 bridge 共用同一 handle。
     let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
@@ -1555,6 +1562,19 @@ fn detect_probe_tx_goes_through_fence() {
     assert_eq!(m.wait_profile_source("COM0"), "detected");
     assert_eq!(tx_rows(&m), 1, "PROBE TX 只由 TxWriter 寫一筆 WAL");
     assert_eq!(m.serial.open_attempts(&real), 1);
+    // 審查 F72：PROBE 的唯一一筆 TX 為 Python `send_command("")` 補上的 `\n`（payload_b64 `Cg==`），
+    // 且裝置收到的第一筆提交即此 `\n`（之後的提交屬正式 bridge 的登入 probe）。
+    let probe_payloads: Vec<String> = m
+        .wal_rows()
+        .into_iter()
+        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+        .filter_map(|r| s_of(&r, "payload_b64"))
+        .collect();
+    assert_eq!(probe_payloads, vec!["Cg==".to_string()]);
+    assert!(
+        m.device(&real).take_tx().starts_with(b"\n"),
+        "PROBE payload 應為 \\n"
+    );
 }
 
 #[test]
@@ -1785,3 +1805,4 @@ fn pin_then_clear_on_attached_session_applies_pin() {
     assert_eq!(s_of(&s, "platform").as_deref(), Some("prpl"));
     assert_eq!(probe_rows(&m), before, "pin 繞過偵測，不得送 PROBE");
 }
+

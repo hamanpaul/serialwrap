@@ -375,7 +375,7 @@ impl CoreHarness {
         self
     }
 
-    fn attach_device(&mut self) {
+    pub fn attach_device(&mut self) {
         self.feed(ControlEvent::DeviceAttached {
             by_id: DEVICE_BY_ID.into(),
             real_path: REAL_PATH.into(),
