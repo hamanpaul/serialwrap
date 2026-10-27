@@ -70,8 +70,10 @@ def test_send_encodings(console_daemon) -> None:
     r = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "aGk=", "encoding": "base64"})
     assert r["ok"] is True and r["bytes"] == 2, r
     assert wait_rx_contains(target, b"hi", 2.0)
+    before = len(target.written(0.3))
     r = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "00", "encoding": "hex"})
     assert r["ok"] is False and r["error_code"] == "EXCEPTION" and "version" not in r, r
+    assert len(target.written(0.5)) == before, "編碼拒絕在送出前（零 TX）"
 
 
 def test_expiry_tick_restores_without_access(console_daemon) -> None:

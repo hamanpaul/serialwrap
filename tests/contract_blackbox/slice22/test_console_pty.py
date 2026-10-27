@@ -121,8 +121,11 @@ def test_session_list_has_no_console_endpoint(console_daemon) -> None:
 def test_session_vtty_cached(console_daemon) -> None:
     d, _target = console_daemon
     first = d._session("COM0")["vtty"]
-    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
-    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    assert first, "READY 後 session.vtty_path 已是 bridge primary（session_manager.py:4832）"
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    assert a1["ok"] is True and a2["ok"] is True, (a1, a2)
+    assert first not in (a1["vtty"], a2["vtty"])
     assert d._session("COM0")["vtty"] == first
 
 

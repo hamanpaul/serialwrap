@@ -224,3 +224,11 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 | R3-11 | Medium | 03ba902 | 哨兵非同步建立，human attach 可搶先成為 primary；control 滿時哨兵遺失 | fixed（本 commit）：executor 在 open_bridge 成功時預建哨兵 PTY，放入 `OpenedBridge.sentinel`，core 在 adopt 同一事件登記；移除 `CreatePrimaryConsole`／`PrimaryConsoleReady`；回歸 `sentinel_registered_in_same_event_as_adopt` |
 | R3-12 | Medium | 7acf7f6 | ATTACHED 救援新增 Python 沒有的 SESSION_BUSY | fixed（本 commit）：移除該出口，依 D-22(4) 撤銷後照常開 lease（保留 #56 的 tick hold 檢查與「只在開 lease 分支撤銷」） |
 | R3-L | Low | 多處 | hub 建立失敗未 WARNING、shutdown 未停 hub、service 註解、ATTACHING 期間提早暴露哨兵 | service 註解 fixed；其餘 deferred |
+
+## f6859e8..f347d5d、f347d5d..e59d928（第四輪；opus 兩份報告內容為空，僅 grok）
+
+| 等級 | Commit | 問題 | 處理 |
+|---|---|---|---|
+| Medium | 5f5133e | `test_session_vtty_cached` 不要求 attach 成功、vtty 為 null 仍綠 | fixed（本 commit）：斷言 READY 後 vtty 非空、兩次 attach ok 且 vtty 不等於 primary |
+| Medium | f347d5d | hex 編碼拒絕未鎖零 TX | fixed（本 commit）：斷言 `written()` 長度不變（Python `_encode_interactive_payload` 送出前即 ValueError） |
+| Medium | f347d5d | Task 11 其餘案例仍缺 | 部分 fixed 23a47d6（第三批 9 案）；其餘見上方進度表 |
