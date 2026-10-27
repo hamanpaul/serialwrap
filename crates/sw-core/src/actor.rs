@@ -322,6 +322,7 @@ fn dispatch(
         }
         MailboxItem::Control(ControlEvent::DeviceAttached { .. }) => (None, "DeviceAttached"),
         MailboxItem::Control(ControlEvent::DeviceDetached { .. }) => (None, "DeviceDetached"),
+        MailboxItem::Control(ControlEvent::DeviceMissing) => (None, "DeviceMissing"),
         MailboxItem::Control(ControlEvent::ConsoleCountChanged { .. }) => {
             (None, "ConsoleCountChanged")
         }

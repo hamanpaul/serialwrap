@@ -1731,6 +1731,10 @@ impl CloseImpl for LoggedClose {
         self.inner.is_alive()
     }
 
+    fn configure(&self, cfg: &SerialConfig) -> sw_pal::PalResult<()> {
+        self.inner.configure(cfg)
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         let me = *self;
         me.log

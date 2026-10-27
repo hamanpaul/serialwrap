@@ -767,6 +767,21 @@ impl Shared {
             inner.pending_com.retain(|b, _| online.contains(b));
             prev
         };
+        // Python `_mark_missing_devices_locked`（審查 F60）：與 Python 同在 detach／attach 之前標記。
+        let missing: Vec<String> = {
+            let inner = lock(&self.inner);
+            inner
+                .sessions
+                .values()
+                .filter(|e| {
+                    !e.profile.device_by_id.is_empty() && !new.contains_key(&e.profile.device_by_id)
+                })
+                .map(|e| e.sid.clone())
+                .collect()
+        };
+        for sid in &missing {
+            self.send_control(sid, ControlEvent::DeviceMissing);
+        }
         let changed: Vec<String> = prev
             .iter()
             .filter(|(k, v)| new.get(*k).is_some_and(|n| n.real_path != v.real_path))
@@ -1657,7 +1672,19 @@ impl ManagerExec {
         }
         let pre = lock(&self.io.preopened).take();
         let handle: Box<dyn SerialHandle> = match pre {
-            Some(pre) if pre.real_path == dev.0 => Box::new(ReassembledHandle(pre.parts)),
+            Some(pre) if pre.real_path == dev.0 => {
+                // Python bridge 啟動時對預開 port 呼叫 `port.configure(self.profile)`：PROBE 以預設設定開啟，
+                // 正式 bridge 前套用解析出的 template UART 設定（審查 F59）。後端未支援時沿用開啟時設定。
+                match pre.parts.close.configure(&cfg) {
+                    Ok(()) => {}
+                    Err(error) if error.kind == PalErrorKind::Unsupported => {}
+                    Err(error) => {
+                        let _ = pre.parts.close();
+                        return Err(OpenFailure::Other(error));
+                    }
+                }
+                Box::new(ReassembledHandle(pre.parts))
+            }
             other => {
                 if let Some(pre) = other {
                     let _ = pre.parts.close();

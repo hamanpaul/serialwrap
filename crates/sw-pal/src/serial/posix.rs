@@ -842,6 +842,17 @@ struct PosixCloseToken {
 }
 
 impl CloseImpl for PosixCloseToken {
+    fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        let close = self
+            .close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fd) = close.fd else {
+            return Err(PalError::from_errno(libc::EBADF));
+        };
+        apply_termios(fd, cfg).map_err(PalError::from_errno)
+    }
+
     fn is_alive(&self) -> bool {
         let close = self
             .close

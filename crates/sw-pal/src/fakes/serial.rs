@@ -312,6 +312,8 @@ pub(crate) struct FakeDeviceInner {
     woken: AtomicBool,
     peer_closed: AtomicBool,
     eof_reads: AtomicUsize,
+    /// 依序套用的 UART 設定（open 時的 cfg 與之後每次 `CloseToken::configure`）。
+    configs: Mutex<Vec<SerialConfig>>,
     read_errors: AtomicUsize,
     on_os_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     paused: Mutex<bool>,
@@ -344,6 +346,7 @@ impl FakeDeviceInner {
             woken: AtomicBool::new(false),
             peer_closed: AtomicBool::new(false),
             eof_reads: AtomicUsize::new(0),
+            configs: Mutex::new(Vec::new()),
             read_errors: AtomicUsize::new(0),
             on_os_submit_hook: Mutex::new(None),
             paused: Mutex::new(false),
@@ -528,6 +531,11 @@ impl SerialBackend for FakeSerialBackend {
         }
 
         inner.opens.fetch_add(1, Ordering::SeqCst);
+        inner
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(_cfg.clone());
         let open_guard = Arc::new(OpenGuard {
             inner: Arc::clone(&inner),
             closed_via_token: AtomicBool::new(false),
@@ -622,6 +630,15 @@ impl FakeDevice {
 
     pub fn open_count(&self) -> usize {
         self.inner.opens.load(Ordering::SeqCst)
+    }
+
+    /// 依序套用過的 UART 設定（open 的 cfg 與之後的 `configure`）。
+    pub fn configs(&self) -> Vec<SerialConfig> {
+        self.inner
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn close_count(&self) -> usize {
@@ -850,6 +867,15 @@ struct FakeCloseImpl {
 impl crate::traits::CloseImpl for FakeCloseImpl {
     fn is_alive(&self) -> bool {
         self.inner.open.load(Ordering::SeqCst)
+    }
+
+    fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        self.inner
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cfg.clone());
+        Ok(())
     }
 
     fn close(self: Box<Self>) -> CloseReceipt {

@@ -1713,3 +1713,42 @@ fn log_filename_uses_local_time_by_default() {
     assert!(path.ends_with(&format!("COM0_{expected}.log")), "{path} vs {expected}");
     let _ = rpc(m.mgr.route(&sid, SessionRequest::LogStop, RPC));
 }
+
+#[test]
+fn dynamic_session_applies_template_uart_config() {
+    // 審查 F59（High，73634db）：動態 session 以預設設定預開 PROBE，偵測命中模板後，正式 bridge 必須對同一預開
+    // handle 套用模板的 UART 設定（Python bridge 啟動時 `port.configure(self.profile)`），不得停在 115200。
+    let yaml = format!(
+        "{}  fast:\n    platform: shell\n    prompt_regex: '(?m)^root@fast:.*# '\n    timeout_s: 2.0\n    uart:\n      baud: 921600\n",
+        manager_yaml(&[])
+    );
+    let m = ManagerRig::with(&yaml, LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    let real = m.real_of("/s/by-id/usb-F");
+    let dev = m.device(&real);
+    dev.on_tx_reply(b"\n", b"root@fast:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("偵測命中 fast", || m.mgr.resolve("COM0").as_deref() == Some("fast:COM0"));
+    wait_until("正式 bridge 已套用設定", || {
+        dev.configs().last().is_some_and(|cfg| cfg.baud == 921_600)
+    });
+    let configs = dev.configs();
+    assert_eq!(configs.first().map(|c| c.baud), Some(115_200), "PROBE 以預設設定開啟：{configs:?}");
+    assert_eq!(m.serial.open_attempts(&real), 1, "PROBE 與正式 bridge 共用同一 handle（#51）");
+}
+
+#[test]
+fn missing_explicit_target_marked_device_not_found() {
+    // 審查 F60（High，73634db）：Python `update_devices` 每次掃描以 `_mark_missing_devices_locked` 標記
+    // 「非 RELEASED、無 bridge、裝置不在快照」的 session：state DETACHED、last_error（None 時）DEVICE_NOT_FOUND、
+    // detached_at（None 時）填入。
+    let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    m.mgr.update_devices(&[]);
+    wait_until("DEVICE_NOT_FOUND", || {
+        m.session_last_error("COM0").as_deref() == Some("DEVICE_NOT_FOUND")
+    });
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "state").as_deref(), Some("DETACHED"));
+    assert!(s_of(&s, "detached_at").is_some(), "{s:?}");
+}

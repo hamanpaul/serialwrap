@@ -75,3 +75,10 @@
 | ID | 嚴重度 | 發現 | 處理 |
 |---|---|---|---|
 | F51 | Medium | 同一 `RxShared` 跨 attach 存活，上一條連線的速率被沿用（可誤判 `RX_FLOOD`） | fixed（本組 commit）：每次 `OpenBridge` 成功建新的 `RxShared::new(131_072, now)` 交該 epoch 的 reader，`OpenedBridge.rx` 帶回，core 於 adopt 時替換 `deps.rx`；executor 的 login／op 也改用新視窗；舊 reader 持舊 Arc。紅燈先行：`session_core::rx_window_resets_per_bridge` |
+
+## session_manager（73634db／7a84168）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F59 | High | 動態偵測 session 的 template UART 設定未套用：PROBE 以預設設定開啟的 port 直接交給正式 bridge | fixed（本組 commit）：PAL `CloseImpl`／`CloseToken` 新增 `configure(&SerialConfig)`（POSIX 以 termios 重設、Windows 以 `configure_port`、fake 記錄每次設定；預設 `Unsupported`），`ManagerExec::open_bridge` 收用預開 handle 前呼叫（Python bridge 啟動時 `port.configure(self.profile)`）；`Unsupported` 沿用開啟時設定，其餘錯誤關閉 handle 並回開啟失敗。紅燈先行：`session_manager::dynamic_session_applies_template_uart_config`（舊實作 fake 只記到 PROBE 的預設 115200） |
+| F60 | High | 缺 Python `_mark_missing_devices_locked`：explicit target 的裝置不在快照中時，session 不會標為 `DETACHED`／`DEVICE_NOT_FOUND` | fixed（本組 commit）：`update_devices` 在 detach／attach 之前，對 `device_by_id` 非空且不在快照的 session 送 `ControlEvent::DeviceMissing`；core 的 `mark_missing_device` 依 Python 條件（非 RELEASED、無 bridge、非 drain 中）設 `DETACHED`，`last_error` 與 `detached_at` 僅在為 null 時填入。具體輸入：targets 綁 `COM0→usb-missing`、快照為空 → Python `session.get_state` 為 `state:"DETACHED"`、`last_error:"DEVICE_NOT_FOUND"`；舊 Rust 停在 `DETACHED`／`last_error:null`。紅燈先行：`session_manager::missing_explicit_target_marked_device_not_found`（註解掉送出行即 FAIL，已實測） |

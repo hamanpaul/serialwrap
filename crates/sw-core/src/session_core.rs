@@ -548,6 +548,9 @@ impl SessionCore {
                     effects.0.extend(self.begin_stop(kind, None, now).0);
                 }
             }
+            MailboxItem::Control(ControlEvent::DeviceMissing) => {
+                self.mark_missing_device(now);
+            }
             MailboxItem::Control(ControlEvent::ConsoleCountChanged { count }) => {
                 self.console_count = count;
             }
@@ -1334,6 +1337,24 @@ impl SessionCore {
 
     fn is_passthrough(&self) -> bool {
         self.profile.template.platform == "passthrough"
+    }
+
+    /// Python `_mark_missing_devices_locked`：非 RELEASED、無 bridge（含 drain 中）時才標記。
+    fn mark_missing_device(&mut self, now: Mono) {
+        self.device_present = false;
+        if self.state == SessionState::Released
+            || self.generations.conn_epoch.is_some()
+            || self.stop.is_some()
+        {
+            return;
+        }
+        self.set_state(SessionState::Detached, now);
+        if self.last_error.is_none() {
+            self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+        }
+        if self.detached_at.is_none() {
+            self.detached_at = Some(self.wall_iso());
+        }
     }
 
     fn set_state(&mut self, state: SessionState, now: Mono) {

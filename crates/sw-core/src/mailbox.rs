@@ -49,6 +49,9 @@ pub enum ControlEvent {
         by_id: String,
         reason: DetachReason,
     },
+    /// 裝置掃描後 by_id 不在快照（Python `_mark_missing_devices_locked`；審查 F60）：無 bridge 的非 RELEASED
+    /// session 標 DETACHED、`last_error`（None 時）`DEVICE_NOT_FOUND`、`detached_at`（None 時）。
+    DeviceMissing,
     /// Console 擁有者更新目前附掛在 session 的 console 數量；供 release 回報實際關閉數。
     ConsoleCountChanged {
         count: usize,
