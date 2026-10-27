@@ -84,6 +84,10 @@ pub struct HumanConsoleState {
     pub next_hold_id: u64,
     /// 07 D-22(4)。
     pub replay_after_revoked: bool,
+    /// TCP console 後端（SC-28 tcp／Windows）：SessionPublic 恆輸出 `console_endpoint`（Python `not _pty_available()`）。
+    pub tcp_console: bool,
+    /// 目前 bridge 的 listener 端點（`uart_io.py` `_console_endpoint`；bridge 停止時清為 None）。
+    pub console_endpoint: Option<String>,
 }
 
 impl HumanConsoleState {
@@ -100,6 +104,8 @@ impl HumanConsoleState {
             replay_hold: None,
             next_hold_id: 0,
             replay_after_revoked: false,
+            tcp_console: false,
+            console_endpoint: None,
         }
     }
 

@@ -801,12 +801,41 @@ impl SessionCore {
         }
     }
 
+    /// TCP console 後端的 `attach_console`（`session_manager.py:6744-6756`、`uart_io.py:2578-2590`）：human 直接連端點，
+    /// client 於 accept 時建立、raw ownership 由 `on_stream_accept` 授予；此處只回端點、不開 lease。
+    fn console_attach_tcp(&mut self, label: Option<String>, now: Mono) -> PyDict {
+        if !self.human.tcp_console
+            || self.generations.conn_epoch.is_none()
+            || !matches!(self.state, SessionState::Ready | SessionState::Attached)
+        {
+            return self.selector_error("SESSION_NOT_READY");
+        }
+        if self.tick_close_hold.is_some() {
+            return self.selector_error("SESSION_INTERACTIVE_BUSY");
+        }
+        let endpoint = self.human.console_endpoint.clone();
+        if self.human.vtty_cache.is_none() {
+            self.human.vtty_cache = endpoint.clone();
+        }
+        let ep = |v: &Option<String>| v.clone().map(PyValue::from).unwrap_or(PyValue::Null);
+        let mut payload = pydict! {
+            "ok" => true,
+            "client_id" => PyValue::Null,
+            "label" => label.map(PyValue::from).unwrap_or(PyValue::Null),
+            "vtty" => ep(&endpoint),
+            "endpoint" => ep(&endpoint),
+            "transport" => "tcp",
+            "protocol" => "telnet",
+        };
+        payload.insert("session", self.session_value(now));
+        payload
+    }
+
     /// `SessionRequest::ConsoleAttach`（PTY；`attach_console`，`session_manager.py:6740-6773`）。
     pub(super) fn console_attach(&mut self, label: Option<String>, pty: Option<PtyInfo>, reply: Reply, now: Mono) -> Vec<Effect> {
         let mut fx = Vec::new();
         let Some(pty) = pty else {
-            // 無 PTY 平台（TCP console）的端點回應屬 Task 10。
-            fx.push(Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY"))));
+            fx.push(Effect::Reply(reply, Ok(self.console_attach_tcp(label, now))));
             return fx;
         };
         if self.generations.conn_epoch.is_none()
@@ -927,6 +956,8 @@ impl SessionCore {
         };
         self.invalidate_input(reason, fx);
         self.human.lane.reset();
+        // `uart_io.py:1113-1115`：bridge 停止時關閉 listener、端點清為 None（executor 於 BeginDrain 停 hub listener）。
+        self.human.console_endpoint = None;
         if let Some(lease) = self.lease.as_ref().filter(|l| l.is_human()) {
             self.retained_human = Some((lease.owner.clone(), lease.timeout_s));
         }

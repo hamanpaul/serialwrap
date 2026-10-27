@@ -647,6 +647,7 @@ impl Shared {
         };
         let mut core = SessionCore::new(profile.clone(), profile_source, deps);
         core.set_path_flavor(self.path_flavor);
+        core.set_tcp_console(self.console.kind() == sw_pal::ConsoleKind::TcpTelnet);
         if core.session_id() != sid {
             core.init_session_id(sid.clone());
         }
@@ -701,6 +702,7 @@ impl Shared {
             runners: HashMap::new(),
             hub,
             pumps: HashMap::new(),
+            listener_epoch: None,
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
         inner.sessions.insert(
@@ -1669,6 +1671,8 @@ struct ManagerExec {
     hub: Option<Arc<crate::human_console::hub::HubHandle>>,
     /// P6 Task 6（07 D-15(5)）：每個 epoch 一條 human TX pump。
     pumps: HashMap<u64, crate::human_console::human_tx::HumanTxPump>,
+    /// TCP console listener 所屬的 bridge epoch（該 epoch `BeginDrain` 時停止，ephemeral port，UIO-12.8-c）。
+    listener_epoch: Option<u64>,
 }
 
 impl ManagerExec {
@@ -1700,6 +1704,41 @@ impl ManagerExec {
             slave_path,
             client_id: SessionCore::new_console_client_id(&fill_random),
         })
+    }
+
+    /// TCP console 後端：每次開埠綁一個新的 127.0.0.1 ephemeral listener 交給 hub（`uart_io.py` `start()` 於
+    /// `not _pty_available()` 時 `_start_console_listener()`），回端點供 core 在 adopt 同一事件登記。
+    fn bind_console_listener(&mut self, epoch: u64) -> Option<String> {
+        let hub = self.hub.as_ref()?;
+        if self.shared.console.kind() != sw_pal::ConsoleKind::TcpTelnet {
+            return None;
+        }
+        let listener = match self.shared.console.bind_tcp_console() {
+            Ok(listener) => listener,
+            Err(e) => {
+                self.shared.warn(format!(
+                    "console listener 建立失敗（com={}）：{}",
+                    self.com(),
+                    e.py_message
+                ));
+                return None;
+            }
+        };
+        let endpoint = listener.endpoint();
+        if hub
+            .cmd
+            .try_send(crate::human_console::hub::HubCmd::AdoptListener { listener })
+            .is_err()
+        {
+            self.shared.warn(format!(
+                "console listener 交給 hub 失敗（com={}）",
+                self.com()
+            ));
+            return None;
+        }
+        hub.waker.wake();
+        self.listener_epoch = Some(epoch);
+        Some(endpoint)
     }
 
     fn human_tx(
@@ -1802,11 +1841,13 @@ impl ManagerExec {
             },
         );
         let sentinel = self.make_sentinel();
+        let console_endpoint = self.bind_console_listener(epoch);
         Ok(OpenedBridge {
             epoch,
             worker,
             real_path: dev.0,
             sentinel,
+            console_endpoint,
         })
     }
 
@@ -1923,6 +1964,22 @@ impl EffectExecutor for ManagerExec {
                 }
                 if let Some(worker) = self.workers.remove(&epoch) {
                     worker.finish_async(stop_id, safety.clone());
+                }
+                if self.listener_epoch == Some(epoch) {
+                    self.listener_epoch = None;
+                    if let Some(hub) = &self.hub {
+                        if hub
+                            .cmd
+                            .try_send(crate::human_console::hub::HubCmd::StopListener)
+                            .is_err()
+                        {
+                            self.shared.warn(format!(
+                                "console listener 停止命令送不進 hub（com={}）",
+                                self.com()
+                            ));
+                        }
+                        hub.waker.wake();
+                    }
                 }
             }
             Effect::StartLogin {

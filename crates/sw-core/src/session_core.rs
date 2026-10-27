@@ -575,6 +575,11 @@ impl SessionCore {
         self.path_flavor = flavor;
     }
 
+    /// SC-28：TCP console 後端（human console 經 127.0.0.1 Telnet listener；SessionPublic 輸出 `console_endpoint`）。
+    pub fn set_tcp_console(&mut self, on: bool) {
+        self.human.tcp_console = on;
+    }
+
     /// 處理一個事件；`now` 為 monotonic（Mono）。
     pub fn on_event(&mut self, ev: MailboxItem, now: Mono) -> Effects {
         #[cfg(feature = "test-fakes")]
@@ -2163,6 +2168,7 @@ impl SessionCore {
             worker,
             real_path,
             sentinel,
+            console_endpoint: _,
         } = opened;
         if let Some(pty) = sentinel {
             // bridge 立即進 drain：預建的哨兵 PTY 不登記。
@@ -2347,7 +2353,10 @@ impl SessionCore {
             worker,
             real_path,
             sentinel,
+            console_endpoint,
         } = opened;
+        // `uart_io.py` `start()`：listener 與 bridge 同時建立（端點同一事件可見）。
+        self.human.console_endpoint = console_endpoint;
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = Some(real_path.clone());
         self.known_real_path = Some(real_path.clone());
@@ -3138,7 +3147,7 @@ impl SessionCore {
 
     /// `to_public_dict` 的 console 三欄（07 Task 10 Step 3 第 3 點）：有 bridge 時 console 數＝哨兵計數＋human
     /// console；無 bridge 時為保留的 console 數。`vtty` 取 D-20 快取，無快取且無 bridge 時取保留 console 的 primary。
-    /// `console_endpoint` 只在 TCP console 有端點時輸出（Windows，LOCAL-WINDOWS-TODO；POSIX 不輸出）。
+    /// `console_endpoint` 只在 TCP console 後端或有端點時輸出（PTY 後端不輸出）。
     fn public_ctx(&self) -> PublicCtx {
         // Python `len(bridge.list_consoles())` 含 internal 哨兵；`console_count` 為 06 測試替身的哨兵計數。
         let consoles = self.human.consoles.len();
@@ -3160,7 +3169,9 @@ impl SessionCore {
         PublicCtx {
             console_count: console_count as i128,
             vtty,
-            console_endpoint: None,
+            // Python `if console_endpoint is not None or not _pty_available()`：TCP 後端恆輸出（無端點為 null）。
+            console_endpoint: (self.human.tcp_console || self.human.console_endpoint.is_some())
+                .then(|| self.human.console_endpoint.clone()),
         }
     }
 

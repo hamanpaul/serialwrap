@@ -129,6 +129,9 @@ pub struct OpenedBridge {
     pub real_path: String,
     /// P6 Task 9 步驟 5：executor 於開埠成功時一併預建的哨兵 primary PTY（PTY 後端；`PtyPair` 留在 executor）。
     pub sentinel: Option<crate::session_core::PtyInfo>,
+    /// TCP console 後端（SC-28 tcp／Windows）：executor 於開埠成功時一併綁定的 listener 端點（`"127.0.0.1:<port>"`）；
+    /// PTY 後端或綁定失敗為 None（`uart_io.py` `_start_console_listener`）。
+    pub console_endpoint: Option<String>,
 }
 
 /// bridge 開啟失敗的分類。

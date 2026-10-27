@@ -53,6 +53,10 @@ pub enum HubCmd {
     },
     /// TcpTelnet：bridge 起來時。
     StartListener,
+    /// TcpTelnet：executor 開埠時已綁定的 listener（端點隨 `OpenedBridge` 交給 core）；取代既有 listener。
+    AdoptListener {
+        listener: Box<dyn ConsoleListener>,
+    },
     /// bridge 停止時（ephemeral port，UIO-12.8-c）。
     StopListener,
     /// 07 D-12。
@@ -596,6 +600,13 @@ impl Hub {
                 );
             }
             HubCmd::StartListener => self.start_listener(),
+            HubCmd::AdoptListener { listener } => {
+                if let Some(id) = self.listener.take() {
+                    let _ = self.mux.remove(id);
+                }
+                self.parked_listener = None;
+                self.install_listener(listener);
+            }
             HubCmd::StopListener => {
                 if let Some(id) = self.listener.take() {
                     let _ = self.mux.remove(id);
@@ -671,31 +682,33 @@ impl Hub {
             return;
         }
         match self.factory.bind_tcp_console() {
-            Ok(listener) => {
-                let endpoint = listener.endpoint();
-                let id = self.alloc_id();
-                if self.tcp_count() >= TELNET_CONSOLES_PER_SESSION {
-                    self.parked_listener = Some(listener);
-                } else if let Err(e) = self.mux.add_listener(id, listener) {
-                    self.warn(format!(
-                        "console listener 建立失敗（com={}）：{}",
-                        self.com, e.py_message
-                    ));
-                    return;
-                }
-                self.listener = Some(id);
-                *self
-                    .status
-                    .endpoint
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(endpoint);
-                self.status.listener_up.store(true, Ordering::Release);
-            }
+            Ok(listener) => self.install_listener(listener),
             Err(e) => self.warn(format!(
                 "console listener 建立失敗（com={}）：{}",
                 self.com, e.py_message
             )),
         }
+    }
+
+    fn install_listener(&mut self, listener: Box<dyn ConsoleListener>) {
+        let endpoint = listener.endpoint();
+        let id = self.alloc_id();
+        if self.tcp_count() >= TELNET_CONSOLES_PER_SESSION {
+            self.parked_listener = Some(listener);
+        } else if let Err(e) = self.mux.add_listener(id, listener) {
+            self.warn(format!(
+                "console listener 建立失敗（com={}）：{}",
+                self.com, e.py_message
+            ));
+            return;
+        }
+        self.listener = Some(id);
+        *self
+            .status
+            .endpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(endpoint);
+        self.status.listener_up.store(true, Ordering::Release);
     }
 
     /// 達上限時把 listener 移出 mux（不再 Acceptable）並寫一筆 WARNING（D-18 pause_accept）。
