@@ -1685,3 +1685,33 @@ fn clear_reopen_attaching_clears_last_error() {
         .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
     assert_eq!(h.public()["last_error"], PyValue::Null, "開埠前清除（`_attach_by_id`）");
 }
+
+#[test]
+fn aborted_in_flight_with_unknown_tail_writes_unknown_outcome() {
+    // 審查 F42（Medium，afe4853）：帳本 `confirmed_bytes>0` 且 `unknown=true`（`TxOpLedger::record` 對
+    // `Unknown{confirmed}` 同時累加 bytes 並設 unknown）時，Python `_map_aborted_result` 先看 unknown：
+    // `COMMAND_ABORTED_IN_FLIGHT`＋META `tx_outcome:"unknown"`。舊 Rust 依長度寫 partial／complete。
+    // 輸入：`echo x`（payload 7 bytes），帳本 confirmed 2＋unknown。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let cmd = h.start_foreground_command("echo x");
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop)
+        .confirmed(cmd.op_id, 2)
+        .unknown(cmd.op_id)
+        .handle_closed(true)
+        .feed();
+    let _ = rx.try_recv();
+    assert_eq!(
+        h.reg.get(&cmd.cmd_id).unwrap().get("error_code"),
+        Some(&PyValue::from("COMMAND_ABORTED_IN_FLIGHT"))
+    );
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|row| row.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("META");
+    assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(2)));
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
+}

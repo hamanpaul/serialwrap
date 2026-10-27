@@ -3122,7 +3122,10 @@ impl SessionCore {
             meta.insert("confirmed_tx_bytes", py_int(confirmed_bytes as i128));
             meta.insert(
                 "tx_outcome",
-                PyValue::from(if payload_len == Some(confirmed_bytes) {
+                // Python `_map_aborted_result`：帳本 unknown 優先於 complete／partial。
+                PyValue::from(if op_ledger.is_some_and(|op| op.unknown) {
+                    "unknown"
+                } else if payload_len == Some(confirmed_bytes) {
                     "complete"
                 } else {
                     "partial"
