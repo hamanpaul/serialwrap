@@ -1113,6 +1113,8 @@ try {
         $b = Invoke-Blackbox 'b-rust-win' $bStagingJunit (Join-Path $bundleBin 'serialwrap.exe') `
             $bundleDaemon $runtimeExe $Label $true $stagingResourceReport $bundleRoot `
             $activePair $activeWire $pidLog
+        # B 輪內記錄的 wire 為本機 scratch 路徑（finally 會刪除）；另記 bridge 停止後回寫的 OutputRoot 副本。
+        $b['bridge_wire_output'] = if ($activeWire) { Join-Path $outputRoot 'windows-com\bridge\wire.ndjson' } else { $null }
         # B 輪 L1 產物（junit 與 resource-report）自 staging 複製到 OutDir\l1\windows\blackbox\。
         Get-ChildItem -LiteralPath $stagingL1Directory -File -ErrorAction SilentlyContinue | ForEach-Object {
             Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $l1Directory $_.Name) -Force
@@ -1136,6 +1138,13 @@ try {
             }
             if (Test-Path -LiteralPath $bridge.control -PathType Leaf) {
                 Remove-Item -LiteralPath $bridge.control -Force -ErrorAction SilentlyContinue
+            }
+            # 例外路徑也回寫本機證據（scratch 隨後刪除）；判定維持 FAIL，回寫錯誤只作診斷。
+            $stopCopyErrors = @(Copy-WindowsComBridgeEvidence $bridge.evidence_dir $bridge.output_dir)
+            $bridgeStop['evidence_copy_ok'] = ($stopCopyErrors.Count -eq 0)
+            $bridgeStop['evidence_copy_errors'] = $stopCopyErrors
+            if ($stopCopyErrors.Count -gt 0) {
+                $bridgeStop.reason = "$($bridgeStop.reason)；證據回寫：$($stopCopyErrors -join '；')"
             }
         }
         Write-Json (Join-Path $outputRoot 'windows-com\bridge-stop.json') $bridgeStop
@@ -1222,6 +1231,12 @@ try {
             }
             if (Test-Path -LiteralPath $bridge.control -PathType Leaf) {
                 Remove-Item -LiteralPath $bridge.control -Force -ErrorAction SilentlyContinue
+            }
+            try {
+                $finalCopyErrors = @(Copy-WindowsComBridgeEvidence $bridge.evidence_dir $bridge.output_dir)
+                if ($finalCopyErrors.Count -gt 0) { Write-Warning "bridge 證據回寫失敗：$($finalCopyErrors -join '；')" }
+            } catch {
+                Write-Warning "bridge 證據回寫例外：$($_.Exception.Message)"
             }
         }
     }

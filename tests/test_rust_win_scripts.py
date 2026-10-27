@@ -462,6 +462,27 @@ def test_windows_com_bridge_evidence_is_local_scratch_with_verified_copy_back():
     assert "evidence_copy_ok" in stop
 
 
+def test_windows_com_bridge_stop_exception_still_copies_back_evidence():
+    """Stop-WindowsComBridge 拋例外時（catch 分支與 finally 兜底）也須先回寫本機 bridge 證據再刪 scratch，
+    回寫錯誤附到 bridge_stop；B 輪結果另記 OutputRoot 回寫副本路徑（本機 scratch 刪除後不得只剩懸空引用）。
+    雲端審查 0e97195..d2118cd 對 7c94c31 的 Low 1／Low 2。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    code = "\n".join(line for line in ps1.splitlines() if not line.strip().startswith("#"))
+    main_stop = code.index("$bridgeStop = Stop-WindowsComBridge $bridge $scratchRoot")
+    main_catch = code[main_stop:code.index("windows_com_case = ", main_stop)]
+    assert "Copy-WindowsComBridgeEvidence $bridge.evidence_dir $bridge.output_dir" in main_catch
+    assert main_catch.index("taskkill.exe") < main_catch.index("Copy-WindowsComBridgeEvidence")
+    assert "evidence_copy_errors" in main_catch
+    final_stop = code.index("try { $null = Stop-WindowsComBridge $bridge $scratchRoot } catch {")
+    final_catch = code[final_stop:code.index("Copy-BlackboxDiagnostics $stagingRepo", final_stop)]
+    assert "Copy-WindowsComBridgeEvidence $bridge.evidence_dir $bridge.output_dir" in final_catch
+    assert final_catch.index("taskkill.exe") < final_catch.index("Copy-WindowsComBridgeEvidence")
+    invoke_b = code.index("$b = Invoke-Blackbox 'b-rust-win'")
+    after_b = code[invoke_b:code.index("$bridgeStop = Stop-WindowsComBridge", invoke_b)]
+    assert "$b['bridge_wire_output'] = " in after_b
+    assert "Join-Path $outputRoot 'windows-com\\bridge\\wire.ndjson'" in after_b
+
+
 def test_windows_selftest_out_is_local_scratch_with_verified_copy_back():
     """bridge selftest 的 --out 必須位於 Windows 本機 scratch，不得位於 OutputRoot 或網路路徑之下；
     行程結束後須整份回寫 OutputRoot\\windows-com\\bridge-selftest 並逐檔比對 SHA256，資格判定行維持不變。
