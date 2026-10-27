@@ -246,6 +246,9 @@ impl crate::fs_ops::FsOps for FaultFs {
     fn remove_file(&self, p: &Path) -> PalResult<()> {
         self.inner.remove_file(p)
     }
+    fn remove_dir(&self, p: &Path) -> PalResult<()> {
+        self.inner.remove_dir(p)
+    }
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         self.inner.copy_preserving(from, to)
     }

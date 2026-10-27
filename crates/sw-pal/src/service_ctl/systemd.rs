@@ -406,17 +406,32 @@ impl SystemdCtl {
             .unwrap_or("serialwrap");
         let mut ran = Vec::new();
 
+        // drop-in 移除後，`<unit>.service.d` 若已空則 best-effort 一併移除（非空或失敗皆不影響 release）。
+        let dropin_dir = path.parent();
         if matches!(mode, SupervisionMode::SystemdSystem) {
             let remove = prepend_sudo(vec!["rm".into(), "-f".into(), path.display().to_string()]);
             self.run_recorded(remove, None, &mut ran)
                 .map_err(|error| Self::release_failure(mode, error))?;
-        } else if self.fs.exists(path) {
-            self.fs.remove_file(path).map_err(|error| {
-                Self::release_failure(
-                    mode,
-                    format!("移除 hold drop-in 失敗：{}", error_summary(&error)),
-                )
-            })?;
+            if let Some(dir) = dropin_dir {
+                let rmdir = prepend_sudo(vec![
+                    "rmdir".into(),
+                    "--ignore-fail-on-non-empty".into(),
+                    dir.display().to_string(),
+                ]);
+                let _ = self.run_recorded(rmdir, None, &mut ran);
+            }
+        } else {
+            if self.fs.exists(path) {
+                self.fs.remove_file(path).map_err(|error| {
+                    Self::release_failure(
+                        mode,
+                        format!("移除 hold drop-in 失敗：{}", error_summary(&error)),
+                    )
+                })?;
+            }
+            if let Some(dir) = dropin_dir {
+                let _ = self.fs.remove_dir(dir);
+            }
         }
 
         let reload = Self::systemctl_argv(mode, with_sudo, &strings(["daemon-reload"]));
