@@ -877,28 +877,22 @@ impl SessionCore {
         fx
     }
 
-    /// P6 Task 9 步驟 5：登記哨兵 primary（`label="primary"`、`internal=true`），`session.vtty_path = bridge.vtty_path`。
-    /// epoch 已換或期間已有其他 console（保留或 attach）時丟棄 PTY。
-    pub(super) fn primary_console_ready(
-        &mut self,
-        epoch: u64,
-        token: u64,
-        slave_path: String,
-        client_id: String,
-        now: Mono,
-    ) -> Vec<Effect> {
-        if self.generations.conn_epoch != Some(epoch) || !self.human.consoles.is_empty() {
-            return vec![Effect::ConsoleDiscard { token }];
+    /// P6 Task 9 步驟 5：登記哨兵 primary（`label="primary"`、`internal=true`），`session.vtty_path = bridge.vtty_path`；
+    /// 已有保留 console 時（Python 沿用 preserved）丟棄預建 PTY。
+    pub(super) fn register_sentinel(&mut self, pty: PtyInfo, now: Mono) -> Vec<Effect> {
+        if !self.human.consoles.is_empty() {
+            return vec![Effect::ConsoleDiscard { token: pty.token }];
         }
         let lifetime = self.human.alloc_lifetime();
         let label = "primary".to_string();
+        let client_id = pty.client_id.clone();
         self.human.consoles.insert(
             client_id.clone(),
             ConsoleRecord {
                 client_id: client_id.clone(),
                 client_lifetime: lifetime,
                 label: label.clone(),
-                vtty: slave_path.clone(),
+                vtty: pty.slave_path.clone(),
                 kind: ConsoleTransportKind::Pty,
                 internal: true,
                 attached_at: now,
@@ -906,9 +900,9 @@ impl SessionCore {
             },
         );
         self.human.primary_client_id = Some(client_id.clone());
-        self.human.vtty_cache = Some(slave_path);
+        self.human.vtty_cache = Some(pty.slave_path);
         vec![Effect::ConsoleAdopt {
-            token,
+            token: pty.token,
             client_id,
             client_lifetime: lifetime,
             label,
@@ -948,6 +942,13 @@ impl SessionCore {
             self.human.primary_client_id = None;
             self.retained_human = None;
         }
+        // Python drain：`session.vtty_path = preserved.primary_vtty()`；release 時 console 全關 → None。
+        self.human.vtty_cache = self
+            .human
+            .primary_client_id
+            .as_ref()
+            .and_then(|p| self.human.consoles.get(p))
+            .map(|c| c.vtty.clone());
     }
 
     /// 06 命令出列時的前景 hook（D-10：只有 `SubmitOrigin::HumanConsole` 不 suspend）。

@@ -206,3 +206,21 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 - slice21 黑箱對 P5 tip 的 Rust：10 failed／36 passed（`test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]` 兩次中一次失敗，屬 flaky）；本分支 Rust 為同一集合。
 - `session.clear` 後 re-attach 在 FakeClock 不推進時停在 ATTACHING、推進後為 ATTACHED（與 console 無關，ServiceRig `ready_shell` 同樣）。
 - sw-pal `holder_scan_unreadable_proc_is_unknown` 依主機是否存在 `/dev/pts/9`（P5 fb76460 既有 High）。
+
+## 4f710c3..1fb9612、1fb9612..f6859e8（第三輪；P5 commit 的發現交 P5）
+
+| # | 等級 | Commit | 問題 | 處理 |
+|---|---|---|---|---|
+| R3-1 | High | 02fb068 | `list_sorted_by_label_then_id` 鎖住「無哨兵」 | fixed 776c029／03ba902（改斷言 `["a","b","primary"]` 並實作哨兵） |
+| R3-2 | High | 1fb9612 | tcp backend 的 `console_attach` 回 SESSION_NOT_READY | deferred：TCP console 端點回應屬 Task 10 後段，Linux 上 SC-28 tcp 後端為 rust_only、Windows 為原生路徑（LOCAL-WINDOWS-TODO）；需 hub StartListener 與端點經 RPC 回填，下一輪實作 |
+| R3-3 | Medium | 1fb9612 | 公開 vtty／console_count 恆 0、無哨兵 | fixed e2e8a57、03ba902 |
+| R3-4 | Medium | 1fb9612 | hub 佇列滿或 request 逾時後留下無 fd 的 console | fixed（本 commit）：executor 取不到 PTY 或 AdoptPty 送不進 hub 時寫 WARNING 並回 `ConsoleDisconnected`，core 移除該 console；回歸測試待 fault-injection hook（FakeConsole 無 add_io／佇列滿注入） |
+| R3-5 | Medium | 1fb9612 | `interactive_open` 的 SESSION_NOT_READY selector 變 COM | fixed（本 commit）；回歸 `interactive_open_not_ready_keeps_raw_selector` |
+| R3-6 | Medium | 1fb9612 | list 前未 scan | fixed e2e8a57 |
+| R3-7 | Medium | 1fb9612 | HumanTxCompleted 回報 try_send 失敗即遺失（D-15(5) 一格重試槽） | deferred：ManagerExec 只在效果執行時被呼叫、沒有 Tick 鉤子，需在 actor 加 executor tick；下一輪 |
+| R3-8 | Medium | 1fb9612 | 產品未注入 `set_worker_health`／`set_path_flavor` | path_flavor fixed（本 commit）；worker health deferred：IoWorker 由 executor 擁有，探針需把 worker 表改為共享（P5 擁有的 executor 結構），下一輪與 P5 協調 |
+| R3-9 | Medium | 02fb068 | 計畫 Task 10 表列測試缺漏／改名 | 補 `attach_selector_alias_chain`、`attach_not_ready_detached_and_released`（c443040），其餘已於 b694662、e2e8a57 等補上；仍缺：`attach_tcp_shape`、`session_public_console_fields_tcp`（TCP，同 R3-2）、`attach_interactive_owner_false_during_replay_hold`、`attach_request_timeout_closes_pty`、`list_and_detach_without_bridge`、`open_coercion_float_error_before_invalid_args`、`open_timeout_zero_uses_default`、`open_allow_attached_string_false_is_truthy`——下一輪 |
+| R3-10 | Medium | e2e8a57 | drain／Release 後 vtty 仍指向舊 PTY | fixed（本 commit）：Phase 1 依保留 console 的 primary 重算 `vtty_cache`（release 為 None）；回歸 `release_clears_public_vtty` |
+| R3-11 | Medium | 03ba902 | 哨兵非同步建立，human attach 可搶先成為 primary；control 滿時哨兵遺失 | fixed（本 commit）：executor 在 open_bridge 成功時預建哨兵 PTY，放入 `OpenedBridge.sentinel`，core 在 adopt 同一事件登記；移除 `CreatePrimaryConsole`／`PrimaryConsoleReady`；回歸 `sentinel_registered_in_same_event_as_adopt` |
+| R3-12 | Medium | 7acf7f6 | ATTACHED 救援新增 Python 沒有的 SESSION_BUSY | fixed（本 commit）：移除該出口，依 D-22(4) 撤銷後照常開 lease（保留 #56 的 tick hold 檢查與「只在開 lease 分支撤銷」） |
+| R3-L | Low | 多處 | hub 建立失敗未 WARNING、shutdown 未停 hub、service 註解、ATTACHING 期間提早暴露哨兵 | service 註解 fixed；其餘 deferred |

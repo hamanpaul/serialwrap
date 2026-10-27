@@ -238,9 +238,6 @@ pub enum Effect {
     HumanTx { tag: HumanTxTag, permit: TxPermit, payload: Vec<u8> },
     /// P6 增補 #10（07 Task 7）：全域 `interactive_id → session_id` 索引；同批 Effects 中一律排在 `Reply` 之前。
     LeaseIndex(LeaseIndexOp),
-    /// P6 Task 9 步驟 5：bridge 起來且沒有保留 console 時建立哨兵 primary（PTY 後端；executor 建好後回
-    /// `ControlEvent::PrimaryConsoleReady`，其他後端忽略）。
-    CreatePrimaryConsole { epoch: u64 },
 }
 
 /// `Effect` 的有序容器。
@@ -756,16 +753,7 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
             }
-            MailboxItem::Control(ControlEvent::PrimaryConsoleReady {
-                epoch,
-                token,
-                slave_path,
-                client_id,
-            }) => {
-                effects
-                    .0
-                    .extend(self.primary_console_ready(epoch, token, slave_path, client_id, now));
-            }
+
         }
         if std::mem::take(&mut self.hold_release_kick) && !self.foreground_busy() {
             effects.0.extend(self.start_next(now));
@@ -2175,8 +2163,12 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
-            sentinel: _,
+            sentinel,
         } = opened;
+        if let Some(pty) = sentinel {
+            // bridge 立即進 drain：預建的哨兵 PTY 不登記。
+            self.fx_buf.push(Effect::ConsoleDiscard { token: pty.token });
+        }
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = None;
         self.open_real_path = None;
@@ -2282,14 +2274,18 @@ impl SessionCore {
         while self.retired_stops.len() > 32 {
             self.retired_stops.pop_front();
         }
-        vec![
+        let mut fx = vec![
             Effect::AdoptBridge {
                 epoch,
                 worker: opened.worker,
                 real_path: opened.real_path,
             },
             Effect::BeginDrain { stop_id, epoch },
-        ]
+        ];
+        if let Some(pty) = opened.sentinel {
+            fx.push(Effect::ConsoleDiscard { token: pty.token });
+        }
+        fx
     }
 
     fn attach_open_failed(
@@ -2351,7 +2347,7 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
-            sentinel: _,
+            sentinel,
         } = opened;
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = Some(real_path.clone());
@@ -2367,9 +2363,10 @@ impl SessionCore {
             worker,
             real_path,
         }];
-        if self.human.consoles.is_empty() {
-            // uart_io.py `start()`：沒有保留 console 時建 internal 哨兵 primary（POSIX PTY）。
-            effects.push(Effect::CreatePrimaryConsole { epoch });
+        // uart_io.py `start()`：沒有保留 console 時以 internal 哨兵為 primary；與 bridge adopt 同一事件登記，
+        // 之後任何 ATTACHED／READY 發布與 console_attach 都看得到它（Python 同一把鎖內完成）。
+        if let Some(pty) = sentinel {
+            effects.extend(self.register_sentinel(pty, now));
         }
 
         if self.is_passthrough() || !self.profile.template.command_capable() {

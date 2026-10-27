@@ -392,16 +392,11 @@ impl SessionCore {
         if self.tick_close_hold.is_some() {
             return Err(self.busy_reply());
         }
-        let replay_before = self.human.replay_hold.as_ref().map(|h| h.hold_id);
         self.refresh_lease_p6(now);
-        // Python ATTACHED 分支 `post.needs_resume → retry_after_post`：refresh 本身建立的回放（或 tick 還原）結算前
-        // 本輪不開新 lease，避免撤銷剛排出的回放。
+        // tick 到期還原的 hold 期間回 SESSION_INTERACTIVE_BUSY（#56）；其餘依 D-22(4) 撤銷回放後照常開 lease
+        // （Python ATTACHED 分支無 SESSION_BUSY 出口，審查 7acf7f6 Medium）。
         if self.tick_close_hold.is_some() {
             return Err(self.busy_reply());
-        }
-        let replay_after = self.human.replay_hold.as_ref().filter(|h| !h.revoked).map(|h| h.hold_id);
-        if replay_after.is_some() && replay_after != replay_before {
-            return Err(self.selector_error("SESSION_BUSY"));
         }
         let clamped = timeout_s.min(MAX_RECOVERY_LEASE_S);
         // D-22(4)：ATTACHED 救援分支不判前景（Python parity），確定開 lease 時才撤銷回放授權。

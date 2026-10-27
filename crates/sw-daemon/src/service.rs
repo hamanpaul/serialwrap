@@ -3,7 +3,7 @@
 //! 對照 Python `sw_core/service.py` 的 `SerialwrapService.rpc()`／`_dispatch()`：
 //! - 分支順序與 `_dispatch` 相同；每個分支的參數轉型逐行照 Python（`str(x or d)`、`int(x or d)`、`float(x or d)`、
 //!   `bool(x)`、`_coerce_rpc_bool(x)`），轉型例外以 `Err(PyErr)` 回傳，由 framing 轉為 `EXCEPTION`（例外不越過 RPC 邊界）。
-//! - Slice 2.1 延後的 15 個 method（console／event／file）不寫分支，落入 `METHOD_NOT_FOUND`，無任何副作用。
+//! - 延後的 12 個 method（event／file；console 三個於 Slice 2.2 承接）不寫分支，落入 `METHOD_NOT_FOUND`，無任何副作用。
 //! - `rpc()`＝`dispatch()` 後 `setdefault("version", version)`（#154）。
 //!
 //! 與 Python 的分層差異（外部回應不變）：Python 的 `_resolve_session_id`（READY／RECOVERING／FLASHING／
@@ -454,7 +454,8 @@ impl Service {
                     // `interactive_open`：`get_session(selector)` 為 None → SESSION_NOT_READY（session_manager.py:6820）。
                     return Ok(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY", "selector" => selector });
                 }
-                self.route(
+                let raw = selector.clone();
+                let mut result = self.route(
                     &selector,
                     SessionRequest::InteractiveOpen {
                         owner,
@@ -463,7 +464,12 @@ impl Service {
                         allow_attached,
                     },
                     ROUTE_TIMEOUT,
-                )
+                )?;
+                // Python 各 SESSION_NOT_READY 出口皆回原樣 selector；SESSION_BUSY／RECOVERING 維持 COM。
+                if result.get("error_code").and_then(PyValue::as_str) == Some("SESSION_NOT_READY") && result.get("selector").is_some() {
+                    result.insert("selector", PyValue::from(raw));
+                }
+                Ok(result)
             }
             "session.interactive_send" => {
                 let interactive_id = p.str_or("interactive_id", "")?;

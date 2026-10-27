@@ -340,7 +340,6 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::ConsoleConnected { .. }) => (None, "ConsoleConnected"),
         MailboxItem::Control(ControlEvent::ConsoleScan { .. }) => (None, "ConsoleScan"),
         MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
-        MailboxItem::Control(ControlEvent::PrimaryConsoleReady { .. }) => (None, "PrimaryConsoleReady"),
         MailboxItem::Data(_) => (None, "Data"),
     };
 

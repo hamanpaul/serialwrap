@@ -252,6 +252,8 @@ struct Shared {
     probe_tx_frozen: AtomicBool,
     /// P6 Task 9／10：console 後端（PTY 建立、ConsoleHub 的 mux）。
     console: Arc<dyn ConsoleTransportFactory>,
+    /// P6（sol 補審 #2）：human line mode basename 的路徑風格（`caps.path_flavor`）。
+    path_flavor: sw_pal::PalPathFlavor,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -644,6 +646,7 @@ impl Shared {
             input_epoch_pub: input_epoch_pub.clone(),
         };
         let mut core = SessionCore::new(profile.clone(), profile_source, deps);
+        core.set_path_flavor(self.path_flavor);
         if core.session_id() != sid {
             core.init_session_id(sid.clone());
         }
@@ -1673,10 +1676,10 @@ impl ManagerExec {
         lock(&self.io.profile).com.clone()
     }
 
-    /// P6 Task 9 步驟 5：PTY 後端且有 hub 時建哨兵 PTY，暫存後回 `PrimaryConsoleReady`（TCP／無 hub 不建，06 §7.2）。
-    fn create_primary_console(&mut self, epoch: u64, control: &Sender<ControlEvent>) {
+    /// P6 Task 9 步驟 5：PTY 後端且有 hub 時預建哨兵 PTY（隨 `OpenedBridge` 交給 core 同一事件登記；TCP／無 hub 不建，06 §7.2）。
+    fn make_sentinel(&mut self) -> Option<crate::session_core::PtyInfo> {
         if self.hub.is_none() || self.shared.console.kind() != sw_pal::ConsoleKind::Pty {
-            return;
+            return None;
         }
         let pair = match self.shared.console.create_pty() {
             Ok(pair) => pair,
@@ -1686,21 +1689,17 @@ impl ManagerExec {
                     self.com(),
                     e.py_message
                 ));
-                return;
+                return None;
             }
         };
         let token = self.io.next_pty_token.fetch_add(1, Ordering::Relaxed) + 1;
         let slave_path = pair.slave_path.clone();
         lock(&self.io.pending_pty).insert(token, pair);
-        let sent = control.try_send(ControlEvent::PrimaryConsoleReady {
-            epoch,
+        Some(crate::session_core::PtyInfo {
             token,
             slave_path,
             client_id: SessionCore::new_console_client_id(&fill_random),
-        });
-        if sent.is_err() {
-            lock(&self.io.pending_pty).remove(&token);
-        }
+        })
     }
 
     fn human_tx(
@@ -1802,11 +1801,12 @@ impl ManagerExec {
                 clock: self.shared.clock.clone(),
             },
         );
+        let sentinel = self.make_sentinel();
         Ok(OpenedBridge {
             epoch,
             worker,
             real_path: dev.0,
-            sentinel: None,
+            sentinel,
         })
     }
 
@@ -1998,19 +1998,32 @@ impl EffectExecutor for ManagerExec {
                 label,
             } => {
                 let pair = lock(&self.io.pending_pty).remove(&token);
-                if let (Some(hub), Some(pair)) = (self.hub.as_ref(), pair) {
-                    if hub
-                        .cmd
-                        .try_send(crate::human_console::hub::HubCmd::AdoptPty {
-                            client_id,
-                            client_lifetime,
-                            label,
-                            pair,
-                        })
-                        .is_ok()
-                    {
-                        hub.waker.wake();
+                let adopted = match (self.hub.as_ref(), pair) {
+                    (Some(hub), Some(pair)) => {
+                        let sent = hub
+                            .cmd
+                            .try_send(crate::human_console::hub::HubCmd::AdoptPty {
+                                client_id: client_id.clone(),
+                                client_lifetime,
+                                label,
+                                pair,
+                            })
+                            .is_ok();
+                        if sent {
+                            hub.waker.wake();
+                        }
+                        sent
                     }
+                    _ => false,
+                };
+                if !adopted {
+                    // PTY 已不在（RPC 逾時已丟棄）或 hub 佇列滿：讓 core 移除這個沒有 fd 的 console（含其 owner／lease），
+                    // 不留下幽靈 console（審查 1fb9612 Medium）。
+                    self.shared.warn(format!(
+                        "console 註冊失敗（com={} client_id={client_id}）：PTY 不存在或 hub 佇列已滿",
+                        self.com()
+                    ));
+                    let _ = self.data.try_send(DataEvent::ConsoleDisconnected { client_id, client_lifetime });
                 }
             }
             Effect::ConsoleDiscard { token } => {
@@ -2018,7 +2031,6 @@ impl EffectExecutor for ManagerExec {
             }
             // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）；送不出去以 NotSubmitted 回報。
             Effect::HumanTx { tag, permit, payload } => self.human_tx(tag, permit, payload, tx),
-            Effect::CreatePrimaryConsole { epoch } => self.create_primary_console(epoch, tx),
         }
     }
 }
@@ -2071,6 +2083,7 @@ impl SessionManager {
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
             console: console.clone(),
+            path_flavor: caps.path_flavor,
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
