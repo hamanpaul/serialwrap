@@ -264,3 +264,4 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 上游（P5）觀察，本輪新增：
 - `lease_selftest::selftest_probe_drain_race_golden`（P5 檔案）在全套 pytest 同時執行的負載下失敗一次（`lease_selftest.rs:1303`），隨後單獨連跑 3 次皆 31/31 綠；失敗集合不同，判定為負載敏感的競態迴圈測試，交 P5 評估是否加寬時序。
 - `origin/feature/rust-refactor-p5` 有 3 個新 commit（18abb03、9363d9b、1f5aafa），本輪 Task 不需要，未合併。
+- Task 11 Step 4 重跑（8032dfa 的 debug artifact）：`tests/test_human_agent_coexist.py` 對 Rust 8/8；func-test 2.2 八案 7/8，`cowork-01-agent-bad-cmd` 仍失敗（PROMPT_TIMEOUT 後停在 ATTACHED、40 s 內未回 READY；Python 基線同案 PASS）。在拋棄式 worktree 合併 P5 tip（1f5aafa）後重建仍失敗，屬 P5 救援／reprobe 路徑的上游缺口，未修。L1.5 `l15-multi-source-contention-console` 本輪未重跑。
