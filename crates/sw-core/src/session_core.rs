@@ -3,7 +3,7 @@
 //! 型別與公開簽章依 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 11「Produces」與 Task 0 骨架凍結；
 //! 事件處理只更新 session 狀態並產生效果，I/O 由 actor executor 執行。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use sw_pal::traits::{DevicePath, PalError, SerialConfig, SysEnv};
@@ -17,12 +17,16 @@ use crate::Mono;
 use crate::arbiter::{CmdOutcome, CommandRegistry, RunDecision, SessionQueue, SubmitReq};
 use crate::drain::{StopId, StopKind, StopOp, WorkerStoppedReceipt};
 use crate::generations::{EpochAllocator, Generations};
-use crate::login_fsm::LoginPlan;
+use crate::login_fsm::{LoginPlan, choose_login_plan, login_error_detail};
 use crate::mailbox::{
     ControlEvent, DataEvent, DetachReason, MailboxItem, OpenFailure, OpenedBridge, Reply,
     TimerEvent,
 };
 use crate::op_runner::{OpOutcome, OpSpec};
+use crate::quiet_gate::{
+    QuietState, QuietTransition, is_reboot_command, slice21_unsupported_feature,
+};
+use crate::session_auth::resolve_session_auth;
 use crate::state_store::{ReleasedRow, StateDelta};
 use crate::tx_writer::{Fence, FlashMode, OpId, TX_LEDGER_LIVE_MAX};
 use crate::uart_bridge::RxShared;
@@ -268,11 +272,12 @@ pub struct SessionCore {
     next_op_id: u64,
     next_uuid: u64,
     quiet_since: Option<Mono>,
-    boot_quiet_until: Option<Mono>,
-    ready_reconfirm_pending: bool,
-    ready_reconfirm_failed: bool,
-    ready_reconfirm_deadline: Option<Mono>,
-    boot_banner_tail: String,
+    /// boot quiet／Ready Reconfirm（P5-T13 `QuietState`；fence 旗標於同一次 `Fence::with` 同步）。
+    quiet: QuietState,
+    /// 進行中的登入 run（StartLogin 已發出、LoginFinished 未到）。
+    login_run: Option<LoginRun>,
+    /// 前景命令為 reboot 類且尚未因 TX 結算 arm quiet（parity-amendments-2026-10-26 #55）。
+    foreground_reboot: bool,
     drain_stalled: bool,
     drain_timeout_epoch: Option<u64>,
     released_by: Option<String>,
@@ -298,6 +303,22 @@ struct PendingOpenStop {
     stalled: bool,
     already_released: bool,
     post_kind: Option<StopKind>,
+}
+
+/// 進行中的登入 run（`Effect::StartLogin` 已發出）。
+struct LoginRun {
+    epoch: u64,
+    kind: LoginRunKind,
+    /// `SessionAttach` 再探的等待者（attach 路徑無）。
+    waiters: Vec<Reply>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginRunKind {
+    /// bridge 開啟後的 attach 登入（`_attach_by_id`）。
+    Attach,
+    /// 既有 bridge 再探（`_probe_existing_bridge`）。
+    Reprobe,
 }
 
 struct PendingRelease {
@@ -382,11 +403,9 @@ impl SessionCore {
             next_op_id: 0,
             next_uuid: 0,
             quiet_since: None,
-            boot_quiet_until: None,
-            ready_reconfirm_pending: false,
-            ready_reconfirm_failed: false,
-            ready_reconfirm_deadline: None,
-            boot_banner_tail: String::new(),
+            quiet: QuietState::default(),
+            login_run: None,
+            foreground_reboot: false,
             drain_stalled: false,
             drain_timeout_epoch: None,
             released_by: None,
@@ -471,10 +490,22 @@ impl SessionCore {
                         .extend(self.begin_stop(StopKind::IoError, None, now).0);
                 }
             }
-            MailboxItem::Control(ControlEvent::UartTxCompleted { epoch, .. }) => {
+            MailboxItem::Control(ControlEvent::UartTxCompleted {
+                epoch,
+                op_id,
+                confirmed_bytes,
+                unknown,
+            }) => {
                 if self.generations.conn_epoch == Some(epoch) {
                     self.last_tx_mono = now;
                     self.last_tx_at = Some((self.deps.wall_iso)());
+                    effects.0.extend(self.reboot_tx_settled(
+                        epoch,
+                        op_id,
+                        confirmed_bytes,
+                        unknown,
+                        now,
+                    ));
                 }
             }
             MailboxItem::Control(ControlEvent::WorkerStopped(receipt)) => {
@@ -541,19 +572,14 @@ impl SessionCore {
             .map(|n| PyValue::Int(PyInt::Small(n as i128)))
             .unwrap_or(PyValue::Null);
         let boot_quiet_remaining = self
-            .boot_quiet_until
-            .filter(|deadline| *deadline > now)
-            .map(|deadline| PyValue::from(py_round((deadline - now) as f64 / 1_000_000_000.0, 1)))
+            .quiet
+            .remaining_s(now)
+            .map(PyValue::from)
             .unwrap_or(PyValue::Null);
         let reconfirm_remaining = self
-            .ready_reconfirm_deadline
-            .filter(|_| self.ready_reconfirm_pending)
-            .map(|deadline| {
-                PyValue::from(py_round(
-                    deadline.saturating_sub(now) as f64 / 1_000_000_000.0,
-                    1,
-                ))
-            })
+            .quiet
+            .reconfirm_remaining_s(now)
+            .map(PyValue::from)
             .unwrap_or(PyValue::Null);
         let outstanding = usize::from(self.foreground.is_some());
         let expected_duration = self
@@ -635,11 +661,11 @@ impl SessionCore {
         out.insert("boot_quiet_remaining_s", boot_quiet_remaining);
         out.insert(
             "ready_reconfirm_pending",
-            PyValue::from(self.ready_reconfirm_pending),
+            PyValue::from(self.quiet.pending),
         );
         out.insert(
             "ready_reconfirm_failed",
-            PyValue::from(self.ready_reconfirm_failed),
+            PyValue::from(self.quiet.failed),
         );
         out.insert("ready_reconfirm_remaining_s", reconfirm_remaining);
         out.insert("idle_for_ms", idle_for_ms);
@@ -717,7 +743,7 @@ impl SessionCore {
     /// 只供測試（test-fakes）：在 attach 前建立仍有效的 boot-quiet deadline。
     #[cfg(feature = "test-fakes")]
     pub fn set_boot_quiet_until_for_test(&mut self, deadline: Mono) {
-        self.boot_quiet_until = Some(deadline);
+        self.quiet.boot_quiet_until = deadline;
     }
 }
 
@@ -725,6 +751,12 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
+        // 再探進行中被 drain 搶進：等待者照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
+        if let Some(run) = self.login_run.take() {
+            for waiter in run.waiters {
+                effects.push(Effect::Reply(waiter, Ok(self.session_recovering_reply(now))));
+            }
+        }
         let already_released = kind == StopKind::Release && self.state == SessionState::Released;
         if kind == StopKind::Shutdown {
             self.shutdown_requested = true;
@@ -897,6 +929,8 @@ impl SessionCore {
             self.generations.conn_epoch = None;
             self.queue_registered = false;
             self.foreground = None;
+            self.foreground_reboot = false;
+            self.login_run = None;
             self.clear_interactive();
             match &kind {
                 StopKind::Clear => self.set_last_error(Some("CLEARED".into()), None),
@@ -1436,7 +1470,7 @@ impl SessionCore {
 
         if !self.is_passthrough() {
             self.expire_reconfirm(now);
-            if self.ready_reconfirm_failed {
+            if self.quiet.failed {
                 let mut result = pydict! {
                     "ok" => false,
                     "error_code" => "READY_UNCONFIRMED",
@@ -1456,11 +1490,11 @@ impl SessionCore {
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
             }
-            if let Some(deadline) = self.boot_quiet_until.filter(|at| *at > now) {
+            if let Some(remaining) = self.quiet.remaining_s(now) {
                 let mut result = pydict! {
                     "ok" => false,
                     "error_code" => "AUTOBOOT_QUIET",
-                    "retry_after_s" => PyValue::from(py_round((deadline - now) as f64 / 1_000_000_000.0, 1)),
+                    "retry_after_s" => PyValue::from(remaining),
                     "hint" => "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
                 };
                 result.insert(
@@ -1476,7 +1510,7 @@ impl SessionCore {
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
             }
-            if self.ready_reconfirm_pending {
+            if self.quiet.pending {
                 let mut result = pydict! {
                     "ok" => false,
                     "error_code" => "AUTOBOOT_QUIET",
@@ -1579,19 +1613,20 @@ impl SessionCore {
         }
         if self.generations.conn_epoch.is_some() {
             if session_attach {
-                if self.state == SessionState::Ready
-                    || self.state == SessionState::Attaching
-                    || self.is_passthrough()
-                {
+                if self.is_passthrough() && self.state == SessionState::Attached {
                     return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
                 }
-                let mut response = self.error_session("SESSION_NOT_READY", now);
-                response.insert("last_error", option_string(self.last_error.as_deref()));
-                response.insert(
-                    "last_error_detail",
-                    option_string(self.last_error_detail.as_deref()),
-                );
-                return vec![Effect::Reply(reply, Ok(response))];
+                let human_lease = self
+                    .interactive_owner
+                    .as_deref()
+                    .is_some_and(|owner| owner.starts_with("human:"));
+                if !human_lease && self.state == SessionState::Attached {
+                    return self.reprobe_existing_bridge(reply, now);
+                }
+                if self.is_passthrough() {
+                    return vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
+                }
+                return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
             }
             let mut response = self.ok_session(now);
             response.insert("already_attached", PyValue::Bool(true));
@@ -1965,106 +2000,93 @@ impl SessionCore {
             self.set_state(SessionState::Attached, now);
             return effects;
         }
-        if self.boot_quiet_until.is_some_and(|deadline| deadline > now) {
-            self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
-            self.adopt_bridge(now);
-            self.set_state(SessionState::Attached, now);
-            return effects;
-        }
-        let template = &self.profile.template;
-        let requires_login = !template.login_regex.is_empty()
-            || template
-                .console_unlock_env
-                .as_deref()
-                .is_some_and(|value| !value.is_empty());
-        if requires_login {
-            if let Some(reason) = self.unresolved_credentials() {
+        let quiet_blocks = self.quiet.quiet_active(now);
+        let (plan, synthesized) = self.choose_plan(quiet_blocks);
+        match plan {
+            LoginPlan::None => {
+                if let Some(error) = synthesized {
+                    // boot quiet（#130）：掛上 bridge 純收 RX，不送 probe。
+                    self.set_last_error(Some(error.to_string()), None);
+                    self.adopt_bridge(now);
+                    self.set_state(SessionState::Attached, now);
+                    return effects;
+                }
+                // Slice 2.1 能力閘：停 ATTACHED、不自動送 TX；StartLogin{None} 只作稽核點，executor 不執行任何登入。
+                self.set_last_error(None, None);
+                self.adopt_bridge(now);
+                self.set_state(SessionState::Attached, now);
+                effects.extend(self.unsupported_warning());
+                effects.push(Effect::StartLogin {
+                    epoch,
+                    fsm_gen: self.generations.fsm_gen,
+                    plan: LoginPlan::None,
+                });
+                effects
+            }
+            LoginPlan::CredentialsUnresolved { reason, env_file } => {
                 self.set_last_error(Some("CREDENTIALS_UNRESOLVED".into()), None);
                 self.adopt_bridge(now);
                 self.set_state(SessionState::Attached, now);
-                let emit_warning = !self.credentials_warned;
-                self.credentials_warned = true;
-                if emit_warning {
-                    let env_file = self.profile.template.env_file.as_deref().unwrap_or("");
-                    let env_file_display = if env_file.is_empty() { "-" } else { env_file };
-                    let mut meta = PyDict::new();
-                    meta.insert("event", PyValue::from("credentials_unresolved"));
-                    meta.insert("reason", PyValue::from(reason));
-                    meta.insert("env_file", PyValue::from(env_file));
-                    effects.push(Effect::WalMeta { cmd_id: None, meta });
-                    effects.push(Effect::Warn(format!(
-                        "session {} 帳密解析未完成（reason={reason}, env_file={env_file_display}）：不對 login prompt 送空帳密，標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover",
-                        self.profile.com
-                    )));
-                }
-                return effects;
+                effects.extend(self.credentials_warning(reason, &env_file));
+                effects
+            }
+            plan => {
+                self.login_run = Some(LoginRun {
+                    epoch,
+                    kind: LoginRunKind::Attach,
+                    waiters: Vec::new(),
+                });
+                effects.push(Effect::StartLogin {
+                    epoch,
+                    fsm_gen: self.generations.fsm_gen,
+                    plan,
+                });
+                effects
             }
         }
-        effects.push(Effect::StartLogin {
-            epoch,
-            fsm_gen: self.generations.fsm_gen,
-            plan: LoginPlan::Probe,
-        });
-        effects
     }
 
-    fn unresolved_credentials(&self) -> Option<&'static str> {
-        let template = &self.profile.template;
-        let mut file_values = HashMap::new();
-        let file_issue = match template
-            .env_file
-            .as_deref()
-            .map(|path| (self.deps.read_env_file)(path))
-        {
-            Some(Some(Ok(contents))) => {
-                file_values = parse_auth_env_file(&contents);
-                None
-            }
-            Some(None) => Some("env_file_missing"),
-            Some(Some(Err(_))) => Some("env_file_unreadable"),
-            None => None,
-        };
-        let declared = template
-            .user_env
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-            || template
-                .pass_env
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            || template
-                .env_file
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            || template
-                .console_unlock_env
-                .as_deref()
-                .is_some_and(|value| !value.is_empty());
-        if !declared {
-            return None;
+    /// 重新解析帳密並選擇登入計畫（attach／既有 bridge 再探共用）。
+    fn choose_plan(&self, quiet_blocks: bool) -> (LoginPlan, Option<&'static str>) {
+        let auth = resolve_session_auth(
+            &self.profile,
+            self.deps.env.as_ref(),
+            self.deps.read_env_file.as_ref(),
+        );
+        choose_login_plan(&self.profile, self.pending_auto_login, auth, quiet_blocks)
+    }
+
+    /// `_emit_credentials_unresolved_warning`：`credentials_warned` 去重；WAL META＋daemon stderr。
+    fn credentials_warning(&mut self, reason: &'static str, env_file: &str) -> Vec<Effect> {
+        if self.credentials_warned {
+            return Vec::new();
         }
-        if let Some(key) = template
-            .console_unlock_env
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            return resolved_auth_value(key, &file_values, self.deps.env.as_ref())
-                .is_none()
-                .then(|| file_issue.unwrap_or("key_absent"));
-        }
-        let username = template
-            .user_env
-            .as_deref()
-            .and_then(|key| resolved_auth_value(key, &file_values, self.deps.env.as_ref()))
-            .or_else(|| template.username.clone().filter(|value| !value.is_empty()));
-        let password = template
-            .pass_env
-            .as_deref()
-            .and_then(|key| resolved_auth_value(key, &file_values, self.deps.env.as_ref()));
-        if username.is_some() && password.is_some() {
-            return None;
-        }
-        Some(file_issue.unwrap_or("key_absent"))
+        self.credentials_warned = true;
+        let env_file_display = if env_file.is_empty() { "-" } else { env_file };
+        let mut meta = PyDict::new();
+        meta.insert("event", PyValue::from("credentials_unresolved"));
+        meta.insert("reason", PyValue::from(reason));
+        meta.insert("env_file", PyValue::from(env_file));
+        vec![
+            Effect::WalMeta { cmd_id: None, meta },
+            Effect::Warn(format!(
+                "session {} 帳密解析未完成（reason={reason}, env_file={env_file_display}）：不對 login prompt 送空帳密，標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover",
+                self.profile.com
+            )),
+        ]
+    }
+
+    /// Slice 2.1 不支援的 profile 能力：daemon stderr 告警（每次自動登入判定一次）。
+    fn unsupported_warning(&self) -> Vec<Effect> {
+        slice21_unsupported_feature(&self.profile)
+            .map(|feature| {
+                Effect::Warn(format!(
+                    "slice-2.1 不支援的 profile 能力（{}: {feature}）；不自動登入",
+                    self.profile.template.profile_name
+                ))
+            })
+            .into_iter()
+            .collect()
     }
 
     fn adopt_bridge(&mut self, now: Mono) {
@@ -2082,36 +2104,166 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
-        if self.state != SessionState::Attaching
-            || self.generations.conn_epoch != Some(epoch)
-            || self.generations.fsm_gen != fsm_gen
-        {
+        let reprobe = self
+            .login_run
+            .as_ref()
+            .is_some_and(|run| run.epoch == epoch && run.kind == LoginRunKind::Reprobe);
+        if self.generations.conn_epoch != Some(epoch) {
             return Vec::new();
         }
+        if reprobe {
+            // 既有 bridge 再探（attach_session ATTACHED 分支）：結果一律回填，quiet 撤銷造成的拒絕亦然（Python 同步 probe）。
+            if self.state != SessionState::Attached {
+                return Vec::new();
+            }
+        } else if self.state != SessionState::Attaching || self.generations.fsm_gen != fsm_gen {
+            return Vec::new();
+        }
+        let run = self.login_run.take();
+        let waiters = run.map(|run| run.waiters).unwrap_or_default();
+        let mut effects = Vec::new();
         match result {
             crate::login_fsm::LoginOutcome::Ready => {
-                self.adopt_bridge(now);
+                if !reprobe {
+                    self.adopt_bridge(now);
+                }
                 self.last_probe_at = Some(self.wall_iso());
                 self.set_last_error(None, None);
                 self.set_state(SessionState::Ready, now);
                 self.last_ready_at = Some(self.wall_iso());
                 self.queue_registered = true;
                 self.recovering = false;
+                if reprobe {
+                    self.pending_auto_login = false;
+                }
                 self.confirm_ready();
-                vec![Effect::Notify(ManagerNote::SessionReady {
+                effects.push(Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
-                })]
+                }));
             }
             crate::login_fsm::LoginOutcome::NotReady(error) => {
-                self.adopt_bridge(now);
+                if !reprobe {
+                    self.adopt_bridge(now);
+                }
                 self.last_probe_at = Some(self.wall_iso());
-                self.set_last_error(Some(error), None);
+                let detail = login_error_detail(&self.deps.rx, &error);
+                self.set_last_error(Some(error), detail);
+                if reprobe {
+                    self.pending_auto_login = false;
+                }
                 self.set_state(SessionState::Attached, now);
-                Vec::new()
             }
             crate::login_fsm::LoginOutcome::Failed(error) => {
-                self.set_last_error(Some(error), None);
-                self.begin_stop(StopKind::LoginFailed, None, now).0
+                let detail = login_error_detail(&self.deps.rx, &error);
+                self.set_last_error(Some(error), detail);
+                if reprobe {
+                    self.pending_auto_login = false;
+                    // `_probe_existing_bridge`：ensure_ready 失敗仍停 ATTACHED（不 drain）。
+                    self.last_probe_at = Some(self.wall_iso());
+                    self.set_state(SessionState::Attached, now);
+                } else {
+                    // `_attach_by_id`：ensure_ready 失敗 → 關 bridge、DETACHED（05 T5）。
+                    effects.extend(self.begin_stop(StopKind::LoginFailed, None, now).0);
+                }
+            }
+        }
+        for waiter in waiters {
+            effects.push(Effect::Reply(waiter, Ok(self.attach_state_result(now))));
+        }
+        effects
+    }
+
+    /// `_attach_state_result`（#94）：command-capable 卡在非 READY／ATTACHING 時回 ok:false＋狀態專用碼。
+    fn attach_state_result(&self, now: Mono) -> PyDict {
+        let session = PyValue::Dict(self.public(
+            now,
+            &PublicCtx {
+                console_count: 0,
+                vtty: None,
+                console_endpoint: None,
+            },
+        ));
+        if self.profile.template.command_capable()
+            && !matches!(self.state, SessionState::Ready | SessionState::Attaching)
+        {
+            return match self.state {
+                SessionState::Flashing => pydict! {
+                    "ok" => false,
+                    "error_code" => "FLASHING_BUSY",
+                    "session" => session
+                },
+                SessionState::Recovering => pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_RECOVERING",
+                    "session" => session
+                },
+                _ => pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_NOT_READY",
+                    "last_error" => option_string(self.last_error.as_deref()),
+                    "last_error_detail" => option_string(self.last_error_detail.as_deref()),
+                    "session" => session
+                },
+            };
+        }
+        pydict! { "ok" => true, "session" => session }
+    }
+
+    /// `attach_session` 的 ATTACHED 分支：`_probe_existing_bridge`（quiet 單點 gate、重新解析帳密、同步 probe）。
+    fn reprobe_existing_bridge(&mut self, reply: Reply, now: Mono) -> Vec<Effect> {
+        let Some(epoch) = self.generations.conn_epoch else {
+            return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+        };
+        if let Some(run) = self.login_run.as_mut() {
+            if run.kind == LoginRunKind::Reprobe && run.epoch == epoch {
+                run.waiters.push(reply);
+                return Vec::new();
+            }
+        }
+        if self.is_passthrough() || !self.profile.template.command_capable() {
+            return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+        }
+        let quiet_blocks = self.quiet.quiet_active(now);
+        if quiet_blocks {
+            // #130 Finding 2／#162：不送 probe TX；READY 不以合成碼覆寫 last_error。
+            if self.state != SessionState::Ready {
+                self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
+            }
+            return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+        }
+        // `_begin_login_run_locked`：新登入世代，舊 run 的 TX 由 fence FsmMismatch 撤銷。
+        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+        self.deps.fence.with(|f| {
+            f.fsm_gen = self.generations.fsm_gen;
+            f.quiet_active = false;
+        });
+        let (plan, _) = self.choose_plan(false);
+        match plan {
+            LoginPlan::CredentialsUnresolved { reason, env_file } => {
+                let mut effects = self.credentials_warning(reason, &env_file);
+                self.set_last_error(Some("CREDENTIALS_UNRESOLVED".into()), None);
+                self.pending_auto_login = false;
+                self.set_state(SessionState::Attached, now);
+                effects.push(Effect::Reply(reply, Ok(self.attach_state_result(now))));
+                effects
+            }
+            LoginPlan::None => {
+                // Slice 2.1 能力閘：不自動送 TX，誠實回報現況。
+                let mut effects = self.unsupported_warning();
+                effects.push(Effect::Reply(reply, Ok(self.attach_state_result(now))));
+                effects
+            }
+            plan => {
+                self.login_run = Some(LoginRun {
+                    epoch,
+                    kind: LoginRunKind::Reprobe,
+                    waiters: vec![reply],
+                });
+                vec![Effect::StartLogin {
+                    epoch,
+                    fsm_gen: self.generations.fsm_gen,
+                    plan,
+                }]
             }
         }
     }
@@ -2122,51 +2274,44 @@ impl SessionCore {
         }
         self.last_rx_mono = now;
         self.last_rx_at = Some(self.wall_iso());
-        if self.is_passthrough() && self.state == SessionState::Attached {
-            self.quiet_since = Some(now);
-        } else if !self.is_passthrough() {
-            let chunk = clean_text(&String::from_utf8_lossy(bytes));
-            let mut window = self.boot_banner_tail.clone();
-            window.push_str(&chunk);
-            if crate::quiet_gate::BOOT_BANNER_PATTERNS
-                .iter()
-                .any(|pattern| window.contains(pattern))
-            {
-                self.boot_banner_tail.clear();
-                return self.arm_boot_quiet(now);
+        if self.is_passthrough() {
+            // SC-35：passthrough 不 arm quiet，只重設安靜視窗。
+            if self.state == SessionState::Attached {
+                self.quiet_since = Some(now);
             }
-            self.boot_banner_tail = window
-                .chars()
-                .rev()
-                .take(256)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
+            return Vec::new();
         }
-        Vec::new()
+        let chunk = clean_text(&String::from_utf8_lossy(bytes));
+        if chunk.is_empty() {
+            return Vec::new();
+        }
+        match self.quiet.on_rx_text(&chunk, &self.profile, now) {
+            QuietTransition::Armed => self.apply_quiet_armed(now),
+            QuietTransition::Cleared => {
+                // 只解除 TX 靜默維度；reconfirm pending 保留（#162）。
+                self.deps.fence.with(|f| f.quiet_active = false);
+                Vec::new()
+            }
+            QuietTransition::None => Vec::new(),
+        }
     }
 
-    fn arm_boot_quiet(&mut self, now: Mono) -> Vec<Effect> {
+    /// quiet 已 arm（`QuietState::arm`）後的同步：世代遞增、fence 旗標、到期 timer。
+    fn apply_quiet_armed(&mut self, now: Mono) -> Vec<Effect> {
         let Some(epoch) = self.generations.conn_epoch else {
             return Vec::new();
         };
-        let until = now.saturating_add(180_000_000_000);
-        self.boot_quiet_until = Some(until);
-        if !self.ready_reconfirm_pending {
-            self.ready_reconfirm_pending = true;
-            self.ready_reconfirm_failed = false;
-            self.ready_reconfirm_deadline = Some(now.saturating_add(300_000_000_000));
-        }
+        let until = self.quiet.boot_quiet_until;
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
+        let pending = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.quiet_active = true;
-            f.reconfirm_pending = true;
+            f.reconfirm_pending = pending;
             f.fsm_gen = self.generations.fsm_gen;
             f.owner_gen = self.generations.owner_gen;
         });
-        self.boot_banner_tail.clear();
+        let _ = now;
         vec![Effect::Schedule {
             at: until,
             ev: TimerEvent::BootQuietExpired {
@@ -2176,14 +2321,39 @@ impl SessionCore {
         }]
     }
 
+    /// reboot 命令 TX 結算（parity-amendments-2026-10-26 #55；`_handle_reboot_command`）：
+    /// 已提交（`Completed(n≥1)`）或結果不明（`Unknown`）時才 arm quiet；`NotSubmitted` 一律不 arm、不進 RECOVERING。
+    fn reboot_tx_settled(
+        &mut self,
+        epoch: u64,
+        op_id: OpId,
+        confirmed_bytes: usize,
+        unknown: bool,
+        now: Mono,
+    ) -> Vec<Effect> {
+        let is_foreground = self
+            .foreground
+            .as_ref()
+            .is_some_and(|grant| grant.op_id == op_id && grant.epoch == epoch);
+        if !self.foreground_reboot || !is_foreground {
+            return Vec::new();
+        }
+        if confirmed_bytes == 0 && !unknown {
+            return Vec::new();
+        }
+        self.foreground_reboot = false;
+        self.quiet.arm(now);
+        self.apply_quiet_armed(now)
+    }
+
     fn timer(&mut self, event: TimerEvent, now: Mono) -> Vec<Effect> {
         match event {
-            TimerEvent::BootQuietExpired { epoch, fsm_gen }
+            TimerEvent::BootQuietExpired { epoch, .. }
                 if self.generations.conn_epoch == Some(epoch)
-                    && self.generations.fsm_gen == fsm_gen
-                    && self.boot_quiet_until.is_some_and(|at| at <= now) =>
+                    && self.quiet.boot_quiet_until != 0
+                    && self.quiet.boot_quiet_until <= now =>
             {
-                self.boot_quiet_until = None;
+                // 照 Python：到期只令 quiet 失效（`boot_quiet_until` 保留），fence 解除 TX 靜默。
                 self.deps.fence.with(|f| f.quiet_active = false);
                 Vec::new()
             }
@@ -2227,21 +2397,13 @@ impl SessionCore {
     }
 
     fn expire_reconfirm(&mut self, now: Mono) {
-        if self.ready_reconfirm_pending && self.ready_reconfirm_deadline.is_some_and(|at| at <= now)
-        {
-            self.ready_reconfirm_pending = false;
-            self.ready_reconfirm_failed = true;
-            self.ready_reconfirm_deadline = None;
+        if self.quiet.expire(now, false) {
             self.deps.fence.with(|f| f.reconfirm_pending = false);
         }
     }
 
     fn confirm_ready(&mut self) {
-        self.boot_quiet_until = None;
-        self.ready_reconfirm_pending = false;
-        self.ready_reconfirm_failed = false;
-        self.ready_reconfirm_deadline = None;
-        self.boot_banner_tail.clear();
+        self.quiet.confirm_ready();
         self.deps.fence.with(|f| {
             f.quiet_active = false;
             f.reconfirm_pending = false;
@@ -2348,10 +2510,9 @@ impl SessionCore {
         self.queue_registered = false;
         self.queue = SessionQueue::new();
         self.clear_interactive();
-        self.boot_quiet_until = None;
-        self.ready_reconfirm_pending = false;
-        self.ready_reconfirm_failed = false;
-        self.ready_reconfirm_deadline = None;
+        self.quiet = QuietState::default();
+        self.login_run = None;
+        self.foreground_reboot = false;
         self.deps.fence.with(|f| {
             f.active_epoch = None;
             f.frozen = true;
@@ -2703,6 +2864,7 @@ impl SessionCore {
         }
         let cmd_id = grant.cmd_id.clone();
         self.foreground = None;
+        self.foreground_reboot = false;
         if let Some(cmd_id) = cmd_id {
             let result = match outcome {
                 OpOutcome::CommandResult(result) | OpOutcome::SelfTest(result) => {
@@ -2748,6 +2910,8 @@ impl SessionCore {
                 cmd_id: Some(command.cmd_id.clone()),
             };
             self.foreground = Some(grant.clone());
+            self.foreground_reboot =
+                !self.is_passthrough() && is_reboot_command(&command.req.command);
             return vec![Effect::StartOp {
                 grant,
                 spec: OpSpec::Command(command),
@@ -2847,45 +3011,4 @@ fn append_receipt_warnings(receipt: &WorkerStoppedReceipt, effects: &mut Vec<Eff
             "WARNING session {com} drain WAL 不健康：{error:?}"
         )));
     }
-}
-
-fn parse_auth_env_file(contents: &str) -> HashMap<String, String> {
-    let mut values = HashMap::new();
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = raw_key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        let value = raw_value.trim();
-        let value = if value.len() >= 2
-            && ((value.starts_with('\'') && value.ends_with('\''))
-                || (value.starts_with('"') && value.ends_with('"')))
-        {
-            &value[1..value.len() - 1]
-        } else {
-            value
-        };
-        values.insert(key.to_string(), value.to_string());
-    }
-    values
-}
-
-fn resolved_auth_value(
-    key: &str,
-    file_values: &HashMap<String, String>,
-    env: &dyn SysEnv,
-) -> Option<String> {
-    file_values
-        .get(key)
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .or_else(|| env.var(key).filter(|value| !value.is_empty()))
 }

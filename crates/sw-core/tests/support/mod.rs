@@ -888,6 +888,15 @@ struct RigExec {
     stderr: Arc<Mutex<Vec<String>>>,
     state: FakeStateStore,
     workers: HashMap<u64, IoWorker>,
+    /// Task 13：login FSM 執行所需（profile、帳密 fallback env）。
+    profile: SessionProfile,
+    env: Arc<FakeEnv>,
+}
+
+/// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
+fn rig_nonce() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5eed_0000);
+    format!("{:08x}", NEXT.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff)
 }
 
 impl EffectExecutor for RigExec {
@@ -977,11 +986,50 @@ impl EffectExecutor for RigExec {
                     worker.finish_async(stop_id, tx.clone());
                 }
             }
-            Effect::StartLogin { .. } => {
-                sw_core::s21_todo!(
-                    "T13",
-                    "ActorRig StartLogin executor（login_fsm 於 OpRunner thread）"
-                )
+            Effect::StartLogin {
+                epoch,
+                fsm_gen,
+                plan,
+            } => {
+                // Task 13 Step 0：login FSM 於獨立 thread 執行（替身 OpRunner）；TX 一律經該 epoch 的 TxWriter。
+                if matches!(
+                    plan,
+                    sw_core::login_fsm::LoginPlan::None
+                        | sw_core::login_fsm::LoginPlan::CredentialsUnresolved { .. }
+                ) {
+                    return;
+                }
+                let Some(worker) = self.workers.get(&epoch) else {
+                    return;
+                };
+                let handle = worker.tx().clone();
+                let rx = self.rx.clone();
+                let clock = self.clock.clone();
+                let profile = self.profile.clone();
+                let env = self.env.clone();
+                let control = tx.clone();
+                std::thread::spawn(move || {
+                    let send = sw_core::login_fsm::login_tx_sender(handle, epoch, 0, fsm_gen);
+                    let nonce = rig_nonce;
+                    let io = sw_core::login_fsm::LoginIo {
+                        rx: &rx,
+                        tx: &send,
+                        clock: &*clock,
+                        nonce: &nonce,
+                    };
+                    let Some(result) =
+                        sw_core::login_fsm::run_login_plan(&io, &profile, &plan, &*env)
+                    else {
+                        return;
+                    };
+                    let (wm_epoch, wm_seq) = rx.watermark();
+                    let _ = control.send(ControlEvent::LoginFinished {
+                        epoch,
+                        fsm_gen,
+                        result,
+                        after_rx_seq: (wm_epoch == epoch).then_some(wm_seq),
+                    });
+                });
             }
             Effect::StartOp { .. } => sw_core::s21_todo!("T14", "ActorRig StartOp executor"),
             Effect::SettleTx { epoch, op_id } => {
@@ -1008,6 +1056,8 @@ pub struct ActorRig {
 }
 
 const RIG_WAIT: Duration = Duration::from_secs(5);
+/// 「之後所有 WAL 寫入失敗」的失敗次數（FakeWalFs 逐筆預排；`usize::MAX` 會預配置到 OOM）。
+const WAL_FAIL_FOREVER: usize = 4096;
 
 impl ActorRig {
     /// 以 profiles YAML 建立 actor（尚未 attach；bridge 未開）。
@@ -1056,6 +1106,7 @@ impl ActorRig {
                     .map(|t| Ok(t.clone()))
             }),
         };
+        let exec_profile = profile.clone();
         let core = SessionCore::new(profile, "yaml-target", deps);
         let mailbox = Mailbox::new(256, 1024);
         let data = mailbox.data_sender();
@@ -1072,6 +1123,8 @@ impl ActorRig {
             stderr: stderr.clone(),
             state: state_store.clone(),
             workers: HashMap::new(),
+            profile: exec_profile,
+            env: env.clone(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -1126,7 +1179,12 @@ impl ActorRig {
     /// 讓之後所有 WAL 寫入失敗（磁碟滿替身；Review Focus 3）。
     pub fn fail_wal_writes(&self, err: PalError) {
         self.wfs
-            .fail_next_writes(&self.wal.wal_path(), usize::MAX, err);
+            .fail_next_writes(&self.wal.wal_path(), WAL_FAIL_FOREVER, err);
+    }
+
+    /// WAL 累計寫入失敗次數（`WalWriter::health().write_failures`；Review Focus 3 同步點）。
+    pub fn wal_write_failures(&self) -> u64 {
+        self.wal.health().write_failures
     }
 
     /// 只送 `DeviceAttached`，不等 READY。
@@ -2082,7 +2140,7 @@ impl ManagerRig {
     /// 讓之後所有 WAL 寫入失敗（磁碟滿替身；Review Focus 3）。
     pub fn fail_wal_writes(&self, err: PalError) {
         self.wfs
-            .fail_next_writes(&self.wal.wal_path(), usize::MAX, err);
+            .fail_next_writes(&self.wal.wal_path(), WAL_FAIL_FOREVER, err);
     }
 
     /// WAL 內所有行（JSON 物件）。
