@@ -1013,6 +1013,7 @@ impl SessionCore {
                 if !already_released {
                     self.set_state(SessionState::Recovering, now);
                 }
+                self.phase1_detach(&kind, already_released);
                 if kind == StopKind::Release {
                     if let Some(pending_attach) = self.pending_attach.take() {
                         effects.push(Effect::Reply(
@@ -1082,12 +1083,30 @@ impl SessionCore {
         if !already_released {
             self.set_state(SessionState::Recovering, now);
         }
+        self.phase1_detach(&kind, already_released);
         effects.push(Effect::BeginDrain { stop_id, epoch });
         effects.push(Effect::Schedule {
             at: now.saturating_add(crate::resources::DRAIN_TIMEOUT_MS.saturating_mul(1_000_000)),
             ev: TimerEvent::DrainTimeout { epoch, stop_id },
         });
         effects
+    }
+
+    /// Python `_begin_drain_locked` Phase 1（等回條前）：非 shutdown 設 `last_error=<reason>`（Removed／Rebound／
+    /// IoError 已由呼叫端設定），清前景欄位並停 log／background capture；`aborted_op` 已抄進 stop，BC-03 不受影響
+    /// （審查 F41）。
+    fn phase1_detach(&mut self, kind: &StopKind, already_released: bool) {
+        let reason = match kind {
+            StopKind::Release if !already_released => Some("RELEASED"),
+            StopKind::Clear => Some("CLEARED"),
+            StopKind::Bind => Some("REBOUND"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.set_last_error(Some(reason.to_string()), None);
+        }
+        self.foreground = None;
+        self.detach_captures();
     }
 
     fn finish_stop_without_worker(

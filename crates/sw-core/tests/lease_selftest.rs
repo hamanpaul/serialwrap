@@ -1387,3 +1387,20 @@ fn lease_expiry_timer_is_strictly_after_deadline() {
     h.advance(Duration::from_millis(1));
     assert!(pget(&h.public(), "interactive_session_id").is_null(), "超過期限即收回");
 }
+
+/// 審查 F38：base64 payload 含非 ASCII → Python `data.encode("ascii")` 的 `UnicodeEncodeError` 訊息
+/// （第一段連續不可編碼字元；單字元帶 repr 跳脫，多字元為 `position S-E`）。期望值為 Python 3.12 實跑。
+#[test]
+fn base64_non_ascii_message_matches_python_unicode_encode_error() {
+    for (data, expected) in [
+        ("é", "'ascii' codec can't encode character '\\xe9' in position 0: ordinal not in range(128)"),
+        ("aé", "'ascii' codec can't encode character '\\xe9' in position 1: ordinal not in range(128)"),
+        ("éè", "'ascii' codec can't encode characters in position 0-1: ordinal not in range(128)"),
+        ("a\u{4e2d}bc", "'ascii' codec can't encode character '\\u4e2d' in position 1: ordinal not in range(128)"),
+        ("\u{1F600}", "'ascii' codec can't encode character '\\U0001f600' in position 0: ordinal not in range(128)"),
+        ("x\u{100}\u{101}y\u{e9}", "'ascii' codec can't encode characters in position 1-2: ordinal not in range(128)"),
+    ] {
+        let err: PyErr = encode_interactive_payload(data, "base64").unwrap_err();
+        assert_eq!(err.message, expected, "{data:?}");
+    }
+}

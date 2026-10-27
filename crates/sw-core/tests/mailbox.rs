@@ -561,3 +561,36 @@ fn request_timeout_returns_internal_timeout() {
         .expect_err("無回覆應逾時");
     assert_eq!(err.message, "internal timeout");
 }
+
+#[test]
+fn op_finished_waits_for_dependent_rx() {
+    // 審查 F52：OpFinished{after_rx_seq: 5} 不得先於 Data(5) 被取出（命令結算依賴最後一段 RX 已處理）。
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender()
+        .send(ControlEvent::OpFinished {
+            op_id: sw_core::tx_writer::OpId(1),
+            epoch: 1,
+            outcome: sw_core::op_runner::OpOutcome::SendFailed,
+            after_rx_seq: Some(5),
+        })
+        .expect("control 送出");
+    let dtx = mb.data_sender();
+    for i in 1..=6 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    let mut processed = (1u64, 0u64);
+    let mut order: Vec<String> = Vec::new();
+    for _ in 0..7 {
+        let item = mb
+            .recv_next(processed, Some(1), None, &*clock)
+            .expect("項目");
+        if let Some(seq) = data_seq(&item) {
+            processed = (1, seq);
+            order.push(format!("D{seq}"));
+        } else {
+            order.push("C".to_string());
+        }
+    }
+    assert_eq!(order, ["D1", "D2", "D3", "D4", "D5", "C", "D6"]);
+}

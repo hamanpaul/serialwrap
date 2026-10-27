@@ -172,15 +172,42 @@ pub fn extract_command_stdout(
     lines.join("\n").trim_matches('\n').to_string()
 }
 
+/// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），
+/// 單一字元時附 repr 跳脫（`\xNN`／`\uNNNN`／`\UNNNNNNNN`，小寫 hex；審查 F38）。
+fn ascii_encode_error_message(data: &str) -> String {
+    let chars: Vec<char> = data.chars().collect();
+    let start = chars.iter().position(|c| !c.is_ascii()).unwrap_or(0);
+    let end = chars[start..]
+        .iter()
+        .position(char::is_ascii)
+        .map_or(chars.len(), |n| start + n);
+    if end - start == 1 {
+        let code = chars[start] as u32;
+        let escaped = if code < 0x100 {
+            format!("\\x{code:02x}")
+        } else if code < 0x10000 {
+            format!("\\u{code:04x}")
+        } else {
+            format!("\\U{code:08x}")
+        };
+        format!(
+            "'ascii' codec can't encode character '{escaped}' in position {start}: ordinal not in range(128)"
+        )
+    } else {
+        format!(
+            "'ascii' codec can't encode characters in position {start}-{}: ordinal not in range(128)",
+            end - 1
+        )
+    }
+}
+
 /// `interactive.send` 的 payload 編碼（Python `_encode_interactive_payload`；不合法 → `PyErr`）。
 pub fn encode_interactive_payload(data: &str, encoding: &str) -> Result<Vec<u8>, PyErr> {
     match encoding {
         "plain" => return Ok(data.as_bytes().to_vec()),
         "base64" => {
             if !data.is_ascii() {
-                return Err(PyErr::value_error(
-                    "'ascii' codec can't encode characters: ordinal not in range(128)",
-                ));
+                return Err(PyErr::value_error(ascii_encode_error_message(data)));
             }
             return a2b_base64_lenient(data.as_bytes())
                 .map_err(|error| PyErr::value_error(error.to_string()));

@@ -1715,3 +1715,46 @@ fn aborted_in_flight_with_unknown_tail_writes_unknown_outcome() {
     assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(2)));
     assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
 }
+
+/// 審查 F41：Python `_begin_drain_locked` 在等回條前（Phase 1）即設 `last_error=<reason>`（setter 清 detail）、
+/// 清前景欄位並停 capture；drain 中的 `GetState` 與 `DRAIN_STALLED` 的 `session` 皆為此快照。
+#[test]
+fn phase1_snapshot_sets_reason_and_clears_foreground() {
+    for (request, reason) in [
+        (release(), "RELEASED"),
+        (SessionRequest::Clear, "CLEARED"),
+        (
+            SessionRequest::Bind {
+                by_id: "/s/by-id/other".into(),
+            },
+            "REBOUND",
+        ),
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        h.core
+            .set_last_error_for_test(Some("LOGIN_REQUIRED"), Some("keep-me"));
+        let _running = h.start_foreground_command("sleep 20");
+        assert_eq!(h.public()["foreground_busy"], PyValue::Bool(true));
+        let (rx, _) = h.rpc_deferred(request);
+        let snapshot = h.public();
+        assert_eq!(snapshot["state"], PyValue::from("RECOVERING"), "{reason}");
+        assert_eq!(snapshot["last_error"], PyValue::from(reason), "{reason}");
+        assert_eq!(snapshot["last_error_detail"], PyValue::Null, "{reason}");
+        assert_eq!(snapshot["foreground_busy"], PyValue::Bool(false), "{reason}");
+        assert_eq!(snapshot["outstanding_commands"], PyValue::from(0), "{reason}");
+        assert_eq!(snapshot["fg_cmd_expected_duration_s"], PyValue::Null, "{reason}");
+        if reason == "RELEASED" {
+            h.advance(Duration::from_millis(3001));
+            let response = rx.try_recv().unwrap().unwrap();
+            session_error(&response, "DRAIN_STALLED");
+            let PyValue::Dict(session) = &response["session"] else {
+                panic!("DRAIN_STALLED 應帶 session");
+            };
+            assert_eq!(session["last_error"], PyValue::from("RELEASED"));
+            assert_eq!(session["last_error_detail"], PyValue::Null);
+            assert_eq!(session["foreground_busy"], PyValue::Bool(false));
+            assert_eq!(session["outstanding_commands"], PyValue::from(0));
+        }
+    }
+}
