@@ -112,3 +112,45 @@ def test_save_then_load_roundtrip_preserves_bindings(tmp_path, monkeypatch):
     mgr2 = _mgr(tmp_path, monkeypatch)  # 重新載入同一 STATE_PATH
     mgr2._load_state()
     assert mgr2._binding_overrides == {"prpl:COM0": "by-id-1", "prpl:COM1": "by-id-2"}
+
+
+# ---------------------------------------------------------------------------
+# P5-T15 特性測試（#81，Python 基線 oracle；Rust state_store 對應測試以此為準）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("row", "exc_type", "msg"),
+    [
+        (1, TypeError, "'int' object is not iterable"),
+        (None, TypeError, "'NoneType' object is not iterable"),
+        ("ab", ValueError, "dictionary update sequence element #0 has length 1; 2 is required"),
+        ([1], TypeError, "cannot convert dictionary update sequence element #0 to a sequence"),
+        ([[[1], 2]], TypeError, "unhashable type: 'list'"),
+    ],
+    ids=["int", "none", "str", "list-int", "unhashable-key"],
+)
+def test_load_state_alias_row_not_dict_raises_uncaught(tmp_path, monkeypatch, row, exc_type, msg):
+    """#12（B-06，KEEP-fail）：aliases 列無法 dict(v) → _load_state 拋未捕捉例外（非 StateLoadError），原檔不動。"""
+    sp = tmp_path / "state.json"
+    mgr = _mgr(tmp_path, monkeypatch)
+    body = json.dumps({"aliases": {"x": row}})
+    sp.write_text(body, encoding="utf-8")
+    with pytest.raises(exc_type) as ei:
+        mgr._load_state()
+    assert not isinstance(ei.value, StateLoadError)
+    assert str(ei.value) == msg
+    assert sp.read_text(encoding="utf-8") == body
+    assert not (tmp_path / "state.json.corrupt").exists()
+
+
+@pytest.mark.parametrize("body", ["[1,2]", "1", '"x"', "null"], ids=["list", "int", "str", "null"])
+def test_load_state_non_dict_json_not_backed_up(tmp_path, monkeypatch, body):
+    """#95（B-04）：合法 JSON 但非 object → 不備份、不改原檔、狀態維持空。"""
+    sp = tmp_path / "state.json"
+    mgr = _mgr(tmp_path, monkeypatch)
+    sp.write_text(body, encoding="utf-8")
+    mgr._load_state()
+    assert sp.read_text(encoding="utf-8") == body
+    assert sorted(p.name for p in tmp_path.glob("state.json*")) == ["state.json"]
+    assert mgr._aliases.dump() == {} and mgr._binding_overrides == {} and mgr._loaded_released == {}
