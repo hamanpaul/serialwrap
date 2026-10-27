@@ -1118,3 +1118,33 @@ fn status_not_ready_without_bridge() {
     let r = h.rpc(status_req(&id, 2048)).unwrap();
     assert_eq!(wire(&r), format!(r#"{{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND","interactive_id":"{id}"}}"#));
 }
+
+/// Medium（審查 f6859e8..3317987 #3，R3-12 回歸）：ATTACHED 救援分支 refresh 惰性結束過期 lease 並建立回放 hold 時，
+/// Python ATTACHED 分支無 SESSION_BUSY 出口（`retry_after_post` 後照常開 lease）；Rust 依 D-22(4) 撤銷該 hold、
+/// `Q` 回 deferred，開 lease 回 `recovery_mode:true`，close B 後才回放 `Q`。
+#[test]
+fn attached_refresh_created_replay_still_opens_recovery() {
+    let mut h = attached(BOOT);
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    feed_rx(&mut h, b"U-Boot 2020\r\n=> ");
+    let a = h.rpc(open_req("agent:a", 1.0, "", true)).unwrap();
+    assert_eq!(a.get("recovery_mode"), Some(&true.into()), "{a:?}");
+    h.input("c1", b"Q"); // 進 deferred
+    assert!(h.human_tx().is_empty());
+    h.clock.advance(Duration::from_millis(1500)); // 過期，但尚未投遞 Tick
+    let b = h.rpc(open_req("agent:b", 60.0, "", true)).unwrap();
+    assert_eq!(b.get("ok"), Some(&true.into()), "ATTACHED 分支無 SESSION_BUSY 出口：{b:?}");
+    assert_eq!(b.get("recovery_mode"), Some(&true.into()));
+    assert_eq!(h.core.active_lease().unwrap().owner, "agent:b");
+    assert_eq!(h.fence_replay_auth(), None, "refresh 建立的回放 hold 被撤銷");
+    assert!(h.replay_hold().unwrap().revoked);
+    let fx = h.complete_human_tx(TxOutcome::NotSubmitted, Some(FenceReject::ReplayRevoked));
+    assert!(human_txs(&fx).is_empty(), "無重送");
+    assert_eq!(h.deferred_len("c1"), 1, "Q restore_front 回 deferred");
+    let bid = iid(&b);
+    let n_tx = h.human_tx().len();
+    h.rpc(close_req(&bid)).unwrap();
+    assert!(h.human_tx().len() > n_tx, "close B 後回放");
+    assert_eq!(h.human_tx().last().unwrap(), &(TxClass::HumanReplay, "human:c1".to_string(), b"Q".to_vec()));
+}

@@ -434,6 +434,9 @@ fn soft_preempt_replays_when_peer_appears_later() {
     let fake = &r.console.as_ref().unwrap().fake;
     fake.set_held(Some(Default::default()));
     let a = attach(&r, r#"{"selector":"COM0"}"#);
+    // attach 後先取一次 session 摘要：held 為空的快照使 peer=false（等同 Python「minicom 尚未開啟」），
+    // 本測試因此只依賴 close 前的即時掃描（審查 bd2f989 Low：原版在 attach 時 peer_present=true，不是獨立回歸）。
+    let _ = r.call("session.get_state", r#"{"selector":"COM0"}"#);
     let o = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
     assert_eq!(o.get("soft_preempted"), Some(&PyValue::Bool(true)), "{}", j(&o));
     fake.set_held(Some([s(&a, "vtty")].into_iter().collect()));

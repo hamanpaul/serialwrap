@@ -232,3 +232,21 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 | Medium | 5f5133e | `test_session_vtty_cached` 不要求 attach 成功、vtty 為 null 仍綠 | fixed（本 commit）：斷言 READY 後 vtty 非空、兩次 attach ok 且 vtty 不等於 primary |
 | Medium | f347d5d | hex 編碼拒絕未鎖零 TX | fixed（本 commit）：斷言 `written()` 長度不變（Python `_encode_interactive_payload` 送出前即 ValueError） |
 | Medium | f347d5d | Task 11 其餘案例仍缺 | 部分 fixed 23a47d6（第三批 9 案）；其餘見上方進度表 |
+
+## f6859e8..3317987（第五輪；`f6859e8_3317987-opus.md`，`e59d928_3317987-{opus,grok}.md` 內容為空）
+
+| # | 等級 | Commit | 問題 | 處理 |
+|---|---|---|---|---|
+| R5-1 | Medium | 23a47d6 | `test_lazy_expiry_parity` 第二次 send 接受 `INTERACTIVE_NOT_FOUND`，違反 #54 | fixed（本輪）：只接受 `INTERACTIVE_EXPIRED`，另補 status／close 皆 `INTERACTIVE_EXPIRED` 與 DUT 未收到 `x`（零 TX）。Python 基線：`interactive_send` 查到 `status=="expired"` 的 tombstone 即回 EXPIRED（`session_manager.py:7072-7075`、`_record_interactive_terminal_locked` `:5644`）。07 計畫 L2421「再 send → NOT_FOUND」文字屬 `docs/parity-amendments` 分支，本分支不改，請計畫擁有者依 #54 同步 |
+| R5-2 | Medium | 23a47d6 | `test_normal_suspend_loses_no_keystroke` 不交錯斷言恆真 | fixed（本輪）：每輪先等 WAL 出現該 `cmd_id` 的 TX 才寫 byte（命令改 `sleep 0.6`，確保寫入落在命令期間）；最後對每個 agent `cmd_id` 取 TX seq `[min,max]`，斷言每筆 `human:<h1>` TX seq 不在任何開區間內 |
+| R5-3 | Medium | e59d928 | R3-12 無回歸測試 | fixed（本輪）：`session_core_lease::attached_refresh_created_replay_still_opens_recovery`（ATTACHED、`=> ` tail、A `timeout=1` soft preempt、c1 打 `Q`、推進 1.5 s 不投遞 Tick、B `allow_attached` → `recovery_mode:true`、hold 被 revoke、`Q` 回 deferred、close B 後回放）。實測把 `lease_p6.rs` 還原到 e59d928~1（放回 SESSION_BUSY 出口）時該測試於「ATTACHED 分支無 SESSION_BUSY 出口」斷言 FAIL；以 `--l1-add-only` 登記 |
+| R5-L1 | Low | f347d5d | `test_deferred_bytes_flushed_after_agent_command` 未用計畫 `scripts` | fixed（本輪）：`console_daemon` 依計畫裝 `scripts`（`sleep 2`→`sleep 2: ok`、`bootcmd`→U-Boot banner 不回 prompt），順序針改 `b"sleep 2: ok"` |
+| R5-L2 | Low | f347d5d／23a47d6 | `test_detach_unknown_client`、`test_peer_loss_grace_then_teardown` 缺零 TX | fixed（本輪） |
+| R5-L3 | Low | 23a47d6 | `interactive_open_scans_peers_before_refresh` 在 23a47d6 的紅燈證據不穩 | 紅燈證據以 bd2f989 版本（含 `wait_for("按鍵到 UART")`）為準 |
+| R5-L4 | Low | bd2f989 | `soft_preempt_replays_when_peer_appears_later` 不是獨立回歸 | fixed（本輪）：attach 後先 `session.get_state`（held 為空 → peer=false），實測只刪 `route_interactive` 的 `send_console_scan` 即 FAIL |
+| R5-L5 | Low | bd2f989 | `send_console_scan` 的 `try_send` 滿載靜默略過 | 已知偏差（記錄不修）：control lane 容量遠大於單一 RPC 一次送出的掃描數，滿載時 core 沿用上一個快照；Python 為同步掃描不會遺失。改為 `send_timeout`＋`SESSION_BUSY` 會新增 Python 沒有的錯誤出口，故維持現狀，待 P5／擁有者決定是否加 WARNING |
+| R5-L6 | Low | e59d928 | ConsoleAdopt 失敗後備走 data lane `try_send` | deferred：同 R3-4，待 FakeConsole 佇列滿注入 hook |
+| R5-L7 | Low | e59d928 | `session_core.rs` match 內空行、rustfmt | 空行 fixed（本輪）；其餘 rustfmt 基線本來不乾淨，新增程式碼以現有風格撰寫 |
+| R5-L8 | Low | e59d928 | changelog 未提 ATTACHED 救援移除 SESSION_BUSY 出口 | fixed（本輪）：`changelog.d/rust-s22-console-sentinel.md` 補一句 |
+| R5-L9 | Low | 3317987 | `target.written(0.5)` 不會等 | fixed（本輪）：hex 拒絕前先 `time.sleep(0.5)` 再比長度 |
+| R5-L10 | Low | 3317987 | vtty 未驗 `/dev/pts/\d+` | fixed（本輪） |

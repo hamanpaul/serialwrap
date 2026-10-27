@@ -753,7 +753,6 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
             }
-
         }
         if std::mem::take(&mut self.hold_release_kick) && !self.foreground_busy() {
             effects.0.extend(self.start_next(now));
