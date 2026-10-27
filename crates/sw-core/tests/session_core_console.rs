@@ -551,3 +551,68 @@ fn phase1_in_flight_human_tx_still_settles_ledger() {
     );
     assert!(human_txs(&fx).is_empty(), "不得因此送出新的 human TX");
 }
+
+// ---------------------------------------------------------------------------
+// p6-cloud 審查回歸（1f1fa67..4f710c3）：core reap（Python `reap_stale_consoles`，#76）
+// ---------------------------------------------------------------------------
+
+fn vtty_of(d: &sw_proto::pyjson::PyDict) -> String {
+    d.get("vtty").and_then(PyValue::as_str).unwrap().to_string()
+}
+
+fn closes(fx: &[Effect]) -> Vec<String> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::ConsoleClose { client_id } => Some(client_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// High（4f710c3）：hub 掃描時回收非 internal、PTY、非 owner、已滿 2 s、不在 held 的 console。
+#[test]
+fn reap_stale_console_without_holder() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let a = h.attach_pty_console("c1", true); // primary＋human lease owner
+    h.attach_pty_console("c2", true);
+    h.advance_s(2.1);
+    let fx = h.scan(Some(&[vtty_of(&a).as_str()]));
+    assert_eq!(closes(&fx), ["c2"]);
+    assert!(!h.core.human_console().consoles.contains_key("c2"));
+    assert_eq!(h.public().get("console_count"), Some(&PyValue::from(1i64)));
+}
+
+/// owner／未滿 grace／held=None 不回收。
+#[test]
+fn reap_skips_owner_young_and_unknown_scan() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    h.attach_pty_console("c2", true);
+    let fx = h.scan(Some(&[])); // 未滿 2 s
+    assert!(closes(&fx).is_empty());
+    h.advance_s(2.1);
+    let fx = h.scan(None); // 掃描失敗：視為全部仍被持有
+    assert!(closes(&fx).is_empty());
+    let fx = h.scan(Some(&[]));
+    assert_eq!(closes(&fx), ["c2"], "owner c1 受保護，只回收 c2");
+}
+
+/// 死掉的非 internal primary 也回收，primary 轉給剩下的第一個 console；TCP console 不受 reaper。
+#[test]
+fn reap_dead_primary_transfers_primary() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    // 先有 agent lease：之後 attach 的 PTY console 都不是 owner。
+    h.rpc(open_req("agent", 60.0, "", false)).unwrap();
+    h.attach_pty_console("c1", true);
+    let b = h.attach_pty_console("c2", true);
+    h.connect_stream_console("t1", ConsoleTransportKind::TcpTelnet);
+    assert_eq!(h.core.human_console().primary_client_id.as_deref(), Some("c1"));
+    h.advance_s(2.1);
+    let fx = h.scan(Some(&[vtty_of(&b).as_str()]));
+    assert_eq!(closes(&fx), ["c1"]);
+    assert_eq!(h.core.human_console().primary_client_id.as_deref(), Some("c2"), "primary 轉移");
+    assert!(h.core.human_console().consoles.contains_key("t1"), "TCP console 不受 reaper");
+}

@@ -1044,3 +1044,77 @@ fn human_line_timeout_sends_no_rescue_keys() {
     assert!(!payloads.iter().any(|p| p == b"\x03" || p == b"\x04"), "human 命令不得送救援鍵：{payloads:?}");
     assert_eq!(rig.get_state()["state"], PyValue::from("READY"));
 }
+
+// ---------------------------------------------------------------------------
+// p6-cloud 審查回歸（1f1fa67..4f710c3）
+// ---------------------------------------------------------------------------
+
+/// High（6eafa6a）：READY open 的 refresh 惰性結束過期 agent lease、還原 human 並建立回放 hold 時，
+/// 本次 open 回 SESSION_BUSY（D-22(2)），不得 revoke 剛建立的回放再 soft preempt。
+#[test]
+fn refresh_created_replay_hold_blocks_reopen() {
+    let mut h = ready();
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    let r = h.rpc(open_req("agent:a", 1.0, "", false)).unwrap();
+    assert_eq!(r.get("soft_preempted"), Some(&true.into()));
+    h.input("c1", b"Q"); // 進 deferred
+    h.clock.advance(Duration::from_millis(1500)); // 過期，但尚未投遞 Tick
+    let r = h.rpc(open_req("agent:b", 60.0, "", false)).unwrap();
+    assert_eq!(wire(&r), r#"{"ok":false,"error_code":"SESSION_BUSY","selector":"COM0"}"#);
+    assert_eq!(h.human_tx(), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"Q".to_vec())]);
+    assert!(h.fence_replay_auth().is_some(), "回放授權未被撤銷");
+    h.complete_human_tx(TxOutcome::Completed(1), None);
+    let r = h.rpc(open_req("agent:b", 60.0, "", false)).unwrap();
+    assert_eq!(r.get("soft_preempted"), Some(&true.into()), "回放結算後下一次 open 才 preempt");
+}
+
+/// Medium（6eafa6a，parity #56）：tick 到期還原結算前，interactive 模式命令回 SESSION_INTERACTIVE_BUSY。
+#[test]
+fn interactive_command_during_tick_close_is_busy() {
+    let mut h = ready();
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    let r = h.rpc(open_req("agent:old", 1.0, "", false)).unwrap();
+    assert_eq!(r.get("soft_preempted"), Some(&true.into()));
+    h.input("c1", b"T");
+    h.advance_s(2.0); // tick 到期 → 還原、回放 T（未結算）
+    let mut req = agent_submit("vim");
+    req.mode = "interactive".into();
+    let resp = h.rpc(SessionRequest::Submit(req)).unwrap();
+    let cmd_id = resp["cmd_id"].as_str().unwrap().to_string();
+    h.complete_human_tx(TxOutcome::Completed(1), None);
+    let row = h.reg.get(&cmd_id).unwrap();
+    assert_eq!(row["error_code"], PyValue::from("SESSION_INTERACTIVE_BUSY"), "{row:?}");
+    assert_eq!(h.core.active_lease().unwrap().owner, "human:c1", "未開新 lease");
+}
+
+/// Medium（35359438）：FLASHING 拒絕零 TX；bridge 掉線後 lease 已隨 detach 移除（Python `session_manager.py:2518-2522`
+/// `_interactive.pop`），send／status 回 INTERACTIVE_NOT_FOUND、零 TX（`SESSION_NOT_READY` 分支在此路徑不可達）。
+#[test]
+fn send_checks_order_detached_and_flashing_zero_tx() {
+    let mut h = ready();
+    let id = iid(&h.rpc(open_req("agent", 60.0, "", false)).unwrap());
+    h.force_state(SessionState::Flashing);
+    let before = h.tx_effect_count();
+    let r = h.rpc(send_req(&id, "x", "plain")).unwrap();
+    assert_eq!(wire(&r), format!(r#"{{"ok":false,"error_code":"FLASHING_BUSY","interactive_id":"{id}"}}"#));
+    assert_eq!(h.tx_effect_count(), before);
+    let mut h = ready();
+    let id = iid(&h.rpc(open_req("agent", 60.0, "", false)).unwrap());
+    h.begin_stop(StopKind::IoError);
+    let before = h.tx_effect_count();
+    let r = h.rpc(send_req(&id, "x", "plain")).unwrap();
+    assert_eq!(wire(&r), format!(r#"{{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND","interactive_id":"{id}"}}"#));
+    assert_eq!(h.tx_effect_count(), before);
+}
+
+/// Medium（35359438）：`status_not_ready_without_bridge`——同上，bridge 掉線時 lease 已移除。
+#[test]
+fn status_not_ready_without_bridge() {
+    let mut h = ready();
+    let id = iid(&h.rpc(open_req("agent", 60.0, "", false)).unwrap());
+    h.begin_stop(StopKind::IoError);
+    let r = h.rpc(status_req(&id, 2048)).unwrap();
+    assert_eq!(wire(&r), format!(r#"{{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND","interactive_id":"{id}"}}"#));
+}
