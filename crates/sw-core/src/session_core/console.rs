@@ -117,6 +117,26 @@ impl SessionCore {
         self.foreground.is_some() || self.human.replay_hold.as_ref().is_some_and(|h| !h.revoked)
     }
 
+    /// 目前 active lease（唯讀；Task 7 測試與 SessionPublic 用）。
+    pub fn active_lease(&self) -> Option<&crate::lease::InteractiveLease> {
+        todo!("P6 Task 7")
+    }
+
+    /// soft preempt／ATTACHED 救援時 stash 的 human lease。
+    pub fn stashed_human_lease(&self) -> Option<&crate::lease::InteractiveLease> {
+        todo!("P6 Task 7")
+    }
+
+    /// `_lease_context(lease, bridge)`（02 §6.2）。
+    pub fn lease_context_now(&self, _now: Mono) -> sw_proto::pyjson::PyDict {
+        todo!("P6 Task 7")
+    }
+
+    /// worker 健康（`snapshot()["running"]`／`["serial_alive"]`；executor 注入）。
+    pub fn set_worker_health(&mut self, _probe: std::sync::Arc<dyn Fn() -> crate::uart_bridge::WorkerSnapshot + Send + Sync>) {
+        todo!("P6 Task 7")
+    }
+
     // ---------------- ownership 與 fence 同步 ----------------
 
     /// owner 實際改變時遞增 `owner_gen` 並在同一次 `Fence::with` 寫入（07 Task 6 Step 3 第 4 點）。

@@ -600,6 +600,11 @@ fn tick_expires_lease_sc13() {
         h.request(status_req(&id)),
         sw_proto::pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED", "interactive_id" => id.clone() }
     );
+    // P6 增補 #16（07 D-08）：tombstone 可重複讀，第二次 status 仍為 INTERACTIVE_EXPIRED。
+    assert_eq!(
+        h.request(status_req(&id)),
+        sw_proto::pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED", "interactive_id" => id.clone() }
+    );
     // lease 已移除：命令不再被 SESSION_INTERACTIVE_BUSY 擋下。
     h.dev.on_tx_reply(b"echo z\n", b"echo z\r\nz\r\nroot@t:/# ");
     let cmd = h.submit_ok("echo z");

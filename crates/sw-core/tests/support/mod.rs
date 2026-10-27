@@ -2707,6 +2707,10 @@ impl CoreHarness {
         let fx = self.core.begin_stop(kind, None, now);
         self.handle_direct(fx.0)
     }
+    /// ATTACHED 救援的 bridge 健康（running／serial_alive／vtty_alive）。
+    pub fn set_bridge_health(&mut self, _running: bool, _serial_alive: bool, _vtty_alive: bool) {
+        todo!("P6 Task 7")
+    }
     /// 該 console 目前的 `client_lifetime`。
     pub fn lifetime(&self, cid: &str) -> u64 {
         self.console_lifetime(cid)
