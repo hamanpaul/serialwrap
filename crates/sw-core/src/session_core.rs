@@ -1487,7 +1487,7 @@ impl SessionCore {
     fn ok_session(&self, now: Mono) -> PyDict {
         pydict! {
             "ok" => true,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1495,7 +1495,7 @@ impl SessionCore {
         pydict! {
             "ok" => false,
             "error_code" => code,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1505,7 +1505,7 @@ impl SessionCore {
             "error_code" => "SESSION_RECOVERING",
             "drain_stalled" => self.drain_stalled,
             "drain_timeout_epoch" => self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null),
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1515,7 +1515,7 @@ impl SessionCore {
             "error_code" => "DRAIN_STALLED",
             "drain_stalled" => true,
             "drain_timeout_epoch" => self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null),
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1532,7 +1532,7 @@ impl SessionCore {
             .unwrap_or((0, false));
         pydict! {
             "ok" => true,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None }),
+            "session" => self.public(now, &self.public_ctx()),
             "closed_consoles" => py_int(closed_consoles),
             "aborted_cmd" => aborted_cmd
         }
@@ -1731,11 +1731,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1752,11 +1748,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1780,11 +1772,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1800,11 +1788,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1820,11 +1804,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1846,11 +1826,7 @@ impl SessionCore {
                             "session",
                             PyValue::Dict(self.public(
                                 now,
-                                &PublicCtx {
-                                    console_count: 0,
-                                    vtty: None,
-                                    console_endpoint: None,
-                                },
+                                &self.public_ctx(),
                             )),
                         );
                     }
@@ -1896,7 +1872,7 @@ impl SessionCore {
                     "ok" => true,
                     "released" => true,
                     "recommended_action" => "device_attach",
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -1992,7 +1968,7 @@ impl SessionCore {
                     "ok" => false,
                     "error_code" => "FLASHING_BUSY",
                     "selector" => self.profile.com.clone(),
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -2005,7 +1981,7 @@ impl SessionCore {
                 Ok(pydict! {
                     "ok" => true,
                     "already_bound" => true,
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -2563,11 +2539,7 @@ impl SessionCore {
     fn attach_state_result(&self, now: Mono) -> PyDict {
         let session = PyValue::Dict(self.public(
             now,
-            &PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
+            &self.public_ctx(),
         ));
         if self.profile.template.command_capable()
             && !matches!(self.state, SessionState::Ready | SessionState::Attaching)
@@ -3145,14 +3117,37 @@ impl SessionCore {
     // recover／force recover、reboot recovery、self-test、background／agent log capture。
     // -----------------------------------------------------------------------
 
+    /// `to_public_dict` 的 console 三欄（07 Task 10 Step 3 第 3 點）：有 bridge 時 console 數＝哨兵計數＋human
+    /// console；無 bridge 時為保留的 console 數。`vtty` 取 D-20 快取，無快取且無 bridge 時取保留 console 的 primary。
+    /// `console_endpoint` 只在 TCP console 有端點時輸出（Windows，LOCAL-WINDOWS-TODO；POSIX 不輸出）。
+    fn public_ctx(&self) -> PublicCtx {
+        let humans = self.human.consoles.values().filter(|c| !c.internal).count();
+        let console_count = if self.generations.conn_epoch.is_some() {
+            self.console_count + humans
+        } else {
+            humans
+        };
+        let vtty = self.human.vtty_cache.clone().or_else(|| {
+            if self.generations.conn_epoch.is_some() {
+                return None;
+            }
+            self.human
+                .primary_client_id
+                .as_ref()
+                .and_then(|p| self.human.consoles.get(p))
+                .map(|c| c.vtty.clone())
+        });
+        PublicCtx {
+            console_count: console_count as i128,
+            vtty,
+            console_endpoint: None,
+        }
+    }
+
     fn session_value(&self, now: Mono) -> PyValue {
         PyValue::Dict(self.public(
             now,
-            &PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
+            &self.public_ctx(),
         ))
     }
 

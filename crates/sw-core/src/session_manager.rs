@@ -562,8 +562,25 @@ impl Shared {
         }
     }
 
+    /// 07 D-09：RPC handler thread 取 `/proc` 持有者快照，經同一條 control sender 先於 request 送
+    /// `ConsoleScan{source: Rpc}`（FIFO 保證 core 處理 request 前已更新 peer 判定）。lane 滿時略過。
+    fn send_console_scan(&self, sid: &str) {
+        let Some(actor) = self.actor_of(sid) else {
+            return;
+        };
+        let scan = crate::human_console::ConsoleScanSnapshot {
+            held: self.console.held_slave_paths(),
+            taken_at: self.clock.mono_ns(),
+        };
+        let _ = actor.control.try_send(ControlEvent::ConsoleScan {
+            scan,
+            source: crate::human_console::ScanSource::Rpc,
+        });
+    }
+
     /// actor 的 `session` 公開欄位（GetState）。
     fn session_public(&self, sid: &str) -> Option<PyDict> {
+        self.send_console_scan(sid);
         let actor = self.actor_of(sid)?;
         let r = actor
             .request(SessionRequest::GetState, QUERY_TIMEOUT)
@@ -2163,6 +2180,10 @@ impl SessionManager {
         }
         let is_open = matches!(req, SessionRequest::InteractiveOpen { .. });
         let is_release = matches!(req, SessionRequest::Release { .. });
+        if matches!(req, SessionRequest::GetState | SessionRequest::Activity) {
+            // 07 D-09：session 摘要前先更新 console peer 判定。
+            self.shared.send_console_scan(sid);
+        }
         let result = self.shared.request(sid, req, timeout)?;
         if is_open && is_ok(&result) {
             if let Some(iid) = str_of(&result, "interactive_id") {
@@ -2540,6 +2561,7 @@ impl SessionManager {
         } else {
             None
         };
+        self.shared.send_console_scan(&sid);
         let result = self
             .shared
             .request(&sid, SessionRequest::ConsoleAttach { label, pty }, timeout);
@@ -2555,6 +2577,7 @@ impl SessionManager {
         let Some(sid) = self.resolve(selector) else {
             return Ok(console_not_ready(selector));
         };
+        self.shared.send_console_scan(&sid);
         Ok(with_raw_selector(self.shared.request(&sid, req, timeout)?, selector))
     }
 
