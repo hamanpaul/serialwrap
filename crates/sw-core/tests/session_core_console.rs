@@ -424,3 +424,17 @@ fn console_disconnect_drops_owner_and_deferred() {
     assert_eq!(h.deferred_len("c1"), 0);
     assert_eq!(owner(&h), None);
 }
+
+#[test]
+fn reboot_command_invalidates_before_send() {
+    // 增補 #13：`bridge.invalidate_deferred("reboot")` 在送出 reboot 之前（session_manager.py `_execute_command_inner`）。
+    let mut h = ready_with_tcp(&["c1"]);
+    let e0 = h.core.generations().input_epoch;
+    let started = h.start_foreground_command("reboot");
+    let _ = started;
+    assert_eq!(h.core.generations().input_epoch, e0 + 1, "StartOp(reboot) 時 input_epoch 已遞增");
+    assert_eq!(h.fence.with(|f| f.input_epoch), e0 + 1);
+    let life = h.lifetime("c1");
+    let fx = h.input_with("c1", life, e0, b"k");
+    assert!(human_txs(&fx).is_empty(), "reboot 前擷取的輸入一律 stale");
+}

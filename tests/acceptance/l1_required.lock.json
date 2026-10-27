@@ -10531,6 +10531,7 @@
           "cargo:sw-core::session_core_console::owner_change_updates_fence_before_tx",
           "cargo:sw-core::session_core_console::queued_command_waits_for_replay_settle",
           "cargo:sw-core::session_core_console::raw_input_becomes_human_tx",
+          "cargo:sw-core::session_core_console::reboot_command_invalidates_before_send",
           "cargo:sw-core::session_core_console::release_phase1_closes_all_consoles",
           "cargo:sw-core::session_core_console::second_console_while_lease_gets_interactive_busy",
           "cargo:sw-core::session_core_console::self_test_probe_suspends_human_without_admission",
