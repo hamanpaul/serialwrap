@@ -26,7 +26,14 @@ CONSOLE_SCRIPTS: dict[bytes, tuple] = {
 }
 
 
-def _start(root: Path, *, profile_yaml: str | None = None, second_board: bool = False, **target_attrs):
+def _start(
+    root: Path,
+    *,
+    profile_yaml: str | None = None,
+    second_board: bool = False,
+    extra_env: dict[str, str] | None = None,
+    **target_attrs,
+):
     """以 06 `start_daemon` 啟動，並在 FakeTarget start 前套用 P6 追加能力（`scripts`／`ready`）。
 
     不改 06 harness：暫時包裝 `harness._make_target`，於回傳前設定屬性（FakeTarget 於執行期讀取）。
@@ -55,7 +62,9 @@ def _start(root: Path, *, profile_yaml: str | None = None, second_board: bool = 
             extra.append(board2)
         return target
 
-    kwargs = {} if profile_yaml is None else {"profile_yaml": profile_yaml}
+    kwargs: dict = {} if profile_yaml is None else {"profile_yaml": profile_yaml}
+    if extra_env:
+        kwargs["extra_env"] = extra_env
     harness._make_target = _make
     try:
         d = start_daemon(root, **kwargs)
@@ -122,5 +131,16 @@ def two_board_daemon(tmp_path: Path):
         d.wait_state("COM0", "READY")
         d.wait_state("COM1", "READY")
         yield d
+    finally:
+        _stop(d)
+
+
+@pytest.fixture
+def telnet_daemon(tmp_path: Path):
+    """SC-28 `SERIALWRAP_CONSOLE_BACKEND=tcp`：human console 走 127.0.0.1 Telnet listener；yield `(daemon, FakeTarget)`。"""
+    d = _start(tmp_path / "telnet", extra_env={"SERIALWRAP_CONSOLE_BACKEND": "tcp"})
+    try:
+        d.wait_state("COM0", "READY")
+        yield d, d.targets["COM0"]
     finally:
         _stop(d)

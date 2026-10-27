@@ -488,3 +488,126 @@ fn attach_not_ready_detached_and_released() {
         assert_eq!(r.side_effect_fingerprint().2, before);
     }
 }
+
+// ---------------------------------------------------------------- TCP console（SC-28 tcp 後端；R3-2）
+
+fn is_loopback_endpoint(v: &str) -> bool {
+    v.strip_prefix("127.0.0.1:")
+        .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn session_row(r: &ServiceRig) -> PyDict {
+    let list = r.call("session.list", "{}");
+    match list.get("sessions") {
+        Some(PyValue::List(rows)) => match &rows[0] {
+            PyValue::Dict(d) => d.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 07 Task 10 `attach_tcp_shape`（`uart_io.py:2578-2590`、`session_manager.py:6748-6756`）：回端點、不開 lease。
+#[test]
+fn attach_tcp_shape() {
+    let r = ServiceRig::with_console_backend("tcp");
+    let resp = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        keys(&resp),
+        ["ok", "client_id", "label", "vtty", "endpoint", "transport", "protocol", "session", "version"],
+        "{}",
+        j(&resp)
+    );
+    let ep = s(&resp, "endpoint");
+    assert!(is_loopback_endpoint(&ep), "{}", j(&resp));
+    let session = match resp.get("session") {
+        Some(PyValue::Dict(d)) => d.clone(),
+        other => panic!("{other:?}"),
+    };
+    let want = format!(
+        r#"{{"ok":true,"client_id":null,"label":null,"vtty":"{ep}","endpoint":"{ep}","transport":"tcp","protocol":"telnet","session":{},"version":"{}"}}"#,
+        j(&session),
+        r.version
+    );
+    assert_eq!(j(&resp), want);
+    assert_eq!(session.get("interactive_session_id"), Some(&PyValue::Null), "TCP attach 不開 lease");
+    assert_eq!(s(&session, "vtty"), ep, "vtty 快取為 None 時設為端點（D-20）");
+    let labeled = attach(&r, r#"{"selector":"COM0","label":"x"}"#);
+    assert_eq!(s(&labeled, "label"), "x");
+    assert_eq!(s(&labeled, "endpoint"), ep, "同一 bridge 端點不變");
+}
+
+/// 07 Task 10 `session_public_console_fields_tcp`：tcp 後端 SessionPublic 恆有 `console_endpoint`（最後一欄）。
+#[test]
+fn session_public_console_fields_tcp() {
+    let r = ServiceRig::with_console_backend("tcp");
+    let row = session_row(&r);
+    let k = keys(&row);
+    assert_eq!(k.last().map(String::as_str), Some("console_endpoint"), "{}", j(&row));
+    assert_eq!(k[k.len() - 2], "drain_timeout_epoch");
+    assert!(is_loopback_endpoint(&s(&row, "console_endpoint")), "{}", j(&row));
+    assert_eq!(j(&row).contains(r#""console_count":0"#), true, "TCP 無哨兵 primary：{}", j(&row));
+}
+
+/// TCP client 連入：首個取得 raw owner（`on_stream_accept`）、先收 greeting、console_list 的 vtty 為端點。
+#[test]
+fn tcp_client_accept_gets_raw_owner_and_greeting() {
+    let r = ServiceRig::with_console_backend("tcp");
+    let ep = s(&session_row(&r), "console_endpoint");
+    let fake = &r.console.as_ref().unwrap().fake;
+    let c1 = fake.connect();
+    wait_for("TCP client 登記", || {
+        matches!(r.call("session.console_list", r#"{"selector":"COM0"}"#).get("consoles"),
+            Some(PyValue::List(rows)) if rows.len() == 1)
+    });
+    let list = r.call("session.console_list", r#"{"selector":"COM0"}"#);
+    let row = match list.get("consoles") {
+        Some(PyValue::List(rows)) => match &rows[0] {
+            PyValue::Dict(d) => d.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(s(&row, "vtty"), ep, "{}", j(&row));
+    assert_eq!(row.get("interactive_owner"), Some(&PyValue::Bool(true)), "{}", j(&row));
+    wait_for("greeting", || c1.written().len() >= 12);
+    assert_eq!(&c1.written()[..12], &sw_proto::constants::telnet::TELNET_GREETING[..]);
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
+    c1.push_input(b"ab");
+    let mut seen = Vec::new();
+    wait_for("raw bytes 到 UART", || {
+        seen.extend(dev.take_tx());
+        seen.windows(2).any(|w| w == b"ab")
+    });
+}
+
+/// release 後 listener 停止、`console_endpoint` 為 null（`uart_io.py:1113-1115`）。
+#[test]
+fn tcp_release_clears_console_endpoint() {
+    let r = ServiceRig::with_console_backend("tcp");
+    assert!(is_loopback_endpoint(&s(&session_row(&r), "console_endpoint")));
+    let rel = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&rel));
+    let row = session_row(&r);
+    assert_eq!(row.get("console_endpoint"), Some(&PyValue::Null), "{}", j(&row));
+}
+
+/// 07 Task 12 `telnet_listener_ephemeral_per_bridge`（Linux 可驗部分）：bridge 重建後 listener 換新 port。
+#[test]
+fn tcp_listener_ephemeral_per_bridge() {
+    let r = ServiceRig::with_console_backend("tcp");
+    let first = s(&session_row(&r), "console_endpoint");
+    assert!(is_loopback_endpoint(&first));
+    let c = r.call("session.clear", r#"{"selector":"COM0"}"#);
+    assert_eq!(c.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&c));
+    let mut second = String::new();
+    wait_for("新 bridge 的端點", || {
+        r.clock.advance(Duration::from_millis(250));
+        let row = session_row(&r);
+        second = s(&row, "console_endpoint");
+        is_loopback_endpoint(&second) && second != first && matches!(s(&row, "state").as_str(), "READY" | "ATTACHED")
+    });
+    let resp = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_eq!(s(&resp, "endpoint"), second);
+}

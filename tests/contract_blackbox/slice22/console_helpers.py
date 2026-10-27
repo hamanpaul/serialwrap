@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import os
 import select
+import socket
 import time
 
 
@@ -37,6 +38,43 @@ def read_until(fd: int, needle: bytes, timeout_s: float) -> bytes:
     deadline = time.monotonic() + timeout_s
     while needle not in out and time.monotonic() < deadline:
         out += read_for(fd, 0.05)
+    return bytes(out)
+
+
+def telnet_connect(endpoint: str) -> socket.socket:
+    """連 `"127.0.0.1:<port>"` 的 Telnet console（非阻塞讀取用 `sock_read_for`）。"""
+    host, port = endpoint.rsplit(":", 1)
+    sock = socket.create_connection((host, int(port)), timeout=3.0)
+    sock.setblocking(False)
+    return sock
+
+
+def sock_read_for(sock: socket.socket, seconds: float) -> bytes:
+    out = bytearray()
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return bytes(out)
+        ready, _, _ = select.select([sock], [], [], remaining)
+        if not ready:
+            continue
+        try:
+            chunk = sock.recv(65536)
+        except BlockingIOError:
+            continue
+        except OSError:
+            return bytes(out)
+        if not chunk:
+            return bytes(out)
+        out += chunk
+
+
+def sock_read_until(sock: socket.socket, needle: bytes, timeout_s: float, buf: bytearray | None = None) -> bytes:
+    out = buf if buf is not None else bytearray()
+    deadline = time.monotonic() + timeout_s
+    while needle not in out and time.monotonic() < deadline:
+        out += sock_read_for(sock, 0.05)
     return bytes(out)
 
 
