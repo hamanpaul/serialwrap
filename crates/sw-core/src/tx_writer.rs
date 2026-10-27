@@ -98,6 +98,8 @@ pub struct FenceState {
     pub input_epoch: u64,
     /// P6 增補 #4（07 D-22）：目前有效的回放授權（`ReplayHold.hold_id`）。
     pub replay_auth: Option<u64>,
+    /// P7 Task 16-wire：SessionCore 發布的 `foreground_busy`（`BridgeQueries::active_cmd_id_for` 不經 actor mailbox 讀取）。
+    pub foreground_busy: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +140,7 @@ impl Fence {
             human_admission_blocked: false,
             input_epoch: 0,
             replay_auth: None,
+            foreground_busy: false,
         })))
     }
 

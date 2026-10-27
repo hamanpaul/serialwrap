@@ -650,3 +650,10 @@ impl EventEngine {
         self.core.log.tail(rule_id, selector, since_ts, n)
     }
 }
+
+/// reader 端 RX 觀察者（Task 16-wire，DF-15）：轉呼 [`EventEngine::feed_rx`]。
+impl crate::uart_bridge::RxObserver for EventEngine {
+    fn on_rx(&self, com: &str, data: &[u8], wal_seq: u64) {
+        self.feed_rx(com, data, wal_seq);
+    }
+}

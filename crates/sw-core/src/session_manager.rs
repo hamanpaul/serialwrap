@@ -247,6 +247,8 @@ struct Shared {
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 以 frozen 建立（驗證 PROBE TX 經 Fence 時零 TX）。
     probe_tx_frozen: AtomicBool,
+    /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
+    rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -1661,7 +1663,8 @@ impl ManagerExec {
             return Err(stopped());
         }
         let epoch = self.shared.epochs.next();
-        let worker = IoWorker::start(
+        let observers = lock(&self.shared.rx_observers).clone();
+        let worker = IoWorker::start_observed(
             handle,
             IoWorkerArgs {
                 com: self.com(),
@@ -1674,6 +1677,7 @@ impl ManagerExec {
                 control: control.clone(),
                 clock: self.shared.clock.clone(),
             },
+            observers,
         );
         Ok(OpenedBridge {
             epoch,
@@ -1892,6 +1896,7 @@ impl SessionManager {
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
+            rx_observers: Mutex::new(Vec::new()),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -2084,6 +2089,11 @@ impl SessionManager {
         sids.iter()
             .filter_map(|sid| self.shared.session_public(sid))
             .collect()
+    }
+
+    /// Python `add_rx_observer`：之後建立的 session bridge reader 依序通知（daemon 於 bootstrap attach 前註冊）。
+    pub fn add_rx_observer(&self, observer: Arc<dyn crate::uart_bridge::RxObserver>) {
+        lock(&self.shared.rx_observers).push(observer);
     }
 
     /// `{by_id, real_path}`，依 by_id 排序。
@@ -2602,5 +2612,36 @@ fn drain_events(
 impl Drop for SessionManager {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Event Engine 查詢（`session_manager.py:1499-1519`）：讀 manager 鏡像與 actor 發布到 fence 的 `foreground_busy`，
+/// 不經 actor mailbox。`active_cmd_id_for` 只回字面 `"foreground"`（EVT-D-E3 KEEP）。
+impl crate::event_engine::BridgeQueries for SessionManager {
+    fn active_cmd_id_for(&self, com: &str) -> Option<String> {
+        let inner = lock(&self.shared.inner);
+        let e = inner.sessions.values().find(|e| e.profile.com == com)?;
+        e.fence
+            .with(|f| f.foreground_busy)
+            .then(|| "foreground".to_string())
+    }
+
+    fn profile_for(&self, com: &str) -> Option<String> {
+        let inner = lock(&self.shared.inner);
+        inner
+            .sessions
+            .values()
+            .find(|e| e.profile.com == com)
+            .map(|e| e.profile.template.profile_name.clone())
+    }
+
+    fn known_coms(&self) -> Vec<String> {
+        let mut coms: Vec<String> = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .map(|e| e.profile.com.clone())
+            .collect();
+        coms.sort();
+        coms
     }
 }

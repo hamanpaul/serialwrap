@@ -79,10 +79,11 @@ fn deferred_methods_return_method_not_found_without_side_effects() {
     let r = ServiceRig::ready_shell();
     let scope = std::fs::read_to_string("../../tests/acceptance/slice21_scope.yaml").unwrap();
     let methods = support::deferred_methods(&scope);
+    // P7 Task 16（08 §0.6 退役清單）：10 個 event.* 移入 served，延後清單隨 yaml 縮小為 console_*／file.*。
     assert_eq!(
         methods.len(),
-        15,
-        "Slice 2.1 延後 15 個 method：{methods:?}"
+        5,
+        "Slice 2.1 延後 method（2.3 起不含 event.*）：{methods:?}"
     );
     for m in methods {
         let before = r.side_effect_fingerprint();

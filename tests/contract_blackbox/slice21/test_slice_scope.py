@@ -33,7 +33,8 @@ def test_deferred_methods(shell_daemon):
 
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
     deferred = [row["method"] for row in scope["deferred_methods"]]
-    assert len(deferred) == 15
+    # P7 Task 16（08 §0.6 退役清單）：event.* 移入 served，deferred 隨 yaml 縮小為 console_*／file.*。
+    assert len(deferred) == 5
     unsupported = [row["method"] for row in scope["unsupported_catalog_methods"]]
     methods = deferred + unsupported
     seq0 = shell_daemon.sw("wal", "current-seq")["seq"]
@@ -44,3 +45,7 @@ def test_deferred_methods(shell_daemon):
         assert r["method"] == method, method
         assert "version" in r, method
     assert shell_daemon.sw("wal", "current-seq")["seq"] == seq0, "延後 method 不得改變 WAL current_seq"
+    # 2.3 承接：event.* 不再回 METHOD_NOT_FOUND。
+    for method in [m for m in scope["served_methods"] if m.startswith("event.")]:
+        r = shell_daemon.rpc(method, {})
+        assert r.get("error_code") != "METHOD_NOT_FOUND", method

@@ -6,7 +6,10 @@ served_methods: [health.ping, health.status, daemon.stop, mcu.patterns, mcu.stat
   session.interactive_open, session.interactive_send, session.interactive_status, session.interactive_close,
   session.log_start, session.log_stop, alias.list, alias.set, alias.assign, alias.unassign, command.submit,
   command.get, command.result_tail, command.cancel, result.tail, log.tail_raw, log.tail_text, wal.range,
-  wal.reset, wal.current_seq]
+  wal.reset, wal.current_seq,
+  # P7 Task 16（08 §0.6 Slice 2.1 閘退役）：10 個 event.* 由 2.3 承接（自 deferred_methods 移入）。
+  event.rule_set, event.rule_delete, event.rule_list, event.rule_get, event.com_enable, event.com_disable,
+  event.com_status, event.reset, event.reload, event.tail]
 deferred_response: {ok: false, error_code: METHOD_NOT_FOUND, keys: [method, version]}
 # P5 Task 0 補記：Rust 方法目錄（rpc_types.rs KNOWN，55 項）＝ served_methods ∪ deferred_methods ∪ unsupported_catalog_methods。
 # daemon.handoff_stop 為 Python 基線服務（sw_core/daemon.py）但不屬 2.1 served／deferred 兩表；歸屬 P1-T8／P8-T14（SC-11 原子交接，2.4）。
@@ -17,16 +20,6 @@ deferred_methods:
   - {method: session.console_attach, slice: "2.2"}
   - {method: session.console_detach, slice: "2.2"}
   - {method: session.console_list, slice: "2.2"}
-  - {method: event.rule_set, slice: "2.3"}
-  - {method: event.rule_delete, slice: "2.3"}
-  - {method: event.rule_list, slice: "2.3"}
-  - {method: event.rule_get, slice: "2.3"}
-  - {method: event.com_enable, slice: "2.3"}
-  - {method: event.com_disable, slice: "2.3"}
-  - {method: event.com_status, slice: "2.3"}
-  - {method: event.reset, slice: "2.3"}
-  - {method: event.reload, slice: "2.3"}
-  - {method: event.tail, slice: "2.3"}
   - {method: file.push, slice: "2.4"}
   - {method: file.pull, slice: "2.4"}
 unsupported_profile_features: []       # 2.3 承接（P7 Task 3 退役 Slice 2.1 能力閘：post_login_cmd、console_unlock_env 改走全平台 Login FSM）

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sw_core::arbiter::CommandRegistry;
+use sw_core::event_engine::{EngineDeps, EventEngine};
 use sw_core::session_manager::{ManagerDeps, PersistObserver, SessionManager};
 use sw_core::state_store::{load_state_with_warn, StateStore};
 use sw_core::wal::{WalConfig, WalWriter};
@@ -56,6 +57,9 @@ const ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE: &str = "SERIALWRAP_TEST_PAUSE_BEFORE_R
 const SERVER_STOP_BUDGET: Duration = Duration::from_secs(10);
 /// drain 全部 session 的共用期限（Python `shutdown_drain(total_timeout_s=5.0)`）。
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+/// Python `EngineDeps` 預設（`engine.py`）：matcher 佇列上限與 per-daemon handler 上限。
+const ENGINE_QUEUE_MAX: usize = 1024;
+const ENGINE_PER_DAEMON_MAX: usize = 8;
 /// DeviceWatcher 輪詢間隔（Python `DeviceWatcher(interval_s=1.0)`）。
 const WATCHER_POLL: Duration = Duration::from_secs(1);
 /// `parse_args` 以此 exit code 表示 `-h`（help 寫 stdout、exit 0）。
@@ -1037,6 +1041,37 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     stage0.kill_after_save(false);
     manager.set_persist_observer(stage0);
 
+    // P7 Task 16-wire：Event Engine（Python `SerialwrapService.__init__`／`start`）：engine.start → 註冊 RX observer →
+    // initial scan／bootstrap（engine 先於 bootstrap attach，parity #121）。
+    let p = Arc::new(p);
+    let engine = EventEngine::new(EngineDeps {
+        events_dir: PathBuf::from(&dirs.events_dir),
+        runtime_dir: PathBuf::from(&dirs.events_runtime_dir),
+        log_path: PathBuf::from(&dirs.events_log_path),
+        bridge: manager.clone(),
+        queue_max: ENGINE_QUEUE_MAX,
+        per_daemon_max: ENGINE_PER_DAEMON_MAX,
+        platform: p.clone(),
+        warn: warn.clone(),
+    })
+    .map_err(|e| e.py_message)
+    .and_then(|e| {
+        let e = Arc::new(e);
+        e.start().map(|()| e).map_err(|err| err.message)
+    });
+    let engine = match engine {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{msg}");
+            manager.begin_shutdown();
+            let _ = manager.shutdown(DRAIN_BUDGET);
+            let _ = wal.shutdown();
+            lock.release();
+            return 1;
+        }
+    };
+    manager.add_rx_observer(engine.clone());
+
     let mut src = (p.devices)(DeviceSelection {
         by_id_dir: PathBuf::from(&dirs.by_id_dir),
         by_path_dir: PathBuf::from(&dirs.by_path_dir),
@@ -1064,13 +1099,16 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         test_device_allowlist: allow.enabled.then(|| allow.clone()),
         pid: p.env.pid(),
     }));
+    svc.attach_engine(engine.clone());
     let listener = match p.rpc_listen.bind(&ep, &listen_options(&*p.env)) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("{}", e.py_message);
             manager.begin_shutdown();
             watcher.stop();
+            engine.close_intake();
             let _ = manager.shutdown(DRAIN_BUDGET);
+            engine.stop(std::time::Instant::now());
             let _ = wal.shutdown();
             lock.release();
             return 1;
@@ -1094,6 +1132,9 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     hooks.trace(Stage::ShutdownGate);
     watcher.stop(); // ② 停 watcher（drain 前，避免 drain 中觸發 attach）
     hooks.trace(Stage::WatcherStopped);
+    // ②b 停止受理事件（R1-F2）：matcher 停、dispatcher 不再 spawn；已在跑的 handler 與 drain 並行。
+    engine.close_intake();
+    let drain_deadline = std::time::Instant::now() + DRAIN_BUDGET;
     let before: HashMap<String, Option<String>> = registry.error_codes().into_iter().collect();
     let drained = manager.shutdown(DRAIN_BUDGET); // ③ drain 全部 session（含在途 attach）、FLUSHED_BY_SHUTDOWN
     let flushed: Vec<(String, String)> = registry
@@ -1117,6 +1158,14 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
             stalled.join(",")
         );
         incomplete.push(format!("drain stalled: {}", stalled.join(",")));
+    }
+    // ③b event handler 收尾（SC-11 細化）：與 drain 共用 5 s 期限，逾時終止整個 process group／Job。
+    let report = engine.stop(drain_deadline);
+    if !report.unreaped.is_empty() {
+        incomplete.push(format!(
+            "event handlers not reaped: {}",
+            report.unreaped.join(",")
+        ));
     }
     let wal_result = wal.shutdown(); // ④ WAL flush＋sync＋close
     hooks.trace(Stage::WalShutdown { ok: wal_result.is_ok() });

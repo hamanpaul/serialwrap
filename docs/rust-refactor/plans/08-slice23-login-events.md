@@ -2261,6 +2261,8 @@ pub struct ReaderCtx { /* 06 欄位 */ pub observers: Vec<Arc<dyn RxObserver>> }
 impl sw_core::event_engine::BridgeQueries for SessionManager { /* known_coms, profile_for, active_cmd_id_for */ }
 ```
 
+**P7 修訂（實作，2026-10-27）：** 不在 06 `ReaderCtx`／`IoWorkerArgs` 加欄位（P5 測試以 struct literal 建構），改為 `spawn_reader_observed`／`IoWorker::start_observed` 另傳觀察者清單；`SessionManager::add_rx_observer`（Python 同名）於 bootstrap 前註冊、每個 session bridge 的 reader 建立時取快照。`foreground_busy` 由 SessionCore 於每個事件後（值改變時）發布到 `FenceState.foreground_busy`，`BridgeQueries::active_cmd_id_for` 讀 fence 不經 mailbox。CaptureObserver 屬 Task 10，尚未注入。停止序不新增 `EngineCloseIntake`／`EngineStop` trace（P5 `daemon_process` 鎖定停機 trace 末 6 筆），改以行為測試（`event_lifecycle.rs`）驗證；`slice21_scope.yaml` 的 event.* 退役與 06 T18／T20 測試的延後數同步於本 commit。
+
 - [ ] **Step 1：寫失敗測試**
 
 | 測試名（檔） | 精確斷言 |

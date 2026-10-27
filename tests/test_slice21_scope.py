@@ -15,12 +15,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCOPE = ROOT / "tests" / "acceptance" / "slice21_scope.yaml"
 LIMITS = ROOT / "contracts" / "resource_limits.yaml"
 
+# P7 Task 16（08 §0.6 退役清單）：10 個 event.* 自 deferred_methods 移入 served_methods（2.3 承接）。
 DEFERRED = {
     "session.console_attach": "2.2", "session.console_detach": "2.2", "session.console_list": "2.2",
-    "event.rule_set": "2.3", "event.rule_delete": "2.3", "event.rule_list": "2.3", "event.rule_get": "2.3",
-    "event.com_enable": "2.3", "event.com_disable": "2.3", "event.com_status": "2.3",
-    "event.reset": "2.3", "event.reload": "2.3", "event.tail": "2.3",
     "file.push": "2.4", "file.pull": "2.4",
+}
+EVENT_METHODS = {
+    "event.rule_set", "event.rule_delete", "event.rule_list", "event.rule_get", "event.com_enable",
+    "event.com_disable", "event.com_status", "event.reset", "event.reload", "event.tail",
 }
 
 
@@ -34,8 +36,9 @@ def test_scope_lists_exact_deferred_methods():
 def test_scope_served_methods_cover_rpc_catalog():
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
     served = set(scope["served_methods"])
-    assert len(served) == 39
+    assert len(served) == 49
     assert served.isdisjoint(DEFERRED)
+    assert EVENT_METHODS <= served
     assert {"health.ping", "health.status", "daemon.stop", "command.submit", "device.release",
             "device.attach", "session.recover", "log.tail_raw", "wal.range", "mcu.status"} <= served
 

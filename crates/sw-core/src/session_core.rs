@@ -286,6 +286,8 @@ pub struct PublicCtx {
 /// sans-IO session 狀態機（05 §1.6 `SessionRuntime` 對應；bridge 物件改為 `conn_epoch`）。
 pub struct SessionCore {
     profile: SessionProfile,
+    /// 最近一次發布到 fence 的 `foreground_busy`（P7 Task 16-wire）。
+    published_foreground_busy: bool,
     sid: String,
     profile_source: String,
     deps: CoreDeps,
@@ -465,6 +467,7 @@ impl SessionCore {
         let sid = format!("{}:{}", profile.template.profile_name, profile.com);
         SessionCore {
             profile,
+            published_foreground_busy: false,
             sid,
             profile_source: profile_source.to_string(),
             deps,
@@ -679,6 +682,12 @@ impl SessionCore {
             }
         }
         effects.0.extend(self.poll_force_recover(now));
+        // P7 Task 16-wire：發布 foreground_busy 供 `BridgeQueries::active_cmd_id_for`（不經 actor mailbox）。
+        let busy = self.foreground.is_some();
+        if busy != self.published_foreground_busy {
+            self.published_foreground_busy = busy;
+            self.deps.fence.with(|f| f.foreground_busy = busy);
+        }
         effects
     }
 

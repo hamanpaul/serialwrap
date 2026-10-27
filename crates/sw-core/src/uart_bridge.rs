@@ -370,12 +370,24 @@ pub fn spawn_reader(
     ctx: ReaderCtx,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<ReaderExit> {
+    spawn_reader_observed(reader, ctx, stop, Vec::new())
+}
+
+/// 同 [`spawn_reader`]，另帶 RX 觀察者（P7 Task 16-wire，DF-15）：每個 chunk 在 WAL append 之後依序以該 chunk 的
+/// `WalAppend.seq` 呼叫；清單於 reader 建立時固定（熱路徑不加鎖）。
+pub fn spawn_reader_observed(
+    reader: Box<dyn SerialReader>,
+    ctx: ReaderCtx,
+    stop: Arc<AtomicBool>,
+    observers: Vec<Arc<dyn RxObserver>>,
+) -> std::thread::JoinHandle<ReaderExit> {
     spawn_reader_inner(
         reader,
         ctx,
         stop,
         None,
         Arc::new(|line| eprintln!("{line}")),
+        observers,
     )
 }
 
@@ -387,7 +399,14 @@ pub fn spawn_reader_with_test_hooks(
     after_rx_append: Arc<dyn Fn() + Send + Sync>,
     warning_sink: Arc<dyn Fn(&str) + Send + Sync>,
 ) -> std::thread::JoinHandle<ReaderExit> {
-    spawn_reader_inner(reader, ctx, stop, Some(after_rx_append), warning_sink)
+    spawn_reader_inner(
+        reader,
+        ctx,
+        stop,
+        Some(after_rx_append),
+        warning_sink,
+        Vec::new(),
+    )
 }
 
 fn spawn_reader_inner(
@@ -396,6 +415,7 @@ fn spawn_reader_inner(
     stop: Arc<AtomicBool>,
     after_rx_append: Option<Arc<dyn Fn() + Send + Sync>>,
     warning_sink: Arc<dyn Fn(&str) + Send + Sync>,
+    observers: Vec<Arc<dyn RxObserver>>,
 ) -> std::thread::JoinHandle<ReaderExit> {
     std::thread::Builder::new()
         .name(format!("serialwrap-rx-{}-{}", ctx.com, ctx.epoch))
@@ -443,6 +463,12 @@ fn spawn_reader_inner(
                                         error: PalError::plain(PalErrorKind::Io, message),
                                     });
                                 }
+                            }
+                            // DF-15：WAL append 之後依序通知觀察者（Python `_on_bridge_rx`：例外一律吞掉）。
+                            for obs in &observers {
+                                let _ = catch_unwind(AssertUnwindSafe(|| {
+                                    obs.on_rx(&ctx.com, data, wal_entry.seq)
+                                }));
                             }
                             let now = ctx.clock.mono_ns();
                             rx_seq = rx_seq.saturating_add(1);
@@ -582,10 +608,19 @@ pub struct WorkerSnapshot {
 
 impl IoWorker {
     pub fn start(handle: Box<dyn SerialHandle>, args: IoWorkerArgs) -> IoWorker {
+        IoWorker::start_observed(handle, args, Vec::new())
+    }
+
+    /// 同 [`IoWorker::start`]，reader 另帶 RX 觀察者（P7 Task 16-wire）。
+    pub fn start_observed(
+        handle: Box<dyn SerialHandle>,
+        args: IoWorkerArgs,
+        observers: Vec<Arc<dyn RxObserver>>,
+    ) -> IoWorker {
         let (reader, writer, waker, close) = handle.split();
         let cancel = CancelToken::new(waker.clone());
         let reader_stop = Arc::new(AtomicBool::new(false));
-        let reader = spawn_reader(
+        let reader = spawn_reader_observed(
             reader,
             ReaderCtx {
                 com: args.com.clone(),
@@ -598,6 +633,7 @@ impl IoWorker {
                 clock: args.clock,
             },
             reader_stop.clone(),
+            observers,
         );
         let wal = args.wal.clone();
         let epoch = args.epoch;
@@ -818,7 +854,7 @@ impl RxShared {
 }
 
 /// reader 在 WAL append 後依序呼叫的 RX 觀察者（DF-15）；不得阻塞於跨 thread 等待、不得回呼 SessionManager。
-/// `ReaderCtx.observers` 欄位隨 Task 16-wire 接線時加入（Task 0 不改 06 `ReaderCtx`）。
+/// 經 [`spawn_reader_observed`]／[`IoWorker::start_observed`] 傳入（06 `ReaderCtx` 欄位不變）。
 pub trait RxObserver: Send + Sync {
     fn on_rx(&self, com: &str, data: &[u8], wal_seq: u64);
 }
