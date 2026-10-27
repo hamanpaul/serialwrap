@@ -55,6 +55,14 @@ fn human_txs(effects: &[Effect]) -> Vec<(TxClass, String, Vec<u8>)> {
         .collect()
 }
 
+/// 比照 reader：先寫入 RX 視窗（`RxShared::append`）再送 `UartRxChunk`。
+fn feed_rx(h: &mut CoreHarness, bytes: &[u8]) -> Vec<Effect> {
+    let epoch = h.epoch();
+    let now = h.clock.mono_ns();
+    h.rx.append(bytes, now, epoch, 0);
+    h.rx(bytes)
+}
+
 fn ready() -> CoreHarness {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
@@ -245,7 +253,7 @@ fn open_state_matrix() {
 fn attached_unhealthy_not_ready() {
     for case in ["running", "serial_alive", "vtty_alive"] {
         let mut h = attached(BOOT);
-        h.rx(b"\r\n=> ");
+        feed_rx(&mut h, b"\r\n=> ");
         h.set_bridge_health(case != "running", case != "serial_alive", case != "vtty_alive");
         let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
         assert_eq!(wire(&r), r#"{"ok":false,"error_code":"SESSION_NOT_READY","selector":"COM0"}"#, "{case}");
@@ -255,7 +263,7 @@ fn attached_unhealthy_not_ready() {
 #[test]
 fn attached_bootloader_prompt() {
     let mut h = attached(BOOT);
-    h.rx(b"U-Boot 2020\r\n=> ");
+    feed_rx(&mut h, b"U-Boot 2020\r\n=> ");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     let keys: Vec<&str> = r.0.keys().map(String::as_str).collect();
     assert_eq!(keys, vec!["ok", "interactive_id", "session", "recovery_mode"]);
@@ -265,7 +273,7 @@ fn attached_bootloader_prompt() {
 #[test]
 fn attached_banner_boot_interrupt() {
     let mut h = attached(BOOT);
-    h.rx(b"Hit any key to stop autoboot:  3");
+    feed_rx(&mut h, b"Hit any key to stop autoboot:  3");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     assert_eq!(r.get("boot_interrupt"), Some(&true.into()));
     assert!(r.get("login_required").is_none());
@@ -274,7 +282,7 @@ fn attached_banner_boot_interrupt() {
 #[test]
 fn attached_login_required() {
     let mut h = attached(BOOT);
-    h.rx(b"\x1b[1m(none) login:\x1b[0m ");
+    feed_rx(&mut h, b"\x1b[1m(none) login:\x1b[0m ");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     assert_eq!(r.get("login_required"), Some(&true.into()));
     assert!(r.get("boot_interrupt").is_none());
@@ -283,7 +291,7 @@ fn attached_login_required() {
 #[test]
 fn attached_bootloader_priority_over_login() {
     let mut h = attached(BOOT);
-    h.rx(b"login: \r\n=> ");
+    feed_rx(&mut h, b"login: \r\n=> ");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     assert_eq!(r.get("ok"), Some(&true.into()));
     assert!(r.get("login_required").is_none());
@@ -292,7 +300,7 @@ fn attached_bootloader_priority_over_login() {
 #[test]
 fn attached_banner_priority_over_login() {
     let mut h = attached(BOOT);
-    h.rx(b"Hit any key to stop autoboot:  1\r\nlogin: ");
+    feed_rx(&mut h, b"Hit any key to stop autoboot:  1\r\nlogin: ");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     assert_eq!(r.get("boot_interrupt"), Some(&true.into()));
     assert!(r.get("login_required").is_none());
@@ -301,7 +309,7 @@ fn attached_banner_priority_over_login() {
 #[test]
 fn attached_not_bootloader() {
     let mut h = attached(BOOT);
-    h.rx(b"random text");
+    feed_rx(&mut h, b"random text");
     let before = h.tx_effect_count();
     let r = h.rpc(open_req("agent", 60.0, "help", true)).unwrap();
     assert_eq!(
@@ -314,7 +322,7 @@ fn attached_not_bootloader() {
 #[test]
 fn attached_fallback_prompts_not_used() {
     let mut h = attached(BOOT_NO_PROMPTS);
-    h.rx(b"\r\n=> ");
+    feed_rx(&mut h, b"\r\n=> ");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     assert_eq!(r.get("error_detail"), Some(&"NOT_BOOTLOADER".into()));
 }
@@ -322,7 +330,7 @@ fn attached_fallback_prompts_not_used() {
 #[test]
 fn recovery_lease_timeout_clamped() {
     let mut h = attached(BOOT);
-    h.rx(b"\r\n=> ");
+    feed_rx(&mut h, b"\r\n=> ");
     h.rpc(open_req("agent", 500.0, "", true)).unwrap();
     assert_eq!(h.core.active_lease().unwrap().timeout_s, 120.0);
 }
@@ -330,7 +338,7 @@ fn recovery_lease_timeout_clamped() {
 #[test]
 fn recovery_small_timeout_passthrough() {
     let mut h = attached(BOOT);
-    h.rx(b"\r\n=> ");
+    feed_rx(&mut h, b"\r\n=> ");
     h.rpc(open_req("agent", 30.0, "", true)).unwrap();
     assert_eq!(h.core.active_lease().unwrap().timeout_s, 30.0);
 }
@@ -348,7 +356,7 @@ fn attached_stashes_human_lease() {
     let mut h = attached(BOOT);
     let a = h.attach_pty_console("c1", true);
     let hid = sv(a.get("interactive_session_id").unwrap());
-    h.rx(b"Hit any key to stop autoboot:  3");
+    feed_rx(&mut h, b"Hit any key to stop autoboot:  3");
     let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
     assert_eq!(r.get("ok"), Some(&true.into()));
     let lease = h.core.active_lease().unwrap();
@@ -360,7 +368,7 @@ fn attached_stashes_human_lease() {
 #[test]
 fn attached_existing_agent_busy() {
     let mut h = attached(BOOT);
-    h.rx(b"\r\n=> ");
+    feed_rx(&mut h, b"\r\n=> ");
     let id0 = iid(&h.rpc(open_req("agent", 60.0, "", true)).unwrap());
     let r = h.rpc(open_req("agent:b", 60.0, "", true)).unwrap();
     assert_eq!(
@@ -495,7 +503,7 @@ fn send_invalid_encoding_after_busy_check() {
 #[test]
 fn send_allowed_in_attached() {
     let mut h = attached(BOOT);
-    h.rx(b"\r\n=> ");
+    feed_rx(&mut h, b"\r\n=> ");
     let id = iid(&h.rpc(open_req("agent", 60.0, "", true)).unwrap());
     let (r, _) = send_ok(&mut h, &id, "ab", "plain");
     assert_eq!(r.get("ok"), Some(&true.into()));
@@ -507,7 +515,7 @@ fn send_allowed_in_attached() {
 fn status_shape_and_touch() {
     let mut h = ready();
     let id = iid(&h.rpc(open_req("agent", 60.0, "", false)).unwrap());
-    h.rx(b"0123456789abcdef");
+    feed_rx(&mut h, b"0123456789abcdef");
     h.clock.advance(Duration::from_secs(5));
     let r = h.rpc(status_req(&id, 10)).unwrap();
     let keys: Vec<&str> = r.0.keys().map(String::as_str).collect();
@@ -520,7 +528,7 @@ fn status_shape_and_touch() {
 fn status_screen_chars_negative() {
     let mut h = ready();
     let id = iid(&h.rpc(open_req("agent", 60.0, "", false)).unwrap());
-    h.rx(b"abcdef");
+    feed_rx(&mut h, b"abcdef");
     let r = h.rpc(status_req(&id, -3)).unwrap();
     assert_eq!(r.get("screen"), Some(&"def".into()));
 }
@@ -529,7 +537,7 @@ fn status_screen_chars_negative() {
 fn status_expired_closes_restores() {
     let mut h = attached(BOOT);
     h.attach_pty_console("c1", true);
-    h.rx(b"Hit any key to stop autoboot:  3");
+    feed_rx(&mut h, b"Hit any key to stop autoboot:  3");
     let id = iid(&h.rpc(open_req("agent", 1.0, "", true)).unwrap());
     h.input("c1", b"k");
     h.clock.advance(Duration::from_millis(1500));
@@ -683,7 +691,7 @@ fn attached_rescue_open_mid_replay_redefers() {
     let mut h = attached(BOOT);
     h.set_auto_complete_human_tx(false);
     h.attach_pty_console("c1", true);
-    h.rx(b"Hit any key to stop autoboot:  3");
+    feed_rx(&mut h, b"Hit any key to stop autoboot:  3");
     let a = iid(&h.rpc(open_req("agent", 60.0, "", true)).unwrap());
     h.input("c1", b"k");
     h.rpc(close_req(&a)).unwrap(); // stash 還原 → 回放 k（hold h，未結算）
@@ -741,10 +749,13 @@ fn peer_gone_past_grace_tears_down() {
 #[test]
 fn refresh_closes_when_owner_mismatch() {
     let mut h = ready();
-    h.attach_pty_console("c1", true);
+    let r = h.attach_pty_console("c1", true);
+    let old = sv(r.get("interactive_session_id").unwrap());
     h.core.human_console_mut().ownership.interactive_owner = Some("human:zz".into());
     h.scan(Some(&["/dev/pts/101"]));
-    assert!(h.core.active_lease().is_none());
+    // refresh 關閉舊 lease（owner 不符）；同一次掃描的 self-heal 可能再授予 primary 新 lease（id 不同）。
+    assert!(h.lease_index_ops().contains(&LeaseIndexOp::Remove { interactive_id: old.clone() }));
+    assert!(h.core.active_lease().is_none_or(|l| l.interactive_id != old));
 }
 
 #[test]
@@ -839,7 +850,7 @@ fn cmd_interactive_mode_opens_lease() {
     finish_op(&mut h, &grant, OpOutcome::Sent { bytes: 4 });
     let row = h.reg.get(&cmd_id).unwrap();
     assert_eq!(row["execution_mode"], PyValue::from("interactive"));
-    assert_eq!(row["status"], PyValue::from("done"));
+    assert_eq!(row["status"], PyValue::from("interactive"), "arbiter：result status interactive 寫回紀錄");
 }
 
 #[test]
@@ -885,4 +896,64 @@ fn lease_context_shapes_in_core() {
         r#"{"interactive_owner":"human:c1","human_attached":true,"human_active":true,"recovery_mode":false}"#
     );
     let _ = pydict! {};
+}
+
+// ---------------------------------------------------------------- console_detach／console_list（`session_manager.py:6775-6804`）
+
+#[test]
+fn console_detach_closes_human_lease() {
+    let mut h = ready();
+    h.attach_pty_console("c1", true);
+    let (r, fx) = h.rpc_full(SessionRequest::ConsoleDetach { client_id: "c1".into() });
+    let r = r.unwrap();
+    let keys: Vec<&str> = r.0.keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["ok", "client_id", "session"]);
+    assert!(fx.iter().any(|e| matches!(e, Effect::ConsoleClose { client_id } if client_id == "c1")));
+    assert!(h.core.active_lease().is_none());
+    assert!(!h.core.human_console().consoles.contains_key("c1"));
+    assert_eq!(h.core.human_console().ownership.interactive_owner, None);
+    assert_eq!(h.core.human_console().vtty_cache, None, "vtty 隨 primary 重算（無 console → None）");
+}
+
+#[test]
+fn console_detach_unknown() {
+    let mut h = ready();
+    let r = h.rpc(SessionRequest::ConsoleDetach { client_id: "zz".into() }).unwrap();
+    assert_eq!(wire(&r), r#"{"ok":false,"error_code":"CONSOLE_NOT_FOUND","client_id":"zz"}"#);
+}
+
+#[test]
+fn console_ops_without_bridge_not_ready() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    for req in [SessionRequest::ConsoleDetach { client_id: "c1".into() }, SessionRequest::ConsoleList] {
+        let r = h.rpc(req).unwrap();
+        assert_eq!(wire(&r), r#"{"ok":false,"error_code":"SESSION_NOT_READY","selector":"COM0"}"#);
+    }
+}
+
+#[test]
+fn console_list_shape_sorted_and_prunes_stale() {
+    let mut h = ready();
+    h.attach_pty_console("c1", true); // primary、raw owner
+    h.attach_pty_console("c2", false); // 無 peer
+    h.connect_stream_console("t9", ConsoleTransportKind::TcpTelnet);
+    h.clock.advance(Duration::from_millis(2100)); // 超過 STALE_CONSOLE_GRACE_S
+    let (r, fx) = h.rpc_full(SessionRequest::ConsoleList);
+    let r = r.unwrap();
+    let keys: Vec<&str> = r.0.keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["ok", "consoles", "session"]);
+    let PyValue::List(rows) = r.get("consoles").unwrap() else { panic!("consoles 應為 list") };
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|row| match row {
+            PyValue::Dict(d) => sv(d.get("client_id").unwrap()),
+            _ => panic!(),
+        })
+        .collect();
+    // c2 無 peer 且已過 grace → prune；依 (label, client_id) 排序（label 預設為 client_id／TCP peer）
+    // t9 的 label 為 TCP peer "127.0.0.1:…"，排序在 "c1" 之前
+    assert_eq!(ids, vec!["t9".to_string(), "c1".to_string()]);
+    assert!(fx.iter().any(|e| matches!(e, Effect::ConsoleClose { client_id } if client_id == "c2")));
+    let PyValue::Dict(c1) = &rows[1] else { panic!() };
+    assert_eq!(wire(c1), r#"{"client_id":"c1","label":"c1","vtty":"/dev/pts/101","interactive_owner":true}"#);
 }
