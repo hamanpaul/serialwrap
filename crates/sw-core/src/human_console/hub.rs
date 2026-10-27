@@ -262,8 +262,20 @@ pub fn spawn_hub(
     clock: Arc<dyn Clock>,
     input_epoch: Arc<AtomicU64>,
 ) -> HubHandle {
-    let factory = Arc::clone(&platform.console);
-    let mux = factory.new_mux().expect("ConsoleMux 建立失敗");
+    spawn_hub_with(com, Arc::clone(&platform.console), control, data, clock, input_epoch)
+        .expect("ConsoleMux 建立失敗")
+}
+
+/// 同 `spawn_hub`，直接取 console 工廠；`new_mux` 失敗（例如 Windows WSAPoll 尚未實作，LOCAL-WINDOWS-TODO）回 `Err`。
+pub fn spawn_hub_with(
+    com: String,
+    factory: Arc<dyn sw_pal::console_pty::ConsoleTransportFactory>,
+    control: ControlSender,
+    data: DataSender,
+    clock: Arc<dyn Clock>,
+    input_epoch: Arc<AtomicU64>,
+) -> sw_pal::traits::PalResult<HubHandle> {
+    let mux = factory.new_mux()?;
     let waker = mux.waker();
     let (cmd_tx, cmd_rx) = bounded::<HubCmd>(CONSOLE_HUB_CTRL_QUEUE);
     let (rx_tx, rx_rx) = bounded::<Arc<[u8]>>(CONSOLE_HUB_RX_QUEUE);
@@ -301,7 +313,7 @@ pub fn spawn_hub(
         .name(format!("serialwrap-console-{com}"))
         .spawn(move || hub.run())
         .expect("建立 ConsoleHub thread");
-    HubHandle {
+    Ok(HubHandle {
         cmd: cmd_tx,
         rx: rx_tx,
         critical,
@@ -309,7 +321,7 @@ pub fn spawn_hub(
         status,
         input_epoch,
         join: Mutex::new(Some(join)),
-    }
+    })
 }
 
 fn secs_ns(s: f64) -> u64 {

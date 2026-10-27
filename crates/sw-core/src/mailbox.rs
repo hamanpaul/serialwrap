@@ -105,8 +105,6 @@ pub enum ControlEvent {
     ConsoleScan { scan: ConsoleScanSnapshot, source: ScanSource },
     /// P6 增補 #8（07 D-15(5)）：human TX pump 的結算。
     HumanTxCompleted { tag: HumanTxTag, report: TxReport },
-    /// P6 增補 #8（07 Task 10）：actor 層 envelope；`PtyPair` 由 executor 保管，不進 `SessionCore`。
-    ConsoleAttachReq { label: Option<String>, pty: Option<sw_pal::PtyPair>, reply: Reply },
 }
 
 /// 到期 timer（`Effect::Schedule` 的內容）。

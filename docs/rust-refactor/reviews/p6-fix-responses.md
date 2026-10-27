@@ -125,3 +125,4 @@ P6 自有 commit 只有 `f97a208`（merge）與 `ac46a0e`；兩份報告皆 NO F
 |---|---|---|---|
 | `begin_stop` 的 `owner_gen += 1` | 07 Step 7／D-02 要求刪除 | 保留 06 世代語意（`owner_gen` 屬 P5 擁有的 fence 世代；human 回放只依 `input_epoch` 判定，frozen 期間 human TX 全拒） | BLOCKED-OWNER：待擁有者簽核是否刪除 |
 | executor 接線與 PumpFull 一格重試槽 | 07 D-15(5) | 產品 executor 尚未存在（06 T15+），`HumanTxPump` 只在測試 `RigExec` 接線；STEP 2 合併 P5 T15～T19 後於 Task 10／11 接上並補重試槽 | 待辦（本輪 STEP 2 追蹤） |
+| `ControlEvent::ConsoleAttachReq` envelope | 07 Task 10 Step 3 第 2 點：RPC thread 以 envelope 送 `PtyPair`，actor 層拆封存 executor `pending_pty` | 改為 manager 端每 session 的 `SessionIo.pending_pty`（RPC thread 插入 token→PtyPair，再送 `SessionRequest::ConsoleAttach{pty: Some(PtyInfo)}`；executor 依 `ConsoleAdopt`／`ConsoleDiscard` 取走或丟棄，request 失敗時 RPC thread 丟棄殘留），移除 envelope 變體。core 只見 `PtyInfo` 與計畫一致；fd 不洩漏由 `attach_rejected_discards_pty` 鎖住 | 待審查簽核 |

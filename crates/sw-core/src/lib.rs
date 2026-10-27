@@ -11,8 +11,8 @@ macro_rules! s21_todo {
 /// `Clock::mono_ns()` 的單位（納秒）。
 pub type Mono = u64;
 
-/// Slice 2.1 識別字串。
-pub const SLICE: &str = "2.1";
+/// 目前交付的切片識別字串（P6 Task 10：Slice 2.2 承接 console RPC，增補 #24）。
+pub const SLICE: &str = "2.2";
 
 pub mod actor;
 pub mod alias_registry;

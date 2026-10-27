@@ -750,8 +750,6 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
             }
-            // actor 層 envelope（`PtyPair` 不進 core）；拆封由 07 Task 10 的 executor 負責。
-            MailboxItem::Control(ControlEvent::ConsoleAttachReq { .. }) => todo!("P6 Task 10"),
         }
         if std::mem::take(&mut self.hold_release_kick) && !self.foreground_busy() {
             effects.0.extend(self.start_next(now));

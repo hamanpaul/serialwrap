@@ -1,4 +1,4 @@
-//! RPC 分派器（arch §6.3，P5-T18）：39 個 served method 的平面 `match`；15 個延後 method 落入 `METHOD_NOT_FOUND`。
+//! RPC 分派器（arch §6.3，P5-T18）：平面 `match`；Slice 2.2 承接 console 三個 method（P6 Task 10），其餘延後 method 落入 `METHOD_NOT_FOUND`。
 //!
 //! 對照 Python `sw_core/service.py` 的 `SerialwrapService.rpc()`／`_dispatch()`：
 //! - 分支順序與 `_dispatch` 相同；每個分支的參數轉型逐行照 Python（`str(x or d)`、`int(x or d)`、`float(x or d)`、
@@ -412,6 +412,35 @@ impl Service {
                 }
                 self.route(&selector, SessionRequest::SessionAttach, LONG_ROUTE_TIMEOUT)
             }
+            // P6 Task 10：console 方法（service.py:1071-1089）；查無 selector 回 SESSION_NOT_READY{selector}。
+            "session.console_attach" => {
+                let selector = selector_chain(&p);
+                // `str(label) if label else None`
+                let label = p
+                    .truthy("label")
+                    .then(|| p.raw("label").map(sw_proto::pyfmt::py_str))
+                    .flatten();
+                if selector.is_empty() {
+                    return Ok(invalid_args());
+                }
+                self.manager.console_attach(&selector, label, ROUTE_TIMEOUT)
+            }
+            "session.console_detach" => {
+                let selector = selector_chain(&p);
+                let client_id = p.str_or("client_id", "")?;
+                if selector.is_empty() || client_id.is_empty() {
+                    return Ok(invalid_args());
+                }
+                self.manager
+                    .console_request(&selector, SessionRequest::ConsoleDetach { client_id }, ROUTE_TIMEOUT)
+            }
+            "session.console_list" => {
+                let selector = selector_chain(&p);
+                if selector.is_empty() {
+                    return Ok(invalid_args());
+                }
+                self.manager.console_request(&selector, SessionRequest::ConsoleList, ROUTE_TIMEOUT)
+            }
             "session.interactive_open" => {
                 let selector = selector_chain(&p);
                 let owner = p.str_or("owner", "agent")?;
@@ -420,6 +449,10 @@ impl Service {
                 let allow_attached = p.truthy("allow_attached");
                 if selector.is_empty() {
                     return Ok(invalid_args());
+                }
+                if self.manager.resolve(&selector).is_none() {
+                    // `interactive_open`：`get_session(selector)` 為 None → SESSION_NOT_READY（session_manager.py:6820）。
+                    return Ok(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY", "selector" => selector });
                 }
                 self.route(
                     &selector,

@@ -78,11 +78,11 @@ fn submit_blocking(r: &ServiceRig) -> String {
 fn deferred_methods_return_method_not_found_without_side_effects() {
     let r = ServiceRig::ready_shell();
     let scope = std::fs::read_to_string("../../tests/acceptance/slice21_scope.yaml").unwrap();
-    let methods = support::deferred_methods(&scope, &["2.1"]); // P6 #186 簽章：Slice 2.1 已交付
+    let methods = support::deferred_methods(&scope, &["2.1", sw_core::SLICE]); // 增補 #24：已交付切片之後的延後 method
     assert_eq!(
         methods.len(),
-        15,
-        "Slice 2.1 延後 15 個 method：{methods:?}"
+        12,
+        "Slice 2.2 承接 console 3 個後，仍延後 12 個 method（event 10＋file 2）：{methods:?}"
     );
     for m in methods {
         let before = r.side_effect_fingerprint();
