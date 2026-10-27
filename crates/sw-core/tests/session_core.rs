@@ -1740,3 +1740,39 @@ fn clear_without_bridge_without_device_stays_detached_cleared() {
     assert_eq!(pget(&s, "last_error"), PyValue::from("CLEARED"));
     assert!(!has_reattach(&effs) && !has_open_bridge(&effs));
 }
+
+#[test]
+fn boot_quiet_survives_clear_drain_and_blocks_reattach_probe() {
+    // 審查 F63（High，73634db）：Python `boot_quiet_until`／`ready_reconfirm_pending` 掛在 SessionRuntime，
+    // drain 收尾（`_complete_drain` 只呼叫 `reset_reprobe_progress`）不清；新 bridge 由 `_push_tx_gate` 帶回 quiet。
+    // 具體輸入：READY shell session 收 `U-Boot 2024.01` → quiet armed → `session.clear` → 重新 attach。
+    // Python：重新 attach 期間 `boot_quiet_remaining_s` 非 null、不送登入 probe（ATTACHED＋PROMPT_UNAVAILABLE）。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.rx(b"U-Boot 2024.01\r\n");
+    assert_ne!(pget(&h.public(), "boot_quiet_remaining_s"), PyValue::Null);
+    let (_rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    let (ep, stop) = h.pending_stop();
+    h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert_ne!(
+        pget(&h.public(), "boot_quiet_remaining_s"),
+        PyValue::Null,
+        "drain 不得清 boot quiet（manager 再解析以此判斷不偵測）"
+    );
+    assert_eq!(pget(&h.public(), "ready_reconfirm_pending"), PyValue::Bool(true));
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    assert!(
+        !effs.iter().any(|e| matches!(
+            e,
+            Effect::StartLogin { plan, .. } if !matches!(plan, sw_core::login_fsm::LoginPlan::None)
+        )),
+        "quiet 中重新 attach 不得送登入 probe"
+    );
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+    assert!(h.fence.with(|f| f.quiet_active), "新 bridge 的 TX fence 須帶回 quiet");
+}

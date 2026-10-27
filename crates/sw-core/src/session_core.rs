@@ -2268,17 +2268,35 @@ impl SessionCore {
         self.vtty = vtty;
         self.attached_real_path = Some(real_path.clone());
         self.known_real_path = Some(real_path.clone());
+        if self.is_passthrough() {
+            // Python `reset_passthrough_boot_gate`：passthrough 重掛清前一 profile 留下的 quiet／READY gate。
+            self.quiet = QuietState::default();
+        }
+        let quiet_on = self.quiet.quiet_active(now);
+        let reconfirm = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.active_epoch = Some(epoch);
             f.fsm_gen = self.generations.fsm_gen;
             f.owner_gen = self.generations.owner_gen;
             f.frozen = false;
+            // Python `_push_tx_gate`：新 bridge 帶回 session 的 quiet 與 reconfirm 狀態（審查 F63）。
+            f.quiet_active = quiet_on;
+            f.reconfirm_pending = reconfirm;
         });
         let mut effects = vec![Effect::AdoptBridge {
             epoch,
             worker,
             real_path,
         }];
+        if quiet_on {
+            effects.push(Effect::Schedule {
+                at: self.quiet.boot_quiet_until,
+                ev: TimerEvent::BootQuietExpired {
+                    epoch,
+                    fsm_gen: self.generations.fsm_gen,
+                },
+            });
+        }
 
         if self.is_passthrough() || !self.profile.template.command_capable() {
             self.set_last_error(None, None);
@@ -2859,7 +2877,8 @@ impl SessionCore {
         self.queue = SessionQueue::new();
         self.clear_interactive();
         self.detach_captures();
-        self.quiet = QuietState::default();
+        // boot quiet／reconfirm 掛在 session 而非 bridge（Python `SessionRuntime.boot_quiet_until`；`_complete_drain`
+        // 只 `reset_reprobe_progress`）：drain 不清，新 bridge adopt 時再推回 fence（審查 F63）。
         self.login_run = None;
         self.foreground_reboot = false;
         self.deps.fence.with(|f| {
