@@ -616,6 +616,19 @@ fn allowlist_rejected_reasons_exact() {
         out.stderr,
         "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: not an isolated instance: SERIALWRAP_RUN_DIR equals default\n"
     );
+    // (2b) 審查 F79：Python `_isolation_reason` 先 `.strip()` 再正規化——前後空白的預設路徑同樣判定為預設。
+    let mut vars = env.vars.clone();
+    vars.insert(
+        "SERIALWRAP_RUN_DIR".to_string(),
+        format!("  {} ", default_run.display()),
+    );
+    vars.insert(ALLOWLIST.to_string(), "/x/by-id/a".to_string());
+    let out = run_to_exit(&env, &vars, &[]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert_eq!(
+        out.stderr,
+        "serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: not an isolated instance: SERIALWRAP_RUN_DIR equals default\n"
+    );
 
     // (3) config windows.test_device_allowlist 非 list。
     fs::write(
@@ -697,6 +710,44 @@ fn backend_env_invalid_exit_1() {
     vars.insert("SERIALWRAP_RPC_BACKEND".to_string(), " posix".to_string()); // 不 strip（02 §2.1）
     let out = run_to_exit(&env, &vars, &[]);
     assert_eq!(out.code, Some(1), "{}", out.stderr);
+}
+
+#[test]
+fn backend_env_checked_where_python_selects_it() {
+    // 審查 F78（Medium，3938032）：Python 在第一次用到各後端時才檢查（argparse、SC-19 allowlist、
+    // ensure_runtime_dirs、load_profiles 之後）：DEVICE 於 `no profiles loaded` 之後、LOCK 於 `_build_lock`、
+    // RPC 於 `_build_server`。Rust 原本在 argv 解析前一次檢查三者。
+    let env = isolated_env();
+
+    // (1) RPC 後端非法＋未知參數：Python argparse 先行 → rc 2、usage。
+    let mut vars = env.vars.clone();
+    vars.insert("SERIALWRAP_RPC_BACKEND".to_string(), "bogus".to_string());
+    let out = run_to_exit(&env, &vars, &["--bogus"]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.starts_with("usage: serialwrapd"), "{}", out.stderr);
+
+    // (2) LOCK 後端非法＋非隔離＋allowlist：SC-19 先行 → rc 2、TEST_DEVICE_ALLOWLIST_REJECTED。
+    let mut vars = non_isolated_vars(&env);
+    vars.insert("SERIALWRAP_LOCK_BACKEND".to_string(), "bogus".to_string());
+    vars.insert(ALLOWLIST.to_string(), "/x/by-id/a".to_string());
+    let out = run_to_exit(&env, &vars, &[]);
+    assert_eq!(out.code, Some(2), "{}", out.stderr);
+    assert!(out.stderr.contains("TEST_DEVICE_ALLOWLIST_REJECTED"), "{}", out.stderr);
+
+    // (3) DEVICE 後端非法：目錄已建立、`no profiles loaded` 已印出後才失敗（exit 1）。
+    let env3 = isolated_env();
+    let wal_dir = env3.wal_dir.clone();
+    let _ = fs::remove_dir_all(&wal_dir);
+    let mut vars = env3.vars.clone();
+    vars.insert("SERIALWRAP_DEVICE_BACKEND".to_string(), "bogus".to_string());
+    let out = run_to_exit(&env3, &vars, &[]);
+    assert_eq!(out.code, Some(1), "{}", out.stderr);
+    assert!(
+        out.stderr.starts_with("serialwrapd: no profiles loaded\n"),
+        "{}",
+        out.stderr
+    );
+    assert!(wal_dir.is_dir(), "ensure_runtime_dirs 應已建立 WAL 目錄");
 }
 
 // ---------------------------------------------------------------------------

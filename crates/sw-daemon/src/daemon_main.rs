@@ -447,7 +447,8 @@ fn isolation_reason(env: &dyn SysEnv, caps: &Capabilities, defaults: &RuntimePat
             "SERIALWRAP_RUN_DIR" => &defaults.run_dir,
             _ => &defaults.config_dir,
         };
-        if normalize_path(f, raw, &snap, &home) == normalize_path(f, default, &snap, &home) {
+        // Python `_isolation_reason`：`raw = (env.get(var) or "").strip()` 後才正規化（審查 F79）。
+        if normalize_path(f, py_strip(raw), &snap, &home) == normalize_path(f, default, &snap, &home) {
             return Some(format!("not an isolated instance: {var} equals default"));
         }
     }
@@ -594,13 +595,22 @@ fn os_exc_name(e: &PalError) -> &'static str {
 
 /// YAML 解析錯誤 → PyYAML 例外類別名（對照表 `contracts/golden/allowlist_unreadable_config.tsv` 由 Python 基線實測）。
 fn yaml_exc_name(m: &str) -> &'static str {
+    // 審查 F80：PyYAML 的 timestamp regex 不符 → `None.groupdict()` 的 AttributeError；未知 bool 值 → `bool_values[...]`
+    // 的 KeyError；重複 anchor → ComposerError；不相容／重複的 %YAML 指令 → ParserError（Python 基線實測，見 golden）。
     if m.contains("recursion limit exceeded") {
         "RecursionError"
     } else if m.contains("unacceptable character") {
         "ReaderError"
+    } else if m.contains("invalid timestamp format") {
+        "AttributeError"
+    } else if m.contains("invalid bool value") {
+        "KeyError"
+    } else if m.contains("incompatible or duplicate YAML directive") {
+        "ParserError"
     } else if m.contains("expected a single document")
         || m.contains("found unknown anchor")
         || m.contains("found undefined alias")
+        || m.contains("found duplicate anchor")
         || m.contains("alias expansion limit")
     {
         "ComposerError"
@@ -610,7 +620,6 @@ fn yaml_exc_name(m: &str) -> &'static str {
         || m.contains("expected a single mapping item")
         || m.contains("base64")
         || m.contains("invalid padding")
-        || m.contains("invalid bool value")
     {
         "ConstructorError"
     } else if m.starts_with("invalid ") || m.ends_with(" out of range") {
@@ -645,20 +654,21 @@ fn load_config_for_allowlist(path: &str, fs: &dyn FsOps) -> (RuntimeConfig, Opti
 
 /// `SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND` 合法性檢查（02 §2.1：不 strip、`or "auto"`、`.lower()`）；
 /// 非法值或非本 build 的原生後端 → `Err`（Python 為 ValueError traceback，exit 1；訊息非契約，G5）。
-fn check_backend_env(env: &dyn SysEnv, caps: &Capabilities) -> Result<(), String> {
+/// 單一變數的檢查；呼叫點對齊 Python 第一次選擇該後端的位置（審查 F78）：DEVICE 於 `load_profiles`／
+/// `no profiles loaded` 之後（`select_device_backend()`）、LOCK 於取鎖前（`_build_lock`）、RPC 於建 server 前
+/// （`_build_server`，SessionManager 建構之後、任何 attach 之前）。
+fn check_backend_env(env: &dyn SysEnv, caps: &Capabilities, name: &str) -> Result<(), String> {
     let native_win = caps.native_backend == BackendKind::Win;
-    for name in ["SERIALWRAP_RPC_BACKEND", "SERIALWRAP_LOCK_BACKEND", "SERIALWRAP_DEVICE_BACKEND"] {
-        let raw = env.var(name).filter(|v| !v.is_empty()).unwrap_or_else(|| "auto".to_string());
-        let mode = raw.to_lowercase();
-        let is_win = match mode.as_str() {
-            "posix" | "unix" | "termios" => false,
-            "win" | "windows" | "win32" => true,
-            "auto" => native_win,
-            _ => return Err(format!("unsupported backend: {}", py_repr_str(&mode))),
-        };
-        if is_win != native_win {
-            return Err(format!("backend {} is not available in this build", py_repr_str(&raw)));
-        }
+    let raw = env.var(name).filter(|v| !v.is_empty()).unwrap_or_else(|| "auto".to_string());
+    let mode = raw.to_lowercase();
+    let is_win = match mode.as_str() {
+        "posix" | "unix" | "termios" => false,
+        "win" | "windows" | "win32" => true,
+        "auto" => native_win,
+        _ => return Err(format!("unsupported backend: {}", py_repr_str(&mode))),
+    };
+    if is_win != native_win {
+        return Err(format!("backend {} is not available in this build", py_repr_str(&raw)));
     }
     Ok(())
 }
@@ -812,31 +822,34 @@ impl Stage0Hooks {
     }
 
     /// `_test_release_persist_point()`：commit 前暫停點（寫 `arrived`、每 50 ms 輪詢 `go`、上限 600 s）。
-    fn release_persist_point(&self) {
+    /// 建目錄或寫 `arrived` 失敗即回 `Err`（Python 例外穿出，release 持久化失敗；審查 F85）。
+    fn release_persist_point(&self) -> PalResult<()> {
         let Some(raw) = &self.pause_dir else {
-            return;
+            return Ok(());
         };
         if let Some(reason) = &self.isolation {
             (self.warn)(format!("SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE 已忽略：{reason}（非隔離實例不得暫停）"));
-            return;
+            return Ok(());
         }
         let dir = Path::new(raw);
-        let _ = self.fs.mkdirs(dir);
-        let _ = self.fs.write_file(&dir.join("arrived"), format!("pid={}\n", self.pid).as_bytes());
+        self.fs.mkdirs(dir)?;
+        self.fs.write_file(&dir.join("arrived"), format!("pid={}\n", self.pid).as_bytes())?;
         let go = dir.join("go");
         let deadline = Instant::now() + Duration::from_secs(600);
         while !self.fs.exists(&go) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
+        Ok(())
     }
 }
 
 impl PersistObserver for Stage0Hooks {
-    fn before_release_commit(&self) {
-        self.release_persist_point();
+    fn before_release_commit(&self) -> PalResult<()> {
+        self.release_persist_point()?;
         if let Some(h) = &self.before_release {
             h();
         }
+        Ok(())
     }
     fn after_commit(&self, release: bool) {
         if release {
@@ -908,10 +921,6 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         }
     };
     let dirs = resolve_daemon_dirs(&env);
-    if let Err(msg) = check_backend_env(&*p.env, &p.caps) {
-        eprintln!("{PROG}: {msg}");
-        return 1;
-    }
     let args = match parse_args_width(&argv, &paths, help_width(&*p.env)) {
         Ok(a) => a,
         Err((HELP_EXIT, help)) => {
@@ -959,6 +968,10 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     if load.profiles.is_empty() && load.templates.is_empty() {
         eprint!("{PROG}: no profiles loaded\n");
     }
+    if let Err(msg) = check_backend_env(&*p.env, &p.caps, "SERIALWRAP_DEVICE_BACKEND") {
+        eprintln!("{PROG}: {msg}");
+        return 1;
+    }
     if p.caps.native_device == DeviceBackendKind::Win {
         inject_windows_passthrough(&mut load.templates);
     }
@@ -969,6 +982,10 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
             return 1;
         }
     };
+    if let Err(msg) = check_backend_env(&*p.env, &p.caps, "SERIALWRAP_LOCK_BACKEND") {
+        eprintln!("{PROG}: {msg}");
+        return 1;
+    }
     let lock = match p.instance_lock.acquire(&args.lock, &ep) {
         Ok(g) => g,
         Err(InstanceLockError::AlreadyRunning) => {
@@ -1038,6 +1055,15 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     // `SessionManager::new` 已完成建構子尾端的啟動存檔（Python `_save_state()`，其內呼叫一次 kill 鉤子(False)）。
     stage0.kill_after_save(false);
     manager.set_persist_observer(stage0);
+    if let Err(msg) = check_backend_env(&*p.env, &p.caps, "SERIALWRAP_RPC_BACKEND") {
+        // Python `_build_server` 於 service 建構後、`service.start()` 前拋出：尚未掃描／attach。
+        eprintln!("{PROG}: {msg}");
+        manager.begin_shutdown();
+        let _ = manager.shutdown(DRAIN_BUDGET);
+        let _ = wal.shutdown();
+        lock.release();
+        return 1;
+    }
 
     let mut src = (p.devices)(DeviceSelection {
         by_id_dir: PathBuf::from(&dirs.by_id_dir),

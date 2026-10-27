@@ -27,6 +27,8 @@ GENERATORS = [
     ("gen_endpoint.py", "endpoint.tsv"),
     ("gen_wal_line.py", "wal_line.tsv"),
     ("gen_cli_trace.py", "cli_trace.tsv"),
+    # 審查 F84（P5-T19）：SC-19 壞 config.yaml 例外類別（permission 列於 root 時以 setpriv 降權）。
+    ("gen_allowlist_unreadable_config.py", "allowlist_unreadable_config.tsv"),
 ]
 
 

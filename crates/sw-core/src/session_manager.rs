@@ -272,8 +272,9 @@ impl SerialWriter for DetachedWriter {
 /// `_save_release_state()`（commit 前暫停點 → 落盤 → 落盤後 kill 鉤子）。是否生效（僅隔離實例）由實作者
 /// （daemon 組裝點）決定，sw-core 只提供呼叫點。
 pub trait PersistObserver: Send + Sync {
-    /// release 持久化 commit 之前（Python `_test_release_persist_point()`）。
-    fn before_release_commit(&self);
+    /// release 持久化 commit 之前（Python `_test_release_persist_point()`）；`Err` 時不 commit、release 持久化失敗
+    /// （Python 暫停點的 `os.makedirs`／寫檔例外會穿出 `_save_release_state`，審查 F85）。
+    fn before_release_commit(&self) -> Result<(), PalError>;
     /// 任一 state.json commit 成功之後；`release` 為 true 表示本次為 release 持久化
     /// （Python 先以 `False` 呼叫一次 kill 鉤子，release 持久化再以 `True` 呼叫一次）。
     fn after_commit(&self, release: bool);
@@ -495,7 +496,7 @@ impl Shared {
         let observer = lock(&self.persist_observer).clone();
         if release {
             if let Some(o) = &observer {
-                o.before_release_commit();
+                o.before_release_commit()?;
             }
         }
         let (tx, rx) = crossbeam_channel::bounded(1);

@@ -1900,3 +1900,32 @@ fn bind_to_online_device_live_state_attaching_before_reply() {
         "{live:?}"
     );
 }
+
+#[test]
+fn release_persist_point_failure_fails_release_commit() {
+    // 審查 F85（Low，3938032）：Python `_test_release_persist_point` 的 `os.makedirs`／寫 `arrived` 失敗會拋出，
+    // `_save_release_state` 不落盤、release 持久化失敗（不得吞掉錯誤後照常 commit）。
+    struct FailingPoint;
+    impl sw_core::session_manager::PersistObserver for FailingPoint {
+        fn before_release_commit(&self) -> Result<(), sw_pal::PalError> {
+            Err(sw_pal::PalError::io(20, "[Errno 20] Not a directory: '/dev/null/x'"))
+        }
+        fn after_commit(&self, _release: bool) {}
+    }
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    m.mgr.set_persist_observer(std::sync::Arc::new(FailingPoint));
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    );
+    assert!(r.is_err(), "暫停點失敗時 release 持久化不得成功：{r:?}");
+    assert!(
+        m.load_state_now().released.is_empty(),
+        "state.json 不得寫入 released 列"
+    );
+}
