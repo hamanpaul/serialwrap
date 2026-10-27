@@ -168,6 +168,11 @@ pub enum SessionRequest {
         profile: SessionProfile,
         profile_source: String,
     },
+    /// bind 等待舊 by_id 的 attach op 逾時（#26；Python `bind_session` 直接寫活 session）：state RECOVERING、
+    /// `drain_stalled=true`、`drain_timeout_epoch=epoch`，回 SESSION_RECOVERING 回應（審查 F64）。
+    MarkAttachStalled {
+        epoch: u64,
+    },
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
@@ -1602,6 +1607,14 @@ impl SessionCore {
                 self.profile = profile;
                 self.profile_source = profile_source;
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
+            SessionRequest::MarkAttachStalled { epoch } => {
+                self.set_state(SessionState::Recovering, now);
+                self.drain_stalled = true;
+                self.drain_timeout_epoch = Some(epoch);
+                let mut response = self.drain_stalled_reply(now);
+                response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
+                vec![Effect::Reply(reply, Ok(response))]
             }
             #[cfg(feature = "test-fakes")]
             SessionRequest::QueueLensForTest => vec![Effect::Reply(

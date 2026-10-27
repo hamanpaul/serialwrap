@@ -2095,7 +2095,20 @@ impl SessionManager {
         match &req {
             SessionRequest::Bind { by_id } => return self.bind(sid, by_id),
             SessionRequest::Clear => return self.clear(sid, timeout),
-            SessionRequest::Recover { .. } | SessionRequest::DeviceAttach { .. }
+            SessionRequest::Recover { .. } if stopping && self.shared.actor_of(sid).is_some() => {
+                // Python `recover_session`：RELEASED 判定（released 回應）先於 stopping 例外（審查 F68）。
+                let released = self.shared.session_public(sid).is_some_and(|s| {
+                    str_of(&s, "state").as_deref() == Some("RELEASED")
+                        || self
+                            .shared
+                            .released_by_ids()
+                            .contains(&str_of(&s, "device_by_id").unwrap_or_default())
+                });
+                if !released {
+                    return Err(stopping_error());
+                }
+            }
+            SessionRequest::DeviceAttach { .. }
                 if stopping && self.shared.actor_of(sid).is_some() =>
             {
                 return Err(stopping_error());
@@ -2278,18 +2291,26 @@ impl SessionManager {
     }
 
     /// #26：attach op 取消後 3000 ms 內未收斂（Python 設 RECOVERING＋drain_stalled 並回 SESSION_RECOVERING）。
+    /// #26 逾時：Python `bind_session` 直接寫活 session（state RECOVERING、drain_stalled、drain_timeout_epoch＝
+    /// attach op 的 bridge_generation），回應取自寫入後的 session（審查 F64：不得只改回應副本）。
     fn attach_op_stalled_reply(&self, sid: &str) -> PyDict {
-        let mut s = self.shared.session_public(sid).unwrap_or_default();
-        let epoch = s.get("bridge_generation").cloned().unwrap_or(PyValue::Null);
-        s.insert("state", PyValue::from("RECOVERING"));
-        s.insert("drain_stalled", PyValue::from(true));
-        s.insert("drain_timeout_epoch", epoch.clone());
-        pydict! {
-            "ok" => false,
-            "error_code" => "SESSION_RECOVERING",
-            "drain_stalled" => true,
-            "drain_timeout_epoch" => epoch,
-            "session" => s
+        let epoch = self
+            .shared
+            .session_public(sid)
+            .and_then(|s| s.get("bridge_generation").and_then(PyValue::as_i64))
+            .unwrap_or(0)
+            .max(0) as u64;
+        match self
+            .shared
+            .request(sid, SessionRequest::MarkAttachStalled { epoch }, QUERY_TIMEOUT)
+        {
+            Ok(reply) => reply,
+            Err(_) => pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_RECOVERING",
+                "drain_stalled" => true,
+                "drain_timeout_epoch" => PyValue::from(epoch as i64),
+            },
         }
     }
 

@@ -1232,6 +1232,19 @@ fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
         s_of(&session_field(&r), "state").as_deref(),
         Some("RECOVERING")
     );
+    // 審查 F64：Python `bind_session` 逾時時寫入活的 session（state、drain_stalled、drain_timeout_epoch），
+    // 之後 `session.get_state` 同為 RECOVERING＋drain_stalled，`command.submit` 回 SESSION_RECOVERING。
+    let live = m.session("COM0");
+    assert_eq!(s_of(&live, "state").as_deref(), Some("RECOVERING"), "{live:?}");
+    assert_eq!(live.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        live.get("drain_timeout_epoch"),
+        r.get("drain_timeout_epoch"),
+        "活 session 的 epoch 與回應一致"
+    );
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let sub = rpc(m.mgr.route(&sid, SessionRequest::Submit(agent_submit("ls")), RPC));
+    assert_eq!(code_of(&sub).as_deref(), Some("SESSION_RECOVERING"), "{sub:?}");
     m.serial.release_open(&real);
     // 取消的 op 拿到 handle 後立即關閉（不交給 session）。
     wait_until("取消的 op 關閉 handle", || m.device(&real).close_count() == 2);
@@ -1806,3 +1819,53 @@ fn pin_then_clear_on_attached_session_applies_pin() {
     assert_eq!(probe_rows(&m), before, "pin 繞過偵測，不得送 PROBE");
 }
 
+
+#[test]
+fn shutdown_gate_after_open_started_stops_bridge_without_tx() {
+    // 審查 F66（Medium，73634db）：原 #29 斷言在 begin_shutdown 之後才送熱插，update_devices 早退，修正前也綠。
+    // 改為「open 已越過 gate、阻塞中 → begin_shutdown → 放行」：Python `_attach_by_id` 在 `bridge.start()` 後持鎖
+    // 檢查 `_shutting_down` → `_begin_attach_bridge_stop_locked` 收掉剛開的 bridge，不送登入 probe；
+    // session 回 DETACHED（parity #29：凍結早退不停在 ATTACHING）。
+    let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    let real = "/dev/ttyGATE";
+    m.add_device_at("/s/by-id/usb-A", real);
+    m.serial.block_open(real);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("open 進入阻塞", || m.serial.open_attempts(real) == 1);
+    m.mgr.begin_shutdown();
+    m.serial.release_open(real);
+    wait_until("COM0 DETACHED", || m.state_of("COM0").as_deref() == Some("DETACHED"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(m.state_of("COM0").as_deref(), Some("DETACHED"));
+    assert!(m.device(real).take_tx().is_empty(), "stopping 後不得送登入 probe");
+}
+
+#[test]
+fn recover_released_during_stopping_returns_released() {
+    // 審查 F68（Low，73634db）：Python `recover_session` 先判 RELEASED（回
+    // `{"ok":true,"released":true,"recommended_action":"device_attach",…}`），才輪到 stopping 的例外。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Str("t".to_string()),
+        },
+        RPC,
+    ));
+    m.wait_state("COM0", "RELEASED");
+    m.mgr.begin_shutdown();
+    let r = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Recover {
+            timeout_s: 1.0,
+            force: false,
+        },
+        RPC,
+    ));
+    assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)), "{r:?}");
+    assert_eq!(r.get("released"), Some(&PyValue::Bool(true)));
+    assert_eq!(r.get("recommended_action"), Some(&PyValue::from("device_attach")));
+}
