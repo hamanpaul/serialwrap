@@ -525,10 +525,33 @@ fn start_windows_python_launcher_without_runtime_does_not_fall_through() {
     });
     t.write_file(&sibling, b"sibling daemon");
 
+    let expected_path = |path: &PathBuf| path.to_string_lossy().replace('/', "\\");
     let located = t.with_cli_ctx(|ctx| sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx));
+    match located {
+        Err(sw_cli::commands::daemon_cmd::DaemonLocateError::ManifestRuntimeMissing {
+            launcher: ref found_launcher,
+            runtime: ref found_runtime,
+        }) => {
+            assert_eq!(found_launcher, &expected_path(&launcher));
+            assert_eq!(
+                found_runtime.as_deref(),
+                Some(expected_path(&t.bundle_dir().join("py").join("python.exe")).as_str())
+            );
+        }
+        other => {
+            panic!("缺 manifest runtime 時不得落到同層或其他候選，且須指出缺 runtime：{other:?}")
+        }
+    }
+
+    // 使用者訊息須指出缺的是 manifest 宣告的 runtime，而非泛稱找不到 daemon。
+    let (rc, out, _err) = t.run(&["daemon", "start"]);
+    assert_eq!(rc, 2);
+    let j = json(&out);
+    assert_eq!(fstr(&j, "error_code"), "DAEMON_BINARY_NOT_FOUND");
+    let message = fstr(&j, "message");
     assert!(
-        located.is_err(),
-        "缺 manifest runtime 時不得落到同層或其他候選：{located:?}"
+        message.contains("runtime") && message.contains("python.exe"),
+        "訊息須帶 manifest runtime 路徑：{message}"
     );
 }
 
