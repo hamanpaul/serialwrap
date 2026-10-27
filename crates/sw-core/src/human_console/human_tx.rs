@@ -48,6 +48,8 @@ pub struct InFlightJob {
     pub payload: Vec<u8>,
     /// HumanReplay 所屬的 hold。
     pub hold: Option<u64>,
+    /// permit 的 `(op_id, epoch)`（Phase 1 後晚到結算時結算帳本用）。
+    pub ledger: (crate::tx_writer::OpId, u64),
 }
 
 /// 每 session 一條 human TX lane 的簿記。
@@ -57,6 +59,8 @@ pub struct HumanLane {
     backlog: VecDeque<BacklogItem>,
     backlog_bytes: usize,
     next_seq: u64,
+    /// drain Phase 1 `reset` 時仍在途那筆的 `(seq, op_id, epoch)`：晚到結算仍須結算舊帳本（D-15(6)）。
+    orphan: Option<(u64, crate::tx_writer::OpId, u64)>,
 }
 
 impl HumanLane {
@@ -108,6 +112,17 @@ impl HumanLane {
         self.backlog_bytes += item.payload.len();
         self.backlog.push_back(item);
         Ok(())
+    }
+
+    /// Phase 1 前在途那筆的晚到結算：`seq` 相符時取出 `(op_id, epoch)`。
+    pub fn take_orphan(&mut self, seq: u64) -> Option<(crate::tx_writer::OpId, u64)> {
+        match self.orphan {
+            Some((s, op_id, epoch)) if s == seq => {
+                self.orphan = None;
+                Some((op_id, epoch))
+            }
+            _ => None,
+        }
     }
 
     pub fn pop_front(&mut self) -> Option<BacklogItem> {
@@ -168,9 +183,12 @@ impl HumanLane {
         out
     }
 
-    /// drain Phase 1：清空在途簿記與 backlog（舊 epoch 的晚到結算一律忽略）；回傳被丟棄的 backlog 項目。
+    /// drain Phase 1：清空在途簿記與 backlog；在途那筆只留帳本身分（`take_orphan`），回傳被丟棄的 backlog 項目。
     pub fn reset(&mut self) -> Vec<BacklogItem> {
-        self.in_flight = None;
+        self.orphan = self
+            .in_flight
+            .take()
+            .map(|job| (job.tag.seq, job.ledger.0, job.ledger.1));
         self.backlog_bytes = 0;
         self.backlog.drain(..).collect()
     }

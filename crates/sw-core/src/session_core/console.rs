@@ -385,6 +385,7 @@ impl SessionCore {
             tag: tag.clone(),
             payload: payload.clone(),
             hold,
+            ledger: (permit.op_id, permit.epoch),
         });
         fx.push(Effect::HumanTx { tag, permit, payload });
     }
@@ -433,6 +434,12 @@ impl SessionCore {
     pub(super) fn human_tx_completed(&mut self, tag: HumanTxTag, report: TxReport, now: Mono) -> Vec<Effect> {
         let mut fx = Vec::new();
         let Some(job) = self.human.lane.take_in_flight(tag.seq) else {
+            // drain Phase 1 前在途者：只結算帳本（conn_epoch 仍相符時），不重新路由（D-15(6)）。
+            if let Some((op_id, epoch)) = self.human.lane.take_orphan(tag.seq) {
+                if self.generations.conn_epoch == Some(epoch) && report.op_id == op_id {
+                    fx.push(Effect::SettleTx { epoch, op_id });
+                }
+            }
             return fx;
         };
         if self.generations.conn_epoch == Some(report.epoch) {

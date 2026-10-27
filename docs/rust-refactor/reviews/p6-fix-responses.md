@@ -10,19 +10,19 @@ P5 commit（`fb76460`、`2d93181`、`0a187c1`、`8b8a40f`、`afe4853` 等）的�
 
 | # | 等級 | Commit | 位置 | 處理 |
 |---|---|---|---|---|
-| 1 | High | 2f4f76a | `session_core/console.rs` 延後回放 | fixed（見下） |
-| 2 | High | 2f4f76a | `human_tx.rs` 斷線／溢位刪回放未結算 hold | fixed（見下） |
-| 3 | High | 1f1fa67 | `session_core.rs` `reboot_tx_settled` 缺第二次失效 | fixed（見下） |
-| 4 | High | 2f4f76a | `op_runner.rs` HumanConsole 命令逾時送 CTRL-C／CTRL-D | fixed（見下） |
-| 5 | Medium | 2f4f76a | interactive 模式 owner／admission 順序 | fixed（見下） |
-| 6 | Medium | 8fdf62f | `human_tx_lane.rs:226` 一一對應與帳本歸零 | fixed（見下） |
-| 7 | Medium | 8fdf62f | `human_tx_lane.rs:126` 溢位斷言過寬 | fixed（見下） |
-| 8 | Medium | 8abd423 | `reboot_command_invalidates_before_send` 鎖不住第二次失效 | fixed（見下） |
+| 1 | High | 2f4f76a | `session_core/console.rs` 延後回放 | fixed 8c8f06d（紅燈 38c3cb6） |
+| 2 | High | 2f4f76a | `human_tx.rs` 斷線／溢位刪回放未結算 hold | fixed 8c8f06d（紅燈 38c3cb6） |
+| 3 | High | 1f1fa67 | `session_core.rs` `reboot_tx_settled` 缺第二次失效 | fixed 8c8f06d（紅燈 38c3cb6） |
+| 4 | High | 2f4f76a | `op_runner.rs` HumanConsole 命令逾時送 CTRL-C／CTRL-D | fixed 8c8f06d（紅燈 38c3cb6） |
+| 5 | Medium | 2f4f76a | interactive 模式 owner／admission 順序 | fixed 8c8f06d（紅燈 38c3cb6） |
+| 6 | Medium | 8fdf62f | `human_tx_lane.rs:226` 一一對應與帳本歸零 | fixed 8c8f06d（紅燈 38c3cb6） |
+| 7 | Medium | 8fdf62f | `human_tx_lane.rs:126` 溢位斷言過寬 | fixed 8c8f06d（紅燈 38c3cb6） |
+| 8 | Medium | 8abd423 | `reboot_command_invalidates_before_send` 鎖不住第二次失效 | fixed 8c8f06d（紅燈 38c3cb6） |
 | 9 | Low | 8fdf62f | `release_phase1_closes_all_consoles` 分不出計數方式 | deferred：與 #12 一併於 Task 10（哨兵登記）處理 |
-| 10 | Low | 8fdf62f | `queued_command_waits_for_replay_settle` 未確認出列者為 B | fixed（見下） |
+| 10 | Low | 8fdf62f | `queued_command_waits_for_replay_settle` 未確認出列者為 B | fixed 4460aa0（測試強化） |
 | 11 | Low | 2f4f76a | `pty: None` 回 `SESSION_NOT_READY` | deferred：Task 10（TCP console 端點回應）；Windows 原生列 LOCAL-WINDOWS-TODO |
 | 12 | Low | 2f4f76a | `closed_consoles = max(...)` | deferred：Task 10 把哨兵以 `internal:true` 登記進 consoles 後改取 `consoles.len()` |
-| 13 | Low | 2f4f76a | Phase 1 `lane.reset()` 丟在途簿記 | fixed（見下） |
+| 13 | Low | 2f4f76a | Phase 1 `lane.reset()` 丟在途簿記 | fixed（紅燈 4460aa0；修正為其後的 fix(rust-console) Phase 1 帳本 commit） |
 | 14 | Low | 2f4f76a | 計畫「實作紀錄」合法化偏離 | deferred：偏離項目（`begin_stop` 保留 `owner_gen += 1`、PumpFull 重試槽）列入本檔下方「待簽核偏離」表，交擁有者／審查者簽核 |
 
 ### 1. 延後回放在新前景命令執行中途送出（High，有效）
