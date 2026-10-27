@@ -398,6 +398,26 @@ impl CommandRegistry {
             .collect()
     }
 
+    /// 全部命令的 `(cmd_id, error_code)`（依 admission 順序；無 error_code 為 `None`）。
+    /// daemon 停機診斷用（P5-T19：停機前後比對 `FLUSHED_BY_SHUTDOWN` 的命令）。
+    pub fn error_codes(&self) -> Vec<(String, Option<String>)> {
+        self.inner
+            .lock()
+            .expect("命令登錄表鎖 poisoned")
+            .records
+            .iter()
+            .map(|(cmd_id, record)| {
+                (
+                    cmd_id.clone(),
+                    record
+                        .get("error_code")
+                        .and_then(PyValue::as_str)
+                        .map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
     /// 目前紀錄總數，包含在途命令。
     pub fn len(&self) -> usize {
         self.inner

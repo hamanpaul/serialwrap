@@ -75,6 +75,12 @@ impl SerialBackend for PosixSerialBackend {
             });
         }
         let fd = ops.take_fd().expect("open_sequence 成功時必須保留 tty fd");
+        // #11：鎖後重掃不完整（AcceptUnverified）→ 登記為 holder_unknown 裝置；否則移除（Python `_set_holder_unknown`）。
+        let unverified = ops
+            .last_probe
+            .as_ref()
+            .is_some_and(|r| post_lock_holder_verdict(r) == PostLockVerdict::AcceptUnverified);
+        crate::serial::set_holder_unknown(&dev.0, unverified);
         let eio_is_pty_hangup = is_pty_slave_fd(fd);
 
         let wake_r = match WakeChannel::new() {
@@ -405,6 +411,8 @@ struct PosixOpenOps<'a> {
     injected_error: Option<PalError>,
     fd: Option<RawFd>,
     excl_armed: bool,
+    /// 最近一次 holder 掃描結果（開啟成功時即鎖後重掃；#11 holder_unknown 登錄依據）。
+    last_probe: Option<HolderReport>,
 }
 
 impl<'a> PosixOpenOps<'a> {
@@ -424,6 +432,7 @@ impl<'a> PosixOpenOps<'a> {
             injected_error: None,
             fd: None,
             excl_armed: false,
+            last_probe: None,
         }
     }
 
@@ -475,7 +484,9 @@ impl TtyOpenOps for PosixOpenOps<'_> {
     }
 
     fn probe_holders(&mut self) -> HolderReport {
-        finalize_holder_report(self.excl.probe_holders(&self.path))
+        let report = finalize_holder_report(self.excl.probe_holders(&self.path));
+        self.last_probe = Some(report.clone());
+        report
     }
 
     fn after_excl(&mut self) -> Result<(), i32> {
@@ -848,6 +859,9 @@ impl CloseImpl for PosixCloseToken {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = close.path.clone();
+        if close.fd.is_some() {
+            crate::serial::set_holder_unknown(&path, false);
+        }
         close_sequence(&mut *close, &path, true)
     }
 }
@@ -856,6 +870,9 @@ impl Drop for PosixClose {
     fn drop(&mut self) {
         if self.fd.is_some() || self.wake_r.is_some() || self.wake_w.is_some() {
             let path = self.path.clone();
+            if self.fd.is_some() {
+                crate::serial::set_holder_unknown(&path, false);
+            }
             let _ = close_sequence(self, &path, true);
         }
     }
@@ -867,6 +884,7 @@ fn close_partial_open(
     wake_r: Option<WakeChannel>,
     wake_w: Option<WakeChannel>,
 ) {
+    crate::serial::set_holder_unknown(&path, false);
     let waker = Arc::new(PosixIoWaker::new(wake_r.as_ref(), wake_w.as_ref()));
     let mut close = PosixClose {
         fd: Some(fd),

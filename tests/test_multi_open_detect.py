@@ -239,6 +239,30 @@ class TestDaemonStatusMultiOpen(unittest.TestCase):
         self.assertEqual(st["multi_open_detail"]["holders_status"], "ok")
         self.assertEqual(st["multi_open_detail"]["daemons"], [{"pid": 1}])
 
+    def test_health_status_warnings_no_profiles_no_devices(self) -> None:
+        """#81 特性測試（P5-T18 parity #100）：warnings 只看 explicit target 與裝置數，位於 limits 與 multi_open 之間。"""
+        svc = self._make_service()
+        fake = {"multi_open": False, "daemons": [], "holders": {}, "holders_status": "ok"}
+        with mock.patch("sw_core.service.detect_multi_open", return_value=fake):
+            st = svc.health()
+        # 純模板（無 explicit target）且無裝置：依序 no_profiles_loaded、no_devices_found。
+        self.assertEqual(st["warnings"], ["no_profiles_loaded", "no_devices_found"])
+        keys = list(st)
+        idx = keys.index("warnings")
+        self.assertEqual(keys[idx - 1], "limits")
+        self.assertEqual(keys[idx + 1], "multi_open")
+        # 有裝置但仍無 explicit target：只剩 no_profiles_loaded。
+        with mock.patch.object(svc._sessions, "list_devices", return_value=[{"by_id": "b", "real_path": "/dev/x"}]), \
+                mock.patch("sw_core.service.detect_multi_open", return_value=fake):
+            st = svc.health()
+        self.assertEqual(st["warnings"], ["no_profiles_loaded"])
+        # explicit target 已載入且有裝置：無 warnings 鍵。
+        svc._profile_count = 1
+        with mock.patch.object(svc._sessions, "list_devices", return_value=[{"by_id": "b", "real_path": "/dev/x"}]), \
+                mock.patch("sw_core.service.detect_multi_open", return_value=fake):
+            st = svc.health()
+        self.assertNotIn("warnings", st)
+
     def test_health_passes_attached_tty_paths(self) -> None:
         from sw_core.config import SessionProfile, UartProfile
         from sw_core.session_manager import SessionRuntime

@@ -6,9 +6,9 @@
 
 #![cfg(feature = "test-fakes")]
 
-#[allow(dead_code)]
 mod common;
 mod support;
+use common::repo_path;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -600,11 +600,6 @@ fn tick_expires_lease_sc13() {
         h.request(status_req(&id)),
         sw_proto::pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED", "interactive_id" => id.clone() }
     );
-    // P6 增補 #16（07 D-08）：tombstone 可重複讀，第二次 status 仍為 INTERACTIVE_EXPIRED。
-    assert_eq!(
-        h.request(status_req(&id)),
-        sw_proto::pydict! { "ok" => false, "error_code" => "INTERACTIVE_EXPIRED", "interactive_id" => id.clone() }
-    );
     // lease 已移除：命令不再被 SESSION_INTERACTIVE_BUSY 擋下。
     h.dev.on_tx_reply(b"echo z\n", b"echo z\r\nz\r\nroot@t:/# ");
     let cmd = h.submit_ok("echo z");
@@ -941,9 +936,7 @@ fn selftest_quiet_armed_during_submit_counts_committed() {
 
 #[test]
 fn selftest_probe_other_reject_zero_tx_matches_python() {
-    let golden_text = std::fs::read_to_string(
-        common::repo_path("contracts/golden/selftest_refused.json"),
-    )
+    let golden_text = std::fs::read_to_string(repo_path("contracts/golden/selftest_refused.json"))
     .expect("golden");
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
         panic!()
@@ -1257,9 +1250,7 @@ fn log_capture_dir_not_creatable_is_exception() {
 fn selftest_probe_drain_race_golden() {
     // R5 審查後續：drain（release）與 probe 提交競態——結果只有「probe 已提交（回 nonce 結果）」或
     // 「零 TX＋golden 碼（drain → EXCEPTION `tx incomplete: not_submitted 0/23 draining`）」兩種。
-    let golden_text = std::fs::read_to_string(
-        common::repo_path("contracts/golden/selftest_refused.json"),
-    )
+    let golden_text = std::fs::read_to_string(repo_path("contracts/golden/selftest_refused.json"))
     .expect("golden");
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
         panic!()

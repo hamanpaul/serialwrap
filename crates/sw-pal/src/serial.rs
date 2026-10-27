@@ -25,3 +25,40 @@ impl crate::traits::UartExclusive for WindowsUartExclusive {
         }
     }
 }
+
+/// 鎖後 holder 掃描不完整（`PostLockVerdict::AcceptUnverified`）而仍開啟中的裝置登錄
+/// （對照 Python `serial_port._UNKNOWN_HOLDER_DEVICES`；`health.status` 的 `foreign_holders` 合併來源，
+/// parity-amendments-2026-10-26 #11）。行程內共用、與 Python 模組層級 set 同語意。
+static UNKNOWN_HOLDER_DEVICES: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Python `os.path.realpath`：可解析時取實體路徑，否則原樣。
+fn holder_key(device_path: &str) -> String {
+    std::fs::canonicalize(device_path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| device_path.to_string())
+}
+
+/// 回傳目前仍開啟、且外部 holder 掃描結果不完整的裝置（依字典序；Python `unknown_holder_devices()`）。
+pub fn unknown_holder_devices() -> Vec<String> {
+    UNKNOWN_HOLDER_DEVICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// 登記或移除「holder 掃描不完整」的裝置（Python `_set_holder_unknown`）。
+/// 開檔成功時依鎖後重掃結果呼叫；關閉時以 `false` 呼叫。測試替身亦可直接呼叫以模擬 PAL 開檔結果。
+pub fn set_holder_unknown(device_path: &str, unknown: bool) {
+    let key = holder_key(device_path);
+    let mut set = UNKNOWN_HOLDER_DEVICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if unknown {
+        set.insert(key);
+    } else {
+        set.remove(&key);
+    }
+}

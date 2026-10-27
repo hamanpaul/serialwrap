@@ -1052,11 +1052,15 @@ OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallbac
 2. `ensure_runtime_dirs`。
 3. `load_profiles`；結果為空時 stderr 印 `serialwrapd: no profiles loaded`。
 4. Windows device backend 時注入 `windows-default-passthrough` template（依 capability 判斷）。此 template 為 `platform=passthrough`，同樣適用 §5.12 的安靜升 READY（`SC-35`）。
-5. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`，exit 2。
-6. 建 Service（帶入步驟 1 的 allowlist 判定）；`StateLoadError` 時 exit 3。
-7. 依序 initial scan → rank → watcher.start（`DF-14`）→ bootstrap attach → flash endpoint。
-8. 綁定 RPC，再寫入 config.yaml 的 `socket_path`；寫入失敗印 stderr，視為非致命。
-9. `signals.wait_stop`。
+5. `instance_lock.acquire`；失敗時 stderr `serialwrapd: DAEMON_ALREADY_RUNNING`（或 `SOCKET_UNAVAILABLE`），exit 2。步驟 3 在前，空 profile dir 時 stderr 先有 `no profiles loaded` 一行（Python 基線實測）。
+6. 載入 `state.json`（`StateLoadError` → 釋放鎖、exit 3）→ 建 SessionManager（建構子尾端啟動存檔）→ 建 Service（帶入步驟 1 的 allowlist 判定）。
+7. 依序 initial scan → rank（`prepare_dynamic_rank`）→ `update_devices` → bootstrap attach → watcher.start（P1 `DF-14`：`scan → rank → update → bootstrap_attach → watcher.start`，與 Python `test_service_start_scans_before_watcher_thread` 相同；P5-T19 修訂，原「watcher.start 在 bootstrap 之前」為誤植）→ flash endpoint（P8）。
+8. 綁定 RPC，再寫入 config.yaml 的 `socket_path`（重新讀取 SC-09 讀取目標、寫入 SC-09 寫入目標）；寫入失敗印 stderr `serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: <msg>`，視為非致命。
+9. `signals.wait_stop`（POSIX SIGINT／SIGTERM、`daemon.stop`；Windows console ctrl 見 NC-07）。
+
+SC-19 判定（步驟 1）讀取 config.yaml 時（P5-T19，parity #46／#47）：缺檔 → 未設定；存在但讀取／UTF-8／YAML 失敗 → 以 Python 對同一輸入的例外類別名（對照表 `contracts/golden/allowlist_unreadable_config.tsv`）走 `decide_on_unreadable_config`：env allowlist 非空依 env、非隔離實例視為未設定、隔離實例 `invalid config.yaml: <類別名>` 拒絕（exit 2）。
+
+Stage 0 測試鉤子（P5-T19，parity #3／#4／#68）：產品 build 亦讀 `SERIALWRAP_TEST_KILL_AFTER_SAVE`／`SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE`，經 `SessionManager::set_persist_observer` 掛在 release 持久化 commit 前後；僅 SC-19 隔離判定通過時生效，非隔離實例只寫 `contracts/daemon_logging.yaml` 凍結的 WARNING。test-fakes 的 `DaemonHooks.{before,after}_state_commit` 掛在同一 release 持久化點（非每次 `StateStore` commit：啟動存檔也會 commit）。
 
 停止順序：
 
@@ -1074,7 +1078,7 @@ OD-14 #2：`platform == "passthrough"` 的 session（含 others-template fallbac
 
 其他規定：
 
-- 未攔截的 panic：exit 1。停機未收斂亦 exit 1（見停止順序第 6 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。由 `daemon.handoff_stop` 觸發的停機同樣可能 exit 1；update／rollback／回退／復原／`supervision-mode set` 的 CLI 在交接前已 `hold_autostart`（§4.8、§10.2，R5-F1），因此不會在切換期間被監管器拉起；daemon 端不為交接改變 exit code。
+- 未攔截的 panic：exit 1（P5-T19 panic 政策：`main.rs` 的 panic hook 只把 thread 名、位置與訊息寫 stderr，不 exit；各工作 thread 以 `catch_unwind` 隔離——RPC handler 轉 `EXCEPTION` 回應、actor 事件／RX chunk／watcher tick 記 WARNING；`daemon_main::run` 外層 `catch_unwind` 攔下主流程 panic 回 1）。停機未收斂亦 exit 1（見停止順序第 6 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。由 `daemon.handoff_stop` 觸發的停機同樣可能 exit 1；update／rollback／回退／復原／`supervision-mode set` 的 CLI 在交接前已 `hold_autostart`（§4.8、§10.2，R5-F1），因此不會在切換期間被監管器拉起；daemon 端不為交接改變 exit code。
 - logging 輸出到 stderr，格式 `%(message)s`，只輸出 WARNING 以上，訊息模板逐字照 10 §G-01（`GAP-G-01`）。
 - 無參數執行時，所有路徑都由 env 決定（regression ThrowawayDaemon 依賴此行為）。
 - 執行檔名固定為 `serialwrapd`，以符合 multi_open 的偵測規則。
