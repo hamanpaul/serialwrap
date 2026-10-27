@@ -728,3 +728,16 @@ def test_windows_selftest_qualification_failure_records_reason():
     assert reason.rstrip().endswith("else { $null }")
     # status 判定不得因新增原因而改變：qualification 失敗仍為 FAIL。
     assert "$ok = ($exitStatusKnown -and $selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')" in block
+
+
+def test_embedded_runtime_site_packages_include_pyserial():
+    """SC-18 根因：B 輪 daemon 以 bundle 內嵌 3.12.3 runtime（-I）執行，必須能 import pyserial 才能開 COM。
+
+    依賴實際所在目錄（可能是 user site）須加入 ._pth，且驗證 yaml 與 serial 皆可匯入；只驗 yaml 會讓
+    COM 開啟在 daemon 內以 ATTACH_FAILED:OSError 失敗。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    block = _ps_function(ps1, "Enable-EmbeddedSitePackages")
+    assert "import os, serial, yaml" in block
+    assert "& (Join-Path $RuntimeRoot 'python.exe') -I -c 'import yaml, serial'" in block
+    assert "-c 'import yaml'\n" not in block

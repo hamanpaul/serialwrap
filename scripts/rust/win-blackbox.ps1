@@ -219,9 +219,17 @@ function Enable-EmbeddedSitePackages([string]$RuntimeRoot, [string]$RepoRoot) {
     $lines.Add($RepoRoot)
     $sitePackagesPath = [string]($sitePackages | Select-Object -Last 1)
     $lines.Add($sitePackagesPath.Trim())
+    # Windows daemon 執行期依賴 PyYAML 與 pyserial（COM 後端）；兩者可能裝在 user site 而非 purelib，
+    # 以實際匯入位置補入 ._pth，避免內嵌 runtime 開 COM 時 ATTACH_FAILED:OSError（SC-18）。
+    $dependencyDirs = & py -3.12 -c "import os, serial, yaml; print('\n'.join(sorted({os.path.dirname(os.path.dirname(m.__file__)) for m in (serial, yaml)})))"
+    if ($LASTEXITCODE -ne 0) { return $false }
+    foreach ($dependencyDir in @($dependencyDirs)) {
+        $trimmed = ([string]$dependencyDir).Trim()
+        if ($trimmed -and -not $lines.Contains($trimmed)) { $lines.Add($trimmed) }
+    }
     $lines.Add('import site')
     [System.IO.File]::WriteAllLines($pth.FullName, $lines, [System.Text.UTF8Encoding]::new($false))
-    & (Join-Path $RuntimeRoot 'python.exe') -I -c 'import yaml'
+    & (Join-Path $RuntimeRoot 'python.exe') -I -c 'import yaml, serial'
     return $LASTEXITCODE -eq 0
 }
 
