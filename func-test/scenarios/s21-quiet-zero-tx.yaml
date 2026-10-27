@@ -1,0 +1,52 @@
+---
+meta:
+  name: s21-quiet-zero-tx
+  category: l15-scenario
+  severity: critical
+  description: "READY 後 DUT 送出 U-Boot autoboot banner，Quiet 窗口內提交命令回 AUTOBOOT_QUIET（附 retry_after_s）且外部 serial_read 零 byte（Slice 2.1 Task 21，SC-03）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [zero_tx_on_reject, insufficient_evidence_not_pass]
+    behavior_changes: ["SC-03"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: quiet
+  # 經 DUT 控制通道（非 UART byte stream）注入 U-Boot banner："\r\nU-Boot 2024.01\r\nHit any key to stop autoboot:  3 \r\n"
+  - action: dut_control
+    action_name: emit
+    params:
+      payload_b64: "DQpVLUJvb3QgMjAyNC4wMQ0KSGl0IGFueSBrZXkgdG8gc3RvcCBhdXRvYm9vdDogIDMgDQo="
+  - action: wait_wire_marker
+    marker: "Hit any key"
+    observation: "serial_write"
+    timeout_s: 10
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo X"]
+    save_as: quiet_x
+    expect: {ok: false, error_code: AUTOBOOT_QUIET, has_keys: [retry_after_s]}
+  - action: op_end
+    op_id: quiet
+  - action: assert_zero_tx
+    op_id: quiet
+  - action: assert_command_resolved
+    from: quiet_x
+    timeout_s: 10
+    payload: "echo X\n"

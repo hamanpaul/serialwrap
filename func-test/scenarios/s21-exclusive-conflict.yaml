@@ -1,0 +1,69 @@
+---
+meta:
+  name: s21-exclusive-conflict
+  category: l15-scenario
+  severity: critical
+  description: "端點被遵守鎖的外部工具（flock＋TIOCEXCL）持有時 session 不進 READY、attach 回 DEVICE_STILL_HELD 且零 TX（Slice 2.1 Task 21，BC-04、SC-05）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 90
+    invariants: [zero_tx_on_reject, no_reopen_before_handoff, insufficient_evidence_not_pass]
+    behavior_changes: ["BC-04", "SC-05"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  # 限制：runner 的 steps 在 daemon 啟動後才執行，無法在 daemon 啟動前 external_open；
+  # 以 device release 讓 daemon 交出端點後再由外部工具占用，近似「daemon 尚未持有時已被外部占用」。
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: release
+  - action: op_begin
+    op_id: conflict
+  - action: assert_peer_closed
+    at_op: release
+    until_op: conflict
+  - action: external_open
+    target: session_slave
+    hold: flock_tiocexcl
+    save_as: ext
+    expect: {opened: true}
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.state"
+    in: [DETACHED, ATTACHED, RELEASED]
+    timeout_s: 10
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    save_as: att_held
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0}
+  # session 不得進 READY（attach 被拒後仍停在非 READY 狀態）
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.state"
+    in: [DETACHED, ATTACHED, RELEASED]
+    timeout_s: 10
+  - action: op_end
+    op_id: conflict
+  - action: assert_zero_tx
+    op_id: conflict
+  - action: external_close
+    from: ext

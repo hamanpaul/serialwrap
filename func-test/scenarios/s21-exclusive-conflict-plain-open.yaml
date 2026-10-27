@@ -1,0 +1,81 @@
+---
+meta:
+  name: s21-exclusive-conflict-plain-open
+  category: l15-scenario
+  severity: critical
+  description: "不取鎖的外部工具（普通 open，模擬 minicom）先持有端點時，attach 與 attach --force 皆回 DEVICE_STILL_HELD{pids,holder_unknown:false} 且零 TX；外部關閉後 attach 成功並 READY（規格 §6.2，BC-04、SC-05）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 90
+    invariants: [zero_tx_on_reject, no_reopen_before_handoff, insufficient_evidence_not_pass]
+    behavior_changes: ["BC-04", "SC-05"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  # 限制：runner 的 steps 在 daemon 啟動後才執行，無法在 daemon 啟動前 external_open；
+  # 以 device release 讓 daemon 交出端點（並解除 TIOCEXCL）後再由普通 open 占用，近似規格情境。
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: release
+  - action: op_begin
+    op_id: attach-plain
+  - action: assert_peer_closed
+    at_op: release
+    until_op: attach-plain
+  - action: external_open
+    target: session_slave
+    hold: plain
+    save_as: ext
+    expect: {opened: true}
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.state"
+    in: [DETACHED, RELEASED]
+    timeout_s: 10
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    save_as: att_plain
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0}
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0", "--force"]
+    save_as: att_plain_force
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0}
+  # external_close 前 session 不得進 ATTACHING／READY
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.state"
+    in: [DETACHED, RELEASED]
+    timeout_s: 10
+  - action: op_end
+    op_id: attach-plain
+  - action: assert_zero_tx
+    op_id: attach-plain
+  - action: external_close
+    from: ext
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: wait_state
+    selector: COM0
+    state: READY
+    timeout_s: 20
+  - action: assert_compare

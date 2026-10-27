@@ -1,0 +1,277 @@
+---
+meta:
+  name: s21-wal-unlink-under-traffic
+  category: l15-scenario
+  severity: critical
+  description: "背景每 100 ms 一筆命令期間外部 unlink 目前 WAL，daemon 重建 WAL 並寫入缺口 META（loss_flag、potentially_lost_seq_range、range_known），之後每筆命令 TX 紀錄 CRC／len 正確（F12 修訂 oracle；Slice 2.1 Task 21，BC-01）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 120
+    invariants: [insufficient_evidence_not_pass]
+    behavior_changes: ["BC-01"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: "until_op:unlink-window"}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  # wire==WAL 比對只到 unlink 窗口開始前（unlink 之後 WAL 依設計可有缺口，由 assert_wal_meta 判定）
+  - action: op_begin
+    op_id: unlink-window
+  - action: parallel
+    steps:
+      # 背景流量：每 100 ms 一筆命令
+      - action: repeat
+        count: 1
+        steps:
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_01"]
+            save_as: bg01
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_02"]
+            save_as: bg02
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_03"]
+            save_as: bg03
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_04"]
+            save_as: bg04
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_05"]
+            save_as: bg05
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_06"]
+            save_as: bg06
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_07"]
+            save_as: bg07
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_08"]
+            save_as: bg08
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_09"]
+            save_as: bg09
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_10"]
+            save_as: bg10
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_11"]
+            save_as: bg11
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_12"]
+            save_as: bg12
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_13"]
+            save_as: bg13
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_14"]
+            save_as: bg14
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_15"]
+            save_as: bg15
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_16"]
+            save_as: bg16
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_17"]
+            save_as: bg17
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_18"]
+            save_as: bg18
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_19"]
+            save_as: bg19
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+          - action: cli
+            argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_BG_20"]
+            save_as: bg20
+            expect: {ok: true}
+          - action: sleep
+            seconds: 0.1
+      # 第 5 筆背景命令寫到 wire 後才 unlink（以 wire marker 同步，不用固定 sleep）
+      - action: repeat
+        count: 1
+        steps:
+          - action: wait_wire_marker
+            marker: "echo WAL_BG_05\n"
+            observation: "serial_read"
+            timeout_s: 15
+          - action: wal_control
+            op: unlink_current
+  - action: wait_command_done
+    cmd_id: "{bg20.cmd_id}"
+    timeout_s: 30
+  - action: op_end
+    op_id: unlink-window
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_01"]
+    save_as: after01
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after01.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_02"]
+    save_as: after02
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after02.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_03"]
+    save_as: after03
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after03.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_04"]
+    save_as: after04
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after04.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_05"]
+    save_as: after05
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after05.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_06"]
+    save_as: after06
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after06.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_07"]
+    save_as: after07
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after07.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_08"]
+    save_as: after08
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after08.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_09"]
+    save_as: after09
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after09.cmd_id}"
+    timeout_s: 15
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_AFTER_10"]
+    save_as: after10
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{after10.cmd_id}"
+    timeout_s: 15
+  - action: assert_wal_meta
+    contains_value: "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"
+    loss_flag: true
+    has_keys: ["potentially_lost_seq_range", "range_known"]
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_01"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_02"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_03"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_04"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_05"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_06"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_07"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_08"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_09"
+    dir: "TX"
+  - action: assert_wal_marker
+    marker: "echo WAL_AFTER_10"
+    dir: "TX"
