@@ -198,6 +198,18 @@ impl Mailbox {
         self.full_backlog_notifier = Some(notifier);
     }
 
+    /// 測試用（Task 12b 延遲探針）：safety／control lane 尚有未取出的事件。
+    #[cfg(feature = "test-fakes")]
+    pub fn control_waiting(&self) -> bool {
+        !self.safety_rx.is_empty() || !self.control_rx.is_empty()
+    }
+
+    /// 測試用（Task 12b 延遲探針）：data lane 目前積壓筆數。
+    #[cfg(feature = "test-fakes")]
+    pub fn data_backlog(&self) -> usize {
+        self.data_rx.len()
+    }
+
     pub fn data_sender(&self) -> Sender<DataEvent> {
         self.data_tx.clone()
     }

@@ -1246,6 +1246,21 @@ impl ActorRig {
         self.wal.health().write_failures
     }
 
+    /// Task 12b：WAL 健康快照（`healthy` 等斷言用）。
+    pub fn wal_health(&self) -> sw_core::wal::WalHealth {
+        self.wal.health()
+    }
+
+    /// Task 12b：actor 事件延遲探針（test-fakes）。
+    pub fn actor_probe(&self) -> Arc<sw_core::actor::ActorLatencyProbe> {
+        self.actor.probe.clone()
+    }
+
+    /// Task 12b：actor data lane 的送出端（滿載測試直接注入 RX chunk）。
+    pub fn data_sender(&self) -> Sender<DataEvent> {
+        self.actor.data.clone()
+    }
+
     /// Task 14：直接投遞 control 事件（例如另一路徑的 `DeviceAttached`）。
     pub fn send_control(&self, ev: ControlEvent) {
         let _ = self.actor.control.send(ev);
