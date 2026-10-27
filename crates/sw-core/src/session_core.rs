@@ -2556,11 +2556,7 @@ impl SessionCore {
         }
         self.foreground_reboot = false;
         self.quiet.arm(now);
-        // 增補 #13：reboot 命令命中點為 BC-02 失效點（07 D-02）。
-        let mut fx = Vec::new();
-        self.invalidate_input(InvalidateReason::RebootCommand, &mut fx);
-        fx.extend(self.apply_quiet_armed(now));
-        fx
+        self.apply_quiet_armed(now)
     }
 
     fn timer(&mut self, event: TimerEvent, now: Mono) -> Vec<Effect> {
@@ -3464,6 +3460,10 @@ impl SessionCore {
             }
             let reboot = !self.is_passthrough() && is_reboot_command(&command.req.command);
             self.command_fg_begin(&command.req.origin, false);
+            if reboot {
+                // 增補 #13：reboot 命令命中點為 BC-02 失效點，送出前失效（`bridge.invalidate_deferred("reboot")`）。
+                self.invalidate_input(InvalidateReason::RebootCommand, &mut effects);
+            }
             let grant = self.new_grant(grant_cmd);
             self.pending_ops.insert(
                 grant.op_id,
