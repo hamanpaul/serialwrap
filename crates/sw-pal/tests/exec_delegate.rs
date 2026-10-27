@@ -59,34 +59,83 @@ fn exec_or_wait_reports_missing_program() {
 // Windows 互動 console 的 Ctrl 事件轉送（僅 Windows 原生執行；WSL interop 不能充數）。
 #[cfg(windows)]
 mod win_ctrl {
+    use std::io::Write;
     use std::os::windows::process::CommandExt;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus};
     use std::time::{Duration, Instant};
 
     pub const CTRL_C_EVENT: u32 = 0;
     pub const CTRL_BREAK_EVENT: u32 = 1;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    pub const CHILD_ENV: &str = "SW_PAL_CTRLC_CHILD";
+    pub const READY_ENV: &str = "SW_PAL_CTRLC_READY";
+    /// 擁有者 runbook 指定的診斷目錄；未設時用 `%TEMP%`。console 輸出未被 transcript 收錄時仍可由此取證。
+    pub const DIAG_ENV: &str = "SW_PAL_CTRLC_DIAG_DIR";
 
     pub fn interactive_console_attached() -> bool {
         use std::io::IsTerminal;
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
     }
 
-    pub fn spawn_self_in_new_console_group(test: &str, env_key: &str) -> Child {
+    pub fn diag_dir() -> PathBuf {
+        let dir = std::env::var_os(DIAG_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&dir).expect("建立診斷目錄");
+        dir
+    }
+
+    /// 逐列附加並立即 flush；panic 前已寫入的列不會遺失。
+    pub fn diag(path: &Path, line: &str) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("開啟診斷檔");
+        writeln!(f, "{line}").expect("寫入診斷檔");
+        f.flush().expect("flush 診斷檔");
+    }
+
+    // 必須帶 `--ignored`：本測試為 #[ignore]，缺此旗標時子 libtest 直接略過並以 0 結束（OD-29 W 空跑根因）。
+    pub fn spawn_self_in_new_console_group(test: &str, ready: &Path) -> Child {
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test, "--nocapture"])
-            .env(env_key, "1")
+            .args(["--ignored", "--exact", test, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env(READY_ENV, ready)
             .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .unwrap()
     }
 
-    pub fn send_console_ctrl(event: u32, group_id: u32) {
+    /// CREATE_NEW_PROCESS_GROUP 會代子行程隱式呼叫 `SetConsoleCtrlHandler(NULL, TRUE)`（停用 Ctrl+C，且由其子孫繼承）；
+    /// 子行程在委派前重新啟用，孫行程才會收到送往本 process group 的 CTRL_C_EVENT。
+    pub fn reenable_ctrl_c() -> bool {
+        // SAFETY: 僅以 NULL handler 與整數旗標呼叫 Win32 API；失敗以回傳值判定。
+        unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) != 0 }
+    }
+
+    pub fn send_console_ctrl(event: u32, group_id: u32) -> bool {
         // SAFETY: 僅傳遞整數參數給 Win32 API；失敗以回傳值判定。
-        let ok = unsafe {
-            windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(event, group_id)
-        };
-        assert!(ok != 0, "GenerateConsoleCtrlEvent 失敗");
+        unsafe { windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(event, group_id) != 0 }
+    }
+
+    pub fn wait_for_file(path: &Path, child: &mut Child, limit: Duration) -> Result<String, String> {
+        let t0 = Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.trim().is_empty() {
+                    return Ok(text.trim().to_string());
+                }
+            }
+            if let Some(st) = child.try_wait().unwrap() {
+                return Err(format!("子行程在寫出 ready 標記前已結束：{st:?}"));
+            }
+            if t0.elapsed() >= limit {
+                return Err(format!("{limit:?} 內未出現 ready 標記"));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn wait_with_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
@@ -108,14 +157,19 @@ mod win_ctrl {
 #[ignore = "cap:interactive_desktop"]
 #[allow(non_snake_case)] // 依 P3 規範：cap_<resource>__<name> 命名
 fn cap_interactive_desktop__exec_or_wait_ctrl_c() {
+    const TEST: &str = "cap_interactive_desktop__exec_or_wait_ctrl_c";
     let probe = sw_pal::native_client();
-    assert!(
-        probe.caps.path_flavor == sw_pal::PalPathFlavor::Windows
-            && win_ctrl::interactive_console_attached(),
-        "cap:interactive_desktop 需要 Windows 互動 console（證據不足，非 PASS）"
-    );
-    if std::env::var_os("SW_PAL_CTRLC_CHILD").is_some() {
-        // 子：委派到一個會等待 30 s 的程式；Ctrl 事件應終止孫行程，並由 exec_or_wait 照傳 exit code。
+    let attached = win_ctrl::interactive_console_attached();
+    if std::env::var_os(win_ctrl::CHILD_ENV).is_some() {
+        // 子：先重新啟用 Ctrl+C，寫出 ready 標記（證明確實進入子分支），再委派到會等待 30 s 的程式；
+        // Ctrl 事件應終止孫行程，並由 exec_or_wait 照傳 exit code。
+        let ready = std::path::PathBuf::from(std::env::var_os(win_ctrl::READY_ENV).expect("缺少 READY 環境變數"));
+        let reenabled = win_ctrl::reenable_ctrl_c();
+        win_ctrl::diag(
+            &ready,
+            &format!("child pid={} interactive={attached} ctrl_c_reenabled={reenabled}", std::process::id()),
+        );
+        assert!(reenabled, "子行程重新啟用 Ctrl+C 失敗");
         let e = probe.process.exec_or_wait(
             &[
                 "cmd.exe".into(),
@@ -127,17 +181,47 @@ fn cap_interactive_desktop__exec_or_wait_ctrl_c() {
         );
         panic!("exec_or_wait 返回錯誤：{e:?}");
     }
-    for event in [win_ctrl::CTRL_C_EVENT, win_ctrl::CTRL_BREAK_EVENT] {
-        let mut child = win_ctrl::spawn_self_in_new_console_group(
-            "cap_interactive_desktop__exec_or_wait_ctrl_c",
-            "SW_PAL_CTRLC_CHILD",
-        );
+    let dir = win_ctrl::diag_dir();
+    let parent_diag = dir.join("ctrl_c-parent.txt");
+    let _ = std::fs::remove_file(&parent_diag);
+    win_ctrl::diag(
+        &parent_diag,
+        &format!("parent pid={} interactive={attached} exe={}", std::process::id(), std::env::current_exe().unwrap().display()),
+    );
+    assert!(
+        probe.caps.path_flavor == sw_pal::PalPathFlavor::Windows && attached,
+        "cap:interactive_desktop 需要 Windows 互動 console（證據不足，非 PASS）"
+    );
+    for (event, name) in [(win_ctrl::CTRL_C_EVENT, "ctrl_c"), (win_ctrl::CTRL_BREAK_EVENT, "ctrl_break")] {
+        let ready = dir.join(format!("ctrl_c-child-{name}.txt"));
+        let _ = std::fs::remove_file(&ready);
+        let mut child = win_ctrl::spawn_self_in_new_console_group(TEST, &ready);
+        win_ctrl::diag(&parent_diag, &format!("{name}: spawned child pid={}", child.id()));
+        // ready 標記未出現即 FAIL：防止子行程未進入子分支（例如漏 `--ignored` 被略過）時空跑。
+        let marker = match win_ctrl::wait_for_file(&ready, &mut child, std::time::Duration::from_secs(10)) {
+            Ok(marker) => marker,
+            Err(reason) => {
+                let _ = child.kill();
+                win_ctrl::diag(&parent_diag, &format!("{name}: FAIL {reason}"));
+                panic!("{name}: {reason}");
+            }
+        };
+        win_ctrl::diag(&parent_diag, &format!("{name}: ready {marker}"));
+        // 標記寫在委派之前：再等 2 s 讓孫行程建立。
         std::thread::sleep(std::time::Duration::from_secs(2));
-        win_ctrl::send_console_ctrl(event, child.id());
-        let st = win_ctrl::wait_with_timeout(&mut child, std::time::Duration::from_secs(10))
-            .expect("10 s 內未結束");
-        assert_eq!(st.code().map(|c| c as u32), Some(0xC000_013A), "event={event}");
+        let sent = win_ctrl::send_console_ctrl(event, child.id());
+        win_ctrl::diag(&parent_diag, &format!("{name}: GenerateConsoleCtrlEvent({event}, {}) ok={sent}", child.id()));
+        assert!(sent, "{name}: GenerateConsoleCtrlEvent 失敗");
+        let st = win_ctrl::wait_with_timeout(&mut child, std::time::Duration::from_secs(10));
+        let code = st.and_then(|st| st.code()).map(|c| c as u32);
+        win_ctrl::diag(&parent_diag, &format!("{name}: exit={st:?} code={code:x?}"));
+        if st.is_none() {
+            let _ = child.kill();
+            panic!("{name}: 10 s 內未結束");
+        }
+        assert_eq!(code, Some(0xC000_013A), "event={event}");
     }
+    win_ctrl::diag(&parent_diag, "PASS");
 }
 
 // 非 Windows：明確失敗（證據不足），不得空跑成 PASS。
