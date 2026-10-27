@@ -778,6 +778,8 @@ fn login_failure_code_table() {
     // (a) SessionAttach 可見的列：ActorRig 實機路徑。
     // Python `attach_session` 在 ATTACHED 分支會經 `_probe_existing_bridge` 重新 probe，故 FakeDevice 的一次性
     // 回應（`on_tx_reply`）於 SessionAttach 前重新佈署（`rearm`）；持續性比對（`on_tx_match`）只佈署一次（`setup`）。
+    // P7 Task 5 起 ATTACHED＋prompt 類失敗會由 1 s tick 自動重探（Python `reconcile_readiness`），自動 probe 可能先吃掉
+    // 一次性回應；故對 "\n" 的回應改為持續性比對（每次 probe 皆回同一內容），結果不受自動／手動 probe 交錯影響。
     // LOGIN_PROMPT_TIMEOUT 列：Python 的 attach 路徑 `ensure_ready` 失敗會關 bridge 回 DETACHED，故改為先以
     // 未解析帳密停 ATTACHED（CREDENTIALS_UNRESOLVED），補 env 後由 SessionAttach 的既有 bridge 再探觸發
     // `ensure_ready` → LOGIN_PROMPT_TIMEOUT（停 ATTACHED）。
@@ -793,15 +795,21 @@ fn login_failure_code_table() {
         Row {
             code: "LOGIN_REQUIRED",
             yaml: LOGIN_PROFILE,
-            setup: nothing,
-            rearm: |rig: &ActorRig| rig.dev.on_tx_reply(b"\n", b"\r\nlogin: "),
+            setup: |rig: &ActorRig| {
+                rig.dev
+                    .on_tx_match("^$", Box::new(|_: &[u8]| b"\r\nlogin: ".to_vec()))
+            },
+            rearm: nothing,
             env_after_attach: false,
         },
         Row {
             code: "READY_NONCE_TIMEOUT",
             yaml: SHELL_PROFILE,
-            setup: nothing,
-            rearm: |rig: &ActorRig| rig.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# "),
+            setup: |rig: &ActorRig| {
+                rig.dev
+                    .on_tx_match("^$", Box::new(|_: &[u8]| b"\r\nroot@t:/# ".to_vec()))
+            },
+            rearm: nothing,
             env_after_attach: false,
         },
         Row {
@@ -821,8 +829,10 @@ fn login_failure_code_table() {
                         format!("__READY__{token}\r\n").into_bytes()
                     }),
                 );
+                rig.dev
+                    .on_tx_match("^$", Box::new(|_: &[u8]| b"\r\nroot@t:/# ".to_vec()));
             },
-            rearm: |rig: &ActorRig| rig.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# "),
+            rearm: nothing,
             env_after_attach: false,
         },
         Row {

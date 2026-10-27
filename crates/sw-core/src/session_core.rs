@@ -310,6 +310,8 @@ pub struct SessionCore {
     open_generation: u64,
     known_real_path: Option<String>,
     device_present: bool,
+    /// P7 Task 5：readiness reprobe 進度（`reprobe_attempts`／`next_reprobe_at`／`reprobe_exhausted`、single-flight）。
+    reprobe: crate::reprobe::ReprobeState,
     console_count: usize,
     queue: SessionQueue,
     foreground: Option<OpGrant>,
@@ -405,6 +407,8 @@ enum LoginRunKind {
     Reprobe,
     /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 `ensure_ready`）。
     RebootRecovery,
+    /// P7 Task 5：1 s tick 的自動 readiness reprobe（`_spawn_reprobe_probe` → `_probe_existing_bridge`）。
+    AutoReprobe,
 }
 
 /// 再探等待者的回應形狀。
@@ -485,6 +489,7 @@ impl SessionCore {
             open_generation: 0,
             known_real_path: None,
             device_present: false,
+            reprobe: crate::reprobe::ReprobeState::default(),
             console_count: 0,
             queue: SessionQueue::new(),
             foreground: None,
@@ -773,9 +778,18 @@ impl SessionCore {
             "last_probe_at",
             option_string(self.last_probe_at.as_deref()),
         );
-        out.insert("reprobe_attempts", py_int(0));
-        out.insert("next_reprobe_at", PyValue::Null);
-        out.insert("reprobe_exhausted", PyValue::from(false));
+        out.insert(
+            "reprobe_attempts",
+            py_int(i128::from(self.reprobe.attempts)),
+        );
+        // Python `next_reprobe_at` 為 `time.monotonic()` 秒（float）。
+        out.insert(
+            "next_reprobe_at",
+            self.reprobe.next_reprobe_at.map_or(PyValue::Null, |m| {
+                PyValue::Float(m as f64 / 1_000_000_000.0)
+            }),
+        );
+        out.insert("reprobe_exhausted", PyValue::from(self.reprobe.exhausted));
         out.insert("boot_quiet_remaining_s", boot_quiet_remaining);
         out.insert(
             "ready_reconfirm_pending",
@@ -2437,6 +2451,13 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
+        if self
+            .login_run
+            .as_ref()
+            .is_some_and(|run| run.epoch == epoch && run.kind == LoginRunKind::AutoReprobe)
+        {
+            return self.auto_reprobe_finished(epoch, fsm_gen, result, now);
+        }
         let result = legacy_login_outcome(result);
         if self
             .login_run
@@ -2485,6 +2506,8 @@ impl SessionCore {
                 if reprobe {
                     self.pending_auto_login = false;
                 }
+                // `_reset_reprobe_progress_locked`（READY 轉移點）。
+                crate::reprobe::reset(&mut self.reprobe);
                 self.confirm_ready();
                 effects.push(Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
@@ -2572,6 +2595,12 @@ impl SessionCore {
         };
         if let Some(run) = self.login_run.as_mut() {
             if run.kind == LoginRunKind::Reprobe && run.epoch == epoch {
+                run.waiters.push((reply, kind));
+                return Vec::new();
+            }
+            // 自動重探進行中：Python 手動 attach／recover 會等 auto worker 釋放 probe 鎖後再自行 probe——
+            // 先掛在 auto run 上，auto 收斂後再以新世代重跑（`auto_reprobe_finished`）。
+            if run.kind == LoginRunKind::AutoReprobe && run.epoch == epoch {
                 run.waiters.push((reply, kind));
                 return Vec::new();
             }
@@ -2794,6 +2823,7 @@ impl SessionCore {
             self.close_lease(true);
         }
         effects.extend(self.reboot_recovery_tick(now));
+        effects.extend(self.reprobe_tick(now));
         let flash_off = self.deps.fence.with(|f| f.flash_mode == FlashMode::Off);
         if self.is_passthrough()
             && self.state == SessionState::Attached
@@ -2813,6 +2843,251 @@ impl SessionCore {
             }));
         }
         effects
+    }
+
+    /// P7 Task 5：`reconcile_readiness` 的單一 session 部分（`_prepare_reprobe_locked`＋worker 寫入前最終驗證）。
+    fn reprobe_tick(&mut self, now: Mono) -> Vec<Effect> {
+        if self.shutdown_requested
+            || self.stop.is_some()
+            || self.pending_open_stop.is_some()
+            || self.pending_attach.is_some()
+            || self.open_real_path.is_some()
+            || self.login_run.is_some()
+            || self.foreground.is_some()
+        {
+            return Vec::new();
+        }
+        let state = self.state.as_str();
+        let last_error = self.last_error.clone();
+        // human_active：Python `_human_active_locked`（human lease＋外部 peer＋60 s 內有輸入）；human lease 由 P6
+        // console 建立（07 T7 `lease_context` 骨架），P6 合入前不可能成立。
+        let human_active = false;
+        let input = crate::reprobe::ReprobeInput {
+            state,
+            by_id: &self.profile.device_by_id,
+            released: self.state == SessionState::Released,
+            device_present: self.device_present,
+            last_error: last_error.as_deref(),
+            last_rx_mono: (self.last_rx_mono != 0).then_some(self.last_rx_mono),
+            human_active,
+            has_bridge: self.generations.conn_epoch.is_some(),
+            profile: &self.profile,
+        };
+        let was_failed = self.quiet.failed;
+        let action = crate::reprobe::prepare(&mut self.reprobe, &mut self.quiet, &input, now);
+        if !was_failed && self.quiet.failed {
+            self.deps.fence.with(|f| f.reconfirm_pending = false);
+        }
+        match action {
+            None => Vec::new(),
+            Some(crate::reprobe::ReprobeAction::Attach) => {
+                // DETACHED 分支：ATTACHING＋last_error=None 後走既有開埠（`_spawn_attach`）。
+                let Some(real_path) = self.known_real_path.clone() else {
+                    return Vec::new();
+                };
+                self.set_last_error(None, None);
+                self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+                self.open_generation = self.generations.fsm_gen;
+                self.open_real_path = Some(real_path.clone());
+                self.set_state(SessionState::Attaching, now);
+                vec![Effect::OpenBridge {
+                    dev: DevicePath(real_path),
+                    cfg: self.serial_config(),
+                    precheck_holders: false,
+                }]
+            }
+            Some(crate::reprobe::ReprobeAction::Probe) => {
+                let tail = self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS);
+                let valid_input = crate::reprobe::ValidInput {
+                    same_bridge: true,
+                    by_id: &self.profile.device_by_id,
+                    released: self.state == SessionState::Released,
+                    device_present: self.device_present,
+                    state: self.state.as_str(),
+                    last_error: last_error.as_deref(),
+                    human_active,
+                    rx_tail_512: &tail,
+                    profile: &self.profile,
+                };
+                let was_failed = self.quiet.failed;
+                let valid = crate::reprobe::target_still_valid(
+                    &self.reprobe,
+                    &mut self.quiet,
+                    &valid_input,
+                    now,
+                );
+                if !was_failed && self.quiet.failed {
+                    self.deps.fence.with(|f| f.reconfirm_pending = false);
+                }
+                if !valid {
+                    self.reprobe.inflight = false;
+                    return Vec::new();
+                }
+                self.start_auto_reprobe(now)
+            }
+        }
+    }
+
+    /// `_probe_existing_bridge` 的自動重探版（無 RPC 等待者）：新登入世代、重新解析帳密（既有 bridge 路徑不看 pending_auto_login）。
+    fn start_auto_reprobe(&mut self, now: Mono) -> Vec<Effect> {
+        let Some(epoch) = self.generations.conn_epoch else {
+            self.reprobe.inflight = false;
+            return Vec::new();
+        };
+        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+        self.deps.fence.with(|f| {
+            f.fsm_gen = self.generations.fsm_gen;
+            f.quiet_active = false;
+            f.probe_quiet_exempt = false;
+        });
+        let (plan, _) = self.choose_plan(false, false);
+        match plan {
+            LoginPlan::CredentialsUnresolved { reason, env_file } => {
+                // `_probe_existing_bridge`：帳密終態 → ATTACHED＋CREDENTIALS_UNRESOLVED；`_finish_probe_reprobe` 記一次。
+                let mut effects = self.credentials_warning(reason, &env_file);
+                self.recovering = false;
+                self.pending_auto_login = false;
+                self.set_last_error(Some("CREDENTIALS_UNRESOLVED".into()), None);
+                self.set_state(SessionState::Attached, now);
+                effects.extend(self.finish_auto_reprobe(false, now));
+                effects
+            }
+            LoginPlan::None => {
+                self.reprobe.inflight = false;
+                Vec::new()
+            }
+            plan => {
+                self.login_run = Some(LoginRun {
+                    epoch,
+                    kind: LoginRunKind::AutoReprobe,
+                    waiters: Vec::new(),
+                    fsm_gen: self.generations.fsm_gen,
+                    quiet_bumps: 0,
+                    exempt_bumps: 0,
+                    revoked_by_quiet: false,
+                });
+                vec![Effect::StartLogin {
+                    epoch,
+                    fsm_gen: self.generations.fsm_gen,
+                    plan,
+                }]
+            }
+        }
+    }
+
+    /// 自動重探的 `LoginFinished`：`_probe_existing_bridge` 收斂（READY 被 quiet 撤銷時保留 READY；例外 → `REPROBE_FAILED:`）
+    /// 後接 `_finish_probe_reprobe`。
+    fn auto_reprobe_finished(
+        &mut self,
+        epoch: u64,
+        fsm_gen: u64,
+        result: crate::login_fsm::LoginOutcome,
+        now: Mono,
+    ) -> Vec<Effect> {
+        if self.generations.conn_epoch != Some(epoch) || !self.login_gen_current(epoch, fsm_gen) {
+            return Vec::new();
+        }
+        let deferred = self
+            .login_run
+            .take()
+            .map(|run| run.waiters)
+            .unwrap_or_default();
+        let mut effects = self.auto_reprobe_converge(result, now);
+        // 等在 auto run 上的手動 attach／recover：以新世代重新 probe（第一個起 run，其餘加入等待）。
+        for (reply, kind) in deferred {
+            effects.extend(self.reprobe_existing_bridge(reply, kind, now));
+        }
+        effects
+    }
+
+    fn auto_reprobe_converge(
+        &mut self,
+        result: crate::login_fsm::LoginOutcome,
+        now: Mono,
+    ) -> Vec<Effect> {
+        use crate::login_fsm::{LoginAbort, LoginOutcome};
+        if !matches!(self.state, SessionState::Attached | SessionState::Ready) {
+            self.reprobe.inflight = false;
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        match result {
+            LoginOutcome::Raised(exc) => {
+                // `_spawn_reprobe_probe` 的 except：ATTACHED＋REPROBE_FAILED:<型別>、記一次 attempt（不經 finish）。
+                self.reprobe.inflight = false;
+                self.set_last_error(Some(format!("REPROBE_FAILED:{exc}")), None);
+                self.set_state(SessionState::Attached, now);
+                crate::reprobe::record_attempt(&mut self.reprobe, now);
+                return effects;
+            }
+            LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
+                self.reprobe.inflight = false;
+                self.set_last_error(Some("REPROBE_FAILED:TxIncompleteError".into()), None);
+                self.set_state(SessionState::Attached, now);
+                crate::reprobe::record_attempt(&mut self.reprobe, now);
+                return effects;
+            }
+            LoginOutcome::Aborted(_) => {
+                // quiet／新世代撤銷（`_login_tx_refused`）：READY 不變；其餘 ATTACHED＋PROMPT_UNAVAILABLE。
+                self.recovering = false;
+                self.pending_auto_login = false;
+                if self.state != SessionState::Ready {
+                    self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
+                    self.set_state(SessionState::Attached, now);
+                } else {
+                    self.last_error_detail = None;
+                }
+            }
+            LoginOutcome::Ready => {
+                self.recovering = false;
+                self.pending_auto_login = false;
+                self.last_probe_at = Some(self.wall_iso());
+                self.set_last_error(None, None);
+                self.set_state(SessionState::Ready, now);
+                self.last_ready_at = Some(self.wall_iso());
+                self.queue_registered = true;
+                self.confirm_ready();
+                effects.push(Effect::Notify(ManagerNote::SessionReady {
+                    sid: self.sid.clone(),
+                }));
+            }
+            LoginOutcome::NotReady(error) | LoginOutcome::Failed(error) => {
+                self.recovering = false;
+                self.pending_auto_login = false;
+                self.last_probe_at = Some(self.wall_iso());
+                let detail = login_error_detail(&self.deps.rx, &error);
+                self.set_last_error(Some(error), detail);
+                self.set_state(SessionState::Attached, now);
+            }
+        }
+        let became_ready = self.state == SessionState::Ready;
+        effects.extend(self.finish_auto_reprobe(became_ready, now));
+        effects
+    }
+
+    /// `_finish_probe_reprobe`：計次／退避、pending 中確認失敗累加，RX 尾行為 bootloader → BOOTLOADER_STUCK 終態。
+    fn finish_auto_reprobe(&mut self, became_ready: bool, now: Mono) -> Vec<Effect> {
+        let matched = if became_ready {
+            None
+        } else {
+            self.bootloader_evidence()
+        };
+        let was_failed = self.quiet.failed;
+        if let Some(fin) = crate::reprobe::finish_probe(
+            &mut self.reprobe,
+            &mut self.quiet,
+            became_ready,
+            matched,
+            now,
+        ) {
+            if fin.last_error.is_some() {
+                self.set_last_error(fin.last_error, fin.last_error_detail);
+            }
+        }
+        if !was_failed && self.quiet.failed {
+            self.deps.fence.with(|f| f.reconfirm_pending = false);
+        }
+        Vec::new()
     }
 
     fn expire_reconfirm(&mut self, now: Mono) {
