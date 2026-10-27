@@ -7,16 +7,17 @@
 mod support;
 
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::TrySendError;
+use support::*;
 use sw_core::actor::spawn_actor;
 use sw_core::login_fsm::LoginOutcome;
 use sw_core::mailbox::{ControlEvent, DataEvent, Mailbox, MailboxItem};
-use sw_core::session_core::SessionRequest;
+use sw_core::session_core::{Effect, ManagerNote, SessionRequest};
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::traits::Clock;
-use support::*;
 
 fn get_state_req() -> ControlEvent {
     ControlEvent::Request {
@@ -69,7 +70,9 @@ fn control_first_when_independent() {
     for i in 1..=1024u64 {
         dtx.try_send(rx_chunk(1, i)).expect("data lane 容量 1024");
     }
-    mb.control_sender().send(get_state_req()).expect("control 送出");
+    mb.control_sender()
+        .send(get_state_req())
+        .expect("control 送出");
     let mut mb = mb;
     let first = mb
         .recv_next((1, 0), Some(1), None, &*clock)
@@ -85,7 +88,9 @@ fn control_waits_for_dependent_rx() {
     // LoginFinished{after_rx_seq: 3} 必須等 rx_seq 3 處理完才釋放：Data(1)、Data(2)、Data(3)、Control、Data(4)。
     let mut mb = Mailbox::new(256, 1024);
     let clock = FakeClock::at(0, 0);
-    mb.control_sender().send(login_after(1, 3)).expect("control 送出");
+    mb.control_sender()
+        .send(login_after(1, 3))
+        .expect("control 送出");
     let dtx = mb.data_sender();
     for i in 1..=5 {
         dtx.send(rx_chunk(1, i)).expect("data 送出");
@@ -111,7 +116,9 @@ fn independent_control_served_while_dependent_stashed() {
     // 依賴 rx_seq 9 的 login 進入 stash 後，獨立的 Release 不得等待 rx_seq 9。
     let mut mb = Mailbox::new(256, 1024);
     let clock = FakeClock::at(0, 0);
-    mb.control_sender().send(login_after(1, 9)).expect("control 送出");
+    mb.control_sender()
+        .send(login_after(1, 9))
+        .expect("control 送出");
     let dtx = mb.data_sender();
     for i in 1..=3 {
         dtx.send(rx_chunk(1, i)).expect("data 送出");
@@ -122,7 +129,9 @@ fn independent_control_served_while_dependent_stashed() {
         .expect("第一個項目");
     processed = (1, data_seq(&first).expect("第一個應為 Data(1)"));
 
-    mb.control_sender().send(release_req()).expect("release 送出");
+    mb.control_sender()
+        .send(release_req())
+        .expect("release 送出");
     let second = mb
         .recv_next(processed, Some(1), None, &*clock)
         .expect("第二個項目");
@@ -137,18 +146,37 @@ fn stale_epoch_dependency_released_immediately() {
     // stash 內項目的 epoch 已非現行 epoch → 立即釋放，舊 epoch 的 data 不再等待。
     let mut mb = Mailbox::new(256, 1024);
     let clock = FakeClock::at(0, 0);
-    mb.control_sender().send(login_after(1, 9)).expect("control 送出");
+    mb.control_sender()
+        .send(login_after(1, 9))
+        .expect("control 送出");
     let dtx = mb.data_sender();
     for i in 1..=3 {
         dtx.send(rx_chunk(1, i)).expect("data 送出");
     }
-    let first = mb
-        .recv_next((1, 0), Some(2), None, &*clock)
-        .expect("項目");
+    let first = mb.recv_next((1, 0), Some(2), None, &*clock).expect("項目");
     assert!(
-        matches!(first, MailboxItem::Control(ControlEvent::LoginFinished { epoch: 1, .. })),
+        matches!(
+            first,
+            MailboxItem::Control(ControlEvent::LoginFinished { epoch: 1, .. })
+        ),
         "現行 epoch 已是 2，epoch 1 的依賴應立即釋放"
     );
+}
+
+#[test]
+fn zero_rx_dependency_is_ready_on_current_epoch() {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender()
+        .send(login_after(2, 0))
+        .expect("control 送出");
+    let item = mb
+        .recv_next((1, 99), Some(2), None, &*clock)
+        .expect("after_rx_seq=0 不需等待新 chunk");
+    assert!(matches!(
+        item,
+        MailboxItem::Control(ControlEvent::LoginFinished { epoch: 2, .. })
+    ));
 }
 
 #[test]
@@ -156,7 +184,9 @@ fn dependency_released_on_worker_stopped() {
     // 依賴的 rx_seq 不會再到（reader 已結束）：WorkerStopped 到達時，stash 先依序釋放，再回 receipt。
     let mut mb = Mailbox::new(256, 1024);
     let clock = FakeClock::at(0, 0);
-    mb.control_sender().send(login_after(1, 9)).expect("control 送出");
+    mb.control_sender()
+        .send(login_after(1, 9))
+        .expect("control 送出");
     let dtx = mb.data_sender();
     for i in 1..=3 {
         dtx.send(rx_chunk(1, i)).expect("data 送出");
@@ -180,7 +210,11 @@ fn dependency_released_on_worker_stopped() {
             _ => order.push("?"),
         }
     }
-    assert_eq!(order, ["D", "D", "D", "L", "W"], "stash 應在 receipt 前全部釋放");
+    assert_eq!(
+        order,
+        ["D", "D", "D", "L", "W"],
+        "stash 應在 receipt 前全部釋放"
+    );
 }
 
 #[test]
@@ -214,7 +248,173 @@ fn stash_bounded_16() {
             _ => panic!("非預期項目"),
         }
     }
-    assert_eq!((logins, data), (17, 100), "17 個依賴 control 與 100 個 data 皆不得丟棄");
+    assert_eq!(
+        (logins, data),
+        (17, 100),
+        "17 個依賴 control 與 100 個 data 皆不得丟棄"
+    );
+}
+
+#[test]
+fn full_dependency_stash_does_not_block_worker_receipt() {
+    let (event, _) =
+        receive_after_full_dependency_backlog(ControlEvent::WorkerStopped(receipt(1, 1)));
+    assert!(matches!(
+        event,
+        Some(MailboxItem::Control(ControlEvent::WorkerStopped(_)))
+    ));
+}
+
+#[test]
+fn full_dependency_stash_does_not_block_independent_release() {
+    let (event, _) = receive_after_full_dependency_backlog(release_req());
+    assert!(matches!(
+        event,
+        Some(MailboxItem::Control(ControlEvent::Request {
+            req: SessionRequest::Release { .. },
+            ..
+        }))
+    ));
+}
+
+fn receive_after_full_dependency_backlog(
+    safety_event: ControlEvent,
+) -> (Option<MailboxItem>, usize) {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    let ctl = mb.control_sender();
+    let safety = mb.safety_sender();
+    let expect_receipt = matches!(&safety_event, ControlEvent::WorkerStopped(_));
+    let receiver_clock = clock.clone();
+    let (item_tx, item_rx) = crossbeam_channel::bounded(1);
+    let (backlog_full_tx, backlog_full_rx) = crossbeam_channel::bounded(1);
+    mb.notify_when_dependency_backlog_full(backlog_full_tx);
+    let receiver = thread::spawn(move || {
+        let dependency_count =
+            sw_core::resources::MAILBOX_STASH_MAX + 1 + sw_core::resources::MAILBOX_CONTROL_CAP;
+        let mut result = None;
+        let mut released_dependencies = 0;
+        for _ in 0..=dependency_count {
+            let Some(item) = mb.recv_next((1, 0), Some(1), Some(2_000_000_000), &*receiver_clock)
+            else {
+                break;
+            };
+            let is_safety_event = if expect_receipt {
+                matches!(&item, MailboxItem::Control(ControlEvent::WorkerStopped(_)))
+            } else {
+                matches!(
+                    &item,
+                    MailboxItem::Control(ControlEvent::Request {
+                        req: SessionRequest::Release { .. },
+                        ..
+                    })
+                )
+            };
+            if is_safety_event {
+                result = Some(item);
+                break;
+            }
+            if matches!(
+                item,
+                MailboxItem::Control(ControlEvent::LoginFinished { .. })
+            ) {
+                released_dependencies += 1;
+            }
+        }
+        item_tx
+            .send((result, released_dependencies))
+            .expect("接收端仍存在");
+    });
+
+    let (producer_done_tx, producer_done_rx) = crossbeam_channel::bounded(1);
+    let producer = thread::spawn(move || {
+        let dependency_count =
+            sw_core::resources::MAILBOX_STASH_MAX + 1 + sw_core::resources::MAILBOX_CONTROL_CAP;
+        for _ in 0..dependency_count {
+            ctl.send(login_after(1, 100)).expect("依賴控制事件送出");
+        }
+        backlog_full_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("consumer 已確認完整依賴 backlog");
+        safety.send(safety_event).expect("安全控制事件送出");
+        producer_done_tx
+            .send(())
+            .expect("producer 同步接收端仍存在");
+    });
+    producer_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("滿載依賴與安全控制事件都應可送入有界佇列");
+
+    let (item, released_dependencies) = match item_rx.recv_timeout(Duration::from_millis(200)) {
+        Ok(item) => item,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            // 舊實作在滿載分支只等 data；推進假時鐘讓錯誤路徑有界結束。
+            clock.advance(Duration::from_secs(2));
+            item_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("滿載分支應在假期限到達後結束")
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            panic!("mailbox 接收端不應提前結束")
+        }
+    };
+    if expect_receipt {
+        assert_eq!(
+            released_dependencies,
+            sw_core::resources::MAILBOX_STASH_MAX + 1 + sw_core::resources::MAILBOX_CONTROL_CAP,
+            "WorkerStopped receipt 前須釋放完整容量的同 epoch 依賴"
+        );
+    } else {
+        assert_eq!(released_dependencies, 0, "Release 不需等待依賴事件釋放");
+    }
+    producer.join().expect("producer 應正常結束");
+    receiver.join().expect("receiver 應正常結束");
+    (item, released_dependencies)
+}
+
+struct ReadyNotifyExec(crossbeam_channel::Sender<()>);
+
+impl sw_core::actor::EffectExecutor for ReadyNotifyExec {
+    fn execute(
+        &mut self,
+        effect: Effect,
+        _tx: &crossbeam_channel::Sender<ControlEvent>,
+        _safety: &crossbeam_channel::Sender<ControlEvent>,
+    ) {
+        match effect {
+            Effect::Notify(ManagerNote::SessionReady { .. }) => {
+                let _ = self.0.try_send(());
+            }
+            Effect::Reply(reply, result) => {
+                let _ = reply.try_send(result);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn actor_ticks_passthrough_ready_without_followup_event() {
+    let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);
+    h.to_attached(None);
+    let clock: Arc<dyn Clock> = h.clock.clone();
+    let fake_clock = h.clock.clone();
+    let core = h.core;
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+    let handle = spawn_actor(
+        core,
+        Mailbox::new(256, 1024),
+        Box::new(ReadyNotifyExec(ready_tx)),
+        clock,
+    );
+
+    handle
+        .request(SessionRequest::GetState, Duration::from_millis(200))
+        .expect("actor 啟動後應可回應");
+    fake_clock.advance(Duration::from_secs(31));
+    ready_rx
+        .recv_timeout(Duration::from_millis(200))
+        .expect("沒有後續事件時仍須由 actor tick 推進 READY");
 }
 
 #[test]
@@ -244,13 +444,63 @@ fn fake_clock_advance_wakes_timer_promptly() {
         let d = handle
             .request(SessionRequest::GetState, Duration::from_millis(100))
             .expect("GetState");
-        if d.get("drain_stalled") == Some(&sw_proto::pyjson::PyValue::Bool(true)) {
+        let stalled_in_session = match d.get("session") {
+            Some(sw_proto::pyjson::PyValue::Dict(session)) => {
+                session.get("drain_stalled") == Some(&sw_proto::pyjson::PyValue::Bool(true))
+            }
+            _ => false,
+        };
+        if stalled_in_session {
             stalled = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(stalled, "advance 後 200 ms 內應處理 DrainTimeout（drain_stalled=true）");
+    assert!(
+        stalled,
+        "advance 後 200 ms 內應處理 DrainTimeout（drain_stalled=true）"
+    );
+}
+
+#[test]
+fn fake_clock_advance_observes_drain_timeout_in_session() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let clock: Arc<dyn Clock> = h.clock.clone();
+    let clock_fake = h.clock.clone();
+    let core = h.core;
+    let handle = spawn_actor(core, Mailbox::new(256, 1024), Box::new(ReplyExec), clock);
+
+    handle
+        .control
+        .send(ControlEvent::DeviceDetached {
+            by_id: DEVICE_BY_ID.into(),
+            reason: sw_core::mailbox::DetachReason::Removed,
+        })
+        .expect("control 送出");
+    std::thread::sleep(Duration::from_millis(50));
+    clock_fake.advance(Duration::from_millis(3_001));
+
+    let started = Instant::now();
+    let mut stalled = false;
+    while started.elapsed() < Duration::from_millis(200) {
+        let response = handle
+            .request(SessionRequest::GetState, Duration::from_millis(100))
+            .expect("GetState");
+        let nested = response.get("session").and_then(|value| match value {
+            sw_proto::pyjson::PyValue::Dict(session) => session.get("drain_stalled"),
+            _ => None,
+        });
+        if nested == Some(&sw_proto::pyjson::PyValue::Bool(true)) {
+            stalled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        stalled,
+        "GetState 的 session.drain_stalled 應於 FakeClock 到期後為 true"
+    );
 }
 
 #[test]
@@ -262,7 +512,24 @@ fn control_lane_bounded_256() {
     }
     match ctl.try_send(ControlEvent::Tick) {
         Err(TrySendError::Full(_)) => {}
-        other => panic!("第 257 筆應回 Full，實際：{}", if other.is_ok() { "Ok" } else { "Err" }),
+        other => panic!(
+            "第 257 筆應回 Full，實際：{}",
+            if other.is_ok() { "Ok" } else { "Err" }
+        ),
+    }
+
+    let safety = mb.safety_sender();
+    for _ in 0..sw_core::resources::MAILBOX_CONTROL_CAP {
+        safety
+            .try_send(ControlEvent::Tick)
+            .expect("safety lane 256 筆應可排入");
+    }
+    match safety.try_send(ControlEvent::Tick) {
+        Err(TrySendError::Full(_)) => {}
+        other => panic!(
+            "safety lane 第 257 筆應回 Full，實際：{}",
+            if other.is_ok() { "Ok" } else { "Err" }
+        ),
     }
 }
 
@@ -275,7 +542,10 @@ fn data_lane_bounded_1024() {
     }
     match dtx.try_send(rx_chunk(1, 1025)) {
         Err(TrySendError::Full(_)) => {}
-        other => panic!("第 1025 筆應回 Full，實際：{}", if other.is_ok() { "Ok" } else { "Err" }),
+        other => panic!(
+            "第 1025 筆應回 Full，實際：{}",
+            if other.is_ok() { "Ok" } else { "Err" }
+        ),
     }
 }
 

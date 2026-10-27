@@ -343,6 +343,8 @@ struct LedgerGaugeCells {
     settled_total: AtomicU64,
     settle_dropped: AtomicU64,
     saturated: AtomicBool,
+    /// P5-T14：writer thread 已結束收尾（之後送入的 job 不會再被回覆；crossbeam array channel 在仍有 Sender 時不丟棄緩衝訊息）。
+    closed: AtomicBool,
 }
 
 impl LedgerGaugeCells {
@@ -392,6 +394,21 @@ impl TxWriterHandle {
 
     pub fn ledger_gauge(&self) -> TxLedgerGauge {
         self.gauge.load()
+    }
+
+    /// P5-T14：等待某筆 job 的 `TxReport`；writer 已結束（stop 後才排入、未被回覆）時回 `None`，不會永久阻塞。
+    pub fn wait_report(&self, report: &crossbeam_channel::Receiver<TxReport>) -> Option<TxReport> {
+        loop {
+            match report.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(report) => return Some(report),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return None,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if self.gauge.closed.load(Ordering::Acquire) {
+                        return report.try_recv().ok();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -611,6 +628,8 @@ impl TxWriter {
         for op_id in self.settle.try_iter() {
             ledger.settle(op_id);
         }
+        // P5-T14：先標記 closed，再收斂佇列；之後才送入的 job 由 `wait_report` 依 closed 旗標收尾。
+        self.gauge.closed.store(true, Ordering::Release);
         for job in self.jobs.try_iter() {
             let op_id = job.permit.op_id;
             let known = ledger.ops.contains_key(&op_id);

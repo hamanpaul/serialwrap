@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use crate::traits::{
     CancelToken, CloseReceipt, CloseToken, DevicePath, HolderReport, HolderScanStatus, OpenError,
-    PalError, PalResult, ReadOutcome, SerialBackend, SerialConfig, SerialHandle, SerialReader,
+    PalError, PalResult, ReadError, ReadOutcome, SerialBackend, SerialConfig, SerialHandle,
+    SerialReader,
     SerialWriter, SubmitGate, SubmitRevoked, SubmitStep, TxOutcome, TxResult, UartExclusive,
 };
 
@@ -310,6 +311,8 @@ pub(crate) struct FakeDeviceInner {
     access_denied: AtomicBool,
     woken: AtomicBool,
     peer_closed: AtomicBool,
+    eof_reads: AtomicUsize,
+    read_errors: AtomicUsize,
     on_os_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     paused: Mutex<bool>,
     paused_cond: Condvar,
@@ -340,6 +343,8 @@ impl FakeDeviceInner {
             access_denied: AtomicBool::new(false),
             woken: AtomicBool::new(false),
             peer_closed: AtomicBool::new(false),
+            eof_reads: AtomicUsize::new(0),
+            read_errors: AtomicUsize::new(0),
             on_os_submit_hook: Mutex::new(None),
             paused: Mutex::new(false),
             paused_cond: Condvar::new(),
@@ -568,6 +573,23 @@ impl FakeDevice {
         self.inner.cond.notify_all();
     }
 
+    /// Fake reader 已觀察到的 EOF 次數（供同步測試使用）。
+    pub fn eof_reads(&self) -> usize {
+        self.inner.eof_reads.load(Ordering::SeqCst)
+    }
+
+    /// Fake reader 已觀察到的讀取錯誤次數（供同步測試使用）。
+    pub fn read_errors(&self) -> usize {
+        self.inner.read_errors.load(Ordering::SeqCst)
+    }
+
+    /// 模擬裝置拔除；既有 handle 仍開啟，但後續讀取回錯誤。
+    pub fn remove(&self) {
+        self.inner.removed.store(true, Ordering::SeqCst);
+        let _g = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.cond.notify_all();
+    }
+
     /// 只含已「確認寫出」的 bytes；讀後清空。
     pub fn take_tx(&self) -> Vec<u8> {
         let mut tx = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -744,7 +766,7 @@ impl SerialHandle for FakeSerialHandle {
     }
 
     fn is_alive(&self) -> bool {
-        !self.inner.removed.load(Ordering::SeqCst)
+        self.inner.open.load(Ordering::SeqCst)
     }
 }
 
@@ -766,12 +788,20 @@ struct FakeSerialReader {
 }
 
 impl SerialReader for FakeSerialReader {
-    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError> {
         let start = std::time::Instant::now();
         let mut guard = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if self.inner.removed.load(Ordering::SeqCst) {
-                return Err(PalError::io(5, "[Errno 5] Input/output error"));
+                self.inner.read_errors.fetch_add(1, Ordering::SeqCst);
+                return Err(ReadError::Read(PalError::io(
+                    5,
+                    "[Errno 5] Input/output error",
+                )));
             }
             if self.inner.woken.swap(false, Ordering::SeqCst) {
                 return Ok(ReadOutcome::Woken);
@@ -787,6 +817,7 @@ impl SerialReader for FakeSerialReader {
                 }
             }
             if self.inner.peer_closed.load(Ordering::SeqCst) {
+                self.inner.eof_reads.fetch_add(1, Ordering::SeqCst);
                 return Ok(ReadOutcome::Eof);
             }
             match timeout {
@@ -817,6 +848,10 @@ struct FakeCloseImpl {
 }
 
 impl crate::traits::CloseImpl for FakeCloseImpl {
+    fn is_alive(&self) -> bool {
+        self.inner.open.load(Ordering::SeqCst)
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         self.inner.closes.fetch_add(1, Ordering::SeqCst);
         if let Some(err) = self

@@ -1569,6 +1569,9 @@ fn health_keys_order() {
             "write_failures",
             "last_write_error",
             "recreated_count",
+            "rotate_retry",
+            "rotate_deferred",
+            "deferred_delete_pending",
             "healthy",
             "unhealthy_reason",
         ]
@@ -1846,4 +1849,22 @@ fn recreate_meta_matches_contract_schema() {
     let range = int_list(meta.get("potentially_lost_seq_range")).expect("range 應為整數陣列");
     assert_eq!(range.len(), 2);
     assert!(range[0] >= 1 && range[0] <= range[1]);
+}
+
+/// parity-amendments-2026-10-26 #61：暫時性輪替失敗（EACCES）計入 health `rotate_retry`（`wal.py` `_rotate_retry_count`）；
+/// Rust 尚無 OD-19 延遲佇列，`rotate_deferred`／`deferred_delete_pending` 維持 0。
+#[test]
+fn health_rotate_retry_counts_transient_rename_failure() {
+    let (w, fs, _) = writer(ROTATE_200);
+    w.set_warn_sink(Arc::new(|_| {}));
+    w.append(req("RX", "uart", b"x"));
+    fs.fail_next_renames(1, eacces());
+    w.append(req("RX", "uart", b"x"));
+    let d = w.health().to_pydict();
+    assert_eq!(d.get("rotate_retry"), Some(&PyValue::Int(PyInt::Small(1))));
+    assert_eq!(d.get("rotate_deferred"), Some(&PyValue::Int(PyInt::Small(0))));
+    assert_eq!(
+        d.get("deferred_delete_pending"),
+        Some(&PyValue::Int(PyInt::Small(0)))
+    );
 }

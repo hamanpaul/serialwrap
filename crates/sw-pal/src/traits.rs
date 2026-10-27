@@ -717,6 +717,13 @@ pub enum ReadOutcome {
     TimedOut,
 }
 
+/// 序列埠讀取失敗階段；等待失敗與真正讀取失敗對外映射為不同 reason。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReadError {
+    Wait(PalError),
+    Read(PalError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxOutcome {
     NotSubmitted,
@@ -765,6 +772,8 @@ impl CancelToken {
 
 /// `close` 的實作端（各後端與替身各自實作）。
 pub trait CloseImpl: Send {
+    /// 回報底層 serial handle 是否仍有效；不以 EOF 或讀取錯誤推斷 handle 已關閉。
+    fn is_alive(&self) -> bool;
     fn close(self: Box<Self>) -> CloseReceipt;
 }
 
@@ -776,6 +785,10 @@ pub struct CloseToken {
 impl CloseToken {
     pub fn new(inner: Box<dyn CloseImpl>) -> CloseToken {
         CloseToken { inner }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
     }
 
     pub fn close(self, r: Box<dyn SerialReader>, w: Box<dyn SerialWriter>) -> CloseReceipt {
@@ -834,7 +847,11 @@ pub trait UartExclusive: Send + Sync {
 pub trait SerialReader: Send {
     /// 逾時以 `None` 表示無限等待；被 waker 喚醒回 `Woken`。
     /// Windows COM 的 200 ms `COMMTIMEOUTS` idle timeout 只作內部輪詢；無資料時重發讀取，直到呼叫端期限到達。
-    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError>;
 }
 
 /// OS 提交的序列化點（arch §4.2，R0-F1）。`submit` 被撤銷時不得呼叫 `os_submit`。

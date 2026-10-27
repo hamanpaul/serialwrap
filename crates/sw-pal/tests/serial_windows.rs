@@ -138,6 +138,19 @@ fn missing_com_error_code_maps_to_not_found() {
     );
 }
 
+#[test]
+fn read_wait_and_operation_errors_keep_distinct_sources() {
+    let error = PalError::io(5, "[Errno 5] Input/output error");
+    match classify_wait_error(error.clone()) {
+        ReadError::Wait(mapped) => assert_eq!(mapped.os_code, Some(5)),
+        other => panic!("等待失敗應保留為 ReadError::Wait，得到 {other:?}"),
+    }
+    match classify_read_error(error) {
+        ReadError::Read(mapped) => assert_eq!(mapped.os_code, Some(5)),
+        other => panic!("讀取失敗應保留為 ReadError::Read，得到 {other:?}"),
+    }
+}
+
 #[cfg(windows)]
 mod windows_native {
     #![allow(non_snake_case)]
@@ -146,17 +159,17 @@ mod windows_native {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use sw_pal::conformance::{serial_suite, PeerEnd};
+    use sw_pal::conformance::{PeerEnd, serial_suite};
     use sw_pal::serial::windows::WindowsSerialBackend;
     use sw_pal::*;
     use windows_sys::Win32::Devices::Communication::{
-        GetCommState, SetCommState, SetCommTimeouts, SetupComm, COMMTIMEOUTS, DCB,
+        COMMTIMEOUTS, DCB, GetCommState, SetCommState, SetCommTimeouts, SetupComm,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
     };
 
     static COM_TEST_LOCK: Mutex<()> = Mutex::new(());

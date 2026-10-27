@@ -5,7 +5,17 @@
 //!
 //! 本檔提供供 Windows 後端與跨平台測試共用的純函式模型。
 
-use crate::traits::{PalErrorKind, SerialConfig, TxOutcome};
+use crate::traits::{PalError, PalErrorKind, ReadError, SerialConfig, TxOutcome};
+
+/// 等待 API 失敗時保留 `SELECT` 類來源，供 `SerialReader` 對齊 POSIX poll 語意。
+pub fn classify_wait_error(error: PalError) -> ReadError {
+    ReadError::Wait(error)
+}
+
+/// 序列埠讀取 API 失敗時保留 `SERIAL_READ` 類來源。
+pub fn classify_read_error(error: PalError) -> ReadError {
+    ReadError::Read(error)
+}
 
 pub const PYSERIAL_ERROR_CHAR: i8 = 0;
 pub const PYSERIAL_XON_CHAR: i8 = 0x11;
@@ -201,10 +211,7 @@ pub fn map_overlapped_write_completion(
         } else {
             PalErrorKind::TimedOut
         };
-        return (
-            TxOutcome::Completed(transferred),
-            Some(kind),
-        );
+        return (TxOutcome::Completed(transferred), Some(kind));
     }
     map_overlapped_completion(get_result_ok, transferred as u32, win32)
 }
