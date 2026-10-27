@@ -372,6 +372,11 @@ pub trait SysEnv: Send + Sync {
     /// `= Python errno.errorcode.get(code)`。
     fn errno_name(&self, code: i32) -> Option<&'static str>;
     fn pid(&self) -> u32;
+    /// P7 Task 2：daemon 端 `os.path`（`posixpath`／`ntpath`）方言，供 `os.path.expanduser` 等承接選擇；
+    /// 預設 POSIX，Windows 原生實作覆寫。
+    fn path_flavor(&self) -> crate::PalPathFlavor {
+        crate::PalPathFlavor::Posix
+    }
 
     /// 子行程執行（等同 Python `subprocess.run(capture_output=True, text=True)`）。逾時回 `rc=-1`、`stderr="TIMEOUT"`。
     fn run(&self, argv: &[String], timeout: Option<Duration>) -> PalResult<CmdOutput>;

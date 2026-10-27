@@ -61,6 +61,10 @@ unsafe extern "system" fn record_ctrl_c(control_type: u32) -> i32 {
 }
 
 impl SysEnv for NativeSysEnv {
+    fn path_flavor(&self) -> crate::PalPathFlavor {
+        crate::PalPathFlavor::Windows
+    }
+
     fn var(&self, key: &str) -> Option<String> {
         std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
     }
