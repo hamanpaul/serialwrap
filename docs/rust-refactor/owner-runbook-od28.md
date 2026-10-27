@@ -20,7 +20,7 @@
 | `run_id` | throwaway run id |
 | `event` | `launcher_start`（工作被觸發、launcher 開始）／`daemon_started`／`daemon_exit` |
 | `utc` | 事件 UTC 時間（ISO 8601） |
-| `logon_session_start_utc` | 目前互動登入的開始時間（用來證明是本次登入觸發，而非建立當下手動啟動） |
+| `logon_session_start_utc` | 目前互動登入的開始時間（用來證明是本次登入觸發，而非建立當下手動啟動）。**取值來源固定**：`Get-CimInstance Win32_LogonSession`，只取 `LogonType` 為 `2`（Interactive）、`10`（RemoteInteractive）或 `11`（CachedInteractive），且經 `Win32_LoggedOnUser` 關聯到排程工作主體（互動使用者）的 session，取其中最晚的 `StartTime` 轉 UTC。不得以 launcher 自身啟動時間、工作觸發時間或其他時間代替；取值失敗或找不到符合的 session 時寫 `null` |
 | `daemon_pid` | `serialwrapd.exe` PID（`daemon_started` 起） |
 | `daemon_sha256` | 受測 `serialwrapd.exe` 的 sha256 |
 | `exit_code`／`task_state` | `daemon_exit` 時的 exit code 與排程工作狀態 |
@@ -33,7 +33,7 @@
 
 1. agent（WSL）：建置 Rust bundle、以 `SW_TEST_ALLOW_SCHTASKS=1` 執行 `win-task-throwaway.ps1 -RunId <run_id> -Bundle <bundle>` 建立工作，確認 `%LOCALAPPDATA%\Temp\sw-od28\<run_id>\` 尚無 `launcher_start` 列（建立時不手動啟動）。
 2. agent：讓本機工作停在段落（commit 進行中的變更、無前景測試），通知擁有者可以登出。
-3. 擁有者：於選定時間（不早於指定日 09:00）登出 Windows，再登入；同時通知 thala session 配合。
+3. 擁有者：於選定時間（不早於指定日 09:00）登出 Windows，再登入；同時通知 thala session 配合。「指定日」由擁有者在 Task 13 執行前另行指定，並登記於 `owner-decisions-addenda.md`；未登記日期前 agent 不得通知擁有者登出，本文件不預設日期。
 4. 擁有者重新開啟 WSL 後，agent 收取 `%LOCALAPPDATA%\Temp\sw-od28\<run_id>\` 全部檔案到 `~/b-log/rust-refactor/od28/<run_id>/`，核對 `SHA256SUMS` 與 `daemon_sha256`。
-5. 判定：`launcher_start.utc` 晚於 `logon_session_start_utc`，且有 `daemon_started` 與 `daemon_pid` → PASS；否則依實際狀況記 FAIL 或證據不足，不得放寬。
+5. 判定：`launcher_start.utc` 晚於 `logon_session_start_utc`，且有 `daemon_started` 與 `daemon_pid` → PASS；`logon_session_start_utc` 為 `null` → 證據不足（不得以其他時間補值後判 PASS）；否則依實際狀況記 FAIL 或證據不足，不得放寬。
 6. agent：執行 `win-task-throwaway.ps1 -RunId <run_id> -Cleanup`，確認無殘留工作與 throwaway daemon。
