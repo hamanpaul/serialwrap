@@ -308,6 +308,7 @@ dependencies = [
  "sw-core",
  "sw-pal",
  "sw-proto",
+ "tempfile",
 ]
 
 [[package]]

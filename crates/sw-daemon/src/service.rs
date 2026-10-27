@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sw_core::arbiter::{CommandRegistry, SubmitReq};
+use sw_core::event_engine::registry::UpsertError;
+use sw_core::event_engine::schema::RuleError;
+use sw_core::event_engine::EventEngine;
 use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_core::SessionRequest;
 use sw_core::session_manager::SessionManager;
@@ -60,6 +63,8 @@ pub struct Service {
     pub(crate) pid: u32,
     mcu: McuPatternRegistry,
     running: AtomicBool,
+    /// P7 Task 16：Event Engine（組裝點以 `attach_engine` 掛上；未掛上時 `event.*` 維持 METHOD_NOT_FOUND）。
+    engine: std::sync::OnceLock<Arc<EventEngine>>,
 }
 
 /// `Service::new` 的依賴（組裝點由 `daemon_main` 提供）。
@@ -205,6 +210,64 @@ impl Service {
             pid: deps.pid,
             mcu: McuPatternRegistry::default(),
             running: AtomicBool::new(true),
+            engine: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 掛上 Event Engine（只可一次；回 `false` 表示已掛上）。
+    pub fn attach_engine(&self, engine: Arc<EventEngine>) -> bool {
+        self.engine.set(engine).is_ok()
+    }
+
+    /// 10 個 `event.*`（`service.py:1393-1432`，順序同 `_dispatch`）。RPC 連線 thread 上直接呼叫 engine（不經 session actor）。
+    fn event_rpc(
+        &self,
+        engine: &EventEngine,
+        method: &str,
+        params: &PyDict,
+    ) -> Result<PyDict, PyErr> {
+        let p = Params::new(params);
+        let raw = |k: &str| p.raw(k).filter(|v| !v.is_null());
+        let spread = |extra: PyDict| {
+            let mut d = pydict! { "ok" => true };
+            d.update(&extra);
+            d
+        };
+        match method {
+            "event.rule_set" => match engine.rule_set(&PyValue::Dict(params.clone())) {
+                // `{"ok": True, **dict(rule.raw)}`：raw 的 `ok` 覆寫值、位置仍第一（RPC-H-14 KEEP）。
+                Ok(rule) => Ok(spread(rule.raw.clone())),
+                Err(UpsertError::Rule(RuleError::Schema(m) | RuleError::Value(m))) => Ok(pydict! {
+                    "ok" => false, "error_code" => "INVALID_RULE_SCHEMA", "error" => m
+                }),
+                Err(UpsertError::Rule(RuleError::Type(m))) => Err(PyErr::value_error(m)),
+                Err(UpsertError::Io(e)) => Err(pal_err(e)),
+            },
+            "event.rule_delete" => {
+                let deleted = engine.rule_delete(&first_str(&p, &["rule_id"]))?;
+                Ok(pydict! { "ok" => true, "deleted" => deleted })
+            }
+            "event.rule_list" => {
+                let rules = engine.rule_list(raw("selector"), raw("owner"))?;
+                Ok(pydict! { "ok" => true, "rules" => dict_list(rules) })
+            }
+            "event.rule_get" => match engine.rule_get(&first_str(&p, &["rule_id"]))? {
+                Some(d) => Ok(spread(d)),
+                None => Ok(error("RULE_NOT_FOUND")),
+            },
+            "event.com_enable" => Ok(spread(engine.com_enable(&first_str(&p, &["selector"]))?)),
+            "event.com_disable" => Ok(spread(engine.com_disable(&first_str(&p, &["selector"]))?)),
+            "event.com_status" => Ok(spread(engine.com_status(raw("selector"))?)),
+            "event.reset" => {
+                let cleared = engine.reset(raw("rule_id"), raw("selector"))?;
+                Ok(pydict! { "ok" => true, "cleared" => int(cleared) })
+            }
+            "event.reload" => Ok(spread(engine.reload()?)),
+            _ => {
+                let entries =
+                    engine.tail(raw("rule_id"), raw("selector"), raw("since_ts"), raw("n"))?;
+                Ok(pydict! { "ok" => true, "entries" => PyValue::List(entries) })
+            }
         }
     }
 
@@ -696,6 +759,14 @@ impl Service {
             // Slice 2.1 延後的 15 個 method（session.console_*、event.*、file.*）與未知 method：無副作用。
             // test-fakes 建置專用（P5-T19 `handler_panic_does_not_kill_daemon`）：handler 內 panic，驗證 framing 的
             // `catch_unwind` 轉 `EXCEPTION` 且 daemon 存活。產品 build 不編譯此分支（落入 METHOD_NOT_FOUND）。
+            "event.rule_set" | "event.rule_delete" | "event.rule_list" | "event.rule_get"
+            | "event.com_enable" | "event.com_disable" | "event.com_status" | "event.reset"
+            | "event.reload" | "event.tail"
+                if self.engine.get().is_some() =>
+            {
+                let engine = Arc::clone(self.engine.get().expect("guarded"));
+                self.event_rpc(&engine, method, params)
+            }
             #[cfg(feature = "test-fakes")]
             "test.panic" => panic!("slice21 T19 test.panic handler"),
             _ => Ok(pydict! { "ok" => false, "error_code" => "METHOD_NOT_FOUND", "method" => method }),

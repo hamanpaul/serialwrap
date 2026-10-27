@@ -24,3 +24,5 @@ crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
+# P7 Task 16：event RPC 測試的規則／事件目錄。
+tempfile = { workspace = true }

@@ -2155,6 +2155,8 @@ impl EventEngine {
 
 RPC 規則（02 §7.12、09 §3.10）：`rule_set` 成功 `{"ok":true, **raw}`（raw 的 `ok` 覆寫值但位置第一，RPC-H-14 KEEP）；`UpsertError::Rule(Schema|Value)` → `{"ok":false,"error_code":"INVALID_RULE_SCHEMA","error":<msg>}`；`Rule(Type)`／`Io` → framing `EXCEPTION`；`rule_delete` 參數 `str(params.get("rule_id") or "")`、DF-01 不合法回 `deleted:false`；`com_enable/disable` 參數 `str(… or "")`（空字串也進集合）；`com_status`／`rule_list`／`reset`／`tail` 原樣傳值；`reload` 回升冪清單；所有 event 方法經 service 包裝 `setdefault("version")`。emit_fire 在 dispatch **之前**設 exhausted（EVT-D-E1 KEEP）；`ALL` 在 `start`、`rule_set`、`reload` 三處（`auto_enable_com_on_load` 為真時）展開到**當下** `known_coms()`，`triggered_by` 分別為 `auto`／`rule_set`／`reload`，之後才出現的 COM 不會自動啟用（EVT-D-D11 KEEP）；事件順序：`rule_set` 與 `reload` 在鎖內先寫 `com_enabled` 再於鎖外寫 `rule_loaded`，只有 `start` 是 `rule_loaded` 在前（`engine.py:101-114`，以 `event_engine_order` golden 鎖定）；`reload` 不 disable COM（EVT-D-E10 KEEP）；RX 精確 wal_seq：reader 對每個 chunk 以 `WalAppend.seq` 呼叫 `feed_rx`（DF-15）。
 
+**P7 修訂（實作，2026-10-27）：** Python 例外穿出為 RPC EXCEPTION，故 `rule_delete -> Result<bool, PyErr>`、`rule_list -> Result<Vec<PyDict>, PyErr>`、`rule_get -> Result<Option<PyDict>, PyErr>`、`reload -> Result<PyDict, PyErr>`（`added`／`removed`／`changed` 升冪）、`com_enable`／`com_disable`／`com_status -> Result<PyDict, PyErr>`（`com in set` 的 unhashable TypeError）、`reset -> Result<i128, PyErr>`。service 以 `Service::attach_engine(Arc<EventEngine>)` 掛上 engine（不改 `ServiceDeps` 欄位，避免動到 P5 測試組裝）；未掛上時 `event.*` 維持 METHOD_NOT_FOUND。`slice21_scope.yaml` 的 event.* 退役移到 Task 16-wire（daemon 組裝點掛上 engine 的同一 commit），否則黑箱會回 METHOD_NOT_FOUND。matcher 內 counter／log 例外以 panic 表達，由 `MatcherWorker` 的 `catch_unwind` 收斂（Python `_evaluate` 的 `except Exception`）。
+
 - [ ] **Step 1：寫失敗測試**
 
 ```rust
