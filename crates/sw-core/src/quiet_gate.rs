@@ -10,6 +10,9 @@ use sw_proto::pycompat::{py_round, py_strip, shlex_split, splitlines};
 use sw_proto::pypath::{PathFlavor, basename};
 use sw_proto::pyre::{PyFlags, compile};
 
+use sw_proto::pydict;
+use sw_proto::pyjson::{PyDict, PyValue};
+
 use crate::Mono;
 
 pub use sw_proto::pyre::valid_completion_regex;
@@ -142,6 +145,10 @@ impl QuietState {
         profile: &SessionProfile,
         now: Mono,
     ) -> QuietTransition {
+        // `_update_boot_quiet_locked`：passthrough 一律不 arm、不維護 tail（SC-35）。
+        if profile.template.platform == "passthrough" {
+            return QuietTransition::None;
+        }
         let mut window = last_chars(&self.boot_banner_tail, BOOT_BANNER_TAIL_CHARS).to_string();
         window.push_str(chunk);
         if detect_boot_banner(&window) {
@@ -221,28 +228,108 @@ pub fn is_reboot_command(cmd: &str) -> bool {
 // ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
 
 /// `quiet_active && console_unlock_env.is_none()`（`session_manager.py:1193`）；passthrough 恆 false（SC-35）。
-pub fn boot_quiet_blocks_probe(_q: &QuietState, _sp: &SessionProfile, _now: Mono) -> bool {
-    todo!("P7 Task 4")
+pub fn boot_quiet_blocks_probe(q: &QuietState, sp: &SessionProfile, now: Mono) -> bool {
+    let t = &sp.template;
+    t.platform != "passthrough"
+        && q.quiet_active(now)
+        && !t
+            .console_unlock_env
+            .as_deref()
+            .is_some_and(|v| !v.is_empty())
 }
 
 impl QuietState {
-    /// 先 `expire(now, false)`，再 `quiet_active || pending`。
-    pub fn agent_gate_active(&mut self, _now: Mono) -> bool {
-        todo!("P7 Task 4")
+    /// 先 `expire(now, false)`，再 `quiet_active || pending`（`SessionRuntime.agent_gate_active`；passthrough 由呼叫端排除）。
+    pub fn agent_gate_active(&mut self, now: Mono) -> bool {
+        self.expire(now, false);
+        self.quiet_active(now) || self.pending
     }
 }
 
-/// `service._resolve_session_id` 的 gate 段。
-pub fn submit_gate_reject(
-    _public_session: &sw_proto::pyjson::PyDict,
-    _source: &str,
-) -> Option<sw_proto::pyjson::PyDict> {
-    todo!("P7 Task 4")
+/// `READY_RECONFIRM_RETRY_S`：pending-only 時的 `retry_after_s`。
+const READY_RECONFIRM_RETRY_S: f64 = 5.0;
+const QUIET_ACTIVE_HINT: &str =
+    "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送";
+const PENDING_ONLY_HINT: &str =
+    "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送";
+
+fn truthy(v: Option<&PyValue>) -> bool {
+    match v {
+        None | Some(PyValue::Null) => false,
+        Some(PyValue::Bool(b)) => *b,
+        Some(_) => true,
+    }
 }
 
-/// `_agent_gate_reject_locked`＋SC-03 `retry_after_s`。
-pub fn execute_gate_reject(_q: &mut QuietState, _com: &str, _now: Mono) -> Option<sw_proto::pyjson::PyDict> {
-    todo!("P7 Task 4")
+/// `service._resolve_session_id` 的 gate 段（只對非 trusted human 的呼叫端；RPC 的 `human:` source 一律視同 agent，DF-02）。
+/// 鍵序依 Python dict 字面量；`session` 為傳入的 public session 原樣。
+pub fn submit_gate_reject(public_session: &PyDict, _source: &str) -> Option<PyDict> {
+    if public_session.get("platform").and_then(PyValue::as_str) == Some("passthrough") {
+        return None;
+    }
+    let session = PyValue::Dict(public_session.clone());
+    if truthy(public_session.get("ready_reconfirm_failed")) {
+        return Some(pydict! {
+            "ok" => false,
+            "error_code" => "READY_UNCONFIRMED",
+            "hint" => READY_UNCONFIRMED_HINT,
+            "recommended_action" => "self_test",
+            "session" => session
+        });
+    }
+    match public_session.get("boot_quiet_remaining_s") {
+        Some(PyValue::Null) | None => {}
+        Some(remaining) => {
+            return Some(pydict! {
+                "ok" => false,
+                "error_code" => "AUTOBOOT_QUIET",
+                "retry_after_s" => remaining.clone(),
+                "hint" => QUIET_ACTIVE_HINT,
+                "session" => session
+            });
+        }
+    }
+    if truthy(public_session.get("ready_reconfirm_pending")) {
+        return Some(pydict! {
+            "ok" => false,
+            "error_code" => "AUTOBOOT_QUIET",
+            "retry_after_s" => READY_RECONFIRM_RETRY_S,
+            "hint" => PENDING_ONLY_HINT,
+            "session" => session
+        });
+    }
+    None
+}
+
+/// `_agent_gate_reject_locked`＋SC-03（execute 層；passthrough 由呼叫端排除）：先落有界化終態，再判 gate。
+pub fn execute_gate_reject(q: &mut QuietState, com: &str, now: Mono) -> Option<PyDict> {
+    q.expire(now, false);
+    if q.failed {
+        return Some(pydict! {
+            "ok" => false,
+            "error_code" => "READY_UNCONFIRMED",
+            "selector" => com,
+            "hint" => READY_UNCONFIRMED_HINT,
+            "recommended_action" => "self_test"
+        });
+    }
+    if q.agent_gate_active(now) {
+        let retry_after_s = if q.quiet_active(now) {
+            py_round(
+                q.boot_quiet_until.saturating_sub(now) as f64 / 1_000_000_000.0,
+                1,
+            )
+        } else {
+            READY_RECONFIRM_RETRY_S
+        };
+        return Some(pydict! {
+            "ok" => false,
+            "error_code" => "AUTOBOOT_QUIET",
+            "selector" => com,
+            "retry_after_s" => retry_after_s
+        });
+    }
+    None
 }
 
 /// READY 確認逾 300 s／5 次的提示文字（字面量；測試另以常數值核對 300／5）。

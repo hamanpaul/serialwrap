@@ -84,6 +84,9 @@ pub struct FenceState {
     pub fsm_gen: u64,
     pub frozen: bool,
     pub quiet_active: bool,
+    /// P7 Task 4／7（08 §0.6）：quiet arm 不擋自動登入 probe（console unlock profile：Python `_boot_quiet_blocks_probe`
+    /// 為假）。計畫的 `auto_probe_blocked == quiet_active && !probe_quiet_exempt`；只影響 LoginProbe／ReadyReconfirm。
+    pub probe_quiet_exempt: bool,
     pub reconfirm_pending: bool,
     pub flash_mode: FlashMode,
     pub wal_unhealthy: bool,
@@ -126,6 +129,7 @@ impl Fence {
             fsm_gen: 0,
             frozen: false,
             quiet_active: false,
+            probe_quiet_exempt: false,
             reconfirm_pending: false,
             flash_mode: FlashMode::Off,
             wal_unhealthy: false,
@@ -174,10 +178,17 @@ impl Fence {
                     return Err(FenceReject::ReconfirmPending);
                 }
             }
-            TxClass::LoginProbe
-            | TxClass::ReadyReconfirm
-            | TxClass::SystemRecoverKey
-            | TxClass::SelfTestProbe => {
+            TxClass::LoginProbe | TxClass::ReadyReconfirm => {
+                // P7 Task 4／7：auto_probe_blocked（console unlock 的 quiet 不擋自身登入 run）。
+                if st.quiet_active && !st.probe_quiet_exempt {
+                    return Err(FenceReject::Quiet);
+                }
+                if st.wal_unhealthy {
+                    return Err(FenceReject::WalUnhealthy);
+                }
+            }
+            TxClass::SystemRecoverKey | TxClass::SelfTestProbe => {
+                // R5-F2：SelfTestProbe／救援鍵一律以 quiet_active 擋（console unlock 的 arm 也擋）。
                 if st.quiet_active {
                     return Err(FenceReject::Quiet);
                 }

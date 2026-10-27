@@ -40,7 +40,8 @@ use crate::mailbox::{
 };
 use crate::op_runner::{OpOutcome, OpSpec, encode_interactive_payload, reject_reason};
 use crate::quiet_gate::{
-    is_reboot_command, matches_any_bootloader_prompt, QuietState, QuietTransition,
+    boot_quiet_blocks_probe, is_reboot_command, matches_any_bootloader_prompt, QuietState,
+    QuietTransition,
 };
 use crate::self_test::{NeedProbe, SelfTestBase, SelfTestCtx, SelfTestProbes};
 use crate::session_auth::resolve_session_auth;
@@ -390,6 +391,8 @@ struct LoginRun {
     fsm_gen: u64,
     /// run 進行中因 boot quiet arm 而遞增的 fsm_gen 次數。
     quiet_bumps: u64,
+    /// run 進行中因不擋 probe 的 quiet arm（console unlock）而遞增的 fsm_gen 次數；run 仍有效（parity #49）。
+    exempt_bumps: u64,
     /// attach run 已被 quiet 撤銷且其（舊世代）結果已回報：下一個 Tick 落定 ATTACHED＋`PROMPT_UNAVAILABLE`。
     revoked_by_quiet: bool,
 }
@@ -2293,7 +2296,7 @@ impl SessionCore {
             self.set_state(SessionState::Attached, now);
             return effects;
         }
-        let quiet_blocks = self.quiet.quiet_active(now);
+        let quiet_blocks = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         let (plan, synthesized) = self.choose_plan(quiet_blocks, self.pending_auto_login);
         match plan {
             LoginPlan::None => {
@@ -2325,6 +2328,7 @@ impl SessionCore {
                     waiters: Vec::new(),
                     fsm_gen: self.generations.fsm_gen,
                     quiet_bumps: 0,
+                    exempt_bumps: 0,
                     revoked_by_quiet: false,
                 });
                 effects.push(Effect::StartLogin {
@@ -2400,6 +2404,18 @@ impl SessionCore {
         }
     }
 
+    /// `LoginFinished` 的世代是否仍為現行 run（`active_login` 以 run 自身的 `(epoch, fsm_gen)` 比對）：core 世代相同，
+    /// 或與 run 相差的只有不擋 probe 的 quiet arm（console unlock，parity #49）。
+    fn login_gen_current(&self, epoch: u64, fsm_gen: u64) -> bool {
+        self.generations.fsm_gen == fsm_gen
+            || self.login_run.as_ref().is_some_and(|run| {
+                run.epoch == epoch
+                    && run.fsm_gen == fsm_gen
+                    && run.quiet_bumps == 0
+                    && self.generations.fsm_gen == fsm_gen.saturating_add(run.exempt_bumps)
+            })
+    }
+
     /// 舊世代 attach 結果是否僅因 run 期間的 quiet arm 而失效（世代差恰為 quiet arm 次數）。
     fn attach_run_revoked_by_quiet(&self, epoch: u64, fsm_gen: u64) -> bool {
         self.login_run.as_ref().is_some_and(|run| {
@@ -2407,7 +2423,10 @@ impl SessionCore {
                 && run.kind == LoginRunKind::Attach
                 && run.fsm_gen == fsm_gen
                 && run.quiet_bumps > 0
-                && self.generations.fsm_gen == fsm_gen.saturating_add(run.quiet_bumps)
+                && self.generations.fsm_gen
+                    == fsm_gen
+                        .saturating_add(run.quiet_bumps)
+                        .saturating_add(run.exempt_bumps)
         })
     }
 
@@ -2438,7 +2457,7 @@ impl SessionCore {
             if self.state != SessionState::Attached {
                 return Vec::new();
             }
-        } else if self.state != SessionState::Attaching || self.generations.fsm_gen != fsm_gen {
+        } else if self.state != SessionState::Attaching || !self.login_gen_current(epoch, fsm_gen) {
             // 舊世代結果一律無效果（T11）。但 quiet 撤銷的 attach run 若就此丟棄，session 會永久停在
             // ATTACHING；Python `_attach_by_id` 的 probe 遇 quiet 撤銷 → TxIncompleteError → PROMPT_UNAVAILABLE、
             // 落定 ATTACHED。故只標記，由下一個 Tick 以 boot quiet 合成碼收尾（P5-T20 黑箱 banner 情境）。
@@ -2560,7 +2579,7 @@ impl SessionCore {
         if self.is_passthrough() || !self.profile.template.command_capable() {
             return self.reprobe_reply(reply, kind, now);
         }
-        let quiet_blocks = self.quiet.quiet_active(now);
+        let quiet_blocks = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         if quiet_blocks {
             // #130 Finding 2／#162：不送 probe TX；READY 不以合成碼覆寫 last_error。
             if self.state != SessionState::Ready {
@@ -2573,6 +2592,7 @@ impl SessionCore {
         self.deps.fence.with(|f| {
             f.fsm_gen = self.generations.fsm_gen;
             f.quiet_active = false;
+            f.probe_quiet_exempt = false;
         });
         let (plan, _) = self.choose_plan(false, false);
         match plan {
@@ -2595,6 +2615,7 @@ impl SessionCore {
                     waiters: vec![(reply, kind)],
                     fsm_gen: self.generations.fsm_gen,
                     quiet_bumps: 0,
+                    exempt_bumps: 0,
                     revoked_by_quiet: false,
                 });
                 vec![Effect::StartLogin {
@@ -2633,7 +2654,10 @@ impl SessionCore {
             QuietTransition::Armed => self.apply_quiet_armed(now),
             QuietTransition::Cleared => {
                 // 只解除 TX 靜默維度；reconfirm pending 保留（#162）。
-                self.deps.fence.with(|f| f.quiet_active = false);
+                self.deps.fence.with(|f| {
+                    f.quiet_active = false;
+                    f.probe_quiet_exempt = false;
+                });
                 Vec::new()
             }
             QuietTransition::None => Vec::new(),
@@ -2646,19 +2670,30 @@ impl SessionCore {
             return Vec::new();
         };
         let until = self.quiet.boot_quiet_until;
+        // P7 Task 4：arm 一律遞增 fsm_gen（隔離 quiet timer）；只有 `boot_quiet_blocks_probe` 為真時才推進 fence 世代
+        // 撤銷在途 login run（Python `_update_boot_quiet_locked` 對 console unlock 不遞增 login_gen、probe gate quiet_until=0）。
+        let blocks_probe = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
-        // quiet 撤銷進行中 attach run 的後續 TX（fence FsmMismatch）；記錄次數以便辨識其舊世代結果（P5-T20）。
         if let Some(run) = self.login_run.as_mut() {
-            if run.epoch == epoch && run.kind == LoginRunKind::Attach {
-                run.quiet_bumps = run.quiet_bumps.saturating_add(1);
+            if run.epoch == epoch {
+                if !blocks_probe {
+                    // console unlock：run 以自身世代繼續，完成時仍套用（parity #49）。
+                    run.exempt_bumps = run.exempt_bumps.saturating_add(1);
+                } else if run.kind == LoginRunKind::Attach {
+                    // quiet 撤銷進行中 attach run 的後續 TX（fence FsmMismatch）；記錄次數以便辨識其舊世代結果（P5-T20）。
+                    run.quiet_bumps = run.quiet_bumps.saturating_add(1);
+                }
             }
         }
         let pending = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.quiet_active = true;
+            f.probe_quiet_exempt = !blocks_probe;
             f.reconfirm_pending = pending;
-            f.fsm_gen = self.generations.fsm_gen;
+            if blocks_probe {
+                f.fsm_gen = self.generations.fsm_gen;
+            }
             f.owner_gen = self.generations.owner_gen;
         });
         let _ = now;
@@ -2704,7 +2739,10 @@ impl SessionCore {
                     && self.quiet.boot_quiet_until <= now =>
             {
                 // 照 Python：到期只令 quiet 失效（`boot_quiet_until` 保留），fence 解除 TX 靜默。
-                self.deps.fence.with(|f| f.quiet_active = false);
+                self.deps.fence.with(|f| {
+                    f.quiet_active = false;
+                    f.probe_quiet_exempt = false;
+                });
                 Vec::new()
             }
             TimerEvent::LeaseExpiry { lease_id, deadline }
@@ -2787,6 +2825,7 @@ impl SessionCore {
         self.quiet.confirm_ready();
         self.deps.fence.with(|f| {
             f.quiet_active = false;
+            f.probe_quiet_exempt = false;
             f.reconfirm_pending = false;
             f.active_epoch = self.generations.conn_epoch;
             f.fsm_gen = self.generations.fsm_gen;
@@ -2899,6 +2938,7 @@ impl SessionCore {
             f.active_epoch = None;
             f.frozen = true;
             f.quiet_active = false;
+            f.probe_quiet_exempt = false;
             f.reconfirm_pending = false;
         });
         effects.push(Effect::Notify(ManagerNote::SessionDetached {
@@ -4114,7 +4154,10 @@ impl SessionCore {
                 if reboot && result.get_truthy("ok") {
                     // #139／#162：prompt 2 s 內回來只清 TX 靜默維度，reconfirm pending 保留。
                     self.quiet.clear_quiet();
-                    self.deps.fence.with(|f| f.quiet_active = false);
+                    self.deps.fence.with(|f| {
+                        f.quiet_active = false;
+                        f.probe_quiet_exempt = false;
+                    });
                 }
                 CmdOutcome::Result(result)
             }
@@ -4461,7 +4504,9 @@ impl SessionCore {
         if self.stop.is_some() || self.pending_open_stop.is_some() || self.login_run.is_some() {
             return Vec::new();
         }
-        if self.quiet.quiet_active(now) {
+        // `_reboot_recovery`：quiet_active＝`_boot_quiet_blocks_probe`（console unlock 不延長、不等待）。
+        let quiet_blocks = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
+        if quiet_blocks {
             let extended = rr
                 .deadline
                 .max(self.quiet.boot_quiet_until.saturating_add(rr.timeout_ns));
@@ -4470,7 +4515,7 @@ impl SessionCore {
         if now >= rr.deadline {
             return self.finish_reboot_recovery_timeout(now);
         }
-        if self.quiet.quiet_active(now) || now < rr.next_attempt {
+        if quiet_blocks || now < rr.next_attempt {
             return Vec::new();
         }
         rr.next_attempt = now.saturating_add(1_000_000_000);
@@ -4494,6 +4539,7 @@ impl SessionCore {
         self.deps.fence.with(|f| {
             f.fsm_gen = self.generations.fsm_gen;
             f.quiet_active = false;
+            f.probe_quiet_exempt = false;
         });
         self.login_run = Some(LoginRun {
             epoch,
@@ -4501,6 +4547,7 @@ impl SessionCore {
             waiters: Vec::new(),
             fsm_gen: self.generations.fsm_gen,
             quiet_bumps: 0,
+            exempt_bumps: 0,
             revoked_by_quiet: false,
         });
         vec![Effect::StartLogin {
