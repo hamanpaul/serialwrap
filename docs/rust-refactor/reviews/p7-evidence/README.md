@@ -14,6 +14,7 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-ae82afe.txt` | 審查第 4 輪後（相對 91109e7：+`test_mgmt_stubs::test_live_daemon_fixture_serves_attached_console_list`（ERROR，單獨重跑 2/2 通過）、+`test_safety_core[SESSION_NOT_READY-ATTACHING]`（起點清單內）） | 510 | a12acbf50459427d |
 | `pytest-fail-aaf2c1d.txt` | 審查第 5 輪後（相對 ae82afe：+`test_bb_daemon_e2e::test_session_reaches_ready`（`逾時 20.0s；最後觀察值：None`；同範圍兩次重跑 1 failed／1 passed，集合不同） | 508 | 031452ef72aa78c7 |
 | `pytest-fail-9c4a80e.txt` | 審查第 6 輪後（相對 aaf2c1d：+`test_l15_smoke::test_reject_zero_tx_runs_on_python`——`DeviceHeldError` 環境類，c58e8d4 列已於 76de0cf worktree 重現） | 508 | 5dca7ec693660c98 |
+| `pytest-fail-0722f75.txt` | Task 16＋16-wire 後（相對 9c4a80e：+slice21 `test_f1_cmd_contract::test_limits_queryable`／`test_newline_rejected`、`test_f12_version_reported_consistent`（ERROR；單獨重跑首次為 Python daemon `ATTACH_FAILED:DeviceHeldError`，合併重跑 4 passed）、+`test_mgmt_stubs` live daemon fixture（同上 4 passed）、+sm04（DeviceHeldError 環境類）） | 512 | f1fcb15f24ef4376 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
