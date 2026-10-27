@@ -457,7 +457,13 @@ def _stage_release_case(
     cli = tmp_path / "serialwrap"
     cli.write_bytes(b"rust cli")
     manifest = tmp_path / "release-manifest.json"
-    manifest.write_text("{}", encoding="utf-8")
+    # B 輪由 manifest 的 daemon launcher 解析受測 daemon（f2d9533）；夾具提供同目錄內的真實 launcher 檔，
+    # 讓 resolve_daemon_launcher 照常驗證，而不是以空 manifest 在 B 輪前拋錯。
+    (tmp_path / "serialwrapd.py").write_text("stub\n", encoding="utf-8")
+    manifest.write_text(
+        json.dumps({"components": {"daemon": {"launcher": {"path": "serialwrapd.py"}}}}),
+        encoding="utf-8",
+    )
     out = tmp_path / "ab"
     a_junit, b_junit = out / "a-python.xml", out / "b-rust.xml"
     lock_cases = [{"case_id": "c-release", "tests": list(selected)}]
