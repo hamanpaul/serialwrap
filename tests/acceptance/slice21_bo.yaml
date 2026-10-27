@@ -1,0 +1,79 @@
+# Slice 2.1 BLOCKED-OWNER 清單（P5-T22；機器可讀版本）。
+# 與 docs/rust-refactor/plans/06-slice21-daemon-core.md 結尾「BLOCKED-OWNER 總表」同序、同 case_ids；
+# 執行程序見 docs/rust-refactor/slice21-owner-runbook.md 的 `### BO-S21-NN` 小節。
+# 規則：gate 報告中本清單各項 status 恆為 BLOCKED-OWNER（schema const），只能由擁有者回填 evidence 後經審查解除，
+# 不得由 gate 或執行者標 PASS。case_ids 取自 tests/acceptance/cases.lock.json（無對應凍結案例者為空陣列）。
+schema_version: 1
+source: docs/rust-refactor/plans/06-slice21-daemon-core.md#blocked-owner-總表
+items:
+  - id: BO-S21-01
+    item: 原生 Windows COM handle gate（OD-08）：SW_TEST_COM_PAIR 下 cap_windows_com__* 全部（獨占 ACCESS_DENIED、CancelIoEx 收斂、部分寫出、conformance）；PR 合併前置。OD-15 起為擁有者 host 可執行 gate（COM20:COM21，orchestrator 經 WSL interop 代跑）
+    case_ids: []
+    source_tasks: [3, 22]
+    gate_section: windows_cap_windows_com
+  - id: BO-S21-02
+    item: Windows 外部 TeraTerm／PuTTY 先開 COM 時 DEVICE_STILL_HELD{pids:[],holder_unknown:true} 實機證據
+    case_ids: []
+    source_tasks: [3]
+  - id: BO-S21-03
+    item: Windows USB 拔除時 overlapped 在途 I/O 完成碼實測與 drain 3000 ms 收斂
+    case_ids: []
+    source_tasks: [3, 12]
+  - id: BO-S21-04
+    item: 實體 USB-UART（CH340／FTDI）上的 TIOCEXCL＋flock 與 RTS/CTS 卡住時可取消寫入（cap_physical_uart__*）
+    case_ids: []
+    source_tasks: [2]
+  - id: BO-S21-05
+    item: 外部 minicom 先開埠時 daemon 得 Held 的 Linux 實機證據
+    case_ids: []
+    source_tasks: [2]
+  - id: BO-S21-06
+    item: Windows CTRL_BREAK／CTRL_CLOSE 停止 daemon（互動 console），以及 windows-task 監管下的啟停（Spike 2）；OD-15 先以 P2 Task 18 throwaway 排程工作在擁有者 host 跑，正式工作的 Spike 2 證據仍待擁有者
+    case_ids: []
+    source_tasks: [4, 19]
+  - id: BO-S21-07
+    item: L2：Rust daemon 執行 serialwrap_regression F1／F2／F3／F4／F12 的 18 個 case（F12 用 OD-13 修訂 oracle）；交 bench 前先以 scripts/docker/run-l15.sh 跑 L1.5-docker（不計 L2）
+    case_ids: [f1-cmdid-survives-timeout, f1-limits-queryable, f1-near-limit-no-logout, f1-newline-rejected, f1-too-long-rejected,
+               f2-history-bounded-rss, f2-queue-full-backpressure, f2-recovery-flushes-queue, f2-rx-window-crossing-prompt,
+               f3-cmd-fail-observable, f3-device-error-names-selector, f3-fail-error-code, f3-log-tail-latest,
+               f4-activity-classification, f4-background-result-tail-consistent,
+               f12-version-reported-consistent, f12-wal-path-live]
+    early_evidence_case_ids: [f4-interactive-line-cmd-defined]
+    source_tasks: [20]
+  - id: BO-S21-08
+    item: L3：realhw P0 適用核心集合＋WAL／裝置衝突／Recovery 相關 P1，Linux 與 Windows 各一輪（先以 docker 兩容器拓樸跑 L1.5-docker，不計 L3）
+    case_ids: [p0-doctor, p0-cmd-async, p0-clear-reattach, p0-selftest, p0-wal-live, p0-multiopen, p1-cmd-serial,
+               p1-rst-daemon, p1-rst-recover, p1-hp-cycle, p1-hp-reorder]
+    source_tasks: [20]
+  - id: BO-S21-09
+    item: 雙平台實機「外部燒錄工具接手→device attach 收回」交接證據
+    case_ids: []
+    source_tasks: [12]
+  - id: BO-S21-10
+    item: 實機 shell／prplOS 板的登入→READY 與 reboot quiet 最小防護（L3 P0 reboot 相關核心）
+    case_ids: []
+    source_tasks: [13, 21]
+  - id: BO-S21-11
+    item: 同款 CH340（by-id 相同）以 by-path 區分的 COM 指派實機證據
+    case_ids: []
+    source_tasks: [16]
+  - id: BO-S21-12
+    item: systemd-user／systemd-system 監管下 Rust serialwrapd 啟停（L3 P0）；OD-15 先在 systemd container（scripts/docker/run-systemd.sh）驗證並附 L1.5-docker 報告，實機 L3 仍待擁有者
+    case_ids: []
+    source_tasks: [19]
+  - id: BO-S21-13
+    item: Windows L1.5（原生 daemon＋com0com DUT-side pair 或實體 USB-UART；OD-15 起 com0com 部分在擁有者 host 以 COM20／COM21 可執行）與實機 A/B（§15.9.2），含 Windows 端以 Rust daemon 跑 tests/contract_blackbox/slice21 全套
+    case_ids: [win-com-open-exclusive, win-com-txrx-bridge, win-com-cancel-close]
+    source_tasks: [20, 21]
+  - id: BO-S21-14
+    item: Spike 3：第三方 EDR 開啟下 Rust WalFs 的寫入／rotate／unlink／外部 reader 結果，與 Stage 0 Python 結果並列；含 Windows 原生與 EDR 開啟下的 wal_s1w 正式量測（§1.2 Windows 門檻）
+    case_ids: [win-wal-av-rotate, win-wal-av-unlink, win-wal-av-reader-handle]
+    source_tasks: [6, 22]
+  - id: BO-S21-15
+    item: 藍牙 SPP 虛擬 COM 實際存在時的 SERIALCOMM 排除證據（需配對藍牙裝置的 Windows 機台）
+    case_ids: []
+    source_tasks: [5]
+  - id: BO-S21-16
+    item: Windows L2：EDR 開啟下以實體 UART 驗證 F12 WAL 進展 oracle
+    case_ids: [win-wal-f12-progress]
+    source_tasks: [20, 22]
