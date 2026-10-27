@@ -2280,12 +2280,28 @@ impl SessionManager {
             })
             .map_err(|e| commit_error(&e))?;
         if has_device {
-            // Python：裝置在線 → ATTACHING、last_error None，並 spawn attach。
-            if let Some(PyValue::Dict(s)) = result.0.get_mut("session") {
-                s.insert("state", PyValue::from("ATTACHING"));
-                s.insert("last_error", PyValue::Null);
+            // Python：裝置在線 → 回覆前活 session 即 ATTACHING、last_error None，再 spawn attach。
+            // 經請求通道的 DeviceOnline 套用並回覆活 session（審查 F70：不得只改回應副本）。
+            let real = lock(&self.shared.inner).device_path(&by_id).map(str::to_string);
+            if let Some(real_path) = real.filter(|_| !lock(&self.shared.inner).stopping) {
+                let applied = self.shared.request(
+                    &sid,
+                    SessionRequest::DeviceOnline {
+                        by_id: by_id.clone(),
+                        real_path,
+                    },
+                    QUERY_TIMEOUT,
+                );
+                if let Some(PyValue::Dict(mut live)) =
+                    applied.ok().and_then(|r| r.get("session").cloned())
+                {
+                    // alias 以 manager 鏡像為準（同 `session_public`）。
+                    if let Some(e) = lock(&self.shared.inner).sessions.get(&sid) {
+                        live.insert("alias", PyValue::from(e.profile.alias.clone()));
+                    }
+                    result.insert("session", PyValue::Dict(live));
+                }
             }
-            self.shared.send_attached(&by_id);
         }
         Ok(result)
     }

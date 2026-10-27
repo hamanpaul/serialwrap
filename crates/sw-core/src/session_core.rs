@@ -173,6 +173,12 @@ pub enum SessionRequest {
     MarkAttachStalled {
         epoch: u64,
     },
+    /// 同 `ControlEvent::DeviceAttached`，但經請求通道並回覆套用後的活 session（bind 改綁到在線裝置時，
+    /// Python 於回覆前即 ATTACHING＋`last_error=None`；審查 F70）。
+    DeviceOnline {
+        by_id: String,
+        real_path: String,
+    },
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
@@ -1607,6 +1613,13 @@ impl SessionCore {
                 self.profile = profile;
                 self.profile_source = profile_source;
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
+            SessionRequest::DeviceOnline { by_id, real_path } => {
+                // 回覆先於 OpenBridge（executor 依序執行；開埠可能阻塞）。
+                let opened = self.device_attached(&by_id, &real_path, now);
+                let mut effects = vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
+                effects.extend(opened);
+                effects
             }
             SessionRequest::MarkAttachStalled { epoch } => {
                 self.set_state(SessionState::Recovering, now);

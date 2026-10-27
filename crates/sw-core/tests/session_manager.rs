@@ -1869,3 +1869,34 @@ fn recover_released_during_stopping_returns_released() {
     assert_eq!(r.get("released"), Some(&PyValue::Bool(true)));
     assert_eq!(r.get("recommended_action"), Some(&PyValue::from("device_attach")));
 }
+
+#[test]
+fn bind_to_online_device_live_state_attaching_before_reply() {
+    // 審查 F70（Low，73634db）：Python `bind_session` 在回覆前把活 session 設 ATTACHING＋`last_error=None`；
+    // 回覆後立即 `session.get_state` 不得看到 DETACHED＋DEVICE_NOT_FOUND（舊實作只改回應副本，另以 control lane
+    // 非同步送 DeviceAttached，請求通道的 GetState 會先被處理）。輸入：RELEASED 的 COM0 改綁回仍在線的原 by_id。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let by_id = s_of(&m.session("COM0"), "device_by_id").expect("by_id");
+    rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    m.wait_state("COM0", "RELEASED");
+    let r = rpc(m.mgr.bind("COM0", &by_id));
+    assert!(is_ok(&r), "{r:?}");
+    let live = m.session("COM0");
+    let reply = session_field(&r);
+    assert_eq!(s_of(&reply, "state").as_deref(), Some("ATTACHING"));
+    assert_eq!(reply.get("last_error"), Some(&PyValue::Null));
+    assert_ne!(s_of(&live, "state").as_deref(), Some("DETACHED"), "{live:?}");
+    assert_ne!(
+        s_of(&live, "last_error").as_deref(),
+        Some("DEVICE_NOT_FOUND"),
+        "{live:?}"
+    );
+}
