@@ -47,6 +47,7 @@ fn greeting_written_before_any_fanout_bytes() {
     t.hub.cmd.try_send(HubCmd::StartListener).unwrap();
     t.settle();
     let client = t.fake.connect(); // fake accept
+    t.settle(); // accept 前到達的 RX 不屬於此 client（不回放），先確定已 accept
     for _ in 0..50 {
         assert!(t.reader_push(b"RXDATA"));
     }
@@ -98,7 +99,9 @@ fn full_mailbox_pauses_reading_without_blocking_hub() {
     assert!(c.closed());
     t.block_mailbox(false);
     t.settle();
-    assert!(t.data_events().len() <= 64 + 1, "pending 有界");
+    // pending 上限 64（CONSOLE_HUB_PENDING_EVENTS）＋harness 容量 1 的 channel＋pump 設 block 前已在 recv 的 1 筆
+    assert!(t.data_events().len() <= 64 + 2, "pending 有界：{}", t.data_events().len());
+    assert!(t.warnings().iter().any(|w| w.contains("session mailbox 已滿")));
 }
 
 // ---------------------------------------------------------------- 表列

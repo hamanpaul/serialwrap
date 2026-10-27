@@ -2021,6 +2021,9 @@ Expected: FAIL（`not yet implemented: P6 Task 8`）；Windows 報告該 exe `fa
 
 - [ ] **Step 4：執行並確認 PASS**
 
+> **實作紀錄（2026-10-27，P6 cloud）**：(1) hub 本體在 `crates/sw-core/src/human_console/hub.rs`（`spawn_hub`／`HubHandle`／`HubTap`／`HubStatus`）；reader 經 `ReaderCtx.hub: Option<HubTap>` 於 `rx.append` 之後、data lane 之前 `try_send`。(2) 測試 harness 新增 `HubCmd::TestStall`（僅 `test-fakes`）、`FakeSerial::set_loopback`、`FakeConsoleFactory::fail_next_mux_waits`；`ActorRig::new_with_hub` 以測試 `RigExec` 承接 `ConsoleOut`／`ConsoleClose`／`ConsoleCloseAll`／Adopt。(3) `full_mailbox_pauses_reading_without_blocking_hub` 的上界為 64＋2：harness 以容量 1 的 channel 與 pump thread 模擬 mailbox，pump 設 block 前可能已在 `recv` 中多收 1 筆；同時新增斷言 mailbox 已滿 WARNING。(4) **未完成、需上游**：正式 actor executor（daemon 端把 `Effect::ConsoleOut`／`HumanTx`／`ConsoleClose` 接到 hub 與 `HumanTxPump`）與步驟 5 的哨兵 primary 建立需 06 T15+ `SessionManager`／`ServiceRig`（P5 擁有），目前只在測試 `RigExec` 接線；in-process 回顯延遲門檻 `console_echo_latency.rs` 已通過，實體 115200 loopback 仍屬 BLOCKED-OWNER #7。
+
+
 Run: `scripts/rust/cargo_nonzero.sh -p sw-pal --features test-fakes --test console_conformance -- --include-ignored cap_posix_pty__ && scripts/rust/cargo_nonzero.sh -p sw-pal --features test-fakes --test console_conformance && python3 scripts/rust/check_cfg_boundary.py`；orchestrator 另執行 `scripts/rust/win-test.sh --package sw-pal --features test-fakes --test console_conformance`
 Expected: Linux 全部 PASS；Windows 報告非 `windows_com` 案例 PASS（`passed` 等於預期的非 cap 測試數）、`cap_windows_com__*` 為 ignored 並標「證據不足」；cfg 檢查 exit 0。
 

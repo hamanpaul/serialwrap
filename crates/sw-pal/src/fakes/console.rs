@@ -9,7 +9,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::console_mux::{ConsoleMux, MuxEntry, MuxEvent, MuxHandle, MuxHandleInner, MuxId};
-use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, KeepAlive, PtyPair, PtySlaveRef};
+use crate::console_pty::{
+    ConsoleIo, ConsoleListener, ConsoleTransportFactory, KeepAlive, PtyPair, PtySlaveRef,
+};
 use crate::traits::{IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome};
 use crate::ConsoleKind;
 
@@ -45,7 +47,11 @@ fn wait_change(seen: u64, deadline: Option<Instant>) -> bool {
     let mut g = lock(m);
     while *g == seen {
         match deadline {
-            None => g = cv.wait(g).unwrap_or_else(std::sync::PoisonError::into_inner),
+            None => {
+                g = cv
+                    .wait(g)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }
             Some(d) => {
                 let now = Instant::now();
                 if now >= d {
@@ -116,7 +122,10 @@ impl IoShared {
     fn read_now(&self, buf: &mut [u8]) -> Option<PalResult<ReadOutcome>> {
         let mut st = lock(&self.st);
         if st.mode == Mode::FailingRead {
-            return Some(Err(PalError::plain(PalErrorKind::Io, "[Errno 5] Input/output error")));
+            return Some(Err(PalError::plain(
+                PalErrorKind::Io,
+                "[Errno 5] Input/output error",
+            )));
         }
         if !st.input.is_empty() {
             let n = buf.len().min(st.input.len());
@@ -134,7 +143,10 @@ impl IoShared {
     fn write_now(&self, data: &[u8]) -> PalResult<usize> {
         let mut st = lock(&self.st);
         if st.closed {
-            return Err(PalError::plain(PalErrorKind::BrokenPipe, "[Errno 32] Broken pipe"));
+            return Err(PalError::plain(
+                PalErrorKind::BrokenPipe,
+                "[Errno 32] Broken pipe",
+            ));
         }
         let n = match st.mode {
             Mode::Stalled => 0,
@@ -317,14 +329,18 @@ struct FactoryShared {
 }
 
 /// 記憶體 console 工廠（`ConsoleTransportFactory` 替身）。
+/// `Clone` 共用全部狀態（P6 Task 9：hub harness 與 `Platform.console` 持有同一個替身）。
+#[derive(Clone)]
 pub struct FakeConsoleFactory {
     kind: ConsoleKind,
     shared: Arc<FactoryShared>,
-    next_port: AtomicU64,
-    next_pty: AtomicU64,
-    held: Mutex<Option<HashSet<String>>>,
-    fail_com0com: AtomicBool,
-    com0com: Mutex<Vec<(String, FakeConsoleRef)>>,
+    next_port: Arc<AtomicU64>,
+    next_pty: Arc<AtomicU64>,
+    held: Arc<Mutex<Option<HashSet<String>>>>,
+    fail_com0com: Arc<AtomicBool>,
+    com0com: Arc<Mutex<Vec<(String, FakeConsoleRef)>>>,
+    /// P6 Task 9（#37）：之後幾次 `ConsoleMux::wait` 回錯誤。
+    mux_wait_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeConsoleFactory {
@@ -335,11 +351,12 @@ impl FakeConsoleFactory {
             shared: Arc::new(FactoryShared {
                 pending: Mutex::new(VecDeque::new()),
             }),
-            next_port: AtomicU64::new(40000),
-            next_pty: AtomicU64::new(0),
-            held: Mutex::new(None),
-            fail_com0com: AtomicBool::new(false),
-            com0com: Mutex::new(Vec::new()),
+            next_port: Arc::new(AtomicU64::new(40000)),
+            next_pty: Arc::new(AtomicU64::new(0)),
+            held: Arc::new(Mutex::new(None)),
+            fail_com0com: Arc::new(AtomicBool::new(false)),
+            com0com: Arc::new(Mutex::new(Vec::new())),
+            mux_wait_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -380,8 +397,9 @@ impl FakeConsoleFactory {
     }
 
     /// P6 Task 9：之後 `n` 次 `ConsoleMux::wait` 回錯誤（#37）。
-    pub fn fail_next_mux_waits(&self, _n: usize) {
-        todo!("P6 Task 9")
+    pub fn fail_next_mux_waits(&self, n: usize) {
+        self.mux_wait_failures.store(n, Ordering::SeqCst);
+        bump();
     }
 
     /// `held_slave_paths` 的回傳值。
@@ -431,6 +449,7 @@ impl ConsoleTransportFactory for FakeConsoleFactory {
             waker: Arc::new(FakeMuxWaker {
                 flag: AtomicBool::new(false),
             }),
+            wait_failures: Arc::clone(&self.mux_wait_failures),
         }))
     }
 }
@@ -498,6 +517,7 @@ struct FakeEntry {
 struct FakeConsoleMux {
     entries: BTreeMap<MuxId, FakeEntry>,
     waker: Arc<FakeMuxWaker>,
+    wait_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 fn foreign() -> PalError {
@@ -603,6 +623,16 @@ impl ConsoleMux for FakeConsoleMux {
     }
 
     fn wait(&mut self, timeout: Duration) -> PalResult<Vec<MuxEvent>> {
+        if self
+            .wait_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(PalError::plain(
+                PalErrorKind::Io,
+                "[Errno 9] Bad file descriptor",
+            ));
+        }
         let deadline = Instant::now() + timeout;
         loop {
             let seen = generation();

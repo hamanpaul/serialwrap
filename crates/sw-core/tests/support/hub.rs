@@ -1,88 +1,319 @@
-//! P6 Slice 2.2：ConsoleHub 測試 harness（07 Task 1 簽章；本體由 Task 9 的測試作者補齊）。
+//! P6 Slice 2.2：ConsoleHub 測試 harness（07 Task 1 簽章；本體由 Task 9 補齊）。
+//!
+//! 以 `FakeConsoleFactory` 驅動真的 hub thread；hub 的 control／data lane 經容量 1 的 channel 交給 pump thread
+//! 收集，`block_mailbox(true)` 時 pump 停止收取，使 hub 的 `try_send` 一律 Full（D-17(1)）。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use sw_core::human_console::hub::{HubHandle, HubStatus};
+use crossbeam_channel::bounded;
+use sw_core::human_console::hub::{spawn_hub, HubCmd, HubHandle, HubStatus, HubTap, StallGate};
 use sw_core::mailbox::{ControlEvent, DataEvent};
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::console::{FakeConsoleFactory, FakeConsoleRef, FakeIo};
+use sw_pal::traits::Clock;
+use sw_pal::ConsoleKind;
 
 /// 以 `FakeConsoleFactory` 驅動真的 hub thread。
 pub struct HubHarness {
     pub hub: HubHandle,
     pub fake: FakeConsoleFactory,
     pub clock: Arc<FakeClock>,
+    control: Arc<Mutex<Vec<ControlEvent>>>,
+    data: Arc<Mutex<Vec<DataEvent>>>,
+    blocked: Arc<AtomicBool>,
+    pumps_stop: Arc<AtomicBool>,
+    tap: HubTap,
+    reader_warnings: Arc<Mutex<Vec<String>>>,
+    next_pty: AtomicU64,
+    gate: Mutex<Option<Arc<StallGate>>>,
+    start: u64,
+}
+
+impl Drop for HubHarness {
+    fn drop(&mut self) {
+        self.unstall();
+        self.hub.shutdown();
+        self.pumps_stop.store(true, Ordering::Release);
+    }
+}
+
+fn pump<T: Send + 'static>(
+    rx: crossbeam_channel::Receiver<T>,
+    sink: Arc<Mutex<Vec<T>>>,
+    blocked: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            if blocked.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(2)) {
+                sink.lock().unwrap().push(ev);
+            }
+        }
+    });
 }
 
 impl HubHarness {
-    pub fn tcp(_com: &str) -> HubHarness {
-        todo!("P6 Task 9")
+    fn with_kind(com: &str, kind: ConsoleKind) -> HubHarness {
+        let fake = FakeConsoleFactory::new(kind);
+        let clock = FakeClock::at(5_000_000_000, 1_000_000);
+        let platform = sw_pal::fakes::platform::platform()
+            .console(Arc::new(fake.clone()))
+            .clock(clock.clone())
+            .build();
+        let (ctl_tx, ctl_rx) = bounded::<ControlEvent>(1);
+        let (data_tx, data_rx) = bounded::<DataEvent>(1);
+        let control = Arc::new(Mutex::new(Vec::new()));
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let blocked = Arc::new(AtomicBool::new(false));
+        let pumps_stop = Arc::new(AtomicBool::new(false));
+        pump(
+            ctl_rx,
+            control.clone(),
+            Arc::new(AtomicBool::new(false)),
+            pumps_stop.clone(),
+        );
+        pump(data_rx, data.clone(), blocked.clone(), pumps_stop.clone());
+        let start = clock.mono_ns();
+        let hub = spawn_hub(
+            com.to_string(),
+            &platform,
+            ctl_tx,
+            data_tx,
+            clock.clone(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let tap = hub.tap();
+        HubHarness {
+            hub,
+            fake,
+            clock,
+            control,
+            data,
+            blocked,
+            pumps_stop,
+            tap,
+            reader_warnings: Arc::new(Mutex::new(Vec::new())),
+            next_pty: AtomicU64::new(0),
+            gate: Mutex::new(None),
+            start,
+        }
     }
-    pub fn pty(_com: &str) -> HubHarness {
-        todo!("P6 Task 9")
+
+    pub fn tcp(com: &str) -> HubHarness {
+        HubHarness::with_kind(com, ConsoleKind::TcpTelnet)
     }
-    pub fn adopt_pty_with(&self, _io: FakeIo) -> FakeConsoleRef {
-        todo!("P6 Task 9")
+    pub fn pty(com: &str) -> HubHarness {
+        HubHarness::with_kind(com, ConsoleKind::Pty)
     }
-    /// 回 `try_send` 是否成功。
-    pub fn reader_push(&self, _b: &[u8]) -> bool {
-        todo!("P6 Task 9")
+    pub fn adopt_pty_with(&self, io: FakeIo) -> FakeConsoleRef {
+        let r = io.reference();
+        let n = self.next_pty.fetch_add(1, Ordering::Relaxed) + 1;
+        let cid = format!("p{n}");
+        r.set_client_id(&cid);
+        let pair = self.fake.pty_pair_from(io);
+        self.hub
+            .cmd
+            .try_send(HubCmd::AdoptPty {
+                client_id: cid.clone(),
+                client_lifetime: n,
+                label: cid,
+                pair,
+            })
+            .unwrap_or_else(|_| panic!("AdoptPty 送出失敗"));
+        self.hub.waker.wake();
+        r
+    }
+    /// 回 `try_send` 是否成功（與 reader 相同的 `HubTap::push`）。
+    pub fn reader_push(&self, b: &[u8]) -> bool {
+        let warnings = self.reader_warnings.clone();
+        self.tap.push(b, &move |line: &str| {
+            warnings.lock().unwrap().push(line.to_string())
+        })
     }
     /// 等 hub 處理完目前所有 channel 內容（上限 2 s）。
     pub fn settle(&self) {
-        todo!("P6 Task 9")
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = &self.hub.status;
+        let mut quiet_loops = 0;
+        let mut last = status.loops.load(Ordering::Acquire);
+        loop {
+            self.hub.waker.wake();
+            std::thread::sleep(Duration::from_millis(1));
+            let now = status.loops.load(Ordering::Acquire);
+            let drained = self.hub.cmd.is_empty()
+                && self.hub.rx.is_empty()
+                && (self.blocked.load(Ordering::Acquire)
+                    || status.pending.load(Ordering::Acquire) == 0);
+            if now > last && drained {
+                quiet_loops += 1;
+                if quiet_loops >= 3 {
+                    break;
+                }
+            }
+            last = now;
+            if self.gate.lock().unwrap().is_some() || status.exited.load(Ordering::Acquire) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "HubHarness::settle 逾時");
+        }
+        std::thread::sleep(Duration::from_millis(5)); // pump thread 收取
     }
     pub fn control_events(&self) -> Vec<ControlEvent> {
-        todo!("P6 Task 9")
+        self.control
+            .lock()
+            .unwrap()
+            .iter()
+            .map(clone_control)
+            .collect()
     }
     pub fn data_events(&self) -> Vec<DataEvent> {
-        todo!("P6 Task 9")
+        self.data.lock().unwrap().iter().map(clone_data).collect()
     }
     pub fn status(&self) -> &HubStatus {
-        todo!("P6 Task 9")
+        &self.hub.status
     }
-    pub fn ring_display_bytes(&self, _cid: &str) -> usize {
-        todo!("P6 Task 9")
+    pub fn ring_display_bytes(&self, cid: &str) -> usize {
+        self.hub
+            .status
+            .ring_display
+            .lock()
+            .unwrap()
+            .get(cid)
+            .copied()
+            .unwrap_or(0)
     }
-    pub fn block_mailbox(&self, _on: bool) {
-        todo!("P6 Task 9")
+    pub fn block_mailbox(&self, on: bool) {
+        self.blocked.store(on, Ordering::Release);
     }
 
     // ---- P6 Task 9 追加（Task 1 簽章之外） ----
     /// hub 在下一輪停住（`HubCmd::TestStall`），直到 `unstall`。
     pub fn stall(&self) {
-        todo!("P6 Task 9")
+        let gate = Arc::new(StallGate::default());
+        self.hub
+            .cmd
+            .try_send(HubCmd::TestStall(gate.clone()))
+            .unwrap_or_else(|_| panic!("TestStall 送出失敗"));
+        self.hub.waker.wake();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !gate.entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "hub 未進入停住狀態");
+            self.hub.waker.wake();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *self.gate.lock().unwrap() = Some(gate);
     }
     pub fn unstall(&self) {
-        todo!("P6 Task 9")
+        if let Some(gate) = self.gate.lock().unwrap().take() {
+            *gate.released.lock().unwrap() = true;
+            gate.cond.notify_all();
+        }
     }
     /// hub 的 WARNING。
     pub fn warnings(&self) -> Vec<String> {
-        todo!("P6 Task 9")
+        self.hub
+            .status
+            .warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
     /// `reader_push` 經 `HubTap::push` 產生的 WARNING。
     pub fn reader_warnings(&self) -> Vec<String> {
-        todo!("P6 Task 9")
+        self.reader_warnings.lock().unwrap().clone()
     }
     /// hub 迴圈輪數。
     pub fn loops(&self) -> u64 {
-        todo!("P6 Task 9")
+        self.hub.status.loops.load(Ordering::Acquire)
     }
     /// 推進注入的 FakeClock 並喚醒 hub。
-    pub fn advance(&self, _d: std::time::Duration) {
-        todo!("P6 Task 9")
+    pub fn advance(&self, d: Duration) {
+        self.clock.advance(d);
+        self.hub.waker.wake();
     }
     /// harness 建立時的 monotonic 時刻。
     pub fn start_mono(&self) -> u64 {
-        todo!("P6 Task 9")
+        self.start
     }
     /// `shutdown` 後等 hub thread 結束（逾時 panic）。
-    pub fn join_within(&self, _d: std::time::Duration) {
-        todo!("P6 Task 9")
+    pub fn join_within(&self, d: Duration) {
+        let deadline = Instant::now() + d;
+        while !self.hub.status.exited.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "hub thread 未於期限內結束");
+            self.hub.waker.wake();
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     /// 下一個 console 輸入處理 panic（#89）。
     pub fn panic_next_input_handler(&self) {
-        todo!("P6 Task 9")
+        self.hub
+            .status
+            .panic_next_input
+            .store(true, Ordering::Release);
     }
 }
 
+fn clone_control(e: &ControlEvent) -> ControlEvent {
+    match e {
+        ControlEvent::ConsoleConnected {
+            client_id,
+            client_lifetime,
+            label,
+            vtty,
+            kind,
+        } => ControlEvent::ConsoleConnected {
+            client_id: client_id.clone(),
+            client_lifetime: *client_lifetime,
+            label: label.clone(),
+            vtty: vtty.clone(),
+            kind: *kind,
+        },
+        ControlEvent::ConsoleScan { scan, source } => ControlEvent::ConsoleScan {
+            scan: scan.clone(),
+            source: source.clone(),
+        },
+        _ => ControlEvent::Tick,
+    }
+}
+
+fn clone_data(e: &DataEvent) -> DataEvent {
+    match e {
+        DataEvent::UartRxChunk {
+            epoch,
+            rx_seq,
+            wal_seq,
+            bytes,
+        } => DataEvent::UartRxChunk {
+            epoch: *epoch,
+            rx_seq: *rx_seq,
+            wal_seq: *wal_seq,
+            bytes: bytes.clone(),
+        },
+        DataEvent::ConsoleInputBytes {
+            client_id,
+            client_lifetime,
+            input_epoch,
+            bytes,
+        } => DataEvent::ConsoleInputBytes {
+            client_id: client_id.clone(),
+            client_lifetime: *client_lifetime,
+            input_epoch: *input_epoch,
+            bytes: bytes.clone(),
+        },
+        DataEvent::ConsoleDisconnected {
+            client_id,
+            client_lifetime,
+        } => DataEvent::ConsoleDisconnected {
+            client_id: client_id.clone(),
+            client_lifetime: *client_lifetime,
+        },
+    }
+}

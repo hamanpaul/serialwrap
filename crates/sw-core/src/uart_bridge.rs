@@ -439,6 +439,11 @@ fn spawn_reader_inner(
                                 hook();
                             }
 
+                            // 增補 #21（07 Task 9 Step 3 第 7 點）：WAL → hub `try_send`（滿載只計數）→ data lane。
+                            if let Some(tap) = ctx.hub.as_ref() {
+                                tap.push(data, warning_sink.as_ref());
+                            }
+
                             if let Some(console) = sentinel.as_mut() {
                                 if catch_unwind(AssertUnwindSafe(|| console.try_write(data)))
                                     .is_err()
