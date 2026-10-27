@@ -223,6 +223,87 @@ pub fn load_state(
     load_state_with_warn(path, fs, &|msg| eprintln!("{msg}"))
 }
 
+/// CPython `json.detect_encoding`：BOM 優先（utf-32 → utf-16 → utf-8-sig），否則依前 2／4 bytes 的 NUL 樣式判斷。
+fn detect_json_encoding(b: &[u8]) -> &'static str {
+    if b.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) || b.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        return "utf-32";
+    }
+    if b.starts_with(&[0xFE, 0xFF]) || b.starts_with(&[0xFF, 0xFE]) {
+        return "utf-16";
+    }
+    if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return "utf-8-sig";
+    }
+    if b.len() >= 4 {
+        if b[0] == 0 {
+            return if b[1] != 0 { "utf-16-be" } else { "utf-32-be" };
+        }
+        if b[1] == 0 {
+            return if b[2] != 0 || b[3] != 0 { "utf-16-le" } else { "utf-32-le" };
+        }
+    } else if b.len() == 2 {
+        if b[0] == 0 {
+            return "utf-16-be";
+        }
+        if b[1] == 0 {
+            return "utf-16-le";
+        }
+    }
+    "utf-8"
+}
+
+/// `bytes.decode(detect_encoding(b), "surrogatepass")` 的嚴格對應（Rust 字串不能承載孤立 surrogate：
+/// 該類輸入回解碼錯誤，屬已知限制）。
+fn json_bytes_to_text(raw: &[u8]) -> Result<String, String> {
+    let codec = detect_json_encoding(raw);
+    let utf16 = |body: &[u8], be: bool, name: &str| -> Result<String, String> {
+        if body.len() % 2 != 0 {
+            return Err(format!(
+                "'{name}' codec can't decode byte 0x{:02x} in position {}: truncated data",
+                body[body.len() - 1],
+                body.len() - 1
+            ));
+        }
+        let units = body
+            .chunks_exact(2)
+            .map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) });
+        char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map_err(|_| format!("'{name}' codec can't decode bytes: illegal UTF-16 surrogate"))
+    };
+    let utf32 = |body: &[u8], be: bool, name: &str| -> Result<String, String> {
+        if body.len() % 4 != 0 {
+            return Err(format!("'{name}' codec can't decode bytes: truncated data"));
+        }
+        body.chunks_exact(4)
+            .map(|c| {
+                let v = if be {
+                    u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+                } else {
+                    u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                };
+                char::from_u32(v).ok_or_else(|| format!("'{name}' codec can't decode bytes: code point not in range(0x110000)"))
+            })
+            .collect()
+    };
+    match codec {
+        "utf-32" => {
+            let be = raw.starts_with(&[0x00, 0x00, 0xFE, 0xFF]);
+            utf32(&raw[4..], be, if be { "utf-32-be" } else { "utf-32-le" })
+        }
+        "utf-16" => {
+            let be = raw.starts_with(&[0xFE, 0xFF]);
+            utf16(&raw[2..], be, if be { "utf-16-be" } else { "utf-16-le" })
+        }
+        "utf-16-be" => utf16(raw, true, codec),
+        "utf-16-le" => utf16(raw, false, codec),
+        "utf-32-be" => utf32(raw, true, codec),
+        "utf-32-le" => utf32(raw, false, codec),
+        "utf-8-sig" => decode_utf8_strict(&raw[3..]).map_err(|e| e.to_string()),
+        _ => decode_utf8_strict(raw).map_err(|e| e.to_string()),
+    }
+}
+
 /// 同 [`load_state`]，WARNING 交給 `warn`（Python `logging.getLogger("serialwrap").warning`）。
 pub fn load_state_with_warn(
     path: &Path,
@@ -240,9 +321,13 @@ pub fn load_state_with_warn(
         ),
         kind: StateLoadErrorKind::ReadFailed,
     })?;
-    // `json.loads(bytes)`：UTF-8 BOM 以 utf-8-sig 解碼；其餘以 UTF-8 strict 解碼。
-    let body = raw.strip_prefix(b"\xef\xbb\xbf".as_slice()).unwrap_or(&raw);
-    let parsed = match decode_utf8_strict(body) {
+    // `json.loads(bytes)`：`json.detect_encoding` 判斷 UTF-8（含 utf-8-sig）／UTF-16／UTF-32 後解碼（審查 F54）。
+    let parsed = match json_bytes_to_text(&raw) {
+        // bytes 路徑不做 str 的 BOM 檢查：解碼後仍以 U+FEFF 起頭（雙重 BOM）時，decoder 直接報
+        // `Expecting value`（CPython `json.loads(bytes)` 實測；審查 F58）。
+        Ok(text) if text.starts_with('\u{feff}') => {
+            Err(Ok("Expecting value: line 1 column 1 (char 0)".to_string()))
+        }
         Ok(text) => pyjson::loads(&text).map_err(|e| match e {
             JsonError::Recursion => Err(StateLoadError {
                 message: "RecursionError: maximum recursion depth exceeded".to_string(),
@@ -250,7 +335,7 @@ pub fn load_state_with_warn(
             }),
             other => Ok(other.to_string()),
         }),
-        Err(e) => Err(Ok(e.to_string())),
+        Err(e) => Err(Ok(e)),
     };
     let obj = match parsed {
         Ok(v) => v,
@@ -325,8 +410,13 @@ fn str_dict(m: &IndexMap<String, String>) -> PyValue {
     ))
 }
 
-/// `state.json` 的序列化位元組（`DISK_STABLE` ＋ `\n`；未知鍵於存檔時丟棄，WAL-D14）。
+/// `state.json` 的序列化位元組（`DISK_STABLE` ＋ 文字模式換行；未知鍵於存檔時丟棄，WAL-D14）。
 pub fn serialize_state(s: &LoadedState) -> Vec<u8> {
+    serialize_state_with(s, sw_pal::fs_ops::TEXT_NEWLINE)
+}
+
+/// 同 [`serialize_state`]，換行由呼叫端指定（Python `_save_state` 文字模式：Windows `\r\n`；審查 F55）。
+pub fn serialize_state_with(s: &LoadedState, newline: &[u8]) -> Vec<u8> {
     let mut d = PyDict::new();
     d.insert(
         "aliases",
@@ -350,7 +440,7 @@ pub fn serialize_state(s: &LoadedState) -> Vec<u8> {
     d.insert("profile_pins", str_dict(&s.profile_pins));
     d.insert("profile_detected", str_dict(&s.profile_detected));
     let mut out = pyjson::dumps_dict(&d, &DISK_STABLE).into_bytes();
-    out.push(b'\n');
+    out.extend_from_slice(newline);
     out
 }
 

@@ -1929,3 +1929,13 @@ fn release_persist_point_failure_fails_release_commit() {
         "state.json 不得寫入 released 列"
     );
 }
+
+#[test]
+fn manager_startup_always_rewrites_state_json() {
+    // 審查 F56（Medium，c96a91c）：Python `SessionManager.__init__` 尾端一律 `_save_state()`（#13），即使內容與磁碟
+    // 相同也重寫；原 `state_store::startup_always_rewrites_state_json` 只驗 store 自身的 commit，不證明啟動會寫。
+    let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    assert!(m.state_writes() >= 1, "SessionManager 建構即應寫一次 state.json");
+    let text = m.state_text();
+    assert!(text.contains("\"aliases\"") && text.ends_with('\n'), "{text:?}");
+}
