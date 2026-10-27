@@ -52,8 +52,12 @@ const INVALID_CONFIG_REASON: &str = "invalid windows.test_device_allowlist";
 const ENV_TEST_KILL_AFTER_SAVE: &str = "SERIALWRAP_TEST_KILL_AFTER_SAVE";
 /// Stage 0 測試鉤子（#4）：release 持久化 commit 前的暫停目錄。
 const ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE: &str = "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE";
-/// RPC server 停止時等待進行中 handler 的上限（SC-11 ①）。
-const SERVER_STOP_BUDGET: Duration = Duration::from_secs(10);
+/// RPC server 停止時等待進行中 handler 的上限（SC-11 ①）。Python `server.stop()`（`wait_closed`）無上限地等
+/// handler 收斂；Rust 以上限換取 SC-11 的 exit 1 診斷，但上限須涵蓋最長的有界 handler：READY 路徑的
+/// `session.recover --force`＝救援鍵（`\x03`／`\x04` 各等 prompt，約 4 s）→ `_force_recover`（clear drain ≤3 s＋
+/// 10 × 1 s 等 READY）≈ 17 s（審查 F87 Python 實測：登入型 DUT 不回 READY 時 handler 約 14 s 才回
+/// FORCE_RECOVER_TIMEOUT，Python exit 0；舊值 10 s 使 Rust exit 1）。
+const SERVER_STOP_BUDGET: Duration = Duration::from_secs(20);
 /// drain 全部 session 的共用期限（Python `shutdown_drain(total_timeout_s=5.0)`）。
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 /// DeviceWatcher 輪詢間隔（Python `DeviceWatcher(interval_s=1.0)`）。

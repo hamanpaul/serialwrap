@@ -146,10 +146,8 @@ fn endpoint_written_after_bind() {
     assert_eq!(d.wait(LONG).code(), Some(0));
 
     // config 目錄唯讀：寫入失敗為非致命，daemon 仍存活。
-    if is_root() {
-        eprintln!("skip: root 下 chmod 無效，寫入失敗路徑證據不足（非 PASS）");
-        return;
-    }
+    // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
+    assert!(!is_root(), "證據不足：root 下 chmod 無效，寫入失敗路徑須以非 root 執行");
     let env2 = isolated_env();
     chmod(&env2.config_dir, "555");
     let mut d2 = DaemonProc::spawn(&env2, &[]);
@@ -425,10 +423,8 @@ fn shutdown_releases_tty_before_exit() {
 
 #[test]
 fn wal_dir_readonly_at_start_blocks_login_probe() {
-    if is_root() {
-        eprintln!("skip: root 下 chmod 無效，唯讀 WAL 路徑證據不足（非 PASS；P5-T19 Review Focus 3）");
-        return;
-    }
+    // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
+    assert!(!is_root(), "證據不足：root 下 chmod 無效，唯讀 WAL 路徑須以非 root 執行（P5-T19 Review Focus 3）");
     let mut env = isolated_env_with_pty_target();
     chmod(&env.wal_dir, "555");
     let mut d = DaemonProc::spawn(&env, &[]);
@@ -436,13 +432,21 @@ fn wal_dir_readonly_at_start_blocks_login_probe() {
 
     let h = health_status(&env.socket);
     assert!(h["wal"]["healthy"] == false, "{h:?}");
-    assert_eq!(h["wal"]["unhealthy_reason"], "dir_unwritable");
-
-    // 登入 probe 不送：假 DUT 收到 0 bytes；session 停在 ATTACHED，last_error=PROMPT_UNAVAILABLE。
+    // 審查 F81 非 root 實跑揭露：計畫寫 `dir_unwritable`，但 Python `WalWriter.append` 第一筆寫入失敗即設
+    // `_unhealthy_reason = "write_failed"`（sw_core/wal.py append 失敗分支），attach 時假 DUT 的 `login: ` RX 即觸發；
+    // 依 Python 斷言 write_failed（`dir_unwritable` 只在尚無任何 append 前可見，屬計畫指定的 Rust-only 值，見 F93）。
     let socket = env.socket.clone();
-    wait_until("COM0 PROMPT_UNAVAILABLE", LONG, || {
+    wait_until("unhealthy_reason == write_failed", SHORT, || {
+        health_status(&socket)["wal"]["unhealthy_reason"] == "write_failed"
+    });
+
+    // 登入 probe 不送：假 DUT 收到 0 bytes。審查 F81 非 root 實跑揭露計畫寫的「停 ATTACHED＋PROMPT_UNAVAILABLE」
+    // 與 Python 不符：Python login TX 於 WAL 不健康時拋 `WalUnavailableError`（`_send_locked` 的 AUTO_TX／system:*
+    // 分支），`_login_tx_refused` 只吞 quiet／stale_login_gen → 例外穿出 `_attach_by_id` → DETACHED＋
+    // `ATTACH_FAILED:WalUnavailableError`（session_manager.py attach 的 except 分支）。依 Python 斷言。
+    wait_until("COM0 ATTACH_FAILED:WalUnavailableError", LONG, || {
         let s = get_state(&socket, "COM0");
-        s["state"] == "ATTACHED" && s["last_error"] == "PROMPT_UNAVAILABLE"
+        s["state"] == "DETACHED" && s["last_error"] == "ATTACH_FAILED:WalUnavailableError"
     });
     assert!(env.target_rx().is_empty(), "WAL 不健康時不得送出登入 probe");
 
@@ -458,17 +462,15 @@ fn wal_dir_readonly_at_start_blocks_login_probe() {
 
 #[test]
 fn wal_fault_after_ready_splits_agent_and_auto_tx() {
-    if is_root() {
-        eprintln!("skip: root 下 chmod 無效，WAL 故障路徑證據不足（非 PASS；P5-T19 Review Focus 3）");
-        return;
-    }
+    // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。
+    assert!(!is_root(), "證據不足：root 下 chmod 無效，WAL 故障路徑須以非 root 執行（P5-T19 Review Focus 3）");
     let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
 
-    // READY 之後：WAL 目錄改唯讀並刪除既有檔（重建失敗）。
-    chmod(&env.wal_dir, "555");
+    // READY 之後：刪除既有檔再把 WAL 目錄改唯讀（重建失敗）。審查 F81：先 chmod 555 再刪檔在非 root 下必 EACCES。
     fs::remove_file(env.wal_dir.join("raw.wal.ndjson")).expect("刪除 raw.wal.ndjson");
+    chmod(&env.wal_dir, "555");
     let socket = env.socket.clone();
     wait_until("wal.healthy == false", SHORT, || {
         health_status(&socket)["wal"]["healthy"] == false
@@ -493,41 +495,51 @@ fn wal_fault_after_ready_splits_agent_and_auto_tx() {
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
 
+/// WAL 中 `system:recover` 的 TX `payload_b64`（依寫入順序）。
+fn recover_tx_payloads(env: &IsolatedEnv) -> Vec<String> {
+    let wal = fs::read_to_string(env.wal_dir.join("raw.wal.ndjson")).unwrap_or_default();
+    wal.lines()
+        .filter_map(|line| pyjson::loads(line).ok())
+        .filter(|row| {
+            row["dir"] == "TX" && row["source"].as_str().is_some_and(|s| s.contains("recover"))
+        })
+        .filter_map(|row| row["payload_b64"].as_str().map(str::to_string))
+        .collect()
+}
+
 #[test]
 fn daemon_stop_during_force_recover_with_client_gone() {
-    // P5-T19 修正（與計畫 Review Focus 5 衝突，依 OD-14 #1 以 Python 行為為準，待擁有者確認）：
-    // Python 基線實測——同連線 pipelining `session.recover --force`＋`daemon.stop` 後 client 立即斷線：
-    // recover handler 照常跑完，其回應寫入失敗（EPIPE）後連線關閉，管線中的 `daemon.stop` 不被處理，daemon 持續運作；
-    // 之後經新連線送 `daemon.stop` 才有序停機（exit 0、socket 檔移除）。
-    let mut env = isolated_env_with_pty_target();
+    // P5-T19 修正（與計畫 Review Focus 5 衝突，依 OD-14 #1 以 Python 行為為準，待擁有者確認；審查 F87）：
+    // Python 基線實測（`tests/contract_blackbox/slice21/test_safety_core.py::
+    // test_pipelined_stop_after_client_gone_not_processed`，Python 輪 2/2 PASS）——同連線 pipelining
+    // `session.recover --force`＋`daemon.stop` 後 client 立即斷線：recover handler 照常跑完（READY 路徑
+    // `_recover_after_failure`，假 DUT 對 Ctrl-C 立即回 prompt → WAL 恰一筆 `system:recover` 的 `\x03`），回應寫入失敗後
+    // 連線關閉，管線中的 `daemon.stop` 不被處理；daemon 持續運作，之後由新連線 `daemon.stop` 才有序停機（exit 0）。
+    let env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
-    env.target_mute(); // DUT 不回 prompt：session.recover --force 會等待逾時
 
-    let wal_before = fs::metadata(env.wal_dir.join("raw.wal.ndjson")).map(|m| m.len()).unwrap_or(0);
     let payload = format!(
         "{}\n{}\n",
         r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#,
         STOP
     );
+    let sent = Instant::now();
     send_and_drop(&env.socket, &payload); // 送出後立即斷線
 
-    // recover handler 不因斷線取消：等它收斂（force recover 最多等 READY 10 s；COM0 離開 RECOVERING／ATTACHING）。
-    let socket = env.socket.clone();
-    thread::sleep(Duration::from_millis(500));
-    wait_until("force recover 收斂", LONG, || {
-        let st = get_state(&socket, "COM0")["state"].clone();
-        st == "READY" || st == "ATTACHED" || st == "DETACHED"
-    });
-    thread::sleep(Duration::from_secs(2));
+    // 收斂以救援 TX 實際寫入 WAL 為準（不以狀態判斷：COM0 起始即 READY）。
+    wait_until("救援 TX 寫入 WAL", LONG, || !recover_tx_payloads(&env).is_empty());
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(recover_tx_payloads(&env), vec!["Aw==".to_string()], "救援 TX 應恰為 \\x03");
+    // 超過 force recover 上限（10 s）＋餘裕：管線中的 stop 若於 handler 結束後才被處理，此時行程已結束。
+    if let Some(rest) = Duration::from_secs(11).checked_sub(sent.elapsed()) {
+        thread::sleep(rest);
+    }
 
-    // 管線中的 daemon.stop 未被處理：daemon 仍存活，新連線 health.status 回 ok。
+    // 管線中的 daemon.stop 未被處理：daemon 仍存活、socket 保留，新連線 health.status 回 ok。
     assert!(d.try_alive(), "回應寫入失敗後連線關閉，管線中的 daemon.stop 不得被處理：{}", d.stderr());
+    assert!(env.socket.exists(), "管線中的 daemon.stop 不得移除 socket");
     assert!(health_status(&env.socket)["ok"] == true, "daemon 應仍可服務新連線");
-
-    // recover handler 的救援 TX 已寫入 WAL，且最後一行完整。
-    let wal_after = fs::metadata(env.wal_dir.join("raw.wal.ndjson")).map(|m| m.len()).unwrap_or(0);
-    assert!(wal_after > wal_before, "救援 TX 應已寫入 WAL");
     let last = last_wal_line(&env);
     assert!(pyjson::loads(&last).is_ok(), "WAL 最後一行不完整：{last}");
 
@@ -536,6 +548,43 @@ fn daemon_stop_during_force_recover_with_client_gone() {
     rpc_once(&env.socket, STOP);
     assert_eq!(d.wait(Duration::from_secs(15)).code(), Some(0));
     assert!(started.elapsed() <= Duration::from_secs(15));
+    assert!(!env.socket.exists(), "有序停機後 socket 檔應已移除");
+}
+
+#[test]
+fn daemon_stop_from_second_connection_during_force_recover() {
+    // 審查 F87（Opus 修法）：force recover handler 進行中（假 DUT 暫停回應 8 s）、client 已斷線，由第二條連線送
+    // `daemon.stop`：關機等 handler 收斂後才 drain（Python `server.stop()` 先於 `service.stop()`），exit 0、
+    // 救援 TX 已在 WAL、WAL 每一行皆為完整 JSON、socket 移除。
+    // Python 基線：`test_safety_core.py::test_daemon_stop_from_second_connection_during_force_recover`（shell DUT，
+    // 2/2 PASS，stop→exit 約 8.2 s）。本 rig 的假 DUT 為登入型：`\x04` 登出後 reattach 停在 login，handler 依
+    // Python `_force_recover` 10 × 1 s 逾時（約 14 s）才回 FORCE_RECOVER_TIMEOUT——上限以 SERVER_STOP_BUDGET（20 s）
+    // ＋drain 計，不以計畫假設的「約 10 s」。
+    let mut env = isolated_env_with_pty_target();
+    let mut d = DaemonProc::spawn(&env, &[]);
+    wait_ready(&env, "COM0");
+    env.target_pause(8.0);
+    send_and_drop(
+        &env.socket,
+        &format!(
+            "{}\n",
+            r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#
+        ),
+    );
+    wait_until("救援 TX 寫入 WAL", SHORT, || !recover_tx_payloads(&env).is_empty());
+    let started = Instant::now();
+    rpc_once(&env.socket, STOP);
+    assert_eq!(d.wait(Duration::from_secs(30)).code(), Some(0), "{}", d.stderr());
+    assert!(started.elapsed() <= Duration::from_secs(25), "{:?}", started.elapsed());
+    assert!(
+        !d.stderr().contains("shutdown incomplete"),
+        "handler 收斂後的關機不得報 shutdown incomplete：{}",
+        d.stderr()
+    );
+    let wal = fs::read_to_string(env.wal_dir.join("raw.wal.ndjson")).expect("讀取 WAL");
+    for line in wal.lines() {
+        assert!(pyjson::loads(line).is_ok(), "WAL 行不完整：{line}");
+    }
     assert!(!env.socket.exists(), "有序停機後 socket 檔應已移除");
 }
 
@@ -737,8 +786,8 @@ fn unreadable_config_isolated_fail_closed() {
             if is_root() {
                 // root 讀檔不受 mode 限制：以 setpriv 降為 nobody 執行（與 golden 產生器相同）；無 setpriv 則證據不足。
                 if !Path::new("/usr/bin/setpriv").exists() {
-                    eprintln!("skip permission_denied：root 且無 setpriv（證據不足，非 PASS）");
-                    continue;
+                    // 審查 F81：證據不足必須 FAIL（不得 continue 計為 PASS）。
+                    panic!("證據不足：permission_denied 列需非 root 或 /usr/bin/setpriv");
                 }
                 let o = Command::new("/usr/bin/setpriv")
                     .args(["--reuid=65534", "--regid=65534", "--clear-groups", DAEMON_BIN])
