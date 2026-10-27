@@ -1806,6 +1806,7 @@ impl ManagerExec {
             epoch,
             worker,
             real_path: dev.0,
+            sentinel: None,
         })
     }
 

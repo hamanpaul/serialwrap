@@ -618,3 +618,46 @@ fn reap_dead_primary_transfers_primary() {
     assert_eq!(h.core.human_console().primary_client_id.as_deref(), Some("c2"), "primary 轉移");
     assert!(h.core.human_console().consoles.contains_key("t1"), "TCP console 不受 reaper");
 }
+
+// ---------------------------------------------------------------------------
+// p6-cloud 審查回歸（1fb9612..f6859e8）
+// ---------------------------------------------------------------------------
+
+/// Medium（03ba902）：哨兵與 bridge adopt 同一事件登記（Python `start()` 先建哨兵再發布 ATTACHED／vtty），
+/// passthrough 立即 ATTACHED 時也不存在 human attach 搶先成為 primary 的窗口。
+#[test]
+fn sentinel_registered_in_same_event_as_adopt() {
+    let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: "/s/by-id/usb-A".into(),
+        real_path: "/fake/tty-A".into(),
+    });
+    let mut opened = h.opened_bridge("/fake/tty-A");
+    opened.sentinel = Some(PtyInfo {
+        token: 77,
+        slave_path: "/dev/pts/77".into(),
+        client_id: "sentinel0001".into(),
+    });
+    let fx = h.feed(ControlEvent::BridgeOpened { epoch_hint: 0, result: Ok(opened) });
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::ConsoleAdopt { token: 77, .. })),
+        "同一事件 adopt 哨兵"
+    );
+    let hc = h.core.human_console();
+    let rec = hc.consoles.get("sentinel0001").expect("哨兵已登記");
+    assert!(rec.internal);
+    assert_eq!(rec.label, "primary");
+    assert_eq!(hc.primary_client_id.as_deref(), Some("sentinel0001"));
+}
+
+/// Medium（e2e8a57）：Release 後 SessionPublic 的 vtty 為 null（Python release 關閉全部 console，vtty_path=None）。
+#[test]
+fn release_clears_public_vtty() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    h.begin_stop(StopKind::Release);
+    let st = h.rpc(SessionRequest::GetState).unwrap();
+    let PyValue::Dict(session) = &st["session"] else { panic!("session") };
+    assert_eq!(session.get("vtty"), Some(&PyValue::Null));
+}

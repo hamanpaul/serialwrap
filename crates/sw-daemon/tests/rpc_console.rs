@@ -451,3 +451,37 @@ fn soft_preempt_replays_when_peer_appears_later() {
         seen.contains(&b'Q')
     });
 }
+
+/// Medium（1fb9612）：`interactive_open` 的 SESSION_NOT_READY 回原樣 selector（Python `session_manager.py:6822` 起）。
+#[test]
+fn interactive_open_not_ready_keeps_raw_selector() {
+    let r = ServiceRig::with_console_backend("pty");
+    r.mgr.force_session_state("COM0", SessionState::Attached);
+    let resp = r.call("session.interactive_open", r#"{"alias":"t+1"}"#);
+    assert_eq!(
+        j(&resp),
+        format!(r#"{{"ok":false,"error_code":"SESSION_NOT_READY","selector":"t+1","version":"{}"}}"#, r.version)
+    );
+}
+
+/// Medium（02fb068）：計畫 `attach_selector_alias_chain`——alias 選取 session。
+#[test]
+fn attach_selector_alias_chain() {
+    let r = ServiceRig::with_console_backend("pty");
+    let resp = attach(&r, r#"{"alias":"t+1"}"#);
+    assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&resp));
+    assert_eq!(s(&resp, "client_id").len(), 12);
+}
+
+/// Medium（02fb068）：計畫 `attach_not_ready_states` 的 DETACHED／RELEASED 兩態。
+#[test]
+fn attach_not_ready_detached_and_released() {
+    let r = ServiceRig::with_console_backend("pty");
+    let want = format!(r#"{{"ok":false,"error_code":"SESSION_NOT_READY","selector":"COM0","version":"{}"}}"#, r.version);
+    for st in [SessionState::Detached, SessionState::Released] {
+        r.mgr.force_session_state("COM0", st);
+        let before = r.side_effect_fingerprint().2;
+        assert_eq!(j(&attach(&r, r#"{"selector":"COM0"}"#)), want, "{st:?}");
+        assert_eq!(r.side_effect_fingerprint().2, before);
+    }
+}

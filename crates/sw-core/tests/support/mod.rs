@@ -396,6 +396,7 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: REAL_PATH.into(),
+            sentinel: None,
         };
         self.feed(ControlEvent::BridgeOpened {
             epoch_hint: 0,
@@ -499,6 +500,7 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: real_path.to_string(),
+            sentinel: None,
         }
     }
 
@@ -961,6 +963,7 @@ impl EffectExecutor for RigExec {
                             epoch,
                             worker,
                             real_path: dev.0.clone(),
+                            sentinel: None,
                         })
                     }
                     Err(OpenError::Held(holder)) => Err(OpenFailure::Held(holder)),

@@ -2175,6 +2175,7 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            sentinel: _,
         } = opened;
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = None;
@@ -2350,6 +2351,7 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            sentinel: _,
         } = opened;
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = Some(real_path.clone());

@@ -129,6 +129,8 @@ pub struct OpenedBridge {
     pub epoch: u64,
     pub worker: IoWorker,
     pub real_path: String,
+    /// P6 Task 9 步驟 5：executor 於開埠成功時一併預建的哨兵 primary PTY（PTY 後端；`PtyPair` 留在 executor）。
+    pub sentinel: Option<crate::session_core::PtyInfo>,
 }
 
 /// bridge 開啟失敗的分類。
