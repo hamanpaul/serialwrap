@@ -496,7 +496,7 @@ def test_windows_com_autostart_case_supplies_release_manifest():
     body = source.split("def test_autostart_l15_tx_once(", 1)[1]
     assert "bundle_manifest_path(" in body
     assert 'env["SERIALWRAP_RELEASE_MANIFEST"]' in body
-    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("_submit_after_on_demand_autostart(env)")
+    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("_submit_after_on_demand_autostart(env, wire)")
 
 
 def test_windows_com_autostart_case_pins_com20_profile():
@@ -507,7 +507,7 @@ def test_windows_com_autostart_case_pins_com20_profile():
     assert 'profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"' in body
     assert "device_by_id: COM20" in body
     assert "com: COM0" in body
-    assert body.index("device_by_id: COM20") < body.index("_submit_after_on_demand_autostart(env)")
+    assert body.index("device_by_id: COM20") < body.index("_submit_after_on_demand_autostart(env, wire)")
 
 
 def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(tmp_path, monkeypatch):
@@ -586,6 +586,111 @@ def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(t
     assert calls[3:] == [commands[1], ["daemon", "stop"]]
 
 
+def _load_sc18_case(tmp_path, monkeypatch):
+    """載入 SC-18 案例模組並以假 Windows 環境替換 os／bundle 解析。"""
+    case_dir = ROOT / "tests/contract_blackbox"
+    case_file = case_dir / "test_cli_mgmt_daemon.py"
+    sys.path.insert(0, str(case_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("serialwrap_sc18_case_variants", case_file)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", pytest.PytestUnknownMarkWarning)
+            spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(case_dir))
+    bundle = tmp_path / "bundle"
+    manifest = bundle / "versions" / "0.3.2" / "release-manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    wire = tmp_path / "wire.ndjson"
+    module.os = SimpleNamespace(
+        name="nt",
+        environ={
+            "SW_WIN_DEV_BUNDLE": str(bundle),
+            "SW_TEST_COM_PAIR": "COM20:COM21",
+            "SW_TEST_DUT_WIRE": str(wire),
+        },
+    )
+    monkeypatch.setattr(module, "is_rust", lambda: True)
+    monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
+    return module, {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, wire
+
+
+def _write_echo_tx(wire):
+    wire.write_text(
+        '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
+        base64.b64encode(b"echo X\r").decode("ascii") + '"}\n',
+        encoding="utf-8",
+    )
+
+
+def test_windows_com_autostart_first_submit_success_is_single_request(tmp_path, monkeypatch):
+    """首次 autostart 請求直接成功（原驗收形狀）時不得再送第二次。"""
+    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    calls = []
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        calls.append(list(args))
+        if args[:2] == ["cmd", "submit"]:
+            _write_echo_tx(wire)
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+    assert [call[:2] for call in calls] == [["cmd", "submit"], ["daemon", "stop"]]
+
+
+@pytest.mark.parametrize(
+    ("first_stdout", "tx_on_reject", "message"),
+    [
+        (b'{"ok":false,"error_code":"SESSION_NOT_READY"}', True, "被拒絕的首次請求不得在 DUT 端留下任何 TX"),
+        (b'{"ok":false,"error_code":"TIMEOUT"}', False, "只接受 session 尚未 READY 的拒絕"),
+        (b"not-json", False, "只接受 session 尚未 READY 的拒絕"),
+    ],
+)
+def test_windows_com_autostart_rejects_unexpected_first_failure(
+    tmp_path, monkeypatch, first_stdout, tx_on_reject, message,
+):
+    """首次請求失敗時只接受零 TX 的 SESSION_NOT_READY；其他錯誤或已 TX 皆 FAIL。"""
+    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        if args[:2] == ["cmd", "submit"]:
+            if tx_on_reject:
+                _write_echo_tx(wire)
+            return SimpleNamespace(rc=2, stdout=first_stdout, stderr="serialwrap: on-demand：已自動啟動\n".encode())
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    with pytest.raises(AssertionError, match=message):
+        module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+
+
+def test_windows_com_autostart_requires_autostart_evidence(tmp_path, monkeypatch):
+    """首次請求即使成功，也必須留下 on-demand 自動啟動證據。"""
+    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        if args[:2] == ["cmd", "submit"]:
+            _write_echo_tx(wire)
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    with pytest.raises(AssertionError, match="autostart 證據"):
+        module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+
+
 def test_windows_dev_bundle_keeps_daemon_inside_install_tree():
     """Windows B 輪 manifest launcher 與執行程序須落在同一版本安裝樹。"""
     ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
@@ -607,3 +712,4 @@ def test_windows_selftest_writeback_retries_and_compares_both_logs():
     assert "foreach ($log in @($selftestLog, $selftestError))" in block
     assert "(Get-Sha256 $log) -ne (Get-Sha256 $logCopy)" in block
     assert "if ($copyErrors.Count -eq 0) { break }" in block
+

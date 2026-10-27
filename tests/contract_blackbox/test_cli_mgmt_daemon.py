@@ -122,27 +122,52 @@ def _rpc_pid(endpoint: str) -> int | None:
     return pid if isinstance(pid, int) else None
 
 
-def _submit_after_on_demand_autostart(env: dict[str, str]):
-    """先確認首次需求確實啟動 daemon，再等 passthrough session READY 後送一次命令。"""
+def _dut_tx_bytes(wire: str) -> bytes:
+    """DUT 模擬器 wire 記錄中實際寫入 DUT stdin 的 bytes。"""
+    path = Path(wire)
+    if not path.is_file():
+        return b""
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    return b"".join(
+        base64.b64decode(row["payload_b64"], validate=True)
+        for row in rows
+        if row.get("dir") == "TX" and row.get("observation") == "dut_stdin_write"
+    )
+
+
+# passthrough 須連續 30 秒無 RX 才升 READY（PASSTHROUGH_READY_QUIET_S）；等待上限另留 attach 與
+# 高負載排程裕度，且不超過首次 CLI 呼叫的 120 秒上限。
+_PASSTHROUGH_READY_WAIT_S = 120.0
+
+
+def _submit_after_on_demand_autostart(env: dict[str, str], wire: str):
+    """首次 `cmd submit` 必須經 on-demand 自動啟動 daemon；若 session 尚未 READY，等 READY 後再送一次。
+
+    SC-18 只規定「連線階段被拒才自動啟動並重送一次」，不規定 CLI 等待 READY。passthrough
+    session 在 attach 後須靜默 30 秒才升 READY，因此首次請求允許兩種結果：(a) 直接成功（原驗收形狀）；
+    (b) 被拒絕為 SESSION_NOT_READY——此時被拒請求必須零 TX，之後的單次送出仍須恰好一次 TX。
+    """
     initial = run_cli(
         ["cmd", "submit", "--selector", "COM0", "--cmd", "echo X", "--cmd-timeout", "1"],
         env=env,
         timeout_s=120.0,
     )
-    initial_response = json.loads(initial.stdout.decode("utf-8"))
-    assert initial.rc == 2 and initial_response.get("error_code") == "SESSION_NOT_READY", (
-        "首次需求必須啟動 daemon，且明確回報 session 尚未 READY；"
-        f"rc={initial.rc} response={initial_response!r}"
-    )
-    initial_session = initial_response.get("session")
-    assert isinstance(initial_session, dict) and initial_session.get("state") in {"ATTACHING", "ATTACHED"}, (
-        f"首次 autostart 的 session 不在可等待 READY 的狀態：{initial_session!r}"
-    )
     assert "已自動啟動" in initial.stderr.decode("utf-8", errors="replace"), (
         f"首次 cmd submit 未留下 on-demand autostart 證據：{initial.stderr!r}"
     )
+    if initial.rc == 0:
+        return initial
+    try:
+        initial_response = json.loads(initial.stdout.decode("utf-8"))
+    except ValueError:
+        initial_response = None
+    assert isinstance(initial_response, dict) and initial_response.get("error_code") == "SESSION_NOT_READY", (
+        "首次需求未成功時只接受 session 尚未 READY 的拒絕；"
+        f"rc={initial.rc} stdout={initial.stdout!r} stderr={initial.stderr!r}"
+    )
+    assert b"echo X" not in _dut_tx_bytes(wire), "被拒絕的首次請求不得在 DUT 端留下任何 TX"
 
-    deadline = time.monotonic() + 45.0
+    deadline = time.monotonic() + _PASSTHROUGH_READY_WAIT_S
     last_session: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         status = run_cli(["session", "list"], env=env, timeout_s=10.0)
@@ -155,7 +180,7 @@ def _submit_after_on_demand_autostart(env: dict[str, str]):
             pytest.fail(f"COM0 attach failed before READY: {last_session!r}")
         time.sleep(0.25)
     else:
-        pytest.fail(f"COM0 未於 passthrough 靜默窗口內進入 READY：{last_session!r}")
+        pytest.fail(f"COM0 未於 {_PASSTHROUGH_READY_WAIT_S:.0f} 秒內進入 READY：{last_session!r}")
 
     return run_cli(
         [
@@ -335,15 +360,9 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
 
     res = None
     try:
-        res = _submit_after_on_demand_autostart(env)
+        res = _submit_after_on_demand_autostart(env, wire)
         assert res.rc == 0, res.stderr.decode("utf-8", errors="replace")
-        rows = [json.loads(line) for line in Path(wire).read_text(encoding="utf-8").splitlines() if line]
-        dut_tx = b"".join(
-            base64.b64decode(row["payload_b64"], validate=True)
-            for row in rows
-            if row.get("dir") == "TX" and row.get("observation") == "dut_stdin_write"
-        )
-        assert dut_tx.count(b"echo X\r") == 1
+        assert _dut_tx_bytes(wire).count(b"echo X\r") == 1
     finally:
         stop = run_cli(["daemon", "stop"], env=env, timeout_s=60.0)
         if res is not None and res.rc == 0:
