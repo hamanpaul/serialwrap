@@ -23,7 +23,7 @@ import pytest
 from sw_core.auth import SessionAuth, resolve_session_auth
 from sw_core.config import ProfileTemplate, SessionProfile, UartProfile, load_profiles
 from sw_core.device_watcher import DeviceInfo
-from sw_core.login_fsm import detect_boot_banner, ensure_ready
+from sw_core.login_fsm import detect_boot_banner, ensure_ready, probe_ready
 from sw_core.session_manager import SessionManager, SessionRuntime, _is_reboot_command
 from sw_core.uart_io import UARTBridge
 
@@ -549,3 +549,27 @@ def test_packaged_smart4_profile_declares_no_literal_secret():
     assert sp["console_unlock_idle_s"] == 5
     assert "console_unlock" not in sp
     assert "prpl-template" in {template.profile_name for template in loaded.templates}
+
+
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
+def test_invalid_regex_raises_immediately(hardware):
+    """parity #114（B:F-25）：無效 regex 在比對／編譯處立即拋 ``re.error``，不消耗 timeout、不送 secret。
+
+    Rust ``login_fsm`` 以 ``LoginOutcome::Raised("error")`` 承接（P7 Task 3 ``invalid_regex_raises_immediately``）。
+    """
+    target, bridge, _ = hardware
+    target.locked = False
+    target.prompt()
+    assert bridge.wait_for_regex(profile().prompt_regex, 0.5)
+
+    started = time.monotonic()
+    with pytest.raises(re.error):
+        ensure_ready(bridge, profile(prompt_regex="(", timeout_s=30.0), SessionAuth(console_unlock="dummy-unlock"))
+    assert time.monotonic() - started < 5.0
+    assert b"dummy-unlock" not in target.lines
+
+    started = time.monotonic()
+    with pytest.raises(re.error):
+        probe_ready(bridge, profile(console_unlock_env=None, prompt_regex="(", timeout_s=30.0))
+    assert time.monotonic() - started < 5.0

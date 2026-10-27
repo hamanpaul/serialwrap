@@ -211,3 +211,52 @@ pub fn fake_read(v: &PyValue) -> impl Fn(&str) -> Option<std::io::Result<String>
         })
     }
 }
+
+const DEFAULT_PROFILE_DIR: &str = "/etc/serialwrap/profiles";
+
+struct DefaultYamlFs(String);
+
+impl sw_proto::config_types::ProfileFs for DefaultYamlFs {
+    fn flavor(&self) -> sw_proto::pypath::PathFlavor {
+        sw_proto::pypath::PathFlavor::Posix
+    }
+    fn is_dir(&self, p: &str) -> bool {
+        p == DEFAULT_PROFILE_DIR
+    }
+    fn list_dir(&self, _p: &str) -> Result<Vec<String>, sw_proto::pycompat::PyOsError> {
+        Ok(vec!["default.yaml".to_string()])
+    }
+    fn read_bytes(&self, _p: &str) -> Result<Vec<u8>, sw_proto::pycompat::PyOsError> {
+        Ok(self.0.clone().into_bytes())
+    }
+    fn expanduser(&self, p: &str) -> String {
+        p.to_string()
+    }
+}
+
+/// 出貨 `sw_core/assets/profiles/default.yaml` 的模板（`capture_p7_goldens._templates()`）。
+pub fn default_templates() -> Vec<sw_proto::config_types::ProfileTemplate> {
+    let path = super::repo_path("sw_core/assets/profiles/default.yaml");
+    let text = std::fs::read_to_string(&path).expect("default.yaml");
+    sw_proto::config_types::load_profiles(DEFAULT_PROFILE_DIR, &DefaultYamlFs(text))
+        .expect("default.yaml 應可載入")
+        .templates
+}
+
+pub fn default_template(name: &str) -> sw_proto::config_types::ProfileTemplate {
+    default_templates()
+        .into_iter()
+        .find(|t| t.profile_name == name)
+        .unwrap_or_else(|| panic!("default.yaml 無模板 {name}"))
+}
+
+/// `capture_p7_goldens.session_profile(template)`：COM0／act_no 1／alias lab+1／fake by-id。
+pub fn session_profile_for(name: &str) -> sw_proto::config_types::SessionProfile {
+    sw_proto::config_types::SessionProfile {
+        com: "COM0".into(),
+        act_no: sw_proto::pyjson::PyInt::Small(1),
+        alias: "lab+1".into(),
+        device_by_id: "/dev/serial/by-id/fake".into(),
+        template: default_template(name),
+    }
+}
