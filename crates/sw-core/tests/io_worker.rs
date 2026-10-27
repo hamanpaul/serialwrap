@@ -59,6 +59,8 @@ fn job(
                 source: "agent:test".into(),
                 cmd_id: Some(format!("cmd-{op_id}")),
                 log: true,
+                input_epoch: None,
+                replay_hold: None,
             },
             payload: bytes.to_vec(),
             reply,

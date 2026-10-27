@@ -1196,6 +1196,8 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
                 source: "agent".into(),
                 cmd_id: None,
                 log: false,
+            input_epoch: None,
+            replay_hold: None,
             }
         )),
         Err(FenceReject::OwnerMismatch)

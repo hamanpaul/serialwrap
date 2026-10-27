@@ -693,6 +693,8 @@ fn flash_probe_does_not_reuse_op_id_as_probe_identity() {
         source: "system:flash".into(),
         cmd_id: None,
         log: true,
+        input_epoch: None,
+        replay_hold: None,
     };
     assert_eq!(fence.with(|state| Fence::admit(state, &permit)), Err(FenceReject::Flash));
 }

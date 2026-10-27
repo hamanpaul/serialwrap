@@ -166,6 +166,11 @@ impl ConsoleIo for TestConsole {
     }
 
     fn close(self: Box<Self>) {}
+
+    /// P6 增補（ConsoleIo::mux_handle）：本測試的 console 不註冊 ConsoleMux，不會被呼叫。
+    fn mux_handle(&self) -> sw_pal::console_mux::MuxHandle {
+        unimplemented!("rx_reader 測試 console 不註冊 ConsoleMux")
+    }
 }
 
 enum ScriptStep {
@@ -273,6 +278,7 @@ fn rx_is_in_wal_before_actor_sees_it_with_exact_seq() {
             (epoch, rx_seq, wal_seq, bytes.as_slice()),
             (3, 1, 2, &b"login: "[..])
         ),
+        other => panic!("非預期的 data 事件：{other:?}"),
     }
     let text = String::from_utf8(
         wfs.contents(Path::new("/w/raw.wal.ndjson"))

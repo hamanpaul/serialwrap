@@ -880,6 +880,8 @@ fn stale_reply_context_rejected_after_release() {
         source: "agent".into(),
         cmd_id: Some(cmd.cmd_id),
         log: true,
+    input_epoch: None,
+    replay_hold: None,
     };
     assert_eq!(
         h.fence
