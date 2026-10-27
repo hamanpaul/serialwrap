@@ -23,6 +23,7 @@ limits:
   - {name: tx_ledger_unresolved_gaps, value: 256, unit: gaps, overflow: merge_oldest, source: "arch §5.7／§5.10：合併為 GapOverflow{gaps, bytes, first_op, last_op}（R1-F8）"}
   - {name: tx_op_wal_gaps, value: 16, unit: gaps, overflow: merge_oldest, source: "arch §5.7／§5.10：單一 op 缺口合併（R1-F8）"}
   - {name: tx_settle_queue, value: 256, unit: entries, overflow: retain_entry, source: "arch §5.10：try_send 滿時該 op 留在帳本，settle_dropped 計數（R1-F8）"}
+  - {name: fence_cancelled_ops_max, value: 512, unit: ops, overflow: drop_oldest, source: "parity-amendments-2026-10-26 #38：撤銷 op tombstone（Python `UARTBridge._revoked_ops`、`_TX_ACCOUNT_MAX`）FIFO 淘汰最舊；Rust `tx_writer::CANCELLED_OPS_MAX`"}
 
 # §5.3 事件延遲契約：開工前凍結。owner 與 reviewed_by 必須不同。
 event_latency:

@@ -374,7 +374,8 @@ fn lease_send_refused_at_commit_maps_codes() {
         (
             "cancelled",
             |f| {
-                for n in 0..4096 {
+                // tombstone 上限 512、FIFO 淘汰（#38）：撤銷全部 rig 內可能的 op id（皆 < 512）。
+                for n in 0..sw_core::tx_writer::CANCELLED_OPS_MAX as u64 {
                     f.cancelled.insert(OpId(n));
                 }
             },
@@ -946,7 +947,8 @@ fn selftest_probe_other_reject_zero_tx_matches_python() {
         ("drain", |f| f.frozen = true),
         ("stale_generation", |f| f.active_epoch = Some(u64::MAX)),
         ("cancelled", |f| {
-            for n in 0..4096 {
+            // tombstone 上限 512、FIFO 淘汰（#38）：撤銷全部 rig 內可能的 op id（皆 < 512）。
+            for n in 0..sw_core::tx_writer::CANCELLED_OPS_MAX as u64 {
                 f.cancelled.insert(OpId(n));
             }
         }),

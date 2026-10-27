@@ -1493,6 +1493,15 @@ impl SessionCore {
             }
             SessionRequest::CancelQueued { cmd_id } => {
                 self.queue.remove(&cmd_id);
+                // Python `revoke_tx_op`：取消的命令若正是前景 op，撤銷其 TX permit——之後以該 op 提交的
+                // TX（含 gate 外等待中的尾段）一律 Cancelled、零 TX（parity-amendments-2026-10-26 #52）。
+                if let Some(grant) = self
+                    .foreground
+                    .as_ref()
+                    .filter(|grant| grant.cmd_id.as_deref() == Some(cmd_id.as_str()))
+                {
+                    self.deps.fence.revoke_ops(&[grant.op_id]);
+                }
                 vec![Effect::Reply(reply, Ok(pydict! { "ok" => true }))]
             }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
@@ -3503,6 +3512,10 @@ impl SessionCore {
             );
             self.foreground = Some(grant.clone());
             self.foreground_reboot = reboot;
+            // 審查 F14：reboot 命令 TX 一經提交，由 TxWriter 在同一次 Fence 臨界區內 arm quiet（不等 actor）。
+            self.deps.fence.with(|f| {
+                f.reboot_arm_op = reboot.then_some(grant.op_id);
+            });
             effects.push(Effect::StartOp {
                 grant,
                 spec: OpSpec::Command(command),

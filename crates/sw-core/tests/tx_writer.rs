@@ -1004,3 +1004,105 @@ fn login_probe_after_fsm_gen_bump_rejected() {
     let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::NotSubmitted, Some(FenceReject::FsmMismatch)));
 }
+
+// ---------------------------------------------------------------------------
+// parity-amendments-2026-10-26 #38／#52（審查 F13）：撤銷 op 的 tombstone 上限 512、FIFO 淘汰
+// （Python `UARTBridge._revoke_ops_locked`，`_TX_ACCOUNT_MAX`）；撤銷在途命令後其後續 TX 一律 Cancelled。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cancelled_ops_bounded_512_fifo() {
+    let fence = Fence::new();
+    let ids: Vec<OpId> = (1..=513).map(OpId).collect();
+    fence.revoke_ops(&ids);
+    fence.with(|s| {
+        s.active_epoch = Some(0);
+        assert_eq!(s.cancelled_len(), 512, "上限 512");
+    });
+    let permit = |op: u64| TxPermit {
+        op_id: OpId(op),
+        epoch: 0,
+        owner_gen: 0,
+        fsm_gen: 0,
+        class: TxClass::Command,
+        source: "agent:x".into(),
+        cmd_id: None,
+        log: true,
+    };
+    fence.with(|s| {
+        assert_eq!(Fence::admit(s, &permit(1)), Ok(()), "最舊者被淘汰");
+        assert_eq!(Fence::admit(s, &permit(2)), Err(FenceReject::Cancelled));
+        assert_eq!(Fence::admit(s, &permit(513)), Err(FenceReject::Cancelled));
+    });
+    // 重複撤銷既有 id：移到最新（Python `pop` 後重新插入），不重複計數。
+    fence.revoke_ops(&[OpId(2)]);
+    fence.revoke_ops(&[OpId(600)]);
+    fence.with(|s| {
+        assert_eq!(s.cancelled_len(), 512);
+        assert_eq!(Fence::admit(s, &permit(2)), Err(FenceReject::Cancelled), "重新撤銷者保留");
+        assert_eq!(Fence::admit(s, &permit(3)), Ok(()), "下一個最舊者被淘汰");
+    });
+}
+
+#[test]
+fn cancelled_inflight_command_later_tx_refused() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(2)]);
+    let rx = send_async(&r, TxClass::Command, 5, 0, b"abcdef");
+    assert!(r.dev.wait_paused(Duration::from_secs(2))); // 已提交 "ab"，於 gate 外等待
+    r.fence.revoke_ops(&[OpId(5)]); // 不得阻塞
+    r.dev.release_pause();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(2), Some(FenceReject::Cancelled))
+    );
+    assert_eq!(r.dev.take_tx(), b"ab".to_vec(), "撤銷後尾段永不交 OS");
+    assert_eq!(r.dev.os_submits(), 1);
+    // 同一 op 之後的新 TX 也一律拒絕、零 TX。
+    let rep = send_async(&r, TxClass::Command, 5, 0, b"x")
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(rep.reject, Some(FenceReject::Cancelled));
+    assert_eq!(r.dev.os_submits(), 1);
+}
+
+#[test]
+fn reboot_tx_arms_quiet_before_next_job() {
+    // 審查 F14（0a187c1）：Python `_handle_reboot_command` 在同一個 `_write_lock` 內 arm quiet——下一個 UART writer
+    // 取得鎖之前 quiet 已生效。TxWriter 在記錄結果的同一次 `Fence::with` 內對 `reboot_arm_op` 設 quiet／reconfirm，
+    // 不等 actor 處理 `UartTxCompleted`：緊接的 LoginProbe 必須被 `Quiet` 拒絕、零 TX。
+    let r = rig();
+    r.fence.with(|s| s.reboot_arm_op = Some(OpId(1)));
+    r.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(3)]);
+    let (reboot, reboot_rx) = job(1, TxClass::Command, 0, 0, true, b"reboot\n");
+    r.h.jobs.send(reboot).unwrap();
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));
+    let (probe, probe_rx) = job(2, TxClass::LoginProbe, 0, 0, true, b"\n");
+    r.h.jobs.send(probe).unwrap();
+    r.dev.release_pause();
+    let rep = reboot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(rep.result.outcome, TxOutcome::Completed(7));
+    let rep = probe_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(rep.reject, Some(FenceReject::Quiet), "reboot 後緊接的 probe 必須被 quiet 拒絕");
+    assert_eq!(r.dev.take_tx(), b"reboot\n".to_vec());
+    r.fence.with(|s| {
+        assert!(s.quiet_active && s.reconfirm_pending);
+        assert_eq!(s.reboot_arm_op, None, "arm 一次即清除");
+    });
+}
+
+#[test]
+fn reboot_tx_not_submitted_does_not_arm_quiet_in_writer() {
+    // NotSubmitted（confirmed 0、非 Unknown）不 arm（#55）。
+    let r = rig();
+    r.fence.with(|s| {
+        s.reboot_arm_op = Some(OpId(1));
+        s.frozen = true;
+    });
+    let (reboot, reboot_rx) = job(1, TxClass::Command, 0, 0, true, b"reboot\n");
+    r.h.jobs.send(reboot).unwrap();
+    let rep = reboot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+    r.fence.with(|s| assert!(!s.quiet_active && !s.reconfirm_pending));
+}

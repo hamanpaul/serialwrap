@@ -771,8 +771,11 @@ fn reboot_not_submitted_does_not_arm_quiet_e2e() {
     h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
     let id = h.submit_ok("reboot");
     assert!(h.dev.wait_paused(Duration::from_secs(2)));
+    // 審查 F35：先記下暫停點的 OS 提交數，最後斷言零新增（原斷言 `os_submits() == os_submits()` 恆真）。
+    let submits = h.dev.os_submits();
     h.fence.with(|f| {
-        for n in 0..4096 {
+        // tombstone 上限 512、FIFO 淘汰（#38）：撤銷全部 rig 內可能的 op id（皆 < 512）。
+        for n in 0..sw_core::tx_writer::CANCELLED_OPS_MAX as u64 {
             f.cancelled.insert(OpId(n));
         }
     });
@@ -780,7 +783,7 @@ fn reboot_not_submitted_does_not_arm_quiet_e2e() {
     let rec = h.wait_done(&id);
     h.fence.with(|f| f.cancelled.clear());
     assert_eq!(rec["error_code"], PyValue::from("FLUSHED_BY_RECOVERY"));
-    assert_eq!(h.dev.os_submits(), h.dev.os_submits());
+    assert_eq!(h.dev.os_submits(), submits, "提交點被拒：零 OS 提交");
     let s = h.get_state();
     assert_eq!(s["state"], PyValue::from("READY"));
     assert_eq!(s["boot_quiet_remaining_s"], PyValue::Null);
@@ -1194,7 +1197,8 @@ fn recover_key_refused_frozen_maps_flushed_by_recovery() {
         ("frozen", |f| f.frozen = true),
         ("stale", |f| f.active_epoch = Some(u64::MAX)),
         ("cancelled", |f| {
-            for n in 0..4096 {
+            // tombstone 上限 512、FIFO 淘汰（#38）：撤銷全部 rig 內可能的 op id（皆 < 512）。
+            for n in 0..sw_core::tx_writer::CANCELLED_OPS_MAX as u64 {
                 f.cancelled.insert(OpId(n));
             }
         }),
@@ -1496,4 +1500,26 @@ fn tx_ledger_bounded_over_long_session_without_reconnect() {
     );
     assert!(!gauge.saturated);
     assert_eq!(gauge.settle_dropped, 0);
+}
+
+#[test]
+fn command_cancel_running_revokes_tx_op() {
+    // 審查 F13／#52：`command.cancel` 在途命令 → Python `revoke_tx_op` 撤銷其 permit；gate 外等待中的尾段不得交 OS。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let _ = h.dev.take_tx();
+    let submits = h.dev.os_submits();
+    h.dev.script_write(vec![FakeWriteStep::AcceptThenWouldBlock(3)]);
+    let id = h.submit_ok("echo hello");
+    assert!(h.dev.wait_paused(Duration::from_secs(5)), "命令 TX 未進入 gate 外等待");
+    let rep = h.request(SessionRequest::CancelQueued { cmd_id: id.clone() });
+    assert_eq!(pget(&rep, "ok"), PyValue::Bool(true));
+    h.dev.release_pause();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.dev.os_submits() == submits {
+        assert!(Instant::now() < deadline, "首段未提交");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(h.dev.os_submits(), submits + 1, "撤銷後尾段不得再交 OS");
+    assert_eq!(h.dev.take_tx(), b"ech".to_vec());
 }

@@ -60,8 +60,11 @@ def test_resource_limits_contract_values():
         "drain_timeout_ms": 3000, "mailbox_stash_max": 16,
         # R1-F8：TX 帳本只保留未結算 op；不得以 drop_oldest／evict 淘汰在途證據
         "tx_ledger_live_ops": 256, "tx_ledger_unresolved_gaps": 256, "tx_op_wal_gaps": 16, "tx_settle_queue": 256,
+        # parity-amendments-2026-10-26 #38：撤銷 op tombstone 上限（Python `_TX_ACCOUNT_MAX`）
+        "fence_cancelled_ops_max": 512,
     }
     assert {k: by_name[k]["value"] for k in expect} == expect
+    assert by_name["fence_cancelled_ops_max"]["overflow"] == "drop_oldest"
     assert {k: by_name[k]["overflow"] for k in ("tx_ledger_live_ops", "tx_ledger_unresolved_gaps", "tx_op_wal_gaps", "tx_settle_queue")} == {
         "tx_ledger_live_ops": "reject_new_and_drain", "tx_ledger_unresolved_gaps": "merge_oldest",
         "tx_op_wal_gaps": "merge_oldest", "tx_settle_queue": "retain_entry"}
