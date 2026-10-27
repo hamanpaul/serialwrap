@@ -397,6 +397,32 @@ impl Hub {
             } else {
                 Duration::from_millis(10)
             };
+            // D-17(1)：pending 已滿時暫停讀取，背壓留在 OS；不呼叫 level-triggered 的 `mux.wait`（fd 仍可讀時會立即
+            // 返回而空轉），改以 10 ms 逾時重試，期間照常處理 critical、cmd、rx 與 pending flush。
+            if self.pending.len() >= CONSOLE_HUB_PENDING_EVENTS {
+                std::thread::sleep(to_scan.min(Duration::from_millis(10)));
+                if self.process_critical() {
+                    break;
+                }
+                for _ in 0..CONSOLE_HUB_LOOP_QUOTA {
+                    match self.cmd_rx.try_recv() {
+                        Ok(cmd) => self.process_cmd(cmd),
+                        Err(_) => break,
+                    }
+                }
+                for _ in 0..CONSOLE_HUB_LOOP_QUOTA {
+                    match self.rx_rx.try_recv() {
+                        Ok(chunk) => self.fanout(&chunk),
+                        Err(_) => break,
+                    }
+                }
+                self.maybe_scan();
+                self.flush_pending();
+                self.flush_rings();
+                self.publish();
+                self.status.loops.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
             let events = match self.mux.wait(to_scan.min(idle)) {
                 Ok(events) => events,
                 Err(_) => {
@@ -910,14 +936,19 @@ impl Hub {
                 }
             }
         }
-        self.pending
-            .push_back(Pending::Control(ControlEvent::ConsoleScan {
-                scan: ConsoleScanSnapshot {
-                    held,
-                    taken_at: now,
-                },
-                source: ScanSource::Hub,
-            }));
+        let scan = Pending::Control(ControlEvent::ConsoleScan {
+            scan: ConsoleScanSnapshot { held, taken_at: now },
+            source: ScanSource::Hub,
+        });
+        // D-18：pending 有界。尚未送出的 hub 掃描以新快照就地取代（只需最新者）；pending 已滿則略過本次。
+        let queued = self.pending.iter().position(|p| {
+            matches!(p, Pending::Control(ControlEvent::ConsoleScan { source: ScanSource::Hub, .. }))
+        });
+        match queued {
+            Some(i) => self.pending[i] = scan,
+            None if self.pending.len() < CONSOLE_HUB_PENDING_EVENTS => self.pending.push_back(scan),
+            None => {}
+        }
     }
 
     fn flush_pending(&mut self) {

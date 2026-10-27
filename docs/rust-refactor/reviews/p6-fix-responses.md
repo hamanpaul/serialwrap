@@ -139,12 +139,12 @@ P6 自有 commit 只有 `f97a208`（merge）與 `ac46a0e`；兩份報告皆 NO F
 | R2-6 | Medium | 3535943 | `send_checks_order` 缺 DETACHED 案、FLASHING 未驗零 TX | fixed 5e682eb：FLASHING 補零 TX；DETACHED 見 R2-4 |
 | R2-7 | Medium | 6eafa6a | #56 tick 還原期間 interactive 模式命令未回 SESSION_INTERACTIVE_BUSY | fixed（見下） |
 | R2-8 | High（opus） | 4f710c3 | core 未實作 hub 掃描 reap（`reap_stale_consoles`） | fixed（見下） |
-| R2-9 | Medium | 17270a4 | `consoles_survive_conn_epoch_change` 未模擬 epoch 變更 | 待下一組 commit |
-| R2-10 | Medium | 17270a4 | `reader_hub_full_does_not_block` 門檻 10→50 ms | 待下一組 commit |
-| R2-11 | Medium | 17270a4／4f710c3 | `console_hub.rs:103` 上界 64→64+2 | 待下一組 commit |
-| R2-12 | Medium | 17270a4 | `sentinel_*` 舊契約凍結進 L1 | 待下一組 commit |
-| R2-13 | Medium | 4f710c3 | pending 滿時 POLLIN 未關，hub 空轉 | 待下一組 commit |
-| R2-14 | Medium | 4f710c3 | `maybe_scan` 無視 pending 上限 | 待下一組 commit |
+| R2-9 | Medium | 17270a4 | `consoles_survive_conn_epoch_change` 未模擬 epoch 變更 | fixed f89d455：hub 測試改以新 HubTap 送 RX 並斷言無斷線；新增 sw-daemon `consoles_survive_bridge_rebuild`（真 epoch／IoWorker 重建、vtty 不變） |
+| R2-10 | Medium | 17270a4 | `reader_hub_full_does_not_block` 門檻 10→50 ms | fixed f89d455：恢復 10 ms（負載下 21/21 綠） |
+| R2-11 | Medium | 17270a4／4f710c3 | `console_hub.rs:103` 上界 64→64+2 | fixed f89d455：恢復 `<= 64`；harness 於 block 時確認 pump 離開 recv 並以佔位事件填滿 data channel |
+| R2-12 | Medium | 17270a4 | `sentinel_*` 舊契約凍結進 L1 | deferred：`rx_reader.rs` 的兩支 sentinel 測試為 P5 Task 10 資產，也在 P5 的 s21 凍結分母；改寫其斷言屬 P5 檔案，交 P5 session 協調（增補 #21）。產品路徑已不建 reader 哨兵（session_manager `sentinel: None`、改走 hub tap，1fb9612），`uart_bridge.rs:342` 註解現與產品一致 |
+| R2-13 | Medium | 4f710c3 | pending 滿時 POLLIN 未關，hub 空轉 | fixed（見本段修正 commit）：pending 滿時不呼叫 `mux.wait`，改 10 ms 逾時重試（照常處理 critical／cmd／rx／flush）；回歸 `full_pending_does_not_spin`（修正前 300 ms 內 96773 輪） |
+| R2-14 | Medium | 4f710c3 | `maybe_scan` 無視 pending 上限 | fixed（同上）：未送出的 hub 掃描以新快照就地取代，pending 已滿則略過；回歸 `scan_does_not_grow_pending_beyond_cap` |
 | R2-15 | Medium | 4f710c3 | hub 未接入 production、changelog 寫成已交付；`uart_bridge.rs:342` 註解 | fixed 1fb9612（ManagerExec 接 hub／pump／LeaseIndex）、03ba902（哨兵 primary） |
 | R2-L | Low | 多處 | `open_with_command_reply_waits_tx_and_expired_maps` 零 TX、`refresh_closes_when_owner_mismatch` 放寬、ATTACHED 無條件 revoke（fixed，見 R2-1）、AdoptPty 失敗 phantom、`critical_close_when_cmd_queue_full`／`no_peer_pty_display_cleared_after_grace`／mux stop 分支 | ATTACHED revoke 已併入 R2-1；其餘 deferred 至下一輪 |
 
