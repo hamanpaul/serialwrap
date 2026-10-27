@@ -1185,3 +1185,75 @@ fn produced_constants_are_frozen() {
     assert_eq!(LOGIN_FSM_DETAIL_ERRORS.len(), 12);
     assert!(detect_boot_banner("xx U-Boot 2024"));
 }
+
+#[test]
+fn attach_settles_attached_after_quiet_revokes_probe() {
+    // P5-T20 黑箱揭露：開機 banner 在 attach probe 進行中抵達 → quiet arm 遞增 fsm_gen，probe 後續 TX 由 fence 撤銷。
+    // 舊世代登入結果本身無效果（T11 `boot_banner_invalidates_old_fsm_and_owner_generations`），但 session 不得因此
+    // 永久停在 ATTACHING：Python `_attach_by_id` 的 probe 遇 quiet 撤銷 → TxIncompleteError → PROMPT_UNAVAILABLE、
+    // 落定 ATTACHED（實測 1 s 內）。Rust 於下一個 Tick 以 boot quiet 合成碼落定 ATTACHED；舊世代 Ready 亦不得升 READY。
+    use sw_core::session_core::{Effect, SessionState};
+    for stale in [
+        LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        LoginOutcome::Ready,
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.feed(ControlEvent::DeviceAttached {
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        let effects = h.bridge_ok();
+        let probe_gen = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::StartLogin {
+                    fsm_gen,
+                    plan: LoginPlan::Probe,
+                    ..
+                } => Some(*fsm_gen),
+                _ => None,
+            })
+            .expect("attach 應啟動 probe 登入");
+        assert_eq!(h.core.state(), SessionState::Attaching);
+        h.rx(BANNER.as_bytes()); // quiet arm（fsm_gen 遞增）
+        assert_ne!(h.core.generations().fsm_gen, probe_gen);
+        let epoch = h.epoch();
+        let fx = h.feed(ControlEvent::LoginFinished {
+            epoch,
+            fsm_gen: probe_gen,
+            result: stale.clone(),
+            after_rx_seq: None,
+        });
+        assert!(fx.is_empty(), "舊世代登入結果本身無效果");
+        assert_eq!(h.core.state(), SessionState::Attaching);
+        h.advance(Duration::from_secs(1));
+        let s = h.public();
+        assert_eq!(pget(&s, "state"), PyValue::from("ATTACHED"), "{stale:?}");
+        assert_eq!(pget(&s, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+        assert_eq!(pget(&s, "last_error_detail"), PyValue::Null);
+        assert!(pget(&s, "boot_quiet_remaining_s") != PyValue::Null);
+    }
+}
+
+#[test]
+fn attach_stale_result_not_from_quiet_still_ignored() {
+    // 對照：非 quiet 造成的世代不符（run 已被取代）不觸發收尾，維持 T11 語意。
+    use sw_core::session_core::SessionState;
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.bridge_ok();
+    let epoch = h.epoch();
+    let gen = h.core.generations().fsm_gen;
+    let fx = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen.wrapping_sub(1),
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert!(fx.is_empty());
+    h.advance(Duration::from_secs(2));
+    assert_eq!(h.core.state(), SessionState::Attaching);
+}

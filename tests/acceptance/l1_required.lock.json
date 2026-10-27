@@ -8990,6 +8990,8 @@
           "cargo:sw-core::lease_selftest::status_touches_and_returns_screen",
           "cargo:sw-core::lease_selftest::tick_expires_lease_sc13",
           "cargo:sw-core::login_quiet::attach_and_recover_reset_credentials_warned",
+          "cargo:sw-core::login_quiet::attach_settles_attached_after_quiet_revokes_probe",
+          "cargo:sw-core::login_quiet::attach_stale_result_not_from_quiet_still_ignored",
           "cargo:sw-core::login_quiet::auth_reasons",
           "cargo:sw-core::login_quiet::banner_split_across_chunks_arms_quiet_and_blocks_agent_with_retry_after",
           "cargo:sw-core::login_quiet::bootloader_prompt_tail_prevents_clear",

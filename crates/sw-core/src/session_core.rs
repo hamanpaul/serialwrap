@@ -359,6 +359,12 @@ struct LoginRun {
     kind: LoginRunKind,
     /// `SessionAttach`／`Recover` 再探的等待者（attach 路徑無）。
     waiters: Vec<(Reply, ReprobeWaiter)>,
+    /// StartLogin 發出時的登入世代。
+    fsm_gen: u64,
+    /// run 進行中因 boot quiet arm 而遞增的 fsm_gen 次數。
+    quiet_bumps: u64,
+    /// attach run 已被 quiet 撤銷且其（舊世代）結果已回報：下一個 Tick 落定 ATTACHED＋`PROMPT_UNAVAILABLE`。
+    revoked_by_quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2272,6 +2278,9 @@ impl SessionCore {
                     epoch,
                     kind: LoginRunKind::Attach,
                     waiters: Vec::new(),
+                    fsm_gen: self.generations.fsm_gen,
+                    quiet_bumps: 0,
+                    revoked_by_quiet: false,
                 });
                 effects.push(Effect::StartLogin {
                     epoch,
@@ -2334,6 +2343,17 @@ impl SessionCore {
         }
     }
 
+    /// 舊世代 attach 結果是否僅因 run 期間的 quiet arm 而失效（世代差恰為 quiet arm 次數）。
+    fn attach_run_revoked_by_quiet(&self, epoch: u64, fsm_gen: u64) -> bool {
+        self.login_run.as_ref().is_some_and(|run| {
+            run.epoch == epoch
+                && run.kind == LoginRunKind::Attach
+                && run.fsm_gen == fsm_gen
+                && run.quiet_bumps > 0
+                && self.generations.fsm_gen == fsm_gen.saturating_add(run.quiet_bumps)
+        })
+    }
+
     fn login_finished(
         &mut self,
         epoch: u64,
@@ -2361,6 +2381,14 @@ impl SessionCore {
                 return Vec::new();
             }
         } else if self.state != SessionState::Attaching || self.generations.fsm_gen != fsm_gen {
+            // 舊世代結果一律無效果（T11）。但 quiet 撤銷的 attach run 若就此丟棄，session 會永久停在
+            // ATTACHING；Python `_attach_by_id` 的 probe 遇 quiet 撤銷 → TxIncompleteError → PROMPT_UNAVAILABLE、
+            // 落定 ATTACHED。故只標記，由下一個 Tick 以 boot quiet 合成碼收尾（P5-T20 黑箱 banner 情境）。
+            if self.state == SessionState::Attaching && self.attach_run_revoked_by_quiet(epoch, fsm_gen) {
+                if let Some(run) = self.login_run.as_mut() {
+                    run.revoked_by_quiet = true;
+                }
+            }
             return Vec::new();
         }
         let run = self.login_run.take();
@@ -2507,6 +2535,9 @@ impl SessionCore {
                     epoch,
                     kind: LoginRunKind::Reprobe,
                     waiters: vec![(reply, kind)],
+                    fsm_gen: self.generations.fsm_gen,
+                    quiet_bumps: 0,
+                    revoked_by_quiet: false,
                 });
                 vec![Effect::StartLogin {
                     epoch,
@@ -2559,6 +2590,12 @@ impl SessionCore {
         let until = self.quiet.boot_quiet_until;
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
+        // quiet 撤銷進行中 attach run 的後續 TX（fence FsmMismatch）；記錄次數以便辨識其舊世代結果（P5-T20）。
+        if let Some(run) = self.login_run.as_mut() {
+            if run.epoch == epoch && run.kind == LoginRunKind::Attach {
+                run.quiet_bumps = run.quiet_bumps.saturating_add(1);
+            }
+        }
         let pending = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.quiet_active = true;
@@ -2629,8 +2666,28 @@ impl SessionCore {
         }
     }
 
+    /// quiet 撤銷的 attach run 收尾：掛上 bridge 純收 RX，`PROMPT_UNAVAILABLE` 停在 ATTACHED
+    /// （同 `_attach_by_id` boot quiet 分支；last_error_detail 不精煉）。
+    fn settle_quiet_revoked_attach(&mut self, now: Mono) {
+        let revoked = self.state == SessionState::Attaching
+            && self.login_run.as_ref().is_some_and(|run| {
+                run.revoked_by_quiet
+                    && run.kind == LoginRunKind::Attach
+                    && self.generations.conn_epoch == Some(run.epoch)
+            });
+        if !revoked {
+            return;
+        }
+        self.login_run = None;
+        self.adopt_bridge(now);
+        self.last_probe_at = Some(self.wall_iso());
+        self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
+        self.set_state(SessionState::Attached, now);
+    }
+
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
+        self.settle_quiet_revoked_attach(now);
         self.expire_reconfirm(now);
         // SC-13：1 s tick 主動收回到期的 agent lease（`_expire_interactive_leases_tick`，留 tombstone）。
         if self
@@ -4383,6 +4440,9 @@ impl SessionCore {
             epoch,
             kind: LoginRunKind::RebootRecovery,
             waiters: Vec::new(),
+            fsm_gen: self.generations.fsm_gen,
+            quiet_bumps: 0,
+            revoked_by_quiet: false,
         });
         vec![Effect::StartLogin {
             epoch,
