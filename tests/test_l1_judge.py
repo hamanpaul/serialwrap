@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -761,6 +762,73 @@ def test_l1_lock_frozen_set_excludes_capability_gated() -> None:
             assert not flagged, f"{set_id}.windows 含能力 SKIP 案例（須自凍結集合移除）：{flagged[:5]}"
 
 
+def _rust_ignored_tests() -> set[tuple[str, str | None, str]]:
+    """掃描 crates/*/ 原始碼中帶 `#[ignore…]`（含 `cfg_attr(…, ignore…)`，保守視為 ignored）的測試函式。
+
+    回傳 (package, target, fn 名稱)；`tests/<stem>.rs` 的 target 為 stem，`tests/<dir>/…` 為 dir，
+    src／benches／examples 內的單元測試 target 記為 None（以 package＋函式名比對）。
+    """
+    found: set[tuple[str, str | None, str]] = set()
+    attr_re = re.compile(r"#\[(?:ignore\b|cfg_attr\(.*\bignore\b)")
+    fn_re = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
+    stop_re = re.compile(r"(?:pub\b|mod\b|struct\b|enum\b|impl\b|use\b|const\b|static\b|let\b|\})")
+    for cargo_toml in sorted((REPO_ROOT / "crates").glob("*/Cargo.toml")):
+        matched = re.search(r'^\[package\][^\[]*?^name\s*=\s*"([^"]+)"', cargo_toml.read_text(encoding="utf-8"), re.M | re.S)
+        assert matched, f"{cargo_toml} 缺 [package] name"
+        pkg = matched.group(1)
+        crate_dir = cargo_toml.parent
+        for rs in sorted(crate_dir.rglob("*.rs")):
+            parts = rs.relative_to(crate_dir).parts
+            if parts[0] == "tests":
+                target: str | None = Path(parts[1]).stem if len(parts) == 2 else parts[1]
+            elif parts[0] in ("src", "benches", "examples"):
+                target = None
+            else:
+                continue
+            pending = False
+            for line in rs.read_text(encoding="utf-8").splitlines():
+                text = line.strip()
+                if attr_re.match(text):
+                    pending = True
+                    continue
+                if not pending:
+                    continue
+                fn = fn_re.match(text)
+                if fn:
+                    found.add((pkg, target, fn.group(1)))
+                    pending = False
+                elif stop_re.match(text):
+                    pending = False
+    return found
+
+
+@pytest.mark.memory_only
+def test_l1_lock_cargo_sets_exclude_ignored_tests() -> None:
+    """OD-24（2026-10-27）：所有 cargo 凍結集合（linux 與 windows）不得含 `#[ignore]` 列。
+
+    官方 cargo L1 selector 不執行 ignored 測試，鎖入後只能得到 skipped；cap_* 與委派 entry
+    由其他已鎖案例或 capability gate 承擔。補足只擋 Windows cap_* 的
+    test_l1_lock_frozen_set_excludes_capability_gated。以原始碼 `#[ignore]` 屬性判定。
+    """
+    ignored = _rust_ignored_tests()
+    # 非空洞檢查：掃描器必須認得已知的 ignored 測試，否則斷言形同虛設
+    assert ("sw-cli", "mgmt_layout", "mkbundle_respects_cargo_target_dir_override") in ignored, sorted(ignored)
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    flagged: list[str] = []
+    for set_id, platforms in lock["sets"].items():
+        for plat, spec in platforms.items():
+            for nid in spec["nodeids"]:
+                if not nid.startswith("cargo:"):
+                    continue
+                parts = nid[len("cargo:"):].split("::")
+                if len(parts) < 3:
+                    continue
+                pkg, target, name = parts[0], parts[1], parts[-1]
+                if (pkg, target, name) in ignored or (pkg, None, name) in ignored:
+                    flagged.append(f"{set_id}:{plat}:{nid}")
+    assert not flagged, f"cargo 凍結集合含 #[ignore] 列（須經擁有者裁決以 --allow-removal 移除）：{flagged}"
+
+
 @pytest.mark.process_rpc
 def test_l1_add_only_creates_new_set_inline(tmp_path: Path) -> None:
     """新 set／新平台可由行內 selector 建立（P2-T13 審查修正：計畫的 --l1-add-only 呼叫未附 selector，原實作拒絕）。"""
@@ -981,3 +1049,89 @@ def test_l1_add_only_removes_only_explicitly_approved_nodeids(tmp_path: Path) ->
                                   capture_output=True, text=True, cwd=REPO_ROOT)
     assert overapproved.returncode == 1, overapproved.stdout + overapproved.stderr
     assert lock_path.read_bytes() == revised_bytes
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+def test_l1_add_only_excludes_ignored_nodeids_od24(tmp_path: Path, platform: str) -> None:
+    """OD-24 回歸：以 68d0941 的收集形狀（--list-only 含 #[ignore] 列與 OD-16／OD-17 已移除列）
+    餵 --l1-add-only，只能新增未 ignored 的真實測試；ignored 列不得加入凍結集合。"""
+    existing = "cargo:sw-cli::mgmt_daemon::start_default_locates_daemon"
+    real_new = {
+        "linux": [
+            "cargo:sw-cli::mgmt_daemon::start_windows_python_launcher_uses_manifest_runtime",
+            "cargo:sw-pal::proc_scan::posix_tty_holder_scan_ignores_unrelated_tty_file",
+            "cargo:sw-pal::proc_scan::posix_tty_holder_scan_reports_unknown_when_target_unstatable",
+        ],
+        "windows": ["cargo:sw-cli::mgmt_daemon::start_windows_python_launcher_uses_manifest_runtime"],
+    }[platform]
+    ignored = {
+        "linux": [
+            "cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+            "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
+            "cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
+            "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+            "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+            "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+            "cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure",
+        ],
+        "windows": [
+            "cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+            "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
+            "cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
+            "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+            "cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry",
+            "cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
+            "cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
+            "cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
+        ],
+    }[platform]
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text(json.dumps({
+        "schema_version": 1,
+        "sets": {"s1b_cargo": {platform: {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""},
+                                          "nodeids": [existing]}}},
+    }), encoding="utf-8")
+    collect = tmp_path / "collect.json"
+    collect.write_text(json.dumps({"collected": [existing, *real_new, *ignored], "ignored": ignored}), encoding="utf-8")
+    res = subprocess.run(
+        [sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+         "--l1-add-only", "--set", "s1b_cargo", "--platform", platform, "--collect", str(collect)],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    got = json.loads(lock_path.read_text(encoding="utf-8"))["sets"]["s1b_cargo"][platform]["nodeids"]
+    assert got == sorted([existing, *real_new])
+    assert not set(got) & set(ignored)
+
+
+@pytest.mark.process_rpc
+def test_l1_add_only_ignored_existing_rows_kept_unless_approved_od24(tmp_path: Path) -> None:
+    """OD-24：鎖中既有的 ignored 列仍在 collected 內，不被視為移除；只有逐名 --allow-removal 才移除。"""
+    kept = "cargo:sw-pal::exec_delegate::exec_or_wait_terminate_kills_default_grandchild"
+    entry = "cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry"
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text(json.dumps({
+        "schema_version": 1,
+        "sets": {"s1b_cargo": {"windows": {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""},
+                                           "nodeids": [kept, entry]}}},
+    }), encoding="utf-8")
+    collect = tmp_path / "collect.json"
+    collect.write_text(json.dumps({"collected": [kept, entry], "ignored": [entry]}), encoding="utf-8")
+    regen = [sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+             "--l1-add-only", "--set", "s1b_cargo", "--platform", "windows", "--collect", str(collect)]
+
+    unchanged = subprocess.run(regen, capture_output=True, text=True, cwd=REPO_ROOT)
+    assert unchanged.returncode == 0, unchanged.stdout + unchanged.stderr
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["sets"]["s1b_cargo"]["windows"]["nodeids"] == [kept, entry]
+
+    before = lock_path.read_bytes()
+    not_ignored = subprocess.run([*regen, "--allow-removal", f"s1b_cargo:windows:{kept}"],
+                                 capture_output=True, text=True, cwd=REPO_ROOT)
+    assert not_ignored.returncode == 1, not_ignored.stdout + not_ignored.stderr  # 仍收集且未 ignored：核准無對象
+    assert lock_path.read_bytes() == before
+
+    removed = subprocess.run([*regen, "--allow-removal", f"s1b_cargo:windows:{entry}"],
+                             capture_output=True, text=True, cwd=REPO_ROOT)
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["sets"]["s1b_cargo"]["windows"]["nodeids"] == [kept]

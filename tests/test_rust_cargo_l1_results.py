@@ -350,8 +350,9 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     )
     assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
     data = json.loads(collect.read_text(encoding="utf-8"))
-    assert set(data) == {"collected"}                              # 只含 collected，不含執行結果
+    assert set(data) == {"collected", "ignored"}                   # 只含收集清單與 ignored 名單，不含執行結果（OD-24）
     assert sorted(data["collected"]) == sorted([A, B, C])
+    assert data["ignored"] == [C]                                  # ignored ⊆ collected
 
     # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記三筆
     regen = ACCEPTANCE / "regen_lock.py"
@@ -377,13 +378,16 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     )
     assert rr.returncode == 0, rr.stderr[-2000:]
     got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
-    assert got == sorted([A, B, C])
+    assert got == sorted([A, B])                                   # OD-24：ignored 的 C 不得新增進凍結集合
 
 
 @pytest.mark.process_rpc
 def test_list_only_keeps_ignored_non_cap_in_denominator(tmp_path: Path) -> None:
     """plan 04 Task 17：--list-only 必須收入 ignored 的非 cap_* 測試（與 cap_* 同樣保留），
-    否則既有鎖列會被 regen_lock 誤判為移除、分母被無聲縮小。"""
+    否則既有鎖列會被 regen_lock 誤判為移除、分母被無聲縮小。
+
+    OD-24（2026-10-27）：輸出另附 ignored 名單；regen_lock --l1-add-only 新增時排除 ignored，
+    但鎖中既有的 ignored 列仍在 collected 內，不因此被視為移除。"""
     _assert_script()
     exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
     ignored = exe.parent / "list_ignored.txt"
@@ -405,8 +409,9 @@ def test_list_only_keeps_ignored_non_cap_in_denominator(tmp_path: Path) -> None:
     )
     assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
     data = json.loads(collect.read_text(encoding="utf-8"))
-    assert set(data) == {"collected"}
+    assert set(data) == {"collected", "ignored"}
     assert sorted(data["collected"]) == sorted([A, B, C, w])       # ignored 非 cap_* 的 W 必須在分母內
+    assert sorted(data["ignored"]) == sorted([C, w])
 
     regen = ACCEPTANCE / "regen_lock.py"
     assert regen.is_file(), "tests/acceptance/regen_lock.py 不存在：P2 Task 13 尚未合併（前置缺口，見 plan §0.2）"
@@ -431,7 +436,28 @@ def test_list_only_keeps_ignored_non_cap_in_denominator(tmp_path: Path) -> None:
     )
     assert rr.returncode == 0, rr.stderr[-2000:]
     got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
-    assert got == sorted([A, B, C, w])
+    assert got == sorted([A, B])                                   # OD-24：ignored 的 C、W 不新增
+
+    # 鎖中既有的 ignored 列 W 仍在 collected 內：不得被視為移除，也不需 --allow-removal
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sets": {"t": {"linux": {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""}, "nodeids": [A, w]}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    kept = subprocess.run(
+        [sys.executable, str(acc / "regen_lock.py"), "--l1-add-only", "--set", "t", "--platform", "linux", "--collect", str(collect)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert kept.returncode == 0, kept.stderr[-2000:]
+    got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
+    assert got == sorted([A, B, w])
 
 
 def _run_env(cwd: Path, bin_dir: Path, args: list[str], *, extra_env: dict[str, str] | None = None,

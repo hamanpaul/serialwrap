@@ -12,6 +12,8 @@
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
                                                       # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
                                                       # 且清單必須與該集合消失集合完全相符；新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
+                                                      # OD-24：collect JSON 的 ignored 名單（cargo_l1_results.py --list-only）新增時排除；
+                                                      # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
   核准移除格式（收緊，2026-10-23）：`--allow-removal` 僅接受三元組 `set_id:platform:nodeid`（platform ∈ linux|windows）。
   裸 nodeid 不再被接受（舊版只比對 nodeid，Windows 之核准會放行 Linux 必要集合中同名 nodeid 之刪除；sol d82d146）。
 
@@ -377,7 +379,12 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set
     return rc
 
 
-def _read_collect(path: pathlib.Path) -> list[str]:
+def _read_collect(path: pathlib.Path) -> tuple[list[str], set[str]]:
+    """讀 collect 輸出，回傳 (collected, ignored)。
+
+    JSON 形式 `{"collected": [...], "ignored": [...]}`（`scripts/rust/cargo_l1_results.py --list-only`）
+    的 ignored 必須 ⊆ collected（OD-24）；文字形式（pytest --collect-only）沒有 ignored 名單。
+    """
     raw = path.read_text(encoding="utf-8")
     try:
         value = json.loads(raw)
@@ -386,14 +393,20 @@ def _read_collect(path: pathlib.Path) -> list[str]:
     if isinstance(value, dict) and isinstance(value.get("collected"), list):
         if not all(isinstance(item, str) for item in value["collected"]):
             raise ValueError(f"collect JSON 的 collected 必須全為字串：{path}")
-        return list(value["collected"])
+        ignored = value.get("ignored", [])
+        if not isinstance(ignored, list) or not all(isinstance(item, str) for item in ignored):
+            raise ValueError(f"collect JSON 的 ignored 必須為字串陣列：{path}")
+        stray = sorted(set(ignored) - set(value["collected"]))
+        if stray:
+            raise ValueError(f"collect JSON 的 ignored 必須屬於 collected：{stray}")
+        return list(value["collected"]), set(ignored)
 
     ids: list[str] = []
     for line in raw.splitlines():
         text = line.strip()
         if "::" in text:
             ids.append(text)
-    return ids
+    return ids, set()
 
 
 def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None, str | None]:
@@ -429,7 +442,11 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         for s, p, nid in foreign:
             print(f"  - {s}:{p}:{nid}", file=sys.stderr)
         return 1
-    collected = _read_collect(collect)
+    try:
+        collected, ignored = _read_collect(collect)
+    except ValueError as exc:
+        print(f"[regen_lock] REFUSED {exc}", file=sys.stderr)
+        return 1
     if not collected:
         print(f"[regen_lock] REFUSED 收集輸出沒有任何 nodeid：{collect}", file=sys.stderr)
         return 1
@@ -446,14 +463,16 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         if approvals:
             print(f"[regen_lock] REFUSED 新增集合 {set_id}.{platform} 無既有 nodeid 可移除，--allow-removal 須為空，鎖檔未變更", file=sys.stderr)
             return 1
-        new_spec = {"selector": selector, "nodeids": sorted(collected)}
-        added_count = len(collected)
+        # OD-24：#[ignore] 列不由官方 selector 執行，新增時一律排除
+        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored)}
+        added_count = len(new_spec["nodeids"])
     else:
         if selector is not None and selector != spec["selector"]:
             print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
             return 1
-        removed = sorted(set(spec["nodeids"]) - set(collected))
         allowed = {nid for _s, _p, nid in approvals}
+        # 既有 ignored 列仍在 collected 內，不視為消失（plan 04 Task 17）；OD-24 起可逐名核准移除
+        removed = sorted((set(spec["nodeids"]) - set(collected)) | (allowed & set(spec["nodeids"]) & ignored))
         unapproved = sorted(set(removed) - allowed)
         unused_approval = sorted(allowed - set(removed))
         if unapproved or unused_approval:
@@ -464,11 +483,11 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
                 print(f"  - 未消失 {set_id}.{platform} {nid}", file=sys.stderr)
             print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
-        added = sorted(set(collected) - set(spec["nodeids"]))
+        added = sorted(set(collected) - set(spec["nodeids"]) - ignored)
         if not added and not removed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
-        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(collected) | (set(spec["nodeids"]) - set(removed)))}
+        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(added) | (set(spec["nodeids"]) - set(removed)))}
         added_count = len(added)
     lock["schema_version"] = 1
     lock.setdefault("sets", {}).setdefault(set_id, {})[platform] = new_spec

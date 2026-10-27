@@ -340,7 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             exit_code = 1
             build_stderr += "\nCargo 沒有產生測試 executable，證據不足。"
         if args.list_only:
-            _read_report(args.out, {"collected": []})
+            _read_report(args.out, {"collected": [], "ignored": []})
         else:
             _read_report(
                 args.out,
@@ -398,7 +398,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.list_only:
         # plan 04 Task 17：--list-only 輸出每個收集到的測試，ignored 與 cap_* 皆保留，
         # 使 regen_lock 不會把既有 ignored／cap_* 列誤判為移除。任何排除須在 freeze 輸入之外明示處理，不得經由此處縮小分母。
-        _read_report(args.out, {"collected": collected})
+        # OD-24：另附 ignored 名單（⊆ collected），供 regen_lock --l1-add-only 在「新增」時排除 #[ignore] 列。
+        ignored = [
+            _nodeid(target, name)
+            for target in targets
+            for name in target.collected_names
+            if name in target.ignored_names
+        ]
+        _read_report(args.out, {"collected": collected, "ignored": ignored})
         return 0 if finished else 1
 
     summaries: list[dict[str, Any]] = []

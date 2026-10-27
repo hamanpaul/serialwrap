@@ -1101,7 +1101,7 @@ def test_workflow_ci_l1_gates() -> None:
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
-    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組
+    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組與 OD-24 的 5 筆 #[ignore] 列
     # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
     allowed_removals = (
         "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
@@ -1625,6 +1625,7 @@ def test_workflow_ci_l1_gates() -> None:
         "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_treats_empty_path_entries_as_current_directory",
         "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_uses_default_path_when_path_is_unset",
         "s1a_delegation:windows:tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child",
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
         "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
         "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
         "s1b_cargo:linux:cargo:sw-cli::mgmt_service::service_non_string_mode_date_is_typeerror_exit1_without_stdout",
@@ -1645,9 +1646,13 @@ def test_workflow_ci_l1_gates() -> None:
         "s1b_cargo:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
         "s1b_cargo:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
         "s1b_cargo:linux:cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure",
+        "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
         "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
         "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
         "s1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
     )
     for nodeid in allowed_removals:
@@ -1696,3 +1701,30 @@ def test_od23_removal_triples_are_all_approved_in_ci() -> None:
     assert not missing, missing
     decisions = Path("docs/rust-refactor/owner-decisions-2026-10-15.md").read_text(encoding="utf-8")
     assert "| OD-23 | **S1X 凍結鎖既有 36 筆移除補授權**" in decisions
+
+
+@pytest.mark.memory_only
+def test_od24_ignored_removal_triples_are_approved_in_ci() -> None:
+    """OD-24：s1b_cargo 的 5 筆 #[ignore] 列移除三元組必須逐名出現在 OD-24 列與 CI 的 --allow-removal 清單中。"""
+    triples = (
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
+    )
+    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    lock_steps = [
+        st for st in wf["jobs"]["pytest"]["steps"]
+        if "regen_lock.py --check --base" in str(st.get("run", ""))
+    ]
+    assert len(lock_steps) == 1
+    tokens = shlex.split(str(lock_steps[0]["run"]))
+    allowed = tokens[tokens.index("--allow-removal") + 1:]
+    assert not [triple for triple in triples if triple not in allowed]
+    decisions = Path("docs/rust-refactor/owner-decisions-2026-10-15.md").read_text(encoding="utf-8")
+    od24 = next(line for line in decisions.splitlines() if line.startswith("| OD-24 |"))
+    assert not [triple for triple in triples if f"`{triple}`" not in od24]
+    addenda = Path("docs/rust-refactor/owner-decisions-addenda.md").read_text(encoding="utf-8")
+    pending = next(line for line in addenda.splitlines() if line.startswith("| PENDING-OD-S1X-L1-IGNORED-READD |"))
+    assert "RESOLVED（OD-24" in pending

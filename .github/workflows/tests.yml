@@ -44,6 +44,7 @@ jobs:
         # 清單與來源逐列對應真實移除事件（git 歷史 parent diff）：d82d146＝OD-16 (1)(2) RM-01～06（505）；61919dd＝OD-17 RM-01～03（4）；
         # 1e24d68＝Linux 占位 12＋12（核准只涵蓋 Linux，見 owner-decisions-s1x-g-list.md）；1ea2bdc＝s1b_cargo.linux 舊名 2；e25aec0＝舊 10 筆 docker／stage0 裁決保留（s0_win_pytest.windows）。
         # 1e24d68（24）、1ea2bdc（2）、e25aec0（10）三組共 36 個三元組由 OD-23（2026-10-27）逐名補授權；清單見 docs/rust-refactor/reviews/s1x-unauthorized-removals.md。
+        # OD-24（2026-10-27）：s1b_cargo 的 5 筆 #[ignore] 列（68d0941 夾帶新增）逐名移除；承擔者見 owner-decisions-2026-10-15.md OD-24 列。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
           python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }} --allow-removal
@@ -568,6 +569,7 @@ jobs:
           's1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_treats_empty_path_entries_as_current_directory'
           's1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_uses_default_path_when_path_is_unset'
           's1a_delegation:windows:tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child'
+          's1b_cargo:linux:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override'
           's1b_cargo:linux:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies'
           's1b_cargo:linux:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename'
           's1b_cargo:linux:cargo:sw-cli::mgmt_service::service_non_string_mode_date_is_typeerror_exit1_without_stdout'
@@ -588,9 +590,13 @@ jobs:
           's1b_cargo:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child'
           's1b_cargo:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c'
           's1b_cargo:linux:cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure'
+          's1b_cargo:windows:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override'
           's1b_cargo:windows:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies'
           's1b_cargo:windows:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename'
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c'
+          's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry'
+          's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry'
+          's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry'
           's1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip'
 
   bridge-tools:
