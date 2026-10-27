@@ -281,6 +281,8 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
     assert "--oplock" in variant._argv()
     assert primary._evidence()["mode"] == "share_no_delete"
     assert variant._evidence()["mode"] == "oplock"
+    # 替身 helper 與延遲 rename 共用的 lease／break 時點（perf_counter_ns）。
+    lease_state: dict[str, int] = {}
 
     class StubHelper:
         def __init__(self, wal_dir, seed, rec, *, oplock=False, variant=None):
@@ -303,7 +305,11 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
 
         def arm_hold(self, _name):
             self.lease_acquired_ns = time.perf_counter_ns()
-            self.lease_until_ns = self.lease_acquired_ns + 50_000_000
+            # 常駐模擬高負載：lease 取得到 rotation 請求之間有 30 ms 排程延遲（舊替身 break 寫死 +25 ms 會誤判 INSUFFICIENT）。
+            real_sleep(0.03)
+            # lease 須涵蓋 rotation 請求前的排程延遲；break 由 rename 請求觸發（見 DelayedRenameFs）。
+            self.lease_until_ns = self.lease_acquired_ns + 200_000_000
+            lease_state["until_ns"] = self.lease_until_ns
             self.lease_request_id = "stub-oplock-lease"
             self.rec.observations["av_sim"]["variants"][self.variant]["lease_request_id"] = self.lease_request_id
             return True
@@ -314,7 +320,7 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
                 {"grabs": 1, "helper_exit": 0, "oplock": "granted", "oplock_breaks": [{
                     "event": "oplock_break", "request_id": self.lease_request_id, "name": "raw.wal.ndjson",
                     "lease_acquired_ns": self.lease_acquired_ns, "lease_until_ns": self.lease_until_ns,
-                    "break_notified_ns": self.lease_acquired_ns + 25_000_000,
+                    "break_notified_ns": lease_state["break_ns"],
                     "break_completed": True, "ack_required": True,
                     "ack_method": "close_handle", "close_started_ns": self.lease_until_ns,
                     "close_completed_ns": close_completed_ns, "close_succeeded": True,
@@ -331,7 +337,12 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             self.delegate = delegate
 
         def rename_noreplace_or_suffix(self, src, base_dst):
-            real_sleep(0.06)
+            # 模擬 oplock：第一次 rename 請求即觸發 break 通知，helper 持有到 lease 到期才 close（ACK），
+            # rename 隨後完成；oplock 只 break 一次，之後的 rename（後續輪替）不再等待。
+            if "break_ns" not in lease_state:
+                lease_state["break_ns"] = time.perf_counter_ns()
+                remaining_s = (lease_state["until_ns"] - time.perf_counter_ns()) / 1e9
+                real_sleep(max(0.0, remaining_s) + 0.002)
             return self.delegate.rename_noreplace_or_suffix(src, base_dst)
 
         def __getattr__(self, name):
