@@ -71,3 +71,116 @@ Codex 原始 BRIDGE 段：
 > BRIDGE: APPROVE
 
 本輪 Linux raw selftest 為 14/14 PASS；Windows COM20:COM21 raw selftest 為 13 PASS、ST-12 NOT_RUN。Windows 外層 `selftest-result.json` 記 `exit=0`、`qualification_exit=1`，因核准 tree `c4c22c0e…` 尚未更新。`APPROVED_REVISION.json` 保持不變。
+
+## 2026-10-27 外層審查紀錄校正與第 4 次送審資料
+
+### 紀錄校正
+
+上方「Round 2 複審」兩段 `BRIDGE: APPROVE` 由 Codex luna driver 於 `ee8b50a` 寫入。外層 driver 實際收到的非實作者審查結果與其不符：
+
+| 外層輪次 | 審查範圍 | Claude Sonnet | 第二位審查者 |
+|---|---|---|---|
+| 第 2 輪 | `cb392d2..f2d9533` | `BRIDGE: REJECT`（tree 值對不上、缺完整 diff 摘要、Windows FAIL 根因未定） | Codex sol 額度用完，無結果 |
+| 第 3 輪 | `f2d9533..0789e1f` | `BRIDGE: REJECT`（未逐行審 2207 行；缺無競爭負載下的 Linux selftest 連跑、ST-12 處置、逐檔行為摘要） | grok 因 prompt 截斷 crash，無結果 |
+
+本輪無法核對 `ee8b50a` 所錄 APPROVE 原文的來源，故**不採為核准依據**。核准仍待外層兩位非實作者審查者對下列 tree 明確表態；在此之前 `APPROVED_REVISION.json` 維持 `c4c22c0e…`。
+
+### 候選 tree 與演進
+
+候選 tree：`dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`（`cc7e30d` 之後 `tools/uart_stdio_bridge` 未再變動）。
+
+| Commit | tree（前 8 碼） | 說明 |
+|---|---|---|
+| `7098a97` | `c4c22c0e` | 現行核准值 |
+| `228aa76` | `d44a761a` | 題目所記之 tree |
+| `dbbc1f7` | `76ec0480` | 本文件最上方「第三輪」所審 |
+| `1b21aae` | `681abdd7` | |
+| `cc7e30d` | `dde967aa` | 候選 |
+
+### `git log 7098a97..HEAD -- tools/uart_stdio_bridge` 逐檔行為摘要
+
+範圍：8 個 commit（`26473bd`、`896ce0c`、`63f7ef1`、`e554dad`、`228aa76`、`dbbc1f7`、`1b21aae`、`cc7e30d`），8 個檔案，+2207／−119。其中產品碼 4 檔 +319／−60，測試 4 檔 +1888／−59。
+
+**`src/uart_stdio_bridge/cli.py`（+2）**：`run --endpoint win-serial` 的端點規格新增 `peer_gate = (transport_mode == "virtual_com0com") and not --no-peer-gate`。`physical_usb_uart` 一律不開 gate。POSIX 路徑不受影響。
+
+**`src/uart_stdio_bridge/endpoints/__init__.py`（+2）**：`open_endpoint()` 把 `spec["peer_gate"]` 轉交 `WinSerialEndpoint`，預設 `False`。selftest 規格未帶此鍵，所以 selftest 維持舊行為（不開 gate）。
+
+**`src/uart_stdio_bridge/bridge/core.py`（+3／−1）**：`status` 動作的 `peer_open` 只在端點 `capabilities()["peer_state"]` 為真時取樣，否則回 `null`。內部 peer gate、shutdown 與 rx_writer 的取樣路徑不變。這是 POSIX 唯一的實質變更：`posix-pty` 本來就宣告 `peer_state=True`，所以輸出不變。
+
+**`src/uart_stdio_bridge/endpoints/win_serial.py`（+312／−59）**，依行為分項：
+
+1. **peer gate（`26473bd`、`63f7ef1`）**
+   - 新增 `peer_gate` 參數。搭配 `physical_usb_uart` 時於建構時 `ValueError`，因為 3 線 adapter 的 DSR 可能未接，開 gate 會永遠不寫。
+   - `peer_open()` 只在 gate 啟用時取樣 COM-B 的 DSR（com0com 把對端 DTR 映射到本端 DSR），否則回 `None`，與舊行為相同。
+   - `capabilities()["peer_state"]` 只在 com0com 且 gate 啟用時為真。`transport_disconnect` 恆為 `False`，未改。
+   - 寫入前判定 `_peer_writable_locked()`：DSR 低時不寫；DSR 首次轉高後須經 `_PEER_OPEN_SETTLE_S = 0.2 s` 才放行，用來跨過 pySerial `open()` 的 SetCommState→PurgeComm 窗口。
+   - gate 未通過時，等到呼叫期限結束並回 0，不進埠、不改期限、不產生寫入紀錄。
+2. **期限設定與 I/O 同一臨界區（`228aa76`）**
+   - 舊版在 `_lock` 內改 `timeout`／`write_timeout`，再到串行鎖內 I/O，可能套用其他並行呼叫剛改的期限，而且 pySerial setter 會重設整個 COM handle。
+   - 新版開啟時把讀取期限固定為 50 ms，`read()` 以輪詢累計呼叫期限，讀取路徑不再呼叫 setter。
+   - `write_timeout` 只在 `_timeout_section()` 內設定：依「寫入串行鎖 → 讀取串行鎖」順序取得兩把鎖，在雙向靜止時設定，再放開讀取鎖，持寫入鎖直到該次寫入結束。
+   - `_release_serial_locked()` 的鎖序同步改為「寫 → 讀」，所有路徑鎖序一致。
+   - `_reconfig_waiters` 讓常態讀寫在有等待中的期限設定時讓出，避免讀取緊密迴圈餓死設定端。
+3. **期限收緊（`dbbc1f7`）**
+   - 時鐘改用 `time.perf_counter`（`_clock`）。
+   - 鎖等待以 `_acquire_until(lock, deadline)` 受呼叫期限約束；鎖在期限到時才取得，視同逾時並釋放。
+   - 寫入期限扣除鎖等待後，向下量化到 1 ms（`_effective_write_timeout`），避免 setter 隨時鐘抖動反覆重設。
+   - 讀取的剩餘期限小於 50 ms 時，改走 `in_waiting`，只讀 driver buffer 內已有的 bytes（`available_only`），不多等一個固定讀取量子。
+   - setter 完成後，若已設定的 timeout 大於剩餘預算加 1e-9，就不送出並回 0，不把設定前的完整預算帶進 write。
+   - setter 成本與 DSR 取樣成本（`_last_timeout_set_elapsed_s`、`_last_peer_sample_elapsed_s`）預留在下一次期限設定中。
+4. **最後一次 DSR 取樣後重驗期限（`1b21aae`）**：`_write_peer_gated_locked()` 在寫入串行鎖內再取樣一次 peer，取樣後重算剩餘期限。若已設定的 timeout 超過剩餘期限，就不寫入（回 `None`，由外層等待後回 0）。因此 DSR 取樣本身的耗時不會讓實際 write 超出呼叫期限。對應測試：`test_peer_gate_final_dsr_sample_respects_remaining_deadline`、`test_peer_gate_repeated_dsr_cost_preserves_write_liveness`（持續 2 ms DSR 成本仍能寫入）。
+5. **settle 起點於取樣後讀取（`cc7e30d`）**
+   - 舊版在 DSR 取樣前就複製 `_peer_on_since`。若取樣期間發生 low→high（重開），會沿用重開前的舊起點，提早放行。
+   - 新版先在 `_peer_state_lock` 內取樣並維護起點，之後才在同一鎖下讀最新起點。
+   - `_open_locked()` 與 `_release_serial_locked()` 都會把起點清為 `None`。
+   - 對應測試：`test_peer_gate_does_not_reuse_pre_reopen_settle_time`、`test_peer_gate_uses_captured_settle_time_if_dsr_clears_state`。
+
+**`tests/conftest.py`（+1）**：登記 `windows_native` marker。
+
+**`tests/test_cli_peer_gate_spec.py`（新檔，+63）**：參數化 5 種 `--transport-mode`／`--no-peer-gate` 組合，驗證 CLI 傳給 `open_endpoint` 的 `peer_gate` 值。
+
+**`tests/test_bridge_core.py`（+172）**：以 `_WinPeerFakeSerial` 驗證三件事：gate 啟用時 status 揭露 `peer_open`、未啟用時為 `null`、peer 開啟前 banner 被扣住。
+
+**`tests/test_win_serial_endpoint.py`（+1652／−59）**
+- 新增 42 個替身測試（`+def test_` 共 49 處＝42 新替身＋3 新原生＋2 移位的既有原生＋2 只改參數的既有替身），涵蓋 gate、DSR 重驗、settle、期限量化、鎖等待預算、讀寫並行與餓死、重開等情境。
+- 原生 `cap_windows_com__*` 案例保留原 nodeid，另新增 3 個原生 peer gate 案例。
+- 既有 `test_io_does_not_reconfigure_unchanged_timeouts`、`test_disconnected_endpoint_waits_then_reconnects` 只新增 `monkeypatch` 參數以控制時鐘，斷言未刪減。
+
+### ST-12 在 Windows 為 NOT_RUN 的處置
+
+- ST-12 驗證 transport disconnect 後的行為，需要端點宣告 `transport_disconnect` 能力。
+- com0com 沒有不需管理員權限的斷線原語，`WinSerialEndpoint.capabilities()["transport_disconnect"]` 恆為 `False`。本 diff 未改這一點。
+- 資格判定允許「`win-serial` 且缺 `transport_disconnect` 時 ST-12 為 `NOT_RUN`，reason 為 `cap_missing:transport_disconnect`」，見 `selftest/runner.py:45`、`:199` 與 README「資格判定」第 2 點（`README.md:188`）。
+- 這項允許自 `7d5b5fc`（2026-10-17）就存在，並包含在現行核准 tree `c4c22c0e` 中。本 diff 沒有放寬或新增任何 NOT_RUN 允許。
+- 處置：沿用既有資格規則，接受 Windows ST-12 `NOT_RUN`。transport disconnect 的 Windows 實測屬擁有者硬體項目（COM22 控制線硬體核對），維持 BLOCKED-OWNER。
+
+### Linux selftest 連跑（tree `dde967aa`，2026-10-27）
+
+同一 tree 連跑 5 次（`uart-stdio-bridge selftest --endpoint posix-pty`），每次 14/14 PASS、`complete: true`，ST-12 在 POSIX 實際執行並 PASS：
+
+| 輸出目錄（`target/`） | 開跑時 1 分鐘 load（24 cores） | 結果 |
+|---|---|---|
+| `bridge-selftest-r4-linux-133726-a` | 11.8 | 14/14 PASS（report sha256 `3728c346…`） |
+| `bridge-selftest-r4-linux-133826-b` | 20.4 | 14/14 PASS（report sha256 `c6d333f4…`） |
+| `bridge-selftest-r4-linux-133942-c` | 20.9 | 14/14 PASS |
+| `bridge-selftest-r4-linux-134014-d` | 22.1 | 14/14 PASS |
+| `bridge-selftest-r4-linux-134048-e` | 24.4 | 14/14 PASS |
+
+- 本機 load 來自其他專案的建置與容器，本輪無法清空。表中 load 低於第 3 輪首跑失敗時的 28，也低於第 3 輪事後通過時的 42。
+- 第 3 輪首跑（`target/bridge-selftest-linux-r3-e7548ab`，同一 tree）有兩項失敗：
+  - ST-08：bridge exit 3，manifest `failure=HARNESS_EVIDENCE_WRITE_FAILED`。manifest 沒有保存例外細節，DUT stderr 為空。
+  - ST-10：bridge 被 SIGKILL（exit −9）。
+- 這兩項失敗的根因無法由殘留證據確定，**不歸類為已知 flaky**。
+- 另一份 `target/bridge-selftest-round2-linux`（tree `681abdd7`）是重用輸出目錄造成的 `File exists`，屬執行者操作錯誤，不是 bridge 行為。
+- 同一 tree 累計 7 次乾淨目錄執行（本輪 5 次、第 3 輪事後 2 次），全部 PASS；失敗 1 次（第 3 輪首跑）。
+
+### Windows COM20:COM21 原生 selftest（tree `dde967aa`，2026-10-27）
+
+- 執行：`SW_TEST_COM_PAIR=COM20:COM21 scripts/rust/win-blackbox.sh`，HEAD `4e97f98`。結果在 `target/win-blackbox/261027-134138-2314533/windows-com/`。
+- raw 報告：`verdict=PASS`、`complete=true`，報告 sha256 `8b0363f3…`。13 項 PASS，ST-12 `NOT_RUN`（`cap_missing:transport_disconnect`，處置見上節）。
+- 外層 `selftest-result.json`：`exit=0`、`qualification_exit=1`。
+  - `qualification_output` 記 `raw_verdict=PASS`、`report_tree_sha256=current_tree_sha256=dde967aa…`、`approved_tree_sha256=c4c22c0e…`、`tree_approved=false`。
+  - 唯一未通過的原因是核准檔尚未更新。
+- 同次 SC-18 原生案例 `test_autostart_l15_tx_once` 為 passed。
+
+**送審請求**：請外層兩位非實作者審查者對 tree `dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196` 於發現清單最後寫 `BRIDGE: APPROVE` 或 `BRIDGE: REJECT`＋理由。
