@@ -886,6 +886,12 @@ impl SessionCore {
         self.set_last_error(error.map(str::to_string), detail.map(str::to_string));
     }
 
+    /// 只供測試（test-fakes）：讀 boot quiet／Ready Reconfirm 狀態（`ready_reconfirm_attempts` 不在 public 投影）。
+    #[cfg(feature = "test-fakes")]
+    pub fn quiet_for_test(&self) -> &crate::quiet_gate::QuietState {
+        &self.quiet
+    }
+
     /// 只供測試（test-fakes）：在 attach 前建立仍有效的 boot-quiet deadline。
     #[cfg(feature = "test-fakes")]
     pub fn set_boot_quiet_until_for_test(&mut self, deadline: Mono) {
@@ -2847,11 +2853,12 @@ impl SessionCore {
             || self.pending_open_stop.is_some()
             || self.pending_attach.is_some()
             || self.open_real_path.is_some()
-            || self.login_run.is_some()
-            || self.foreground.is_some()
         {
             return Vec::new();
         }
+        // 手動 attach／recover（或其他 login run）持有 probe：Python `_prepare_reprobe_locked` 照常排程（前移
+        // `next_reprobe_at`），worker 取不到 probe 鎖才跳過（審查 c11aa89_92e0223 L-3）。
+        let probe_busy = self.login_run.is_some() || self.foreground.is_some();
         let state = self.state.as_str();
         let last_error = self.last_error.clone();
         // human_active：Python `_human_active_locked`（human lease＋外部 peer＋60 s 內有輸入）；human lease 由 P6
@@ -2873,10 +2880,20 @@ impl SessionCore {
         if !was_failed && self.quiet.failed {
             self.deps.fence.with(|f| f.reconfirm_pending = false);
         }
+        if probe_busy && action.is_some() {
+            self.reprobe.inflight = false;
+            return Vec::new();
+        }
         match action {
             None => Vec::new(),
             Some(crate::reprobe::ReprobeAction::Attach) => {
                 // DETACHED 分支：ATTACHING＋last_error=None 後走既有開埠（`_spawn_attach`）。
+                // `prepare` 只在 device_present 時回 Attach；device_present 與 known_real_path 一律成對設定／清除
+                // （DeviceAttached／DeviceDetached），故此處必有路徑（審查 c11aa89_92e0223 L-4）。
+                debug_assert!(
+                    self.known_real_path.is_some(),
+                    "device_present 隱含 known_real_path"
+                );
                 let Some(real_path) = self.known_real_path.clone() else {
                     return Vec::new();
                 };
@@ -2974,9 +2991,23 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
-        if self.generations.conn_epoch != Some(epoch) || !self.login_gen_current(epoch, fsm_gen) {
+        if self.generations.conn_epoch != Some(epoch)
+            || !self
+                .login_run
+                .as_ref()
+                .is_some_and(|run| run.epoch == epoch && run.fsm_gen == fsm_gen)
+        {
             return Vec::new();
         }
+        // 世代已被擋 probe 的 quiet arm 推進：Python 後續 TX 由 `_login_tx_refused` 拒絕 → probe_refused，
+        // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
+        let result = if self.login_gen_current(epoch, fsm_gen) {
+            result
+        } else {
+            crate::login_fsm::LoginOutcome::Aborted(crate::login_fsm::LoginAbort::Refused(
+                FenceReject::Quiet,
+            ))
+        };
         let deferred = self
             .login_run
             .take()

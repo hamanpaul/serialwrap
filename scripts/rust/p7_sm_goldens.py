@@ -356,6 +356,13 @@ def gen_reprobe_decisions() -> list[dict[str, Any]]:
                              "finish", result_state="ATTACHED"))
     rows.append(_reprobe_row({"state": "READY", "bridge": {}, "quiet": {"until_rel": None, "pending": True, "deadline_rel": 100.0, "attempts": 1}},
                              "finish", result_state="ATTACHED"))
+    # #162 A6：pending 中確認 probe 失敗（session 已落 ATTACHED）→ ready_reconfirm_attempts 累加；達上限落 failed。
+    rows.append(_reprobe_row({"state": "ATTACHED", "last_error": "READY_NONCE_TIMEOUT", "bridge": {},
+                              "quiet": {"until_rel": None, "pending": True, "deadline_rel": 100.0, "attempts": 2}},
+                             "finish", result_state="ATTACHED"))
+    rows.append(_reprobe_row({"state": "ATTACHED", "last_error": "READY_NONCE_TIMEOUT", "bridge": {},
+                              "quiet": {"until_rel": None, "pending": True, "deadline_rel": 100.0, "attempts": 4}},
+                             "finish", result_state="ATTACHED"))
     return rows_with_ids("reprobe_decisions", rows)
 
 

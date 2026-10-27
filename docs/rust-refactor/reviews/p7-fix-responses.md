@@ -56,3 +56,17 @@
 | Opus-8 | Low | `unsupported_profile_behavior` 失效宣告 | 加註「2.3 起已無適用 feature，僅留存紀錄」（鍵為 06 T0 契約，不刪） |
 | Opus-9／grok-5 | Low | 驗證證據不可追溯 | 新增 `docs/rust-refactor/reviews/p7-evidence/`（失敗清單＋sha256＋成因說明） |
 | （自查） | — | Task 5 的自動重探使 `lease_selftest::selftest_unresponsive_counts_attempt` 偶發轉紅（READY＋pending 3 s 安靜後被 tick 自動確認 probe 降為 ATTACHED） | **fixed**：該測試迴圈持續送空白 RX 讓自動重探不介入（Python `_rx_idle_enough` 同樣擋）；sw-core 連跑 3 次全綠 |
+
+## 第 3 輪：p7-cloud/c11aa89_92e0223（Opus）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| H-1 | High | 自動重探中 quiet arm 推進 fsm_gen，`auto_reprobe_finished` 以 `login_gen_current` 丟棄原世代結果 → `login_run`／inflight 永久殘留、不再重探、掛上的手動 attach 永不回覆 | **fixed**：auto run 只比對 run 自身 `(epoch, fsm_gen)`，結果一律回填；世代被擋 probe 的 quiet 推進時視為 `Aborted(Refused(Quiet))`（Python `_login_tx_refused` → probe_refused：READY 保留、其餘 ATTACHED＋PROMPT_UNAVAILABLE），經 `_finish_probe_reprobe` 記 attempt、清 inflight，再重派等待者。回歸 `session_core_reprobe_p7::quiet_arm_during_auto_reprobe_settles_and_resumes`（修前紅） |
+| M-2 | Medium | pending 中確認失敗的 `ready_reconfirm_attempts += 1` 無測試覆蓋 | **fixed（屬實）**：golden 042／043 的 session 仍為 READY（Python 視為 became_ready），未覆蓋失敗分支。`p7_sm_goldens.py` add-only 新增 044（ATTACHED＋pending、attempts 2→3）、045（attempts 4→5 落 failed），重新擷取；session_core 測試補 `quiet_for_test().attempts == before + 1`。反證：刪 `q.attempts += 1` → `reprobe::prepare_decisions_match_python_golden` 紅 |
+| L-3 | Low | `reprobe_tick` 在 login run／前景命令存在時不呼叫 `prepare`，`next_reprobe_at` 不前移 | **fixed**：照常 `prepare`，得到動作即清 inflight 並丟棄（等價 worker 取不到 probe 鎖） |
+| L-4 | Low | `ReprobeAction::Attach` 在 `known_real_path` 為 None 時已記 attempt 卻停在 DETACHED | **fixed（不可達）**：`device_present` 與 `known_real_path` 一律成對設定／清除，`prepare` 只在 device_present 時回 Attach；改 `debug_assert!`＋註解 |
+| L-5 | Low | `human_active_blocks_reprobe` 只在純函式層覆蓋 | 已登記 BLOCKED-UPSTREAM P7-BU-2（`p7-local-windows-todo.md`）；P6 合入後補 actor 層測試 |
+| stall L-1 | Low | `after.saturating_sub(before)` 將倒退計數視為零 RX | **fixed**：`checked_sub(..).unwrap_or(1)`（Python 負值 `!= 0` 不翻轉）；回歸 `transport_stall::refine_regressing_rx_counter_is_not_zero_rx`（修前紅） |
+| stall L-2 | Low | `canonicalize` 整條失敗即退回原路徑，與 `realpath(strict=False)` 不同 | **fixed**：`realpath_lenient` 解析最長存在前綴後接回其餘段；回歸 `usb_topology::busid_resolves_existing_prefix_when_device_link_missing`（修前紅） |
+| stall L-3 | Low | `with_filename` 未跳脫非 printable Unicode | **deferred**：sw-pal 不得依賴 sw-proto（arch §1.3），完整 `str.isprintable` 表需另行移植；檔名含 C1／非 printable 字元為邊角，Task 19 收斂 |
+| stall L-4 | Low | `usb_windows_is_always_none`、`fs_ops_p7::*` 未登記 Windows gate | **deferred（LOCAL-WINDOWS-TODO P7-LW-2，已登記）**：Windows 原生證據到位同 PR add-only 登記 |

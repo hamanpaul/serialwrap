@@ -92,8 +92,9 @@ pub fn refine_probe_failure(
             stall_warning: None,
         };
     };
-    let (refined, flipped) =
-        classify_probe_failure(&err, after.saturating_sub(before), last_rx_mono, now);
+    // Python `rx_after - rx_before` 可為負（計數倒退）→ 非零、不翻轉；不可飽和截成 0。
+    let rx_delta = after.checked_sub(before).unwrap_or(1);
+    let (refined, flipped) = classify_probe_failure(&err, rx_delta, last_rx_mono, now);
     if !flipped {
         let detail = if LOGIN_FSM_DETAIL_ERRORS.contains(&err.as_str()) {
             rx_tail_detail(rx_tail_4096)

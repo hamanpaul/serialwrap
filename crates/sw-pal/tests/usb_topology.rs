@@ -30,6 +30,23 @@ fn busid_from_sysfs_tempdir() {
     assert_eq!(usb.usb_busid(""), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn busid_resolves_existing_prefix_when_device_link_missing() {
+    // 審查 c11aa89_92e0223 L-2：`os.path.realpath(strict=False)` 仍解析存在的前綴 symlink；
+    // `/sys/class/tty/<name>` 本身是指向 `.../1-3/1-3:1.0/ttyUSB2/tty/<name>` 的 symlink，缺 `device` 仍得 `1-3`。
+    use sw_pal::device_source::usb_posix::SysfsUsbTopology;
+    use sw_pal::traits::UsbTopology;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let dev = root.join("devices/platform/vhci_hcd.0/usb1/1-3/1-3:1.0/ttyUSB2/tty/ttyUSB2");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::create_dir_all(root.join("class/tty")).unwrap();
+    std::os::unix::fs::symlink(&dev, root.join("class/tty/ttyUSB2")).unwrap();
+    let usb = SysfsUsbTopology::with_root(root);
+    assert_eq!(usb.usb_busid("/dev/ttyUSB2").as_deref(), Some("1-3"));
+}
+
 #[cfg(windows)]
 #[test]
 fn usb_windows_is_always_none() {

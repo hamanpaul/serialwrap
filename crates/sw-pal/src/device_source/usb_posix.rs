@@ -32,6 +32,27 @@ fn is_busid(seg: &str) -> bool {
     digits(head) && rest.split('.').all(digits)
 }
 
+/// `os.path.realpath(strict=False)`：路徑不存在時不拋錯，解析最長存在的前綴（含其中的 symlink）後接回其餘段。
+fn realpath_lenient(path: &Path) -> PathBuf {
+    let mut prefix = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(&prefix) {
+            return rest.iter().rev().fold(resolved, |acc, seg| acc.join(seg));
+        }
+        match (
+            prefix.file_name().map(|n| n.to_os_string()),
+            prefix.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                prefix = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 impl UsbTopology for SysfsUsbTopology {
     fn usb_busid(&self, real_path: &str) -> Option<String> {
         if real_path.is_empty() {
@@ -43,8 +64,7 @@ impl UsbTopology for SysfsUsbTopology {
             return None;
         }
         let link = self.root.join("class/tty").join(name).join("device");
-        // `os.path.realpath` 不存在時不拋錯而回原路徑；原路徑段不會命中 busid，結果同為 None。
-        let resolved = std::fs::canonicalize(&link).unwrap_or(link);
+        let resolved = realpath_lenient(&link);
         let text = resolved.to_string_lossy().into_owned();
         text.rsplit('/')
             .find(|seg| is_busid(seg))

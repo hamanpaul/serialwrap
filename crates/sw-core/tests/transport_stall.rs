@@ -266,3 +266,23 @@ fn wal_meta_rx_age_rounded() {
         Some(&PyValue::Float(sw_proto::pycompat::py_round(31.05, 1)))
     );
 }
+
+#[test]
+fn refine_regressing_rx_counter_is_not_zero_rx() {
+    // 審查 c11aa89_92e0223 L-1：Python `rx_after - rx_before` 為負 → `!= 0` → 不翻轉。
+    let usb = FakeUsb(Some("1-1".into()));
+    let r = refine_probe_failure(
+        PU.into(),
+        Some(500),
+        Some(400),
+        Some(t(10.0)),
+        t(40.0),
+        Some("/dev/ttyUSB0"),
+        &usb,
+        false,
+        "",
+        "COM0",
+    );
+    assert_eq!(r.err, PU);
+    assert!(r.stall_warning.is_none());
+}

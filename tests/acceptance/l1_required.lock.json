@@ -103,6 +103,7 @@
           "cargo:sw-core::session_core_reprobe_p7::credentials_unresolved_never_reprobes",
           "cargo:sw-core::session_core_reprobe_p7::detached_timeout_error_reattaches",
           "cargo:sw-core::session_core_reprobe_p7::manual_attach_during_auto_reprobe_waits_then_probes_afresh",
+          "cargo:sw-core::session_core_reprobe_p7::quiet_arm_during_auto_reprobe_settles_and_resumes",
           "cargo:sw-core::session_core_reprobe_p7::ready_pending_schedules_confirm_probe_and_failure_counts_reconfirm_attempt",
           "cargo:sw-core::session_core_reprobe_p7::reprobe_bootloader_tail_sets_bootloader_stuck",
           "cargo:sw-core::session_core_reprobe_p7::reprobe_failure_records_attempt_and_backs_off",
@@ -112,6 +113,7 @@
           "cargo:sw-core::transport_stall::login_detail_attached_when_not_flipped",
           "cargo:sw-core::transport_stall::refinable_and_classify_golden_table",
           "cargo:sw-core::transport_stall::refine_flips_only_when_zero_rx_and_frozen_30s_and_warns_once",
+          "cargo:sw-core::transport_stall::refine_regressing_rx_counter_is_not_zero_rx",
           "cargo:sw-core::transport_stall::refine_without_real_path_uses_dash_and_generic_hint",
           "cargo:sw-core::transport_stall::rx_before_none_returns_err_without_detail",
           "cargo:sw-core::transport_stall::wal_meta_rx_age_rounded",
@@ -121,7 +123,8 @@
           "cargo:sw-pal::fs_ops_p7::open_append_appends_and_creates",
           "cargo:sw-pal::fs_ops_p7::open_append_error_message_has_quoted_path",
           "cargo:sw-pal::fs_ops_p7::remove_file_if_exists_missing_is_false",
-          "cargo:sw-pal::usb_topology::busid_from_sysfs_tempdir"
+          "cargo:sw-pal::usb_topology::busid_from_sysfs_tempdir",
+          "cargo:sw-pal::usb_topology::busid_resolves_existing_prefix_when_device_link_missing"
         ],
         "selector": {
           "argv": [

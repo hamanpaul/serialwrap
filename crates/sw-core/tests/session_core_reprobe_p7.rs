@@ -129,6 +129,7 @@ fn ready_pending_schedules_confirm_probe_and_failure_counts_reconfirm_attempt() 
     assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
     let fx = advance_collect(&mut h, 4);
     let (epoch, gen) = start_login(&fx).expect("READY＋pending → 確認 probe");
+    let before = h.core.quiet_for_test().attempts;
     h.feed(ControlEvent::LoginFinished {
         epoch,
         fsm_gen: gen,
@@ -137,6 +138,8 @@ fn ready_pending_schedules_confirm_probe_and_failure_counts_reconfirm_attempt() 
     });
     assert_eq!(h.core.state(), SessionState::Attached);
     assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
+    // 審查 c11aa89_92e0223 Opus M-2：#162 A6 pending 中失敗累加 ready_reconfirm_attempts。
+    assert_eq!(h.core.quiet_for_test().attempts, before + 1);
 }
 
 #[test]
@@ -200,4 +203,33 @@ fn manual_attach_during_auto_reprobe_waits_then_probes_afresh() {
         .expect("ok");
     assert_eq!(resp["ok"], PyValue::Bool(true));
     assert_eq!(h.public()["state"], PyValue::from("READY"));
+}
+
+#[test]
+fn quiet_arm_during_auto_reprobe_settles_and_resumes() {
+    // 審查 c11aa89_92e0223 Opus H-1：自動重探中 banner arm quiet → FSM 以原世代回報；Python `_login_tx_refused`
+    // → probe_refused（ATTACHED＋PROMPT_UNAVAILABLE）＋`_finish_probe_reprobe` 記 attempt、清 inflight；手動 attach 照常回覆。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let fx = advance_collect(&mut h, 4);
+    let (epoch, gen) = start_login(&fx).expect("自動重探");
+    h.rx(b"\r\nU-Boot 2024.04\r\n");
+    let (reply, fx) = h.rpc_deferred(sw_core::session_core::SessionRequest::SessionAttach);
+    assert!(start_login(&fx).is_none());
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Aborted(sw_core::login_fsm::LoginAbort::Cancelled),
+        after_rx_seq: None,
+    });
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("ATTACHED"));
+    assert_eq!(p["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_eq!(p["reprobe_attempts"], PyValue::from(1));
+    assert!(matches!(p["next_reprobe_at"], PyValue::Float(_)));
+    // quiet 中手動 attach 不送 probe、直接回覆（`_probe_existing_bridge` quiet gate）。
+    assert!(reply.try_recv().is_ok(), "手動 SessionAttach 須回覆");
+    // quiet 到期且 RX 安靜後恢復重探。
+    let fx = advance_collect(&mut h, 200);
+    assert!(start_login(&fx).is_some(), "quiet 到期後恢復自動重探");
 }
