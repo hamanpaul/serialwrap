@@ -93,7 +93,8 @@ fn attach_pty_shape_first() {
     assert_eq!(s(&resp, "interactive_session_id").len(), 32);
     assert_eq!(resp.get("interactive_owner"), Some(&PyValue::Bool(true)));
     let created = r.console.as_ref().unwrap().created();
-    assert_eq!(s(&resp, "vtty"), created[0].0);
+    // created[0] 為 bridge 起來時建立的哨兵 primary（uart_io.py `_create_console_client("primary")`）。
+    assert_eq!(s(&resp, "vtty"), created[1].0);
 }
 
 #[test]
@@ -182,14 +183,14 @@ fn list_sorted_by_label_then_id() {
             _ => panic!("row"),
         })
         .collect();
-    assert_eq!(labels, ["a", "b"]);
+    assert_eq!(labels, ["a", "b", "primary"], "含哨兵 primary");
 }
 
 #[test]
 fn console_input_reaches_uart_and_rx_fans_out() {
     let r = ServiceRig::with_console_backend("pty");
     attach(&r, r#"{"selector":"COM0"}"#);
-    let (_, io) = r.console.as_ref().unwrap().created()[0].clone();
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
     let dev = r.device(REAL_A);
     let _ = dev.take_tx();
     io.push_input(b"x");
@@ -228,15 +229,30 @@ fn session_of(d: &PyDict) -> PyDict {
 }
 
 #[test]
+fn bridge_creates_internal_primary_sentinel() {
+    let r = ServiceRig::with_console_backend("pty");
+    let sentinel = r.console.as_ref().unwrap().created();
+    assert_eq!(sentinel.len(), 1, "bridge 起來時建立一個哨兵 PTY");
+    let st = r.session("COM0").unwrap();
+    assert_eq!(s(&st, "vtty"), sentinel[0].0, "session.vtty_path = bridge.vtty_path（哨兵 primary）");
+    assert_eq!(st.get("console_count"), Some(&PyValue::from(1i64)));
+    let l = r.call("session.console_list", r#"{"selector":"COM0"}"#);
+    let Some(PyValue::List(rows)) = l.get("consoles") else { panic!("consoles") };
+    assert_eq!(rows.len(), 1);
+    let PyValue::Dict(row) = &rows[0] else { panic!("row") };
+    assert_eq!(s(row, "label"), "primary");
+    assert_eq!(row.get("interactive_owner"), Some(&PyValue::Bool(false)));
+}
+
+#[test]
 fn session_public_vtty_is_cached() {
     let r = ServiceRig::with_console_backend("pty");
+    let primary = r.session("COM0").map(|st| s(&st, "vtty")).unwrap();
     let a = attach(&r, r#"{"selector":"COM0"}"#);
-    let h1 = s(&a, "vtty");
-    assert_eq!(s(&session_of(&a), "vtty"), h1, "首個 console 設定 vtty");
-    let b = attach(&r, r#"{"selector":"COM0"}"#);
-    assert_ne!(s(&b, "vtty"), h1);
+    assert_eq!(s(&session_of(&a), "vtty"), primary, "已有 vtty（哨兵）時 attach 不覆寫");
+    attach(&r, r#"{"selector":"COM0"}"#);
     let st = r.session("COM0").unwrap();
-    assert_eq!(s(&st, "vtty"), h1, "vtty 不隨第二個 console 改變（D-20）");
+    assert_eq!(s(&st, "vtty"), primary, "vtty 不隨後續 console 改變（D-20）");
 }
 
 #[test]
@@ -245,7 +261,7 @@ fn session_public_console_fields_pty() {
     attach(&r, r#"{"selector":"COM0"}"#);
     attach(&r, r#"{"selector":"COM0"}"#);
     let st = r.session("COM0").unwrap();
-    assert_eq!(st.get("console_count"), Some(&PyValue::from(2i64)), "{}", j(&st));
+    assert_eq!(st.get("console_count"), Some(&PyValue::from(3i64)), "哨兵＋2 個 human：{}", j(&st));
     assert!(st.get("console_endpoint").is_none(), "PTY 後端無 console_endpoint 鍵");
 }
 
@@ -266,7 +282,7 @@ fn list_prunes_stale_without_peer() {
             _ => panic!("row"),
         })
         .collect();
-    assert_eq!(labels, ["a"], "非 primary、逾 2 s、無 peer 者被 prune（RPC 前 ConsoleScan）");
+    assert_eq!(labels, ["a", "primary"], "非 primary、逾 2 s、無 peer 者被 prune（RPC 前 ConsoleScan）");
 }
 
 #[test]
@@ -289,11 +305,11 @@ fn detach_unknown_client_still_closes_own_lease() {
     let r = ServiceRig::with_console_backend("pty");
     let a = attach(&r, r#"{"selector":"COM0"}"#);
     let cid = s(&a, "client_id");
-    let (_, io) = r.console.as_ref().unwrap().created()[0].clone();
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
     io.hangup();
     wait_for("console 斷線後被移除", || {
         let l = r.call("session.console_list", r#"{"selector":"COM0"}"#);
-        matches!(l.get("consoles"), Some(PyValue::List(v)) if v.is_empty())
+        matches!(l.get("consoles"), Some(PyValue::List(v)) if v.len() == 1)
     });
     let d = r.call("session.console_detach", &format!(r#"{{"selector":"COM0","client_id":"{cid}"}}"#));
     assert_eq!(s(&d, "error_code"), "CONSOLE_NOT_FOUND");

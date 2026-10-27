@@ -10874,6 +10874,7 @@
           "cargo:sw-daemon::rpc_console::attach_rejected_discards_pty",
           "cargo:sw-daemon::rpc_console::attach_selector_com_chain",
           "cargo:sw-daemon::rpc_console::attach_then_status_has_no_false_not_found",
+          "cargo:sw-daemon::rpc_console::bridge_creates_internal_primary_sentinel",
           "cargo:sw-daemon::rpc_console::console_input_reaches_uart_and_rx_fans_out",
           "cargo:sw-daemon::rpc_console::console_methods_no_longer_deferred",
           "cargo:sw-daemon::rpc_console::detach_missing_client_id",
