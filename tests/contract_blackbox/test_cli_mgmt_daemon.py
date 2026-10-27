@@ -166,6 +166,7 @@ def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baselin
         env=env,
         timeout_s=120.0,
     )
+    initial_returned_at = time.monotonic()
     assert "已自動啟動" in initial.stderr.decode("utf-8", errors="replace"), (
         f"首次 cmd submit 未留下 on-demand autostart 證據：{initial.stderr!r}"
     )
@@ -194,7 +195,12 @@ def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baselin
     else:
         pytest.fail(f"COM0 未於 {_PASSTHROUGH_READY_WAIT_S:.0f} 秒內進入 READY：{last_session!r}")
 
-    # 零 TX 檢查放在 READY 等待（≥30 秒）之後、唯一送出之前：被拒請求若有延遲落盤的 TX 也必然已寫入。
+    # 零 TX 檢查放在 READY 等待之後、唯一送出之前。READY 等待長度取決於被拒請求落在 30 秒靜默窗口的
+    # 哪個時點、不保證夠長，故另確保距被拒回傳已過 wire 落盤等待上限並 settle，延遲落盤的 TX 必已寫入。
+    flush_remaining_s = _WIRE_FLUSH_WAIT_S - (time.monotonic() - initial_returned_at)
+    if flush_remaining_s > 0:
+        time.sleep(flush_remaining_s)
+    time.sleep(_WIRE_SETTLE_S)
     assert b"echo X" not in _dut_tx_bytes(wire)[tx_baseline:], "被拒絕的首次請求不得在 DUT 端留下任何 TX"
 
     return run_cli(

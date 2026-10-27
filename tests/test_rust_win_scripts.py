@@ -584,6 +584,8 @@ def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(t
     )
     monkeypatch.setattr(module, "is_rust", lambda: True)
     monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
+    monkeypatch.setattr(module, "_WIRE_SETTLE_S", 0.05)
+    monkeypatch.setattr(module, "_WIRE_FLUSH_WAIT_S", 1.0)
 
     calls = []
     states = ["ATTACHED", "READY"]
@@ -659,6 +661,7 @@ def _load_sc18_case(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "is_rust", lambda: True)
     monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
     monkeypatch.setattr(module, "_WIRE_SETTLE_S", 0.05)
+    monkeypatch.setattr(module, "_WIRE_FLUSH_WAIT_S", 1.0)
     return module, {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, wire
 
 
@@ -784,6 +787,43 @@ def test_windows_com_autostart_waits_for_lagging_wire_record(tmp_path, monkeypat
     monkeypatch.setattr(module, "run_cli", fake_run_cli)
     try:
         module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+    finally:
+        for timer in writers:
+            timer.join(2)
+
+
+def test_windows_com_autostart_rejected_request_delayed_tx_is_counted(tmp_path, monkeypatch):
+    """被拒請求的 TX 延遲落盤、READY 立即、最後一次送出遺失 → 必須 FAIL（不得以延遲 TX 冒充最後一次送出）。"""
+    import threading
+
+    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    writers = []
+    submits = []
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        if args[:2] == ["cmd", "submit"]:
+            submits.append(args)
+            if len(submits) == 1:
+                timer = threading.Timer(0.3, _write_echo_tx, args=(wire,))
+                timer.start()
+                writers.append(timer)
+                return SimpleNamespace(
+                    rc=2, stdout=b'{"ok":false,"error_code":"SESSION_NOT_READY"}',
+                    stderr="serialwrap: on-demand：已自動啟動\n".encode(),
+                )
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        if args == ["session", "list"]:
+            return SimpleNamespace(
+                rc=0, stdout=json.dumps({"sessions": [{"com": "COM0", "state": "READY"}]}).encode(), stderr=b"",
+            )
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    try:
+        with pytest.raises(AssertionError, match="被拒絕的首次請求不得在 DUT 端留下任何 TX"):
+            module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
     finally:
         for timer in writers:
             timer.join(2)
