@@ -261,6 +261,20 @@ def test_daemon_start_releases_caller_stdio_pipes(tmp_path: Path, env: dict[str,
     agent 會一直等到 daemon 結束（SC-18 on-demand autostart 在原生 Windows 卡死 3600 秒的根因）。
     Python 基線以 `close_fds` 只傳標準 handle，兩實作須同樣立即放行。
     """
+    _assert_daemon_start_releases_pipes(env, subprocess.PIPE)
+
+
+@pytest.mark.windows_native
+@pytest.mark.process_rpc
+def test_daemon_start_releases_caller_merged_stdio_pipe(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
+    """Windows：呼叫端以同一條 pipe 合併 stdout／stderr（`stderr=STDOUT`）時，`daemon start` 結束後該 pipe 也必須立即 EOF。
+
+    兩個標準 handle 指向同一 pipe 是 StdOutputInheritGuard 去重的路徑；與分開兩條 pipe 的案例互補。
+    """
+    _assert_daemon_start_releases_pipes(env, subprocess.STDOUT)
+
+
+def _assert_daemon_start_releases_pipes(env: dict[str, str], stderr: int) -> None:
     if os.name != "nt":
         pytest.skip("windows_native：僅原生 Windows 執行")
     if is_rust():
@@ -280,7 +294,7 @@ def test_daemon_start_releases_caller_stdio_pipes(tmp_path: Path, env: dict[str,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr,
     )
     drained = False
     try:
@@ -290,7 +304,10 @@ def test_daemon_start_releases_caller_stdio_pipes(tmp_path: Path, env: dict[str,
             drained = True
         except subprocess.TimeoutExpired:
             pytest.fail("daemon start 已結束，但呼叫端 stdout／stderr pipe 15 秒內未 EOF：背景 daemon 繼承了 CLI 的 pipe")
-        assert proc.returncode == 0, err.decode("utf-8", errors="replace")
+        assert proc.returncode == 0, (err or out).decode("utf-8", errors="replace")
+        if stderr == subprocess.STDOUT:
+            # 合併 pipe：stdout 同時含 stderr；成功時 CLI 只輸出一行 JSON。
+            out = out.strip().splitlines()[-1]
         assert json.loads(out.decode("utf-8")).get("ok") is True, out
     finally:
         # stop 的輸出導向 DEVNULL，避免本身也被同一缺陷卡住。

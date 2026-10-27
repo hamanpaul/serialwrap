@@ -34,12 +34,21 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
 /// 串行化「暫時取消標準輸出 handle 繼承旗標」的區段，避免並行 spawn 互相還原彼此的旗標。
+///
+/// 本模組內直接以原始標準 handle 呼叫 `CreateProcessW` 的路徑（`exec_or_wait_opts`）也持有此鎖，
+/// 不會在旗標被暫時取消的視窗內把不可繼承的 handle 交給子行程。std `Command` 的 `Stdio::inherit()`
+/// 會另行 `DuplicateHandle` 出可繼承副本，不受此旗標影響。
 static STD_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// spawn 背景 daemon 期間暫時取消目前行程 stdout／stderr 的 `HANDLE_FLAG_INHERIT`，drop 時還原。
 ///
 /// 子行程的 stdout／stderr 已明確指定為 NUL（std 會另建可繼承的 NUL handle），原始 handle 不需傳給子行程；
 /// 與 stdin 相同的 handle 不動（stdin 依 Python 基線語意繼承）。
+///
+/// 已知限制：std 以 `bInheritHandles=TRUE` 建立行程，只處理標準輸出 handle；CLI 由父行程繼承而來、
+/// 且仍標為可繼承的其他 handle（非標準 handle）仍會傳給 daemon。CLI 自身以 std 開啟的檔案與 pipe
+/// 預設不可繼承，故實務上只剩父行程刻意傳入的額外 handle。完整解法為改以
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 明確列出要繼承的 handle（需改寫成原始 `CreateProcessW`）。
 struct StdOutputInheritGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     cleared: Vec<HANDLE>,
@@ -254,6 +263,10 @@ impl ProcessCtl for NativeProcessCtl {
         }
         let mut process_info = PROCESS_INFORMATION::default();
 
+        // 傳入的是原始標準 handle：與 StdOutputInheritGuard 串行，避免在其暫時取消繼承旗標時建立行程。
+        let inherit_lock = STD_INHERIT_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // SAFETY: 所有 UTF-16 緩衝區皆以 NUL 結尾，且呼叫期間保持可寫並有效。
         let created = unsafe {
             CreateProcessW(
@@ -271,6 +284,7 @@ impl ProcessCtl for NativeProcessCtl {
                 &mut process_info,
             )
         };
+        drop(inherit_lock);
         if created == 0 {
             // SAFETY: GetLastError 讀取目前執行緒最近一次 Win32 錯誤。
             return unsafe { windows_win32_error(GetLastError()) };
