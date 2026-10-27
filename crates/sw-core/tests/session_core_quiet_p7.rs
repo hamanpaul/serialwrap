@@ -218,3 +218,246 @@ fn stale_login_finished_is_ignored() {
     });
     assert_eq!(h.core.state(), SessionState::Attaching);
 }
+
+/// 審查 c11aa89（Opus C-1）：console unlock 在 quiet 進行中起既有 bridge 再探時，fence 仍須保留 quiet：
+/// Python 只把 `_gate_probe_quiet_until` 設 0，`_gate_self_test_quiet_until` 不變（`uart_io.py:635-649`）——
+/// 救援鍵／self-test probe 在 quiet 期間仍回 quiet，在途 unlock login probe 放行。
+#[test]
+fn console_unlock_reprobe_during_quiet_keeps_recover_key_blocked() {
+    let mut h = CoreHarness::new(UNLOCK_PROFILE);
+    h.set_env("SW_T_UNLOCK", "k");
+    let effs = attach(&mut h);
+    let (epoch, gen, _) = start_login(&effs).expect("unlock login run");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::NotReady("CONSOLE_UNLOCK_PROMPT_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Attached);
+    h.rx(BANNER);
+    let (_rx, effs) = h.rpc_deferred(sw_core::session_core::SessionRequest::SessionAttach);
+    let (epoch, gen, _) = start_login(&effs).expect("console unlock 不被 quiet 擋：再探起 run");
+    assert_ne!(h.public()["boot_quiet_remaining_s"], PyValue::Null);
+    h.fence.with(|f| {
+        assert!(f.quiet_active, "quiet 仍在進行中，fence 不得清除");
+        let mut p = login_permit(epoch, gen);
+        assert_eq!(Fence::admit(f, &p), Ok(()), "unlock login probe 放行");
+        p.class = TxClass::SystemRecoverKey;
+        assert_eq!(Fence::admit(f, &p), Err(FenceReject::Quiet));
+        p.class = TxClass::SelfTestProbe;
+        assert_eq!(Fence::admit(f, &p), Err(FenceReject::Quiet));
+    });
+}
+
+/// DETACHED（拔插）並重新列舉：Python detach 不清 `boot_quiet_until`／`ready_reconfirm_pending`（只有 passthrough 重掛時
+/// `reset_passthrough_boot_gate` 清，`session_manager.py:644-654`、`:4856-4858`），故 180 s 內重插的 attach 不送 probe、
+/// 以 PROMPT_UNAVAILABLE 停 ATTACHED（#130：DUT reboot 期間 re-enumerate 觸發的 re-attach）。
+fn detach_and_reattach(h: &mut CoreHarness) -> Vec<Effect> {
+    h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: sw_core::mailbox::DetachReason::Removed,
+    });
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    attach(h)
+}
+
+#[test]
+fn detach_keeps_quiet_and_reattach_within_window_is_zero_tx() {
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    let effs = detach_and_reattach(&mut h);
+    assert_eq!(
+        start_login(&effs),
+        None,
+        "quiet 仍在：重插的 attach 不送 probe"
+    );
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("ATTACHED"));
+    assert_eq!(p["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(true));
+    assert!(matches!(p["boot_quiet_remaining_s"], PyValue::Float(_)));
+    h.fence
+        .with(|f| assert!(f.quiet_active, "新 bridge 的 fence 同步現行 quiet"));
+}
+
+#[test] // parity #17（B:B-36）
+fn passthrough_reattach_clears_previous_profile_quiet_and_reconfirm() {
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: sw_core::mailbox::DetachReason::Removed,
+    });
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop).feed();
+    // profile 改為 passthrough（P5-T16 SetProfile：`_rematerialize_profile_locked`）後重掛。
+    let pt = profile_of(PASSTHROUGH_PROFILE);
+    let r = h
+        .rpc(sw_core::session_core::SessionRequest::SetProfile {
+            profile: pt,
+            profile_source: "yaml-target".into(),
+        })
+        .expect("SetProfile");
+    assert_eq!(r["ok"], PyValue::Bool(true));
+    attach(&mut h);
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("ATTACHED"));
+    assert_eq!(p["boot_quiet_remaining_s"], PyValue::Null);
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(false));
+    assert_eq!(p["ready_reconfirm_failed"], PyValue::Bool(false));
+    assert_eq!(p["ready_reconfirm_remaining_s"], PyValue::Null);
+    h.fence.with(|f| {
+        assert!(!f.quiet_active);
+        assert!(!f.reconfirm_pending);
+    });
+}
+
+#[test]
+fn confirm_ready_clears_all() {
+    // READY＋pending → 自動確認 probe（當前 (epoch, fsm_gen)）回 Ready → until=0、pending=false、failed=false、attempts=0。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    h.rx(b"root@prplOS:~# ");
+    let mut fx = Vec::new();
+    for _ in 0..4 {
+        fx.extend(h.advance(std::time::Duration::from_secs(1)));
+    }
+    let (epoch, gen, _) = start_login(&fx).expect("確認 probe");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let p = h.public();
+    assert_eq!(p["boot_quiet_remaining_s"], PyValue::Null);
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(false));
+    assert_eq!(p["ready_reconfirm_failed"], PyValue::Bool(false));
+    assert_eq!(p["ready_reconfirm_remaining_s"], PyValue::Null);
+    assert_eq!(p["reprobe_attempts"], PyValue::from(0));
+    h.fence
+        .with(|f| assert!(!f.quiet_active && !f.reconfirm_pending));
+}
+
+#[test]
+fn bootloader_tail_blocks_clear() {
+    // brcm 類寬鬆 prompt（`[>#]\s*$`）會誤配 `CFE> `；尾行命中 bootloader_prompts 時不解除 quiet（#130 Finding 3）。
+    const BRCM: &str = "profiles:\n  b:\n    platform: bcm\n    prompt_regex: '(?m)[>#]\\s*$'\n    bootloader_prompts: ['^CFE> $']\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: b, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
+    let mut h = CoreHarness::new(BRCM);
+    h.to_ready();
+    h.rx(b"\r\nCFE version 1.0\r\n");
+    h.rx(b"\r\nCFE> ");
+    assert_eq!(
+        h.public()["boot_quiet_remaining_s"],
+        PyValue::Float(180.0),
+        "bootloader 尾行不解除 quiet"
+    );
+    h.rx(b"\r\n# ");
+    assert_eq!(
+        h.public()["boot_quiet_remaining_s"],
+        PyValue::Null,
+        "shell prompt 解除"
+    );
+}
+
+#[test]
+fn quiet_rx_runs_during_foreground_busy() {
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    let _cmd = h.start_foreground_command("sleep 30");
+    h.rx(BANNER);
+    assert_eq!(h.public()["boot_quiet_remaining_s"], PyValue::Float(180.0));
+    h.fence.with(|f| assert!(f.quiet_active));
+}
+
+#[test]
+fn rpc_human_source_is_treated_as_agent() {
+    // DF-02：RPC 帶入的 `human:` source 一律視同 agent（submit 層 gate）。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    let mut req = agent_submit("ls");
+    req.source = "human:x".into();
+    let r = h
+        .rpc(sw_core::session_core::SessionRequest::Submit(req))
+        .expect("rpc");
+    assert_eq!(r["error_code"], PyValue::from("AUTOBOOT_QUIET"));
+    assert_eq!(r["retry_after_s"], PyValue::Float(180.0));
+}
+
+const OTHERS_PT: &str = "profiles:\n  o:\n    platform: passthrough\n    prompt_regex: '.*'\n    login_regex: '$^'\n    password_regex: '$^'\n    ready_probe: ''\ntargets:\n  - {com: COM0, profile: o, act_no: 1, alias: o+1, device_by_id: /s/by-id/usb-A}\n";
+const UBOOT_PT: &str = "profiles:\n  u:\n    platform: passthrough\n    prompt_regex: '(?mi)^(=>|u-boot>|cfe>) $'\n    login_regex: '$^'\n    ready_probe: 'echo __READY__${nonce}'\ntargets:\n  - {com: COM0, profile: u, act_no: 1, alias: u+1, device_by_id: /s/by-id/usb-A}\n";
+
+#[test] // SC-35：uboot-template／others-template × ATTACHED／READY
+fn passthrough_banner_never_arms_quiet_both_templates_both_states() {
+    for yaml in [OTHERS_PT, UBOOT_PT] {
+        for ready in [false, true] {
+            let mut h = CoreHarness::new(yaml);
+            attach(&mut h);
+            if ready {
+                h.advance(std::time::Duration::from_secs(31));
+                assert_eq!(h.core.state(), SessionState::Ready, "30 s 安靜 → READY");
+            }
+            let gen = h.core.generations().fsm_gen;
+            h.rx(b"U-Boot 2024.04\r\nHit any key to stop autoboot:  3");
+            assert_eq!(h.core.generations().fsm_gen, gen);
+            let p = h.public();
+            assert_eq!(p["boot_quiet_remaining_s"], PyValue::Null);
+            assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(false));
+            h.fence.with(|f| {
+                assert!(!f.quiet_active && !f.probe_quiet_exempt && !f.reconfirm_pending)
+            });
+            if ready {
+                // passthrough_ready_never_gated：banner 後立即 Submit → 進 Arbiter（回 cmd_id），不回 gate 碼。
+                let r = h
+                    .rpc(sw_core::session_core::SessionRequest::Submit(agent_submit(
+                        "ls",
+                    )))
+                    .expect("rpc");
+                assert!(r.get("cmd_id").is_some(), "{r:?}");
+                assert_eq!(h.public()["ready_reconfirm_failed"], PyValue::Bool(false));
+                assert_eq!(h.public()["ready_reconfirm_remaining_s"], PyValue::Null);
+            }
+        }
+    }
+}
+
+#[test] // SC-35
+fn passthrough_banner_restarts_quiet_window() {
+    let mut h = CoreHarness::new(OTHERS_PT);
+    attach(&mut h);
+    h.advance(std::time::Duration::from_secs(29));
+    h.rx(b"U-Boot 2024.04\r\n");
+    h.advance(std::time::Duration::from_secs(29));
+    assert_eq!(
+        h.core.state(),
+        SessionState::Attached,
+        "banner chunk 重算安靜視窗"
+    );
+    h.advance(std::time::Duration::from_secs(1));
+    assert_eq!(h.core.state(), SessionState::Ready);
+}
+
+#[test]
+fn stale_login_finished_keeps_pending() {
+    // §5.3 過期事件：READY＋pending 時，舊世代 LoginFinished{Ready} 不清 pending、state 不變。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    h.rx(b"root@prplOS:~# ");
+    let (epoch, gen) = (h.epoch(), h.core.generations().fsm_gen);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen.wrapping_sub(1),
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
+}

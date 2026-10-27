@@ -34,3 +34,25 @@
 | 2 ReDoS 分數溢位 | 已由 `bd82c26` 修正 |
 | 3 rule_id 訊息 | 已由 `21c586f` 修正 |
 | 4 #49 未入鎖 | 已由 `58e0aa5` 修正 |
+
+## 第 2 輪：p7-cloud/de24500_fa847c7（Opus／grok）、fa847c7_c11aa89（Opus）、fa847c7_be89081（grok，報告未完成）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| grok-1／Opus-3／Opus-4 | High／Medium | `legacy_login_outcome` 把所有 run 的 TX 未完整都寫成 `ATTACH_FAILED:TxIncompleteError`；reboot 應 `RECOVERY_ERROR`、再探應 RPC `EXCEPTION`／`REPROBE_FAILED`、WAL 不健康應 `WalUnavailableError` | **fixed**：`login_exception_name` 依 Python 例外型別（`TxIncompleteError`／`WalUnavailableError`；draining、revoked op 同 `TxIncompleteError`），依 run 種類收斂：attach → `DETACHED`＋`ATTACH_FAILED:<型別>`；手動 attach／recover 再探 → session 不變、RPC `Err`（framing EXCEPTION）；自動重探 → `ATTACHED`＋`REPROBE_FAILED:<型別>`＋記 attempt；reboot recovery → `RECOVERY_ERROR`＋WARNING（`reboot-recovery ensure_ready TX 例外（session=…）`／`…例外（session=…），續迴圈待逾時收尾`）、續迴圈；quiet／新世代撤銷 → `continue`。reboot 路徑不再經 `legacy_login_outcome` 二次轉換。回歸 `session_core_login_exc_p7`（7 項，修前全紅）。06 T13 `disk_full_blocks_login_probe_but_not_agent_cmd` 的 PROMPT_UNAVAILABLE 斷言改依 Python（`WalUnavailableError` 穿出 → RPC EXCEPTION、session 不變）。**deferred（Task 7）**：結果不明在 Python 為 `TxUnknownError`、例外訊息全文 `str(TxIncompleteError)`（`tx incomplete: <outcome> <n>/<m> <error>`）需 `LoginReport` 帶出 TxResult；計畫 Task 7 表「`Aborted(TxIncomplete)` → ATTACHED＋PROMPT_UNAVAILABLE＋`tx_incomplete`」與 Python 衝突，以 Python 為準，Task 7 實作時修訂該表 |
+| Opus-1／grok-3 | Medium | 零寬重複上限 0（`(){0}`、`(){0,0}`、`(){0}+`）被譯成可參與 | **fixed**：上限 0 輸出 `(?:|(?!)body)`（群組保留、永不參與）；回歸 `event_matcher::groups_zero_width_zero_max_and_lookaround_body`（11 組 CPython 3.12 實測＋`(){0}\1(a)` 不匹配） |
+| Opus-2 | Medium | lookaround 本體的可選重複 `(?=(a))?(a)` 被譯成 `(?:(?=(a)))?`，fancy-regex 拒收 | **fixed**：可選以交替表達（greedy `(?:body|)`、lazy `(?:|body)`、possessive 外包 `(?>…)`）；同上回歸 |
+| grok-4 | Medium | quiet 略過帳密解析用 `quiet_active`，console unlock 在 Python 仍解析並登入 | 已於 c11aa89（Task 4）修正：attach 改傳 `boot_quiet_blocks_probe`；回歸 `session_core_quiet_p7::console_unlock_attach_during_quiet_still_starts_login` |
+| Opus-6 | Medium | §0.6 第 3 列（session_manager detect）未退役卻宣稱完成 | 已於 94526b4 完成（merge P5-T16 後）；`changelog.d/rust-p7-retire-slice21-gate.md` 已同步 |
+| Opus-5／grok-2／Opus(94526b4)-1 | Medium | L1 鎖非 add-only，`s21_core.windows` 淨減 2；LOCAL-WINDOWS-TODO 無樹內追蹤 | **fixed（部分）**：`s21_core.windows` 以 add-only 還原兩個舊 nodeid（627 筆，Windows gate 會報缺測直到原生替換）；新增樹內追蹤 `docs/rust-refactor/reviews/p7-local-windows-todo.md`（P7-LW-1～3）。**BLOCKED-OWNER P7-BO-1**：linux 的逐名替換需擁有者核准並加入 CI `--allow-removal` 白名單（本分支不自行修改 CI） |
+| Opus(c11aa89)-1 | Medium | console unlock 在 quiet 中起再探／reboot recovery run 時把 fence `quiet_active` 清成 false，救援鍵／self-test 被放行 | **fixed**：`begin_login_generation` 依現況重設 fence（`quiet_active` 保留、只豁免登入 probe）；回歸 `console_unlock_reprobe_during_quiet_keeps_recover_key_blocked`（修前紅） |
+| Opus(c11aa89)-2 | Medium | Task 4 計畫測試缺列 | **fixed**：補 `passthrough_reattach_clears_previous_profile_quiet_and_reconfirm`（#17）、`confirm_ready_clears_all`、`bootloader_tail_blocks_clear`、`quiet_rx_runs_during_foreground_busy`、`execute_time_quiet_has_retry_after_s`（37.26→37.3）、`rpc_human_source_is_treated_as_agent`、`passthrough_banner_restarts_quiet_window`、`passthrough_banner_never_arms_quiet_both_templates_both_states`（含 passthrough_ready_never_gated）、`stale_login_finished_keeps_pending`。#17 暴露的 detach 差異（Rust 每次 stop 清 quiet，Python detach 保留、只有 passthrough 重掛清）一併 **fixed**：stop 不再清 quiet，重開時依現況同步 fence；passthrough 重掛 `reset_passthrough_boot_gate`；回歸 `detach_keeps_quiet_and_reattach_within_window_is_zero_tx`（修前紅）。`banner_arm_bumps_fsm_gen_once_and_invalidates_human_input` 全名仍為 BLOCKED-UPSTREAM P7-BU-1 |
+| Opus(c11aa89)-3 | Low | passthrough／stale 測試斷言弱 | **fixed**：見上（2 template × 2 狀態、pending 下的舊世代） |
+| Opus(c11aa89)-4 | Low | `submit_gate_reject`／`execute_gate_reject` 未被 production 使用；`truthy` 非 Python truthiness | **fixed**：SessionCore submit／execute gate 改呼叫兩函式（刪除內嵌重複）；`truthy` 改用 `pycompat::py_truthy` |
+| Opus(c11aa89)-5 | Low | reboot recovery／再探改用 `boot_quiet_blocks_probe` 無 console unlock 測試 | 再探：`console_unlock_reprobe_during_quiet_keeps_recover_key_blocked` 覆蓋；reboot recovery 的 console unlock 案 **deferred（Task 7 reboot 收斂表測試）** |
+| Opus(be89081)-1 | Low | merge 時改了 P5 `session_attach_paths` 子案斷言、`GATED_PROFILE` 名不符實 | 已改名 `POST_LOGIN_PROFILE`；null 子案列 BLOCKED-UPSTREAM P7-BU-3 |
+| Opus(be89081)-2 | Low | production executor 的 P6 效果為 `todo!` | 列 P7-BU-4（P6 合入前 SessionCore 不產生） |
+| Opus-7 | Low | `post_login_cmd_profile_logs_in` 未驗 TX 序列 | **fixed**：斷言 `\n`、帳號、secret、`sh`、nonce probe 依序送出、secret 不進 WAL；補對照 `post_login_cmd_without_shell_prompt_does_not_reach_ready`（POST_LOGIN_CMD_TIMEOUT＋DETACHED） |
+| Opus-8 | Low | `unsupported_profile_behavior` 失效宣告 | 加註「2.3 起已無適用 feature，僅留存紀錄」（鍵為 06 T0 契約，不刪） |
+| Opus-9／grok-5 | Low | 驗證證據不可追溯 | 新增 `docs/rust-refactor/reviews/p7-evidence/`（失敗清單＋sha256＋成因說明） |
+| （自查） | — | Task 5 的自動重探使 `lease_selftest::selftest_unresponsive_counts_attempt` 偶發轉紅（READY＋pending 3 s 安靜後被 tick 自動確認 probe 降為 ATTACHED） | **fixed**：該測試迴圈持續送空白 RX 讓自動重探不介入（Python `_rx_idle_enough` 同樣擋）；sw-core 連跑 3 次全綠 |

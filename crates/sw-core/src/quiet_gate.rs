@@ -253,12 +253,9 @@ const QUIET_ACTIVE_HINT: &str =
 const PENDING_ONLY_HINT: &str =
     "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送";
 
+/// `session.get(k)` 的 Python truthiness（缺鍵為 None）。
 fn truthy(v: Option<&PyValue>) -> bool {
-    match v {
-        None | Some(PyValue::Null) => false,
-        Some(PyValue::Bool(b)) => *b,
-        Some(_) => true,
-    }
+    v.is_some_and(sw_proto::pycompat::py_truthy)
 }
 
 /// `service._resolve_session_id` 的 gate 段（只對非 trusted human 的呼叫端；RPC 的 `human:` source 一律視同 agent，DF-02）。

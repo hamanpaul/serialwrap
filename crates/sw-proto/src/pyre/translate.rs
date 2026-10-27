@@ -192,16 +192,28 @@ fn write_repeat(
     if is_zero_width(body) {
         if min == 0 {
             // 零寬本體重複至多一次有意義；本體含保留的擷取群組時不得省略，否則後續群組序號錯位
-            // （CPython：`()?` 參與為 ''、`()??` 不參與為 None）。
+            // （CPython：`()?` 參與為 ''、`()??` 不參與為 None、`(){0}` 不參與為 None）。以交替表達可選，
+            // 避免 `(?:(?=…))?` 這類「重複 lookaround」被 fancy-regex 拒收。
             if !has_mapped_capture(body, group_map) {
                 return Ok(());
             }
             let possessive = matches!(mode, RepeatMode::Possessive);
-            out.push_str(if possessive { "(?>(?:" } else { "(?:" });
-            write_expr(body, group_map, flags, out)?;
-            out.push_str(")?");
-            if matches!(mode, RepeatMode::Lazy) {
-                out.push('?');
+            if possessive {
+                out.push_str("(?>");
+            }
+            if max == Some(0) {
+                // 上限 0：群組保留但永不參與。
+                out.push_str("(?:|(?!)");
+                write_expr(body, group_map, flags, out)?;
+                out.push(')');
+            } else if matches!(mode, RepeatMode::Lazy) {
+                out.push_str("(?:|");
+                write_expr(body, group_map, flags, out)?;
+                out.push(')');
+            } else {
+                out.push_str("(?:");
+                write_expr(body, group_map, flags, out)?;
+                out.push_str("|)");
             }
             if possessive {
                 out.push(')');

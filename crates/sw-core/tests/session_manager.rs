@@ -690,8 +690,8 @@ fn session_attach_paths() {
     // merge P7：原以 Slice 2.1 能力閘（post_login_cmd：不自動登入、不送 TX）取得「ATTACHED 且 last_error 為 None」；
     // P7 Task 3 依 08 §0.6 退役該閘後，post_login_cmd profile 與 Python 相同會送 probe 並寫入失敗碼（Python 無此閘，
     // 無 human lease 的 capable ATTACHED 不會停在 last_error None）。改斷言 Python 實際輸出；null 分支待 P6 human lease 可用時補回。
-    const GATED_PROFILE: &str = "profiles:\n  g:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: g, act_no: 1, alias: g+1, device_by_id: /s/by-id/usb-A}\n";
-    let m = rig_s(GATED_PROFILE);
+    const POST_LOGIN_PROFILE: &str = "profiles:\n  g:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: g, act_no: 1, alias: g+1, device_by_id: /s/by-id/usb-A}\n";
+    let m = rig_s(POST_LOGIN_PROFILE);
     let dev = m.add_device_at("/s/by-id/usb-A", "/dev/ttyOLD");
     let _ = dev;
     m.mgr.update_devices(&m.snapshot());

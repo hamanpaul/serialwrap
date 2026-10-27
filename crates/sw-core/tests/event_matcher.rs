@@ -338,3 +338,34 @@ fn cooldown_big_int_exact_not_saturated() {
     let r = rule(r#"{"cooldown_ms":170141183460469231731687303715884105728}"#);
     assert!(!apply_cooldown(&r, &c(PyInt::Small(i128::MIN + 1)), 0));
 }
+
+#[test] // 審查 fa847c7（Opus #1／#2、grok #3）：零寬重複的上限 0 永不參與、lookaround 本體可選重複可載入；值以 CPython 3.12 實測
+fn groups_zero_width_zero_max_and_lookaround_body() {
+    for (pattern, text, matched, groups) in [
+        ("(){0}(a)", "a", "a", vec![None, Some("a")]),
+        ("(\\b){0}(a)", "a", "a", vec![None, Some("a")]),
+        ("(){0,0}(a)", "a", "a", vec![None, Some("a")]),
+        ("(){0}+(a)", "a", "a", vec![None, Some("a")]),
+        ("(?=(a))?(a)", "a", "a", vec![Some("a"), Some("a")]),
+        ("(?=(a))*(a)", "a", "a", vec![Some("a"), Some("a")]),
+        ("(?=(a))??(a)", "a", "a", vec![None, Some("a")]),
+        ("(a)(){0}(b)", "ab", "ab", vec![Some("a"), None, Some("b")]),
+        ("(){1}(a)", "a", "a", vec![Some(""), Some("a")]),
+        ("(){0,2}(a)", "a", "a", vec![Some(""), Some("a")]),
+        ("(){0,2}?(a)", "a", "a", vec![None, Some("a")]),
+    ] {
+        let m = pm("regex", pattern, "")
+            .eval(text)
+            .unwrap_or_else(|| panic!("{pattern} 應命中"));
+        assert_eq!(m.matched_text, matched, "{pattern}");
+        let want: Vec<Option<String>> = groups.into_iter().map(|g| g.map(str::to_string)).collect();
+        assert_eq!(m.groups, want, "{pattern}");
+    }
+    // 規則 schema 會以 ReDoS 拒收 backreference；直接以 pyre 驗證：CPython `re.search(r'(){0}\1(a)', 'ab')` 為 None。
+    let re = sw_proto::pyre::compile_capturing("(){0}\\1(a)", sw_proto::pyre::PyFlags(0))
+        .expect("CPython 可編譯");
+    assert!(
+        re.search_groups("ab").is_none(),
+        "未參與群組的反向參照不匹配"
+    );
+}

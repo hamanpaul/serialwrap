@@ -1699,66 +1699,20 @@ impl SessionCore {
         }
 
         if !self.is_passthrough() {
+            // `service._resolve_session_id` 的 gate 段（RPC 的 `human:` source 一律視同 agent，DF-02）。
             self.expire_reconfirm(now);
-            if self.quiet.failed {
-                let mut result = pydict! {
-                    "ok" => false,
-                    "error_code" => "READY_UNCONFIRMED",
-                    "hint" => "READY 已逾 300s／5 次未能經 nonce probe 再確認（可能卡在 bootloader）；請 session self-test 取分類後 interactive-open 處理",
-                    "recommended_action" => "self_test",
-                };
-                result.insert(
-                    "session",
-                    PyValue::Dict(self.public(
-                        now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
-                    )),
+            if self.quiet.failed || self.quiet.quiet_active(now) || self.quiet.pending {
+                let public = self.public(
+                    now,
+                    &PublicCtx {
+                        console_count: 0,
+                        vtty: None,
+                        console_endpoint: None,
+                    },
                 );
-                return vec![Effect::Reply(reply, Ok(result))];
-            }
-            if let Some(remaining) = self.quiet.remaining_s(now) {
-                let mut result = pydict! {
-                    "ok" => false,
-                    "error_code" => "AUTOBOOT_QUIET",
-                    "retry_after_s" => PyValue::from(remaining),
-                    "hint" => "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
-                };
-                result.insert(
-                    "session",
-                    PyValue::Dict(self.public(
-                        now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
-                    )),
-                );
-                return vec![Effect::Reply(reply, Ok(result))];
-            }
-            if self.quiet.pending {
-                let mut result = pydict! {
-                    "ok" => false,
-                    "error_code" => "AUTOBOOT_QUIET",
-                    "retry_after_s" => 5.0,
-                    "hint" => "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送",
-                };
-                result.insert(
-                    "session",
-                    PyValue::Dict(self.public(
-                        now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
-                    )),
-                );
-                return vec![Effect::Reply(reply, Ok(result))];
+                if let Some(result) = crate::quiet_gate::submit_gate_reject(&public, &req.source) {
+                    return vec![Effect::Reply(reply, Ok(result))];
+                }
             }
         }
 
@@ -2292,11 +2246,21 @@ impl SessionCore {
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = Some(real_path.clone());
         self.known_real_path = Some(real_path.clone());
+        if self.is_passthrough() {
+            // `reset_passthrough_boot_gate`（`session_manager.py:644-654`）：清前一 profile 留下的 quiet／READY gate。
+            self.quiet = QuietState::default();
+        }
+        let quiet_active = self.quiet.quiet_active(now);
+        let blocks_probe = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
+        let reconfirm_pending = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.active_epoch = Some(epoch);
             f.fsm_gen = self.generations.fsm_gen;
             f.owner_gen = self.generations.owner_gen;
             f.frozen = false;
+            f.quiet_active = quiet_active;
+            f.probe_quiet_exempt = quiet_active && !blocks_probe;
+            f.reconfirm_pending = reconfirm_pending;
         });
         let mut effects = vec![Effect::AdoptBridge {
             epoch,
@@ -2458,7 +2422,6 @@ impl SessionCore {
         {
             return self.auto_reprobe_finished(epoch, fsm_gen, result, now);
         }
-        let result = legacy_login_outcome(result);
         if self
             .login_run
             .as_ref()
@@ -2473,6 +2436,29 @@ impl SessionCore {
         if self.generations.conn_epoch != Some(epoch) {
             return Vec::new();
         }
+        if reprobe && self.state == SessionState::Attached {
+            if let Some(exc) = login_exception_name(&result) {
+                // `_probe_existing_bridge` 的例外穿出 manager：session 不變，attach／recover 的 RPC 回 framing EXCEPTION。
+                // 例外訊息全文（`str(TxIncompleteError)`）待 Task 7 LoginReport 帶出 TxResult。
+                let waiters = self
+                    .login_run
+                    .take()
+                    .map(|run| run.waiters)
+                    .unwrap_or_default();
+                return waiters
+                    .into_iter()
+                    .map(|(reply, _)| {
+                        Effect::Reply(
+                            reply,
+                            Err(PyErr {
+                                message: exc.clone(),
+                            }),
+                        )
+                    })
+                    .collect();
+            }
+        }
+        let result = legacy_login_outcome(result);
         if reprobe {
             // 既有 bridge 再探（attach_session ATTACHED 分支）：結果一律回填，quiet 撤銷造成的拒絕亦然（Python 同步 probe）。
             if self.state != SessionState::Attached {
@@ -2617,12 +2603,7 @@ impl SessionCore {
             return self.reprobe_reply(reply, kind, now);
         }
         // `_begin_login_run_locked`：新登入世代，舊 run 的 TX 由 fence FsmMismatch 撤銷。
-        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
-        self.deps.fence.with(|f| {
-            f.fsm_gen = self.generations.fsm_gen;
-            f.quiet_active = false;
-            f.probe_quiet_exempt = false;
-        });
+        self.begin_login_generation(now);
         let (plan, _) = self.choose_plan(false, false);
         match plan {
             LoginPlan::CredentialsUnresolved { reason, env_file } => {
@@ -2845,6 +2826,20 @@ impl SessionCore {
         effects
     }
 
+    /// `_begin_login_run_locked`＋`_push_probe_gate`：新登入世代（舊 run 的 TX 由 fence FsmMismatch 撤銷），fence 的 quiet
+    /// 依現況重設——console unlock 在 quiet 中只豁免登入 probe（`_gate_probe_quiet_until=0`），救援鍵／self-test 仍擋
+    /// （`_gate_self_test_quiet_until` 不變，`uart_io.py:635-649`）。
+    fn begin_login_generation(&mut self, now: Mono) {
+        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
+        let quiet_active = self.quiet.quiet_active(now);
+        let blocks_probe = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
+        self.deps.fence.with(|f| {
+            f.fsm_gen = self.generations.fsm_gen;
+            f.quiet_active = quiet_active;
+            f.probe_quiet_exempt = quiet_active && !blocks_probe;
+        });
+    }
+
     /// P7 Task 5：`reconcile_readiness` 的單一 session 部分（`_prepare_reprobe_locked`＋worker 寫入前最終驗證）。
     fn reprobe_tick(&mut self, now: Mono) -> Vec<Effect> {
         if self.shutdown_requested
@@ -2934,12 +2929,7 @@ impl SessionCore {
             self.reprobe.inflight = false;
             return Vec::new();
         };
-        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
-        self.deps.fence.with(|f| {
-            f.fsm_gen = self.generations.fsm_gen;
-            f.quiet_active = false;
-            f.probe_quiet_exempt = false;
-        });
+        self.begin_login_generation(now);
         let (plan, _) = self.choose_plan(false, false);
         match plan {
             LoginPlan::CredentialsUnresolved { reason, env_file } => {
@@ -3011,21 +3001,18 @@ impl SessionCore {
             return Vec::new();
         }
         let mut effects = Vec::new();
+        if let Some(exc) = login_exception_name(&result) {
+            // `_spawn_reprobe_probe` 的 except：ATTACHED＋REPROBE_FAILED:<型別>、記一次 attempt（不經 finish）。
+            self.reprobe.inflight = false;
+            self.set_last_error(Some(format!("REPROBE_FAILED:{exc}")), None);
+            self.set_state(SessionState::Attached, now);
+            crate::reprobe::record_attempt(&mut self.reprobe, now);
+            return effects;
+        }
         match result {
-            LoginOutcome::Raised(exc) => {
-                // `_spawn_reprobe_probe` 的 except：ATTACHED＋REPROBE_FAILED:<型別>、記一次 attempt（不經 finish）。
-                self.reprobe.inflight = false;
-                self.set_last_error(Some(format!("REPROBE_FAILED:{exc}")), None);
-                self.set_state(SessionState::Attached, now);
-                crate::reprobe::record_attempt(&mut self.reprobe, now);
-                return effects;
-            }
-            LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
-                self.reprobe.inflight = false;
-                self.set_last_error(Some("REPROBE_FAILED:TxIncompleteError".into()), None);
-                self.set_state(SessionState::Attached, now);
-                crate::reprobe::record_attempt(&mut self.reprobe, now);
-                return effects;
+            // login_exception_name 已於上方收斂（不會到達）。
+            LoginOutcome::Raised(_) | LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
+                return effects
             }
             LoginOutcome::Aborted(_) => {
                 // quiet／新世代撤銷（`_login_tx_refused`）：READY 不變；其餘 ATTACHED＋PROMPT_UNAVAILABLE。
@@ -3206,7 +3193,8 @@ impl SessionCore {
         self.queue = SessionQueue::new();
         self.clear_interactive();
         self.detach_captures();
-        self.quiet = QuietState::default();
+        // Python detach 不清 boot quiet／READY reconfirm（只有 passthrough 重掛時 `reset_passthrough_boot_gate` 清）：
+        // DUT reboot 期間 re-enumerate 的重插仍受 quiet 保護（#130）。fence 隨 epoch 失效，重開時依現況同步。
         self.login_run = None;
         self.foreground_reboot = false;
         self.deps.fence.with(|f| {
@@ -3808,20 +3796,14 @@ impl SessionCore {
         }
         let human = command.req.source.starts_with("human:");
         if !human && !self.is_passthrough() {
-            self.expire_reconfirm(now);
-            if self.quiet.failed {
-                let mut out = self.selector_error("READY_UNCONFIRMED");
-                out.insert(
-                    "hint",
-                    PyValue::from("READY 已逾 300s／5 次未能經 nonce probe 再確認（可能卡在 bootloader）；請 session self-test 取分類後 interactive-open 處理"),
-                );
-                out.insert("recommended_action", PyValue::from("self_test"));
-                return Some(out);
+            // `_agent_gate_reject_locked`＋SC-03（execute 層）；expire 翻轉時同步 fence。
+            let was_failed = self.quiet.failed;
+            let reject =
+                crate::quiet_gate::execute_gate_reject(&mut self.quiet, &self.profile.com, now);
+            if !was_failed && self.quiet.failed {
+                self.deps.fence.with(|f| f.reconfirm_pending = false);
             }
-            if self.quiet.quiet_active(now) || self.quiet.pending {
-                let retry = self.quiet.remaining_s(now).unwrap_or(READY_RECONFIRM_RETRY_S);
-                let mut out = self.selector_error("AUTOBOOT_QUIET");
-                out.insert("retry_after_s", PyValue::from(retry));
+            if let Some(out) = reject {
                 return Some(out);
             }
         }
@@ -4810,12 +4792,7 @@ impl SessionCore {
             effects.extend(self.finish_reboot_recovery_timeout(now));
             return effects;
         }
-        self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
-        self.deps.fence.with(|f| {
-            f.fsm_gen = self.generations.fsm_gen;
-            f.quiet_active = false;
-            f.probe_quiet_exempt = false;
-        });
+        self.begin_login_generation(now);
         self.login_run = Some(LoginRun {
             epoch,
             kind: LoginRunKind::RebootRecovery,
@@ -4838,10 +4815,26 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
-        let result = legacy_login_outcome(result);
         self.login_run = None;
         if self.generations.conn_epoch != Some(epoch) || self.state != SessionState::Recovering {
             return Vec::new();
+        }
+        // `_spawn_reboot_recovery`：TX 例外／其他例外 → RECOVERY_ERROR＋WARNING、續迴圈；quiet／新世代撤銷 → continue。
+        if let Some(exc) = login_exception_name(&result) {
+            let tx_exception = !matches!(result, crate::login_fsm::LoginOutcome::Raised(_));
+            let _ = exc;
+            self.set_last_error(Some("RECOVERY_ERROR".into()), None);
+            return vec![Effect::Warn(if tx_exception {
+                format!(
+                    "reboot-recovery ensure_ready TX 例外（session={}）",
+                    self.sid
+                )
+            } else {
+                format!(
+                    "reboot-recovery ensure_ready 例外（session={}），續迴圈待逾時收尾",
+                    self.sid
+                )
+            })];
         }
         match result {
             crate::login_fsm::LoginOutcome::Ready => {
@@ -4858,13 +4851,12 @@ impl SessionCore {
                     sid: self.sid.clone(),
                 })]
             }
-            // ensure_ready 的 NotReady 只來自 TX 被 quiet／新世代撤銷（Python `continue`，不記錯）。
-            crate::login_fsm::LoginOutcome::NotReady(_) => Vec::new(),
-            crate::login_fsm::LoginOutcome::Failed(error) => {
+            crate::login_fsm::LoginOutcome::NotReady(error)
+            | crate::login_fsm::LoginOutcome::Failed(error) => {
                 self.set_last_error(Some(error), None);
                 Vec::new()
             }
-            // 已由 `legacy_login_outcome` 收斂，不會到達（P7 Task 7 以收斂表取代）。
+            // quiet／新世代撤銷（`_login_tx_refused`）：continue，不記錯。
             crate::login_fsm::LoginOutcome::Aborted(_) | crate::login_fsm::LoginOutcome::Raised(_) => {
                 Vec::new()
             }
@@ -5309,8 +5301,6 @@ enum ForceKind {
     AfterPromptTimeout,
 }
 
-/// `READY_RECONFIRM_RETRY_S`。
-const READY_RECONFIRM_RETRY_S: f64 = 5.0;
 /// `MAX_RECOVERY_LEASE_S`。
 const MAX_RECOVERY_LEASE_S: f64 = 120.0;
 /// `BOOTLOADER_RX_TAIL_BYTES`（`rx_tail` 以字元計）。
@@ -5507,18 +5497,36 @@ impl SessionCore {
     }
 }
 
-/// P7 Task 3 過渡：Task 7 的 login 收斂表（`login_run.rs`）落地前，Task 3 新增的 variant 依 06 既有語意收斂——
-/// `Aborted(Refused|Cancelled)` 同 06 `refused()`（`NotReady("PROMPT_UNAVAILABLE")`，Python `_login_tx_refused`）；
-/// `Aborted(TxIncomplete)`（部分寫出／結果不明）在 Python 是穿出 manager 的 `TxIncompleteError`，同 `Raised`；
-/// `Raised(exc)` 同 attach 失敗（`Failed("ATTACH_FAILED:{exc}")`，`session_manager.py:2749`）。
-fn legacy_login_outcome(result: crate::login_fsm::LoginOutcome) -> crate::login_fsm::LoginOutcome {
+/// login run 結果中「Python 會以例外穿出」者的例外型別名（`_login_tx_refused` 只認 quiet／stale_login_gen）：
+/// 部分寫出／結果不明 → `TxIncompleteError`；WAL 不健康 → `WalUnavailableError`；draining／revoked op →
+/// `TxIncompleteError`；`Raised(exc)` → `exc`。quiet／新世代撤銷與 `Cancelled` 回 `None`（撤銷語意）。
+/// 已知差異：Python 結果不明為 `TxUnknownError`，待 Task 7 `LoginReport` 帶出 TxResult 後區分。
+fn login_exception_name(result: &crate::login_fsm::LoginOutcome) -> Option<String> {
     use crate::login_fsm::{LoginAbort, LoginOutcome};
     match result {
-        LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
-            LoginOutcome::Failed("ATTACH_FAILED:TxIncompleteError".into())
+        LoginOutcome::Raised(exc) => Some(exc.clone()),
+        LoginOutcome::Aborted(LoginAbort::TxIncomplete) => Some("TxIncompleteError".into()),
+        LoginOutcome::Aborted(LoginAbort::Refused(FenceReject::WalUnhealthy)) => {
+            Some("WalUnavailableError".into())
         }
+        LoginOutcome::Aborted(LoginAbort::Refused(
+            FenceReject::Frozen | FenceReject::Cancelled,
+        )) => Some("TxIncompleteError".into()),
+        _ => None,
+    }
+}
+
+/// P7 Task 3 過渡：Task 7 的 login 收斂表（`login_run.rs`）落地前，attach 路徑的新 variant 依 Python 收斂——
+/// 例外（`login_exception_name`）同 attach 失敗 `Failed("ATTACH_FAILED:<型別>")`（`session_manager.py:4873-4909`）；
+/// 其餘 `Aborted`（quiet／新世代撤銷）同 06 `refused()`（`NotReady("PROMPT_UNAVAILABLE")`）。
+/// 只供 attach（與既有 bridge 再探的非例外結果）使用；reboot recovery／自動重探各自收斂。
+fn legacy_login_outcome(result: crate::login_fsm::LoginOutcome) -> crate::login_fsm::LoginOutcome {
+    use crate::login_fsm::LoginOutcome;
+    if let Some(exc) = login_exception_name(&result) {
+        return LoginOutcome::Failed(format!("ATTACH_FAILED:{exc}"));
+    }
+    match result {
         LoginOutcome::Aborted(_) => LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
-        LoginOutcome::Raised(exc) => LoginOutcome::Failed(format!("ATTACH_FAILED:{exc}")),
         other => other,
     }
 }

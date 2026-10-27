@@ -230,3 +230,28 @@ fn agent_gate_active_expires_first() {
     );
     assert!(q.failed);
 }
+
+#[test] // 回歸（SC-03）：execute 層 quiet 剩 37.26 s → retry_after_s 37.3；pending-only → 5.0；failed → READY_UNCONFIRMED
+fn execute_time_quiet_has_retry_after_s() {
+    let mut q = QuietState::default();
+    q.arm(t(0.0));
+    let now = t(180.0 - 37.26);
+    let r = execute_gate_reject(&mut q, "COM0", now).expect("quiet → 拒絕");
+    assert_eq!(
+        dumps_dict(&r, &RPC_WIRE),
+        r#"{"ok":false,"error_code":"AUTOBOOT_QUIET","selector":"COM0","retry_after_s":37.3}"#
+    );
+    q.clear_quiet();
+    let r = execute_gate_reject(&mut q, "COM0", t(200.0)).expect("pending-only → 拒絕");
+    assert_eq!(r.get("retry_after_s"), Some(&PyValue::Float(5.0)));
+    let r = execute_gate_reject(&mut q, "COM0", t(300.0)).expect("deadline → failed");
+    assert_eq!(
+        r.get("error_code"),
+        Some(&PyValue::from("READY_UNCONFIRMED"))
+    );
+    assert_eq!(r.get("retry_after_s"), None);
+    assert_eq!(
+        r.get("recommended_action"),
+        Some(&PyValue::from("self_test"))
+    );
+}

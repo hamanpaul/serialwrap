@@ -990,16 +990,23 @@ fn disk_full_blocks_login_probe_but_not_agent_cmd() {
     a.wait_state("ATTACHED");
     make_unhealthy(&a);
     let before = a.dev.write_calls();
-    let resp = a.request(SessionRequest::SessionAttach);
+    // 審查 fa847c7（grok #1／Opus #4）：Python 對 system probe 拋 `WalUnavailableError`（`uart_io.py:1987-1991`），
+    // 非 `_login_tx_refused` → 穿出 `_probe_existing_bridge` → `attach_session` RPC framing EXCEPTION，session 不變；
+    // 原斷言的 PROMPT_UNAVAILABLE 為 06 過渡收斂，改依 Python 實際行為。
+    let resp = a
+        .request_async(SessionRequest::SessionAttach)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("回覆");
     assert_eq!(
         a.dev.write_calls(),
         before,
         "unhealthy WAL 下 probe 不得寫出"
     );
     assert_eq!(
-        pget(&resp, "last_error"),
-        PyValue::from("PROMPT_UNAVAILABLE")
+        resp.map_err(|e| e.message),
+        Err("WalUnavailableError".to_string())
     );
+    assert_eq!(pget(&a.get_state(), "state"), PyValue::from("ATTACHED"));
 
     let h = ActorRig::new(SHELL_PROFILE).ready();
     make_unhealthy(&h);
@@ -1086,6 +1093,35 @@ fn post_login_cmd_profile_logs_in() {
             .all(|l| !l.contains("slice-2.1 不支援")),
         "{:?}",
         h.stderr_lines()
+    );
+    // 審查 fa847c7（Opus #7）：完整 bcm 登入的 TX 依序為 "\n"、帳號、secret、post_login_cmd、nonce probe。
+    let tx = String::from_utf8_lossy(&h.dev.take_tx()).into_owned();
+    let mut at = 0;
+    for piece in ["\n", "admin\n", "pw\n", "sh\n", "echo __READY__"] {
+        let found = tx[at..]
+            .find(piece)
+            .unwrap_or_else(|| panic!("TX 缺 {piece:?}（之後）：{tx:?}"));
+        at += found + piece.len();
+    }
+    let wal = h.wal_tx_payloads();
+    assert!(wal.iter().all(|p| p != b"pw\n"), "secret 不得進 WAL");
+    assert!(wal.iter().any(|p| p == b"sh\n"), "post_login_cmd 記 WAL");
+}
+
+#[test]
+fn post_login_cmd_without_shell_prompt_does_not_reach_ready() {
+    // 對照：不回應 `sh` 時 Python `_finalize_ready` → POST_LOGIN_CMD_TIMEOUT（ensure_ready 失敗 → 關 bridge、DETACHED）。
+    let h = ActorRig::new(BRCM_POST_LOGIN_ENV_PROFILE);
+    h.set_env("SW_T_U", "admin");
+    h.set_env("SW_T_P", "pw");
+    h.dev.on_tx_reply(b"\n", b"\r\nlogin: ");
+    h.dev.on_tx_reply(b"admin", b"\r\nPassword: ");
+    h.dev.on_tx_reply(b"pw", b"\r\nCM> ");
+    let h = h.attach();
+    h.wait_state("DETACHED");
+    assert_eq!(
+        pget(&h.get_state(), "last_error"),
+        PyValue::from("POST_LOGIN_CMD_TIMEOUT")
     );
 }
 

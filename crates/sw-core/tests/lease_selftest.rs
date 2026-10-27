@@ -1020,6 +1020,9 @@ fn selftest_unresponsive_counts_attempt() {
                 break v.unwrap();
             }
             assert!(Instant::now() < deadline);
+            // P7 Task 5 起 READY＋pending 在 RX 安靜 ≥3 s 後會由 1 s tick 自動排確認 probe（Python `reconcile_readiness`）；
+            // 本案只驗 self-test 自身不計次，以持續的空白 RX 讓自動重探不介入（Python `_rx_idle_enough` 同樣擋）。
+            h.inject_rx(b"\r\n");
             h.clock.advance(Duration::from_millis(250));
             std::thread::sleep(Duration::from_millis(60));
         };
