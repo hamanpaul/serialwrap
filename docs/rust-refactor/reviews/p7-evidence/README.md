@@ -10,6 +10,7 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-92e0223.txt` | Task 6 後 | 505 | 97227e891849425d |
 | `pytest-fail-d5b2dd6.txt` | 審查第 3 輪後（多出 `test_functest_bridge_smoke::test_bridge_smoke_sm04_until_op`：Python daemon `ATTACH_FAILED:DeviceHeldError`、本 commit 未改 `sw_core/`，同 sm01 環境類；`test_multiagent_e2e` 五 agent 案重跑 2/2 通過） | 508 | c2e8c596adb453e6 |
 | `pytest-fail-c58e8d4.txt` | Task 13／13-py 後（多出者：`test_l15_smoke::test_reject_zero_tx_runs_on_python`、`test_functest_bridge_smoke::*sm01*` 為 Python daemon `ATTACH_FAILED:DeviceHeldError`，於 76de0cf worktree 同樣失敗；容器內殘留一個早先 slice21 測試洩漏的 throwaway `serialwrapd`（auto mode 不允許本 session 終止），疑為成因；`test_functest_windows_wiring::test_windows_wiring_env_and_argv` 單獨執行於 76de0cf 亦失敗（`WindowsPath` 於 POSIX 不可實例化，順序相依）；`test_human_agent_coexist` t1 單獨 2/2 通過；`test_regression_windows_caps` 單獨 2/2 通過） | 511 | ba8d5196ca29c0e3 |
+| `pytest-fail-91109e7.txt` | Task 14＋15 後（相對 c58e8d4 無新增失敗） | 508 | 5dca7ec693660c98 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
