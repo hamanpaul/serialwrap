@@ -189,3 +189,20 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 | `peer_loss_grace_then_teardown`：Rust 在 human console 關閉逾 grace 後 `interactive_open` 仍回 SESSION_INTERACTIVE_BUSY（Python 拆除後 ok） | fixed：interactive_open 前送 RPC ConsoleScan；L1 回歸 `interactive_open_scans_peers_before_refresh` |
 | `soft_preempt_restore_and_replay`：open 時 console 尚無 peer、之後才開啟時，close 用快取 peer 判定而丟棄 stash，`Q` 不回放（Python close 即時 `console_has_external_peer`） | fixed：interactive send／status／close 前亦送 RPC ConsoleScan；L1 回歸 `soft_preempt_replays_when_peer_appears_later` |
 | `f4_interactive_line_cmd_defined`：Python 基線黑箱對 `cmd submit --mode interactive --cmd vim` 回 `status=error, error_code=SEND_FAILED`（session 的 lease 已開），Rust 回 ok／`execution_mode=interactive` | 未收錄、待查：需判定 Python 的 SEND_FAILED 是否為基線缺陷（`_send_command_with_permit` 以 `interactive` permit 送出被拒）或 Rust 偏離；列為 BLOCKED-OWNER（parity 判定） |
+
+## P6 進度與上游狀態（2026-10-27 cloud session）
+
+| Task | 狀態 |
+|---|---|
+| 6／7／9 審查修正 | 見上兩輪表 |
+| 9 步驟 5（哨兵 primary）、產品 executor 接線 | 完成（03ba902、1fb9612） |
+| 10 | 完成：console 三方法、LeaseIndex、SessionPublic console 欄位、RPC 前 ConsoleScan、`windows.serial_console`（D-12）、SLICE 2.2。未完成：TCP console 的 `console_attach` 端點回應（`client_id:null`／`endpoint`／`transport`）與 `console_endpoint` 欄位——Linux 上 SC-28 tcp 後端與 Windows 原生（LOCAL-WINDOWS-TODO） |
+| 11 | 部分完成：slice22 黑箱 29 案（Python 29/29、Rust 29/29，各兩次）；`tests/test_human_agent_coexist.py` 對 Rust 8/8；func-test 2.2 八案對 Rust 7/8（`cowork-01-agent-bad-cmd` 在 P5 tip 的 Rust 同樣失敗：PROMPT_TIMEOUT 後 40 s 內未回 READY，屬 P5 上游）。待做：Telnet（rust_only，需 TCP console）、BC-02 banner／recovery（需 FakeTarget `scripts`／`hold_reply`，測試資產變更需獨立審閱）、ATTACHED 救援三案（需 `FakeTarget(ready=False)`）、stash_dropped、open_rejections_zero_tx、f6_two_boards、f8 兩案、L1.5 情境 |
+| 12 | LOCAL-WINDOWS-TODO（Windows 原生 console、com0com；W-1～W-7） |
+| 13 | 未開始（依 11／12） |
+
+上游（P5）觀察，交 P5 session：
+- slice21 黑箱（Python 基線）6 案在 P5 tip 同樣失敗：`test_f2_backpressure::{test_queue_full_backpressure,test_recovery_flushes_queue}`、`test_f3_observability::test_device_error_names_selector`、`test_f4_session_semantics::test_activity_classification`、`test_safety_core::{test_recovering_submit_session_recovering,test_stale_context_not_replayed}`。
+- slice21 黑箱對 P5 tip 的 Rust：10 failed／36 passed（`test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]` 兩次中一次失敗，屬 flaky）；本分支 Rust 為同一集合。
+- `session.clear` 後 re-attach 在 FakeClock 不推進時停在 ATTACHING、推進後為 ATTACHED（與 console 無關，ServiceRig `ready_shell` 同樣）。
+- sw-pal `holder_scan_unreadable_proc_is_unknown` 依主機是否存在 `/dev/pts/9`（P5 fb76460 既有 High）。
