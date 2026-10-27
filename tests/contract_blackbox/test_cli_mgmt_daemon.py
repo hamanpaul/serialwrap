@@ -135,6 +135,20 @@ def _dut_tx_bytes(wire: str) -> bytes:
     )
 
 
+# bridge 證據 writer 以佇列非同步寫 wire.ndjson：CLI 回傳時對應 TX 列可能尚未落盤。
+_WIRE_FLUSH_WAIT_S = 10.0
+_WIRE_SETTLE_S = 1.0
+
+
+def _wait_dut_tx(wire: str, baseline: int, expected: bytes) -> bytes:
+    """等基線後的 DUT TX 至少達到 expected 長度（有界），再於 settle 後重讀，回傳最終片段。"""
+    deadline = time.monotonic() + _WIRE_FLUSH_WAIT_S
+    while time.monotonic() < deadline and len(_dut_tx_bytes(wire)[baseline:]) < len(expected):
+        time.sleep(0.1)
+    time.sleep(_WIRE_SETTLE_S)
+    return _dut_tx_bytes(wire)[baseline:]
+
+
 # passthrough 須連續 30 秒無 RX 才升 READY（PASSTHROUGH_READY_QUIET_S）；等待上限另留 attach 與
 # 高負載排程裕度，且不超過首次 CLI 呼叫的 120 秒上限。
 _PASSTHROUGH_READY_WAIT_S = 120.0
@@ -165,8 +179,6 @@ def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baselin
         "首次需求未成功時只接受 session 尚未 READY 的拒絕；"
         f"rc={initial.rc} stdout={initial.stdout!r} stderr={initial.stderr!r}"
     )
-    assert b"echo X" not in _dut_tx_bytes(wire)[tx_baseline:], "被拒絕的首次請求不得在 DUT 端留下任何 TX"
-
     deadline = time.monotonic() + _PASSTHROUGH_READY_WAIT_S
     last_session: dict[str, Any] | None = None
     while time.monotonic() < deadline:
@@ -181,6 +193,9 @@ def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baselin
         time.sleep(0.25)
     else:
         pytest.fail(f"COM0 未於 {_PASSTHROUGH_READY_WAIT_S:.0f} 秒內進入 READY：{last_session!r}")
+
+    # 零 TX 檢查放在 READY 等待（≥30 秒）之後、唯一送出之前：被拒請求若有延遲落盤的 TX 也必然已寫入。
+    assert b"echo X" not in _dut_tx_bytes(wire)[tx_baseline:], "被拒絕的首次請求不得在 DUT 端留下任何 TX"
 
     return run_cli(
         [
@@ -421,7 +436,7 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
         assert res.rc == 0, res.stderr.decode("utf-8", errors="replace")
         # 本案例自身的 TX（自基線起）必須恰為一行命令：daemon 以 body＋"\n" 送出（uart_io），
         # explicit target attach 零 TX（SC-35）；同一 B 輪的其他 COM 案例寫入不計。
-        assert _dut_tx_bytes(wire)[tx_baseline:] == b"echo X\n"
+        assert _wait_dut_tx(wire, tx_baseline, b"echo X\n") == b"echo X\n"
     finally:
         stop = run_cli(["daemon", "stop"], env=env, timeout_s=60.0)
         if res is not None and res.rc == 0:

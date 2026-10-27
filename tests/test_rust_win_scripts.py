@@ -616,6 +616,7 @@ def _load_sc18_case(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(module, "is_rust", lambda: True)
     monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
+    monkeypatch.setattr(module, "_WIRE_SETTLE_S", 0.05)
     return module, {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, wire
 
 
@@ -665,6 +666,10 @@ def test_windows_com_autostart_rejects_unexpected_first_failure(
             if tx_on_reject:
                 _write_echo_tx(wire)
             return SimpleNamespace(rc=2, stdout=first_stdout, stderr="serialwrap: on-demand：已自動啟動\n".encode())
+        if args == ["session", "list"]:
+            return SimpleNamespace(
+                rc=0, stdout=json.dumps({"sessions": [{"com": "COM0", "state": "READY"}]}).encode(), stderr=b"",
+            )
         if args == ["daemon", "stop"]:
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
         raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
@@ -715,6 +720,31 @@ def test_windows_com_autostart_counts_only_its_own_tx(tmp_path, monkeypatch):
     monkeypatch.setattr(module2, "run_cli", duplicate_run_cli)
     with pytest.raises(AssertionError):
         module2.test_autostart_l15_tx_once(tmp_path / "dup", env2, tmp_path / "dup" / "DELEGATED")
+
+
+def test_windows_com_autostart_waits_for_lagging_wire_record(tmp_path, monkeypatch):
+    """bridge 證據 writer 非同步落盤：CLI 回傳後才寫入的 TX 列仍須被計入（有界等待）。"""
+    import threading
+
+    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    writers = []
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        if args[:2] == ["cmd", "submit"]:
+            timer = threading.Timer(0.3, _write_echo_tx, args=(wire,))
+            timer.start()
+            writers.append(timer)
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    try:
+        module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+    finally:
+        for timer in writers:
+            timer.join(2)
 
 
 def test_windows_com_autostart_requires_autostart_evidence(tmp_path, monkeypatch):
