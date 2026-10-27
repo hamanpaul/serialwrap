@@ -8,6 +8,7 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-start-de24500.txt` | 起點 de24500（`python3.12 -m pytest -q tests/` 分段前景） | 543 | 2ed0d942635a3c54 |
 | `pytest-fail-merge-be89081.txt` | merge P5 T15～T19 後 | 509 | de1e51bc8ae12610 |
 | `pytest-fail-92e0223.txt` | Task 6 後 | 505 | 97227e891849425d |
+| `pytest-fail-d5b2dd6.txt` | 審查第 3 輪後（多出 `test_functest_bridge_smoke::test_bridge_smoke_sm04_until_op`：Python daemon `ATTACH_FAILED:DeviceHeldError`、本 commit 未改 `sw_core/`，同 sm01 環境類；`test_multiagent_e2e` 五 agent 案重跑 2/2 通過） | 508 | c2e8c596adb453e6 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
