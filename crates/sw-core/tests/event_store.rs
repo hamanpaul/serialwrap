@@ -340,10 +340,12 @@ fn upsert_rule_file_indent2_sorted_no_newline() {
     }
     let rule = reg.upsert(&obj).unwrap();
     assert_eq!(rule.rule_id, "o.n");
-    // CPython 3.12：json.dump(dict(rule.raw), f, ensure_ascii=False, indent=2, sort_keys=True)
+    // CPython 3.12：json.dump(dict(rule.raw), f, ensure_ascii=False, indent=2, sort_keys=True)（文字模式）
+    let expected = "{\n  \"debug\": \"中文\",\n  \"handler\": {\n    \"exec\": [\n      \"/bin/true\"\n    ]\n  },\n  \"kind\": \"tool\",\n  \"name\": \"n\",\n  \"owner\": \"o\",\n  \"pattern\": {\n    \"kind\": \"contains\",\n    \"value\": \"x\"\n  },\n  \"schema_version\": 1,\n  \"selectors\": [\n    \"COM0\"\n  ]\n}";
+    // Python 文字模式寫入：Windows 每個 `\n` 寫成 `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
     assert_eq!(
         std::fs::read_to_string(d.path().join("o.n.json")).unwrap(),
-        "{\n  \"debug\": \"中文\",\n  \"handler\": {\n    \"exec\": [\n      \"/bin/true\"\n    ]\n  },\n  \"kind\": \"tool\",\n  \"name\": \"n\",\n  \"owner\": \"o\",\n  \"pattern\": {\n    \"kind\": \"contains\",\n    \"value\": \"x\"\n  },\n  \"schema_version\": 1,\n  \"selectors\": [\n    \"COM0\"\n  ]\n}"
+        expected.replace('\n', sw_pal::fs_ops::TEXT_NEWLINE)
     );
     assert!(!d.path().join("o.n.json.tmp").exists());
 }
@@ -635,4 +637,126 @@ fn logger_creates_parent_dir() {
     let log = EventLogger::new(p.clone(), native_fs(), c).unwrap();
     assert!(d.path().join("a/b").is_dir());
     assert_eq!(log.path(), p.as_path());
+}
+
+#[test]
+fn diff_against_nan_field_is_unchanged() {
+    // 審查 76de0cf_96b28dd c58e8d4-1：JSON 解出的 NaN 為單例，dict／list 比較走 identity 捷徑 → 相等（CPython 3.12 實測 `changed=[]`）。
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("o.n.json"),
+        r#"{"schema_version": 1, "owner": "o", "name": "n", "kind": "tool", "selectors": ["COM0"], "pattern": {"kind": "contains", "value": "x"}, "handler": {"exec": ["/bin/true"]}, "note": NaN}"#,
+    )
+    .unwrap();
+    let reg = RuleRegistry::new(d.path().into(), native_fs()).unwrap();
+    let prev = reg.load_all().unwrap().rules;
+    let diff = reg.diff_against(&prev).unwrap();
+    assert!(diff.changed.is_empty(), "{diff:?}");
+}
+
+#[test]
+fn tail_filter_list_with_nan_matches_python() {
+    // CPython 3.12 實測：`tail(rule_id=[NaN])` 1 筆（容器 identity）、`tail(rule_id=NaN)` 0 筆（頂層純量 NaN != NaN）、
+    // `tail(since_ts=[NaN, 2])` 對 `[NaN,1]`／`[NaN,3]` 留 1 筆（字典序跳過 identity 相等的 NaN）。
+    let d = tempfile::tempdir().unwrap();
+    let (log, _c) = logger(d.path(), 1);
+    std::fs::write(
+        d.path().join("events.ndjson"),
+        b"{\"rule_id\": [NaN], \"ts\": 1}\n{\"rule_id\": NaN, \"ts\": 2}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        log.tail(Some(&loads("[NaN]")), None, None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        log.tail(Some(&loads("NaN")), None, None, None)
+            .unwrap()
+            .len(),
+        0
+    );
+    std::fs::write(
+        d.path().join("events.ndjson"),
+        b"{\"ts\": [NaN, 1]}\n{\"ts\": [NaN, 3]}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        log.tail(None, None, Some(&loads("[NaN, 2]")), None)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn tail_decode_error_position_is_chunk_relative() {
+    // 審查 76de0cf_96b28dd c58e8d4-3：Python `readlines()` 經 TextIOWrapper 以 8192 bytes 分塊增量解碼，
+    // UnicodeDecodeError 的 position 相對於「前塊殘留＋當前塊」（CPython 3.12 實測）。
+    let d = tempfile::tempdir().unwrap();
+    let (log, _c) = logger(d.path(), 1);
+    let path = d.path().join("events.ndjson");
+    let line = b"{\"a\": 1}\n";
+    let mut base: Vec<u8> = line.repeat(15000 / line.len());
+    base.resize(15000, b' ');
+    let mut case1 = base.clone();
+    case1.extend_from_slice(b"\xff\n");
+    let mut case2 = vec![b'x'; 8191];
+    case2.extend_from_slice("中".as_bytes());
+    case2.push(b'\n');
+    case2.extend_from_slice(&[b'y'; 100]);
+    case2.extend_from_slice(b"\xff\n");
+    let mut case5 = vec![b'x'; 8191];
+    case5.extend_from_slice(b"\xe4\x41\n");
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (
+            case1,
+            "'utf-8' codec can't decode byte 0xff in position 6808: invalid start byte",
+        ),
+        (
+            case2,
+            "'utf-8' codec can't decode byte 0xff in position 104: invalid start byte",
+        ),
+        (
+            b"{\"a\":1}\n\xe4\xb8".to_vec(),
+            "'utf-8' codec can't decode bytes in position 0-1: unexpected end of data",
+        ),
+        (
+            b"ab\xe4\x41\n".to_vec(),
+            "'utf-8' codec can't decode byte 0xe4 in position 2: invalid continuation byte",
+        ),
+        (
+            case5,
+            "'utf-8' codec can't decode byte 0xe4 in position 0: invalid continuation byte",
+        ),
+    ];
+    for (i, (data, msg)) in cases.into_iter().enumerate() {
+        std::fs::write(&path, data).unwrap();
+        let err = log
+            .tail(None, None, None, None)
+            .expect_err("UnicodeDecodeError 穿出");
+        assert_eq!(err.message, msg, "case {i}");
+    }
+    // 多位元組字元跨塊但合法：照常解碼。
+    let mut ok = vec![b' '; 8191];
+    ok.extend_from_slice("{\"中\": 1}\n".as_bytes());
+    std::fs::write(&path, ok).unwrap();
+    assert_eq!(
+        dumps_default(&PyValue::List(log.tail(None, None, None, None).unwrap())),
+        r#"[{"中": 1}]"#
+    );
+}
+
+#[test]
+fn tail_reads_current_file_only() {
+    // 計畫表名（08 Task 13）：`.1` 內容不出現在 tail。
+    let d = tempfile::tempdir().unwrap();
+    let (log, _c) = logger(d.path(), 1);
+    std::fs::write(d.path().join("events.ndjson.1"), b"{\"old\": 1}\n").unwrap();
+    std::fs::write(d.path().join("events.ndjson"), b"{\"cur\": 1}\n").unwrap();
+    assert_eq!(
+        dumps_default(&PyValue::List(log.tail(None, None, None, None).unwrap())),
+        r#"[{"cur": 1}]"#
+    );
 }

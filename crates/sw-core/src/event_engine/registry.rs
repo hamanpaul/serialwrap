@@ -153,8 +153,9 @@ impl RuleRegistry {
                 allow_nan: true,
             },
         );
+        // Python `open(tmp, "w", encoding="utf-8")` 文字模式：Windows 寫出 CRLF（審查 76de0cf_96b28dd c58e8d4-2）。
         self.fs
-            .create_truncate(&tmp, body.as_bytes())
+            .create_truncate_text(&tmp, &body)
             .map_err(UpsertError::Io)?;
         self.fs.sync_file(&tmp).map_err(UpsertError::Io)?;
         self.fs.replace(&tmp, &path).map_err(UpsertError::Io)?;

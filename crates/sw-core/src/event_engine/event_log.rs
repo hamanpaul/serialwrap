@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sw_pal::traits::{Clock, FsOps, PalErrorKind, PalResult};
-use sw_proto::pycompat::PyErr;
+use sw_proto::pycompat::{decode_utf8_strict, universal_newlines, PyErr};
 use sw_proto::pyjson::{self, PyDict, PyInt, PyValue};
 
-use super::counter::read_text_utf8;
 use super::pyops::{py_eq, py_lt, py_time_ms};
 use super::schema::type_name;
 
@@ -105,8 +104,8 @@ impl EventLogger {
         let selector = selector.filter(|v| !v.is_null());
         let since_ts = since_ts.filter(|v| !v.is_null());
         let n = n.filter(|v| !v.is_null());
-        let text = match read_text_utf8(&*self.fs, &self.path)? {
-            Ok(t) => t,
+        let bytes = match self.fs.read(&self.path) {
+            Ok(b) => b,
             Err(e) if e.kind == PalErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
                 return Err(PyErr {
@@ -118,6 +117,7 @@ impl EventLogger {
                 })
             }
         };
+        let text = universal_newlines(&decode_text_chunked(&bytes)?);
         let mut out = Vec::new();
         for line in text.split_inclusive('\n') {
             let obj = match pyjson::loads(line) {
@@ -200,4 +200,44 @@ fn py_tail_slice(mut out: Vec<PyValue>, n: &PyValue) -> Result<Vec<PyValue>, PyE
         }
     };
     Ok(out.split_off(start as usize))
+}
+
+/// `TextIOWrapper` 的讀取分塊（CPython `_CHUNK_SIZE`）。
+const TEXT_CHUNK: usize = 8192;
+
+/// `open(path, "r", encoding="utf-8").readlines()` 的解碼：以 8192 bytes 分塊增量解碼，塊尾不完整的多位元組序列
+/// 留到下一塊；UnicodeDecodeError 的 position 相對於「前塊殘留＋當前塊」，EOF 時殘留以 final 解碼
+/// （審查 76de0cf_96b28dd c58e8d4-3）。
+fn decode_text_chunked(bytes: &[u8]) -> Result<String, PyErr> {
+    let mut out = String::new();
+    let mut carry: Vec<u8> = Vec::new();
+    let mut chunks = bytes.chunks(TEXT_CHUNK);
+    loop {
+        let (data, last) = match chunks.next() {
+            Some(c) => {
+                let mut d = std::mem::take(&mut carry);
+                d.extend_from_slice(c);
+                (d, false)
+            }
+            None => (std::mem::take(&mut carry), true),
+        };
+        if data.is_empty() {
+            return Ok(out);
+        }
+        match decode_utf8_strict(&data) {
+            Ok(s) => out.push_str(&s),
+            Err(e) if !last && e.reason == "unexpected end of data" => {
+                out.push_str(std::str::from_utf8(&data[..e.start]).expect("前綴已驗證"));
+                carry = data[e.start..].to_vec();
+            }
+            Err(e) => {
+                return Err(PyErr {
+                    message: e.to_string(),
+                })
+            }
+        }
+        if last {
+            return Ok(out);
+        }
+    }
 }

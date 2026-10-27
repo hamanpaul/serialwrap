@@ -1797,6 +1797,12 @@ impl EventLogger { pub fn new(path: PathBuf, fs: Arc<dyn FsOps>, clock: Arc<dyn 
                    pub fn tail(&self, rule_id: Option<&PyValue>, selector: Option<&PyValue>, since_ts: Option<&PyValue>, n: Option<&PyValue>) -> Result<Vec<PyValue>, PyErr>; }
 ```
 
+**P7 修訂（實作，2026-10-27；審查 76de0cf_96b28dd c58e8d4-5）：** Python 會讓下列例外穿出，簽章依此修訂（理由與 golden 證據見 `crates/sw-core/tests/event_store.rs` 檔頭）：
+`Counter::from_json(&PyValue) -> Result<Counter, PyErr>`、`CounterStore::load -> Result<Counter, PyErr>`、`CounterStore::clear -> PalResult<()>`、新增 `CounterStore::{path_for, known_rule_ids -> PalResult<Vec<String>>}`；
+`RuleRegistry::load_all -> Result<LoadResult, PyErr>`、`delete -> PalResult<bool>`、`diff_against -> Result<DiffResult, PyErr>`、新增 `root()`／`path_for()`；
+`EventLogger::write -> PalResult<()>`、新增 `path()`。tmp 寫入改用 `FsOps::create_truncate_text`（Python 文字模式，Windows CRLF）。
+表格家族的 `tail_reads_current_file_only` 另與 `tail_missing_file_is_empty_and_reads_current_file_only` 並存。
+
 - [ ] **Step 1：寫失敗測試**
 
 ```rust
@@ -2035,6 +2041,8 @@ impl Dispatcher {
 }
 pub struct DispatcherStopReport { pub aborted: usize, pub unreaped: Vec<String> /* 100 ms 寬限後 run 仍未返回的 rule_id，依 rule_id 排序 */ }
 ```
+
+**P7 修訂（實作，2026-10-27）：** `build_env(fire, fire_count, inherited)` 的 `inherited` 由呼叫端依 `HandlerSpawner::inherited_env_keys()` 順序自 `SysEnv` 取得（sw-core 不以 cfg 分辨平台鍵集合，不在函式內過濾）；shutdown WARNING 字串由 `DispatcherStopReport::warning() -> Option<String>` 提供，Task 16 經 `EngineDeps.warn` 寫出。`FakeHandlerSpawner` 增補 `scripted`／`blocking`／`ignore_abort`／`release_all`／`spawn_count`／`aborts_seen`／`set_hook`。
 
 - [ ] **Step 1：寫失敗測試**
 

@@ -52,3 +52,42 @@ $ timeout 290 python3.12 -m pytest -q -p no:cacheprovider tests/contract_blackbo
 
 multiagent 五 agent 案在重跑中 2/2 通過、全套中失敗一次，前兩筆 slice21 在起點清單內且兩次重跑集合不同；sm04 與 sm01 同為
 `DeviceHeldError` 環境類（c58e8d4 列另以 76de0cf worktree 重現）。d5b2dd6 未改 `sw_core/`。
+
+### c58e8d4 列的完整差異（審查 76de0cf_96b28dd 96b28dd-1 補記）
+
+相對 `pytest-fail-d5b2dd6.txt`：**+7／−4**。
+
+- `+ tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[INVALID_COMPLETION_REGEX]`
+- `+ tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`
+- `+ tests/test_functest_windows_wiring.py::test_windows_wiring_env_and_argv`
+- `+ tests/test_human_agent_coexist.py::TestHumanAgentCoexist::test_t1_wal_reset_preserves_console`
+- `+ tests/test_l15_smoke.py::test_reject_zero_tx_runs_on_python`
+- `+ tests/test_regression_windows_caps.py::test_regression_case_requires_updated`
+- `+ tests/test_regression_windows_caps.py::test_regression_windows_skip_is_capability_based`
+- `− tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent`
+- `− tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`
+- `− tests/test_l15_smoke.py::test_release_inflight_runs_on_python`
+- `− tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`
+
+同範圍重跑（本 session 實跑）：
+
+```
+$ timeout 290 python3.12 -m pytest -q -p no:cacheprovider tests/test_human_agent_coexist.py::TestHumanAgentCoexist::test_t1_wal_reset_preserves_console \
+    tests/test_l15_smoke.py::test_reject_zero_tx_runs_on_python "tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[INVALID_COMPLETION_REGEX]" tests/test_regression_windows_caps.py
+第 1 次：2 failed, 11 passed
+第 2 次：1 failed, 12 passed（失敗集合不同；-rf 顯示唯一失敗者為 l15 reject_zero_tx：Python daemon `ATTACH_FAILED:DeviceHeldError`）
+$ timeout 200 python3.12 -m pytest -q -p no:cacheprovider tests/test_human_agent_coexist.py::TestHumanAgentCoexist::test_t1_wal_reset_preserves_console
+第 1 次：1 passed；第 2 次：1 passed（全套中失敗一次，同範圍兩次皆過 → 失敗集合不同）
+$ timeout 280 python3.12 -m pytest -q -p no:cacheprovider tests/test_regression_windows_caps.py tests/test_functest_windows_wiring.py::test_windows_wiring_env_and_argv
+第 1 次：1 failed, 10 passed；第 2 次：1 failed, 10 passed（regression_windows_caps 兩次皆過；windows_wiring 單獨執行恆紅，
+於 76de0cf worktree 同樣恆紅：`NotImplementedError: cannot instantiate 'WindowsPath' on your system`，全套中依執行順序時過時不過）
+$ （76de0cf worktree）timeout 200 python3.12 -m pytest -q -p no:cacheprovider tests/test_l15_smoke.py::test_reject_zero_tx_runs_on_python
+1 failed（ATTACH_FAILED:DeviceHeldError）——與 c58e8d4 相同，非本範圍引入
+```
+
+殘留 throwaway daemon 的觀察（本 session，2026-10-27 約 12:35 UTC）：`ps` 見 pid 11089
+`python3 …/tests/contract_blackbox/bin/../../../serialwrapd.py`（etime 05:23:28），`/proc/11089/environ` 的
+`SERIALWRAP_STATE_DIR=/tmp/pytest-of-root/pytest-40/test_reject_paths_zero_tx_SESS0/shell/state`、
+`SERIALWRAP_RUN_DIR=/tmp/sw21-_65e8la_`，持有 `/dev/ptmx`×2 與該測試的 WAL handle。auto mode 不允許本 session 終止該行程，
+故 DeviceHeldError 類失敗與其關聯僅為推測；審查者容器中無此行程、sm01 通過，與此推測一致。
+

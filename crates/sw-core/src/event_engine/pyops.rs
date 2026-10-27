@@ -80,6 +80,15 @@ fn cmp_num(a: &Num, b: &Num) -> Option<Ordering> {
     }
 }
 
+/// 容器元素比較（`PyObject_RichCompareBool`）：同一物件直接相等。JSON 解出的 NaN 為 `json.decoder` 模組層單例，
+/// 故容器內 NaN 與 NaN 相等；頂層純量 `NaN != NaN` 仍不相等（審查 76de0cf_96b28dd c58e8d4-1）。
+fn py_eq_elem(a: &PyValue, b: &PyValue) -> bool {
+    match (a, b) {
+        (PyValue::Float(x), PyValue::Float(y)) if x.is_nan() && y.is_nan() => true,
+        _ => py_eq(a, b),
+    }
+}
+
 /// Python `a == b`。
 pub(crate) fn py_eq(a: &PyValue, b: &PyValue) -> bool {
     if let (Some(x), Some(y)) = (num(a), num(b)) {
@@ -89,13 +98,13 @@ pub(crate) fn py_eq(a: &PyValue, b: &PyValue) -> bool {
         (PyValue::Null, PyValue::Null) => true,
         (PyValue::Str(x), PyValue::Str(y)) => x == y,
         (PyValue::List(x), PyValue::List(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq(p, q))
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| py_eq_elem(p, q))
         }
         (PyValue::Dict(x), PyValue::Dict(y)) => {
             x.0.len() == y.0.len()
                 && x.0
                     .iter()
-                    .all(|(k, v)| y.0.get(k).is_some_and(|w| py_eq(v, w)))
+                    .all(|(k, v)| y.0.get(k).is_some_and(|w| py_eq_elem(v, w)))
         }
         _ => false,
     }
@@ -120,7 +129,7 @@ pub(crate) fn py_lt(a: &PyValue, b: &PyValue) -> Result<bool, PyErr> {
         (PyValue::Str(x), PyValue::Str(y)) => Ok(x < y),
         (PyValue::List(x), PyValue::List(y)) => {
             for (p, q) in x.iter().zip(y) {
-                if !py_eq(p, q) {
+                if !py_eq_elem(p, q) {
                     return py_lt(p, q);
                 }
             }

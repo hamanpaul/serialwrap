@@ -84,3 +84,14 @@
 | bea2d8e-3 | Low | 測試把型別名凍結為 EXCEPTION message | **fixed**：`login_quiet::disk_full_blocks_login_probe_but_not_agent_cmd` 改只斷言例外穿出並註明已知偏離（Task 7 `LoginReport` 帶出 TxResult 後補 `str(exc)` 全文） |
 | bea2d8e-4 | Low | `s21_core.windows` 加回的兩個舊 nodeid 樹內已不存在 | 已登記 P7-LW-1／P7-BO-1（擁有者核准 `--allow-removal` 後與原生替換同 PR 處理）；無程式變更 |
 | 76de0cf-1 | Low | 證據 README 未交代 +4／−1 與重跑紀錄 | **fixed**：README 補「d5b2dd6 列的完整差異」段（完整 +/−、兩次重跑命令與結果） |
+
+## 第 5 輪：p7-cloud/76de0cf_96b28dd（Opus）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| c58e8d4-1 | Medium | 容器比較未承接 CPython identity 捷徑（JSON NaN 單例）：含 NaN 欄位的規則每次 reload 被列 changed；tail 的 list 過濾不同 | **fixed**：`pyops::py_eq_elem`（容器元素兩邊皆 NaN 視為相等），dict／list 的 `==` 與 list 字典序 `<` 的「找第一個不等元素」改用之；頂層純量 NaN 仍不等。回歸 `event_store::diff_against_nan_field_is_unchanged`、`tail_filter_list_with_nan_matches_python`（修前紅；期望值 CPython 3.12 實測） |
+| c58e8d4-2 | Medium | Windows 上 Python 文字模式寫出 CRLF 規則檔，Rust 寫 LF，未登記 | **fixed（選 a）**：sw-pal 新增 `FsOps::create_truncate_text`（預設實作經 `text_mode_bytes`：Windows `\n`→`\r\n`，cfg 只在 sw-pal）與 `TEXT_NEWLINE`；registry／counter 的 tmp 寫入改用之；`upsert_rule_file_indent2_sorted_no_newline` 期望值以平台換行組成；新增 `fs_ops_p7::create_truncate_text_uses_platform_newline`。Windows 原生核對併入 P7-LW-4 |
+| c58e8d4-3 | Low | tail 的 UnicodeDecodeError position 以整檔計 | **fixed**：`decode_text_chunked` 模擬 TextIOWrapper 8192 bytes 分塊增量解碼（塊尾不完整序列留到下一塊、EOF final）；回歸 `tail_decode_error_position_is_chunk_relative`（5 組 CPython 3.12 實測訊息＋跨塊合法字元） |
+| c58e8d4-4 | Low | parity #5 未在 `runtime_paths.{posix,windows}.tsv` 加欄 | **deferred**：該 golden 只涵蓋 client `resolve()` 的 `RuntimePaths`，無 daemon 目錄欄位；加欄需改 P2 擷取器與既有列的 JSON 內容（非 add-only），且 windows 側需 Windows Python。POSIX 期望值已由本 session 與審查者以 CPython 3.12 實跑核對一致；windows ntpath 期望值列 P7-LW-4 |
+| c58e8d4-5 | Low | 介面偏離只記在檔頭；紅燈宣稱無法核實；計畫測試名不一致 | **fixed**：08 Task 13／15 加「P7 修訂」區塊列出簽章；新增計畫名 `tail_reads_current_file_only`（與既有測試並存，鎖 add-only）；`p7-evidence/red-runs.md` 記錄各 Task 紅燈命令與結果 |
+| 96b28dd-1 | Low | 證據 README 差異說明不完整、PTY 測試缺同範圍兩次重跑紀錄 | **fixed**：README 補「c58e8d4 列的完整差異」（+7／−4、重跑命令與結果、殘留 daemon 觀察的 pid／environ／fd） |

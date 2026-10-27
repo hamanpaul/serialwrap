@@ -120,6 +120,22 @@ pub(crate) fn with_filename(
     error
 }
 
+/// Python 文字模式寫入的換行（`os.linesep`）：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+#[cfg(windows)]
+pub const TEXT_NEWLINE: &str = "\r\n";
+/// Python 文字模式寫入的換行（`os.linesep`）：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+#[cfg(not(windows))]
+pub const TEXT_NEWLINE: &str = "\n";
+
+/// 文字模式寫入的位元組：每個 `\n` 換成 [`TEXT_NEWLINE`]（UTF-8 編碼）。
+pub fn text_mode_bytes(text: &str) -> Vec<u8> {
+    if TEXT_NEWLINE == "\n" {
+        text.as_bytes().to_vec()
+    } else {
+        text.replace('\n', TEXT_NEWLINE).into_bytes()
+    }
+}
+
 /// 寫入面（P4-T1 補齊簽章；P3 呼叫端僅使用 `FsRead` 方法，`FsOps: FsRead` 為 supertrait）。
 #[allow(unused_variables)]
 pub trait FsOps: FsRead {
@@ -192,6 +208,10 @@ pub trait FsOps: FsRead {
     /// `open(p, "w")` 截斷後寫入並 close（counter／registry 的 `<path>.tmp`：殘留 tmp 必須被覆寫，不得續寫）。
     fn create_truncate(&self, p: &Path, bytes: &[u8]) -> PalResult<()> {
         todo!("P7 Task 6")
+    }
+    /// `open(p, "w", encoding="utf-8")` 文字模式寫入：`\n` 依平台換行（Windows `\r\n`，`newline=None`）後截斷寫入。
+    fn create_truncate_text(&self, p: &Path, text: &str) -> PalResult<()> {
+        self.create_truncate(p, &text_mode_bytes(text))
     }
     // `os.path.isfile` 沿用既有 `FsRead::is_file`（P3），不在 FsOps 重複定義（08 Task 0 核對註記）。
     /// 檔案大小；`None`＝不存在。

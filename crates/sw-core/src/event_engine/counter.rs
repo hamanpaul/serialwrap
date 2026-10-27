@@ -156,7 +156,8 @@ impl CounterStore {
                 allow_nan: true,
             },
         );
-        self.fs.create_truncate(&tmp, body.as_bytes())?;
+        // Python 文字模式寫入（內容無換行，雙平台位元組相同）。
+        self.fs.create_truncate_text(&tmp, &body)?;
         self.fs.sync_file(&tmp)?;
         self.fs.replace(&tmp, &path)?;
         self.cache

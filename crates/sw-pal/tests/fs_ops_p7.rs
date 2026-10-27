@@ -81,3 +81,24 @@ fn open_append_error_message_has_quoted_path() {
         format!("[Errno 2] No such file or directory: '{}'", p.display())
     );
 }
+
+#[test]
+fn create_truncate_text_uses_platform_newline() {
+    // 審查 76de0cf_96b28dd c58e8d4-2：Python `open(p, "w")` 文字模式在 Windows 把 `\n` 寫成 `\r\n`。
+    use sw_pal::fs_ops::{text_mode_bytes, TEXT_NEWLINE};
+    let fs = sw_pal::native().fs;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("r.json.tmp");
+    std::fs::write(&p, b"stale-longer-content").unwrap();
+    fs.create_truncate_text(&p, "{\n  \"a\": 1\n}").unwrap();
+    let want = format!("{{{TEXT_NEWLINE}  \"a\": 1{TEXT_NEWLINE}}}");
+    assert_eq!(std::fs::read(&p).unwrap(), want.as_bytes());
+    assert_eq!(
+        text_mode_bytes("x\ny"),
+        format!("x{TEXT_NEWLINE}y").into_bytes()
+    );
+    #[cfg(windows)]
+    assert_eq!(TEXT_NEWLINE, "\r\n");
+    #[cfg(not(windows))]
+    assert_eq!(TEXT_NEWLINE, "\n");
+}
