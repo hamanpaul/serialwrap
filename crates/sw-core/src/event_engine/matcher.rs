@@ -93,23 +93,86 @@ fn int_cmp(a: &PyInt, b: &PyInt) -> CmpOrdering {
     }
 }
 
-fn int_sat(v: &PyInt) -> i128 {
-    match v {
-        PyInt::Small(n) => *n,
-        PyInt::Big(s) if s.starts_with('-') => i128::MIN,
-        PyInt::Big(_) => i128::MAX,
+/// Python 任意精度 int 的加法（十進位逐位；結果以 `PyInt::Big` 十進位字串表示，只供 [`int_cmp`] 比較）。
+fn int_add(a: &PyInt, b: &PyInt) -> PyInt {
+    fn parts(v: &PyInt) -> (bool, Vec<u8>) {
+        let s = match v {
+            PyInt::Small(n) => n.to_string(),
+            PyInt::Big(s) => s.clone(),
+        };
+        let (neg, digits) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest.to_string()),
+            None => (false, s),
+        };
+        // 低位在前
+        (neg, digits.bytes().rev().map(|d| d - b'0').collect())
     }
+    fn mag_cmp(a: &[u8], b: &[u8]) -> CmpOrdering {
+        let trim = |v: &[u8]| v.len() - v.iter().rev().take_while(|d| **d == 0).count();
+        let (la, lb) = (trim(a), trim(b));
+        la.cmp(&lb)
+            .then_with(|| a[..la].iter().rev().cmp(b[..lb].iter().rev()))
+    }
+    fn mag_add(a: &[u8], b: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+        let mut carry = 0u8;
+        for i in 0..a.len().max(b.len()) {
+            let sum = a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0) + carry;
+            out.push(sum % 10);
+            carry = sum / 10;
+        }
+        if carry > 0 {
+            out.push(carry);
+        }
+        out
+    }
+    /// 前提 `a >= b`。
+    fn mag_sub(a: &[u8], b: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(a.len());
+        let mut borrow = 0i8;
+        for (i, digit) in a.iter().enumerate() {
+            let mut d = *digit as i8 - b.get(i).copied().unwrap_or(0) as i8 - borrow;
+            borrow = 0;
+            if d < 0 {
+                d += 10;
+                borrow = 1;
+            }
+            out.push(d as u8);
+        }
+        out
+    }
+    let (an, ad) = parts(a);
+    let (bn, bd) = parts(b);
+    let (neg, mag) = if an == bn {
+        (an, mag_add(&ad, &bd))
+    } else if mag_cmp(&ad, &bd) != CmpOrdering::Less {
+        (an, mag_sub(&ad, &bd))
+    } else {
+        (bn, mag_sub(&bd, &ad))
+    };
+    let mut text: String = mag.iter().rev().map(|d| char::from(b'0' + d)).collect();
+    text = text.trim_start_matches('0').to_string();
+    if text.is_empty() {
+        return PyInt::Small(0);
+    }
+    if neg {
+        text.insert(0, '-');
+    }
+    PyInt::Big(text)
 }
 
 pub fn apply_cooldown(rule: &Rule, c: &Counter, now_ms: i64) -> bool {
-    let cooldown = rule.cooldown_ms_sat();
     let Some(last) = c.last_fire_ts.as_ref() else {
         return true;
     };
-    if cooldown <= 0 {
+    if int_cmp(&rule.cooldown_ms, &PyInt::Small(0)) != CmpOrdering::Greater {
         return true;
     }
-    (now_ms as i128).saturating_sub(int_sat(last)) >= cooldown
+    // `(now_ms - last) >= cooldown_ms` ⇔ `now_ms >= last + cooldown_ms`（任意精度，不飽和）。
+    int_cmp(
+        &PyInt::Small(i128::from(now_ms)),
+        &int_add(last, &rule.cooldown_ms),
+    ) != CmpOrdering::Less
 }
 
 pub fn apply_max_fires(rule: &Rule, c: &Counter) -> bool {

@@ -1,7 +1,7 @@
 //! 登入狀態機（P5-T13 最小版 → P7 Task 3 全平台；05 §8；逐函式對照 `sw_core/login_fsm.py`）。
 //!
-//! - `choose_login_plan`：sans-IO 的計畫選擇（passthrough／不具 command capability／boot quiet／帳密未解析／
-//!   Slice 2.1 不支援能力 → 不送任何 TX；Slice 2.1 能力閘的退役待 08 §0.6 退役清單的 L1 鎖裁決）。
+//! - `choose_login_plan`：sans-IO 的計畫選擇（passthrough／不具 command capability／boot quiet／帳密未解析
+//!   → 不送任何 TX；Slice 2.1 能力閘已依 08 §0.6 退役清單於 P7 Task 3 移除）。
 //! - `probe_ready`／`ensure_ready`／`detect_template`：在 OpRunner（或測試 executor）thread 執行；TX 一律經
 //!   `LoginIo.tx`（TxWriter，class 由呼叫端以 `LoginIo.class` 決定），RX 比對整個 RX 視窗（Python
 //!   `wait_for_regex` 語意，SES-16.6-05 KEEP），等待可經 `LoginIo.cancel` 取消（SC-30）。
@@ -104,8 +104,7 @@ pub const LOGIN_FSM_DETAIL_ERRORS: [&str; 12] = [
 /// 回傳 `(計畫, 合成的 last_error)`。
 ///
 /// 順序：passthrough（SC-35）→ 不具 command capability → boot quiet（合成 `PROMPT_UNAVAILABLE`）→
-/// 宣告但未解析的帳密（`CredentialsUnresolved`）→ Slice 2.1 不支援能力（`None`）→ `EnsureReady`／`Probe`。
-/// 帳密閘先於能力閘：未解析帳密的 `CREDENTIALS_UNRESOLVED` 終態與 Python 一致（T11 `console_unlock_env_is_a_credential_source`）。
+/// 宣告但未解析的帳密（`CredentialsUnresolved`）→ `EnsureReady`／`Probe`。
 pub fn choose_login_plan(
     p: &SessionProfile,
     pending_auto_login: bool,
@@ -130,9 +129,6 @@ pub fn choose_login_plan(
             },
             Some("CREDENTIALS_UNRESOLVED"),
         );
-    }
-    if crate::quiet_gate::slice21_unsupported_feature(p).is_some() {
-        return (LoginPlan::None, None);
     }
     let has = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.is_empty());
     if require_login && (has(&auth.console_unlock) || (has(&auth.username) && has(&auth.password)))

@@ -42,7 +42,8 @@ def test_scope_served_methods_cover_rpc_catalog():
 
 def test_unsupported_profile_features_are_declared():
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
-    assert scope["unsupported_profile_features"] == ["post_login_cmd", "console_unlock_env"]
+    # P7 Task 3（08 §0.6 退役清單）：Slice 2.3 承接 post_login_cmd／console_unlock_env，能力閘清單改為空。
+    assert scope["unsupported_profile_features"] == []
     assert scope["unsupported_profile_behavior"] == {
         "auto_tx": False, "state": "ATTACHED", "last_error": None, "submit_error_code": "SESSION_NOT_READY"}
     assert scope["sentinel_console_input"] == "discard"

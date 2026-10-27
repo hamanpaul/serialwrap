@@ -120,7 +120,6 @@ CHECKS: list[tuple[str, str, str, int, str | None]] = [
     (f"{CORE}/quiet_gate.rs", r"pub fn on_rx_text\b", "06 T13", 4, "on_rx_text"),
     (f"{CORE}/quiet_gate.rs", r"pub fn detect_boot_banner\b", "06 T13", 3, "detect_boot_banner"),
     (f"{CORE}/quiet_gate.rs", r"pub fn is_reboot_command\b", "06 T13", 4, "is_reboot_command"),
-    (f"{CORE}/quiet_gate.rs", r"pub fn slice21_unsupported_feature\b", "06 T13", 3, "slice21_unsupported_feature"),
     (f"{CORE}/op_runner.rs", r"pub enum OpSpec\b", "06 T14", 7, None),
     (f"{CORE}/op_runner.rs", r"pub enum OpOutcome\b", "06 T14", 7, None),
     (f"{CORE}/op_runner.rs", r"pub fn spawn\b", "06 T14", 7, "spawn"),

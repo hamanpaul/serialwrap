@@ -191,6 +191,21 @@ fn write_repeat(
 ) -> Result<(), String> {
     if is_zero_width(body) {
         if min == 0 {
+            // 零寬本體重複至多一次有意義；本體含保留的擷取群組時不得省略，否則後續群組序號錯位
+            // （CPython：`()?` 參與為 ''、`()??` 不參與為 None）。
+            if !has_mapped_capture(body, group_map) {
+                return Ok(());
+            }
+            let possessive = matches!(mode, RepeatMode::Possessive);
+            out.push_str(if possessive { "(?>(?:" } else { "(?:" });
+            write_expr(body, group_map, flags, out)?;
+            out.push_str(")?");
+            if matches!(mode, RepeatMode::Lazy) {
+                out.push('?');
+            }
+            if possessive {
+                out.push(')');
+            }
             return Ok(());
         }
         return write_expr(body, group_map, flags, out);
@@ -266,6 +281,12 @@ fn is_zero_width(expr: &Expr) -> bool {
         | Expr::CharacterClass { .. }
         | Expr::Backreference { .. } => false,
     }
+}
+
+fn has_mapped_capture(expr: &Expr, group_map: &BTreeMap<usize, usize>) -> bool {
+    let mut found = BTreeSet::new();
+    collect_captures(expr, &mut found);
+    found.iter().any(|index| group_map.contains_key(index))
 }
 
 fn collect_captures(expr: &Expr, used: &mut BTreeSet<usize>) {

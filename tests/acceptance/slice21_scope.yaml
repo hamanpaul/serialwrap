@@ -29,7 +29,7 @@ deferred_methods:
   - {method: event.tail, slice: "2.3"}
   - {method: file.push, slice: "2.4"}
   - {method: file.pull, slice: "2.4"}
-unsupported_profile_features: [post_login_cmd, console_unlock_env]
+unsupported_profile_features: []       # 2.3 承接（P7 Task 3 退役 Slice 2.1 能力閘：post_login_cmd、console_unlock_env 改走全平台 Login FSM）
 unsupported_profile_behavior: {auto_tx: false, state: ATTACHED, last_error: null, submit_error_code: SESSION_NOT_READY}
 sentinel_console_input: discard        # POSIX 哨兵 PTY 收到的 human bytes 在 2.1 丟棄（2.2 承接 Raw／Line）
 session_public_deferred_fields:

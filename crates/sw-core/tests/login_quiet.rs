@@ -20,9 +20,8 @@ use sw_core::login_fsm::{
     LoginPlan, FLOOD_MASKABLE_ERRORS, LOGIN_FSM_DETAIL_ERRORS,
 };
 use sw_core::quiet_gate::{
-    detect_boot_banner, is_reboot_command, matches_any_bootloader_prompt,
-    slice21_unsupported_feature, valid_completion_regex, QuietState, QuietTransition,
-    BOOT_BANNER_PATTERNS,
+    detect_boot_banner, is_reboot_command, matches_any_bootloader_prompt, valid_completion_regex,
+    QuietState, QuietTransition, BOOT_BANNER_PATTERNS,
 };
 use sw_core::session_auth::{
     credentials_declared_but_unresolved, parse_env_file, resolve_session_auth, AuthResolution,
@@ -47,7 +46,7 @@ const NONCE: &str = "ab12cd34";
 const LOGIN_PROFILE: &str = "profiles:\n  l:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: l, act_no: 1, alias: l+1, device_by_id: /s/by-id/usb-A}\n";
 const LOGIN_ENV_PROFILE: &str = "profiles:\n  e:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: e, act_no: 1, alias: e+1, device_by_id: /s/by-id/usb-A}\n";
 const BOOTLOADER_PROFILE: &str = "profiles:\n  b:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    bootloader_prompts: ['(?m)^=> $']\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: b, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
-const BRCM_POST_LOGIN_PROFILE: &str = "profiles:\n  brcm-template:\n    platform: bcm\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: brcm-template, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
+const BRCM_POST_LOGIN_ENV_PROFILE: &str = "profiles:\n  brcm-template:\n    platform: bcm\n    prompt_regex: '(?m)^(CM> |root@t:.*# )'\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: brcm-template, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
 
 /// prompt 以 `$` 錨定視窗尾端：nonce 回顯後若無新 prompt，整窗比對即不命中（READY_PROMPT_TIMEOUT 可達）。
 /// Python `wait_for_regex` 比對整個 RX 視窗（SES-16.6-05 KEEP），`(?m)^root@t:.*# ` 這類 prompt 會被 probe 早已收到的
@@ -1056,25 +1055,28 @@ fn passthrough_banner_does_not_arm_quiet() {
     h.wait_state("READY");
 }
 
+/// P7 Task 3 退役 Slice 2.1 能力閘（08 §0.6 退役清單；取代 06 T13 `unsupported_profile_no_auto_tx`）：
+/// `post_login_cmd: sh` 的 brcm-template 走完整 bcm 登入到 READY，不再寫 `slice-2.1 不支援` 告警。
 #[test]
-fn unsupported_profile_no_auto_tx() {
-    let p = profile_of(BRCM_POST_LOGIN_PROFILE);
-    assert_eq!(slice21_unsupported_feature(&p), Some("post_login_cmd"));
-    let h = ActorRig::new(BRCM_POST_LOGIN_PROFILE).attach();
-    h.wait_state("ATTACHED");
-    let s = h.get_state();
-    assert_eq!(pget(&s, "last_error"), PyValue::Null);
-    assert_eq!(h.dev.write_calls(), 0);
-    let msg = "slice-2.1 不支援的 profile 能力（brcm-template: post_login_cmd）；不自動登入";
-    assert_eq!(
+fn post_login_cmd_profile_logs_in() {
+    let h = ActorRig::new(BRCM_POST_LOGIN_ENV_PROFILE);
+    h.set_env("SW_T_U", "admin");
+    h.set_env("SW_T_P", "pw");
+    h.dev.on_tx_reply(b"\n", b"\r\nlogin: ");
+    h.dev.on_tx_reply(b"admin", b"\r\nPassword: ");
+    h.dev.on_tx_reply(b"pw", b"\r\nCM> ");
+    h.dev.on_tx_reply(b"sh", b"\r\nroot@t:/# ");
+    answer_nonce(&h.dev);
+    let h = h.attach();
+    h.wait_state("READY");
+    assert!(h.dev.write_calls() > 0);
+    assert!(
         h.stderr_lines()
             .iter()
-            .filter(|l| l.as_str() == msg)
-            .count(),
-        1
+            .all(|l| !l.contains("slice-2.1 不支援")),
+        "{:?}",
+        h.stderr_lines()
     );
-    let r = h.request(SessionRequest::Submit(agent_submit("ls")));
-    assert_eq!(pget(&r, "error_code"), PyValue::from("SESSION_NOT_READY"));
 }
 
 #[test]
@@ -1210,6 +1212,9 @@ const CONSOLE_UNLOCK_PROFILE: &str = "profiles:\n  c:\n    platform: shell\n    
 #[test]
 fn console_unlock_arm_mid_login_finish_applied() {
     let mut h = CoreHarness::new(CONSOLE_UNLOCK_PROFILE);
+    // 審查 9e6895d（Opus #3）：未設 unlock env 時 Python 回 CREDENTIALS_UNRESOLVED、不起登入
+    // （`session_manager.py:1727`），紅燈須落在 Task 4／7 行為而非 setup。
+    h.set_env("SW_T_UNLOCK", "k");
     h.feed(ControlEvent::DeviceAttached {
         by_id: DEVICE_BY_ID.into(),
         real_path: REAL_PATH.into(),
@@ -1236,4 +1241,124 @@ fn console_unlock_arm_mid_login_finish_applied() {
         after_rx_seq: None,
     });
     assert_eq!(h.core.state(), SessionState::Ready, "在途 unlock run 的 LoginFinished 不得因 quiet arm 被丟棄");
+}
+
+// ---------------------------------------------------------------------------
+// 審查 60b3dd5／P7 承接：帳密只在 Python 會解析處解析（`session_manager.py:4717-4742`、`:4465-4466`）
+// ——boot quiet 時不讀 env_file，因而不多寫 `env_file 不存在` WARNING。（!require_login 經 YAML 不可達：
+// `config.py:171` 的 `login_regex or 預設` 使非 passthrough 恆 require_login。）
+// ---------------------------------------------------------------------------
+
+struct OneYamlFs(String);
+
+impl sw_proto::config_types::ProfileFs for OneYamlFs {
+    fn flavor(&self) -> sw_proto::pypath::PathFlavor {
+        sw_proto::pypath::PathFlavor::Posix
+    }
+    fn is_dir(&self, p: &str) -> bool {
+        p == "/fake/profiles"
+    }
+    fn list_dir(&self, _p: &str) -> Result<Vec<String>, sw_proto::pycompat::PyOsError> {
+        Ok(vec!["profiles.yaml".to_string()])
+    }
+    fn read_bytes(&self, _p: &str) -> Result<Vec<u8>, sw_proto::pycompat::PyOsError> {
+        Ok(self.0.clone().into_bytes())
+    }
+    fn expanduser(&self, p: &str) -> String {
+        p.to_string()
+    }
+}
+
+/// `CoreHarness` 換上計數 env_file 讀取的 core（其餘 deps 沿用 harness 的同一組）。
+fn harness_counting_env_reads(yaml: &str) -> (CoreHarness, Arc<AtomicU64>) {
+    let mut h = CoreHarness::new(yaml);
+    let profile =
+        sw_proto::config_types::load_profiles("/fake/profiles", &OneYamlFs(yaml.to_string()))
+            .expect("profile")
+            .profiles
+            .remove(0);
+    let reads = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&reads);
+    let deps = sw_core::session_core::CoreDeps {
+        fence: h.fence.clone(),
+        registry: h.reg.clone(),
+        wal: h.wal.clone(),
+        rx: h.rx.clone(),
+        epochs: h.epochs.clone(),
+        wall_iso: Arc::new(|| "wall-rig".to_string()),
+        rng: Arc::new(|buf: &mut [u8]| buf.iter_mut().for_each(|b| *b = 0)),
+        env: h.env.clone(),
+        read_env_file: Arc::new(move |_p: &str| -> Option<std::io::Result<String>> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            None
+        }),
+        input_epoch_pub: Arc::new(AtomicU64::new(0)),
+    };
+    h.core = sw_core::session_core::SessionCore::new(profile, "yaml-target", deps);
+    (h, reads)
+}
+
+const LOGIN_ENV_FILE_PROFILE: &str = "profiles:\n  c:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: '(?m)login: $'\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    env_file: /nonexistent/s21.env\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: c, act_no: 1, alias: c+1, device_by_id: /s/by-id/usb-A}\n";
+
+/// 第一個 `StartLogin` 的計畫種類（`LoginPlan` 不 derive `Debug`／`PartialEq`）。
+fn start_login_plan(effs: &[Effect]) -> Option<&'static str> {
+    effs.iter().find_map(|e| match e {
+        Effect::StartLogin { plan, .. } => Some(match plan {
+            LoginPlan::Probe => "Probe",
+            LoginPlan::EnsureReady { .. } => "EnsureReady",
+            LoginPlan::None => "None",
+            LoginPlan::CredentialsUnresolved { .. } => "CredentialsUnresolved",
+        }),
+        _ => None,
+    })
+}
+
+#[test]
+fn attach_during_boot_quiet_does_not_resolve_credentials() {
+    // Python：boot_quiet 時直接合成 PROMPT_UNAVAILABLE，`resolve_session_auth` 不被呼叫。
+    let (mut h, reads) = harness_counting_env_reads(LOGIN_ENV_FILE_PROFILE);
+    let far: Mono = h.clock.mono_ns() + 100_000_000_000;
+    h.core.set_boot_quiet_until_for_test(far);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    assert_eq!(start_login_plan(&effs), None);
+    assert_eq!(
+        h.public()["last_error"],
+        PyValue::from("PROMPT_UNAVAILABLE")
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "boot quiet 時不得解析帳密");
+}
+
+/// 審查 60b3dd5：login run 部分寫出／結果不明（`Aborted(TxIncomplete)`）不是 quiet 撤銷。Python 的
+/// `TxIncompleteError` 非 `_login_tx_refused` 時穿出 `_attach_by_id` 的 `except Exception`（`session_manager.py:4873-4909`）：
+/// 關 bridge、`DETACHED`、`last_error="ATTACH_FAILED:TxIncompleteError"`；不得標成 `PROMPT_UNAVAILABLE` 保橋。
+#[test]
+fn attach_login_tx_incomplete_detaches_attach_failed() {
+    use sw_core::login_fsm::LoginAbort;
+    let mut h = CoreHarness::new(LOGIN_ENV_PROFILE);
+    h.set_env("SW_T_U", "root");
+    h.set_env("SW_T_P", "pw");
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.bridge_ok();
+    let epoch = h.epoch();
+    let fsm_gen = h.core.generations().fsm_gen;
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Aborted(LoginAbort::TxIncomplete),
+        after_rx_seq: None,
+    });
+    let (stop_epoch, stop) = h.pending_stop();
+    h.receipt(stop_epoch, stop).feed();
+    assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+    assert_eq!(
+        h.public()["last_error"],
+        PyValue::from("ATTACH_FAILED:TxIncompleteError")
+    );
 }

@@ -218,18 +218,6 @@ pub fn is_reboot_command(cmd: &str) -> bool {
         .any(|t| t == "-r" || t == "--reboot" || t.starts_with("-r"))
 }
 
-/// Slice 2.1 不支援、不得自動送 TX 的 profile 能力（`"post_login_cmd"` | `"console_unlock_env"`）。
-pub fn slice21_unsupported_feature(p: &SessionProfile) -> Option<&'static str> {
-    let t = &p.template;
-    if !t.post_login_cmd.is_empty() {
-        return Some("post_login_cmd");
-    }
-    if t.console_unlock_env.as_deref().is_some_and(|v| !v.is_empty()) {
-        return Some("console_unlock_env");
-    }
-    None
-}
-
 // ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
 
 /// `quiet_active && console_unlock_env.is_none()`（`session_manager.py:1193`）；passthrough 恆 false（SC-35）。

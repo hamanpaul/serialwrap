@@ -40,8 +40,7 @@ use crate::mailbox::{
 };
 use crate::op_runner::{OpOutcome, OpSpec, encode_interactive_payload, reject_reason};
 use crate::quiet_gate::{
-    QuietState, QuietTransition, is_reboot_command, matches_any_bootloader_prompt,
-    slice21_unsupported_feature,
+    is_reboot_command, matches_any_bootloader_prompt, QuietState, QuietTransition,
 };
 use crate::self_test::{NeedProbe, SelfTestBase, SelfTestCtx, SelfTestProbes};
 use crate::session_auth::resolve_session_auth;
@@ -2132,7 +2131,7 @@ impl SessionCore {
             return effects;
         }
         let quiet_blocks = self.quiet.quiet_active(now);
-        let (plan, synthesized) = self.choose_plan(quiet_blocks);
+        let (plan, synthesized) = self.choose_plan(quiet_blocks, self.pending_auto_login);
         match plan {
             LoginPlan::None => {
                 if let Some(error) = synthesized {
@@ -2142,16 +2141,11 @@ impl SessionCore {
                     self.set_state(SessionState::Attached, now);
                     return effects;
                 }
-                // Slice 2.1 能力閘：停 ATTACHED、不自動送 TX；StartLogin{None} 只作稽核點，executor 不執行任何登入。
+                // 防禦（P7 Task 3 退役 Slice 2.1 能力閘後不應到達：None 只來自 passthrough／非 command-capable／quiet，
+                // 前兩者已於上方提早返回）：停 ATTACHED、不自動送 TX。
                 self.set_last_error(None, None);
                 self.adopt_bridge(now);
                 self.set_state(SessionState::Attached, now);
-                effects.extend(self.unsupported_warning());
-                effects.push(Effect::StartLogin {
-                    epoch,
-                    fsm_gen: self.generations.fsm_gen,
-                    plan: LoginPlan::None,
-                });
                 effects
             }
             LoginPlan::CredentialsUnresolved { reason, env_file } => {
@@ -2178,13 +2172,38 @@ impl SessionCore {
     }
 
     /// 重新解析帳密並選擇登入計畫（attach／既有 bridge 再探共用）。
-    fn choose_plan(&self, quiet_blocks: bool) -> (LoginPlan, Option<&'static str>) {
-        let auth = resolve_session_auth(
-            &self.profile,
-            self.deps.env.as_ref(),
-            self.deps.read_env_file.as_ref(),
-        );
-        choose_login_plan(&self.profile, self.pending_auto_login, auth, quiet_blocks)
+    ///
+    /// 帳密只在 Python 會呼叫 `resolve_session_auth` 處解析（`session_manager.py:4717-4742`、`:4465-4466`）：
+    /// boot quiet 或 `require_login` 為假時不解析，不讀 env_file、不寫 `env_file 不存在` WARNING。
+    /// `pending_auto_login`：attach 傳 session 旗標；既有 bridge 再探傳 `false`（Python 只看 `login_regex or console_unlock_env`）。
+    fn choose_plan(
+        &self,
+        quiet_blocks: bool,
+        pending_auto_login: bool,
+    ) -> (LoginPlan, Option<&'static str>) {
+        let t = &self.profile.template;
+        let require_login = t.platform != "passthrough"
+            && (pending_auto_login
+                || !t.login_regex.is_empty()
+                || t.console_unlock_env
+                    .as_deref()
+                    .is_some_and(|v| !v.is_empty()));
+        let auth = if quiet_blocks || !require_login {
+            (
+                crate::session_auth::SessionAuth::default(),
+                crate::session_auth::AuthResolution {
+                    reason: "not_configured",
+                    env_file_path: None,
+                },
+            )
+        } else {
+            resolve_session_auth(
+                &self.profile,
+                self.deps.env.as_ref(),
+                self.deps.read_env_file.as_ref(),
+            )
+        };
+        choose_login_plan(&self.profile, pending_auto_login, auth, quiet_blocks)
     }
 
     /// `_emit_credentials_unresolved_warning`：`credentials_warned` 去重；WAL META＋daemon stderr。
@@ -2205,19 +2224,6 @@ impl SessionCore {
                 self.profile.com
             )),
         ]
-    }
-
-    /// Slice 2.1 不支援的 profile 能力：daemon stderr 告警（每次自動登入判定一次）。
-    fn unsupported_warning(&self) -> Vec<Effect> {
-        slice21_unsupported_feature(&self.profile)
-            .map(|feature| {
-                Effect::Warn(format!(
-                    "slice-2.1 不支援的 profile 能力（{}: {feature}）；不自動登入",
-                    self.profile.template.profile_name
-                ))
-            })
-            .into_iter()
-            .collect()
     }
 
     fn adopt_bridge(&mut self, now: Mono) {
@@ -2383,7 +2389,7 @@ impl SessionCore {
             f.fsm_gen = self.generations.fsm_gen;
             f.quiet_active = false;
         });
-        let (plan, _) = self.choose_plan(false);
+        let (plan, _) = self.choose_plan(false, false);
         match plan {
             LoginPlan::CredentialsUnresolved { reason, env_file } => {
                 let mut effects = self.credentials_warning(reason, &env_file);
@@ -2394,10 +2400,8 @@ impl SessionCore {
                 effects
             }
             LoginPlan::None => {
-                // Slice 2.1 能力閘：不自動送 TX，誠實回報現況。
-                let mut effects = self.unsupported_warning();
-                effects.extend(self.reprobe_reply(reply, kind, now));
-                effects
+                // 防禦（能力閘已退役，quiet 已於上方處理）：不自動送 TX，誠實回報現況。
+                self.reprobe_reply(reply, kind, now)
             }
             plan => {
                 self.login_run = Some(LoginRun {
@@ -4267,10 +4271,6 @@ impl SessionCore {
             effects.extend(self.finish_reboot_recovery_timeout(now));
             return effects;
         }
-        if slice21_unsupported_feature(&self.profile).is_some() {
-            // Slice 2.1 能力閘：不自動送 TX，等期限收尾。
-            return Vec::new();
-        }
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.deps.fence.with(|f| {
             f.fsm_gen = self.generations.fsm_gen;
@@ -4964,11 +4964,15 @@ impl SessionCore {
 }
 
 /// P7 Task 3 過渡：Task 7 的 login 收斂表（`login_run.rs`）落地前，Task 3 新增的 variant 依 06 既有語意收斂——
-/// `Aborted(_)` 同 06 `refused()`（`NotReady("PROMPT_UNAVAILABLE")`）；`Raised(exc)` 同 attach 失敗
-/// （`Failed("ATTACH_FAILED:{exc}")`，`session_manager.py:2749`）。
+/// `Aborted(Refused|Cancelled)` 同 06 `refused()`（`NotReady("PROMPT_UNAVAILABLE")`，Python `_login_tx_refused`）；
+/// `Aborted(TxIncomplete)`（部分寫出／結果不明）在 Python 是穿出 manager 的 `TxIncompleteError`，同 `Raised`；
+/// `Raised(exc)` 同 attach 失敗（`Failed("ATTACH_FAILED:{exc}")`，`session_manager.py:2749`）。
 fn legacy_login_outcome(result: crate::login_fsm::LoginOutcome) -> crate::login_fsm::LoginOutcome {
-    use crate::login_fsm::LoginOutcome;
+    use crate::login_fsm::{LoginAbort, LoginOutcome};
     match result {
+        LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
+            LoginOutcome::Failed("ATTACH_FAILED:TxIncompleteError".into())
+        }
         LoginOutcome::Aborted(_) => LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
         LoginOutcome::Raised(exc) => LoginOutcome::Failed(format!("ATTACH_FAILED:{exc}")),
         other => other,

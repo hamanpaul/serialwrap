@@ -179,6 +179,10 @@ struct Inner {
     attempts: AtomicU64,
     reject_after: Option<(usize, FenceReject)>,
     partial_on: Option<usize>,
+    /// 審查補測：第 `n` 次 TX 回 `NotSubmitted` 且無 fence 拒絕。
+    not_submitted_on: Option<usize>,
+    /// 審查補測：第 `n` 次 TX 回 `Unknown { confirmed: 0 }`。
+    unknown_on: Option<usize>,
 }
 
 impl Inner {
@@ -227,8 +231,15 @@ impl Inner {
             .lock()
             .unwrap()
             .push((source.to_string(), payload.to_vec(), log));
+        if self.not_submitted_on == Some(n) {
+            self.sent.lock().unwrap().pop();
+            return report(TxOutcome::NotSubmitted, None);
+        }
         if self.partial_on == Some(n) {
             return report(TxOutcome::Completed(1.min(payload.len())), None);
+        }
+        if self.unknown_on == Some(n) {
+            return report(TxOutcome::Unknown { confirmed: 0 }, None);
         }
         let text = String::from_utf8_lossy(payload);
         let cmd = text.strip_suffix('\n').unwrap_or(&text).to_string();
@@ -263,6 +274,10 @@ pub struct LoginRigBuilder {
     idle_s: f64,
     reject_after: Option<(usize, FenceReject)>,
     partial_on: Option<usize>,
+    /// 審查補測：第 `n` 次 TX 回 `NotSubmitted` 且無 fence 拒絕。
+    not_submitted_on: Option<usize>,
+    /// 審查補測：第 `n` 次 TX 回 `Unknown { confirmed: 0 }`。
+    unknown_on: Option<usize>,
     cancel_at_s: Option<f64>,
     class: Option<TxClass>,
 }
@@ -319,6 +334,16 @@ impl LoginRigBuilder {
         self.partial_on = Some(n);
         self
     }
+    /// 第 `n` 次 TX 回 `NotSubmitted`、`reject: None`（不記錄）。
+    pub fn not_submitted_on(mut self, n: usize) -> Self {
+        self.not_submitted_on = Some(n);
+        self
+    }
+    /// 第 `n` 次 TX 回 `Unknown { confirmed: 0 }`（結果不明）。
+    pub fn unknown_on(mut self, n: usize) -> Self {
+        self.unknown_on = Some(n);
+        self
+    }
     /// 虛擬時間 `t` 秒時觸發 `RunCancel`。
     pub fn cancel_at(mut self, t: f64) -> Self {
         self.cancel_at_s = Some(t);
@@ -354,6 +379,8 @@ impl LoginRigBuilder {
             attempts: AtomicU64::new(0),
             reject_after: self.reject_after,
             partial_on: self.partial_on,
+            not_submitted_on: self.not_submitted_on,
+            unknown_on: self.unknown_on,
         });
         let tx_inner = Arc::clone(&inner);
         let nonce_inner = Arc::clone(&inner);

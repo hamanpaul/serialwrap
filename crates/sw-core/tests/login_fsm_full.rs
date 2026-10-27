@@ -652,3 +652,38 @@ fn invalid_regex_raises_immediately() {
     assert_eq!(rig.tx_attempts(), 0, "不送空行與 secret");
     assert!((rig.virtual_elapsed_s() - 5.05).abs() < 1e-6, "{}", rig.virtual_elapsed_s());
 }
+
+#[test] // 審查 60b3dd5：`not_submitted_without_reject_is_cancelled` 實際帶 reject；此處補真正「NotSubmitted 且無 reject」臂
+fn not_submitted_no_reject_aborts_cancelled_without_further_tx() {
+    let sp = brcm();
+    let rig = LoginRig::new()
+        .initial_rx("\r\nLogin: ")
+        .on_eq("", "\r\nLogin: ")
+        .not_submitted_on(2)
+        .build();
+    assert_eq!(
+        ensure_ready(&rig.io(), &sp, &admin_pw(), &empty_env()),
+        LoginOutcome::Aborted(LoginAbort::Cancelled)
+    );
+    assert_eq!(
+        rig.tx_attempts(),
+        2,
+        "NotSubmitted 後不再呼叫 tx（不自動重送）"
+    );
+    assert_eq!(rig.sent_triples().len(), 1);
+}
+
+#[test] // 計畫 Task 3：`Unknown` → `Aborted(TxIncomplete)`，之後不再 TX
+fn unknown_outcome_aborts_tx_incomplete_without_further_tx() {
+    let sp = brcm();
+    let rig = LoginRig::new()
+        .initial_rx("\r\nLogin: ")
+        .on_eq("", "\r\nLogin: ")
+        .unknown_on(2)
+        .build();
+    assert_eq!(
+        ensure_ready(&rig.io(), &sp, &admin_pw(), &empty_env()),
+        LoginOutcome::Aborted(LoginAbort::TxIncomplete)
+    );
+    assert_eq!(rig.tx_attempts(), 2);
+}

@@ -278,3 +278,63 @@ fn matcher_exception_converges_and_stop_warns_after_2s() {
     assert_eq!(ctx.fires().len(), 1);
     assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
 }
+
+#[test] // 審查 de24500：零寬可選擷取群組（`()?`、`(\b)?`…）不得在轉譯時被省略，使後續群組序號錯位；值以 CPython 3.12 實測
+fn groups_zero_width_optional_capture_keeps_index() {
+    for (pattern, first) in [
+        ("()?(a)", Some("")),
+        ("()*(a)", Some("")),
+        ("()??(a)", None),
+        ("(\\b)?(a)", Some("")),
+        ("()*?(a)", None),
+        ("()?+(a)", Some("")),
+    ] {
+        let m = pm("regex", pattern, "").eval("a").unwrap();
+        assert_eq!(m.matched_text, "a", "{pattern}");
+        assert_eq!(
+            m.groups,
+            vec![first.map(str::to_string), Some("a".to_string())],
+            "{pattern}"
+        );
+    }
+}
+
+#[test] // 審查 de24500：cooldown 以任意精度整數比較（Python int），不得因 i128 飽和改變判定；值以 CPython 3.12 實測
+fn cooldown_big_int_exact_not_saturated() {
+    let big = |s: &str| PyInt::Big(s.to_string());
+    let c = |last: PyInt| Counter {
+        fires: PyInt::Small(1),
+        last_fire_ts: Some(last),
+        exhausted: false,
+    };
+    let r = rule(r#"{"cooldown_ms":2000000000000000000000000000000000000000}"#);
+    assert!(!apply_cooldown(
+        &r,
+        &c(big("-1000000000000000000000000000000000000000")),
+        0
+    ));
+    assert!(apply_cooldown(
+        &r,
+        &c(big("-3000000000000000000000000000000000000000")),
+        0
+    ));
+    let r = rule(r#"{"cooldown_ms":10000000000000000000000000000000000000000}"#);
+    assert!(!apply_cooldown(
+        &r,
+        &c(big("10000000000000000000000000000000000000000")),
+        5
+    ));
+    let r = rule(r#"{"cooldown_ms":1000}"#);
+    assert!(apply_cooldown(
+        &r,
+        &c(big("-170141183460469231731687303715884105728")),
+        0
+    ));
+    assert!(!apply_cooldown(
+        &r,
+        &c(big("170141183460469231731687303715884105728")),
+        0
+    ));
+    let r = rule(r#"{"cooldown_ms":170141183460469231731687303715884105728}"#);
+    assert!(!apply_cooldown(&r, &c(PyInt::Small(i128::MIN + 1)), 0));
+}
