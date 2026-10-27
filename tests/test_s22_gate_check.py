@@ -18,7 +18,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "rust" / "s22_gate_check.py"
 
-pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 CARGO_ARGV = ["--workspace", "--features", "test-fakes"]
 PTY_ARGV = ["--package", "sw-pal", "--features", "test-fakes", "--test", "console_conformance", "--", "--ignored", "cap_posix_pty__"]
