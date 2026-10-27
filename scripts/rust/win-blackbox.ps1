@@ -550,17 +550,21 @@ function Start-WindowsComBridge([string]$StagingRepo, [string]$ScratchRoot, [str
     $comRoot = Join-Path $OutputRoot 'windows-com'
     $bridgeRoot = Join-Path $comRoot 'bridge'
     $null = New-Item -ItemType Directory -Path $bridgeRoot -Force
+    # bridge 證據（wire／control.json 皆 fsync）寫在 Windows 本機 scratch，停止後再回寫 OutputRoot：
+    # \\wsl.localhost（9P）上 FlushFileBuffers 失敗時 CRT 一律回 EBADF，曾使 bridge 未建 control.json 即以 exit 3 結束。
+    $localBridgeRoot = Join-Path $ScratchRoot 'windows-com-bridge'
+    $null = New-Item -ItemType Directory -Path $localBridgeRoot -Force
     $bridgeSource = Join-Path $StagingRepo 'tools/uart_stdio_bridge/src'
     $runScript = Join-Path $ScratchRoot 'run-uart-stdio-bridge.py'
     $specPath = Join-Path $ScratchRoot 'run-uart-stdio-bridge.json'
-    $wirePath = Join-Path $bridgeRoot 'wire.ndjson'
-    $controlPath = Join-Path $bridgeRoot 'control.json'
-    $stdoutPath = Join-Path $bridgeRoot 'stdout.log'
-    $stderrPath = Join-Path $bridgeRoot 'stderr.log'
+    $wirePath = Join-Path $localBridgeRoot 'wire.ndjson'
+    $controlPath = Join-Path $localBridgeRoot 'control.json'
+    $stdoutPath = Join-Path $localBridgeRoot 'stdout.log'
+    $stderrPath = Join-Path $localBridgeRoot 'stderr.log'
     $dutArgv = ConvertTo-Json -InputObject @('py', '-3.12', '-m', 'uart_stdio_bridge.dut', '--mode', 'echo') -Compress
     $bridgeArgs = @(
         'run', '--run-id', "g1-$RunId", '--case-id', 'stage1a-windows-com', '--port-id', 'COM0',
-        '--evidence-dir', $bridgeRoot, '--endpoint', 'win-serial', '--com', 'COM21',
+        '--evidence-dir', $localBridgeRoot, '--endpoint', 'win-serial', '--com', 'COM21',
         '--transport-mode', 'virtual_com0com', '--dut-mode', 'local-process', '--dut-argv-json', $dutArgv
     )
     Write-Json $specPath ([ordered]@{ argv = $bridgeArgs })
@@ -599,7 +603,8 @@ raise SystemExit(main(arguments))
                 process = $process
                 python = $pythonExe
                 source = $bridgeSource
-                evidence_dir = $bridgeRoot
+                evidence_dir = $localBridgeRoot
+                output_dir = $bridgeRoot
                 wire = $wirePath
                 control = $controlPath
                 stdout = $stdoutPath
@@ -616,7 +621,40 @@ raise SystemExit(main(arguments))
         & taskkill.exe /PID $process.Id /T /F *> $null
         $null = $process.WaitForExit(10000)
     }
+    $copyErrors = @(Copy-WindowsComBridgeEvidence $localBridgeRoot $bridgeRoot)
+    if ($copyErrors.Count -gt 0) { $reason += "；證據回寫不完整：$($copyErrors -join '；')" }
     throw $reason
+}
+
+function Copy-WindowsComBridgeEvidence([string]$LocalRoot, [string]$OutRoot) {
+    # 整份回寫並逐檔比對 SHA256；有界重試 3 次，任一次全部相符即止。回傳錯誤清單（空＝成功）。
+    $copyErrors = [System.Collections.Generic.List[string]]::new()
+    for ($copyAttempt = 1; $copyAttempt -le 3; $copyAttempt++) {
+        $copyErrors = [System.Collections.Generic.List[string]]::new()
+        try {
+            $null = New-Item -ItemType Directory -Path $OutRoot -Force
+            if (Test-Path -LiteralPath $LocalRoot -PathType Container) {
+                foreach ($file in @(Get-ChildItem -LiteralPath $LocalRoot -Recurse -File -Force)) {
+                    $relative = $file.FullName.Substring($LocalRoot.Length).TrimStart('\', '/')
+                    $copied = Join-Path $OutRoot $relative
+                    $null = New-Item -ItemType Directory -Path (Split-Path -Parent $copied) -Force
+                    Copy-Item -LiteralPath $file.FullName -Destination $copied -Force
+                    if (-not (Test-Path -LiteralPath $copied -PathType Leaf)) {
+                        $copyErrors.Add("回寫缺檔：$relative")
+                    } elseif ((Get-Sha256 $file.FullName) -ne (Get-Sha256 $copied)) {
+                        $copyErrors.Add("回寫 SHA256 不符：$relative")
+                    }
+                }
+            } else {
+                $copyErrors.Add("本機 bridge 證據目錄不存在：$LocalRoot")
+            }
+        } catch {
+            $copyErrors.Add("回寫例外：$($_.Exception.Message)")
+        }
+        if ($copyErrors.Count -eq 0) { break }
+        if ($copyAttempt -lt 3) { Start-Sleep -Milliseconds 500 }
+    }
+    return @($copyErrors)
 }
 
 function Invoke-WindowsComSequence([string]$StagingRepo, [string]$ScratchRoot, [string]$OutputRoot,
@@ -855,17 +893,26 @@ finally:
     if (Test-Path -LiteralPath $Bridge.control -PathType Leaf) {
         Remove-Item -LiteralPath $Bridge.control -Force
     }
+    # 行程結束後才把本機證據回寫 OutputRoot；回寫不完整只會使證據不足，不會放行。
+    $copyErrors = @(Copy-WindowsComBridgeEvidence $Bridge.evidence_dir $Bridge.output_dir)
+    $copyOk = ($copyErrors.Count -eq 0)
     # ExitCode 為 null 時必須判定為失敗（fail closed），不得與 0 比較後被當成通過。
     $processExit = if ($exited) { $Bridge.process.ExitCode } else { $null }
     $processExitKnown = ($null -ne $processExit)
+    $status = if ($controlExit -eq 0 -and $exited -and $processExitKnown -and $processExit -eq 0) { 'PASS' } else { 'FAIL' }
+    if ($status -eq 'PASS' -and -not $copyOk) { $status = 'EVIDENCE-INSUFFICIENT' }
     return [ordered]@{
-        status = if ($controlExit -eq 0 -and $exited -and $processExitKnown -and $processExit -eq 0) { 'PASS' } else { 'FAIL' }
+        status = $status
+        evidence_copy_ok = $copyOk
+        evidence_copy_errors = @($copyErrors)
+        evidence_dir = $Bridge.evidence_dir
+        output_dir = $Bridge.output_dir
         control_exit = $controlExit
         process_exit = $processExit
         process_exit_known = $processExitKnown
         output = @($controlOutput)
-        stdout = $Bridge.stdout
-        stderr = $Bridge.stderr
+        stdout = (Join-Path $Bridge.output_dir 'stdout.log')
+        stderr = (Join-Path $Bridge.output_dir 'stderr.log')
     }
 }
 

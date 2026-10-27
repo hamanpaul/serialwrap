@@ -422,6 +422,46 @@ def test_windows_blackbox_copies_ab_suite_and_dev_bundle_to_outdir():
     assert finally_block.index("Copy-BlackboxDiagnostics") < finally_block.index("Remove-Item -LiteralPath $scratchRoot")
 
 
+def test_windows_com_bridge_evidence_is_local_scratch_with_verified_copy_back():
+    """COM 序列 bridge（`uart_stdio_bridge run`）的 --evidence-dir 與 stdout／stderr 必須位於 Windows 本機 scratch；
+    停止後（以及啟動失敗時）整份回寫 OutputRoot\\windows-com\\bridge 並逐檔比對 SHA256，回寫不符時 bridge stop 不得 PASS。
+
+    回歸：`261027-152902-584296` 的 bridge 已寫出 wire（bridge_start、peer_state）後，`control.json` 未建立即以
+    `HARNESS_DUT_SPAWN_FAILED`／`[Errno 9] Bad file descriptor` 結束（exit 3）。Windows CRT `_commit`（`os.fsync`）在
+    `FlushFileBuffers` 任何失敗時都回 EBADF；當時 evidence dir 位於 \\\\wsl.localhost（9P），與 selftest 曾遇到的 9P 寫入失敗同類。
+    """
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    start = _ps_function(ps1, "Start-WindowsComBridge")
+    start_code = "\n".join(line for line in start.splitlines() if not line.strip().startswith("#"))
+
+    # 1. --evidence-dir、wire、control、stdout、stderr 只能來自本機 scratch。
+    assert "$localBridgeRoot = Join-Path $ScratchRoot 'windows-com-bridge'" in start_code
+    for name in ("wirePath", "controlPath", "stdoutPath", "stderrPath"):
+        assignment = re.search(rf"^\s*\${name} = (.+)$", start_code, re.MULTILINE)
+        assert assignment, name
+        assert "$localBridgeRoot" in assignment.group(1), assignment.group(0)
+    assert "'--evidence-dir', $localBridgeRoot" in start_code
+    assert "'--evidence-dir', $bridgeRoot" not in start_code
+    assert "wsl.localhost" not in start_code.lower()
+
+    # 2. 啟動失敗也先回寫再拋出，保留診斷證據。
+    throw_index = start_code.rindex("throw $reason")
+    assert "Copy-WindowsComBridgeEvidence $localBridgeRoot $bridgeRoot" in start_code[:throw_index]
+
+    # 3. 回寫函式逐檔比對 SHA256。
+    copy = _ps_function(ps1, "Copy-WindowsComBridgeEvidence")
+    assert "Get-Sha256 $file.FullName" in copy and "Get-Sha256 $copied" in copy
+
+    # 4. 停止時在行程結束後回寫；回寫不完整不得 PASS。
+    stop = _ps_function(ps1, "Stop-WindowsComBridge")
+    exit_index = stop.index("$exited = $Bridge.process.WaitForExit(30000)")
+    copy_index = stop.index("Copy-WindowsComBridgeEvidence $Bridge.evidence_dir $Bridge.output_dir")
+    assert exit_index < copy_index, "回寫必須在 bridge 行程結束之後"
+    assert "if ($status -eq 'PASS' -and -not $copyOk) { $status = 'EVIDENCE-INSUFFICIENT' }" in stop
+    assert stop.index("$copyOk = ") < stop.index("if ($status -eq 'PASS' -and -not $copyOk)")
+    assert "evidence_copy_ok" in stop
+
+
 def test_windows_selftest_out_is_local_scratch_with_verified_copy_back():
     """bridge selftest 的 --out 必須位於 Windows 本機 scratch，不得位於 OutputRoot 或網路路徑之下；
     行程結束後須整份回寫 OutputRoot\\windows-com\\bridge-selftest 並逐檔比對 SHA256，資格判定行維持不變。
