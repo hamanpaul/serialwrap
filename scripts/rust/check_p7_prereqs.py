@@ -143,6 +143,13 @@ DIFFERS: list[tuple[str, str, str]] = [
     (f"{PROTO}/pyre/mod.rs", r"^mod parse;", "`pyre::parse` 為私有模組（`parse()` 為 pub(super)，回 `ParsedPattern`）；無 `pyre::sre::SubPattern`"),
 ]
 
+def _shape(pat: str) -> str:
+    """欄位形狀（`X \\{ a: T, b: U \\}`）容忍 rustfmt 換行與尾逗號：空白→`\\s*`、`\\}` 前允許 `,`。"""
+    if r"\{ " not in pat:
+        return pat
+    return pat.replace(r" \}", r",?\s*\}").replace(", ", r",\s*").replace(r"\{ ", r"\{\s*")
+
+
 _FN_TODO = re.compile(r"\b(s21_todo!|todo!|unimplemented!)\s*\(")
 
 
@@ -166,7 +173,7 @@ def check(root: pathlib.Path):
             missing.append((rel, pat or "<檔案存在>", src, task))
             continue
         text = path.read_text(encoding="utf-8")
-        if pat and re.search(pat, text, re.M) is None:
+        if pat and re.search(_shape(pat), text, re.M) is None:
             missing.append((rel, pat, src, task))
             continue
         if fn and _fn_is_skeleton(text, fn):
