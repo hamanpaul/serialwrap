@@ -219,3 +219,52 @@ fn console_methods_no_longer_deferred() {
         assert_eq!(s(&resp, "error_code"), "METHOD_NOT_FOUND", "{m}");
     }
 }
+
+fn session_of(d: &PyDict) -> PyDict {
+    match d.get("session") {
+        Some(PyValue::Dict(x)) => x.clone(),
+        _ => panic!("session：{}", j(d)),
+    }
+}
+
+#[test]
+fn session_public_vtty_is_cached() {
+    let r = ServiceRig::with_console_backend("pty");
+    let a = attach(&r, r#"{"selector":"COM0"}"#);
+    let h1 = s(&a, "vtty");
+    assert_eq!(s(&session_of(&a), "vtty"), h1, "首個 console 設定 vtty");
+    let b = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_ne!(s(&b, "vtty"), h1);
+    let st = r.session("COM0").unwrap();
+    assert_eq!(s(&st, "vtty"), h1, "vtty 不隨第二個 console 改變（D-20）");
+}
+
+#[test]
+fn session_public_console_fields_pty() {
+    let r = ServiceRig::with_console_backend("pty");
+    attach(&r, r#"{"selector":"COM0"}"#);
+    attach(&r, r#"{"selector":"COM0"}"#);
+    let st = r.session("COM0").unwrap();
+    assert_eq!(st.get("console_count"), Some(&PyValue::from(2i64)), "{}", j(&st));
+    assert!(st.get("console_endpoint").is_none(), "PTY 後端無 console_endpoint 鍵");
+}
+
+#[test]
+fn list_prunes_stale_without_peer() {
+    let r = ServiceRig::with_console_backend("pty");
+    let a = attach(&r, r#"{"selector":"COM0","label":"a"}"#);
+    attach(&r, r#"{"selector":"COM0","label":"b"}"#);
+    let held: std::collections::HashSet<String> = [s(&a, "vtty")].into_iter().collect();
+    r.console.as_ref().unwrap().fake.set_held(Some(held));
+    r.clock.advance(Duration::from_millis(2100));
+    let l = r.call("session.console_list", r#"{"selector":"COM0"}"#);
+    let Some(PyValue::List(rows)) = l.get("consoles") else { panic!("consoles") };
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|v| match v {
+            PyValue::Dict(d) => s(d, "label"),
+            _ => panic!("row"),
+        })
+        .collect();
+    assert_eq!(labels, ["a"], "非 primary、逾 2 s、無 peer 者被 prune（RPC 前 ConsoleScan）");
+}
