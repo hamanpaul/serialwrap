@@ -284,6 +284,25 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
     # 替身 helper 與延遲 rename 共用的 lease／break 時點（perf_counter_ns）。
     lease_state: dict[str, int] = {}
 
+    class VirtualPerfClock:
+        """虛擬 perf_counter_ns：每次讀取只前進 1 µs，lease／break／rename 等待改以 advance 推進。
+
+        spike3 的 lease 窗口、break 時點、rotation 請求／完成與 append 延遲樣本全部以
+        ``time.perf_counter_ns`` 計時；改用虛擬時鐘後判定不再依賴真實排程（雲端審查 63d9bdb#1）。
+        """
+
+        def __init__(self) -> None:
+            self.ns = 1_000_000_000
+
+        def __call__(self) -> int:
+            self.ns += 1_000
+            return self.ns
+
+        def advance_s(self, seconds: float) -> None:
+            self.ns += int(seconds * 1_000_000_000)
+
+    vclock = VirtualPerfClock()
+
     class StubHelper:
         def __init__(self, wal_dir, seed, rec, *, oplock=False, variant=None):
             self.rec = rec
@@ -306,7 +325,7 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
         def arm_hold(self, _name):
             self.lease_acquired_ns = time.perf_counter_ns()
             # 常駐模擬高負載：lease 取得到 rotation 請求之間有 30 ms 排程延遲（舊替身 break 寫死 +25 ms 會誤判 INSUFFICIENT）。
-            real_sleep(0.03)
+            vclock.advance_s(0.03)
             # lease 須涵蓋 rotation 請求前的排程延遲；break 由 rename 請求觸發（見 DelayedRenameFs）。
             self.lease_until_ns = self.lease_acquired_ns + 200_000_000
             lease_state["until_ns"] = self.lease_until_ns
@@ -329,7 +348,6 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             )
 
     monkeypatch.setattr(module, "AvHelper", StubHelper)
-    real_sleep = time.sleep
     real_default_wal_fs = wal_fs.default_wal_fs
 
     class DelayedRenameFs:
@@ -342,7 +360,7 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
             if "break_ns" not in lease_state:
                 lease_state["break_ns"] = time.perf_counter_ns()
                 remaining_s = (lease_state["until_ns"] - time.perf_counter_ns()) / 1e9
-                real_sleep(max(0.0, remaining_s) + 0.002)
+                vclock.advance_s(max(0.0, remaining_s) + 0.002)
             return self.delegate.rename_noreplace_or_suffix(src, base_dst)
 
         def __getattr__(self, name):
@@ -350,6 +368,8 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
 
     monkeypatch.setattr(wal_fs, "default_wal_fs", lambda: DelayedRenameFs(real_default_wal_fs()))
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    # module.time 即全域 time 模組；monkeypatch 於測試結束還原 perf_counter_ns。
+    monkeypatch.setattr(module.time, "perf_counter_ns", vclock)
     (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
     status = module._collect_oplock_variant(tmp_path, recorder)
     workload = recorder.observations.get("oplock_variant", {})
@@ -358,8 +378,10 @@ def test_spike3_records_no_delete_primary_and_oplock_variant_separately(monkeypa
         "error": recorder.observations.get("oplock_variant_error"),
         "rotation_requested_ns": workload.get("rotation_requested_ns"),
         "rotation_completed_ns": workload.get("rotation_completed_ns"),
+        "lease_acquired_ns": workload.get("lease_acquired_ns"),
         "lease_until_ns": workload.get("lease_until_ns"),
         "oplock_breaks": workload.get("oplock_breaks"),
+        "append_latency_ms": workload.get("append_latency_ms"),
     }
     assert recorder.observations["av_sim"]["variants"]["oplock"]["share_mode"] == (
         "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"
