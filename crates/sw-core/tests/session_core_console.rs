@@ -580,7 +580,9 @@ fn reap_stale_console_without_holder() {
     let fx = h.scan(Some(&[vtty_of(&a).as_str()]));
     assert_eq!(closes(&fx), ["c2"]);
     assert!(!h.core.human_console().consoles.contains_key("c2"));
-    assert_eq!(h.public().get("console_count"), Some(&PyValue::from(1i64)));
+    let st = h.rpc(SessionRequest::GetState).unwrap();
+    let PyValue::Dict(session) = &st["session"] else { panic!("session") };
+    assert_eq!(session.get("console_count"), Some(&PyValue::from(1i64)));
 }
 
 /// owner／未滿 grace／held=None 不回收。

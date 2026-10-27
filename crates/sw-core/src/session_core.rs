@@ -3,7 +3,7 @@
 //! 型別與公開簽章依 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 11「Produces」與 Task 0 骨架凍結；
 //! 事件處理只更新 session 狀態並產生效果，I/O 由 actor executor 執行。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -392,6 +392,8 @@ pub struct SessionCore {
     hold_release_kick: bool,
     /// 前景命令的 `timeout_s`（human 逾時開 lease 的 `max(timeout_s, hard_timeout_s)`）。
     fg_cmd_timeout_s: f64,
+    /// parity #56：tick 到期還原結算前提交的 interactive 模式命令（出列時回 SESSION_INTERACTIVE_BUSY）。
+    tick_close_interactive: HashSet<String>,
     /// P6 Task 7：P5 既有函式內產生、於本事件結尾併入的效果（LeaseIndex 一律排在 Reply 之前）。
     fx_buf: Vec<Effect>,
     /// P6 Task 7：目前事件的 monotonic 時刻（不帶 `now` 參數的既有 helper 使用）。
@@ -562,6 +564,7 @@ impl SessionCore {
             tick_close_hold: None,
             hold_release_kick: false,
             fg_cmd_timeout_s: 0.0,
+            tick_close_interactive: HashSet::new(),
             fx_buf: Vec::new(),
             now_cache: 0,
             fg_origin: None,
@@ -1846,6 +1849,7 @@ impl SessionCore {
                     return vec![Effect::Reply(reply, Ok(result))];
                 }
             };
+        self.note_tick_close_interactive(&admitted.queued);
         self.queue.push(admitted.queued, &self.deps.registry);
         let mut effects = vec![Effect::Reply(reply, Ok(admitted.response))];
         effects.extend(self.start_next(now));
@@ -3162,6 +3166,13 @@ impl SessionCore {
         }
     }
 
+    /// parity #56：記下 tick 還原 hold 期間提交的 interactive 模式命令（Python 於執行時發現 post-close 仍在而拒絕）。
+    fn note_tick_close_interactive(&mut self, queued: &crate::arbiter::QueuedCommand) {
+        if self.tick_close_hold.is_some() && normalized_mode(&queued.req.mode) == "interactive" {
+            self.tick_close_interactive.insert(queued.cmd_id.clone());
+        }
+    }
+
     fn session_value(&self, now: Mono) -> PyValue {
         PyValue::Dict(self.public(
             now,
@@ -3521,6 +3532,15 @@ impl SessionCore {
                 }
             }
             let grant_cmd = Some(command.cmd_id.clone());
+            if mode == "interactive" && self.tick_close_interactive.remove(&command.cmd_id) {
+                // Python `_execute_command_inner`：`session_id in _interactive_post_close` → SESSION_INTERACTIVE_BUSY。
+                self.deps.registry.complete(
+                    &command.cmd_id,
+                    CmdOutcome::Result(pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" }),
+                    &self.wall_iso(),
+                );
+                continue;
+            }
             if mode == "interactive" {
                 // Python 先 `_begin_foreground_operation_locked`（關 admission）再 `_open_interactive_locked`：
                 // admission 已關時 human owner 只記為 pending，不會搶走現有 raw owner。

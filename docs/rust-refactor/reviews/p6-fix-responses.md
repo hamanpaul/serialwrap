@@ -126,3 +126,58 @@ P6 自有 commit 只有 `f97a208`（merge）與 `ac46a0e`；兩份報告皆 NO F
 | `begin_stop` 的 `owner_gen += 1` | 07 Step 7／D-02 要求刪除 | 保留 06 世代語意（`owner_gen` 屬 P5 擁有的 fence 世代；human 回放只依 `input_epoch` 判定，frozen 期間 human TX 全拒） | BLOCKED-OWNER：待擁有者簽核是否刪除 |
 | executor 接線與 PumpFull 一格重試槽 | 07 D-15(5) | 產品 executor 尚未存在（06 T15+），`HumanTxPump` 只在測試 `RigExec` 接線；STEP 2 合併 P5 T15～T19 後於 Task 10／11 接上並補重試槽 | 待辦（本輪 STEP 2 追蹤） |
 | `ControlEvent::ConsoleAttachReq` envelope | 07 Task 10 Step 3 第 2 點：RPC thread 以 envelope 送 `PtyPair`，actor 層拆封存 executor `pending_pty` | 改為 manager 端每 session 的 `SessionIo.pending_pty`（RPC thread 插入 token→PtyPair，再送 `SessionRequest::ConsoleAttach{pty: Some(PtyInfo)}`；executor 依 `ConsoleAdopt`／`ConsoleDiscard` 取走或丟棄，request 失敗時 RPC thread 丟棄殘留），移除 envelope 變體。core 只見 `PtyInfo` 與計畫一致；fd 不洩漏由 `attach_rejected_discards_pty` 鎖住 | 待審查簽核 |
+
+## 1f1fa67..4f710c3（`1f1fa67_4f710c3-{opus,grok}.md`）
+
+| # | 等級 | Commit | 位置 | 處理 |
+|---|---|---|---|---|
+| R2-1 | High（grok）／Medium（opus） | 6eafa6a | `lease_p6.rs` READY／ATTACHED refresh 後撤銷剛建立的回放 | fixed（見下） |
+| R2-2 | High（grok） | 6eafa6a | HumanConsole 命令逾時回 PROMPT_TIMEOUT | fixed 8c8f06d（同上一輪 #4） |
+| R2-3 | Medium | 3535943 | 計畫必要測試缺：`human_timeout_promoted_only_for_internal_origin` | fixed 38c3cb6／8c8f06d |
+| R2-4 | Medium | 3535943 | 缺 `status_not_ready_without_bridge` | fixed 5e682eb（見下理由：Python 該路徑回 INTERACTIVE_NOT_FOUND） |
+| R2-5 | Medium | 3535943 | #108 兩案（`windows_tcp_attach_console_does_not_open_lease`、`transfer_suspend_defers_existing_human_window`） | deferred：前者為 Windows TCP console（Task 10 後段，LOCAL-WINDOWS-TODO）；後者依 P8 file transfer。不以恆紅 `todo!` 測試進凍結分母（會讓 s22 gate 在上游交付前恆紅），列入本表待擁有者簽核移列 |
+| R2-6 | Medium | 3535943 | `send_checks_order` 缺 DETACHED 案、FLASHING 未驗零 TX | fixed 5e682eb：FLASHING 補零 TX；DETACHED 見 R2-4 |
+| R2-7 | Medium | 6eafa6a | #56 tick 還原期間 interactive 模式命令未回 SESSION_INTERACTIVE_BUSY | fixed（見下） |
+| R2-8 | High（opus） | 4f710c3 | core 未實作 hub 掃描 reap（`reap_stale_consoles`） | fixed（見下） |
+| R2-9 | Medium | 17270a4 | `consoles_survive_conn_epoch_change` 未模擬 epoch 變更 | 待下一組 commit |
+| R2-10 | Medium | 17270a4 | `reader_hub_full_does_not_block` 門檻 10→50 ms | 待下一組 commit |
+| R2-11 | Medium | 17270a4／4f710c3 | `console_hub.rs:103` 上界 64→64+2 | 待下一組 commit |
+| R2-12 | Medium | 17270a4 | `sentinel_*` 舊契約凍結進 L1 | 待下一組 commit |
+| R2-13 | Medium | 4f710c3 | pending 滿時 POLLIN 未關，hub 空轉 | 待下一組 commit |
+| R2-14 | Medium | 4f710c3 | `maybe_scan` 無視 pending 上限 | 待下一組 commit |
+| R2-15 | Medium | 4f710c3 | hub 未接入 production、changelog 寫成已交付；`uart_bridge.rs:342` 註解 | fixed 1fb9612（ManagerExec 接 hub／pump／LeaseIndex）、03ba902（哨兵 primary） |
+| R2-L | Low | 多處 | `open_with_command_reply_waits_tx_and_expired_maps` 零 TX、`refresh_closes_when_owner_mismatch` 放寬、ATTACHED 無條件 revoke（fixed，見 R2-1）、AdoptPty 失敗 phantom、`critical_close_when_cmd_queue_full`／`no_peer_pty_display_cleared_after_grace`／mux stop 分支 | ATTACHED revoke 已併入 R2-1；其餘 deferred 至下一輪 |
+
+### R2-1：refresh 惰性結束過期 lease 後同一次 open 撤銷回放（有效）
+
+Python 基線：`interactive_open` READY 分支 `_refresh_interactive_locked` 回 `post.needs_resume` 時 `retry_after_post`
+（`session_manager.py:6849-6851`、ATTACHED `:6946-6948`），`post.execute()` 先同步把 deferred 的 `Q` 寫上 UART，才重新評估。
+具體輸入：READY、c1 human lease；agent A `open(timeout=1.0)` soft preempt；c1 打 `Q`；時鐘前進 1.5 s（未投遞 Tick）；
+agent B `open`。修正前 Rust：B 回 `soft_preempted:true`，`Q` 被 `ReplayRevoked` 重新 defer。
+修正：Rust 的回放為非同步（HumanReplay hold），無法在同一次呼叫內完成；依 D-22(2)「hold 期間 READY open 回 SESSION_BUSY」，
+refresh 後若有未撤銷 hold 回 `SESSION_BUSY`（tick 還原 hold 回 `SESSION_INTERACTIVE_BUSY`），不 revoke、不 preempt；
+結算後下一次 open 才 preempt（UART 先有 `Q`）。ATTACHED 分支同理（只比對 refresh 前後新建的 hold，保留 D-22(4) 對既有在途回放的撤銷），
+並把 `revoke_replay` 移到確定開 lease 的分支內（opus Low #3）。回歸：`refresh_created_replay_hold_blocks_reopen`。
+
+### R2-4／R2-6：bridge 不存在時 send／status（部分 rejected）
+
+Python 基線：bridge 掉線的 detach 路徑 `session_manager.py:2518-2522` 會 `self._interactive.pop(session.interactive_session_id)`
+並清 `interactive_session_id`，之後 `interactive_send`／`status` 以 `_interactive.get(id)` 查無 → `INTERACTIVE_NOT_FOUND`。
+具體輸入：READY、agent `open` 得 id、bridge IoError drain；`send(id,"x")`。Python：`{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND",
+"interactive_id":id}`；Rust（drain Phase 1 清 lease）相同。審查要求的 `SESSION_NOT_READY` 需要「lease 存在但 bridge 為 None」，
+此路徑在 Python 與 Rust 皆不可達，故以 INTERACTIVE_NOT_FOUND＋零 TX 鎖定 parity，不改產品碼。
+
+### R2-7：#56 tick 還原期間的 interactive 模式命令（有效）
+
+Python 基線：`_execute_command_inner` interactive 分支 `session_id in _interactive_post_close` → `{"ok":false,
+"error_code":"SESSION_INTERACTIVE_BUSY"}`（`:6407`）。Rust 的 tick 還原 hold 使佇列不出列，命令在結算後才執行，Python 則在 post-close
+期間執行並拒絕。修正：hold 期間提交（RPC 與 line editor）的 interactive 模式命令記入 `tick_close_interactive`，出列時直接以
+SESSION_INTERACTIVE_BUSY 完成、不開 lease。human 逾時升格路徑原本即經 `human_promote_lease` 檢查 `tick_close_hold`。
+回歸：`interactive_command_during_tick_close_is_busy`。
+
+### R2-8：core reap（有效）
+
+Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspended owner、`now-attached_at >= 2.0 s`、slave 不在 held → pop、
+清 deferred、primary 轉給剩下第一個。修正：`console_scan` 的 Hub 分支先 `reap_stale_consoles`（held=None 不剪），再 peer grace／self-heal；
+被回收者清 deferred、lane backlog（結算所屬 replay hold）、移除並發 `ConsoleClose`。
+回歸：`reap_stale_console_without_holder`、`reap_skips_owner_young_and_unknown_scan`、`reap_dead_primary_transfers_primary`。

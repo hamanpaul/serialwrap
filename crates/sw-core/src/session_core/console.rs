@@ -668,6 +668,7 @@ impl SessionCore {
             .admit(req, self.queue_registered, cmd_id, &self.wall_iso())
         {
             Ok(admitted) => {
+                self.note_tick_close_interactive(&admitted.queued);
                 self.queue.push(admitted.queued, &self.deps.registry);
                 fx.extend(self.start_next(now));
             }
@@ -760,11 +761,44 @@ impl SessionCore {
             };
             peer_present.insert(cid.clone(), present);
         }
+        let mut fx = Vec::new();
         if matches!(source, crate::human_console::ScanSource::Hub) {
-            // 07 Task 7 Step 4／5：peer grace 與 self-heal（reap 屬 Task 9）。
+            // 07 Task 9 Step 3.4：先 reap（Python `reap_stale_consoles`，#76），再做 Task 7 的 peer grace 與 self-heal。
+            if let Some(held) = scan.held.as_ref() {
+                self.reap_stale_consoles(held, now, &mut fx);
+            }
             self.after_console_scan(now);
         }
-        Vec::new()
+        fx
+    }
+
+    /// `uart_io.py:1458-1507`：回收非 internal、PTY、非 owner／suspended owner、已滿 `STALE_CONSOLE_GRACE_S`、
+    /// 不在 held 的 console；primary 被回收時轉給剩下的第一個（`remove_console`）。`held=None`（掃描失敗）不回收。
+    fn reap_stale_consoles(&mut self, held: &std::collections::HashSet<String>, now: Mono, fx: &mut Vec<Effect>) {
+        let human_cid = |o: &Option<String>| o.as_deref().and_then(|o| o.strip_prefix("human:")).map(str::to_string);
+        let protected = [
+            human_cid(&self.human.ownership.interactive_owner),
+            human_cid(&self.human.ownership.suspended_owner),
+        ];
+        let grace = super::lease_p6::secs_to_ns(sw_proto::constants::STALE_CONSOLE_GRACE_S);
+        let stale: Vec<String> = self
+            .human
+            .consoles
+            .values()
+            .filter(|c| !c.internal && c.kind == ConsoleTransportKind::Pty)
+            .filter(|c| !protected.iter().any(|p| p.as_deref() == Some(c.client_id.as_str())))
+            .filter(|c| now.saturating_sub(c.attached_at) >= grace)
+            .filter(|c| !held.contains(&c.vtty))
+            .map(|c| c.client_id.clone())
+            .collect();
+        for cid in stale {
+            self.human.deferred_mut().remove_client(&cid);
+            let removed = self.human.lane.remove_client(&cid);
+            self.settle_removed_replays(&removed);
+            self.human.remove_console(&cid);
+            self.human.peer_present.remove(&cid);
+            fx.push(Effect::ConsoleClose { client_id: cid });
+        }
     }
 
     /// `SessionRequest::ConsoleAttach`（PTY；`attach_console`，`session_manager.py:6740-6773`）。
@@ -888,6 +922,7 @@ impl SessionCore {
         self.human.replay_hold = None;
         self.human.replay_after_revoked = false;
         self.tick_close_hold = None;
+        self.tick_close_interactive.clear();
         self.fg_adm = None;
         self.fg_origin = None;
         self.self_test_suspended = false;

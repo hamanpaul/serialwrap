@@ -14,7 +14,7 @@ use crate::lease::{lease_context, PostClose};
 use crate::rescue::{classify_attached_rescue, RescueClass};
 use crate::uart_bridge::WorkerSnapshot;
 
-fn secs_to_ns(s: f64) -> u64 {
+pub(super) fn secs_to_ns(s: f64) -> u64 {
     (s.max(0.0) * 1_000_000_000.0) as u64
 }
 
@@ -327,6 +327,14 @@ impl SessionCore {
                 return Err(self.selector_error("SESSION_BUSY"));
             }
             self.refresh_lease_p6(now);
+            // Python `post.needs_resume → retry`：refresh 若惰性結束過期 lease 並建立回放 hold（或 tick 還原），
+            // 本次不再 soft preempt（否則 revoke 會撤銷剛建立的回放），依 D-22(2) 回 busy；結算後下一次 open 再評估。
+            if self.tick_close_hold.is_some() {
+                return Err(self.busy_reply());
+            }
+            if self.foreground_busy() {
+                return Err(self.selector_error("SESSION_BUSY"));
+            }
             let mut result;
             match self.lease.as_ref() {
                 Some(existing) => {
@@ -384,15 +392,31 @@ impl SessionCore {
         if self.tick_close_hold.is_some() {
             return Err(self.busy_reply());
         }
+        let replay_before = self.human.replay_hold.as_ref().map(|h| h.hold_id);
         self.refresh_lease_p6(now);
-        let clamped = timeout_s.min(MAX_RECOVERY_LEASE_S);
-        // D-22(4)：ATTACHED 救援分支不判前景（Python parity），開 lease 前撤銷回放授權。
-        if !owner.starts_with("human:") {
-            self.revoke_replay();
+        // Python ATTACHED 分支 `post.needs_resume → retry_after_post`：refresh 本身建立的回放（或 tick 還原）結算前
+        // 本輪不開新 lease，避免撤銷剛排出的回放。
+        if self.tick_close_hold.is_some() {
+            return Err(self.busy_reply());
         }
+        let replay_after = self.human.replay_hold.as_ref().filter(|h| !h.revoked).map(|h| h.hold_id);
+        if replay_after.is_some() && replay_after != replay_before {
+            return Err(self.selector_error("SESSION_BUSY"));
+        }
+        let clamped = timeout_s.min(MAX_RECOVERY_LEASE_S);
+        // D-22(4)：ATTACHED 救援分支不判前景（Python parity），確定開 lease 時才撤銷回放授權。
+        let revoke = !owner.starts_with("human:");
         let id = match self.lease.as_ref() {
-            None => self.open_lease_full(owner, clamped, true, false, now),
+            None => {
+                if revoke {
+                    self.revoke_replay();
+                }
+                self.open_lease_full(owner, clamped, true, false, now)
+            }
             Some(existing) if existing.is_human() => {
+                if revoke {
+                    self.revoke_replay();
+                }
                 self.stash_human_and_suspend();
                 self.open_lease_full(owner, clamped, true, true, now)
             }
