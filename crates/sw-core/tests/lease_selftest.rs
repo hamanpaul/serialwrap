@@ -6,6 +6,8 @@
 
 #![cfg(feature = "test-fakes")]
 
+#[allow(dead_code)]
+mod common;
 mod support;
 
 use std::collections::HashMap;
@@ -935,8 +937,7 @@ fn selftest_quiet_armed_during_submit_counts_committed() {
 #[test]
 fn selftest_probe_other_reject_zero_tx_matches_python() {
     let golden_text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../contracts/golden/selftest_refused.json"),
+        common::repo_path("contracts/golden/selftest_refused.json"),
     )
     .expect("golden");
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
@@ -1252,8 +1253,7 @@ fn selftest_probe_drain_race_golden() {
     // R5 審查後續：drain（release）與 probe 提交競態——結果只有「probe 已提交（回 nonce 結果）」或
     // 「零 TX＋golden 碼（drain → EXCEPTION `tx incomplete: not_submitted 0/23 draining`）」兩種。
     let golden_text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../contracts/golden/selftest_refused.json"),
+        common::repo_path("contracts/golden/selftest_refused.json"),
     )
     .expect("golden");
     let PyValue::Dict(golden) = loads(&golden_text).expect("json") else {
