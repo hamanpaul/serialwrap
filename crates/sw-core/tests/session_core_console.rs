@@ -438,3 +438,95 @@ fn reboot_command_invalidates_before_send() {
     let fx = h.input_with("c1", life, e0, b"k");
     assert!(human_txs(&fx).is_empty(), "reboot 前擷取的輸入一律 stale");
 }
+
+// ---------------------------------------------------------------------------
+// p6-cloud 審查回歸（ac46a0e..1f1fa67）
+// ---------------------------------------------------------------------------
+
+/// High（1f1fa67）：reboot 送出後 arm quiet 時再失效一次（Python `arm_boot_quiet` → `invalidate_deferred("boot_quiet")`）。
+#[test]
+fn reboot_tx_settled_invalidates_again_on_quiet_arm() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    let e0 = h.core.generations().input_epoch;
+    let started = h.start_foreground_command("reboot");
+    assert_eq!(h.core.generations().input_epoch, e0 + 1);
+    h.input("c1", b"k"); // agent 命令 suspend 中 → deferred（epoch e0+1）
+    assert_eq!(h.deferred_len("c1"), 1);
+    let epoch = h.epoch();
+    h.feed(ControlEvent::UartTxCompleted {
+        epoch,
+        op_id: started.op_id,
+        confirmed_bytes: 7,
+        unknown: false,
+    });
+    assert_eq!(h.core.generations().input_epoch, e0 + 2, "arm quiet 為第二個失效點");
+    assert_eq!(h.fence.with(|f| f.input_epoch), e0 + 2);
+    assert_eq!(h.deferred_len("c1"), 0, "reboot 在途期間的按鍵被清掉");
+    let fx = h.feed(ControlEvent::OpFinished {
+        op_id: started.op_id,
+        epoch,
+        outcome: OpOutcome::RebootExpected,
+        after_rx_seq: None,
+    });
+    assert!(
+        human_txs(&fx).iter().all(|(_, _, p)| p != b"k"),
+        "resume 不得回放 k：{:?}",
+        human_txs(&fx)
+    );
+}
+
+/// 對照：reboot TX 完全未送出（confirmed 0、非 unknown）時不 arm、不做第二次失效。
+#[test]
+fn reboot_tx_not_submitted_no_second_invalidation() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    let e0 = h.core.generations().input_epoch;
+    let started = h.start_foreground_command("reboot");
+    h.input("c1", b"k");
+    let epoch = h.epoch();
+    h.feed(ControlEvent::UartTxCompleted {
+        epoch,
+        op_id: started.op_id,
+        confirmed_bytes: 0,
+        unknown: false,
+    });
+    assert_eq!(h.core.generations().input_epoch, e0 + 1);
+    assert_eq!(h.deferred_len("c1"), 1);
+    assert!(!h.fence.with(|f| f.quiet_active));
+}
+
+/// Medium（2f4f76a）：interactive 模式先關 admission 再開 lease（Python `_begin_foreground_operation_locked`
+/// 先於 `_open_interactive_locked`）；第二個 console 的 interactive 命令只把自己記為 pending owner。
+#[test]
+fn interactive_line_command_does_not_steal_raw_owner() {
+    let mut h = ready_with_tcp(&["c1", "c2"]);
+    assert_eq!(owner(&h).as_deref(), Some("human:c1"));
+    let fx = h.input("c2", b"vi\r");
+    assert_eq!(start_ops(&fx).len(), 1, "interactive 命令出列");
+    assert_eq!(owner(&h).as_deref(), Some("human:c1"), "raw owner 仍是 c1");
+    assert_eq!(
+        h.core.human_console().ownership.pending_owner.as_deref(),
+        Some("human:c2")
+    );
+    // c1 的按鍵仍以 raw 路徑處理（admission 關 → defer），不會走 line editor 成為命令。
+    let before = h.reg.records_for_test().len();
+    h.input("c1", b"ls\r");
+    assert_eq!(h.reg.records_for_test().len(), before, "c1 的輸入不得被當成命令送出");
+}
+
+/// Medium（2f4f76a）：空命令的 interactive 也要成對 begin／finish（admission 恢復開放）。
+#[test]
+fn empty_interactive_command_reopens_admission() {
+    let mut h = ready_with_tcp(&["c1"]);
+    let (resp, _fx) = h.rpc_full(SessionRequest::Submit({
+        let mut r = agent_submit("");
+        r.mode = "interactive".into();
+        r
+    }));
+    assert_eq!(resp.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    assert!(!h.fence.with(|f| f.human_admission_blocked), "admission 應恢復開放");
+    assert!(!h.core.human_console().ownership.admission_blocked);
+}

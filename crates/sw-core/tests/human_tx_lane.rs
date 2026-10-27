@@ -228,6 +228,7 @@ fn human_tx_settles_ledger_each_chunk() {
     h.set_auto_complete_human_tx(true);
     let mut settles = 0usize;
     let mut ops = Vec::new();
+    let mut settled_ops = Vec::new();
     for _ in 0..1000 {
         let fx = h.input("c1", b"k");
         for e in &fx {
@@ -236,6 +237,7 @@ fn human_tx_settles_ledger_each_chunk() {
                 Effect::SettleTx { op_id, .. } => {
                     settles += 1;
                     assert!(ops.contains(op_id));
+                    settled_ops.push(*op_id);
                 }
                 _ => {}
             }
@@ -243,4 +245,146 @@ fn human_tx_settles_ledger_each_chunk() {
     }
     assert_eq!(ops.len(), 1000);
     assert_eq!(settles, 1000, "每個 HumanTxCompleted 恰一個 SettleTx（D-15(6)）");
+    assert_eq!(settled_ops, ops, "SettleTx 的 op_id 與各 HumanTx permit 一一對應（不重複、不遺漏）");
+}
+
+// ---------------------------------------------------------------------------
+// p6-cloud 審查回歸（ac46a0e..1f1fa67）
+// ---------------------------------------------------------------------------
+
+/// High（2f4f76a）：revoked 在途回放結算時，若新前景命令已出列，延後的回放不得在命令執行中送出。
+#[test]
+fn deferred_replay_after_revoked_waits_for_idle_foreground() {
+    use sw_core::mailbox::ControlEvent;
+    use sw_core::op_runner::OpOutcome;
+    use sw_proto::pydict;
+    let mut h = manual_lease();
+    let (adm, _) = h.fg_begin(true);
+    h.input("c1", b"x");
+    h.fg_finish(adm); // x 以 HumanReplay 在途
+    let (adm2, _) = h.fg_begin(true); // 撤銷
+    h.input("c1", b"n");
+    h.fg_finish(adm2); // revoked 在途 → 延後
+    let c = h.start_foreground_command("echo c");
+    let fx = h.complete_human_tx(TxOutcome::NotSubmitted, Some(FenceReject::ReplayRevoked));
+    assert!(human_txs(&fx).is_empty(), "前景命令執行中不得回放：{:?}", human_txs(&fx));
+    assert_eq!(h.fence_replay_auth(), None, "命令執行中不得授權回放");
+    assert_eq!(h.deferred_len("c1"), 2, "x、n 仍留在 deferred");
+    let epoch = h.epoch();
+    let fx = h.feed(ControlEvent::OpFinished {
+        op_id: c.op_id,
+        epoch,
+        outcome: OpOutcome::CommandResult(pydict! { "ok" => true, "stdout" => "c" }),
+        after_rx_seq: None,
+    });
+    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"xn".to_vec())]);
+    let order = h.tx_order();
+    let pos_cmd = order.iter().position(|(c, p)| *c == TxClass::Command && p == b"echo c\n").unwrap();
+    let pos_xn = order.iter().position(|(c, p)| *c == TxClass::HumanReplay && p == b"xn").unwrap();
+    assert!(pos_cmd < pos_xn, "回放在命令之後：{order:?}");
+}
+
+/// High（2f4f76a）：斷線刪掉 backlog 中的回放時要結算 hold，佇列不得永久卡住。
+#[test]
+fn disconnect_settles_backlogged_replay_hold() {
+    let mut h = manual(&["c1", "c2"]);
+    let (adm, _) = h.fg_begin(false);
+    h.input("c1", b"x");
+    h.seed_deferred("c2", b"y");
+    h.fg_finish(adm);
+    assert_eq!(h.replay_hold().unwrap().remaining, 2);
+    h.disconnect("c2");
+    h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert_eq!(h.replay_hold(), None, "c2 的回放已隨斷線刪除，hold 應釋放");
+    assert_eq!(h.fence_replay_auth(), None);
+    assert!(!h.foreground_busy(), "hold 釋放後前景不忙");
+    let c = h.start_foreground_command("echo after");
+    let _ = c;
+}
+
+/// High（2f4f76a）：backlog 溢位清掉某 client 的回放時同樣要結算 hold，且 hold 釋放後佇列可出列。
+#[test]
+fn overflow_settles_backlogged_replay_hold() {
+    let mut h = manual(&["c1", "c2"]);
+    let (adm, _) = h.fg_begin(false);
+    h.input("c1", b"x");
+    h.seed_deferred("c2", b"y");
+    h.fg_finish(adm);
+    assert_eq!(h.replay_hold().unwrap().remaining, 2);
+    // c2 的 "y" 回放在 backlog；c2 後續輸入排在其後直到溢位、整段清空（含 y）。
+    let chunk = vec![b'z'; 8192];
+    let mut sent = 0usize;
+    while sent <= HUMAN_TX_BACKLOG_MAX_BYTES {
+        h.input("c2", &chunk);
+        sent += chunk.len();
+    }
+    assert!(h.warns().iter().any(|w| w.contains("human TX backlog") && w.contains("client_id=c2")));
+    let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert!(human_txs(&fx).is_empty(), "c2 的 backlog 已清空：{:?}", human_txs(&fx).len());
+    assert_eq!(h.replay_hold(), None, "hold 應釋放");
+    assert!(!h.foreground_busy());
+}
+
+/// Medium（8fdf62f）：溢位只清該 client（含觸發的那一筆），其他 client 的 backlog 保留。
+#[test]
+fn backlog_overflow_clears_only_that_client() {
+    let mut h = manual(&["c1", "c2"]);
+    h.input("c1", b"a"); // c1 在途、不結算
+    let (adm, _) = h.fg_begin(false);
+    h.seed_deferred("c2", b"q");
+    let _ = adm; // c2 的 q 以 owner 外 client 的 deferred 保留，稍後回放
+    let chunk = vec![b'z'; 8192];
+    let mut sent = 0usize;
+    while sent <= HUMAN_TX_BACKLOG_MAX_BYTES {
+        h.input("c1", &chunk);
+        sent += chunk.len();
+    }
+    assert!(h.warns().iter().any(|w| w.contains("human TX backlog") && w.contains("client_id=c1")));
+    let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert!(
+        human_txs(&fx).iter().all(|(_, src, _)| src != "human:c1"),
+        "c1 的 backlog 應整段清空：{} 筆",
+        human_txs(&fx).len()
+    );
+    assert_eq!(h.deferred_len("c2"), 1, "其他 client 不受影響");
+}
+
+/// Medium（8fdf62f）：真 actor＋TxWriter 下，1000 個按鍵的 op 逐一結算、帳本 2 s 內歸 0。
+#[test]
+fn human_tx_ledger_drains_after_1000_keys() {
+    use std::time::{Duration, Instant};
+    use sw_core::mailbox::{ControlEvent, DataEvent};
+    let rig = ActorRig::new(SHELL_PROFILE).ready();
+    rig.send_control(ControlEvent::ConsoleConnected {
+        client_id: "c1".into(),
+        client_lifetime: 1,
+        label: "127.0.0.1:50000".into(),
+        vtty: "127.0.0.1:50000".into(),
+        kind: ConsoleTransportKind::TcpTelnet,
+    });
+    let _ = rig.get_state();
+    for _ in 0..1000 {
+        let epoch = rig.fence.with(|f| f.input_epoch);
+        rig.data_sender()
+            .send(DataEvent::ConsoleInputBytes {
+                client_id: "c1".into(),
+                client_lifetime: 1,
+                input_epoch: epoch,
+                bytes: b"k".to_vec(),
+            })
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rig.wal_tx_payloads().iter().filter(|p| p.as_slice() == b"k").count() < 1000 {
+        assert!(Instant::now() < deadline, "1000 個按鍵未全部寫出");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let settle_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if rig.tx_ledger_gauge().live_ops == 0 {
+            break;
+        }
+        assert!(Instant::now() < settle_deadline, "最後結算後 2 s 內 live_ops 應歸 0：{:?}", rig.tx_ledger_gauge().live_ops);
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

@@ -957,3 +957,90 @@ fn console_list_shape_sorted_and_prunes_stale() {
     let PyValue::Dict(c1) = &rows[1] else { panic!() };
     assert_eq!(wire(c1), r#"{"client_id":"c1","label":"c1","vtty":"/dev/pts/101","interactive_owner":true}"#);
 }
+
+/// High（2f4f76a）：line editor（`SubmitOrigin::HumanConsole`）命令逾時改開 human lease，不走 agent 救援。
+#[test]
+fn human_timeout_promoted_only_for_internal_origin() {
+    let mut h = ready();
+    h.connect_stream_console("c1", ConsoleTransportKind::TcpTelnet);
+    h.connect_stream_console("c2", ConsoleTransportKind::TcpTelnet);
+    let fx = h.input("c2", b"ls\r");
+    let grant = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("ls 出列");
+    finish_op(&mut h, &grant, OpOutcome::PromptTimeout { stdout: String::new() });
+    assert_eq!(h.core.state(), SessionState::Ready, "human 逾時不轉 ATTACHED");
+    let lease = h.core.active_lease().expect("human lease");
+    assert_eq!(lease.owner, "human:c2");
+    let row = h.last_human_command().unwrap();
+    assert_eq!(row["recovery_action"], PyValue::from("PROMOTE_HUMAN_INTERACTIVE"));
+    assert_eq!(row["partial"], PyValue::Bool(true));
+    assert_eq!(row["execution_mode"], PyValue::from("interactive"));
+    assert_eq!(row["interactive_session_id"], PyValue::from(lease.interactive_id.clone()));
+
+    // 對照：RPC 來源即使 source 為 `human:x` 仍走 agent 分支（DF-02）。
+    let mut h = ready();
+    let (resp, fx) = h.rpc_full(SessionRequest::Submit({
+        let mut r = agent_submit("ls");
+        r.source = "human:x".into();
+        r
+    }));
+    assert_eq!(resp.unwrap().get("ok"), Some(&PyValue::Bool(true)));
+    let grant = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartOp { grant, .. } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("ls 出列");
+    finish_op(&mut h, &grant, OpOutcome::PromptTimeout { stdout: String::new() });
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert!(h.core.active_lease().is_none());
+}
+
+/// High（2f4f76a）：真 OpRunner 下，line editor 命令逾時不送 CTRL-C／CTRL-D。
+#[test]
+fn human_line_timeout_sends_no_rescue_keys() {
+    use std::time::Instant;
+    use sw_core::mailbox::DataEvent;
+    let rig = ActorRig::new(SHELL_PROFILE).ready();
+    for (cid, life) in [("c1", 1u64), ("c2", 2u64)] {
+        rig.send_control(ControlEvent::ConsoleConnected {
+            client_id: cid.into(),
+            client_lifetime: life,
+            label: format!("127.0.0.1:5000{life}"),
+            vtty: format!("127.0.0.1:5000{life}"),
+            kind: ConsoleTransportKind::TcpTelnet,
+        });
+    }
+    let _ = rig.get_state();
+    let epoch = rig.fence.with(|f| f.input_epoch);
+    rig.data_sender()
+        .send(DataEvent::ConsoleInputBytes {
+            client_id: "c2".into(),
+            client_lifetime: 2,
+            input_epoch: epoch,
+            bytes: b"ls\r".to_vec(),
+        })
+        .unwrap();
+    rig.wait_for("ls 寫出", |r| r.wal_tx_payloads().iter().any(|p| p == b"ls\n"));
+    std::thread::sleep(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = rig.get_state();
+        if st.get("interactive_session_id").is_some_and(|v| !v.is_null()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "逾時後應開 human lease：{st:?}");
+        rig.clock.advance(Duration::from_millis(500));
+        rig.send_control(ControlEvent::Tick);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let payloads = rig.wal_tx_payloads();
+    assert!(!payloads.iter().any(|p| p == b"\x03" || p == b"\x04"), "human 命令不得送救援鍵：{payloads:?}");
+    assert_eq!(rig.get_state()["state"], PyValue::from("READY"));
+}
