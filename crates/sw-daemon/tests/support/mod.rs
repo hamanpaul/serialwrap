@@ -391,6 +391,11 @@ impl DaemonProc {
         }
     }
 
+    /// 行程是否仍在執行（未結束）。
+    pub fn try_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     /// 等待行程結束；逾時 panic（不留下殘留行程：Drop 會 kill）。
     pub fn wait(&mut self, timeout: Duration) -> ExitStatus {
         let deadline = Instant::now() + timeout;

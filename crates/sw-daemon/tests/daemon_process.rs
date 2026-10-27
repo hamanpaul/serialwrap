@@ -495,6 +495,10 @@ fn wal_fault_after_ready_splits_agent_and_auto_tx() {
 
 #[test]
 fn daemon_stop_during_force_recover_with_client_gone() {
+    // P5-T19 修正（與計畫 Review Focus 5 衝突，依 OD-14 #1 以 Python 行為為準，待擁有者確認）：
+    // Python 基線實測——同連線 pipelining `session.recover --force`＋`daemon.stop` 後 client 立即斷線：
+    // recover handler 照常跑完，其回應寫入失敗（EPIPE）後連線關閉，管線中的 `daemon.stop` 不被處理，daemon 持續運作；
+    // 之後經新連線送 `daemon.stop` 才有序停機（exit 0、socket 檔移除）。
     let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");
@@ -506,20 +510,33 @@ fn daemon_stop_during_force_recover_with_client_gone() {
         r#"{"id":3,"method":"session.recover","params":{"selector":"COM0","force":true}}"#,
         STOP
     );
-    let started = Instant::now();
     send_and_drop(&env.socket, &payload); // 送出後立即斷線
 
-    // handler 不因斷線取消；停機在 handler 收斂後進行，15 s 內 exit 0。
-    let status = d.wait(Duration::from_secs(15));
-    assert_eq!(status.code(), Some(0));
-    assert!(started.elapsed() <= Duration::from_secs(15));
+    // recover handler 不因斷線取消：等它收斂（force recover 最多等 READY 10 s；COM0 離開 RECOVERING／ATTACHING）。
+    let socket = env.socket.clone();
+    thread::sleep(Duration::from_millis(500));
+    wait_until("force recover 收斂", LONG, || {
+        let st = get_state(&socket, "COM0")["state"].clone();
+        st == "READY" || st == "ATTACHED" || st == "DETACHED"
+    });
+    thread::sleep(Duration::from_secs(2));
+
+    // 管線中的 daemon.stop 未被處理：daemon 仍存活，新連線 health.status 回 ok。
+    assert!(d.try_alive(), "回應寫入失敗後連線關閉，管線中的 daemon.stop 不得被處理：{}", d.stderr());
+    assert!(health_status(&env.socket)["ok"] == true, "daemon 應仍可服務新連線");
 
     // recover handler 的救援 TX 已寫入 WAL，且最後一行完整。
     let wal_after = fs::metadata(env.wal_dir.join("raw.wal.ndjson")).map(|m| m.len()).unwrap_or(0);
     assert!(wal_after > wal_before, "救援 TX 應已寫入 WAL");
     let last = last_wal_line(&env);
     assert!(pyjson::loads(&last).is_ok(), "WAL 最後一行不完整：{last}");
-    // 註：「WAL close 發生在 handler 結束之後」的順序斷言需 trace，留待 in-process 變體（實作者補強）。
+
+    // 新連線 daemon.stop → 有序停機。
+    let started = Instant::now();
+    rpc_once(&env.socket, STOP);
+    assert_eq!(d.wait(Duration::from_secs(15)).code(), Some(0));
+    assert!(started.elapsed() <= Duration::from_secs(15));
+    assert!(!env.socket.exists(), "有序停機後 socket 檔應已移除");
 }
 
 #[test]
