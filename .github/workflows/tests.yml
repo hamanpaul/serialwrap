@@ -43,6 +43,7 @@ jobs:
         # 核准粒度為三元組（收緊，2026-10-23；sol d82d146）：同名 nodeid 於其他集合／平台的核准不相通。
         # 清單與來源逐列對應真實移除事件（git 歷史 parent diff）：d82d146＝OD-16 (1)(2) RM-01～06（505）；61919dd＝OD-17 RM-01～03（4）；
         # 1e24d68＝Linux 占位 12＋12（核准只涵蓋 Linux，見 owner-decisions-s1x-g-list.md）；1ea2bdc＝s1b_cargo.linux 舊名 2；e25aec0＝舊 10 筆 docker／stage0 裁決保留（s0_win_pytest.windows）。
+        # 1e24d68（24）、1ea2bdc（2）、e25aec0（10）三組共 36 個三元組由 OD-23（2026-10-27）逐名補授權；清單見 docs/rust-refactor/reviews/s1x-unauthorized-removals.md。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
           python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }} --allow-removal

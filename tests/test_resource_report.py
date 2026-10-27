@@ -1101,6 +1101,8 @@ def test_workflow_ci_l1_gates() -> None:
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
+    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組
+    # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
     allowed_removals = (
         "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
         "s0_win_pytest:windows:tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
@@ -1671,3 +1673,26 @@ def test_workflow_ci_l1_gates() -> None:
 def test_win_pytest_does_not_add_ineffective_safe_directory() -> None:
     script = Path("scripts/stage0/win-pytest.sh").read_text(encoding="utf-8")
     assert "config --local --add safe.directory" not in script
+
+
+@pytest.mark.memory_only
+def test_od23_removal_triples_are_all_approved_in_ci() -> None:
+    """OD-23：稽核清單所列 36 個既有移除三元組必須逐名出現在 CI 的 --allow-removal 清單中。"""
+    import re
+
+    doc = Path("docs/rust-refactor/reviews/s1x-unauthorized-removals.md").read_text(encoding="utf-8")
+    triples = list(dict.fromkeys(re.findall(r"^\| `([a-z0-9_]+:(?:linux|windows):[^`]+)` \|", doc, re.MULTILINE)))
+    assert len(triples) == 36, triples
+    assert "RESOLVED（OD-23" in doc
+    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    lock_steps = [
+        st for st in wf["jobs"]["pytest"]["steps"]
+        if "regen_lock.py --check --base" in str(st.get("run", ""))
+    ]
+    assert len(lock_steps) == 1
+    tokens = shlex.split(str(lock_steps[0]["run"]))
+    allowed = tokens[tokens.index("--allow-removal") + 1:]
+    missing = [triple for triple in triples if triple not in allowed]
+    assert not missing, missing
+    decisions = Path("docs/rust-refactor/owner-decisions-2026-10-15.md").read_text(encoding="utf-8")
+    assert "| OD-23 | **S1X 凍結鎖既有 36 筆移除補授權**" in decisions

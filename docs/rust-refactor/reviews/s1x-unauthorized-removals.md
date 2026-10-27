@@ -1,5 +1,7 @@
 # S1X 凍結鎖既有 36 筆移除盤點
 
+> **狀態：RESOLVED（OD-23，2026-10-27）**——擁有者核准下列 36 個 `set:platform:nodeid` 三元組全部補授權（P4 佔位 24、S1B 改名 2、Windows 平台不適用 10）；替換測試與不適用理由依本清單，Windows 不適用者在 Linux 集合仍保留原測試。36 個三元組均已列於 `.github/workflows/tests.yml` 的 `--allow-removal` 與 `tests/test_resource_report.py` 的 pinned 清單，`regen_lock.py --check --base` 對 `1e24d68^`、`1ea2bdc^`、`e25aec0^` 皆通過。下文「建議補授權」欄保留為裁決前的稽核原文。
+
 本清單依各移除 commit 與其直接 parent 的 `tests/acceptance/l1_required.lock.json` 三元組差異產生。三組共 36 筆：`1e24d68` 24 筆、`1ea2bdc` 2 筆、`e25aec0` 10 筆。此文件只供擁有者裁決；本輪沒有修改凍結鎖，也沒有重新產生鎖檔。
 
 ## 分類結論
@@ -65,7 +67,7 @@
 | `s0_win_pytest:windows:tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[probe]` | `e25aec0`；同上 | 無；Linux `s0_bc` 仍收集原測試 | 建議補授權 |
 | `s0_win_pytest:windows:tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[race]` | `e25aec0`；同上 | 無；Linux `s0_bc` 仍收集原測試 | 建議補授權 |
 
-## 裁決前邊界
+## 裁決前邊界（已由 OD-23 結案）
 
 - 上表 36 筆均待擁有者決定；不得自行移除／還原鎖項或修改 `tests/acceptance/l1_required.lock.json`。
 - 若擁有者同意維持，後續變更須只經 `tests/acceptance/regen_lock.py`，逐筆採精確 `set:platform:nodeid` 核准，並保留本清單及裁決依據。

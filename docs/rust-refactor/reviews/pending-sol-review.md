@@ -77,7 +77,7 @@ Reviewer A（Sonnet max）對上一輪提交提出 8 項 finding，處置如下�
 | #5 AF_UNIX long path | **fixed `41d4914`**：handoff child socket 使用 `/tmp/sw-*` 並清理，POSIX pytest 預設 basetemp 採短路徑。 |
 | #6 latency bound branches | **fixed `19bcc16`，OD-22 本輪完成**：保留超限 FAIL 分支，新增主案例與 oplock 變體的 p99／最大值 boundary 測試；門檻為 p99 ≤100 ms、最大值 ≤600 ms。 |
 | #7 Cargo provenance | **fixed `19bcc16`**：`rustc -vV` 使用 repo cwd；Stage 1A gate 核對 provenance 起訖 HEAD 與 clean 狀態。 |
-| #8 scope／carry-over／oracle inventory | OD-20 超出 OD-14..OD-19 範圍，未改文件消費者或 verdict；36 筆既有未由 OD-16／17 授權的 removal 保持原樣、待 owner；凍結 `test_spike3_pass_with_known_edr_is_pass` nodeid 保留且明確斷言 BLOCKED-OWNER；absolute-dir 原 nodeid 已恢復；handoff infrastructure、addenda count 與 G-REG 鎖數已補正。Bridge 核准 tree `c4c22c0e…` 與目前 `d44a761a…` 不同，保持 OPEN，不改核准值；full pytest 的 docker bridge case 為 INSUFFICIENT_EVIDENCE。 |
+| #8 scope／carry-over／oracle inventory | OD-20 超出 OD-14..OD-19 範圍，未改文件消費者或 verdict；36 筆既有未由 OD-16／17 授權的 removal 保持原樣、待 owner（2026-10-27 已由 OD-23 全部補授權，RESOLVED）；凍結 `test_spike3_pass_with_known_edr_is_pass` nodeid 保留且明確斷言 BLOCKED-OWNER；absolute-dir 原 nodeid 已恢復；handoff infrastructure、addenda count 與 G-REG 鎖數已補正。Bridge 核准 tree `c4c22c0e…` 與目前 `d44a761a…` 不同，保持 OPEN，不改核准值；full pytest 的 docker bridge case 為 INSUFFICIENT_EVIDENCE。 |
 
 驗證記錄：全套 `python3 -m pytest -q tests/` 僅執行一次，`5063 passed, 111 skipped, 1 xfailed, 4 failed`；兩個暫時 lock 範圍失敗修正後定點重跑 `2 passed`，未重跑全套。P4 evidence 缺失案例已於 `3684f06` 基線重現；bridge revision mismatch 亦為既有核准落差。Stage 1 exit driver 未執行；COM22 owner/hardware 複核仍 OPEN。
 
