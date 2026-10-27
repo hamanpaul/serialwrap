@@ -305,7 +305,8 @@ pub struct SessionCore {
     drain_timeout_epoch: Option<u64>,
     released_by: Option<String>,
     released_at: Option<String>,
-    released_reason: Option<String>,
+    /// Python `released_reason`：RPC `device.release` 的 `reason` 原樣（任意 JSON；未帶為 null）。
+    released_reason: PyValue,
     /// agent Interactive Lease（P5-T14；`interactive_session_id` 由此導出）。
     lease: Option<InteractiveLease>,
     /// 已到期 lease 的 tombstone（每 session FIFO 16，#54）。
@@ -468,7 +469,7 @@ impl SessionCore {
             drain_timeout_epoch: None,
             released_by: None,
             released_at: None,
-            released_reason: None,
+            released_reason: PyValue::Null,
             lease: None,
             tombstones: Tombstones::new(),
             pending_ops: HashMap::new(),
@@ -760,7 +761,7 @@ impl SessionCore {
         out.insert("released_at", option_string(self.released_at.as_deref()));
         out.insert(
             "released_reason",
-            option_string(self.released_reason.as_deref()),
+            self.released_reason.clone(),
         );
         out.insert(
             "capture",
@@ -843,7 +844,7 @@ impl SessionCore {
         &mut self,
         released_by: Option<String>,
         released_at: Option<String>,
-        reason: Option<String>,
+        reason: PyValue,
     ) {
         self.state = SessionState::Released;
         self.released_by = released_by;
@@ -1232,7 +1233,7 @@ impl SessionCore {
                             self.release_persist_pending = false;
                             self.released_by = None;
                             self.released_at = None;
-                            self.released_reason = None;
+                            self.released_reason = PyValue::Null;
                             if pending_stop.kind != StopKind::Release {
                                 self.pending_release = None;
                             }
@@ -1248,7 +1249,7 @@ impl SessionCore {
                     self.release_persist_pending = false;
                     self.released_by = None;
                     self.released_at = None;
-                    self.released_reason = None;
+                    self.released_reason = PyValue::Null;
                     self.pending_release = None;
                     self.pending_attach = None;
                     self.state = SessionState::Attaching;
@@ -1293,7 +1294,7 @@ impl SessionCore {
                     self.release_persist_pending = false;
                     self.released_by = None;
                     self.released_at = None;
-                    self.released_reason = None;
+                    self.released_reason = PyValue::Null;
                     self.pending_release = None;
                     self.set_state(SessionState::Detached, now);
                     vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
@@ -1888,7 +1889,7 @@ impl SessionCore {
         }
         self.released_by = None;
         self.released_at = None;
-        self.released_reason = None;
+        self.released_reason = PyValue::Null;
         self.profile.device_by_id = target;
         self.device_present = false;
         self.known_real_path = None;
@@ -2980,11 +2981,7 @@ impl SessionCore {
             .unwrap_or_else(|| ("cli".into(), PyValue::Null));
         self.released_by = Some(source);
         self.released_at = Some(self.wall_iso());
-        self.released_reason = match reason {
-            PyValue::Str(s) => Some(s),
-            PyValue::Null => None,
-            other => Some(format!("{other:?}")),
-        };
+        self.released_reason = reason;
         self.set_last_error(Some("RELEASED".into()), None);
         self.set_state(SessionState::Released, now);
     }
@@ -4613,7 +4610,7 @@ impl SessionCore {
                 "session" => session,
                 "released_by" => option_string(self.released_by.as_deref()),
                 "released_at" => option_string(self.released_at.as_deref()),
-                "reason" => option_string(self.released_reason.as_deref()),
+                "reason" => self.released_reason.clone(),
                 "external_holder" => external,
                 "reclaimable" => reclaimable,
                 "recommended_action" => if reclaimable { "device_attach" } else { "wait_external_flash" },

@@ -564,7 +564,7 @@ impl Shared {
             core.init_released(
                 text(&row.released_by),
                 text(&row.released_at),
-                text(&row.reason),
+                row.reason.clone(),
             );
         }
         if let Some(err) = detached_error {
@@ -2298,6 +2298,11 @@ impl SessionManager {
     /// DeviceWatcher Tick：Slice 2.1 無 readiness 自動重探（Phase 08），只依序處理已排入的事件。
     pub fn on_tick(&self) {
         self.pump();
+    }
+
+    /// 以注入的 `Clock` 產生 ISO 時間字串（service 層 `command.cancel` 的 `done_at`；Python `now_iso()`）。
+    pub fn now_iso(&self) -> String {
+        self.shared.now_iso()
     }
 
     /// `(sessions, devices)`。

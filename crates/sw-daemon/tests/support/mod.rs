@@ -20,6 +20,10 @@ use sw_proto::pyjson::{self, PyValue};
 
 pub use sw_daemon::daemon_main::{run_with_hooks, DaemonHooks, TraceEvent};
 
+/// P5-T18：`dispatch.rs` 的 `ServiceRig` 與 `deferred_methods`（追加，不改既有支援碼）。
+mod service_rig;
+pub use service_rig::*;
+
 /// 以 `cargo test` 建置的 daemon 執行檔（`--features test-fakes` 下含測試專用 method）。
 pub const DAEMON_BIN: &str = env!("CARGO_BIN_EXE_serialwrapd");
 pub const PING: &str = r#"{"id":1,"method":"health.ping"}"#;
