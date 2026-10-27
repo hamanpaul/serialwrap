@@ -3,6 +3,10 @@
 //! 背景啟動保留 stdin，並依平台建立獨立 session／process group；stdout 與 stderr
 //! 導向 null device。同步前景呼叫則繼承標準串流並回傳子行程結束碼。
 #[cfg(unix)]
+mod handler_posix;
+#[cfg(windows)]
+mod handler_windows;
+#[cfg(unix)]
 pub mod posix;
 #[cfg(windows)]
 pub mod windows;
@@ -45,15 +49,71 @@ pub enum HandlerOutcome {
 
 /// 關機時由 dispatcher 觸發的中止旗標（視同逾時終止整個 process group／Job）。
 #[derive(Clone, Debug, Default)]
-pub struct HandlerAbort(#[allow(dead_code)] std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+pub struct HandlerAbort(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
 
 impl HandlerAbort {
     pub fn new() -> Self {
-        todo!("P7 Task 14")
+        Self::default()
     }
     pub fn trigger(&self) {
-        todo!("P7 Task 14")
+        let (flag, cv) = &*self.0;
+        *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
     }
+    pub fn is_triggered(&self) -> bool {
+        *self.0 .0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// 最多等 `d`；回 `true` 表示已觸發。
+    pub(crate) fn wait_timeout(&self, d: std::time::Duration) -> bool {
+        let (flag, cv) = &*self.0;
+        let g = flag.lock().unwrap_or_else(|e| e.into_inner());
+        if *g {
+            return true;
+        }
+        let (g, _) = cv.wait_timeout(g, d).unwrap_or_else(|e| e.into_inner());
+        *g
+    }
+}
+
+/// stdout／stderr 讀取執行緒：讀到 EOF，只保留最後 `tail` bytes（Python `stdout[-N:]` 等價）；結束時通知 `done`。
+pub(crate) fn spawn_tail_reader<R: std::io::Read + Send + 'static>(
+    mut r: R,
+    tail: usize,
+    done: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut keep: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    keep.extend_from_slice(&buf[..n]);
+                    if keep.len() > tail.saturating_mul(2).max(8192) {
+                        let cut = keep.len() - tail;
+                        keep.drain(..cut);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if keep.len() > tail {
+            let cut = keep.len() - tail;
+            keep.drain(..cut);
+        }
+        let _ = done.send(());
+        keep
+    })
+}
+
+/// stdin 寫入執行緒：寫完即關閉；子行程不讀或已結束（EPIPE）時略過（Python `communicate` 同樣忽略 BrokenPipe）。
+/// 不 join：孫行程持有 stdin 而不讀時不得卡住收尾。
+pub(crate) fn spawn_stdin_writer<W: std::io::Write + Send + 'static>(mut w: W, data: Vec<u8>) {
+    std::thread::spawn(move || {
+        let _ = w.write_all(&data);
+        let _ = w.flush();
+    });
 }
 
 /// event handler 子行程產生器（POSIX `fork/exec`＋process group；Windows `CreateProcessW`＋Job，SC-26）。
@@ -66,17 +126,38 @@ pub trait HandlerSpawner: Send + Sync {
     fn run(&self, spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome;
 }
 
-/// 原生 `HandlerSpawner`（平台本體在 `posix`／`windows` 子模組；Task 14 實作）。
+/// 原生 `HandlerSpawner`（平台本體在 `handler_posix`／`handler_windows`；Task 14）。
 pub struct NativeHandlerSpawner;
 
 impl HandlerSpawner for NativeHandlerSpawner {
-    fn shell_argv(&self, _shell: &str) -> Vec<String> {
-        todo!("P7 Task 14")
+    fn shell_argv(&self, shell: &str) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            handler_posix::shell_argv(shell)
+        }
+        #[cfg(windows)]
+        {
+            handler_windows::shell_argv(shell)
+        }
     }
     fn inherited_env_keys(&self) -> &'static [&'static str] {
-        todo!("P7 Task 14")
+        #[cfg(unix)]
+        {
+            handler_posix::INHERITED_ENV_KEYS
+        }
+        #[cfg(windows)]
+        {
+            handler_windows::INHERITED_ENV_KEYS
+        }
     }
-    fn run(&self, _spec: &HandlerSpec, _abort: &HandlerAbort) -> HandlerOutcome {
-        todo!("P7 Task 14")
+    fn run(&self, spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
+        #[cfg(unix)]
+        {
+            handler_posix::run(spec, abort)
+        }
+        #[cfg(windows)]
+        {
+            handler_windows::run(spec, abort)
+        }
     }
 }

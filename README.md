@@ -1321,6 +1321,8 @@ serialwrap event tail --rule-id ops.kernel-panic -n 20
 
 Handlers must finish within `timeout_ms`, avoid daemonizing, read the JSON
 payload from stdin, and use exit code `0` for success.
+On Windows (Rust daemon) handlers run under a Job Object with `cmd.exe /d /s /c`
+for `shell` rules; see "Windows handler 語意" in `docs/design-event-trigger.md`.
 
 ### Testing
 
@@ -3225,6 +3227,8 @@ Handler **建議**：
 - 保持冪等性（同一 pattern 可能觸發多次）
 - 輸出寫到 syslog 或獨立 log 檔（stdout/stderr 僅保留最後 4 KB）
 - 響應 SIGTERM 做 graceful shutdown
+
+Windows（Rust daemon）上 handler 置於 Job Object 內，`shell` 規則以 `cmd.exe /d /s /c` 執行；詳見 `docs/design-event-trigger.md` 的「Windows handler 語意」。
 
 詳細設計請見 [`docs/plan-event-trigger.md`](./docs/plan-event-trigger.md)。
 

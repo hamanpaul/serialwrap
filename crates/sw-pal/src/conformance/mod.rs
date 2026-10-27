@@ -5,6 +5,7 @@
 //! 讓測試能走到被測行為；被測的 PAL 行為（`PosixSerialBackend` 等）仍為 `unimplemented!` 骨架。
 
 pub mod console_suite;
+pub mod handler_suite;
 pub mod lock_suite;
 pub mod rpc_suite;
 pub mod serial_suite;

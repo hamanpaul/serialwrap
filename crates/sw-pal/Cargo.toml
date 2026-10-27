@@ -24,6 +24,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    # P7 Task 14：event handler 的 stdio pipe（CreatePipe）。
+    "Win32_System_Pipes",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security",
     "Win32_Security_Cryptography",

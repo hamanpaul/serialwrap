@@ -8,6 +8,7 @@
 | ID | 項目 | 需要的裁決／動作 | 來源 |
 |---|---|---|---|
 | P7-BO-1 | `s21_core.linux` 依 08 §0.6 退役清單以替換測試逐名移除 `cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx`（→ `post_login_cmd_profile_logs_in`）與 `cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported`（→ `detect_skips_passthrough_and_console_unlock`） | OD-16：縮減／替換須擁有者明示核准；P7 PR 的 CI `regen_lock.py --check --base … --allow-removal` 清單需由擁有者加入上述兩個 nodeid（本分支不自行修改 CI 白名單） | fa847c7、94526b4 |
+| P7-BO-2 | Task 14 B-08：測試團隊 Windows 工作站（`windows-task` 監管、第三方 EDR）實際觸發 handler 的行為與延遲；B-06（OD-08）：本 PR 動到 PAL，需原生 Windows COM handle 環境的回歸證據 | 擁有者於實機環境執行並提供報告 | Task 14 |
 
 ## LOCAL-WINDOWS-TODO
 
@@ -18,6 +19,7 @@
 | P7-LW-3 | P7 新增 sw-core 測試的 Windows 原生執行（`p7_gate:cargo-test-workspace` 目前只有 linux） | 08 Task 19 Windows 原生 L1 | 全 P7 |
 | P7-LW-4 | Task 13 `event_store`（23 項，含 DF-18 第二次覆寫）與 `runtime_paths_golden::events_log_path_env_override` 的 Windows 原生執行與 `p7_gate` windows 集合登記；`runtime_paths.windows.tsv` 尚無 daemon 目錄欄位，`events_log_path` 的 ntpath 期望值待 Windows Python 實測 | `scripts/rust/win-test.sh --package sw-core --test event_store`、`--package sw-proto --test runtime_paths_golden`，核對報告 `passed >= 1` | Task 13 |
 | P7-LW-5 | 13-py：Windows Python 3.12 執行 `tests/test_event_replace_df18.py`（DF-18 的 Windows 可觀測差異） | `scripts/stage0/win-pytest.sh tests/test_event_replace_df18.py` | Task 13-py |
+| P7-LW-6 | Task 14 `handler_spawner`（9 項）Windows 原生：`CreateProcessW`＋Job Object、`cmd.exe /d /s /c` 引號、handle 白名單、`[WinError 2]` 訊息；報告 `passed == 9`、`ignored == 0` 後登記 `p7_gate` windows 集合 | `scripts/rust/win-test.sh --package sw-pal --test handler_spawner`（`--test` 選 binary，禁用 `-- handler_spawner` 名稱過濾） | Task 14 |
 
 ## BLOCKED-UPSTREAM（P6）
 

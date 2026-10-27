@@ -401,7 +401,7 @@ fn terminate_and_close(info: &PROCESS_INFORMATION, job: HANDLE) {
     }
 }
 
-fn quote_command_line(argv: &[OsString]) -> Vec<u16> {
+pub(super) fn quote_command_line(argv: &[OsString]) -> Vec<u16> {
     let mut result = Vec::new();
     for (index, arg) in argv.iter().enumerate() {
         if index > 0 {
