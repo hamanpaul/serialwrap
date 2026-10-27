@@ -68,6 +68,58 @@ pub trait AppendFile: Send {
     fn sync(&mut self) -> PalResult<()>;
 }
 
+/// 原生 `AppendFile`：`std::fs::File`＋平台錯誤映射（P7 Task 6）。
+pub(crate) struct StdAppendFile {
+    pub(crate) file: std::fs::File,
+    pub(crate) map: fn(std::io::Error) -> crate::traits::PalError,
+}
+
+impl AppendFile for StdAppendFile {
+    fn write_all_flush(&mut self, b: &[u8]) -> PalResult<()> {
+        use std::io::Write;
+        self.file.write_all(b).map_err(self.map)?;
+        self.file.flush().map_err(self.map)
+    }
+
+    fn sync(&mut self) -> PalResult<()> {
+        self.file.sync_all().map_err(self.map)
+    }
+}
+
+/// Python `str(OSError)` 帶檔名的形式：`<訊息>: <repr(path)>`（P7 Task 6；`repr(str)` 規則同 `rpc_transport`）。
+pub(crate) fn with_filename(
+    mut error: crate::traits::PalError,
+    p: &Path,
+) -> crate::traits::PalError {
+    let s = p.to_string_lossy();
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut repr = String::with_capacity(s.len() + 2);
+    repr.push(quote);
+    for ch in s.chars() {
+        match ch {
+            '\\' => repr.push_str("\\\\"),
+            '\n' => repr.push_str("\\n"),
+            '\r' => repr.push_str("\\r"),
+            '\t' => repr.push_str("\\t"),
+            c if c == quote => {
+                repr.push('\\');
+                repr.push(c);
+            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                repr.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c => repr.push(c),
+        }
+    }
+    repr.push(quote);
+    error.py_message = format!("{}: {repr}", error.py_message);
+    error
+}
+
 /// 寫入面（P4-T1 補齊簽章；P3 呼叫端僅使用 `FsRead` 方法，`FsOps: FsRead` 為 supertrait）。
 #[allow(unused_variables)]
 pub trait FsOps: FsRead {

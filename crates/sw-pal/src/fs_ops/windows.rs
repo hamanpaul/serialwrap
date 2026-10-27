@@ -233,6 +233,45 @@ impl FsOps for NativeFsOps {
         }
         Ok(FileLockGuard::from_file(file))
     }
+
+    // ---- P7 Task 6：寫入側增補（counter／registry／agent log）----
+    fn open_append(&self, p: &Path) -> PalResult<Box<dyn crate::fs_ops::AppendFile>> {
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(p)
+            .map_err(|e| crate::fs_ops::with_filename(file_error(e), p))?;
+        Ok(Box::new(crate::fs_ops::StdAppendFile {
+            file,
+            map: file_error,
+        }))
+    }
+
+    fn create_truncate(&self, p: &Path, bytes: &[u8]) -> PalResult<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(p)
+            .map_err(|e| crate::fs_ops::with_filename(file_error(e), p))?;
+        file.write_all(bytes).map_err(file_error)
+    }
+
+    fn file_size(&self, p: &Path) -> PalResult<Option<u64>> {
+        match fs::metadata(p) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(crate::fs_ops::with_filename(file_error(e), p)),
+        }
+    }
+
+    fn remove_file_if_exists(&self, p: &Path) -> PalResult<bool> {
+        match fs::remove_file(p) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(crate::fs_ops::with_filename(file_error(e), p)),
+        }
+    }
 }
 
 impl FsRead for NativeFsRead {
