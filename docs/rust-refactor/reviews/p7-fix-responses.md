@@ -108,3 +108,13 @@
 | 91109e7-1 | Low | stop 逾時時尚未登記 running 的 worker 會漏 abort、之後 spawn 不受控 handler | **fixed**：`State.aborting` 於 trigger 迴圈前同鎖設立，`run_inner` 登記 running 時檢查並立即 abort；回歸 `stop_aborts_handler_registered_after_deadline`（以 read 阻塞的 FsOps 讓 worker 停在 `counters.load`；修前紅） |
 | 91109e7-2 | Low | 非 UTF-8 環境值以 lossy 傳遞 | **deferred**：凍結介面為 `(String, String)`；日後以 add-only 方式在 `HandlerSpec` 新增 OsString env，再登記於 behavior_changes（需獨立審閱）。實務上 PATH／HOME 非 UTF-8 罕見 |
 | 91109e7-3 | Low | `stop_deadline_aborts_running_handlers` 上限放寬到 400 ms 無理由 | **fixed**：改回 ≤ 300 ms；ignore_abort 案註明 200＋100 ms 本身即 300 ms、另加 100 ms 排程餘裕 |
+
+## 第 7 輪：p7-cloud/06c61d0_b65df2d（Opus）、b65df2d_01c474c（Opus）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| aaf2c1d-1 | Low | 分塊解碼漏了 CPython 對塊尾「0xED＋0xA0..0xBF」（截斷代理對）的延後緩衝 | **fixed**：`decode_text_chunked` 於非 final 塊再加此條件延後；`tail_decode_error_position_is_chunk_relative` 補 3 組（CPython 3.12 實測：8190＋`ed a0 80`→position 0、8190＋`ed a0` EOF→position 0、8189＋`ed a0 80`→position 8189；修前紅） |
+| aaf2c1d-2 | Low | CRLF 修正的 Windows 原生核對未實際登記，LW-2／LW-4 項目數與判準過時 | **fixed**：LW-2 改 7 項（含 `create_truncate_text_uses_platform_newline`，Windows 斷言 `TEXT_NEWLINE == "\r\n"`）、LW-4 改 27 項（含 CRLF 期望值）；判準改為 `passed == 總數` 且 `ignored == 0`；LW-6 改 `passed == 10` |
+| b65df2d-1／01c474c-1 | Low | 證據 README 差異說明漏列移除項 | **fixed**：aaf2c1d／9c4a80e／0722f75 三列補完整 +/−；README 末新增「逐列完整 +/−（自動產生）」段，以 `comm` 列出所有相鄰清單檔的新增與移除 |
+| 9c4a80e-1 | Low | Windows `fire_completed.exit_code` 以有號 i32 呈現、與 Python DWORD 不一致且無授權 | **fixed（選 add-only 還原）**：sw-pal `process::py_returncode(i32) -> i64`（Windows `as u32`、POSIX 原值，cfg 在 sw-pal），dispatcher emit 改用之；design-event-trigger 改述為與 Python 相同；回歸 `handler_spawner::py_returncode_matches_python_popen`（Windows 斷言 `-1073741819 → 3221225477`，原生執行併入 P7-LW-6） |
+| （前輪未結） | Medium | 96b28dd_06c61d0 ENOEXEC | 已於 9c4a80e 修正（第 6 輪；b65df2d_01c474c 已以 10 組 1:1 對照核對） |

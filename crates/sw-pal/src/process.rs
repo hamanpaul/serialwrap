@@ -29,6 +29,19 @@ pub enum ElevatedOutcome {
     Declined,
 }
 
+/// Python `Popen.returncode` 的呈現（審查 b65df2d_01c474c 9c4a80e-1）：Windows 為 `GetExitCodeProcess` 的不帶號 DWORD
+/// （`HandlerOutcome.exit_code: i32` 凍結，呈現時還原）；POSIX 原值（訊號終止為 `-signum`）。
+pub fn py_returncode(exit_code: i32) -> i64 {
+    #[cfg(windows)]
+    {
+        i64::from(exit_code as u32)
+    }
+    #[cfg(not(windows))]
+    {
+        i64::from(exit_code)
+    }
+}
+
 /// event handler 的執行規格（P7 Task 0 凍結；Task 14 實作，SC-26）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandlerSpec {

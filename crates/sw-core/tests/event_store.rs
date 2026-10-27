@@ -731,6 +731,26 @@ fn tail_decode_error_position_is_chunk_relative() {
             "'utf-8' codec can't decode byte 0xe4 in position 0: invalid continuation byte",
         ),
     ];
+    // 審查 06c61d0_b65df2d aaf2c1d-1：CPython 非 final 解碼對塊尾「0xED＋0xA0..0xBF」（截斷代理對）延後到下一塊。
+    let mut case6 = vec![b'x'; 8190];
+    case6.extend_from_slice(b"\xed\xa0\x80\n");
+    let mut case7 = vec![b'x'; 8190];
+    case7.extend_from_slice(b"\xed\xa0");
+    let mut case8 = vec![b'x'; 8189];
+    case8.extend_from_slice(b"\xed\xa0\x80\n");
+    let mut cases = cases;
+    cases.push((
+        case6,
+        "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte",
+    ));
+    cases.push((
+        case7,
+        "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte",
+    ));
+    cases.push((
+        case8,
+        "'utf-8' codec can't decode byte 0xed in position 8189: invalid continuation byte",
+    ));
     for (i, (data, msg)) in cases.into_iter().enumerate() {
         std::fs::write(&path, data).unwrap();
         let err = log

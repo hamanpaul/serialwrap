@@ -84,3 +84,16 @@ fn shell_argv_and_env_keys_by_platform() {
         assert_eq!(keys.len(), 5);
     }
 }
+
+#[test]
+fn py_returncode_matches_python_popen() {
+    // 審查 b65df2d_01c474c 9c4a80e-1：Python `Popen.returncode` 在 Windows 為不帶號 DWORD（`0xC0000005` → 3221225477），
+    // POSIX 原值（訊號終止為 `-signum`）。
+    use sw_pal::process::py_returncode;
+    assert_eq!(py_returncode(0), 0);
+    assert_eq!(py_returncode(3), 3);
+    #[cfg(windows)]
+    assert_eq!(py_returncode(-1073741819), 3221225477);
+    #[cfg(not(windows))]
+    assert_eq!(py_returncode(-9), -9);
+}

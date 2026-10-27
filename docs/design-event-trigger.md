@@ -243,8 +243,8 @@ per-line 長度上限 16 KB；超出視為「split 後比對」（簡化：直�
 - 只繼承三條 stdio pipe（`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`），不繼承 daemon 的其他 handle；`CREATE_NO_WINDOW`。
 - 環境白名單：POSIX 五鍵（`PATH`、`HOME`、`USER`、`LANG`、`LC_ALL`）再加 Windows 六鍵（`SYSTEMROOT`、`COMSPEC`、
   `PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`），以及所有 `SERIALWRAP_EVENT_*`。
-- `fire_completed.exit_code`：Windows 以有號 32 位元呈現（`GetExitCodeProcess` 的 DWORD 轉 i32；例：NTSTATUS
-  `0xC0000005` 呈現為 `-1073741819`，非 Python `returncode` 的不帶號 `3221225477`）。
+- `fire_completed.exit_code`：同 Python `Popen.returncode`，Windows 為 `GetExitCodeProcess` 的不帶號 DWORD
+  （例：NTSTATUS `0xC0000005` 呈現為 `3221225477`）。
 - 判定 shell 形：argv 恰為 `["cmd.exe", "/d", "/s", "/c", X]` 即以 shell 形逐字組 command line——`handler.exec`
   寫成同樣五元素時亦等同 `handler.shell: X`（不套 MSVC 跳脫）。
 - 信任範圍（OD-12）：handler 以 daemon 使用者身分執行；Windows 的 RPC 信任範圍為整機本機使用者（TCP loopback），

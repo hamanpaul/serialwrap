@@ -204,6 +204,7 @@
           "cargo:sw-pal::handler_spawner::native_spawn_failure",
           "cargo:sw-pal::handler_spawner::native_tail_bounded",
           "cargo:sw-pal::handler_spawner::native_timeout_kills_tree",
+          "cargo:sw-pal::handler_spawner::py_returncode_matches_python_popen",
           "cargo:sw-pal::handler_spawner::shell_argv_and_env_keys_by_platform",
           "cargo:sw-pal::usb_topology::busid_follows_dangling_device_symlink",
           "cargo:sw-pal::usb_topology::busid_from_sysfs_tempdir",

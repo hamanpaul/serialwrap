@@ -260,7 +260,10 @@ impl Shared {
                     ("type", PyValue::from("fire_completed")),
                     ("rule_id", PyValue::from(rule.rule_id.as_str())),
                     ("selector", PyValue::from(fire.selector.as_str())),
-                    ("exit_code", PyValue::from(i64::from(exit_code))),
+                    (
+                        "exit_code",
+                        PyValue::from(sw_pal::process::py_returncode(exit_code)),
+                    ),
                     ("duration_ms", duration()),
                     ("stdout_tail", tail(&stdout_tail)),
                     ("stderr_tail", tail(&stderr_tail)),

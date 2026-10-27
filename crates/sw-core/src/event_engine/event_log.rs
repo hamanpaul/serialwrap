@@ -226,7 +226,15 @@ fn decode_text_chunked(bytes: &[u8]) -> Result<String, PyErr> {
         }
         match decode_utf8_strict(&data) {
             Ok(s) => out.push_str(&s),
-            Err(e) if !last && e.reason == "unexpected end of data" => {
+            // 塊尾不完整序列延後；CPython 另把塊尾恰為「0xED＋0xA0..=0xBF」（截斷代理對）也延後到下一塊
+            // （審查 06c61d0_b65df2d aaf2c1d-1）。
+            Err(e)
+                if !last
+                    && (e.reason == "unexpected end of data"
+                        || (e.start + 2 == data.len()
+                            && data[e.start] == 0xED
+                            && (0xA0..=0xBF).contains(&data[e.start + 1]))) =>
+            {
                 out.push_str(std::str::from_utf8(&data[..e.start]).expect("前綴已驗證"));
                 carry = data[e.start..].to_vec();
             }

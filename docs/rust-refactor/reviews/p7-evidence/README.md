@@ -12,9 +12,9 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-c58e8d4.txt` | Task 13／13-py 後（多出者：`test_l15_smoke::test_reject_zero_tx_runs_on_python`、`test_functest_bridge_smoke::*sm01*` 為 Python daemon `ATTACH_FAILED:DeviceHeldError`，於 76de0cf worktree 同樣失敗；容器內殘留一個早先 slice21 測試洩漏的 throwaway `serialwrapd`（auto mode 不允許本 session 終止），疑為成因；`test_functest_windows_wiring::test_windows_wiring_env_and_argv` 單獨執行於 76de0cf 亦失敗（`WindowsPath` 於 POSIX 不可實例化，順序相依）；`test_human_agent_coexist` t1 單獨 2/2 通過；`test_regression_windows_caps` 單獨 2/2 通過） | 511 | ba8d5196ca29c0e3 |
 | `pytest-fail-91109e7.txt` | Task 14＋15 後（相對 c58e8d4 無新增失敗） | 508 | 5dca7ec693660c98 |
 | `pytest-fail-ae82afe.txt` | 審查第 4 輪後（相對 91109e7：+`test_mgmt_stubs::test_live_daemon_fixture_serves_attached_console_list`（ERROR，單獨重跑 2/2 通過）、+`test_safety_core[SESSION_NOT_READY-ATTACHING]`（起點清單內）） | 510 | a12acbf50459427d |
-| `pytest-fail-aaf2c1d.txt` | 審查第 5 輪後（相對 ae82afe：+`test_bb_daemon_e2e::test_session_reaches_ready`（`逾時 20.0s；最後觀察值：None`；同範圍兩次重跑 1 failed／1 passed，集合不同） | 508 | 031452ef72aa78c7 |
-| `pytest-fail-9c4a80e.txt` | 審查第 6 輪後（相對 aaf2c1d：+`test_l15_smoke::test_reject_zero_tx_runs_on_python`——`DeviceHeldError` 環境類，c58e8d4 列已於 76de0cf worktree 重現） | 508 | 5dca7ec693660c98 |
-| `pytest-fail-0722f75.txt` | Task 16＋16-wire 後（相對 9c4a80e：+slice21 `test_f1_cmd_contract::test_limits_queryable`／`test_newline_rejected`、`test_f12_version_reported_consistent`（ERROR；單獨重跑首次為 Python daemon `ATTACH_FAILED:DeviceHeldError`，合併重跑 4 passed）、+`test_mgmt_stubs` live daemon fixture（同上 4 passed）、+sm04（DeviceHeldError 環境類）） | 512 | f1fcb15f24ef4376 |
+| `pytest-fail-aaf2c1d.txt` | 審查第 5 輪後（相對 ae82afe：+1／−3——+`test_bb_daemon_e2e::test_session_reaches_ready`（`逾時 20.0s；最後觀察值：None`；同範圍兩次重跑 1 failed／1 passed，集合不同） | 508 | 031452ef72aa78c7 |
+| `pytest-fail-9c4a80e.txt` | 審查第 6 輪後（相對 aaf2c1d：+1／−1——−`test_bb_daemon_e2e::test_session_reaches_ready`（上一輪已記為同範圍兩次重跑、集合不同）；+`test_l15_smoke::test_reject_zero_tx_runs_on_python`——`DeviceHeldError` 環境類，c58e8d4 列已於 76de0cf worktree 重現） | 508 | 5dca7ec693660c98 |
+| `pytest-fail-0722f75.txt` | Task 16＋16-wire 後（相對 9c4a80e：+5／−1——−sm01；+slice21 `test_f1_cmd_contract::test_limits_queryable`／`test_newline_rejected`、`test_f12_version_reported_consistent`（ERROR；單獨重跑首次為 Python daemon `ATTACH_FAILED:DeviceHeldError`，合併重跑 4 passed）、+`test_mgmt_stubs` live daemon fixture（同上 4 passed）、+sm04（DeviceHeldError 環境類）） | 512 | f1fcb15f24ef4376 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
@@ -94,3 +94,101 @@ $ （76de0cf worktree）timeout 200 python3.12 -m pytest -q -p no:cacheprovider 
 `SERIALWRAP_RUN_DIR=/tmp/sw21-_65e8la_`，持有 `/dev/ptmx`×2 與該測試的 WAL handle。auto mode 不允許本 session 終止該行程，
 故 DeviceHeldError 類失敗與其關聯僅為推測；審查者容器中無此行程、sm01 通過，與此推測一致。
 
+### 逐列完整 +/−（自動產生；審查 06c61d0_b65df2d b65df2d-1、b65df2d_01c474c 01c474c-1）
+
+以 `comm` 比對相鄰兩個清單檔（`+` 為新增失敗、`−` 為不再失敗）。各新增項的成因判定見上表與前述各段。
+
+- `start-de24500` → `merge-be89081`：+7／−41
+  - `+ FAILED tests/contract_blackbox/slice21/test_f2_backpressure.py::test_queue_full_backpressure`
+  - `+ FAILED tests/contract_blackbox/slice21/test_f2_backpressure.py::test_recovery_flushes_queue`
+  - `+ FAILED tests/contract_blackbox/slice21/test_f3_observability.py::test_device_error_names_selector`
+  - `+ FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_recovering_submit_session_recovering`
+  - `+ FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed`
+  - `+ FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`
+  - `+ FAILED tests/test_l15_smoke.py::test_release_inflight_runs_on_python`
+  - `− ERROR tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_wal_path_live_marker_crc`
+  - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_cmdid_survives_timeout`
+  - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_near_limit_no_logout`
+  - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_too_long_rejected`
+  - `− ERROR tests/contract_blackbox/slice21/test_f2_backpressure.py::test_history_bounded`
+  - `− ERROR tests/contract_blackbox/slice21/test_f2_backpressure.py::test_queue_full_backpressure`
+  - `− ERROR tests/contract_blackbox/slice21/test_f2_backpressure.py::test_recovery_flushes_queue`
+  - `− ERROR tests/contract_blackbox/slice21/test_f2_backpressure.py::test_rx_window_crossing_prompt`
+  - `− ERROR tests/contract_blackbox/slice21/test_f3_observability.py::test_cmd_fail_observable`
+  - `− ERROR tests/contract_blackbox/slice21/test_f3_observability.py::test_device_error_names_selector`
+  - `− ERROR tests/contract_blackbox/slice21/test_f3_observability.py::test_fail_error_code`
+  - `− ERROR tests/contract_blackbox/slice21/test_f3_observability.py::test_log_tail_latest`
+  - `− ERROR tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_activity_classification`
+  - `− ERROR tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_background_result_tail_consistent`
+  - `− ERROR tests/contract_blackbox/slice21/test_f4_session_semantics.py::test_interactive_line_cmd_defined`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_attach_not_ready_last_error_field`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_credentials_unresolved_no_empty_login`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_external_open_blocked_then_release_attach_handoff`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_passthrough_quiet_ready_and_cmd`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_recovering_submit_session_recovering`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_released_survives_two_restarts_dynamic`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_socket_mode_0660`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_two_daemons_same_tty`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta`
+  - `− ERROR tests/contract_blackbox/slice21/test_safety_core.py::test_zero_tx_while_autoboot_quiet`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[CMD_CONTAINS_NEWLINE]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[CMD_TOO_LONG]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[INVALID_COMPLETION_REGEX]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[PROFILE_NOT_COMMAND_CAPABLE]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-DETACHED]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-PASSTHROUGH]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-RELEASED]`
+  - `− FAILED tests/contract_blackbox/test_bb_faketarget_s21.py::test_boot_banner_precedes_first_prompt[login-false-shell-prompt]`
+  - `− FAILED tests/contract_blackbox/test_bb_faketarget_s21.py::test_boot_banner_precedes_first_prompt[login-true-login-prompt]`
+  - `− FAILED tests/contract_blackbox/test_bb_faketarget_s21.py::test_login_false_sends_prompt_at_boot`
+  - `− FAILED tests/contract_blackbox/test_bb_faketarget_s21.py::test_sleep_command_sends_prompt_after_n_seconds`
+  - `− FAILED tests/contract_blackbox/test_bb_faketarget_s21.py::test_written_returns_all_bytes_received_by_dut`
+  - `− FAILED tests/contract_blackbox/test_bb_faketarget_s21.py::test_yes_head_emits_exact_bytes_then_prompt`
+  - `− FAILED tests/test_p7_skeleton_boundary.py::test_p7_files_exist_and_cfg_boundary_clean`
+  - `− FAILED tests/test_rust_cfg_boundary.py::test_repo_clean`
+- `merge-be89081` → `92e0223`：+0／−4
+  - `− ERROR tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent`
+  - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_limits_queryable`
+  - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_newline_rejected`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`
+- `92e0223` → `d5b2dd6`：+4／−1
+  - `+ ERROR tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent`
+  - `+ FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`
+  - `+ FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`
+  - `+ FAILED tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`
+  - `− FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`
+- `d5b2dd6` → `c58e8d4`：+7／−4
+  - `+ FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[INVALID_COMPLETION_REGEX]`
+  - `+ FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`
+  - `+ FAILED tests/test_functest_windows_wiring.py::test_windows_wiring_env_and_argv`
+  - `+ FAILED tests/test_human_agent_coexist.py::TestHumanAgentCoexist::test_t1_wal_reset_preserves_console`
+  - `+ FAILED tests/test_l15_smoke.py::test_reject_zero_tx_runs_on_python`
+  - `+ FAILED tests/test_regression_windows_caps.py::test_regression_case_requires_updated`
+  - `+ FAILED tests/test_regression_windows_caps.py::test_regression_windows_skip_is_capability_based`
+  - `− ERROR tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent`
+  - `− FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`
+  - `− FAILED tests/test_l15_smoke.py::test_release_inflight_runs_on_python`
+  - `− FAILED tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`
+- `c58e8d4` → `91109e7`：+0／−3
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[INVALID_COMPLETION_REGEX]`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`
+  - `− FAILED tests/test_human_agent_coexist.py::TestHumanAgentCoexist::test_t1_wal_reset_preserves_console`
+- `91109e7` → `ae82afe`：+2／−0
+  - `+ ERROR tests/contract_blackbox/test_mgmt_stubs.py::test_live_daemon_fixture_serves_attached_console_list`
+  - `+ FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`
+- `ae82afe` → `aaf2c1d`：+1／−3
+  - `+ FAILED tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready`
+  - `− ERROR tests/contract_blackbox/test_mgmt_stubs.py::test_live_daemon_fixture_serves_attached_console_list`
+  - `− FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`
+  - `− FAILED tests/test_l15_smoke.py::test_reject_zero_tx_runs_on_python`
+- `aaf2c1d` → `9c4a80e`：+1／−1
+  - `+ FAILED tests/test_l15_smoke.py::test_reject_zero_tx_runs_on_python`
+  - `− FAILED tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready`
+- `9c4a80e` → `0722f75`：+5／−1
+  - `+ ERROR tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent`
+  - `+ ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_limits_queryable`
+  - `+ ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_newline_rejected`
+  - `+ ERROR tests/contract_blackbox/test_mgmt_stubs.py::test_live_daemon_fixture_serves_attached_console_list`
+  - `+ FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`
+  - `− FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`
