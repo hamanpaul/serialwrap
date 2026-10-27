@@ -1,17 +1,21 @@
 # S1X Bridge 工具 revision 第三輪審查
 
-審查記錄日：2026-10-27（Asia/Taipei）
-候選工具樹：`76ec0480b0e675330fba56fa1a11e40eb782f2412f849ef7c52626637bf0dfd5`
-審查者：Claude Sonnet、Codex gpt-6.1-sol；兩位均非實作者。
+> **閱讀須知**：本文件「第三輪紀錄」與「Round 2 複審」兩節所錄的 `BRIDGE: APPROVE` 原文由 Codex luna driver 寫入，外層 driver 無法核對其來源，**不採為核准依據**（見〈外層審查紀錄校正〉）。`APPROVED_REVISION.json` 的 `review_ref` 只指向〈第 4 次送審外層審查原文〉一節。
 
-## 本輪驗證
+## 第三輪紀錄（tree `76ec0480`）（不採信：來源無法核對，見〈外層審查紀錄校正〉）
+
+審查記錄日：2026-10-27（Asia/Taipei）
+候選工具樹：`76ec0480b0e675330fba56fa1a11e40eb782f2412f849ef7c52626637bf0dfd5`（舊候選，已由 `dde967aa…` 取代）
+審查者（driver 所記）：Claude Sonnet、Codex gpt-6.1-sol。
+
+### 本輪驗證
 
 - Linux bridge selftest 原生報告為 PASS；14 項中 13 項 PASS，ST-12 因 `transport_disconnect` 能力未宣告而為 NOT_RUN。
 - Windows COM20:COM21 selftest 原生報告 verdict 為 PASS；外層 qualification exit 1，因核准 tree `c4c22c0e…` 與候選 tree `76ec0480…` 不同。ST-06／13／14 輸出的 `HARNESS_DUT_EXITED`、`HARNESS_WRITE_UNCERTAIN`、`HARNESS_EVIDENCE_OVERFLOW` 是故障注入觀測，不是 selftest 失敗原因。
 - `python3 -m pytest -q tools/uart_stdio_bridge/tests`：299 passed、5 skipped、1 failed。唯一失敗為 `test_approved_revision_matches_tool_tree`，其斷言正確反映本輪尚未更新核准值。
 - Windows COM run：`target/win-blackbox/261026-232001-1616734/windows-com/selftest-result.json`。Linux 與 Windows raw selftest 均未被外層資格失敗改寫。
 
-## Claude Sonnet 審查摘要
+### Claude Sonnet 審查摘要
 
 - R1（Medium）：`read(..., 0.05)` 的實際路徑以 `in_waiting` 輪詢，不進 pySerial 阻塞讀；建議補一個時鐘前進的讀取測試並在 changelog 說明。已在本輪 changelog 補充 50 ms 呼叫與 10 ms 輪詢行為。
 - R2（Medium-Low）：1 ms setter slack 與跨量化桶的 churn 缺少邊界測試；建議於後續 src 修改時一併處理。
@@ -20,15 +24,15 @@
 - R5（Low）：factory timeout、非有限 timeout、DSR 讀取例外等測試覆蓋缺口；`+inf` 溢位屬既有行為，review 未判為本輪 regression。
 - R6（Info）：`peer_open()` lock-free 與 close/reconnect 競態可能帶來瞬時 peer-state 樣本；為未實測推論。
 
-Claude 原始 BRIDGE 段：
+Claude 原始 BRIDGE 段（不採信：來源無法核對，見〈外層審查紀錄校正〉）：
 
 > BRIDGE: APPROVE — tree 76ec0480b0e675330fba56fa1a11e40eb782f2412f849ef7c52626637bf0dfd5 重算相符，上一輪三項修訂成立，未發現阻擋性缺陷；R1/R2 建議併入下次 src 修改、R3–R5 為不影響 hash 的 test-only 跟進，原生 Windows 重跑與重新 pin 仍為前置
 
-## Codex gpt-6.1-sol 審查摘要
+### Codex gpt-6.1-sol 審查摘要
 
 獨立靜態核對確認受控時鐘一致、setter 期間 DSR 降低會禁止寫入，窄期限案例保留剩餘預算與禁止阻塞讀取的斷言；未新增發現。
 
-Codex 原始 BRIDGE 段：
+Codex 原始 BRIDGE 段（不採信：來源無法核對，見〈外層審查紀錄校正〉）：
 
 > 無新增發現。靜態核對證據：
 >
@@ -40,15 +44,15 @@ Codex 原始 BRIDGE 段：
 >
 > BRIDGE: APPROVE
 
-## 裁定狀態
+### 裁定狀態（不採信：來源無法核對，見〈外層審查紀錄校正〉）
 
-兩位非實作者均對候選 tree 明確寫下 `BRIDGE: APPROVE`。本輪不改 `tools/uart_stdio_bridge/APPROVED_REVISION.json`；依本輪指示，下一輪才以此文件作為 `review_ref` 更新 tree hash、reviewer 與日期並另行提交。核准檔更新前，Windows qualification、bridge revision 測試及依賴該資格的 Docker smoke 仍須按原判定保持 FAIL／INSUFFICIENT。
+driver 所記為兩位非實作者均對候選 tree 寫下 `BRIDGE: APPROVE`。本輪不改 `tools/uart_stdio_bridge/APPROVED_REVISION.json`；依本輪指示，下一輪才以此文件作為 `review_ref` 更新 tree hash、reviewer 與日期並另行提交。核准檔更新前，Windows qualification、bridge revision 測試及依賴該資格的 Docker smoke 仍須按原判定保持 FAIL／INSUFFICIENT。
 
-## 2026-10-27 Round 2 複審
+## 2026-10-27 Round 2 複審（不採信：來源無法核對，見〈外層審查紀錄校正〉）
 
-候選工具樹：`dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`。審查範圍為 `7098a97..cc7e30d` 中 `tools/uart_stdio_bridge` 的完整差異，共 8 個檔案、2207 行新增、119 行刪除。兩位審查者皆未參與實作，並對此 tree 明確核准。
+候選工具樹：`dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`。審查範圍為 `7098a97..cc7e30d` 中 `tools/uart_stdio_bridge` 的完整差異，共 8 個檔案、2207 行新增、119 行刪除。driver 所記兩位審查者皆未參與實作。
 
-### Claude Sonnet 原始審查段
+### Claude Sonnet 原始審查段（不採信：來源無法核對，見〈外層審查紀錄校正〉）
 
 > 非實作者複審：未發現尚未修復的阻擋缺陷。
 >
@@ -60,7 +64,7 @@ Codex 原始 BRIDGE 段：
 >
 > BRIDGE: APPROVE
 
-### Codex gpt-6.1-sol 原始審查段
+### Codex gpt-6.1-sol 原始審查段（不採信：來源無法核對，見〈外層審查紀錄校正〉）
 
 > 未發現阻擋性缺陷。核准候選 tree：`dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196`。
 >
@@ -82,6 +86,7 @@ Codex 原始 BRIDGE 段：
 |---|---|---|---|
 | 第 2 輪 | `cb392d2..f2d9533` | `BRIDGE: REJECT`（tree 值對不上、缺完整 diff 摘要、Windows FAIL 根因未定） | Codex sol 額度用完，無結果 |
 | 第 3 輪 | `f2d9533..0789e1f` | `BRIDGE: REJECT`（未逐行審 2207 行；缺無競爭負載下的 Linux selftest 連跑、ST-12 處置、逐檔行為摘要） | grok 因 prompt 截斷 crash，無結果 |
+| 第 4 輪 | `0789e1f..0e97195` | Claude Opus 5.5（pi）：`BRIDGE: APPROVE` | grok-4.7：`BRIDGE: APPROVE` |
 
 本輪無法核對 `ee8b50a` 所錄 APPROVE 原文的來源，故**不採為核准依據**。核准仍待外層兩位非實作者審查者對下列 tree 明確表態；在此之前 `APPROVED_REVISION.json` 維持 `c4c22c0e…`。
 
@@ -184,3 +189,54 @@ Codex 原始 BRIDGE 段：
 - 同次 SC-18 原生案例 `test_autostart_l15_tx_once` 為 passed。
 
 **送審請求**：請外層兩位非實作者審查者對 tree `dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196` 於發現清單最後寫 `BRIDGE: APPROVE` 或 `BRIDGE: REJECT`＋理由。
+
+## 第 4 次送審外層審查原文（2026-10-27）
+
+本節為 `tools/uart_stdio_bridge/APPROVED_REVISION.json` 的 `review_ref` 所指的唯一核准依據。
+
+- 審查範圍：外層第 4 輪，`0789e1f..0e97195`，並以本文件〈第 4 次送審資料〉對 bridge tree `dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196` 表態。
+- 審查者：Claude Opus 5.5（經 pi 執行）、grok-4.7。兩位皆非實作者；實作者為另一個 Claude Opus 5.5 session。
+- 原指示預計的審查者為 Claude Sonnet 與 Codex gpt-6.1-sol；第二位因額度與工具故障先後改派，實際表態者以本節為準。
+- 審查日期：2026-10-27（Asia/Taipei）。
+- 結論：兩位均為 `BRIDGE: APPROVE`。Claude Opus 5.5 的前提「更新核准檔前先處理發現 1，讓 `review_ref` 只指向可核對的審查原文」已於本次修訂處理：前述兩節標題標明不採信，Round 2 一節刪去「並對此 tree 明確核准」，並新增本節。
+
+### Claude Opus 5.5（pi）BRIDGE 段原文
+
+> ## BRIDGE 審查範圍與判斷
+>
+> **範圍**
+> - 產品碼 4 檔我逐行審過：`cli.py`、`endpoints/__init__.py`、`bridge/core.py`、`win_serial.py`（+319／−60）。
+> - 測試 4 檔我沒有逐行審，只跑了全套 310 passed。
+>
+> **判斷依據**
+> - **鎖序**：I/O 路徑固定先寫入串行鎖、再讀取串行鎖，最後才到 `_peer_state_lock`。控制面（關閉、重開）是先 `_lock`、再寫、再讀、最後 `_peer_state_lock`。持有串行鎖或 `_peer_state_lock` 期間都不會再取 `_lock`，沒有死鎖路徑。
+> - **`peer_open()` 不持鎖**：handle 被關閉後讀 DSR 會丟例外，例外被接住並回 `None`，可以接受。
+> - **POSIX 路徑**：唯一實質變更是 `core.py` 的 status 欄位。`posix-pty` 本來就宣告 `peer_state=True`，所以輸出不變。第 3 輪 Linux 首跑的 ST-08／ST-10 失敗發生在不受本 diff 影響的路徑，不能歸責於本次變更。同一 tree 另外 7 次乾淨執行全部 PASS。
+> - **ST-12 NOT_RUN**：沿用 `7d5b5fc` 起就存在、且包含在現行核准 tree 內的資格規則，本 diff 沒有放寬。
+>
+> **不阻擋、建議下次改 src 時順帶處理的觀察**
+> - **極短期限一律不寫入**：`win_serial.py:139` 與 `:355-359`、`:402`。`write_some(timeout_s≤~1ms)` 會被 1 ms 下限墊高，但隨後的剩餘期限檢查一定不過，結果恆回 0，從不寫入。現有產品呼叫端最小用 50 ms，不受影響；但這是 API 語意變更，應在 docstring 寫明。
+> - **50 ms 讀取永遠走輪詢**：`win_serial.py:106`、`:242`。pumps 以 0.05 s 讀取時，取得鎖後剩餘一定小於 50 ms，所以永遠走 `in_waiting` 輪詢，最多增加約 10 ms 延遲。前一輪的 R1 已提過，只影響效能。
+>
+> BRIDGE: APPROVE — tree `dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196` 重算相符；產品碼逐行審查沒有阻擋性缺陷，鎖序無死鎖路徑；Linux 5 份與 Windows COM20:COM21 的 selftest artifacts 都綁定此 tree，raw 結果 PASS，ST-12 NOT_RUN 依既有規則接受；bridge 測試 310 passed。前提：更新核准檔前，必須先處理發現 1，讓 `review_ref` 只指向可核對的審查原文。
+
+### grok-4.7 BRIDGE 段原文
+
+> NO FINDINGS
+>
+> BRIDGE: APPROVE
+>
+> 候選 tree `dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196` 可核准。我用與 `tool_tree_sha256()` 相同的演算法，對 git 物件重算：`7098a97` 為核准值 `c4c22c0e…`，`228aa76` 為 `d44a761a…`，`dbbc1f7` 為 `76ec0480…`，`1b21aae` 為 `681abdd7…`，`cc7e30d` 與 HEAD `0e97195` 都是 `dde967aa…`。`cc7e30d..HEAD` 的 `tools/uart_stdio_bridge` 無差異。`APPROVED_REVISION.json` 仍是 `c4c22c0e…`。
+>
+> `7098a97..HEAD -- tools/uart_stdio_bridge` 是 8 個 commit、8 個檔案、+2207/−119；產品碼 4 檔 +319/−60，測試 4 檔 +1888/−59。`test_win_serial_endpoint.py` 的 `+def test_` 是 49 處，與送審帳（42 個新替身、3 個新原生、2 個移位、2 個只加參數）一致。舊的 18 個測試名稱都還在；`test_io_does_not_reconfigure_unchanged_timeouts` 仍檢查 timeout 指派次數，`test_disconnected_endpoint_waits_then_reconnects` 仍要求讀寫各等滿 0.05 秒，`test_cap_windows_com__roundtrip_full_byte_range` 仍有 `bytes(got) == data` 與 `result.get("data") == data`。
+>
+> 寫入路徑在最後一次 DSR 取樣之後重算剩餘期限；已設定的 `write_timeout` 大於剩餘預算時不送出。settle 起點在取樣之後、於 `_peer_state_lock` 內讀取；`_open_locked` 與 `_release_serial_locked` 都會把起點清成 `None`。`open_endpoint()` 的 `peer_gate` 預設 `False`。POSIX `capabilities()["peer_state"]` 仍為 `True`。`selftest/runner.py` 自 `7d5b5fc` 起對 win-serial 缺 `transport_disconnect` 的 ST-12 允許 `NOT_RUN`，這次 diff 沒有碰到該檔。
+>
+> Linux 五份 `selftest-report.json` 都是 14/14 PASS、`complete: true`、tree `dde967aa…`；第一、二份 sha256 前綴為 `3728c346`、`c6d333f4`。Windows `261027-134138-2314533` 的 raw 報告是 13 PASS、ST-12 `NOT_RUN`（`cap_missing:transport_disconnect`），`qualification_output` 只有 `tree_approved: false`。日誌裡的 `HARNESS_DUT_EXITED`、`HARNESS_WRITE_UNCERTAIN`、`HARNESS_EVIDENCE_OVERFLOW` 對應 ST-06、ST-13、ST-14，這三項在報告中的 verdict 是 PASS。
+
+### 未採為阻擋、留待下次修改 `tools/uart_stdio_bridge` 時處理
+
+- 極短期限（≤ 約 1 ms）的 `write_some` 恆回 0，docstring 未載明（Claude Opus 5.5 觀察一）。
+- 50 ms 讀取恆走 `in_waiting` 輪詢，最多多約 10 ms 延遲（Claude Opus 5.5 觀察二；同第三輪 R1）。
+
+本次不改 `tools/uart_stdio_bridge` 原始碼，以免 tree 再次變動而需重審。
