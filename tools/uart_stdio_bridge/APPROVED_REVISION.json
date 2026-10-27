@@ -1,7 +1,7 @@
 {
   "schema_version": "bridge-approved.v1",
-  "tree_sha256": "c4c22c0e369e4c593e3b4a6a9a0ebb21c37259cc63b0394d295948568e60b030",
-  "reviewer": "Claude Sonnet max (non-implementer; codex sol re-review pending)",
-  "review_ref": "docs/rust-refactor/reviews/s1x-bridge-review.md",
-  "date": "2026-10-22"
+  "tree_sha256": "dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196",
+  "reviewer": "Claude Opus 5.5 (pi) + grok-4.7 (non-implementer)",
+  "review_ref": "docs/rust-refactor/reviews/s1x-bridge-review-3.md",
+  "date": "2026-10-27"
 }
