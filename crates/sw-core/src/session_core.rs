@@ -373,6 +373,10 @@ pub struct SessionCore {
     worker_health: Option<Arc<dyn Fn() -> crate::uart_bridge::WorkerSnapshot + Send + Sync>>,
     /// P6 Task 7（#56）：tick 到期還原所建立的回放 hold（結算前 lease 類操作回 SESSION_INTERACTIVE_BUSY）。
     tick_close_hold: Option<u64>,
+    /// lane 刪除回放使 replay hold 釋放（D-22(3)）；事件結尾讓佇列繼續出列。
+    hold_release_kick: bool,
+    /// 前景命令的 `timeout_s`（human 逾時開 lease 的 `max(timeout_s, hard_timeout_s)`）。
+    fg_cmd_timeout_s: f64,
     /// P6 Task 7：P5 既有函式內產生、於本事件結尾併入的效果（LeaseIndex 一律排在 Reply 之前）。
     fx_buf: Vec<Effect>,
     /// P6 Task 7：目前事件的 monotonic 時刻（不帶 `now` 參數的既有 helper 使用）。
@@ -537,6 +541,8 @@ impl SessionCore {
             stashed_human: None,
             worker_health: None,
             tick_close_hold: None,
+            hold_release_kick: false,
+            fg_cmd_timeout_s: 0.0,
             fx_buf: Vec::new(),
             now_cache: 0,
             fg_origin: None,
@@ -728,6 +734,9 @@ impl SessionCore {
             }
             // actor 層 envelope（`PtyPair` 不進 core）；拆封由 07 Task 10 的 executor 負責。
             MailboxItem::Control(ControlEvent::ConsoleAttachReq { .. }) => todo!("P6 Task 10"),
+        }
+        if std::mem::take(&mut self.hold_release_kick) && !self.foreground_busy() {
+            effects.0.extend(self.start_next(now));
         }
         effects.0.extend(self.poll_force_recover(now));
         // P6 Task 7：retained human 還原（READY／ATTACHED）與緩衝效果併入（LeaseIndex 先於 Reply）。
@@ -2582,7 +2591,12 @@ impl SessionCore {
         }
         self.foreground_reboot = false;
         self.quiet.arm(now);
-        self.apply_quiet_armed(now)
+        // Python `_handle_reboot_command` 寫入後呼叫 `arm_boot_quiet()`，其內一律 `invalidate_deferred("boot_quiet")`：
+        // 這是出列前 `RebootCommand` 之外的第二個 BC-02 失效點（reboot 在途期間擷取的 human 輸入不得回放）。
+        let mut fx = Vec::new();
+        self.invalidate_input(InvalidateReason::QuietRearm, &mut fx);
+        fx.extend(self.apply_quiet_armed(now));
+        fx
     }
 
     fn timer(&mut self, event: TimerEvent, now: Mono) -> Vec<Effect> {
@@ -3340,6 +3354,9 @@ impl SessionCore {
             }
             let grant_cmd = Some(command.cmd_id.clone());
             if mode == "interactive" {
+                // Python 先 `_begin_foreground_operation_locked`（關 admission）再 `_open_interactive_locked`：
+                // admission 已關時 human owner 只記為 pending，不會搶走現有 raw owner。
+                self.command_fg_begin(&command.req.origin, true);
                 let timeout = command
                     .req
                     .timeout_s
@@ -3363,9 +3380,10 @@ impl SessionCore {
                         CmdOutcome::Result(result),
                         &self.wall_iso(),
                     );
+                    // 空命令同樣成對 begin／finish（finish 時 admission 開放與回放）。
+                    self.command_fg_finish(&mut effects);
                     continue;
                 }
-                self.command_fg_begin(&command.req.origin, true);
                 let grant = self.new_grant(grant_cmd);
                 self.pending_ops.insert(
                     grant.op_id,
@@ -3391,6 +3409,7 @@ impl SessionCore {
             }
             let reboot = !self.is_passthrough() && is_reboot_command(&command.req.command);
             self.command_fg_begin(&command.req.origin, false);
+            self.fg_cmd_timeout_s = command.req.timeout_s;
             if reboot {
                 // 增補 #13：reboot 命令命中點為 BC-02 失效點，送出前失效（`bridge.invalidate_deferred("reboot")`）。
                 self.invalidate_input(InvalidateReason::RebootCommand, &mut effects);
@@ -3920,6 +3939,10 @@ impl SessionCore {
                     "partial" => true,
                     "recovery_action" => key,
                 })
+            }
+            // DF-02：line editor 來源逾時走 `_recover_after_failure` 的 human 分支（不轉 ATTACHED、不寫 capture）。
+            OpOutcome::PromptTimeout { .. } if self.fg_origin_is_human() => {
+                CmdOutcome::Result(self.human_timeout_promote(self.fg_cmd_timeout_s, now))
             }
             OpOutcome::PromptTimeout { stdout } => {
                 self.set_terminal_capture(cmd_id, Some(stdout), Some("PROMPT_TIMEOUT"), now);

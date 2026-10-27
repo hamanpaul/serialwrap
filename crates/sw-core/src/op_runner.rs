@@ -20,7 +20,7 @@ use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{PyFlags, PyRegex, compile, valid_completion_regex};
 
-use crate::arbiter::QueuedCommand;
+use crate::arbiter::{QueuedCommand, SubmitOrigin};
 use crate::login_fsm::LoginOutcome;
 use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
@@ -471,6 +471,12 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         }
     }
     if !matched {
+        if matches!(q.req.origin, SubmitOrigin::HumanConsole { .. }) {
+            // `_recover_after_failure` human 分支（DF-02）：不送救援鍵；actor 依前景來源改開 human lease。
+            return OpOutcome::PromptTimeout {
+                stdout: clean_text(&ctx.rx.text_from(pre_offset)),
+            };
+        }
         return recover_after_failure(
             ctx,
             grant,

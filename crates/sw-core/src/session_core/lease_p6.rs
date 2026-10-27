@@ -231,7 +231,8 @@ impl SessionCore {
         self.human.ownership.on_detach(client_id);
         self.after_owner_change(before);
         self.human.deferred_mut().remove_client(client_id);
-        self.human.lane.remove_client(client_id);
+        let removed = self.human.lane.remove_client(client_id);
+        self.settle_removed_replays(&removed);
         self.human.remove_console(client_id);
         self.fx_buf.push(Effect::ConsoleClose {
             client_id: client_id.to_string(),
@@ -442,10 +443,11 @@ impl SessionCore {
         matches!(self.fg_origin, Some(SubmitOrigin::HumanConsole { .. }))
     }
 
-    /// human 來源 reboot 的 `PROMOTE_HUMAN_INTERACTIVE`（`_execute_command_inner` human 分支）。
-    pub(super) fn human_reboot_promote(&mut self, now: Mono) -> PyDict {
+    /// human 來源 open-or-refresh lease（`_refresh_interactive_locked`＋`_open_interactive_locked`）；
+    /// `#56` tick 還原結算前回 `Err(SESSION_INTERACTIVE_BUSY)`。
+    fn human_promote_lease(&mut self, timeout_s: f64, now: Mono) -> Result<String, PyDict> {
         if self.tick_close_hold.is_some() {
-            return pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
+            return Err(pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" });
         }
         self.refresh_lease_p6(now);
         if self.lease.is_none() {
@@ -453,14 +455,40 @@ impl SessionCore {
                 Some(SubmitOrigin::HumanConsole { client_id }) => format!("human:{client_id}"),
                 _ => "human:".to_string(),
             };
-            let timeout = self
-                .profile
-                .template
-                .hard_timeout_s
-                .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
-            self.open_lease(&source, timeout, false, now);
+            self.open_lease(&source, timeout_s, false, now);
         }
-        let lease_id = self.lease.as_ref().map(|l| l.interactive_id.clone()).unwrap_or_default();
+        Ok(self.lease.as_ref().map(|l| l.interactive_id.clone()).unwrap_or_default())
+    }
+
+    /// human 來源命令逾時（`_recover_after_failure` human 分支，DF-02）：不送救援鍵、不改 state。
+    pub(super) fn human_timeout_promote(&mut self, cmd_timeout_s: f64, now: Mono) -> PyDict {
+        let timeout = cmd_timeout_s.max(self.profile.template.hard_timeout_s);
+        let lease_id = match self.human_promote_lease(timeout, now) {
+            Ok(id) => id,
+            Err(busy) => return busy,
+        };
+        pydict! {
+            "ok" => true,
+            "execution_mode" => "interactive",
+            "interactive_session_id" => lease_id,
+            "status" => "interactive",
+            "stdout" => "",
+            "partial" => true,
+            "recovery_action" => "PROMOTE_HUMAN_INTERACTIVE",
+        }
+    }
+
+    /// human 來源 reboot 的 `PROMOTE_HUMAN_INTERACTIVE`（`_execute_command_inner` human 分支）。
+    pub(super) fn human_reboot_promote(&mut self, now: Mono) -> PyDict {
+        let timeout = self
+            .profile
+            .template
+            .hard_timeout_s
+            .max(ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
+        let lease_id = match self.human_promote_lease(timeout, now) {
+            Ok(id) => id,
+            Err(busy) => return busy,
+        };
         self.set_state(SessionState::Attached, now);
         self.set_last_error(Some("REBOOTING".to_string()), None);
         self.recovering = false;
@@ -528,7 +556,8 @@ impl SessionCore {
             self.human.ownership.on_prune(&cid);
             self.after_owner_change(before);
             self.human.deferred_mut().remove_client(&cid);
-            self.human.lane.remove_client(&cid);
+            let removed = self.human.lane.remove_client(&cid);
+            self.settle_removed_replays(&removed);
             self.human.remove_console(&cid);
             self.fx_buf.push(Effect::ConsoleClose { client_id: cid });
         }

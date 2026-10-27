@@ -96,12 +96,14 @@ impl HumanLane {
         }
     }
 
-    /// 排入 backlog 尾端；超過 `HUMAN_TX_BACKLOG_MAX_BYTES` 時清空該 client 的 backlog（連同本筆），回 `Err(丟棄 bytes)`。
-    pub fn push_backlog(&mut self, item: BacklogItem) -> Result<(), usize> {
+    /// 排入 backlog 尾端；超過 `HUMAN_TX_BACKLOG_MAX_BYTES` 時清空該 client 的 backlog（連同本筆），
+    /// 回 `Err(被丟棄的項目)`（呼叫端依其中的回放結算 hold）。
+    pub fn push_backlog(&mut self, item: BacklogItem) -> Result<(), Vec<BacklogItem>> {
         if self.backlog_bytes + item.payload.len() > HUMAN_TX_BACKLOG_MAX_BYTES {
             let cid = item.tag.client_id.clone();
-            let dropped = item.payload.len() + self.remove_client(&cid);
-            return Err(dropped);
+            let mut removed = self.remove_client(&cid);
+            removed.push(item);
+            return Err(removed);
         }
         self.backlog_bytes += item.payload.len();
         self.backlog.push_back(item);
@@ -150,19 +152,20 @@ impl HumanLane {
         out
     }
 
-    /// 清掉該 client 的 backlog（detach／drop／溢位）；回傳丟棄 bytes 數。
-    pub fn remove_client(&mut self, client_id: &str) -> usize {
-        let mut dropped = 0;
-        self.backlog.retain(|b| {
-            if b.tag.client_id == client_id {
-                dropped += b.payload.len();
-                false
+    /// 清掉該 client 的 backlog（detach／drop／溢位）；回傳被丟棄的項目（依原順序）。
+    pub fn remove_client(&mut self, client_id: &str) -> Vec<BacklogItem> {
+        let mut out = Vec::new();
+        let mut keep = VecDeque::with_capacity(self.backlog.len());
+        for item in self.backlog.drain(..) {
+            if item.tag.client_id == client_id {
+                self.backlog_bytes -= item.payload.len();
+                out.push(item);
             } else {
-                true
+                keep.push_back(item);
             }
-        });
-        self.backlog_bytes -= dropped;
-        dropped
+        }
+        self.backlog = keep;
+        out
     }
 
     /// drain Phase 1：清空在途簿記與 backlog（舊 epoch 的晚到結算一律忽略）；回傳被丟棄的 backlog 項目。

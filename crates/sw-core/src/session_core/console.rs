@@ -203,6 +203,7 @@ impl SessionCore {
             self.human.replay_after_revoked = true;
             return;
         }
+        self.human.replay_after_revoked = false;
         let epoch = self.generations.input_epoch;
         let items = self.human.take_replay(epoch);
         self.submit_replays(items, fx);
@@ -356,11 +357,13 @@ impl SessionCore {
 
     fn push_backlog(&mut self, item: BacklogItem, fx: &mut Vec<Effect>) {
         let cid = item.tag.client_id.clone();
-        if let Err(dropped) = self.human.lane.push_backlog(item) {
+        if let Err(removed) = self.human.lane.push_backlog(item) {
+            let dropped: usize = removed.iter().map(|b| b.payload.len()).sum();
             fx.push(Effect::Warn(format!(
                 "human TX backlog 超過 262144 bytes，整段清空（com={} client_id={cid} dropped={dropped}）",
                 self.profile.com
             )));
+            self.settle_removed_replays(&removed);
         }
     }
 
@@ -413,6 +416,12 @@ impl SessionCore {
                 }
             }
         }
+    }
+
+    /// 延後回放（D-22(4)）可兌現的 context：前景空閒、admission 開、未 suspend。
+    fn deferred_replay_context_open(&self) -> bool {
+        let o = &self.human.ownership;
+        self.foreground.is_none() && !o.admission_blocked && o.suspend_depth == 0 && o.suspended_owner.is_none()
     }
 
     /// D-15(4) 的「context 允許」：前景空閒且該 client 此刻會被路由為 Raw。
@@ -469,8 +478,10 @@ impl SessionCore {
         self.pump_lane(now, &mut fx);
         if self.human.replay_after_revoked
             && !self.human.replay_hold.as_ref().is_some_and(|h| h.revoked)
+            && self.deferred_replay_context_open()
         {
-            self.human.replay_after_revoked = false;
+            // 延後的回放點只在前景空閒、admission 開且未 suspend 時兌現；否則留給下一個回放點
+            // （該前景的 fg_finish／resume）處理，被撤銷者已 restore_front 不會遺失（D-22(4)）。
             self.replay_point(&mut fx);
         }
         if released && !self.foreground_busy() {
@@ -708,9 +719,25 @@ impl SessionCore {
         self.human.ownership.on_drop(client_id);
         self.after_owner_change(before);
         self.human.deferred_mut().remove_client(client_id);
-        self.human.lane.remove_client(client_id);
+        let removed = self.human.lane.remove_client(client_id);
+        self.settle_removed_replays(&removed);
         self.human.remove_console(client_id);
         Vec::new()
+    }
+
+    /// lane 刪除（斷線／溢位／prune）的項目中屬於現行 hold 的回放一併結算，避免 hold 永不釋放（D-22(3)）。
+    /// hold 因此釋放時，事件結尾由 `kick_after_hold_release` 讓佇列繼續出列。
+    pub(super) fn settle_removed_replays(&mut self, removed: &[BacklogItem]) {
+        let Some(current) = self.human.replay_hold.as_ref().map(|h| h.hold_id) else {
+            return;
+        };
+        let n = removed
+            .iter()
+            .filter(|b| b.kind == (BacklogKind::Replay { hold: current }))
+            .count();
+        if n > 0 && self.hold_settled(n) {
+            self.hold_release_kick = true;
+        }
     }
 
     /// `ControlEvent::ConsoleScan`：更新 peer 判定（D-09）；hub 掃描另做 peer grace 與 self-heal（Task 7）。
