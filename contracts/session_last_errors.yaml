@@ -96,7 +96,7 @@ values:
     detail: "null（無附帶 detail）"
     terminal: false
     auto_reprobe: {attached: false, detached: false}
-    states: ["DETACHED"]
+    states: ["DETACHED", "ATTACHING"]
     set_by: ["sw_core/session_manager.py:1841 (clear_session)"]
     cleared_by: ["auto:裝置在線立即清除@session_manager.py:1846", "auto:裝置事件觸發之 attach 開頭清除@session_manager.py:2602", "operator:device.attach", "operator:session.attach", "operator:session.recover", "operator:daemon restart"]
     promoted_via: []

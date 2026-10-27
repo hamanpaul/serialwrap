@@ -1661,10 +1661,21 @@ fn clear_reopen_attaching_clears_last_error() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::Reattach { .. })));
-    assert!(rx.try_recv().unwrap().is_ok());
+    // 審查 F97（多輪 Medium）：Python `_complete_drain` 於鎖內設 `ATTACHING`＋`last_error="CLEARED"` 後才
+    // `_spawn_attach`，`clear_session` 在 `_await_drain` 後立即組回應 → 回應為 `CLEARED`（黑箱 Python 3/3）；
+    // `_attach_by_id` 開埠前才 `last_error = None`。先前「ATTACHING 期間不帶 CLEARED」的 P5-T20 觀察是回應之後的
+    // get_state，不是 clear 回應本身。
+    let reply = rx.try_recv().unwrap().expect("clear 回應");
+    match reply.get("session") {
+        Some(PyValue::Dict(session)) => {
+            assert_eq!(session.get("state"), Some(&PyValue::from("ATTACHING")));
+            assert_eq!(session.get("last_error"), Some(&PyValue::from("CLEARED")));
+        }
+        other => panic!("缺 session：{other:?}"),
+    }
     let s = h.public();
     assert_eq!(s["state"], PyValue::from("ATTACHING"));
-    assert_eq!(s["last_error"], PyValue::Null);
+    assert_eq!(s["last_error"], PyValue::from("CLEARED"));
     let effects = h.feed(ControlEvent::DeviceAttached {
         by_id: DEVICE_BY_ID.into(),
         real_path: REAL_PATH.into(),
@@ -1672,4 +1683,5 @@ fn clear_reopen_attaching_clears_last_error() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    assert_eq!(h.public()["last_error"], PyValue::Null, "開埠前清除（`_attach_by_id`）");
 }

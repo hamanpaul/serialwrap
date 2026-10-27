@@ -170,7 +170,8 @@ struct Entry {
 struct AttachOp {
     cancelled: Arc<AtomicBool>,
     /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
-    after_clear: bool,
+    /// 在途 op 與 clear 重疊時由 `spawn_attach_with` OR 進來，避免該次再解析遺失（審查 F98）。
+    after_clear: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -849,7 +850,13 @@ impl Shared {
             self.warn(format!("shutdown 中，略過 attach {by_id}"));
             return;
         }
-        if released.contains(by_id) || inner.inflight.contains_key(by_id) {
+        if released.contains(by_id) {
+            return;
+        }
+        if let Some(op) = inner.inflight.get(by_id) {
+            if after_clear {
+                op.after_clear.store(true, Ordering::SeqCst);
+            }
             return;
         }
         let Some(real) = inner.device_path(by_id).map(str::to_string) else {
@@ -874,7 +881,7 @@ impl Shared {
         }
         let op = AttachOp {
             cancelled: Arc::new(AtomicBool::new(false)),
-            after_clear,
+            after_clear: Arc::new(AtomicBool::new(after_clear)),
         };
         inner.inflight.insert(by_id.to_string(), op.clone());
         drop(inner);
@@ -1258,7 +1265,7 @@ impl Shared {
         if state == "RELEASED" || self.released_by_ids().contains(by_id) {
             return;
         }
-        if state != "DETACHED" && !(op.after_clear && state == "ATTACHING") {
+        if state != "DETACHED" && !(op.after_clear.load(Ordering::SeqCst) && state == "ATTACHING") {
             // 已有 bridge（或 attach／drain 進行中）：不再解析（再開 PROBE 會 two-reader），交給 actor 判斷。
             // clear 收尾的 ATTACHING 尚未開埠（bridge 已關），與 Python `_attach_by_id` 同樣先再解析。
             self.send_attached(by_id);
@@ -2156,8 +2163,9 @@ impl SessionManager {
             .as_deref()
             == Some("DETACHED");
         if is_ok(&result) && detached && !by_id.is_empty() {
-            // 無 bridge 的 clear：裝置在線時重新 attach（Python `clear_session` 的 `_spawn_attach`）。
-            self.shared.send_attached(&by_id);
+            // core 判定裝置不在線而 manager 鏡像有裝置（兩者不一致時）：仍經 `_spawn_attach` 再解析，不直接以舊
+            // profile 開埠（審查 F98）。裝置確實不在線時 `spawn_attach` 為 no-op。
+            self.shared.spawn_attach(&by_id);
         }
         Ok(result)
     }

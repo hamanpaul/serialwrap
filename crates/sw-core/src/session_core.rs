@@ -3037,12 +3037,8 @@ impl SessionCore {
                     _ => Vec::new(),
                 };
                 effects.extend(open_effects);
-                if kind == StopKind::Clear && self.state == SessionState::Attaching {
-                    // Python `clear_session`：drain 收尾設 ATTACHING＋CLEARED 後立即 `_spawn_attach`，
-                    // `_attach_by_id` 開埠前 `last_error = None`；ATTACHING 期間不帶 CLEARED（P5-T20 黑箱）。
-                    // 開埠前由 manager 再解析 pin／fallback（`Effect::Reattach`，審查 F62）。
-                    self.set_last_error(None, None);
-                }
+                // Clear：回應帶 Python `_complete_drain` 的 `ATTACHING`＋`CLEARED`；`last_error` 於再解析後接受
+                // `DeviceAttached`（開埠前，Python `_attach_by_id`）才清除（審查 F97）。
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }

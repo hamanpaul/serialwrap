@@ -278,7 +278,10 @@ impl Service {
             .filter_map(|s| s.get("session_id").and_then(PyValue::as_str).map(str::to_string))
             .filter(|sid| Some(sid) != owner.as_ref());
         for sid in owner.clone().into_iter().chain(others) {
-            let r = self.manager.route(&sid, req(), ROUTE_TIMEOUT)?;
+            // 個別 session 查詢失敗（actor 已結束／逾時）不使整個 RPC 失敗：Python 只查 manager 的全域 dict（審查 F98）。
+            let Ok(r) = self.manager.route(&sid, req(), ROUTE_TIMEOUT) else {
+                continue;
+            };
             if is_ok(&r) {
                 return Ok(r);
             }

@@ -310,6 +310,8 @@ fn launcher_argv_matches_multi_open_rule2() {
     );
 }
 
+/// 名稱沿用 Stage 1（nodeid 已入 L1 鎖，不得改名）：P5-T19 起驗證「exec 路徑仍拒絕 rust（`launcher_argv`），
+/// 但 rust bundle 入口交 Rust daemon 本體」（審查 F82／F98）。
 #[test]
 fn launcher_rejects_rust_implementation_in_stage1() {
     let dir = release_manifest_dir();

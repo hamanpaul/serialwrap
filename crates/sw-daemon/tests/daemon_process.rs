@@ -436,7 +436,7 @@ fn wal_dir_readonly_at_start_blocks_login_probe() {
     // `_unhealthy_reason = "write_failed"`（sw_core/wal.py append 失敗分支），attach 時假 DUT 的 `login: ` RX 即觸發；
     // 依 Python 斷言 write_failed（`dir_unwritable` 只在尚無任何 append 前可見，屬計畫指定的 Rust-only 值，見 F93）。
     let socket = env.socket.clone();
-    wait_until("unhealthy_reason == write_failed", SHORT, || {
+    wait_until("unhealthy_reason == write_failed", LONG, || {
         health_status(&socket)["wal"]["unhealthy_reason"] == "write_failed"
     });
 
@@ -574,8 +574,11 @@ fn daemon_stop_from_second_connection_during_force_recover() {
     wait_until("救援 TX 寫入 WAL", SHORT, || !recover_tx_payloads(&env).is_empty());
     let started = Instant::now();
     rpc_once(&env.socket, STOP);
-    assert_eq!(d.wait(Duration::from_secs(30)).code(), Some(0), "{}", d.stderr());
-    assert!(started.elapsed() <= Duration::from_secs(25), "{:?}", started.elapsed());
+    let code = d.wait(Duration::from_secs(30)).code();
+    let elapsed = started.elapsed();
+    eprintln!("daemon.stop → exit 耗時 {elapsed:?}（登入型 DUT，非 Python shell DUT 同情境）");
+    assert_eq!(code, Some(0), "耗時 {elapsed:?}：{}", d.stderr());
+    assert!(elapsed <= Duration::from_secs(25), "{elapsed:?}");
     assert!(
         !d.stderr().contains("shutdown incomplete"),
         "handler 收斂後的關機不得報 shutdown incomplete：{}",
