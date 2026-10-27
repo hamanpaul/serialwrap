@@ -240,7 +240,9 @@ def test_windows_com_runner_is_confined_and_wires_the_frozen_case():
     assert '["device", "attach", "--selector", "COM0"]' in powershell
     assert 'cmd-status-poll' in powershell
     assert 'status_deadline = time.monotonic() + 20' in powershell
-    assert "echo X\\r" in com_test
+    # daemon 以 body＋"\\n" 送出 agent 命令（sw_core/uart_io.py）；案例須比對本案例基線後恰一行。
+    assert '_dut_tx_bytes(wire)[tx_baseline:]' in com_test
+    assert 'b"echo X\\n"' in com_test
     assert 'row.get("dir") == "TX" and row.get("observation") == "dut_stdin_write"' in com_test
     assert 'base64.b64decode(row["payload_b64"], validate=True)' in com_test
 

@@ -388,7 +388,8 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
 @pytest.mark.windows_com
 @pytest.mark.case("sc18-windows-ondemand-autostart")
 def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
-    """SC-18（原生 Windows）：無 daemon 時 `cmd submit` 經 on-demand 自動啟動，DUT 端 `echo X\\r` 恰出現一次。
+    """SC-18（原生 Windows）：無 daemon 時 `cmd submit` 經 on-demand 自動啟動，本案例基線後 DUT 端 TX 恰為一行 `echo X\\n`
+    （daemon 以 body＋`\\n` 送出；原計畫寫 `\\r`，依 CHG-S1X-SC18-TX-BASELINE-01 更正）。
 
     需 owner 在原生 Windows 提供 COM 配對（`SW_TEST_COM_PAIR`）與 DUT 模擬器寫出的 wire 記錄（`SW_TEST_DUT_WIRE`）。
     """

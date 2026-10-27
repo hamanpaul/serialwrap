@@ -1353,7 +1353,7 @@ fn windows_task_restart_aborts_when_daemon_never_exits() {
 | `test_daemon_start_ab_conflict`（黑箱 A/B） | 以 PATH 外的假 `serialwrapd` 行程（`tests/contract_blackbox/bin/fake-serialwrapd --socket /tmp/other`）製造衝突 → Python／Rust stdout 逐位元組相同 |
 | `test_daemon_start_stop_ab_real_daemon`（黑箱 A/B，`process_rpc`） | 隔離目錄以 P3 `py_daemon` 啟動真 daemon → `daemon status` ok → `daemon stop` → ping 失敗；兩實作輸出經 contracts 正規化（pid、started_at）後相同 |
 | `test_daemon_restart_ab`（黑箱 A/B，`process_rpc`） | on-demand restart 後 pid 改變；兩實作輸出形狀 `{ok,restarted,start,stopped}` 經正規化後相同 |
-| `test_autostart_l15_tx_once`（黑箱，`rust_only`、`windows_native`，§0.4） | 原生 Windows 隔離 install root、無 daemon、bridge＋DUT 模擬器：`cmd submit --cmd "echo X"` → DUT 端 `wire.ndjson` 的 `echo X\r` 恰出現一次 |
+| `test_autostart_l15_tx_once`（黑箱，`rust_only`、`windows_native`，§0.4） | 原生 Windows 隔離 install root、無 daemon、bridge＋DUT 模擬器：`cmd submit --cmd "echo X"` → DUT 端 `wire.ndjson` 自本案例基線後的 TX 恰為 `echo X\n`（原文誤寫 `echo X\r`；Python 基線實測送出 `echo X\n`，依 CHG-S1X-SC18-TX-BASELINE-01 更正） |
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_daemon --test mgmt_graceful_stop` → `not implemented: P4-T7`；黑箱 Rust 端 → exit 97（委派 sentinel）。
 - [ ] **步驟 3：實作**（關鍵虛擬碼；`ctx` 即 `CliCtx`）
