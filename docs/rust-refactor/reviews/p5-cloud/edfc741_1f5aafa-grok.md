@@ -1,0 +1,28 @@
+我以非實作者身份審查 `edfc741..1f5aafa`，先讀審查規範與計畫，再逐一核對 commit、測試與 Python 基線。範圍是三個 commit。我先把 diff、計畫與 Python 基線對齊，再核對測試是否真的能在未修正時失敗。我先核對這三個 commit 的差異、鎖定檔與平台 `cfg` 邊界，並在暫存 worktree 驗證回歸測試去掉修正後會失敗。審查 worktree 的檔案不會改。### 18abb03d9c42b5b79d2cd781ad5eda34bbbc5db7 fix(sw-core): attach probe 遇開機 banner 撤銷時落定 ATTACHED，不再永久停在 ATTACHING
+
+1. [High] `crates/sw-core/src/session_core.rs:2383` — quiet 撤銷的 attach `LoginFinished` 被丟棄，下一個 Tick 一律收成 `ATTACHED`＋`PROMPT_UNAVAILABLE`，與 Python `_attach_by_id` 的終態不一致，而且新測試把錯誤終態鎖死。`login_finished` 在狀態不是 `ATTACHING` 或 `fsm_gen` 不符時直接 return（2383–2392）。若 `attach_run_revoked_by_quiet` 為真，只把 `revoked_by_quiet` 設上，不看 `result`。`tick`（2688–2690）再呼叫 `settle_quiet_revoked_attach`（2669–2685）：`adopt_bridge`、`last_error=PROMPT_UNAVAILABLE`、`detail=null`、狀態 `ATTACHED`。生產 actor 的 Tick 起點是單調時鐘加 1 秒，之後每秒一次（`crates/sw-core/src/actor.rs:187`）。commit message 把「延後 ≤1 秒」和「Ready 也不得升 READY」寫成待裁決的差異，但沒有登記 DF／SC。`origin/docs/parity-amendments` 的 OD-21 只核准 PA-OD-1／2／3，並寫明其後新增的對外差異要逐項核准；該檔與 `parity-amendments-2026-10-26.md` 都沒有 OD-23。parity 文件第 7 行要求外部可觀察行為與 Python 1:1。
+
+   輸入 A：command-capable shell，`StartLogin` 的 `fsm_gen=N`，`\n` 與 ready probe 都已 `Completed`，executor 得到 `LoginOutcome::Ready`。banner 的 RX 先被 actor 處理，`fsm_gen` 變成 `N+quiet_bumps`，然後才處理 `LoginFinished { fsm_gen: N, result: Ready }`。Python 在 `sw_core/session_manager.py:4838` 把狀態設成 `READY`、`last_error=None`，並 `confirm_ready()` 清掉 boot quiet（`boot_quiet_remaining_s` 不再倒數）；之後 `cmd submit` 可以進 READY。Rust 在 2392 return，當下仍是 `ATTACHING`、effects 為空；Tick 之後變成 `ATTACHED`、`PROMPT_UNAVAILABLE`、detail null，quiet 仍武裝。`submit` 在 `session_core.rs:1583` 回 `SESSION_NOT_READY`。`crates/sw-core/tests/login_quiet.rs:1196` 的 Ready 分支把這個終態寫成斷言。`tests/session_core.rs:1174` 的 T11 用同一順序送出 Ready，但沒有 `advance`，所以「無效果」只維持到下一個 Tick。
+
+   輸入 B：有 username 與 password（`banner_target` 走 `EnsureReady`），帳密 TX 都已 `Completed`，隨後等待逾時，executor 回 `Failed("SHELL_PROMPT_TIMEOUT")` 或 `Failed("READY_NONCE_TIMEOUT")`（`crates/sw-core/src/login_fsm.rs:197`）。這兩個碼在 `LOGIN_FSM_DETAIL_ERRORS`（`login_fsm.rs:67`），detail 是 RX tail。banner 已把世代加上 quiet 次數。Python 在 `session_manager.py:4762` 停掉 bridge、狀態 `DETACHED`、`last_error` 為原碼並帶 detail；`READY_NONCE_TIMEOUT` 不是 reprobe prompt error（`session_manager.py:1955`）。Rust 不進 2428 的 `begin_stop(LoginFailed)`，Tick 後仍佔著 UART，狀態 `ATTACHED`、碼被改成 `PROMPT_UNAVAILABLE`、detail null。
+
+   輸入 C：`LoginFinished { result: NotReady("PROMPT_UNAVAILABLE") }`，世代差等於 quiet arm 次數（fence 拒絕後續 TX；`login_fsm.rs:302` 的 `refused()`）。Python 在 `session_manager.py:4757` 設 `probe_refused`，不 detach，並在 4850 的同一臨界區寫上 `ATTACHED`＋`PROMPT_UNAVAILABLE`、detail 不精煉。Rust 要等下一個 Tick，這段時間 `get_state` 仍是 `ATTACHING`、`last_error` null。
+
+   回歸：`/tmp` 的乾淨 archive 上，`attach_settles_attached_after_quiet_revokes_probe`、`attach_stale_result_not_from_quiet_still_ignored`、`clear_reopen_attaching_clears_last_error` 三支都過。只拿掉 2387–2390 的標記後，第一支在 `NotReady("PROMPT_UNAVAILABLE")` 失敗，1 秒後仍是 `ATTACHING`（left `ATTACHING`，right `ATTACHED`）；對照的 stale 測試仍過。lock 這個 commit 只在 `sets/s21_core/linux/nodeids` 加兩筆，沒有 Windows nodeid，diff 裡沒有 `cfg(`。
+
+   修法：`attach_run_revoked_by_quiet` 為真時不要標記後 return，立刻走既有 match。`Ready` 走 2398 的 READY 臂（`confirm_ready`，`last_error` null）。`NotReady(code)` 走 2416，保留原碼與 `login_error_detail`。`Failed(code)` 走 2428 的 `begin_stop(StopKind::LoginFailed)`，終態 `DETACHED`、原碼與 detail、bridge 關閉。刪除 `settle_quiet_revoked_attach` 與 `tick` 對它的呼叫。改 `attach_settles_attached_after_quiet_revokes_probe`：`NotReady("PROMPT_UNAVAILABLE")` 在 `LoginFinished` 當下就是 `ATTACHED`＋該碼＋detail null；`Ready` 期望 `READY`、`last_error` null、`boot_quiet_remaining_s` null。補一筆 `Failed("SHELL_PROMPT_TIMEOUT")` 或 `Failed("READY_NONCE_TIMEOUT")`，期望 `DETACHED`、原碼、bridge 已停。T11 的「無效果」只留給 `quiet_bumps==0` 的被取代世代。若仍要讓已成功的 probe 在 banner 後不得升 READY，先登記 DF／SC 並取得擁有者逐項核准。不得只把 Tick 提前，卻保留「一律 `PROMPT_UNAVAILABLE`」。
+
+### 9363d9ba9197eb81f8e162f691f17500f7a445ff fix(sw-core): session clear 重新開埠進 ATTACHING 時清除 last_error
+
+NO FINDINGS。`worker_stopped` 只在 `StopKind::Clear` 且已進入 `ATTACHING` 時把 `last_error` 清掉（`session_core.rs:2937`）。`Rebound` 仍留 `DEVICE_REBOUND_REQUIRED`，`reopen_known_device` 沒改。這對應 Python `clear_session` 在 `_complete_drain` 寫下 `ATTACHING`＋`CLEARED` 之後，`_attach_by_id` 於開埠成功、公開 `ATTACHING` 時設 `last_error=None`（`session_manager.py:4641`）。無裝置的 clear 不會進這個分支，`CLEARED` 留在 `DETACHED`。同一 `/tmp` archive：HEAD 上 `clear_reopen_attaching_clears_last_error` 通過；拿掉這 5 行後失敗，left `Str("CLEARED")`、right `Null`。lock 只在 `s21_core.linux.nodeids` 加這一筆。
+
+### 1f5aafa97b6aa2bba2edcbd01e913aacfcfff6e7 test(contract): Slice 2.1 黑箱 A/B 正規化映射與兩處預寫案例補強
+
+NO FINDINGS。`contracts/ab_normalization.yaml` 只列計畫 Step 3 的具名欄位（`wall_ts`、`*_at` 為 `key_suffix`、`mono_ts_ns`、`cmd_id`、`interactive_id`、`nonce`、`vtty`、`pty_path`、`pid`），沒有 regex；`cmd_id`／`interactive_id` 的 `consistent: true` 保留同一次執行內的關聯。`reviewed_by: []` 是提案狀態，這次審查沒有改檔。`test_activity_classification` 改讀 `session.activity_classification`，與 `service.py:1001` 的 `session.activity` 回 `get_session_state`、以及 `to_public_dict` 的欄位位置一致；五類集合還在，並加上 `ok is True` 與 `_rc == 0`。`test_deferred_methods` 的 15 個 method、`METHOD_NOT_FOUND`、`method`、`version`、WAL `current_seq` 斷言沒變；skipif 改讀 `tests/ab_env.AB_ENV`，避開 root conftest 先 pop `SERIALWRAP_AB_LABEL`。這個 commit 沒有動 lock，也沒有把 Windows 原生 L1 標成完成。`python3 scripts/rust/check_cfg_boundary.py` 對審查 worktree 的 exit code 是 0；三個 commit 的 `*.rs` diff 沒有 `cfg(`。
+
+### High／Medium 摘要
+
+| 嚴重度 | Commit | 位置 | 問題 |
+| --- | --- | --- | --- |
+| High | `18abb03` | `crates/sw-core/src/session_core.rs:2383` | quiet 撤銷的 attach 結果被丟棄，Tick 後一律 `ATTACHED`＋`PROMPT_UNAVAILABLE`。Python 對 `Ready` 是 `READY` 並清 quiet，對 `EnsureReady` 的 `Failed` 是 `DETACHED`＋原碼並關埠。測試把 Ready 的錯誤終態鎖住。 |
+| Medium | — | — | 無 |
