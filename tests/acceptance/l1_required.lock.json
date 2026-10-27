@@ -9125,6 +9125,7 @@
           "cargo:sw-core::session_manager::clear_paths",
           "cargo:sw-core::session_manager::com_for_by_id_session_first_then_pending",
           "cargo:sw-core::session_manager::detached_rebind_fallback_smallest_act_no",
+          "cargo:sw-core::session_manager::detect_probe_tx_goes_through_fence",
           "cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
           "cargo:sw-core::session_manager::device_attach_during_shutdown_errors",
           "cargo:sw-core::session_manager::device_removed_drains_to_detached",

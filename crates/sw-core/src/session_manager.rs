@@ -29,7 +29,8 @@ use sw_pal::Capabilities;
 use sw_pal::traits::{
     CancelToken, Clock, CloseReceipt, CloseToken, ConsoleTransportFactory, DeviceInfo, DevicePath,
     FsOps, IoWaker, OpenError, PalError, PalErrorKind, PalResult, ReadOutcome, SerialBackend,
-    SerialConfig, SerialHandle, SerialReader, SerialWriter, SysEnv, UartExclusive, WatcherEvent,
+    SerialConfig, SerialHandle, SerialReader, SerialWriter, SubmitGate, SysEnv, TxOutcome, TxResult,
+    UartExclusive, WatcherEvent,
 };
 use sw_proto::config_types::{LoadResult, ProfileTemplate, SessionProfile, UartProfile};
 use sw_proto::pycompat::{PyErr, clean_text, iso_utc_now};
@@ -50,7 +51,7 @@ use crate::resources::{
 use crate::session_core::SessionState;
 use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, SessionRequest};
 use crate::state_store::{LoadedState, ReleasedRow, StateDelta, StateModel, StateStore};
-use crate::tx_writer::Fence;
+use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, spawn_tx_writer};
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 
@@ -244,6 +245,20 @@ struct Shared {
     closed: AtomicBool,
     /// state.json 持久化觀察者（P5-T19 #3／#4／#68 的 Stage 0 測試鉤子；未設定時不動作）。
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
+    /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 以 frozen 建立（驗證 PROBE TX 經 Fence 時零 TX）。
+    probe_tx_frozen: AtomicBool,
+}
+
+/// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
+struct DetachedWriter;
+
+impl SerialWriter for DetachedWriter {
+    fn write_gated(&mut self, _data: &[u8], _cancel: &CancelToken, _gate: &dyn SubmitGate) -> TxResult {
+        TxResult {
+            outcome: TxOutcome::NotSubmitted,
+            error: None,
+        }
+    }
 }
 
 /// state.json 持久化觀察者（P5-T19，parity #3／#4／#68）。
@@ -1072,23 +1087,61 @@ impl Shared {
         );
     }
 
+    /// PROBE bridge 的 `send`：經 TxWriter／Fence（單一寫入者、OS 提交於 Fence 鎖內重驗），TX WAL 由 TxWriter 以
+    /// `com=PROBE` 寫入（Python PROBE bridge 的 send 同樣走 TX gate 與 WAL）。writer 於送出後原樣交回 `parts`，
+    /// 維持 #51「PROBE 與正式 bridge 共用同一預開 handle」。自動 TX（`LoginProbe` 類）：WAL 不健康時由 Fence 拒絕、零 TX。
+    fn probe_send(&self, parts: &mut HandleParts, payload: &[u8]) {
+        let fence = Fence::new();
+        let frozen = self.probe_tx_frozen.load(Ordering::SeqCst);
+        let wal_unhealthy = self.fanout.current();
+        fence.with(|f| {
+            f.active_epoch = Some(0);
+            f.frozen = frozen;
+            f.wal_unhealthy = wal_unhealthy;
+        });
+        let writer = std::mem::replace(&mut parts.writer, Box::new(DetachedWriter));
+        let (control_tx, _control_rx) = crossbeam_channel::unbounded();
+        let cancel = CancelToken::new(parts.waker.clone());
+        let (handle, stop, join) = spawn_tx_writer(
+            PROBE_COM.to_string(),
+            writer,
+            cancel,
+            fence,
+            self.wal.clone(),
+            0,
+            control_tx,
+        );
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let job = TxJob {
+            permit: TxPermit {
+                op_id: OpId(1),
+                epoch: 0,
+                owner_gen: 0,
+                fsm_gen: 0,
+                class: TxClass::LoginProbe,
+                source: "system".to_string(),
+                cmd_id: None,
+                log: true,
+            },
+            payload: payload.to_vec(),
+            reply: reply_tx,
+        };
+        if handle.jobs.send(job).is_ok() {
+            let _ = handle.wait_report(&reply_rx);
+        }
+        stop.send();
+        if let Ok((writer, _ledger)) = join.join() {
+            parts.writer = writer;
+        }
+    }
+
     /// `detect_template`：送 `\n`、等待 3.0 s（Clock）、以 RX 快照依序比對候選模板的 prompt（再以 login regex 備選）。
     /// 候選排除 passthrough 與 Slice 2.1 不支援能力（`console_unlock_env`、`post_login_cmd`）。RX／TX 以 `com=PROBE` 寫 WAL。
     fn detect_template(&self, parts: &mut HandleParts) -> Option<ProfileTemplate> {
         let mut buf = vec![0u8; 8192];
         // `clear_rx_buffer`：丟棄開埠後已到的舊資料（仍寫 WAL）。
         let _ = self.probe_drain(parts, &mut buf);
-        let _ = self.wal.append(WalAppendReq {
-            com: PROBE_COM,
-            dir: "TX",
-            source: "system",
-            payload: b"\n",
-            cmd_id: None,
-            loss_flag: false,
-            meta: None,
-        });
-        let cancel = CancelToken::new(parts.waker.clone());
-        let _ = parts.writer.write(b"\n", &cancel);
+        self.probe_send(parts, b"\n");
         self.clock.sleep(DETECT_PROBE);
         let bytes = self.probe_drain(parts, &mut buf);
         let snapshot = clean_text(&String::from_utf8_lossy(&bytes));
@@ -1819,6 +1872,7 @@ impl SessionManager {
             note_tx,
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
+            probe_tx_frozen: AtomicBool::new(false),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -2390,6 +2444,12 @@ impl SessionManager {
     /// DeviceWatcher → manager 的事件送端（Delta 轉 `update_devices`、Tick 轉 `on_tick`）。
     pub fn watcher_sender(&self) -> Sender<WatcherEvent> {
         self.watcher_tx.clone()
+    }
+
+    /// 只供測試（test-fakes）：之後的偵測 PROBE 以凍結的 Fence 送出（驗證 PROBE TX 經 Fence：零 TX）。
+    #[cfg(feature = "test-fakes")]
+    pub fn freeze_probe_tx_for_test(&self, frozen: bool) {
+        self.shared.probe_tx_frozen.store(frozen, Ordering::SeqCst);
     }
 
     /// 設定 state.json 持久化觀察者（P5-T19 #3／#4／#68；daemon 組裝點於 `new()` 之後、任何 attach 之前呼叫）。

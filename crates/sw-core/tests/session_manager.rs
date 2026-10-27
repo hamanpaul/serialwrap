@@ -1520,3 +1520,39 @@ fn probe_cfg() -> SerialConfig {
 fn rpc_bind(m: &ManagerRig, selector: &str, by_id: &str) -> PyDict {
     rpc(m.mgr.bind(selector, by_id))
 }
+
+/// P5-T19 fix（skeleton guard `test_business_crates_cannot_bypass_fence_with_always_open`）：偵測 PROBE 的 `\n` 必須經
+/// TxWriter／Fence 送出（Python PROBE bridge 的 send 同樣走 TX gate），TX WAL 只由 TxWriter 寫一筆（不重複）。
+/// 重現：PROBE 的 Fence 凍結時 OS 提交為零、無 PROBE TX WAL；未凍結時恰一次提交、恰一筆 PROBE TX，且 handle 仍只 open 一次（#51）。
+#[test]
+fn detect_probe_tx_goes_through_fence() {
+    let tx_rows = |m: &ManagerRig| {
+        m.wal_rows()
+            .into_iter()
+            .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+            .count()
+    };
+
+    // 凍結：零 TX、偵測不中 → fallback（passthrough 不送任何 bytes）。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    let real = m.real_of("/s/by-id/usb-F");
+    m.reply_probe(&real, b"root@prpl:/# ");
+    m.mgr.freeze_probe_tx_for_test(true);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    assert_eq!(m.device(&real).os_submits(), 0, "PROBE Fence 凍結時不得提交任何 bytes 給 OS");
+    assert_eq!(tx_rows(&m), 0, "未送出的 PROBE TX 不得寫 WAL");
+
+    // 未凍結：恰一次 OS 提交、恰一筆 PROBE TX WAL（由 TxWriter 寫），PROBE 與正式 bridge 共用同一 handle。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    let real = m.real_of("/s/by-id/usb-F");
+    m.reply_probe(&real, b"root@prpl:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "detected");
+    assert_eq!(tx_rows(&m), 1, "PROBE TX 只由 TxWriter 寫一筆 WAL");
+    assert_eq!(m.serial.open_attempts(&real), 1);
+}
