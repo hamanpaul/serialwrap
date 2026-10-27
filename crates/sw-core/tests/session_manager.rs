@@ -12,7 +12,9 @@ use support::*;
 use sw_core::session_core::{SessionRequest, SessionState};
 use sw_core::state_store::{LoadedState, ReleasedRow};
 use sw_pal::fakes::serial::FakeWriteStep;
-use sw_pal::traits::{DeviceInfo, PalError, WatcherEvent};
+use sw_pal::traits::{
+    DeviceInfo, DevicePath, OpenError, PalError, SerialBackend, SerialConfig, WatcherEvent,
+};
 use sw_proto::pycompat::PyErr;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 
@@ -145,6 +147,11 @@ fn next_dynamic_com_for_hotplug() {
     ]);
     let m = ManagerRig::with(&yaml, LoadedState::default(), None);
     m.wait_sessions(2);
+    // COM0／COM2 的裝置在線（使用中），否則依 Python `_attach_by_id` 的 DETACHED-rebind fallback，
+    // 新裝置會改綁到離線且 act_no 最小的 DETACHED target（見 detached_rebind_fallback_smallest_act_no），
+    // 而不是取得新的動態 COM。
+    m.add_device_at("/s/by-id/usb-X1", "/dev/ttyX1");
+    m.add_device_at("/s/by-id/usb-X2", "/dev/ttyX2");
     m.devices(&["/s/by-id/usb-N"]);
     m.mgr.prepare_dynamic_rank(&m.device_keys());
     m.mgr.update_devices(&m.snapshot());
@@ -165,11 +172,21 @@ fn dynamic_session_naming() {
             .insert(by_id.to_string(), "prpl-template".to_string());
     }
     let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
-    m.devices(&["/s/by-id/usb-A", "/s/by-id/usb-B", "/s/by-id/usb-C"]);
-    m.mgr.prepare_dynamic_rank(&m.device_keys());
-    m.mgr.update_devices(&m.snapshot());
-    m.mgr.bootstrap_attach();
-    m.wait_sessions(3);
+    m.mgr.prepare_dynamic_rank(&[
+        "/s/by-id/usb-A".to_string(),
+        "/s/by-id/usb-B".to_string(),
+        "/s/by-id/usb-C".to_string(),
+    ]);
+    // act_no＝建立當下的 session 數＋1（Python `_session_from_template`），並發 attach 時取決於完成順序；
+    // 依序上線使「第 3 個建立的 session」確定為 usb-C（rank 預配 COM2）。
+    for (n, by_id) in ["/s/by-id/usb-A", "/s/by-id/usb-B", "/s/by-id/usb-C"]
+        .into_iter()
+        .enumerate()
+    {
+        m.devices(&[by_id]);
+        m.mgr.update_devices(&m.snapshot());
+        m.wait_sessions(n + 1);
+    }
     let s = m.session("COM2");
     assert_eq!(
         s_of(&s, "session_id").as_deref(),
@@ -242,7 +259,9 @@ fn detect_skips_passthrough_console_unlock_and_unsupported() {
 
 #[test]
 fn probe_bridge_closed_with_receipt_before_real_open() {
-    // PROBE handle 的 CloseReceipt{closed:true, excl_cleared:true} 收到後才 open(real)。
+    // parity-amendments-2026-10-26 #51 改正後語意（名稱保留於 L1 鎖）：Python P1 T10 已凍結「PROBE 與正式 bridge
+    // 共用同一預開 port」（session_manager.py `_preopen_dynamic_attach_port`／`owns_port=False`）。
+    // 命中模板時整段只有一次 open、中間沒有 close；只有 PROBE 未命中且無任何可用模板時才 close 並取得回條。
     let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
     m.devices(&["/s/by-id/usb-D"]);
     let real = m.real_of("/s/by-id/usb-D");
@@ -250,21 +269,16 @@ fn probe_bridge_closed_with_receipt_before_real_open() {
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     assert_eq!(m.wait_profile_source("COM0"), "detected");
-    let ev = m.events();
-    let want = [
-        format!("open:{real}"),
-        format!("close:{real}"),
-        format!("open:{real}"),
-    ];
-    assert!(
-        ev.len() >= 3,
-        "至少應有 open(PROBE)、close(PROBE)、open(real)：{ev:?}"
-    );
+    wait_until("正式 bridge 接手（ATTACHING 結束）", || {
+        m.state_of("COM0").as_deref() != Some("ATTACHING")
+    });
     assert_eq!(
-        &ev[..3],
-        &want[..],
-        "時序應為 open(PROBE)→close(PROBE)→open(real)"
+        m.events(),
+        vec![format!("open:{real}")],
+        "PROBE 與正式 bridge 共用同一 handle：只有一次 open、沒有 close"
     );
+    assert_eq!(m.serial.open_attempts(&real), 1);
+    assert_eq!(m.device(&real).close_count(), 0);
     let probe_rows = m
         .wal_rows()
         .into_iter()
@@ -272,18 +286,56 @@ fn probe_bridge_closed_with_receipt_before_real_open() {
         .count();
     assert!(probe_rows >= 2, "偵測的 RX／TX 應以 com == PROBE 寫入 WAL");
 
-    // 變體：excl_cleared:false 時仍嘗試 open(real)，得 Held → DETACHED＋ATTACH_FAILED:DeviceHeldError（不得靜默吞掉）。
-    let m2 = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    // 變體：PROBE 未命中且無任何 fallback 模板 → 關閉 PROBE handle（回條 excl_cleared:true → 外部可再 open）。
+    const NO_FALLBACK: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
+    let m2 = ManagerRig::with(NO_FALLBACK, LoadedState::default(), None);
     m2.devices(&["/s/by-id/usb-D"]);
     let real2 = m2.real_of("/s/by-id/usb-D");
-    m2.reply_probe(&real2, b"root@prpl:/# ");
-    m2.serial.fail_excl_clear(&real2);
     m2.mgr.update_devices(&m2.snapshot());
     m2.mgr.bootstrap_attach();
-    wait_until("COM0 以 DeviceHeldError 失敗", || {
-        m2.session_last_error("COM0").as_deref() == Some("ATTACH_FAILED:DeviceHeldError")
+    wait_until("PROBE handle 關閉", || {
+        m2.events().contains(&format!("close:{real2}"))
     });
-    assert_eq!(m2.state_of("COM0").as_deref(), Some("DETACHED"));
+    assert_eq!(
+        m2.events(),
+        vec![format!("open:{real2}"), format!("close:{real2}")]
+    );
+    assert_eq!(m2.mgr.counts().0, 0, "無模板時不建立 session");
+    assert!(
+        m2.serial
+            .open_exclusive(&DevicePath(real2.clone()), &probe_cfg())
+            .is_ok(),
+        "close 回條 excl_cleared:true 後外部可再開啟"
+    );
+}
+
+#[test]
+fn dynamic_probe_and_bridge_share_preopened_port() {
+    // #51：動態 detect 的 PROBE handle 命中模板後原樣交給正式 bridge；正式 bridge 在同一 handle 上完成登入至 READY，
+    // 期間外部 open 恆得 Held（無「PROBE 關閉 → 正式 open」的無鎖空窗）。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-S"]);
+    let real = m.real_of("/s/by-id/usb-S");
+    let dev = m.device(&real);
+    install_shell_replies(&dev);
+    dev.on_tx_reply(b"\n\n", b"root@t:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "READY");
+    assert_eq!(s_of(&m.session("COM0"), "profile_source").as_deref(), Some("detected"));
+    assert_eq!(m.serial.open_attempts(&real), 1, "整段只 open 一次");
+    assert_eq!(dev.open_count(), 1);
+    assert_eq!(dev.close_count(), 0, "PROBE 與正式 bridge 之間沒有 close");
+    assert!(
+        !m.events().iter().any(|e| e.starts_with("close:")),
+        "無 CloseReceipt 介於 PROBE 與正式 bridge 之間：{:?}",
+        m.events()
+    );
+    match m.serial.open_exclusive(&DevicePath(real.clone()), &probe_cfg()) {
+        Err(OpenError::Held(_)) => {}
+        Err(other) => panic!("外部 open 應得 Held，實際 {other:?}"),
+        Ok(_) => panic!("外部 open 應得 Held，實際成功"),
+    }
 }
 
 #[test]
@@ -291,7 +343,11 @@ fn sticky_persisted_only_when_ready_and_path_unchanged() {
     // READY 且 real_path 未變 → state.json.profile_detected[by_id] 寫入。
     let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
     m.devices(&["/s/by-id/usb-S"]);
-    install_shell_replies(&m.device(&m.real_of("/s/by-id/usb-S")));
+    let dev_s = m.device(&m.real_of("/s/by-id/usb-S"));
+    install_shell_replies(&dev_s);
+    // FakeDevice 的 `on_tx_reply` 只觸發一次：第一個 `\n` 被偵測 PROBE 用掉；登入 probe 的第二個 `\n`
+    // 需另一個回應（實機每次都會回 prompt）。
+    dev_s.on_tx_reply(b"\n\n", b"root@t:/# ");
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     m.wait_state("COM0", "READY");
@@ -311,8 +367,9 @@ fn sticky_persisted_only_when_ready_and_path_unchanged() {
     });
     m2.retarget_by_id("/s/by-id/usb-S", "/dev/ttyMOVED");
     std::thread::sleep(Duration::from_millis(100));
+    // state.json 一律寫出 profile_detected 區段（Python `_save_state` 的 5 個 key），故以載入結果判斷「未寫入」。
     assert!(
-        !m2.state_text().contains("profile_detected"),
+        m2.load_state_now().profile_detected.is_empty(),
         "READY 前 real_path 改變時不得寫入 sticky：{}",
         m2.state_text()
     );
@@ -422,6 +479,8 @@ fn bind_paths() {
     wait_until("COM0 已取得 usb-A", || {
         m.com_by_id().get("/s/by-id/usb-A").map(String::as_str) == Some("COM0")
     });
+    // attach（登入 probe）完成才有 bridge＋ATTACHED；ATTACHING 期間 bind 同值不屬冪等分支（Python 同）。
+    m.wait_state("COM0", "ATTACHED");
 
     // 空 by_id → INVALID_ARGS。
     let r = rpc_bind(&m, "COM0", "");
@@ -470,6 +529,8 @@ fn bind_paths() {
 fn pin_unpin_paths() {
     let yaml = manager_yaml(&[&t_target("COM0", 1, "/s/by-id/usb-X")]);
     let m = ManagerRig::with(&yaml, LoadedState::default(), None);
+    // COM0 的裝置在線：否則 usb-D 會依 DETACHED-rebind fallback 改綁到離線的 COM0（Python 1:1）。
+    m.add_device_at("/s/by-id/usb-X", "/dev/ttyX");
     m.devices(&["/s/by-id/usb-D"]);
     m.mgr.prepare_dynamic_rank(&m.device_keys());
     m.mgr.update_devices(&m.snapshot());
@@ -540,13 +601,13 @@ fn clear_paths() {
 fn session_attach_paths() {
     let rig_s = |yaml: &str| ManagerRig::with(yaml, LoadedState::default(), None);
 
-    // 無 by_id → DEVICE_NOT_BOUND。
+    // 無 by_id 的 target：Python `load_profiles` 直接丟棄（config.py `if not device_by_id: continue`），
+    // 不會建立 session，故 `attach_session` 的 DEVICE_NOT_BOUND 分支對外不可達（Rust 保留同一分支）。
     let m = rig_s(&manager_yaml(&[
         "{com: COM0, profile: t, act_no: 1, alias: t+1}",
     ]));
-    let sid = m.mgr.resolve("COM0").expect("COM0 session");
-    let r = rpc(m.mgr.route(&sid, SessionRequest::SessionAttach, RPC));
-    assert_eq!(code_of(&r).as_deref(), Some("DEVICE_NOT_BOUND"));
+    assert_eq!(m.mgr.resolve("COM0"), None);
+    assert_eq!(m.mgr.counts().0, 0);
 
     // 無 bridge 且裝置不在快照 → DEVICE_NOT_FOUND，並設 DETACHED。
     let m = rig_s(SHELL_PROFILE);
@@ -621,9 +682,12 @@ fn session_attach_paths() {
     );
 
     // last_error 為 None → 兩欄皆 null（不再回 NOT_READY）。
-    let m = rig_s(SHELL_PROFILE);
+    // 不回應 prompt 時 Python／Rust 皆會把 probe 失敗碼（PROMPT_UNAVAILABLE）寫入 last_error；
+    // 以 Slice 2.1 能力閘（post_login_cmd：不自動登入、不送 TX）取得「ATTACHED 且 last_error 為 None」的 capable session。
+    const GATED_PROFILE: &str = "profiles:\n  g:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: g, act_no: 1, alias: g+1, device_by_id: /s/by-id/usb-A}\n";
+    let m = rig_s(GATED_PROFILE);
     let dev = m.add_device_at("/s/by-id/usb-A", "/dev/ttyOLD");
-    let _ = dev; // 不回應任何 prompt：停在 ATTACHED，無 last_error。
+    let _ = dev;
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     m.wait_state("COM0", "ATTACHED");
@@ -689,9 +753,13 @@ fn shutdown_budget_5s() {
     let sid0 = m.mgr.resolve("COM0").expect("COM0 session");
     m.device("/dev/ttyOLD")
         .script_write(vec![FakeWriteStep::BlockForever]);
+    let dev0 = m.device("/dev/ttyOLD");
+    let submits = dev0.os_submits();
     let _ = m
         .mgr
         .route(&sid0, SessionRequest::Submit(agent_submit("sleep 1")), RPC);
+    // 命令 TX 已交 OS 並阻塞（writer 卡住）後才 shutdown；否則 Phase 1 先凍結 fence，TX 未提交即不會阻塞。
+    wait_until("命令 TX 阻塞於 writer", || dev0.os_submits() > submits);
 
     let t0 = m.clock.elapsed();
     let res = m.mgr.shutdown(Duration::from_secs(5));
@@ -760,6 +828,25 @@ fn begin_shutdown_blocks_hotplug_open() {
         "應恰記錄一筆略過 attach 的 log：{:?}",
         m.warnings()
     );
+
+    // #29（parity-amendments-2026-10-26）：stopping gate 早退時既有 session 不得停在（預標的）ATTACHING——
+    // 裝置於 begin_shutdown 後才上線的 explicit target 維持 DETACHED、零 open。
+    let m2 = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    m2.mgr.begin_shutdown();
+    let real2 = "/dev/ttyLATE";
+    m2.add_device_at("/s/by-id/usb-A", real2);
+    let _ = m2.mgr.watcher_sender().send(WatcherEvent::Delta {
+        added: vec![DeviceInfo {
+            by_id: "/s/by-id/usb-A".to_string(),
+            real_path: real2.to_string(),
+        }],
+        removed: Vec::new(),
+        snapshot: m2.snapshot(),
+    });
+    m2.mgr.bootstrap_attach();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(m2.state_of("COM0").as_deref(), Some("DETACHED"));
+    assert_eq!(m2.serial.open_attempts(real2), 0);
 }
 
 #[test]
@@ -990,8 +1077,444 @@ fn management_ops_commit_failure_is_err() {
 }
 
 // ---------------------------------------------------------------------------
+// parity-amendments-2026-10-26 追加（Task 16）。
+// ---------------------------------------------------------------------------
+
+/// `state.json` released 列。
+fn released_row(by_id: &str) -> ReleasedRow {
+    ReleasedRow {
+        by_id: PyValue::Str(by_id.to_string()),
+        released_by: PyValue::Str("agent".to_string()),
+        released_at: PyValue::Str("2026-10-21T00:00:00".to_string()),
+        reason: PyValue::Str("manual".to_string()),
+    }
+}
+
+/// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。
+fn snapshot_without(m: &ManagerRig, by_id: &str) -> Vec<(String, DeviceInfo)> {
+    m.snapshot().into_iter().filter(|(k, _)| k != by_id).collect()
+}
+
+/// 建立 fallback（others-template）動態 session，等它 ATTACHED 後拔除並等 DETACHED；回傳實體路徑。
+fn fallback_session_then_unplug(m: &ManagerRig, by_id: &str) -> String {
+    m.devices(&[by_id]);
+    let real = m.real_of(by_id);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    m.wait_state("COM0", "ATTACHED");
+    m.mgr.update_devices(&snapshot_without(m, by_id));
+    m.wait_state("COM0", "DETACHED");
+    real
+}
+
+#[test]
+fn released_dynamic_materialize_template_fallback() {
+    // #14：重啟時動態 RELEASED 列的 template 後備（session_manager.py `__init__` released 實體化）：
+    // - template 缺定義但名稱為 others-template／passthrough → 最小 passthrough profile 實體化（非 command_capable）；
+    // - 其他缺定義的 template（如 uboot-template）→ 不實體化、WARNING、保留持久化阻擋（裝置上線也不 open）。
+    const ONLY_PRPL: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
+    let mut loaded = LoadedState::default();
+    loaded
+        .released
+        .insert("others-template:COM3".to_string(), released_row("/s/by-id/usb-R"));
+    loaded
+        .released
+        .insert("uboot-template:COM4".to_string(), released_row("/s/by-id/usb-U"));
+    let m = ManagerRig::with(ONLY_PRPL, loaded, None);
+    let sid = m.mgr.resolve("others-template:COM3").expect("others-template 應以最小 profile 實體化");
+    let s = m.session(&sid);
+    assert_eq!(s_of(&s, "state").as_deref(), Some("RELEASED"));
+    assert_eq!(s_of(&s, "platform").as_deref(), Some("passthrough"));
+    assert_eq!(s.get("command_capable"), Some(&PyValue::Bool(false)));
+    assert_eq!(s_of(&s, "profile_source").as_deref(), Some("fallback"));
+    assert_eq!(s.get("act_no"), Some(&PyValue::Int(PyInt::Small(4))));
+    assert_eq!(s_of(&s, "alias").as_deref(), Some("others-template+4"));
+    assert_eq!(m.mgr.resolve("COM4"), None, "uboot-template 缺定義不得降級實體化");
+    assert!(m.warnings().iter().any(|w| w
+        == "released session 的 template 不存在（session=uboot-template:COM4、profile=uboot-template），保留持久化阻擋"));
+    assert!(
+        m.load_state_now().released.contains_key("uboot-template:COM4"),
+        "未實體化的 released 列須保留在 state.json"
+    );
+    m.add_device_at("/s/by-id/usb-R", "/dev/ttyR");
+    m.add_device_at("/s/by-id/usb-U", "/dev/ttyU");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(m.serial.open_attempts("/dev/ttyR"), 0);
+    assert_eq!(m.serial.open_attempts("/dev/ttyU"), 0, "未實體化列仍阻擋該 tty");
+    assert_eq!(m.mgr.counts().0, 1);
+}
+
+#[test]
+fn released_dynamic_act_no_and_profile_source() {
+    // #14：act_no 由 alias 列（<template>+N）推導，否則 COM 號＋1；profile_source 依 pin／detected／fallback；
+    // session_id 沿用 state.json 的 key（template 經 pin 改變時不重算）。
+    let mut loaded = LoadedState::default();
+    loaded
+        .released
+        .insert("prpl-template:COM2".to_string(), released_row("/s/by-id/usb-P1"));
+    loaded
+        .released
+        .insert("prpl-template:COM5".to_string(), released_row("/s/by-id/usb-P2"));
+    loaded
+        .released
+        .insert("others-template:COM8".to_string(), released_row("/s/by-id/usb-P3"));
+    let mut row = PyDict::new();
+    row.insert("session_id", PyValue::from("prpl-template:COM2"));
+    loaded.aliases.insert("prpl-template+7".to_string(), row);
+    loaded
+        .profile_pins
+        .insert("/s/by-id/usb-P2".to_string(), "others-template".to_string());
+    loaded
+        .profile_detected
+        .insert("/s/by-id/usb-P3".to_string(), "prpl-template".to_string());
+    let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+
+    let a = m.session("prpl-template:COM2");
+    assert_eq!(a.get("act_no"), Some(&PyValue::Int(PyInt::Small(7))));
+    assert_eq!(s_of(&a, "alias").as_deref(), Some("prpl-template+7"));
+    assert_eq!(s_of(&a, "profile_source").as_deref(), Some("fallback"));
+
+    let b = m.session("prpl-template:COM5");
+    assert_eq!(s_of(&b, "session_id").as_deref(), Some("prpl-template:COM5"));
+    assert_eq!(s_of(&b, "profile").as_deref(), Some("others-template"));
+    assert_eq!(s_of(&b, "profile_source").as_deref(), Some("pin"));
+    assert_eq!(b.get("act_no"), Some(&PyValue::Int(PyInt::Small(6))));
+    assert_eq!(s_of(&b, "alias").as_deref(), Some("others-template+6"));
+
+    let c = m.session("others-template:COM8");
+    assert_eq!(s_of(&c, "profile").as_deref(), Some("prpl-template"));
+    assert_eq!(s_of(&c, "profile_source").as_deref(), Some("detected"));
+    assert_eq!(c.get("act_no"), Some(&PyValue::Int(PyInt::Small(9))));
+    for s in [a, b, c] {
+        assert_eq!(s_of(&s, "state").as_deref(), Some("RELEASED"));
+    }
+}
+
+#[test]
+fn com_for_by_id_session_first_then_pending() {
+    // #20：既有 session 的 COM 優先；否則 startup 預配（pending）COM；都沒有 → None。
+    let yaml = manager_yaml(&[&others_target("COM5", 6, "/s/by-id/usb-X", "x")]);
+    let m = ManagerRig::with(&yaml, LoadedState::default(), None);
+    m.mgr.prepare_dynamic_rank(&[
+        "/s/by-id/usb-X".to_string(),
+        "/s/by-id/usb-A".to_string(),
+    ]);
+    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-X").as_deref(), Some("COM5"));
+    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(), Some("COM0"));
+    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-none"), None);
+    m.add_device_at("/s/by-id/usb-X", "/dev/ttyX");
+    m.devices(&["/s/by-id/usb-A"]);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("usb-A 建立 session", || m.com_by_id().contains_key("/s/by-id/usb-A"));
+    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(), Some("COM0"));
+}
+
+#[test]
+fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
+    // #26：bind 遇舊 by_id 的 attach op（此處為卡在 open 的 #181 再偵測）→ 取消並等待 3000 ms；
+    // 逾時 → SESSION_RECOVERING＋drain_stalled；op 結束後重試即成功。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    let t0 = std::time::Instant::now();
+    let r = rpc(m.mgr.bind("COM0", "/s/by-id/usb-Z"));
+    let waited = t0.elapsed();
+    assert!(waited >= Duration::from_millis(3000), "應等待 3000 ms：{waited:?}");
+    assert_eq!(code_of(&r).as_deref(), Some("SESSION_RECOVERING"));
+    assert_eq!(r.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        s_of(&session_field(&r), "state").as_deref(),
+        Some("RECOVERING")
+    );
+    m.serial.release_open(&real);
+    // 取消的 op 拿到 handle 後立即關閉（不交給 session）。
+    wait_until("取消的 op 關閉 handle", || m.device(&real).close_count() == 2);
+    let r = rpc(m.mgr.bind("COM0", "/s/by-id/usb-Z"));
+    assert!(is_ok(&r), "op 結束後 bind 應成功：{r:?}");
+    assert_eq!(
+        s_of(&m.session("COM0"), "device_by_id").as_deref(),
+        Some("/s/by-id/usb-Z")
+    );
+}
+
+#[test]
+fn hotplug_invalidates_pending_attach_op_and_closes_unused_port() {
+    // #27：attach op 進行中裝置被拔除 → op 失效；之後拿到的 port 未被消費即關閉（零 TX、不建立 bridge）。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let dev = m.device(&real);
+    let _ = dev.take_tx();
+    m.serial.block_open(&real);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測卡在 open", || m.serial.open_attempts(&real) == 2);
+    m.mgr.update_devices(&snapshot_without(&m, "/s/by-id/usb-D"));
+    m.serial.release_open(&real);
+    wait_until("未消費的 port 關閉", || dev.close_count() == 2);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(dev.open_count(), 2);
+    assert!(dev.take_tx().is_empty(), "失效的 op 不得送出任何 TX");
+    assert_eq!(m.state_of("COM0").as_deref(), Some("DETACHED"));
+    assert_eq!(m.serial.open_attempts(&real), 2, "之後不得再 open");
+}
+
+#[test]
+fn pending_rank_pruned_on_removal() {
+    // #28：裝置離線時 prune 其預配 COM；熱插的新裝置可回收該號，不得保留給已離線的板。
+    let m = ManagerRig::templates_only();
+    m.devices(&["/s/by-id/usb-B"]);
+    m.mgr.prepare_dynamic_rank(&[
+        "/s/by-id/usb-A".to_string(),
+        "/s/by-id/usb-B".to_string(),
+    ]);
+    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A").as_deref(), Some("COM0"));
+    m.mgr.update_devices(&m.snapshot()); // usb-A 不在快照 → prune
+    assert_eq!(m.mgr.com_for_by_id("/s/by-id/usb-A"), None);
+    m.mgr.bootstrap_attach();
+    wait_until("usb-B 建立 session", || m.com_by_id().contains_key("/s/by-id/usb-B"));
+    assert_eq!(m.com_by_id()["/s/by-id/usb-B"], "COM1");
+    m.devices(&["/s/by-id/usb-C"]);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("usb-C 建立 session", || m.com_by_id().contains_key("/s/by-id/usb-C"));
+    assert_eq!(m.com_by_id()["/s/by-id/usb-C"], "COM0");
+}
+
+#[test]
+fn rematerialize_profile_recomputes_session_id_and_alias() {
+    // #31：pin 後重新 attach → 換 template，session_id 依新 profile 重算、自動 alias 跟著改名、alias 列搬移；
+    // 使用者自訂的 alias 保留。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    assert_eq!(m.mgr.resolve("COM0").as_deref(), Some("others-template:COM0"));
+    assert!(is_ok(&rpc(m.mgr.pin("COM0", "prpl-template"))));
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("rematerialize 完成", || {
+        m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
+    });
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "session_id").as_deref(), Some("prpl-template:COM0"));
+    assert_eq!(s_of(&s, "alias").as_deref(), Some("prpl-template+1"));
+    assert_eq!(s_of(&s, "profile_source").as_deref(), Some("pin"));
+    assert_eq!(m.mgr.resolve("others-template:COM0"), None);
+    let aliases = m.load_state_now().aliases;
+    assert_eq!(
+        aliases
+            .get("prpl-template+1")
+            .and_then(|r| r.get("session_id"))
+            .and_then(PyValue::as_str),
+        Some("prpl-template:COM0")
+    );
+    assert!(!aliases.contains_key("others-template+1"), "舊自動 alias 應移除：{aliases:?}");
+
+    // 自訂 alias：rematerialize 不改名。
+    let m2 = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    fallback_session_then_unplug(&m2, "/s/by-id/usb-D");
+    assert!(is_ok(&rpc(m2.mgr.alias_set("others-template:COM0", "mybox"))));
+    assert!(is_ok(&rpc(m2.mgr.pin("COM0", "prpl-template"))));
+    m2.mgr.update_devices(&m2.snapshot());
+    wait_until("rematerialize 完成", || {
+        m2.mgr.resolve("mybox").as_deref() == Some("prpl-template:COM0")
+    });
+    assert_eq!(s_of(&m2.session("COM0"), "alias").as_deref(), Some("mybox"));
+}
+
+#[test]
+fn pin_applies_on_reattach() {
+    // #32（#181）：既有 fallback session 被 pin 後，重新 attach 套用 pin（繞過偵測：不送 PROBE）。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let dev = m.device(&real);
+    let _ = dev.take_tx();
+    let probe_rows_before = m
+        .wal_rows()
+        .iter()
+        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE"))
+        .count();
+    assert!(is_ok(&rpc(m.mgr.pin("COM0", "prpl-template"))));
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("pin 套用並重新 attach", || {
+        m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
+            && m.state_of("COM0").as_deref() == Some("ATTACHED")
+    });
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile_source").as_deref(),
+        Some("pin")
+    );
+    assert_eq!(s_of(&m.session("COM0"), "platform").as_deref(), Some("prpl"));
+    let probe_rows_after = m
+        .wal_rows()
+        .iter()
+        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE"))
+        .count();
+    assert_eq!(probe_rows_after, probe_rows_before, "pin 繞過偵測，不得送 PROBE");
+}
+
+#[test]
+fn fallback_redetects_on_reattach() {
+    // #32（#181）：fallback 只是暫時分類——重新 attach 時再偵測一次；命中 → profile 換成偵測結果（detected）。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    // 第一次偵測已送過 `\n`（FakeDevice 以累積 TX 比對 trigger）：重插後的再偵測以第二個 `\n` 觸發 prompt。
+    m.device(&real).on_tx_reply(b"\n\n", b"root@prpl:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測命中 prpl-template", || {
+        m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
+    });
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "profile_source").as_deref(), Some("detected"));
+    assert_eq!(s_of(&s, "platform").as_deref(), Some("prpl"));
+    // 再偵測與正式 bridge 共用同一 handle（#51）：本次重插只有一次 open。
+    assert_eq!(m.serial.open_attempts(&real), 2);
+}
+
+#[test]
+fn unresolvable_pin_falls_through() {
+    // #32（#181）：指向不存在 template 的 pin 視同無 pin，fallback session 仍再偵測（不被失效 pin 卡死）。
+    let mut loaded = LoadedState::default();
+    loaded
+        .profile_pins
+        .insert("/s/by-id/usb-D".to_string(), "no-such-template".to_string());
+    let m = ManagerRig::with(&manager_yaml(&[]), loaded, None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    // 第一次偵測已送過 `\n`（FakeDevice 以累積 TX 比對 trigger）：重插後的再偵測以第二個 `\n` 觸發 prompt。
+    m.device(&real).on_tx_reply(b"\n\n", b"root@prpl:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測命中", || {
+        m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
+    });
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile_source").as_deref(),
+        Some("detected")
+    );
+}
+
+#[test]
+fn attach_finish_respawns_when_state_requires() {
+    // #50：開啟途中裝置改指（BridgeOpened 為舊路徑）→ 舊 worker 交 executor 退休 drain，且因 session 仍需 attach，
+    // actor 以目前 real_path 再送一次 OpenBridge（Python `_spawn_attach` 收尾自動再 spawn）。對外狀態維持 ATTACHING。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let first = h.feed(sw_core::mailbox::ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.to_string(),
+        real_path: "/fake/tty-old".to_string(),
+    });
+    assert!(first.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { dev, .. } if dev.0 == "/fake/tty-old")));
+    let second = h.feed(sw_core::mailbox::ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.to_string(),
+        real_path: "/fake/tty-new".to_string(),
+    });
+    assert!(
+        !second.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { .. })),
+        "ATTACHING 中不得並行第二個 open"
+    );
+    let opened = h.opened_bridge("/fake/tty-old");
+    let effects = h.feed(sw_core::mailbox::ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    assert!(
+        effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::BeginDrain { .. })),
+        "舊路徑的 worker 須退休 drain"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::OpenBridge { dev, .. } if dev.0 == "/fake/tty-new")),
+        "仍需 attach → 以新路徑再送 OpenBridge"
+    );
+    assert_eq!(s_of(&h.public(), "state").as_deref(), Some("ATTACHING"));
+}
+
+#[test]
+fn clear_during_shutdown_errors() {
+    // #97：shutdown 中 session.clear → Err("daemon stopping")（framing 轉 EXCEPTION）；RELEASED 早退先於 stopping。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    m.mgr.begin_shutdown();
+    match m.mgr.route(&sid, SessionRequest::Clear, RPC) {
+        Err(e) => assert_eq!(e.message, "daemon stopping"),
+        Ok(d) => panic!("stopping 後 clear 應回 Err，實際 {d:?}"),
+    }
+    assert_eq!(m.dev.close_count(), 0, "clear 被拒時不得 drain");
+    assert_eq!(m.state_of("COM0").as_deref(), Some("READY"));
+
+    let m2 = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid2 = m2.mgr.resolve("COM0").expect("COM0 session");
+    rpc(m2.mgr.route(
+        &sid2,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Str("t".to_string()),
+        },
+        RPC,
+    ));
+    m2.wait_state("COM0", "RELEASED");
+    m2.mgr.begin_shutdown();
+    let r = rpc(m2.mgr.route(&sid2, SessionRequest::Clear, RPC));
+    assert_eq!(r.get("released"), Some(&PyValue::Bool(true)));
+}
+
+#[test]
+fn device_attach_during_shutdown_errors() {
+    // #97：shutdown 中 device.attach → Err("daemon stopping")，不 open。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Str("t".to_string()),
+        },
+        RPC,
+    ));
+    m.wait_state("COM0", "RELEASED");
+    let opens = m.dev.open_count();
+    m.mgr.begin_shutdown();
+    match m.mgr.route(&sid, SessionRequest::DeviceAttach { force: false }, RPC) {
+        Err(e) => assert_eq!(e.message, "daemon stopping"),
+        Ok(d) => panic!("stopping 後 device.attach 應回 Err，實際 {d:?}"),
+    }
+    assert_eq!(m.dev.open_count(), opens);
+    assert_eq!(m.state_of("COM0").as_deref(), Some("RELEASED"));
+}
+
+#[test]
+fn dynamic_attach_skipped_during_shutdown_or_drain() {
+    // #97：shutdown 中新裝置不建立動態 session、不 open；已越過 gate 的動態 attach 於 open 返回後即關閉（零 TX）。
+    let m = ManagerRig::templates_only();
+    m.mgr.begin_shutdown();
+    m.devices(&["/s/by-id/usb-N"]);
+    let real = m.real_of("/s/by-id/usb-N");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(m.mgr.counts().0, 0);
+    assert_eq!(m.serial.open_attempts(&real), 0);
+
+    let m2 = ManagerRig::templates_only();
+    m2.devices(&["/s/by-id/usb-N"]);
+    let real2 = m2.real_of("/s/by-id/usb-N");
+    m2.serial.block_open(&real2);
+    m2.mgr.update_devices(&m2.snapshot());
+    wait_until("動態 attach 卡在 open", || m2.serial.open_attempts(&real2) == 1);
+    m2.mgr.begin_shutdown();
+    m2.serial.release_open(&real2);
+    wait_until("open 返回後關閉", || m2.device(&real2).close_count() == 1);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(m2.mgr.counts().0, 0, "drain／shutdown 中不建立動態 session");
+    assert!(m2.device(&real2).take_tx().is_empty(), "零 TX（不送偵測 probe）");
+}
+
+// ---------------------------------------------------------------------------
 // 測試輔助（本檔專用）。
 // ---------------------------------------------------------------------------
+
+/// PROBE 預設 UART 設定（外部 open 驗證用）。
+fn probe_cfg() -> SerialConfig {
+    SerialConfig::from_uart_profile(115_200, 8, "N", 1, "none", false)
+}
 
 /// `bind` 的 RPC 呼叫（Result 解包）。
 fn rpc_bind(m: &ManagerRig, selector: &str, by_id: &str) -> PyDict {

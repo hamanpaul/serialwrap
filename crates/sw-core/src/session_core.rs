@@ -152,6 +152,15 @@ pub enum SessionRequest {
     CancelQueued {
         cmd_id: String,
     },
+    /// P5-T16：manager 的 profile 再解析（#181 `_rematerialize_profile_locked`）：無 bridge 時原地換 template，
+    /// `session_id` 依新 `profile_name` 重算；有 bridge 或 drain 中回 `SESSION_RECOVERING`（manager 不在此時呼叫）。
+    SetProfile {
+        profile: SessionProfile,
+        profile_source: String,
+    },
+    /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
+    #[cfg(feature = "test-fakes")]
+    ForceStateForTest(SessionState),
 }
 
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
@@ -323,8 +332,13 @@ pub struct SessionCore {
     pending_auto_login: bool,
     shutdown_requested: bool,
     shutdown_complete: bool,
+    /// P5-T16：`StopKind::Bind` drain 完成後要改綁的 by_id（Python `_DrainJob.target_by_id`）。
+    pending_bind: Option<String>,
     #[cfg(feature = "test-fakes")]
     panic_events_remaining: u8,
+    /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
+    #[cfg(feature = "test-fakes")]
+    last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
 }
 
 struct PendingOpenStop {
@@ -472,8 +486,11 @@ impl SessionCore {
             pending_auto_login: false,
             shutdown_requested: false,
             shutdown_complete: false,
+            pending_bind: None,
             #[cfg(feature = "test-fakes")]
             panic_events_remaining: 0,
+            #[cfg(feature = "test-fakes")]
+            last_error_observer: None,
         }
     }
 
@@ -813,6 +830,38 @@ impl SessionCore {
     #[cfg(feature = "test-fakes")]
     pub fn set_boot_quiet_until_for_test(&mut self, deadline: Mono) {
         self.quiet.boot_quiet_until = deadline;
+    }
+
+    /// 只供測試（test-fakes）：`last_error` 變更觀察者（spawn 前設定；Task 16 `last_error_history`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_last_error_observer(&mut self, observer: Box<dyn Fn(&str) + Send>) {
+        self.last_error_observer = Some(observer);
+    }
+
+    /// P5-T16：manager 啟動時還原 `state.json` 的 RELEASED 列（spawn 前呼叫；Python `__init__` 的 released 實體化）。
+    pub fn init_released(
+        &mut self,
+        released_by: Option<String>,
+        released_at: Option<String>,
+        reason: Option<String>,
+    ) {
+        self.state = SessionState::Released;
+        self.released_by = released_by;
+        self.released_at = released_at;
+        self.released_reason = reason;
+    }
+
+    /// P5-T16：還原 RELEASED 動態 session 時沿用 `state.json` 的 session_id（Python `session_id_override`；
+    /// template 經 pin／sticky 改變時 sid 不隨之重算）。spawn 前呼叫。
+    pub fn init_session_id(&mut self, sid: String) {
+        self.sid = sid;
+    }
+
+    /// P5-T16：動態 attach 開埠失敗時保留可診斷的 DETACHED session（spawn 前呼叫；`_record_dynamic_open_failure`）。
+    pub fn init_detached_error(&mut self, last_error: String, detached_at: String) {
+        self.state = SessionState::Detached;
+        self.last_error = Some(last_error);
+        self.detached_at = Some(detached_at);
     }
 }
 
@@ -1292,6 +1341,10 @@ impl SessionCore {
     fn set_last_error(&mut self, error: Option<String>, detail: Option<String>) {
         if self.last_error != error {
             self.last_error_detail = None;
+            #[cfg(feature = "test-fakes")]
+            if let (Some(observer), Some(value)) = (self.last_error_observer.as_ref(), error.as_deref()) {
+                observer(value);
+            }
         }
         self.last_error = error;
         if detail.is_some() {
@@ -1456,7 +1509,27 @@ impl SessionCore {
             SessionRequest::Bind { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
-            SessionRequest::Bind { .. } => s21_todo!("T15", "bind request"),
+            SessionRequest::Bind { by_id } => self.bind_request(by_id, reply, now),
+            SessionRequest::SetProfile {
+                profile,
+                profile_source,
+            } => {
+                if self.generations.conn_epoch.is_some()
+                    || self.drain_in_progress()
+                    || self.open_real_path.is_some()
+                {
+                    return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+                }
+                self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
+                self.profile = profile;
+                self.profile_source = profile_source;
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
+            #[cfg(feature = "test-fakes")]
+            SessionRequest::ForceStateForTest(state) => {
+                self.set_state(state, now);
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
             SessionRequest::InteractiveSend {
                 interactive_id,
                 data,
@@ -1660,6 +1733,13 @@ impl SessionCore {
                 Ok(self.session_recovering_reply(now)),
             )];
         }
+        // P5-T16：`attach_session` 的未綁定早退（Python 同樣只在 device_by_id 為空時；config 會丟棄無 by_id 的 target）。
+        if session_attach && self.profile.device_by_id.is_empty() {
+            return vec![Effect::Reply(
+                reply,
+                Ok(self.error_session("DEVICE_NOT_BOUND", now)),
+            )];
+        }
         if session_attach
             && self.state == SessionState::Released
             && !self
@@ -1715,6 +1795,16 @@ impl SessionCore {
         if self.release_persist_pending {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
         }
+        if !self.device_present && session_attach {
+            // P5-T16：`attach_session` 無 bridge 且裝置不在快照 → DETACHED＋DEVICE_NOT_FOUND（Python 1:1）。
+            self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+            self.detached_at = Some(self.wall_iso());
+            self.set_state(SessionState::Detached, now);
+            return vec![Effect::Reply(
+                reply,
+                Ok(self.error_session("DEVICE_NOT_FOUND", now)),
+            )];
+        }
         if !self.device_present {
             return vec![Effect::Reply(
                 reply,
@@ -1746,6 +1836,64 @@ impl SessionCore {
             cfg: self.serial_config(),
             precheck_holders: !force,
         }]
+    }
+
+    /// P5-T16：`bind_session`（session 層）：同值冪等、有 bridge 先 `StopKind::Bind` drain、否則立即改綁。
+    /// 改綁後一律 DETACHED＋`DEVICE_NOT_FOUND`；裝置在線時由 manager 隨後送 `DeviceAttached` 進 ATTACHING。
+    fn bind_request(&mut self, by_id: String, reply: Reply, now: Mono) -> Vec<Effect> {
+        if self.state == SessionState::Flashing {
+            // Python `bind_session` 鍵序：ok／error_code／selector／session。
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "FLASHING_BUSY",
+                    "selector" => self.profile.com.clone(),
+                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                }),
+            )];
+        }
+        if self.generations.conn_epoch.is_some()
+            && self.profile.device_by_id == by_id
+            && matches!(self.state, SessionState::Ready | SessionState::Attached)
+        {
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => true,
+                    "already_bound" => true,
+                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                }),
+            )];
+        }
+        if self.open_real_path.is_some()
+            || self.pending_attach.is_some()
+            || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+        {
+            return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
+        if self.generations.conn_epoch.is_some() {
+            self.pending_bind = Some(by_id);
+            return self.begin_stop(StopKind::Bind, Some(reply), now).0;
+        }
+        self.apply_bind(by_id, now);
+        vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+    }
+
+    /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。
+    fn apply_bind(&mut self, target: String, now: Mono) {
+        if self.state == SessionState::Released {
+            self.release_persist_pending = false;
+            self.pending_release = None;
+        }
+        self.released_by = None;
+        self.released_at = None;
+        self.released_reason = None;
+        self.profile.device_by_id = target;
+        self.device_present = false;
+        self.known_real_path = None;
+        self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+        self.set_state(SessionState::Detached, now);
     }
 
     fn serial_config(&self) -> SerialConfig {
@@ -1823,6 +1971,14 @@ impl SessionCore {
                             pending.reply,
                             Ok(self.session_recovering_reply(now)),
                         ));
+                    } else if self.state == SessionState::Attaching
+                        && !path_matches
+                        && !self.shutdown_requested
+                    {
+                        // #50（P5-T16）：attach 收尾時仍需 attach（Python `_spawn_attach` finally 再 spawn）：
+                        // 裝置於開啟途中改指 → 以目前 known_real_path 再送一次 OpenBridge；裝置已不在則 DETACHED。
+                        self.open_real_path = None;
+                        effects.extend(self.reopen_known_device(now));
                     }
                     return effects;
                 }
@@ -2725,7 +2881,11 @@ impl SessionCore {
                 }
             }
             StopKind::Bind => {
+                self.set_last_error(Some("REBOUND".into()), None);
                 self.set_state(SessionState::Detached, now);
+                if let Some(target) = self.pending_bind.take() {
+                    self.apply_bind(target, now);
+                }
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }
