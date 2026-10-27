@@ -12,6 +12,7 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-c58e8d4.txt` | Task 13／13-py 後（多出者：`test_l15_smoke::test_reject_zero_tx_runs_on_python`、`test_functest_bridge_smoke::*sm01*` 為 Python daemon `ATTACH_FAILED:DeviceHeldError`，於 76de0cf worktree 同樣失敗；容器內殘留一個早先 slice21 測試洩漏的 throwaway `serialwrapd`（auto mode 不允許本 session 終止），疑為成因；`test_functest_windows_wiring::test_windows_wiring_env_and_argv` 單獨執行於 76de0cf 亦失敗（`WindowsPath` 於 POSIX 不可實例化，順序相依）；`test_human_agent_coexist` t1 單獨 2/2 通過；`test_regression_windows_caps` 單獨 2/2 通過） | 511 | ba8d5196ca29c0e3 |
 | `pytest-fail-91109e7.txt` | Task 14＋15 後（相對 c58e8d4 無新增失敗） | 508 | 5dca7ec693660c98 |
 | `pytest-fail-ae82afe.txt` | 審查第 4 輪後（相對 91109e7：+`test_mgmt_stubs::test_live_daemon_fixture_serves_attached_console_list`（ERROR，單獨重跑 2/2 通過）、+`test_safety_core[SESSION_NOT_READY-ATTACHING]`（起點清單內）） | 510 | a12acbf50459427d |
+| `pytest-fail-aaf2c1d.txt` | 審查第 5 輪後（相對 ae82afe：+`test_bb_daemon_e2e::test_session_reaches_ready`（`逾時 20.0s；最後觀察值：None`；同範圍兩次重跑 1 failed／1 passed，集合不同） | 508 | 031452ef72aa78c7 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
