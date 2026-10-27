@@ -161,3 +161,38 @@ fn test_resolve_config_path_sc09() {
         assert_eq!(&got, want, "{id}");
     }
 }
+
+/// P7 Task 13（parity-amendments #5，A:G-5）：`EVENTS_LOG_PATH = _env_path("SERIALWRAP_EVENTS_LOG_PATH",
+/// os.path.join(EVENTS_RUNTIME_DIR, "events.ndjson"))`——strip 後空 → 預設、`expanduser`。
+/// 期望值以 CPython 3.12 於 `env -i HOME=/fakehome XDG_STATE_HOME=/state` 實跑取得。
+#[test]
+fn events_log_path_env_override() {
+    use sw_proto::runtime_paths::resolve_daemon_dirs;
+    let base = [
+        ("HOME", "/fakehome"),
+        ("USERPROFILE", "/fakehome"),
+        ("XDG_STATE_HOME", "/state"),
+    ];
+    let with = |extra: &[(&str, &str)]| {
+        let mut pairs = base.to_vec();
+        pairs.extend_from_slice(extra);
+        resolve_daemon_dirs(&env_of(&pairs))
+    };
+    let sep = std::path::MAIN_SEPARATOR;
+    let d = with(&[]);
+    assert_eq!(
+        d.events_log_path,
+        format!("{}{sep}events.ndjson", d.events_runtime_dir)
+    );
+    let d = with(&[("SERIALWRAP_EVENTS_LOG_PATH", "   ")]);
+    assert_eq!(
+        d.events_log_path,
+        format!("{}{sep}events.ndjson", d.events_runtime_dir)
+    );
+    let d = with(&[("SERIALWRAP_EVENTS_LOG_PATH", "~/ev/x.ndjson")]);
+    assert_eq!(d.events_log_path, "/fakehome/ev/x.ndjson");
+    let d = with(&[("SERIALWRAP_EVENTS_LOG_PATH", "/abs/e.ndjson")]);
+    assert_eq!(d.events_log_path, "/abs/e.ndjson");
+    let d = with(&[("SERIALWRAP_EVENTS_RUNTIME_DIR", "/rt")]);
+    assert_eq!(d.events_log_path, format!("/rt{sep}events.ndjson"));
+}

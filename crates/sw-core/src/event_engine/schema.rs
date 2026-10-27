@@ -132,7 +132,7 @@ fn str_or(v: Option<&PyValue>, default: &str) -> String {
     v.map_or_else(|| default.to_string(), py_str)
 }
 
-fn type_name(v: &PyValue) -> &'static str {
+pub(crate) fn type_name(v: &PyValue) -> &'static str {
     match v {
         PyValue::Null => "NoneType",
         PyValue::Bool(_) => "bool",
@@ -145,7 +145,7 @@ fn type_name(v: &PyValue) -> &'static str {
 }
 
 /// `int(v)`（JSON 值可出現的型別）。
-fn py_int(v: &PyValue) -> Result<PyInt, RuleError> {
+pub(crate) fn py_int(v: &PyValue) -> Result<PyInt, RuleError> {
     match v {
         PyValue::Int(i) => Ok(i.clone()),
         PyValue::Bool(b) => Ok(PyInt::Small(i128::from(*b))),
@@ -159,7 +159,7 @@ fn py_int(v: &PyValue) -> Result<PyInt, RuleError> {
 }
 
 /// `int(float)`：向零截斷，超出 i128 時以精確十進位字串表示。
-fn float_to_int(f: f64) -> Result<PyInt, RuleError> {
+pub(crate) fn float_to_int(f: f64) -> Result<PyInt, RuleError> {
     if f.is_nan() {
         return Err(RuleError::Value(
             "cannot convert float NaN to integer".into(),

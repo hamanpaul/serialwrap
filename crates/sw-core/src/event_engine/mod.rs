@@ -7,6 +7,7 @@ pub mod dispatcher;
 pub mod event_log;
 pub mod line_buffer;
 pub mod matcher;
+mod pyops;
 pub mod registry;
 pub mod schema;
 

@@ -368,6 +368,8 @@ pub struct DaemonDirs {
     pub by_path_dir: String,
     pub events_dir: String,
     pub events_runtime_dir: String,
+    /// `SERIALWRAP_EVENTS_LOG_PATH`（預設 `<events_runtime_dir>/events.ndjson`；P7 Task 13，parity #5）。
+    pub events_log_path: String,
 }
 
 /// 解析 daemon 目錄（Task 0c）。
@@ -399,11 +401,19 @@ fn resolve_daemon_dirs_for_flavor(env: &EnvSnapshot, flavor: PathFlavor) -> Daem
         &events_runtime_default,
         flavor,
     );
+    let events_log_default = pypath::join(flavor, &events_runtime_dir, &["events.ndjson"]);
+    let events_log_path = daemon_env_path(
+        env,
+        "SERIALWRAP_EVENTS_LOG_PATH",
+        &events_log_default,
+        flavor,
+    );
     DaemonDirs {
         by_id_dir: daemon_env_path(env, "SERIALWRAP_BY_ID_DIR", "/dev/serial/by-id", flavor),
         by_path_dir: daemon_env_path(env, "SERIALWRAP_BY_PATH_DIR", "/dev/serial/by-path", flavor),
         events_dir,
         events_runtime_dir,
+        events_log_path,
     }
 }
 

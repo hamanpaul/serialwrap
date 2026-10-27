@@ -25,6 +25,29 @@
           "cargo:sw-core::event_matcher::selector_filter_com_name_only",
           "cargo:sw-core::event_matcher::stop_join_2s_warning",
           "cargo:sw-core::event_matcher::unknown_pattern_kind_is_value_error",
+          "cargo:sw-core::event_store::counter_clear_and_known_rule_ids",
+          "cargo:sw-core::event_store::counter_file_bytes_match_python",
+          "cargo:sw-core::event_store::counter_file_matches_python_golden",
+          "cargo:sw-core::event_store::counter_load_bad_file_is_default",
+          "cargo:sw-core::event_store::counter_load_raise_messages_match_python",
+          "cargo:sw-core::event_store::diff_against_reports_sorted_ids",
+          "cargo:sw-core::event_store::event_line_format_default_separators_ts_last",
+          "cargo:sw-core::event_store::load_all_valueerror_typeerror_are_failed_df09",
+          "cargo:sw-core::event_store::logger_creates_parent_dir",
+          "cargo:sw-core::event_store::registry_load_directory_entry_reason_has_filename",
+          "cargo:sw-core::event_store::registry_load_matches_python_golden_reasons",
+          "cargo:sw-core::event_store::registry_missing_root_is_empty",
+          "cargo:sw-core::event_store::reset_with_invalid_rule_id_counts_zero_df01",
+          "cargo:sw-core::event_store::rotate_when_size_plus_incoming_exceeds",
+          "cargo:sw-core::event_store::rule_id_traversal_is_refused_df01",
+          "cargo:sw-core::event_store::stale_tmp_is_overwritten",
+          "cargo:sw-core::event_store::tail_filters_use_python_equality",
+          "cargo:sw-core::event_store::tail_missing_file_is_empty_and_reads_current_file_only",
+          "cargo:sw-core::event_store::tail_n_semantics_match_python_slicing",
+          "cargo:sw-core::event_store::tail_non_dict_lines_and_type_errors_match_python",
+          "cargo:sw-core::event_store::upsert_overwrites_existing_df18",
+          "cargo:sw-core::event_store::upsert_rule_file_indent2_sorted_no_newline",
+          "cargo:sw-core::event_store::upsert_schema_error_is_rule_error",
           "cargo:sw-core::login_fsm_full::bcm_two_stage_login_then_post_login_sh_then_nonce",
           "cargo:sw-core::login_fsm_full::bootloader_prompt_last_nonblank_line_uses_py_splitlines",
           "cargo:sw-core::login_fsm_full::cancel_ends_wait_and_sends_nothing_more",
@@ -124,7 +147,8 @@
           "cargo:sw-pal::fs_ops_p7::open_append_error_message_has_quoted_path",
           "cargo:sw-pal::fs_ops_p7::remove_file_if_exists_missing_is_false",
           "cargo:sw-pal::usb_topology::busid_from_sysfs_tempdir",
-          "cargo:sw-pal::usb_topology::busid_resolves_existing_prefix_when_device_link_missing"
+          "cargo:sw-pal::usb_topology::busid_resolves_existing_prefix_when_device_link_missing",
+          "cargo:sw-proto::runtime_paths_golden::events_log_path_env_override"
         ],
         "selector": {
           "argv": [
@@ -204,6 +228,26 @@
             "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
             "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
             "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter"
+          ]
+        }
+      }
+    },
+    "p7_gate:py_parity_df18": {
+      "linux": {
+        "nodeids": [
+          "tests/test_event_replace_df18.py::test_counter_save_uses_replace",
+          "tests/test_event_replace_df18.py::test_registry_upsert_uses_replace"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "-m",
+            "core_portable or posix_only",
+            "tests/test_event_replace_df18.py"
+          ],
+          "markexpr": "core_portable or posix_only",
+          "paths": [
+            "tests/test_event_replace_df18.py"
           ]
         }
       }

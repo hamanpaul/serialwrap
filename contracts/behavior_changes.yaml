@@ -1483,7 +1483,7 @@ changes:
   - id: "DF-18"
     kind: "DF"
     title: "event registry 與 counter 的 tmp→正式檔改名改用 replace（Windows 目的檔已存在時不再失敗）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-10-26"
