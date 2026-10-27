@@ -1815,3 +1815,25 @@ fn session_ready_note_marks_attach_run_only() {
     assert_eq!(h.core.state(), SessionState::Ready);
     assert_eq!(ready_note(&effs), Some(false), "reprobe 到 READY 不得標為 attach");
 }
+
+#[test]
+fn reprobe_plan_ignores_pending_auto_login() {
+    // 審查 F17（Medium，0a187c1）：Python `_probe_existing_bridge` 只依 `login_regex or console_unlock_env` 決定走
+    // 帳密／ensure_ready，不看 `pending_auto_login`（attach 失敗分支不清該旗標，ATTACHED 時可能為真）。
+    // 輸入：login_regex 為空白（config `or` 後 strip 成空字串）、宣告 user_env／pass_env 但未解析；ATTACHED 且
+    // pending_auto_login=true → `session.attach` 再探。Python：probe_ready；舊 Rust：CREDENTIALS_UNRESOLVED。
+    const PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: '  '\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    env_file: /nonexistent/s21.env\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
+    let mut h = CoreHarness::new(PROFILE);
+    h.to_attached(None);
+    h.core.set_pending_auto_login_for_test(true);
+    let (_resp, effs) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let plan = effs.iter().find_map(|e| match e {
+        Effect::StartLogin { plan, .. } => Some(plan.clone()),
+        _ => None,
+    });
+    assert!(
+        matches!(plan, Some(sw_core::login_fsm::LoginPlan::Probe)),
+        "再探應為 probe"
+    );
+    assert_ne!(pget(&h.public(), "last_error"), PyValue::from("CREDENTIALS_UNRESOLVED"));
+}

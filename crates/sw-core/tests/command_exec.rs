@@ -1616,3 +1616,4 @@ fn outstanding_commands_counts_background_ids() {
     assert_eq!(s["foreground_busy"], PyValue::Bool(false));
     assert_eq!(s["outstanding_commands"], PyValue::from(1), "{s:?}");
 }
+

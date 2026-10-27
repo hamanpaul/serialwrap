@@ -2413,12 +2413,18 @@ impl SessionCore {
 
     /// 重新解析帳密並選擇登入計畫（attach／既有 bridge 再探共用）。
     fn choose_plan(&self, quiet_blocks: bool) -> (LoginPlan, Option<&'static str>) {
+        self.choose_plan_with(self.pending_auto_login, quiet_blocks)
+    }
+
+    /// `choose_plan`，`pending_auto_login` 由呼叫端指定：再探（Python `_probe_existing_bridge`）只看
+    /// `login_regex or console_unlock_env`，不算 `pending_auto_login`（審查 F17）。
+    fn choose_plan_with(&self, pending_auto_login: bool, quiet_blocks: bool) -> (LoginPlan, Option<&'static str>) {
         let auth = resolve_session_auth(
             &self.profile,
             self.deps.env.as_ref(),
             self.deps.read_env_file.as_ref(),
         );
-        choose_login_plan(&self.profile, self.pending_auto_login, auth, quiet_blocks)
+        choose_login_plan(&self.profile, pending_auto_login, auth, quiet_blocks)
     }
 
     /// `_emit_credentials_unresolved_warning`：`credentials_warned` 去重；WAL META＋daemon stderr。
@@ -2634,7 +2640,7 @@ impl SessionCore {
             f.fsm_gen = self.generations.fsm_gen;
             f.quiet_active = false;
         });
-        let (plan, _) = self.choose_plan(false);
+        let (plan, _) = self.choose_plan_with(false, false);
         match plan {
             LoginPlan::CredentialsUnresolved { reason, env_file } => {
                 let mut effects = self.credentials_warning(reason, &env_file);
