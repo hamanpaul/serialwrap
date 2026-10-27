@@ -594,3 +594,44 @@ pub fn child_daemon_abort_before_commit() {
 pub fn process_vars() -> BTreeMap<String, String> {
     std::env::vars().collect()
 }
+
+/// P5-T17：以 `sw_proto::pyjson::loads` 讀 repo 內 golden（不引入 serde；`framing.rs` 使用）。
+pub mod serde_free {
+    use std::path::PathBuf;
+    use sw_proto::pyjson::{self, PyValue};
+
+    /// `contracts/golden/rpc/line_limit.json` 的兩個門檻（內容不含 `\n` 的位元組數）。
+    pub struct Golden {
+        pub max_ok_bytes: usize,
+        pub first_close_bytes: usize,
+    }
+
+    /// 由目前工作目錄往上找 repo 相對路徑 `rel`（cargo test 的 cwd 為 crate 目錄）。
+    pub fn repo_file(rel: &str) -> PathBuf {
+        let mut dir = std::env::current_dir().expect("current_dir");
+        loop {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return candidate;
+            }
+            assert!(dir.pop(), "找不到 repo 檔案 {rel}");
+        }
+    }
+
+    /// 讀取 line_limit golden。
+    pub fn load(rel: &str) -> Golden {
+        let text = std::fs::read_to_string(repo_file(rel)).expect("讀取 golden");
+        let PyValue::Dict(d) = pyjson::loads(&text).expect("golden 為合法 JSON") else {
+            panic!("golden 頂層須為 object");
+        };
+        let int = |k: &str| {
+            d.get(k)
+                .and_then(PyValue::as_i64)
+                .unwrap_or_else(|| panic!("golden 缺 {k}")) as usize
+        };
+        Golden {
+            max_ok_bytes: int("max_ok_bytes"),
+            first_close_bytes: int("first_close_bytes"),
+        }
+    }
+}
