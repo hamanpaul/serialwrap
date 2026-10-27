@@ -1625,3 +1625,28 @@ fn banner_during_attach_login_failed_drains_detached() {
     h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
     assert_eq!(h.core.state(), SessionState::Detached);
 }
+
+#[test]
+fn recover_during_pending_attach_returns_reattach() {
+    // 審查 F29（8b8a40f）：Python `recover_session` 在 `bridge is None and by_id in devices` 時一律
+    // `{ok:true, recovering:false, action:REATTACH}`；`_spawn_attach` 對進行中的 attach 不重複開檔。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let effs = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })));
+    let (resp, effs) = h.rpc_full(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    let resp = resp.expect("RPC");
+    assert_eq!(pget(&resp, "ok"), PyValue::Bool(true), "{resp:?}");
+    assert_eq!(pget(&resp, "action"), PyValue::from("REATTACH"));
+    assert_eq!(pget(&resp, "recovering"), PyValue::Bool(false));
+    assert!(
+        !effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })),
+        "attach 進行中不得再發 OpenBridge"
+    );
+    assert_eq!(h.core.state(), SessionState::Attaching);
+}

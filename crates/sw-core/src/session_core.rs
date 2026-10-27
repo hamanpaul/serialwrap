@@ -285,6 +285,9 @@ pub struct SessionCore {
     console_count: usize,
     queue: SessionQueue,
     foreground: Option<OpGrant>,
+    /// 與前景並行的 op（READY recover、self-test probe；審查 F25）：不是 Python 的前景 operation，
+    /// 不佔前景槽、不設 `foreground_busy`；epoch 結束時清空，遲到的完成事件以 stale 回覆。
+    side_ops: HashMap<OpId, OpGrant>,
     queue_registered: bool,
     stop: Option<StopOp>,
     next_stop_id: u64,
@@ -455,6 +458,7 @@ impl SessionCore {
             console_count: 0,
             queue: SessionQueue::new(),
             foreground: None,
+            side_ops: HashMap::new(),
             queue_registered: false,
             stop: None,
             next_stop_id: 0,
@@ -657,7 +661,8 @@ impl SessionCore {
             .reconfirm_remaining_s(now)
             .map(PyValue::from)
             .unwrap_or(PyValue::Null);
-        let outstanding = usize::from(self.foreground.is_some());
+        // Python：`len(background_cmd_ids) + (1 if foreground_busy else 0)`（審查 F27）。
+        let outstanding = self.background_cmd_ids.len() + usize::from(self.foreground_busy());
         let expected_duration = self
             .foreground
             .as_ref()
@@ -718,7 +723,7 @@ impl SessionCore {
             "interactive_session_id",
             option_string(self.lease.as_ref().map(|l| l.interactive_id.as_str())),
         );
-        out.insert("foreground_busy", PyValue::from(self.foreground.is_some()));
+        out.insert("foreground_busy", PyValue::from(self.foreground_busy()));
         out.insert("fg_cmd_expected_duration_s", expected_duration);
         out.insert("console_count", py_int(ctx.console_count));
         out.insert(
@@ -1052,6 +1057,7 @@ impl SessionCore {
             self.generations.conn_epoch = None;
             self.queue_registered = false;
             self.foreground = None;
+            self.side_ops.clear();
             self.foreground_reboot = false;
             self.login_run = None;
             self.clear_interactive();
@@ -1480,7 +1486,7 @@ impl SessionCore {
                     source,
                     reason,
                     closed_consoles: self.console_count as i128,
-                    aborted_cmd: self.foreground.is_some(),
+                    aborted_cmd: self.foreground_busy(),
                 });
                 self.console_count = 0;
                 self.begin_stop(StopKind::Release, Some(reply), now).0
@@ -2810,6 +2816,7 @@ impl SessionCore {
         self.generations.conn_epoch = None;
         self.attached_real_path = None;
         self.foreground = None;
+        self.side_ops.clear();
         self.queue_registered = false;
         self.queue = SessionQueue::new();
         self.clear_interactive();
@@ -3630,7 +3637,7 @@ impl SessionCore {
                 capture.last_seq = wal_seq;
             }
         }
-        if self.foreground.is_some() {
+        if self.foreground_busy() {
             return;
         }
         let Some(cap) = self.log_capture.as_mut() else {
@@ -3846,6 +3853,17 @@ impl SessionCore {
 
     // ---------------- OpFinished ----------------
 
+    /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）是前景 operation；recover、self-test、
+    /// interactive send 不設此旗標（審查 F27）。
+    fn foreground_busy(&self) -> bool {
+        self.foreground.as_ref().is_some_and(|grant| {
+            matches!(
+                self.pending_ops.get(&grant.op_id),
+                Some(PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. })
+            )
+        })
+    }
+
     fn op_finished(
         &mut self,
         op_id: OpId,
@@ -3864,6 +3882,22 @@ impl SessionCore {
             return Vec::new();
         }
         let pending = self.pending_ops.remove(&op_id);
+        if self
+            .side_ops
+            .get(&op_id)
+            .is_some_and(|grant| grant.epoch == epoch)
+        {
+            // 並行 op（READY recover／self-test）：不動前景槽。
+            self.side_ops.remove(&op_id);
+            let mut effects = match pending {
+                Some(PendingOp::Recover { reply }) => self.finish_recover(reply, outcome, now),
+                Some(other) => self.answer_op(other, outcome, now, true),
+                None => Vec::new(),
+            };
+            effects.push(Effect::SettleTx { epoch, op_id });
+            effects.extend(self.start_next(now));
+            return effects;
+        }
         let is_current = self
             .foreground
             .as_ref()
@@ -4184,6 +4218,21 @@ impl SessionCore {
                     ),
                 ];
             }
+            if self.device_present {
+                // attach 已在進行（開檔中）：Python `_spawn_attach` 對 in-flight attach 直接返回，回應仍是
+                // REATTACH；不重複發 `OpenBridge`（審查 F29）。
+                self.set_last_error(None, None);
+                self.set_state(SessionState::Attaching, now);
+                return vec![Effect::Reply(
+                    reply,
+                    Ok(pydict! {
+                        "ok" => true,
+                        "recovering" => false,
+                        "action" => "REATTACH",
+                        "session" => self.session_value(now),
+                    }),
+                )];
+            }
             return vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))];
         }
         match self.state {
@@ -4194,14 +4243,11 @@ impl SessionCore {
                 self.reprobe_existing_bridge(reply, ReprobeWaiter::Recover { force: false }, now)
             }
             SessionState::Ready => {
-                if self.foreground.is_some() {
-                    // Slice 2.1 單一前景槽：前景忙時不併行送救援鍵（Python 會與在途命令並行寫入）。
-                    return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
-                }
+                // Python `recover_session` READY 分支不看 `foreground_busy`：救援鍵與在途命令並行（審查 F25）。
                 let grant = self.new_grant(None);
                 self.pending_ops
                     .insert(grant.op_id, PendingOp::Recover { reply });
-                self.foreground = Some(grant.clone());
+                self.side_ops.insert(grant.op_id, grant.clone());
                 vec![Effect::StartOp {
                     grant,
                     spec: OpSpec::Recover { timeout_s, force },
@@ -4596,10 +4642,7 @@ impl SessionCore {
         match self.self_test_pre_probe(&ctx) {
             Ok(result) => vec![Effect::Reply(reply, Ok(self.finish_self_test(result)))],
             Err(need) => {
-                if self.foreground.is_some() {
-                    // Slice 2.1 單一前景槽：前景忙時不併行送 nonce probe。
-                    return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
-                }
+                // Python `self_test` 不看前景：nonce probe 與在途命令並行（審查 F25）。
                 let rng = self.deps.rng.clone();
                 let sequence = self.next_op_id;
                 let mut fill = |bytes: &mut [u8]| {
@@ -4622,7 +4665,7 @@ impl SessionCore {
                         lease_ctx: self.lease_ctx(),
                     },
                 );
-                self.foreground = Some(grant.clone());
+                self.side_ops.insert(grant.op_id, grant.clone());
                 vec![Effect::StartOp {
                     grant,
                     spec: OpSpec::SelfTestProbe {

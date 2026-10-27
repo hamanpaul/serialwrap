@@ -1523,3 +1523,91 @@ fn command_cancel_running_revokes_tx_op() {
     assert_eq!(h.dev.os_submits(), submits + 1, "撤銷後尾段不得再交 OS");
     assert_eq!(h.dev.take_tx(), b"ech".to_vec());
 }
+
+// ---------------------------------------------------------------------------
+// 審查 F25（High，8b8a40f）／F27（Medium）：Python `recover_session`／`self_test` 不看 `foreground_busy`——
+// READY 且前景命令仍在等 prompt 時，recover 照送 `\x03`／`\x04`、self-test 照送 nonce probe；兩者都不是
+// Python 的前景 operation，不設 `foreground_busy`、不擋 agent log RX。
+// ---------------------------------------------------------------------------
+
+fn ready_with_hung_command() -> (ActorRig, String) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_ok("sleep 20");
+    h.wait_running(&id);
+    wait_tx(&h, b"sleep 20\n");
+    (h, id)
+}
+
+#[test]
+fn recover_while_foreground_command_sends_recover_keys() {
+    let (h, _id) = ready_with_hung_command();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let r = h
+        .request_async(SessionRequest::Recover {
+            timeout_s: 2.0,
+            force: false,
+        })
+        .recv_timeout(Duration::from_secs(10))
+        .expect("recover 回覆")
+        .expect("recover ok");
+    assert_ne!(r["error_code"], PyValue::from("SESSION_BUSY"), "{r:?}");
+    assert_eq!(r["error_code"], PyValue::from("PROMPT_TIMEOUT_RECOVERED"));
+    assert_eq!(r["recovery_action"], PyValue::from("CTRL_C"));
+    assert!(wal_tx_has(&h, b"\x03"), "救援鍵應寫出");
+}
+
+#[test]
+fn self_test_while_foreground_command_sends_probe() {
+    let (h, _id) = ready_with_hung_command();
+    h.dev.on_tx_match(
+        r"__READY__[0-9a-f]+",
+        Box::new(|line: &[u8]| {
+            let text = String::from_utf8_lossy(line).into_owned();
+            let token = text.split("__READY__").nth(1).unwrap_or("").trim().to_string();
+            format!("__READY__{token}\r\nroot@t:/# ").into_bytes()
+        }),
+    );
+    let r = h
+        .request_async(SessionRequest::SelfTest {
+            timeout_s: 2.0,
+            strict_human_lock: false,
+        })
+        .recv_timeout(Duration::from_secs(10))
+        .expect("self-test 回覆")
+        .expect("self-test ok");
+    assert_ne!(r["error_code"], PyValue::from("SESSION_BUSY"), "{r:?}");
+    assert_eq!(r["classification"], PyValue::from("OK"));
+}
+
+#[test]
+fn self_test_probe_in_flight_is_not_foreground_busy() {
+    // F27：nonce probe 等待中（裝置不回 nonce）：`foreground_busy` 為 false、`outstanding_commands` 為 0。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let rx = h.request_async(SessionRequest::SelfTest {
+        timeout_s: 2.0,
+        strict_human_lock: false,
+    });
+    h.wait_for("probe 已送出", |h| {
+        tx_rows(h)
+            .iter()
+            .any(|r| String::from_utf8_lossy(&b64(r)).contains("__READY__"))
+    });
+    let s = h.get_state();
+    assert_eq!(s["foreground_busy"], PyValue::Bool(false));
+    assert_eq!(s["outstanding_commands"], PyValue::from(0));
+    advance_until(&h, Duration::from_millis(200), "self-test 收尾", |_| {
+        !rx.is_empty()
+    });
+}
+
+#[test]
+fn outstanding_commands_counts_background_ids() {
+    // F27：Python `outstanding = len(background_cmd_ids) + (1 if foreground_busy else 0)`。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"echo bg", b"bg\r\nroot@t:/# ");
+    let id = h.submit_with("echo bg", |r| r.mode = "background".into());
+    h.wait_done(&id);
+    let s = h.get_state();
+    assert_eq!(s["foreground_busy"], PyValue::Bool(false));
+    assert_eq!(s["outstanding_commands"], PyValue::from(1), "{s:?}");
+}
