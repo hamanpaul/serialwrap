@@ -386,6 +386,10 @@ fn queued_command_waits_for_replay_settle() {
     assert!(h.foreground_busy());
     let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
     assert_eq!(start_ops(&fx).len(), 1, "結算後 B 才出列");
+    match start_ops(&fx)[0] {
+        OpSpec::Command(q) => assert_eq!(q.cmd_id, b, "出列的是 B"),
+        _ => panic!("應為 OpSpec::Command"),
+    }
     assert_eq!(
         h.tx_order(),
         vec![
@@ -529,4 +533,21 @@ fn empty_interactive_command_reopens_admission() {
     assert_eq!(resp.unwrap().get("ok"), Some(&PyValue::Bool(true)));
     assert!(!h.fence.with(|f| f.human_admission_blocked), "admission 應恢復開放");
     assert!(!h.core.human_console().ownership.admission_blocked);
+}
+
+/// Low（2f4f76a）：drain Phase 1 時在途的 human TX，若 report 仍屬現行 conn_epoch，晚到的結算照樣送 SettleTx（D-15(6)）。
+#[test]
+fn phase1_in_flight_human_tx_still_settles_ledger() {
+    let mut h = ready_with_tcp(&["c1"]);
+    h.set_auto_complete_human_tx(false);
+    h.input("c1", b"a");
+    let permit = h.last_human_permit().unwrap();
+    h.begin_stop(StopKind::IoError);
+    assert_eq!(h.epoch(), permit.epoch, "Phase 1 期間 conn_epoch 仍為舊值");
+    let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::SettleTx { op_id, .. } if *op_id == permit.op_id)),
+        "晚到結算仍須結算帳本"
+    );
+    assert!(human_txs(&fx).is_empty(), "不得因此送出新的 human TX");
 }

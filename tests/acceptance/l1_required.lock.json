@@ -10605,6 +10605,7 @@
           "cargo:sw-core::session_core_console::line_input_echo_then_submit_order",
           "cargo:sw-core::session_core_console::line_rejected_logs_warning_zero_tx",
           "cargo:sw-core::session_core_console::owner_change_updates_fence_before_tx",
+          "cargo:sw-core::session_core_console::phase1_in_flight_human_tx_still_settles_ledger",
           "cargo:sw-core::session_core_console::queued_command_waits_for_replay_settle",
           "cargo:sw-core::session_core_console::raw_input_becomes_human_tx",
           "cargo:sw-core::session_core_console::reboot_command_invalidates_before_send",
