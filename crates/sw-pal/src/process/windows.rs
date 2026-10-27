@@ -39,7 +39,8 @@ use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 /// 不會在旗標被暫時取消的視窗內把不可繼承的 handle 交給子行程。std `Command` 的 `Stdio::inherit()`
 /// 會另行 `DuplicateHandle` 出可繼承副本，不受此旗標影響。
 ///
-/// 鎖只在同一行程多執行緒並行 spawn 時有作用：正式 `sw-cli` 無執行緒、`exec_or_wait_opts` 只在
+/// 鎖只在同一行程多執行緒並行 spawn 時有作用：正式 `sw-cli` 沒有並行建立行程的執行緒（`sysenv` 的
+/// pipe reader 執行緒只讀取子行程輸出、不 spawn）、`exec_or_wait_opts` 只在
 /// `sw-daemon` launcher 另一 binary，實際只保護 cargo test 的並行測試執行緒；正確性以程式碼審查為證（OD-26 (c)）。
 static STD_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 
