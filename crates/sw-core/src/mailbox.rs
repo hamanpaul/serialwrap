@@ -103,6 +103,8 @@ pub enum ControlEvent {
     ConsoleConnected { client_id: String, client_lifetime: u64, label: String, vtty: String, kind: ConsoleTransportKind },
     /// P6 增補 #8（07 D-09）：actor thread 之外取得的 `/proc` 掃描快照。
     ConsoleScan { scan: ConsoleScanSnapshot, source: ScanSource },
+    /// P6 Task 9 步驟 5：executor 已為 `epoch` 建好哨兵 primary 的 PTY（`token` 對應 executor 暫存的 PtyPair）。
+    PrimaryConsoleReady { epoch: u64, token: u64, slave_path: String, client_id: String },
     /// P6 增補 #8（07 D-15(5)）：human TX pump 的結算。
     HumanTxCompleted { tag: HumanTxTag, report: TxReport },
 }

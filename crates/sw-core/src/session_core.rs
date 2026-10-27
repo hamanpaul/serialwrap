@@ -238,6 +238,9 @@ pub enum Effect {
     HumanTx { tag: HumanTxTag, permit: TxPermit, payload: Vec<u8> },
     /// P6 增補 #10（07 Task 7）：全域 `interactive_id → session_id` 索引；同批 Effects 中一律排在 `Reply` 之前。
     LeaseIndex(LeaseIndexOp),
+    /// P6 Task 9 步驟 5：bridge 起來且沒有保留 console 時建立哨兵 primary（PTY 後端；executor 建好後回
+    /// `ControlEvent::PrimaryConsoleReady`，其他後端忽略）。
+    CreatePrimaryConsole { epoch: u64 },
 }
 
 /// `Effect` 的有序容器。
@@ -749,6 +752,16 @@ impl SessionCore {
             }
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
+            }
+            MailboxItem::Control(ControlEvent::PrimaryConsoleReady {
+                epoch,
+                token,
+                slave_path,
+                client_id,
+            }) => {
+                effects
+                    .0
+                    .extend(self.primary_console_ready(epoch, token, slave_path, client_id, now));
             }
         }
         if std::mem::take(&mut self.hold_release_kick) && !self.foreground_busy() {
@@ -1608,7 +1621,7 @@ impl SessionCore {
                     source,
                     reason,
                     // 增補 #11：取進入 Phase 1 時的 console 數（2.1 executor 回報的哨兵數為下限）。
-                    closed_consoles: self.human.consoles.len().max(self.console_count) as i128,
+                    closed_consoles: (self.console_count + self.human.consoles.len()) as i128,
                     aborted_cmd: self.foreground.is_some(),
                 });
                 self.console_count = 0;
@@ -2348,6 +2361,10 @@ impl SessionCore {
             worker,
             real_path,
         }];
+        if self.human.consoles.is_empty() {
+            // uart_io.py `start()`：沒有保留 console 時建 internal 哨兵 primary（POSIX PTY）。
+            effects.push(Effect::CreatePrimaryConsole { epoch });
+        }
 
         if self.is_passthrough() || !self.profile.template.command_capable() {
             self.set_last_error(None, None);
@@ -3121,11 +3138,12 @@ impl SessionCore {
     /// console；無 bridge 時為保留的 console 數。`vtty` 取 D-20 快取，無快取且無 bridge 時取保留 console 的 primary。
     /// `console_endpoint` 只在 TCP console 有端點時輸出（Windows，LOCAL-WINDOWS-TODO；POSIX 不輸出）。
     fn public_ctx(&self) -> PublicCtx {
-        let humans = self.human.consoles.values().filter(|c| !c.internal).count();
+        // Python `len(bridge.list_consoles())` 含 internal 哨兵；`console_count` 為 06 測試替身的哨兵計數。
+        let consoles = self.human.consoles.len();
         let console_count = if self.generations.conn_epoch.is_some() {
-            self.console_count + humans
+            self.console_count + consoles
         } else {
-            humans
+            consoles
         };
         let vtty = self.human.vtty_cache.clone().or_else(|| {
             if self.generations.conn_epoch.is_some() {

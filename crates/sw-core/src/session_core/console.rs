@@ -843,6 +843,44 @@ impl SessionCore {
         fx
     }
 
+    /// P6 Task 9 步驟 5：登記哨兵 primary（`label="primary"`、`internal=true`），`session.vtty_path = bridge.vtty_path`。
+    /// epoch 已換或期間已有其他 console（保留或 attach）時丟棄 PTY。
+    pub(super) fn primary_console_ready(
+        &mut self,
+        epoch: u64,
+        token: u64,
+        slave_path: String,
+        client_id: String,
+        now: Mono,
+    ) -> Vec<Effect> {
+        if self.generations.conn_epoch != Some(epoch) || !self.human.consoles.is_empty() {
+            return vec![Effect::ConsoleDiscard { token }];
+        }
+        let lifetime = self.human.alloc_lifetime();
+        let label = "primary".to_string();
+        self.human.consoles.insert(
+            client_id.clone(),
+            ConsoleRecord {
+                client_id: client_id.clone(),
+                client_lifetime: lifetime,
+                label: label.clone(),
+                vtty: slave_path.clone(),
+                kind: ConsoleTransportKind::Pty,
+                internal: true,
+                attached_at: now,
+                line: LineEditor::new(),
+            },
+        );
+        self.human.primary_client_id = Some(client_id.clone());
+        self.human.vtty_cache = Some(slave_path);
+        vec![Effect::ConsoleAdopt {
+            token,
+            client_id,
+            client_lifetime: lifetime,
+            label,
+        }]
+    }
+
     /// drain Phase 1 差量（增補 #11）：回放撤銷、BC-02 失效、ownership 重設、retained human、Release 關閉全部 console。
     pub(super) fn human_phase1(&mut self, kind: &StopKind, fx: &mut Vec<Effect>) {
         self.revoke_replay();

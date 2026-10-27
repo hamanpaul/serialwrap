@@ -1673,6 +1673,36 @@ impl ManagerExec {
         lock(&self.io.profile).com.clone()
     }
 
+    /// P6 Task 9 步驟 5：PTY 後端且有 hub 時建哨兵 PTY，暫存後回 `PrimaryConsoleReady`（TCP／無 hub 不建，06 §7.2）。
+    fn create_primary_console(&mut self, epoch: u64, control: &Sender<ControlEvent>) {
+        if self.hub.is_none() || self.shared.console.kind() != sw_pal::ConsoleKind::Pty {
+            return;
+        }
+        let pair = match self.shared.console.create_pty() {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.shared.warn(format!(
+                    "哨兵 primary console 建立失敗（com={}）：{}",
+                    self.com(),
+                    e.py_message
+                ));
+                return;
+            }
+        };
+        let token = self.io.next_pty_token.fetch_add(1, Ordering::Relaxed) + 1;
+        let slave_path = pair.slave_path.clone();
+        lock(&self.io.pending_pty).insert(token, pair);
+        let sent = control.try_send(ControlEvent::PrimaryConsoleReady {
+            epoch,
+            token,
+            slave_path,
+            client_id: SessionCore::new_console_client_id(&fill_random),
+        });
+        if sent.is_err() {
+            lock(&self.io.pending_pty).remove(&token);
+        }
+    }
+
     fn human_tx(
         &mut self,
         tag: crate::human_console::human_tx::HumanTxTag,
@@ -1987,6 +2017,7 @@ impl EffectExecutor for ManagerExec {
             }
             // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）；送不出去以 NotSubmitted 回報。
             Effect::HumanTx { tag, permit, payload } => self.human_tx(tag, permit, payload, tx),
+            Effect::CreatePrimaryConsole { epoch } => self.create_primary_console(epoch, tx),
         }
     }
 }

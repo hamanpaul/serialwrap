@@ -1147,6 +1147,8 @@ impl EffectExecutor for RigExec {
                 self.pending_pty.lock().unwrap().remove(&token);
             }
             Effect::LeaseIndex(_) => {}
+            // 06 ActorRig 不建哨兵（hub 測試以 attach_pty_console 掛 console）。
+            Effect::CreatePrimaryConsole { .. } => {}
             // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）。
             Effect::HumanTx {
                 tag,
@@ -2538,6 +2540,7 @@ fn effect_kind(e: &Effect) -> &'static str {
         Effect::ConsoleDiscard { .. } => "ConsoleDiscard",
         Effect::HumanTx { .. } => "HumanTx",
         Effect::LeaseIndex(_) => "LeaseIndex",
+        Effect::CreatePrimaryConsole { .. } => "CreatePrimaryConsole",
     }
 }
 
