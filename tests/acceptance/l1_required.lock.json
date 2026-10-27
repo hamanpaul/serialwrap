@@ -4,6 +4,24 @@
     "p7_gate:cargo-test-workspace": {
       "linux": {
         "nodeids": [
+          "cargo:sw-core::event_line_buffer::exactly_16384_byte_line_not_truncated_16385_is",
+          "cargo:sw-core::event_line_buffer::line_buffer_matches_python_golden",
+          "cargo:sw-core::event_line_buffer::oversized_without_newline_cuts_one_chunk_per_feed",
+          "cargo:sw-core::event_matcher::contains_flags_i",
+          "cargo:sw-core::event_matcher::cooldown_from_last_fire",
+          "cargo:sw-core::event_matcher::evaluate_panic_is_contained",
+          "cargo:sw-core::event_matcher::gate_order_and_debug_skipped",
+          "cargo:sw-core::event_matcher::groups_none_for_unparticipating",
+          "cargo:sw-core::event_matcher::matcher_exception_converges_and_stop_warns_after_2s",
+          "cargo:sw-core::event_matcher::max_fires_zero_never",
+          "cargo:sw-core::event_matcher::multiple_rules_fire_same_line",
+          "cargo:sw-core::event_matcher::queue_overflow_drops_oldest_and_emits_event_dropped",
+          "cargo:sw-core::event_matcher::regex_input_capped_4096_chars",
+          "cargo:sw-core::event_matcher::replace_rules_failure_keeps_old_compiled",
+          "cargo:sw-core::event_matcher::scope_active_foreground_string",
+          "cargo:sw-core::event_matcher::selector_filter_com_name_only",
+          "cargo:sw-core::event_matcher::stop_join_2s_warning",
+          "cargo:sw-core::event_matcher::unknown_pattern_kind_is_value_error",
           "cargo:sw-core::login_fsm_full::bcm_two_stage_login_then_post_login_sh_then_nonce",
           "cargo:sw-core::login_fsm_full::bootloader_prompt_last_nonblank_line_uses_py_splitlines",
           "cargo:sw-core::login_fsm_full::cancel_ends_wait_and_sends_nothing_more",
@@ -114,6 +132,25 @@
             "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
             "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
             "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter"
+          ]
+        }
+      }
+    },
+    "p7_gate:py_parity_matcher": {
+      "linux": {
+        "nodeids": [
+          "tests/test_event_matcher.py::test_matcher_exception_converges_and_stop_warns_after_2s"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "-m",
+            "core_portable or posix_only",
+            "tests/test_event_matcher.py::test_matcher_exception_converges_and_stop_warns_after_2s"
+          ],
+          "markexpr": "core_portable or posix_only",
+          "paths": [
+            "tests/test_event_matcher.py::test_matcher_exception_converges_and_stop_warns_after_2s"
           ]
         }
       }
