@@ -923,16 +923,9 @@ def _spike3_status(cid: str, spike_dir: Path | None, schema_path: Path,
                 f"{label} append 延遲最大值 {max_latency_ms:.6f} ms 超過 OD-22 上限 "
                 f"{OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:.6f} ms"
             )
-    oplock_observations = observations["oplock_variant"]
-    rotation_wait_ms = (
-        oplock_observations["rotation_completed_ns"]
-        - oplock_observations["rotation_requested_ns"]
-    ) / 1_000_000
-    if rotation_wait_ms > OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:
-        latency_failures.append(
-            f"oplock rotation completion 延遲 {rotation_wait_ms:.6f} ms 超過 OD-22 有界上限 "
-            f"{OD22_AVSIM_WRITE_LATENCY_MAX_BOUND_MS:.6f} ms"
-        )
+    # OD-22 的上限只作用於 append 延遲樣本；rotation 的有界完成已由「完成落在某次 append 時間窗內、
+    # 該 append 樣本受上限涵蓋、rotation_completion_succeeded」證明，不另設未經裁決的完成時限
+    # （CHG-S1X-SPIKE3-ROTWAIT-01）。
     if latency_failures:
         return "FAIL", latency_failures
     return "PASS", []

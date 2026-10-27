@@ -1547,6 +1547,46 @@ def test_spike3_oplock_unbounded_completion_cannot_pass(tmp_path):
                for reason in reasons), reasons
 
 
+def test_spike3_rotation_wait_beyond_append_bound_is_not_an_od22_failure(tmp_path):
+    """OD-22 只限制 append 延遲樣本；跨多次 append 的 rotation 等待不得另以 600 ms 判 FAIL。
+
+    rotation 於第 1 次 append 提出、第 3 次 append 完成，每次 append 都 ≤ 600 ms，
+    但 request→completion 合計 700 ms；OD-19 只要求「最終完成」，OD-22 未授權額外的完成時限。
+    """
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    workload = doc["observations"]["oplock_variant"]
+    ms = 1_000_000
+    workload.update({
+        "lease_acquired_ns": 100, "stimulus_started_ns": 120, "rotation_requested_ns": 120,
+        "lease_until_ns": 200 * ms,
+        "rotation_append_index": 1, "rotation_append_started_ns": 100, "rotation_append_completed_ns": 300 * ms,
+        "rotation_completion_append_index": 3,
+        "rotation_completion_append_started_ns": 500 * ms,
+        "rotation_completion_append_completed_ns": 700 * ms + 120,
+        "rotation_completed_ns": 700 * ms + 120,
+    })
+    workload["append_latency_ms"][0] = 300.0
+    workload["append_latency_ms"][2] = 200.001
+    break_update = {
+        "lease_until_ns": 200 * ms, "break_notified_ns": 150,
+        "close_started_ns": 200 * ms, "close_completed_ns": 210 * ms, "acknowledged_ns": 210 * ms,
+    }
+    workload["oplock_breaks"][0].update(break_update)
+    # helper 原始 break 記錄須與 workload 一致。
+    doc["av_sim"]["variants"]["oplock"]["oplock_breaks"][0].update(break_update)
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "PASS", reasons
+
+
 def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
     """保留凍結 nodeid：未知 EDR 不影響 OD-22 延遲合格的 PASS。"""
     _enable_spike3(tree, product="unknown", status="unknown")
