@@ -2211,8 +2211,11 @@ impl SessionManager {
         }
         let is_open = matches!(req, SessionRequest::InteractiveOpen { .. });
         let is_release = matches!(req, SessionRequest::Release { .. });
-        if matches!(req, SessionRequest::GetState | SessionRequest::Activity) {
-            // 07 D-09：session 摘要前先更新 console peer 判定。
+        if matches!(
+            req,
+            SessionRequest::GetState | SessionRequest::Activity | SessionRequest::InteractiveOpen { .. }
+        ) {
+            // 07 D-09：session 摘要與 interactive_open（Python `_refresh_interactive_locked` 即時掃 peer）前先更新 console peer 判定。
             self.shared.send_console_scan(sid);
         }
         let result = self.shared.request(sid, req, timeout)?;
@@ -2635,6 +2638,8 @@ impl SessionManager {
             return Ok(not_found());
         };
         let is_close = matches!(req, SessionRequest::InteractiveClose { .. });
+        // 07 D-09：Python `_refresh_interactive_locked`／close 的 `console_has_external_peer` 皆即時掃描。
+        self.shared.send_console_scan(&sid);
         let result = self.shared.request(&sid, req, timeout)?;
         if str_of(&result, "error_code").as_deref() == Some("INTERACTIVE_NOT_FOUND") {
             lock(&self.shared.inner).interactive.remove(interactive_id);

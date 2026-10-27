@@ -10897,6 +10897,7 @@
           "cargo:sw-daemon::rpc_console::send_routes_by_lease_index",
           "cargo:sw-daemon::rpc_console::session_public_console_fields_pty",
           "cargo:sw-daemon::rpc_console::session_public_vtty_is_cached",
+          "cargo:sw-daemon::rpc_console::soft_preempt_replays_when_peer_appears_later",
           "cargo:sw-daemon::rpc_console::status_not_in_retry_whitelist",
           "cargo:sw-daemon::rpc_console::status_screen_chars_coerced_and_negative",
           "cargo:sw-daemon::rpc_console::unknown_selector_shapes",

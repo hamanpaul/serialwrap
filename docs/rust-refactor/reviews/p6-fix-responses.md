@@ -181,3 +181,11 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 清 deferred、primary 轉給剩下第一個。修正：`console_scan` 的 Hub 分支先 `reap_stale_consoles`（held=None 不剪），再 peer grace／self-heal；
 被回收者清 deferred、lane backlog（結算所屬 replay hold）、移除並發 `ConsoleClose`。
 回歸：`reap_stale_console_without_holder`、`reap_skips_owner_young_and_unknown_scan`、`reap_dead_primary_transfers_primary`。
+
+## Task 11 黑箱發現（slice22，本 session 實測）
+
+| 項目 | 處理 |
+|---|---|
+| `peer_loss_grace_then_teardown`：Rust 在 human console 關閉逾 grace 後 `interactive_open` 仍回 SESSION_INTERACTIVE_BUSY（Python 拆除後 ok） | fixed：interactive_open 前送 RPC ConsoleScan；L1 回歸 `interactive_open_scans_peers_before_refresh` |
+| `soft_preempt_restore_and_replay`：open 時 console 尚無 peer、之後才開啟時，close 用快取 peer 判定而丟棄 stash，`Q` 不回放（Python close 即時 `console_has_external_peer`） | fixed：interactive send／status／close 前亦送 RPC ConsoleScan；L1 回歸 `soft_preempt_replays_when_peer_appears_later` |
+| `f4_interactive_line_cmd_defined`：Python 基線黑箱對 `cmd submit --mode interactive --cmd vim` 回 `status=error, error_code=SEND_FAILED`（session 的 lease 已開），Rust 回 ok／`execution_mode=interactive` | 未收錄、待查：需判定 Python 的 SEND_FAILED 是否為基線缺陷（`_send_command_with_permit` 以 `interactive` permit 送出被拒）或 Rust 偏離；列為 BLOCKED-OWNER（parity 判定） |

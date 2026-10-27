@@ -408,7 +408,14 @@ fn interactive_open_scans_peers_before_refresh() {
     let fake = &r.console.as_ref().unwrap().fake;
     fake.set_held(Some([vtty.clone()].into_iter().collect()));
     let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
     io.push_input(b"a"); // human active
+    let mut seen = Vec::new();
+    wait_for("按鍵到 UART", || {
+        seen.extend(dev.take_tx());
+        seen.contains(&b'a')
+    });
     let first = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
     assert_eq!(s(&first, "error_code"), "SESSION_INTERACTIVE_BUSY", "{}", j(&first));
     fake.set_held(Some(Default::default())); // minicom 關閉
@@ -417,4 +424,30 @@ fn interactive_open_scans_peers_before_refresh() {
     let ok = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
     assert_eq!(ok.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&ok));
     assert!(ok.get("soft_preempted").is_none(), "peer 消失逾 grace → 拆除後一般開啟：{}", j(&ok));
+}
+
+/// Task 11 黑箱 `test_soft_preempt_restore_and_replay` 的 L1 回歸：open 時 human console 尚無 peer（minicom 稍後才開），
+/// soft preempt 期間的按鍵仍於 close 後回放到 UART。
+#[test]
+fn soft_preempt_replays_when_peer_appears_later() {
+    let r = ServiceRig::with_console_backend("pty");
+    let fake = &r.console.as_ref().unwrap().fake;
+    fake.set_held(Some(Default::default()));
+    let a = attach(&r, r#"{"selector":"COM0"}"#);
+    let o = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
+    assert_eq!(o.get("soft_preempted"), Some(&PyValue::Bool(true)), "{}", j(&o));
+    fake.set_held(Some([s(&a, "vtty")].into_iter().collect()));
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
+    io.push_input(b"Q");
+    std::thread::sleep(Duration::from_millis(200));
+    let iid = s(&o, "interactive_id");
+    let c = r.call("session.interactive_close", &format!(r#"{{"interactive_id":"{iid}"}}"#));
+    assert_eq!(c.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&c));
+    let mut seen = Vec::new();
+    wait_for("close 後回放 Q", || {
+        seen.extend(dev.take_tx());
+        seen.contains(&b'Q')
+    });
 }
