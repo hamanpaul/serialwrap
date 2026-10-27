@@ -165,6 +165,41 @@ impl UartExclusive for RigExcl {
 
 struct RigConsole;
 
+/// P6 Task 10：PTY 替身工廠（委派 `FakeConsoleFactory`，並記錄每個 `create_pty` 的 io 參照供測試推輸入、讀輸出）。
+pub struct RigPtyFactory {
+    pub fake: sw_pal::fakes::console::FakeConsoleFactory,
+    created: Mutex<Vec<(String, sw_pal::fakes::console::FakeConsoleRef)>>,
+}
+
+impl RigPtyFactory {
+    /// 依建立順序的 (slave_path, io 參照)。
+    pub fn created(&self) -> Vec<(String, sw_pal::fakes::console::FakeConsoleRef)> {
+        self.created.lock().unwrap().clone()
+    }
+}
+
+impl ConsoleTransportFactory for RigPtyFactory {
+    fn kind(&self) -> ConsoleKind {
+        self.fake.kind()
+    }
+    fn create_pty(&self) -> PalResult<sw_pal::PtyPair> {
+        let io = sw_pal::fakes::console::FakeIo::unbounded();
+        let r = io.reference();
+        let pair = self.fake.pty_pair_from(io);
+        self.created.lock().unwrap().push((pair.slave_path.clone(), r));
+        Ok(pair)
+    }
+    fn bind_tcp_console(&self) -> PalResult<Box<dyn sw_pal::console_pty::ConsoleListener>> {
+        self.fake.bind_tcp_console()
+    }
+    fn held_slave_paths(&self) -> Option<std::collections::HashSet<String>> {
+        self.fake.held_slave_paths()
+    }
+    fn new_mux(&self) -> PalResult<Box<dyn sw_pal::console_mux::ConsoleMux>> {
+        self.fake.new_mux()
+    }
+}
+
 impl ConsoleTransportFactory for RigConsole {
     fn kind(&self) -> ConsoleKind {
         ConsoleKind::Pty
@@ -223,6 +258,8 @@ pub struct ServiceRig {
     pub registry: Arc<CommandRegistry>,
     pub devices: BTreeMap<String, FakeDevice>,
     pub version: String,
+    /// P6 Task 10：`with_console_backend` 的 console 替身工廠（其餘建構子為 `None`）。
+    pub console: Option<Arc<RigPtyFactory>>,
 }
 
 /// `targets:` 一列。
@@ -232,6 +269,33 @@ fn target_line(com: &str, by_id: &str) -> String {
 
 impl ServiceRig {
     pub fn build(spec: RigSpec) -> ServiceRig {
+        ServiceRig::build_with_console(spec, None)
+    }
+
+    /// P6 Task 10：單一 shell target（COM0）已 READY，console 後端為 `kind`（`"pty"`｜`"tcp"`）的替身工廠。
+    pub fn with_console_backend(kind: &str) -> ServiceRig {
+        let kind = match kind {
+            "pty" => ConsoleKind::Pty,
+            "tcp" => ConsoleKind::TcpTelnet,
+            other => panic!("未知 console 後端 {other}"),
+        };
+        let factory = Arc::new(RigPtyFactory {
+            fake: sw_pal::fakes::console::FakeConsoleFactory::new(kind),
+            created: Mutex::new(Vec::new()),
+        });
+        ServiceRig::build_with_console(
+            RigSpec {
+                yaml: format!("{TEMPLATES}targets:\n{}", target_line("COM0", BY_ID_A)),
+                devices: vec![(BY_ID_A.into(), REAL_A.into())],
+                explicit_target_count: 1,
+                allowlist: None,
+                wait_ready: vec!["COM0".into()],
+            },
+            Some(factory),
+        )
+    }
+
+    fn build_with_console(spec: RigSpec, console: Option<Arc<RigPtyFactory>>) -> ServiceRig {
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
         let mut snapshot = Vec::new();
@@ -265,7 +329,10 @@ impl ServiceRig {
         let mgr = SessionManager::new(ManagerDeps {
             serial: serial.clone(),
             uart_excl: excl.clone(),
-            console: Arc::new(RigConsole),
+            console: match &console {
+                Some(f) => f.clone() as Arc<dyn ConsoleTransportFactory>,
+                None => Arc::new(RigConsole),
+            },
             caps: sw_pal::fakes::posix_caps(),
             wal: wal.clone(),
             registry: registry.clone(),
@@ -303,6 +370,7 @@ impl ServiceRig {
             registry,
             devices,
             version: RIG_VERSION.to_string(),
+            console,
         };
         for com in &spec.wait_ready {
             rig.wait_state(com, "READY");

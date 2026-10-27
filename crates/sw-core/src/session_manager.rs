@@ -2367,6 +2367,11 @@ impl SessionManager {
         Ok(pydict! { "ok" => true, "alias" => alias.to_string() })
     }
 
+    /// P6 Task 10：RPC thread 預建、尚未被 core `ConsoleAdopt`／`ConsoleDiscard` 結算的 PTY 數（全部 session）。
+    pub fn pending_pty_count(&self) -> usize {
+        todo!("P6 Task 10")
+    }
+
     /// interactive_send／status／close 只帶 interactive_id，以 manager 的索引路由；查無 → `INTERACTIVE_NOT_FOUND`。
     pub fn route_interactive(
         &self,
