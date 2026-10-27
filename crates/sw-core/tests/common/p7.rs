@@ -73,3 +73,141 @@ pub fn rule_json(fragment: &str) -> PyValue {
     }
     PyValue::Dict(base)
 }
+
+impl Row {
+    pub fn opt_bool(&self, k: &str) -> Option<bool> {
+        self.0.get(k).and_then(PyValue::as_bool)
+    }
+    pub fn str_vec(&self, k: &str) -> Vec<String> {
+        self.get(k)
+            .as_array()
+            .unwrap_or_else(|| panic!("golden 欄位 {k} 不是 list"))
+            .iter()
+            .map(|v| v.as_str().expect("list 元素須為字串").to_string())
+            .collect()
+    }
+    /// `[[k, v], ...]` → `Vec<(String, String)>`。
+    pub fn pairs(&self, k: &str) -> Vec<(String, String)> {
+        self.get(k)
+            .as_array()
+            .unwrap_or_else(|| panic!("golden 欄位 {k} 不是 list"))
+            .iter()
+            .map(|pair| {
+                let pair = pair.as_array().expect("pair 須為 list");
+                (
+                    pair[0].as_str().expect("key").to_string(),
+                    pair[1].as_str().expect("value").to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// golden 的 base64 欄位解碼（`binascii.a2b_base64`）。
+pub fn b64(s: &str) -> Vec<u8> {
+    sw_proto::pycompat::a2b_base64_lenient(s.as_bytes()).expect("golden base64")
+}
+
+fn opt_string(v: Option<&PyValue>) -> Option<String> {
+    v.and_then(PyValue::as_str).map(str::to_string)
+}
+
+fn float(v: &PyValue) -> f64 {
+    match v {
+        PyValue::Float(f) => *f,
+        PyValue::Int(_) => v.as_i64().expect("int") as f64,
+        other => panic!("不是數值：{other:?}"),
+    }
+}
+
+fn pyint(v: &PyValue) -> sw_proto::pyjson::PyInt {
+    match v {
+        PyValue::Int(i) => i.clone(),
+        other => panic!("不是 int：{other:?}"),
+    }
+}
+
+/// `capture_p7_goldens.profile_json(sp)` 的反向：golden `profile` 物件 → `SessionProfile`。
+pub fn profile_from_json(v: &PyValue) -> sw_proto::config_types::SessionProfile {
+    use sw_proto::config_types::{ProfileTemplate, SessionProfile, UartProfile};
+    let d = match v {
+        PyValue::Dict(d) => d,
+        other => panic!("profile 須為 object：{other:?}"),
+    };
+    let g = |k: &str| d.get(k).unwrap_or_else(|| panic!("profile 欄位 {k} 不存在"));
+    let s = |k: &str| g(k).as_str().unwrap_or_else(|| panic!("profile 欄位 {k} 不是字串")).to_string();
+    let uart = g("uart");
+    let u = |k: &str| uart.get(k).unwrap_or_else(|| panic!("uart 欄位 {k} 不存在"));
+    SessionProfile {
+        com: s("com"),
+        act_no: pyint(g("act_no")),
+        alias: s("alias"),
+        device_by_id: s("device_by_id"),
+        template: ProfileTemplate {
+            profile_name: s("profile_name"),
+            platform: s("platform"),
+            prompt_regex: s("prompt_regex"),
+            login_regex: s("login_regex"),
+            password_regex: s("password_regex"),
+            post_login_cmd: s("post_login_cmd"),
+            ready_probe: s("ready_probe"),
+            username: opt_string(d.get("username")),
+            user_env: opt_string(d.get("user_env")),
+            pass_env: opt_string(d.get("pass_env")),
+            env_file: opt_string(d.get("env_file")),
+            console_unlock_env: opt_string(d.get("console_unlock_env")),
+            console_unlock_idle_s: float(g("console_unlock_idle_s")),
+            timeout_s: float(g("timeout_s")),
+            quiet_window_s: float(g("quiet_window_s")),
+            hard_timeout_s: float(g("hard_timeout_s")),
+            log_dir: opt_string(d.get("log_dir")),
+            uart: UartProfile {
+                baud: pyint(u("baud")),
+                data_bits: pyint(u("data_bits")),
+                parity: u("parity").as_str().expect("parity").to_string(),
+                stop_bits: pyint(u("stop_bits")),
+                flow_control: u("flow_control").as_str().expect("flow_control").to_string(),
+                xonxoff: u("xonxoff").as_bool().expect("xonxoff"),
+            },
+            bootloader_prompts: g("bootloader_prompts")
+                .as_array()
+                .expect("bootloader_prompts")
+                .iter()
+                .map(|p| p.as_str().expect("prompt").to_string())
+                .collect(),
+            max_console_line_chars: match g("max_console_line_chars") {
+                PyValue::Null => None,
+                other => Some(pyint(other)),
+            },
+        },
+    }
+}
+
+/// golden `environ` 物件 → `FakeEnv`（`HOME` 等鍵照原樣）。
+pub fn fake_env(v: &PyValue) -> sw_pal::fakes::FakeEnv {
+    let env = sw_pal::fakes::FakeEnv::default();
+    if let PyValue::Dict(d) = v {
+        let mut vars = env.vars.lock().unwrap();
+        for (k, val) in &d.0 {
+            vars.insert(k.clone(), val.as_str().expect("environ 值須為字串").to_string());
+        }
+    }
+    env
+}
+
+/// golden `files` 物件（`{path: {"b64": ...}}`）→ `read_env_file` 替身：缺檔 `None`、非 UTF-8 `Some(Err(InvalidData))`。
+pub fn fake_read(v: &PyValue) -> impl Fn(&str) -> Option<std::io::Result<String>> {
+    let mut files = std::collections::BTreeMap::new();
+    if let PyValue::Dict(d) = v {
+        for (k, val) in &d.0 {
+            let data = b64(val.get("b64").and_then(PyValue::as_str).expect("files[].b64"));
+            files.insert(k.clone(), data);
+        }
+    }
+    move |path: &str| {
+        files.get(path).map(|data| {
+            String::from_utf8(data.clone())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+}

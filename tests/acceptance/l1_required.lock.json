@@ -4,7 +4,10 @@
     "p7_gate:cargo-test-workspace": {
       "linux": {
         "nodeids": [
-          "cargo:sw-core::login_quiet::console_unlock_arm_mid_login_finish_applied"
+          "cargo:sw-core::login_quiet::console_unlock_arm_mid_login_finish_applied",
+          "cargo:sw-core::session_auth_golden::debug_output_redacts_secrets",
+          "cargo:sw-core::session_auth_golden::parse_env_file_matches_python_golden",
+          "cargo:sw-core::session_auth_golden::resolve_session_auth_matches_python_golden_including_warnings"
         ],
         "selector": {
           "argv": [
