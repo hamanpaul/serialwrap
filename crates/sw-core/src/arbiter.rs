@@ -386,6 +386,18 @@ impl CommandRegistry {
             .cloned()
     }
 
+    /// 測試用：依建立順序的全部命令紀錄（P6 harness 查 human console 命令）。
+    #[cfg(feature = "test-fakes")]
+    pub fn records_for_test(&self) -> Vec<PyDict> {
+        self.inner
+            .lock()
+            .expect("命令登錄表鎖 poisoned")
+            .records
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// 目前紀錄總數，包含在途命令。
     pub fn len(&self) -> usize {
         self.inner

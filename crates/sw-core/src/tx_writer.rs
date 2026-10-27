@@ -189,12 +189,28 @@ impl Fence {
         }
 
         match p.class {
-            TxClass::LeaseOwner
-            | TxClass::InteractiveOpenCmd
-            | TxClass::HumanRaw
-            | TxClass::HumanReplay
-                if p.owner_gen != st.owner_gen =>
-            {
+            // 07 D-03：HumanRaw 依序 input_epoch → owner_gen → admission。
+            TxClass::HumanRaw => {
+                if p.input_epoch != Some(st.input_epoch) {
+                    return Err(FenceReject::InputStale);
+                }
+                if p.owner_gen != st.owner_gen {
+                    return Err(FenceReject::OwnerMismatch);
+                }
+                if st.human_admission_blocked {
+                    return Err(FenceReject::HumanAdmissionClosed);
+                }
+            }
+            // 07 D-03／D-22：HumanReplay 只比對 input_epoch 與專屬回放授權，不比對 owner_gen／admission。
+            TxClass::HumanReplay => {
+                if p.input_epoch != Some(st.input_epoch) {
+                    return Err(FenceReject::InputStale);
+                }
+                if p.replay_hold.is_none() || p.replay_hold != st.replay_auth {
+                    return Err(FenceReject::ReplayRevoked);
+                }
+            }
+            TxClass::LeaseOwner | TxClass::InteractiveOpenCmd if p.owner_gen != st.owner_gen => {
                 return Err(FenceReject::OwnerMismatch);
             }
             TxClass::LoginProbe | TxClass::ReadyReconfirm if p.fsm_gen != st.fsm_gen => {

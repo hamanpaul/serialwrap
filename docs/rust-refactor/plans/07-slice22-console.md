@@ -1644,6 +1644,8 @@ pub fn on_stream_accept(&mut self, cid: &str) {
 9. Human TX lane（D-15）：`Effect::HumanTx` 由 executor 呼叫 `pump.try_submit`；core 保證同時只有一筆，所以 `Err(PumpFull)` 屬不變式違反，寫 WARNING，並以 `HumanTxCompleted{NotSubmitted}` 回送 core 重新路由（經 executor 已有的 control sender `try_send`；失敗時保留在 executor 的 1 格重試槽，下一次 `Tick` 再送）。pump thread 迴圈：`recv` → `jobs.send(TxJob{permit, payload, reply: bounded(1)})`（可阻塞）→ `reply.recv()` → `control.send(HumanTxCompleted{tag, report})`；`jobs.send` 回 `Disconnected` 時以 `NotSubmitted` 回報。`HumanTxCompleted` 依 D-15(3) 結算後，產生 06 `Effect::SettleTx{epoch, op_id}`（D-15(6)，R1-F8），再取 backlog 下一筆重新路由。結算的是 HumanReplay 時 `replay_hold.remaining -= 1`；降到 0 時依 D-22(3) 在同一次 `Fence::with` 清 `replay_auth`（hold 未被撤銷時）、清 `replay_hold`，然後執行 06 的出列（`foreground_busy()` 轉 false 後的第一個出列點）。測試 `human_tx_settles_ledger_each_chunk`：同一 epoch 由 c1 raw 輸入 1000 個 1-byte chunk → effects 中 `SettleTx` 恰 1000 個且 op_id 與各 `HumanTx` permit 一一對應；`ServiceRig` 讀現行 worker `tx().ledger_gauge().live_ops` 於最後一個 `HumanTxCompleted` 後 2 s 內為 0。
 10. 06 `SelfTestProbe`、quiet arm、reboot 命中點依增補 #12、#13 接上。
 
+> **實作紀錄（2026-10-27，P6 cloud）**：(1) 核心邏輯置於 `session_core.rs` 的子模組 `crates/sw-core/src/session_core/console.rs`，06 檔案只加 hook（降低與 P5 的合併衝突）；(2) `begin_stop` 保留 06 既有的 `owner_gen += 1`（另以 lease 關閉／ownership 重設遞增），並新增 `invalidate_human_input(Recovery／Release)`——D-02 要求的「deferred 回放不依 `owner_gen` 判定」已由 `input_epoch` 滿足，多一次 `owner_gen` 遞增不影響 human TX（frozen 期間全部被拒），故不改 P5 擁有的世代語意；(3) `PtyInfo` 增 `client_id`（見 Task 7 Produces）；(4) sw-core 尚無產品 executor（06 T15+ 的 daemon executor 未交付），`HumanTxPump` 的接線先在 `ActorRig` 的 `RigExec` 驗證，daemon executor 交付時比照接上；`ConsoleDetach`／`ConsoleList` request 屬 Task 7。
+
 - [ ] **Step 4：執行並確認 PASS**
 
 Run: `scripts/rust/cargo_nonzero.sh -p sw-core --features test-fakes --test ownership --test session_core_console --test human_tx_lane --test fence_human_raw --test actor_liveness && scripts/rust/cargo_nonzero.sh -p sw-core --features test-fakes && python3 scripts/rust/check_cfg_boundary.py`
@@ -1701,7 +1703,7 @@ pub enum RescueClass { BootloaderPrompt, BootInterrupt, LoginRequired, NotBootlo
 pub fn classify_attached_rescue(rx_tail_raw: &str, profile: &SessionProfile) -> RescueClass;  // 05 §10.1 ATTACHED 分支順序
 
 // crates/sw-core/src/session_core.rs（增補 #9、#10）
-pub struct PtyInfo { pub token: u64, pub slave_path: String }       // actor 層持有實際 PtyPair，core 只見資料（Task 10）
+pub struct PtyInfo { pub token: u64, pub slave_path: String, pub client_id: String }       // actor 層持有實際 PtyPair，core 只見資料（Task 10）；client_id 由 RPC thread 建 PTY 時一併產生（`uuid4().hex[:12]`，對照 Python `_create_console_client` 同時決定 PTY 與 id；Task 6 實作時補欄，harness 因此可指定 cid）
 pub enum LeaseIndexOp { Insert { interactive_id: String }, Remove { interactive_id: String } }
 // 效果順序不變式：同一批 Effects 中 LeaseIndex 一律排在 Reply 之前（executor 依序執行，先更新全域索引再回覆），
 // 使 client 收到 interactive_id 後立即 interactive_send 不會得到假的 INTERACTIVE_NOT_FOUND

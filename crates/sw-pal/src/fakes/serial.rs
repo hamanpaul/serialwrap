@@ -305,6 +305,8 @@ pub(crate) struct FakeDeviceInner {
     writes: AtomicUsize,
     os_submits: AtomicUsize,
     blocked_release: AtomicBool,
+    /// P6 Task 6：`BlockForever` 正在 gate 外阻塞（`wait_blocked` 讀取）。
+    blocked_now: AtomicBool,
     close_err: Mutex<Option<PalError>>,
     removed: AtomicBool,
     external_hold: Mutex<Option<Vec<u32>>>,
@@ -337,6 +339,7 @@ impl FakeDeviceInner {
             writes: AtomicUsize::new(0),
             os_submits: AtomicUsize::new(0),
             blocked_release: AtomicBool::new(false),
+            blocked_now: AtomicBool::new(false),
             close_err: Mutex::new(None),
             removed: AtomicBool::new(false),
             external_hold: Mutex::new(None),
@@ -611,7 +614,14 @@ impl FakeDevice {
 
     /// P6 Task 6：等到 `BlockForever` 的 job 已經 gate 提交 OS、在 gate 外阻塞（上限 2 s）。
     pub fn wait_blocked(&self) {
-        todo!("P6 Task 6")
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !self.inner.blocked_now.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wait_blocked：2 s 內沒有 BlockForever 寫入進入阻塞"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     pub fn release_block(&self) {
@@ -1229,6 +1239,7 @@ impl SerialWriter for FakeSerialWriter {
                     };
                 }
                 self.inner.blocked_release.store(false, Ordering::SeqCst);
+                self.inner.blocked_now.store(true, Ordering::SeqCst);
                 let mut guard = self
                     .inner
                     .cond_mutex
@@ -1243,6 +1254,7 @@ impl SerialWriter for FakeSerialWriter {
                         .0;
                 }
                 self.inner.blocked_release.store(false, Ordering::SeqCst);
+                self.inner.blocked_now.store(false, Ordering::SeqCst);
                 TxResult {
                     outcome: TxOutcome::Completed(committed),
                     error: None,
