@@ -121,6 +121,24 @@ impl PyRegex {
         })
     }
 
+    /// `re.search(hay)` 的 `m.group(0)` 與 `m.groups()`（未參與的群組為 `None`）。
+    ///
+    /// UP-P7-02（P7 Task 12 上游補件，add-only）：event matcher 的 `MatchResult.groups` 需要擷取群組；
+    /// 群組序號只有以 [`compile_capturing`] 編譯者與 Python 對齊（[`compile`] 會省略未被反向參照的群組）。
+    pub fn search_groups(&self, hay: &str) -> Option<(String, Vec<Option<String>>)> {
+        if let Some(repeat) = &self.large_literal_repeat {
+            let m = repeat.search(hay, 0)?;
+            let text: String = hay.chars().skip(m.start).take(m.end - m.start).collect();
+            return Some((text, Vec::new()));
+        }
+        let caps = self.regex.as_ref()?.captures(hay).ok().flatten()?;
+        let whole = caps.get(0)?.as_str().to_string();
+        let groups = (1..caps.len())
+            .map(|i| caps.get(i).map(|g| g.as_str().to_string()))
+            .collect();
+        Some((whole, groups))
+    }
+
     /// 自 Python 字元索引 pos 開始搜尋。
     pub fn search_from(&self, hay: &str, pos: usize) -> Option<PyMatch> {
         let byte_pos = char_index_to_byte(hay, pos.min(py_len_chars(hay)));
@@ -220,22 +238,31 @@ pub fn escape(pattern: &str) -> String {
 
 /// 以 Python re 語法接受集合編譯 pattern。
 pub fn compile(pat: &str, flags: PyFlags) -> Result<PyRegex, CompileError> {
+    compile_mode(pat, flags, false)
+}
+
+/// UP-P7-02：同 [`compile`]，但保留全部擷取群組（`PyRegex::search_groups` 需要；成本較高，只供 event matcher）。
+pub fn compile_capturing(pat: &str, flags: PyFlags) -> Result<PyRegex, CompileError> {
+    compile_mode(pat, flags, true)
+}
+
+fn compile_mode(pat: &str, flags: PyFlags, capturing: bool) -> Result<PyRegex, CompileError> {
     if estimated_group_depth(pat) > 64 {
         let pattern = pat.to_string();
         let worker = std::thread::Builder::new()
             .name("sw-proto-pyre-deep-parse".to_string())
             .stack_size(16 * 1024 * 1024)
-            .spawn(move || compile_inner(&pattern, flags))
+            .spawn(move || compile_inner(&pattern, flags, capturing))
             .unwrap_or_else(|error| panic!("無法啟動 pyre parser 執行緒：{error}"));
         return match worker.join() {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         };
     }
-    compile_inner(pat, flags)
+    compile_inner(pat, flags, capturing)
 }
 
-fn compile_inner(pat: &str, flags: PyFlags) -> Result<PyRegex, CompileError> {
+fn compile_inner(pat: &str, flags: PyFlags, capturing: bool) -> Result<PyRegex, CompileError> {
     let parsed = parse::parse(pat, flags)?;
     if let parse::Expr::Repeat {
         body,
@@ -261,7 +288,12 @@ fn compile_inner(pat: &str, flags: PyFlags) -> Result<PyRegex, CompileError> {
             }
         }
     }
-    let translated = translate::translate(&parsed).map_err(CompileError::Untranslatable)?;
+    let translated = if capturing {
+        translate::translate_capturing(&parsed)
+    } else {
+        translate::translate(&parsed)
+    }
+    .map_err(CompileError::Untranslatable)?;
     let mut builder = RegexBuilder::new(&translated);
     builder.backtrack_limit(BACKTRACK_LIMIT);
     let regex = builder

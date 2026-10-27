@@ -149,7 +149,7 @@ impl MatcherContext for RecordingMatcherCtx {
 
 /// 以合法預設規則覆寫 `fragment` 後驗證。
 pub fn rule(fragment: &str) -> Arc<Rule> {
-    Arc::new(validate_rule_dict(&super::p7::rule_json(fragment)).expect("規則應合法"))
+    Arc::new(validate_rule_dict(&crate::common::p7::rule_json(fragment)).expect("規則應合法"))
 }
 
 pub fn rule_contains(value: &str, selectors: &[&str]) -> Arc<Rule> {

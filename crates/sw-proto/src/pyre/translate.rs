@@ -12,8 +12,20 @@ const FLAG_S: u32 = PyFlags::S;
 const FLAG_A: u32 = PyFlags::A;
 
 pub(super) fn translate(parsed: &ParsedPattern) -> Result<String, String> {
+    translate_inner(parsed, false)
+}
+
+/// UP-P7-02：保留全部擷取群組（engine 群組序號＝Python 群組序號），供 `PyRegex::search_groups`。
+pub(super) fn translate_capturing(parsed: &ParsedPattern) -> Result<String, String> {
+    translate_inner(parsed, true)
+}
+
+fn translate_inner(parsed: &ParsedPattern, keep_all_groups: bool) -> Result<String, String> {
     let mut used_groups = BTreeSet::new();
     collect_references(&parsed.expression, &mut used_groups);
+    if keep_all_groups {
+        collect_captures(&parsed.expression, &mut used_groups);
+    }
     let group_map: BTreeMap<usize, usize> = used_groups
         .into_iter()
         .enumerate()
@@ -253,6 +265,38 @@ fn is_zero_width(expr: &Expr) -> bool {
         | Expr::Category(_)
         | Expr::CharacterClass { .. }
         | Expr::Backreference { .. } => false,
+    }
+}
+
+fn collect_captures(expr: &Expr, used: &mut BTreeSet<usize>) {
+    match expr {
+        Expr::Capture { index, body } => {
+            used.insert(*index);
+            collect_captures(body, used);
+        }
+        Expr::Conditional { yes, no, .. } => {
+            collect_captures(yes, used);
+            collect_captures(no, used);
+        }
+        Expr::Sequence(items) | Expr::Alternation(items) => {
+            for item in items {
+                collect_captures(item, used);
+            }
+        }
+        Expr::NonCapture(body)
+        | Expr::Atomic(body)
+        | Expr::ScopedFlags { body, .. }
+        | Expr::Repeat { body, .. }
+        | Expr::LookAhead { body, .. }
+        | Expr::LookBehind { body, .. } => collect_captures(body, used),
+        Expr::Backreference { .. }
+        | Expr::Empty
+        | Expr::Literal(_)
+        | Expr::Dot
+        | Expr::Category(_)
+        | Expr::CharacterClass { .. }
+        | Expr::Anchor(_)
+        | Expr::WordBoundary { .. } => {}
     }
 }
 
