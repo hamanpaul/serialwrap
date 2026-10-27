@@ -43,5 +43,7 @@ $d="$env:LOCALAPPDATA\Temp\sw-od29"; $env:SW_PAL_CTRLC_DIAG_DIR=$d; Start-Transc
 
 ## 執行後（agent 處理）
 
+判定範圍（已知限制，2026-10-28 雲端審查 `69b5a91_9d74511-opus.md` d0b8ad7#1）：Ctrl+C 圈可證明「孫行程被終止且 exit code 經 exec_or_wait 照傳」（產品在建立孫行程後對委派者自身忽略 Ctrl+C）；**Ctrl+Break 圈只證明行程樹會被終止，不證明照傳**——產品只對委派者忽略 Ctrl+C、不忽略 Ctrl+Break，委派者本身也以 `0xC000013A` 結束，該圈無法區分兩者。不改為「孫行程攔截 Ctrl+Break 並以特徵碼結束」的理由：那會要求委派者忽略 Ctrl+Break，屬規格（plan 04 Task 9 的本案例形狀、`STATUS_CONTROL_C_EXIT` 原樣照傳）與 Python 基線（無委派層，`python.exe` 對 Ctrl+Break 採預設處置直接結束）都沒有的新行為，超出本 oracle 修正範圍。登記 PASS 時須照此範圍描述，不得寫成兩圈都證明照傳。
+
 1. 將 `%LOCALAPPDATA%\Temp\sw-od29\` 下的 `ctrl_c-result.json`、`ctrl_c-transcript.txt`、`ctrl_c-parent.txt`、`ctrl_c-child-*.txt` 複製到 `~/b-log/rust-refactor/od29/`（附 `SHA256SUMS`），核對 `exe_sha256` 等於上表值、`exit_code` 為 0、transcript 或 `ctrl_c-parent.txt` 內有 `1 passed`／`PASS`，且兩個子診斷檔都存在（證明子行程確實進入子分支）。
 2. PASS：在 `docs/rust-refactor/owner-decisions-addenda.md` 的 OD-29 實跑紀錄列把本項改為「已實證（OD-29）」，附結果檔 sha256；FAIL 照實回報，不得改判或重跑到通過為止。
