@@ -184,6 +184,7 @@ cargo:sw-pal::sysenv_mgmt::which_uses_default_path_when_path_is_unset
 
 1. 擁有者逐項核准上列各表；未核准項目維持原狀，不得部分套用。
 2. 收集輸入：`scripts/rust/cargo_l1_results.py --list-only` 依設計保留 ignored 與 `cap_*`（見該檔註解）。移除必須由收集檔**明示排除**核准名單，不得由工具自動排除，排除清單須寫入 commit 訊息。
+   - **OD-24 補註（2026-10-27）**：`--list-only` 另輸出 `ignored` 名單，`regen_lock.py --l1-add-only` 只在「新增」時排除 ignored nodeid（不把 `#[ignore]` 列加入鎖），**不自動移除任何既有列**；鎖中既有 ignored 列仍須逐名 `--allow-removal`（OD-24 (3) 的 5 筆即如此移除）。與本步驟「不得由工具自動排除」的規定不衝突。
 2a. **替換前置（修正輪補記，須先於步驟 3）**：L-1、L-2 的替換 pytest（`tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override`、`tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields`）目前未被任何凍結集合或不變量點名，僅隱含於 pytest-full。須先以 `--l1-add-only` 將兩個替換 nodeid 登記為必要集合（或加入 stage1a coverage 不變量），之後才可 `--allow-removal` 移除舊名。W-1 至 W-5 的替換測試同此處理。
 3. Linux（`s1a`：`-- --workspace --all-features`；`s1b`：`-- --workspace`）：`python3 scripts/rust/cargo_l1_results.py --list-only --out <收集檔> -- …` → 排除核准項 → `python3 tests/acceptance/regen_lock.py --l1-add-only --set <s1a_cargo|s1b_cargo> --platform linux --collect <收集檔> --allow-removal <set_id:linux:nodeid>`（集合已存在，不需 selector）。
 4. Windows cargo 收集**必須於 Windows 原生執行**（WSL 以 `--platform windows` 做的是交叉編譯，不得代替）：`s1a` 為 `-- --package sw-proto --package sw-pal --package sw-cli`，`s1b` 為 `-- --package sw-pal --package sw-cli`。排除核准項後執行 `regen_lock.py --l1-add-only --set <s1a_cargo|s1b_cargo> --platform windows --collect <收集檔> --allow-removal <set_id:windows:nodeid>`。`--allow-removal` 須與實際消失集合完全相符，工具會拒絕未列名或未消失的項目。

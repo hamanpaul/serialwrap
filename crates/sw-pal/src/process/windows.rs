@@ -38,6 +38,9 @@ use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 /// 本模組內直接以原始標準 handle 呼叫 `CreateProcessW` 的路徑（`exec_or_wait_opts`）也持有此鎖，
 /// 不會在旗標被暫時取消的視窗內把不可繼承的 handle 交給子行程。std `Command` 的 `Stdio::inherit()`
 /// 會另行 `DuplicateHandle` 出可繼承副本，不受此旗標影響。
+///
+/// 鎖只在同一行程多執行緒並行 spawn 時有作用：正式 `sw-cli` 無執行緒、`exec_or_wait_opts` 只在
+/// `sw-daemon` launcher 另一 binary，實際只保護 cargo test 的並行測試執行緒；正確性以程式碼審查為證（OD-26 (c)）。
 static STD_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// spawn 背景 daemon 期間暫時取消目前行程 stdout／stderr 的 `HANDLE_FLAG_INHERIT`，drop 時還原。
@@ -49,6 +52,11 @@ static STD_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 /// 且仍標為可繼承的其他 handle（非標準 handle）仍會傳給 daemon。CLI 自身以 std 開啟的檔案與 pipe
 /// 預設不可繼承，故實務上只剩父行程刻意傳入的額外 handle。完整解法為改以
 /// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 明確列出要繼承的 handle（需改寫成原始 `CreateProcessW`）。
+///
+/// OD-26（2026-10-27）：擁有者裁決維持本半修法（功能面已對齊 Python 基線），不改寫 `CreateProcessW`。
+/// 追蹤項：std 的 `CommandExt::inherit_handles(false)`（feature `windows_process_extensions_inherit_handles`）
+/// 與 `ProcThreadAttributeList`（feature `windows_process_extensions_raw_attribute`）在 1.96.1 stable
+/// 仍為 unstable（E0658）；穩定後改用 `inherit_handles(false)`，並移除本 guard 與 `STD_INHERIT_LOCK`。
 struct StdOutputInheritGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     cleared: Vec<HANDLE>,
