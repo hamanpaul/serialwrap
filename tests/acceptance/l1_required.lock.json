@@ -10891,6 +10891,7 @@
           "cargo:sw-daemon::rpc_console::detach_ok_closes_own_lease",
           "cargo:sw-daemon::rpc_console::detach_unknown_client",
           "cargo:sw-daemon::rpc_console::detach_unknown_client_still_closes_own_lease",
+          "cargo:sw-daemon::rpc_console::interactive_open_scans_peers_before_refresh",
           "cargo:sw-daemon::rpc_console::list_prunes_stale_without_peer",
           "cargo:sw-daemon::rpc_console::list_sorted_by_label_then_id",
           "cargo:sw-daemon::rpc_console::send_routes_by_lease_index",

@@ -249,3 +249,67 @@ def test_last_line_before_disconnect_submitted(console_daemon) -> None:
     os.write(fd2, b"echo LAST\r")
     os.close(fd2)
     assert wait_rx_contains(target, b"echo LAST\n", 5.0)
+
+
+def test_peer_loss_grace_then_teardown(console_daemon) -> None:
+    import time
+
+    d, _target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    fd1 = open_vtty(a1["vtty"])
+    os.write(fd1, b"a")  # human active
+    time.sleep(0.3)
+    os.close(fd1)
+    busy = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent"})
+    assert busy["ok"] is False and busy["error_code"] == "SESSION_INTERACTIVE_BUSY", busy
+    time.sleep(3.5)
+    ok = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent"})
+    assert ok["ok"] is True and "soft_preempted" not in ok, ok
+    assert a1["client_id"] not in [r["client_id"] for r in _consoles(d)]
+
+
+def test_vtty_stable_across_recover(console_daemon) -> None:
+    d, target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        d.sw("session", "clear", "--selector", "COM0")
+        d.wait_state("COM0", "READY")
+        row = next(r for r in _consoles(d) if r["client_id"] == a1["client_id"])
+        assert row["vtty"] == a1["vtty"]
+        target.emit(b"AFTER-CLEAR\r\n")
+        assert b"AFTER-CLEAR" in read_until(fd1, b"AFTER-CLEAR", 3.0)
+    finally:
+        os.close(fd1)
+
+
+def test_release_closes_consoles_before_reply(console_daemon) -> None:
+    d, _target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        count = d._session("COM0")["console_count"]
+        r = d.sw("device", "release", "--selector", "COM0")
+        assert r["ok"] is True and r["closed_consoles"] == count, r
+        try:
+            data = os.read(fd1, 1024)
+            assert data == b"", data
+        except BlockingIOError:
+            raise AssertionError("release 回覆後 console 仍未關閉") from None
+        except OSError:
+            pass  # EIO：master 已關
+        assert d._session("COM0")["state"] == "RELEASED"
+    finally:
+        os.close(fd1)
+
+
+def test_unread_console_does_not_block(console_daemon) -> None:
+    d, target = console_daemon
+    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h3")  # 從不讀取
+    chunk = b"y" * 65536
+    for _ in range(32):  # 2 MiB
+        target.emit(chunk)
+    sub = d.sw("cmd", "submit", "--selector", "COM0", "--cmd", "echo OK", "--cmd-timeout", "5")
+    assert sub["ok"] is True, sub
+    done = d.wait_command_done(sub["cmd_id"], timeout=5.0)
+    assert done["status"] == "done", done

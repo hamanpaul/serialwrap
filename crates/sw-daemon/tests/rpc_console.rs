@@ -397,3 +397,24 @@ fn consoles_survive_bridge_rebuild() {
         String::from_utf8_lossy(&io.written()).contains("after-rebuild")
     });
 }
+
+/// Task 11 黑箱 `test_peer_loss_grace_then_teardown` 的 L1 回歸：human lease 的 console 失去 peer 逾 grace 後，
+/// `interactive_open` 前的 RPC ConsoleScan 讓 refresh 拆除該 lease（Python `_refresh_interactive_locked` 即時掃描）。
+#[test]
+fn interactive_open_scans_peers_before_refresh() {
+    let r = ServiceRig::with_console_backend("pty");
+    let a = attach(&r, r#"{"selector":"COM0"}"#);
+    let vtty = s(&a, "vtty");
+    let fake = &r.console.as_ref().unwrap().fake;
+    fake.set_held(Some([vtty.clone()].into_iter().collect()));
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    io.push_input(b"a"); // human active
+    let first = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
+    assert_eq!(s(&first, "error_code"), "SESSION_INTERACTIVE_BUSY", "{}", j(&first));
+    fake.set_held(Some(Default::default())); // minicom 關閉
+    let _ = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#); // 記下 peer 消失
+    r.clock.advance(Duration::from_millis(3500));
+    let ok = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
+    assert_eq!(ok.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&ok));
+    assert!(ok.get("soft_preempted").is_none(), "peer 消失逾 grace → 拆除後一般開啟：{}", j(&ok));
+}

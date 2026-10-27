@@ -72,3 +72,51 @@ def test_send_encodings(console_daemon) -> None:
     assert wait_rx_contains(target, b"hi", 2.0)
     r = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "00", "encoding": "hex"})
     assert r["ok"] is False and r["error_code"] == "EXCEPTION" and "version" not in r, r
+
+
+def test_expiry_tick_restores_without_access(console_daemon) -> None:
+    import time
+
+    d, target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        o = _open(d, timeout="1")
+        assert o.get("soft_preempted") is True, o
+        os.write(fd1, b"W")
+        time.sleep(3.0)  # 期間不發任何 RPC：tick 到期還原並回放
+        assert b"W" in target.written(0.5)
+        iid = o["interactive_id"]
+        for _ in range(2):
+            st = d.rpc("session.interactive_status", {"interactive_id": iid})
+            assert st["ok"] is False and st["error_code"] == "INTERACTIVE_EXPIRED", st
+        cl = d.rpc("session.interactive_close", {"interactive_id": iid})
+        assert cl["ok"] is False and cl["error_code"] == "INTERACTIVE_EXPIRED", cl
+    finally:
+        os.close(fd1)
+
+
+def test_lazy_expiry_parity(console_daemon) -> None:
+    import time
+
+    d, _target = console_daemon
+    iid = _open(d, timeout="1")["interactive_id"]
+    time.sleep(1.05)
+    first = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "x"})
+    assert first["ok"] is False and first["error_code"] == "INTERACTIVE_EXPIRED", first
+    second = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "x"})
+    assert second["ok"] is False and second["error_code"] in ("INTERACTIVE_NOT_FOUND", "INTERACTIVE_EXPIRED"), second
+
+
+def test_status_touch_extends(console_daemon) -> None:
+    import time
+
+    d, _target = console_daemon
+    iid = _open(d, timeout="2")["interactive_id"]
+    time.sleep(1.5)
+    assert d.rpc("session.interactive_status", {"interactive_id": iid})["ok"] is True
+    time.sleep(1.0)
+    assert d.rpc("session.interactive_status", {"interactive_id": iid})["ok"] is True
+    time.sleep(3.5)
+    st = d.rpc("session.interactive_status", {"interactive_id": iid})
+    assert st["ok"] is False and st["error_code"] == "INTERACTIVE_EXPIRED", st
