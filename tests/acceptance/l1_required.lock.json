@@ -4019,6 +4019,7 @@
           "tests/test_l1_judge.py::test_l1_lock_frozen_set_excludes_capability_gated",
           "tests/test_policy_r21_allow_guard.py::test_allowed_oracle_review_has_no_credential_or_marker_and_single_structural_hit",
           "tests/test_policy_r21_allow_guard.py::test_guarded_file_is_still_the_only_reason_for_its_allow_entry",
+          "tests/test_policy_r21_allow_guard.py::test_marker_guard_still_catches_baseline_markers_without_engine",
           "tests/test_policy_r21_allow_guard.py::test_pinned_patterns_match_engine_when_available",
           "tests/test_resource_report.py::test_od23_removal_triples_are_all_approved_in_ci",
           "tests/test_resource_report.py::test_od24_ignored_removal_triples_are_approved_in_ci",

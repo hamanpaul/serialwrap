@@ -6,12 +6,14 @@
 credential 與 marker 命中為 0、structural 命中恰為第 3 行一處；日後編輯若夾帶憑證或新路徑即 FAIL。
 
 engine（`policy_check`）不在 CI 的 pytest 依賴內：可匯入時直接取用其正規式並核對本檔釘選副本
-未漂移；不可匯入時改用釘選副本（仍執行，不 SKIP）。
+與 baseline markers 未漂移；不可匯入時改用釘選副本（仍執行，不 SKIP），marker 集合依 engine
+`resolve_markers` 同式由釘選 baseline 與 repo 設定解析，集合為空即 FAIL。
 """
 
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,11 @@ _PINNED = {
     "_PRIVATE_KEY": (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", 0),
     "_AWS_ACCESS_KEY": (r"\b(?:AKIA|ASIA|A3T|AIDA|AGPA)[A-Z0-9]{16}\b", 0),
     "_GITHUB_TOKEN": (r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b", 0),
+}
+# 同版 engine `policy_check/data/secret_scan_defaults.yml` 的 baseline 釘選副本（`resolve_markers` 的基底）。
+_PINNED_BASELINE = {
+    "markers": ["bgw720", "build20"],
+    "public_names": ["brcm", "broadcom", "airoha", "mtk", "mediatek", "prplos", "prplog", "marvell"],
 }
 
 
@@ -51,16 +58,31 @@ def _patterns() -> dict[str, re.Pattern[str]]:
     return {name: getattr(engine, name) for name in _PINNED}
 
 
-def _marker_re() -> re.Pattern[str] | None:
+def _pinned_markers(config: dict) -> set[str]:
+    # 與 engine `resolve_markers` 同式：(baseline.markers ∪ repo.markers) − (baseline.public_names ∪ repo.public_names)。
+    sec = (config or {}).get("secret_scan") or {}
+
+    def repo(key: str) -> set[str]:
+        return {str(t).lower() for t in (sec.get(key) or []) if str(t).strip()}
+
+    markers = set(_PINNED_BASELINE["markers"]) | repo("markers")
+    public = set(_PINNED_BASELINE["public_names"]) | repo("public_names")
+    return markers - public
+
+
+def _marker_re() -> re.Pattern[str]:
     engine = _engine()
     if engine is None:
-        tokens = {str(t).lower() for t in ((_config().get("secret_scan") or {}).get("markers") or [])}
+        tokens = _pinned_markers(_config())
         if not tokens:
-            return None
-        return re.compile(r"\b(?:" + "|".join(re.escape(t) for t in sorted(tokens)) + r")\b", re.IGNORECASE)
+            pytest.fail("marker 集合為空：釘選 baseline 與 repo 設定解析後無任何 marker，防線失效")
+        return re.compile(r"\b(" + "|".join(re.escape(t) for t in sorted(tokens)) + r")\b", re.IGNORECASE)
     from policy_check.rules._secret_scan_config import resolve_markers
 
-    return engine._build_marker_re(resolve_markers(_config()))
+    pattern = engine._build_marker_re(resolve_markers(_config()))
+    if pattern is None:
+        pytest.fail("engine 解析的 marker 集合為空，防線失效")
+    return pattern
 
 
 def test_guarded_file_is_still_the_only_reason_for_its_allow_entry() -> None:
@@ -75,22 +97,39 @@ def test_pinned_patterns_match_engine_when_available() -> None:
     for name, (src, flags) in _PINNED.items():
         pattern = getattr(engine, name)
         assert (pattern.pattern, pattern.flags & re.IGNORECASE) == (src, flags & re.IGNORECASE), name
+    from policy_check.rules._secret_scan_config import resolve_markers
+
+    assert resolve_markers(_config()) == _pinned_markers(_config()), "baseline markers 釘選副本與 engine 漂移"
 
 
-def test_allowed_oracle_review_has_no_credential_or_marker_and_single_structural_hit() -> None:
+def _scan(text: str) -> tuple[list[int], list[int], list[int]]:
     patterns = _patterns()
     marker_re = _marker_re()
     structural: list[int] = []
     credential: list[int] = []
     marker: list[int] = []
-    text = (ROOT / GUARDED).read_text(encoding="utf-8", errors="replace")
     for ln, line in enumerate(text.splitlines(), start=1):
         if patterns["_STRUCTURAL"].search(line) or patterns["_PRIVATE_KEY"].search(line):
             structural.append(ln)
         if patterns["_AWS_ACCESS_KEY"].search(line) or patterns["_GITHUB_TOKEN"].search(line):
             credential.append(ln)
-        if marker_re is not None and marker_re.search(line):
+        if marker_re.search(line):
             marker.append(ln)
+    return structural, credential, marker
+
+
+def test_marker_guard_still_catches_baseline_markers_without_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CI 無 engine：fallback 須含 engine baseline markers，否則受整檔豁免的檔案夾帶 marker 無任何防線。
+    monkeypatch.setattr(sys.modules[__name__], "_engine", lambda: None)
+    text = (ROOT / GUARDED).read_text(encoding="utf-8", errors="replace")
+    for token in _PINNED_BASELINE["markers"]:
+        _, _, marker = _scan(text + f"\nmutant: {token.upper()} build\n")
+        assert marker, f"無 engine 時 baseline marker {token} 未被偵測"
+
+
+def test_allowed_oracle_review_has_no_credential_or_marker_and_single_structural_hit() -> None:
+    text = (ROOT / GUARDED).read_text(encoding="utf-8", errors="replace")
+    structural, credential, marker = _scan(text)
     assert credential == [], f"整檔豁免下不得出現 credential 樣式：行 {credential}"
     assert marker == [], f"整檔豁免下不得出現 marker 樣式：行 {marker}"
     assert structural == EXPECTED_STRUCTURAL_LINES, f"structural 命中須恰為雲端容器路徑所在行：{structural}"
