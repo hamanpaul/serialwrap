@@ -245,16 +245,21 @@ fn resolution_order_pin_sticky_detect_fallback() {
 }
 
 #[test]
-fn detect_skips_passthrough_console_unlock_and_unsupported() {
-    // 偵測候選只含 command-capable 且不需 console_unlock_env／post_login_cmd 的模板；
-    // 其餘（passthrough、console_unlock、post_login）即使 prompt 可匹配也不得被嘗試。
+fn detect_skips_passthrough_and_console_unlock() {
+    // P7 Task 3（08 §0.6 退役清單，取代 06 T16 `detect_skips_passthrough_console_unlock_and_unsupported`）：
+    // Python `login_fsm.detect_template` 只略過 passthrough 與 `console_unlock_env`；`post_login_cmd` 模板（brcm）恢復為候選。
     const DETECT_TEMPLATES: &str = "profiles:\n  pt-template:\n    platform: passthrough\n    prompt_regex: '.*'\n    login_regex: '$^'\n    password_regex: '$^'\n    ready_probe: ''\n  cu-template:\n    platform: shell\n    prompt_regex: '(?m)^root@x:.*# '\n    console_unlock_env: SW_UNLOCK\n    timeout_s: 2.0\n  pl-template:\n    platform: shell\n    prompt_regex: '(?m)^root@x:.*# '\n    post_login_cmd: sh\n    timeout_s: 2.0\n";
     let m = ManagerRig::with(DETECT_TEMPLATES, LoadedState::default(), None);
     m.devices(&["/s/by-id/usb-D"]);
     m.reply_probe(&m.real_of("/s/by-id/usb-D"), b"root@x:/# ");
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
-    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    assert_eq!(m.wait_profile_source("COM0"), "detected");
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile").as_deref(),
+        Some("pl-template"),
+        "略過 passthrough 與 console unlock 後，post_login_cmd 模板為第一個命中者"
+    );
 }
 
 #[test]

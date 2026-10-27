@@ -1140,7 +1140,7 @@ impl Shared {
     }
 
     /// `detect_template`：送 `\n`、等待 3.0 s（Clock）、以 RX 快照依序比對候選模板的 prompt（再以 login regex 備選）。
-    /// 候選排除 passthrough 與 Slice 2.1 不支援能力（`console_unlock_env`、`post_login_cmd`）。RX／TX 以 `com=PROBE` 寫 WAL。
+    /// 候選排除 passthrough 與 `console_unlock_env`（Python `detect_template`）。RX／TX 以 `com=PROBE` 寫 WAL。
     fn detect_template(&self, parts: &mut HandleParts) -> Option<ProfileTemplate> {
         let mut buf = vec![0u8; 8192];
         // `clear_rx_buffer`：丟棄開埠後已到的舊資料（仍寫 WAL）。
@@ -1151,12 +1151,13 @@ impl Shared {
         let snapshot = clean_text(&String::from_utf8_lossy(&bytes));
         let mut login_candidate: Option<ProfileTemplate> = None;
         for tpl in &self.templates {
+            // `login_fsm.detect_template`：只略過 passthrough 與 console_unlock_env（P7 Task 3 退役 Slice 2.1 能力閘，
+            // post_login_cmd 模板恢復為候選）。
             if tpl.platform == "passthrough"
                 || tpl
                     .console_unlock_env
                     .as_deref()
                     .is_some_and(|v| !v.is_empty())
-                || !tpl.post_login_cmd.is_empty()
             {
                 continue;
             }

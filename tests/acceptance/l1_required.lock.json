@@ -59,7 +59,8 @@
           "cargo:sw-core::login_quiet::post_login_cmd_profile_logs_in",
           "cargo:sw-core::session_auth_golden::debug_output_redacts_secrets",
           "cargo:sw-core::session_auth_golden::parse_env_file_matches_python_golden",
-          "cargo:sw-core::session_auth_golden::resolve_session_auth_matches_python_golden_including_warnings"
+          "cargo:sw-core::session_auth_golden::resolve_session_auth_matches_python_golden_including_warnings",
+          "cargo:sw-core::session_manager::detect_skips_passthrough_and_console_unlock"
         ],
         "selector": {
           "argv": [
@@ -9290,7 +9291,7 @@
           "cargo:sw-core::session_manager::com_for_by_id_session_first_then_pending",
           "cargo:sw-core::session_manager::detached_rebind_fallback_smallest_act_no",
           "cargo:sw-core::session_manager::detect_probe_tx_goes_through_fence",
-          "cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
+          "cargo:sw-core::session_manager::detect_skips_passthrough_and_console_unlock",
           "cargo:sw-core::session_manager::device_attach_during_shutdown_errors",
           "cargo:sw-core::session_manager::device_removed_drains_to_detached",
           "cargo:sw-core::session_manager::dynamic_attach_skipped_during_shutdown_or_drain",
@@ -10246,7 +10247,6 @@
           "cargo:sw-core::session_manager::binding_override_cleanup_186",
           "cargo:sw-core::session_manager::clear_paths",
           "cargo:sw-core::session_manager::detached_rebind_fallback_smallest_act_no",
-          "cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
           "cargo:sw-core::session_manager::device_removed_drains_to_detached",
           "cargo:sw-core::session_manager::dynamic_session_naming",
           "cargo:sw-core::session_manager::fanout_registers_every_session_fence",
