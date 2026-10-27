@@ -4012,6 +4012,18 @@
     "s1_pytest_full": {
       "linux": {
         "nodeids": [
+          "tests/test_l1_judge.py::test_l1_add_only_excludes_ignored_nodeids_od24[linux]",
+          "tests/test_l1_judge.py::test_l1_add_only_excludes_ignored_nodeids_od24[windows]",
+          "tests/test_l1_judge.py::test_l1_add_only_ignored_existing_rows_kept_unless_approved_od24",
+          "tests/test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests",
+          "tests/test_l1_judge.py::test_l1_lock_frozen_set_excludes_capability_gated",
+          "tests/test_policy_r21_allow_guard.py::test_allowed_oracle_review_has_no_credential_or_marker_and_single_structural_hit",
+          "tests/test_policy_r21_allow_guard.py::test_guarded_file_is_still_the_only_reason_for_its_allow_entry",
+          "tests/test_policy_r21_allow_guard.py::test_pinned_patterns_match_engine_when_available",
+          "tests/test_resource_report.py::test_od23_removal_triples_are_all_approved_in_ci",
+          "tests/test_resource_report.py::test_od24_ignored_removal_triples_are_approved_in_ci",
+          "tests/test_rust_cargo_l1_results.py::test_list_only_feeds_regen_lock",
+          "tests/test_rust_cargo_l1_results.py::test_list_only_keeps_ignored_non_cap_in_denominator",
           "tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override",
           "tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields"
         ],
