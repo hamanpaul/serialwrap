@@ -9,7 +9,7 @@
 #   - PASS 必須附 tests（nodeid）；且每個 nodeid 須在本次 gate 已載入的 l1-results 中恰為 passed，否則降為 INCOMPLETE。
 #   - BLOCKED-OWNER 必須附 bo（BO-S21-NN，須存在於 tests/acceptance/slice21_bo.yaml）。
 #   - 任一列為 INCOMPLETE → gate verdict INCOMPLETE。
-# 初填依據（2026-10-27，分支 p5work @ 8a7986e）：Linux `cargo_l1_results.py -- --workspace --features test-fakes -- --skip cap_`
+# 初填依據（2026-10-27，分支 p5work @ 8a7986e；同日 P5 審查修正輪更新 #3／#4／#32／#38／#46／#47／#52／#68／#72／A-88／A-92／D-106／F-W13）：Linux `cargo_l1_results.py -- --workspace --features test-fakes -- --skip cap_`
 #   逐案結果（P5-T19～T21 未完成）、`grep` 測試函式是否存在、`tests/acceptance/l1_required.lock.json` 的 s21_core／s21_gate:py_parity。
 #   PASS 只表示「計畫指名的測試存在且本次 Linux 執行 passed」；Windows 原生證據仍由 gate 的 windows_native_l1 補齊。
 schema_version: 1
@@ -20,8 +20,12 @@ rows:
   # ---------- §1 總表 ----------
   - {id: "#1", status: INCOMPLETE, reason: "計畫指名 serial_backend_env_values／serial_backend_env_values_windows（P5-T2／T3 追加段）尚未建立"}
   - {id: "#2", status: INCOMPLETE, reason: "sysenv_test_system_config_path_overrides 與 runtime_paths golden 新列不在本分支（修正在 feature/rust-refactor，尚未併入 P5）"}
-  - {id: "#3", status: INCOMPLETE, reason: "P5-T19 未完成：release_kill_hook_env_isolated_only 尚未建立"}
-  - {id: "#4", status: INCOMPLETE, reason: "P5-T19 未完成：release_pause_hook_env_isolated_only 尚未建立"}
+  - id: "#3"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only"]
+  - id: "#4"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
   - {id: "#6", status: OWNER-DECISION-PENDING, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
   - id: "#11"
     status: PASS
@@ -94,14 +98,16 @@ rows:
   - id: "#31"
     status: PASS
     tests: ["cargo:sw-core::session_manager::rematerialize_profile_recomputes_session_id_and_alias"]
-  - {id: "#32", status: INCOMPLETE, reason: "pin_applies_on_reattach／fallback_redetects_on_reattach／unresolvable_pin_falls_through 已 passed；計畫指名的 no_redetect_during_quiet 尚未建立"}
+  - {id: "#32", status: OWNER-DECISION-PENDING, reason: "pin_applies_on_reattach／fallback_redetects_on_reattach／unresolvable_pin_falls_through 已 passed；計畫指名的 no_redetect_during_quiet 經公開輸入不可達（後備 template 恆為 passthrough，Python 不對 passthrough 武裝 quiet；見 p5-fix-responses F67），語意由 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 鎖住，待擁有者核可以 core 層案例替代"}
   - id: "#34"
     status: PASS
     tests: ["cargo:sw-core::command_exec::recover_key_refused_frozen_maps_flushed_by_recovery"]
   - id: "#36"
     status: PASS
     tests: ["cargo:sw-core::lease_selftest::lease_send_refused_at_commit_maps_codes"]
-  - {id: "#38", status: INCOMPLETE, reason: "cancelled_ops_bounded_512_fifo 尚未建立；resource_limits fence_cancelled_ops_max 未登記"}
+  - id: "#38"
+    status: PASS
+    tests: ["cargo:sw-core::tx_writer::cancelled_ops_bounded_512_fifo"]
   - {id: "#39", status: INCOMPLETE, reason: "計畫指名 unknown_outcome_writes_confirmed_prefix_and_meta／unknown_without_confirmed_bytes_writes_meta_only 尚未建立（tx_writer.rs 現有 unknown_with_log_* 為不同語意的既有列，需 P5-T9 對齊）"}
   - id: "#41"
     status: PASS
@@ -112,15 +118,21 @@ rows:
     tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
     note: "併 #11"
   - {id: "#45", status: INCOMPLETE, reason: "三個 Rust 測試已 passed；D-44 Python 特性測試（#81）尚未新增／登記 s21_gate:py_parity"}
-  - {id: "#46", status: INCOMPLETE, reason: "P5-T19 未完成：allowlist_rejected_before_runtime_dirs_and_lock 尚未建立"}
-  - {id: "#47", status: INCOMPLETE, reason: "P5-T19 未完成：unreadable_config_* 三案與 golden 尚未建立"}
+  - id: "#46"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock"]
+  - id: "#47"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::unreadable_config_env_allowlist_wins", "cargo:sw-daemon::daemon_process::unreadable_config_isolated_fail_closed", "cargo:sw-daemon::daemon_process::unreadable_config_non_isolated_unchanged"]
   - id: "#50"
     status: PASS
     tests: ["cargo:sw-core::session_manager::attach_finish_respawns_when_state_requires"]
   - id: "#51"
     status: PASS
     tests: ["cargo:sw-core::session_manager::dynamic_probe_and_bridge_share_preopened_port"]
-  - {id: "#52", status: INCOMPLETE, reason: "cancelled_inflight_command_later_tx_refused 尚未建立（P5-T9）"}
+  - id: "#52"
+    status: PASS
+    tests: ["cargo:sw-core::tx_writer::cancelled_inflight_command_later_tx_refused"]
   - {id: "#53", status: INCOMPLETE, reason: "watcher_delta_not_lost_when_consumer_rejects 尚未建立（P5-T5）"}
   - id: "#54"
     status: PASS
@@ -148,12 +160,14 @@ rows:
   - id: "#65"
     status: PASS
     tests: ["cargo:sw-pal::serial_posix::conflict_holder_unknown_when_no_pids"]
-  - {id: "#68", status: INCOMPLETE, reason: "併 #3／#4（P5-T19 未完成）"}
+  - id: "#68"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only", "cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
   - id: "#69"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::ready_unconfirmed_response_has_session_field"]
   - {id: "#71", status: OWNER-DECISION-PENDING, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
-  - {id: "#72", status: INCOMPLETE, reason: "sigterm_sigint_orderly_stop、windows_console_ctrl_triggers_orderly_stop 與 Python test_sigterm_orderly_shutdown_posix 尚未建立（P5-T4／T19）"}
+  - {id: "#72", status: INCOMPLETE, reason: "Rust sigterm_sigint_orderly_stop 已建立並登記 s21_core；windows_console_ctrl_triggers_orderly_stop（LOCAL-WINDOWS-TODO）與 Python test_sigterm_orderly_shutdown_posix 尚未建立"}
   - id: "#73"
     status: PASS
     tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]
@@ -165,8 +179,8 @@ rows:
     status: PASS
     tests: ["tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices"]
   - {id: "A-86", status: INCOMPLETE, reason: "P5-T19 註記免測（#102）待 Task 19 完成時確認"}
-  - {id: "A-88", status: INCOMPLETE, reason: "no_profiles_message_and_continue 目前 failed（P5-T19 未完成）；Python `no profiles loaded` 特性測試（#81）尚未新增"}
-  - {id: "A-92", status: INCOMPLETE, reason: "#78 Python 測試（test_daemon_lock.py 等）尚未登記 s21_gate:py_parity；#101 second_daemon_same_lock_exits_2_with_stderr 目前 failed（P5-T19）"}
+  - {id: "A-88", status: INCOMPLETE, reason: "Rust no_profiles_message_and_continue 已 passed（P5-T19 完成）；Python `no profiles loaded` 特性測試（#81）尚未新增"}
+  - {id: "A-92", status: INCOMPLETE, reason: "#101 second_daemon_same_lock_exits_2_with_stderr 已 passed（P5-T19 完成）；#78 Python 測試（test_daemon_lock.py 等）尚未登記 s21_gate:py_parity（selector 登記待擁有者，F57）"}
   - {id: "A-94", status: INCOMPLETE, reason: "併 #72"}
   - id: "A-103"
     status: PASS
@@ -258,7 +272,9 @@ rows:
       - "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain"
   - {id: "D-44", status: INCOMPLETE, reason: "併 #45：D-44 Python 特性測試尚未新增"}
   - {id: "D-51", status: INCOMPLETE, reason: "Rust passthrough_timeout_no_rescue_keys_no_downgrade 已 passed；Python oracle test_p1oc_sc35_commands.py（#77）尚未登記 s21_gate:py_parity"}
-  - {id: "D-106", status: INCOMPLETE, reason: "併 #68（P5-T19 未完成）"}
+  - id: "D-106"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only", "cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
   - id: "E-19"
     status: PASS
     tests:
@@ -276,7 +292,7 @@ rows:
   - {id: "E-43", status: INCOMPLETE, reason: "#82 PAL conformance Linux 列已在 s21_core；Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
   - {id: "E-50", status: INCOMPLETE, reason: "#79 begin_drain→cancel_pending_write 既有 Python 測試尚未登記 s21_gate:py_parity"}
   - {id: "E-52", status: INCOMPLETE, reason: "#79 test_stage0_bridge_drain.py 兩筆尚未登記 s21_gate:py_parity"}
-  - {id: "F-W13", status: INCOMPLETE, reason: "rotate_schedule_cancelled_when_file_shrinks_or_vanishes 與 Python test_rotate_schedule_cancelled_on_shrink 尚未建立"}
+  - {id: "F-W13", status: INCOMPLETE, reason: "Rust rotate_schedule_cancelled_when_file_shrinks_or_vanishes 已建立並登記 s21_core；Python test_rotate_schedule_cancelled_on_shrink 尚未建立"}
   - {id: "F-W32", status: INCOMPLETE, reason: "#80 test_reset_on_posix_still_fsyncs_directory 尚未登記 s21_gate:py_parity；#87 wal_fs Windows 列需原生收集"}
   - id: "F-S02"
     status: PASS
