@@ -263,6 +263,22 @@ def test_compose_no_real_serial_devices():
                 f"{name} 非 systemd profile 不得掛載 /sys/fs/cgroup"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_selftest_diag_tolerates_non_object_reports(tmp_path):
+    # 診斷只增加輸出：報告為合法 JSON 但頂層非物件時不得拋例外吞掉原失敗訊息。
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "selftest-report.json").write_text("[1, 2]", encoding="utf-8")
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "selftest-report.json").write_text(
+        json.dumps({"verdict": "FAIL", "complete": True, "checks": [{"id": "ST-01", "verdict": "FAIL", "reason": "x"}]}),
+        encoding="utf-8",
+    )
+    diag = _selftest_diag(tmp_path)
+    assert "頂層非物件（list）" in diag
+    assert "ST-01=FAIL：x" in diag
+
+
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
@@ -479,6 +495,9 @@ def _selftest_diag(out: Path) -> str:
             report = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             lines.append(f"{path.relative_to(out)}: 無法解析（{type(exc).__name__}: {exc}）")
+            continue
+        if not isinstance(report, dict):
+            lines.append(f"{path.relative_to(out)}: 頂層非物件（{type(report).__name__}）")
             continue
         bad = [f"{row.get('id')}={row.get('verdict')}：{row.get('reason')}"
                for row in report.get("checks") or [] if isinstance(row, dict) and row.get("verdict") != "PASS"]
