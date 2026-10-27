@@ -242,6 +242,21 @@ struct Shared {
     cv: Condvar,
     note_tx: Sender<ManagerNote>,
     closed: AtomicBool,
+    /// state.json 持久化觀察者（P5-T19 #3／#4／#68 的 Stage 0 測試鉤子；未設定時不動作）。
+    persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
+}
+
+/// state.json 持久化觀察者（P5-T19，parity #3／#4／#68）。
+///
+/// 對應 Python `_save_state()` 尾端的 `_test_kill_after_save_hook(False)` 與 release 持久化專用入口
+/// `_save_release_state()`（commit 前暫停點 → 落盤 → 落盤後 kill 鉤子）。是否生效（僅隔離實例）由實作者
+/// （daemon 組裝點）決定，sw-core 只提供呼叫點。
+pub trait PersistObserver: Send + Sync {
+    /// release 持久化 commit 之前（Python `_test_release_persist_point()`）。
+    fn before_release_commit(&self);
+    /// 任一 state.json commit 成功之後；`release` 為 true 表示本次為 release 持久化
+    /// （Python 先以 `False` 呼叫一次 kill 鉤子，release 持久化再以 `True` 呼叫一次）。
+    fn after_commit(&self, release: bool);
 }
 
 /// 全域 session 管理者（plan 06 Task 16）。
@@ -448,18 +463,42 @@ impl Shared {
     /// state.json 同步寫入（`StateModel::apply` → `StateStore` 單一寫入者）；失敗回 `Err`。
     /// 快照於 model 鎖內建立並排入 store（last-writer-wins 依提交順序）。
     fn commit_sync(&self, f: impl FnOnce(&mut StateModel)) -> Result<(), PalError> {
+        self.commit_sync_kind(f, false)
+    }
+
+    /// 同 `commit_sync`；`release` 為 true 時為 release 持久化（觀察者的暫停點與 kill 鉤子，P5-T19 #3／#4）。
+    fn commit_sync_kind(
+        &self,
+        f: impl FnOnce(&mut StateModel),
+        release: bool,
+    ) -> Result<(), PalError> {
+        let observer = lock(&self.persist_observer).clone();
+        if release {
+            if let Some(o) = &observer {
+                o.before_release_commit();
+            }
+        }
         let (tx, rx) = crossbeam_channel::bounded(1);
         {
             let mut model = lock(&self.model);
             f(&mut model);
             self.store.commit(model.snapshot(), tx);
         }
-        rx.recv().unwrap_or_else(|_| {
+        let result = rx.recv().unwrap_or_else(|_| {
             Err(PalError::plain(
                 PalErrorKind::BrokenPipe,
                 "state store 已停止",
             ))
-        })
+        });
+        if result.is_ok() {
+            if let Some(o) = &observer {
+                o.after_commit(false);
+                if release {
+                    o.after_commit(true);
+                }
+            }
+        }
+        result
     }
 
     /// 只改記憶體 model（下一次寫入才落盤；Python 只改 `self._aliases` 等而不 `_save_state` 的路徑）。
@@ -1717,7 +1756,8 @@ impl EffectExecutor for ManagerExec {
                 });
             }
             Effect::Persist { commit_id, delta } => {
-                let result = self.shared.commit_sync(|m| m.apply(delta));
+                let release = matches!(delta, StateDelta::Released { .. });
+                let result = self.shared.commit_sync_kind(|m| m.apply(delta), release);
                 let _ = tx.send(ControlEvent::StateCommitted { commit_id, result });
             }
             Effect::Notify(note) => {
@@ -1778,6 +1818,7 @@ impl SessionManager {
             cv: Condvar::new(),
             note_tx,
             closed: AtomicBool::new(false),
+            persist_observer: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -2349,6 +2390,11 @@ impl SessionManager {
     /// DeviceWatcher → manager 的事件送端（Delta 轉 `update_devices`、Tick 轉 `on_tick`）。
     pub fn watcher_sender(&self) -> Sender<WatcherEvent> {
         self.watcher_tx.clone()
+    }
+
+    /// 設定 state.json 持久化觀察者（P5-T19 #3／#4／#68；daemon 組裝點於 `new()` 之後、任何 attach 之前呼叫）。
+    pub fn set_persist_observer(&self, observer: Arc<dyn PersistObserver>) {
+        *lock(&self.shared.persist_observer) = Some(observer);
     }
 
     /// SC-11 stopping gate：冪等設定 `stopping=true`；之後任何自動或 RPC 路徑的 attach 都不開啟裝置。

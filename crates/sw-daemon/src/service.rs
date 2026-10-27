@@ -692,6 +692,10 @@ impl Service {
             }
 
             // Slice 2.1 延後的 15 個 method（session.console_*、event.*、file.*）與未知 method：無副作用。
+            // test-fakes 建置專用（P5-T19 `handler_panic_does_not_kill_daemon`）：handler 內 panic，驗證 framing 的
+            // `catch_unwind` 轉 `EXCEPTION` 且 daemon 存活。產品 build 不編譯此分支（落入 METHOD_NOT_FOUND）。
+            #[cfg(feature = "test-fakes")]
+            "test.panic" => panic!("slice21 T19 test.panic handler"),
             _ => Ok(pydict! { "ok" => false, "error_code" => "METHOD_NOT_FOUND", "method" => method }),
         }
     }
