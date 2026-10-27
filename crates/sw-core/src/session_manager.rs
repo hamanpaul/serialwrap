@@ -703,7 +703,11 @@ impl Shared {
     fn handle_watcher(self: &Arc<Self>, ev: WatcherEvent) {
         match ev {
             WatcherEvent::Delta { snapshot, .. } => self.update_devices(&snapshot),
-            WatcherEvent::Tick => {}
+            // Python `Service._on_watcher_tick`：每輪先非阻塞服務 WAL 延後輪替（OD-19；無新流量時 append 不會發生）。
+            // readiness reconcile 屬後續 Slice，不在 2.1 範圍。
+            WatcherEvent::Tick => {
+                self.wal.tick();
+            }
             WatcherEvent::ScanFailed(e) => self.warn(format!("裝置掃描失敗：{e:?}")),
         }
     }

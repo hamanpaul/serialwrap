@@ -28,3 +28,11 @@
 | F07 | Medium | 2fcdbbf | `uds_mode_0660_baseline` 非 root 時以主要群組為 chgrp 目標，拿掉 chgrp 仍綠 | fixed（本組 commit）：非 root 改選與主要群組不同的附加群組；皆無 → 以 FAIL 報證據不足 |
 | F08 | Medium | 335665e | POSIX `poll` rc<0 臂未被測試鎖住 | fixed（本組 commit）：抽出 `poll_failure(errno)`（`read` 迴圈唯一呼叫點），新增 `poll_rc_negative_is_wait_error_not_read_error`：EINTR 重試、EINVAL／ENOMEM／EFAULT → `ReadError::Wait`；把該臂改回 `Read` 即紅 |
 | F09 | Medium | 335665e | Windows `WaitForMultipleObjects` 失敗臂只測分類函式 | deferred：LOCAL-WINDOWS-TODO（須在 `#[cfg(windows)] mod windows_native` 以原生 API 失敗經 `WindowsSerialReader::read` 斷言 `ReadError::Wait`＋`SELECT:<errno>`；本機無 Windows，不以模型測試充數） |
+
+## sw-core WAL／TX
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F10 | Medium | 2d93181 | `rotate_retry` 只計 rename、每次 append 都重試；`rotate_deferred`／`deferred_delete_pending` 寫死 0；無 backoff／`next_at`／`tick` | fixed（本組 commit）：移植 `_RotatePending`、`_schedule_rotate_retry_locked`（backoff 10／50／200 ms，第 4 次轉入 1 s 延遲佇列）、告警節流（首次失敗、轉入延遲、延遲中每 60 s 一筆）、`WalWriter::tick`（try_lock、無 pending 不動作、現行檔延後輪替完成時寫 `WAL_ROTATED_AFTER_DEFERRAL`）；close(sync)／rename／sync_dir 的暫時性錯誤都計數；非暫時性錯誤移除排程。daemon：`SessionManager` 處理 watcher `Tick` 時呼叫 `wal.tick()`（Python `Service._on_watcher_tick`）。期望值以 Python oracle（`origin/feature/rust-refactor` `wal.py`＋可控時鐘、注入 EACCES 的 fs 包裝）實跑取得：四次 EACCES → `4/1/1`；未到 next_at 連 5 次 append → `1/0/0`；截短後 → `4/1/0`；告警 3 筆；tick 完成後新現行檔僅一筆 META、`archived_through_seq` 為輪替前 seq |
+| F11 | Low | 2d93181 | 本分支 `contracts/rpc_schema.json` 與 `sw_core/wal.py` 仍為 11 鍵 | deferred：BLOCKED-OWNER（同 R-00，須併入 `origin/feature/rust-refactor` 的 OD-19 契約與 Python 變更） |
+| F12 | Medium | 7c084ef | #88 `rotate_schedule_cancelled_when_file_shrinks_or_vanishes` 不存在 | fixed（本組 commit）：Rust 測試補上（含移除後重新從第 1 段退避）；Python 側對應案例屬 `origin/feature/rust-refactor` 的 `tests/test_wal.py`（本分支無 OD-19 Python 實作，同 R-00），未在本分支新增 |

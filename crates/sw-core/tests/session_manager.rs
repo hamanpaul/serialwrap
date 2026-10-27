@@ -1556,3 +1556,46 @@ fn detect_probe_tx_goes_through_fence() {
     assert_eq!(tx_rows(&m), 1, "PROBE TX 只由 TxWriter 寫一筆 WAL");
     assert_eq!(m.serial.open_attempts(&real), 1);
 }
+
+#[test]
+fn watcher_tick_services_deferred_wal_rotation() {
+    // 審查 F10（OD-19）：Python `Service._on_watcher_tick` 每輪先 `wal.tick()`——延後輪替的完成不得依賴後續 append。
+    // 現行檔達門檻、rename 連 4 次 EACCES 轉入延遲佇列；之後不再 append，只送 watcher Tick → 輪替完成並寫
+    // `WAL_ROTATED_AFTER_DEFERRAL`。
+    let m = ManagerRig::templates_only();
+    let wal_path = std::path::Path::new("/fake/wal/raw.wal.ndjson");
+    m.wfs.seed(wal_path, &vec![b'\n'; 67_108_864]);
+    m.wfs
+        .fail_next_renames(4, sw_pal::PalError::io(13, "[Errno 13] Permission denied"));
+    let append = || {
+        m.wal.append(sw_core::wal::WalAppendReq {
+            com: "COM0",
+            dir: "RX",
+            source: "uart",
+            payload: b"x",
+            cmd_id: None,
+            loss_flag: false,
+            meta: None,
+        })
+    };
+    m.clock.advance(Duration::from_millis(300));
+    for backoff_ms in [11u64, 51, 201, 0] {
+        append();
+        m.clock.advance(Duration::from_millis(backoff_ms));
+    }
+    let h = m.wal.health().to_pydict();
+    assert_eq!(h.get("deferred_delete_pending").and_then(PyValue::as_i64), Some(1));
+    m.clock.advance(Duration::from_millis(1001));
+    m.mgr.watcher_sender().send(WatcherEvent::Tick).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let h = m.wal.health().to_pydict();
+        if h.get("deferred_delete_pending").and_then(PyValue::as_i64) == Some(0) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "watcher Tick 未推進延後輪替：{h:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = String::from_utf8(m.wfs.contents(wal_path).expect("新現行檔")).unwrap();
+    assert!(text.contains("WAL_ROTATED_AFTER_DEFERRAL"), "{text}");
+}

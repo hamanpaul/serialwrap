@@ -1,4 +1,5 @@
 //! POSIX `/proc` 行程掃描（P4-T4）。
+#[cfg(unix)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

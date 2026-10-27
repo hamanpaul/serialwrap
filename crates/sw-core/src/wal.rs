@@ -24,6 +24,23 @@ fn is_transient_rotate_error(error: &PalError) -> bool {
 
 const RECREATE_RETRY_INTERVALS_NS: [u64; 3] = [1_000_000_000, 2_000_000_000, 5_000_000_000];
 
+/// OD-19：輪替遇暫時性干擾的立即退避（`wal.py` `WAL_ROTATE_RETRY_BACKOFF_S = (0.01, 0.05, 0.2)`）；
+/// 超過即轉入延遲佇列，以 [`WAL_DEFERRED_DELETE_INTERVAL_NS`] 非阻塞重試。寫入路徑從不睡眠。
+const WAL_ROTATE_RETRY_BACKOFF_NS: [u64; 3] = [10_000_000, 50_000_000, 200_000_000];
+/// `wal.py` `WAL_DEFERRED_DELETE_INTERVAL_S = 1.0`。
+const WAL_DEFERRED_DELETE_INTERVAL_NS: u64 = 1_000_000_000;
+/// `wal.py` `WAL_DEFERRED_WARNING_INTERVAL_S = 60.0`：延遲中每分鐘最多一筆告警。
+const WAL_DEFERRED_WARNING_INTERVAL_NS: u64 = 60_000_000_000;
+
+/// 某個 WAL 檔（現行檔或 mirror）因干擾尚未完成的輪替（`wal.py` `_RotatePending`）。
+#[derive(Clone, Copy, Debug, Default)]
+struct RotatePending {
+    failures: usize,
+    next_at_ns: u64,
+    deferred: bool,
+    last_warning_at_ns: Option<u64>,
+}
+
 pub struct WalConfig {
     pub dir: PathBuf,
     pub rotate_bytes: u64,
@@ -194,6 +211,16 @@ enum Target {
     Mirror,
 }
 
+impl Target {
+    /// `WalInner::rotate_pending` 的索引。
+    fn index(self) -> usize {
+        match self {
+            Target::Wal => 0,
+            Target::Mirror => 1,
+        }
+    }
+}
+
 struct PendingRecreate {
     reason: &'static str,
     previous_identity: Option<String>,
@@ -223,6 +250,10 @@ struct WalInner {
     last_write_error: Option<String>,
     recreated_count: u64,
     rotate_retry: u64,
+    /// OD-19：轉入延遲佇列的累計次數（`wal.py` `_rotate_deferred_count`）。
+    rotate_deferred: u64,
+    /// OD-19：`[現行檔, mirror]` 的待完成輪替（`wal.py` `_rotate_pending`，以路徑種類為鍵）。
+    rotate_pending: [Option<RotatePending>; 2],
     unhealthy_reason: Option<&'static str>,
     dir_exists: bool,
     closed: bool,
@@ -377,6 +408,8 @@ impl WalWriter {
                 last_write_error: last_write_error.clone(),
                 recreated_count: 0,
                 rotate_retry: 0,
+                rotate_deferred: 0,
+                rotate_pending: [None, None],
                 unhealthy_reason,
                 dir_exists,
                 closed: false,
@@ -1154,6 +1187,11 @@ impl WalWriter {
         }
     }
 
+    /// 檔案超過上限時輪替；回傳本次呼叫是否有輪替嘗試失敗（best-effort，續用既有檔）。
+    ///
+    /// OD-19（`wal.py` `_rotate_if_needed`）：close(sync)／rename／sync_dir 的暫時性錯誤走
+    /// [`Self::schedule_rotate_retry_locked`] 有界退避；未到 `next_at` 者不嘗試、不計數；檔案已不存在或
+    /// 已低於門檻 → 先前排程的輪替不再需要（#88）；非暫時性錯誤移除排程並告警。
     fn rotate_if_needed_locked(
         &self,
         inner: &mut WalInner,
@@ -1167,22 +1205,29 @@ impl WalWriter {
                 continue;
             }
             let Some(size) = sizes.get(target) else {
+                inner.rotate_pending[target.index()] = None;
                 continue;
             };
             if size < self.rotate_bytes {
+                inner.rotate_pending[target.index()] = None;
                 inner.set_size(target, Some(size));
+                continue;
+            }
+            if inner.rotate_pending[target.index()]
+                .is_some_and(|pending| self.clock.mono_ns() < pending.next_at_ns)
+            {
                 continue;
             }
             let path = self.path_for(target);
             if inner.file(target).is_none() {
                 if let Err(error) = self.open_handle_locked(inner, target) {
-                    self.warn_rotate_failed(path, &error);
+                    self.rotate_failed_locked(inner, target, &error);
                     failed = true;
                     continue;
                 }
             }
             if let Some(error) = self.close_handle_locked(inner, target, true) {
-                self.warn_rotate_failed(path, &error);
+                self.rotate_failed_locked(inner, target, &error);
                 failed = true;
                 let _ = self.open_handle_locked(inner, target);
                 continue;
@@ -1190,6 +1235,7 @@ impl WalWriter {
             let base = archive_path(path, &timestamp);
             match self.fs.rename_noreplace_or_suffix(path, &base) {
                 Ok(_) => {
+                    inner.rotate_pending[target.index()] = None;
                     inner.set_size(target, None);
                     inner.set_dirty_tail(target, false);
                     if target == Target::Wal {
@@ -1198,22 +1244,118 @@ impl WalWriter {
                         inner.file_first_seq = Some(inner.seq.saturating_add(1));
                         inner.file_first_seq_pending = false;
                     }
+                    // Python：sync_dir 與 rename 同在 try 區塊內，其暫時性錯誤同樣排程重試（即使 rename 已完成）。
                     if let Err(error) = self.fs.sync_dir(&self.dir) {
-                        self.warn_rotate_failed(path, &error);
+                        self.rotate_failed_locked(inner, target, &error);
                         failed = true;
                     }
                 }
                 Err(error) => {
-                    if is_transient_rotate_error(&error) {
-                        inner.rotate_retry += 1;
-                    }
-                    self.warn_rotate_failed(path, &error);
+                    self.rotate_failed_locked(inner, target, &error);
                     failed = true;
                     let _ = self.open_handle_locked(inner, target);
                 }
             }
         }
         failed
+    }
+
+    /// 輪替失敗的計數、排程與告警節流（`wal.py` `_rotate_if_needed` 的 `except OSError` 分支）。
+    fn rotate_failed_locked(&self, inner: &mut WalInner, target: Target, error: &PalError) {
+        let warn_now = if is_transient_rotate_error(error) {
+            let newly_deferred = self.schedule_rotate_retry_locked(inner, target);
+            let now = self.clock.mono_ns();
+            let pending = inner.rotate_pending[target.index()]
+                .as_mut()
+                .expect("schedule_rotate_retry_locked 已建立 pending");
+            // 首次失敗與轉入延遲時告警；持續延遲則每分鐘最多一筆。
+            let warn_now = newly_deferred
+                || pending.failures == 1
+                || (pending.deferred
+                    && pending.last_warning_at_ns.is_some_and(|at| {
+                        now.saturating_sub(at) >= WAL_DEFERRED_WARNING_INTERVAL_NS
+                    }));
+            if warn_now {
+                pending.last_warning_at_ns = Some(now);
+            }
+            warn_now
+        } else {
+            inner.rotate_pending[target.index()] = None;
+            true
+        };
+        if warn_now {
+            self.warn_rotate_failed(self.path_for(target), error);
+        }
+    }
+
+    /// 記錄一次暫時性輪替失敗並排程下一次嘗試；回傳是否剛轉入延遲佇列（`_schedule_rotate_retry_locked`）。
+    fn schedule_rotate_retry_locked(&self, inner: &mut WalInner, target: Target) -> bool {
+        inner.rotate_retry += 1;
+        let now = self.clock.mono_ns();
+        let pending = inner.rotate_pending[target.index()].get_or_insert_with(RotatePending::default);
+        pending.failures += 1;
+        if pending.failures <= WAL_ROTATE_RETRY_BACKOFF_NS.len() {
+            pending.deferred = false;
+            pending.next_at_ns = now.saturating_add(WAL_ROTATE_RETRY_BACKOFF_NS[pending.failures - 1]);
+            return false;
+        }
+        let newly_deferred = !pending.deferred;
+        pending.deferred = true;
+        pending.next_at_ns = now.saturating_add(WAL_DEFERRED_DELETE_INTERVAL_NS);
+        if newly_deferred {
+            inner.rotate_deferred += 1;
+        }
+        newly_deferred
+    }
+
+    /// 非阻塞服務到期的延後輪替（`wal.py` `WalWriter.tick`）：主鎖被佔用時立即返回 `false`、不等待；
+    /// 無待完成輪替時不動作。現行檔的延後輪替在本次 tick 完成時，於新現行檔寫
+    /// `WAL_ROTATED_AFTER_DEFERRAL` 連續性 META。回傳本次是否有輪替嘗試失敗。
+    pub fn tick(&self) -> bool {
+        let Ok(mut guard) = self.inner.try_lock() else {
+            return false;
+        };
+        let inner = &mut *guard;
+        if inner.closed || inner.rotate_pending.iter().all(Option::is_none) {
+            return false;
+        }
+        let wal_expected_before = inner.wal_path_expected;
+        let sizes = self.observe_sizes();
+        let failed = self.rotate_if_needed_locked(inner, &sizes, &HashSet::new());
+        if wal_expected_before && !inner.wal_path_expected {
+            self.write_rotation_continuity_meta_locked(inner);
+        }
+        self.refresh_health_locked(inner);
+        failed
+    }
+
+    /// tick 驅動的現行檔輪替完成後寫 `WAL_ROTATED_AFTER_DEFERRAL` META（`_write_rotation_continuity_meta_locked`）。
+    fn write_rotation_continuity_meta_locked(&self, inner: &mut WalInner) {
+        match self.fs.size(&self.wal_path) {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(_) => return,
+        }
+        let archived_through = inner.seq;
+        let mut meta = PyDict::new();
+        meta.insert("event", PyValue::from("WAL_ROTATED_AFTER_DEFERRAL"));
+        meta.insert(
+            "archived_through_seq",
+            PyValue::Int(PyInt::Small(i128::from(archived_through))),
+        );
+        let record = self.new_meta_record_locked(inner, self.clock.mono_ns(), meta);
+        let mut line = record.to_line().into_bytes();
+        line.push(b'\n');
+        if let Err(error) = self.write_target_locked(inner, Target::Wal, &line) {
+            inner.write_failures += 1;
+            inner.last_write_error = Some(write_error_text(&error));
+            inner.unhealthy_reason = Some("write_failed");
+            return;
+        }
+        let _ = self.open_handle_locked(inner, Target::Mirror);
+        inner.file_first_seq = Some(record.seq);
+        inner.file_first_seq_pending = false;
+        inner.wal_path_expected = true;
+        inner.unhealthy_reason = None;
     }
 
     fn warn_rotate_failed(&self, path: &Path, error: &PalError) {
@@ -1410,8 +1552,13 @@ impl WalWriter {
             last_write_error: inner.last_write_error.clone(),
             recreated_count: inner.recreated_count,
             rotate_retry: inner.rotate_retry,
-            rotate_deferred: 0,
-            deferred_delete_pending: 0,
+            rotate_deferred: inner.rotate_deferred,
+            deferred_delete_pending: inner
+                .rotate_pending
+                .iter()
+                .flatten()
+                .filter(|pending| pending.deferred)
+                .count() as u64,
             healthy,
             unhealthy_reason: inner.unhealthy_reason,
         };
