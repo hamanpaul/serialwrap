@@ -234,6 +234,18 @@ driver 所記為兩位非實作者均對候選 tree 寫下 `BRIDGE: APPROVE`。�
 >
 > Linux 五份 `selftest-report.json` 都是 14/14 PASS、`complete: true`、tree `dde967aa…`；第一、二份 sha256 前綴為 `3728c346`、`c6d333f4`。Windows `261027-134138-2314533` 的 raw 報告是 13 PASS、ST-12 `NOT_RUN`（`cap_missing:transport_disconnect`），`qualification_output` 只有 `tree_approved: false`。日誌裡的 `HARNESS_DUT_EXITED`、`HARNESS_WRITE_UNCERTAIN`、`HARNESS_EVIDENCE_OVERFLOW` 對應 ST-06、ST-13、ST-14，這三項在報告中的 verdict 是 PASS。
 
+### 原始輸出可追溯指標（2026-10-27 補記，雲端審查 0e97195..d2118cd 對 1bccc4a 的 Low 1）
+
+上兩節原文由外層 driver 自審查者輸出檔轉錄。原始輸出檔保存於擁有者 host 的 `~/b-log/rust-refactor/exec/s1v9/`（不入版本庫），可依下列 sha256 獨立核對：
+
+| 審查者 | 原始輸出檔 | sha256 |
+|---|---|---|
+| Claude Opus 5.5（pi；driver 檔名沿用 `sonnet` 槽位） | `~/b-log/rust-refactor/exec/s1v9/rev-sonnet-1.last` | `e6a1b798101a511f95efe6f49d935f48caeb1264a654b2ebc5fade9910f1f751` |
+| grok-4.7（driver 檔名沿用 `sol` 槽位） | `~/b-log/rust-refactor/exec/s1v9/rev-sol-1.last` | `7e050ba66897a8e669364819d28a19bf4d941ccfde7cf5bafc744ece295dbf05` |
+| 轉交兩份原文給下一輪的 driver prompt（第 348、428 行起為兩位原文） | `~/b-log/rust-refactor/exec/s1v9/round-2.prompt` | `fac355f005f0cde89093e88e43db9122cee996b41aeb33af2976243934d49265` |
+
+`APPROVED_REVISION.json` 不因本補記而變更。
+
 ### 未採為阻擋、留待下次修改 `tools/uart_stdio_bridge` 時處理
 
 - 極短期限（≤ 約 1 ms）的 `write_some` 恆回 0，docstring 未載明（Claude Opus 5.5 觀察一）。
