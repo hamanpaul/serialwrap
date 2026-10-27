@@ -31,8 +31,7 @@ use crate::generations::{EpochAllocator, Generations};
 use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::out_ring::OutItem;
 use crate::login_fsm::{
-    LoginPlan, choose_login_plan, detect_boot_banner, login_error_detail,
-    matches_login_or_password,
+    LoginPlan, choose_login_plan, login_error_detail,
 };
 use crate::mailbox::{
     ControlEvent, DataEvent, DetachReason, MailboxItem, OpenFailure, OpenedBridge, Reply,
@@ -52,6 +51,8 @@ use crate::wal::WalWriter;
 
 /// P6 Task 6：human console 狀態機（分檔，見 `session_core/console.rs`）。
 mod console;
+/// P6 Task 7：interactive lease 差量（分檔，見 `session_core/lease_p6.rs`）。
+mod lease_p6;
 
 /// daemon stderr／state.json 相關通知（Task 0 骨架型別）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,6 +367,18 @@ pub struct SessionCore {
     input_drop_warned: std::collections::HashSet<(String, &'static str, u64)>,
     /// P6 Task 3／6：human line mode 的 basename 路徑風格（`Pal.caps.path_flavor`；預設 POSIX）。
     path_flavor: sw_pal::PalPathFlavor,
+    /// P6 Task 7：soft preempt／ATTACHED 救援 stash 的 human lease（`_stashed_human_lease`）。
+    stashed_human: Option<InteractiveLease>,
+    /// P6 Task 7：worker `snapshot()` 的 running／serial_alive（executor 注入；`None` 視為健康）。
+    worker_health: Option<Arc<dyn Fn() -> crate::uart_bridge::WorkerSnapshot + Send + Sync>>,
+    /// P6 Task 7（#56）：tick 到期還原所建立的回放 hold（結算前 lease 類操作回 SESSION_INTERACTIVE_BUSY）。
+    tick_close_hold: Option<u64>,
+    /// P6 Task 7：P5 既有函式內產生、於本事件結尾併入的效果（LeaseIndex 一律排在 Reply 之前）。
+    fx_buf: Vec<Effect>,
+    /// P6 Task 7：目前事件的 monotonic 時刻（不帶 `now` 參數的既有 helper 使用）。
+    now_cache: Mono,
+    /// P6 Task 7：目前前景命令的來源（human reboot／逾時升格判定，D-10）。
+    fg_origin: Option<SubmitOrigin>,
 }
 
 struct PendingOpenStop {
@@ -521,6 +534,12 @@ impl SessionCore {
             self_test_suspended: false,
             input_drop_warned: std::collections::HashSet::new(),
             path_flavor: sw_pal::PalPathFlavor::Posix,
+            stashed_human: None,
+            worker_health: None,
+            tick_close_hold: None,
+            fx_buf: Vec::new(),
+            now_cache: 0,
+            fg_origin: None,
         }
     }
 
@@ -537,6 +556,7 @@ impl SessionCore {
             panic!("測試注入的 session actor panic");
         }
 
+        self.now_cache = now;
         let mut effects = Effects(Vec::new());
         match ev {
             MailboxItem::Control(ControlEvent::Request { req, reply }) => {
@@ -700,8 +720,8 @@ impl SessionCore {
                     now,
                 ));
             }
-            MailboxItem::Control(ControlEvent::ConsoleScan { scan, .. }) => {
-                effects.0.extend(self.console_scan(scan));
+            MailboxItem::Control(ControlEvent::ConsoleScan { scan, source }) => {
+                effects.0.extend(self.console_scan(scan, source, now));
             }
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
@@ -710,6 +730,9 @@ impl SessionCore {
             MailboxItem::Control(ControlEvent::ConsoleAttachReq { .. }) => todo!("P6 Task 10"),
         }
         effects.0.extend(self.poll_force_recover(now));
+        // P6 Task 7：retained human 還原（READY／ATTACHED）與緩衝效果併入（LeaseIndex 先於 Reply）。
+        self.restore_retained_human(now);
+        self.drain_fx_buf(&mut effects.0);
         effects
     }
 
@@ -1547,8 +1570,11 @@ impl SessionCore {
             SessionRequest::ConsoleAttach { label, pty } => {
                 self.console_attach(label, pty, reply, now)
             }
-            SessionRequest::ConsoleDetach { .. } | SessionRequest::ConsoleList => {
-                todo!("P6 Task 7")
+            SessionRequest::ConsoleDetach { client_id } => {
+                vec![Effect::Reply(reply, Ok(self.console_detach_request(&client_id, now)))]
+            }
+            SessionRequest::ConsoleList => {
+                vec![Effect::Reply(reply, Ok(self.console_list_request(now)))]
             }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
             SessionRequest::Recover { timeout_s, force } => {
@@ -2577,7 +2603,8 @@ impl SessionCore {
                         && lease.deadline() == deadline
                 }) && now >= deadline =>
             {
-                self.close_lease(true);
+                // P6：到期收回與 tick 同為「tick close」（#56 的 SESSION_INTERACTIVE_BUSY 期間）。
+                self.close_lease_tick();
                 Vec::new()
             }
             TimerEvent::DrainTimeout { epoch, stop_id } => {
@@ -2596,7 +2623,7 @@ impl SessionCore {
             .as_ref()
             .is_some_and(|lease| !lease.is_human() && lease.expired(now))
         {
-            self.close_lease(true);
+            self.close_lease_tick();
         }
         effects.extend(self.reboot_recovery_tick(now));
         let flash_off = self.deps.fence.with(|f| f.flash_mode == FlashMode::Off);
@@ -2970,20 +2997,12 @@ impl SessionCore {
 
     /// `_lease_context`：4 個 LeaseContext 鍵（Slice 2.1 無 human 鍵入追蹤，`human_active` 恆 false）。
     fn lease_ctx(&self) -> Vec<(&'static str, PyValue)> {
-        let owner = self.lease.as_ref().map(|lease| lease.owner.clone());
-        let human_attached = owner.as_deref().is_some_and(|o| o.starts_with("human:"));
-        vec![
-            (
-                "interactive_owner",
-                owner.map(PyValue::from).unwrap_or(PyValue::Null),
-            ),
-            ("human_attached", PyValue::Bool(human_attached)),
-            ("human_active", PyValue::Bool(false)),
-            (
-                "recovery_mode",
-                PyValue::Bool(self.lease.as_ref().is_some_and(|lease| lease.recovery_mode)),
-            ),
-        ]
+        // P6 Task 7：`_lease_context`（human_active 依最近 raw 鍵入，#53）。
+        let ctx = self.lease_context_now(self.now_cache);
+        ["interactive_owner", "human_attached", "human_active", "recovery_mode"]
+            .into_iter()
+            .map(|k| (k, ctx.get(k).cloned().unwrap_or(PyValue::Null)))
+            .collect()
     }
 
     fn extend_pairs(out: &mut PyDict, pairs: Vec<(&'static str, PyValue)>) {
@@ -3007,8 +3026,9 @@ impl SessionCore {
         );
         self.lease = Some(lease);
         self.bump_owner_gen();
-        // P6：`_open_interactive_locked` → `bridge.set_interactive_owner(owner)`。
+        // P6：`_open_interactive_locked` → `bridge.set_interactive_owner(owner)`；全域 LeaseIndex 先於 Reply（07 Task 7）。
         self.human_set_owner(Some(owner));
+        self.lease_index(LeaseIndexOp::Insert { interactive_id: id.clone() });
         id
     }
 
@@ -3019,31 +3039,19 @@ impl SessionCore {
             .with(|f| f.owner_gen = self.generations.owner_gen);
     }
 
-    /// 關閉目前 lease；`expired` 時留 tombstone（`keep_tombstone=True`）。
+    /// 關閉目前 lease；`expired` 時留 tombstone（`keep_tombstone=True`）。P6：stash 還原與 PostClose（`lease_p6.rs`）。
     fn close_lease(&mut self, expired: bool) {
-        if let Some(lease) = self.lease.take() {
-            if expired {
-                self.tombstones.push(lease.interactive_id, "expired");
-            }
-            self.bump_owner_gen();
-            // P6：一般 close → `bridge.set_interactive_owner(None)`（stash 還原屬 07 Task 7）。
-            self.human_set_owner(None);
-        }
+        self.close_lease_p6(expired);
     }
 
+    /// drain Phase 1：關閉 lease、丟棄 stash（不回放；ownership 由 `human_phase1` 重設）。
     fn clear_interactive(&mut self) {
-        self.close_lease(false);
+        self.clear_interactive_p6();
     }
 
-    /// `_refresh_interactive_locked`：agent lease lazy 到期 → expired tombstone。
+    /// `_refresh_interactive_locked`（P6：human peer grace 與 owner 檢查，`lease_p6.rs`）。
     fn refresh_lease(&mut self, now: Mono) {
-        if self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| !lease.is_human() && lease.expired(now))
-        {
-            self.close_lease(true);
-        }
+        self.refresh_lease_p6(now);
     }
 
     fn lease_expiry_timer(&self) -> Option<Effect> {
@@ -3074,89 +3082,11 @@ impl SessionCore {
         if self.generations.conn_epoch.is_none() {
             return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
         }
-        let mut result;
-        if self.state == SessionState::Ready {
-            if self.foreground_busy() {
-                return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
-            }
-            self.refresh_lease(now);
-            let mut soft_preempted = false;
-            if let Some(existing) = self.lease.as_ref() {
-                // #53 soft preempt：human lease 閒置時 agent 可取得控制權（Slice 2.1 無 human console 回放，直接替換）。
-                if existing.is_human() && !owner.starts_with("human:") {
-                    self.lease = None;
-                    soft_preempted = true;
-                } else {
-                    let mut busy = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
-                    busy.insert(
-                        "interactive_session_id",
-                        PyValue::from(existing.interactive_id.clone()),
-                    );
-                    return vec![Effect::Reply(reply, Ok(busy))];
-                }
-            }
-            let id = self.open_lease(&owner, timeout_s, false, now);
-            result = pydict! {
-                "ok" => true,
-                "interactive_id" => id,
-                "session" => self.session_value(now),
-                "recovery_mode" => false,
-            };
-            if soft_preempted {
-                result.insert("soft_preempted", PyValue::Bool(true));
-            }
-        } else if !allow_attached {
-            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
-        } else if self.state == SessionState::Attached {
-            if self.vtty_alive() == Some(false) {
-                return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
-            }
-            let tail = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
-            let matched =
-                matches_any_bootloader_prompt(&tail, &self.profile.template.bootloader_prompts);
-            let mut boot_interrupt = false;
-            let mut login_required = false;
-            if matched.is_none() {
-                if detect_boot_banner(&tail) {
-                    boot_interrupt = true;
-                } else if matches_login_or_password(&tail, &self.profile) {
-                    login_required = true;
-                } else {
-                    let mut out = self.selector_error("SESSION_NOT_READY");
-                    out.insert("error_detail", PyValue::from("NOT_BOOTLOADER"));
-                    return vec![Effect::Reply(reply, Ok(out))];
-                }
-            }
-            self.refresh_lease(now);
-            let clamped = timeout_s.min(MAX_RECOVERY_LEASE_S);
-            if let Some(existing) = self.lease.as_ref() {
-                if existing.is_human() {
-                    self.lease = None;
-                } else {
-                    let mut busy = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
-                    busy.insert(
-                        "interactive_session_id",
-                        PyValue::from(existing.interactive_id.clone()),
-                    );
-                    return vec![Effect::Reply(reply, Ok(busy))];
-                }
-            }
-            let id = self.open_lease(&owner, clamped, true, now);
-            result = pydict! {
-                "ok" => true,
-                "interactive_id" => id,
-                "session" => self.session_value(now),
-                "recovery_mode" => true,
-            };
-            if boot_interrupt {
-                result.insert("boot_interrupt", PyValue::Bool(true));
-            }
-            if login_required {
-                result.insert("login_required", PyValue::Bool(true));
-            }
-        } else {
-            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
-        }
+        // P6 Task 7：READY／ATTACHED 分支（human lease、soft preempt stash、救援、#56）見 `lease_p6.rs`。
+        let result = match self.interactive_open_branches(&owner, timeout_s, allow_attached, now) {
+            Ok(result) => result,
+            Err(refused) => return vec![Effect::Reply(reply, Ok(refused))],
+        };
         let interactive_id = self
             .lease
             .as_ref()
@@ -3296,7 +3226,8 @@ impl SessionCore {
         lease.touch(now);
         let (owner, status, recovery_mode) =
             (lease.owner.clone(), lease.status, lease.recovery_mode);
-        let screen = clean_text(&py_tail(&self.deps.rx.tail(0), screen_chars));
+        // 增補 #19：Python `rx_tail(screen_chars)` 即 `text[-n:]`。
+        let screen = clean_text(&self.deps.rx.tail_py(screen_chars));
         pydict! {
             "ok" => true,
             "interactive_id" => interactive_id,
@@ -3996,6 +3927,10 @@ impl SessionCore {
                     self.transition_to_attached("PROMPT_TIMEOUT", now);
                 }
                 CmdOutcome::Result(prompt_timeout_none())
+            }
+            // P6 Task 7（D-10）：line editor 來源的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner` human 分支）。
+            OpOutcome::RebootExpected if self.fg_origin_is_human() => {
+                CmdOutcome::Result(self.human_reboot_promote(now))
             }
             OpOutcome::RebootExpected => {
                 self.pending_auto_login = true;
@@ -4901,6 +4836,7 @@ fn lease_refused_command_code(reject: FenceReject) -> &'static str {
 }
 
 /// Python `text[-n:]`（n == 0 → 全部；n < 0 → 去掉前 |n| 字元）。
+#[allow(dead_code)] // P6：status 改用 `RxShared::tail_py`（增補 #19）
 fn py_tail(text: &str, n: i128) -> String {
     let count = text.chars().count() as i128;
     let skip = if n > 0 {

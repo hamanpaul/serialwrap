@@ -1851,6 +1851,8 @@ Expected: P6 新行為 FAIL（`not yet implemented: P6 Task 7`、tombstone 斷�
 
 - [ ] **Step 4：執行並確認 PASS**
 
+> **實作紀錄（2026-10-27，P6 cloud）**：(1) 差量置於 `crates/sw-core/src/session_core/lease_p6.rs`，06 既有 `close_lease`／`refresh_lease`／`clear_interactive`／`interactive_open` 改為委派；06 函式內產生的效果（`LeaseIndex`、回放、`ConsoleClose`）經 `fx_buf` 於事件結尾併入，`LeaseIndex` 一律排在本批最前。(2) `LeaseState` 型別保留但未取代 06 的 `lease`／`tombstones` 欄位（避免改動 P5 擁有的大量存取點），stash 以 `stashed_human` 欄位承接。(3) hub 掃描（`ConsoleScan{Hub}`）執行 peer grace 與 self-heal；owner 不符的 close 在掃描路徑只於未 suspend 時判定（Python 只在 RPC 路徑 refresh，否則 agent 命令期間會誤拆 human lease）。(4) **未完成、需上游**：`human_timeout_promoted_only_for_internal_origin` 需 06 T14 `OpRunner` 依 `SubmitOrigin::HumanConsole` 跳過 CTRL-C／CTRL-D 救援鍵（P5 擁有 `op_runner.rs`）；全域 `LeaseIndex`（`session_manager.rs`）需 06 T15 `SessionManager`（現為 `s21_todo!`），core 已發 `Effect::LeaseIndex`；#108 兩列分屬 Task 10（Windows TCP `console_attach` 端點回應）與 P8（file transfer）。
+
 Run: `scripts/rust/cargo_nonzero.sh -p sw-core --features test-fakes --test lease_p6 --test rescue --test session_core_lease --test lease_selftest && scripts/rust/cargo_nonzero.sh -p sw-core --features test-fakes`
 Expected: PASS。
 

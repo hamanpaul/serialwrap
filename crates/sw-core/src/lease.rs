@@ -5,7 +5,8 @@
 
 use std::collections::VecDeque;
 
-use sw_proto::pyjson::PyDict;
+use sw_proto::constants::HUMAN_ACTIVE_WINDOW_S;
+use sw_proto::pyjson::{PyDict, PyValue};
 
 use crate::Mono;
 
@@ -72,7 +73,7 @@ impl InteractiveLease {
     }
     /// P6 Task 7：human lease 的 client_id（owner 去掉 `human:`）。
     pub fn human_client_id(&self) -> Option<&str> {
-        todo!("P6 Task 7")
+        self.owner.strip_prefix("human:")
     }
 }
 
@@ -107,6 +108,20 @@ impl Tombstones {
         while self.entries.len() > INTERACTIVE_TOMBSTONE_MAX {
             self.entries.pop_front();
         }
+    }
+
+    /// P6 Task 7：同 `push`，回傳被 FIFO 擠出的 id（供 `LeaseIndex(Remove)`）。
+    pub fn push_evicting(&mut self, id: String, status: &'static str) -> Vec<String> {
+        if !self.entries.iter().any(|(existing, _)| *existing == id) {
+            self.entries.push_back((id, status));
+        }
+        let mut evicted = Vec::new();
+        while self.entries.len() > INTERACTIVE_TOMBSTONE_MAX {
+            if let Some((old, _)) = self.entries.pop_front() {
+                evicted.push(old);
+            }
+        }
+        evicted
     }
 
     /// 查詢 tombstone 中的終態（`"expired"`）；不存在回 `None`。
@@ -146,6 +161,17 @@ pub struct PostClose {
 }
 
 /// P6 增補 #14：`{"interactive_owner","human_attached","human_active","recovery_mode"}`（02 §6.2）。
-pub fn lease_context(_lease: Option<&InteractiveLease>, _last_human_input_at: Option<Mono>, _now: Mono) -> PyDict {
-    todo!("P6 Task 7")
+///
+/// `human_active`：human lease 且最近一次真實鍵入在 `HUMAN_ACTIVE_WINDOW_S` 內（含邊界，#53）。
+pub fn lease_context(lease: Option<&InteractiveLease>, last_human_input_at: Option<Mono>, now: Mono) -> PyDict {
+    let owner = lease.map(|l| l.owner.clone());
+    let human_attached = owner.as_deref().is_some_and(|o| o.starts_with("human:"));
+    let window_ns = (HUMAN_ACTIVE_WINDOW_S * 1_000_000_000.0) as u64;
+    let human_active = human_attached && last_human_input_at.is_some_and(|last| now.saturating_sub(last) <= window_ns);
+    let mut d = PyDict::new();
+    d.insert("interactive_owner", owner.map(PyValue::from).unwrap_or(PyValue::Null));
+    d.insert("human_attached", PyValue::Bool(human_attached));
+    d.insert("human_active", PyValue::Bool(human_active));
+    d.insert("recovery_mode", PyValue::Bool(lease.is_some_and(|l| l.recovery_mode)));
+    d
 }

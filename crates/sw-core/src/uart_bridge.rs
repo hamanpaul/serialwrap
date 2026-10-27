@@ -182,6 +182,16 @@ impl RxShared {
         window.text[byte_index..].to_string()
     }
 
+    /// P6 增補 #19：Python `text[-n:]`（n>0 尾 n 字元、n==0 全窗、n<0 去掉開頭 |n| 字元）。
+    pub fn tail_py(&self, n: i128) -> String {
+        if n >= 0 {
+            return self.tail(n as usize);
+        }
+        let text = self.tail(0);
+        let skip = n.unsigned_abs().min(usize::MAX as u128) as usize;
+        text.chars().skip(skip).collect()
+    }
+
     pub fn rx_stats(&self, now: Mono) -> (u64, u64) {
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.prune_rate(now);
