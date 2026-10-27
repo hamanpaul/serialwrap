@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -73,7 +74,8 @@ def test_send_encodings(console_daemon) -> None:
     before = len(target.written(0.3))
     r = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "00", "encoding": "hex"})
     assert r["ok"] is False and r["error_code"] == "EXCEPTION" and "version" not in r, r
-    assert len(target.written(0.5)) == before, "編碼拒絕在送出前（零 TX）"
+    time.sleep(0.5)  # written() 讀完即返回，不會等；先等非同步寫出的機會
+    assert len(target.written(0.2)) == before, "編碼拒絕在送出前（零 TX）"
 
 
 def test_expiry_tick_restores_without_access(console_daemon) -> None:
@@ -101,13 +103,21 @@ def test_expiry_tick_restores_without_access(console_daemon) -> None:
 def test_lazy_expiry_parity(console_daemon) -> None:
     import time
 
-    d, _target = console_daemon
+    d, target = console_daemon
     iid = _open(d, timeout="1")["interactive_id"]
     time.sleep(1.05)
+    before = len(target.written(0.2))
     first = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "x"})
     assert first["ok"] is False and first["error_code"] == "INTERACTIVE_EXPIRED", first
+    # parity-amendments #54（ALIGN-TO-PYTHON）：lazy 到期後 tombstone 使後續 send／status／close 持續回 EXPIRED
     second = d.rpc("session.interactive_send", {"interactive_id": iid, "data": "x"})
-    assert second["ok"] is False and second["error_code"] in ("INTERACTIVE_NOT_FOUND", "INTERACTIVE_EXPIRED"), second
+    assert second["ok"] is False and second["error_code"] == "INTERACTIVE_EXPIRED", second
+    st = d.rpc("session.interactive_status", {"interactive_id": iid})
+    assert st["ok"] is False and st["error_code"] == "INTERACTIVE_EXPIRED", st
+    cl = d.rpc("session.interactive_close", {"interactive_id": iid})
+    assert cl["ok"] is False and cl["error_code"] == "INTERACTIVE_EXPIRED", cl
+    time.sleep(0.5)
+    assert b"x" not in target.written(0.2)[before:], "到期拒絕零 TX"
 
 
 def test_status_touch_extends(console_daemon) -> None:
@@ -122,3 +132,92 @@ def test_status_touch_extends(console_daemon) -> None:
     time.sleep(3.5)
     st = d.rpc("session.interactive_status", {"interactive_id": iid})
     assert st["ok"] is False and st["error_code"] == "INTERACTIVE_EXPIRED", st
+
+
+def test_open_rejections_zero_tx(console_daemon) -> None:
+    import threading
+
+    d, target = console_daemon
+    # RECOVERING：agent `reboot` 進入 reboot recovery（`session_manager.py:6157-6165`），hold_reply 卡住其 prompt
+    # 等待；`session recover --force` 在兩版都不對外暴露 RECOVERING（READY→ATTACHING），故改走 reboot。
+    target.hold_reply(True)
+    rec = threading.Thread(
+        target=lambda: d.sw("cmd", "submit", "--selector", "COM0", "--cmd", "reboot", "--cmd-timeout", "5"),
+        daemon=True,
+    )
+    try:
+        rec.start()
+        assert wait_for(lambda: d._session("COM0")["state"] == "RECOVERING", 10.0, 0.02), d._session("COM0")
+        before = len(target.written(0.2))
+        r = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent", "command": "help"})
+        assert r["ok"] is False and r["error_code"] == "SESSION_RECOVERING", r
+        time.sleep(0.5)
+        assert b"help" not in target.written(0.2)[before:], "RECOVERING 拒絕零 TX"
+    finally:
+        target.hold_reply(False)
+        rec.join(timeout=30.0)
+    d.wait_state("COM0", "READY", timeout=30.0)
+    # 已有 lease → SESSION_INTERACTIVE_BUSY
+    _open(d)
+    before = len(target.written(0.2))
+    busy = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent", "command": "help"})
+    assert busy["ok"] is False and busy["error_code"] == "SESSION_INTERACTIVE_BUSY", busy
+    time.sleep(0.5)
+    assert b"help" not in target.written(0.2)[before:], "BUSY 拒絕零 TX"
+
+
+def test_attached_rescue_boot_interrupt(unready_daemon) -> None:
+    d, target = unready_daemon
+    target.emit(b"Hit any key to stop autoboot:  3\r\n")
+    time.sleep(0.3)
+    r = d.sw("session", "interactive-open", "--selector", "COM0", "--owner", "agent", "--allow-attached")
+    assert r["ok"] is True and r["recovery_mode"] is True and r.get("boot_interrupt") is True, r
+    assert "login_required" not in r, r
+
+
+def test_attached_rescue_login_required(unready_daemon) -> None:
+    d, target = unready_daemon
+    target.emit(b"\r\n(none) login: ")
+    time.sleep(0.3)
+    r = d.sw("session", "interactive-open", "--selector", "COM0", "--owner", "agent", "--allow-attached")
+    assert r["ok"] is True and r["recovery_mode"] is True and r.get("login_required") is True, r
+    assert "boot_interrupt" not in r, r
+
+
+def test_attached_not_bootloader(unready_daemon) -> None:
+    d, target = unready_daemon
+    target.emit(b"random\r\n")
+    time.sleep(0.3)
+    before = len(target.written(0.2))
+    r = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent", "allow_attached": True})
+    assert r["ok"] is False and r["error_code"] == "SESSION_NOT_READY", r
+    assert r.get("error_detail") == "NOT_BOOTLOADER", r
+    time.sleep(0.3)
+    assert len(target.written(0.2)) == before, "拒絕路徑零 TX"
+
+
+def test_attached_without_allow_rejected(unready_daemon) -> None:
+    d, target = unready_daemon
+    before = len(target.written(0.2))
+    r = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent"})
+    assert r["ok"] is False and r["error_code"] == "SESSION_NOT_READY" and r["selector"] == "COM0", r
+    time.sleep(0.3)
+    assert len(target.written(0.2)) == before, "拒絕路徑零 TX"
+
+
+@pytest.mark.rust_only
+def test_stash_dropped_does_not_replay(console_daemon) -> None:
+    d, target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    o = _open(d)
+    assert o.get("soft_preempted") is True, o
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        os.write(fd1, b"Q")
+        time.sleep(0.3)
+    finally:
+        os.close(fd1)
+    time.sleep(3.5)  # peer 消失超過 grace（D-16：stash 丟棄）
+    assert d.rpc("session.interactive_close", {"interactive_id": o["interactive_id"]})["ok"] is True
+    time.sleep(1.0)
+    assert b"Q" not in target.written(0.2), "stash 已丟棄，close 後不回放"

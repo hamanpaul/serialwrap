@@ -91,7 +91,8 @@ def test_detach_releases_owner(console_daemon) -> None:
 
 
 def test_detach_unknown_client(console_daemon) -> None:
-    d, _target = console_daemon
+    d, target = console_daemon
+    before = len(target.written(0.2))
     r = d.rpc("session.console_detach", {"selector": "COM0", "client_id": "nope"})
     assert {k: r[k] for k in ("ok", "error_code", "client_id")} == {
         "ok": False,
@@ -99,6 +100,7 @@ def test_detach_unknown_client(console_daemon) -> None:
         "client_id": "nope",
     }
     assert "version" in r
+    assert len(target.written(0.2)) == before, "拒絕路徑零 TX"
 
 
 def test_invalid_args_and_alias_selector(console_daemon) -> None:
@@ -125,6 +127,8 @@ def test_session_vtty_cached(console_daemon) -> None:
     a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
     a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
     assert a1["ok"] is True and a2["ok"] is True, (a1, a2)
+    for path in (first, a1["vtty"], a2["vtty"]):
+        assert re.fullmatch(r"/dev/pts/\d+", path), path
     assert first not in (a1["vtty"], a2["vtty"])
     assert d._session("COM0")["vtty"] == first
 
@@ -161,10 +165,9 @@ def test_deferred_bytes_flushed_after_agent_command(console_daemon) -> None:
         recs = [r for r in d.wal_records() if r["dir"] in ("TX", "RX")]
         seq_cmd = min(r["seq"] for r in recs if r["dir"] == "TX" and r.get("cmd_id") == sub["cmd_id"])
         seq_x = min(r["seq"] for r in recs if r["dir"] == "TX" and r["source"] == f"human:{a1['client_id']}")
-        seq_prompt = min(
-            r["seq"] for r in recs if r["dir"] == "RX" and r["seq"] > seq_cmd and b"# " in b64_payload(r)
-        )
-        assert seq_cmd < seq_prompt < seq_x, (seq_cmd, seq_prompt, seq_x)
+        # console_daemon 的 FakeTarget 腳本：`sleep 2` 於 2 s 後回 `sleep 2: ok`（07 Task 11 fixture）
+        seq_ok = min(r["seq"] for r in recs if r["dir"] == "RX" and b"sleep 2: ok" in b64_payload(r))
+        assert seq_cmd < seq_ok < seq_x, (seq_cmd, seq_ok, seq_x)
     finally:
         os.close(fd1)
 
@@ -257,14 +260,16 @@ def test_last_line_before_disconnect_submitted(console_daemon) -> None:
 def test_peer_loss_grace_then_teardown(console_daemon) -> None:
     import time
 
-    d, _target = console_daemon
+    d, target = console_daemon
     a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
     fd1 = open_vtty(a1["vtty"])
     os.write(fd1, b"a")  # human active
     time.sleep(0.3)
     os.close(fd1)
+    before = len(target.written(0.2))
     busy = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent"})
     assert busy["ok"] is False and busy["error_code"] == "SESSION_INTERACTIVE_BUSY", busy
+    assert len(target.written(0.2)) == before, "拒絕路徑零 TX"
     time.sleep(3.5)
     ok = d.rpc("session.interactive_open", {"selector": "COM0", "owner": "agent"})
     assert ok["ok"] is True and "soft_preempted" not in ok, ok

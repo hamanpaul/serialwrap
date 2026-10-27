@@ -10,6 +10,11 @@ P5-T15a（測試資產變更，規格 §10.4）向後相容擴充；既有參數
   `pause_responding(seconds)`（期間收到的輸入照常記錄，但所有回應延到暫停結束後才送出）。
 - 行內命令：`sleep N`（N 秒後送 prompt）、`yes | head -c N`（恰送 N bytes 的 `y\\n` 後送 prompt）、
   `printf M<a>..M<b>`（分 10 個 chunk 送出 `M<a>`～`M<b>` 各一行後送 prompt，供 F4 背景分頁）。
+P6 Task 11（07 計畫；測試資產變更，規格 §10.4 需獨立審閱）再追加 keyword-only 選用能力，預設行為不變：
+- `scripts`：`{命令行 bytes: (延遲秒, 回覆 bytes[, 是否補 prompt])}`；收到該行時先回顯，延遲後送回覆，
+  第三欄省略或為 True 時接著送 prompt（False 時不回 prompt，模擬 `bootcmd` 之類卡在 boot 的命令）。
+- `ready=False`：不回應含 `__READY__` 的行（不回顯、不送 prompt），ready nonce 永遠等不到，session 停在 ATTACHED。
+- `hold_reply(on)`：True 時暫停所有回應（輸入照常記錄），False 時解除並送出累積的回應。
 回應一律依排程佇列送出（FIFO、命令間序列化，如同真實 shell 依序執行）；`^C` 會取消尚未送出的
 命令輸出並立即回 `^C` 與 prompt。
 """
@@ -45,6 +50,8 @@ class FakeTarget:
         login: bool = True,
         boot_banner: bytes = b"",
         noise_interval_s: float | None = None,
+        scripts: dict[bytes, tuple] | None = None,
+        ready: bool = True,
     ) -> None:
         self.workdir = Path(workdir)
         self.prompt = prompt
@@ -55,6 +62,11 @@ class FakeTarget:
         if noise_interval_s is not None and noise_interval_s <= 0:
             raise ValueError("noise_interval_s 必須為正數或 None")
         self.noise_interval_s = noise_interval_s
+        self.scripts: dict[bytes, tuple] = dict(scripts or {})
+        for key, spec in self.scripts.items():
+            if not isinstance(key, bytes) or not isinstance(spec, tuple) or len(spec) not in (2, 3):
+                raise ValueError("scripts 格式為 {bytes: (延遲秒, 回覆 bytes[, 是否補 prompt])}")
+        self.ready = bool(ready)
         self.master_fd: int | None = None
         self.slave_fd: int | None = None
         self.slave_path: str | None = None
@@ -158,6 +170,12 @@ class FakeTarget:
         """暫停回應 `seconds` 秒：期間輸入照常讀取與記錄，所有回應（含雜訊）延到暫停結束後送出。"""
         with self._sched_lock:
             self._pause_until = max(self._pause_until, time.monotonic() + float(seconds))
+        self._wake()
+
+    def hold_reply(self, on: bool) -> None:
+        """True：暫停所有回應直到以 False 解除（輸入照常讀取與記錄）；False：解除並送出累積的回應。"""
+        with self._sched_lock:
+            self._pause_until = float("inf") if on else 0.0
         self._wake()
 
     def rx_log(self, timeout_s: float = 1.0) -> bytes:
@@ -366,6 +384,17 @@ class FakeTarget:
     def _run_command(self, cmd: str, prompt_b: bytes) -> None:
         """把一行命令的回顯、輸出與 prompt 排入回應佇列。"""
         echo = (cmd + "\r\n").encode("utf-8")
+
+        if not self.ready and "__READY__" in cmd:
+            return
+        spec = self.scripts.get(cmd.encode("utf-8"))
+        if spec is not None:
+            delay_s, reply = float(spec[0]), bytes(spec[1])
+            self._schedule(echo)
+            self._schedule(reply, delay_s=delay_s)
+            if len(spec) < 3 or spec[2]:
+                self._schedule(prompt_b)
+            return
 
         m = _SLEEP_RE.match(cmd)
         if m:
