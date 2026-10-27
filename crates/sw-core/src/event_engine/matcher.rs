@@ -94,7 +94,7 @@ fn int_cmp(a: &PyInt, b: &PyInt) -> CmpOrdering {
 }
 
 /// Python 任意精度 int 的加法（十進位逐位；結果以 `PyInt::Big` 十進位字串表示，只供 [`int_cmp`] 比較）。
-fn int_add(a: &PyInt, b: &PyInt) -> PyInt {
+pub(crate) fn int_add(a: &PyInt, b: &PyInt) -> PyInt {
     fn parts(v: &PyInt) -> (bool, Vec<u8>) {
         let s = match v {
             PyInt::Small(n) => n.to_string(),

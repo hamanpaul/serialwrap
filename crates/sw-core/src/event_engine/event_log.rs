@@ -10,7 +10,7 @@ use sw_proto::pycompat::PyErr;
 use sw_proto::pyjson::{self, PyDict, PyInt, PyValue};
 
 use super::counter::read_text_utf8;
-use super::pyops::{py_eq, py_lt};
+use super::pyops::{py_eq, py_lt, py_time_ms};
 use super::schema::type_name;
 
 const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
@@ -52,17 +52,10 @@ impl EventLogger {
         &self.path
     }
 
-    /// `int(time.time() * 1000)`：以 Python 相同的浮點運算（ns → 秒 double → ×1000 → 向零截斷）。
-    fn now_ms(&self) -> i64 {
-        let ns = self.clock.wall_unix_us().saturating_mul(1000);
-        let secs = ns as f64 / 1e9;
-        (secs * 1000.0) as i64
-    }
-
     /// 缺 `ts` 時補在最後；整行先判定輪替再 append＋fsync。
     pub fn write(&self, mut ev: PyDict) -> PalResult<()> {
         if ev.get("ts").is_none() {
-            ev.insert("ts", PyValue::from(self.now_ms()));
+            ev.insert("ts", PyValue::from(py_time_ms(&*self.clock)));
         }
         let mut line = pyjson::dumps_dict(&ev, &LINE_OPTS);
         line.push('\n');

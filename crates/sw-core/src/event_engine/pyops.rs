@@ -129,3 +129,13 @@ pub(crate) fn py_lt(a: &PyValue, b: &PyValue) -> Result<bool, PyErr> {
         _ => Err(lt_unsupported(a, b)),
     }
 }
+
+/// Python `time.time()`：wall clock 奈秒轉 double 秒（`_PyTime_AsSecondsDouble`）。
+pub(crate) fn py_time_s(clock: &dyn sw_pal::traits::Clock) -> f64 {
+    clock.wall_unix_us().saturating_mul(1000) as f64 / 1e9
+}
+
+/// Python `int(time.time() * 1000)`（向零截斷）。
+pub(crate) fn py_time_ms(clock: &dyn sw_pal::traits::Clock) -> i64 {
+    (py_time_s(clock) * 1000.0) as i64
+}

@@ -203,20 +203,149 @@ impl ProcessCtl for FakeProcessCtl {
 }
 
 /// 假 `HandlerSpawner`（P7 Task 0 凍結；Task 14／15 使用）：依序回放腳本結果並記錄每次 `run` 的規格。
-#[derive(Debug, Default)]
+///
+/// 模式：預設（`script` 回放；空則 `Completed{0}`）、[`FakeHandlerSpawner::blocking`]（`run` 阻塞到
+/// [`release_all`](FakeHandlerSpawner::release_all)，abort 觸發即回 `TimedOut`）、
+/// [`FakeHandlerSpawner::ignore_abort`]（abort 後仍阻塞，只等 release）。`shell_argv` 回 `["fake-sh","-c",shell]`。
+#[derive(Default)]
 pub struct FakeHandlerSpawner {
     pub script: Mutex<VecDeque<crate::traits::HandlerOutcome>>,
     pub calls: Mutex<Vec<crate::traits::HandlerSpec>>,
+    mode: FakeHandlerMode,
+    released: Mutex<Option<crate::traits::HandlerOutcome>>,
+    cv: std::sync::Condvar,
+    /// 每次 `run` 返回時 abort 是否已觸發（依呼叫序）。
+    aborts: Mutex<Vec<bool>>,
+    /// 每次 `run` 前呼叫（測試可推進虛擬時鐘）。
+    hook: Mutex<Option<Arc<dyn Fn(&crate::traits::HandlerSpec) + Send + Sync>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FakeHandlerMode {
+    #[default]
+    Script,
+    Blocking,
+    IgnoreAbort,
+}
+
+impl std::fmt::Debug for FakeHandlerSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FakeHandlerSpawner")
+            .field("mode", &self.mode)
+            .field("spawn_count", &self.spawn_count())
+            .finish()
+    }
+}
+
+fn clone_outcome(o: &crate::traits::HandlerOutcome) -> crate::traits::HandlerOutcome {
+    use crate::traits::HandlerOutcome as O;
+    match o {
+        O::Completed {
+            exit_code,
+            stdout_tail,
+            stderr_tail,
+        } => O::Completed {
+            exit_code: *exit_code,
+            stdout_tail: stdout_tail.clone(),
+            stderr_tail: stderr_tail.clone(),
+        },
+        O::TimedOut => O::TimedOut,
+        O::SpawnFailed(e) => O::SpawnFailed(e.clone()),
+    }
+}
+
+impl FakeHandlerSpawner {
+    pub fn scripted(outcomes: Vec<crate::traits::HandlerOutcome>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(outcomes.into()),
+            ..Default::default()
+        })
+    }
+    pub fn blocking() -> Arc<Self> {
+        Arc::new(Self {
+            mode: FakeHandlerMode::Blocking,
+            ..Default::default()
+        })
+    }
+    pub fn ignore_abort() -> Arc<Self> {
+        Arc::new(Self {
+            mode: FakeHandlerMode::IgnoreAbort,
+            ..Default::default()
+        })
+    }
+    /// 放行所有阻塞中（與之後）的 `run`，皆回 `outcome`。
+    pub fn release_all(&self, outcome: crate::traits::HandlerOutcome) {
+        *self.released.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        self.cv.notify_all();
+    }
+    pub fn spawn_count(&self) -> usize {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+    pub fn aborts_seen(&self) -> Vec<bool> {
+        self.aborts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    pub fn set_hook(&self, hook: Arc<dyn Fn(&crate::traits::HandlerSpec) + Send + Sync>) {
+        *self.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    fn wait_release(&self, abort: &crate::traits::HandlerAbort) -> crate::traits::HandlerOutcome {
+        let mut g = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(o) = g.as_ref() {
+                return clone_outcome(o);
+            }
+            if self.mode == FakeHandlerMode::Blocking && abort.is_triggered() {
+                return crate::traits::HandlerOutcome::TimedOut;
+            }
+            g = self
+                .cv
+                .wait_timeout(g, std::time::Duration::from_millis(5))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
 }
 
 impl crate::traits::HandlerSpawner for FakeHandlerSpawner {
-    fn shell_argv(&self, _shell: &str) -> Vec<String> {
-        todo!("P7 Task 14")
+    fn shell_argv(&self, shell: &str) -> Vec<String> {
+        vec!["fake-sh".into(), "-c".into(), shell.into()]
     }
     fn inherited_env_keys(&self) -> &'static [&'static str] {
-        todo!("P7 Task 14")
+        &["PATH", "HOME", "USER", "LANG", "LC_ALL"]
     }
-    fn run(&self, _spec: &crate::traits::HandlerSpec, _abort: &crate::traits::HandlerAbort) -> crate::traits::HandlerOutcome {
-        todo!("P7 Task 14")
+    fn run(
+        &self,
+        spec: &crate::traits::HandlerSpec,
+        abort: &crate::traits::HandlerAbort,
+    ) -> crate::traits::HandlerOutcome {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(spec.clone());
+        let hook = self.hook.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(h) = hook {
+            h(spec);
+        }
+        let out = match self.mode {
+            FakeHandlerMode::Script => self
+                .script
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+                .unwrap_or(crate::traits::HandlerOutcome::Completed {
+                    exit_code: 0,
+                    stdout_tail: Vec::new(),
+                    stderr_tail: Vec::new(),
+                }),
+            FakeHandlerMode::Blocking | FakeHandlerMode::IgnoreAbort => self.wait_release(abort),
+        };
+        self.aborts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(abort.is_triggered());
+        out
     }
 }

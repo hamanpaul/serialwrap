@@ -4,6 +4,23 @@
     "p7_gate:cargo-test-workspace": {
       "linux": {
         "nodeids": [
+          "cargo:sw-core::event_dispatcher::close_intake_rejects_new_dispatch",
+          "cargo:sw-core::event_dispatcher::counter_load_error_skips_fire_and_releases_rule",
+          "cargo:sw-core::event_dispatcher::fire_completed_shape",
+          "cargo:sw-core::event_dispatcher::fire_count_continues_from_counter",
+          "cargo:sw-core::event_dispatcher::fire_timeout_shape",
+          "cargo:sw-core::event_dispatcher::inherited_env_only_whitelisted_present",
+          "cargo:sw-core::event_dispatcher::last_fire_ts_is_end_time",
+          "cargo:sw-core::event_dispatcher::matched_text_env_truncation_chars",
+          "cargo:sw-core::event_dispatcher::payload_and_env_bytes_match_python",
+          "cargo:sw-core::event_dispatcher::per_rule_busy_and_per_daemon_saturated",
+          "cargo:sw-core::event_dispatcher::shell_handler_uses_platform_argv",
+          "cargo:sw-core::event_dispatcher::spawn_failure_reports_fire_failed",
+          "cargo:sw-core::event_dispatcher::spawn_value_error_emits_nothing_and_releases_rule",
+          "cargo:sw-core::event_dispatcher::stdout_tail_decoded_replace",
+          "cargo:sw-core::event_dispatcher::stop_deadline_aborts_running_handlers",
+          "cargo:sw-core::event_dispatcher::stop_reports_unreaped_when_run_ignores_abort",
+          "cargo:sw-core::event_dispatcher::timeout_kills_process_group",
           "cargo:sw-core::event_line_buffer::exactly_16384_byte_line_not_truncated_16385_is",
           "cargo:sw-core::event_line_buffer::line_buffer_matches_python_golden",
           "cargo:sw-core::event_line_buffer::oversized_without_newline_cuts_one_chunk_per_feed",
