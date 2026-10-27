@@ -1599,3 +1599,117 @@ fn watcher_tick_services_deferred_wal_rotation() {
     let text = String::from_utf8(m.wfs.contents(wal_path).expect("新現行檔")).unwrap();
     assert!(text.contains("WAL_ROTATED_AFTER_DEFERRAL"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// 審查 F43／F30（afe4853／8b8a40f）：POSIX bridge 開成時建 internal 哨兵 primary PTY——Python
+// `UARTBridge.start` 的 `_create_console_client("primary")`：`console_count == 1`、`vtty == "/dev/pts/N"`，
+// release 回應 `closed_consoles == 1`；無 PTY 平台（create_pty Unsupported）為 0／null。
+// ---------------------------------------------------------------------------
+
+fn native_console_rig() -> ManagerRig {
+    ManagerRig::with_console(
+        SHELL_PROFILE,
+        LoadedState::default(),
+        Some(("/s/by-id/usb-A", "/dev/ttyOLD")),
+        sw_pal::native().console.clone(),
+    )
+    .ready()
+}
+
+fn has_pty() -> bool {
+    sw_pal::native().console.create_pty().is_ok()
+}
+
+#[test]
+fn sentinel_pty_reported_in_public_and_release() {
+    let m = native_console_rig();
+    let s = m.session("COM0");
+    if has_pty() {
+        assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(1), "{s:?}");
+        let vtty = s.get("vtty").and_then(PyValue::as_str).unwrap_or_default().to_string();
+        assert!(vtty.starts_with("/dev/pts/") && std::path::Path::new(&vtty).exists(), "vtty={vtty}");
+    } else {
+        assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(0));
+        assert_eq!(s.get("vtty"), Some(&PyValue::Null));
+    }
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    assert!(is_ok(&r), "{r:?}");
+    assert_eq!(
+        r.get("closed_consoles").and_then(PyValue::as_i64),
+        Some(i64::from(has_pty()))
+    );
+    let s = session_field(&r);
+    assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(0));
+    assert_eq!(s.get("vtty"), Some(&PyValue::Null));
+}
+
+#[test]
+fn selftest_fallback_passthrough_suggests_pin_profile() {
+    // 審查 F31（8b8a40f）：fallback passthrough（ATTACHED）且 RX tail 命中非 passthrough template 的 prompt →
+    // Python `PASSTHROUGH`＋`recommended_action:"pin_profile"`＋`suggested_profile`＋`hint`，零 TX。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("fallback session", || m.wait_profile_source("COM0") == "fallback");
+    m.wait_state("COM0", "ATTACHED");
+    let real = m.real_of("/s/by-id/usb-F");
+    let dev = m.device(&real);
+    dev.push_rx(b"\r\nroot@prpl:/# ");
+    wait_until("RX 進入視窗", || {
+        m.session("COM0")
+            .get("rx_bytes_last_10s")
+            .and_then(PyValue::as_i64)
+            .is_some_and(|n| n > 0)
+    });
+    let submits = dev.os_submits();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::SelfTest {
+            timeout_s: 2.0,
+            strict_human_lock: false,
+        },
+        RPC,
+    ));
+    assert_eq!(s_of(&r, "classification").as_deref(), Some("PASSTHROUGH"), "{r:?}");
+    assert_eq!(s_of(&r, "recommended_action").as_deref(), Some("pin_profile"));
+    assert_eq!(s_of(&r, "suggested_profile").as_deref(), Some("prpl-template"));
+    let hint = s_of(&r, "hint").unwrap_or_default();
+    assert!(
+        hint.contains("serialwrap session pin --selector COM0 --profile prpl-template"),
+        "{hint}"
+    );
+    assert_eq!(dev.os_submits(), submits, "PASSTHROUGH 分類零 TX");
+}
+
+#[test]
+fn log_filename_uses_local_time_by_default() {
+    // 審查 F34（8b8a40f）：Python `time.strftime("%y%m%d-%H%M%S")` 為本地時間。manager 預設以平台 Clock
+    // （`local_utc_offset_s`）組檔名，不得以 UTC 代替。wall=1970-01-01T00:00:00Z、本地 UTC+8 → `COM0_700101-080000.log`。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let yaml = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    log_dir: {}\ntargets:\n  - {{com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}}\n",
+        dir.path().display()
+    );
+    let m = ManagerRig::single_target(&yaml).ready();
+    m.clock.set_local_offset_s(8 * 3600);
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(&sid, SessionRequest::LogStart, RPC));
+    assert!(is_ok(&r), "{r:?}");
+    let path = s_of(&r, "log_path").unwrap_or_default();
+    let expected = sw_proto::pycompat::strftime_local(
+        sw_pal::traits::Clock::wall_unix_us(&*m.clock),
+        8 * 3600,
+        "%y%m%d-%H%M%S",
+    );
+    assert!(path.ends_with(&format!("COM0_{expected}.log")), "{path} vs {expected}");
+    let _ = rpc(m.mgr.route(&sid, SessionRequest::LogStop, RPC));
+}

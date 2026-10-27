@@ -1048,6 +1048,7 @@ fn selftest_released_external_holder() {
                 report: Mutex::new(HashMap::new()),
             })),
             vtty_alive: None,
+            ..Default::default()
         });
     })
     .ready();
@@ -1112,6 +1113,7 @@ fn selftest_vtty_stale() {
         core.set_self_test_probes(SelfTestProbes {
             holders: None,
             vtty_alive: Some(Arc::new(move || Some(probe.load(Ordering::SeqCst)))),
+            ..Default::default()
         });
     })
     .ready();
@@ -1329,4 +1331,59 @@ fn selftest_probe_drain_race_golden() {
     }
     eprintln!("selftest_probe_drain_race_golden: committed={committed} refused={refused}");
     assert_eq!(committed + refused, iterations);
+    // 審查 F39：兩種結果都必須真的出現，競態退化成單一路徑時不得仍綠（迭代數過少時證據不足即 FAIL）。
+    assert!(
+        committed > 0 && refused > 0,
+        "證據不足：競態只出現單一路徑（committed={committed} refused={refused}，iterations={iterations}）"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// 審查 F32（8b8a40f）：bridge epoch 仍在、但 IoWorker 快照 running／serial_alive 為假 → Python
+// `BRIDGE_DOWN`＋`recommended_action:"recover"`，零 probe。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn selftest_bridge_down_when_serial_dead() {
+    use sw_core::uart_bridge::WorkerSnapshot;
+    let dead = Arc::new(AtomicBool::new(false));
+    let flag = dead.clone();
+    let h = ActorRig::new_with(SHELL_PROFILE, move |core| {
+        core.set_self_test_probes(SelfTestProbes {
+            bridge_snapshot: Some(Arc::new(move |_epoch| {
+                Some(WorkerSnapshot {
+                    serial_alive: !flag.load(Ordering::SeqCst),
+                    running: true,
+                })
+            })),
+            ..Default::default()
+        });
+    })
+    .ready();
+    dead.store(true, Ordering::SeqCst);
+    let _ = h.dev.take_tx();
+    let submits = h.dev.os_submits();
+    let r = h.request(self_test());
+    assert_eq!(r["classification"], PyValue::from("BRIDGE_DOWN"), "{r:?}");
+    assert_eq!(r["recommended_action"], PyValue::from("recover"));
+    assert!(r.get("current_real_path").is_some());
+    assert_eq!(h.dev.os_submits(), submits, "BRIDGE_DOWN 不得送 probe");
+}
+
+#[test]
+fn lease_expiry_timer_is_strictly_after_deadline() {
+    // 審查 F36（8b8a40f）：Python `expired()` 與 tick 皆為 `now - last > timeout`（嚴格大於）——
+    // 恰在期限的那一刻 lease 仍 active，之後才收回。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let id = iid(&h.rpc(open_req("agent:a", 10.0, "", false)).unwrap());
+    h.advance(Duration::from_secs(10));
+    assert_eq!(
+        pget(&h.public(), "interactive_session_id"),
+        PyValue::from(id.clone()),
+        "恰在期限：仍 active"
+    );
+    h.advance(Duration::from_millis(1));
+    assert!(pget(&h.public(), "interactive_session_id").is_null(), "超過期限即收回");
 }

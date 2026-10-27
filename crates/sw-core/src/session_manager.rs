@@ -52,6 +52,7 @@ use crate::session_core::SessionState;
 use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, SessionRequest};
 use crate::state_store::{LoadedState, ReleasedRow, StateDelta, StateModel, StateStore};
 use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, spawn_tx_writer};
+use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 
@@ -227,6 +228,8 @@ impl Inner {
 struct Shared {
     serial: Arc<dyn SerialBackend>,
     uart_excl: Arc<dyn UartExclusive>,
+    /// 哨兵 PTY 工廠（bridge 開成時建 internal primary；審查 F43）。
+    console: Arc<dyn ConsoleTransportFactory>,
     wal: Arc<WalWriter>,
     registry: Arc<CommandRegistry>,
     clock: Arc<dyn Clock>,
@@ -637,13 +640,31 @@ impl Shared {
             preopened: Mutex::new(preopened),
         });
         let mailbox = Mailbox::new(MAILBOX_CONTROL_CAP, MAILBOX_DATA_CHUNKS_CAP);
+        // agent log 檔名以平台 Clock 的本地時間組成（Python `time.strftime` 本地時間；審查 F34）。
+        core.set_capture_env(crate::capture::CaptureEnv {
+            clock: Some(self.clock.clone()),
+            ..Default::default()
+        });
+        let workers: Arc<Mutex<HashMap<u64, IoWorker>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            // self-test 的外部觀測（Python `bridge.snapshot()` 與 RELEASED 的 `/proc` holder 掃描）。
+            let snapshot_workers = workers.clone();
+            core.set_self_test_probes(SelfTestProbes {
+                holders: Some(self.uart_excl.clone()),
+                vtty_alive: None,
+                bridge_snapshot: Some(Arc::new(move |epoch: u64| {
+                    lock(&snapshot_workers).get(&epoch).map(IoWorker::snapshot)
+                })),
+                templates: Arc::new(self.templates.clone()),
+            });
+        }
         let exec = ManagerExec {
             shared: self.clone(),
             io: io.clone(),
             rx,
             fence: fence.clone(),
             data: mailbox.data_sender(),
-            workers: HashMap::new(),
+            workers,
             runners: HashMap::new(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
@@ -1609,7 +1630,8 @@ struct ManagerExec {
     rx: Arc<RxShared>,
     fence: Arc<Fence>,
     data: Sender<DataEvent>,
-    workers: HashMap<u64, IoWorker>,
+    /// 各 epoch 的 IoWorker；與 self-test 的 bridge 快照探針共用（審查 F32：`snapshot()` 的 running／serial_alive）。
+    workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
     runners: HashMap<u64, OpRunner>,
 }
 
@@ -1658,24 +1680,36 @@ impl ManagerExec {
             return Err(stopped());
         }
         let epoch = self.shared.epochs.next();
+        // Python 每次 attach 新建 `UARTBridge`：RX 視窗、速率、總量、最後 RX 時刻一律歸零（審查 F51）。
+        let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.shared.clock.mono_ns());
+        // POSIX：建 internal 哨兵 primary PTY（keepalive＋RX fan-out；Python `_create_console_client("primary")`）；
+        // 無 PTY 平台（create_pty Unsupported）不建，console_count／vtty 為 0／null（審查 F43／F30）。
+        let (sentinel, sentinel_keepalive, vtty) = match self.shared.console.create_pty() {
+            Ok(pair) => (Some(pair.master), Some(pair.slave_keepalive), Some(pair.slave_path)),
+            Err(_) => (None, None, None),
+        };
         let worker = IoWorker::start(
             handle,
             IoWorkerArgs {
                 com: self.com(),
                 epoch,
                 wal: self.shared.wal.clone(),
-                rx: self.rx.clone(),
+                rx: rx.clone(),
                 fence: self.fence.clone(),
-                sentinel: None,
+                sentinel,
+                sentinel_keepalive,
                 data: self.data.clone(),
                 control: control.clone(),
                 clock: self.shared.clock.clone(),
             },
         );
+        self.rx = rx.clone();
         Ok(OpenedBridge {
             epoch,
             worker,
             real_path: dev.0,
+            rx,
+            vtty,
         })
     }
 
@@ -1685,13 +1719,13 @@ impl ManagerExec {
         let op_id = grant.op_id;
         let ran = catch_unwind(AssertUnwindSafe(|| {
             if !self.runners.contains_key(&epoch) {
-                let worker = self.workers.get(&epoch)?;
+                let tx = lock(&self.workers).get(&epoch)?.tx().clone();
                 let ctx = OpCtx {
                     com: self.com(),
                     sid: lock(&self.io.sid).clone(),
                     profile: lock(&self.io.profile).clone(),
                     rx: self.rx.clone(),
-                    tx: worker.tx().clone(),
+                    tx,
                     wal: self.shared.wal.clone(),
                     clock: self.shared.clock.clone(),
                     control: control.clone(),
@@ -1730,10 +1764,9 @@ impl ManagerExec {
         ) {
             return;
         }
-        let Some(worker) = self.workers.get(&epoch) else {
+        let Some(handle) = lock(&self.workers).get(&epoch).map(|worker| worker.tx().clone()) else {
             return;
         };
-        let handle = worker.tx().clone();
         let rx = self.rx.clone();
         let clock = self.shared.clock.clone();
         let profile = lock(&self.io.profile).clone();
@@ -1783,11 +1816,12 @@ impl EffectExecutor for ManagerExec {
                 });
             }
             Effect::AdoptBridge { epoch, worker, .. } => {
-                self.workers.insert(epoch, worker);
+                lock(&self.workers).insert(epoch, worker);
             }
             Effect::BeginDrain { stop_id, epoch } => {
                 self.runners.remove(&epoch);
-                if let Some(worker) = self.workers.remove(&epoch) {
+                let worker = lock(&self.workers).remove(&epoch);
+                if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
                 }
             }
@@ -1822,7 +1856,7 @@ impl EffectExecutor for ManagerExec {
             }
             Effect::Warn(msg) => self.shared.warn(msg),
             Effect::SettleTx { epoch, op_id } => {
-                if let Some(worker) = self.workers.get(&epoch) {
+                if let Some(worker) = lock(&self.workers).get(&epoch) {
                     let _ = worker.tx().settle(op_id);
                 }
             }
@@ -1859,6 +1893,7 @@ impl SessionManager {
         let shared = Arc::new(Shared {
             serial,
             uart_excl,
+            console: console.clone(),
             wal,
             registry,
             clock,

@@ -5,6 +5,7 @@
 //! 控制事件依賴 RX watermark 時先暫存；獨立控制事件仍可越過暫存項目。
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -17,7 +18,7 @@ use crate::login_fsm::LoginOutcome;
 use crate::op_runner::OpOutcome;
 use crate::session_core::SessionRequest;
 use crate::tx_writer::OpId;
-use crate::uart_bridge::IoWorker;
+use crate::uart_bridge::{IoWorker, RxShared};
 use crate::Mono;
 
 /// RPC 回覆通道（容量 1；接收端已離開時丟棄）。
@@ -115,6 +116,10 @@ pub struct OpenedBridge {
     pub epoch: u64,
     pub worker: IoWorker,
     pub real_path: String,
+    /// 本 bridge 專屬的 RX 視窗（Python 每次 attach 新建 `UARTBridge`，視窗／速率／總量歸零；審查 F51）。
+    pub rx: Arc<RxShared>,
+    /// POSIX 哨兵 primary PTY 的 slave 路徑（Python `snapshot()["vtty"]`）；無哨兵（Windows）為 `None`。
+    pub vtty: Option<String>,
 }
 
 /// bridge 開啟失敗的分類。

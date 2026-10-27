@@ -895,6 +895,13 @@ fn wall_clock_jump_param() {
                 PyValue::Null,
                 "lease 到期前 1 ms"
             );
+            // Python `expired()` 為嚴格大於（審查 F36）：恰在 20 s 仍 active，超過期限才收回。
+            h.advance(Duration::from_millis(1));
+            assert_ne!(
+                pget(&h.public(), "interactive_session_id"),
+                PyValue::Null,
+                "恰在期限 ({jump_s})"
+            );
             h.advance(Duration::from_millis(1));
             assert_eq!(
                 pget(&h.public(), "interactive_session_id"),
@@ -1649,4 +1656,29 @@ fn recover_during_pending_attach_returns_reattach() {
         "attach 進行中不得再發 OpenBridge"
     );
     assert_eq!(h.core.state(), SessionState::Attaching);
+}
+
+#[test]
+fn rx_window_resets_per_bridge() {
+    // 審查 F51（f20bdd0）：Python 每次 attach 新建 `UARTBridge`（`_rx_window` 空、`_rx_total_bytes=0`）。
+    // t=0 上一條連線收 20000 bytes，clear 後 1 s 內重接、新連線零 RX → 公開速率兩欄皆 0（不沿用上一條連線）。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let now = h.clock.mono_ns();
+    h.rx.append(&vec![b'x'; 20_000], now, h.epoch(), 1);
+    assert!(pget(&h.public(), "rx_bytes_last_10s").as_i64().is_some_and(|n| n >= 20_000));
+    let (_resp, effs) = h.rpc_deferred(SessionRequest::Clear);
+    let (ep, stop) = begin_drain(&effs);
+    let effs = h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert!(effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })), "clear 後應重新開檔");
+    h.advance(Duration::from_secs(1));
+    let mut opened = h.opened_bridge(REAL_PATH);
+    opened.rx = sw_core::uart_bridge::RxShared::new(131_072, h.clock.mono_ns());
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    let public = h.public();
+    assert_eq!(pget(&public, "rx_bytes_last_10s"), PyValue::from(0), "{public:?}");
+    assert_eq!(pget(&public, "rx_rate_bps"), PyValue::from(0));
 }

@@ -283,6 +283,8 @@ pub struct SessionCore {
     known_real_path: Option<String>,
     device_present: bool,
     console_count: usize,
+    /// 現行 bridge 的哨兵 PTY slave 路徑（`public()["vtty"]`、self-test `attached_vtty`）。
+    vtty: Option<String>,
     queue: SessionQueue,
     foreground: Option<OpGrant>,
     /// 與前景並行的 op（READY recover、self-test probe；審查 F25）：不是 Python 的前景 operation，
@@ -456,6 +458,7 @@ impl SessionCore {
             known_real_path: None,
             device_present: false,
             console_count: 0,
+            vtty: None,
             queue: SessionQueue::new(),
             foreground: None,
             side_ops: HashMap::new(),
@@ -1058,6 +1061,8 @@ impl SessionCore {
             self.queue_registered = false;
             self.foreground = None;
             self.side_ops.clear();
+            self.vtty = None;
+            self.console_count = 0;
             self.foreground_reboot = false;
             self.login_run = None;
             self.clear_interactive();
@@ -1365,7 +1370,7 @@ impl SessionCore {
     fn ok_session(&self, now: Mono) -> PyDict {
         pydict! {
             "ok" => true,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1373,7 +1378,7 @@ impl SessionCore {
         pydict! {
             "ok" => false,
             "error_code" => code,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1383,7 +1388,7 @@ impl SessionCore {
             "error_code" => "SESSION_RECOVERING",
             "drain_stalled" => self.drain_stalled,
             "drain_timeout_epoch" => self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null),
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1393,7 +1398,7 @@ impl SessionCore {
             "error_code" => "DRAIN_STALLED",
             "drain_stalled" => true,
             "drain_timeout_epoch" => self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null),
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1410,7 +1415,7 @@ impl SessionCore {
             .unwrap_or((0, false));
         pydict! {
             "ok" => true,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None }),
+            "session" => self.public(now, &self.public_ctx()),
             "closed_consoles" => py_int(closed_consoles),
             "aborted_cmd" => aborted_cmd
         }
@@ -1607,11 +1612,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1628,11 +1629,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1656,11 +1653,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1676,11 +1669,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1696,11 +1685,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1722,11 +1707,7 @@ impl SessionCore {
                             "session",
                             PyValue::Dict(self.public(
                                 now,
-                                &PublicCtx {
-                                    console_count: 0,
-                                    vtty: None,
-                                    console_endpoint: None,
-                                },
+                                &self.public_ctx(),
                             )),
                         );
                     }
@@ -1772,7 +1753,7 @@ impl SessionCore {
                     "ok" => true,
                     "released" => true,
                     "recommended_action" => "device_attach",
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -1868,7 +1849,7 @@ impl SessionCore {
                     "ok" => false,
                     "error_code" => "FLASHING_BUSY",
                     "selector" => self.profile.com.clone(),
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -1881,7 +1862,7 @@ impl SessionCore {
                 Ok(pydict! {
                     "ok" => true,
                     "already_bound" => true,
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -2058,6 +2039,7 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            ..
         } = opened;
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = None;
@@ -2233,8 +2215,14 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            rx,
+            vtty,
         } = opened;
         self.generations.conn_epoch = Some(epoch);
+        // 新 bridge 的 RX 視窗與哨兵（Python 每次 attach 新建 `UARTBridge`；POSIX 哨兵 primary 算 1 個 console）。
+        self.deps.rx = rx;
+        self.console_count = usize::from(vtty.is_some());
+        self.vtty = vtty;
         self.attached_real_path = Some(real_path.clone());
         self.known_real_path = Some(real_path.clone());
         self.deps.fence.with(|f| {
@@ -2463,11 +2451,7 @@ impl SessionCore {
     fn attach_state_result(&self, now: Mono) -> PyDict {
         let session = PyValue::Dict(self.public(
             now,
-            &PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
+            &self.public_ctx(),
         ));
         if self.profile.template.command_capable()
             && !matches!(self.state, SessionState::Ready | SessionState::Attaching)
@@ -2662,8 +2646,17 @@ impl SessionCore {
                         && lease.deadline() == deadline
                 }) && now >= deadline =>
             {
-                self.close_lease(true);
-                Vec::new()
+                // Python `expired()`：`now - last > timeout`（嚴格大於；審查 F36）。恰在期限仍 active，
+                // 於期限後 1 ns 再檢查一次。
+                if now > deadline {
+                    self.close_lease(true);
+                    Vec::new()
+                } else {
+                    vec![Effect::Schedule {
+                        at: deadline.saturating_add(1),
+                        ev: TimerEvent::LeaseExpiry { lease_id, deadline },
+                    }]
+                }
             }
             TimerEvent::DrainTimeout { epoch, stop_id } => {
                 self.mark_drain_timeout(epoch, stop_id, now)
@@ -2817,6 +2810,8 @@ impl SessionCore {
         self.attached_real_path = None;
         self.foreground = None;
         self.side_ops.clear();
+        self.vtty = None;
+        self.console_count = 0;
         self.queue_registered = false;
         self.queue = SessionQueue::new();
         self.clear_interactive();
@@ -3038,11 +3033,7 @@ impl SessionCore {
     fn session_value(&self, now: Mono) -> PyValue {
         PyValue::Dict(self.public(
             now,
-            &PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
+            &self.public_ctx(),
         ))
     }
 
@@ -3721,7 +3712,54 @@ impl SessionCore {
     }
 
     fn vtty_alive(&self) -> Option<bool> {
-        self.self_test_probes.vtty_alive.as_ref().and_then(|f| f())
+        if let Some(probe) = self.self_test_probes.vtty_alive.as_ref() {
+            return probe();
+        }
+        // Python `snapshot()["vtty_alive"] = bool(primary and os.path.exists(primary))`。
+        self.current_vtty()
+            .map(|path| std::path::Path::new(path).exists())
+    }
+
+    /// Python `_suggest_profile_from_rx`：`clean_text(rx_tail(512))` 依序比對非 passthrough template 的
+    /// `prompt_regex`（`re.search`；不合法 regex 略過），回第一個命中的 template 名。
+    fn suggest_profile_from_rx(&self) -> Option<String> {
+        let templates = &self.self_test_probes.templates;
+        if templates.is_empty() {
+            return None;
+        }
+        let snapshot = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
+        if snapshot.is_empty() {
+            return None;
+        }
+        templates
+            .iter()
+            .filter(|tpl| tpl.platform != "passthrough")
+            .find(|tpl| {
+                sw_proto::pyre::compile(&tpl.prompt_regex, sw_proto::pyre::PyFlags(0))
+                    .is_ok_and(|re| re.search(&snapshot).is_some())
+            })
+            .map(|tpl| tpl.profile_name.clone())
+    }
+
+    /// 現行 bridge 的哨兵 vtty（無 bridge 時為 `None`）。
+    fn current_vtty(&self) -> Option<&str> {
+        self.generations.conn_epoch.and(self.vtty.as_deref())
+    }
+
+    /// `public()` 的 console 欄位（Python `to_public_dict`：有 bridge 時 `len(list_consoles())` 與 primary vtty）。
+    fn public_ctx(&self) -> PublicCtx {
+        match self.generations.conn_epoch {
+            Some(_) => PublicCtx {
+                console_count: self.console_count as i128,
+                vtty: self.vtty.clone(),
+                console_endpoint: None,
+            },
+            None => PublicCtx {
+                console_count: 0,
+                vtty: None,
+                console_endpoint: None,
+            },
+        }
     }
 
     fn resolve_log_dir(&self) -> String {
@@ -4575,7 +4613,7 @@ impl SessionCore {
                 "session" => self.session_value(now),
                 "attached_real_path" => attached,
                 "current_real_path" => current,
-                "attached_vtty" => PyValue::Null,
+                "attached_vtty" => option_string(base.attached_vtty.as_deref()),
                 "bridge_generation" => py_int(base.bridge_generation as i128),
                 "probe_ok" => true,
                 "recommended_action" => "none",
@@ -4636,6 +4674,12 @@ impl SessionCore {
             holder,
             by_id_realpath: self.known_real_path.clone(),
             vtty_alive: self.vtty_alive(),
+            bridge: self.generations.conn_epoch.and_then(|epoch| {
+                self.self_test_probes
+                    .bridge_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot(epoch))
+            }),
             strict_human_lock,
             now,
         };
@@ -4759,11 +4803,23 @@ impl SessionCore {
                 vec![("current_real_path", current)],
             ));
         }
+        // Python：bridge 物件仍在但 `snapshot()` 的 running／serial_alive 為假 → BRIDGE_DOWN／recover，零 probe。
+        if ctx
+            .bridge
+            .is_some_and(|snapshot| !snapshot.running || !snapshot.serial_alive)
+        {
+            return Ok(simple(
+                "BRIDGE_DOWN",
+                "recover",
+                vec![("current_real_path", current)],
+            ));
+        }
+        let attached_vtty = option_string(self.current_vtty());
         if ctx.vtty_alive == Some(false) {
             return Ok(simple(
                 "VTTY_STALE",
                 "console_attach",
-                vec![("attached_vtty", PyValue::Null)],
+                vec![("attached_vtty", attached_vtty)],
             ));
         }
         let attached = option_string(self.attached_real_path.as_deref());
@@ -4772,7 +4828,7 @@ impl SessionCore {
             vec![
                 ("attached_real_path", attached.clone()),
                 ("current_real_path", current.clone()),
-                ("attached_vtty", PyValue::Null),
+                ("attached_vtty", attached_vtty.clone()),
                 ("bridge_generation", bridge_generation.clone()),
             ]
         };
@@ -4790,7 +4846,25 @@ impl SessionCore {
                     "passthrough_ready_in_s",
                     PyValue::from(py_round((PASSTHROUGH_READY_QUIET_S - elapsed).max(0.0), 1)),
                 ));
-                ("PASSTHROUGH", "console_attach")
+                // #181（Python `_suggest_profile_from_rx`）：fallback 為未經量測的 catch-all——RX 命中某個非
+                // passthrough template 的 prompt 時給出可執行的出口（審查 F31）。
+                match (self.profile_source == "fallback")
+                    .then(|| self.suggest_profile_from_rx())
+                    .flatten()
+                {
+                    Some(suggested) => {
+                        let com = self.profile.com.clone();
+                        extra.push(("suggested_profile", PyValue::from(suggested.clone())));
+                        extra.push((
+                            "hint",
+                            PyValue::from(format!(
+                                "此 session 為未經量測的 fallback 分類，RX 內容匹配 {suggested}。套用：serialwrap session pin --selector {com} --profile {suggested} 之後 serialwrap session clear --selector {com}。"
+                            )),
+                        ));
+                        ("PASSTHROUGH", "pin_profile")
+                    }
+                    None => ("PASSTHROUGH", "console_attach"),
+                }
             } else if self.last_error.as_deref() == Some("LOGIN_REQUIRED") {
                 ("LOGIN_REQUIRED", "console_attach")
             } else if self.last_error.as_deref() == Some("REBOOTING") {
@@ -4851,6 +4925,7 @@ impl SessionCore {
                 attached_real_path: self.attached_real_path.clone(),
                 current_real_path: ctx.by_id_realpath.clone(),
                 bridge_generation: self.generations.bridge_generation,
+                attached_vtty: self.current_vtty().map(str::to_string),
             },
         })
     }

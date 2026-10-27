@@ -191,7 +191,8 @@ impl LogFs for StdLogFs {
 #[derive(Clone)]
 pub struct CaptureEnv {
     pub fs: Arc<dyn LogFs>,
-    /// 檔名時間戳（`time.strftime("%y%m%d-%H%M%S")` 本地時間）；`None` 時以 UTC 系統時間代替。
+    /// 檔名時間戳（`time.strftime("%y%m%d-%H%M%S")` 本地時間）。產品路徑由 manager 注入平台 Clock；
+    /// `None` 只見於未經 manager 組裝的獨立 core（以 UTC 系統時間代替）。
     pub clock: Option<Arc<dyn Clock>>,
     /// `LOG_DIR`（`SERIALWRAP_LOG_DIR` 或 `~/b-log`）；`None` 時由 env 推導。
     pub default_log_dir: Option<String>,

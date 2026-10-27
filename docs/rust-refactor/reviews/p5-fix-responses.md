@@ -56,3 +56,22 @@
 | F25 | High | READY 且前景命令在等 prompt 時，`session.recover`／`session.self_test` 回 `SESSION_BUSY`、零 TX | fixed（本組 commit）：OpRunner 增並行 lane（`OpSpec::runs_beside_foreground`：READY recover、self-test probe），session 以 `side_ops` 追蹤、不佔前景槽；epoch 結束時清空，遲到完成以 stale 回覆。TX 仍經同一 epoch 的 TxWriter（單一寫入者不變）。parity #58 原排 P8-T5 的 recover 對齊一併提前完成。紅燈先行：`recover_while_foreground_command_sends_recover_keys`、`self_test_while_foreground_command_sends_probe` |
 | F27 | Medium | self-test／recover／interactive send 進行中 `foreground_busy` 為 true、agent log 不寫 RX；interactive_send 並行回 `SESSION_BUSY` | fixed（本組 commit）：新增 `foreground_busy()`（只有命令／mode=interactive 命令算前景 operation），用於 `foreground_busy`、`outstanding_commands`、agent log RX 閘與 release `aborted_cmd`；`outstanding_commands` 補上 Python 的 `len(background_cmd_ids)`（同為本輪發現的差異）。紅燈先行：`self_test_probe_in_flight_is_not_foreground_busy`、`outstanding_commands_counts_background_ids`。interactive_send 並行 `SESSION_BUSY` 屬 D-22(2) 已核准差異，維持 |
 | F29 | Medium | 裝置在、bridge 開檔中呼叫 recover 回 `SESSION_NOT_READY` | fixed（本組 commit）：attach 進行中回 `{ok:true, recovering:false, action:"REATTACH"}`、`last_error=null`、state ATTACHING，不重複發 `OpenBridge`。紅燈先行：`recover_during_pending_attach_returns_reattach` |
+| F30 | Medium | self-test `attached_vtty` 恆 null | fixed（本組 commit，與 F43 同組）：bridge 開成時記下哨兵 vtty；OK／PASSTHROUGH／ATTACHED 子分類／VTTY_STALE 的 `attached_vtty` 回該路徑（無哨兵為 null）；`vtty_alive` 未注入時依 Python `os.path.exists(primary)` 判定 |
+| F31 | Medium | fallback passthrough 缺 `pin_profile`／`suggested_profile`／`hint` | fixed（本組 commit）：移植 `_suggest_profile_from_rx`（`clean_text(rx_tail(512))` 依序比對非 passthrough template 的 `prompt_regex`），manager 經 `SelfTestProbes.templates` 注入全部 template；`profile_source=="fallback"` 命中時改 `pin_profile` 並附 `suggested_profile` 與 Python 同字 hint。紅燈先行：`session_manager::selftest_fallback_passthrough_suggests_pin_profile` |
+| F32 | Medium | epoch 在、serial 已死仍送 probe | fixed（本組 commit）：`SelfTestProbes.bridge_snapshot`（manager 以共用 workers 表提供 `IoWorker::snapshot`）；running／serial_alive 為假 → `BRIDGE_DOWN`／`recover`、零 probe。紅燈先行：`lease_selftest::selftest_bridge_down_when_serial_dead` |
+| F33 | Medium | RELEASED 的 `/proc` holder 掃描在 actor 執行緒 | 部分修正／deferred：本輪發現產品路徑原本**完全沒有**注入 holder 掃描（`SelfTestProbes.holders` 只在測試設定，RELEASED self-test 一律視為無 holder，與 Python 不同），本組 commit 由 manager 注入 `uart_excl`。掃描仍在該 session 的 actor 內同步執行：RELEASED 狀態沒有 IoWorker（無 RX、無 banner、無 quiet arm、無 TX），只延後送往同一 session 的其他 RPC（Python 註解關切的是持 manager 全域鎖阻塞所有 RPC，Rust 每 session 一個 actor 不會）；移出 actor 需新增 effect／事件往返，延後至 P6 console reaper（同樣需要 `/proc` 掃描的 2.2 路徑）一併處理 |
+| F34 | Medium | 未注入 clock 時 log 檔名用 UTC | fixed（本組 commit）：manager 建 session 時以平台 Clock 注入 `CaptureEnv`（`local_utc_offset_s` → `strftime_local`）。紅燈先行：`session_manager::log_filename_uses_local_time_by_default`（舊實作得 UTC 系統時間） |
+| F36 | Low | `LeaseExpiry` timer 以 `>=` 關閉 | fixed（本組 commit）：嚴格大於（Python `now - last > timeout`）；恰在期限時改排期限後 1 ns 再檢查。新增 `lease_expiry_timer_is_strictly_after_deadline`；`wall_clock_jump_param` 的 lease 段同步改為「恰在 20 s 仍 active、再 1 ms 才收回」（期望值依 Python 更正） |
+| F39 | Low | `selftest_probe_drain_race_golden` 不保證兩分支都出現 | fixed（本組 commit）：加 `committed > 0 && refused > 0`（不足即 FAIL 報證據不足）；F92 修正後實跑 committed=840／refused=160 |
+
+## drain（afe4853／b73da42）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F43 | Medium | POSIX 自然開啟後 release 的 `closed_consoles` 為 0（產品路徑從未建哨兵） | fixed（本組 commit）：`ManagerExec::open_bridge` 以 `ConsoleTransportFactory::create_pty` 建 internal 哨兵 primary（master 交 IoWorker reader、slave keepalive 隨 worker 收尾釋放；Windows `Unsupported` 不建）；`OpenedBridge.vtty` 傳給 core，`console_count`＝1、`vtty`＝`/dev/pts/N`，release `closed_consoles`＝1，bridge 結束後 0／null（Python `to_public_dict`）。`public()` 各處改由 `public_ctx()` 取現行 bridge 的 console 欄位（原本一律傳空 context）。紅燈先行：`session_manager::sentinel_pty_reported_in_public_and_release`（以真 PTY；無 PTY 平台斷言 0／null） |
+
+## RX／mailbox
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F51 | Medium | 同一 `RxShared` 跨 attach 存活，上一條連線的速率被沿用（可誤判 `RX_FLOOD`） | fixed（本組 commit）：每次 `OpenBridge` 成功建新的 `RxShared::new(131_072, now)` 交該 epoch 的 reader，`OpenedBridge.rx` 帶回，core 於 adopt 時替換 `deps.rx`；executor 的 login／op 也改用新視窗；舊 reader 持舊 Arc。紅燈先行：`session_core::rx_window_resets_per_bridge` |

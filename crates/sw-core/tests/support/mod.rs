@@ -390,6 +390,8 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: REAL_PATH.into(),
+            rx: self.rx.clone(),
+            vtty: None,
         };
         self.feed(ControlEvent::BridgeOpened {
             epoch_hint: 0,
@@ -476,6 +478,7 @@ impl CoreHarness {
                 rx: self.rx.clone(),
                 fence: self.fence.clone(),
                 sentinel: None,
+                sentinel_keepalive: None,
                 data: self.data_tx.clone(),
                 control: self.ctl_tx.clone(),
                 clock: self.clock.clone(),
@@ -492,6 +495,8 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: real_path.to_string(),
+            rx: self.rx.clone(),
+            vtty: None,
         }
     }
 
@@ -927,6 +932,7 @@ impl EffectExecutor for RigExec {
                                 rx: self.rx.clone(),
                                 fence: self.fence.clone(),
                                 sentinel: None,
+                                sentinel_keepalive: None,
                                 data: self.data.clone(),
                                 control: tx.clone(),
                                 clock: self.clock.clone(),
@@ -936,6 +942,8 @@ impl EffectExecutor for RigExec {
                             epoch,
                             worker,
                             real_path: dev.0.clone(),
+                            rx: self.rx.clone(),
+                            vtty: None,
                         })
                     }
                     Err(OpenError::Held(holder)) => Err(OpenFailure::Held(holder)),
@@ -1926,6 +1934,7 @@ fn assemble_manager(
     clock: Arc<FakeClock>,
     serial: Arc<RigSerial>,
     warnings: Arc<Mutex<Vec<String>>>,
+    console: Arc<dyn ConsoleTransportFactory>,
 ) -> (Arc<SessionManager>, Arc<WalWriter>) {
     let load = load_profiles(
         PROFILE_DIR,
@@ -1946,7 +1955,7 @@ fn assemble_manager(
     let deps = ManagerDeps {
         serial: serial.clone(),
         uart_excl: Arc::new(RigExcl),
-        console: Arc::new(RigConsole),
+        console,
         caps: sw_pal::fakes::posix_caps(),
         wal: wal.clone(),
         registry: CommandRegistry::new(),
@@ -1980,6 +1989,7 @@ pub struct ManagerRig {
     yaml: String,
     warnings: Arc<Mutex<Vec<String>>>,
     shared: Arc<RigShared>,
+    console: Arc<dyn ConsoleTransportFactory>,
 }
 
 /// 快照與實體路徑登錄（restart 之間共享）。
@@ -1994,6 +2004,16 @@ struct RigShared {
 impl ManagerRig {
     /// 以 YAML 與 `state.json` 初值建立；`primary` 為 `(by_id, 實體路徑)`，會登錄到快照並安裝 shell 回應。
     pub fn with(yaml: &str, loaded: LoadedState, primary: Option<(&str, &str)>) -> ManagerRig {
+        ManagerRig::with_console(yaml, loaded, primary, Arc::new(RigConsole))
+    }
+
+    /// 同 [`ManagerRig::with`]，但以 `console` 作為哨兵 PTY 工廠（例如 `sw_pal::native().console`：POSIX 建真 PTY）。
+    pub fn with_console(
+        yaml: &str,
+        loaded: LoadedState,
+        primary: Option<(&str, &str)>,
+        console: Arc<dyn ConsoleTransportFactory>,
+    ) -> ManagerRig {
         let serial = RigSerial::new();
         let shared = Arc::new(RigShared::default());
         let dev = match primary {
@@ -2027,6 +2047,7 @@ impl ManagerRig {
             clock.clone(),
             serial.clone(),
             warnings.clone(),
+            console.clone(),
         );
         ManagerRig {
             mgr,
@@ -2040,6 +2061,7 @@ impl ManagerRig {
             yaml: yaml.to_string(),
             warnings,
             shared,
+            console,
         }
     }
 
@@ -2276,6 +2298,7 @@ impl ManagerRig {
             self.clock.clone(),
             self.serial.clone(),
             warnings.clone(),
+            self.console.clone(),
         );
         ManagerRig {
             mgr,
@@ -2289,6 +2312,7 @@ impl ManagerRig {
             yaml: self.yaml.clone(),
             warnings,
             shared: self.shared.clone(),
+            console: self.console.clone(),
         }
     }
 }
