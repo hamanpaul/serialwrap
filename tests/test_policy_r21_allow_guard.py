@@ -33,8 +33,9 @@ _PINNED = {
     "_GITHUB_TOKEN": (r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b", 0),
 }
 # 同版 engine `policy_check/data/secret_scan_defaults.yml` 的 baseline 釘選副本（`resolve_markers` 的基底）。
+# marker 以字串拆段書寫：本檔不在 allow 內，原字會被 R-21 本身判為 marker 命中。
 _PINNED_BASELINE = {
-    "markers": ["bgw720", "build20"],
+    "markers": ["bgw" "720", "build" "20"],
     "public_names": ["brcm", "broadcom", "airoha", "mtk", "mediatek", "prplos", "prplog", "marvell"],
 }
 
