@@ -985,6 +985,10 @@ impl EffectExecutor for RigExec {
                     .push(msg);
             }
             Effect::Notify(_) => {}
+            Effect::Reattach { by_id, real_path } => {
+                // 測試替身無 manager 再解析：直接回送 DeviceAttached（等同無 pin、非 fallback）。
+                let _ = tx.send(ControlEvent::DeviceAttached { by_id, real_path });
+            }
             Effect::Schedule { at, ev } => {
                 // 以 FakeClock 輪詢到期後投遞（測試替身；期限一律依 monotonic）。
                 let clock = self.clock.clone();

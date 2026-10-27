@@ -1670,6 +1670,11 @@ fn rx_window_resets_per_bridge() {
     let (_resp, effs) = h.rpc_deferred(SessionRequest::Clear);
     let (ep, stop) = begin_drain(&effs);
     let effs = h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert!(has_reattach(&effs), "clear 後交 manager 再解析");
+    let effs = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
     assert!(effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })), "clear 後應重新開檔");
     h.advance(Duration::from_secs(1));
     let mut opened = h.opened_bridge(REAL_PATH);
@@ -1681,4 +1686,57 @@ fn rx_window_resets_per_bridge() {
     let public = h.public();
     assert_eq!(pget(&public, "rx_bytes_last_10s"), PyValue::from(0), "{public:?}");
     assert_eq!(pget(&public, "rx_rate_bps"), PyValue::from(0));
+}
+
+fn has_reattach(effs: &[Effect]) -> bool {
+    effs.iter().any(|e| matches!(e, Effect::Reattach { .. }))
+}
+
+#[test]
+fn clear_without_bridge_with_device_reports_attaching_and_reattaches() {
+    // 審查 F61（High，73634db）：Python `clear_session` 無 bridge 分支：裝置在線 → 回應前活 session 即
+    // `state:"ATTACHING"`、`last_error:null`，再 `_spawn_attach`（開埠前走 `_reresolve_profile_on_reattach`）。
+    // 具體輸入：開埠 AccessDenied（ATTACH_FAILED:PermissionError、DETACHED、裝置仍在）→ `session.clear`。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::AccessDenied(HolderReport {
+            pids: Vec::new(),
+            holder_unknown: true,
+            status: sw_pal::proc_scan::HolderScanStatus::Unknown,
+        })),
+    });
+    assert_eq!(pget(&h.public(), "state"), PyValue::from("DETACHED"));
+    let (rx, effs) = h.rpc_deferred(SessionRequest::Clear);
+    let resp = rx.try_recv().expect("clear 應立即回覆").expect("ok");
+    let session = match resp.get("session") {
+        Some(PyValue::Dict(d)) => d.clone(),
+        other => panic!("缺 session：{other:?}"),
+    };
+    assert_eq!(session.get("state"), Some(&PyValue::from("ATTACHING")));
+    assert_eq!(session.get("last_error"), Some(&PyValue::Null));
+    assert!(has_reattach(&effs), "需交 manager 再解析後 attach");
+    assert!(!has_open_bridge(&effs), "再解析前不得直接開埠");
+    // manager 再解析後送 DeviceAttached：ATTACHING（等待再 attach）仍須接受並開埠。
+    let effs = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(has_open_bridge(&effs), "DeviceAttached 後應開埠");
+}
+
+#[test]
+fn clear_without_bridge_without_device_stays_detached_cleared() {
+    // Python `clear_session` 無 bridge 且裝置不在：`state:"DETACHED"`、`last_error:"CLEARED"`，不 `_spawn_attach`。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (rx, effs) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(rx.try_recv().expect("立即回覆").is_ok());
+    let s = h.public();
+    assert_eq!(pget(&s, "state"), PyValue::from("DETACHED"));
+    assert_eq!(pget(&s, "last_error"), PyValue::from("CLEARED"));
+    assert!(!has_reattach(&effs) && !has_open_bridge(&effs));
 }

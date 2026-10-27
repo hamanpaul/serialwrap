@@ -177,6 +177,12 @@ pub enum Effect {
         cfg: SerialConfig,
         precheck_holders: bool,
     },
+    /// 交 manager 依 Python `_spawn_attach` 重新 attach（開埠前再解析 pin／fallback 偵測）；
+    /// manager 完成後以 `DeviceAttached` 回送（審查 F61／F62）。
+    Reattach {
+        by_id: String,
+        real_path: String,
+    },
     BeginDrain {
         stop_id: StopId,
         epoch: u64,
@@ -279,6 +285,9 @@ pub struct SessionCore {
     pending_open_stop: Option<PendingOpenStop>,
     pending_attach: Option<PendingAttach>,
     open_real_path: Option<String>,
+    /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
+    /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
+    reattach_pending: bool,
     open_generation: u64,
     known_real_path: Option<String>,
     device_present: bool,
@@ -454,6 +463,7 @@ impl SessionCore {
             pending_open_stop: None,
             pending_attach: None,
             open_real_path: None,
+            reattach_pending: false,
             open_generation: 0,
             known_real_path: None,
             device_present: false,
@@ -1053,6 +1063,7 @@ impl SessionCore {
         now: Mono,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        self.reattach_pending = false;
         if kind == StopKind::Release {
             self.finish_release(now);
             effects.extend(
@@ -1084,6 +1095,14 @@ impl SessionCore {
                 _ => {}
             }
             self.set_state(SessionState::Detached, now);
+            if kind == StopKind::Clear {
+                // Python `clear_session` 無 bridge 分支：裝置在線 → 回覆前即 ATTACHING＋`last_error=None`，
+                // 再 `_spawn_attach`（審查 F61）；不在線維持 DETACHED＋CLEARED。
+                effects.extend(self.request_reattach(now));
+                if self.state == SessionState::Attaching {
+                    self.set_last_error(None, None);
+                }
+            }
             for waiter in waiters {
                 effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
             }
@@ -1348,6 +1367,7 @@ impl SessionCore {
         {
             return;
         }
+        self.reattach_pending = false;
         self.set_state(SessionState::Detached, now);
         if self.last_error.is_none() {
             self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
@@ -1941,9 +1961,11 @@ impl SessionCore {
         if self.state == SessionState::Released {
             return Vec::new();
         }
-        if self.state != SessionState::Detached {
+        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
+        if self.state != SessionState::Detached && !awaiting {
             return Vec::new();
         }
+        self.reattach_pending = false;
         self.set_last_error(None, None);
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.open_generation = self.generations.fsm_gen;
@@ -2928,18 +2950,16 @@ impl SessionCore {
                     _ => {}
                 }
                 self.set_state(SessionState::Detached, now);
-                let open_effects = if matches!(
-                    kind,
-                    StopKind::IoError | StopKind::Recover | StopKind::Clear
-                ) {
-                    self.reopen_known_device(now)
-                } else {
-                    Vec::new()
+                let open_effects = match kind {
+                    StopKind::IoError | StopKind::Recover => self.reopen_known_device(now),
+                    StopKind::Clear => self.request_reattach(now),
+                    _ => Vec::new(),
                 };
                 effects.extend(open_effects);
                 if kind == StopKind::Clear && self.state == SessionState::Attaching {
                     // Python `clear_session`：drain 收尾設 ATTACHING＋CLEARED 後立即 `_spawn_attach`，
                     // `_attach_by_id` 開埠前 `last_error = None`；ATTACHING 期間不帶 CLEARED（P5-T20 黑箱）。
+                    // 開埠前由 manager 再解析 pin／fallback（`Effect::Reattach`，審查 F62）。
                     self.set_last_error(None, None);
                 }
                 for waiter in stop.waiters {
@@ -3016,6 +3036,25 @@ impl SessionCore {
                 meta,
             });
         }
+    }
+
+    /// clear 收尾的重新 attach：裝置在線時 ATTACHING 並交 manager 再解析（`Effect::Reattach`），
+    /// 不在線（或 shutdown 中）維持 DETACHED。
+    fn request_reattach(&mut self, now: Mono) -> Vec<Effect> {
+        let by_id = self.profile.device_by_id.clone();
+        let real_path = match self.known_real_path.clone() {
+            Some(path) if self.device_present && !self.shutdown_requested && !by_id.is_empty() => {
+                path
+            }
+            _ => {
+                self.set_state(SessionState::Detached, now);
+                return Vec::new();
+            }
+        };
+        self.open_real_path = None;
+        self.reattach_pending = true;
+        self.set_state(SessionState::Attaching, now);
+        vec![Effect::Reattach { by_id, real_path }]
     }
 
     fn reopen_known_device(&mut self, now: Mono) -> Vec<Effect> {

@@ -1752,3 +1752,36 @@ fn missing_explicit_target_marked_device_not_found() {
     assert_eq!(s_of(&s, "state").as_deref(), Some("DETACHED"));
     assert!(s_of(&s, "detached_at").is_some(), "{s:?}");
 }
+
+#[test]
+fn pin_then_clear_on_attached_session_applies_pin() {
+    // 審查 F62（High，73634db）：parity #32／#181「session pin + session clear 對既有 session 生效」。
+    // Python `clear_session` drain 後 `_complete_drain` → `_spawn_attach` → `_attach_by_id` 開埠前
+    // `_reresolve_profile_on_reattach`：pin 可解析即換 template（profile_source pin）、不送 PROBE。
+    // 具體輸入：fallback session（others-template:COM0）已 ATTACHED → pin prpl-template → clear。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-D"]);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    m.wait_state("COM0", "ATTACHED");
+    let probe_rows = |m: &ManagerRig| {
+        m.wal_rows()
+            .iter()
+            .filter(|r| s_of(r, "com").as_deref() == Some("PROBE"))
+            .count()
+    };
+    let before = probe_rows(&m);
+    assert!(is_ok(&rpc(m.mgr.pin("COM0", "prpl-template"))));
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(&sid, SessionRequest::Clear, RPC));
+    assert!(is_ok(&r), "clear 應成功：{r:?}");
+    wait_until("clear 後套用 pin", || {
+        m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
+            && m.state_of("COM0").as_deref() == Some("ATTACHED")
+    });
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "profile_source").as_deref(), Some("pin"));
+    assert_eq!(s_of(&s, "platform").as_deref(), Some("prpl"));
+    assert_eq!(probe_rows(&m), before, "pin 繞過偵測，不得送 PROBE");
+}

@@ -1657,11 +1657,19 @@ fn clear_reopen_attaching_clears_last_error() {
     let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
     let (epoch, stop) = h.pending_stop();
     let effects = h.receipt(epoch, stop).feed();
+    // 審查 F62：開埠前先交 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）。
     assert!(effects
         .iter()
-        .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+        .any(|effect| matches!(effect, Effect::Reattach { .. })));
     assert!(rx.try_recv().unwrap().is_ok());
     let s = h.public();
     assert_eq!(s["state"], PyValue::from("ATTACHING"));
     assert_eq!(s["last_error"], PyValue::Null);
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
 }

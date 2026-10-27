@@ -169,6 +169,8 @@ struct Entry {
 #[derive(Clone)]
 struct AttachOp {
     cancelled: Arc<AtomicBool>,
+    /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
+    after_clear: bool,
 }
 
 #[derive(Default)]
@@ -833,6 +835,11 @@ impl Shared {
 
     /// `_spawn_attach`：stopping gate、released／inflight 去重；需要再解析或尚無 session 時起 attach worker。
     fn spawn_attach(self: &Arc<Self>, by_id: &str) {
+        self.spawn_attach_with(by_id, false);
+    }
+
+    /// `spawn_attach` 本體；`after_clear` 見 `AttachOp::after_clear`。
+    fn spawn_attach_with(self: &Arc<Self>, by_id: &str, after_clear: bool) {
         let released = self.released_by_ids();
         let pins = self.model_snapshot().profile_pins;
         let mut inner = lock(&self.inner);
@@ -866,6 +873,7 @@ impl Shared {
         }
         let op = AttachOp {
             cancelled: Arc::new(AtomicBool::new(false)),
+            after_clear,
         };
         inner.inflight.insert(by_id.to_string(), op.clone());
         drop(inner);
@@ -1243,8 +1251,9 @@ impl Shared {
         if state == "RELEASED" || self.released_by_ids().contains(by_id) {
             return;
         }
-        if state != "DETACHED" {
+        if state != "DETACHED" && !(op.after_clear && state == "ATTACHING") {
             // 已有 bridge（或 attach／drain 進行中）：不再解析（再開 PROBE 會 two-reader），交給 actor 判斷。
+            // clear 收尾的 ATTACHING 尚未開埠（bridge 已關），與 Python `_attach_by_id` 同樣先再解析。
             self.send_attached(by_id);
             return;
         }
@@ -1882,6 +1891,7 @@ impl EffectExecutor for ManagerExec {
                 let _ = self.shared.note_tx.send(note);
             }
             Effect::Warn(msg) => self.shared.warn(msg),
+            Effect::Reattach { by_id, .. } => self.shared.spawn_attach_with(&by_id, true),
             Effect::SettleTx { epoch, op_id } => {
                 if let Some(worker) = lock(&self.workers).get(&epoch) {
                     let _ = worker.tx().settle(op_id);
