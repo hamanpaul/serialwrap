@@ -1279,3 +1279,9 @@ mod tests {
         assert!(!is_optional_like("-a b"));
     }
 }
+
+/// P6 D-12：`windows.serial_console` 的 console／peer 埠（只在 `caps.com0com_console` 時生效）。
+pub fn serial_console_excludes(cfg: &RuntimeConfig, caps: &Capabilities, warn: &dyn Fn(String)) -> Vec<String> {
+    let _ = (cfg, caps, warn);
+    todo!("P6 Task 10")
+}

@@ -995,3 +995,21 @@ impl RuntimeConfig {
         Ok(Some(result))
     }
 }
+
+/// P6 D-12：`windows.serial_console` 的一列（com0com Console-side pair）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialConsolePair {
+    pub console_port: String,
+    pub peer_port: String,
+}
+
+/// P6 D-12：DUT by_id → pair（依 YAML 順序）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerialConsoleMap(pub indexmap::IndexMap<String, SerialConsolePair>);
+
+impl RuntimeConfig {
+    /// P6 D-12：`None`＝無此鍵；`Some(Err(()))`＝形狀不符（呼叫端寫 WARNING 並忽略整個鍵）。
+    pub fn windows_serial_console(&self) -> Option<Result<SerialConsoleMap, ()>> {
+        todo!("P6 Task 10")
+    }
+}
