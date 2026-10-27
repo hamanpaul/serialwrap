@@ -260,29 +260,34 @@ impl Service {
             .and_then(|r| r.get("session_id").and_then(PyValue::as_str).map(str::to_string))
     }
 
-    /// `get_background_result`＋`_bg_fallback_from_arbiter`（兩者皆在 SessionCore 內；此處只決定路由的 session）。
+    /// Python `get_background_result`（以 cmd_id 全域查 capture：先問命令紀錄的 session，再問其餘）＋
+    /// 全部查無時一次 `_bg_fallback_from_arbiter`（審查 F76：fallback 不得先於其他 session 的 capture）。
     fn result_tail(&self, cmd_id: &str, from_chunk: i128, limit: i128) -> Result<PyDict, PyErr> {
-        let req = || SessionRequest::ResultTail {
+        let req = || SessionRequest::BackgroundResult {
             cmd_id: cmd_id.to_string(),
             from_chunk,
             limit,
         };
-        if let Some(sid) = self.cmd_owner(cmd_id) {
-            if self.manager.resolve(&sid).as_deref() == Some(sid.as_str()) {
-                return self.manager.route(&sid, req(), ROUTE_TIMEOUT);
-            }
-        }
-        // 命令紀錄已被 history 淘汰（或 session_id 已重算）：逐一詢問可能持有 capture 的 session。
-        for s in self.manager.list_sessions() {
-            let Some(sid) = s.get("session_id").and_then(PyValue::as_str).map(str::to_string) else {
-                continue;
-            };
+        let owner = self
+            .cmd_owner(cmd_id)
+            .and_then(|sid| self.manager.resolve(&sid).filter(|resolved| *resolved == sid));
+        let others = self
+            .manager
+            .list_sessions()
+            .into_iter()
+            .filter_map(|s| s.get("session_id").and_then(PyValue::as_str).map(str::to_string))
+            .filter(|sid| Some(sid) != owner.as_ref());
+        for sid in owner.clone().into_iter().chain(others) {
             let r = self.manager.route(&sid, req(), ROUTE_TIMEOUT)?;
             if is_ok(&r) {
                 return Ok(r);
             }
         }
-        Ok(cmd_not_found(cmd_id))
+        Ok(sw_core::session_core::bg_fallback_from_registry(
+            &self.registry,
+            cmd_id,
+            from_chunk,
+        ))
     }
 
     fn dispatch(&self, method: &str, params: &PyDict) -> Result<PyDict, PyErr> {
@@ -421,8 +426,16 @@ impl Service {
                 if selector.is_empty() {
                     return Ok(invalid_args());
                 }
-                self.route(
-                    &selector,
+                // Python `interactive_open`：查無 session 回 SESSION_NOT_READY＋selector（審查 F73）。
+                let Some(sid) = self.manager.resolve(&selector) else {
+                    return Ok(pydict! {
+                        "ok" => false,
+                        "error_code" => "SESSION_NOT_READY",
+                        "selector" => selector,
+                    });
+                };
+                self.manager.route(
+                    &sid,
                     SessionRequest::InteractiveOpen {
                         owner,
                         timeout_s,

@@ -880,6 +880,7 @@ fn command_cancel_queued_command() {
         j(&queued)
     );
     let id = s(&queued, "cmd_id").to_string();
+    let (len_before, physical_before) = r.mgr.session_queue_lens("COM0").expect("COM0 佇列");
     let resp = r.call("command.cancel", &format!(r#"{{"cmd_id":"{id}"}}"#));
     assert_eq!(
         j(&resp),
@@ -895,8 +896,13 @@ fn command_cancel_queued_command() {
         Some(&PyValue::Null),
         "排隊中取消，不得開始執行"
     );
-    // 佇列實體移除（`route(sid, CancelQueued)` → `SessionQueue::remove`，physical_len 減 1）不經 RPC 外露；
-    // 該語意由 sw-core arbiter／session_core 測試覆蓋，此處只驗 RPC 回應與命令紀錄。
+    // 審查 F74：計畫 Task 18 要求 RPC cancel 經 `route(sid, CancelQueued)` → `SessionQueue::remove`，
+    // 前景仍阻塞時佇列實體項目即減 1（不等出列時 Skip）。
+    assert_eq!(
+        r.mgr.session_queue_lens("COM0"),
+        Some((len_before - 1, physical_before - 1)),
+        "cancel 後佇列 len／physical_len 皆應減 1"
+    );
     // 再取消：Python 只擋 done／error，canceled 可重複取消。
     let again = r.call("command.cancel", &format!(r#"{{"cmd_id":"{id}"}}"#));
     assert_eq!(again.get("ok"), Some(&PyValue::Bool(true)));
@@ -1030,5 +1036,47 @@ fn ready_unconfirmed_response_has_session_field() {
     assert_eq!(
         sub(&resp, "session").get("ready_reconfirm_failed"),
         Some(&PyValue::Bool(true))
+    );
+}
+
+#[test]
+fn interactive_open_unknown_selector_session_not_ready() {
+    // 審查 F73（High，8a7986e）：Python `SessionManager.interactive_open` 查無 session 回
+    // `{"ok":false,"error_code":"SESSION_NOT_READY","selector":<原 selector>}`（非 SESSION_NOT_FOUND）。
+    let r = ServiceRig::ready_shell();
+    assert_eq!(
+        j(&r.call("session.interactive_open", r#"{"selector":"NOSUCH"}"#)),
+        format!(
+            "{{\"ok\":false,\"error_code\":\"SESSION_NOT_READY\",\"selector\":\"NOSUCH\",\"version\":\"{}\"}}",
+            r.version
+        )
+    );
+}
+
+#[test]
+fn result_tail_stale_owner_finds_capture_in_other_session() {
+    // 審查 F76（Medium，8a7986e）：Python `command.result_tail` 先以 cmd_id 全域查 `_background`
+    // （`get_background_result`），只有 CMD_NOT_FOUND 才走 `_bg_fallback_from_arbiter`。
+    // 具體輸入：COM0、COM1 皆在；背景命令的 capture 在 COM1；命令紀錄的 session_id 已對不上（rematerialize 後）。
+    // Python：回 COM1 capture 的結果（含 `dropped_chunks`／`lost`）。舊 Rust：排序較前的 COM0 以登錄表 fallback
+    // 先回 `ok:true`、空 chunks、無 `dropped_chunks`。
+    let r = ServiceRig::two_shells();
+    let resp = r.call(
+        "command.submit",
+        r#"{"selector":"COM1","cmd":"sleep 100","mode":"bg","timeout_s":30}"#,
+    );
+    assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&resp));
+    let id = s(&resp, "cmd_id").to_string();
+    wait_until("背景命令 running", || {
+        r.registry.get(&id).and_then(|rec| rec.get("status").cloned())
+            == Some(PyValue::from("running"))
+    });
+    r.registry.set_session_id_for_test(&id, "t:GONE");
+    let tail = r.call("command.result_tail", &format!(r#"{{"cmd_id":"{id}"}}"#));
+    assert_eq!(tail.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&tail));
+    assert!(
+        tail.get("dropped_chunks").is_some(),
+        "應回 COM1 capture 的結果，而非登錄表 fallback：{}",
+        j(&tail)
     );
 }

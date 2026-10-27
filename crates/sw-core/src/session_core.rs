@@ -149,6 +149,13 @@ pub enum SessionRequest {
         from_chunk: i128,
         limit: i128,
     },
+    /// 只查本 session 的 background capture（Python `get_background_result` 的單 session 部分；
+    /// 查無回 CMD_NOT_FOUND、不走登錄表 fallback，審查 F76）。
+    BackgroundResult {
+        cmd_id: String,
+        from_chunk: i128,
+        limit: i128,
+    },
     CancelQueued {
         cmd_id: String,
     },
@@ -161,6 +168,9 @@ pub enum SessionRequest {
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
+    /// 只供測試（test-fakes）：佇列長度 `{len, physical_len}`（審查 F74：RPC cancel 的實體移除）。
+    #[cfg(feature = "test-fakes")]
+    QueueLensForTest,
 }
 
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
@@ -1591,6 +1601,14 @@ impl SessionCore {
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
             }
             #[cfg(feature = "test-fakes")]
+            SessionRequest::QueueLensForTest => vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "len" => PyValue::from(self.queue.len() as i64),
+                    "physical_len" => PyValue::from(self.queue.physical_len() as i64),
+                }),
+            )],
+            #[cfg(feature = "test-fakes")]
             SessionRequest::ForceStateForTest(state) => {
                 self.set_state(state, now);
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
@@ -1614,6 +1632,19 @@ impl SessionCore {
             SessionRequest::LogStart => vec![Effect::Reply(reply, self.log_start(now))],
             SessionRequest::LogStop => vec![Effect::Reply(reply, Ok(self.log_stop(now)))],
             SessionRequest::LogStatus => vec![Effect::Reply(reply, Ok(self.log_status(now)))],
+            SessionRequest::BackgroundResult {
+                cmd_id,
+                from_chunk,
+                limit,
+            } => vec![Effect::Reply(
+                reply,
+                match self.background.get_mut(&cmd_id) {
+                    Some(capture) => capture.result(from_chunk, limit, now),
+                    None => Ok(
+                        pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id },
+                    ),
+                },
+            )],
             SessionRequest::ResultTail {
                 cmd_id,
                 from_chunk,
@@ -3741,36 +3772,7 @@ impl SessionCore {
         if let Some(capture) = self.background.get_mut(cmd_id) {
             return capture.result(from_chunk, limit, now);
         }
-        let not_found = pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id };
-        let Some(record) = self.deps.registry.get(cmd_id) else {
-            return Ok(not_found);
-        };
-        if record.get("execution_mode").and_then(PyValue::as_str) != Some("background") {
-            return Ok(not_found);
-        }
-        let status = record
-            .get("status")
-            .cloned()
-            .unwrap_or(PyValue::Null);
-        if status.as_str() == Some("done") {
-            return Ok(not_found);
-        }
-        if status.as_str() == Some("canceled")
-            && record.get("started_at").is_some_and(|v| !v.is_null())
-        {
-            return Ok(not_found);
-        }
-        Ok(pydict! {
-            "ok" => true,
-            "cmd_id" => cmd_id,
-            "status" => status,
-            "error_code" => record.get("error_code").cloned().unwrap_or(PyValue::Null),
-            "from_seq" => py_int(0),
-            "last_seq" => py_int(0),
-            "from_chunk" => py_int(from_chunk),
-            "next_chunk" => py_int(from_chunk),
-            "chunks" => PyValue::List(Vec::new()),
-        })
+        Ok(bg_fallback_from_registry(&self.deps.registry, cmd_id, from_chunk))
     }
 
     /// session detach：停止 agent log、終結 background capture、清除 `background_cmd_ids`。
@@ -5207,6 +5209,41 @@ fn option_string(value: Option<&str>) -> PyValue {
 
 fn py_int(value: i128) -> PyValue {
     PyValue::Int(PyInt::Small(value))
+}
+
+/// Python `_bg_fallback_from_arbiter`：capture 尚未建立（或已不在任何 session）時以命令紀錄合成 result_tail 回應；
+/// 非 background、done、已開始的 canceled 回 CMD_NOT_FOUND（審查 F76：service 於全域 capture 查無後才呼叫）。
+pub fn bg_fallback_from_registry(registry: &CommandRegistry, cmd_id: &str, from_chunk: i128) -> PyDict {
+    let not_found = pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id };
+    let Some(record) = registry.get(cmd_id) else {
+        return not_found;
+    };
+    if record.get("execution_mode").and_then(PyValue::as_str) != Some("background") {
+        return not_found;
+    }
+    let status = record
+        .get("status")
+        .cloned()
+        .unwrap_or(PyValue::Null);
+    if status.as_str() == Some("done") {
+        return not_found;
+    }
+    if status.as_str() == Some("canceled")
+        && record.get("started_at").is_some_and(|v| !v.is_null())
+    {
+        return not_found;
+    }
+    pydict! {
+        "ok" => true,
+        "cmd_id" => cmd_id,
+        "status" => status,
+        "error_code" => record.get("error_code").cloned().unwrap_or(PyValue::Null),
+        "from_seq" => py_int(0),
+        "last_seq" => py_int(0),
+        "from_chunk" => py_int(from_chunk),
+        "next_chunk" => py_int(from_chunk),
+        "chunks" => PyValue::List(Vec::new()),
+    }
 }
 
 fn age_s(last: Mono, now: Mono) -> PyValue {

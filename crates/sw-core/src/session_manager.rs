@@ -2621,6 +2621,17 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    /// 只供測試（test-fakes）：session 佇列的 `(len, physical_len)`（`None`＝查無 session）。
+    #[cfg(feature = "test-fakes")]
+    pub fn session_queue_lens(&self, selector: &str) -> Option<(i64, i64)> {
+        let sid = self.resolve(selector)?;
+        let d = self
+            .shared
+            .request(&sid, SessionRequest::QueueLensForTest, QUERY_TIMEOUT)
+            .ok()?;
+        Some((d.get("len")?.as_i64()?, d.get("physical_len")?.as_i64()?))
+    }
+
     /// 只供測試（test-fakes）：直接設定 session 狀態（FLASHING／RECOVERING 等無法由 RPC 到達的狀態）。
     #[cfg(feature = "test-fakes")]
     pub fn force_session_state(&self, selector: &str, state: SessionState) {
