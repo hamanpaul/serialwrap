@@ -387,6 +387,8 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     events: list[tuple[str, int]] = []
+    # 替身 helper 與延遲 rename 共用的 lease／break 時點（perf_counter_ns）。
+    lease_state: dict[str, int] = {}
 
     class FakeWriter:
         def __init__(self, *, wal_dir, rotate_bytes, fs=None):
@@ -400,6 +402,8 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
             if self.index == 1:
                 (self.wal_dir / "raw.wal.ndjson").write_bytes(b"prefill\n")
             elif self.index == 2:
+                # 模擬高負載：lease 取得到 rotation 請求之間有排程延遲（全套 pytest 曾因此誤判 INSUFFICIENT）。
+                real_sleep(0.015)
                 wal_path = self.wal_dir / "raw.wal.ndjson"
                 wal_path.write_bytes(b"rotation request\n")
                 assert self.fs is not None
@@ -439,8 +443,10 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
         def arm_hold(self, _name):
             events.append(("helper_rearm", 0))
             self.lease_acquired_ns = time.perf_counter_ns()
-            hold_ns = 500_000_000 if failure_point == "break-after-expiry" else 10_000_000
+            # lease 須涵蓋 rotation 請求前的排程延遲；break 由 rename 請求觸發（見 DelayedRenameFs）。
+            hold_ns = 500_000_000 if failure_point == "break-after-expiry" else 200_000_000
             self.lease_until_ns = self.lease_acquired_ns + hold_ns
+            lease_state["until_ns"] = self.lease_until_ns
             self.lease_request_id = "fake-oplock-lease"
             self.rec.observations["av_sim"]["variants"][self.variant]["lease_request_id"] = self.lease_request_id
             return True
@@ -453,7 +459,7 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
                     "event": "oplock_break", "request_id": self.lease_request_id, "name": "raw.wal.ndjson",
                     "lease_acquired_ns": self.lease_acquired_ns, "lease_until_ns": self.lease_until_ns,
                     "break_notified_ns": self.lease_until_ns + 1 if failure_point == "break-after-expiry"
-                    else self.lease_acquired_ns + 5_000_000,
+                    else lease_state["break_ns"],
                     "break_completed": True, "ack_required": True,
                     "ack_method": "close_handle", "close_started_ns": close_started_ns,
                     "close_completed_ns": close_completed_ns, "close_succeeded": True,
@@ -494,8 +500,13 @@ def _run_spike3_oplock_variant_workload(monkeypatch, tmp_path, failure_point):
             self.delegate = delegate
 
         def rename_noreplace_or_suffix(self, src, base_dst):
-            # 模擬 oplock break 要等 lease 到期／handle close 才完成 ACK。
-            real_sleep(0.52 if failure_point == "break-after-expiry" else 0.02)
+            # 模擬 oplock：rename 請求即觸發 break 通知，helper 持有到 lease 到期才 close（ACK），rename 隨後完成。
+            if failure_point == "break-after-expiry":
+                real_sleep(0.52)
+            else:
+                lease_state["break_ns"] = time.perf_counter_ns()
+                remaining_s = (lease_state["until_ns"] - time.perf_counter_ns()) / 1e9
+                real_sleep(max(0.0, remaining_s) + 0.002)
             return self.delegate.rename_noreplace_or_suffix(src, base_dst)
 
         def __getattr__(self, name):
