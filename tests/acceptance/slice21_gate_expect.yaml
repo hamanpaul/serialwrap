@@ -1,0 +1,47 @@
+# Slice 2.1 出口 gate 的 section 定義（P5-T22；計畫 06 Task 22「判定規則」）。
+# 測試類 section 的 PASS 只看 required_set 的凍結 nodeid（R5-F3），nodeid 清單本身只存在於
+# tests/acceptance/l1_required.lock.json；本檔只寫 section→集合對應與執行命令，不寫計數門檻。
+schema_version: 1
+lock_file: tests/acceptance/l1_required.lock.json
+freeze_file: tests/acceptance/breaker/slice_2.1.json
+blocked_owner_file: tests/acceptance/slice21_bo.yaml
+runbook: docs/rust-refactor/slice21-owner-runbook.md
+parity:
+  # #104：逐列狀態檔；來源文件位置與 sha256 記在狀態檔內。
+  status_file: tests/acceptance/slice21_parity_status.yaml
+# #103：pytest_full 另須通過 Task 0b 的 Python 基線 parity 集合。
+additional_required_sets:
+  pytest_full: ["s21_gate:py_parity"]
+sections:
+  - {name: cfg_boundary, kind: non_test, required_set: null, command: "python3 scripts/rust/check_cfg_boundary.py"}
+  - {name: linux_l1, kind: test, platform: linux, required_set: s21_core,
+     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_l1/l1-results.json -- --workspace --features test-fakes -- --skip cap_"}
+  - {name: linux_cap_posix_pty, kind: test, platform: linux, required_set: "s21_gate:linux_cap_posix_pty",
+     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --caps posix_pty --out <run>/linux_cap_posix_pty/l1-results.json -- -p sw-pal --features test-fakes"}
+  - {name: windows_native_l1, kind: test, platform: windows, required_set: s21_core,
+     command: "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon"}
+  - {name: windows_cap_windows_com, kind: test, platform: windows, required_set: "s21_gate:windows_cap_windows_com",
+     allowed_missing_bo: BO-S21-01, command: "scripts/rust/win-test.sh --caps windows_com --package sw-pal（需 --with-com-pair 與 SW_TEST_COM_PAIR）"}
+  - {name: blackbox_python, kind: test, platform: linux, required_set: "s21_gate:blackbox_python",
+     command: "python3 -m pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty（Python daemon）"}
+  - {name: blackbox_rust, kind: test, platform: linux, required_set: "s21_gate:blackbox_rust",
+     command: "Task 20 Step 2 命令（SERIALWRAP_DAEMON_IMPL=rust）"}
+  - {name: existing_suites_rust, kind: test, platform: linux, required_set: "s21_gate:existing_suites_rust",
+     command: "Task 20 既有套件兩條 pytest 命令＋三次 func-test/runner.py --case <id>"}
+  - {name: l15_ab, kind: non_test, required_set: null, command: "Task 21 L1.5 命令（SERIALWRAP_GATE=1）"}
+  - {name: event_latency, kind: non_test, required_set: null, command: "Task 21 event_latency 三輪"}
+  - {name: wal_s1w_perf, kind: non_test, required_set: null,
+     command: "cargo run --release -p sw-core --example wal_s1w -- --out <run>/wal_s1w_perf/wal_s1w.json",
+     note: "門檻逐字取規格 §1.2（Linux p50≤0.005／p95≤0.01／p99≤0.02 ms、rotate≤3 ms）；Windows 原生與 EDR 下正式量測屬 BO-S21-14"}
+  - {name: case_uptake, kind: non_test, required_set: null, command: "slice_breaker.acceptance_rate（Task 0b）"}
+  - {name: pytest_full, kind: test, platform: linux, required_set: "s21_gate:pytest_full",
+     command: "SW_RESOURCE_REPORT=<run>/pytest_full/resource-report.json python3 -m pytest -q tests/ --junitxml=<run>/pytest_full/junit.xml"}
+  - {name: policy_check, kind: non_test, required_set: null, command: "python3 -m policy_check --repo ."}
+# 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
+pending_decisions:
+  - id: PA-OD-1
+    scenario: SC-37 候選（daemon 端 backend env 強制非原生後端 → exit 1）與「只可新增、不可修改」原則適用範圍（parity #6／#71）
+    evidence: "origin/docs/parity-amendments:docs/rust-refactor/plans/parity-amendments-2026-10-26.md#pa-od-1"
+  - id: NC-P5-02
+    scenario: 承接率斷路器窗口採單一固定窗口；「連續三週內」滾動解讀待擁有者確認（Task 0b）
+    evidence: docs/rust-refactor/plans/spec-reconciliation.md
