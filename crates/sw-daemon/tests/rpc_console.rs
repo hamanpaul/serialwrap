@@ -611,3 +611,55 @@ fn tcp_listener_ephemeral_per_bridge() {
     let resp = attach(&r, r#"{"selector":"COM0"}"#);
     assert_eq!(s(&resp, "endpoint"), second);
 }
+
+// ---------------------------------------------------------------- 07 Task 10 表列（R3-9 補齊）
+
+/// `list_consoles`／`detach_console`：bridge 不存在（release 後）→ `SESSION_NOT_READY{selector}`（`session_manager.py:6778`、`:6800`）。
+#[test]
+fn list_and_detach_without_bridge() {
+    let r = ServiceRig::with_console_backend("pty");
+    let rel = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&rel));
+    let want = format!(r#"{{"ok":false,"error_code":"SESSION_NOT_READY","selector":"COM0","version":"{}"}}"#, r.version);
+    let before = r.side_effect_fingerprint().2;
+    assert_eq!(j(&r.call("session.console_list", r#"{"selector":"COM0"}"#)), want);
+    assert_eq!(j(&r.call("session.console_detach", r#"{"selector":"COM0","client_id":"abc"}"#)), want);
+    assert_eq!(r.side_effect_fingerprint().2, before, "零 TX");
+}
+
+/// `service.py:1094` `float(params.get("timeout_s") or 60.0)` 先於 selector 檢查：轉型失敗為 framing EXCEPTION。
+#[test]
+fn open_coercion_float_error_before_invalid_args() {
+    let r = ServiceRig::with_console_backend("pty");
+    let err = r.call_err("session.interactive_open", r#"{"timeout_s":"x"}"#);
+    assert_eq!(err.message, "could not convert string to float: 'x'", "{err:?}");
+}
+
+/// `timeout_s:0` 為 falsy → 預設 60.0：59 s 時仍 active，61 s 後 `INTERACTIVE_EXPIRED`。
+#[test]
+fn open_timeout_zero_uses_default() {
+    let r = ServiceRig::with_console_backend("pty");
+    let o = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent","timeout_s":0}"#);
+    assert_eq!(o.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&o));
+    let iid = s(&o, "interactive_id");
+    let status = |r: &ServiceRig| r.call("session.interactive_status", &format!(r#"{{"interactive_id":"{iid}"}}"#));
+    r.clock.advance(Duration::from_secs(30));
+    assert_eq!(status(&r).get("ok"), Some(&PyValue::Bool(true)));
+    // status 觸碰把到期延到 30+60＝90 s；再推進 61 s（91 s）越過（若誤用 0 s，第一次 status 即到期）
+    r.clock.advance(Duration::from_secs(61));
+    let st = status(&r);
+    assert_eq!(s(&st, "error_code"), "INTERACTIVE_EXPIRED", "{}", j(&st));
+}
+
+/// `allow_attached = bool(params.get("allow_attached", False))`：字串 `"false"` 為 truthy，走 ATTACHED 救援分支。
+#[test]
+fn open_allow_attached_string_false_is_truthy() {
+    let r = ServiceRig::with_console_backend("pty");
+    r.mgr.force_session_state("COM0", SessionState::Attached);
+    let plain = r.call("session.interactive_open", r#"{"selector":"COM0","allow_attached":false}"#);
+    assert_eq!(s(&plain, "error_code"), "SESSION_NOT_READY", "{}", j(&plain));
+    assert!(plain.get("error_detail").is_none(), "未帶 allow_attached 不判 bootloader：{}", j(&plain));
+    let truthy = r.call("session.interactive_open", r#"{"selector":"COM0","allow_attached":"false"}"#);
+    assert_eq!(s(&truthy, "error_code"), "SESSION_NOT_READY", "{}", j(&truthy));
+    assert_eq!(s(&truthy, "error_detail"), "NOT_BOOTLOADER", "字串 false 為 truthy：{}", j(&truthy));
+}
