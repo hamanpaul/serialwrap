@@ -268,3 +268,80 @@ fn list_prunes_stale_without_peer() {
         .collect();
     assert_eq!(labels, ["a"], "非 primary、逾 2 s、無 peer 者被 prune（RPC 前 ConsoleScan）");
 }
+
+#[test]
+fn attach_interactive_owner_false_when_fg_busy() {
+    let r = ServiceRig::with_console_backend("pty");
+    // DUT 不回 prompt：命令一直在前景。
+    let sub = r.call("command.submit", r#"{"selector":"COM0","cmd":"sleep 99","timeout_s":30}"#);
+    let cmd_id = s(&sub, "cmd_id");
+    wait_for("前景命令開始執行", || {
+        let g = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(g.get("command"), Some(PyValue::Dict(c)) if s(c, "status") == "running")
+    });
+    let resp = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_eq!(resp.get("interactive_owner"), Some(&PyValue::Bool(false)), "{}", j(&resp));
+    assert_eq!(s(&resp, "interactive_session_id").len(), 32, "lease 仍開");
+}
+
+#[test]
+fn detach_unknown_client_still_closes_own_lease() {
+    let r = ServiceRig::with_console_backend("pty");
+    let a = attach(&r, r#"{"selector":"COM0"}"#);
+    let cid = s(&a, "client_id");
+    let (_, io) = r.console.as_ref().unwrap().created()[0].clone();
+    io.hangup();
+    wait_for("console 斷線後被移除", || {
+        let l = r.call("session.console_list", r#"{"selector":"COM0"}"#);
+        matches!(l.get("consoles"), Some(PyValue::List(v)) if v.is_empty())
+    });
+    let d = r.call("session.console_detach", &format!(r#"{{"selector":"COM0","client_id":"{cid}"}}"#));
+    assert_eq!(s(&d, "error_code"), "CONSOLE_NOT_FOUND");
+    let st = r.session("COM0").unwrap();
+    assert_eq!(st.get("interactive_session_id"), Some(&PyValue::Null), "ERR-7.5-b：仍關閉自己的 human lease");
+}
+
+#[test]
+fn status_screen_chars_coerced_and_negative() {
+    let r = ServiceRig::with_console_backend("pty");
+    let a = attach(&r, r#"{"selector":"COM0"}"#);
+    let iid = s(&a, "interactive_session_id");
+    r.device(REAL_A).push_rx(b"0123456789abcdefghij");
+    wait_for("RX 進視窗", || {
+        s(&r.call("session.interactive_status", &format!(r#"{{"interactive_id":"{iid}","screen_chars":"10"}}"#)), "screen")
+            .ends_with("abcdefghij")
+    });
+    let st = r.call("session.interactive_status", &format!(r#"{{"interactive_id":"{iid}","screen_chars":"10"}}"#));
+    assert_eq!(s(&st, "screen"), "abcdefghij", "screen 最多 10 字元");
+    let all = r.call("session.interactive_status", &format!(r#"{{"interactive_id":"{iid}","screen_chars":100000}}"#));
+    let neg = r.call("session.interactive_status", &format!(r#"{{"interactive_id":"{iid}","screen_chars":-3}}"#));
+    let full = s(&all, "screen");
+    let expect: String = full.chars().skip(3).collect();
+    assert_eq!(s(&neg, "screen"), expect, "負值＝去掉開頭 3 字元（text[3:]，H-08）");
+}
+
+#[test]
+fn status_not_in_retry_whitelist() {
+    use sw_proto::rpc_types::Method;
+    assert!(!Method::parse("session.interactive_status").is_retryable_readonly());
+    assert!(Method::parse("session.console_list").is_retryable_readonly());
+}
+
+#[test]
+fn send_routes_by_lease_index() {
+    let r = ServiceRig::two_shells();
+    let o0 = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent:a"}"#);
+    let o1 = r.call("session.interactive_open", r#"{"selector":"COM1","owner":"agent:b"}"#);
+    let id1 = s(&o1, "interactive_id");
+    assert!(!s(&o0, "interactive_id").is_empty() && !id1.is_empty(), "{} {}", j(&o0), j(&o1));
+    let _ = r.device(REAL_A).take_tx();
+    let _ = r.device(REAL_B).take_tx();
+    let resp = r.call("session.interactive_send", &format!(r#"{{"interactive_id":"{id1}","data":"zz"}}"#));
+    assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&resp));
+    let mut b = Vec::new();
+    wait_for("COM1 收到 zz", || {
+        b.extend(r.device(REAL_B).take_tx());
+        b.windows(2).any(|w| w == b"zz")
+    });
+    assert!(!r.device(REAL_A).take_tx().windows(2).any(|w| w == b"zz"), "COM0 不得收到");
+}
