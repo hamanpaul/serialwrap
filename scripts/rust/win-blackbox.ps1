@@ -333,13 +333,27 @@ import sys
 from uart_stdio_bridge.identity import tool_tree_sha256
 from uart_stdio_bridge.selftest.runner import is_qualified, load_approved_revision
 report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+approved = load_approved_revision()
+current_tree = tool_tree_sha256()
 qualified = is_qualified(
     report,
     endpoint="win-serial",
-    tool_tree_sha256=tool_tree_sha256(),
+    tool_tree_sha256=current_tree,
     platform_os=platform.system(),
-    approved=load_approved_revision(),
+    approved=approved,
 )
+# 只輸出診斷，不參與判定：讓 selftest-result.json 能區分「raw selftest 失敗」與「核准 tree 不符」。
+report_tree = (report.get("tool") or {}).get("tree_sha256") if isinstance(report.get("tool"), dict) else None
+print(json.dumps({
+    "qualified": qualified,
+    "raw_verdict": report.get("verdict"),
+    "raw_complete": report.get("complete"),
+    "report_tree_sha256": report_tree,
+    "current_tree_sha256": current_tree,
+    "approved_tree_sha256": approved.get("tree_sha256"),
+    "tree_approved": report_tree == approved.get("tree_sha256") == current_tree,
+    "test_overrides": report.get("test_overrides"),
+}, ensure_ascii=False, sort_keys=True))
 raise SystemExit(0 if qualified else 1)
 '@
     [System.IO.File]::WriteAllText($verifyScript, $verifyCode, [System.Text.UTF8Encoding]::new($false))
@@ -446,7 +460,7 @@ raise SystemExit(0 if qualified else 1)
     # raw selftest 成功即可執行診斷；qualification（含核准 tree）仍由 status 單獨決定。
     $diagnosticReady = ($exitStatusKnown -and $selftestExit -eq 0 -and $report -and $report.verdict -eq 'PASS' -and $report.complete -eq $true)
     $status = if (-not $ok) { if ($report) { 'FAIL' } else { 'EVIDENCE-INSUFFICIENT' } } elseif ($copyOk) { 'PASS' } else { 'EVIDENCE-INSUFFICIENT' }
-    $reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $exitStatusKnown) { 'S0 selftest 行程 ExitCode 不可得（null），視為失敗' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } elseif (-not $copyOk) { 'S0 selftest 報告已產生，但回寫 OutDir 證據不完整：' + ($copyErrors -join '；') } else { $null }
+    $reason = if ($timedOut) { 'S0 selftest 逾時，沒有完成報告；保留部分工作證據並停止子行程樹' } elseif (-not $exitStatusKnown) { 'S0 selftest 行程 ExitCode 不可得（null），視為失敗' } elseif (-not $report) { 'S0 selftest 未產生完成報告' } elseif ($selftestExit -ne 0 -or $report.verdict -ne 'PASS') { 'S0 selftest raw 結果失敗（exit=' + $selftestExit + '、verdict=' + $report.verdict + '）' } elseif ($qualifiedExit -ne 0) { 'S0 selftest 資格檢查未通過（qualification_exit=' + $qualifiedExit + '）；raw verdict 與核准 tree 比對見 qualification_output' } elseif (-not $copyOk) { 'S0 selftest 報告已產生，但回寫 OutDir 證據不完整：' + ($copyErrors -join '；') } else { $null }
     return [ordered]@{
         status = $status
         diagnostic_ready = $diagnosticReady

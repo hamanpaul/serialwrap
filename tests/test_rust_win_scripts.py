@@ -713,3 +713,18 @@ def test_windows_selftest_writeback_retries_and_compares_both_logs():
     assert "(Get-Sha256 $log) -ne (Get-Sha256 $logCopy)" in block
     assert "if ($copyErrors.Count -eq 0) { break }" in block
 
+
+def test_windows_selftest_qualification_failure_records_reason():
+    """D：status FAIL 若只因核准 tree 不符，selftest-result.json 必須寫明原因並保留 tree 比對診斷。"""
+    ps1 = WIN_BLACKBOX_PS1.read_text(encoding="utf-8-sig")
+    block = ps1.split("function Invoke-BridgeSelftest", 1)[1].split("\nfunction ", 1)[0]
+    # 診斷只輸出、不參與判定：退出碼仍只由 is_qualified 決定。
+    assert '"approved_tree_sha256": approved.get("tree_sha256")' in block
+    assert '"current_tree_sha256": current_tree' in block
+    assert "raise SystemExit(0 if qualified else 1)" in block
+    reason = block.split("$reason = ", 1)[1].split("\n", 1)[0]
+    assert "elseif ($qualifiedExit -ne 0)" in reason
+    assert reason.index("$selftestExit -ne 0 -or $report.verdict -ne 'PASS'") < reason.index("$qualifiedExit -ne 0")
+    assert reason.rstrip().endswith("else { $null }")
+    # status 判定不得因新增原因而改變：qualification 失敗仍為 FAIL。
+    assert "$ok = ($exitStatusKnown -and $selftestExit -eq 0 -and $qualifiedExit -eq 0 -and $report -and $report.verdict -eq 'PASS')" in block
