@@ -1,7 +1,8 @@
 //! P6 Slice 2.2：ConsoleHub 測試 harness（07 Task 1 簽章；本體由 Task 9 補齊）。
 //!
 //! 以 `FakeConsoleFactory` 驅動真的 hub thread；hub 的 control／data lane 經容量 1 的 channel 交給 pump thread
-//! 收集，`block_mailbox(true)` 時 pump 停止收取，使 hub 的 `try_send` 一律 Full（D-17(1)）。
+//! 收集。`block_mailbox(true)` 等 pump 確認已離開 `recv`，再以佔位事件填滿 data channel，之後 data lane 的
+//! `try_send` 一律 Full（D-17(1)；不會有 channel 緩衝或在途 `recv` 多收的那 1～2 筆）。佔位事件不計入 `data_events`。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,10 @@ pub struct HubHarness {
     control: Arc<Mutex<Vec<ControlEvent>>>,
     data: Arc<Mutex<Vec<DataEvent>>>,
     blocked: Arc<AtomicBool>,
+    /// data pump 已觀察到 blocked 並停在 `recv` 之外。
+    paused: Arc<AtomicBool>,
+    /// block 時填滿 data channel 的入口（佔位事件）。
+    data_fill: crossbeam_channel::Sender<DataEvent>,
     pumps_stop: Arc<AtomicBool>,
     tap: HubTap,
     reader_warnings: Arc<Mutex<Vec<String>>>,
@@ -39,18 +44,24 @@ impl Drop for HubHarness {
     }
 }
 
+/// `block_mailbox` 佔位事件的 client id（不會與 12-hex client id 衝突）。
+const FILL_CID: &str = "__mailbox_fill__";
+
 fn pump<T: Send + 'static>(
     rx: crossbeam_channel::Receiver<T>,
     sink: Arc<Mutex<Vec<T>>>,
     blocked: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         while !stop.load(Ordering::Acquire) {
             if blocked.load(Ordering::Acquire) {
+                paused.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
+            paused.store(false, Ordering::Release);
             if let Ok(ev) = rx.recv_timeout(Duration::from_millis(2)) {
                 sink.lock().unwrap().push(ev);
             }
@@ -68,17 +79,20 @@ impl HubHarness {
             .build();
         let (ctl_tx, ctl_rx) = bounded::<ControlEvent>(1);
         let (data_tx, data_rx) = bounded::<DataEvent>(1);
+        let data_fill = data_tx.clone();
         let control = Arc::new(Mutex::new(Vec::new()));
         let data = Arc::new(Mutex::new(Vec::new()));
         let blocked = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let pumps_stop = Arc::new(AtomicBool::new(false));
         pump(
             ctl_rx,
             control.clone(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             pumps_stop.clone(),
         );
-        pump(data_rx, data.clone(), blocked.clone(), pumps_stop.clone());
+        pump(data_rx, data.clone(), blocked.clone(), paused.clone(), pumps_stop.clone());
         let start = clock.mono_ns();
         let hub = spawn_hub(
             com.to_string(),
@@ -96,6 +110,8 @@ impl HubHarness {
             control,
             data,
             blocked,
+            paused,
+            data_fill,
             pumps_stop,
             tap,
             reader_warnings: Arc::new(Mutex::new(Vec::new())),
@@ -173,7 +189,13 @@ impl HubHarness {
             .collect()
     }
     pub fn data_events(&self) -> Vec<DataEvent> {
-        self.data.lock().unwrap().iter().map(clone_data).collect()
+        self.data
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| !matches!(e, DataEvent::ConsoleDisconnected { client_id, .. } if client_id == FILL_CID))
+            .map(clone_data)
+            .collect()
     }
     pub fn status(&self) -> &HubStatus {
         &self.hub.status
@@ -190,6 +212,18 @@ impl HubHarness {
     }
     pub fn block_mailbox(&self, on: bool) {
         self.blocked.store(on, Ordering::Release);
+        if on {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.paused.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "data pump 未暫停");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // channel 若尚有空位，以佔位事件填滿（已滿則代表 block 前已送入一筆，照常計入）。
+            let _ = self.data_fill.try_send(DataEvent::ConsoleDisconnected {
+                client_id: FILL_CID.into(),
+                client_lifetime: 0,
+            });
+        }
     }
 
     // ---- P6 Task 9 追加（Task 1 簽章之外） ----

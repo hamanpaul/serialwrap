@@ -1005,7 +1005,7 @@ fn reader_hub_full_does_not_block() {
     let t = Instant::now();
     port.dev.push_rx(b"b");
     let ev = data_rx.recv_timeout(Duration::from_secs(1)).expect("第二個 chunk 仍進 data lane");
-    assert!(t.elapsed() < Duration::from_millis(50), "hub 滿時 reader 不阻塞：{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_millis(10), "hub 滿時 reader 不阻塞（10 ms 內送進 data lane）：{:?}", t.elapsed());
     assert!(matches!(ev, DataEvent::UartRxChunk { ref bytes, .. } if bytes == b"b"));
     assert_eq!(status.rx_dropped_chunks.load(Ordering::Relaxed), 1);
     let _ = stop_and_join(&stop, &port.waker, worker);

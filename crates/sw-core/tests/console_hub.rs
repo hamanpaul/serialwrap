@@ -99,8 +99,8 @@ fn full_mailbox_pauses_reading_without_blocking_hub() {
     assert!(c.closed());
     t.block_mailbox(false);
     t.settle();
-    // pending 上限 64（CONSOLE_HUB_PENDING_EVENTS）＋harness 容量 1 的 channel＋pump 設 block 前已在 recv 的 1 筆
-    assert!(t.data_events().len() <= 64 + 2, "pending 有界：{}", t.data_events().len());
+    // pending 上限 64（CONSOLE_HUB_PENDING_EVENTS）；harness 的 data lane 為 rendezvous，block 期間一律 Full。
+    assert!(t.data_events().len() <= 64, "pending 有界：{}", t.data_events().len());
     assert!(t.warnings().iter().any(|w| w.contains("session mailbox 已滿")));
 }
 
@@ -265,12 +265,19 @@ fn consoles_survive_conn_epoch_change() {
     let t = HubHarness::pty("COM0");
     let c1 = t.adopt_pty_with(FakeIo::unbounded());
     t.settle();
-    // 06 的 epoch 變更只換 reader（hub 不隨 IoWorker 重建）；新 reader 的 RX 仍 fan-out 到 c1
+    // 06 的 epoch 變更只換 reader（hub 不隨 IoWorker 重建）：舊 reader 的 tap 丟棄、新 reader 取新的 tap。
     t.reader_push(b"old");
-    t.reader_push(b"new");
+    t.settle();
+    let new_reader_tap = t.hub.tap();
+    assert!(new_reader_tap.push(b"new", &|_line: &str| {}));
     t.settle();
     assert!(!c1.closed());
     assert_eq!(c1.written(), b"oldnew".to_vec());
+    assert!(
+        t.data_events().iter().all(|e| !matches!(e, DataEvent::ConsoleDisconnected { .. })),
+        "epoch 變更不產生 console 斷線"
+    );
+    // 端到端（真 epoch／IoWorker 重建、slave_path 不變）見 sw-daemon rpc_console::consoles_survive_bridge_rebuild。
 }
 
 #[test]
@@ -444,4 +451,54 @@ fn console_rx_handler_panic_isolated() {
     t.settle();
     assert!(t.warnings().iter().any(|w| w.contains("console RX handler 例外")));
     assert!(input_events(&t).iter().any(|(_, b)| b == b"ok"));
+}
+
+// ---------------------------------------------------------------------------
+// p6-cloud 審查回歸（1f1fa67..4f710c3）
+// ---------------------------------------------------------------------------
+
+fn fill_pending(t: &HubHarness) -> sw_pal::fakes::console::FakeConsoleRef {
+    t.hub.cmd.try_send(HubCmd::StartListener).unwrap();
+    t.settle();
+    let c = t.fake.connect();
+    t.settle();
+    t.block_mailbox(true);
+    for _ in 0..200 {
+        c.push_input(b"k");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while t.status().pending.load(Ordering::Acquire) < sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64 {
+        assert!(Instant::now() < deadline, "pending 未滿");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    c
+}
+
+/// R2-13（4f710c3）：pending 滿時暫停讀取不得讓 level-triggered poll 空轉（D-17(1)：10 ms 逾時重試）。
+#[test]
+fn full_pending_does_not_spin() {
+    let t = HubHarness::tcp("COM0");
+    let c = fill_pending(&t);
+    c.push_input(b"more"); // fd 仍可讀
+    let before = t.status().loops.load(Ordering::Acquire);
+    std::thread::sleep(Duration::from_millis(300));
+    let spins = t.status().loops.load(Ordering::Acquire) - before;
+    assert!(spins <= 60, "300 ms 內 hub 迴圈 {spins} 輪（應以 ~10 ms 逾時重試，非空轉）");
+    t.block_mailbox(false);
+}
+
+/// R2-14（4f710c3）：mailbox 長時間塞住時，週期掃描不得讓 pending 超過 64（D-18）。
+#[test]
+fn scan_does_not_grow_pending_beyond_cap() {
+    let t = HubHarness::tcp("COM0");
+    let _c = fill_pending(&t);
+    for _ in 0..10 {
+        t.clock.advance(Duration::from_secs(3)); // 每次推進觸發一次 peer scan
+        t.hub.waker.wake();
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let pending = t.status().pending.load(Ordering::Acquire);
+    assert!(pending <= sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64, "pending={pending}");
+    t.block_mailbox(false);
 }

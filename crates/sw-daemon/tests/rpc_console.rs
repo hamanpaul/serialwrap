@@ -361,3 +361,39 @@ fn send_routes_by_lease_index() {
     });
     assert!(!r.device(REAL_A).take_tx().windows(2).any(|w| w == b"zz"), "COM0 不得收到");
 }
+
+/// R2-9（17270a4）：bridge 重建（新 epoch、新 IoWorker）後 console 保留、vtty 不變，新 reader 的 RX 仍到該 console。
+#[test]
+fn consoles_survive_bridge_rebuild() {
+    let r = ServiceRig::with_console_backend("pty");
+    let a = attach(&r, r#"{"selector":"COM0","label":"h1"}"#);
+    let cid = s(&a, "client_id");
+    let vtty = s(&a, "vtty");
+    let gen0 = r.session("COM0").unwrap().get("bridge_generation").cloned();
+    let c = r.call("session.clear", r#"{"selector":"COM0"}"#);
+    assert_eq!(c.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&c));
+    // 重新 attach 的等待依 FakeClock 推進；新 epoch 的 bridge 掛上即可（clear 後 READY／ATTACHED 皆屬 06 行為）。
+    wait_for("bridge 以新 epoch 重建", || {
+        r.clock.advance(Duration::from_millis(250));
+        r.session("COM0").is_some_and(|st| {
+            st.get("bridge_generation").cloned() != gen0
+                && matches!(s(&st, "state").as_str(), "READY" | "ATTACHED")
+        })
+    });
+    let l = r.call("session.console_list", r#"{"selector":"COM0"}"#);
+    let Some(PyValue::List(rows)) = l.get("consoles") else { panic!("consoles：{}", j(&l)) };
+    let row = rows
+        .iter()
+        .find_map(|v| match v {
+            PyValue::Dict(d) if s(d, "client_id") == cid => Some(d.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("h1 仍在：{}", j(&l)));
+    assert_eq!(s(&row, "vtty"), vtty, "slave_path 不變");
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    assert!(!io.closed(), "未關閉");
+    r.device(REAL_A).push_rx(b"after-rebuild");
+    wait_for("新 reader 的 RX 寫到 h1", || {
+        String::from_utf8_lossy(&io.written()).contains("after-rebuild")
+    });
+}
