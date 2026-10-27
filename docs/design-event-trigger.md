@@ -164,7 +164,7 @@ Bridge._handle_serial_rx ──► WAL.append(RX)               (現有，零改
 ### Counter 寫入
 
 - 每次 fire → 更新 `fire_count`、`last_fire_ts`；達 `max_fires` 設 `exhausted: true`。
-- 寫法：write tmp file → `os.rename` 原子覆蓋；確保 daemon crash 不留半寫狀態。
+- 寫法：write tmp file → `os.replace` 原子覆蓋（DF-18：Windows 目標已存在時 `os.rename` 會失敗）；確保 daemon crash 不留半寫狀態。
 - handler 失敗（exit != 0、timeout、spawn 錯）**仍然計入** fire_count，避免重試風暴。
 
 ### Counter 清除（對應前述 D 結論）
