@@ -1013,11 +1013,10 @@ impl SerialReader for PosixSerialReader {
                 return Ok(ReadOutcome::TimedOut);
             }
             if rc < 0 {
-                let code = errno();
-                if code == libc::EINTR {
-                    continue;
+                match poll_failure(errno()) {
+                    None => continue,
+                    Some(error) => return Err(error),
                 }
-                return Err(ReadError::Wait(PalError::from_errno(code)));
             }
             if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 drain_fd(self.wake_fd, self.wake_eventfd);
@@ -1169,6 +1168,16 @@ fn remaining_timeout_ms(start: Instant, timeout: Option<Duration>) -> Option<i32
     let millis = remaining.as_millis();
     let rounded = millis + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
     Some(rounded.clamp(1, i32::MAX as u128) as i32)
+}
+
+/// `poll` 回 `-1` 的分類（#59；Python `uart_io.py` `select` 失敗 → `SELECT:<errno>`）：`EINTR` 重試（`None`），
+/// 其餘一律是**等待**失敗 `ReadError::Wait`（reader 回報 `SELECT:<errno>`），不得與 `read` 失敗
+/// （`SERIAL_READ:<errno>`）混用（審查 F08）。
+fn poll_failure(code: i32) -> Option<ReadError> {
+    if code == libc::EINTR {
+        return None;
+    }
+    Some(ReadError::Wait(PalError::from_errno(code)))
 }
 
 fn classify_read_result(
@@ -1418,6 +1427,18 @@ mod tests {
         match reader.read(&mut [0u8; 8], Some(Duration::from_millis(100))) {
             Err(ReadError::Wait(error)) => assert_eq!(error.os_code, Some(libc::EBADF)),
             other => panic!("poll(POLLNVAL) 應回 ReadError::Wait(EBADF)，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_rc_negative_is_wait_error_not_read_error() {
+        // 審查 F08：`poll` 失敗臂（rc<0、非 EINTR）必須是 Wait（→ `SELECT:<errno>`）；EINTR 重試。
+        assert!(poll_failure(libc::EINTR).is_none());
+        for code in [libc::EINVAL, libc::ENOMEM, libc::EFAULT] {
+            match poll_failure(code) {
+                Some(ReadError::Wait(error)) => assert_eq!(error.os_code, Some(code)),
+                other => panic!("poll 失敗 errno={code} 應為 ReadError::Wait，得到 {other:?}"),
+            }
         }
     }
 

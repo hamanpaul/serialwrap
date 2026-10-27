@@ -40,10 +40,15 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// acceptor 每次 accept 的有界等待。
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
+/// stop 後「正在寫出的回應」的總期限（停止時刻起算；計畫 Task 17 Produces ③）。平時寫入不設期限
+/// （Python `writer.drain()` 無逾時；審查 F06）。PAL 只設短輪詢的 send 逾時，讓寫迴圈能定期檢查停止旗標。
+pub const STOP_WRITE_BUDGET: Duration = Duration::from_secs(2);
+
 /// 連線停止旗標與「本連線是否正在 handler 內」（stop 時的分級關閉依據）。
 pub struct ConnStop {
     stopping: AtomicBool,
     in_handler: AtomicBool,
+    stopped_at: Mutex<Option<Instant>>,
 }
 
 impl ConnStop {
@@ -52,12 +57,29 @@ impl ConnStop {
         ConnStop {
             stopping: AtomicBool::new(false),
             in_handler: AtomicBool::new(false),
+            stopped_at: Mutex::new(None),
         }
     }
 
-    /// 要求本連線結束：閒置／半行時讀迴圈醒來即結束；handler 內的請求寫完回應後結束。
+    /// 要求本連線結束：閒置／半行時讀迴圈醒來即結束；handler 內的請求寫完回應後結束（寫出總期限
+    /// [`STOP_WRITE_BUDGET`]，自第一次要求停止起算）。
     pub fn request(&self) {
+        let mut at = self.stopped_at.lock().unwrap_or_else(|e| e.into_inner());
+        if at.is_none() {
+            *at = Some(Instant::now());
+        }
         self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// 停止後寫出回應的期限；未要求停止時為 `None`（不設期限）。
+    fn write_deadline(&self) -> Option<Instant> {
+        if !self.is_stopping() {
+            return None;
+        }
+        self.stopped_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|at| at + STOP_WRITE_BUDGET)
     }
 
     /// 是否已要求停止。
@@ -108,8 +130,23 @@ fn wire(d: &PyDict) -> Vec<u8> {
     out
 }
 
-fn write_line(stream: &mut dyn RpcServerStream, bytes: &[u8]) -> bool {
-    stream.write_all(bytes).is_ok() && stream.flush().is_ok()
+/// 寫出一整行。PAL 的短輪詢 send 逾時（`WouldBlock`／`TimedOut`）不是失敗：未要求停止時持續重試
+/// （Python `drain()` 無逾時），要求停止後以「停止時刻 + 2 s」為總期限，到期即放棄並關閉連線。
+fn write_line(stream: &mut dyn RpcServerStream, bytes: &[u8], stop: &ConnStop) -> bool {
+    let mut off = 0;
+    while off < bytes.len() {
+        match stream.write(&bytes[off..]) {
+            Ok(0) => return false,
+            Ok(n) => off += n,
+            Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if stop.write_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    stream.flush().is_ok()
 }
 
 /// panic payload → Python `str(exc)` 對應字串。
@@ -135,6 +172,7 @@ fn handle_line(
     raw: &[u8],
     stream: &mut dyn RpcServerStream,
     handler: &dyn RpcHandler,
+    stop: &ConnStop,
 ) -> LineOutcome {
     let line = trim_py_bytes(raw);
     if line.is_empty() {
@@ -144,7 +182,7 @@ fn handle_line(
     let obj = match pyjson::loads(&text) {
         Ok(v) => v,
         Err(JsonError::Decode(_)) => {
-            return if write_line(stream, &early_error("INVALID_JSON")) {
+            return if write_line(stream, &early_error("INVALID_JSON"), stop) {
                 LineOutcome::Continue
             } else {
                 LineOutcome::Close
@@ -154,7 +192,7 @@ fn handle_line(
         Err(JsonError::Recursion) => return LineOutcome::Close,
     };
     let PyValue::Dict(obj) = obj else {
-        return if write_line(stream, &early_error("INVALID_REQUEST")) {
+        return if write_line(stream, &early_error("INVALID_REQUEST"), stop) {
             LineOutcome::Continue
         } else {
             LineOutcome::Close
@@ -168,7 +206,7 @@ fn handle_line(
         _ => {
             resp.insert("ok", PyValue::Bool(false));
             resp.insert("error_code", PyValue::from("INVALID_METHOD"));
-            return if write_line(stream, &wire(&resp)) {
+            return if write_line(stream, &wire(&resp), stop) {
                 LineOutcome::Continue
             } else {
                 LineOutcome::Close
@@ -179,7 +217,7 @@ fn handle_line(
         // Python：handler 回 `{"ok":True,"stopping":True,"_rpc_after_write":stop}`；寫回應後於 finally 呼叫 stop。
         resp.insert("ok", PyValue::Bool(true));
         resp.insert("stopping", PyValue::Bool(true));
-        let written = write_line(stream, &wire(&resp));
+        let written = write_line(stream, &wire(&resp), stop);
         handler.request_stop();
         return if written {
             LineOutcome::Continue
@@ -197,7 +235,7 @@ fn handle_line(
         Err(payload) => exception_result(panic_message(payload.as_ref())),
     };
     resp.update(&result);
-    if write_line(stream, &wire(&resp)) {
+    if write_line(stream, &wire(&resp), stop) {
         LineOutcome::Continue
     } else {
         LineOutcome::Close
@@ -219,7 +257,7 @@ pub fn serve_connection(mut stream: Box<dyn RpcServerStream>, handler: &dyn RpcH
             }
             let line: Vec<u8> = pending.drain(..=pos).collect();
             stop.in_handler.store(true, Ordering::SeqCst);
-            let outcome = handle_line(&line[..pos], stream.as_mut(), handler);
+            let outcome = handle_line(&line[..pos], stream.as_mut(), handler, stop);
             stop.in_handler.store(false, Ordering::SeqCst);
             if matches!(outcome, LineOutcome::Close) {
                 return;
@@ -238,7 +276,7 @@ pub fn serve_connection(mut stream: Box<dyn RpcServerStream>, handler: &dyn RpcH
                 if !pending.is_empty() {
                     let line = std::mem::take(&mut pending);
                     stop.in_handler.store(true, Ordering::SeqCst);
-                    let _ = handle_line(&line, stream.as_mut(), handler);
+                    let _ = handle_line(&line, stream.as_mut(), handler, stop);
                     stop.in_handler.store(false, Ordering::SeqCst);
                 }
                 return;
@@ -348,7 +386,7 @@ impl RpcServer {
     /// 回傳 handler 是否全部收斂（arch §6.2 停止流程 ①～④）。
     ///
     /// ① 停 accept 並 close listener；② 對全部連線設停止旗標（讀逾時 100 ms 讓閒置／半行的讀迴圈醒來即結束）；
-    /// ③ handler 內的連線把該筆回應寫完後結束（寫逾時 2 s 由 PAL 設定，逾時放棄）；④ 在 `budget` 內 join 全部連線 thread。
+    /// ③ handler 內的連線把該筆回應寫完後結束（寫出總期限為停止時刻 + 2 s，逾時放棄；PAL 只設短輪詢 send 逾時）；④ 在 `budget` 內 join 全部連線 thread。
     /// 逾 `budget` 仍未結束的 thread 不再等待（detach），回傳 `false`。
     pub fn stop(mut self, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;

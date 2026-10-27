@@ -4197,6 +4197,8 @@ fn over_limit_line_closes_without_reply() {
 | `pipelined_stop_after_long_call`（Review Focus 5） | 同連線送 `slow`（handler sleep 500 ms）、`daemon.stop` → 回應順序 `slow` 先、`stop` 後；`request_stop` 只在 `slow` 回應寫出後才被呼叫 |
 | `idle_connection_does_not_block_stop`（Review Focus 5） | 一條已連線但從未送資料的 client、一條送了半行（無 `\n`）的 client → `RpcServer::stop(5s)` 於 500 ms 內返回 `true` |
 | `half_line_and_unread_response_do_not_block_stop` | client 送 100 個請求但從不讀回應（socket buffer 塞滿）→ `stop(5s)` 於 3 s 內返回（寫逾時放棄）；handler 已完成的呼叫不被取消 |
+| `slow_reader_large_response_is_not_truncated`（審查 F06 追加） | 平時寫入無期限（Python `drain()` 無逾時）：client 超過 2 s 不讀，回應仍完整寫出、同連線後續請求照常處理 |
+| `stop_bounds_total_write_time_with_trickle_reader`（審查 F06 追加） | stop 後寫出總期限為「停止時刻 + 2 s」，client 持續少量讀取也不重設；`stop(5s)` 於 3.5 s 內收斂（PAL 只設 100 ms 短輪詢 send 逾時） |
 | `stop_waits_for_in_handler_connection` | handler 進行中（sleep 500 ms）時 `stop` → 該回應仍寫出且 `stop` 在其後返回 |
 | `handler_panic_is_exception` | handler `panic!("x")` → `{"id":…,"ok":false,"error_code":"EXCEPTION","message":"x"}`，連線續用 |
 | `deep_json_closes_connection` | 深度超過 `JSON_MAX_DEPTH` 的請求 → 無回應並關閉（arch §6.2 step 3） |

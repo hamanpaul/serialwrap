@@ -24,3 +24,7 @@
 | F05 | Low | fb76460 | `serial_posix.rs:93` 註解被 rustfmt 縮到程式行後 | fixed（本組 commit） |
 | F90 | Low | 0fd8fa9 | 計畫 Task 2 測試表仍寫 `/dev/pts/9`、缺 proc → Unknown | fixed（本組 commit）：測試表改為替身檔與 #64 期望 |
 | F75 | Medium | 8a7986e | `cap_posix_pty__accept_unverified_registers_unknown_holder_device` 未入 L1 鎖 | fixed（本組 commit）：以真實 `cargo_l1_results.py --list-only` 收集 add-only 登記；同時補登先前漏登的 `proc_holders_namespace` 15 案、`serial_posix` 3 案、`wal_writer`／`state_store` 各 1 案 |
+| F06 | High／Medium | 2fcdbbf | 2 s 寫逾時設在每次 send 上：stop 時總寫入時間無上限；平時慢讀 client 的大回應被截斷（Python `drain()` 無逾時） | fixed（本組 commit）：PAL（POSIX）改設 100 ms 短輪詢 send 逾時；framing 自寫寫迴圈，`WouldBlock`／`TimedOut` 不是失敗——未停止時持續重試，`ConnStop::request` 起算總期限 2 s。紅燈先行：`slow_reader_large_response_is_not_truncated`（慢讀替身 stream）、`stop_bounds_total_write_time_with_trickle_reader`（真 TCP、48 MiB、client 每 200 ms 讀 16 KiB）在舊實作皆 FAILED。Windows 維持 2 s 單次逾時（Winsock 逾時後 socket 狀態未定義）：LOCAL-WINDOWS-TODO |
+| F07 | Medium | 2fcdbbf | `uds_mode_0660_baseline` 非 root 時以主要群組為 chgrp 目標，拿掉 chgrp 仍綠 | fixed（本組 commit）：非 root 改選與主要群組不同的附加群組；皆無 → 以 FAIL 報證據不足 |
+| F08 | Medium | 335665e | POSIX `poll` rc<0 臂未被測試鎖住 | fixed（本組 commit）：抽出 `poll_failure(errno)`（`read` 迴圈唯一呼叫點），新增 `poll_rc_negative_is_wait_error_not_read_error`：EINTR 重試、EINVAL／ENOMEM／EFAULT → `ReadError::Wait`；把該臂改回 `Read` 即紅 |
+| F09 | Medium | 335665e | Windows `WaitForMultipleObjects` 失敗臂只測分類函式 | deferred：LOCAL-WINDOWS-TODO（須在 `#[cfg(windows)] mod windows_native` 以原生 API 失敗經 `WindowsSerialReader::read` 斷言 `ReadError::Wait`＋`SELECT:<errno>`；本機無 Windows，不以模型測試充數） |
