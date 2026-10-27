@@ -25,3 +25,29 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
   `file_eacces_matches_golden`、`unix_fixture_rows_match_python` 兩筆（root 執行使 EACCES 不成立的環境差異）。
 
 每個 commit 群組 push 前的判定：失敗集合不得超出起點（多出者同範圍重跑兩次取證）；比對結果記於各 commit message。
+
+### d5b2dd6 列的完整差異（審查 92e0223_76de0cf 76de0cf-1 補記）
+
+相對 `pytest-fail-92e0223.txt`：**+4／−1**。
+
+- `+ tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent`（ERROR）
+- `+ tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`
+- `+ tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`
+- `+ tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`
+- `− tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`
+
+同範圍連跑兩次（CLAUDE.md 要求「同範圍連跑兩次、失敗集合不同」）：
+
+```
+$ timeout 280 python3.12 -m pytest -q -p no:cacheprovider tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op \
+    tests/test_l15_smoke.py::test_release_inflight_runs_on_python "tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict"
+第 1 次：1 failed, 2 passed（失敗者為 sm04：Python daemon `ATTACH_FAILED:DeviceHeldError`；multiagent 五 agent 案通過）
+第 2 次：1 failed, 2 passed（同上）
+$ timeout 290 python3.12 -m pytest -q -p no:cacheprovider tests/contract_blackbox/slice21/test_f12_diagnostics.py::test_f12_version_reported_consistent \
+    "tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]"
+第 1 次：1 failed, 1 error
+第 2 次：1 failed, 1 passed（失敗集合不同）
+```
+
+multiagent 五 agent 案在重跑中 2/2 通過、全套中失敗一次，前兩筆 slice21 在起點清單內且兩次重跑集合不同；sm04 與 sm01 同為
+`DeviceHeldError` 環境類（c58e8d4 列另以 76de0cf worktree 重現）。d5b2dd6 未改 `sw_core/`。

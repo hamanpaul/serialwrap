@@ -461,3 +461,26 @@ fn stale_login_finished_keeps_pending() {
     assert_eq!(h.core.state(), SessionState::Ready);
     assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
 }
+
+#[test]
+fn reattach_within_quiet_fence_expires_with_window() {
+    // 審查 92e0223_76de0cf bea2d8e-1：重掛後 fence 同步 quiet，須為新 epoch 排到期計時器；Python `_push_probe_gate`
+    // 以 `time.monotonic() < self_test_quiet_until` 判定，到期即放行 self-test／救援鍵。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    detach_and_reattach(&mut h);
+    h.fence.with(|f| assert!(f.quiet_active));
+    // 持續非 banner／非 prompt RX（自動重探被 RX idle 擋住），推進過 quiet 視窗。
+    for _ in 0..200 {
+        h.rx(b"booting...\r\n");
+        h.advance(std::time::Duration::from_secs(1));
+    }
+    assert_eq!(h.public()["boot_quiet_remaining_s"], PyValue::Null);
+    h.fence.with(|f| {
+        assert!(
+            !f.quiet_active,
+            "quiet 到期後 fence 解除（self-test／救援鍵放行）"
+        )
+    });
+}

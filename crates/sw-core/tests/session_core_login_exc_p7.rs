@@ -209,3 +209,28 @@ fn reboot_recovery_quiet_refusal_continues_without_error() {
         "quiet 撤銷 → continue，不記錯"
     );
 }
+
+#[test]
+fn manual_reprobe_exception_only_fails_first_waiter_others_reprobe() {
+    // 審查 92e0223_76de0cf bea2d8e-2：併發的第二個 attach 在 Python 取得 probe 鎖後自行重新 probe，不連帶收到例外。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (first, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let (epoch, gen) = start_login(&fx).expect("第一個 attach 起 run");
+    let (second, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    assert!(start_login(&fx).is_none(), "合併到同一 run");
+    let fx = finish(
+        &mut h,
+        epoch,
+        gen,
+        LoginOutcome::Aborted(LoginAbort::TxIncomplete),
+    );
+    assert!(first.try_recv().expect("第一個回覆").is_err());
+    assert!(second.try_recv().is_err(), "第二個尚未回覆");
+    let (_, gen2) = start_login(&fx).expect("第二個以新世代重新 probe");
+    assert!(gen2 > gen);
+    finish(&mut h, epoch, gen2, LoginOutcome::Ready);
+    let resp = second.try_recv().expect("回覆").expect("ok");
+    assert_eq!(resp["ok"], PyValue::Bool(true));
+    assert_eq!(h.public()["state"], PyValue::from("READY"));
+}

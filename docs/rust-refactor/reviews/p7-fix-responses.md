@@ -70,3 +70,17 @@
 | stall L-2 | Low | `canonicalize` 整條失敗即退回原路徑，與 `realpath(strict=False)` 不同 | **fixed**：`realpath_lenient` 解析最長存在前綴後接回其餘段；回歸 `usb_topology::busid_resolves_existing_prefix_when_device_link_missing`（修前紅） |
 | stall L-3 | Low | `with_filename` 未跳脫非 printable Unicode | **deferred**：sw-pal 不得依賴 sw-proto（arch §1.3），完整 `str.isprintable` 表需另行移植；檔名含 C1／非 printable 字元為邊角，Task 19 收斂 |
 | stall L-4 | Low | `usb_windows_is_always_none`、`fs_ops_p7::*` 未登記 Windows gate | **deferred（LOCAL-WINDOWS-TODO P7-LW-2，已登記）**：Windows 原生證據到位同 PR add-only 登記 |
+
+## 第 4 輪：p7-cloud/92e0223_76de0cf（Opus）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| bea2d8e-1 | Medium | quiet 跨 detach 保留後，重掛的 fence 設 quiet 卻未為新 epoch 排到期計時器；quiet 到期後 self-test／救援鍵仍被 fence 拒絕 | **fixed**：`adopt_opened_bridge` 同步 fence 後若 quiet 生效，排 `BootQuietExpired{新 epoch}`；回歸 `session_core_quiet_p7::reattach_within_quiet_fence_expires_with_window`（修前紅） |
+| d5b2dd6-1 | Medium | H-1 修法把非現行世代的所有結果覆寫為 probe_refused；quiet arm 後 FSM 回 Ready 時 Python 為 READY（#139） | **fixed（屬實，前輪修法過度）**：刪除覆寫，auto run 只比對 run 自身世代、結果原樣交給 converge（被 fence 撤銷時 FSM 本就回 `Aborted`）；回歸 `quiet_arm_during_auto_reprobe_ready_result_is_ready`、`quiet_arm_during_auto_reprobe_not_ready_keeps_failure_code`（修前皆紅） |
+| d5b2dd6-2 | Low | H-1 測試注入 Cancelled 無法約束覆寫 | **fixed**：同上兩個 Ready／NotReady 變體 |
+| d5b2dd6-3 | Low | L-3 行為無回歸測試 | **fixed**：`reprobe_tick_while_manual_probe_busy_advances_next_reprobe_at`；突變 M9（busy 即早退）→ 紅 |
+| d5b2dd6-4 | Low | 懸空 `device` symlink 未依內容展開 | **fixed**：`realpath_lenient` 改為逐位元組移植 CPython 3.12 `_joinrealpath`（seen 快取、迴圈原樣回傳）；回歸 `usb_topology::busid_follows_dangling_device_symlink`（修前紅，CPython 實測 `…/1-5/1-5:1.0/ttyX`） |
+| bea2d8e-2 | Low | 手動再探例外以 Err 回覆所有合併的 waiters | **fixed**：只回覆第一個，其餘以新世代 `reprobe_existing_bridge` 重派；回歸 `session_core_login_exc_p7::manual_reprobe_exception_only_fails_first_waiter_others_reprobe`（修前紅） |
+| bea2d8e-3 | Low | 測試把型別名凍結為 EXCEPTION message | **fixed**：`login_quiet::disk_full_blocks_login_probe_but_not_agent_cmd` 改只斷言例外穿出並註明已知偏離（Task 7 `LoginReport` 帶出 TxResult 後補 `str(exc)` 全文） |
+| bea2d8e-4 | Low | `s21_core.windows` 加回的兩個舊 nodeid 樹內已不存在 | 已登記 P7-LW-1／P7-BO-1（擁有者核准 `--allow-removal` 後與原生替換同 PR 處理）；無程式變更 |
+| 76de0cf-1 | Low | 證據 README 未交代 +4／−1 與重跑紀錄 | **fixed**：README 補「d5b2dd6 列的完整差異」段（完整 +/−、兩次重跑命令與結果） |

@@ -47,6 +47,26 @@ fn busid_resolves_existing_prefix_when_device_link_missing() {
     assert_eq!(usb.usb_busid("/dev/ttyUSB2").as_deref(), Some("1-3"));
 }
 
+#[cfg(unix)]
+#[test]
+fn busid_follows_dangling_device_symlink() {
+    // 審查 92e0223_76de0cf d5b2dd6-4：`device` 為懸空 symlink 時，CPython `realpath(strict=False)` 仍依連結內容展開
+    // （`…/1-5/1-5:1.0/ttyX`），busid 為 `1-5`。
+    use sw_pal::device_source::usb_posix::SysfsUsbTopology;
+    use sw_pal::traits::UsbTopology;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let class = root.join("class/tty/ttyX");
+    std::fs::create_dir_all(&class).unwrap();
+    std::os::unix::fs::symlink(
+        "../../../devices/usb1/1-5/1-5:1.0/ttyX",
+        class.join("device"),
+    )
+    .unwrap();
+    let usb = SysfsUsbTopology::with_root(root);
+    assert_eq!(usb.usb_busid("/dev/ttyX").as_deref(), Some("1-5"));
+}
+
 #[cfg(windows)]
 #[test]
 fn usb_windows_is_always_none() {

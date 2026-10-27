@@ -1002,9 +1002,11 @@ fn disk_full_blocks_login_probe_but_not_agent_cmd() {
         before,
         "unhealthy WAL 下 probe 不得寫出"
     );
-    assert_eq!(
-        resp.map_err(|e| e.message),
-        Err("WalUnavailableError".to_string())
+    // 已知偏離（Task 7，p7-fix-responses 第 2／4 輪）：Python EXCEPTION 的 message 為 `str(exc)`，Rust 目前回型別名；
+    // 在 `LoginReport` 帶出 TxResult 前只斷言例外穿出，不把型別名凍結為期望值（審查 92e0223_76de0cf bea2d8e-3）。
+    assert!(
+        resp.is_err(),
+        "WalUnavailableError 穿出 → RPC EXCEPTION：{resp:?}"
     );
     assert_eq!(pget(&a.get_state(), "state"), PyValue::from("ATTACHED"));
 

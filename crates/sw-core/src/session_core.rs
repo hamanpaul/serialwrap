@@ -2273,6 +2273,16 @@ impl SessionCore {
             worker,
             real_path,
         }];
+        if quiet_active {
+            // 跨 detach 保留的 quiet：為新 epoch 排到期計時器，到期解除 fence（Python 時間式 gate；審查 92e0223_76de0cf bea2d8e-1）。
+            effects.push(Effect::Schedule {
+                at: self.quiet.boot_quiet_until,
+                ev: TimerEvent::BootQuietExpired {
+                    epoch,
+                    fsm_gen: self.generations.fsm_gen,
+                },
+            });
+        }
 
         if self.is_passthrough() || !self.profile.template.command_capable() {
             self.set_last_error(None, None);
@@ -2446,22 +2456,23 @@ impl SessionCore {
             if let Some(exc) = login_exception_name(&result) {
                 // `_probe_existing_bridge` 的例外穿出 manager：session 不變，attach／recover 的 RPC 回 framing EXCEPTION。
                 // 例外訊息全文（`str(TxIncompleteError)`）待 Task 7 LoginReport 帶出 TxResult。
-                let waiters = self
+                // 只有發起 probe 的第一個呼叫收到例外；併發的後續 attach／recover 在 Python 取得 probe 鎖後自行重新 probe
+                // （審查 92e0223_76de0cf bea2d8e-2）：以新世代重派。
+                let mut waiters = self
                     .login_run
                     .take()
                     .map(|run| run.waiters)
-                    .unwrap_or_default();
-                return waiters
+                    .unwrap_or_default()
+                    .into_iter();
+                let mut effects: Vec<Effect> = waiters
+                    .next()
+                    .map(|(reply, _)| Effect::Reply(reply, Err(PyErr { message: exc })))
                     .into_iter()
-                    .map(|(reply, _)| {
-                        Effect::Reply(
-                            reply,
-                            Err(PyErr {
-                                message: exc.clone(),
-                            }),
-                        )
-                    })
                     .collect();
+                for (reply, kind) in waiters {
+                    effects.extend(self.reprobe_existing_bridge(reply, kind, now));
+                }
+                return effects;
             }
         }
         let result = legacy_login_outcome(result);
@@ -2999,15 +3010,9 @@ impl SessionCore {
         {
             return Vec::new();
         }
-        // 世代已被擋 probe 的 quiet arm 推進：Python 後續 TX 由 `_login_tx_refused` 拒絕 → probe_refused，
         // 結果一律回填（不得丟棄，否則 run／inflight 永久殘留、等待者永不回覆；審查 c11aa89_92e0223 H-1）。
-        let result = if self.login_gen_current(epoch, fsm_gen) {
-            result
-        } else {
-            crate::login_fsm::LoginOutcome::Aborted(crate::login_fsm::LoginAbort::Refused(
-                FenceReject::Quiet,
-            ))
-        };
+        // Python `_probe_existing_bridge` 只依 probe 實際結果收斂、不看 login_gen：probe 期間 banner 才 arm 仍可回 ok → READY
+        // （#139）；後續 TX 被 fence 撤銷時 FSM 本就回 `Aborted(Refused|Cancelled)`（審查 92e0223_76de0cf d5b2dd6-1）。
         let deferred = self
             .login_run
             .take()

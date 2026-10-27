@@ -233,3 +233,65 @@ fn quiet_arm_during_auto_reprobe_settles_and_resumes() {
     let fx = advance_collect(&mut h, 200);
     assert!(start_login(&fx).is_some(), "quiet 到期後恢復自動重探");
 }
+
+#[test]
+fn quiet_arm_during_auto_reprobe_ready_result_is_ready() {
+    // 審查 92e0223_76de0cf d5b2dd6-1：Python `_probe_existing_bridge` 只依 probe 實際結果收斂；probe 期間 banner 才 arm、
+    // FSM 仍回 ok → READY＋confirm_ready（#139）。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let fx = advance_collect(&mut h, 4);
+    let (epoch, gen) = start_login(&fx).expect("自動重探");
+    h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"));
+    assert_eq!(p["last_error"], PyValue::Null);
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(false));
+    assert_eq!(p["reprobe_attempts"], PyValue::from(0));
+}
+
+#[test]
+fn quiet_arm_during_auto_reprobe_not_ready_keeps_failure_code() {
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let fx = advance_collect(&mut h, 4);
+    let (epoch, gen) = start_login(&fx).expect("自動重探");
+    h.rx(b"\r\nU-Boot 2024.04\r\n");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::NotReady("READY_NONCE_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("ATTACHED"));
+    assert_eq!(p["last_error"], PyValue::from("READY_NONCE_TIMEOUT"));
+    assert_eq!(p["reprobe_attempts"], PyValue::from(1));
+}
+
+#[test]
+fn reprobe_tick_while_manual_probe_busy_advances_next_reprobe_at() {
+    // 審查 92e0223_76de0cf d5b2dd6-3（L-3 回歸）：手動 attach 持有 probe 時 `_prepare_reprobe_locked` 照常排程，
+    // worker 取不到 probe 鎖才跳過——`next_reprobe_at` 前移、不起新的 StartLogin。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    assert_eq!(h.public()["next_reprobe_at"], PyValue::Null);
+    let (_reply, fx) = h.rpc_deferred(sw_core::session_core::SessionRequest::SessionAttach);
+    assert!(start_login(&fx).is_some(), "手動再探起 run");
+    let fx = advance_collect(&mut h, 4);
+    assert!(
+        start_login(&fx).is_none(),
+        "probe 被占用：不起新的 StartLogin"
+    );
+    assert!(
+        matches!(h.public()["next_reprobe_at"], PyValue::Float(_)),
+        "prepare 照常排程 next_reprobe_at"
+    );
+}
