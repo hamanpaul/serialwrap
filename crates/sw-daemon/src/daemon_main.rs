@@ -1040,7 +1040,16 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     let mut src = (p.devices)(DeviceSelection {
         by_id_dir: PathBuf::from(&dirs.by_id_dir),
         by_path_dir: PathBuf::from(&dirs.by_path_dir),
-        exclude_coms: cfg.windows_exclude_coms(),
+        exclude_coms: {
+            // D-12：com0com Console-side pair 永不被列舉成受管 UART。
+            let mut coms = cfg.windows_exclude_coms();
+            for port in serial_console_excludes(&cfg, &p.caps, &|m: String| warn(m)) {
+                if !coms.contains(&port) {
+                    coms.push(port);
+                }
+            }
+            coms
+        },
         test_allowlist: allow.enabled.then(|| allow.coms.clone()),
     });
     hooks.trace(Stage::InitialScan);
@@ -1282,6 +1291,24 @@ mod tests {
 
 /// P6 D-12：`windows.serial_console` 的 console／peer 埠（只在 `caps.com0com_console` 時生效）。
 pub fn serial_console_excludes(cfg: &RuntimeConfig, caps: &Capabilities, warn: &dyn Fn(String)) -> Vec<String> {
-    let _ = (cfg, caps, warn);
-    todo!("P6 Task 10")
+    let Some(parsed) = cfg.windows_serial_console() else {
+        return Vec::new();
+    };
+    if !caps.com0com_console {
+        warn("windows.serial_console 在此平台不支援，已忽略".to_string());
+        return Vec::new();
+    }
+    let Ok(map) = parsed else {
+        warn("windows.serial_console 格式不符（須為 <by_id>: {console_port, peer_port} 的 mapping），已忽略".to_string());
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for pair in map.0.values() {
+        for port in [&pair.console_port, &pair.peer_port] {
+            if !out.contains(port) {
+                out.push(port.clone());
+            }
+        }
+    }
+    out
 }

@@ -1010,6 +1010,29 @@ pub struct SerialConsoleMap(pub indexmap::IndexMap<String, SerialConsolePair>);
 impl RuntimeConfig {
     /// P6 D-12：`None`＝無此鍵；`Some(Err(()))`＝形狀不符（呼叫端寫 WARNING 並忽略整個鍵）。
     pub fn windows_serial_console(&self) -> Option<Result<SerialConsoleMap, ()>> {
-        todo!("P6 Task 10")
+        let Some(YValue::Map(windows)) = self.data.get_str("windows") else {
+            return None;
+        };
+        let value = windows.get_str("serial_console")?;
+        let YValue::Map(rows) = value else {
+            return Some(Err(()));
+        };
+        let text = |v: Option<&YValue>| match v {
+            Some(YValue::Str(s)) if !s.is_empty() => Ok(s.clone()),
+            _ => Err(()),
+        };
+        let mut out = indexmap::IndexMap::new();
+        for (key, row) in &rows.0 {
+            let (YValue::Str(by_id), YValue::Map(pair)) = (key, row) else {
+                return Some(Err(()));
+            };
+            let parsed = text(pair.get_str("console_port"))
+                .and_then(|c| text(pair.get_str("peer_port")).map(|p| (c, p)));
+            let Ok((console_port, peer_port)) = parsed else {
+                return Some(Err(()));
+            };
+            out.insert(by_id.clone(), SerialConsolePair { console_port, peer_port });
+        }
+        Some(Ok(SerialConsoleMap(out)))
     }
 }
