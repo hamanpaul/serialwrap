@@ -2916,6 +2916,11 @@ impl SessionCore {
                     Vec::new()
                 };
                 effects.extend(open_effects);
+                if kind == StopKind::Clear && self.state == SessionState::Attaching {
+                    // Python `clear_session`：drain 收尾設 ATTACHING＋CLEARED 後立即 `_spawn_attach`，
+                    // `_attach_by_id` 開埠前 `last_error = None`；ATTACHING 期間不帶 CLEARED（P5-T20 黑箱）。
+                    self.set_last_error(None, None);
+                }
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }

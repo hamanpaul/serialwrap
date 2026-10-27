@@ -14,8 +14,18 @@ pytestmark = pytest.mark.cap_posix_pty
 SCOPE = Path(__file__).resolve().parents[3] / "tests" / "acceptance" / "slice21_scope.yaml"
 
 
+def _ab_label() -> str:
+    """A/B label：root conftest 會 pop `SERIALWRAP_AB_LABEL`，故以 pop 前擷取的 `tests/ab_env.AB_ENV` 為準
+    （P5-T20 補強：原本只讀 os.environ，pytest 下恆為空而使 Rust 輪也 skip）；os.environ 仍作後備。"""
+    try:
+        from ab_env import AB_ENV
+    except ImportError:
+        AB_ENV = {}
+    return AB_ENV.get("SERIALWRAP_AB_LABEL") or os.environ.get("SERIALWRAP_AB_LABEL", "")
+
+
 @pytest.mark.skipif(
-    not os.environ.get("SERIALWRAP_AB_LABEL", "").startswith("rust-s21"),
+    not _ab_label().startswith("rust-s21"),
     reason="範圍清單僅於 Rust Slice 2.1 輪執行（SERIALWRAP_AB_LABEL=rust-s21*）",
 )
 def test_deferred_methods(shell_daemon):

@@ -1,0 +1,54 @@
+# A/B 黑箱比對的具名正規化映射（P5-T20 Step 3；規格 §15.6.3、arch §9.3）。
+#
+# 用途：Slice 2.1 黑箱案例（tests/contract_blackbox/slice21/）同一案例分別對 Python 基線與
+# Rust daemon 執行後，比對 CLI stdout JSON／WAL／state.json 時，下列「具名欄位」的值屬於
+# 每次執行必然不同的動態資料，只能以本檔列出的映射替換成占位符後再比對。
+#
+# 約束：
+# - 只列具名欄位（JSON 物件鍵名，`*_at` 為鍵名後綴），不提供 regex；不得以寬鬆比對抹除真正差異。
+# - 比對前須先驗證原始 bytes 完整性（WAL 每行 CRC／len、JSON 可解析），再套用本檔映射。
+# - 靜態格式 golden（contracts/golden/rpc/*.json、WAL 序列化 golden）不經本檔，直接位元組比對。
+# - P2 bridge 比較器的 APPROVED_RULES（tools/uart_stdio_bridge/.../compare/rules.py）不受本檔影響。
+# - 本檔屬測試資產（§10.4）：任何變更須非實作者獨立審閱，變更即提升 approved_revision；
+#   P9-T7B（10-stage3-canary.md Task 7B）只追加鍵，不改既有映射。
+approved_revision: 1
+reviewed_by: []            # 待獨立審閱者填入（審閱完成前本檔視為提案）
+mappings:
+  - field: wall_ts
+    kind: key
+    placeholder: "<WALL_TS>"
+    reason: WAL 與事件紀錄的牆鐘時間戳，每次執行不同
+  - field: "*_at"
+    kind: key_suffix
+    placeholder: "<TS>"
+    reason: created_at／started_at／done_at／last_rx_at 等時間欄位
+  - field: mono_ts_ns
+    kind: key
+    placeholder: "<MONO_TS_NS>"
+    reason: 單調時鐘奈秒值，與開機時間相關
+  - field: cmd_id
+    kind: key
+    placeholder: "<CMD_ID:n>"
+    consistent: true
+    reason: daemon 產生的命令 ID；同一次執行內依首次出現順序編號，保留關聯一致性
+  - field: interactive_id
+    kind: key
+    placeholder: "<INTERACTIVE_ID:n>"
+    consistent: true
+    reason: interactive lease ID；同一次執行內依首次出現順序編號
+  - field: nonce
+    kind: key
+    placeholder: "<NONCE>"
+    reason: ready_probe nonce（login_fsm）
+  - field: vtty
+    kind: key
+    placeholder: "<PTY_PATH>"
+    reason: human console PTY 路徑（/dev/pts/N）
+  - field: pty_path
+    kind: key
+    placeholder: "<PTY_PATH>"
+    reason: PTY 路徑欄位
+  - field: pid
+    kind: key
+    placeholder: "<PID>"
+    reason: 行程 ID

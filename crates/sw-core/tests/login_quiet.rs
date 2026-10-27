@@ -1220,6 +1220,57 @@ fn report_of(outcome: TxOutcome, reject: Option<sw_core::tx_writer::FenceReject>
 }
 
 #[test]
+fn attach_settles_attached_after_quiet_revokes_probe() {
+    // P5-T20 黑箱揭露（審查 F15 同一缺陷）：開機 banner 在 attach probe 進行中抵達 → quiet arm 遞增 core fsm_gen，
+    // probe 後續 TX 由 fence 以 FsmMismatch（stale_login_gen）撤銷。該 run 自己的結果照 Python `_attach_by_id` 套用：
+    // 撤銷 → `PROMPT_UNAVAILABLE`、立即落定 ATTACHED（quiet 計時中）；probe 在 banner 前已完整取得 nonce → READY
+    // （`confirm_ready` 清 quiet）。合併時依 Python 更正：原版本以下一個 Tick 收尾、舊世代 Ready 也停 ATTACHED。
+    use sw_core::session_core::{Effect, SessionState};
+    for stale in [
+        LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        LoginOutcome::Ready,
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.feed(ControlEvent::DeviceAttached {
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        let effects = h.bridge_ok();
+        let probe_gen = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::StartLogin {
+                    fsm_gen,
+                    plan: LoginPlan::Probe,
+                    ..
+                } => Some(*fsm_gen),
+                _ => None,
+            })
+            .expect("attach 應啟動 probe 登入");
+        assert_eq!(h.core.state(), SessionState::Attaching);
+        h.rx(BANNER.as_bytes()); // quiet arm（fsm_gen 遞增）
+        assert_ne!(h.core.generations().fsm_gen, probe_gen);
+        let epoch = h.epoch();
+        h.feed(ControlEvent::LoginFinished {
+            epoch,
+            fsm_gen: probe_gen,
+            result: stale.clone(),
+            after_rx_seq: None,
+        });
+        let s = h.public();
+        if stale == LoginOutcome::Ready {
+            assert_eq!(pget(&s, "state"), PyValue::from("READY"), "{stale:?}");
+            assert_eq!(pget(&s, "boot_quiet_remaining_s"), PyValue::Null);
+        } else {
+            assert_eq!(pget(&s, "state"), PyValue::from("ATTACHED"), "{stale:?}");
+            assert_eq!(pget(&s, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+            assert_eq!(pget(&s, "last_error_detail"), PyValue::Null);
+            assert!(pget(&s, "boot_quiet_remaining_s") != PyValue::Null);
+        }
+    }
+}
+
+#[test]
 fn login_tx_failure_classified_like_login_tx_refused() {
     use sw_core::login_fsm::{classify_login_tx_failure, TxFail};
     use sw_core::tx_writer::FenceReject;
@@ -1290,3 +1341,27 @@ fn attach_login_tx_unknown_detaches_attach_failed() {
     assert_eq!(h.core.state(), sw_core::session_core::SessionState::Detached);
     assert_eq!(pget(&h.public(), "last_error"), PyValue::from("ATTACH_FAILED:TxUnknownError"));
 }
+
+#[test]
+fn attach_stale_result_not_from_quiet_still_ignored() {
+    // 對照：不屬現行 attach run 的世代（run 已被取代）仍丟棄，維持 T11 語意。
+    use sw_core::session_core::SessionState;
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.bridge_ok();
+    let epoch = h.epoch();
+    let gen = h.core.generations().fsm_gen;
+    let fx = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen.wrapping_sub(1),
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert!(fx.is_empty());
+    h.advance(Duration::from_secs(2));
+    assert_eq!(h.core.state(), SessionState::Attaching);
+}
+

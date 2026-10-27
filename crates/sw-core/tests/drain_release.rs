@@ -1646,3 +1646,22 @@ fn release_closed_console_count_comes_from_owner_and_is_platform_independent() {
         PyValue::from(3)
     );
 }
+
+#[test]
+fn clear_reopen_attaching_clears_last_error() {
+    // P5-T20 黑箱揭露：Python `clear_session` drain 收尾設 ATTACHING＋`CLEARED` 後立即 `_spawn_attach`，
+    // `_attach_by_id` 開埠前即 `last_error = None`（實測 recover 救援失敗 → clear → ATTACHING 期間 last_error 為 null）。
+    // Rust 重新開埠（reopen_known_device）時亦須清除 last_error，不得帶著 `CLEARED` 停在 ATTACHING。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    let (epoch, stop) = h.pending_stop();
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    assert!(rx.try_recv().unwrap().is_ok());
+    let s = h.public();
+    assert_eq!(s["state"], PyValue::from("ATTACHING"));
+    assert_eq!(s["last_error"], PyValue::Null);
+}
