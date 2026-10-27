@@ -358,3 +358,26 @@ fn multi_open_tty_stat_failure_skips_tty_and_fd_dir_errors_classified() {
     let (_, status) = multi_open_holders(&proc_ns, 7006, TTY);
     assert_eq!(status, HolderScanStatus::Unknown);
 }
+
+#[test]
+fn posix_proc_scan_tty_holders_matches_alias_by_inode() {
+    // 審查 F101（Medium，18358a5）：F02 的產品接線 `PosixProcScan::serialwrapd_tty_holders` 需經 inode 身分比對
+    // （Python `detect_multi_open`：`os.stat` 後比 st_dev／st_ino），不得退回 readlink 字串比對。
+    // 輸入：tty 以 symlink 別名 `<tmp>/alias -> <tmp>/real` 傳入；假 /proc 的 serialwrapd 行程 fd 5 指向 `<tmp>/real`。
+    use sw_pal::proc_scan::posix::PosixProcScan;
+    use sw_pal::traits::ProcScan;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("real");
+    std::fs::write(&real, b"").expect("建立替身 tty");
+    let alias = tmp.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).expect("建立別名");
+    let proc_root = tmp.path().join("proc");
+    let pid_dir = proc_root.join("4242");
+    std::fs::create_dir_all(pid_dir.join("fd")).expect("建立 fd 目錄");
+    std::fs::write(pid_dir.join("cmdline"), b"/x/bin/serialwrapd\0--socket\0/s\0").expect("cmdline");
+    std::os::unix::fs::symlink(&real, pid_dir.join("fd").join("5")).expect("fd 連結");
+    let scan = PosixProcScan::with_root(&proc_root);
+    let (pids, status) = scan.serialwrapd_tty_holders(&[alias]);
+    assert_eq!(pids, vec![4242], "同一 inode 應列入 holder（readlink 字串比對會漏判）");
+    assert_eq!(status, HolderScanStatus::Ok);
+}

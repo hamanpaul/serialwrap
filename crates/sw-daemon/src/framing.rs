@@ -130,15 +130,28 @@ fn wire(d: &PyDict) -> Vec<u8> {
     out
 }
 
-/// 寫出一整行。PAL 的短輪詢 send 逾時（`WouldBlock`／`TimedOut`）不是失敗：未要求停止時持續重試
+/// 寫出一整行。PAL 的短輪詢 send 逾時（`WouldBlock`／可重試的 `TimedOut`）不是失敗：未要求停止時持續重試
 /// （Python `drain()` 無逾時），要求停止後以「停止時刻 + 2 s」為總期限，到期即放棄並關閉連線。
 fn write_line(stream: &mut dyn RpcServerStream, bytes: &[u8], stop: &ConnStop) -> bool {
+    write_line_with(stream, bytes, stop, sw_pal::rpc_transport::SEND_TIMEOUT_RETRYABLE)
+}
+
+/// `write_line` 本體；`timeout_retryable` 為 false 時 `TimedOut` 即放棄（Winsock 逾時後 socket 狀態未定義，審查 F102）。
+fn write_line_with(
+    stream: &mut dyn RpcServerStream,
+    bytes: &[u8],
+    stop: &ConnStop,
+    timeout_retryable: bool,
+) -> bool {
     let mut off = 0;
     while off < bytes.len() {
         match stream.write(&bytes[off..]) {
             Ok(0) => return false,
             Ok(n) => off += n,
-            Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock)
+                    || (timeout_retryable && e.kind() == ErrorKind::TimedOut) =>
+            {
                 if stop.write_deadline().is_some_and(|deadline| Instant::now() >= deadline) {
                     return false;
                 }
@@ -435,12 +448,61 @@ impl Drop for RpcServer {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_py_bytes;
+    use super::{trim_py_bytes, write_line_with, ConnStop};
+    use std::io::{ErrorKind, Read, Write};
+    use std::time::Duration;
+    use sw_pal::traits::{PalResult, RpcServerStream};
 
     #[test]
     fn trim_matches_python_strip() {
         assert_eq!(trim_py_bytes(b" \t\x0b\x0cab c\r\n"), b"ab c");
         assert_eq!(trim_py_bytes(b"\r\n \t"), b"");
         assert_eq!(trim_py_bytes(b""), b"");
+    }
+
+    /// 第一次 write 回 `TimedOut`，之後全收。
+    struct TimeoutOnce {
+        calls: usize,
+        out: Vec<u8>,
+    }
+    impl Read for TimeoutOnce {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for TimeoutOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Err(ErrorKind::TimedOut.into());
+            }
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl RpcServerStream for TimeoutOnce {
+        fn shutdown_read(&mut self) -> PalResult<()> {
+            Ok(())
+        }
+        fn set_read_timeout(&mut self, _d: Option<Duration>) -> PalResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn send_timeout_retry_follows_pal_retryability() {
+        // 審查 F102（Medium，c43bb3e）：POSIX `SO_SNDTIMEO` 逾時（EAGAIN）不改 socket 狀態，可重試；Winsock send
+        // 逾時後 socket 狀態未定義（不得再用），PAL 宣告不可重試時 framing 不得從原 offset 重送（避免重複／毀損行）。
+        let stop = ConnStop::new();
+        let mut retry = TimeoutOnce { calls: 0, out: Vec::new() };
+        assert!(write_line_with(&mut retry, b"{\"ok\":true}\n", &stop, true));
+        assert_eq!(retry.out, b"{\"ok\":true}\n");
+        let mut no_retry = TimeoutOnce { calls: 0, out: Vec::new() };
+        assert!(!write_line_with(&mut no_retry, b"{\"ok\":true}\n", &stop, false));
+        assert_eq!(no_retry.calls, 1, "不可重試時逾時即放棄、不再寫");
+        assert!(no_retry.out.is_empty());
     }
 }
