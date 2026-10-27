@@ -510,6 +510,29 @@ fn start_windows_python_launcher_uses_manifest_runtime() {
 }
 
 #[test]
+fn start_windows_python_launcher_without_runtime_does_not_fall_through() {
+    // manifest 宣告 `.py` launcher 卻缺 runtime 時必須 fail-closed；
+    // 不得改走 CLI 同層 serialwrapd.exe，否則會繞過 manifest 的版本配對。
+    let t = TestEnv::windows().with_process();
+    let launcher = t.bundle_dir().join("serialwrapd.py");
+    let manifest = t.bundle_dir().join("release-manifest.json");
+    let body = r#"{"schema_version":1,"bundle_version":"test","stage":"rust-1b-test","target":"x86_64-pc-windows-gnu","git_revision":"test","components":{"cli":{"implementation":"rust","version":"test","path":"bin/serialwrap.exe","sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"python_cli_delegate":{"entry":["py/python.exe","-I","delegate_sentinel.py"]},"daemon":{"launcher":{"path":"serialwrapd.py"},"runtime":{"path":"py/python.exe","python_version":"3.12"}}}}"#;
+    t.write_file(&launcher, b"python daemon shim");
+    t.write_file(&manifest, body.as_bytes());
+    let sibling = t.with_cli_ctx(|ctx| {
+        let exe = ctx.p.env.current_exe().expect("current exe");
+        exe.parent().expect("exe directory").join("serialwrapd.exe")
+    });
+    t.write_file(&sibling, b"sibling daemon");
+
+    let located = t.with_cli_ctx(|ctx| sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx));
+    assert!(
+        located.is_err(),
+        "缺 manifest runtime 時不得落到同層或其他候選：{located:?}"
+    );
+}
+
+#[test]
 fn start_binary_not_found() {
     let t = TestEnv::posix().with_process();
     let (rc, out, err) = t.run(&["daemon", "start"]);

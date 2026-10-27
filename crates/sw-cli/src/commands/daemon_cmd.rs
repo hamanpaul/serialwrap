@@ -556,6 +556,9 @@ pub fn locate_daemon_argv(ctx: &CliCtx<'_>) -> Result<Vec<String>, DaemonLocateE
                             ]);
                         }
                     }
+                    // `.py` launcher 只能由同一 manifest 的 runtime 執行；缺 runtime 時 fail-closed，
+                    // 不得落到 CLI 同層 serialwrapd.exe 等候選而繞過 manifest 版本配對。
+                    return Err(DaemonLocateError::NotFound);
                 } else {
                     return Ok(vec![absolute_path(ctx, &candidate)]);
                 }
