@@ -2308,7 +2308,7 @@ impl ManagerRig {
 pub mod hub;
 
 use sw_core::human_console::{ConsoleTransportKind, ReplayHold};
-use sw_core::session_core::LeaseIndexOp;
+use sw_core::session_core::{FgAdmission, LeaseIndexOp};
 use sw_core::tx_writer::{FenceReject, TxClass, TxPermit, TxReport};
 use sw_pal::traits::TxOutcome;
 
@@ -2398,6 +2398,47 @@ impl CoreHarness {
     /// `= advance(Duration::from_secs_f64(s))`（投遞 Tick 與到期 timer）。
     pub fn advance_s(&mut self, _s: f64) -> Vec<Effect> {
         todo!("P6 Task 7")
+    }
+}
+
+/// P6 Task 6 追加的 harness helper（Task 1 簽章之外；直接呼叫 core 方法並經 harness 處理效果）。
+impl CoreHarness {
+    /// `SessionCore::fg_begin`；回 (admission, 經 harness 處理後的其餘效果)。
+    pub fn fg_begin(&mut self, _source_is_agent: bool) -> (FgAdmission, Vec<Effect>) {
+        todo!("P6 Task 6")
+    }
+    pub fn fg_finish(&mut self, _adm: FgAdmission) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    pub fn human_suspend_begin(&mut self) -> (bool, Vec<Effect>) {
+        todo!("P6 Task 6")
+    }
+    pub fn human_suspend_end(&mut self, _suspended: bool) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// `SessionCore::invalidate_human_input`。
+    pub fn invalidate(&mut self, _reason: sw_core::deferred::InvalidateReason) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// `SessionCore::begin_stop(kind, None, now)`。
+    pub fn begin_stop(&mut self, _kind: sw_core::drain::StopKind) -> Vec<Effect> {
+        todo!("P6 Task 6")
+    }
+    /// 該 console 目前的 `client_lifetime`。
+    pub fn lifetime(&self, _cid: &str) -> u64 {
+        todo!("P6 Task 6")
+    }
+    /// `CoreDeps.input_epoch_pub` 目前值。
+    pub fn input_epoch_pub(&self) -> u64 {
+        todo!("P6 Task 6")
+    }
+    /// registry 中最近一筆 source 以 `human:` 開頭的命令紀錄。
+    pub fn last_human_command(&self) -> Option<PyDict> {
+        todo!("P6 Task 6")
+    }
+    /// 直接在 DeferredBuffer 為該 client 附加 bytes（現值 epoch／lifetime；test-fakes）。
+    pub fn seed_deferred(&mut self, _cid: &str, _bytes: &[u8]) {
+        todo!("P6 Task 6")
     }
 }
 

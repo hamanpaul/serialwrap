@@ -4935,6 +4935,28 @@ impl SessionCore {
         todo!("P6 Task 6")
     }
 
+    /// P6 Task 6：human console 狀態（唯讀；SessionPublic 與測試用）。
+    pub fn human_console(&self) -> &crate::human_console::HumanConsoleState {
+        todo!("P6 Task 6")
+    }
+
+    /// 測試用：可變 human console 狀態（例如模擬 P8 的 `flash_mode`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn human_console_mut(&mut self) -> &mut crate::human_console::HumanConsoleState {
+        todo!("P6 Task 6")
+    }
+
+    /// 測試用：DeferredBuffer 附加（07 D-02：產品路徑不得直接操作 deferred）。
+    #[cfg(feature = "test-fakes")]
+    pub fn seed_deferred_for_test(&mut self, _client_id: &str, _bytes: &[u8]) {
+        todo!("P6 Task 6")
+    }
+
+    /// drain Phase 1 時記下的 human lease owner（05 §3.1 第 1 步）。
+    pub fn retained_human_owner(&self) -> Option<&str> {
+        todo!("P6 Task 6")
+    }
+
     /// P6 Task 6（增補 #26）：`foreground.is_some()` 或存在未撤銷的 `replay_hold`（07 D-22(2)）。
     pub fn foreground_busy(&self) -> bool {
         todo!("P6 Task 6")

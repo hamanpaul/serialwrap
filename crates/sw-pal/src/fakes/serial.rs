@@ -609,6 +609,11 @@ impl FakeDevice {
         s.extend(steps);
     }
 
+    /// P6 Task 6：等到 `BlockForever` 的 job 已經 gate 提交 OS、在 gate 外阻塞（上限 2 s）。
+    pub fn wait_blocked(&self) {
+        todo!("P6 Task 6")
+    }
+
     pub fn release_block(&self) {
         self.inner.blocked_release.store(true, Ordering::SeqCst);
         let _g = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
