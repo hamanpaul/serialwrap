@@ -30,7 +30,7 @@ use sw_core::session_auth::{
 };
 use sw_core::mailbox::ControlEvent;
 use sw_core::session_core::{Effect, SessionRequest, SessionState};
-use sw_core::tx_writer::TxClass;
+use sw_core::tx_writer::{OpId, TxClass, TxReport};
 use sw_core::Mono;
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::env::FakeEnv;
@@ -162,7 +162,7 @@ impl LoginRig {
         let clock = Arc::clone(&self.clock);
         let written = Arc::clone(&self.written);
         let seq = Arc::new(AtomicU64::new(100));
-        let tx = move |b: &[u8], class: TxClass, source: &str, log: bool| -> TxResult {
+        let tx = move |b: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
             written
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -178,14 +178,24 @@ impl LoginRig {
                 let s = seq.fetch_add(1, Ordering::SeqCst);
                 rx.append(&reply, now, 1, s);
             }
-            tx_ok(b.len())
+            // P7 Task 3：LoginIo.tx 改回 06 T9 TxReport（只改 helper 型別，不改斷言）。
+            TxReport {
+                op_id: OpId(0),
+                epoch: 1,
+                result: tx_ok(b.len()),
+                wal: None,
+                reject: None,
+            }
         };
         let nonce = || NONCE.to_string();
+        let cancel = sw_core::uart_bridge::RunCancel::new(&self.rx);
         let io = LoginIo {
             rx: &self.rx,
             tx: &tx,
             clock: &*self.clock,
             nonce: &nonce,
+            cancel: &cancel,
+            class: TxClass::LoginProbe,
         };
         f(&io)
     }
@@ -212,6 +222,7 @@ fn outcome_code(o: &LoginOutcome) -> String {
     match o {
         LoginOutcome::NotReady(c) | LoginOutcome::Failed(c) => c.clone(),
         LoginOutcome::Ready => panic!("預期失敗碼，實際 Ready"),
+        other => panic!("預期失敗碼，實際 {other:?}"),
     }
 }
 

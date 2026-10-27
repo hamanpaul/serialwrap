@@ -2235,6 +2235,7 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
+        let result = legacy_login_outcome(result);
         if self
             .login_run
             .as_ref()
@@ -2304,6 +2305,8 @@ impl SessionCore {
                     effects.extend(self.begin_stop(StopKind::LoginFailed, None, now).0);
                 }
             }
+            // 已由 `legacy_login_outcome` 收斂，不會到達（P7 Task 7 以收斂表取代）。
+            crate::login_fsm::LoginOutcome::Aborted(_) | crate::login_fsm::LoginOutcome::Raised(_) => {}
         }
         for (waiter, kind) in waiters {
             effects.extend(self.reprobe_reply(waiter, kind, now));
@@ -4291,6 +4294,7 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
+        let result = legacy_login_outcome(result);
         self.login_run = None;
         if self.generations.conn_epoch != Some(epoch) || self.state != SessionState::Recovering {
             return Vec::new();
@@ -4314,6 +4318,10 @@ impl SessionCore {
             crate::login_fsm::LoginOutcome::NotReady(_) => Vec::new(),
             crate::login_fsm::LoginOutcome::Failed(error) => {
                 self.set_last_error(Some(error), None);
+                Vec::new()
+            }
+            // 已由 `legacy_login_outcome` 收斂，不會到達（P7 Task 7 以收斂表取代）。
+            crate::login_fsm::LoginOutcome::Aborted(_) | crate::login_fsm::LoginOutcome::Raised(_) => {
                 Vec::new()
             }
         }
@@ -4952,5 +4960,17 @@ impl SessionCore {
     /// P6 Task 6（增補 #26）：`foreground.is_some()` 或存在未撤銷的 `replay_hold`（07 D-22(2)）。
     pub fn foreground_busy(&self) -> bool {
         todo!("P6 Task 6")
+    }
+}
+
+/// P7 Task 3 過渡：Task 7 的 login 收斂表（`login_run.rs`）落地前，Task 3 新增的 variant 依 06 既有語意收斂——
+/// `Aborted(_)` 同 06 `refused()`（`NotReady("PROMPT_UNAVAILABLE")`）；`Raised(exc)` 同 attach 失敗
+/// （`Failed("ATTACH_FAILED:{exc}")`，`session_manager.py:2749`）。
+fn legacy_login_outcome(result: crate::login_fsm::LoginOutcome) -> crate::login_fsm::LoginOutcome {
+    use crate::login_fsm::LoginOutcome;
+    match result {
+        LoginOutcome::Aborted(_) => LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        LoginOutcome::Raised(exc) => LoginOutcome::Failed(format!("ATTACH_FAILED:{exc}")),
+        other => other,
     }
 }

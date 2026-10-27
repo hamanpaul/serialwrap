@@ -39,12 +39,18 @@ struct Reaction {
     after_s: Option<f64>,
 }
 
+/// 時間一律以 `f64` 秒（自 `BASE` 起）累加，與 Python `VirtualClock`（`now += d`）的浮點誤差逐位相同；
+/// `mono_ns` 取 `BASE + floor(now * 1e9)`。
 #[derive(Default)]
 struct ClockState {
-    now: u64,
-    pending: Vec<(u64, u64, String)>,
+    now: f64,
+    pending: Vec<(f64, u64, String)>,
     seq: u64,
-    cancel_at: Option<u64>,
+    cancel_at: Option<f64>,
+}
+
+fn to_ns(t: f64) -> u64 {
+    BASE + (t * 1e9) as u64
 }
 
 /// 腳本化虛擬時鐘（`VirtualClock`）：`sleep` 推進並遞送到期 RX。
@@ -59,10 +65,7 @@ pub struct ScriptClock {
 impl ScriptClock {
     fn new(rx: Arc<RxShared>) -> Arc<ScriptClock> {
         Arc::new(ScriptClock {
-            st: Mutex::new(ClockState {
-                now: BASE,
-                ..ClockState::default()
-            }),
+            st: Mutex::new(ClockState::default()),
             rx,
             rx_seq: AtomicU64::new(0),
             cancel: Mutex::new(None),
@@ -71,6 +74,10 @@ impl ScriptClock {
     }
 
     fn now(&self) -> u64 {
+        to_ns(self.st.lock().unwrap().now)
+    }
+
+    fn now_s(&self) -> f64 {
         self.st.lock().unwrap().now
     }
 
@@ -83,13 +90,14 @@ impl ScriptClock {
     fn schedule(&self, after_s: f64, text: String) {
         let mut st = self.st.lock().unwrap();
         st.seq += 1;
-        let at = st.now + (after_s * 1e9).round() as u64;
+        let at = st.now + after_s;
         let seq = st.seq;
         st.pending.push((at, seq, text));
-        st.pending.sort();
+        st.pending
+            .sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     }
 
-    fn advance_to(&self, target: u64) {
+    fn advance_to(&self, target: f64) {
         let (due, cancel_now) = {
             let mut st = self.st.lock().unwrap();
             if target > st.now {
@@ -123,9 +131,35 @@ impl Clock for ScriptClock {
     }
     fn sleep(&self, d: Duration) {
         self.sleeps.lock().unwrap().push(d);
-        let ns = d.as_nanos().min(u64::MAX as u128) as u64;
-        let target = self.now().saturating_add(ns);
+        let target = self.now_s() + d.as_secs_f64();
         self.advance_to(target);
+    }
+    /// `ScriptedBridge.wait_for_regex` 的推進：直接跳到「下一筆排程 RX／取消／期限」中最早者。
+    fn wait_until_or_cancel(&self, deadline_ns: u64, cancel: &crossbeam_channel::Receiver<()>) -> bool {
+        loop {
+            if cancel.try_recv().is_ok() {
+                return false;
+            }
+            if self.now() >= deadline_ns {
+                return true;
+            }
+            let mut deadline_s = (deadline_ns - BASE) as f64 / 1e9;
+            while to_ns(deadline_s) < deadline_ns {
+                deadline_s = f64::from_bits(deadline_s.to_bits() + 1);
+            }
+            let target = {
+                let st = self.st.lock().unwrap();
+                let mut t = deadline_s;
+                if let Some((at, _, _)) = st.pending.first() {
+                    t = t.min(*at);
+                }
+                if let Some(at) = st.cancel_at {
+                    t = t.min(at);
+                }
+                t
+            };
+            self.advance_to(target);
+        }
     }
     fn wall_unix_us(&self) -> i64 {
         0
@@ -308,7 +342,7 @@ impl LoginRigBuilder {
         let cancel = RunCancel::new(&rx);
         *clock.cancel.lock().unwrap() = Some(cancel.clone());
         if let Some(t) = self.cancel_at_s {
-            clock.st.lock().unwrap().cancel_at = Some(BASE + (t * 1e9).round() as u64);
+            clock.st.lock().unwrap().cancel_at = Some(t);
         }
         let inner = Arc::new(Inner {
             clock: Arc::clone(&clock),
@@ -360,7 +394,8 @@ fn dsl_f64(v: Option<&PyValue>) -> f64 {
 impl LoginRig {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> LoginRigBuilder {
-        LoginRigBuilder::default()
+        // `p7_login_cases._c` 的預設 nonces。
+        LoginRigBuilder::default().nonces(&["deadbeef"])
     }
 
     /// golden `case` 物件（`p7_fake_bridge` DSL）。
@@ -429,7 +464,7 @@ impl LoginRig {
         self.inner.attempts.load(Ordering::SeqCst) as usize
     }
     pub fn virtual_elapsed_s(&self) -> f64 {
-        (self.clock.now() - BASE) as f64 / 1e9
+        self.clock.now_s()
     }
     pub fn sleeps_s(&self) -> Vec<f64> {
         self.clock

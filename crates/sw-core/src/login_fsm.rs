@@ -1,23 +1,27 @@
-//! P5-T13：最小登入狀態機（05 §8；對照 `sw_core/login_fsm.py` 與 `session_manager._attach_by_id` 的計畫選擇）。
+//! 登入狀態機（P5-T13 最小版 → P7 Task 3 全平台；05 §8；逐函式對照 `sw_core/login_fsm.py`）。
 //!
 //! - `choose_login_plan`：sans-IO 的計畫選擇（passthrough／不具 command capability／boot quiet／帳密未解析／
-//!   Slice 2.1 不支援能力 → 不送任何 TX）。
-//! - `probe_ready`／`ensure_ready`：在 OpRunner（或測試 executor）thread 執行；TX 一律經 `LoginIo.tx`
-//!   （TxWriter，class `LoginProbe`），RX 比對整個 RX 視窗（Python `wait_for_regex` 語意，SES-16.6-05 KEEP）。
-//! - Slice 2.1 不承接 `post_login_cmd` 與 console unlock（能力閘在 `choose_login_plan` 擋下）。
+//!   Slice 2.1 不支援能力 → 不送任何 TX；Slice 2.1 能力閘的退役待 08 §0.6 退役清單的 L1 鎖裁決）。
+//! - `probe_ready`／`ensure_ready`／`detect_template`：在 OpRunner（或測試 executor）thread 執行；TX 一律經
+//!   `LoginIo.tx`（TxWriter，class 由呼叫端以 `LoginIo.class` 決定），RX 比對整個 RX 視窗（Python
+//!   `wait_for_regex` 語意，SES-16.6-05 KEEP），等待可經 `LoginIo.cancel` 取消（SC-30）。
+//! - TX 回報對應（§11.3 不得自動重送）：fence 拒絕 → `Aborted(Refused)`；未提交且無拒絕 → `Aborted(Cancelled)`；
+//!   部分寫出或結果不明 → `Aborted(TxIncomplete)`；之後一律不再呼叫 `tx`。Python 會拋例外處（無效 regex）
+//!   → `Raised("error")`。
+//! - console unlock 的 INFO log 依 GAP-G-01 不輸出。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sw_pal::traits::{Clock, SysEnv, TxOutcome, TxResult};
-use sw_proto::config_types::SessionProfile;
+use sw_proto::config_types::{ProfileTemplate, SessionProfile};
 use sw_proto::pycompat::clean_text;
-use sw_proto::pyre::{PyFlags, compile};
+use sw_proto::pyre::{PyFlags, PyRegex, compile, escape};
 
 use crate::session_auth::{AuthResolution, SessionAuth, credentials_declared_but_unresolved};
-use crate::tx_writer::{OpId, TxClass, TxJob, TxPermit, TxWriterHandle};
-use crate::uart_bridge::RxShared;
+use crate::tx_writer::{FenceReject, OpId, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
+use crate::uart_bridge::{RunCancel, RxShared, WaitOutcome};
 
 pub use crate::quiet_gate::detect_boot_banner;
 
@@ -40,18 +44,35 @@ pub enum LoginPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoginOutcome {
     Ready,
-    /// probe 失敗或 TX 遭 fence 拒絕：停 ATTACHED，內含 last_error。
+    /// probe 失敗：停 ATTACHED，內含 last_error。
     NotReady(String),
     /// `ensure_ready` 失敗：attach 路徑 → drain（`LoginFailed`），既有 bridge 路徑 → ATTACHED。
     Failed(String),
+    /// P7 Task 3：TX 被拒／取消／結果不完整，之後零 TX。
+    Aborted(LoginAbort),
+    /// P7 Task 3：Python 會拋例外處（無效 regex → `"error"`），值為例外型別名。
+    Raised(String),
+}
+
+/// `LoginOutcome::Aborted` 的原因。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoginAbort {
+    Refused(FenceReject),
+    Cancelled,
+    TxIncomplete,
 }
 
 /// 登入 FSM 所需的 I/O 注入點（TX 經 TxWriter；測試以閉包替身）。
 pub struct LoginIo<'a> {
     pub rx: &'a RxShared,
-    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> sw_pal::TxResult,
+    /// P7 Task 3：回 06 T9 `TxReport`（取得 fence 拒絕原因）。
+    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> TxReport,
     pub clock: &'a dyn Clock,
     pub nonce: &'a dyn Fn() -> String,
+    /// P7 Task 3：SC-30 取消。
+    pub cancel: &'a RunCancel,
+    /// P7 Task 3：`LoginProbe`｜`ReadyReconfirm`（呼叫端決定）。
+    pub class: TxClass,
 }
 
 /// RX_FLOOD 可遮蔽的失敗碼（login_fsm.py `_FLOOD_MASKABLE_ERRORS` 逐字）。
@@ -78,62 +99,6 @@ pub const LOGIN_FSM_DETAIL_ERRORS: [&str; 12] = [
     "READY_PROMPT_TIMEOUT",
     "LOGIN_REQUIRED",
 ];
-
-// ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
-
-/// `LoginOutcome::Aborted` 的原因（P7 Task 3；`LoginOutcome` 新 variant 隨 Task 3 一併加入，Task 0 不改 06 enum）。
-#[derive(Debug, Clone, PartialEq)]
-pub enum LoginAbort {
-    Refused(crate::tx_writer::FenceReject),
-    Cancelled,
-    TxIncomplete,
-}
-
-/// `err.endswith("_PROMPT_TIMEOUT")`（`login_fsm.py:57`）。
-pub fn is_prompt_timeout_error(_err: &str) -> bool {
-    todo!("P7 Task 3")
-}
-
-pub fn maybe_reclassify_flood(_io: &LoginIo, _err: Option<String>) -> Option<String> {
-    todo!("P7 Task 3")
-}
-
-pub fn detect_template<'t>(
-    _io: &LoginIo,
-    _templates: &'t [sw_proto::config_types::ProfileTemplate],
-    _probe_timeout_s: f64,
-) -> Result<Option<&'t sw_proto::config_types::ProfileTemplate>, LoginOutcome> {
-    todo!("P7 Task 3")
-}
-
-/// `session_manager._matches_any_bootloader_prompt`：`pycompat::splitlines` 取最後一個非空白行；無效 regex 略過。
-pub fn matches_any_bootloader_prompt(_text: &str, _prompts: &[String]) -> Option<String> {
-    todo!("P7 Task 3")
-}
-
-/// `login_fsm._console_at_bootloader`：尾行＝`clean_text(tail).rstrip("\r\n").split("\n")[-1]`；無效 regex → `Err(Raised("error"))`。
-pub fn console_at_bootloader(_rx_tail: &str, _prompts: &[String]) -> Result<bool, LoginOutcome> {
-    todo!("P7 Task 3")
-}
-
-/// `RX_FLOOD_BYTES_PER_10S`（constants.py）。
-const RX_FLOOD_BYTES_PER_10S: u64 = 20_000;
-/// `rx_tail()` 預設字元數（uart_io.py）。
-const RX_TAIL_CHARS: usize = 4096;
-/// `_login_fsm_rx_tail_detail` 截尾字元數。
-const DETAIL_TAIL_CHARS: usize = 300;
-/// 等待輪詢：每輪最多推進的注入時鐘時間（Python 以 50 ms 輪詢）。
-const WAIT_CLOCK_SLICE: Duration = Duration::from_millis(10);
-/// 等待輪詢：每輪的實時讓出（讓 reader thread 交付 RX；期限一律以注入 Clock 判定）。
-const WAIT_REAL_YIELD: Duration = Duration::from_millis(5);
-/// 登入 TX 的 op_id 區段（與 SessionCore 前景 op 的遞增序號不重疊）。
-const LOGIN_OP_ID_BASE: u64 = 1 << 62;
-
-static NEXT_LOGIN_OP: AtomicU64 = AtomicU64::new(0);
-
-fn declared(value: &Option<String>) -> bool {
-    value.as_deref().is_some_and(|v| !v.is_empty())
-}
 
 /// 依 profile、待自動登入旗標、已解析帳密與 quiet 狀態選擇登入計畫（05 §8.2＋`_attach_by_id`）。
 /// 回傳 `(計畫, 合成的 last_error)`。
@@ -191,57 +156,120 @@ pub fn run_login_plan(
     }
 }
 
-/// 只做 probe：送 `\n` 並等 prompt；失敗時依視窗分類（05 §8.3；`login_fsm.probe_ready`）。
-pub fn probe_ready(io: &LoginIo, p: &SessionProfile) -> LoginOutcome {
-    match probe_prompt(io, p) {
-        Err(Refused) => return refused(),
-        Ok(false) => {
-            let code = classify_non_ready_state(io, p);
-            return LoginOutcome::NotReady(reclassify_flood_code(io, code).to_string());
-        }
-        Ok(true) => {}
-    }
-    match finalize_ready(io, p) {
-        Err(Refused) => refused(),
-        Ok(None) => LoginOutcome::Ready,
-        Ok(Some(code)) => LoginOutcome::NotReady(reclassify_flood_code(io, code).to_string()),
-    }
+/// `err.endswith("_PROMPT_TIMEOUT")`（`login_fsm.py:57`）。
+pub fn is_prompt_timeout_error(err: &str) -> bool {
+    err.ends_with("_PROMPT_TIMEOUT")
 }
 
-/// 完整登入：login → password → prompt → nonce 驗證（05 §8.3；`login_fsm.ensure_ready`）。
+/// `_maybe_reclassify_flood`（#153）：可遮蔽碼且 10 s 視窗 raw RX ≥ `RX_FLOOD_BYTES_PER_10S` → `RX_FLOOD`。
+pub fn maybe_reclassify_flood(io: &LoginIo, err: Option<String>) -> Option<String> {
+    let err = err?;
+    if !FLOOD_MASKABLE_ERRORS.contains(&err.as_str()) && !is_prompt_timeout_error(&err) {
+        return Some(err);
+    }
+    if io.rx.rx_stats(io.clock.mono_ns()).0 >= RX_FLOOD_BYTES_PER_10S {
+        return Some("RX_FLOOD".to_string());
+    }
+    Some(err)
+}
+
+/// `login_fsm.detect_template`：送 `\n`、`time.sleep(probe_timeout_s)`，依序比對各 template。
+///
+/// 略過 passthrough 與宣告 `console_unlock_env` 者；先 `prompt_regex`（命中即回），否則記第一個
+/// `login_regex` 命中者為備選。無效 regex 略過（Python `except re.error: continue`）。TX 中止 → `Err`。
+pub fn detect_template<'t>(
+    io: &LoginIo,
+    templates: &'t [ProfileTemplate],
+    probe_timeout_s: f64,
+) -> Result<Option<&'t ProfileTemplate>, LoginOutcome> {
+    io.rx.clear();
+    send_command(io, "")?;
+    io.clock.sleep(secs(probe_timeout_s));
+    let snapshot = io.rx.tail(RX_TAIL_CHARS);
+    let mut login_candidate = None;
+    for tpl in templates {
+        if tpl.platform == "passthrough" || declared(&tpl.console_unlock_env) {
+            continue;
+        }
+        match compile(&tpl.prompt_regex, PyFlags(0)) {
+            Ok(re) if re.search(&snapshot).is_some() => return Ok(Some(tpl)),
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        if login_candidate.is_none() {
+            match compile(&tpl.login_regex, PyFlags(0)) {
+                Ok(re) if re.search(&snapshot).is_some() => login_candidate = Some(tpl),
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+        }
+    }
+    Ok(login_candidate)
+}
+
+/// `session_manager._matches_any_bootloader_prompt`（重用 06 T13 `quiet_gate` 的實作，不另寫）。
+pub fn matches_any_bootloader_prompt(text: &str, prompts: &[String]) -> Option<String> {
+    crate::quiet_gate::matches_any_bootloader_prompt(text, prompts)
+}
+
+/// `login_fsm._console_at_bootloader`：尾行＝`clean_text(tail).rstrip("\r\n").split("\n")[-1]`；
+/// 無效 regex → `Err(Raised("error"))`（與 `matches_any_bootloader_prompt` 略過不同）。
+pub fn console_at_bootloader(rx_tail: &str, prompts: &[String]) -> Result<bool, LoginOutcome> {
+    let tail = console_tail_line(rx_tail);
+    for pattern in prompts {
+        if compile_or_raise(pattern)?.search(&tail).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 只做 probe：送 `\n` 並等 prompt；失敗時依視窗分類（05 §8.3；`login_fsm.probe_ready`）。
+pub fn probe_ready(io: &LoginIo, p: &SessionProfile) -> LoginOutcome {
+    finish(probe_ready_inner(io, p), false)
+}
+
+fn probe_ready_inner(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
+    if !probe_prompt(io, p)? {
+        let code = classify_non_ready_state(io, p).to_string();
+        return Ok(maybe_reclassify_flood(io, Some(code)));
+    }
+    let err = finalize_ready(io, p)?;
+    Ok(maybe_reclassify_flood(io, err))
+}
+
+/// 完整登入：login → password → prompt → post_login_cmd → nonce 驗證；console unlock profile 改走
+/// 被動靜默解鎖（05 §8.3；`login_fsm.ensure_ready`）。
 pub fn ensure_ready(
     io: &LoginIo,
     p: &SessionProfile,
     auth: &SessionAuth,
     env: &dyn SysEnv,
 ) -> LoginOutcome {
+    finish(ensure_ready_inner(io, p, auth, env), true)
+}
+
+fn ensure_ready_inner(
+    io: &LoginIo,
+    p: &SessionProfile,
+    auth: &SessionAuth,
+    env: &dyn SysEnv,
+) -> Step<Option<String>> {
     if declared(&p.template.console_unlock_env) {
-        // Slice 2.1 不承接 console unlock（能力閘已在 choose_login_plan 擋下，不自動送 TX）。
-        if auth.console_unlock.as_deref().is_none_or(str::is_empty) {
-            return LoginOutcome::Failed("CREDENTIALS_UNRESOLVED".into());
+        return ensure_console_unlocked(io, p, auth);
+    }
+    if !probe_prompt(io, p)? {
+        let (ok, err) = maybe_login(io, p, auth, env)?;
+        if err.is_some() {
+            return Ok(maybe_reclassify_flood(io, err));
         }
-        return LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into());
+        if !ok {
+            let code = prompt_timeout_error(&p.template.platform).to_string();
+            return Ok(maybe_reclassify_flood(io, Some(code)));
+        }
     }
-    match probe_prompt(io, p) {
-        Err(Refused) => return refused(),
-        Ok(true) => {}
-        Ok(false) => match maybe_login(io, p, auth, env) {
-            Err(Refused) => return refused(),
-            Ok((_, Some(code))) => {
-                return LoginOutcome::Failed(reclassify_flood_code(io, code).to_string());
-            }
-            Ok((false, None)) => {
-                let code = prompt_timeout_error(&p.template.platform);
-                return LoginOutcome::Failed(reclassify_flood_code(io, code).to_string());
-            }
-            Ok((true, None)) => {}
-        },
-    }
-    match finalize_ready(io, p) {
-        Err(Refused) => refused(),
-        Ok(None) => LoginOutcome::Ready,
-        Ok(Some(code)) => LoginOutcome::Failed(reclassify_flood_code(io, code).to_string()),
-    }
+    let err = finalize_ready(io, p)?;
+    Ok(maybe_reclassify_flood(io, err))
 }
 
 /// 依 platform 回傳 prompt 逾時碼（bcm→BCM_PROMPT_TIMEOUT、shell→SHELL_PROMPT_TIMEOUT、其他→PRPL_PROMPT_TIMEOUT）。
@@ -288,15 +316,15 @@ pub fn login_error_detail(rx: &RxShared, code: &str) -> Option<String> {
 }
 
 /// 經 `TxWriterHandle` 送出登入 TX 的閉包（class 由呼叫端決定；permit 帶 StartLogin 的 epoch／fsm_gen）。
-/// 每筆 TX 取得 `TxReport` 後立即 settle（登入 op 不參與 BC-03 映射）。
+/// 每筆 TX 取得 `TxReport` 後立即 settle（登入 op 不參與 BC-03 映射）；TxWriter 已結束時回 `NotSubmitted`。
 pub fn login_tx_sender(
     handle: TxWriterHandle,
     epoch: u64,
     owner_gen: u64,
     fsm_gen: u64,
-) -> impl Fn(&[u8], TxClass, &str, bool) -> TxResult + Send + Sync {
+) -> impl Fn(&[u8], TxClass, &str, bool) -> TxReport + Send + Sync {
     let handle = Arc::new(handle);
-    move |payload: &[u8], class: TxClass, source: &str, log: bool| -> TxResult {
+    move |payload: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
         let op_id = OpId(LOGIN_OP_ID_BASE | NEXT_LOGIN_OP.fetch_add(1, Ordering::Relaxed));
         let (reply, report) = crossbeam_channel::bounded(1);
         let job = TxJob {
@@ -315,17 +343,20 @@ pub fn login_tx_sender(
             payload: payload.to_vec(),
             reply,
         };
-        let not_submitted = TxResult {
-            outcome: TxOutcome::NotSubmitted,
-            error: None,
+        let not_submitted = TxReport {
+            op_id,
+            epoch,
+            result: TxResult {
+                outcome: TxOutcome::NotSubmitted,
+                error: None,
+            },
+            wal: None,
+            reject: None,
         };
         if handle.jobs.send(job).is_err() {
             return not_submitted;
         }
-        let result = match handle.wait_report(&report) {
-            Some(report) => report.result,
-            None => not_submitted,
-        };
+        let result = handle.wait_report(&report).unwrap_or(not_submitted);
         let _ = handle.settle(op_id);
         result
     }
@@ -335,67 +366,99 @@ pub fn login_tx_sender(
 // 內部步驟（login_fsm.py 逐步承接）
 // ---------------------------------------------------------------------------
 
-/// TX 未完整提交（fence 拒絕或結果不明）：Python `TxIncompleteError` → `PROMPT_UNAVAILABLE`，不精煉。
-struct Refused;
+/// `RX_FLOOD_BYTES_PER_10S`（constants.py）。
+const RX_FLOOD_BYTES_PER_10S: u64 = 20_000;
+/// `rx_tail()` 預設字元數（uart_io.py）。
+const RX_TAIL_CHARS: usize = 4096;
+/// `_login_fsm_rx_tail_detail` 截尾字元數。
+const DETAIL_TAIL_CHARS: usize = 300;
+/// `_wait_console_idle` 的輪詢上限／下限（`time.sleep(min(0.05, max(0.001, deadline - now)))`）。
+const IDLE_POLL_MAX: Duration = Duration::from_millis(50);
+const IDLE_POLL_MIN: Duration = Duration::from_millis(1);
+/// console unlock 空行辨識等待上限（`min(1.0, …)`）。
+const BLANK_LINE_PROBE_MAX: Duration = Duration::from_secs(1);
+/// 字面預設 ready_probe（console unlock 時改用錨定 nonce 樣式）。
+const DEFAULT_READY_PROBE: &str = "echo __READY__${nonce}";
+/// 登入 TX 的 op_id 區段（與 SessionCore 前景 op 的遞增序號不重疊）。
+const LOGIN_OP_ID_BASE: u64 = 1 << 62;
 
-fn refused() -> LoginOutcome {
-    LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into())
+static NEXT_LOGIN_OP: AtomicU64 = AtomicU64::new(0);
+
+/// 中途結束（`Aborted`／`Raised`）以 `Err` 傳遞；`Ok(None)` 為成功，`Ok(Some(code))` 為失敗碼。
+type Step<T> = Result<T, LoginOutcome>;
+
+fn finish(step: Step<Option<String>>, ensure: bool) -> LoginOutcome {
+    match step {
+        Ok(None) => LoginOutcome::Ready,
+        Ok(Some(code)) if ensure => LoginOutcome::Failed(code),
+        Ok(Some(code)) => LoginOutcome::NotReady(code),
+        Err(outcome) => outcome,
+    }
 }
 
-fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Result<(), Refused> {
+fn declared(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|v| !v.is_empty())
+}
+
+fn secs(s: f64) -> Duration {
+    if s.is_finite() && s > 0.0 {
+        Duration::from_secs_f64(s)
+    } else {
+        Duration::ZERO
+    }
+}
+
+fn compile_or_raise(pattern: &str) -> Step<PyRegex> {
+    compile(pattern, PyFlags(0)).map_err(|_| LoginOutcome::Raised("error".to_string()))
+}
+
+fn search_or_raise(pattern: &str, text: &str) -> Step<bool> {
+    Ok(compile_or_raise(pattern)?.search(text).is_some())
+}
+
+fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Step<()> {
     let mut bytes = payload.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    let result = (io.tx)(&bytes, TxClass::LoginProbe, source, log);
-    match result.outcome {
+    let report = (io.tx)(&bytes, io.class, source, log);
+    if let Some(reject) = report.reject {
+        return Err(LoginOutcome::Aborted(LoginAbort::Refused(reject)));
+    }
+    match report.result.outcome {
         TxOutcome::Completed(n) if n >= bytes.len() => Ok(()),
-        _ => Err(Refused),
+        TxOutcome::NotSubmitted => Err(LoginOutcome::Aborted(LoginAbort::Cancelled)),
+        TxOutcome::Completed(_) | TxOutcome::Unknown { .. } => {
+            Err(LoginOutcome::Aborted(LoginAbort::TxIncomplete))
+        }
     }
 }
 
-fn send_command(io: &LoginIo, cmd: &str) -> Result<(), Refused> {
+fn send_command(io: &LoginIo, cmd: &str) -> Step<()> {
     send(io, cmd, "system", true)
 }
 
-fn send_secret(io: &LoginIo, secret: &str) -> Result<(), Refused> {
+fn send_secret(io: &LoginIo, secret: &str) -> Step<()> {
     send(io, secret, "system:secret", false)
 }
 
-/// 以整個 RX 視窗等待 `pred` 成立；期限依注入 Clock（每輪最多推進 `WAIT_CLOCK_SLICE`）。
-fn wait_for(io: &LoginIo, timeout_s: f64, pred: &dyn Fn(&str) -> bool) -> bool {
-    let timeout_ns = (timeout_s.max(0.0) * 1_000_000_000.0) as u64;
-    let deadline = io.clock.mono_ns().saturating_add(timeout_ns);
-    let slice_ns = WAIT_CLOCK_SLICE.as_nanos() as u64;
-    loop {
-        if pred(&io.rx.text_from(0)) {
-            return true;
-        }
-        let now = io.clock.mono_ns();
-        if now >= deadline {
-            return false;
-        }
-        let step = deadline.saturating_sub(now).min(slice_ns);
-        std::thread::sleep(WAIT_REAL_YIELD.min(Duration::from_nanos(step)));
-        let advanced = io.clock.mono_ns().saturating_sub(now);
-        if advanced < step {
-            io.clock.sleep(Duration::from_nanos(step - advanced));
-        }
+/// `bridge.wait_for_regex(pattern, timeout_s)`：regex 先編譯（失敗 → `Raised`），再以整個 RX 視窗等待。
+fn wait_regex(io: &LoginIo, pattern: &str, timeout: Duration) -> Step<bool> {
+    let re = compile_or_raise(pattern)?;
+    match io
+        .rx
+        .wait_for_regex_cancellable(&re, None, timeout, io.clock, io.cancel)
+    {
+        WaitOutcome::Matched => Ok(true),
+        WaitOutcome::TimedOut => Ok(false),
+        WaitOutcome::Cancelled => Err(LoginOutcome::Aborted(LoginAbort::Cancelled)),
     }
 }
 
-fn wait_for_regex(io: &LoginIo, pattern: &str, timeout_s: f64) -> bool {
-    match compile(pattern, PyFlags(0)) {
-        Ok(re) => wait_for(io, timeout_s, &|text| re.search(text).is_some()),
-        // Python `re.compile` 會拋例外；Rust 以「永不命中」收斂（逾時）。
-        Err(_) => wait_for(io, timeout_s, &|_| false),
-    }
-}
-
-fn probe_prompt(io: &LoginIo, p: &SessionProfile) -> Result<bool, Refused> {
+fn probe_prompt(io: &LoginIo, p: &SessionProfile) -> Step<bool> {
     io.rx.clear();
     send_command(io, "")?;
-    Ok(wait_for_regex(io, &p.template.prompt_regex, p.template.timeout_s))
+    wait_regex(io, &p.template.prompt_regex, secs(p.template.timeout_s))
 }
 
 fn classify_non_ready_state(io: &LoginIo, p: &SessionProfile) -> &'static str {
@@ -406,37 +469,52 @@ fn classify_non_ready_state(io: &LoginIo, p: &SessionProfile) -> &'static str {
     }
 }
 
-/// P5 內部版（`&'static str`）；P7 Task 3 的公開 `maybe_reclassify_flood(Option<String>)` 收斂後統一。
-fn reclassify_flood_code(io: &LoginIo, code: &'static str) -> &'static str {
-    if !FLOOD_MASKABLE_ERRORS.contains(&code) && !code.ends_with("_PROMPT_TIMEOUT") {
-        return code;
-    }
-    if io.rx.rx_stats(io.clock.mono_ns()).0 >= RX_FLOOD_BYTES_PER_10S {
-        "RX_FLOOD"
-    } else {
-        code
-    }
+fn tail_requires_login(io: &LoginIo, p: &SessionProfile) -> bool {
+    matches_login_or_password(&io.rx.tail(RX_TAIL_CHARS), p)
 }
 
-/// nonce 驗證（Slice 2.1 不送 `post_login_cmd`）；`Ok(None)` 為成功。
-fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Result<Option<&'static str>, Refused> {
+/// `_finalize_ready`：post_login_cmd（含 #174 login guard）→ nonce probe → prompt；`Ok(None)` 為成功。
+fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Step<Option<String>> {
     let t = &p.template;
+    let timeout = secs(t.timeout_s);
+    if !t.post_login_cmd.is_empty() {
+        if tail_requires_login(io, p) {
+            return Ok(Some("LOGIN_REQUIRED".into()));
+        }
+        send_command(io, &t.post_login_cmd)?;
+        if !wait_regex(io, &t.prompt_regex, timeout)? {
+            if tail_requires_login(io, p) {
+                return Ok(Some("LOGIN_REQUIRED".into()));
+            }
+            return Ok(Some("POST_LOGIN_CMD_TIMEOUT".into()));
+        }
+    }
     let nonce = (io.nonce)();
     let probe = t.ready_probe.replace("${nonce}", &nonce);
-    send_command(io, &probe)?;
-    // 裸 nonce 字串（8 位 hex，regex 與字面相同）比對整個視窗：命令回顯即可滿足（SES-16.6-05 KEEP）。
-    if !wait_for(io, t.timeout_s, &|text| text.contains(nonce.as_str())) {
-        if matches_login_or_password(&io.rx.tail(RX_TAIL_CHARS), p) {
-            return Ok(Some("LOGIN_REQUIRED"));
-        }
-        return Ok(Some("READY_NONCE_TIMEOUT"));
+    let unlock = declared(&t.console_unlock_env);
+    if unlock {
+        // 隱藏 lock 的舊 prompt 與 terminal echo 都不能作為解鎖證據。
+        io.rx.clear();
     }
-    if !wait_for_regex(io, &t.prompt_regex, t.timeout_s) {
-        return Ok(Some("READY_PROMPT_TIMEOUT"));
+    send_command(io, &probe)?;
+    let nonce_pattern = if unlock && t.ready_probe == DEFAULT_READY_PROBE {
+        format!("(?m)^__READY__{}\\r?$", escape(&nonce))
+    } else {
+        nonce
+    };
+    if !wait_regex(io, &nonce_pattern, timeout)? {
+        if tail_requires_login(io, p) {
+            return Ok(Some("LOGIN_REQUIRED".into()));
+        }
+        return Ok(Some("READY_NONCE_TIMEOUT".into()));
+    }
+    if !wait_regex(io, &t.prompt_regex, timeout)? {
+        return Ok(Some("READY_PROMPT_TIMEOUT".into()));
     }
     Ok(None)
 }
 
+/// `_resolve_login_user`：auth → `user_env`（空值即缺，**不** fallback `sp.username`）→ `sp.username`。
 fn resolve_login_user(
     p: &SessionProfile,
     auth: &SessionAuth,
@@ -480,38 +558,112 @@ fn maybe_login(
     p: &SessionProfile,
     auth: &SessionAuth,
     env: &dyn SysEnv,
-) -> Result<(bool, Option<&'static str>), Refused> {
+) -> Step<(bool, Option<String>)> {
     let t = &p.template;
+    let timeout = secs(t.timeout_s);
     let (user, _unreachable_err) = resolve_login_user(p, auth, env);
-    let needs_login = user.is_some() || t.pass_env.as_deref().is_some_and(|k| !k.is_empty());
-    if !needs_login {
+    if user.is_none() && !declared(&t.pass_env) {
         return Ok((false, None));
     }
-    if !wait_for_regex(io, &t.login_regex, t.timeout_s) {
-        return Ok((false, Some("LOGIN_PROMPT_TIMEOUT")));
+    if !wait_regex(io, &t.login_regex, timeout)? {
+        return Ok((false, Some("LOGIN_PROMPT_TIMEOUT".into())));
     }
     let Some(user) = user else {
-        return Ok((false, Some("LOGIN_USER_REQUIRED")));
+        return Ok((false, Some("LOGIN_USER_REQUIRED".into())));
     };
     send_command(io, &user)?;
-    if wait_for_regex(io, &t.password_regex, t.timeout_s) {
+    let timeout_code = prompt_timeout_error(&t.platform);
+    if wait_regex(io, &t.password_regex, timeout)? {
         let password = match resolve_login_password(p, auth, env) {
             Ok(password) => password,
-            Err(code) => return Ok((false, Some(code))),
+            Err(code) => return Ok((false, Some(code.into()))),
         };
         send_secret(io, &password)?;
-        let ok = wait_for_regex(io, &t.prompt_regex, t.timeout_s);
+        let ok = wait_regex(io, &t.prompt_regex, timeout)?;
         io.rx.clear();
-        return Ok(if ok {
-            (true, None)
-        } else {
-            (false, Some(prompt_timeout_error(&t.platform)))
-        });
+        return Ok((ok, (!ok).then(|| timeout_code.into())));
     }
-    let ok = wait_for_regex(io, &t.prompt_regex, t.timeout_s);
-    Ok(if ok {
-        (true, None)
-    } else {
-        (false, Some(prompt_timeout_error(&t.platform)))
-    })
+    let ok = wait_regex(io, &t.prompt_regex, timeout)?;
+    Ok((ok, (!ok).then(|| timeout_code.into())))
+}
+
+/// `_console_tail_line` 的純函式部分：`clean_text(tail).rstrip("\r\n").split("\n")[-1]`。
+fn console_tail_line(rx_tail: &str) -> String {
+    let cleaned = clean_text(rx_tail);
+    let trimmed = cleaned.trim_end_matches(['\r', '\n']);
+    trimmed.rsplit('\n').next().unwrap_or("").to_string()
+}
+
+/// `_wait_console_idle`：每筆真實 RX 都重設靜默計時；此階段完全不送 UART bytes。
+fn wait_console_idle(io: &LoginIo, p: &SessionProfile, deadline: u64) -> Step<bool> {
+    let idle_s = p.template.console_unlock_idle_s;
+    let idle_ns = secs(idle_s).as_nanos().min(u64::MAX as u128) as u64;
+    let start = io.clock.mono_ns();
+    loop {
+        if io.cancel.is_triggered() {
+            return Err(LoginOutcome::Aborted(LoginAbort::Cancelled));
+        }
+        let now = io.clock.mono_ns();
+        if now >= deadline {
+            return Ok(false);
+        }
+        if now.saturating_sub(start) >= idle_ns && io.rx.idle_s(now) >= idle_s {
+            return Ok(true);
+        }
+        let remaining = Duration::from_nanos(deadline - now);
+        io.clock
+            .sleep(IDLE_POLL_MAX.min(IDLE_POLL_MIN.max(remaining)));
+    }
+}
+
+/// `_ensure_console_unlocked`：隱藏 console lock——靜默後辨識 prompt，必要時才送不記錄的 secret。
+fn ensure_console_unlocked(
+    io: &LoginIo,
+    p: &SessionProfile,
+    auth: &SessionAuth,
+) -> Step<Option<String>> {
+    let t = &p.template;
+    let Some(secret) = auth.console_unlock.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(Some("CREDENTIALS_UNRESOLVED".into()));
+    };
+    let timeout = secs(t.timeout_s);
+    let deadline = io
+        .clock
+        .mono_ns()
+        .saturating_add(timeout.as_nanos().min(u64::MAX as u128) as u64);
+    if !wait_console_idle(io, p, deadline)? {
+        return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
+    }
+    if console_at_bootloader(&io.rx.tail(RX_TAIL_CHARS), &t.bootloader_prompts)? {
+        return Ok(Some("CONSOLE_UNLOCK_BOOTLOADER".into()));
+    }
+    // 新 bridge 未必收到早已顯示的 shell prompt；靜默滿額後才送空行辨識。
+    let mut prompt = search_or_raise(&t.prompt_regex, &console_tail_line(&io.rx.tail(RX_TAIL_CHARS)))?;
+    if !prompt {
+        io.rx.clear();
+        send_command(io, "")?;
+        let remaining = Duration::from_nanos(deadline.saturating_sub(io.clock.mono_ns()));
+        prompt = wait_regex(io, &t.prompt_regex, BLANK_LINE_PROBE_MAX.min(remaining))?;
+    }
+    if !prompt {
+        if !wait_console_idle(io, p, deadline)? {
+            return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
+        }
+        if console_at_bootloader(&io.rx.tail(RX_TAIL_CHARS), &t.bootloader_prompts)? {
+            return Ok(Some("CONSOLE_UNLOCK_BOOTLOADER".into()));
+        }
+        // 此 buffer 已在空行 probe 前清空；接受等待期間到達的新 prompt。
+        if search_or_raise(&t.prompt_regex, &clean_text(&io.rx.text_from(0)))? {
+            return finalize_ready(io, p);
+        }
+        if io.rx.idle_s(io.clock.mono_ns()) < t.console_unlock_idle_s {
+            return Ok(Some("CONSOLE_UNLOCK_IDLE_TIMEOUT".into()));
+        }
+        io.rx.clear();
+        send_secret(io, secret)?;
+        if !wait_regex(io, &t.prompt_regex, timeout)? {
+            return Ok(Some("CONSOLE_UNLOCK_PROMPT_TIMEOUT".into()));
+        }
+    }
+    finalize_ready(io, p)
 }

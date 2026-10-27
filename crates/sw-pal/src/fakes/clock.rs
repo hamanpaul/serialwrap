@@ -155,6 +155,28 @@ impl Clock for FakeClock {
         deadline_ns: u64,
         cancel: &crossbeam_channel::Receiver<()>,
     ) -> bool {
+        if !self.is_threaded {
+            // 非 threaded 模式（`sleep` 自行推進）：沒有其他 thread 會推進時鐘，故比照 `sleep` 以 10 ms 切片自行
+            // 推進；每片先以 5 ms 實時等待取消訊號（讓其他 thread 交付 RX），收到即回 false
+            //（P7 Task 3：`RxShared::wait_for_regex_cancellable`；與 P5 login 等待的輪詢節奏相同）。
+            const SLICE: Duration = Duration::from_millis(10);
+            const REAL_YIELD: Duration = Duration::from_millis(5);
+            loop {
+                let now = self.mono_ns();
+                if now >= deadline_ns {
+                    return true;
+                }
+                if cancel.recv_timeout(REAL_YIELD).is_ok() {
+                    return false;
+                }
+                let step = SLICE.min(Duration::from_nanos(deadline_ns - now));
+                self.sleeps
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(step);
+                self.advance(step);
+            }
+        }
         let advanced = self.subscribe();
         loop {
             let now = self.mono_ns();

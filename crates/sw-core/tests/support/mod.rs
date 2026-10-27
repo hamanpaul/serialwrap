@@ -1020,11 +1020,15 @@ impl EffectExecutor for RigExec {
                 std::thread::spawn(move || {
                     let send = sw_core::login_fsm::login_tx_sender(handle, epoch, 0, fsm_gen);
                     let nonce = rig_nonce;
+                    // P7 Task 3：LoginIo 增 cancel／class（Task 7 起由 OpRunner 依 run 種類決定 class）。
+                    let cancel = sw_core::uart_bridge::RunCancel::new(&rx);
                     let io = sw_core::login_fsm::LoginIo {
                         rx: &rx,
                         tx: &send,
                         clock: &*clock,
                         nonce: &nonce,
+                        cancel: &cancel,
+                        class: sw_core::tx_writer::TxClass::LoginProbe,
                     };
                     let Some(result) =
                         sw_core::login_fsm::run_login_plan(&io, &profile, &plan, &*env)

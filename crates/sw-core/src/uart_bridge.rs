@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -106,6 +106,10 @@ impl RxWindow {
 pub struct RxShared {
     inner: Mutex<RxWindow>,
     changed: Condvar,
+    /// P7 Task 3：`wait_for_regex_cancellable` 的喚醒通道（append／clear／`RunCancel::trigger` 時 `try_send`）。
+    wakers: Mutex<Vec<Sender<()>>>,
+    /// P7 Task 3：測試替身固定 `rx_stats` 的 bytes（`ScriptedBridge.rx_stats`）；`u64::MAX` 為未設定。
+    stats_override: AtomicU64,
 }
 
 impl RxShared {
@@ -117,7 +121,21 @@ impl RxShared {
                 ..RxWindow::default()
             }),
             changed: Condvar::new(),
+            wakers: Mutex::new(Vec::new()),
+            stats_override: AtomicU64::new(u64::MAX),
         })
+    }
+
+    /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
+    fn wake_all(&self) {
+        self.changed.notify_all();
+        let mut wakers = self.wakers.lock().unwrap_or_else(|error| error.into_inner());
+        wakers.retain(|tx| {
+            !matches!(
+                tx.try_send(()),
+                Err(crossbeam_channel::TrySendError::Disconnected(()))
+            )
+        });
     }
 
     pub fn append(&self, data: &[u8], now: Mono, epoch: u64, rx_seq: u64) {
@@ -133,7 +151,8 @@ impl RxShared {
             window.text.push_str(&decode_utf8_replace(data));
             window.trim_to_limit();
         }
-        self.changed.notify_all();
+        drop(window);
+        self.wake_all();
     }
 
     pub fn watermark(&self) -> (u64, u64) {
@@ -150,7 +169,8 @@ impl RxShared {
             .saturating_add(window.text.chars().count() as u64);
         window.text.clear();
         window.revision = window.revision.saturating_add(1);
-        self.changed.notify_all();
+        drop(window);
+        self.wake_all();
     }
 
     pub fn snapshot_len(&self) -> u64 {
@@ -183,6 +203,10 @@ impl RxShared {
     }
 
     pub fn rx_stats(&self, now: Mono) -> (u64, u64) {
+        let fixed = self.stats_override.load(Ordering::Acquire);
+        if fixed != u64::MAX {
+            return (fixed, fixed / 10);
+        }
         let mut window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         window.prune_rate(now);
         let total = window
@@ -706,18 +730,24 @@ impl IoWorker {
 /// login run 的取消旗標（SC-30）：`Arc<AtomicBool>`＋喚醒所屬 `RxShared` 的等待者；不得使用 PAL `CancelToken`。
 #[derive(Clone)]
 pub struct RunCancel {
-    _flag: Arc<AtomicBool>,
+    flag: Arc<AtomicBool>,
+    rx: Arc<RxShared>,
 }
 
 impl RunCancel {
-    pub fn new(_rx: &Arc<RxShared>) -> Self {
-        todo!("P7 Task 7")
+    pub fn new(rx: &Arc<RxShared>) -> Self {
+        RunCancel {
+            flag: Arc::new(AtomicBool::new(false)),
+            rx: Arc::clone(rx),
+        }
     }
+    /// 設旗標並喚醒等待中的 `wait_for_regex_cancellable`（P7 Task 3 先行；Task 7 由 `Effect::CancelLogin` 觸發）。
     pub fn trigger(&self) {
-        todo!("P7 Task 7")
+        self.flag.store(true, Ordering::Release);
+        self.rx.wake_all();
     }
     pub fn is_triggered(&self) -> bool {
-        todo!("P7 Task 7")
+        self.flag.load(Ordering::Acquire)
     }
 }
 
@@ -730,15 +760,56 @@ pub enum WaitOutcome {
 }
 
 impl RxShared {
+    /// Python `wait_for_regex`（整窗或自絕對偏移 `from` 起）＋SC-30 取消：先比對、再看期限；未命中時以
+    /// `Clock::wait_until_or_cancel` 等到期限或「RX／clear／取消」喚醒（P7 Task 3 先行實作）。
     pub fn wait_for_regex_cancellable(
         &self,
-        _re: &PyRegex,
-        _from: Option<u64>,
-        _timeout: Duration,
-        _clock: &dyn Clock,
-        _cancel: &RunCancel,
+        re: &PyRegex,
+        from: Option<u64>,
+        timeout: Duration,
+        clock: &dyn Clock,
+        cancel: &RunCancel,
     ) -> WaitOutcome {
-        todo!("P7 Task 7")
+        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let deadline = clock.mono_ns().saturating_add(timeout_ns);
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        self.wakers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(wake_tx);
+        loop {
+            if cancel.is_triggered() {
+                return WaitOutcome::Cancelled;
+            }
+            let (snapshot, revision) = {
+                let window = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                (window.text_from(from.unwrap_or(0)).to_string(), window.revision)
+            };
+            if re.search(&snapshot).is_some() {
+                return WaitOutcome::Matched;
+            }
+            if clock.mono_ns() >= deadline {
+                return WaitOutcome::TimedOut;
+            }
+            while wake_rx.try_recv().is_ok() {}
+            let changed = self
+                .inner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .revision
+                != revision;
+            if changed || cancel.is_triggered() {
+                continue;
+            }
+            clock.wait_until_or_cancel(deadline, &wake_rx);
+        }
+    }
+
+    /// P7 Task 3（測試替身）：固定 `rx_stats` 回報的 10 s bytes（`None` 恢復實際統計）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_rx_stats_override(&self, bytes: Option<u64>) {
+        self.stats_override
+            .store(bytes.unwrap_or(u64::MAX), Ordering::Release);
     }
     /// 最後一個 append 的 `rx_seq`（`LoginFinished.after_rx_seq` 來源）。
     pub fn last_rx_seq(&self) -> u64 {
