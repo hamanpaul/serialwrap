@@ -1274,6 +1274,71 @@ def test_spike3_arm_hold_rearms_expired_ack_before_accepting(monkeypatch, tmp_pa
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_spike3_arm_hold_never_accepts_only_expired_acknowledgements(monkeypatch, tmp_path):
+    """helper 每次 ACK 的 lease 都已到期（或剩餘不足安全邊界）時，真實 arm_hold 必須逾時失敗、不得記錄 lease。"""
+    import importlib.util
+    import json
+    import threading
+
+    script = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_always_expired_ack_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.AV_HELPER_READY_TIMEOUT_S = 0.3
+    recorder = module.Recorder()
+    helper = module.AvHelper(tmp_path, SEED, recorder)
+    (tmp_path / "raw.wal.ndjson").write_bytes(b"prefill\n")
+
+    class RunningProcess:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    helper._proc = RunningProcess()
+    stop = threading.Event()
+    request_ids: set[str] = set()
+
+    def serve_expired_acks():
+        while not stop.is_set():
+            try:
+                request = json.loads(helper._go.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                time.sleep(0.001)
+                continue
+            request_id = request.get("request_id")
+            if not isinstance(request_id, str) or request_id in request_ids:
+                time.sleep(0.001)
+                continue
+            request_ids.add(request_id)
+            now_ns = time.perf_counter_ns()
+            # 交替送出「已到期」與「剩餘時間落在安全邊界內」的 lease；兩者都不得被接受。
+            remaining_ns = -1 if len(request_ids) % 2 else module.AV_HELPER_LEASE_SAFETY_NS // 2
+            until_ns = now_ns + remaining_ns
+            helper._ack.write_text(
+                json.dumps({
+                    "request_id": request_id, "held_file": "raw.wal.ndjson", "hold_ms": 200,
+                    "acquired_ns": until_ns - 200_000_000, "until_ns": until_ns,
+                }),
+                encoding="utf-8",
+            )
+
+    server = threading.Thread(target=serve_expired_acks, daemon=True)
+    server.start()
+    try:
+        assert helper.arm_hold("raw.wal.ndjson") is False
+        assert len(request_ids) >= 2, "過期 ACK 必須觸發重新 go，而不是只讀一次"
+        assert helper.lease_acquired_ns is None and helper.lease_until_ns is None
+        assert "逾時" in (helper.launch_error or "")
+    finally:
+        stop.set()
+        server.join(1)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 @pytest.mark.parametrize(
     "response_mode",
     ["wrong_request_id", "wrong_held_file", "hold_too_short", "hold_too_long", "helper_error", "invalid_times", "helper_exited", "timeout"],
