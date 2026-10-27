@@ -164,6 +164,10 @@ struct Running {
 }
 
 fn spawn(spec: &HandlerSpec) -> Result<Running, PalError> {
+    // 從建立可繼承子端 pipe 到 CreateProcessW 後關閉子端為止，與其他 CreateProcessW 互斥（審查 96b28dd_06c61d0 L3）。
+    let spawn_guard = super::WIN_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let (child_in, mut parent_in) = pipe(true)?;
     let (child_out, mut parent_out) = pipe(false)?;
     let (child_err, mut parent_err) = pipe(false)?;
@@ -239,6 +243,7 @@ fn spawn(spec: &HandlerSpec) -> Result<Running, PalError> {
     let thread = Owned(info.hThread);
     // 子端 handle 已複製進子行程，父行程立即關閉（否則讀端永遠等不到 EOF）。
     drop((child_in, child_out, child_err));
+    drop(spawn_guard);
 
     // SAFETY: 建立匿名 Job。
     let job = Owned(unsafe { CreateJobObjectW(ptr::null(), ptr::null()) });

@@ -504,7 +504,7 @@ fn stop_deadline_aborts_running_handlers() {
     let t0 = Instant::now();
     let rep = d.stop(Instant::now() + Duration::from_millis(200));
     assert!(
-        t0.elapsed() <= Duration::from_millis(300) + Duration::from_millis(100),
+        t0.elapsed() <= Duration::from_millis(300),
         "{:?}",
         t0.elapsed()
     );
@@ -567,6 +567,7 @@ fn stop_reports_unreaped_when_run_ignores_abort() {
     }
     let t0 = Instant::now();
     let rep = d.stop(Instant::now() + Duration::from_millis(200));
+    // ignore_abort：deadline 200 ms＋abort 寬限 100 ms 本身即 300 ms，再加 100 ms 排程餘裕（審查 96b28dd_06c61d0 91109e7-3）。
     assert!(
         t0.elapsed() <= Duration::from_millis(300) + Duration::from_millis(100),
         "{:?}",
@@ -619,4 +620,84 @@ fn timeout_kills_process_group() {
     let ms = ev.get("duration_ms").unwrap().as_i64().unwrap();
     assert!((300..5000).contains(&ms), "{ms}");
     d.stop(soon());
+}
+
+/// `read` 在 gate 開啟前阻塞的 FsOps（其餘委派原生）：讓 worker 停在 `counters.load`（登記 `running` 之前）。
+struct GatedFs {
+    inner: Arc<dyn sw_pal::traits::FsOps>,
+    open: Mutex<bool>,
+    cv: std::sync::Condvar,
+    entered: std::sync::atomic::AtomicBool,
+}
+
+impl sw_pal::traits::FsRead for GatedFs {
+    fn read(&self, p: &std::path::Path) -> sw_pal::traits::PalResult<Vec<u8>> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut g = self.open.lock().unwrap();
+        while !*g {
+            g = self.cv.wait(g).unwrap();
+        }
+        self.inner.read(p)
+    }
+    fn exists(&self, p: &std::path::Path) -> bool {
+        self.inner.exists(p)
+    }
+    fn is_dir(&self, p: &std::path::Path) -> bool {
+        self.inner.is_dir(p)
+    }
+    fn is_file(&self, p: &std::path::Path) -> bool {
+        self.inner.is_file(p)
+    }
+    fn list_dir(&self, p: &std::path::Path) -> sw_pal::traits::PalResult<Vec<String>> {
+        self.inner.list_dir(p)
+    }
+}
+
+impl sw_pal::traits::FsOps for GatedFs {
+    fn mkdirs(&self, p: &std::path::Path) -> sw_pal::traits::PalResult<()> {
+        self.inner.mkdirs(p)
+    }
+    fn replace(&self, a: &std::path::Path, b: &std::path::Path) -> sw_pal::traits::PalResult<()> {
+        self.inner.replace(a, b)
+    }
+    fn sync_file(&self, p: &std::path::Path) -> sw_pal::traits::PalResult<()> {
+        self.inner.sync_file(p)
+    }
+    fn create_truncate(&self, p: &std::path::Path, b: &[u8]) -> sw_pal::traits::PalResult<()> {
+        self.inner.create_truncate(p, b)
+    }
+}
+
+#[test]
+fn stop_aborts_handler_registered_after_deadline() {
+    // 審查 96b28dd_06c61d0 91109e7-1：worker 已計入 inflight、尚未登記 running 時 stop 逾時——之後登記的 handler
+    // 必須立即 abort（不得 spawn 一個不受控的 handler）。
+    let r = rig();
+    let gated = Arc::new(GatedFs {
+        inner: sw_pal::native().fs,
+        open: Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+        entered: std::sync::atomic::AtomicBool::new(false),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let counters = Arc::new(CounterStore::new(dir.path().into(), gated.clone()).unwrap());
+    let sp = FakeHandlerSpawner::blocking();
+    let clock: Arc<dyn Clock> = r.clock.clone();
+    let env: Arc<dyn SysEnv> = r.env.clone();
+    let d = Dispatcher::start(8, sp.clone(), counters, r.emit.as_fn(), env, clock);
+    d.dispatch(fire("o.a", "COM0", 1), "x".into());
+    while !gated.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let rep = d.stop(Instant::now() + Duration::from_millis(50));
+    assert_eq!(rep.unreaped, ["o.a"], "仍卡在 counters.load");
+    *gated.open.lock().unwrap() = true;
+    gated.cv.notify_all();
+    r.emit.wait_for("fire_timeout", 1);
+    assert_eq!(
+        sp.aborts_seen(),
+        [true],
+        "登記時即已 abort：run 立即回 TimedOut"
+    );
 }

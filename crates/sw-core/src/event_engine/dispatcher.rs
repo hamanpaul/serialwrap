@@ -137,6 +137,8 @@ pub fn stdin_bytes(payload: &PyDict) -> Vec<u8> {
 #[derive(Default)]
 struct State {
     closed: bool,
+    /// stop 已逾時：之後才登記 `running` 的 handler 立即 abort（審查 96b28dd_06c61d0 91109e7-1）。
+    aborting: bool,
     busy: HashSet<String>,
     inflight: usize,
     running: HashMap<String, HandlerAbort>,
@@ -218,11 +220,13 @@ impl Shared {
             tail_bytes: STDIO_TAIL_BYTES,
         };
         let abort = HandlerAbort::new();
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .running
-            .insert(rule.rule_id.clone(), abort.clone());
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.aborting {
+                abort.trigger();
+            }
+            st.running.insert(rule.rule_id.clone(), abort.clone());
+        }
         let start = py_time_s(&*self.clock);
         let outcome = self.spawner.run(&spec, &abort);
         let duration = || PyValue::from(((py_time_s(&*self.clock) - start) * 1000.0) as i64);
@@ -407,7 +411,8 @@ impl Dispatcher {
             return DispatcherStopReport::default();
         }
         let aborted = {
-            let st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.aborting = true;
             for abort in st.running.values() {
                 abort.trigger();
             }

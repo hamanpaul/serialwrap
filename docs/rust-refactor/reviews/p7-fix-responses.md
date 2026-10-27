@@ -95,3 +95,16 @@
 | c58e8d4-4 | Low | parity #5 未在 `runtime_paths.{posix,windows}.tsv` 加欄 | **deferred**：該 golden 只涵蓋 client `resolve()` 的 `RuntimePaths`，無 daemon 目錄欄位；加欄需改 P2 擷取器與既有列的 JSON 內容（非 add-only），且 windows 側需 Windows Python。POSIX 期望值已由本 session 與審查者以 CPython 3.12 實跑核對一致；windows ntpath 期望值列 P7-LW-4 |
 | c58e8d4-5 | Low | 介面偏離只記在檔頭；紅燈宣稱無法核實；計畫測試名不一致 | **fixed**：08 Task 13／15 加「P7 修訂」區塊列出簽章；新增計畫名 `tail_reads_current_file_only`（與既有測試並存，鎖 add-only）；`p7-evidence/red-runs.md` 記錄各 Task 紅燈命令與結果 |
 | 96b28dd-1 | Low | 證據 README 差異說明不完整、PTY 測試缺同範圍兩次重跑紀錄 | **fixed**：README 補「c58e8d4 列的完整差異」（+7／−4、重跑命令與結果、殘留 daemon 觀察的 pid／environ／fd） |
+
+## 第 6 輪：p7-cloud/96b28dd_06c61d0（Opus）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| fa7e409-1 | Medium | POSIX 經 glibc `execvp` 的 ENOEXEC→`/bin/sh` 後備：無 shebang 檔 Python `fire_failed [Errno 8]`、Rust `fire_completed` | **fixed**：`handler_posix::ExecPlan` 於 fork 前備妥 argv／envp／候選路徑（argv0 含 `/` 只試本身；否則 spec.env `PATH`，無則 `os.defpath`），`pre_exec` 內逐一 `execve`（不配置記憶體），回報第一個非 ENOENT／ENOTDIR 的 errno（同 `_posixsubprocess.child_exec`）。回歸 conformance `spawn_enoexec_is_python_like`（絕對路徑、PATH 查找、defpath 三種；修前紅，期望值 CPython 3.12 實測） |
+| fa7e409-2 | Low | 子程序 environ 被 std 排序 | **fixed（併入上項）**：envp 依 spec.env 順序；回歸 `env_order_is_spec_order`（讀 `/proc/$$/environ`；修前紅） |
+| fa7e409-3 | Low | Windows 子端 pipe 在 CreateProcessW 前已可繼承，可能被其他同時 spawn 繼承 | **fixed（部分）**：sw-pal `WIN_SPAWN_LOCK`，handler 的 pipe 建立至關閉子端、ProcessCtl 的 CreateProcessW 皆持有；sysenv／com0com 的 std `Command` 無法共用 std 內部鎖，殘留登記 P7-LW-6 觀察項 |
+| fa7e409-4 | Low | Windows exit code 以 i32 呈現 | **documented**：design-event-trigger「Windows handler 語意」註明有號 32 位元呈現（例 `0xC0000005`→`-1073741819`）；`HandlerOutcome.exit_code: i32` 凍結不改 |
+| fa7e409-5 | Low | 以 argv 內容推斷 shell 形 | **documented**：同段註明五元素 `cmd.exe /d /s /c X` 的等價規則 |
+| 91109e7-1 | Low | stop 逾時時尚未登記 running 的 worker 會漏 abort、之後 spawn 不受控 handler | **fixed**：`State.aborting` 於 trigger 迴圈前同鎖設立，`run_inner` 登記 running 時檢查並立即 abort；回歸 `stop_aborts_handler_registered_after_deadline`（以 read 阻塞的 FsOps 讓 worker 停在 `counters.load`；修前紅） |
+| 91109e7-2 | Low | 非 UTF-8 環境值以 lossy 傳遞 | **deferred**：凍結介面為 `(String, String)`；日後以 add-only 方式在 `HandlerSpec` 新增 OsString env，再登記於 behavior_changes（需獨立審閱）。實務上 PATH／HOME 非 UTF-8 罕見 |
+| 91109e7-3 | Low | `stop_deadline_aborts_running_handlers` 上限放寬到 400 ms 無理由 | **fixed**：改回 ≤ 300 ms；ignore_abort 案註明 200＋100 ms 本身即 300 ms、另加 100 ms 排程餘裕 |

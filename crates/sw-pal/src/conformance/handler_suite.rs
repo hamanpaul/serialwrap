@@ -470,3 +470,82 @@ pub fn cmd_shell_preserves_inner_quotes(s: &dyn HandlerSpawner) {
     assert_eq!(exit_code, 3);
     assert!(String::from_utf8_lossy(&stdout_tail).contains("\"a  b\""));
 }
+
+/// POSIX：沒有 shebang 的 0755 檔案（審查 96b28dd_06c61d0 M1）。CPython `_posixsubprocess` 直接 `execve`，
+/// 不做 glibc `execvp` 的 ENOEXEC→`/bin/sh` 後備：`[Errno 8] Exec format error: '<argv0>'`（PATH 查找時 argv0 原樣）。
+#[cfg(unix)]
+pub fn spawn_enoexec_is_python_like(s: &dyn HandlerSpawner) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(unique_marker());
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("noshebang");
+    std::fs::write(&file, b"echo RAN-AS-SH\nexit 4\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let abs = file.to_string_lossy().into_owned();
+    let run = |argv: Vec<String>, env: Vec<(String, String)>| {
+        s.run(
+            &spec(argv, env, b"", Duration::from_secs(5)),
+            &HandlerAbort::new(),
+        )
+    };
+    let out = run(
+        vec![abs.clone()],
+        vec![("PATH".into(), "/usr/bin:/bin".into())],
+    );
+    let HandlerOutcome::SpawnFailed(e) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        e.py_message,
+        format!("[Errno 8] Exec format error: '{abs}'")
+    );
+    let path = format!("/nonexist:{}", dir.display());
+    let out = run(vec!["noshebang".into()], vec![("PATH".into(), path)]);
+    let HandlerOutcome::SpawnFailed(e) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(e.py_message, "[Errno 8] Exec format error: 'noshebang'");
+    // spec.env 無 PATH → `os.defpath`（`/bin:/usr/bin`）。
+    let out = run(vec!["sw-p7-nonexistent-binary".into()], vec![]);
+    let HandlerOutcome::SpawnFailed(e) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        e.py_message,
+        "[Errno 2] No such file or directory: 'sw-p7-nonexistent-binary'"
+    );
+    let out = run(vec!["sh".into(), "-c".into(), "exit 5".into()], vec![]);
+    assert!(
+        matches!(out, HandlerOutcome::Completed { exit_code: 5, .. }),
+        "defpath 找得到 /bin/sh：{out:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// POSIX：子程序 environ 依 spec.env 的順序（Python 依 dict 插入序；審查 96b28dd_06c61d0 L2）。
+#[cfg(unix)]
+pub fn env_order_is_spec_order(s: &dyn HandlerSpawner) {
+    let env: Vec<(String, String)> = vec![
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("SERIALWRAP_EVENT_SCHEMA_VERSION".into(), "1".into()),
+        ("SERIALWRAP_EVENT_A".into(), "a".into()),
+        ("HOME".into(), "/h".into()),
+    ];
+    let out = s.run(
+        &spec(
+            vec!["/bin/sh".into(), "-c".into(), "cat /proc/$$/environ".into()],
+            env.clone(),
+            b"",
+            Duration::from_secs(5),
+        ),
+        &HandlerAbort::new(),
+    );
+    let HandlerOutcome::Completed { stdout_tail, .. } = out else {
+        panic!("{out:?}")
+    };
+    let want: Vec<u8> = env
+        .iter()
+        .flat_map(|(k, v)| format!("{k}={v}\0").into_bytes())
+        .collect();
+    assert_eq!(stdout_tail, want);
+}

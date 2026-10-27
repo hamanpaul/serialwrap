@@ -52,6 +52,18 @@ fn native_cmd_shell_quotes() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn native_spawn_enoexec_is_python_like() {
+    suite::spawn_enoexec_is_python_like(&*native());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_env_order_is_spec_order() {
+    suite::env_order_is_spec_order(&*native());
+}
+
 #[test]
 fn shell_argv_and_env_keys_by_platform() {
     let h = native();

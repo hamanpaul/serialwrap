@@ -3,6 +3,7 @@
 //! `communicate(stdin, timeout)`：子行程結束且 stdout／stderr 皆 EOF 才算完成；逾時 `killpg(SIGTERM)` → 等 1.0 s →
 //! `killpg(SIGKILL)` → 讀完剩餘輸出。
 
+use std::ffi::CString;
 use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
@@ -20,6 +21,95 @@ pub(super) const INHERITED_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "LANG",
 const POLL: Duration = Duration::from_millis(10);
 /// Python `proc.wait(timeout=1.0)`：SIGTERM 後等子行程結束的寬限。
 const TERM_GRACE: Duration = Duration::from_secs(1);
+
+/// CPython `os.defpath`（spec.env 無 `PATH` 時的查找路徑）。
+const DEFPATH: &str = "/bin:/usr/bin";
+
+/// fork 前備妥的 `execve` 參數（CPython `_posixsubprocess.child_exec`）：argv0 含 `/` 時只試其本身，否則依
+/// spec.env 的 `PATH`（無則 `os.defpath`）逐目錄組候選；envp 依 spec.env 順序。不經 glibc `execvp`，故無
+/// ENOEXEC→`/bin/sh` 後備（審查 96b28dd_06c61d0 M1、L2）。
+struct ExecPlan {
+    _argv: Vec<CString>,
+    _envp: Vec<CString>,
+    candidates: Vec<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+    envp_ptrs: Vec<*const libc::c_char>,
+}
+
+// SAFETY: 指標只指向本結構自有、建立後不再變動的 CString 緩衝；僅在 fork 後的子行程中讀取。
+unsafe impl Send for ExecPlan {}
+unsafe impl Sync for ExecPlan {}
+
+fn cstring(s: &str) -> io::Result<CString> {
+    CString::new(s).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "embedded null byte"))
+}
+
+impl ExecPlan {
+    fn new(spec: &HandlerSpec) -> io::Result<Self> {
+        let argv: Vec<CString> = spec
+            .argv
+            .iter()
+            .map(|a| cstring(a))
+            .collect::<io::Result<_>>()?;
+        let envp: Vec<CString> = spec
+            .env
+            .iter()
+            .map(|(k, v)| cstring(&format!("{k}={v}")))
+            .collect::<io::Result<_>>()?;
+        let exe = &spec.argv[0];
+        let candidates: Vec<CString> = if exe.contains('/') {
+            vec![cstring(exe)?]
+        } else {
+            let path = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == "PATH")
+                .map_or(DEFPATH, |(_, v)| v.as_str());
+            path.split(':')
+                .map(|dir| {
+                    if dir.is_empty() {
+                        cstring(exe)
+                    } else if dir.ends_with('/') {
+                        cstring(&format!("{dir}{exe}"))
+                    } else {
+                        cstring(&format!("{dir}/{exe}"))
+                    }
+                })
+                .collect::<io::Result<_>>()?
+        };
+        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+        Ok(Self {
+            _argv: argv,
+            _envp: envp,
+            candidates,
+            argv_ptrs,
+            envp_ptrs,
+        })
+    }
+
+    /// 逐一 `execve`；成功不返回。回報第一個非 ENOENT／ENOTDIR 的 errno，否則最後一個（不配置記憶體）。
+    fn exec(&self) -> io::Error {
+        let mut saved = 0;
+        let mut last = libc::ENOENT;
+        for c in &self.candidates {
+            // SAFETY: c／argv／envp 皆為 NUL 結尾 C 字串與 NULL 結尾指標陣列，於子行程記憶體中有效。
+            unsafe {
+                libc::execve(c.as_ptr(), self.argv_ptrs.as_ptr(), self.envp_ptrs.as_ptr());
+            }
+            last = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::ENOENT);
+            if last != libc::ENOENT && last != libc::ENOTDIR && saved == 0 {
+                saved = last;
+            }
+        }
+        io::Error::from_raw_os_error(if saved != 0 { saved } else { last })
+    }
+}
 
 pub(super) fn shell_argv(shell: &str) -> Vec<String> {
     vec!["/bin/sh".into(), "-c".into(), shell.into()]
@@ -59,22 +149,26 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
         Ok(n) => n,
         Err(e) => return HandlerOutcome::SpawnFailed(posix_io_error(e)),
     };
+    let plan = match ExecPlan::new(spec) {
+        Ok(p) => p,
+        Err(e) => return HandlerOutcome::SpawnFailed(spawn_error(e, argv0)),
+    };
     let mut command = Command::new(argv0);
     command
-        .args(&spec.argv[1..])
         .env_clear()
-        .envs(spec.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: closure 只呼叫 async-signal-safe 的 setsid／close_range／fcntl，於 fork 後、exec 前執行；
-    // 只「標記」CLOEXEC（不直接關閉），保留 std 回報 exec 失敗用的 CLOEXEC pipe。
+    // SAFETY: closure 只呼叫 async-signal-safe 的 setsid／close_range／fcntl／execve，於 fork 後、exec 前執行，
+    // 不配置記憶體（argv／envp／候選路徑皆於 fork 前備妥）；只「標記」CLOEXEC（不直接關閉），保留 std 回報
+    // exec 失敗用的 CLOEXEC pipe。execve 全數失敗時回 Err，由 std 經該 pipe 回報 errno。
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            mark_inherited_fds_cloexec(max_fd)
+            mark_inherited_fds_cloexec(max_fd)?;
+            Err(plan.exec())
         });
     }
     let start = Instant::now();

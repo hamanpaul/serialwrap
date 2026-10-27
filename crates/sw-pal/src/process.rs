@@ -75,6 +75,11 @@ impl HandlerAbort {
     }
 }
 
+/// Windows：可繼承 handle 的建立到 CreateProcessW 之間的互斥（handler pipe 子端與 ProcessCtl 的 spawn 不交錯；
+/// 審查 96b28dd_06c61d0 L3）。POSIX 不使用（CLOEXEC 標記即足夠）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) static WIN_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// stdout／stderr 讀取執行緒：讀到 EOF，只保留最後 `tail` bytes（Python `stdout[-N:]` 等價）；結束時通知 `done`。
 pub(crate) fn spawn_tail_reader<R: std::io::Read + Send + 'static>(
     mut r: R,
