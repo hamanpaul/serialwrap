@@ -237,6 +237,61 @@ def test_daemon_start_stop_ab_real_daemon(tmp_path: Path, env: dict[str, str], p
     assert results["cli"] == results["python"]
 
 
+@pytest.mark.windows_native
+@pytest.mark.process_rpc
+def test_daemon_start_releases_caller_stdio_pipes(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
+    """Windows：`daemon start` 結束後，呼叫端擷取的 stdout／stderr pipe 必須立即 EOF。
+
+    背景 daemon 不得繼承 CLI 的標準輸出 pipe；否則以 `subprocess.run(capture_output)` 呼叫 CLI 的
+    agent 會一直等到 daemon 結束（SC-18 on-demand autostart 在原生 Windows 卡死 3600 秒的根因）。
+    Python 基線以 `close_fds` 只傳標準 handle，兩實作須同樣立即放行。
+    """
+    if os.name != "nt":
+        pytest.skip("windows_native：僅原生 Windows 執行")
+    if is_rust():
+        bundle_root = os.environ.get("SW_WIN_DEV_BUNDLE")
+        assert bundle_root, "Windows Rust daemon 案例需要隔離 staging bundle"
+        manifest = bundle_manifest_path(Path(bundle_root))
+        assert manifest.is_file(), f"Windows Rust bundle manifest 不存在：{manifest}"
+        env["SERIALWRAP_RELEASE_MANIFEST"] = str(manifest)
+    # 只放行不存在的 COM99：本案例不得開啟任何序列埠。
+    env["SERIALWRAP_TEST_DEVICE_ALLOWLIST"] = "COM99"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        env["SERIALWRAP_ENDPOINT"] = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+
+    proc = subprocess.Popen(
+        cli_prefix() + ["daemon", "start"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    drained = False
+    try:
+        proc.wait(timeout=90)
+        try:
+            out, err = proc.communicate(timeout=15)
+            drained = True
+        except subprocess.TimeoutExpired:
+            pytest.fail("daemon start 已結束，但呼叫端 stdout／stderr pipe 15 秒內未 EOF：背景 daemon 繼承了 CLI 的 pipe")
+        assert proc.returncode == 0, err.decode("utf-8", errors="replace")
+        assert json.loads(out.decode("utf-8")).get("ok") is True, out
+    finally:
+        # stop 的輸出導向 DEVNULL，避免本身也被同一缺陷卡住。
+        subprocess.run(
+            cli_prefix() + ["daemon", "stop"], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
+        )
+        if proc.poll() is None:
+            proc.kill()
+        if not drained:
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 @pytest.mark.case("sc20-daemon-restart")
 @pytest.mark.pidns_rig
 # P0 T14：補唯一平台 marker 與資源 marker。依賴 /proc 與 sh，故為 posix_only；Windows 由 cargo restart_* 承接 sc20，

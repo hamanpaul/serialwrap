@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FreeLibrary, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, FreeLibrary, GetHandleInformation, GetLastError, SetHandleInformation, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, SetConsoleCtrlHandler, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -31,6 +32,66 @@ use windows_sys::Win32::System::Threading::{
     DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+
+/// 串行化「暫時取消標準輸出 handle 繼承旗標」的區段，避免並行 spawn 互相還原彼此的旗標。
+static STD_INHERIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// spawn 背景 daemon 期間暫時取消目前行程 stdout／stderr 的 `HANDLE_FLAG_INHERIT`，drop 時還原。
+///
+/// 子行程的 stdout／stderr 已明確指定為 NUL（std 會另建可繼承的 NUL handle），原始 handle 不需傳給子行程；
+/// 與 stdin 相同的 handle 不動（stdin 依 Python 基線語意繼承）。
+struct StdOutputInheritGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    cleared: Vec<HANDLE>,
+}
+
+impl StdOutputInheritGuard {
+    fn suppress() -> Self {
+        let lock = STD_INHERIT_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut cleared: Vec<HANDLE> = Vec::new();
+        // SAFETY: GetStdHandle 只讀取目前行程的標準 handle 值，不解參考。
+        let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: 同上。
+            let handle = unsafe { GetStdHandle(id) };
+            if handle.is_null()
+                || handle == INVALID_HANDLE_VALUE
+                || handle == stdin
+                || cleared.contains(&handle)
+            {
+                continue;
+            }
+            let mut flags = 0u32;
+            // SAFETY: handle 為目前行程的有效標準 handle；flags 指向可寫 u32。
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0
+                || flags & HANDLE_FLAG_INHERIT == 0
+            {
+                continue;
+            }
+            // SAFETY: 只修改繼承旗標，不關閉或轉移 handle 所有權。
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                cleared.push(handle);
+            }
+        }
+        Self {
+            _lock: lock,
+            cleared,
+        }
+    }
+}
+
+impl Drop for StdOutputInheritGuard {
+    fn drop(&mut self) {
+        for handle in &self.cleared {
+            // SAFETY: 還原 suppress 時清除的繼承旗標；handle 仍為目前行程的標準 handle。
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeProcessCtl;
@@ -326,6 +387,10 @@ impl ProcessCtl for NativeProcessCtl {
                 .stderr(Stdio::null());
         }
 
+        // std 以 bInheritHandles=TRUE 建立行程：CLI 自身可繼承的 stdout／stderr（呼叫端擷取輸出的 pipe）
+        // 會被背景 daemon 一併繼承，使呼叫端在 CLI 結束後仍等到 daemon 結束才 EOF（SC-18 autostart 卡死）。
+        // 與 Python 基線（close_fds 只傳標準 handle）對齊：spawn 期間暫時取消這兩個 handle 的繼承旗標。
+        let _inherit_guard = detached.then(StdOutputInheritGuard::suppress);
         let child = command.spawn().map_err(process_io_error)?;
         let pid = child.id();
         let mut handle = crate::traits::ChildHandle::new(pid);
