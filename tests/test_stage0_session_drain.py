@@ -744,6 +744,36 @@ def test_release_persist_failure_keeps_blocking(tmp_path, monkeypatch):
     assert mgr.get_session("COM0").bridge is None
 
 
+def test_release_persist_failure_retried(tmp_path, monkeypatch):
+    """第一次 RELEASED state.json 寫入失敗後，下次 release 會接手重試。"""
+    mgr = make_manager(tmp_path, [make_profile(by_id=BY_ID)])
+    session = mgr.get_session("COM0")
+    original_save = mgr._save_state
+    save_calls = 0
+
+    def fail_once() -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 1:
+            raise OSError("disk error")
+        original_save()
+
+    monkeypatch.setattr(mgr, "_save_state", fail_once)
+    with pytest.raises(OSError, match="disk error"):
+        mgr.release_device("COM0")
+
+    assert session.state == "RELEASED"
+    assert session._release_persist_pending is True
+    assert BY_ID in mgr._released_by_ids
+
+    response = mgr.release_device("COM0")
+    assert response["ok"] is True and response["already_released"] is True
+    assert session._release_persist_pending is False
+    assert save_calls == 2
+    saved = json.loads(Path(mgr._state_path).read_text(encoding="utf-8"))
+    assert saved["released"][session.session_id]["by_id"] == BY_ID
+
+
 def test_duplicate_release_waits_for_persist_completion(tmp_path, monkeypatch):
     mgr, _session, _bridge = _ready_with_port(tmp_path, FakePort())
     save_started = threading.Event()

@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 #[cfg(any(test, feature = "test-fakes"))]
 use std::cell::Cell;
 
-pub use crate::proc_holders::posix::{probe_holders_in, PosixUartExclusive};
+pub use crate::proc_holders::posix::{PosixUartExclusive, probe_holders_in};
 use crate::traits::{
     CloseImpl, CloseReceipt, CloseToken, DevicePath, HolderReport, HolderScanStatus, IoWaker,
-    OpenError, PalError, PalResult, ReadOutcome, SerialBackend, SerialConfig, SerialHandle,
-    SerialReader, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep, TxOutcome, TxResult,
-    UartExclusive,
+    OpenError, PalError, PalResult, ReadError, ReadOutcome, SerialBackend, SerialConfig,
+    SerialHandle, SerialReader, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep, TxOutcome,
+    TxResult, UartExclusive,
 };
 
 /// POSIX 序列埠後端。`post_excl_fault` 只供 test-fakes 注入「TIOCEXCL 成功後」的失敗。
@@ -306,7 +306,8 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
         return Err(open_error(code, || ops.probe_holders()));
     }
     if let Err(code) = ops.flock() {
-        let error = if code == libc::EWOULDBLOCK || code == libc::EAGAIN {
+        // serial_port.py:387：flock 失敗 errno ∈ {EACCES, EAGAIN, EWOULDBLOCK} → Held（parity-amendments-2026-10-26 #63）。
+        let error = if code == libc::EWOULDBLOCK || code == libc::EAGAIN || code == libc::EACCES {
             OpenError::Held(finalize_holder_report(ops.probe_holders()))
         } else {
             OpenError::Other(PalError::from_errno(code))
@@ -323,7 +324,8 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
         return Err(OpenError::Other(PalError::from_errno(code)));
     }
 
-    let holders = finalize_holder_report(ops.probe_holders());
+    // 鎖後重掃沿用 probe 本身的 holder_unknown 規則（pids 空且 status 非 ok；parity-amendments-2026-10-26 #64）。
+    let holders = ops.probe_holders();
     match post_lock_holder_verdict(&holders) {
         PostLockVerdict::Reject => {
             cleanup_open_failure(ops, dev);
@@ -345,14 +347,11 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
 
 fn open_error(code: i32, mut holders: impl FnMut() -> HolderReport) -> OpenError {
     match code {
-        libc::ENOENT | libc::ENODEV | libc::ENXIO => {
-            OpenError::NotFound(PalError::from_errno(code))
-        }
+        // serial_port.py:373-379：只有 ENOENT → DeviceNotPresentError、EBUSY → DeviceHeldError；
+        // EACCES／EPERM／ENODEV／ENXIO 等原樣 raise OSError（parity-amendments-2026-10-26 #62）。
+        // `AccessDenied` 只由 Windows 後端產生。
+        libc::ENOENT => OpenError::NotFound(PalError::from_errno(code)),
         libc::EBUSY => OpenError::Held(finalize_holder_report(holders())),
-        libc::EACCES | libc::EPERM => OpenError::AccessDenied {
-            os: PalError::from_errno(code),
-            holder: finalize_holder_report(holders()),
-        },
         _ => OpenError::Other(PalError::from_errno(code)),
     }
 }
@@ -830,6 +829,19 @@ struct PosixCloseToken {
 }
 
 impl CloseImpl for PosixCloseToken {
+    fn is_alive(&self) -> bool {
+        let close = self
+            .close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fd) = close.fd else {
+            return false;
+        };
+        // SAFETY：`fd` 由共用 close 狀態持有，close token 仍有效時不會被重用。
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        unsafe { libc::fstat(fd, &mut st) == 0 }
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         let mut close = self
             .close
@@ -946,7 +958,11 @@ struct PosixSerialReader {
 }
 
 impl SerialReader for PosixSerialReader {
-    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError> {
         if buf.is_empty() {
             return Ok(ReadOutcome::Data(0));
         }
@@ -981,7 +997,7 @@ impl SerialReader for PosixSerialReader {
                 if code == libc::EINTR {
                     continue;
                 }
-                return Err(PalError::from_errno(code));
+                return Err(ReadError::Wait(PalError::from_errno(code)));
             }
             if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 drain_fd(self.wake_fd, self.wake_eventfd);
@@ -990,13 +1006,15 @@ impl SerialReader for PosixSerialReader {
             if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 // SAFETY: buf 是有效輸出緩衝區，fd 由共用的關閉狀態持有。
                 let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-                match classify_read_result(n, (n < 0).then(errno), self.eio_is_pty_hangup)? {
+                match classify_read_result(n, (n < 0).then(errno), self.eio_is_pty_hangup)
+                    .map_err(ReadError::Read)?
+                {
                     Some(outcome) => return Ok(outcome),
                     None => continue,
                 }
             }
             if fds[0].revents & libc::POLLNVAL != 0 {
-                return Err(PalError::from_errno(libc::EBADF));
+                return Err(ReadError::Wait(PalError::from_errno(libc::EBADF)));
             }
         }
     }
@@ -1035,11 +1053,7 @@ impl SerialWriter for PosixSerialWriter {
             let fd = self.fd;
             let step = gate.submit(&mut || match retry_eintr(|| {
                 let n = raw_tx_write(fd, &data[sent..]);
-                if n < 0 {
-                    Err(errno())
-                } else {
-                    Ok(n)
-                }
+                if n < 0 { Err(errno()) } else { Ok(n) }
             }) {
                 Ok(n) if n > 0 => SubmitStep::Accepted(n as usize),
                 Ok(0) => SubmitStep::Failed(PalError::io(0, "write returned 0")),
@@ -1349,6 +1363,45 @@ mod tests {
     }
 
     #[test]
+    fn invalid_serial_fd_is_a_poll_wait_error() {
+        let mut wake_fds = [-1; 2];
+        // SAFETY: wake_fds 提供兩個有效輸出欄位。
+        assert_eq!(unsafe { libc::pipe(wake_fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe 回傳的 fd 由 OwnedFd 接管。
+        let wake_read = unsafe { OwnedFd::from_raw_fd(wake_fds[0]) };
+        // SAFETY: pipe 回傳的 fd 由 OwnedFd 接管。
+        let _wake_write = unsafe { OwnedFd::from_raw_fd(wake_fds[1]) };
+
+        let mut serial_fds = [-1; 2];
+        // SAFETY: serial_fds 提供兩個有效輸出欄位。
+        assert_eq!(unsafe { libc::pipe(serial_fds.as_mut_ptr()) }, 0);
+        let serial_fd = serial_fds[0];
+        // SAFETY: serial_fds[1] 是 pipe 回傳的唯一寫入 fd，交由 OwnedFd 關閉。
+        let _serial_write = unsafe { OwnedFd::from_raw_fd(serial_fds[1]) };
+        // SAFETY: serial_fd 是 pipe 回傳的有效讀取 fd；刻意關閉以重現 poll(POLLNVAL)。
+        assert_eq!(unsafe { libc::close(serial_fd) }, 0);
+
+        let close = Arc::new(Mutex::new(PosixClose {
+            fd: None,
+            path: "<closed-test-fd>".to_string(),
+            wake_r: None,
+            wake_w: None,
+            waker: Arc::new(PosixIoWaker::new(None, None)),
+        }));
+        let mut reader = PosixSerialReader {
+            fd: serial_fd,
+            wake_fd: wake_read.as_raw_fd(),
+            wake_eventfd: false,
+            eio_is_pty_hangup: false,
+            _close: close,
+        };
+        match reader.read(&mut [0u8; 8], Some(Duration::from_millis(100))) {
+            Err(ReadError::Wait(error)) => assert_eq!(error.os_code, Some(libc::EBADF)),
+            other => panic!("poll(POLLNVAL) 應回 ReadError::Wait(EBADF)，得到 {other:?}"),
+        }
+    }
+
+    #[test]
     fn write_retries_eintr_without_losing_result() {
         let mut attempts = 0;
         let mut results = [Err(libc::EINTR), Ok(4isize)].into_iter();
@@ -1485,13 +1538,19 @@ mod tests {
 
     #[test]
     fn holder_scan_excludes_self_and_matches_rdev() {
+        // parity-amendments-2026-10-26 #64：同一 tty 改以 (st_dev, st_ino) 判定，fd 必須指向真實存在的同一
+        // inode（舊版以 readlink 字串比對不存在的 /dev/pts/9，已與 Python `same_tty` 不符）。
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        make_fd_link(root, 123, "/dev/pts/9");
-        make_fd_link(root, std::process::id(), "/dev/pts/9"); // 自身 pid 必須被排除
-        let rep = probe_holders_in(root, "/dev/pts/9");
+        let root = tmp.path().join("proc");
+        let tty = tmp.path().join("tty9");
+        std::fs::write(&tty, b"").expect("tty 替身");
+        let tty = tty.to_string_lossy().into_owned();
+        make_fd_link(&root, 123, &tty);
+        make_fd_link(&root, std::process::id(), &tty); // 自身 pid 必須被排除
+        let rep = probe_holders_in(&root, &tty);
         assert_eq!(rep.pids, vec![123]);
         assert_eq!(rep.status, HolderScanStatus::Ok);
+        assert!(!rep.holder_unknown);
     }
 
     #[test]

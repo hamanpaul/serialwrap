@@ -20,8 +20,9 @@ use sw_core::login_fsm::{
     LoginPlan, FLOOD_MASKABLE_ERRORS, LOGIN_FSM_DETAIL_ERRORS,
 };
 use sw_core::quiet_gate::{
-    detect_boot_banner, is_reboot_command, slice21_unsupported_feature, valid_completion_regex,
-    QuietState, QuietTransition, BOOT_BANNER_PATTERNS,
+    detect_boot_banner, is_reboot_command, matches_any_bootloader_prompt,
+    slice21_unsupported_feature, valid_completion_regex, QuietState, QuietTransition,
+    BOOT_BANNER_PATTERNS,
 };
 use sw_core::session_auth::{
     credentials_declared_but_unresolved, parse_env_file, resolve_session_auth, AuthResolution,
@@ -47,6 +48,14 @@ const LOGIN_PROFILE: &str = "profiles:\n  l:\n    platform: shell\n    prompt_re
 const LOGIN_ENV_PROFILE: &str = "profiles:\n  e:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: e, act_no: 1, alias: e+1, device_by_id: /s/by-id/usb-A}\n";
 const BOOTLOADER_PROFILE: &str = "profiles:\n  b:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    bootloader_prompts: ['(?m)^=> $']\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: b, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
 const BRCM_POST_LOGIN_PROFILE: &str = "profiles:\n  brcm-template:\n    platform: bcm\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    post_login_cmd: sh\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: brcm-template, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
+
+/// prompt 以 `$` 錨定視窗尾端：nonce 回顯後若無新 prompt，整窗比對即不命中（READY_PROMPT_TIMEOUT 可達）。
+/// Python `wait_for_regex` 比對整個 RX 視窗（SES-16.6-05 KEEP），`(?m)^root@t:.*# ` 這類 prompt 會被 probe 早已收到的
+/// prompt 滿足，READY_PROMPT_TIMEOUT 不可達（Python 實測 `probe_ready` 回 `(True, None)`）。
+const ANCHORED_PROMPT_PROFILE: &str = "profiles:\n  a:\n    platform: shell\n    prompt_regex: 'root@t:/# $'\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: a, act_no: 1, alias: a+1, device_by_id: /s/by-id/usb-A}\n";
+
+/// #93：`bootloader_prompts` 含不合法 regex（`[invalid(`）與合法樣式。
+const INVALID_BOOTLOADER_PROFILE: &str = "profiles:\n  b:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    bootloader_prompts: ['[invalid(', '(?m)^=> $']\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: b, act_no: 1, alias: b+1, device_by_id: /s/by-id/usb-A}\n";
 
 fn secs(s: u64) -> Mono {
     s * 1_000_000_000
@@ -107,8 +116,9 @@ fn device_reply(dev: Dev, bytes: &[u8]) -> Vec<u8> {
         "\r\nPassword: "
     } else {
         match dev {
-            Dev::Shell | Dev::NonceSilent | Dev::PromptNoNonce | Dev::Login => PROMPT,
-            Dev::LoginPrompt => "\r\nlogin: ",
+            Dev::Shell | Dev::NonceSilent | Dev::PromptNoNonce => PROMPT,
+            // 依 `Dev::Login` 文件：LF→`login:`（原列於 PROMPT 分支，與文件矛盾）。
+            Dev::LoginPrompt | Dev::Login => "\r\nlogin: ",
             Dev::Silent => "",
         }
     };
@@ -316,6 +326,48 @@ fn bootloader_prompt_tail_prevents_clear() {
 }
 
 #[test]
+fn invalid_bootloader_regex_skipped() {
+    // parity-amendments-2026-10-26 #93（B-43 部分）：不合法 regex 照 `_matches_any_bootloader_prompt`
+    // 靜默略過（Python 只 `continue`、不 log），其餘樣式照常比對。
+    let p = profile_of(INVALID_BOOTLOADER_PROFILE);
+    assert_eq!(
+        matches_any_bootloader_prompt("U-Boot\r\n=> ", &p.template.bootloader_prompts),
+        Some("(?m)^=> $".to_string())
+    );
+    assert_eq!(
+        matches_any_bootloader_prompt("=> ", &["[invalid(".to_string()]),
+        None,
+        "全部不合法 → 視為未命中"
+    );
+
+    // QuietState：合法樣式仍擋下解除；prompt_regex 照常解除。
+    let mut q = QuietState::default();
+    let now = secs(10);
+    q.arm(now);
+    assert_eq!(q.on_rx_text("=> ", &p, now), QuietTransition::None);
+    assert!(q.quiet_active(now));
+    assert_eq!(
+        q.on_rx_text("\r\nroot@t:/# ", &p, now),
+        QuietTransition::Cleared
+    );
+
+    // SessionCore：RX 路徑不 panic、不產生告警效果，quiet 維持啟用。
+    let mut h = CoreHarness::new(INVALID_BOOTLOADER_PROFILE);
+    h.to_ready();
+    h.rx(BANNER.as_bytes());
+    let effects = h.rx(b"=> ");
+    assert!(
+        !effects.iter().any(|e| matches!(e, sw_core::session_core::Effect::Warn(_))),
+        "Python 不記錄 invalid bootloader regex"
+    );
+    assert!(h.fence.with(|f| f.quiet_active));
+    assert_eq!(
+        pget(&h.public(), "boot_quiet_remaining_s"),
+        PyValue::Float(180.0)
+    );
+}
+
+#[test]
 fn reconfirm_exhausts_after_300s_ready_unconfirmed() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
@@ -361,7 +413,11 @@ fn execute_time_gate_has_retry_after_sc03() {
     h.wait_running(&hold);
     let queued = h.submit_ok("ls");
     h.inject_rx(BANNER.as_bytes());
-    h.advance(Duration::from_secs(120)); // hold 逾時，佇列中的 ls 出列
+    // Python 基線：hold 若逾時，`_recover_after_failure`（quiet 中不送救援鍵）→ `_transition_to_attached`
+    // → `_on_detached` 以 FLUSHED_BY_RECOVERY 終結佇列，ls 永遠走不到 execute-time gate。故改以 prompt 回來
+    // 讓 hold 正常完成：prompt 只清 TX 靜默維度、reconfirm pending 保留（#162），ls 出列時仍被 gate 擋下。
+    h.inject_rx(b"root@t:/# ");
+    let _ = h.wait_done(&hold);
     let done = h.wait_done(&queued);
     assert_eq!(
         done.get("error_code"),
@@ -381,10 +437,37 @@ fn execute_time_gate_has_retry_after_sc03() {
 
 #[test]
 fn quiet_blocks_login_probe_zero_tx() {
+    // Python `attach_session`：READY 不 probe（`_attach_state_result` → ok:true），ATTACHED 才經
+    // `_probe_existing_bridge` 的 quiet 單點 gate（#130 Finding 2）合成 PROMPT_UNAVAILABLE。兩態皆零 TX。
+    fn wait_quiet(h: &ActorRig) {
+        wait_until("banner 已 arm quiet", || {
+            pget(&h.get_state(), "boot_quiet_remaining_s") != PyValue::Null
+        });
+    }
+
+    // READY：不 probe、不以合成碼覆寫 READY 的 last_error（#162）。
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.inject_rx(BANNER.as_bytes());
+    wait_quiet(&h);
+    let before = h.dev.write_calls();
+    let resp = h.request(SessionRequest::SessionAttach);
+    assert_eq!(pget(&resp, "ok"), PyValue::Bool(true));
+    assert_eq!(pget(&h.get_state(), "last_error"), PyValue::Null);
+    assert_eq!(h.dev.write_calls(), before, "quiet 中不得送出任何 TX");
+
+    // ATTACHED（nonce 未回 → READY_NONCE_TIMEOUT）：quiet 中觸發 attach → LoginPlan 不啟動、PROMPT_UNAVAILABLE。
+    let h = ActorRig::new(SHELL_PROFILE);
+    h.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# ");
+    let h = h.attach();
+    h.wait_state("ATTACHED");
+    h.inject_rx(BANNER.as_bytes());
+    wait_quiet(&h);
     let before = h.dev.write_calls();
     let resp = h.request(SessionRequest::SessionAttach); // quiet 中觸發 attach
+    assert_eq!(
+        pget(&resp, "error_code"),
+        PyValue::from("SESSION_NOT_READY")
+    );
     assert_eq!(
         pget(&resp, "last_error"),
         PyValue::from("PROMPT_UNAVAILABLE")
@@ -396,33 +479,128 @@ fn quiet_blocks_login_probe_zero_tx() {
     );
 }
 
+/// reboot 命令 TX 的結算結果（TxWriter 每個 job 都送出 `UartTxCompleted`，與 `TxReport` 同一結算點）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RebootTx {
+    /// `Completed(n≥1)`。
+    Completed,
+    /// `Unknown`（結果不明）。
+    Unknown,
+    /// `NotSubmitted`（Frozen／StaleEpoch／Cancelled／Quiet 拒絕：confirmed 0、非 unknown）。
+    NotSubmitted,
+}
+
+const REBOOT_COMMANDS: [&str; 5] = [
+    "reboot",
+    "echo b > /proc/sysrq-trigger",
+    "systemctl reboot",
+    "shutdown -r now",
+    "/sbin/reboot",
+];
+
+/// sans-IO（parity-amendments-2026-10-26 #55）：reboot 命令出列（`StartOp`）後，先斷言 TX 結算前未 arm，
+/// 再以 `UartTxCompleted` 結算該命令的 TX。命令執行路徑（OpRunner）屬 Task 14，故於 SessionCore 層驗證。
+fn reboot_case(cmd: &str, tx: RebootTx) -> CoreHarness {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let started = h.start_foreground_command(cmd);
+    assert!(
+        !h.fence.with(|f| f.quiet_active),
+        "{cmd}：出列後、TxReport 前不得 arm quiet"
+    );
+    assert_eq!(
+        pget(&h.public(), "boot_quiet_remaining_s"),
+        PyValue::Null,
+        "{cmd}"
+    );
+    let (confirmed_bytes, unknown) = match tx {
+        RebootTx::Completed => (cmd.len() + 1, false),
+        RebootTx::Unknown => (0, true),
+        RebootTx::NotSubmitted => (0, false),
+    };
+    let epoch = h.epoch();
+    h.feed(ControlEvent::UartTxCompleted {
+        epoch,
+        op_id: started.op_id,
+        confirmed_bytes,
+        unknown,
+    });
+    h
+}
+
+fn assert_reboot_armed(h: &mut CoreHarness, cmd: &str, tx: RebootTx) {
+    assert!(
+        h.fence.with(|f| f.quiet_active),
+        "{cmd}／{tx:?}：TX 結算後 fence quiet_active 應為 true"
+    );
+    assert_eq!(
+        pget(&h.public(), "boot_quiet_remaining_s"),
+        PyValue::Float(180.0),
+        "{cmd}／{tx:?}"
+    );
+    assert_eq!(
+        pget(&h.public(), "ready_reconfirm_pending"),
+        PyValue::Bool(true),
+        "{cmd}／{tx:?}"
+    );
+    let r = h.rpc(SessionRequest::Submit(agent_submit("ls"))).unwrap();
+    assert_eq!(
+        r.get("error_code"),
+        Some(&PyValue::from("AUTOBOOT_QUIET")),
+        "{cmd}／{tx:?}"
+    );
+    assert_eq!(
+        r.get("retry_after_s"),
+        Some(&PyValue::Float(180.0)),
+        "{cmd}／{tx:?}"
+    );
+}
+
 #[test]
 fn reboot_command_arms_quiet_at_dequeue() {
-    let cmds = [
-        "reboot",
-        "echo b > /proc/sysrq-trigger",
-        "systemctl reboot",
-        "shutdown -r now",
-        "/sbin/reboot",
-    ];
-    for cmd in cmds {
-        let h = ActorRig::new(SHELL_PROFILE).ready();
-        let _id = h.submit_ok(cmd);
-        // 命令 TX 寫出後 quiet 才武裝（dequeue 時）。
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while pget(&h.get_state(), "boot_quiet_remaining_s") == PyValue::Null {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{cmd}：應於 dequeue 武裝 quiet"
-            );
-            std::thread::sleep(Duration::from_millis(2));
+    // 舊名保留（L1 鎖）；語意依 parity-amendments-2026-10-26 #55 修正：出列時不 arm，TX 已提交後才 arm。
+    for cmd in REBOOT_COMMANDS {
+        let mut h = reboot_case(cmd, RebootTx::Completed);
+        assert_reboot_armed(&mut h, cmd, RebootTx::Completed);
+    }
+}
+
+#[test]
+fn reboot_command_arms_quiet_after_tx_submitted() {
+    for cmd in REBOOT_COMMANDS {
+        for tx in [RebootTx::Completed, RebootTx::Unknown] {
+            let mut h = reboot_case(cmd, tx);
+            assert_reboot_armed(&mut h, cmd, tx);
         }
-        let r = h.request(SessionRequest::Submit(agent_submit("ls")));
+    }
+    // 非 reboot 命令的 TX 結算不 arm。
+    for cmd in ["rebootx", "echo b", "shutdown -h now"] {
+        let h = reboot_case(cmd, RebootTx::Completed);
+        assert!(!h.fence.with(|f| f.quiet_active), "{cmd}");
         assert_eq!(
-            pget(&r, "error_code"),
-            PyValue::from("AUTOBOOT_QUIET"),
+            pget(&h.public(), "boot_quiet_remaining_s"),
+            PyValue::Null,
             "{cmd}"
         );
+    }
+}
+
+#[test]
+fn reboot_not_submitted_does_not_arm_quiet() {
+    for cmd in REBOOT_COMMANDS {
+        let mut h = reboot_case(cmd, RebootTx::NotSubmitted);
+        assert!(!h.fence.with(|f| f.quiet_active), "{cmd}");
+        let s = h.public();
+        assert_eq!(pget(&s, "boot_quiet_remaining_s"), PyValue::Null, "{cmd}");
+        assert_eq!(pget(&s, "ready_reconfirm_pending"), PyValue::Bool(false), "{cmd}");
+        assert_eq!(pget(&s, "state"), PyValue::from("READY"), "{cmd}：不得進 RECOVERING");
+        let r = h.rpc(SessionRequest::Submit(agent_submit("ls"))).unwrap();
+        assert_ne!(
+            r.get("error_code"),
+            Some(&PyValue::from("AUTOBOOT_QUIET")),
+            "{cmd}"
+        );
+        assert!(r.get("retry_after_s").is_none(), "{cmd}");
     }
 }
 
@@ -522,6 +700,7 @@ fn flood_masking_exact_set() {
         ]
     );
     let shell_p = profile_of(SHELL_PROFILE);
+    let anchored_p = profile_of(ANCHORED_PROMPT_PROFILE);
     let login_p = profile_of(LOGIN_PROFILE);
     let env_login = profile_of(LOGIN_ENV_PROFILE);
     let env_missing = FakeEnv::default();
@@ -544,7 +723,7 @@ fn flood_masking_exact_set() {
         "READY_NONCE_TIMEOUT"
     );
     assert_eq!(
-        flooded(&|rig| rig.run(Dev::PromptNoNonce, |io| probe_ready(io, &shell_p))),
+        flooded(&|rig| rig.run(Dev::PromptNoNonce, |io| probe_ready(io, &anchored_p))),
         LoginOutcome::NotReady("RX_FLOOD".to_string()),
         "READY_PROMPT_TIMEOUT"
     );
@@ -565,13 +744,15 @@ fn flood_masking_exact_set() {
         )),
         "LOGIN_REQUIRED"
     );
+    // X3：USER_ENV_MISSING 對外不可達（`_maybe_login` 的 err 被後續等待覆寫）；user 缺＋pass_env 宣告時
+    // Python 等到 login prompt 後回 LOGIN_USER_REQUIRED（不可遮蔽碼）。
     assert_eq!(
         outcome_code(&flooded(&|rig| {
-            rig.run(Dev::Silent, |io| {
+            rig.run(Dev::LoginPrompt, |io| {
                 ensure_ready(io, &env_login, &auth(None, None), &env_missing)
             })
         })),
-        "USER_ENV_MISSING"
+        "LOGIN_USER_REQUIRED"
     );
     for code in ["LOGIN_REQUIRED", "USER_ENV_MISSING", "SHELL_PROMPT_TIMEOUT"] {
         assert!(
@@ -585,44 +766,76 @@ fn flood_masking_exact_set() {
 #[test]
 fn login_failure_code_table() {
     // (a) SessionAttach 可見的列：ActorRig 實機路徑。
-    let rows: [(&str, &str, fn(&ActorRig)); 4] = [
-        ("LOGIN_REQUIRED", LOGIN_PROFILE, |rig: &ActorRig| {
-            rig.dev.on_tx_reply(b"\n", b"\r\nlogin: ");
-        }),
-        ("READY_NONCE_TIMEOUT", SHELL_PROFILE, |rig: &ActorRig| {
-            rig.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# ");
-        }),
-        ("READY_PROMPT_TIMEOUT", SHELL_PROFILE, |rig: &ActorRig| {
-            rig.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# ");
-            rig.dev.on_tx_match(
-                r"__READY__[0-9a-f]+",
-                Box::new(|line: &[u8]| {
-                    let text = String::from_utf8_lossy(line).into_owned();
-                    let token = text
-                        .split("__READY__")
-                        .nth(1)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    format!("__READY__{token}\r\n").into_bytes()
-                }),
-            );
-        }),
-        (
-            "LOGIN_PROMPT_TIMEOUT",
-            LOGIN_ENV_PROFILE,
-            |_rig: &ActorRig| {},
-        ),
+    // Python `attach_session` 在 ATTACHED 分支會經 `_probe_existing_bridge` 重新 probe，故 FakeDevice 的一次性
+    // 回應（`on_tx_reply`）於 SessionAttach 前重新佈署（`rearm`）；持續性比對（`on_tx_match`）只佈署一次（`setup`）。
+    // LOGIN_PROMPT_TIMEOUT 列：Python 的 attach 路徑 `ensure_ready` 失敗會關 bridge 回 DETACHED，故改為先以
+    // 未解析帳密停 ATTACHED（CREDENTIALS_UNRESOLVED），補 env 後由 SessionAttach 的既有 bridge 再探觸發
+    // `ensure_ready` → LOGIN_PROMPT_TIMEOUT（停 ATTACHED）。
+    struct Row {
+        code: &'static str,
+        yaml: &'static str,
+        setup: fn(&ActorRig),
+        rearm: fn(&ActorRig),
+        env_after_attach: bool,
+    }
+    fn nothing(_: &ActorRig) {}
+    let rows = [
+        Row {
+            code: "LOGIN_REQUIRED",
+            yaml: LOGIN_PROFILE,
+            setup: nothing,
+            rearm: |rig: &ActorRig| rig.dev.on_tx_reply(b"\n", b"\r\nlogin: "),
+            env_after_attach: false,
+        },
+        Row {
+            code: "READY_NONCE_TIMEOUT",
+            yaml: SHELL_PROFILE,
+            setup: nothing,
+            rearm: |rig: &ActorRig| rig.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# "),
+            env_after_attach: false,
+        },
+        Row {
+            code: "READY_PROMPT_TIMEOUT",
+            yaml: ANCHORED_PROMPT_PROFILE,
+            setup: |rig: &ActorRig| {
+                rig.dev.on_tx_match(
+                    r"__READY__[0-9a-f]+",
+                    Box::new(|line: &[u8]| {
+                        let text = String::from_utf8_lossy(line).into_owned();
+                        let token = text
+                            .split("__READY__")
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        format!("__READY__{token}\r\n").into_bytes()
+                    }),
+                );
+            },
+            rearm: |rig: &ActorRig| rig.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# "),
+            env_after_attach: false,
+        },
+        Row {
+            code: "LOGIN_PROMPT_TIMEOUT",
+            yaml: LOGIN_ENV_PROFILE,
+            setup: nothing,
+            rearm: nothing,
+            env_after_attach: true,
+        },
     ];
-    for (code, yaml, device) in rows {
-        let rig = ActorRig::new(yaml);
-        if code == "LOGIN_PROMPT_TIMEOUT" {
+    for row in rows {
+        let code = row.code;
+        let rig = ActorRig::new(row.yaml);
+        (row.setup)(&rig);
+        (row.rearm)(&rig);
+        let rig = rig.attach();
+        rig.wait_state("ATTACHED");
+        if row.env_after_attach {
             rig.set_env("SW_T_U", "root");
             rig.set_env("SW_T_P", "s3cret");
         }
-        device(&rig);
-        let rig = rig.attach();
-        rig.wait_state("ATTACHED");
+        let _ = rig.dev.take_tx();
+        (row.rearm)(&rig);
         let resp = rig.request(SessionRequest::SessionAttach);
         assert_eq!(
             pget(&resp, "error_code"),
@@ -635,9 +848,13 @@ fn login_failure_code_table() {
             pget(&rig.get_state(), "last_error_detail"),
             "{code}：last_error_detail 應與 session 內同名欄位一致"
         );
+        assert_eq!(pget(&rig.get_state(), "state"), PyValue::from("ATTACHED"), "{code}");
     }
 
-    // (b) 只能於 env／帳密層判定的列：ensure_ready 的失敗碼（函式層）。
+    // (b) 只能於 env／帳密層判定的列：ensure_ready 的失敗碼（函式層；斷言值為 Python 基線實測）。
+    // - X3：USER_ENV_MISSING 對外不可達——user_env 缺＋pass_env 宣告時，等到 login prompt 後回 LOGIN_USER_REQUIRED。
+    // - user 缺且未宣告 pass_env：`needs_login` 為假，Python 回 `<PLATFORM>_PROMPT_TIMEOUT`（shell → SHELL_PROMPT_TIMEOUT）。
+    // - PASS_ENV_REQUIRED／PASS_ENV_MISSING 需裝置先出現 password prompt（`Dev::Login`）。
     let env_missing = FakeEnv::default();
     let env_pass_only = FakeEnv::default();
     env_pass_only
@@ -645,42 +862,48 @@ fn login_failure_code_table() {
         .lock()
         .unwrap()
         .insert("SW_T_P".into(), "pw".into());
-    let fn_rows: [(&str, &str, SessionAuth, &dyn SysEnv); 4] = [
+    let fn_rows: [(&str, &str, SessionAuth, &dyn SysEnv, Dev); 4] = [
         (
-            "USER_ENV_MISSING",
+            "LOGIN_USER_REQUIRED",
             LOGIN_ENV_PROFILE,
             auth(None, None),
             &env_pass_only,
+            Dev::LoginPrompt,
         ),
         (
             "PASS_ENV_REQUIRED",
             LOGIN_PROFILE,
             auth(Some("root"), None),
             &env_missing,
+            Dev::Login,
         ),
         (
             "PASS_ENV_MISSING",
             LOGIN_ENV_PROFILE,
             auth(Some("root"), None),
             &env_missing,
+            Dev::Login,
         ),
         (
-            "LOGIN_USER_REQUIRED",
+            "SHELL_PROMPT_TIMEOUT",
             LOGIN_PROFILE,
             auth(None, Some("pw")),
             &env_missing,
+            Dev::LoginPrompt,
         ),
     ];
-    for (code, yaml, a, env) in fn_rows {
+    for (code, yaml, a, env, dev) in fn_rows {
         let p = profile_of(yaml);
         let rig = LoginRig::new();
-        let out = rig.run(Dev::LoginPrompt, |io| ensure_ready(io, &p, &a, env));
+        let out = rig.run(dev, |io| ensure_ready(io, &p, &a, env));
         assert_eq!(outcome_code(&out), code);
+        assert_ne!(outcome_code(&out), "USER_ENV_MISSING", "X3：不可達");
     }
 
     // (c) probe／ensure 的裝置端失敗碼（函式層，與 (a) 相同的分類規則）。
     let login_p = profile_of(LOGIN_PROFILE);
     let shell_p = profile_of(SHELL_PROFILE);
+    let anchored_p = profile_of(ANCHORED_PROMPT_PROFILE);
     let rig = LoginRig::new();
     let out = rig.run(Dev::LoginPrompt, |io| probe_ready(io, &login_p));
     assert_eq!(outcome_code(&out), "LOGIN_REQUIRED");
@@ -688,8 +911,12 @@ fn login_failure_code_table() {
     let out = rig.run(Dev::NonceSilent, |io| probe_ready(io, &shell_p));
     assert_eq!(outcome_code(&out), "READY_NONCE_TIMEOUT");
     let rig = LoginRig::new();
-    let out = rig.run(Dev::PromptNoNonce, |io| probe_ready(io, &shell_p));
+    let out = rig.run(Dev::PromptNoNonce, |io| probe_ready(io, &anchored_p));
     assert_eq!(outcome_code(&out), "READY_PROMPT_TIMEOUT");
+    // 整窗比對（SES-16.6-05 KEEP）：非錨定 prompt 會被 probe 先前收到的 prompt 滿足 → Ready（Python 實測）。
+    let rig = LoginRig::new();
+    let out = rig.run(Dev::PromptNoNonce, |io| probe_ready(io, &shell_p));
+    assert_eq!(out, LoginOutcome::Ready);
     let env_login = profile_of(LOGIN_ENV_PROFILE);
     let rig = LoginRig::new();
     let a = auth(Some("root"), Some("s3cret"));
@@ -729,13 +956,23 @@ fn login_error_detail_carries_rx_tail() {
 
 #[test]
 fn disk_full_blocks_login_probe_but_not_agent_cmd() {
-    // Review Focus 3：WAL 寫入持續失敗 → 登入 probe 被 fence 拒絕，agent 命令仍照常寫出。
-    let h = ActorRig::new(SHELL_PROFILE).ready();
-    h.fail_wal_writes(PalError::io(28, "No space left on device"));
-    let before = h.dev.write_calls();
-    let resp = h.request(SessionRequest::SessionAttach);
+    // Review Focus 3：WAL 寫入持續失敗 → 登入 probe 被 fence（WalUnhealthy）拒絕，agent 命令仍照常寫出。
+    // Python `attach_session` 只在 ATTACHED 分支 probe（READY 回 `_attach_state_result`、不 probe），
+    // 故 probe 案例以 ATTACHED（nonce 未回）session 驗證；agent 命令案例以 READY session 驗證。
+    fn make_unhealthy(h: &ActorRig) {
+        h.fail_wal_writes(PalError::io(28, "No space left on device"));
+        h.inject_rx(b"noise\r\n"); // RX WAL 寫入失敗 → WAL unhealthy
+        wait_until("WAL 寫入失敗", || h.wal_write_failures() > 0);
+    }
+    let a = ActorRig::new(SHELL_PROFILE);
+    a.dev.on_tx_reply(b"\n", b"\r\nroot@t:/# ");
+    let a = a.attach();
+    a.wait_state("ATTACHED");
+    make_unhealthy(&a);
+    let before = a.dev.write_calls();
+    let resp = a.request(SessionRequest::SessionAttach);
     assert_eq!(
-        h.dev.write_calls(),
+        a.dev.write_calls(),
         before,
         "unhealthy WAL 下 probe 不得寫出"
     );
@@ -743,6 +980,9 @@ fn disk_full_blocks_login_probe_but_not_agent_cmd() {
         pget(&resp, "last_error"),
         PyValue::from("PROMPT_UNAVAILABLE")
     );
+
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    make_unhealthy(&h);
     h.dev.on_tx_reply(b"echo x", b"x\r\nroot@t:/# ");
     let id = h.submit_ok("echo x");
     h.wait_done(&id);

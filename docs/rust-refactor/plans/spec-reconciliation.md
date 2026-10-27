@@ -93,6 +93,10 @@
 | DF-18 | event registry 與 counter 的 tmp→正式檔改名改用 `os.replace`／`FsOps::replace`（Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`）：Python `os.rename` 在 Windows 目的檔已存在時拋 `FileExistsError`，第二次 `event.rule_set` 同一規則回 `EXCEPTION`、counter 存不進第二次；POSIX 行為不變（08 §0.5，P1／P7） |
 | DF-19 | `session.self_test` 的 nonce probe（`source:"system:self_test"`）在每次 OS 提交前重驗 boot quiet（任何 profile，含 console unlock；與 pre-check `boot_quiet_active()` 同義）與 bridge 世代／epoch：pre-check 通過後才 arm 的 quiet 使 probe 零 TX，回應改為與 pre-check 同形的 `{"ok":true,"classification":"AUTOBOOT_QUIET","session":…,"recommended_action":"wait",<lease ctx>,"command_capable":…}`，不等 nonce、不 `confirm_ready`。不受 ready reconfirm 擋（self-test 是 `READY_UNCONFIRMED` 的建議出口）、不與 login run 世代掛鉤；FLASHING 中照舊 `TARGET_UNRESPONSIVE`（RPC-H-07）。來源 SES-16.6-08（R5-F2）。DF-18 由 P7 Task 0 登記（`08` §0.5） |
 
+### P5-T7 P1 WAL 位元組 golden 缺口補充
+
+P1 T02～T05 原定交付 `contracts/golden/wal/*.json`，但該計畫未產生這些檔案；`wal_line.tsv` 只覆蓋單列序列化，不能替代 WalWriter 寫檔輸出。依本 Task 的補充決議，新增 `scripts/stage0/capture_wal_golden.py`，以固定單調時鐘、wall 時間及空白初始 WAL 目錄驅動 Python `sw_core.wal.WalWriter`，記錄輸入與 WAL／mirror 實際位元組；`tests/test_rust_goldens_fresh.py` 重跑擷取器並逐位元組比對，Rust `wal_contract_golden_matches_p1` 逐案重播同一輸入並比對兩個輸出檔。補充的 JSON golden 不取代 `contracts/golden/wal_line.tsv`。`contracts/captures/wal/*` 未包含在此補充範圍，仍待 P1 上游交付或後續明確處理；P5-T7 的 Rust 重播測試不消費該目錄。提交說明需指出此上游缺口與本補充。
+
 ### 1.3 既有核准：BC-01～BC-05
 
 照規格 §9.1 實作，各列以 **BC** 標示。

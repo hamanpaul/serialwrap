@@ -1,12 +1,10 @@
-//! P5-T12：兩階段 drain 的型別（紅燈階段骨架；T11 的 `Effect::BeginDrain`／`ControlEvent::WorkerStopped` 使用）。
-//!
-//! 函式本體（drain 狀態機）由 Task 12 實作者補上；本檔只宣告型別。
+//! P5-T12：兩階段 drain 的狀態與 worker 收尾回條型別。
 
 use sw_pal::traits::PalError;
 
-use crate::mailbox::Reply;
-use crate::tx_writer::{EvidenceGap, OpId, TxLedger};
 use crate::Mono;
+use crate::mailbox::Reply;
+pub use crate::tx_writer::{EvidenceGap, OpId, TxLedger};
 
 /// 一次 drain 的識別碼（`WorkerStopped`／`DrainTimeout` 以此比對）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,6 +32,8 @@ pub struct StopOp {
     pub waiters: Vec<Reply>,
     pub started: Mono,
     pub stalled: bool,
+    /// 本次 Release 是對已 RELEASED session 的在途 attach 做取消，不得改寫 release metadata。
+    pub already_released: bool,
     /// Phase 1 當下的前景命令。
     pub aborted_op: Option<(OpId, String)>,
     /// drain 中到達的 Removed／Rebound／IoError。

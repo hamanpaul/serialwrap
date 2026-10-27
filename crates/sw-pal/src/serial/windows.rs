@@ -2,32 +2,33 @@
 
 #[cfg(any(test, feature = "test-fakes"))]
 use std::cell::Cell;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Devices::Communication::{
-    GetCommState, SetCommState, SetCommTimeouts, SetupComm, COMMTIMEOUTS, DCB,
+    COMMTIMEOUTS, DCB, GetCommState, SetCommState, SetCommTimeouts, SetupComm,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+    CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+};
 
 use crate::serial::windows_model::{
-    comm_timeouts_model, dcb_flags, dcb_model, map_open_error, map_overlapped_write_completion,
-    win_device_name, OpenErrorKind, PYSERIAL_ERROR_CHAR, PYSERIAL_XOFF_CHAR, PYSERIAL_XON_CHAR,
+    OpenErrorKind, PYSERIAL_ERROR_CHAR, PYSERIAL_XOFF_CHAR, PYSERIAL_XON_CHAR, classify_read_error,
+    classify_wait_error, comm_timeouts_model, dcb_flags, dcb_model, map_open_error,
+    map_overlapped_write_completion, win_device_name,
 };
 use crate::traits::{
     CancelToken, CloseImpl, CloseReceipt, CloseToken, DevicePath, HolderReport, HolderScanStatus,
-    IoWaker, OpenError, PalError, PalErrorKind, PalResult, ReadOutcome, SerialBackend,
+    IoWaker, OpenError, PalError, PalErrorKind, PalResult, ReadError, ReadOutcome, SerialBackend,
     SerialConfig, SerialHandle, SerialReader, SerialWriter, SubmitGate, SubmitRevoked, SubmitStep,
     TxOutcome, TxResult,
 };
@@ -449,6 +450,10 @@ struct WindowsClose {
 }
 
 impl CloseImpl for WindowsClose {
+    fn is_alive(&self) -> bool {
+        self.port.is_open()
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         match self.port.close_once() {
             Ok(()) => CloseReceipt {
@@ -591,16 +596,24 @@ impl WindowsSerialReader {
 }
 
 impl SerialReader for WindowsSerialReader {
-    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<ReadOutcome, ReadError> {
         if buf.is_empty() {
             return Ok(ReadOutcome::Data(0));
         }
         let start = Instant::now();
         loop {
-            if self.wake_event.consume_if_signaled()? {
+            if self
+                .wake_event
+                .consume_if_signaled()
+                .map_err(classify_wait_error)?
+            {
                 return Ok(ReadOutcome::Woken);
             }
-            self.reset_operation()?;
+            self.reset_operation().map_err(classify_read_error)?;
             let read_len = buf.len().min(u32::MAX as usize);
             self.buffer.resize(read_len, 0);
             let buffer_ptr = self.buffer.as_mut_ptr();
@@ -618,7 +631,7 @@ impl SerialReader for WindowsSerialReader {
             if started == 0 {
                 let code = last_error();
                 if code != windows_sys::Win32::Foundation::ERROR_IO_PENDING {
-                    return Err(win32_error(code));
+                    return Err(classify_read_error(win32_error(code)));
                 }
                 self.mark_pending();
             }
@@ -631,7 +644,9 @@ impl SerialReader for WindowsSerialReader {
                         if completion.win32 == ERROR_IO_INCOMPLETE {
                             continue;
                         }
-                        let outcome = self.read_result(completion, false, false)?;
+                        let outcome = self
+                            .read_result(completion, false, false)
+                            .map_err(classify_read_error)?;
                         if let ReadOutcome::Data(count) = &outcome {
                             buf[..*count].copy_from_slice(&self.buffer[..*count]);
                         }
@@ -645,10 +660,12 @@ impl SerialReader for WindowsSerialReader {
                     Ok(WaitResult::Wake) => {
                         if let Err(error) = self.wake_event.consume_if_signaled() {
                             self.cancel_and_collect();
-                            return Err(error);
+                            return Err(classify_wait_error(error));
                         }
                         let completion = self.cancel_and_collect();
-                        let outcome = self.read_result(completion, true, false)?;
+                        let outcome = self
+                            .read_result(completion, true, false)
+                            .map_err(classify_read_error)?;
                         if let ReadOutcome::Data(count) = &outcome {
                             buf[..*count].copy_from_slice(&self.buffer[..*count]);
                         }
@@ -656,7 +673,9 @@ impl SerialReader for WindowsSerialReader {
                     }
                     Ok(WaitResult::Timeout) => {
                         let completion = self.cancel_and_collect();
-                        let outcome = self.read_result(completion, false, true)?;
+                        let outcome = self
+                            .read_result(completion, false, true)
+                            .map_err(classify_read_error)?;
                         if let ReadOutcome::Data(count) = &outcome {
                             buf[..*count].copy_from_slice(&self.buffer[..*count]);
                         }
@@ -669,7 +688,7 @@ impl SerialReader for WindowsSerialReader {
                     }
                     Err(wait_error) => {
                         self.cancel_and_collect();
-                        return Err(wait_error);
+                        return Err(classify_wait_error(wait_error));
                     }
                 }
             }

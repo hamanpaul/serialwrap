@@ -12,7 +12,7 @@ use sw_pal::fakes::serial::{FakeSerialBackend, FakeWriteStep};
 use sw_pal::fakes::wal_fs::FakeWalFs;
 use sw_pal::{
     CancelToken, Clock, DevicePath, HolderReport, HolderScanStatus, OpenError, PalError,
-    PalErrorKind, ReadOutcome, SerialBackend, SerialConfig, SubmitGate,
+    PalErrorKind, ReadError, ReadOutcome, SerialBackend, SerialConfig, SubmitGate,
     SubmitRevoked, SubmitStep, TxOutcome, WalFs,
 };
 use sw_pal::SysEnv;
@@ -294,7 +294,8 @@ fn removed_device_read_errors() {
     be.remove_device(TTY);
     let mut buf = [0u8; 16];
     match r.read(&mut buf, Some(Duration::from_millis(200))) {
-        Err(e) => assert_eq!(e.py_message, IO_ERR),
+        Err(ReadError::Read(e)) => assert_eq!(e.py_message, IO_ERR),
+        Err(other) => panic!("expected read error, got {other:?}"),
         Ok(out) => panic!("expected read error after remove_device, got {out:?}"),
     }
 }

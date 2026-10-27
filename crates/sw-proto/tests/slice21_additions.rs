@@ -261,14 +261,14 @@ fn daemon_dirs_defaults() {
     assert_eq!(dirs.events_runtime_dir, "~/.local/state/serialwrap/events");
 
     let custom = EnvSnapshot::from_pairs(BTreeMap::from([
-        ("HOME".to_string(), "/home/tester".to_string()),
+        ("HOME".to_string(), "/fakehome".to_string()),
         ("XDG_STATE_HOME".to_string(), "/state".to_string()),
         ("SERIALWRAP_BY_ID_DIR".to_string(), "~/by-id".to_string()),
         ("SERIALWRAP_EVENTS_RUNTIME_DIR".to_string(), "".to_string()),
     ]));
     let dirs = resolve_daemon_dirs(&custom);
-    assert_eq!(dirs.by_id_dir, "/home/tester/by-id");
-    assert_eq!(dirs.events_dir, "/home/tester/.serialwrap/events.d");
+    assert_eq!(dirs.by_id_dir, "/fakehome/by-id");
+    assert_eq!(dirs.events_dir, "/fakehome/.serialwrap/events.d");
     assert_eq!(dirs.events_runtime_dir, "/state/serialwrap/events");
 }
 

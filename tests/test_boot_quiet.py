@@ -877,6 +877,18 @@ class TestBootloaderPromptDoesNotClearQuiet(unittest.TestCase):
 
         self.assertTrue(session.boot_quiet_active(), "bootloader prompt 不應解除 quiet window")
 
+    def test_invalid_bootloader_regex_skipped_other_patterns_still_match(self) -> None:
+        """parity-amendments-2026-10-26 #93（B-43 部分）：``bootloader_prompts`` 含不合法 regex 時
+        靜默略過該樣式（不拋例外、不記 WARNING），其餘合法樣式照常比對、仍擋下 quiet 解除。"""
+        mgr, session = self._make_manager(bootloader_prompts=("[invalid(", "^=> $"))
+        session.state = "READY"
+        self._rx(mgr, session, "> ")
+        session.arm_boot_quiet()
+        self._rx(mgr, session, "U-Boot 2022.01 (fake)\r\n")
+        with self.assertNoLogs(level="WARNING"):
+            self._rx(mgr, session, "\r\n=> ")
+        self.assertTrue(session.boot_quiet_active(), "合法的 bootloader 樣式仍須擋下解除")
+
     def test_gate_is_not_vacuous_without_bootloader_prompts_configured(self) -> None:
         """反證：template 未設定 bootloader_prompts（排除清單為空）時，``=> `` 仍會被
         寬鬆 prompt_regex 誤判為開機完成而解除——證明上一個測試通過並非巧合

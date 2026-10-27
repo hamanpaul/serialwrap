@@ -33,7 +33,10 @@ fn cap_posix_pty__second_open_in_process_is_held() {
     let _h = pal.serial.open_exclusive(&dev, &cfg()).expect("first open");
     match pal.serial.open_exclusive(&dev, &cfg()) {
         Err(OpenError::Held(rep)) => {
-            assert!(rep.holder_unknown, "self pid excluded → pids empty → holder_unknown")
+            assert!(
+                rep.holder_unknown,
+                "self pid excluded → pids empty → holder_unknown"
+            )
         }
         other => panic!("expected Held, got {}", show_open(&other)),
     }
@@ -88,7 +91,7 @@ fn cap_posix_pty__external_plain_open_before_daemon_is_held() {
         "被拒時 UART 零 TX"
     );
     drop(child); // kill + wait
-    // peer（PTY master）仍開啟：被拒路徑若只 close(fd) 未 TIOCNXCL，旗標殘留，此處會得 Held(EBUSY)（R0-F3）
+                 // peer（PTY master）仍開啟：被拒路徑若只 close(fd) 未 TIOCNXCL，旗標殘留，此處會得 Held(EBUSY)（R0-F3）
     let _h = sw_pal::native()
         .serial
         .open_exclusive(&dev, &cfg())
@@ -113,7 +116,10 @@ fn cap_posix_pty__probe_close_reopen_with_master_open() {
             .unwrap_or_else(|e| panic!("round {round}: reopen failed {e:?}"));
         let (r, w, _waker, close) = h.split();
         let rc = close.close(r, w);
-        assert!(rc.closed && rc.excl_cleared && rc.error.is_none(), "round {round}: {rc:?}");
+        assert!(
+            rc.closed && rc.excl_cleared && rc.error.is_none(),
+            "round {round}: {rc:?}"
+        );
         // 外部一般 open（不經 serialwrap）也必須成功：證明旗標已解除，而不只是同 backend 的路徑碰巧可用
         let ext = std::fs::OpenOptions::new()
             .read(true)
@@ -192,7 +198,10 @@ fn cap_posix_pty__blocked_write_cancel_returns_partial_completed() {
         TxOutcome::Completed(n) => assert!(n > 0 && n < (1 << 20)),
         o => panic!("{o:?}"),
     }
-    assert_eq!(res.error.expect("cancel error").kind, PalErrorKind::Cancelled);
+    assert_eq!(
+        res.error.expect("cancel error").kind,
+        PalErrorKind::Cancelled
+    );
     peer.resume_reading();
 }
 
@@ -212,7 +221,10 @@ fn cap_posix_pty__reader_woken_within_50ms() {
     thread::sleep(Duration::from_millis(50));
     let t0 = Instant::now();
     waker.wake();
-    assert_eq!(j.join().expect("reader thread").expect("read"), ReadOutcome::Woken);
+    assert_eq!(
+        j.join().expect("reader thread").expect("read"),
+        ReadOutcome::Woken
+    );
     assert!(t0.elapsed() < Duration::from_millis(50));
 }
 
@@ -264,4 +276,150 @@ fn plain_holder_child() {
     std::io::stdout().flush().ok();
     let mut b = [0u8; 1];
     let _ = std::io::stdin().read(&mut b);
+}
+
+// ---- parity-amendments-2026-10-26 #62／#63／#65：開啟序 errno 映射逐字照 Python `serial_port.py:373-387,429-435` ----
+
+use sw_pal::serial::posix::{open_sequence, OpenOp, TtyOpenOps};
+
+#[derive(Default)]
+struct FakeOps {
+    ops: Vec<OpenOp>,
+    open_err: Option<i32>,
+    flock_err: Option<i32>,
+    probe: Option<HolderReport>,
+}
+
+impl TtyOpenOps for FakeOps {
+    fn open(&mut self) -> Result<(), i32> {
+        self.ops.push(OpenOp::Open);
+        self.open_err.map_or(Ok(()), Err)
+    }
+    fn flock(&mut self) -> Result<(), i32> {
+        self.ops.push(OpenOp::Flock);
+        self.flock_err.map_or(Ok(()), Err)
+    }
+    fn excl(&mut self) -> Result<(), i32> {
+        self.ops.push(OpenOp::Excl);
+        Ok(())
+    }
+    fn probe_holders(&mut self) -> HolderReport {
+        self.ops.push(OpenOp::ProbeHolders);
+        self.probe.clone().unwrap_or(HolderReport {
+            pids: vec![],
+            holder_unknown: false,
+            status: HolderScanStatus::Ok,
+        })
+    }
+    fn termios(&mut self) -> Result<(), i32> {
+        self.ops.push(OpenOp::Termios(Ok(())));
+        Ok(())
+    }
+    fn nxcl(&mut self) -> Result<(), i32> {
+        self.ops.push(OpenOp::Nxcl);
+        Ok(())
+    }
+    fn close_fd(&mut self) -> Result<(), i32> {
+        self.ops.push(OpenOp::CloseFd);
+        Ok(())
+    }
+    fn warn(&mut self, _line: &str) {}
+}
+
+fn open_with(open_err: Option<i32>, flock_err: Option<i32>) -> Result<(), OpenError> {
+    let mut ops = FakeOps {
+        open_err,
+        flock_err,
+        ..Default::default()
+    };
+    open_sequence(&mut ops, "/dev/ttyUSB0")
+}
+
+/// #62：只有 `ENOENT`→`NotFound`、`EBUSY`→`Held`；`EACCES`／`EPERM`／`ENODEV`／`ENXIO` 原樣 → `Other`，
+/// 且 `Other` 的 Python 例外類別名與 Python `raise` 的 OSError 子類別相同（session `ATTACH_FAILED:<名>`）。
+#[test]
+fn open_errno_maps_like_python() {
+    assert!(matches!(
+        open_with(Some(libc::ENOENT), None),
+        Err(OpenError::NotFound(_))
+    ));
+    match open_with(Some(libc::EBUSY), None) {
+        Err(OpenError::Held(rep)) => assert!(rep.holder_unknown, "pids 空時 holder_unknown"),
+        other => panic!("EBUSY 應為 Held，實際 {other:?}"),
+    }
+    for (code, py_name) in [
+        (libc::EACCES, "PermissionError"),
+        (libc::EPERM, "PermissionError"),
+        (libc::ENODEV, "OSError"),
+        (libc::ENXIO, "OSError"),
+    ] {
+        match open_with(Some(code), None) {
+            Err(OpenError::Other(e)) => {
+                assert_eq!(e.os_code, Some(code), "errno {code}");
+                assert_eq!(e.py_exc_name(), py_name, "errno {code}");
+            }
+            other => panic!("errno {code} 應為 Other，實際 {other:?}"),
+        }
+    }
+}
+
+/// #63：flock 失敗 errno ∈ {EACCES, EAGAIN, EWOULDBLOCK} → `Held`；其他 → `Other`；兩者皆先 close(fd)、不 TIOCNXCL。
+#[test]
+fn flock_eacces_is_held() {
+    for code in [libc::EACCES, libc::EAGAIN, libc::EWOULDBLOCK] {
+        let mut ops = FakeOps {
+            flock_err: Some(code),
+            ..Default::default()
+        };
+        match open_sequence(&mut ops, "/dev/ttyUSB0") {
+            Err(OpenError::Held(_)) => {}
+            other => panic!("flock errno {code} 應為 Held，實際 {other:?}"),
+        }
+        assert!(ops.ops.contains(&OpenOp::CloseFd));
+        assert!(!ops.ops.contains(&OpenOp::Nxcl));
+    }
+    assert!(matches!(
+        open_with(None, Some(libc::EBADF)),
+        Err(OpenError::Other(_))
+    ));
+}
+
+/// #65：衝突路徑（EBUSY／flock 失敗）在掃描無 pids 時 `holder_unknown:true`（`_conflict_holder_report`），
+/// 掃描到 pids 時 `holder_unknown:false`。
+#[test]
+fn conflict_holder_unknown_when_no_pids() {
+    for (open_err, flock_err) in [(Some(libc::EBUSY), None), (None, Some(libc::EWOULDBLOCK))] {
+        let mut ops = FakeOps {
+            open_err,
+            flock_err,
+            ..Default::default()
+        };
+        match open_sequence(&mut ops, "/dev/ttyUSB0") {
+            Err(OpenError::Held(rep)) => {
+                assert!(rep.pids.is_empty());
+                assert!(
+                    rep.holder_unknown,
+                    "status ok 但 pids 空 → 仍須 holder_unknown"
+                );
+            }
+            other => panic!("應為 Held，實際 {other:?}"),
+        }
+        let mut ops = FakeOps {
+            open_err,
+            flock_err,
+            probe: Some(HolderReport {
+                pids: vec![4242],
+                holder_unknown: false,
+                status: HolderScanStatus::Permission,
+            }),
+            ..Default::default()
+        };
+        match open_sequence(&mut ops, "/dev/ttyUSB0") {
+            Err(OpenError::Held(rep)) => {
+                assert_eq!(rep.pids, vec![4242]);
+                assert!(!rep.holder_unknown);
+            }
+            other => panic!("應為 Held，實際 {other:?}"),
+        }
+    }
 }

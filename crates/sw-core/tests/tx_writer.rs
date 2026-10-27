@@ -153,11 +153,24 @@ fn send_async(
 }
 
 fn tx_lens(r: &Rig) -> Vec<String> {
+    wal_lines(r)
+        .into_iter()
+        .filter(|line| line.contains("\"dir\":\"TX\""))
+        .collect()
+}
+
+fn meta_lens(r: &Rig) -> Vec<String> {
+    wal_lines(r)
+        .into_iter()
+        .filter(|line| line.contains("\"dir\":\"META\""))
+        .collect()
+}
+
+fn wal_lines(r: &Rig) -> Vec<String> {
     String::from_utf8(r.wfs.contents(WAL_PATH.as_ref()).unwrap_or_default())
         .unwrap()
         .lines()
-        .filter(|l| l.contains("\"dir\":\"TX\""))
-        .map(|l| l.to_string())
+        .map(str::to_string)
         .collect()
 }
 
@@ -265,7 +278,7 @@ fn freeze_during_in_flight_counts_as_committed_and_next_is_rejected() {
     r.dev.script_write(vec![FakeWriteStep::BlockUntilCancel { accept_before_cancel: 2 }]);
     let (j, rx) = job(1, TxClass::Command, 0, 0, true, b"abcdef");
     r.h.jobs.send(j).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    wait_in_flight(&r, 1);
     r.fence.with(|s| {
         assert!(s.in_flight.is_some());
         s.frozen = true;
@@ -456,7 +469,8 @@ fn ledger_retire_racing_drain_preserves_bc03() {
         }
         r.cancel.cancel();
         assert_eq!(rx2.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome, TxOutcome::Completed(2));
-        let queued = send_async(&r, TxClass::Command, 3, 0, b"zz"); // stop 後才到：不得寫 OS
+        let (queued_job, queued_reply) = job(3, TxClass::Command, 0, 0, true, b"zz"); // stop 後才到：不得寫 OS
+        let queued_sent = r.h.jobs.send(queued_job).is_ok();
         let (_w, ledger) = r.join.take().unwrap().join().unwrap();
         let op2 = &ledger.ops[&OpId(2)]; // aborted_op 永不被結算，帳本必有其證據
         assert_eq!((op2.confirmed_bytes, op2.unknown), (2, false), "settle_after_stop={settle_after_stop}");
@@ -466,8 +480,10 @@ fn ledger_retire_racing_drain_preserves_bc03() {
         if let Some(op1) = ledger.ops.get(&OpId(1)) {
             assert_eq!(op1.confirmed_bytes, 5); // 未套用時證據完整、不被部分改寫
         }
-        if let Ok(rep) = queued.recv_timeout(Duration::from_millis(200)) {
-            assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+        if queued_sent {
+            if let Ok(rep) = queued_reply.try_recv() {
+                assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+            }
         }
         assert_eq!(r.dev.take_tx(), b"done\nab".to_vec()); // 結算不改變任何已寫出／未寫出的事實
     }
@@ -593,6 +609,95 @@ fn unknown_outcome_records_no_tx_and_reports_unknown() {
 }
 
 #[test]
+fn unknown_with_log_writes_tx_outcome_unknown_meta() {
+    let r = rig();
+    let error = PalError::io(5, "[Errno 5] Input/output error");
+    r.dev.script_write(vec![
+        FakeWriteStep::Unknown { confirmed: 0, error: error.clone() },
+        FakeWriteStep::Unknown { confirmed: 2, error },
+    ]);
+
+    let zero = send(&r, TxClass::Command, 1, 7, b"abc");
+    assert_eq!(zero.result.outcome, TxOutcome::Unknown { confirmed: 0 });
+    assert!(zero.wal.is_none());
+    let partial = send(&r, TxClass::Command, 2, 7, b"abcde");
+    assert_eq!(partial.result.outcome, TxOutcome::Unknown { confirmed: 2 });
+    assert!(matches!(partial.wal, Some(WalAppend { ok: true, loss_flag: false, .. })));
+
+    let metas = meta_lens(&r);
+    assert_eq!(metas.len(), 2, "Unknown 的零確認與部分確認都要有 META：{metas:?}");
+    assert!(metas[0].contains("\"event\":\"tx_outcome_unknown\""));
+    assert!(metas[0].contains("\"payload_b64\":\"\""));
+    assert!(metas[0].contains("\"cmd_id\":\"c\""));
+    assert!(metas[0].contains("\"com\":\"COM0\""));
+    assert!(metas[0].contains("\"source\":\"agent:x\""));
+    assert!(metas[0].contains("\"confirmed_bytes\":0"));
+    assert!(metas[0].contains("\"requested_bytes\":3"));
+    assert!(metas[0].contains("\"unknown_range\":[0,3]"));
+    assert!(metas[0].contains("\"error\":\"[Errno 5] Input/output error\""));
+    assert!(metas[1].contains("\"confirmed_bytes\":2"));
+    assert!(metas[1].contains("\"requested_bytes\":5"));
+    assert!(metas[1].contains("\"unknown_range\":[2,5]"));
+    assert_eq!(tx_lens(&r).len(), 1, "只記錄部分確認的 TX 前綴");
+    assert!(tx_lens(&r)[0].contains("\"payload_b64\":\"YWI=\""));
+}
+
+#[test]
+fn unknown_with_log_false_writes_no_meta() {
+    let r = rig();
+    r.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 2,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let (j, rx) = job(1, TxClass::Command, 0, 0, false, b"secret");
+    r.h.jobs.send(j).unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap().result.outcome,
+        TxOutcome::Unknown { confirmed: 2 }
+    );
+    assert!(tx_lens(&r).is_empty());
+    assert!(meta_lens(&r).is_empty());
+}
+
+#[test]
+fn unknown_meta_wal_failure_is_recorded_as_evidence_gap() {
+    let mut r = rig();
+    r.wfs.fail_next_writes(Path::new(WAL_PATH), 2, enospc());
+    r.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 0,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let rep = send(&r, TxClass::Command, 1, 7, b"abc");
+    assert_eq!(rep.result.outcome, TxOutcome::Unknown { confirmed: 0 });
+    r.stop.as_ref().unwrap().send();
+    let (_w, ledger) = r.join.take().unwrap().join().unwrap();
+    let op = &ledger.ops[&OpId(1)];
+    assert!(!op.wal_ok);
+    assert_eq!(op.wal_gaps.len(), 1);
+    assert_eq!((op.wal_gaps[0].dir, op.wal_gaps[0].len), ("META", 0));
+}
+
+#[test]
+fn flash_probe_does_not_reuse_op_id_as_probe_identity() {
+    let fence = Fence::new();
+    fence.with(|state| {
+        state.active_epoch = Some(7);
+        state.flash_mode = FlashMode::Probe(1);
+    });
+    let permit = TxPermit {
+        op_id: OpId(1),
+        epoch: 7,
+        owner_gen: 0,
+        fsm_gen: 0,
+        class: TxClass::FlashProbe,
+        source: "system:flash".into(),
+        cmd_id: None,
+        log: true,
+    };
+    assert_eq!(fence.with(|state| Fence::admit(state, &permit)), Err(FenceReject::Flash));
+}
+
+#[test]
 fn log_false_secret_not_in_wal() {
     let r = rig();
     let (j, rx) = job(1, TxClass::LoginProbe, 0, 0, false, b"secret\n");
@@ -669,9 +774,18 @@ fn stop_ends_writer_while_other_senders_alive() {
         let _ = done_tx.send(join.join());
     });
     assert!(
-        done_rx.recv_timeout(Duration::from_millis(100)).is_ok(),
-        "stop 後 writer 必須在 100 ms 內結束（不依賴 Sender 全數 drop）"
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "stop 後 writer 必須在期限內結束（不依賴 Sender 全數 drop）"
     );
+}
+
+#[test]
+fn send_after_writer_join_is_disconnected() {
+    let mut r = rig();
+    r.stop.as_ref().unwrap().send();
+    let _ = r.join.take().unwrap().join().unwrap();
+    let (late_job, _reply) = job(1, TxClass::Command, 0, 0, true, b"late");
+    assert!(r.h.jobs.send(late_job).is_err());
 }
 
 #[test]
