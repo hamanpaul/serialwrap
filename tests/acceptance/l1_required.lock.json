@@ -8889,6 +8889,7 @@
           "cargo:sw-core::drain_release::attach_precheck_holder_still_held",
           "cargo:sw-core::drain_release::attach_success_commits_then_attaching",
           "cargo:sw-core::drain_release::auto_attach_plain_external_holder_no_io",
+          "cargo:sw-core::drain_release::clear_reopen_attaching_clears_last_error",
           "cargo:sw-core::drain_release::close_failure_keeps_recovering_and_no_success",
           "cargo:sw-core::drain_release::cross_kind_request_during_drain_is_session_recovering",
           "cargo:sw-core::drain_release::device_attach_dedup_same_by_id_inflight",
