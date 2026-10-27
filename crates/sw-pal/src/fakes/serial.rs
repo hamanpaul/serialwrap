@@ -612,6 +612,11 @@ impl FakeDevice {
         s.extend(steps);
     }
 
+    /// P6 Task 9：loopback——之後確認寫出的每個 byte 立即回送為 RX。
+    pub fn set_loopback(&self, _on: bool) {
+        todo!("P6 Task 9")
+    }
+
     /// P6 Task 6：等到 `BlockForever` 的 job 已經 gate 提交 OS、在 gate 外阻塞（上限 2 s）。
     pub fn wait_blocked(&self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

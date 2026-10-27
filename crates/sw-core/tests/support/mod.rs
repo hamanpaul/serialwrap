@@ -485,6 +485,7 @@ impl CoreHarness {
                 data: self.data_tx.clone(),
                 control: self.ctl_tx.clone(),
                 clock: self.clock.clone(),
+                hub: None,
             },
         )
     }
@@ -910,6 +911,13 @@ struct RigExec {
     pumps: HashMap<u64, sw_core::human_console::human_tx::HumanTxPump>,
 }
 
+impl RigExec {
+    /// P6 Task 9：reader 的 hub tap（未接 hub 時 `None`）。
+    fn hub_tap(&self) -> Option<sw_core::human_console::hub::HubTap> {
+        None
+    }
+}
+
 /// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
 fn rig_nonce() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5eed_0000);
@@ -942,6 +950,7 @@ impl EffectExecutor for RigExec {
                                 data: self.data.clone(),
                                 control: tx.clone(),
                                 clock: self.clock.clone(),
+                                hub: self.hub_tap(),
                             },
                         );
                         Ok(OpenedBridge {
@@ -1161,6 +1170,16 @@ impl ActorRig {
     /// 以 profiles YAML 建立 actor（尚未 attach；bridge 未開）。
     pub fn new(profile_yaml: &str) -> ActorRig {
         ActorRig::new_with(profile_yaml, |_| {})
+    }
+
+    /// P6 Task 9：附 ConsoleHub（PTY 替身工廠）的 actor rig。
+    pub fn new_with_hub(_profile_yaml: &str) -> ActorRig {
+        todo!("P6 Task 9")
+    }
+
+    /// P6 Task 9：以 `SessionRequest::ConsoleAttach` 掛上 PTY 替身 console（executor 經 `ConsoleAdopt` 交給 hub）。
+    pub fn attach_pty_console(&self, _cid: &str) -> sw_pal::fakes::console::FakeConsoleRef {
+        todo!("P6 Task 9")
     }
 
     /// 同 `new`，但在 actor 啟動前可調整 `SessionCore`（Task 14：capture env、self-test 觀測注入）。

@@ -339,6 +339,8 @@ pub struct ReaderCtx {
     pub data: Sender<crate::mailbox::DataEvent>,
     pub control: Sender<crate::mailbox::ControlEvent>,
     pub clock: Arc<dyn Clock>,
+    /// P6 增補 #21：RX 於 WAL 之後 `try_send` 給 ConsoleHub（`None`＝無 hub；P6 起 `sentinel` 一律 `None`）。
+    pub hub: Option<crate::human_console::hub::HubTap>,
 }
 
 /// reader thread 結束時交回的資源（讀取錯誤與 reader 本體，供 IoWorker 收尾）。
@@ -544,6 +546,8 @@ pub struct IoWorkerArgs {
     pub data: Sender<DataEvent>,
     pub control: Sender<ControlEvent>,
     pub clock: Arc<dyn Clock>,
+    /// P6 增補 #21：ConsoleHub tap（見 `ReaderCtx.hub`）。
+    pub hub: Option<crate::human_console::hub::HubTap>,
 }
 
 /// 單一 bridge 的 I/O worker（reader thread＋TxWriter thread）。
@@ -582,6 +586,7 @@ impl IoWorker {
                 data: args.data,
                 control: args.control.clone(),
                 clock: args.clock,
+                hub: args.hub,
             },
             reader_stop.clone(),
         );

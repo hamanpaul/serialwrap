@@ -47,4 +47,42 @@ impl HubHarness {
     pub fn block_mailbox(&self, _on: bool) {
         todo!("P6 Task 9")
     }
+
+    // ---- P6 Task 9 追加（Task 1 簽章之外） ----
+    /// hub 在下一輪停住（`HubCmd::TestStall`），直到 `unstall`。
+    pub fn stall(&self) {
+        todo!("P6 Task 9")
+    }
+    pub fn unstall(&self) {
+        todo!("P6 Task 9")
+    }
+    /// hub 的 WARNING。
+    pub fn warnings(&self) -> Vec<String> {
+        todo!("P6 Task 9")
+    }
+    /// `reader_push` 經 `HubTap::push` 產生的 WARNING。
+    pub fn reader_warnings(&self) -> Vec<String> {
+        todo!("P6 Task 9")
+    }
+    /// hub 迴圈輪數。
+    pub fn loops(&self) -> u64 {
+        todo!("P6 Task 9")
+    }
+    /// 推進注入的 FakeClock 並喚醒 hub。
+    pub fn advance(&self, _d: std::time::Duration) {
+        todo!("P6 Task 9")
+    }
+    /// harness 建立時的 monotonic 時刻。
+    pub fn start_mono(&self) -> u64 {
+        todo!("P6 Task 9")
+    }
+    /// `shutdown` 後等 hub thread 結束（逾時 panic）。
+    pub fn join_within(&self, _d: std::time::Duration) {
+        todo!("P6 Task 9")
+    }
+    /// 下一個 console 輸入處理 panic（#89）。
+    pub fn panic_next_input_handler(&self) {
+        todo!("P6 Task 9")
+    }
 }
+

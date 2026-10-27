@@ -28,6 +28,19 @@ pub enum HubCmd {
     /// 07 D-12。
     OpenCom0com { port: String },
     Out { client_id: String, item: OutItem },
+    /// 測試用：hub 在本輪停住直到 gate 釋放（模擬 hub 卡住、驗證有界佇列）。
+    #[cfg(feature = "test-fakes")]
+    TestStall(Arc<StallGate>),
+}
+
+/// 測試用：`HubCmd::TestStall` 的閘門。
+#[cfg(feature = "test-fakes")]
+#[derive(Default)]
+pub struct StallGate {
+    pub released: Mutex<bool>,
+    pub cond: std::sync::Condvar,
+    /// hub 已進入停住狀態。
+    pub entered: AtomicBool,
 }
 
 /// channel 滿時的關閉旁路（07 D-17(4)）。
@@ -45,9 +58,23 @@ pub struct HubStatus {
     pub listener_up: AtomicBool,
     pub rx_dropped_chunks: AtomicU64,
     pub out_dropped: AtomicU64,
+    /// reader 端：rx channel 目前是否已滿（每次由未滿轉滿寫一筆 WARNING，D-18）。
+    pub rx_full: AtomicBool,
+    /// hub 迴圈輪數（測試與診斷）。
+    pub loops: AtomicU64,
+    /// 最近的 WARNING（上限 `HUB_WARNINGS_MAX`，供診斷與測試；同時寫 stderr）。
+    pub warnings: Mutex<std::collections::VecDeque<String>>,
+    /// 各 console 出向 ring 的 Display bytes（每輪更新，診斷用）。
+    pub ring_display: Mutex<std::collections::HashMap<String, usize>>,
+    /// 測試用：下一個 console 輸入處理 panic（#89）。
+    #[cfg(feature = "test-fakes")]
+    pub panic_next_input: AtomicBool,
 }
 
 impl HubStatus {
+    pub fn new() -> HubStatus {
+        todo!("P6 Task 9")
+    }
     /// POSIX：primary 的 vtty 路徑存在；TcpTelnet：`listener_up`（06 §7.7）。
     pub fn vtty_alive(&self, _primary_vtty: Option<&str>, _fs_exists: &dyn Fn(&str) -> bool, _kind: ConsoleKind) -> bool {
         todo!("P6 Task 9")
@@ -90,4 +117,25 @@ pub fn spawn_hub(
     _input_epoch: Arc<AtomicU64>,
 ) -> HubHandle {
     todo!("P6 Task 9")
+}
+
+/// reader 對 hub 的 RX 入口（增補 #21）：WAL 之後 `try_send`，滿載只計數＋WARNING，永不阻塞。
+pub struct HubTap {
+    pub rx: Sender<Arc<[u8]>>,
+    pub waker: Arc<dyn IoWaker>,
+    pub status: Arc<HubStatus>,
+}
+
+impl HubTap {
+    /// 回 true＝已送進 hub。
+    pub fn push(&self, _bytes: &[u8], _warning_sink: &dyn Fn(&str)) -> bool {
+        todo!("P6 Task 9")
+    }
+}
+
+impl HubHandle {
+    /// reader 用的 tap（clone `rx`／`waker`／`status`）。
+    pub fn tap(&self) -> HubTap {
+        todo!("P6 Task 9")
+    }
 }

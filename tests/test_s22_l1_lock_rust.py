@@ -36,6 +36,8 @@ P6_RUST_TEST_FILES = [
     ("sw-core", "lease_p6.rs"),
     ("sw-core", "rescue.rs"),
     ("sw-core", "session_core_lease.rs"),
+    ("sw-core", "console_hub.rs"),
+    ("sw-core", "console_echo_latency.rs"),
     ("sw-daemon", "deferred_methods.rs"),
     ("sw-pal", "console_conformance.rs"),
     ("sw-proto", "constants_slice22.rs"),

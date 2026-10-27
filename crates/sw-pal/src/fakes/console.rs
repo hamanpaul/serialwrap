@@ -379,6 +379,11 @@ impl FakeConsoleFactory {
         lock(&self.com0com).clone()
     }
 
+    /// P6 Task 9：之後 `n` 次 `ConsoleMux::wait` 回錯誤（#37）。
+    pub fn fail_next_mux_waits(&self, _n: usize) {
+        todo!("P6 Task 9")
+    }
+
     /// `held_slave_paths` 的回傳值。
     pub fn set_held(&self, held: Option<HashSet<String>>) {
         *lock(&self.held) = held;
