@@ -467,6 +467,26 @@ def test_resource_report_uart_kind(tmp_path):
         assert data["uart_kind"] == expect
 
 
+def _selftest_diag(out: Path) -> str:
+    """把 bridge selftest 報告的非 PASS 檢查摘要附進失敗訊息。
+
+    POSIX pytest 的短 basetemp 於 unconfigure 時整個刪除，失敗當次的 tmp 證據無法事後查閱；
+    只增加診斷輸出，不影響判定。
+    """
+    lines = []
+    for path in sorted(out.rglob("selftest-report.json")):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            lines.append(f"{path.relative_to(out)}: 無法解析（{type(exc).__name__}: {exc}）")
+            continue
+        bad = [f"{row.get('id')}={row.get('verdict')}：{row.get('reason')}"
+               for row in report.get("checks") or [] if isinstance(row, dict) and row.get("verdict") != "PASS"]
+        lines.append(f"{path.relative_to(out)}: verdict={report.get('verdict')} complete={report.get('complete')}"
+                     + "".join(f"\n  - {item}" for item in bad))
+    return "\n--- selftest ---\n" + ("\n".join(lines) if lines else "（未產生 selftest-report.json）")
+
+
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
@@ -476,7 +496,7 @@ def test_docker_smoke_two_container(tmp_path):
         pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
     r = _run_script(RUN_L15, "func-test-bridge", "--case", "sm-01-attach-to-ready", "--out", str(tmp_path),
                     timeout=900)
-    assert r.returncode == 0, _tail(r)
+    assert r.returncode == 0, _tail(r) + _selftest_diag(tmp_path)
     report_path = tmp_path / "l15-docker-report.json"
     assert report_path.is_file(), "run-l15.sh 未寫出 l15-docker-report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
