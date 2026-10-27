@@ -124,3 +124,128 @@ def test_session_vtty_cached(console_daemon) -> None:
     d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
     d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
     assert d._session("COM0")["vtty"] == first
+
+
+def test_second_console_blocked_while_human_lease(console_daemon) -> None:
+    d, target = console_daemon
+    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    fd2 = open_vtty(a2["vtty"])
+    try:
+        os.write(fd2, b"ls\r")
+        assert not wait_rx_contains(target, b"ls\n", 3.0), "h1 持 lease 時 h2 的行不得送到 DUT"
+        assert tx_payload(d.wal_records(), f"human:{a2['client_id']}") == b""
+    finally:
+        os.close(fd2)
+
+
+def test_deferred_bytes_flushed_after_agent_command(console_daemon) -> None:
+    import time
+
+    from .console_helpers import b64_payload
+
+    d, target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0")
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        sub = d.sw("cmd", "submit", "--selector", "COM0", "--cmd", "sleep 2", "--cmd-timeout", "8")
+        assert sub["ok"] is True, sub
+        time.sleep(0.5)
+        os.write(fd1, b"X")
+        time.sleep(0.5)
+        assert b"X" not in target.written(0.1), "agent 命令期間 human 位元組必須進 deferred"
+        assert wait_rx_contains(target, b"X", 6.0)
+        recs = [r for r in d.wal_records() if r["dir"] in ("TX", "RX")]
+        seq_cmd = min(r["seq"] for r in recs if r["dir"] == "TX" and r.get("cmd_id") == sub["cmd_id"])
+        seq_x = min(r["seq"] for r in recs if r["dir"] == "TX" and r["source"] == f"human:{a1['client_id']}")
+        seq_prompt = min(
+            r["seq"] for r in recs if r["dir"] == "RX" and r["seq"] > seq_cmd and b"# " in b64_payload(r)
+        )
+        assert seq_cmd < seq_prompt < seq_x, (seq_cmd, seq_prompt, seq_x)
+    finally:
+        os.close(fd1)
+
+
+def test_raw_ownership_survives_agent_rounds(console_daemon) -> None:
+    d, target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    # human 的 minicom 一直開著（否則逾 2 s 無 peer 會被 list prune，與 ownership 無關）。
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        for n in range(5):
+            sub = d.sw("cmd", "submit", "--selector", "COM0", "--cmd", f"echo R{n}", "--cmd-timeout", "5")
+            assert sub["ok"] is True, sub
+            d.wait_command_done(sub["cmd_id"])
+            # done_at 之後 resume 才還原 owner（Python `finally` 先 resume 再結束前景），短暫輪詢。
+            assert wait_for(
+                lambda: [r["client_id"] for r in _consoles(d) if r["interactive_owner"]] == [a1["client_id"]], 2.0
+            ), _consoles(d)
+        os.write(fd1, b"\t")
+        assert wait_rx_contains(target, b"\t", 2.0)
+    finally:
+        os.close(fd1)
+
+
+def test_peer_gone_console_pruned(console_daemon) -> None:
+    import time
+
+    d, _target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    fd1 = open_vtty(a1["vtty"])
+    try:
+        time.sleep(2.5)
+        ids = [r["client_id"] for r in _consoles(d)]
+        assert a2["client_id"] not in ids, ids
+        assert a1["client_id"] in ids, ids
+    finally:
+        os.close(fd1)
+
+
+def test_human_line_interactive_mode_opens_lease(console_daemon) -> None:
+    d, _target = console_daemon
+    a1 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    d.sw("session", "console-detach", "--selector", "COM0", "--client-id", a1["client_id"])
+    fd2 = open_vtty(a2["vtty"])
+    try:
+        os.write(fd2, b"vim\r")
+        assert wait_for(
+            lambda: any(r["client_id"] == a2["client_id"] and r["interactive_owner"] for r in _consoles(d)), 5.0
+        ), _consoles(d)
+    finally:
+        os.close(fd2)
+
+
+def test_line_overflow_warning(console_daemon) -> None:
+    d, target = console_daemon
+    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    d.sw("session", "console-detach", "--selector", "COM0", "--client-id", _consoles(d)[0]["client_id"])
+    fd2 = open_vtty(a2["vtty"])
+    try:
+        payload = b"a" * 16390 + b"\r"
+        view = memoryview(payload)
+        while view:
+            try:
+                n = os.write(fd2, view[:4096])
+            except BlockingIOError:
+                read_until(fd2, b"\x00", 0.05)
+                continue
+            view = view[n:]
+            read_until(fd2, b"\x00", 0.01)
+        assert not wait_rx_contains(target, b"aaaa", 2.0)
+        assert wait_for(lambda: a2["client_id"] in d._stderr_tail(20000), 3.0), d._stderr_tail()
+    finally:
+        os.close(fd2)
+
+
+def test_last_line_before_disconnect_submitted(console_daemon) -> None:
+    d, target = console_daemon
+    d.sw("session", "console-attach", "--selector", "COM0", "--label", "h1")
+    a2 = d.sw("session", "console-attach", "--selector", "COM0", "--label", "h2")
+    d.sw("session", "console-detach", "--selector", "COM0", "--client-id", _consoles(d)[0]["client_id"])
+    fd2 = open_vtty(a2["vtty"])
+    os.write(fd2, b"echo LAST\r")
+    os.close(fd2)
+    assert wait_rx_contains(target, b"echo LAST\n", 5.0)
