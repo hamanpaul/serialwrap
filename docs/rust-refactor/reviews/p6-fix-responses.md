@@ -212,7 +212,7 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 | # | 等級 | Commit | 問題 | 處理 |
 |---|---|---|---|---|
 | R3-1 | High | 02fb068 | `list_sorted_by_label_then_id` 鎖住「無哨兵」 | fixed 776c029／03ba902（改斷言 `["a","b","primary"]` 並實作哨兵） |
-| R3-2 | High | 1fb9612 | tcp backend 的 `console_attach` 回 SESSION_NOT_READY | deferred：TCP console 端點回應屬 Task 10 後段，Linux 上 SC-28 tcp 後端為 rust_only、Windows 為原生路徑（LOCAL-WINDOWS-TODO）；需 hub StartListener 與端點經 RPC 回填，下一輪實作 |
+| R3-2 | High | 1fb9612 | tcp backend 的 `console_attach` 回 SESSION_NOT_READY | fixed（第五輪 c7980a0 紅燈／a6a6850 修正）：executor 開埠時綁 per-bridge listener、端點隨 `OpenedBridge` 同事件登記；`console_attach` 回端點形狀、SessionPublic 恆輸出 `console_endpoint`；Linux 上以 SC-28 tcp 後端驗證（rpc_console 5 支、slice22 Telnet 黑箱 6 案），Windows 原生（WSAPoll mux）仍為 LOCAL-WINDOWS-TODO |
 | R3-3 | Medium | 1fb9612 | 公開 vtty／console_count 恆 0、無哨兵 | fixed e2e8a57、03ba902 |
 | R3-4 | Medium | 1fb9612 | hub 佇列滿或 request 逾時後留下無 fd 的 console | fixed（本 commit）：executor 取不到 PTY 或 AdoptPty 送不進 hub 時寫 WARNING 並回 `ConsoleDisconnected`，core 移除該 console；回歸測試待 fault-injection hook（FakeConsole 無 add_io／佇列滿注入） |
 | R3-5 | Medium | 1fb9612 | `interactive_open` 的 SESSION_NOT_READY selector 變 COM | fixed（本 commit）；回歸 `interactive_open_not_ready_keeps_raw_selector` |
@@ -250,3 +250,17 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 | R5-L8 | Low | e59d928 | changelog 未提 ATTACHED 救援移除 SESSION_BUSY 出口 | fixed（本輪）：`changelog.d/rust-s22-console-sentinel.md` 補一句 |
 | R5-L9 | Low | 3317987 | `target.written(0.5)` 不會等 | fixed（本輪）：hex 拒絕前先 `time.sleep(0.5)` 再比長度 |
 | R5-L10 | Low | 3317987 | vtty 未驗 `/dev/pts/\d+` | fixed（本輪） |
+
+## 第五輪 Task 進度（2026-10-27 cloud session）
+
+| 項目 | 狀態 |
+|---|---|
+| Task 10 TCP console（R3-2、`attach_tcp_shape`、`session_public_console_fields_tcp`） | 完成（c7980a0／a6a6850）；另補 `tcp_client_accept_gets_raw_owner_and_greeting`、`tcp_release_clears_console_endpoint`、`tcp_listener_ephemeral_per_bridge`（Task 12 `telnet_listener_ephemeral_per_bridge` 的 Linux 可驗部分） |
+| Task 10 表列（R3-9） | 補 `list_and_detach_without_bridge`、`open_coercion_float_error_before_invalid_args`、`open_timeout_zero_uses_default`、`open_allow_attached_string_false_is_truthy`。仍 deferred：`attach_interactive_owner_false_during_replay_hold`（需「無 lease 的 human 在前景命令期間鍵入、命令結束回放停在 OS 提交前」：PTY attach 必開 human lease，TCP accept 無 lease 但目前 FakeDevice 的 `PauseBeforeSubmit` 無法只作用於回放那筆寫入，需 per-source 寫入腳本 hook）、`attach_request_timeout_closes_pty`（需 actor 卡住的 fault-injection hook，同 R3-4） |
+| Task 11 | 第四批完成（c6578a2、c7980a0）：Telnet 6 案（rust_only）、ATTACHED 救援 4 案、open 拒絕零 TX、stash_dropped（rust_only）、BC-02 banner／恢復窗（後者 rust_only）、f6_two_boards、f8 兩案。slice22：Python 38 passed／8 skipped、Rust 46 passed。待做：`f4_interactive_line_cmd_defined`（BLOCKED-OWNER parity 判定，見上）、func-test 八案與 L1.5 `l15-multi-source-contention-console` 重跑 |
+| Task 12 | LOCAL-WINDOWS-TODO（Windows 原生 console：WSAPoll mux、com0com Serial console、W-1～W-7、win-blackbox A/B） |
+| Task 13 | 部分完成：`s22_gate_check.py`＋`tests/test_s22_gate_check.py`（合成 fixture 8 案）、三份 BLOCKED-OWNER 程序、README、#155 評估。未做：`slice22_evidence_map.yaml` 95 筆填寫與 `tests/test_acceptance_slice22.py`——繼承案例（F1～F4／F12、P0、L1.5、SM、win-com／win-wal）的證據條目依 06（P5）的 evidence 規劃，P5 尚未交付對應對照；且 `AUTOMATED` 條目須在 `s22_gate:*` 凍結集合內，`s22_gate:blackbox_rust`／`s22_gate:win_test` 兩集合需 Task 12 的 Windows 報告一併凍結。`test_no_pending_entries` 在此之前恆紅，不以恆紅測試進分母（同 R2-5 處理）；SC-28／SC-29／SC-31 的 `IMPLEMENTED` 依計畫須 Step 4 全通過（含 win-test），維持現狀 |
+
+上游（P5）觀察，本輪新增：
+- `lease_selftest::selftest_probe_drain_race_golden`（P5 檔案）在全套 pytest 同時執行的負載下失敗一次（`lease_selftest.rs:1303`），隨後單獨連跑 3 次皆 31/31 綠；失敗集合不同，判定為負載敏感的競態迴圈測試，交 P5 評估是否加寬時序。
+- `origin/feature/rust-refactor-p5` 有 3 個新 commit（18abb03、9363d9b、1f5aafa），本輪 Task 不需要，未合併。
