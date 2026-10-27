@@ -43,6 +43,19 @@ class TestSessionBind(unittest.TestCase):
         self.assertEqual(resp["session"]["state"], "DETACHED")
         self.assertEqual(resp["session"]["last_error"], "DEVICE_NOT_FOUND")
 
+    def test_bind_empty_device_by_id_is_invalid_args(self) -> None:
+        """#98（parity-amendments-2026-10-26，#81 特性測試）：空字串／純空白 device_by_id → INVALID_ARGS，不改綁、不寫 binding。"""
+        profiles = [self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")]
+        mgr = SessionManager(profiles, WalWriter(wal_dir=self._tmp.name), on_ready=lambda _sid: None, on_detached=lambda _sid: None)
+
+        for value in ("", "   "):
+            resp = mgr.bind_session("COM0", value)
+            self.assertEqual(resp, {"ok": False, "error_code": "INVALID_ARGS"})
+        session = mgr.get_session("COM0")
+        assert session is not None
+        self.assertEqual(session.profile.device_by_id, "/dev/serial/by-id/orig")
+        self.assertNotIn("p:COM0", mgr._binding_overrides)
+
     def test_bind_rejects_duplicate_device(self) -> None:
         profiles = [
             self._make_profile("p1", "COM0", "lab+1", "/dev/serial/by-id/a"),

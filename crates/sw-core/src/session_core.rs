@@ -163,6 +163,15 @@ pub enum SessionRequest {
     ConsoleDetach { client_id: String },
     /// P6 增補 #9。
     ConsoleList,
+    /// P5-T16：manager 的 profile 再解析（#181 `_rematerialize_profile_locked`）：無 bridge 時原地換 template，
+    /// `session_id` 依新 `profile_name` 重算；有 bridge 或 drain 中回 `SESSION_RECOVERING`（manager 不在此時呼叫）。
+    SetProfile {
+        profile: SessionProfile,
+        profile_source: String,
+    },
+    /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
+    #[cfg(feature = "test-fakes")]
+    ForceStateForTest(SessionState),
 }
 
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
@@ -323,7 +332,8 @@ pub struct SessionCore {
     drain_timeout_epoch: Option<u64>,
     released_by: Option<String>,
     released_at: Option<String>,
-    released_reason: Option<String>,
+    /// Python `released_reason`：RPC `device.release` 的 `reason` 原樣（任意 JSON；未帶為 null）。
+    released_reason: PyValue,
     /// agent Interactive Lease（P5-T14；`interactive_session_id` 由此導出）。
     lease: Option<InteractiveLease>,
     /// 已到期 lease 的 tombstone（每 session FIFO 16，#54）。
@@ -350,8 +360,13 @@ pub struct SessionCore {
     pending_auto_login: bool,
     shutdown_requested: bool,
     shutdown_complete: bool,
+    /// P5-T16：`StopKind::Bind` drain 完成後要改綁的 by_id（Python `_DrainJob.target_by_id`）。
+    pending_bind: Option<String>,
     #[cfg(feature = "test-fakes")]
     panic_events_remaining: u8,
+    /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
+    #[cfg(feature = "test-fakes")]
+    last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
 }
 
 struct PendingOpenStop {
@@ -371,6 +386,12 @@ struct LoginRun {
     kind: LoginRunKind,
     /// `SessionAttach`／`Recover` 再探的等待者（attach 路徑無）。
     waiters: Vec<(Reply, ReprobeWaiter)>,
+    /// StartLogin 發出時的登入世代。
+    fsm_gen: u64,
+    /// run 進行中因 boot quiet arm 而遞增的 fsm_gen 次數。
+    quiet_bumps: u64,
+    /// attach run 已被 quiet 撤銷且其（舊世代）結果已回報：下一個 Tick 落定 ATTACHED＋`PROMPT_UNAVAILABLE`。
+    revoked_by_quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,7 +502,7 @@ impl SessionCore {
             drain_timeout_epoch: None,
             released_by: None,
             released_at: None,
-            released_reason: None,
+            released_reason: PyValue::Null,
             lease: None,
             tombstones: Tombstones::new(),
             pending_ops: HashMap::new(),
@@ -499,8 +520,11 @@ impl SessionCore {
             pending_auto_login: false,
             shutdown_requested: false,
             shutdown_complete: false,
+            pending_bind: None,
             #[cfg(feature = "test-fakes")]
             panic_events_remaining: 0,
+            #[cfg(feature = "test-fakes")]
+            last_error_observer: None,
         }
     }
 
@@ -779,7 +803,7 @@ impl SessionCore {
         out.insert("released_at", option_string(self.released_at.as_deref()));
         out.insert(
             "released_reason",
-            option_string(self.released_reason.as_deref()),
+            self.released_reason.clone(),
         );
         out.insert(
             "capture",
@@ -849,6 +873,38 @@ impl SessionCore {
     #[cfg(feature = "test-fakes")]
     pub fn set_boot_quiet_until_for_test(&mut self, deadline: Mono) {
         self.quiet.boot_quiet_until = deadline;
+    }
+
+    /// 只供測試（test-fakes）：`last_error` 變更觀察者（spawn 前設定；Task 16 `last_error_history`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_last_error_observer(&mut self, observer: Box<dyn Fn(&str) + Send>) {
+        self.last_error_observer = Some(observer);
+    }
+
+    /// P5-T16：manager 啟動時還原 `state.json` 的 RELEASED 列（spawn 前呼叫；Python `__init__` 的 released 實體化）。
+    pub fn init_released(
+        &mut self,
+        released_by: Option<String>,
+        released_at: Option<String>,
+        reason: PyValue,
+    ) {
+        self.state = SessionState::Released;
+        self.released_by = released_by;
+        self.released_at = released_at;
+        self.released_reason = reason;
+    }
+
+    /// P5-T16：還原 RELEASED 動態 session 時沿用 `state.json` 的 session_id（Python `session_id_override`；
+    /// template 經 pin／sticky 改變時 sid 不隨之重算）。spawn 前呼叫。
+    pub fn init_session_id(&mut self, sid: String) {
+        self.sid = sid;
+    }
+
+    /// P5-T16：動態 attach 開埠失敗時保留可診斷的 DETACHED session（spawn 前呼叫；`_record_dynamic_open_failure`）。
+    pub fn init_detached_error(&mut self, last_error: String, detached_at: String) {
+        self.state = SessionState::Detached;
+        self.last_error = Some(last_error);
+        self.detached_at = Some(detached_at);
     }
 }
 
@@ -1219,7 +1275,7 @@ impl SessionCore {
                             self.release_persist_pending = false;
                             self.released_by = None;
                             self.released_at = None;
-                            self.released_reason = None;
+                            self.released_reason = PyValue::Null;
                             if pending_stop.kind != StopKind::Release {
                                 self.pending_release = None;
                             }
@@ -1235,7 +1291,7 @@ impl SessionCore {
                     self.release_persist_pending = false;
                     self.released_by = None;
                     self.released_at = None;
-                    self.released_reason = None;
+                    self.released_reason = PyValue::Null;
                     self.pending_release = None;
                     self.pending_attach = None;
                     self.state = SessionState::Attaching;
@@ -1280,7 +1336,7 @@ impl SessionCore {
                     self.release_persist_pending = false;
                     self.released_by = None;
                     self.released_at = None;
-                    self.released_reason = None;
+                    self.released_reason = PyValue::Null;
                     self.pending_release = None;
                     self.set_state(SessionState::Detached, now);
                     vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
@@ -1328,6 +1384,10 @@ impl SessionCore {
     fn set_last_error(&mut self, error: Option<String>, detail: Option<String>) {
         if self.last_error != error {
             self.last_error_detail = None;
+            #[cfg(feature = "test-fakes")]
+            if let (Some(observer), Some(value)) = (self.last_error_observer.as_ref(), error.as_deref()) {
+                observer(value);
+            }
         }
         self.last_error = error;
         if detail.is_some() {
@@ -1506,7 +1566,27 @@ impl SessionCore {
             SessionRequest::Bind { .. } if self.drain_in_progress() => {
                 vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
-            SessionRequest::Bind { .. } => s21_todo!("T15", "bind request"),
+            SessionRequest::Bind { by_id } => self.bind_request(by_id, reply, now),
+            SessionRequest::SetProfile {
+                profile,
+                profile_source,
+            } => {
+                if self.generations.conn_epoch.is_some()
+                    || self.drain_in_progress()
+                    || self.open_real_path.is_some()
+                {
+                    return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+                }
+                self.sid = format!("{}:{}", profile.template.profile_name, profile.com);
+                self.profile = profile;
+                self.profile_source = profile_source;
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
+            #[cfg(feature = "test-fakes")]
+            SessionRequest::ForceStateForTest(state) => {
+                self.set_state(state, now);
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
             SessionRequest::InteractiveSend {
                 interactive_id,
                 data,
@@ -1710,6 +1790,13 @@ impl SessionCore {
                 Ok(self.session_recovering_reply(now)),
             )];
         }
+        // P5-T16：`attach_session` 的未綁定早退（Python 同樣只在 device_by_id 為空時；config 會丟棄無 by_id 的 target）。
+        if session_attach && self.profile.device_by_id.is_empty() {
+            return vec![Effect::Reply(
+                reply,
+                Ok(self.error_session("DEVICE_NOT_BOUND", now)),
+            )];
+        }
         if session_attach
             && self.state == SessionState::Released
             && !self
@@ -1765,6 +1852,16 @@ impl SessionCore {
         if self.release_persist_pending {
             return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
         }
+        if !self.device_present && session_attach {
+            // P5-T16：`attach_session` 無 bridge 且裝置不在快照 → DETACHED＋DEVICE_NOT_FOUND（Python 1:1）。
+            self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+            self.detached_at = Some(self.wall_iso());
+            self.set_state(SessionState::Detached, now);
+            return vec![Effect::Reply(
+                reply,
+                Ok(self.error_session("DEVICE_NOT_FOUND", now)),
+            )];
+        }
         if !self.device_present {
             return vec![Effect::Reply(
                 reply,
@@ -1796,6 +1893,64 @@ impl SessionCore {
             cfg: self.serial_config(),
             precheck_holders: !force,
         }]
+    }
+
+    /// P5-T16：`bind_session`（session 層）：同值冪等、有 bridge 先 `StopKind::Bind` drain、否則立即改綁。
+    /// 改綁後一律 DETACHED＋`DEVICE_NOT_FOUND`；裝置在線時由 manager 隨後送 `DeviceAttached` 進 ATTACHING。
+    fn bind_request(&mut self, by_id: String, reply: Reply, now: Mono) -> Vec<Effect> {
+        if self.state == SessionState::Flashing {
+            // Python `bind_session` 鍵序：ok／error_code／selector／session。
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "FLASHING_BUSY",
+                    "selector" => self.profile.com.clone(),
+                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                }),
+            )];
+        }
+        if self.generations.conn_epoch.is_some()
+            && self.profile.device_by_id == by_id
+            && matches!(self.state, SessionState::Ready | SessionState::Attached)
+        {
+            return vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "ok" => true,
+                    "already_bound" => true,
+                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                }),
+            )];
+        }
+        if self.open_real_path.is_some()
+            || self.pending_attach.is_some()
+            || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }))
+        {
+            return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+        }
+        if self.generations.conn_epoch.is_some() {
+            self.pending_bind = Some(by_id);
+            return self.begin_stop(StopKind::Bind, Some(reply), now).0;
+        }
+        self.apply_bind(by_id, now);
+        vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+    }
+
+    /// 改綁的狀態套用（離開 RELEASED、清 released metadata、裝置視為未在線）。
+    fn apply_bind(&mut self, target: String, now: Mono) {
+        if self.state == SessionState::Released {
+            self.release_persist_pending = false;
+            self.pending_release = None;
+        }
+        self.released_by = None;
+        self.released_at = None;
+        self.released_reason = PyValue::Null;
+        self.profile.device_by_id = target;
+        self.device_present = false;
+        self.known_real_path = None;
+        self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+        self.set_state(SessionState::Detached, now);
     }
 
     fn serial_config(&self) -> SerialConfig {
@@ -1873,6 +2028,14 @@ impl SessionCore {
                             pending.reply,
                             Ok(self.session_recovering_reply(now)),
                         ));
+                    } else if self.state == SessionState::Attaching
+                        && !path_matches
+                        && !self.shutdown_requested
+                    {
+                        // #50（P5-T16）：attach 收尾時仍需 attach（Python `_spawn_attach` finally 再 spawn）：
+                        // 裝置於開啟途中改指 → 以目前 known_real_path 再送一次 OpenBridge；裝置已不在則 DETACHED。
+                        self.open_real_path = None;
+                        effects.extend(self.reopen_known_device(now));
                     }
                     return effects;
                 }
@@ -2160,6 +2323,9 @@ impl SessionCore {
                     epoch,
                     kind: LoginRunKind::Attach,
                     waiters: Vec::new(),
+                    fsm_gen: self.generations.fsm_gen,
+                    quiet_bumps: 0,
+                    revoked_by_quiet: false,
                 });
                 effects.push(Effect::StartLogin {
                     epoch,
@@ -2234,6 +2400,17 @@ impl SessionCore {
         }
     }
 
+    /// 舊世代 attach 結果是否僅因 run 期間的 quiet arm 而失效（世代差恰為 quiet arm 次數）。
+    fn attach_run_revoked_by_quiet(&self, epoch: u64, fsm_gen: u64) -> bool {
+        self.login_run.as_ref().is_some_and(|run| {
+            run.epoch == epoch
+                && run.kind == LoginRunKind::Attach
+                && run.fsm_gen == fsm_gen
+                && run.quiet_bumps > 0
+                && self.generations.fsm_gen == fsm_gen.saturating_add(run.quiet_bumps)
+        })
+    }
+
     fn login_finished(
         &mut self,
         epoch: u64,
@@ -2262,6 +2439,14 @@ impl SessionCore {
                 return Vec::new();
             }
         } else if self.state != SessionState::Attaching || self.generations.fsm_gen != fsm_gen {
+            // 舊世代結果一律無效果（T11）。但 quiet 撤銷的 attach run 若就此丟棄，session 會永久停在
+            // ATTACHING；Python `_attach_by_id` 的 probe 遇 quiet 撤銷 → TxIncompleteError → PROMPT_UNAVAILABLE、
+            // 落定 ATTACHED。故只標記，由下一個 Tick 以 boot quiet 合成碼收尾（P5-T20 黑箱 banner 情境）。
+            if self.state == SessionState::Attaching && self.attach_run_revoked_by_quiet(epoch, fsm_gen) {
+                if let Some(run) = self.login_run.as_mut() {
+                    run.revoked_by_quiet = true;
+                }
+            }
             return Vec::new();
         }
         let run = self.login_run.take();
@@ -2408,6 +2593,9 @@ impl SessionCore {
                     epoch,
                     kind: LoginRunKind::Reprobe,
                     waiters: vec![(reply, kind)],
+                    fsm_gen: self.generations.fsm_gen,
+                    quiet_bumps: 0,
+                    revoked_by_quiet: false,
                 });
                 vec![Effect::StartLogin {
                     epoch,
@@ -2460,6 +2648,12 @@ impl SessionCore {
         let until = self.quiet.boot_quiet_until;
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
+        // quiet 撤銷進行中 attach run 的後續 TX（fence FsmMismatch）；記錄次數以便辨識其舊世代結果（P5-T20）。
+        if let Some(run) = self.login_run.as_mut() {
+            if run.epoch == epoch && run.kind == LoginRunKind::Attach {
+                run.quiet_bumps = run.quiet_bumps.saturating_add(1);
+            }
+        }
         let pending = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.quiet_active = true;
@@ -2530,8 +2724,28 @@ impl SessionCore {
         }
     }
 
+    /// quiet 撤銷的 attach run 收尾：掛上 bridge 純收 RX，`PROMPT_UNAVAILABLE` 停在 ATTACHED
+    /// （同 `_attach_by_id` boot quiet 分支；last_error_detail 不精煉）。
+    fn settle_quiet_revoked_attach(&mut self, now: Mono) {
+        let revoked = self.state == SessionState::Attaching
+            && self.login_run.as_ref().is_some_and(|run| {
+                run.revoked_by_quiet
+                    && run.kind == LoginRunKind::Attach
+                    && self.generations.conn_epoch == Some(run.epoch)
+            });
+        if !revoked {
+            return;
+        }
+        self.login_run = None;
+        self.adopt_bridge(now);
+        self.last_probe_at = Some(self.wall_iso());
+        self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
+        self.set_state(SessionState::Attached, now);
+    }
+
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
+        self.settle_quiet_revoked_attach(now);
         self.expire_reconfirm(now);
         // SC-13：1 s tick 主動收回到期的 agent lease（`_expire_interactive_leases_tick`，留 tombstone）。
         if self
@@ -2778,12 +2992,21 @@ impl SessionCore {
                     Vec::new()
                 };
                 effects.extend(open_effects);
+                if kind == StopKind::Clear && self.state == SessionState::Attaching {
+                    // Python `clear_session`：drain 收尾設 ATTACHING＋CLEARED 後立即 `_spawn_attach`，
+                    // `_attach_by_id` 開埠前 `last_error = None`；ATTACHING 期間不帶 CLEARED（P5-T20 黑箱）。
+                    self.set_last_error(None, None);
+                }
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }
             }
             StopKind::Bind => {
+                self.set_last_error(Some("REBOUND".into()), None);
                 self.set_state(SessionState::Detached, now);
+                if let Some(target) = self.pending_bind.take() {
+                    self.apply_bind(target, now);
+                }
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }
@@ -2878,11 +3101,7 @@ impl SessionCore {
             .unwrap_or_else(|| ("cli".into(), PyValue::Null));
         self.released_by = Some(source);
         self.released_at = Some(self.wall_iso());
-        self.released_reason = match reason {
-            PyValue::Str(s) => Some(s),
-            PyValue::Null => None,
-            other => Some(format!("{other:?}")),
-        };
+        self.released_reason = reason;
         self.set_last_error(Some("RELEASED".into()), None);
         self.set_state(SessionState::Released, now);
     }
@@ -4280,6 +4499,9 @@ impl SessionCore {
             epoch,
             kind: LoginRunKind::RebootRecovery,
             waiters: Vec::new(),
+            fsm_gen: self.generations.fsm_gen,
+            quiet_bumps: 0,
+            revoked_by_quiet: false,
         });
         vec![Effect::StartLogin {
             epoch,
@@ -4512,7 +4734,7 @@ impl SessionCore {
                 "session" => session,
                 "released_by" => option_string(self.released_by.as_deref()),
                 "released_at" => option_string(self.released_at.as_deref()),
-                "reason" => option_string(self.released_reason.as_deref()),
+                "reason" => self.released_reason.clone(),
                 "external_holder" => external,
                 "reclaimable" => reclaimable,
                 "recommended_action" => if reclaimable { "device_attach" } else { "wait_external_flash" },

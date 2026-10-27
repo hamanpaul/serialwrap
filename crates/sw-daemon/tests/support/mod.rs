@@ -20,6 +20,10 @@ use sw_proto::pyjson::{self, PyValue};
 
 pub use sw_daemon::daemon_main::{run_with_hooks, DaemonHooks, TraceEvent};
 
+/// P5-T18：`dispatch.rs` 的 `ServiceRig` 與 `deferred_methods`（追加，不改既有支援碼）。
+mod service_rig;
+pub use service_rig::*;
+
 /// 以 `cargo test` 建置的 daemon 執行檔（`--features test-fakes` 下含測試專用 method）。
 pub const DAEMON_BIN: &str = env!("CARGO_BIN_EXE_serialwrapd");
 pub const PING: &str = r#"{"id":1,"method":"health.ping"}"#;
@@ -183,7 +187,7 @@ pub fn isolated_env_with_pty_target() -> IsolatedEnv {
     env
 }
 
-/// 寫入 `config.yaml`：一個 shell profile（`shell-test`）與 COM0 target（device_by_id 指向隔離 by-id 目錄）。
+/// 寫入 `<CONFIG_DIR>/profiles/target.yaml`：一個 shell profile（`shell-test`）與 COM0 target（device_by_id 指向隔離 by-id 目錄）。
 pub fn write_target_config(config_dir: &Path, by_id_dir: &Path) {
     let device = by_id_dir.join(TARGET_BY_ID);
     let yaml = format!(
@@ -204,7 +208,11 @@ targets:
 "#,
         device.display()
     );
-    fs::write(config_dir.join("config.yaml"), yaml).expect("寫入 config.yaml");
+    // 修正（P5-T19）：daemon 只從 `PROFILE_DIR`（`<CONFIG_DIR>/profiles`）載入 profile（Python `load_profiles(args.profile_dir)`），
+    // `config.yaml` 不含 profile。原預寫版本寫入 `config.yaml`，Python 與 Rust 兩端都載不到 COM0 target。
+    let profile_dir = config_dir.join("profiles");
+    fs::create_dir_all(&profile_dir).expect("建立 profiles 目錄");
+    fs::write(profile_dir.join("target.yaml"), yaml).expect("寫入 profiles/target.yaml");
 }
 
 impl IsolatedEnv {
@@ -239,9 +247,22 @@ const RUNNER_PY: &str = r#"
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
+import os
 from bb_faketarget import FakeTarget
-ft = FakeTarget(Path(sys.argv[2]))
+class _Attachable(FakeTarget):
+    # P5-T19 修正：比照 test_bb_daemon_e2e.py 的 DaemonAttachableTarget。FakeTarget 在 start() 後仍持有 slave fd，
+    # daemon 的 BC-04 外部 holder 偵測（Python probe_holders／Rust UartExclusive）會把本行程視為外部 holder
+    # （ATTACH_FAILED:DeviceHeldError）；連結建立後立即關閉 slave，reader 在 daemon 關閉／重開 slave 的 EIO 後持續存活。
+    def _run_loop(self):
+        while not self._stop.is_set():
+            super()._run_loop()
+            if self._stop.wait(0.05):
+                break
+ft = _Attachable(Path(sys.argv[2]))
 ft.start(Path(sys.argv[3]), sys.argv[4])
+if ft.slave_fd is not None:
+    os.close(ft.slave_fd)
+    ft.slave_fd = None
 print("READY " + ft.slave_path, flush=True)
 for raw in sys.stdin:
     cmd = raw.strip()
@@ -368,6 +389,11 @@ impl DaemonProc {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// 行程是否仍在執行（未結束）。
+    pub fn try_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     /// 等待行程結束；逾時 panic（不留下殘留行程：Drop 會 kill）。
@@ -556,16 +582,174 @@ pub enum Fixture {
 
 /// 建立 in-process 測試用的 `sw_pal::Platform`：環境變數取自 `vars`（不改動行程環境）、裝置來源為 `devices`、夾具為 `fixture`。
 ///
-/// 紅燈狀態：`sw_pal::Platform` 尚無 DeviceSource 注入點（P5-T5 `devices` 工廠）與 FakeEnv 注入，
-/// 且 `FakeDeviceSource`（P5-T1）、READY shell 腳本、FakeWalFs 故障（P5-T7／T12）仍為 stub。
-/// 實作者於接線後以真實替身取代此 `unimplemented!`，並保持呼叫端簽章不變。
+/// 以 `sw_pal::native()` 為底（實例鎖、RPC listener、FsOps、時鐘為原生），替換：
+/// - `env`：`FakeEnv`（內容＝`vars`）；
+/// - `devices`：`FakeDeviceSource`（初始快照＝`devices`，依列舉順序）；
+/// - `serial`／`uart_excl`：`FakeSerialBackend`（每個裝置以 `real_path` 登錄）／無持有者；
+/// - `wal_fs`：原生 WalFs；`Fixture::WalSyncFailure` 時包一層「`sync` 一律失敗」。
+///
+/// profile 寫入 `<SERIALWRAP_CONFIG_DIR>/profiles/inproc.yaml`：`Fixture::None` 只有 passthrough template（動態 session 停 ATTACHED）；
+/// 其餘夾具為 shell template `t`＋target `COM0`（第一個裝置），FakeSerial 假 DUT 回 prompt 與 ready nonce。
+/// `BlockForeverWriter`／`WalSyncFailure` 由夾具自帶的驅動 thread 完成「等 READY → 動作 → `daemon.stop`」（子行程模式無其他 client）。
 pub fn in_process_platform(
     vars: &BTreeMap<String, String>,
     devices: Vec<(String, DeviceInfo)>,
     fixture: Fixture,
 ) -> sw_pal::Platform {
-    let _ = (vars, devices, fixture);
-    unimplemented!("slice21 T19 red: in-process 假平台（FakeDeviceSource 注入、FakeEnv、夾具）尚未接線")
+    use sw_pal::fakes::{FakeDeviceSource, FakeEnv, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
+    use std::sync::Arc;
+
+    let config_dir = PathBuf::from(vars.get("SERIALWRAP_CONFIG_DIR").expect("vars 須含 SERIALWRAP_CONFIG_DIR"));
+    let socket = PathBuf::from(vars.get("SERIALWRAP_RUN_DIR").expect("vars 須含 SERIALWRAP_RUN_DIR")).join("serialwrapd.sock");
+    let profile_dir = config_dir.join("profiles");
+    fs::create_dir_all(&profile_dir).expect("建立 profiles 目錄");
+    let yaml = match fixture {
+        Fixture::None => "profiles:\n  p:\n    platform: passthrough\n    ready_probe: ''\n".to_string(),
+        _ => format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\ntargets:\n  - {{com: COM0, profile: t, device_by_id: {}}}\n",
+            devices.first().map(|(k, _)| k.clone()).unwrap_or_default()
+        ),
+    };
+    fs::write(profile_dir.join("inproc.yaml"), yaml).expect("寫入 in-process profile");
+
+    let serial = FakeSerialBackend::new();
+    let mut first_dev = None;
+    for (_, info) in &devices {
+        let dev = serial.add_device(&info.real_path);
+        if fixture != Fixture::None {
+            install_shell_replies(&dev);
+            if first_dev.is_none() {
+                first_dev = Some(dev.clone());
+            }
+        }
+    }
+    // READY 之後的第一筆寫入（agent 命令）依夾具阻塞：ready nonce 回應的同時排入寫入腳本。
+    if let Some(dev) = &first_dev {
+        let step = match fixture {
+            Fixture::ReadyShellBlockingWithQueue => Some(FakeWriteStep::BlockUntilCancel { accept_before_cancel: 0 }),
+            Fixture::BlockForeverWriter => Some(FakeWriteStep::BlockForever),
+            _ => None,
+        };
+        if let Some(step) = step {
+            let handle = dev.clone();
+            let armed = std::sync::atomic::AtomicBool::new(false);
+            dev.on_tx_match(
+                r"__READY__[0-9a-f]+",
+                Box::new(move |_line: &[u8]| {
+                    if !armed.swap(true, Ordering::SeqCst) {
+                        handle.script_write(vec![step.clone()]);
+                    }
+                    Vec::new()
+                }),
+            );
+        }
+    }
+
+    let env = FakeEnv::default();
+    *env.vars.lock().unwrap() = vars.clone();
+    let mut p = sw_pal::native();
+    p.env = Arc::new(env);
+    p.serial = serial;
+    p.uart_excl = Arc::new(FakeUartExclusive { report: Default::default() });
+    let snapshot = devices.clone();
+    p.devices = Box::new(move |_sel: sw_pal::traits::DeviceSelection| -> Box<dyn sw_pal::traits::DeviceSource> {
+        Box::new(FakeDeviceSource::new(snapshot.clone()).0)
+    });
+    if fixture == Fixture::WalSyncFailure {
+        p.wal_fs = Arc::new(SyncFailWalFs(p.wal_fs.clone()));
+    }
+
+    match fixture {
+        Fixture::BlockForeverWriter => {
+            std::thread::spawn(move || {
+                wait_socket(&socket, LONG);
+                wait_state_in_process(&socket, "COM0", "READY");
+                let r = submit(&socket, "COM0", "stuck");
+                assert!(r["ok"] == true, "BlockForever 夾具的命令應被接受：{r:?}");
+                std::thread::sleep(Duration::from_millis(300));
+                rpc_once(&socket, STOP);
+            });
+        }
+        Fixture::WalSyncFailure => {
+            std::thread::spawn(move || {
+                wait_socket(&socket, LONG);
+                wait_state_in_process(&socket, "COM0", "READY");
+                rpc_once(&socket, STOP);
+            });
+        }
+        _ => {}
+    }
+    p
+}
+
+/// 輪詢 session 狀態（in-process 夾具驅動 thread 用；逾時 panic）。
+fn wait_state_in_process(socket: &Path, com: &str, want: &str) {
+    let deadline = Instant::now() + LONG;
+    loop {
+        if get_state(socket, com)["state"] == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{com} 未在 30 s 內進入 {want}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// shell 假 DUT（FakeSerial）：`\n` → prompt；`__READY__<nonce>` → nonce＋prompt（與 `ServiceRig` 相同）。
+fn install_shell_replies(dev: &sw_pal::fakes::FakeDevice) {
+    service_rig::install_shell_replies(dev);
+}
+
+/// WAL 檔案層：委派原生實作，但每個檔案的 `sync` 一律回 EIO（`shutdown_wal_sync_failure_exits_1`）。
+struct SyncFailWalFs(std::sync::Arc<dyn sw_pal::traits::WalFs>);
+
+struct SyncFailFile(Box<dyn sw_pal::traits::WalFile>);
+
+impl sw_pal::traits::WalFile for SyncFailFile {
+    fn write_all_flush(&mut self, bytes: &[u8]) -> Result<(), sw_pal::traits::WalWriteError> {
+        self.0.write_all_flush(bytes)
+    }
+    fn sync(&mut self) -> sw_pal::traits::PalResult<()> {
+        Err(sw_pal::traits::PalError::from_errno(5))
+    }
+    fn identity(&self) -> sw_pal::traits::PalResult<sw_pal::traits::FileIdentity> {
+        self.0.identity()
+    }
+    fn unlinked(&self) -> sw_pal::traits::PalResult<bool> {
+        self.0.unlinked()
+    }
+    fn close(self: Box<Self>) -> sw_pal::traits::PalResult<()> {
+        self.0.close()
+    }
+}
+
+impl sw_pal::traits::WalFs for SyncFailWalFs {
+    fn open_append(&self, path: &Path) -> sw_pal::traits::PalResult<Box<dyn sw_pal::traits::WalFile>> {
+        Ok(Box::new(SyncFailFile(self.0.open_append(path)?)))
+    }
+    fn path_identity(&self, path: &Path) -> sw_pal::traits::PalResult<Option<sw_pal::traits::FileIdentity>> {
+        self.0.path_identity(path)
+    }
+    fn size(&self, path: &Path) -> sw_pal::traits::PalResult<Option<u64>> {
+        self.0.size(path)
+    }
+    fn tail_needs_termination(&self, path: &Path) -> sw_pal::traits::PalResult<bool> {
+        self.0.tail_needs_termination(path)
+    }
+    fn read_all(&self, path: &Path) -> sw_pal::traits::PalResult<Option<Vec<u8>>> {
+        self.0.read_all(path)
+    }
+    fn rename_noreplace_or_suffix(&self, from: &Path, base_to: &Path) -> sw_pal::traits::PalResult<PathBuf> {
+        self.0.rename_noreplace_or_suffix(from, base_to)
+    }
+    fn sync_dir(&self, dir: &Path) -> sw_pal::traits::PalResult<()> {
+        self.0.sync_dir(dir)
+    }
+    fn ensure_dir(&self, dir: &Path) -> sw_pal::traits::PalResult<()> {
+        self.0.ensure_dir(dir)
+    }
+    fn dir_writable(&self, dir: &Path) -> bool {
+        self.0.dir_writable(dir)
+    }
 }
 
 /// 子行程模式：`restart_after_commit` 的 state.json 提交後中止（hook 於 `StateStore` commit 成功後觸發 abort）。
@@ -593,4 +777,45 @@ pub fn child_daemon_abort_before_commit() {
 /// 子行程模式取得目前行程的環境變數（即父行程以 `run_child_test` 注入的隔離 vars）。
 pub fn process_vars() -> BTreeMap<String, String> {
     std::env::vars().collect()
+}
+
+/// P5-T17：以 `sw_proto::pyjson::loads` 讀 repo 內 golden（不引入 serde；`framing.rs` 使用）。
+pub mod serde_free {
+    use std::path::PathBuf;
+    use sw_proto::pyjson::{self, PyValue};
+
+    /// `contracts/golden/rpc/line_limit.json` 的兩個門檻（內容不含 `\n` 的位元組數）。
+    pub struct Golden {
+        pub max_ok_bytes: usize,
+        pub first_close_bytes: usize,
+    }
+
+    /// 由目前工作目錄往上找 repo 相對路徑 `rel`（cargo test 的 cwd 為 crate 目錄）。
+    pub fn repo_file(rel: &str) -> PathBuf {
+        let mut dir = std::env::current_dir().expect("current_dir");
+        loop {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return candidate;
+            }
+            assert!(dir.pop(), "找不到 repo 檔案 {rel}");
+        }
+    }
+
+    /// 讀取 line_limit golden。
+    pub fn load(rel: &str) -> Golden {
+        let text = std::fs::read_to_string(repo_file(rel)).expect("讀取 golden");
+        let PyValue::Dict(d) = pyjson::loads(&text).expect("golden 為合法 JSON") else {
+            panic!("golden 頂層須為 object");
+        };
+        let int = |k: &str| {
+            d.get(k)
+                .and_then(PyValue::as_i64)
+                .unwrap_or_else(|| panic!("golden 缺 {k}")) as usize
+        };
+        Golden {
+            max_ok_bytes: int("max_ok_bytes"),
+            first_close_bytes: int("first_close_bytes"),
+        }
+    }
 }

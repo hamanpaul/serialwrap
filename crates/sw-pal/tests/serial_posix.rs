@@ -243,6 +243,55 @@ fn cap_posix_pty__conformance_suite() {
     );
 }
 
+/// 鎖後重掃 status 非 ok、pids 空（`PostLockVerdict::AcceptUnverified`）的 holder 診斷替身。
+struct UnknownStatusHolders;
+
+impl UartExclusive for UnknownStatusHolders {
+    fn probe_holders(&self, _real_path: &str) -> HolderReport {
+        HolderReport {
+            pids: Vec::new(),
+            holder_unknown: true,
+            status: HolderScanStatus::Unknown,
+        }
+    }
+}
+
+/// P5-T18 parity-amendments-2026-10-26 #11：開檔回 AcceptUnverified 時登記為 holder_unknown 裝置，
+/// close 後移除；鎖後重掃 ok（Accept）不登記（Python `serial_port._set_holder_unknown`）。
+#[test]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__accept_unverified_registers_unknown_holder_device() {
+    use std::sync::Arc;
+    let (dev, _peer) = posix_pty_pair();
+    let key = std::fs::canonicalize(&dev.0)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| dev.0.clone());
+    let be = sw_pal::serial::posix::PosixSerialBackend::with_uart_exclusive(Arc::new(
+        UnknownStatusHolders,
+    ));
+    let h = be.open_exclusive(&dev, &cfg()).expect("AcceptUnverified 仍開檔成功");
+    assert!(
+        sw_pal::serial::unknown_holder_devices().contains(&key),
+        "AcceptUnverified 應登記 {key}"
+    );
+    let (r, w, _waker, token) = h.split();
+    let _ = token.close(r, w);
+    assert!(
+        !sw_pal::serial::unknown_holder_devices().contains(&key),
+        "close 後應移除 {key}"
+    );
+
+    let be = sw_pal::serial::posix::PosixSerialBackend::with_uart_exclusive(Arc::new(
+        sw_pal::conformance::NoHolders,
+    ));
+    let h = be.open_exclusive(&dev, &cfg()).expect("Accept 開檔");
+    assert!(
+        !sw_pal::serial::unknown_holder_devices().contains(&key),
+        "鎖後重掃 ok 不登記"
+    );
+    drop(h);
+}
+
 #[test]
 fn fakes_conformance_suite() {
     let be = sw_pal::fakes::serial::FakeSerialBackend::new();
