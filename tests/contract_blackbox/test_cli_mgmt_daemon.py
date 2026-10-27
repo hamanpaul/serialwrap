@@ -140,7 +140,7 @@ def _dut_tx_bytes(wire: str) -> bytes:
 _PASSTHROUGH_READY_WAIT_S = 120.0
 
 
-def _submit_after_on_demand_autostart(env: dict[str, str], wire: str):
+def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baseline: int):
     """首次 `cmd submit` 必須經 on-demand 自動啟動 daemon；若 session 尚未 READY，等 READY 後再送一次。
 
     SC-18 只規定「連線階段被拒才自動啟動並重送一次」，不規定 CLI 等待 READY。passthrough
@@ -165,7 +165,7 @@ def _submit_after_on_demand_autostart(env: dict[str, str], wire: str):
         "首次需求未成功時只接受 session 尚未 READY 的拒絕；"
         f"rc={initial.rc} stdout={initial.stdout!r} stderr={initial.stderr!r}"
     )
-    assert b"echo X" not in _dut_tx_bytes(wire), "被拒絕的首次請求不得在 DUT 端留下任何 TX"
+    assert b"echo X" not in _dut_tx_bytes(wire)[tx_baseline:], "被拒絕的首次請求不得在 DUT 端留下任何 TX"
 
     deadline = time.monotonic() + _PASSTHROUGH_READY_WAIT_S
     last_session: dict[str, Any] | None = None
@@ -413,11 +413,15 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
         listener.bind(("127.0.0.1", 0))
         env["SERIALWRAP_ENDPOINT"] = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
 
+    # wire 為整個 B 輪共用（含 COM 序列與巢狀 A/B 內的同一案例），只比對本案例開始後的 TX。
+    tx_baseline = len(_dut_tx_bytes(wire))
     res = None
     try:
-        res = _submit_after_on_demand_autostart(env, wire)
+        res = _submit_after_on_demand_autostart(env, wire, tx_baseline)
         assert res.rc == 0, res.stderr.decode("utf-8", errors="replace")
-        assert _dut_tx_bytes(wire).count(b"echo X\r") == 1
+        # 本案例自身的 TX（自基線起）必須恰為一行命令：daemon 以 body＋"\n" 送出（uart_io），
+        # explicit target attach 零 TX（SC-35）；同一 B 輪的其他 COM 案例寫入不計。
+        assert _dut_tx_bytes(wire)[tx_baseline:] == b"echo X\n"
     finally:
         stop = run_cli(["daemon", "stop"], env=env, timeout_s=60.0)
         if res is not None and res.rc == 0:

@@ -496,7 +496,7 @@ def test_windows_com_autostart_case_supplies_release_manifest():
     body = source.split("def test_autostart_l15_tx_once(", 1)[1]
     assert "bundle_manifest_path(" in body
     assert 'env["SERIALWRAP_RELEASE_MANIFEST"]' in body
-    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("_submit_after_on_demand_autostart(env, wire)")
+    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("_submit_after_on_demand_autostart(env, wire, tx_baseline)")
 
 
 def test_windows_com_autostart_case_pins_com20_profile():
@@ -507,7 +507,7 @@ def test_windows_com_autostart_case_pins_com20_profile():
     assert 'profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"' in body
     assert "device_by_id: COM20" in body
     assert "com: COM0" in body
-    assert body.index("device_by_id: COM20") < body.index("_submit_after_on_demand_autostart(env, wire)")
+    assert body.index("device_by_id: COM20") < body.index("_submit_after_on_demand_autostart(env, wire, tx_baseline)")
 
 
 def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(tmp_path, monkeypatch):
@@ -560,7 +560,7 @@ def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(t
                 )
             wire.write_text(
                 '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
-                base64.b64encode(b"echo X\r").decode("ascii") + '"}\n',
+                base64.b64encode(b"echo X\n").decode("ascii") + '"}\n',
                 encoding="utf-8",
             )
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
@@ -622,7 +622,7 @@ def _load_sc18_case(tmp_path, monkeypatch):
 def _write_echo_tx(wire):
     wire.write_text(
         '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
-        base64.b64encode(b"echo X\r").decode("ascii") + '"}\n',
+        base64.b64encode(b"echo X\n").decode("ascii") + '"}\n',
         encoding="utf-8",
     )
 
@@ -672,6 +672,49 @@ def test_windows_com_autostart_rejects_unexpected_first_failure(
     monkeypatch.setattr(module, "run_cli", fake_run_cli)
     with pytest.raises(AssertionError, match=message):
         module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+
+
+def test_windows_com_autostart_counts_only_its_own_tx(tmp_path, monkeypatch):
+    """共用 wire 已含其他案例的 `echo X` 時仍以基線後的 TX 判定；本案例多送一次即 FAIL。"""
+    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    _write_echo_tx(wire)  # 同一 B 輪較早案例留下的 TX
+    sends = []
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        if args[:2] == ["cmd", "submit"]:
+            sends.append(args)
+            with wire.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
+                    base64.b64encode(b"echo X\n").decode("ascii") + '"}\n'
+                )
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+
+    # 同一案例若寫出兩行命令（重送）必須 FAIL。
+    module2, env2, wire2 = _load_sc18_case(tmp_path / "dup", monkeypatch)
+
+    def duplicate_run_cli(args, *, env, timeout_s=120.0):
+        if args[:2] == ["cmd", "submit"]:
+            for _ in range(2):
+                with wire2.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
+                        base64.b64encode(b"echo X\n").decode("ascii") + '"}\n'
+                    )
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module2, "run_cli", duplicate_run_cli)
+    with pytest.raises(AssertionError):
+        module2.test_autostart_l15_tx_once(tmp_path / "dup", env2, tmp_path / "dup" / "DELEGATED")
 
 
 def test_windows_com_autostart_requires_autostart_evidence(tmp_path, monkeypatch):
