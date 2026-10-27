@@ -306,7 +306,8 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
         return Err(open_error(code, || ops.probe_holders()));
     }
     if let Err(code) = ops.flock() {
-        let error = if code == libc::EWOULDBLOCK || code == libc::EAGAIN {
+        // serial_port.py:387：flock 失敗 errno ∈ {EACCES, EAGAIN, EWOULDBLOCK} → Held（parity-amendments-2026-10-26 #63）。
+        let error = if code == libc::EWOULDBLOCK || code == libc::EAGAIN || code == libc::EACCES {
             OpenError::Held(finalize_holder_report(ops.probe_holders()))
         } else {
             OpenError::Other(PalError::from_errno(code))
@@ -323,7 +324,8 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
         return Err(OpenError::Other(PalError::from_errno(code)));
     }
 
-    let holders = finalize_holder_report(ops.probe_holders());
+    // 鎖後重掃沿用 probe 本身的 holder_unknown 規則（pids 空且 status 非 ok；parity-amendments-2026-10-26 #64）。
+    let holders = ops.probe_holders();
     match post_lock_holder_verdict(&holders) {
         PostLockVerdict::Reject => {
             cleanup_open_failure(ops, dev);
@@ -345,14 +347,11 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
 
 fn open_error(code: i32, mut holders: impl FnMut() -> HolderReport) -> OpenError {
     match code {
-        libc::ENOENT | libc::ENODEV | libc::ENXIO => {
-            OpenError::NotFound(PalError::from_errno(code))
-        }
+        // serial_port.py:373-379：只有 ENOENT → DeviceNotPresentError、EBUSY → DeviceHeldError；
+        // EACCES／EPERM／ENODEV／ENXIO 等原樣 raise OSError（parity-amendments-2026-10-26 #62）。
+        // `AccessDenied` 只由 Windows 後端產生。
+        libc::ENOENT => OpenError::NotFound(PalError::from_errno(code)),
         libc::EBUSY => OpenError::Held(finalize_holder_report(holders())),
-        libc::EACCES | libc::EPERM => OpenError::AccessDenied {
-            os: PalError::from_errno(code),
-            holder: finalize_holder_report(holders()),
-        },
         _ => OpenError::Other(PalError::from_errno(code)),
     }
 }
@@ -1539,13 +1538,19 @@ mod tests {
 
     #[test]
     fn holder_scan_excludes_self_and_matches_rdev() {
+        // parity-amendments-2026-10-26 #64：同一 tty 改以 (st_dev, st_ino) 判定，fd 必須指向真實存在的同一
+        // inode（舊版以 readlink 字串比對不存在的 /dev/pts/9，已與 Python `same_tty` 不符）。
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        make_fd_link(root, 123, "/dev/pts/9");
-        make_fd_link(root, std::process::id(), "/dev/pts/9"); // 自身 pid 必須被排除
-        let rep = probe_holders_in(root, "/dev/pts/9");
+        let root = tmp.path().join("proc");
+        let tty = tmp.path().join("tty9");
+        std::fs::write(&tty, b"").expect("tty 替身");
+        let tty = tty.to_string_lossy().into_owned();
+        make_fd_link(&root, 123, &tty);
+        make_fd_link(&root, std::process::id(), &tty); // 自身 pid 必須被排除
+        let rep = probe_holders_in(&root, &tty);
         assert_eq!(rep.pids, vec![123]);
         assert_eq!(rep.status, HolderScanStatus::Ok);
+        assert!(!rep.holder_unknown);
     }
 
     #[test]
