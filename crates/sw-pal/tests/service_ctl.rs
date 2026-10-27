@@ -1281,6 +1281,8 @@ fn cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure() {
                 let _ = std::process::Command::new("systemctl").arg("--user").args(args).output();
             }
             let _ = std::fs::remove_file(&self.unit);
+            // release 只移除 drop-in 檔；空的 `<unit>.d` 目錄由測試清掉（OD-29：結束不得留下暫時 unit 痕跡）。
+            let _ = std::fs::remove_dir(self.unit.with_extension("service.d"));
             let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).output();
         }
     }
