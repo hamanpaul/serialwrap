@@ -17,6 +17,11 @@ use sw_proto::wal_types::{crc32_hex, wal_recreated_meta, WalRecord};
 
 const IDENTITY_CHECK_INTERVAL_NS: u64 = 50_000_000;
 const RECREATE_BACKOFF_NS: [u64; 3] = [10_000_000, 50_000_000, 200_000_000];
+/// `wal.py` `_is_transient_rotate_error`：共用違規或存取拒絕（POSIX EACCES／EBUSY、Windows winerror 5／32）。
+fn is_transient_rotate_error(error: &PalError) -> bool {
+    matches!(error.os_code, Some(13) | Some(16)) || matches!(error.winerror, Some(5) | Some(32))
+}
+
 const RECREATE_RETRY_INTERVALS_NS: [u64; 3] = [1_000_000_000, 2_000_000_000, 5_000_000_000];
 
 pub struct WalConfig {
@@ -121,6 +126,12 @@ pub struct WalHealth {
     pub write_failures: u64,
     pub last_write_error: Option<String>,
     pub recreated_count: u64,
+    /// OD-19：暫時性輪替失敗（EACCES／EBUSY、Windows winerror 5／32）累計次數（`wal.py` `_rotate_retry_count`）。
+    pub rotate_retry: u64,
+    /// OD-19：轉入延遲佇列的次數（Rust 尚無延遲佇列，恆 0；parity-amendments-2026-10-26 #61 只承接鍵集合）。
+    pub rotate_deferred: u64,
+    /// OD-19：延遲佇列中待輪替的檔案數（同上，恆 0）。
+    pub deferred_delete_pending: u64,
     pub healthy: bool,
     /// `"recreate_failed"`、`"write_failed"`、`"dir_unwritable"` 或 `None`。
     pub unhealthy_reason: Option<&'static str>,
@@ -153,6 +164,14 @@ impl WalHealth {
             "recreated_count",
             PyValue::Int(PyInt::Small(i128::from(self.recreated_count))),
         );
+        // wal.py:861-914 的 OD-19 三鍵，位於 recreated_count 之後（parity-amendments-2026-10-26 #61）。
+        for (key, value) in [
+            ("rotate_retry", self.rotate_retry),
+            ("rotate_deferred", self.rotate_deferred),
+            ("deferred_delete_pending", self.deferred_delete_pending),
+        ] {
+            dict.insert(key, PyValue::Int(PyInt::Small(i128::from(value))));
+        }
         dict.insert("healthy", PyValue::Bool(self.healthy));
         dict.insert(
             "unhealthy_reason",
@@ -203,6 +222,7 @@ struct WalInner {
     write_failures: u64,
     last_write_error: Option<String>,
     recreated_count: u64,
+    rotate_retry: u64,
     unhealthy_reason: Option<&'static str>,
     dir_exists: bool,
     closed: bool,
@@ -356,6 +376,7 @@ impl WalWriter {
                 write_failures: 0,
                 last_write_error: last_write_error.clone(),
                 recreated_count: 0,
+                rotate_retry: 0,
                 unhealthy_reason,
                 dir_exists,
                 closed: false,
@@ -371,6 +392,9 @@ impl WalWriter {
                 write_failures: 0,
                 last_write_error,
                 recreated_count: 0,
+                rotate_retry: 0,
+                rotate_deferred: 0,
+                deferred_delete_pending: 0,
                 healthy: dir_exists && dir_writable && unhealthy_reason.is_none(),
                 unhealthy_reason,
             }),
@@ -1180,6 +1204,9 @@ impl WalWriter {
                     }
                 }
                 Err(error) => {
+                    if is_transient_rotate_error(&error) {
+                        inner.rotate_retry += 1;
+                    }
                     self.warn_rotate_failed(path, &error);
                     failed = true;
                     let _ = self.open_handle_locked(inner, target);
@@ -1382,6 +1409,9 @@ impl WalWriter {
             write_failures: inner.write_failures,
             last_write_error: inner.last_write_error.clone(),
             recreated_count: inner.recreated_count,
+            rotate_retry: inner.rotate_retry,
+            rotate_deferred: 0,
+            deferred_delete_pending: 0,
             healthy,
             unhealthy_reason: inner.unhealthy_reason,
         };
