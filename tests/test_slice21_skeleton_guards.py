@@ -45,6 +45,8 @@ MIRROR = {
     "tx_ledger_unresolved_gaps": ("tx_writer.rs", "TX_LEDGER_UNRESOLVED_GAPS_MAX"),
     "tx_op_wal_gaps": ("tx_writer.rs", "TX_OP_WAL_GAPS_MAX"),
     "tx_settle_queue": ("tx_writer.rs", "TX_SETTLE_QUEUE_MAX"),
+    # parity-amendments-2026-10-26 #38：撤銷 op tombstone 上限（審查 F13）
+    "fence_cancelled_ops_max": ("tx_writer.rs", "CANCELLED_OPS_MAX"),
 }
 MIRROR_FILES = {
     "resources.rs": ROOT / "crates" / "sw-core" / "src" / "resources.rs",

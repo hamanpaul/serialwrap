@@ -755,10 +755,10 @@ fn reboot_arms_quiet_only_after_tx_settled_e2e() {
     );
     assert!(!h.fence.with(|f| f.quiet_active));
     h.dev.release_pause();
+    // 審查 F14：fence 的 quiet 由 TxWriter 於 TX 臨界區同步設定，actor 隨後同步 QuietState——兩者都要等到。
     h.wait_for("TX 結算後 arm quiet", |h| {
-        h.fence.with(|f| f.quiet_active)
+        h.fence.with(|f| f.quiet_active) && h.get_state()["boot_quiet_remaining_s"] != PyValue::Null
     });
-    assert_ne!(h.get_state()["boot_quiet_remaining_s"], PyValue::Null);
     advance_until(&h, Duration::from_millis(200), "reboot 收尾", |h| {
         is_done(h, &id)
     });

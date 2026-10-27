@@ -357,6 +357,9 @@ struct PendingOpenStop {
 struct LoginRun {
     epoch: u64,
     kind: LoginRunKind,
+    /// 啟動當下的 `fsm_gen`（審查 F15）：quiet arm 會令 core 的 `fsm_gen` 前進，但不是新的 login run；
+    /// 完成事件以 run 自己的世代比對（Python attach thread 照常寫終態）。
+    fsm_gen: u64,
     /// `SessionAttach`／`Recover` 再探的等待者（attach 路徑無）。
     waiters: Vec<(Reply, ReprobeWaiter)>,
 }
@@ -2280,6 +2283,7 @@ impl SessionCore {
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Attach,
+                    fsm_gen: self.generations.fsm_gen,
                     waiters: Vec::new(),
                 });
                 effects.push(Effect::StartLogin {
@@ -2369,13 +2373,36 @@ impl SessionCore {
             if self.state != SessionState::Attached {
                 return Vec::new();
             }
-        } else if self.state != SessionState::Attaching || self.generations.fsm_gen != fsm_gen {
+        } else if self.state != SessionState::Attaching
+            || !self.login_run.as_ref().is_some_and(|run| {
+                run.epoch == epoch && run.kind == LoginRunKind::Attach && run.fsm_gen == fsm_gen
+            })
+        {
+            // 只丟棄「不屬於現行 attach run」的事件（已被新 run 取代或世代不符）；quiet arm 推進的 core
+            // `fsm_gen` 不使現行 run 失效（審查 F15；Python `_attach_by_id` 照常寫 ATTACHED／READY／DETACHED）。
             return Vec::new();
         }
         let run = self.login_run.take();
-        let waiters = run.map(|run| run.waiters).unwrap_or_default();
+        let mut waiters = run.map(|run| run.waiters).unwrap_or_default();
         let mut effects = Vec::new();
         match result {
+            // 審查 F16：非 quiet／非 stale_login_gen 的 TX 失敗＝Python 例外上拋。
+            crate::login_fsm::LoginOutcome::Raised { exc, message } => {
+                if reprobe {
+                    // `_probe_existing_bridge` 例外穿出 attach_session／recover_session：state、last_error 不變，
+                    // RPC 回 `EXCEPTION`（message＝`str(exc)`）。
+                    for (waiter, _) in std::mem::take(&mut waiters) {
+                        effects.push(Effect::Reply(
+                            waiter,
+                            Err(sw_proto::pycompat::PyErr::value_error(message.clone())),
+                        ));
+                    }
+                } else {
+                    // `_attach_by_id` 外層 except：關 bridge、DETACHED、`ATTACH_FAILED:<ExcType>`。
+                    self.set_last_error(Some(format!("ATTACH_FAILED:{exc}")), None);
+                    effects.extend(self.begin_stop(StopKind::LoginFailed, None, now).0);
+                }
+            }
             crate::login_fsm::LoginOutcome::Ready => {
                 if !reprobe {
                     self.adopt_bridge(now);
@@ -2515,6 +2542,7 @@ impl SessionCore {
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Reprobe,
+                    fsm_gen: self.generations.fsm_gen,
                     waiters: vec![(reply, kind)],
                 });
                 vec![Effect::StartLogin {
@@ -4395,6 +4423,7 @@ impl SessionCore {
         self.login_run = Some(LoginRun {
             epoch,
             kind: LoginRunKind::RebootRecovery,
+            fsm_gen: self.generations.fsm_gen,
             waiters: Vec::new(),
         });
         vec![Effect::StartLogin {
@@ -4433,6 +4462,11 @@ impl SessionCore {
             crate::login_fsm::LoginOutcome::NotReady(_) => Vec::new(),
             crate::login_fsm::LoginOutcome::Failed(error) => {
                 self.set_last_error(Some(error), None);
+                Vec::new()
+            }
+            // Python `_spawn_reboot_recovery`：非 refused 的 TxIncompleteError → `RECOVERY_ERROR`，續迴圈（審查 F16）。
+            crate::login_fsm::LoginOutcome::Raised { .. } => {
+                self.set_last_error(Some("RECOVERY_ERROR".into()), None);
                 Vec::new()
             }
         }

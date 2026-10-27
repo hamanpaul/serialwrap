@@ -16,7 +16,7 @@ use sw_proto::pycompat::clean_text;
 use sw_proto::pyre::{PyFlags, compile};
 
 use crate::session_auth::{AuthResolution, SessionAuth, credentials_declared_but_unresolved};
-use crate::tx_writer::{OpId, TxClass, TxJob, TxPermit, TxWriterHandle};
+use crate::tx_writer::{FenceReject, OpId, TxClass, TxJob, TxPermit, TxReport, TxWriterHandle};
 use crate::uart_bridge::RxShared;
 
 pub use crate::quiet_gate::detect_boot_banner;
@@ -44,12 +44,18 @@ pub enum LoginOutcome {
     NotReady(String),
     /// `ensure_ready` 失敗：attach 路徑 → drain（`LoginFailed`），既有 bridge 路徑 → ATTACHED。
     Failed(String),
+    /// TX 未完整提交且不是 quiet／較新 login run 的拒絕（Python `_login_tx_refused` 為假 → 例外上拋；審查 F16）：
+    /// `exc` 為 Python 例外類別名（`WalUnavailableError`／`TxUnknownError`／`TxIncompleteError`），`message` 為 `str(exc)`。
+    /// attach 路徑 → DETACHED＋`ATTACH_FAILED:<exc>`；既有 bridge 再探 → RPC `EXCEPTION`、state 不變；
+    /// reboot recovery → `RECOVERY_ERROR`。
+    Raised { exc: String, message: String },
 }
 
 /// 登入 FSM 所需的 I/O 注入點（TX 經 TxWriter；測試以閉包替身）。
 pub struct LoginIo<'a> {
     pub rx: &'a RxShared,
-    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> sw_pal::TxResult,
+    /// 送出一筆登入 TX，回傳 TxWriter 的結果（含 fence 拒絕原因，供 `_login_tx_refused` 分流）。
+    pub tx: &'a dyn Fn(&[u8], TxClass, &str, bool) -> TxReport,
     pub clock: &'a dyn Clock,
     pub nonce: &'a dyn Fn() -> String,
 }
@@ -157,7 +163,7 @@ pub fn run_login_plan(
 /// 只做 probe：送 `\n` 並等 prompt；失敗時依視窗分類（05 §8.3；`login_fsm.probe_ready`）。
 pub fn probe_ready(io: &LoginIo, p: &SessionProfile) -> LoginOutcome {
     match probe_prompt(io, p) {
-        Err(Refused) => return refused(),
+        Err(fail) => return fail.outcome(),
         Ok(false) => {
             let code = classify_non_ready_state(io, p);
             return LoginOutcome::NotReady(maybe_reclassify_flood(io, code).to_string());
@@ -165,7 +171,7 @@ pub fn probe_ready(io: &LoginIo, p: &SessionProfile) -> LoginOutcome {
         Ok(true) => {}
     }
     match finalize_ready(io, p) {
-        Err(Refused) => refused(),
+        Err(fail) => fail.outcome(),
         Ok(None) => LoginOutcome::Ready,
         Ok(Some(code)) => LoginOutcome::NotReady(maybe_reclassify_flood(io, code).to_string()),
     }
@@ -186,10 +192,10 @@ pub fn ensure_ready(
         return LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into());
     }
     match probe_prompt(io, p) {
-        Err(Refused) => return refused(),
+        Err(fail) => return fail.outcome(),
         Ok(true) => {}
         Ok(false) => match maybe_login(io, p, auth, env) {
-            Err(Refused) => return refused(),
+            Err(fail) => return fail.outcome(),
             Ok((_, Some(code))) => {
                 return LoginOutcome::Failed(maybe_reclassify_flood(io, code).to_string());
             }
@@ -201,7 +207,7 @@ pub fn ensure_ready(
         },
     }
     match finalize_ready(io, p) {
-        Err(Refused) => refused(),
+        Err(fail) => fail.outcome(),
         Ok(None) => LoginOutcome::Ready,
         Ok(Some(code)) => LoginOutcome::Failed(maybe_reclassify_flood(io, code).to_string()),
     }
@@ -257,9 +263,9 @@ pub fn login_tx_sender(
     epoch: u64,
     owner_gen: u64,
     fsm_gen: u64,
-) -> impl Fn(&[u8], TxClass, &str, bool) -> TxResult + Send + Sync {
+) -> impl Fn(&[u8], TxClass, &str, bool) -> TxReport + Send + Sync {
     let handle = Arc::new(handle);
-    move |payload: &[u8], class: TxClass, source: &str, log: bool| -> TxResult {
+    move |payload: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
         let op_id = OpId(LOGIN_OP_ID_BASE | NEXT_LOGIN_OP.fetch_add(1, Ordering::Relaxed));
         let (reply, report) = crossbeam_channel::bounded(1);
         let job = TxJob {
@@ -276,17 +282,21 @@ pub fn login_tx_sender(
             payload: payload.to_vec(),
             reply,
         };
-        let not_submitted = TxResult {
-            outcome: TxOutcome::NotSubmitted,
-            error: None,
+        // TxWriter 已關閉（drain／shutdown）：等同 fence 凍結（Python `_tx_frozen` → `draining`）。
+        let not_submitted = TxReport {
+            op_id,
+            epoch,
+            result: TxResult {
+                outcome: TxOutcome::NotSubmitted,
+                error: None,
+            },
+            wal: None,
+            reject: Some(FenceReject::Frozen),
         };
         if handle.jobs.send(job).is_err() {
             return not_submitted;
         }
-        let result = match handle.wait_report(&report) {
-            Some(report) => report.result,
-            None => not_submitted,
-        };
+        let result = handle.wait_report(&report).unwrap_or(not_submitted);
         let _ = handle.settle(op_id);
         result
     }
@@ -296,30 +306,69 @@ pub fn login_tx_sender(
 // 內部步驟（login_fsm.py 逐步承接）
 // ---------------------------------------------------------------------------
 
-/// TX 未完整提交（fence 拒絕或結果不明）：Python `TxIncompleteError` → `PROMPT_UNAVAILABLE`，不精煉。
-struct Refused;
-
-fn refused() -> LoginOutcome {
-    LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into())
+/// 登入 TX 未完整提交（Python `send_command` 拋 `TxIncompleteError` 家族）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TxFail {
+    /// `_login_tx_refused` 為真（fence 以 quiet 或較新 login run 拒絕）→ `PROMPT_UNAVAILABLE`，不精煉。
+    Refused,
+    /// 其餘拒絕、結果不明或部分寫出：例外上拋（類別名與 `str(exc)`）。
+    Raised { exc: &'static str, message: String },
 }
 
-fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Result<(), Refused> {
+impl TxFail {
+    fn outcome(self) -> LoginOutcome {
+        match self {
+            TxFail::Refused => LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+            TxFail::Raised { exc, message } => LoginOutcome::Raised {
+                exc: exc.to_string(),
+                message,
+            },
+        }
+    }
+}
+
+/// 依 Python `_login_tx_refused` 與 `UARTBridge._send_locked` 分類登入 TX 失敗（審查 F16）：
+/// - `Quiet`／`ReconfirmPending`（`quiet`）、`FsmMismatch`（`stale_login_gen`）→ [`TxFail::Refused`]；
+/// - `WalUnhealthy` → `WalUnavailableError("tx incomplete: not_submitted 0/N WAL_UNHEALTHY")`（系統 TX 於寫前拒絕）；
+/// - `Unknown` → `TxUnknownError`；其餘拒絕（draining／stale_generation／cancelled／flashing…）與部分寫出 →
+///   `TxIncompleteError`；訊息皆為 `tx incomplete: {outcome} {confirmed}/{requested} {error}`。
+pub fn classify_login_tx_failure(report: &TxReport, requested: usize) -> TxFail {
+    match report.reject {
+        Some(FenceReject::Quiet | FenceReject::ReconfirmPending | FenceReject::FsmMismatch) => {
+            TxFail::Refused
+        }
+        Some(FenceReject::WalUnhealthy) => TxFail::Raised {
+            exc: "WalUnavailableError",
+            message: format!("tx incomplete: not_submitted 0/{requested} WAL_UNHEALTHY"),
+        },
+        _ => TxFail::Raised {
+            exc: if matches!(report.result.outcome, TxOutcome::Unknown { .. }) {
+                "TxUnknownError"
+            } else {
+                "TxIncompleteError"
+            },
+            message: crate::op_runner::tx_incomplete_message(report, requested),
+        },
+    }
+}
+
+fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Result<(), TxFail> {
     let mut bytes = payload.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
         bytes.push(b'\n');
     }
-    let result = (io.tx)(&bytes, TxClass::LoginProbe, source, log);
-    match result.outcome {
+    let report = (io.tx)(&bytes, TxClass::LoginProbe, source, log);
+    match report.result.outcome {
         TxOutcome::Completed(n) if n >= bytes.len() => Ok(()),
-        _ => Err(Refused),
+        _ => Err(classify_login_tx_failure(&report, bytes.len())),
     }
 }
 
-fn send_command(io: &LoginIo, cmd: &str) -> Result<(), Refused> {
+fn send_command(io: &LoginIo, cmd: &str) -> Result<(), TxFail> {
     send(io, cmd, "system", true)
 }
 
-fn send_secret(io: &LoginIo, secret: &str) -> Result<(), Refused> {
+fn send_secret(io: &LoginIo, secret: &str) -> Result<(), TxFail> {
     send(io, secret, "system:secret", false)
 }
 
@@ -353,7 +402,7 @@ fn wait_for_regex(io: &LoginIo, pattern: &str, timeout_s: f64) -> bool {
     }
 }
 
-fn probe_prompt(io: &LoginIo, p: &SessionProfile) -> Result<bool, Refused> {
+fn probe_prompt(io: &LoginIo, p: &SessionProfile) -> Result<bool, TxFail> {
     io.rx.clear();
     send_command(io, "")?;
     Ok(wait_for_regex(io, &p.template.prompt_regex, p.template.timeout_s))
@@ -379,7 +428,7 @@ fn maybe_reclassify_flood(io: &LoginIo, code: &'static str) -> &'static str {
 }
 
 /// nonce 驗證（Slice 2.1 不送 `post_login_cmd`）；`Ok(None)` 為成功。
-fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Result<Option<&'static str>, Refused> {
+fn finalize_ready(io: &LoginIo, p: &SessionProfile) -> Result<Option<&'static str>, TxFail> {
     let t = &p.template;
     let nonce = (io.nonce)();
     let probe = t.ready_probe.replace("${nonce}", &nonce);
@@ -440,7 +489,7 @@ fn maybe_login(
     p: &SessionProfile,
     auth: &SessionAuth,
     env: &dyn SysEnv,
-) -> Result<(bool, Option<&'static str>), Refused> {
+) -> Result<(bool, Option<&'static str>), TxFail> {
     let t = &p.template;
     let (user, _unreachable_err) = resolve_login_user(p, auth, env);
     let needs_login = user.is_some() || t.pass_env.as_deref().is_some_and(|k| !k.is_empty());

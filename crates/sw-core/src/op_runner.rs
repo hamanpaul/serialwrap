@@ -199,10 +199,12 @@ pub fn reject_reason(reject: FenceReject) -> &'static str {
 }
 
 /// Python `TxIncompleteError.__str__`：`tx incomplete: {outcome} {confirmed}/{requested} {error}`。
+/// `outcome` 只有 Python `TxResult.outcome` 的三個字面值（`not_submitted`／`completed`／`unknown`）；部分寫出是
+/// `completed` 加 `confirmed < requested`（審查 F16 順帶修正：舊版寫成 Python 不存在的 `partial`）。
 pub fn tx_incomplete_message(report: &TxReport, requested: usize) -> String {
     let (outcome, confirmed) = match &report.result.outcome {
         TxOutcome::NotSubmitted => ("not_submitted", 0),
-        TxOutcome::Completed(n) => ("partial", *n),
+        TxOutcome::Completed(n) => ("completed", *n),
         TxOutcome::Unknown { confirmed } => ("unknown", *confirmed),
     };
     let error = match (report.reject, &report.result.error) {

@@ -30,7 +30,7 @@ use sw_core::session_auth::{
 };
 use sw_core::mailbox::ControlEvent;
 use sw_core::session_core::SessionRequest;
-use sw_core::tx_writer::TxClass;
+use sw_core::tx_writer::{OpId, TxClass, TxReport};
 use sw_core::Mono;
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::env::FakeEnv;
@@ -65,10 +65,16 @@ fn pget(d: &PyDict, k: &str) -> PyValue {
     d.get(k).cloned().unwrap_or(PyValue::Null)
 }
 
-fn tx_ok(n: usize) -> TxResult {
-    TxResult {
-        outcome: TxOutcome::Completed(n),
-        error: None,
+fn tx_ok(n: usize) -> TxReport {
+    TxReport {
+        op_id: OpId(0),
+        epoch: 0,
+        result: TxResult {
+            outcome: TxOutcome::Completed(n),
+            error: None,
+        },
+        wal: None,
+        reject: None,
     }
 }
 
@@ -162,7 +168,7 @@ impl LoginRig {
         let clock = Arc::clone(&self.clock);
         let written = Arc::clone(&self.written);
         let seq = Arc::new(AtomicU64::new(100));
-        let tx = move |b: &[u8], class: TxClass, source: &str, log: bool| -> TxResult {
+        let tx = move |b: &[u8], class: TxClass, source: &str, log: bool| -> TxReport {
             written
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -212,6 +218,7 @@ fn outcome_code(o: &LoginOutcome) -> String {
     match o {
         LoginOutcome::NotReady(c) | LoginOutcome::Failed(c) => c.clone(),
         LoginOutcome::Ready => panic!("預期失敗碼，實際 Ready"),
+        LoginOutcome::Raised { exc, message } => panic!("預期失敗碼，實際例外 {exc}: {message}"),
     }
 }
 
@@ -970,16 +977,24 @@ fn disk_full_blocks_login_probe_but_not_agent_cmd() {
     a.wait_state("ATTACHED");
     make_unhealthy(&a);
     let before = a.dev.write_calls();
-    let resp = a.request(SessionRequest::SessionAttach);
+    let last_error_before = pget(&a.get_state(), "last_error");
+    // 審查 F16（Python 基線）：系統 TX 在 WAL 不健康時於寫前拋 `WalUnavailableError`，`_login_tx_refused` 為假
+    // → 例外穿出 attach_session：RPC `EXCEPTION`（message＝`str(exc)`），state 與 last_error 不變。
+    // （舊斷言 `last_error == PROMPT_UNAVAILABLE` 與 Python 衝突。）
+    let resp = a
+        .request_async(SessionRequest::SessionAttach)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("SessionAttach 回覆");
     assert_eq!(
         a.dev.write_calls(),
         before,
         "unhealthy WAL 下 probe 不得寫出"
     );
-    assert_eq!(
-        pget(&resp, "last_error"),
-        PyValue::from("PROMPT_UNAVAILABLE")
-    );
+    let err = resp.expect_err("WAL 不健康時再探應以例外回覆");
+    assert_eq!(err.message, "tx incomplete: not_submitted 0/1 WAL_UNHEALTHY");
+    let state = a.get_state();
+    assert_eq!(pget(&state, "state"), PyValue::from("ATTACHED"));
+    assert_eq!(pget(&state, "last_error"), last_error_before);
 
     let h = ActorRig::new(SHELL_PROFILE).ready();
     make_unhealthy(&h);
@@ -1184,4 +1199,94 @@ fn produced_constants_are_frozen() {
     );
     assert_eq!(LOGIN_FSM_DETAIL_ERRORS.len(), 12);
     assert!(detect_boot_banner("xx U-Boot 2024"));
+}
+
+// ---------------------------------------------------------------------------
+// 審查 F16（0a187c1）：登入 TX 失敗依 Python `_login_tx_refused` 分流——只有 quiet 與 stale_login_gen 收斂為
+// `PROMPT_UNAVAILABLE`；其餘照 Python 例外上拋（attach → DETACHED＋`ATTACH_FAILED:<ExcType>`）。
+// ---------------------------------------------------------------------------
+
+fn report_of(outcome: TxOutcome, reject: Option<sw_core::tx_writer::FenceReject>) -> TxReport {
+    TxReport {
+        op_id: OpId(0),
+        epoch: 0,
+        result: TxResult {
+            outcome,
+            error: None,
+        },
+        wal: None,
+        reject,
+    }
+}
+
+#[test]
+fn login_tx_failure_classified_like_login_tx_refused() {
+    use sw_core::login_fsm::{classify_login_tx_failure, TxFail};
+    use sw_core::tx_writer::FenceReject;
+    for reject in [FenceReject::Quiet, FenceReject::ReconfirmPending, FenceReject::FsmMismatch] {
+        assert_eq!(
+            classify_login_tx_failure(&report_of(TxOutcome::NotSubmitted, Some(reject)), 1),
+            TxFail::Refused,
+            "{reject:?}"
+        );
+    }
+    let raised = |r: TxReport, n: usize| match classify_login_tx_failure(&r, n) {
+        TxFail::Raised { exc, message } => (exc, message),
+        other => panic!("應上拋，實際 {other:?}"),
+    };
+    assert_eq!(
+        raised(report_of(TxOutcome::NotSubmitted, Some(FenceReject::WalUnhealthy)), 1),
+        ("WalUnavailableError", "tx incomplete: not_submitted 0/1 WAL_UNHEALTHY".to_string())
+    );
+    assert_eq!(
+        raised(report_of(TxOutcome::NotSubmitted, Some(FenceReject::Frozen)), 1),
+        ("TxIncompleteError", "tx incomplete: not_submitted 0/1 draining".to_string())
+    );
+    assert_eq!(
+        raised(report_of(TxOutcome::NotSubmitted, Some(FenceReject::StaleEpoch)), 1),
+        ("TxIncompleteError", "tx incomplete: not_submitted 0/1 stale_generation".to_string())
+    );
+    assert_eq!(raised(report_of(TxOutcome::Unknown { confirmed: 0 }, None), 1).0, "TxUnknownError");
+    // 部分寫出：Python outcome 字面值為 `completed`（不是 `partial`）。
+    assert_eq!(
+        raised(report_of(TxOutcome::Completed(2), None), 8),
+        ("TxIncompleteError", "tx incomplete: completed 2/8 None".to_string())
+    );
+}
+
+#[test]
+fn attach_login_tx_unknown_detaches_attach_failed() {
+    // Python：attach thread 的 probe TX 結果不明（TxUnknownError）→ 外層 except：DETACHED、`ATTACH_FAILED:TxUnknownError`、關 bridge。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    let fsm_gen = effs
+        .iter()
+        .find_map(|e| match e {
+            sw_core::session_core::Effect::StartLogin { fsm_gen, .. } => Some(*fsm_gen),
+            _ => None,
+        })
+        .expect("StartLogin");
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch: h.epoch(),
+        fsm_gen,
+        result: LoginOutcome::Raised {
+            exc: "TxUnknownError".into(),
+            message: "tx incomplete: unknown 0/1 None".into(),
+        },
+        after_rx_seq: None,
+    });
+    let (ep, stop) = effs
+        .iter()
+        .find_map(|e| match e {
+            sw_core::session_core::Effect::BeginDrain { epoch, stop_id, .. } => Some((*epoch, *stop_id)),
+            _ => None,
+        })
+        .expect("應 drain 關 bridge");
+    h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert_eq!(h.core.state(), sw_core::session_core::SessionState::Detached);
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::from("ATTACH_FAILED:TxUnknownError"));
 }

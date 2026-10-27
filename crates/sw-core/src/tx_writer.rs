@@ -473,6 +473,27 @@ struct TxWriter {
     gauge: Arc<LedgerGaugeCells>,
 }
 
+/// 0 byte 即中止的寫入（`Completed(0)`、無 fence 拒絕原因，PAL 於提交前檢查到 cancel）重驗授權後的收斂：
+/// fence 已拒絕（drain 先凍結再 cancel）→ `NotSubmitted`＋該原因，對齊 Python 提交點的 `_tx_frozen` 檢查
+/// （`TxIncompleteError("not_submitted", 0, N, "draining")`）；否則原樣保留（審查 F92：self-test 與 release 競態下
+/// 曾回 `tx incomplete: completed 0/23 [Errno 125] Operation canceled`，與 golden `not_submitted … draining` 不符）。
+pub fn reclassify_unsubmitted(
+    result: TxResult,
+    reject: Option<FenceReject>,
+    recheck: Result<(), FenceReject>,
+) -> (TxResult, Option<FenceReject>) {
+    match (&result.outcome, reject, recheck) {
+        (TxOutcome::Completed(0), None, Err(reason)) => (
+            TxResult {
+                outcome: TxOutcome::NotSubmitted,
+                error: None,
+            },
+            Some(reason),
+        ),
+        _ => (result, reject),
+    }
+}
+
 impl TxWriter {
     fn publish_gauge(&self, ledger: &TxLedger) {
         self.gauge.publish(ledger);
@@ -551,6 +572,11 @@ impl TxWriter {
                         last_reject: Cell::new(None),
                     };
                     let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
+                    // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
+                    let recheck = self.fence.with(|state| Fence::admit(state, &job.permit));
+                    let (result, reject) =
+                        reclassify_unsubmitted(result, gate.last_reject.get(), recheck);
+                    gate.last_reject.set(reject);
                     let submitted = confirmed_bytes(&result.outcome) > 0
                         || matches!(result.outcome, TxOutcome::Unknown { .. });
                     self.fence.with(|state| {

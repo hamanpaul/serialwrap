@@ -1200,7 +1200,9 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
         )),
         Err(FenceReject::OwnerMismatch)
     ));
-    assert!(h
+    // 審查 F15：banner 推進的是 core 世代，不是新的 login run——現行 attach run（以 old_fsm_gen 啟動）的
+    // Ready 結果照 Python 套用（READY＋confirm_ready）。舊版斷言「停在 ATTACHING」鎖住的是永久卡住的缺陷。
+    assert!(!h
         .feed(ControlEvent::LoginFinished {
             epoch,
             fsm_gen: old_fsm_gen,
@@ -1208,7 +1210,7 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
             after_rx_seq: None,
         })
         .is_empty());
-    assert_eq!(h.core.state(), SessionState::Attaching);
+    assert_eq!(h.core.state(), SessionState::Ready);
 }
 
 #[test]
@@ -1544,4 +1546,82 @@ fn credentials_warning_is_deduplicated_until_manual_recover() {
     assert_eq!(metas(&third), 0);
     assert_eq!(warns(&recover_effects) + warns(&third), 1);
     assert_eq!(metas(&recover_effects) + metas(&third), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 審查 F15（High，0a187c1）：attach 登入中收到 boot banner（quiet arm 令 fsm_gen 前進）後，該次 run 自己的
+// LoginFinished 仍須照 Python 套用（`_attach_by_id` 的 attach thread 照常寫終態）：NotReady → ATTACHED、
+// Ready → READY（confirm_ready）、Failed → drain 到 DETACHED；不得永久停在 ATTACHING、SessionAttach 回 ok。
+// ---------------------------------------------------------------------------
+
+fn attach_login_then_banner(h: &mut CoreHarness) -> (u64, u64) {
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    let run_gen = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartLogin { fsm_gen, .. } => Some(*fsm_gen),
+            _ => None,
+        })
+        .expect("bridge 開成後應發出 StartLogin");
+    h.rx(b"U-Boot 2024.01\r\n");
+    assert_ne!(h.core.generations().fsm_gen, run_gen, "banner 應 arm quiet 並使 fsm_gen 前進");
+    (h.epoch(), run_gen)
+}
+
+#[test]
+fn banner_during_attach_login_settles_attached() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, run_gen) = attach_login_then_banner(&mut h);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Attached);
+    let public = h.public();
+    assert_eq!(pget(&public, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_ne!(h.core.generations().bridge_generation, 0, "bridge 已採用");
+    // 再一次 SessionAttach 不得在 ATTACHING 回 ok:true（走 ATTACHED 再探）。
+    let (resp, effs) = h.rpc_full(SessionRequest::SessionAttach);
+    if let Ok(resp) = resp {
+        let session = pget(&resp, "session");
+        if let PyValue::Dict(s) = session {
+            assert_ne!(pget(&s, "state"), PyValue::from("ATTACHING"));
+        }
+    }
+    let _ = effs;
+}
+
+#[test]
+fn banner_during_attach_login_ready_result_applied() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, run_gen) = attach_login_then_banner(&mut h);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(pget(&h.public(), "boot_quiet_remaining_s"), PyValue::Null, "confirm_ready 清 quiet");
+}
+
+#[test]
+fn banner_during_attach_login_failed_drains_detached() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, run_gen) = attach_login_then_banner(&mut h);
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::Failed("SHELL_PROMPT_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    let (ep, stop) = begin_drain(&effs);
+    h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert_eq!(h.core.state(), SessionState::Detached);
 }

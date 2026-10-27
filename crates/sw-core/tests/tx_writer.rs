@@ -1106,3 +1106,27 @@ fn reboot_tx_not_submitted_does_not_arm_quiet_in_writer() {
     assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
     r.fence.with(|s| assert!(!s.quiet_active && !s.reconfirm_pending));
 }
+
+#[test]
+fn zero_progress_cancel_after_freeze_is_not_submitted_draining() {
+    // 審查 F92：drain 先凍結 fence 再 cancel；PAL 在提交前看到 cancel 回 `Completed(0)`＋Cancelled（無 fence 原因）。
+    // 重驗授權後應收斂為 `NotSubmitted`＋`Frozen`（Python `not_submitted 0/N draining`）；仍授權者原樣保留。
+    let cancelled = || TxResult {
+        outcome: TxOutcome::Completed(0),
+        error: Some(PalError::cancelled()),
+    };
+    let (result, reject) = reclassify_unsubmitted(cancelled(), None, Err(FenceReject::Frozen));
+    assert_eq!(result.outcome, TxOutcome::NotSubmitted);
+    assert!(result.error.is_none());
+    assert_eq!(reject, Some(FenceReject::Frozen));
+    let (result, reject) = reclassify_unsubmitted(cancelled(), None, Ok(()));
+    assert_eq!(result.outcome, TxOutcome::Completed(0));
+    assert_eq!(reject, None);
+    let partial = TxResult {
+        outcome: TxOutcome::Completed(2),
+        error: Some(PalError::cancelled()),
+    };
+    let (result, reject) = reclassify_unsubmitted(partial, None, Err(FenceReject::Frozen));
+    assert_eq!(result.outcome, TxOutcome::Completed(2), "已有確認 bytes 者不改寫（BC-03）");
+    assert_eq!(reject, None);
+}
