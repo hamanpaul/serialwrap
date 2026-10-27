@@ -47,7 +47,8 @@ CHECKS: list[tuple[str, str, str, int]] = [
     ("crates/sw-pal/src/console_pty/posix.rs", r"", "06 T2", 8),
     ("crates/sw-core/tests/support/mod.rs", r"pub struct CoreHarness\b", "06 T11", 6),
     ("crates/sw-core/tests/support/mod.rs", r"ActorRig", "06 T11", 6),
-    ("crates/sw-daemon/tests/support/mod.rs", r"pub struct ServiceRig\b", "06 T18", 10),
+    # 06 T18 交付時 ServiceRig 置於 support 子模組 `service_rig.rs`（`support/mod.rs` 以 `pub use service_rig::*` 匯出）。
+    ("crates/sw-daemon/tests/support/service_rig.rs", r"pub struct ServiceRig\b", "06 T18", 10),
     ("tests/contract_blackbox/bb_harness.py", r"def is_rust\b", "P3 04 T2", 11),
     ("tests/contract_blackbox/bb_harness.py", r"def isolated_env\b", "P3 04 T2", 0),
     # 計畫 Task 1 文字寫 `tests/contract_blackbox/faketarget.py`，但「跨 Phase 介面」註明 P2 沒有該檔、
@@ -69,7 +70,7 @@ CHECKS: list[tuple[str, str, str, int]] = [
 
 # 因上游未交付而無法開工的 P6 Task（parity-amendments-2026-10-26 #179／#180；07「執行順序」表的進度欄同步）。
 BLOCKED_UPSTREAM: dict[int, str] = {
-    10: "06 T18 ServiceRig（crates/sw-daemon/tests/support/mod.rs）未交付；另依 06 T11 PublicCtx 與 T14 lease 的行為",
+    10: "06 T18 ServiceRig（crates/sw-daemon/tests/support/service_rig.rs）未交付；另依 06 T11 PublicCtx 與 T14 lease 的行為",
     11: "06 T15a FakeTarget emit／written 與 06 T15／T20 slice21 shell_daemon fixture 未交付",
 }
 
