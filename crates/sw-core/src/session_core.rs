@@ -20,7 +20,7 @@ use crate::arbiter::{
     CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitReq,
 };
 use crate::capture::{
-    AgentLogCapture, BG_CAPTURE_MAX_BYTES, BG_CAPTURE_MAX_COUNT, BackgroundCapture, CaptureEnv,
+    AgentLogCapture, BG_CAPTURE_MAX_BYTES, BackgroundCapture, CaptureEnv,
     LogFile,
 };
 use crate::lease::{InteractiveLease, Tombstones};
@@ -49,6 +49,11 @@ use crate::wal::WalWriter;
 /// daemon stderr／state.json 相關通知（Task 0 骨架型別）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManagerNote {
+    /// 全域 background capture 淘汰到其他 session（manager 以 COM 解析擁有者後送 `EvictCapture`；審查 F28）。
+    EvictCapture {
+        com: String,
+        cmd_id: String,
+    },
     SessionReady {
         sid: String,
         /// 由 attach 登入 run 本身到 READY（Python `_attach_by_id_dynamic` 的 sticky 寫入點；reprobe／passthrough
@@ -274,6 +279,8 @@ pub struct CoreDeps {
     pub env: Arc<dyn SysEnv>,
     /// 帳密解析用 env 檔讀取（P5 Task 0 雙審修正：計畫 Task 11 Produces 補記；`None`＝檔案不存在，`Some(Err)`＝不可讀）。
     pub read_env_file: Arc<dyn Fn(&str) -> Option<std::io::Result<String>> + Send + Sync>,
+    /// 全 daemon 共用的 background capture 索引（`BG_CAPTURE_MAX_COUNT` 為全域上限，審查 F28）。
+    pub bg_index: Arc<crate::capture::BackgroundIndex>,
 }
 
 /// `public()` 需要由 actor 外部提供的欄位（console 計數與 endpoint）。
@@ -584,6 +591,9 @@ impl SessionCore {
             }
             MailboxItem::Control(ControlEvent::DeviceMissing) => {
                 self.mark_missing_device(now);
+            }
+            MailboxItem::Control(ControlEvent::EvictCapture { cmd_id }) => {
+                self.drop_background_capture(&cmd_id);
             }
             MailboxItem::Control(ControlEvent::ConsoleCountChanged { count }) => {
                 self.console_count = count;
@@ -1668,7 +1678,11 @@ impl SessionCore {
             } => vec![Effect::Reply(
                 reply,
                 match self.background.get_mut(&cmd_id) {
-                    Some(capture) => capture.result(from_chunk, limit, now),
+                    Some(capture) => {
+                        let result = capture.result(from_chunk, limit, now);
+                        self.sync_bg(&cmd_id);
+                        result
+                    }
                     None => Ok(
                         pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id },
                     ),
@@ -3622,6 +3636,7 @@ impl SessionCore {
                     if let Some(capture) = self.background.get_mut(&id) {
                         capture.status = "done";
                     }
+                    self.sync_bg(&id);
                 }
             }
             let grant_cmd = Some(command.cmd_id.clone());
@@ -3713,26 +3728,30 @@ impl SessionCore {
             now,
             self.background_seq,
         );
+        let created_at = capture.created_at.clone();
         self.background.insert(cmd_id.to_string(), capture);
-        self.evict_background();
+        // `_evict_background_locked`：全域（manager 層）上限，依 `created_at` 淘汰最舊的已終結 capture；
+        // 擁有者以 COM 標識（rematerialize 不變），本 session 者就地移除，其餘交擁有者（審查 F28）。
+        let owner = self.profile.com.clone();
+        for (victim_owner, id) in self.deps.bg_index.register(cmd_id, &owner, &created_at) {
+            if victim_owner == owner {
+                self.drop_background_capture(&id);
+            } else {
+                self.deps.bg_index.evict_remote(&victim_owner, &id);
+            }
+        }
     }
 
-    /// `_evict_background_locked`：淘汰最舊的已終結 capture，並同步移除 `background_cmd_ids`（#45 D-94）。
-    fn evict_background(&mut self) {
-        if self.background.len() <= BG_CAPTURE_MAX_COUNT {
-            return;
-        }
-        let mut finalized: Vec<(String, String, u64)> = self
-            .background
-            .values()
-            .filter(|cap| cap.status != "active")
-            .map(|cap| (cap.created_at.clone(), cap.cmd_id.clone(), cap.seq_no))
-            .collect();
-        finalized.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-        let excess = self.background.len() - BG_CAPTURE_MAX_COUNT;
-        for (_, id, _) in finalized.into_iter().take(excess) {
-            self.background.shift_remove(&id);
-            self.background_cmd_ids.retain(|existing| *existing != id);
+    /// 丟棄被淘汰的 capture，並同步移除 `background_cmd_ids`（#45 D-94）。
+    fn drop_background_capture(&mut self, id: &str) {
+        self.background.shift_remove(id);
+        self.background_cmd_ids.retain(|existing| existing != id);
+    }
+
+    /// 將本地 capture 的 `status` 同步到全域索引（淘汰只考慮已終結者）。
+    fn sync_bg(&self, id: &str) {
+        if let Some(capture) = self.background.get(id) {
+            self.deps.bg_index.set_active(id, capture.status == "active");
         }
     }
 
@@ -3762,6 +3781,7 @@ impl SessionCore {
             capture.status = if error_code.is_some() { "error" } else { "done" };
             capture.error_code = error_code.map(str::to_string);
         }
+        self.sync_bg(cmd_id);
     }
 
     /// RX 進入 background capture 與 agent log（`_on_bridge_rx`；前景執行中不寫 agent log，EVT-D-L1）。
@@ -3803,7 +3823,9 @@ impl SessionCore {
         now: Mono,
     ) -> Result<PyDict, PyErr> {
         if let Some(capture) = self.background.get_mut(cmd_id) {
-            return capture.result(from_chunk, limit, now);
+            let result = capture.result(from_chunk, limit, now);
+            self.sync_bg(cmd_id);
+            return result;
         }
         Ok(bg_fallback_from_registry(&self.deps.registry, cmd_id, from_chunk))
     }
@@ -3815,6 +3837,7 @@ impl SessionCore {
             if let Some(capture) = self.background.get_mut(&id) {
                 capture.status = "done";
             }
+            self.sync_bg(&id);
         }
     }
 
@@ -4278,7 +4301,8 @@ impl SessionCore {
                     "recovery_action" => "EXPECT_REBOOT",
                 })
             }
-            // Python：救援路徑例外穿出 → `_map_aborted_result` → SEND_FAILED。
+            // Python：救援路徑例外穿出 → `_map_aborted_result`：命令已確認 bytes > 0 時由 OpRunner 直接回
+            // COMMAND_ABORTED_IN_FLIGHT＋META（審查 F26）；此處只剩 0 byte（未有命令 TX 帳）→ SEND_FAILED。
             OpOutcome::Error(_) => CmdOutcome::Result(pydict! { "ok" => false, "error_code" => "SEND_FAILED" }),
             _ => CmdOutcome::SendFailed,
         };

@@ -1617,3 +1617,77 @@ fn outstanding_commands_counts_background_ids() {
     assert_eq!(s["outstanding_commands"], PyValue::from(1), "{s:?}");
 }
 
+
+#[test]
+fn recover_key_other_reject_in_command_maps_aborted_in_flight() {
+    // 審查 F26（Medium，8b8a40f）：命令逾時後送救援鍵，若救援鍵被 Frozen／StaleEpoch／Cancelled／Quiet 以外的原因
+    // 拒絕（此處 WAL 不健康），Python `_recover_after_failure` 拋 TxIncompleteError → `execute_command` 以
+    // `_map_aborted_result(cmd_id, exc)` 結算：`tx_account(cmd_id)` 已有命令本身的 9 bytes（`sleep 20\n`）→
+    // META `{"event":"command_aborted_in_flight","confirmed_tx_bytes":9,"tx_outcome":"partial"}`＋
+    // `{ok:false, error_code:"COMMAND_ABORTED_IN_FLIGHT"}`。舊 Rust：SEND_FAILED、無 META。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let slow = h.submit_with("sleep 20", |r| r.timeout_s = 1.0);
+    wait_tx(&h, b"sleep 20\n");
+    h.fence.with(|f| f.wal_unhealthy = true);
+    advance_until(&h, Duration::from_millis(100), "命令結算", |h| is_done(h, &slow));
+    let rec = h.wait_done(&slow);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(9)));
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("partial")));
+    assert!(!h.wal_tx_payloads().contains(&b"\x03".to_vec()), "救援鍵被拒，零 TX");
+}
+
+#[test]
+fn global_background_capture_limit_evicts_oldest_across_sessions() {
+    // 審查 F28（Medium，8b8a40f）：Python `SessionManager._background` 為 manager 層全域 dict，`BG_CAPTURE_MAX_COUNT`
+    // （64）是整個 daemon 的上限，`_evict_background_locked` 依全域 `created_at` 淘汰最舊的已終結 capture（跨 session）。
+    // 輸入：COM1 已有 64 筆已終結 capture（較舊），COM0 再完成 1 筆 background 命令 → 總數 65 → 淘汰 COM1 最舊的一筆。
+    let index = sw_core::capture::BackgroundIndex::new();
+    let evicted = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let sink = evicted.clone();
+    index.set_remote_evictor(Arc::new(move |com: &str, id: &str| {
+        sink.lock().unwrap().push((com.to_string(), id.to_string()));
+    }));
+    for i in 0..64 {
+        let id = format!("old{i:02}");
+        assert!(index.register(&id, "COM1", "2000-01-01T00:00:00").is_empty());
+        index.set_active(&id, false);
+    }
+    let h = ActorRig::new_with_bg_index(SHELL_PROFILE, |_| {}, index.clone()).ready();
+    h.dev.on_tx_reply(b"dmesg\n", b"dmesg\r\nline1\r\nroot@t:/# ");
+    let id = h.submit_with("dmesg", |r| r.mode = "bg".into());
+    h.wait_done(&id);
+    assert_eq!(
+        evicted.lock().unwrap().clone(),
+        vec![("COM1".to_string(), "old00".to_string())],
+        "應淘汰全域最舊的已終結 capture"
+    );
+    assert_eq!(index.len(), 64);
+}
+
+#[test]
+fn evict_capture_event_drops_local_capture() {
+    // 審查 F28：被全域淘汰的 capture 由擁有者丟棄，之後 `result_tail` 回 CMD_NOT_FOUND（Python `_background.pop`）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"dmesg\n", b"dmesg\r\nline1\r\nroot@t:/# ");
+    let id = h.submit_with("dmesg", |r| r.mode = "bg".into());
+    h.wait_done(&id);
+    let before = h.request(SessionRequest::BackgroundResult {
+        cmd_id: id.clone(),
+        from_chunk: 0,
+        limit: 200,
+    });
+    assert_eq!(before["ok"], PyValue::Bool(true));
+    h.send_control(ControlEvent::EvictCapture { cmd_id: id.clone() });
+    let after = h.request(SessionRequest::BackgroundResult {
+        cmd_id: id.clone(),
+        from_chunk: 0,
+        limit: 200,
+    });
+    assert_eq!(after["error_code"], PyValue::from("CMD_NOT_FOUND"));
+}

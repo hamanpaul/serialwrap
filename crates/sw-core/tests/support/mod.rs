@@ -229,6 +229,7 @@ impl CoreHarness {
                     .cloned()
                     .map(Ok)
             }),
+            bg_index: sw_core::capture::BackgroundIndex::new(),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
 
@@ -1124,6 +1125,15 @@ impl ActorRig {
 
     /// 同 `new`，但在 actor 啟動前可調整 `SessionCore`（Task 14：capture env、self-test 觀測注入）。
     pub fn new_with(profile_yaml: &str, setup: impl FnOnce(&mut SessionCore)) -> ActorRig {
+        ActorRig::new_with_bg_index(profile_yaml, setup, sw_core::capture::BackgroundIndex::new())
+    }
+
+    /// 同 `new_with`，並注入共用的 background capture 索引（審查 F28：全域上限）。
+    pub fn new_with_bg_index(
+        profile_yaml: &str,
+        setup: impl FnOnce(&mut SessionCore),
+        bg_index: Arc<sw_core::capture::BackgroundIndex>,
+    ) -> ActorRig {
         let profile = profile_of(profile_yaml);
         let clock = FakeClock::new();
         let fence = Fence::new();
@@ -1167,6 +1177,7 @@ impl ActorRig {
                     .get(p)
                     .map(|t| Ok(t.clone()))
             }),
+            bg_index,
         };
         let exec_profile = profile.clone();
         let mut core = SessionCore::new(profile, "yaml-target", deps);

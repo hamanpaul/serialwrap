@@ -264,6 +264,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
                 &t.prompt_regex,
                 pre_offset,
                 t.platform == "passthrough",
+                None,
             )
         }
         OpSpec::SelfTestProbe {
@@ -496,6 +497,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             &t.prompt_regex,
             pre_offset,
             passthrough,
+            Some((cmd_id, confirmed_of(&report))),
         );
     }
     let raw = ctx.rx.text_from(pre_offset);
@@ -569,6 +571,9 @@ fn run_reboot(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand, mode: &str) -> Op
 
 /// `_recover_after_failure`（agent／system:recover 分支；人類來源不適用，DF-02）。
 /// passthrough 不送救援鍵（SC-35）；quiet 由 fence 在每次寫入前重驗（`Quiet` 拒絕即停止）。
+/// `aborted`：命令路徑的 `(cmd_id, 命令本身已確認的 TX bytes)`，救援鍵遇其他拒絕時依 Python `_map_aborted_result`
+/// 結算（審查 F26）；READY recover 為 `None`（維持例外）。
+#[allow(clippy::too_many_arguments)]
 fn recover_after_failure(
     ctx: &OpCtx,
     grant: &OpGrant,
@@ -577,6 +582,7 @@ fn recover_after_failure(
     prompt_regex: &str,
     pre_offset: u64,
     passthrough: bool,
+    aborted: Option<(&str, usize)>,
 ) -> OpOutcome {
     if passthrough {
         return OpOutcome::PromptTimeout {
@@ -604,6 +610,31 @@ fn recover_after_failure(
                     );
                 }
                 _ => {
+                    if let Some((cmd_id, confirmed)) = aborted.filter(|(_, n)| *n > 0) {
+                        // Python：TxIncompleteError → `execute_command` → `_map_aborted_result(cmd_id, exc)`；
+                        // `tx_account(cmd_id)` 含命令本身的 bytes，救援鍵結果非完整 → `partial`（Unknown → `unknown`）。
+                        let tx_outcome = if matches!(report.result.outcome, TxOutcome::Unknown { .. }) {
+                            "unknown"
+                        } else {
+                            "partial"
+                        };
+                        let mut meta = PyDict::new();
+                        meta.insert("event", PyValue::from("command_aborted_in_flight"));
+                        meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
+                        meta.insert("tx_outcome", PyValue::from(tx_outcome));
+                        let _ = ctx.wal.append(WalAppendReq {
+                            com: &ctx.com,
+                            dir: "META",
+                            source: "system",
+                            payload: b"",
+                            cmd_id: Some(cmd_id),
+                            loss_flag: false,
+                            meta: Some(meta),
+                        });
+                        return OpOutcome::CommandResult(
+                            pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
+                        );
+                    }
                     return OpOutcome::Error(PyErr::value_error(tx_incomplete_message(
                         &report, 1,
                     )));

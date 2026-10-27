@@ -248,6 +248,8 @@ struct Shared {
     inner: Mutex<Inner>,
     cv: Condvar,
     note_tx: Sender<ManagerNote>,
+    /// 全 daemon 共用的 background capture 索引（審查 F28）。
+    bg_index: Arc<crate::capture::BackgroundIndex>,
     closed: AtomicBool,
     /// state.json 持久化觀察者（P5-T19 #3／#4／#68 的 Stage 0 測試鉤子；未設定時不動作）。
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
@@ -611,6 +613,7 @@ impl Shared {
                     Err(e) => Some(Err(std::io::Error::other(format!("{e:?}")))),
                 }
             }),
+            bg_index: self.bg_index.clone(),
         };
         let mut core = SessionCore::new(profile.clone(), profile_source, deps);
         if core.session_id() != sid {
@@ -1468,6 +1471,12 @@ impl Shared {
             } => {
                 lock(&self.inner).interactive.insert(interactive_id, sid);
             }
+            ManagerNote::EvictCapture { com, cmd_id } => {
+                let actor = lock(&self.inner).resolve(&com).map(|e| e.actor.clone());
+                if let Some(actor) = actor {
+                    let _ = actor.control.send(ControlEvent::EvictCapture { cmd_id });
+                }
+            }
             ManagerNote::InteractiveClosed { interactive_id } => {
                 lock(&self.inner).interactive.remove(&interactive_id);
             }
@@ -1967,7 +1976,19 @@ impl SessionManager {
             max_sessions,
             inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
-            note_tx,
+            note_tx: note_tx.clone(),
+            bg_index: {
+                let index = crate::capture::BackgroundIndex::new();
+                // 淘汰決定在 actor thread 內做出：只經通知通道交給 manager pump，不在 actor thread 取 manager 鎖。
+                let tx = note_tx;
+                index.set_remote_evictor(Arc::new(move |com: &str, cmd_id: &str| {
+                    let _ = tx.send(ManagerNote::EvictCapture {
+                        com: com.to_string(),
+                        cmd_id: cmd_id.to_string(),
+                    });
+                }));
+                index
+            },
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),

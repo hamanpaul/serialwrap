@@ -52,6 +52,10 @@ pub enum ControlEvent {
     /// 裝置掃描後 by_id 不在快照（Python `_mark_missing_devices_locked`；審查 F60）：無 bridge 的非 RELEASED
     /// session 標 DETACHED、`last_error`（None 時）`DEVICE_NOT_FOUND`、`detached_at`（None 時）。
     DeviceMissing,
+    /// 全域 background capture 上限的跨 session 淘汰（Python `_evict_background_locked`；審查 F28）。
+    EvictCapture {
+        cmd_id: String,
+    },
     /// Console 擁有者更新目前附掛在 session 的 console 數量；供 release 回報實際關閉數。
     ConsoleCountChanged {
         count: usize,
