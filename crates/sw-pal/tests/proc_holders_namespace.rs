@@ -3,7 +3,7 @@
 //!
 //! 以可注入的 `HolderFs` 佈置假 `/proc`：每條 fd 的 inode 身分可獨立指定，模擬「字串相同、inode 不同」的
 //! 外部 namespace fd 與「同一 inode」的真實 holder。`TestUartBridgeHeldPathsNamespace`（console reaper）由
-//! P6-T8 承接，`TestDetectMultiOpenNamespace` 由 `proc_scan`（multi_open）承接。
+//! P6-T8 承接；`TestDetectMultiOpenNamespace` 3 案見本檔末段（`proc_scan::posix::tty_holders_with`）。
 // sw-pal 是唯一允許平台 cfg 的 crate
 #![cfg(unix)]
 
@@ -298,4 +298,63 @@ fn same_tty_matrix() {
         !same_tty(&TtyStat { dev: 9, ..zero }, &zero),
         "rdev 0 不視為別名"
     );
+}
+
+// --- Python `TestDetectMultiOpenNamespace`（parity-amendments-2026-10-26 #64；審查 F02）：multi_open 的
+// serialwrapd tty 持有者比對與 probe 同源，以 inode 身分（`same_tty`）判定，不以 readlink 字串。
+
+fn multi_open_holders(proc_ns: &FakeProcNs, pid: u32, tty: &str) -> (Vec<u32>, HolderScanStatus) {
+    sw_pal::proc_scan::posix::tty_holders_with(
+        proc_ns,
+        Path::new(PROC),
+        &[pid],
+        &[PathBuf::from(tty)],
+    )
+}
+
+#[test]
+fn multi_open_foreign_namespace_same_string_not_reported() {
+    let mut proc_ns = FakeProcNs::new();
+    proc_ns.add_fd(7001, 5, chr(CONTAINER_DEV_B, 10, PTS7_RDEV));
+    let (holders, status) = multi_open_holders(&proc_ns, 7001, TTY);
+    assert!(holders.is_empty(), "字串相同、inode 不同的外部 namespace fd 不得列入");
+    assert_eq!(status, HolderScanStatus::Ok);
+}
+
+#[test]
+fn multi_open_same_inode_reported_under_caller_path() {
+    let mut proc_ns = FakeProcNs::new();
+    proc_ns.add_fd(7002, 5, chr(HOST_DEV, 10, PTS7_RDEV));
+    let (holders, status) = multi_open_holders(&proc_ns, 7002, TTY);
+    assert_eq!(holders, vec![7002]);
+    assert_eq!(status, HolderScanStatus::Ok);
+}
+
+#[test]
+fn multi_open_non_devpts_mknod_alias_reported_under_caller_path() {
+    let uart = "/dev/ttyS0";
+    let uart_rdev = (4 << 8) | 64;
+    let mut proc_ns = FakeProcNs::new();
+    proc_ns.set_path(uart, chr(HOST_DEV, 11, uart_rdev));
+    proc_ns.add_fd(7003, 5, chr(CONTAINER_DEV_A, 55, uart_rdev));
+    let (holders, _) = multi_open_holders(&proc_ns, 7003, uart);
+    assert_eq!(holders, vec![7003]);
+}
+
+#[test]
+fn multi_open_tty_stat_failure_skips_tty_and_fd_dir_errors_classified() {
+    // Python `tty_stat` 回 None → 該 tty 不參與比對；fd 目錄 PermissionError → permission，其餘 → unknown。
+    let mut proc_ns = FakeProcNs::new();
+    proc_ns.add_fd(7004, 5, chr(HOST_DEV, 10, PTS7_RDEV));
+    let (holders, status) = multi_open_holders(&proc_ns, 7004, "/dev/pts/404");
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Ok);
+    let fd_dir = Path::new(PROC).join("7005").join("fd");
+    proc_ns
+        .dirs
+        .insert(fd_dir, Err(io::ErrorKind::PermissionDenied));
+    let (_, status) = multi_open_holders(&proc_ns, 7005, TTY);
+    assert_eq!(status, HolderScanStatus::Permission);
+    let (_, status) = multi_open_holders(&proc_ns, 7006, TTY);
+    assert_eq!(status, HolderScanStatus::Unknown);
 }

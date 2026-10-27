@@ -484,7 +484,9 @@ impl TtyOpenOps for PosixOpenOps<'_> {
     }
 
     fn probe_holders(&mut self) -> HolderReport {
-        let report = finalize_holder_report(self.excl.probe_holders(&self.path));
+        // 回傳 probe 原值（不 finalize）：open／flock 衝突路徑已在 `open_error`／`open_sequence` 自行 finalize，
+        // 鎖後重掃沿用 probe 本身的 holder_unknown 規則（parity-amendments-2026-10-26 #64；審查 F03）。
+        let report = self.excl.probe_holders(&self.path);
         self.last_probe = Some(report.clone());
         report
     }
@@ -1571,9 +1573,23 @@ mod tests {
         assert!(!rep.holder_unknown);
     }
 
+    /// 測內暫存檔當 tty 替身：目標 `stat` 一定成功，結果不再取決於主機有無 `/dev/pts/9`（審查 F01）。
+    fn temp_tty(tmp: &Path) -> String {
+        let tty = tmp.join("tty9");
+        std::fs::write(&tty, b"").expect("tty 替身");
+        tty.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn holder_scan_unreadable_proc_is_unknown() {
-        let rep = probe_holders_in(Path::new("/nonexistent/serialwrap-s21-proc"), "/dev/pts/9");
+        // Python `probe_holders`：`os.listdir(<proc>/<pid>/fd)` 的非 PermissionError OSError → status
+        // "unknown"；pids 空 → holder_unknown。此處 fd 為一般檔案（listdir → ENOTDIR）。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tty = temp_tty(tmp.path());
+        let root = tmp.path().join("proc");
+        std::fs::create_dir_all(root.join("123")).expect("mkdir pid");
+        std::fs::write(root.join("123").join("fd"), b"").expect("fd 為一般檔");
+        let rep = probe_holders_in(&root, &tty);
         assert_eq!(
             rep,
             HolderReport {
@@ -1585,18 +1601,38 @@ mod tests {
     }
 
     #[test]
-    fn holder_scan_permission() {
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("EVIDENCE_MISSING: root 下 chmod 000 無效，本案例證據不足");
-            return;
-        }
+    fn holder_scan_missing_proc_root_is_permission() {
+        // Python `probe_holders`：目標 stat 成功後 `os.listdir(proc_root)` 的任何 OSError 皆回 "permission"
+        // （parity-amendments-2026-10-26 #64；舊版期望 Unknown 與 Python 相反）。
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        make_fd_link(root, 123, "/dev/pts/9");
+        let tty = temp_tty(tmp.path());
+        let rep = probe_holders_in(&tmp.path().join("no-such-proc"), &tty);
+        assert_eq!(
+            rep,
+            HolderReport {
+                pids: vec![],
+                holder_unknown: true,
+                status: HolderScanStatus::Permission,
+            }
+        );
+    }
+
+    #[test]
+    fn holder_scan_permission() {
+        // root 下 chmod 000 無效：證據不足即 FAIL，不得以 return 計為 PASS（審查 F01／F81）。
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "證據不足：root 下 chmod 000 無效，須以非 root 執行"
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tty = temp_tty(tmp.path());
+        let root = tmp.path().join("proc");
+        make_fd_link(&root, 123, &tty);
         let fd_dir = root.join("123").join("fd");
         std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o000))
             .expect("chmod 000");
-        let rep = probe_holders_in(root, "/dev/pts/9");
+        let rep = probe_holders_in(&root, &tty);
         // 還原權限，讓 tempdir 可被清除
         let _ = std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755));
         assert_eq!(rep.status, HolderScanStatus::Permission);

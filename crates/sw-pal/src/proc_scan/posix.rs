@@ -3,6 +3,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use crate::proc_holders::posix::{same_tty, HolderFs, RealHolderFs, TtyStat};
 use crate::proc_scan::{
     extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScanStatus,
     ProcIdentity, ProcScan, ScanFailure,
@@ -91,40 +93,17 @@ impl ProcScan for PosixProcScan {
         let Ok(daemons) = self.serialwrapd_instances() else {
             return (Vec::new(), HolderScanStatus::Unknown);
         };
-        let expected = paths.iter().collect::<BTreeSet<_>>();
-        let mut holders = BTreeSet::new();
-        let mut status = HolderScanStatus::Ok;
-        for daemon in daemons {
-            let fd_dir = self.proc_root.join(daemon.pid.to_string()).join("fd");
-            let entries = match fs::read_dir(fd_dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    status = HolderScanStatus::Permission;
-                    continue;
-                }
-                Err(_) => {
-                    if status == HolderScanStatus::Ok {
-                        status = HolderScanStatus::Unknown;
-                    }
-                    continue;
-                }
-            };
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    if status == HolderScanStatus::Ok {
-                        status = HolderScanStatus::Unknown;
-                    }
-                    continue;
-                };
-                let Ok(target) = fs::read_link(entry.path()) else {
-                    continue;
-                };
-                if expected.contains(&target) {
-                    holders.insert(daemon.pid);
-                }
-            }
+        let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
+        #[cfg(unix)]
+        {
+            tty_holders_with(&RealHolderFs, &self.proc_root, &pids, paths)
         }
-        (holders.into_iter().collect(), status)
+        // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
+        #[cfg(not(unix))]
+        {
+            let _ = (pids, paths);
+            (Vec::new(), HolderScanStatus::Unknown)
+        }
     }
 
     fn pid_alive(&self, pid: u32) -> bool {
@@ -198,4 +177,49 @@ fn read_proc_stat(root: &Path, pid: u32) -> ProcStatRead {
             .and_then(|value| value.parse::<u64>().ok())
     });
     ProcStatRead::Parsed(ProcStat { state, start_ticks })
+}
+
+#[cfg(unix)]
+/// `serialwrapd` fd 與 tty 的同一性比對（Python `multi_open.detect_multi_open` 的 holders 段；#R2／parity #64）。
+///
+/// 以 `stat`（跟隨 fd symlink）取得 inode 身分後經 [`same_tty`] 判定，不以 readlink 字串比對：跨 mount
+/// namespace 的同名 `/dev/pts/N` 字串相同卻非同一 tty。tty 本身 stat 失敗即略過該 tty（Python `tty_stat`
+/// 回 None）；fd stat 失敗略過該 fd；fd 目錄 PermissionError → `Permission`，其他錯誤 → `Unknown`。
+pub fn tty_holders_with(
+    fs: &dyn HolderFs,
+    proc_root: &Path,
+    pids: &[u32],
+    paths: &[PathBuf],
+) -> (Vec<u32>, HolderScanStatus) {
+    let tty_stats = paths
+        .iter()
+        .filter_map(|path| fs.stat(path).ok())
+        .collect::<Vec<TtyStat>>();
+    let mut holders = BTreeSet::new();
+    let mut status = HolderScanStatus::Ok;
+    for pid in pids {
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
+        let fds = match fs.list_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                status = HolderScanStatus::Permission;
+                continue;
+            }
+            Err(_) => {
+                if status == HolderScanStatus::Ok {
+                    status = HolderScanStatus::Unknown;
+                }
+                continue;
+            }
+        };
+        for fd in fds {
+            let Ok(fd_stat) = fs.stat(&fd_dir.join(&fd)) else {
+                continue;
+            };
+            if tty_stats.iter().any(|tty| same_tty(&fd_stat, tty)) {
+                holders.insert(*pid);
+            }
+        }
+    }
+    (holders.into_iter().collect(), status)
 }
