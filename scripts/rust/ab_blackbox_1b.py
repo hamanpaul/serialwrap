@@ -503,6 +503,36 @@ def resolve_manifest(cli: Path) -> Path:
     raise ValueError(f"找不到 release-manifest.json（bundle={bundle}）；不得以 git HEAD 代替")
 
 
+def resolve_daemon_launcher(manifest_path: Path) -> Path:
+    """由 release manifest 解析 B 輪 daemon，並限制在該版本安裝目錄內。"""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"release-manifest.json 無法解析：{exc}") from exc
+    components = manifest.get("components", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(components, dict):
+        raise ValueError("release-manifest.json 的 components 必須是物件")
+    daemon = components.get("daemon", {})
+    if not isinstance(daemon, dict):
+        raise ValueError("release-manifest.json 的 components.daemon 必須是物件")
+    launcher = daemon.get("launcher", {})
+    raw_path = launcher.get("path") if isinstance(launcher, dict) else None
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("release-manifest.json 缺少 components.daemon.launcher.path")
+    relative_path = Path(raw_path)
+    if relative_path.is_absolute():
+        raise ValueError("daemon launcher 必須使用相對於 release-manifest.json 的路徑")
+    install_root = manifest_path.parent.resolve()
+    resolved = (install_root / relative_path).resolve()
+    try:
+        resolved.relative_to(install_root)
+    except ValueError as exc:
+        raise ValueError("daemon launcher 超出 release-manifest.json 所在版本目錄") from exc
+    if not resolved.is_file():
+        raise ValueError(f"release-manifest.json 指向的 daemon launcher 不存在：{resolved}")
+    return resolved
+
+
 def _config_digest_module() -> Any:
     """以路徑載入 tests/contract_blackbox/config_digest.py（stdlib-only；不經 sys.path，避免與 harness 同名模組衝突）。"""
     import importlib.util
@@ -838,10 +868,13 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
         print(json.dumps({"result": "fail", "summary": str(out_dir / "summary.json"), "counts": {}}, ensure_ascii=False, sort_keys=True))
         return 1
 
+    manifest_path = resolve_manifest(cli)
+    daemon_launcher = resolve_daemon_launcher(manifest_path)
     b_env = dict(base_env)
     b_env.update({
         "SERIALWRAP_CLI_EXE": str(cli.resolve()),
-        "SERIALWRAP_RELEASE_MANIFEST": str(resolve_manifest(cli)),
+        "SERIALWRAP_DAEMON_EXE": str(daemon_launcher),
+        "SERIALWRAP_RELEASE_MANIFEST": str(manifest_path),
         "SW_BUNDLE": str(cli.parent.parent),
         "SERIALWRAP_AB_LABEL": "rust-1b",
         "SW_AB_PIDLOG": str(b_pidlog),

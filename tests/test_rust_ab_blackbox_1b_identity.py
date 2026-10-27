@@ -222,11 +222,19 @@ def _patch_identity_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def _bundle_cli(tmp_path: Path) -> Path:
     bundle = tmp_path / "bundle"
     (bundle / "bin").mkdir(parents=True)
+    daemon_launcher = bundle / "daemon.py"
+    daemon_launcher.write_text("# staged daemon launcher\n", encoding="utf-8")
     (bundle / "release-manifest.json").write_text(
         json.dumps({
             "git_revision": "deadbeef",
             "contract_revision": "cafe",
-            "components": {"cli": {"implementation": "rust"}, "daemon": {"package": {"tree_sha256": "tree-sha"}}},
+            "components": {
+                "cli": {"implementation": "rust"},
+                "daemon": {
+                    "launcher": {"path": "daemon.py"},
+                    "package": {"tree_sha256": "tree-sha"},
+                },
+            },
         }),
         encoding="utf-8",
     )
@@ -298,6 +306,7 @@ def _execute_harness(
     *,
     write_config: dict[str, str] | None,
     approved_a_skips: bool = False,
+    captured_env: dict[str, dict[str, str]] | None = None,
 ) -> tuple[ModuleType, Path, int]:
     """以假的 pytest 子行程驅動 `execute()`。`write_config` 為 {"a": timeout, "b": timeout}；None 表示兩輪都不寫設定紀錄。"""
     cd = _cd()
@@ -317,7 +326,7 @@ def _execute_harness(
     out = tmp_path / "ab"
     a_junit, b_junit = out / "a-python.xml", out / "b-rust.xml"
     lock_cases = [{"case_id": "c-cfg", "tests": list(nodes)}]
-    seen_env: dict[str, dict[str, str]] = {}
+    seen_env: dict[str, dict[str, str]] = captured_env if captured_env is not None else {}
 
     def fake_run(argv, *, env, timeout):  # type: ignore[no-untyped-def]
         if "--collect-only" in argv:
@@ -358,14 +367,20 @@ def _execute_harness(
 def test_execute_wires_each_round_config_log_into_its_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """執行器把 SW_AB_CONFIGLOG 傳給 A、B 兩輪；兩側身分引用各自彙整的設定摘要，並保留證據檔。"""
+    """執行器為 A、B 傳入各自設定紀錄，且 B daemon 取自核准 bundle manifest。"""
     cd = _cd()
-    executor, out, _rc = _execute_harness(tmp_path, monkeypatch, write_config={"a": "5", "b": "9"})
+    seen_env: dict[str, dict[str, str]] = {}
+    executor, out, _rc = _execute_harness(
+        tmp_path, monkeypatch, write_config={"a": "5", "b": "9"}, captured_env=seen_env,
+    )
     identity_a = json.loads((out / "identity-a.json").read_text(encoding="utf-8"))
     identity_b = json.loads((out / "identity-b.json").read_text(encoding="utf-8"))
     assert identity_a["config_digest"] == cd.aggregate(out / "a-config.jsonl")["digest"]
     assert identity_b["config_digest"] == cd.aggregate(out / "b-config.jsonl")["digest"]
     assert identity_a["config_digest"] != identity_b["config_digest"]
+    assert seen_env["a"]["SERIALWRAP_DAEMON_EXE"] == str(tmp_path / "py-serialwrapd")
+    assert seen_env["b"]["SERIALWRAP_DAEMON_EXE"] == str(tmp_path / "bundle" / "daemon.py")
+    assert seen_env["b"]["SERIALWRAP_RELEASE_MANIFEST"] == str(tmp_path / "bundle" / "release-manifest.json")
     expected_lock = hashlib.sha256(executor.LOCK.read_bytes() + executor.APPLICABILITY.read_bytes()).hexdigest()
     assert identity_a["lock_applicability_sha256"] == expected_lock
     assert identity_b["lock_applicability_sha256"] == expected_lock

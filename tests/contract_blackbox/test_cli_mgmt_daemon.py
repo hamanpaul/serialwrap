@@ -122,6 +122,51 @@ def _rpc_pid(endpoint: str) -> int | None:
     return pid if isinstance(pid, int) else None
 
 
+def _submit_after_on_demand_autostart(env: dict[str, str]):
+    """先確認首次需求確實啟動 daemon，再等 passthrough session READY 後送一次命令。"""
+    initial = run_cli(
+        ["cmd", "submit", "--selector", "COM0", "--cmd", "echo X", "--cmd-timeout", "1"],
+        env=env,
+        timeout_s=120.0,
+    )
+    initial_response = json.loads(initial.stdout.decode("utf-8"))
+    assert initial.rc == 2 and initial_response.get("error_code") == "SESSION_NOT_READY", (
+        "首次需求必須啟動 daemon，且明確回報 session 尚未 READY；"
+        f"rc={initial.rc} response={initial_response!r}"
+    )
+    initial_session = initial_response.get("session")
+    assert isinstance(initial_session, dict) and initial_session.get("state") in {"ATTACHING", "ATTACHED"}, (
+        f"首次 autostart 的 session 不在可等待 READY 的狀態：{initial_session!r}"
+    )
+    assert "已自動啟動" in initial.stderr.decode("utf-8", errors="replace"), (
+        f"首次 cmd submit 未留下 on-demand autostart 證據：{initial.stderr!r}"
+    )
+
+    deadline = time.monotonic() + 45.0
+    last_session: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        status = run_cli(["session", "list"], env=env, timeout_s=10.0)
+        assert status.rc == 0, status.stderr.decode("utf-8", errors="replace")
+        rows = json.loads(status.stdout.decode("utf-8")).get("sessions", [])
+        last_session = next((row for row in rows if row.get("com") == "COM0"), None)
+        if last_session and last_session.get("state") == "READY":
+            break
+        if last_session and last_session.get("state") == "DETACHED" and last_session.get("last_error"):
+            pytest.fail(f"COM0 attach failed before READY: {last_session!r}")
+        time.sleep(0.25)
+    else:
+        pytest.fail(f"COM0 未於 passthrough 靜默窗口內進入 READY：{last_session!r}")
+
+    return run_cli(
+        [
+            "cmd", "submit", "--selector", "COM0", "--cmd", "echo X",
+            "--completion-regex", "echo X",
+        ],
+        env=env,
+        timeout_s=30.0,
+    )
+
+
 def test_daemon_start_ab_conflict(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-17／SC-10：同機已有 serialwrapd 綁在其他 socket → 兩實作以相同 stdout 與 rc 2 拒絕再 spawn。"""
     other = _spawn_fake_serialwrapd("/tmp/other")
@@ -290,7 +335,7 @@ def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegatio
 
     res = None
     try:
-        res = run_cli(["cmd", "submit", "--selector", "COM0", "--cmd", "echo X"], env=env, timeout_s=120.0)
+        res = _submit_after_on_demand_autostart(env)
         assert res.rc == 0, res.stderr.decode("utf-8", errors="replace")
         rows = [json.loads(line) for line in Path(wire).read_text(encoding="utf-8").splitlines() if line]
         dut_tx = b"".join(

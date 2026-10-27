@@ -7,13 +7,18 @@
 from __future__ import annotations
 
 import ast
+import base64
+import importlib.util
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -491,7 +496,7 @@ def test_windows_com_autostart_case_supplies_release_manifest():
     body = source.split("def test_autostart_l15_tx_once(", 1)[1]
     assert "bundle_manifest_path(" in body
     assert 'env["SERIALWRAP_RELEASE_MANIFEST"]' in body
-    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("run_cli([\"cmd\", \"submit\"")
+    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("_submit_after_on_demand_autostart(env)")
 
 
 def test_windows_com_autostart_case_pins_com20_profile():
@@ -502,7 +507,83 @@ def test_windows_com_autostart_case_pins_com20_profile():
     assert 'profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"' in body
     assert "device_by_id: COM20" in body
     assert "com: COM0" in body
-    assert body.index("device_by_id: COM20") < body.index("run_cli([\"cmd\", \"submit\"")
+    assert body.index("device_by_id: COM20") < body.index("_submit_after_on_demand_autostart(env)")
+
+
+def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(tmp_path, monkeypatch):
+    """SC-18 先證明 on-demand 啟動，再等 passthrough READY 才傳送唯一命令。"""
+    case_dir = ROOT / "tests/contract_blackbox"
+    case_file = case_dir / "test_cli_mgmt_daemon.py"
+    sys.path.insert(0, str(case_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("serialwrap_sc18_case_tdd", case_file)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", pytest.PytestUnknownMarkWarning)
+            spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(case_dir))
+
+    bundle = tmp_path / "bundle"
+    manifest = bundle / "versions" / "0.3.2" / "release-manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    wire = tmp_path / "wire.ndjson"
+    env = {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}
+    module.os = SimpleNamespace(
+        name="nt",
+        environ={
+            "SW_WIN_DEV_BUNDLE": str(bundle),
+            "SW_TEST_COM_PAIR": "COM20:COM21",
+            "SW_TEST_DUT_WIRE": str(wire),
+        },
+    )
+    monkeypatch.setattr(module, "is_rust", lambda: True)
+    monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
+
+    calls = []
+    states = ["ATTACHED", "READY"]
+
+    def fake_run_cli(args, *, env, timeout_s=120.0):
+        calls.append(list(args))
+        profile = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles" / "windows-com.yaml"
+        profile_text = profile.read_text(encoding="utf-8")
+        assert "com: COM0" in profile_text and "device_by_id: COM20" in profile_text
+        if args[:2] == ["cmd", "submit"]:
+            if sum(call[:2] == ["cmd", "submit"] for call in calls) == 1:
+                return SimpleNamespace(
+                    rc=2,
+                    stdout=b'{"ok":false,"error_code":"SESSION_NOT_READY","session":{"com":"COM0","state":"ATTACHED"}}',
+                    stderr="serialwrap: on-demand：已自動啟動\n".encode(),
+                )
+            wire.write_text(
+                '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
+                base64.b64encode(b"echo X\r").decode("ascii") + '"}\n',
+                encoding="utf-8",
+            )
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        if args == ["session", "list"]:
+            state = states.pop(0) if states else "READY"
+            return SimpleNamespace(
+                rc=0,
+                stdout=json.dumps({"sessions": [{"com": "COM0", "state": state}]}).encode(),
+                stderr=b"",
+            )
+        if args == ["daemon", "stop"]:
+            return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
+        raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
+
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+
+    commands = [call for call in calls if call[:2] == ["cmd", "submit"]]
+    assert len(commands) == 2
+    assert commands[0][-2:] == ["--cmd-timeout", "1"]
+    assert commands[1][-2:] == ["--completion-regex", "echo X"]
+    assert calls[1:3] == [["session", "list"], ["session", "list"]]
+    assert calls[3:] == [commands[1], ["daemon", "stop"]]
 
 
 def test_windows_dev_bundle_keeps_daemon_inside_install_tree():
