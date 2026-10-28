@@ -1209,9 +1209,10 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
         )),
         Err(FenceReject::OwnerMismatch)
     ));
-    // 審查 F15：banner 推進的是 core 世代，不是新的 login run——現行 attach run（以 old_fsm_gen 啟動）的
-    // Ready 結果照 Python 套用（READY＋confirm_ready）。舊版斷言「停在 ATTACHING」鎖住的是永久卡住的缺陷。
-    assert!(!h
+    // OD-35（2026-10-28）：原 F15 期望（舊世代 attach run 的 Ready 照 Python 套用 → READY）被已核准 SC-30 取代（非削弱）：
+    // banner arm 當下即取消該 run、收斂 ATTACHED（不得永久停在 ATTACHING），之後抵達的舊世代 Ready 被丟棄。
+    assert_eq!(h.core.state(), SessionState::Attached, "arm 同一事件內收斂");
+    assert!(h
         .feed(ControlEvent::LoginFinished {
             epoch,
             fsm_gen: old_fsm_gen,
@@ -1219,7 +1220,7 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
             after_rx_seq: None,
         })
         .is_empty());
-    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(h.core.state(), SessionState::Attached);
 }
 
 #[test]
@@ -1558,9 +1559,11 @@ fn credentials_warning_is_deduplicated_until_manual_recover() {
 }
 
 // ---------------------------------------------------------------------------
-// 審查 F15（High，0a187c1）：attach 登入中收到 boot banner（quiet arm 令 fsm_gen 前進）後，該次 run 自己的
-// LoginFinished 仍須照 Python 套用（`_attach_by_id` 的 attach thread 照常寫終態）：NotReady → ATTACHED、
-// Ready → READY（confirm_ready）、Failed → drain 到 DETACHED；不得永久停在 ATTACHING、SessionAttach 回 ok。
+// 審查 F15（High，0a187c1）：attach 登入中收到 boot banner（quiet arm 令 fsm_gen 前進）後，不得永久停在 ATTACHING、
+// SessionAttach 不得回 ok。原期望（該次 run 的 LoginFinished 照 Python 套用：NotReady → ATTACHED、Ready → READY、
+// Failed → drain DETACHED）依 OD-35（2026-10-28）被已核准 SC-30 取代（非削弱）：arm 當下即取消 run、收斂
+// ATTACHED＋PROMPT_UNAVAILABLE（bridge 採用、quiet 計時、#162 pending 保留），之後抵達的舊世代結果一律丟棄。
+// 下列 nodeid 已入 L1 鎖，名稱保留；`ready_result_applied`／`failed_drains_detached` 為歷史名稱。
 // ---------------------------------------------------------------------------
 
 fn attach_login_then_banner(h: &mut CoreHarness) -> (u64, u64) {
@@ -1616,8 +1619,12 @@ fn banner_during_attach_login_ready_result_applied() {
         result: LoginOutcome::Ready,
         after_rx_seq: None,
     });
-    assert_eq!(h.core.state(), SessionState::Ready);
-    assert_eq!(pget(&h.public(), "boot_quiet_remaining_s"), PyValue::Null, "confirm_ready 清 quiet");
+    // SC-30（OD-35）：舊世代 Ready 不得推 READY、不得以 confirm_ready 解除 quiet／#162 gate。
+    assert_eq!(h.core.state(), SessionState::Attached);
+    let public = h.public();
+    assert_eq!(pget(&public, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_ne!(pget(&public, "boot_quiet_remaining_s"), PyValue::Null, "quiet 仍計時");
+    assert_eq!(pget(&public, "ready_reconfirm_pending"), PyValue::Bool(true));
 }
 
 #[test]
@@ -1630,9 +1637,13 @@ fn banner_during_attach_login_failed_drains_detached() {
         result: LoginOutcome::Failed("SHELL_PROMPT_TIMEOUT".into()),
         after_rx_seq: None,
     });
-    let (ep, stop) = begin_drain(&effs);
-    h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
-    assert_eq!(h.core.state(), SessionState::Detached);
+    // SC-30（OD-35）：run 已於 arm 時取消並收斂 ATTACHED；舊世代 Failed 被丟棄，不 drain、bridge 保留。
+    assert!(
+        !effs.iter().any(|e| matches!(e, Effect::BeginDrain { .. })),
+        "舊世代失敗不得拆 bridge"
+    );
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
 }
 
 #[test]

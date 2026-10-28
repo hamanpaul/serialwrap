@@ -1216,6 +1216,14 @@ fn op_login_routes_secret_with_log_false_and_login_probe_class() {
 
 ---
 
+**P7 修訂（OD-35 定案，2026-10-28）：** 擁有者裁決維持 SC-30（P7-BO-3 RESOLVED）。實作與本 Task 原文的差異：
+
+- **`TxPermit.fsm_gen` 形狀定案為 06 既有 `u64`**（不改 `Option<u64>`、不新增 `FenceReject::StaleFsmGen`）：所有 permit 皆帶建立時的 `fsm_gen`，Fence 對 login 類 class 以 06 既有 `FsmMismatch`（與 `FenceState.fsm_gen` 相等比對）擋過期世代；會擋 probe 的 quiet arm 與 StartLogin 才推進 `FenceState.fsm_gen`（等同本 Task 的 `fsm_gen_floor`，單一 run 下相等比對與 floor 比對等價）；console unlock 的 arm 不推進（`probe_quiet_exempt`）。理由：06 介面已凍結且 P5 測試與 TxWriter 依此形狀，改形狀需改 P5 檔案而無可觀察差異。
+- **取消訊號不新增 `Effect::CancelLogin`**：actor 在 arm 的同一事件內呼叫 `RxShared::cancel_login_runs()`（取消世代遞增），run 端以 `RunCancel::new(&rx)` 建立的旗標隨之轉真、等待中的 `wait_for_regex_cancellable` 立即回 `Cancelled`；新增 Effect 變體需改 P5 `tests/support` 的窮舉 executor 與 production executor（P5 檔案）。
+- **收斂在 arm 事件內完成**（`SessionCore::sc30_cancel_login_run`）：Attach／既有 bridge 再探且非 READY → 採用 bridge、ATTACHED＋`PROMPT_UNAVAILABLE`（detail None），等待者依 `reprobe_reply` 回覆；READY → 不變；自動重探（含 READY 再確認）→ 以 `Aborted(Refused(Quiet))` 收斂（記 attempt、#162 pending 保留）；reboot recovery → 回等待迴圈。run 自 `login_run` 移除，之後抵達的舊世代 `LoginFinished` 一律丟棄。
+- P5 F15 測試期望依 OD-35 改為 SC-30 行為並登記「被已核准 SC-30 取代」（非削弱）：`session_core::{boot_banner_invalidates_old_fsm_and_owner_generations, banner_during_attach_login_ready_result_applied, banner_during_attach_login_failed_drains_detached}`、`login_quiet::attach_settles_attached_after_quiet_revokes_probe`（Ready 子案）；P7 `session_core_reprobe_p7::{quiet_arm_during_auto_reprobe_ready_result_is_ready, quiet_arm_during_auto_reprobe_not_ready_keeps_failure_code}` 同。nodeid 不變（名稱為歷史名稱）。
+- 新增 `crates/sw-core/tests/session_core_login.rs` 6 項（attach／手動再探／READY 再確認／reboot recovery 的取消與收斂、console unlock 不取消、`cancel_login_runs` 喚醒）。本 Task 其餘收斂表（`LoginReport`／`EntryUsed`／`active_login` 改名、stall_warning 去重、`Aborted(TxIncomplete)` 停自動重探等）與 `fence_fsm_gen.rs`／`login_run.rs` 整合測試尚未承接，列下一輪。
+
 ## Task 8：`self_test.rs`：self-test 分類與 nonce probe 整合
 
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max

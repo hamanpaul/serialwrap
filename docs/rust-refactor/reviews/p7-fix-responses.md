@@ -189,3 +189,9 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | a6b24f7-4 | Low | `plan_recover` 結果未使用、後段重算 | **fixed**：`recover_request` 後段改 `match plan`（Reattach／Force／Reprobe／ReadyKeys），刪除重算；sw-core 全綠 |
 | a6b24f7-5 | Low | BU 編號不一致 | **fixed**：08 Task 9 與本檔 Task 9 列統一為 P7-BU-5 |
 | 4221ba2-1 | Low | golden 成因（「隨 checkout 路徑變動」）無證據 | **documented**：該 generator 屬 P5（`gen_allowlist_unreadable_config.py`）；本輪主工作樹（非 `/tmp/<0700>`）跑全套未再出現該失敗，與審查者「父目錄權限使 nobody 無法進入」的假設相容。成因描述改為「未實證；疑似 `/tmp` 下 0700 父目錄使降權列例外類別改變」，請 P5 於 generator 偵測不可進入父目錄 |
+
+### 擁有者裁決（OD-31／OD-34／OD-35，2026-10-28）
+
+| OD | 處理 |
+|---|---|
+| OD-35（P7-BO-3） | **完成（Task 7 SC-30 核心）**：`sc30_cancel_login_run` 於會擋 probe 的 quiet arm 事件內取消並收斂 run；`TxPermit.fsm_gen` 定案為 06 既有 `u64`＋`FsmMismatch`；P5 F15 測試 4 支與 P7 d5b2dd6-1 測試 2 支期望改為 SC-30 行為並登記「被已核准 SC-30 取代」（非削弱，nodeid 不變）；新增 `session_core_login.rs` 6 項。詳見 08 Task 7「P7 修訂（OD-35 定案）」。SC-30 的 L1.5 黑箱 `sc30-quiet-mid-login-aborts`（`test_p7_quiet_reconfirm.py`）屬 Task 18，`behavior_changes.yaml` 狀態維持 APPROVED 至黑箱證據到位 |

@@ -112,6 +112,9 @@ pub struct RxShared {
     stats_override: AtomicU64,
     /// P7 Task 10：agent log 的 reader 端寫入者（`append` 內同步呼叫；Python `_on_bridge_rx` 於 reader 執行緒寫檔）。
     capture: Mutex<Option<Arc<crate::capture::CaptureObserver>>>,
+    /// P7 Task 7（SC-30）：login run 取消世代。`RunCancel` 建立時記下當時值，之後遞增即視為已取消
+    /// （actor 在 quiet arm 的同一事件內呼叫 `cancel_login_runs`，不需新增 Effect 變體）。
+    run_cancel_gen: AtomicU64,
 }
 
 impl RxShared {
@@ -126,7 +129,14 @@ impl RxShared {
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
             capture: Mutex::new(None),
+            run_cancel_gen: AtomicU64::new(0),
         })
+    }
+
+    /// SC-30：取消本 bridge 上所有既存的 login run（其 `RunCancel::is_triggered` 轉真）並喚醒等待者。
+    pub fn cancel_login_runs(&self) {
+        self.run_cancel_gen.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
     }
 
     /// P7 Task 10：掛上／卸下 agent log 寫入者（SessionCore 於 log_start／stop／bridge 交接時呼叫）。
@@ -792,6 +802,8 @@ impl IoWorker {
 pub struct RunCancel {
     flag: Arc<AtomicBool>,
     rx: Arc<RxShared>,
+    /// 建立當下的 `RxShared::run_cancel_gen`；之後 `cancel_login_runs` 使其不符即視為取消。
+    start_gen: u64,
 }
 
 impl RunCancel {
@@ -799,6 +811,7 @@ impl RunCancel {
         RunCancel {
             flag: Arc::new(AtomicBool::new(false)),
             rx: Arc::clone(rx),
+            start_gen: rx.run_cancel_gen.load(Ordering::Acquire),
         }
     }
     /// 設旗標並喚醒等待中的 `wait_for_regex_cancellable`（P7 Task 3 先行；Task 7 由 `Effect::CancelLogin` 觸發）。
@@ -808,6 +821,7 @@ impl RunCancel {
     }
     pub fn is_triggered(&self) -> bool {
         self.flag.load(Ordering::Acquire)
+            || self.rx.run_cancel_gen.load(Ordering::Acquire) != self.start_gen
     }
 }
 

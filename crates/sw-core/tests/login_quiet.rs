@@ -1467,16 +1467,15 @@ fn attach_settles_attached_after_quiet_revokes_probe() {
             result: stale.clone(),
             after_rx_seq: None,
         });
+        // OD-35（2026-10-28）：P5 F15 的 Ready 子案期望「READY＋confirm_ready 清 quiet」被已核准 SC-30 取代（非削弱）——
+        // 會擋 probe 的 quiet arm 當下即取消 run 並收斂 ATTACHED＋PROMPT_UNAVAILABLE；banner 之前已取得、但
+        // 尚未套用的 Ready 不得推 READY、不得解除 #162 gate。兩個子案現皆落 ATTACHED、quiet 計時中。
         let s = h.public();
-        if stale == LoginOutcome::Ready {
-            assert_eq!(pget(&s, "state"), PyValue::from("READY"), "{stale:?}");
-            assert_eq!(pget(&s, "boot_quiet_remaining_s"), PyValue::Null);
-        } else {
-            assert_eq!(pget(&s, "state"), PyValue::from("ATTACHED"), "{stale:?}");
-            assert_eq!(pget(&s, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
-            assert_eq!(pget(&s, "last_error_detail"), PyValue::Null);
-            assert!(pget(&s, "boot_quiet_remaining_s") != PyValue::Null);
-        }
+        assert_eq!(pget(&s, "state"), PyValue::from("ATTACHED"), "{stale:?}");
+        assert_eq!(pget(&s, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+        assert_eq!(pget(&s, "last_error_detail"), PyValue::Null);
+        assert!(pget(&s, "boot_quiet_remaining_s") != PyValue::Null);
+        assert_eq!(pget(&s, "ready_reconfirm_pending"), PyValue::Bool(true), "{stale:?}");
     }
 }
 

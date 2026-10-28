@@ -236,8 +236,10 @@ fn quiet_arm_during_auto_reprobe_settles_and_resumes() {
 
 #[test]
 fn quiet_arm_during_auto_reprobe_ready_result_is_ready() {
-    // 審查 92e0223_76de0cf d5b2dd6-1：Python `_probe_existing_bridge` 只依 probe 實際結果收斂；probe 期間 banner 才 arm、
-    // FSM 仍回 ok → READY＋confirm_ready（#139）。
+    // 審查 92e0223_76de0cf d5b2dd6-1 的原期望（Python `_probe_existing_bridge` 只依 probe 實際結果收斂；probe 期間 banner
+    // 才 arm、FSM 仍回 ok → READY＋confirm_ready，#139）依 OD-35（2026-10-28）被已核准 SC-30 取代（非削弱）：
+    // arm 當下即取消自動重探並以 quiet 拒絕收斂（記 attempt、#162 pending 保留），之後抵達的舊世代 Ready 被丟棄。
+    // nodeid 已入 L1 鎖，名稱為歷史名稱。
     let mut h = CoreHarness::new(PRPL_PROFILE);
     h.to_attached(Some("PROMPT_UNAVAILABLE"));
     let fx = advance_collect(&mut h, 4);
@@ -251,14 +253,16 @@ fn quiet_arm_during_auto_reprobe_ready_result_is_ready() {
         after_rx_seq: None,
     });
     let p = h.public();
-    assert_eq!(p["state"], PyValue::from("READY"));
-    assert_eq!(p["last_error"], PyValue::Null);
-    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(false));
-    assert_eq!(p["reprobe_attempts"], PyValue::from(0));
+    assert_eq!(p["state"], PyValue::from("ATTACHED"));
+    assert_eq!(p["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(true), "不得解除 #162 gate");
+    assert_eq!(p["reprobe_attempts"], PyValue::from(1));
 }
 
 #[test]
 fn quiet_arm_during_auto_reprobe_not_ready_keeps_failure_code() {
+    // OD-35（SC-30）：原期望「舊世代 NotReady 的失敗碼照套用」被取代——arm 當下已以 quiet 拒絕收斂
+    // （`PROMPT_UNAVAILABLE`、attempt 記一次），之後抵達的舊世代結果被丟棄、不再記第二次 attempt。名稱為歷史名稱。
     let mut h = CoreHarness::new(PRPL_PROFILE);
     h.to_attached(Some("PROMPT_UNAVAILABLE"));
     let fx = advance_collect(&mut h, 4);
@@ -272,7 +276,7 @@ fn quiet_arm_during_auto_reprobe_not_ready_keeps_failure_code() {
     });
     let p = h.public();
     assert_eq!(p["state"], PyValue::from("ATTACHED"));
-    assert_eq!(p["last_error"], PyValue::from("READY_NONCE_TIMEOUT"));
+    assert_eq!(p["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
     assert_eq!(p["reprobe_attempts"], PyValue::from(1));
 }
 

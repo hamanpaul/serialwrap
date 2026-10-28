@@ -2855,14 +2855,60 @@ impl SessionCore {
             }
             f.owner_gen = self.generations.owner_gen;
         });
-        let _ = now;
-        vec![Effect::Schedule {
+        let mut effects = vec![Effect::Schedule {
             at: until,
             ev: TimerEvent::BootQuietExpired {
                 epoch,
                 fsm_gen: self.generations.fsm_gen,
             },
-        }]
+        }];
+        if blocks_probe {
+            effects.extend(self.sc30_cancel_login_run(now));
+        }
+        effects
+    }
+
+    /// SC-30（OD-35，2026-10-28 擁有者裁決維持）：會擋 probe 的 quiet arm 當下，立即中止進行中的自動 login／probe／
+    /// READY 再確認／reboot recovery run，並於同一事件內收斂——banner 之前 run 已取得但尚未套用的成功結果一律
+    /// 不得推 READY、不得解除 #162 agent gate（之後抵達的 `LoginFinished` 因 run 已移除而被丟棄）：
+    /// attach／既有 bridge 再探且非 READY → ATTACHED＋`PROMPT_UNAVAILABLE`（detail 為 None，同 quiet 擋 probe 的
+    /// 入口）；READY → 不變；自動重探 → 以 quiet 拒絕收斂（記 attempt、pending 保留）；reboot recovery → 回等待迴圈。
+    /// 取消經 `RxShared::cancel_login_runs`（run 端 `RunCancel` 立即轉真）；在途 TX 由 fence 世代（arm 已推進）擋下。
+    /// console unlock（`blocks_probe` 為假）不呼叫本函式。Python 基線不取消（P5 F15 期望已依 OD-35 改為本行為）。
+    fn sc30_cancel_login_run(&mut self, now: Mono) -> Vec<Effect> {
+        use crate::login_fsm::{LoginAbort, LoginOutcome};
+        let Some(epoch) = self.generations.conn_epoch else {
+            return Vec::new();
+        };
+        let Some((kind, run_gen)) = self
+            .login_run
+            .as_ref()
+            .filter(|run| run.epoch == epoch)
+            .map(|run| (run.kind, run.fsm_gen))
+        else {
+            return Vec::new();
+        };
+        self.deps.rx.cancel_login_runs();
+        let refused = LoginOutcome::Aborted(LoginAbort::Refused(FenceReject::Quiet));
+        match kind {
+            LoginRunKind::AutoReprobe => self.auto_reprobe_finished(epoch, run_gen, refused, now),
+            LoginRunKind::RebootRecovery => self.reboot_login_finished(epoch, refused, now),
+            LoginRunKind::Attach | LoginRunKind::Reprobe => {
+                let run = self.login_run.take().expect("已確認 login run 存在");
+                if run.kind == LoginRunKind::Attach && self.state == SessionState::Attaching {
+                    self.adopt_bridge(now);
+                }
+                if self.state != SessionState::Ready {
+                    self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
+                    self.set_state(SessionState::Attached, now);
+                }
+                let mut effects = Vec::new();
+                for (waiter, waiter_kind) in run.waiters {
+                    effects.extend(self.reprobe_reply(waiter, waiter_kind, now));
+                }
+                effects
+            }
+        }
     }
 
     /// reboot 命令 TX 結算（parity-amendments-2026-10-26 #55；`_handle_reboot_command`）：
