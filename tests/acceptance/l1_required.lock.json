@@ -11,6 +11,7 @@
           "cargo:sw-core::capture_p7::log_path_uses_local_time",
           "cargo:sw-core::capture_p7::log_responses_match_python_golden_bytes",
           "cargo:sw-core::capture_p7::log_start_already_active",
+          "cargo:sw-core::capture_p7::log_status_counts_single_snapshot_under_concurrent_rx",
           "cargo:sw-core::capture_p7::log_status_inactive_and_active",
           "cargo:sw-core::capture_p7::log_stop_without_capture",
           "cargo:sw-core::capture_p7::no_drop_under_burst",

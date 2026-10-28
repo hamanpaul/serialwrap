@@ -412,3 +412,44 @@ fn log_open_failed_detail_is_python_oserror_str() {
     };
     assert_eq!(r["detail"], PyValue::from(expected));
 }
+
+#[test]
+fn log_status_counts_single_snapshot_under_concurrent_rx() {
+    // 審查 71fe017_27b5bf4 P7-27b5bf4-1：Python `log_status` 與 `_on_bridge_rx` 的計數更新共用 manager lock，
+    // 頂層與 `session.capture` 計數必然一致。Rust 以 test-fakes hook 在第一次取樣後注入第二筆 RX
+    // （模擬 reader 在兩次取樣之間更新），兩處仍須相同。
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let mut h = CoreHarness::new(&log_profile(&dir));
+    let clock: Arc<dyn Clock> = sw_pal::fakes::clock::FakeClock::new();
+    h.core.set_capture_env(CaptureEnv {
+        clock: Some(clock),
+        ..CaptureEnv::default()
+    });
+    h.to_ready();
+    let start = h.rpc(SessionRequest::LogStart).expect("log_start");
+    assert_eq!(start["ok"], PyValue::Bool(true), "{start:?}");
+    let obs = h.core.capture_observer_for_test();
+    obs.write_rx(b"a\n");
+    let injected = Arc::new(AtomicBool::new(false));
+    {
+        let (obs2, injected) = (obs.clone(), injected.clone());
+        obs.set_counts_hook(Some(Box::new(move || {
+            if !injected.swap(true, Ordering::SeqCst) {
+                obs2.write_rx(b"b\n");
+            }
+        })));
+    }
+    let r = h.rpc(SessionRequest::LogStatus).expect("log_status");
+    obs.set_counts_hook(None);
+    assert!(injected.load(Ordering::SeqCst), "hook 須觸發（取樣之間注入 RX）");
+    let top = (r["line_count"].clone(), r["byte_count"].clone());
+    let nested = match &r["session"] {
+        PyValue::Dict(s) => match &s["capture"] {
+            PyValue::Dict(c) => (c["line_count"].clone(), c["byte_count"].clone()),
+            other => panic!("session.capture：{other:?}"),
+        },
+        other => panic!("session：{other:?}"),
+    };
+    assert_eq!(top, nested, "同一回應的頂層與 session.capture 計數須來自同一快照");
+}

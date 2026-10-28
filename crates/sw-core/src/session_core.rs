@@ -751,6 +751,27 @@ impl SessionCore {
         effects
     }
 
+    /// `to_public_dict()` 的 capture 子 dict。計數由 reader 端 `CaptureObserver` 即時累加（Python `_on_bridge_rx` 寫
+    /// `active_capture.line_count`；審查 a0cad06_4221ba2 397a473-1）；`counts` 給定時沿用呼叫端已取的同一快照
+    /// （`log_status` 頂層與巢狀一致，審查 71fe017_27b5bf4 P7-27b5bf4-1）。
+    fn capture_value(&self, counts: Option<(u64, u64)>) -> PyValue {
+        let Some(cap) = &self.log_capture else {
+            return PyValue::Null;
+        };
+        let (line_count, byte_count) = counts.unwrap_or_else(|| {
+            self.capture_observer
+                .counts(&cap.capture_id)
+                .unwrap_or((cap.line_count, cap.byte_count))
+        });
+        let mut d = PyDict::new();
+        d.insert("capture_id", PyValue::from(cap.capture_id.clone()));
+        d.insert("log_path", PyValue::from(cap.log_path.clone()));
+        d.insert("status", PyValue::from(cap.status));
+        d.insert("line_count", py_int(line_count as i128));
+        d.insert("byte_count", py_int(byte_count as i128));
+        PyValue::Dict(d)
+    }
+
     /// 02 §6.1 欄位順序的 `SessionPublic`＋SC-04 兩欄。
     pub fn public(&self, now: Mono, ctx: &PublicCtx) -> PyDict {
         let (rx_bytes, rx_rate) = if self.generations.conn_epoch.is_some() {
@@ -892,27 +913,7 @@ impl SessionCore {
             "released_reason",
             self.released_reason.clone(),
         );
-        out.insert(
-            "capture",
-            match &self.log_capture {
-                Some(cap) => {
-                    // 計數由 reader 端 `CaptureObserver` 即時累加（Python `_on_bridge_rx` 寫
-                    // `active_capture.line_count`）；審查 a0cad06_4221ba2 397a473-1。
-                    let (line_count, byte_count) = self
-                        .capture_observer
-                        .counts(&cap.capture_id)
-                        .unwrap_or((cap.line_count, cap.byte_count));
-                    let mut d = PyDict::new();
-                    d.insert("capture_id", PyValue::from(cap.capture_id.clone()));
-                    d.insert("log_path", PyValue::from(cap.log_path.clone()));
-                    d.insert("status", PyValue::from(cap.status));
-                    d.insert("line_count", py_int(line_count as i128));
-                    d.insert("byte_count", py_int(byte_count as i128));
-                    PyValue::Dict(d)
-                }
-                None => PyValue::Null,
-            },
-        );
+        out.insert("capture", self.capture_value(None));
         out.insert("drain_stalled", PyValue::from(self.drain_stalled));
         out.insert(
             "drain_timeout_epoch",
@@ -960,6 +961,12 @@ impl SessionCore {
     #[cfg(feature = "test-fakes")]
     pub fn set_last_error_for_test(&mut self, error: Option<&str>, detail: Option<&str>) {
         self.set_last_error(error.map(str::to_string), detail.map(str::to_string));
+    }
+
+    /// 只供測試（test-fakes）：reader 端 agent log 寫入者（注入 RX 寫入、取樣交錯）。
+    #[cfg(feature = "test-fakes")]
+    pub fn capture_observer_for_test(&self) -> Arc<crate::capture::CaptureObserver> {
+        self.capture_observer.clone()
     }
 
     /// 只供測試（test-fakes）：讀 boot quiet／Ready Reconfirm 狀態（`ready_reconfirm_attempts` 不在 public 投影）。
@@ -4436,7 +4443,10 @@ impl SessionCore {
             .capture_observer
             .counts(&cap.capture_id)
             .unwrap_or((0, 0));
-        crate::capture::log_status_reply(Some((cap, line_count, byte_count)), self.session_dict(now))
+        // 頂層與 session.capture 用同一快照（Python 兩者在同一把 manager lock 內讀取）。
+        let mut session = self.session_dict(now);
+        session.insert("capture", self.capture_value(Some((line_count, byte_count))));
+        crate::capture::log_status_reply(Some((cap, line_count, byte_count)), session)
     }
 
     // ---------------- OpFinished ----------------

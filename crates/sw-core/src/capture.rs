@@ -278,6 +278,10 @@ struct ActiveFile {
 pub struct CaptureObserver {
     active: Mutex<Option<ActiveFile>>,
     foreground_busy: AtomicBool,
+    /// 測試替身：每次 `counts()` 取樣後（已放鎖）呼叫一次，用來在取樣之間注入 RX（審查 71fe017_27b5bf4
+    /// P7-27b5bf4-1 的交錯）。
+    #[cfg(feature = "test-fakes")]
+    counts_hook: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 impl CaptureObserver {
@@ -285,7 +289,15 @@ impl CaptureObserver {
         Arc::new(CaptureObserver {
             active: Mutex::new(None),
             foreground_busy: AtomicBool::new(false),
+            #[cfg(feature = "test-fakes")]
+            counts_hook: Mutex::new(None),
         })
+    }
+
+    /// 測試替身：設定 `counts()` 取樣後的回呼（`None` 清除）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_counts_hook(&self, hook: Option<Box<dyn FnMut() + Send>>) {
+        *self.counts_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<ActiveFile>> {
@@ -319,10 +331,20 @@ impl CaptureObserver {
 
     /// 目前計數（`log_status`）。
     pub fn counts(&self, capture_id: &str) -> Option<(u64, u64)> {
-        self.lock()
+        let counts = self
+            .lock()
             .as_ref()
             .filter(|a| a.capture_id == capture_id)
-            .map(|a| a.stats.snapshot())
+            .map(|a| a.stats.snapshot());
+        #[cfg(feature = "test-fakes")]
+        {
+            let hook = self.counts_hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut hook) = hook {
+                hook();
+                *self.counts_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+            }
+        }
+        counts
     }
 
     /// 一個 RX chunk：`clean_text(data.decode("utf-8", errors="replace"))` 非空且非前景時寫入（文字模式換行）；

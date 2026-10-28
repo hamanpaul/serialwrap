@@ -207,3 +207,11 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | P7-71fe017-2 | High | merge #234 後 `boot_done_regex` 未接上 quiet 判定 | 已於 7e2da7a 修正（報告範圍止於 71fe017）：`QuietState::on_rx_text` 三者同列判定、golden quiet_rx 014～020、actor 層 `boot_done_regex_clears_quiet_but_keeps_reconfirm_pending` |
 | P7-71fe017-3 | High | merge #237 後 Rust 命令結果未剝除折行回顯（`op_runner.rs:146`） | **屬實；BLOCKED-UPSTREAM P7-BU-8（P5）**：命令輸出擷取屬 Slice 2.1、`op_runner.rs` 為 P5 擁有檔案（P7 自身 commit 從未修改，只經 merge 帶入），本分支依指示不改 P5 檔案。建議修法（交 P5）：移植 `session_manager.py:250` `_strip_wrapped_command_echo`（在清除折行標記前以「累加行前綴＝command」辨識回顯），並移植 `tests/test_wrapped_echo_strip.py` 的折行與保留正常輸出案例為 sw-core 回歸 |
 | P7-71fe017-4 | Medium | 合併的 proc_scan 保守判準使 health `holders_status` 對消失的 tty 由 `ok` 變 `unknown` | **屬實（merge 9d21ef7 引入）；BLOCKED-UPSTREAM P7-BU-9（P5／主線）**：兩條呼叫路徑（P5 `sw-daemon/src/health.rs`、主線 `sw-cli/src/rollback.rs`）皆非 P7 檔案，sw-pal 端無法依路徑區分兩種語意。建議修法（交 P5）：`health.rs` 迴圈先以 `std::fs::metadata` 濾掉取不到身分的 tty（全被濾掉時改以 `&[]` 呼叫，保留 fd 目錄的 permission／unknown 判定），即與 Python `detect_multi_open`（`tty_stat` 為 None 略過）一致；rollback 維持保守判定。P7 不改 health.rs |
+
+### p7-cloud/71fe017_27b5bf4（Codex sol，incr）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-71fe017-1（第 2 輪） | Medium | 溢位分支仍關閉管線 | 已於 030d294 修正（報告範圍止於 27b5bf4） |
+| P7-71fe017-3／-4（第 2 輪） | High／Medium | 未修 | 維持 BLOCKED-UPSTREAM P7-BU-8／BU-9：本輪排程指示明定 P7 不修改 P5 擁有的檔案（`op_runner.rs`、`health.rs`），須編排者／擁有者裁決改由 P5 承接，或授權 P7 逐檔修改；建議修法已附於第 10 輪表 |
+| P7-27b5bf4-1 | High | `log_status` 頂層與 `session.capture` 分兩次取樣，reader 在其間更新會不一致 | **fixed（屬實）**：抽出 `capture_value(counts)`，`log_status` 取一次快照供頂層與巢狀共用；回歸 `capture_p7::log_status_counts_single_snapshot_under_concurrent_rx`（test-fakes `CaptureObserver::set_counts_hook` 於第一次取樣後注入 RX；修前 `(1,2)` vs `(2,4)` 紅） |
