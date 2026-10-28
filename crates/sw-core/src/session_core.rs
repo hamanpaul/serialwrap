@@ -2583,6 +2583,15 @@ impl SessionCore {
         result: crate::login_fsm::LoginOutcome,
         now: Mono,
     ) -> Vec<Effect> {
+        // 任何種類分派與例外處理之前，統一核對事件 `(epoch, fsm_gen)` 與現行 run 完全相符：SC-30 取消後
+        // 新 run 可能已以新世代起跑，舊 run 的完成事件須丟棄（審查 27b5bf4_030d294 P7-030d294-1）。
+        if !self
+            .login_run
+            .as_ref()
+            .is_some_and(|run| run.epoch == epoch && run.fsm_gen == fsm_gen)
+        {
+            return Vec::new();
+        }
         if self
             .login_run
             .as_ref()

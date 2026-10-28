@@ -238,3 +238,60 @@ fn attach_state_result_mapping() {
     // `if not tail: None`），此處只鎖「頂層與 session 快照同值」。
     assert_eq!(r["last_error_detail"], s["last_error_detail"]);
 }
+
+#[test]
+fn stale_reboot_recovery_result_after_sc30_does_not_hijack_new_run() {
+    // 審查 27b5bf4_030d294 P7-030d294-1：取消 run A（g1）後 quiet 解除、run B（g2）起跑，A 的舊 Ready 才抵達——
+    // 須丟棄：維持 RECOVERING、run B 保留，只有 B 的結果能推 READY。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let started = h.start_foreground_command("reboot");
+    let epoch = h.epoch();
+    h.feed(ControlEvent::UartTxCompleted {
+        epoch,
+        op_id: started.op_id,
+        confirmed_bytes: 7,
+        unknown: false,
+    });
+    h.feed(ControlEvent::OpFinished {
+        op_id: started.op_id,
+        epoch,
+        outcome: OpOutcome::RebootExpected,
+        after_rx_seq: None,
+    });
+    h.rx(b"\r\nroot@t:/# ");
+    let fx = advance_collect(&mut h, 2);
+    let (epoch, g1) = start_login(&fx).expect("run A");
+    h.rx(BANNER);
+    h.rx(b"\r\nroot@t:/# ");
+    let fx = advance_collect(&mut h, 3);
+    let (_, g2) = start_login(&fx).expect("run B");
+    assert!(g2 > g1);
+    assert!(finish(&mut h, epoch, g1, LoginOutcome::Ready).is_empty(), "A 的舊結果須丟棄");
+    assert_eq!(h.core.state(), SessionState::Recovering);
+    finish(&mut h, epoch, g2, LoginOutcome::Ready);
+    assert_eq!(h.core.state(), SessionState::Ready, "B 的結果照常套用");
+}
+
+#[test]
+fn stale_manual_reprobe_result_after_sc30_does_not_answer_new_waiter() {
+    // 同上，手動再探：A（g1）被 banner 取消並回覆；quiet 解除後第二個 SessionAttach 起 B（g2）；A 的舊 Ready 抵達
+    // 不得回覆 B 的等待者、不得推 READY。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (first, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let (epoch, g1) = start_login(&fx).expect("run A");
+    h.rx(BANNER);
+    assert!(first.try_recv().is_ok(), "A 的等待者於 arm 時回覆");
+    h.rx(b"\r\nroot@t:/# ");
+    assert_eq!(h.public()["boot_quiet_remaining_s"], PyValue::Null, "prompt 解除 quiet");
+    let (second, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let (_, g2) = start_login(&fx).expect("run B");
+    assert!(g2 > g1);
+    assert!(finish(&mut h, epoch, g1, LoginOutcome::Ready).is_empty(), "A 的舊結果須丟棄");
+    assert!(second.try_recv().is_err(), "B 的等待者不得收到 A 的結果");
+    assert_eq!(h.core.state(), SessionState::Attached);
+    finish(&mut h, epoch, g2, LoginOutcome::Ready);
+    assert_eq!(second.try_recv().expect("B 回覆").expect("ok")["ok"], PyValue::Bool(true));
+    assert_eq!(h.core.state(), SessionState::Ready);
+}

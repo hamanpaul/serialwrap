@@ -232,3 +232,10 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | `session_rpc_p7::attach_resets_credentials_warned`（#140） | 新增；WAL META `credentials_unresolved` 1→2（回歸鎖） |
 | `session_core_login::attach_state_result_mapping` | 新增；**揭露並修正兩處偏離**：bridge 存在時 SessionAttach 的 FLASHING 回應多 `selector`、reboot recovery 中的 RECOVERING 回應多 drain 欄位——Python `attach_session` 兩者皆走 `_attach_state_result`（鍵 `ok, error_code, session`，CPython 3.12 實測；Python 側 `tests/test_p7_attach_parity.py`，新 L1 集合 `p7_gate:py_parity_attach`）。`device.attach` 等非 SessionAttach 路徑不變。last_error None 子案依賴 human lease（P6，P7-BU-3） |
 | `attach_human_lease_branch_last_error_field` | 仍 BLOCKED-UPSTREAM（P6 human lease） |
+
+### p7-cloud/27b5bf4_030d294、030d294_2e15878（Codex sol，incr）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-030d294-1 | High | SC-30 取消後舊 run 的完成事件被新 run（同 epoch、新 fsm_gen）的種類分派接受：reboot recovery 推 READY、手動再探回覆新等待者 | **fixed（屬實）**：`login_finished` 入口於任何分派前統一核對 `(epoch, fsm_gen)` 與現行 run 完全相符。回歸 `session_core_login::stale_reboot_recovery_result_after_sc30_does_not_hijack_new_run`、`stale_manual_reprobe_result_after_sc30_does_not_answer_new_waiter`（取消 A → 起 B → 注入 A；修前皆紅） |
+| 030d294_2e15878 | — | NO FINDINGS | — |

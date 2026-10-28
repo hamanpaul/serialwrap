@@ -170,6 +170,8 @@
           "cargo:sw-core::session_core_login::ready_reconfirm_probe_banner_keeps_ready_and_gate_sc30",
           "cargo:sw-core::session_core_login::reboot_recovery_banner_returns_to_wait_loop_sc30",
           "cargo:sw-core::session_core_login::rx_cancel_login_runs_wakes_waiter_and_spares_later_runs",
+          "cargo:sw-core::session_core_login::stale_manual_reprobe_result_after_sc30_does_not_answer_new_waiter",
+          "cargo:sw-core::session_core_login::stale_reboot_recovery_result_after_sc30_does_not_hijack_new_run",
           "cargo:sw-core::session_core_login_exc_p7::attach_wal_unhealthy_refusal_detaches_wal_unavailable_error",
           "cargo:sw-core::session_core_login_exc_p7::auto_reprobe_tx_incomplete_records_reprobe_failed",
           "cargo:sw-core::session_core_login_exc_p7::manual_recover_reprobe_raised_is_rpc_exception",
