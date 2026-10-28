@@ -46,6 +46,22 @@ def test_normal_suspend_loses_no_keystroke(console_daemon) -> None:
             if r["source"] == human_src:
                 for lo, hi in spans:
                     assert not (lo < r["seq"] < hi), (r, lo, hi)
+        # 審查 3317987_d6e3b3c-opus Medium（c6578a2 #1）：每個 agent 命令只有一筆 TX，上面的開區間恆為空；
+        # 另以「命令完成」為界：第 n 輪命令 TX 之後第一筆含 prompt（`#`）的 RX 為 s_done[n]，第 n 個 human TX 必須晚於它
+        # （命令期間的按鍵 defer 到命令結束後才回放；直接送出時 human seq 會落在 s_done 之前）。
+        allrecs = sorted((r for r in d.wal_records() if r["dir"] in ("TX", "RX")), key=lambda r: r["seq"])
+        done: list[int] = []
+        for cid in cmd_ids:
+            s_cmd = min(r["seq"] for r in allrecs if r["dir"] == "TX" and r.get("cmd_id") == cid)
+            s_done = next(
+                (r["seq"] for r in allrecs if r["dir"] == "RX" and r["seq"] > s_cmd and b"#" in b64_payload(r)), None
+            )
+            assert s_done is not None, f"命令 {cid} 之後找不到 prompt RX"
+            done.append(s_done)
+        human_seqs = [r["seq"] for r in recs if r["source"] == human_src]
+        assert len(human_seqs) == len(done), (human_seqs, done)
+        for n, (h_seq, s_done) in enumerate(zip(human_seqs, done)):
+            assert h_seq > s_done, f"第 {n} 個按鍵（seq {h_seq}）早於第 {n} 輪命令完成（prompt RX seq {s_done}）"
     finally:
         os.close(fd1)
 

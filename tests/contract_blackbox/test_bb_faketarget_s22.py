@@ -94,3 +94,20 @@ def test_hold_reply_pauses_until_released(make_target, tmp_path):
         rd.wait_for(b"echo H\r\nH\r\n" + PROMPT_B, start=mark, timeout=2.0)
     finally:
         rd.close()
+
+
+def test_hold_reply_release_keeps_pending_pause(make_target, tmp_path):
+    """審查 3317987_d6e3b3c-opus Low（c6578a2 #3）：`hold_reply(False)` 不得取消尚未到期的 `pause_responding`。"""
+    ft = make_target()
+    rd = _open_reader(ft, tmp_path)
+    try:
+        mark = _login_default(rd)
+        ft.pause_responding(1.5)
+        ft.hold_reply(True)
+        os.write(rd.fd, b"echo P\r")
+        ft.hold_reply(False)  # pause 仍在期限內
+        _drain(rd, 0.8)
+        assert bytes(rd.buf[mark:]) == b"", "pause_responding 期限內仍不回應"
+        rd.wait_for(b"echo P\r\nP\r\n" + PROMPT_B, start=mark, timeout=3.0)
+    finally:
+        rd.close()

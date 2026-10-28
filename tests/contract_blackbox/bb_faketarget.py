@@ -83,6 +83,7 @@ class FakeTarget:
         self._seq = 0
         self._tail_due = 0.0  # 最後一筆回應的排程時刻（維持 FIFO 與命令序列化）
         self._pause_until = 0.0
+        self._hold = False  # hold_reply(True)；與 pause_responding 的期限各自獨立、可疊加
         self._noise_count = 0
         self._wake_r: int | None = None
         self._wake_w: int | None = None
@@ -124,6 +125,7 @@ class FakeTarget:
             self._sched.clear()
             self._tail_due = 0.0
             self._pause_until = 0.0
+            self._hold = False
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
@@ -173,9 +175,12 @@ class FakeTarget:
         self._wake()
 
     def hold_reply(self, on: bool) -> None:
-        """True：暫停所有回應直到以 False 解除（輸入照常讀取與記錄）；False：解除並送出累積的回應。"""
+        """True：暫停所有回應直到以 False 解除（輸入照常讀取與記錄）；False：解除並送出累積的回應。
+
+        與 `pause_responding(seconds)` 可疊加：兩者以獨立旗標／期限判定（任一生效即暫停），
+        `hold_reply(False)` 不會取消尚未到期的 `pause_responding`（審查 3317987_d6e3b3c-opus Low）。"""
         with self._sched_lock:
-            self._pause_until = float("inf") if on else 0.0
+            self._hold = bool(on)
         self._wake()
 
     def rx_log(self, timeout_s: float = 1.0) -> bytes:
@@ -253,11 +258,13 @@ class FakeTarget:
         """取出已到期的項目；回傳 (待送資料, 距下一筆到期的秒數或 None)。"""
         out: list[bytes] = []
         with self._sched_lock:
-            paused = now < self._pause_until
+            paused = self._hold or now < self._pause_until
             if not paused:
                 while self._sched and self._sched[0][0] <= now:
                     out.append(heapq.heappop(self._sched)[2])
-            if paused:
+            if self._hold:
+                nxt = None  # 等 hold_reply(False) 的 wake
+            elif paused:
                 nxt = self._pause_until - now
             elif self._sched:
                 nxt = max(0.0, self._sched[0][0] - now)

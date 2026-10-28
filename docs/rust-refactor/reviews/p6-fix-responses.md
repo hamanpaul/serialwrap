@@ -311,3 +311,18 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 |---|---|
 | OD-34 | `cowork-01-agent-bad-cmd` 的 `daemon_slice` 2.2→2.3（`cross_slice_reason` 引用 OD-34），`cases.yaml` revision 2026-10-28.1；`regen_lock.py --add-only --authorize-deferral cowork-01-agent-bad-cmd:OD-34` 逐名授權（新選項，回歸 `tests/test_acceptance_cases.py::test_regen_lock_authorized_deferral_is_per_name`：未授權拒絕、其他屬性改動拒絕、過期授權拒絕、非 OD 依據 exit 2）；slice_2.2 分母 95→94、slice_2.3／2.4 保留；`breaker/slice_2.2.json` 移除該案並重算 `denominator_sha256`，另記 `amendments`（OD-34）；`slice22_evidence_map.yaml` 移除該鍵、`slice21_scope.yaml` cross_slice func-test 改列 2.3；`test_contracts_slice22.py` 改斷言該案不在 2.2、在 2.3。07 計畫 Task 11 Step 4 的 func-test 迴圈文字屬 `docs/parity-amendments`，請計畫擁有者同步移出 |
 | OD-37 | Rust 實測已回 `INTERACTIVE_NOT_FOUND`＋零 TX（release Phase 1 移除 lease 與 LeaseIndex，manager 路由查無）；新增 `rpc_console::od37_send_with_pre_release_id_after_reattach_not_found_zero_tx`（agent lease 與 human console lease 兩案）鎖住，登記時即為綠燈（行為先前已存在，無產品碼變更），以 `--l1-add-only` 登記。登記 DF-20（`contracts/behavior_changes.yaml` revision 6，`scope: rust_only`；validator 規定 DF 的 approval 為 spec-reconciliation，以 `decision_ref: OD-37`、`related_decisions` 引用裁決）與 case `df20-release-reattach-stale-interactive-id`（`necessity: conditional`，不改變 slice_2.2 凍結分母；L1 證據由 s22_gate:cargo_workspace 執行）。DF 編號 20 為各分支未用的下一號；主線登錄 OD-34～44 若另配號，請以主線為準並告知 P6 |
+
+### 3317987..d6e3b3c（`3317987_d6e3b3c-opus.md`）
+
+| # | 等級 | Commit | 位置 | 處理 |
+|---|---|---|---|---|
+| O1 | High | dc8a67a | `s22_gate_check.py:110-134` unchecked 判 PASS | fixed：非 nodeid 參照須 `--l15-results` 恰一列 passed、exit 0，否則 INSUFFICIENT（failed → FAIL）；回歸 `test_unchecked_only_case_is_insufficient`（紅燈：舊腳本不認新參數） |
+| O2 | Medium | dc8a67a | 無固定必要集合／map 覆蓋 | fixed：`REQUIRED_SECTIONS` 五集合（平台依計畫）；`--cases-lock` 比對 `slice_2.2`；回歸 `test_missing_required_sets_insufficient`、`test_map_must_cover_frozen_slice22`。fixture 補 `s22_gate:py_parity` 報告（補強，非削弱） |
+| O3 | Medium | dc8a67a | 增補 #180／#187 未實作 | fixed：`--prereqs-script`（預設 `check_p6_prereqs.py`，`--strict`）非 0 → INSUFFICIENT；`--parity-doc` 解析 §1 第 5 欄、§2 第 3 欄、§3 P6 小節的承接編號（現行文件 23 列），狀態取對照表 `parity_rows`；回歸 `test_prereqs_strict_failure_insufficient`、`test_parity_rows_listed_and_pending_not_pass` |
+| O4 | Medium | c6578a2 | `test_console_bc02.py:39-49` 開區間恆空 | fixed：另以「第 n 輪命令 TX 之後第一筆含 `#` 的 RX」為 s_done，斷言第 n 個 human TX seq > s_done（原斷言保留）；Python 1/1、Rust slice22 46/46 |
+| O-L1 | Low | c6578a2 | `test_open_rejections_zero_tx` 未依計畫用 `unready_daemon`＋`hold_reply` | 已知偏離（登記）：`session recover --force` 不對外暴露 RECOVERING 視窗，改用 `console_daemon`＋agent `reboot` 進恢復窗；請計畫擁有者同步 07 L2424 |
+| O-L2 | Low | c6578a2 | `hold_reply(False)` 取消 `pause_responding` | fixed：獨立 `_hold` 旗標；回歸 `test_hold_reply_release_keeps_pending_pause`（修正前 FAIL） |
+| O-L3 | Low | a6a6850 | listener bind 失敗只 WARNING、bridge 照開 | 已知偏差（記錄不修）：Python `start()` 會失敗；Rust 維持 UART 可用、`console_endpoint` 為 null（127.0.0.1:0 實務上不失敗），待擁有者決定 |
+| O-L4 | Low | a6a6850 | `StopListener` try_send 滿載 | 已知偏差（同 R5-L5）：hub cmd 佇列滿時舊 port 至下一次 AdoptListener 前仍可連入；core 的 close 世代（本輪 S3）使此類晚到 accept 不會登記為 console |
+| O-L5 | Low | 159fc6d | 缺兩個反證測試 | fixed（同 O1／O2） |
+| O-L6 | Low | dc8a67a | 任一平台 passed 即通過 | deferred：條目 `platforms:` 欄位待 Task 12 Windows 報告一併設計（目前 Windows 只有 win_test 一個集合） |
