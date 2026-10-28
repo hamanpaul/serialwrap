@@ -149,11 +149,14 @@ struct Shared {
     idle: Condvar,
     spawner: Arc<dyn HandlerSpawner>,
     counters: Arc<CounterStore>,
-    emit: Arc<dyn Fn(PyDict) + Send + Sync>,
+    emit: FallibleEmit,
     env: Arc<dyn SysEnv>,
     clock: Arc<dyn Clock>,
     max: usize,
 }
+
+/// 可回報失敗的 emit（Python `event_emit=self._log.write`：寫檔例外穿出 `_emit`）。`Err` 內容僅供診斷。
+pub type FallibleEmit = Arc<dyn Fn(PyDict) -> Result<(), String> + Send + Sync>;
 
 struct Job {
     fire: MatcherFire,
@@ -185,10 +188,17 @@ impl Shared {
         }
     }
 
+    /// Python `_run_handler` 的 `try/finally`：名額以 RAII 釋放；`run_inner` panic（Python 例外由 executor 吞掉）
+    /// 時同樣釋放並由 worker 迴圈 `catch_unwind` 收斂，worker 存活（審查 sol-backfill p7-20261028 #1）。
     fn run_handler(&self, fire: MatcherFire, line: String) {
-        let rule_id = fire.rule.rule_id.clone();
+        struct Release<'a>(&'a Shared, String);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.release(&self.1);
+            }
+        }
+        let _release = Release(self, fire.rule.rule_id.clone());
         self.run_inner(&fire, &line);
-        self.release(&rule_id);
     }
 
     fn run_inner(&self, fire: &MatcherFire, line: &str) {
@@ -233,19 +243,24 @@ impl Shared {
         let wal_seq = PyValue::Int(PyInt::Small(i128::from(fire.wal_seq)));
         match outcome {
             HandlerOutcome::SpawnFailed(e) => {
-                // Popen 的 ValueError（嵌入 NUL）不屬 `except OSError`：穿出、不 emit、不更新 counter。
+                // 非 OSError 例外穿出 try、不 emit、不更新 counter：Popen 的 ValueError（嵌入 NUL）與
+                // `communicate` 期限溢位的 OverflowError（`sw_pal::process::py_communicate_timeout_overflows`）。
                 if e.os_code.is_none()
                     && e.winerror.is_none()
                     && e.kind == PalErrorKind::InvalidInput
                 {
                     return;
                 }
-                (self.emit)(event(vec![
+                if (self.emit)(event(vec![
                     ("type", PyValue::from("fire_failed")),
                     ("rule_id", PyValue::from(rule.rule_id.as_str())),
                     ("selector", PyValue::from(fire.selector.as_str())),
                     ("reason", PyValue::from(e.py_message.as_str())),
-                ]));
+                ]))
+                .is_err()
+                {
+                    return;
+                }
             }
             HandlerOutcome::Completed {
                 exit_code,
@@ -256,7 +271,7 @@ impl Shared {
                     let cut = b.len().saturating_sub(STDIO_TAIL_BYTES);
                     PyValue::from(decode_utf8_replace(&b[cut..]))
                 };
-                (self.emit)(event(vec![
+                if (self.emit)(event(vec![
                     ("type", PyValue::from("fire_completed")),
                     ("rule_id", PyValue::from(rule.rule_id.as_str())),
                     ("selector", PyValue::from(fire.selector.as_str())),
@@ -269,19 +284,29 @@ impl Shared {
                     ("stderr_tail", tail(&stderr_tail)),
                     ("fire_count", PyValue::Int(new_fires.clone())),
                     ("wal_seq", wal_seq),
-                ]));
+                ]))
+                .is_err()
+                {
+                    return;
+                }
             }
             HandlerOutcome::TimedOut => {
-                (self.emit)(event(vec![
+                if (self.emit)(event(vec![
                     ("type", PyValue::from("fire_timeout")),
                     ("rule_id", PyValue::from(rule.rule_id.as_str())),
                     ("selector", PyValue::from(fire.selector.as_str())),
                     ("duration_ms", duration()),
                     ("fire_count", PyValue::Int(new_fires.clone())),
                     ("wal_seq", wal_seq),
-                ]));
+                ]))
+                .is_err()
+                {
+                    return;
+                }
             }
         }
+        // 上面任一 emit 寫檔失敗即 return：Python `_emit` 例外穿出、跳過 `_post_fire_counter_update`，名額由
+        // RAII 釋放（審查 sol-backfill p7-20261028 #2）。
         self.post_fire_counter_update(&rule.rule_id, new_fires);
     }
 
@@ -302,6 +327,23 @@ impl Dispatcher {
         spawner: Arc<dyn HandlerSpawner>,
         counters: Arc<CounterStore>,
         emit: Arc<dyn Fn(PyDict) + Send + Sync>,
+        env: Arc<dyn SysEnv>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let emit: FallibleEmit = Arc::new(move |ev| {
+            emit(ev);
+            Ok(())
+        });
+        Self::start_fallible(per_daemon_max, spawner, counters, emit, env, clock)
+    }
+
+    /// 同 [`Dispatcher::start`]，但 emit 可回報寫檔失敗：完成類事件（fire_completed／fire_timeout／fire_failed）
+    /// 寫入失敗時不更新 counter（Python `_emit` 例外穿出 `_run_handler`）。凍結的 `start` 簽章不變。
+    pub fn start_fallible(
+        per_daemon_max: usize,
+        spawner: Arc<dyn HandlerSpawner>,
+        counters: Arc<CounterStore>,
+        emit: FallibleEmit,
         env: Arc<dyn SysEnv>,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -326,7 +368,12 @@ impl Dispatcher {
                 .spawn(move || loop {
                     let job = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     match job {
-                        Ok(job) => shared.run_handler(job.fire, job.line),
+                        Ok(job) => {
+                            let shared = &shared;
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                shared.run_handler(job.fire, job.line)
+                            }));
+                        }
                         Err(_) => break,
                     }
                 })
@@ -354,11 +401,11 @@ impl Dispatcher {
                 ])
             };
             if st.busy.contains(&rule_id) {
-                (self.shared.emit)(dropped("per_rule_busy"));
+                let _ = (self.shared.emit)(dropped("per_rule_busy"));
                 return;
             }
             if st.inflight >= self.shared.max {
-                (self.shared.emit)(dropped("per_daemon_saturated"));
+                let _ = (self.shared.emit)(dropped("per_daemon_saturated"));
                 return;
             }
             st.busy.insert(rule_id.clone());

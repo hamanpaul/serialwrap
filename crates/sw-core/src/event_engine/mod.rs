@@ -266,14 +266,14 @@ impl EventEngine {
             return Ok(());
         }
         let emit_log = Arc::clone(&self.core.log);
-        let emit: Arc<dyn Fn(PyDict) + Send + Sync> = Arc::new(move |ev| {
-            let _ = emit_log.write(ev);
-        });
+        // 寫檔失敗須回報給 dispatcher：完成事件寫不出時不推進 counter／cooldown（審查 sol-backfill p7-20261028 #2）。
+        let emit: dispatcher::FallibleEmit =
+            Arc::new(move |ev| emit_log.write(ev).map_err(|e| e.py_message));
         *self
             .core
             .dispatcher
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Dispatcher::start(
+            .unwrap_or_else(|e| e.into_inner()) = Some(Dispatcher::start_fallible(
             self.per_daemon_max,
             Arc::clone(&self.platform.handlers),
             Arc::clone(&self.core.counters),

@@ -549,3 +549,46 @@ pub fn env_order_is_spec_order(s: &dyn HandlerSpawner) {
         .collect();
     assert_eq!(stdout_tail, want);
 }
+
+/// 期限溢位（審查 sol-backfill p7-20261028 #1）：Python `communicate(timeout=…)` 以 `OverflowError` 穿出——
+/// 子行程已啟動且不被終止、`_run_handler` 不 emit。PAL 以非 OSError 的 `SpawnFailed(InvalidInput)` 回報，且不得
+/// panic（修前 `start + Duration::MAX` 溢位 panic，worker 跳過 release 而死）。
+pub fn huge_timeout_overflow_is_python_like(s: &dyn HandlerSpawner) {
+    let marker = unique_marker();
+    let win = is_windows(s);
+    let cmd = if win {
+        format!("ping -n 3 127.0.0.1 >nul & rem {marker}")
+    } else {
+        format!("sleep 2; : {marker}")
+    };
+    let sp = spec(s.shell_argv(&cmd), minimal_env(s), b"", Duration::MAX);
+    let t0 = Instant::now();
+    let out = s.run(&sp, &HandlerAbort::new());
+    match &out {
+        HandlerOutcome::SpawnFailed(e) => {
+            assert_eq!(e.kind, crate::traits::PalErrorKind::InvalidInput, "{e:?}");
+            assert!(e.os_code.is_none() && e.winerror.is_none(), "不得呈現為 OSError：{e:?}");
+        }
+        o => panic!("unexpected {o:?}"),
+    }
+    assert!(t0.elapsed() < Duration::from_millis(1500), "溢位須立即回報，不得等子行程");
+    assert!(
+        wait_until(|| process_with_marker_alive(&marker), Duration::from_secs(1)),
+        "子行程已啟動且不被終止（Python Popen 成功後才溢位）"
+    );
+    assert!(
+        wait_until(|| !process_with_marker_alive(&marker), Duration::from_secs(10)),
+        "子行程自行結束"
+    );
+    // 未溢位的上限（POSIX INT_MAX ms）照常完成。
+    let ok = spec(
+        s.shell_argv("exit 0"),
+        minimal_env(s),
+        b"",
+        Duration::from_millis(i32::MAX as u64),
+    );
+    assert!(
+        matches!(s.run(&ok, &HandlerAbort::new()), HandlerOutcome::Completed { exit_code: 0, .. }),
+        "INT_MAX ms 不溢位"
+    );
+}

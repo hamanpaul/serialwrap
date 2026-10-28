@@ -94,6 +94,8 @@ fn env_block(env: &[(String, String)]) -> Vec<u16> {
 }
 
 struct Owned(HANDLE);
+// SAFETY: kernel handle 可跨執行緒使用；Owned 獨占所有權、只在 Drop 關閉一次（期限溢位時交給等待執行緒）。
+unsafe impl Send for Owned {}
 impl Drop for Owned {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -149,6 +151,19 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
         ));
     }
     match spawn(spec) {
+        Ok(running) if super::py_communicate_timeout_overflows(spec.timeout) => {
+            // Python（Windows）：`communicate` 先起讀取執行緒並寫入 stdin，`Thread.join(timeout)` 才溢位；子行程
+            // 不被終止。Job 為 KILL_ON_JOB_CLOSE，故另起執行緒等子行程自行結束後才釋放 handle。
+            std::thread::spawn(move || {
+                let running = running; // 整體移入（避免 disjoint capture 只捕獲 raw HANDLE 欄位）
+                // SAFETY: process 為有效 handle；無限等待其結束。
+                unsafe { WaitForSingleObject(running.process.0, INFINITE) };
+                let Running { out, err, .. } = running;
+                let _ = out.join();
+                let _ = err.join();
+            });
+            super::communicate_overflow()
+        }
         Ok(running) => running.wait(spec, abort),
         Err(e) => HandlerOutcome::SpawnFailed(e),
     }
@@ -298,7 +313,9 @@ fn spawn(spec: &HandlerSpec) -> Result<Running, PalError> {
 
 impl Running {
     fn wait(self, spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
-        let deadline = self.start + spec.timeout;
+        let Some(deadline) = self.start.checked_add(spec.timeout) else {
+            return super::communicate_overflow();
+        };
         let mut exited = false;
         let mut eof = 0usize;
         loop {

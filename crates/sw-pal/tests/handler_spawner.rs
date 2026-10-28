@@ -1,6 +1,6 @@
 //! P7 Task 14（08-slice23-login-events.md）：原生 `HandlerSpawner`（SC-26）。斷言在 `conformance::handler_suite`。
 //! Windows 原生執行列 LOCAL-WINDOWS-TODO（`scripts/rust/win-test.sh --package sw-pal --test handler_spawner`，
-//! 報告 `passed` 須等於 10（12 個 `#[test]` 扣除 2 個 `#[cfg(unix)]`）、`ignored==0`；判準以
+//! 報告 `passed` 須等於 12（14 個 `#[test]` 扣除 2 個 `#[cfg(unix)]`）、`ignored==0`；判準以
 //! `docs/rust-refactor/reviews/p7-local-windows-todo.md` P7-LW-6 為準）。
 #![cfg(feature = "test-fakes")]
 
@@ -63,6 +63,24 @@ fn native_spawn_enoexec_is_python_like() {
 #[test]
 fn native_env_order_is_spec_order() {
     suite::env_order_is_spec_order(&*native());
+}
+
+#[test]
+fn native_huge_timeout_overflow_is_python_like() {
+    suite::huge_timeout_overflow_is_python_like(&*native());
+}
+
+/// Python `communicate` 期限溢位門檻（CPython 3.12 實測：POSIX 2147483.647 s 正常、2147483.648 s 溢位；
+/// Windows `threading.TIMEOUT_MAX`＝4294967.294 s）。
+#[test]
+fn py_communicate_timeout_overflow_threshold() {
+    use std::time::Duration;
+    use sw_pal::process::py_communicate_timeout_overflows as over;
+    let max_ms: u64 = if cfg!(windows) { 0xFFFF_FFFE } else { i32::MAX as u64 };
+    assert!(!over(Duration::from_millis(max_ms)));
+    assert!(over(Duration::from_millis(max_ms + 1)));
+    assert!(over(Duration::MAX));
+    assert!(!over(Duration::from_secs(10)));
 }
 
 #[test]

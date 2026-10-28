@@ -265,6 +265,56 @@ fn end_to_end_fire_uses_exact_wal_seq_and_writes_ndjson() {
 }
 
 #[test]
+fn completion_log_write_failure_skips_counter_and_cooldown() {
+    // 審查 sol-backfill p7-20261028 #2：match_recorded 寫入成功、handler 完成時 events log 寫入失敗（counter 目錄
+    // 仍可寫）。Python `_emit` 例外穿出 `_run_handler`，跳過 `_post_fire_counter_update`：fires 維持 0、
+    // last_fire_ts 為 null，下一次命中不被 cooldown 擋住且 fire_count 為 1。
+    let sp = FakeHandlerSpawner::scripted(vec![]);
+    let h = harness_with(&["COM0"], &[], 8, sp.clone());
+    let log_path = h.dir.path().join("events.ndjson");
+    let armed = Arc::new(Mutex::new(true));
+    {
+        let (log_path, armed) = (log_path.clone(), armed.clone());
+        sp.set_hook(Arc::new(move |_spec| {
+            if std::mem::take(&mut *armed.lock().unwrap()) {
+                // 第一次 handler 執行期間讓 events log 不可 append（以同名目錄取代，open_append → EISDIR）。
+                std::fs::remove_file(&log_path).unwrap();
+                std::fs::create_dir(&log_path).unwrap();
+            }
+        }));
+    }
+    h.engine.start().unwrap();
+    h.engine
+        .rule_set(&rule(
+            r#"{"selectors":["COM0"],"cooldown_ms":60000,"pattern":{"kind":"contains","value":"hit"}}"#,
+        ))
+        .unwrap();
+    h.engine.feed_rx("COM0", b"hit\n", 1);
+    let end = Instant::now() + Duration::from_secs(5);
+    while h.sp.spawn_count() < 1 {
+        assert!(Instant::now() < end);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::remove_dir(&log_path).unwrap();
+    h.engine.feed_rx("COM0", b"hit\n", 2);
+    h.wait_type("fire_completed", 1);
+    let done = h
+        .log()
+        .into_iter()
+        .filter(|e| e.get("type").and_then(PyValue::as_str) == Some("fire_completed"))
+        .collect::<Vec<_>>();
+    assert_eq!(done.len(), 1, "{:?}", h.types());
+    assert_eq!(
+        done[0].get("fire_count"),
+        Some(&PyValue::from(1i64)),
+        "失敗那次不得推進 fires"
+    );
+    assert_eq!(h.sp.spawn_count(), 2, "第二次命中不得被 cooldown 擋住");
+    h.engine.stop(Instant::now() + Duration::from_secs(5));
+}
+
+#[test]
 fn line_buffer_persists_while_com_disabled() {
     // EVT-D-S5：per-COM LineBuffer 永不重設；啟用與否在「行完成時」判定（Python `feed_line` 檢查 enabled）。
     let h = harness(&["COM0"]);

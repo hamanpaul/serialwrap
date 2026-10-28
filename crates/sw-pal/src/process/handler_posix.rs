@@ -177,6 +177,17 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
         Err(e) => return HandlerOutcome::SpawnFailed(spawn_error(e, argv0)),
     };
     let pgid = child.id();
+    if super::py_communicate_timeout_overflows(spec.timeout) {
+        // Python：Popen 成功後 `communicate` 在第一次 select 前溢位（stdin 尚未寫入）；Popen 物件隨即被回收、
+        // 管線關閉，子行程不被終止。此處同樣關閉三條管線、不送訊號，另起執行緒 wait 以免殭屍。
+        drop(child.stdin.take());
+        drop(child.stdout.take());
+        drop(child.stderr.take());
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return super::communicate_overflow();
+    }
     let (done_tx, done_rx) = mpsc::channel();
     let out = spawn_tail_reader(
         child.stdout.take().expect("piped stdout"),
@@ -190,7 +201,10 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
     );
     spawn_stdin_writer(child.stdin.take().expect("piped stdin"), spec.stdin.clone());
 
-    let deadline = start + spec.timeout;
+    // 未溢位者 timeout ≤ INT_MAX ms，`start + timeout` 不會溢位；仍以 checked_add 防禦。
+    let Some(deadline) = start.checked_add(spec.timeout) else {
+        return super::communicate_overflow();
+    };
     let mut status = None;
     let mut eof = 0usize;
     loop {

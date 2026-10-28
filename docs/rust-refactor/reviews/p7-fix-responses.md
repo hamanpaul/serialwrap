@@ -152,3 +152,24 @@
 | 7 | **未開始（BLOCKED-OWNER P7-BO-3）** | SC-30 與 merge 帶入的 P5 F15 衝突：收斂表的「quiet 撤銷 run 結果不得推 READY」與 P5 測試期望相反，須擁有者裁決後才能動 `active_login`／`fsm_gen_floor`／`CancelLogin`；`TxPermit.fsm_gen: Option<u64>`／`StaleFsmGen` 與 06 現況形狀不同（check_p7_prereqs DIFFERS）亦需一併定案 |
 | 18 | **未開始** | 依賴 Task 18A（黑箱工具獨立 PR）與 Task 7；L1.5／A/B 需 Python 與 Rust daemon 實跑環境 |
 | 19 | **LOCAL-WINDOWS-TODO** | Windows 原生 L1／COM 證據，見 p7-local-windows-todo（P7-LW-1～6） |
+
+## 第 9 輪：merge 主線（9d21ef7）＋P5（b0772fe）、sol-backfill/p7-20261028（Codex sol）
+
+### merge 衝突裁決（細節見 merge commit 訊息）
+
+| 衝突點 | 處理 |
+|---|---|
+| sw-pal `proc_scan/posix.rs`：P5 18358a5 `tty_holders_with`（Python `detect_multi_open`：tty stat 失敗略過）vs 主線 e4d1ae2／d82a7b9（目標 tty 取不到身分 → Unknown） | `tty_holders_with` 維持 Python multi_open 語意（P5 `multi_open_tty_stat_failure_skips_tty_and_fd_dir_errors_classified`）；產品接線 `PosixProcScan::serialwrapd_tty_holders` 另疊加主線的目標身分檢查（主線 `posix_tty_holder_scan_reports_unknown_when_target_unstatable`）。附帶影響：`daemon.status` 的 `holders_status` 對不存在的 tty 由 `ok` 變 `unknown`（Python `detect_multi_open` 為 `ok`）——P5／主線需裁定 health 路徑是否改呼叫 `tty_holders_with`，P7 不改 P5 的 `health.rs` |
+| `ProfileTemplate.boot_done_regex`（#234）新欄位 | sw-core `minimal_passthrough_template` 與 P7 golden 轉換補 `""`（dataclass 預設） |
+| OD-24 防線 vs P5 `s21_core` 的 `#[ignore]` 列 | **BLOCKED-OWNER P7-BO-4**（linux 27＋windows 13 筆；merge 訊息誤記 39，以本表為準） |
+
+### sol-backfill/p7-20261028（4 Medium，皆屬實）
+
+| # | 發現 | Python 驗證 | 處理 |
+|---|---|---|---|
+| 1 | `dispatcher.rs:188` 超大 timeout 殺死 worker、永久占住名額 | CPython 3.12：`communicate(b'x\n', timeout=2147483.647)` 正常；`2147483.648` → `OverflowError: timeout is too large`；`1e27` → `OverflowError: timestamp too large…`；兩者子行程仍存活（`poll() is None`）。`_run_handler` 的例外穿出 try（非 OSError）、`finally` 釋放 busy／inflight | **fixed**：sw-pal `py_communicate_timeout_overflows`（POSIX > INT_MAX ms、Windows > `0xFFFFFFFE` ms，cfg 在 sw-pal）；溢位時子行程照常啟動、關閉管線不送訊號、背景 wait 防殭屍，回非 OSError 的 `SpawnFailed(InvalidInput)`（dispatcher 既有「例外穿出」路徑：不 emit、不更新 counter）；`start + timeout` 改 `checked_add`；dispatcher 名額改 RAII、worker 迴圈 `catch_unwind`。回歸 `event_dispatcher::huge_timeout_native_handler_then_normal_rule_completes`（原生 spawner，8 條巨大 timeout 後 8 條正常規則全數 fire_completed、無 event_dropped）、`handler_panic_releases_slot_and_worker_survives`、conformance `huge_timeout_overflow_is_python_like`（子行程存活、立即回報；INT_MAX ms 照常完成）、`py_communicate_timeout_overflow_threshold`。Windows 原生併入 P7-LW-6 |
+| 2 | `event_engine/mod.rs:269` 吞掉完成事件寫檔錯誤仍推進 counter／cooldown | `event_emit=self._log.write`；`_emit` 例外穿出 `_run_handler`，跳過 `_post_fire_counter_update` | **fixed**：新增 `Dispatcher::start_fallible`（`FallibleEmit`），凍結的 `start` 不變；完成類 emit 失敗即 return（不更新 counter），名額由 RAII 釋放。EventEngine 改用之。回歸 `event_engine::completion_log_write_failure_skips_counter_and_cooldown`（handler 執行期間以同名目錄取代 events log；第二次命中不被 `cooldown_ms:60000` 擋住、`fire_count` 為 1）。dispatch 端 `event_dropped` 的寫檔失敗仍忽略（Python 會穿出 `dispatch()`；不在本發現範圍，未改） |
+| 3 | `session_core.rs:740` interactive send 被分類為前景 | `interactive_send`／無命令 `interactive_open` 不經 `_begin_foreground_operation_locked`（`session_manager.py:1615`，呼叫點只有命令路徑 6403／8037／8135），`foreground_busy` 維持 False → `active_cmd_id_for` 回 None | **fixed**：發布 `self.foreground_busy()`（與 capture gate 同源）。回歸 `event_scope_p7::interactive_send_tx_in_flight_is_not_foreground_for_events`（修前紅）與對照 `foreground_command_in_flight_is_foreground_for_events` |
+| 4 | `session_core.rs:4356` 首次 log_start 的 `session.capture:null` | `log_start`：`session.active_capture = cap` 後才 `to_public_dict()`（`:7923-7929`） | **fixed**：先安裝 `log_capture` 再組回應。回歸 `capture_p7::first_log_start_reply_session_has_active_capture`（修前紅） |
+
+L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。

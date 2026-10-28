@@ -93,6 +93,28 @@ impl HandlerAbort {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) static WIN_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Python `proc.communicate(stdin, timeout=timeout_ms / 1000.0)` 是否因期限過大而以 `OverflowError` 穿出
+/// （審查 sol-backfill p7-20261028 #1）。POSIX：`PollSelector.select` 以 `ceil(remaining*1e3)` 轉 C int，
+/// 超過 `INT_MAX` ms 即溢位（CPython 3.12 實測 2147483.647 s 正常、2147483.648 s 溢位）；Windows：讀取執行緒
+/// `Thread.join(timeout)` 的 `PY_TIMEOUT_MAX`＝`0xFFFFFFFE` ms（`threading.TIMEOUT_MAX`），超過即溢位。
+/// 溢位時 Python 已 `Popen` 出子行程、不 emit、不更新 counter，由 `finally` 釋放名額；子行程任其自行結束。
+pub fn py_communicate_timeout_overflows(timeout: std::time::Duration) -> bool {
+    #[cfg(windows)]
+    const MAX_MS: u128 = 0xFFFF_FFFE;
+    #[cfg(not(windows))]
+    const MAX_MS: u128 = i32::MAX as u128;
+    timeout.as_millis() > MAX_MS
+}
+
+/// `communicate` 期限溢位時回給 dispatcher 的結果：非 `OSError`（`os_code`／`winerror` 皆無、`InvalidInput`），
+/// 與 Popen 的 `ValueError` 同屬「例外穿出 `_run_handler`」路徑。
+pub(crate) fn communicate_overflow() -> HandlerOutcome {
+    HandlerOutcome::SpawnFailed(crate::traits::PalError::plain(
+        crate::traits::PalErrorKind::InvalidInput,
+        "timeout is too large",
+    ))
+}
+
 /// stdout／stderr 讀取執行緒：讀到 EOF，只保留最後 `tail` bytes（Python `stdout[-N:]` 等價）；結束時通知 `done`。
 pub(crate) fn spawn_tail_reader<R: std::io::Read + Send + 'static>(
     mut r: R,

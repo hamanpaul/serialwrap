@@ -734,10 +734,11 @@ impl SessionCore {
             }
         }
         // P7 Task 10：reader 端 agent log 的前景 gate（Python `session.foreground_busy`，只計命令，EVT-D-L1）。
-        self.capture_observer
-            .set_foreground_busy(self.foreground_busy());
+        let busy = self.foreground_busy();
+        self.capture_observer.set_foreground_busy(busy);
         // P7 Task 16-wire：發布 foreground_busy 供 `BridgeQueries::active_cmd_id_for`（不經 actor mailbox）。
-        let busy = self.foreground.is_some();
+        // 同樣只計命令：interactive open／send 的 TX 也占 `self.foreground`，但 Python 不經
+        // `_begin_foreground_operation_locked`（審查 sol-backfill p7-20261028 #3）。
         if busy != self.published_foreground_busy {
             self.published_foreground_busy = busy;
             self.deps.fence.with(|f| f.foreground_busy = busy);
@@ -4345,9 +4346,10 @@ impl SessionCore {
         };
         self.capture_observer.install(capture_id, file);
         self.deps.rx.set_capture(Some(self.capture_observer.clone()));
-        let reply = crate::capture::log_start_reply(&cap, false, self.session_dict(now));
-        self.log_capture = Some(cap);
-        Ok(reply)
+        // Python 先設 `session.active_capture` 再 `to_public_dict()`：巢狀 session.capture 即本次 capture
+        // （審查 sol-backfill p7-20261028 #4）。
+        self.log_capture = Some(cap.clone());
+        Ok(crate::capture::log_start_reply(&cap, false, self.session_dict(now)))
     }
 
     /// 停止 capture（Python `_stop_capture_locked`）；回停止前最後的 `(line_count, byte_count)`。

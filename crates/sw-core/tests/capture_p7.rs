@@ -267,3 +267,27 @@ fn detach_auto_stops_capture() {
         sw_pal::fs_ops::text_mode_bytes("before\n")
     );
 }
+
+#[test]
+fn first_log_start_reply_session_has_active_capture() {
+    // 審查 sol-backfill p7-20261028 #4：Python `log_start` 先設 `session.active_capture` 再 `to_public_dict()`，
+    // 首次成功回應的巢狀 `session.capture` 即為同一 capture（status active、零計數），非 null。
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let h = rig_with_log_dir(&dir);
+    let start = h.request(SessionRequest::LogStart);
+    assert_eq!(start["ok"], PyValue::Bool(true), "{start:?}");
+    let session = match &start["session"] {
+        PyValue::Dict(d) => d.clone(),
+        other => panic!("session 應為 dict：{other:?}"),
+    };
+    let cap = match &session["capture"] {
+        PyValue::Dict(d) => d.clone(),
+        other => panic!("首次 log_start 的 session.capture 不得為 null：{other:?}"),
+    };
+    assert_eq!(cap["capture_id"], start["capture_id"]);
+    assert_eq!(cap["log_path"], start["log_path"]);
+    assert_eq!(cap["status"], PyValue::from("active"));
+    assert_eq!(cap["line_count"], int(0));
+    assert_eq!(cap["byte_count"], int(0));
+}

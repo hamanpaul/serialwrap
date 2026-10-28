@@ -384,6 +384,87 @@ fn spawn_value_error_emits_nothing_and_releases_rule() {
     d.stop(soon());
 }
 
+/// 每次 `run` 都 panic 的 spawner（模擬 PAL 內部 panic；修前 worker 跳過 release 後死亡）。
+struct PanickingSpawner(Arc<Mutex<usize>>);
+
+impl HandlerSpawner for PanickingSpawner {
+    fn shell_argv(&self, shell: &str) -> Vec<String> {
+        vec!["/bin/sh".into(), "-c".into(), shell.into()]
+    }
+    fn inherited_env_keys(&self) -> &'static [&'static str] {
+        &KEYS
+    }
+    fn run(&self, _spec: &sw_pal::traits::HandlerSpec, _abort: &sw_pal::traits::HandlerAbort) -> HandlerOutcome {
+        *self.0.lock().unwrap() += 1;
+        panic!("injected spawner panic");
+    }
+}
+
+#[test]
+fn handler_panic_releases_slot_and_worker_survives() {
+    // 審查 sol-backfill p7-20261028 #1：Python `_run_handler` 的例外由 `finally` 釋放 busy／inflight、executor 執行緒
+    // 存活。max=2、連續 3 條不同規則 panic 後，名額須全數釋放（不回 per_daemon_saturated）且 worker 仍能取 job。
+    let r = rig();
+    let calls = Arc::new(Mutex::new(0usize));
+    let d = r.start(2, Arc::new(PanickingSpawner(calls.clone())));
+    for (i, rule) in ["o.p1", "o.p2", "o.p3", "o.p4"].iter().enumerate() {
+        d.dispatch(fire(rule, "COM0", i as u64 + 1), "x".into());
+        let end = Instant::now() + Duration::from_secs(5);
+        while *calls.lock().unwrap() < i + 1 {
+            assert!(Instant::now() < end, "第 {} 條規則未被 worker 取走：{:?}", i + 1, r.emit.types());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // run 已進入；等 unwind 收尾釋放名額後再送下一條。
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(r.emit.all().is_empty(), "{:?}", r.emit.types());
+    assert_eq!(r.counters.load("o.p1").unwrap().fires, PyInt::Small(0));
+    assert_eq!(d.stop(soon()), DispatcherStopReport::default(), "panic 後 inflight 須歸零");
+}
+
+#[test]
+fn huge_timeout_native_handler_then_normal_rule_completes() {
+    // 審查 sol-backfill p7-20261028 #1：`timeout_ms` 超大 → `Rule::timeout()` 為 Duration::MAX；Python
+    // `communicate` 以 OverflowError 穿出：不 emit、counter 不變、名額釋放。之後 8 條不同規則照常完成
+    // （修前原生 spawner `start + timeout` panic，worker 與名額永久流失 → per_daemon_saturated）。
+    let r = rig();
+    let d = r.start(8, sw_pal::native().handlers);
+    for i in 0..8u64 {
+        let rule = format!("o.huge{i}");
+        let (_, name) = rule.split_once('.').unwrap();
+        d.dispatch(
+            fire_with(
+                &format!(
+                    r#"{{"name":"{name}","timeout_ms":1000000000000000000000000000000,"handler":{{"shell":"exit 0"}}}}"#
+                ),
+                "COM0",
+                i + 1,
+                "x",
+            ),
+            "x".into(),
+        );
+    }
+    // 溢位在 spawn 後立即回報（PAL 測試鎖定 < 1.5 s）；此處給 1 s 讓 8 個 worker 收尾。
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(r.emit.all().is_empty(), "{:?}", r.emit.types());
+    assert_eq!(r.counters.load("o.huge0").unwrap().fires, PyInt::Small(0));
+    for i in 0..8u64 {
+        let name = format!("ok{i}");
+        d.dispatch(
+            fire_with(
+                &format!(r#"{{"name":"{name}","handler":{{"shell":"exit 0"}}}}"#),
+                "COM0",
+                100 + i,
+                "x",
+            ),
+            "x".into(),
+        );
+    }
+    r.emit.wait_for("fire_completed", 8);
+    assert!(r.emit.of_type("event_dropped").is_empty(), "{:?}", r.emit.types());
+    d.stop(soon());
+}
+
 #[test]
 fn counter_load_error_skips_fire_and_releases_rule() {
     // Python `_run_handler`：`self._counters.load` 的例外穿出 try、finally 釋放 busy，不 emit。
