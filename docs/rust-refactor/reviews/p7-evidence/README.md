@@ -16,6 +16,8 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-9c4a80e.txt` | 審查第 6 輪後（相對 aaf2c1d：+1／−1——−`test_bb_daemon_e2e::test_session_reaches_ready`（上一輪已記為同範圍兩次重跑、集合不同）；+`test_l15_smoke::test_reject_zero_tx_runs_on_python`——`DeviceHeldError` 環境類，c58e8d4 列已於 76de0cf worktree 重現） | 508 | 5dca7ec693660c98 |
 | `pytest-fail-0722f75.txt` | Task 16＋16-wire 後（相對 9c4a80e：+5／−1——−sm01；+slice21 `test_f1_cmd_contract::test_limits_queryable`／`test_newline_rejected`、`test_f12_version_reported_consistent`（ERROR；單獨重跑首次為 Python daemon `ATTACH_FAILED:DeviceHeldError`，合併重跑 4 passed）、+`test_mgmt_stubs` live daemon fixture（同上 4 passed）、+sm04（DeviceHeldError 環境類）） | 512 | f1fcb15f24ef4376 |
 | `pytest-fail-3030adc.txt` | 審查第 7 輪後（相對 0722f75：+2／−3——+`tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`；+`tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`；−`tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_limits_queryable`；−`tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_newline_rejected`；−`tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`；新增兩筆分別在起點清單內（SESSION_NOT_READY-ATTACHING）與 DeviceHeldError 環境類（sm01）） | 511 | 5b1216e4c3e40aac |
+| `pytest-fail-start-a0cad06.txt` | 第 3 輪 session 起點 a0cad06（`git worktree` 於 `/tmp`，`python3.12 -m pytest -q -p no:cacheprovider tests/ -rfE`；73 failed／432 errors） | 505 | 2b8fe0b8f0458c21 |
+| `pytest-fail-96c9f02.txt` | merge P5（a089f9f）＋第 8 輪審查修正＋Task 10／9／17 後（同上命令；45 failed／432 errors）。相對起點 +1／−29：−28 為 P5 交付的 slice21 calibration／gate judge／gate report 與 `SESSION_NOT_READY-ATTACHING`；+1 為 `test_rust_goldens_fresh::test_golden_is_fresh[gen_allowlist_unreadable_config.py-allowlist_unreadable_config.tsv]`（P5 F84 帶入的 golden；主工作樹同範圍重跑 2/2 passed，`origin/feature/rust-refactor-p5` 的 `/tmp` worktree 重跑 2/2 failed——golden 內容隨 checkout 路徑變動，P5 範圍、環境類） | 477 | 5130dd36be4b5478 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
@@ -199,3 +201,8 @@ $ （76de0cf worktree）timeout 200 python3.12 -m pytest -q -p no:cacheprovider 
   - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_limits_queryable`
   - `− ERROR tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_newline_rejected`
   - `− FAILED tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`
+
+### 第 8 輪補記：sm01／SESSION_NOT_READY-ATTACHING 同範圍重跑（審查 01c474c_a0cad06 a0cad06-1）
+
+命令：`python3.12 -m pytest -q -p no:cacheprovider tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01 "tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]"`（主工作樹 96c9f02，連跑 3 次）：
+`2 passed`／`1 failed, 1 passed`／`2 passed`——同範圍失敗集合不同，與既有「DeviceHeldError 環境類」判定一致；兩者皆不在 `pytest-fail-96c9f02.txt`。
