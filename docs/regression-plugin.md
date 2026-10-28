@@ -99,6 +99,7 @@ RX 視窗修剪破壞 offset 語意（絕對偏移記帳根治）：`f2-history-
 （任一輪未 done 即 FAIL），並新增決定性重演 case `f2-rx-window-crossing-prompt`。其餘 issue
 修復後可收緊對應 oracle。
 | `f9-spontaneous-reboot-agent-gated` | 常駐防線（#162 已修，預期綠） | 原 #162 紅燈哨兵：連續重開機後延遲 banner 污染後續命令 stdout（quiet 清空判定過早）。#162 修復＝quiet 清空改綁 READY 再確認（`ready_reconfirm_pending`＋reprobe 確認 probe 消耗 askconsole banner），`_wait_quiet_cleared` 已加等 pending 歸 False；本 case 轉為常駐防線，再紅即回歸 |
+| `f9-reboot-stale-ready` | 寫成後尚未上板跑過 | #162 延伸（非同步 reboot 的 stale-READY）：單獨 `reboot` 後 prompt 立刻回來但板子 shutdown 很慢（IB8 banner 在 +17～26s），舊 shell 會應答確認 probe 的 nonce。case 於 reboot 後以 1 秒週期送 boot_id 讀取：banner 前須被 `AUTOBOOT_QUIET` 擋下，讀到 reboot 前的 boot_id 即 FAIL（`stale_ready_old_boot_id`），最終 boot_id 改變並回真 READY。|
 | （bench 事實）COM1 bcm 板 | — | busybox 映像未編入 `base64` applet——F7 逐板 fallback 的「bcm 實證 #157」客觀上不可行（`target_tool_missing` 為真實板端限制，非探測 bug；`md5sum` 存在）|
 
 
