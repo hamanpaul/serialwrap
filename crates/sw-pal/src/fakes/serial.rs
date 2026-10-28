@@ -637,6 +637,17 @@ impl FakeDevice {
         out
     }
 
+    /// 已「確認寫出」的 bytes 長度（不清空、不動 loopback／tx_match 游標；P6 審查 sol 補審 Medium）。
+    pub fn tx_len(&self) -> usize {
+        self.inner.tx.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// 已「確認寫出」bytes 中 `from` 之後的副本（不清空）。
+    pub fn tx_since(&self, from: usize) -> Vec<u8> {
+        let tx = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner());
+        tx.get(from..).map(<[u8]>::to_vec).unwrap_or_default()
+    }
+
     /// 依序消耗寫入腳本；耗盡後恢復 `Accept(全部)`。
     pub fn script_write(&self, steps: Vec<FakeWriteStep>) {
         let mut s = self.inner.steps.lock().unwrap_or_else(|e| e.into_inner());

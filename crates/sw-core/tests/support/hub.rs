@@ -303,12 +303,14 @@ fn clone_control(e: &ControlEvent) -> ControlEvent {
             label,
             vtty,
             kind,
+            close_gen,
         } => ControlEvent::ConsoleConnected {
             client_id: client_id.clone(),
             client_lifetime: *client_lifetime,
             label: label.clone(),
             vtty: vtty.clone(),
             kind: *kind,
+            close_gen: *close_gen,
         },
         ControlEvent::ConsoleScan { scan, source } => ControlEvent::ConsoleScan {
             scan: scan.clone(),

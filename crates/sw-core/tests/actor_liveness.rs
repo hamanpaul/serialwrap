@@ -19,6 +19,7 @@ fn ready_with_owner() -> ActorRig {
         label: "127.0.0.1:50000".into(),
         vtty: "127.0.0.1:50000".into(),
         kind: ConsoleTransportKind::TcpTelnet,
+        close_gen: 0,
     });
     let _ = rig.get_state(); // 同一 control sender FIFO：回覆前 ConsoleConnected 已處理
     rig

@@ -1015,6 +1015,7 @@ fn human_line_timeout_sends_no_rescue_keys() {
             label: format!("127.0.0.1:5000{life}"),
             vtty: format!("127.0.0.1:5000{life}"),
             kind: ConsoleTransportKind::TcpTelnet,
+            close_gen: 0,
         });
     }
     let _ = rig.get_state();
@@ -1147,4 +1148,68 @@ fn attached_refresh_created_replay_still_opens_recovery() {
     h.rpc(close_req(&bid)).unwrap();
     assert!(h.human_tx().len() > n_tx, "close B 後回放");
     assert_eq!(h.human_tx().last().unwrap(), &(TxClass::HumanReplay, "human:c1".to_string(), b"Q".to_vec()));
+}
+
+/// sol 補審 p6-20261028 High #1（6eafa6a，`lease_p6.rs:139`）：命令出列時的 lazy expiry 還原 human 並建立回放 hold，
+/// 回放必須先於該命令送出且不得被其 `command_fg_begin` 撤銷（Python `execute_command` 於送出命令前同步
+/// `post.execute()`，UART 順序為 Q → B）；reboot 命令同樣不得讓 Q 因失效而遺失。
+#[test]
+fn dequeue_lazy_expiry_replays_before_next_command() {
+    for cmd in ["echo B", "reboot"] {
+        let mut h = ready();
+        h.set_auto_complete_human_tx(false);
+        h.attach_pty_console("c1", true);
+        let r = h.rpc(open_req("agent:a", 1.0, "", false)).unwrap();
+        assert_eq!(r.get("soft_preempted"), Some(&true.into()));
+        h.input("c1", b"Q"); // 進 deferred
+        h.clock.advance(Duration::from_millis(1500)); // A 過期，尚未投遞 Tick
+        let resp = h.rpc(SessionRequest::Submit(agent_submit(cmd))).unwrap();
+        assert_eq!(resp.get("ok"), Some(&true.into()), "{cmd}: {resp:?}");
+        let order = h.tx_order();
+        assert!(
+            !order.iter().any(|(c, _)| *c == TxClass::Command),
+            "{cmd}: 回放結算前命令不得送出：{order:?}"
+        );
+        assert_eq!(
+            order.last(),
+            Some(&(TxClass::HumanReplay, b"Q".to_vec())),
+            "{cmd}: lazy expiry 的回放先送出：{order:?}"
+        );
+        assert!(h.fence_replay_auth().is_some(), "{cmd}: 回放授權未被撤銷");
+        h.complete_human_tx(TxOutcome::Completed(1), None);
+        let order = h.tx_order();
+        let q = order.iter().position(|(c, p)| *c == TxClass::HumanReplay && p == b"Q");
+        let b = order
+            .iter()
+            .position(|(c, p)| *c == TxClass::Command && p == format!("{cmd}\n").as_bytes());
+        assert!(q.is_some() && b.is_some() && q < b, "{cmd}: UART 順序須為 Q → 命令：{order:?}");
+        assert_eq!(h.deferred_len("c1"), 0, "{cmd}: Q 不得留在 deferred");
+        assert_eq!(
+            order.iter().filter(|(c, p)| *c == TxClass::HumanReplay && p == b"Q").count(),
+            1,
+            "{cmd}: Q 恰送出一次"
+        );
+    }
+}
+
+/// 同上：命令停在回放 hold 期間遇 drain，該命令以未送出終結（零 Command TX），不得於 drain 後補送。
+#[test]
+fn dequeue_parked_command_aborted_on_drain() {
+    let mut h = ready();
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    let r = h.rpc(open_req("agent:a", 1.0, "", false)).unwrap();
+    assert_eq!(r.get("soft_preempted"), Some(&true.into()));
+    h.input("c1", b"Q");
+    h.clock.advance(Duration::from_millis(1500));
+    let resp = h.rpc(SessionRequest::Submit(agent_submit("echo B"))).unwrap();
+    let cmd_id = resp["cmd_id"].as_str().unwrap().to_string();
+    h.begin_stop(StopKind::IoError);
+    let row = h.reg.get(&cmd_id).unwrap();
+    assert!(!row.get("done_at").unwrap_or(&PyValue::Null).is_null(), "drain 時終結：{row:?}");
+    assert!(
+        !h.tx_order().iter().any(|(c, _)| *c == TxClass::Command),
+        "停放的命令零 TX：{:?}",
+        h.tx_order()
+    );
 }

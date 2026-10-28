@@ -2734,6 +2734,7 @@ impl CoreHarness {
             label: peer.clone(),
             vtty: peer,
             kind,
+            close_gen: self.core.human_console().close_gen,
         });
         lifetime
     }

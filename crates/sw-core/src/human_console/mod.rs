@@ -88,6 +88,8 @@ pub struct HumanConsoleState {
     pub tcp_console: bool,
     /// 目前 bridge 的 listener 端點（`uart_io.py` `_console_endpoint`；bridge 停止時清為 None）。
     pub console_endpoint: Option<String>,
+    /// 已送出的 `Effect::ConsoleCloseAll` 次數（與 hub 的 close 世代一一對應；sol 補審 High #2）。
+    pub close_gen: u64,
 }
 
 impl HumanConsoleState {
@@ -106,6 +108,7 @@ impl HumanConsoleState {
             replay_after_revoked: false,
             tcp_console: false,
             console_endpoint: None,
+            close_gen: 0,
         }
     }
 

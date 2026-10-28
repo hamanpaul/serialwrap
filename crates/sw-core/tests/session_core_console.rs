@@ -661,3 +661,38 @@ fn release_clears_public_vtty() {
     let PyValue::Dict(session) = &st["session"] else { panic!("session") };
     assert_eq!(session.get("vtty"), Some(&PyValue::Null));
 }
+
+/// sol 補審 p6-20261028 High #2（4f710c3，`hub.rs:503`）：hub 已 accept、但 `ConsoleConnected` 仍在 hub pending 或
+/// mailbox 時 release Phase 1 先完成；晚到事件帶舊的 close 世代，core 須拒收並要求關閉該 client，維持
+/// console_count=0、無 owner（Python accept 與 begin_drain 同鎖，release 必關閉所有 client）。之後 reclaim 的新連線正常取得 raw owner。
+#[test]
+fn late_console_connected_after_release_is_rejected() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let stale_gen = h.core.human_console().close_gen;
+    let (_rx, fx) = h.rpc_deferred(SessionRequest::Release { source: "agent".into(), reason: PyValue::Null });
+    assert_eq!(
+        fx.iter().filter(|e| matches!(e, Effect::ConsoleCloseAll)).count(),
+        1,
+        "release 一律送 close-all（撤銷 hub 已 accept、尚未登記的連線）"
+    );
+    assert_eq!(h.core.human_console().close_gen, stale_gen + 1);
+    let fx = h.feed(ControlEvent::ConsoleConnected {
+        client_id: "t1".into(),
+        client_lifetime: 1,
+        label: "127.0.0.1:50001".into(),
+        vtty: "127.0.0.1:50001".into(),
+        kind: ConsoleTransportKind::TcpTelnet,
+        close_gen: stale_gen,
+    });
+    assert!(h.core.human_console().consoles.is_empty(), "已關閉的 console 不得復活");
+    assert_eq!(owner(&h), None, "幽靈 owner");
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::ConsoleClose { client_id } if client_id == "t1")),
+        "要求 hub 關閉該 client"
+    );
+    // 帶現行世代的連線（release 之後才 accept）照常登記並取得 raw owner。
+    h.connect_stream_console("t2", ConsoleTransportKind::TcpTelnet);
+    assert!(h.core.human_console().consoles.contains_key("t2"));
+    assert_eq!(owner(&h).as_deref(), Some("human:t2"));
+}

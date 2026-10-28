@@ -434,6 +434,10 @@ pub struct SessionCore {
     fg_cmd_timeout_s: f64,
     /// parity #56：tick 到期還原結算前提交的 interactive 模式命令（出列時回 SESSION_INTERACTIVE_BUSY）。
     tick_close_interactive: HashSet<String>,
+    /// sol 補審 p6-20261028 High #1：已出列、通過執行期檢查，但其 refresh（lazy expiry）剛建立回放 hold 的命令。
+    /// Python `execute_command` 於送出前同步 `post.execute()`；Rust 回放為非同步，命令停在此槽（registry 已為
+    /// running）待 hold 結算後於 `start_next` 優先送出，不再重做出列檢查。drain／flush 時以 NotSubmitted 結束。
+    replay_parked: Option<QueuedCommand>,
     /// P6 Task 7：P5 既有函式內產生、於本事件結尾併入的效果（LeaseIndex 一律排在 Reply 之前）。
     fx_buf: Vec<Effect>,
     /// P6 Task 7：目前事件的 monotonic 時刻（不帶 `now` 參數的既有 helper 使用）。
@@ -610,6 +614,7 @@ impl SessionCore {
             hold_release_kick: false,
             fg_cmd_timeout_s: 0.0,
             tick_close_interactive: HashSet::new(),
+            replay_parked: None,
             fx_buf: Vec::new(),
             now_cache: 0,
             fg_origin: None,
@@ -796,6 +801,7 @@ impl SessionCore {
                 label,
                 vtty,
                 kind,
+                close_gen,
             }) => {
                 effects.0.extend(self.console_connected(
                     client_id,
@@ -803,6 +809,7 @@ impl SessionCore {
                     label,
                     vtty,
                     kind,
+                    close_gen,
                     now,
                 ));
             }
@@ -1212,6 +1219,7 @@ impl SessionCore {
             "FLUSHED_BY_RECOVERY"
         };
         let _ = self.queue.drain_all();
+        self.abort_parked_command();
         self.deps
             .registry
             .flush_session(&self.sid, code, &self.wall_iso());
@@ -3141,6 +3149,7 @@ impl SessionCore {
         self.console_count = 0;
         self.queue_registered = false;
         self.queue = SessionQueue::new();
+        self.abort_parked_command();
         self.clear_interactive();
         self.detach_captures();
         // boot quiet／reconfirm 掛在 session 而非 bridge（Python `SessionRuntime.boot_quiet_until`；`_complete_drain`
@@ -3747,25 +3756,39 @@ impl SessionCore {
             return effects;
         }
         loop {
-            let Some(command) = self.queue.pop() else {
-                return effects;
+            let command = if let Some(parked) = self.replay_parked.take() {
+                if self.parked_terminal(&parked.cmd_id) {
+                    continue;
+                }
+                parked
+            } else {
+                let Some(command) = self.queue.pop() else {
+                    return effects;
+                };
+                if matches!(
+                    self.deps
+                        .registry
+                        .mark_running(&command.cmd_id, &self.wall_iso()),
+                    RunDecision::Skip
+                ) {
+                    continue;
+                }
+                if let Some(reject) = self.execute_time_reject(&command, now) {
+                    self.deps.registry.complete(
+                        &command.cmd_id,
+                        CmdOutcome::Result(reject),
+                        &self.wall_iso(),
+                    );
+                    continue;
+                }
+                if self.fg_slot_busy() {
+                    // 執行期 refresh 惰性結束過期 lease 並建立回放 hold：回放先上 UART（Python `post.execute()`），
+                    // 命令於 hold 結算後送出，不讓本命令的 `command_fg_begin` 撤銷剛建立的回放。
+                    self.replay_parked = Some(command);
+                    return effects;
+                }
+                command
             };
-            if matches!(
-                self.deps
-                    .registry
-                    .mark_running(&command.cmd_id, &self.wall_iso()),
-                RunDecision::Skip
-            ) {
-                continue;
-            }
-            if let Some(reject) = self.execute_time_reject(&command, now) {
-                self.deps.registry.complete(
-                    &command.cmd_id,
-                    CmdOutcome::Result(reject),
-                    &self.wall_iso(),
-                );
-                continue;
-            }
             let mode = normalized_mode(&command.req.mode).to_string();
             // #45 D-44：同 session 非 background 命令開始前，終結既有 background capture。
             if mode != "background" {
@@ -3867,6 +3890,27 @@ impl SessionCore {
                 spec: OpSpec::Command(command),
             });
             return effects;
+        }
+    }
+
+    /// 停在 `replay_parked` 的命令已被其他路徑終結（cancel 等）時不再送出。
+    fn parked_terminal(&self, cmd_id: &str) -> bool {
+        self.deps.registry.get(cmd_id).is_none_or(|record| {
+            record.get("done_at").is_some_and(|value| !value.is_null())
+                || record.get("status").and_then(PyValue::as_str) != Some("running")
+        })
+    }
+
+    /// drain／flush：停在 `replay_parked` 的命令尚未有任何 TX，以 NotSubmitted 結束（同在途前景的中止分類）。
+    fn abort_parked_command(&mut self) {
+        if let Some(parked) = self.replay_parked.take() {
+            if !self.parked_terminal(&parked.cmd_id) {
+                self.deps.registry.complete(
+                    &parked.cmd_id,
+                    CmdOutcome::Aborted(crate::arbiter::AbortClass::NotSubmitted),
+                    &self.wall_iso(),
+                );
+            }
         }
     }
 
@@ -4465,6 +4509,7 @@ impl SessionCore {
     /// `_on_command_flush`／`_on_detached` 的佇列終結（FLUSHED_BY_RECOVERY）。
     fn flush_queue(&mut self) {
         let _ = self.queue.drain_all();
+        self.abort_parked_command();
         self.deps
             .registry
             .flush_session(&self.sid, "FLUSHED_BY_RECOVERY", &self.wall_iso());

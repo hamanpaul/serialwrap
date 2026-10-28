@@ -107,8 +107,16 @@ pub enum ControlEvent {
     Shutdown {
         reply: Reply,
     },
-    /// P6 增補 #8：stream console（TCP／com0com）accept 或 hub 註冊完成。
-    ConsoleConnected { client_id: String, client_lifetime: u64, label: String, vtty: String, kind: ConsoleTransportKind },
+    /// P6 增補 #8：stream console（TCP／com0com）accept 或 hub 註冊完成。`close_gen`＝accept 當下 hub 已處理的
+    /// close-all 次數；小於 core 已送出的 `ConsoleCloseAll` 次數者屬已關閉世代，core 拒收（sol 補審 High #2）。
+    ConsoleConnected {
+        client_id: String,
+        client_lifetime: u64,
+        label: String,
+        vtty: String,
+        kind: ConsoleTransportKind,
+        close_gen: u64,
+    },
     /// P6 增補 #8（07 D-09）：actor thread 之外取得的 `/proc` 掃描快照。
     ConsoleScan { scan: ConsoleScanSnapshot, source: ScanSource },
     /// P6 增補 #8（07 D-15(5)）：human TX pump 的結算。

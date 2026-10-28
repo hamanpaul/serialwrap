@@ -361,6 +361,7 @@ fn human_tx_ledger_drains_after_1000_keys() {
         label: "127.0.0.1:50000".into(),
         vtty: "127.0.0.1:50000".into(),
         kind: ConsoleTransportKind::TcpTelnet,
+        close_gen: 0,
     });
     let _ = rig.get_state();
     for _ in 0..1000 {

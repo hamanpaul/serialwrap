@@ -709,8 +709,14 @@ impl SessionCore {
         label: String,
         vtty: String,
         kind: ConsoleTransportKind,
+        close_gen: u64,
         now: Mono,
     ) -> Vec<Effect> {
+        if close_gen < self.human.close_gen {
+            // hub 於 close-all 之前 accept、事件晚於 release Phase 1 到達：Python accept 與 begin_drain 同鎖，release
+            // 必關閉此 client；不登記、不授 owner，並要求 hub 關閉（hub 處理 close-all 時多半已關，重送為 no-op）。
+            return vec![Effect::ConsoleClose { client_id }];
+        }
         self.human.next_lifetime = self.human.next_lifetime.max(lifetime);
         self.human.consoles.insert(
             client_id.clone(),
@@ -982,9 +988,9 @@ impl SessionCore {
         self.human.ownership.reset_for_stop();
         self.after_owner_change(before);
         if *kind == StopKind::Release {
-            if !self.human.consoles.is_empty() {
-                fx.push(Effect::ConsoleCloseAll);
-            }
+            // 一律送出（含 core 尚無 console 時）：hub 可能已 accept、事件仍在途（sol 補審 High #2）。
+            fx.push(Effect::ConsoleCloseAll);
+            self.human.close_gen += 1;
             self.human.consoles.clear();
             self.human.peer_present.clear();
             self.human.primary_client_id = None;

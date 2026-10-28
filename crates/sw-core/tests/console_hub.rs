@@ -502,3 +502,27 @@ fn scan_does_not_grow_pending_beyond_cap() {
     assert!(pending <= sw_proto::constants::CONSOLE_HUB_PENDING_EVENTS as u64, "pending={pending}");
     t.block_mailbox(false);
 }
+
+/// sol 補審 p6-20261028 High #2：`ConsoleConnected` 帶 hub 已處理的 close-all 世代（close_all 之後的 accept 為新世代）。
+#[test]
+fn console_connected_carries_processed_close_gen() {
+    let t = HubHarness::tcp("COM0");
+    t.hub.cmd.try_send(HubCmd::StartListener).unwrap();
+    t.settle();
+    let c1 = t.fake.connect();
+    t.settle();
+    t.hub.close_all();
+    t.settle();
+    assert!(c1.closed());
+    let _c2 = t.fake.connect();
+    t.settle();
+    let gens: Vec<u64> = t
+        .control_events()
+        .iter()
+        .filter_map(|e| match e {
+            ControlEvent::ConsoleConnected { close_gen, .. } => Some(*close_gen),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gens, vec![0, 1]);
+}

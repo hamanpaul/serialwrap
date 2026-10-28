@@ -88,6 +88,8 @@ pub struct HubCritical {
     /// ≤ console 數。
     pub close: Vec<String>,
     pub close_all: bool,
+    /// 自上次取出以來的 close_all 請求數（hub 累加為已處理的 close 世代）。
+    pub close_all_requests: u64,
     pub shutdown: bool,
 }
 
@@ -199,7 +201,10 @@ impl HubHandle {
         });
     }
     pub fn close_all(&self) {
-        self.critical(|c| c.close_all = true);
+        self.critical(|c| {
+            c.close_all = true;
+            c.close_all_requests += 1;
+        });
     }
     pub fn shutdown(&self) {
         self.critical(|c| c.shutdown = true);
@@ -308,6 +313,7 @@ pub fn spawn_hub_with(
         pending_full_warned: false,
         next_scan: now.saturating_add(secs_ns(HUMAN_PEER_GRACE_S)),
         stream_lifetime: 1 << 40,
+        close_gen: 0,
         id_seq: 0,
         id_hash: RandomState::new(),
         #[cfg(feature = "test-fakes")]
@@ -370,6 +376,8 @@ struct Hub {
     pending_full_warned: bool,
     next_scan: Mono,
     stream_lifetime: u64,
+    /// 已處理的 close-all 次數（`ConsoleConnected.close_gen`；sol 補審 High #2）。
+    close_gen: u64,
     id_seq: u64,
     id_hash: RandomState,
     #[cfg(feature = "test-fakes")]
@@ -492,6 +500,7 @@ impl Hub {
         if taken.close_all {
             self.close_everything();
         }
+        self.close_gen += taken.close_all_requests;
         for cid in taken.close {
             if let Some(id) = self.by_cid.get(&cid).copied() {
                 self.remove_client(id, false);
@@ -648,6 +657,7 @@ impl Hub {
                             label: format!("serial:{port}"),
                             vtty: port,
                             kind: ConsoleTransportKind::Com0com,
+                            close_gen: self.close_gen,
                         }));
                 }
                 Err(e) => self.warn(format!(
@@ -791,6 +801,7 @@ impl Hub {
                     label: peer,
                     vtty: endpoint,
                     kind: ConsoleTransportKind::TcpTelnet,
+                    close_gen: self.close_gen,
                 }));
         }
     }

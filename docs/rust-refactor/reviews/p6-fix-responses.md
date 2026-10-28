@@ -265,3 +265,42 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 - `lease_selftest::selftest_probe_drain_race_golden`（P5 檔案）在全套 pytest 同時執行的負載下失敗一次（`lease_selftest.rs:1303`），隨後單獨連跑 3 次皆 31/31 綠；失敗集合不同，判定為負載敏感的競態迴圈測試，交 P5 評估是否加寬時序。
 - `origin/feature/rust-refactor-p5` 有 3 個新 commit（18abb03、9363d9b、1f5aafa），本輪 Task 不需要，未合併。
 - Task 11 Step 4 重跑（8032dfa 的 debug artifact）：`tests/test_human_agent_coexist.py` 對 Rust 8/8；func-test 2.2 八案 7/8，`cowork-01-agent-bad-cmd` 仍失敗（PROMPT_TIMEOUT 後停在 ATTACHED、40 s 內未回 READY；Python 基線同案 PASS）。在拋棄式 worktree 合併 P5 tip（1f5aafa）後重建仍失敗，屬 P5 救援／reprobe 路徑的上游缺口，未修。L1.5 `l15-multi-source-contention-console` 本輪未重跑。
+
+## 第三輪 Slice 2.2（2026-10-28 cloud session）：合併與 sol 補審
+
+### 合併（60ab7d2 主線、9dca414 P5 c66f65e）
+
+| 項目 | 處理 |
+|---|---|
+| cases.yaml／cases.lock.json／counts | 主線版本為底附加 P6 Task 0 的 14 案，`regen_lock.py --add-only` 重算；兩父 commit 的集合 ID 與 case_attrs 全保留（slice_2.2＝95） |
+| l1_required.lock.json | 對主線 add-only；相對 P6 少的 508 列皆為合併基點既有、由主線 `--allow-removal` 移除的 s1a／s1b 列 |
+| 哨兵重複（P5 10e4ea6 F43／F30 與 P6 Task 9 步驟 5） | 保留 P6 hub 哨兵；P5 `OpenedBridge.vtty`／`SessionCore.vtty` 移除，`rx`（F51）照收；self-test `vtty_alive` 經 `ConsoleTransportFactory::slave_path_exists` 注入 |
+| `foreground_busy` 語意（P5 F27 與 P6 增補 #26） | 合併為「命令前景或未撤銷 hold」；P6 的前景槽占用語意改名 `fg_slot_busy` |
+| self-test 改 side op（P5 F25） | side op 完成路徑補 `self_test_suspend_end`（否則 probe 期間的 human 輸入不回放；`self_test_probe_suspends_human_without_admission` 鎖住） |
+| BLOCKED-OWNER：proc_scan 目標 tty 不可 stat | 主線 s1b_cargo `posix_tty_holder_scan_reports_unknown_when_target_unstatable`（→ Unknown）與 P5 s21_core `multi_open_tty_stat_failure_skips_tty_and_fd_dir_errors_classified`（→ Ok）矛盾；`posix.rs` 屬 P5，取 P5 版本，主線該測試在本分支為紅。交 P5 合併主線時裁決（Python `detect_multi_open` 無 status 欄，僅略過該 tty） |
+| BLOCKED-OWNER：凍結檔案例指紋 | 主線改 `l15-release-inflight` 的 `windows_gap_reason`（非 case_attrs 欄），`tests/test_slice21_case_freeze.py::test_freeze_case_fingerprints_match_current_cases[2.1／2.2]` 轉紅；`breaker/slice_2.{1,2}.json` 不得自行改寫，待擁有者逐名授權更新指紋 |
+
+### sol-backfill/p6-20261028.md
+
+| # | 等級 | Commit | 位置 | 處理 |
+|---|---|---|---|---|
+| S1 | High | 6eafa6a | `lease_p6.rs:139`／`start_next` | fixed（見下） |
+| S2 | Medium | 17270a4 | `console_echo_latency.rs:30` | fixed（見下） |
+| S3 | High | 4f710c3 | `hub.rs:503` | fixed（見下） |
+
+**S1（有效）**：照報告序列（c1 被 agent A soft preempt、鍵入 `Q`、A 過期未投 Tick、提交 `echo B`）實測 `tx_order` 為
+`[Command "echo B\n", HumanReplay "Q"]`，Q 的 hold 隨後被 `command_fg_begin` 撤銷。Python `execute_command` 於 refresh 後同步
+`post.execute()`，UART 為 Q → B。修正：`start_next` 在執行期檢查通過後若 refresh 建立了回放 hold（`fg_slot_busy()`），命令停在
+`replay_parked`（registry 已為 running），hold 結算後的 kick 優先送出、不重做出列檢查；drain／flush 以 `Aborted(NotSubmitted)`
+終結。回歸：`session_core_lease::dequeue_lazy_expiry_replays_before_next_command`（`echo B` 與 `reboot` 兩案；修正前 FAIL）、
+`dequeue_parked_command_aborted_on_drain`（移除 abort 呼叫即 FAIL）。
+
+**S2（有效）**：原測試只等 console 收到按鍵，line mode 本地回顯也會通過。修正：先斷言 c1 為 raw owner；每個樣本須先在
+FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 byte，才接受 console 回顯；新增負對照
+`console_echo_sample_rejects_local_echo`（第二個 console、line mode：本地回顯存在但樣本判定失敗）。
+
+**S3（有效）**：release Phase 1 只在 core 已有 console 時送 `ConsoleCloseAll`，且 `console_connected` 不檢查世代；hub 已 accept、
+事件在途時晚到事件會登記 console 並授 raw owner。修正：`ConsoleConnected` 帶 hub 已處理的 close-all 次數 `close_gen`
+（`HubCritical.close_all_requests` 累加，不受合併旗標影響）；core 每次送 `ConsoleCloseAll` 遞增 `human.close_gen`，release 一律送出；
+`close_gen` 小於 core 值的事件不登記並回 `ConsoleClose`。回歸：`session_core_console::late_console_connected_after_release_is_rejected`
+（拿掉世代檢查即 FAIL；並驗證 release 後新世代連線照常取得 owner）、`console_hub::console_connected_carries_processed_close_gen`。
