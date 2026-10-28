@@ -1372,7 +1372,7 @@ def test_bc_real_sc_df_ranges() -> None:
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36"}
+    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36", "SC-37"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
     assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20", "DF-21", "DF-22"}
 
@@ -1382,6 +1382,14 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df19.case_ids == ("df19-self-test-probe-quiet-fence",)
     assert "SES-16.6-08" in df19.reconciliation_refs
     assert df19.applies_rust_stage == "slice-2.1"
+
+    # PA-OD-1／OD-21 (1)：SC-37 daemon 端 backend env 強制非原生後端 → Rust exit 1（parity #6／#71）。
+    sc37 = by_id["SC-37"]
+    assert sc37.scope == "rust_only" and sc37.applies_python_min is None
+    assert sc37.applies_rust_stage == "slice-2.1"
+    assert sc37.ab_participation == "absolute_only"
+    assert "OD-21" in sc37.related_decisions
+    assert "exit 1" in sc37.compatibility_impact and "SERIALWRAP_RPC_BACKEND" in sc37.compatibility_impact
 
     df20 = by_id["DF-20"]
     assert df20.scope == "both" and df20.applies_python_min == "0.4.0"

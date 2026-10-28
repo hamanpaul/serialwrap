@@ -474,3 +474,24 @@ def test_cmd_judge_reloads_parity_like_assemble(case, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["verdict"] == "INCOMPLETE", out
     assert any("#104" in r for r in out["verdict_reasons"]), out
+
+
+def test_l15_ab_excluded_case_requires_covering_pytest_passed(case):
+    """OD-40：`l15-wal-interference` 移出 l15_ab 判定後，改由逐名列出的 pytest WAL 測試承擔；
+    l15_ab 只有在每個 covered_by 測試於指定 section 恰為 passed 時才得 PASS，否則 EVIDENCE_MISSING（不得默默放行）。"""
+    nid = GATE_NODEIDS["blackbox_rust"][0]
+    exp = case.expect()
+    exp["l15_ab_excluded"] = [{"case_id": "l15-wal-interference", "decision": "OD-40",
+                               "covered_by": [{"section": "blackbox_rust", "nodeid": nid},
+                                              {"section": "blackbox_python", "nodeid": "tests/x.py::test_absent"}]}]
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "l15_ab")["status"] == "EVIDENCE_MISSING"
+    assert any("OD-40" in r and "test_absent" in r for r in _sec(out, "l15_ab")["reasons"])
+    assert out["verdict"] == "INCOMPLETE"
+    exp["l15_ab_excluded"][0]["covered_by"][1]["nodeid"] = GATE_NODEIDS["blackbox_python"][0]
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "l15_ab")["status"] == "PASS"
+    # 只在其他 section 通過不算（必須在列出的 section）
+    exp["l15_ab_excluded"][0]["covered_by"] = [{"section": "blackbox_python", "nodeid": nid}]
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "l15_ab")["status"] == "EVIDENCE_MISSING"

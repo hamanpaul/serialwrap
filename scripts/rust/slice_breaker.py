@@ -160,6 +160,17 @@ def _check_snapshot_denominators(snapshots: list[dict], freeze: dict) -> None:
             raise ValueError(f"快照 {snap.get('date')} 的 rate={snap['rate']} 與 passed÷denominator={passed / denom:.6f} 不符")
 
 
+def _effective_freeze(path: pathlib.Path) -> dict:
+    """凍結檔＋擁有者逐名核准的修訂（`freeze_slice_cases.load_effective_freeze`；OD-34 起）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("freeze_slice_cases",
+                                                  pathlib.Path(__file__).resolve().parent / "freeze_slice_cases.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.load_effective_freeze(path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="承接率斷路器判定（§12.2、OD-02、OD-13）")
     parser.add_argument("--freeze", type=pathlib.Path, required=True, help="斷路器凍結檔（slice_2.x.json）")
@@ -170,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        freeze = json.loads(args.freeze.read_text(encoding="utf-8"))
+        freeze = _effective_freeze(args.freeze)
         snapshots = _read_ndjson(args.snapshots)
         _check_snapshot_denominators(snapshots, freeze)
         today = args.today or dt.datetime.now(dt.timezone.utc).date().isoformat()

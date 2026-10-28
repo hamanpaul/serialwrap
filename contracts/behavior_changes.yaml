@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-36、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導（DF-18 保留給 P7）。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導（DF-18 保留給 P7）。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
@@ -918,6 +918,32 @@ changes:
     compatibility_impact: "Windows bundle 可選附 com0com 3.0.0.0；預設不安裝。基本安裝不需管理員，只有明確安裝或移除此元件時才以 UAC 啟動 bundle helper。UAC 拒絕或 helper 失敗不影響基本安裝；本體 rollback 不移除 driver。元件附 GPLv2 授權與原始碼提供資訊，Spike 1 剩餘項目通過前維持 experimental。"
     approval_conditions: "依 OD-15：元件為預設不選取的 Windows 選項，helper 單獨提權；基本安裝與更新不提權，rollback 不操作 driver。Spike 1 剩餘項目需於 HVCI 開啟機台全數通過前維持 experimental:true。"
     related_decisions: ["OD-15", "OD-01", "OD-08"]
+  - id: "SC-37"
+    kind: "SC"
+    title: "daemon 端 backend env 強制非本平台後端時 exit 1"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-26"
+      decision_ref: "OD-21"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 6
+    spec_refs: ["OD-21 (1)", "parity-amendments-2026-10-26 #6／#71"]
+    reconciliation_refs: ["SC-37"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P5"]
+    case_ids: ["sc37-daemon-backend-env-non-native-exit-1"]
+    compatibility_impact: "serialwrapd 的 SERIALWRAP_RPC_BACKEND／SERIALWRAP_LOCK_BACKEND／SERIALWRAP_DEVICE_BACKEND 設為非本平台後端（例如 Linux 上 win）時，Rust daemon 於 Python 選擇該後端的同一時點報錯並 exit 1；Python 會在 POSIX 上改建 TCP RPC 等非原生後端。合法值與本平台值行為不變。"
+    approval_conditions: "依 OD-21 (1) 擁有者逐項核准；A/B manifest 以 absolute_only 精確排除，比較器只驗 Rust 側 exit 1 與 stderr；argparse 錯誤（rc 2）與 SC-19 allowlist 檢查的先後順序維持 Python 時點（cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1、backend_env_checked_where_python_selects_it）。"
+    related_decisions: ["OD-21"]
   - id: "DF-01"
     kind: "DF"
     title: "event rule_id 路徑穿越防護"

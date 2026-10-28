@@ -376,6 +376,7 @@ def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[s
 def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any]:
     """依計畫 Task 22 判定規則重算 section 與 verdict（純函式；不寫檔）。"""
     passed_pool: set[str] = set()
+    section_passed: dict[str, set[str]] = {}
     by_name: dict[str, Mapping[str, Any]] = {}
     for sec in report.get("sections") or []:
         if isinstance(sec, Mapping) and sec.get("name") not in by_name:
@@ -392,7 +393,10 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
             reasons = ["section 未出現在報告中"]
             status, l1v = "EVIDENCE_MISSING", _empty_l1_verdict("section 缺失")
         elif name in TEST_SECTIONS:
-            status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], passed_pool)
+            pool: set[str] = set()
+            status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], pool)
+            section_passed[name] = pool
+            passed_pool |= pool
         elif name in NON_TEST_SECTIONS:
             status, reasons = _judge_non_test_section(sec)
             l1v = {}
@@ -403,6 +407,18 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         sec["reasons"] = reasons
         sec["allowed_missing_bo"] = ALLOWED_MISSING.get(name)
         out_sections.append(sec)
+
+    # OD-40：移出 l15_ab 的情境改由逐名列出的 pytest 測試承擔；每筆須在指定 section 恰為 passed，否則 l15_ab 不得 PASS。
+    for sec in out_sections:
+        if sec["name"] != "l15_ab" or sec["status"] != "PASS":
+            continue
+        for row in expect.get("l15_ab_excluded") or []:
+            absent = [f"{c.get('section')}:{c.get('nodeid')}" for c in (row.get("covered_by") or [])
+                      if c.get("nodeid") not in section_passed.get(str(c.get("section")), set())]
+            if absent or not row.get("covered_by"):
+                sec["status"] = "EVIDENCE_MISSING"
+                sec["reasons"] = list(sec["reasons"]) + [
+                    f"{row.get('case_id')} 依 {row.get('decision')} 移出 l15_ab，承擔的 pytest 未見 passed：{absent or '（未列）'}"]
 
     missing_id, mismatch_id = identity_problems(report.get("identity"), expect.get("daemon_path"))
     uptake = case_uptake(expect.get("freeze"), expect.get("case_verdicts"))
@@ -617,7 +633,9 @@ def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case
     狀態／來源一律由檔案重新載入並驗證；parity 狀態檔或來源不可得時仍帶入（judge_parity 判 INCOMPLETE），
     不得以「未提供 parity」略過必要條件。回傳 (expect, parity 來源位置)。"""
     freeze_path = ROOT / expect_yaml["freeze_file"]
-    freeze = json.loads(freeze_path.read_text(encoding="utf-8")) if freeze_path.is_file() else None
+    # 凍結檔＋擁有者逐名核准的修訂（OD-34 起）；修訂鏈不一致即 ValueError（工具錯誤 exit 2，不得放行）。
+    freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
+    freeze = freeze_mod.load_effective_freeze(freeze_path) if freeze_path.is_file() else None
     pcfg = expect_yaml.get("parity") or {}
     status_rel = str(pcfg.get("status_file", "") or "")
     status_file = ROOT / status_rel
@@ -633,7 +651,8 @@ def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case
     expect = {"lock": lock, "base_dir": base_dir, "freeze": freeze, "case_verdicts": dict(case_verdicts),
               "daemon_path": daemon_path, "parity": parity_in,
               "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
-              "bo_ids": list(bo_ids), "breaker": breaker_inputs(expect_yaml)}
+              "bo_ids": list(bo_ids), "breaker": breaker_inputs(expect_yaml),
+              "l15_ab_excluded": list(expect_yaml.get("l15_ab_excluded") or [])}
     return expect, src_where
 
 

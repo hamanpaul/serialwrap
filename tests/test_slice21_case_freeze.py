@@ -37,13 +37,27 @@ def _freeze() -> dict:
     return json.loads(FREEZE.read_text(encoding="utf-8"))
 
 
+def _effective() -> dict:
+    """凍結檔＋擁有者逐名核准的修訂（`slice_2.1.amendments.json`；OD-34 起）的有效凍結內容。"""
+    return _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py").load_effective_freeze(FREEZE)
+
+
 def test_freeze_matches_lock():
-    """分母以凍結時的 required_case_ids 為準，並與 lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，
-    後續切片只新增 slice_2.1 以外的案例）。cases_lock_sha256 僅作 provenance：lock 每次 add-only 重算都會改位元組，
-    只有 cases_revision 相同時才比對。分母指紋 denominator_sha256 以 lock 現行的 case_attrs 重算比對，
-    確認 required 案例的屬性未被改動。另釘住凍結欄位（schema、slice、窗口、Stage 2 起算日）與 cases.yaml 重算的集合，
-    cases_yaml_sha256 同樣只在 cases_revision 相同時比對。"""
-    fr = _freeze()
+    """分母以凍結時的 required_case_ids 為準（扣除擁有者逐名核准、記於修訂檔的延後案例），並與
+    lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，後續切片只新增 slice_2.1 以外的案例）。
+    cases_lock_sha256 僅作 provenance：lock 每次 add-only 重算都會改位元組，只有 cases_revision 相同時才比對。
+    分母指紋 denominator_sha256 以 lock 現行的 case_attrs 重算比對，確認 required 案例的屬性未被改動。
+    另釘住凍結欄位（schema、slice、窗口、Stage 2 起算日）與 cases.yaml 重算的集合，
+    cases_yaml_sha256 同樣只在 cases_revision 相同時比對。凍結檔本體不因修訂改寫：有效分母恆為其子集，
+    且被扣除者每一筆都附 OD 編號（OD-34）。"""
+    base = _freeze()
+    fr = _effective()
+    assert set(fr["required_case_ids"]) <= set(base["required_case_ids"])
+    removed = {r["case_id"]: r["decision"] for a in fr["amendments"] for r in a["removed"]}
+    assert set(base["required_case_ids"]) - set(fr["required_case_ids"]) == set(removed)
+    assert all(od.startswith("OD-") for od in removed.values())
+    for key in ("frozen_at", "window", "stage2_started_at", "schema_version", "slice", "denominator_set"):
+        assert fr[key] == base[key], key
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
     cases_doc = yaml.safe_load(CASES.read_text(encoding="utf-8"))
     assert fr["required_case_ids"] == lock["sets"]["slice_2.1"]
@@ -324,3 +338,72 @@ def test_breaker_stdio_is_utf8_under_cp1252(monkeypatch):
     sb._force_utf8_stdio()
     print("證據不足", file=sys.stderr)
     assert "證據不足".encode("utf-8") in raw_err.getvalue()
+
+
+def _defer_in_tmp(tmp_path, cid: str, to_slice: str, od: str):
+    """在暫存目錄複製 cases.yaml／lock 並以 regen_lock 逐名核准延後（OD 編號）；回傳 (cases, lock)。"""
+    import subprocess
+    import sys as _sys
+
+    regen = [_sys.executable, str(ACC / "regen_lock.py"), "--add-only"]
+    cases_doc = yaml.safe_load(CASES.read_text(encoding="utf-8"))
+    target = next(c for c in cases_doc["cases"] if c["case_id"] == cid)
+    # 先建「延後前」的暫存鎖（該案例在 2.1），再改 daemon_slice 並以核准延後重算。
+    target["daemon_slice"] = "2.1"
+    cases_doc["revision"] = "2099-01-01.0"
+    tcases = tmp_path / "cases.yaml"
+    tlock = tmp_path / "cases.lock.json"
+    tcases.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    pre = subprocess.run([*regen, "--cases", str(tcases), "--lock", str(tlock)], capture_output=True, text=True,
+                         encoding="utf-8")
+    assert pre.returncode == 0, pre.stderr
+    target["daemon_slice"] = to_slice
+    cases_doc["revision"] = "2099-01-01.1"
+    tcases.write_text(yaml.safe_dump(cases_doc, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    r = subprocess.run([_sys.executable, str(ACC / "regen_lock.py"), "--add-only", "--cases", str(tcases), "--lock", str(tlock),
+                        "--allow-defer", f"{cid}:2.1:{to_slice}:{od}"], capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stderr
+    return tcases, tlock
+
+
+def test_freeze_amend_records_owner_deferral_and_keeps_base(tmp_path, monkeypatch):
+    """OD-34：凍結檔不得覆寫；擁有者逐名核准的延後以 `--amend` 追加修訂紀錄（附 OD 編號、新 provenance），
+    有效分母＝凍結分母扣除核准延後者；觀測窗口與 Stage 2 起算日不變。未核准的移除、未引用 OD、鎖未同步延後皆拒絕。"""
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    bdir = tmp_path / "breaker"
+    bdir.mkdir()
+    monkeypatch.setattr(freeze, "BREAKER_DIR", bdir)
+    base_doc = _freeze()
+    base_path = bdir / "slice_2.1.json"
+    base_path.write_bytes(FREEZE.read_bytes())
+    base_bytes = base_path.read_bytes()
+    cid = "l15-delayed-reply"
+    assert cid in base_doc["required_case_ids"]
+    work = tmp_path / "work"
+    work.mkdir()
+    tcases, tlock = _defer_in_tmp(work, cid, "2.3", "OD-34")
+    common = ["--slice", "2.1", "--date", "2026-10-28", "--lock", str(tlock), "--cases", str(tcases)]
+    # 拒絕：未引用 OD／OD 不合法／延後清單與鎖不符
+    assert freeze.main(["--amend", *common, "--defer", f"{cid}:2.3"]) == 2
+    assert freeze.main(["--amend", *common, "--defer", f"{cid}:2.3:ODX"]) == 2
+    assert freeze.main(["--amend", *common]) == 2                                     # 鎖少了 cid 但未核准
+    assert freeze.main(["--amend", *common, "--defer", f"{cid}:2.2:OD-34"]) == 2     # 切片與鎖不符
+    assert not (bdir / "slice_2.1.amendments.json").exists()
+    assert freeze.main(["--amend", *common, "--defer", f"{cid}:2.3:OD-34"]) == 0
+    assert base_path.read_bytes() == base_bytes, "凍結檔本體不得改寫"
+    eff = freeze.load_effective_freeze(base_path)
+    assert eff["required_case_ids"] == [c for c in base_doc["required_case_ids"] if c != cid]
+    assert eff["denominator"] == base_doc["denominator"] - 1
+    assert eff["window"] == base_doc["window"] and eff["stage2_started_at"] == base_doc["stage2_started_at"]
+    assert eff["frozen_at"] == base_doc["frozen_at"]
+    assert eff["cases_revision"] == "2099-01-01.1"
+    assert eff["cases_lock_sha256"] == hashlib.sha256(tlock.read_bytes()).hexdigest()
+    amend = eff["amendments"][-1]
+    assert amend["removed"] == [{"case_id": cid, "to_slice": "2.3", "decision": "OD-34"}]
+    assert amend["base_freeze_sha256"] == hashlib.sha256(base_bytes).hexdigest()
+    # 修訂檔遭竄改（移除項與核准不符）即拒絕載入
+    tampered = json.loads((bdir / "slice_2.1.amendments.json").read_text(encoding="utf-8"))
+    tampered[-1]["required_case_ids"] = tampered[-1]["required_case_ids"][1:]
+    (bdir / "slice_2.1.amendments.json").write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)

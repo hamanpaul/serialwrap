@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-21.1",
+  "cases_revision": "2026-10-28.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -370,7 +370,6 @@
       "f4-activity-classification",
       "f4-background-result-tail-consistent",
       "ha-05-concurrent-submit",
-      "l15-delayed-reply",
       "l15-exclusive-open",
       "l15-half-prompt",
       "l15-multi-source-contention-cli",
@@ -439,7 +438,6 @@
       "hk-03-deferred-input-flush",
       "hk-04-minicom-exit-cleanup",
       "l15-context-switch-deferred-input",
-      "l15-delayed-reply",
       "l15-exclusive-open",
       "l15-half-prompt",
       "l15-multi-source-contention-cli",
@@ -1785,7 +1783,7 @@
       ],
       "expected": "PASS",
       "necessity": "required",
-      "daemon_slice": "2.1",
+      "daemon_slice": "2.3",
       "cli_stage": "1A",
       "stage0_required": true
     },

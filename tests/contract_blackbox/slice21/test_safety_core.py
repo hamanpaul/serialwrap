@@ -188,6 +188,49 @@ def test_wal_unlink_recreates_with_meta(shell_daemon):
     assert m["potentially_lost_seq_range"][1] < recs[1]["seq"]
 
 
+def _tx_payloads(recs: list[dict]) -> list[bytes]:
+    import base64
+
+    return [base64.b64decode(r.get("payload_b64") or "") for r in recs if r.get("dir") == "TX"]
+
+
+def test_wal_reset_archives_and_next_command_recorded(shell_daemon):
+    """OD-40：l15-wal-interference 的 reset 段改由本案承擔——`wal reset` 把現行 WAL 改名歸檔（輪替），
+    之後的命令 TX 記於新現行檔、seq 自頭起算；reset 前的紀錄只留在歸檔檔。"""
+    d = shell_daemon
+    before = _submit(d, "echo wal-before-reset")
+    d.wait_command_done(before["cmd_id"], timeout=15)
+    r = d.sw("wal", "reset")
+    assert r.get("ok") is True, r
+    archived = sorted(d.wal_dir.glob("raw.wal.ndjson.*"))
+    assert archived, f"reset 須把現行 WAL 改名歸檔：{sorted(p.name for p in d.wal_dir.iterdir())}"
+    assert any(b"echo wal-before-reset\n" in p.read_bytes() or b"ZWNobyB3YWwtYmVmb3JlLXJlc2V0Cg" in p.read_bytes()
+               for p in archived), "reset 前的 TX 須留在歸檔檔"
+    d.wait_state("COM0", "READY")
+    after = _submit(d, "echo wal-after-reset")
+    d.wait_command_done(after["cmd_id"], timeout=15)
+    recs = d.wal_records()
+    payloads = _tx_payloads(recs)
+    assert b"echo wal-after-reset\n" in payloads, payloads
+    assert b"echo wal-before-reset\n" not in payloads, "reset 前的紀錄不得出現在新現行檔"
+    assert recs and recs[0]["seq"] < 10, f"reset 後 seq 須自頭起算：{recs[:2]}"
+
+
+def test_wal_reader_hold_does_not_block_records(shell_daemon):
+    """OD-40：l15-wal-interference 的讀取鎖定段——外部持有 WAL 讀取 handle 期間，命令照常完成且 TX 照記
+    （Windows 原生執行時才是真正的共用鎖定情境；POSIX 上 reader 不阻擋，仍驗證不漏記）。"""
+    d = shell_daemon
+    wal = d.wal_dir / "raw.wal.ndjson"
+    assert wal.exists()
+    with open(wal, "rb"):
+        sub = _submit(d, "echo wal-during-hold")
+        d.wait_command_done(sub["cmd_id"], timeout=15)
+        assert b"echo wal-during-hold\n" in _tx_payloads(d.wal_records())
+    after = _submit(d, "echo wal-after-hold")
+    d.wait_command_done(after["cmd_id"], timeout=15)
+    assert b"echo wal-after-hold\n" in _tx_payloads(d.wal_records())
+
+
 def test_recovering_submit_session_recovering(shell_daemon):
     _tgt(shell_daemon).stop()                                              # FakeTarget I/O error 瞬間
     r = _submit(shell_daemon, "echo x")

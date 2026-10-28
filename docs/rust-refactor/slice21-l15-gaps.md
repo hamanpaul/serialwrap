@@ -32,12 +32,12 @@
 | 4 | `s21-partial-tx-abort`：BC-03 條件式映射與「該 cmd_id TX len 總和 < 16001」無法表達 | 待裁決（需條件式／聚合斷言動作） |
 | 5 | `s21-reboot-minimal-guard`：`recovery_action == EXPECT_REBOOT` 或 `done` 的 OR、`dut_generation == 2` | 待裁決（需 OR 斷言與 DUT generation 查詢動作）；另見上表 #162 修正 |
 | 6 | `s21-event-latency`：缺 `stop_request`、flood 無速率控制且量測時 flood 已結束（審查 c0d221f #1）、loadavg 超標不重跑、樣本數超過 900 s、兩個 daemon 皆無計時欄位、INSUFFICIENT_EVIDENCE 與 FAIL 共用 StepError（2af2554 #2） | 待裁決 `PA-OD-EVLAT`：需 daemon 端（Python 與 Rust）提供 `test_fakes.event_latency.<event>` 計時欄位、runner 補 `stop_request`／重啟與 flood 在途檢查（2af2554 #1），判定器讀 `resource_limits.yaml measurement_runs` |
-| 7 | P2 凍結 `l15-wal-interference` 為 `compare: none`，兩個 label 恆 INSUFFICIENT | 待裁決 `PA-OD-L15-WAL`（原檔依規定未改） |
+| 7 | P2 凍結 `l15-wal-interference` 為 `compare: none`，兩個 label 恆 INSUFFICIENT | **OD-40 已裁決**：自 `l15_ab` 判定逐名移出（情境檔與 2.1 必要案例保留），由 `slice21_gate_expect.yaml` `l15_ab_excluded` 逐名列出的 pytest 承擔（unlink、reset 歸檔改名、reader-hold 為新增黑箱 A/B；寫入門檻輪替由 Python／Rust 單元測試承擔；Windows 讀取鎖定 LOCAL-WINDOWS-TODO），judge 要求每筆在指定 section passed |
 | 8 | `external_open` 只能排在 release 之後（daemon 持 TIOCEXCL 時 EBUSY 依 R0-F3 判 FAIL） | 同 #1 |
 | 9 | 「從未進入 ATTACHING／READY」只能以 `wait_cli_until` 單點取樣（審查 c0d221f #2） | 待裁決（需以 daemon 事件或 WAL META 判定窗口內狀態序列的動作）；兩個情境的註解已改為如實描述「單點取樣」 |
 | 10 | `s21-wal-unlink-under-traffic`：unlink 後 WAL 無窗口前紀錄可比 | 待裁決（需 runner 在 `wal_control unlink_current` 前保存 WAL 快照並讓比較器納入，或改情境比對範圍；比較器屬已核准 bridge 工具樹，不在本輪改） |
 
-裁決項：`PA-OD-L15-GAPS`（#1、#3～#5、#8～#10）、`PA-OD-EVLAT`（#6）、`PA-OD-L15-WAL`（#7）、`PA-OD-REPROBE`（readiness reprobe 依賴）。
+裁決項：`PA-OD-L15-GAPS`（#1、#3～#5、#8～#10）→ OD-39、`PA-OD-EVLAT`（#6）→ OD-41、`PA-OD-L15-WAL`（#7）→ OD-40、`PA-OD-REPROBE`（readiness reprobe 依賴）→ OD-34（`l15-delayed-reply`、`s21-reboot-minimal-guard` 延至 Slice 2.3 出口；見 `slice21_gate_expect.yaml` `deferred_to_s23`）。
 
 另：`tests/acceptance/l15/test_slice21_l15.py` 的 P2 凍結清單依 `cases.lock.json` `slice_2.1` 為 11 個（計畫程式草稿列 8 個，
 與凍結 lock 不符；repo 內 06 計畫第 4827、4842 行亦為 11 個），總項數 43。
