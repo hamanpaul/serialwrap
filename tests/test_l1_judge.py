@@ -746,6 +746,43 @@ def test_l1_lock_nodeids_subset_of_collect_only() -> None:
 
 
 @pytest.mark.memory_only
+@pytest.mark.parametrize("set_id", ["s1a_cargo", "s1b_cargo"])
+def test_boot_done_profile_parity_cases_are_frozen_and_required(set_id: str) -> None:
+    """#234 新增的四支 profile parity 測試須進 Linux cargo 分母；judge 漏收任一支都不能 PASS。"""
+    import tests.acceptance.l1_judge as l1_judge
+
+    required = [
+        "cargo:sw-cli::profile_checks::boot_done_regex_is_reported_like_python",
+        "cargo:sw-cli::profile_checks::boot_done_regex_unset_reports_empty_pattern",
+        "cargo:sw-cli::profile_checks::boot_done_value_error_wins_over_later_bootloader_overflow",
+        "cargo:sw-cli::profile_checks::password_value_error_wins_over_later_boot_done_overflow",
+    ]
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    platform = "linux"
+    frozen = set(lock["sets"][set_id][platform]["nodeids"])
+    assert set(required) <= frozen, f"{set_id}.{platform} 缺 frozen parity nodeid：{sorted(set(required) - frozen)}"
+
+    def report_for(nodeids: list[str], report_platform: str) -> dict:
+        return {
+            "format": "l1-results.v1", "platform": report_platform, "runner": "cargo", "schema_version": 2,
+            "argv": lock["sets"][set_id][platform]["selector"]["argv"], "markexpr": "", "counts": {},
+            "resources": {}, "uart_kind": "native", "not_collected_platform": [],
+            "core_portable_platform_skips": [], "deselected": [], "collected": nodeids,
+            "exit_code": 0, "finished": True, "deployed_content": None,
+            "results": [{"nodeid": nodeid, "outcome": "passed", "skip_kind": None,
+                         "phases": {"setup": "passed", "call": "passed", "teardown": "passed"}}
+                        for nodeid in nodeids],
+        }
+
+    for judge_platform in ("linux", "windows"):
+        assert l1_judge.judge(report_for(required, judge_platform), required, platform=judge_platform)["verdict"] == "PASS"
+        missing = required[:-1]
+        verdict = l1_judge.judge(report_for(missing, judge_platform), required, platform=judge_platform)
+        assert verdict["verdict"] == "INSUFFICIENT", verdict
+        assert required[-1] in verdict["missing"]
+
+
+@pytest.mark.memory_only
 def test_l1_lock_frozen_set_excludes_capability_gated() -> None:
     """凍結的 Windows 必要集合不得含能力 SKIP 案例（plan Task 13：不適用的案例不得列入該平台集合）。
 
