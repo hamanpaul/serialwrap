@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _DEFERRED_CASES = {
     "l15-transport-disconnect": (
@@ -37,6 +41,27 @@ def _is_deferred_result(row: dict[str, Any]) -> bool:
     return isinstance(diagnostics, list) and not any(
         isinstance(item, dict) and item.get("kind") == "harness_stop_failed" for item in diagnostics
     )
+
+
+def _declared_repeat(case_id: str, *, scenarios: bool) -> int | None:
+    """讀取 runner 實際使用的案例 repeat；檔案或宣告不合法時 fail-closed。"""
+    if not case_id or Path(case_id).name != case_id:
+        return None
+    kind = "scenarios" if scenarios else "cases"
+    path = _REPO_ROOT / "func-test" / kind / f"{case_id}.yaml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    meta = raw.get("meta") or {}
+    if not isinstance(meta, dict) or meta.get("name", path.stem) != case_id:
+        return None
+    repeat = meta.get("repeat", 1)
+    if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:
+        return None
+    return repeat
 
 
 def _gate_deferred_case_ids(gate: dict[str, Any]) -> set[str] | None:
@@ -86,7 +111,9 @@ def _report_results(
     if not all(
         isinstance(row, dict)
         and isinstance(row.get("case_id"), str) and row["case_id"]
-        and row.get("mode") == "bridge" and row.get("run_index") == 0
+        and row.get("mode") == "bridge"
+        and isinstance(row.get("run_index"), int) and not isinstance(row.get("run_index"), bool)
+        and row["run_index"] >= 0
         and isinstance(row.get("message"), str)
         and isinstance(row.get("harness_diagnostics"), list)
         and isinstance(row.get("evidence_dir"), str)
@@ -94,12 +121,21 @@ def _report_results(
     ):
         return False, [], 0
     case_ids = [row["case_id"] for row in results]
-    if len(set(case_ids)) != len(case_ids) or report.get("independent_cases") != len(case_ids):
+    unique_case_ids = set(case_ids)
+    run_keys = [(row["case_id"], row["mode"], row["run_index"]) for row in results]
+    if len(set(run_keys)) != len(run_keys) or report.get("independent_cases") != len(unique_case_ids):
         return False, [], 0
+    for case_id in unique_case_ids:
+        expected_repeat = _declared_repeat(case_id, scenarios=scenarios)
+        indexes = sorted(row["run_index"] for row in results if row["case_id"] == case_id)
+        if expected_repeat is None or indexes != list(range(expected_repeat)):
+            return False, [], 0
     report_subdir = "report" if scenarios else "report-basic"
     for row in results:
         evidence_dir = row["evidence_dir"].replace("\\", "/").rstrip("/")
-        expected_suffix = f"/sw-rust-test/{run_id}/{report_subdir}/{row['case_id']}/bridge/0"
+        expected_suffix = (
+            f"/sw-rust-test/{run_id}/{report_subdir}/{row['case_id']}/bridge/{row['run_index']}"
+        )
         if not evidence_dir.lower().endswith(expected_suffix.lower()):
             return False, [], 0
     verdicts = [row.get("verdict") for row in results]
