@@ -47,6 +47,7 @@ resolved_decisions:
   - {id: NC-P5-02, decision: OD-44, resolution: "承接率斷路器維持單一固定窗口（實作不改）；plan 09 斷路器段改為固定窗口寫法"}
   - {id: PA-OD-F67, decision: OD-42, resolution: "parity #32 以 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 替代；plan 06 #32 列改名附不可達理由"}
   - {id: PA-OD-L15-WAL, decision: OD-40, resolution: "l15-wal-interference 自 l15_ab 判定逐名移出，改由 l15_ab_excluded 所列 pytest 承擔"}
+  - {id: PA-OD-L15-GAPS, decision: OD-39, resolution: "runner 擴充 pre_daemon_steps、assert_when／assert_value、assert_wal_tx_total、assert_any、query_dut_generation、assert_wal_window、assert_wire_offsets（gaps #1／#3／#4／#5／#8 已補、#9 部分承接；#10 另列 PA-OD-L15-GAPS-10）"}
   - {id: PA-OD-T20, decision: "OD-36／OD-37／OD-38", resolution: "8 案案例設計修正（CHG-S21-OD36-*）、DF-20／DF-21 判定（CHG-S21-OD37-DF-01；DF-20 Rust 實作 → P6）、METHOD_NOT_FOUND Rust 專屬（CHG-S21-OD38-MNF-01）"}
   - {id: PA-OD-REPROBE, decision: OD-34, resolution: "l15-delayed-reply（凍結修訂 #1）、s21-reboot-minimal-guard 延至 Slice 2.3（deferred_to_s23）；cowork-01-agent-bad-cmd 屬 Slice 2.2，由 P6 分支承接"}
 # OD-34：自 Slice 2.1 gate 逐名移出、改列 Slice 2.3 出口必須 PASS（情境檔保留）。
@@ -76,8 +77,8 @@ l15_ab_excluded:
 # 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
 pending_decisions:
   - id: PA-OD-EVLAT
-    scenario: "event_latency 三輪判定器未實作（讀 resource_limits.yaml measurement_runs）；Rust daemon 尚無 test_fakes.event_latency 計時欄位、runner 無 stop_request（審查 b7cd852 #5、c0d221f #1、gaps #6）"
+    scenario: "OD-41（外部量測：觸發 RPC 時間 vs WAL 對應 META mono_ts_ns）停下回報：stop_request／command_cancel／lease_expiry／drain_receipt／release_request 五種事件在 Python 與 Rust daemon 的 WAL 皆無對應紀錄；不得在 daemon 加計時欄位，需擁有者裁決可觀測點（新增 WAL META 屬對外格式變更）"
     evidence: docs/rust-refactor/slice21-l15-gaps.md
-  - id: PA-OD-L15-GAPS
-    scenario: "s21 情境中 runner 仍無法表達的計畫斷言（gaps #1、#3～#5、#8～#10）；裁決前 gate 的 l15_ab 不計 PASS（EVIDENCE_MISSING；審查 c0d221f #3）"
+  - id: PA-OD-L15-GAPS-10
+    scenario: "OD-39 已裁決 runner 擴充；其中 gaps #10（s21-wal-unlink-under-traffic 比對範圍）在不改 bridge 工具樹下不可實作，#9 以 WAL RX／TX 紀錄替代狀態 META（兩個 daemon 皆無狀態 META）。需擁有者擇一：核准比較器起點窗口，或改以 unlink 前硬連結保存 WAL"
     evidence: docs/rust-refactor/slice21-l15-gaps.md

@@ -345,3 +345,189 @@ def test_expect_list_contains_matches_expanded_scalar():
     assert len(check_expect(resp, {"pids": {"list_contains": "999"}})) == 1
     assert len(check_expect({"pids": "4242"}, {"pids": {"list_contains": "4242"}})) == 1   # 非 list 不得視為命中
     assert len(check_expect({}, {"pids": {"list_contains": "1"}})) == 1
+
+
+# ---------------------------------------------------------------------------
+# OD-39（2026-10-28）：runner 擴充承接 slice21-l15-gaps.md #1／#3／#4／#5／#8／#9（不改 bridge 工具樹）
+# ---------------------------------------------------------------------------
+
+
+def _write_wal(path: pathlib.Path, rows: list[dict]) -> None:
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_pre_daemon_steps_loaded_and_run_before_daemon(tmp_path, monkeypatch):
+    """gaps #1／#3／#8：情境 `pre_daemon_steps` 於 DUT／bridge 就緒後、daemon 啟動前執行；只接受不需 daemon 的動作。"""
+    _ensure_func_test_path()
+    from lib import daemon_harness, yaml_loader
+
+    scen = tmp_path / "x.yaml"
+    scen.write_text("meta: {name: x}\npre_daemon_steps:\n  - {action: sleep, seconds: 0}\nsteps: []\n", encoding="utf-8")
+    tc = yaml_loader.load_test_case(scen)
+    assert tc.pre_daemon_steps == [{"action": "sleep", "seconds": 0}]
+
+    order: list[str] = []
+    cfg = daemon_harness.HarnessConfig(target_config=yaml_loader_target(), mode="pty", evidence_dir=tmp_path / "ev")
+    h = daemon_harness.DaemonHarness(cfg)
+    monkeypatch.setattr(h, "_start_fake_target", lambda: order.append("dut"))
+    monkeypatch.setattr(h, "wait_endpoint", lambda timeout_s=5.0: order.append("endpoint"))
+
+    class _P:
+        def __init__(self, *a, **k):
+            order.append("daemon")
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(daemon_harness.subprocess, "Popen", _P)
+    monkeypatch.setattr(h, "stop", lambda: None)
+    h.start(before_daemon=lambda: order.append("pre"))
+    assert order[:3] == ["dut", "pre", "daemon"], order
+
+    runner_mod = _load_runner()
+    fh = _FakeHarness(tmp_path)
+    fh.bridge = None    # op_begin 不取 bridge 快照
+    tr = _make_runner(runner_mod, fh, tmp_path / "reports")
+    tr._run_pre_daemon_steps([{"action": "sleep", "seconds": 0}, {"action": "op_begin", "op_id": "w", "settle": False}])
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._run_pre_daemon_steps([{"action": "cli", "argv": ["session", "list"]}])
+    assert "pre_daemon_steps" in str(exc.value)
+
+
+def yaml_loader_target():
+    _ensure_func_test_path()
+    from lib.target_config import TargetConfig
+
+    return TargetConfig.from_yaml({})
+
+
+def test_assert_when_runs_matching_branch(tmp_path):
+    """gaps #4：條件式斷言——依已存變數選分支執行；分支內斷言失敗即失敗。"""
+    runner_mod = _load_runner()
+    tr = _make_runner(runner_mod, _FakeHarness(tmp_path), tmp_path / "reports")
+    tr.variables["big"] = {"error_code": "COMMAND_ABORTED_IN_FLIGHT"}
+    ran: list[str] = []
+    tr._step_sleep = lambda step, idx: ran.append(str(step.get("tag")))  # type: ignore[method-assign]
+    step = {"action": "assert_when", "value": "{big.error_code}", "in": ["COMMAND_ABORTED_IN_FLIGHT"],
+            "then": [{"action": "sleep", "tag": "then"}], "else": [{"action": "sleep", "tag": "else"}]}
+    tr._exec_step(step, 0)
+    tr.variables["big"] = {"error_code": None}
+    tr._exec_step(step, 1)
+    assert ran == ["then", "else"]
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_when", "value": "{big.error_code}", "equals": None,
+                       "then": [{"action": "assert_any", "of": []}]}, 2)
+
+
+def test_assert_wal_tx_total_sums_cmd_tx_bytes(tmp_path):
+    """gaps #4：聚合斷言——同一 cmd_id 的 TX payload 長度總和（含歸檔 WAL）與門檻比較。"""
+    import base64
+
+    runner_mod = _load_runner()
+    h = _FakeHarness(tmp_path)
+    b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+    _write_wal(h.wal_dir() / "raw.wal.ndjson.20261028-000000", [{"dir": "TX", "cmd_id": "c1", "payload_b64": b64(b"x" * 100)}])
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [{"dir": "TX", "cmd_id": "c1", "payload_b64": b64(b"y" * 50)},
+                                                  {"dir": "TX", "cmd_id": "c2", "payload_b64": b64(b"z" * 999)},
+                                                  {"dir": "RX", "cmd_id": "c1", "payload_b64": b64(b"r" * 999)}])
+    tr = _make_runner(runner_mod, h, tmp_path / "reports")
+    tr.variables["big"] = {"cmd_id": "c1"}
+    out = tr._exec_step({"action": "assert_wal_tx_total", "cmd_id": "{big.cmd_id}", "lt": 151}, 0)
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_wal_tx_total", "cmd_id": "{big.cmd_id}", "lt": 150}, 1)
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_wal_tx_total", "cmd_id": "{big.cmd_id}"}, 2)   # 未給比較子
+
+
+def test_assert_any_passes_if_one_alternative_passes(tmp_path):
+    """gaps #5：OR 斷言——任一替代分支全部通過即通過；全部失敗則列出各分支錯誤。只接受無副作用的動作。"""
+    runner_mod = _load_runner()
+    tr = _make_runner(runner_mod, _FakeHarness(tmp_path), tmp_path / "reports")
+    tr.variables["rb"] = {"recovery_action": "NONE", "status": "done"}
+    ok = {"action": "assert_any", "of": [
+        [{"action": "assert_when", "value": "{rb.recovery_action}", "equals": "EXPECT_REBOOT", "then": [], "else": [{"action": "assert_any", "of": []}]}],
+        [{"action": "assert_when", "value": "{rb.status}", "equals": "done", "then": [], "else": [{"action": "assert_any", "of": []}]}],
+    ]}
+    tr._exec_step(ok, 0)
+    bad = {"action": "assert_any", "of": [
+        [{"action": "assert_when", "value": "{rb.status}", "equals": "error", "then": [], "else": [{"action": "assert_any", "of": []}]}]]}
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step(bad, 1)
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._exec_step({"action": "assert_any", "of": [[{"action": "cli", "argv": ["x"]}]]}, 2)
+    assert "assert_any" in str(exc.value)
+
+
+def test_query_dut_generation_reads_wire_records(tmp_path):
+    """gaps #5：DUT generation 查詢——取 wire.ndjson 的最大 dut_generation，可接 expect。"""
+    import json
+
+    runner_mod = _load_runner()
+    tr = _make_runner(runner_mod, _FakeHarness(tmp_path), tmp_path / "reports")
+    wire = tr._evidence_dir_path() / "wire.ndjson"
+    wire.parent.mkdir(parents=True, exist_ok=True)
+    wire.write_text("".join(json.dumps({"seq": i, "dut_generation": g}) + "\n" for i, g in enumerate([1, 1, 2])), encoding="utf-8")
+    out = tr._exec_step({"action": "query_dut_generation", "save_as": "gen", "expect": {"dut_generation": 2}}, 0)
+    assert tr.variables["gen"]["dut_generation"] == 2
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "query_dut_generation", "expect": {"dut_generation": 3}}, 1)
+
+
+def test_assert_wal_window_forbids_records_inside_op_window(tmp_path):
+    """gaps #9：以 WAL 紀錄判定 op 窗口內的狀態序列（兩個 daemon 皆無狀態轉移 META；以「窗口內該 COM 無 RX／TX」
+    證明 daemon 未開埠進入 ATTACHING／READY）。窗口以 op_begin／op_end 的 CLOCK_MONOTONIC 對 WAL mono_ts_ns。"""
+    runner_mod = _load_runner()
+    h = _FakeHarness(tmp_path)
+    h.bridge = None
+    tr = _make_runner(runner_mod, h, tmp_path / "reports")
+    tr._exec_step({"action": "op_begin", "op_id": "win", "settle": False}, 0)
+    start = tr._ops["win"]["start_mono_ns"]
+    tr._exec_step({"action": "op_end", "op_id": "win", "settle": False}, 1)
+    end = tr._ops["win"]["end_mono_ns"]
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [
+        {"com": "COM0", "dir": "TX", "mono_ts_ns": start - 1},
+        {"com": "COM1", "dir": "TX", "mono_ts_ns": start + 1},
+        {"com": "COM0", "dir": "META", "mono_ts_ns": start + 1},
+    ])
+    tr._exec_step({"action": "assert_wal_window", "op_id": "win", "com": "COM0", "forbid_dirs": ["RX", "TX"]}, 2)
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [{"com": "COM0", "dir": "RX", "mono_ts_ns": (start + end) // 2}])
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_wal_window", "op_id": "win", "com": "COM0", "forbid_dirs": ["RX", "TX"]}, 3)
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_wal_window", "op_id": "nosuch", "com": "COM0", "forbid_dirs": ["TX"]}, 4)
+
+
+def test_assert_value_and_tx_total_save_as(tmp_path):
+    """gaps #4：`assert_value` 比對已存變數（equals／in／matches）；`assert_wal_tx_total` 可 save_as 供條件式使用。"""
+    runner_mod = _load_runner()
+    h = _FakeHarness(tmp_path)
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [])
+    tr = _make_runner(runner_mod, h, tmp_path / "reports")
+    tr.variables["r"] = {"code": "X", "n": 0}
+    tr._exec_step({"action": "assert_value", "value": "{r.code}", "in": ["X", "Y"]}, 0)
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_value", "value": "{r.code}", "equals": "Y"}, 1)
+    tr._exec_step({"action": "assert_wal_tx_total", "cmd_id": "c9", "eq": 0, "save_as": "t"}, 2)
+    assert tr.variables["t"]["tx_bytes"] == 0
+
+
+def test_assert_wire_offsets_requires_settled_snapshot(tmp_path):
+    """gaps #1／#3：窗口自 daemon 啟動前起算時，以 settled 快照的絕對 wire offset 判定零 TX（daemon 不存在時
+    serial_read 必為 0）；快照未 settled 即 INSUFFICIENT_EVIDENCE，不得視為 PASS。"""
+    runner_mod = _load_runner()
+    h = _FakeHarness(tmp_path)
+    snaps = [{"settled": True, "wire": {"offsets": {"serial_read": 0, "serial_write": 9}}},
+             {"settled": True, "wire": {"offsets": {"serial_read": 4, "serial_write": 9}}},
+             {"settled": False, "wire": {"offsets": {"serial_read": 0}}}]
+    h.bridge.snapshot = lambda settle: snaps.pop(0)  # type: ignore[attr-defined]
+    tr = _make_runner(runner_mod, h, tmp_path / "reports")
+    step = {"action": "assert_wire_offsets", "observation": "serial_read", "equals": 0}
+    tr._exec_step(step, 0)
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step(step, 1)
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._exec_step(step, 2)
+    assert "INSUFFICIENT_EVIDENCE" in str(exc.value)

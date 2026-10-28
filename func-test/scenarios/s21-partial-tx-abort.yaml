@@ -5,7 +5,7 @@ meta:
   severity: critical
   description: "bridge 停止讀取 PTY master 使 writer 阻塞時 release，在途大命令終態明確且不重送；wire 該命令 bytes 總量與 WAL TX 一致（Slice 2.1 Task 21，BC-03）"
   scenario:
-    revision: "2026-10-27.1"
+    revision: "2026-10-28.1"
     seed: 1021
     capabilities: [posix_pty, process_rpc]
     timeout_s: 120
@@ -72,5 +72,25 @@ steps:
     json_path: "command.status"
     in: [done, error, canceled]
     timeout_s: 10
+  # OD-39（gaps #4）：BC-03 條件式映射——該 cmd_id 的 TX bytes > 0 ⇒ COMMAND_ABORTED_IN_FLIGHT，= 0 ⇒ FLUSHED_BY_RECOVERY；
+  # 兩種情形 TX 總和皆 < 16001（不重送、未寫完）
+  - action: cli
+    argv: ["cmd", "status", "--cmd-id", "{big.cmd_id}"]
+    save_as: big_done
+  - action: assert_wal_tx_total
+    cmd_id: "{big.cmd_id}"
+    lt: 16001
+    save_as: big_tx
+  - action: assert_when
+    value: "{big_tx.tx_bytes}"
+    equals: 0
+    then:
+      - action: assert_value
+        value: "{big_done.command.error_code}"
+        equals: FLUSHED_BY_RECOVERY
+    else:
+      - action: assert_value
+        value: "{big_done.command.error_code}"
+        equals: COMMAND_ABORTED_IN_FLIGHT
   # wire serial_read 與 WAL TX 位元組總量一致（BC-03：寫出幾個 byte 就記幾個 byte）
   - action: assert_compare

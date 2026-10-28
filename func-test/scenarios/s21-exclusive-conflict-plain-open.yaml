@@ -5,7 +5,7 @@ meta:
   severity: critical
   description: "不取鎖的外部工具（普通 open，模擬 minicom）先持有端點時，attach 與 attach --force 皆回 DEVICE_STILL_HELD{pids,holder_unknown:false} 且零 TX；外部關閉後 attach 成功並 READY（規格 §6.2，BC-04、SC-05）"
   scenario:
-    revision: "2026-10-27.1"
+    revision: "2026-10-28.1"
     seed: 1021
     capabilities: [posix_pty, process_rpc]
     timeout_s: 90
@@ -24,9 +24,53 @@ profile:
   prompt_regex: '(?m)^root@prplOS:.*# '
   ready_probe: 'echo __READY__${nonce}'
   timeout_s: 15
+# OD-39（gaps #1／#8／#9）：daemon 啟動前以普通 open（不 flock、不 TIOCEXCL，模擬 minicom）占用端點；
+# 「external_close 前從未進入 ATTACHING／READY」以窗口內 COM0 無 RX／TX 的 WAL 紀錄判定。
+pre_daemon_steps:
+  # daemon 啟動前 DUT 輸出暫存於 bridge，快照無法 settled；窗口只取 mono 時間點（assert_wal_window），
+  # 零 TX 改以 assert_wire_offsets 的絕對 serial_read == 0 判定（daemon 不存在時不可能有 serial_read）。
+  - action: op_begin
+    op_id: preplain
+    settle: false
+  - action: external_open
+    target: session_slave
+    hold: plain
+    save_as: pre
+    expect: {opened: true}
 steps:
-  # 限制：runner 的 steps 在 daemon 啟動後才執行，無法在 daemon 啟動前 external_open；
-  # 以 device release 讓 daemon 交出端點（並解除 TIOCEXCL）後再由普通 open 占用，近似規格情境。
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.state"
+    in: [DETACHED]
+    timeout_s: 15
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.last_error"
+    in: ["ATTACH_FAILED:DeviceHeldError"]
+    timeout_s: 15
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
+             pids: {list_contains: "{pre.pid}"}}
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0", "--force"]
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
+             pids: {list_contains: "{pre.pid}"}}
+  - action: op_end
+    op_id: preplain
+  - action: assert_wire_offsets
+    observation: serial_read
+    equals: 0
+  - action: assert_wal_window
+    op_id: preplain
+    com: COM0
+    forbid_dirs: [RX, TX]
+  - action: external_close
+    from: pre
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  # 以下為原「release 後普通 open 占用」段（保留，改為第二段）
   - action: wait_ready
     timeout_s: 20
   - action: op_begin
