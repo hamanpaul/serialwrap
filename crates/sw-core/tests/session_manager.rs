@@ -2234,6 +2234,70 @@ fn product_executor_blocked_release_commit_keeps_actor_responsive() {
     assert!(is_ok(&reply), "{reply:?}");
 }
 
+/// sol P5-5cc4623-1：release 持久化於暫停點卡住時，bind 到離線裝置 B 成功；恢復後不得回放舊 `Released`，
+/// 重啟後 COM0 保留 binding B 且非 RELEASED（Python `_save_release_state` 暫停後重建當前快照）。
+#[test]
+fn release_commit_paused_then_bind_keeps_binding_without_stale_released_row() {
+    struct BlockingPoint {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl sw_core::session_manager::PersistObserver for BlockingPoint {
+        fn before_release_commit(&self) -> Result<(), sw_pal::PalError> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(20));
+            Ok(())
+        }
+        fn after_commit(&self, _release: bool) {}
+    }
+    const OFFLINE_B: &str = "/dev/serial/by-id/usb-OFFLINE-B";
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_persist_observer(std::sync::Arc::new(BlockingPoint {
+        entered: entered_tx,
+        release: release_rx,
+    }));
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let mgr = m.mgr.clone();
+    let sid2 = sid.clone();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let r = mgr.route(
+            &sid2,
+            SessionRequest::Release {
+                source: "agent".to_string(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(20),
+        );
+        let _ = done_tx.send(r);
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 持久化進入暫停點");
+    let bound = m.mgr.bind("COM0", OFFLINE_B);
+    let _ = release_tx.send(());
+    let bound = rpc(bound);
+    assert!(is_ok(&bound), "{bound:?}");
+    let reply = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("release 完成")
+        .expect("release 回 dict");
+    assert!(is_ok(&reply), "{reply:?}");
+    let saved = m.load_state_now();
+    assert!(
+        saved.bindings.values().any(|v| v == OFFLINE_B),
+        "binding B 須落盤：{:?}",
+        saved.bindings
+    );
+    assert!(
+        !saved.released.contains_key(&sid),
+        "已改綁的 session 不得留下舊 released 列（重啟會再次成為 RELEASED）：{:?}",
+        saved.released
+    );
+}
+
 /// sol-backfill p5 #4：Python `SessionManager.__init__` 尾端 `_save_state()` 失敗（EACCES／ENOSPC）即拋出，
 /// daemon rc 1、尚未掃描／attach。Rust 須以 `startup_error()` 回報 Python 例外末行，不得只 warn 後繼續。
 #[test]

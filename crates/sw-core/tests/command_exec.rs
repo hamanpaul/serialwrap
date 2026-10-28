@@ -1863,3 +1863,62 @@ fn wrapped_echo_insertion_before_first_char_or_too_close_is_kept() {
     let raw = format!("{}\r\r\n{}TAIL\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
     assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}TAIL", &c[..65], &c[65..]));
 }
+
+/// 以 readline 折行標記 `" \r"` 於 `cuts` 處切開 `command`（Python `" \r".join(parts)`）。
+fn readline_wrapped(command: &str, cuts: &[usize]) -> String {
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(cuts);
+    bounds.push(command.len());
+    bounds
+        .windows(2)
+        .map(|w| &command[w[0]..w[1]])
+        .collect::<Vec<_>>()
+        .join(" \r")
+}
+
+#[test]
+fn wrapped_echo_plain_crlf_stdout_spelling_command_is_kept() {
+    // sol P5-70f6ce7-1：echo 關閉時 `cat` 的檔案內容恰為命令兩段＋OUT；原始串流沒有 `\r\r\n`／`" \r"`
+    // 折行證據，Python 基線全文保留（不得當成折行回顯刪掉有效 stdout）。
+    let cmd = format!("cat /tmp/{}", "x".repeat(60));
+    let raw = format!("{}\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &cmd[..40], &cmd[40..]);
+    assert_eq!(wrap_extract(&raw, &cmd), format!("{}\n{}\nOUT", &cmd[..40], &cmd[40..]));
+    // 普通換行切在命令空白處也一樣（Python `test_normal_newline_output_is_not_treated_as_terminal_wrap`）。
+    let raw = format!("echo x \r\ny\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "echo x y"), "echo x \ny");
+}
+
+#[test]
+fn wrapped_echo_readline_wrap_before_command_space_is_stripped() {
+    // sol P5-5cc4623-2（Python 842c014）：readline 折行點緊貼命令原有空白時，標記須優先於命令字元比對。
+    let command = format!("echo {} {}", "x".repeat(74), "y".repeat(20));
+    for prefix in ["\n", "\r\n"] {
+        let raw = format!("{prefix}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&command, &[30, 79]));
+        assert_eq!(wrap_extract(&raw, &command), "OUT", "prefix={prefix:?}");
+    }
+}
+
+#[test]
+fn wrapped_echo_readline_python_golden_cases() {
+    // Python `tests/test_wrapped_echo_strip.py`（主線 842c014）其餘 readline 案例逐案對照。
+    let c200 = wrap_cmd200();
+    for cuts in [&[79usize, 159][..], &[50, 100, 150][..]] {
+        let raw = format!("{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&c200, cuts));
+        assert_eq!(wrap_extract(&raw, &c200), "OUT", "cuts={cuts:?}");
+    }
+    for prefix in ["\n", "\r\n"] {
+        for cuts in [&[79usize][..], &[79, 159][..]] {
+            let raw = format!("{prefix}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&c200, cuts));
+            assert_eq!(wrap_extract(&raw, &c200), "OUT", "prefix={prefix:?} cuts={cuts:?}");
+        }
+    }
+    // 標記距命令起點不足 20 字元：不接受；殘留 prompt 不計入距離。
+    let x60 = "x".repeat(60);
+    let raw = format!("{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&x60, &[10]));
+    assert_eq!(wrap_extract(&raw, &x60), format!("{} {}\nOUT", &x60[..10], &x60[10..]));
+    let raw = format!("{WRAP_PROMPT}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&x60, &[10]));
+    assert_eq!(
+        wrap_extract(&raw, &x60),
+        format!("{WRAP_PROMPT}{} {}\nOUT", &x60[..10], &x60[10..])
+    );
+}

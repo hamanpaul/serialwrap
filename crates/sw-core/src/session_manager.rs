@@ -2042,10 +2042,14 @@ impl EffectExecutor for ManagerExec {
             }
             Effect::Persist { commit_id, delta } => {
                 let release = matches!(delta, StateDelta::Released { .. });
+                // sol P5-5cc4623-1：delta 依 actor 順序同步套入 model；工作者只跑 release 暫停鉤子並提交「當下」快照。
+                // 若延到工作者才套 delta，release 暫停期間完成的 bind（Unreleased＋新 binding）會被舊 Released 覆寫
+                // （Python `_save_release_state` 暫停後重建當前快照，不回放已失效的 delta）。
+                self.shared.model_apply(delta);
                 let shared = self.shared.clone();
                 let control = tx.clone();
                 let submitted = self.persist_jobs.submit(Box::new(move || {
-                    let result = shared.commit_sync_kind(|m| m.apply(delta), release);
+                    let result = shared.commit_sync_kind(|_| {}, release);
                     let _ = control.send(ControlEvent::StateCommitted { commit_id, result });
                 }));
                 if !submitted {
