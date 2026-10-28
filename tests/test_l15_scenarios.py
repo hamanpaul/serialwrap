@@ -732,3 +732,48 @@ def test_plus_one_x_derived_var(tmp_path, monkeypatch):
     tr = _make_runner(runner_mod, [], _FakeHarness(tmp_path), bridge=False)
     tr._exec_step({"action": "cli", "argv": ["daemon", "status"], "save_as": "st"}, 0)
     assert tr._expand("{st.limits.max_submit_cmd_bytes_plus_one_x}") == "xxxxxx"
+
+
+# ---------------------------------------------------------------------------
+# win-com-txrx-bridge 情境形狀（S1X Y4，CHG-S1X-WIN-TXRX-PAYLOADS-01）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.memory_only
+def test_repeat_exposes_one_based_index(tmp_path, monkeypatch):
+    """`repeat` 迴圈內可用 `{repeat.index}`（1 起算）；迴圈結束後還原外層同名變數。"""
+    runner_mod = _load_runner()
+    calls = _patch_cli(monkeypatch, runner_mod, [{"ok": True, "cmd_id": "c"}])
+    tr = _make_runner(runner_mod, [], _FakeHarness(tmp_path), bridge=False)
+    tr.variables["repeat"] = {"index": "outer"}
+    tr._exec_step({"action": "repeat", "count": 3, "steps": [
+        {"action": "cli", "argv": ["cmd", "submit", "--cmd", "echo W_{repeat.index}"]}]}, 0)
+    assert [c[-1] for c in calls] == ["echo W_1", "echo W_2", "echo W_3"]
+    assert tr.variables["repeat"] == {"index": "outer"}
+
+
+@pytest.mark.memory_only
+def test_win_com_txrx_bridge_expects_each_payload_exactly_once():
+    """plan 03 §win-com-txrx-bridge：`echo W_<n>` 50 次、每個 payload 在 wire 恰一次且依序；console bytes 原樣出現。
+
+    舊版以相同 `echo W_TEST` 送 50 次卻只預期 1 次（比較器要求次數完全相符，正確行為必 FAIL），且未檢 console bytes。
+    """
+    doc = yaml.safe_load((SCEN_DIR / "win-com-txrx-bridge.yaml").read_text(encoding="utf-8"))
+    steps = doc["steps"]
+    rep = next(s for s in steps if s.get("action") == "repeat")
+    assert rep["count"] == 50
+    submit = rep["steps"][0]
+    assert _cli_argv_has(submit, "cmd", "submit") and "echo W_{repeat.index}" in submit["argv"]
+    asserts = [s for s in steps if s.get("action") == "assert_wire_contiguous"]
+    assert [f"echo W_{n}\n" for n in range(1, 51)] in [a["payloads"] for a in asserts]
+    console = next(s for s in steps if s.get("action") == "console_write")["input_raw"]
+    assert console == "".join(chr(c) for c in range(0x20, 0x7F)) + "\r"
+    assert [console] in [a["payloads"] for a in asserts]
+    # 斷言前須等 console bytes 落盤到 wire（證據 writer 非同步）
+    names = [s.get("action") for s in steps]
+    wait_idx = next(i for i, s in enumerate(steps)
+                    if s.get("action") == "wait_wire_marker" and console.endswith(s.get("marker", "\0")))
+    assert names.index("console_write") < wait_idx < names.index("assert_wire_contiguous")
+    # 最後一個命令須 done（佇列 FIFO，最後一個完成代表 50 個都已執行）
+    assert any(_cli_argv_has(s, "cmd", "status") and (s.get("expect") or {}).get("command.status") == "done"
+               for s in steps)

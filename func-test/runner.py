@@ -1948,12 +1948,22 @@ class TestRunner:
         self._log(f"Target 暫停回應 {duration_s}s")
 
     def _step_repeat(self, step: dict[str, Any], idx: int) -> None:
+        """重複執行子步驟；子步驟內可用 `{repeat.index}`（1 起算），迴圈結束後還原外層同名變數。"""
         count = step.get("count", 1)
         sub_steps = step.get("steps", [])
-        for iteration in range(count):
-            self._log(f"Repeat {iteration + 1}/{count}")
-            for si, sub in enumerate(sub_steps):
-                self._exec_step(sub, step_idx=idx * 1000 + iteration * 100 + si)
+        missing = object()
+        outer = self.variables.get("repeat", missing)
+        try:
+            for iteration in range(count):
+                self._log(f"Repeat {iteration + 1}/{count}")
+                self.variables["repeat"] = {"index": iteration + 1}
+                for si, sub in enumerate(sub_steps):
+                    self._exec_step(sub, step_idx=idx * 1000 + iteration * 100 + si)
+        finally:
+            if outer is missing:
+                self.variables.pop("repeat", None)
+            else:
+                self.variables["repeat"] = outer
 
     def _step_shell(self, step: dict[str, Any], idx: int) -> None:
         cmd = self._expand(step.get("cmd", ""))
