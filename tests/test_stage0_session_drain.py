@@ -130,9 +130,13 @@ def test_release_transitions_recovering_then_released(tmp_path):
     assert mgr.get_session("COM0").state == "RECOVERING"
     assert BY_ID in mgr._released_by_ids
     gate.set()
-    rt.join(3.0)
+    # release_device 的 drain deadline 本身就是 3 秒；join 另留 2 秒供排程及 state persistence 收尾。
+    rt.join(const.DRAIN_TIMEOUT_MS / 1000 + 2.0)
     t.join(1.0)
-    assert out["ok"] is True and mgr.get_session("COM0").state == "RELEASED"
+    assert not rt.is_alive(), "release_device 未在 drain 上限與收尾裕度內返回"
+    assert not t.is_alive(), "UART writer 在 release_device 返回後仍存活"
+    assert out.get("ok") is True, f"release_device thread 未回傳成功結果：{out!r}"
+    assert mgr.get_session("COM0").state == "RELEASED"
     assert port.close_calls == 1
     state = json.load(open(mgr._state_path, encoding="utf-8"))
     assert "p:COM0" in state["released"]
