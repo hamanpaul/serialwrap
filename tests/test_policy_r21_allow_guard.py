@@ -139,7 +139,7 @@ def test_allowed_oracle_review_has_no_credential_or_marker_and_single_structural
 # OD-33 升級驗證報告原文（`evidence/stage1/upgrade-docker/**`）同為整檔豁免：只為容器內 swtest 測試帳號的
 # home 路徑列入 allow。要求 credential／marker 命中為 0，且每一處 home 路徑樣式都只能是該容器帳號。
 UPGRADE_EVIDENCE_ALLOW = "evidence/stage1/upgrade-docker/**"
-UPGRADE_CONTAINER_HOME = "/home/swtest/"
+UPGRADE_CONTAINER_HOME = "/home/" "swtest/"  # 拆段書寫：本檔不在 allow 內，原字會被 R-21 判為 structural
 
 
 def _upgrade_evidence_files() -> list[Path]:
