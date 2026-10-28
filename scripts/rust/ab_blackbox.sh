@@ -464,6 +464,9 @@ Path('$ID_B').write_text(json.dumps(id_b, indent=2) + '\n', encoding='utf-8')
 # 6. 執行 ab_compare.py
 REPORT_OUT="$REPO_ROOT/target/ab-report/$RUN_ID.json"
 echo "=== 執行 A/B 比較器 ==="
+# 比較器回非 0（例如 baseline-fail）時仍須輸出報告路徑，讓 exit driver 交給 gate 依報告內容判定；
+# 不得因 set -e 提前結束而使 gate 誤判「缺少 ab-report」（S1X Y2）。exit code 照傳。
+compare_rc=0
 python3 "$REPO_ROOT/scripts/rust/ab_compare.py" \
   --a "$A_XML" \
   --b "$B_XML" \
@@ -473,6 +476,15 @@ python3 "$REPO_ROOT/scripts/rust/ab_compare.py" \
   --identity-a "$ID_A" \
   --identity-b "$ID_B" \
   --applicability "$REPO_ROOT/tests/contract_blackbox/data/applicability.json" \
-  --required "$REQUIRED_CASES"
+  --required "$REQUIRED_CASES" || compare_rc=$?
 
-echo "A/B 比較完成：$REPORT_OUT"
+if [[ -f "$REPORT_OUT" ]]; then
+  if (( compare_rc == 0 )); then
+    echo "A/B 比較完成：$REPORT_OUT"
+  else
+    echo "A/B 比較器 exit $compare_rc（判定見報告）：$REPORT_OUT"
+  fi
+else
+  echo "A/B 比較器未產生報告（exit $compare_rc）" >&2
+fi
+exit "$compare_rc"
