@@ -112,9 +112,26 @@ impl SessionCore {
         self.retained_human.as_ref().map(|(owner, _)| owner.as_str())
     }
 
-    /// 增補 #26：`foreground.is_some()` 或存在未撤銷的 `replay_hold`（D-22(2)）。
+    /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）是前景 operation；recover、self-test、
+    /// interactive send 不設此旗標（審查 F27）。增補 #26：另計未撤銷的 `replay_hold`（D-22(2)）。
     pub fn foreground_busy(&self) -> bool {
-        self.foreground.is_some() || self.human.replay_hold.as_ref().is_some_and(|h| !h.revoked)
+        let command = self.foreground.as_ref().is_some_and(|grant| {
+            matches!(
+                self.pending_ops.get(&grant.op_id),
+                Some(PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. })
+            )
+        });
+        command || self.replay_hold_active()
+    }
+
+    /// 前景槽占用（任何前景 op，含 interactive send）或未撤銷的 `replay_hold`（D-22(2)）：佇列出列、
+    /// open／attach 的 SESSION_BUSY 與 raw owner 判定用（P6 原 `foreground_busy` 語意）。
+    pub(super) fn fg_slot_busy(&self) -> bool {
+        self.foreground.is_some() || self.replay_hold_active()
+    }
+
+    fn replay_hold_active(&self) -> bool {
+        self.human.replay_hold.as_ref().is_some_and(|h| !h.revoked)
     }
 
     // ---------------- ownership 與 fence 同步 ----------------
@@ -491,7 +508,7 @@ impl SessionCore {
             // （該前景的 fg_finish／resume）處理，被撤銷者已 restore_front 不會遺失（D-22(4)）。
             self.replay_point(&mut fx);
         }
-        if released && !self.foreground_busy() {
+        if released && !self.fg_slot_busy() {
             fx.extend(self.start_next(now));
         }
         fx
@@ -899,7 +916,7 @@ impl SessionCore {
                 .max(sw_proto::constants::ATTACHED_CONSOLE_LEASE_TIMEOUT_S);
             let id = self.open_lease(&format!("human:{client_id}"), timeout, false, now);
             payload.insert("interactive_session_id", PyValue::from(id));
-            payload.insert("interactive_owner", PyValue::Bool(!self.foreground_busy()));
+            payload.insert("interactive_owner", PyValue::Bool(!self.fg_slot_busy()));
         }
         payload.insert("session", self.session_value(now));
         fx.push(Effect::Reply(reply, Ok(payload)));

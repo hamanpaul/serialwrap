@@ -242,13 +242,32 @@ fn load_manifest(platform: &sw_pal::Platform) -> Result<(PathBuf, ReleaseManifes
     Ok((manifest_dir, manifest))
 }
 
-/// `serialwrapd` 入口的分派判斷（P5-T0 起由 `main.rs` 使用）：回傳 `true` 只表示開發 build
-/// （`DevBuildNoManifest`：指標 `current-release.json` 不存在且版本 manifest 讀取為 NotFound），此時交 Rust daemon 本體（`daemon_main::run`）。
-/// 指標存在但目標缺失、manifest 不可讀（EACCES／EIO 等）、realpath 或目錄解析失敗、manifest 解析失敗，一律回 `false`，交 launcher 走 exit 2（fail-closed）。
-/// manifest 存在（任何 implementation，含 `rust`）一律維持 P4 launcher 既有路徑：
-/// `implementation=rust` 的 Stage 1 拒絕（`launcher_rejects_rust_implementation_in_stage1`）保留到 P5-T19 才由該 Task 切換。
+/// 開發 build 判斷：回傳 `true` 只表示 `DevBuildNoManifest`（指標 `current-release.json` 不存在且版本 manifest
+/// 讀取為 NotFound）。指標存在但目標缺失、manifest 不可讀（EACCES／EIO 等）、realpath 或目錄解析失敗、
+/// manifest 解析失敗，一律回 `false`（fail-closed）。
 pub fn manifest_absent(platform: &sw_pal::Platform) -> bool {
     matches!(load_manifest(platform), Err(LauncherError::DevBuildNoManifest))
+}
+
+/// `serialwrapd` 入口的分派判斷（P5-T19，計畫 Task 19 main.rs 規格；審查 F82）：開發 build（無 manifest）或
+/// `components.daemon.implementation == "rust"` → `true`，交 Rust daemon 本體 `daemon_main::run`；
+/// `"python"`、其他值、manifest 不可讀或解析失敗 → `false`，交 launcher（python exec，或既有 exit 2 錯誤）。
+pub fn dispatch_to_rust_daemon(platform: &sw_pal::Platform) -> bool {
+    match load_manifest(platform) {
+        Err(LauncherError::DevBuildNoManifest) => true,
+        Ok((_, manifest)) => {
+            manifest
+                .raw
+                .get("components")
+                .and_then(as_dict)
+                .and_then(|c| c.get("daemon"))
+                .and_then(as_dict)
+                .and_then(|d| d.get("implementation"))
+                .and_then(PyValue::as_str)
+                == Some("rust")
+        }
+        Err(_) => false,
+    }
 }
 
 fn launch(argv: Vec<OsString>, platform: &sw_pal::Platform) -> Result<i32, LauncherError> {

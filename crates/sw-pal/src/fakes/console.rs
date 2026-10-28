@@ -417,6 +417,13 @@ impl ConsoleTransportFactory for FakeConsoleFactory {
         Ok(self.pty_pair_from(FakeIo::unbounded()))
     }
 
+    /// `pty_pair_from` 發出的 `/fake/pts/<n>` 視為存在（替身不模擬 slave 消失）。
+    fn slave_path_exists(&self, path: &str) -> bool {
+        path.strip_prefix("/fake/pts/")
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| n < self.next_pty.load(Ordering::Relaxed))
+    }
+
     fn bind_tcp_console(&self) -> PalResult<Box<dyn ConsoleListener>> {
         let id = next_id();
         lock(registry()).insert(id, Registered::Listener(Arc::downgrade(&self.shared)));

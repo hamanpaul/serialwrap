@@ -759,3 +759,148 @@ fn alias_set_overwrites_in_place() {
         r#"{"session_id":"t:COM0","updated_at":"T9"}"#
     );
 }
+
+#[test]
+fn utf16_and_utf32_state_json_load_like_python() {
+    // 審查 F54（Medium，c96a91c）：Python `json.loads(bytes)` 以 `json.detect_encoding` 判斷 UTF-8／16／32
+    // （含 BOM 與無 BOM 的 NUL 樣式），UTF-16 改寫的 state.json 正常載入、RELEASED 保留、不產生 `.corrupt`。
+    let text = r#"{"released":{"t:COM0":{"by_id":"/dev/serial/by-id/X","released_by":"agent","released_at":"2026-10-21T00:00:00","reason":null}}}"#;
+    let utf16le_bom: Vec<u8> = [0xFFu8, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let utf16be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let utf32le: Vec<u8> = text.chars().flat_map(|c| (c as u32).to_le_bytes()).collect();
+    let utf32be_bom: Vec<u8> = [0x00u8, 0x00, 0xFE, 0xFF]
+        .into_iter()
+        .chain(text.chars().flat_map(|c| (c as u32).to_be_bytes()))
+        .collect();
+    for (name, bytes) in [
+        ("utf-16 BOM", utf16le_bom),
+        ("utf-16-be", utf16be),
+        ("utf-32-le", utf32le),
+        ("utf-32 BOM", utf32be_bom),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state.json");
+        std::fs::write(&p, &bytes).unwrap();
+        let (s, backup) = load(&p).unwrap_or_else(|e| panic!("{name}：{e:?}"));
+        assert!(backup.is_none(), "{name}：不得視為損毀");
+        assert!(s.released.contains_key("t:COM0"), "{name}：RELEASED 應保留");
+        assert!(!dir_names(d.path()).iter().any(|n| n.contains("corrupt")), "{name}");
+    }
+}
+
+#[test]
+fn double_bom_state_json_warning_matches_python() {
+    // 審查 F58（Low）：CPython `json.loads(bytes)` 解碼後不做 str 的 BOM 檢查，雙重 BOM → decoder
+    // `Expecting value: line 1 column 1 (char 0)`（實測），非 `Unexpected UTF-8 BOM`。
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("state.json");
+    std::fs::write(&p, b"\xef\xbb\xbf\xef\xbb\xbf{}").unwrap();
+    let warnings = std::cell::RefCell::new(Vec::new());
+    let (_s, backup) = sw_core::state_store::load_state_with_warn(&p, &*native_fs(), &|m| {
+        warnings.borrow_mut().push(m.to_string())
+    })
+    .unwrap();
+    assert!(backup.is_some());
+    let w = warnings.borrow();
+    assert!(
+        w.iter().any(|m| m.ends_with("：Expecting value: line 1 column 1 (char 0)")),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn state_json_line_ending_follows_python_text_mode() {
+    // 審查 F55（Medium，c96a91c）：Python `_save_state` 以文字模式 `os.fdopen(fd, "w", encoding="utf-8")` 寫檔，
+    // Windows 上唯一的結構換行（尾端）為 `\r\n`、POSIX 為 `\n`（JSON 字串內換行一律跳脫，不受影響）。
+    let s = LoadedState::default();
+    let crlf = sw_core::state_store::serialize_state_with(&s, b"\r\n");
+    assert!(crlf.ends_with(b"}\r\n"), "{:?}", String::from_utf8_lossy(&crlf));
+    assert_eq!(crlf.iter().filter(|b| **b == b'\n').count(), 1);
+    let native = sw_core::state_store::serialize_state(&s);
+    assert!(native.ends_with(sw_pal::fs_ops::TEXT_NEWLINE));
+    let expected: &[u8] = if std::path::MAIN_SEPARATOR == '\\' { b"\r\n" } else { b"\n" };
+    assert_eq!(sw_pal::fs_ops::TEXT_NEWLINE, expected);
+    // 讀取端兩種皆接受。
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("state.json");
+    std::fs::write(&p, &crlf).unwrap();
+    assert!(load(&p).unwrap().1.is_none());
+}
+
+/// 以 `load_state_with_warn` 載入 `bytes`，回傳（結果、WARNING 清單、是否產生 `.corrupt`）。
+fn load_bytes(bytes: &[u8]) -> (LoadedState, Vec<String>, bool) {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("state.json");
+    std::fs::write(&p, bytes).unwrap();
+    let warnings = std::cell::RefCell::new(Vec::new());
+    let (s, _backup) = sw_core::state_store::load_state_with_warn(&p, &*native_fs(), &|m| {
+        warnings.borrow_mut().push(m.to_string())
+    })
+    .unwrap();
+    let corrupt = dir_names(d.path()).iter().any(|n| n.contains("corrupt"));
+    (s, warnings.into_inner(), corrupt)
+}
+
+#[test]
+fn lone_surrogate_state_json_loads_and_reproduces_python_encode_error() {
+    // 審查 d2d29a6_7af6567 47c7b25 #1（Medium）：Python `json.loads(bytes)` 以 surrogatepass 解碼、`\uXXXX` 跳脫亦可
+    // 產生孤立 surrogate，載入成功（不得改名 `.corrupt`、不得丟掉 RELEASED）；`_save_state` 寫檔時才拋
+    // `UnicodeEncodeError`（位置為 payload 字元索引；以 python3.12 實測）。
+    let row = |reason: &str| {
+        format!(r#"{{"released":{{"t:COM0":{{"by_id":"/x","released_by":"a","released_at":"t","reason":"{reason}"}}}}}}"#)
+    };
+    let mut utf8 = row("@").into_bytes();
+    let at = utf8.iter().position(|&b| b == b'@').unwrap();
+    utf8.splice(at..at + 1, [0xED, 0xA0, 0x80]); // U+D800 的 surrogatepass 位元組
+    let utf16: Vec<u8> = [0xFFu8, 0xFE]
+        .into_iter()
+        .chain(row("@").encode_utf16().map(|u| if u == u16::from(b'@') { 0xDC00 } else { u }).flat_map(u16::to_le_bytes))
+        .collect();
+    for (name, bytes, unit) in [
+        ("utf-8 surrogatepass", utf8, "d800"),
+        ("json \\ud800 跳脫", row("\\ud800").into_bytes(), "d800"),
+        ("json 孤立 low 跳脫", row("\\udfff").into_bytes(), "dfff"),
+        ("utf-16 孤立 low", utf16, "dc00"),
+    ] {
+        let (s, warnings, corrupt) = load_bytes(&bytes);
+        assert!(!corrupt && warnings.is_empty(), "{name}：不得視為損毀：{warnings:?}");
+        assert!(s.lone_surrogates, "{name}");
+        assert!(s.released.contains_key("t:COM0"), "{name}：RELEASED 應保留");
+        let payload = String::from_utf8(sw_core::state_store::serialize_state(&s)).unwrap();
+        let pos = payload.find("\"reason\":\"").map(|b| payload[..b].chars().count() + 10).unwrap();
+        assert_eq!(
+            sw_core::state_store::lone_surrogate_encode_error(&payload).as_deref(),
+            Some(format!("UnicodeEncodeError: 'utf-8' codec can't encode character '\\u{unit}' in position {pos}: surrogates not allowed").as_str()),
+            "{name}"
+        );
+    }
+    // 成對跳脫（😀）不是孤立 surrogate；一般檔不受影響。
+    let (s, _, corrupt) = load_bytes(row("\\ud83d\\ude00").as_bytes());
+    assert!(!corrupt && !s.lone_surrogates);
+    assert_eq!(s.released["t:COM0"].reason, sw_proto::pyjson::PyValue::from("😀"));
+    let payload = String::from_utf8(sw_core::state_store::serialize_state(&s)).unwrap();
+    assert!(sw_core::state_store::lone_surrogate_encode_error(&payload).is_none());
+}
+
+#[test]
+fn utf16_utf32_decode_error_text_matches_python() {
+    // 審查 d2d29a6_7af6567 47c7b25 #2（Low）：位置以原始 bytes 計（含 BOM）；UTF-32 多 byte 為 `bytes in position S-E`
+    // （期望值取自 python3.12 `json.loads(bytes)` 實跑）。
+    for (raw, want) in [
+        (&b"\xff\xfe{\x00}"[..], "'utf-16-le' codec can't decode byte 0x7d in position 4: truncated data"),
+        (&b"\xff\xfe\x00\x00\x00\x00\x11\x00"[..], "'utf-32-le' codec can't decode bytes in position 4-7: code point not in range(0x110000)"),
+        (&b"{\x00\x00\x00}\x00\x00"[..], "'utf-32-le' codec can't decode bytes in position 4-6: truncated data"),
+        (&b"\xfe\xff\x00{\x00"[..], "'utf-16-be' codec can't decode byte 0x00 in position 4: truncated data"),
+        (&b"\x00\x00\xfe\xff\x00\x00\x00{\x00"[..], "'utf-32-be' codec can't decode byte 0x00 in position 8: truncated data"),
+        (&b"{\"a\":\"\xed\xa0\"}"[..], "'utf-8' codec can't decode byte 0xed in position 6: invalid continuation byte"),
+        // UTF-16 BOM 後的孤立 high surrogate 在字串外：Python 解碼成功、JSON 報 `Expecting value`。
+        (&b"\xff\xfe\x00\xd8{\x00}\x00"[..], "Expecting value: line 1 column 1 (char 0)"),
+    ] {
+        let (_s, warnings, corrupt) = load_bytes(raw);
+        assert!(corrupt, "{raw:?}");
+        assert!(warnings.iter().any(|w| w.ends_with(&format!("：{want}"))), "{raw:?}：{warnings:?}");
+    }
+}

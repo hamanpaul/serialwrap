@@ -50,8 +50,11 @@ use crate::resources::{
 #[cfg(feature = "test-fakes")]
 use crate::session_core::SessionState;
 use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, SessionRequest};
-use crate::state_store::{LoadedState, ReleasedRow, StateDelta, StateModel, StateStore};
+use crate::state_store::{
+    lone_surrogate_encode_error, serialize_state, LoadedState, ReleasedRow, StateDelta, StateModel, StateStore,
+};
 use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, spawn_tx_writer};
+use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 
@@ -171,6 +174,9 @@ struct Entry {
 #[derive(Clone)]
 struct AttachOp {
     cancelled: Arc<AtomicBool>,
+    /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
+    /// 在途 op 與 clear 重疊時由 `spawn_attach_with` OR 進來，避免該次再解析遺失（審查 F98）。
+    after_clear: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -230,6 +236,8 @@ impl Inner {
 struct Shared {
     serial: Arc<dyn SerialBackend>,
     uart_excl: Arc<dyn UartExclusive>,
+    /// console 後端：哨兵 PTY 工廠（審查 F43）與 P6 Task 9／10 的 PTY 建立、ConsoleHub 的 mux。
+    console: Arc<dyn ConsoleTransportFactory>,
     wal: Arc<WalWriter>,
     registry: Arc<CommandRegistry>,
     clock: Arc<dyn Clock>,
@@ -245,15 +253,19 @@ struct Shared {
     inner: Mutex<Inner>,
     cv: Condvar,
     note_tx: Sender<ManagerNote>,
+    /// 全 daemon 共用的 background capture 索引（審查 F28）。
+    bg_index: Arc<crate::capture::BackgroundIndex>,
     closed: AtomicBool,
     /// state.json 持久化觀察者（P5-T19 #3／#4／#68 的 Stage 0 測試鉤子；未設定時不動作）。
     persist_observer: Mutex<Option<Arc<dyn PersistObserver>>>,
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 以 frozen 建立（驗證 PROBE TX 經 Fence 時零 TX）。
     probe_tx_frozen: AtomicBool,
-    /// P6 Task 9／10：console 後端（PTY 建立、ConsoleHub 的 mux）。
-    console: Arc<dyn ConsoleTransportFactory>,
     /// P6（sol 補審 #2）：human line mode basename 的路徑風格（`caps.path_flavor`）。
     path_flavor: sw_pal::PalPathFlavor,
+    /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
+    lone_surrogates: bool,
+    /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
+    startup_error: Mutex<Option<String>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -274,8 +286,9 @@ impl SerialWriter for DetachedWriter {
 /// `_save_release_state()`（commit 前暫停點 → 落盤 → 落盤後 kill 鉤子）。是否生效（僅隔離實例）由實作者
 /// （daemon 組裝點）決定，sw-core 只提供呼叫點。
 pub trait PersistObserver: Send + Sync {
-    /// release 持久化 commit 之前（Python `_test_release_persist_point()`）。
-    fn before_release_commit(&self);
+    /// release 持久化 commit 之前（Python `_test_release_persist_point()`）；`Err` 時不 commit、release 持久化失敗
+    /// （Python 暫停點的 `os.makedirs`／寫檔例外會穿出 `_save_release_state`，審查 F85）。
+    fn before_release_commit(&self) -> Result<(), PalError>;
     /// 任一 state.json commit 成功之後；`release` 為 true 表示本次為 release 持久化
     /// （Python 先以 `False` 呼叫一次 kill 鉤子，release 持久化再以 `True` 呼叫一次）。
     fn after_commit(&self, release: bool);
@@ -391,7 +404,7 @@ fn stopping_error() -> PyErr {
 }
 
 fn commit_error(e: &PalError) -> PyErr {
-    PyErr::value_error(format!("state.json commit failed: {e:?}"))
+    PyErr::value_error(e.py_message.clone())
 }
 
 /// 由 template 物化 session profile（`_session_from_template` 的 `SessionProfile(...)`）。
@@ -433,6 +446,7 @@ fn minimal_passthrough_template(name: &str) -> ProfileTemplate {
         log_dir: None,
         uart: UartProfile::default(),
         bootloader_prompts: Vec::new(),
+        boot_done_regex: String::new(),
         max_console_line_chars: None,
     }
 }
@@ -510,7 +524,7 @@ impl Shared {
         let observer = lock(&self.persist_observer).clone();
         if release {
             if let Some(o) = &observer {
-                o.before_release_commit();
+                o.before_release_commit()?;
             }
         }
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -644,6 +658,7 @@ impl Shared {
             }),
             // P6（07 D-02）：human console 擷取時讀的 input_epoch（與 ConsoleHub 共用）。
             input_epoch_pub: input_epoch_pub.clone(),
+            bg_index: self.bg_index.clone(),
         };
         let mut core = SessionCore::new(profile.clone(), profile_source, deps);
         core.set_path_flavor(self.path_flavor);
@@ -692,13 +707,35 @@ impl Shared {
         )
         .ok()
         .map(Arc::new);
+        // agent log 檔名以平台 Clock 的本地時間組成（Python `time.strftime` 本地時間；審查 F34）。
+        core.set_capture_env(crate::capture::CaptureEnv {
+            clock: Some(self.clock.clone()),
+            ..Default::default()
+        });
+        let workers: Arc<Mutex<HashMap<u64, IoWorker>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            // self-test 的外部觀測（Python `bridge.snapshot()` 與 RELEASED 的 `/proc` holder 掃描）。
+            let snapshot_workers = workers.clone();
+            core.set_self_test_probes(SelfTestProbes {
+                holders: Some(self.uart_excl.clone()),
+                vtty_alive: None,
+                path_exists: Some({
+                    let console = self.console.clone();
+                    Arc::new(move |path: &str| console.slave_path_exists(path))
+                }),
+                bridge_snapshot: Some(Arc::new(move |epoch: u64| {
+                    lock(&snapshot_workers).get(&epoch).map(IoWorker::snapshot)
+                })),
+                templates: Arc::new(self.templates.clone()),
+            });
+        }
         let exec = ManagerExec {
             shared: self.clone(),
             io: io.clone(),
             rx,
             fence: fence.clone(),
             data: mailbox.data_sender(),
-            workers: HashMap::new(),
+            workers,
             runners: HashMap::new(),
             hub,
             pumps: HashMap::new(),
@@ -761,7 +798,11 @@ impl Shared {
     fn handle_watcher(self: &Arc<Self>, ev: WatcherEvent) {
         match ev {
             WatcherEvent::Delta { snapshot, .. } => self.update_devices(&snapshot),
-            WatcherEvent::Tick => {}
+            // Python `Service._on_watcher_tick`：每輪先非阻塞服務 WAL 延後輪替（OD-19；無新流量時 append 不會發生）。
+            // readiness reconcile 屬後續 Slice，不在 2.1 範圍。
+            WatcherEvent::Tick => {
+                self.wal.tick();
+            }
             WatcherEvent::ScanFailed(e) => self.warn(format!("裝置掃描失敗：{e:?}")),
         }
     }
@@ -800,6 +841,21 @@ impl Shared {
             inner.pending_com.retain(|b, _| online.contains(b));
             prev
         };
+        // Python `_mark_missing_devices_locked`（審查 F60）：與 Python 同在 detach／attach 之前標記。
+        let missing: Vec<String> = {
+            let inner = lock(&self.inner);
+            inner
+                .sessions
+                .values()
+                .filter(|e| {
+                    !e.profile.device_by_id.is_empty() && !new.contains_key(&e.profile.device_by_id)
+                })
+                .map(|e| e.sid.clone())
+                .collect()
+        };
+        for sid in &missing {
+            self.send_control(sid, ControlEvent::DeviceMissing);
+        }
         let changed: Vec<String> = prev
             .iter()
             .filter(|(k, v)| new.get(*k).is_some_and(|n| n.real_path != v.real_path))
@@ -851,6 +907,11 @@ impl Shared {
 
     /// `_spawn_attach`：stopping gate、released／inflight 去重；需要再解析或尚無 session 時起 attach worker。
     fn spawn_attach(self: &Arc<Self>, by_id: &str) {
+        self.spawn_attach_with(by_id, false);
+    }
+
+    /// `spawn_attach` 本體；`after_clear` 見 `AttachOp::after_clear`。
+    fn spawn_attach_with(self: &Arc<Self>, by_id: &str, after_clear: bool) {
         let released = self.released_by_ids();
         let pins = self.model_snapshot().profile_pins;
         let mut inner = lock(&self.inner);
@@ -859,7 +920,13 @@ impl Shared {
             self.warn(format!("shutdown 中，略過 attach {by_id}"));
             return;
         }
-        if released.contains(by_id) || inner.inflight.contains_key(by_id) {
+        if released.contains(by_id) {
+            return;
+        }
+        if let Some(op) = inner.inflight.get(by_id) {
+            if after_clear {
+                op.after_clear.store(true, Ordering::SeqCst);
+            }
             return;
         }
         let Some(real) = inner.device_path(by_id).map(str::to_string) else {
@@ -884,6 +951,7 @@ impl Shared {
         }
         let op = AttachOp {
             cancelled: Arc::new(AtomicBool::new(false)),
+            after_clear: Arc::new(AtomicBool::new(after_clear)),
         };
         inner.inflight.insert(by_id.to_string(), op.clone());
         drop(inner);
@@ -1148,7 +1216,8 @@ impl Shared {
     /// PROBE bridge 的 `send`：經 TxWriter／Fence（單一寫入者、OS 提交於 Fence 鎖內重驗），TX WAL 由 TxWriter 以
     /// `com=PROBE` 寫入（Python PROBE bridge 的 send 同樣走 TX gate 與 WAL）。writer 於送出後原樣交回 `parts`，
     /// 維持 #51「PROBE 與正式 bridge 共用同一預開 handle」。自動 TX（`LoginProbe` 類）：WAL 不健康時由 Fence 拒絕、零 TX。
-    fn probe_send(&self, parts: &mut HandleParts, payload: &[u8]) {
+    /// 回傳是否完整送出（Python `send_command` 未拋例外；被拒或未完整時 `detect_template` 的呼叫端視為偵測失敗）。
+    fn probe_send(&self, parts: &mut HandleParts, payload: &[u8]) -> bool {
         let fence = Fence::new();
         let frozen = self.probe_tx_frozen.load(Ordering::SeqCst);
         let wal_unhealthy = self.fanout.current();
@@ -1186,13 +1255,15 @@ impl Shared {
             payload: payload.to_vec(),
             reply: reply_tx,
         };
-        if handle.jobs.send(job).is_ok() {
-            let _ = handle.wait_report(&reply_rx);
-        }
+        let sent = handle.jobs.send(job).is_ok()
+            && handle.wait_report(&reply_rx).is_some_and(|report| {
+                matches!(report.result.outcome, TxOutcome::Completed(n) if n >= payload.len())
+            });
         stop.send();
         if let Ok((writer, _ledger)) = join.join() {
             parts.writer = writer;
         }
+        sent
     }
 
     /// `detect_template`：送 `\n`、等待 3.0 s（Clock）、以 RX 快照依序比對候選模板的 prompt（再以 login regex 備選）。
@@ -1201,7 +1272,10 @@ impl Shared {
         let mut buf = vec![0u8; 8192];
         // `clear_rx_buffer`：丟棄開埠後已到的舊資料（仍寫 WAL）。
         let _ = self.probe_drain(parts, &mut buf);
-        self.probe_send(parts, b"\n");
+        if !self.probe_send(parts, b"\n") {
+            // Python：`send_command("")` 拋例外 → 呼叫端 `except: detected = None`，不睡、不比對（審查 F71）。
+            return None;
+        }
         self.clock.sleep(DETECT_PROBE);
         let bytes = self.probe_drain(parts, &mut buf);
         let snapshot = clean_text(&String::from_utf8_lossy(&bytes));
@@ -1263,8 +1337,9 @@ impl Shared {
         if state == "RELEASED" || self.released_by_ids().contains(by_id) {
             return;
         }
-        if state != "DETACHED" {
+        if state != "DETACHED" && !(op.after_clear.load(Ordering::SeqCst) && state == "ATTACHING") {
             // 已有 bridge（或 attach／drain 進行中）：不再解析（再開 PROBE 會 two-reader），交給 actor 判斷。
+            // clear 收尾的 ATTACHING 尚未開埠（bridge 已關），與 Python `_attach_by_id` 同樣先再解析。
             self.send_attached(by_id);
             return;
         }
@@ -1336,7 +1411,7 @@ impl Shared {
                     real_path: real.clone(),
                     parts,
                 });
-                lock(&self.inner).probe_paths.insert(sid_now, real);
+                // Python `_attach_by_id` 的再偵測不寫 sticky（`_maybe_persist_sticky` 只在動態 attach；審查 F65）。
                 self.send_attached(by_id);
             }
             None => {
@@ -1448,15 +1523,28 @@ impl Shared {
 
     fn handle_note(&self, note: ManagerNote) {
         match note {
-            ManagerNote::SessionReady { sid } => self.maybe_persist_sticky(&sid),
+            ManagerNote::SessionReady { sid, via_attach } => {
+                if via_attach {
+                    self.maybe_persist_sticky(&sid);
+                }
+            }
             ManagerNote::SessionDetached { sid, .. } => {
-                lock(&self.inner).interactive.retain(|_, v| *v != sid);
+                let mut inner = lock(&self.inner);
+                inner.interactive.retain(|_, v| *v != sid);
+                // 動態 attach 的偵測紀錄只屬該次 attach（審查 F65）：bridge 結束即失效。
+                inner.probe_paths.remove(&sid);
             }
             ManagerNote::InteractiveOpened {
                 sid,
                 interactive_id,
             } => {
                 lock(&self.inner).interactive.insert(interactive_id, sid);
+            }
+            ManagerNote::EvictCapture { com, cmd_id } => {
+                let actor = lock(&self.inner).resolve(&com).map(|e| e.actor.clone());
+                if let Some(actor) = actor {
+                    let _ = actor.control.send(ControlEvent::EvictCapture { cmd_id });
+                }
             }
             ManagerNote::InteractiveClosed { interactive_id } => {
                 lock(&self.inner).interactive.remove(&interactive_id);
@@ -1465,19 +1553,20 @@ impl Shared {
         }
     }
 
-    /// `_maybe_persist_sticky`：只有 READY 的正向偵測（`detected`）且 real_path 與偵測當時相同才寫入。
+    /// `_maybe_persist_sticky`：只有動態 attach 本身到 READY 的正向偵測（`detected`）且 real_path 與偵測當時相同
+    /// 才寫入；偵測紀錄只消費一次（Python 只在 `_attach_by_id_dynamic` 呼叫，審查 F65）。
     fn maybe_persist_sticky(&self, sid: &str) {
         let (by_id, name) = {
-            let inner = lock(&self.inner);
+            let mut inner = lock(&self.inner);
+            let Some(probe) = inner.probe_paths.remove(sid) else {
+                return;
+            };
             let Some(e) = inner.sessions.get(sid) else {
                 return;
             };
             if e.profile_source != "detected" {
                 return;
             }
-            let Some(probe) = inner.probe_paths.get(sid) else {
-                return;
-            };
             if inner.device_path(&e.profile.device_by_id) != Some(probe.as_str()) {
                 return;
             }
@@ -1648,6 +1737,15 @@ impl Shared {
             });
         }
         drop(inner);
+        if self.lone_surrogates {
+            // Python `__init__` 尾端 `_save_state`：payload 含孤立 surrogate 時 UTF-8 文字模式寫入拋
+            // `UnicodeEncodeError`（未捕捉 → daemon rc 1）；temp 檔清除、原 state.json 不動（審查 47c7b25 #1）。
+            let payload = String::from_utf8_lossy(&serialize_state(&self.model_snapshot())).into_owned();
+            if let Some(msg) = lone_surrogate_encode_error(&payload) {
+                *lock(&self.startup_error) = Some(msg);
+                return;
+            }
+        }
         if let Err(e) = self.commit_sync(|_| {}) {
             self.warn(format!("state.json 寫入失敗（啟動存檔）：{e:?}"));
         }
@@ -1665,7 +1763,8 @@ struct ManagerExec {
     rx: Arc<RxShared>,
     fence: Arc<Fence>,
     data: Sender<DataEvent>,
-    workers: HashMap<u64, IoWorker>,
+    /// 各 epoch 的 IoWorker；與 self-test 的 bridge 快照探針共用（審查 F32：`snapshot()` 的 running／serial_alive）。
+    workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
     runners: HashMap<u64, OpRunner>,
     /// P6 Task 9：該 session 的 ConsoleHub（RX 分流、console I/O）。
     hub: Option<Arc<crate::human_console::hub::HubHandle>>,
@@ -1750,7 +1849,7 @@ impl ManagerExec {
     ) {
         let epoch = permit.epoch;
         if !self.pumps.contains_key(&epoch) {
-            if let Some(worker) = self.workers.get(&epoch) {
+            if let Some(worker) = lock(&self.workers).get(&epoch) {
                 let pump = crate::human_console::human_tx::HumanTxPump::spawn(
                     &self.com(),
                     worker.tx().clone(),
@@ -1802,7 +1901,19 @@ impl ManagerExec {
         }
         let pre = lock(&self.io.preopened).take();
         let handle: Box<dyn SerialHandle> = match pre {
-            Some(pre) if pre.real_path == dev.0 => Box::new(ReassembledHandle(pre.parts)),
+            Some(pre) if pre.real_path == dev.0 => {
+                // Python bridge 啟動時對預開 port 呼叫 `port.configure(self.profile)`：PROBE 以預設設定開啟，
+                // 正式 bridge 前套用解析出的 template UART 設定（審查 F59）。後端未支援時沿用開啟時設定。
+                match pre.parts.close.configure(&cfg) {
+                    Ok(()) => {}
+                    Err(error) if error.kind == PalErrorKind::Unsupported => {}
+                    Err(error) => {
+                        let _ = pre.parts.close();
+                        return Err(OpenFailure::Other(error));
+                    }
+                }
+                Box::new(ReassembledHandle(pre.parts))
+            }
             other => {
                 if let Some(pre) = other {
                     let _ = pre.parts.close();
@@ -1825,15 +1936,20 @@ impl ManagerExec {
             return Err(stopped());
         }
         let epoch = self.shared.epochs.next();
+        // Python 每次 attach 新建 `UARTBridge`：RX 視窗、速率、總量、最後 RX 時刻一律歸零（審查 F51）。
+        let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.shared.clock.mono_ns());
         let worker = IoWorker::start(
             handle,
             IoWorkerArgs {
                 com: self.com(),
                 epoch,
                 wal: self.shared.wal.clone(),
-                rx: self.rx.clone(),
+                rx: rx.clone(),
                 fence: self.fence.clone(),
+                // P6：哨兵 primary 由 `make_sentinel` 預建並經 hub 登記（取代 2.1 的 reader 哨兵；審查 F43／F30 的
+                // console_count／vtty 由 core 的 human.consoles 計算）。
                 sentinel: None,
+                sentinel_keepalive: None,
                 hub: self.hub.as_ref().map(|h| h.tap()),
                 data: self.data.clone(),
                 control: control.clone(),
@@ -1842,12 +1958,14 @@ impl ManagerExec {
         );
         let sentinel = self.make_sentinel();
         let console_endpoint = self.bind_console_listener(epoch);
+        self.rx = rx.clone();
         Ok(OpenedBridge {
             epoch,
             worker,
             real_path: dev.0,
             sentinel,
             console_endpoint,
+            rx,
         })
     }
 
@@ -1857,13 +1975,13 @@ impl ManagerExec {
         let op_id = grant.op_id;
         let ran = catch_unwind(AssertUnwindSafe(|| {
             if !self.runners.contains_key(&epoch) {
-                let worker = self.workers.get(&epoch)?;
+                let tx = lock(&self.workers).get(&epoch)?.tx().clone();
                 let ctx = OpCtx {
                     com: self.com(),
                     sid: lock(&self.io.sid).clone(),
                     profile: lock(&self.io.profile).clone(),
                     rx: self.rx.clone(),
-                    tx: worker.tx().clone(),
+                    tx,
                     wal: self.shared.wal.clone(),
                     clock: self.shared.clock.clone(),
                     control: control.clone(),
@@ -1902,10 +2020,9 @@ impl ManagerExec {
         ) {
             return;
         }
-        let Some(worker) = self.workers.get(&epoch) else {
+        let Some(handle) = lock(&self.workers).get(&epoch).map(|worker| worker.tx().clone()) else {
             return;
         };
-        let handle = worker.tx().clone();
         let rx = self.rx.clone();
         let clock = self.shared.clock.clone();
         let profile = lock(&self.io.profile).clone();
@@ -1955,14 +2072,15 @@ impl EffectExecutor for ManagerExec {
                 });
             }
             Effect::AdoptBridge { epoch, worker, .. } => {
-                self.workers.insert(epoch, worker);
+                lock(&self.workers).insert(epoch, worker);
             }
             Effect::BeginDrain { stop_id, epoch } => {
                 self.runners.remove(&epoch);
                 if let Some(pump) = self.pumps.remove(&epoch) {
                     pump.stop();
                 }
-                if let Some(worker) = self.workers.remove(&epoch) {
+                let worker = lock(&self.workers).remove(&epoch);
+                if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
                 }
                 if self.listener_epoch == Some(epoch) {
@@ -2012,8 +2130,9 @@ impl EffectExecutor for ManagerExec {
                 let _ = self.shared.note_tx.send(note);
             }
             Effect::Warn(msg) => self.shared.warn(msg),
+            Effect::Reattach { by_id, .. } => self.shared.spawn_attach_with(&by_id, true),
             Effect::SettleTx { epoch, op_id } => {
-                if let Some(worker) = self.workers.get(&epoch) {
+                if let Some(worker) = lock(&self.workers).get(&epoch) {
                     let _ = worker.tx().settle(op_id);
                 }
             }
@@ -2121,6 +2240,7 @@ impl SessionManager {
         let shared = Arc::new(Shared {
             serial,
             uart_excl,
+            console: console.clone(),
             wal,
             registry,
             clock,
@@ -2128,6 +2248,8 @@ impl SessionManager {
             fs,
             warn,
             store: state,
+            lone_surrogates: loaded.lone_surrogates,
+            startup_error: Mutex::new(None),
             model: Mutex::new(StateModel::new(loaded)),
             fanout,
             epochs: EpochAllocator::new(),
@@ -2135,11 +2257,22 @@ impl SessionManager {
             max_sessions,
             inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
-            note_tx,
+            note_tx: note_tx.clone(),
+            bg_index: {
+                let index = crate::capture::BackgroundIndex::new();
+                // 淘汰決定在 actor thread 內做出：只經通知通道交給 manager pump，不在 actor thread 取 manager 鎖。
+                let tx = note_tx;
+                index.set_remote_evictor(Arc::new(move |com: &str, cmd_id: &str| {
+                    let _ = tx.send(ManagerNote::EvictCapture {
+                        com: com.to_string(),
+                        cmd_id: cmd_id.to_string(),
+                    });
+                }));
+                index
+            },
             closed: AtomicBool::new(false),
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
-            console: console.clone(),
             path_flavor: caps.path_flavor,
         });
         shared.bootstrap_sessions(&load.profiles);
@@ -2273,7 +2406,20 @@ impl SessionManager {
         match &req {
             SessionRequest::Bind { by_id } => return self.bind(sid, by_id),
             SessionRequest::Clear => return self.clear(sid, timeout),
-            SessionRequest::Recover { .. } | SessionRequest::DeviceAttach { .. }
+            SessionRequest::Recover { .. } if stopping && self.shared.actor_of(sid).is_some() => {
+                // Python `recover_session`：RELEASED 判定（released 回應）先於 stopping 例外（審查 F68）。
+                let released = self.shared.session_public(sid).is_some_and(|s| {
+                    str_of(&s, "state").as_deref() == Some("RELEASED")
+                        || self
+                            .shared
+                            .released_by_ids()
+                            .contains(&str_of(&s, "device_by_id").unwrap_or_default())
+                });
+                if !released {
+                    return Err(stopping_error());
+                }
+            }
+            SessionRequest::DeviceAttach { .. }
                 if stopping && self.shared.actor_of(sid).is_some() =>
             {
                 return Err(stopping_error());
@@ -2327,8 +2473,9 @@ impl SessionManager {
             .as_deref()
             == Some("DETACHED");
         if is_ok(&result) && detached && !by_id.is_empty() {
-            // 無 bridge 的 clear：裝置在線時重新 attach（Python `clear_session` 的 `_spawn_attach`）。
-            self.shared.send_attached(&by_id);
+            // core 判定裝置不在線而 manager 鏡像有裝置（兩者不一致時）：仍經 `_spawn_attach` 再解析，不直接以舊
+            // profile 開埠（審查 F98）。裝置確實不在線時 `spawn_attach` 為 no-op。
+            self.shared.spawn_attach(&by_id);
         }
         Ok(result)
     }
@@ -2452,29 +2599,53 @@ impl SessionManager {
             })
             .map_err(|e| commit_error(&e))?;
         if has_device {
-            // Python：裝置在線 → ATTACHING、last_error None，並 spawn attach。
-            if let Some(PyValue::Dict(s)) = result.0.get_mut("session") {
-                s.insert("state", PyValue::from("ATTACHING"));
-                s.insert("last_error", PyValue::Null);
+            // Python：裝置在線 → 回覆前活 session 即 ATTACHING、last_error None，再 spawn attach。
+            // 經請求通道的 DeviceOnline 套用並回覆活 session（審查 F70：不得只改回應副本）。
+            let real = lock(&self.shared.inner).device_path(&by_id).map(str::to_string);
+            if let Some(real_path) = real.filter(|_| !lock(&self.shared.inner).stopping) {
+                let applied = self.shared.request(
+                    &sid,
+                    SessionRequest::DeviceOnline {
+                        by_id: by_id.clone(),
+                        real_path,
+                    },
+                    QUERY_TIMEOUT,
+                );
+                if let Some(PyValue::Dict(mut live)) =
+                    applied.ok().and_then(|r| r.get("session").cloned())
+                {
+                    // alias 以 manager 鏡像為準（同 `session_public`）。
+                    if let Some(e) = lock(&self.shared.inner).sessions.get(&sid) {
+                        live.insert("alias", PyValue::from(e.profile.alias.clone()));
+                    }
+                    result.insert("session", PyValue::Dict(live));
+                }
             }
-            self.shared.send_attached(&by_id);
         }
         Ok(result)
     }
 
     /// #26：attach op 取消後 3000 ms 內未收斂（Python 設 RECOVERING＋drain_stalled 並回 SESSION_RECOVERING）。
+    /// #26 逾時：Python `bind_session` 直接寫活 session（state RECOVERING、drain_stalled、drain_timeout_epoch＝
+    /// attach op 的 bridge_generation），回應取自寫入後的 session（審查 F64：不得只改回應副本）。
     fn attach_op_stalled_reply(&self, sid: &str) -> PyDict {
-        let mut s = self.shared.session_public(sid).unwrap_or_default();
-        let epoch = s.get("bridge_generation").cloned().unwrap_or(PyValue::Null);
-        s.insert("state", PyValue::from("RECOVERING"));
-        s.insert("drain_stalled", PyValue::from(true));
-        s.insert("drain_timeout_epoch", epoch.clone());
-        pydict! {
-            "ok" => false,
-            "error_code" => "SESSION_RECOVERING",
-            "drain_stalled" => true,
-            "drain_timeout_epoch" => epoch,
-            "session" => s
+        let epoch = self
+            .shared
+            .session_public(sid)
+            .and_then(|s| s.get("bridge_generation").and_then(PyValue::as_i64))
+            .unwrap_or(0)
+            .max(0) as u64;
+        match self
+            .shared
+            .request(sid, SessionRequest::MarkAttachStalled { epoch }, QUERY_TIMEOUT)
+        {
+            Ok(reply) => reply,
+            Err(_) => pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_RECOVERING",
+                "drain_stalled" => true,
+                "drain_timeout_epoch" => PyValue::from(epoch as i64),
+            },
         }
     }
 
@@ -2795,6 +2966,11 @@ impl SessionManager {
     }
 
     /// SC-11 stopping gate：冪等設定 `stopping=true`；之後任何自動或 RPC 路徑的 attach 都不開啟裝置。
+    /// 建構子尾端啟動存檔重現的 Python 未捕捉例外末行（有值時 daemon 應印 traceback 並 exit 1）。
+    pub fn startup_error(&self) -> Option<String> {
+        lock(&self.shared.startup_error).clone()
+    }
+
     pub fn begin_shutdown(&self) {
         lock(&self.shared.inner).stopping = true;
     }
@@ -2880,6 +3056,17 @@ impl SessionManager {
             .resolve(com)
             .map(|e| lock(&e.history).clone())
             .unwrap_or_default()
+    }
+
+    /// 只供測試（test-fakes）：session 佇列的 `(len, physical_len)`（`None`＝查無 session）。
+    #[cfg(feature = "test-fakes")]
+    pub fn session_queue_lens(&self, selector: &str) -> Option<(i64, i64)> {
+        let sid = self.resolve(selector)?;
+        let d = self
+            .shared
+            .request(&sid, SessionRequest::QueueLensForTest, QUERY_TIMEOUT)
+            .ok()?;
+        Some((d.get("len")?.as_i64()?, d.get("physical_len")?.as_i64()?))
     }
 
     /// 只供測試（test-fakes）：直接設定 session 狀態（FLASHING／RECOVERING 等無法由 RPC 到達的狀態）。

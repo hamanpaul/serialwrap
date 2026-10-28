@@ -105,6 +105,11 @@ pub trait ConsoleTransportFactory: Send + Sync {
     fn new_mux(&self) -> PalResult<Box<dyn ConsoleMux>> {
         Err(unsupported("new_mux"))
     }
+    /// 哨兵 PTY slave 路徑是否仍存在（Python `snapshot()["vtty_alive"]` 的 `os.path.exists(primary)`）。
+    /// 替身工廠覆寫為「由本工廠發出」判定，使 in-process 測試的假路徑與 Python 實機語意一致。
+    fn slave_path_exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
 }
 
 fn unsupported(name: &str) -> PalError {

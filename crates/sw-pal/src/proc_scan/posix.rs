@@ -1,8 +1,11 @@
 //! POSIX `/proc` 行程掃描（P4-T4）。
+#[cfg(unix)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use crate::proc_holders::posix::{same_tty, HolderFs, RealHolderFs, TtyStat};
 use crate::proc_scan::{
     extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScanStatus,
     ProcIdentity, ProcScan, ScanFailure,
@@ -147,69 +150,17 @@ impl ProcScan for PosixProcScan {
         let Ok(daemons) = self.serialwrapd_instances() else {
             return (Vec::new(), HolderScanStatus::Unknown);
         };
-        // #R2：與 Python `sw_core.serial_port.same_tty` 同一判準（見 `same_tty`）。比對依 inode 身分，不以
-        // readlink 字串：跨 mount namespace（docker 容器）的同名 `/dev/pts/N` 字串相同卻非同一 tty。
-        // 目標身分取不到時不得推論為「無 holder」，status 回報 Permission／Unknown。
-        let mut status = HolderScanStatus::Ok;
-        let mut targets = Vec::with_capacity(paths.len());
-        for path in paths {
-            match fs::metadata(path) {
-                Ok(meta) => targets.push(meta),
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    status = HolderScanStatus::Permission;
-                }
-                Err(_) => {
-                    if status == HolderScanStatus::Ok {
-                        status = HolderScanStatus::Unknown;
-                    }
-                }
-            }
+        let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
+        #[cfg(unix)]
+        {
+            tty_holders_with(&RealHolderFs, &self.proc_root, &pids, paths)
         }
-        let mut holders = BTreeSet::new();
-        for daemon in daemons {
-            let fd_dir = self.proc_root.join(daemon.pid.to_string()).join("fd");
-            let entries = match fs::read_dir(fd_dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    status = HolderScanStatus::Permission;
-                    continue;
-                }
-                Err(_) => {
-                    if status == HolderScanStatus::Ok {
-                        status = HolderScanStatus::Unknown;
-                    }
-                    continue;
-                }
-            };
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    if status == HolderScanStatus::Ok {
-                        status = HolderScanStatus::Unknown;
-                    }
-                    continue;
-                };
-                // `fs::metadata` 跟隨 /proc/<pid>/fd/N 至 fd 實際指向的 inode。
-                let fd_meta = match fs::metadata(entry.path()) {
-                    Ok(meta) => meta,
-                    // 行程或 fd 在掃描期間消失屬正常競態。
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                        status = HolderScanStatus::Permission;
-                        continue;
-                    }
-                    Err(_) => {
-                        if status == HolderScanStatus::Ok {
-                            status = HolderScanStatus::Unknown;
-                        }
-                        continue;
-                    }
-                };
-                if targets.iter().any(|tty| same_tty(&fd_meta, tty)) {
-                    holders.insert(daemon.pid);
-                }
-            }
+        // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
+        #[cfg(not(unix))]
+        {
+            let _ = (pids, paths);
+            (Vec::new(), HolderScanStatus::Unknown)
         }
-        (holders.into_iter().collect(), status)
     }
 
     fn pid_alive(&self, pid: u32) -> bool {
@@ -285,31 +236,47 @@ fn read_proc_stat(root: &Path, pid: u32) -> ProcStatRead {
     ProcStatRead::Parsed(ProcStat { state, start_ticks })
 }
 
-/// 同一 tty 判定（#R2，與 Python `serial_port.same_tty` 一致）：`(dev, ino)` 相同；或兩邊皆為字元裝置、
-/// `rdev` 相等且非零、且 major 不在 devpts 範圍。devpts 各 instance 會重用 136:N，不以 rdev 判定。
 #[cfg(unix)]
-fn same_tty(fd: &fs::Metadata, tty: &fs::Metadata) -> bool {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    if fd.dev() == tty.dev() && fd.ino() == tty.ino() {
-        return true;
+/// `serialwrapd` fd 與 tty 的同一性比對（Python `multi_open.detect_multi_open` 的 holders 段；#R2／parity #64）。
+///
+/// 以 `stat`（跟隨 fd symlink）取得 inode 身分後經 [`same_tty`] 判定，不以 readlink 字串比對：跨 mount
+/// namespace 的同名 `/dev/pts/N` 字串相同卻非同一 tty。tty 本身 stat 失敗即略過該 tty（Python `tty_stat`
+/// 回 None）；fd stat 失敗略過該 fd；fd 目錄 PermissionError → `Permission`，其他錯誤 → `Unknown`。
+pub fn tty_holders_with(
+    fs: &dyn HolderFs,
+    proc_root: &Path,
+    pids: &[u32],
+    paths: &[PathBuf],
+) -> (Vec<u32>, HolderScanStatus) {
+    let tty_stats = paths
+        .iter()
+        .filter_map(|path| fs.stat(path).ok())
+        .collect::<Vec<TtyStat>>();
+    let mut holders = BTreeSet::new();
+    let mut status = HolderScanStatus::Ok;
+    for pid in pids {
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
+        let fds = match fs.list_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                status = HolderScanStatus::Permission;
+                continue;
+            }
+            Err(_) => {
+                if status == HolderScanStatus::Ok {
+                    status = HolderScanStatus::Unknown;
+                }
+                continue;
+            }
+        };
+        for fd in fds {
+            let Ok(fd_stat) = fs.stat(&fd_dir.join(&fd)) else {
+                continue;
+            };
+            if tty_stats.iter().any(|tty| same_tty(&fd_stat, tty)) {
+                holders.insert(*pid);
+            }
+        }
     }
-    if !(fd.file_type().is_char_device() && tty.file_type().is_char_device()) {
-        return false;
-    }
-    let rdev = tty.rdev();
-    rdev != 0 && fd.rdev() == rdev && !is_devpts_major(rdev)
-}
-
-/// Linux `dev_t` 的 major（與 glibc `gnu_dev_major` 同一位元運算）落在 UNIX98 devpts 範圍 136–143。
-#[cfg(unix)]
-fn is_devpts_major(rdev: u64) -> bool {
-    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff_u64);
-    (136..=143).contains(&major)
-}
-
-/// 非 unix 無 `(dev, ino)` 身分可用；`PosixProcScan` 的 holder 判定僅於 unix 實際使用（Windows 走 `WindowsProcScan`）。
-#[cfg(not(unix))]
-fn same_tty(_fd: &fs::Metadata, _tty: &fs::Metadata) -> bool {
-    false
+    (holders.into_iter().collect(), status)
 }

@@ -18,6 +18,101 @@ pub const BG_CAPTURE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// `BG_CAPTURE_MAX_COUNT`。
 pub const BG_CAPTURE_MAX_COUNT: usize = 64;
 
+/// 遠端淘汰回呼：`(擁有者 session_id, cmd_id)`；由 manager 轉為對該 session 的 `ControlEvent::EvictCapture`。
+pub type RemoteEvictor = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// 全 daemon 共用的 background capture 索引（Python `SessionManager._background` 為 manager 層全域 dict，
+/// `_evict_background_locked` 依全域 `created_at` 淘汰；審查 F28）。capture 本體仍由各 session 持有，
+/// 索引只記擁有者、`created_at`、插入序與是否 active（與 capture 的 `status` 同步）。
+pub struct BackgroundIndex {
+    inner: std::sync::Mutex<BackgroundIndexInner>,
+    remote: std::sync::OnceLock<RemoteEvictor>,
+}
+
+#[derive(Default)]
+struct BackgroundIndexInner {
+    next_seq: u64,
+    /// cmd_id → (sid, created_at, seq, active)；插入序即 Python dict 序。
+    entries: indexmap::IndexMap<String, (String, String, u64, bool)>,
+}
+
+impl BackgroundIndex {
+    pub fn new() -> Arc<BackgroundIndex> {
+        Arc::new(BackgroundIndex {
+            inner: std::sync::Mutex::new(BackgroundIndexInner::default()),
+            remote: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// 設定遠端淘汰回呼（只生效一次；未設定時跨 session 的淘汰只從索引移除）。
+    pub fn set_remote_evictor(&self, f: RemoteEvictor) {
+        let _ = self.remote.set(f);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BackgroundIndexInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 登錄新 capture（active）並依 `_evict_background_locked` 淘汰：總數超過 `BG_CAPTURE_MAX_COUNT` 時，
+    /// 依 `created_at`（同值依插入序）移除最舊的已終結者，回傳被淘汰的 `(sid, cmd_id)`（呼叫端處理本 session 者，
+    /// 其餘經遠端回呼）。active 者永不淘汰。
+    pub fn register(&self, cmd_id: &str, sid: &str, created_at: &str) -> Vec<(String, String)> {
+        let mut g = self.lock();
+        let seq = g.next_seq;
+        g.next_seq = g.next_seq.saturating_add(1);
+        g.entries
+            .insert(cmd_id.to_string(), (sid.to_string(), created_at.to_string(), seq, true));
+        if g.entries.len() <= BG_CAPTURE_MAX_COUNT {
+            return Vec::new();
+        }
+        let mut finalized: Vec<(String, u64, String, String)> = g
+            .entries
+            .iter()
+            .filter(|(_, (_, _, _, active))| !*active)
+            .map(|(id, (owner, at, seq, _))| (at.clone(), *seq, id.clone(), owner.clone()))
+            .collect();
+        finalized.sort();
+        let excess = g.entries.len() - BG_CAPTURE_MAX_COUNT;
+        let victims: Vec<(String, String)> = finalized
+            .into_iter()
+            .take(excess)
+            .map(|(_, _, id, owner)| (owner, id))
+            .collect();
+        for (_, id) in &victims {
+            g.entries.shift_remove(id);
+        }
+        victims
+    }
+
+    /// 同步 capture 的 active 狀態（`status == "active"`）。
+    pub fn set_active(&self, cmd_id: &str, active: bool) {
+        if let Some(entry) = self.lock().entries.get_mut(cmd_id) {
+            entry.3 = active;
+        }
+    }
+
+    /// 自索引移除（capture 被擁有者丟棄時）。
+    pub fn remove(&self, cmd_id: &str) {
+        self.lock().entries.shift_remove(cmd_id);
+    }
+
+    /// 索引內 capture 數（測試與診斷用）。
+    pub fn len(&self) -> usize {
+        self.lock().entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 通知擁有者 session 丟棄被全域淘汰的 capture。
+    pub fn evict_remote(&self, sid: &str, cmd_id: &str) {
+        if let Some(f) = self.remote.get() {
+            f(sid, cmd_id);
+        }
+    }
+}
+
 /// `background` 命令的輸出累積（`command.result_tail` 逐段讀取）。
 #[derive(Clone, Debug)]
 pub struct BackgroundCapture {
@@ -191,7 +286,8 @@ impl LogFs for StdLogFs {
 #[derive(Clone)]
 pub struct CaptureEnv {
     pub fs: Arc<dyn LogFs>,
-    /// 檔名時間戳（`time.strftime("%y%m%d-%H%M%S")` 本地時間）；`None` 時以 UTC 系統時間代替。
+    /// 檔名時間戳（`time.strftime("%y%m%d-%H%M%S")` 本地時間）。產品路徑由 manager 注入平台 Clock；
+    /// `None` 只見於未經 manager 組裝的獨立 core（以 UTC 系統時間代替）。
     pub clock: Option<Arc<dyn Clock>>,
     /// `LOG_DIR`（`SERIALWRAP_LOG_DIR` 或 `~/b-log`）；`None` 時由 env 推導。
     pub default_log_dir: Option<String>,

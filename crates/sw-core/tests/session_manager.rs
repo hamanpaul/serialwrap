@@ -1232,6 +1232,19 @@ fn bind_with_inflight_attach_op_cancels_waits_3000ms() {
         s_of(&session_field(&r), "state").as_deref(),
         Some("RECOVERING")
     );
+    // 審查 F64：Python `bind_session` 逾時時寫入活的 session（state、drain_stalled、drain_timeout_epoch），
+    // 之後 `session.get_state` 同為 RECOVERING＋drain_stalled，`command.submit` 回 SESSION_RECOVERING。
+    let live = m.session("COM0");
+    assert_eq!(s_of(&live, "state").as_deref(), Some("RECOVERING"), "{live:?}");
+    assert_eq!(live.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(
+        live.get("drain_timeout_epoch"),
+        r.get("drain_timeout_epoch"),
+        "活 session 的 epoch 與回應一致"
+    );
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let sub = rpc(m.mgr.route(&sid, SessionRequest::Submit(agent_submit("ls")), RPC));
+    assert_eq!(code_of(&sub).as_deref(), Some("SESSION_RECOVERING"), "{sub:?}");
     m.serial.release_open(&real);
     // 取消的 op 拿到 handle 後立即關閉（不交給 session）。
     wait_until("取消的 op 關閉 handle", || m.device(&real).close_count() == 2);
@@ -1544,6 +1557,13 @@ fn detect_probe_tx_goes_through_fence() {
     assert_eq!(m.wait_profile_source("COM0"), "fallback");
     assert_eq!(m.device(&real).os_submits(), 0, "PROBE Fence 凍結時不得提交任何 bytes 給 OS");
     assert_eq!(tx_rows(&m), 0, "未送出的 PROBE TX 不得寫 WAL");
+    // 審查 F71：Python `detect_template` 的 `send_command("")` 被拒即拋例外，呼叫端 `except` → `detected=None`，
+    // 不睡 3 s、不比對 RX（否則 DUT 在視窗內自吐的 prompt 會被誤判為 detected）。
+    assert!(
+        !m.clock.sleeps_s().contains(&3.0),
+        "PROBE 被拒後不得再等偵測視窗：{:?}",
+        m.clock.sleeps_s()
+    );
 
     // 未凍結：恰一次 OS 提交、恰一筆 PROBE TX WAL（由 TxWriter 寫），PROBE 與正式 bridge 共用同一 handle。
     let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
@@ -1555,4 +1575,465 @@ fn detect_probe_tx_goes_through_fence() {
     assert_eq!(m.wait_profile_source("COM0"), "detected");
     assert_eq!(tx_rows(&m), 1, "PROBE TX 只由 TxWriter 寫一筆 WAL");
     assert_eq!(m.serial.open_attempts(&real), 1);
+    // 審查 F72：PROBE 的唯一一筆 TX 為 Python `send_command("")` 補上的 `\n`（payload_b64 `Cg==`），
+    // 且裝置收到的第一筆提交即此 `\n`（之後的提交屬正式 bridge 的登入 probe）。
+    let probe_payloads: Vec<String> = m
+        .wal_rows()
+        .into_iter()
+        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+        .filter_map(|r| s_of(&r, "payload_b64"))
+        .collect();
+    assert_eq!(probe_payloads, vec!["Cg==".to_string()]);
+    assert!(
+        m.device(&real).take_tx().starts_with(b"\n"),
+        "PROBE payload 應為 \\n"
+    );
+}
+
+#[test]
+fn watcher_tick_services_deferred_wal_rotation() {
+    // 審查 F10（OD-19）：Python `Service._on_watcher_tick` 每輪先 `wal.tick()`——延後輪替的完成不得依賴後續 append。
+    // 現行檔達門檻、rename 連 4 次 EACCES 轉入延遲佇列；之後不再 append，只送 watcher Tick → 輪替完成並寫
+    // `WAL_ROTATED_AFTER_DEFERRAL`。
+    let m = ManagerRig::templates_only();
+    let wal_path = std::path::Path::new("/fake/wal/raw.wal.ndjson");
+    m.wfs.seed(wal_path, &vec![b'\n'; 67_108_864]);
+    m.wfs
+        .fail_next_renames(4, sw_pal::PalError::io(13, "[Errno 13] Permission denied"));
+    let append = || {
+        m.wal.append(sw_core::wal::WalAppendReq {
+            com: "COM0",
+            dir: "RX",
+            source: "uart",
+            payload: b"x",
+            cmd_id: None,
+            loss_flag: false,
+            meta: None,
+        })
+    };
+    m.clock.advance(Duration::from_millis(300));
+    for backoff_ms in [11u64, 51, 201, 0] {
+        append();
+        m.clock.advance(Duration::from_millis(backoff_ms));
+    }
+    let h = m.wal.health().to_pydict();
+    assert_eq!(h.get("deferred_delete_pending").and_then(PyValue::as_i64), Some(1));
+    m.clock.advance(Duration::from_millis(1001));
+    m.mgr.watcher_sender().send(WatcherEvent::Tick).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let h = m.wal.health().to_pydict();
+        if h.get("deferred_delete_pending").and_then(PyValue::as_i64) == Some(0) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "watcher Tick 未推進延後輪替：{h:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let text = String::from_utf8(m.wfs.contents(wal_path).expect("新現行檔")).unwrap();
+    assert!(text.contains("WAL_ROTATED_AFTER_DEFERRAL"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// 審查 F43／F30（afe4853／8b8a40f）：POSIX bridge 開成時建 internal 哨兵 primary PTY——Python
+// `UARTBridge.start` 的 `_create_console_client("primary")`：`console_count == 1`、`vtty == "/dev/pts/N"`，
+// release 回應 `closed_consoles == 1`；無 PTY 平台（create_pty Unsupported）為 0／null。
+// ---------------------------------------------------------------------------
+
+fn native_console_rig() -> ManagerRig {
+    ManagerRig::with_console(
+        SHELL_PROFILE,
+        LoadedState::default(),
+        Some(("/s/by-id/usb-A", "/dev/ttyOLD")),
+        sw_pal::native().console.clone(),
+    )
+    .ready()
+}
+
+fn has_pty() -> bool {
+    sw_pal::native().console.create_pty().is_ok()
+}
+
+#[test]
+fn sentinel_pty_reported_in_public_and_release() {
+    let m = native_console_rig();
+    let s = m.session("COM0");
+    if has_pty() {
+        assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(1), "{s:?}");
+        let vtty = s.get("vtty").and_then(PyValue::as_str).unwrap_or_default().to_string();
+        assert!(vtty.starts_with("/dev/pts/") && std::path::Path::new(&vtty).exists(), "vtty={vtty}");
+    } else {
+        assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(0));
+        assert_eq!(s.get("vtty"), Some(&PyValue::Null));
+    }
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    assert!(is_ok(&r), "{r:?}");
+    assert_eq!(
+        r.get("closed_consoles").and_then(PyValue::as_i64),
+        Some(i64::from(has_pty()))
+    );
+    let s = session_field(&r);
+    assert_eq!(s.get("console_count").and_then(PyValue::as_i64), Some(0));
+    assert_eq!(s.get("vtty"), Some(&PyValue::Null));
+}
+
+#[test]
+fn selftest_fallback_passthrough_suggests_pin_profile() {
+    // 審查 F31（8b8a40f）：fallback passthrough（ATTACHED）且 RX tail 命中非 passthrough template 的 prompt →
+    // Python `PASSTHROUGH`＋`recommended_action:"pin_profile"`＋`suggested_profile`＋`hint`，零 TX。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("fallback session", || m.wait_profile_source("COM0") == "fallback");
+    m.wait_state("COM0", "ATTACHED");
+    let real = m.real_of("/s/by-id/usb-F");
+    let dev = m.device(&real);
+    dev.push_rx(b"\r\nroot@prpl:/# ");
+    wait_until("RX 進入視窗", || {
+        m.session("COM0")
+            .get("rx_bytes_last_10s")
+            .and_then(PyValue::as_i64)
+            .is_some_and(|n| n > 0)
+    });
+    let submits = dev.os_submits();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::SelfTest {
+            timeout_s: 2.0,
+            strict_human_lock: false,
+        },
+        RPC,
+    ));
+    assert_eq!(s_of(&r, "classification").as_deref(), Some("PASSTHROUGH"), "{r:?}");
+    assert_eq!(s_of(&r, "recommended_action").as_deref(), Some("pin_profile"));
+    assert_eq!(s_of(&r, "suggested_profile").as_deref(), Some("prpl-template"));
+    let hint = s_of(&r, "hint").unwrap_or_default();
+    assert!(
+        hint.contains("serialwrap session pin --selector COM0 --profile prpl-template"),
+        "{hint}"
+    );
+    assert_eq!(dev.os_submits(), submits, "PASSTHROUGH 分類零 TX");
+}
+
+#[test]
+fn log_filename_uses_local_time_by_default() {
+    // 審查 F34（8b8a40f）：Python `time.strftime("%y%m%d-%H%M%S")` 為本地時間。manager 預設以平台 Clock
+    // （`local_utc_offset_s`）組檔名，不得以 UTC 代替。wall=1970-01-01T00:00:00Z、本地 UTC+8 → `COM0_700101-080000.log`。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let yaml = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    log_dir: {}\ntargets:\n  - {{com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}}\n",
+        dir.path().display()
+    );
+    let m = ManagerRig::single_target(&yaml).ready();
+    m.clock.set_local_offset_s(8 * 3600);
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(&sid, SessionRequest::LogStart, RPC));
+    assert!(is_ok(&r), "{r:?}");
+    let path = s_of(&r, "log_path").unwrap_or_default();
+    let expected = sw_proto::pycompat::strftime_local(
+        sw_pal::traits::Clock::wall_unix_us(&*m.clock),
+        8 * 3600,
+        "%y%m%d-%H%M%S",
+    );
+    assert!(path.ends_with(&format!("COM0_{expected}.log")), "{path} vs {expected}");
+    let _ = rpc(m.mgr.route(&sid, SessionRequest::LogStop, RPC));
+}
+
+#[test]
+fn dynamic_session_applies_template_uart_config() {
+    // 審查 F59（High，73634db）：動態 session 以預設設定預開 PROBE，偵測命中模板後，正式 bridge 必須對同一預開
+    // handle 套用模板的 UART 設定（Python bridge 啟動時 `port.configure(self.profile)`），不得停在 115200。
+    let yaml = format!(
+        "{}  fast:\n    platform: shell\n    prompt_regex: '(?m)^root@fast:.*# '\n    timeout_s: 2.0\n    uart:\n      baud: 921600\n",
+        manager_yaml(&[])
+    );
+    let m = ManagerRig::with(&yaml, LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    let real = m.real_of("/s/by-id/usb-F");
+    let dev = m.device(&real);
+    dev.on_tx_reply(b"\n", b"root@fast:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("偵測命中 fast", || m.mgr.resolve("COM0").as_deref() == Some("fast:COM0"));
+    wait_until("正式 bridge 已套用設定", || {
+        dev.configs().last().is_some_and(|cfg| cfg.baud == 921_600)
+    });
+    let configs = dev.configs();
+    assert_eq!(configs.first().map(|c| c.baud), Some(115_200), "PROBE 以預設設定開啟：{configs:?}");
+    assert_eq!(m.serial.open_attempts(&real), 1, "PROBE 與正式 bridge 共用同一 handle（#51）");
+}
+
+#[test]
+fn missing_explicit_target_marked_device_not_found() {
+    // 審查 F60（High，73634db）：Python `update_devices` 每次掃描以 `_mark_missing_devices_locked` 標記
+    // 「非 RELEASED、無 bridge、裝置不在快照」的 session：state DETACHED、last_error（None 時）DEVICE_NOT_FOUND、
+    // detached_at（None 時）填入。
+    let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    m.mgr.update_devices(&[]);
+    wait_until("DEVICE_NOT_FOUND", || {
+        m.session_last_error("COM0").as_deref() == Some("DEVICE_NOT_FOUND")
+    });
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "state").as_deref(), Some("DETACHED"));
+    assert!(s_of(&s, "detached_at").is_some(), "{s:?}");
+}
+
+#[test]
+fn pin_then_clear_on_attached_session_applies_pin() {
+    // 審查 F62（High，73634db）：parity #32／#181「session pin + session clear 對既有 session 生效」。
+    // Python `clear_session` drain 後 `_complete_drain` → `_spawn_attach` → `_attach_by_id` 開埠前
+    // `_reresolve_profile_on_reattach`：pin 可解析即換 template（profile_source pin）、不送 PROBE。
+    // 具體輸入：fallback session（others-template:COM0）已 ATTACHED → pin prpl-template → clear。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-D"]);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    m.wait_state("COM0", "ATTACHED");
+    let probe_rows = |m: &ManagerRig| {
+        m.wal_rows()
+            .iter()
+            .filter(|r| s_of(r, "com").as_deref() == Some("PROBE"))
+            .count()
+    };
+    let before = probe_rows(&m);
+    assert!(is_ok(&rpc(m.mgr.pin("COM0", "prpl-template"))));
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = rpc(m.mgr.route(&sid, SessionRequest::Clear, RPC));
+    assert!(is_ok(&r), "clear 應成功：{r:?}");
+    wait_until("clear 後套用 pin", || {
+        m.mgr.resolve("COM0").as_deref() == Some("prpl-template:COM0")
+            && m.state_of("COM0").as_deref() == Some("ATTACHED")
+    });
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "profile_source").as_deref(), Some("pin"));
+    assert_eq!(s_of(&s, "platform").as_deref(), Some("prpl"));
+    assert_eq!(probe_rows(&m), before, "pin 繞過偵測，不得送 PROBE");
+}
+
+
+#[test]
+fn shutdown_gate_after_open_started_stops_bridge_without_tx() {
+    // 審查 F66（Medium，73634db）：原 #29 斷言在 begin_shutdown 之後才送熱插，update_devices 早退，修正前也綠。
+    // 改為「open 已越過 gate、阻塞中 → begin_shutdown → 放行」：Python `_attach_by_id` 在 `bridge.start()` 後持鎖
+    // 檢查 `_shutting_down` → `_begin_attach_bridge_stop_locked` 收掉剛開的 bridge，不送登入 probe；
+    // session 回 DETACHED（parity #29：凍結早退不停在 ATTACHING）。
+    let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    let real = "/dev/ttyGATE";
+    m.add_device_at("/s/by-id/usb-A", real);
+    m.serial.block_open(real);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("open 進入阻塞", || m.serial.open_attempts(real) == 1);
+    m.mgr.begin_shutdown();
+    m.serial.release_open(real);
+    wait_until("COM0 DETACHED", || m.state_of("COM0").as_deref() == Some("DETACHED"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(m.state_of("COM0").as_deref(), Some("DETACHED"));
+    assert!(m.device(real).take_tx().is_empty(), "stopping 後不得送登入 probe");
+}
+
+#[test]
+fn recover_released_during_stopping_returns_released() {
+    // 審查 F68（Low，73634db）：Python `recover_session` 先判 RELEASED（回
+    // `{"ok":true,"released":true,"recommended_action":"device_attach",…}`），才輪到 stopping 的例外。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Str("t".to_string()),
+        },
+        RPC,
+    ));
+    m.wait_state("COM0", "RELEASED");
+    m.mgr.begin_shutdown();
+    let r = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Recover {
+            timeout_s: 1.0,
+            force: false,
+        },
+        RPC,
+    ));
+    assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)), "{r:?}");
+    assert_eq!(r.get("released"), Some(&PyValue::Bool(true)));
+    assert_eq!(r.get("recommended_action"), Some(&PyValue::from("device_attach")));
+}
+
+#[test]
+fn bind_to_online_device_live_state_attaching_before_reply() {
+    // 審查 F70（Low，73634db）：Python `bind_session` 在回覆前把活 session 設 ATTACHING＋`last_error=None`；
+    // 回覆後立即 `session.get_state` 不得看到 DETACHED＋DEVICE_NOT_FOUND（舊實作只改回應副本，另以 control lane
+    // 非同步送 DeviceAttached，請求通道的 GetState 會先被處理）。輸入：RELEASED 的 COM0 改綁回仍在線的原 by_id。
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let by_id = s_of(&m.session("COM0"), "device_by_id").expect("by_id");
+    rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    m.wait_state("COM0", "RELEASED");
+    let r = rpc(m.mgr.bind("COM0", &by_id));
+    assert!(is_ok(&r), "{r:?}");
+    let live = m.session("COM0");
+    let reply = session_field(&r);
+    assert_eq!(s_of(&reply, "state").as_deref(), Some("ATTACHING"));
+    assert_eq!(reply.get("last_error"), Some(&PyValue::Null));
+    assert_ne!(s_of(&live, "state").as_deref(), Some("DETACHED"), "{live:?}");
+    assert_ne!(
+        s_of(&live, "last_error").as_deref(),
+        Some("DEVICE_NOT_FOUND"),
+        "{live:?}"
+    );
+}
+
+#[test]
+fn release_persist_point_failure_fails_release_commit() {
+    // 審查 F85（Low，3938032）：Python `_test_release_persist_point` 的 `os.makedirs`／寫 `arrived` 失敗會拋出，
+    // `_save_release_state` 不落盤、release 持久化失敗（不得吞掉錯誤後照常 commit）。
+    struct FailingPoint;
+    impl sw_core::session_manager::PersistObserver for FailingPoint {
+        fn before_release_commit(&self) -> Result<(), sw_pal::PalError> {
+            Err(sw_pal::PalError::io(20, "[Errno 20] Not a directory: '/dev/null/x'"))
+        }
+        fn after_commit(&self, _release: bool) {}
+    }
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    m.mgr.set_persist_observer(std::sync::Arc::new(FailingPoint));
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let r = m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    );
+    assert!(r.is_err(), "暫停點失敗時 release 持久化不得成功：{r:?}");
+    assert!(
+        m.load_state_now().released.is_empty(),
+        "state.json 不得寫入 released 列"
+    );
+}
+
+#[test]
+fn manager_startup_always_rewrites_state_json() {
+    // 審查 F56（Medium，c96a91c）：Python `SessionManager.__init__` 尾端一律 `_save_state()`（#13），即使內容與磁碟
+    // 相同也重寫；原 `state_store::startup_always_rewrites_state_json` 只驗 store 自身的 commit，不證明啟動會寫。
+    let m = ManagerRig::with(SHELL_PROFILE, LoadedState::default(), None);
+    assert!(m.state_writes() >= 1, "SessionManager 建構即應寫一次 state.json");
+    let text = m.state_text();
+    assert!(text.contains("\"aliases\"") && text.ends_with('\n'), "{text:?}");
+}
+
+#[test]
+fn reattach_redetect_to_ready_does_not_write_sticky() {
+    // 審查 F65（manager 層）：sticky 只由「動態 attach 本身」到 READY 時寫入（Python `_attach_by_id_dynamic`）。
+    // 既有 fallback session 重插經 `_reresolve_profile_on_reattach` 再偵測命中 `t` 並到 READY，Python 不寫
+    // `profile_detected`。
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    let real = fallback_session_then_unplug(&m, "/s/by-id/usb-D");
+    let dev = m.device(&real);
+    install_shell_replies(&dev);
+    // 第一次偵測已送過 `\n`：重插後的再偵測（第二個 `\n`）與登入 probe（第三個 `\n`）各需一次 prompt。
+    dev.on_tx_reply(b"\n\n", b"root@t:/# ");
+    dev.on_tx_reply(b"\n\n\n", b"root@t:/# ");
+    m.mgr.update_devices(&m.snapshot());
+    wait_until("再偵測命中 t 並 READY", || {
+        m.mgr.resolve("COM0").as_deref() == Some("t:COM0")
+            && m.state_of("COM0").as_deref() == Some("READY")
+    });
+    assert_eq!(
+        s_of(&m.session("COM0"), "profile_source").as_deref(),
+        Some("detected")
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        m.load_state_now().profile_detected.is_empty(),
+        "重新 attach 的再偵測到 READY 不得寫 sticky：{}",
+        m.state_text()
+    );
+}
+
+#[test]
+fn global_bg_capture_eviction_reaches_owner_session_via_manager() {
+    // 審查 d2d29a6_7af6567 3b5927a #1（F28 manager 接線）：跨 session 淘汰須經 actor `register` →
+    // `ManagerNote::EvictCapture` → manager 依 COM 解析擁有者 → `ControlEvent::EvictCapture`。
+    // Python `SessionManager._background` 為全域 dict，`_evict_background_locked` 直接 `pop`，之後
+    // `result_tail` 回 CMD_NOT_FOUND。輸入：COM1 先完成 64 筆 bg capture，COM0 再完成 1 筆 → 淘汰 COM1 最舊者。
+    let yaml = manager_yaml(&[
+        &t_target("COM0", 1, "/s/by-id/usb-A"),
+        &t_target("COM1", 2, "/s/by-id/usb-B"),
+    ]);
+    let m = ManagerRig::with(&yaml, LoadedState::default(), Some(("/s/by-id/usb-A", "/dev/ttyA")));
+    let dev_b = m.add_device_at("/s/by-id/usb-B", "/dev/ttyB");
+    install_shell_replies(&dev_b);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "READY");
+    m.wait_state("COM1", "READY");
+    // `on_tx_reply` 只推一次；65 筆命令改用逐行比對的 `on_tx_match`。
+    for dev in [&m.dev, &dev_b] {
+        dev.on_tx_match("dmesg", Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()));
+    }
+    let sid0 = m.mgr.resolve("COM0").unwrap();
+    let sid1 = m.mgr.resolve("COM1").unwrap();
+    let bg = |sid: &str| -> String {
+        let mut req = agent_submit("dmesg");
+        req.mode = "bg".into();
+        let r = rpc(m.mgr.route(sid, SessionRequest::Submit(req), RPC));
+        s_of(&r, "cmd_id").expect("cmd_id")
+    };
+    let tail = |sid: &str, id: &str| -> PyDict {
+        rpc(m.mgr.route(
+            sid,
+            SessionRequest::BackgroundResult {
+                cmd_id: id.to_string(),
+                from_chunk: 0,
+                limit: 200,
+            },
+            RPC,
+        ))
+    };
+    let wait_done = |_sid: &str, id: &str| {
+        wait_until(&format!("{id} 完成"), || {
+            m.reg
+                .get(id)
+                .and_then(|c| c.get("done_at").cloned())
+                .is_some_and(|v| !matches!(v, PyValue::Null))
+        });
+    };
+    let mut ids1 = Vec::new();
+    for _ in 0..64 {
+        let id = bg(&sid1);
+        wait_done(&sid1, &id);
+        ids1.push(id);
+    }
+    // capture 於最後活動後 quiet window 才轉 done（`maybe_finalize`，讀取時評估）：推進時鐘並逐筆讀取，
+    // 使 COM1 的 64 筆在索引中皆為已終結（可淘汰）。
+    m.clock.advance(Duration::from_secs(120));
+    for id in &ids1 {
+        assert_eq!(s_of(&tail(&sid1, id), "status").as_deref(), Some("done"));
+    }
+    let id0 = bg(&sid0);
+    wait_done(&sid0, &id0);
+    wait_until("COM1 最舊 capture 被淘汰", || {
+        s_of(&tail(&sid1, &ids1[0]), "error_code").as_deref() == Some("CMD_NOT_FOUND")
+    });
+    assert_eq!(tail(&sid1, &ids1[1])["ok"], PyValue::Bool(true), "只淘汰最舊一筆");
+    assert_eq!(tail(&sid0, &id0)["ok"], PyValue::Bool(true), "新完成者保留");
 }

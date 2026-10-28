@@ -774,6 +774,14 @@ impl CancelToken {
 pub trait CloseImpl: Send {
     /// 回報底層 serial handle 是否仍有效；不以 EOF 或讀取錯誤推斷 handle 已關閉。
     fn is_alive(&self) -> bool;
+    /// 對仍開啟的 handle 重新套用 UART 設定（Python bridge 啟動時對預開 port 的 `port.configure(profile)`；
+    /// 動態 session 的 PROBE 與正式 bridge 共用同一預開 handle，#51）。未支援的後端回 `Unsupported`。
+    fn configure(&self, _cfg: &SerialConfig) -> PalResult<()> {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "configure 於此後端未支援",
+        ))
+    }
     fn close(self: Box<Self>) -> CloseReceipt;
 }
 
@@ -789,6 +797,11 @@ impl CloseToken {
 
     pub fn is_alive(&self) -> bool {
         self.inner.is_alive()
+    }
+
+    /// 見 [`CloseImpl::configure`]。
+    pub fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        self.inner.configure(cfg)
     }
 
     pub fn close(self, r: Box<dyn SerialReader>, w: Box<dyn SerialWriter>) -> CloseReceipt {

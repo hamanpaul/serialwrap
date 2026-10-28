@@ -323,7 +323,7 @@ impl SessionCore {
             if self.tick_close_hold.is_some() {
                 return Err(self.busy_reply());
             }
-            if self.foreground_busy() {
+            if self.fg_slot_busy() {
                 return Err(self.selector_error("SESSION_BUSY"));
             }
             self.refresh_lease_p6(now);
@@ -332,7 +332,7 @@ impl SessionCore {
             if self.tick_close_hold.is_some() {
                 return Err(self.busy_reply());
             }
-            if self.foreground_busy() {
+            if self.fg_slot_busy() {
                 return Err(self.selector_error("SESSION_BUSY"));
             }
             let mut result;

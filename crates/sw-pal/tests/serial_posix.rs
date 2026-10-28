@@ -91,7 +91,7 @@ fn cap_posix_pty__external_plain_open_before_daemon_is_held() {
         "被拒時 UART 零 TX"
     );
     drop(child); // kill + wait
-                 // peer（PTY master）仍開啟：被拒路徑若只 close(fd) 未 TIOCNXCL，旗標殘留，此處會得 Held(EBUSY)（R0-F3）
+    // peer（PTY master）仍開啟：被拒路徑若只 close(fd) 未 TIOCNXCL，旗標殘留，此處會得 Held(EBUSY)（R0-F3）
     let _h = sw_pal::native()
         .serial
         .open_exclusive(&dev, &cfg())

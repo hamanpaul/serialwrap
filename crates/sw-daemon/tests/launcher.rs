@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sw_daemon::launcher::{launcher_argv, manifest_absent, LauncherError};
+use sw_daemon::launcher::{dispatch_to_rust_daemon, launcher_argv, manifest_absent, LauncherError};
 use std::sync::Arc;
 use sw_pal::fakes::{platform, FakeSysEnv, MemFs};
 use sw_pal::traits::{PalError, SysEnv};
@@ -310,6 +310,8 @@ fn launcher_argv_matches_multi_open_rule2() {
     );
 }
 
+/// 名稱沿用 Stage 1（nodeid 已入 L1 鎖，不得改名）：P5-T19 起驗證「exec 路徑仍拒絕 rust（`launcher_argv`），
+/// 但 rust bundle 入口交 Rust daemon 本體」（審查 F82／F98）。
 #[test]
 fn launcher_rejects_rust_implementation_in_stage1() {
     let dir = release_manifest_dir();
@@ -321,22 +323,35 @@ fn launcher_rejects_rust_implementation_in_stage1() {
         "錯誤種類必須為 UnsupportedImplementation：{err:?}"
     );
 
-    // 端到端：stderr 恰一行 `serialwrapd: <原因>`、exit 2、stdout 不印任何 JSON。
+    // 端到端（P5-T19 切換，計畫 Task 19 Files／main.rs 規格；審查 F82）：launcher 的 exec 路徑仍只承接
+    // python（上方 `launcher_argv` 拒絕不變），但 `implementation=rust` 的 bundle 入口改交 Rust daemon 本體
+    // `daemon_main::run`：以 `--bogus` 驗證進入本體——Python argparse 形狀（首行 `usage: serialwrapd`、exit 2），
+    // 而非 launcher 的單行 `serialwrapd: <原因>`。stdout 不印任何 JSON。
     let root = TempTree::new("rust-impl");
     let exe = stage_bundle(root.path(), &manifest_text("rust", &["bin/serialwrapd"]));
-    let out = retry_busy(|| Command::new(&exe).stdin(Stdio::null()).output())
-        .expect("執行 launcher");
+    let out = retry_busy(|| {
+        Command::new(&exe)
+            .arg("--bogus")
+            .stdin(Stdio::null())
+            .output()
+    })
+    .expect("執行 serialwrapd");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(out.status.code(), Some(2), "exit code 必須為 2；stderr={stderr:?}");
     let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(lines.len(), 1, "stderr 必須恰一行：{stderr:?}");
     assert!(
-        lines[0].starts_with("serialwrapd: "),
-        "stderr 須以 `serialwrapd: ` 起頭：{stderr:?}"
+        lines.first().is_some_and(|l| l.starts_with("usage: serialwrapd")),
+        "rust manifest 須進入 daemon 本體（argparse usage）：{stderr:?}"
+    );
+    assert!(
+        lines
+            .last()
+            .is_some_and(|l| l == &"serialwrapd: error: unrecognized arguments: --bogus"),
+        "argparse 錯誤行：{stderr:?}"
     );
     assert!(
         out.stdout.is_empty(),
-        "launcher 失敗不得在 stdout 印出 JSON：{:?}",
+        "不得在 stdout 印出 JSON：{:?}",
         String::from_utf8_lossy(&out.stdout)
     );
 }
@@ -580,4 +595,32 @@ fn manifest_absent_false_when_manifest_present_for_python_and_rust() {
             "manifest 存在（implementation={implementation}）須維持 launcher 路徑"
         );
     }
+}
+
+#[test]
+fn dispatch_to_rust_daemon_for_dev_build_and_rust_manifest() {
+    // 審查 F82（P5-T19）：計畫 main.rs 規格——`implementation == "python"` → launcher；`"rust"` 或無 manifest
+    // （開發 build）→ `daemon_main::run`；manifest 不可讀／指標懸空／解析失敗 → launcher（fail-closed exit 2）。
+    let (_root, _exe, env) = dispatch_fixture("rust-dispatch-dev");
+    assert!(dispatch_to_rust_daemon(&dispatch_platform(env, MemFs::default())));
+    for (implementation, expected) in [("python", false), ("rust", true)] {
+        let (_root, exe, env) = dispatch_fixture(&format!("rust-dispatch-{implementation}"));
+        let fs = MemFs::default();
+        fs.files.lock().unwrap().insert(
+            bundle_root_of(&exe).join("release-manifest.json"),
+            Ok(manifest_text(implementation, &["py/bin/python3"]).into_bytes()),
+        );
+        assert_eq!(
+            dispatch_to_rust_daemon(&dispatch_platform(env, fs)),
+            expected,
+            "implementation={implementation}"
+        );
+    }
+    let (_root, exe, env) = dispatch_fixture("rust-dispatch-eacces");
+    let fs = MemFs::default();
+    fs.files.lock().unwrap().insert(
+        bundle_root_of(&exe).join("release-manifest.json"),
+        Err(PalError::io(13, "[Errno 13] Permission denied")),
+    );
+    assert!(!dispatch_to_rust_daemon(&dispatch_platform(env, fs)));
 }

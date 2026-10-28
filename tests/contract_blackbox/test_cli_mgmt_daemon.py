@@ -434,6 +434,7 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
         profile_dir = tmp_path / f"restart-{label}-profiles"
         profile_dir.mkdir(parents=True, exist_ok=True)
         before_pid = _start_detached_daemon(env, profile_dir, sock, tmp_path / f"restart-{label}.lock")
+        after = None
         try:
             assert _rpc_pid(sock) == before_pid, "重啟前 daemon 必須健康且 pid 一致"
             res = subprocess.run(
@@ -452,6 +453,12 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
                 os.kill(before_pid, 15)
             except ProcessLookupError:
                 pass
+            # `daemon stop` 回覆後 daemon 仍在收尾；等重啟後的 pid 真正離開 /proc，避免下一個測試的 /proc 掃描
+            # （doctor `single_daemon`）看到本測試殘留的 serialwrapd（第三輪實測：doctor A/B 因此 1≠0）。
+            if after is not None:
+                deadline = time.monotonic() + 15
+                while os.path.exists(f"/proc/{after}") and time.monotonic() < deadline:
+                    time.sleep(0.05)
     assert results["cli"] == results["python"]
 
 

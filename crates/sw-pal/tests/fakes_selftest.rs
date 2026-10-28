@@ -664,3 +664,70 @@ fn clock_advance_saturates_at_max() {
     c.advance(Duration::from_nanos(10));
     assert_eq!(c.mono_ns(), u64::MAX);
 }
+
+/// 審查 F45：`release_block` 落在 `os_submits` 已增加、writer 尚未進入等待的空窗（`os_submit` 閉包內）
+/// 時不得被吃掉；舊實作於 gate 之後才重設旗標，writer 永遠阻塞。
+#[test]
+fn block_forever_release_during_submit_window_is_not_lost() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![FakeWriteStep::BlockForever]);
+    let hook_dev = dev.clone();
+    dev.on_os_submit(Box::new(move || hook_dev.release_block()));
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(w.write(b"abc", &tok));
+    });
+    let res = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("空窗內的 release_block 不得遺失");
+    assert_eq!(res.outcome, TxOutcome::Completed(3));
+}
+
+/// 審查 F44：經 gate 提交後阻塞直到 cancel，才回 `Unknown { confirmed }`。
+#[test]
+fn block_until_cancel_then_unknown_reports_unknown_after_cancel() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.script_write(vec![FakeWriteStep::BlockUntilCancelThenUnknown {
+        confirmed: 0,
+        error: PalError::io(5, IO_ERR),
+    }]);
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (_r, mut w, waker, _close) = h.split();
+    let tok = CancelToken::new(waker);
+    let t2 = tok.clone();
+    let j = thread::spawn(move || w.write(b"abcdefgh", &t2));
+    let start = std::time::Instant::now();
+    while dev.os_submits() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "os_submits not reached in time");
+        thread::yield_now();
+    }
+    thread::sleep(Duration::from_millis(30));
+    assert!(!j.is_finished(), "cancel 前不得返回");
+    tok.cancel();
+    let res = j.join().unwrap();
+    assert_eq!(res.outcome, TxOutcome::Unknown { confirmed: 0 });
+    assert!(res.error.is_some());
+    assert!(dev.take_tx().is_empty());
+}
+
+/// 審查 F46：`pause_next_close` 讓下一次 close 停在暫停點，`release_pause` 後才回條。
+#[test]
+fn pause_next_close_holds_close_until_released() {
+    let be = FakeSerialBackend::new();
+    let dev = be.add_device(TTY);
+    dev.pause_next_close();
+    let h = be.open_exclusive(&dev_path(), &cfg()).unwrap();
+    let (r, w, _waker, close) = h.split();
+    let j = thread::spawn(move || close.close(r, w));
+    assert!(dev.wait_paused(Duration::from_secs(5)), "close 應停在暫停點");
+    assert!(!j.is_finished());
+    dev.release_pause();
+    let receipt = j.join().unwrap();
+    assert!(receipt.closed);
+    assert_eq!(dev.close_count(), 1);
+}

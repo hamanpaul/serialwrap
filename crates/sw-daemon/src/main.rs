@@ -1,7 +1,7 @@
 //! `serialwrapd` 入口（P4-T17；P5-T0 起分派；P5-T19 承接 daemon 本體）。
 //!
-//! release manifest 存在時交 launcher（P4 既有路徑，含 `implementation` 的既有拒絕與錯誤碼）；
-//! manifest 不存在（開發 build）時交 Rust daemon 本體 `daemon_main::run`：
+//! `implementation == "python"`（或 manifest 不可讀／無效）交 launcher（P4 既有路徑與錯誤碼）；
+//! `"rust"` 或 manifest 不存在（開發 build）交 Rust daemon 本體 `daemon_main::run`（P5-T19）：
 //! 1. 建立任何 thread 之前先 `signals.install()`（POSIX 封鎖 SIGINT／SIGTERM 交專屬 sigwait thread；Task 4）。
 //!    launcher 路徑不安裝：訊號遮罩會經 exec 繼承給 Python daemon。
 //! 2. panic hook 只把訊息與位置寫到 stderr（不 exit），讓 framing／actor／reader 的 `catch_unwind` 能各自隔離。
@@ -11,7 +11,7 @@
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let p = sw_pal::native_client();
-    if !sw_daemon::launcher::manifest_absent(&p) {
+    if !sw_daemon::launcher::dispatch_to_rust_daemon(&p) {
         std::process::exit(sw_daemon::launcher::run(argv, &p));
     }
     if let Err(e) = p.signals.install() {

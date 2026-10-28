@@ -15,8 +15,22 @@ use std::time::Duration;
 /// RPC server 僅允許的 bind host（`sw_core/constants.py::LOOPBACK_TCP_HOSTS`；sw-pal 不依賴 sw-proto，故於此重述）。
 pub const LOOPBACK_TCP_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
 
-/// 伺服端寫回應的單次 send 逾時（計畫 Task 17 Produces ③：寫逾時 2 s 後放棄，不阻塞 stop）。
+/// 伺服端 send 的短輪詢逾時：只讓寫迴圈定期醒來檢查停止旗標，不是放棄條件（審查 F06）。平時寫入無期限
+/// （Python `writer.drain()` 無逾時）；stop 後的總期限（停止時刻 + 2 s）由 sw-daemon framing 自行計算。
+#[cfg(unix)]
+pub(crate) const SERVER_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+/// Windows：send 逾時後 socket 狀態未定義（Winsock `SO_SNDTIMEO` 文件），維持 2 s 單次逾時且不重試
+/// （`SEND_TIMEOUT_RETRYABLE=false`）。LOCAL-WINDOWS-TODO：改 non-blocking＋`WSAPoll` 以對齊 Python 平時無逾時
+/// （慢讀大回應不截斷），並以原生慢讀案例驗證。
+#[cfg(windows)]
 pub(crate) const SERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// send 逾時（`ErrorKind::TimedOut`）後可否在同一 socket 重試：POSIX `SO_SNDTIMEO` 逾時為 EAGAIN、不改 socket 狀態；
+/// Winsock 逾時後 socket 狀態未定義、不得再用（審查 F102）。framing 只在本值為 true 時把 `TimedOut` 當短輪詢。
+#[cfg(unix)]
+pub const SEND_TIMEOUT_RETRYABLE: bool = true;
+#[cfg(windows)]
+pub const SEND_TIMEOUT_RETRYABLE: bool = false;
 
 /// 原生 RPC listener 工廠（arch §4.6；P5-T17 交付 POSIX AF_UNIX／Windows loopback TCP）。
 pub struct NativeRpcListenerFactory;

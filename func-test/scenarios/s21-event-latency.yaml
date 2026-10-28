@@ -1,0 +1,413 @@
+---
+meta:
+  name: s21-event-latency
+  category: l15-scenario
+  severity: critical
+  description: "依 contracts/resource_limits.yaml event_latency 量測控制事件延遲：每事件每輪 samples_per_run 筆、idle 與 flood 各一輪、整體重複 repeats 輪；每輪樣本最大值不得超過 max_ms_idle／max_ms_flood（gate_rule every_run_max_le_max_ms），p99 只作診斷（Slice 2.1 Task 21，SC-13）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 14400
+    invariants: [insufficient_evidence_not_pass]
+    behavior_changes: ["SC-13"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+  plan:
+    schema_version: "dut-plan.v1"
+    seed: 1021
+    triggers:
+      # command_cancel 量測：命令保持在途（DUT 延遲回覆），以便 cancel 打在在途命令上
+      - id: cancel-inflight
+        line_contains: "LAT_CANCEL"
+        once: false
+        action:
+          kind: delay_reply
+          delay_ms: 3000
+      # flood 負載：bytes = flood_load.bytes_per_s × seconds（20000 × 30）；每行約 chunk_bytes（256）bytes、不含 prompt
+      - id: flood-load
+        line_contains: "LAT_FLOOD"
+        once: false
+        action:
+          kind: flood
+          bytes: 600000
+          line: "LAT_FLOOD_{n}_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n"
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  # ---- 第 1 輪（repeats=3）：idle ----
+  - action: measure_event_latency
+    event: release_request
+    load: idle
+    save_as: r1-release_request-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["device", "release", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: cli
+        argv: ["device", "attach", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: measure_event_latency
+    event: command_cancel
+    load: idle
+    save_as: r1-command_cancel-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_CANCEL", "--cmd-timeout", "30"]
+        save_as: lat_cancel
+        expect: {ok: true}
+      - action: wait_cli_until
+        argv: ["cmd", "status", "--cmd-id", "{lat_cancel.cmd_id}"]
+        json_path: "command.status"
+        equals: running
+        timeout_s: 10
+      - action: cli
+        argv: ["cmd", "cancel", "--cmd-id", "{lat_cancel.cmd_id}"]
+      - action: wait_command_done
+        cmd_id: "{lat_cancel.cmd_id}"
+        timeout_s: 10
+  - action: measure_event_latency
+    event: lease_expiry
+    load: idle
+    save_as: r1-lease_expiry-idle
+    sample_timeout_s: 5.0
+    trigger:
+      - action: cli
+        argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15", "--timeout", "1"]
+        expect: {ok: true}
+  - action: measure_event_latency
+    event: drain_receipt
+    load: idle
+    save_as: r1-drain_receipt-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["session", "clear", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  # ---- 第 1 輪（repeats=3）：flood ----
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_FLOOD", "--cmd-timeout", "2"]
+    save_as: flood_r1
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{flood_r1.cmd_id}"
+    timeout_s: 30
+  - action: wait_ready
+    timeout_s: 60
+  - action: measure_event_latency
+    event: release_request
+    load: flood
+    save_as: r1-release_request-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["device", "release", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: cli
+        argv: ["device", "attach", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: measure_event_latency
+    event: command_cancel
+    load: flood
+    save_as: r1-command_cancel-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_CANCEL", "--cmd-timeout", "30"]
+        save_as: lat_cancel
+        expect: {ok: true}
+      - action: wait_cli_until
+        argv: ["cmd", "status", "--cmd-id", "{lat_cancel.cmd_id}"]
+        json_path: "command.status"
+        equals: running
+        timeout_s: 10
+      - action: cli
+        argv: ["cmd", "cancel", "--cmd-id", "{lat_cancel.cmd_id}"]
+      - action: wait_command_done
+        cmd_id: "{lat_cancel.cmd_id}"
+        timeout_s: 10
+  - action: measure_event_latency
+    event: lease_expiry
+    load: flood
+    save_as: r1-lease_expiry-flood
+    sample_timeout_s: 5.0
+    trigger:
+      - action: cli
+        argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15", "--timeout", "1"]
+        expect: {ok: true}
+  - action: measure_event_latency
+    event: drain_receipt
+    load: flood
+    save_as: r1-drain_receipt-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["session", "clear", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: wait_ready
+    timeout_s: 60
+  # ---- 第 2 輪（repeats=3）：idle ----
+  - action: measure_event_latency
+    event: release_request
+    load: idle
+    save_as: r2-release_request-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["device", "release", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: cli
+        argv: ["device", "attach", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: measure_event_latency
+    event: command_cancel
+    load: idle
+    save_as: r2-command_cancel-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_CANCEL", "--cmd-timeout", "30"]
+        save_as: lat_cancel
+        expect: {ok: true}
+      - action: wait_cli_until
+        argv: ["cmd", "status", "--cmd-id", "{lat_cancel.cmd_id}"]
+        json_path: "command.status"
+        equals: running
+        timeout_s: 10
+      - action: cli
+        argv: ["cmd", "cancel", "--cmd-id", "{lat_cancel.cmd_id}"]
+      - action: wait_command_done
+        cmd_id: "{lat_cancel.cmd_id}"
+        timeout_s: 10
+  - action: measure_event_latency
+    event: lease_expiry
+    load: idle
+    save_as: r2-lease_expiry-idle
+    sample_timeout_s: 5.0
+    trigger:
+      - action: cli
+        argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15", "--timeout", "1"]
+        expect: {ok: true}
+  - action: measure_event_latency
+    event: drain_receipt
+    load: idle
+    save_as: r2-drain_receipt-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["session", "clear", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  # ---- 第 2 輪（repeats=3）：flood ----
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_FLOOD", "--cmd-timeout", "2"]
+    save_as: flood_r2
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{flood_r2.cmd_id}"
+    timeout_s: 30
+  - action: wait_ready
+    timeout_s: 60
+  - action: measure_event_latency
+    event: release_request
+    load: flood
+    save_as: r2-release_request-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["device", "release", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: cli
+        argv: ["device", "attach", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: measure_event_latency
+    event: command_cancel
+    load: flood
+    save_as: r2-command_cancel-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_CANCEL", "--cmd-timeout", "30"]
+        save_as: lat_cancel
+        expect: {ok: true}
+      - action: wait_cli_until
+        argv: ["cmd", "status", "--cmd-id", "{lat_cancel.cmd_id}"]
+        json_path: "command.status"
+        equals: running
+        timeout_s: 10
+      - action: cli
+        argv: ["cmd", "cancel", "--cmd-id", "{lat_cancel.cmd_id}"]
+      - action: wait_command_done
+        cmd_id: "{lat_cancel.cmd_id}"
+        timeout_s: 10
+  - action: measure_event_latency
+    event: lease_expiry
+    load: flood
+    save_as: r2-lease_expiry-flood
+    sample_timeout_s: 5.0
+    trigger:
+      - action: cli
+        argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15", "--timeout", "1"]
+        expect: {ok: true}
+  - action: measure_event_latency
+    event: drain_receipt
+    load: flood
+    save_as: r2-drain_receipt-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["session", "clear", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: wait_ready
+    timeout_s: 60
+  # ---- 第 3 輪（repeats=3）：idle ----
+  - action: measure_event_latency
+    event: release_request
+    load: idle
+    save_as: r3-release_request-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["device", "release", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: cli
+        argv: ["device", "attach", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: measure_event_latency
+    event: command_cancel
+    load: idle
+    save_as: r3-command_cancel-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_CANCEL", "--cmd-timeout", "30"]
+        save_as: lat_cancel
+        expect: {ok: true}
+      - action: wait_cli_until
+        argv: ["cmd", "status", "--cmd-id", "{lat_cancel.cmd_id}"]
+        json_path: "command.status"
+        equals: running
+        timeout_s: 10
+      - action: cli
+        argv: ["cmd", "cancel", "--cmd-id", "{lat_cancel.cmd_id}"]
+      - action: wait_command_done
+        cmd_id: "{lat_cancel.cmd_id}"
+        timeout_s: 10
+  - action: measure_event_latency
+    event: lease_expiry
+    load: idle
+    save_as: r3-lease_expiry-idle
+    sample_timeout_s: 5.0
+    trigger:
+      - action: cli
+        argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15", "--timeout", "1"]
+        expect: {ok: true}
+  - action: measure_event_latency
+    event: drain_receipt
+    load: idle
+    save_as: r3-drain_receipt-idle
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["session", "clear", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  # ---- 第 3 輪（repeats=3）：flood ----
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_FLOOD", "--cmd-timeout", "2"]
+    save_as: flood_r3
+    expect: {ok: true}
+  - action: wait_command_done
+    cmd_id: "{flood_r3.cmd_id}"
+    timeout_s: 30
+  - action: wait_ready
+    timeout_s: 60
+  - action: measure_event_latency
+    event: release_request
+    load: flood
+    save_as: r3-release_request-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["device", "release", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: cli
+        argv: ["device", "attach", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: measure_event_latency
+    event: command_cancel
+    load: flood
+    save_as: r3-command_cancel-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo LAT_CANCEL", "--cmd-timeout", "30"]
+        save_as: lat_cancel
+        expect: {ok: true}
+      - action: wait_cli_until
+        argv: ["cmd", "status", "--cmd-id", "{lat_cancel.cmd_id}"]
+        json_path: "command.status"
+        equals: running
+        timeout_s: 10
+      - action: cli
+        argv: ["cmd", "cancel", "--cmd-id", "{lat_cancel.cmd_id}"]
+      - action: wait_command_done
+        cmd_id: "{lat_cancel.cmd_id}"
+        timeout_s: 10
+  - action: measure_event_latency
+    event: lease_expiry
+    load: flood
+    save_as: r3-lease_expiry-flood
+    sample_timeout_s: 5.0
+    trigger:
+      - action: cli
+        argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15", "--timeout", "1"]
+        expect: {ok: true}
+  - action: measure_event_latency
+    event: drain_receipt
+    load: flood
+    save_as: r3-drain_receipt-flood
+    sample_timeout_s: 10.0
+    trigger:
+      - action: cli
+        argv: ["session", "clear", "--selector", "COM0"]
+        expect: {ok: true}
+      - action: wait_ready
+        timeout_s: 20
+  - action: wait_ready
+    timeout_s: 60
+  # 量測結束後 wire 與 WAL 位元組一致（量測欄位併入 comparison.json）
+  - action: assert_compare

@@ -195,6 +195,9 @@ impl ConsoleTransportFactory for RigPtyFactory {
     fn held_slave_paths(&self) -> Option<std::collections::HashSet<String>> {
         self.fake.held_slave_paths()
     }
+    fn slave_path_exists(&self, path: &str) -> bool {
+        self.fake.slave_path_exists(path)
+    }
     fn new_mux(&self) -> PalResult<Box<dyn sw_pal::console_mux::ConsoleMux>> {
         self.fake.new_mux()
     }

@@ -454,6 +454,12 @@ impl CloseImpl for WindowsClose {
         self.port.is_open()
     }
 
+    /// 對預開 port 重新套用 DCB／timeouts（Python `_PySerialPort.configure`；審查 F59）。
+    /// LOCAL-WINDOWS-TODO：原生驗證（本機只做 cross check）。
+    fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        configure_port(&self.port, cfg)
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         match self.port.close_once() {
             Ok(()) => CloseReceipt {

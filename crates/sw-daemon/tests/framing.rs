@@ -53,6 +53,13 @@ impl RpcHandler for H {
                 d.insert("blob", PyValue::Str("y".repeat(256 * 1024)));
                 Ok(d)
             }
+            // 審查 F06：遠大於 loopback 收送緩衝的單筆回應（stop 總期限案例）。
+            "huge" => {
+                let mut d = PyDict::new();
+                d.insert("ok", PyValue::Bool(true));
+                d.insert("blob", PyValue::Str("z".repeat(48 * 1024 * 1024)));
+                Ok(d)
+            }
             _ => {
                 let mut d = PyDict::new();
                 d.insert("ok", PyValue::Bool(true));
@@ -363,6 +370,124 @@ fn half_line_and_unread_response_do_not_block_stop() {
     assert!(!calls.is_empty() && calls.iter().all(|c| c == "big"), "handler 已完成的呼叫不被取消：{calls:?}");
     assert!(calls.len() < 100, "client 未讀回應時不應處理完全部請求");
     drop(c);
+}
+
+/// 模擬核心 send 緩衝：client 未讀時，寫入在短輪詢（≈ PAL 的 100 ms `SO_SNDTIMEO`）後回 `WouldBlock`；
+/// `drain_after` 之後 client 開始讀，寫入即可前進（審查 F06）。
+struct SlowReaderStream {
+    input: std::io::Cursor<Vec<u8>>,
+    out: Arc<Mutex<Vec<u8>>>,
+    t0: Instant,
+    drain_after: Duration,
+}
+
+impl Read for SlowReaderStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.input.read(buf)?;
+        if n == 0 {
+            // EOF 前保持連線：讓 serve_connection 停在讀迴圈（讀逾時語意）。
+            std::thread::sleep(Duration::from_millis(20));
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        Ok(n)
+    }
+}
+
+impl Write for SlowReaderStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.t0.elapsed() < self.drain_after {
+            std::thread::sleep(Duration::from_millis(100));
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        let n = buf.len().min(4096);
+        self.out.lock().unwrap().extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl RpcServerStream for SlowReaderStream {
+    fn shutdown_read(&mut self) -> PalResult<()> {
+        Ok(())
+    }
+    fn set_read_timeout(&mut self, _d: Option<Duration>) -> PalResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn slow_reader_large_response_is_not_truncated() {
+    // 審查 F06（2fcdbbf）：Python `writer.drain()` 無逾時——client 超過 2 s 不讀，回應仍完整寫出，同連線後續
+    // 請求照常處理。舊實作每次 send 套 2 s 寫逾時、`write_all` 遇逾時即關閉 → 截斷並斷線。
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let stream = SlowReaderStream {
+        input: std::io::Cursor::new(b"{\"id\":1,\"method\":\"big\"}\n{\"id\":2,\"method\":\"a\"}\n".to_vec()),
+        out: out.clone(),
+        t0: Instant::now(),
+        drain_after: Duration::from_millis(2600),
+    };
+    let stop = Arc::new(ConnStop::new());
+    let h = new_h();
+    let j = {
+        let stop = stop.clone();
+        std::thread::spawn(move || serve_connection(Box::new(stream), &*h, &stop))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if out.lock().unwrap().iter().filter(|&&b| b == b'\n').count() >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "回應未完整寫出（已寫 {} bytes）", out.lock().unwrap().len());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.request();
+    j.join().unwrap();
+    let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("{\"id\":1,\"ok\":true,\"blob\":\"") && lines[0].ends_with("\"}\n"));
+    assert_eq!(lines[0].len(), 256 * 1024 + "{\"id\":1,\"ok\":true,\"blob\":\"\"}\n".len());
+    assert_eq!(lines[1], "{\"id\":2,\"ok\":true}\n");
+}
+
+#[test]
+fn stop_bounds_total_write_time_with_trickle_reader() {
+    // 審查 F06（High）：stop 後對「正在寫的回應」套用總期限 2 s（停止時刻起算），不因 client 持續少量讀取
+    // 而一再重設。舊實作每次部分寫出重新計時 → stop 用完 5 s budget 仍未收斂。
+    let h = new_h();
+    let (server, port) = tcp_server(h.clone());
+    let mut c = connect(port);
+    c.write_all(b"{\"id\":1,\"method\":\"huge\"}\n").unwrap();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let done = done.clone();
+        let mut c2 = c.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 16 * 1024];
+            while !done.load(Ordering::SeqCst) {
+                match c2.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => std::thread::sleep(Duration::from_millis(200)),
+                }
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.0.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "handler 未被呼叫");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let t0 = Instant::now();
+    let converged = server.stop(Duration::from_secs(5));
+    let took = t0.elapsed();
+    done.store(true, Ordering::SeqCst);
+    drop(c);
+    let _ = reader.join();
+    assert!(converged, "stop 未收斂（{took:?}）");
+    assert!(took < Duration::from_millis(3500), "stop 耗時 {took:?}（總期限應為停止時刻 + 2 s）");
 }
 
 #[test]

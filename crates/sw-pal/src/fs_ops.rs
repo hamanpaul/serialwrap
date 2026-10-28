@@ -2,6 +2,13 @@
 //! 平台實作放在 `posix`／`windows` 子模組，依目標平台擇一編譯。
 //!
 //! 原生寫入面由 P4-T5 的 POSIX 與 Windows 後端提供；測試替身可覆寫所需方法。
+
+/// Python 文字模式寫檔的換行（`open(..., "w")` 的 `newline=None` → `os.linesep`）：Windows `\r\n`、其餘 `\n`
+/// （state.json 尾端換行，審查 F55）。
+#[cfg(windows)]
+pub const TEXT_NEWLINE: &[u8] = b"\r\n";
+#[cfg(not(windows))]
+pub const TEXT_NEWLINE: &[u8] = b"\n";
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};

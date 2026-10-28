@@ -5,6 +5,7 @@
 //! 控制事件依賴 RX watermark 時先暫存；獨立控制事件仍可越過暫存項目。
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -19,7 +20,7 @@ use crate::login_fsm::LoginOutcome;
 use crate::op_runner::OpOutcome;
 use crate::session_core::SessionRequest;
 use crate::tx_writer::{OpId, TxReport};
-use crate::uart_bridge::IoWorker;
+use crate::uart_bridge::{IoWorker, RxShared};
 use crate::Mono;
 
 /// RPC 回覆通道（容量 1；接收端已離開時丟棄）。
@@ -53,6 +54,13 @@ pub enum ControlEvent {
     DeviceDetached {
         by_id: String,
         reason: DetachReason,
+    },
+    /// 裝置掃描後 by_id 不在快照（Python `_mark_missing_devices_locked`；審查 F60）：無 bridge 的非 RELEASED
+    /// session 標 DETACHED、`last_error`（None 時）`DEVICE_NOT_FOUND`、`detached_at`（None 時）。
+    DeviceMissing,
+    /// 全域 background capture 上限的跨 session 淘汰（Python `_evict_background_locked`；審查 F28）。
+    EvictCapture {
+        cmd_id: String,
     },
     /// Console 擁有者更新目前附掛在 session 的 console 數量；供 release 回報實際關閉數。
     ConsoleCountChanged {
@@ -132,6 +140,8 @@ pub struct OpenedBridge {
     /// TCP console 後端（SC-28 tcp／Windows）：executor 於開埠成功時一併綁定的 listener 端點（`"127.0.0.1:<port>"`）；
     /// PTY 後端或綁定失敗為 None（`uart_io.py` `_start_console_listener`）。
     pub console_endpoint: Option<String>,
+    /// 本 bridge 專屬的 RX 視窗（Python 每次 attach 新建 `UARTBridge`，視窗／速率／總量歸零；審查 F51）。
+    pub rx: Arc<RxShared>,
 }
 
 /// bridge 開啟失敗的分類。

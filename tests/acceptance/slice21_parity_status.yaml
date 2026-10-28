@@ -1,0 +1,303 @@
+# #104：parity-amendments-2026-10-26.md 中承接 Phase 為 P5 的每一列之承接狀態（P5-T22 初填）。
+#
+# 來源：origin/docs/parity-amendments:docs/rust-refactor/plans/parity-amendments-2026-10-26.md
+#   §1 總表（id 為 `#N`）與 §2 未測行為表（id 為稽核 ID，原樣保留「（部分）」字樣）中「承接 Phase/Task」欄含 P5 者，共 105 列。
+# 判定器 scripts/rust/slice21_gate_judge.py 的規則（不得預設 PASS）：
+#   - 來源文件可得時，以文件重新抽出 P5 列並與本檔逐列比對：文件有而本檔無 → INCOMPLETE（無標記）；
+#     source_sha256 與文件不符 → 全段 INCOMPLETE（須重新核對後更新本檔）。
+#   - status 只能是 PASS／BLOCKED-OWNER／OWNER-DECISION-PENDING／INCOMPLETE。
+#   - PASS 必須附 tests（nodeid）；且每個 nodeid 須在本次 gate 已載入的 l1-results 中恰為 passed，否則降為 INCOMPLETE。
+#   - BLOCKED-OWNER 必須附 bo（BO-S21-NN，須存在於 tests/acceptance/slice21_bo.yaml）。
+#   - OWNER-DECISION-PENDING 必須附 decision（須存在於 slice21_gate_expect.yaml 的 pending_decisions），否則降為 INCOMPLETE。
+#   - 任一列為 INCOMPLETE → gate verdict INCOMPLETE。
+# 初填依據（2026-10-27，分支 p5work @ 8a7986e；同日 P5 審查修正輪更新 #3／#4／#32／#38／#46／#47／#52／#68／#72／A-88／A-92／D-106／F-W13）：Linux `cargo_l1_results.py -- --workspace --features test-fakes -- --skip cap_`
+#   逐案結果（P5-T19 已完成；T20 A/B 交付報告、T21 L1.5 未完成）、`grep` 測試函式是否存在、`tests/acceptance/l1_required.lock.json` 的 s21_core／s21_gate:py_parity。
+#   PASS 只表示「計畫指名的測試存在且本次 Linux 執行 passed」；Windows 原生證據仍由 gate 的 windows_native_l1 補齊。
+schema_version: 1
+source: docs/rust-refactor/plans/parity-amendments-2026-10-26.md
+source_ref: origin/docs/parity-amendments
+source_sha256: 722b6d72034ae2fa7a37e98c35e9bf4c3782ffc047215785fdcab1a5d9e2bf1b
+rows:
+  # ---------- §1 總表 ----------
+  - {id: "#1", status: INCOMPLETE, reason: "計畫指名 serial_backend_env_values／serial_backend_env_values_windows（P5-T2／T3 追加段）尚未建立"}
+  - {id: "#2", status: INCOMPLETE, reason: "sysenv_test_system_config_path_overrides 與 runtime_paths golden 新列不在本分支（修正在 feature/rust-refactor，尚未併入 P5）"}
+  - id: "#3"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only"]
+  - id: "#4"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
+  - {id: "#6", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
+  - id: "#11"
+    status: PASS
+    tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
+  - id: "#12"
+    status: PASS
+    tests:
+      - "cargo:sw-core::state_store::aliases_not_dict_fails_startup_like_python"
+      - "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[int]"
+  - id: "#13"
+    status: PASS
+    tests: ["cargo:sw-core::state_store::startup_always_rewrites_state_json"]
+  - id: "#14"
+    status: PASS
+    tests:
+      - "cargo:sw-core::session_manager::released_dynamic_materialize_template_fallback"
+      - "cargo:sw-core::session_manager::released_dynamic_act_no_and_profile_source"
+  - id: "#15"
+    status: PASS
+    tests: ["cargo:sw-core::state_store::released_materialize_failure_keeps_block"]
+  - id: "#18"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::io_error_with_pending_auto_login_goes_recovering_not_attach"]
+    note: "P5 部分；io_error_pending_auto_login_converges_via_reboot_recovery 屬 P7-T7"
+  - id: "#19"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::late_receipt_persist_failure_sets_pending_and_retries"
+      - "cargo:sw-core::drain_release::release_retry_persists_after_commit_failure"
+    note: "併 #23"
+  - id: "#20"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::com_for_by_id_session_first_then_pending"]
+  - id: "#21"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::release_during_pending_open_bridge_closes_late_handle"]
+  - {id: "#22", status: INCOMPLETE, reason: "Rust release_during_pending_open_drain_stalled 已 passed，但 tests/test_p1oc_drain_stalled.py 尚未登記 s21_gate:py_parity（P5-T0b parity Step #77）"}
+  - id: "#23"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::release_retry_persists_after_commit_failure"
+      - "cargo:sw-core::drain_release::late_receipt_persist_failure_sets_pending_and_retries"
+      - "cargo:sw-core::drain_release::single_release_persister_waiters_take_over"
+      - "tests/test_stage0_session_drain.py::test_release_persist_failure_retried"
+  - id: "#24"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::device_attach_dedup_same_by_id_inflight"]
+  - id: "#25"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::stale_bridge_opened_after_rebind_closed"
+      - "cargo:sw-core::drain_release::stale_bridge_opened_after_real_path_change_closed"
+  - id: "#26"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::bind_with_inflight_attach_op_cancels_waits_3000ms"]
+  - id: "#27"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::hotplug_invalidates_pending_attach_op_and_closes_unused_port"]
+  - id: "#28"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::pending_rank_pruned_on_removal"]
+  - id: "#29"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::begin_shutdown_blocks_hotplug_open"]
+    note: "P5 部分（stopping gate 早退維持 DETACHED 斷言已加）；handoff_freeze_restores_preattaching_to_detached 屬 P8-T14"
+  - id: "#30"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::release_during_pending_open_bridge_closes_late_handle"]
+    note: "併 #21"
+  - id: "#31"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::rematerialize_profile_recomputes_session_id_and_alias"]
+  - {id: "#32", status: OWNER-DECISION-PENDING, decision: PA-OD-F67, reason: "pin_applies_on_reattach／fallback_redetects_on_reattach／unresolvable_pin_falls_through 已 passed；計畫指名的 no_redetect_during_quiet 經公開輸入不可達（後備 template 恆為 passthrough，Python 不對 passthrough 武裝 quiet；見 p5-fix-responses F67），語意由 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 鎖住，待擁有者核可以 core 層案例替代"}
+  - id: "#34"
+    status: PASS
+    tests: ["cargo:sw-core::command_exec::recover_key_refused_frozen_maps_flushed_by_recovery"]
+  - id: "#36"
+    status: PASS
+    tests: ["cargo:sw-core::lease_selftest::lease_send_refused_at_commit_maps_codes"]
+  - id: "#38"
+    status: PASS
+    tests: ["cargo:sw-core::tx_writer::cancelled_ops_bounded_512_fifo"]
+  - {id: "#39", status: INCOMPLETE, reason: "計畫指名 unknown_outcome_writes_confirmed_prefix_and_meta／unknown_without_confirmed_bytes_writes_meta_only 尚未建立（tx_writer.rs 現有 unknown_with_log_* 為不同語意的既有列，需 P5-T9 對齊）"}
+  - id: "#41"
+    status: PASS
+    tests: ["cargo:sw-core::io_worker::snapshot_serial_alive_and_running_semantics"]
+  - {id: "#42", status: INCOMPLETE, reason: "併 #1"}
+  - id: "#43"
+    status: PASS
+    tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
+    note: "併 #11"
+  - {id: "#45", status: INCOMPLETE, reason: "三個 Rust 測試已 passed；D-44 Python 特性測試（#81）尚未新增／登記 s21_gate:py_parity"}
+  - id: "#46"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::allowlist_rejected_before_runtime_dirs_and_lock"]
+  - id: "#47"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::unreadable_config_env_allowlist_wins", "cargo:sw-daemon::daemon_process::unreadable_config_isolated_fail_closed", "cargo:sw-daemon::daemon_process::unreadable_config_non_isolated_unchanged"]
+  - id: "#50"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::attach_finish_respawns_when_state_requires"]
+  - id: "#51"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::dynamic_probe_and_bridge_share_preopened_port"]
+  - id: "#52"
+    status: PASS
+    tests: ["cargo:sw-core::tx_writer::cancelled_inflight_command_later_tx_refused"]
+  - {id: "#53", status: INCOMPLETE, reason: "watcher_delta_not_lost_when_consumer_rejects 尚未建立（P5-T5）"}
+  - id: "#54"
+    status: PASS
+    tests:
+      - "cargo:sw-core::lease_selftest::send_expired_closes"
+      - "cargo:sw-core::lease_selftest::lazy_expiry_keeps_tombstone_expired"
+  - id: "#55"
+    status: PASS
+    tests:
+      - "cargo:sw-core::login_quiet::reboot_command_arms_quiet_after_tx_submitted"
+      - "cargo:sw-core::login_quiet::reboot_not_submitted_does_not_arm_quiet"
+  - id: "#59"
+    status: PASS
+    tests: ["cargo:sw-core::rx_reader::reader_wait_error_reason_is_select_errno"]
+  - id: "#61"
+    status: PASS
+    tests: ["cargo:sw-core::wal_writer::health_keys_order"]
+  - id: "#62"
+    status: PASS
+    tests: ["cargo:sw-pal::serial_posix::open_errno_maps_like_python"]
+  - id: "#63"
+    status: PASS
+    tests: ["cargo:sw-pal::serial_posix::flock_eacces_is_held"]
+  - {id: "#64", status: INCOMPLETE, reason: "proc_holders_namespace.rs 現有 15 案（計畫要求移植 18 案、指名的 same_name_pts_other_devpts_not_holder 不存在）；Python 18 案尚未登記 s21_gate:py_parity（#76）"}
+  - id: "#65"
+    status: PASS
+    tests: ["cargo:sw-pal::serial_posix::conflict_holder_unknown_when_no_pids"]
+  - id: "#68"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only", "cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
+  - id: "#69"
+    status: PASS
+    tests: ["cargo:sw-daemon::dispatch::ready_unconfirmed_response_has_session_field"]
+  - {id: "#71", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
+  - {id: "#72", status: INCOMPLETE, reason: "Rust sigterm_sigint_orderly_stop 已建立並登記 s21_core；windows_console_ctrl_triggers_orderly_stop（LOCAL-WINDOWS-TODO）與 Python test_sigterm_orderly_shutdown_posix 尚未建立"}
+  - id: "#73"
+    status: PASS
+    tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]
+  - id: "#74"
+    status: PASS
+    tests: ["cargo:sw-core::rx_reader::rate_window_merge_oldest_keeps_byte_sum"]
+  # ---------- §2 未測行為表 ----------
+  - id: "A-40"
+    status: PASS
+    tests: ["tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices"]
+  - {id: "A-86", status: INCOMPLETE, reason: "P5-T19 註記免測（#102）待 Task 19 完成時確認"}
+  - {id: "A-88", status: INCOMPLETE, reason: "Rust no_profiles_message_and_continue 已 passed（P5-T19 完成）；Python `no profiles loaded` 特性測試（#81）尚未新增"}
+  - {id: "A-92", status: INCOMPLETE, reason: "#101 second_daemon_same_lock_exits_2_with_stderr 已 passed（P5-T19 完成）；#78 Python 測試（test_daemon_lock.py 等）尚未登記 s21_gate:py_parity（selector 登記待擁有者，F57）"}
+  - {id: "A-94", status: INCOMPLETE, reason: "併 #72"}
+  - id: "A-103"
+    status: PASS
+    tests: ["cargo:sw-daemon::framing::rpc_accept_paused_at_128_connections"]
+  - {id: "A-104", status: INCOMPLETE, reason: "#78 JsonRpcUnixServer 相關 10 個 Python nodeid 尚未逐名登記 s21_gate:py_parity；#99 listen_options UDS 測試待 P5-T19"}
+  - {id: "A-106", status: INCOMPLETE, reason: "#78 Python 測試尚未登記 s21_gate:py_parity；#82／#84 Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
+  - {id: "A-107", status: INCOMPLETE, reason: "#78 Python 測試尚未登記 s21_gate:py_parity"}
+  - {id: "A-108", status: INCOMPLETE, reason: "#78 Python 測試尚未登記 s21_gate:py_parity；#84 Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
+  - id: "B-04"
+    status: PASS
+    tests:
+      - "cargo:sw-core::state_store::non_dict_json_not_backed_up"
+      - "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[list]"
+  - id: "B-06"
+    status: PASS
+    tests:
+      - "cargo:sw-core::state_store::aliases_not_dict_fails_startup_like_python"
+      - "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[int]"
+  - {id: "B-36", status: INCOMPLETE, reason: "#77 p1oc 8 檔尚未登記 s21_gate:py_parity（P5 部分）；P7-T4 部分不在本 Phase"}
+  - id: "B-82"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::io_error_with_pending_auto_login_goes_recovering_not_attach"]
+  - id: "B-85"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::single_release_persister_waiters_take_over"
+      - "cargo:sw-core::drain_release::release_retry_persists_after_commit_failure"
+  - id: "B-86"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::late_receipt_persist_failure_sets_pending_and_retries"
+      - "tests/test_stage0_session_drain.py::test_release_persist_failure_retried"
+  - {id: "B-43（部分）", status: INCOMPLETE, reason: "Rust invalid_bootloader_regex_skipped 已 passed；Python 特性測試（#81）尚未新增／登記"}
+  - id: "B-05（部分）"
+    status: PASS
+    tests: ["cargo:sw-core::state_store::profile_pins_and_detected_strip_tolerance"]
+  - id: "C-05"
+    status: PASS
+    tests:
+      - "cargo:sw-core::session_manager::clear_during_shutdown_errors"
+      - "tests/test_stage0_session_drain.py::test_clear_during_shutdown_raises_daemon_stopping"
+  - {id: "C-10", status: INCOMPLETE, reason: "併 #22／#77：test_p1oc_drain_stalled.py 尚未登記 s21_gate:py_parity"}
+  - id: "C-13"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::release_response_closed_consoles_and_aborted_cmd"]
+  - id: "C-16"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::release_response_closed_consoles_and_aborted_cmd"]
+  - id: "C-24"
+    status: PASS
+    tests:
+      - "cargo:sw-core::session_manager::device_attach_during_shutdown_errors"
+      - "tests/test_stage0_session_drain.py::test_device_attach_during_shutdown_raises_daemon_stopping"
+  - id: "C-28"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::device_attach_dedup_same_by_id_inflight"]
+  - id: "C-30"
+    status: PASS
+    tests:
+      - "cargo:sw-core::drain_release::stale_bridge_opened_after_rebind_closed"
+      - "cargo:sw-core::drain_release::stale_bridge_opened_after_real_path_change_closed"
+  - id: "C-33"
+    status: PASS
+    tests:
+      - "cargo:sw-core::session_manager::bind_paths"
+      - "tests/test_session_bind.py::TestSessionBind::test_bind_empty_device_by_id_is_invalid_args"
+  - id: "C-34"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::bind_with_inflight_attach_op_cancels_waits_3000ms"]
+  - {id: "C-44", status: INCOMPLETE, reason: "Rust session_attach_with_release_request_session_recovering 已 passed；Python oracle（#77 p1oc）尚未登記 s21_gate:py_parity"}
+  - id: "C-53"
+    status: PASS
+    tests: ["cargo:sw-core::session_manager::hotplug_invalidates_pending_attach_op_and_closes_unused_port"]
+  - id: "C-62"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::release_during_pending_open_bridge_closes_late_handle"]
+  - id: "C-63"
+    status: PASS
+    tests: ["cargo:sw-core::drain_release::probe_stop_timeout_waits_late_receipt"]
+  - {id: "C-90", status: INCOMPLETE, reason: "併 #53：watcher_delta_not_lost_when_consumer_rejects 尚未建立"}
+  - {id: "C-93", status: INCOMPLETE, reason: "watcher_stop_bounded_2s 尚未建立（P5-T5 #85）"}
+  - {id: "C-95", status: INCOMPLETE, reason: "Rust device_source 已登記 s21_core（linux）；Python tests/test_device_source.py::test_posix_by_path_dedup_and_sort（#81）尚未新增；Windows 列需原生收集"}
+  - {id: "C-96", status: BLOCKED-OWNER, bo: BO-S21-15, reason: "SERIALCOMM 實機排除證據需配對藍牙裝置的 Windows 機台；Rust 測試 Windows 列另需原生收集（LOCAL-WINDOWS-TODO）"}
+  - {id: "C-97", status: BLOCKED-OWNER, bo: BO-S21-15, reason: "BTHENUM 遞迴實機證據需配對藍牙裝置的 Windows 機台；Rust 測試 Windows 列另需原生收集（LOCAL-WINDOWS-TODO）"}
+  - id: "D-01"
+    status: PASS
+    tests:
+      - "cargo:sw-core::session_manager::dynamic_attach_skipped_during_shutdown_or_drain"
+      - "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain"
+  - {id: "D-44", status: INCOMPLETE, reason: "併 #45：D-44 Python 特性測試尚未新增"}
+  - {id: "D-51", status: INCOMPLETE, reason: "Rust passthrough_timeout_no_rescue_keys_no_downgrade 已 passed；Python oracle test_p1oc_sc35_commands.py（#77）尚未登記 s21_gate:py_parity"}
+  - id: "D-106"
+    status: PASS
+    tests: ["cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only", "cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
+  - id: "E-19"
+    status: PASS
+    tests:
+      - "cargo:sw-core::rx_reader::rx_observer_panic_isolated_reader_continues"
+      - "tests/test_uart_io.py::test_rx_handler_exception_isolated"
+    note: "P5 部分；P6-T9 部分不在本 Phase"
+  - id: "E-39"
+    status: PASS
+    tests:
+      - "cargo:sw-core::rx_reader::rx_observer_panic_isolated_reader_continues"
+      - "tests/test_uart_io.py::test_rx_handler_exception_isolated"
+  - id: "E-42"
+    status: PASS
+    tests: ["cargo:sw-core::rx_reader::reader_wait_error_reason_is_select_errno"]
+  - {id: "E-43", status: INCOMPLETE, reason: "#82 PAL conformance Linux 列已在 s21_core；Windows 列需原生收集（LOCAL-WINDOWS-TODO）"}
+  - {id: "E-50", status: INCOMPLETE, reason: "#79 begin_drain→cancel_pending_write 既有 Python 測試尚未登記 s21_gate:py_parity"}
+  - {id: "E-52", status: INCOMPLETE, reason: "#79 test_stage0_bridge_drain.py 兩筆尚未登記 s21_gate:py_parity"}
+  - {id: "F-W13", status: INCOMPLETE, reason: "Rust rotate_schedule_cancelled_when_file_shrinks_or_vanishes 已建立並登記 s21_core；Python test_rotate_schedule_cancelled_on_shrink 尚未建立"}
+  - {id: "F-W32", status: INCOMPLETE, reason: "#80 test_reset_on_posix_still_fsyncs_directory 尚未登記 s21_gate:py_parity；#87 wal_fs Windows 列需原生收集"}
+  - id: "F-S02"
+    status: PASS
+    tests: ["cargo:sw-pal::serial_posix::open_errno_maps_like_python"]
+  - {id: "F-S06", status: INCOMPLETE, reason: "併 #64／#76"}
+  - {id: "F-S11", status: INCOMPLETE, reason: "#80 test_serial_port.py::test_set_baud_runs 尚未登記 s21_gate:py_parity"}
+  - {id: "F-S19", status: INCOMPLETE, reason: "#83 Windows native cancel_pending_write Python 測試需以 Windows 原生收集登記 s21_gate:py_parity（LOCAL-WINDOWS-TODO）"}

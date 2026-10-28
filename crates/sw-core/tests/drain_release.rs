@@ -1648,3 +1648,115 @@ fn release_closed_console_count_comes_from_owner_and_is_platform_independent() {
         PyValue::from(3)
     );
 }
+
+#[test]
+fn clear_reopen_attaching_clears_last_error() {
+    // P5-T20 黑箱揭露：Python `clear_session` drain 收尾設 ATTACHING＋`CLEARED` 後立即 `_spawn_attach`，
+    // `_attach_by_id` 開埠前即 `last_error = None`（實測 recover 救援失敗 → clear → ATTACHING 期間 last_error 為 null）。
+    // Rust 重新開埠（reopen_known_device）時亦須清除 last_error，不得帶著 `CLEARED` 停在 ATTACHING。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    let (epoch, stop) = h.pending_stop();
+    let effects = h.receipt(epoch, stop).feed();
+    // 審查 F62：開埠前先交 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）。
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Reattach { .. })));
+    // 審查 F97（多輪 Medium）：Python `_complete_drain` 於鎖內設 `ATTACHING`＋`last_error="CLEARED"` 後才
+    // `_spawn_attach`，`clear_session` 在 `_await_drain` 後立即組回應 → 回應為 `CLEARED`（黑箱 Python 3/3）；
+    // `_attach_by_id` 開埠前才 `last_error = None`。先前「ATTACHING 期間不帶 CLEARED」的 P5-T20 觀察是回應之後的
+    // get_state，不是 clear 回應本身。
+    let reply = rx.try_recv().unwrap().expect("clear 回應");
+    match reply.get("session") {
+        Some(PyValue::Dict(session)) => {
+            assert_eq!(session.get("state"), Some(&PyValue::from("ATTACHING")));
+            assert_eq!(session.get("last_error"), Some(&PyValue::from("CLEARED")));
+        }
+        other => panic!("缺 session：{other:?}"),
+    }
+    let s = h.public();
+    assert_eq!(s["state"], PyValue::from("ATTACHING"));
+    assert_eq!(s["last_error"], PyValue::from("CLEARED"));
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+    assert_eq!(h.public()["last_error"], PyValue::Null, "開埠前清除（`_attach_by_id`）");
+}
+
+#[test]
+fn aborted_in_flight_with_unknown_tail_writes_unknown_outcome() {
+    // 審查 F42（Medium，afe4853）：帳本 `confirmed_bytes>0` 且 `unknown=true`（`TxOpLedger::record` 對
+    // `Unknown{confirmed}` 同時累加 bytes 並設 unknown）時，Python `_map_aborted_result` 先看 unknown：
+    // `COMMAND_ABORTED_IN_FLIGHT`＋META `tx_outcome:"unknown"`。舊 Rust 依長度寫 partial／complete。
+    // 輸入：`echo x`（payload 7 bytes），帳本 confirmed 2＋unknown。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let cmd = h.start_foreground_command("echo x");
+    let (rx, _) = h.rpc_deferred(release());
+    let (epoch, stop) = h.pending_stop();
+    h.receipt(epoch, stop)
+        .confirmed(cmd.op_id, 2)
+        .unknown(cmd.op_id)
+        .handle_closed(true)
+        .feed();
+    let _ = rx.try_recv();
+    assert_eq!(
+        h.reg.get(&cmd.cmd_id).unwrap().get("error_code"),
+        Some(&PyValue::from("COMMAND_ABORTED_IN_FLIGHT"))
+    );
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|row| row.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("META");
+    assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(2)));
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
+}
+
+/// 審查 F41：Python `_begin_drain_locked` 在等回條前（Phase 1）即設 `last_error=<reason>`（setter 清 detail）、
+/// 清前景欄位並停 capture；drain 中的 `GetState` 與 `DRAIN_STALLED` 的 `session` 皆為此快照。
+#[test]
+fn phase1_snapshot_sets_reason_and_clears_foreground() {
+    for (request, reason) in [
+        (release(), "RELEASED"),
+        (SessionRequest::Clear, "CLEARED"),
+        (
+            SessionRequest::Bind {
+                by_id: "/s/by-id/other".into(),
+            },
+            "REBOUND",
+        ),
+    ] {
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        h.core
+            .set_last_error_for_test(Some("LOGIN_REQUIRED"), Some("keep-me"));
+        let _running = h.start_foreground_command("sleep 20");
+        assert_eq!(h.public()["foreground_busy"], PyValue::Bool(true));
+        let (rx, _) = h.rpc_deferred(request);
+        let snapshot = h.public();
+        assert_eq!(snapshot["state"], PyValue::from("RECOVERING"), "{reason}");
+        assert_eq!(snapshot["last_error"], PyValue::from(reason), "{reason}");
+        assert_eq!(snapshot["last_error_detail"], PyValue::Null, "{reason}");
+        assert_eq!(snapshot["foreground_busy"], PyValue::Bool(false), "{reason}");
+        assert_eq!(snapshot["outstanding_commands"], PyValue::from(0), "{reason}");
+        assert_eq!(snapshot["fg_cmd_expected_duration_s"], PyValue::Null, "{reason}");
+        if reason == "RELEASED" {
+            h.advance(Duration::from_millis(3001));
+            let response = rx.try_recv().unwrap().unwrap();
+            session_error(&response, "DRAIN_STALLED");
+            let PyValue::Dict(session) = &response["session"] else {
+                panic!("DRAIN_STALLED 應帶 session");
+            };
+            assert_eq!(session["last_error"], PyValue::from("RELEASED"));
+            assert_eq!(session["last_error_detail"], PyValue::Null);
+            assert_eq!(session["foreground_busy"], PyValue::Bool(false));
+            assert_eq!(session["outstanding_commands"], PyValue::from(0));
+        }
+    }
+}

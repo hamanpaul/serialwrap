@@ -281,6 +281,9 @@ pub enum FakeWriteStep {
     BlockUntilCancel { accept_before_cancel: usize },
     /// 經 gate 提交後於 gate 外阻塞直到 `FakeDevice::release_block`（模擬 D-state；不持 Fence 鎖）。
     BlockForever,
+    /// 經 gate 提交（`confirmed` > 0 時先接受該數 bytes）後於 gate 外阻塞直到 `CancelToken::cancel`，
+    /// 才回 `TxOutcome::Unknown { confirmed }` 加 error（drain 中在途 Unknown；審查 F44）。
+    BlockUntilCancelThenUnknown { confirmed: usize, error: PalError },
     /// 0 byte + error。
     Error(PalError),
     /// R0-F1 線性化測試用：`write_gated` 進入後、第一次 `gate.submit` 之前暫停（不持鎖）。
@@ -308,6 +311,8 @@ pub(crate) struct FakeDeviceInner {
     blocked_now: AtomicBool,
     /// P6 Task 9：loopback 游標（`Some(已回送的 tx 長度)`＝開啟）。
     loopback: Mutex<Option<usize>>,
+    /// 下一次 close 於暫停點（`wait_paused`／`release_pause`）停住（審查 F46）。
+    pause_close: AtomicBool,
     close_err: Mutex<Option<PalError>>,
     removed: AtomicBool,
     external_hold: Mutex<Option<Vec<u32>>>,
@@ -315,6 +320,8 @@ pub(crate) struct FakeDeviceInner {
     woken: AtomicBool,
     peer_closed: AtomicBool,
     eof_reads: AtomicUsize,
+    /// 依序套用的 UART 設定（open 時的 cfg 與之後每次 `CloseToken::configure`）。
+    configs: Mutex<Vec<SerialConfig>>,
     read_errors: AtomicUsize,
     on_os_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     paused: Mutex<bool>,
@@ -342,6 +349,7 @@ impl FakeDeviceInner {
             blocked_release: AtomicBool::new(false),
             blocked_now: AtomicBool::new(false),
             loopback: Mutex::new(None),
+            pause_close: AtomicBool::new(false),
             close_err: Mutex::new(None),
             removed: AtomicBool::new(false),
             external_hold: Mutex::new(None),
@@ -349,6 +357,7 @@ impl FakeDeviceInner {
             woken: AtomicBool::new(false),
             peer_closed: AtomicBool::new(false),
             eof_reads: AtomicUsize::new(0),
+            configs: Mutex::new(Vec::new()),
             read_errors: AtomicUsize::new(0),
             on_os_submit_hook: Mutex::new(None),
             paused: Mutex::new(false),
@@ -548,6 +557,11 @@ impl SerialBackend for FakeSerialBackend {
         }
 
         inner.opens.fetch_add(1, Ordering::SeqCst);
+        inner
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(_cfg.clone());
         let open_guard = Arc::new(OpenGuard {
             inner: Arc::clone(&inner),
             closed_via_token: AtomicBool::new(false),
@@ -662,6 +676,11 @@ impl FakeDevice {
         self.inner.cond.notify_all();
     }
 
+    /// 下一次 `close` 先停在暫停點，`release_pause` 後才收尾（drain 中間態斷言用）。
+    pub fn pause_next_close(&self) {
+        self.inner.pause_close.store(true, Ordering::SeqCst);
+    }
+
     /// 之後 `close` 回 `closed:false, excl_cleared:false, error:Some(err)`。
     pub fn fail_close(&self, err: PalError) {
         *self.inner.close_err.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
@@ -669,6 +688,15 @@ impl FakeDevice {
 
     pub fn open_count(&self) -> usize {
         self.inner.opens.load(Ordering::SeqCst)
+    }
+
+    /// 依序套用過的 UART 設定（open 的 cfg 與之後的 `configure`）。
+    pub fn configs(&self) -> Vec<SerialConfig> {
+        self.inner
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn close_count(&self) -> usize {
@@ -895,7 +923,19 @@ impl crate::traits::CloseImpl for FakeCloseImpl {
         self.inner.open.load(Ordering::SeqCst)
     }
 
+    fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        self.inner
+            .configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cfg.clone());
+        Ok(())
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
+        if self.inner.pause_close.swap(false, Ordering::SeqCst) {
+            do_pause(&self.inner);
+        }
         self.inner.closes.fetch_add(1, Ordering::SeqCst);
         if let Some(err) = self
             .inner
@@ -1243,7 +1283,58 @@ impl SerialWriter for FakeSerialWriter {
                     error: Some(PalError::cancelled()),
                 }
             }
+            FakeWriteStep::BlockUntilCancelThenUnknown { confirmed, error } => {
+                let to_accept = confirmed.min(data.len());
+                let submit_res = gate.submit(&mut || {
+                    self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(hook) = self
+                        .inner
+                        .on_os_submit_hook
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    if to_accept > 0 {
+                        self.inner
+                            .tx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&data[..to_accept]);
+                        check_tx_triggers_and_matches(&self.inner);
+                        SubmitStep::Accepted(to_accept)
+                    } else {
+                        SubmitStep::Pending
+                    }
+                });
+                if submit_res.is_err() {
+                    return TxResult {
+                        outcome: TxOutcome::NotSubmitted,
+                        error: None,
+                    };
+                }
+                let mut guard = self
+                    .inner
+                    .cond_mutex
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                while !cancel.is_cancelled() {
+                    guard = self
+                        .inner
+                        .cond
+                        .wait_timeout(guard, Duration::from_millis(10))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                TxResult {
+                    outcome: TxOutcome::Unknown { confirmed: to_accept },
+                    error: Some(error),
+                }
+            }
             FakeWriteStep::BlockForever => {
+                // 旗標於交 OS 之前重設：`os_submits` 增加後才呼叫的 `release_block` 一定被看見（審查 F45）。
+                self.inner.blocked_release.store(false, Ordering::SeqCst);
                 let mut committed = 0;
                 let submit_res = gate.submit(&mut || {
                     self.inner.os_submits.fetch_add(1, Ordering::SeqCst);
@@ -1271,7 +1362,6 @@ impl SerialWriter for FakeSerialWriter {
                         error: None,
                     };
                 }
-                self.inner.blocked_release.store(false, Ordering::SeqCst);
                 self.inner.blocked_now.store(true, Ordering::SeqCst);
                 let mut guard = self
                     .inner
