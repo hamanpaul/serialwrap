@@ -206,6 +206,82 @@ def test_refused_upgrade_must_leave_install_untouched():
     assert uc.judge_refusal_untouched("upgrade_with_old_daemon_running", before, switched)["verdict"] == "FAIL"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_refusal_with_wrong_reason_fails():
+    """現場未改動但拒絕原因與規格不符（例如 manifest 錯誤、DAEMON_BUSY）→ FAIL；原因相符才 PASS（e270e89#2）。"""
+    before = {"daemon_pids": [101], "entries": {"serialwrap": "/pipx/bin/serialwrap"}, "files": {"config.yaml": "a"}}
+    after = json.loads(json.dumps(before))
+    legacy = {"ok": False, "error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+    row = uc.judge_refusal("upgrade_with_old_daemon_running", before, after, legacy, uc.REFUSAL_LEGACY_HANDOFF)
+    assert row["verdict"] == "PASS", row
+    busy = {"ok": False, "error_code": "DAEMON_BUSY"}
+    row = uc.judge_refusal("upgrade_with_old_daemon_running", before, after, busy, uc.REFUSAL_LEGACY_HANDOFF)
+    assert row["verdict"] == "FAIL" and "拒絕原因" in row["reason"], row
+    other_probe = dict(legacy, probe="daemon.status")
+    assert uc.judge_refusal("upgrade_with_old_daemon_running", before, after, other_probe,
+                            uc.REFUSAL_LEGACY_HANDOFF)["verdict"] == "FAIL"
+    rollback = {"ok": False, "error_code": "INVALID_ARGS", "reason": "rollback_unavailable"}
+    assert uc.judge_refusal("rollback_command", before, after, rollback, uc.REFUSAL_ROLLBACK_UNAVAILABLE)[
+        "verdict"] == "PASS"
+    wrong = dict(rollback, reason="manifest_invalid")
+    assert uc.judge_refusal("rollback_command", before, after, wrong, uc.REFUSAL_ROLLBACK_UNAVAILABLE)[
+        "verdict"] == "FAIL"
+    # 原因相符但現場被改動仍 FAIL；拒絕前沒有舊 daemon 仍 INSUFFICIENT
+    killed = dict(after, daemon_pids=[])
+    assert uc.judge_refusal("rollback_command", before, killed, rollback, uc.REFUSAL_ROLLBACK_UNAVAILABLE)[
+        "verdict"] == "FAIL"
+    nodaemon = dict(before, daemon_pids=[])
+    assert uc.judge_refusal("rollback_command", nodaemon, nodaemon, rollback, uc.REFUSAL_ROLLBACK_UNAVAILABLE)[
+        "verdict"] == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_seed_requires_binding_effective_in_baseline():
+    """基線 session list 沒有 COM7 或 by-id 仍是 YAML 原值 → seed FAIL，避免 binding 相容檢查空轉（e270e89#1）。"""
+    aliases = [{"alias": "upgbench", "session_id": "shellboard:COM7"},
+               {"alias": "pinned", "device_by_id": "/dev/serial/by-id/usb-UPGRADE_PIN-if00-port0"}]
+    bound = [{"session_id": "shellboard:COM7", "device_by_id": "/dev/serial/by-id/usb-UPGRADE_REBOUND-if00-port0"}]
+    files = ["config.yaml", "profiles/bench.yaml"]
+    ok = uc.judge_seed("seed_user_data", rcs=[0, 0, 0, 0], baseline={"aliases": aliases, "sessions": bound},
+                       config_files=files)
+    assert ok["verdict"] == "PASS", ok
+    assert ok["detail"]["sessions"] == bound
+    yaml_value = [{"session_id": "shellboard:COM7", "device_by_id": "/dev/serial/by-id/usb-UPGRADE_TEST-if00-port0"}]
+    row = uc.judge_seed("seed_user_data", rcs=[0, 0, 0, 0], baseline={"aliases": aliases, "sessions": yaml_value},
+                        config_files=files)
+    assert row["verdict"] == "FAIL", row
+    row = uc.judge_seed("seed_user_data", rcs=[0, 0, 0, 0], baseline={"aliases": aliases, "sessions": []},
+                        config_files=files)
+    assert row["verdict"] == "FAIL", row
+    row = uc.judge_seed("seed_user_data", rcs=[0, 0, 0, 0], baseline={"aliases": aliases[:1], "sessions": bound},
+                        config_files=files)
+    assert row["verdict"] == "FAIL", row
+    row = uc.judge_seed("seed_user_data", rcs=[0, 1, 0, 0], baseline={"aliases": aliases, "sessions": bound},
+                        config_files=files)
+    assert row["verdict"] == "FAIL", row
+    row = uc.judge_seed("seed_user_data", rcs=[0, 0, 0, 0], baseline={"aliases": aliases, "sessions": bound},
+                        config_files=["config.yaml"])
+    assert row["verdict"] == "FAIL", row
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_rollback_success_path_requires_old_daemon_and_config():
+    """setup --rollback 若成功：CLI、daemon 版本都須為 0.3.2，config 須逐位元組保留（e270e89#3）。"""
+    cfg = {"config.yaml": "a"}
+    good = uc.judge_rollback_success("rollback_command", cli_version="serialwrap 0.3.2",
+                                     daemon_version="0.3.2", cfg_before=cfg, cfg_after=dict(cfg))
+    assert good["verdict"] == "PASS", good
+    assert uc.judge_rollback_success("rollback_command", cli_version="serialwrap 0.3.2", daemon_version="0.4.0",
+                                     cfg_before=cfg, cfg_after=dict(cfg))["verdict"] == "FAIL"
+    assert uc.judge_rollback_success("rollback_command", cli_version="serialwrap 0.3.2", daemon_version="0.3.2",
+                                     cfg_before=cfg, cfg_after={})["verdict"] == "FAIL"
+    assert uc.judge_rollback_success("rollback_command", cli_version="serialwrap 0.4.0", daemon_version="0.3.2",
+                                     cfg_before=cfg, cfg_after=dict(cfg))["verdict"] == "FAIL"
+
+
 # ---------- runner 與映像 ----------
 
 @pytest.mark.core_portable

@@ -37,6 +37,15 @@ ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
 
 _DAEMON_NAMES = frozenset({"serialwrapd", "serialwrapd.exe", "serialwrapd.py"})
 
+# 升級前寫入的使用者資料（driver phase_seed 建立）：基線必須真的含這些，相容比對才不會空轉。
+SEED_ALIASES = frozenset({"upgbench", "pinned"})
+SEED_BINDINGS = {"shellboard:COM7": "/dev/serial/by-id/usb-UPGRADE_REBOUND-if00-port0"}
+SEED_CONFIG_FILES = frozenset({"profiles/bench.yaml"})
+
+# 規格上預期的拒絕原因（release-0.4.0-plan.md §6）：現場未改動之外，拒絕原因也必須相符。
+REFUSAL_LEGACY_HANDOFF = {"error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+REFUSAL_ROLLBACK_UNAVAILABLE = {"error_code": "INVALID_ARGS", "reason": "rollback_unavailable"}
+
 
 def row(check_id: str, verdict: str, reason: str | None = None, **detail: Any) -> dict[str, Any]:
     return {"id": check_id, "verdict": verdict, "reason": reason, "detail": detail}
@@ -201,6 +210,48 @@ def judge_refusal_untouched(check_id: str, before: dict[str, Any], after: dict[s
     if diffs:
         return row(check_id, "FAIL", "setup 拒絕後安裝現場已被改動", changed=diffs, before=before, after=after)
     return row(check_id, "PASS", None, kept=["daemon_pids", "entries", "files"])
+
+
+def judge_refusal(check_id: str, before: dict[str, Any], after: dict[str, Any], body: dict[str, Any] | None,
+                  expected: dict[str, str]) -> dict[str, Any]:
+    """拒絕型檢查：現場須未改動（judge_refusal_untouched），且回應欄位須逐一等於 expected，否則 FAIL。"""
+    body = body if isinstance(body, dict) else {}
+    result = judge_refusal_untouched(check_id, before, after)
+    got = {key: body.get(key) for key in expected}
+    result["detail"]["refusal"] = got
+    if result["verdict"] != "PASS":
+        return result
+    mismatched = sorted(key for key, value in expected.items() if got[key] != value)
+    if mismatched:
+        return row(check_id, "FAIL", "拒絕原因與規格不符", expected=dict(expected), refusal=got, mismatched=mismatched)
+    return result
+
+
+def judge_seed(check_id: str, *, rcs: list[int], baseline: dict[str, Any], config_files: Iterable[str]) -> dict[str, Any]:
+    """基線須含 SEED_ALIASES、SEED_BINDINGS 已生效（session list 的 by-id 為重綁值）與 SEED_CONFIG_FILES。"""
+    names = {a.get("alias") for a in baseline.get("aliases") or []}
+    sessions = list(baseline.get("sessions") or [])
+    bound = {s.get("session_id"): s.get("device_by_id") for s in sessions}
+    files = set(config_files)
+    missing_aliases = sorted(SEED_ALIASES - names)
+    bindings_missing = sorted(sid for sid, dev in SEED_BINDINGS.items() if bound.get(sid) != dev)
+    missing_files = sorted(SEED_CONFIG_FILES - files)
+    detail = {"rcs": list(rcs), "aliases": sorted(map(str, names)), "sessions": sessions,
+              "config_files": sorted(files)}
+    if any(rc != 0 for rc in rcs) or missing_aliases or bindings_missing or missing_files:
+        return row(check_id, "FAIL", "無法建立 alias／binding／profile 基線", missing_aliases=missing_aliases,
+                   bindings_missing=bindings_missing, missing_files=missing_files, **detail)
+    return row(check_id, "PASS", None, **detail)
+
+
+def judge_rollback_success(check_id: str, *, cli_version: str | None, daemon_version: str | None,
+                           cfg_before: dict[str, str], cfg_after: dict[str, str], old_version: str = "0.3.2") -> dict[str, Any]:
+    """setup --rollback 成功路徑：CLI 與 daemon 都回到 old_version，且設定逐位元組保留。"""
+    preserved = judge_files_preserved(check_id, cfg_before, cfg_after)
+    detail = {"outcome": "rolled_back", "cli_version": cli_version, "daemon_version": daemon_version,
+              "config": preserved["detail"]}
+    ok = cli_version == f"serialwrap {old_version}" and daemon_version == old_version and preserved["verdict"] == "PASS"
+    return row(check_id, "PASS" if ok else "FAIL", None if ok else f"setup --rollback 未完整回到 {old_version}", **detail)
 
 
 def overall_verdict(rows: list[dict[str, Any]]) -> str:

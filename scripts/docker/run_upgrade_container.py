@@ -218,12 +218,8 @@ class Driver:
         ]
         self.baseline = self.state_view()
         self.cfg_before = uc.snapshot_files(CONFIG)
-        names = {a.get("alias") for a in self.baseline["aliases"]}
-        ok = (all(p.returncode == 0 for p in restart + cmds) and {"upgbench", "pinned"} <= names
-              and "bench.yaml" in " ".join(self.cfg_before))
-        self.add(uc.row("seed_user_data", "PASS" if ok else "FAIL", None if ok else "無法建立 alias／binding／profile 基線",
-                        rcs=[p.returncode for p in restart + cmds], aliases=sorted(map(str, names)),
-                        config_files=sorted(self.cfg_before)))
+        self.add(uc.judge_seed("seed_user_data", rcs=[p.returncode for p in restart + cmds], baseline=self.baseline,
+                               config_files=self.cfg_before))
         self.add(uc.judge_doctor("doctor_green_old", self.doctor("0.3.2 doctor"), require_pairing=False))
 
     def _site(self) -> dict[str, Any]:
@@ -240,9 +236,8 @@ class Driver:
         self.observations.append({"id": "OBS-UPGRADE-LEGACY-HANDOFF", "phase": "upgrade_with_old_daemon_running",
                                   "error_code": body.get("error_code"), "probe": body.get("probe"),
                                   "message": body.get("message"), "hint": body.get("hint")})
-        r = uc.judge_refusal_untouched("upgrade_with_old_daemon_running", before, self._site())
+        r = uc.judge_refusal("upgrade_with_old_daemon_running", before, self._site(), body, uc.REFUSAL_LEGACY_HANDOFF)
         r["detail"]["outcome"] = "refused"
-        r["detail"]["error_code"] = body.get("error_code")
         self.add(r)
         return False
 
@@ -325,19 +320,17 @@ class Driver:
         proc = self.sw("setup", "--rollback", label="0.4.0 setup --rollback", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
-            # 回滾成功時必須真的回到 0.3.2；之後的手動降級改為驗證既有結果
-            status = self.wait_daemon(version=None) or {}
-            ok = self.cli_version() == f"serialwrap {OLD_VERSION}"
-            self.add(uc.row("rollback_command", "PASS" if ok else "FAIL", None if ok else "setup --rollback 未回到 0.3.2",
-                            outcome="rolled_back", daemon_version=status.get("version")))
+            # 回滾成功時 CLI、daemon 都必須回到 0.3.2 且設定保留；之後的手動降級照常執行並另行判定
+            status = self.wait_daemon(version=OLD_VERSION) or {}
+            self.add(uc.judge_rollback_success("rollback_command", cli_version=self.cli_version(),
+                                               daemon_version=status.get("version"), cfg_before=self.cfg_before,
+                                               cfg_after=uc.snapshot_files(CONFIG), old_version=OLD_VERSION))
             return
         self.observations.append({"id": "OBS-UPGRADE-ROLLBACK-PIPX", "phase": "rollback_command",
                                   "error_code": body.get("error_code"), "reason": body.get("reason"),
                                   "message": body.get("message")})
-        r = uc.judge_refusal_untouched("rollback_command", before, self._site())
+        r = uc.judge_refusal("rollback_command", before, self._site(), body, uc.REFUSAL_ROLLBACK_UNAVAILABLE)
         r["detail"]["outcome"] = "refused"
-        r["detail"]["error_code"] = body.get("error_code")
-        r["detail"]["reason_code"] = body.get("reason")
         self.add(r)
 
     def phase_downgrade(self) -> None:
