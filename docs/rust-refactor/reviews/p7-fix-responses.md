@@ -148,3 +148,7 @@
 |---|---|---|
 | 10 | **完成（部分偏離）** | reader 端 `CaptureObserver`（掛 `RxShared`）、回應函式對齊 `log_responses` golden、文字模式換行；`capture_p7` 7 項。未承接：`slow_capture_fs_does_not_block_actor_control_lane`（需新增 Effect 變體＝改 P5 `tests/support` 窮舉 executor；P5 正由另一 session 修改，本輪不動 P5 檔案）。08 Task 10「P7 修訂」 |
 | 9 | **完成（部分）** | `recover.rs` 純函式（`plan_recover`／`plan_resets_progress`／`reprobe_reply`／`force_reply`）接入 SessionCore；修正 recover 未重置 reprobe 進度（Python `_reset_reprobe_progress_locked`）；force 輪詢改 1 s 輪詢點計時器、並發等待者各自輪詢（不再以逾時打發前一個）；`recover_p7` 9 項。未承接：`force_clear_invalidates_human_input`、READY 分支 `invalidate_deferred("recover")`（P6，P7-BU-1）；`recover_passthrough_*`／`recover_reprobe_failure_with_force_goes_to_force` 等由 06 既有行為涵蓋者未另立同名測試 |
+| 17 | **部分** | `session_rpc_p7` 7 項回歸鎖（self_test 轉型三項、`force:"false"` 為真、passthrough attach 零 TX、log RPC 鍵序與 RETRYABLE、public 鍵序＝`to_public_dict()`）全綠（行為已由 06 T18／P7 Task 5 實作）。未承接：`attach_human_lease_branch_last_error_field`（P6 human lease）、`attach_credentials_unresolved_last_error_field`／`attach_resets_credentials_warned`／`attach_state_result_mapping`（依賴 Task 7 收斂表；Task 7 待 P7-BO-3 裁決） |
+| 7 | **未開始（BLOCKED-OWNER P7-BO-3）** | SC-30 與 merge 帶入的 P5 F15 衝突：收斂表的「quiet 撤銷 run 結果不得推 READY」與 P5 測試期望相反，須擁有者裁決後才能動 `active_login`／`fsm_gen_floor`／`CancelLogin`；`TxPermit.fsm_gen: Option<u64>`／`StaleFsmGen` 與 06 現況形狀不同（check_p7_prereqs DIFFERS）亦需一併定案 |
+| 18 | **未開始** | 依賴 Task 18A（黑箱工具獨立 PR）與 Task 7；L1.5／A/B 需 Python 與 Rust daemon 實跑環境 |
+| 19 | **LOCAL-WINDOWS-TODO** | Windows 原生 L1／COM 證據，見 p7-local-windows-todo（P7-LW-1～6） |
