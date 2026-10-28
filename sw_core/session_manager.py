@@ -8275,16 +8275,16 @@ def _match_readline_wrapped_echo(text: str, command: str) -> tuple[int, int] | N
         matched = 0
         last_wrap: int | None = None
         while matched < len(command) and cursor < len(line):
-            if line[cursor] == command[matched]:
-                cursor += 1
-                matched += 1
-                continue
             if line.startswith(" \r", cursor) and matched > 0:
                 segment = matched if last_wrap is None else matched - last_wrap
                 if segment < _READLINE_WRAP_MIN_SEGMENT:
                     break
                 last_wrap = matched
                 cursor += 2
+                continue
+            if line[cursor] == command[matched]:
+                cursor += 1
+                matched += 1
                 continue
             break
         if matched != len(command):
