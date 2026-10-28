@@ -148,3 +148,69 @@ fn session_public_fields_p7() {
     assert_eq!(s["next_reprobe_at"], PyValue::Null);
     assert_eq!(s["reprobe_exhausted"], PyValue::Bool(false));
 }
+
+// --- Task 17 剩餘列（Task 7 OD-35 後解除阻擋）：帳密未解析的 attach 回應與再告警（SC-34、#140）。
+
+const CRED_SHELL: &str = "profiles:\n  c:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: 'login: ?$'\n    password_regex: 'Password: ?$'\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    env_file: /nonexistent/s21.env\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: c, device_by_id: /s/by-id/usb-A}\n";
+
+fn cred_attached() -> ServiceRig {
+    let rig = ServiceRig::build(RigSpec {
+        yaml: CRED_SHELL.to_string(),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec![],
+    });
+    rig.wait_state("COM0", "ATTACHED");
+    rig
+}
+
+fn credentials_metas(rig: &ServiceRig) -> usize {
+    let r = rig.call("log.tail_raw", r#"{"selector":"COM0","limit":500}"#);
+    match &r["records"] {
+        PyValue::List(rows) => rows
+            .iter()
+            .filter(|row| {
+                let PyValue::Dict(d) = row else { return false };
+                d.get("dir").and_then(PyValue::as_str) == Some("META")
+                    && sw_proto::pyjson::dumps_dict(d, &sw_proto::pyjson::RPC_WIRE)
+                        .contains("credentials_unresolved")
+            })
+            .count(),
+        other => panic!("records：{other:?}"),
+    }
+}
+
+#[test]
+fn attach_credentials_unresolved_last_error_field() {
+    // SC-34（OD-14 #1）：ATTACHED＋CREDENTIALS_UNRESOLVED，`session.attach` 再探仍未解析 → `_attach_state_result`：
+    // `{"ok":false,"error_code":"SESSION_NOT_READY","last_error":"CREDENTIALS_UNRESOLVED","last_error_detail":null,
+    // "session":…}`（error_code 不得為 CREDENTIALS_UNRESOLVED）。
+    let rig = cred_attached();
+    let r = rig.call("session.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        keys(&r),
+        ["ok", "error_code", "last_error", "last_error_detail", "session", "version"]
+    );
+    assert_eq!(r["ok"], PyValue::Bool(false));
+    assert_eq!(r["error_code"], PyValue::from("SESSION_NOT_READY"));
+    assert_eq!(r["last_error"], PyValue::from("CREDENTIALS_UNRESOLVED"));
+    assert_eq!(r["last_error_detail"], PyValue::Null);
+    match &r["session"] {
+        PyValue::Dict(s) => {
+            assert_eq!(s["state"], PyValue::from("ATTACHED"));
+            assert_eq!(s["last_error"], PyValue::from("CREDENTIALS_UNRESOLVED"));
+        }
+        other => panic!("session：{other:?}"),
+    }
+}
+
+#[test]
+fn attach_resets_credentials_warned() {
+    // #140：手動 attach 為重新介入（`credentials_warned = False`）——仍未解析時再告警一次（WAL META +1）。
+    let rig = cred_attached();
+    let before = credentials_metas(&rig);
+    assert_eq!(before, 1, "首次 attach 告警一次");
+    rig.call("session.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(credentials_metas(&rig), before + 1);
+}

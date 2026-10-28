@@ -164,6 +164,7 @@
           "cargo:sw-core::session_auth_golden::parse_env_file_matches_python_golden",
           "cargo:sw-core::session_auth_golden::resolve_session_auth_matches_python_golden_including_warnings",
           "cargo:sw-core::session_core_login::attach_login_banner_cancels_run_and_adopts_bridge_sc30",
+          "cargo:sw-core::session_core_login::attach_state_result_mapping",
           "cargo:sw-core::session_core_login::console_unlock_banner_does_not_cancel_run",
           "cargo:sw-core::session_core_login::manual_reprobe_banner_cancels_run_and_late_ready_is_ignored_sc30",
           "cargo:sw-core::session_core_login::ready_reconfirm_probe_banner_keeps_ready_and_gate_sc30",
@@ -230,7 +231,9 @@
           "cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found",
           "cargo:sw-daemon::event_rpc::rule_set_invalid_schema_and_type_error",
           "cargo:sw-daemon::event_rpc::rule_set_response_spreads_raw_with_ok_first",
+          "cargo:sw-daemon::session_rpc_p7::attach_credentials_unresolved_last_error_field",
           "cargo:sw-daemon::session_rpc_p7::attach_passthrough_attached_ok_no_probe",
+          "cargo:sw-daemon::session_rpc_p7::attach_resets_credentials_warned",
           "cargo:sw-daemon::session_rpc_p7::log_rpcs_shapes",
           "cargo:sw-daemon::session_rpc_p7::recover_force_string_false_is_true",
           "cargo:sw-daemon::session_rpc_p7::self_test_bad_timeout_before_selector_is_exception",
@@ -342,6 +345,26 @@
             "tests/test_event_dispatcher.py::TestDispatcher::test_per_rule_concurrency_drops_oldest",
             "tests/test_event_dispatcher.py::TestDispatcher::test_timeout_kills_handler",
             "tests/test_event_engine.py::TestEventEngine::test_disable_clears_counter"
+          ]
+        }
+      }
+    },
+    "p7_gate:py_parity_attach": {
+      "linux": {
+        "nodeids": [
+          "tests/test_p7_attach_parity.py::test_attach_with_bridge_state_result_shape[FLASHING-FLASHING_BUSY]",
+          "tests/test_p7_attach_parity.py::test_attach_with_bridge_state_result_shape[RECOVERING-SESSION_RECOVERING]"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "-m",
+            "core_portable or posix_only",
+            "tests/test_p7_attach_parity.py"
+          ],
+          "markexpr": "core_portable or posix_only",
+          "paths": [
+            "tests/test_p7_attach_parity.py"
           ]
         }
       }

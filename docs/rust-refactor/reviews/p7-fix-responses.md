@@ -223,3 +223,12 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | `tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_rust_quiet_mid_login_aborts_sc30`（`sc30-quiet-mid-login-aborts`） | **新增**：Rust CLI＋daemon（`SERIALWRAP_AB_LABEL=rust-p7`）連跑 2 次 PASS——送出帳號後 target 輸出 U-Boot banner，之後 target 0 byte（secret 未送）、ATTACHED＋`PROMPT_UNAVAILABLE`、detail null；Python 基線 `pytest.skip("SC-30 Rust-only")`（cases.yaml 平台限定）。此黑箱以外部 byte 證據鎖定行為，SC-30 與 F15 的差異（舊世代 Ready 不得推 READY）由 `session_core_login.rs` 區分 |
 | `tests/acceptance/l15/test_slice23_l15.py` | OD-34／OD-31 gate 案例（Rust label），見上 |
 | 其餘 Task 18 檔案（test_p7_login／selftest_recover／stall／events／log_capture／latency_noise／invariants、l15/slice23 yaml、run_p7_ab.sh） | 未開始，列下一輪 |
+
+### Task 17（剩餘列，Task 7 後解除阻擋）
+
+| 測試 | 結果 |
+|---|---|
+| `session_rpc_p7::attach_credentials_unresolved_last_error_field`（SC-34） | 新增；行為既有（回歸鎖） |
+| `session_rpc_p7::attach_resets_credentials_warned`（#140） | 新增；WAL META `credentials_unresolved` 1→2（回歸鎖） |
+| `session_core_login::attach_state_result_mapping` | 新增；**揭露並修正兩處偏離**：bridge 存在時 SessionAttach 的 FLASHING 回應多 `selector`、reboot recovery 中的 RECOVERING 回應多 drain 欄位——Python `attach_session` 兩者皆走 `_attach_state_result`（鍵 `ok, error_code, session`，CPython 3.12 實測；Python 側 `tests/test_p7_attach_parity.py`，新 L1 集合 `p7_gate:py_parity_attach`）。`device.attach` 等非 SessionAttach 路徑不變。last_error None 子案依賴 human lease（P6，P7-BU-3） |
+| `attach_human_lease_branch_last_error_field` | 仍 BLOCKED-UPSTREAM（P6 human lease） |

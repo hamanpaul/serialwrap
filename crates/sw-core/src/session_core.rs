@@ -1947,14 +1947,25 @@ impl SessionCore {
             )];
         }
         if self.state == SessionState::Flashing {
+            if session_attach && self.generations.conn_epoch.is_some() {
+                // Python `attach_session`：bridge 存在、非 ATTACHED → `_attach_state_result`：
+                // `{"ok":false,"error_code":"FLASHING_BUSY","session"}`（無 `selector`；P7 Task 17
+                // `attach_state_result_mapping`，CPython 3.12 實測鍵序 ok, error_code, session）。
+                return vec![Effect::Reply(reply, Ok(self.attach_state_result(now)))];
+            }
             let mut response = self.error_session("FLASHING_BUSY", now);
             response.insert("selector", PyValue::from(self.profile.com.clone()));
             return vec![Effect::Reply(reply, Ok(response))];
         }
+        // RECOVERING 且 bridge 存在、無 drain（reboot recovery 等待中）：Python `attach_session` 不走
+        // `_pending_drain` 分支（無 drain 欄位），而是 bridge 存在的 `_attach_state_result` →
+        // `{"ok":false,"error_code":"SESSION_RECOVERING","session"}`（P7 Task 17 `attach_state_result_mapping`）。
+        let recovering_with_bridge =
+            session_attach && self.state == SessionState::Recovering && self.generations.conn_epoch.is_some();
         if self.drain_in_progress()
             || self.pending_attach.is_some()
             || self.open_real_path.is_some()
-            || self.state == SessionState::Recovering
+            || (self.state == SessionState::Recovering && !recovering_with_bridge)
             || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
             || matches!(
                 &self.pending_commit,

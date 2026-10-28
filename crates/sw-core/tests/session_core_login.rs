@@ -184,3 +184,57 @@ fn rx_cancel_login_runs_wakes_waiter_and_spares_later_runs() {
     assert!(old.is_triggered());
     assert!(!RunCancel::new(&rx).is_triggered(), "取消後新建的 run 不受影響");
 }
+
+#[test]
+fn attach_state_result_mapping() {
+    // P7 Task 17 `attach_state_result_mapping`（Python `_attach_state_result`，SC-34）：bridge 存在時
+    // FLASHING → FLASHING_BUSY；RECOVERING（無 pending drain）→ SESSION_RECOVERING；ATTACHED 再探失敗
+    // READY_NONCE_TIMEOUT → SESSION_NOT_READY＋last_error＋last_error_detail（＝session 快照）。
+    use sw_proto::pyjson::PyDict;
+    let keys = |d: &PyDict| d.0.keys().cloned().collect::<Vec<_>>();
+    // FLASHING
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.force_state(SessionState::Flashing);
+    let r = h.rpc(SessionRequest::SessionAttach).expect("ok");
+    assert_eq!(keys(&r), ["ok", "error_code", "session"]);
+    assert_eq!(r["error_code"], PyValue::from("FLASHING_BUSY"));
+    // RECOVERING（reboot recovery 等待中）
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let started = h.start_foreground_command("reboot");
+    let epoch = h.epoch();
+    h.feed(ControlEvent::UartTxCompleted {
+        epoch,
+        op_id: started.op_id,
+        confirmed_bytes: 7,
+        unknown: false,
+    });
+    h.feed(ControlEvent::OpFinished {
+        op_id: started.op_id,
+        epoch,
+        outcome: OpOutcome::RebootExpected,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Recovering);
+    let r = h.rpc(SessionRequest::SessionAttach).expect("ok");
+    assert_eq!(keys(&r), ["ok", "error_code", "session"]);
+    assert_eq!(r["error_code"], PyValue::from("SESSION_RECOVERING"));
+    // ATTACHED 再探 READY_NONCE_TIMEOUT
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (reply, fx) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let (epoch, gen) = start_login(&fx).expect("再探");
+    finish(&mut h, epoch, gen, LoginOutcome::NotReady("READY_NONCE_TIMEOUT".into()));
+    let r = reply.try_recv().expect("回覆").expect("ok");
+    assert_eq!(
+        keys(&r),
+        ["ok", "error_code", "last_error", "last_error_detail", "session"]
+    );
+    assert_eq!(r["error_code"], PyValue::from("SESSION_NOT_READY"));
+    assert_eq!(r["last_error"], PyValue::from("READY_NONCE_TIMEOUT"));
+    let PyValue::Dict(s) = &r["session"] else { panic!("session") };
+    // detail＝`login_error_detail(rx tail)`；CoreHarness 不經 reader 寫 RxShared 視窗（tail 空 → None，同 Python
+    // `if not tail: None`），此處只鎖「頂層與 session 快照同值」。
+    assert_eq!(r["last_error_detail"], s["last_error_detail"]);
+}

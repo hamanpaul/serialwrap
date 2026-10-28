@@ -23,6 +23,10 @@ use sw_proto::pyjson::{self, PyDict, PyInt, PyValue};
 
 const KEYS: [&str; 5] = ["PATH", "HOME", "USER", "LANG", "LC_ALL"];
 
+/// 原生行程密集的案例與計時敏感的 stop 案例互斥（同一 test binary 內平行執行時，16 個 shell 子行程會拉長
+/// `stop` 的實測耗時）；只序列化，不改任何斷言。
+static TIMING: Mutex<()> = Mutex::new(());
+
 fn dumps_default(v: &PyValue) -> String {
     pyjson::dumps(
         v,
@@ -427,6 +431,7 @@ fn huge_timeout_native_handler_then_normal_rule_completes() {
     // 審查 sol-backfill p7-20261028 #1：`timeout_ms` 超大 → `Rule::timeout()` 為 Duration::MAX；Python
     // `communicate` 以 OverflowError 穿出：不 emit、counter 不變、名額釋放。之後 8 條不同規則照常完成
     // （修前原生 spawner `start + timeout` panic，worker 與名額永久流失 → per_daemon_saturated）。
+    let _serial = TIMING.lock().unwrap_or_else(|e| e.into_inner());
     let r = rig();
     let d = r.start(8, sw_pal::native().handlers);
     for i in 0..8u64 {
@@ -601,6 +606,7 @@ fn inherited_env_only_whitelisted_present() {
 
 #[test]
 fn stop_deadline_aborts_running_handlers() {
+    let _serial = TIMING.lock().unwrap_or_else(|e| e.into_inner());
     let r = rig();
     let sp = FakeHandlerSpawner::blocking();
     let d = r.start(8, sp.clone());
@@ -665,6 +671,7 @@ fn close_intake_rejects_new_dispatch() {
 
 #[test]
 fn stop_reports_unreaped_when_run_ignores_abort() {
+    let _serial = TIMING.lock().unwrap_or_else(|e| e.into_inner());
     let r = rig();
     let sp = FakeHandlerSpawner::ignore_abort();
     let d = r.start(8, sp.clone());
@@ -778,6 +785,7 @@ impl sw_pal::traits::FsOps for GatedFs {
 
 #[test]
 fn stop_aborts_handler_registered_after_deadline() {
+    let _serial = TIMING.lock().unwrap_or_else(|e| e.into_inner());
     // 審查 96b28dd_06c61d0 91109e7-1：worker 已計入 inflight、尚未登記 running 時 stop 逾時——之後登記的 handler
     // 必須立即 abort（不得 spawn 一個不受控的 handler）。
     let r = rig();
