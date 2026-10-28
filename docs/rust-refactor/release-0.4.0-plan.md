@@ -46,7 +46,8 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
 - 0.3.2 來源：容器不連網，預設以 `git archive v0.3.2` 建 wheel；正式驗證時改用 `--wheel` 指向 GitHub release 上的 0.3.2 wheel。
 - 判定：`scripts/docker/upgrade_checks.py`（`tests/test_docker_upgrade.py`）。18 項必要檢查，任一 FAIL 即 FAIL、缺項即 INSUFFICIENT：
   0.3.2 安裝與啟動、建立 profile／alias／binding 基線、0.3.2 doctor、舊 daemon 執行中直接 setup（拒絕時現場不得改動）、停舊後 setup、`~/.local/bin` 入口取代且備份記下 pipx 入口、config／profiles 逐位元組保留、0.4.0 daemon 由 bundle 啟動、監管模式依 config 收斂（systemd-user：unit active＋enabled、MainPID 為新 daemon、無殘留 hold drop-in；on-demand：unit 未啟用）、alias／binding 語意相容、0.4.0 doctor（非 advisory 全綠＋`version_pairing`；advisory 只容許容器內必然為 0 的 `devices`）、`setup --rollback`（拒絕時現場不得改動）、手動降級回 0.3.2（版本、config、狀態、doctor）、降級後重新升級、全程 /proc 20 ms 取樣不得同時出現兩個 serialwrapd 實例。
-- 首次實跑（2026-10-28，bundle git revision `2a947f6`）：systemd-user 與 on-demand 皆 **PASS**（各約 2,800 筆取樣、0 次重疊）。觀察項見 §6。
+- 首次實跑（2026-10-28，bundle git revision `2a947f6`）：systemd-user 與 on-demand 皆 **PASS**（各約 2,800 筆取樣、0 次重疊）；報告未保存，不作為證據。
+- 判準收緊後實跑（2026-10-28，run `s1v14-c8df563`，bundle git revision `c8df563`）：兩模式皆 **PASS**（取樣 2641／2705、0 次重疊）；報告原文與 `SHA256SUMS` 保存於 `evidence/stage1/upgrade-docker/s1v14-c8df563/`。此為開發中 bundle，不取代前置條件 #3 的 release bundle 重跑。觀察項見 §6。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 

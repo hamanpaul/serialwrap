@@ -18,6 +18,9 @@ secret_scan:
     # 非實作者雲端審查原文（依擁有者裁決逐字複製）記錄雲端 routine 容器預設帳號 home 下的工作樹路徑，
     # 為一次性雲端容器的預設帳號路徑，非任何真人開發者的本機個人路徑；為保留原文不改寫，允許放行。
     - "docs/rust-refactor/reviews/s1x-oracle-review-1.md"
+    # OD-33 升級驗證報告原文：容器內 swtest 測試帳號 home 下的 pipx／入口路徑（僅存在於一次性升級容器），
+    # 非真人開發者的本機個人路徑；證據須保留原文供雜湊核對，允許放行。
+    - "evidence/stage1/upgrade-docker/**"
 code_paths:
   - "sw_core/**"
   - "tools/**"

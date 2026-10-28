@@ -134,3 +134,39 @@ def test_allowed_oracle_review_has_no_credential_or_marker_and_single_structural
     assert credential == [], f"整檔豁免下不得出現 credential 樣式：行 {credential}"
     assert marker == [], f"整檔豁免下不得出現 marker 樣式：行 {marker}"
     assert structural == EXPECTED_STRUCTURAL_LINES, f"structural 命中須恰為雲端容器路徑所在行：{structural}"
+
+
+# OD-33 升級驗證報告原文（`evidence/stage1/upgrade-docker/**`）同為整檔豁免：只為容器內 swtest 測試帳號的
+# home 路徑列入 allow。要求 credential／marker 命中為 0，且每一處 home 路徑樣式都只能是該容器帳號。
+UPGRADE_EVIDENCE_ALLOW = "evidence/stage1/upgrade-docker/**"
+UPGRADE_CONTAINER_HOME = "/home/swtest/"
+
+
+def _upgrade_evidence_files() -> list[Path]:
+    return sorted(p for p in (ROOT / "evidence/stage1/upgrade-docker").rglob("*") if p.is_file())
+
+
+def test_upgrade_evidence_allow_entry_matches_guard() -> None:
+    allow = (_config().get("secret_scan") or {}).get("allow") or []
+    assert UPGRADE_EVIDENCE_ALLOW in allow, "防線對象須與 allow 條目一致；移除 allow 時一併移除本段測試"
+    assert _upgrade_evidence_files(), "allow 條目存在但沒有受防線涵蓋的證據檔"
+
+
+def test_upgrade_evidence_only_container_home_paths() -> None:
+    patterns = _patterns()
+    for path in _upgrade_evidence_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        _, credential, marker = _scan(text)
+        rel = path.relative_to(ROOT).as_posix()
+        assert credential == [], f"{rel}：整檔豁免下不得出現 credential 樣式：行 {credential}"
+        assert marker == [], f"{rel}：整檔豁免下不得出現 marker 樣式：行 {marker}"
+        assert not patterns["_PRIVATE_KEY"].search(text), f"{rel}：不得出現私鑰樣式"
+        homes = {m.group(0) for m in patterns["_STRUCTURAL"].finditer(text)}
+        assert homes <= {UPGRADE_CONTAINER_HOME}, f"{rel}：只允許容器帳號 home 路徑，實際 {sorted(homes)}"
+
+
+def test_upgrade_evidence_guard_rejects_host_home_mutant() -> None:
+    patterns = _patterns()
+    mutant = '{"entry": "/home/' + 'someone/.local/bin/serialwrap"}'
+    homes = {m.group(0) for m in patterns["_STRUCTURAL"].finditer(mutant)}
+    assert not homes <= {UPGRADE_CONTAINER_HOME}
