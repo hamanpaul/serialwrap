@@ -808,6 +808,8 @@ fn console_unlock_profile_is_not_probe_blocked() {
 
 ---
 
+**P7 修訂（#234 承接，2026-10-28）：** `QuietState::on_rx_text` 的解除判定改為 `login_regex`、`prompt_regex`、`boot_done_regex` 三者同列（Python `_update_boot_quiet_locked` 的 `for pattern in (sp.login_regex, sp.prompt_regex, sp.boot_done_regex)`），同樣先過 `bootloader_prompts` 尾行例外、無效 regex 略過；只清 quiet、不清 `pending`。template 載入與 target 覆寫（`str(... or "").strip()`）由主線 sw-proto `config_types` 承接。golden `quiet_rx` add-only 014～020（CPython 3.12 擷取）；actor 層 `session_core_quiet_p7::boot_done_regex_clears_quiet_but_keeps_reconfirm_pending`／`boot_done_regex_absent_keeps_quiet_on_askconsole`。
+
 ## Task 5：`reprobe.rs`：readiness reprobe 與 bootloader 證據
 
 **Test author model:** haiku-xhigh　**Implementer model:** codex-gpt-6-luna-max

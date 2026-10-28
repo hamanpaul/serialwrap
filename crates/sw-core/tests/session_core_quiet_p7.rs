@@ -484,3 +484,39 @@ fn reattach_within_quiet_fence_expires_with_window() {
         )
     });
 }
+
+/// #234：profile 宣告 `boot_done_regex`（YAML 經 sw-proto `load_profiles` 承接）。
+const PRPL_BOOT_DONE_PROFILE: &str = "profiles:\n  r:\n    platform: prpl\n    prompt_regex: '(?m)^root@prplOS:.*# '\n    boot_done_regex: '  Please press Enter to activate this console  '\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: r, act_no: 1, alias: r+1, device_by_id: /s/by-id/usb-A}\n";
+
+#[test]
+fn boot_done_regex_clears_quiet_but_keeps_reconfirm_pending() {
+    // Python `_update_boot_quiet_locked`（#234）：quiet 期間 RX 命中 boot_done_regex 即 `clear_boot_quiet()`；
+    // `ready_reconfirm_pending` 不清（仍由 nonce probe 確認），agent 顯式命令仍回 AUTOBOOT_QUIET。
+    // config.py：`str(raw.get("boot_done_regex") or "").strip()`——前後空白去除後才比對。
+    let mut h = CoreHarness::new(PRPL_BOOT_DONE_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    assert_eq!(h.public()["boot_quiet_remaining_s"], PyValue::Float(180.0));
+    let gen = h.core.generations().fsm_gen;
+    h.rx(b"\r\nPlease press Enter to activate this console.\r\n");
+    let p = h.public();
+    assert_eq!(p["boot_quiet_remaining_s"], PyValue::Null, "boot_done_regex 命中即解除 quiet");
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(true), "不清 ready_reconfirm_pending");
+    assert_eq!(h.core.generations().fsm_gen, gen);
+    h.fence.with(|f| {
+        assert!(!f.quiet_active);
+        assert!(f.reconfirm_pending);
+    });
+    let r = h.rpc(sw_core::session_core::SessionRequest::Submit(agent_submit("ls")));
+    assert_eq!(r.expect("submit")["error_code"], PyValue::from("AUTOBOOT_QUIET"));
+}
+
+#[test]
+fn boot_done_regex_absent_keeps_quiet_on_askconsole() {
+    // 對照：未設 boot_done_regex 時 askconsole 不匹配 login／prompt，quiet 只能等 180 s 過期（#162 根因）。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(BANNER);
+    h.rx(b"\r\nPlease press Enter to activate this console.\r\n");
+    assert_eq!(h.public()["boot_quiet_remaining_s"], PyValue::Float(180.0));
+}

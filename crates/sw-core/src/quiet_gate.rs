@@ -164,7 +164,14 @@ impl QuietState {
         if matches_any_bootloader_prompt(&tail, &t.bootloader_prompts).is_some() {
             return QuietTransition::None;
         }
-        for pattern in [t.login_regex.as_str(), t.prompt_regex.as_str()] {
+        // #234 `boot_done_regex`：profile 宣告的開機完成訊號（如 askconsole「Please press Enter to activate this
+        // console」）與 login／prompt 同列判定；無效 regex 照 Python `except re.error: continue` 略過。只清 quiet，
+        // `pending`（ready_reconfirm）仍由 nonce probe 確認點清除。
+        for pattern in [
+            t.login_regex.as_str(),
+            t.prompt_regex.as_str(),
+            t.boot_done_regex.as_str(),
+        ] {
             if pattern.is_empty() {
                 continue;
             }

@@ -172,6 +172,8 @@
           "cargo:sw-core::session_core_login_exc_p7::reboot_recovery_tx_incomplete_records_recovery_error",
           "cargo:sw-core::session_core_quiet_p7::banner_arm_bumps_fsm_gen_once",
           "cargo:sw-core::session_core_quiet_p7::banner_arm_keeps_external_state",
+          "cargo:sw-core::session_core_quiet_p7::boot_done_regex_absent_keeps_quiet_on_askconsole",
+          "cargo:sw-core::session_core_quiet_p7::boot_done_regex_clears_quiet_but_keeps_reconfirm_pending",
           "cargo:sw-core::session_core_quiet_p7::bootloader_tail_blocks_clear",
           "cargo:sw-core::session_core_quiet_p7::confirm_ready_clears_all",
           "cargo:sw-core::session_core_quiet_p7::console_unlock_arm_keeps_auto_probe_open",

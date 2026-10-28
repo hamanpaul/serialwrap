@@ -221,6 +221,23 @@ def gen_quiet_rx() -> list[dict[str, Any]]:
         {"template": "prpl-template", "steps": [(0.0, "U-Boot 2024.04\r\n"), (1.0, "\r\nlogin: "), (2.0, "Hit any key to stop autoboot:  1")]},
         {"template": "prpl-template", "profile_over": {"prompt_regex": "("}, "steps": [(0.0, "U-Boot\r\n"), (1.0, "root@prplOS:~# ")]},
         {"template": "prpl-template", "steps": [(0.0, "y" * 250 + "CFE ver"), (0.5, "sion 3\r\n")]},
+        # #234 boot_done_regex（add-only，014 起）：quiet 期間命中即解除、pending 不清；受 bootloader 尾行例外約束；
+        # 無效 regex 靜默略過；quiet 未生效時不作用；跨 chunk 以 rolling tail 拼接；passthrough 一律不作用。
+        {"template": "prpl-template", "profile_over": {"boot_done_regex": "Please press Enter to activate this console"},
+         "steps": [(0.0, "U-Boot 2024.04\r\n"), (20.0, "\r\nPlease press Enter to activate this console.\r\n"),
+                   (21.0, "U-Boot again\r\n")]},
+        {"template": "prpl-template", "profile_over": {"boot_done_regex": "activate this console"},
+         "steps": [(0.0, "U-Boot 2024.04\r\n"), (5.0, "Please press Enter to activate this console.\r\n=> ")]},
+        {"template": "prpl-template", "profile_over": {"boot_done_regex": "("},
+         "steps": [(0.0, "U-Boot 2024.04\r\n"), (5.0, "Please press Enter to activate this console.\r\n")]},
+        {"template": "prpl-template", "profile_over": {"boot_done_regex": "activate this console"},
+         "steps": [(0.0, "plain\r\n"), (1.0, "Please press Enter to activate this console.\r\n")]},
+        {"template": "prpl-template", "profile_over": {"boot_done_regex": "activate this console"},
+         "steps": [(0.0, "U-Boot 2024.04\r\n"), (5.0, "Please press Enter to acti"), (5.1, "vate this console.\r\n")]},
+        {"template": "others-template", "profile_over": {"boot_done_regex": "activate this console"},
+         "steps": [(0.0, "U-Boot 2024.04\r\n"), (1.0, "Please press Enter to activate this console.\r\n")]},
+        {"template": "prpl-template", "profile_over": {"boot_done_regex": "(?m)^ready$"},
+         "steps": [(0.0, "U-Boot 2024.04\r\n"), (3.0, "\r\nready\r\n"), (4.0, "\r\nready")]},
     ]
     rows = []
     for case in cases:
