@@ -339,7 +339,9 @@ main() {
   step l15_linux_1b_scenarios env SERIALWRAP_CLI_EXE="$SW_BUNDLE/bin/serialwrap" \
     python3 func-test/runner.py --mode bridge --scenarios --selftest-report "$SELFTEST_LINUX_PATH" \
     --report-dir "$P4/l15-linux-scenarios"
-  step no_onefile_extract python3 scripts/rust/check_no_onefile_extract.py --cli "$SW_BUNDLE/bin/serialwrap" --runs 100
+  # S1X Y5（CHG-S1X-ONEFILE-PRIVATE-TMP-01）：共用 /tmp 有他人事件而恆判 INSUFFICIENT；改於私有 mount namespace 內以獨占 /tmp 執行。
+  step no_onefile_extract python3 scripts/rust/check_no_onefile_extract.py --cli "$SW_BUNDLE/bin/serialwrap" --runs 100 \
+    --private-tmp --json-out "$EV/no-onefile-extract.json"
   BENCH_BASE="$(mktemp -d "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/s1x-bench.XXXXXX")" || BENCH_BASE=""
   if [[ -n "$BENCH_BASE" ]]; then
     bench_linux "$BENCH_BASE"

@@ -3481,6 +3481,9 @@ scripts/rust/check_no_onefile_extract.py --cli <exe> [--runs 100]
   每次執行前把 TMP／TEMP／TMPDIR 指向全新空目錄 D_i，並在 CLI 行程存活期間以檔案系統事件監看（Linux inotify、Windows ReadDirectoryChangesW，皆以 ctypes／stdlib 實作）
   遞迴觀察 D_i 與系統預設暫存根（%TEMP% 或 /tmp）；記錄任何「建立」事件（不限名稱、含建立後立即刪除者），再加執行前後快照比對。
   輸出 {"runs","created":[{"run","path","kind"}],"leftover":[...],"ok":bool}；created 或 leftover 非空 → ok:false。
+  S1X 修訂（2026-10-28，CHG-S1X-ONEFILE-PRIVATE-TMP-01，比照 OD-25 隔離精神）：共用 /tmp 的他人事件無法歸屬 → INSUFFICIENT；
+  出口以 `--private-tmp`（Linux）執行：於 user+mount namespace 內把全新空目錄 bind 到 /tmp 並宣告獨占，其中任何建立／殘留
+  皆歸屬 CLI 判 FAIL（含寫死 /tmp 者）；無法建立 namespace → INSUFFICIENT，不退回共用 /tmp。
 ```
 
 - [ ] **步驟 1：寫失敗測試**
@@ -3561,7 +3564,7 @@ mkdir -p target/p4-evidence/l1/windows/cargo && cp -r target/win-blackbox/<run_i
 cp "target/win-test-report/$(jq -r .l1_results target/win-test-report/<run_id>.json)" target/p4-evidence/l1/windows/cargo/resource-report.json   # windows s1b_cargo
 python3 scripts/rust/bench_cli_roundtrip.py --cli $SW_BUNDLE/bin/serialwrap --endpoint <隔離 daemon socket> --platform linux --json-out target/p4-bench-linux-wsl2.json
 python3 scripts/rust/bench_cli_roundtrip.py --cli $SW_BUNDLE/bin/serialwrap --endpoint <stubd socket> --cli-only-stub --json-out target/p4-bench-cli-only.json
-python3 scripts/rust/check_no_onefile_extract.py --cli $SW_BUNDLE/bin/serialwrap --runs 100
+python3 scripts/rust/check_no_onefile_extract.py --cli $SW_BUNDLE/bin/serialwrap --runs 100 --private-tmp   # S1X：CHG-S1X-ONEFILE-PRIVATE-TMP-01
 python3 scripts/rust/register_p4_evidence.py --linux-cli $SW_BUNDLE/bin/serialwrap --linux-unit-junit target/p4-evidence/l1/linux/20groups/junit.xml --l1-dir target/p4-evidence/l1 --windows-cli <WB_DIR>/bundle/bin/serialwrap.exe --windows-unit-junit <WB_DIR>/l1/windows/blackbox/junit.xml   # S1X：check 前的一次性逐案例證據登記（只寫 target/p4-evidence；髒樹拒絕）；Windows 參數取自本次 win-blackbox OutDir `WB_DIR`（G4 匯出佈局），不另行提供
 python3 scripts/rust/check_p4_cases.py --check
 python3 scripts/rust/check_cfg_boundary.py && PYTHONPATH=scripts/rust SW_REQUIRE_CARGO=1 SW_RESOURCE_REPORT=target/stage1a-evidence/<run_id>/l1/linux/pytest-full/resource-report.json python3 -m pytest -q tests/ -p junit_provenance --junitxml=target/stage1a-evidence/<run_id>/pytest-full.xml && python3 -m policy_check --repo .   # S1X：完整 pytest 為同一 HEAD 唯一一次，取代原 `pytest -q tests/`；須於 register 與 check_p4_cases 之後（測試讀取 target/p4-evidence）；集合 `s1_pytest_full`、gate 第 7 列依 G1
