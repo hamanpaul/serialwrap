@@ -1,0 +1,78 @@
+{
+  "cli_exe_sha256": "65a15804f446dd0ddbe683d77d94f18627ba313071ceb499ab3e7c27d77f5ec5",
+  "com_pair": {
+    "bridge": "COM21",
+    "daemon": "COM20"
+  },
+  "created_at": "2026-10-28T01:20:06Z",
+  "git_clean": true,
+  "git_head": "6eb949c486181ef3144b894097e8fd480c8545fe",
+  "git_tree": "325b89e3d7d1295a5364c283ba5b64400b04e8ae",
+  "run_id": "261028-091236-3084805",
+  "runner_argv": [
+    "-3.12",
+    "func-test/runner.py",
+    "--mode",
+    "bridge",
+    "--scenarios",
+    "--daemon-com",
+    "COM20",
+    "--bridge-com",
+    "COM21",
+    "--transport-mode",
+    "virtual_com0com",
+    "--selftest-report",
+    "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rust-test\\261028-091236-3084805\\selftest-report.json",
+    "--report-dir",
+    "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rust-test\\261028-091236-3084805\\report"
+  ],
+  "runner_exit": 1,
+  "runner_timeout_s": 5400,
+  "runs": {
+    "basic": {
+      "report": "basic/func-test-report.json",
+      "runner_argv": [
+        "-3.12",
+        "func-test/runner.py",
+        "--mode",
+        "bridge",
+        "--daemon-com",
+        "COM20",
+        "--bridge-com",
+        "COM21",
+        "--transport-mode",
+        "virtual_com0com",
+        "--selftest-report",
+        "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rust-test\\261028-091236-3084805\\selftest-report.json",
+        "--report-dir",
+        "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rust-test\\261028-091236-3084805\\report-basic"
+      ],
+      "runner_exit": 1
+    },
+    "scenarios": {
+      "report": "func-test-report.json",
+      "runner_argv": [
+        "-3.12",
+        "func-test/runner.py",
+        "--mode",
+        "bridge",
+        "--scenarios",
+        "--daemon-com",
+        "COM20",
+        "--bridge-com",
+        "COM21",
+        "--transport-mode",
+        "virtual_com0com",
+        "--selftest-report",
+        "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rust-test\\261028-091236-3084805\\selftest-report.json",
+        "--report-dir",
+        "C:\\Users\\haman\\AppData\\Local\\Temp\\sw-rust-test\\261028-091236-3084805\\report"
+      ],
+      "runner_exit": 1
+    }
+  },
+  "schema_version": "win-func-test-meta.v2",
+  "selftest_report_sha256": "0dce16aa09a56a86457d2508f0e2e3bb34c362b142c5ae16b9e300cc6ada9453",
+  "tool_tree_sha256": "dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196",
+  "transport_mode": "virtual_com0com"
+}

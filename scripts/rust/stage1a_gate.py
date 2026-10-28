@@ -11,8 +11,9 @@ S1X 規則（計畫 04 Task 18、§3 B3；owner_gated.py 為擁有者機台列�
 - pytest JUnit 必須帶 provenance：HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/ 且不縮小範圍；否則整份拒收。
 - s1_pytest_full（linux，OD-17）：`<l1>/linux/pytest-full/resource-report.json` 與 `--pytest-junit-report` 對帳；缺檔、集合不存在、INSUFFICIENT 或 INVALID → evidence-insufficient，FAIL → FAIL；不新增放行規則。
 - spike3（`scripts/stage0/spike3_win_wal.py`）證據依 `spike3_evidence.schema.json` 驗證、case_id 相符、git_head＝受測 HEAD、git_clean、verdict PASS 與 binary_integrity 成立才 PASS；防毒產品名與狀態只是資訊欄位（OD-19），不參與判定。
-- L1.5 擁有者延後列（`L15_OWNER_DEFERRED`；OD-30 (2) 的 Windows `l15-transport-disconnect`）：僅在 harness 明示該能力
-  不可用時，該列改判 BLOCKED-OWNER（不阻擋、不計 PASS）；其他平台列仍須 PASS，其他失敗照判 FAIL。
+- L1.5 擁有者延後列（`L15_OWNER_DEFERRED`；OD-30 (2) 的 Windows `l15-transport-disconnect`、OD-31 的 Windows
+  `ev-01-spawn-handler`、OD-32 的 Windows `sm-04-device-unplug`）：僅在列的 verdict 與訊息完整符合登記型態、且無
+  harness 關閉失敗時，該列改判 BLOCKED-OWNER（不阻擋、不計 PASS）；其他平台列仍須 PASS，其他失敗照判 FAIL。
 - Windows COM（OD-15、計畫 04 §3 B1）：可執行 gate。`--windows-com` 缺席、目錄無 `windows-com.json` 或任何驗證不符 → evidence-insufficient（整體 FAIL）；明示 `windows_com: FAIL` → FAIL。不再列為 BLOCKED-OWNER。
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ import base64
 import importlib.util
 import json
 import math
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -94,22 +96,40 @@ def _l15_row_na_only(row: dict[str, Any]) -> bool:
     )
 
 
-# 擁有者裁決延後的 L1.5 (案例, 平台) 能力缺口：該列只在 harness 明示「能力不可用」時改判 BLOCKED-OWNER（不是 PASS）。
-# OD-30 (2)：Windows transport disconnect（com0com 無斷線能力）套用 OD-27，release 後於接有真實 USB 序列硬體的安裝機實測。
-L15_OWNER_DEFERRED: dict[tuple[str, str], dict[str, str]] = {
+# 擁有者裁決延後的 L1.5 (案例, 平台) 缺口：該列只在登記的 verdict 且訊息完整符合登記型態時改判 BLOCKED-OWNER（不是 PASS）。
+# - OD-30 (2)：Windows transport disconnect（com0com 無斷線能力）套用 OD-27，release 後於接有真實 USB 序列硬體的安裝機實測。
+# - OD-31：ev-01 Windows 列的 shell handler 屬 SC-26（Rust slice 2.3），Python 基線 `/bin/sh -c` 於 Windows 不觸發；
+#   僅限「等待 ev-fired 檔案逾時」型態，其他失敗照判 FAIL。slice 2.3 的 Rust daemon 須在 Windows 原生把此列跑到 PASS。
+# - OD-32：sm-04 Windows 列無 by-id 連結、com0com 無拔除能力，比照 OD-30 (2)、套用 OD-27；僅限 SKIP `cap_missing:by_id_link`。
+# `pattern` 以 re.fullmatch 比對整個 message；列帶 `harness_stop_failed` 診斷時一律不延後（雲端審查 40ba293#1）。
+L15_OWNER_DEFERRED: dict[tuple[str, str], dict[str, Any]] = {
     ("l15-transport-disconnect", "windows"): {
         "decision": "OD-30",
-        "marker": "'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE",
+        "verdicts": ("FAIL", "INSUFFICIENT_EVIDENCE"),
+        "pattern": r".*'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE.*",
+    },
+    ("ev-01-spawn-handler", "windows"): {
+        "decision": "OD-31",
+        "verdicts": ("FAIL",),
+        "pattern": r"步驟 \d+: 等待檔案逾時 [0-9.]+s: [^\r\n]*[/\\]ev-fired",
+    },
+    ("sm-04-device-unplug", "windows"): {
+        "decision": "OD-32",
+        "verdicts": ("SKIP",),
+        "pattern": r"cap_missing:by_id_link",
     },
 }
 
 
 def _l15_row_owner_deferred(row: dict[str, Any]) -> bool:
-    """列屬擁有者延後的能力缺口：(案例, 平台) 已登記、verdict 非 PASS，且訊息含登記的能力不可用標記。"""
+    """列屬擁有者延後的缺口：(案例, 平台) 已登記、verdict 屬登記值、訊息完整符合登記型態，且無 harness 關閉失敗診斷。"""
     entry = L15_OWNER_DEFERRED.get((str(row.get("case_id")), str(row.get("platform"))))
-    if entry is None or row.get("verdict") == "PASS":
+    if entry is None or row.get("verdict") not in entry["verdicts"]:
         return False
-    return entry["marker"] in str(row.get("message") or "")
+    diagnostics = row.get("harness_diagnostics") or []
+    if any(isinstance(d, dict) and d.get("kind") == "harness_stop_failed" for d in diagnostics):
+        return False
+    return re.fullmatch(entry["pattern"], str(row.get("message") or ""), flags=re.DOTALL) is not None
 
 
 def _l15_case_status(rows: list[dict[str, Any]], platforms: list[str] | None = None) -> str:
@@ -124,7 +144,7 @@ def _l15_case_status(rows: list[dict[str, Any]], platforms: list[str] | None = N
     - 其餘列全部 PASS 且 gate_eligible，且至少一列 → PASS；否則 evidence-insufficient。
       例如 l15-wal-interference：POSIX 列僅缺 segment (c)（windows 專屬）時，必須由 Windows 列 PASS＋eligible 才成立。
     - `L15_OWNER_DEFERRED` 登記的 (案例, 平台) 列若僅因登記的能力不可用而未 PASS：該列不阻擋、也不計為 PASS；
-      其餘列依上列規則全部 PASS 時，案例為 BLOCKED-OWNER（S1X Y4，OD-30 (2)）。
+      其餘列依上列規則全部 PASS 時，案例為 BLOCKED-OWNER（S1X Y4，OD-30 (2)、OD-31、OD-32）。
     """
     if not rows:
         return "evidence-insufficient"
@@ -275,24 +295,25 @@ def _junit_totals(path: Path | None, count: Callable[[Path], dict[str, int]] | N
 
 
 def _pytest_exact_key(nodeid: str) -> str:
-    """凍結 pytest nodeid 的逐列對帳 key：模組檔名＋其後完整路徑（含類別與 `[param]`）。
+    """凍結 pytest nodeid 的逐列對帳 key：與 pytest junitxml `mangle_test_address` 同形的 `classname::name`。
 
-    與 `_normalize_case_id` 不同，不去除參數化 id：同一函式的 `[linux]`／`[windows]` 必須各自對帳，
-    不得合併成同一 key（S1X Y1）。目錄前綴一律丟棄（與 `_normalize_case_id` 的模組慣例一致）。
+    保留完整相對路徑（目錄段以 `.` 串接）、類別與 `[param]`：同一函式的 `[linux]`／`[windows]` 必須各自對帳（S1X Y1），
+    不同目錄下的同名模組也不得合併成同一 key（雲端審查 ead2028#1）。參數 id 內的 `::`／`.` 只留在 name 側。
     """
-    path, sep, rest = nodeid.partition("::")
-    if not sep:
+    base, bracket, params = nodeid.partition("[")
+    names = base.split("::")
+    if len(names) < 2:
         return nodeid
-    return f"{path.rsplit('/', 1)[-1]}::{rest}"
+    path = names[0].removeprefix("./")
+    if path.endswith(".py"):
+        path = path[:-3]
+    classname = ".".join([path.replace("/", "."), *names[1:-1]])
+    return f"{classname}::{names[-1]}{bracket}{params}"
 
 
 def _pytest_exact_key_from_junit(classname: str, name: str) -> str:
-    """JUnit testcase（classname＋name）→ `_pytest_exact_key` 同形 key；classname 須含 `test_*` 模組段。"""
-    parts = classname.split(".")
-    for idx, part in enumerate(parts):
-        if part.startswith("test_"):
-            return "::".join([f"{part}.py", *parts[idx + 1:], name])
-    return "::".join([p for p in (classname, name) if p])
+    """JUnit testcase（classname＋name）→ `_pytest_exact_key` 同形 key（classname 已是 pytest 的完整路徑 mangling）。"""
+    return f"{classname}::{name}" if classname else name
 
 
 def _pytest_junit_cases(path: Path | None, errors: list[str],

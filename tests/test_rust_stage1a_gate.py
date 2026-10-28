@@ -167,8 +167,10 @@ def _pytest_full_junit_xml(outcomes: dict[str, str] | None = None, *, subtests: 
     skipped = sum(1 for o in outcomes.values() if o == "skipped")
     cases = []
     for nid, outcome in outcomes.items():
-        classname, name = nid.split("::")
-        cls = "tests." + classname.replace("/", ".").removesuffix(".py")
+        # 與 pytest junitxml 的 mangle_test_address 同形：完整相對路徑（`/`→`.`、去 `.py`）＋類別段。
+        path, *rest = nid.partition("[")[0].split("::")
+        cls = ".".join([path.removesuffix(".py").replace("/", "."), *rest[:-1]])
+        name = rest[-1] + nid[len(nid.partition("[")[0]):]
         body = {"failed": '<failure message="x"/>', "skipped": '<skipped message="x"/>'}.get(outcome, "")
         cases.append(f'<testcase classname="{cls}" name="{name}">{body}</testcase>')
     n = len(outcomes) + subtests
@@ -2084,6 +2086,50 @@ def test_pytest_full_parametrized_missing_param_is_not_pass(tree):
     assert any(PYT_PARAM_WIN in r for r in row["reasons"]), row["reasons"]
 
 
+PYT_SAMEMOD_TOP = "tests/test_rust_samemod.py::test_same_name"
+PYT_SAMEMOD_SUB = "tests/contract_blackbox/test_rust_samemod.py::test_same_name"
+
+
+def test_pytest_exact_key_matches_pytest_junit_mangling():
+    """nodeid 與 pytest junitxml（mangle_test_address）的 classname＋name 必須得到同一 key，且保留目錄段。"""
+    gate = _load_gate_module()
+    samples = [
+        ("tests/contract_blackbox/test_x.py::TestA::test_y[a::b.c d]",
+         "tests.contract_blackbox.test_x.TestA", "test_y[a::b.c d]"),
+        ("tests/test_x.py::test_y", "tests.test_x", "test_y"),
+        ("tests/test_data/test_x.py::test_y[linux]", "tests.test_data.test_x", "test_y[linux]"),
+    ]
+    for nodeid, classname, name in samples:
+        assert gate._pytest_exact_key(nodeid) == gate._pytest_exact_key_from_junit(classname, name), nodeid
+    assert gate._pytest_exact_key(PYT_SAMEMOD_TOP) != gate._pytest_exact_key(PYT_SAMEMOD_SUB)
+
+
+def test_pytest_full_same_module_name_in_other_dir_cannot_fill_in(tree):
+    """不同目錄的同名模組：JUnit 只有其中一個 passed → 缺席者不得由另一個補位成 PASS（雲端審查 ead2028#1）。"""
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_SAMEMOD_TOP, PYT_SAMEMOD_SUB])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    present = {n: "passed" for n in nodes if n != PYT_SAMEMOD_SUB}
+    present["tests/test_rust_other_fixture.py::test_filler"] = "passed"
+    tree.pytest_junit_xml = _pytest_full_junit_xml(present)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(PYT_SAMEMOD_SUB in r for r in row["reasons"]), row["reasons"]
+
+
+def test_pytest_full_same_module_name_in_two_dirs_both_present_is_pass(tree):
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_SAMEMOD_TOP, PYT_SAMEMOD_SUB])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({n: "passed" for n in nodes})
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "PASS", row
+
+
 # --- OD-30 (2)：Windows transport disconnect 能力缺失 → BLOCKED-OWNER（S1X Y4，CHG-S1X-GATE-OD30-TRANSPORT-01）---
 
 TD_CID = "l15-transport-disconnect"
@@ -2150,4 +2196,128 @@ def test_od30_case_row_blocked_owner_keeps_overall_implemented(tree):
     _, rep = tree.run()
     row = _case_row(rep, TD_CID)
     assert row["status"] == "BLOCKED-OWNER", row
+    assert rep["overall"] == "IMPLEMENTED", rep["errors"]
+
+
+def test_od30_capability_missing_with_harness_stop_failed_is_not_deferred():
+    """能力缺失＋harness 關閉失敗 → 不得藏進 BLOCKED-OWNER（雲端審查 40ba293#1）。"""
+    gate = _load_gate_module()
+    diag = [{"kind": "harness_stop_failed", "error": "daemon 未確認結束"}]
+    win = {**_TD_WIN_CAP, "harness_diagnostics": diag}
+    # 列本身 verdict FAIL → 照原規則 FAIL；verdict INSUFFICIENT_EVIDENCE → 證據不足；兩者皆不得改判 BLOCKED-OWNER。
+    assert gate._l15_case_status(_td_rows(_TD_PASS, win), ["linux", "windows"]) == "FAIL"
+    win_ins = {**win, "verdict": "INSUFFICIENT_EVIDENCE"}
+    assert gate._l15_case_status(_td_rows(_TD_PASS, win_ins), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od30_capability_marker_on_pass_or_skip_verdict_is_not_deferred():
+    """延後只適用登記的 verdict（OD-30：FAIL／INSUFFICIENT_EVIDENCE）；SKIP 帶同訊息不得延後。"""
+    gate = _load_gate_module()
+    win_skip = {"verdict": "SKIP", "gate_eligible": False, "message": _TD_CAP_MISSING}
+    assert gate._l15_case_status(_td_rows(_TD_PASS, win_skip), ["linux", "windows"]) == "evidence-insufficient"
+
+
+# --- OD-31：ev-01-spawn-handler Windows 列 handler 未觸發 → BLOCKED-OWNER（CHG-S1X-GATE-OD31-OD32-01）---
+
+EV_CID = "ev-01-spawn-handler"
+_EV_WIN_NOT_FIRED = {
+    "verdict": "FAIL", "gate_eligible": False,
+    "message": "步驟 7: 等待檔案逾時 8s: C:\\Users\\x\\AppData\\Local\\Temp\\sw-rust-test\\r\\tmp\\sw-func-abc/ev-fired",
+}
+
+
+def _ev_rows(linux: dict[str, Any] | None, windows: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows = []
+    if linux is not None:
+        rows.append({"case_id": EV_CID, "platform": "linux", **linux})
+    if windows is not None:
+        rows.append({"case_id": EV_CID, "platform": "windows", **windows})
+    return rows
+
+
+def test_od31_windows_handler_not_fired_is_blocked_owner():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_ev_rows(_TD_PASS, _EV_WIN_NOT_FIRED), ["linux", "windows"]) == "BLOCKED-OWNER"
+
+
+def test_od31_linux_failure_still_fails():
+    gate = _load_gate_module()
+    lin_fail = {**_EV_WIN_NOT_FIRED}
+    assert gate._l15_case_status(_ev_rows(lin_fail, _EV_WIN_NOT_FIRED), ["linux", "windows"]) == "FAIL"
+
+
+def test_od31_linux_row_missing_is_evidence_insufficient():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_ev_rows(None, _EV_WIN_NOT_FIRED), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od31_windows_other_failure_still_fails():
+    """Windows 列其他失敗型態（非 ev-fired 等待逾時，例如規則載入失敗、其他檔案逾時）照判 FAIL。"""
+    gate = _load_gate_module()
+    for msg in (
+        "步驟 4: cli event add 失敗: rc=1",
+        "步驟 7: 等待檔案逾時 8s: C:\\tmp\\sw-func-abc/ev-rule.json",
+        "步驟 7: 等待檔案逾時 8s: C:\\tmp\\sw-func-abc/ev-fired.bak",
+    ):
+        other = {"verdict": "FAIL", "gate_eligible": False, "message": msg}
+        assert gate._l15_case_status(_ev_rows(_TD_PASS, other), ["linux", "windows"]) == "FAIL", msg
+
+
+def test_od31_windows_not_fired_with_harness_stop_failed_is_not_deferred():
+    gate = _load_gate_module()
+    win = {**_EV_WIN_NOT_FIRED, "harness_diagnostics": [{"kind": "harness_stop_failed", "error": "x"}]}
+    assert gate._l15_case_status(_ev_rows(_TD_PASS, win), ["linux", "windows"]) == "FAIL"
+
+
+def test_od31_windows_pass_is_pass():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_ev_rows(_TD_PASS, _TD_PASS), ["linux", "windows"]) == "PASS"
+
+
+# --- OD-32：sm-04-device-unplug Windows 列 cap_missing:by_id_link SKIP → BLOCKED-OWNER ---
+
+SM_CID = "sm-04-device-unplug"
+_SM_WIN_SKIP = {"verdict": "SKIP", "gate_eligible": False, "message": "cap_missing:by_id_link"}
+
+
+def _sm_rows(linux: dict[str, Any] | None, windows: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows = []
+    if linux is not None:
+        rows.append({"case_id": SM_CID, "platform": "linux", **linux})
+    if windows is not None:
+        rows.append({"case_id": SM_CID, "platform": "windows", **windows})
+    return rows
+
+
+def test_od32_windows_by_id_link_skip_is_blocked_owner():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_sm_rows(_TD_PASS, _SM_WIN_SKIP), ["linux", "windows"]) == "BLOCKED-OWNER"
+
+
+def test_od32_linux_failure_or_skip_still_blocks():
+    gate = _load_gate_module()
+    lin_fail = {"verdict": "FAIL", "gate_eligible": False, "message": "x"}
+    assert gate._l15_case_status(_sm_rows(lin_fail, _SM_WIN_SKIP), ["linux", "windows"]) == "FAIL"
+    assert gate._l15_case_status(_sm_rows(_SM_WIN_SKIP, _SM_WIN_SKIP), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od32_windows_other_failure_or_skip_reason_not_deferred():
+    gate = _load_gate_module()
+    other_skip = {"verdict": "SKIP", "gate_eligible": False, "message": "cap_missing:transport_disconnect"}
+    assert gate._l15_case_status(_sm_rows(_TD_PASS, other_skip), ["linux", "windows"]) == "evidence-insufficient"
+    fail = {"verdict": "FAIL", "gate_eligible": False, "message": "cap_missing:by_id_link"}
+    assert gate._l15_case_status(_sm_rows(_TD_PASS, fail), ["linux", "windows"]) == "FAIL"
+
+
+def test_od31_od32_case_rows_blocked_owner_keep_overall_implemented(tree):
+    tree.cases.append({"case_id": EV_CID, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.cases.append({"case_id": SM_CID, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, EV_CID, SM_CID, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": EV_CID, **_TD_PASS}, {"case_id": SM_CID, **_TD_PASS}]}),
+        ("windows", {"results": [{"case_id": EV_CID, **_EV_WIN_NOT_FIRED}, {"case_id": SM_CID, **_SM_WIN_SKIP}]}),
+    ]
+    _, rep = tree.run()
+    assert _case_row(rep, EV_CID)["status"] == "BLOCKED-OWNER", _case_row(rep, EV_CID)
+    assert _case_row(rep, SM_CID)["status"] == "BLOCKED-OWNER", _case_row(rep, SM_CID)
     assert rep["overall"] == "IMPLEMENTED", rep["errors"]
