@@ -22,6 +22,7 @@ description: 透過 serialwrap broker + CLI 進行多 agent UART 存取，提供
 
 ## 前置條件
 - `serialwrapd` 必須啟動（`serialwrap daemon status` 確認）。
+- daemon 跑的要是目前安裝的那份程式碼：`serialwrap --version` 印 `0.3.2 (code <12 碼>)`，`daemon status` 的 `code_fingerprint` 是 daemon 啟動時載入的那份（`code_path` 為其安裝位置）；兩者不同、或任何指令的 stderr 出現「client 程式碼 … 與 daemon 程式碼 … 不一致」，代表升級後 daemon 還在跑舊碼——先 `serialwrap service restart`（on-demand 模式：`daemon stop` 後 `daemon start`）再繼續，別靠檔案時間猜。版本字串（如 `0.3.2`）在 release／分支 build 間相同，不能拿來判斷。
 - 目標 session 必須是 `READY`（或對 console-only profile 為 `ATTACHED`，見下方 command_capable）。
 - profile 與 target 已綁定（`session bind` + `session attach` 至少完成一次）。
 

@@ -628,6 +628,56 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 
 詳見設計文件：[`docs/design-file-transfer.md`](./design-file-transfer.md)。
 
+### 8.7 程式碼指紋與升級後 daemon 換新碼（build fingerprint）
+
+**根因**：版本字串只來自 `VERSION`，release、分支 build、main 全印同一個 `0.3.2`；而
+`pipx install --force` 之後 `serialwrap setup` 的同模式刷新只重寫 unit／`daemon-reload`／
+`enable`、從不 `start`，模式轉換送的 `systemctl start` 在服務已 active 時也是 no-op——
+正在跑的 daemon 靜默沿用舊碼，外面看不出來，也無從用版本比對抓到。
+
+**指紋定義**（`sw_core/version.py` 的 `compute_code_fingerprint()`）：對 `sw_core/**/*.py`
+（含 `event_engine`、`assets/__init__.py`）依相對路徑排序後，逐檔把「相對路徑、長度、內容」
+餵進 sha256，取前 12 碼十六進位。不含 `sw_core/assets/` 下的 skill／profile／shell wrapper
+（改文件或範本不需重啟 daemon，納入只會製造假警報）、不含 `__pycache__`、不含 `VERSION`
+（版本另有比對）。wheel 安裝與 git checkout 讀到相同的 `.py` 位元組，所以同一個 commit 在兩處
+指紋一致。找不到任何 `.py`（PyInstaller 凍結包）或有檔案讀不到時為 `None`，一律視為「無從
+比對」而靜默略過、不當作不一致。
+
+**三個 surface**：
+
+- **daemon**：`SerialwrapService` 建立時算一次、常駐（代表「daemon 啟動當下載入的程式碼」）。
+  `health.status`（`daemon status`）回 `code_fingerprint` 與 `code_path`（daemon 載入的
+  `sw_core` 目錄）；`rpc()` wrapper 對**每個** RPC 回應 `setdefault` 帶 `code_fingerprint`
+  （與 #154 的 `version` 同機制，不逐一 handler 加），算不出時略過該欄位。
+- **CLI `--version`**：印 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`；只在被問 `--version` 時才
+  算（argparse 自訂 action，一般子命令不為它多讀一次原始碼）。
+- **client↔daemon 比對**（`cli._warn_version_mismatch`）：版本字串不同 → 既有的版本警告
+  （只印這一行）；版本相同但 `code_fingerprint` 不同 → stderr 一行
+  `serialwrap: client 程式碼 X 與 daemon 程式碼 Y 不一致…請執行 serialwrap service restart`。
+  只寫 stderr、exit code 與 stdout JSON 不變。daemon 回應無此欄位（舊 build）或 client 算不出
+  指紋時靜默。
+- **`doctor` 的 `daemon_code_current`**（advisory）：以 `health.ping` 取 daemon 指紋與本行程
+  比對；daemon 沒回報 `code_fingerprint` 視為舊 build（不一致）；daemon 連不上或本行程算不出
+  指紋 → informational ok。
+
+**`serialwrap setup` 的行為**（`cli._run_setup` + `setup_cmd.reconcile(restart_daemon=…)`）：
+以既有的 `health.ping` 探測回應取 daemon 指紋（不多一次 RPC），與本行程（＝剛安裝的版本）比對：
+
+| 情境 | 動作 |
+|---|---|
+| daemon 連不上 | 同過去，輸出不含 `daemon_code` |
+| 指紋相同 | 不重啟（`daemon_code.action = "none"`，連 `is-active` 都不查） |
+| 不同／daemon 不回報指紋，同模式 systemd-user／systemd-system，服務 `is-active` | 刷新 unit 後 `systemctl [--user] restart serialwrap`（system scope 為 `sudo systemctl restart`，未帶 `--with-sudo` 時只列入 `pending_sudo`），再輪詢 `health.ping` 核對指紋，`daemon_code.after` 為 `match`／`mismatch`／`unreachable` |
+| 同上但服務非 active（daemon 是手動 start 的） | 不動，`action = "service_inactive"` 並附提示 |
+| 模式轉換 | 轉換本來就停舊起新，不另補 restart（`action = "mode_transition"`） |
+| on-demand | 不自動停 daemon，`action = "manual_restart"` 並提示 `daemon stop`／`daemon start` |
+| flash 進行中（含 `--force`） | 不重啟，`action = "skipped_flashing"` |
+| `--no-restart` | 不重啟，`action = "skipped_no_restart_flag"` |
+
+`daemon_code.after = "mismatch"` 代表重啟了但 unit 的 ExecStart 指向的不是這份安裝（例如從 checkout
+跑 `./serialwrap setup`），setup 會在 stderr 明講，不回報成功。注意此處與 `ensure_wsl_systemd`
+回傳的 `needs_restart` 無關——那個是「須在 Windows 端 `wsl --shutdown` 讓 systemd 生效」。
+
 ## 11. Public Interface
 
 ### 11.1 CLI

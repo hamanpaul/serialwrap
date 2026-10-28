@@ -21,6 +21,10 @@ TBD - created by archiving change install-flow-systemd-pipx. Update Purpose afte
 - **WHEN** 重跑 `setup` 且解析出的模式與 `config.yaml` 記錄相同
 - **THEN** 冪等刷新（重物化資產、確保 unit enabled），不拆既有 daemon
 
+#### Scenario: 同模式刷新時 daemon 載入的是舊碼
+- **WHEN** 同模式（systemd-user／systemd-system）重跑 `setup`，systemd 服務為 active，且正在跑的 daemon 回報的 `code_fingerprint` 與剛安裝的程式碼不同（或 daemon 完全不回報該欄位）
+- **THEN** 刷新 unit 後 restart 服務讓 daemon 載入新碼，並輸出 `daemon_code`（`action`、重啟後核對結果 `after`）；指紋相同、daemon 連不上、服務非 active、flash 進行中、帶 `--no-restart`、或 on-demand 模式時不重啟；system scope 未帶 `--with-sudo` 時只把 restart 指令列入 `pending_sudo`
+
 #### Scenario: on-demand → systemd 轉換
 - **WHEN** 舊為 on-demand、目標為 systemd 重跑 `setup`
 - **THEN** 先停掉 on-demand daemon 釋放 `/dev/ttyUSB*`、（必要時）遷移 state、再裝/enable unit，最後驗證單一 daemon（無 two-reader）
@@ -51,7 +55,7 @@ TBD - created by archiving change install-flow-systemd-pipx. Update Purpose afte
 
 #### Scenario: 診斷輸出
 - **WHEN** 執行 `serialwrap doctor`
-- **THEN** 逐項回報 python 版本／PyYAML／`serialwrap`+`serialwrapd` 在 PATH／dialout 成員／human console 就緒組（`serialwrap-minicom`／`jq`／`minicom` 是否在 PATH，advisory，#149）／systemd 與 unit 狀態／`supervision_mode`／socket 可連／`/dev/serial/by-id` 裝置／（WSL）systemd 旗標，並對失敗項印修復指令
+- **THEN** 逐項回報 python 版本／PyYAML／`serialwrap`+`serialwrapd` 在 PATH／dialout 成員／human console 就緒組（`serialwrap-minicom`／`jq`／`minicom` 是否在 PATH，advisory，#149）／systemd 與 unit 狀態／`supervision_mode`／socket 可連／daemon 載入的程式碼是否為目前安裝的那份（`daemon_code_current`，advisory）／`/dev/serial/by-id` 裝置／（WSL）systemd 旗標，並對失敗項印修復指令
 
 ### Requirement: legacy ~/.paul_tools 遷移
 `setup` SHALL 偵測既有 `~/.paul_tools` 安裝並引導退役（停 legacy daemon、備份移除影子 `serialwrap`/`serialwrapd.py`/`minicom` symlink、提示移除 `PATH` 行）。

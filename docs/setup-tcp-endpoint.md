@@ -30,7 +30,11 @@ serialwrap setup --on-demand
   經該設定送到 TCP daemon；這是原有行為，本次沒有修復。遠端客戶端不要
   用不帶模式旗標的安裝流程來假設「只刷新資產」。
 - **systemd-user／systemd-system 刷新**：延續本機 unit 的 socket 契約，
-  不把 TCP client 設定與本機 daemon 的 endpoint 回寫混用。
+  不把 TCP client 設定與本機 daemon 的 endpoint 回寫混用。與上面的 on-demand
+  同模式刷新不同：服務 active 且 daemon 載入的程式碼指紋與剛安裝的不同時
+  （例如 `pipx install --force` 之後），setup 會 restart 服務讓 daemon 換新碼，
+  `--no-restart` 可略過；on-demand 不受影響，詳見
+  [serialwrap-spec §8.7](serialwrap-spec.md)。
 - **win backend**：不套用 POSIX 保存例外；測試只覆蓋此排除分支，並非
   Windows 原生端到端驗證。
 - **Unix、缺值或無法解析的 endpoint**：仍寫本機預設；本次不是保存所有
