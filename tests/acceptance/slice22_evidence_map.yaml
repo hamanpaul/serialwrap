@@ -21,7 +21,7 @@ cases:
     tests: ['tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke']
   co-01-line-buffering:
     status: AUTOMATED
-    tests: [func-test/runner.py -c co-01-line-buffering]
+    tests: [func-test/runner.py --case co-01-line-buffering]
   f1-cmdid-survives-timeout:
     blocked_item: BO-S21-07
     evidence_schema: &id001 [testpilot 原始結果（regression-reports/tp-<ts>/）, 外層 envelope（§11.4）, case_verdicts.json]
@@ -159,22 +159,22 @@ cases:
     status: BLOCKED-OWNER
   ha-01-human-then-agent:
     status: AUTOMATED
-    tests: [func-test/runner.py -c ha-01-human-then-agent]
+    tests: [func-test/runner.py --case ha-01-human-then-agent]
   ha-05-concurrent-submit:
     status: AUTOMATED
-    tests: [func-test/runner.py -c ha-05-concurrent-submit]
+    tests: [func-test/runner.py --case ha-05-concurrent-submit]
   hk-01-special-keys-raw:
     status: AUTOMATED
-    tests: [func-test/runner.py -c hk-01-special-keys-raw]
+    tests: [func-test/runner.py --case hk-01-special-keys-raw]
   hk-02-agent-preempt-human:
     status: AUTOMATED
-    tests: [func-test/runner.py -c hk-02-agent-preempt-human]
+    tests: [func-test/runner.py --case hk-02-agent-preempt-human]
   hk-03-deferred-input-flush:
     status: AUTOMATED
-    tests: [func-test/runner.py -c hk-03-deferred-input-flush]
+    tests: [func-test/runner.py --case hk-03-deferred-input-flush]
   hk-04-minicom-exit-cleanup:
     status: AUTOMATED
-    tests: [func-test/runner.py -c hk-04-minicom-exit-cleanup]
+    tests: [func-test/runner.py --case hk-04-minicom-exit-cleanup]
   l15-context-switch-deferred-input:
     status: AUTOMATED
     tests: [func-test/runner.py --mode bridge --scenarios --case l15-context-switch-deferred-input]
@@ -332,7 +332,7 @@ cases:
     status: BLOCKED-OWNER
   rc-01-interactive-mode-switch:
     status: AUTOMATED
-    tests: [func-test/runner.py -c rc-01-interactive-mode-switch]
+    tests: [func-test/runner.py --case rc-01-interactive-mode-switch]
   sc13-lease-expiry-tick:
     status: AUTOMATED
     tests: ['tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access', 'crates/sw-core/tests/session_core_lease.rs::open_state_matrix']
@@ -355,10 +355,10 @@ cases:
     tests: ['tests/contract_blackbox/slice22/test_console_bc02.py::test_input_during_recovery_not_replayed']
   sm-01-attach-to-ready:
     status: AUTOMATED
-    tests: [func-test/runner.py -c sm-01-attach-to-ready]
+    tests: [func-test/runner.py --case sm-01-attach-to-ready]
   sm-04-device-unplug:
     status: AUTOMATED
-    tests: [func-test/runner.py -c sm-04-device-unplug]
+    tests: [func-test/runner.py --case sm-04-device-unplug]
   win-com-cancel-close:
     blocked_item: BO-S21-13
     evidence_schema: [l1-results.json, junit.xml]

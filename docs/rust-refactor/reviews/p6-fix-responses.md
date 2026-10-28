@@ -334,3 +334,12 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 | Task 11 | slice22 黑箱：Python 38 passed／8 skipped、Rust（合併後 debug artifact）46 passed。`f4_interactive_line_cmd_defined` 仍 BLOCKED-OWNER（parity 判定，見上）；func-test 八案依 OD-34 改為七案（cowork-01 移 2.3）。func-test／L1.5 `l15-multi-source-contention-console` 本輪重跑結果見本輪回報 |
 | Task 12 | LOCAL-WINDOWS-TODO（WSAPoll mux、com0com Serial console、`windows_console_native.rs`、`win-blackbox.ps1 -Subset console`）；本輪只補 Linux 可寫的程序文件 `procedures/windows-serial-console.md` |
 | Task 13 | `slice22_evidence_map.yaml` 94 案填妥（AUTOMATED 32：contract-blackbox 的 .py／.rs nodeid 皆在 `s22_gate:*`，func-test／scenario 參照待 `--l15-results`；BLOCKED-OWNER 62：BO-S22-01～05 與繼承的 BO-S21-07／08／13／14／16）；`tests/test_acceptance_slice22.py` 7 案（計畫 `_fn_exists` 對 func-test 參照會讀不存在路徑，分流為驗 case／scenario YAML 存在）；`s22_gate:blackbox_rust/linux` 登記 46 nodeid（selector 依 Step 4：slice21＋slice22 兩目錄，只要求 slice22 的 nodeid，slice21 不退步由 P5 `s21_gate:blackbox_rust` 承接）。未做：`s22_gate:win_test/windows`（需 Windows 報告，LOCAL-WINDOWS-TODO）、對照表 `parity_rows`（23 列承接編號逐列驗證尚未完成，gate 依規則回 OWNER-DECISION-PENDING）、SC-28／29／31 `IMPLEMENTED`（依計畫須 Step 4 全通過含 win-test） |
+
+### 第三輪 Task 11 Step 4 重跑（Rust debug artifact，合併後 416fffd＋本 commit）
+
+- func-test：`runner.py` 的 `-c` 是 `--category`，計畫 07 Task 11 Step 4 的 `runner.py -c <case>` 實際「找不到符合條件的測試案例」
+  （rc=1）；改用 `--case <id>`，對照表參照同步改為 `func-test/runner.py --case <id>`。請計畫擁有者修正 07 L137／L160 的命令。
+- `--case` 結果：co-01、ha-01、hk-01、hk-02、hk-03、rc-01 PASS；hk-04 首次 FAIL（`ATTACH_FAILED:DeviceHeldError`，同時有被中斷的
+  全套 pytest 洩漏的 throwaway daemon 持有 PTY），清除後同範圍連跑兩次皆 PASS；cowork-01（OD-34 已移 2.3）仍 FAIL（步驟 4
+  wait_ready 40 s 逾時，與上輪相同，P5 救援／reprobe 上游缺口）。
+- L1.5 `l15-multi-source-contention-console`（`--mode bridge --scenarios --case`）連跑兩次 PASS；`tests/test_human_agent_coexist.py` 對 Rust 8/8。
