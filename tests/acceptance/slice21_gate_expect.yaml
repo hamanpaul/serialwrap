@@ -44,7 +44,7 @@ sections:
 # 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
 pending_decisions:
   - id: PA-OD-1
-    scenario: SC-37 候選（daemon 端 backend env 強制非原生後端 → exit 1）與「只可新增、不可修改」原則適用範圍（parity #6／#71）
+    scenario: SC-37（daemon 端 backend env 強制非原生後端 → exit 1）與「只可新增、不可修改」原則（parity #6／#71）；OD-21 已核准 SC-37，待寫入 contracts/behavior_changes.yaml 後解除
     evidence: "origin/docs/parity-amendments:docs/rust-refactor/plans/parity-amendments-2026-10-26.md#pa-od-1"
   - id: NC-P5-02
     scenario: 承接率斷路器窗口採單一固定窗口；「連續三週內」滾動解讀待擁有者確認（Task 0b）

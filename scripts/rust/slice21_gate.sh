@@ -225,9 +225,10 @@ pytest_l1() {  # pytest_l1 <section> <log> <env…> -- <pytest 參數…>：帶 
 pytest_l1 blackbox_python blackbox_python -- -q tests/contract_blackbox/slice21 -m cap_posix_pty
 record blackbox_python --required-set s21_gate:blackbox_python --command "pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty（Python）" \
   --exit "$LAST_RC" --log logs/blackbox_python.log --l1-results blackbox_python/l1-results.json
-pytest_l1 blackbox_rust blackbox_rust SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_AB_LABEL=rust-s21 -- \
+# Rust 標籤須以 ELF CLI 執行（contract_blackbox conftest 的 artifact 身分檢查；第三輪 gate 實跑 46/46 因此 fail）。
+pytest_l1 blackbox_rust blackbox_rust SERIALWRAP_CLI_EXE="$RUST_CLI" SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_AB_LABEL=rust-s21 -- \
   -q tests/contract_blackbox/slice21 -m cap_posix_pty
-record blackbox_rust --required-set s21_gate:blackbox_rust --command "SERIALWRAP_DAEMON_EXE=<rust> pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty" \
+record blackbox_rust --required-set s21_gate:blackbox_rust --command "SERIALWRAP_CLI_EXE=<rust cli> SERIALWRAP_DAEMON_EXE=<rust> pytest -q tests/contract_blackbox/slice21 -m cap_posix_pty" \
   --exit "$LAST_RC" --log logs/blackbox_rust.log --l1-results blackbox_rust/l1-results.json
 
 # 8. Task 20 既有套件改指 Rust（兩條 pytest 合併為一次收集＋三次單 case runner）

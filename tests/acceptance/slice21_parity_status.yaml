@@ -27,7 +27,7 @@ rows:
   - id: "#4"
     status: PASS
     tests: ["cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
-  - {id: "#6", status: OWNER-DECISION-PENDING, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
+  - {id: "#6", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
   - id: "#11"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
@@ -167,7 +167,7 @@ rows:
   - id: "#69"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::ready_unconfirmed_response_has_session_field"]
-  - {id: "#71", status: OWNER-DECISION-PENDING, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
+  - {id: "#71", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
   - {id: "#72", status: INCOMPLETE, reason: "Rust sigterm_sigint_orderly_stop 已建立並登記 s21_core；windows_console_ctrl_triggers_orderly_stop（LOCAL-WINDOWS-TODO）與 Python test_sigterm_orderly_shutdown_posix 尚未建立"}
   - id: "#73"
     status: PASS

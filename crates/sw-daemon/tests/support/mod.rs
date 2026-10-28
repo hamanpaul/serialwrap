@@ -20,6 +20,10 @@ use sw_proto::pyjson::{self, PyValue};
 
 pub use sw_daemon::daemon_main::{run_with_hooks, DaemonHooks, TraceEvent};
 
+#[path = "../common/mod.rs"]
+mod common;
+pub use common::data_root;
+
 /// P5-T18：`dispatch.rs` 的 `ServiceRig` 與 `deferred_methods`（追加，不改既有支援碼）。
 mod service_rig;
 pub use service_rig::*;
@@ -289,9 +293,8 @@ ft.stop()
 
 impl FakeTargetProc {
     fn start(workdir: &Path, by_id_dir: &Path, name: &str) -> (FakeTargetProc, PathBuf) {
-        let lib = std::env::current_dir()
-            .expect("測試 cwd")
-            .join("../../tests/contract_blackbox");
+        // 以 repo 根目錄定位（不依賴 cwd：`cargo_l1_results.py` 等 runner 不在 crate 目錄執行測試 binary）。
+        let lib = data_root().join("tests/contract_blackbox");
         let mut child = Command::new("python3")
             .arg("-I")
             .arg("-c")
@@ -548,6 +551,8 @@ pub fn wait_ready(env: &IsolatedEnv, com: &str) {
 /// 只用於失敗訊息的診斷：`/proc` 不存在或不可讀時回空清單，不影響判定。
 pub fn path_holders(path: &Path) -> Vec<(u32, String)> {
     let me = std::process::id();
+    // fd 的 readlink 為實體路徑：傳入 symlink（例如 by-id）時先解析（審查 7af6567_9b81d9a #3）。
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = Vec::new();
     let Ok(procs) = fs::read_dir("/proc") else {
         return out;
@@ -861,9 +866,9 @@ pub mod serde_free {
         pub first_close_bytes: usize,
     }
 
-    /// 由目前工作目錄往上找 repo 相對路徑 `rel`（cargo test 的 cwd 為 crate 目錄）。
+    /// 由 crate 目錄往上找 repo 相對路徑 `rel`（不依賴 cwd，理由同 `FakeTargetProc::start`）。
     pub fn repo_file(rel: &str) -> PathBuf {
-        let mut dir = std::env::current_dir().expect("current_dir");
+        let mut dir = super::data_root();
         loop {
             let candidate = dir.join(rel);
             if candidate.is_file() {
