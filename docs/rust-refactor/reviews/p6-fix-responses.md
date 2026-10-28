@@ -343,3 +343,14 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
   全套 pytest 洩漏的 throwaway daemon 持有 PTY），清除後同範圍連跑兩次皆 PASS；cowork-01（OD-34 已移 2.3）仍 FAIL（步驟 4
   wait_ready 40 s 逾時，與上輪相同，P5 救援／reprobe 上游缺口）。
 - L1.5 `l15-multi-source-contention-console`（`--mode bridge --scenarios --case`）連跑兩次 PASS；`tests/test_human_agent_coexist.py` 對 Rust 8/8。
+
+### 第三輪全套 pytest（起點 d6e3b3c 基準 vs 本輪 HEAD）
+
+起點：56 failed／4769 passed／147 skipped；本輪：26 failed／5515 passed／238 skipped（同一 Python 3.12 環境、root、無 pyserial）。
+起點失敗中 34 項本輪通過（主線／P5 帶入的校準、gate judge、cli_mgmt 等）。超出基準的 4 項，皆同範圍連跑兩次仍失敗（確定性）：
+
+| 測試 | 原因 | 處理 |
+|---|---|---|
+| `test_slice21_case_freeze.py::test_freeze_case_fingerprints_match_current_cases[2.1／2.2]` | 主線改 `l15-release-inflight` 文字欄 | BLOCKED-OWNER（見合併表） |
+| `test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests` | 主線 OD-24 測試禁止 cargo 凍結集合含 `#[ignore]` 列；P5 `s21_core` 與 P6 `s22_gate:console_conformance_pty`（計畫 07 Task 13 Step 4 以 `--include-ignored cap_posix_pty__` 執行的 7 列）皆命中 | BLOCKED-OWNER：OD-24 與 07 Task 13 的 cap 集合設計衝突；移除須擁有者以 `--allow-removal` 逐名裁決（或裁定 `--include-ignored` selector 的集合豁免），P6 不自行移除 |
+| `test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread` | 主線新測試（4ad9b39）預期 PermissionError，root 下不會發生 | 環境（root），與 P6 無關；非 root 環境應重跑確認 |
