@@ -5758,7 +5758,11 @@ class SessionManager:
                 # 只在移除這個明確控制字元後，首行確實以完整命令結尾時才剝除；
                 # 一般單行 stdout 不因忽略空白而取得回顯資格。
                 if lines is original_lines and " \r" in text:
-                    candidate_text = text.replace(" \r", "", 1)
+                    # 控制字元只從第一個換行前的回顯區段移除，支援多次折行且不改寫 stdout。
+                    echo_end = text.find("\n")
+                    if echo_end < 0:
+                        echo_end = len(text)
+                    candidate_text = text[:echo_end].replace(" \r", "") + text[echo_end:]
                     candidate_cleaned = clean_text(candidate_text)
                     candidate_prompt_start = self._last_prompt_start(candidate_cleaned, prompt_regex)
                     candidate_completion = (

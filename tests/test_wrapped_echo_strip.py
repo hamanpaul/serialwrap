@@ -40,6 +40,17 @@ class TestWrappedEchoStrip(unittest.TestCase):
         raw = CMD96[:79] + " \r" + CMD96[79:] + "\r\nOUT\r\n" + PROMPT
         self.assertEqual(_extract(raw, CMD96), "OUT")
 
+    def _assert_readline_wraps_stripped(self, cuts: tuple[int, ...]) -> None:
+        parts = [CMD200[start:end] for start, end in zip((0, *cuts), (*cuts, len(CMD200)))]
+        raw = " \r".join(parts) + "\r\nOUT\r\n" + PROMPT
+        self.assertEqual(_extract(raw, CMD200), "OUT")
+
+    def test_two_readline_space_wraps_are_stripped(self) -> None:
+        self._assert_readline_wraps_stripped((79, 159))
+
+    def test_three_readline_space_wraps_are_stripped(self) -> None:
+        self._assert_readline_wraps_stripped((50, 100, 150))
+
     def test_prompt_prefix_on_first_echo_line(self) -> None:
         raw = PROMPT + CMD96[:65] + "\r\r\n" + CMD96[65:] + "\r\nOUT\r\n" + PROMPT
         self.assertEqual(_extract(raw, CMD96), "OUT")
