@@ -11,9 +11,7 @@ permissions:
   contents: read
 jobs:
   native-html:
-    # 釘 ubuntu-24.04：ubuntu-latest 已指向 26.04，釘住的 playwright 1.51 不支援在其上
-    # 安裝 chromium 相依（`Playwright does not support chromium on ubuntu26.04-x64`）。
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
