@@ -2263,6 +2263,8 @@ impl sw_core::event_engine::BridgeQueries for SessionManager { /* known_coms, pr
 
 **P7 修訂（實作，2026-10-27）：** 不在 06 `ReaderCtx`／`IoWorkerArgs` 加欄位（P5 測試以 struct literal 建構），改為 `spawn_reader_observed`／`IoWorker::start_observed` 另傳觀察者清單；`SessionManager::add_rx_observer`（Python 同名）於 bootstrap 前註冊、每個 session bridge 的 reader 建立時取快照。`foreground_busy` 由 SessionCore 於每個事件後（值改變時）發布到 `FenceState.foreground_busy`，`BridgeQueries::active_cmd_id_for` 讀 fence 不經 mailbox。CaptureObserver 屬 Task 10，尚未注入。停止序不新增 `EngineCloseIntake`／`EngineStop` trace（P5 `daemon_process` 鎖定停機 trace 末 6 筆），改以行為測試（`event_lifecycle.rs`）驗證；`slice21_scope.yaml` 的 event.* 退役與 06 T18／T20 測試的延後數同步於本 commit。
 
+**P7 修訂（審查 01c474c_a0cad06 0722f75-1／-2，2026-10-28）：** 表列 `shutdown_closes_event_intake_before_drain` 以 `shutdown_closes_event_intake_before_drain_behavior` 承接（R1-F2，修正前必 FAIL 已實證：移除 `daemon_main.rs` drain 前的 `engine.close_intake()` → 50 筆積壓於 drain 期間被處理而紅）。drain 一開始 reader 即停止，drain 期間不會再有 RX 進 matcher，可觀測差異只在停機當下 matcher 佇列的積壓：子行程中以 `WatcherStopped` hook 關閉 events log append 閘門、注入 50 行命中規則的 RX 並等其落 WAL，800 ms 後放閘；writer 以 BlockForever 卡住使 drain 撐到 5 s 期限；斷言積壓 `match_recorded` ≤ 1 筆（matcher 卡在第一筆寫入）。`shutdown_aborts_long_handler_within_budget` 改為子行程執行：斷言 stderr 含 `event dispatcher shutdown 逾時，終止 1 個 handler`、exit 0（失敗時附 `shutdown incomplete:` 行），時間上限依表列 5.1 s 但自 `WatcherStopped`（緊接 `close_intake`、drain 共用期限的起點）起算，另加 `daemon.stop` 送出起算 < 5.6 s（含 server／watcher stop）。handler 與行程樹檢查以執行期分支區分平台（POSIX `sh`＋`/proc`；Windows `cmd.exe`＋`Win32_Process`），Windows 原生核對列 P7-LW-3。
+
 - [ ] **Step 1：寫失敗測試**
 
 | 測試名（檔） | 精確斷言 |

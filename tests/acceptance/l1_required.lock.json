@@ -6,6 +6,7 @@
         "nodeids": [
           "cargo:sw-core::event_dispatcher::close_intake_rejects_new_dispatch",
           "cargo:sw-core::event_dispatcher::counter_load_error_skips_fire_and_releases_rule",
+          "cargo:sw-core::event_dispatcher::fire_completed_exit_code_follows_py_returncode",
           "cargo:sw-core::event_dispatcher::fire_completed_shape",
           "cargo:sw-core::event_dispatcher::fire_count_continues_from_counter",
           "cargo:sw-core::event_dispatcher::fire_timeout_shape",
@@ -180,6 +181,7 @@
           "cargo:sw-daemon::event_lifecycle::bridge_queries_reflect_manager_state",
           "cargo:sw-daemon::event_lifecycle::engine_started_before_bootstrap_attach",
           "cargo:sw-daemon::event_lifecycle::shutdown_aborts_long_handler_within_budget",
+          "cargo:sw-daemon::event_lifecycle::shutdown_closes_event_intake_before_drain_behavior",
           "cargo:sw-daemon::event_rpc::com_toggle_status_reset_reload_tail",
           "cargo:sw-daemon::event_rpc::event_methods_served_not_method_not_found_and_not_retryable",
           "cargo:sw-daemon::event_rpc::event_methods_without_engine_are_method_not_found",

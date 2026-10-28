@@ -284,6 +284,32 @@ fn fire_completed_shape() {
     assert_eq!(r.counters.load("o.a").unwrap().fires, PyInt::Small(1));
 }
 
+/// 審查 01c474c_a0cad06（3030adc-2）：`fire_completed.exit_code` 必須經 `sw_pal::process::py_returncode`
+/// （Windows 為 `GetExitCodeProcess` 的不帶號 DWORD，`-1073741819` → `3221225477`；POSIX 原值，訊號終止為
+/// `-signum`）。sw-core 不得以 cfg 分辨平台（OD），故以 helper 本身為期望值綁定 dispatcher 的呈現；
+/// helper 的平台值由 sw-pal `handler_spawner::py_returncode_matches_python_popen` 鎖定（Windows 原生見 P7-LW-6）。
+#[test]
+fn fire_completed_exit_code_follows_py_returncode() {
+    for (rule, raw) in [("o.a", -1_073_741_819_i32), ("o.b", -9)] {
+        let r = rig();
+        let sp = FakeHandlerSpawner::scripted(vec![HandlerOutcome::Completed {
+            exit_code: raw,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+        }]);
+        let d = r.start(8, sp);
+        d.dispatch(fire(rule, "COM0", 1), "line".into());
+        r.emit.wait_for("fire_completed", 1);
+        d.stop(soon());
+        let ev = &r.emit.of_type("fire_completed")[0];
+        assert_eq!(
+            ev.get("exit_code"),
+            Some(&PyValue::from(sw_pal::process::py_returncode(raw))),
+            "raw={raw}"
+        );
+    }
+}
+
 #[test]
 fn fire_timeout_shape() {
     let r = rig();

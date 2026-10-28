@@ -118,3 +118,26 @@
 | b65df2d-1／01c474c-1 | Low | 證據 README 差異說明漏列移除項 | **fixed**：aaf2c1d／9c4a80e／0722f75 三列補完整 +/−；README 末新增「逐列完整 +/−（自動產生）」段，以 `comm` 列出所有相鄰清單檔的新增與移除 |
 | 9c4a80e-1 | Low | Windows `fire_completed.exit_code` 以有號 i32 呈現、與 Python DWORD 不一致且無授權 | **fixed（選 add-only 還原）**：sw-pal `process::py_returncode(i32) -> i64`（Windows `as u32`、POSIX 原值，cfg 在 sw-pal），dispatcher emit 改用之；design-event-trigger 改述為與 Python 相同；回歸 `handler_spawner::py_returncode_matches_python_popen`（Windows 斷言 `-1073741819 → 3221225477`，原生執行併入 P7-LW-6） |
 | （前輪未結） | Medium | 96b28dd_06c61d0 ENOEXEC | 已於 9c4a80e 修正（第 6 輪；b65df2d_01c474c 已以 10 組 1:1 對照核對） |
+
+## 第 8 輪：merge P5（a089f9f）與 p7-cloud/01c474c_a0cad06（Opus）
+
+### merge P5 審查修正（a089f9f）的衝突裁決
+
+| 衝突點 | P5 | P7 | 處理 |
+|---|---|---|---|
+| `LoginOutcome::Raised` | `{ exc, message }`（F16，`message`＝`str(exc)`） | `Raised(String)`＋`Aborted(Refused／Cancelled／TxIncomplete)` | 採 P5 形狀；`Aborted` 只留 `_login_tx_refused` 為真（Quiet／ReconfirmPending／FsmMismatch）與 RunCancel 取消；其餘依 P5 `classify_login_tx_failure` 上拋。結清第 2／4 輪 deferred（`TxUnknownError`、EXCEPTION 訊息全文） |
+| attach run 遇 quiet arm | F15：run 以自身 `fsm_gen` 比對、結果照 Python 套用 | 18abb03 延伸（quiet_bumps／revoked_by_quiet＋Tick 收尾） | 採 P5 F15（P5 已刪 Tick 收尾）；與 SC-30 的差異登記 **BLOCKED-OWNER P7-BO-3** |
+| `choose_plan` | F17 `choose_plan_with(pending, quiet)` | `(quiet_blocks, pending_auto_login)`，quiet／!require_login 不解析帳密 | 採 P7（涵蓋 F17） |
+| `foreground_busy` | F27 只計命令 | P6 Task 6 `todo!` 骨架 | 採 P5 實作（P6 的 replay_hold 條件待 P6） |
+| sw-pal `TEXT_NEWLINE` | `&[u8]`（F55） | `&str`（c58e8d4-2） | P5 名稱保留位元組形；P7 改名 `TEXT_NEWLINE_STR`，測試斷言兩者同值 |
+
+### p7-cloud/01c474c_a0cad06（Opus）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| 0722f75-1 | Medium | R1-F2 停止序回歸被替換，但宣稱的行為測試不存在；移除 `engine.close_intake()` 後仍全綠 | **fixed（屬實）**：新增 `event_lifecycle::shutdown_closes_event_intake_before_drain_behavior`。實測發現 drain 一開始 reader 即停止，審查建議的「stop 後持續吐 RX」在修前修後都不會進 matcher（無法分辨），改以停機當下的 matcher 積壓驗證：`WatcherStopped` hook 閘住 events log append、注入 50 行並等落 WAL，BlockForever 使 drain 撐滿期限。反證：註解掉 `daemon_main.rs` drain 前的 `engine.close_intake()` → `__B2__ match_recorded 50 筆` 紅；還原後綠。規則需 `scope: any`（卡住的前景命令使 RX 為 command_output）。08 Task 16-wire 補「P7 修訂」；L1 鎖 add-only +1 |
+| 0722f75-2 | Medium | `shutdown_aborts_long_handler_within_budget` 上限放寬為 5.6 s、漏 stderr WARNING 斷言、失敗不印 stderr | **fixed**：改為子行程（`run_child_test`）執行：斷言 stderr 含 `event dispatcher shutdown 逾時，終止 1 個 handler`、exit 0（失敗訊息附 `shutdown incomplete:` 行與完整 stderr）；計畫 5.1 s 自 `WatcherStopped`（close_intake／drain 期限起點）起算，另保留 `daemon.stop` 起算 < 5.6 s。本機 5 次：intake→exit 5012～5014 ms、stop→exit 5062～5063 ms。08「P7 修訂」登記 |
+| 0722f75-3 | Low | sw-daemon 新測試未列 Windows 待辦；POSIX-only 測試無 cfg | **fixed**：`check_cfg_boundary` 也掃 tests，sw-daemon 不得用 `#[cfg(unix)]`；改以執行期分支（`MAIN_SEPARATOR`，同 P5 `state_store` 測試）：Windows 用 `cmd.exe` shell handler `ping -n 60 127.0.0.1 > nul & rem <marker>`、行程樹以 PowerShell `Win32_Process` 查詢，POSIX 不變；P7-LW-3 補列 sw-daemon `event_rpc`、`event_lifecycle` 與判準（Windows 分支待原生核對） |
+| 3030adc-1 | Low | `handler_spawner.rs` 檔頭 Windows 判準仍寫 9 | **fixed**：改為 `passed == 10`（12 個 `#[test]` 扣 2 個 `#[cfg(unix)]`），以 P7-LW-6 為準 |
+| 3030adc-2 | Low | dispatcher `exit_code` emit 未與 `py_returncode` 綁定 | **fixed（部分）**：新增 `event_dispatcher::fire_completed_exit_code_follows_py_returncode`（`-1073741819`、`-9` 兩組，期望值為 helper 本身）；sw-core 不得以 cfg 分辨平台（OD），故不建審查建議的 `#[cfg(windows)]` 版本——Linux 上 helper 為恆等，payload 的 Windows 值於 P7-LW-3 原生執行時驗（helper 平台值由 sw-pal `py_returncode_matches_python_popen` 鎖定）。L1 鎖 add-only +1 |
+| a0cad06-1 | Low | 新增環境類失敗（sm01）無同範圍重跑紀錄 | **fixed**：`p7-evidence/README.md` 本輪列附同範圍兩次重跑結果 |

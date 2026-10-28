@@ -1,6 +1,7 @@
 //! P7 Task 14（08-slice23-login-events.md）：原生 `HandlerSpawner`（SC-26）。斷言在 `conformance::handler_suite`。
 //! Windows 原生執行列 LOCAL-WINDOWS-TODO（`scripts/rust/win-test.sh --package sw-pal --test handler_spawner`，
-//! 報告 `passed` 須等於本檔 `#[test]` 數 9、`ignored==0`）。
+//! 報告 `passed` 須等於 10（12 個 `#[test]` 扣除 2 個 `#[cfg(unix)]`）、`ignored==0`；判準以
+//! `docs/rust-refactor/reviews/p7-local-windows-todo.md` P7-LW-6 為準）。
 #![cfg(feature = "test-fakes")]
 
 use sw_pal::conformance::handler_suite as suite;
