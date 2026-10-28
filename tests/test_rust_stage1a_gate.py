@@ -2032,3 +2032,53 @@ def test_l15_na_flag_without_structured_steps_does_not_exempt_row():
     gate = _load_gate_module()
     forged = {"verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": True, "not_applicable_steps": []}
     assert gate._l15_case_status([forged, dict(_WIN_PASS_ROW)]) == "evidence-insufficient"
+
+
+PYT_PARAM_LINUX = "tests/test_rust_param_fixture.py::test_param_case[linux]"
+PYT_PARAM_WIN = "tests/test_rust_param_fixture.py::test_param_case[windows]"
+
+
+def _pytest_full_param_nodes(tree) -> list[str]:
+    """s1_pytest_full 凍結同一函式的兩個參數化 nodeid（S1X Y1：曾因去掉 `[param]` 合併成同 key）。"""
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_PARAM_LINUX, PYT_PARAM_WIN])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    return nodes
+
+
+def test_pytest_full_parametrized_nodeids_are_reconciled_individually(tree):
+    """參數化 nodeid 逐一對帳：`[linux]`／`[windows]` 各在 JUnit 恰一次且 passed → PASS（不得合併成出現 2 次）。"""
+    nodes = _pytest_full_param_nodes(tree)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({n: "passed" for n in nodes})
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert not any("逐列對帳失敗" in r for r in row["reasons"]), row["reasons"]
+    assert row["verdict"] == "PASS", row
+
+
+def test_pytest_full_parametrized_one_param_failed_is_not_pass(tree):
+    """參數化逐一對帳不得放寬：只有 `[windows]` failed 時，`[windows]` 列必須被點名、整列不得 PASS。"""
+    nodes = _pytest_full_param_nodes(tree)
+    outcomes = {n: "passed" for n in nodes}
+    outcomes[PYT_PARAM_WIN] = "failed"
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes,
+        outcomes=outcomes, exit_code=1)
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] != "PASS", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_parametrized_missing_param_is_not_pass(tree):
+    """JUnit 只有 `[linux]`、缺 `[windows]` → 不得以同函式另一參數補位成 PASS。"""
+    nodes = _pytest_full_param_nodes(tree)
+    present = {n: "passed" for n in nodes if n != PYT_PARAM_WIN}
+    present["tests/test_rust_other_fixture.py::test_filler"] = "passed"
+    tree.pytest_junit_xml = _pytest_full_junit_xml(present)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(PYT_PARAM_WIN in r for r in row["reasons"]), row["reasons"]

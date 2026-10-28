@@ -251,8 +251,34 @@ def _junit_totals(path: Path | None, count: Callable[[Path], dict[str, int]] | N
         return None
 
 
+def _pytest_exact_key(nodeid: str) -> str:
+    """凍結 pytest nodeid 的逐列對帳 key：模組檔名＋其後完整路徑（含類別與 `[param]`）。
+
+    與 `_normalize_case_id` 不同，不去除參數化 id：同一函式的 `[linux]`／`[windows]` 必須各自對帳，
+    不得合併成同一 key（S1X Y1）。目錄前綴一律丟棄（與 `_normalize_case_id` 的模組慣例一致）。
+    """
+    path, sep, rest = nodeid.partition("::")
+    if not sep:
+        return nodeid
+    return f"{path.rsplit('/', 1)[-1]}::{rest}"
+
+
+def _pytest_exact_key_from_junit(classname: str, name: str) -> str:
+    """JUnit testcase（classname＋name）→ `_pytest_exact_key` 同形 key；classname 須含 `test_*` 模組段。"""
+    parts = classname.split(".")
+    for idx, part in enumerate(parts):
+        if part.startswith("test_"):
+            return "::".join([f"{part}.py", *parts[idx + 1:], name])
+    return "::".join([p for p in (classname, name) if p])
+
+
 def _pytest_junit_cases(path: Path | None, errors: list[str],
-                        expected_head: str | None = None) -> dict[str, list[str]]:
+                        expected_head: str | None = None, *, exact: bool = False) -> dict[str, list[str]]:
+    """JUnit → {case key: [outcome...]}。
+
+    exact=False：key 為 `_normalize_case_id`（去參數），供安全不變量以函式名彙整。
+    exact=True：key 為 `_pytest_exact_key`（保留類別與參數），供 s1_pytest_full 凍結 nodeid 逐列對帳。
+    """
     cases: dict[str, list[str]] = {}
     if path is None:
         return cases
@@ -288,7 +314,10 @@ def _pytest_junit_cases(path: Path | None, errors: list[str],
 
     for testcase in testcases:
         nodeid = testcase.get("nodeid")
-        if nodeid:
+        if exact:
+            case_id = (_pytest_exact_key(nodeid) if nodeid
+                       else _pytest_exact_key_from_junit(testcase.get("classname", ""), testcase.get("name", "")))
+        elif nodeid:
             case_id = _normalize_case_id(nodeid)
             if case_id.startswith("tests/"):
                 case_id = case_id[len("tests/"):]
@@ -306,21 +335,16 @@ def _pytest_junit_cases(path: Path | None, errors: list[str],
     return cases
 
 
-def _pytest_junit_key(nodeid: str) -> str:
-    """與 `_pytest_junit_cases` 相同的 case_id 正規化（去除 `tests/` 前綴），供凍結 nodeid 與 JUnit 對應。"""
-    case_id = _normalize_case_id(nodeid)
-    if case_id.startswith("tests/"):
-        case_id = case_id[len("tests/"):]
-    return case_id
+def _pytest_nodes_junit_problems(nodes: list[str], pytest_cases_exact: dict[str, list[str]]) -> list[str]:
+    """凍結 pytest 節點與 provenance 驗證後 JUnit 的逐列對帳；每個節點須恰出現一次且結果為 passed。
 
-
-def _pytest_nodes_junit_problems(nodes: list[str], pytest_cases: dict[str, list[str]]) -> list[str]:
-    """凍結 pytest 節點與 provenance 驗證後 JUnit 的逐列對帳；每個節點須恰出現一次且結果為 passed。"""
+    pytest_cases_exact 須以 `_pytest_junit_cases(..., exact=True)` 產生（保留參數化 id）。
+    """
     if not nodes:
         return ["s1_pytest_full 凍結 nodeids 為空，無法與 pytest JUnit 逐列對帳"]
     problems: list[str] = []
     for nodeid in nodes:
-        outcomes = pytest_cases.get(_pytest_junit_key(nodeid), [])
+        outcomes = pytest_cases_exact.get(_pytest_exact_key(nodeid), [])
         if outcomes != ["passed"]:
             problems.append(f"pytest JUnit 逐列對帳失敗：{nodeid} 出現 {len(outcomes)} 次，結果 {outcomes}（須恰一次且 passed）")
     return problems
@@ -1035,6 +1059,8 @@ def judge_stage1a(
             errors.append(f"讀取 {platform} l15-report 失敗: {e}")
 
     pytest_cases = _pytest_junit_cases(pytest_junit_path, errors, head)
+    # 逐列對帳用（保留參數化 id）；錯誤訊息已由上一次解析記錄，此處不重複加入。
+    pytest_cases_exact = _pytest_junit_cases(pytest_junit_path, [], head, exact=True)
 
     # 5. Windows COM：--windows-com 指向 OutDir；逐項驗證 windows-com.json 與其引用的子證據。
     # OD-15：Windows COM 為可執行 gate，缺席即證據不足（FAIL），不是 BLOCKED-OWNER。
@@ -1425,7 +1451,7 @@ def judge_stage1a(
                     # 驗證的 JUnit（pytest_cases，已排除 provenance 不符者）中恰出現一次且為 passed。
                     junit_row_problems: list[str] = []
                     if strict and v_raw == "PASS" and junit_dict is not None:
-                        junit_row_problems = _pytest_nodes_junit_problems(required_nodes, pytest_cases)
+                        junit_row_problems = _pytest_nodes_junit_problems(required_nodes, pytest_cases_exact)
                     if v_raw == "PASS" and junit_error is None and (junit_dict is not None or not strict) and not junit_row_problems:
                         verdict = "PASS"
                     elif v_raw == "FAIL":
