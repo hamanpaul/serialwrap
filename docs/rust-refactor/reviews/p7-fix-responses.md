@@ -195,3 +195,5 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | OD | 處理 |
 |---|---|
 | OD-35（P7-BO-3） | **完成（Task 7 SC-30 核心）**：`sc30_cancel_login_run` 於會擋 probe 的 quiet arm 事件內取消並收斂 run；`TxPermit.fsm_gen` 定案為 06 既有 `u64`＋`FsmMismatch`；P5 F15 測試 4 支與 P7 d5b2dd6-1 測試 2 支期望改為 SC-30 行為並登記「被已核准 SC-30 取代」（非削弱，nodeid 不變）；新增 `session_core_login.rs` 6 項。詳見 08 Task 7「P7 修訂（OD-35 定案）」。SC-30 的 L1.5 黑箱 `sc30-quiet-mid-login-aborts`（`test_p7_quiet_reconfirm.py`）屬 Task 18，`behavior_changes.yaml` 狀態維持 APPROVED 至黑箱證據到位 |
+| OD-34 | **部分完成**：`l15-delayed-reply`、`s21-reboot-minimal-guard` 於 Rust daemon（`target/debug/serialwrapd`、bridge 自測 `uart_stdio_bridge selftest --endpoint posix-pty` PASS）連跑 3 次皆 PASS；新增 P7 gate 測試 `tests/acceptance/l15/test_slice23_l15.py`（Rust label；缺證據 skip、`SERIALWRAP_GATE=1` 下 fail）。`cowork-01-agent-bad-cmd` FAIL：`session.console_attach` 回 METHOD_NOT_FOUND（P6 human console），**BLOCKED-UPSTREAM P7-BU-7**（不 merge P6） |
+| OD-31 | Linux 列 `ev-01-spawn-handler` 於 Rust daemon PASS（併入 `test_slice23_l15.py`）；Windows 原生列 **LOCAL-WINDOWS-TODO P7-LW-7** |
