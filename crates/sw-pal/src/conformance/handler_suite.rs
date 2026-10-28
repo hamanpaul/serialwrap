@@ -592,3 +592,35 @@ pub fn huge_timeout_overflow_is_python_like(s: &dyn HandlerSpawner) {
         "INT_MAX ms 不溢位"
     );
 }
+
+/// 期限溢位後管線維持開啟（審查 71fe017_27b5bf4 P7-71fe017-1；POSIX）：CPython 3.12 的 Popen 留在
+/// `subprocess._active`，stdin 不寫、不關——等待 stdin 的 handler 不得提前收到 EOF。Windows 的 Python
+/// `communicate` 在溢位前已寫入並關閉 stdin，故本案只適用 POSIX。
+#[cfg(unix)]
+pub fn huge_timeout_overflow_keeps_pipes_open(s: &dyn HandlerSpawner) {
+    let marker = unique_marker();
+    let dir = std::env::temp_dir().join(format!("sw-ovf-{marker}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let got_eof = dir.join("eof");
+    let cmd = format!("read x; echo eof > '{}' # {marker}", got_eof.display());
+    let sp = spec(s.shell_argv(&cmd), minimal_env(s), b"", Duration::MAX);
+    assert!(matches!(s.run(&sp, &HandlerAbort::new()), HandlerOutcome::SpawnFailed(_)));
+    std::thread::sleep(Duration::from_millis(800));
+    let alive = process_with_marker_alive(&marker);
+    let eof = got_eof.exists();
+    // 收尾：以 /proc 找出該 sh 並結束，避免殘留。
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Ok(pid) = name.to_string_lossy().parse::<i32>() else { continue };
+            let cmdline = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+            if String::from_utf8_lossy(&cmdline).contains(&marker) {
+                // SAFETY: 只對本測試啟動、cmdline 含唯一 marker 的行程送 SIGKILL。
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!eof, "stdin 不得在溢位後提前收到 EOF");
+    assert!(alive, "等待 stdin 的 handler 仍存活");
+}

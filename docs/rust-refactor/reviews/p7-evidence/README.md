@@ -21,6 +21,7 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-start-4221ba2.txt` | 第 4 輪 session 起點 4221ba2（主工作樹；`python3` 改指 CPython 3.12.3 並裝 pytest／PyYAML／jsonschema，故 `test_bb_cli_help` 432 筆 ERROR 不再出現；`python3 -m pytest -q -p no:cacheprovider -rfE` 依檔名 8 分段前景執行） | 28 | 666a6afab09553d1 |
 | `pytest-fail-f150a24.txt` | merge 主線（9d21ef7）＋P5（b0772fe）＋第 9 輪修正（f150a24）＋P7 golden 重擷（#234 `boot_done_regex` 欄）後（同上命令；`test_bb_daemon_e2e.py` 因主線新增 27 案、每案 setup 10.7 s 另段執行）。相對起點 +2／−6，見下段 | 24 | 199751778b9fa817 |
 | `pytest-fail-7e2da7a.txt` | 第 9 輪 Opus 修正（bf26e33）＋#234（7e2da7a）後（同上命令；改依檔名 10 分段＋`test_bb_daemon_e2e.py` 獨立一段）。相對起點同 f150a24 列 +2（holder observer zombie 環境類、OD-24 防線 P7-BO-4）；相對 f150a24 多 `test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`（起點清單內、歷次重跑集合不同） | 25 | 7f30fe87842ba86f |
+| `pytest-fail-cf2ba94.txt` | Task 7 SC-30（4f0754b）＋OD-34／31 gate 測試（cf2ba94）＋overflow 管線修正（工作樹）後（10 分段＋e2e 段）。相對起點 +2（同 f150a24 列），其餘皆在起點清單內；新增的 `tests/acceptance/l15/test_slice23_l15.py` 於全套中因未設 Rust daemon 環境變數而 skip | 24 | 199751778b9fa817 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：

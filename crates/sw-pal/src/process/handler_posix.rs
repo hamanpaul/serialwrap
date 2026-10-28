@@ -178,13 +178,16 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
     };
     let pgid = child.id();
     if super::py_communicate_timeout_overflows(spec.timeout) {
-        // Python：Popen 成功後 `communicate` 在第一次 select 前溢位（stdin 尚未寫入）；Popen 物件隨即被回收、
-        // 管線關閉，子行程不被終止。此處同樣關閉三條管線、不送訊號，另起執行緒 wait 以免殭屍。
-        drop(child.stdin.take());
-        drop(child.stdout.take());
-        drop(child.stderr.take());
+        // Python：Popen 成功後 `communicate` 在第一次 select 前溢位（stdin 尚未寫入）；子行程未結束的 Popen 由
+        // `__del__` 放進 `subprocess._active`，三條管線維持開啟直到子行程結束後被回收（CPython 3.12 探針，審查
+        // 71fe017_27b5bf4 P7-71fe017-1）。此處同樣不寫 stdin、不讀輸出、不送訊號：整個 Child（含管線）移交
+        // 背景執行緒，子行程結束後才關閉管線並回收（免殭屍）。
         std::thread::spawn(move || {
+            // `Child::wait` 會先關閉 stdin：先取出持有，子行程結束後才釋放。
+            let stdin = child.stdin.take();
             let _ = child.wait();
+            drop(stdin);
+            drop(child);
         });
         return super::communicate_overflow();
     }

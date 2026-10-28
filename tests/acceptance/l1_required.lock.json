@@ -249,6 +249,7 @@
           "cargo:sw-pal::handler_spawner::native_env_cleared",
           "cargo:sw-pal::handler_spawner::native_env_order_is_spec_order",
           "cargo:sw-pal::handler_spawner::native_huge_timeout_overflow_is_python_like",
+          "cargo:sw-pal::handler_spawner::native_huge_timeout_overflow_keeps_pipes_open",
           "cargo:sw-pal::handler_spawner::native_inherits_only_stdio",
           "cargo:sw-pal::handler_spawner::native_spawn_enoexec_is_python_like",
           "cargo:sw-pal::handler_spawner::native_spawn_failure",
