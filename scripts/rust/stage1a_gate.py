@@ -11,6 +11,8 @@ S1X 規則（計畫 04 Task 18、§3 B3；owner_gated.py 為擁有者機台列�
 - pytest JUnit 必須帶 provenance：HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/ 且不縮小範圍；否則整份拒收。
 - s1_pytest_full（linux，OD-17）：`<l1>/linux/pytest-full/resource-report.json` 與 `--pytest-junit-report` 對帳；缺檔、集合不存在、INSUFFICIENT 或 INVALID → evidence-insufficient，FAIL → FAIL；不新增放行規則。
 - spike3（`scripts/stage0/spike3_win_wal.py`）證據依 `spike3_evidence.schema.json` 驗證、case_id 相符、git_head＝受測 HEAD、git_clean、verdict PASS 與 binary_integrity 成立才 PASS；防毒產品名與狀態只是資訊欄位（OD-19），不參與判定。
+- L1.5 擁有者延後列（`L15_OWNER_DEFERRED`；OD-30 (2) 的 Windows `l15-transport-disconnect`）：僅在 harness 明示該能力
+  不可用時，該列改判 BLOCKED-OWNER（不阻擋、不計 PASS）；其他平台列仍須 PASS，其他失敗照判 FAIL。
 - Windows COM（OD-15、計畫 04 §3 B1）：可執行 gate。`--windows-com` 缺席、目錄無 `windows-com.json` 或任何驗證不符 → evidence-insufficient（整體 FAIL）；明示 `windows_com: FAIL` → FAIL。不再列為 BLOCKED-OWNER。
 """
 from __future__ import annotations
@@ -92,6 +94,24 @@ def _l15_row_na_only(row: dict[str, Any]) -> bool:
     )
 
 
+# 擁有者裁決延後的 L1.5 (案例, 平台) 能力缺口：該列只在 harness 明示「能力不可用」時改判 BLOCKED-OWNER（不是 PASS）。
+# OD-30 (2)：Windows transport disconnect（com0com 無斷線能力）套用 OD-27，release 後於接有真實 USB 序列硬體的安裝機實測。
+L15_OWNER_DEFERRED: dict[tuple[str, str], dict[str, str]] = {
+    ("l15-transport-disconnect", "windows"): {
+        "decision": "OD-30",
+        "marker": "'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE",
+    },
+}
+
+
+def _l15_row_owner_deferred(row: dict[str, Any]) -> bool:
+    """列屬擁有者延後的能力缺口：(案例, 平台) 已登記、verdict 非 PASS，且訊息含登記的能力不可用標記。"""
+    entry = L15_OWNER_DEFERRED.get((str(row.get("case_id")), str(row.get("platform"))))
+    if entry is None or row.get("verdict") == "PASS":
+        return False
+    return entry["marker"] in str(row.get("message") or "")
+
+
 def _l15_case_status(rows: list[dict[str, Any]], platforms: list[str] | None = None) -> str:
     """L15 案例的 gate 狀態（計畫 04 §5c）。
 
@@ -103,6 +123,8 @@ def _l15_case_status(rows: list[dict[str, Any]], platforms: list[str] | None = N
       任一列 INSUFFICIENT_EVIDENCE／SKIP → evidence-insufficient（不得記為 FAIL）。
     - 其餘列全部 PASS 且 gate_eligible，且至少一列 → PASS；否則 evidence-insufficient。
       例如 l15-wal-interference：POSIX 列僅缺 segment (c)（windows 專屬）時，必須由 Windows 列 PASS＋eligible 才成立。
+    - `L15_OWNER_DEFERRED` 登記的 (案例, 平台) 列若僅因登記的能力不可用而未 PASS：該列不阻擋、也不計為 PASS；
+      其餘列依上列規則全部 PASS 時，案例為 BLOCKED-OWNER（S1X Y4，OD-30 (2)）。
     """
     if not rows:
         return "evidence-insufficient"
@@ -110,14 +132,15 @@ def _l15_case_status(rows: list[dict[str, Any]], platforms: list[str] | None = N
         present = {row.get("platform") for row in rows}
         if any(platform not in present for platform in platforms):
             return "evidence-insufficient"
-    blocking = [row for row in rows if not _l15_row_na_only(row)]
+    deferred = [row for row in rows if _l15_row_owner_deferred(row)]
+    blocking = [row for row in rows if not _l15_row_na_only(row) and not _l15_row_owner_deferred(row)]
     if any(row.get("verdict") not in ("PASS", "INSUFFICIENT_EVIDENCE", "SKIP") for row in blocking):
         return "FAIL"
     if any(row.get("verdict") != "PASS" for row in blocking):
         return "evidence-insufficient"
     if not blocking or any(row.get("gate_eligible") is not True for row in blocking):
         return "evidence-insufficient"
-    return "PASS"
+    return "BLOCKED-OWNER" if deferred else "PASS"
 
 
 def _is_rust_pytest_case(case_id: str) -> bool:

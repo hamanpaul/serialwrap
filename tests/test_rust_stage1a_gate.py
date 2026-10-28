@@ -2082,3 +2082,72 @@ def test_pytest_full_parametrized_missing_param_is_not_pass(tree):
     row = _pytest_full_row(rep)
     assert row["verdict"] == "evidence-insufficient", row
     assert any(PYT_PARAM_WIN in r for r in row["reasons"]), row["reasons"]
+
+
+# --- OD-30 (2)：Windows transport disconnect 能力缺失 → BLOCKED-OWNER（S1X Y4，CHG-S1X-GATE-OD30-TRANSPORT-01）---
+
+TD_CID = "l15-transport-disconnect"
+_TD_CAP_MISSING = "bridge_control 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE"
+
+
+def _td_rows(linux: dict[str, Any] | None, windows: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows = []
+    if linux is not None:
+        rows.append({"case_id": TD_CID, "platform": "linux", **linux})
+    if windows is not None:
+        rows.append({"case_id": TD_CID, "platform": "windows", **windows})
+    return rows
+
+
+_TD_PASS = {"verdict": "PASS", "gate_eligible": True}
+_TD_WIN_CAP = {"verdict": "FAIL", "gate_eligible": False, "message": _TD_CAP_MISSING}
+
+
+def test_od30_windows_transport_disconnect_capability_missing_is_blocked_owner():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_td_rows(_TD_PASS, _TD_WIN_CAP), ["linux", "windows"]) == "BLOCKED-OWNER"
+
+
+def test_od30_linux_failure_still_fails():
+    gate = _load_gate_module()
+    lin_fail = {"verdict": "FAIL", "gate_eligible": False, "message": "x"}
+    assert gate._l15_case_status(_td_rows(lin_fail, _TD_WIN_CAP), ["linux", "windows"]) == "FAIL"
+
+
+def test_od30_linux_row_missing_is_evidence_insufficient():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_td_rows(None, _TD_WIN_CAP), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od30_windows_other_failure_is_not_deferred():
+    gate = _load_gate_module()
+    other = {"verdict": "FAIL", "gate_eligible": False, "message": "assert_command_resolved 失敗"}
+    assert gate._l15_case_status(_td_rows(_TD_PASS, other), ["linux", "windows"]) == "FAIL"
+
+
+def test_od30_deferral_is_scoped_to_case_and_platform():
+    """同訊息出現在其他案例或 Linux 列 → 不得延後（不是一般性的能力缺失放行）。"""
+    gate = _load_gate_module()
+    other_case = [{"case_id": "l15-other", "platform": "linux", **_TD_PASS},
+                  {"case_id": "l15-other", "platform": "windows", **_TD_WIN_CAP}]
+    assert gate._l15_case_status(other_case, ["linux", "windows"]) == "FAIL"
+    lin_cap = {"verdict": "FAIL", "gate_eligible": False, "message": _TD_CAP_MISSING}
+    assert gate._l15_case_status(_td_rows(lin_cap, _TD_PASS), ["linux", "windows"]) == "FAIL"
+
+
+def test_od30_windows_pass_when_capability_available_is_pass():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_td_rows(_TD_PASS, _TD_PASS), ["linux", "windows"]) == "PASS"
+
+
+def test_od30_case_row_blocked_owner_keeps_overall_implemented(tree):
+    tree.cases.append({"case_id": TD_CID, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, TD_CID, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": TD_CID, **_TD_PASS}]}),
+        ("windows", {"results": [{"case_id": TD_CID, **_TD_WIN_CAP}]}),
+    ]
+    _, rep = tree.run()
+    row = _case_row(rep, TD_CID)
+    assert row["status"] == "BLOCKED-OWNER", row
+    assert rep["overall"] == "IMPLEMENTED", rep["errors"]
