@@ -64,3 +64,6 @@ pending_decisions:
   - id: PA-OD-COWORK01
     scenario: "func-test cowork-01-agent-bad-cmd（Slice 2.2 gate）依賴 Slice 2.3 readiness reprobe（08 計畫 P7-T5）：移至 2.3 gate 或核准 backport（上游缺口 U-01）"
     evidence: docs/rust-refactor/reviews/p5-fix-responses.md#上游缺口-u-01
+  - id: PA-OD-T20
+    scenario: "Task 20 黑箱 11 案與基線／計畫不符（7 案 Python 與 Rust 一致但違反案例斷言、2 案 Python 基線缺陷候選或計時敏感、1 案只適用 Rust、1 案 TX 窗口設計缺陷）；逐案根因與建議見交付報告，裁決前不放寬斷言、不改 skip"
+    evidence: docs/rust-refactor/reviews/p5-t20-blackbox-report.md
