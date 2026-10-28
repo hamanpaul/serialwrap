@@ -1,0 +1,13 @@
+# s1v12 Codex sol 審查發現處理紀錄
+
+審查來源：`origin/docs/parity-amendments` 的 `docs/rust-refactor/reviews/sol-backfill/s1-20261028.md`；本分支修正起點為 `9908f93e64f379bcaa77898a4540b42fdab600f4`。五項都以可重現反例確認有效，沒有拒絕項。需 oracle／判定形狀複審者已在 `owner-decisions-addenda.md` 登記，待雲端 Claude Opus 複審。
+
+| 審查項 | 判定 | 處理與證據 | 剩餘證據 |
+|---|---|---|---|
+| BB-1（High）：升級容器的系統 PyYAML 遮住一般 pipx 使用者依賴缺失 | 有效 | 測試先確認舊映像安裝 `python3-yaml`、舊 pipx 安裝可見共享依賴；修正後移除系統 PyYAML，pipx 只從隔離 wheelhouse 離線安裝，release bundle 自帶 PyYAML 並以 `-I` 驗證載入路徑，且正式 bundle 不啟用 `sw-cli/test-fakes`。`tests/test_docker_upgrade.py`、`tests/test_rust_mkbundle.py` 有回歸。 | `tests/test_docker_upgrade.py` 29 passed，含 Docker 兩模式 0.3.2→0.4.0→降級→再升級實跑；輸出留於 pytest 暫存目錄，未保存進 repo，因此還需在最終 HEAD 重跑並登記證據。 |
+| BB-2（Medium）：SC-18 首筆 TX 後固定等待可能漏判延遲的重複 TX | 有效 | 新增 bridge barrier／checkpoint fake-control 回歸；案例在靜默屏障後讀取 checkpoint 前 wire prefix，對 prefix 長度與 sha256 做完整性核對，再要求基線後 payload 恰等於 `echo X\n`。無固定時間 settle 視窗。 | COM20:COM21 原生案例未在本輪執行；出口 run 需重跑。 |
+| BB-3（Medium）：Ctrl-C 測試 ready 標記不足以證明委派孫行程已啟動 | 有效 | 測試先以舊行為寫紅燈防線；現由受測孫行程自行寫含 PID 的 delegate-ready 檔，父行程確認行程仍存活才送事件，並於事件後確認孫行程結束。保留 `--ignored --exact`、Ctrl+C／Ctrl+Break 兩圈及 `0xC000013A` 判準。Windows GNU `cargo test --no-run` 成功。 | 原生互動驗證需要擁有者依 `owner-runbook-od29.md` 第 3 次命令重跑；本機缺 `cmd.exe`，沒有宣稱 PASS。 |
+| BB-4（Medium）：gate 的 OD-30／31／32 `BLOCKED-OWNER` 未連接出口 driver | 有效 | 新增 driver helper 回歸，舊 driver 對合法 Windows producer rc=1 仍失敗的情境先紅；現只在 Stage 1A gate rc=0、overall 為 `IMPLEMENTED`／`VERIFIED`、errors 空、同案 Linux PASS、精確 OD 延後列為 `BLOCKED-OWNER`，且唯一非零步驟為 `win_l15_func_test 1` 時豁免。其餘 rc、格式錯誤、FAIL／INSUFFICIENT 全保留。 | 新 helper 只由合成 gate 報告與 rc.txt 驗證；出口 run 才能確認真實證據路徑。 |
+| BB-5（Medium）：release 配方會將測試故障注入 feature 編入產物 | 有效 | 新增 release bundle 靜態回歸先紅；`run-upgrade.sh` 改用 `--release-bundle --profile release`，`mkbundle.sh` 不加 `sw-cli/test-fakes`，bundle runtime 自帶 PyYAML；release 計畫同步改用相同配方。 | 本輪沒有製作或發佈 release bundle；正式版本仍須依 OD-33 由出口流程產生。 |
+
+本輪未執行完整 pytest、workspace cargo tests、contracts、policy；驗證結果以最後報告為準。未完成複審或原生實跑前，各對應 addenda 列維持待複審／待實跑，不表示 Stage 1 出口已通過。
