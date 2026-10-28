@@ -286,6 +286,28 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 Supported key encodings include `enter`, `tab`, `escape`, `ctrl-c`, `ctrl-d`,
 `up`, `down`, `left`, and `right`.
 
+#### Source labels (`--source`)
+
+`--source` (`cmd submit`, `file push`, `file pull`, `device release`) and
+`session interactive-open --owner` are not just tracking labels: the daemon decides
+what to do when a command times out from the **prefix**.
+
+| Prefix | Class | On command timeout (no prompt came back) |
+|--------|-------|------------------------------------------|
+| `agent:<name>`, or any other string (`agent`, `codex`, ...) | agent | Sends CTRL-C, then CTRL-D, to get a prompt back — CTRL-D **logs out** a console sitting at a shell; no keys inside the boot quiet window |
+| `human:<name>` | human | Sends **no keys**; the command is promoted to an interactive lease for the human; not subject to the boot quiet gate |
+| `system`, `system:*` | reserved | Internal only (forced recovery, self-test, login probes); external callers get `SOURCE_RESERVED` |
+
+- Bare `human` and `human:` (no name) are **normalized to `human:cli`** instead of being
+  silently treated as agent; the response carries `source` and `source_normalized_from`.
+  The prefix is case-insensitive.
+- `system` / `system:*` are rejected by both the CLI and the daemon
+  (`error_code: SOURCE_RESERVED`) before anything is queued or written to the UART.
+  Look-alikes such as `systemd:x` are unaffected.
+- Any other unknown prefix (`codex`, `cli`, `agent`, ...) keeps the agent behavior.
+- `cmd submit` responses and the `command` record of `cmd status` carry `source_class`
+  (`human` or `agent`) so you can see how a source was classified.
+
 ### Human Console Coexistence
 
 The broker minicom wrapper is `serialwrap-minicom COMx`. The first human console
@@ -1937,6 +1959,24 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 ```
 
 `--encoding key` 目前支援：`enter`、`tab`、`escape`、`ctrl-c`、`ctrl-d`、`up`、`down`、`left`、`right`。
+
+#### 來源標籤（`--source`）
+
+`--source`（`cmd submit`／`file push`／`file pull`／`device release`）與 `session interactive-open --owner`
+不只是追蹤標籤：daemon 用**前綴**決定命令逾時（沒等到 prompt）時怎麼處理。
+
+| 前綴 | 歸類 | 命令逾時時 |
+|------|------|-----------|
+| `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 先送 CTRL-C、再送 CTRL-D 嘗試把 prompt 叫回來——停在 shell 的 console 會被 CTRL-D **登出**；boot quiet window 內不送按鍵 |
+| `human:<名>` | human | **不送任何按鍵**，命令升級成 interactive lease 交給人處理；不受 boot quiet gate |
+| `system`、`system:*` | 保留 | daemon 內部（強制恢復、self-test、登入探測）專用，外部呼叫回 `SOURCE_RESERVED` |
+
+- bare `human`（沒冒號）與 `human:`（沒名字）**正規化為 `human:cli`**，不再默默當成 agent；回應多帶
+  `source`（正規化後的值）與 `source_normalized_from`（原字串）。前綴不分大小寫。
+- `system`／`system:*` 由 CLI 與 daemon 兩端拒絕（`error_code: SOURCE_RESERVED`），在排隊與送 UART 之前就擋下；
+  `systemd:x` 之類只是長得像的字串不受影響。
+- 其他沒見過的前綴（`codex`、`cli`、`agent`…）維持 agent 行為，不報錯。
+- `cmd submit` 的回應與 `cmd status` 的 `command` 記錄帶 `source_class`（`human`／`agent`），可確認一筆來源被歸成哪類。
 
 #### Bootloader Recovery Lease
 

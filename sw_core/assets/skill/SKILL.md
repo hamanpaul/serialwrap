@@ -218,6 +218,21 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
 - session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
 
+## `--source` 的語意
+`--source`（`cmd submit`／`file push`／`file pull`／`device release`）與 `session interactive-open --owner` 的字串**不只是追蹤標籤**：daemon 用它的**前綴**決定命令逾時（沒等到 prompt）時怎麼處理。
+
+| 前綴 | 歸類 | 命令逾時時 |
+|------|------|-----------|
+| `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 先送 CTRL-C、再送 CTRL-D 嘗試把 prompt 叫回來——停在 shell 的 console 會被 **CTRL-D 登出**；boot quiet window 內不送按鍵，且 `cmd submit`／`file push`／`file pull` 會被 `AUTOBOOT_QUIET` 擋下 |
+| `human:<名>` | human | **不送任何按鍵**，命令升級成 interactive lease 交給人處理；不受 boot quiet gate |
+| `system`、`system:*` | 保留 | daemon 內部（強制恢復、self-test、登入探測）專用，外部呼叫回 `SOURCE_RESERVED` |
+
+- 自動化一律用 `agent:<名>`；`human:<名>` 只給真的有人在鍵盤前操作的情境（例如替使用者手動跑一條會卡住的命令），不要拿來繞過 boot quiet gate。
+- **bare `human`（沒冒號）與 `human:`（沒名字）會正規化為 `human:cli`**，不是被當成 agent：回應多帶 `source`（正規化後的值）與 `source_normalized_from`（你傳的原字串）。前綴不分大小寫（`Human:bob` → `human:bob`）。要明確區分是誰，請自己帶名字（`human:alice`）。
+- `system`／`system:*`（不分大小寫）會被 CLI 與 daemon 兩端拒絕：`error_code: SOURCE_RESERVED`，回應帶 `reserved_prefix` 與 `hint`，命令不入列、不送 UART。`systemd:x` 之類只是長得像的字串不受影響。
+- 其他沒見過的前綴（`codex`、`cli`、`agent`、`agent-A`…）維持 agent 行為，不報錯。打錯 `agent:` 不會被攔——為了追蹤性仍請照 `agent:<名>` 寫。
+- 想確認一筆命令被歸成哪類：`cmd submit` 的回應與 `cmd status` 的 `command` 記錄都帶 `source_class`（`human`／`agent`）。
+
 ## 短命令原則（Best Practice）
 - **避免 heredoc**：heredoc 經 UART 傳輸時容易遺失字元或打亂 prompt，改用 `echo ... > file` 分步寫入。
 - **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。

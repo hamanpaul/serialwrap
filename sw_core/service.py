@@ -42,6 +42,7 @@ from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
 from .session_manager import SessionManager
+from .source_policy import SourceCheck, check_source, classify_source
 from .util import now_iso
 from .version import resolve_version
 from .wal import WalWriter, rows_to_text_lines
@@ -687,6 +688,20 @@ class SerialwrapService:
                 }
         return str(session["session_id"]), None
 
+    @staticmethod
+    def _annotate_source(result: Any, check: SourceCheck, *, with_class: bool = False) -> Any:
+        """在成功回應補上來源歸類資訊（additive）：被正規化時帶 ``source``＋
+        ``source_normalized_from``，讓呼叫端看得到「你傳的字串被當成什麼」；
+        ``with_class`` 另帶 ``source_class``（human／agent，``command.submit`` 用）。"""
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+        if check.normalized_from is not None:
+            result["source"] = check.source
+            result["source_normalized_from"] = check.normalized_from
+        if with_class:
+            result["source_class"] = classify_source(check.source)
+        return result
+
     def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """RPC 平面分派器的薄包裝（#154）：委派 `_dispatch()`，並在回應為 dict 時
         補上 daemon 版本欄位。`health()` 已顯式帶 `version`，`setdefault` 對它是
@@ -730,9 +745,12 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            source = str(params.get("source") or "cli")
+            src = check_source(params.get("source"), default="cli")
+            if src.error is not None:
+                return src.error
             reason = params.get("reason")
-            return self._sessions.release_device(selector, source=source, reason=reason)
+            result = self._sessions.release_device(selector, source=src.source, reason=reason)
+            return self._annotate_source(result, src)
 
         if method == "device.attach":
             selector = str(params.get("selector") or "")
@@ -839,7 +857,11 @@ class SerialwrapService:
 
         if method == "session.interactive_open":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
-            owner = str(params.get("owner") or "agent")
+            # owner 只擋保留前綴；不正規化 bare human（會開出沒有 console peer 的 human lease）。
+            owner_check = check_source(params.get("owner"), default="agent", field="owner", normalize_human=False)
+            if owner_check.error is not None:
+                return owner_check.error
+            owner = owner_check.source
             timeout_s = float(params.get("timeout_s") or 60.0)
             command = str(params.get("command") or "")
             allow_attached = bool(params.get("allow_attached", False))
@@ -892,9 +914,12 @@ class SerialwrapService:
             completion_regex = params.get("completion_regex")
             if not valid_completion_regex(completion_regex):
                 return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
+            src = check_source(params.get("source"), default="agent")
+            if src.error is not None:
+                return src.error
+            source = src.source
             selector = str(params.get("selector") or params.get("com") or params.get("alias") or "")
             cmd = str(params.get("cmd") or params.get("command") or "")
-            source = str(params.get("source") or "agent")
             mode = str(params.get("mode") or "line")
             timeout_s = float(params.get("timeout_s") or 10.0)
             priority = int(params.get("priority") or 10)
@@ -906,7 +931,7 @@ class SerialwrapService:
             if err is not None:
                 return err
             assert session_id is not None
-            return self._arbiter.submit(
+            result = self._arbiter.submit(
                 session_id=session_id,
                 command=cmd,
                 source=source,
@@ -916,10 +941,15 @@ class SerialwrapService:
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
             )
+            return self._annotate_source(result, src, with_class=True)
 
         if method == "command.get":
             cmd_id = str(params.get("cmd_id") or "")
-            return self._arbiter.get(cmd_id)
+            result = self._arbiter.get(cmd_id)
+            record = result.get("command") if isinstance(result, dict) else None
+            if isinstance(record, dict):
+                record["source_class"] = classify_source(str(record.get("source") or ""))
+            return result
 
         if method == "command.result_tail":
             cmd_id = str(params.get("cmd_id") or "")
@@ -1085,13 +1115,16 @@ class SerialwrapService:
             ack_mode = str(params.get("ack_mode") or "auto")
             if ack_mode not in _ACK_MODES:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            source = str(params.get("source") or "agent")
+            src = check_source(params.get("source"), default="agent")
+            if src.error is not None:
+                return src.error
+            source = src.source
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
-            return self._sessions.file_push(
+            result = self._sessions.file_push(
                 selector,
                 local_path=local_path,
                 remote_path=remote_path,
@@ -1100,6 +1133,7 @@ class SerialwrapService:
                 ack_mode=ack_mode,
                 source=source,
             )
+            return self._annotate_source(result, src)
 
         if method == "file.pull":
             selector = str(params.get("selector") or "")
@@ -1116,19 +1150,23 @@ class SerialwrapService:
             # 作用於 push 的 chunk 命令行；pull 單行短命令不走 paced，故不轉傳）。
             if str(params.get("ack_mode") or "auto") not in _ACK_MODES:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            source = str(params.get("source") or "agent")
+            src = check_source(params.get("source"), default="agent")
+            if src.error is not None:
+                return src.error
+            source = src.source
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(selector, source=source)
             if err is not None:
                 return err
-            return self._sessions.file_pull(
+            result = self._sessions.file_pull(
                 selector,
                 remote_path=remote_path,
                 local_path=str(local_path) if local_path else None,
                 chunk_timeout_s=chunk_timeout_s,
                 source=source,
             )
+            return self._annotate_source(result, src)
 
         if method == "event.rule_set":
             try:

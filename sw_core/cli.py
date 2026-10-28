@@ -34,6 +34,7 @@ from .doctor_cmd import DOCTOR_ADVISORY_CHECKS, DOCTOR_ADVISORY_CHECKS_WIN, run_
 from .platform_backends import select_rpc_backend
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
+from .source_policy import check_source
 from .sysenv import force_utf8_stdio
 from .setup_cmd import (
     SYSTEM_SOCKET,
@@ -139,6 +140,35 @@ def _print_internal_error(*, context: str, exc: Exception) -> int:
     _print(resp)
     _mirror_err(resp, context=context)
     return 1
+
+
+_SOURCE_HELP = (
+    "命令來源標籤：自動化用 agent:<名>（逾時走 CTRL-C/CTRL-D 恢復）、人工操作用 human:<名>"
+    "（逾時升級 interactive、不送按鍵）；bare `human`／`human:` 正規化為 human:cli；"
+    "`system`／`system:*` 為內部保留，會被拒絕（SOURCE_RESERVED）；其他字串視為 agent"
+)
+
+
+def _source_rejected(
+    raw: object,
+    *,
+    default: str,
+    context: str,
+    field: str = "source",
+    normalize_human: bool = True,
+) -> bool:
+    """送 RPC 前的 ``--source``／``--owner`` 預檢：保留前綴（``system``／``system:*``）即時拒絕。
+
+    daemon 端 ``check_source`` 才是權威（含 ``human`` 正規化與回應標註）；CLI 預檢的價值是
+    不依賴 daemon 版本——舊 daemon 不擋 ``system:recover``——且不必連線就能得到明確錯誤。
+    被拒時印出 ``SOURCE_RESERVED`` JSON（stdout）＋一行 stderr，回 True，呼叫端 ``return 1``。
+    """
+    check = check_source(raw, default=default, field=field, normalize_human=normalize_human)
+    if check.error is None:
+        return False
+    _print(check.error)
+    _mirror_err(check.error, context=context)
+    return True
 
 
 def _format_err_line(resp: dict[str, Any], *, context: str | None = None) -> str:
@@ -2001,7 +2031,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回",
     )
     p_drel.add_argument("--selector", required=True)
-    p_drel.add_argument("--source", default="cli")
+    p_drel.add_argument("--source", default="cli", help=_SOURCE_HELP)
     p_drel.add_argument("--reason", default=None)
     p_datt = device_sub.add_parser(
         "attach",
@@ -2054,7 +2084,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scl.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sio = sess_sub.add_parser("interactive-open", help="開啟 interactive lease（給全螢幕互動程式用）")
     p_sio.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_sio.add_argument("--owner", default="agent")
+    p_sio.add_argument("--owner", default="agent", help="lease 擁有者標籤（預設 agent）；`system`／`system:*` 為內部保留，會被拒絕（SOURCE_RESERVED）")
     p_sio.add_argument("--timeout", dest="interactive_timeout_s", type=float, default=60.0)
     p_sio.add_argument("--command", default="")
     p_sio.add_argument(
@@ -2127,7 +2157,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=f"要執行的單行命令（UTF-8 > {CMD_WARN_BYTES} bytes warning、> {CMD_REJECT_BYTES} bytes 拒絕，詳見上方說明）",
     )
-    p_cs.add_argument("--source", default="agent")
+    p_cs.add_argument("--source", default="agent", help=_SOURCE_HELP)
     p_cs.add_argument("--mode", default="line")
     p_cs.add_argument("--priority", type=int, default=10)
     p_cs.add_argument("--cmd-timeout", dest="cmd_timeout_s", type=float, default=10.0)
@@ -2198,7 +2228,7 @@ def build_parser() -> argparse.ArgumentParser:
                       default="auto",
                       help="chunk 命令行送出方式（#161）：auto=有 echo-ACK 原語即節流（預設）、"
                            "echo=強制 echo-ACK、none=legacy 整行送出（急件換吞吐）")
-    p_fp.add_argument("--source", default="agent")
+    p_fp.add_argument("--source", default="agent", help=_SOURCE_HELP)
     p_fl = file_sub.add_parser("pull", help="透過 UART 從 target 拉取檔案到本機")
     p_fl.add_argument("--selector", required=True)
     p_fl.add_argument("--remote", required=True)
@@ -2208,7 +2238,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--ack-mode", dest="ack_mode", choices=["auto", "echo", "none"],
                       default="auto",
                       help="介面對齊 file push（#161）；pull 端目前僅驗證、不影響行為")
-    p_fl.add_argument("--source", default="agent")
+    p_fl.add_argument("--source", default="agent", help=_SOURCE_HELP)
 
     p_wal = sub.add_parser(
         "wal",
@@ -2501,6 +2531,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.device_cmd == "list":
             return _run_rpc(args, "device.list", {})
         if args.device_cmd == "release":
+            if _source_rejected(args.source, default="cli", context="device.release"):
+                return 1
             return _run_rpc(args, "device.release", {"selector": args.selector, "source": args.source, "reason": args.reason})
         if args.device_cmd == "attach":
             return _run_rpc(args, "device.attach", {"selector": args.selector, "force": args.force})
@@ -2542,6 +2574,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.session_cmd == "console-list":
             return _run_rpc(args, "session.console_list", {"selector": args.selector})
         if args.session_cmd == "interactive-open":
+            if _source_rejected(
+                args.owner, default="agent", context="session.interactive_open",
+                field="owner", normalize_human=False,
+            ):
+                return 1
             return _run_rpc(
                 args,
                 "session.interactive_open",
@@ -2593,6 +2630,8 @@ def main(argv: list[str] | None = None) -> int:
             if not valid_completion_regex(args.completion_regex):
                 _print({"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX})
                 return 1
+            if _source_rejected(args.source, default="agent", context="command.submit"):
+                return 1
             submit_params: dict[str, Any] = {
                 "selector": args.selector,
                 "cmd": args.command_text,
@@ -2639,6 +2678,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "file":
         if args.file_cmd == "push":
+            if _source_rejected(args.source, default="agent", context="file.push"):
+                return 1
             params = {
                 "selector": args.selector,
                 "local_path": args.local,
@@ -2652,6 +2693,8 @@ def main(argv: list[str] | None = None) -> int:
                 params["chunk_timeout_s"] = args.chunk_timeout_s
             return _run_rpc(args, "file.push", params)
         if args.file_cmd == "pull":
+            if _source_rejected(args.source, default="agent", context="file.pull"):
+                return 1
             p: dict[str, Any] = {
                 "selector": args.selector,
                 "remote_path": args.remote,

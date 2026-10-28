@@ -204,6 +204,24 @@ sequenceDiagram
 - `started_at`
 - `done_at`
 
+`command.get` 的 command 記錄另帶衍生欄位 `source_class`（`human`／`agent`）。
+
+### 5.3.1 `source` 前綴語意與外部入口驗證
+
+`source`（`command.submit`／`file.push`／`file.pull`／`device.release`）與 `session.interactive_open` 的
+`owner` 以**前綴**決定行為：`human:` 開頭為 human 來源（逾時升級 interactive、不送 CTRL-C／CTRL-D、
+不受 boot quiet gate），其餘一律 agent（逾時送 CTRL-C／CTRL-D）；`system`／`system:*` 為 daemon 內部
+保留（WAL 歸因與 `system:recover` 強制恢復旗標）。外部入口經 `sw_core/source_policy.py` 的 `check_source`：
+
+- `human`、`human:`（沒名字，前綴不分大小寫）→ 正規化為 `human:cli`，成功回應帶 `source` 與
+  `source_normalized_from`（`session.interactive_open` 的 `owner` 不正規化）。
+- `system`、`system:*`（不分大小寫）→ 拒絕，`error_code: SOURCE_RESERVED`（帶 `field`、`value`、
+  `reserved_prefix`、`hint`），在 resolve session／入列／送 UART 之前回傳。CLI 於送 RPC 前先預檢。
+- 其餘字串原樣放行（未知前綴維持 agent）。
+- `command.submit` 成功回應帶 `source_class`。
+- 內部路徑（human console 行 `human:<client_id>`、`recover_session`、self-test、login probe）直接進
+  arbiter／bridge，不經此驗證。
+
 ## 6. Execution Modes
 
 ### 6.1 line
