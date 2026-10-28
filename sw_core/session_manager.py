@@ -371,9 +371,10 @@ class SessionRuntime:
     # （attach probe／reboot recovery／self-test nonce 的 confirm_ready()）清除——
     # quiet 過期或 RX prompt 解除都「不」清。transient，不進 _save_state。
     # 根因：prpl/OpenWrt askconsole 停在「Please press Enter to activate this
-    # console」，既不匹配 login_regex 也不匹配 prompt_regex → quiet 只能靠 180s
-    # 過期清空；期間 session 名義 READY 且無人重新確認，第一個 agent 命令的 "\n"
-    # 觸發 askconsole 啟用、命令文字被 askfirst 吞掉、stdout 吃到啟用 banner。
+    # console」，既不匹配 login_regex 也不匹配 prompt_regex → profile 未設
+    # boot_done_regex 時 quiet 只能靠 180s 過期清空；期間 session 名義 READY 且
+    # 無人重新確認，第一個 agent 命令的 "\n" 觸發 askconsole 啟用、命令文字被
+    # askfirst 吞掉、stdout 吃到啟用 banner。
     # agent 顯式命令 gate 改判 agent_gate_active()（quiet or pending），解除的
     # 唯一路徑＝READY 經 nonce probe 再確認；確認 probe 的 "\n" 順帶消耗 banner。
     ready_reconfirm_pending: bool = False
@@ -980,6 +981,7 @@ class SessionManager:
             log_dir=tpl.log_dir,
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
+            boot_done_regex=tpl.boot_done_regex,
             uart=tpl.uart,
         )
         sid = f"{profile.profile_name}:{com}"
@@ -2330,8 +2332,9 @@ class SessionManager:
         - RX 見到 boot banner（U-Boot 版本行／autoboot 倒數）→ 啟用／延長 quiet
           window。``arm_boot_quiet`` 同時清空 rolling tail，使 banner 之前殘留的
           舊 prompt 不會誤觸發解除（DUT 自行重開機、無人先呼叫 reboot 的情境）。
-        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex`` 或
-          ``prompt_regex``（開機完成訊號）→ 立即解除，讓 recovery / reprobe 恢復探測。
+        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex``、
+          ``prompt_regex`` 或 ``boot_done_regex``（開機完成訊號）→ 立即解除，讓
+          recovery / reprobe 恢復探測。
           但尾行先命中 ``bootloader_prompts``（見下方 Finding 3 說明）時例外不解除。
         - gate source=system 的自動 probe 與（#139）非 human 來源的 agent 顯式命令
           （submit/execute/file 傳輸雙層 gate）；不 gate human console／lease TX。
@@ -2363,7 +2366,10 @@ class SessionManager:
         # 解除 quiet window，讓後續自動 probe 又打斷一次 autoboot。
         if _matches_any_bootloader_prompt(tail, sp.bootloader_prompts) is not None:
             return
-        for pattern in (sp.login_regex, sp.prompt_regex):
+        # boot_done_regex：profile 宣告的開機完成訊號（例：prpl/OpenWrt askconsole 的
+        # 「Please press Enter to activate this console」）。askconsole 不匹配 login／prompt，
+        # 未設時只能等 BOOT_QUIET_WINDOW_S 過期；文案放 profile、不寫死在程式碼。
+        for pattern in (sp.login_regex, sp.prompt_regex, sp.boot_done_regex):
             if not pattern:
                 continue
             try:
@@ -2839,6 +2845,7 @@ class SessionManager:
             log_dir=tpl.log_dir,
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
+            boot_done_regex=tpl.boot_done_regex,
             uart=tpl.uart,
         )
         session.profile_source = source

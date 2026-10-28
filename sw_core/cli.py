@@ -1890,6 +1890,7 @@ def _run_profile_test(args: argparse.Namespace) -> int:
         "prompt_regex": _profile_test_check(tpl.prompt_regex, sample_text),
         "login_regex": _profile_test_check(tpl.login_regex, sample_text),
         "password_regex": _profile_test_check(tpl.password_regex, sample_text),
+        "boot_done_regex": _profile_test_check(tpl.boot_done_regex, sample_text),
         "bootloader_prompts": [
             _profile_test_bootloader_check(pattern, last_line) for pattern in tpl.bootloader_prompts
         ],
@@ -2417,10 +2418,10 @@ def build_parser() -> argparse.ArgumentParser:
     profile_sub = p_profile.add_subparsers(dest="profile_cmd", required=True, metavar="<command>")
     p_ptest = profile_sub.add_parser(
         "test",
-        help="對樣本文字逐一跑 prompt/login/password/bootloader regex，回報是否命中",
+        help="對樣本文字逐一跑 prompt/login/password/boot_done/bootloader regex，回報是否命中",
         description=(
             "從 --profile-dir 載入 profile YAML，找出 --profile 指定的 template，\n"
-            "對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／\n"
+            "對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／boot_done_regex／\n"
             "bootloader_prompts（逐條），stdout 印 JSON 回報各 regex 是否命中與命中的行。\n"
             "純離線診斷：不連 daemon、不碰任何 UART，exit code 恆為 0。"
         ),

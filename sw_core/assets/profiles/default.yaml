@@ -14,6 +14,9 @@ profiles:
     bootloader_prompts:
       - "^=> $"
       - "^U-Boot> $"
+    # 開機完成訊號：prplOS 開機後停在 askconsole，不匹配 login／prompt；命中即提早解除
+    # boot quiet window，免等滿 180s（實測目標板於 U-Boot banner 後約 18s 出現）。
+    boot_done_regex: "Please press Enter to activate this console"
     uart:
       baud: 115200
       data_bits: 8
