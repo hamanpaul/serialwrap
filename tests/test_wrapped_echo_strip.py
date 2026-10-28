@@ -60,6 +60,16 @@ class TestWrappedEchoStrip(unittest.TestCase):
                     raw = prefix + " \r".join(parts) + "\r\nOUT\r\n" + PROMPT
                     self.assertEqual(_extract(raw, CMD200), "OUT")
 
+    def test_wrap_before_command_whitespace_is_stripped_after_blank_line(self) -> None:
+        """折行標記緊貼命令原有空白時，前置空行與多次折行仍只留下 stdout。"""
+        command = "echo " + "x" * 74 + " " + "y" * 20
+        cuts = (30, 79)
+        parts = [command[start:end] for start, end in zip((0, *cuts), (*cuts, len(command)))]
+        for prefix in ("\n", "\r\n"):
+            with self.subTest(prefix=repr(prefix)):
+                raw = prefix + " \r".join(parts) + "\r\nOUT\r\n" + PROMPT
+                self.assertEqual(_extract(raw, command), "OUT")
+
     def test_readline_marker_too_close_to_command_start_is_not_accepted(self) -> None:
         command = "x" * 60
         raw = command[:10] + " \r" + command[10:] + "\r\nOUT\r\n" + PROMPT
