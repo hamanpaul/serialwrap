@@ -461,6 +461,83 @@ def test_assert_any_passes_if_one_alternative_passes(tmp_path):
     assert "assert_any" in str(exc.value)
 
 
+def test_assert_any_rejects_nested_side_effects_before_running_any_branch(tmp_path):
+    """sol P5-3c4e051-2：副作用白名單須遞迴檢查 then／else／of，且 assert_any 內的 wait_cli_until 只能是唯讀查詢；
+    拒絕發生在執行任何分支之前（CLI 呼叫次數為零），失敗分支不得留下受測狀態變更。"""
+    runner_mod = _load_runner()
+    tr = _make_runner(runner_mod, _FakeHarness(tmp_path), tmp_path / "reports")
+    calls: list[list[str]] = []
+    tr._cli = lambda argv, timeout=None: calls.append(list(argv)) or {"ok": True}  # type: ignore[method-assign]
+    nested = {"action": "assert_any", "of": [
+        [{"action": "assert_when", "value": True, "equals": True, "then": [
+            {"action": "cli", "argv": ["cmd", "submit", "--selector", "COM0", "--cmd", "echo MUTATION"]},
+            {"action": "assert_value", "value": False, "equals": True}]}],
+        [{"action": "assert_value", "value": True, "equals": True}],
+    ]}
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._exec_step(nested, 0)
+    assert "assert_any" in str(exc.value)
+    assert calls == []
+    mutating_wait = {"action": "assert_any", "of": [
+        [{"action": "wait_cli_until", "argv": ["cmd", "submit", "--selector", "COM0", "--cmd", "echo X"],
+          "json_path": "ok", "equals": True, "timeout_s": 0.1}],
+        [{"action": "assert_value", "value": True, "equals": True}],
+    ]}
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._exec_step(mutating_wait, 1)
+    assert "wait_cli_until" in str(exc.value)
+    assert calls == []
+    deep = {"action": "assert_any", "of": [[{"action": "assert_any", "of": [
+        [{"action": "assert_when", "value": True, "equals": False, "then": [],
+          "else": [{"action": "dut_control", "op": "reboot"}]}]]}]]}
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step(deep, 2)
+    # 唯讀查詢的 wait_cli_until 照常可用
+    tr._cli = lambda argv, timeout=None: calls.append(list(argv)) or {"sessions": [{"state": "READY"}]}  # type: ignore[method-assign]
+    ok = {"action": "assert_any", "of": [[{"action": "wait_cli_until", "argv": ["session", "list"],
+                                           "json_path": "sessions.0.state", "equals": "READY", "timeout_s": 1}]]}
+    tr._exec_step(ok, 3)
+    assert calls == [["session", "list"]]
+
+
+def test_assert_wire_tx_window_counts_wire_independently_of_cmd_id(tmp_path):
+    """sol P5-3c4e051-1：partial-TX 判準須以 op 窗口的 wire serial_read 位元組獨立計量，並要求等於該命令 WAL TX 總和；
+    錯誤 daemon 送完整 16001 bytes、WAL 卻記 `cmd_id: null` 時，`assert_wal_tx_total` 算 0 會誤過，此斷言必紅。"""
+    import base64
+
+    runner_mod = _load_runner()
+    h = _FakeHarness(tmp_path)
+    b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+    tr = _make_runner(runner_mod, h, tmp_path / "reports")
+    tr.variables["big"] = {"cmd_id": "c1"}
+
+    def window(start, end, *, settled=True):
+        snap = lambda off: {"settled": settled, "wire": {"offsets": {"serial_read": off}}}  # noqa: E731
+        tr._ops["pa"] = {"start": snap(start), "end": snap(end)}
+
+    # 錯置 cmd_id：wire 16001、WAL TX 16001 但 cmd_id null
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [{"dir": "TX", "cmd_id": None, "payload_b64": b64(b"x" * 16001)}])
+    window(100, 100 + 16001)
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._exec_step({"action": "assert_wire_tx_window", "op_id": "pa", "cmd_id": "{big.cmd_id}", "lt": 16001}, 0)
+    assert "16001" in str(exc.value)
+    # 正確歸屬但已寫完（wire＝WAL＝16001）：lt 16001 必紅（不得以完整送出冒充部分送出）
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [{"dir": "TX", "cmd_id": "c1", "payload_b64": b64(b"x" * 16001)}])
+    with pytest.raises(runner_mod.StepError):
+        tr._exec_step({"action": "assert_wire_tx_window", "op_id": "pa", "cmd_id": "{big.cmd_id}", "lt": 16001}, 1)
+    # 部分送出 4096 bytes：wire 與 WAL 一致 → 通過並保存 wire 計量供錯誤碼判定
+    _write_wal(h.wal_dir() / "raw.wal.ndjson", [{"dir": "TX", "cmd_id": "c1", "payload_b64": b64(b"x" * 4096)}])
+    window(100, 100 + 4096)
+    tr._exec_step({"action": "assert_wire_tx_window", "op_id": "pa", "cmd_id": "{big.cmd_id}", "lt": 16001,
+                   "save_as": "big_wire"}, 2)
+    assert tr.variables["big_wire"] == {"cmd_id": "c1", "op_id": "pa", "wire_tx_bytes": 4096, "wal_tx_bytes": 4096}
+    # 快照未 settled → 證據不足，不得 PASS
+    window(100, 200, settled=False)
+    with pytest.raises(runner_mod.StepError) as exc:
+        tr._exec_step({"action": "assert_wire_tx_window", "op_id": "pa", "cmd_id": "{big.cmd_id}", "lt": 16001}, 3)
+    assert "INSUFFICIENT_EVIDENCE" in str(exc.value)
+
+
 def test_query_dut_generation_reads_wire_records(tmp_path):
     """gaps #5：DUT generation 查詢——取 wire.ndjson 的最大 dut_generation，可接 expect。"""
     import json

@@ -779,6 +779,49 @@ fn shutdown_budget_5s() {
     assert!(drained(&sid1), "COM1 應 drained:true");
 }
 
+/// BC-03（產品 executor）：release 中止已部分送出的前景命令時，`command_aborted_in_flight` META 只寫一筆
+/// （Python 僅 worker 的 `_map_aborted_result` 寫；Rust 的 drain 回條與 op runner 不得各寫一筆）。
+#[test]
+fn release_partial_in_flight_command_writes_single_aborted_meta() {
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let dev = m.device("/dev/ttyOLD");
+    dev.script_write(vec![FakeWriteStep::BlockUntilCancel {
+        accept_before_cancel: 4,
+    }]);
+    let submits = dev.os_submits();
+    let sub = rpc(m
+        .mgr
+        .route(&sid, SessionRequest::Submit(agent_submit("sleep 1")), RPC));
+    let cmd_id = s_of(&sub, "cmd_id").expect("cmd_id");
+    wait_until("命令 TX 阻塞於 writer", || dev.os_submits() > submits);
+    let rel = rpc(m.mgr.route(
+        &sid,
+        SessionRequest::Release {
+            source: "agent".to_string(),
+            reason: PyValue::Null,
+        },
+        RPC,
+    ));
+    assert!(is_ok(&rel), "{rel:?}");
+    m.wait_state("COM0", "RELEASED");
+    let aborted = || {
+        m.wal_rows()
+            .into_iter()
+            .filter(|row| {
+                row.get("dir") == Some(&PyValue::from("META"))
+                    && row.get("cmd_id") == Some(&PyValue::from(cmd_id.as_str()))
+                    && matches!(row.get("meta"), Some(PyValue::Dict(meta))
+                        if meta.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+            })
+            .count()
+    };
+    wait_until("command_aborted_in_flight META 落盤", || aborted() >= 1);
+    // op runner 的 OpFinished 與 drain 回條先後不定：給雙方都完成的時間後再數。
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(aborted(), 1, "META 應只寫一筆：{:?}", m.wal_rows());
+}
+
 #[test]
 fn begin_shutdown_blocks_hotplug_open() {
     // SC-11 stopping gate：begin_shutdown 之後的熱插、bootstrap、recover 一律不 open、不建 session。

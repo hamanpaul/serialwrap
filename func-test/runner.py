@@ -1195,6 +1195,7 @@ class TestRunner:
             "assert_wire_offsets": self._step_assert_wire_offsets,
             "assert_any": self._step_assert_any,
             "assert_wal_tx_total": self._step_assert_wal_tx_total,
+            "assert_wire_tx_window": self._step_assert_wire_tx_window,
             "assert_wal_window": self._step_assert_wal_window,
             "query_dut_generation": self._step_query_dut_generation,
         }.get(action)
@@ -1930,6 +1931,7 @@ class TestRunner:
     PRE_DAEMON_ACTIONS = frozenset({"sleep", "op_begin", "external_open", "bridge_control", "dut_control"})
     # assert_any 的替代分支只能放無副作用的檢查（失敗分支不得留下 UART／daemon 副作用）
     _ASSERT_ANY_ACTIONS = frozenset({"assert_when", "assert_value", "assert_any", "assert_wal_tx_total", "assert_wal_window",
+                                     "assert_wire_tx_window",
                                      "query_dut_generation", "assert_wal_meta", "assert_wal_marker",
                                      "assert_wire_absent", "wait_cli_until", "wait_state"})
 
@@ -1980,12 +1982,39 @@ class TestRunner:
             cur = cur[part]
         return cur
 
+    # assert_any 內 wait_cli_until 只允許的唯讀查詢（argv 前綴）
+    _ASSERT_ANY_READONLY_CLI = (("session", "list"), ("session", "get-state"), ("session", "get"), ("cmd", "status"),
+                                ("cmd", "get"), ("daemon", "status"))
+
+    @classmethod
+    def _assert_any_side_effects(cls, steps: Any) -> list[str]:
+        """遞迴列出 assert_any 分支（含 then／else／of 巢狀）中的副作用動作（sol P5-3c4e051-2）；空列表表示可執行。"""
+        bad: list[str] = []
+        for sub in steps if isinstance(steps, list) else [steps]:
+            if not isinstance(sub, dict):
+                bad.append(repr(sub))
+                continue
+            action = sub.get("action")
+            if action not in cls._ASSERT_ANY_ACTIONS:
+                bad.append(str(action))
+                continue
+            if action == "wait_cli_until":
+                argv = sub.get("argv")
+                head = tuple(str(a) for a in argv[:2]) if isinstance(argv, list) else ()
+                if head not in cls._ASSERT_ANY_READONLY_CLI:
+                    bad.append(f"wait_cli_until{list(head)}")
+            for key in ("then", "else"):
+                bad.extend(cls._assert_any_side_effects(sub.get(key) or []))
+            for alt in sub.get("of") or []:
+                bad.extend(cls._assert_any_side_effects(alt))
+        return bad
+
     def _step_assert_any(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
         """OR 斷言（gaps #5）：`of` 中任一替代分支全部通過即通過；全部失敗列出各分支錯誤。"""
         alternatives = step.get("of") or []
         errors: list[str] = []
         for a, alt in enumerate(alternatives):
-            bad = [s.get("action") for s in alt if s.get("action") not in self._ASSERT_ANY_ACTIONS]
+            bad = self._assert_any_side_effects(alt)
             if bad:
                 raise StepError(f"步驟 {idx}: assert_any 分支 {a} 含有副作用動作 {bad}")
         for a, alt in enumerate(alternatives):
@@ -2029,6 +2058,43 @@ class TestRunner:
             if not fn(total, bound):
                 raise StepError(f"步驟 {idx}: assert_wal_tx_total({cmd_id}) 總和 {total} 不符 {key} {bound}")
         out = {"cmd_id": cmd_id, "tx_bytes": total}
+        if step.get("save_as"):
+            self.variables[str(step["save_as"])] = out
+        return out
+
+    def _step_assert_wire_tx_window(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
+        """wire TX 窗口斷言（sol P5-3c4e051-1）：以 op 窗口兩端 settled 快照的 `serial_read` 差值獨立計量 daemon 實際
+        寫出的 bytes，要求等於該 cmd_id 的 WAL TX 總和（漏記／錯置 cmd_id 即紅），再以 wire 計量套 lt／le／eq／ge／gt。"""
+        import base64
+        import operator
+
+        op_id = str(self._expand(step.get("op_id", "")))
+        cmd_id = str(self._expand(step.get("cmd_id", "")))
+        ops = {"lt": operator.lt, "le": operator.le, "eq": operator.eq, "ge": operator.ge, "gt": operator.gt}
+        given = [(k, ops[k]) for k in ops if k in step]
+        if not op_id or not cmd_id:
+            raise StepError(f"步驟 {idx}: assert_wire_tx_window 需 op_id 與 cmd_id")
+        win = self._ops.get(op_id) or {}
+        if "start" not in win or "end" not in win:
+            raise StepError(f"步驟 {idx}: assert_wire_tx_window 找不到已結案的 op '{op_id}'")
+        offsets = []
+        for edge in ("start", "end"):
+            snap = win[edge] or {}
+            off = ((snap.get("wire") or {}).get("offsets") or {}).get("serial_read")
+            if snap.get("settled") is not True or not isinstance(off, int):
+                raise StepError(f"INSUFFICIENT_EVIDENCE: 步驟 {idx}: assert_wire_tx_window op '{op_id}' {edge} 快照未 settled：{snap}")
+            offsets.append(off)
+        wire_tx = offsets[1] - offsets[0]
+        wal_tx = sum(len(base64.b64decode(r.get("payload_b64") or "")) for r in self._wal_rows()
+                     if r.get("dir") == "TX" and r.get("cmd_id") == cmd_id)
+        if wire_tx != wal_tx:
+            raise StepError(f"步驟 {idx}: assert_wire_tx_window({op_id}) wire serial_read {wire_tx} bytes ≠ "
+                            f"cmd_id {cmd_id} 的 WAL TX {wal_tx} bytes")
+        for key, fn in given:
+            bound = int(self._expand(step[key]))
+            if not fn(wire_tx, bound):
+                raise StepError(f"步驟 {idx}: assert_wire_tx_window({op_id}) wire {wire_tx} bytes 不符 {key} {bound}")
+        out = {"cmd_id": cmd_id, "op_id": op_id, "wire_tx_bytes": wire_tx, "wal_tx_bytes": wal_tx}
         if step.get("save_as"):
             self.variables[str(step["save_as"])] = out
         return out

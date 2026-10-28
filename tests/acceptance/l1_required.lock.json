@@ -9510,6 +9510,7 @@
           "cargo:sw-core::session_manager::rebind_drains_before_reopen",
           "cargo:sw-core::session_manager::recover_released_during_stopping_returns_released",
           "cargo:sw-core::session_manager::release_commit_paused_then_bind_keeps_binding_without_stale_released_row",
+          "cargo:sw-core::session_manager::release_partial_in_flight_command_writes_single_aborted_meta",
           "cargo:sw-core::session_manager::release_persist_point_failure_fails_release_commit",
           "cargo:sw-core::session_manager::released_dynamic_act_no_and_profile_source",
           "cargo:sw-core::session_manager::released_dynamic_materialize_template_fallback",

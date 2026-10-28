@@ -1886,6 +1886,7 @@ impl ManagerExec {
                     clock: self.shared.clock.clone(),
                     control: control.clone(),
                     rng: Arc::new(fill_random),
+                    registry: self.shared.registry.clone(),
                 };
                 self.runners.insert(epoch, OpRunner::spawn(ctx));
             }

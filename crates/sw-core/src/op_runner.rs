@@ -77,6 +77,8 @@ pub struct OpCtx {
     pub clock: Arc<dyn Clock>,
     pub control: crossbeam_channel::Sender<ControlEvent>,
     pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync>,
+    /// `command_aborted_in_flight` META 寫入權（與 drain 回條互斥；`CommandRegistry::claim_abort_meta`）。
+    pub registry: Arc<crate::arbiter::CommandRegistry>,
 }
 
 /// 前景 op 執行器（thread pool size 1 per session，ForegroundSlot；Task 14 Produces）。
@@ -521,15 +523,17 @@ fn map_send_failure(
         meta.insert("event", PyValue::from("command_aborted_in_flight"));
         meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
         meta.insert("tx_outcome", PyValue::from(tx_outcome));
-        let _ = ctx.wal.append(WalAppendReq {
-            com: &ctx.com,
-            dir: "META",
-            source: "system",
-            payload: b"",
-            cmd_id: Some(cmd_id),
-            loss_flag: false,
-            meta: Some(meta),
-        });
+        if ctx.registry.claim_abort_meta(cmd_id) {
+            let _ = ctx.wal.append(WalAppendReq {
+                com: &ctx.com,
+                dir: "META",
+                source: "system",
+                payload: b"",
+                cmd_id: Some(cmd_id),
+                loss_flag: false,
+                meta: Some(meta),
+            });
+        }
         return pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" };
     }
     if unknown {
@@ -769,15 +773,17 @@ fn recover_after_failure(
                         meta.insert("event", PyValue::from("command_aborted_in_flight"));
                         meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
                         meta.insert("tx_outcome", PyValue::from(tx_outcome));
-                        let _ = ctx.wal.append(WalAppendReq {
-                            com: &ctx.com,
-                            dir: "META",
-                            source: "system",
-                            payload: b"",
-                            cmd_id: Some(cmd_id),
-                            loss_flag: false,
-                            meta: Some(meta),
-                        });
+                        if ctx.registry.claim_abort_meta(cmd_id) {
+                            let _ = ctx.wal.append(WalAppendReq {
+                                com: &ctx.com,
+                                dir: "META",
+                                source: "system",
+                                payload: b"",
+                                cmd_id: Some(cmd_id),
+                                loss_flag: false,
+                                meta: Some(meta),
+                            });
+                        }
                         return OpOutcome::CommandResult(
                             pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
                         );

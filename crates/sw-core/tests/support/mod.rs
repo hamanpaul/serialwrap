@@ -902,6 +902,8 @@ struct RigExec {
     runners: HashMap<u64, OpRunner>,
     /// Task 14：現行 worker 的 TX 入口（`tx_ledger_gauge()` 用）。
     current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
+    /// 與 actor 共用的命令登錄表（op runner 的 abort META 寫入權）。
+    registry: Arc<CommandRegistry>,
 }
 
 /// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
@@ -1078,6 +1080,7 @@ impl EffectExecutor for RigExec {
                                 *b = i as u8;
                             }
                         }),
+                        registry: self.registry.clone(),
                     });
                     self.runners.insert(epoch, runner);
                 }
@@ -1204,6 +1207,7 @@ impl ActorRig {
             env: env.clone(),
             runners: HashMap::new(),
             current_tx: current_tx.clone(),
+            registry: reg.clone(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {

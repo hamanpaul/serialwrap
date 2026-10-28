@@ -3151,10 +3151,13 @@ impl SessionCore {
                     "partial"
                 }),
             );
-            effects.push(Effect::WalMeta {
-                cmd_id: Some(cmd_id.clone()),
-                meta,
-            });
+            // op runner 可能已於 `map_send_failure` 寫出同一筆（回條與 OpFinished 先後不定）：只寫一次。
+            if self.deps.registry.claim_abort_meta(cmd_id) {
+                effects.push(Effect::WalMeta {
+                    cmd_id: Some(cmd_id.clone()),
+                    meta,
+                });
+            }
         }
     }
 
