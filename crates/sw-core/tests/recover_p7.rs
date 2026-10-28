@@ -224,7 +224,9 @@ fn finish_clear_and_login_ready(h: &mut CoreHarness) {
 
 #[test]
 fn force_recover_replies_on_one_second_poll_grid() {
-    // Python `_force_recover`：`for _ in range(10): time.sleep(1.0); if READY: return`——READY 只在第 n 秒的輪詢點被看見。
+    // Python `_force_recover`：`clear_session`（有 bridge 時 `_await_drain` 等回條）返回後才
+    // `for _ in range(10): time.sleep(1.0); if READY: return`——輪詢格以 clear 返回為起點（審查 a0cad06_4221ba2
+    // a6b24f7-1 更正：drain 回條於 1.5 s、READY 同時 → Python 於 2.5 s 回覆；原期望 2.0 s 為偏離值）。
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
     let (reply, fx) = h.rpc_deferred(SessionRequest::Recover {
@@ -234,16 +236,56 @@ fn force_recover_replies_on_one_second_poll_grid() {
     assert_eq!(begin_drains(&fx), 1);
     h.advance(Duration::from_millis(1500));
     finish_clear_and_login_ready(&mut h);
-    assert!(reply.try_recv().is_err(), "READY 於 1.5 s，回覆須等到第 2 秒的輪詢點");
-    h.advance(Duration::from_millis(400));
-    assert!(reply.try_recv().is_err(), "1.9 s 尚未到輪詢點");
+    assert!(reply.try_recv().is_err(), "READY 於 1.5 s，回覆須等到 clear 返回後第 1 秒的輪詢點");
+    h.advance(Duration::from_millis(900));
+    assert!(reply.try_recv().is_err(), "2.4 s 尚未到輪詢點（舊偏離值 2.0 s 不得回覆）");
     h.advance(Duration::from_millis(100));
-    let r = reply.try_recv().expect("第 2 秒輪詢回覆").expect("ok");
+    let r = reply.try_recv().expect("2.5 s 輪詢回覆").expect("ok");
     assert_eq!(
         r.0.keys().map(String::as_str).collect::<Vec<_>>(),
         ["ok", "recovering", "action", "recovered", "session"]
     );
     assert_eq!(r["recovered"], PyValue::Bool(true));
+}
+
+#[test]
+fn force_recover_poll_grid_starts_after_clear_drain() {
+    // 審查 a0cad06_4221ba2 a6b24f7-1 輸入 B：drain 回條逾時（3 s，`_await_drain` 回 None）、板子 11 s 才 READY。
+    // Python 輪詢點 4…13 s → 12 s 回 `recovered:true`；舊實作輪詢點 1…10 s → 10 s 回 FORCE_RECOVER_TIMEOUT。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (reply, fx) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: true,
+    });
+    assert_eq!(begin_drains(&fx), 1);
+    h.advance(Duration::from_millis(5_000));
+    assert!(reply.try_recv().is_err());
+    // 逾時後回條才到（5 s）→ reattach → 開埠，登入 11 s 才 READY。
+    let (epoch, stop) = h.pending_stop();
+    let fx = h.receipt(epoch, stop).feed();
+    assert!(fx.iter().any(|e| matches!(e, Effect::Reattach { .. })), "clear 後 reattach");
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let fx = h.bridge_ok();
+    let (epoch, gen) = start_login(&fx).expect("reattach 後登入");
+    h.advance(Duration::from_millis(6_000));
+    assert!(reply.try_recv().is_err(), "10 s 不得以 FORCE_RECOVER_TIMEOUT 回覆（仍在 4…13 s 輪詢格內）");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    h.advance(Duration::from_millis(900));
+    assert!(reply.try_recv().is_err(), "11.9 s 尚未到輪詢點");
+    h.advance(Duration::from_millis(100));
+    let r = reply.try_recv().expect("12 s 輪詢回覆").expect("ok");
+    assert_eq!(r["recovered"], PyValue::Bool(true));
+    assert_eq!(r["action"], PyValue::from("FORCE_CLEAR_REATTACH"));
 }
 
 #[test]
@@ -266,9 +308,11 @@ fn duplicate_force_recover_joins_same_stop() {
     assert_eq!(r2["error_code"], PyValue::from("SESSION_RECOVERING"));
     assert!(r2.get("drain_stalled").is_some() && r2.get("drain_timeout_epoch").is_some());
     finish_clear_and_login_ready(&mut h);
-    assert!(first.try_recv().is_err(), "第一個等到第 1 秒輪詢點");
+    assert!(first.try_recv().is_err(), "第一個等到 clear 返回（0.3 s）後第 1 秒輪詢點");
     h.advance(Duration::from_millis(700));
-    let r1 = first.try_recv().expect("第一個於第 1 秒輪詢回覆").expect("ok");
+    assert!(first.try_recv().is_err(), "1.0 s 不是輪詢點（格以 clear 返回 0.3 s 起算）");
+    h.advance(Duration::from_millis(300));
+    let r1 = first.try_recv().expect("第一個於 1.3 s 輪詢回覆").expect("ok");
     assert_eq!(r1["recovered"], PyValue::Bool(true));
 }
 
@@ -280,7 +324,8 @@ fn force_recover_timeout_after_ten_polls_exact_shape() {
         timeout_s: 2.0,
         force: true,
     });
-    h.advance(Duration::from_millis(9_900));
+    // drain 回條未到：Python `_await_drain` 於 DRAIN_TIMEOUT_MS（3 s）回 None → clear 返回 → 輪詢 4…13 s。
+    h.advance(Duration::from_millis(12_900));
     assert!(reply.try_recv().is_err(), "10 次輪詢前不回覆");
     h.advance(Duration::from_millis(100));
     let r = reply.try_recv().expect("第 10 次輪詢後回覆").expect("ok");
@@ -306,11 +351,95 @@ fn stale_force_recover_poll_is_ignored() {
     }));
     assert!(fx.is_empty());
     assert!(reply.try_recv().is_err());
-    h.advance(Duration::from_millis(9_900));
+    // drain 逾時 3 s 後才開始輪詢（同上）。
+    h.advance(Duration::from_millis(12_900));
     assert!(reply.try_recv().is_err(), "仍依現行等待者自己的 10 次輪詢");
     h.advance(Duration::from_millis(100));
     assert_eq!(
         reply.try_recv().expect("逾時回覆").expect("ok")["error_code"],
         PyValue::from("FORCE_RECOVER_TIMEOUT")
     );
+}
+
+// --- 審查 a0cad06_4221ba2 a6b24f7-2：parity-amendments 必要列 #57／#117（`session_manager.py:7694-7797`）。
+
+#[test]
+fn recover_during_drain_returns_session_recovering_immediately() {
+    // #57：`_pending_drain is not None` 為 recover_session 第一個分支——立即回 SESSION_RECOVERING＋drain 欄位，
+    // 不掛 StopOp waiter、不開 bridge、不另起 drain；回條後是否 reattach 只依該 drain 的 kind（此處 clear）。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (clear_reply, fx) = h.rpc_deferred(SessionRequest::Clear);
+    assert_eq!(begin_drains(&fx), 1);
+    for force in [false, true] {
+        let (r, fx) = h.rpc_full(SessionRequest::Recover {
+            timeout_s: 2.0,
+            force,
+        });
+        let r = r.expect("drain 中 recover 立即回覆");
+        assert_eq!(
+            r.0.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+            "force={force}"
+        );
+        assert_eq!(r["error_code"], PyValue::from("SESSION_RECOVERING"));
+        assert!(
+            !fx.iter().any(|e| matches!(
+                e,
+                Effect::OpenBridge { .. } | Effect::BeginDrain { .. } | Effect::Reattach { .. }
+            )),
+            "回條前不得重開端點或另起 drain（§11.3-4）"
+        );
+    }
+    let (epoch, stop) = h.pending_stop();
+    // recover 已同步回覆（rpc_full 斷言同步路徑）＝未掛 waiter；回條後 reattach 屬 clear。
+    let fx = h.receipt(epoch, stop).feed();
+    assert!(fx.iter().any(|e| matches!(e, Effect::Reattach { .. })), "clear 的回條照常 reattach");
+    assert!(clear_reply.try_recv().is_ok(), "clear 的 waiter 於回條後回覆");
+}
+
+#[test]
+fn recover_not_ready_non_force_returns_not_ready() {
+    // #117：有 bridge、state 非 READY／ATTACHED（ATTACHING：登入進行中）且非 force → `SESSION_NOT_READY`＋session。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    let fx = h.bridge_ok();
+    assert!(start_login(&fx).is_some());
+    assert_eq!(h.core.state(), SessionState::Attaching);
+    let (r, fx) = h.rpc_full(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    let r = r.expect("ok");
+    assert_eq!(
+        r.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "error_code", "session"]
+    );
+    assert_eq!(r["ok"], PyValue::Bool(false));
+    assert_eq!(r["error_code"], PyValue::from("SESSION_NOT_READY"));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::BeginDrain { .. } | Effect::OpenBridge { .. })));
+    assert_eq!(h.core.state(), SessionState::Attaching);
+}
+
+#[test]
+fn recover_resets_credentials_warned() {
+    // #117／#140：手動 recover 為重新介入，`credentials_warned = False`——ATTACHED（CREDENTIALS_UNRESOLVED 已告警
+    // 一次）recover 非 force → 再探重新解析帳密，仍未補齊 → 再告警一次。
+    let h = ActorRig::new(CRED_PROFILE).attach();
+    h.wait_state("ATTACHED");
+    let warned = |h: &ActorRig| {
+        h.stderr_lines()
+            .iter()
+            .filter(|l| l.contains("帳密解析未完成"))
+            .count()
+    };
+    assert_eq!(warned(&h), 1);
+    let r = h.request(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    assert_eq!(r["action"], PyValue::from("REPROBE"), "{r:?}");
+    assert_eq!(r["recovered"], PyValue::Bool(false));
+    assert_eq!(r["last_error"], PyValue::from("CREDENTIALS_UNRESOLVED"));
+    assert_eq!(warned(&h), 2, "recover 重置 credentials_warned 後再遇終態須再告警");
 }

@@ -31,4 +31,5 @@
 | P7-BU-2 | reprobe 的 `human_active`（`lease_context(...)["human_active"]`）；`human_active_blocks_reprobe` | 07 T7 |
 | P7-BU-3 | `session_attach_paths` 的「ATTACHED 且 last_error None」null 子案（需 human lease 持有中的 capable ATTACHED） | 07 T7／T10 |
 | P7-BU-5 | Task 9：force recover 的 drain Phase 1 `invalidate_human_input(Recovery)`（`force_clear_invalidates_human_input`）與 READY recover 前的 `invalidate_deferred("recover")`；Task 10：`slow_capture_fs_does_not_block_actor_control_lane`（需新增 `Effect::CaptureOpen／CaptureClose`，須改 P5 `tests/support` 窮舉 executor） | 07 T6 D-02；P5 測試支援碼 |
+| P7-BU-6 | recover 的 `_released_by_ids` 判定（Python `recover_session` `:7709`：state 非 RELEASED 但 by_id 已 release → `{"ok":true,"released":true,"recommended_action":"device_attach",…}`）；manager `route` 只在 stopping 時檢查（審查 a0cad06_4221ba2 a6b24f7-3） | P5 `session_manager.rs` route／`SessionRequest::Recover` 欄位 |
 | P7-BU-4 | production executor 對 P6 `Effect::Console*`／`HumanTx`／`LeaseIndex` 為 `todo!`（同 tests/support）；P6 合入前 SessionCore 不產生 | 07 T6／T7／T9 |

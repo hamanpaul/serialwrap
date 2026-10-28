@@ -291,3 +291,124 @@ fn first_log_start_reply_session_has_active_capture() {
     assert_eq!(cap["line_count"], int(0));
     assert_eq!(cap["byte_count"], int(0));
 }
+
+#[test]
+fn session_capture_counts_are_live() {
+    // 審查 p7-cloud a0cad06_4221ba2 397a473-1：Python `to_public_dict()` 的 capture 子 dict 讀
+    // `active_capture.line_count／byte_count`（`_on_bridge_rx` 即時累加）。LogStart → RX `a\nb\n` → LogStatus：
+    // 頂層與 `session.capture` 皆 2／4，`get_state` 快照亦同。
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let h = rig_with_log_dir(&dir);
+    h.request(SessionRequest::LogStart);
+    h.inject_rx(b"a\nb\n");
+    h.wait_for("a、b 寫入", |h| {
+        h.request(SessionRequest::LogStatus)["line_count"] == int(2)
+    });
+    let status = h.request(SessionRequest::LogStatus);
+    assert_eq!(status["byte_count"], int(4));
+    let nested = |d: &PyDict| match &d["session"] {
+        PyValue::Dict(s) => match &s["capture"] {
+            PyValue::Dict(c) => (c["line_count"].clone(), c["byte_count"].clone()),
+            other => panic!("session.capture：{other:?}"),
+        },
+        other => panic!("session：{other:?}"),
+    };
+    assert_eq!(nested(&status), (int(2), int(4)), "log_status 的 session.capture 須為即時計數");
+    let state = h.get_state();
+    match &state["capture"] {
+        PyValue::Dict(c) => assert_eq!((c["line_count"].clone(), c["byte_count"].clone()), (int(2), int(4))),
+        other => panic!("get_state capture：{other:?}"),
+    }
+}
+
+// --- 審查 a0cad06_4221ba2 397a473-2：08 Task 10 表列的 actor 層 log RPC 測試（`session_manager.py:7893-7968`）。
+
+fn session_capture(d: &PyDict) -> PyValue {
+    match &d["session"] {
+        PyValue::Dict(s) => s["capture"].clone(),
+        other => panic!("session：{other:?}"),
+    }
+}
+
+#[test]
+fn log_start_already_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let h = rig_with_log_dir(&dir);
+    let first = h.request(SessionRequest::LogStart);
+    let second = h.request(SessionRequest::LogStart);
+    assert_eq!(keys(&second), ["ok", "already_active", "capture_id", "log_path", "session"]);
+    assert_eq!(second["ok"], PyValue::Bool(true));
+    assert_eq!(second["already_active"], PyValue::Bool(true));
+    assert_eq!(second["capture_id"], first["capture_id"]);
+    assert_eq!(second["log_path"], first["log_path"]);
+    assert!(matches!(session_capture(&second), PyValue::Dict(_)));
+}
+
+#[test]
+fn log_stop_without_capture() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let h = rig_with_log_dir(&dir);
+    let r = h.request(SessionRequest::LogStop);
+    assert_eq!(keys(&r), ["ok", "error_code", "session"]);
+    assert_eq!(r["ok"], PyValue::Bool(false));
+    assert_eq!(r["error_code"], PyValue::from("NO_ACTIVE_CAPTURE"));
+    assert_eq!(session_capture(&r), PyValue::Null);
+}
+
+#[test]
+fn log_status_inactive_and_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let h = rig_with_log_dir(&dir);
+    let idle = h.request(SessionRequest::LogStatus);
+    assert_eq!(keys(&idle), ["ok", "active", "session"]);
+    assert_eq!(idle["active"], PyValue::Bool(false));
+    assert_eq!(session_capture(&idle), PyValue::Null);
+    let start = h.request(SessionRequest::LogStart);
+    h.inject_rx(b"line\n");
+    h.wait_for("line 寫入", |h| {
+        h.request(SessionRequest::LogStatus)["line_count"] == int(1)
+    });
+    let active = h.request(SessionRequest::LogStatus);
+    assert_eq!(
+        keys(&active),
+        ["ok", "active", "capture_id", "log_path", "line_count", "byte_count", "started_at", "session"]
+    );
+    assert_eq!(active["active"], PyValue::Bool(true));
+    assert_eq!(active["capture_id"], start["capture_id"]);
+    assert_eq!((active["line_count"].clone(), active["byte_count"].clone()), (int(1), int(5)));
+    match session_capture(&active) {
+        PyValue::Dict(c) => {
+            assert_eq!(c["capture_id"], start["capture_id"]);
+            assert_eq!((c["line_count"].clone(), c["byte_count"].clone()), (int(1), int(5)));
+        }
+        other => panic!("session.capture：{other:?}"),
+    }
+}
+
+#[test]
+fn log_open_failed_detail_is_python_oserror_str() {
+    // root 下唯讀目錄無效，改以「log 檔路徑已是目錄」觸發 `open(path, "a")` 失敗（FakeClock 不前進 → 第二次
+    // log_start 的檔名相同）。Python：POSIX `IsADirectoryError` → `[Errno 21] Is a directory: '<path>'`；Windows
+    // 開目錄為 `PermissionError` → `[Errno 13] Permission denied: '<path>'`（Windows 原生列 P7-LW-3）。
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("logs").to_string_lossy().into_owned();
+    let h = rig_with_log_dir(&dir);
+    let first = h.request(SessionRequest::LogStart);
+    let path = first["log_path"].as_str().unwrap().to_string();
+    h.request(SessionRequest::LogStop);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let r = h.request(SessionRequest::LogStart);
+    assert_eq!(keys(&r), ["ok", "error_code", "detail"]);
+    assert_eq!(r["error_code"], PyValue::from("LOG_OPEN_FAILED"));
+    let expected = if std::path::MAIN_SEPARATOR == '\\' {
+        format!("[Errno 13] Permission denied: '{path}'")
+    } else {
+        format!("[Errno 21] Is a directory: '{path}'")
+    };
+    assert_eq!(r["detail"], PyValue::from(expected));
+}

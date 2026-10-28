@@ -404,6 +404,9 @@ pub struct SessionCore {
     /// force recover 的等待者（每個呼叫各自 10 次 × 1 s 輪詢，Python 各 thread 獨立 `_force_recover`）。
     force_recover: Vec<ForceRecover>,
     next_force_id: u64,
+    /// 本次 force 建立的 clear drain 尚未結束（收到回條或 3 s 逾時）的 force id：Python `_force_recover` 在
+    /// `clear_session` 的 `_await_drain` 返回後才開始 `for _ in range(10): sleep(1.0)`（審查 a6b24f7-1）。
+    force_poll_after_clear: Vec<u64>,
     /// self-test 的外部觀測注入（RELEASED holder 掃描、哨兵 PTY 存活）。
     self_test_probes: SelfTestProbes,
     /// 最近一筆 RX 的 WAL seq（capture `last_seq`）。
@@ -571,6 +574,7 @@ impl SessionCore {
             reboot_recovery: None,
             force_recover: Vec::new(),
             next_force_id: 0,
+            force_poll_after_clear: Vec::new(),
             self_test_probes: SelfTestProbes::default(),
             last_rx_wal_seq: 0,
             pending_release: None,
@@ -733,6 +737,7 @@ impl SessionCore {
                 effects.0.extend(self.console_event(ev, now));
             }
         }
+        effects.0.extend(self.release_force_polls(now));
         // P7 Task 10：reader 端 agent log 的前景 gate（Python `session.foreground_busy`，只計命令，EVT-D-L1）。
         let busy = self.foreground_busy();
         self.capture_observer.set_foreground_busy(busy);
@@ -891,12 +896,18 @@ impl SessionCore {
             "capture",
             match &self.log_capture {
                 Some(cap) => {
+                    // 計數由 reader 端 `CaptureObserver` 即時累加（Python `_on_bridge_rx` 寫
+                    // `active_capture.line_count`）；審查 a0cad06_4221ba2 397a473-1。
+                    let (line_count, byte_count) = self
+                        .capture_observer
+                        .counts(&cap.capture_id)
+                        .unwrap_or((cap.line_count, cap.byte_count));
                     let mut d = PyDict::new();
                     d.insert("capture_id", PyValue::from(cap.capture_id.clone()));
                     d.insert("log_path", PyValue::from(cap.log_path.clone()));
                     d.insert("status", PyValue::from(cap.status));
-                    d.insert("line_count", py_int(cap.line_count as i128));
-                    d.insert("byte_count", py_int(cap.byte_count as i128));
+                    d.insert("line_count", py_int(line_count as i128));
+                    d.insert("byte_count", py_int(byte_count as i128));
                     PyValue::Dict(d)
                 }
                 None => PyValue::Null,
@@ -4721,19 +4732,31 @@ impl SessionCore {
             crate::reprobe::reset(&mut self.reprobe);
             self.credentials_warned = false;
         }
+        // 分支只依 `plan_recover`（審查 a0cad06_4221ba2 a6b24f7-4：不另以 conn_epoch／state 重算一份）。
         match plan {
             RecoverPlan::DrainBusy => {
-                return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+                vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))]
             }
             RecoverPlan::Reply(mut out) => {
                 out.insert("session", self.session_value(now));
-                return vec![Effect::Reply(reply, Ok(out))];
+                vec![Effect::Reply(reply, Ok(out))]
             }
-            _ => {}
-        }
-        if self.generations.conn_epoch.is_none() {
-            if self.device_present && self.open_real_path.is_none() && self.pending_attach.is_none()
-            {
+            RecoverPlan::Reattach => {
+                let reattach_reply = |core: &Self| {
+                    pydict! {
+                        "ok" => true,
+                        "recovering" => false,
+                        "action" => "REATTACH",
+                        "session" => core.session_value(now),
+                    }
+                };
+                if self.open_real_path.is_some() || self.pending_attach.is_some() {
+                    // attach 已在進行（開檔中）：Python `_spawn_attach` 對 in-flight attach 直接返回，回應仍是
+                    // REATTACH；不重複發 `OpenBridge`（審查 F29）。
+                    self.set_last_error(None, None);
+                    self.set_state(SessionState::Attaching, now);
+                    return vec![Effect::Reply(reply, Ok(reattach_reply(self)))];
+                }
                 let real_path = self
                     .known_real_path
                     .clone()
@@ -4743,48 +4766,20 @@ impl SessionCore {
                 self.open_generation = self.generations.fsm_gen;
                 self.open_real_path = Some(real_path.clone());
                 self.set_state(SessionState::Attaching, now);
-                return vec![
+                vec![
                     Effect::OpenBridge {
                         dev: DevicePath(real_path),
                         cfg: self.serial_config(),
                         precheck_holders: false,
                     },
-                    Effect::Reply(
-                        reply,
-                        Ok(pydict! {
-                            "ok" => true,
-                            "recovering" => false,
-                            "action" => "REATTACH",
-                            "session" => self.session_value(now),
-                        }),
-                    ),
-                ];
+                    Effect::Reply(reply, Ok(reattach_reply(self))),
+                ]
             }
-            if self.device_present {
-                // attach 已在進行（開檔中）：Python `_spawn_attach` 對 in-flight attach 直接返回，回應仍是
-                // REATTACH；不重複發 `OpenBridge`（審查 F29）。
-                self.set_last_error(None, None);
-                self.set_state(SessionState::Attaching, now);
-                return vec![Effect::Reply(
-                    reply,
-                    Ok(pydict! {
-                        "ok" => true,
-                        "recovering" => false,
-                        "action" => "REATTACH",
-                        "session" => self.session_value(now),
-                    }),
-                )];
-            }
-            return vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))];
-        }
-        match self.state {
-            SessionState::Attached => {
-                if force {
-                    return self.start_force_recover(reply, ForceKind::Direct, now);
-                }
+            RecoverPlan::Force => self.start_force_recover(reply, ForceKind::Direct, now),
+            RecoverPlan::Reprobe => {
                 self.reprobe_existing_bridge(reply, ReprobeWaiter::Recover { force: false }, now)
             }
-            SessionState::Ready => {
+            RecoverPlan::ReadyKeys => {
                 // Python `recover_session` READY 分支不看 `foreground_busy`：救援鍵與在途命令並行（審查 F25）。
                 let grant = self.new_grant(None);
                 self.pending_ops
@@ -4794,12 +4789,6 @@ impl SessionCore {
                     grant,
                     spec: OpSpec::Recover { timeout_s, force },
                 }]
-            }
-            _ => {
-                if force {
-                    return self.start_force_recover(reply, ForceKind::Direct, now);
-                }
-                vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))]
             }
         }
     }
@@ -4839,9 +4828,38 @@ impl SessionCore {
         self.next_force_id = self.next_force_id.saturating_add(1);
         let id = self.next_force_id;
         self.force_recover.push(ForceRecover { id, reply, kind });
+        // Python `clear_session`：既有 drain（`_pending_drain`）或無 bridge → 立即返回；本次新建 drain →
+        // `_await_drain` 等回條（≤ DRAIN_TIMEOUT_MS）。輪詢格以 clear 返回為起點。
+        let existing = self.stop.is_some() || self.pending_open_stop.is_some();
         let mut effects = self.begin_stop(StopKind::Clear, None, now).0;
-        effects.push(self.schedule_force_poll(id, 1, now));
+        if !existing && self.clear_drain_in_progress() {
+            self.force_poll_after_clear.push(id);
+        } else {
+            effects.push(self.schedule_force_poll(id, 1, now));
+        }
         effects
+    }
+
+    /// 本 session 有未結束（未 stalled）的 clear drain。stalled＝Python `_await_drain` 已以逾時返回。
+    fn clear_drain_in_progress(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|stop| stop.kind == StopKind::Clear && !stop.stalled)
+            || self
+                .pending_open_stop
+                .as_ref()
+                .is_some_and(|pending| pending.kind == StopKind::Clear && !pending.stalled)
+    }
+
+    /// clear drain 結束（回條、逾時 stalled 或被其他 stop 取代）時，替等待中的 force 排第 1 次輪詢。
+    fn release_force_polls(&mut self, now: Mono) -> Vec<Effect> {
+        if self.force_poll_after_clear.is_empty() || self.clear_drain_in_progress() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.force_poll_after_clear)
+            .into_iter()
+            .map(|id| self.schedule_force_poll(id, 1, now))
+            .collect()
     }
 
     fn schedule_force_poll(&self, id: u64, n: u32, now: Mono) -> Effect {

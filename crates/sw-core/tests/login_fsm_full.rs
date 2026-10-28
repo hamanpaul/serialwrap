@@ -287,7 +287,10 @@ fn refusal_and_partial_write_abort_without_further_tx() {
     assert_eq!(rig2.tx_attempts(), 3);
 }
 
-#[test] // NotSubmitted 且無 reject → Aborted(Cancelled)
+// 名稱為歷史遺留（nodeid 已入 L1 鎖，不改名）：merge P5 F16 後 draining（Frozen）不屬 `_login_tx_refused`，
+// 結果為 `Raised{TxIncompleteError}`，不是 Cancelled。同斷言的正確名稱見
+// `not_submitted_frozen_raises_tx_incomplete_error`（審查 a0cad06_4221ba2 a089f9f-1）。
+#[test]
 fn not_submitted_without_reject_is_cancelled() {
     let sp = prpl();
     let rig = LoginRig::new()
@@ -302,6 +305,24 @@ fn not_submitted_without_reject_is_cancelled() {
         }
     );
     assert_eq!(rig.tx_attempts(), 1);
+}
+
+#[test]
+fn not_submitted_frozen_raises_tx_incomplete_error() {
+    // Python `uart_io.py`：draining（Frozen）的 TX 未送出 → `TxIncompleteError("tx incomplete: not_submitted 0/1 draining")`，
+    // 非 `_login_tx_refused`（只認 quiet／stale_login_gen）→ 穿出 FSM。
+    let sp = prpl();
+    let rig = LoginRig::new()
+        .reject_after(0, FenceReject::Frozen)
+        .build();
+    assert_eq!(
+        probe_ready(&rig.io(), &sp),
+        LoginOutcome::Raised {
+            exc: "TxIncompleteError".into(),
+            message: "tx incomplete: not_submitted 0/1 draining".into(),
+        }
+    );
+    assert_eq!(rig.tx_attempts(), 1, "第一筆被拒後不再送");
 }
 
 #[test] // Python 實測（unlock_cfe_history）：(True, None)、virtual 11.05、TX ["\n", secret, nonce]
