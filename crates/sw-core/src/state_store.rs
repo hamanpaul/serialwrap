@@ -70,6 +70,8 @@ pub struct LoadedState {
     pub released: IndexMap<String, ReleasedRow>,
     pub profile_pins: IndexMap<String, String>,
     pub profile_detected: IndexMap<String, String>,
+    /// 本次載入遇到孤立 surrogate（以 `U+10F800..` 標記承載；啟動存檔前據此重現 Python 的 `UnicodeEncodeError`）。
+    pub lone_surrogates: bool,
 }
 
 /// `StateLoadError` 的來源分類（決定 daemon 的 exit code 與 stderr 形狀）。
@@ -252,56 +254,197 @@ fn detect_json_encoding(b: &[u8]) -> &'static str {
     "utf-8"
 }
 
-/// `bytes.decode(detect_encoding(b), "surrogatepass")` 的嚴格對應（Rust 字串不能承載孤立 surrogate：
-/// 該類輸入回解碼錯誤，屬已知限制）。
-fn json_bytes_to_text(raw: &[u8]) -> Result<String, String> {
+/// 孤立 surrogate（U+D800..=U+DFFF）的私有表示起點：`U+10F800 + (u - 0xD800)`（2048 個，落在 U+10F800..=U+10FFFF）。
+///
+/// Python `json.loads(bytes)` 以 `surrogatepass` 解碼、`\uXXXX` 跳脫也可產生孤立 surrogate；Rust `String` 無法承載，
+/// 故載入時改以此區段標記，啟動存檔前再依標記重現 Python `_save_state` 的 `UnicodeEncodeError`（審查 47c7b25 #1）。
+/// 只有在本次載入確實遇到孤立 surrogate 時才解讀此區段（`LoadedState::lone_surrogates`）；同檔同時含此區段的真實字元屬已知限制。
+const SURROGATE_MARK_BASE: u32 = 0x10F800;
+
+fn surrogate_mark(u: u32) -> char {
+    char::from_u32(SURROGATE_MARK_BASE + (u - 0xD800)).expect("U+10F800..=U+10FFFF 為合法 char")
+}
+
+/// 若 `c` 是孤立 surrogate 標記，回原 surrogate 值。
+fn marked_surrogate(c: char) -> Option<u32> {
+    let v = c as u32;
+    (SURROGATE_MARK_BASE..=0x10FFFF).contains(&v).then(|| v - SURROGATE_MARK_BASE + 0xD800)
+}
+
+/// Python `_save_state` 以 UTF-8 文字模式寫入含孤立 surrogate 的 payload 時的例外末行；無標記回 `None`。
+///
+/// 位置為 payload（`json.dumps(...)+"\n"`）中第一個 surrogate 的字元索引（code point 計）。
+pub fn lone_surrogate_encode_error(payload: &str) -> Option<String> {
+    payload.chars().enumerate().find_map(|(i, c)| {
+        marked_surrogate(c).map(|u| {
+            format!("UnicodeEncodeError: 'utf-8' codec can't encode character '\\u{u:04x}' in position {i}: surrogates not allowed")
+        })
+    })
+}
+
+/// `bytes.decode(detect_encoding(b), "surrogatepass")`：孤立 surrogate 轉為標記字元，回 `(text, 是否遇到孤立 surrogate)`。
+/// 錯誤訊息依 CPython 3.12 實測：位置以原始 `raw` 的 offset 計（含 BOM），UTF-32 多 byte 時為 `bytes in position S-E`。
+fn json_bytes_to_text(raw: &[u8]) -> Result<(String, bool), String> {
     let codec = detect_json_encoding(raw);
-    let utf16 = |body: &[u8], be: bool, name: &str| -> Result<String, String> {
-        if body.len() % 2 != 0 {
-            return Err(format!(
-                "'{name}' codec can't decode byte 0x{:02x} in position {}: truncated data",
-                body[body.len() - 1],
-                body.len() - 1
-            ));
+    let marked = std::cell::Cell::new(false);
+    let byte_err = |name: &str, s: usize, e: usize, reason: &str| -> String {
+        if e == s {
+            format!("'{name}' codec can't decode byte 0x{:02x} in position {s}: {reason}", raw[s])
+        } else {
+            format!("'{name}' codec can't decode bytes in position {s}-{e}: {reason}")
         }
-        let units = body
-            .chunks_exact(2)
-            .map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) });
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|_| format!("'{name}' codec can't decode bytes: illegal UTF-16 surrogate"))
     };
-    let utf32 = |body: &[u8], be: bool, name: &str| -> Result<String, String> {
-        if body.len() % 4 != 0 {
-            return Err(format!("'{name}' codec can't decode bytes: truncated data"));
+    let utf16 = |off: usize, be: bool, name: &str| -> Result<String, String> {
+        let body = &raw[off..];
+        let mut out = String::with_capacity(body.len() / 2);
+        let unit = |i: usize| {
+            let c = [body[i], body[i + 1]];
+            u32::from(if be { u16::from_be_bytes(c) } else { u16::from_le_bytes(c) })
+        };
+        let mut i = 0;
+        while i + 1 < body.len() {
+            let u = unit(i);
+            if (0xD800..=0xDBFF).contains(&u) && i + 3 < body.len() && (0xDC00..=0xDFFF).contains(&unit(i + 2)) {
+                out.push(char::from_u32(0x10000 + ((u - 0xD800) << 10) + (unit(i + 2) - 0xDC00)).unwrap());
+                i += 4;
+            } else if (0xD800..=0xDFFF).contains(&u) {
+                out.push(surrogate_mark(u));
+                marked.set(true);
+                i += 2;
+            } else {
+                out.push(char::from_u32(u).unwrap());
+                i += 2;
+            }
         }
-        body.chunks_exact(4)
-            .map(|c| {
-                let v = if be {
-                    u32::from_be_bytes([c[0], c[1], c[2], c[3]])
-                } else {
-                    u32::from_le_bytes([c[0], c[1], c[2], c[3]])
-                };
-                char::from_u32(v).ok_or_else(|| format!("'{name}' codec can't decode bytes: code point not in range(0x110000)"))
-            })
-            .collect()
+        if i < body.len() {
+            return Err(byte_err(name, off + i, off + body.len() - 1, "truncated data"));
+        }
+        Ok(out)
     };
-    match codec {
+    let utf32 = |off: usize, be: bool, name: &str| -> Result<String, String> {
+        let body = &raw[off..];
+        let mut out = String::with_capacity(body.len() / 4);
+        let mut i = 0;
+        while i + 3 < body.len() {
+            let c = [body[i], body[i + 1], body[i + 2], body[i + 3]];
+            let v = if be { u32::from_be_bytes(c) } else { u32::from_le_bytes(c) };
+            if (0xD800..=0xDFFF).contains(&v) {
+                out.push(surrogate_mark(v));
+                marked.set(true);
+            } else if let Some(ch) = char::from_u32(v) {
+                out.push(ch);
+            } else {
+                return Err(byte_err(name, off + i, off + i + 3, "code point not in range(0x110000)"));
+            }
+            i += 4;
+        }
+        if i < body.len() {
+            return Err(byte_err(name, off + i, off + body.len() - 1, "truncated data"));
+        }
+        Ok(out)
+    };
+    let text = match codec {
         "utf-32" => {
             let be = raw.starts_with(&[0x00, 0x00, 0xFE, 0xFF]);
-            utf32(&raw[4..], be, if be { "utf-32-be" } else { "utf-32-le" })
+            utf32(4, be, if be { "utf-32-be" } else { "utf-32-le" })
         }
         "utf-16" => {
             let be = raw.starts_with(&[0xFE, 0xFF]);
-            utf16(&raw[2..], be, if be { "utf-16-be" } else { "utf-16-le" })
+            utf16(2, be, if be { "utf-16-be" } else { "utf-16-le" })
         }
-        "utf-16-be" => utf16(raw, true, codec),
-        "utf-16-le" => utf16(raw, false, codec),
-        "utf-32-be" => utf32(raw, true, codec),
-        "utf-32-le" => utf32(raw, false, codec),
-        "utf-8-sig" => decode_utf8_strict(&raw[3..]).map_err(|e| e.to_string()),
-        _ => decode_utf8_strict(raw).map_err(|e| e.to_string()),
+        "utf-16-be" => utf16(0, true, codec),
+        "utf-16-le" => utf16(0, false, codec),
+        "utf-32-be" => utf32(0, true, codec),
+        "utf-32-le" => utf32(0, false, codec),
+        "utf-8-sig" => utf8_surrogatepass(&raw[3..], &marked),
+        _ => utf8_surrogatepass(raw, &marked),
+    }?;
+    Ok((text, marked.get()))
+}
+
+/// UTF-8 `surrogatepass`：完整的 `ED A0..BF 80..BF` 視為孤立 surrogate，其餘依嚴格 UTF-8（錯誤訊息不變）。
+///
+/// 先以等長的 U+FFFD（3 bytes）佔位交給嚴格解碼，故其餘錯誤的位置與 Python 相同；成功後再把佔位換回標記。
+fn utf8_surrogatepass(b: &[u8], marked: &std::cell::Cell<bool>) -> Result<String, String> {
+    let mut spots: Vec<(usize, u32)> = Vec::new();
+    let mut i = 0;
+    while i + 2 < b.len() {
+        if b[i] == 0xED && (0xA0..=0xBF).contains(&b[i + 1]) && (0x80..=0xBF).contains(&b[i + 2]) {
+            spots.push((i, 0xD000 | (u32::from(b[i + 1] & 0x3F) << 6) | u32::from(b[i + 2] & 0x3F)));
+            i += 3;
+        } else {
+            i += 1;
+        }
     }
+    if spots.is_empty() {
+        return decode_utf8_strict(b).map_err(|e| e.to_string());
+    }
+    let mut patched = b.to_vec();
+    for &(at, _) in &spots {
+        patched[at..at + 3].copy_from_slice("\u{FFFD}".as_bytes());
+    }
+    let text = decode_utf8_strict(&patched).map_err(|e| e.to_string())?;
+    marked.set(true);
+    let mut out = String::with_capacity(text.len());
+    let mut next = spots.iter().peekable();
+    for (at, c) in text.char_indices() {
+        match next.peek() {
+            Some(&&(pos, u)) if pos == at => {
+                out.push(surrogate_mark(u));
+                next.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// JSON 字串內的孤立 `\uXXXX` surrogate 跳脫改寫為標記字元（Python `py_scanstring` 的配對規則：high 後緊接 `\u`
+/// 且為 low 才合併；其餘孤立）。沒有可改寫者回 `None`。只供載入使用：改寫後解析失敗時呼叫端改以原文取得錯誤訊息。
+fn mark_lone_surrogate_escapes(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let hex4 = |at: usize| -> Option<u32> {
+        let h = b.get(at..at + 4)?;
+        u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok().filter(|_| h.iter().all(u8::is_ascii_hexdigit))
+    };
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut last, mut in_str, mut changed) = (0, 0, false, false);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                in_str = !in_str;
+                i += 1;
+            }
+            b'\\' if in_str => {
+                if b.get(i + 1) == Some(&b'u') {
+                    if let Some(u) = hex4(i + 2) {
+                        let paired = (0xD800..=0xDBFF).contains(&u)
+                            && b.get(i + 6..i + 8) == Some(b"\\u")
+                            && hex4(i + 8).is_some_and(|l| (0xDC00..=0xDFFF).contains(&l));
+                        if paired {
+                            i += 12;
+                            continue;
+                        }
+                        if (0xD800..=0xDFFF).contains(&u) {
+                            out.push_str(&text[last..i]);
+                            out.push(surrogate_mark(u));
+                            i += 6;
+                            last = i;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&text[last..]);
+    Some(out)
 }
 
 /// 同 [`load_state`]，WARNING 交給 `warn`（Python `logging.getLogger("serialwrap").warning`）。
@@ -322,19 +465,29 @@ pub fn load_state_with_warn(
         kind: StateLoadErrorKind::ReadFailed,
     })?;
     // `json.loads(bytes)`：`json.detect_encoding` 判斷 UTF-8（含 utf-8-sig）／UTF-16／UTF-32 後解碼（審查 F54）。
+    let mut lone_surrogates = false;
     let parsed = match json_bytes_to_text(&raw) {
         // bytes 路徑不做 str 的 BOM 檢查：解碼後仍以 U+FEFF 起頭（雙重 BOM）時，decoder 直接報
         // `Expecting value`（CPython `json.loads(bytes)` 實測；審查 F58）。
-        Ok(text) if text.starts_with('\u{feff}') => {
+        Ok((text, _)) if text.starts_with('\u{feff}') => {
             Err(Ok("Expecting value: line 1 column 1 (char 0)".to_string()))
         }
-        Ok(text) => pyjson::loads(&text).map_err(|e| match e {
-            JsonError::Recursion => Err(StateLoadError {
-                message: "RecursionError: maximum recursion depth exceeded".to_string(),
-                kind: StateLoadErrorKind::Uncaught,
-            }),
-            other => Ok(other.to_string()),
-        }),
+        Ok((text, marked)) => {
+            let escaped = mark_lone_surrogate_escapes(&text);
+            let result = match &escaped {
+                // 改寫會使字元位置位移：解析失敗時以原文重新解析取得與 Python 相同的錯誤訊息。
+                Some(rewritten) => pyjson::loads(rewritten).or_else(|_| pyjson::loads(&text)),
+                None => pyjson::loads(&text),
+            };
+            lone_surrogates = marked || escaped.is_some();
+            result.map_err(|e| match e {
+                JsonError::Recursion => Err(StateLoadError {
+                    message: "RecursionError: maximum recursion depth exceeded".to_string(),
+                    kind: StateLoadErrorKind::Uncaught,
+                }),
+                other => Ok(other.to_string()),
+            })
+        }
         Err(e) => Err(Ok(e)),
     };
     let obj = match parsed {
@@ -399,6 +552,7 @@ pub fn load_state_with_warn(
     if let Some(detected) = str_map_stripped(obj.get("profile_detected")) {
         out.profile_detected = detected;
     }
+    out.lone_surrogates = lone_surrogates;
     Ok((out, None))
 }
 

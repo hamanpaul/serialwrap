@@ -3,3 +3,5 @@ type: fix
 scope: rust-s21
 ---
 Slice 2.1 第三輪審查修正：sw-daemon 行程測試的 `wait_ready` 逾時改為輸出 `last_error` 與假 DUT PTY 的外部持有者、自行 spawn 的子行程以守衛於 panic 時回收（F91／F111：外部行程搶開測試 PTY 時 daemon 依 #82 正確拒開，原本只剩狀態名且孤兒子行程會卡住 `cargo test`）。其餘處理見 `docs/rust-refactor/reviews/p5-fix-responses.md` 第三輪段。
+
+state.json 含孤立 surrogate（surrogatepass 位元組或 `\uXXXX` 跳脫）時，Rust daemon 比照 Python 載入成功、於啟動存檔重現 `UnicodeEncodeError`（rc 1、原檔不動、不產生 `.corrupt`、不 attach），不再改名損毀備份並丟掉 RELEASED；UTF-16／32 解碼錯誤訊息位置含 BOM。release 存檔前暫停點的 OSError 與 state.json 提交失敗的 RPC `EXCEPTION` message 改為 Python `str(OSError)` 形式。Slice 2.1 出口 gate：`case_uptake` 依承接率斷路器判定（tripped／OD-02 → FAIL、證據不足 → EVIDENCE_MISSING）、非測試 section 須明確帶判定、OWNER-DECISION-PENDING 列須對應登記的裁決項、L1.5 缺合格 bridge 自測報告時記為證據缺失。

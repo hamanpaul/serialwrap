@@ -242,7 +242,17 @@ record existing_suites_rust --required-set s21_gate:existing_suites_rust \
   --log logs/existing_suites_rust.log --l1-results existing_suites_rust/l1-results.json "${extra_checks[@]}"
 
 # 9. Task 21 L1.5 與 event_latency
-if [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
+# bridge 自測報告（SERIALWRAP_L15_SELFTEST_REPORT）須存在且依 Task 8 正式資格判定合格；否則屬證據缺失，
+# 不得跑成 FAIL（審查 b7cd852 #2）。判定沿用 func-test/runner.py 的 evaluate_bridge_eligibility。
+l15_qualified=0
+if [[ -n "${SERIALWRAP_L15_SELFTEST_REPORT:-}" && -f "${SERIALWRAP_L15_SELFTEST_REPORT}" ]]; then
+  l15_qualified="$(python3 -c 'import sys; sys.path.insert(0, "func-test"); import runner; print(int(runner.evaluate_bridge_eligibility(sys.argv[1])[1]))' \
+    "$SERIALWRAP_L15_SELFTEST_REPORT" 2>/dev/null || echo 0)"
+fi
+if [[ "$l15_qualified" != "1" ]]; then
+  record l15_ab --exit 0 --section-verdict EVIDENCE_MISSING \
+    --reason "SERIALWRAP_L15_SELFTEST_REPORT 未提供或 bridge 自測報告不合格（Task 8 資格判定）：L1.5 A/B 未執行"
+elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
   run_logged l15_ab env SERIALWRAP_GATE=1 SERIALWRAP_L15_PY_DAEMON="$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
     SERIALWRAP_L15_RUST_DAEMON="$RUST_D" python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py
   record l15_ab --command "SERIALWRAP_GATE=1 pytest -q tests/acceptance/l15/test_slice21_l15.py" --exit "$LAST_RC" \
@@ -264,7 +274,9 @@ record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w"
   --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence wal_s1w_perf/wal_s1w.json \
   --reason "Linux 門檻（規格 §1.2）；Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
 
-# 9b. 承接率（case_verdicts.json 由 Task 20／21 的逐案證據彙整；缺檔即證據不足）
+# 9b. 承接率（case_verdicts.json 由 Task 20／21 的逐案證據彙整；缺檔即證據不足）。
+#     此處的 PASS 只表示「輸入已備齊」；judge 另以 slice_breaker.evaluate 判定斷路器（tripped／OD-02 → FAIL、
+#     證據不足 → EVIDENCE_MISSING；審查 b7cd852 #1），快照檔與 OD-02 預估由 slice21_gate_expect.yaml 指定。
 cv_args=()
 if [[ -f "$RUN_DIR/case_verdicts.json" ]]; then
   record case_uptake --command "slice_breaker.acceptance_rate" --exit 0 --section-verdict PASS \

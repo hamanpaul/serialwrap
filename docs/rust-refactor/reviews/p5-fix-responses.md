@@ -198,3 +198,32 @@
 ### F91／F111：sw-daemon 間歇失敗
 
 見上表 F91、F111 兩列（根因：外部行程持有測試 PTY；產品依 #82 正確拒開；測試支援補診斷訊息與子行程守衛）。
+
+### 報告 `p5-cloud/d2d29a6_7af6567-opus.md`（High 0、Medium 8、Low 15）
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F116 | Medium | 47c7b25 #1 | state.json 含孤立 surrogate：Python surrogatepass 載入成功、`_save_state` 拋 `UnicodeEncodeError` → rc 1、原檔不動；Rust 改名 `.corrupt`、丟掉 RELEASED 並 attach 到 READY | fixed（本組 commit）：`json_bytes_to_text` 改 surrogatepass（UTF-8 完整 `ED A0..BF xx`、UTF-16／32 孤立單元）並以 `U+10F800+(u−0xD800)` 標記承載；JSON 字串內孤立 `\uXXXX` 跳脫依 `py_scanstring` 配對規則改寫為同一標記（改寫後解析失敗時以原文取錯誤訊息）；`LoadedState.lone_surrogates` 為真時，manager 在建構子尾端啟動存檔前序列化 payload，含標記即記錄 Python 例外末行並跳過寫檔，daemon 印 traceback 首末行、exit 1、不掃描不 attach。紅燈先行：`tests/contract_blackbox/slice21/test_state_file_compat.py` 新增 `test_lone_surrogate_in_persisted_row_fails_startup_like_python[surrogatepass_bytes／json_escape]`（期望末行取自同輸入的 Python 基線實跑，位置含自動 alias 列）、`test_lone_surrogate_in_unknown_key_starts_normally[…]`：修正前 Rust 3 failed／1 passed、Python 4 passed；修正後兩邊皆通過。Rust 單元 `state_store::lone_surrogate_state_json_loads_and_reproduces_python_encode_error`。已知限制：同一檔案同時含孤立 surrogate 與 U+10F800..U+10FFFF 真實字元時，後者會被視為 surrogate |
+| F117 | Low | 47c7b25 #2 | UTF-16／32 解碼錯誤訊息位置未含 BOM、UTF-32 缺 `position S-E` | fixed（本組 commit）：位置一律以原始 bytes 計，UTF-32 依 CPython 單／多 byte 格式；`state_store::utf16_utf32_decode_error_text_matches_python`（7 組，期望值取自 python3.12 實跑） |
+| F118 | Medium | 3b5927a #1 | F28 跨 session 淘汰的 manager 接線（`ManagerNote::EvictCapture`）無回歸 | fixed（本組 commit）：`session_manager::global_bg_capture_eviction_reaches_owner_session_via_manager`（兩個 READY session；COM1 完成 64 筆 bg capture、推進時鐘使其 quiet window 終結，COM0 再完成 1 筆 → COM1 最舊者 `result_tail` 轉 `CMD_NOT_FOUND`、次舊者與 COM0 新者保留）。突變驗證：把 manager 的 `EvictCapture` 分支改為 no-op 時該案 FAIL（已實測，已還原）。ManagerRig 新增 `reg`（manager 的命令登錄）供等待命令完成 |
+| F119 | Medium | b7cd852 #1 | `case_uptake` 只要 case_verdicts 存在即 PASS，未呼叫斷路器 | fixed（本組 commit）：judge 新增 `judge_breaker`（`slice_breaker.evaluate`＋分母核對）：tripped／od02_resubmit → FAIL、insufficient_evidence／輸入缺漏／格式錯誤 → EVIDENCE_MISSING；assemble／judge CLI 由 `slice21_gate_expect.yaml` 的 `breaker_snapshots_file`、`stage2_estimate_weeks`（擁有者填值；null → EVIDENCE_MISSING，不以 0 放行）組輸入；報告 `case_uptake.breaker` 附 evaluate 結果。紅燈先行 5 支：`test_case_uptake_tripped_is_fail`、`…od02_resubmit_is_fail`、`…insufficient_evidence_is_missing`、`…without_breaker_inputs_is_missing`、`…rate_zero_reported_in_reasons` |
+| F120 | Medium | b7cd852 #2 | L1.5 未檢查 `SERIALWRAP_L15_SELFTEST_REPORT`，證據缺失記成 FAIL；`l15-wal-interference` 結構上不可能 PASS 未列裁決 | fixed（本組 commit）：gate 第 9 段先以 `func-test/runner.py` 的 `evaluate_bridge_eligibility`（Task 8 正式資格判定）核對自測報告，未設或不合格即 `l15_ab` EVIDENCE_MISSING；runbook 共通規則補該環境變數與命令；`pending_decisions` 新增 `PA-OD-L15-WAL` |
+| F121 | Low | b7cd852 #3 | 非測試 section 缺 `section_verdict` 預設 PASS | fixed（本組 commit）：預設改 EVIDENCE_MISSING；`test_non_test_section_requires_explicit_verdict`。既有正向夾具改為明確帶 `section_verdict: PASS`（判定更嚴，斷言未放寬） |
+| F122 | Low | b7cd852 #4 | `win_l1_into` 取最新報告未綁定本次 run | deferred：LOCAL-WINDOWS-TODO（`win-test.sh` 報告格式無 run_id；於擁有者 Windows host 實跑 gate 時一併改為傳 `--run-id` 並只取該檔） |
+| F123 | Low | b7cd852 #5 | event_latency 判定器未實作且未追蹤 | `pending_decisions` 新增 `PA-OD-EVLAT`（同時涵蓋 c0d221f #1 的 Rust 計時欄位缺口） |
+| F124 | Medium | 4920d90 #1 | `#32` 改 OWNER-DECISION-PENDING 但無對應裁決項；judge 無條件接受 | fixed（本組 commit）：`pending_decisions` 新增 `PA-OD-F67`，`#32` 列加 `decision: PA-OD-F67`；judge 要求 `decision` 存在於報告 `pending_decisions`，否則 INCOMPLETE（`test_owner_decision_pending_requires_registered_decision`，紅燈先行）；狀態檔檔頭規則補一行 |
+| F125 | Low | 4920d90 #2 | 狀態檔檔頭「P5-T19～T21 未完成」與內容矛盾 | fixed（本組 commit） |
+| F126 | Medium | c0d221f #1 | s21-event-latency flood 輪實為 idle 量測；Rust 無 `test_fakes.event_latency` 欄位 | 見 T21（runner 缺口逐項處理段）；裁決項 `PA-OD-EVLAT` |
+| F127 | Medium | c0d221f #2 | 「從未進 ATTACHING／READY」以單點取樣表達 | 見 T21 |
+| F128 | Medium | c0d221f #3 | gaps #1～#6 未連結 gate，情境仍 `expected: PASS` | 見 T21；裁決項 `PA-OD-L15-GAPS` |
+| F129 | Low | 2af2554 #1／#2 | `load: flood` 不驗 flood 在途；INSUFFICIENT_EVIDENCE 與 FAIL 共用 StepError | 見 T21 |
+| F130 | Low | b069633 #1 | F98 (a)(b)(c) 無回歸 | deferred：測試強化（(b) 需在途 op 與 Reattach 同時、(c) 需 actor 已結束的 owner；無已知外部行為差異），排入下一輪 |
+| F131 | Low | 7536870 #1 | `pending_open_stop` 的 Phase 1 快照無測試；Clear／Bind 於開埠窗口 Python 走 `_detach_session_locked`（ATTACHING／null） | deferred：需 test-fakes 暫停 open 的黑箱 A/B 取得 Python 實際行為後裁決（可能為 BC）；未取得實測前不改產品 |
+| F132 | Low | 68fd9bf #1～#3 | 校準報告時區、P2 凍結情境數、「flake」措辭 | fixed（T22 組 commit，校準報告更新） |
+| F133 | Low | 7af6567 #1 | 防再生斷言事後偵測，紅燈實作仍污染工作樹 | deferred：拒絕路徑改 `current_dir(tempdir)` 屬測試支援重構，排入下一輪（F112 斷言仍有效） |
+| F134 | Low | 7af6567 #2 | sticky 否定斷言靠 200 ms sleep | deferred：同上 |
+| F135 | Low | 7af6567 #3（F115 拆項） | F115 中 3 項實為行為差異 | 拆項：(1) e95c5e9 #2 `DeviceOnline` 失敗時不 `send_attached`——deferred：需讓 actor 回覆逾時的 fault hook 才能先紅，未有前不改；可達條件為 actor 已結束或 5 s 內未處理 control（daemon 異常狀態）。(2) 3afdc4f #2 YAML 例外類別名 5 種不同——deferred：須追加 golden 產生器 CASES 並經 §10.4 審閱，排入下一輪。(3) 3afdc4f #4 EXCEPTION message 為 Debug 格式——fixed（本組 commit）：`release_persist_point` 的 OSError 附失敗路徑（`os.makedirs` 第一個不存在層級），session_core／manager 的 commit 失敗 message 改用 `py_message`；紅燈先行 `test_state_file_compat.py::test_release_persist_oserror_message_like_python`（Python 1 passed、修正前 Rust FAIL：`state.json commit failed: PalError { … }`） |
+
+### 本輪全套 pytest 新增失敗的取證
+
+- `tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks`：本組 G2 全套與同範圍（`tests/contract_blackbox --ignore slice21`）重跑皆失敗（3/3），與起點基準不同；把本組變更 `git stash` 後以 9b81d9a 重建仍失敗，非本組造成。根因：前一個檔 `test_cli_mgmt_daemon.py::test_daemon_restart_ab` 收尾只送 `daemon stop` 未等重啟後的 Python `serialwrapd.py`（ppid 1）離開，doctor 測試開始時 `/proc` 仍有該行程（以 pytest 插件在 setup 時列出：`pid=… cmd=… test_daemon_restart_ab0 …`），Python doctor 與 Rust CLI 兩次掃描間該行程結束 → `single_daemon` 1≠0。修正（測試收尾，未放寬斷言）：收尾等重啟後 pid 自 `/proc` 消失（上限 15 s）；同範圍重跑 1/1、兩檔合跑 2/2 通過，失敗集合回到起點基準。

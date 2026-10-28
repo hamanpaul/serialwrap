@@ -1968,3 +1968,72 @@ fn reattach_redetect_to_ready_does_not_write_sticky() {
         m.state_text()
     );
 }
+
+#[test]
+fn global_bg_capture_eviction_reaches_owner_session_via_manager() {
+    // 審查 d2d29a6_7af6567 3b5927a #1（F28 manager 接線）：跨 session 淘汰須經 actor `register` →
+    // `ManagerNote::EvictCapture` → manager 依 COM 解析擁有者 → `ControlEvent::EvictCapture`。
+    // Python `SessionManager._background` 為全域 dict，`_evict_background_locked` 直接 `pop`，之後
+    // `result_tail` 回 CMD_NOT_FOUND。輸入：COM1 先完成 64 筆 bg capture，COM0 再完成 1 筆 → 淘汰 COM1 最舊者。
+    let yaml = manager_yaml(&[
+        &t_target("COM0", 1, "/s/by-id/usb-A"),
+        &t_target("COM1", 2, "/s/by-id/usb-B"),
+    ]);
+    let m = ManagerRig::with(&yaml, LoadedState::default(), Some(("/s/by-id/usb-A", "/dev/ttyA")));
+    let dev_b = m.add_device_at("/s/by-id/usb-B", "/dev/ttyB");
+    install_shell_replies(&dev_b);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "READY");
+    m.wait_state("COM1", "READY");
+    // `on_tx_reply` 只推一次；65 筆命令改用逐行比對的 `on_tx_match`。
+    for dev in [&m.dev, &dev_b] {
+        dev.on_tx_match("dmesg", Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()));
+    }
+    let sid0 = m.mgr.resolve("COM0").unwrap();
+    let sid1 = m.mgr.resolve("COM1").unwrap();
+    let bg = |sid: &str| -> String {
+        let mut req = agent_submit("dmesg");
+        req.mode = "bg".into();
+        let r = rpc(m.mgr.route(sid, SessionRequest::Submit(req), RPC));
+        s_of(&r, "cmd_id").expect("cmd_id")
+    };
+    let tail = |sid: &str, id: &str| -> PyDict {
+        rpc(m.mgr.route(
+            sid,
+            SessionRequest::BackgroundResult {
+                cmd_id: id.to_string(),
+                from_chunk: 0,
+                limit: 200,
+            },
+            RPC,
+        ))
+    };
+    let wait_done = |_sid: &str, id: &str| {
+        wait_until(&format!("{id} 完成"), || {
+            m.reg
+                .get(id)
+                .and_then(|c| c.get("done_at").cloned())
+                .is_some_and(|v| !matches!(v, PyValue::Null))
+        });
+    };
+    let mut ids1 = Vec::new();
+    for _ in 0..64 {
+        let id = bg(&sid1);
+        wait_done(&sid1, &id);
+        ids1.push(id);
+    }
+    // capture 於最後活動後 quiet window 才轉 done（`maybe_finalize`，讀取時評估）：推進時鐘並逐筆讀取，
+    // 使 COM1 的 64 筆在索引中皆為已終結（可淘汰）。
+    m.clock.advance(Duration::from_secs(120));
+    for id in &ids1 {
+        assert_eq!(s_of(&tail(&sid1, id), "status").as_deref(), Some("done"));
+    }
+    let id0 = bg(&sid0);
+    wait_done(&sid0, &id0);
+    wait_until("COM1 最舊 capture 被淘汰", || {
+        s_of(&tail(&sid1, &ids1[0]), "error_code").as_deref() == Some("CMD_NOT_FOUND")
+    });
+    assert_eq!(tail(&sid1, &ids1[1])["ok"], PyValue::Bool(true), "只淘汰最舊一筆");
+    assert_eq!(tail(&sid0, &id0)["ok"], PyValue::Bool(true), "新完成者保留");
+}

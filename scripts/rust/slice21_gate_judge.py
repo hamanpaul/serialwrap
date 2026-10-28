@@ -6,8 +6,10 @@
 - 測試類 section（`TEST_SECTIONS`）：`required_set` 非 null、`l1_results` 指向存在的 `l1-results.v1`，且
   P2 唯一實作 `tests/acceptance/l1_judge.py` 的 `judge(...)` 為 PASS（R5-F3：取代計數門檻），
   另核對 section `exit`／計數與 `l1_results` 一致；`FAIL` → FAIL；其餘不足 → EVIDENCE_MISSING。
-- 非測試類 section：`required_set` 為 null，`exit == 0` 且（若有）`section_verdict == "PASS"` 才 PASS；
-  `section_verdict == "FAIL"` → FAIL；未執行（exit null）或證據缺 → EVIDENCE_MISSING。
+- 非測試類 section：`required_set` 為 null，`exit == 0` 且明確帶 `section_verdict == "PASS"` 才 PASS（缺即 EVIDENCE_MISSING）；
+  `section_verdict == "FAIL"` → FAIL；未執行（exit null）或證據缺 → EVIDENCE_MISSING。`case_uptake` 另以
+  `slice_breaker.evaluate` 判定斷路器：tripped／OD-02 → FAIL、證據不足 → EVIDENCE_MISSING。
+- parity 列 `OWNER-DECISION-PENDING` 須帶存在於報告 `pending_decisions` 的 `decision` id，否則 INCOMPLETE。
 - 只有 `ALLOWED_MISSING`（`windows_cap_windows_com`→BO-S21-01）可在 EVIDENCE_MISSING 下不阻擋。
 - `verdict`：任何 FAIL → FAIL；否則非豁免 EVIDENCE_MISSING、identity 欄位缺漏、dry-run、#104 parity 列
   INCOMPLETE／無標記 → INCOMPLETE；全部 PASS → READY_FOR_OWNER_EVIDENCE。本判定器永不輸出 PASS 作為 Slice 出口。
@@ -189,7 +191,8 @@ def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platf
 def _judge_non_test_section(sec: Mapping[str, Any]) -> tuple[str, list[str]]:
     if sec.get("required_set") is not None:
         return "EVIDENCE_MISSING", ["非測試類 section 的 required_set 必須為 null"]
-    sv = sec.get("section_verdict", "PASS")
+    # 不預設放行：缺 section_verdict 即證據不足（審查 b7cd852 #3）。
+    sv = sec.get("section_verdict")
     exit_code = sec.get("exit")
     if sv == "FAIL":
         return "FAIL", [f"section 自身判定 FAIL（exit {exit_code!r}）"] + list(sec.get("reasons") or [])
@@ -250,6 +253,34 @@ def case_uptake(freeze: Mapping[str, Any] | None, case_verdicts: Mapping[str, An
             "window_start": window.get("start"), "pass_case_ids": passed}
 
 
+def judge_breaker(freeze: Mapping[str, Any] | None, breaker: Mapping[str, Any] | None) -> tuple[str, list[str], Any]:
+    """承接率斷路器（審查 b7cd852 #1）：以 `slice_breaker.evaluate` 判定，回 (status, reasons, evaluate 結果)。
+
+    tripped 或 od02_resubmit → FAIL；insufficient_evidence、輸入缺漏或格式錯誤 → EVIDENCE_MISSING；其餘 PASS。
+    `breaker` 須含 `snapshots`（每週快照）、`today`（YYYY-MM-DD）與 `stage2_estimate_weeks`（OD-02 輸入）。
+    """
+    if not isinstance(breaker, Mapping):
+        return "EVIDENCE_MISSING", ["斷路器輸入缺漏（每週快照／判定日／stage2_estimate_weeks）"], None
+    missing = [k for k in ("snapshots", "today", "stage2_estimate_weeks") if breaker.get(k) is None]
+    if missing or not isinstance(freeze, Mapping):
+        return "EVIDENCE_MISSING", [f"斷路器輸入缺漏：{missing or ['freeze']}"], None
+    sb = _load_module("slice_breaker", SLICE_BREAKER_PATH)
+    try:
+        sb._check_snapshot_denominators(list(breaker["snapshots"]), dict(freeze))
+        res = sb.evaluate(dict(freeze), list(breaker["snapshots"]), today=str(breaker["today"]),
+                          stage2_estimate_weeks=breaker["stage2_estimate_weeks"])
+    except (ValueError, KeyError, TypeError, OverflowError) as exc:
+        return "EVIDENCE_MISSING", [f"斷路器輸入錯誤：{exc}"], None
+    if res["tripped"] or res["od02_resubmit"]:
+        reasons = [r for r in (res.get("reason"),) if r]
+        if res["od02_resubmit"]:
+            reasons.append("Stage 2 已耗週數＋剩餘預估超過 OD-02 24 週上限")
+        return "FAIL", reasons, res
+    if res["insufficient_evidence"]:
+        return "EVIDENCE_MISSING", [str(res.get("reason"))], res
+    return "PASS", [], res
+
+
 def parity_rows_from_doc(text: str) -> list[dict[str, str]]:
     """自 parity-amendments 文件抽出「承接 Phase/Task」含 P5 的列（§1 以 `#N`、§2 以稽核 ID 為 id）。"""
     rows: list[dict[str, str]] = []
@@ -274,7 +305,8 @@ def parity_rows_from_doc(text: str) -> list[dict[str, str]]:
     return rows
 
 
-def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[str]) -> dict[str, Any]:
+def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[str],
+                 decision_ids: set[str] | None = None) -> dict[str, Any]:
     status_doc = parity.get("status") or {}
     status_rows = {str(r.get("id")): r for r in (status_doc.get("rows") or []) if isinstance(r, Mapping)}
     source_rows = parity.get("source_rows")
@@ -318,6 +350,12 @@ def judge_parity(parity: Mapping[str, Any], passed_pool: set[str], bo_ids: set[s
             status = "BLOCKED-OWNER" if bo in bo_ids else "INCOMPLETE"
             if status != "BLOCKED-OWNER":
                 reasons.append(f"BLOCKED-OWNER 未對應有效 BO 項目：{bo!r}")
+        elif claimed == "OWNER-DECISION-PENDING":
+            # 須對應報告 pending_decisions 中的裁決項，擁有者才看得到（審查 4920d90 #1）。
+            decision = row.get("decision")
+            status = claimed if decision and decision in (decision_ids or set()) else "INCOMPLETE"
+            if status != claimed:
+                reasons.append(f"OWNER-DECISION-PENDING 未對應 pending_decisions 項目：{decision!r}")
         else:
             status = claimed
         if row and row.get("reason") and status != "PASS":
@@ -368,10 +406,18 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
 
     missing_id, mismatch_id = identity_problems(report.get("identity"), expect.get("daemon_path"))
     uptake = case_uptake(expect.get("freeze"), expect.get("case_verdicts"))
+    b_status, b_reasons, b_res = judge_breaker(expect.get("freeze"), expect.get("breaker"))
+    uptake["breaker"] = b_res
+    for sec in out_sections:
+        if sec["name"] == "case_uptake" and sec["status"] == "PASS" and b_status != "PASS":
+            sec["status"] = b_status
+            sec["reasons"] = list(sec["reasons"]) + b_reasons
     parity_cfg = expect.get("parity")
     bo_ids = {str(b.get("id")) for b in (report.get("blocked_owner") or []) if isinstance(b, Mapping)}
     bo_ids |= set(expect.get("bo_ids") or [])
-    parity = judge_parity(parity_cfg, passed_pool, bo_ids) if parity_cfg else {"evaluated": False, "rows": []}
+    decision_ids = {str(d.get("id")) for d in (report.get("pending_decisions") or []) if isinstance(d, Mapping)}
+    parity = (judge_parity(parity_cfg, passed_pool, bo_ids, decision_ids) if parity_cfg
+              else {"evaluated": False, "rows": []})
 
     failed = [s["name"] for s in out_sections if s["status"] == "FAIL"]
     missing = [s["name"] for s in out_sections
@@ -506,6 +552,16 @@ def build_identity(args: argparse.Namespace) -> dict[str, Any]:
     return ident
 
 
+def breaker_inputs(expect_yaml: Mapping[str, Any], today: str | None = None) -> dict[str, Any]:
+    """組 `judge_breaker` 的輸入：快照檔（不存在即 None → 證據缺）、判定日（預設今日 UTC）、OD-02 剩餘預估週數。"""
+    snaps = None
+    rel = expect_yaml.get("breaker_snapshots_file")
+    if rel and (ROOT / rel).is_file():
+        snaps = [json.loads(line) for line in (ROOT / rel).read_text(encoding="utf-8").splitlines() if line.strip()]
+    return {"snapshots": snaps, "today": today or dt.datetime.now(dt.timezone.utc).date().isoformat(),
+            "stage2_estimate_weeks": expect_yaml.get("stage2_estimate_weeks")}
+
+
 def cmd_assemble(args: argparse.Namespace) -> int:
     run_dir = pathlib.Path(args.run_dir)
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
@@ -553,7 +609,7 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     expect = {"lock": lock, "base_dir": run_dir, "freeze": freeze, "case_verdicts": case_verdicts,
               "daemon_path": args.daemon_path or None, "parity": parity_in,
               "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
-              "bo_ids": [b["id"] for b in blocked]}
+              "bo_ids": [b["id"] for b in blocked], "breaker": breaker_inputs(expect_yaml)}
     out = judge(report, expect)
     report["sections"] = out["sections"]
     report["case_uptake"] = out["case_uptake"]
@@ -578,7 +634,8 @@ def cmd_judge(args: argparse.Namespace) -> int:
     out = judge(report, {"lock": lock, "base_dir": pathlib.Path(args.report).parent,
                          "freeze": json.loads(freeze_path.read_text(encoding="utf-8")),
                          "case_verdicts": {}, "daemon_path": args.daemon_path,
-                         "additional_required_sets": expect_yaml.get("additional_required_sets") or {}})
+                         "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
+                         "breaker": breaker_inputs(expect_yaml)})
     print(json.dumps({"verdict": out["verdict"], "verdict_reasons": out["verdict_reasons"],
                       "sections": {s["name"]: s["status"] for s in out["sections"]}}, ensure_ascii=False, indent=1))
     return 0

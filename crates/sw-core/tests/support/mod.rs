@@ -1954,7 +1954,7 @@ fn assemble_manager(
     serial: Arc<RigSerial>,
     warnings: Arc<Mutex<Vec<String>>>,
     console: Arc<dyn ConsoleTransportFactory>,
-) -> (Arc<SessionManager>, Arc<WalWriter>) {
+) -> (Arc<SessionManager>, Arc<WalWriter>, Arc<CommandRegistry>) {
     let load = load_profiles(
         PROFILE_DIR,
         &MemProfileFs {
@@ -1971,13 +1971,14 @@ fn assemble_manager(
         clock.clone(),
     ));
     let warn_sink = warnings.clone();
+    let registry = CommandRegistry::new();
     let deps = ManagerDeps {
         serial: serial.clone(),
         uart_excl: Arc::new(RigExcl),
         console,
         caps: sw_pal::fakes::posix_caps(),
         wal: wal.clone(),
-        registry: CommandRegistry::new(),
+        registry: registry.clone(),
         state: StateStore::spawn(PathBuf::from(STATE_PATH), fs.clone()),
         loaded,
         load,
@@ -1991,7 +1992,7 @@ fn assemble_manager(
                 .push(msg)
         }),
     };
-    (SessionManager::new(deps), wal)
+    (SessionManager::new(deps), wal, registry)
 }
 
 /// `SessionManager` 測試驅動（plan 06 Task 16 Step 0）：真 `SessionManager`＋RigSerial＋RigFs＋FakeWalFs＋FakeClock。
@@ -2004,6 +2005,8 @@ pub struct ManagerRig {
     pub serial: Arc<RigSerial>,
     pub fs: Arc<RigFs>,
     pub wfs: Arc<FakeWalFs>,
+    /// manager 的命令登錄（等命令完成用；第三輪 F28 manager 接線回歸）。
+    pub reg: Arc<CommandRegistry>,
     pub state_path: String,
     yaml: String,
     warnings: Arc<Mutex<Vec<String>>>,
@@ -2058,7 +2061,7 @@ impl ManagerRig {
         let wfs = FakeWalFs::new();
         let clock = FakeClock::new();
         let warnings = Arc::new(Mutex::new(Vec::new()));
-        let (mgr, wal) = assemble_manager(
+        let (mgr, wal, reg) = assemble_manager(
             yaml,
             loaded,
             fs.clone(),
@@ -2076,6 +2079,7 @@ impl ManagerRig {
             serial,
             fs,
             wfs,
+            reg,
             state_path: STATE_PATH.to_string(),
             yaml: yaml.to_string(),
             warnings,
@@ -2309,7 +2313,7 @@ impl ManagerRig {
         let (loaded, _) =
             load_state(Path::new(&self.state_path), &*self.fs).expect("state.json 應可載入");
         let warnings = Arc::new(Mutex::new(Vec::new()));
-        let (mgr, wal) = assemble_manager(
+        let (mgr, wal, reg) = assemble_manager(
             &self.yaml,
             loaded,
             self.fs.clone(),
@@ -2327,6 +2331,7 @@ impl ManagerRig {
             serial: self.serial.clone(),
             fs: self.fs.clone(),
             wfs: self.wfs.clone(),
+            reg,
             state_path: self.state_path.clone(),
             yaml: self.yaml.clone(),
             warnings,

@@ -1291,9 +1291,7 @@ impl SessionCore {
                         .map(|(reply, _)| {
                             Effect::Reply(
                                 reply,
-                                Err(PyErr::value_error(format!(
-                                    "state.json commit failed: {error:?}"
-                                ))),
+                                Err(PyErr::value_error(error.py_message.clone())),
                             )
                         })
                         .collect();
@@ -1356,9 +1354,7 @@ impl SessionCore {
                         let mut effects = self.drain_opened_bridge(pending_stop, opened, now);
                         effects.push(Effect::Reply(
                             reply,
-                            Err(PyErr::value_error(format!(
-                                "state.json commit failed: {error:?}"
-                            ))),
+                            Err(PyErr::value_error(error.py_message.clone())),
                         ));
                         return effects;
                     }
@@ -1367,9 +1363,7 @@ impl SessionCore {
                     let mut effects = self.retire_opened_bridge(opened);
                     effects.push(Effect::Reply(
                         reply,
-                        Err(PyErr::value_error(format!(
-                            "state.json commit failed: {error:?}"
-                        ))),
+                        Err(PyErr::value_error(error.py_message.clone())),
                     ));
                     effects
                 }
@@ -1392,9 +1386,7 @@ impl SessionCore {
                     self.state = previous_state;
                     vec![Effect::Reply(
                         reply,
-                        Err(PyErr::value_error(format!(
-                            "state.json commit failed: {error:?}"
-                        ))),
+                        Err(PyErr::value_error(error.py_message.clone())),
                     )]
                 }
             },
