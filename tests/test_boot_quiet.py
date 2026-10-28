@@ -9,6 +9,7 @@
 - ``_spawn_reboot_recovery`` 在 quiet window 內不送 probe、deadline 延伸涵蓋
   window 結束後至少一輪 probe、RX 解除後立即恢復探測
 - prpl-template 的 ``bootloader_prompts`` 資產載入
+- ``boot_done_regex``：profile 宣告的開機完成訊號（askconsole）提早解除 quiet window
 
 以下為對抗審查（review）findings 收斂後補的回歸測試：
 - ``_self_test_impl`` READY 分支的 nonce probe gate（Finding 1b）
@@ -128,7 +129,7 @@ class _ManagerMixin(unittest.TestCase):
     def tearDown(self) -> None:
         sm_mod.STATE_PATH = self._old_state_path
 
-    def _make_profile(self, *, login_regex: str = "") -> SessionProfile:
+    def _make_profile(self, *, login_regex: str = "", boot_done_regex: str = "") -> SessionProfile:
         return SessionProfile(
             profile_name="p",
             com="COM0",
@@ -139,11 +140,14 @@ class _ManagerMixin(unittest.TestCase):
             prompt_regex=r"(?m)^root@prplOS:.*# ",
             login_regex=login_regex,
             ready_probe="echo __READY__${nonce}",
+            boot_done_regex=boot_done_regex,
             uart=UartProfile(),
         )
 
-    def _make_manager(self, *, login_regex: str = "") -> tuple[SessionManager, sm_mod.SessionRuntime]:
-        profile = self._make_profile(login_regex=login_regex)
+    def _make_manager(
+        self, *, login_regex: str = "", boot_done_regex: str = ""
+    ) -> tuple[SessionManager, sm_mod.SessionRuntime]:
+        profile = self._make_profile(login_regex=login_regex, boot_done_regex=boot_done_regex)
         mgr = SessionManager(
             [profile],
             WalWriter(wal_dir=self._tmp.name),
@@ -416,6 +420,81 @@ class TestPrplTemplateBootloaderPrompts(unittest.TestCase):
         tpl = next(t for t in result.templates if t.profile_name == "prpl-template")
         self.assertIn("^=> $", tpl.bootloader_prompts)
         self.assertIn("^U-Boot> $", tpl.bootloader_prompts)
+
+
+_ASKCONSOLE = "Please press Enter to activate this console"
+
+
+class TestBootDoneRegex(_ManagerMixin):
+    """``boot_done_regex``：askconsole 不匹配 login／prompt，靠 profile 宣告的開機完成訊號提早解除。"""
+
+    def test_boot_done_regex_clears_quiet_window(self) -> None:
+        mgr, session = self._make_manager(boot_done_regex=_ASKCONSOLE)
+        session.state = "ATTACHED"
+        self._rx(mgr, session, "U-Boot TPL 2024.04 (fake)\r\n")
+        self.assertGreater(session.boot_quiet_until, 0.0)
+        self._rx(mgr, session, "Starting kernel ...\r\n[   10.0] procd: fake\r\n")
+        self.assertGreater(session.boot_quiet_until, 0.0, "kernel 開機中不得解除")
+        self._rx(mgr, session, "\r\nPlease press Enter to activate this console.\r\n")
+        self.assertEqual(session.boot_quiet_until, 0.0)
+
+    def test_askconsole_without_boot_done_regex_keeps_quiet(self) -> None:
+        """未設 boot_done_regex 時行為不變：askconsole 不解除，只能等過期。"""
+        mgr, session = self._make_manager()
+        session.state = "ATTACHED"
+        self._rx(mgr, session, "U-Boot TPL 2024.04 (fake)\r\n")
+        self._rx(mgr, session, "\r\nPlease press Enter to activate this console.\r\n")
+        self.assertGreater(session.boot_quiet_until, 0.0)
+
+    def test_stale_askconsole_before_banner_does_not_clear(self) -> None:
+        """banner 之前殘留的 askconsole（例：上一輪 Ctrl-D 登出）不得誤解除下一輪 quiet window。"""
+        mgr, session = self._make_manager(boot_done_regex=_ASKCONSOLE)
+        session.state = "ATTACHED"
+        self._rx(mgr, session, "\r\nPlease press Enter to activate this console.\r\n")
+        self._rx(mgr, session, "reboot: Restarting system\r\nU-Boot TPL 2024.04 (fake)\r\n")
+        self.assertGreater(session.boot_quiet_until, 0.0)
+        self._rx(mgr, session, "DRAM:  1 GiB\r\n")
+        self.assertGreater(session.boot_quiet_until, 0.0)
+
+    def test_boot_done_clear_keeps_ready_reconfirm_pending(self) -> None:
+        """#162 不變式：解除 quiet 不清 pending，agent gate 仍待 nonce probe 再確認。"""
+        mgr, session = self._make_manager(boot_done_regex=_ASKCONSOLE)
+        session.state = "READY"
+        self._rx(mgr, session, "U-Boot TPL 2024.04 (fake)\r\n")
+        self.assertTrue(session.ready_reconfirm_pending)
+        self._rx(mgr, session, "Please press Enter to activate this console.\r\n")
+        self.assertEqual(session.boot_quiet_until, 0.0)
+        self.assertTrue(session.ready_reconfirm_pending)
+
+    def test_asset_prpl_template_has_boot_done_regex(self) -> None:
+        assets_dir = os.path.join(
+            os.path.dirname(os.path.abspath(sm_mod.__file__)), "assets", "profiles"
+        )
+        result = load_profiles(assets_dir)
+        tpl = next(t for t in result.templates if t.profile_name == "prpl-template")
+        self.assertRegex("Please press Enter to activate this console.", tpl.boot_done_regex)
+
+    def test_target_inherits_and_overrides_boot_done_regex(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "default.yaml").write_text(
+                "profiles:\n"
+                "  t:\n"
+                "    platform: prpl\n"
+                "    boot_done_regex: \"activate this console\"\n"
+                "targets:\n"
+                "  - com: COM0\n"
+                "    profile: t\n"
+                "    device_by_id: /dev/serial/by-id/fake0\n"
+                "  - com: COM1\n"
+                "    profile: t\n"
+                "    device_by_id: /dev/serial/by-id/fake1\n"
+                "    boot_done_regex: \"^custom done$\"\n",
+                encoding="utf-8",
+            )
+            result = load_profiles(d)
+        by_com = {p.com: p for p in result.profiles}
+        self.assertEqual(by_com["COM0"].boot_done_regex, "activate this console")
+        self.assertEqual(by_com["COM1"].boot_done_regex, "^custom done$")
 
 
 class TestSelfTestQuietGate(_ManagerMixin):

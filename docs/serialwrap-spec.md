@@ -520,7 +520,7 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 - 命令逾時後的強制按鍵迴圈（`_recover_after_failure` 的 CTRL_C/CTRL_D）：跳過強制按鍵，直接落到既有 timeout 收尾（session 轉 `ATTACHED`）——這是最容易觸發的路徑，agent 正常送命令途中 target 自發重開機、逾時即進入本函式。
 - `session self-test`（`_self_test_impl` 的 READY 分支 nonce probe）：回報 `classification: "AUTOBOOT_QUIET"`，不送 probe。
 
-**解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`（開機完成訊號）即刻解除並恢復探測；否則過期自動解除。例外：若命中的尾行本身就是該 session `bootloader_prompts` 名單中的一員（如 U-Boot 自己的 `=> `），視為仍在 bootloader、非開機完成，本輪不解除——寬鬆撰寫的 `prompt_regex`（如 brcm-template `(?m)[>#]\s*$`）會誤配 bootloader 自身 prompt，若不先排除會在板子正卡 bootloader 的最危險時刻誤解除（`_update_boot_quiet_locked` 於解除前先呼叫 `_matches_any_bootloader_prompt`）。（#162：解除／過期只結束 **TX 靜默**維度；agent 顯式命令 gate 的解除另綁 READY 再確認，見下方 #162 段。）
+**解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`，或 profile 選配的 `boot_done_regex`（開機完成訊號，例：askconsole 的「`Please press Enter to activate this console`」）即刻解除並恢復探測；否則過期自動解除。例外：若命中的尾行本身就是該 session `bootloader_prompts` 名單中的一員（如 U-Boot 自己的 `=> `），視為仍在 bootloader、非開機完成，本輪不解除——寬鬆撰寫的 `prompt_regex`（如 brcm-template `(?m)[>#]\s*$`）會誤配 bootloader 自身 prompt，若不先排除會在板子正卡 bootloader 的最危險時刻誤解除（`_update_boot_quiet_locked` 於解除前先呼叫 `_matches_any_bootloader_prompt`）。（#162：解除／過期只結束 **TX 靜默**維度；agent 顯式命令 gate 的解除另綁 READY 再確認，見下方 #162 段。）
 
 **不 gate**：human console bytes、interactive lease TX。與 #114「刻意進 bootloader」相容——human/lease 送鍵永遠放行。
 
@@ -685,7 +685,7 @@ gate、`REMOTE_NOT_SUPPORTED`、`INVALID_ARGS`）且 exit code 非零時：
 
 #### profile test（離線 regex 診斷，#174）
 
-`serialwrap profile test --profile <name> --sample <file> [--profile-dir DIR]` 不連 daemon、不碰任何 UART：從 `--profile-dir`（預設 `PROFILE_DIR`）載入 profile YAML，找出名為 `<name>` 的 template，對 `--sample` 檔案的文字內容跑 `prompt_regex` / `login_regex` / `password_regex`（整段文字 `re.search`，比對基準同 `wait_for_regex`）與 `bootloader_prompts`（清單逐條，僅比對樣本**最後一個非空白行**，比對基準同 `_matches_any_bootloader_prompt` 的 recovery gate 語意），stdout 印 JSON 回報各 regex 是否命中與命中的行，exit code 恆為 0（純診斷、不因未命中而失敗）。用途：operator 自訂／收緊 regex 前，先拿一段真實 console 文字（例如外部 minicom capture log 的片段）離線驗證，不必上板試錯導致 session 卡死。
+`serialwrap profile test --profile <name> --sample <file> [--profile-dir DIR]` 不連 daemon、不碰任何 UART：從 `--profile-dir`（預設 `PROFILE_DIR`）載入 profile YAML，找出名為 `<name>` 的 template，對 `--sample` 檔案的文字內容跑 `prompt_regex` / `login_regex` / `boot_done_regex` / `password_regex`（整段文字 `re.search`，比對基準同 `wait_for_regex`）與 `bootloader_prompts`（清單逐條，僅比對樣本**最後一個非空白行**，比對基準同 `_matches_any_bootloader_prompt` 的 recovery gate 語意），stdout 印 JSON 回報各 regex 是否命中與命中的行，exit code 恆為 0（純診斷、不因未命中而失敗）。用途：operator 自訂／收緊 regex 前，先拿一段真實 console 文字（例如外部 minicom capture log 的片段）離線驗證，不必上板試錯導致 session 卡死。
 
 ### 11.2 RPC
 
@@ -796,6 +796,7 @@ targets:
     - "^=> $"         # U-Boot 標準 prompt
     - "^BCM\\d+>> $"  # Broadcom BCM 系列 bootloader
   ```
+- `boot_done_regex`：開機完成訊號 regex（字串，預設空＝不設）。boot quiet window 期間 RX 命中即提早解除，與 `login_regex`／`prompt_regex` 同列判定，同樣受 `bootloader_prompts` 尾行例外約束；**不參與登入流程**（不會因命中而送帳密）。target 可覆寫。出貨 `prpl-template` 設為 `"Please press Enter to activate this console"`。
 
 ### 13.3 Platform 行為
 
