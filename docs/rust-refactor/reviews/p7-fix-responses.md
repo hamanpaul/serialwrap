@@ -215,3 +215,11 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | P7-71fe017-1（第 2 輪） | Medium | 溢位分支仍關閉管線 | 已於 030d294 修正（報告範圍止於 27b5bf4） |
 | P7-71fe017-3／-4（第 2 輪） | High／Medium | 未修 | 維持 BLOCKED-UPSTREAM P7-BU-8／BU-9：本輪排程指示明定 P7 不修改 P5 擁有的檔案（`op_runner.rs`、`health.rs`），須編排者／擁有者裁決改由 P5 承接，或授權 P7 逐檔修改；建議修法已附於第 10 輪表 |
 | P7-27b5bf4-1 | High | `log_status` 頂層與 `session.capture` 分兩次取樣，reader 在其間更新會不一致 | **fixed（屬實）**：抽出 `capture_value(counts)`，`log_status` 取一次快照供頂層與巢狀共用；回歸 `capture_p7::log_status_counts_single_snapshot_under_concurrent_rx`（test-fakes `CaptureObserver::set_counts_hook` 於第一次取樣後注入 RX；修前 `(1,2)` vs `(2,4)` 紅） |
+
+### Task 18（本輪部分）
+
+| 項目 | 狀態 |
+|---|---|
+| `tests/contract_blackbox/test_p7_quiet_reconfirm.py::test_rust_quiet_mid_login_aborts_sc30`（`sc30-quiet-mid-login-aborts`） | **新增**：Rust CLI＋daemon（`SERIALWRAP_AB_LABEL=rust-p7`）連跑 2 次 PASS——送出帳號後 target 輸出 U-Boot banner，之後 target 0 byte（secret 未送）、ATTACHED＋`PROMPT_UNAVAILABLE`、detail null；Python 基線 `pytest.skip("SC-30 Rust-only")`（cases.yaml 平台限定）。此黑箱以外部 byte 證據鎖定行為，SC-30 與 F15 的差異（舊世代 Ready 不得推 READY）由 `session_core_login.rs` 區分 |
+| `tests/acceptance/l15/test_slice23_l15.py` | OD-34／OD-31 gate 案例（Rust label），見上 |
+| 其餘 Task 18 檔案（test_p7_login／selftest_recover／stall／events／log_capture／latency_noise／invariants、l15/slice23 yaml、run_p7_ab.sh） | 未開始，列下一輪 |
