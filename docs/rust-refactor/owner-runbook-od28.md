@@ -25,15 +25,17 @@
 | `daemon_sha256` | 受測 `serialwrapd.exe` 的 sha256 |
 | `exit_code`／`task_state` | `daemon_exit` 時的 exit code 與排程工作狀態 |
 
-另寫 `SHA256SUMS`（本目錄所有檔案）。launcher 寫入失敗不得影響 daemon 判定以外的行為，但缺少 `launcher_start`／`daemon_started` 列即判「證據不足」，不得記為 PASS。
+工作建立時另寫 `task_created.json`（`run_id`、`task_created_utc`：`Register-ScheduledTask` 成功返回後的 UTC 時間，ISO 8601；由建立工作的同一個 `win-task-throwaway.ps1` 呼叫寫入，不得事後補寫）。
 
-**待 P8 實作**：現行 `win-task-throwaway.ps1` 的 launcher 尚未寫上述證據檔；Task 13 須新增（例如 `-EvidenceDir` 參數），以 Windows 原生測試驗證後才可進行登出測試。
+另寫 `SHA256SUMS`（本目錄所有檔案，含 `task_created.json`）。launcher 寫入失敗不得影響 daemon 判定以外的行為，但缺少 `launcher_start`／`daemon_started` 列即判「證據不足」，不得記為 PASS。
+
+**待 P8 實作**：現行 `win-task-throwaway.ps1` 的 launcher 尚未寫上述證據檔（含 `task_created.json`）；Task 13 須新增（例如 `-EvidenceDir` 參數），以 Windows 原生測試驗證後才可進行登出測試。
 
 ## 程序
 
-1. agent（WSL）：建置 Rust bundle、以 `SW_TEST_ALLOW_SCHTASKS=1` 執行 `win-task-throwaway.ps1 -RunId <run_id> -Bundle <bundle>` 建立工作，確認 `%LOCALAPPDATA%\Temp\sw-od28\<run_id>\` 尚無 `launcher_start` 列（建立時不手動啟動）。
+1. agent（WSL）：建置 Rust bundle、以 `SW_TEST_ALLOW_SCHTASKS=1` 執行 `win-task-throwaway.ps1 -RunId <run_id> -Bundle <bundle>` 建立工作，確認 `%LOCALAPPDATA%\Temp\sw-od28\<run_id>\` 已有 `task_created.json`（含 `task_created_utc`）且尚無 `launcher_start` 列（建立時不手動啟動）。
 2. agent：讓本機工作停在段落（commit 進行中的變更、無前景測試），通知擁有者可以登出。
 3. 擁有者：於選定時間（不早於指定日 09:00）登出 Windows，再登入；同時通知 thala session 配合。「指定日」由擁有者在 Task 13 執行前另行指定，並登記於 `owner-decisions-addenda.md`；未登記日期前 agent 不得通知擁有者登出，本文件不預設日期。
 4. 擁有者重新開啟 WSL 後，agent 收取 `%LOCALAPPDATA%\Temp\sw-od28\<run_id>\` 全部檔案到 `~/b-log/rust-refactor/od28/<run_id>/`，核對 `SHA256SUMS` 與 `daemon_sha256`。
-5. 判定：`launcher_start.utc` 晚於 `logon_session_start_utc`，且有 `daemon_started` 與 `daemon_pid` → PASS；`logon_session_start_utc` 為 `null` → 證據不足（不得以其他時間補值後判 PASS）；否則依實際狀況記 FAIL 或證據不足，不得放寬。
+5. 判定（2026-10-28 依雲端審查 `9d74511_32f6dd1-opus.md` 32f6dd1#1 收緊）：以下全部成立才 PASS——(a) `logon_session_start_utc` 晚於 `task_created_utc`（工作建立後確實有一次新的互動登入；鎖定／解鎖為 LogonType 7、不在取值範圍）；(b) `launcher_start.utc` 晚於 `logon_session_start_utc`；(c) `launcher_start.utc` 與 `logon_session_start_utc` 相差不超過 10 分鐘（排除登入後很久才以 `schtasks /Run` 等方式手動觸發）；(d) 有 `daemon_started` 與 `daemon_pid`。`logon_session_start_utc` 或 `task_created_utc` 為 `null`／缺檔，或 (c) 超過 10 分鐘 → 證據不足（不得以其他時間補值後判 PASS）；否則依實際狀況記 FAIL 或證據不足，不得放寬。
 6. agent：執行 `win-task-throwaway.ps1 -RunId <run_id> -Cleanup`，確認無殘留工作與 throwaway daemon。
