@@ -135,6 +135,9 @@ impl FsOps for RealFs {
     fn remove_file(&self, p: &Path) -> PalResult<()> {
         std::fs::remove_file(p).map_err(io_error)
     }
+    fn remove_dir(&self, p: &Path) -> PalResult<()> {
+        std::fs::remove_dir(p).map_err(io_error)
+    }
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         std::fs::copy(from, to).map(|_| ()).map_err(io_error)
     }

@@ -15,6 +15,10 @@ from typing import Mapping, Sequence
 
 NL: bytes = b"\r\n" if os.name == "nt" else b"\n"
 
+# 本行程內 isolated_env 登記的 (隔離根, env)；conftest 於每個案例 call 階段結束時據以記錄 config_digest
+# （見 config_digest.py）。env 保存同一物件參考，夾具之後的修改會反映在摘要中。
+ISOLATED_ROOTS: list[tuple[Path, dict[str, str]]] = []
+
 
 @dataclass(frozen=True)
 class CliResult:
@@ -151,6 +155,7 @@ def isolated_env(tmp: Path, **overrides: str | None) -> dict[str, str]:
             e.pop(k, None)
         else:
             e[k] = str(v)
+    ISOLATED_ROOTS.append((tmp, e))
     return e
 
 

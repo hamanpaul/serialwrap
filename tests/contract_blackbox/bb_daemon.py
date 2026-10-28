@@ -88,6 +88,59 @@ def _collect_pids(pid: int) -> list[int]:
     return pids
 
 
+def _current_pid_ns() -> str | None:
+    """本行程所屬 pid namespace 的連結字串（`pid:[inode]`）；非 POSIX 或無法讀取回 None。
+
+    釋放檢查（scripts/rust/ab_blackbox_1b.py）以此區分「與 host 同 namespace」與「pidns_rig 子行程的內部 pid」：
+    後者的 pid 數字是 namespace 內編號，不得拿去查 host 的 /proc/<pid>。
+    """
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
+def _proc_diag(pid: int) -> list[dict[str, str]]:
+    """行程各 thread 的排程狀態與 wchan（`/proc/<pid>/task/*`）；供 stop 失敗時歸因（S1X Y3）。
+
+    狀態 `D`（不可中斷睡眠）表示卡在核心 I/O，SIGKILL 也要等該 I/O 完成；`Z` 為已死待回收。讀取失敗回空清單。
+    """
+    rows: list[dict[str, str]] = []
+    task_dir = Path(f"/proc/{pid}/task")
+    try:
+        tasks = sorted(task_dir.iterdir(), key=lambda t: int(t.name))
+    except (OSError, ValueError):
+        return rows
+    for task in tasks:
+        row = {"tid": task.name}
+        try:
+            stat = (task / "stat").read_text()
+            # comm 以括號包住且可能含空白：狀態欄位在最後一個 ')' 之後
+            row["comm"] = stat[stat.index("(") + 1: stat.rindex(")")]
+            row["state"] = stat[stat.rindex(")") + 2:].split(" ", 1)[0]
+        except (OSError, ValueError):
+            row["state"] = "?"
+        for name in ("wchan", "syscall"):
+            try:
+                row[name] = (task / name).read_text().strip()
+            except OSError:
+                pass
+        rows.append(row)
+    return rows
+
+
+def _stoplog(record: dict[str, Any]) -> None:
+    """`$SW_AB_STOPLOG` 有設定時，以 NDJSON 附加一筆 stop 紀錄（各階段耗時與結果）。"""
+    path = os.environ.get("SW_AB_STOPLOG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
 class PyDaemon:
     def __init__(self, env: Mapping[str, str], *, profile_dir: Path, socket: str, lock: Path) -> None:
         self.env = dict(env)
@@ -123,6 +176,7 @@ class PyDaemon:
         if pidlog:
             record = {
                 "pid": self.proc.pid,
+                "pid_ns": _current_pid_ns(),
                 "children": [],
                 "socket": self.socket,
                 "lock": str(self.lock),
@@ -150,6 +204,7 @@ class PyDaemon:
         if pidlog and len(self._pids) > 1:
             record = {
                 "pid": self.proc.pid,
+                "pid_ns": _current_pid_ns(),
                 "children": [p for p in self._pids if p != self.proc.pid],
                 "socket": self.socket,
                 "lock": str(self.lock),
@@ -163,14 +218,20 @@ class PyDaemon:
             return
         proc = self.proc
         pid = proc.pid
+        t0 = time.monotonic()
+        record: dict[str, Any] = {"pid": pid, "socket": self.socket, "escalation": "rpc"}
         try:
-            _send_rpc(self.socket, "daemon.stop", {}, timeout_s=1.0)
+            rpc = _send_rpc(self.socket, "daemon.stop", {}, timeout_s=1.0)
         except Exception:
-            pass
+            rpc = None
+        record["rpc_ok"] = bool(rpc and rpc.get("ok"))
+        record["rpc_s"] = round(time.monotonic() - t0, 3)
 
         try:
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            record["escalation"] = "sigterm"
+            record["diag_before_sigterm"] = _proc_diag(pid)
             if os.name == "posix":
                 try:
                     os.killpg(pid, signal.SIGTERM)
@@ -181,6 +242,8 @@ class PyDaemon:
             try:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
+                record["escalation"] = "sigkill"
+                record["diag_before_sigkill"] = _proc_diag(pid)
                 if os.name == "posix":
                     try:
                         os.killpg(pid, signal.SIGKILL)
@@ -193,9 +256,19 @@ class PyDaemon:
                 except subprocess.TimeoutExpired:
                     pass
 
+        record["exit_s"] = round(time.monotonic() - t0, 3)
+        record["returncode"] = proc.poll()
         # 有界確認主行程消失
         if proc.poll() is None:
-            raise RuntimeError(f"Daemon process pid={pid} 於 stop 後仍存活")
+            diag = _proc_diag(pid)
+            record["diag_after_sigkill"] = diag
+            record["alive"] = True
+            _stoplog(record)
+            raise RuntimeError(
+                f"Daemon process pid={pid} 於 stop 後仍存活（{record['exit_s']}s、升級至 {record['escalation']}；"
+                f"threads={json.dumps(diag, ensure_ascii=False)}）"
+            )
+        _stoplog(record)
 
         # POSIX 下確認子行程消失
         if os.name == "posix":

@@ -130,6 +130,23 @@ def test_registered_skip_is_not_applicable_only_on_matching_platform(tmp_path):
     assert (code, rep["cases"][0]["class"]) == (1, "evidence-insufficient")
 
 
+def test_approved_rust_only_skips_accept_runner_config_digest(tmp_path):
+    """A 輪全為核准 rust-only skip 時，runner 摘要可與 B 夾具摘要不同。"""
+    identity_a = identity(tmp_path, "a", config_digest="a" * 64)
+    identity_b = identity(tmp_path, "b", config_digest="b" * 64)
+    code, report = run(
+        tmp_path,
+        [("t_cfg.py::test_one", "skip_rust_only")],
+        [("t_cfg.py::test_one", "pass")],
+        id_a=identity_a,
+        id_b=identity_b,
+    )
+    assert code == 0
+    assert report["result"] == "pass"
+    assert report["cases"][0]["class"] == "rust-only-ok"
+    assert report["identity"]["a"]["config_digest"] != report["identity"]["b"]["config_digest"]
+
+
 def test_case_set_mismatch(tmp_path):
     code, rep = run(tmp_path, [("t::a", "pass")], [("t::b", "pass")])
     assert code == 1

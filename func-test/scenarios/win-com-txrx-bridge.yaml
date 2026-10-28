@@ -28,11 +28,27 @@ profile:
 steps:
   - action: wait_ready
     timeout_s: 20
+  # S1X Y4（CHG-S1X-WIN-TXRX-PAYLOADS-01）：依 plan 03 送 `echo W_<n>` 50 次（payload 各不相同），
+  # 每個 payload 在 wire 恰一次且依序；每個命令 done；console bytes 原樣出現。
+  # 50 個命令連續送出（burst），逐次另存 w_<n>；之後第二個 repeat 逐一等終態並斷言 done——Python arbiter 單一命令
+  # error 後仍續處理下一個，「最後一個 done」不能推論前 49 個 done（雲端審查 6eb949c#1）。
   - action: repeat
     count: 50
     steps:
       - action: cli
-        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:w1", "--cmd", "echo W_TEST"]
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:w1", "--cmd", "echo W_{repeat.index}"]
+        save_as: "w_{repeat.index}"
+        expect: {ok: true}
+  - action: repeat
+    count: 50
+    steps:
+      - action: wait_command_done
+        cmd_id: "{w_{repeat.index}.cmd_id}"
+        timeout_s: 40
+      - action: cli
+        argv: ["cmd", "status", "--cmd-id", "{w_{repeat.index}.cmd_id}"]
+        expect:
+          command.status: "done"
   - action: attach_console
     selector: COM0
     label: win-con
@@ -40,6 +56,13 @@ steps:
   - action: console_write
     console_id: "{wcon.client_id}"
     input_raw: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\r"
+  # bridge 證據 writer 非同步落盤（同 CHG-S1X-SC18-WIRE-FLUSH-01）：先等 console 最後幾個 byte 出現在 wire 再斷言。
+  - action: wait_wire_marker
+    marker: "xyz{|}~\r"
+    observation: "serial_read"
+    timeout_s: 15
   - action: assert_wire_contiguous
-    payloads: ["echo W_TEST\n"]
+    payloads: ["echo W_1\n", "echo W_2\n", "echo W_3\n", "echo W_4\n", "echo W_5\n", "echo W_6\n", "echo W_7\n", "echo W_8\n", "echo W_9\n", "echo W_10\n", "echo W_11\n", "echo W_12\n", "echo W_13\n", "echo W_14\n", "echo W_15\n", "echo W_16\n", "echo W_17\n", "echo W_18\n", "echo W_19\n", "echo W_20\n", "echo W_21\n", "echo W_22\n", "echo W_23\n", "echo W_24\n", "echo W_25\n", "echo W_26\n", "echo W_27\n", "echo W_28\n", "echo W_29\n", "echo W_30\n", "echo W_31\n", "echo W_32\n", "echo W_33\n", "echo W_34\n", "echo W_35\n", "echo W_36\n", "echo W_37\n", "echo W_38\n", "echo W_39\n", "echo W_40\n", "echo W_41\n", "echo W_42\n", "echo W_43\n", "echo W_44\n", "echo W_45\n", "echo W_46\n", "echo W_47\n", "echo W_48\n", "echo W_49\n", "echo W_50\n"]
+  - action: assert_wire_contiguous
+    payloads: [" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\r"]
   - action: assert_compare

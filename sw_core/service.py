@@ -304,7 +304,7 @@ class SerialwrapService:
         self._watcher = DeviceWatcher(
             by_id_dir, self._on_device_change,
             extra_scan_dirs=[by_path_dir],
-            on_tick=self._sessions.reconcile_readiness,
+            on_tick=self._on_watcher_tick,
             source=_source,
         )
         self._mcu_registry = McuPatternRegistry.load(None)
@@ -899,6 +899,25 @@ class SerialwrapService:
             return session.profile.com if session is not None else None
         return None
 
+    def _on_watcher_tick(self) -> None:
+        """DeviceWatcher 每輪（約 1 Hz）呼叫：先非阻塞服務 WAL 延後輪替，再做 readiness reconcile。
+
+        OD-19：延後輪替的完成不得依賴後續 append（無新流量時 append 不會發生），故由 watcher 週期 tick 推進。
+        兩者各自含住例外、互不遮蔽；第一個例外於最後重新拋出，由 DeviceWatcher._loop 既有的 tick 失敗處理記錄。
+        """
+        first_error: Exception | None = None
+        try:
+            self._wal.tick()
+        except Exception as exc:  # noqa: BLE001 — 互不遮蔽：WAL tick 失敗仍須執行 readiness reconcile
+            first_error = exc
+        try:
+            self._sessions.reconcile_readiness()
+        except Exception as exc:  # noqa: BLE001 — 同上；第一個例外重新拋出
+            if first_error is None:
+                first_error = exc
+        if first_error is not None:
+            raise first_error
+
     def _reconcile_interactive_admission_tickets(self) -> None:
         tickets = getattr(self, "_interactive_admission_tickets", None)
         gate = getattr(self, "admission", None)
@@ -951,6 +970,31 @@ class SerialwrapService:
                     })
                 error_code = "FLASHING_BUSY" if busy.get("flashing") else "SESSION_BUSY"
                 return {"ok": False, "error_code": error_code, "busy": rows}
+            # 回覆前先凍結背景引擎與 bridge TX（SC-11 排空窗口零 TX）：RPC admission 之外的
+            # 重探 tick、重 attach、login、console 行原本不經 admission。
+            unconverged = self._sessions.freeze_for_handoff()
+            if unconverged:
+                # fail-closed：TX fence 逾時，仍有已通過提交檢查的寫入段在進行中，交接不得成立（不回 ok:true）。
+                # SC-11「忙碌回 SESSION_BUSY＋busy，不凍結、不停止」：撤銷本次新建立的 admission 凍結；
+                # 背景凍結由 freeze_for_handoff 已於內部撤銷。已凍結者（重複呼叫）不在此撤銷。
+                # thaw 僅撤銷本次呼叫新建立的凍結（AdmissionGate 以建立者 token 判定），
+                # 因此與 stop() 等並行建立的凍結不會被誤撤。
+                if token is not None:
+                    self.admission.thaw(token)
+                tx_rows: list[dict[str, Any]] = []
+                for com in unconverged:
+                    session = next((item for item in sessions if item.profile.com == com), None)
+                    public = session.to_public_dict() if session is not None else {}
+                    tx_rows.append({
+                        "com": com,
+                        "state": public.get("state", "UNKNOWN"),
+                        "foreground_busy": bool(public.get("foreground_busy", False)),
+                        "outstanding_commands": int(public.get("outstanding_commands", 0)),
+                        "interactive_session_id": public.get("interactive_session_id"),
+                        "recovering": bool(public.get("recovering", False)),
+                        "ops": ["tx.in_flight"],
+                    })
+                return {"ok": False, "error_code": "SESSION_BUSY", "busy": tx_rows}
         return {"ok": True, "stopping": True, "handoff_token": token}
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:

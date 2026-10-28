@@ -47,7 +47,8 @@ def _capture_popen(captured: dict[str, Any]):
 @pytest.mark.memory_only
 def test_windows_wiring_env_and_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
     """驗證 Windows bridge 模式下的環境變數、argv、profile targets 綁定及不建立 symlink。"""
-    from lib import daemon_harness
+    # 先於 os.name 偽裝前載入：模組層以 pathlib.Path 建立路徑，偽裝為 nt 時會選到 WindowsPath。
+    from lib import bridge_session, daemon_harness, target_config  # noqa: F401
     monkeypatch.setattr(os, "name", "nt")
 
     captured_daemon: dict[str, Any] = {}

@@ -39,6 +39,38 @@ SERIALWRAP = AB_ENV.get("SERIALWRAP_CLI_EXE") or str(ROOT_DIR / "serialwrap")
 SERIALWRAPD_ARGV = [AB_ENV["SERIALWRAP_DAEMON_EXE"]] if AB_ENV.get("SERIALWRAP_DAEMON_EXE") else [sys.executable, str(ROOT_DIR / "serialwrapd.py")]
 
 
+def _external_holders(path: str, *, exclude_pid: int) -> list[str]:
+    """掃 /proc，回傳持有 path 的 pid（排除 exclude_pid）。
+
+    判準為 inode 身分（fd 經 os.stat 跟隨後的 (st_dev, st_ino) 等於 path 的身分；#R2），與 daemon 端
+    `UARTBridge._enumerate_all_held_paths` 使用同一判準，讓測試的等待條件與 daemon 的孤兒回收判準一致。
+    不以 readlink 字串比對：容器內獨立 devpts instance 的 /dev/pts/N 會與本測試的 pty 同名，造成假 holder。
+    """
+    try:
+        target = os.stat(path)
+    except OSError:
+        return []
+    target_id = (target.st_dev, target.st_ino)
+    holders: list[str] = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == exclude_pid:
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for name in names:
+            try:
+                st = os.stat(os.path.join(fd_dir, name))
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == target_id:
+                holders.append(pid)
+                break
+    return holders
+
+
 class FakeTarget:
     """PTY 假 target，回應 prpl 風格 prompt 並 echo 命令。"""
 
@@ -267,13 +299,6 @@ targets:
             check=True, timeout=5,
         )
 
-    def _tmux_send(self, keys: str, delay: float = 0.5) -> None:
-        subprocess.run(
-            ["tmux", "send-keys", "-t", self._tmux_session, keys, "Enter"],
-            check=True, timeout=5,
-        )
-        time.sleep(delay)
-
     def _tmux_capture(self) -> str:
         proc = subprocess.run(
             ["tmux", "capture-pane", "-t", self._tmux_session, "-p"],
@@ -281,12 +306,38 @@ targets:
         )
         return proc.stdout
 
+    def _wait_vtty_reader(self, vtty: str, timeout_s: float = 10.0) -> None:
+        """等待條件：vtty 已由 daemon 以外的行程持有（即 tmux 內的讀者已開啟）。
+
+        vtty 已不存在代表 daemon 已回收該 console，立即失敗並指出原因，不空等到逾時。
+        無 /proc 的平台無法觀測持有者；daemon 端在此情況下也保守地不回收（視為仍有 peer），
+        故此時直接回傳。
+        """
+        if not os.path.isdir("/proc"):
+            return
+        daemon_pid = self._daemon.pid
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if _external_holders(vtty, exclude_pid=daemon_pid):
+                return
+            if not os.path.exists(vtty):
+                self.fail(f"vtty {vtty} 在讀者握住前已消失（console 被 daemon 回收）")
+            time.sleep(0.05)
+        self.fail(f"tmux 內的讀者未在 {timeout_s}s 內握住 vtty {vtty}；pane:\n{self._tmux_capture()}")
+
     def _start_minicom_in_tmux(self, vtty: str) -> None:
-        """在 tmux session 內用 cat 讀 vtty（模擬 minicom 的 RX 觀測）。"""
-        self._tmux_new("bash")
-        time.sleep(0.3)
-        # 用 cat 讀 PTY slave 以觀測 RX（比 minicom 更輕量且不需安裝）
-        self._tmux_send(f"cat {vtty}", delay=1.0)
+        """在 tmux session 內用 cat 讀 vtty（模擬 minicom 的 RX 觀測）。
+
+        時序約束：daemon 會回收「建立後 _STALE_CONSOLE_GRACE_S（2.0s）內仍無外部 reader」的
+        非 primary console（sw_core/uart_io.py 的 `_prune_stale_consoles_locked`，由 reconcile tick
+        經 snapshot／list_consoles 觸發）。讀者必須在此窗內握住 vtty，否則 console 會被合法回收，
+        測試即競態失敗。因此：
+        - 直接以 tmux 啟動 cat，不經互動式 bash 啟動（負載下 bash 版實測 1.3～1.6s 才握住 vtty，
+          直接啟動約 0.05s）；cat 結束（例如 C-c）後 exec bash，保留 pane 內的 shell。
+        - 以等待條件取代固定 sleep：vtty 出現 daemon 以外的持有者後才回傳。
+        """
+        self._tmux_new(f"cat {vtty}; exec bash")
+        self._wait_vtty_reader(vtty)
 
     # ---------------------------------------------------------------
     # T1: wal.reset 後 console PTY 仍然有效

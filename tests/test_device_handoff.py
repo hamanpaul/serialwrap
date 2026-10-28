@@ -181,10 +181,14 @@ class TestProbeExternalHolder(_Base):
         mgr = self._mgr([self._make_profile("p", "COM0", "lab+1", "/dev/serial/by-id/orig")])
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyUSB9", proc / "1234" / "fd" / "5")
+        # #R2：holder 以 inode 身分判定，fixture 需為同一實體檔案（字串相同但不存在者不再計入）。
+        dev = Path(self._tmp.name) / "dev" / "ttyUSB9"
+        dev.parent.mkdir(parents=True)
+        dev.write_bytes(b"")
+        os.symlink(dev, proc / "1234" / "fd" / "5")
         # 釘 POSIX procfs 分支：probe_holders 在 os.name == "nt" 時直接回 unsupported（見 test_holder_probe_portability.py）
         with mock.patch.object(os, "name", "posix"):
-            res = mgr._probe_external_holder("/dev/ttyUSB9", _proc_root=str(proc))
+            res = mgr._probe_external_holder(str(dev), _proc_root=str(proc))
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
 

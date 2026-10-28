@@ -202,6 +202,36 @@ def _write_all(fd: int, data: bytes, timeout_s: float = 10.0) -> None:
                 raise OSError("POLLERR 發生於檔案描述子")
 
 
+# ST-03(a) Windows 分支的有界期限：寫入與讀取皆須於期限內完成，否則 fail closed（不無限等待）。
+ST03_WIN_WRITE_TIMEOUT_S = 120.0
+ST03_WIN_READ_DEADLINE_S = 120.0
+# ST-03(a) Windows 分支的驅動層收發佇列（pySerial `set_buffer_size`，須於開啟後呼叫）。
+# 依據（2026-10-22 於 COM20:COM21、com0com 實測）：未設定時每方向僅接受 4096 位元組即阻塞（對端不讀）；
+# 設為 4 MiB 後可整段接受 4 MiB。ST-03 在測試端讀取前須寫入 2 MiB，回聲因而需停在測試端的接收佇列；
+# POSIX 分支的 PTY 核心緩衝可提供同類的餘裕，Windows 端須以此明示等價餘裕。
+# 不影響位元組相等與短讀斷言，也不改變 bridge 的 max_inflight_bytes（1 MiB）與 write_timeout_s（5 s）。
+ST03_WIN_QUEUE_BYTES = 4 * 1024 * 1024
+
+
+def _win_write_all(ser: Any, data: bytes, *, timeout_s: float) -> None:
+    """pySerial 版寫入：以 write_timeout 有界寫入整段；回報長度不足或逾時即失敗。"""
+    ser.write_timeout = timeout_s
+    written = int(ser.write(data))
+    if written != len(data):
+        raise OSError(f"寫入回報 {written}/{len(data)} bytes（寫入不完整）")
+
+
+def _win_read_exact(ser: Any, size: int, *, timeout_s: float) -> bytes:
+    """pySerial 版讀取：以整體期限讀滿 size bytes；期限內未讀滿即 TimeoutError（不回傳部分資料當成功）。"""
+    deadline = time.monotonic() + timeout_s
+    out = bytearray()
+    while len(out) < size:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"讀取期限逾 {timeout_s:.0f} 秒，已接收 {len(out)}/{size} 位元組")
+        out.extend(bytes(ser.read(size - len(out))))
+    return bytes(out)
+
+
 def _make_wal_and_correlation(
     ev_dir: pathlib.Path,
     tx_data: bytes,
@@ -549,6 +579,7 @@ def _run_st03(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
 
         data_2mib = b"0123456789ABCDEF" * (128 * 1024)  # 2 MiB
         recvd_2mib = bytearray()
+        win_io_error: str | None = None
         try:
             if ctx.endpoint == "posix-pty":
                 fd = os.open(str(link_path), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -561,9 +592,15 @@ def _run_st03(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
                     os.close(fd)
             else:
                 import serial
-                with serial.Serial(ctx.com_pair[0], 115200, timeout=10.0) as ser:
-                    ser.write(data_2mib)
-                    recvd_2mib = ser.read(len(data_2mib))
+                # 與 POSIX 分支同序：一次寫 2 MiB 且不讀，之後再讀；寫入與讀取皆有界，逾時即 fail closed。
+                try:
+                    with serial.Serial(ctx.com_pair[0], 115200, timeout=0.5) as ser:
+                        ser.set_buffer_size(rx_size=ST03_WIN_QUEUE_BYTES, tx_size=ST03_WIN_QUEUE_BYTES)
+                        _win_write_all(ser, data_2mib, timeout_s=ST03_WIN_WRITE_TIMEOUT_S)
+                        recvd_2mib = bytearray(_win_read_exact(ser, len(data_2mib), timeout_s=ST03_WIN_READ_DEADLINE_S))
+                except (OSError, TimeoutError, AttributeError) as exc:
+                    # AttributeError：本 pySerial 後端不支援 set_buffer_size 時同樣 fail closed，不得略過緩衝設定。
+                    win_io_error = str(exc)
         finally:
             bridge_a.handle_action("barrier", {"quiet_ms": 100}, "a1")
             bridge_a.handle_action("shutdown", {}, "a2")
@@ -571,6 +608,9 @@ def _run_st03(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
 
         if rc_a != 0 or bridge_a.failure is not None:
             return CheckResult("ST-03", "FAIL", f"(a) bridge 未乾淨結束 rc={rc_a} failure={bridge_a.failure}", str(ev_dir))
+
+        if win_io_error is not None:
+            return CheckResult("ST-03", "FAIL", f"(a) Windows COM 往返失敗（期限內未完成，fail closed）：{win_io_error}", str(ev_dir))
 
         if bytes(recvd_2mib) != data_2mib:
             return CheckResult("ST-03", "FAIL", f"(a) 真 pipe 2 MiB 往返資料不符（實收 {len(recvd_2mib)} vs 預期 {len(data_2mib)}）", str(ev_dir))
@@ -942,6 +982,20 @@ def _run_st06(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
 
 def _run_st07(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
     """ST-07: 故障控制 通道動作依序呼叫並驗證 control.ndjson。"""
+    if ctx.endpoint != "win-serial" or not ctx.com_pair:
+        return _run_st07_body(ctx, ev_dir)
+    import serial
+    # Windows 對端（COM20）於整段檢查期間保持開啟，模擬實體連線：實測 com0com 對端關閉時寫入會阻塞直到 bridge 的 5 秒
+    # 寫入逾時，隨即以 HARNESS_WRITE_UNCERTAIN fail closed（POSIX 端由 peer gate 處理，Windows 端無 peer 狀態可取樣）。
+    peer = serial.Serial(ctx.com_pair[0], 115200, timeout=0.05)
+    try:
+        return _run_st07_body(ctx, ev_dir)
+    finally:
+        peer.close()
+
+
+def _run_st07_body(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
+    """ST-07 本體（不含 Windows 對端保持開啟之包裝）。"""
     link_path = ev_dir / "fake-uart"
     if ctx.endpoint == "posix-pty":
         ep_spec = {"kind": "posix-pty", "by_id_link": str(link_path), "peer_gate": True}
@@ -1380,7 +1434,8 @@ def _run_st10(ctx: SelftestContext, ev_dir: pathlib.Path) -> CheckResult:
                 os.close(fd)
         elif ctx.com_pair:
             import serial
-            with serial.Serial(ctx.com_pair[0], 115200, timeout=1.0) as ser:
+            # 寫入須有界（同 POSIX 分支的 _write_all 1.0 秒期限）：bridge 因磁碟滿退出後不再讀取，無 write_timeout 時會永久阻塞。
+            with serial.Serial(ctx.com_pair[0], 115200, timeout=1.0, write_timeout=1.0) as ser:
                 for _ in range(32):
                     if proc.poll() is not None:
                         break

@@ -732,3 +732,81 @@ def test_plus_one_x_derived_var(tmp_path, monkeypatch):
     tr = _make_runner(runner_mod, [], _FakeHarness(tmp_path), bridge=False)
     tr._exec_step({"action": "cli", "argv": ["daemon", "status"], "save_as": "st"}, 0)
     assert tr._expand("{st.limits.max_submit_cmd_bytes_plus_one_x}") == "xxxxxx"
+
+
+# ---------------------------------------------------------------------------
+# win-com-txrx-bridge 情境形狀（S1X Y4，CHG-S1X-WIN-TXRX-PAYLOADS-01）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.memory_only
+def test_repeat_exposes_one_based_index(tmp_path, monkeypatch):
+    """`repeat` 迴圈內可用 `{repeat.index}`（1 起算）；迴圈結束後還原外層同名變數。"""
+    runner_mod = _load_runner()
+    calls = _patch_cli(monkeypatch, runner_mod, [{"ok": True, "cmd_id": "c"}])
+    tr = _make_runner(runner_mod, [], _FakeHarness(tmp_path), bridge=False)
+    tr.variables["repeat"] = {"index": "outer"}
+    tr._exec_step({"action": "repeat", "count": 3, "steps": [
+        {"action": "cli", "argv": ["cmd", "submit", "--cmd", "echo W_{repeat.index}"]}]}, 0)
+    assert [c[-1] for c in calls] == ["echo W_1", "echo W_2", "echo W_3"]
+    assert tr.variables["repeat"] == {"index": "outer"}
+
+
+@pytest.mark.memory_only
+def test_repeat_save_as_and_nested_reference_resolve_per_index(tmp_path, monkeypatch):
+    """`save_as: "w_{repeat.index}"` 逐次另存；第二個 repeat 以 `{w_{repeat.index}.cmd_id}` 取回對應命令（雲端審查 6eb949c#1）。"""
+    runner_mod = _load_runner()
+    calls = _patch_cli(monkeypatch, runner_mod, [{"ok": True, "cmd_id": f"c{n}"} for n in range(1, 4)])
+    tr = _make_runner(runner_mod, [], _FakeHarness(tmp_path), bridge=False)
+    tr._exec_step({"action": "repeat", "count": 3, "steps": [
+        {"action": "cli", "argv": ["cmd", "submit", "--cmd", "echo W_{repeat.index}"], "save_as": "w_{repeat.index}"}]}, 0)
+    assert [tr.variables[f"w_{n}"]["cmd_id"] for n in range(1, 4)] == ["c1", "c2", "c3"]
+    assert "w_{repeat.index}" not in tr.variables
+    expanded = []
+    tr.variables["repeat"] = {"index": 2}
+    expanded.append(tr._expand("{w_{repeat.index}.cmd_id}"))
+    tr.variables.pop("repeat")
+    # 未解析的內層或外層維持原字面（由 _require_resolved 擋下），不得靜默變成其他命令
+    assert expanded == ["c2"]
+    assert tr._expand("{w_{repeat.index}.cmd_id}") == "{w_{repeat.index}.cmd_id}"
+    tr.variables["repeat"] = {"index": 9}
+    assert tr._expand("{w_{repeat.index}.cmd_id}") == "{w_9.cmd_id}"
+    # console 字面的 `{|}` 等非名稱字元不受巢狀展開影響
+    assert tr._expand("xyz{|}~") == "xyz{|}~"
+    assert len(calls) == 3
+
+
+@pytest.mark.memory_only
+def test_win_com_txrx_bridge_expects_each_payload_exactly_once():
+    """plan 03 §win-com-txrx-bridge：`echo W_<n>` 50 次、每個 payload 在 wire 恰一次且依序；console bytes 原樣出現。
+
+    舊版以相同 `echo W_TEST` 送 50 次卻只預期 1 次（比較器要求次數完全相符，正確行為必 FAIL），且未檢 console bytes。
+    """
+    doc = yaml.safe_load((SCEN_DIR / "win-com-txrx-bridge.yaml").read_text(encoding="utf-8"))
+    steps = doc["steps"]
+    rep = next(s for s in steps if s.get("action") == "repeat")
+    assert rep["count"] == 50
+    submit = rep["steps"][0]
+    assert _cli_argv_has(submit, "cmd", "submit") and "echo W_{repeat.index}" in submit["argv"]
+    asserts = [s for s in steps if s.get("action") == "assert_wire_contiguous"]
+    assert [f"echo W_{n}\n" for n in range(1, 51)] in [a["payloads"] for a in asserts]
+    console = next(s for s in steps if s.get("action") == "console_write")["input_raw"]
+    assert console == "".join(chr(c) for c in range(0x20, 0x7F)) + "\r"
+    assert [console] in [a["payloads"] for a in asserts]
+    # 斷言前須等 console bytes 落盤到 wire（證據 writer 非同步）
+    names = [s.get("action") for s in steps]
+    wait_idx = next(i for i, s in enumerate(steps)
+                    if s.get("action") == "wait_wire_marker" and console.endswith(s.get("marker", "\0")))
+    assert names.index("console_write") < wait_idx < names.index("assert_wire_contiguous")
+    # 每個命令都須 done（plan 03；雲端審查 6eb949c#1）：Python arbiter 單一命令 error 後仍續處理下一個，
+    # 故「最後一個 done」不能推論前 49 個 done。burst 送出時逐次 save_as，第二個 repeat 逐一等終態並斷言 done。
+    assert submit.get("save_as") == "w_{repeat.index}"
+    reps = [s for s in steps if s.get("action") == "repeat"]
+    assert len(reps) == 2 and reps[1]["count"] == 50
+    assert names.index("repeat") < steps.index(reps[1]) < names.index("assert_wire_contiguous")
+    sub = reps[1]["steps"]
+    assert any(s.get("action") == "wait_command_done" and s.get("cmd_id") == "{w_{repeat.index}.cmd_id}" for s in sub)
+    assert any(_cli_argv_has(s, "cmd", "status") and "{w_{repeat.index}.cmd_id}" in s["argv"]
+               and (s.get("expect") or {}).get("command.status") == "done" for s in sub)
+    assert [i for i, s in enumerate(sub) if s.get("action") == "wait_command_done"] < \
+        [i for i, s in enumerate(sub) if _cli_argv_has(s, "cmd", "status")]

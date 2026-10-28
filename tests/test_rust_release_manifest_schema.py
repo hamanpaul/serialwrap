@@ -111,3 +111,7 @@ def test_manifest_schema_accepts_new_optional_fields(tmp_path: Path) -> None:
         "Rust verify_bundle 必須接受真實 mkbundle.sh --dev 產物："
         f"stdout={proc.stdout}\nstderr={proc.stderr}"
     )
+    assert "1 passed" in proc.stdout, (
+        "pytest 必須確實執行 real_mkbundle_dev_output_verifies，不得以 --ignored 空跑通過："
+        f"stdout={proc.stdout}\nstderr={proc.stderr}"
+    )

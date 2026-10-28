@@ -46,17 +46,23 @@ steps:
   - action: assert_wal_marker
     marker: "echo WAL_AFTER_UNLINK"
     dir: "TX"
+  # 段 (c)：讀取鎖定只在 Windows 有意義（POSIX 的 reader handle 不阻擋 unlink／rename）；
+  # POSIX 上記為 not_applicable_posix（runner 的 platforms 閘門；不執行、不計 PASS、不計資格）。
   - action: wal_control
     op: hold_reader
     seconds: 5
+    platforms: [windows]
   - action: cli
     argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo WAL_DURING_HOLD"]
     save_as: w_hold
+    platforms: [windows]
   - action: wait_command_done
     cmd_id: "{w_hold.cmd_id}"
+    platforms: [windows]
   - action: assert_wal_marker
     marker: "echo WAL_DURING_HOLD"
     dir: "TX"
+    platforms: [windows]
   - action: wal_control
     op: reset
   - action: wait_ready

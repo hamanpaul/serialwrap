@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 
+from .serial_port import same_tty, tty_stat
 from .util import normalize_endpoint_path
 
 
@@ -131,7 +132,13 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
 
     holders: dict[str, int] = {}
     status = "ok"
-    tty_set = set(tty_paths)
+    # #R2：以 inode 身分比對（見 serial_port.same_tty），不以 readlink 字串——跨 mount namespace 的同名
+    # /dev/pts/N（例如 docker 容器內獨立 devpts）字串相同卻非同一 tty。holders 的鍵仍為呼叫端給的 tty 路徑。
+    tty_stats: list[tuple[str, os.stat_result]] = []
+    for tty in tty_paths:
+        tty_st = tty_stat(tty)
+        if tty_st is not None:
+            tty_stats.append((tty, tty_st))
     for info in daemons:
         pid = info["pid"]
         fd_dir = f"{proc_root}/{pid}/fd"
@@ -146,11 +153,12 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
             continue
         for fd in fds:
             try:
-                target = os.readlink(f"{fd_dir}/{fd}")
+                fd_stat = os.stat(f"{fd_dir}/{fd}")
             except OSError:
                 continue
-            if target in tty_set:
-                holders[target] = pid
+            for tty, tty_st in tty_stats:
+                if same_tty(fd_stat, tty_st):
+                    holders[tty] = pid
 
     return {
         "multi_open": len(daemons) > 1,

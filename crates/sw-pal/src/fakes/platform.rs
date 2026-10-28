@@ -323,6 +323,9 @@ impl FsOps for Unconfigured {
     fn remove_file(&self, _p: &Path) -> PalResult<()> {
         not_configured(self.0)
     }
+    fn remove_dir(&self, _p: &Path) -> PalResult<()> {
+        not_configured(self.0)
+    }
     fn copy_preserving(&self, _from: &Path, _to: &Path) -> PalResult<()> {
         not_configured(self.0)
     }

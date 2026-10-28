@@ -10,6 +10,7 @@ import time
 import zlib
 from collections import deque
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from .constants import (
@@ -25,6 +26,33 @@ from .wal_fs import PartialWriteError, WalFile, WalFs, default_wal_fs
 # 模組層 logger：append 的頻率等同 UART RX，而 logging.getLogger() 每次呼叫都會
 # 進 logging.Manager 取全域鎖——不可放在這條熱路徑上（#189）。
 _LOG = logging.getLogger("serialwrap")
+
+# OD-19（2026-10-23）：rotate 遇共用違規（ERROR_SHARING_VIOLATION）或存取拒絕（ERROR_ACCESS_DENIED）
+# 屬防毒等外部程式暫時佔用的干擾，不是資料錯誤。立即退避的次數與間隔為有上限的常數；超過上限即
+# 轉入延遲佇列，之後以 WAL_DEFERRED_DELETE_INTERVAL_S 非阻塞重試，直到輪替完成。寫入路徑不持鎖睡眠：
+# 退避以「下一次嘗試的時間戳」判定，於後續 append 或 tick() 檢查到期。Rust sw-pal wal_fs 須採相同語意。
+WAL_ROTATE_RETRY_BACKOFF_S: tuple[float, ...] = (0.01, 0.05, 0.2)
+WAL_DEFERRED_DELETE_INTERVAL_S: float = 1.0
+WAL_DEFERRED_WARNING_INTERVAL_S: float = 60.0
+_WINERROR_ACCESS_DENIED = 5
+_WINERROR_SHARING_VIOLATION = 32
+
+
+@dataclass
+class _RotatePending:
+    """某個 WAL 檔（現行 WAL 或 mirror）因干擾而尚未完成的輪替。"""
+
+    failures: int = 0
+    next_at: float = 0.0
+    deferred: bool = False
+    last_warning_at: float | None = None
+
+
+def _is_transient_rotate_error(exc: OSError) -> bool:
+    """共用違規或存取拒絕（含 POSIX 的 EACCES／EBUSY 與 Windows winerror 5／32）屬暫時性干擾。"""
+    if exc.errno in (errno.EACCES, errno.EBUSY):
+        return True
+    return getattr(exc, "winerror", None) in (_WINERROR_ACCESS_DENIED, _WINERROR_SHARING_VIOLATION)
 
 
 class WalWriter:
@@ -56,6 +84,10 @@ class WalWriter:
         self._write_failures = 0
         self._last_write_error: str | None = None
         self._recreated_count = 0
+        # OD-19：輪替干擾的有界退避狀態與計數（health() 快照）；以路徑種類（"wal"／"mirror"）為鍵。
+        self._rotate_pending: dict[str, _RotatePending] = {}
+        self._rotate_retry_count = 0
+        self._rotate_deferred_count = 0
         self._file_first_seq: int | None = None
         self._file_first_seq_pending = True
         self._last_identity_check: float | None = None
@@ -139,13 +171,17 @@ class WalWriter:
         *,
         skip_paths: set[str] | None = None,
     ) -> bool:
-        """檔案超過上限時輪替。回傳 True 表示輪替過程發生 OSError 已被 best-effort 含住（degrade）。
+        """檔案超過上限時輪替。回傳 True 表示本次呼叫有輪替嘗試失敗（已被 best-effort 含住，degrade）。
 
         輪替只是「限制檔案大小」的最佳化，不是資料平面必要步驟。原本此方法在 ``append`` 的 try
         之外執行，rotation path 的 ``fs.size``/``rename_noreplace_or_suffix``/``open(dir)``/``fsync(dir)`` 因 EIO/權限/
         fd 耗盡拋 OSError 會逃出 ``append`` → 殺死 RX reader thread（正是 #79 想避免的長壽 thread
         死亡，含 console fan-out 一併中止）。改為自身含住例外：失敗則告警並續用既有（可能超大的）
         檔案，遠優於殺 reader（#79 Codex 必修）。
+
+        OD-19：共用違規／存取拒絕（``_is_transient_rotate_error``）改為有界退避：前
+        ``WAL_ROTATE_RETRY_BACKOFF_S`` 段以下一次嘗試時間戳排程，之後轉入延遲佇列
+        （``WAL_DEFERRED_DELETE_INTERVAL_S``）。未到期者不嘗試、也不計為本次失敗；寫入路徑從不睡眠。
         """
         rotation_failed = False
         observed_sizes = sizes if sizes is not None else {}
@@ -153,22 +189,26 @@ class WalWriter:
         for path in (self._wal_path, self._mirror_path):
             if path in paths_to_skip:
                 continue
+            which = "wal" if path == self._wal_path else "mirror"
+            pending = self._rotate_pending.get(which)
             try:
                 if path in observed_sizes:
                     size = observed_sizes[path]
                 else:
                     size = self._fs.size(path)
                     observed_sizes[path] = size
-                if size is None:
+                if size is None or size < self._rotate_bytes:
+                    # 檔案已不存在或已低於門檻（例如外部截短）：先前排程的輪替不再需要。
+                    self._rotate_pending.pop(which, None)
                     continue
-                if size < self._rotate_bytes:
+                if pending is not None and self._clock() < pending.next_at:
                     continue
-                which = "wal" if path == self._wal_path else "mirror"
                 close_error = self._close_handle_locked(which, sync=True)
                 if close_error is not None:
                     raise close_error
                 ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
                 self._fs.rename_noreplace_or_suffix(path, f"{path}.{ts}")
+                self._rotate_pending.pop(which, None)
                 self._dirty_tail[which] = False
                 if which == "wal":
                     self._wal_path_expected = False
@@ -178,8 +218,103 @@ class WalWriter:
                 self._fs.sync_dir(os.path.dirname(path))
             except OSError as exc:
                 rotation_failed = True
-                _LOG.warning("WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s", path, exc)
+                if _is_transient_rotate_error(exc):
+                    newly_deferred = self._schedule_rotate_retry_locked(which)
+                    pending = self._rotate_pending[which]
+                    now = self._clock()
+                    # 首次失敗與轉入延遲時告警；持續延遲則每分鐘最多一筆，保留永久拒絕的訊號而不刷屏。
+                    warn_now = newly_deferred or pending.failures == 1
+                    if (
+                        pending.deferred
+                        and pending.last_warning_at is not None
+                        and now - pending.last_warning_at >= WAL_DEFERRED_WARNING_INTERVAL_S
+                    ):
+                        warn_now = True
+                else:
+                    self._rotate_pending.pop(which, None)
+                    warn_now = True
+                if warn_now:
+                    if _is_transient_rotate_error(exc):
+                        self._rotate_pending[which].last_warning_at = self._clock()
+                    _LOG.warning("WAL 輪替失敗（best-effort 續用既有檔案，不殺 reader）：%s：%s", path, exc)
         return rotation_failed
+
+    def _schedule_rotate_retry_locked(self, which: str) -> bool:
+        """記錄一次暫時性輪替失敗並排程下一次嘗試；回傳 True 表示本次剛轉入延遲佇列。須在 ``self._lock`` 內呼叫。"""
+        self._rotate_retry_count += 1
+        pending = self._rotate_pending.get(which)
+        if pending is None:
+            pending = _RotatePending()
+            self._rotate_pending[which] = pending
+        pending.failures += 1
+        now = self._clock()
+        if pending.failures <= len(WAL_ROTATE_RETRY_BACKOFF_S):
+            pending.deferred = False
+            pending.next_at = now + WAL_ROTATE_RETRY_BACKOFF_S[pending.failures - 1]
+            return False
+        newly_deferred = not pending.deferred
+        pending.deferred = True
+        pending.next_at = now + WAL_DEFERRED_DELETE_INTERVAL_S
+        if newly_deferred:
+            self._rotate_deferred_count += 1
+        return newly_deferred
+
+    def tick(self) -> bool:
+        """非阻塞地服務到期的輪替重試（延遲佇列）；寫鎖被佔用時立即返回，不等待、不寫入紀錄。
+
+        回傳本次是否有輪替嘗試失敗。append 路徑本身也會檢查到期項目；tick 讓沒有新寫入時
+        仍能完成先前因干擾而延後的輪替。
+        """
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._closed or not self._rotate_pending:
+                return False
+            wal_expected_before = self._wal_path_expected
+            failed = self._rotate_if_needed()
+            if wal_expected_before and not self._wal_path_expected:
+                # 延後的現行檔輪替在無新寫入的 tick 內完成：立即於新檔寫連續性 META，
+                # 與 append 驅動輪替（觸發寫入即落在新檔）等價，維持現行檔存在與重啟後 seq 續接。
+                self._write_rotation_continuity_meta_locked()
+            return failed
+        finally:
+            self._lock.release()
+
+    def _write_rotation_continuity_meta_locked(self) -> None:
+        """tick 驅動的現行檔輪替完成後，於新現行檔寫一筆 WAL_ROTATED_AFTER_DEFERRAL META。
+
+        只在輪替確實於本次 tick 完成（``_wal_path_expected`` 由 True 轉 False）且現行檔仍不存在時寫入，
+        不與外部 unlink 的重建路徑（WAL_RECREATED_AFTER_EXTERNAL_UNLINK）重疊。寫入失敗依 append 同一語意
+        計入寫入失敗並標示不健康，下一次 append 或 tick 以既有重建路徑處理。須在 ``self._lock`` 內呼叫。
+        """
+        try:
+            if self._fs.size(self._wal_path) is not None:
+                return
+        except OSError:
+            return
+        archived_through = self._seq
+        record = self._new_record_locked(
+            com="WAL",
+            direction="META",
+            source="system",
+            payload=b"",
+            cmd_id=None,
+            loss_flag=False,
+            meta={"event": "WAL_ROTATED_AFTER_DEFERRAL", "archived_through_seq": archived_through},
+        )
+        wal_error, _ = self._write_record_locked(record, b"")
+        if wal_error is not None:
+            record["loss_flag"] = True
+            self._write_failures += 1
+            self._last_write_error = self._write_error_text(wal_error)
+            self._unhealthy = True
+            self._unhealthy_reason = "write_failed"
+            return
+        self._file_first_seq = record["seq"]
+        self._file_first_seq_pending = False
+        self._wal_path_expected = True
+        self._unhealthy = False
+        self._unhealthy_reason = None
 
     def _handle_for(self, which: str) -> WalFile | None:
         return self._wal_fp if which == "wal" else self._mirror_fp
@@ -752,6 +887,10 @@ class WalWriter:
         recreated = self._recreated_count
         unhealthy = self._unhealthy
         unhealthy_reason = self._unhealthy_reason
+        # OD-19：輪替干擾計數（防毒等外部程式佔用）；屬可觀測的干擾指標，不影響 healthy 判定。
+        rotate_retry = self._rotate_retry_count
+        rotate_deferred = self._rotate_deferred_count
+        deferred_delete_pending = sum(1 for p in tuple(self._rotate_pending.values()) if p.deferred)
         return {
             "wal_dir": self._wal_dir,
             "wal_path": self._wal_path,
@@ -762,6 +901,9 @@ class WalWriter:
             "write_failures": failures,
             "last_write_error": last_error,
             "recreated_count": recreated,
+            "rotate_retry": rotate_retry,
+            "rotate_deferred": rotate_deferred,
+            "deferred_delete_pending": deferred_delete_pending,
             "healthy": bool(
                 wal_dir_exists
                 and wal_dir_writable
@@ -808,6 +950,7 @@ class WalWriter:
                         self._file_first_seq_pending = False
                     self._dirty_tail[which] = False
             self._fs.sync_dir(self._wal_dir)
+            self._rotate_pending.clear()
             self._seq = 0
             self._wal_path_expected = False
             self._wal_identity = None

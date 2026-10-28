@@ -905,7 +905,7 @@ scripts/rust/win-test.sh --package sw-pal -- proc_scan process_ctl
 - [ ] **步驟 5：commit**：`feat(sw-pal): 實作 daemon spawn 與 serialwrapd 行程掃描（含 Windows launcher 去重）`
 
 **BLOCKED-OWNER：**
-- 以正式 Windows artifact（原生 build 的 launcher＋bundled Python）在 OD-05 機台實測 Stage 1 daemon 只被計為 1 個實例；受 EDR 限制時 `NtQueryInformationProcess` 是否可讀命令列需實機確認。
+- 以正式 Windows artifact（原生 build 的 launcher＋bundled Python）在 OD-05 機台實測 Stage 1 daemon 只被計為 1 個實例；受端點防毒影響時（OD-19，與防毒產品無關）`NtQueryInformationProcess` 是否可讀命令列需實機確認。
 - OD-08：本 Task 動到 PAL，PR 必附原生 Windows COM handle 證據；OD-15 起為可執行 gate（擁有者 host `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例、allowlist `COM20`，orchestrator 代跑；host 不可用才記「證據不足」）。
 
 ---
@@ -1353,7 +1353,7 @@ fn windows_task_restart_aborts_when_daemon_never_exits() {
 | `test_daemon_start_ab_conflict`（黑箱 A/B） | 以 PATH 外的假 `serialwrapd` 行程（`tests/contract_blackbox/bin/fake-serialwrapd --socket /tmp/other`）製造衝突 → Python／Rust stdout 逐位元組相同 |
 | `test_daemon_start_stop_ab_real_daemon`（黑箱 A/B，`process_rpc`） | 隔離目錄以 P3 `py_daemon` 啟動真 daemon → `daemon status` ok → `daemon stop` → ping 失敗；兩實作輸出經 contracts 正規化（pid、started_at）後相同 |
 | `test_daemon_restart_ab`（黑箱 A/B，`process_rpc`） | on-demand restart 後 pid 改變；兩實作輸出形狀 `{ok,restarted,start,stopped}` 經正規化後相同 |
-| `test_autostart_l15_tx_once`（黑箱，`rust_only`、`windows_native`，§0.4） | 原生 Windows 隔離 install root、無 daemon、bridge＋DUT 模擬器：`cmd submit --cmd "echo X"` → DUT 端 `wire.ndjson` 的 `echo X\r` 恰出現一次 |
+| `test_autostart_l15_tx_once`（黑箱，`rust_only`、`windows_native`，§0.4） | 原生 Windows 隔離 install root、無 daemon、bridge＋DUT 模擬器：`cmd submit --cmd "echo X"` → DUT 端 `wire.ndjson` 自本案例基線後的 TX 恰為 `echo X\n`（原文誤寫 `echo X\r`；Python 基線實測送出 `echo X\n`，依 CHG-S1X-SC18-TX-BASELINE-01 更正） |
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_daemon --test mgmt_graceful_stop` → `not implemented: P4-T7`；黑箱 Rust 端 → exit 97（委派 sentinel）。
 - [ ] **步驟 3：實作**（關鍵虛擬碼；`ctx` 即 `CliCtx`）
@@ -1404,7 +1404,7 @@ python3 scripts/rust/check_cfg_boundary.py
 - [ ] **步驟 5：commit**：`feat(rust-cli): 原生承接 daemon start/stop/status/restart 與多開預檢`
 
 **BLOCKED-OWNER：**
-- Windows on-demand 首次需求啟動在 OD-05 機台以正式 artifact（原生 build）實跑，含 EDR 開啟下 `DETACHED_PROCESS` spawn 不被攔截的證據；`test_autostart_l15_tx_once` 的原生 Windows COM 版本依 OD-08（com0com 或實體 USB-UART）。
+- Windows on-demand 首次需求啟動在 OD-05 機台以正式 artifact（原生 build）實跑，含 OD-19 `binary_integrity` 的啟動未被拒與執行檔前後 sha256 相同證據；`test_autostart_l15_tx_once` 的原生 Windows COM 版本依 OD-08（com0com 或實體 USB-UART）。
 - `daemon restart` 在實體 UART 上確認舊 daemon 釋放 tty 後新 daemon 才取得（Spike 6 實機部分）。
 
 ---
@@ -1518,7 +1518,7 @@ fn remote_stop_is_alias_of_close() {
 | `remote_close_empty_selector_closes_nothing` | 兩條 alive 隧道、`remote close ""` → `{"closed":[],"ok":true}`、無 terminate；`remote stop ""` 同 |
 | `test_remote_ab_status_close_empty`（黑箱 A/B） | 空 run_dir：`remote` → `{"ok":true,"tunnels":[]}`；`remote close` → `{"closed":[],"ok":true}`；Python 與 Rust 相同 |
 | `test_remote_ab_open_with_stub_ssh`（黑箱 A/B） | stub `ssh`（`-O check` rc 0；長駐模式 sleep）＋ stub `ss` 回 loopback → 兩實作輸出經 pid 正規化後相同 |
-| `test_remote_topologies_docker`（cap `docker`、`process_rpc`；`bc05-three-topologies` 的 Linux 面） | `SERIALWRAP_CLI_BUNDLE_DIR=$SW_BUNDLE bash tools/docker/remote_tunnel_test.sh all` exit 0：`direct`、`nat_host`、`dual_nat`、`agent_pull` 四拓樸加 `gwports` fail-closed 全過；log 中每次 `serialwrap` 呼叫路徑皆為 `/opt/sw-bundle/bin/serialwrap` |
+| `test_remote_topologies_docker`（cap `docker`、`process_rpc`；`bc05-three-topologies` 的 Linux 面） | `SERIALWRAP_CLI_BUNDLE_DIR=$SW_BUNDLE bash tools/docker/remote_tunnel_test.sh all` exit 0：`direct`、`nat_host`、`dual_nat`、`agent_pull` 四拓樸加 `gwports` fail-closed 全過；log 中每次 `serialwrap` 呼叫路徑皆為 `/opt/sw-bundle/bin/serialwrap`；**修正輪補記**：A 輪（Python 基線，不設 bundle）亦執行同一拓樸斷言，並斷言 bare `serialwrap` 呼叫、不得出現 `/opt/sw-bundle` 路徑（見 addenda `CHG-S1X-REMOTE-AB-01`，待非實作者審查） |
 
 - [ ] **步驟 2：執行並確認 FAIL**：`cargo test -p sw-cli --test mgmt_remote` → `not implemented: P4-T8`；黑箱 Rust → 97。
 - [ ] **步驟 3：實作**：依「行為」；`open_tunnel` 的「鎖內讀判定→spawn→寫 spawning」、「鎖外 wait_ready」、「任何錯誤（含 panic，以 `catch_unwind` 包住）→ terminate＋鎖內 remove＋原錯誤回傳」順序逐字照 07 §8.4。
@@ -1935,7 +1935,7 @@ python3 -m pytest -q tests/test_rust_release_manifest_schema.py
 
 **BLOCKED-OWNER：**
 - 正式 Windows release artifact 必須在擁有者 Windows 自架 runner 原生 build/link（arch §1.1），並以該 artifact 驗證安裝佈局與 `windows_switch_running_exe_rename`。
-- EDR 開啟下 `bin\*.old.*` 改名與新 exe 首次執行不被攔截的證據（§1.2 端點防毒列）。
+- OD-19 下 `bin\*.old.*` 改名與新 exe 首次執行未被拒的證據（以執行結果與執行檔完整性判定，不要求 EDR 資料；§1.2 端點防毒列）。
 
 ---
 
@@ -2771,7 +2771,7 @@ fn journal_recovery_releases_persistent_systemd_hold() {
 | `journal_recovery_releases_persistent_systemd_hold`（上方程式碼；R5-F1） | crash 於 `backup_complete:after_effect` 後 `hold_state_now()==Held`、外部 `start` 回 `ok:false`、無 relaunch；`recover()` → `ok:true`、`backup_used:false`、`release_autostart:true` < `service:start`、`NotHeld`、版本 0.4.0、journal 刪除 |
 | `journal_recovery_release_failure_keeps_journal`（R5-F1） | 上例復原時 `release_autostart` 回 `Err(phase:"autostart_release")` → `RecoveryReport{ok:false, journal_kept:true, error_code:"INTERNAL_ERROR"}`、`reason:"autostart_release_failed"`、journal 逐位元組不變、不 start；之後 release 恢復正常再 `recover()` → `ok:true` |
 | `update_interrupt_injection_every_point_releases_hold`（R5-F1；以 `update_interrupt_injection_every_point_recovers_to_previous` 的迴圈，另以 `TestEnv::posix()`＋`systemd-user`＋`with_restart_on_failure()` 各跑一次） | 每個 crash point：中斷後至 `recover()` 前 `service().relaunches()` 為空；`recover()` 後 `hold_state_now()==NotHeld`、`Restart` 回 `on-failure`、`(enabled,running)==(Some(true),true)`、版本 0.4.0 |
-| `test_update_systemd_exit1_not_relaunched_l15`（黑箱，`rust_only`，`posix_pty`，`process_rpc`，`supervisor_runtime`；R5-F1；預設 ignored，擁有者授權） | 真 `systemd --user` 隔離 unit（`serialwrap-r5f1-<pid>`，以 `SERIALWRAP_SYSTEMD_UNIT_NAME` test-hook 指定，只在 `test-hooks` feature 編入）＋兩個 dev bundle，舊版 daemon 以 `SW_TEST_DAEMON_SHUTDOWN_INCOMPLETE=1`（test-hook：停機強制累積 `incomplete` → exit 1）執行 `setup`：全程 `systemctl --user show -p NRestarts --value` 維持 0、`HolderSampler(slave_path)` `max_concurrent()<=1`、舊 daemon pid 消失到新版 pid 出現之間 tty 無 holder；更新後 `daemon status.version` 為新版、drop-in 不存在、`Restart=on-failure` |
+| `test_update_systemd_exit1_not_relaunched_l15`（黑箱，`rust_only`，`posix_pty`，`process_rpc`，`supervisor_runtime`；R5-F1；無 ignore 標記，依 OD-16 (5) 以 systemd 容器實跑） | 真 `systemd --user` 隔離 unit（`serialwrap-r5f1-<pid>`，以 `SERIALWRAP_SYSTEMD_UNIT_NAME` test-hook 指定，只在 `test-hooks` feature 編入）＋兩個 dev bundle，舊版 daemon 以 `SW_TEST_DAEMON_SHUTDOWN_INCOMPLETE=1`（test-hook：停機強制累積 `incomplete` → exit 1）執行 `setup`：全程 `systemctl --user show -p NRestarts --value` 維持 0、`HolderSampler(slave_path)` `max_concurrent()<=1`、舊 daemon pid 消失到新版 pid 出現之間 tty 無 holder；更新後 `daemon status.version` 為新版、drop-in 不存在、`Restart=on-failure` 。**S1X 狀態：RESOLVED（OD-16 (5)，2026-10-22；原 BLOCKED-PREREQ-S1X-04）**：`tools/docker/systemd.Dockerfile` 基底改為 `ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac`（glibc 2.39，與 host 建置一致；原 `debian:12-slim`（glibc 2.36）的 `GLIBC_2.39 not found` 報告為歷史證據）。實跑：本測試 1 passed，docker 報告 verdict PASS、`evidence_layer: "L1.5-docker"`、producer `run-systemd.sh`。實跑前另修正之 harness 缺陷與 pin 變更見 `changelog.d/rust-s1x-systemd-base-ubuntu2404.md`。 |
 
 監管切換測試（R1-F3；`crates/sw-cli/tests/mgmt_supervision_switch.rs`，修正前——即 `supervision-mode set` 沿用 setup 步驟 3／4 時——下列前三支必 FAIL）：
 
@@ -3481,6 +3481,10 @@ scripts/rust/check_no_onefile_extract.py --cli <exe> [--runs 100]
   每次執行前把 TMP／TEMP／TMPDIR 指向全新空目錄 D_i，並在 CLI 行程存活期間以檔案系統事件監看（Linux inotify、Windows ReadDirectoryChangesW，皆以 ctypes／stdlib 實作）
   遞迴觀察 D_i 與系統預設暫存根（%TEMP% 或 /tmp）；記錄任何「建立」事件（不限名稱、含建立後立即刪除者），再加執行前後快照比對。
   輸出 {"runs","created":[{"run","path","kind"}],"leftover":[...],"ok":bool}；created 或 leftover 非空 → ok:false。
+  S1X 修訂（2026-10-28，CHG-S1X-ONEFILE-PRIVATE-TMP-01，比照 OD-25 隔離精神）：共用 /tmp 的他人事件無法歸屬 → INSUFFICIENT；
+  出口以 `--private-tmp`（Linux）執行：於 user+mount namespace 內把全新空目錄 bind 到 /tmp 並宣告獨占，其中任何建立／殘留
+  皆歸屬 CLI 判 FAIL（含寫死 /tmp 者）；無法建立 namespace → INSUFFICIENT，不退回共用 /tmp。
+  直譯器、本工具、受測 CLI 路徑字詞或工作目錄位於 /tmp 下（namespace 內看不到）→ 用法錯誤 exit 2，不計入判定。
 ```
 
 - [ ] **步驟 1：寫失敗測試**
@@ -3522,7 +3526,7 @@ def test_p4_required_cases_have_passing_evidence():
 
 `tests/contract_blackbox/test_cli_mgmt_ab_suite.py`：`AB_CASES` **由 `tests/acceptance/p4_required.lock.json` 讀取**（凍結於紅燈 commit，§0.1），不得以 pytest collection 反推；對每個案例以 P2 比較器在「Python CLI＋Python daemon」與「Rust CLI＋Python daemon」兩輪依序執行（先停 A、確認資源釋放、再起 B，新模擬器實例），斷言比較器結果 `equal`；`rust_only` 案例只跑 B 並驗絕對契約。凍結清單中任一案例的測試節點不存在或被 SKIP（未登記）→ FAIL。
 
-`tests/contract_blackbox/test_cli_mgmt_l15.py`（L1.5，P2 bridge＋DUT 模擬器，`posix_pty`；§0.4 不變量）：`test_autostart_l15_tx_once`（POSIX 以 `caps` 覆寫 env 模擬不可行，故本檔只收 Linux 可跑者；Windows 版本在 `win-blackbox.ps1` 原生執行）、`test_update_busy_l15_zero_tx`、`test_update_file_push_after_last_probe_l15`、`test_update_push_after_freeze_zero_tx_l15`（R1-F1，見 Task 12 表）、`test_reject_conflict_l15_zero_tx`（`DAEMON_ALREADY_RUNNING_ELSEWHERE` 時 DUT 無 TX）、`test_restart_no_stale_console_replay`（restart 前 human console 緩衝未送出的行，新 daemon 起來後 DUT RX 中不出現）、`test_restart_no_reopen_before_handoff`（新 daemon 開 tty 時舊 daemon 的 fd 已關：bridge `control.ndjson` 中舊 holder `closed` 早於新 holder `opened`）。
+`tests/contract_blackbox/test_cli_mgmt_l15.py`（L1.5，P2 bridge＋DUT 模擬器，`posix_pty`；§0.4 不變量）：`test_autostart_l15_tx_once`（POSIX 以 `caps` 覆寫 env 模擬不可行，故本檔只收 Linux 可跑者；Windows 版本在 `win-blackbox.ps1` 原生執行）、`test_update_busy_l15_zero_tx`、`test_update_file_push_after_last_probe_l15`、`test_update_push_after_freeze_zero_tx_l15`（R1-F1，見 Task 12 表）、`test_reject_conflict_l15_zero_tx`（`DAEMON_ALREADY_RUNNING_ELSEWHERE` 時 DUT 無 TX）、`test_restart_no_stale_console_replay`（restart 前 human console 緩衝未送出的行，新 daemon 起來後 DUT RX 中不出現）、`test_restart_no_reopen_before_handoff`（`HolderObserver` 僅掃描本次測試 rig 的舊／新 daemon PID，於操作期間取樣；`assert_holder_handoff` 要求新 holder 出現前曾觀測到舊 holder 已結束，並接受兩個檢視來源回報的事件時間順序差異；取樣無法證明兩次取樣之間從未重疊，不得外推為連續無重疊證明。已確認 PID 消失或 state 為 `Z`／`X` 時視為無 fd；對仍存活 PID 的 fd 權限錯誤重試 40 次、每次 5 ms，仍無法讀取則 holder 狀態未知，案例為 `evidence-insufficient`／SKIP，不得當成 PASS；操作本身的失敗仍須保留為 FAIL）。
 
 `tests/test_rust_bench_tools.py` 表列案例：
 
@@ -3542,33 +3546,45 @@ def test_p4_required_cases_have_passing_evidence():
 - [ ] **步驟 3：實作**：兩支腳本（stdlib-only＋ctypes）；A/B 套件與 L1.5 套件；`check_p4_cases.py --check` 整合所有證據寫 `target/p4-evidence/summary.json`（每個 case：結果、證據檔、commit、artifact sha256）；另以 `--l1-results <dir>`（預設 `target/p4-evidence/l1`；目錄缺失＝證據不足）讀 `linux/20groups/`、`windows/20groups/`（`tests/contract_blackbox` 以 Rust CLI 執行時帶 `SW_RESOURCE_REPORT` 的報告＋junit）與 `linux/cargo/`、`windows/cargo/`（P3 `cargo_l1_results.py`／`win-test` 的 `l1_results`），以 P2 `l1_judge`（帶 lock 的 `selector`，報告 argv 不同即 `INVALID`）對 `s1b_20groups`、`s1b_cargo` 判定並寫入 `summary.json` 的 `l1` 段：`FAIL`／`INSUFFICIENT`／`INVALID`／缺檔一律 exit 1（L1 證據不足即 FAIL，不列 BLOCKED-OWNER）。兩個 set 以 P2 `regen_lock.py --l1-add-only` 凍結，時點依 P2 Task 13：P4 各 Task 在自己的紅燈 commit 登記新增 nodeid，本 Task 只登記 gate 自身測試（R5 審查後續；原「步驟 1 紅燈之後、第一次 `--check` 之前」晚於 Phase 內各 Task 的實作）。selector（R5 審查後續：每平台明定產生命令，Windows 不跑 workspace 其他 crate）：`s1b_20groups`＝argv `tests/contract_blackbox -m <markexpr>`，平台 markexpr 同 P3 `s1a_blackbox`；`s1b_cargo` linux＝argv `--workspace`（`cargo_l1_results.py --platform linux -- --workspace`），windows＝argv `--package sw-pal --package sw-cli`（`win-test.sh` 同參數），皆為非 `cap_*` 測試（R5-F3）。
 - [ ] **步驟 4：執行並確認 PASS**
 
+S1X 修訂（G2）：自測報告改為核准 tree 對應者（`selftest-linux-20261022`、`selftest-windows-20261022`，tree c4c22c0e），理由同 plan 04 Task 19 Step 5；完整 pytest（`s1_pytest_full`，`SW_RESOURCE_REPORT` 與 gate 第 7 列依 G1）於 register 與 check_p4_cases 之後唯一執行一次，理由：該套件含讀取 `target/p4-evidence` 的測試，過早執行會讀到過期證據；register 帶 Windows CLI 與 junit；Windows L1.5 producer 與 spike3 改為 wrapper 命令；win-blackbox 1A 與 1B 共用同一次執行（`WB_DIR`，同一 HEAD；理由：本節既有註記 windows 20groups 由 win-blackbox B 輪產生，Windows markexpr 與 1A 黑箱相同），不另行第二次執行；bench 兩步由 driver 以隔離 throwaway serialwrapd（socket 置於短路徑暫存目錄，AF_UNIX 上限約 107 bytes）與 bb_stubd 執行；可重現入口為 `scripts/rust/stage1_exit_driver.sh`（驅動順序與 gate 參數以該腳本為準）。
+
 ```bash
 cargo test --workspace && cargo build --workspace --release
 scripts/rust/win-test.sh --l1-set s1b_cargo --package sw-pal --package sw-cli
-SW_BUNDLE=$(scripts/rust/mkbundle.sh --dev --delegate-sentinel --print-dir)
-SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1b SW_RESOURCE_REPORT=target/p4-evidence/l1/linux/20groups/resource-report.json \
-  python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --junitxml=target/p4-evidence/l1/linux/20groups/junit.xml    # R5-F3：l1-results.v1 供 check_p4_cases --l1-results（argv＝s1b_20groups linux selector）
+export SW_BUNDLE=$PWD/target/dev-bundle-sentinel   # F4：sentinel 佈局獨立目錄（與 04 Task 19 的 target/dev-bundle 非 sentinel 佈局分開）；須 export，test_cli_mgmt_update 等以 SW_BUNDLE 找 bundle
+scripts/rust/mkbundle.sh --dev --delegate-sentinel --out "$SW_BUNDLE"   # S1X（D）：bundle 以 --out 絕對目錄指定，不依賴 --print-dir（保留旗標，不改變行為；成功時 stdout 末行為 $OUT）
+[ -d target/p4-evidence/l1/linux/20groups/ab-suite ] && mv target/p4-evidence/l1/linux/20groups/ab-suite "target/p4-evidence/l1/linux/20groups/ab-suite.stale-$(date +%Y%m%dT%H%M%S)"   # T-2：先移走既有 ab-suite 輸出（移動、不刪除）；runner 拒絕覆寫時會讀到舊 fail summary
+SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap SERIALWRAP_DAEMON_EXE=$SW_BUNDLE/bin/serialwrapd SERIALWRAP_AB_LABEL=rust-1b SW_RESOURCE_REPORT=target/p4-evidence/l1/linux/20groups/resource-report.json \
+  python3 -m pytest tests/contract_blackbox -m "core_portable or posix_only" --junitxml=target/p4-evidence/l1/linux/20groups/junit.xml    # S1X（i，PENDING-OD-S1X-20GROUPS-LAYOUT）：SERIALWRAP_DAEMON_EXE 指向同一 sentinel bundle 的 bin/serialwrapd（launcher，manifest components.daemon 定位 py/serialwrapd.py）；sentinel 佈局與 dev bundle 組成相同（bin/serialwrapd、py/sw_core、SHA256SUMS），僅委派入口為 sentinel（非委派守門，DELEGATED marker 仍有效）。R5-F3：l1-results.v1 供 check_p4_cases --l1-results（argv＝s1b_20groups linux selector）；理由：lock selector 為權威，R5-F3。
 python3 scripts/rust/cargo_l1_results.py --platform linux --out target/p4-evidence/l1/linux/cargo/resource-report.json -- --workspace
 SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py
-SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap python3 func-test/runner.py --mode bridge --selftest-report <P2 Task 8 selftest 報告> --report-dir target/p4-evidence/l15-linux   # P2 既有 13 case＋11 L1.5 scenario 以 Rust CLI 執行
-scripts/rust/win-blackbox.sh                                                                                 # P3 Task 17 入口（staging 需加入本 Phase 的 tests/contract_blackbox 與 Task 17 Windows dev bundle）；含 Windows 版 test_autostart_l15_tx_once
+SERIALWRAP_CLI_EXE=$SW_BUNDLE/bin/serialwrap python3 func-test/runner.py --mode bridge --selftest-report ~/b-log/rust-refactor/p2/selftest-linux-20261022/selftest-report.json --report-dir target/p4-evidence/l15-linux   # P2 既有 13 case＋11 L1.5 scenario 以 Rust CLI 執行
+scripts/rust/win-func-test.sh --bundle target/win-blackbox/<run_id>/bundle --selftest-report ~/b-log/rust-refactor/p2/selftest-windows-20261022/selftest-report.json --report-dir target/stage1a-evidence/<run_id>/func-test-windows   # S1X（G3 wrapper，OD-15 COM20:COM21；取代原 win-l15-producer.sh，該檔不存在）：內部等同 `py -3.12 func-test/runner.py --mode bridge --scenarios --daemon-com COM20 --bridge-com COM21 --transport-mode virtual_com0com`；Linux 結果不得替代；報告目錄與 gate 的 `--l15-report windows=` 來源一致；另於同一 staging 跑基本案例（不帶 --scenarios），報告於 `<report-dir>/basic/func-test-report.json`，驅動以第二個 `--l15-report windows=…/basic/func-test-report.json` 交給 gate（S1X（G3）修訂，理由見 plan 04 Task 19 Step 5）
+SW_TEST_COM_PAIR=COM20:COM21 scripts/rust/win-blackbox.sh                                                  # F4：未設 SW_TEST_COM_PAIR 時不傳 -ComPair，不產生 windows-com.json（gate 會 fail closed）。P3 Task 17 入口（staging 需加入本 Phase 的 tests/contract_blackbox 與 Task 17 Windows dev bundle）；含 Windows 版 test_autostart_l15_tx_once
 mkdir -p target/p4-evidence/l1/windows/cargo && cp -r target/win-blackbox/<run_id>/l1/windows/blackbox target/p4-evidence/l1/windows/20groups   # R5 審查後續：windows 20groups 由 win-blackbox B 輪產生
 cp "target/win-test-report/$(jq -r .l1_results target/win-test-report/<run_id>.json)" target/p4-evidence/l1/windows/cargo/resource-report.json   # windows s1b_cargo
 python3 scripts/rust/bench_cli_roundtrip.py --cli $SW_BUNDLE/bin/serialwrap --endpoint <隔離 daemon socket> --platform linux --json-out target/p4-bench-linux-wsl2.json
 python3 scripts/rust/bench_cli_roundtrip.py --cli $SW_BUNDLE/bin/serialwrap --endpoint <stubd socket> --cli-only-stub --json-out target/p4-bench-cli-only.json
-python3 scripts/rust/check_no_onefile_extract.py --cli $SW_BUNDLE/bin/serialwrap --runs 100
+python3 scripts/rust/check_no_onefile_extract.py --cli $SW_BUNDLE/bin/serialwrap --runs 100 --private-tmp   # S1X：CHG-S1X-ONEFILE-PRIVATE-TMP-01
+python3 scripts/rust/register_p4_evidence.py --linux-cli $SW_BUNDLE/bin/serialwrap --linux-unit-junit target/p4-evidence/l1/linux/20groups/junit.xml --l1-dir target/p4-evidence/l1 --windows-cli <WB_DIR>/bundle/bin/serialwrap.exe --windows-unit-junit <WB_DIR>/l1/windows/blackbox/junit.xml   # S1X：check 前的一次性逐案例證據登記（只寫 target/p4-evidence；髒樹拒絕）；Windows 參數取自本次 win-blackbox OutDir `WB_DIR`（G4 匯出佈局），不另行提供
 python3 scripts/rust/check_p4_cases.py --check
-python3 scripts/rust/check_cfg_boundary.py && python3 -m pytest -q tests/ && python3 -m policy_check --repo .
+python3 scripts/rust/check_cfg_boundary.py && PYTHONPATH=scripts/rust SW_REQUIRE_CARGO=1 SW_RESOURCE_REPORT=target/stage1a-evidence/<run_id>/l1/linux/pytest-full/resource-report.json python3 -m pytest -q tests/ -p junit_provenance --junitxml=target/stage1a-evidence/<run_id>/pytest-full.xml && python3 -m policy_check --repo .   # S1X：完整 pytest 為同一 HEAD 唯一一次，取代原 `pytest -q tests/`；須於 register 與 check_p4_cases 之後（測試讀取 target/p4-evidence）；集合 `s1_pytest_full`、gate 第 7 列依 G1
 ```
 
-**OD-15 docker 優先**：上列 Linux L1.5（`func-test/runner.py --mode bridge`、`test_multiagent_e2e.py`／`test_human_agent_coexist.py` 以 Rust CLI 執行）與監管相關黑箱，先以 P2 Task 17 的 `scripts/docker/run-l15.sh rust-1b`（兩容器拓樸 serialwrap ⇄ bridge ⇄ DUT 模擬器、假 COM 為 socat PTY pair）與 `scripts/docker/run-systemd.sh`（systemd container：journald 收 daemon stderr、`setup` reconcile 與 SC-23 autostart hold drop-in 以 `systemctl show -p Restart,RefuseManualStart` 驗 `Restart=no`／`RefuseManualStart=yes`）執行；報告帶 `evidence_layer: "L1.5-docker"`、`topology: "docker-2c"`、`uart_kind: "pty-fake"`、`image_digests`、`bundle_tree_sha256`，`check_p4_cases.py --check` 只把它們計入 L1.5，掛到 `layer ∈ {L2, L3}` 或 bench 長跑案例時判 FAIL（P2 `evidence_labels.assert_not_real_board`）。步驟 1 另加測試 `test_check_p4_cases_rejects_docker_for_l2`：合成一份 `evidence_layer: "L1.5-docker"` 報告綁到 L2 案例 → `check_p4_cases.py --check` exit 1 且訊息含 `not_real_board`。
+**OD-15 docker 優先**：監管相關黑箱，先以 P2 Task 17 的 `scripts/docker/run-systemd.sh`（systemd container：journald 收 daemon stderr、`setup` reconcile 與 SC-23 autostart hold drop-in 以 `systemctl show -p Restart,RefuseManualStart` 驗 `Restart=no`／`RefuseManualStart=yes`）執行；報告帶 `evidence_layer: "L1.5-docker"`、`topology: "docker-2c"`、`uart_kind: "pty-fake"`、`image_digests`、`bundle_tree_sha256`，`check_p4_cases.py --check` 只把它們計入 L1.5，掛到 `layer ∈ {L2, L3}` 或 bench 長跑案例時判 FAIL（P2 `evidence_labels.assert_not_real_board`）。步驟 1 另加測試 `test_check_p4_cases_rejects_docker_for_l2`：合成一份 `evidence_layer: "L1.5-docker"` 報告綁到 L2 案例 → `check_p4_cases.py --check` exit 1 且訊息含 `not_real_board`。
+
+**S1X 修訂（OD-16 (4) 裁決，PENDING-OD-S1X-03 RESOLVED；docker Rust-CLI L1.5 移至 Slice 2.1 出口，不屬 Stage 1 要求）**：`scripts/docker/run-l15.sh` 只接受 `pytest-physical-uart|func-test-bridge|realhw-p0p1|regression-nondestructive`，`--bundle` 需 CLI 與 daemon 皆 `implementation=rust`（`run-l15.sh` 第 18、31（suite 清單）與 71–72 行）；Stage 1 bundle 的 daemon 為 Python，故上文 `run-l15.sh rust-1b` 不列為 Stage 1 證據，改於 plan 06 Slice 2.1 出口執行（Rust daemon 自該 Slice 起存在）。Linux L1.5（func-test 外部 bridge 與 Rust CLI 黑箱）的 Stage 1 證據不受影響，其 docker 前置（原 `run-l15.sh rust-1b`）依 OD-16 (4) 不再屬 Stage 1 要求。理由：工具介面為權威，不以文字假設其存在。
 
 本環境量得的 WSL2 數值只記為「Linux／WSL2 開發參考」（`gate:"NOT_STANDARD_ENV"`），報告中明確標示環境，不填入 §1.2 正式欄位。P3 沿用的 Stage 1A 證據（資料面 A/B、L1.5）只在其 artifact sha256 與本次 bundle 的 `components.cli.sha256` 相同時才可沿用，否則以本次 bundle 重跑。
 
 - [ ] **步驟 5：commit**：`test(rust-cli): 完成 Stage 1B 黑箱 A/B、L1.5 與量測工具`
 
+**Windows golden 範圍（S1X 修訂，OD-16 (2) 裁決，RESOLVED）**：依 OD-16 (2)，Windows golden 採 plan 04 Task 10 之 12 情境（`help_root_col80`、`help_profile_test_col80`，以及 10 個錯誤情境 `err_bogus`、`err_empty`、`err_event_reset_missing_mut`、`err_retries_invalid_int`、`err_session_bogus_sub`、`err_session_list_extra`、`err_session_missing_sub`、`err_timeout_invalid_float`、`err_timeout_missing_val`、`err_verbose_ambiguous`），另保留實作之 2 個 boundary 情境（`boundary_socket_connect`、`boundary_endpoint_connect`，`test_platform_oracle_exists_and_boundary_values_are_native` 所需），合計 14 個，即 `contracts/cli_help/windows/*.json` 全部。`s1a_blackbox.windows` 之 test_help_usage_error_bytes 分母由 431 縮為 14：以 `regen_lock --l1-add-only --allow-removal` 逐名移除 418 筆（僅 Linux 黃金有之情境），並 add-only 登記原生收集之 `help_profile_test_col80`；Linux 集合不變。逐名清單見 `docs/rust-refactor/owner-decisions-addenda.md` CHG-S1X-OD16-RM-05。
+
+**unshare 包裝（B，S1X 修訂）**：PID 隔離分三層。(1) pytest 標記 `pidns_rig`（`tests/contract_blackbox/conftest.py` 的 `pytest_pyfunc_call` hook）：被標記的 nodeid 於子 pytest 內以 `unshare -Upf --mount-proc --map-current-user` 重跑同一 nodeid，判定只取子行程 junit；`bb_l15.in_isolated_pidns()` 比對 `/proc/self/ns/pid` 與 `SW_PIDNS_OUTER` 確認已隔離；unshare 不可用時 skip 並附原因（非 PASS，不退回無隔離執行，不設 `--force-spawn`）。(2) `scripts/rust/ab_blackbox.sh` 整段（A 輪、釋放確認、B 輪）於同一 user+pid+mount namespace 重新 exec；不可用時 exit 3（INVALID，不得作為 A/B 證據）；執行前寫 `preflight.json`，若不隔離或可見外部 `serialwrapd` 即 exit 4（INVALID）；身分檔記錄 `pid_namespace_isolated`（僅為記錄，真正的守門是 preflight）。(3) `tests/contract_blackbox/test_cli_mgmt_connect.py::test_connect_close_with_non_reaping_pid1` 以 `_unshare_pidns_argv()` 建立非特權 PID／mount namespace（`unshare --user --map-current-user --pid --fork --mount --mount-proc`）。Step 4 的 pytest 命令在 unshare 不可用時上述案例 skip 並記「環境能力不足，非 PASS」，證據須記錄 `unshare` 可用與否；不得因 skip 而記為 PASS（理由：該案例為 PID 1 不回收孤兒的回歸，Rust PAL zombie 誤判即由此抓出）。（T-2 例外：`tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_version_pairing_in_bundle` 亦標 `pidns_rig`，host 上其他 serialwrapd 會使 pid 計數不穩，故由子 pytest 於隔離 namespace 執行；Step 4 不需外層 unshare。）
+
 **BLOCKED-OWNER：**
-- §1.2 CLI 暖快取往返 p50／p95／p99 在 §1.1.1 標準量測環境（Linux 原生、Windows OD-05 機台原生 artifact）正式量測（`bench_cli_roundtrip.py` gate 必須為 `PASS`）；Windows 連續 100 次 CLI 不產生解壓檔案或目錄的正式證據；EDR 無新增攔截證據（查詢權限不足時列證據不足）。
+- §1.2 CLI 暖快取往返 p50／p95／p99 在 §1.1.1 標準量測環境（Linux 原生、Windows OD-05 機台原生 artifact）正式量測（`bench_cli_roundtrip.py` gate 必須為 `PASS`）；Windows 連續 100 次 CLI 不產生解壓檔案或目錄的正式證據；OD-19 模擬防毒干擾、每次 WAL append 延遲樣本與 binary integrity 證據；主案例及 oplock 變體依 OD-22 分別檢查 p99 ≤100 ms、最大值 ≤600 ms。四案 Windows Spike 3 artifacts 已於 HEAD `42e6d6c` 重採但均為 `INSUFFICIENT_EVIDENCE`，因首次 rotation 完成晚於 lease 到期 12 ms；防毒產品資料僅作參考，不是 gate 條件。
 - §11.6 Stage 1B L2：以 Rust CLI 作為 pinned `serialwrap_exe` 在 live bench 跑全部適用 TestPilot `serialwrap_regression` 案例，含已授權破壞集。
 - §11.6 Stage 1B L3：`realhw` P0＋P1＋remote 以 Rust CLI 執行。
 - §11.6／OD-10：Rust CLI＋Python daemon 混合組合 48 小時長跑（至少 Windows 生產目標環境；bench 依序排程，約佔 3 天）——程序與 gate 判定沿用 P2 `longrun_acceptance.yaml`，本 Phase 只把 Rust CLI artifact 填入 manifest。這是最早的 Rust 候選長跑（`S1B-L3-MIXED-48H-WINDOWS`）：前置為 OD-09 延後項已於正式 Stage 0 出口以 P2 Task 16 凍結（工具屬 P2，不需等待 P9，R4-F2）；啟動 `python3 -m realhw --tier longrun` 前必須先執行 `py -3.12 -m realhw.acceptance.od09_freeze register-candidate --acceptance realhw/acceptance/longrun_acceptance.yaml --item S1B-L3-MIXED-48H-WINDOWS --platform windows --run-id <run_id> --started-at <now>`，exit 非 0（未凍結 → 5，`HARNESS_OD09_NOT_FROZEN`）即不得開跑；gate 的 `pre_frozen` 仍為最後防線。
@@ -3854,14 +3870,14 @@ pub fn run_optional_step(ctx: &Ctx, bundle: &Path, step: OptionalStep) -> PyDict
 | B-05 | Spike 6：混合版本實機更新／回滾的 L2 bench 部分。Windows 側真實串口釋放與重新取得自 OD-15 起在擁有者 host 以 `COM20`／`COM21`＋OD-11 隔離實例（allowlist `COM20`）執行，為可執行 gate | §12.1、§13、OD-08、OD-15 | 7、12 |
 | B-06 | BC-05 Windows：Win32-OpenSSH 對真實 relay 的三拓樸、生命週期、停止／重啟；L3 remote | §9.1 BC-05、§11.6 | 5、8、9 |
 | B-07 | 正式 Windows release artifact 原生 build/link（自架 runner）與 DLL 匯入檢查 | arch §1.1、ADR-01 | 11、16 |
-| B-08 | EDR 開啟下 spawn、改名切換、首次執行不被攔截；100 次 CLI 執行期間無任何暫存檔／目錄建立（含建立後刪除） | §1.2、OD-05 | 7、11、16 |
+| B-08 | OD-19 產品無關驗收：模擬干擾下 WAL 正確性與活性成立，binary integrity 前後一致；100 次 CLI 執行期間無任何暫存檔／目錄建立（含建立後刪除） | §1.2、OD-05、OD-19 | 7、11、16 |
 | B-09 | §1.2 CLI 往返效能在標準量測環境正式量測（Linux 原生、Windows 原生） | §1.1、§1.2 | 16 |
 | B-10 | Stage 1B L2：Rust CLI 為 pinned `serialwrap_exe` 跑全部適用案例含已授權破壞集 | §11.6 | 16 |
 | B-11 | Stage 1B L3：`realhw` P0＋P1＋remote | §11.6 | 16 |
 | B-12 | Rust CLI＋Python daemon 混合組合 48 h 長跑（Windows 生產目標環境，OD-10 依序排程）；前置：OD-09 延後項已於 Stage 0 出口以 P2 Task 16 凍結，開跑前 `od09_freeze register-candidate --item S1B-L3-MIXED-48H-WINDOWS`（R4-F2） | §11.6、OD-10、OD-09、§14.2 | 16 |
 | B-13 | §10.3 身分清單由部署負責人提供，並以一般任務 Agent 實際身分取得 `verify_agent_perms.py` `verdict:"blocked"`（exit 0；restore_checks 全 `possible:false`）證據；`not_blocked`／`unknown` 不計，同帳號部署只能登錄流程約束 | §10.3 | 12、15 |
 | B-14 | 測試團隊工作站 `doctor` 全項、`connect`／`--bench` 經真實 relay、TeraTerm／PuTTY 連 `console_endpoint` 實機操作 | §11.6 | 9、13、14 |
-| B-15 | Windows 實機 SERIALCOMM（藍牙＋USB-UART 混合）與 `NtQueryInformationProcess` 在 EDR 下可讀性 | SC-17、07 §1.6 | 2、4 |
+| B-15 | Windows 實機 SERIALCOMM（藍牙＋USB-UART 混合）與 `NtQueryInformationProcess` 在端點防毒存在下的可讀性（OD-19：實機判定，不依賴防毒產品資料） | SC-17、07 §1.6 | 2、4 |
 | B-16 | ~~OD-08 原生 Windows COM handle 證據~~ **OD-15 起不再 BLOCKED**：動到 PAL 的 PR（Task 2、3、4、5、17、19）在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21`＋OD-11 隔離實例（allowlist `COM20`）由 orchestrator 代跑取得；擁有者 host 不可用時記「證據不足」 | OD-08、OD-15 | 2、3、4、5、17、19 |
 | B-17 | P2 指派本 Phase 的 `win-task-logon-trigger`、`win-task-single-instance`、`win-task-restart-on-failure`、`win-task-72h`、windows-task 版 `p1-rst-daemon`、Windows 版 `rm-live-e2e` 實跑（程序與判定器由 Task 18 交付） | P2 L1855、L1869、L1906-1909、L2493 | 18 |
 | B-18 | 正式 Windows bundle 的 bundled Python runtime 與 launcher（GUI subsystem）於自架 runner 原生產生 | arch §1.1、§6.1 | 17 |

@@ -1,6 +1,7 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
 # BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34、SC-35、DF-01～DF-17、DF-19 依定稿規格、調和表與 OD-14 推導（DF-18 保留給 P7）。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
+# SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
@@ -403,15 +404,15 @@ changes:
       rust:
         stage: "slice-2.1"
     approved_at_revision: 1
-    spec_refs: ["§6.1 更新流程", "§8.1", "§12.1 步驟 2～3", "BC-01"]
+    spec_refs: ["§6.1 更新流程", "§8.1", "§12.1 步驟 2～3", "BC-01", "OD-16 (3)"]
     reconciliation_refs: ["RPC-H-16"]
     scope: "both"
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["sc11-ordered-shutdown"]
-    compatibility_impact: "有序關機：drain 所有 worker、關閉 handle、WAL sync 後才 exit；任一步驟收斂失敗時以 serialwrapd: shutdown incomplete 診斷與 exit 1 結束。新增 RPC daemon.handoff_stop（x-methods 54→55）；忙碌回 FLASHING_BUSY 或 SESSION_BUSY。Python 基線此情境 exit code 不改，以 log 與 shutdown_drain().graceful 揭露。交接停止：busy 判定與凍結在同一 AdmissionGate 臨界區內完成；閒置時凍結所有新的有副作用操作，之後的呼叫回 FLUSHED_BY_SHUTDOWN 且 reason:\"handoff_frozen\"、零 TX，ttyMCU 端點保持沉默；回應為 {\"ok\":true,\"stopping\":true,\"handoff_token\"}。忙碌時回 FLASHING_BUSY 或 SESSION_BUSY 並附 busy，不凍結、不停止。停止起點依序為 manager stopping gate、停 watcher、關閉事件派工 intake。FLUSHED_BY_SHUTDOWN 介面加 rpc，不新增碼。「shutdown incomplete」exit 1 為 Rust-only、不屬 A/B 比較範圍；ab_participation: diff 不涵蓋此項。"
-    approval_conditions: "規格要求確認 handle 已釋放"
-    related_decisions: []
+    compatibility_impact: "有序關機：drain 所有 worker、關閉 handle、WAL sync 後才 exit；任一步驟收斂失敗時以 serialwrapd: shutdown incomplete 診斷與 exit 1 結束。新增 RPC daemon.handoff_stop（x-methods 54→55）；忙碌回 FLASHING_BUSY 或 SESSION_BUSY。Python 基線此情境 exit code 不改，以 log 與 shutdown_drain().graceful 揭露。交接停止：busy 判定與凍結在同一 AdmissionGate 臨界區內完成；閒置時凍結所有新的有副作用操作，之後的呼叫回 FLUSHED_BY_SHUTDOWN 且 reason:\"handoff_frozen\"、零 TX，ttyMCU 端點保持沉默；回應為 {\"ok\":true,\"stopping\":true,\"handoff_token\"}。忙碌時回 FLASHING_BUSY 或 SESSION_BUSY 並附 busy，不凍結、不停止；若交接凍結後 TX fence 未於期限內收斂，回 SESSION_BUSY，對應 busy[].ops 含 tx.in_flight，不回成功，且只撤銷本次新建的 AdmissionGate／背景凍結，與 daemon stop 並行建立的凍結保留。handoff_stop 在 SessionManager lock 內重查 session 與 bridge，freeze_for_handoff 亦在同一把 lock 內重查並於 TX fence 逾時撤銷本次背景凍結。交接排空窗口（OD-16 (3)，2026-10-22 擁有者接受）：回覆寫出後 RPC 監聽保留 HANDOFF_DRAIN_GRACE_S＝3 秒（sw_core/daemon.py），窗口內有副作用請求回 FLUSHED_BY_SHUTDOWN＋reason:\"handoff_frozen\"（零 TX），health.ping 仍可回應，窗口結束才停止；窗口內 DeviceWatcher 重探、在途 probe 與 console 行零 TX，session 狀態與 state.json 不改寫（SessionManager.freeze_for_handoff）。此為對「回覆後立即停止」字面的已裁決偏離；Rust daemon 於 P8 Task 14 承接相同語意。停止起點依序為 manager stopping gate、停 watcher、關閉事件派工 intake。FLUSHED_BY_SHUTDOWN 介面加 rpc，不新增碼。「shutdown incomplete」exit 1 為 Rust-only、不屬 A/B 比較範圍；ab_participation: diff 不涵蓋此項。"
+    approval_conditions: "規格要求確認 handle 已釋放；OD-16 (3) 接受 Python 基線交接排空窗口（3 秒，窗口零 TX 凍結），Rust 於 P8 Task 14 承接相同語意；真實 daemon＋PTY 背景觸發的 L1.5 證據待補（PENDING-EVID-S1X-HANDOFF-WINDOW-L15）"
+    related_decisions: ["OD-16"]
   - id: "SC-12"
     kind: "SC"
     title: "監管 reconcile 等待舊 daemon 結束"

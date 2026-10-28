@@ -186,6 +186,34 @@
       ]
     },
     {
+      "title": "WAL_ROTATED_AFTER_DEFERRAL",
+      "description": "OD-19：延後的現行檔輪替於無新寫入的週期 tick 內完成時，於新現行檔首筆寫入的連續性 META（不改變 seq 續接語意）",
+      "x-status": "IMPLEMENTED",
+      "x-behavior-change": "OD-19",
+      "x-outer-record": {
+        "dir": "META",
+        "source": "system",
+        "com": "WAL",
+        "loss_flag": false
+      },
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archived_through_seq",
+        "event"
+      ],
+      "properties": {
+        "event": {
+          "const": "WAL_ROTATED_AFTER_DEFERRAL"
+        },
+        "archived_through_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "輪替前現行檔最後寫入的 seq（即歸檔段的最後一筆）；本筆 META 的 seq 為其 +1"
+        }
+      }
+    },
+    {
       "title": "tx_outcome_unknown",
       "description": "UART 寫入結果不明事件",
       "x-behavior-change": "BC-03",

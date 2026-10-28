@@ -16,11 +16,21 @@
   （不算 created，也不得判 PASS）。`--system-tmp <dir>` 宣告該目錄為本次獨占，其事件即歸屬於 CLI，計入 FAIL。
 - 監看失敗（無法加監看、事件佇列溢位、看門狗執行緒異常）一律 INSUFFICIENT，不得判 PASS。
 
+私有 /tmp 隔離（`--private-tmp`，Linux；S1X Y5，比照 OD-25 隔離精神）：
+- 共用 /tmp 會混入其他程序的建立事件而恆判 INSUFFICIENT。`--private-tmp` 以 `unshare -Um --map-current-user
+  --keep-caps` 建立 user+mount namespace，把 `--private-tmp-base` 下全新的空目錄 bind 到 /tmp，再以 `setpriv`
+  清空 capability 後於其中重新執行本工具：namespace 內的 /tmp 宣告為獨占（D_i 亦在其下），任何建立事件、殘留
+  或新增項目都歸屬 CLI 判 FAIL——包含無視 TMPDIR、寫死 /tmp 的解壓器；namespace 外的 /tmp 活動看不到也不計入。
+- 進入 namespace 後先核對 /tmp 確為該私有目錄（st_dev／st_ino）且為空，否則 INSUFFICIENT。
+- 無法建立 namespace（缺 unshare／setpriv／mount、非 Linux、內層失敗）→ INSUFFICIENT，不退回共用 /tmp。
+- 受測 CLI、本工具或 `--private-tmp-base` 位於 /tmp 下（namespace 內看不到）→ 用法錯誤（exit 2）。
+
 判定 verdict：FAIL（created／leftover／獨占系統暫存根的新增項目／非零退出）、INSUFFICIENT（上列證據不足）、PASS（皆無）。
 ok 僅在 verdict 為 PASS 時為 true。
 
 輸出 JSON：{"runs","verdict","ok","created","leftover","system_tmp_new","system_tmp_unattributed",
-"nonzero_exits","errors","insufficient_reasons","watcher","system_tmp","system_tmp_private","argv"}。
+"nonzero_exits","errors","insufficient_reasons","watcher","system_tmp","system_tmp_private","argv"}；
+`--private-tmp` 另含 `"tmp_isolation":"mount-ns-private-tmp"`（未能隔離時為 null）。
 退出碼：報告成功寫出即 0（判定以 JSON 的 `verdict`／`ok` 為準）；用法或工具錯誤為 2。
 """
 from __future__ import annotations
@@ -557,6 +567,87 @@ def _dedupe_with_run(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [seen[key] for key in sorted(seen, key=lambda k: (k[0], k[1]))]
 
 
+PRIVATE_TMP_ENV = "SW_ONEFILE_PRIVATE_TMP_ID"  # 內層：外層私有目錄的 "st_dev:st_ino"
+TMP_ISOLATION = "mount-ns-private-tmp"
+
+
+def _insufficient_report(cli_argv: list[str], runs: int, cli_args: list[str], reason: str) -> dict[str, Any]:
+    """無法執行（隔離失敗）時的報告：不執行 CLI，verdict INSUFFICIENT。"""
+    return {
+        "runs": runs, "argv": cli_argv + cli_args, "created": [], "leftover": [], "system_tmp_new": [],
+        "system_tmp_unattributed": [], "nonzero_exits": [], "errors": [], "insufficient_reasons": [reason],
+        "watcher": watcher_name(), "system_tmp": "/tmp", "system_tmp_private": False, "tmp_isolation": None,
+        "verdict": "INSUFFICIENT", "ok": False,
+    }
+
+
+def _under_tmp(path: Path) -> bool:
+    """path 是否位於 /tmp 下：不跟隨 symlink 的字面路徑與 resolve 後路徑，任一在 /tmp 下即是（namespace 內兩者皆看不到）。"""
+    literal = Path(os.path.abspath(path))
+    return (_within(literal, Path("/tmp")) or _within(literal, Path("/tmp").resolve())
+            or _within(path.resolve(), Path("/tmp").resolve()))
+
+
+def _private_tmp_outer(args: argparse.Namespace, cli_argv: list[str], cli_args: list[str]) -> dict[str, Any]:
+    """外層：建立私有目錄與 user+mount namespace，於其中重新執行本工具並取回報告。"""
+    script = Path(__file__).resolve()
+    # 內層繼承工作目錄；cwd 在 /tmp 下時 namespace 內看不到，相對路徑的 CLI 會以非零退出被誤判為產品 FAIL（c46c416#1）。
+    cwd = Path(os.getcwd())
+    if _under_tmp(cwd):
+        raise ValueError(f"--private-tmp：工作目錄 {cwd} 位於 /tmp 下，namespace 內看不到")
+    # 內層以 sys.executable 執行本工具；直譯器、本工具與受測 CLI 的任何絕對路徑字詞都必須在 namespace 內可見。
+    for word in [sys.executable, os.path.abspath(__file__), str(script), *cli_argv]:
+        if word.startswith("/") and _under_tmp(Path(word)):
+            raise ValueError(f"--private-tmp：{word} 位於 /tmp 下，namespace 內看不到")
+    if not sys.platform.startswith("linux"):
+        return _insufficient_report(cli_argv, args.runs, cli_args, f"private_tmp_unavailable：平台 {sys.platform} 不支援")
+    tools = {name: shutil.which(name) for name in ("unshare", "setpriv", "mount")}
+    missing = sorted(name for name, path in tools.items() if path is None)
+    if missing:
+        return _insufficient_report(cli_argv, args.runs, cli_args, f"private_tmp_unavailable：找不到 {missing}")
+    base_text = args.private_tmp_base or os.environ.get("XDG_RUNTIME_DIR") or str(Path.home() / ".cache")
+    base = Path(base_text)
+    if _under_tmp(base):
+        raise ValueError(f"--private-tmp-base 不得位於 /tmp 下：{base}")
+    base.mkdir(parents=True, exist_ok=True)
+    priv = Path(tempfile.mkdtemp(prefix="sw-onefile-privtmp-", dir=str(base))).resolve()
+    try:
+        st = os.stat(priv)
+        inner = [sys.executable, str(script), "--cli", args.cli, "--runs", str(args.runs),
+                 f"--cli-args={args.cli_args}", "--private-tmp"]  # = 形式：值以 - 開頭（預設 --version）時不被當成旗標
+        cmd = [tools["unshare"], "-Um", "--map-current-user", "--keep-caps", "--",
+               "/bin/sh", "-c", 'm="$1"; p="$2"; shift 2; "$m" --bind "$p" /tmp && exec "$@"', "sh",
+               tools["mount"], str(priv),
+               tools["setpriv"], "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--", *inner]
+        env = dict(os.environ)
+        env[PRIVATE_TMP_ENV] = f"{st.st_dev}:{st.st_ino}"
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        try:
+            report = json.loads(proc.stdout) if proc.returncode == 0 else None
+        except json.JSONDecodeError:
+            report = None
+        if not isinstance(report, dict):
+            tail = (proc.stderr or "").strip().splitlines()[-3:]
+            return _insufficient_report(cli_argv, args.runs, cli_args,
+                                        f"private_tmp_failed：內層 rc={proc.returncode} stderr={tail}")
+        return report
+    finally:
+        shutil.rmtree(priv, ignore_errors=True)
+
+
+def _private_tmp_inner(cli_argv: list[str], runs: int, cli_args: list[str], expected_id: str) -> dict[str, Any]:
+    """內層（namespace 內）：核對 /tmp 為外層私有目錄且為空，再以獨占 /tmp 執行檢查。"""
+    tmp = Path("/tmp")
+    st = os.stat(tmp)
+    if f"{st.st_dev}:{st.st_ino}" != expected_id:
+        return _insufficient_report(cli_argv, runs, cli_args, "private_tmp_failed：namespace 內 /tmp 不是外層私有目錄")
+    if any(tmp.iterdir()):
+        return _insufficient_report(cli_argv, runs, cli_args, "private_tmp_failed：namespace 內 /tmp 執行前非空")
+    report = run_checks(cli_argv, runs, cli_args, tmp, tmp)
+    report["tmp_isolation"] = TMP_ISOLATION
+    return report
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CLI 單檔執行期解壓檢查（P4-T16）")
     parser.add_argument("--cli", required=True, help="CLI 執行檔路徑，或含參數的命令字串")
@@ -567,10 +658,19 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--system-tmp",
         help="獨占的系統暫存根目錄（宣告本次獨占，其事件即歸屬於 CLI）；未指定時共用系統暫存根，事件判 INSUFFICIENT",
     )
+    parser.add_argument(
+        "--private-tmp", action="store_true",
+        help="Linux：於 user+mount namespace 內以 bind 進來的全新空目錄作為獨占 /tmp 執行（S1X Y5）",
+    )
+    parser.add_argument("--private-tmp-base", help="--private-tmp 私有目錄的父目錄（不得位於 /tmp；預設 XDG_RUNTIME_DIR）")
     parser.add_argument("--json-out", help="報告 JSON 輸出路徑")
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.runs < 1:
         parser.error("--runs 須 ≥1")
+    if args.private_tmp and (args.system_tmp or args.work_base):
+        parser.error("--private-tmp 不可與 --system-tmp／--work-base 併用（namespace 內固定以 /tmp 為獨占根）")
+    if args.private_tmp_base and not args.private_tmp:
+        parser.error("--private-tmp-base 須搭配 --private-tmp")
     return args
 
 
@@ -578,6 +678,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         cli_argv = _split_cli(args.cli)
+        if args.private_tmp:
+            cli_args = _split_words(args.cli_args)
+            inner_id = os.environ.get(PRIVATE_TMP_ENV)
+            if inner_id:
+                report = _private_tmp_inner(cli_argv, args.runs, cli_args, inner_id)
+            else:
+                report = _private_tmp_outer(args, cli_argv, cli_args)
+            return _emit(report, args.json_out)
         work_base = Path(args.work_base) if args.work_base else _system_tmp_root()
         work_base.mkdir(parents=True, exist_ok=True)
         system_tmp = Path(args.system_tmp) if args.system_tmp else None
@@ -587,10 +695,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"check_no_onefile_extract: {exc}", file=sys.stderr)
         return 2
+    return _emit(report, args.json_out)
+
+
+def _emit(report: dict[str, Any], json_out: str | None) -> int:
     text = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    if args.json_out:
-        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.json_out).write_text(text + "\n", encoding="utf-8")
+    if json_out:
+        Path(json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(json_out).write_text(text + "\n", encoding="utf-8")
     # 強制 UTF-8 輸出：Windows 主控台預設 cp950 無法表示部分字元，且報告含繁中說明。
     sys.stdout.buffer.write((text + "\n").encode("utf-8"))
     sys.stdout.flush()

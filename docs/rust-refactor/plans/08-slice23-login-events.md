@@ -757,6 +757,7 @@ fn console_unlock_profile_is_not_probe_blocked() {
 
 - [ ] **Step 2：執行**：`cargo test -p sw-core --features test-fakes --test quiet_gate_p7 --test session_core_quiet_p7` → 新增列 RED；標「回歸」者 PASS（FAIL 記 P5 缺陷）。
 - [ ] **Step 3：實作**：照 05 §1.6 與 `_update_boot_quiet_locked`（`session_manager.py:2327-2368`）核對 06 本體；`QuietTransition::Armed` → 在同一次 `Fence::with` 內設 `quiet_active=true`、`auto_probe_blocked=boot_quiet_blocks_probe(..)`、`fsm_gen+=1`，且 `boot_quiet_blocks_probe` 為真時 `fence.fsm_gen_floor = fsm_gen`、清 `active_login`（線性化點，Review Focus 1；console unlock 只遞增 `fsm_gen`、不推 floor），鎖外再 `invalidate_human_input(BootBanner|QuietRearm, fx)`、對進行中且被擋的 login run 發 `Effect::CancelLogin{epoch, fsm_gen: 舊值}`（Task 7）；`Cleared` → 同鎖清 `quiet_active`、`auto_probe_blocked`，**不**動 `fsm_gen`。`submit_gate_reject`／`execute_gate_reject` 依 `gate_responses` golden 的 key 順序以 `pydict!` 建構。
+  - 併入 main #234（CHG-S1X-MAIN-SYNC-01）：`quiet_gate`／`session_core` 須承接 profile `boot_done_regex` 的 quiet 提早解除——與 login／prompt 同一判定點（RX 命中即 `clear_quiet`）、同樣受 `bootloader_prompts` 尾行例外約束（尾行命中 bootloader prompt 時不因此解除）、**不清** `ready_reconfirm_pending`；空字串＝不設。`ProfileTemplate.boot_done_regex` 的載入與 target 覆寫已由 Stage 1 `sw-proto::config_types` 承接（golden `contracts/golden/profiles_fixtures/45_boot_done_regex`）；daemon 行為的 oracle 為 `tests/test_boot_quiet.py` 的 #234 案例。
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test login_quiet`（06）不退化。
 - [ ] **Step 5：commit**：`feat(rust-quiet): 完成 Ready Reconfirm 有界化與 Quiet gate 回應`
 
@@ -2358,6 +2359,7 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 **Changelog fragment:** `changelog.d/rust-p7-phase-gate.md`（`### Added`：Slice 2.3 Windows 原生 COM 案例、出口證據產生器與驗證器）
 **擁有者 host 可執行 gate（OD-15）：** B-06（原生 Windows COM handle 下的登入、quiet 與事件，OD-08）：由 orchestrator 經 WSL interop 在擁有者 host 以 `SW_TEST_COM_PAIR=COM20:COM21`（Spike 1 已通過的 com0com DUT-side pair）執行，結果依實跑判 PASS／FAIL；只有該 host 不可用（`caps_missing` 含 `windows_com`）時才為 BLOCKED-OWNER。
 **BLOCKED-OWNER:** B-08（測試團隊工作站）。
+**OD-31 承接（2026-10-28）：** func-test `ev-01-spawn-handler` 的 Windows 列在 Stage 1（Rust CLI＋Python daemon）因 Python 基線 `shell` handler 固定 `/bin/sh -c` 而必然不觸發，Stage 1 gate 依 OD-31 暫判 BLOCKED-OWNER（`scripts/rust/stage1a_gate.py` 的 `L15_OWNER_DEFERRED`）。本 Task 出口必須以 Rust daemon（SC-26，Task 14 `HandlerSpawner`）在擁有者 host Windows 原生（`scripts/rust/win-func-test.sh`，COM20:COM21）把該列跑到 PASS＋`gate_eligible`；未 PASS 不得標本 Phase 完成。Rust daemon 上線後應自 `L15_OWNER_DEFERRED` 移除 OD-31 列，使 Windows 列回到一般判定（不得以延後列替代 PASS）。
 
 **Files:**
 - Create: `crates/sw-daemon/tests/cap_windows_com_p7.rs`（`#[ignore = "cap:windows_com"]`；三案 `cap_windows_com__p7_login_ready`、`cap_windows_com__p7_quiet_banner_zero_tx`、`cap_windows_com__p7_event_fire`）

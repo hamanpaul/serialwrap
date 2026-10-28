@@ -37,6 +37,8 @@ def open_endpoint(spec: dict[str, Any]) -> Endpoint:
             baud=spec.get("baud", 115200),
             transport_mode=spec.get("transport_mode", "virtual_com0com"),
             allow_peer_close=spec.get("allow_peer_close", False),
+            # 預設關閉（與既有 selftest 規格一致）；L1.5 經 CLI 明確傳入 peer_gate。
+            peer_gate=spec.get("peer_gate", False),
         )
         endpoint.open()
         return endpoint

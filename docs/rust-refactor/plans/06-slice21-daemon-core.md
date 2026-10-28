@@ -154,6 +154,8 @@ Task 0 的 `crates/sw-core/tests/slice21_prereqs.rs` 與 `tests/test_slice21_pre
 **Changelog fragment:** `changelog.d/rust-s21-skeleton.md`（front matter `type: feat`、`scope: rust-s21`；本文：「新增 Slice 2.1 Rust daemon 範圍清單、有界資源契約與 crate 骨架（尚無行為）。」）
 **BLOCKED-OWNER：** 無。
 
+**SC-11 `daemon.handoff_stop` 承接（R1-F1；與 Python 基線 TX fence 語意一致）：** AdmissionGate 閒置凍結成功後，SessionManager 必須在同一把 manager lock 內重查 session／bridge，凍結背景來源與各 bridge 的新 TX，並等待已通過提交檢查的 TX fence 於有界期限內收斂。任一 fence 逾時即不得回成功或停止 daemon；回 `SESSION_BUSY`，對應 `busy[].ops` 含 `tx.in_flight`，並只撤銷本次新建的 AdmissionGate 與背景／bridge 凍結。若 `daemon.stop` 已接手凍結，handoff 失敗路徑不得撤銷其凍結。Rust 回歸須涵蓋 timeout 拒絕、session／bridge 在 lock 內重查，以及 shutdown 凍結與 handoff rollback 的競態；此項只規定實作與測試，不替代 Stage 1 正式 gate 證據。
+
 **Files:**
 - Create: `tests/acceptance/slice21_scope.yaml`
 - Create: `contracts/resource_limits.yaml`
@@ -1532,9 +1534,12 @@ git commit -m "feat(sw-pal): 裝置來源掃描、藍牙排除、測試裝置 al
 
 ## Task 6：PAL WalFs（常駐 handle、identity、share-delete、不覆蓋 rename）
 
+> **OD-19 交叉引用（2026-10-23）**：Rust `sw-pal` `WalFs` 與 `sw-core` `WalWriter` 須實作與 Python 基線相同的輪替干擾語意：rotate 與 unlink 遇共用違規（ERROR_SHARING_VIOLATION＝32）或存取拒絕（ERROR_ACCESS_DENIED＝5）做有上限的退避重試（`WAL_ROTATE_RETRY_BACKOFF_S`＝10／50／200 ms），刪不掉的段落進延遲佇列（`WAL_DEFERRED_DELETE_INTERVAL_S`＝1 s）並以非阻塞方式於後續 append 或 tick 重試，寫入路徑不持鎖睡眠，干擾計數 `rotate_retry`、`rotate_deferred`、`deferred_delete_pending` 入 health 快照；首次失敗與轉入 deferred 時告警，持續 deferred 每 60 s 最多再告警一次。OD-19 Spike 3 必須記錄實際 `WalWriter.append` 延遲樣本；上限未經 owner 裁決前 gate 保持 BLOCKED-OWNER。驗收以 `scripts/stage0/av_sim.py` 的注入式與原生 helper 判定（見 `docs/rust-refactor/plans/spec-reconciliation.md` §1.4）。
+> **OD-19 接線補充（2026-10-23）**：Rust daemon 須於週期回呼（對應 Python `DeviceWatcher` 的 1.0 s tick）呼叫等價於 `WalWriter.tick()` 的非阻塞輪替推進，且與 readiness reconcile 互不遮蔽；tick 驅動的現行檔輪替完成時須寫入 `WAL_ROTATED_AFTER_DEFERRAL` META（`archived_through_seq`），維持現行檔存在與 seq 續接。Rust 對等項以相同 contract（`contracts/wal_meta_events.schema.json`）驗收。
+
 **Test author model:** agy-gemini-3.8-flash-high　**Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/rust-s21-pal-walfs.md`（front matter `type: feat`、`scope: rust-s21`；本文：「Rust PAL WAL 檔案層：常駐 append handle、檔案 identity 與 unlink／DeletePending 偵測、Windows FILE_SHARE_DELETE、不覆蓋既有歸檔的 rename（DF-03）。」）
-**BLOCKED-OWNER：** 無（Windows 部分在擁有者本機經 WSL interop 原生執行，屬本環境可產出；第三方 EDR 影響併入 Spike 3 結果比對，見 Task 22）。
+**Windows Spike 3 evidence（本輪）：** 四案 artifacts 已於 HEAD `42e6d6c` 重採但均為 `INSUFFICIENT_EVIDENCE`，因首次 rotation 完成晚於 lease 到期 12 ms。OD-22 已核准主案例與 oplock 變體的 p99 ≤100 ms、最大值 ≤600 ms 門檻；EDR 欄位只作參考資訊。
 
 **Files:**
 - Create: `crates/sw-pal/src/wal_fs/posix.rs`、`crates/sw-pal/src/wal_fs/windows.rs`
@@ -3459,6 +3464,9 @@ impl OpRunner { pub fn spawn(ctx: OpCtx) -> OpRunner; pub fn run(&self, grant: O
 pub struct OpCtx { pub com: String, pub sid: String, pub profile: SessionProfile, pub rx: Arc<RxShared>, pub tx: TxWriterHandle,
                    pub wal: Arc<WalWriter>, pub clock: Arc<dyn Clock>, pub control: crossbeam_channel::Sender<ControlEvent>, pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync> }
 pub fn extract_command_stdout(raw: &str, command: &str, prompt_regex: &PyRegex, completion: Option<&PyRegex>) -> String;  // 05 §5.2
+// 併入 main #237（CHG-S1X-MAIN-SYNC-01）：line mode 回顯剝除除逐行 ends_with 外，須承接 `_strip_wrapped_command_echo`
+// （命令回顯被終端折行拆成多行時：開頭至多 len(command)/20+2 行去空白後接回、須以完整命令結尾且起點落在第一行內才剝除）；
+// 回歸以 tests/test_wrapped_echo_strip.py 的 BusyBox `\r\r\n` 與 bash `" \r"` 樣本為 oracle。
 pub fn encode_interactive_payload(data: &str, encoding: &str) -> Result<Vec<u8>, PyErr>;
 
 // lease.rs
@@ -5103,6 +5111,7 @@ git commit -m "chore(rust): Slice 2.1 出口 gate 腳本、報告 schema 與擁�
 - **合併阻擋（OD-08）**：本 PR 動到 PAL（serial、lock、device source、WalFs、RPC listener），依 OD-08「動到 PAL 的 PR 必須取得原生 Windows COM handle 證據；記憶體 fake 不得充數」，PR 保持 draft／不得合併，直到 BO-S21-01 證據回填並經審查，或擁有者在 PR 上留下明確書面豁免（比照 04 計畫 Task 9）。OD-15 起 BO-S21-01 可在擁有者 host（`COM20`／`COM21`）取得，預期以實跑證據解除阻擋，不以豁免代替。
 - 回歸 case 政策（#155）：本 Phase 非 bug 修復；實機案例由 BO-S21-07／08 以既有 TestPilot case 承接，PR 描述註明「未新增 regression case：F1／F2／F3／F4／F12 既有 18 個 case（17 個屬 `slice_2.1` 分母、`f4-interactive-line-cmd-defined` 為提前證據）由擁有者以 Rust daemon 執行」。
 - Slice 2.1 出口（§11.6）需同時具備：本環境 gate `READY_FOR_OWNER_EVIDENCE`（不得為 `INCOMPLETE`）＋BO-S21-01～16 證據回填並經審查＋`pending_decisions` 經擁有者裁決＋Task 23 校準報告。未回填前不得宣告 Slice 2.1 出口通過。
+- Slice 2.1 出口另需（OD-16 (4)，2026-10-22 自 Stage 1 移入；原 `run-l15.sh rust-1a`／`rust-1b` 項，見 plan 04 Task 19 Step 5 與 plan 05 Task 16 Step 4）：docker Rust-CLI L1.5——以本 Slice 的 Rust daemon bundle（`daemon.implementation=rust`，CLI 亦為 Rust）執行 `scripts/docker/run-l15.sh`（至少 `func-test-bridge` suite，`--bundle <bundle>`；兩容器拓樸、假 COM 為 socat PTY pair），產出 `evidence_layer: "L1.5-docker"` 報告且 PASS。本項為本環境可產出項（非 BLOCKED-OWNER），不計 L2／L3。移入理由：`run-l15.sh` 的 `--bundle` 需 CLI 與 daemon 皆 `implementation=rust`，Rust daemon 自本 Slice Task 19（`daemon_main`）起存在；Stage 1 bundle 的 daemon 為 Python，不列為 Stage 1 證據。
 
 ## BLOCKED-OWNER 總表
 

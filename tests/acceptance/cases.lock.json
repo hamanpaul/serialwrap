@@ -99,18 +99,39 @@
       "win-wal-f12-progress"
     ],
     "cli_1A": [
+      "bb-alias-assign-persists-device-binding",
       "bb-alias-roundtrip",
+      "bb-alias-unassign-removes-device-binding",
       "bb-cmd-background-result-tail",
+      "bb-cmd-cancel-marks-running-command-canceled",
       "bb-cmd-submit-status",
       "bb-console-attach-detach",
       "bb-device-mcu-health",
+      "bb-event-disable-updates-matcher-state",
+      "bb-event-enable-updates-matcher-state",
+      "bb-event-reload-removes-deleted-registry-rule",
+      "bb-event-reset-clears-fired-rule-counter",
       "bb-event-rule-roundtrip",
+      "bb-event-show-returns-registered-rule",
+      "bb-event-status-lists-enabled-daemon-selector",
+      "bb-event-tail-reads-matcher-log",
+      "bb-file-pull-transfers-bytes-from-target",
+      "bb-file-push-transfers-bytes-to-target",
       "bb-interactive-lease-roundtrip",
       "bb-local-rejections-zero-tx",
       "bb-log-and-wal",
+      "bb-log-tail-raw-reads-daemon-wal",
       "bb-no-version-warning",
       "bb-recover-release-attach-no-replay",
+      "bb-session-activity-reports-live-session",
+      "bb-session-attach-restarts-cleared-session",
+      "bb-session-bind-switches-device",
+      "bb-session-clear-detaches-and-reattaches",
+      "bb-session-log-capture-lifecycle",
+      "bb-session-profile-pin-persists",
       "bb-session-reaches-ready",
+      "bb-session-self-test-reports-live-health",
+      "bb-wal-reset-rotates-and-resets-sequence",
       "brcm-01-login-flow",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
@@ -175,18 +196,39 @@
       "win-wal-av-unlink"
     ],
     "cli_1B": [
+      "bb-alias-assign-persists-device-binding",
       "bb-alias-roundtrip",
+      "bb-alias-unassign-removes-device-binding",
       "bb-cmd-background-result-tail",
+      "bb-cmd-cancel-marks-running-command-canceled",
       "bb-cmd-submit-status",
       "bb-console-attach-detach",
       "bb-device-mcu-health",
+      "bb-event-disable-updates-matcher-state",
+      "bb-event-enable-updates-matcher-state",
+      "bb-event-reload-removes-deleted-registry-rule",
+      "bb-event-reset-clears-fired-rule-counter",
       "bb-event-rule-roundtrip",
+      "bb-event-show-returns-registered-rule",
+      "bb-event-status-lists-enabled-daemon-selector",
+      "bb-event-tail-reads-matcher-log",
+      "bb-file-pull-transfers-bytes-from-target",
+      "bb-file-push-transfers-bytes-to-target",
       "bb-interactive-lease-roundtrip",
       "bb-local-rejections-zero-tx",
       "bb-log-and-wal",
+      "bb-log-tail-raw-reads-daemon-wal",
       "bb-no-version-warning",
       "bb-recover-release-attach-no-replay",
+      "bb-session-activity-reports-live-session",
+      "bb-session-attach-restarts-cleared-session",
+      "bb-session-bind-switches-device",
+      "bb-session-clear-detaches-and-reattaches",
+      "bb-session-log-capture-lifecycle",
+      "bb-session-profile-pin-persists",
       "bb-session-reaches-ready",
+      "bb-session-self-test-reports-live-health",
+      "bb-wal-reset-rotates-and-resets-sequence",
       "bc02-deferred-context-switch-clear",
       "bc02-deferred-overflow-clear",
       "bc02-mailbox-stale-input-not-replayed",
@@ -718,6 +760,18 @@
     ]
   },
   "case_attrs": {
+    "bb-alias-assign-persists-device-binding": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "bb-alias-roundtrip": {
       "suite": "contract-blackbox",
       "layer": "L1",
@@ -730,7 +784,31 @@
       "cli_stage": "1A",
       "stage0_required": false
     },
+    "bb-alias-unassign-removes-device-binding": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "bb-cmd-background-result-tail": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-cmd-cancel-marks-running-command-canceled": {
       "suite": "contract-blackbox",
       "layer": "L1",
       "platforms": [
@@ -778,7 +856,115 @@
       "cli_stage": "1A",
       "stage0_required": false
     },
+    "bb-event-disable-updates-matcher-state": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-enable-updates-matcher-state": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-reload-removes-deleted-registry-rule": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-reset-clears-fired-rule-counter": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "bb-event-rule-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-show-returns-registered-rule": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-status-lists-enabled-daemon-selector": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-event-tail-reads-matcher-log": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-file-pull-transfers-bytes-from-target": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-file-push-transfers-bytes-to-target": {
       "suite": "contract-blackbox",
       "layer": "L1",
       "platforms": [
@@ -826,6 +1012,18 @@
       "cli_stage": "1A",
       "stage0_required": false
     },
+    "bb-log-tail-raw-reads-daemon-wal": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "bb-no-version-warning": {
       "suite": "contract-blackbox",
       "layer": "L1",
@@ -850,7 +1048,103 @@
       "cli_stage": "1A",
       "stage0_required": false
     },
+    "bb-session-activity-reports-live-session": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-attach-restarts-cleared-session": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-bind-switches-device": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-clear-detaches-and-reattaches": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-log-capture-lifecycle": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-profile-pin-persists": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "bb-session-reaches-ready": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-session-self-test-reports-live-health": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": null,
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "bb-wal-reset-rotates-and-resets-sequence": {
       "suite": "contract-blackbox",
       "layer": "L1",
       "platforms": [

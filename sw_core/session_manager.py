@@ -247,6 +247,28 @@ def passthrough_file_transfer_error(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
+    """移除含 BusyBox 雙 CR 折行標記的命令回顯；``lines`` 已經 ``clean_text`` 並切行。
+
+    shell 回顯打到終端寬度（serial console 常見 80 欄）時會在回顯中插入換行
+    （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）。只接合不同輸出行，
+    行內空白保持原樣，避免把未回顯的有效 stdout（如 ``cat file`` 輸出 ``catfile``）
+    誤認為命令。bash readline 的單行 ``" \\r"`` 插入空白由呼叫端以原始控制字元
+    單獨辨識。
+    """
+    if not command or len(lines) < 2:
+        return lines
+    joined = ""
+    # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
+    for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
+        joined += line
+        if joined.endswith(command):
+            prefix = joined[:-len(command)]
+            if len(prefix) < len(lines[0]):
+                return lines[n:]
+    return lines
+
+
 @dataclasses.dataclass
 class BackgroundCapture:
     cmd_id: str
@@ -493,9 +515,10 @@ class SessionRuntime:
     # （attach probe／reboot recovery／self-test nonce 的 confirm_ready()）清除——
     # quiet 過期或 RX prompt 解除都「不」清。transient，不進 _save_state。
     # 根因：prpl/OpenWrt askconsole 停在「Please press Enter to activate this
-    # console」，既不匹配 login_regex 也不匹配 prompt_regex → quiet 只能靠 180s
-    # 過期清空；期間 session 名義 READY 且無人重新確認，第一個 agent 命令的 "\n"
-    # 觸發 askconsole 啟用、命令文字被 askfirst 吞掉、stdout 吃到啟用 banner。
+    # console」，既不匹配 login_regex 也不匹配 prompt_regex → profile 未設
+    # boot_done_regex 時 quiet 只能靠 180s 過期清空；期間 session 名義 READY 且
+    # 無人重新確認，第一個 agent 命令的 "\n" 觸發 askconsole 啟用、命令文字被
+    # askfirst 吞掉、stdout 吃到啟用 banner。
     # agent 顯式命令 gate 改判 agent_gate_active()（quiet or pending），解除的
     # 唯一路徑＝READY 經 nonce probe 再確認；確認 probe 的 "\n" 順帶消耗 banner。
     ready_reconfirm_pending: bool = False
@@ -888,6 +911,9 @@ class SessionManager:
         self._draining_by_ids: dict[str, _DrainJob] = {}
         self._aborted_cmd_ids: set[str] = set()
         self._shutting_down = False
+        # 交接停止（SC-11 `daemon.handoff_stop`）freeze 成立後為 True：DeviceWatcher tick 不再排工、
+        # 在途 readiness probe 的結果不再改寫 session（見 freeze_for_handoff）。
+        self._handoff_frozen = False
         self._shutdown_deadline: float | None = None
         self._shutdown_workers: set[threading.Thread] = set()
         # flash 偵測 probe 進行中的 COM（#83 RACE-2 final）：probe 已開 bridge flash_mode gate 擋 console，
@@ -1015,6 +1041,54 @@ class SessionManager:
         """凍結 attach、hotplug 與後置重開入口。"""
         with self._lock:
             self._shutting_down = True
+
+    def freeze_for_handoff(self) -> list[str]:
+        """交接停止成功後凍結背景引擎與既有 bridge 的 TX（SC-11 `daemon.handoff_stop`，R1-F1）。
+
+        RPC admission 只擋新進的 RPC；DeviceWatcher 重探 tick、重新 attach、login 與人工 console 行
+        等背景來源原本不經 admission，排空窗口內仍會 TX 或改寫 session。本方法於 freeze 成立時：
+
+        1. 進入 stopping gate（`begin_shutdown`）：attach、熱插不再開 UART、不建 worker；
+        2. 設 `_handoff_frozen`：`reconcile_readiness` 不再排重探／重 attach 與 lease tick，
+           在途 readiness probe 的結果不再改寫 session；
+        3. 對所有已掛載 bridge（session、attach、probe）呼叫 `freeze_tx()`：此後任何來源的 TX
+           都由 bridge 拒絕（零 TX）。
+
+        回傳 TX fence 未在期限內收斂的 COM 清單（空清單＝凍結成立，回覆前已授權的寫入段皆已結束）。
+        收斂失敗且本次為新凍結時，撤銷上述三項（flag 還原、bridge 凍結撤銷），daemon 回到可正常運作的狀態，
+        由 `handoff_stop` 回 SESSION_BUSY（SC-11：忙碌不凍結、不停止）。已凍結者保持凍結（冪等）。
+
+        reader 與埠保持開啟；實際排空仍由 stop 的 `shutdown_drain()` 於窗口結束後完成。
+        """
+        with self._lock:
+            was_frozen = self._handoff_frozen
+            was_shutting_down = self._shutting_down
+            self._handoff_frozen = True
+            self._shutting_down = True
+            bridges: dict[int, UARTBridge] = {}
+            for session in self._sessions.values():
+                if session.bridge is not None:
+                    bridges[id(session.bridge)] = session.bridge
+            for bridge in self._attach_bridges.values():
+                bridges[id(bridge)] = bridge
+            for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops):
+                for op in table.values():
+                    if op.probe_bridge is not None:
+                        bridges[id(op.probe_bridge)] = op.probe_bridge
+            unconverged: list[str] = []
+            for bridge in bridges.values():
+                freeze_tx = getattr(bridge, "freeze_tx", None)
+                if callable(freeze_tx) and freeze_tx() is False:
+                    unconverged.append(str(getattr(bridge, "com", "") or ""))
+            if unconverged and not was_frozen:
+                # 交接未成立：撤銷本次新建立的凍結。drain 已開始的 bridge 由 thaw_tx 自行保留凍結。
+                self._handoff_frozen = False
+                self._shutting_down = was_shutting_down
+                for bridge in bridges.values():
+                    thaw_tx = getattr(bridge, "thaw_tx", None)
+                    if callable(thaw_tx):
+                        thaw_tx()
+            return sorted(set(unconverged))
 
     def shutdown_drain(self, *, total_timeout_s: float = 5.0) -> dict[str, Any]:
         """以一個共用期限等待 attach 收尾並取得所有 bridge 關閉回條。"""
@@ -1472,6 +1546,7 @@ class SessionManager:
             log_dir=tpl.log_dir,
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
+            boot_done_regex=tpl.boot_done_regex,
             uart=tpl.uart,
         )
         sid = session_id_override or f"{profile.profile_name}:{com}"
@@ -2094,6 +2169,9 @@ class SessionManager:
 
     def _finish_probe_reprobe(self, session_id: str, bridge: UARTBridge, result: dict[str, Any], now: float) -> None:
         with self._lock:
+            if self._handoff_frozen:
+                # 交接凍結後，在途 probe 的結果不得再把 session 推進到 READY（零狀態改寫）。
+                return
             current = self._sessions.get(session_id)
             if current is None or current.bridge is not bridge:
                 return
@@ -2192,6 +2270,9 @@ class SessionManager:
                     session = self._sessions.get(session_id)
                     if session is None or session.bridge is not bridge:
                         return
+                    # 交接凍結後不再開始 readiness probe（SC-11，零 TX、零登入世代產生）。
+                    if self._handoff_frozen:
+                        return
                     if not self._reprobe_target_still_valid_locked(session, bridge, start):
                         return
                 try:
@@ -2207,6 +2288,7 @@ class SessionManager:
                             current is not None
                             and current.bridge is bridge
                             and current.state not in {"FLASHING", "RELEASED"}
+                            and not self._handoff_frozen
                         ):
                             current.state = "ATTACHED"
                             current.last_error = f"REPROBE_FAILED:{type(exc).__name__}"
@@ -2240,6 +2322,9 @@ class SessionManager:
         post_actions: list[tuple[str, _PostCloseAction]] = []
         expired_count = 0
         with self._lock:
+            # SC-11：交接凍結後 tick 不改動 lease（也不排還原／回放）；鎖內重新檢查，覆蓋頂部無鎖檢查之後的凍結。
+            if self._handoff_frozen:
+                return 0
             for interactive_id, lease in list(self._interactive.items()):
                 if lease.status != "active" or lease.owner.startswith("human:"):
                     continue
@@ -2312,14 +2397,22 @@ class SessionManager:
 
         本方法由 DeviceWatcher tick 同步呼叫，因此只在 lock 內收集候選、不在此同步等待 probe；
         ATTACHED 的 readiness probe 改交背景 worker（Finding 3），DETACHED 走既有 threaded _spawn_attach。
+        交接凍結（freeze_for_handoff）後整個 tick 不再改動 session 或送出 TX（SC-11，零 TX）。
         """
+        if self._handoff_frozen:
+            return
         self._expire_interactive_leases_tick()
         now = time.monotonic()
         jobs: list[tuple[str, str, UARTBridge | None, str]] = []
         promoted: list[str] = []
         with self._lock:
+            # 頂部無鎖檢查之後、取得鎖之前，交接可能已完成凍結：鎖內重新檢查（SC-11，零狀態改寫）。
+            if self._handoff_frozen:
+                return
             promoted = self._promote_quiet_passthrough_locked(now)
             for session in list(self._sessions.values()):
+                if self._handoff_frozen:
+                    break
                 prepared = self._prepare_reprobe_locked(session, now)
                 if prepared is None:
                     continue
@@ -2345,7 +2438,12 @@ class SessionManager:
         if now - self._last_console_reap_at >= _HUMAN_PEER_GRACE_S:
             self._last_console_reap_at = now
             with self._lock:
-                bridges = [s.bridge for s in self._sessions.values() if s.bridge is not None]
+                # 交接凍結後 tick 不再回收或授予任何 console／lease（SC-11）。
+                bridges = (
+                    []
+                    if self._handoff_frozen
+                    else [s.bridge for s in self._sessions.values() if s.bridge is not None]
+                )
             if bridges:
                 # 取第一個 bridge 做全域 /proc 掃描（結果對所有 bridge 共用）；
                 # procfs 不可用時回 None，各 bridge 的 reap 自行 fallback 至本身保守掃描（不誤剪）。
@@ -2384,6 +2482,9 @@ class SessionManager:
                         elif not bridge.console_has_external_peer(primary_cid):
                             continue  # procfs 不可用 / vtty 未知時的保守 fallback
                         with self._lock:
+                            # 鎖外判定（snapshot／外部 peer）期間可能已完成交接凍結：鎖內重新檢查，凍結後不授予 lease。
+                            if self._handoff_frozen:
+                                continue
                             session = self._session_for_bridge_locked(bridge)
                             if session is None or session.state not in {"READY", "ATTACHED"}:
                                 continue
@@ -3827,11 +3928,23 @@ class SessionManager:
         for by_id in keys:
             self._spawn_attach(by_id)
 
+    def _revert_pre_marked_attaching_locked(self, by_id: str) -> None:
+        """attach 因交接凍結／停止而早退時，還原鎖內預先標記的 ATTACHING 為 DETACHED（須持有 self._lock）。
+
+        只處理尚未開啟 bridge 的 ATTACHING；否則凍結被撤銷（交接未成立）後該 session 會永久卡在 ATTACHING，
+        `_prepare_reprobe_locked` 不再排它。呼叫端須確認沒有其他 attach 本體正在處理同一 by_id。
+        """
+        session = next((s for s in self._sessions.values() if s.profile.device_by_id == by_id), None)
+        if session is not None and session.state == "ATTACHING" and session.bridge is None:
+            session.state = "DETACHED"
+
     def _spawn_attach(self, by_id: str) -> None:
         with self._lock:
             if self._shutting_down:
                 import logging
                 logging.getLogger("serialwrap").info("shutdown 中，略過 attach %s", by_id)
+                if by_id not in self._attach_inflight:
+                    self._revert_pre_marked_attaching_locked(by_id)
                 return
             if by_id in self._released_by_ids:
                 return
@@ -4258,8 +4371,9 @@ class SessionManager:
         - RX 見到 boot banner（U-Boot 版本行／autoboot 倒數）→ 啟用／延長 quiet
           window。``arm_boot_quiet`` 同時清空 rolling tail，使 banner 之前殘留的
           舊 prompt 不會誤觸發解除（DUT 自行重開機、無人先呼叫 reboot 的情境）。
-        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex`` 或
-          ``prompt_regex``（開機完成訊號）→ 立即解除，讓 recovery / reprobe 恢復探測。
+        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex``、
+          ``prompt_regex`` 或 ``boot_done_regex``（開機完成訊號）→ 立即解除，讓
+          recovery / reprobe 恢復探測。
           但尾行先命中 ``bootloader_prompts``（見下方 Finding 3 說明）時例外不解除。
         - gate source=system 的自動 probe 與（#139）非 human 來源的 agent 顯式命令
           （submit/execute/file 傳輸雙層 gate）；不 gate human console／lease TX。
@@ -4293,7 +4407,10 @@ class SessionManager:
         # 解除 quiet window，讓後續自動 probe 又打斷一次 autoboot。
         if _matches_any_bootloader_prompt(tail, sp.bootloader_prompts) is not None:
             return
-        for pattern in (sp.login_regex, sp.prompt_regex):
+        # boot_done_regex：profile 宣告的開機完成訊號（例：prpl/OpenWrt askconsole 的
+        # 「Please press Enter to activate this console」）。askconsole 不匹配 login／prompt，
+        # 未設時只能等 BOOT_QUIET_WINDOW_S 過期；文案放 profile、不寫死在程式碼。
+        for pattern in (sp.login_regex, sp.prompt_regex, sp.boot_done_regex):
             if not pattern:
                 continue
             try:
@@ -4423,6 +4540,16 @@ class SessionManager:
             self._on_detached(session.session_id)
             self._await_drain(job)
 
+    @staticmethod
+    def _handoff_frozen_probe_result_locked(session: SessionRuntime) -> dict[str, Any]:
+        """交接凍結後 probe 的拒絕結果：零 TX、零狀態改寫（須持有 self._lock，且不得修改 session）。"""
+        return {
+            "ok": False,
+            "error_code": "FLUSHED_BY_SHUTDOWN",
+            "reason": "handoff_frozen",
+            "session": session.to_public_dict(),
+        }
+
     def _probe_existing_bridge(self, session: SessionRuntime, bridge: UARTBridge) -> dict[str, Any]:
         if session.profile.platform == "passthrough":
             current = self._sessions.get(session.session_id)
@@ -4446,6 +4573,9 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            if self._handoff_frozen:
+                # SC-11：交接已凍結，不得再開始 probe（登入世代與 probe 授權亦不得在凍結後產生）。
+                return self._handoff_frozen_probe_result_locked(current)
             if self._boot_quiet_blocks_probe(current):
                 # #162：READY（再確認 pending）走到這裡＝quiet 又被 re-arm——不得以
                 # 合成 PROMPT_UNAVAILABLE 覆寫 READY 的 last_error（名義 READY 的
@@ -4495,6 +4625,10 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
+            # SC-11：probe 於鎖外執行期間可能已完成交接凍結。凍結檢查位於同一把 manager lock 內、
+            # 任何狀態修改（含下方 READY 寫入點與 ATTACHED 錯誤寫入）之前；凍結後 probe 結果不得改寫 session。
+            if self._handoff_frozen:
+                return self._handoff_frozen_probe_result_locked(current)
             # probe 在 lock 外阻塞期間，session 可能被 flash broker 搶進 FLASHING、或被 device
             # handoff 釋放成 RELEASED。此時不得用 probe 結果覆寫狀態，否則會把 FLASHING 打回
             # ATTACHED → flasher 結束時 exit_flashing 見 state≠FLASHING 提早 return、bridge 永久
@@ -4541,6 +4675,7 @@ class SessionManager:
             if self._shutting_down:
                 import logging
                 logging.getLogger("serialwrap").info("shutdown 中，略過 attach %s", by_id)
+                self._revert_pre_marked_attaching_locked(by_id)
                 return
             if by_id in self._draining_by_ids:
                 return
@@ -4999,6 +5134,7 @@ class SessionManager:
             log_dir=tpl.log_dir,
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
+            boot_done_regex=tpl.boot_done_regex,
             uart=tpl.uart,
         )
         session.profile_source = source
@@ -5609,8 +5745,38 @@ class SessionManager:
         lines = cleaned.lstrip("\n").splitlines()
         if command:
             command_stripped = command.strip()
+            stripped = False
             while lines and lines[0].strip().endswith(command_stripped):
                 lines = lines[1:]
+                stripped = True
+            if not stripped:
+                original_lines = lines
+                # 只把原始串流中 BusyBox 的雙 CR＋LF 視為折行證據；一般 stdout 換行不可拼接。
+                if "\r\r\n" in text:
+                    lines = _strip_wrapped_command_echo(lines, command_stripped)
+                # bash readline 會在長回顯折行處寫入「空白＋CR」再接續同一行。
+                # 只在移除這個明確控制字元後，首行確實以完整命令結尾時才剝除；
+                # 一般單行 stdout 不因忽略空白而取得回顯資格。
+                if lines is original_lines and " \r" in text:
+                    candidate_text = text.replace(" \r", "", 1)
+                    candidate_cleaned = clean_text(candidate_text)
+                    candidate_prompt_start = self._last_prompt_start(candidate_cleaned, prompt_regex)
+                    candidate_completion = (
+                        re.search(completion_regex, candidate_text) if completion_regex is not None else None
+                    )
+                    candidate_completion_end = (
+                        len(clean_text(candidate_text[:candidate_completion.end()]))
+                        if candidate_completion is not None else None
+                    )
+                    if candidate_prompt_start is not None and (
+                        completion_regex is None
+                        or (candidate_completion_end is not None
+                            and candidate_prompt_start >= candidate_completion_end)
+                    ):
+                        candidate_cleaned = candidate_cleaned[:candidate_prompt_start]
+                    candidate_lines = candidate_cleaned.lstrip("\n").splitlines()
+                    if candidate_lines and candidate_lines[0].strip().endswith(command_stripped):
+                        lines = candidate_lines[1:]
         return "\n".join(lines).strip("\n")
 
     def _open_interactive_locked(

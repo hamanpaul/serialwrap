@@ -1469,9 +1469,9 @@ fn spec_profile(d: &SpecDefaults) -> ParserSpec {
         sub: Some(SubparsersSpec {
             dest: "profile_cmd", required: true, title: None, metavar: Some("<command>"),
             entries: vec![
-                SubparserEntry { name: "test", help: Some("對樣本文字逐一跑 prompt/login/password/bootloader regex，回報是否命中"), target: SubTarget::Native(Box::new(ParserSpec {
+                SubparserEntry { name: "test", help: Some("對樣本文字逐一跑 prompt/login/password/boot_done/bootloader regex，回報是否命中"), target: SubTarget::Native(Box::new(ParserSpec {
         prog: "serialwrap profile test".to_string(),
-        description: Some("從 --profile-dir 載入 profile YAML，找出 --profile 指定的 template，\n對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／\nbootloader_prompts（逐條），stdout 印 JSON 回報各 regex 是否命中與命中的行。\n純離線診斷：不連 daemon、不碰任何 UART，exit code 恆為 0。"),
+        description: Some("從 --profile-dir 載入 profile YAML，找出 --profile 指定的 template，\n對 --sample 檔案內容依序跑 prompt_regex／login_regex／password_regex／boot_done_regex／\nbootloader_prompts（逐條），stdout 印 JSON 回報各 regex 是否命中與命中的行。\n純離線診斷：不連 daemon、不碰任何 UART，exit code 恆為 0。"),
         epilog: None,
         raw_text: true,
         raw_description: false,
