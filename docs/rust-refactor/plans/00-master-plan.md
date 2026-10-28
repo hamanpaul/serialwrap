@@ -58,6 +58,16 @@
 | P8 | Slice 2.4 | `09-slice24-transfer-flash.md` | FileTransfer、完整裝置交接、MCU flash／holder-probe、監管整合 |
 | P9 | Stage 3 前置 | `10-stage3-canary.md` | A/B 執行器、Canary 帳本工具、退役切換與回滾演練程序 |
 
+**版號與對外 release（OD-33，2026-10-28）**：
+
+| 出口 | 產品組成 | 版號 | 對外發佈 |
+|---|---|---|---|
+| Stage 1（P3＋P4） | Rust CLI＋Python daemon | `0.4.0` | 出口 gate 通過後發佈 `0.4.0` release，並以此驗證 0.3.2 → 0.4.0 升級（程序與發佈內容見 `docs/rust-refactor/release-0.4.0-plan.md`；Linux 升級測試 `scripts/docker/run-upgrade.sh`） |
+| Stage 2（P5～P8） | 全 Rust daemon | `0.5.0`（Canary 前可用 `0.5.0-rc.N`） | Stage 2 出口後 |
+| Stage 3（P9） | Python daemon 退役 | `1.0.0` | 退役裁決（BO-P9-13）後 |
+
+merge 到 `main`、建 tag 與發 GitHub release 由主 session 在出口 gate 通過後依政策開 PR 執行（`release:<version>` label 對應 R-07）；實作輪只做準備，不得自行操作。release 後於已安裝 release 的其他電腦執行的真板全套與既有正式安裝升級實測依 OD-27。
+
 每個 Phase 依序：**計畫（本目錄）→ 測試先行（TDD，紅燈確認）→ 實作 → 雙審（sonnet max＋codex gpt-6.1-sol medium）→ 修正 → 全套測試＋policy_check → commit**。
 
 ## 2. 模型分工（使用者指定）
