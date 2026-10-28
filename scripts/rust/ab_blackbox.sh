@@ -167,7 +167,7 @@ echo "=== 開始 A 輪（Python 基線）==="
 touch "$A_PIDS"
 set +e
 env -u SERIALWRAP_CLI_EXE -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_AB_LABEL \
-  SW_AB_PIDLOG="$A_PIDS" SW_AB_CONFIGLOG="$A_CONFIG" python3 -m pytest tests/contract_blackbox \
+  SW_AB_PIDLOG="$A_PIDS" SW_AB_CONFIGLOG="$A_CONFIG" SW_AB_STOPLOG="$RUN_DIR/a.stoplog.ndjson" python3 -m pytest tests/contract_blackbox \
   -m "core_portable or posix_only" \
   --junitxml="$A_XML"
 a_rc=$?
@@ -335,6 +335,8 @@ b_env=(
   SERIALWRAP_AB_LABEL="rust-1a"
   SW_AB_PIDLOG="$B_PIDS"
   SW_AB_CONFIGLOG="$B_CONFIG"
+  # S1X Y3：daemon stop 各階段耗時與升級（SIGTERM／SIGKILL）紀錄，teardown「stop 後仍存活」時供歸因。
+  SW_AB_STOPLOG="$RUN_DIR/b.stoplog.ndjson"
 )
 if [[ -n "$L1_OUT" ]]; then
   b_env+=(SW_RESOURCE_REPORT="$B_RESOURCE_REPORT")
