@@ -1,12 +1,12 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34、SC-35、DF-01～DF-17、DF-19 依定稿規格、調和表與 OD-14 推導（DF-18 保留給 P7）。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-36、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導（DF-18 保留給 P7）。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 5
+revision: 6
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -1404,6 +1404,86 @@ changes:
     compatibility_impact: "session.self_test 的 nonce probe 在每次 OS 提交前重驗 boot quiet 與 bridge 世代／epoch；被擋時回與 pre-check 同形的 AUTOBOOT_QUIET（零 TX），不等 nonce、不 confirm_ready。FLASHING 中仍回 TARGET_UNRESPONSIVE。"
     approval_conditions: "self-test 是 READY_UNCONFIRMED 的建議出口，不受 ready reconfirm 擋；不與 login run 世代掛鉤；pre-check 通過後才 arm 的 quiet 使 probe 零 TX（來源 SES-16.6-08，R5-F2）。"
     related_decisions: []
+  - id: "DF-20"
+    kind: "DF"
+    title: "失效 interactive context 不回放"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-28"
+      decision_ref: "OD-37"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 6
+    spec_refs: ["§11.3"]
+    reconciliation_refs: []
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P6"]
+    case_ids: ["df20-stale-interactive-id-no-replay"]
+    compatibility_impact: "release 後重新 attach，以舊 interactive_id 呼叫 interactive-send 時，Rust 回 INTERACTIVE_NOT_FOUND 且 UART TX 為零；Python 0.4.0 現行行為照送。失效上下文不得回放。"
+    approval_conditions: "涵蓋 release→重新 attach 的舊 interactive_id；拒絕回應須為 INTERACTIVE_NOT_FOUND，且健康 wire 觀測窗口內 TX 為零。"
+    related_decisions: ["OD-37"]
+  - id: "DF-21"
+    kind: "DF"
+    title: "Recovery flush 原子化"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-28"
+      decision_ref: "OD-37"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 6
+    spec_refs: ["§11.3"]
+    reconciliation_refs: []
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df21-recover-flush-atomic"]
+    compatibility_impact: "Ctrl-C recovery 後，佇列內命令全部回 FLUSHED_BY_RECOVERY 且 UART TX 為零；Rust 將 flush 與提交原子化。Python 0.4.0 現行路徑存在 q0 仍送出的競態。"
+    approval_conditions: "在 recover flush／TX 提交競態下，所有尚未提交的佇列項均為 FLUSHED_BY_RECOVERY，且 UART TX 為零；不得自動重送。"
+    related_decisions: ["OD-37"]
+  - id: "DF-22"
+    kind: "DF"
+    title: "Rust RX 速率視窗合併最舊樣本且不低估"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-28"
+      decision_ref: "OD-43"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 6
+    spec_refs: ["plans/06-slice21-daemon-core.md Task 10"]
+    reconciliation_refs: []
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P5"]
+    case_ids: ["df22-rx-window-merge-oldest"]
+    compatibility_impact: "RX 速率視窗達 4096 筆上限時採 merge_oldest，合併最舊兩筆並保留 bytes 總和、使用較新時間戳；高負載下不得低估 RX_FLOOD 判定。"
+    approval_conditions: "10000 個 1-byte chunk 的 capped window 長度不得超過 4096，rx_stats 的有效 bytes 不得低於未設上限時的值。"
+    related_decisions: ["OD-43"]
 pending_owner_confirmations: []
 safety_invariants:
   - id: zero_tx_on_reject
