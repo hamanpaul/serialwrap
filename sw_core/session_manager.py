@@ -192,6 +192,33 @@ def _is_reboot_command(command: str) -> bool:
     return any(token == "-r" or token == "--reboot" or token.startswith("-r") for token in tokens[1:])
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
+    """移除被終端折行拆開的命令回顯；``lines`` 已經 ``clean_text`` 並切行。
+
+    shell 回顯打到終端寬度（serial console 常見 80 欄）時會在回顯中插入換行
+    （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）或補一個空白（bash readline
+    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡把開頭幾行
+    接回去、去掉空白後比較：命令必須從第一行開始（容許第一行前面殘留 prompt），
+    且接回的內容以完整命令結尾，才把這幾行視為回顯。
+    """
+    target = _WHITESPACE_RE.sub("", command)
+    if not target or not lines:
+        return lines
+    first_len = len(_WHITESPACE_RE.sub("", lines[0]))
+    joined = ""
+    # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
+    for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
+        joined += _WHITESPACE_RE.sub("", line)
+        if joined.endswith(target):
+            if len(joined) - len(target) < first_len:
+                return lines[n:]
+            return lines
+    return lines
+
+
 @dataclasses.dataclass
 class BackgroundCapture:
     cmd_id: str
@@ -3200,8 +3227,12 @@ class SessionManager:
         lines = cleaned.lstrip("\n").splitlines()
         if command:
             command_stripped = command.strip()
+            stripped = False
             while lines and lines[0].strip().endswith(command_stripped):
                 lines = lines[1:]
+                stripped = True
+            if not stripped:
+                lines = _strip_wrapped_command_echo(lines, command_stripped)
         return "\n".join(lines).strip("\n")
 
     def _open_interactive_locked(
