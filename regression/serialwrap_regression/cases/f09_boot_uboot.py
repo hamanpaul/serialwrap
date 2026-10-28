@@ -589,8 +589,12 @@ def f9_expect_reboot_chained(ctx):
             return CaseResult("SKIP", reason=f"WAL 證據不完整：{wal_error}", category="environment",
                               reason_code=wal_error)
         if not after or after == before:
-            return CaseResult("FAIL", reason="boot ID 未改變：板子沒有重開機", category="test",
-                              reason_code="boot_id_unchanged")
+            # 讀到舊 boot ID 有兩種成因：板子真的沒重開，或 daemon 在非同步 reboot 的關機期間
+            # 就確認了 READY（舊 shell 回應 nonce 探測，stale-READY），讀 boot ID 的命令落在
+            # 重開之前。2026-10-28 IB8 實機首跑屬後者：TX reboot 後 +3.9 s nonce 被舊 shell
+            # 回應，+5.2 s 讀到舊 boot ID，+8.6 s 板子才開始重開。
+            return CaseResult("FAIL", reason="boot ID 未改變：板子沒有重開機，或 daemon 在關機期間就確認了 READY（stale-READY）",
+                              category="test", reason_code="boot_id_unchanged")
         if record.get("expect_reboot") is not True:
             return CaseResult("FAIL", reason="command.get 沒有回報 expect_reboot=true", category="test",
                               reason_code="record_missing_flag")
