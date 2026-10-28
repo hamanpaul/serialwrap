@@ -33,6 +33,7 @@ limits:
   - {name: human_tx_backlog_bytes, value: 262144, unit: bytes, overflow: clear_all, source: "07 D-15／D-18：human TX lane backlog；溢位清空該 client 並 WARNING"}
   - {name: telnet_consoles_per_session, value: 32, unit: consoles, overflow: pause_accept, source: "07 D-18：達上限時 listener 不加入 mux 讀取（SC-31(d)）"}
   - {name: com0com_reader_channel, value: 64, unit: events, overflow: block_sender, source: "07 D-04／D-18：com0com reader→mux 有界 channel"}
+  - {name: fence_cancelled_ops_max, value: 512, unit: ops, overflow: drop_oldest, source: "parity-amendments-2026-10-26 #38：撤銷 op tombstone（Python `UARTBridge._revoked_ops`、`_TX_ACCOUNT_MAX`）FIFO 淘汰最舊；Rust `tx_writer::CANCELLED_OPS_MAX`"}
 
 # §5.3 事件延遲契約：開工前凍結。owner 與 reviewed_by 必須不同。
 event_latency:

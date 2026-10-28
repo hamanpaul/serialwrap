@@ -2,6 +2,13 @@
 //! 平台實作放在 `posix`／`windows` 子模組，依目標平台擇一編譯。
 //!
 //! 原生寫入面由 P4-T5 的 POSIX 與 Windows 後端提供；測試替身可覆寫所需方法。
+
+/// Python 文字模式寫檔的換行（`open(..., "w")` 的 `newline=None` → `os.linesep`）：Windows `\r\n`、其餘 `\n`
+/// （state.json 尾端換行，審查 F55）。
+#[cfg(windows)]
+pub const TEXT_NEWLINE: &[u8] = b"\r\n";
+#[cfg(not(windows))]
+pub const TEXT_NEWLINE: &[u8] = b"\n";
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
@@ -120,19 +127,20 @@ pub(crate) fn with_filename(
     error
 }
 
-/// Python 文字模式寫入的換行（`os.linesep`）：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+/// Python 文字模式寫入的換行（`os.linesep`）的字串形：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+/// 與 P5 的位元組形 [`TEXT_NEWLINE`] 同值（merge P5 47c7b25 時兩邊各自新增，P5 名稱保留給位元組形）。
 #[cfg(windows)]
-pub const TEXT_NEWLINE: &str = "\r\n";
-/// Python 文字模式寫入的換行（`os.linesep`）：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
+pub const TEXT_NEWLINE_STR: &str = "\r\n";
+/// Python 文字模式寫入的換行（`os.linesep`）的字串形：POSIX `\n`、Windows `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
 #[cfg(not(windows))]
-pub const TEXT_NEWLINE: &str = "\n";
+pub const TEXT_NEWLINE_STR: &str = "\n";
 
-/// 文字模式寫入的位元組：每個 `\n` 換成 [`TEXT_NEWLINE`]（UTF-8 編碼）。
+/// 文字模式寫入的位元組：每個 `\n` 換成 [`TEXT_NEWLINE_STR`]（UTF-8 編碼）。
 pub fn text_mode_bytes(text: &str) -> Vec<u8> {
-    if TEXT_NEWLINE == "\n" {
+    if TEXT_NEWLINE_STR == "\n" {
         text.as_bytes().to_vec()
     } else {
-        text.replace('\n', TEXT_NEWLINE).into_bytes()
+        text.replace('\n', TEXT_NEWLINE_STR).into_bytes()
     }
 }
 

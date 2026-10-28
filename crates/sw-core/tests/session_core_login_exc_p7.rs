@@ -95,7 +95,10 @@ fn manual_recover_reprobe_raised_is_rpc_exception() {
         force: false,
     });
     let (epoch, gen) = start_login(&fx).expect("recover 的 ATTACHED 再探");
-    finish(&mut h, epoch, gen, LoginOutcome::Raised("error".into()));
+    finish(&mut h, epoch, gen, LoginOutcome::Raised {
+            exc: "error".into(),
+            message: "missing ), unterminated subpattern at position 0".into(),
+        });
     assert!(reply.try_recv().expect("回覆").is_err());
     assert_eq!(
         h.public()["last_error"],
@@ -184,7 +187,10 @@ fn reboot_recovery_tx_incomplete_records_recovery_error() {
 fn reboot_recovery_raised_records_recovery_error() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     let (epoch, gen) = reboot_recovery_run(&mut h);
-    let fx = finish(&mut h, epoch, gen, LoginOutcome::Raised("error".into()));
+    let fx = finish(&mut h, epoch, gen, LoginOutcome::Raised {
+            exc: "error".into(),
+            message: "missing ), unterminated subpattern at position 0".into(),
+        });
     assert_eq!(h.public()["last_error"], PyValue::from("RECOVERY_ERROR"));
     assert!(fx.iter().any(
         |e| matches!(e, Effect::Warn(m) if m == "reboot-recovery ensure_ready 例外（session=t:COM0），續迴圈待逾時收尾")

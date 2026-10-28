@@ -114,7 +114,9 @@ fn group_gid(name: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
-/// 可 chgrp 的既有群組：root 下選與目前 gid 不同的群組（使 chgrp 可觀察），否則用目前主要群組。
+/// 可 chgrp、且與 socket 建立時群組（目前主要群組）不同的既有群組，使 chgrp 可觀察（審查 F07）：
+/// root 下選 `daemon`；非 root 選第一個不同於主要群組的附加群組。皆無 → 證據不足即 FAIL（不得以主要群組
+/// 充數——拿掉 chgrp 實作時測試仍會綠）。
 fn usable_group() -> (String, u32) {
     let out = |args: &[&str]| {
         String::from_utf8(
@@ -128,12 +130,23 @@ fn usable_group() -> (String, u32) {
         .trim()
         .to_string()
     };
+    let primary: u32 = out(&["-g"]).parse().unwrap();
     if out(&["-u"]) == "0" {
         if let Some(gid) = group_gid("daemon") {
-            return ("daemon".into(), gid);
+            if gid != primary {
+                return ("daemon".into(), gid);
+            }
         }
     }
-    (out(&["-gn"]), out(&["-g"]).parse().unwrap())
+    let gids = out(&["-G"]);
+    let names = out(&["-Gn"]);
+    gids.split_whitespace()
+        .zip(names.split_whitespace())
+        .find_map(|(gid, name)| {
+            let gid: u32 = gid.parse().ok()?;
+            (gid != primary).then(|| (name.to_string(), gid))
+        })
+        .expect("證據不足：找不到與主要群組不同、可 chgrp 的附加群組")
 }
 
 #[cfg(unix)]

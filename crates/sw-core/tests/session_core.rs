@@ -895,6 +895,13 @@ fn wall_clock_jump_param() {
                 PyValue::Null,
                 "lease 到期前 1 ms"
             );
+            // Python `expired()` 為嚴格大於（審查 F36）：恰在 20 s 仍 active，超過期限才收回。
+            h.advance(Duration::from_millis(1));
+            assert_ne!(
+                pget(&h.public(), "interactive_session_id"),
+                PyValue::Null,
+                "恰在期限 ({jump_s})"
+            );
             h.advance(Duration::from_millis(1));
             assert_eq!(
                 pget(&h.public(), "interactive_session_id"),
@@ -1202,7 +1209,9 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
         )),
         Err(FenceReject::OwnerMismatch)
     ));
-    assert!(h
+    // 審查 F15：banner 推進的是 core 世代，不是新的 login run——現行 attach run（以 old_fsm_gen 啟動）的
+    // Ready 結果照 Python 套用（READY＋confirm_ready）。舊版斷言「停在 ATTACHING」鎖住的是永久卡住的缺陷。
+    assert!(!h
         .feed(ControlEvent::LoginFinished {
             epoch,
             fsm_gen: old_fsm_gen,
@@ -1210,7 +1219,7 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
             after_rx_seq: None,
         })
         .is_empty());
-    assert_eq!(h.core.state(), SessionState::Attaching);
+    assert_eq!(h.core.state(), SessionState::Ready);
 }
 
 #[test]
@@ -1546,4 +1555,287 @@ fn credentials_warning_is_deduplicated_until_manual_recover() {
     assert_eq!(metas(&third), 0);
     assert_eq!(warns(&recover_effects) + warns(&third), 1);
     assert_eq!(metas(&recover_effects) + metas(&third), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 審查 F15（High，0a187c1）：attach 登入中收到 boot banner（quiet arm 令 fsm_gen 前進）後，該次 run 自己的
+// LoginFinished 仍須照 Python 套用（`_attach_by_id` 的 attach thread 照常寫終態）：NotReady → ATTACHED、
+// Ready → READY（confirm_ready）、Failed → drain 到 DETACHED；不得永久停在 ATTACHING、SessionAttach 回 ok。
+// ---------------------------------------------------------------------------
+
+fn attach_login_then_banner(h: &mut CoreHarness) -> (u64, u64) {
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    let run_gen = effs
+        .iter()
+        .find_map(|e| match e {
+            Effect::StartLogin { fsm_gen, .. } => Some(*fsm_gen),
+            _ => None,
+        })
+        .expect("bridge 開成後應發出 StartLogin");
+    h.rx(b"U-Boot 2024.01\r\n");
+    assert_ne!(h.core.generations().fsm_gen, run_gen, "banner 應 arm quiet 並使 fsm_gen 前進");
+    (h.epoch(), run_gen)
+}
+
+#[test]
+fn banner_during_attach_login_settles_attached() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, run_gen) = attach_login_then_banner(&mut h);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Attached);
+    let public = h.public();
+    assert_eq!(pget(&public, "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+    assert_ne!(h.core.generations().bridge_generation, 0, "bridge 已採用");
+    // 再一次 SessionAttach 不得在 ATTACHING 回 ok:true（走 ATTACHED 再探）。
+    let (resp, effs) = h.rpc_full(SessionRequest::SessionAttach);
+    if let Ok(resp) = resp {
+        let session = pget(&resp, "session");
+        if let PyValue::Dict(s) = session {
+            assert_ne!(pget(&s, "state"), PyValue::from("ATTACHING"));
+        }
+    }
+    let _ = effs;
+}
+
+#[test]
+fn banner_during_attach_login_ready_result_applied() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, run_gen) = attach_login_then_banner(&mut h);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(pget(&h.public(), "boot_quiet_remaining_s"), PyValue::Null, "confirm_ready 清 quiet");
+}
+
+#[test]
+fn banner_during_attach_login_failed_drains_detached() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, run_gen) = attach_login_then_banner(&mut h);
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: run_gen,
+        result: LoginOutcome::Failed("SHELL_PROMPT_TIMEOUT".into()),
+        after_rx_seq: None,
+    });
+    let (ep, stop) = begin_drain(&effs);
+    h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert_eq!(h.core.state(), SessionState::Detached);
+}
+
+#[test]
+fn recover_during_pending_attach_returns_reattach() {
+    // 審查 F29（8b8a40f）：Python `recover_session` 在 `bridge is None and by_id in devices` 時一律
+    // `{ok:true, recovering:false, action:REATTACH}`；`_spawn_attach` 對進行中的 attach 不重複開檔。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let effs = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })));
+    let (resp, effs) = h.rpc_full(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    let resp = resp.expect("RPC");
+    assert_eq!(pget(&resp, "ok"), PyValue::Bool(true), "{resp:?}");
+    assert_eq!(pget(&resp, "action"), PyValue::from("REATTACH"));
+    assert_eq!(pget(&resp, "recovering"), PyValue::Bool(false));
+    assert!(
+        !effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })),
+        "attach 進行中不得再發 OpenBridge"
+    );
+    assert_eq!(h.core.state(), SessionState::Attaching);
+}
+
+#[test]
+fn rx_window_resets_per_bridge() {
+    // 審查 F51（f20bdd0）：Python 每次 attach 新建 `UARTBridge`（`_rx_window` 空、`_rx_total_bytes=0`）。
+    // t=0 上一條連線收 20000 bytes，clear 後 1 s 內重接、新連線零 RX → 公開速率兩欄皆 0（不沿用上一條連線）。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let now = h.clock.mono_ns();
+    h.rx.append(&vec![b'x'; 20_000], now, h.epoch(), 1);
+    assert!(pget(&h.public(), "rx_bytes_last_10s").as_i64().is_some_and(|n| n >= 20_000));
+    let (_resp, effs) = h.rpc_deferred(SessionRequest::Clear);
+    let (ep, stop) = begin_drain(&effs);
+    let effs = h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert!(has_reattach(&effs), "clear 後交 manager 再解析");
+    let effs = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(effs.iter().any(|e| matches!(e, Effect::OpenBridge { .. })), "clear 後應重新開檔");
+    h.advance(Duration::from_secs(1));
+    let mut opened = h.opened_bridge(REAL_PATH);
+    opened.rx = sw_core::uart_bridge::RxShared::new(131_072, h.clock.mono_ns());
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Ok(opened),
+    });
+    let public = h.public();
+    assert_eq!(pget(&public, "rx_bytes_last_10s"), PyValue::from(0), "{public:?}");
+    assert_eq!(pget(&public, "rx_rate_bps"), PyValue::from(0));
+}
+
+fn has_reattach(effs: &[Effect]) -> bool {
+    effs.iter().any(|e| matches!(e, Effect::Reattach { .. }))
+}
+
+#[test]
+fn clear_without_bridge_with_device_reports_attaching_and_reattaches() {
+    // 審查 F61（High，73634db）：Python `clear_session` 無 bridge 分支：裝置在線 → 回應前活 session 即
+    // `state:"ATTACHING"`、`last_error:null`，再 `_spawn_attach`（開埠前走 `_reresolve_profile_on_reattach`）。
+    // 具體輸入：開埠 AccessDenied（ATTACH_FAILED:PermissionError、DETACHED、裝置仍在）→ `session.clear`。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    h.feed(ControlEvent::BridgeOpened {
+        epoch_hint: 0,
+        result: Err(OpenFailure::AccessDenied(HolderReport {
+            pids: Vec::new(),
+            holder_unknown: true,
+            status: sw_pal::proc_scan::HolderScanStatus::Unknown,
+        })),
+    });
+    assert_eq!(pget(&h.public(), "state"), PyValue::from("DETACHED"));
+    let (rx, effs) = h.rpc_deferred(SessionRequest::Clear);
+    let resp = rx.try_recv().expect("clear 應立即回覆").expect("ok");
+    let session = match resp.get("session") {
+        Some(PyValue::Dict(d)) => d.clone(),
+        other => panic!("缺 session：{other:?}"),
+    };
+    assert_eq!(session.get("state"), Some(&PyValue::from("ATTACHING")));
+    assert_eq!(session.get("last_error"), Some(&PyValue::Null));
+    assert!(has_reattach(&effs), "需交 manager 再解析後 attach");
+    assert!(!has_open_bridge(&effs), "再解析前不得直接開埠");
+    // manager 再解析後送 DeviceAttached：ATTACHING（等待再 attach）仍須接受並開埠。
+    let effs = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(has_open_bridge(&effs), "DeviceAttached 後應開埠");
+}
+
+#[test]
+fn clear_without_bridge_without_device_stays_detached_cleared() {
+    // Python `clear_session` 無 bridge 且裝置不在：`state:"DETACHED"`、`last_error:"CLEARED"`，不 `_spawn_attach`。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (rx, effs) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(rx.try_recv().expect("立即回覆").is_ok());
+    let s = h.public();
+    assert_eq!(pget(&s, "state"), PyValue::from("DETACHED"));
+    assert_eq!(pget(&s, "last_error"), PyValue::from("CLEARED"));
+    assert!(!has_reattach(&effs) && !has_open_bridge(&effs));
+}
+
+#[test]
+fn boot_quiet_survives_clear_drain_and_blocks_reattach_probe() {
+    // 審查 F63（High，73634db）：Python `boot_quiet_until`／`ready_reconfirm_pending` 掛在 SessionRuntime，
+    // drain 收尾（`_complete_drain` 只呼叫 `reset_reprobe_progress`）不清；新 bridge 由 `_push_tx_gate` 帶回 quiet。
+    // 具體輸入：READY shell session 收 `U-Boot 2024.01` → quiet armed → `session.clear` → 重新 attach。
+    // Python：重新 attach 期間 `boot_quiet_remaining_s` 非 null、不送登入 probe（ATTACHED＋PROMPT_UNAVAILABLE）。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.rx(b"U-Boot 2024.01\r\n");
+    assert_ne!(pget(&h.public(), "boot_quiet_remaining_s"), PyValue::Null);
+    let (_rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    let (ep, stop) = h.pending_stop();
+    h.feed(ControlEvent::WorkerStopped(receipt(ep, stop.0)));
+    assert_ne!(
+        pget(&h.public(), "boot_quiet_remaining_s"),
+        PyValue::Null,
+        "drain 不得清 boot quiet（manager 再解析以此判斷不偵測）"
+    );
+    assert_eq!(pget(&h.public(), "ready_reconfirm_pending"), PyValue::Bool(true));
+    h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    let effs = h.bridge_ok();
+    assert!(
+        !effs.iter().any(|e| matches!(
+            e,
+            Effect::StartLogin { plan, .. } if !matches!(plan, sw_core::login_fsm::LoginPlan::None)
+        )),
+        "quiet 中重新 attach 不得送登入 probe"
+    );
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+    assert!(h.fence.with(|f| f.quiet_active), "新 bridge 的 TX fence 須帶回 quiet");
+}
+
+fn ready_note(effs: &[Effect]) -> Option<bool> {
+    effs.iter().find_map(|e| match e {
+        Effect::Notify(ManagerNote::SessionReady { via_attach, .. }) => Some(*via_attach),
+        _ => None,
+    })
+}
+
+#[test]
+fn session_ready_note_marks_attach_run_only() {
+    // 審查 F65（Medium，73634db）：Python `_maybe_persist_sticky` 只在 `_attach_by_id_dynamic` 的 attach 本身到
+    // READY 時呼叫；reprobe（`session.attach` 於 ATTACHED）、passthrough 安靜升 READY、reboot recovery 不寫 sticky。
+    // core 以 `SessionReady.via_attach` 區分，manager 只對 true 寫 sticky。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    h.bridge_ok();
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(ready_note(&effs), Some(true), "attach run 到 READY");
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(None);
+    let (_resp, effs) = h.rpc_deferred(SessionRequest::SessionAttach);
+    assert!(has_start_login(&effs), "ATTACHED 再探應啟動登入 run");
+    let (epoch, fsm_gen) = (h.epoch(), h.core.generations().fsm_gen);
+    let effs = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(ready_note(&effs), Some(false), "reprobe 到 READY 不得標為 attach");
+}
+
+#[test]
+fn reprobe_plan_ignores_pending_auto_login() {
+    // 審查 F17（Medium，0a187c1）：Python `_probe_existing_bridge` 只依 `login_regex or console_unlock_env` 決定走
+    // 帳密／ensure_ready，不看 `pending_auto_login`（attach 失敗分支不清該旗標，ATTACHED 時可能為真）。
+    // 輸入：login_regex 為空白（config `or` 後 strip 成空字串）、宣告 user_env／pass_env 但未解析；ATTACHED 且
+    // pending_auto_login=true → `session.attach` 再探。Python：probe_ready；舊 Rust：CREDENTIALS_UNRESOLVED。
+    const PROFILE: &str = "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    login_regex: '  '\n    user_env: SW_T_U\n    pass_env: SW_T_P\n    env_file: /nonexistent/s21.env\n    timeout_s: 2.0\ntargets:\n  - {com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}\n";
+    let mut h = CoreHarness::new(PROFILE);
+    h.to_attached(None);
+    h.core.set_pending_auto_login_for_test(true);
+    let (_resp, effs) = h.rpc_deferred(SessionRequest::SessionAttach);
+    let plan = effs.iter().find_map(|e| match e {
+        Effect::StartLogin { plan, .. } => Some(plan.clone()),
+        _ => None,
+    });
+    assert!(
+        matches!(plan, Some(sw_core::login_fsm::LoginPlan::Probe)),
+        "再探應為 probe"
+    );
+    assert_ne!(pget(&h.public(), "last_error"), PyValue::from("CREDENTIALS_UNRESOLVED"));
 }

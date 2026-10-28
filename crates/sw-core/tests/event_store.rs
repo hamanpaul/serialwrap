@@ -345,7 +345,7 @@ fn upsert_rule_file_indent2_sorted_no_newline() {
     // Python 文字模式寫入：Windows 每個 `\n` 寫成 `\r\n`（審查 76de0cf_96b28dd c58e8d4-2）。
     assert_eq!(
         std::fs::read_to_string(d.path().join("o.n.json")).unwrap(),
-        expected.replace('\n', sw_pal::fs_ops::TEXT_NEWLINE)
+        expected.replace('\n', sw_pal::fs_ops::TEXT_NEWLINE_STR)
     );
     assert!(!d.path().join("o.n.json.tmp").exists());
 }

@@ -376,6 +376,20 @@ impl CommandRegistry {
         flushed
     }
 
+    /// 只供測試（test-fakes）：改寫命令紀錄的 `session_id`（模擬 rematerialize 後的舊 session_id；審查 F76）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_session_id_for_test(&self, cmd_id: &str, session_id: &str) {
+        if let Some(record) = self
+            .inner
+            .lock()
+            .expect("命令登錄表鎖 poisoned")
+            .records
+            .get_mut(cmd_id)
+        {
+            record.insert("session_id", PyValue::from(session_id));
+        }
+    }
+
     /// 取得命令紀錄副本。
     pub fn get(&self, cmd_id: &str) -> Option<PyDict> {
         self.inner

@@ -366,3 +366,83 @@ def test_two_daemons_same_tty(shell_daemon, slice21_daemon_factory, tmp_path):
     assert s["state"] != "READY"
     time.sleep(1.0)
     assert t.written()[snap:] == b"", "第二個 daemon 不得對同一 tty 送出任何 TX"
+
+
+# ---------------------------------------------------------------------------
+# 審查 F87（edfc741）：Review Focus 5 的 Python 基線實測（同連線 pipelining＋client 斷線）
+# ---------------------------------------------------------------------------
+
+
+def _recover_tx_payloads(d) -> list[bytes]:
+    import base64
+
+    return [
+        base64.b64decode(r.get("payload_b64") or "")
+        for r in d.wal_records()
+        if r.get("dir") == "TX" and "recover" in str(r.get("source") or "")
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UDS 寫入對端已關閉的 EPIPE 語意（POSIX）")
+def test_pipelined_stop_after_client_gone_not_processed(shell_daemon):
+    """同一連線依序送 `session.recover --force` 與 `daemon.stop` 後 client 立即關閉：
+
+    Python `rpc_posix.serve_connection` 先處理 recover（handler 不因斷線取消，救援 TX 照寫），
+    其回應 `write`／`drain` 對已關閉的對端失敗（無 except）→ 離開讀取迴圈，緩衝區中的 `daemon.stop` 不再被
+    `readline`：daemon 持續運作、socket 保留；之後由新連線 `daemon.stop` 才有序停機（exit 0）。
+    """
+    import json
+    import socket
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(shell_daemon.endpoint)
+    recover = {"id": 3, "method": "session.recover", "params": {"selector": "COM0", "force": True}}
+    stop = {"id": 4, "method": "daemon.stop", "params": {}}
+    sent_at = time.monotonic()
+    sock.sendall((json.dumps(recover) + "\n" + json.dumps(stop) + "\n").encode("utf-8"))
+    sock.close()
+
+    # Python 實測（假 DUT 對 Ctrl-C 立即回 prompt）：READY 路徑 `_recover_after_failure` 只送 `system:recover` 的
+    # `\x03`（prompt 已回，不再送 `\x04`）。
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline and not _recover_tx_payloads(shell_daemon):
+        time.sleep(0.2)
+    time.sleep(1.0)
+    assert _recover_tx_payloads(shell_daemon) == [b"\x03"], "recover handler 應照常寫出救援 TX"
+    # 超過 force recover 上限（10 s）＋餘裕後再判定：管線中的 stop 若於 handler 結束後才被處理，此處會已退出。
+    time.sleep(max(0.0, 11.0 - (time.monotonic() - sent_at)))
+    assert shell_daemon.proc.poll() is None, "管線中的 daemon.stop 不得被處理"
+    assert os.path.exists(shell_daemon.endpoint), "socket 檔應保留"
+    assert shell_daemon.rpc("health.status", {})["ok"] is True
+    records = shell_daemon.wal_records()
+    assert records, "WAL 應有紀錄"
+    assert shell_daemon.stop(timeout=15.0) == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UDS 端點（POSIX）")
+def test_daemon_stop_from_second_connection_during_force_recover(shell_daemon):
+    """審查 F87（Opus 修法）：force recover handler 進行中（DUT 暫停回應），由第二條連線送 `daemon.stop`：
+    daemon 於 15 s 內 exit 0、救援 TX 已在 WAL、WAL 每一行皆為完整 JSON（停機不在 handler 持有 session 時截斷 WAL）。"""
+    import json
+    import socket
+
+    shell_daemon.targets["COM0"].pause_responding(8.0)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(shell_daemon.endpoint)
+    try:
+        req = {"id": 3, "method": "session.recover", "params": {"selector": "COM0", "force": True}}
+        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        sock.close()  # client 斷線（handler 仍在跑）
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not _recover_tx_payloads(shell_daemon):
+            time.sleep(0.1)
+        assert _recover_tx_payloads(shell_daemon), "force recover 應已送出救援 TX"
+        started = time.monotonic()
+        rc = shell_daemon.stop(timeout=15.0)
+        assert rc == 0, (rc, time.monotonic() - started, shell_daemon._stderr_tail(4000))
+        assert time.monotonic() - started <= 15.0
+    finally:
+        sock.close()
+    records = shell_daemon.wal_records()  # 任一行不完整即 JSONDecodeError
+    assert records
+    assert not os.path.exists(shell_daemon.endpoint), "有序停機後 socket 檔應移除"

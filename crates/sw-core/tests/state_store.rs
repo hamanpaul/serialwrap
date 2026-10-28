@@ -759,3 +759,73 @@ fn alias_set_overwrites_in_place() {
         r#"{"session_id":"t:COM0","updated_at":"T9"}"#
     );
 }
+
+#[test]
+fn utf16_and_utf32_state_json_load_like_python() {
+    // 審查 F54（Medium，c96a91c）：Python `json.loads(bytes)` 以 `json.detect_encoding` 判斷 UTF-8／16／32
+    // （含 BOM 與無 BOM 的 NUL 樣式），UTF-16 改寫的 state.json 正常載入、RELEASED 保留、不產生 `.corrupt`。
+    let text = r#"{"released":{"t:COM0":{"by_id":"/dev/serial/by-id/X","released_by":"agent","released_at":"2026-10-21T00:00:00","reason":null}}}"#;
+    let utf16le_bom: Vec<u8> = [0xFFu8, 0xFE]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let utf16be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let utf32le: Vec<u8> = text.chars().flat_map(|c| (c as u32).to_le_bytes()).collect();
+    let utf32be_bom: Vec<u8> = [0x00u8, 0x00, 0xFE, 0xFF]
+        .into_iter()
+        .chain(text.chars().flat_map(|c| (c as u32).to_be_bytes()))
+        .collect();
+    for (name, bytes) in [
+        ("utf-16 BOM", utf16le_bom),
+        ("utf-16-be", utf16be),
+        ("utf-32-le", utf32le),
+        ("utf-32 BOM", utf32be_bom),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state.json");
+        std::fs::write(&p, &bytes).unwrap();
+        let (s, backup) = load(&p).unwrap_or_else(|e| panic!("{name}：{e:?}"));
+        assert!(backup.is_none(), "{name}：不得視為損毀");
+        assert!(s.released.contains_key("t:COM0"), "{name}：RELEASED 應保留");
+        assert!(!dir_names(d.path()).iter().any(|n| n.contains("corrupt")), "{name}");
+    }
+}
+
+#[test]
+fn double_bom_state_json_warning_matches_python() {
+    // 審查 F58（Low）：CPython `json.loads(bytes)` 解碼後不做 str 的 BOM 檢查，雙重 BOM → decoder
+    // `Expecting value: line 1 column 1 (char 0)`（實測），非 `Unexpected UTF-8 BOM`。
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("state.json");
+    std::fs::write(&p, b"\xef\xbb\xbf\xef\xbb\xbf{}").unwrap();
+    let warnings = std::cell::RefCell::new(Vec::new());
+    let (_s, backup) = sw_core::state_store::load_state_with_warn(&p, &*native_fs(), &|m| {
+        warnings.borrow_mut().push(m.to_string())
+    })
+    .unwrap();
+    assert!(backup.is_some());
+    let w = warnings.borrow();
+    assert!(
+        w.iter().any(|m| m.ends_with("：Expecting value: line 1 column 1 (char 0)")),
+        "{w:?}"
+    );
+}
+
+#[test]
+fn state_json_line_ending_follows_python_text_mode() {
+    // 審查 F55（Medium，c96a91c）：Python `_save_state` 以文字模式 `os.fdopen(fd, "w", encoding="utf-8")` 寫檔，
+    // Windows 上唯一的結構換行（尾端）為 `\r\n`、POSIX 為 `\n`（JSON 字串內換行一律跳脫，不受影響）。
+    let s = LoadedState::default();
+    let crlf = sw_core::state_store::serialize_state_with(&s, b"\r\n");
+    assert!(crlf.ends_with(b"}\r\n"), "{:?}", String::from_utf8_lossy(&crlf));
+    assert_eq!(crlf.iter().filter(|b| **b == b'\n').count(), 1);
+    let native = sw_core::state_store::serialize_state(&s);
+    assert!(native.ends_with(sw_pal::fs_ops::TEXT_NEWLINE));
+    let expected: &[u8] = if std::path::MAIN_SEPARATOR == '\\' { b"\r\n" } else { b"\n" };
+    assert_eq!(sw_pal::fs_ops::TEXT_NEWLINE, expected);
+    // 讀取端兩種皆接受。
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("state.json");
+    std::fs::write(&p, &crlf).unwrap();
+    assert!(load(&p).unwrap().1.is_none());
+}

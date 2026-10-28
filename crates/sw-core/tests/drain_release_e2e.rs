@@ -21,11 +21,16 @@ fn release_waits_for_receipt_and_aborts_partial_in_flight() {
     let cmd = h.submit_ok("sleep 20");
     h.wait_running(&cmd);
     wait_tx_in_flight(&h, base);
+    // 停住 IoWorker 的 close（回條送不出）：drain 確定停在 Phase 1，中間態可嚴格斷言（審查 F46）。
+    h.dev.pause_next_close();
     let pending = h.request_async(SessionRequest::Release { source: "agent:t".into(), reason: PyValue::from("r") });
-    std::thread::sleep(Duration::from_millis(20));
-    // actor 仍可回應；BlockUntilCancel 於 drain 一開始即被取消，20 ms 內 drain 可能已完成（見 commit 說明）。
-    let mid = h.get_state()["state"].clone();
-    assert!(mid == PyValue::from("RECOVERING") || mid == PyValue::from("RELEASED"), "drain 中狀態應為 RECOVERING（或已完成 RELEASED），實際 {mid:?}");
+    assert!(h.dev.wait_paused(Duration::from_secs(5)), "IoWorker 應已進入 close");
+    let mid = h.get_state();
+    assert_eq!(mid["state"], PyValue::from("RECOVERING"), "drain 中狀態應為 RECOVERING");
+    assert_eq!(mid["last_error"], PyValue::from("RELEASED"));     // Python `_begin_drain_locked` Phase 1（F41）
+    assert_eq!(mid["foreground_busy"], PyValue::Bool(false));
+    assert!(pending.try_recv().is_err(), "release 應仍在等回條");
+    h.dev.release_pause();
     let resp = pending.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
     assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)));
     assert_eq!(resp.get("aborted_cmd"), Some(&PyValue::Bool(true)));
@@ -44,12 +49,16 @@ fn drain_timeout_marks_stalled_and_release_reports_drain_stalled() {
     let base = h.dev.os_submits();
     let cmd = h.submit_ok("x"); h.wait_running(&cmd);
     wait_tx_in_flight(&h, base);
+    let generation = h.get_state()["bridge_generation"].clone();
     let pending = h.request_async(SessionRequest::Release { source: "cli".into(), reason: PyValue::Null });
     h.wait_state("RECOVERING");                                                // drain timer 已排程後才推進時鐘
     h.clock.advance(Duration::from_millis(3001));                              // FakeClock::subscribe 立即喚醒 actor
     let resp = pending.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    assert_eq!(resp.get("ok"), Some(&PyValue::Bool(false)));                   // 審查 F47
     assert_eq!(resp.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")));        // OD-14 #4
     assert_eq!(resp.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(resp.get("drain_timeout_epoch"), Some(&generation));            // Python `job.epoch`
+    assert_eq!(h.get_state()["state"], PyValue::from("RECOVERING"));
     assert_eq!(h.dev.open_count(), 1, "no reopen while stalled");
     h.dev.release_block();                                                     // 回條遲到
     h.wait_state("RELEASED");
@@ -122,6 +131,44 @@ fn in_flight_unknown_is_send_failed_no_resend() {
     assert_eq!(h.dev.write_calls(), writes, "release 後不得重送");
 }
 
+/// 審查 F44：release 時命令仍在途、writer 於 cancel 後才回 `Unknown { confirmed: 0 }` → `aborted_cmd:true`、
+/// 命令 `SEND_FAILED`（Python `_map_aborted_result` confirmed 0＋unknown），重新 attach 後不重送。
+#[test]
+fn in_flight_unknown_during_drain_is_send_failed_no_resend() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::BlockUntilCancelThenUnknown {
+        confirmed: 0,
+        error: PalError::io(5, "Input/output error"),
+    }]);
+    let base = h.dev.os_submits();
+    let cmd = h.submit_ok("sleep 20");
+    h.wait_running(&cmd);
+    wait_tx_in_flight(&h, base);
+    assert_eq!(h.command_get(&cmd)["status"], PyValue::from("running"));
+    let resp = h
+        .request_async(release_cli())
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)), "{resp:?}");
+    assert_eq!(resp.get("aborted_cmd"), Some(&PyValue::Bool(true)));
+    let rec = h.wait_done(&cmd);
+    assert_eq!(rec["status"], PyValue::from("error"));
+    assert_eq!(rec["error_code"], PyValue::from("SEND_FAILED"));
+    h.wait_state("RELEASED");
+    rearm_login_reply(&h);
+    let attach = h.request(SessionRequest::DeviceAttach { force: false });
+    assert_eq!(attach.get("ok"), Some(&PyValue::Bool(true)), "{attach:?}");
+    h.wait_state("READY");
+    std::thread::sleep(Duration::from_millis(50));
+    let tx = h.dev.take_tx();
+    assert!(
+        !tx.windows(b"sleep 20".len()).any(|w| w == b"sleep 20"),
+        "重新 attach 後不得重送：{:?}",
+        String::from_utf8_lossy(&tx)
+    );
+}
+
 /// drain 期間 WAL 不可寫 → release 仍完成、WAL 不健康、stderr WARNING 列出未落盤證據。
 #[test]
 fn wal_unwritable_does_not_block_close_but_lists_gap() {
@@ -161,6 +208,7 @@ fn close_failure_keeps_recovering_and_no_success() {
     assert_eq!(resp.get("ok"), Some(&PyValue::Bool(false)), "{resp:?}");
     assert_eq!(resp.get("error_code"), Some(&PyValue::from("DRAIN_STALLED")));
     assert_eq!(resp.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    assert_eq!(resp.get("drain_timeout_epoch"), Some(&h.get_state()["bridge_generation"])); // 審查 F47
     let s = h.get_state();
     assert_eq!(s["state"], PyValue::from("RECOVERING"));
     assert_eq!(s["drain_stalled"], PyValue::Bool(true));

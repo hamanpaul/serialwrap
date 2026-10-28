@@ -85,20 +85,22 @@ fn open_append_error_message_has_quoted_path() {
 #[test]
 fn create_truncate_text_uses_platform_newline() {
     // 審查 76de0cf_96b28dd c58e8d4-2：Python `open(p, "w")` 文字模式在 Windows 把 `\n` 寫成 `\r\n`。
-    use sw_pal::fs_ops::{text_mode_bytes, TEXT_NEWLINE};
+    use sw_pal::fs_ops::{text_mode_bytes, TEXT_NEWLINE, TEXT_NEWLINE_STR};
     let fs = sw_pal::native().fs;
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("r.json.tmp");
     std::fs::write(&p, b"stale-longer-content").unwrap();
     fs.create_truncate_text(&p, "{\n  \"a\": 1\n}").unwrap();
-    let want = format!("{{{TEXT_NEWLINE}  \"a\": 1{TEXT_NEWLINE}}}");
+    let want = format!("{{{TEXT_NEWLINE_STR}  \"a\": 1{TEXT_NEWLINE_STR}}}");
     assert_eq!(std::fs::read(&p).unwrap(), want.as_bytes());
     assert_eq!(
         text_mode_bytes("x\ny"),
-        format!("x{TEXT_NEWLINE}y").into_bytes()
+        format!("x{TEXT_NEWLINE_STR}y").into_bytes()
     );
     #[cfg(windows)]
-    assert_eq!(TEXT_NEWLINE, "\r\n");
+    assert_eq!(TEXT_NEWLINE_STR, "\r\n");
     #[cfg(not(windows))]
-    assert_eq!(TEXT_NEWLINE, "\n");
+    assert_eq!(TEXT_NEWLINE_STR, "\n");
+    // merge P5 47c7b25：位元組形與字串形同值。
+    assert_eq!(TEXT_NEWLINE, TEXT_NEWLINE_STR.as_bytes());
 }

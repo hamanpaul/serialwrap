@@ -484,7 +484,9 @@ impl TtyOpenOps for PosixOpenOps<'_> {
     }
 
     fn probe_holders(&mut self) -> HolderReport {
-        let report = finalize_holder_report(self.excl.probe_holders(&self.path));
+        // 回傳 probe 原值（不 finalize）：open／flock 衝突路徑已在 `open_error`／`open_sequence` 自行 finalize，
+        // 鎖後重掃沿用 probe 本身的 holder_unknown 規則（parity-amendments-2026-10-26 #64；審查 F03）。
+        let report = self.excl.probe_holders(&self.path);
         self.last_probe = Some(report.clone());
         report
     }
@@ -840,6 +842,17 @@ struct PosixCloseToken {
 }
 
 impl CloseImpl for PosixCloseToken {
+    fn configure(&self, cfg: &SerialConfig) -> PalResult<()> {
+        let close = self
+            .close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(fd) = close.fd else {
+            return Err(PalError::from_errno(libc::EBADF));
+        };
+        apply_termios(fd, cfg).map_err(PalError::from_errno)
+    }
+
     fn is_alive(&self) -> bool {
         let close = self
             .close
@@ -1011,11 +1024,10 @@ impl SerialReader for PosixSerialReader {
                 return Ok(ReadOutcome::TimedOut);
             }
             if rc < 0 {
-                let code = errno();
-                if code == libc::EINTR {
-                    continue;
+                match poll_failure(errno()) {
+                    None => continue,
+                    Some(error) => return Err(error),
                 }
-                return Err(ReadError::Wait(PalError::from_errno(code)));
             }
             if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 drain_fd(self.wake_fd, self.wake_eventfd);
@@ -1167,6 +1179,16 @@ fn remaining_timeout_ms(start: Instant, timeout: Option<Duration>) -> Option<i32
     let millis = remaining.as_millis();
     let rounded = millis + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
     Some(rounded.clamp(1, i32::MAX as u128) as i32)
+}
+
+/// `poll` 回 `-1` 的分類（#59；Python `uart_io.py` `select` 失敗 → `SELECT:<errno>`）：`EINTR` 重試（`None`），
+/// 其餘一律是**等待**失敗 `ReadError::Wait`（reader 回報 `SELECT:<errno>`），不得與 `read` 失敗
+/// （`SERIAL_READ:<errno>`）混用（審查 F08）。
+fn poll_failure(code: i32) -> Option<ReadError> {
+    if code == libc::EINTR {
+        return None;
+    }
+    Some(ReadError::Wait(PalError::from_errno(code)))
 }
 
 fn classify_read_result(
@@ -1420,6 +1442,18 @@ mod tests {
     }
 
     #[test]
+    fn poll_rc_negative_is_wait_error_not_read_error() {
+        // 審查 F08：`poll` 失敗臂（rc<0、非 EINTR）必須是 Wait（→ `SELECT:<errno>`）；EINTR 重試。
+        assert!(poll_failure(libc::EINTR).is_none());
+        for code in [libc::EINVAL, libc::ENOMEM, libc::EFAULT] {
+            match poll_failure(code) {
+                Some(ReadError::Wait(error)) => assert_eq!(error.os_code, Some(code)),
+                other => panic!("poll 失敗 errno={code} 應為 ReadError::Wait，得到 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn write_retries_eintr_without_losing_result() {
         let mut attempts = 0;
         let mut results = [Err(libc::EINTR), Ok(4isize)].into_iter();
@@ -1571,9 +1605,23 @@ mod tests {
         assert!(!rep.holder_unknown);
     }
 
+    /// 測內暫存檔當 tty 替身：目標 `stat` 一定成功，結果不再取決於主機有無 `/dev/pts/9`（審查 F01）。
+    fn temp_tty(tmp: &Path) -> String {
+        let tty = tmp.join("tty9");
+        std::fs::write(&tty, b"").expect("tty 替身");
+        tty.to_string_lossy().into_owned()
+    }
+
     #[test]
     fn holder_scan_unreadable_proc_is_unknown() {
-        let rep = probe_holders_in(Path::new("/nonexistent/serialwrap-s21-proc"), "/dev/pts/9");
+        // Python `probe_holders`：`os.listdir(<proc>/<pid>/fd)` 的非 PermissionError OSError → status
+        // "unknown"；pids 空 → holder_unknown。此處 fd 為一般檔案（listdir → ENOTDIR）。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tty = temp_tty(tmp.path());
+        let root = tmp.path().join("proc");
+        std::fs::create_dir_all(root.join("123")).expect("mkdir pid");
+        std::fs::write(root.join("123").join("fd"), b"").expect("fd 為一般檔");
+        let rep = probe_holders_in(&root, &tty);
         assert_eq!(
             rep,
             HolderReport {
@@ -1585,18 +1633,38 @@ mod tests {
     }
 
     #[test]
-    fn holder_scan_permission() {
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("EVIDENCE_MISSING: root 下 chmod 000 無效，本案例證據不足");
-            return;
-        }
+    fn holder_scan_missing_proc_root_is_permission() {
+        // Python `probe_holders`：目標 stat 成功後 `os.listdir(proc_root)` 的任何 OSError 皆回 "permission"
+        // （parity-amendments-2026-10-26 #64；舊版期望 Unknown 與 Python 相反）。
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        make_fd_link(root, 123, "/dev/pts/9");
+        let tty = temp_tty(tmp.path());
+        let rep = probe_holders_in(&tmp.path().join("no-such-proc"), &tty);
+        assert_eq!(
+            rep,
+            HolderReport {
+                pids: vec![],
+                holder_unknown: true,
+                status: HolderScanStatus::Permission,
+            }
+        );
+    }
+
+    #[test]
+    fn holder_scan_permission() {
+        // root 下 chmod 000 無效：證據不足即 FAIL，不得以 return 計為 PASS（審查 F01／F81）。
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "證據不足：root 下 chmod 000 無效，須以非 root 執行"
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tty = temp_tty(tmp.path());
+        let root = tmp.path().join("proc");
+        make_fd_link(&root, 123, &tty);
         let fd_dir = root.join("123").join("fd");
         std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o000))
             .expect("chmod 000");
-        let rep = probe_holders_in(root, "/dev/pts/9");
+        let rep = probe_holders_in(&root, &tty);
         // 還原權限，讓 tempdir 可被清除
         let _ = std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755));
         assert_eq!(rep.status, HolderScanStatus::Permission);

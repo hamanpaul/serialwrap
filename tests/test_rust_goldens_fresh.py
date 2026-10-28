@@ -34,6 +34,8 @@ GENERATORS = [
     ("gen_shlex.py", "shlex_split.tsv"),
     # P7 Task 3 上游補件（P3 缺口）：sw_proto::pyre::escape
     ("gen_pyre_escape.py", "pyre_escape.tsv"),
+    # 審查 F84（P5-T19）：SC-19 壞 config.yaml 例外類別（permission 列於 root 時以 setpriv 降權）。
+    ("gen_allowlist_unreadable_config.py", "allowlist_unreadable_config.tsv"),
 ]
 
 

@@ -3,7 +3,7 @@
 //! `EvidenceGap` 為 Task 12 的型別，因 `TxOpLedger` 先需要而定義於此。
 
 use std::cell::Cell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
@@ -90,7 +90,7 @@ pub struct FenceState {
     pub reconfirm_pending: bool,
     pub flash_mode: FlashMode,
     pub wal_unhealthy: bool,
-    pub cancelled: HashSet<OpId>,
+    pub cancelled: CancelledOps,
     pub in_flight: Option<InFlight>,
     /// P6 增補 #4（07 D-03）：human admission 關閉（前景操作期間）；HumanRaw 被擋為 `HumanAdmissionClosed`。
     pub human_admission_blocked: bool,
@@ -100,6 +100,45 @@ pub struct FenceState {
     pub replay_auth: Option<u64>,
     /// P7 Task 16-wire：SessionCore 發布的 `foreground_busy`（`BridgeQueries::active_cmd_id_for` 不經 actor mailbox 讀取）。
     pub foreground_busy: bool,
+    /// 前景 reboot 命令的 op（#55）：其 Command TX 已提交（confirmed>0）或結果不明時，TxWriter 在記錄結果的同一次
+    /// `Fence::with` 內設 `quiet_active`／`reconfirm_pending` 並清除本欄——對齊 Python `_handle_reboot_command` 在
+    /// `_write_lock` 內 arm，下一個 TX job 的出列檢查前 quiet 已生效（審查 F14）。actor 之後只同步 `QuietState`／世代。
+    pub reboot_arm_op: Option<OpId>,
+}
+
+/// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
+pub const CANCELLED_OPS_MAX: usize = 512;
+
+/// 已撤銷的 op（Python `UARTBridge._revoked_ops` 的 `OrderedDict`）：上限 [`CANCELLED_OPS_MAX`]、FIFO 淘汰最舊；
+/// 重複撤銷既有 id 時移到最新（`pop` 後重新插入）。
+#[derive(Debug, Default)]
+pub struct CancelledOps(indexmap::IndexSet<OpId>);
+
+impl CancelledOps {
+    /// 登記撤銷（Python `_revoke_ops_locked` 的單一 id 步驟）。
+    pub fn insert(&mut self, op: OpId) {
+        self.0.shift_remove(&op);
+        self.0.insert(op);
+        while self.0.len() > CANCELLED_OPS_MAX {
+            self.0.shift_remove_index(0);
+        }
+    }
+
+    pub fn contains(&self, op: &OpId) -> bool {
+        self.0.contains(op)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +160,13 @@ pub enum FenceReject {
     ReplayRevoked,
 }
 
+impl FenceState {
+    /// 撤銷 tombstone 數（測試觀察上限用）。
+    pub fn cancelled_len(&self) -> usize {
+        self.cancelled.len()
+    }
+}
+
 pub struct Fence(Mutex<FenceState>);
 
 impl Fence {
@@ -135,13 +181,24 @@ impl Fence {
             reconfirm_pending: false,
             flash_mode: FlashMode::Off,
             wal_unhealthy: false,
-            cancelled: HashSet::new(),
+            cancelled: CancelledOps::default(),
             in_flight: None,
             human_admission_blocked: false,
             input_epoch: 0,
             replay_auth: None,
             foreground_busy: false,
+            reboot_arm_op: None,
         })))
+    }
+
+    /// 撤銷 op（Python `UARTBridge.revoke_ops`）：之後以這些 op 提交的 TX 一律 `Cancelled`、零 TX；
+    /// 已在 gate 外等待的寫入，下一次 `gate.submit` 重驗即拒絕尾段（#52）。
+    pub fn revoke_ops(&self, ops: &[OpId]) {
+        self.with(|state| {
+            for op in ops {
+                state.cancelled.insert(*op);
+            }
+        });
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut FenceState) -> R) -> R {
@@ -449,6 +506,27 @@ struct TxWriter {
     gauge: Arc<LedgerGaugeCells>,
 }
 
+/// 0 byte 即中止的寫入（`Completed(0)`、無 fence 拒絕原因，PAL 於提交前檢查到 cancel）重驗授權後的收斂：
+/// fence 已拒絕（drain 先凍結再 cancel）→ `NotSubmitted`＋該原因，對齊 Python 提交點的 `_tx_frozen` 檢查
+/// （`TxIncompleteError("not_submitted", 0, N, "draining")`）；否則原樣保留（審查 F92：self-test 與 release 競態下
+/// 曾回 `tx incomplete: completed 0/23 [Errno 125] Operation canceled`，與 golden `not_submitted … draining` 不符）。
+pub fn reclassify_unsubmitted(
+    result: TxResult,
+    reject: Option<FenceReject>,
+    recheck: Result<(), FenceReject>,
+) -> (TxResult, Option<FenceReject>) {
+    match (&result.outcome, reject, recheck) {
+        (TxOutcome::Completed(0), None, Err(reason)) => (
+            TxResult {
+                outcome: TxOutcome::NotSubmitted,
+                error: None,
+            },
+            Some(reason),
+        ),
+        _ => (result, reject),
+    }
+}
+
 impl TxWriter {
     fn publish_gauge(&self, ledger: &TxLedger) {
         self.gauge.publish(ledger);
@@ -527,11 +605,26 @@ impl TxWriter {
                         last_reject: Cell::new(None),
                     };
                     let result = self.writer.write_gated(&job.payload, &self.cancel, &gate);
+                    // 0 byte 即被 cancel（drain 先凍結 fence 再 cancel）時，重驗授權並以 fence 原因收斂。
+                    let recheck = self.fence.with(|state| Fence::admit(state, &job.permit));
+                    let (result, reject) =
+                        reclassify_unsubmitted(result, gate.last_reject.get(), recheck);
+                    gate.last_reject.set(reject);
+                    let submitted = confirmed_bytes(&result.outcome) > 0
+                        || matches!(result.outcome, TxOutcome::Unknown { .. });
                     self.fence.with(|state| {
                         if state.in_flight.as_ref().map(|flight| flight.op_id)
                             == Some(job.permit.op_id)
                         {
                             state.in_flight = None;
+                        }
+                        if submitted
+                            && job.permit.class == TxClass::Command
+                            && state.reboot_arm_op == Some(job.permit.op_id)
+                        {
+                            state.reboot_arm_op = None;
+                            state.quiet_active = true;
+                            state.reconfirm_pending = true;
                         }
                     });
                     (result, gate.last_reject.get())

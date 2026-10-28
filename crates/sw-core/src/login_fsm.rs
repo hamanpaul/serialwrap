@@ -5,9 +5,10 @@
 //! - `probe_ready`／`ensure_ready`／`detect_template`：在 OpRunner（或測試 executor）thread 執行；TX 一律經
 //!   `LoginIo.tx`（TxWriter，class 由呼叫端以 `LoginIo.class` 決定），RX 比對整個 RX 視窗（Python
 //!   `wait_for_regex` 語意，SES-16.6-05 KEEP），等待可經 `LoginIo.cancel` 取消（SC-30）。
-//! - TX 回報對應（§11.3 不得自動重送）：fence 拒絕 → `Aborted(Refused)`；未提交且無拒絕 → `Aborted(Cancelled)`；
-//!   部分寫出或結果不明 → `Aborted(TxIncomplete)`；之後一律不再呼叫 `tx`。Python 會拋例外處（無效 regex）
-//!   → `Raised("error")`。
+//! - TX 回報對應（§11.3 不得自動重送）：quiet／較新 login run 的 fence 拒絕（`_login_tx_refused`）→
+//!   `Aborted(Refused)`；未提交且無拒絕 → `Aborted(Cancelled)`；其餘拒絕、部分寫出或結果不明 → `Raised`
+//!   （P5 F16 `classify_login_tx_failure`：類別名與 `str(exc)`）；之後一律不再呼叫 `tx`。Python 會拋例外處
+//!   （無效 regex）→ `Raised { exc: "error", .. }`。
 //! - console unlock 的 INFO log 依 GAP-G-01 不輸出。
 
 use std::sync::Arc;
@@ -48,10 +49,14 @@ pub enum LoginOutcome {
     NotReady(String),
     /// `ensure_ready` 失敗：attach 路徑 → drain（`LoginFailed`），既有 bridge 路徑 → ATTACHED。
     Failed(String),
-    /// P7 Task 3：TX 被拒／取消／結果不完整，之後零 TX。
+    /// P7 Task 3：TX 被拒（quiet／較新 login run：Python `_login_tx_refused` 為真）或取消，之後零 TX。
     Aborted(LoginAbort),
-    /// P7 Task 3：Python 會拋例外處（無效 regex → `"error"`），值為例外型別名。
-    Raised(String),
+    /// TX 未完整提交且不是 quiet／較新 login run 的拒絕（Python `_login_tx_refused` 為假 → 例外上拋；審查 F16），
+    /// 或 Python 會拋例外處（無效 regex → `exc == "error"`）：`exc` 為 Python 例外類別名
+    /// （`WalUnavailableError`／`TxUnknownError`／`TxIncompleteError`／`error`…），`message` 為 `str(exc)`。
+    /// attach 路徑 → DETACHED＋`ATTACH_FAILED:<exc>`；既有 bridge 再探 → RPC `EXCEPTION`、state 不變；
+    /// reboot recovery → `RECOVERY_ERROR`。
+    Raised { exc: String, message: String },
 }
 
 /// `LoginOutcome::Aborted` 的原因。
@@ -59,6 +64,7 @@ pub enum LoginOutcome {
 pub enum LoginAbort {
     Refused(FenceReject),
     Cancelled,
+    /// 保留給收斂表（08 Task 7）；merge P5 F16 後 login FSM 對部分寫出／結果不明改回 `Raised`（帶 `str(exc)`）。
     TxIncomplete,
 }
 
@@ -339,6 +345,7 @@ pub fn login_tx_sender(
             payload: payload.to_vec(),
             reply,
         };
+        // TxWriter 已關閉（drain／shutdown）：等同 fence 凍結（Python `_tx_frozen` → `draining`）。
         let not_submitted = TxReport {
             op_id,
             epoch,
@@ -347,7 +354,7 @@ pub fn login_tx_sender(
                 error: None,
             },
             wal: None,
-            reject: None,
+            reject: Some(FenceReject::Frozen),
         };
         if handle.jobs.send(job).is_err() {
             return not_submitted;
@@ -405,11 +412,61 @@ fn secs(s: f64) -> Duration {
 }
 
 fn compile_or_raise(pattern: &str) -> Step<PyRegex> {
-    compile(pattern, PyFlags(0)).map_err(|_| LoginOutcome::Raised("error".to_string()))
+    compile(pattern, PyFlags(0)).map_err(|err| compile_raised(&err))
+}
+
+/// `re.compile` 失敗的 Python 例外（類別名、`str(exc)`）：`re.error` 的類別名為 `error`。
+fn compile_raised(err: &sw_proto::pyre::CompileError) -> LoginOutcome {
+    use sw_proto::pyre::CompileError;
+    let (exc, message) = match err {
+        CompileError::Re(e) if e.value_error => ("ValueError", e.to_string()),
+        CompileError::Re(e) => ("error", e.to_string()),
+        CompileError::Recursion => ("RecursionError", "maximum recursion depth exceeded".to_string()),
+        CompileError::Overflow(m) => ("OverflowError", m.clone()),
+        CompileError::Untranslatable(m) => ("error", m.clone()),
+    };
+    LoginOutcome::Raised {
+        exc: exc.to_string(),
+        message,
+    }
 }
 
 fn search_or_raise(pattern: &str, text: &str) -> Step<bool> {
     Ok(compile_or_raise(pattern)?.search(text).is_some())
+}
+
+/// 登入 TX 未完整提交（Python `send_command` 拋 `TxIncompleteError` 家族）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TxFail {
+    /// `_login_tx_refused` 為真（fence 以 quiet 或較新 login run 拒絕）→ `PROMPT_UNAVAILABLE`，不精煉。
+    Refused,
+    /// 其餘拒絕、結果不明或部分寫出：例外上拋（類別名與 `str(exc)`）。
+    Raised { exc: &'static str, message: String },
+}
+
+/// 依 Python `_login_tx_refused` 與 `UARTBridge._send_locked` 分類登入 TX 失敗（審查 F16）：
+/// - `Quiet`／`ReconfirmPending`（`quiet`）、`FsmMismatch`（`stale_login_gen`）→ [`TxFail::Refused`]；
+/// - `WalUnhealthy` → `WalUnavailableError("tx incomplete: not_submitted 0/N WAL_UNHEALTHY")`（系統 TX 於寫前拒絕）；
+/// - `Unknown` → `TxUnknownError`；其餘拒絕（draining／stale_generation／cancelled／flashing…）與部分寫出 →
+///   `TxIncompleteError`；訊息皆為 `tx incomplete: {outcome} {confirmed}/{requested} {error}`。
+pub fn classify_login_tx_failure(report: &TxReport, requested: usize) -> TxFail {
+    match report.reject {
+        Some(FenceReject::Quiet | FenceReject::ReconfirmPending | FenceReject::FsmMismatch) => {
+            TxFail::Refused
+        }
+        Some(FenceReject::WalUnhealthy) => TxFail::Raised {
+            exc: "WalUnavailableError",
+            message: format!("tx incomplete: not_submitted 0/{requested} WAL_UNHEALTHY"),
+        },
+        _ => TxFail::Raised {
+            exc: if matches!(report.result.outcome, TxOutcome::Unknown { .. }) {
+                "TxUnknownError"
+            } else {
+                "TxIncompleteError"
+            },
+            message: crate::op_runner::tx_incomplete_message(report, requested),
+        },
+    }
 }
 
 fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Step<()> {
@@ -418,16 +475,23 @@ fn send(io: &LoginIo, payload: &str, source: &str, log: bool) -> Step<()> {
         bytes.push(b'\n');
     }
     let report = (io.tx)(&bytes, io.class, source, log);
-    if let Some(reject) = report.reject {
-        return Err(LoginOutcome::Aborted(LoginAbort::Refused(reject)));
-    }
     match report.result.outcome {
-        TxOutcome::Completed(n) if n >= bytes.len() => Ok(()),
-        TxOutcome::NotSubmitted => Err(LoginOutcome::Aborted(LoginAbort::Cancelled)),
-        TxOutcome::Completed(_) | TxOutcome::Unknown { .. } => {
-            Err(LoginOutcome::Aborted(LoginAbort::TxIncomplete))
+        TxOutcome::Completed(n) if n >= bytes.len() => return Ok(()),
+        // 未提交且無 fence 原因：run 被取消（SC-30 RunCancel）。
+        TxOutcome::NotSubmitted if report.reject.is_none() => {
+            return Err(LoginOutcome::Aborted(LoginAbort::Cancelled));
         }
+        _ => {}
     }
+    Err(match classify_login_tx_failure(&report, bytes.len()) {
+        TxFail::Refused => LoginOutcome::Aborted(LoginAbort::Refused(
+            report.reject.unwrap_or(FenceReject::Quiet),
+        )),
+        TxFail::Raised { exc, message } => LoginOutcome::Raised {
+            exc: exc.to_string(),
+            message,
+        },
+    })
 }
 
 fn send_command(io: &LoginIo, cmd: &str) -> Step<()> {

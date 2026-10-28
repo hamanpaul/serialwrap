@@ -43,8 +43,12 @@ pub struct ActorLatencyProbe {
 struct ProbeInner {
     streak: u64,
     data_items: u64,
-    log: Vec<ProbeEntry>,
+    log: std::collections::VecDeque<ProbeEntry>,
 }
+
+/// 探針紀錄上限：超過即丟最舊（長跑的 test-fakes daemon 不無限累積；審查 F49）。
+#[cfg(feature = "test-fakes")]
+pub const PROBE_LOG_MAX: usize = 4096;
 
 /// 單一非 data 事件的延遲紀錄。
 #[cfg(feature = "test-fakes")]
@@ -85,11 +89,30 @@ impl ActorLatencyProbe {
     fn before_other(&self, label: &'static str, data_backlog: usize) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let data_while_waiting = std::mem::take(&mut g.streak);
-        g.log.push(ProbeEntry {
+        if g.log.len() >= PROBE_LOG_MAX {
+            g.log.pop_front();
+        }
+        g.log.push_back(ProbeEntry {
             label,
             data_while_waiting,
             data_backlog,
         });
+    }
+}
+
+#[cfg(all(test, feature = "test-fakes"))]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn probe_log_is_bounded_and_keeps_newest() {
+        let probe = ActorLatencyProbe::default();
+        for _ in 0..PROBE_LOG_MAX + 10 {
+            probe.before_other("Tick", 0);
+        }
+        probe.before_other("Release", 7);
+        assert_eq!(probe.entries("Tick").len(), PROBE_LOG_MAX - 1);
+        assert_eq!(probe.entries("Release")[0].data_backlog, 7);
     }
 }
 
@@ -328,6 +351,8 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
         MailboxItem::Control(ControlEvent::DeviceAttached { .. }) => (None, "DeviceAttached"),
         MailboxItem::Control(ControlEvent::DeviceDetached { .. }) => (None, "DeviceDetached"),
+        MailboxItem::Control(ControlEvent::DeviceMissing) => (None, "DeviceMissing"),
+        MailboxItem::Control(ControlEvent::EvictCapture { .. }) => (None, "EvictCapture"),
         MailboxItem::Control(ControlEvent::ConsoleCountChanged { .. }) => {
             (None, "ConsoleCountChanged")
         }

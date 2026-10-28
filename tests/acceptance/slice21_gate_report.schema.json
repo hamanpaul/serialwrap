@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "serialwrap/tests/acceptance/slice21_gate_report.schema.json",
+  "title": "Slice 2.1 出口 gate 報告（P5-T22）",
+  "description": "scripts/rust/slice21_gate.sh 產出的 target/slice21-gate/<run_id>/report.json。section 狀態與 verdict 一律由 scripts/rust/slice21_gate_judge.py 重算；BLOCKED-OWNER 項目永不為 PASS，本環境永不輸出 PASS 作為 Slice 出口（R5-F3：已移除計數門檻 expected_min_passed）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "started_at", "git_revision", "slice", "identity", "sections",
+               "case_uptake", "pending_decisions", "blocked_owner", "parity_amendments", "verdict"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "minLength": 1},
+    "started_at": {"type": "string", "description": "ISO8601"},
+    "git_revision": {"type": "string", "pattern": "^([0-9a-f]{40}|unknown)$"},
+    "slice": {"const": "2.1"},
+    "dry_run": {"type": "boolean"},
+    "preflight": {
+      "type": "object",
+      "description": "§5.3 開工前凍結檢查（event_latency freeze_status、reviewed_by／reviewed_at／review_conclusion、無 pending_owner_decision）。",
+      "required": ["event_latency_frozen", "reasons"],
+      "properties": {
+        "event_latency_frozen": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "required": ["cli_path", "cli_sha256", "daemon_implementation", "daemon_version", "daemon_artifact_id",
+                   "daemon_sha256", "contracts_revision", "cases_lock_sha256", "freeze_file_sha256",
+                   "tool_revision", "platform", "device"],
+      "properties": {
+        "cli_path": {"type": ["string", "null"]},
+        "cli_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "daemon_implementation": {"enum": ["rust", "python", null]},
+        "daemon_version": {"type": ["string", "null"]},
+        "daemon_artifact_id": {"type": ["string", "null"]},
+        "daemon_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "contracts_revision": {"type": ["string", "null"]},
+        "cases_lock_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "freeze_file_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "tool_revision": {
+          "type": "object",
+          "required": ["uart_stdio_bridge_tree_sha256", "runner_sha256"],
+          "properties": {
+            "uart_stdio_bridge_tree_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+            "runner_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "platform": {
+          "type": "object",
+          "required": ["os", "kernel", "arch"],
+          "properties": {"os": {"type": "string"}, "kernel": {"type": "string"}, "arch": {"type": "string"}}
+        },
+        "device": {"type": ["string", "null"]}
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status", "command", "exit", "passed", "failed", "skipped", "deselected", "ignored",
+                     "required_set", "l1_results", "l1_verdict", "allowed_missing_bo", "log"],
+        "properties": {
+          "name": {"enum": ["linux_l1", "linux_cap_posix_pty", "windows_native_l1", "windows_cap_windows_com",
+                            "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency",
+                            "wal_s1w_perf", "cfg_boundary", "pytest_full", "policy_check", "case_uptake"]},
+          "status": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"]},
+          "command": {"type": "string"},
+          "exit": {"type": ["integer", "null"]},
+          "passed": {"type": "integer", "minimum": 0},
+          "failed": {"type": "integer", "minimum": 0},
+          "skipped": {"type": "integer", "minimum": 0},
+          "deselected": {"type": "integer", "minimum": 0},
+          "ignored": {"type": "integer", "minimum": 0},
+          "required_set": {"type": ["string", "null"], "pattern": "^(s21_core|s21_gate:[a-z0-9_]+)$"},
+          "additional_required_sets": {"type": "array", "items": {"type": "string"}},
+          "l1_results": {"type": ["string", "null"]},
+          "l1_verdict": {
+            "type": "object",
+            "properties": {
+              "verdict": {"enum": ["PASS", "FAIL", "INSUFFICIENT", "INVALID"]},
+              "reasons": {"type": "array", "items": {"type": "string"}},
+              "missing": {"type": "array", "items": {"type": "string"}},
+              "skipped_required": {"type": "array", "items": {"type": "object"}},
+              "deselected_required": {"type": "array", "items": {"type": "string"}},
+              "duplicates": {"type": "array", "items": {"type": "string"}},
+              "not_run": {"type": "array", "items": {"type": "string"}},
+              "required_sha256": {"type": "string"}
+            }
+          },
+          "allowed_missing_bo": {"type": ["string", "null"], "pattern": "^BO-S21-[0-9]{2}$"},
+          "log": {"type": "string"},
+          "reasons": {"type": "array", "items": {"type": "string"}},
+          "evidence": {"type": ["string", "null"]},
+          "section_verdict": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"],
+                              "description": "非測試類 section 自身報告的判定（如 wal_s1w verdict）；判定器只當輸入條件之一。"},
+          "extra_checks": {
+            "type": "array",
+            "items": {"type": "object", "required": ["name", "exit"],
+                      "properties": {"name": {"type": "string"}, "exit": {"type": ["integer", "null"]}}}
+          }
+        }
+      }
+    },
+    "case_uptake": {
+      "type": "object",
+      "required": ["denominator", "valid_pass", "rate", "window_start", "pass_case_ids"],
+      "properties": {
+        "denominator": {"type": "integer", "minimum": 0},
+        "valid_pass": {"type": "integer", "minimum": 0},
+        "rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "window_start": {"type": ["string", "null"]},
+        "pass_case_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "pending_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "scenario", "evidence"],
+        "properties": {"id": {"type": "string"}, "scenario": {"type": "string"}, "evidence": {"type": ["string", "null"]}}
+      }
+    },
+    "blocked_owner": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "item", "case_ids", "status", "procedure", "evidence"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^BO-S21-[0-9]{2}$"},
+          "item": {"type": "string"},
+          "case_ids": {"type": "array", "items": {"type": "string"}},
+          "status": {"const": "BLOCKED-OWNER"},
+          "procedure": {"type": "string", "pattern": "^docs/rust-refactor/slice21-owner-runbook\\.md#bo-s21-[0-9]{2}$"},
+          "evidence": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "parity_amendments": {
+      "type": "object",
+      "description": "#104：parity-amendments-2026-10-26.md 中承接 Phase 為 P5 的每一列；狀態取自 tests/acceptance/slice21_parity_status.yaml，經判定器核對（PASS 必附 nodeid 且於本次 L1 證據中 passed）。任一列 INCOMPLETE／無標記 → verdict INCOMPLETE。",
+      "required": ["source", "status_file", "rows", "summary"],
+      "properties": {
+        "source": {"type": "string"},
+        "status_file": {"type": "string"},
+        "summary": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "status", "claimed", "reasons"],
+            "properties": {
+              "id": {"type": "string"},
+              "take": {"type": "string"},
+              "status": {"enum": ["PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "INCOMPLETE"]},
+              "claimed": {"type": ["string", "null"]},
+              "tests": {"type": "array", "items": {"type": "string"}},
+              "reasons": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "verdict": {"enum": ["READY_FOR_OWNER_EVIDENCE", "INCOMPLETE", "FAIL"]},
+    "verdict_reasons": {"type": "array", "items": {"type": "string"}},
+    "identity_problems": {
+      "type": "object",
+      "properties": {
+        "missing": {"type": "array", "items": {"type": "string"}},
+        "mismatch": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -9,7 +9,6 @@
 //! 由 actor 在終態處理點 `SettleTx`）。
 
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -66,6 +65,7 @@ pub enum OpOutcome {
 }
 
 /// `OpRunner` 的依賴（Task 14 Produces）。
+#[derive(Clone)]
 pub struct OpCtx {
     pub com: String,
     pub sid: String,
@@ -82,35 +82,57 @@ pub struct OpCtx {
 /// 前景 op 執行器（thread pool size 1 per session，ForegroundSlot；Task 14 Produces）。
 pub struct OpRunner {
     jobs: Sender<(OpGrant, OpSpec)>,
-    _join: JoinHandle<()>,
+    /// 並行 lane（READY recover、self-test probe）。
+    side: Sender<(OpGrant, OpSpec)>,
+}
+
+impl OpSpec {
+    /// 不是 Python 前景 operation、須與前景命令並行的 op（審查 F25）：READY recover（`recover_session` →
+    /// `_recover_after_failure`）與 self-test nonce probe 都不看 `foreground_busy`，照送救援鍵／probe。
+    pub fn runs_beside_foreground(&self) -> bool {
+        matches!(self, OpSpec::Recover { .. } | OpSpec::SelfTestProbe { .. })
+    }
+}
+
+fn spawn_lane(ctx: OpCtx, lane: &str) -> Sender<(OpGrant, OpSpec)> {
+    let (jobs, rx): (Sender<(OpGrant, OpSpec)>, Receiver<(OpGrant, OpSpec)>) =
+        crossbeam_channel::unbounded();
+    let name = format!("serialwrap-op{lane}-{}", ctx.com);
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            for (grant, spec) in rx.iter() {
+                let outcome = execute(&ctx, &grant, spec);
+                let (wm_epoch, wm_seq) = ctx.rx.watermark();
+                let _ = ctx.control.send(ControlEvent::OpFinished {
+                    op_id: grant.op_id,
+                    epoch: grant.epoch,
+                    outcome,
+                    after_rx_seq: (wm_epoch == grant.epoch).then_some(wm_seq),
+                });
+            }
+        })
+        .expect("建立 OpRunner thread");
+    jobs
 }
 
 impl OpRunner {
+    /// 前景 lane（命令、interactive）與並行 lane（[`OpSpec::runs_beside_foreground`]）各一條 thread；
+    /// 兩者的 TX 一律經同一 epoch 的 TxWriter（單一寫入者不變）。
     pub fn spawn(ctx: OpCtx) -> OpRunner {
-        let (jobs, rx): (Sender<(OpGrant, OpSpec)>, Receiver<(OpGrant, OpSpec)>) =
-            crossbeam_channel::unbounded();
-        let name = format!("serialwrap-op-{}", ctx.com);
-        let join = std::thread::Builder::new()
-            .name(name)
-            .spawn(move || {
-                for (grant, spec) in rx.iter() {
-                    let outcome = execute(&ctx, &grant, spec);
-                    let (wm_epoch, wm_seq) = ctx.rx.watermark();
-                    let _ = ctx.control.send(ControlEvent::OpFinished {
-                        op_id: grant.op_id,
-                        epoch: grant.epoch,
-                        outcome,
-                        after_rx_seq: (wm_epoch == grant.epoch).then_some(wm_seq),
-                    });
-                }
-            })
-            .expect("建立 OpRunner thread");
-        OpRunner { jobs, _join: join }
+        let side = spawn_lane(ctx.clone(), "-side");
+        let jobs = spawn_lane(ctx, "");
+        OpRunner { jobs, side }
     }
 
     /// 以授權 `grant` 執行 `spec`；結果以 `ControlEvent::OpFinished` 回報給 actor。
     pub fn run(&self, grant: OpGrant, spec: OpSpec) {
-        let _ = self.jobs.send((grant, spec));
+        let lane = if spec.runs_beside_foreground() {
+            &self.side
+        } else {
+            &self.jobs
+        };
+        let _ = lane.send((grant, spec));
     }
 }
 
@@ -150,15 +172,42 @@ pub fn extract_command_stdout(
     lines.join("\n").trim_matches('\n').to_string()
 }
 
+/// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），
+/// 單一字元時附 repr 跳脫（`\xNN`／`\uNNNN`／`\UNNNNNNNN`，小寫 hex；審查 F38）。
+fn ascii_encode_error_message(data: &str) -> String {
+    let chars: Vec<char> = data.chars().collect();
+    let start = chars.iter().position(|c| !c.is_ascii()).unwrap_or(0);
+    let end = chars[start..]
+        .iter()
+        .position(char::is_ascii)
+        .map_or(chars.len(), |n| start + n);
+    if end - start == 1 {
+        let code = chars[start] as u32;
+        let escaped = if code < 0x100 {
+            format!("\\x{code:02x}")
+        } else if code < 0x10000 {
+            format!("\\u{code:04x}")
+        } else {
+            format!("\\U{code:08x}")
+        };
+        format!(
+            "'ascii' codec can't encode character '{escaped}' in position {start}: ordinal not in range(128)"
+        )
+    } else {
+        format!(
+            "'ascii' codec can't encode characters in position {start}-{}: ordinal not in range(128)",
+            end - 1
+        )
+    }
+}
+
 /// `interactive.send` 的 payload 編碼（Python `_encode_interactive_payload`；不合法 → `PyErr`）。
 pub fn encode_interactive_payload(data: &str, encoding: &str) -> Result<Vec<u8>, PyErr> {
     match encoding {
         "plain" => return Ok(data.as_bytes().to_vec()),
         "base64" => {
             if !data.is_ascii() {
-                return Err(PyErr::value_error(
-                    "'ascii' codec can't encode characters: ordinal not in range(128)",
-                ));
+                return Err(PyErr::value_error(ascii_encode_error_message(data)));
             }
             return a2b_base64_lenient(data.as_bytes())
                 .map_err(|error| PyErr::value_error(error.to_string()));
@@ -203,10 +252,12 @@ pub fn reject_reason(reject: FenceReject) -> &'static str {
 }
 
 /// Python `TxIncompleteError.__str__`：`tx incomplete: {outcome} {confirmed}/{requested} {error}`。
+/// `outcome` 只有 Python `TxResult.outcome` 的三個字面值（`not_submitted`／`completed`／`unknown`）；部分寫出是
+/// `completed` 加 `confirmed < requested`（審查 F16 順帶修正：舊版寫成 Python 不存在的 `partial`）。
 pub fn tx_incomplete_message(report: &TxReport, requested: usize) -> String {
     let (outcome, confirmed) = match &report.result.outcome {
         TxOutcome::NotSubmitted => ("not_submitted", 0),
-        TxOutcome::Completed(n) => ("partial", *n),
+        TxOutcome::Completed(n) => ("completed", *n),
         TxOutcome::Unknown { confirmed } => ("unknown", *confirmed),
     };
     let error = match (report.reject, &report.result.error) {
@@ -244,6 +295,7 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
                 &t.prompt_regex,
                 pre_offset,
                 t.platform == "passthrough",
+                None,
             )
         }
         OpSpec::SelfTestProbe {
@@ -478,6 +530,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
             &t.prompt_regex,
             pre_offset,
             passthrough,
+            Some((cmd_id, confirmed_of(&report))),
         );
     }
     let raw = ctx.rx.text_from(pre_offset);
@@ -551,6 +604,9 @@ fn run_reboot(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand, mode: &str) -> Op
 
 /// `_recover_after_failure`（agent／system:recover 分支；人類來源不適用，DF-02）。
 /// passthrough 不送救援鍵（SC-35）；quiet 由 fence 在每次寫入前重驗（`Quiet` 拒絕即停止）。
+/// `aborted`：命令路徑的 `(cmd_id, 命令本身已確認的 TX bytes)`，救援鍵遇其他拒絕時依 Python `_map_aborted_result`
+/// 結算（審查 F26）；READY recover 為 `None`（維持例外）。
+#[allow(clippy::too_many_arguments)]
 fn recover_after_failure(
     ctx: &OpCtx,
     grant: &OpGrant,
@@ -559,6 +615,7 @@ fn recover_after_failure(
     prompt_regex: &str,
     pre_offset: u64,
     passthrough: bool,
+    aborted: Option<(&str, usize)>,
 ) -> OpOutcome {
     if passthrough {
         return OpOutcome::PromptTimeout {
@@ -586,6 +643,31 @@ fn recover_after_failure(
                     );
                 }
                 _ => {
+                    if let Some((cmd_id, confirmed)) = aborted.filter(|(_, n)| *n > 0) {
+                        // Python：TxIncompleteError → `execute_command` → `_map_aborted_result(cmd_id, exc)`；
+                        // `tx_account(cmd_id)` 含命令本身的 bytes，救援鍵結果非完整 → `partial`（Unknown → `unknown`）。
+                        let tx_outcome = if matches!(report.result.outcome, TxOutcome::Unknown { .. }) {
+                            "unknown"
+                        } else {
+                            "partial"
+                        };
+                        let mut meta = PyDict::new();
+                        meta.insert("event", PyValue::from("command_aborted_in_flight"));
+                        meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
+                        meta.insert("tx_outcome", PyValue::from(tx_outcome));
+                        let _ = ctx.wal.append(WalAppendReq {
+                            com: &ctx.com,
+                            dir: "META",
+                            source: "system",
+                            payload: b"",
+                            cmd_id: Some(cmd_id),
+                            loss_flag: false,
+                            meta: Some(meta),
+                        });
+                        return OpOutcome::CommandResult(
+                            pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
+                        );
+                    }
                     return OpOutcome::Error(PyErr::value_error(tx_incomplete_message(
                         &report, 1,
                     )));

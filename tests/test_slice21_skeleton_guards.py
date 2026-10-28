@@ -56,6 +56,8 @@ MIRROR = {
     "human_tx_backlog_bytes": ("constants.rs", "HUMAN_TX_BACKLOG_MAX_BYTES"),
     "telnet_consoles_per_session": ("constants.rs", "TELNET_CONSOLES_PER_SESSION"),
     "com0com_reader_channel": ("constants.rs", "COM0COM_READER_CHANNEL"),
+    # parity-amendments-2026-10-26 #38：撤銷 op tombstone 上限（審查 F13）
+    "fence_cancelled_ops_max": ("tx_writer.rs", "CANCELLED_OPS_MAX"),
 }
 MIRROR_FILES = {
     "resources.rs": ROOT / "crates" / "sw-core" / "src" / "resources.rs",

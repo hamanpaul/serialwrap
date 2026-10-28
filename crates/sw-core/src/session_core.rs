@@ -21,7 +21,7 @@ use crate::arbiter::{
     CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitReq,
 };
 use crate::capture::{
-    AgentLogCapture, BG_CAPTURE_MAX_BYTES, BG_CAPTURE_MAX_COUNT, BackgroundCapture, CaptureEnv,
+    AgentLogCapture, BG_CAPTURE_MAX_BYTES, BackgroundCapture, CaptureEnv,
     LogFile,
 };
 use crate::deferred::InvalidateReason;
@@ -53,8 +53,16 @@ use crate::wal::WalWriter;
 /// daemon stderr／state.json 相關通知（Task 0 骨架型別）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManagerNote {
+    /// 全域 background capture 淘汰到其他 session（manager 以 COM 解析擁有者後送 `EvictCapture`；審查 F28）。
+    EvictCapture {
+        com: String,
+        cmd_id: String,
+    },
     SessionReady {
         sid: String,
+        /// 由 attach 登入 run 本身到 READY（Python `_attach_by_id_dynamic` 的 sticky 寫入點；reprobe／passthrough
+        /// 安靜升 READY／reboot recovery 為 false，審查 F65）。
+        via_attach: bool,
     },
     SessionDetached {
         sid: String,
@@ -155,6 +163,13 @@ pub enum SessionRequest {
         from_chunk: i128,
         limit: i128,
     },
+    /// 只查本 session 的 background capture（Python `get_background_result` 的單 session 部分；
+    /// 查無回 CMD_NOT_FOUND、不走登錄表 fallback，審查 F76）。
+    BackgroundResult {
+        cmd_id: String,
+        from_chunk: i128,
+        limit: i128,
+    },
     CancelQueued {
         cmd_id: String,
     },
@@ -170,9 +185,23 @@ pub enum SessionRequest {
         profile: SessionProfile,
         profile_source: String,
     },
+    /// bind 等待舊 by_id 的 attach op 逾時（#26；Python `bind_session` 直接寫活 session）：state RECOVERING、
+    /// `drain_stalled=true`、`drain_timeout_epoch=epoch`，回 SESSION_RECOVERING 回應（審查 F64）。
+    MarkAttachStalled {
+        epoch: u64,
+    },
+    /// 同 `ControlEvent::DeviceAttached`，但經請求通道並回覆套用後的活 session（bind 改綁到在線裝置時，
+    /// Python 於回覆前即 ATTACHING＋`last_error=None`；審查 F70）。
+    DeviceOnline {
+        by_id: String,
+        real_path: String,
+    },
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
+    /// 只供測試（test-fakes）：佇列長度 `{len, physical_len}`（審查 F74：RPC cancel 的實體移除）。
+    #[cfg(feature = "test-fakes")]
+    QueueLensForTest,
 }
 
 /// `SessionCore::on_event` 的輸出效果；由 actor executor 執行（sans-IO）。
@@ -188,6 +217,12 @@ pub enum Effect {
         dev: DevicePath,
         cfg: SerialConfig,
         precheck_holders: bool,
+    },
+    /// 交 manager 依 Python `_spawn_attach` 重新 attach（開埠前再解析 pin／fallback 偵測）；
+    /// manager 完成後以 `DeviceAttached` 回送（審查 F61／F62）。
+    Reattach {
+        by_id: String,
+        real_path: String,
     },
     BeginDrain {
         stop_id: StopId,
@@ -272,6 +307,8 @@ pub struct CoreDeps {
     pub read_env_file: Arc<dyn Fn(&str) -> Option<std::io::Result<String>> + Send + Sync>,
     /// P6 增補 #2（07 D-02）：hub 讀取用的 `input_epoch`；只在 `Fence::with` 內寫入。
     pub input_epoch_pub: Arc<AtomicU64>,
+    /// 全 daemon 共用的 background capture 索引（`BG_CAPTURE_MAX_COUNT` 為全域上限，審查 F28）。
+    pub bg_index: Arc<crate::capture::BackgroundIndex>,
 }
 
 /// `public()` 需要由 actor 外部提供的欄位（console 計數與 endpoint）。
@@ -309,14 +346,22 @@ pub struct SessionCore {
     pending_open_stop: Option<PendingOpenStop>,
     pending_attach: Option<PendingAttach>,
     open_real_path: Option<String>,
+    /// clear 收尾後等 manager 再解析（Python `_spawn_attach` → `_reresolve_profile_on_reattach`）再送
+    /// `DeviceAttached`：期間 state 為 ATTACHING、無開埠（審查 F61／F62）。
+    reattach_pending: bool,
     open_generation: u64,
     known_real_path: Option<String>,
     device_present: bool,
     /// P7 Task 5：readiness reprobe 進度（`reprobe_attempts`／`next_reprobe_at`／`reprobe_exhausted`、single-flight）。
     reprobe: crate::reprobe::ReprobeState,
     console_count: usize,
+    /// 現行 bridge 的哨兵 PTY slave 路徑（`public()["vtty"]`、self-test `attached_vtty`）。
+    vtty: Option<String>,
     queue: SessionQueue,
     foreground: Option<OpGrant>,
+    /// 與前景並行的 op（READY recover、self-test probe；審查 F25）：不是 Python 的前景 operation，
+    /// 不佔前景槽、不設 `foreground_busy`；epoch 結束時清空，遲到的完成事件以 stale 回覆。
+    side_ops: HashMap<OpId, OpGrant>,
     queue_registered: bool,
     stop: Option<StopOp>,
     next_stop_id: u64,
@@ -389,16 +434,11 @@ struct PendingOpenStop {
 struct LoginRun {
     epoch: u64,
     kind: LoginRunKind,
+    /// 啟動當下的 `fsm_gen`（審查 F15）：quiet arm 會令 core 的 `fsm_gen` 前進，但不是新的 login run；
+    /// 完成事件以 run 自己的世代比對（Python attach thread 照常寫終態）。
+    fsm_gen: u64,
     /// `SessionAttach`／`Recover` 再探的等待者（attach 路徑無）。
     waiters: Vec<(Reply, ReprobeWaiter)>,
-    /// StartLogin 發出時的登入世代。
-    fsm_gen: u64,
-    /// run 進行中因 boot quiet arm 而遞增的 fsm_gen 次數。
-    quiet_bumps: u64,
-    /// run 進行中因不擋 probe 的 quiet arm（console unlock）而遞增的 fsm_gen 次數；run 仍有效（parity #49）。
-    exempt_bumps: u64,
-    /// attach run 已被 quiet 撤銷且其（舊世代）結果已回報：下一個 Tick 落定 ATTACHED＋`PROMPT_UNAVAILABLE`。
-    revoked_by_quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -489,13 +529,16 @@ impl SessionCore {
             pending_open_stop: None,
             pending_attach: None,
             open_real_path: None,
+            reattach_pending: false,
             open_generation: 0,
             known_real_path: None,
             device_present: false,
             reprobe: crate::reprobe::ReprobeState::default(),
             console_count: 0,
+            vtty: None,
             queue: SessionQueue::new(),
             foreground: None,
+            side_ops: HashMap::new(),
             queue_registered: false,
             stop: None,
             next_stop_id: 0,
@@ -581,6 +624,12 @@ impl SessionCore {
                     self.set_last_error(Some(error.to_string()), None);
                     effects.0.extend(self.begin_stop(kind, None, now).0);
                 }
+            }
+            MailboxItem::Control(ControlEvent::DeviceMissing) => {
+                self.mark_missing_device(now);
+            }
+            MailboxItem::Control(ControlEvent::EvictCapture { cmd_id }) => {
+                self.drop_background_capture(&cmd_id);
             }
             MailboxItem::Control(ControlEvent::ConsoleCountChanged { count }) => {
                 self.console_count = count;
@@ -713,7 +762,8 @@ impl SessionCore {
             .reconfirm_remaining_s(now)
             .map(PyValue::from)
             .unwrap_or(PyValue::Null);
-        let outstanding = usize::from(self.foreground.is_some());
+        // Python：`len(background_cmd_ids) + (1 if foreground_busy else 0)`（審查 F27）。
+        let outstanding = self.background_cmd_ids.len() + usize::from(self.foreground_busy());
         let expected_duration = self
             .foreground
             .as_ref()
@@ -774,7 +824,7 @@ impl SessionCore {
             "interactive_session_id",
             option_string(self.lease.as_ref().map(|l| l.interactive_id.as_str())),
         );
-        out.insert("foreground_busy", PyValue::from(self.foreground.is_some()));
+        out.insert("foreground_busy", PyValue::from(self.foreground_busy()));
         out.insert("fg_cmd_expected_duration_s", expected_duration);
         out.insert("console_count", py_int(ctx.console_count));
         out.insert(
@@ -1029,6 +1079,7 @@ impl SessionCore {
                 if !already_released {
                     self.set_state(SessionState::Recovering, now);
                 }
+                self.phase1_detach(&kind, already_released);
                 if kind == StopKind::Release {
                     if let Some(pending_attach) = self.pending_attach.take() {
                         effects.push(Effect::Reply(
@@ -1098,12 +1149,30 @@ impl SessionCore {
         if !already_released {
             self.set_state(SessionState::Recovering, now);
         }
+        self.phase1_detach(&kind, already_released);
         effects.push(Effect::BeginDrain { stop_id, epoch });
         effects.push(Effect::Schedule {
             at: now.saturating_add(crate::resources::DRAIN_TIMEOUT_MS.saturating_mul(1_000_000)),
             ev: TimerEvent::DrainTimeout { epoch, stop_id },
         });
         effects
+    }
+
+    /// Python `_begin_drain_locked` Phase 1（等回條前）：非 shutdown 設 `last_error=<reason>`（Removed／Rebound／
+    /// IoError 已由呼叫端設定），清前景欄位並停 log／background capture；`aborted_op` 已抄進 stop，BC-03 不受影響
+    /// （審查 F41）。
+    fn phase1_detach(&mut self, kind: &StopKind, already_released: bool) {
+        let reason = match kind {
+            StopKind::Release if !already_released => Some("RELEASED"),
+            StopKind::Clear => Some("CLEARED"),
+            StopKind::Bind => Some("REBOUND"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.set_last_error(Some(reason.to_string()), None);
+        }
+        self.foreground = None;
+        self.detach_captures();
     }
 
     fn finish_stop_without_worker(
@@ -1113,6 +1182,7 @@ impl SessionCore {
         now: Mono,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        self.reattach_pending = false;
         if kind == StopKind::Release {
             self.finish_release(now);
             effects.extend(
@@ -1123,6 +1193,9 @@ impl SessionCore {
             self.generations.conn_epoch = None;
             self.queue_registered = false;
             self.foreground = None;
+            self.side_ops.clear();
+            self.vtty = None;
+            self.console_count = 0;
             self.foreground_reboot = false;
             self.login_run = None;
             self.clear_interactive();
@@ -1141,6 +1214,14 @@ impl SessionCore {
                 _ => {}
             }
             self.set_state(SessionState::Detached, now);
+            if kind == StopKind::Clear {
+                // Python `clear_session` 無 bridge 分支：裝置在線 → 回覆前即 ATTACHING＋`last_error=None`，
+                // 再 `_spawn_attach`（審查 F61）；不在線維持 DETACHED＋CLEARED。
+                effects.extend(self.request_reattach(now));
+                if self.state == SessionState::Attaching {
+                    self.set_last_error(None, None);
+                }
+            }
             for waiter in waiters {
                 effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
             }
@@ -1396,6 +1477,25 @@ impl SessionCore {
         self.profile.template.platform == "passthrough"
     }
 
+    /// Python `_mark_missing_devices_locked`：非 RELEASED、無 bridge（含 drain 中）時才標記。
+    fn mark_missing_device(&mut self, now: Mono) {
+        self.device_present = false;
+        if self.state == SessionState::Released
+            || self.generations.conn_epoch.is_some()
+            || self.stop.is_some()
+        {
+            return;
+        }
+        self.reattach_pending = false;
+        self.set_state(SessionState::Detached, now);
+        if self.last_error.is_none() {
+            self.set_last_error(Some("DEVICE_NOT_FOUND".into()), None);
+        }
+        if self.detached_at.is_none() {
+            self.detached_at = Some(self.wall_iso());
+        }
+    }
+
     fn set_state(&mut self, state: SessionState, now: Mono) {
         if self.state != state {
             self.last_state_change_at = Some(self.wall_iso());
@@ -1430,7 +1530,7 @@ impl SessionCore {
     fn ok_session(&self, now: Mono) -> PyDict {
         pydict! {
             "ok" => true,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1438,7 +1538,7 @@ impl SessionCore {
         pydict! {
             "ok" => false,
             "error_code" => code,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1448,7 +1548,7 @@ impl SessionCore {
             "error_code" => "SESSION_RECOVERING",
             "drain_stalled" => self.drain_stalled,
             "drain_timeout_epoch" => self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null),
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1458,7 +1558,7 @@ impl SessionCore {
             "error_code" => "DRAIN_STALLED",
             "drain_stalled" => true,
             "drain_timeout_epoch" => self.drain_timeout_epoch.map(|epoch| py_int(epoch as i128)).unwrap_or(PyValue::Null),
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+            "session" => self.public(now, &self.public_ctx())
         }
     }
 
@@ -1475,7 +1575,7 @@ impl SessionCore {
             .unwrap_or((0, false));
         pydict! {
             "ok" => true,
-            "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None }),
+            "session" => self.public(now, &self.public_ctx()),
             "closed_consoles" => py_int(closed_consoles),
             "aborted_cmd" => aborted_cmd
         }
@@ -1565,7 +1665,7 @@ impl SessionCore {
                     source,
                     reason,
                     closed_consoles: self.console_count as i128,
-                    aborted_cmd: self.foreground.is_some(),
+                    aborted_cmd: self.foreground_busy(),
                 });
                 self.console_count = 0;
                 self.begin_stop(StopKind::Release, Some(reply), now).0
@@ -1581,6 +1681,15 @@ impl SessionCore {
             }
             SessionRequest::CancelQueued { cmd_id } => {
                 self.queue.remove(&cmd_id);
+                // Python `revoke_tx_op`：取消的命令若正是前景 op，撤銷其 TX permit——之後以該 op 提交的
+                // TX（含 gate 外等待中的尾段）一律 Cancelled、零 TX（parity-amendments-2026-10-26 #52）。
+                if let Some(grant) = self
+                    .foreground
+                    .as_ref()
+                    .filter(|grant| grant.cmd_id.as_deref() == Some(cmd_id.as_str()))
+                {
+                    self.deps.fence.revoke_ops(&[grant.op_id]);
+                }
                 vec![Effect::Reply(reply, Ok(pydict! { "ok" => true }))]
             }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
@@ -1614,6 +1723,29 @@ impl SessionCore {
                 self.profile_source = profile_source;
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
             }
+            SessionRequest::DeviceOnline { by_id, real_path } => {
+                // 回覆先於 OpenBridge（executor 依序執行；開埠可能阻塞）。
+                let opened = self.device_attached(&by_id, &real_path, now);
+                let mut effects = vec![Effect::Reply(reply, Ok(self.ok_session(now)))];
+                effects.extend(opened);
+                effects
+            }
+            SessionRequest::MarkAttachStalled { epoch } => {
+                self.set_state(SessionState::Recovering, now);
+                self.drain_stalled = true;
+                self.drain_timeout_epoch = Some(epoch);
+                let mut response = self.drain_stalled_reply(now);
+                response.insert("error_code", PyValue::from("SESSION_RECOVERING"));
+                vec![Effect::Reply(reply, Ok(response))]
+            }
+            #[cfg(feature = "test-fakes")]
+            SessionRequest::QueueLensForTest => vec![Effect::Reply(
+                reply,
+                Ok(pydict! {
+                    "len" => PyValue::from(self.queue.len() as i64),
+                    "physical_len" => PyValue::from(self.queue.physical_len() as i64),
+                }),
+            )],
             #[cfg(feature = "test-fakes")]
             SessionRequest::ForceStateForTest(state) => {
                 self.set_state(state, now);
@@ -1638,6 +1770,23 @@ impl SessionCore {
             SessionRequest::LogStart => vec![Effect::Reply(reply, self.log_start(now))],
             SessionRequest::LogStop => vec![Effect::Reply(reply, Ok(self.log_stop(now)))],
             SessionRequest::LogStatus => vec![Effect::Reply(reply, Ok(self.log_status(now)))],
+            SessionRequest::BackgroundResult {
+                cmd_id,
+                from_chunk,
+                limit,
+            } => vec![Effect::Reply(
+                reply,
+                match self.background.get_mut(&cmd_id) {
+                    Some(capture) => {
+                        let result = capture.result(from_chunk, limit, now);
+                        self.sync_bg(&cmd_id);
+                        result
+                    }
+                    None => Ok(
+                        pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id },
+                    ),
+                },
+            )],
             SessionRequest::ResultTail {
                 cmd_id,
                 from_chunk,
@@ -1677,11 +1826,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1698,11 +1843,7 @@ impl SessionCore {
                     "session",
                     PyValue::Dict(self.public(
                         now,
-                        &PublicCtx {
-                            console_count: 0,
-                            vtty: None,
-                            console_endpoint: None,
-                        },
+                        &self.public_ctx(),
                     )),
                 );
                 return vec![Effect::Reply(reply, Ok(result))];
@@ -1717,14 +1858,7 @@ impl SessionCore {
             // `service._resolve_session_id` 的 gate 段（RPC 的 `human:` source 一律視同 agent，DF-02）。
             self.expire_reconfirm(now);
             if self.quiet.failed || self.quiet.quiet_active(now) || self.quiet.pending {
-                let public = self.public(
-                    now,
-                    &PublicCtx {
-                        console_count: 0,
-                        vtty: None,
-                        console_endpoint: None,
-                    },
-                );
+                let public = self.public(now, &self.public_ctx());
                 if let Some(result) = crate::quiet_gate::submit_gate_reject(&public, &req.source) {
                     return vec![Effect::Reply(reply, Ok(result))];
                 }
@@ -1746,11 +1880,7 @@ impl SessionCore {
                             "session",
                             PyValue::Dict(self.public(
                                 now,
-                                &PublicCtx {
-                                    console_count: 0,
-                                    vtty: None,
-                                    console_endpoint: None,
-                                },
+                                &self.public_ctx(),
                             )),
                         );
                     }
@@ -1796,7 +1926,7 @@ impl SessionCore {
                     "ok" => true,
                     "released" => true,
                     "recommended_action" => "device_attach",
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -1892,7 +2022,7 @@ impl SessionCore {
                     "ok" => false,
                     "error_code" => "FLASHING_BUSY",
                     "selector" => self.profile.com.clone(),
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -1905,7 +2035,7 @@ impl SessionCore {
                 Ok(pydict! {
                     "ok" => true,
                     "already_bound" => true,
-                    "session" => self.public(now, &PublicCtx { console_count: 0, vtty: None, console_endpoint: None })
+                    "session" => self.public(now, &self.public_ctx())
                 }),
             )];
         }
@@ -1963,9 +2093,11 @@ impl SessionCore {
         if self.state == SessionState::Released {
             return Vec::new();
         }
-        if self.state != SessionState::Detached {
+        let awaiting = self.reattach_pending && self.state == SessionState::Attaching;
+        if self.state != SessionState::Detached && !awaiting {
             return Vec::new();
         }
+        self.reattach_pending = false;
         self.set_last_error(None, None);
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.open_generation = self.generations.fsm_gen;
@@ -2082,6 +2214,7 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            ..
         } = opened;
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = None;
@@ -2257,8 +2390,14 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            rx,
+            vtty,
         } = opened;
         self.generations.conn_epoch = Some(epoch);
+        // 新 bridge 的 RX 視窗與哨兵（Python 每次 attach 新建 `UARTBridge`；POSIX 哨兵 primary 算 1 個 console）。
+        self.deps.rx = rx;
+        self.console_count = usize::from(vtty.is_some());
+        self.vtty = vtty;
         self.attached_real_path = Some(real_path.clone());
         self.known_real_path = Some(real_path.clone());
         if self.is_passthrough() {
@@ -2273,6 +2412,7 @@ impl SessionCore {
             f.fsm_gen = self.generations.fsm_gen;
             f.owner_gen = self.generations.owner_gen;
             f.frozen = false;
+            // Python `_push_tx_gate`：新 bridge 帶回 session 的 quiet 與 reconfirm 狀態（審查 F63）。
             f.quiet_active = quiet_active;
             f.probe_quiet_exempt = quiet_active && !blocks_probe;
             f.reconfirm_pending = reconfirm_pending;
@@ -2328,11 +2468,8 @@ impl SessionCore {
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Attach,
-                    waiters: Vec::new(),
                     fsm_gen: self.generations.fsm_gen,
-                    quiet_bumps: 0,
-                    exempt_bumps: 0,
-                    revoked_by_quiet: false,
+                    waiters: Vec::new(),
                 });
                 effects.push(Effect::StartLogin {
                     epoch,
@@ -2407,32 +2544,6 @@ impl SessionCore {
         }
     }
 
-    /// `LoginFinished` 的世代是否仍為現行 run（`active_login` 以 run 自身的 `(epoch, fsm_gen)` 比對）：core 世代相同，
-    /// 或與 run 相差的只有不擋 probe 的 quiet arm（console unlock，parity #49）。
-    fn login_gen_current(&self, epoch: u64, fsm_gen: u64) -> bool {
-        self.generations.fsm_gen == fsm_gen
-            || self.login_run.as_ref().is_some_and(|run| {
-                run.epoch == epoch
-                    && run.fsm_gen == fsm_gen
-                    && run.quiet_bumps == 0
-                    && self.generations.fsm_gen == fsm_gen.saturating_add(run.exempt_bumps)
-            })
-    }
-
-    /// 舊世代 attach 結果是否僅因 run 期間的 quiet arm 而失效（世代差恰為 quiet arm 次數）。
-    fn attach_run_revoked_by_quiet(&self, epoch: u64, fsm_gen: u64) -> bool {
-        self.login_run.as_ref().is_some_and(|run| {
-            run.epoch == epoch
-                && run.kind == LoginRunKind::Attach
-                && run.fsm_gen == fsm_gen
-                && run.quiet_bumps > 0
-                && self.generations.fsm_gen
-                    == fsm_gen
-                        .saturating_add(run.quiet_bumps)
-                        .saturating_add(run.exempt_bumps)
-        })
-    }
-
     fn login_finished(
         &mut self,
         epoch: u64,
@@ -2462,9 +2573,9 @@ impl SessionCore {
             return Vec::new();
         }
         if reprobe && self.state == SessionState::Attached {
-            if let Some(exc) = login_exception_name(&result) {
-                // `_probe_existing_bridge` 的例外穿出 manager：session 不變，attach／recover 的 RPC 回 framing EXCEPTION。
-                // 例外訊息全文（`str(TxIncompleteError)`）待 Task 7 LoginReport 帶出 TxResult。
+            if let Some((_, message)) = login_exception(&result) {
+                // `_probe_existing_bridge` 的例外穿出 manager：session 不變，attach／recover 的 RPC 回 framing EXCEPTION
+                // （message＝`str(exc)`，審查 F16）。
                 // 只有發起 probe 的第一個呼叫收到例外；併發的後續 attach／recover 在 Python 取得 probe 鎖後自行重新 probe
                 // （審查 92e0223_76de0cf bea2d8e-2）：以新世代重派。
                 let mut waiters = self
@@ -2475,7 +2586,7 @@ impl SessionCore {
                     .into_iter();
                 let mut effects: Vec<Effect> = waiters
                     .next()
-                    .map(|(reply, _)| Effect::Reply(reply, Err(PyErr { message: exc })))
+                    .map(|(reply, _)| Effect::Reply(reply, Err(PyErr::value_error(message))))
                     .into_iter()
                     .collect();
                 for (reply, kind) in waiters {
@@ -2490,21 +2601,36 @@ impl SessionCore {
             if self.state != SessionState::Attached {
                 return Vec::new();
             }
-        } else if self.state != SessionState::Attaching || !self.login_gen_current(epoch, fsm_gen) {
-            // 舊世代結果一律無效果（T11）。但 quiet 撤銷的 attach run 若就此丟棄，session 會永久停在
-            // ATTACHING；Python `_attach_by_id` 的 probe 遇 quiet 撤銷 → TxIncompleteError → PROMPT_UNAVAILABLE、
-            // 落定 ATTACHED。故只標記，由下一個 Tick 以 boot quiet 合成碼收尾（P5-T20 黑箱 banner 情境）。
-            if self.state == SessionState::Attaching && self.attach_run_revoked_by_quiet(epoch, fsm_gen) {
-                if let Some(run) = self.login_run.as_mut() {
-                    run.revoked_by_quiet = true;
-                }
-            }
+        } else if self.state != SessionState::Attaching
+            || !self.login_run.as_ref().is_some_and(|run| {
+                run.epoch == epoch && run.kind == LoginRunKind::Attach && run.fsm_gen == fsm_gen
+            })
+        {
+            // 只丟棄「不屬於現行 attach run」的事件（已被新 run 取代或世代不符）；quiet arm 推進的 core
+            // `fsm_gen` 不使現行 run 失效（審查 F15；Python `_attach_by_id` 照常寫 ATTACHED／READY／DETACHED）。
             return Vec::new();
         }
         let run = self.login_run.take();
-        let waiters = run.map(|run| run.waiters).unwrap_or_default();
+        let mut waiters = run.map(|run| run.waiters).unwrap_or_default();
         let mut effects = Vec::new();
         match result {
+            // 審查 F16：非 quiet／非 stale_login_gen 的 TX 失敗＝Python 例外上拋。
+            crate::login_fsm::LoginOutcome::Raised { exc, message } => {
+                if reprobe {
+                    // `_probe_existing_bridge` 例外穿出 attach_session／recover_session：state、last_error 不變，
+                    // RPC 回 `EXCEPTION`（message＝`str(exc)`）。
+                    for (waiter, _) in std::mem::take(&mut waiters) {
+                        effects.push(Effect::Reply(
+                            waiter,
+                            Err(sw_proto::pycompat::PyErr::value_error(message.clone())),
+                        ));
+                    }
+                } else {
+                    // `_attach_by_id` 外層 except：關 bridge、DETACHED、`ATTACH_FAILED:<ExcType>`。
+                    self.set_last_error(Some(format!("ATTACH_FAILED:{exc}")), None);
+                    effects.extend(self.begin_stop(StopKind::LoginFailed, None, now).0);
+                }
+            }
             crate::login_fsm::LoginOutcome::Ready => {
                 if !reprobe {
                     self.adopt_bridge(now);
@@ -2523,6 +2649,7 @@ impl SessionCore {
                 self.confirm_ready();
                 effects.push(Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
+                    via_attach: !reprobe,
                 }));
             }
             crate::login_fsm::LoginOutcome::NotReady(error) => {
@@ -2551,7 +2678,7 @@ impl SessionCore {
                 }
             }
             // 已由 `legacy_login_outcome` 收斂，不會到達（P7 Task 7 以收斂表取代）。
-            crate::login_fsm::LoginOutcome::Aborted(_) | crate::login_fsm::LoginOutcome::Raised(_) => {}
+            crate::login_fsm::LoginOutcome::Aborted(_) => {}
         }
         for (waiter, kind) in waiters {
             effects.extend(self.reprobe_reply(waiter, kind, now));
@@ -2563,11 +2690,7 @@ impl SessionCore {
     fn attach_state_result(&self, now: Mono) -> PyDict {
         let session = PyValue::Dict(self.public(
             now,
-            &PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
+            &self.public_ctx(),
         ));
         if self.profile.template.command_capable()
             && !matches!(self.state, SessionState::Ready | SessionState::Attaching)
@@ -2648,11 +2771,8 @@ impl SessionCore {
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Reprobe,
-                    waiters: vec![(reply, kind)],
                     fsm_gen: self.generations.fsm_gen,
-                    quiet_bumps: 0,
-                    exempt_bumps: 0,
-                    revoked_by_quiet: false,
+                    waiters: vec![(reply, kind)],
                 });
                 vec![Effect::StartLogin {
                     epoch,
@@ -2711,17 +2831,6 @@ impl SessionCore {
         let blocks_probe = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         self.generations.fsm_gen = self.generations.fsm_gen.saturating_add(1);
         self.generations.owner_gen = self.generations.owner_gen.saturating_add(1);
-        if let Some(run) = self.login_run.as_mut() {
-            if run.epoch == epoch {
-                if !blocks_probe {
-                    // console unlock：run 以自身世代繼續，完成時仍套用（parity #49）。
-                    run.exempt_bumps = run.exempt_bumps.saturating_add(1);
-                } else if run.kind == LoginRunKind::Attach {
-                    // quiet 撤銷進行中 attach run 的後續 TX（fence FsmMismatch）；記錄次數以便辨識其舊世代結果（P5-T20）。
-                    run.quiet_bumps = run.quiet_bumps.saturating_add(1);
-                }
-            }
-        }
         let pending = self.quiet.pending;
         self.deps.fence.with(|f| {
             f.quiet_active = true;
@@ -2788,8 +2897,17 @@ impl SessionCore {
                         && lease.deadline() == deadline
                 }) && now >= deadline =>
             {
-                self.close_lease(true);
-                Vec::new()
+                // Python `expired()`：`now - last > timeout`（嚴格大於；審查 F36）。恰在期限仍 active，
+                // 於期限後 1 ns 再檢查一次。
+                if now > deadline {
+                    self.close_lease(true);
+                    Vec::new()
+                } else {
+                    vec![Effect::Schedule {
+                        at: deadline.saturating_add(1),
+                        ev: TimerEvent::LeaseExpiry { lease_id, deadline },
+                    }]
+                }
             }
             TimerEvent::DrainTimeout { epoch, stop_id } => {
                 self.mark_drain_timeout(epoch, stop_id, now)
@@ -2798,28 +2916,8 @@ impl SessionCore {
         }
     }
 
-    /// quiet 撤銷的 attach run 收尾：掛上 bridge 純收 RX，`PROMPT_UNAVAILABLE` 停在 ATTACHED
-    /// （同 `_attach_by_id` boot quiet 分支；last_error_detail 不精煉）。
-    fn settle_quiet_revoked_attach(&mut self, now: Mono) {
-        let revoked = self.state == SessionState::Attaching
-            && self.login_run.as_ref().is_some_and(|run| {
-                run.revoked_by_quiet
-                    && run.kind == LoginRunKind::Attach
-                    && self.generations.conn_epoch == Some(run.epoch)
-            });
-        if !revoked {
-            return;
-        }
-        self.login_run = None;
-        self.adopt_bridge(now);
-        self.last_probe_at = Some(self.wall_iso());
-        self.set_last_error(Some("PROMPT_UNAVAILABLE".into()), None);
-        self.set_state(SessionState::Attached, now);
-    }
-
     fn tick(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
-        self.settle_quiet_revoked_attach(now);
         self.expire_reconfirm(now);
         // SC-13：1 s tick 主動收回到期的 agent lease（`_expire_interactive_leases_tick`，留 tombstone）。
         if self
@@ -2847,6 +2945,7 @@ impl SessionCore {
             self.queue_registered = true;
             effects.push(Effect::Notify(ManagerNote::SessionReady {
                 sid: self.sid.clone(),
+                via_attach: false,
             }));
         }
         effects
@@ -2989,9 +3088,6 @@ impl SessionCore {
                     kind: LoginRunKind::AutoReprobe,
                     waiters: Vec::new(),
                     fsm_gen: self.generations.fsm_gen,
-                    quiet_bumps: 0,
-                    exempt_bumps: 0,
-                    revoked_by_quiet: false,
                 });
                 vec![Effect::StartLogin {
                     epoch,
@@ -3046,7 +3142,7 @@ impl SessionCore {
             return Vec::new();
         }
         let mut effects = Vec::new();
-        if let Some(exc) = login_exception_name(&result) {
+        if let Some((exc, _)) = login_exception(&result) {
             // `_spawn_reprobe_probe` 的 except：ATTACHED＋REPROBE_FAILED:<型別>、記一次 attempt（不經 finish）。
             self.reprobe.inflight = false;
             self.set_last_error(Some(format!("REPROBE_FAILED:{exc}")), None);
@@ -3056,7 +3152,7 @@ impl SessionCore {
         }
         match result {
             // login_exception_name 已於上方收斂（不會到達）。
-            LoginOutcome::Raised(_) | LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
+            LoginOutcome::Raised { .. } | LoginOutcome::Aborted(LoginAbort::TxIncomplete) => {
                 return effects
             }
             LoginOutcome::Aborted(_) => {
@@ -3079,8 +3175,10 @@ impl SessionCore {
                 self.last_ready_at = Some(self.wall_iso());
                 self.queue_registered = true;
                 self.confirm_ready();
+                // 自動重探不是動態 attach 本身（P5 6aafe8f：sticky 只在 attach 到 READY 時寫入）。
                 effects.push(Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
+                    via_attach: false,
                 }));
             }
             LoginOutcome::NotReady(error) | LoginOutcome::Failed(error) => {
@@ -3234,12 +3332,17 @@ impl SessionCore {
         self.generations.conn_epoch = None;
         self.attached_real_path = None;
         self.foreground = None;
+        self.side_ops.clear();
+        self.vtty = None;
+        self.console_count = 0;
         self.queue_registered = false;
         self.queue = SessionQueue::new();
         self.clear_interactive();
         self.detach_captures();
         // Python detach 不清 boot quiet／READY reconfirm（只有 passthrough 重掛時 `reset_passthrough_boot_gate` 清）：
         // DUT reboot 期間 re-enumerate 的重插仍受 quiet 保護（#130）。fence 隨 epoch 失效，重開時依現況同步。
+        // boot quiet／reconfirm 掛在 session 而非 bridge（Python `SessionRuntime.boot_quiet_until`；`_complete_drain`
+        // 只 `reset_reprobe_progress`）：drain 不清，新 bridge adopt 時再推回 fence（審查 F63）。
         self.login_run = None;
         self.foreground_reboot = false;
         self.deps.fence.with(|f| {
@@ -3331,20 +3434,14 @@ impl SessionCore {
                     _ => {}
                 }
                 self.set_state(SessionState::Detached, now);
-                let open_effects = if matches!(
-                    kind,
-                    StopKind::IoError | StopKind::Recover | StopKind::Clear
-                ) {
-                    self.reopen_known_device(now)
-                } else {
-                    Vec::new()
+                let open_effects = match kind {
+                    StopKind::IoError | StopKind::Recover => self.reopen_known_device(now),
+                    StopKind::Clear => self.request_reattach(now),
+                    _ => Vec::new(),
                 };
                 effects.extend(open_effects);
-                if kind == StopKind::Clear && self.state == SessionState::Attaching {
-                    // Python `clear_session`：drain 收尾設 ATTACHING＋CLEARED 後立即 `_spawn_attach`，
-                    // `_attach_by_id` 開埠前 `last_error = None`；ATTACHING 期間不帶 CLEARED（P5-T20 黑箱）。
-                    self.set_last_error(None, None);
-                }
+                // Clear：回應帶 Python `_complete_drain` 的 `ATTACHING`＋`CLEARED`；`last_error` 於再解析後接受
+                // `DeviceAttached`（開埠前，Python `_attach_by_id`）才清除（審查 F97）。
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }
@@ -3408,7 +3505,10 @@ impl SessionCore {
             meta.insert("confirmed_tx_bytes", py_int(confirmed_bytes as i128));
             meta.insert(
                 "tx_outcome",
-                PyValue::from(if payload_len == Some(confirmed_bytes) {
+                // Python `_map_aborted_result`：帳本 unknown 優先於 complete／partial。
+                PyValue::from(if op_ledger.is_some_and(|op| op.unknown) {
+                    "unknown"
+                } else if payload_len == Some(confirmed_bytes) {
                     "complete"
                 } else {
                     "partial"
@@ -3419,6 +3519,25 @@ impl SessionCore {
                 meta,
             });
         }
+    }
+
+    /// clear 收尾的重新 attach：裝置在線時 ATTACHING 並交 manager 再解析（`Effect::Reattach`），
+    /// 不在線（或 shutdown 中）維持 DETACHED。
+    fn request_reattach(&mut self, now: Mono) -> Vec<Effect> {
+        let by_id = self.profile.device_by_id.clone();
+        let real_path = match self.known_real_path.clone() {
+            Some(path) if self.device_present && !self.shutdown_requested && !by_id.is_empty() => {
+                path
+            }
+            _ => {
+                self.set_state(SessionState::Detached, now);
+                return Vec::new();
+            }
+        };
+        self.open_real_path = None;
+        self.reattach_pending = true;
+        self.set_state(SessionState::Attaching, now);
+        vec![Effect::Reattach { by_id, real_path }]
     }
 
     fn reopen_known_device(&mut self, now: Mono) -> Vec<Effect> {
@@ -3462,11 +3581,7 @@ impl SessionCore {
     fn session_value(&self, now: Mono) -> PyValue {
         PyValue::Dict(self.public(
             now,
-            &PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
+            &self.public_ctx(),
         ))
     }
 
@@ -3901,6 +4016,7 @@ impl SessionCore {
                     if let Some(capture) = self.background.get_mut(&id) {
                         capture.status = "done";
                     }
+                    self.sync_bg(&id);
                 }
             }
             let grant_cmd = Some(command.cmd_id.clone());
@@ -3965,6 +4081,10 @@ impl SessionCore {
             );
             self.foreground = Some(grant.clone());
             self.foreground_reboot = reboot;
+            // 審查 F14：reboot 命令 TX 一經提交，由 TxWriter 在同一次 Fence 臨界區內 arm quiet（不等 actor）。
+            self.deps.fence.with(|f| {
+                f.reboot_arm_op = reboot.then_some(grant.op_id);
+            });
             effects.push(Effect::StartOp {
                 grant,
                 spec: OpSpec::Command(command),
@@ -3988,26 +4108,30 @@ impl SessionCore {
             now,
             self.background_seq,
         );
+        let created_at = capture.created_at.clone();
         self.background.insert(cmd_id.to_string(), capture);
-        self.evict_background();
+        // `_evict_background_locked`：全域（manager 層）上限，依 `created_at` 淘汰最舊的已終結 capture；
+        // 擁有者以 COM 標識（rematerialize 不變），本 session 者就地移除，其餘交擁有者（審查 F28）。
+        let owner = self.profile.com.clone();
+        for (victim_owner, id) in self.deps.bg_index.register(cmd_id, &owner, &created_at) {
+            if victim_owner == owner {
+                self.drop_background_capture(&id);
+            } else {
+                self.deps.bg_index.evict_remote(&victim_owner, &id);
+            }
+        }
     }
 
-    /// `_evict_background_locked`：淘汰最舊的已終結 capture，並同步移除 `background_cmd_ids`（#45 D-94）。
-    fn evict_background(&mut self) {
-        if self.background.len() <= BG_CAPTURE_MAX_COUNT {
-            return;
-        }
-        let mut finalized: Vec<(String, String, u64)> = self
-            .background
-            .values()
-            .filter(|cap| cap.status != "active")
-            .map(|cap| (cap.created_at.clone(), cap.cmd_id.clone(), cap.seq_no))
-            .collect();
-        finalized.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-        let excess = self.background.len() - BG_CAPTURE_MAX_COUNT;
-        for (_, id, _) in finalized.into_iter().take(excess) {
-            self.background.shift_remove(&id);
-            self.background_cmd_ids.retain(|existing| *existing != id);
+    /// 丟棄被淘汰的 capture，並同步移除 `background_cmd_ids`（#45 D-94）。
+    fn drop_background_capture(&mut self, id: &str) {
+        self.background.shift_remove(id);
+        self.background_cmd_ids.retain(|existing| existing != id);
+    }
+
+    /// 將本地 capture 的 `status` 同步到全域索引（淘汰只考慮已終結者）。
+    fn sync_bg(&self, id: &str) {
+        if let Some(capture) = self.background.get(id) {
+            self.deps.bg_index.set_active(id, capture.status == "active");
         }
     }
 
@@ -4037,6 +4161,7 @@ impl SessionCore {
             capture.status = if error_code.is_some() { "error" } else { "done" };
             capture.error_code = error_code.map(str::to_string);
         }
+        self.sync_bg(cmd_id);
     }
 
     /// RX 進入 background capture 與 agent log（`_on_bridge_rx`；前景執行中不寫 agent log，EVT-D-L1）。
@@ -4051,7 +4176,7 @@ impl SessionCore {
                 capture.last_seq = wal_seq;
             }
         }
-        if self.foreground.is_some() {
+        if self.foreground_busy() {
             return;
         }
         let Some(cap) = self.log_capture.as_mut() else {
@@ -4078,38 +4203,11 @@ impl SessionCore {
         now: Mono,
     ) -> Result<PyDict, PyErr> {
         if let Some(capture) = self.background.get_mut(cmd_id) {
-            return capture.result(from_chunk, limit, now);
+            let result = capture.result(from_chunk, limit, now);
+            self.sync_bg(cmd_id);
+            return result;
         }
-        let not_found = pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id };
-        let Some(record) = self.deps.registry.get(cmd_id) else {
-            return Ok(not_found);
-        };
-        if record.get("execution_mode").and_then(PyValue::as_str) != Some("background") {
-            return Ok(not_found);
-        }
-        let status = record
-            .get("status")
-            .cloned()
-            .unwrap_or(PyValue::Null);
-        if status.as_str() == Some("done") {
-            return Ok(not_found);
-        }
-        if status.as_str() == Some("canceled")
-            && record.get("started_at").is_some_and(|v| !v.is_null())
-        {
-            return Ok(not_found);
-        }
-        Ok(pydict! {
-            "ok" => true,
-            "cmd_id" => cmd_id,
-            "status" => status,
-            "error_code" => record.get("error_code").cloned().unwrap_or(PyValue::Null),
-            "from_seq" => py_int(0),
-            "last_seq" => py_int(0),
-            "from_chunk" => py_int(from_chunk),
-            "next_chunk" => py_int(from_chunk),
-            "chunks" => PyValue::List(Vec::new()),
-        })
+        Ok(bg_fallback_from_registry(&self.deps.registry, cmd_id, from_chunk))
     }
 
     /// session detach：停止 agent log、終結 background capture、清除 `background_cmd_ids`。
@@ -4119,6 +4217,7 @@ impl SessionCore {
             if let Some(capture) = self.background.get_mut(&id) {
                 capture.status = "done";
             }
+            self.sync_bg(&id);
         }
     }
 
@@ -4135,7 +4234,54 @@ impl SessionCore {
     }
 
     fn vtty_alive(&self) -> Option<bool> {
-        self.self_test_probes.vtty_alive.as_ref().and_then(|f| f())
+        if let Some(probe) = self.self_test_probes.vtty_alive.as_ref() {
+            return probe();
+        }
+        // Python `snapshot()["vtty_alive"] = bool(primary and os.path.exists(primary))`。
+        self.current_vtty()
+            .map(|path| std::path::Path::new(path).exists())
+    }
+
+    /// Python `_suggest_profile_from_rx`：`clean_text(rx_tail(512))` 依序比對非 passthrough template 的
+    /// `prompt_regex`（`re.search`；不合法 regex 略過），回第一個命中的 template 名。
+    fn suggest_profile_from_rx(&self) -> Option<String> {
+        let templates = &self.self_test_probes.templates;
+        if templates.is_empty() {
+            return None;
+        }
+        let snapshot = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
+        if snapshot.is_empty() {
+            return None;
+        }
+        templates
+            .iter()
+            .filter(|tpl| tpl.platform != "passthrough")
+            .find(|tpl| {
+                sw_proto::pyre::compile(&tpl.prompt_regex, sw_proto::pyre::PyFlags(0))
+                    .is_ok_and(|re| re.search(&snapshot).is_some())
+            })
+            .map(|tpl| tpl.profile_name.clone())
+    }
+
+    /// 現行 bridge 的哨兵 vtty（無 bridge 時為 `None`）。
+    fn current_vtty(&self) -> Option<&str> {
+        self.generations.conn_epoch.and(self.vtty.as_deref())
+    }
+
+    /// `public()` 的 console 欄位（Python `to_public_dict`：有 bridge 時 `len(list_consoles())` 與 primary vtty）。
+    fn public_ctx(&self) -> PublicCtx {
+        match self.generations.conn_epoch {
+            Some(_) => PublicCtx {
+                console_count: self.console_count as i128,
+                vtty: self.vtty.clone(),
+                console_endpoint: None,
+            },
+            None => PublicCtx {
+                console_count: 0,
+                vtty: None,
+                console_endpoint: None,
+            },
+        }
     }
 
     fn resolve_log_dir(&self) -> String {
@@ -4267,6 +4413,18 @@ impl SessionCore {
 
     // ---------------- OpFinished ----------------
 
+    /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）是前景 operation；recover、self-test、
+    /// interactive send 不設此旗標（審查 F27）。
+    /// merge P5 348eb2f：取代 P6 Task 6（增補 #26）的 `todo!` 骨架；P6 的 `replay_hold` 條件由 P6 合入時補上。
+    pub fn foreground_busy(&self) -> bool {
+        self.foreground.as_ref().is_some_and(|grant| {
+            matches!(
+                self.pending_ops.get(&grant.op_id),
+                Some(PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. })
+            )
+        })
+    }
+
     fn op_finished(
         &mut self,
         op_id: OpId,
@@ -4285,6 +4443,22 @@ impl SessionCore {
             return Vec::new();
         }
         let pending = self.pending_ops.remove(&op_id);
+        if self
+            .side_ops
+            .get(&op_id)
+            .is_some_and(|grant| grant.epoch == epoch)
+        {
+            // 並行 op（READY recover／self-test）：不動前景槽。
+            self.side_ops.remove(&op_id);
+            let mut effects = match pending {
+                Some(PendingOp::Recover { reply }) => self.finish_recover(reply, outcome, now),
+                Some(other) => self.answer_op(other, outcome, now, true),
+                None => Vec::new(),
+            };
+            effects.push(Effect::SettleTx { epoch, op_id });
+            effects.extend(self.start_next(now));
+            return effects;
+        }
         let is_current = self
             .foreground
             .as_ref()
@@ -4511,7 +4685,8 @@ impl SessionCore {
                     "recovery_action" => "EXPECT_REBOOT",
                 })
             }
-            // Python：救援路徑例外穿出 → `_map_aborted_result` → SEND_FAILED。
+            // Python：救援路徑例外穿出 → `_map_aborted_result`：命令已確認 bytes > 0 時由 OpRunner 直接回
+            // COMMAND_ABORTED_IN_FLIGHT＋META（審查 F26）；此處只剩 0 byte（未有命令 TX 帳）→ SEND_FAILED。
             OpOutcome::Error(_) => CmdOutcome::Result(pydict! { "ok" => false, "error_code" => "SEND_FAILED" }),
             _ => CmdOutcome::SendFailed,
         };
@@ -4608,6 +4783,21 @@ impl SessionCore {
                     ),
                 ];
             }
+            if self.device_present {
+                // attach 已在進行（開檔中）：Python `_spawn_attach` 對 in-flight attach 直接返回，回應仍是
+                // REATTACH；不重複發 `OpenBridge`（審查 F29）。
+                self.set_last_error(None, None);
+                self.set_state(SessionState::Attaching, now);
+                return vec![Effect::Reply(
+                    reply,
+                    Ok(pydict! {
+                        "ok" => true,
+                        "recovering" => false,
+                        "action" => "REATTACH",
+                        "session" => self.session_value(now),
+                    }),
+                )];
+            }
             return vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))];
         }
         match self.state {
@@ -4618,14 +4808,11 @@ impl SessionCore {
                 self.reprobe_existing_bridge(reply, ReprobeWaiter::Recover { force: false }, now)
             }
             SessionState::Ready => {
-                if self.foreground.is_some() {
-                    // Slice 2.1 單一前景槽：前景忙時不併行送救援鍵（Python 會與在途命令並行寫入）。
-                    return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
-                }
+                // Python `recover_session` READY 分支不看 `foreground_busy`：救援鍵與在途命令並行（審查 F25）。
                 let grant = self.new_grant(None);
                 self.pending_ops
                     .insert(grant.op_id, PendingOp::Recover { reply });
-                self.foreground = Some(grant.clone());
+                self.side_ops.insert(grant.op_id, grant.clone());
                 vec![Effect::StartOp {
                     grant,
                     spec: OpSpec::Recover { timeout_s, force },
@@ -4841,11 +5028,8 @@ impl SessionCore {
         self.login_run = Some(LoginRun {
             epoch,
             kind: LoginRunKind::RebootRecovery,
-            waiters: Vec::new(),
             fsm_gen: self.generations.fsm_gen,
-            quiet_bumps: 0,
-            exempt_bumps: 0,
-            revoked_by_quiet: false,
+            waiters: Vec::new(),
         });
         vec![Effect::StartLogin {
             epoch,
@@ -4865,9 +5049,12 @@ impl SessionCore {
             return Vec::new();
         }
         // `_spawn_reboot_recovery`：TX 例外／其他例外 → RECOVERY_ERROR＋WARNING、續迴圈；quiet／新世代撤銷 → continue。
-        if let Some(exc) = login_exception_name(&result) {
-            let tx_exception = !matches!(result, crate::login_fsm::LoginOutcome::Raised(_));
-            let _ = exc;
+        if let Some((exc, _)) = login_exception(&result) {
+            // Python `except TxIncompleteError`（含子類別 TxUnknownError／WalUnavailableError）與 `except Exception` 分開告警。
+            let tx_exception = matches!(
+                exc.as_str(),
+                "TxIncompleteError" | "TxUnknownError" | "WalUnavailableError"
+            );
             self.set_last_error(Some("RECOVERY_ERROR".into()), None);
             return vec![Effect::Warn(if tx_exception {
                 format!(
@@ -4894,6 +5081,7 @@ impl SessionCore {
                 self.reboot_recovery = None;
                 vec![Effect::Notify(ManagerNote::SessionReady {
                     sid: self.sid.clone(),
+                    via_attach: false,
                 })]
             }
             crate::login_fsm::LoginOutcome::NotReady(error)
@@ -4901,8 +5089,8 @@ impl SessionCore {
                 self.set_last_error(Some(error), None);
                 Vec::new()
             }
-            // quiet／新世代撤銷（`_login_tx_refused`）：continue，不記錯。
-            crate::login_fsm::LoginOutcome::Aborted(_) | crate::login_fsm::LoginOutcome::Raised(_) => {
+            // quiet／新世代撤銷（`_login_tx_refused`）：continue，不記錯（例外已於上方收斂）。
+            crate::login_fsm::LoginOutcome::Aborted(_) | crate::login_fsm::LoginOutcome::Raised { .. } => {
                 Vec::new()
             }
         }
@@ -4965,7 +5153,7 @@ impl SessionCore {
                 "session" => self.session_value(now),
                 "attached_real_path" => attached,
                 "current_real_path" => current,
-                "attached_vtty" => PyValue::Null,
+                "attached_vtty" => option_string(base.attached_vtty.as_deref()),
                 "bridge_generation" => py_int(base.bridge_generation as i128),
                 "probe_ok" => true,
                 "recommended_action" => "none",
@@ -5026,16 +5214,19 @@ impl SessionCore {
             holder,
             by_id_realpath: self.known_real_path.clone(),
             vtty_alive: self.vtty_alive(),
+            bridge: self.generations.conn_epoch.and_then(|epoch| {
+                self.self_test_probes
+                    .bridge_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot(epoch))
+            }),
             strict_human_lock,
             now,
         };
         match self.self_test_pre_probe(&ctx) {
             Ok(result) => vec![Effect::Reply(reply, Ok(self.finish_self_test(result)))],
             Err(need) => {
-                if self.foreground.is_some() {
-                    // Slice 2.1 單一前景槽：前景忙時不併行送 nonce probe。
-                    return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
-                }
+                // Python `self_test` 不看前景：nonce probe 與在途命令並行（審查 F25）。
                 let rng = self.deps.rng.clone();
                 let sequence = self.next_op_id;
                 let mut fill = |bytes: &mut [u8]| {
@@ -5058,7 +5249,7 @@ impl SessionCore {
                         lease_ctx: self.lease_ctx(),
                     },
                 );
-                self.foreground = Some(grant.clone());
+                self.side_ops.insert(grant.op_id, grant.clone());
                 vec![Effect::StartOp {
                     grant,
                     spec: OpSpec::SelfTestProbe {
@@ -5152,11 +5343,23 @@ impl SessionCore {
                 vec![("current_real_path", current)],
             ));
         }
+        // Python：bridge 物件仍在但 `snapshot()` 的 running／serial_alive 為假 → BRIDGE_DOWN／recover，零 probe。
+        if ctx
+            .bridge
+            .is_some_and(|snapshot| !snapshot.running || !snapshot.serial_alive)
+        {
+            return Ok(simple(
+                "BRIDGE_DOWN",
+                "recover",
+                vec![("current_real_path", current)],
+            ));
+        }
+        let attached_vtty = option_string(self.current_vtty());
         if ctx.vtty_alive == Some(false) {
             return Ok(simple(
                 "VTTY_STALE",
                 "console_attach",
-                vec![("attached_vtty", PyValue::Null)],
+                vec![("attached_vtty", attached_vtty)],
             ));
         }
         let attached = option_string(self.attached_real_path.as_deref());
@@ -5165,7 +5368,7 @@ impl SessionCore {
             vec![
                 ("attached_real_path", attached.clone()),
                 ("current_real_path", current.clone()),
-                ("attached_vtty", PyValue::Null),
+                ("attached_vtty", attached_vtty.clone()),
                 ("bridge_generation", bridge_generation.clone()),
             ]
         };
@@ -5183,7 +5386,25 @@ impl SessionCore {
                     "passthrough_ready_in_s",
                     PyValue::from(py_round((PASSTHROUGH_READY_QUIET_S - elapsed).max(0.0), 1)),
                 ));
-                ("PASSTHROUGH", "console_attach")
+                // #181（Python `_suggest_profile_from_rx`）：fallback 為未經量測的 catch-all——RX 命中某個非
+                // passthrough template 的 prompt 時給出可執行的出口（審查 F31）。
+                match (self.profile_source == "fallback")
+                    .then(|| self.suggest_profile_from_rx())
+                    .flatten()
+                {
+                    Some(suggested) => {
+                        let com = self.profile.com.clone();
+                        extra.push(("suggested_profile", PyValue::from(suggested.clone())));
+                        extra.push((
+                            "hint",
+                            PyValue::from(format!(
+                                "此 session 為未經量測的 fallback 分類，RX 內容匹配 {suggested}。套用：serialwrap session pin --selector {com} --profile {suggested} 之後 serialwrap session clear --selector {com}。"
+                            )),
+                        ));
+                        ("PASSTHROUGH", "pin_profile")
+                    }
+                    None => ("PASSTHROUGH", "console_attach"),
+                }
             } else if self.last_error.as_deref() == Some("LOGIN_REQUIRED") {
                 ("LOGIN_REQUIRED", "console_attach")
             } else if self.last_error.as_deref() == Some("REBOOTING") {
@@ -5244,6 +5465,7 @@ impl SessionCore {
                 attached_real_path: self.attached_real_path.clone(),
                 current_real_path: ctx.by_id_realpath.clone(),
                 bridge_generation: self.generations.bridge_generation,
+                attached_vtty: self.current_vtty().map(str::to_string),
             },
         })
     }
@@ -5441,6 +5663,41 @@ fn py_int(value: i128) -> PyValue {
     PyValue::Int(PyInt::Small(value))
 }
 
+/// Python `_bg_fallback_from_arbiter`：capture 尚未建立（或已不在任何 session）時以命令紀錄合成 result_tail 回應；
+/// 非 background、done、已開始的 canceled 回 CMD_NOT_FOUND（審查 F76：service 於全域 capture 查無後才呼叫）。
+pub fn bg_fallback_from_registry(registry: &CommandRegistry, cmd_id: &str, from_chunk: i128) -> PyDict {
+    let not_found = pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id };
+    let Some(record) = registry.get(cmd_id) else {
+        return not_found;
+    };
+    if record.get("execution_mode").and_then(PyValue::as_str) != Some("background") {
+        return not_found;
+    }
+    let status = record
+        .get("status")
+        .cloned()
+        .unwrap_or(PyValue::Null);
+    if status.as_str() == Some("done") {
+        return not_found;
+    }
+    if status.as_str() == Some("canceled")
+        && record.get("started_at").is_some_and(|v| !v.is_null())
+    {
+        return not_found;
+    }
+    pydict! {
+        "ok" => true,
+        "cmd_id" => cmd_id,
+        "status" => status,
+        "error_code" => record.get("error_code").cloned().unwrap_or(PyValue::Null),
+        "from_seq" => py_int(0),
+        "last_seq" => py_int(0),
+        "from_chunk" => py_int(from_chunk),
+        "next_chunk" => py_int(from_chunk),
+        "chunks" => PyValue::List(Vec::new()),
+    }
+}
+
 fn age_s(last: Mono, now: Mono) -> PyValue {
     if last == 0 {
         PyValue::Null
@@ -5536,39 +5793,38 @@ impl SessionCore {
         todo!("P6 Task 6")
     }
 
-    /// P6 Task 6（增補 #26）：`foreground.is_some()` 或存在未撤銷的 `replay_hold`（07 D-22(2)）。
-    pub fn foreground_busy(&self) -> bool {
-        todo!("P6 Task 6")
-    }
 }
 
-/// login run 結果中「Python 會以例外穿出」者的例外型別名（`_login_tx_refused` 只認 quiet／stale_login_gen）：
-/// 部分寫出／結果不明 → `TxIncompleteError`；WAL 不健康 → `WalUnavailableError`；draining／revoked op →
-/// `TxIncompleteError`；`Raised(exc)` → `exc`。quiet／新世代撤銷與 `Cancelled` 回 `None`（撤銷語意）。
-/// 已知差異：Python 結果不明為 `TxUnknownError`，待 Task 7 `LoginReport` 帶出 TxResult 後區分。
-fn login_exception_name(result: &crate::login_fsm::LoginOutcome) -> Option<String> {
+/// login run 結果中「Python 會以例外穿出」者的（例外型別名, `str(exc)`）（`_login_tx_refused` 只認 quiet／stale_login_gen）。
+/// login FSM 自 merge P5 F16 起直接回 `Raised { exc, message }`（`classify_login_tx_failure`）；下列 `Aborted`
+/// 變體 login FSM 已不產生，保留為防禦性收斂（訊息無 TxResult 可取，以型別名代之）：部分寫出 → `TxIncompleteError`；
+/// WAL 不健康 → `WalUnavailableError`；draining／revoked op → `TxIncompleteError`。quiet／新世代撤銷與 `Cancelled`
+/// 回 `None`（撤銷語意）。
+fn login_exception(result: &crate::login_fsm::LoginOutcome) -> Option<(String, String)> {
     use crate::login_fsm::{LoginAbort, LoginOutcome};
+    let synthetic = |exc: &str| Some((exc.to_string(), exc.to_string()));
     match result {
-        LoginOutcome::Raised(exc) => Some(exc.clone()),
-        LoginOutcome::Aborted(LoginAbort::TxIncomplete) => Some("TxIncompleteError".into()),
+        LoginOutcome::Raised { exc, message } => Some((exc.clone(), message.clone())),
+        LoginOutcome::Aborted(LoginAbort::TxIncomplete) => synthetic("TxIncompleteError"),
         LoginOutcome::Aborted(LoginAbort::Refused(FenceReject::WalUnhealthy)) => {
-            Some("WalUnavailableError".into())
+            synthetic("WalUnavailableError")
         }
         LoginOutcome::Aborted(LoginAbort::Refused(
             FenceReject::Frozen | FenceReject::Cancelled,
-        )) => Some("TxIncompleteError".into()),
+        )) => synthetic("TxIncompleteError"),
         _ => None,
     }
 }
 
 /// P7 Task 3 過渡：Task 7 的 login 收斂表（`login_run.rs`）落地前，attach 路徑的新 variant 依 Python 收斂——
-/// 例外（`login_exception_name`）同 attach 失敗 `Failed("ATTACH_FAILED:<型別>")`（`session_manager.py:4873-4909`）；
+/// 例外（`login_exception`）一律以 `Raised { exc, message }` 交給 attach 的 `Raised` 分支（`_attach_by_id` 外層
+/// except：關 bridge、DETACHED、`ATTACH_FAILED:<型別>`，`session_manager.py:4873-4909`）；
 /// 其餘 `Aborted`（quiet／新世代撤銷）同 06 `refused()`（`NotReady("PROMPT_UNAVAILABLE")`）。
 /// 只供 attach（與既有 bridge 再探的非例外結果）使用；reboot recovery／自動重探各自收斂。
 fn legacy_login_outcome(result: crate::login_fsm::LoginOutcome) -> crate::login_fsm::LoginOutcome {
     use crate::login_fsm::LoginOutcome;
-    if let Some(exc) = login_exception_name(&result) {
-        return LoginOutcome::Failed(format!("ATTACH_FAILED:{exc}"));
+    if let Some((exc, message)) = login_exception(&result) {
+        return LoginOutcome::Raised { exc, message };
     }
     match result {
         LoginOutcome::Aborted(_) => LoginOutcome::NotReady("PROMPT_UNAVAILABLE".into()),

@@ -1,0 +1,85 @@
+---
+meta:
+  name: s21-reboot-minimal-guard
+  category: l15-scenario
+  severity: critical
+  description: "reboot 後 Quiet 窗口內命令被拒（AUTOBOOT_QUIET／READY_UNCONFIRMED）且零 TX，DUT 回 prompt 後重新 READY 並可執行命令（§11.6 最小 reboot 防護，Slice 2.1 Task 21）"
+  scenario:
+    revision: "2026-10-27.1"
+    seed: 1021
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 90
+    invariants: [zero_tx_on_reject, no_auto_resend, insufficient_evidence_not_pass]
+    behavior_changes: ["SC-03"]
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "reboot", "--cmd-timeout", "20"]
+    save_as: rb
+    expect: {ok: true}
+  - action: wait_wire_marker
+    marker: "reboot\n"
+    observation: "serial_read"
+    timeout_s: 10
+  - action: dut_control
+    action_name: logical_reboot
+    params:
+      pre_text: "\r\nU-Boot 2024.01\r\nHit any key to stop autoboot:  3 \r\n"
+      banner_delay_ms: 500
+  - action: wait_wire_marker
+    marker: "Hit any key"
+    observation: "serial_write"
+    timeout_s: 10
+  - action: op_begin
+    op_id: quiet
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo DURING"]
+    save_as: during
+    expect: {ok: false, error_code: {matches: "^(AUTOBOOT_QUIET|READY_UNCONFIRMED)$"}}
+  - action: op_end
+    op_id: quiet
+  - action: assert_zero_tx
+    op_id: quiet
+  # DUT 於 banner_delay_ms 後回 boot banner 與 prompt；Quiet 窗口結束後重新 READY
+  - action: wait_state
+    selector: COM0
+    state: READY
+    field: boot_quiet_remaining_s
+    value: null
+    timeout_s: 30
+  # 被拒命令 payload 在 wire 出現 0 次
+  - action: assert_command_resolved
+    from: during
+    timeout_s: 10
+    payload: "echo DURING\n"
+  # reboot 命令須到達終態，且 payload 只寫出一次（不自動重送）
+  - action: assert_command_resolved
+    from: rb
+    timeout_s: 30
+    payload: "reboot\n"
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo AFTER"]
+    save_as: after
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{after.cmd_id}"]
+    json_path: "command.status"
+    equals: done
+    timeout_s: 20
+  - action: assert_wire_contiguous
+    payloads: ["echo AFTER\n"]
+  - action: assert_compare

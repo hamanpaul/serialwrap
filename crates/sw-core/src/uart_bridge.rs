@@ -581,6 +581,8 @@ pub struct IoWorkerArgs {
     pub rx: Arc<RxShared>,
     pub fence: Arc<Fence>,
     pub sentinel: Option<Box<dyn ConsoleIo>>,
+    /// 哨兵 PTY slave 的 keepalive（與 master 同生命週期；worker 收尾關閉 master 後一併釋放）。
+    pub sentinel_keepalive: Option<sw_pal::traits::KeepAlive>,
     pub data: Sender<DataEvent>,
     pub control: Sender<ControlEvent>,
     pub clock: Arc<dyn Clock>,
@@ -597,6 +599,7 @@ pub struct IoWorker {
     close: CloseToken,
     wal: Arc<WalWriter>,
     epoch: u64,
+    sentinel_keepalive: Option<sw_pal::traits::KeepAlive>,
 }
 
 /// IoWorker 對外快照（P5-T12 parity-amendments #41）。
@@ -656,6 +659,7 @@ impl IoWorker {
             close,
             wal,
             epoch,
+            sentinel_keepalive: args.sentinel_keepalive,
         }
     }
 
@@ -691,6 +695,7 @@ impl IoWorker {
             close,
             wal,
             epoch,
+            sentinel_keepalive,
         } = self;
         std::thread::Builder::new()
             .name(format!("serialwrap-drain-{}", stop_id.0))
@@ -707,6 +712,7 @@ impl IoWorker {
                             unrecorded,
                         } = reader_exit;
                         drop(sentinel);
+                        drop(sentinel_keepalive);
                         let close_receipt = close.close(reader, writer);
                         (ledger, Some(unrecorded), Some(close_receipt))
                     }

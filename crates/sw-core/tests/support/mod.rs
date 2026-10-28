@@ -231,6 +231,7 @@ impl CoreHarness {
                     .map(Ok)
             }),
             input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bg_index: sw_core::capture::BackgroundIndex::new(),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
 
@@ -377,7 +378,7 @@ impl CoreHarness {
         self
     }
 
-    fn attach_device(&mut self) {
+    pub fn attach_device(&mut self) {
         self.feed(ControlEvent::DeviceAttached {
             by_id: DEVICE_BY_ID.into(),
             real_path: REAL_PATH.into(),
@@ -392,6 +393,8 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: REAL_PATH.into(),
+            rx: self.rx.clone(),
+            vtty: None,
         };
         self.feed(ControlEvent::BridgeOpened {
             epoch_hint: 0,
@@ -478,6 +481,7 @@ impl CoreHarness {
                 rx: self.rx.clone(),
                 fence: self.fence.clone(),
                 sentinel: None,
+                sentinel_keepalive: None,
                 data: self.data_tx.clone(),
                 control: self.ctl_tx.clone(),
                 clock: self.clock.clone(),
@@ -494,6 +498,8 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: real_path.to_string(),
+            rx: self.rx.clone(),
+            vtty: None,
         }
     }
 
@@ -929,6 +935,7 @@ impl EffectExecutor for RigExec {
                                 rx: self.rx.clone(),
                                 fence: self.fence.clone(),
                                 sentinel: None,
+                                sentinel_keepalive: None,
                                 data: self.data.clone(),
                                 control: tx.clone(),
                                 clock: self.clock.clone(),
@@ -938,6 +945,8 @@ impl EffectExecutor for RigExec {
                             epoch,
                             worker,
                             real_path: dev.0.clone(),
+                            rx: self.rx.clone(),
+                            vtty: None,
                         })
                     }
                     Err(OpenError::Held(holder)) => Err(OpenFailure::Held(holder)),
@@ -979,6 +988,10 @@ impl EffectExecutor for RigExec {
                     .push(msg);
             }
             Effect::Notify(_) => {}
+            Effect::Reattach { by_id, real_path } => {
+                // 測試替身無 manager 再解析：直接回送 DeviceAttached（等同無 pin、非 fallback）。
+                let _ = tx.send(ControlEvent::DeviceAttached { by_id, real_path });
+            }
             Effect::Schedule { at, ev } => {
                 // 以 FakeClock 輪詢到期後投遞（測試替身；期限一律依 monotonic）。
                 let clock = self.clock.clone();
@@ -1126,6 +1139,15 @@ impl ActorRig {
 
     /// 同 `new`，但在 actor 啟動前可調整 `SessionCore`（Task 14：capture env、self-test 觀測注入）。
     pub fn new_with(profile_yaml: &str, setup: impl FnOnce(&mut SessionCore)) -> ActorRig {
+        ActorRig::new_with_bg_index(profile_yaml, setup, sw_core::capture::BackgroundIndex::new())
+    }
+
+    /// 同 `new_with`，並注入共用的 background capture 索引（審查 F28：全域上限）。
+    pub fn new_with_bg_index(
+        profile_yaml: &str,
+        setup: impl FnOnce(&mut SessionCore),
+        bg_index: Arc<sw_core::capture::BackgroundIndex>,
+    ) -> ActorRig {
         let profile = profile_of(profile_yaml);
         let clock = FakeClock::new();
         let fence = Fence::new();
@@ -1170,6 +1192,7 @@ impl ActorRig {
                     .map(|t| Ok(t.clone()))
             }),
             input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bg_index,
         };
         let exec_profile = profile.clone();
         let mut core = SessionCore::new(profile, "yaml-target", deps);
@@ -1738,6 +1761,10 @@ impl CloseImpl for LoggedClose {
         self.inner.is_alive()
     }
 
+    fn configure(&self, cfg: &SerialConfig) -> sw_pal::PalResult<()> {
+        self.inner.configure(cfg)
+    }
+
     fn close(self: Box<Self>) -> CloseReceipt {
         let me = *self;
         me.log
@@ -1941,6 +1968,7 @@ fn assemble_manager(
     clock: Arc<FakeClock>,
     serial: Arc<RigSerial>,
     warnings: Arc<Mutex<Vec<String>>>,
+    console: Arc<dyn ConsoleTransportFactory>,
 ) -> (Arc<SessionManager>, Arc<WalWriter>) {
     let load = load_profiles(
         PROFILE_DIR,
@@ -1961,7 +1989,7 @@ fn assemble_manager(
     let deps = ManagerDeps {
         serial: serial.clone(),
         uart_excl: Arc::new(RigExcl),
-        console: Arc::new(RigConsole),
+        console,
         caps: sw_pal::fakes::posix_caps(),
         wal: wal.clone(),
         registry: CommandRegistry::new(),
@@ -1995,6 +2023,7 @@ pub struct ManagerRig {
     yaml: String,
     warnings: Arc<Mutex<Vec<String>>>,
     shared: Arc<RigShared>,
+    console: Arc<dyn ConsoleTransportFactory>,
 }
 
 /// 快照與實體路徑登錄（restart 之間共享）。
@@ -2009,6 +2038,16 @@ struct RigShared {
 impl ManagerRig {
     /// 以 YAML 與 `state.json` 初值建立；`primary` 為 `(by_id, 實體路徑)`，會登錄到快照並安裝 shell 回應。
     pub fn with(yaml: &str, loaded: LoadedState, primary: Option<(&str, &str)>) -> ManagerRig {
+        ManagerRig::with_console(yaml, loaded, primary, Arc::new(RigConsole))
+    }
+
+    /// 同 [`ManagerRig::with`]，但以 `console` 作為哨兵 PTY 工廠（例如 `sw_pal::native().console`：POSIX 建真 PTY）。
+    pub fn with_console(
+        yaml: &str,
+        loaded: LoadedState,
+        primary: Option<(&str, &str)>,
+        console: Arc<dyn ConsoleTransportFactory>,
+    ) -> ManagerRig {
         let serial = RigSerial::new();
         let shared = Arc::new(RigShared::default());
         let dev = match primary {
@@ -2042,6 +2081,7 @@ impl ManagerRig {
             clock.clone(),
             serial.clone(),
             warnings.clone(),
+            console.clone(),
         );
         ManagerRig {
             mgr,
@@ -2055,6 +2095,7 @@ impl ManagerRig {
             yaml: yaml.to_string(),
             warnings,
             shared,
+            console,
         }
     }
 
@@ -2291,6 +2332,7 @@ impl ManagerRig {
             self.clock.clone(),
             self.serial.clone(),
             warnings.clone(),
+            self.console.clone(),
         );
         ManagerRig {
             mgr,
@@ -2304,6 +2346,7 @@ impl ManagerRig {
             yaml: self.yaml.clone(),
             warnings,
             shared: self.shared.clone(),
+            console: self.console.clone(),
         }
     }
 }

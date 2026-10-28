@@ -1852,7 +1852,7 @@ fn recreate_meta_matches_contract_schema() {
 }
 
 /// parity-amendments-2026-10-26 #61：暫時性輪替失敗（EACCES）計入 health `rotate_retry`（`wal.py` `_rotate_retry_count`）；
-/// Rust 尚無 OD-19 延遲佇列，`rotate_deferred`／`deferred_delete_pending` 維持 0。
+/// 單次失敗仍在立即退避段（`WAL_ROTATE_RETRY_BACKOFF_S` 第 1 段），未轉入延遲佇列，故另兩鍵為 0。
 #[test]
 fn health_rotate_retry_counts_transient_rename_failure() {
     let (w, fs, _) = writer(ROTATE_200);
@@ -1867,4 +1867,170 @@ fn health_rotate_retry_counts_transient_rename_failure() {
         d.get("deferred_delete_pending"),
         Some(&PyValue::Int(PyInt::Small(0)))
     );
+}
+
+// ---------------------------------------------------------------------------
+// OD-19：輪替干擾的有界退避與延遲佇列（`origin/feature/rust-refactor` `wal.py`
+// `_rotate_if_needed`／`_schedule_rotate_retry_locked`／`tick`；審查 F10、#88 F12）
+// ---------------------------------------------------------------------------
+
+fn health_int(w: &WalWriter, key: &str) -> i64 {
+    w.health()
+        .to_pydict()
+        .get(key)
+        .and_then(PyValue::as_i64)
+        .unwrap_or_else(|| panic!("health 缺 {key}"))
+}
+
+fn rotate_counts(w: &WalWriter) -> (i64, i64, i64) {
+    (
+        health_int(w, "rotate_retry"),
+        health_int(w, "rotate_deferred"),
+        health_int(w, "deferred_delete_pending"),
+    )
+}
+
+/// 讓現行檔超過 200 bytes 門檻（一筆 RX 行約 200 bytes）。
+fn grow_past_rotate(w: &WalWriter) {
+    w.append(req("RX", "uart", b"x"));
+    w.append(req("RX", "uart", b"x"));
+}
+
+#[test]
+fn rotate_backoff_defers_after_three_transient_failures() {
+    // Python：前 3 次 EACCES 依 (0.01, 0.05, 0.2) s 退避，第 4 次轉入延遲佇列 → 4/1/1。
+    let (w, fs, clock) = writer(ROTATE_200);
+    w.set_warn_sink(Arc::new(|_| {}));
+    grow_past_rotate(&w);
+    let before = rotate_counts(&w);
+    assert_eq!(before, (0, 0, 0), "門檻前不得計數");
+    fs.fail_next_renames(1000, eacces());
+    clock.advance(Duration::from_millis(300));
+    for backoff_ms in [11u64, 51, 201, 0] {
+        w.append(req("RX", "uart", b"x"));
+        clock.advance(Duration::from_millis(backoff_ms));
+    }
+    assert_eq!(rotate_counts(&w), (4, 1, 1));
+    // 已延遲：1 s 內再 append 不嘗試、不計數。
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(rotate_counts(&w), (4, 1, 1));
+    // 延遲間隔 1 s 到期後再試一次（仍失敗）：retry 加 1，deferred 不重複計（只在轉入時加一）。
+    clock.advance(Duration::from_millis(1001));
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(rotate_counts(&w), (5, 1, 1));
+}
+
+#[test]
+fn rotate_retry_not_counted_before_next_at() {
+    // Python：rename 持續 EACCES、時鐘不前進，連續 5 次 append → rotate_retry 恰 1（未到 next_at 不嘗試、不計數）。
+    let (w, fs, _clock) = writer(ROTATE_200);
+    w.set_warn_sink(Arc::new(|_| {}));
+    grow_past_rotate(&w);
+    fs.fail_next_renames(1000, eacces());
+    for _ in 0..5 {
+        w.append(req("RX", "uart", b"x"));
+    }
+    assert_eq!(rotate_counts(&w), (1, 0, 0));
+}
+
+#[test]
+fn rotate_close_and_sync_dir_transient_errors_count() {
+    // Python：輪替 try 區塊內 close(sync=True)／sync_dir 的暫時性 OSError 同樣走 `_schedule_rotate_retry_locked`。
+    let (w, fs, clock) = writer(ROTATE_200);
+    w.set_warn_sink(Arc::new(|_| {}));
+    grow_past_rotate(&w);
+    fs.fail_next_handle_syncs(p(WAL), 1, eacces());
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(health_int(&w, "rotate_retry"), 1, "close(sync) EACCES 應計數");
+    clock.advance(Duration::from_millis(11));
+    fs.fail_next_sync_dirs(1, eacces());
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(health_int(&w, "rotate_retry"), 2, "sync_dir EACCES 應計數");
+    assert!(has_archive(&fs, WAL, SUFFIX_1), "rename 已完成");
+}
+
+#[test]
+fn rotate_non_transient_error_clears_schedule() {
+    // Python：非暫時性錯誤（EIO）→ pop pending、不計 rotate_retry；下一次 append 立即重試。
+    let (w, fs, _clock) = writer(ROTATE_200);
+    w.set_warn_sink(Arc::new(|_| {}));
+    grow_past_rotate(&w);
+    fs.fail_next_renames(1, eacces());
+    w.append(req("RX", "uart", b"x"));
+    fs.fail_next_renames(1, eio());
+    // 未到 next_at（10 ms）：不嘗試，EIO 留在佇列。
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(health_int(&w, "rotate_retry"), 1);
+}
+
+#[test]
+fn rotate_schedule_cancelled_when_file_shrinks_or_vanishes() {
+    // #88：檔案已低於門檻（外部截短）或已不存在 → 先前排程的輪替不再需要（pending 移除）。
+    let (w, fs, clock) = writer(ROTATE_200);
+    let warnings = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let warnings = warnings.clone();
+        w.set_warn_sink(Arc::new(move |m| warnings.lock().unwrap().push(m.to_string())));
+    }
+    grow_past_rotate(&w);
+    fs.fail_next_renames(4, eacces());
+    clock.advance(Duration::from_millis(300));
+    for backoff_ms in [11u64, 51, 201, 0] {
+        w.append(req("RX", "uart", b"x"));
+        clock.advance(Duration::from_millis(backoff_ms));
+    }
+    assert_eq!(rotate_counts(&w), (4, 1, 1));
+    // 截短（identity 不變）→ 低於門檻 → pending 移除，延遲中的數量歸零（累計鍵不倒退）。
+    fs.external_truncate(p(WAL), 0);
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(rotate_counts(&w), (4, 1, 0));
+    // 移除後重新超過門檻並再失敗：重新從第 1 段退避計起（failures 歸零），不直接進延遲。
+    grow_past_rotate(&w);
+    fs.fail_next_renames(1, eacces());
+    w.append(req("RX", "uart", b"x"));
+    assert_eq!(rotate_counts(&w), (5, 1, 0));
+    let n = warnings.lock().unwrap().iter().filter(|m| m.contains("WAL 輪替失敗")).count();
+    // 告警：首次失敗、轉入延遲各一筆；pending 移除後再失敗屬新的首次失敗。
+    assert_eq!(n, 3, "{:?}", warnings.lock().unwrap());
+}
+
+#[test]
+fn rotate_deferred_warning_rate_limited_and_tick_completes() {
+    // Python：延遲中每 60 s 最多一筆告警；tick() 在無新寫入時完成延後輪替，並於新現行檔寫
+    // `WAL_ROTATED_AFTER_DEFERRAL` META（archived_through_seq = 輪替前最後 seq）。
+    let (w, fs, clock) = writer(ROTATE_200);
+    let warnings = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let warnings = warnings.clone();
+        w.set_warn_sink(Arc::new(move |m| warnings.lock().unwrap().push(m.to_string())));
+    }
+    grow_past_rotate(&w);
+    fs.fail_next_renames(6, eacces());
+    clock.advance(Duration::from_millis(300));
+    for backoff_ms in [11u64, 51, 201, 1001, 1001] {
+        w.append(req("RX", "uart", b"x"));
+        clock.advance(Duration::from_millis(backoff_ms));
+    }
+    // 第 1 次與轉入延遲（第 4 次）告警；第 5 次在 60 s 內不告警。
+    let count = |ws: &Arc<Mutex<Vec<String>>>| {
+        ws.lock().unwrap().iter().filter(|m| m.contains("WAL 輪替失敗")).count()
+    };
+    assert_eq!(count(&warnings), 2);
+    clock.advance(Duration::from_secs(61));
+    assert!(w.tick(), "第 6 次（tick 驅動）仍失敗");
+    assert_eq!(count(&warnings), 3, "延遲中滿 60 s 再告警一筆");
+    let last_seq = w.current_seq();
+    clock.advance(Duration::from_millis(1001));
+    assert!(!w.tick(), "rename 不再失敗：tick 完成輪替");
+    assert_eq!(rotate_counts(&w), (6, 1, 0));
+    let text = read_text(&fs, WAL);
+    let rows = dict_lines(&text);
+    assert_eq!(rows.len(), 1, "新現行檔只有連續性 META：{text}");
+    let meta = meta_of(&rows[0]);
+    assert_eq!(str_of(meta, "event"), Some("WAL_ROTATED_AFTER_DEFERRAL"));
+    assert_eq!(meta.get("archived_through_seq").and_then(PyValue::as_i64), Some(last_seq as i64));
+    assert_eq!(seq_of(&rows[0]), Some(last_seq as i64 + 1));
+    // 無 pending 時 tick 為 no-op。
+    assert!(!w.tick());
+    assert_eq!(w.current_seq(), last_seq + 1);
 }

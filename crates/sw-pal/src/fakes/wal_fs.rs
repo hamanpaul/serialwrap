@@ -33,6 +33,8 @@ struct FsInner {
     sync_calls: HashMap<PathBuf, usize>,
     fail_opens: HashMap<PathBuf, VecDeque<PalError>>,
     fail_renames: VecDeque<PalError>,
+    fail_sync_dirs: VecDeque<PalError>,
+    fail_handle_syncs: HashMap<PathBuf, VecDeque<PalError>>,
     fail_identity: HashMap<PathBuf, PalError>,
     force_identity: HashMap<PathBuf, Option<FileIdentity>>,
     dir_writable: HashMap<PathBuf, bool>,
@@ -119,6 +121,14 @@ impl FakeWalFs {
             } else {
                 inner.files.remove(path);
             }
+        }
+    }
+
+    /// 就地截短（identity 不變；外部截短現行檔，OD-19 #88 的「檔案已低於門檻」情境）。
+    pub fn external_truncate(&self, path: &Path, len: usize) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(node) = inner.files.get(path) {
+            node.bytes.lock().unwrap_or_else(|e| e.into_inner()).truncate(len);
         }
     }
 
@@ -212,6 +222,23 @@ impl FakeWalFs {
         }
     }
 
+    /// 下 `n` 次 `sync_dir` 失敗（OD-19：輪替後的目錄同步錯誤亦計入 `rotate_retry`）。
+    pub fn fail_next_sync_dirs(&self, n: usize, err: PalError) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..n {
+            inner.fail_sync_dirs.push_back(err.clone());
+        }
+    }
+
+    /// `path` 的 handle 下 `n` 次 `sync` 失敗（輪替前 close(sync=True) 的錯誤路徑）。
+    pub fn fail_next_handle_syncs(&self, path: &Path, n: usize, err: PalError) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = inner.fail_handle_syncs.entry(path.to_path_buf()).or_default();
+        for _ in 0..n {
+            queue.push_back(err.clone());
+        }
+    }
+
     pub fn fail_next_opens(&self, path: &Path, n: usize, err: PalError) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let q = inner.fail_opens.entry(path.to_path_buf()).or_default();
@@ -285,6 +312,13 @@ impl WalFile for FakeWalFile {
     fn sync(&mut self) -> PalResult<()> {
         let mut inner = self.fs.lock().unwrap_or_else(|e| e.into_inner());
         *inner.sync_calls.entry(self.path.clone()).or_default() += 1;
+        if let Some(err) = inner
+            .fail_handle_syncs
+            .get_mut(&self.path)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -422,6 +456,9 @@ impl WalFs for FakeWalFs {
     fn sync_dir(&self, dir: &Path) -> PalResult<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         *inner.sync_calls.entry(dir.to_path_buf()).or_default() += 1;
+        if let Some(err) = inner.fail_sync_dirs.pop_front() {
+            return Err(err);
+        }
         Ok(())
     }
 

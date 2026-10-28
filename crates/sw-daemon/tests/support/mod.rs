@@ -224,6 +224,14 @@ impl IsolatedEnv {
             .rx_bytes()
     }
 
+    /// 假 DUT 暫停回應 `seconds` 秒（`FakeTarget.pause_responding`：輸入照記錄，回應延到暫停結束）。
+    pub fn target_pause(&mut self, seconds: f64) {
+        self.target
+            .as_mut()
+            .expect("無 PTY 假 DUT：請改用 isolated_env_with_pty_target()")
+            .pause(seconds);
+    }
+
     /// 讓假 DUT 不再回 prompt（DUT 靜默）。
     pub fn target_mute(&mut self) {
         self.target
@@ -270,6 +278,9 @@ for raw in sys.stdin:
         print("RX " + ft.rx_log(timeout_s=0.5).hex(), flush=True)
     elif cmd == "MUTE":
         ft.prompt = "muted-dut> "
+        print("OK", flush=True)
+    elif cmd.startswith("PAUSE "):
+        ft.pause_responding(float(cmd.split(" ", 1)[1]))
         print("OK", flush=True)
     elif cmd == "EXIT":
         break
@@ -321,6 +332,10 @@ impl FakeTargetProc {
 
     fn mute(&mut self) {
         assert_eq!(self.send("MUTE"), "OK", "假 DUT MUTE 失敗");
+    }
+
+    fn pause(&mut self, seconds: f64) {
+        assert_eq!(self.send(&format!("PAUSE {seconds}")), "OK", "假 DUT PAUSE 失敗");
     }
 }
 

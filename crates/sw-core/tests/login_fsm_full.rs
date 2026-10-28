@@ -46,9 +46,31 @@ fn sent_triples(row: &Row) -> Vec<(String, Vec<u8>, bool)> {
         .collect()
 }
 
+/// `re.error("missing ), unterminated subpattern at position 0")`（CPython 3.12 `re.compile("(")` 實測）。
+fn raised_paren() -> LoginOutcome {
+    LoginOutcome::Raised {
+        exc: "error".into(),
+        message: "missing ), unterminated subpattern at position 0".into(),
+    }
+}
+
+/// golden 只記錄例外類別名（`raised`）：比較時 `Raised` 的訊息不列入（類別名仍須相等）。
+fn without_message(o: LoginOutcome) -> LoginOutcome {
+    match o {
+        LoginOutcome::Raised { exc, .. } => LoginOutcome::Raised {
+            exc,
+            message: String::new(),
+        },
+        other => other,
+    }
+}
+
 fn expected_outcome(row: &Row, entry: &str) -> LoginOutcome {
     if let Some(exc) = row.opt_str("raised") {
-        return LoginOutcome::Raised(exc.to_string());
+        return LoginOutcome::Raised {
+            exc: exc.to_string(),
+            message: String::new(),
+        };
     }
     let result = row["result"].as_array().expect("result");
     if result[0].as_bool() == Some(true) {
@@ -158,7 +180,7 @@ fn every_python_scenario_produces_identical_tx_and_result() {
                 } else {
                     probe_ready(&rig.io(), &sp)
                 };
-                assert_eq!(got, expected_outcome(&row, entry), "case {}", row.id());
+                assert_eq!(without_message(got), expected_outcome(&row, entry), "case {}", row.id());
             }
             other => panic!("unknown entry {other}"),
         }
@@ -227,7 +249,7 @@ fn invalid_prompt_regex_raises_like_python_instead_of_timing_out() {
     let mut sp = prpl();
     sp.template.prompt_regex = "(".into();
     let rig = LoginRig::new().initial_rx("root@prplOS:~# ").build();
-    assert_eq!(probe_ready(&rig.io(), &sp), LoginOutcome::Raised("error".into()));
+    assert_eq!(probe_ready(&rig.io(), &sp), raised_paren());
     assert!(rig.virtual_elapsed_s() < 1e-9, "Python 在 re.compile 立即拋出，不消耗 timeout");
     assert_eq!(rig.sent_payloads(), [b"\n".to_vec()]);
 }
@@ -253,9 +275,13 @@ fn refusal_and_partial_write_abort_without_further_tx() {
         .on_eq("admin", "Password: ")
         .partial_on(3)
         .build();
+    // merge P5 F16：部分寫出 → Python `TxIncompleteError`（`str(exc)`；outcome 字面值 `completed`）。
     assert_eq!(
         ensure_ready(&rig2.io(), &sp, &admin_pw(), &empty_env()),
-        LoginOutcome::Aborted(LoginAbort::TxIncomplete)
+        LoginOutcome::Raised {
+            exc: "TxIncompleteError".into(),
+            message: "tx incomplete: completed 1/3 None".into(),
+        }
     );
     assert_eq!(rig2.sent_triples().len(), 3, "secret 部分寫出後不重送、不再等 prompt");
     assert_eq!(rig2.tx_attempts(), 3);
@@ -267,9 +293,13 @@ fn not_submitted_without_reject_is_cancelled() {
     let rig = LoginRig::new()
         .reject_after(0, FenceReject::Frozen)
         .build();
+    // merge P5 F16：draining（Frozen）不是 `_login_tx_refused` → `TxIncompleteError` 上拋。
     assert_eq!(
         probe_ready(&rig.io(), &sp),
-        LoginOutcome::Aborted(LoginAbort::Refused(FenceReject::Frozen))
+        LoginOutcome::Raised {
+            exc: "TxIncompleteError".into(),
+            message: "tx incomplete: not_submitted 0/1 draining".into(),
+        }
     );
     assert_eq!(rig.tx_attempts(), 1);
 }
@@ -528,7 +558,7 @@ fn console_unlock_idle_timeout_and_bootloader() {
 fn console_at_bootloader_invalid_regex_raises() {
     assert_eq!(
         console_at_bootloader("CFE> ", &["(".to_string()]),
-        Err(LoginOutcome::Raised("error".into()))
+        Err(raised_paren())
     );
     assert_eq!(console_at_bootloader("x\r\nCFE> \r\n", &["^CFE> $".to_string()]), Ok(true));
     assert_eq!(
@@ -637,7 +667,7 @@ fn invalid_regex_raises_immediately() {
     let rig = LoginRig::new().build();
     assert_eq!(
         ensure_ready(&rig.io(), &sp, &root_pw(), &empty_env()),
-        LoginOutcome::Raised("error".into())
+        raised_paren()
     );
     assert_eq!(rig.sent_payloads(), [b"\n".to_vec()]);
     assert!((rig.virtual_elapsed_s() - 10.0).abs() < 1e-6, "只消耗 probe 的 timeout");
@@ -647,7 +677,7 @@ fn invalid_regex_raises_immediately() {
     let rig = LoginRig::new().idle_s(10.0).build();
     assert_eq!(
         ensure_ready(&rig.io(), &sp, &unlock_k(), &empty_env()),
-        LoginOutcome::Raised("error".into())
+        raised_paren()
     );
     assert_eq!(rig.tx_attempts(), 0, "不送空行與 secret");
     assert!((rig.virtual_elapsed_s() - 5.05).abs() < 1e-6, "{}", rig.virtual_elapsed_s());
@@ -673,7 +703,7 @@ fn not_submitted_no_reject_aborts_cancelled_without_further_tx() {
     assert_eq!(rig.sent_triples().len(), 1);
 }
 
-#[test] // 計畫 Task 3：`Unknown` → `Aborted(TxIncomplete)`，之後不再 TX
+#[test] // 結果不明 → Python `TxUnknownError`（merge P5 F16；計畫 Task 3 原列 `Aborted(TxIncomplete)`，以 Python 為準），之後不再 TX
 fn unknown_outcome_aborts_tx_incomplete_without_further_tx() {
     let sp = brcm();
     let rig = LoginRig::new()
@@ -683,7 +713,10 @@ fn unknown_outcome_aborts_tx_incomplete_without_further_tx() {
         .build();
     assert_eq!(
         ensure_ready(&rig.io(), &sp, &admin_pw(), &empty_env()),
-        LoginOutcome::Aborted(LoginAbort::TxIncomplete)
+        LoginOutcome::Raised {
+            exc: "TxUnknownError".into(),
+            message: "tx incomplete: unknown 0/6 None".into(),
+        }
     );
     assert_eq!(rig.tx_attempts(), 2);
 }

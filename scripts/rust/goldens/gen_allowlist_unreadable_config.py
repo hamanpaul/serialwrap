@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -36,6 +37,11 @@ CASES: list[tuple[str, bytes]] = [
     ("value_bad_date", b"d: 2024-13-45\n"),
     ("recursion_deep", b"[" * 5000 + b"]" * 5000 + b"\n"),
     ("permission_denied", b"windows:\n  test_device_allowlist: [COM9]\n"),
+    # 審查 F80：PyYAML 實際例外類別與訊息猜測不同的 4 種輸入（追加於尾端，不動既有列）。
+    ("attribute_bad_timestamp", b"a: !!timestamp foo\n"),
+    ("key_bad_bool", b"a: !!bool maybe\n"),
+    ("composer_duplicate_anchor", b"a: &x 1\nb: &x 2\nc: *x\n"),
+    ("parser_incompatible_version", b"%YAML 2.0\n---\na: 1\n"),
 ]
 
 
@@ -73,6 +79,9 @@ def run_case(case_id: str, data: bytes) -> tuple[int, str] | None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", type=Path, default=OUT, help="輸出路徑（預設 contracts/golden/…）")
+    args = parser.parse_args()
     rows: list[str] = []
     for case_id, data in CASES:
         result = run_case(case_id, data)
@@ -80,7 +89,7 @@ def main() -> int:
             continue
         code, stderr = result
         rows.append(f"{case_id}\t{data.hex()}\t{code}\t{stderr.encode('utf-8').hex()}\n")
-    OUT.write_text("".join(rows), encoding="utf-8", newline="\n")
+    args.out.write_text("".join(rows), encoding="utf-8", newline="\n")
     return 0
 
 
