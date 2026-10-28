@@ -20,6 +20,13 @@
 - [ ] 已標記適用 label（release PR 使用 `release:<version>`；豁免白名單見 `CLAUDE.md`，如 `skip-changelog`(R-09)／`policy-exempt:ci-tests`(R-19)／`policy-exempt:issue-link`(R-17)）
 - [ ] 回歸 case 評估已記錄（修 bug issue 時：新增 `regression/` case／pytest 已覆蓋／免加理由，見 CLAUDE.md「回歸 case 政策」）
 
+## Rust 重構跟進
+
+<!-- Rust 重構（docs/rust-refactor/）完成前，凡改動 `sw_core/`、`serialwrap.py`、`serialwrapd.py`、`sw_core/assets/` 或外部可觀察行為的 PR，須寫明 Rust 端要跟進的 Phase 與位置；不影響者寫「不需要」並附理由。 -->
+
+- 需跟進的 Phase：<!-- Stage 1（Rust CLI）／P5（daemon 核心）／P6（console）／P7（登入與事件）／P8（傳輸與燒錄）／不需要 -->
+- Rust 對應位置與要做的事：
+
 ## Issue Reference
 
 <!-- 關聯的 Issue，例如：Closes #44 -->
