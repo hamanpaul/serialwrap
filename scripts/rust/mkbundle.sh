@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 建立 Stage 1A 自含式開發 bundle；`--delegate-sentinel` 產生組成相同（含 bin/serialwrapd 與 py/sw_core）、委派入口改為 P4 sentinel 的扁平 bundle。
+# 建立 Stage 1A bundle：開發 bundle 可含測試鉤子；正式候選 bundle 不含故障注入 feature，且自帶 PyYAML。
 set -euo pipefail
 
 usage() {
@@ -7,9 +7,11 @@ usage() {
 用法：
   scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--version-override <版本>] [--with-com0com <signed zip>] [--with-com0com-fixture <fixture zip>] [--print-dir]
   scripts/rust/mkbundle.sh --dev --delegate-sentinel --out <目錄> [其他選項]
+  scripts/rust/mkbundle.sh --release-bundle --profile release --out <目錄> [其他選項]
 
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
+  --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
   --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
   --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
@@ -24,6 +26,7 @@ EOF
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 DEV=0
+RELEASE_BUNDLE=0
 SENTINEL=0
 PROFILE=debug
 TARGET=""
@@ -36,6 +39,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --dev) DEV=1; shift ;;
+    --release-bundle) RELEASE_BUNDLE=1; shift ;;
     --delegate-sentinel) SENTINEL=1; shift ;;
     --print-dir) shift ;;
     --out)
@@ -91,8 +95,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DEV" -ne 1 ]]; then
-  echo "mkbundle.sh: 目前只支援 --dev（正式 bundle 由後續階段承接）" >&2
+if [[ "$DEV" -eq 1 && "$RELEASE_BUNDLE" -eq 1 ]]; then
+  echo "mkbundle.sh: --dev 與 --release-bundle 不可並用" >&2
+  exit 2
+fi
+if [[ "$DEV" -eq 0 && "$RELEASE_BUNDLE" -eq 0 ]]; then
+  echo "mkbundle.sh: 必須指定 --dev 或 --release-bundle" >&2
+  exit 2
+fi
+if [[ "$SENTINEL" -eq 1 && "$DEV" -ne 1 ]]; then
+  echo "mkbundle.sh: --delegate-sentinel 僅支援 --dev" >&2
   exit 2
 fi
 if [[ "$PROFILE" != debug && "$PROFILE" != release ]]; then
@@ -142,7 +154,7 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
-# 更新 race barrier 僅編入 `--dev` bundle；正式 bundle 不帶測試 feature。
+# 更新 race barrier 與安裝故障注入僅編入 `--dev` bundle；正式候選不帶測試 feature。
 if [[ "$DEV" -eq 1 ]]; then
   BUILD_ARGS+=(--features sw-cli/test-fakes)
 fi
@@ -264,13 +276,40 @@ PY
   fi
 
   PY_DIR="$VERSION_DIR/py"
-  python3 -m venv --copies --system-site-packages "$PY_DIR"
+  python3 -m venv --copies "$PY_DIR"
   if [[ -L "$PY_DIR/lib64" ]]; then
     rm -- "$PY_DIR/lib64"
   fi
   PYTHON="$PY_DIR/bin/python3"
   PY_SITE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
   mkdir -p "$PY_SITE"
+
+  # PyYAML 是 daemon 的執行期依賴；不可仰賴目標主機的 system site-packages。
+  # 複製與 runtime 同版 Python、同平台的已安裝模組及 dist-info，正式 bundle 因而可離線啟動。
+  python3 - "$PY_SITE" <<'PY'
+import importlib.metadata
+import pathlib
+import shutil
+import sys
+import yaml
+
+site = pathlib.Path(sys.argv[1])
+source = pathlib.Path(yaml.__file__).resolve().parent
+shutil.copytree(source, site / "yaml")
+dist = importlib.metadata.distribution("PyYAML")
+dist_path = pathlib.Path(dist._path)
+shutil.copytree(dist_path, site / dist_path.name)
+PY
+  "$PYTHON" -I -B - "$PY_SITE" <<'PY'
+import pathlib
+import sys
+import yaml
+
+site = pathlib.Path(sys.argv[1]).resolve()
+module = pathlib.Path(yaml.__file__).resolve()
+if not module.is_relative_to(site):
+    raise SystemExit(f"PyYAML 未由 bundle runtime 載入：{module}")
+PY
 
   python3 - "$REPO_ROOT/sw_core" "$PY_DIR/sw_core" "$PY_SITE/sw_core" \
     "$REPO_ROOT/serialwrapd.py" "$PY_DIR/serialwrapd.py" "$VERSION" \

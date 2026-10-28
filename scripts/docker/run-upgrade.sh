@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OD-33 R2(b)：0.3.2 正式版 → 0.4.0 候選升級驗證（Linux，OD-16 (5) ubuntu:24.04 systemd 容器）。
-# host 端：由 git tag v0.3.2 建 wheel、以 mkbundle.sh 建 0.4.0 候選 dev bundle（或沿用 --wheel／--bundle）、
+# host 端：由 git tag v0.3.2 建 wheel、下載隔離安裝所需 PyYAML wheel、以 mkbundle.sh 建不含測試鉤子的 0.4.0 release bundle（或沿用 --wheel／--bundle）、
 # 建升級映像，每種監管模式起一個全新容器（--network none、不帶任何裝置），以唯讀 bind mount 提供 wheel、bundle 與
 # 容器內 driver，結果寫 <out>/<mode>/upgrade-report.json。不碰本機正式安裝、/dev/ttyUSB* 或其他容器。
 set -euo pipefail
@@ -71,7 +71,8 @@ container_run() {
 if ((DRY_RUN)); then
     echo "+ git archive $OLD_TAG | tar -x -C $WORK/src-$OLD_VERSION"
     print_command python3 -m pip wheel --no-deps --no-build-isolation -w "$WORK/wheels" "$WORK/src-$OLD_VERSION"
-    print_command "$REPO_ROOT/scripts/rust/mkbundle.sh" --dev --version-override "$NEW_VERSION" --out "$WORK/bundle-$NEW_VERSION"
+    print_command python3 -m pip download --only-binary=:all: --dest "$WORK/wheels" 'PyYAML>=6'
+    print_command "$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --profile release --version-override "$NEW_VERSION" --out "$WORK/bundle-$NEW_VERSION"
     print_command docker build -f "$DOCKERFILE" -t "$IMAGE" "$WORK/empty-context"
     for mode in "${MODES[@]}"; do
         container_run "$mode" "$WORK/wheels" "${BUNDLE:-$WORK/bundle-$NEW_VERSION}"
@@ -84,6 +85,7 @@ if ((DRY_RUN)); then
 fi
 
 mkdir -p "$WORK"
+mkdir -p "$WORK/wheels"
 CONTAINERS=()
 cleanup() {
     for name in "${CONTAINERS[@]}"; do
@@ -105,8 +107,12 @@ fi
 WHEEL="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$WHEEL")"
 [[ -f "$WHEEL" && "$(basename "$WHEEL")" == "serialwrap-$OLD_VERSION-py3-none-any.whl" ]] \
     || { echo "wheel 必須是 serialwrap-$OLD_VERSION-py3-none-any.whl：$WHEEL" >&2; exit 2; }
+if [[ "$WHEEL" != "$WORK/wheels/serialwrap-$OLD_VERSION-py3-none-any.whl" ]]; then
+    cp "$WHEEL" "$WORK/wheels/serialwrap-$OLD_VERSION-py3-none-any.whl"
+fi
+python3 -m pip download --quiet --only-binary=:all: --dest "$WORK/wheels" 'PyYAML>=6'
 if [[ -z "$BUNDLE" ]]; then
-    BUNDLE="$("$REPO_ROOT/scripts/rust/mkbundle.sh" --dev --version-override "$NEW_VERSION" \
+    BUNDLE="$("$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --profile release --version-override "$NEW_VERSION" \
         --out "$WORK/bundle-$NEW_VERSION" --print-dir | tail -1)"
 fi
 BUNDLE="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$BUNDLE")"
@@ -126,7 +132,7 @@ IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
 overall=0
 for mode in "${MODES[@]}"; do
     mkdir -p "$OUT/$mode"
-    container_run "$mode" "$(dirname "$WHEEL")" "$BUNDLE"
+    container_run "$mode" "$WORK/wheels" "$BUNDLE"
     name="sw-upgrade-$RUN_ID-$mode"
     CONTAINERS+=("$name")
     "${run_cmd[@]}" >/dev/null

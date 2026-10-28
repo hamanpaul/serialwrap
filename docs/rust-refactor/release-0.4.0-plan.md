@@ -7,7 +7,7 @@
 
 | # | 條件 | 證據 |
 |---|---|---|
-| 1 | Stage 1 出口 gate：Stage 1A `stage1a_gate.py` overall PASS；Stage 1B 只剩擁有者裁決允許的 BLOCKED-OWNER（OD-27～OD-32），無 FAIL／INSUFFICIENT | 出口 driver `scripts/rust/stage1_exit_driver.sh` 於最終 HEAD 的報告 |
+| 1 | Stage 1 出口 gate：Stage 1A `stage1a_gate.py` overall 為 `VERIFIED`，或為 `IMPLEMENTED` 且只剩 OD-27～OD-32 明確允許的 `BLOCKED-OWNER`；Stage 1B 只剩同範圍擁有者項，沒有 FAIL／INSUFFICIENT | 出口 driver `scripts/rust/stage1_exit_driver.sh` 於最終 HEAD 的報告 |
 | 2 | 全套 `python3 -m pytest -q tests/`、`cargo test --workspace`、`python3 -m tools.contracts check`、`python3 -m policy_check --repo .` 在 release HEAD 通過 | 同上 |
 | 3 | Linux 升級驗證（§4）在 release 候選 bundle 上兩種監管模式皆 PASS | `scripts/docker/run-upgrade.sh` 的 `<out>/<mode>/upgrade-report.json` |
 | 4 | §6 列的待擁有者裁決項已裁決（或擁有者明示接受以已知限制發佈） | `owner-decisions-2026-10-15.md` |
@@ -17,12 +17,12 @@
 
 | 產物 | 內容 | 產生方式 |
 |---|---|---|
-| Linux x86_64 bundle（`serialwrap-0.4.0-linux-x86_64.tar.gz`） | `bin/serialwrap`（Rust CLI，20 個群組原生）、`bin/serialwrapd`（launcher）、`versions/0.4.0/`：`release-manifest.json`、`SHA256SUMS`、`py/`（Python daemon runtime＋`sw_core`，亦為 Python 委派元件 `python_cli_delegate`） | `scripts/rust/mkbundle.sh --dev --profile release --out <dir>`（`VERSION` 已改為 0.4.0，**不得**用 `--version-override`） |
+| Linux x86_64 bundle（`serialwrap-0.4.0-linux-x86_64.tar.gz`） | `bin/serialwrap`（Rust CLI，20 個群組原生）、`bin/serialwrapd`（launcher）、`versions/0.4.0/`：`release-manifest.json`、`SHA256SUMS`、`py/`（自帶 PyYAML 的 Python daemon runtime＋`sw_core`，亦為 Python 委派元件 `python_cli_delegate`）；不含 `sw-cli/test-fakes` | `scripts/rust/mkbundle.sh --release-bundle --profile release --out <dir>`（`VERSION` 已改為 0.4.0，**不得**用 `--version-override`） |
 | Windows x86_64 bundle（`serialwrap-0.4.0-windows-x86_64.zip`） | 同上，入口為 `.exe`；可選 com0com 3.0.0.0 元件（`--with-com0com`，含 GPLv2 授權與原始碼連結） | 擁有者 Windows runner 原生建置（P9 BO-P9-17 的同一條路徑）；或 `--target x86_64-pc-windows-gnu` 交叉編譯後於 Windows 原生驗證 |
 | Python wheel（`serialwrap-0.4.0-py3-none-any.whl`） | Python CLI＋daemon（相容路徑：只裝 Python 的使用者、`install.sh`） | 既有 `release.yml` 的 `python3 -m build --wheel` |
 | `install.sh` | 目前仍為 pipx 安裝 Python 套件＋`serialwrap setup`（與 0.3.2 相同）。**0.4.0 Rust CLI 的安裝入口是 bundle 的 `bin/serialwrap setup`** | 見 RELEASE-TODO-02 |
 
-**RELEASE-TODO-01（release workflow）**：現行 `.github/workflows/release.yml` 只發佈 wheel 與 PyInstaller exe，沒有 Rust bundle job。release PR 必須新增 Linux bundle job（cargo build＋`mkbundle.sh --profile release`＋打包＋上傳＋`SHA256SUMS`）並登記 Windows bundle 的上傳方式；PyInstaller exe 是否續發由擁有者決定（建議 0.4.0 仍附上，供尚未改用 bundle 的 Windows 使用者）。
+**RELEASE-TODO-01（release workflow）**：現行 `.github/workflows/release.yml` 只發佈 wheel 與 PyInstaller exe，沒有 Rust bundle job。release PR 必須新增 Linux bundle job（cargo build＋`mkbundle.sh --release-bundle --profile release`＋打包＋上傳＋`SHA256SUMS`）並登記 Windows bundle 的上傳方式；PyInstaller exe 是否續發由擁有者決定（建議 0.4.0 仍附上，供尚未改用 bundle 的 Windows 使用者）。
 
 **RELEASE-TODO-02（install.sh）**：決定 0.4.0 的 `install.sh` 是維持 pipx（Python CLI）還是改為「下載／解開 bundle 後執行 `bin/serialwrap setup`」。在決定前，release notes 必須明寫兩條安裝路徑的差異。
 
@@ -38,7 +38,7 @@
 ### 4.1 Linux（實作完成，可重複執行）
 
 ```bash
-scripts/docker/run-upgrade.sh                    # 兩種模式；預設由 git tag v0.3.2 建 wheel、mkbundle 建 0.4.0 候選
+scripts/docker/run-upgrade.sh                    # 兩種模式；預設由 git tag v0.3.2 建 wheel、mkbundle 建不含測試鉤子的 0.4.0 release 候選
 scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目錄> --wheel <0.3.2 發佈 wheel>
 ```
 
@@ -47,6 +47,7 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
 - 判定：`scripts/docker/upgrade_checks.py`（`tests/test_docker_upgrade.py`）。18 項必要檢查，任一 FAIL 即 FAIL、缺項即 INSUFFICIENT：
   0.3.2 安裝與啟動、建立 profile／alias／binding 基線、0.3.2 doctor、舊 daemon 執行中直接 setup（拒絕時現場不得改動）、停舊後 setup、`~/.local/bin` 入口取代且備份記下 pipx 入口、config／profiles 逐位元組保留、0.4.0 daemon 由 bundle 啟動、監管模式依 config 收斂（systemd-user：unit active＋enabled、MainPID 為新 daemon、無殘留 hold drop-in；on-demand：unit 未啟用）、alias／binding 語意相容、0.4.0 doctor（非 advisory 全綠＋`version_pairing`；advisory 只容許容器內必然為 0 的 `devices`）、`setup --rollback`（拒絕時現場不得改動）、手動降級回 0.3.2（版本、config、狀態、doctor）、降級後重新升級、全程 /proc 20 ms 取樣不得同時出現兩個 serialwrapd 實例。
 - 首次實跑（2026-10-28，bundle git revision `2a947f6`）：systemd-user 與 on-demand 皆 **PASS**（各約 2,800 筆取樣、0 次重疊）；報告未保存，不作為證據。
+- 本輪驗證（起點 `9908f93`，工作樹含 BB-1 修正）：`python3 -m pytest -q tests/test_docker_upgrade.py` 29 passed，含 systemd-user 與 on-demand 兩模式的完整 0.3.2→0.4.0→降級→再升級實跑並各判 PASS；Docker 報告留在 pytest 暫存目錄，未保存進 repo，不能替代最終 HEAD 的出口證據。
 - 判準收緊後實跑（2026-10-28，run `s1v14-c8df563`，bundle git revision `c8df563`）：兩模式皆 **PASS**（取樣 2641／2705、0 次重疊）；報告原文與 `SHA256SUMS` 保存於 `evidence/stage1/upgrade-docker/s1v14-c8df563/`。此為開發中 bundle，不取代前置條件 #3 的 release bundle 重跑。觀察項見 §6。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）

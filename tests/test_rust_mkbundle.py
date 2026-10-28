@@ -173,6 +173,24 @@ def test_daemon_block_fields_nonempty_and_dev_bundle_shape(bundle):
     assert d["runtime"]["python_version"] == _meta_python_version()
 
 
+def test_bundle_runtime_contains_isolated_pyyaml(bundle, tmp_path):
+    """daemon bundle 自帶 PyYAML，且隔離執行時不依賴宿主 site-packages。"""
+    out = bundle.out()
+    py_dir = out / "versions" / VERSION / "py"
+    pyvenv_cfg = (py_dir / "pyvenv.cfg").read_text(encoding="utf-8").lower()
+    assert "include-system-site-packages = false" in pyvenv_cfg
+    python = py_dir / "bin" / "python3"
+    result = subprocess.run(
+        [str(python), "-I", "-B", "-c", "import pathlib, yaml; print(pathlib.Path(yaml.__file__).resolve())"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path / "host-site-packages")},
+    )
+    assert result.returncode == 0, result.stderr
+    assert str(py_dir.resolve()) in result.stdout, result.stdout
+
+
 def test_manifest_top_level_and_pairing(bundle):
     out = bundle.out()
     m = _manifest(out)
@@ -250,6 +268,35 @@ def test_windows_target_is_rejected_before_build(tmp_path):
     assert not cargo_called.exists()
 
 
+def test_release_bundle_build_does_not_enable_test_fakes(tmp_path):
+    """正式 bundle 的 cargo invocation 不得啟用 setup 故障注入 feature。"""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    cargo_args = tmp_path / "cargo-args"
+    fake_rustc = fake_bin / "rustc"
+    fake_rustc.write_text("#!/bin/sh\nprintf 'host: x86_64-unknown-linux-gnu\\n'\n", encoding="utf-8")
+    fake_rustc.chmod(0o755)
+    fake_cargo = fake_bin / "cargo"
+    fake_cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SW_CARGO_ARGS\"\nexit 0\n", encoding="utf-8")
+    fake_cargo.chmod(0o755)
+    env = dict(os.environ, PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}", SW_CARGO_ARGS=str(cargo_args),
+               CARGO_TARGET_DIR=str(tmp_path / "cargo-target"))
+
+    result = subprocess.run(
+        [str(MKBUNDLE), "--release-bundle", "--profile", "release", "--out", str(tmp_path / "release")],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert cargo_args.is_file(), result.stderr
+    args = cargo_args.read_text(encoding="utf-8")
+    assert "sw-cli/test-fakes" not in args
+    assert "--release" in args
+    assert result.returncode != 0, "fake cargo 未產生 binaries，後續 bundle 組裝應 fail-closed"
+
+
 def test_help_lists_supported_options_without_building():
     result = subprocess.run(
         [str(MKBUNDLE), "--help"],
@@ -259,7 +306,7 @@ def test_help_lists_supported_options_without_building():
     )
 
     assert result.returncode == 0, result.stderr
-    for option in ("--target", "--profile", "--out", "--print-dir"):
+    for option in ("--target", "--profile", "--release-bundle", "--out", "--print-dir"):
         assert option in result.stdout
 
 

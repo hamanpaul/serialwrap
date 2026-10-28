@@ -187,7 +187,7 @@ class Driver:
 
     # ---------- 流程 ----------
     def phase_old_install(self) -> None:
-        inst = self.run(["pipx", "install", "--system-site-packages", "--pip-args=--no-index", str(self.wheel)],
+        inst = self.run(["pipx", "install", "--pip-args", "--no-index --find-links=/opt/sw-old", str(self.wheel)],
                         label="pipx install 0.3.2", timeout=600)
         setup = self.sw("setup", self.flag, label="0.3.2 setup")
         start = self.start_daemon("0.3.2 start") if self.mode == "on-demand" else None
@@ -344,7 +344,7 @@ class Driver:
                 path.unlink()
                 removed.append(name)
         steps.append(self.run(["pipx", "uninstall", "serialwrap"], label="pipx uninstall"))
-        steps.append(self.run(["pipx", "install", "--system-site-packages", "--pip-args=--no-index", str(self.wheel)],
+        steps.append(self.run(["pipx", "install", "--pip-args", "--no-index --find-links=/opt/sw-old", str(self.wheel)],
                               label="pipx install 0.3.2（降級）", timeout=600))
         steps.append(self.sw("setup", self.flag, label="0.3.2 setup（降級）"))
         steps.append(self.start_daemon("0.3.2 start（降級）"))

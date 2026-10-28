@@ -25,6 +25,7 @@ REPO = Path(__file__).resolve().parents[1]
 RUN_UPGRADE = REPO / "scripts" / "docker" / "run-upgrade.sh"
 DOCKERFILE = REPO / "tools" / "docker" / "upgrade.Dockerfile"
 SYSTEMD_DOCKERFILE = REPO / "tools" / "docker" / "systemd.Dockerfile"
+UPGRADE_CONTAINER = REPO / "scripts" / "docker" / "run_upgrade_container.py"
 
 sys.path.insert(0, str(REPO))
 
@@ -293,8 +294,9 @@ def test_upgrade_image_pins_same_base_as_systemd_image():
     assert base(DOCKERFILE) == base(SYSTEMD_DOCKERFILE)
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "COPY" not in text
-    for pkg in ("pipx", "python3-yaml", "systemd", "dbus-user-session"):
+    for pkg in ("pipx", "systemd", "dbus-user-session"):
         assert pkg in text, pkg
+    assert "python3-yaml" not in text, "升級驗證映像不得以系統 PyYAML 遮住 bundle 缺少執行期依賴"
 
 
 def _docker_available() -> bool:
@@ -315,11 +317,33 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout
     assert "git archive v0.3.2" in out
-    assert "--version-override 0.4.0" in out
+    assert "--release-bundle --profile release --version-override 0.4.0" in out
+    assert "pip download --only-binary=:all:" in out
     assert "--network none" in out
     for mode in ("systemd-user", "on-demand"):
         assert f"--mode {mode}" in out, out
     assert "/dev/ttyUSB" not in out and "--device" not in out
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_environment_does_not_hide_missing_pyyaml():
+    """升級容器不得用系統 PyYAML 或共享 site-packages 遮住一般 pipx 使用者缺依賴。"""
+    container = UPGRADE_CONTAINER.read_text(encoding="utf-8")
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "--system-site-packages" not in container
+    assert "python3-yaml" not in dockerfile
+    assert "--find-links=/opt/sw-old" in container
+    assert "pip download" in (REPO / "scripts" / "docker" / "run-upgrade.sh").read_text(encoding="utf-8")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_release_plan_accepts_only_real_stage1_gate_outcomes():
+    plan = (REPO / "docs" / "rust-refactor" / "release-0.4.0-plan.md").read_text(encoding="utf-8")
+    assert "`stage1a_gate.py` overall PASS" not in plan
+    assert "VERIFIED" in plan and "IMPLEMENTED" in plan
+    assert "沒有 FAIL／INSUFFICIENT" in plan
 
 
 @pytest.mark.posix_only
