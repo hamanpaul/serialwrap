@@ -162,14 +162,72 @@ pub fn extract_command_stdout(
     let mut lines: Vec<&str> = splitlines(trimmed);
     if !command.is_empty() {
         let stripped = py_strip(command);
+        let mut removed = false;
         while lines
             .first()
             .is_some_and(|line| py_strip(line).ends_with(stripped))
         {
             lines.remove(0);
+            removed = true;
+        }
+        if !removed {
+            lines = strip_wrapped_command_echo(lines, stripped);
         }
     }
     lines.join("\n").trim_matches('\n').to_string()
+}
+
+/// 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt），也以此保守估計回顯最多佔幾行（Python `_WRAP_MIN_SEGMENT`）。
+const WRAP_MIN_SEGMENT: usize = 20;
+
+/// Python `_match_wrapped_echo`（PR 237 修正後語意）：自 `text[start]` 比對一段可能被折行的命令回顯，
+/// 成功回傳回顯結束位置（字元索引）。命令每個字元（含空白）依序出現；只有換行或多出的空白可跳過，
+/// 第一個命令字元前不得插入，插入點彼此至少相隔 [`WRAP_MIN_SEGMENT`]（第一個以第一行欄位計，含殘留 prompt）。
+fn match_wrapped_echo(text: &[char], start: usize, command: &[char]) -> Option<usize> {
+    let (mut i, mut j) = (start, 0usize);
+    let mut last_wrap: Option<usize> = None;
+    while j < command.len() {
+        let ch = *text.get(i)?;
+        if ch == command[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if j == 0 || !matches!(ch, '\n' | ' ') {
+            return None;
+        }
+        let column = match last_wrap {
+            None => start + j,
+            Some(w) => j - w,
+        };
+        if column < WRAP_MIN_SEGMENT {
+            return None;
+        }
+        last_wrap = Some(j);
+        i += 1;
+    }
+    Some(i)
+}
+
+/// Python `_strip_wrapped_command_echo`（PR 237 修正後語意）：`lines` 已 `clean_text` 並切行；BusyBox ash 的
+/// `\r\r\n` 折行成為換行、bash readline 的 `" \r"` 成為多一個空白。只接受「命令原文＋折行插入字元」從第一行
+/// 開始（容許殘留 prompt）並結束在某一行行尾，才把這幾行視為回顯；命令本身的空白不能少（`cat file`→`catfile` 不剝）。
+fn strip_wrapped_command_echo<'a>(lines: Vec<&'a str>, command: &str) -> Vec<&'a str> {
+    if command.is_empty() || lines.is_empty() {
+        return lines;
+    }
+    let cmd: Vec<char> = command.chars().collect();
+    let window = &lines[..lines.len().min(cmd.len() / WRAP_MIN_SEGMENT + 2)];
+    let text: Vec<char> = window.join("\n").chars().collect();
+    for start in 0..lines[0].chars().count() {
+        if let Some(end) = match_wrapped_echo(&text, start, &cmd) {
+            if end == text.len() || text[end] == '\n' {
+                let consumed = text[..end].iter().filter(|c| **c == '\n').count() + 1;
+                return lines[consumed..].to_vec();
+            }
+        }
+    }
+    lines
 }
 
 /// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），

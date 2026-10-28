@@ -274,3 +274,11 @@ gate 逐 section 判定見 `docs/rust-refactor/reviews/p5-t22-gate-run.md`。
 | F151 | Medium | 2be8982 #1 | `test_recovery_flushes_queue`：Python 先送 q0、Rust 全 flush，卻寫成無差異 | 擁有者 OD-37 已裁決：Rust 採 DF 行為（recover 原子 flush），Python 輪逐列標記 DF 差異並登記 `contracts/behavior_changes.yaml`；見本輪 OD 段 |
 | F152 | Low | 2be8982 #2 | ATTACHING 案 RPC 回覆與 probe TX 先後 | 併入 OD-36（該案零 TX 窗口排除合法 attach 登入序列）；見本輪 OD 段 |
 | F153 | Low | 4f4082f #1 | 孤立 surrogate 位於鍵且同層有 ≥U+E000 鍵時，`position N` 與 Python 不同 | deferred：Low，僅影響錯誤末行的位置數字（rc、traceback、原檔不動皆一致），排入下一輪 |
+
+### 報告 `p5-cloud/c66f65e_1393573-sol.md`（Codex sol incr；本輪 merge 審查）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| — | A 1～8 | 前輪 sol-backfill 8 項未修（審查時點為 1393573） | 已於 `25ad3900` 修正（F143～F150） |
+| F154 | High | P5-1393573-1：PR 237 折行回顯修正未接上 Rust（逐行 `ends_with`） | fixed：`op_runner::strip_wrapped_command_echo`／`match_wrapped_echo` 承接修正後語意（origin/fix/wrapped-echo-false-positive 34c3a84b；擁有者指定不採主線現行 s1v13 版）。紅燈先行：`command_exec::wrapped_echo_*` 11 案，修正前 BusyBox／三行／readline／prompt 前綴 4 案 FAIL；審查反例 `cmd[:65]+"\r\r\n"+cmd[65:]+"\r\nOUT"` 即 `wrapped_echo_busybox_wrap_is_stripped`。CHG-S21-PR237-ECHO-01 |
+| F155 | Medium | P5-1393573-2：合入主線 cases.yaml 後凍結 provenance 不符 | fixed：OD-34 凍結修訂 #1（`d8ac988c`；`slice_2.1.amendments.json` 記錄當下 provenance，凍結檔本體與窗口不動，cases revision 升 `2026-10-28.1`），未刪雜湊斷言 |

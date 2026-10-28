@@ -1753,3 +1753,113 @@ fn interactive_mode_command_unknown_send_maps_aborted_in_flight_unknown() {
         .expect("應寫 command_aborted_in_flight META");
     assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
 }
+
+// ---------------------------------------------------------------------------
+// PR 237 承接（修正後語意，origin/fix/wrapped-echo-false-positive 34c3a84b）：長命令回顯被終端折行拆開時的剝除。
+// 只接受「命令原文＋折行插入字元」：命令每個字元（含空白）依序出現，只有換行或多出的一個空白可跳過，
+// 插入點彼此至少相隔 20 字元（第一個插入點以第一行欄位計、含殘留 prompt），第一個命令字元前不得插入，
+// 回顯須從第一行開始並結束在行尾。期望值與 Python 修正版 tests/test_wrapped_echo_strip.py 相同。
+// ---------------------------------------------------------------------------
+
+const WRAP_PROMPT_RE: &str = "(?m)^root@prplOS:.*# ";
+const WRAP_PROMPT: &str = "root@prplOS:~# ";
+
+fn wrap_cmd96() -> String {
+    format!("echo {} {}", "x".repeat(50), "y".repeat(40))
+}
+
+fn wrap_cmd200() -> String {
+    format!("echo {} {} {}", "a".repeat(60), "b".repeat(60), "c".repeat(73))
+}
+
+fn wrap_extract(raw: &str, command: &str) -> String {
+    let prompt = compile(WRAP_PROMPT_RE, PyFlags(0)).expect("prompt regex");
+    extract_command_stdout(raw, command, &prompt, None)
+}
+
+#[test]
+fn wrapped_echo_busybox_wrap_is_stripped() {
+    let c = wrap_cmd96();
+    let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_three_line_wrap_is_stripped() {
+    let c = wrap_cmd200();
+    let raw = format!("{}\r\r\n{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..65], &c[65..145], &c[145..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_readline_space_wrap_is_stripped() {
+    let c = wrap_cmd96();
+    let raw = format!("{} \r{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..79], &c[79..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_prompt_prefix_on_first_echo_line() {
+    let c = wrap_cmd96();
+    let raw = format!("{WRAP_PROMPT}{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+    // readline 折行＋prompt 前綴
+    let raw = format!("{WRAP_PROMPT}{} \r{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..64], &c[64..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_short_command_and_no_echo_unchanged() {
+    let raw = format!("cut -d. -f1 /proc/uptime\r\n65\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "cut -d. -f1 /proc/uptime"), "65");
+    let raw = format!("line1\r\nline2\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, &wrap_cmd96()), "line1\nline2");
+}
+
+#[test]
+fn wrapped_echo_not_starting_on_first_line_is_kept() {
+    let c = wrap_cmd96();
+    let raw = format!("header\r\n{}\r\n{}\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("header\n{}\n{}", &c[..65], &c[65..]));
+}
+
+#[test]
+fn wrapped_echo_single_line_echo_not_stripped_twice() {
+    let c = wrap_cmd96();
+    let raw = format!("{c}\r\n{}\r\n{}\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}", &c[..65], &c[65..]));
+}
+
+#[test]
+fn wrapped_echo_output_equal_to_command_without_spaces_is_kept() {
+    // echo 關閉時 `cat file` 印出 `catfile`：不得被當成回顯。
+    let raw = format!("catfile\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "cat file"), "catfile");
+}
+
+#[test]
+fn wrapped_echo_short_output_split_like_command_is_kept() {
+    let raw = format!("ls -la\r\n/tmp\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "ls -la /tmp"), "ls -la\n/tmp");
+}
+
+#[test]
+fn wrapped_echo_long_output_missing_command_space_is_kept() {
+    let squeezed = wrap_cmd96().replace(' ', "");
+    let raw = format!("{}\r\n{}\r\n{WRAP_PROMPT}", &squeezed[..60], &squeezed[60..]);
+    assert_eq!(
+        wrap_extract(&raw, &wrap_cmd96()),
+        format!("{}\n{}", &squeezed[..60], &squeezed[60..])
+    );
+}
+
+#[test]
+fn wrapped_echo_insertion_before_first_char_or_too_close_is_kept() {
+    let c = wrap_cmd96();
+    // 插入點距離不足 20 字元（第二段只有 10 字元就再折行）→ 不是終端折行。
+    let raw = format!("{}\r\n{}\r\n{}\r\n{WRAP_PROMPT}", &c[..30], &c[30..40], &c[40..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\n{}", &c[..30], &c[30..40], &c[40..]));
+    // 回顯未結束在行尾（命令後同行還有其他字）→ 不剝。
+    let raw = format!("{}\r\r\n{}TAIL\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}TAIL", &c[..65], &c[65..]));
+}

@@ -583,7 +583,7 @@ def _regen(*args: str) -> subprocess.CompletedProcess:
                           cwd=REPO, capture_output=True, text=True, encoding="utf-8")
 
 
-@pytest.mark.memory_only
+@pytest.mark.process_rpc
 def test_regen_lock_defer_requires_named_owner_decision(tmp_path: pathlib.Path):
     """OD-34：既有案例延後切片只能逐名以 `--allow-defer case_id:from:to:OD-NN` 核准；未核准、核准不符或多列
     未使用的核准皆拒絕且鎖檔不變；核准後只改該案例的 daemon_slice 與早期切片集合，其餘屬性與集合不動。"""
