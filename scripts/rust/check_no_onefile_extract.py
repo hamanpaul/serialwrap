@@ -591,6 +591,10 @@ def _under_tmp(path: Path) -> bool:
 def _private_tmp_outer(args: argparse.Namespace, cli_argv: list[str], cli_args: list[str]) -> dict[str, Any]:
     """外層：建立私有目錄與 user+mount namespace，於其中重新執行本工具並取回報告。"""
     script = Path(__file__).resolve()
+    # 內層繼承工作目錄；cwd 在 /tmp 下時 namespace 內看不到，相對路徑的 CLI 會以非零退出被誤判為產品 FAIL（c46c416#1）。
+    cwd = Path(os.getcwd())
+    if _under_tmp(cwd):
+        raise ValueError(f"--private-tmp：工作目錄 {cwd} 位於 /tmp 下，namespace 內看不到")
     # 內層以 sys.executable 執行本工具；直譯器、本工具與受測 CLI 的任何絕對路徑字詞都必須在 namespace 內可見。
     for word in [sys.executable, os.path.abspath(__file__), str(script), *cli_argv]:
         if word.startswith("/") and _under_tmp(Path(word)):

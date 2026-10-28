@@ -186,6 +186,17 @@ def test_private_tmp_rejects_interpreter_under_tmp(outside_tmp, under_tmp):
     assert str(py) in res.stderr, res.stderr
 
 
+def test_private_tmp_rejects_relative_cli_with_cwd_under_tmp(outside_tmp, under_tmp):
+    """工作目錄位於 /tmp 下、`--cli` 以相對路徑給出時，namespace 內看不到 cwd → exit 2，不得以內層 CLI 非零退出判產品 FAIL（c46c416#1）。"""
+    fake = under_tmp / "fake_cli.py"
+    fake.write_text("print('ok')\n", encoding="utf-8")
+    res = subprocess.run([sys.executable, str(SCRIPT), "--cli", f"{sys.executable} fake_cli.py", "--runs", "1",
+                          "--private-tmp", "--private-tmp-base", str(outside_tmp)],
+                         capture_output=True, text=True, timeout=60, cwd=str(under_tmp))
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert str(under_tmp) in res.stderr, res.stderr
+
+
 @needs_ns
 def test_private_tmp_passes_dash_prefixed_cli_args_to_inner(outside_tmp):
     """預設 `--cli-args --version` 形式（值以 - 開頭）須原樣傳進 namespace 內層，CLI 收到該參數。"""

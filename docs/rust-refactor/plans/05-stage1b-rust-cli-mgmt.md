@@ -3484,6 +3484,7 @@ scripts/rust/check_no_onefile_extract.py --cli <exe> [--runs 100]
   S1X 修訂（2026-10-28，CHG-S1X-ONEFILE-PRIVATE-TMP-01，比照 OD-25 隔離精神）：共用 /tmp 的他人事件無法歸屬 → INSUFFICIENT；
   出口以 `--private-tmp`（Linux）執行：於 user+mount namespace 內把全新空目錄 bind 到 /tmp 並宣告獨占，其中任何建立／殘留
   皆歸屬 CLI 判 FAIL（含寫死 /tmp 者）；無法建立 namespace → INSUFFICIENT，不退回共用 /tmp。
+  直譯器、本工具、受測 CLI 路徑字詞或工作目錄位於 /tmp 下（namespace 內看不到）→ 用法錯誤 exit 2，不計入判定。
 ```
 
 - [ ] **步驟 1：寫失敗測試**
