@@ -416,7 +416,9 @@ main() {
   step tools_contracts python3 -m tools.contracts check
   step git_status_end bash -c 'git status --short; echo "HEAD=$(git rev-parse HEAD)"'
 
-  rc_fail="$(awk '$2 != 0' "$EV/rc.txt" | wc -l)"
+  RC_SUMMARY="$(python3 scripts/rust/l15_exit_driver.py "$EV/rc.txt" "$EV/stage1a-gate.json")"
+  log "RC_SUMMARY=$RC_SUMMARY"
+  rc_fail="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["failed_steps"])' <<<"$RC_SUMMARY")"
   log "DRIVER DONE failed_steps=$rc_fail"
   echo "DONE" >> "$EV/rc.txt"
   [[ "$rc_fail" -eq 0 ]]

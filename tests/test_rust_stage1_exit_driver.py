@@ -16,6 +16,8 @@ import pytest
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
+from scripts.rust import l15_exit_driver
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "scripts" / "rust" / "stage1_exit_driver.sh"
 APPROVED_JSON = REPO_ROOT / "tools" / "uart_stdio_bridge" / "APPROVED_REVISION.json"
@@ -254,6 +256,76 @@ def test_driver_checks_clean_tree_at_start_and_records_head():
     text = _driver_text()
     assert "git status --porcelain" in text
     assert 'git rev-parse HEAD' in text
+
+
+def _gate_with_owner_deferred_case(case_id: str, status: str, windows_verdict: str, message: str) -> dict:
+    return {
+        "overall": "IMPLEMENTED",
+        "errors": [],
+        "cases": [{
+            "id": case_id, "layer": "L1.5", "status": status,
+            "evidence": [
+                {"platform": "linux", "verdict": "PASS", "gate_eligible": True},
+                {"platform": "windows", "verdict": windows_verdict, "gate_eligible": False,
+                 "message": message},
+            ],
+        }],
+    }
+
+
+@pytest.mark.parametrize("case_id,windows_verdict,message", [
+    ("l15-transport-disconnect", "INSUFFICIENT_EVIDENCE",
+     "step 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE"),
+    ("ev-01-spawn-handler", "FAIL", r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired"),
+    ("sm-04-device-unplug", "SKIP", "cap_missing:by_id_link"),
+])
+def test_exit_driver_accepts_only_gate_approved_windows_owner_deferred_l15_rc(case_id, windows_verdict, message):
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n",
+        _gate_with_owner_deferred_case(case_id, "BLOCKED-OWNER", windows_verdict, message),
+    )
+    assert unresolved == []
+    assert suppressed == [{"step": "win_l15_func_test", "rc": 1}]
+
+
+@pytest.mark.parametrize("rc_text,gate", [
+    ("win_l15_func_test 1\nstage1a_gate 1\n", _gate_with_owner_deferred_case(
+        "l15-transport-disconnect", "BLOCKED-OWNER", "INSUFFICIENT_EVIDENCE",
+        "step 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE")),
+    ("win_l15_func_test 2\nstage1a_gate 0\n", _gate_with_owner_deferred_case(
+        "l15-transport-disconnect", "BLOCKED-OWNER", "INSUFFICIENT_EVIDENCE",
+        "step 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE")),
+    ("win_l15_func_test 1\nstage1a_gate 0\npolicy_check 1\n", _gate_with_owner_deferred_case(
+        "l15-transport-disconnect", "BLOCKED-OWNER", "INSUFFICIENT_EVIDENCE",
+        "step 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE")),
+    ("win_l15_func_test 1\nstage1a_gate 0\n", _gate_with_owner_deferred_case(
+        "l15-transport-disconnect", "FAIL", "INSUFFICIENT_EVIDENCE",
+        "step 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE")),
+    ("win_l15_func_test 1\nstage1a_gate 0\n", {
+        "overall": "FAIL", "errors": ["有其他 gate 失敗"], "cases": [
+            {"id": "l15-transport-disconnect", "layer": "L1.5", "status": "BLOCKED-OWNER"},
+        ],
+    }),
+])
+def test_exit_driver_does_not_hide_non_deferred_or_gate_failures(rc_text, gate):
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(rc_text, gate)
+    assert unresolved
+    assert suppressed == []
+
+
+def test_exit_driver_requires_an_explicit_od30_to_od32_blocked_owner_row():
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n",
+        {"overall": "IMPLEMENTED", "errors": [], "cases": []},
+    )
+    assert unresolved == [{"step": "win_l15_func_test", "rc": 1}]
+    assert suppressed == []
+
+
+def test_driver_filters_windows_l15_rc_only_through_owner_deferred_gate_summary():
+    text = _driver_text()
+    assert 'scripts/rust/l15_exit_driver.py "$EV/rc.txt" "$EV/stage1a-gate.json"' in text
+    assert 'awk \'$2 != 0\' "$EV/rc.txt"' not in text
 
 
 # ── no_onefile_extract：報告新鮮度與 verdict（雲端審查 bf8583b#2）──────────────
