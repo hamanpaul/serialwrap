@@ -1252,7 +1252,11 @@ class TestRunner:
         )
 
     def _expand(self, value: Any) -> Any:
-        """展開 {var.field} 參照，支援 _plus_one_x 與 {N_x} 衍生變數。"""
+        """展開 {var.field} 參照，支援 _plus_one_x 與 {N_x} 衍生變數。
+
+        另支援一層巢狀參照 `{prefix{inner}suffix}`（例如 `{w_{repeat.index}.cmd_id}`）：先展開內層名稱，
+        再以結果組成外層名稱展開；內層未解析時整段維持原字面（交由 `_require_resolved` 擋下）。
+        """
         if isinstance(value, str):
             def _replace(m: re.Match[str]) -> str:
                 path = m.group(1)
@@ -1276,6 +1280,12 @@ class TestRunner:
                     else:
                         return m.group(0)
                 return str(current) if current is not None else m.group(0)
+            def _replace_nested(m: re.Match[str]) -> str:
+                inner = _replace(re.match(r"\{([a-zA-Z0-9_.]+)\}", m.group(2)))  # type: ignore[arg-type]
+                if inner == m.group(2) or not re.fullmatch(r"[a-zA-Z0-9_.]*", inner):
+                    return m.group(0)
+                return "{" + m.group(1) + inner + m.group(3) + "}"
+            value = re.sub(r"(?<!\$)\{([a-zA-Z0-9_.]*)(\{[a-zA-Z0-9_.]+\})([a-zA-Z0-9_.]*)\}", _replace_nested, value)
             return re.sub(r"(?<!\$)\{([a-zA-Z0-9_.]+)\}", _replace, value)
         if isinstance(value, list):
             return [self._expand(v) for v in value]
@@ -1712,9 +1722,11 @@ class TestRunner:
         resp = self._cli(argv, timeout=timeout)
         self._log(f"CLI 回應: ok={resp.get('ok')}")
 
-        # 儲存變數
+        # 儲存變數（save_as 可含 `{repeat.index}` 等參照，逐次另存）
         save_as = step.get("save_as")
         if save_as:
+            save_as = str(self._expand(save_as))
+            self._require_resolved(save_as, idx, "cli save_as")
             self.variables[save_as] = resp
 
         # 檢查 expect

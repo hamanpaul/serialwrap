@@ -29,21 +29,26 @@ steps:
   - action: wait_ready
     timeout_s: 20
   # S1X Y4（CHG-S1X-WIN-TXRX-PAYLOADS-01）：依 plan 03 送 `echo W_<n>` 50 次（payload 各不相同），
-  # 每個 payload 在 wire 恰一次且依序；最後一個命令 done（佇列 FIFO）；console bytes 原樣出現。
+  # 每個 payload 在 wire 恰一次且依序；每個命令 done；console bytes 原樣出現。
+  # 50 個命令連續送出（burst），逐次另存 w_<n>；之後第二個 repeat 逐一等終態並斷言 done——Python arbiter 單一命令
+  # error 後仍續處理下一個，「最後一個 done」不能推論前 49 個 done（雲端審查 6eb949c#1）。
   - action: repeat
     count: 50
     steps:
       - action: cli
         argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:w1", "--cmd", "echo W_{repeat.index}"]
-        save_as: w_last
+        save_as: "w_{repeat.index}"
         expect: {ok: true}
-  - action: wait_command_done
-    cmd_id: "{w_last.cmd_id}"
-    timeout_s: 40
-  - action: cli
-    argv: ["cmd", "status", "--cmd-id", "{w_last.cmd_id}"]
-    expect:
-      command.status: "done"
+  - action: repeat
+    count: 50
+    steps:
+      - action: wait_command_done
+        cmd_id: "{w_{repeat.index}.cmd_id}"
+        timeout_s: 40
+      - action: cli
+        argv: ["cmd", "status", "--cmd-id", "{w_{repeat.index}.cmd_id}"]
+        expect:
+          command.status: "done"
   - action: attach_console
     selector: COM0
     label: win-con
