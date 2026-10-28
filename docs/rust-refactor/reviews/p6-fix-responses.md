@@ -268,7 +268,7 @@ Python 基線 `uart_io.py:1458-1507`：非 internal、PTY、非 owner／suspende
 
 ## 第三輪 Slice 2.2（2026-10-28 cloud session）：合併與 sol 補審
 
-### 合併（60ab7d2 主線、9dca414 P5 c66f65e）
+### 合併（60ab7d2 主線、2228cc7 P5 c66f65e）
 
 | 項目 | 處理 |
 |---|---|
