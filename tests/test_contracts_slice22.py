@@ -95,7 +95,10 @@ def test_slice22_case_set_frozen_and_mapped() -> None:
     assert set(NEW_SC.values()) <= lock
     assert {"bc02-deferred-overflow-clear", "bc02-mailbox-stale-input-not-replayed", "sc13-lease-expiry-tick",
             "sc15-console-ring-drop-oldest", "sc16-console-line-reject-log", "f4-interactive-line-cmd-defined",
-            "p0-blog-clean", "p1-wal-reset", "p1-wal-fullrun", "cowork-01-agent-bad-cmd", "ha-01-human-then-agent",
+            "p0-blog-clean", "p1-wal-reset", "p1-wal-fullrun", "ha-01-human-then-agent",
             "hk-02-agent-preempt-human", "win-telnet-raw-owner", "l15-multi-source-contention-console"} <= lock
+    # OD-34（擁有者裁決 2026-10-28）：cowork-01-agent-bad-cmd 逐名移至 Slice 2.3（不在 2.2 分母、仍在 2.3／2.4）。
+    sets = json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))["sets"]
+    assert "cowork-01-agent-bad-cmd" not in lock and "cowork-01-agent-bad-cmd" in set(sets["slice_2.3"])
     emap = yaml.safe_load((ROOT / "tests/acceptance/slice22_evidence_map.yaml").read_text(encoding="utf-8"))["cases"]
     assert set(emap) == lock, "evidence map 的分母必須等於凍結的 slice_2.2 集合"

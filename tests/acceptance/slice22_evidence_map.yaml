@@ -1,6 +1,7 @@
 # Slice 2.2 必要案例證據對照（P6 Task 0 建立骨架，07-slice22-console.md）。
 # 鍵集合＝Task 0 凍結的 cases.lock.json sets["slice_2.2"]（分母只能 add-only）；值由 Task 13 補 evidence。
 # frozen_lock_sha1＝凍結當下 cases.lock.json 的 git blob sha1。
+# OD-34（擁有者裁決 2026-10-28）：cowork-01-agent-bad-cmd 逐名移至 Slice 2.3，自本對照表移除（breaker/slice_2.2.json amendments）。
 schema_version: 1
 frozen_lock_sha1: dc692da1787818230b0b119ff4d0f652b31554d4
 cases:
@@ -9,7 +10,6 @@ cases:
   bc02-mailbox-stale-input-not-replayed: {status: PENDING}
   bc02-normal-replay-53: {status: PENDING}
   co-01-line-buffering: {status: PENDING}
-  cowork-01-agent-bad-cmd: {status: PENDING}
   f1-cmdid-survives-timeout: {status: PENDING}
   f1-limits-queryable: {status: PENDING}
   f1-near-limit-no-logout: {status: PENDING}

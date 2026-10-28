@@ -613,3 +613,59 @@ def test_counts_report():
     assert counts.get("by_suite") == by_suite, f"counts by_suite mismatch: {counts.get('by_suite')} vs {by_suite}"
     assert counts.get("by_layer") == by_layer, f"counts by_layer mismatch: {counts.get('by_layer')} vs {by_layer}"
     assert counts.get("by_slice") == by_slice, f"counts by_slice mismatch: {counts.get('by_slice')} vs {by_slice}"
+
+
+@pytest.mark.process_rpc
+def test_regen_lock_authorized_deferral_is_per_name(tmp_path: pathlib.Path):
+    """OD-34（擁有者裁決 2026-10-28）：案例延後切片只能逐名授權（`--authorize-deferral <case_id>:OD-<n>`）。
+    未授權者照舊拒絕；授權只放行該案例的 daemon_slice 往後移，不放行其他分母屬性改動或其他案例；
+    沒有實際延後的授權（過期 token）亦拒絕。"""
+    regen_script = REPO / "tests/acceptance/regen_lock.py"
+    orig_lock = (REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8")
+    counts = (REPO / "tests/acceptance/cases.counts.json").read_text(encoding="utf-8")
+    lock_now = json.loads(orig_lock)
+    cid = next(c for c in lock_now["sets"]["slice_2.2"] if c not in lock_now["sets"]["slice_2.1"]
+               and lock_now["case_attrs"][c]["daemon_slice"] == "2.2")
+
+    def run(tag: str, mutate, *extra: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        d = tmp_path / tag
+        d.mkdir()
+        cases_data = _load_cases()
+        mutate({c["case_id"]: c for c in cases_data["cases"]})
+        (d / "cases.yaml").write_text(yaml.safe_dump(cases_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        (d / "cases.lock.json").write_text(orig_lock, encoding="utf-8")
+        (d / "cases.counts.json").write_text(counts, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(regen_script), "--add-only", "--cases", str(d / "cases.yaml"),
+             "--lock", str(d / "cases.lock.json"), *extra],
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+        )
+        return proc, d / "cases.lock.json"
+
+    def defer(cases):
+        cases[cid]["daemon_slice"] = "2.3"
+
+    proc, lock = run("unauth", defer)
+    assert proc.returncode == 1 and "被延後切片" in proc.stderr, proc.stderr
+    assert lock.read_text(encoding="utf-8") == orig_lock
+
+    proc, lock = run("auth", defer, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 0, proc.stderr
+    new = json.loads(lock.read_text(encoding="utf-8"))
+    assert cid not in new["sets"]["slice_2.2"] and cid in new["sets"]["slice_2.3"]
+    assert new["case_attrs"][cid]["daemon_slice"] == "2.3"
+    assert f"{cid}" in proc.stdout and "OD-34" in proc.stdout
+
+    def defer_and_shrink(cases):
+        defer(cases)
+        cases[cid]["platforms"] = ["linux"]
+
+    proc, lock = run("attr", defer_and_shrink, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 1 and "分母屬性變更" in proc.stderr, proc.stderr
+    assert lock.read_text(encoding="utf-8") == orig_lock
+
+    proc, lock = run("stale", lambda cases: None, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 1 and "未對應" in proc.stderr, proc.stderr
+
+    proc, lock = run("badref", defer, "--authorize-deferral", f"{cid}:owner")
+    assert proc.returncode == 2, proc.stderr

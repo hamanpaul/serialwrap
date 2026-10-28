@@ -7,6 +7,9 @@
   python3 tests/acceptance/regen_lock.py --check --base <rev> [--allow-removal <set_id:platform:nodeid>…]
                                                       # 另以 <rev> 的 L1 鎖為基準：基準已有的 (set, platform, nodeid) 消失或 selector 改變即 exit 1
   python3 tests/acceptance/regen_lock.py --add-only   # 重算；既有 ID 從任何集合消失、被延後切片，或分母屬性被改動即 exit 1 且不寫檔，否則寫回
+  python3 tests/acceptance/regen_lock.py --add-only --authorize-deferral <case_id>:OD-<n> …
+                                                      # 擁有者裁決逐名授權的延後切片（OD-34 起）：只放行該案例 daemon_slice 往後移
+                                                      # 及因此自較早 slice_X 消失；其他屬性改動、其他案例或未對應實際延後的授權仍拒絕
   python3 tests/acceptance/regen_lock.py --l1-add-only --set <id> --platform <linux|windows> --collect <檔>
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
@@ -193,7 +196,30 @@ def cmd_check(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
     return 0
 
 
-def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
+DEFERRAL_REF_RE = re.compile(r"^OD-\d+$")
+
+
+def parse_deferral_authorization(token: str) -> tuple[str, str]:
+    """`<case_id>:OD-<n>` → (case_id, decision_ref)；擁有者裁決編號以外的依據一律拒絕。"""
+    cid, sep, ref = token.rpartition(":")
+    if not sep or not cid or not DEFERRAL_REF_RE.match(ref):
+        raise ValueError(f"--authorize-deferral 須為 <case_id>:OD-<n>：{token!r}")
+    return cid, ref
+
+
+def _is_authorized_deferral(old_a: dict[str, Any] | None, new_a: dict[str, Any] | None) -> bool:
+    """只有 daemon_slice 往後移、其餘分母屬性完全不變才算可授權的延後。"""
+    if not old_a or not new_a:
+        return False
+    if {k for k in ATTR_KEYS if old_a.get(k) != new_a.get(k)} != {"daemon_slice"}:
+        return False
+    old_s, new_s = old_a.get("daemon_slice"), new_a.get("daemon_slice")
+    return isinstance(old_s, str) and isinstance(new_s, str) and _slice_tuple(new_s) > _slice_tuple(old_s)
+
+
+def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
+                 deferrals: dict[str, str] | None = None) -> int:
+    deferrals = deferrals or {}
     cases_data = _load_yaml(cases_path)
     new_sets = compute_sets(cases_data)
     new_attrs = compute_attrs(cases_data)
@@ -201,21 +227,31 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
         old = json.loads(lock_path.read_text(encoding="utf-8"))
     else:
         old = _empty_lock(None)
+    old_attrs = old.get("case_attrs")
+    authorized = {cid for cid in deferrals
+                  if _is_authorized_deferral((old_attrs or {}).get(cid), new_attrs.get(cid))}
     removed: list[str] = []
     for name, old_ids in (old.get("sets") or {}).items():
         gone = sorted(set(old_ids) - set(new_sets.get(name, [])))
         for cid in gone:
+            if (cid in authorized and name.startswith("slice_")
+                    and _slice_tuple(name[len("slice_"):]) < _slice_tuple(new_attrs[cid]["daemon_slice"])):
+                continue
             removed.append(f"{cid}（集合 {name}）")
     changed: list[str] = []
-    old_attrs = old.get("case_attrs")
     if old_attrs is not None:
         for cid, old_a in sorted(old_attrs.items()):
             if cid not in new_attrs:
                 removed.append(f"{cid}（案例已不存在）")
                 continue
-            if new_attrs[cid] != old_a:
+            if new_attrs[cid] != old_a and cid not in authorized:
                 diff = {k: (old_a.get(k), new_attrs[cid].get(k)) for k in ATTR_KEYS if old_a.get(k) != new_attrs[cid].get(k)}
                 changed.append(f"{cid}（分母屬性變更：{diff}）")
+    stale = sorted(set(deferrals) - authorized)
+    if stale and not (removed or changed):
+        print("[regen_lock] REFUSED：--authorize-deferral 未對應任何實際延後（只允許 daemon_slice 往後移且其餘屬性不變）："
+              + "、".join(f"{cid}:{deferrals[cid]}" for cid in stale), file=sys.stderr)
+        return 1
     if removed or changed:
         print("[regen_lock] REFUSED：既有 case 從集合消失、被延後切片或分母屬性被改動，鎖檔未變更：", file=sys.stderr)
         for line in removed + changed:
@@ -236,6 +272,9 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path) -> int:
     counts_path = lock_path.parent / COUNTS_NAME
     _write(counts_path, _dump_json(compute_counts(cases_data)))
     total_added = sum(len(v) for v in added.values())
+    for cid in sorted(authorized):
+        print(f"[regen_lock] AUTHORIZED 逐名延後：{cid} daemon_slice {old_attrs[cid]['daemon_slice']}→"
+              f"{new_attrs[cid]['daemon_slice']}（{deferrals[cid]}）")
     print(f"[regen_lock] wrote {lock_path.name} 與 {COUNTS_NAME}（新增集合條目 {total_added}）")
     return 0
 
@@ -524,11 +563,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="--l1-add-only：行內 selector.argv（JSON 字串陣列；產生該平台報告的完整命令）")
     parser.add_argument("--paths-json", default=None, help="--l1-add-only：行內 selector.paths（JSON 字串陣列）")
     parser.add_argument("--markexpr", default=None, help="--l1-add-only：行內 selector.markexpr")
+    parser.add_argument("--authorize-deferral", action="append", default=[], metavar="CASE_ID:OD-N",
+                        help="--add-only：擁有者裁決逐名授權的延後切片（只放行該案例 daemon_slice 往後移）")
     parser.add_argument("--cases-only", action="store_true",
                         help="--check：只驗證案例鎖（func-test 執行器用；不檢查 L1 鎖）")
     args = parser.parse_args(argv)
     try:
         approvals = {parse_removal_approval(token) for token in args.allow_removal}
+        deferrals = dict(parse_deferral_authorization(token) for token in args.authorize_deferral)
     except ValueError as exc:
         print(f"[regen_lock] 用法錯誤：{exc}", file=sys.stderr)
         return 2
@@ -549,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
         # L1 鎖缺檔即失敗（P2-T13 審查修正）：刪除 l1_required.lock.json 不得讓 --check 通過。
         rc |= cmd_check_l1(args.lock_file, args.base, approvals)
         return 1 if rc else 0
-    return cmd_add_only(args.cases, args.lock)
+    return cmd_add_only(args.cases, args.lock, deferrals)
 
 
 if __name__ == "__main__":

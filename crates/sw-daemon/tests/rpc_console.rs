@@ -663,3 +663,47 @@ fn open_allow_attached_string_false_is_truthy() {
     assert_eq!(s(&truthy, "error_code"), "SESSION_NOT_READY", "{}", j(&truthy));
     assert_eq!(s(&truthy, "error_detail"), "NOT_BOOTLOADER", "字串 false 為 truthy：{}", j(&truthy));
 }
+
+/// OD-37（擁有者裁決 2026-10-28；DF-20，Python 不改）：release → 重新 attach 後，以 release 前取得的舊
+/// interactive_id（agent lease 與 human console lease 各一）呼叫 interactive_send，Rust 回 `INTERACTIVE_NOT_FOUND`
+/// （帶 interactive_id）且零 TX。Python 現行仍照送該 bytes（舊 lease 未隨 release 失效），此為登記的刻意差異。
+#[test]
+fn od37_send_with_pre_release_id_after_reattach_not_found_zero_tx() {
+    for human in [false, true] {
+        let r = ServiceRig::with_console_backend("pty");
+        let old = if human {
+            let a = attach(&r, r#"{"selector":"COM0"}"#);
+            s(&a, "interactive_session_id")
+        } else {
+            let o = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
+            assert_eq!(o.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&o));
+            s(&o, "interactive_id")
+        };
+        assert!(!old.is_empty(), "human={human}");
+        let rel = r.call("device.release", r#"{"selector":"COM0"}"#);
+        assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&rel));
+        let att = r.call("device.attach", r#"{"selector":"COM0"}"#);
+        assert_eq!(att.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&att));
+        wait_for("重新 attach 後 bridge 就緒", || {
+            r.clock.advance(Duration::from_millis(250));
+            matches!(s(&session_row(&r), "state").as_str(), "READY" | "ATTACHED")
+        });
+        let dev = r.device(REAL_A);
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = dev.take_tx();
+        let send = r.call(
+            "session.interactive_send",
+            &format!(r#"{{"interactive_id":"{old}","data":"x\n"}}"#),
+        );
+        assert_eq!(
+            j(&send),
+            format!(
+                r#"{{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND","interactive_id":"{old}","version":"{}"}}"#,
+                r.version
+            ),
+            "human={human}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!dev.take_tx().contains(&b'x'), "human={human}：零 TX");
+    }
+}

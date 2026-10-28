@@ -304,3 +304,10 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 （`HubCritical.close_all_requests` 累加，不受合併旗標影響）；core 每次送 `ConsoleCloseAll` 遞增 `human.close_gen`，release 一律送出；
 `close_gen` 小於 core 值的事件不登記並回 `ConsoleClose`。回歸：`session_core_console::late_console_connected_after_release_is_rejected`
 （拿掉世代檢查即 FAIL；並驗證 release 後新世代連線照常取得 owner）、`console_hub::console_connected_carries_processed_close_gen`。
+
+### 擁有者裁決 OD-34／OD-37（2026-10-28）
+
+| OD | 處理 |
+|---|---|
+| OD-34 | `cowork-01-agent-bad-cmd` 的 `daemon_slice` 2.2→2.3（`cross_slice_reason` 引用 OD-34），`cases.yaml` revision 2026-10-28.1；`regen_lock.py --add-only --authorize-deferral cowork-01-agent-bad-cmd:OD-34` 逐名授權（新選項，回歸 `tests/test_acceptance_cases.py::test_regen_lock_authorized_deferral_is_per_name`：未授權拒絕、其他屬性改動拒絕、過期授權拒絕、非 OD 依據 exit 2）；slice_2.2 分母 95→94、slice_2.3／2.4 保留；`breaker/slice_2.2.json` 移除該案並重算 `denominator_sha256`，另記 `amendments`（OD-34）；`slice22_evidence_map.yaml` 移除該鍵、`slice21_scope.yaml` cross_slice func-test 改列 2.3；`test_contracts_slice22.py` 改斷言該案不在 2.2、在 2.3。07 計畫 Task 11 Step 4 的 func-test 迴圈文字屬 `docs/parity-amendments`，請計畫擁有者同步移出 |
+| OD-37 | Rust 實測已回 `INTERACTIVE_NOT_FOUND`＋零 TX（release Phase 1 移除 lease 與 LeaseIndex，manager 路由查無）；新增 `rpc_console::od37_send_with_pre_release_id_after_reattach_not_found_zero_tx`（agent lease 與 human console lease 兩案）鎖住，登記時即為綠燈（行為先前已存在，無產品碼變更），以 `--l1-add-only` 登記。登記 DF-20（`contracts/behavior_changes.yaml` revision 6，`scope: rust_only`；validator 規定 DF 的 approval 為 spec-reconciliation，以 `decision_ref: OD-37`、`related_decisions` 引用裁決）與 case `df20-release-reattach-stale-interactive-id`（`necessity: conditional`，不改變 slice_2.2 凍結分母；L1 證據由 s22_gate:cargo_workspace 執行）。DF 編號 20 為各分支未用的下一號；主線登錄 OD-34～44 若另配號，請以主線為準並告知 P6 |

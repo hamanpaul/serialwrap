@@ -12,7 +12,7 @@
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-24.1
+revision: 2026-10-28.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -2097,7 +2097,7 @@ cases:
   platform_capabilities:
     windows: [windows_com, process_rpc]
   cli_stage: 1B
-  daemon_slice: '2.2'
+  daemon_slice: '2.3'
   stage0_required: true
   prerequisites: [arbiter, recovery_min, console_pty]
   necessity: required
@@ -2108,7 +2108,7 @@ cases:
   sentinel: null
   evidence: [manifest.json, wire.ndjson, control.ndjson, correlation.ndjson, comparison.json, dut.stderr.log, cli.ndjson, daemon.log, wal/]
   implemented_by: existing
-  cross_slice_reason: null
+  cross_slice_reason: 'OD-34（擁有者裁決 2026-10-28）：自 Slice 2.2 func-test gate 逐名移出、改列 Slice 2.3（regen_lock.py --authorize-deferral 逐名授權）'
 - case_id: ev-01-spawn-handler
   suite: func-test
   source_ref: func-test/cases/ev-01-spawn-handler.yaml
@@ -4551,5 +4551,31 @@ cases:
   expected: PASS
   sentinel: null
   evidence: [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, ab_summary.json]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+# --- P6 Slice 2.2 第三輪：OD-37（擁有者裁決 2026-10-28）登記為 DF-20（add-only；Rust-only L1，conditional 不改變切片凍結分母） ---
+- case_id: df20-release-reattach-stale-interactive-id
+  suite: contract-blackbox
+  source_ref: crates/sw-daemon/tests/rpc_console.rs::od37_send_with_pre_release_id_after_reattach_not_found_zero_tx
+  family: L15
+  title: release 後重新 attach，以舊 interactive_id 的 interactive_send 回 INTERACTIVE_NOT_FOUND 且零 TX
+  contract: 'DF-20（OD-37）：device.release 使既有 interactive lease（agent 或 human console）失效；重新 attach 後以舊 id 呼叫 session.interactive_send 回 {ok:false, error_code:INTERACTIVE_NOT_FOUND, interactive_id}，不送任何 bytes。Python 現行照送，依 OD-37 不改。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [lease]
+  necessity: conditional
+  issues: []
+  behavior_changes: [DF-20]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [crates/sw-daemon/tests/rpc_console.rs]
   implemented_by: 07-slice22-console.md
   cross_slice_reason: null

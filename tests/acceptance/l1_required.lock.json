@@ -11301,6 +11301,7 @@
           "cargo:sw-daemon::rpc_console::list_and_detach_without_bridge",
           "cargo:sw-daemon::rpc_console::list_prunes_stale_without_peer",
           "cargo:sw-daemon::rpc_console::list_sorted_by_label_then_id",
+          "cargo:sw-daemon::rpc_console::od37_send_with_pre_release_id_after_reattach_not_found_zero_tx",
           "cargo:sw-daemon::rpc_console::open_allow_attached_string_false_is_truthy",
           "cargo:sw-daemon::rpc_console::open_coercion_float_error_before_invalid_args",
           "cargo:sw-daemon::rpc_console::open_timeout_zero_uses_default",

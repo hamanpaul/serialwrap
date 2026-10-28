@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-24.1",
+  "cases_revision": "2026-10-28.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -236,6 +236,7 @@
       "brcm-01-login-flow",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
+      "df20-release-reattach-stale-interactive-id",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
@@ -422,7 +423,6 @@
       "bc02-mailbox-stale-input-not-replayed",
       "bc02-normal-replay-53",
       "co-01-line-buffering",
-      "cowork-01-agent-bad-cmd",
       "f1-cmdid-survives-timeout",
       "f1-limits-queryable",
       "f1-near-limit-no-logout",
@@ -1243,9 +1243,22 @@
       ],
       "expected": "PASS",
       "necessity": "required",
-      "daemon_slice": "2.2",
+      "daemon_slice": "2.3",
       "cli_stage": "1B",
       "stage0_required": true
+    },
+    "df20-release-reattach-stale-interactive-id": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
     },
     "ev-01-spawn-handler": {
       "suite": "func-test",

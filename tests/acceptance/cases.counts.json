@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-24.1",
-  "total": 168,
+  "cases_revision": "2026-10-28.1",
+  "total": 169,
   "by_suite": {
-    "contract-blackbox": 42,
+    "contract-blackbox": 43,
     "func-test": 13,
     "l15-scenario": 15,
     "manual-procedure": 1,
@@ -12,7 +12,7 @@
     "windows-native": 18
   },
   "by_layer": {
-    "L1": 37,
+    "L1": 38,
     "L1.5": 45,
     "L2": 43,
     "L3": 42,
@@ -21,7 +21,7 @@
   "by_slice": {
     "2.1": 49,
     "2.2": 46,
-    "2.3": 27,
+    "2.3": 28,
     "2.4": 11,
     "None": 35
   }

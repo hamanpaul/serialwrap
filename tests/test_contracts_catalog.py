@@ -1376,7 +1376,12 @@ def test_bc_real_sc_df_ranges() -> None:
     # SC-08 依 OD-14 #3 撤回、編號不重用。
     assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36"}) - {"SC-08"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19"}
+    # DF-20 由 P6 依 OD-37（2026-10-28）登記（rust_only）。
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20"}
+    df20 = by_id["DF-20"]
+    assert df20.scope == "rust_only" and list(df20.phases) == ["P6"]
+    assert df20.case_ids == ("df20-release-reattach-stale-interactive-id",)
+    assert df20.applies_rust_stage == "slice-2.2"
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
