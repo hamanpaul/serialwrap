@@ -25,6 +25,7 @@
 - docker 優先驗證（OD-15 (3)～(5)、(7)）：每個 release candidate 在 L2／L3 A/B 前先以 P2 Task 17 的 docker 兩容器拓樸（`serialwrap` ⇄ bridge ⇄ `dut-sim`，假 COM 為 PTY pair）跑 L1.5；該類報告帶 `evidence_layer: "L1.5-docker"`，Windows `windows-task` >72h 監管報告（P2 Task 18 throwaway 排程工作）帶 `evidence_layer: "host-throwaway"`。兩者都**不得**計為真板 L2、實機 L3、OD-10 bench 長跑或實機回滾演練證據（§11.1、§15.3），Task 14B ingest 一律拒收（`test_docker_and_throwaway_reports_rejected_for_real_board_items`）。
 - 48h A/B 長跑在擁有者 bench 上 Linux、Windows **依序**執行（同機同板經 usbipd，不可並行）；`lr-mixed` 故障保留模式不得被外部監管自動重啟抵銷（§15.11.2）。
 - 退役範圍只限產品執行期 Python daemon；Python 測試、bridge、DUT 模擬器、TestPilot 與 `realhw` 引擎保留（§12.2 Stage 3 末段）。
+- 版號（OD-33）：Stage 1 出口（Rust CLI＋Python daemon）＝ `0.4.0`、Stage 2 出口（全 Rust daemon）＝ `0.5.0`（Canary 前可用 `0.5.0-rc.N`），**Stage 3 退役 bundle（本 Phase Task 16 的 `retired:true` 發佈）＝ `1.0.0`**；Canary 帳本與回滾演練的 current／previous 以實際受測 bundle 版號登記（Stage 3 Canary 以 `0.5.x` 起算），測試假資料中的 `0.8.0`／`0.9.0`／`1.0.0` 只是佔位值、不必改。
 - 測試工具原因碼一律 `HARNESS_*`，屬測試工具契約，不得混入 `contracts/error_codes.yaml`（§11.4）。
 - 證據不足、擷取失敗、`unknown`、未執行均不得轉為 PASS（§11.3、§11.4）。
 - L1 出口（`layer=="L1"`）一律以事先凍結的每平台必要 nodeid 清單（P2 `l1_required.lock.json`）為分母，經 P2 `l1_judge.judge` 判定：缺案、重複、必要案例任何 SKIP／xfail／deselected／未執行、runner exit code 非 0 或未完成，都不得 PASS；不得以「測試數 >0、無 failure」或「passed ≥ N」判定（R5-F3）。

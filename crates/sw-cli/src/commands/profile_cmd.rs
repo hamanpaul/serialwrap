@@ -157,14 +157,16 @@ fn unknown_profile(ctx: &mut CliCtx, profile: &str, profile_dir: &str, names: &[
     0
 }
 
-/// 四組 regex 檢查（`cli.py:1889-1896`）。
+/// 五組 regex 檢查（`cli.py` `_run_profile_test` 的 `checks` dict 字面量）。
 ///
-/// 求值順序與 Python dict 字面量相同（prompt → login → password → bootloader），使多個未攔截例外並存時
+/// 求值順序與 Python dict 字面量相同（prompt → login → password → boot_done → bootloader；boot_done 為 #234），
+/// 使多個未攔截例外並存時
 /// stderr 顯示的是 Python 先拋出的那一個。
 fn run_checks(template: &ProfileTemplate, text: &str) -> Result<PyDict, String> {
     let prompt = search_pattern(&template.prompt_regex, text)?;
     let login = search_pattern(&template.login_regex, text)?;
     let password = search_pattern(&template.password_regex, text)?;
+    let boot_done = search_pattern(&template.boot_done_regex, text)?;
     let last = last_nonblank_line(text);
     let mut bootloader = Vec::with_capacity(template.bootloader_prompts.len());
     for pattern in &template.bootloader_prompts {
@@ -174,6 +176,7 @@ fn run_checks(template: &ProfileTemplate, text: &str) -> Result<PyDict, String> 
         ("prompt_regex".to_string(), PyValue::Dict(prompt)),
         ("login_regex".to_string(), PyValue::Dict(login)),
         ("password_regex".to_string(), PyValue::Dict(password)),
+        ("boot_done_regex".to_string(), PyValue::Dict(boot_done)),
         ("bootloader_prompts".to_string(), PyValue::List(bootloader)),
     ]))
 }

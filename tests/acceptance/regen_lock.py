@@ -4,14 +4,18 @@
   python3 tests/acceptance/regen_lock.py --check      # 驗證案例鎖與 L1 鎖結構；兩者缺一即 exit 1（P2-T13 審查修正）
   python3 tests/acceptance/regen_lock.py --check --cases-only
                                                       # 只驗證案例鎖（供 func-test 執行器；不檢查 L1 鎖）
-  python3 tests/acceptance/regen_lock.py --check --base <rev> [--allow-removal <nodeid>…]
-                                                      # 另以 <rev> 的 L1 鎖為基準：基準已有的 nodeid 消失或 selector 改變即 exit 1
+  python3 tests/acceptance/regen_lock.py --check --base <rev> [--allow-removal <set_id:platform:nodeid>…]
+                                                      # 另以 <rev> 的 L1 鎖為基準：基準已有的 (set, platform, nodeid) 消失或 selector 改變即 exit 1
   python3 tests/acceptance/regen_lock.py --add-only   # 重算；既有 ID 從任何集合消失、被延後切片，或分母屬性被改動即 exit 1 且不寫檔，否則寫回
   python3 tests/acceptance/regen_lock.py --l1-add-only --set <id> --platform <linux|windows> --collect <檔>
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
-                                                      # 經核准替換者須逐名列 --allow-removal，且清單必須與消失集合完全相符；
-                                                      # 新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
+                                                      # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
+                                                      # 且清單必須與該集合消失集合完全相符；新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
+                                                      # OD-24：collect JSON 的 ignored 名單（cargo_l1_results.py --list-only）新增時排除；
+                                                      # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
+  核准移除格式（收緊，2026-10-23）：`--allow-removal` 僅接受三元組 `set_id:platform:nodeid`（platform ∈ linux|windows）。
+  裸 nodeid 不再被接受（舊版只比對 nodeid，Windows 之核准會放行 Linux 必要集合中同名 nodeid 之刪除；sol d82d146）。
 
 集合定義（字典序排序的 case_id）：
   stage0   ＝ stage0_required 為 true
@@ -49,6 +53,8 @@ SET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_:.-]*$")
 COUNTS_NAME = "cases.counts.json"
 SLICES = ("2.1", "2.2", "2.3", "2.4")
 ATTR_KEYS = ("suite", "layer", "platforms", "expected", "necessity", "daemon_slice", "cli_stage", "stage0_required")
+# 核准移除之粒度為 (set_id, platform, nodeid) 三元組：同名 nodeid 在不同集合／平台的核准互不相通。
+Approval = tuple[str, str, str]
 
 
 def _configure_stdio() -> None:
@@ -310,7 +316,18 @@ def _git_base_lock(lock_path: pathlib.Path, rev: str) -> tuple[dict[str, Any] | 
         return None, f"基準 {rev} 的鎖檔不是合法 JSON：{exc}"
 
 
-def cmd_check_l1(lock_path: pathlib.Path, base: str | None, allow_removal: list[str]) -> int:
+def parse_removal_approval(token: str) -> Approval:
+    """解析 `set_id:platform:nodeid` 三元組；不合法即拋 ValueError（不得靜默忽略）。
+
+    以 maxsplit=2 切分，故 nodeid 內的 `::` 不影響切分；set_id 不含 `:`（由 SET_ID_RE 與切分共同保證）。
+    """
+    parts = token.split(":", 2)
+    if len(parts) != 3 or not SET_ID_RE.match(parts[0]) or ":" in parts[0] or parts[1] not in L1_PLATFORMS or not parts[2]:
+        raise ValueError(f"--allow-removal 須為 set_id:platform:nodeid 三元組（platform ∈ linux|windows）：{token!r}")
+    return parts[0], parts[1], parts[2]
+
+
+def cmd_check_l1(lock_path: pathlib.Path, base: str | None, approvals: set[Approval]) -> int:
     if not lock_path.exists():
         print(f"[regen_lock] FAIL L1 鎖檔不存在：{lock_path}", file=sys.stderr)
         return 1
@@ -331,13 +348,14 @@ def cmd_check_l1(lock_path: pathlib.Path, base: str | None, allow_removal: list[
         if base_lock is None:
             print(f"[regen_lock] 基準 {base} 尚無 L1 鎖檔（首次引入），略過基準比對")
         else:
-            rc |= _report_base_diff(base_lock, lock, allow_removal)
+            rc |= _report_base_diff(base_lock, lock, approvals)
     if rc == 0:
         print("[regen_lock] OK：L1 必要集合鎖結構" + ("與基準比對一致" if base is not None else "正確"))
     return rc
 
 
-def _report_base_diff(base: dict[str, Any], head: dict[str, Any], allow_removal: list[str]) -> int:
+def _report_base_diff(base: dict[str, Any], head: dict[str, Any], approvals: set[Approval]) -> int:
+    """基準已有的 (set, platform, nodeid) 於 HEAD 消失者，須有同一三元組之核准；selector 改變一律拒絕。"""
     rc = 0
     head_sets = head.get("sets", {})
     for set_id, plats in sorted(base.get("sets", {}).items()):
@@ -350,10 +368,10 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], allow_removal:
                 gone = sorted(set(spec["nodeids"]) - set(head_spec["nodeids"]))
                 changed = head_spec["selector"] != spec["selector"]
             for nid in gone:
-                if nid in allow_removal:
+                if (set_id, plat, nid) in approvals:
                     print(f"[regen_lock] 基準已有、HEAD 已消失（已以 --allow-removal 允許）：{set_id}.{plat} {nid}")
                 else:
-                    print(f"[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal 列名）：{set_id}.{plat} {nid}")
+                    print(f"[regen_lock] FAIL 基準已有、HEAD 已消失（須擁有者裁決並以 --allow-removal {set_id}:{plat}:{nid} 列名）：{set_id}.{plat} {nid}")
                     rc = 1
             if changed:
                 print(f"[regen_lock] FAIL selector 改變（基準 {spec['selector']}）：{set_id}.{plat}")
@@ -361,7 +379,12 @@ def _report_base_diff(base: dict[str, Any], head: dict[str, Any], allow_removal:
     return rc
 
 
-def _read_collect(path: pathlib.Path) -> list[str]:
+def _read_collect(path: pathlib.Path) -> tuple[list[str], set[str]]:
+    """讀 collect 輸出，回傳 (collected, ignored)。
+
+    JSON 形式 `{"collected": [...], "ignored": [...]}`（`scripts/rust/cargo_l1_results.py --list-only`）
+    的 ignored 必須 ⊆ collected（OD-24）；文字形式（pytest --collect-only）沒有 ignored 名單。
+    """
     raw = path.read_text(encoding="utf-8")
     try:
         value = json.loads(raw)
@@ -370,14 +393,20 @@ def _read_collect(path: pathlib.Path) -> list[str]:
     if isinstance(value, dict) and isinstance(value.get("collected"), list):
         if not all(isinstance(item, str) for item in value["collected"]):
             raise ValueError(f"collect JSON 的 collected 必須全為字串：{path}")
-        return list(value["collected"])
+        ignored = value.get("ignored", [])
+        if not isinstance(ignored, list) or not all(isinstance(item, str) for item in ignored):
+            raise ValueError(f"collect JSON 的 ignored 必須為字串陣列：{path}")
+        stray = sorted(set(ignored) - set(value["collected"]))
+        if stray:
+            raise ValueError(f"collect JSON 的 ignored 必須屬於 collected：{stray}")
+        return list(value["collected"]), set(ignored)
 
     ids: list[str] = []
     for line in raw.splitlines():
         text = line.strip()
         if "::" in text:
             ids.append(text)
-    return ids
+    return ids, set()
 
 
 def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None, str | None]:
@@ -403,11 +432,21 @@ def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None
 
 
 def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect: pathlib.Path,
-                    selector: dict[str, Any] | None, allow_removal: list[str]) -> int:
+                    selector: dict[str, Any] | None, approvals: set[Approval]) -> int:
     if platform not in L1_PLATFORMS or not SET_ID_RE.match(set_id or ""):
         print("[regen_lock] 用法錯誤：--set 與 --platform（linux|windows）必填", file=sys.stderr)
         return 2
-    collected = _read_collect(collect)
+    foreign = sorted(a for a in approvals if (a[0], a[1]) != (set_id, platform))
+    if foreign:
+        print(f"[regen_lock] REFUSED --allow-removal 含非本次集合／平台之三元組（本次為 {set_id}.{platform}），鎖檔未變更：", file=sys.stderr)
+        for s, p, nid in foreign:
+            print(f"  - {s}:{p}:{nid}", file=sys.stderr)
+        return 1
+    try:
+        collected, ignored = _read_collect(collect)
+    except ValueError as exc:
+        print(f"[regen_lock] REFUSED {exc}", file=sys.stderr)
+        return 1
     if not collected:
         print(f"[regen_lock] REFUSED 收集輸出沒有任何 nodeid：{collect}", file=sys.stderr)
         return 1
@@ -421,14 +460,19 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         if selector is None:
             print(f"[regen_lock] 用法錯誤：新增 {set_id}.{platform} 需以 --selector 或 --argv-json 指定產生命令", file=sys.stderr)
             return 2
-        new_spec = {"selector": selector, "nodeids": sorted(collected)}
-        added_count = len(collected)
+        if approvals:
+            print(f"[regen_lock] REFUSED 新增集合 {set_id}.{platform} 無既有 nodeid 可移除，--allow-removal 須為空，鎖檔未變更", file=sys.stderr)
+            return 1
+        # OD-24：#[ignore] 列不由官方 selector 執行，新增時一律排除
+        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored)}
+        added_count = len(new_spec["nodeids"])
     else:
         if selector is not None and selector != spec["selector"]:
             print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
             return 1
-        removed = sorted(set(spec["nodeids"]) - set(collected))
-        allowed = set(allow_removal)
+        allowed = {nid for _s, _p, nid in approvals}
+        # 既有 ignored 列仍在 collected 內，不視為消失（plan 04 Task 17）；OD-24 起可逐名核准移除
+        removed = sorted((set(spec["nodeids"]) - set(collected)) | (allowed & set(spec["nodeids"]) & ignored))
         unapproved = sorted(set(removed) - allowed)
         unused_approval = sorted(allowed - set(removed))
         if unapproved or unused_approval:
@@ -439,11 +483,11 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
                 print(f"  - 未消失 {set_id}.{platform} {nid}", file=sys.stderr)
             print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
-        added = sorted(set(collected) - set(spec["nodeids"]))
+        added = sorted(set(collected) - set(spec["nodeids"]) - ignored)
         if not added and not removed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
-        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(collected) | (set(spec["nodeids"]) - set(removed)))}
+        new_spec = {"selector": spec["selector"], "nodeids": sorted(set(added) | (set(spec["nodeids"]) - set(removed)))}
         added_count = len(added)
     lock["schema_version"] = 1
     lock.setdefault("sets", {}).setdefault(set_id, {})[platform] = new_spec
@@ -469,8 +513,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lock", type=pathlib.Path, default=DEFAULT_LOCK, help="cases.lock.json 路徑")
     parser.add_argument("--lock-file", type=pathlib.Path, default=DEFAULT_L1_LOCK, help="l1_required.lock.json 路徑")
     parser.add_argument("--base", default=None, help="--check 時的基準 rev（以其 L1 鎖比對只增）")
-    parser.add_argument("--allow-removal", action="extend", nargs="+", default=[], metavar="NODEID",
-                        help="經核准替換而允許移除的 nodeid；須逐名列出且於交付說明對應新測試")
+    parser.add_argument("--allow-removal", action="extend", nargs="+", default=[], metavar="SET:PLATFORM:NODEID",
+                        help="經核准替換而允許移除的三元組 set_id:platform:nodeid（僅接受三元組）；須逐筆列出且於交付說明對應新測試")
     parser.add_argument("--set", dest="set_id", default=None, help="--l1-add-only：集合 ID")
     parser.add_argument("--platform", default=None, help="--l1-add-only：linux 或 windows")
     parser.add_argument("--collect", type=pathlib.Path, default=None, help="--l1-add-only：collect-only 輸出檔")
@@ -483,6 +527,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases-only", action="store_true",
                         help="--check：只驗證案例鎖（func-test 執行器用；不檢查 L1 鎖）")
     args = parser.parse_args(argv)
+    try:
+        approvals = {parse_removal_approval(token) for token in args.allow_removal}
+    except ValueError as exc:
+        print(f"[regen_lock] 用法錯誤：{exc}", file=sys.stderr)
+        return 2
     if args.l1_add_only:
         if args.collect is None:
             print("[regen_lock] 用法錯誤：--l1-add-only 需 --collect", file=sys.stderr)
@@ -492,13 +541,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[regen_lock] 用法錯誤：{err}", file=sys.stderr)
             return 2
         return cmd_l1_add_only(args.lock_file, args.set_id or "", args.platform or "", args.collect, selector,
-                               list(args.allow_removal))
+                               approvals)
     if args.check:
         rc = cmd_check(args.cases, args.lock)
         if args.cases_only:
             return 1 if rc else 0
         # L1 鎖缺檔即失敗（P2-T13 審查修正）：刪除 l1_required.lock.json 不得讓 --check 通過。
-        rc |= cmd_check_l1(args.lock_file, args.base, list(args.allow_removal))
+        rc |= cmd_check_l1(args.lock_file, args.base, approvals)
         return 1 if rc else 0
     return cmd_add_only(args.cases, args.lock)
 

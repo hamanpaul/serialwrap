@@ -77,6 +77,41 @@ def test_allows_test_and_fakes(tmp_path, snippet):
     assert _run(tmp_path).returncode == 0
 
 
+def test_rejects_platform_cfg_in_named_mgmt_layout_tests(tmp_path):
+    _crate(
+        tmp_path,
+        "sw-cli",
+        "tests/mgmt_layout.rs",
+        """#[cfg(unix)]
+#[test]
+fn mkbundle_respects_cargo_target_dir_override() {
+    use std::os::unix::fs::PermissionsExt;
+}
+#[cfg(unix)]
+#[test]
+fn real_mkbundle_dev_output_verifies() {}
+#[cfg(windows)]
+#[test]
+fn windows_switch_running_exe_rename() {}
+""",
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert r.stdout.count(": cfg-predicate: ") == 3
+
+
+def test_native_test_allowlist_does_not_allow_other_cfg(tmp_path):
+    _crate(
+        tmp_path,
+        "sw-cli",
+        "tests/mgmt_layout.rs",
+        "#[cfg(windows)]\n#[test]\nfn unrelated_windows_test() {}\n",
+    )
+    r = _run(tmp_path)
+    assert r.returncode == 1
+    assert ": cfg-predicate: #[cfg(windows)]" in r.stdout
+
+
 def test_pal_exempt(tmp_path):
     _crate(
         tmp_path,

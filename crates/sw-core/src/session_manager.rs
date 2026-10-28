@@ -428,6 +428,7 @@ fn minimal_passthrough_template(name: &str) -> ProfileTemplate {
         log_dir: None,
         uart: UartProfile::default(),
         bootloader_prompts: Vec::new(),
+        boot_done_regex: String::new(),
         max_console_line_chars: None,
     }
 }

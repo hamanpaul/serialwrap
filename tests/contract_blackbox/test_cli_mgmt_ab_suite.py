@@ -5,22 +5,24 @@ AB_CASES 由 tests/acceptance/p4_required.lock.json 讀取（凍結於紅燈 com
 （先停 A、確認資源釋放、再起 B，新模擬器實例），斷言比較器結果 pass；rust_only 案例只跑 B 並驗絕對契約。
 凍結清單中任一 pytest 節點來源不存在、適用平台不可收集、或被 SKIP／xfail（未登記）→ FAIL。
 
-現況（BLOCKED）：本分支的 scripts/rust/ab_blackbox.sh 僅支援 stage 1A（固定 rust-1a、cli_1A），
-scripts/rust/ab_compare.py 無 `--stage 1b --lock` 介面；兩輪執行器尚未實作，執行案例以 BLOCKED-PREREQ 明確失敗，
-不以 xfail 隱藏，亦不以既有 1A 介面假裝完成。
+`scripts/rust/ab_blackbox_1b.py` 直接讀取 P4 凍結清單，依序跑 Python CLI 基線與 Rust CLI，
+中間執行資源釋放檢查，再以既有 `ab_compare.py --required` 判定；任何未核准 skip、xfail、
+失敗或證據不足都不得通過。
 """
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
-from bb_harness import repo_root
+from bb_harness import cli_prefix, repo_root
 
 pytestmark = [
     pytest.mark.core_portable,
@@ -130,17 +132,136 @@ def _pytest_node_markers(node: str) -> set[str]:
     return markers
 
 
+@pytest.mark.rust_only
 def test_cli_mgmt_ab_suite_execution(tmp_path: Path) -> None:
-    """全群組黑箱 A/B 執行（BLOCKED-PREREQ）。
-
-    通過判準（待實作）：依序以 Python CLI＋Python daemon 與 Rust CLI＋Python daemon 兩輪執行凍結節點，
-    比較器結果 pass，且 unregistered skip／xfail 與 evidence-insufficient 皆為 0。
-    """
-    pytest.fail(
-        "BLOCKED-PREREQ：全群組 A/B 兩輪執行器未實作（scripts/rust/ab_blackbox.sh 僅 stage 1A；"
-        "ab_compare.py 無 --stage 1b／--lock）。需擴充執行器後才可判定 pass；本案例不得以 xfail 或既有 1A 結果代替。"
-        f" 凍結案例數：{len(_load_ab_cases())}"
+    """依 P4 凍結 pytest 節點跑 Python／Rust 兩輪，並以比較器核對必要案例。"""
+    runner = ROOT / "scripts" / "rust" / "ab_blackbox_1b.py"
+    assert runner.is_file(), f"Stage 1B A/B 執行器不存在：{runner}"
+    cli = cli_prefix()
+    assert cli and Path(cli[-1]).is_file(), "Stage 1B A/B 必須以 Rust dev bundle 設定 SERIALWRAP_CLI_EXE"
+    resource_report = os.environ.get("SW_RESOURCE_REPORT")
+    output = (Path(resource_report).resolve().parent / "ab-suite") if resource_report else tmp_path / "ab-1b"
+    if resource_report:
+        assert ROOT.resolve() in output.resolve().parents, f"A/B 證據路徑須位於本 worktree：{output}"
+    result = subprocess.run(
+        [sys.executable, str(runner), "--cli", cli[-1], "--out", str(output)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=7200,
+        check=False,
     )
+    summary_path = output / "summary.json"
+    assert summary_path.is_file(), result.stdout + result.stderr
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary.get("result") == "pass", summary
+    assert summary.get("exit_codes", {}).get("a") == 0, summary
+    assert summary.get("exit_codes", {}).get("b") == 0, summary
+    classes = [row.get("class") for row in summary.get("ab_report", {}).get("cases", [])]
+    assert classes and set(classes) <= {"ok", "rust-only-ok", "not-applicable"}, summary
+    assert summary.get("counts", {}).get("xfail-unapproved", 0) == 0, summary
+    assert summary.get("counts", {}).get("evidence-insufficient", 0) == 0, summary
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _load_ab_executor():
+    """惰性載入 A/B executor：Windows staging 缺 scripts/ 時只讓用到它的測試失敗，不中止整個收集。"""
+    path = ROOT / "scripts" / "rust" / "ab_blackbox_1b.py"
+    if not path.is_file():
+        pytest.fail(f"A/B executor 缺失，無法執行此測試：{path}")
+    spec = importlib.util.spec_from_file_location("ab_blackbox_1b", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_status_junit(path: Path, nodeid: str, *, outcome: str, message: str = "") -> None:
+    path_text, *segments = nodeid.split("::")
+    classname = ".".join([path_text.removesuffix(".py").replace("/", "."), *segments[:-1]])
+    name = segments[-1]
+    suite = ET.Element("testsuite", tests="1", failures="0", errors="0", skipped="0")
+    testcase = ET.SubElement(suite, "testcase", classname=classname, name=name)
+    if outcome == "skip":
+        suite.set("skipped", "1")
+        ET.SubElement(testcase, "skipped", message=message)
+    elif outcome == "xfail":
+        suite.set("skipped", "1")
+        ET.SubElement(testcase, "skipped", type="pytest.xfail", message=message)
+    ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def test_ab_executor_rejects_unregistered_skip_and_xfail(tmp_path: Path) -> None:
+    nodeid = "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present"
+    junit = tmp_path / "junit.xml"
+
+    _write_status_junit(junit, nodeid, outcome="skip", message="rust-only contract")
+    ab_executor = _load_ab_executor()
+    skip_errors = ab_executor._junit_required(junit, [nodeid])
+    assert skip_errors, "未登記的 rust-only skip 不可放行"
+
+    _write_status_junit(junit, nodeid, outcome="xfail", message="P4 regression")
+    xfail_errors = ab_executor._junit_required(junit, [nodeid], approved_skips={nodeid: "rust-only contract"})
+    assert xfail_errors, "xfail 不得因 skip allowlist 而放行"
+
+
+def test_ab_executor_accepts_only_registered_python_skip(tmp_path: Path) -> None:
+    nodeid = "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present"
+    junit = tmp_path / "junit.xml"
+    _write_status_junit(junit, nodeid, outcome="skip", message="rust-only contract")
+    ab_executor = _load_ab_executor()
+
+    assert ab_executor._junit_required(junit, [nodeid], approved_skips={nodeid: "rust-only contract"}) == []
+    assert ab_executor._junit_required(junit, [nodeid], approved_skips={})
+    assert ab_executor._junit_required(junit, [nodeid], approved_skips={nodeid: "other reason"})
+
+
+def test_inherited_child_flag_alone_does_not_skip_the_outer_ab_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = tmp_path / "serialwrap"
+    cli.write_bytes(b"rust cli")
+    monkeypatch.setenv("SW_G5_AB_CHILD_TOKEN", "a" * 32)
+    monkeypatch.setenv("SW_G5_AB_PARENT_PID", str(os.getppid()))
+    monkeypatch.setenv("SW_G5_AB_CHILD", "1")
+    monkeypatch.delenv("SW_RESOURCE_REPORT", raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "cli_prefix", lambda: [str(cli)])
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        output = Path(argv[argv.index("--out") + 1])
+        output.mkdir(parents=True)
+        (output / "summary.json").write_text(
+            json.dumps(
+                {
+                    "result": "pass",
+                    "exit_codes": {"a": 0, "b": 0},
+                    "ab_report": {"cases": [{"class": "ok"}]},
+                    "counts": {"xfail-unapproved": 0, "evidence-insufficient": 0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    test_cli_mgmt_ab_suite_execution(tmp_path)
+
+    assert len(calls) == 1, "只有 A/B executor 的子輪可短路，外層必須真正啟動 executor"
+
+
+def test_frozen_cases_rejects_ab_suite_recursion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """凍結節點若含外層 A/B 測試即 ValueError（取代已移除的 env 遞迴防護）。"""
+    lock = tmp_path / "p4_required.lock.json"
+    lock.write_text(
+        json.dumps({"cases": [{"case_id": "x", "tests": [
+            "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_suite_execution"]}]}),
+        encoding="utf-8",
+    )
+    executor = _load_ab_executor()
+    monkeypatch.setattr(executor, "LOCK", lock)
+    with pytest.raises(ValueError, match="遞迴"):
+        executor._frozen_cases()
 
 
 def test_cli_mgmt_ab_cases_lock_present() -> None:
@@ -171,3 +292,301 @@ def test_cli_mgmt_ab_cases_lock_present() -> None:
             f"適用平台凍結節點無法收集（missing {len(missing_collection)}）："
             f"{missing_collection[:10]}\n{res.stdout[-1000:]}{res.stderr[-1000:]}"
         )
+
+
+def test_existing_out_dir_is_refused_without_overwrite(tmp_path: Path) -> None:
+    """既有結果目錄（含先前成功 run 的 summary.json）一律拒絕，且不寫入任何檔案。"""
+    executor = _load_ab_executor()
+    out = tmp_path / "ab"
+    out.mkdir()
+    previous = out / "summary.json"
+    previous.write_text('{"result":"pass"}', encoding="utf-8")
+    rc = executor.main(["--cli", str(tmp_path / "serialwrap"), "--out", str(out)])
+    assert rc == 2
+    assert previous.read_text(encoding="utf-8") == '{"result":"pass"}'
+    assert not (out / "summary.error.json").exists()
+
+
+def test_failure_writes_error_summary_never_summary_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """執行失敗只寫 summary.error.json，不得產生或覆寫 summary.json。"""
+    executor = _load_ab_executor()
+
+    def boom(**_kwargs: object) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(executor, "execute", boom)
+    out = tmp_path / "new"
+    rc = executor.main(["--cli", str(tmp_path / "serialwrap"), "--out", str(out)])
+    assert rc == 1
+    assert not (out / "summary.json").exists()
+    assert json.loads((out / "summary.error.json").read_text(encoding="utf-8"))["result"] == "fail"
+
+
+def test_resolve_manifest_uses_pointer_and_never_falls_back(tmp_path: Path) -> None:
+    """Windows dev bundle（bin\\current-release.json 指向 versions\\<V>）可定位 manifest；都缺則 ValueError。"""
+    executor = _load_ab_executor()
+    bundle = tmp_path / "bundle"
+    (bundle / "bin").mkdir(parents=True)
+    cli = bundle / "bin" / "serialwrap.exe"
+    cli.write_bytes(b"x")
+    version_dir = bundle / "versions" / "9.9.9-test"
+    version_dir.mkdir(parents=True)
+    manifest = version_dir / "release-manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    (bundle / "bin" / "current-release.json").write_text(
+        json.dumps({"dir": "versions\\9.9.9-test"}), encoding="utf-8"
+    )
+    assert executor.resolve_manifest(cli) == manifest
+    manifest.unlink()
+    with pytest.raises(ValueError, match="release-manifest"):
+        executor.resolve_manifest(cli)
+
+
+def test_registered_python_skip_is_approved_only_for_rust_only_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一登記案例內，只有 rust_only 節點可被核准為 Python 輪 skip；共用節點即使被 skip 也必須判失敗。"""
+    executor = _load_ab_executor()
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    (fake_root / "t_mixed.py").write_text(
+        "import pytest\n\n\n"
+        "@pytest.mark.rust_only\n"
+        "def test_rust_side():\n"
+        "    pass\n\n\n"
+        "def test_shared():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(executor, "ROOT", fake_root)
+    rust_node = "t_mixed.py::test_rust_side"
+    shared_node = "t_mixed.py::test_shared"
+    selected = [rust_node, shared_node]
+    lock_cases = [{"case_id": "mixed", "tests": selected}]
+    case_map = [{"case_id": "mixed", "skip_registered": {"python": "rust-only 契約（behavior_changes 已登記）"}}]
+
+    approved = executor._approved_python_skips(lock_cases, case_map, "linux", selected)
+    assert approved == {rust_node: "rust-only contract"}
+
+    junit = tmp_path / "junit.xml"
+    _write_status_junit(junit, shared_node, outcome="skip", message="rust-only contract")
+    assert executor._junit_required(junit, [shared_node], approved_skips=approved), "共用節點 skip 不得因案例登記而放行"
+
+    _write_status_junit(junit, rust_node, outcome="skip", message="rust-only contract")
+    assert executor._junit_required(junit, [rust_node], approved_skips=approved) == []
+    assert executor._junit_required(junit, [rust_node], approved_skips={}), "未登記的 rust_only skip 仍須失敗"
+
+    _write_status_junit(junit, rust_node, outcome="xfail", message="P4 regression")
+    assert executor._junit_required(junit, [rust_node], approved_skips=approved), "xfail 不得因登記而放行"
+
+
+def test_frozen_registry_keeps_shared_doctor_node_out_of_python_skip_allowlist() -> None:
+    """真實凍結資料：sc25 的共用節點不得進入 Python skip allowlist，執行器也不得因此拋出 ValueError。"""
+    executor = _load_ab_executor()
+    lock_cases, nodes = executor._frozen_cases()
+    case_map = executor._frozen_case_map(lock_cases)
+    selected = executor._applicable_nodes(nodes, "linux")
+    approved = executor._approved_python_skips(lock_cases, case_map, "linux", selected)
+    shared = "tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks"
+    assert shared in selected
+    assert shared not in approved
+    assert approved and all("rust_only" in executor._markers(node) for node in approved)
+
+
+def test_outer_ab_run_fails_when_executor_leaves_no_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """外層 A/B 測試不得因子行程回傳 0 而通過；執行器未產生 summary.json 即失敗（不得零執行器產出即 PASS）。"""
+    cli = tmp_path / "serialwrap"
+    cli.write_bytes(b"rust cli")
+    monkeypatch.setattr(sys.modules[__name__], "cli_prefix", lambda: [str(cli)])
+    monkeypatch.delenv("SW_RESOURCE_REPORT", raising=False)
+    calls: list[list[str]] = []
+
+    def silent_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", silent_run)
+    with pytest.raises(AssertionError):
+        test_cli_mgmt_ab_suite_execution(tmp_path)
+    assert len(calls) == 1
+
+
+_RUST_ONLY_REASON = "rust-only contract"
+
+
+def _write_suite_junit(path: Path, rows: list[tuple[str, str, str]]) -> None:
+    """依 (nodeid, outcome, message) 產生多列 testcase 的 JUnit；outcome 為 pass 或 skip。"""
+    suite = ET.Element("testsuite", tests=str(len(rows)), failures="0", errors="0", skipped="0")
+    for nodeid, outcome, message in rows:
+        path_text, *segments = nodeid.split("::")
+        classname = ".".join([path_text.removesuffix(".py").replace("/", "."), *segments[:-1]])
+        testcase = ET.SubElement(suite, "testcase", classname=classname, name=segments[-1])
+        if outcome == "skip":
+            ET.SubElement(testcase, "skipped", message=message)
+    ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def _stage_release_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    selected: list[str],
+    rust_only: set[str],
+    a_rows: list[tuple[str, str, str]],
+    a_returncode: int = 0,
+    a_pidlog: str | None = None,
+) -> dict:
+    """以假的 pytest 子行程驅動 `execute()`，只觀察 A 輪釋放前置判斷與 B 輪是否啟動。
+
+    節點檔為暫存目錄內的 `t_release.py`，`rust_only` 節點帶 marker，其餘為共用節點；
+    不啟動真實 pytest、daemon 或比較器，平台以本機為準（Windows 與 Linux 共用同一判斷）。
+    """
+    executor = _load_ab_executor()
+    platform = "windows" if os.name == "nt" else "linux"
+    fake_root = tmp_path / "repo"
+    fake_root.mkdir()
+    body = ["import pytest", ""]
+    for node in selected:
+        name = node.split("::", 1)[1]
+        if node in rust_only:
+            body.append("@pytest.mark.rust_only")
+        body.extend([f"def {name}():", "    pass", "", ""])
+    (fake_root / "t_release.py").write_text("\n".join(body), encoding="utf-8")
+    daemon = tmp_path / "py-serialwrapd"
+    daemon.write_text("stub\n", encoding="utf-8")
+    cli = tmp_path / "serialwrap"
+    cli.write_bytes(b"rust cli")
+    manifest = tmp_path / "release-manifest.json"
+    # B 輪由 manifest 的 daemon launcher 解析受測 daemon（f2d9533）；夾具提供同目錄內的真實 launcher 檔，
+    # 讓 resolve_daemon_launcher 照常驗證，而不是以空 manifest 在 B 輪前拋錯。
+    (tmp_path / "serialwrapd.py").write_text("stub\n", encoding="utf-8")
+    manifest.write_text(
+        json.dumps({"components": {"daemon": {"launcher": {"path": "serialwrapd.py"}}}}),
+        encoding="utf-8",
+    )
+    out = tmp_path / "ab"
+    a_junit, b_junit = out / "a-python.xml", out / "b-rust.xml"
+    lock_cases = [{"case_id": "c-release", "tests": list(selected)}]
+    case_map = [{"case_id": "c-release", "skip_registered": {"python": "rust-only 契約（behavior_changes 已登記）"}}]
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if "--collect-only" in argv:
+            return subprocess.CompletedProcess(argv, 0, "\n".join(selected) + "\n", "")
+        if f"--junitxml={a_junit}" in argv:
+            _write_suite_junit(a_junit, a_rows)
+            if a_pidlog is not None:
+                (out / "a.pids").write_text(a_pidlog, encoding="utf-8")
+            return subprocess.CompletedProcess(argv, a_returncode, "", "")
+        if f"--junitxml={b_junit}" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+    monkeypatch.setattr(executor, "ROOT", fake_root)
+    monkeypatch.setattr(executor, "PY_DAEMON", daemon)
+    monkeypatch.setattr(executor, "_frozen_cases", lambda: (lock_cases, sorted(selected)))
+    monkeypatch.setattr(executor, "_frozen_case_map", lambda _lock: case_map)
+    monkeypatch.setattr(executor, "_applicable_nodes", lambda nodes, _platform: list(nodes))
+    monkeypatch.setattr(executor, "_baseline_identity", lambda *_a, **_k: {})
+    monkeypatch.setattr(executor, "_bundle_identity", lambda *_a, **_k: {})
+    monkeypatch.setattr(executor, "resolve_manifest", lambda _cli: manifest)
+    monkeypatch.setattr(executor, "_run", fake_run)
+    rc = executor.execute(cli=cli, out_dir=out, platform=platform, timeout=60)
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    return {"rc": rc, "out": out, "calls": calls, "summary": summary, "b_junit": b_junit}
+
+
+def _b_round_started(run: dict) -> bool:
+    return any(f"--junitxml={run['b_junit']}" in argv for argv in run["calls"])
+
+
+def test_all_rust_only_selection_without_pids_records_release_ok_and_starts_b(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """plan 05 Task 16：全 rust_only 選取時 A 輪只收集並 skip、不啟動行程；release 記 ok，且照常啟動 B 輪。"""
+    selected = ["t_release.py::test_rust_one", "t_release.py::test_rust_two"]
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=selected, rust_only=set(selected),
+        a_rows=[(node, "skip", _RUST_ONLY_REASON) for node in selected],
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is True, release
+    assert release["a_round_spawned"] is False, release
+    assert "未啟動受測行程" in release["reason"], release
+    assert (run["out"] / "release-check.json").is_file()
+    assert _b_round_started(run), "release 通過後 B 輪必須照常啟動"
+
+
+def test_mixed_selection_with_shared_node_still_fails_release_without_pid_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """選取含一個共用（非 rust_only）節點時，即使 A 輪無 PID 日誌，release 仍為 ok:false 且 B 輪不啟動。"""
+    rust_node, shared_node = "t_release.py::test_rust_one", "t_release.py::test_shared"
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=[rust_node, shared_node], rust_only={rust_node},
+        a_rows=[(rust_node, "skip", _RUST_ONLY_REASON), (shared_node, "pass", "")],
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is False, release
+    assert "A 輪沒有產生 PID 資源日誌" in release["parse_errors"], release
+    assert not _b_round_started(run)
+    assert run["rc"] == 1
+
+
+@pytest.mark.parametrize(
+    ("a_rows", "a_returncode"),
+    [
+        pytest.param(
+            [("t_release.py::test_rust_one", "pass", ""), ("t_release.py::test_rust_two", "skip", _RUST_ONLY_REASON)],
+            0,
+            id="a-round-passed-node",
+        ),
+        pytest.param(
+            [("t_release.py::test_rust_one", "skip", "other reason"), ("t_release.py::test_rust_two", "skip", _RUST_ONLY_REASON)],
+            0,
+            id="unapproved-skip-reason",
+        ),
+        pytest.param(
+            [("t_release.py::test_rust_one", "skip", _RUST_ONLY_REASON), ("t_release.py::test_rust_two", "skip", _RUST_ONLY_REASON)],
+            1,
+            id="a-round-exit-nonzero",
+        ),
+    ],
+)
+def test_all_rust_only_release_stays_failed_unless_a_round_is_pure_registered_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, a_rows: list[tuple[str, str, str]], a_returncode: int
+) -> None:
+    """全 rust_only 但 A 輪 JUnit 含 passed、未核准 skip，或 A 輪 exit 非 0 → 不得豁免，維持 ok:false。"""
+    selected = ["t_release.py::test_rust_one", "t_release.py::test_rust_two"]
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=selected, rust_only=set(selected), a_rows=a_rows, a_returncode=a_returncode,
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is False, release
+    assert "a_round_spawned" not in release, release
+    assert not _b_round_started(run)
+    assert run["rc"] == 1
+
+
+def test_all_rust_only_release_falls_back_to_real_check_when_pid_log_has_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 輪 PID 日誌含任一列即沿用現行檢查：殘留 socket 仍判 ok:false，不得因全 rust_only 而豁免。"""
+    selected = ["t_release.py::test_rust_one", "t_release.py::test_rust_two"]
+    stale_socket = tmp_path / "stale.sock"
+    stale_socket.write_text("leftover", encoding="utf-8")
+    row = json.dumps({"pid": None, "children": [], "socket": str(stale_socket), "lock": None, "run_dir": None})
+    run = _stage_release_case(
+        tmp_path, monkeypatch,
+        selected=selected, rust_only=set(selected),
+        a_rows=[(node, "skip", _RUST_ONLY_REASON) for node in selected],
+        a_pidlog=row + "\n",
+    )
+    release = run["summary"]["release_check"]
+    assert release["ok"] is False, release
+    assert release["remaining_sockets"] == [str(stale_socket)], release
+    assert not _b_round_started(run)

@@ -58,6 +58,16 @@
 | P8 | Slice 2.4 | `09-slice24-transfer-flash.md` | FileTransfer、完整裝置交接、MCU flash／holder-probe、監管整合 |
 | P9 | Stage 3 前置 | `10-stage3-canary.md` | A/B 執行器、Canary 帳本工具、退役切換與回滾演練程序 |
 
+**版號與對外 release（OD-33，2026-10-28）**：
+
+| 出口 | 產品組成 | 版號 | 對外發佈 |
+|---|---|---|---|
+| Stage 1（P3＋P4） | Rust CLI＋Python daemon | `0.4.0` | 出口 gate 通過後發佈 `0.4.0` release，並以此驗證 0.3.2 → 0.4.0 升級（程序與發佈內容見 `docs/rust-refactor/release-0.4.0-plan.md`；Linux 升級測試 `scripts/docker/run-upgrade.sh`） |
+| Stage 2（P5～P8） | 全 Rust daemon | `0.5.0`（Canary 前可用 `0.5.0-rc.N`） | Stage 2 出口後 |
+| Stage 3（P9） | Python daemon 退役 | `1.0.0` | 退役裁決（BO-P9-13）後 |
+
+merge 到 `main`、建 tag 與發 GitHub release 由主 session 在出口 gate 通過後依政策開 PR 執行（`release:<version>` label 對應 R-07）；實作輪只做準備，不得自行操作。release 後於已安裝 release 的其他電腦執行的真板全套與既有正式安裝升級實測依 OD-27。
+
 每個 Phase 依序：**計畫（本目錄）→ 測試先行（TDD，紅燈確認）→ 實作 → 雙審（sonnet max＋codex gpt-6.1-sol medium）→ 修正 → 全套測試＋policy_check → commit**。
 
 ## 2. 模型分工（使用者指定）
@@ -87,6 +97,7 @@ OD-15（2026-10-16）後新增可取得的證據：
 本環境**無法**產出、須由擁有者排程或授權的項目（各 Phase 交付時以「BLOCKED-OWNER」明列，不得標 PASS）：
 - 擁有者 host 以外的原生 Windows COM 證據（例如測試團隊工作站、開啟 Secure Boot 的機台）；需管理員的 com0com 選用元件實機安裝／移除（P4-T19，擁有者 host 可執行）。
 - L2 實機回歸（TestPilot `serialwrap_regression` on live bench）、L3 `realhw` P0／P1／remote、OD-10 bench 依序 48 小時長跑（docker 48h 不取代）。
+  - **OD-27（2026-10-27）**：本 host 沒有可供測試的真板。真板 L2 回歸 f1～f11 與 pt-quiet-ready（41 案）、realhw p0／p1（28 案，含 p1-rst-daemon）與 rm-live-e2e，以及 OD-30 (2) 的 Windows transport disconnect（bridge selftest ST-12）與 Serial Console 實體控制線隔離、OD-32 的 `sm-04-device-unplug` Windows 列（實際拔除 USB 序列裝置），移到「可 release、可在其他電腦安裝」之後執行。**步驟**：(1) 以 release 產物在接有真板與真實 USB 序列硬體的其他電腦完成安裝（`install.sh`／Windows installer，非開發 worktree）；(2) 由該安裝機發起真板全套（TestPilot `serialwrap_regression` 的 f1～f11、pt-quiet-ready，`realhw` p0／p1、rm-live-e2e，bridge selftest 實際拔線的 ST-12，Windows 上以實際拔線執行 `sm-04-device-unplug`）；(3) 證據以該安裝機的 release 版本與 tree 標示，FAIL 照實回報。Stage 1 與 Stage 2 出口不以上述案例為條件，維持 BLOCKED-OWNER 並引用 OD-27，不得記為 PASS、不得刪除案例。
 - Canary（每平台 14 活躍日、≥5,000 次 `cmd submit`、≥50 次干擾／交接；OD-15 (8) 由執行者決定延到 Stage 3（P9）執行，P9 帳本工具保留，早期 Phase 不以 canary 為出口條件）、實機回滾演練、Stage 3 退役判定。
 - OD-09 延後凍結項（RSS 預算、最低負載、容許誤差）——需 Python 48h 基線後、於正式 Stage 0 出口以 P2-T16 凍結工具凍結（早於 Stage 1B 混合 48 h 長跑；工具不依賴後續 Phase，R4-F2）。
 

@@ -785,8 +785,59 @@ fn verify_bundle_rejects_missing_digest_and_component_paths_that_escape() {
     }
 }
 
+/// repo 根目錄：改用編譯期 manifest 位置推導（同 `common::data_root`），
+/// 不依賴 test executable 位置；`CARGO_TARGET_DIR` 位於 repo 外時仍可定位 `scripts/rust/mkbundle.sh`。
+fn repo_root_for_mkbundle_test() -> PathBuf {
+    common::data_root()
+}
+
 #[test]
-#[ignore = "pytest 以真實 mkbundle.sh --dev 輸出設定 SERIALWRAP_TEST_MKBUNDLE_DIR"]
+#[ignore = "由 tests/test_rust_mkbundle.py 驅動；需要 POSIX bash"]
+fn mkbundle_respects_cargo_target_dir_override() {
+    let temp = tempfile::tempdir().expect("建立 mkbundle 暫存目錄失敗");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("建立 fake cargo 目錄失敗");
+    let capture = temp.path().join("cargo-target-dir.txt");
+    let fake_cargo = bin.join("cargo");
+    std::fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$CARGO_TARGET_DIR\" > \"$SW_TEST_CARGO_TARGET_CAPTURE\"\nexit 91\n",
+    )
+    .expect("寫入 fake cargo 失敗");
+    let chmod = std::process::Command::new("chmod")
+        .args(["+x"])
+        .arg(&fake_cargo)
+        .status()
+        .expect("設定 fake cargo 權限失敗");
+    assert!(chmod.success(), "chmod +x fake cargo 失敗");
+
+    let target_dir = temp.path().join("requested-target");
+    let script = repo_root_for_mkbundle_test().join("scripts/rust/mkbundle.sh");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var_os("PATH").unwrap_or_default().to_string_lossy()
+    );
+    let output = std::process::Command::new("bash")
+        .arg(script)
+        .args(["--dev", "--out"])
+        .arg(temp.path().join("bundle"))
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("SW_TEST_CARGO_TARGET_CAPTURE", &capture)
+        .output()
+        .expect("執行 mkbundle.sh 失敗");
+
+    assert_eq!(output.status.code(), Some(91), "fake cargo 未被呼叫：{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        std::fs::read_to_string(capture).expect("fake cargo 未留下 target 記錄").trim_end(),
+        target_dir.to_string_lossy(),
+        "mkbundle.sh 必須把呼叫端指定的 Cargo target dir 傳給 cargo"
+    );
+}
+
+#[test]
+#[ignore = "由 tests/test_rust_release_manifest_schema.py 驅動；實測 mkbundle 產物"]
 fn real_mkbundle_dev_output_verifies() {
     let bundle = std::env::var_os("SERIALWRAP_TEST_MKBUNDLE_DIR")
         .map(PathBuf::from)

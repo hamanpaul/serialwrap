@@ -10,6 +10,9 @@ publish.workspace = true
 name = "sw_cli"
 path = "src/lib.rs"
 
+[features]
+test-fakes = []
+
 [[bin]]
 name = "serialwrap"
 path = "src/main.rs"

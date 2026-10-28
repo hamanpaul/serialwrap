@@ -125,15 +125,32 @@ def _write_config_endpoint(endpoint: str) -> None:
         sys.stderr.write(f"serialwrapd: 寫入 config.yaml endpoint 失敗（非致命）: {exc}\n")
 
 
-def make_rpc_handler(service: SerialwrapService, stop_after_response: object):
-    """建立 daemon 控制方法與 service RPC 共用的正式分派器。"""
+# 交接停止（SC-11 `daemon.handoff_stop`，R1-F1）成功回覆後的有界排空窗口。
+# freeze 已成立；回覆寫出後 RPC 監聽仍保留本秒數，窗口內送達的有副作用請求取得
+# `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`（零 TX、零狀態改寫），而非 socket 錯誤；
+# 背景來源（DeviceWatcher 重探、重 attach、login、console 行）與既有 bridge 的 TX 已於回覆前
+# 由 `SessionManager.freeze_for_handoff` 凍結，窗口內同樣零 TX。
+# 窗口結束才關閉監聽並結束行程。須明顯小於 CLI `wait_handoff_gone` 的 10 秒等待上限。
+HANDOFF_DRAIN_GRACE_S = 3.0
+
+
+def make_rpc_handler(
+    service: SerialwrapService,
+    stop_after_response: object,
+    stop_after_handoff: object | None = None,
+):
+    """建立 daemon 控制方法與 service RPC 共用的正式分派器。
+
+    ``stop_after_handoff`` 僅於 ``daemon.handoff_stop`` 成功時使用（有界排空窗口，見 HANDOFF_DRAIN_GRACE_S）；
+    未提供時沿用 ``stop_after_response``（與 ``daemon.stop`` 相同的立即停止）。
+    """
     def _handle(method: str, params: dict[str, object]) -> dict[str, object]:
         if method == "daemon.stop":
             return {"ok": True, "stopping": True, "_rpc_after_write": stop_after_response}
         if method == "daemon.handoff_stop":
             result = service.handoff_stop(params)
             if result.get("ok"):
-                result["_rpc_after_write"] = stop_after_response
+                result["_rpc_after_write"] = stop_after_handoff or stop_after_response
             return result
         return service.rpc(method, params)
 
@@ -263,8 +280,15 @@ async def _run_async(args: argparse.Namespace) -> int:
         # 由 RPC framing 層於 writer.drain() 完成後呼叫，確保交接回應先送出。
         asyncio.get_running_loop().call_soon(stop_event.set)
 
+    def _stop_after_handoff() -> None:
+        # 交接停止：freeze 已成立，監聽保留有界排空窗口（HANDOFF_DRAIN_GRACE_S）後才停止。
+        asyncio.get_running_loop().call_later(HANDOFF_DRAIN_GRACE_S, stop_event.set)
+
     # 依平台後端選擇器建構 RPC server（Windows: TcpRpcServer / POSIX: JsonRpcUnixServer）。
-    server = _build_server(args, make_rpc_handler(service, _stop_after_response))
+    server = _build_server(
+        args,
+        make_rpc_handler(service, _stop_after_response, _stop_after_handoff),
+    )
 
     def _stop(*_unused: object) -> None:
         stop_event.set()

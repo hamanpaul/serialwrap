@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,11 +16,19 @@ from typing import Any, Mapping
 
 import yaml
 
+from .target_config import TargetConfig
+
 _PATH_CLASS = type(pathlib.Path("."))
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[2]
 SERIALWRAP = str(ROOT_DIR / "serialwrap")
 SERIALWRAPD = str(ROOT_DIR / "serialwrapd.py")
 _REAL_POPEN = subprocess.Popen
+
+# 關閉階段的上限（秒）。daemon 與 WAL 占用釋放在 Windows 上可能滯後於行程結束，故有界重試。
+_DAEMON_EXIT_TIMEOUT_S = 3.0
+_HANDLE_HOLDER_JOIN_TIMEOUT_S = 15.0
+_TMPDIR_REMOVE_ATTEMPTS = 20
+_TMPDIR_REMOVE_DELAY_S = 0.5
 
 ISOLATED_DIR_ENV: dict[str, str] = {
     "SERIALWRAP_STATE_DIR": "state",
@@ -129,8 +138,6 @@ class DaemonHarness:
     def __init__(self, config: HarnessConfig | None = None) -> None:
         self.config = config or HarnessConfig()
         if self.config.target_config is None:
-            from .target_config import TargetConfig
-
             self.config.target_config = TargetConfig()
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._root: pathlib.Path | None = None
@@ -144,6 +151,10 @@ class DaemonHarness:
         self.bridge: Any | None = None
         self.bridge_argv: list[str] = []
         self.bridge_stop_result: dict[str, Any] | None = None
+        # 測試案例自建、於 stop() 前必須結束的持有者執行緒（例如持有 WAL 讀取 handle 的情境）。
+        self._handle_holders: list[threading.Thread] = []
+        # 關閉階段無法完全回收、但不影響證據完整性的診斷（例如臨時目錄殘留）；由 runner 寫入該案報告。
+        self.cleanup_diagnostics: list[dict[str, Any]] = []
         self._started = False
 
     @property
@@ -200,6 +211,7 @@ class DaemonHarness:
         if self._started:
             return
         self.bridge_stop_result = None
+        self.cleanup_diagnostics = []
         if self.config.mode not in {"pty", "bridge"}:
             raise ValueError(f"不支援的 harness mode：{self.config.mode}")
         if self.config.dut_mode not in {"local-process", "docker"}:
@@ -336,6 +348,10 @@ class DaemonHarness:
         self.bridge_argv = self.bridge.command()
         self._spawn_bridge(self.bridge_argv, env=self.env)
 
+    def register_handle_holder(self, thread: threading.Thread) -> None:
+        """登記持有 WAL 等檔案 handle 的案例執行緒；stop() 會等待其結束後才回收臨時目錄。"""
+        self._handle_holders.append(thread)
+
     def wait_endpoint(self, timeout_s: float = 5.0) -> None:
         """等待 POSIX socket 出現或以 TCP connect 確認 Windows RPC listener。"""
         deadline = time.monotonic() + timeout_s
@@ -443,66 +459,129 @@ class DaemonHarness:
         return yaml.safe_dump(document, allow_unicode=True, sort_keys=False)
 
     def stop(self) -> None:
-        """先停 daemon/bridge、保存 WAL 複本，再回收所有 throwaway 資源。"""
-        try:
-            if self._daemon is not None:
-                if isinstance(self._daemon, _REAL_POPEN) and self._daemon.poll() is None and self.endpoint:
-                    try:
-                        from .cli_client import cli_run
+        """先停 daemon/bridge、保存 WAL 複本，再回收所有 throwaway 資源。
 
-                        cli_run(
-                            ["daemon", "stop"],
-                            socket_path=self.endpoint,
-                            env=self.env,
-                            timeout=3.0,
-                            log_path=(self.evidence_dir / "cli.ndjson") if self._evidence_dir else None,
-                        )
-                    except Exception:
-                        pass
-                if self._daemon.poll() is None:
-                    self._daemon.terminate()
-                    try:
-                        self._daemon.wait(timeout=3.0)
-                    except subprocess.TimeoutExpired:
-                        self._daemon.kill()
-                        self._daemon.wait(timeout=3.0)
-                self._daemon = None
-            if self._daemon_log is not None:
-                try:
-                    self._daemon_log.flush()
-                    self._daemon_log.close()
-                except OSError:
-                    pass
-                self._daemon_log = None
-            if self.bridge is not None:
-                try:
-                    result = self.bridge.stop()
-                    if isinstance(result, dict):
-                        self.bridge_stop_result = dict(result)
-                finally:
-                    self.bridge = None
-            if self.fake_target is not None:
-                self.fake_target.stop()
-                self._fake_target = None
-            if self._root is not None and self._evidence_dir is not None:
-                source = self.root / "wal"
-                if source.is_dir():
-                    destination = self.evidence_dir / "wal"
-                    shutil.copytree(source, destination, dirs_exist_ok=True)
-                else:
-                    (self.evidence_dir / "wal").mkdir(parents=True, exist_ok=True)
-                link_path = self.root / "by-id" / "fake-uart0"
-                try:
-                    link_path.unlink()
-                except FileNotFoundError:
-                    pass
+        失敗分類：daemon 行程未確認結束、bridge 關閉或 WAL 複本失敗會以例外拋出（證據完整性不明，由 runner 判為
+        INSUFFICIENT_EVIDENCE）。等待案例持有者執行緒與臨時目錄回收為有界重試；回收仍失敗者只寫入
+        cleanup_diagnostics，不改變案例判定。
+        """
+        try:
+            try:
+                self._stop_daemon()
+            finally:
+                self._close_daemon_log()
+                self._stop_bridge_and_target()
+            self._preserve_wal_and_unlink_link()
         finally:
-            if self._tmpdir is not None:
-                self._tmpdir.cleanup()
-                self._tmpdir = None
+            self._join_handle_holders()
+            self._remove_tmpdir()
             self._root = None
             self._started = False
 
+    def _stop_daemon(self) -> None:
+        """停止隔離 daemon；以 Popen 的 wait 確認行程結束（不以 pid 數字判斷，避免 pid 重用）。"""
+        daemon = self._daemon
+        if daemon is None:
+            return
+        try:
+            if isinstance(daemon, _REAL_POPEN) and daemon.poll() is None and self.endpoint:
+                try:
+                    from .cli_client import cli_run
+
+                    cli_run(
+                        ["daemon", "stop"],
+                        socket_path=self.endpoint,
+                        env=self.env,
+                        timeout=3.0,
+                        log_path=(self.evidence_dir / "cli.ndjson") if self._evidence_dir else None,
+                    )
+                except Exception:
+                    pass
+            if daemon.poll() is None:
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=_DAEMON_EXIT_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    try:
+                        daemon.wait(timeout=_DAEMON_EXIT_TIMEOUT_S)
+                    except subprocess.TimeoutExpired as exc:
+                        raise StepError(
+                            f"daemon pid={daemon.pid} 於 kill 後仍未確認結束（WAL 可能仍被占用，證據不完整）"
+                        ) from exc
+        finally:
+            self._daemon = None
+
+    def _close_daemon_log(self) -> None:
+        if self._daemon_log is not None:
+            try:
+                self._daemon_log.flush()
+                self._daemon_log.close()
+            except OSError:
+                pass
+            self._daemon_log = None
+
+    def _stop_bridge_and_target(self) -> None:
+        if self.bridge is not None:
+            try:
+                result = self.bridge.stop()
+                if isinstance(result, dict):
+                    self.bridge_stop_result = dict(result)
+            finally:
+                self.bridge = None
+        if self.fake_target is not None:
+            self.fake_target.stop()
+            self._fake_target = None
+
+    def _preserve_wal_and_unlink_link(self) -> None:
+        if self._root is not None and self._evidence_dir is not None:
+            source = self.root / "wal"
+            if source.is_dir():
+                destination = self.evidence_dir / "wal"
+                shutil.copytree(source, destination, dirs_exist_ok=True)
+            else:
+                (self.evidence_dir / "wal").mkdir(parents=True, exist_ok=True)
+            link_path = self.root / "by-id" / "fake-uart0"
+            try:
+                link_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _join_handle_holders(self) -> None:
+        """等待案例自建的 handle 持有者結束（其 sleep 結束後即釋放檔案），有上限。"""
+        holders, self._handle_holders = self._handle_holders, []
+        for thread in holders:
+            thread.join(timeout=_HANDLE_HOLDER_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                self.cleanup_diagnostics.append({
+                    "kind": "handle_holder_alive",
+                    "thread": thread.name,
+                    "join_timeout_s": _HANDLE_HOLDER_JOIN_TIMEOUT_S,
+                })
+
+    def _remove_tmpdir(self) -> None:
+        """回收臨時目錄；TemporaryDirectory.cleanup 失敗後可再次呼叫（finalizer 已分離、路徑仍存在時會重試）。"""
+        tmpdir = self._tmpdir
+        if tmpdir is None:
+            return
+        root = tmpdir.name
+        last_error: OSError | None = None
+        for _attempt in range(_TMPDIR_REMOVE_ATTEMPTS):
+            try:
+                tmpdir.cleanup()
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                time.sleep(_TMPDIR_REMOVE_DELAY_S)
+        if last_error is not None:
+            self.cleanup_diagnostics.append({
+                "kind": "tmpdir_remove_failed",
+                "path": root,
+                "attempts": _TMPDIR_REMOVE_ATTEMPTS,
+                "error": f"{type(last_error).__name__}: {last_error}",
+            })
+        self._tmpdir = None
 
 __all__ = [
     "ARTIFACT_ENV", "ISOLATED_DIR_ENV", "DaemonHarness", "HarnessConfig", "StepError",

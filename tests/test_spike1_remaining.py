@@ -323,6 +323,187 @@ def test_control_line_setup_error_is_not_run(monkeypatch):
     assert result["blocked_reason"] == "serial_port_open_failed"
 
 
+# pyserial 開埠後 RTS／DTR 預設為 True（Windows 實機如此）；四埠皆以此狀態開啟。
+_PYSERIAL_OPEN_DEFAULTS = {"COM20": True, "COM21": True, "COM22": True, "COM23": True}
+_ALL_LINES_LOW = {"cts": False, "dsr": False, "cd": False}
+
+
+class _FabricPort:
+    """`_FabricSerialModule` 的單一埠；輸出線可寫，輸入線由對端輸出與注入的異常推導。"""
+
+    def __init__(self, module, port):
+        self._module = module
+        self._port = port
+
+    @property
+    def rts(self):
+        return self._module.outputs[self._port]["rts"]
+
+    @rts.setter
+    def rts(self, value):
+        self._module.outputs[self._port]["rts"] = bool(value)
+
+    @property
+    def dtr(self):
+        return self._module.outputs[self._port]["dtr"]
+
+    @dtr.setter
+    def dtr(self, value):
+        self._module.outputs[self._port]["dtr"] = bool(value)
+
+    @property
+    def cts(self):
+        return self._module.read_line(self._port, "cts")
+
+    @property
+    def dsr(self):
+        return self._module.read_line(self._port, "dsr")
+
+    @property
+    def cd(self):
+        return self._module.read_line(self._port, "cd")
+
+    def read(self, _size):
+        return b""
+
+    def write(self, _payload):
+        return 1
+
+    def close(self):
+        pass
+
+
+class _FabricSerialModule:
+    """com0com 交叉線模型，供控制線隔離判定的負向與正向測試使用。
+
+    對埠 P：CTS 讀對端 RTS；DSR／CD 讀對端 DTR。開埠時輸出線設為 `open_defaults[P]`（預設 False）。
+    - `leaks`：{埠: [來源埠…]}，該埠的輸入線額外疊加來源埠的輸出（模擬跨 pair 洩漏）。
+    - `dead_inputs`：輸入線恆為 False 的埠（模擬該方向斷路）。
+    - `stuck_high`：{埠: {線名…}}，該輸入線恆為 True（模擬接線或驅動異常）。
+    """
+
+    class SerialException(Exception):
+        pass
+
+    class SerialTimeoutException(SerialException):
+        pass
+
+    _PARTNER = {"COM20": "COM21", "COM21": "COM20", "COM22": "COM23", "COM23": "COM22"}
+
+    def __init__(self, *, open_defaults=None, leaks=None, dead_inputs=(), stuck_high=None):
+        self.open_defaults = dict(open_defaults or {})
+        self.leaks = {port: tuple(sources) for port, sources in (leaks or {}).items()}
+        self.dead_inputs = frozenset(dead_inputs)
+        self.stuck_high = {port: frozenset(lines) for port, lines in (stuck_high or {}).items()}
+        self.outputs: dict[str, dict[str, bool]] = {}
+
+    def Serial(self, *, port, **_kwargs):
+        if port not in self._PARTNER:
+            raise self.SerialException(f"unexpected port {port}")
+        default = bool(self.open_defaults.get(port, False))
+        self.outputs[port] = {"rts": default, "dtr": default}
+        return _FabricPort(self, port)
+
+    def _driven(self, port, line):
+        return bool(self.outputs.get(port, {}).get(line, False))
+
+    def read_line(self, port, line):
+        source_line = "rts" if line == "cts" else "dtr"
+        if line in self.stuck_high.get(port, frozenset()):
+            return True
+        if port in self.dead_inputs:
+            return False
+        value = self._driven(self._PARTNER[port], source_line)
+        for source in self.leaks.get(port, ()):
+            value = value or self._driven(source, source_line)
+        return value
+
+
+def _install_fabric(monkeypatch, **kwargs):
+    from realhw.acceptance import spike1_remaining
+
+    module = _FabricSerialModule(**kwargs)
+    monkeypatch.setattr(spike1_remaining, "_serial_module", lambda: module)
+    return module
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_clean_wiring_passes_only_with_both_directions_proven(monkeypatch):
+    """pyserial 預設開埠狀態下，乾淨接線須通過；控制線報告須含 A→B 與 B→A 兩方向的正向對照。"""
+    from realhw.acceptance import spike1_remaining
+
+    _install_fabric(monkeypatch, open_defaults=_PYSERIAL_OPEN_DEFAULTS)
+    result = spike1_remaining._measure_control_lines("COM20:COM21", "COM22:COM23")
+
+    assert result["verdict"] == "PASS"
+    assert result["outputs_cleared_before_baseline"] == ["COM20", "COM21", "COM22", "COM23"]
+    isolation = result["console_side_isolation"]
+    assert isolation["unaffected"] is True
+    assert isolation["baseline"] == {"console_a": _ALL_LINES_LOW, "console_b": _ALL_LINES_LOW}
+    controls = result["console_pair_positive_control"]
+    assert controls["rts_only"]["observed"] == {"cts": True, "dsr": False, "cd": False}
+    assert controls["dtr_only"]["observed"] == {"cts": False, "dsr": True, "cd": True}
+    assert controls["reverse_rts_only"]["observed"] == {"cts": True, "dsr": False, "cd": False}
+    assert controls["reverse_dtr_only"]["observed"] == {"cts": False, "dsr": True, "cd": True}
+    assert controls["reverse_rts_only"]["mapping_consistent"] is True
+    assert controls["reverse_dtr_only"]["mapping_consistent"] is True
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_console_leak_is_not_masked_by_default_open_lines(monkeypatch):
+    """COM23 開埠預設輸出為 True 時，不得把 COM22 釘在 true 而遮蔽 DUT→COM22 的洩漏（舊量測會誤判 PASS）。"""
+    from realhw.acceptance import spike1_remaining
+
+    _install_fabric(monkeypatch, open_defaults=_PYSERIAL_OPEN_DEFAULTS, leaks={"COM22": ("COM20",)})
+    result = spike1_remaining._measure_control_lines("COM20:COM21", "COM22:COM23")
+
+    assert result["verdict"] == "FAIL"
+    assert result["console_side_isolation"]["unaffected"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_dut_leak_into_console_a_is_detected_without_default_open(monkeypatch):
+    """即使 COM23 未設預設高電位，DUT→COM22 洩漏仍須被判為隔離失敗。"""
+    from realhw.acceptance import spike1_remaining
+
+    _install_fabric(monkeypatch, leaks={"COM22": ("COM20",)})
+    result = spike1_remaining._measure_control_lines("COM20:COM21", "COM22:COM23")
+
+    assert result["verdict"] == "FAIL"
+    assert result["console_side_isolation"]["unaffected"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_reverse_positive_control_requires_console_b_to_drive_console_a(monkeypatch):
+    """COM22 的輸入線斷路時，B→A 正向對照必須失敗；不得以恆為 False 的 COM22 冒充隔離證據。"""
+    from realhw.acceptance import spike1_remaining
+
+    _install_fabric(monkeypatch, open_defaults=_PYSERIAL_OPEN_DEFAULTS, dead_inputs={"COM22"})
+    result = spike1_remaining._measure_control_lines("COM20:COM21", "COM22:COM23")
+
+    assert result["verdict"] == "FAIL"
+    controls = result["console_pair_positive_control"]
+    assert controls["rts_only"]["mapping_consistent"] is True
+    assert controls["reverse_rts_only"]["mapping_consistent"] is False
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_stuck_console_line_never_reports_isolation_unaffected(monkeypatch):
+    """控制台端某線恆為 true 時，基線即非全低，隔離結論不得成立。"""
+    from realhw.acceptance import spike1_remaining
+
+    _install_fabric(monkeypatch, stuck_high={"COM23": ("cd",)})
+    result = spike1_remaining._measure_control_lines("COM20:COM21", "COM22:COM23")
+
+    assert result["verdict"] == "FAIL"
+    assert result["console_side_isolation"]["unaffected"] is False
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_peer_close_timeout_is_not_transport_disconnect(monkeypatch):
@@ -401,11 +582,15 @@ class TestSpike1NativeCom:
         import jsonschema
         from realhw.acceptance.spike1_remaining import main
 
-        args = [action, "--pair", com_pair, "--out", str(tmp_path)]
+        # 三項須寫入同一持久化 evidence 目錄，工具才會合併既有項目（同目錄重測會拒絕）。
+        # 未設定 SW_TEST_SPIKE1_OUT_DIR 時維持逐測試 tmp_path（單項報告，僅供本機除錯）。
+        spike_out = os.environ.get("SW_TEST_SPIKE1_OUT_DIR")
+        out_dir = Path(spike_out) if spike_out else tmp_path
+        args = [action, "--pair", com_pair, "--out", str(out_dir)]
         if console_pair:
             args.extend(["--console-pair", console_pair])
         exit_code = main(args)
-        report_path = tmp_path / "spike1-remaining.json"
+        report_path = out_dir / "spike1-remaining.json"
         assert report_path.exists(), "原生工具未產生合併報告"
         report = json.loads(report_path.read_text(encoding="utf-8"))
         schema_path = REPO_ROOT / "realhw" / "acceptance" / "spike1_report.schema.json"
@@ -439,6 +624,15 @@ class TestSpike1NativeCom:
             assert result["console_side_isolation"]["unaffected"] is True
             assert result["console_pair_positive_control"]["rts_only"]["mapping_consistent"] is True
             assert result["console_pair_positive_control"]["dtr_only"]["mapping_consistent"] is True
+            # 反向對照（B→A）與基線全低：隔離結論須同時證明兩個方向皆可觀測。
+            assert result["console_pair_positive_control"]["reverse_rts_only"]["mapping_consistent"] is True
+            assert result["console_pair_positive_control"]["reverse_dtr_only"]["mapping_consistent"] is True
+            assert result["outputs_cleared_before_baseline"] == [
+                *com_pair.upper().split(":"), *console_pair.upper().split(":"),
+            ]
+            baseline_console = result["console_side_isolation"]["baseline"]
+            assert baseline_console["console_a"] == {"cts": False, "dsr": False, "cd": False}
+            assert baseline_console["console_b"] == {"cts": False, "dsr": False, "cd": False}
         else:
             assert result["verdict"] == "NOT_RUN"
             assert result["console_side_isolation"]["tested"] is False

@@ -459,7 +459,8 @@
 - **範圍**：BC-01 Windows 部分：WAL／mirror handle 帶 `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`，`open_osfhandle` 所有權轉移、失敗清理、唯一 close；`DeletePending` 與 FileId 查詢。另提供 SC-10 所需 `LockFileEx` 包裝（由 T15 使用）。依據：規格 §8.2「常駐開檔」第二段、§6.2 Tier 1；arch §4.4、§4.5。
 - **Test author model**：agy-gemini-3.8-flash-high　**Implementer model**：codex-gpt-6-luna-max
 - **Changelog fragment**：`changelog.d/rust-p1-bc01-windows-share-delete.md`（`type: fix`，`scope: wal`）：Windows WAL 以 `CreateFileW` 取得含 share-delete 的常駐 handle，外部改名或刪除不再被 daemon 阻擋。
-- **BLOCKED-OWNER**：端點防毒（代表機台為第三方企業 EDR，OD-05）對常駐 handle 與 rename 的攔截紀錄查詢需擁有者權限；本 Task 只能提供「本機實跑通過」證據，EDR 攔截數據記為證據不足。
+- **OD-19 更正（2026-10-26）**：端點防毒驗收與防毒產品無關。`scripts/stage0/av_sim.py` 以 seed 可重現、10～500 ms 的持有模型注入共用違規；ready 記錄同目錄原子發布，Windows 暫時分享拒絕時有界重試；consumer 在刺激開始前以 go／ack 要求 helper 對現行 WAL 重新取得 seeded lease，不能只依賴已到期的首次 ready。Spike 3 四案主注入一律使用不含 `FILE_SHARE_DELETE` 的 `share_no_delete`，`FILE_SHARE_DELETE` + RH oplock 僅為獨立記錄的第二變體，不能代替主注入。每案另執行獨立 oplock workload：append、跨 rotate、F12 前後 marker、WAL 記錄與序號連續性都寫入 evidence，schema 與 Stage 1A gate 驗證完整性；Windows 暫存 WAL 回歸由 `test_native_av_sim_oplock_variant_keeps_wal_writes_and_rotation_live` 覆蓋，案例層回歸驗證 barrier 與 gate。這些是 oracle 變更，須待非實作者複審。Round 2 以 `time.perf_counter_ns()` 統一奈秒時間戳與 `HeldFile` lease 到期判定，並把 CloseHandle ACK 記為呼叫區間；break notification 必須在有效 lease 內且晚於 rotation request，rotation completion 可於 ACK 返回前完成。兩位非實作者均 APPROVE。乾淨 HEAD `afdcc01` 的四案 Windows producer artifacts 與 Stage 1A gate 均 PASS；主案例 p99 2.38～3.90 ms／最大 3.91～7.29 ms，oplock p99 4.48～5.37 ms／最大 257.39～286.86 ms，均符合 OD-22。此為 Spike 3 證據，不代表 Stage 1 出口通過。OD-22 已核准並實作兩組樣本延遲門檻。不再需要 EDR 攔截紀錄；防毒產品名與狀態由工具唯讀查詢，只作資訊欄位，查不到寫 `unknown`。
+- **Spike 3 計時與 ACK oracle 更新（2026-10-27）**：所有 `*_ns` 證據欄位與 `HeldFile` lease 到期控制共用 `time.perf_counter_ns()`／`until_ns`；producer 記錄 `get_clock_info("perf_counter")` 的 implementation、解析度、monotonic 與 adjustable 值，Stage 1A schema/gate 拒絕粗時鐘或錯誤來源。helper 整體執行期限仍用 `time.monotonic()` 秒值。Windows `CloseHandle` 的隱含 oplock ACK 以呼叫起訖與成功狀態記錄；gate 不把 API 返回時刻當作精確 ACK 時點，要求 rotation completion 晚於 close 起點，並比對 helper 與 workload 的原始 break 記錄。
 
 **Files**
 - Create: `sw_core/win32_files.py`、`tests/test_stage0_wal_winfs.py`
@@ -3292,7 +3293,7 @@
 - **範圍**：master plan P1「Stage 0 擷取凍結值」中屬本 Phase 的部分：BC-01 後的 WAL seq 語意（rotate／reset／restart／recreate）、CRC 變體、META 空 payload、BC-03 映射、release 回應形狀，寫入 `contracts/captures/stage0-python-bc.json` 並以測試防止漂移；S1-W WAL 寫入微基準工具（OD-10：BC-01 效能以微基準與短測驗證），四流 × 10,000 筆 × 1,024 B、預填 `60/64 × R`、每流至少跨一次 rotate，輸出 p50／p95／p99 與所有 rotate 停頓；以及 OD-10(2)「BC-01 效能以微基準與**短測**驗證」的短測定義與工具。RPC 行長邊界（`RPC-H-02`）已由 P0 T8 `scripts/stage0/capture_rpc_line_limit.py` 以真實 `JsonRpcUnixServer`／`TcpRpcServer` 對 65535／65536／65537 實測並寫入 `contracts/golden/rpc/line_limit.json`，不在此重做。依據：規格 §1.1.1、§1.1.2、§1.1.3、§1.1.4、§1.2、§8.1；OD-10、OD-13；arch §5.8 熱路徑。
 - **Test author model**：haiku-xhigh　**Implementer model**：agy-gemini-3.8-flash-high
 - **Changelog fragment**：`changelog.d/rust-p1-stage0-captures-microbench.md`（`type: perf`，`scope: wal`）：新增 Stage 0 Python 基線凍結值擷取與 S1-W WAL 寫入微基準工具。
-- **BLOCKED-OWNER**：(1) 修正後 Python 48 小時基線（Linux、Windows 各一次，bench 依序，OD-10）；(2) 端點防毒（EDR）在量測期間「無新增攔截」的查詢紀錄（OD-05、規格 §1.2「查詢權限不足不得填零」）；(3) 量測 manifest 中未列值項目（ANSI／文字／prompt 比例、暖機、取樣算法）需 Stage 0 測試負責人具體化並經獨立審閱後，才能把本工具的輸出當正式量測（規格 §1.1.2 末段）——本 Task 交付工具與本機 Linux／Windows 煙霧數據，正式量測紀錄標「待審閱口徑」。
+- **BLOCKED-OWNER**：(1) 修正後 Python 48 小時基線（Linux、Windows 各一次，bench 依序，OD-10）；(2) 量測期間端點防毒干擾的判定（OD-19：與防毒產品無關，以 av_sim 注入與 binary_integrity 判定，不需 EDR 攔截紀錄）；(3) 量測 manifest 中未列值項目（ANSI／文字／prompt 比例、暖機、取樣算法）需 Stage 0 測試負責人具體化並經獨立審閱後，才能把本工具的輸出當正式量測（規格 §1.1.2 末段）——本 Task 交付工具與本機 Linux／Windows 煙霧數據，正式量測紀錄標「待審閱口徑」。
 
 **Files**
 - Create: `scripts/stage0/capture_bc_baseline.py`、`scripts/stage0/wal_microbench.py`、`scripts/stage0/wal_shorttest.py`、`contracts/captures/stage0-python-bc.json`、`contracts/captures/stage0-python-bc.schema.json`、`tests/test_stage0_captures.py`
@@ -3440,13 +3441,13 @@
 | `f10-release-drain-receipt` | `f10_device_handoff.py` | TestPilot `serialwrap_regression`（`allow_destructive=true`） | throwaway daemon 對實板 console 持續 TX 時 `device release` → 回應 `ok:true` 只在 handle 關閉後出現（外部 `python -c "open(tty)"` 於回應後立即成功）；`device attach` 後恢復 `ATTACHING`→`READY` | BC-04、SC-04、SC-05 |
 | `f10-release-aborts-inflight-command` | 同上 | 同上 | 長命令（`sleep 20; echo X`）送出後 release → `cmd status` 為 `COMMAND_ABORTED_IN_FLIGHT`，WAL 中該 cmd_id 的 TX 只出現一次（無重送） | BC-03 |
 | `f5-deferred-dropped-after-reboot` | `f05_console_coexist.py` | 同 F5 既有執行方式（tmux＋minicom） | agent 命令進行中 human 鍵入 `echo STALE`，期間觸發 reboot（boot quiet 重新啟動）→ 開機後 console 不出現 `STALE` 的回放；未觸發 reboot 的對照組照常回放 | BC-02 |
-| `win-wal-av-rotate`／`win-wal-av-unlink`／`win-wal-av-reader-handle`／`win-wal-f12-progress` | `scripts/stage0/spike3_win_wal.py --case <id> --evidence-dir <dir>` | Windows host `py -3.12`（經 `win-pytest.sh` 同樣 staging） | rotate：常駐 handle 下 rotate 成功、seq 連續；unlink：classic／POSIX delete 後 META 正確、`range_known` 依實況；reader-handle：無 share-delete 的外部 reader 期間 `rotation_failed:true` 且不遺失；f12-progress：T17 oracle 對常駐 handle WAL PASS。每項同時記錄 EDR 產品／狀態與攔截查詢結果（查不到寫 `unknown`） | BC-01、OD-05、P2 case_id |
+| `win-wal-av-rotate`／`win-wal-av-unlink`／`win-wal-av-reader-handle`／`win-wal-f12-progress` | `scripts/stage0/spike3_win_wal.py --case <id> --evidence-dir <dir>` | Windows host `py -3.12`（經 `win-pytest.sh` 同樣 staging） | rotate：常駐 handle 下 rotate 成功、seq 連續；unlink：classic／POSIX delete 後 META 正確、`range_known` 依實況；reader-handle：無 share-delete 的外部 reader 期間 `rotation_failed:true` 且不遺失；f12-progress：T17 oracle 對常駐 handle WAL PASS。各案於 `av_sim` 注入下執行（OD-19），並記錄 av_sim 參數與 binary_integrity；防毒產品名與狀態由工具唯讀查詢作資訊欄位（查不到寫 `unknown`，不影響 verdict） | BC-01、OD-05、P2 case_id |
 | release 持久化 kill | `realhw/procedures/stage0-release-kill.md` | 手動程序（逐步命令） | 兩情境：(a) `_save_state` 完成**後**、回應送達前 kill（以 `SERIALWRAP_TEST_KILL_AFTER_SAVE=1` 測試鉤子觸發，僅隔離實例生效）→ 重啟仍 `RELEASED`；(b) 完成**前** kill → 依最後有效 state 恢復、不宣稱 release 完成 | §6.2 交接 |
 | 3,000 ms drain 量測 | `scripts/stage0/drain_timing.py --device <by-id|COMx> --iterations 50 --out <json>` | Linux 與 Windows 實體 USB-UART 依序 | 輸出每次 release 的 Phase 1→回條耗時分佈與逾時次數；USB 拔線中 write 不返回情境另以 `--unplug-prompt` 互動記錄 | SC-04、規格 §5.2.5 |
 | Spike 1 Windows 虛擬 COM 資格 | `realhw/procedures/stage0-spike1-win-vcom.md` | 手動程序（需管理員；侵入性驅動安裝由擁有者執行） | 在 OD-05 機台分別記錄：com0com 版本與簽章、Secure Boot／HVCI／VBS 狀態、DUT-side pair 與 Console-side pair 建立結果、Python 原生 serial backend 開埠（`dwShareMode=0`、第二次開啟 `ERROR_ACCESS_DENIED`）、DTR／RTS／baud 不跨 pair 外洩；失敗時記錄退路（Console 依 OD-01、DUT-side 改實體 USB-UART 直連依 OD-08），不得關閉安全功能後宣稱符合 | §13 Spike 1、OD-01、OD-08；P9 `S0-SPIKE1-WIN-VCOM` |
 | Windows remote 三拓樸 | `realhw/procedures/stage0-windows-remote-topologies.md` | 手動程序 | 對既有三拓樸（expose tcp、expose remote_socket、connect）各記錄 open／status／stop／重啟後 registry 清理；信任範圍依 OD-12 記錄 ssh 驗證者 | BC-05、SC-21、SC-27 |
 
-每個 runbook／腳本檔首段固定欄位：`entry`（命令）、`revision`（`git rev-parse HEAD:<path>` blob sha1，執行時記入證據）、`expected`、`owner`（擁有者實機）、`evidence_dir`（`~/b-log/rust-refactor/p1/<id>/<YYMMDD-HHMMSS>/`）、`rollback`（失敗時的復原步驟）。`spike3_evidence.schema.json` 定義 Spike 3 證據 JSON：`{"case_id","run_at","env":{…同 T19 env…},"artifact":{…},"steps":[{"op","ts","result"}],"observations":{…},"edr":{"product","status","interceptions"|"unknown"},"verdict":"PASS"|"FAIL"|"INSUFFICIENT_EVIDENCE","fallback":str}`。`SERIALWRAP_TEST_KILL_AFTER_SAVE` 鉤子只在 T13 判定為隔離實例時生效，正式實例忽略並 log WARNING（加入 conftest pop 清單）。
+每個 runbook／腳本檔首段固定欄位：`entry`（命令）、`revision`（`git rev-parse HEAD:<path>` blob sha1，執行時記入證據）、`expected`、`owner`（擁有者實機）、`evidence_dir`（`~/b-log/rust-refactor/p1/<id>/<YYMMDD-HHMMSS>/`）、`rollback`（失敗時的復原步驟）。`spike3_evidence.schema.json` 定義 Spike 3 證據 JSON：`{"case_id","run_at","env":{…同 T19 env…},"artifact":{…},"steps":[{"op","ts","result"}],"observations":{"append_count","append_latency_ms","oplock_variant":{"append_count","append_latency_ms","archives","records","continuity_meta_count","first_seq","last_seq","seq_continuous","rotate_retry","deferred_delete_pending","write_failures","pre_rotate","post_rotate","crc_errors","interference_observed","lease_acquired_ns","stimulus_started_ns","rotation_completed_ns","lease_until_ns"},…},"av_sim":{"mode","share_mode","hold_ms_range","seed","oplock",…},"binary_integrity":{"subjects","unchanged","launch_refused","launch_error"},"edr":{"product","status","interceptions"|"unknown"}（選填資訊欄，OD-19）,"verdict":"PASS"|"FAIL"|"INSUFFICIENT_EVIDENCE","fallback":str}`。四案 Spike 3 artifacts 已於 HEAD `42e6d6c` 重採；四案均為 `INSUFFICIENT_EVIDENCE`，因首次 rotation 完成時間比 lease 到期晚 12 ms。主案例與 oplock 變體延遲樣本均符合 OD-22 的 p99 ≤100 ms、最大值 ≤600 ms。`SERIALWRAP_TEST_KILL_AFTER_SAVE` 鉤子只在 T13 判定為隔離實例時生效，正式實例忽略並 log WARNING（加入 conftest pop 清單）。
 
 **Steps**
 - [ ] **A1 寫失敗測試**：`tests/test_stage0_hw_cases.py`（`core_portable`＋`memory_only`；只驗 case 註冊、oracle 判定邏輯與檔案契約，不碰硬體）
@@ -3459,7 +3460,7 @@
   | `test_f5_stale_replay_oracle` | 替身 console 擷取含 `STALE` → FAIL；不含且對照組含 → PASS；對照組也不含 → `INSUFFICIENT_EVIDENCE`（不得 PASS） |
   | `test_runbooks_have_frozen_header_fields` | 三份 `realhw/procedures/*.md` 與三支腳本 docstring 皆含 `entry`、`revision`、`expected`、`owner`、`evidence_dir`、`rollback` |
   | `test_spike3_cases_match_p2_case_ids` | `spike3_win_wal.py --list` 輸出恰為 P2 指派給本計畫的四個 case_id |
-  | `test_spike3_evidence_schema_rejects_missing_edr` | 缺 `edr` 的證據 JSON 不通過 schema |
+  | `test_spike3_evidence_schema_rejects_missing_edr` | 函式名沿用凍結 nodeid；缺 `av_sim`、`binary_integrity` 或完整 `observations.oplock_variant` workload 的證據 JSON 不通過 schema；缺 `edr` 仍合格（選填資訊欄，OD-19） |
   | `test_kill_hook_ignored_on_non_isolated_instance` | 非隔離實例設 `SERIALWRAP_TEST_KILL_AFTER_SAVE=1` → `_save_state` 後不 kill、log WARNING |
 - [ ] **A2 執行並確認 FAIL**：`python3 -m pytest -q tests/test_stage0_hw_cases.py` → 預期 case id 不存在與檔案不存在的斷言失敗。commit：`test(regression): Stage 0 實機回歸 case 與 runbook 契約失敗測試`
 - [ ] **B1 實作**：依交付物表；case 沿用 `regression/serialwrap_regression/harness.py` 的 `Case`／`register` 與 ThrowawayDaemon 既有工具；`docs/regression-plugin.md` 執行順序表把新 F10 case 放在既有 F10 之後（破壞性壓軸順序不變）。
@@ -3485,7 +3486,7 @@
 | # | 項目 | 來源 Task | 需要的資源 |
 |---|---|---|---|
 | 1 | Windows host `py -3.12` 安裝 `pytest`／`PyYAML`／`pyserial`（使用者層級）之同意 | T01 | 擁有者同意 |
-| 2 | 端點防毒（第三方企業 EDR）對常駐 WAL handle、rename 與量測期間的攔截紀錄 | T03、T19 | EDR 主控台查詢權限 |
+| 2 | 端點防毒干擾（OD-19：與防毒產品無關）：以 av_sim 注入與 binary_integrity 判定常駐 WAL handle、rename 與量測期間；不需攔截紀錄 | T03、T19 | 無（Windows host 實跑依 OD-08） |
 | 3 | 實體 USB-UART 部分寫入、RTS/CTS 卡住與取消；Windows 原生 COM pyserial write timeout | T06 | 實機 bench、OD-08 COM gate |
 | 4 | 3,000 ms drain 時限雙平台實測、USB 拔插時 write 不返回 | T07、T08 | 實機 bench（Linux＋Windows 依序） |
 | 5 | L2 F10 release／attach 交接、程序中斷（持久化提交前後 kill）實機驗證；新增 `f10-release-drain-receipt` case 實跑 | T08 | TestPilot bench |
@@ -3498,6 +3499,6 @@
 | 12 | L2 F12 兩 case、L3 `p0-wal-live` 實跑；Windows F12 對常駐 handle 驗證 | T17 | TestPilot bench、realhw、OD-08 |
 | 13 | 修正後 Python 48 小時基線（Linux、Windows 各一次，bench 依序）；量測口徑獨立審閱；realhw P1 WAL 子集的 bench 短測 | T19 | bench 約 5 天（OD-10）、測試負責人 |
 | 14 | T21 新增 L2 case（`f10-release-drain-receipt`、`f10-release-aborts-inflight-command`、`f5-deferred-dropped-after-reboot`）實跑；case `issues` 欄的 Stage 0 issue 號 | T21 | TestPilot bench、擁有者開 issue |
-| 15 | Spike 3 `win-wal-av-rotate`／`-unlink`／`-reader-handle`／`win-wal-f12-progress` 實跑與 EDR 攔截查詢 | T21 | Windows host、EDR 主控台權限、OD-08 |
+| 15 | Spike 3 `win-wal-av-rotate`／`-unlink`／`-reader-handle`／`win-wal-f12-progress` 於 av_sim 注入下實跑（OD-19：不需 EDR 攔截查詢） | T21 | Windows host、OD-08 |
 | 16 | release 持久化前後 kill 程序、雙平台 3,000 ms drain 量測（`drain_timing.py`） | T21（程序）、T08 | 實機 bench（Linux＋Windows 依序） |
 | 17 | Windows remote 三拓樸程序實跑 | T21（程序）、T14 | relay 主機、金鑰、Windows 工作站 |

@@ -267,7 +267,14 @@ fn is_python_image(image: &str) -> bool {
 /// 行程掃描抽象 trait。
 pub trait ProcScan: Send + Sync {
     fn serialwrapd_instances(&self) -> Result<Vec<DaemonProc>, ScanFailure>;
+    /// fail-closed 版（CLI 更新／回滾確認釋放用；Python `serial_port.probe_holders` 語意）：目標 tty 取不到
+    /// 身分、或 fd 因權限／其他錯誤讀不到時，不得推論「無 holder」，status 回 `Permission`／`Unknown`。
     fn serialwrapd_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus);
+    /// daemon status／doctor 的多開偵測版（Python `multi_open.detect_multi_open` 語意）：tty 本身 stat 失敗即
+    /// 略過該 tty、fd stat 失敗略過該 fd，只有 fd 目錄讀不到才降級 status。預設沿用 fail-closed 版（替身）。
+    fn multi_open_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        self.serialwrapd_tty_holders(paths)
+    }
     fn pid_alive(&self, pid: u32) -> bool;
     fn identity_alive(&self, id: &ProcIdentity) -> bool;
 }

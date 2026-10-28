@@ -2,7 +2,7 @@
 //!
 //! - `(?L)` 是 Python `re.error`（回報於 `error` 欄位），不是未攔截的 ValueError。
 //! - `(?a)(?u)` 才是未攔截的 ValueError（CLI 路徑 exit 1、stdout 空）。
-//! - 四組檢查的求值順序與 Python dict 字面量相同（prompt → login → password → bootloader）。
+//! - 五組檢查的求值順序與 Python dict 字面量相同（prompt → login → password → boot_done → bootloader）。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -163,4 +163,54 @@ fn reported_re_error_keeps_exit_zero_and_error_field() {
         out.contains("\"login_regex\":{\"error\":null,\"matched\":true,\"matched_line\":\"boot\""),
         "out={out}"
     );
+}
+
+#[test]
+fn boot_done_regex_is_reported_like_python() {
+    // #234：Python `cli.py` 在 password_regex 之後檢查 boot_done_regex；期望 stdout 取自 Python 基線實測。
+    let (rc, out, err) = run_profile(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: \"x\"\n    login_regex: \"x\"\n    password_regex: \"x\"\n    boot_done_regex: \"oot\"\n",
+    );
+    assert_eq!((rc, err.as_str()), (0, ""));
+    assert_eq!(
+        out.trim_end(),
+        "{\"checks\":{\"boot_done_regex\":{\"error\":null,\"matched\":true,\"matched_line\":\"boot\",\"pattern\":\"oot\"},\
+\"bootloader_prompts\":[],\
+\"login_regex\":{\"error\":null,\"matched\":false,\"matched_line\":null,\"pattern\":\"x\"},\
+\"password_regex\":{\"error\":null,\"matched\":false,\"matched_line\":null,\"pattern\":\"x\"},\
+\"prompt_regex\":{\"error\":null,\"matched\":false,\"matched_line\":null,\"pattern\":\"x\"}},\
+\"ok\":true,\"platform\":\"shell\",\"profile\":\"t\",\"profile_dir\":\"/p\",\"sample\":\"/s.txt\"}"
+    );
+}
+
+#[test]
+fn boot_done_regex_unset_reports_empty_pattern() {
+    let (rc, out, _) = run_profile("profiles:\n  t:\n    platform: shell\n");
+    assert_eq!(rc, 0);
+    assert!(
+        out.contains("\"boot_done_regex\":{\"error\":null,\"matched\":false,\"matched_line\":null,\"pattern\":\"\"}"),
+        "out={out}"
+    );
+}
+
+#[test]
+fn boot_done_value_error_wins_over_later_bootloader_overflow() {
+    // Python：boot_done（ValueError，未攔截）先於 bootloader（OverflowError）拋出。
+    let (rc, out, err) = run_profile(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: \"x\"\n    login_regex: \"x\"\n    password_regex: \"x\"\n    boot_done_regex: \"(?a)(?u)\"\n    bootloader_prompts:\n      - \"a{4294967296}\"\n",
+    );
+    assert_eq!((rc, out.as_str()), (1, ""));
+    assert!(err.contains("ASCII and UNICODE flags are incompatible"), "err={err}");
+    assert!(!err.contains("repetition"), "err={err}");
+}
+
+#[test]
+fn password_value_error_wins_over_later_boot_done_overflow() {
+    // Python：password（ValueError）先於 boot_done（OverflowError）拋出。
+    let (rc, out, err) = run_profile(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: \"x\"\n    login_regex: \"x\"\n    password_regex: \"(?a)(?u)\"\n    boot_done_regex: \"a{4294967296}\"\n",
+    );
+    assert_eq!((rc, out.as_str()), (1, ""));
+    assert!(err.contains("ASCII and UNICODE flags are incompatible"), "err={err}");
+    assert!(!err.contains("repetition"), "err={err}");
 }

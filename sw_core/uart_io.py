@@ -923,6 +923,41 @@ class UARTBridge:
                     "UART pending write 取消失敗（com=%s）", self.com, exc_info=True
                 )
 
+    def freeze_tx(self) -> bool:
+        """凍結此後所有來源的新 TX，但不啟動 drain（reader、埠與 console 保持開啟）。
+
+        交接停止（SC-11 `daemon.handoff_stop`）成功後由 SessionManager.freeze_for_handoff 呼叫：
+        與 `begin_drain` 共用 `_tx_frozen` 閘門，故 `_send_bytes_locked` 與 TX fence 內的提交檢查
+        都會拒絕之後的寫入（含背景 probe、login、human raw 與 console 行）。旗標在 state lock 下設定；
+        隨後以短期限等待 TX fence。
+
+        回傳 True：fence 已在期限內取得並釋放，回覆前已通過提交檢查的寫入段皆已結束，之後新開始的段
+        一律被拒絕，故交接成立時 TX 為零可保證。回傳 False：逾時，仍有已通過提交檢查的寫入段在進行中，
+        呼叫端不得回報交接成立，須以 `thaw_tx` 撤銷（SC-11：忙碌不凍結、不停止）。冪等。
+        """
+        with self._lifecycle_lock:
+            with self._state_lock:
+                self._tx_frozen = True
+        fence = getattr(self, "_tx_fence_lock", None)
+        if fence is None:
+            return True
+        # 逾時不呼叫 logger：daemon logging 基線（contracts/daemon_logging.yaml）未列此訊息，新增 logger
+        # 呼叫需經契約變更與審查。逾時的結果由回傳值交給呼叫端處理，不以 log 取代。
+        if fence.acquire(timeout=_constants.DRAIN_FENCE_ACQUIRE_S):
+            fence.release()
+            return True
+        return False
+
+    def thaw_tx(self) -> None:
+        """撤銷尚未成立的 `freeze_tx`（交接因 TX fence 逾時而未成立時）。
+
+        drain 已開始者不解除：`_tx_frozen` 由 `begin_drain` 設定，不得被交接撤銷覆寫。冪等。
+        """
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if not self._drain_started:
+                    self._tx_frozen = False
+
     def _on_drain_invalidate(self) -> None:
         """Drain 開始時使所有已擷取的 deferred 輸入失效。"""
         self.invalidate_deferred("drain")
@@ -1392,33 +1427,47 @@ class UARTBridge:
         with self._state_lock:
             return self._console_endpoint
 
-    def _enumerate_all_held_paths(self) -> set[str] | None:
-        """掃描 /proc，回傳所有外部 process 持有的 fd readlink 目標集合（排除自身 pid）。
+    def _enumerate_all_held_paths(self, *, proc_root: str = "/proc") -> set[str] | None:
+        """掃描 procfs，回傳外部 process 持有的 tty 路徑字串集合（排除自身 pid）。
 
-        procfs 不可用時回傳 None（呼叫端據此採保守策略）。本函式不取任何鎖，純讀 /proc；
+        #R2：fd 的 readlink 字串只是「該行程 mount namespace 內」的路徑，不足以代表本 daemon 所見的 tty。
+        一條 fd 只有在「該字串於本 daemon 命名空間中 stat 到的 inode」與「fd 實際指向的 inode」相同時才計入；
+        因此容器內獨立 devpts instance 的 /dev/pts/N（與主機同名）不會被誤判為本 daemon console 的 peer。
+        procfs 不可用時回傳 None（呼叫端據此採保守策略）。本函式不取任何鎖，純讀 procfs；
         呼叫端自行決定是否在 _state_lock 內外呼叫（reaper 走鎖外、_client_has_external_peer_locked
         既有行為走鎖內，均不變）。
         """
         held: set[str] = set()
         self_pid = os.getpid()
         try:
-            pids = os.listdir("/proc")
+            pids = os.listdir(proc_root)
         except OSError:
             return None
         for pid_text in pids:
             if not pid_text.isdigit() or int(pid_text) == self_pid:
                 continue
-            fd_dir = os.path.join("/proc", pid_text, "fd")
+            fd_dir = os.path.join(proc_root, pid_text, "fd")
             try:
                 fd_names = os.listdir(fd_dir)
             except OSError:
                 continue
             for fd_name in fd_names:
+                fd_path = os.path.join(fd_dir, fd_name)
                 try:
-                    target = os.readlink(os.path.join(fd_dir, fd_name))
+                    target = os.readlink(fd_path)
                 except OSError:
                     continue
-                held.add(target)
+                # 先以字串篩掉非 tty 的 link（pipe:／socket:／anon_inode:／一般檔案），只對 /dev/ 下的
+                # 路徑才做 stat，避免 reaper 週期性地對 NFS／FUSE／9p 等 inode 做多餘 syscall（#R2 效能）。
+                if not target.startswith("/dev/"):
+                    continue
+                try:
+                    fd_stat = os.stat(fd_path)
+                    tgt_stat = os.stat(target)
+                except OSError:
+                    continue
+                if serial_port_mod.same_tty(fd_stat, tgt_stat):
+                    held.add(target)
         return held
 
     def _client_has_external_peer_locked(self, client: ConsoleClient) -> bool:

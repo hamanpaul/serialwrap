@@ -143,3 +143,29 @@ def test_profile_test_missing_sample_file_returns_ok_false(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["error_code"] == "SAMPLE_READ_FAILED"
+
+
+def test_profile_test_reports_boot_done_regex(tmp_path, capsys):
+    profile_dir = tmp_path / "profiles"
+    profile_dir.mkdir()
+    (profile_dir / "default.yaml").write_text(
+        "profiles:\n"
+        "  prpl-template:\n"
+        "    platform: prpl\n"
+        "    boot_done_regex: \"Please press Enter to activate this console\"\n",
+        encoding="utf-8",
+    )
+    sample = tmp_path / "sample.txt"
+    sample.write_text("Starting kernel ...\nPlease press Enter to activate this console.\n", encoding="utf-8")
+
+    rc = cli.main([
+        "profile", "test",
+        "--profile", "prpl-template",
+        "--sample", str(sample),
+        "--profile-dir", str(profile_dir),
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    check = payload["checks"]["boot_done_regex"]
+    assert check["matched"] is True
+    assert check["matched_line"] == "Please press Enter to activate this console."

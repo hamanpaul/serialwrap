@@ -223,8 +223,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $contractRev = (git -C $root rev-parse HEAD:contracts).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $gitBundle = Join-Path $env:RUNNER_TEMP 'source-revision.bundle'
+          git -C $root bundle create $gitBundle HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\rust\win-blackbox.ps1') `
-            -RustExe $exe -RepoSnapshot $root -OutDir $out `
+            -RustExe $exe -RepoSnapshot $root -GitBundle $gitBundle -OutDir $out `
             -GitRevision $gitRev -ContractRevision $contractRev `
             -Python3123 $env:SW_PY3123 -ComPair $env:SW_TEST_COM_PAIR
           exit $LASTEXITCODE

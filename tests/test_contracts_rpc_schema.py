@@ -941,11 +941,14 @@ def test_foreign_holders_includes_self_pid(tmp_path: Path):
     (pid_dir / "cmdline").write_bytes(b"/usr/bin/serialwrapd\0--socket\0/tmp/s.sock\0")
     fd_dir = pid_dir / "fd"
     fd_dir.mkdir()
-    fake_tty = "/dev/pts/999"
+    # #R2：holder 以 inode 身分判定，故 tty 以暫存實體檔案代表（字串相同但不存在者不計入）。
+    fake_tty = tmp_path / "dev" / "pts999"
+    fake_tty.parent.mkdir(parents=True)
+    fake_tty.write_bytes(b"")
     (fd_dir / "0").symlink_to(fake_tty)
 
-    result = detect_multi_open(proc_root=str(proc_root), tty_paths=[fake_tty])
-    assert result["holders"].get(fake_tty) == my_pid
+    result = detect_multi_open(proc_root=str(proc_root), tty_paths=[str(fake_tty)])
+    assert result["holders"].get(str(fake_tty)) == my_pid
 
 
 @pytest.mark.core_portable

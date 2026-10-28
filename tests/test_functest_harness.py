@@ -519,3 +519,457 @@ def test_tools_docker_reads_artifact_env(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod._serialwrap_bin() == "/x/sw"
+
+
+@pytest.mark.memory_only
+def test_unresolved_template_fails_closed_with_variable_context():
+    """展開後仍殘留 {var.field} 樣板的 cli argv 必須 StepError，且附上對應變數的實際 CLI 回應（不得把字面樣板送進 CLI）。"""
+    import runner
+    from types import SimpleNamespace
+
+    fake_runner = SimpleNamespace(variables={"delay_cmd": {"ok": False, "error_code": "SESSION_NOT_READY"}})
+    with pytest.raises(runner.StepError, match="SESSION_NOT_READY"):
+        runner.TestRunner._require_resolved(
+            fake_runner, ["cmd", "status", "--cmd-id", "{delay_cmd.cmd_id}"], 7, "cli argv"
+        )
+    # 已完全解析者不得拋出例外
+    runner.TestRunner._require_resolved(
+        SimpleNamespace(variables={}), ["cmd", "status", "--cmd-id", "abc"], 7, "cli argv"
+    )
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["cmd", "submit", "--cmd", "echo ${HOME}"],
+        ["cmd", "submit", "--cmd", "echo $HOME"],
+        ["cmd", "submit", "--cmd", "echo ${A:-b}"],
+    ],
+)
+def test_shell_dollar_brace_forms_are_not_unresolved_templates(argv):
+    """DUT 端 shell 參數展開（${HOME}、$HOME、${A:-b}）是字面字串，不是未解析的 harness 樣板，不得被 _require_resolved 提前拒絕。"""
+    import runner
+    from types import SimpleNamespace
+
+    runner.TestRunner._require_resolved(SimpleNamespace(variables={}), argv, 3, "cli argv")
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["cmd", "status", "--cmd-id", "{after_cmd.cmd_id}"],
+        ["cmd", "status", "--cmd-id", "${after_cmd.cmd_id}"],
+        ["cmd", "status", "--cmd-id", "{after_cmd}"],
+        ["cmd", "submit", "--cmd", "echo ${HOME}", "--x", "{after_cmd.cmd_id}"],
+        "{after_cmd.cmd_id}",
+    ],
+)
+def test_unresolved_harness_template_still_fails_closed_next_to_shell_forms(value):
+    """修正 ${HOME} 誤判後，未解析的 harness 樣板（含誤加 $ 前綴的點號形式）仍須 StepError；錯誤訊息不得把合法的 shell 形式列為樣板。"""
+    import runner
+    from types import SimpleNamespace
+
+    with pytest.raises(runner.StepError, match="after_cmd") as excinfo:
+        runner.TestRunner._require_resolved(SimpleNamespace(variables={}), value, 7, "cli argv")
+    assert "${HOME}" not in str(excinfo.value)
+
+
+@pytest.mark.memory_only
+def test_shell_brace_name_matching_declared_save_as_stays_unresolved():
+    """審查 sol 7：${NAME} 若 NAME 為本案例宣告的 save_as，仍是未解析樣板（fail-closed），不得當字面字串送出。"""
+    import runner
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(
+        variables={"after_cmd": {"ok": False, "error_code": "SESSION_NOT_READY"}},
+        tc=SimpleNamespace(steps=[{"save_as": "after_cmd"}]),
+    )
+    with pytest.raises(runner.StepError, match="after_cmd"):
+        runner.TestRunner._require_resolved(fake, ["cmd", "submit", "--cmd", "echo ${after_cmd}"], 3, "cli argv")
+    # 未宣告為 save_as 的 ${NAME}（DUT 端 shell 展開）仍為字面字串
+    runner.TestRunner._require_resolved(fake, ["cmd", "submit", "--cmd", "echo ${HOME}"], 3, "cli argv")
+
+
+@pytest.mark.memory_only
+def test_expand_does_not_consume_declared_shell_brace_name():
+    """`${NAME}` 即使撞到既有 save_as 值，也要保留給 DUT shell 再由 fail-closed 檢查拒絕。"""
+    import runner
+    from types import SimpleNamespace
+
+    fake = SimpleNamespace(
+        variables={"after_cmd": {"ok": False, "error_code": "SESSION_NOT_READY"}},
+        tc=SimpleNamespace(steps=[{"save_as": "after_cmd"}]),
+    )
+    expanded = runner.TestRunner._expand(fake, "echo ${after_cmd}")
+    assert expanded == "echo ${after_cmd}"
+    with pytest.raises(runner.StepError, match="after_cmd"):
+        runner.TestRunner._require_resolved(fake, expanded, 4, "shell command")
+
+
+# ---------------------------------------------------------------------------
+# S1X-gate-accounting（計畫 03 §15.5／I10）：compare:none 的 gate_eligible 定義與 not_applicable 段。
+# ---------------------------------------------------------------------------
+
+def _eligibility(**overrides: Any) -> bool:
+    import runner
+
+    kwargs: dict[str, Any] = {
+        "mode": "bridge", "bridge_eligible": True, "cases_frozen": True, "settle_failure": None,
+        "shutdown_failure": None, "compare_mode": "none", "comparison_verdict": None,
+        "assert_steps_passed": 2, "not_applicable_steps": [], "ok": True,
+    }
+    kwargs.update(overrides)
+    return runner.compute_gate_eligible(**kwargs)
+
+
+@pytest.mark.memory_only
+def test_compare_none_eligible_only_when_all_asserts_pass_and_no_not_applicable():
+    assert _eligibility() is True
+    # 失敗的斷言（ok=False）不得成為資格
+    assert _eligibility(ok=False) is False
+    # 沒有任何斷言實際執行（無證據）不得成為資格
+    assert _eligibility(assert_steps_passed=0) is False
+    # not_applicable 段（POSIX 上的 segment (c)）永不計入資格
+    assert _eligibility(not_applicable_steps=[{"step": 8, "action": "cli"}]) is False
+    # 非 bridge、未自測、case 未凍結、settle／shutdown 失敗皆不得成為資格
+    assert _eligibility(mode="pty") is False
+    assert _eligibility(bridge_eligible=False) is False
+    assert _eligibility(cases_frozen=False) is False
+    assert _eligibility(settle_failure="x") is False
+    assert _eligibility(shutdown_failure="x") is False
+
+
+@pytest.mark.memory_only
+def test_compare_full_still_requires_comparator_pass():
+    assert _eligibility(compare_mode="full", comparison_verdict="PASS", assert_steps_passed=0) is True
+    assert _eligibility(compare_mode="full", comparison_verdict="FAIL") is False
+    assert _eligibility(compare_mode="full", comparison_verdict=None) is False
+    assert _eligibility(compare_mode="full", comparison_verdict="PASS", not_applicable_steps=[{"step": 1}]) is False
+
+
+def _run_bridge_case(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, steps: list[dict[str, Any]],
+                     *, host: str = "linux", stop_error: BaseException | None = None) -> dict[str, Any]:
+    """以假 harness 跑一個 bridge／compare:none 案例，回傳 runner.last_result（並附 run 的回傳值）。"""
+    import realhw.deployed_content
+    import runner
+    from lib import daemon_harness
+    from lib.yaml_loader import TestCase
+
+    monkeypatch.setattr(realhw.deployed_content, "measure", lambda *a, **k: {"bundle_tree_sha256": "a" * 64})
+    monkeypatch.setattr(realhw.deployed_content, "live_daemon", lambda pid, install: {"pid": pid})
+    monkeypatch.setattr(runner, "host_platform", lambda: host)
+    monkeypatch.setattr(runner.TestRunner, "_acceptance_cases_info", lambda self: ("d" * 64, True))
+    monkeypatch.setattr(runner.TestRunner, "_bridge_snapshot", lambda self, *, settle: {"settled": True})
+    monkeypatch.setattr(runner.TestRunner, "_capture_live_daemon", lambda self: None)
+    monkeypatch.setattr(runner.TestRunner, "_tool_identity", lambda self: {})
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
+    monkeypatch.setattr(runner.TestRunner, "_cli",
+                        lambda self, argv, timeout=10.0: {"sessions": [{"com": "COM0", "state": "DETACHED"}]})
+
+    def fake_start(self: Any) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="sw-func-")
+        self._root = pathlib.Path(self._tmpdir.name)
+        (self._root / "run").mkdir(parents=True, exist_ok=True)
+        self._socket_path = str(self._root / "run" / "serialwrapd.sock")
+        pathlib.Path(self._socket_path).touch()
+
+    def fake_stop(self: Any) -> None:
+        if getattr(self, "_tmpdir", None) is not None:
+            self._tmpdir.cleanup()
+        if stop_error is not None:
+            raise stop_error
+
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "start", fake_start)
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "stop", fake_stop)
+    monkeypatch.setattr(daemon_harness.DaemonHarness, "wait_endpoint", lambda self, timeout_s=5.0: None)
+
+    case = TestCase(
+        name="l15-probe",
+        category="l15-scenario",
+        severity="critical",
+        target={"platform": "shell"},
+        profile={},
+        env_files={},
+        steps=steps,
+        bridge={"applicable": True, "only": True, "compare": "none"},
+        scenario={"revision": "test"},
+    )
+    tr = runner.TestRunner(case, mode="bridge", report_dir=tmp_path / "reports")
+    returned_ok, message = tr.run()
+    return {**tr.last_result, "returned_ok": returned_ok, "message": message}
+
+
+@pytest.mark.memory_only
+def test_runner_compare_none_failed_assert_is_fail_and_not_eligible(tmp_path, monkeypatch):
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "READY"}},
+    ])
+    assert res["verdict"] == "FAIL", res
+    assert res["gate_eligible"] is False
+    assert res["returned_ok"] is False
+
+
+@pytest.mark.memory_only
+def test_runner_compare_none_passing_asserts_are_eligible(tmp_path, monkeypatch):
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+    ])
+    assert res["verdict"] == "PASS", res
+    assert res["gate_eligible"] is True
+    assert res["returned_ok"] is True
+
+
+@pytest.mark.memory_only
+def test_runner_posix_not_applicable_segment_is_not_pass(tmp_path, monkeypatch):
+    """POSIX 上 platforms:[windows] 的段記為 not_applicable：整體不得 PASS、不得 gate_eligible。"""
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "READY"}, "platforms": ["windows"]},
+    ], host="linux")
+    assert res["verdict"] == "INSUFFICIENT_EVIDENCE", res
+    assert res["gate_eligible"] is False
+    assert res["returned_ok"] is False
+    assert "not_applicable" in res["message"]
+    # 結構化欄位：gate 依 not_applicable_steps 與 na_only_gap 判定缺口是否僅為平台不適用。
+    # step 為 0-based 步驟索引：第二個步驟（index 1）為 windows 專屬段。
+    assert [step["step"] for step in res["not_applicable_steps"]] == [1], res
+    assert res["na_only_gap"] is True, res
+
+
+@pytest.mark.memory_only
+def test_runner_windows_host_runs_segment_and_can_be_eligible(tmp_path, monkeypatch):
+    """同一段在 Windows 上實際執行（READY 不成立時 FAIL；成立時 PASS 且 eligible）。"""
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}, "platforms": ["windows"]},
+    ], host="windows")
+    assert res["verdict"] == "PASS", res
+    assert res["gate_eligible"] is True
+
+
+def _harness_with_tmpdir(tmp_path: pathlib.Path):
+    """建立已具 root／證據目錄的 DaemonHarness（不啟動任何行程），供 stop() 的關閉階段測試使用。"""
+    from lib import daemon_harness
+
+    h = daemon_harness.DaemonHarness()
+    tmpdir = tempfile.TemporaryDirectory(prefix="sw-func-test-")
+    h._tmpdir = tmpdir
+    h._root = pathlib.Path(tmpdir.name)
+    h._evidence_dir = tmp_path / "evidence"
+    h._evidence_dir.mkdir(parents=True, exist_ok=True)
+    (h._root / "wal").mkdir()
+    return h, tmpdir
+
+
+@pytest.mark.memory_only
+def test_stop_retries_tmpdir_removal_without_failing_the_case(monkeypatch, tmp_path):
+    """S1X G3 (a)：臨時目錄回收遇 WinError 32 時有界重試；重試成功即無診斷，stop() 不拋出。"""
+    from lib import daemon_harness
+
+    monkeypatch.setattr(daemon_harness, "_TMPDIR_REMOVE_DELAY_S", 0.0)
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    real_cleanup = tmpdir.cleanup
+    calls = {"n": 0}
+
+    def flaky_cleanup() -> None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(32, "程序無法存取檔案（模擬 WinError 32）")
+        real_cleanup()
+
+    monkeypatch.setattr(tmpdir, "cleanup", flaky_cleanup)
+    h.stop()
+    assert calls["n"] == 3
+    assert h.cleanup_diagnostics == []
+    assert not os.path.exists(tmpdir.name)
+    assert (tmp_path / "evidence" / "wal").is_dir(), "WAL 複本仍須保存於證據目錄"
+
+
+@pytest.mark.memory_only
+def test_stop_records_diagnostic_when_tmpdir_stays_locked(monkeypatch, tmp_path):
+    """重試用盡仍無法回收：只寫入 cleanup_diagnostics，不改變案例結果（stop() 不拋出）。"""
+    import shutil
+
+    from lib import daemon_harness
+
+    monkeypatch.setattr(daemon_harness, "_TMPDIR_REMOVE_DELAY_S", 0.0)
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    leftover = tmpdir.name
+
+    def always_locked() -> None:
+        raise PermissionError(32, "仍被占用（模擬）")
+
+    monkeypatch.setattr(tmpdir, "cleanup", always_locked)
+    try:
+        h.stop()
+        diagnostics = h.cleanup_diagnostics
+        assert [item["kind"] for item in diagnostics] == ["tmpdir_remove_failed"], diagnostics
+        assert diagnostics[0]["attempts"] == daemon_harness._TMPDIR_REMOVE_ATTEMPTS
+        assert "PermissionError" in diagnostics[0]["error"]
+        assert diagnostics[0]["path"] == leftover
+    finally:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+@pytest.mark.memory_only
+def test_stop_waits_for_registered_handle_holder(tmp_path):
+    """S1X G3 (a)：案例自建的 WAL 讀取 handle 持有者須於回收臨時目錄前結束。"""
+    import shutil
+    import threading
+
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    leftover = tmpdir.name
+    finished = threading.Event()
+
+    def hold() -> None:
+        time.sleep(0.3)
+        finished.set()
+
+    holder = threading.Thread(target=hold, name="test-wal-holder", daemon=True)
+    holder.start()
+    h.register_handle_holder(holder)
+    try:
+        h.stop()
+        assert finished.is_set(), "stop() 必須等待持有者結束後才回收"
+        assert h.cleanup_diagnostics == []
+        assert not os.path.exists(leftover)
+    finally:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+@pytest.mark.memory_only
+def test_stop_raises_when_daemon_exit_is_unconfirmed(tmp_path):
+    """S1X G3 (a)：kill 後仍無法確認 daemon 行程結束 → 以 StepError 拋出（證據完整性不明）；臨時目錄仍嘗試回收。"""
+    import shutil
+
+    from lib import daemon_harness
+
+    class StuckProc:
+        pid = 4242
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired(cmd="daemon", timeout=timeout or 0)
+
+    h, tmpdir = _harness_with_tmpdir(tmp_path)
+    leftover = tmpdir.name
+    h._daemon = StuckProc()
+    try:
+        with pytest.raises(daemon_harness.StepError, match="未確認結束"):
+            h.stop()
+        assert h._daemon is None
+        assert h._tmpdir is None
+        assert not os.path.exists(leftover)
+    finally:
+        shutil.rmtree(leftover, ignore_errors=True)
+
+
+@pytest.mark.memory_only
+def test_runner_harness_stop_failure_is_insufficient_and_not_eligible(tmp_path, monkeypatch):
+    """關閉失敗的案例：原本 PASS 者判為 INSUFFICIENT_EVIDENCE、不得 gate_eligible，失敗原因寫入診斷。"""
+    from lib import daemon_harness
+
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "DETACHED"}},
+    ], stop_error=daemon_harness.StepError("daemon pid=1 未確認結束"))
+    assert res["verdict"] == "INSUFFICIENT_EVIDENCE", res
+    assert res["gate_eligible"] is False
+    assert res["returned_ok"] is False
+    assert [item["kind"] for item in res["harness_diagnostics"]] == ["harness_stop_failed"], res
+
+
+@pytest.mark.memory_only
+def test_runner_harness_stop_failure_keeps_case_fail(tmp_path, monkeypatch):
+    """關閉失敗不得覆寫既有 FAIL：案例判定與訊息保留，失敗原因僅記入診斷。"""
+    from lib import daemon_harness
+
+    res = _run_bridge_case(tmp_path, monkeypatch, [
+        {"action": "assert_state", "selector": "COM0", "expect": {"state": "READY"}},
+    ], stop_error=daemon_harness.StepError("daemon pid=1 未確認結束"))
+    assert res["verdict"] == "FAIL", res
+    assert res["gate_eligible"] is False
+    assert "harness" not in res["message"]
+    assert [item["kind"] for item in res["harness_diagnostics"]] == ["harness_stop_failed"], res
+
+
+@pytest.mark.memory_only
+def test_main_continues_after_runner_exception_and_writes_report(tmp_path, monkeypatch):
+    """S1X G3 (a)：單一案例的 runner 例外不得中止整次執行；每案結束後都寫出報告。"""
+    import json
+
+    import runner
+    from lib.yaml_loader import TestCase
+
+    def make(name: str) -> TestCase:
+        return TestCase(name=name, category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *a, **k: [make("boom-case"), make("ok-case")])
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
+
+    def fake_run(self: Any) -> tuple[bool, str]:
+        if self.tc.name == "boom-case":
+            raise RuntimeError("synthetic crash")
+        self.last_result = self._result("PASS", "OK")
+        return True, "OK"
+
+    monkeypatch.setattr(runner.TestRunner, "run", fake_run)
+    report_dir = tmp_path / "reports"
+    rc = runner.main(["--report-dir", str(report_dir)])
+    report = json.loads((report_dir / "func-test-report.json").read_text(encoding="utf-8"))
+    assert [row["verdict"] for row in report["results"]] == ["INSUFFICIENT_EVIDENCE", "PASS"], report
+    assert "synthetic crash" in report["results"][0]["message"]
+    assert rc == 1
+
+
+@pytest.mark.memory_only
+def test_bridge_stdout_is_decoded_explicitly_as_utf8():
+    """S1X G3 (c)：bridge 的 stdout 明確以 UTF-8 解碼並 replace，不依系統 locale，且解碼錯誤不終止讀取執行緒。"""
+    text = (FUNC_TEST_DIR / "lib" / "bridge_session.py").read_text(encoding="utf-8")
+    start = text.index("self.process = subprocess.Popen(")
+    call = text[start:text.index(")\n", start)]
+    assert 'encoding="utf-8"' in call and 'errors="replace"' in call, call
+
+
+@pytest.mark.memory_only
+def test_func_report_complete_flag_false_midrun_true_only_at_end(tmp_path, monkeypatch):
+    """F7：每案中途寫出的報告 complete=false，僅最後一次寫出為 complete=true；逾時或崩潰留下的部分報告不得與完整報告外觀相同。"""
+    import json
+
+    import runner
+    from lib.yaml_loader import TestCase
+
+    def make(name: str) -> TestCase:
+        return TestCase(name=name, category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+
+    monkeypatch.setattr(runner, "discover_test_cases", lambda *a, **k: [make("a-case"), make("b-case")])
+    monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
+
+    def fake_run(self: Any) -> tuple[bool, str]:
+        self.last_result = self._result("PASS", "OK")
+        return True, "OK"
+
+    monkeypatch.setattr(runner.TestRunner, "run", fake_run)
+    seen: list[bool] = []
+    real_write = runner._write_summary_report
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(bool(kwargs.get("complete", False)))
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_write_summary_report", spy)
+    report_dir = tmp_path / "reports"
+    runner.main(["--report-dir", str(report_dir)])
+    report = json.loads((report_dir / "func-test-report.json").read_text(encoding="utf-8"))
+    assert seen == [False, False, True], seen
+    assert report["complete"] is True
+    assert runner.build_summary_report([])["complete"] is False

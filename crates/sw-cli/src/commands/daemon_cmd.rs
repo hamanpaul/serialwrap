@@ -160,11 +160,21 @@ pub fn run_daemon_start(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
 
     let daemon_argv = match locate_daemon_argv(ctx) {
         Ok(value) => value,
-        Err(_) => {
+        Err(DaemonLocateError::NotFound) => {
             let resp = error(
                 ErrorCode::DaemonBinaryNotFound,
                 "找不到 serialwrapd（release manifest 的 launcher、CLI 同層 serialwrapd、manifest 的 Python runtime 皆不存在）；請確認發行包完整",
             );
+            emit(ctx, &resp, Some("daemon start"), 2);
+            return 2;
+        }
+        Err(DaemonLocateError::ManifestRuntimeMissing { launcher, runtime }) => {
+            let runtime = runtime
+                .unwrap_or_else(|| "（manifest 未宣告 components.daemon.runtime）".to_string());
+            let message = format!(
+                "release manifest 的 daemon launcher {launcher} 須由同一 manifest 的 Python runtime 執行，但 runtime 不存在：{runtime}；請確認發行包完整"
+            );
+            let resp = error(ErrorCode::DaemonBinaryNotFound, &message);
             emit(ctx, &resp, Some("daemon start"), 2);
             return 2;
         }
@@ -530,6 +540,11 @@ fn capture_start(ctx: &mut CliCtx<'_>, ns: &Namespace) -> (i32, PyDict, Vec<u8>)
 #[derive(Debug)]
 pub enum DaemonLocateError {
     NotFound,
+    /// manifest 宣告 `.py` launcher，但同一 manifest 的 runtime 未宣告（`None`）或檔案不存在。
+    ManifestRuntimeMissing {
+        launcher: String,
+        runtime: Option<String>,
+    },
 }
 
 /// DF-05：依 manifest launcher、CLI 同層 daemon、manifest runtime 的順序尋找啟動入口。
@@ -539,7 +554,32 @@ pub fn locate_daemon_argv(ctx: &CliCtx<'_>) -> Result<Vec<String>, DaemonLocateE
         if let Some(relative) = manifest_component_path(&parsed.raw, "launcher") {
             let candidate = resolve_component_path(path, relative);
             if ctx.p.fs.is_file(&candidate) {
-                return Ok(vec![absolute_path(ctx, &candidate)]);
+                let windows_python_script = path_flavor(ctx) == PathFlavor::Windows
+                    && Path::new(relative).extension().is_some_and(|extension| {
+                        extension.to_string_lossy().eq_ignore_ascii_case("py")
+                    });
+                if windows_python_script {
+                    let runtime = manifest_component_path(&parsed.raw, "runtime")
+                        .map(|runtime_relative| resolve_component_path(path, runtime_relative));
+                    if let Some(runtime) = &runtime {
+                        if ctx.p.fs.is_file(runtime) {
+                            return Ok(vec![
+                                absolute_path(ctx, runtime),
+                                "-I".to_string(),
+                                "-B".to_string(),
+                                absolute_path(ctx, &candidate),
+                            ]);
+                        }
+                    }
+                    // `.py` launcher 只能由同一 manifest 的 runtime 執行；缺 runtime 時 fail-closed，
+                    // 不得落到 CLI 同層 serialwrapd.exe 等候選而繞過 manifest 版本配對。
+                    return Err(DaemonLocateError::ManifestRuntimeMissing {
+                        launcher: absolute_path(ctx, &candidate),
+                        runtime: runtime.map(|runtime| absolute_path(ctx, &runtime)),
+                    });
+                } else {
+                    return Ok(vec![absolute_path(ctx, &candidate)]);
+                }
             }
         }
     }

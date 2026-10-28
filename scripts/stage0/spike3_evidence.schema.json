@@ -2,9 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://serialwrap.local/schemas/stage0/spike3_evidence.schema.json",
   "title": "Stage 0 Spike 3 Windows WAL／EDR 證據",
-  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。edr 缺欄即不合格（EDR 攔截查詢結果必須記錄，查不到寫 unknown）。",
+  "description": "docs/rust-refactor/plans/02-stage0-python-bc.md T21：scripts/stage0/spike3_win_wal.py 每次執行輸出一份證據 JSON。OD-19／OD-22：判定依 av_sim 注入、binary_integrity 與主案例／oplock append 樣本；兩組延遲須符合 p99 ≤100 ms、最大 ≤600 ms。edr 為唯讀資訊欄。",
   "type": "object",
-  "required": ["case_id", "run_at", "env", "artifact", "steps", "observations", "edr", "verdict", "fallback"],
+  "required": ["case_id", "run_at", "env", "artifact", "steps", "observations", "av_sim", "binary_integrity", "verdict", "fallback"],
   "additionalProperties": false,
   "properties": {
     "case_id": {
@@ -18,9 +18,17 @@
     "env": {
       "type": "object",
       "description": "同 T19 env（§1.1.1）；查不到的值一律為 unknown，不得填 0 或空字串。",
-      "required": ["os"],
+      "required": [
+        "os", "timing_method", "timing_clock", "timing_resolution_ns",
+        "timing_monotonic", "timing_adjustable"
+      ],
       "properties": {
         "os": {"type": "string"},
+        "timing_method": {"type": "string", "const": "time.perf_counter_ns"},
+        "timing_clock": {"type": "string", "minLength": 1},
+        "timing_resolution_ns": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "timing_monotonic": {"type": "boolean", "const": true},
+        "timing_adjustable": {"type": "boolean", "const": false},
         "os_build": {"type": "string"},
         "python": {"type": "string"},
         "platform": {"type": "string"},
@@ -40,7 +48,9 @@
       "properties": {
         "binary": {"type": "string"},
         "revision": {"type": "string"},
-        "tree_sha256": {"type": "string"}
+        "tree_sha256": {"type": "string"},
+        "git_head": {"type": "string"},
+        "git_clean": {"type": "boolean"}
       }
     },
     "steps": {
@@ -58,11 +68,215 @@
       }
     },
     "observations": {
-      "type": "object"
+      "type": "object",
+      "required": [
+        "append_count", "append_latency_ms", "lease_acquired_ns", "stimulus_started_ns",
+        "lease_until_ns", "oplock_variant_status", "oplock_variant"
+      ],
+      "properties": {
+        "append_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "由 Spike 3 writer proxy 計數的 WalWriter.append 呼叫次數；gate 會與延遲樣本數逐一核對。"
+        },
+        "append_latency_ms": {
+          "type": "array",
+          "description": "實際 WalWriter.append 呼叫耗時（毫秒）；OD-22 要求 p99 ≤100 ms 且最大值 ≤600 ms。",
+          "minItems": 1,
+          "items": {"type": "number", "minimum": 0}
+        },
+        "lease_acquired_ns": {"type": "integer", "minimum": 0},
+        "stimulus_started_ns": {"type": "integer", "minimum": 0},
+        "lease_until_ns": {"type": "integer", "minimum": 0},
+        "oplock_variant_status": {"enum": ["PASS", "FAIL", "INSUFFICIENT_EVIDENCE"]},
+        "oplock_variant": {
+          "type": "object",
+          "description": "OD-19 (2)：獨立 oplock helper 持有期間實際 append、rotate，並由 F12 oracle 證明前後 marker 進展。",
+          "required": [
+            "append_count", "append_latency_ms", "archives", "records", "continuity_meta_count",
+            "first_seq", "last_seq", "seq_continuous", "rotate_retry", "deferred_delete_pending",
+            "write_failures", "pre_rotate", "post_rotate", "crc_errors", "interference_observed",
+            "archive_scan_elapsed_ms", "oracle_wait_elapsed_ms", "lease_acquired_ns",
+            "stimulus_started_ns", "rotation_requested_ns", "rotation_completed_ns", "lease_until_ns",
+            "rotation_attempt_count", "rotation_request_succeeded", "rotation_append_index",
+            "rotation_append_started_ns", "rotation_append_completed_ns", "rotation_completion_succeeded",
+            "rotation_completion_append_index", "rotation_completion_append_started_ns",
+            "rotation_completion_append_completed_ns", "lease_request_id", "oplock_breaks"
+          ],
+          "properties": {
+            "append_count": {"type": "integer", "minimum": 1},
+            "append_latency_ms": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0}},
+            "archives": {"type": "integer", "minimum": 0},
+            "records": {"type": "integer", "minimum": 1},
+            "continuity_meta_count": {"type": "integer", "minimum": 0},
+            "first_seq": {"type": ["integer", "null"]},
+            "last_seq": {"type": ["integer", "null"]},
+            "seq_continuous": {"type": "boolean"},
+            "rotate_retry": {"type": ["integer", "null"], "minimum": 0},
+            "deferred_delete_pending": {"type": ["integer", "null"], "minimum": 0},
+            "write_failures": {"type": ["integer", "null"], "minimum": 0},
+            "pre_rotate": {
+              "type": "object", "required": ["ok"], "additionalProperties": false,
+              "properties": {"ok": {"type": ["boolean", "null"]}, "reason_code": {"type": ["string", "null"]}}
+            },
+            "post_rotate": {
+              "type": "object", "required": ["ok"], "additionalProperties": false,
+              "properties": {"ok": {"type": ["boolean", "null"]}, "reason_code": {"type": ["string", "null"]}}
+            },
+            "archive_scan_elapsed_ms": {"type": "number", "minimum": 0},
+            "oracle_wait_elapsed_ms": {"type": "number", "minimum": 0},
+            "crc_errors": {"type": "array"},
+            "interference_observed": {"type": "boolean"},
+            "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
+            "stimulus_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_requested_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+            "lease_until_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_append_index": {"type": ["integer", "null"], "minimum": 1},
+            "rotation_append_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_append_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_attempt_count": {"type": "integer", "minimum": 0},
+            "rotation_request_succeeded": {"type": ["boolean", "null"]},
+            "rotation_completion_succeeded": {"type": ["boolean", "null"]},
+            "rotation_completion_append_index": {"type": ["integer", "null"], "minimum": 1},
+            "rotation_completion_append_started_ns": {"type": ["integer", "null"], "minimum": 0},
+            "rotation_completion_append_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+            "lease_request_id": {"type": ["string", "null"], "minLength": 1},
+            "oplock_breaks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "event", "request_id", "name", "lease_acquired_ns", "lease_until_ns", "break_notified_ns",
+                  "break_completed", "ack_required", "ack_method", "close_started_ns", "close_completed_ns",
+                  "close_succeeded", "acknowledged_ns", "observation_error"
+                ],
+                "properties": {
+                  "event": {"type": "string", "const": "oplock_break"},
+                  "request_id": {"type": ["string", "null"]},
+                  "name": {"type": "string"},
+                  "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "lease_until_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "break_notified_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "break_completed": {"type": ["boolean", "null"]},
+                  "ack_required": {"type": ["boolean", "null"]},
+                  "ack_method": {"type": ["string", "null"], "enum": ["close_handle", "not_required", null]},
+                  "close_started_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "close_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "close_succeeded": {"type": ["boolean", "null"]},
+                  "acknowledged_ns": {"type": ["integer", "null"], "minimum": 0},
+                  "observation_error": {"type": ["integer", "null"], "minimum": 0}
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "av_sim": {
+      "type": "object",
+      "description": "OD-19 (2)：主案例以不含 FILE_SHARE_DELETE 的 share_no_delete helper 驗證 rotate／unlink 干擾；獨立 variants.oplock 記錄允許 delete 的 overlapped RH oplock 變體。",
+      "required": ["mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs", "helper_exit", "variants"],
+      "properties": {
+        "mode": {"type": "string", "const": "share_no_delete"},
+        "share_mode": {"type": "string", "const": "FILE_SHARE_READ|FILE_SHARE_WRITE"},
+        "hold_ms_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+        "seed": {"type": "integer"},
+        "oplock": {"type": "string", "const": "not_requested"},
+        "launch_error": {"type": "string"},
+        "grabs": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "open_errors": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+        "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "variants": {
+          "type": "object",
+          "required": ["oplock"],
+          "properties": {
+            "oplock": {
+              "type": "object",
+              "required": [
+                "mode", "share_mode", "hold_ms_range", "seed", "oplock", "launch_error", "grabs",
+                "helper_exit", "lease_request_id", "oplock_breaks"
+              ],
+              "properties": {
+                "mode": {"type": "string", "const": "oplock"},
+                "share_mode": {"type": "string", "const": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"},
+                "hold_ms_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                "seed": {"type": "integer"},
+                "oplock": {"type": "string", "enum": ["pending", "unavailable", "granted", "denied"]},
+                "launch_error": {"type": "string"},
+                "grabs": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+                "open_errors": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]},
+                "helper_exit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "lease_request_id": {"type": ["string", "null"], "minLength": 1},
+                "oplock_breaks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "event", "name", "request_id", "lease_acquired_ns", "lease_until_ns",
+                      "break_notified_ns", "break_completed", "ack_required", "ack_method",
+                      "close_started_ns", "close_completed_ns", "close_succeeded",
+                      "acknowledged_ns", "observation_error"
+                    ],
+                    "properties": {
+                      "event": {"type": "string", "const": "oplock_break"},
+                      "request_id": {"type": ["string", "null"]},
+                      "name": {"type": "string"},
+                      "lease_acquired_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "lease_until_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "break_notified_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "break_completed": {"type": ["boolean", "null"]},
+                      "ack_required": {"type": ["boolean", "null"]},
+                      "ack_method": {"type": ["string", "null"], "enum": ["close_handle", "not_required", null]},
+                      "close_started_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "close_completed_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "close_succeeded": {"type": ["boolean", "null"]},
+                      "acknowledged_ns": {"type": ["integer", "null"], "minimum": 0},
+                      "observation_error": {"type": ["integer", "null"], "minimum": 0}
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "binary_integrity": {
+      "type": "object",
+      "description": "OD-19 (3)：測試前後執行檔存在、sha256 不變、啟動未被拒；unchanged 與 launch_refused 為判定依據。",
+      "required": ["subjects", "unchanged", "launch_refused", "launch_error"],
+      "properties": {
+        "subjects": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path", "exists_before", "exists_after", "sha256_before", "sha256_after", "unchanged"],
+            "properties": {
+              "path": {"type": "string"},
+              "exists_before": {"type": "boolean"},
+              "exists_after": {"type": "boolean"},
+              "sha256_before": {"type": "string"},
+              "sha256_after": {"type": "string"},
+              "unchanged": {"type": "boolean"}
+            }
+          }
+        },
+        "unchanged": {"type": "boolean"},
+        "launch_refused": {"type": "boolean"},
+        "launch_error": {"type": "string"}
+      }
     },
     "edr": {
       "type": "object",
-      "description": "EDR 產品與狀態（OD-05 代表機台為第三方企業 EDR）；攔截查詢結果需 EDR 主控台權限，查不到寫 unknown。",
+      "description": "OD-19 (3)：防毒產品名與狀態由工具以 SecurityCenter2 唯讀查詢取得，僅作資訊欄位（選填）；查不到寫 unknown，不參與 verdict。",
       "required": ["product", "status", "interceptions"],
       "additionalProperties": false,
       "properties": {

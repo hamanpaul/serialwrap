@@ -665,8 +665,10 @@ class Bridge:
 
     def _handle_action(self, action: str, params: dict[str, Any], action_id: str) -> dict[str, Any]:
         if action == "status":
+            # 對外 status 只在端點宣告 peer_state 能力時揭露 peer_open（POSIX PTY；win-serial 僅 com0com 且 peer gate 啟用時）；其餘為 null。
+            # 內部 peer gate、shutdown 與 rx_writer 仍直接取樣，不受此對外欄位影響。
             try:
-                peer_open = self.endpoint.peer_open()
+                peer_open = self.endpoint.peer_open() if self._capability("peer_state") else None
             except OSError:
                 peer_open = None
             with self._state_lock:

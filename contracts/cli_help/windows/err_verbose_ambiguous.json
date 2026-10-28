@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "--v",
+    "session",
+    "list"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap [-h] [--version] [-v] [--socket SOCKET]\n                  [--endpoint ENDPOINT] [--bench CODE] [--timeout TIMEOUT_S]\n                  [--retries RETRIES]\n                  <group> ...\nserialwrap: error: ambiguous option: --v could match --version, --verbose\n",
+  "native": true,
+  "post_parse_effects": false
+}

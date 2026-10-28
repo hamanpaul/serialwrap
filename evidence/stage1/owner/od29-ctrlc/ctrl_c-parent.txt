@@ -1,0 +1,10 @@
+parent pid=35440 interactive=true exe=C:\Users\haman\AppData\Local\Temp\sw-od29\exec_delegate.exe
+ctrl_c: spawned child pid=4488
+ctrl_c: ready child pid=4488 interactive=true ctrl_c_reenabled=true
+ctrl_c: GenerateConsoleCtrlEvent(0, 4488) ok=true
+ctrl_c: exit=Some(ExitStatus(ExitStatus(3221225786))) code=Some(c000013a)
+ctrl_break: spawned child pid=39248
+ctrl_break: ready child pid=39248 interactive=true ctrl_c_reenabled=true
+ctrl_break: GenerateConsoleCtrlEvent(1, 39248) ok=true
+ctrl_break: exit=Some(ExitStatus(ExitStatus(3221225786))) code=Some(c000013a)
+PASS

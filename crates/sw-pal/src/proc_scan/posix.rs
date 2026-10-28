@@ -97,6 +97,23 @@ impl ProcScan for PosixProcScan {
         let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
         #[cfg(unix)]
         {
+            tty_holders_fail_closed_with(&RealHolderFs, &self.proc_root, &pids, paths)
+        }
+        // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
+        #[cfg(not(unix))]
+        {
+            let _ = (pids, paths);
+            (Vec::new(), HolderScanStatus::Unknown)
+        }
+    }
+
+    fn multi_open_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let Ok(daemons) = self.serialwrapd_instances() else {
+            return (Vec::new(), HolderScanStatus::Unknown);
+        };
+        let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
+        #[cfg(unix)]
+        {
             tty_holders_with(&RealHolderFs, &self.proc_root, &pids, paths)
         }
         // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
@@ -216,6 +233,58 @@ pub fn tty_holders_with(
         for fd in fds {
             let Ok(fd_stat) = fs.stat(&fd_dir.join(&fd)) else {
                 continue;
+            };
+            if tty_stats.iter().any(|tty| same_tty(&fd_stat, tty)) {
+                holders.insert(*pid);
+            }
+        }
+    }
+    (holders.into_iter().collect(), status)
+}
+
+#[cfg(unix)]
+/// [`tty_holders_with`] 的 fail-closed 版（#R2／Codex P2；`serial_port.probe_holders` 語意）：目標 tty 取不到
+/// 身分時不得回「無 holder、Ok」（呼叫端會當成已確認可安全開啟）——PermissionDenied → `Permission`，其他 →
+/// `Unknown`；fd 在掃描期間消失（NotFound）屬正常競態而略過，fd 因權限讀不到 → `Permission`，其他 → `Unknown`。
+pub fn tty_holders_fail_closed_with(
+    fs: &dyn HolderFs,
+    proc_root: &Path,
+    pids: &[u32],
+    paths: &[PathBuf],
+) -> (Vec<u32>, HolderScanStatus) {
+    let mut status = HolderScanStatus::Ok;
+    let degrade = |status: &mut HolderScanStatus, error: &std::io::Error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            *status = HolderScanStatus::Permission;
+        } else if *status == HolderScanStatus::Ok {
+            *status = HolderScanStatus::Unknown;
+        }
+    };
+    let mut tty_stats = Vec::with_capacity(paths.len());
+    for path in paths {
+        match fs.stat(path) {
+            Ok(stat) => tty_stats.push(stat),
+            Err(error) => degrade(&mut status, &error),
+        }
+    }
+    let mut holders = BTreeSet::new();
+    for pid in pids {
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
+        let fds = match fs.list_dir(&fd_dir) {
+            Ok(fds) => fds,
+            Err(error) => {
+                degrade(&mut status, &error);
+                continue;
+            }
+        };
+        for fd in fds {
+            let fd_stat = match fs.stat(&fd_dir.join(&fd)) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    degrade(&mut status, &error);
+                    continue;
+                }
             };
             if tty_stats.iter().any(|tty| same_tty(&fd_stat, tty)) {
                 holders.insert(*pid);

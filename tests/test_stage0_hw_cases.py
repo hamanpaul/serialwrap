@@ -292,6 +292,84 @@ def test_runbooks_have_frozen_header_fields():
             assert field in doc, f"Script {script.name} docstring missing required header field '{field}'"
 
 
+def _load_spike3_module():
+    """以檔案路徑載入 spike3_win_wal.py（頂層只定義函式與常數，不執行 Windows 探測）。"""
+    import importlib.util
+
+    path = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
+    spec = importlib.util.spec_from_file_location("spike3_win_wal_under_test", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _fake_run(stdout: str = "", returncode: int = 0):
+    import subprocess
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+    return runner
+
+
+def test_spike3_query_edr_reports_product_and_status_as_info_only():
+    """OD-19 (3)：唯讀查詢解析防毒名稱與狀態；成功即寫入資訊欄，失敗一律 unknown。"""
+    mod = _load_spike3_module()
+    rows = json.dumps([
+        {"displayName": "Vendor EDR", "productState": 397568},
+        {"displayName": "Vendor EDR", "productState": 397568},
+    ])
+    info = mod.query_edr(runner=_fake_run(rows))
+    assert info["product"] == "Vendor EDR" and info["status"] == "enabled"
+    assert info["interceptions"] == "unknown"
+
+    single = mod.query_edr(runner=_fake_run(json.dumps({"displayName": "Other AV", "productState": 262144})))
+    assert single["product"] == "Other AV" and single["status"] == "disabled"
+
+    for failing in (_fake_run("", returncode=1), _fake_run("not json"), _fake_run("[]")):
+        degraded = mod.query_edr(runner=failing)
+        assert degraded["product"] == "unknown" and degraded["status"] == "unknown"
+
+    def missing_powershell(*_args, **_kwargs):
+        raise FileNotFoundError("powershell.exe")
+
+    assert mod.query_edr(runner=missing_powershell)["product"] == "unknown"
+
+
+def test_spike3_decode_product_state_is_info_only_mapping():
+    mod = _load_spike3_module()
+    assert mod.decode_product_state(397568) == "enabled"      # 0x61100，第二位元組 0x11
+    assert mod.decode_product_state(262144) == "disabled"     # 0x40000，第二位元組 0x00
+    assert mod.decode_product_state(0xFF00) == "unknown"      # 第二位元組 0xFF，不在已知版面內
+    assert mod.decode_product_state("bad") == "unknown"
+
+
+def test_spike3_binary_integrity_report_detects_change_and_refusal():
+    mod = _load_spike3_module()
+    before = {"x.exe": {"exists": True, "sha256": "a" * 64}}
+    same = mod.binary_integrity_report(before, {"x.exe": {"exists": True, "sha256": "a" * 64}}, "none")
+    assert same["unchanged"] is True and same["launch_refused"] is False
+
+    changed = mod.binary_integrity_report(before, {"x.exe": {"exists": True, "sha256": "b" * 64}}, "none")
+    assert changed["unchanged"] is False
+
+    removed = mod.binary_integrity_report(before, {"x.exe": {"exists": False, "sha256": None}}, "none")
+    assert removed["unchanged"] is False
+
+    refused = mod.binary_integrity_report(before, {"x.exe": {"exists": True, "sha256": "a" * 64}}, "helper 就緒逾時")
+    assert refused["launch_refused"] is True and refused["unchanged"] is True
+
+
+def test_spike3_cli_takes_no_edr_flags():
+    """OD-19：--edr-* 自填參數已移除，argparse 必須拒絕。"""
+    mod = _load_spike3_module()
+    parser = mod.build_parser()
+    for flag in ("--edr-product", "--edr-status", "--edr-interceptions"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([flag, "x", "--case", "win-wal-av-rotate", "--evidence-dir", "d"])
+
+
 def test_spike3_cases_match_p2_case_ids(capsys, monkeypatch):
     """spike3_win_wal.py --list 輸出恰為 P2 指派給本計畫的四個 case_id。"""
     script_path = REPO_ROOT / "scripts" / "stage0" / "spike3_win_wal.py"
@@ -327,7 +405,13 @@ def test_spike3_cases_match_p2_case_ids(capsys, monkeypatch):
 
 
 def test_spike3_evidence_schema_rejects_missing_edr():
-    """缺 edr 的證據 JSON 不通過 schema。"""
+    """OD-19（oracle 變更，見 commit 的兩位審查者註記）：av_sim 與 binary_integrity 必填；edr 為選填資訊欄。
+
+    注意：函式名稱沿用舊名 ``test_spike3_evidence_schema_rejects_missing_edr``，因為 L1 凍結鎖
+    （``tests/acceptance/l1_required.lock.json``，``s0_win_pytest.windows``）以此 nodeid 登記；
+    改名會使凍結必要集合出現懸空 nodeid。函式本體的斷言已依 OD-19 改為「edr 缺漏可接受」。
+    改名須依 §11.3 以 ``regen_lock --l1-add-only --allow-removal`` 與擁有者核准一併處理。
+    """
     schema_path = REPO_ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json"
     assert schema_path.is_file(), f"Spike 3 evidence schema missing: {schema_path}"
 
@@ -335,25 +419,139 @@ def test_spike3_evidence_schema_rejects_missing_edr():
 
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
 
-    sample_without_edr = {
+    base = {
         "case_id": "win-wal-av-rotate",
         "run_at": "2026-10-16T12:00:00Z",
-        "env": {"os": "windows"},
+        "env": {
+            "os": "windows", "timing_method": "time.perf_counter_ns",
+            "timing_clock": "QueryPerformanceCounter", "timing_resolution_ns": 100,
+            "timing_monotonic": True, "timing_adjustable": False,
+        },
         "artifact": {"binary": "sw-core.exe"},
         "steps": [{"op": "rotate", "ts": "2026-10-16T12:00:01Z", "result": "ok"}],
-        "observations": {"rotated": True},
+        "observations": {
+            "append_count": 1, "append_latency_ms": [0.1], "rotated": True,
+            "oplock_variant_status": "PASS",
+            "oplock_variant": {
+                "append_count": 1, "append_latency_ms": [0.1], "archives": 1, "records": 1,
+                "continuity_meta_count": 0, "first_seq": 1, "last_seq": 1,
+                "seq_continuous": True, "rotate_retry": 0, "deferred_delete_pending": 0,
+                "write_failures": 0, "pre_rotate": {"ok": True}, "post_rotate": {"ok": True},
+                "archive_scan_elapsed_ms": 0.1, "oracle_wait_elapsed_ms": 0.2,
+                "crc_errors": [], "interference_observed": True,
+                "lease_request_id": "oplock-lease-1",
+                "oplock_breaks": [{
+                    "event": "oplock_break", "request_id": "oplock-lease-1", "name": "raw.wal.ndjson",
+                    "lease_acquired_ns": 1, "lease_until_ns": 4,
+                    "break_notified_ns": 4, "break_completed": True,
+                    "ack_required": True, "ack_method": "close_handle",
+                    "close_started_ns": 5, "close_completed_ns": 6, "close_succeeded": True,
+                    "acknowledged_ns": 6, "observation_error": None,
+                }],
+                "rotation_attempt_count": 1, "rotation_request_succeeded": True,
+                "lease_acquired_ns": 1, "stimulus_started_ns": 2,
+                "rotation_requested_ns": 3, "rotation_completed_ns": 5, "lease_until_ns": 4,
+                "rotation_append_index": 1, "rotation_append_started_ns": 2,
+                "rotation_append_completed_ns": 6, "rotation_completion_succeeded": True,
+                "rotation_completion_append_index": 1, "rotation_completion_append_started_ns": 2,
+                "rotation_completion_append_completed_ns": 6,
+            },
+            "lease_acquired_ns": 1, "stimulus_started_ns": 2, "lease_until_ns": 10,
+        },
+        "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
+                   "hold_ms_range": [10, 500], "seed": 1, "oplock": "not_requested",
+                   "launch_error": "none", "grabs": 1, "helper_exit": 0,
+                   "variants": {"oplock": {
+                       "mode": "oplock",
+                       "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE",
+                       "hold_ms_range": [10, 500], "seed": 1, "oplock": "unavailable",
+                       "launch_error": "none", "grabs": 1, "helper_exit": 0,
+                       "lease_request_id": "oplock-lease-1", "oplock_breaks": [
+                           {
+                               "event": "oplock_break", "request_id": "oplock-lease-1",
+                               "name": "raw.wal.ndjson", "lease_acquired_ns": 1, "lease_until_ns": 4,
+                               "break_notified_ns": 4, "break_completed": True,
+                               "ack_required": True, "ack_method": "close_handle",
+                               "close_started_ns": 5, "close_completed_ns": 6, "close_succeeded": True,
+                               "acknowledged_ns": 6, "observation_error": None,
+                           }
+                       ],
+                   }}},
+        "binary_integrity": {
+            "subjects": [{"path": "sw-core.exe", "exists_before": True, "exists_after": True,
+                          "sha256_before": "c" * 64, "sha256_after": "c" * 64, "unchanged": True}],
+            "unchanged": True, "launch_refused": False, "launch_error": "none",
+        },
         "verdict": "PASS",
         "fallback": "none",
     }
 
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(instance=sample_without_edr, schema=schema)
-
-    sample_with_edr = dict(
-        sample_without_edr,
-        edr={"product": "Defender", "status": "active", "interceptions": "unknown"},
+    jsonschema.validate(instance=base, schema=schema)  # edr 缺漏不再不合格
+    jsonschema.validate(
+        instance=dict(base, edr={"product": "unknown", "status": "unknown", "interceptions": "unknown"}),
+        schema=schema,
     )
-    jsonschema.validate(instance=sample_with_edr, schema=schema)
+    without_av = {k: v for k, v in base.items() if k != "av_sim"}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_av, schema=schema)
+    without_oplock_workload = json.loads(json.dumps(base))
+    without_oplock_workload["observations"].pop("oplock_variant")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_oplock_workload, schema=schema)
+    without_integrity = {k: v for k, v in base.items() if k != "binary_integrity"}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_integrity, schema=schema)
+    without_clock_method = json.loads(json.dumps(base))
+    without_clock_method["env"].pop("timing_method")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_clock_method, schema=schema)
+    coarse_clock = json.loads(json.dumps(base))
+    coarse_clock["env"]["timing_resolution_ns"] = 15_625_000
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=coarse_clock, schema=schema)
+    without_close_interval = json.loads(json.dumps(base))
+    without_close_interval["observations"]["oplock_variant"]["oplock_breaks"][0].pop("close_started_ns")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_close_interval, schema=schema)
+    for field in (
+        "append_count", "append_latency_ms", "archives", "records", "continuity_meta_count",
+        "first_seq", "last_seq", "seq_continuous", "rotate_retry", "deferred_delete_pending",
+        "write_failures", "pre_rotate", "post_rotate", "crc_errors", "interference_observed",
+        "lease_request_id", "oplock_breaks",
+        "archive_scan_elapsed_ms", "oracle_wait_elapsed_ms", "lease_acquired_ns",
+        "stimulus_started_ns", "rotation_requested_ns", "rotation_completed_ns", "lease_until_ns",
+        "rotation_attempt_count", "rotation_request_succeeded", "rotation_append_index",
+        "rotation_append_started_ns", "rotation_append_completed_ns", "rotation_completion_succeeded",
+        "rotation_completion_append_index", "rotation_completion_append_started_ns",
+        "rotation_completion_append_completed_ns",
+    ):
+        incomplete = json.loads(json.dumps(base))
+        incomplete["observations"]["oplock_variant"].pop(field)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=incomplete, schema=schema)
+    without_oplock_status = json.loads(json.dumps(base))
+    without_oplock_status["observations"].pop("oplock_variant_status")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_oplock_status, schema=schema)
+    without_main_lease = json.loads(json.dumps(base))
+    without_main_lease["observations"].pop("lease_acquired_ns")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=without_main_lease, schema=schema)
+    for field in (
+        "lease_acquired_ns", "stimulus_started_ns", "rotation_completed_ns", "lease_until_ns",
+    ):
+        without_live_lease = json.loads(json.dumps(base))
+        without_live_lease["observations"]["oplock_variant"].pop(field)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=without_live_lease, schema=schema)
+    for field in (
+        "event", "request_id", "name", "lease_acquired_ns", "lease_until_ns", "break_notified_ns",
+        "break_completed", "ack_required", "ack_method", "acknowledged_ns", "observation_error",
+    ):
+        without_break_evidence = json.loads(json.dumps(base))
+        without_break_evidence["observations"]["oplock_variant"]["oplock_breaks"][0].pop(field)
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=without_break_evidence, schema=schema)
 
 
 def test_kill_hook_ignored_on_non_isolated_instance(tmp_path, monkeypatch, caplog):

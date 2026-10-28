@@ -195,6 +195,43 @@ def evaluate_bridge_eligibility(report_path: pathlib.Path | str | None) -> tuple
         return "INSUFFICIENT_EVIDENCE", False
 
 
+def host_platform() -> str:
+    """step 的 `platforms` 比對用本機平台（windows／linux）；與 DUT 平台（target.platform）無關。"""
+    return "windows" if os.name == "nt" else "linux"
+
+
+def compute_gate_eligible(
+    *,
+    mode: str,
+    bridge_eligible: bool,
+    cases_frozen: bool,
+    settle_failure: str | None,
+    shutdown_failure: str | None,
+    compare_mode: str,
+    comparison_verdict: str | None,
+    assert_steps_passed: int,
+    not_applicable_steps: list[dict[str, Any]],
+    ok: bool,
+) -> bool:
+    """bridge 結果的 gate_eligible（計畫 03 §15.5／I10）。
+
+    共同條件：bridge 模式、自測資格、case 已凍結、settle 與 bridge 關閉皆無失敗、
+    且沒有任何 not_applicable 段（不適用於本平台的段一律不計 PASS，也不得計入資格）。
+    - compare 非 none：比較器 verdict 必須為 PASS（既有規則）。
+    - compare none（l15-wal-interference）：沒有比較器證據；資格改以「所有斷言步驟 PASS」定義：
+      ok（無 StepError）、至少一個 assert_* 步驟實際執行並通過。
+    """
+    if mode != "bridge" or not bridge_eligible or not cases_frozen:
+        return False
+    if settle_failure is not None or shutdown_failure is not None:
+        return False
+    if not_applicable_steps:
+        return False
+    if compare_mode == "none":
+        return bool(ok) and assert_steps_passed >= 1
+    return comparison_verdict == "PASS"
+
+
 def _scrub_sensitive(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     """遞迴移除原始 payload 欄位與遮罩報告內的機密字串。"""
     sensitive_names = {"payload_b64", "token", "secret", "password", "raw_payload"}
@@ -237,8 +274,13 @@ def build_summary_report(
     *,
     independent_cases: list[str] | None = None,
     started_at: str | None = None,
+    complete: bool = False,
 ) -> dict[str, Any]:
-    """將獨立案例數與各模式的執行統計分開計算。"""
+    """將獨立案例數與各模式的執行統計分開計算。
+
+    `complete` 僅在全部案例結束後的最後一次寫出時為 True；每案中途寫出的部分報告為 False，
+    stage1a_gate 對非 True 的報告判為證據不足（逾時或崩潰留下的部分報告不得與完整報告等同）。
+    """
     modes: dict[str, dict[str, int]] = {}
     for mode in ("pty", "bridge"):
         selected = [item for item in results if item.get("mode") == mode]
@@ -253,10 +295,25 @@ def build_summary_report(
     return {
         "schema_version": "func-test-report.v1",
         "started_at": started_at or datetime.now(timezone.utc).isoformat(),
+        "complete": bool(complete),
         "modes": modes,
         "independent_cases": len(set(case_ids)),
         "results": results,
     }
+
+
+# 未解析樣板的形式：裸 {var} 或 {var.field}（前面不得緊接 $），以及誤加 $ 前綴的點號形式 ${var.field}。
+# 不匹配 ${NAME}（NAME 為不含點號的識別字，如 DUT 端 ${HOME}、${A:-b}），那是字面字串、須原樣送出，不是樣板；
+# 點號不是合法 shell 識別字，因此 ${var.field} 必為 harness 樣板，仍須 fail-closed。
+_UNRESOLVED_TEMPLATE_RE = re.compile(r"(?<!\$)\{[a-zA-Z0-9_.]+\}|\$\{[a-zA-Z0-9_.]*\.[a-zA-Z0-9_.]*\}")
+# ${NAME}（不含點號）僅在 NAME 為本案例宣告的 save_as 名稱時仍視為未解析樣板（審查 sol 7：避免未就緒變數被靜默當字面字串送出）。
+_SHELL_BRACE_NAME_RE = re.compile(r"\$\{([a-zA-Z0-9_]+)\}")
+
+
+def _declared_save_as_names(tc: Any) -> frozenset[str]:
+    """案例宣告的全部 save_as 名稱（``_SHELL_BRACE_NAME_RE`` 命中時的樣板判定依據）。"""
+    steps = getattr(tc, "steps", None) or []
+    return frozenset(str(step["save_as"]) for step in steps if isinstance(step, dict) and step.get("save_as"))
 
 
 class TestRunner:
@@ -311,6 +368,12 @@ class TestRunner:
         self._bridge_shutdown_failure: str | None = None
         self._cases_yaml_digest: str | None = None
         self._cases_frozen = False
+        # S1X：step 的 `platforms` 不適用於本機時記為 not_applicable（不執行、不計 PASS、不計資格）。
+        self._not_applicable_steps: list[dict[str, Any]] = []
+        self._assert_steps_passed = 0
+        # harness 關閉失敗（證據完整性不明）與關閉階段的診斷；寫入該案結果，不改寫案例本身的判定訊息。
+        self._harness_stop_failure: str | None = None
+        self._harness_diagnostics: list[dict[str, Any]] = []
 
     def run(self) -> tuple[bool, str]:
         """執行測試，回傳 (通過, 訊息)。"""
@@ -413,7 +476,14 @@ class TestRunner:
                 self.correlation.close()
                 self.correlation = None
             if self.harness is not None:
-                self.harness.stop()
+                try:
+                    self.harness.stop()
+                except Exception as exc:
+                    # daemon 未確認結束、WAL 複本失敗等：證據完整性不明，於下方判為 INSUFFICIENT_EVIDENCE。
+                    self._harness_stop_failure = f"{type(exc).__name__}: {exc}"
+                self._harness_diagnostics.extend(
+                    dict(item) for item in (getattr(self.harness, "cleanup_diagnostics", None) or [])
+                )
                 stop_result = getattr(self.harness, "bridge_stop_result", None)
                 if self.mode == "bridge" and stop_result is not None:
                     if (
@@ -432,6 +502,14 @@ class TestRunner:
         # 量測動作（measure_rpc_latency／measure_event_latency）只寫入量測欄位、不帶 verdict；
         # 先取出，避免被當成「無 verdict 的 comparison」而判 INSUFFICIENT_EVIDENCE。
         measurements = self._take_measurements()
+
+        if self._harness_stop_failure is not None:
+            # 關閉失敗的案例不得 PASS／gate_eligible；原本已 FAIL 者保留其判定與訊息，失敗原因僅記入診斷。
+            self._harness_diagnostics.append({"kind": "harness_stop_failed", "error": self._harness_stop_failure})
+            if ok:
+                ok = False
+                message = f"INSUFFICIENT_EVIDENCE: harness 關閉失敗（證據完整性不明）：{self._harness_stop_failure}"
+
         if self.mode == "bridge" and ok:
             compare_mode = self.tc.bridge.get("compare", "none")
             if compare_mode != "none":
@@ -448,16 +526,26 @@ class TestRunner:
         elif self._settle_failure:
             ok = False
             message = self._settle_failure
+        elif ok and self._not_applicable_steps:
+            message = f"not_applicable 段不計 PASS（不適用於 {host_platform()}）：{[s['step'] for s in self._not_applicable_steps]}"
         verdict = self._final_verdict(ok=ok, message=message)
-        gate_eligible = (
-            self.mode == "bridge"
-            and self._bridge_eligible
-            and self._cases_frozen
-            and self._settle_failure is None
-            and self._bridge_shutdown_failure is None
-            and (self.comparison or {}).get("verdict") == "PASS"
+        eligibility_kwargs = dict(
+            mode=self.mode,
+            bridge_eligible=self._bridge_eligible,
+            cases_frozen=self._cases_frozen,
+            settle_failure=self._settle_failure,
+            shutdown_failure=self._bridge_shutdown_failure or self._harness_stop_failure,
+            compare_mode=str(self.tc.bridge.get("compare", "none")),
+            comparison_verdict=(self.comparison or {}).get("verdict"),
+            assert_steps_passed=self._assert_steps_passed,
+            ok=ok,
         )
-        self.last_result = self._result(verdict, message, gate_eligible=gate_eligible)
+        gate_eligible = compute_gate_eligible(not_applicable_steps=self._not_applicable_steps, **eligibility_kwargs)
+        # na_only_gap：其餘條件皆成立、唯一缺口是 not_applicable 段（gate 據此不把該列視為阻擋）。
+        na_only_gap = bool(self._not_applicable_steps) and compute_gate_eligible(
+            not_applicable_steps=[], **eligibility_kwargs
+        )
+        self.last_result = self._result(verdict, message, gate_eligible=gate_eligible, na_only_gap=na_only_gap)
         self._write_manifest(self._artifact_record(collect_artifacts(cli_argv, daemon_argv, ROOT_DIR)), self.comparison)
         return (verdict == "PASS" or verdict == "SKIP"), message
 
@@ -468,6 +556,9 @@ class TestRunner:
                 return "SKIP"
             if message.startswith("INSUFFICIENT_EVIDENCE:") or "INSUFFICIENT_EVIDENCE:" in message:
                 return "INSUFFICIENT_EVIDENCE"
+        if ok and self._not_applicable_steps:
+            # not_applicable 段（平台不適用）不得以 PASS 放行（plan 03 l15-wal-interference 段 (c)）。
+            return "INSUFFICIENT_EVIDENCE"
         if self.mode != "bridge":
             return "PASS" if ok else "FAIL"
         if not self._bridge_eligible or self._settle_failure or self._bridge_shutdown_failure:
@@ -537,7 +628,7 @@ class TestRunner:
                 return digest, False
         return digest, True
 
-    def _result(self, verdict: str, message: str, *, gate_eligible: bool = False) -> dict[str, Any]:
+    def _result(self, verdict: str, message: str, *, gate_eligible: bool = False, na_only_gap: bool = False) -> dict[str, Any]:
         comparison_verdict = self.comparison.get("verdict") if self.comparison else None
         return {
             "case_id": self.tc.name,
@@ -548,6 +639,11 @@ class TestRunner:
             "evidence_dir": str(self.run_dir),
             "comparison_verdict": comparison_verdict,
             "gate_eligible": gate_eligible,
+            # 結構化 not_applicable 段清單（平台不適用、未執行的段）；gate 以此判定缺口是否僅為平台不適用。
+            "not_applicable_steps": [dict(step) for step in self._not_applicable_steps],
+            "na_only_gap": bool(na_only_gap),
+            # 關閉階段的 harness 診斷（臨時目錄殘留、持有者逾時、關閉失敗）；僅供追查，不改變判定欄位以外的內容。
+            "harness_diagnostics": [dict(item) for item in self._harness_diagnostics],
         }
 
     def _new_correlation(self) -> CorrelationLog:
@@ -1032,6 +1128,18 @@ class TestRunner:
         action = step.get("action", "")
         self._log(f"步驟 {step_idx}: {action}")
 
+        applicable = step.get("platforms")
+        if applicable is not None:
+            if not isinstance(applicable, list):
+                raise StepError(f"步驟 {step_idx}: platforms 必須為清單")
+            names = [str(x) for x in applicable]
+            if host_platform() not in names:
+                self._not_applicable_steps.append({
+                    "step": step_idx, "action": str(action), "platforms": names, "host": host_platform(),
+                })
+                self._log(f"步驟 {step_idx}: {action} 不適用於 {host_platform()}（not_applicable，不計 PASS）")
+                return
+
         if action in BRIDGE_ONLY_ACTIONS:
             is_bridge = (self.mode == "bridge") or (self.harness is not None and getattr(self.harness, "bridge", None) is not None)
             if not is_bridge:
@@ -1098,6 +1206,8 @@ class TestRunner:
             )
         try:
             response = handler(step, step_idx)
+            if str(action).startswith("assert_"):
+                self._assert_steps_passed += 1
         except Exception as exc:
             if self.correlation is not None and not is_op_boundary:
                 self.correlation.op_end(
@@ -1126,8 +1236,42 @@ class TestRunner:
 
     # -- 變數展開 --
 
+    def _require_resolved(self, value: Any, idx: int, what: str) -> None:
+        """展開後仍殘留 {var.field} 樣板即 fail-closed。
+
+        原本未解析的樣板會被字面字串送進 CLI／wait，導致錯誤的 cmd_id 或 argv 被當成真實失敗，掩蓋變數未就緒的真因。
+        此處改為 StepError，並附上對應 save_as 變數的實際 CLI 回應，方便判讀。
+        DUT 端 shell 參數展開（如 ``${HOME}``）不視為樣板，見 ``_UNRESOLVED_TEMPLATE_RE``。
+        """
+        leftovers: list[str] = []
+        declared = _declared_save_as_names(getattr(self, "tc", None))
+
+        def _scan(item: Any) -> None:
+            if isinstance(item, str):
+                leftovers.extend(m.group(0) for m in _UNRESOLVED_TEMPLATE_RE.finditer(item))
+                leftovers.extend(m.group(0) for m in _SHELL_BRACE_NAME_RE.finditer(item) if m.group(1) in declared)
+            elif isinstance(item, list):
+                for entry in item:
+                    _scan(entry)
+            elif isinstance(item, dict):
+                for entry in item.values():
+                    _scan(entry)
+
+        _scan(value)
+        if not leftovers:
+            return
+        roots = sorted({token.lstrip("$").strip("{}").split(".")[0] for token in leftovers})
+        context = {root: self.variables.get(root) for root in roots}
+        raise StepError(
+            f"步驟 {idx}: {what} 含未解析的樣板 {leftovers}；對應變數的實際 CLI 回應：{context}"
+        )
+
     def _expand(self, value: Any) -> Any:
-        """展開 {var.field} 參照，支援 _plus_one_x 與 {N_x} 衍生變數。"""
+        """展開 {var.field} 參照，支援 _plus_one_x 與 {N_x} 衍生變數。
+
+        另支援一層巢狀參照 `{prefix{inner}suffix}`（例如 `{w_{repeat.index}.cmd_id}`）：先展開內層名稱，
+        再以結果組成外層名稱展開；內層未解析時整段維持原字面（交由 `_require_resolved` 擋下）。
+        """
         if isinstance(value, str):
             def _replace(m: re.Match[str]) -> str:
                 path = m.group(1)
@@ -1151,7 +1295,13 @@ class TestRunner:
                     else:
                         return m.group(0)
                 return str(current) if current is not None else m.group(0)
-            return re.sub(r"\{([a-zA-Z0-9_.]+)\}", _replace, value)
+            def _replace_nested(m: re.Match[str]) -> str:
+                inner = _replace(re.match(r"\{([a-zA-Z0-9_.]+)\}", m.group(2)))  # type: ignore[arg-type]
+                if inner == m.group(2) or not re.fullmatch(r"[a-zA-Z0-9_.]*", inner):
+                    return m.group(0)
+                return "{" + m.group(1) + inner + m.group(3) + "}"
+            value = re.sub(r"(?<!\$)\{([a-zA-Z0-9_.]*)(\{[a-zA-Z0-9_.]+\})([a-zA-Z0-9_.]*)\}", _replace_nested, value)
+            return re.sub(r"(?<!\$)\{([a-zA-Z0-9_.]+)\}", _replace, value)
         if isinstance(value, list):
             return [self._expand(v) for v in value]
         if isinstance(value, dict):
@@ -1278,7 +1428,11 @@ class TestRunner:
                         time.sleep(seconds)
                 except Exception:
                     pass
-            threading.Thread(target=_hold, daemon=True).start()
+            # 讀取 handle 於 sleep 結束後才釋放；登記於 harness，stop() 等待其結束後才回收臨時目錄（WinError 32）。
+            holder = threading.Thread(target=_hold, name=f"wal-hold-reader-step{idx}", daemon=True)
+            holder.start()
+            if self.harness is not None:
+                self.harness.register_handle_holder(holder)
             return {"ok": True}
         elif op == "reset":
             return self._cli(["wal", "reset"])
@@ -1445,7 +1599,7 @@ class TestRunner:
 
         peer_open = at_snap.get("peer_open")
         if peer_open is None:
-            raise StepError("cap_missing:peer_state: 端點不支援 peer_state 觀測（如 Windows）")
+            raise StepError("cap_missing:peer_state: 端點未提供 peer_state 觀測（例如 peer_gate 未啟用的 COM 端點）")
         if peer_open is True:
             raise StepError(f"assert_peer_closed: '{at_op}' op_end 快照 peer_open 為 True（端點未及時關閉）")
 
@@ -1898,13 +2052,16 @@ class TestRunner:
     def _step_cli(self, step: dict[str, Any], idx: int) -> dict[str, Any]:
         assert self.harness is not None
         argv = self._expand(step.get("argv", []))
+        self._require_resolved(argv, idx, "cli argv")
         timeout = step.get("timeout", 10.0)
         resp = self._cli(argv, timeout=timeout)
         self._log(f"CLI 回應: ok={resp.get('ok')}")
 
-        # 儲存變數
+        # 儲存變數（save_as 可含 `{repeat.index}` 等參照，逐次另存）
         save_as = step.get("save_as")
         if save_as:
+            save_as = str(self._expand(save_as))
+            self._require_resolved(save_as, idx, "cli save_as")
             self.variables[save_as] = resp
 
         # 檢查 expect
@@ -1918,6 +2075,7 @@ class TestRunner:
     def _step_wait_command_done(self, step: dict[str, Any], idx: int) -> None:
         assert self.harness is not None
         cmd_id = self._expand(step.get("cmd_id", ""))
+        self._require_resolved(cmd_id, idx, "wait_command_done cmd_id")
         timeout_s = step.get("timeout_s", 10.0)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -2137,12 +2295,22 @@ class TestRunner:
         self._log(f"Target 暫停回應 {duration_s}s")
 
     def _step_repeat(self, step: dict[str, Any], idx: int) -> None:
+        """重複執行子步驟；子步驟內可用 `{repeat.index}`（1 起算），迴圈結束後還原外層同名變數。"""
         count = step.get("count", 1)
         sub_steps = step.get("steps", [])
-        for iteration in range(count):
-            self._log(f"Repeat {iteration + 1}/{count}")
-            for si, sub in enumerate(sub_steps):
-                self._exec_step(sub, step_idx=idx * 1000 + iteration * 100 + si)
+        missing = object()
+        outer = self.variables.get("repeat", missing)
+        try:
+            for iteration in range(count):
+                self._log(f"Repeat {iteration + 1}/{count}")
+                self.variables["repeat"] = {"index": iteration + 1}
+                for si, sub in enumerate(sub_steps):
+                    self._exec_step(sub, step_idx=idx * 1000 + iteration * 100 + si)
+        finally:
+            if outer is missing:
+                self.variables.pop("repeat", None)
+            else:
+                self.variables["repeat"] = outer
 
     def _step_shell(self, step: dict[str, Any], idx: int) -> None:
         cmd = self._expand(step.get("cmd", ""))
@@ -2226,6 +2394,29 @@ class TestRunner:
 
 
 # -- 主程式 --
+
+def _write_summary_report(
+    report_dir: pathlib.Path,
+    results: list[dict[str, Any]],
+    *,
+    started_at: str,
+    independent_cases: list[str] | None = None,
+    secrets: list[str] | tuple[str, ...] = (),
+    complete: bool = False,
+) -> pathlib.Path:
+    """寫出 func-test-report.json（先寫暫存檔再原子取代，避免讀到半寫入的報告）。
+
+    `complete=False` 為中途寫出（部分報告）；僅最後一次寫出傳 True。
+    """
+    summary = build_summary_report(results, independent_cases=independent_cases, started_at=started_at, complete=complete)
+    summary = _scrub_sensitive(summary, tuple(secrets))
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "func-test-report.json"
+    tmp_path = report_dir / "func-test-report.json.tmp"
+    tmp_path.write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, report_path)
+    return report_path
+
 
 def main(argv: list[str] | None = None) -> int:
     started_at = datetime.now(timezone.utc).isoformat()
@@ -2327,7 +2518,14 @@ def main(argv: list[str] | None = None) -> int:
                     runner._write_manifest(None, None)
                     ok, msg = False, "SKIP: cap_missing:by_id_link"
                 else:
-                    ok, msg = runner.run()
+                    try:
+                        ok, msg = runner.run()
+                    except Exception as exc:
+                        # runner 自身的未預期例外：該案沒有完整證據，記為 INSUFFICIENT_EVIDENCE 並繼續其餘案例；
+                        # 不得讓單一案例中止整次執行（報告必須於每案結束後寫出）。
+                        msg = f"INSUFFICIENT_EVIDENCE: runner 例外（{type(exc).__name__}）：{exc}"
+                        runner.last_result = runner._result("INSUFFICIENT_EVIDENCE", msg)
+                        ok = False
                 if args.verbose:
                     print()
                 v = runner.last_result.get("verdict")
@@ -2340,16 +2538,17 @@ def main(argv: list[str] | None = None) -> int:
                 results.append(runner.last_result)
                 if runner._secrets:
                     report_secrets.extend(secret.decode("utf-8", errors="replace") for secret in runner._secrets)
+                # 每案結束即寫出（原子取代）：後續案例若中止，已完成案例的報告仍存在。
+                _write_summary_report(report_dir, results, started_at=started_at, secrets=report_secrets)
 
-    summary = build_summary_report(
+    report_path = _write_summary_report(
+        report_dir,
         results,
-        independent_cases=[tc.name for tc in test_cases],
         started_at=started_at,
+        independent_cases=[tc.name for tc in test_cases],
+        secrets=report_secrets,
+        complete=True,
     )
-    summary = _scrub_sensitive(summary, tuple(report_secrets))
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / "func-test-report.json"
-    report_path.write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     passed = sum(item.get("verdict") == "PASS" for item in results)
     skipped = sum(item.get("verdict") == "SKIP" for item in results)
     failed = len(results) - passed - skipped

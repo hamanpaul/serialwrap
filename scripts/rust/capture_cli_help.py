@@ -13,6 +13,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -116,37 +117,39 @@ def is_native(argv: list[str]) -> bool:
 
 
 def make_env(columns: int, platform: str) -> dict[str, str]:
-    if platform == "windows":
-        home = r"C:\golden\home"
-        config_dir = r"C:\golden\config"
-        state_dir = r"C:\golden\state"
-        run_dir = r"C:\golden\run"
-    else:
-        home = "/golden/home"
-        config_dir = "/golden/config"
-        state_dir = "/golden/state"
-        run_dir = "/golden/run"
-    env = {
-        "HOME": home,
+    # 兩平台同值，與 `tests/contract_blackbox/test_bb_cli_help.py::_env` 一致（計畫 Task 10 固定 env）。
+    # `profile test --help` 會把 SERIALWRAP_CONFIG_DIR 展開進輸出，Windows golden 必須以黑箱測試的同一組值產生，
+    # 否則輸出路徑不同而無法逐位元組比對。
+    return {
+        "HOME": "/golden/home",
         "COLUMNS": str(columns),
-        "SERIALWRAP_CONFIG_DIR": config_dir,
-        "SERIALWRAP_STATE_DIR": state_dir,
-        "SERIALWRAP_RUN_DIR": run_dir,
+        "SERIALWRAP_CONFIG_DIR": "/golden/config",
+        "SERIALWRAP_STATE_DIR": "/golden/state",
+        "SERIALWRAP_RUN_DIR": "/golden/run",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
     }
-    if platform == "linux":
-        env.update(LANG="C.UTF-8", LC_ALL="C.UTF-8")
-    return env
+
+
+def cli_command(argv: list[str], platform: str) -> list[str]:
+    # Windows 不能直接執行 `serialwrap.py`（CreateProcess 不吃 .py，`py` 啟動器可能改用 3.12.10），
+    # 改以本腳本的直譯器（已斷言為 CPython 3.12.3）執行；-B 避免在 repo 內寫入 __pycache__。
+    if platform == "windows":
+        return [sys.executable, "-B", str(CLI_EXE), *argv]
+    return [str(CLI_EXE), *argv]
 
 
 def run_one(argv: list[str], columns: int, platform: str) -> tuple[int, str, str]:
-    cmd = [str(CLI_EXE), *argv]
+    # 子行程 stdout 恆為 UTF-8（CLI 入口 force_utf8_stdio）；解碼必須明確指定 utf-8，
+    # 不可依父行程 locale（Windows 繁中為 cp950）。text 模式的換行轉換會把 CRLF 還原為 LF。
     res = subprocess.run(
-        cmd,
+        cli_command(argv, platform),
         cwd=REPO_ROOT,
         env=make_env(columns, platform),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     return res.returncode, res.stdout, res.stderr
@@ -308,6 +311,11 @@ def main() -> None:
         action="store_true",
         help="擷取 Stage 1B Rust-only golden（contracts/cli_help/rust_only/，P4-T1）",
     )
+    parser.add_argument(
+        "--git-revision",
+        help="寫入 _meta.json 的 40 碼 git revision；預設 `git rev-parse HEAD`。"
+        "Windows 端 git 無法讀取 WSL worktree 的 .git 指標時以此參數由 WSL 端指定",
+    )
     args = parser.parse_args()
     if args.rust_only:
         out_dir = Path(args.out) if args.out else REPO_ROOT / "contracts" / "cli_help" / "rust_only"
@@ -415,6 +423,10 @@ def main() -> None:
             "err_verbose_ambiguous",
             "err_session_list_extra",
             "err_event_reset_missing_mut",
+            # 平台 oracle 邊界值：`test_bb_cli_help.py::test_platform_oracle_exists_and_boundary_values_are_native`
+            # 強制讀取這兩筆並要求 native=True（全域選項值不可當作委派群組），缺少即失敗。
+            "boundary_socket_connect",
+            "boundary_endpoint_connect",
         }
         cases = [
             {"id": "help_root_col80", "argv": ["--help"], "columns": 80, "post_parse_effects": False},
@@ -464,16 +476,23 @@ def main() -> None:
         if not c["post_parse_effects"] and (parse_rc, parse_out, parse_err) != (rc, out, err):
             record.update(parse_rc=parse_rc, parse_stdout=parse_out, parse_stderr=parse_err)
         dest_file = out_dir / f"{c['id']}.json"
-        dest_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        # newline="\n"：Windows 上不得把 golden 寫成 CRLF，與 Linux golden 位元組一致（測試端自行換行）。
+        dest_file.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
 
+    if args.git_revision and not re.fullmatch(r"[0-9a-f]{40}", args.git_revision):
+        raise SystemExit(f"--git-revision 必須為 40 碼小寫 hex：{args.git_revision!r}")
     meta = {
         "python_version": "3.12.3",
-        "git_revision": git_rev(),
+        "git_revision": args.git_revision or git_rev(),
     }
-    # 寫入 _meta.json 到 contracts/cli_help/ 與 out_dir
+    # _meta.json：out_dir 內必寫；repo 根的共享 `contracts/cli_help/_meta.json` 只由 Linux 擷取更新。
+    # Windows 擷取不得改寫它（其 git_revision 與 Linux 基線不同），test_bb_cli_help／mkbundle 只讀其 python_version。
     meta_json = json.dumps(meta, ensure_ascii=False, indent=2) + "\n"
-    (REPO_ROOT / "contracts" / "cli_help" / "_meta.json").write_text(meta_json, encoding="utf-8")
-    (out_dir / "_meta.json").write_text(meta_json, encoding="utf-8")
+    # 只有寫入預設輸出目錄（contracts/cli_help/<platform>）時才更新共享的 repo 根 _meta.json；
+    # 以 --out 寫到其他目錄不得改寫受版控的 contracts/cli_help/_meta.json。
+    if platform == "linux" and out_dir.resolve() == default_out.resolve():
+        (REPO_ROOT / "contracts" / "cli_help" / "_meta.json").write_text(meta_json, encoding="utf-8", newline="\n")
+    (out_dir / "_meta.json").write_text(meta_json, encoding="utf-8", newline="\n")
     print(f"完成！已輸出至 {out_dir}")
 
 

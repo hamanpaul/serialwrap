@@ -175,7 +175,7 @@ BOOT_QUIET_WINDOW_S: float = 180.0
 """偵測到 boot banner（或 agent 送出 reboot 命令）後，system probe TX 的靜默秒數。
 
 實測 prpl 平台目標板完整開機約 150s，加裕度取 180s。RX 見到該 session 的 login/prompt
-（開機完成訊號）會提前解除；quiet window 擋 source=system 的自動 probe，
+或 profile 宣告的 ``boot_done_regex``（開機完成訊號）會提前解除；quiet window 擋 source=system 的自動 probe，
 不擋 human console bytes 與 interactive lease TX；agent 顯式命令自 #139 起僅在
 「quiet armed 且 session 尚未重新確認 READY」的過渡態被 ``AUTOBOOT_QUIET`` 拒絕
 （可重試），session 回 READY 即同步解除。"""

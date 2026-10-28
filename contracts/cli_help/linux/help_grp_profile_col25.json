@@ -5,7 +5,7 @@
   ],
   "columns": 25,
   "rc": 0,
-  "stdout": "usage: serialwrap profile\n       [-h]\n       <command> ...\n\n離線驗證 profile 的 prompt/l\nogin/password/bootloade\nr regex\n是否命中一段樣本文字（#174）。\n\npositional arguments:\n  <command>\n    test\n    對樣本文字逐一跑 prompt/log\n    in/password/bootloa\n    der regex，回報是否命中\n\noptions:\n  -h, --help\n    show this help\n    message and exit\n",
+  "stdout": "usage: serialwrap profile\n       [-h]\n       <command> ...\n\n離線驗證 profile 的 prompt/l\nogin/password/bootloade\nr regex\n是否命中一段樣本文字（#174）。\n\npositional arguments:\n  <command>\n    test\n    對樣本文字逐一跑 prompt/log\n    in/password/boot_do\n    ne/bootloader\n    regex，回報是否命中\n\noptions:\n  -h, --help\n    show this help\n    message and exit\n",
   "stderr": "",
   "native": true,
   "post_parse_effects": false
