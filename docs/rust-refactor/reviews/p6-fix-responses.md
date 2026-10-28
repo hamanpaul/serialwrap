@@ -326,3 +326,11 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 | O-L4 | Low | a6a6850 | `StopListener` try_send 滿載 | 已知偏差（同 R5-L5）：hub cmd 佇列滿時舊 port 至下一次 AdoptListener 前仍可連入；core 的 close 世代（本輪 S3）使此類晚到 accept 不會登記為 console |
 | O-L5 | Low | 159fc6d | 缺兩個反證測試 | fixed（同 O1／O2） |
 | O-L6 | Low | dc8a67a | 任一平台 passed 即通過 | deferred：條目 `platforms:` 欄位待 Task 12 Windows 報告一併設計（目前 Windows 只有 win_test 一個集合） |
+
+## 第三輪 Task 進度（2026-10-28 cloud session）
+
+| 項目 | 狀態 |
+|---|---|
+| Task 11 | slice22 黑箱：Python 38 passed／8 skipped、Rust（合併後 debug artifact）46 passed。`f4_interactive_line_cmd_defined` 仍 BLOCKED-OWNER（parity 判定，見上）；func-test 八案依 OD-34 改為七案（cowork-01 移 2.3）。func-test／L1.5 `l15-multi-source-contention-console` 本輪重跑結果見本輪回報 |
+| Task 12 | LOCAL-WINDOWS-TODO（WSAPoll mux、com0com Serial console、`windows_console_native.rs`、`win-blackbox.ps1 -Subset console`）；本輪只補 Linux 可寫的程序文件 `procedures/windows-serial-console.md` |
+| Task 13 | `slice22_evidence_map.yaml` 94 案填妥（AUTOMATED 32：contract-blackbox 的 .py／.rs nodeid 皆在 `s22_gate:*`，func-test／scenario 參照待 `--l15-results`；BLOCKED-OWNER 62：BO-S22-01～05 與繼承的 BO-S21-07／08／13／14／16）；`tests/test_acceptance_slice22.py` 7 案（計畫 `_fn_exists` 對 func-test 參照會讀不存在路徑，分流為驗 case／scenario YAML 存在）；`s22_gate:blackbox_rust/linux` 登記 46 nodeid（selector 依 Step 4：slice21＋slice22 兩目錄，只要求 slice22 的 nodeid，slice21 不退步由 P5 `s21_gate:blackbox_rust` 承接）。未做：`s22_gate:win_test/windows`（需 Windows 報告，LOCAL-WINDOWS-TODO）、對照表 `parity_rows`（23 列承接編號逐列驗證尚未完成，gate 依規則回 OWNER-DECISION-PENDING）、SC-28／29／31 `IMPLEMENTED`（依計畫須 Step 4 全通過含 win-test） |

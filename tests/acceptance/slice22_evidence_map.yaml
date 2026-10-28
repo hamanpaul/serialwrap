@@ -1,101 +1,416 @@
 # Slice 2.2 必要案例證據對照（P6 Task 0 建立骨架，07-slice22-console.md）。
-# 鍵集合＝Task 0 凍結的 cases.lock.json sets["slice_2.2"]（分母只能 add-only）；值由 Task 13 補 evidence。
+# 鍵集合＝Task 0 凍結的 cases.lock.json sets["slice_2.2"]（分母只能 add-only）；值由 Task 13 填寫（2026-10-28 第三輪）。
+# AUTOMATED：.py／.rs 參照須在 s22_gate:* 凍結集合內；func-test／scenario 參照由 s22_gate_check.py --l15-results 判定。
+# BLOCKED-OWNER：procedure 為擁有者證據手冊（slice22-owner-runbook.md BO-S22-NN；Slice 2.1 繼承者沿用 BO-S21-NN），不得標 PASS。
 # frozen_lock_sha1＝凍結當下 cases.lock.json 的 git blob sha1。
 # OD-34（擁有者裁決 2026-10-28）：cowork-01-agent-bad-cmd 逐名移至 Slice 2.3，自本對照表移除（breaker/slice_2.2.json amendments）。
 schema_version: 1
 frozen_lock_sha1: dc692da1787818230b0b119ff4d0f652b31554d4
 cases:
-  bc02-deferred-context-switch-clear: {status: PENDING}
-  bc02-deferred-overflow-clear: {status: PENDING}
-  bc02-mailbox-stale-input-not-replayed: {status: PENDING}
-  bc02-normal-replay-53: {status: PENDING}
-  co-01-line-buffering: {status: PENDING}
-  f1-cmdid-survives-timeout: {status: PENDING}
-  f1-limits-queryable: {status: PENDING}
-  f1-near-limit-no-logout: {status: PENDING}
-  f1-newline-rejected: {status: PENDING}
-  f1-too-long-rejected: {status: PENDING}
-  f12-version-reported-consistent: {status: PENDING}
-  f12-wal-path-live: {status: PENDING}
-  f2-history-bounded-rss: {status: PENDING}
-  f2-queue-full-backpressure: {status: PENDING}
-  f2-recovery-flushes-queue: {status: PENDING}
-  f2-rx-window-crossing-prompt: {status: PENDING}
-  f3-cmd-fail-observable: {status: PENDING}
-  f3-device-error-names-selector: {status: PENDING}
-  f3-fail-error-code: {status: PENDING}
-  f3-log-tail-latest: {status: PENDING}
-  f4-activity-classification: {status: PENDING}
-  f4-background-result-tail-consistent: {status: PENDING}
-  f4-interactive-line-cmd-defined: {status: PENDING}
-  f5-console-peer-gone-recycled: {status: PENDING}
-  f5-deferred-bytes-flushed: {status: PENDING}
-  f5-deferred-dropped-after-reboot: {status: PENDING}
-  f5-raw-ownership-survives-agent-rounds: {status: PENDING}
-  f5-second-console-linebuffer: {status: PENDING}
-  f6-ping-during-long-op: {status: PENDING}
-  f6-two-boards-no-starvation: {status: PENDING}
-  f8-second-daemon-detected: {status: PENDING}
-  f8-tty-holders-reported: {status: PENDING}
-  ha-01-human-then-agent: {status: PENDING}
-  ha-05-concurrent-submit: {status: PENDING}
-  hk-01-special-keys-raw: {status: PENDING}
-  hk-02-agent-preempt-human: {status: PENDING}
-  hk-03-deferred-input-flush: {status: PENDING}
-  hk-04-minicom-exit-cleanup: {status: PENDING}
-  l15-context-switch-deferred-input: {status: PENDING}
-  l15-delayed-reply: {status: PENDING}
-  l15-exclusive-open: {status: PENDING}
-  l15-half-prompt: {status: PENDING}
-  l15-multi-source-contention-cli: {status: PENDING}
-  l15-multi-source-contention-console: {status: PENDING}
-  l15-reboot-min-guard: {status: PENDING}
-  l15-reject-zero-tx: {status: PENDING}
-  l15-release-inflight: {status: PENDING}
-  l15-slow-reader-backpressure: {status: PENDING}
-  l15-stale-event-delay: {status: PENDING}
-  l15-transport-disconnect: {status: PENDING}
-  l15-wal-interference: {status: PENDING}
-  p0-blog-clean: {status: PENDING}
-  p0-clear-reattach: {status: PENDING}
-  p0-cmd-async: {status: PENDING}
-  p0-console-raw: {status: PENDING}
-  p0-doctor: {status: PENDING}
-  p0-multiopen: {status: PENDING}
-  p0-selftest: {status: PENDING}
-  p0-wal-live: {status: PENDING}
-  p1-cmd-modes: {status: PENDING}
-  p1-cmd-serial: {status: PENDING}
-  p1-con-busy: {status: PENDING}
-  p1-con-defer: {status: PENDING}
-  p1-con-fanout: {status: PENDING}
-  p1-con-liveness: {status: PENDING}
-  p1-con-orphan: {status: PENDING}
-  p1-con-second: {status: PENDING}
-  p1-con-softpreempt: {status: PENDING}
-  p1-hp-cycle: {status: PENDING}
-  p1-hp-reorder: {status: PENDING}
-  p1-rst-daemon: {status: PENDING}
-  p1-rst-recover: {status: PENDING}
-  p1-wal-fullrun: {status: PENDING}
-  p1-wal-reset: {status: PENDING}
-  rc-01-interactive-mode-switch: {status: PENDING}
-  sc13-lease-expiry-tick: {status: PENDING}
-  sc15-console-ring-drop-oldest: {status: PENDING}
-  sc16-console-line-reject-log: {status: PENDING}
-  sc28-console-backend-env: {status: PENDING}
-  sc29-com0com-serial-console: {status: PENDING}
-  sc31-console-stale-context-rust: {status: PENDING}
-  sm-01-attach-to-ready: {status: PENDING}
-  sm-04-device-unplug: {status: PENDING}
-  win-com-cancel-close: {status: PENDING}
-  win-com-open-exclusive: {status: PENDING}
-  win-com-txrx-bridge: {status: PENDING}
-  win-telnet-deferred: {status: PENDING}
-  win-telnet-linebuffer: {status: PENDING}
-  win-telnet-raw-owner: {status: PENDING}
-  win-telnet-suspend-resume: {status: PENDING}
-  win-wal-av-reader-handle: {status: PENDING}
-  win-wal-av-rotate: {status: PENDING}
-  win-wal-av-unlink: {status: PENDING}
-  win-wal-f12-progress: {status: PENDING}
+  bc02-deferred-context-switch-clear:
+    status: AUTOMATED
+    tests: ['tests/contract_blackbox/slice22/test_console_bc02.py::test_banner_during_suspend_drops_deferred', 'crates/sw-core/tests/session_core_console.rs::stale_epoch_input_dropped_and_diagnosed']
+  bc02-deferred-overflow-clear:
+    status: AUTOMATED
+    tests: ['crates/sw-core/tests/deferred_bc02.rs::overflow_deletes_whole_entry_then_new_bytes_kept']
+  bc02-mailbox-stale-input-not-replayed:
+    status: AUTOMATED
+    tests: ['crates/sw-core/tests/session_core_console.rs::stale_epoch_input_dropped_and_diagnosed']
+  bc02-normal-replay-53:
+    status: AUTOMATED
+    tests: ['tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke']
+  co-01-line-buffering:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c co-01-line-buffering]
+  f1-cmdid-survives-timeout:
+    blocked_item: BO-S21-07
+    evidence_schema: &id001 [testpilot 原始結果（regression-reports/tp-<ts>/）, 外層 envelope（§11.4）, case_verdicts.json]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f1-limits-queryable:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f1-near-limit-no-logout:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f1-newline-rejected:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f1-too-long-rejected:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f12-version-reported-consistent:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f12-wal-path-live:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f2-history-bounded-rss:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f2-queue-full-backpressure:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f2-recovery-flushes-queue:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f2-rx-window-crossing-prompt:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f3-cmd-fail-observable:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f3-device-error-names-selector:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f3-fail-error-code:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f3-log-tail-latest:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f4-activity-classification:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f4-background-result-tail-consistent:
+    blocked_item: BO-S21-07
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  f4-interactive-line-cmd-defined:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f5-console-peer-gone-recycled:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f5-deferred-bytes-flushed:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f5-deferred-dropped-after-reboot:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f5-raw-ownership-survives-agent-rounds:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f5-second-console-linebuffer:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f6-ping-during-long-op:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f6-two-boards-no-starvation:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f8-second-daemon-detected:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  f8-tty-holders-reported:
+    blocked_item: BO-S22-04
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  ha-01-human-then-agent:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c ha-01-human-then-agent]
+  ha-05-concurrent-submit:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c ha-05-concurrent-submit]
+  hk-01-special-keys-raw:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c hk-01-special-keys-raw]
+  hk-02-agent-preempt-human:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c hk-02-agent-preempt-human]
+  hk-03-deferred-input-flush:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c hk-03-deferred-input-flush]
+  hk-04-minicom-exit-cleanup:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c hk-04-minicom-exit-cleanup]
+  l15-context-switch-deferred-input:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-context-switch-deferred-input]
+  l15-delayed-reply:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-delayed-reply]
+  l15-exclusive-open:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-exclusive-open]
+  l15-half-prompt:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-half-prompt]
+  l15-multi-source-contention-cli:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-multi-source-contention-cli]
+  l15-multi-source-contention-console:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-multi-source-contention-console]
+  l15-reboot-min-guard:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-reboot-min-guard]
+  l15-reject-zero-tx:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-reject-zero-tx]
+  l15-release-inflight:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-release-inflight]
+  l15-slow-reader-backpressure:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-slow-reader-backpressure]
+  l15-stale-event-delay:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-stale-event-delay]
+  l15-transport-disconnect:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-transport-disconnect]
+  l15-wal-interference:
+    status: AUTOMATED
+    tests: [func-test/runner.py --mode bridge --scenarios --case l15-wal-interference]
+  p0-blog-clean:
+    blocked_item: BO-S22-05
+    evidence_schema: &id002 [engine_result, release_gate_result]
+    not_applicable_platforms: {windows: 驗的是 minicom capture 檔（`~/b-log/mini_COM0_*.log`），Windows Telnet frontend 無對應產物}
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-clear-reattach:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-cmd-async:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-console-raw:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-doctor:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-multiopen:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-selftest:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p0-wal-live:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-cmd-modes:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-cmd-serial:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-busy:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-defer:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-fanout:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-liveness:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-orphan:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-second:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-con-softpreempt:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-hp-cycle:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-hp-reorder:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-rst-daemon:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-rst-recover:
+    blocked_item: BO-S21-08
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-wal-fullrun:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  p1-wal-reset:
+    blocked_item: BO-S22-05
+    evidence_schema: *id002
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  rc-01-interactive-mode-switch:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c rc-01-interactive-mode-switch]
+  sc13-lease-expiry-tick:
+    status: AUTOMATED
+    tests: ['tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access', 'crates/sw-core/tests/session_core_lease.rs::open_state_matrix']
+  sc15-console-ring-drop-oldest:
+    status: AUTOMATED
+    tests: ['crates/sw-core/tests/out_ring.rs::drop_oldest_keeps_newest_within_cap']
+  sc16-console-line-reject-log:
+    status: AUTOMATED
+    tests: ['tests/contract_blackbox/slice22/test_console_pty.py::test_line_overflow_warning']
+  sc28-console-backend-env:
+    status: AUTOMATED
+    tests: ['tests/contract_blackbox/slice22/test_console_telnet.py::test_greeting_and_attach_shape']
+  sc29-com0com-serial-console:
+    blocked_item: BO-S22-02
+    evidence_schema: [console_conformance.json, serial-wal.json, control-lines.txt, env.json]
+    procedure: docs/rust-refactor/procedures/windows-serial-console.md
+    status: BLOCKED-OWNER
+  sc31-console-stale-context-rust:
+    status: AUTOMATED
+    tests: ['tests/contract_blackbox/slice22/test_console_bc02.py::test_input_during_recovery_not_replayed']
+  sm-01-attach-to-ready:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c sm-01-attach-to-ready]
+  sm-04-device-unplug:
+    status: AUTOMATED
+    tests: [func-test/runner.py -c sm-04-device-unplug]
+  win-com-cancel-close:
+    blocked_item: BO-S21-13
+    evidence_schema: [l1-results.json, junit.xml]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-com-open-exclusive:
+    blocked_item: BO-S21-13
+    evidence_schema: [l1-results.json, junit.xml]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-com-txrx-bridge:
+    blocked_item: BO-S21-13
+    evidence_schema: [l1-results.json, junit.xml]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-telnet-deferred:
+    blocked_item: BO-S22-01
+    evidence_schema: &id003 [target/win-blackbox/<run_id>/python/junit.xml, target/win-blackbox/<run_id>/rust/junit.xml, bridge.v1 紀錄, ab_summary.json]
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-telnet-linebuffer:
+    blocked_item: BO-S22-01
+    evidence_schema: *id003
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-telnet-raw-owner:
+    blocked_item: BO-S22-01
+    evidence_schema: *id003
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-telnet-suspend-resume:
+    blocked_item: BO-S22-01
+    evidence_schema: *id003
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-wal-av-reader-handle:
+    blocked_item: BO-S21-14
+    evidence_schema: [l1-results.json, junit.xml]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-wal-av-rotate:
+    blocked_item: BO-S21-14
+    evidence_schema: [l1-results.json, junit.xml]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-wal-av-unlink:
+    blocked_item: BO-S21-14
+    evidence_schema: [l1-results.json, junit.xml]
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER
+  win-wal-f12-progress:
+    blocked_item: BO-S21-16
+    evidence_schema: *id001
+    procedure: docs/rust-refactor/slice21-owner-runbook.md
+    status: BLOCKED-OWNER

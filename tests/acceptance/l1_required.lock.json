@@ -10930,6 +10930,70 @@
         }
       }
     },
+    "s22_gate:blackbox_rust": {
+      "linux": {
+        "nodeids": [
+          "tests/contract_blackbox/slice22/test_console_bc02.py::test_banner_during_suspend_drops_deferred",
+          "tests/contract_blackbox/slice22/test_console_bc02.py::test_input_during_recovery_not_replayed",
+          "tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_backspace_local_echo",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_deferred_bytes_flushed_after_agent_command",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_detach_releases_owner",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_detach_unknown_client",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_first_console_raw_second_line_buffered",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_human_line_interactive_mode_opens_lease",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_invalid_args_and_alias_selector",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_last_line_before_disconnect_submitted",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_line_overflow_warning",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_peer_gone_console_pruned",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_peer_loss_grace_then_teardown",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_raw_ownership_survives_agent_rounds",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_release_closes_consoles_before_reply",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_rx_fanned_out_to_all_consoles",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_second_console_blocked_while_human_lease",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_second_console_line_runs_after_owner_detached",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_session_list_has_no_console_endpoint",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_session_vtty_cached",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_unread_console_does_not_block",
+          "tests/contract_blackbox/slice22/test_console_pty.py::test_vtty_stable_across_recover",
+          "tests/contract_blackbox/slice22/test_console_telnet.py::test_disconnect_removes_console",
+          "tests/contract_blackbox/slice22/test_console_telnet.py::test_first_raw_second_line",
+          "tests/contract_blackbox/slice22/test_console_telnet.py::test_greeting_and_attach_shape",
+          "tests/contract_blackbox/slice22/test_console_telnet.py::test_iac_escape_outbound",
+          "tests/contract_blackbox/slice22/test_console_telnet.py::test_inbound_nvt_and_binary_refusal",
+          "tests/contract_blackbox/slice22/test_console_telnet.py::test_session_public_has_console_endpoint",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_attached_not_bootloader",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_attached_rescue_boot_interrupt",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_attached_rescue_login_required",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_attached_without_allow_rejected",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_expiry_tick_restores_without_access",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_lazy_expiry_parity",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_open_rejections_zero_tx",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_open_send_status_close_shapes",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_open_twice_busy",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_send_encodings",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_soft_preempt_restore_and_replay",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_stash_dropped_does_not_replay",
+          "tests/contract_blackbox/slice22/test_interactive_lease.py::test_status_touch_extends",
+          "tests/contract_blackbox/slice22/test_slice22_family_mirrors.py::test_f6_ping_during_long_op",
+          "tests/contract_blackbox/slice22/test_slice22_family_mirrors.py::test_f6_two_boards_no_starvation",
+          "tests/contract_blackbox/slice22/test_slice22_family_mirrors.py::test_f8_second_daemon_detected",
+          "tests/contract_blackbox/slice22/test_slice22_family_mirrors.py::test_f8_tty_holders_reported"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "tests/contract_blackbox/slice21",
+            "tests/contract_blackbox/slice22"
+          ],
+          "markexpr": "",
+          "paths": [
+            "tests/contract_blackbox/slice21",
+            "tests/contract_blackbox/slice22"
+          ]
+        }
+      }
+    },
     "s22_gate:cargo_workspace": {
       "linux": {
         "nodeids": [
