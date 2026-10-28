@@ -254,3 +254,50 @@ def test_driver_checks_clean_tree_at_start_and_records_head():
     text = _driver_text()
     assert "git status --porcelain" in text
     assert 'git rev-parse HEAD' in text
+
+
+# ── no_onefile_extract：報告新鮮度與 verdict（雲端審查 bf8583b#2）──────────────
+
+def _onefile_verdict_source() -> str:
+    m = re.search(r"^onefile_verdict\(\) \{\n  python3 - [^\n]*<<'PY'\n(.*?)\nPY\n\}", _driver_text(), re.S | re.M)
+    assert m, "找不到 onefile_verdict 的內嵌 python 區段"
+    return m.group(1)
+
+
+def _run_onefile_verdict(monkeypatch, path: Path) -> int:
+    monkeypatch.setattr(sys, "argv", ["onefile_verdict", str(path)])
+    rc = 0
+    try:
+        exec(compile(_onefile_verdict_source(), "<onefile_verdict>", "exec"), {"__name__": "__main__"})
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 1
+    return rc
+
+
+@pytest.mark.parametrize("report,expected", [
+    ({"verdict": "PASS", "tmp_isolation": "mount-ns-private-tmp"}, 0),
+    ({"verdict": "FAIL", "tmp_isolation": "mount-ns-private-tmp"}, 1),
+    ({"verdict": "INSUFFICIENT", "tmp_isolation": None}, 1),
+    ({"verdict": "PASS", "tmp_isolation": None}, 1),
+    ({"verdict": "PASS"}, 1),
+])
+def test_onefile_verdict_requires_pass_and_private_tmp(monkeypatch, tmp_path, report, expected):
+    path = tmp_path / "no-onefile-extract.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    assert _run_onefile_verdict(monkeypatch, path) == expected
+
+
+def test_onefile_verdict_unreadable_report_is_failure(monkeypatch, tmp_path):
+    path = tmp_path / "no-onefile-extract.json"
+    path.write_text("{not json", encoding="utf-8")
+    assert _run_onefile_verdict(monkeypatch, path) != 0
+    assert _run_onefile_verdict(monkeypatch, tmp_path / "missing.json") != 0
+
+
+def test_no_onefile_extract_step_checks_freshness_and_verdict():
+    text = _joined()
+    step = _step_index(text, "step no_onefile_extract ")
+    fresh = _step_index(text, 'fresh_or_fail no_onefile_extract "$EV/no-onefile-extract.json"')
+    verdict = _step_index(text, 'echo "verdict_no_onefile_extract 1" >> "$EV/rc.txt"')
+    assert step < fresh < verdict
+    assert 'onefile_verdict "$EV/no-onefile-extract.json"' in text

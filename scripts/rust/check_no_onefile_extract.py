@@ -582,13 +582,17 @@ def _insufficient_report(cli_argv: list[str], runs: int, cli_args: list[str], re
 
 
 def _under_tmp(path: Path) -> bool:
-    return _within(path.resolve(), Path("/tmp").resolve())
+    """path 是否位於 /tmp 下：不跟隨 symlink 的字面路徑與 resolve 後路徑，任一在 /tmp 下即是（namespace 內兩者皆看不到）。"""
+    literal = Path(os.path.abspath(path))
+    return (_within(literal, Path("/tmp")) or _within(literal, Path("/tmp").resolve())
+            or _within(path.resolve(), Path("/tmp").resolve()))
 
 
 def _private_tmp_outer(args: argparse.Namespace, cli_argv: list[str], cli_args: list[str]) -> dict[str, Any]:
     """外層：建立私有目錄與 user+mount namespace，於其中重新執行本工具並取回報告。"""
     script = Path(__file__).resolve()
-    for word in [str(script), *cli_argv]:
+    # 內層以 sys.executable 執行本工具；直譯器、本工具與受測 CLI 的任何絕對路徑字詞都必須在 namespace 內可見。
+    for word in [sys.executable, os.path.abspath(__file__), str(script), *cli_argv]:
         if word.startswith("/") and _under_tmp(Path(word)):
             raise ValueError(f"--private-tmp：{word} 位於 /tmp 下，namespace 內看不到")
     if not sys.platform.startswith("linux"):

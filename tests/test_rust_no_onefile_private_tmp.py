@@ -153,6 +153,39 @@ def test_private_tmp_rejects_cli_under_tmp(tmp_path):
     assert res.returncode == 2, res.stdout + res.stderr
 
 
+@pytest.fixture()
+def under_tmp():
+    d = Path(tempfile.mkdtemp(prefix="test-onefile-undertmp-", dir="/tmp"))
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_private_tmp_rejects_cli_symlink_under_tmp(outside_tmp, under_tmp):
+    """`--cli` 為 /tmp 下指向外部的 symlink：resolve 後在 /tmp 外，但 namespace 內看不到該 symlink → exit 2（bf8583b#1）。"""
+    fake = outside_tmp / "fake_cli.py"
+    fake.write_text("print('ok')\n", encoding="utf-8")
+    link = under_tmp / "fake_cli.py"
+    link.symlink_to(fake)
+    res = subprocess.run([sys.executable, str(SCRIPT), "--cli", f"{sys.executable} {link}", "--runs", "1",
+                          "--private-tmp", "--private-tmp-base", str(outside_tmp)],
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert str(link) in res.stderr, res.stderr
+
+
+def test_private_tmp_rejects_interpreter_under_tmp(outside_tmp, under_tmp):
+    """本工具以 /tmp 下的直譯器（symlink／venv）執行時，內層 `sys.executable` 在 namespace 內看不到 → exit 2（bf8583b#1）。"""
+    fake = outside_tmp / "fake_cli.py"
+    fake.write_text("print('ok')\n", encoding="utf-8")
+    py = under_tmp / "python3"
+    py.symlink_to(Path(sys.executable).resolve())
+    res = subprocess.run([str(py), str(SCRIPT), "--cli", f"{Path(sys.executable).resolve()} {fake}", "--runs", "1",
+                          "--private-tmp", "--private-tmp-base", str(outside_tmp)],
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert str(py) in res.stderr, res.stderr
+
+
 @needs_ns
 def test_private_tmp_passes_dash_prefixed_cli_args_to_inner(outside_tmp):
     """預設 `--cli-args --version` 形式（值以 - 開頭）須原樣傳進 namespace 內層，CLI 收到該參數。"""

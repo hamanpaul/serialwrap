@@ -56,6 +56,24 @@ fresh_or_fail() {
   return 1
 }
 
+# onefile_verdict <json>：no_onefile_extract 工具只要寫出報告即 exit 0，判定只在報告內；
+# 須 verdict PASS 且 tmp_isolation 為 mount-ns-private-tmp（雲端審查 bf8583b#2）。不可讀或欄位不符 → 非 0。
+onefile_verdict() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        report = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+ok = isinstance(report, dict) and report.get("verdict") == "PASS" \
+    and report.get("tmp_isolation") == "mount-ns-private-tmp"
+sys.exit(0 if ok else 1)
+PY
+}
+
 # printed_path <步驟名> <ERE>：取出工具輸出中符合的最後一個路徑（即工具自己報告的 run_id 路徑）。
 printed_path() {
   grep -oE "$2" "$EV/$1.log" 2>/dev/null | tail -n 1
@@ -342,6 +360,9 @@ main() {
   # S1X Y5（CHG-S1X-ONEFILE-PRIVATE-TMP-01）：共用 /tmp 有他人事件而恆判 INSUFFICIENT；改於私有 mount namespace 內以獨占 /tmp 執行。
   step no_onefile_extract python3 scripts/rust/check_no_onefile_extract.py --cli "$SW_BUNDLE/bin/serialwrap" --runs 100 \
     --private-tmp --json-out "$EV/no-onefile-extract.json"
+  if fresh_or_fail no_onefile_extract "$EV/no-onefile-extract.json"; then
+    onefile_verdict "$EV/no-onefile-extract.json" || echo "verdict_no_onefile_extract 1" >> "$EV/rc.txt"
+  fi
   BENCH_BASE="$(mktemp -d "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/s1x-bench.XXXXXX")" || BENCH_BASE=""
   if [[ -n "$BENCH_BASE" ]]; then
     bench_linux "$BENCH_BASE"
