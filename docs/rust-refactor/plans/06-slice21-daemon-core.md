@@ -3225,6 +3225,9 @@ impl OpRunner { pub fn spawn(ctx: OpCtx) -> OpRunner; pub fn run(&self, grant: O
 pub struct OpCtx { pub com: String, pub sid: String, pub profile: SessionProfile, pub rx: Arc<RxShared>, pub tx: TxWriterHandle,
                    pub wal: Arc<WalWriter>, pub clock: Arc<dyn Clock>, pub control: crossbeam_channel::Sender<ControlEvent>, pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync> }
 pub fn extract_command_stdout(raw: &str, command: &str, prompt_regex: &PyRegex, completion: Option<&PyRegex>) -> String;  // 05 §5.2
+// 併入 main #237（CHG-S1X-MAIN-SYNC-01）：line mode 回顯剝除除逐行 ends_with 外，須承接 `_strip_wrapped_command_echo`
+// （命令回顯被終端折行拆成多行時：開頭至多 len(command)/20+2 行去空白後接回、須以完整命令結尾且起點落在第一行內才剝除）；
+// 回歸以 tests/test_wrapped_echo_strip.py 的 BusyBox `\r\r\n` 與 bash `" \r"` 樣本為 oracle。
 pub fn encode_interactive_payload(data: &str, encoding: &str) -> Result<Vec<u8>, PyErr>;
 
 // lease.rs

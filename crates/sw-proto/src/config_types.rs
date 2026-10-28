@@ -56,6 +56,8 @@ pub struct ProfileTemplate {
     pub log_dir: Option<String>,
     pub uart: UartProfile,
     pub bootloader_prompts: Vec<String>,
+    /// 開機完成訊號（#234，`config.py` 的 `boot_done_regex`）：`str(v or "").strip()`；空字串＝不設。
+    pub boot_done_regex: String,
     pub max_console_line_chars: Option<PyInt>,
 }
 
@@ -478,6 +480,12 @@ fn template_from_map(
         _ => Vec::new(),
     };
 
+    // config.py `_template_from_dict`：`str(raw.get("boot_done_regex") or "").strip()`
+    let boot_done_regex = match raw.get_str("boot_done_regex").filter(|v| py_truthy_of(v)) {
+        Some(v) => py_strip(&py_str_of(v)).to_string(),
+        None => String::new(),
+    };
+
     Ok(ProfileTemplate {
         profile_name: name.to_string(),
         platform,
@@ -498,6 +506,7 @@ fn template_from_map(
         log_dir,
         uart,
         bootloader_prompts,
+        boot_done_regex,
         max_console_line_chars,
     })
 }
@@ -674,6 +683,11 @@ fn merge_session(
 
     let uart = load_uart(target.get_str("uart"), Some(&template.uart));
     let bootloader_prompts = template.bootloader_prompts.clone();
+    // config.py `_merge_session`：`str(target.get("boot_done_regex") or template.boot_done_regex).strip()`
+    let boot_done_regex = match target.get_str("boot_done_regex").filter(|v| py_truthy_of(v)) {
+        Some(v) => py_strip(&py_str_of(v)).to_string(),
+        None => py_strip(&template.boot_done_regex).to_string(),
+    };
 
     let merged_template = ProfileTemplate {
         profile_name: template.profile_name.clone(),
@@ -695,6 +709,7 @@ fn merge_session(
         log_dir,
         uart,
         bootloader_prompts,
+        boot_done_regex,
         max_console_line_chars,
     };
 
