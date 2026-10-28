@@ -93,8 +93,32 @@ serialwrap 另提供原生 MCU flash 端點（與上面 device handoff 互補）
 - **TIMEOUT 錯誤帶診斷欄位**：`daemon_reachable`（1s `health.ping` 探測）分辨「daemon 死亡／斷線」（false → 檢查 daemon／裝置）與「daemon 忙碌」（true → 操作多半仍在跑，稍候以 `session list`／`self-test` 確認結果）；可達時另附 `daemon_busy`（in-flight `commands`／`sessions` 計數）。
 - **`--retries N` 僅作用唯讀方法**：只有冪等唯讀白名單（`session list`、`health.*`、`device list` 等查詢類）會在 TIMEOUT／連線失敗／`EMPTY_RESPONSE` 時指數退避重試（0.5s 起 ×2、單次上限 5s）；寫入類（attach／recover／submit…）絕不自動重送。白名單呼叫最壞總耗時約 `(retries+1) × timeout_s + 退避總和`。
 
+## `cmd submit` 的期限語意（非 human 來源；reboot 類命令另有流程）
+`--cmd-timeout`（預設 10s）是命令在 broker 內**等多久**，與上節全域 `--timeout`（CLI 等 RPC 的秒數）無關。`line` 與 `background` 共用同一段等待邏輯，`--mode background` **不會**讓命令脫離這些期限（它只是讓輸出可用 `result-tail` 增量取回）。
+- **總期限＝`max(--cmd-timeout, --expected-duration)`**。到點還等不到 prompt（或 `--completion-regex`）就進恢復流程——**命令一直有輸出也一樣**。
+- **靜默上限＝`min(--cmd-timeout, 30s)`**：以此為窗長，一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。命令回顯本身算 RX，所以完全靜默的命令約在最後一次輸出後 1～2 個窗長觸發。
+- **`--expected-duration <秒>` 只延長總期限，靜默上限不變**；它不會暫停 prompt timeout。只對持續有輸出的命令有用；會靜默的命令（如 `sleep 60`）光加它沒用，仍在 1～2 個窗長內被打斷（預設 `--cmd-timeout 10` 即 10～20s）。持續輸出的長命令：`--cmd-timeout 30 --expected-duration 300`。
+- **逾時恢復**：依序送 Ctrl-C，在 `min(--cmd-timeout, 2s)` 內比對 profile 的 `prompt_regex`；比不到再送 Ctrl-D，同樣等 `min(--cmd-timeout, 2s)`。任一次比到 prompt 回 `ok: true`、`error_code: PROMPT_TIMEOUT_RECOVERED`、`partial: true`、`recovery_action: CTRL_C|CTRL_D`；都比不到 session 轉 `ATTACHED`，回 `ok: false`、`error_code: PROMPT_TIMEOUT`。開機靜默窗（下節）內不送這兩個 byte。
+- **Ctrl-C 會中斷前景程式；Ctrl-D 落在已登入 shell 的空提示符上＝EOF＝登出**，console 變回 login 畫面、session 要重新登入——所以別讓會靜默的命令走到恢復流程。
+- **建議做法**：長時間或會靜默的命令，不要靠 `--cmd-timeout`／`--expected-duration` 硬撐；在板上丟背景（新 session 不吃 Ctrl-C、輸出不灌 console），再用短命令輪詢：
+  ```bash
+  serialwrap cmd submit --selector COM0 --source agent:diag \
+    --cmd "setsid sh -c 'long_cmd >/tmp/job.log 2>&1; echo \$? >/tmp/job.rc' </dev/null >/dev/null 2>&1 &"
+  serialwrap cmd submit --selector COM0 --source agent:diag --cmd 'cat /tmp/job.rc; tail -n 20 /tmp/job.log'
+  ```
+
+### `--completion-regex`（console 持續吐 log、等不到 prompt 時）
+`cmd submit --completion-regex <regex>`（限 `line`／`background`）把「等什麼」從 profile 的 `prompt_regex` 換成呼叫端自訂的完成標記。完整契約見 `docs/command-completion.md`，要點：
+- 標記由命令自己印出：**數字 RC 行加獨立 END 行**，兩者**行首錨定**，例如命令尾巴 `rc=$?; printf "__RUN_RC__=%s\n__RUN_END__\n" "$rc"` 配 `--completion-regex '(?m)^__RUN_RC__=[0-9]+\r*\n__RUN_END__\r*$'`（`\r*` 容忍板端 ONLCR 多出的 CR）。命令回顯含字面標記、但沒有數字 RC，才不會被誤當完成。
+- **標記每次換 nonce**。regex 只比對本命令送出後的新 RX，不接受 buffer 內歷史標記。
+- 限制：最多 1024 UTF-8 bytes、可編譯、**不匹配空串**；否則回 `INVALID_COMPLETION_REGEX`，零 TX、不排隊。
+- **只換掉「等什麼」**：總期限、靜默上限、逾時恢復與 partial 語意都不變（Ctrl-C／Ctrl-D 之後仍用 profile 的 `prompt_regex` 判斷）；`reboot` 類命令仍優先走既有 recovery，此參數不生效。
+- 非 partial 完成只代表 broker 等到標記，不代表命令成功；呼叫端要自己驗 RC 數值與唯一 payload。
+
 ## U-Boot autoboot 保護（boot quiet window，#130）
-- 對 DUT 下 `reboot` 後 session 停在 `RECOVERING`／`ATTACHED`、且 `session list` 的 `boot_quiet_remaining_s` 有值：**這是正常的 autoboot 保護**，daemon 正在靜默等 DUT 開機（避免自動 probe 打斷 U-Boot autoboot 倒數把板子卡在 `=> `）。**等它自己回 `READY`**（RX 見 login/prompt 即解除、最長 180s），勿反覆下 `session recover`——反覆下也一樣會被 gate 擋下（見下一點），不會提早成功，只會浪費時間。
+- 對 DUT 下 `reboot` 後 session 停在 `RECOVERING`／`ATTACHED`、且 `session list` 的 `boot_quiet_remaining_s` 有值：**這是正常的 autoboot 保護**，daemon 正在靜默等 DUT 開機（避免自動 probe 打斷 U-Boot autoboot 倒數把板子卡在 `=> `）。**等它自己回 `READY`**（RX 命中 profile 的 `login_regex`、`prompt_regex`、`boot_done_regex` 任一即解除，三者都不中才等滿 180s），勿反覆下 `session recover`——反覆下也一樣會被 gate 擋下（見下方「保護 gate」一點），不會提早成功，只會浪費時間。
+- **`boot_done_regex`（profile 選配欄位，開機完成訊號）**：與 `login_regex`／`prompt_regex` 同列判定，命中即解除 quiet window，不參與登入流程；空字串＝不設。例外：RX 尾行（最後一個非空行）命中該 profile 的 `bootloader_prompts`（如 `=> `）時**不**解除，板子仍視為卡在 bootloader。prplOS 開機停在 askconsole（`Please press Enter to activate this console`），它既不匹配 `login_regex` 也不匹配 `prompt_regex`，要靠 `boot_done_regex` 才不必等滿 180s；出貨的 `prpl-template` 已設。解除 quiet 後仍要經 READY 再確認才放行 agent 命令（見下方「過渡態拒絕」一點）。
+  - **舊安裝要手動補**：`serialwrap setup` 不覆寫既有的 `~/.config/serialwrap/profiles/*.yaml`（只有 `setup --force` 會覆蓋，連本機改動一併蓋掉；systemd-system 模式則由 setup 以 sudo 把出貨 profile 複製進 `/etc/serialwrap/profiles`，同名檔會被蓋掉），升級後舊 profile 沒有這個欄位，askconsole 的板子照舊等滿 180s。補法：在對應 template（或 target）加 `boot_done_regex: "Please press Enter to activate this console"`，再 `serialwrap service restart` 讓 daemon 重讀；可先用 `serialwrap profile test --profile <template> --sample <console log>` 離線確認命中（不連 daemon、不碰 UART）。
 - 保護 gate 所有自動 probe/按鍵，**含手動觸發的 RPC**：`session attach`、`session recover`（兩者共用同一個 probe 入口）、`session self-test`（回報 `classification: "AUTOBOOT_QUIET"`）、命令逾時後的強制恢復按鍵，在 quiet window 內都會誠實回報「還在等」而不會送 bytes 進 UART。只有 human console bytes 與 interactive lease TX 永遠不受影響——刻意要進 bootloader（先送 reboot 再於 lease 連打按鍵）仍可行。
 - **agent 顯式命令的過渡態拒絕（#139；#162 解除改綁 READY 再確認）**：`cmd submit`／`file push`／`file pull` 僅在「quiet 已 arm 且 session 尚未重新確認 `READY`」的過渡態（疑似板卡自發重開機、state 名義上停 `READY`）拿到**可重試的 `error_code: AUTOBOOT_QUIET`**（submit-time 即回、附 `retry_after_s`；或 queue race 時 `cmd status` 終態帶同碼）——命令未送 UART、零副作用，**等 daemon 重新確認 `READY` 後重送即可**，勿當永久失敗、勿反覆 recover。#162 起 quiet 視窗過期**不等於**放行：gate 由 daemon 的確認 probe（nonce）解除，過渡態可看 `session list` 的 `ready_reconfirm_pending`（pending-only 拒絕的 `retry_after_s` 固定 `5.0`，如實照等即可）。**但重試是有上限的**：再確認逾 300s／5 次仍不成功時，同樣三個命令改回**不可重試**的 `error_code: READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action: "self_test"`，`session list` 的 `ready_reconfirm_failed` 為 `true`）。收到此碼請**停止重試迴圈**，改跑 `session self-test` 取分類——若板子卡在 bootloader 會回 `classification: "BOOTLOADER"` ＋ `recommended_action: "recover_interactive"`（session 的 `last_error` 為 `BOOTLOADER_STUCK`），再以 `interactive-open --allow-attached` 打 `boot` 脫困。刻意進 bootloader 的正路是 `interactive-open --allow-attached`（#114，不受 gate），不要用 `cmd submit --mode interactive`（quiet 內同樣會被拒）。
 - 若板子已卡在 bootloader prompt（`=> `／`U-Boot> `）：prpl-template 有 `bootloader_prompts`，用 `serialwrap session interactive-open --selector COM0 --allow-attached` 開 recovery lease 打 `boot` 脫困。
@@ -213,7 +237,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - 禁止 Agent 直接寫 `/dev/ttyUSB*` 或 `/dev/ttyACM*`。
 - 禁止繞過 broker 自行開多個 serial writer。
 - 外部工具需要獨佔 raw device 時，用 `device release` / `device attach` 正式交接（或走 `/dev/ttyMCU` 燒錄端點），**不要**直接 kill daemon 或用 placeholder bind 繞過。
-- 長流命令（`logread -f`、`tcpdump`、kernel debug）一律用 `--mode background` 或設足夠長的 `--cmd-timeout`，避免阻塞共享通道。
+- 長流命令（`logread -f`、`tcpdump`、kernel debug）：`--mode background` 不會讓命令脫離 `--cmd-timeout` 期限，到點（或靜默超過上限）一樣被 Ctrl-C 結束，期間也佔住該 session 的命令佇列。限時抓取可用 `--mode background` 並把 `--cmd-timeout` 設成想抓的時長；要長時間或可能靜默的，改在板上丟背景（見「`cmd submit` 的期限語意」）。
 - 每筆自動化命令必填 `--source`，不可省略，確保追蹤性。
 - 卡住時先 `serialwrap session self-test`，再決定是否 `serialwrap session recover`（可加 `--force`）。recover 成功恢復 prompt 時回 `ok: true`（附 `error_code: PROMPT_TIMEOUT_RECOVERED`, `partial: true`），表示 session 可繼續使用。
 - session 於命令排隊期間發生 recovery/re-attach（掉出 `READY`）時，尚未啟動的排隊命令會被終結為 `status=error`、`error_code=FLUSHED_BY_RECOVERY`（#128）——代表該命令**未執行**，等 session 回 `READY` 後重送即可；執行中的命令不受影響，仍以真實結果收尾。所有 detach 類路徑（含 clear/release/熱拔/re-attach）皆用 `FLUSHED_BY_RECOVERY`；daemon shutdown 則用 `FLUSHED_BY_SHUTDOWN`，語意相同＝命令未執行、可於 `READY` 後重送。
@@ -223,7 +247,7 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 - **單行盡量短**：每條命令控制在 2 KB 以內；UTF-8 位元組 > 4 KB 會 warning、> 16 KB 會被 reject（`CMD_TOO_LONG`）。命令不得含 `\n` 換行字元，否則回 `CMD_CONTAINS_NEWLINE`。broker 不截斷；但 broker 上限與 target 端 tty line buffer（常見 4096 bytes）的物理單行限制是兩回事，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 的 `limits` 欄位執行期查詢，不需硬編碼。
 - **避免 base64 inline**：不要將整個檔案 base64 編碼塞進 `cmd submit`。小檔（數十 KB 內）改用 `serialwrap file push`；firmware image 這類大檔在 DUT 有網路通道時一律走 SCP／TFTP，不要交給 `file push`（界線見「透過 UART 推送／拉取檔案」）。
 - **長命令拆分**：管線命令過長時，先寫成 script 檔再 `source` 或 `sh /tmp/script.sh`。
-- **長命令 keepalive**：長時間命令加 `--expected-duration <秒>`，broker 在此期間暫停 prompt timeout 並監控 RX 活動延長等待，避免誤判 PROMPT_TIMEOUT。
+- **長命令**：`--expected-duration <秒>` 只延長總期限、不延長靜默上限（見「`cmd submit` 的期限語意」）；會靜默的長命令在板上 `setsid … &` 丟背景再用短命令輪詢，不要靠它硬撐。
 - **line vs background**：`line` 命令直接看 `cmd status`，不要用 `cmd result-tail`（那是給 `background` capture 用的）。
 
 ## 最小可用範例
@@ -243,6 +267,7 @@ serialwrap mcu status
 
 ## 參考檔案
 - `README.md`
+- `docs/command-completion.md`（`--completion-regex` 每命令完成條件）
 - `openspec/specs/session-command-readiness/spec.md`（#51）
 - `openspec/specs/session-interactive/spec.md`（#53）
 - `openspec/specs/device-handoff/spec.md`（#54）

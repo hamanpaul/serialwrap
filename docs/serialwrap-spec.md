@@ -323,11 +323,11 @@ session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unre
 
 ### 6.5 長命令 keepalive hint
 
-`command.submit` 支援選填的 `expected_duration_s` 參數，用於提示 broker 該命令預期的執行時間。機制包含：
+`command.submit` 支援選填的 `expected_duration_s` 參數，用於延長長命令的**總期限**。機制（`SessionManager._execute_command_inner`，`line` 與 `background` 共用）：
 
-1. **Foreground busy 保護**：前景命令執行期間，prompt timeout 暫停，避免誤判為 session 失聯。
-2. **Expected duration hint**：在 `expected_duration_s` 期間內不觸發 prompt 超時警告。
-3. **Output-based keepalive**：監控 UART RX 活動，若有任何輸出（如測試進度、編譯訊息），自動重置靜默計時器，延長等待。
+1. **總期限**：`max(timeout_s, expected_duration_s)`。到點仍未等到 prompt（或 `completion_regex`）即進 `_recover_after_failure`；命令持續有輸出也一樣。
+2. **靜默上限**：`min(timeout_s, 30s)`，**不受 `expected_duration_s` 影響**。以此為窗長，單一等待窗內 RX 完全沒有增加即視為靜默，不再等待、同樣進恢復流程（命令回顯亦算 RX，故完全靜默的命令約在最後一次輸出後 1～2 個窗長觸發）。
+3. **Foreground busy 觀測**：前景命令執行期間 `foreground_busy` 為 true，`fg_cmd_expected_duration_s` 記錄提示值（`session list` 可見）；`expected_duration_s` 本身只影響第 1 點的總期限。
 
 範例：
 
@@ -337,12 +337,12 @@ session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unre
   "cmd":"python3 -m unittest discover -s tests -v",
   "source":"agent:ci",
   "mode":"line",
-  "timeout_s":300,
-  "expected_duration_s":120
+  "timeout_s":30,
+  "expected_duration_s":300
 }}
 ```
 
-適用場景：`apt upgrade`、`make`、`python -m unittest`、`opkg install` 等長時間但有間歇輸出的命令。
+適用場景：`make`、`python -m unittest` 等長時間**且持續有輸出**的命令。會靜默的長命令不適用——改在板上 `setsid sh -c '…' </dev/null >/dev/null 2>&1 &` 丟背景，再以短命令輪詢。
 
 詳見設計文件：[`docs/design-heartbeat-keepalive.md`](./design-heartbeat-keepalive.md)。
 
@@ -867,7 +867,7 @@ targets:
 - background capture 建立前的 `result-tail` 回傳 `from_seq=0, last_seq=0` sentinel
 - prompt timeout 後 `result-tail` 仍可查 terminal status / error_code 與已緩衝 chunk
 - `_recover_after_failure` 成功恢復 prompt 時回 `ok: true`（含 `PROMPT_TIMEOUT_RECOVERED`）
-- `expected_duration_s` 可延長前景命令 keepalive 等待
+- `expected_duration_s` 可延長前景命令總期限（靜默上限 `min(timeout_s, 30s)` 不變）
 - interactive lease 可建立、送 key、關閉
 - 多 console attach 可同時收到 RX
 - human input 在 line-buffer 模式下經 broker 排隊；raw interactive 模式直接透傳 UART

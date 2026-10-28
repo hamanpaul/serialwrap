@@ -1900,15 +1900,15 @@ reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-co
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
-**長命令 keepalive**：對於 `apt upgrade`、`make`、`python -m unittest` 等長時間命令，可加 `--expected-duration` 提示 broker 延長等待：
+**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
 ```bash
 serialwrap cmd submit --selector COM0 --mode line --source agent:ci \
   --cmd "python3 -m unittest discover -s tests -v" \
-  --timeout 300 --expected-duration 120
+  --cmd-timeout 30 --expected-duration 300
 ```
 
-broker 會在命令執行期間監控 UART RX 活動，有輸出時自動延長等待。詳見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
+會靜默的長命令（如 `sleep 60`）請在板上用 `setsid sh -c '…' </dev/null >/dev/null 2>&1 &` 丟背景，再以短命令輪詢結果；`--mode background` 與 `line` 共用同一段期限邏輯，不是長命令的出口。歷史設計記錄見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
 
 ### 2. `background`
 
