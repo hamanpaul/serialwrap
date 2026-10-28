@@ -261,7 +261,7 @@ def acceptance_rate(lock: dict, results: list[dict], *, set_name: str) -> float 
 def evaluate(freeze: dict, snapshots: list[dict], *, today: str, stage2_estimate_weeks: float) -> dict
 #   snapshots：[{"date","rate","results_sha256"}]（每週一筆，check-in 至 tests/acceptance/breaker/slice_2.4.snapshots.ndjson）
 #   回 {"tripped": bool, "reason": str|None, "window_delta_pp": float, "od02_resubmit": bool}
-#   tripped：觀測窗口內任一連續三週 rate 累計增加 < 10 個百分點；od02_resubmit：stage2_started_at 至今已耗週數＋剩餘預估 > 24
+#   tripped：自切片開始時凍結的三週觀測窗口內，rate 累計增加 < 10 個百分點；od02_resubmit：stage2_started_at 至今已耗週數＋剩餘預估 > 24
 def main(argv=None) -> int      # tripped 或 od02_resubmit → exit 1，stderr 指示「停止擴大部署、退守 Stage 1 artifact、提請擁有者審查／重提 OD-02」
 ```
 
