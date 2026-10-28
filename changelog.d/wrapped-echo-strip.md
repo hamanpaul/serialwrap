@@ -3,4 +3,4 @@ type: fix
 scope: command-output
 ---
 
-修正長命令的回顯被終端折行拆成多行時殘留在 line mode `stdout` 的問題。serial console 的 shell 回顯打到第 80 欄會折行（BusyBox ash 插入 `\r\r\n`、bash readline 補 `" \r"`），過去 `_extract_command_stdout` 只逐行比對 `endswith(command)`，折行後每一行都只有命令的一部分，整段回顯留在輸出開頭。現在單行比對沒剝到時，把開頭幾行接回、去空白後與完整命令比對再剝；命令字樣必須從第一行開始（容許前面殘留 prompt），單行回顯已剝掉時不再重複比對。實測目標板（BusyBox 1.36.1）上 87–123 字元的命令過去 stdout 首行是被折行的回顯，修正後為實際輸出；短命令行為不變。
+修正長命令回顯被終端折行拆成多行時殘留在 line mode `stdout` 的問題，同時保留命令中的有效空白。只有原始串流帶 BusyBox ash 的 `\r\r\n` 折行標記時才跨行接合；bash readline 的單行 `" \r"` 插入空白則由呼叫端只在辨識到該控制字元後處理。一般 stdout（例如 `cat file` 輸出 `catfile`，或普通換行輸出 `echo x `／`y`）不會因去除空白或跨行拼接而被誤刪。新增兩種反例回歸，既有 BusyBox／readline 折行測試仍通過。

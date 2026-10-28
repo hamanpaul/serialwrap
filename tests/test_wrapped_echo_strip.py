@@ -48,6 +48,16 @@ class TestWrappedEchoStrip(unittest.TestCase):
         raw = "cut -d. -f1 /proc/uptime\r\n65\r\n" + PROMPT
         self.assertEqual(_extract(raw, "cut -d. -f1 /proc/uptime"), "65")
 
+    def test_single_line_output_matching_command_without_spaces_is_kept(self) -> None:
+        """無回顯時，輸出即使省略命令空白後與命令相同，也不是折行回顯。"""
+        raw = "catfile\r\n" + PROMPT
+        self.assertEqual(_extract(raw, "cat file"), "catfile")
+
+    def test_normal_newline_output_is_not_treated_as_terminal_wrap(self) -> None:
+        """只有 BusyBox 的雙 CR 折行標記可授權跨行拼接，普通 stdout 換行須保留。"""
+        raw = "echo x \r\ny\r\n" + PROMPT
+        self.assertEqual(_extract(raw, "echo x y"), "echo x \ny")
+
     def test_no_echo_keeps_output(self) -> None:
         raw = "line1\r\nline2\r\n" + PROMPT
         self.assertEqual(_extract(raw, CMD96), "line1\nline2")

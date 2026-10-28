@@ -247,30 +247,25 @@ def passthrough_file_transfer_error(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_WHITESPACE_RE = re.compile(r"\s+")
-
-
 def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
-    """移除被終端折行拆開的命令回顯；``lines`` 已經 ``clean_text`` 並切行。
+    """移除含 BusyBox 雙 CR 折行標記的命令回顯；``lines`` 已經 ``clean_text`` 並切行。
 
     shell 回顯打到終端寬度（serial console 常見 80 欄）時會在回顯中插入換行
-    （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）或補一個空白（bash readline
-    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡把開頭幾行
-    接回去、去掉空白後比較：命令必須從第一行開始（容許第一行前面殘留 prompt），
-    且接回的內容以完整命令結尾，才把這幾行視為回顯。
+    （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）。只接合不同輸出行，
+    行內空白保持原樣，避免把未回顯的有效 stdout（如 ``cat file`` 輸出 ``catfile``）
+    誤認為命令。bash readline 的單行 ``" \\r"`` 插入空白由呼叫端以原始控制字元
+    單獨辨識。
     """
-    target = _WHITESPACE_RE.sub("", command)
-    if not target or not lines:
+    if not command or len(lines) < 2:
         return lines
-    first_len = len(_WHITESPACE_RE.sub("", lines[0]))
     joined = ""
     # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
     for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
-        joined += _WHITESPACE_RE.sub("", line)
-        if joined.endswith(target):
-            if len(joined) - len(target) < first_len:
+        joined += line
+        if joined.endswith(command):
+            prefix = joined[:-len(command)]
+            if len(prefix) < len(lines[0]):
                 return lines[n:]
-            return lines
     return lines
 
 
@@ -5755,7 +5750,33 @@ class SessionManager:
                 lines = lines[1:]
                 stripped = True
             if not stripped:
-                lines = _strip_wrapped_command_echo(lines, command_stripped)
+                original_lines = lines
+                # 只把原始串流中 BusyBox 的雙 CR＋LF 視為折行證據；一般 stdout 換行不可拼接。
+                if "\r\r\n" in text:
+                    lines = _strip_wrapped_command_echo(lines, command_stripped)
+                # bash readline 會在長回顯折行處寫入「空白＋CR」再接續同一行。
+                # 只在移除這個明確控制字元後，首行確實以完整命令結尾時才剝除；
+                # 一般單行 stdout 不因忽略空白而取得回顯資格。
+                if lines is original_lines and " \r" in text:
+                    candidate_text = text.replace(" \r", "", 1)
+                    candidate_cleaned = clean_text(candidate_text)
+                    candidate_prompt_start = self._last_prompt_start(candidate_cleaned, prompt_regex)
+                    candidate_completion = (
+                        re.search(completion_regex, candidate_text) if completion_regex is not None else None
+                    )
+                    candidate_completion_end = (
+                        len(clean_text(candidate_text[:candidate_completion.end()]))
+                        if candidate_completion is not None else None
+                    )
+                    if candidate_prompt_start is not None and (
+                        completion_regex is None
+                        or (candidate_completion_end is not None
+                            and candidate_prompt_start >= candidate_completion_end)
+                    ):
+                        candidate_cleaned = candidate_cleaned[:candidate_prompt_start]
+                    candidate_lines = candidate_cleaned.lstrip("\n").splitlines()
+                    if candidate_lines and candidate_lines[0].strip().endswith(command_stripped):
+                        lines = candidate_lines[1:]
         return "\n".join(lines).strip("\n")
 
     def _open_interactive_locked(
