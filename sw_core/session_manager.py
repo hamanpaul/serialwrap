@@ -19,6 +19,7 @@ from .alias_registry import AliasRegistry
 from .auth import AuthResolution, resolve_session_auth
 from .config import ProfileTemplate, SessionProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+from .expect_reboot import expect_reboot_rejection
 from .constants import (
     BG_CAPTURE_MAX_BYTES,
     BG_CAPTURE_MAX_COUNT,
@@ -190,6 +191,37 @@ def _is_reboot_command(command: str) -> bool:
     if base != "shutdown":
         return False
     return any(token == "-r" or token == "--reboot" or token.startswith("-r") for token in tokens[1:])
+
+
+_CHAIN_OPERATORS = frozenset({"&&", "||", ";", "&"})
+
+
+def find_chained_reboot_segment(command: str) -> str | None:
+    """沒帶 ``--expect-reboot`` 時，找出 ``&&``／``||``／``;``／``&`` 之後的 reboot 區段。
+
+    **只用來產生提示，不影響執行**：``_is_reboot_command`` 的判定範圍維持不變。第一段
+    本身就是 reboot（已走 reboot 路徑）時回 None；切詞失敗（引號不成對）也回 None。
+    每一段交給 ``_is_reboot_command`` 判斷，故認得的形式與它完全相同。
+    """
+    if _is_reboot_command(command):
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.commenters = ""  # 與 shlex.split 一致：不把 # 當註解
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in _CHAIN_OPERATORS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    for segment in segments[1:]:
+        text = " ".join(segment)
+        if segment and _is_reboot_command(text):
+            return text
+    return None
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -3575,6 +3607,7 @@ class SessionManager:
         cmd_id: str,
         timeout_s: float,
         execution_mode: str,
+        prompt_wait_s: float | None = None,
     ) -> dict[str, Any]:
         prompt_regex = session.profile.prompt_regex
         pre_offset = bridge.rx_snapshot_len()
@@ -3589,7 +3622,15 @@ class SessionManager:
             bridge.clear_rx_buffer()
         self._mark_session_tx(session)
         bridge.send_command(command, source=source, cmd_id=cmd_id)
-        if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
+        # 單獨一條 reboot 的 prompt 若會回來，毫秒內就回來，2s 足夠；``--expect-reboot`` 的
+        # 串接命令（``A && reboot``）則要先跑完 A 才會輪到 reboot，prompt 回來的時點由呼叫端
+        # 的 ``--cmd-timeout``（可再加 ``--expected-duration``）界定，由呼叫端傳入 prompt_wait_s。
+        # 若仍用 2s：A 跑超過 2s 就誤入下方 recovery 分支，prompt 隨後回來（非同步 reboot）
+        # 會被 recovery 迴圈當成開機完成、ensure_ready 打到仍活著的 shell 而過早 confirm_ready，
+        # 正是 #162 要避免的 stale-READY；改成與單獨 reboot 同一條「prompt 回顯不是 READY 實證」路徑。
+        if bridge.wait_for_regex_from(
+            prompt_regex, pre_offset, min(timeout_s, 2.0) if prompt_wait_s is None else prompt_wait_s
+        ):
             # #139（belt-and-suspenders）：2s 內 prompt 回來，RX 解除檢查
             # （_update_boot_quiet_locked）通常已清 quiet，但 prompt 被 RX chunk 切割
             # miss 時，若不補清，READY session 會白白被 TX 靜默擋到 180s 過期。
@@ -3668,10 +3709,14 @@ class SessionManager:
         mode: str = "line",
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        expect_reboot: bool = False,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
+        rejection = expect_reboot_rejection(expect_reboot, normalized_mode)
+        if rejection is not None:
+            return rejection
         suspend_human_interactive = False
         post = _PostCloseAction()
         busy_result: dict[str, Any] | None = None
@@ -3732,6 +3777,7 @@ class SessionManager:
                 prompt_regex=prompt_regex,
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
+                expect_reboot=expect_reboot is True,
             )
         finally:
             try:
@@ -3753,6 +3799,7 @@ class SessionManager:
         prompt_regex: str,
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
+        expect_reboot: bool = False,
     ) -> dict[str, Any]:
         if normalized_mode == "interactive":
             with self._lock:
@@ -3778,7 +3825,18 @@ class SessionManager:
                     capture = self._background.get(bg_cmd_id)
                     if capture is not None:
                         capture.status = "done"
-        if _is_reboot_command(command):
+        guessed_reboot = _is_reboot_command(command)
+        if expect_reboot or guessed_reboot:
+            prompt_wait_s: float | None = None
+            if expect_reboot:
+                # 明示 reboot：不管命令文字一律走 reboot 路徑（含 ``A && reboot`` 這類
+                # ``_is_reboot_command`` 猜不到的串接）；WAL 留 META 供稽核「為何走 reboot 路徑」。
+                self._wal.append(
+                    com=session.profile.com, direction="META", source="system", cmd_id=cmd_id,
+                    payload=b"", meta={"event": "command_expect_reboot", "expect_reboot": True},
+                )
+                if not guessed_reboot:
+                    prompt_wait_s = max(timeout_s, expected_duration_s or 0.0)
             return self._handle_reboot_command(
                 session,
                 bridge,
@@ -3787,6 +3845,7 @@ class SessionManager:
                 cmd_id=cmd_id,
                 timeout_s=timeout_s,
                 execution_mode=normalized_mode,
+                prompt_wait_s=prompt_wait_s,
             )
         pre_offset = bridge.rx_snapshot_len()
         if completion_regex is not None:

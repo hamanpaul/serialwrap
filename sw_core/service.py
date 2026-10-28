@@ -19,6 +19,7 @@ from .arbiter import (
 )
 from .config import ProfileTemplate, SessionProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+from .expect_reboot import add_submit_warning, chained_reboot_warning, expect_reboot_rejection
 from .constants import (
     CONFIG_DIR,
     DEVICE_BY_ID_DIR,
@@ -41,7 +42,7 @@ from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
-from .session_manager import SessionManager
+from .session_manager import SessionManager, find_chained_reboot_segment
 from .util import now_iso
 from .version import resolve_version
 from .wal import WalWriter, rows_to_text_lines
@@ -304,10 +305,12 @@ class SerialwrapService:
         for line in buf.feed(data):
             self._engine.feed_line(com, line, wal_seq)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None) -> dict[str, Any]:
+    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None, expect_reboot: bool = False) -> dict[str, Any]:
         options: dict[str, Any] = {"timeout_s": timeout_s, "mode": mode, "expected_duration_s": expected_duration_s}
         if completion_regex is not None:
             options["completion_regex"] = completion_regex
+        if expect_reboot:
+            options["expect_reboot"] = True
         return self._sessions.execute_command(session_id, command, source, cmd_id, **options)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
@@ -892,10 +895,14 @@ class SerialwrapService:
             completion_regex = params.get("completion_regex")
             if not valid_completion_regex(completion_regex):
                 return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
+            expect_reboot = params.get("expect_reboot")
             selector = str(params.get("selector") or params.get("com") or params.get("alias") or "")
             cmd = str(params.get("cmd") or params.get("command") or "")
             source = str(params.get("source") or "agent")
             mode = str(params.get("mode") or "line")
+            rejection = expect_reboot_rejection(expect_reboot, {"fg": "line", "bg": "background"}.get(mode, mode))
+            if rejection is not None:
+                return rejection
             timeout_s = float(params.get("timeout_s") or 10.0)
             priority = int(params.get("priority") or 10)
             raw_ed = params.get("expected_duration_s")
@@ -906,7 +913,7 @@ class SerialwrapService:
             if err is not None:
                 return err
             assert session_id is not None
-            return self._arbiter.submit(
+            result = self._arbiter.submit(
                 session_id=session_id,
                 command=cmd,
                 source=source,
@@ -915,7 +922,14 @@ class SerialwrapService:
                 priority=priority,
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
+                expect_reboot=expect_reboot is True,
             )
+            if result.get("ok") and expect_reboot is not True and mode != "interactive":
+                # 非致命提示：沒帶 --expect-reboot 的串接 reboot 不會走 reboot 路徑。僅提示、不改變執行。
+                segment = find_chained_reboot_segment(cmd)
+                if segment is not None:
+                    add_submit_warning(result, chained_reboot_warning(segment))
+            return result
 
         if method == "command.get":
             cmd_id = str(params.get("cmd_id") or "")
