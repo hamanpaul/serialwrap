@@ -13,7 +13,8 @@ RUN apt-get update \
        bash ca-certificates dbus-user-session jq login minicom pipx python3 python3-venv python3-yaml systemd systemd-sysv util-linux \
     && if getent passwd 1000 >/dev/null; then userdel -r "$(getent passwd 1000 | cut -d: -f1)"; fi \
     && useradd --create-home --uid 1000 --shell /bin/bash --groups dialout swtest \
-    && install -d -o swtest -g swtest /home/swtest/.config /home/swtest/.config/systemd /home/swtest/.config/systemd/user \
+    && h="$(getent passwd swtest | cut -d: -f6)" \
+    && install -d -o swtest -g swtest "$h/.config" "$h/.config/systemd" "$h/.config/systemd/user" \
     && install -d /var/lib/systemd/linger \
     && touch /var/lib/systemd/linger/swtest \
     && apt-get clean \

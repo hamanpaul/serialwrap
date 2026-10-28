@@ -43,10 +43,10 @@ def _proc(root: Path, pid: int, argv: list[str], ppid: int = 1) -> None:
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 @pytest.mark.parametrize("argv", [
-    ["/home/swtest/.local/share/pipx/venvs/serialwrap/bin/python", "/home/swtest/.local/bin/serialwrapd"],
-    ["/home/swtest/.local/share/serialwrap/versions/0.4.0/py/bin/python3", "-I", "-B",
-     "/home/swtest/.local/share/serialwrap/versions/0.4.0/py/serialwrapd.py"],
-    ["/home/swtest/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd"],
+    ["/opt/u/.local/share/pipx/venvs/serialwrap/bin/python", "/opt/u/.local/bin/serialwrapd"],
+    ["/opt/u/.local/share/serialwrap/versions/0.4.0/py/bin/python3", "-I", "-B",
+     "/opt/u/.local/share/serialwrap/versions/0.4.0/py/serialwrapd.py"],
+    ["/opt/u/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd"],
     ["python3", "-m", "sw_core.daemon", "--socket", "/run/x.sock"],
 ])
 def test_daemon_argv_recognized(argv):
@@ -57,8 +57,8 @@ def test_daemon_argv_recognized(argv):
 @pytest.mark.memory_only
 @pytest.mark.parametrize("argv", [
     ["bash", "-lc", "serialwrap daemon stop; ls ~/.local/bin/serialwrapd"],
-    ["runuser", "-u", "swtest", "--", "/home/swtest/.local/bin/serialwrapd"],
-    ["/home/swtest/.local/bin/serialwrap", "daemon", "start"],
+    ["runuser", "-u", "swtest", "--", "/opt/u/.local/bin/serialwrapd"],
+    ["/opt/u/.local/bin/serialwrap", "daemon", "start"],
     ["python3", "/opt/sw-driver/run_upgrade_container.py", "--mode", "serialwrapd"],
     ["grep", "serialwrapd"],
     [],
@@ -75,7 +75,7 @@ def test_scan_counts_launcher_child_as_one_instance(tmp_path):
     _proc(tmp_path, 11, ["/v/0.4.0/py/bin/python3", "-I", "-B", "/v/0.4.0/py/serialwrapd.py"], ppid=10)
     _proc(tmp_path, 12, ["bash", "-lc", "echo serialwrapd"])
     assert uc.scan_daemon_instances(tmp_path) == [10]
-    _proc(tmp_path, 20, ["/pipx/bin/python", "/home/u/.local/bin/serialwrapd"])
+    _proc(tmp_path, 20, ["/pipx/bin/python", "/opt/u/.local/bin/serialwrapd"])
     assert uc.scan_daemon_instances(tmp_path) == [10, 20]
 
 

@@ -39,8 +39,6 @@ ENTRY_NAMES = ("serialwrap", "serialwrapd")
 RUNUSER = shutil.which("runuser") or "/usr/sbin/runuser"
 
 BENCH_PROFILE = """\
-defaults:
-  log_dir: /home/swtest/b-log
 profiles:
   shellboard:
     platform: shell
