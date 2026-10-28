@@ -1,0 +1,24 @@
+**********************
+PowerShell 文字記錄開始
+開始時間: 20261028071157
+使用者名稱: 9900X\haman
+RunAs 使用者: 9900X\haman
+設定名稱: 
+機器: 9900X(Microsoft Windows NT 10.0.26300.0)
+主應用程式: C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.9.0_x64__8wekyb3d8bbwe\pwsh.dll
+處理序識別碼: 30800
+PSVersion: 7.6.9
+PSEdition: Core
+GitCommitId: 7.6.9
+OS: Microsoft Windows 10.0.26300
+Platform: Win32NT
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1, 6.0, 7.0
+PSRemotingProtocolVersion: 2.4
+SerializationVersion: 1.1.0.1
+WSManStackVersion: 3.0
+**********************
+
+**********************
+PowerShell 文字記錄結束
+結束時間: 20261028071201
+**********************

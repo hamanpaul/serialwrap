@@ -8,6 +8,26 @@
 
 根因（測試程式缺陷）：子行程重入參數缺 `--ignored`，子 libtest 把 #[ignore] 測試直接略過並以 0 結束，父行程 2 s 後才對已結束的行程送事件；產品程式碼未被這支測試驗到。另查證 Win32 行為：`CREATE_NEW_PROCESS_GROUP` 會代子行程隱式呼叫 `SetConsoleCtrlHandler(NULL, TRUE)`（停用 Ctrl+C 並由子孫繼承），即使補上 `--ignored`，送往子 process group 的 `CTRL_C_EVENT` 也不會被孫行程收到。修正與 oracle 變更登記見 `owner-decisions-addenda.md` 的 `CHG-S1X-OD29-CTRLC-REENTRY-01`。首跑原始檔（`ctrl_c-result.json`、`ctrl_c-transcript.txt`、舊 exe）已保存於 `~/b-log/rust-refactor/od29/ctrl_c-owner-run1-fail/`（`SHA256SUMS` 列完整 sha256）。
 
+## 第 2 次執行結果（2026-10-28，PASS，已實證）
+
+擁有者於 2026-10-28 07:12（台北；`finished_utc` `2026-10-27T23:12:01.7150514Z`，Windows Terminal PowerShell 7.6.9，host `9900X`）以下表 exe（sha256 `3607686f1390e88f15fc00c5e86ff19b85987f9e7d64c208552f2665f18efd76`，與 `d0b8ad7` 建置一致）執行：`exit_code=0`，**PASS**。
+
+- Ctrl+C 圈：子 pid 4488 ready（`interactive=true ctrl_c_reenabled=true`）→ `GenerateConsoleCtrlEvent(0, 4488) ok=true` → `code=c000013a`。
+- Ctrl+Break 圈：子 pid 39248 ready → `GenerateConsoleCtrlEvent(1, 39248) ok=true` → `code=c000013a`（依下方「判定範圍」只證明行程樹會被終止）。
+- `ctrl_c-parent.txt` 最後一列 `PASS`；transcript 未收錄原生 exe 輸出（PowerShell transcript 不擷取原生程式的 console 輸出），以父／子診斷檔取證。
+
+原始檔逐字複製於 repo `evidence/stage1/owner/od29-ctrlc/`（來源 `~/b-log/rust-refactor/evidence/od29-ctrlc-20261028T071201/`，`SHA256SUMS` 同目錄）：
+
+| 檔案 | sha256 |
+|---|---|
+| `ctrl_c-result.json` | `c7905571da2b16ac4ff6cebc38bcb17d8a2d27f48bbb98d7882236467e13d061` |
+| `ctrl_c-parent.txt` | `41fabe3954388efdff6aee2af88e2843dab35784821b4cf4fb2c5f39e5e9ff33` |
+| `ctrl_c-child-ctrl_c.txt` | `00024be237b18ded9f1d13a54295b86eaf477a0c2b625078b8fd9fe4474cb38e` |
+| `ctrl_c-child-ctrl_break.txt` | `307f3a189f124aaa7453ec4a77f0c17ccc24df1c2036b863a21632465fa16e0d` |
+| `ctrl_c-transcript.txt` | `a509edfba75708ef0a9aac0a5960a42371249c67dd84e51f77d2a63fd8f11309` |
+
+`ctrl_c-result.json` 內記錄的三個診斷檔 sha256 與上表逐一相符。
+
 ## 受測 binary（第 2 次執行用）
 
 | 項目 | 值 |
@@ -43,7 +63,7 @@ $d="$env:LOCALAPPDATA\Temp\sw-od29"; $env:SW_PAL_CTRLC_DIAG_DIR=$d; Start-Transc
 
 ## 執行後（agent 處理）
 
-判定範圍（已知限制，2026-10-28 雲端審查 `69b5a91_9d74511-opus.md` d0b8ad7#1）：Ctrl+C 圈可證明「孫行程被終止且 exit code 經 exec_or_wait 照傳」（產品在建立孫行程後對委派者自身忽略 Ctrl+C）；**Ctrl+Break 圈只證明行程樹會被終止，不證明照傳**——產品只對委派者忽略 Ctrl+C、不忽略 Ctrl+Break，委派者本身也以 `0xC000013A` 結束，該圈無法區分兩者。不改為「孫行程攔截 Ctrl+Break 並以特徵碼結束」的理由：那會要求委派者忽略 Ctrl+Break，屬規格（plan 04 Task 9 的本案例形狀、`STATUS_CONTROL_C_EXIT` 原樣照傳）與 Python 基線（無委派層，`python.exe` 對 Ctrl+Break 採預設處置直接結束）都沒有的新行為，超出本 oracle 修正範圍。登記 PASS 時須照此範圍描述，不得寫成兩圈都證明照傳。
+判定範圍（已知限制，2026-10-28 雲端審查 `69b5a91_9d74511-opus.md` d0b8ad7#1）：Ctrl+C 圈可證明「孫行程被終止且 exit code 經 exec_or_wait 照傳」（產品在建立孫行程後對委派者自身忽略 Ctrl+C）；**Ctrl+Break 圈只證明行程樹會被終止，不證明照傳**——產品只對委派者忽略 Ctrl+C、不忽略 Ctrl+Break，委派者本身也以 `0xC000013A` 結束，該圈無法區分兩者。不改為「孫行程攔截 Ctrl+Break 並以特徵碼結束」的理由（2026-10-28 依雲端審查 `9d74511_32f6dd1-opus.md` 6c9a512#1 更正）：Python 基線的 Windows release（PyInstaller one-file）的 bootloader 對 Ctrl+C／Ctrl+Break 都忽略，並照傳子行程結束碼；Rust 委派者只忽略 Ctrl+C。由於 `sw_core` 沒有 SIGBREAK 處理器，兩者對使用者可觀察的結束碼目前相同，所以本輪不改案例形狀。這項差異登記為已知差距（addenda `CHG-S1X-WIN-DELEGATE-CTRLBREAK-GAP-01`），交擁有者裁定是否讓委派者一併忽略 Ctrl+Break（若裁定要改，就採用前輪 d0b8ad7#1 的特徵碼 77 案例）。登記 PASS 時須照此範圍描述，不得寫成兩圈都證明照傳。
 
 1. 將 `%LOCALAPPDATA%\Temp\sw-od29\` 下的 `ctrl_c-result.json`、`ctrl_c-transcript.txt`、`ctrl_c-parent.txt`、`ctrl_c-child-*.txt` 複製到 `~/b-log/rust-refactor/od29/`（附 `SHA256SUMS`），核對 `exe_sha256` 等於上表值、`exit_code` 為 0、transcript 或 `ctrl_c-parent.txt` 內有 `1 passed`／`PASS`，且兩個子診斷檔都存在（證明子行程確實進入子分支）。
 2. PASS：在 `docs/rust-refactor/owner-decisions-addenda.md` 的 OD-29 實跑紀錄列把本項改為「已實證（OD-29）」，附結果檔 sha256；FAIL 照實回報，不得改判或重跑到通過為止。
