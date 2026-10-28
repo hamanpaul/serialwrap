@@ -18,6 +18,8 @@ CPython 3.12.3 跑 pytest；系統 `python3` 為 3.11.17）實跑的失敗清單
 | `pytest-fail-3030adc.txt` | 審查第 7 輪後（相對 0722f75：+2／−3——+`tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`；+`tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01`；−`tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_limits_queryable`；−`tests/contract_blackbox/slice21/test_f1_cmd_contract.py::test_newline_rejected`；−`tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm04_until_op`；新增兩筆分別在起點清單內（SESSION_NOT_READY-ATTACHING）與 DeviceHeldError 環境類（sm01）） | 511 | 5b1216e4c3e40aac |
 | `pytest-fail-start-a0cad06.txt` | 第 3 輪 session 起點 a0cad06（`git worktree` 於 `/tmp`，`python3.12 -m pytest -q -p no:cacheprovider tests/ -rfE`；73 failed／432 errors） | 505 | 2b8fe0b8f0458c21 |
 | `pytest-fail-96c9f02.txt` | merge P5（a089f9f）＋第 8 輪審查修正＋Task 10／9／17 後（同上命令；45 failed／432 errors）。相對起點 +1／−29：−28 為 P5 交付的 slice21 calibration／gate judge／gate report 與 `SESSION_NOT_READY-ATTACHING`；+1 為 `test_rust_goldens_fresh::test_golden_is_fresh[gen_allowlist_unreadable_config.py-allowlist_unreadable_config.tsv]`（P5 F84 帶入的 golden；主工作樹同範圍重跑 2/2 passed，`origin/feature/rust-refactor-p5` 的 `/tmp` worktree 重跑 2/2 failed——golden 內容隨 checkout 路徑變動，P5 範圍、環境類） | 477 | 5130dd36be4b5478 |
+| `pytest-fail-start-4221ba2.txt` | 第 4 輪 session 起點 4221ba2（主工作樹；`python3` 改指 CPython 3.12.3 並裝 pytest／PyYAML／jsonschema，故 `test_bb_cli_help` 432 筆 ERROR 不再出現；`python3 -m pytest -q -p no:cacheprovider -rfE` 依檔名 8 分段前景執行） | 28 | 666a6afab09553d1 |
+| `pytest-fail-f150a24.txt` | merge 主線（9d21ef7）＋P5（b0772fe）＋第 9 輪修正（f150a24）＋P7 golden 重擷（#234 `boot_done_regex` 欄）後（同上命令；`test_bb_daemon_e2e.py` 因主線新增 27 案、每案 setup 10.7 s 另段執行）。相對起點 +2／−6，見下段 | 24 | 199751778b9fa817 |
 | `cargo-fail-start-de24500.txt` | 起點 `cargo test --workspace --features test-fakes --no-fail-fast` | 51 | f357f5d2317730d8 |
 
 失敗主要成因（非本分支引入，皆於起點即存在或由 P5 merge 帶入、在 P5 分支同樣失敗）：
@@ -206,3 +208,24 @@ $ （76de0cf worktree）timeout 200 python3.12 -m pytest -q -p no:cacheprovider 
 
 命令：`python3.12 -m pytest -q -p no:cacheprovider tests/test_functest_bridge_smoke.py::test_bridge_smoke_sm01 "tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]"`（主工作樹 96c9f02，連跑 3 次）：
 `2 passed`／`1 failed, 1 passed`／`2 passed`——同範圍失敗集合不同，與既有「DeviceHeldError 環境類」判定一致；兩者皆不在 `pytest-fail-96c9f02.txt`。
+
+### f150a24 列的完整差異（第 4 輪）
+
+相對 `pytest-fail-start-4221ba2.txt`：**+2／−6**。
+
+- `+ tests/test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread`：主線 4ad9b39 新增，
+  期望 `PermissionError`；root 執行讀得到 zombie leader 的 fd 目錄（`DID NOT RAISE PermissionError`）。於
+  `origin/feature/rust-refactor` worktree 同範圍連跑兩次皆 `1 failed`（環境類，非本分支引入）。
+- `+ tests/test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests`：主線 OD-24 防線對 P5 `s21_core` 的
+  `#[ignore]` 列報錯（linux 27、windows 13），移除須擁有者逐名授權（BLOCKED-OWNER P7-BO-4）。
+- `− tests/contract_blackbox/slice21/test_safety_core.py::test_reject_paths_zero_tx[SESSION_NOT_READY-ATTACHING]`、
+  `− tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_suite_execution`、
+  `− tests/contract_blackbox/test_cli_mgmt_l15.py::{test_reject_conflict_l15_zero_tx,test_restart_no_reopen_before_handoff,test_restart_no_stale_console_replay}`、
+  `− tests/test_functest_windows_wiring.py::test_windows_wiring_env_and_argv`（主線帶入的修正／順序相依）。
+- 過程中另有 `tests/test_p7_goldens_fresh.py::test_goldens_exist_and_are_fresh`：主線 #234 使 Python `ProfileTemplate`
+  多出 `boot_done_regex` 欄，`auth_resolution`／`login_fsm_scenarios`／`quiet_rx` 三檔以 `capture_p7_goldens.py` 重擷；
+  JSON 比對去掉該鍵後 113 列內容完全相同。重擷後 6 passed，不列入清單。
+
+cargo（`--workspace --features test-fakes`）失敗 6 筆皆為 root 使 chmod 無效的環境類（`daemon_process` 3、sw-pal
+`holder_scan_permission`、`file_eacces_matches_golden`、`unix_fixture_rows_match_python`），訊息皆為「證據不足：root 下 chmod
+無效…」。
