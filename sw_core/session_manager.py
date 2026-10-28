@@ -247,6 +247,33 @@ def passthrough_file_transfer_error(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
+    """移除被終端折行拆開的命令回顯；``lines`` 已經 ``clean_text`` 並切行。
+
+    shell 回顯打到終端寬度（serial console 常見 80 欄）時會在回顯中插入換行
+    （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）或補一個空白（bash readline
+    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡把開頭幾行
+    接回去、去掉空白後比較：命令必須從第一行開始（容許第一行前面殘留 prompt），
+    且接回的內容以完整命令結尾，才把這幾行視為回顯。
+    """
+    target = _WHITESPACE_RE.sub("", command)
+    if not target or not lines:
+        return lines
+    first_len = len(_WHITESPACE_RE.sub("", lines[0]))
+    joined = ""
+    # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
+    for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
+        joined += _WHITESPACE_RE.sub("", line)
+        if joined.endswith(target):
+            if len(joined) - len(target) < first_len:
+                return lines[n:]
+            return lines
+    return lines
+
+
 @dataclasses.dataclass
 class BackgroundCapture:
     cmd_id: str
@@ -493,9 +520,10 @@ class SessionRuntime:
     # （attach probe／reboot recovery／self-test nonce 的 confirm_ready()）清除——
     # quiet 過期或 RX prompt 解除都「不」清。transient，不進 _save_state。
     # 根因：prpl/OpenWrt askconsole 停在「Please press Enter to activate this
-    # console」，既不匹配 login_regex 也不匹配 prompt_regex → quiet 只能靠 180s
-    # 過期清空；期間 session 名義 READY 且無人重新確認，第一個 agent 命令的 "\n"
-    # 觸發 askconsole 啟用、命令文字被 askfirst 吞掉、stdout 吃到啟用 banner。
+    # console」，既不匹配 login_regex 也不匹配 prompt_regex → profile 未設
+    # boot_done_regex 時 quiet 只能靠 180s 過期清空；期間 session 名義 READY 且
+    # 無人重新確認，第一個 agent 命令的 "\n" 觸發 askconsole 啟用、命令文字被
+    # askfirst 吞掉、stdout 吃到啟用 banner。
     # agent 顯式命令 gate 改判 agent_gate_active()（quiet or pending），解除的
     # 唯一路徑＝READY 經 nonce probe 再確認；確認 probe 的 "\n" 順帶消耗 banner。
     ready_reconfirm_pending: bool = False
@@ -1523,6 +1551,7 @@ class SessionManager:
             log_dir=tpl.log_dir,
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
+            boot_done_regex=tpl.boot_done_regex,
             uart=tpl.uart,
         )
         sid = session_id_override or f"{profile.profile_name}:{com}"
@@ -4347,8 +4376,9 @@ class SessionManager:
         - RX 見到 boot banner（U-Boot 版本行／autoboot 倒數）→ 啟用／延長 quiet
           window。``arm_boot_quiet`` 同時清空 rolling tail，使 banner 之前殘留的
           舊 prompt 不會誤觸發解除（DUT 自行重開機、無人先呼叫 reboot 的情境）。
-        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex`` 或
-          ``prompt_regex``（開機完成訊號）→ 立即解除，讓 recovery / reprobe 恢復探測。
+        - quiet window 進行中，RX 匹配該 session template 的 ``login_regex``、
+          ``prompt_regex`` 或 ``boot_done_regex``（開機完成訊號）→ 立即解除，讓
+          recovery / reprobe 恢復探測。
           但尾行先命中 ``bootloader_prompts``（見下方 Finding 3 說明）時例外不解除。
         - gate source=system 的自動 probe 與（#139）非 human 來源的 agent 顯式命令
           （submit/execute/file 傳輸雙層 gate）；不 gate human console／lease TX。
@@ -4382,7 +4412,10 @@ class SessionManager:
         # 解除 quiet window，讓後續自動 probe 又打斷一次 autoboot。
         if _matches_any_bootloader_prompt(tail, sp.bootloader_prompts) is not None:
             return
-        for pattern in (sp.login_regex, sp.prompt_regex):
+        # boot_done_regex：profile 宣告的開機完成訊號（例：prpl/OpenWrt askconsole 的
+        # 「Please press Enter to activate this console」）。askconsole 不匹配 login／prompt，
+        # 未設時只能等 BOOT_QUIET_WINDOW_S 過期；文案放 profile、不寫死在程式碼。
+        for pattern in (sp.login_regex, sp.prompt_regex, sp.boot_done_regex):
             if not pattern:
                 continue
             try:
@@ -5106,6 +5139,7 @@ class SessionManager:
             log_dir=tpl.log_dir,
             max_console_line_chars=tpl.max_console_line_chars,
             bootloader_prompts=tpl.bootloader_prompts,
+            boot_done_regex=tpl.boot_done_regex,
             uart=tpl.uart,
         )
         session.profile_source = source
@@ -5716,8 +5750,12 @@ class SessionManager:
         lines = cleaned.lstrip("\n").splitlines()
         if command:
             command_stripped = command.strip()
+            stripped = False
             while lines and lines[0].strip().endswith(command_stripped):
                 lines = lines[1:]
+                stripped = True
+            if not stripped:
+                lines = _strip_wrapped_command_echo(lines, command_stripped)
         return "\n".join(lines).strip("\n")
 
     def _open_interactive_locked(
