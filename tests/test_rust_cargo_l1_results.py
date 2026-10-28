@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -228,6 +229,67 @@ def test_build_failure_is_not_success(tmp_path: Path) -> None:
 
 
 @pytest.mark.process_rpc
+def test_cargo_build_runs_from_this_script_workspace_even_when_called_elsewhere(tmp_path: Path) -> None:
+    """Cargo 必須在收集器所在 repo 執行，不能把其他 cwd 的產物配上本 repo 的 HEAD。"""
+    _assert_script()
+    other_checkout = tmp_path / "other-checkout"
+    other_checkout.mkdir()
+    exe = _write_exe(tmp_path / "exe", TARGET, run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    cwd_log = tmp_path / "cargo-cwd.txt"
+    if os.name == "nt":
+        (bin_dir / "cargo.cmd").write_text(
+            "@echo off\r\n"
+            'echo %CD%>>"%CARGO_CWD_LOG%"\r\n'
+            'type "%~dp0cargo_no_run.jsonl"\r\n'
+            'for /f "usebackq delims=" %%I in ("%~dp0cargo_exit") do exit /b %%I\r\n'
+            "exit /b 0\r\n",
+            encoding="utf-8",
+        )
+    else:
+        (bin_dir / "cargo").write_text(
+            "#!/bin/sh\n"
+            'printf "%s\\n" "$PWD" >> "$CARGO_CWD_LOG"\n'
+            'dir=$(dirname "$0")\n'
+            'cat "$dir/cargo_no_run.jsonl"\n'
+            'exit "$(cat "$dir/cargo_exit")"\n',
+            encoding="utf-8",
+        )
+        (bin_dir / "cargo").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+           "CARGO_CWD_LOG": str(cwd_log)}
+    external_manifest = other_checkout / "Cargo.toml"
+    external_manifest.write_text("[workspace]\nmembers = []\n", encoding="utf-8")
+    rejected_out = tmp_path / "external-workspace.json"
+    rejected = subprocess.run(
+        [sys.executable, str(SCRIPT), "--platform", "linux", "--out", str(rejected_out), "--",
+         "--manifest-path", str(external_manifest)],
+        cwd=other_checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode == 2, rejected.stderr
+    assert "manifest" in rejected.stderr.lower(), rejected.stderr
+    assert not cwd_log.exists(), "外部 manifest 在 Cargo 啟動前即應被拒絕"
+
+    out = tmp_path / "l1.json"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--platform", "linux", "--out", str(out), "--", "--workspace"],
+        cwd=other_checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    rep = _report(out, r)
+    assert rep["finished"] is True
+    assert cwd_log.read_text(encoding="utf-8").splitlines() == [str(ROOT)]
+
+
+@pytest.mark.process_rpc
 def test_timeout_marks_unfinished(tmp_path: Path) -> None:
     _assert_script()
     exe_a = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
@@ -288,8 +350,9 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     )
     assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
     data = json.loads(collect.read_text(encoding="utf-8"))
-    assert set(data) == {"collected"}                              # 只含 collected，不含執行結果
+    assert set(data) == {"collected", "ignored"}                   # 只含收集清單與 ignored 名單，不含執行結果（OD-24）
     assert sorted(data["collected"]) == sorted([A, B, C])
+    assert data["ignored"] == [C]                                  # ignored ⊆ collected
 
     # 以 P2 Task 13 的 regen_lock.py 登記到暫存鎖檔（副本），必須成功登記三筆
     regen = ACCEPTANCE / "regen_lock.py"
@@ -315,4 +378,234 @@ def test_list_only_feeds_regen_lock(tmp_path: Path) -> None:
     )
     assert rr.returncode == 0, rr.stderr[-2000:]
     got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
-    assert got == sorted([A, B, C])
+    assert got == sorted([A, B])                                   # OD-24：ignored 的 C 不得新增進凍結集合
+
+
+@pytest.mark.process_rpc
+def test_list_only_keeps_ignored_non_cap_in_denominator(tmp_path: Path) -> None:
+    """plan 04 Task 17：--list-only 必須收入 ignored 的非 cap_* 測試（與 cap_* 同樣保留），
+    否則既有鎖列會被 regen_lock 誤判為移除、分母被無聲縮小。
+
+    OD-24（2026-10-27）：輸出另附 ignored 名單；regen_lock --l1-add-only 新增時排除 ignored，
+    但鎖中既有的 ignored 列仍在 collected 內，不因此被視為移除。"""
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    ignored = exe.parent / "list_ignored.txt"
+    ignored.write_text(
+        ignored.read_text(encoding="utf-8") + "windows_switch_running_exe_rename: test\n",
+        encoding="utf-8",
+    )
+    w = f"cargo:{CRATE}::{TARGET}::windows_switch_running_exe_rename"
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    collect = tmp_path / "collect.json"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "--list-only", "--out", str(collect), "--", "--workspace"],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert collect.is_file(), f"--list-only 未寫出輸出；stderr={r.stderr[-2000:]}"
+    data = json.loads(collect.read_text(encoding="utf-8"))
+    assert set(data) == {"collected", "ignored"}
+    assert sorted(data["collected"]) == sorted([A, B, C, w])       # ignored 非 cap_* 的 W 必須在分母內
+    assert sorted(data["ignored"]) == sorted([C, w])
+
+    regen = ACCEPTANCE / "regen_lock.py"
+    assert regen.is_file(), "tests/acceptance/regen_lock.py 不存在：P2 Task 13 尚未合併（前置缺口，見 plan §0.2）"
+    acc = tmp_path / "tests" / "acceptance"
+    shutil.copytree(ACCEPTANCE, acc)
+    lock = acc / "l1_required.lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sets": {"t": {"linux": {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""}, "nodeids": []}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rr = subprocess.run(
+        [sys.executable, str(acc / "regen_lock.py"), "--l1-add-only", "--set", "t", "--platform", "linux", "--collect", str(collect)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rr.returncode == 0, rr.stderr[-2000:]
+    got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
+    assert got == sorted([A, B])                                   # OD-24：ignored 的 C、W 不新增
+
+    # 鎖中既有的 ignored 列 W 仍在 collected 內：不得被視為移除，也不需 --allow-removal
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sets": {"t": {"linux": {"selector": {"argv": ["--workspace"], "paths": [], "markexpr": ""}, "nodeids": [A, w]}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    kept = subprocess.run(
+        [sys.executable, str(acc / "regen_lock.py"), "--l1-add-only", "--set", "t", "--platform", "linux", "--collect", str(collect)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert kept.returncode == 0, kept.stderr[-2000:]
+    got = json.loads(lock.read_text(encoding="utf-8"))["sets"]["t"]["linux"]["nodeids"]
+    assert got == sorted([A, B, w])
+
+
+def _run_env(cwd: Path, bin_dir: Path, args: list[str], *, extra_env: dict[str, str] | None = None,
+             drop: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
+    """同 `_run`，但可指定額外環境變數並移除指定變數（避免外層 RUSTFLAGS 影響 provenance 斷言）。"""
+    env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+    for name in drop:
+        env.pop(name, None)
+    env.update(extra_env or {})
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args, "--", "--workspace"],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _git_head() -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+
+
+@pytest.mark.process_rpc
+def test_provenance_binds_executable_sha_head_and_toolchain(tmp_path: Path) -> None:
+    """報告的 provenance 記錄每個執行檔的路徑與執行前 sha256、受測 HEAD（開始與結束）、rustc -vV 與 RUSTFLAGS 摘要。"""
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run_env(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)],
+                 drop=("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"))
+    rep = _report(out, r)
+    prov = rep["provenance"]
+    assert prov["schema"] == "cargo-l1-provenance.v1"
+    assert prov["platform"] == "linux" and prov["build_target"] is None
+    assert prov["git"]["head"] == _git_head()
+    assert isinstance(prov["git"]["clean"], bool)
+    assert prov["git"]["end"]["head"] == _git_head()
+    assert isinstance(prov["git"]["end"]["clean"], bool)
+    [row] = prov["executables"]
+    assert row["crate"] == CRATE and row["target"] == TARGET
+    assert row["path"] == str(exe.resolve())
+    assert row["sha256"] == hashlib.sha256(exe.read_bytes()).hexdigest()
+    assert sorted(row["nodeids"]) == sorted([A, B, C])
+    toolchain = prov["toolchain"]
+    if shutil.which("rustc") is not None:
+        assert toolchain["rustc_vv"] and toolchain["rustc_vv"].startswith("rustc "), toolchain
+        assert toolchain["rustc_vv_sha256"] == hashlib.sha256(toolchain["rustc_vv"].encode("utf-8")).hexdigest()
+    else:
+        assert toolchain["rustc_vv"] is None and toolchain["error"], toolchain
+    assert prov["rustflags"]["RUSTFLAGS"] == {"set": False, "sha256": None}
+    assert prov["rustflags"]["CARGO_ENCODED_RUSTFLAGS"] == {"set": False, "sha256": None}
+
+
+def test_rustc_version_probe_uses_repo_toolchain_cwd(monkeypatch) -> None:
+    """rustc -vV 必須在 repo cwd 執行，套用該 repo 的 rust-toolchain.toml。"""
+    _assert_script()
+    spec = importlib.util.spec_from_file_location("cargo_l1_toolchain_cwd_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "rustc 1.96.1\n", "")
+
+    monkeypatch.setenv("RUSTC", "rustc-shim")
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module._toolchain()
+
+    assert result["rustc_vv"].startswith("rustc 1.96.1")
+    assert calls and calls[0][1].get("cwd") == ROOT
+
+
+@pytest.mark.process_rpc
+def test_rustflags_recorded_as_digest_without_flag_text(tmp_path: Path) -> None:
+    """RUSTFLAGS 只記錄是否設定與 sha256；旗標文字本身不寫入報告。"""
+    _assert_script()
+    flags = "-C debuginfo=0 --cfg rustflags_marker_for_digest_test"
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run_env(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)],
+                 extra_env={"RUSTFLAGS": flags}, drop=("CARGO_ENCODED_RUSTFLAGS",))
+    rep = _report(out, r)
+    assert rep["provenance"]["rustflags"]["RUSTFLAGS"] == {
+        "set": True,
+        "sha256": hashlib.sha256(flags.encode("utf-8")).hexdigest(),
+    }
+    assert "rustflags_marker_for_digest_test" not in out.read_text(encoding="utf-8")
+
+
+MUTATING_LIBTEST = """import pathlib
+import sys
+
+me = pathlib.Path(__file__)
+if "--list" in sys.argv:
+    if "--ignored" not in sys.argv:
+        print("a: test")
+        print("b: test")
+    sys.exit(0)
+print("test a ... ok")
+print("test b ... ok")
+me.write_text(me.read_text(encoding="utf-8") + "# rebuilt during run\\n", encoding="utf-8")
+"""
+
+
+@pytest.mark.process_rpc
+def test_executable_rewritten_during_run_marks_report_unfinished(tmp_path: Path) -> None:
+    """測試執行期間執行檔被改寫：報告 finished=false，且 provenance 記錄的是執行前的 sha256（不是事後的內容）。
+
+    以 Python 腳本當測試執行檔（runner 為 sys.executable），故與平台無關、不依賴 shebang。
+    """
+    _assert_script()
+    exe = tmp_path / "exe_m" / "mutating_libtest.py"
+    exe.parent.mkdir(parents=True)
+    exe.write_text(MUTATING_LIBTEST, encoding="utf-8")
+    before = hashlib.sha256(exe.read_bytes()).hexdigest()
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--runner", sys.executable, "--out", str(out)])
+    rep = _report(out, r)
+    assert rep["finished"] is False
+    assert r.returncode != 0
+    assert "測試執行檔於執行期間被改寫" in r.stderr, r.stderr
+    [row] = rep["provenance"]["executables"]
+    assert row["sha256"] == before
+    assert row["sha256"] != hashlib.sha256(exe.read_bytes()).hexdigest()
+
+
+@pytest.mark.process_rpc
+def test_build_failure_report_still_carries_provenance(tmp_path: Path) -> None:
+    """建置失敗的報告也附 provenance（finished=false、executables 為空），不得缺少紀錄欄位。"""
+    _assert_script()
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_lib_artifact()], exit_code=101)
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    assert rep["finished"] is False
+    prov = rep["provenance"]
+    assert prov["schema"] == "cargo-l1-provenance.v1"
+    assert prov["executables"] == []
+    assert prov["git"]["head"] == _git_head()

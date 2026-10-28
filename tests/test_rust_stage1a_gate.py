@@ -12,11 +12,11 @@ tests/acceptance/l1_judge.py），複製閘門腳本到暫存樹後執行，不�
 - ab-report：ab_compare.py 的輸出（`result`、`cases[{id,class,…}]`）。
 - --l1-results <dir>：`<dir>/<platform>/<blackbox|cargo>/resource-report.json`（l1-results.v1）；
   blackbox 目錄另有同目錄 junit.xml。
+- --l15-report <path>|<platform>=<path>：可重複指定；未帶前綴時視為 linux。
+- --pytest-junit-report <path>：安全不變量引用的 test_rust_ pytest 節點必須在此 JUnit 中通過。
 - case id 慣例：`<檔名>::<函式名>`（與計畫各表一致）。
 
-紅燈：stage1a_gate.py 為 stub（exit 2、不產生報告），本檔測試以 strict xfail 標示。
-前置（P2 Task 13 `tests/acceptance/l1_judge.py`，唯一判定實作）：本 worktree 尚無此檔；
-閘門實作依計畫須載入它，未合併前 L1 相關判定無法通過，屬待補前置，不在本檔以斷言掩蓋。
+本檔直接執行 `stage1a_gate.py`，以暫存樹驗證 CLI 參數、證據判定與 fail-closed 行為；L1 集合由 P2 Task 13 的 `tests/acceptance/l1_judge.py` 判定。
 """
 from __future__ import annotations
 
@@ -56,6 +56,11 @@ CARGO_LINUX = {"argv": ["--workspace", "--all-features"], "paths": [], "markexpr
 CARGO_WIN = {"argv": ["--package", "sw-proto", "--package", "sw-pal", "--package", "sw-cli"],
              "paths": [], "markexpr": ""}
 
+# OD-17：mkbundle ignored cargo 列的替換登記（Stage 1 pytest 全套，Linux）。
+PYT_MKBUNDLE = "tests/test_rust_mkbundle.py::test_mkbundle_respects_cargo_target_dir_override"
+PYT_MANIFEST = "tests/test_rust_release_manifest_schema.py::test_manifest_schema_accepts_new_optional_fields"
+PYT_FULL_SEL = {"argv": ["-q", "tests/", "-p", "junit_provenance"], "paths": ["tests/"], "markexpr": ""}
+
 
 def _l1_lock() -> dict[str, Any]:
     return {
@@ -74,6 +79,9 @@ def _l1_lock() -> dict[str, Any]:
             "s1a_cargo": {
                 "linux": {"selector": CARGO_LINUX, "nodeids": [CARGO1]},
                 "windows": {"selector": CARGO_WIN, "nodeids": [CARGO1]},
+            },
+            "s1_pytest_full": {
+                "linux": {"selector": PYT_FULL_SEL, "nodeids": sorted([PYT_MKBUNDLE, PYT_MANIFEST])},
             },
         },
     }
@@ -104,7 +112,9 @@ def _report(platform: str, *, runner: str, argv: list[str], markexpr: str, nodei
         "collected": list(nodeids),
         "deselected": [],
         "results": [
-            {"nodeid": n, "outcome": o, "skip_kind": ("other" if o == "skipped" else None),
+            {"nodeid": n, "outcome": o,
+             "skip_kind": (("capability" if n.rsplit("::", 1)[-1].startswith("cap_") else "other")
+                           if o == "skipped" else None),
              "phases": {"setup": "passed", "call": ("skipped" if o in ("skipped", "xfailed") else
                                                            "failed" if o in ("failed", "error", "xpassed") else "passed"),
                         "teardown": "passed"}}
@@ -121,6 +131,16 @@ def _pytest_argv(sel: dict[str, Any]) -> list[str]:
     return ["/usr/lib/python3/dist-packages/pytest/__main__.py", *sel["argv"], "--junitxml=/x/junit.xml"]
 
 
+def _owner_nodeids(platform: str, argv: list[str]) -> list[str]:
+    """selector 涵蓋且本平台會編譯進來的擁有者機台登記列（與 owner_gated.expected_names 同範圍）。"""
+    sys.path.insert(0, str(ROOT / "scripts" / "rust"))
+    try:
+        import owner_gated
+    finally:
+        sys.path.pop(0)
+    return [f"cargo:{crate}::t::{name}" for crate, name in owner_gated.expected_names(platform, argv)]
+
+
 def _default_l1_reports() -> dict[tuple[str, str], dict[str, Any]]:
     lock = _l1_lock()["sets"]
     reports: dict[tuple[str, str], dict[str, Any]] = {}
@@ -128,9 +148,34 @@ def _default_l1_reports() -> dict[tuple[str, str], dict[str, Any]]:
         nodes = lock["s1a_blackbox"][platform]["nodeids"]
         reports[(platform, "blackbox")] = _report(
             platform, runner="pytest", argv=_pytest_argv(sel_bb), markexpr=sel_bb["markexpr"], nodeids=nodes)
+        owner = _owner_nodeids(platform, list(sel_cargo["argv"]))
         reports[(platform, "cargo")] = _report(
-            platform, runner="cargo", argv=list(sel_cargo["argv"]), markexpr="", nodeids=[CARGO1])
+            platform, runner="cargo", argv=list(sel_cargo["argv"]), markexpr="", nodeids=[CARGO1, *owner])
+    reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="",
+        nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]))
     return reports
+
+
+def _pytest_full_junit_xml(outcomes: dict[str, str] | None = None, *, subtests: int = 0) -> str:
+    """與 s1_pytest_full 報告對應的 pytest JUnit（passed／failed／skipped 依 outcomes；預設兩筆皆 passed）。
+
+    subtests：模擬 pytest 9 的 subtests——testsuite 的 tests 屬性多計這些數量，但不產生對應的 testcase 元素。
+    """
+    outcomes = outcomes or {PYT_MKBUNDLE: "passed", PYT_MANIFEST: "passed"}
+    failed = sum(1 for o in outcomes.values() if o == "failed")
+    skipped = sum(1 for o in outcomes.values() if o == "skipped")
+    cases = []
+    for nid, outcome in outcomes.items():
+        # 與 pytest junitxml 的 mangle_test_address 同形：完整相對路徑（`/`→`.`、去 `.py`）＋類別段。
+        path, *rest = nid.partition("[")[0].split("::")
+        cls = ".".join([path.removesuffix(".py").replace("/", "."), *rest[:-1]])
+        name = rest[-1] + nid[len(nid.partition("[")[0]):]
+        body = {"failed": '<failure message="x"/>', "skipped": '<skipped message="x"/>'}.get(outcome, "")
+        cases.append(f'<testcase classname="{cls}" name="{name}">{body}</testcase>')
+    n = len(outcomes) + subtests
+    attrs = f'tests="{n}" failures="{failed}" errors="0" skipped="{skipped}"'
+    return f"<testsuites {attrs}><testsuite {attrs}>{''.join(cases)}</testsuite></testsuites>"
 
 
 def _synthetic_coverage() -> dict[str, Any]:
@@ -147,11 +192,47 @@ def _synthetic_coverage() -> dict[str, Any]:
     return cov
 
 
+_PROVENANCE_ARGV = ["-q", "tests/", "-p", "junit_provenance", "--junitxml=/x/j.xml"]
+
+_PROVENANCE_EFFECTIVE: dict[str, Any] = {
+    "keyword": "", "markexpr": "", "deselect": [], "ignore": [], "ignore_glob": [],
+    "maxfail": 0, "collectonly": False, "lf": False, "ff": False,
+}
+
+
+def _init_git_head(root: Path) -> str:
+    """建立含一個 commit 的暫存 git repo，回傳 HEAD（gate 以 repo_root 的 HEAD 作為受測 revision）。"""
+    root.mkdir(parents=True, exist_ok=True)
+    git = ["git", "-c", "user.name=gate-test", "-c", "user.email=gate-test@invalid", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], cwd=root, check=True)
+    res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True)
+    return res.stdout.strip()
+
+
+def _with_properties(xml: str, props: dict[str, str] | None) -> str:
+    """把 pytest `record_testsuite_property` 形式的 `<properties>` 插入第一個 testsuite 開頭標籤之後。"""
+    if props is None:
+        return xml
+    from html import escape
+    block = "<properties>" + "".join(
+        f'<property name="{escape(k)}" value="{escape(v)}"/>' for k, v in props.items()
+    ) + "</properties>"
+    start = xml.index("<testsuite ")
+    end = xml.index(">", start) + 1
+    return xml[:end] + block + xml[end:]
+
+
 class GateTree:
     """暫存 repo 樹；預設為「只缺 L2／L3」的完整情境（應判 IMPLEMENTED）。"""
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.head: str | None = None
+        # None：依樹的 HEAD 與 PASS 所需的 provenance 自動帶入；dict：照原樣寫入（負向測試用）。
+        self.junit_props: dict[str, str] | None = None
+        # None：不提供 spike3 證據目錄；dict：寫入 <case_id>.json 並以 --spike3-evidence 傳入。
+        self.spike3: dict[str, dict[str, Any]] | None = None
         self.cases: list[dict[str, Any]] = [
             {"case_id": A1, "layer": "L1", "cli_stage": "1A"},
             {"case_id": Z, "layer": "L2", "cli_stage": "1A"},
@@ -161,6 +242,7 @@ class GateTree:
         self.coverage: dict[str, Any] | None = _synthetic_coverage()
         self.l1_lock = _l1_lock()
         self.l1_reports = _default_l1_reports()
+        self.auto_cargo_provenance = True
         self.ab_report: dict[str, Any] | None = {
             "result": "pass",
             "errors": [],
@@ -168,16 +250,32 @@ class GateTree:
         }
         self.win_report: dict[str, Any] | None = {"exe": "bin/serialwrap.exe", "passed": 3, "failed": 0,
                                                   "ignored": 0, "exit": 0}
-        self.windows_com: str | None = None
-        self.l15_report: dict[str, Any] | None = None
+        # OD-15：Windows COM 為可執行 gate，預設為完整通過的證據（與「只缺 L2／L3」情境一致）；None＝不傳 --windows-com。
+        self.windows_com: str | None = "valid"
+        self.l15_reports: list[tuple[str, dict[str, Any]]] = []
+        # 預設與 s1_pytest_full 報告同一次執行的 JUnit（provenance 由 write() 自動帶入）。
+        self.pytest_junit_xml: str | None = _pytest_full_junit_xml()
+        self.blackbox_junit_xml: str | None = None
+
+    def default_junit_props(self) -> dict[str, str]:
+        return {"HEAD": self.head or "", "SW_REQUIRE_CARGO": "1", "git_clean": "1",
+                "effective": json.dumps(_PROVENANCE_EFFECTIVE, sort_keys=True), "argv": json.dumps(_PROVENANCE_ARGV)}
 
     def write(self) -> None:
+        if self.head is None:
+            self.head = _init_git_head(self.root)
         (self.root / "scripts" / "rust").mkdir(parents=True, exist_ok=True)
         shutil.copy2(GATE, self.root / "scripts" / "rust" / "stage1a_gate.py")
+        shutil.copy2(ROOT / "scripts" / "rust" / "owner_gated.py", self.root / "scripts" / "rust" / "owner_gated.py")
+        (self.root / "scripts" / "stage0").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json",
+                     self.root / "scripts" / "stage0" / "spike3_evidence.schema.json")
         acc = self.root / "tests" / "acceptance"
         acc.mkdir(parents=True, exist_ok=True)
         if (ACC / "l1_judge.py").exists():  # P2 Task 13 唯一判定實作；未合併時閘門的 L1 判定無法執行
             shutil.copy2(ACC / "l1_judge.py", acc / "l1_judge.py")
+        # junit 計數的唯一實作（P2 check_evidence_index._junit_counts）；閘門依路徑載入，缺檔即 fail-closed。
+        shutil.copy2(ACC / "check_evidence_index.py", acc / "check_evidence_index.py")
         (acc / "cases.yaml").write_text(yaml.safe_dump({"schema_version": 1, "cases": self.cases}, allow_unicode=True),
                                         encoding="utf-8")
         if self.lock is not None:
@@ -190,24 +288,45 @@ class GateTree:
         out = self.root / "out"
         out.mkdir(parents=True, exist_ok=True)
         for (platform, kind), rep in self.l1_reports.items():
+            if kind == "cargo" and self.auto_cargo_provenance and "provenance" not in rep:
+                rep["provenance"] = {
+                    "schema": "cargo-l1-provenance.v1",
+                    "git": {
+                        "head": self.head,
+                        "clean": True,
+                        "end": {"head": self.head, "clean": True},
+                    },
+                }
             d = out / "l1" / platform / kind
             d.mkdir(parents=True, exist_ok=True)
             (d / "resource-report.json").write_text(json.dumps(rep, ensure_ascii=False), encoding="utf-8")
             if kind == "blackbox":
+                # 計數以 testcase 元素為準（P2 慣例）：每個結果列對應一個 testcase；屬性與元素數一致。
                 n = len(rep["results"])
+                cases = "".join(f'<testcase classname="tests.contract_blackbox" name="case{i}"/>' for i in range(n))
                 (d / "junit.xml").write_text(
-                    f'<testsuites><testsuite tests="{n}" failures="0" errors="0" skipped="0"/></testsuites>',
+                    self.blackbox_junit_xml or
+                    f'<testsuites><testsuite tests="{n}" failures="0" errors="0" skipped="0">{cases}</testsuite></testsuites>',
                     encoding="utf-8")
         if self.ab_report is not None:
             (out / "ab-report.json").write_text(json.dumps(self.ab_report, ensure_ascii=False), encoding="utf-8")
         if self.win_report is not None:
             (out / "win-report.json").write_text(json.dumps(self.win_report, ensure_ascii=False), encoding="utf-8")
-        if self.l15_report is not None:
-            (out / "l15-report.json").write_text(json.dumps(self.l15_report, ensure_ascii=False), encoding="utf-8")
+        for index, (_, report) in enumerate(self.l15_reports):
+            # F7：fixture 預設為完整報告（complete=true）；不完整報告的判定由 test_incomplete_l15_report_is_rejected 覆蓋。
+            doc = {"complete": True, **report}
+            (out / f"l15-report-{index}.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        if self.pytest_junit_xml is not None:
+            props = self.junit_props if self.junit_props is not None else self.default_junit_props()
+            (out / "pytest-junit.xml").write_text(_with_properties(self.pytest_junit_xml, props), encoding="utf-8")
         if self.windows_com is not None:
-            (out / "windows-com").mkdir(parents=True, exist_ok=True)
+            _write_windows_com_fixture(out, self.windows_com)
+        if self.spike3 is not None:
+            (out / "spike3").mkdir(parents=True, exist_ok=True)
+            for cid, doc in self.spike3.items():
+                (out / "spike3" / f"{cid}.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
-    def run(self) -> tuple[int, dict[str, Any]]:
+    def run(self, *, legacy_l15_report: bool = False) -> tuple[int, dict[str, Any]]:
         self.write()
         out = self.root / "out"
         argv = [sys.executable, str(self.root / "scripts" / "rust" / "stage1a_gate.py"),
@@ -216,10 +335,15 @@ class GateTree:
             argv += ["--ab-report", str(out / "ab-report.json")]
         if self.win_report is not None:
             argv += ["--win-report", str(out / "win-report.json")]
-        if self.l15_report is not None:
-            argv += ["--l15-report", str(out / "l15-report.json")]
+        for index, (platform, _) in enumerate(self.l15_reports):
+            report_path = str(out / f"l15-report-{index}.json")
+            argv += ["--l15-report", report_path if legacy_l15_report else f"{platform}={report_path}"]
+        if self.pytest_junit_xml is not None:
+            argv += ["--pytest-junit-report", str(out / "pytest-junit.xml")]
         if self.windows_com is not None:
-            argv += ["--windows-com", str(out / "windows-com")]
+            argv += ["--windows-com", str(out)]
+        if self.spike3 is not None:
+            argv += ["--spike3-evidence", str(out / "spike3")]
         r = subprocess.run(argv, capture_output=True, text=True, check=False)
         assert (out / "gate.json").exists(), f"閘門未產生報告（rc={r.returncode}，stderr={r.stderr.strip()!r}）"
         return r.returncode, json.loads((out / "gate.json").read_text(encoding="utf-8"))
@@ -228,6 +352,77 @@ class GateTree:
 @pytest.fixture
 def tree(tmp_path: Path) -> GateTree:
     return GateTree(tmp_path / "repo")
+
+
+_WIN_COM_P4 = "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
+_WIN_COM_SEQ = ["python-daemon-start", "session-list-ready", "cmd-submit", "cmd-status-poll",
+                "device-release", "session-list-released", "device-attach", "session-list-ready", "daemon-stop"]
+
+
+def _write_windows_com_fixture(out: Path, mode: str) -> None:
+    """依 win-blackbox.ps1 的 OutDir 佈局寫入 Windows COM 證據。
+
+    mode：valid（完整通過）、forged（僅有 verdict／windows_com 後門欄位）、
+    no-wire（缺 dut_stdin_write TX）、bad-order（序列步驟對調）、
+    absent（OutDir 內不寫任何 windows-com.json）、explicit-fail（doc 明示 windows_com: FAIL）。
+    """
+    if mode == "forged":
+        for name in ("windows-com.json", "report.json", "com-selftest.json"):
+            (out / name).write_text(json.dumps({"verdict": "PASS", "windows_com": "PASS"}), encoding="utf-8")
+        return
+    if mode == "absent":
+        return
+    if mode == "explicit-fail":
+        (out / "windows-com.json").write_text(json.dumps({"windows_com": "FAIL"}), encoding="utf-8")
+        return
+    com = out / "windows-com"
+    (com / "bridge-selftest").mkdir(parents=True, exist_ok=True)
+    (com / "bridge").mkdir(parents=True, exist_ok=True)
+    (com / "bridge-selftest" / "selftest-report.json").write_text(json.dumps({"verdict": "PASS"}), encoding="utf-8")
+    names = list(_WIN_COM_SEQ)
+    if mode == "bad-order":
+        names[2], names[3] = names[3], names[2]
+    steps = [{"name": "python-daemon-start", "pid": 1}] + [
+        {"name": n, "returncode": 0} for n in names[1:]
+    ]
+    # 依真機 win-blackbox.ps1 的佈局：sequence.json（頂層 result／steps）＋ sequence-result.json（wrapper 的 status／report）。
+    sequence_doc = {
+        "format": "windows-com-sequence.v1", "result": "PASS", "com_pair": "COM20:COM21",
+        "serialwrap_com": "COM20", "bridge_com": "COM21", "steps": steps,
+    }
+    (com / "sequence.json").write_text(json.dumps(sequence_doc), encoding="utf-8")
+    (com / "sequence-result.json").write_text(
+        json.dumps({"status": "PASS", "exit": 0, "report": sequence_doc}), encoding="utf-8"
+    )
+    import base64
+    rows = [{"dir": "RX", "observation": "dut_stdout_read", "payload_b64": base64.b64encode(b"ok\n").decode()}]
+    if mode != "no-wire":
+        rows.append({"dir": "TX", "observation": "dut_stdin_write",
+                     "payload_b64": base64.b64encode(b"echo hi\n").decode()})
+    (com / "bridge" / "wire.ndjson").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    doc = {
+        "format": "windows-com-evidence.v1", "windows_com": "PASS", "com_pair": "COM20:COM21",
+        "selftest": {"status": "PASS"}, "sequence": {"status": "PASS"},
+        "bridge_stop": {"status": "PASS"},
+        "p4_case": {"nodeid": _WIN_COM_P4, "outcome": "passed"},
+    }
+    (out / "windows-com.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_windows_com_valid_fixture_passes(tree):
+    tree.windows_com = "valid"
+    code, rep = tree.run()
+    assert rep["windows_com"] == "PASS", rep["windows_com_reasons"]
+
+
+@pytest.mark.parametrize("mode", ["forged", "no-wire", "bad-order"])
+def test_windows_com_invalid_evidence_is_insufficient_and_fails(tree, mode):
+    """OD-15：不合格的 Windows COM 證據為證據不足（非 BLOCKED-OWNER），整體 FAIL。"""
+    tree.windows_com = mode
+    code, rep = tree.run()
+    assert rep["windows_com"] == "evidence-insufficient", rep["windows_com_reasons"]
+    assert rep["overall"] == "FAIL"
+    assert rep["windows_com_reasons"]
 
 
 def _l1_row(rep: dict[str, Any], set_id: str, platform: str) -> dict[str, Any]:
@@ -285,10 +480,25 @@ def test_invariant_case_missing_fails(tree):
     assert "test_missing.py::test_nope" in json.dumps(rep["invariants"], ensure_ascii=False)
 
 
-def test_windows_com_missing_is_blocked_owner_not_verified(tree):
+@pytest.mark.parametrize("mode", ["none", "absent"])
+def test_windows_com_missing_is_evidence_insufficient_and_fails(tree, mode):
+    """OD-15：Windows COM 為可執行 gate。未帶 --windows-com（none）或目錄內無 windows-com.json（absent）
+    皆為證據不足（不得 BLOCKED-OWNER、不得 IMPLEMENTED），整體 FAIL。"""
+    tree.windows_com = None if mode == "none" else "absent"
     code, rep = tree.run()
-    assert rep["windows_com"] == "BLOCKED-OWNER"
-    assert rep["overall"] != "VERIFIED"
+    assert rep["windows_com"] == "evidence-insufficient", rep["windows_com_reasons"]
+    assert rep["windows_com_reasons"]
+    assert rep["overall"] == "FAIL"
+    assert code != 0
+
+
+def test_windows_com_explicit_fail_stays_fail(tree):
+    """明示 FAIL 維持 FAIL（不降為證據不足）。"""
+    tree.windows_com = "explicit-fail"
+    code, rep = tree.run()
+    assert rep["windows_com"] == "FAIL"
+    assert rep["overall"] == "FAIL"
+    assert code != 0
 
 
 def test_win_report_missing_is_insufficient(tree):
@@ -344,8 +554,189 @@ def test_l1_full_sets_pass(tree):
     code, rep = tree.run()
     assert rep["overall"] == "IMPLEMENTED"
     rows = rep["l1"]
-    assert len(rows) == 6
+    # 六列（s1a_blackbox／s1a_delegation／s1a_cargo × 平台）＋ s1_pytest_full（linux，OD-17 替換登記）
+    assert len(rows) == 7
     assert all(r["verdict"] == "PASS" for r in rows)
+
+
+def test_l1_blackbox_inconsistent_suite_junit_is_not_pass(tree):
+    """黑箱 JUnit 宣告失敗數高於 testcase 層時，不能因非 strict 集合而忽略解析錯誤。"""
+    tree.blackbox_junit_xml = (
+        '<testsuites><testsuite tests="3" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.contract_blackbox" name="case0"/>'
+        '<testcase classname="tests.contract_blackbox" name="case1"/>'
+        '<testcase classname="tests.contract_blackbox" name="case2"/>'
+        '</testsuite></testsuites>'
+    )
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_blackbox", "linux")
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("JUnit" in reason and "failures=1" in reason for reason in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def _pytest_full_row(rep: dict[str, Any]) -> dict[str, Any]:
+    return _l1_row(rep, "s1_pytest_full", "linux")
+
+
+def test_pytest_full_missing_report_is_evidence_insufficient(tree):
+    tree.l1_reports.pop(("linux", "pytest-full"))
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_required_skip_is_not_pass(tree):
+    outcomes = {PYT_MKBUNDLE: "skipped", PYT_MANIFEST: "passed"}
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="",
+        nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]), outcomes=outcomes)
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(x["nodeid"] == PYT_MKBUNDLE for x in row["skipped_required"]), row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_selector_mismatch_is_not_pass(tree):
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv({"argv": ["-q", "tests/test_rust_mkbundle.py"]}),
+        markexpr="", nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]))
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("selector mismatch" in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_without_junit_is_not_pass(tree):
+    tree.pytest_junit_xml = None
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_failed_required_is_fail(tree):
+    outcomes = {PYT_MKBUNDLE: "failed", PYT_MANIFEST: "passed"}
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="",
+        nodeids=sorted([PYT_MKBUNDLE, PYT_MANIFEST]), outcomes=outcomes)
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "FAIL", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_junit_with_matching_totals_but_missing_required_nodeid_is_not_pass(tree):
+    """計數相同的過期 JUnit（必要 nodeid 缺席、以他案補足筆數）不得與報告湊成 PASS（逐列對帳）。"""
+    outcomes = {PYT_MKBUNDLE: "passed", "tests/test_unrelated.py::test_unrelated": "passed"}
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(PYT_MANIFEST in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_junit_required_nodeid_not_passed_is_not_pass(tree):
+    """必要 nodeid 在 JUnit 中為 skipped → 不得 PASS（由 judge 的 totals 對帳先行攔下，逐列對帳亦不放行）。"""
+    outcomes = {PYT_MKBUNDLE: "passed", PYT_MANIFEST: "skipped"}
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert row["reasons"], row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_set_missing_from_lock_is_evidence_insufficient(tree):
+    tree.l1_lock["sets"].pop("s1_pytest_full")
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_complete_evidence_is_pass(tree):
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "PASS", row
+    assert rep["overall"] == "IMPLEMENTED"
+
+
+PYT_SUBTEST_NODE = "tests/test_rust_subtests_fixture.py::test_parametrized_with_subtests"
+
+
+def _pytest_full_three_nodes(tree) -> list[str]:
+    """s1_pytest_full 凍結 3 個 nodeid（含一個以 subtests 執行的節點），報告同為 3 列。"""
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_SUBTEST_NODE])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    return nodes
+
+
+def test_pytest_full_subtests_in_tests_attr_are_not_junit_mismatch(tree):
+    """G4-junit-subtest-count-mismatch：testsuite tests=6、testcase 元素 3 個（subtests 計入屬性、不產生 testcase），
+    報告 3 列 → 計數以 testcase 元素為準（P2 check_evidence_index 慣例），不得出現 junit mismatch，逐列 PASS。"""
+    nodes = _pytest_full_three_nodes(tree)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({n: "passed" for n in nodes}, subtests=3)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert not any("junit/l1-results mismatch" in r for r in row["reasons"]), row["reasons"]
+    assert row["verdict"] == "PASS", row
+    assert rep["overall"] == "IMPLEMENTED"
+
+
+def test_pytest_full_testcase_count_mismatch_is_still_evidence_insufficient(tree):
+    """真正不一致不得因改用 testcase 計數而放行：屬性 tests=3（與報告 3 列相符）但 testcase 元素僅 2 個 → 判證據不足。"""
+    _pytest_full_three_nodes(tree)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({PYT_MKBUNDLE: "passed", PYT_MANIFEST: "passed"}, subtests=1)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("junit/l1-results mismatch" in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def _p2_junit_counter():
+    """依路徑載入 P2 `check_evidence_index._junit_counts`（與閘門同一實作）。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("p2_check_evidence_index_for_test", ACC / "check_evidence_index.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._junit_counts
+
+
+def test_junit_totals_counts_testcase_elements_not_suite_attributes(tmp_path):
+    """黑箱與 pytest-full 共用的計數：tests 屬性含 subtests（6）但 testcase 僅 3 個 → 合計以 testcase 為準。"""
+    gate = _load_gate_module()
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<testsuites><testsuite tests="6" failures="0" errors="0" skipped="1">'
+        '<testcase classname="tests.a" name="t1"/>'
+        '<testcase classname="tests.a" name="t2"><failure message="x"/></testcase>'
+        '<testcase classname="tests.a" name="t3"><skipped message="x"/></testcase>'
+        '</testsuite></testsuites>', encoding="utf-8")
+    assert gate._junit_totals(path, _p2_junit_counter()) == {"tests": 3, "failures": 1, "errors": 0, "skipped": 1}
+
+
+def test_junit_totals_without_counter_or_file_is_none(tmp_path):
+    """計數函式未載入（P2 缺席）或檔案缺漏／不可解析 → None（閘門 fail-closed，不得以屬性放行）。"""
+    gate = _load_gate_module()
+    junit = tmp_path / "junit.xml"
+    junit.write_text('<testsuites><testsuite tests="1" failures="0" errors="0" skipped="0"/></testsuites>', encoding="utf-8")
+    assert gate._junit_totals(junit, None) is None
+    assert gate._junit_totals(tmp_path / "missing.xml", _p2_junit_counter()) is None
+    bad = tmp_path / "bad.xml"
+    bad.write_text("<testsuites>", encoding="utf-8")
+    assert gate._junit_totals(bad, _p2_junit_counter()) is None
 
 
 def test_l1_cargo_argv_not_matching_selector_invalid(tree):
@@ -358,9 +749,1575 @@ def test_l1_cargo_argv_not_matching_selector_invalid(tree):
     assert rep["overall"] == "FAIL"
 
 
+def test_l1_cargo_provenance_head_and_clean_tree_are_required(tree):
+    """Stage 1A cargo 報告必須綁定受測 HEAD，且執行前後工作樹皆乾淨。"""
+    tree.write()
+    report = tree.l1_reports[("linux", "cargo")]
+    for mutation in (
+        lambda git: git.__setitem__("head", "0" * 40),
+        lambda git: git.__setitem__("clean", False),
+        lambda git: git["end"].__setitem__("head", "0" * 40),
+        lambda git: git["end"].__setitem__("clean", False),
+    ):
+        report["provenance"] = {
+            "schema": "cargo-l1-provenance.v1",
+            "git": {"head": tree.head, "clean": True,
+                    "end": {"head": tree.head, "clean": True}},
+        }
+        mutation(report["provenance"]["git"])
+        _, gate_report = tree.run()
+        row = _l1_row(gate_report, "s1a_cargo", "linux")
+        assert row["verdict"] == "evidence-insufficient", row
+        assert gate_report["overall"] == "FAIL"
+
+
+@pytest.mark.parametrize("damage", ["missing", "schema", "git_end"])
+def test_l1_cargo_missing_or_malformed_provenance_is_rejected(tree, damage):
+    """Cargo provenance 缺漏、schema 錯誤或缺少結束狀態時，均不得被 fixture 自動補成有效證據。"""
+    tree.write()
+    report = tree.l1_reports[("linux", "cargo")]
+    tree.auto_cargo_provenance = False
+    report.pop("provenance", None)
+    if damage != "missing":
+        report["provenance"] = {
+            "schema": "cargo-l1-provenance.v1" if damage == "git_end" else "wrong-schema",
+            "git": {"head": tree.head, "clean": True,
+                    "end": {"head": tree.head, "clean": True}},
+        }
+        if damage == "git_end":
+            report["provenance"]["git"].pop("end")
+
+    _, gate_report = tree.run()
+    row = _l1_row(gate_report, "s1a_cargo", "linux")
+    assert row["verdict"] == "evidence-insufficient", row
+    assert gate_report["overall"] == "FAIL"
+
+
+def test_l1_cargo_provenance_does_not_overwrite_a_real_fail(tree):
+    """provenance 缺漏只能補強不足判定，不得把 Cargo 的真實 FAIL 改成 evidence-insufficient。"""
+    tree.write()
+    report = tree.l1_reports[("linux", "cargo")]
+    tree.auto_cargo_provenance = False
+    report.pop("provenance", None)
+    report["results"][0]["outcome"] = "failed"
+    report["counts"]["all"]["failed"] = 1
+    report["exit_code"] = 1
+
+    _, gate_report = tree.run()
+    row = _l1_row(gate_report, "s1a_cargo", "linux")
+    assert row["verdict"] == "FAIL", row
+    assert any("provenance" in reason.lower() for reason in row["reasons"]), row
+    assert gate_report["overall"] == "FAIL"
+
+
 def test_l1_delegation_judged_from_blackbox_report(tree):
     tree.l1_reports.pop(("linux", "cargo"))
     code, rep = tree.run()
     assert _l1_row(rep, "s1a_cargo", "linux")["verdict"] == "evidence-insufficient"
     assert _l1_row(rep, "s1a_delegation", "linux")["verdict"] == "PASS"
     assert rep["overall"] == "FAIL"
+
+
+def test_slugged_contract_case_uses_source_ref(tree):
+    cid = "bb-session-reaches-ready"
+    source_ref = "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready"
+    tree.cases.append({"case_id": cid, "layer": "L1", "cli_stage": "1A", "source_ref": source_ref})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.ab_report["cases"].append({
+        "id": "test_bb_daemon_e2e.py::test_session_reaches_ready",
+        "case": "test_bb_daemon_e2e.py::test_session_reaches_ready",
+        "class": "ok",
+    })
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "ok"
+
+
+def test_slugged_contract_case_rejects_any_bad_source_ref_row(tree):
+    cid = "bb-session-reaches-ready"
+    source_ref = "tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_reaches_ready"
+    tree.cases.append({"case_id": cid, "layer": "L1", "cli_stage": "1A", "source_ref": source_ref})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    for class_name in ("ok", "regression"):
+        tree.ab_report["cases"].append({
+            "id": f"report-{class_name}",
+            "case": "test_bb_daemon_e2e.py::test_session_reaches_ready",
+            "class": class_name,
+        })
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "regression"
+
+
+def test_slugged_contract_case_does_not_fall_back_when_source_ref_is_absent(tree):
+    cid = "bb-session-reaches-ready"
+    tree.cases.append({
+        "case_id": cid,
+        "layer": "L1",
+        "cli_stage": "1A",
+        "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_missing_case",
+    })
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.ab_report["cases"].append({"id": cid, "class": "ok"})
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+
+def test_l15_cases_are_found_across_repeated_reports(tree):
+    first = "l15-first-scenario"
+    second = "l15-second-scenario"
+    tree.cases.extend([
+        {"case_id": first, "layer": "L1.5", "platforms": ["linux", "windows"]},
+        {"case_id": second, "layer": "L1.5", "platforms": ["linux", "windows"]},
+    ])
+    tree.lock["sets"]["cli_1A"] = sorted([A1, first, second, Z])
+    # 宣告 linux+windows 的案例須兩平台各有列（Linux 列不得替代 Windows）；本測試重點仍是跨多份報告找列。
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": first, "verdict": "PASS", "gate_eligible": True}]}),
+        ("linux", {"results": [{"case_id": second, "verdict": "PASS", "gate_eligible": True}]}),
+        ("windows", {"results": [
+            {"case_id": first, "verdict": "PASS", "gate_eligible": True},
+            {"case_id": second, "verdict": "PASS", "gate_eligible": True},
+        ]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, first)["status"] == "PASS"
+    assert _case_row(rep, second)["status"] == "PASS"
+
+
+def test_l15_case_requires_all_matching_rows_to_be_gate_eligible(tree):
+    cid = "l15-eligible-everywhere"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": False}]}),
+        ("windows", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+
+def test_l15_case_fails_if_any_matching_row_fails(tree):
+    cid = "l15-fails-anywhere"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "FAIL", "gate_eligible": True}]}),
+        ("windows", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "FAIL"
+
+
+def test_windows_l15_case_cannot_use_linux_evidence(tree):
+    cid = "win-com-open-exclusive"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+    tree.l15_reports.append(
+        ("windows", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]})
+    )
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "PASS"
+
+
+def test_l15_case_declared_on_windows_is_not_satisfied_by_linux_rows(tree):
+    """宣告 linux+windows 的 L1.5 案例：只有 Linux 列（Windows 報告缺席）→ evidence-insufficient，不得 PASS。"""
+    cid = "l15-needs-windows-producer"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    _, rep = tree.run()
+
+    assert _case_row(rep, cid)["status"] == "evidence-insufficient"
+
+
+def test_l15_status_requires_each_declared_platform_row():
+    """單元層：platforms 宣告時每個平台都要有列；未宣告時行為不變（既有 PASS 判定保留）。"""
+    gate = _load_gate_module()
+    lin = {"case_id": "c", "verdict": "PASS", "gate_eligible": True, "platform": "linux"}
+    win = {"case_id": "c", "verdict": "PASS", "gate_eligible": True, "platform": "windows"}
+    assert gate._l15_case_status([dict(lin)], ["linux", "windows"]) == "evidence-insufficient"
+    assert gate._l15_case_status([dict(lin), dict(win)], ["linux", "windows"]) == "PASS"
+    assert gate._l15_case_status([dict(lin)]) == "PASS"
+
+
+def test_unprefixed_l15_report_path_is_linux_compatible(tree):
+    cid = "l15-legacy-linux-report"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]})
+    ]
+
+    _, rep = tree.run(legacy_l15_report=True)
+
+    assert _case_row(rep, cid)["status"] == "PASS"
+
+
+def test_incomplete_l15_report_is_rejected(tree):
+    """F7：每案中途寫出的部分報告（complete=false）不得作為 L1.5 證據；gate 須判證據不足並記錄錯誤。"""
+    cid = "l15-incomplete-report"
+    tree.cases.append({"case_id": cid, "layer": "L1.5", "platforms": ["linux"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, cid, Z])
+    tree.l15_reports = [
+        ("linux", {"complete": False, "results": [{"case_id": cid, "verdict": "PASS", "gate_eligible": True}]}),
+    ]
+
+    rc, rep = tree.run()
+
+    assert rc != 0
+    assert _case_row(rep, cid)["status"] != "PASS"
+    assert any("complete" in str(e) for e in rep["errors"])
+
+
+def _set_evidence_insufficient_invariant_cases(tree, cases: list[str]) -> None:
+    invariant = next(x for x in tree.coverage["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    invariant["cases"] = cases
+
+
+def test_evidence_insufficient_invariant_accepts_passing_pytest_junit(tree):
+    cases = [
+        "test_rust_ab_compare.py::test_classification",
+        "test_rust_stage1a_gate.py::test_l1_single_passing_case_is_insufficient",
+    ]
+    _set_evidence_insufficient_invariant_cases(tree, cases)
+    tree.pytest_junit_xml = (
+        '<testsuites tests="2" failures="0" errors="0" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="0" skipped="0">'
+        '<testcase classname="tests.test_rust_ab_compare" name="test_classification" />'
+        '<testcase classname="tests.test_rust_stage1a_gate" '
+        'name="test_l1_single_passing_case_is_insufficient" />'
+        '</testsuite></testsuites>'
+    )
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "PASS"
+    assert invariant["missing_or_failed"] == []
+
+
+def test_evidence_insufficient_invariant_fails_without_pytest_junit(tree):
+    cases = ["test_rust_ab_compare.py::test_classification"]
+    _set_evidence_insufficient_invariant_cases(tree, cases)
+    tree.pytest_junit_xml = None  # 不提供 --pytest-junit-report（預設 fixture 會帶入 s1_pytest_full 的 JUnit）
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "FAIL"
+    assert invariant["missing_or_failed"] == cases
+    assert rep["overall"] == "FAIL"
+
+
+def test_evidence_insufficient_invariant_fails_on_pytest_junit_failure(tree):
+    case = "test_rust_ab_compare.py::test_classification"
+    _set_evidence_insufficient_invariant_cases(tree, [case])
+    tree.pytest_junit_xml = (
+        '<testsuites tests="1" failures="1" errors="0" skipped="0">'
+        '<testsuite tests="1" failures="1" errors="0" skipped="0">'
+        '<testcase classname="tests.test_rust_ab_compare" name="test_classification">'
+        '<failure message="assertion failed" />'
+        '</testcase></testsuite></testsuites>'
+    )
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "FAIL"
+    assert invariant["missing_or_failed"] == [case]
+
+
+def test_evidence_insufficient_invariant_fails_when_junit_suite_has_other_error(tree):
+    case = "test_rust_ab_compare.py::test_classification"
+    _set_evidence_insufficient_invariant_cases(tree, [case])
+    tree.pytest_junit_xml = (
+        '<testsuites tests="2" failures="0" errors="1" skipped="0">'
+        '<testsuite tests="2" failures="0" errors="1" skipped="0">'
+        '<testcase classname="tests.test_rust_ab_compare" name="test_classification" />'
+        '<testcase classname="tests.test_unrelated" name="test_other_case">'
+        '<error message="fixture setup failed" />'
+        '</testcase></testsuite></testsuites>'
+    )
+
+    _, rep = tree.run()
+
+    invariant = next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+    assert invariant["status"] == "FAIL"
+    assert invariant["missing_or_failed"] == [case]
+
+
+
+# ---------------------------------------------------------------------------
+# S1X-gate-accounting：擁有者機台相依列（cap_*／登記列）不得靜默消失（BLOCKED-OWNER）；
+# pytest JUnit 必須帶 provenance（HEAD＝受測 revision、SW_REQUIRE_CARGO=1、argv 涵蓋 tests/）；
+# spike3 證據依 schema 與 git_head 判定，未知 EDR 不得 PASS。
+# ---------------------------------------------------------------------------
+
+LINUX_OWNER_OUTCOMES = {
+    "cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename": "passed",
+    "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem": "passed",
+    "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child": "passed",
+    "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c": "passed",
+    "cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure": "passed",
+}
+GUI = "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem"
+
+
+def _cargo_report(platform: str, owner: dict[str, str], *, omit: tuple[str, ...] = ()) -> dict[str, Any]:
+    """cargo 報告：CARGO1 必為 passed；owner 為登記列的結果；omit 內的 nodeid 整列自報告中移除（不收集）。"""
+    argv = list(CARGO_LINUX["argv"]) if platform == "linux" else list(CARGO_WIN["argv"])
+    outcomes = {CARGO1: "passed", **owner}
+    for nid in omit:
+        outcomes.pop(nid, None)
+    return _report(platform, runner="cargo", argv=argv, markexpr="", nodeids=list(outcomes), outcomes=outcomes)
+
+
+def test_owner_gated_row_absent_from_lock_is_blocked_owner_not_verified(tree):
+    """鎖內不含 cap 列、報告以 skipped 呈現 → 列為 BLOCKED-OWNER，整體不得 VERIFIED（不得因不在鎖內而消失）。"""
+    owner = dict(LINUX_OWNER_OUTCOMES, **{GUI: "skipped"})
+    tree.l1_reports[("linux", "cargo")] = _cargo_report("linux", owner)
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] == "BLOCKED-OWNER", row
+    assert GUI in json.dumps(rep["owner_gated"], ensure_ascii=False)
+    assert rep["overall"] == "IMPLEMENTED", rep["overall"]
+
+
+def test_owner_gated_expected_row_absent_from_report_is_insufficient(tree):
+    """登記列在 selector 涵蓋範圍內且本平台會編譯，卻在報告中完全缺席 → INSUFFICIENT，整體 FAIL。"""
+    tree.l1_reports[("linux", "cargo")] = _cargo_report("linux", LINUX_OWNER_OUTCOMES, omit=(GUI,))
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any("launcher_gui_subsystem" in r for r in row["reasons"]), row["reasons"]
+    assert rep["overall"] == "FAIL"
+
+
+def test_owner_gated_locked_skip_maps_to_blocked_owner_not_fail(tree):
+    """過渡期：cap 列仍在鎖內且為 skipped → judge 的 INSUFFICIENT 僅由擁有者列造成時，列為 BLOCKED-OWNER（非 PASS）。"""
+    tree.l1_lock["sets"]["s1a_cargo"]["linux"]["nodeids"] = sorted([CARGO1, GUI])
+    tree.l1_reports[("linux", "cargo")] = _cargo_report("linux", dict(LINUX_OWNER_OUTCOMES, **{GUI: "skipped"}))
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] == "BLOCKED-OWNER", row
+    assert rep["overall"] == "IMPLEMENTED", rep["overall"]
+
+
+def test_owner_gated_skip_is_not_hidden_by_non_owner_gap(tree):
+    """必要的非擁有者案例 CARGO1 缺席，同時 cap 列 skipped → 仍 FAIL（擁有者列不得掩蓋其他缺口）。"""
+    tree.l1_lock["sets"]["s1a_cargo"]["linux"]["nodeids"] = sorted([CARGO1, GUI])
+    report = _cargo_report("linux", dict(LINUX_OWNER_OUTCOMES, **{GUI: "skipped"}), omit=(CARGO1,))
+    tree.l1_reports[("linux", "cargo")] = report
+    code, rep = tree.run()
+    row = _l1_row(rep, "s1a_cargo", "linux")
+    assert row["verdict"] != "BLOCKED-OWNER", row
+    assert rep["overall"] == "FAIL"
+
+
+def _junit_case_xml(case_id: str, *, failure: bool = False) -> str:
+    classname, name = case_id.split("::")
+    cls = classname.replace("/", ".").removesuffix(".py")
+    body = '<failure message="x"/>' if failure else ""
+    n = 1 if failure else 0
+    return (
+        f'<testsuites tests="1" failures="{n}" errors="0" skipped="0">'
+        f'<testsuite tests="1" failures="{n}" errors="0" skipped="0">'
+        f'<testcase classname="tests.{cls}" name="{name}">{body}</testcase>'
+        "</testsuite></testsuites>"
+    )
+
+
+_PROVENANCE_CASE = "test_rust_ab_compare.py::test_classification"
+
+
+def _provenance_invariant(tree: GateTree, props: dict[str, str] | None) -> dict[str, Any]:
+    """以單一案例的 pytest JUnit 驅動安全不變量；props 為 None 時自動帶入正確 provenance。"""
+    if tree.head is None:
+        tree.head = _init_git_head(tree.root)
+    _set_evidence_insufficient_invariant_cases(tree, [_PROVENANCE_CASE])
+    tree.pytest_junit_xml = _junit_case_xml(_PROVENANCE_CASE)
+    tree.junit_props = props
+    _, rep = tree.run()
+    return next(x for x in rep["invariants"] if x["id"] == "evidence-insufficient-never-pass")
+
+
+def test_pytest_junit_with_full_provenance_is_accepted(tree):
+    inv = _provenance_invariant(tree, None)
+    assert inv["status"] == "PASS", inv
+
+
+def test_pytest_junit_without_provenance_is_rejected(tree):
+    inv = _provenance_invariant(tree, {})
+    assert inv["status"] == "FAIL", inv
+
+
+def test_pytest_junit_head_mismatch_is_rejected(tree):
+    _provenance_invariant(tree, None)  # 先取得 tree.head
+    inv = _provenance_invariant(tree, {**tree.default_junit_props(), "HEAD": "0" * 40})
+    assert inv["status"] == "FAIL"
+    assert inv["missing_or_failed"] == [_PROVENANCE_CASE]
+
+
+def _eff(**changes: Any) -> str:
+    return json.dumps({**_PROVENANCE_EFFECTIVE, **changes}, sort_keys=True)
+
+
+@pytest.mark.parametrize("override", [
+    {"SW_REQUIRE_CARGO": "0"},
+    {"SW_REQUIRE_CARGO": None},
+    {"HEAD": None},
+    {"argv": json.dumps(["-q", "tests/test_rust_stage1a_gate.py", "-p", "junit_provenance"])},
+    {"argv": json.dumps(["-q", "tests/", "-k", "rust"])},
+    {"argv": json.dumps(["-q", "tests/", "-m", "core_portable"])},
+    {"argv": json.dumps(["-q", "tests/", "--deselect", "tests/x.py::y"])},
+    {"argv": "not-json"},
+    # 髒樹：同 HEAD 但工作樹有未提交／未追蹤變更，不得作為正式證據
+    {"git_clean": "0"},
+    {"git_clean": None},
+    # 生效設定縮小範圍（argv 看不出，例如 addopts／PYTEST_ADDOPTS 或合併短旗標 -xq）
+    {"effective": _eff(keyword="rust")},
+    {"effective": _eff(markexpr="core_portable")},
+    {"effective": _eff(deselect=["tests/x.py::y"])},
+    {"effective": _eff(ignore=["tests/acceptance"])},
+    {"effective": _eff(maxfail=1)},
+    {"effective": _eff(collectonly=True)},
+    {"effective": "not-json"},
+    {"effective": None},
+], ids=["require-cargo-0", "require-cargo-missing", "head-missing", "argv-not-tests-tree", "argv-k",
+        "argv-m", "argv-deselect", "argv-unparseable", "dirty-tree", "git-clean-missing",
+        "effective-keyword-via-addopts", "effective-markexpr", "effective-deselect", "effective-ignore",
+        "effective-maxfail-via-xq", "effective-collectonly", "effective-unparseable", "effective-missing"])
+def test_pytest_junit_provenance_violations_rejected(tree, override):
+    _provenance_invariant(tree, None)  # 先取得 tree.head
+    base = tree.default_junit_props()
+    props = {k: v for k, v in {**base, **override}.items() if v is not None}
+    inv = _provenance_invariant(tree, props)
+    assert inv["status"] == "FAIL", (override, inv)
+
+
+SP = "win-wal-av-rotate"  # spike3 產物 scripts/stage0/spike3_win_wal.py 的 case_id（L1.5、cli_1A）
+SP_CASES = (
+    "win-wal-av-rotate",
+    "win-wal-av-unlink",
+    "win-wal-av-reader-handle",
+    "win-wal-f12-progress",
+)
+
+
+def _enable_spike3_case(tree: GateTree, case_id: str = SP, *, mutate=None, **doc_kwargs: Any) -> dict[str, Any]:
+    """啟用一個 Spike 3 案例（L1.5、cli_1A）；證據的 git_head 預設為受測 HEAD。"""
+    tree.head = _init_git_head(tree.root)
+    tree.cases.append({"case_id": case_id, "layer": "L1.5", "cli_stage": "1A"})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, Z, case_id])
+    doc = _spike3_doc(tree.head, case_id=case_id, **doc_kwargs)
+    if mutate is not None:
+        mutate(doc)
+    tree.spike3 = {case_id: doc}
+    return doc
+
+
+def _enable_spike3(tree: GateTree, *, mutate=None, **doc_kwargs: Any) -> dict[str, Any]:
+    """維持既有 rotate 測試 helper 的呼叫介面。"""
+    return _enable_spike3_case(tree, SP, mutate=mutate, **doc_kwargs)
+
+
+def _spike3_observations(case_id: str) -> dict[str, Any]:
+    """各 Spike 3 案例的有效觀察替身，避免只用自報 verdict 走過 gate。"""
+    append_count = {
+        "win-wal-av-rotate": 400,
+        "win-wal-av-unlink": 11,
+        "win-wal-av-reader-handle": 401,
+        "win-wal-f12-progress": 403,
+    }[case_id]
+    common = {
+        "append_count": append_count, "append_latency_ms": [1.0] * append_count,
+        "lease_acquired_ns": 50, "stimulus_started_ns": 100, "lease_until_ns": 1000,
+        "oplock_variant_status": "PASS",
+        "oplock_variant": {
+            "append_count": 403, "append_latency_ms": [0.5] * 403,
+            "archives": 1, "records": 403, "continuity_meta_count": 0,
+            "first_seq": 1, "last_seq": 403, "seq_continuous": True,
+            "rotate_retry": 0, "deferred_delete_pending": 0, "write_failures": 0,
+            "pre_rotate": {"ok": True}, "post_rotate": {"ok": True}, "crc_errors": [],
+            "archive_scan_elapsed_ms": 0.2, "oracle_wait_elapsed_ms": 1.5,
+            "interference_observed": True,
+            "lease_request_id": "oplock-lease-1",
+            "oplock_breaks": [{
+                "event": "oplock_break", "request_id": "oplock-lease-1", "name": "raw.wal.ndjson",
+                "lease_acquired_ns": 100, "lease_until_ns": 200,
+                "break_notified_ns": 150, "break_completed": True,
+                "ack_required": True, "ack_method": "close_handle",
+                "close_started_ns": 220, "close_completed_ns": 260,
+                "close_succeeded": True, "acknowledged_ns": 260, "observation_error": None,
+            }],
+            "lease_acquired_ns": 100, "stimulus_started_ns": 120,
+            "rotation_requested_ns": 120, "rotation_completed_ns": 250, "lease_until_ns": 200,
+            "rotation_attempt_count": 1, "rotation_request_succeeded": True,
+            "rotation_append_index": 1, "rotation_append_started_ns": 100,
+            "rotation_append_completed_ns": 500100,
+            "rotation_completion_succeeded": True, "rotation_completion_append_index": 1,
+            "rotation_completion_append_started_ns": 100,
+            "rotation_completion_append_completed_ns": 500100,
+        },
+    }
+    if case_id == "win-wal-av-rotate":
+        return {
+            **common,
+            "archives": 1, "records": 400, "continuity_meta_count": 0,
+            "expected_records": 400, "first_seq": 1, "last_seq": 400,
+            "seq_continuous": True, "rotate_retry": 1, "deferred_delete_pending": 0,
+            "interference_observed": True,
+            "drain": {"tick_interval_s": 1.0, "ticks": 1, "drained": True},
+        }
+    if case_id == "win-wal-av-unlink":
+        return {
+            **common,
+            "unlink_attempts": 2, "sharing_violation_attempts": 1,
+            "interference_observed": True, "unlinked": True, "append_attempts_until_meta": 1,
+            "meta_count": 1, "loss_flag": True, "range_known": True,
+            "potentially_lost_seq_range": [1, 2],
+        }
+    if case_id == "win-wal-av-reader-handle":
+        return {
+            **common,
+            "rotation_failed_seen": True, "appended": 401, "records": 401,
+            "continuity_meta_count": 0, "first_seq": 1, "last_seq": 401,
+            "seq_continuous": True, "write_failures": 0, "deferred_delete_pending": 0,
+            "interference_observed": True,
+            "drain": {"tick_interval_s": 1.0, "ticks": 1, "drained": True},
+        }
+    if case_id == "win-wal-f12-progress":
+        return {
+            **common,
+            "archives": 1, "records": 403, "continuity_meta_count": 0,
+            "first_seq": 1, "last_seq": 403, "seq_continuous": True,
+            "rotate_retry": 1, "deferred_delete_pending": 0,
+            "pre_rotate": {"ok": True, "reason_code": "none", "diagnostics": {}},
+            "post_rotate": {"ok": True, "reason_code": "none", "diagnostics": {}},
+            "crc_errors": [], "interference_observed": True,
+            "drain": {"tick_interval_s": 1.0, "ticks": 1, "drained": True},
+        }
+    raise AssertionError(f"unknown Spike 3 case: {case_id}")
+
+
+def _spike3_doc(git_head: str, *, verdict: str = "PASS", product: str = "Vendor EDR",
+                status: str = "enabled", case_id: str = SP, drop_integrity: bool = False,
+                drop_av: bool = False, unchanged: bool = True, launch_refused: bool = False,
+                oplock: str = "granted", grabs: Any = 3, launch_error: str = "none",
+                subjects: Any = None, sha_after: str | None = None) -> dict[str, Any]:
+    """spike3 證據替身（OD-19 形態）：edr 為選填資訊欄；av_sim 與 binary_integrity 為必填。
+
+    oplock 預設 granted 僅為替身，用來走通 PASS 路徑（gate 只接受 granted／denied／unavailable）；
+    真實值必須由原生 Windows 執行產生，不得以替身代替證據。
+    """
+    if subjects is None:
+        subjects = [{"path": "python.exe", "exists_before": True, "exists_after": True,
+                     "sha256_before": "c" * 64, "sha256_after": sha_after or "c" * 64, "unchanged": unchanged}]
+    doc: dict[str, Any] = {
+        "case_id": case_id,
+        "run_at": "2026-10-22T00:00:00Z",
+        "env": {
+            "os": "Windows 10", "timing_method": "time.perf_counter_ns",
+            "timing_clock": "QueryPerformanceCounter", "timing_resolution_ns": 100,
+            "timing_monotonic": True, "timing_adjustable": False,
+        },
+        "artifact": {"binary": "sw_core (Python 基線)", "revision": "a" * 40, "tree_sha256": "b" * 64,
+                     "git_head": git_head, "git_clean": True},
+        "steps": [{"op": "case", "ts": "2026-10-22T00:00:01Z", "result": "ok"}],
+        "observations": _spike3_observations(case_id),
+        "av_sim": {"mode": "share_no_delete", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE",
+                   "hold_ms_range": [10, 500], "seed": 20261023, "oplock": "not_requested",
+                   "launch_error": launch_error, "grabs": grabs, "open_errors": 0, "helper_exit": 0,
+                   "variants": {"oplock": {
+                       "mode": "oplock",
+                       "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE",
+                       "hold_ms_range": [10, 500], "seed": 20261023, "oplock": oplock,
+                       "launch_error": "none", "grabs": 1, "open_errors": 0, "helper_exit": 0,
+                       "lease_request_id": "oplock-lease-1",
+                       "oplock_breaks": [{
+                           "event": "oplock_break", "request_id": "oplock-lease-1",
+                           "name": "raw.wal.ndjson", "lease_acquired_ns": 100,
+                           "lease_until_ns": 200, "break_notified_ns": 150,
+                           "break_completed": True, "ack_required": True,
+                           "ack_method": "close_handle", "close_started_ns": 220,
+                           "close_completed_ns": 260, "close_succeeded": True,
+                           "acknowledged_ns": 260,
+                           "observation_error": None,
+                       }],
+                   }}},
+        "binary_integrity": {
+            "subjects": subjects,
+            "unchanged": unchanged, "launch_refused": launch_refused, "launch_error": "none",
+        },
+        "edr": {"product": product, "status": status, "interceptions": "unknown"},
+        "verdict": verdict,
+        "fallback": "none",
+    }
+    if drop_integrity:
+        del doc["binary_integrity"]
+    if drop_av:
+        del doc["av_sim"]
+    return doc
+
+
+def test_spike3_dirty_tree_evidence_is_insufficient_never_pass(tree):
+    """spike3 證據產出於髒樹（artifact.git_clean 非 true）即使 HEAD 相符也不得 PASS。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["artifact"].__setitem__("git_clean", False))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] != "PASS", _case_row(rep, SP)
+
+
+def test_spike3_pass_with_known_edr_is_pass(tree):
+    """OD-22 有效延遲樣本通過時，EDR 欄位仍只供資訊記錄。"""
+    _enable_spike3(tree)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+@pytest.mark.parametrize("bound_mode,expected", [("above", "PASS"), ("below", "FAIL")])
+def test_spike3_latency_bound_pass_and_fail_paths(tmp_path, bound_mode, expected):
+    """OD-22 最大 append 樣本分別走 PASS 與超限 FAIL 分支。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    samples = doc["observations"]["append_latency_ms"]
+    samples[:] = [1.0] * len(samples)
+    samples[-1] = 600.0 if bound_mode == "above" else 600.1
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == expected, reasons
+    if expected == "FAIL":
+        assert any("OD-22 上限" in reason for reason in reasons)
+
+
+@pytest.mark.parametrize(
+    "sample_set,distribution,expected",
+    [
+        ("main", "p99_over", "FAIL"),
+        ("main", "max_over", "FAIL"),
+        ("oplock", "p99_over", "FAIL"),
+        ("oplock", "max_over", "FAIL"),
+        ("both", "within", "PASS"),
+        ("main", "missing", "evidence-insufficient"),
+        ("oplock", "missing", "evidence-insufficient"),
+        ("main", "count_mismatch", "evidence-insufficient"),
+        ("oplock", "count_mismatch", "evidence-insufficient"),
+    ],
+)
+def test_spike3_od22_latency_limits_apply_to_both_sample_sets(
+    tmp_path, sample_set, distribution, expected,
+):
+    """OD-22 同時檢查主案例與 oplock 的 p99 ≤100 ms、最大值 ≤600 ms。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    observations = doc["observations"]
+    sample_sets = (
+        ("main", observations["append_latency_ms"]),
+        ("oplock", observations["oplock_variant"]["append_latency_ms"]),
+    )
+    for name, field in sample_sets:
+        count = len(field)
+        if distribution == "p99_over" and sample_set in ("both", name):
+            field[:] = [1.0] * count
+            field[-5:] = [101.0] * 5
+        elif distribution == "max_over" and sample_set in ("both", name):
+            field[:] = [1.0] * count
+            field[-1] = 601.0
+        elif distribution == "missing" and sample_set == name:
+            field.clear()
+        elif distribution == "count_mismatch" and sample_set == name:
+            field.pop()
+        elif distribution == "within":
+            field[:] = [100.0] * count
+            field[-1] = 600.0
+
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == expected, reasons
+    if expected == "FAIL":
+        assert any("p99" in reason or "最大" in reason for reason in reasons), reasons
+
+
+@pytest.mark.parametrize("error_key", ["oplock_variant_error", "oplock_variant_close_error"])
+def test_spike3_oplock_variant_errors_are_insufficient(tmp_path, error_key):
+    """oplock 子變體執行或收尾例外不得被有效 grabs 與 workload 掩蓋。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    doc["observations"][error_key] = "OSError: injected failure"
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "evidence-insufficient", reasons
+    assert any(error_key in reason for reason in reasons), reasons
+
+
+def test_spike3_oplock_grabs_without_live_rotation_are_insufficient(tmp_path):
+    """rotation 必須在 lease 內提出；oplock break ACK 可使完成時間晚於 lease。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    doc["observations"]["oplock_variant"].update({
+        "lease_acquired_ns": 100,
+        "stimulus_started_ns": 120,
+        "rotation_requested_ns": 120,
+        "lease_until_ns": 200,
+        "rotation_completed_ns": 250,
+    })
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    evidence_path = evidence_dir / f"{SP}.json"
+    evidence_path.write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "PASS", reasons
+
+    doc["observations"]["oplock_variant"]["rotation_requested_ns"] = 200
+    doc["observations"]["oplock_variant"]["stimulus_started_ns"] = 200
+    evidence_path.write_text(json.dumps(doc), encoding="utf-8")
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+    assert status == "evidence-insufficient", reasons
+    assert any("rotation_requested_ns 必須位於 lease 有效區間" in reason for reason in reasons), reasons
+
+
+def test_spike3_oplock_unbounded_completion_cannot_pass(tmp_path):
+    """rename 完成時間須與實際 append 樣本相符並受 OD-22 上限涵蓋。"""
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    workload = doc["observations"]["oplock_variant"]
+    workload["rotation_completed_ns"] = workload["rotation_requested_ns"] + 10_000_000_000
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "evidence-insufficient", reasons
+    assert any("rotation completion 須落在完成它的 WalWriter.append 時間窗內" in reason
+               for reason in reasons), reasons
+
+
+def test_spike3_rotation_wait_beyond_append_bound_is_not_an_od22_failure(tmp_path):
+    """OD-22 只限制 append 延遲樣本；跨多次 append 的 rotation 等待不得另以 600 ms 判 FAIL。
+
+    rotation 於第 1 次 append 提出、第 3 次 append 完成，每次 append 都 ≤ 600 ms，
+    但 request→completion 合計 700 ms；OD-19 只要求「最終完成」，OD-22 未授權額外的完成時限。
+    """
+    gate = _load_gate_module()
+    head = "a" * 40
+    doc = _spike3_doc(head)
+    workload = doc["observations"]["oplock_variant"]
+    ms = 1_000_000
+    workload.update({
+        "lease_acquired_ns": 100, "stimulus_started_ns": 120, "rotation_requested_ns": 120,
+        "lease_until_ns": 200 * ms,
+        "rotation_append_index": 1, "rotation_append_started_ns": 100, "rotation_append_completed_ns": 300 * ms,
+        "rotation_completion_append_index": 3,
+        "rotation_completion_append_started_ns": 500 * ms,
+        "rotation_completion_append_completed_ns": 700 * ms + 120,
+        "rotation_completed_ns": 700 * ms + 120,
+    })
+    workload["append_latency_ms"][0] = 300.0
+    workload["append_latency_ms"][2] = 200.001
+    break_update = {
+        "lease_until_ns": 200 * ms, "break_notified_ns": 150,
+        "close_started_ns": 200 * ms, "close_completed_ns": 210 * ms, "acknowledged_ns": 210 * ms,
+    }
+    workload["oplock_breaks"][0].update(break_update)
+    # helper 原始 break 記錄須與 workload 一致。
+    doc["av_sim"]["variants"]["oplock"]["oplock_breaks"][0].update(break_update)
+    evidence_dir = tmp_path / "spike3"
+    evidence_dir.mkdir()
+    (evidence_dir / f"{SP}.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    status, reasons = gate._spike3_status(
+        SP, evidence_dir, ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json", head,
+    )
+
+    assert status == "PASS", reasons
+
+
+def test_spike3_unknown_edr_is_blocked_owner_never_pass(tree):
+    """保留凍結 nodeid：未知 EDR 不影響 OD-22 延遲合格的 PASS。"""
+    _enable_spike3(tree, product="unknown", status="unknown")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert not any("EDR" in reason or "edr" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+def test_spike3_unknown_edr_is_info_only_and_does_not_block_pass(tree):
+    """保留已登記 nodeid；未知 EDR 不參與 OD-22 延遲判定。"""
+    _enable_spike3(tree, product="unknown", status="unknown")
+    code, rep = tree.run()
+    row = _case_row(rep, SP)
+    assert row["status"] == "PASS", row
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in row["evidence"]["reasons"])
+    assert not any("EDR" in reason or "edr" in reason for reason in row["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+def test_spike3_missing_append_latency_measurements_is_insufficient(tree):
+    """OD-19 (2)：缺少實際 append 延遲樣本時，不得用其他 WAL 結果代替延遲證據。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["observations"].pop("append_latency_ms"))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert any("append 延遲" in reason or "schema" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_owner_latency_bound_not_decided_cannot_pass(tree):
+    """保留凍結 nodeid：主案例缺 lease 時間戳不足；有效樣本與 lease 證據可通過。"""
+    def set_valid_latency_samples(doc: dict[str, Any]) -> None:
+        doc["observations"]["append_latency_ms"] = [2.0, *([1.0] * 399)]
+
+    def missing_main_lease(doc: dict[str, Any]) -> None:
+        set_valid_latency_samples(doc)
+        doc["observations"].pop("lease_acquired_ns")
+
+    _enable_spike3(tree, mutate=missing_main_lease)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+
+    def expired_main_stimulus(doc: dict[str, Any]) -> None:
+        set_valid_latency_samples(doc)
+        doc["observations"]["stimulus_started_ns"] = doc["observations"]["lease_until_ns"]
+
+    expired_tree = GateTree(tree.root.parent / "expired")
+    _enable_spike3(expired_tree, mutate=expired_main_stimulus)
+    code, rep = expired_tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+
+    valid_tree = GateTree(tree.root.parent / "valid")
+    _enable_spike3(valid_tree, mutate=set_valid_latency_samples)
+    code, rep = valid_tree.run()
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert not any("PENDING-OD-S1X-AVSIM-LATENCY" in reason for reason in _case_row(rep, SP)["evidence"]["reasons"])
+    assert rep["overall"] == "IMPLEMENTED"
+
+
+def test_spike3_invalid_append_latency_measurement_is_insufficient(tree):
+    """OD-19 (2)：非數值、負數或非有限值不能充當 append 延遲證據。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["observations"].update({"append_latency_ms": [1.0, "fast"]}))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_nonzero_helper_exit_is_insufficient_never_owner_pending(tree):
+    """helper 有非零退出碼時證據不足；不可只靠先前 grabs 和自報 PASS 進入 owner pending。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["av_sim"].__setitem__("helper_exit", 1))
+    code, rep = tree.run()
+    row = _case_row(rep, SP)
+    assert row["status"] == "evidence-insufficient", row
+    assert any("helper" in reason.lower() for reason in row["evidence"]["reasons"])
+    assert rep["overall"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    ("case_id", "field"),
+    [
+        ("win-wal-av-rotate", "seq_continuous"),
+        ("win-wal-av-unlink", "meta_count"),
+        ("win-wal-av-unlink", "sharing_violation_attempts"),
+        ("win-wal-av-unlink", "interference_observed"),
+        ("win-wal-av-reader-handle", "write_failures"),
+        ("win-wal-f12-progress", "post_rotate"),
+        ("win-wal-f12-progress", "rotate_retry"),
+        ("win-wal-f12-progress", "records"),
+    ],
+)
+def test_spike3_each_case_requires_its_own_observations(tree, case_id: str, field: str):
+    """四個 Spike 3 case 均須提交能支撐 PASS 的案例專屬觀察，不得以 verdict 欄位代替。"""
+    def remove_required_observation(doc: dict[str, Any]) -> None:
+        doc["observations"].pop(field)
+
+    _enable_spike3_case(tree, case_id, mutate=remove_required_observation)
+    code, rep = tree.run()
+    row = _case_row(rep, case_id)
+    assert row["status"] == "evidence-insufficient", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_rotate_counts_continuity_meta_without_calling_it_data_loss(tree):
+    """tick 完成延後輪替時會新增連續性 META；仍須保留 400 筆資料 append 與完整 seq。"""
+    def add_continuity_meta(doc: dict[str, Any]) -> None:
+        obs = doc["observations"]
+        obs.update({"records": 401, "continuity_meta_count": 1, "last_seq": 401})
+
+    _enable_spike3(tree, mutate=add_continuity_meta)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "PASS", _case_row(rep, SP)
+    assert rep["overall"] == "IMPLEMENTED"
+    assert code == 0
+
+
+def test_spike3_f12_requires_proven_rotate_and_complete_sequence(tree):
+    """F12 marker 成功不能替代跨輪替資料完整性與實際輪替干擾證據。"""
+    def remove_rotation_evidence(doc: dict[str, Any]) -> None:
+        obs = doc["observations"]
+        obs.pop("rotate_retry")
+        obs["last_seq"] = 402
+
+    _enable_spike3_case(tree, "win-wal-f12-progress", mutate=remove_rotation_evidence)
+    code, rep = tree.run()
+    assert _case_row(rep, "win-wal-f12-progress")["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+    assert code == 1
+
+
+def test_spike3_unlink_without_observed_sharing_violation_is_insufficient(tree):
+    """外部 unlink 未遇到 FILE_SHARE_DELETE 衝突時，即使 helper 抓到檔案也不能算干擾驗收。"""
+    def no_sharing_violation(doc: dict[str, Any]) -> None:
+        doc["observations"].update({"sharing_violation_attempts": 0, "interference_observed": False})
+
+    _enable_spike3_case(tree, "win-wal-av-unlink", mutate=no_sharing_violation)
+    code, rep = tree.run()
+    assert _case_row(rep, "win-wal-av-unlink")["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+    assert code == 1
+
+
+def test_spike3_binary_changed_is_insufficient_never_pass(tree):
+    """OD-19 (3)：測試前後執行檔 sha256 不一致即不得 PASS。"""
+    _enable_spike3(tree, unchanged=False)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_launch_refused_is_insufficient_never_pass(tree):
+    """OD-19 (3)：helper 或執行檔啟動被拒（launch_refused）即不得 PASS。"""
+    _enable_spike3(tree, launch_refused=True)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_zero_grabs_is_insufficient_never_pass(tree):
+    """OD-19 (2)：模擬防毒未實際佔用任何檔案（grabs=0）即不得 PASS（僅有自報 verdict 不足）。"""
+    _enable_spike3(tree, grabs=0)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_empty_subjects_is_insufficient_never_pass(tree):
+    """OD-19 (3)：binary_integrity.subjects 為空＝無前後比對證據，不得以 unchanged=true 過閘（schema minItems）。"""
+    _enable_spike3(tree, subjects=[])
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_sha_mismatch_with_unchanged_true_is_insufficient(tree):
+    """OD-19 (3)：sha256 前後不一致但自報 unchanged=true，gate 逐 subject 重算判定，仍不得 PASS。"""
+    subjects = [{"path": "python.exe", "exists_before": True, "exists_after": True,
+                 "sha256_before": "c" * 64, "sha256_after": "d" * 64, "unchanged": True}]
+    _enable_spike3(tree, subjects=subjects, sha_after="d" * 64)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_oplock_not_implemented_is_insufficient_never_pass(tree):
+    """OD-19 (2)：oplock 變體為驗收必要項；未實作（not_implemented）即標示 oplock_not_covered，不得 PASS。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["av_sim"]["variants"]["oplock"].__setitem__("oplock", "not_implemented"))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing", "append_count_invalid", "append_samples_missing", "append_sample_count",
+        "no_archive", "marker", "records_invalid", "records_math", "meta_invalid", "first_seq", "last_seq",
+        "sequence", "rotate_retry_invalid", "deferred_pending_invalid", "write_failures_invalid",
+        "deferred_pending", "write_failures", "pre_marker", "post_marker", "crc_errors",
+        "interference_false", "lease_acquired_ns_missing", "lease_request_id_missing",
+        "oplock_breaks_missing", "oplock_break_not_completed", "oplock_break_no_ack",
+        "oplock_break_notified_after_lease",
+        "oplock_break_ack_before_lease_expiry", "oplock_break_ack_after_rotation",
+        "oplock_break_request_mismatch", "helper_break_mismatch", "oplock_close_failed",
+        "coarse_timing_clock", "wrong_timing_method",
+        "stimulus_started_ns_missing", "rotation_completed_ns_missing", "lease_until_ns_missing",
+        "rotation_attempt_count_missing", "rotation_request_succeeded_missing", "rotation_append_index_missing",
+        "rotation_append_started_ns_missing", "rotation_append_completed_ns_missing",
+        "rotation_completion_succeeded_missing", "rotation_completion_append_index_missing",
+        "rotation_completion_append_started_ns_missing", "rotation_completion_append_completed_ns_missing",
+        "lease_timestamp_invalid", "stimulus_before_lease", "rotation_after_expiry",
+        "stimulus_request_mismatch", "rotation_completion_after_append_window", "interference_mismatch",
+    ],
+)
+def test_spike3_oplock_variant_must_prove_live_workload(tree, mutation):
+    """具備 helper grabs 仍不足：oplock 變體須證明寫入、輪替、F12 marker 與連續 WAL。"""
+    def damage(doc: dict[str, Any]) -> None:
+        workload = doc["observations"]["oplock_variant"]
+        if mutation == "missing":
+            doc["observations"].pop("oplock_variant")
+        elif mutation == "append_count_invalid":
+            workload["append_count"] = 0
+        elif mutation == "append_samples_missing":
+            workload["append_latency_ms"] = []
+        elif mutation == "append_sample_count":
+            workload["append_latency_ms"].pop()
+        elif mutation == "no_archive":
+            workload["archives"] = 0
+        elif mutation == "records_invalid":
+            workload["records"] = 0
+        elif mutation == "records_math":
+            workload["records"] = 404
+            workload["last_seq"] = 404
+        elif mutation == "meta_invalid":
+            workload["continuity_meta_count"] = -1
+        elif mutation == "first_seq":
+            workload["first_seq"] = 2
+        elif mutation == "last_seq":
+            workload["last_seq"] = workload["records"] + 1
+        elif mutation == "marker":
+            workload["post_rotate"]["ok"] = False
+        elif mutation == "sequence":
+            workload["seq_continuous"] = False
+        elif mutation == "rotate_retry_invalid":
+            workload["rotate_retry"] = -1
+        elif mutation == "deferred_pending_invalid":
+            workload["deferred_delete_pending"] = -1
+        elif mutation == "write_failures_invalid":
+            workload["write_failures"] = -1
+        elif mutation == "deferred_pending":
+            workload["deferred_delete_pending"] = 1
+        elif mutation == "write_failures":
+            workload["write_failures"] = 1
+        elif mutation == "pre_marker":
+            workload["pre_rotate"]["ok"] = False
+        elif mutation == "post_marker":
+            workload["post_rotate"]["ok"] = False
+        elif mutation == "crc_errors":
+            workload["crc_errors"].append("bad CRC")
+        elif mutation == "interference_false":
+            workload["interference_observed"] = False
+        elif mutation == "oplock_break_not_completed":
+            workload["oplock_breaks"][0]["break_completed"] = False
+        elif mutation == "oplock_break_no_ack":
+            workload["oplock_breaks"][0]["ack_required"] = False
+        elif mutation == "oplock_break_notified_after_lease":
+            row = workload["oplock_breaks"][0]
+            row["break_notified_ns"] = row["close_started_ns"] - 1
+            doc["av_sim"]["variants"]["oplock"]["oplock_breaks"][0]["break_notified_ns"] = row[
+                "break_notified_ns"
+            ]
+        elif mutation == "oplock_break_ack_before_lease_expiry":
+            workload["oplock_breaks"][0]["close_started_ns"] = workload["lease_until_ns"] - 1
+        elif mutation == "oplock_break_ack_after_rotation":
+            workload["oplock_breaks"][0]["close_started_ns"] = workload["rotation_completed_ns"] + 1
+        elif mutation == "oplock_break_request_mismatch":
+            workload["oplock_breaks"][0]["request_id"] = "different-lease"
+        elif mutation == "helper_break_mismatch":
+            doc["av_sim"]["variants"]["oplock"]["oplock_breaks"][0]["request_id"] = "other-helper-lease"
+        elif mutation == "oplock_close_failed":
+            workload["oplock_breaks"][0]["close_succeeded"] = False
+        elif mutation == "coarse_timing_clock":
+            doc["env"]["timing_resolution_ns"] = 15_625_000
+        elif mutation == "wrong_timing_method":
+            doc["env"]["timing_method"] = "time.monotonic_ns"
+        elif mutation.endswith("_missing"):
+            workload.pop(mutation.removesuffix("_missing"))
+        elif mutation == "lease_timestamp_invalid":
+            workload["lease_acquired_ns"] = "100"
+        elif mutation == "stimulus_before_lease":
+            workload["stimulus_started_ns"] = workload["lease_acquired_ns"] - 1
+        elif mutation == "rotation_after_expiry":
+            workload["rotation_requested_ns"] = workload["lease_until_ns"]
+            workload["stimulus_started_ns"] = workload["lease_until_ns"]
+        elif mutation == "stimulus_request_mismatch":
+            workload["stimulus_started_ns"] = workload["rotation_requested_ns"] - 1
+        elif mutation == "rotation_completion_after_append_window":
+            workload["rotation_completed_ns"] = workload["rotation_requested_ns"] + 10_000_000_000
+        else:
+            workload["interference_observed"] = False
+
+    _enable_spike3(tree, mutate=damage)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+    assert code == 1
+
+
+def test_spike3_oplock_helper_cannot_replace_no_delete_injection(tree):
+    """OD-19 (2)：允許 delete 的 oplock helper 不得取代主案例 no-delete 干擾證據。"""
+    _enable_spike3(tree, mutate=lambda doc: doc["av_sim"].update(
+        {"mode": "oplock", "share_mode": "FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE"}
+    ))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_helper_launch_error_is_insufficient_never_pass(tree):
+    """OD-19 (2)：模擬防毒 helper 啟動失敗（launch_error 非 none）不得 PASS。"""
+    _enable_spike3(tree, launch_error="helper_spawn_failed")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_missing_av_sim_parameters_is_insufficient(tree):
+    """OD-19 (2)：av_sim 參數為必填；缺漏即不合格（schema 驗證失敗）。"""
+    _enable_spike3(tree, drop_av=True)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient", _case_row(rep, SP)
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_git_head_mismatch_is_insufficient(tree):
+    _enable_spike3(tree, mutate=lambda d: d["artifact"].__setitem__("git_head", "0" * 40))
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_missing_evidence_file_is_insufficient(tree):
+    _enable_spike3(tree)
+    tree.spike3 = {}
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_schema_invalid_is_insufficient(tree):
+    _enable_spike3(tree, drop_integrity=True)
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_verdict_fail_is_fail(tree):
+    _enable_spike3(tree, verdict="FAIL")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "FAIL"
+    assert rep["overall"] == "FAIL"
+
+
+def test_spike3_insufficient_verdict_is_not_pass(tree):
+    _enable_spike3(tree, verdict="INSUFFICIENT_EVIDENCE")
+    code, rep = tree.run()
+    assert _case_row(rep, SP)["status"] == "evidence-insufficient"
+    assert rep["overall"] == "FAIL"
+
+
+def test_junit_provenance_plugin_records_head_require_cargo_and_argv(tmp_path):
+    """scripts/rust/junit_provenance.py 寫出的 properties 須能被 gate 的 provenance 檢查接受（HEAD／SW_REQUIRE_CARGO／argv）。"""
+    import os
+    import xml.etree.ElementTree as ET
+
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_probe.py").write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+    junit = tmp_path / "junit.xml"
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "scripts" / "rust"), "SW_REQUIRE_CARGO": "1"}
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests", "-p", "junit_provenance",
+         f"--junitxml={junit}"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=False,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    root = ET.parse(junit).getroot()
+    props = {p.get("name"): p.get("value") for p in root.iter("property")}
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                          check=True).stdout.strip()
+    assert props["HEAD"] == head
+    assert props["SW_REQUIRE_CARGO"] == "1"
+    argv = json.loads(props["argv"])
+    assert "tests" in argv and "junit_provenance" in " ".join(argv)
+    assert "--junitxml" in " ".join(argv)
+
+
+# ---- L15 gate accounting（計畫 04 §5c）：not_applicable 缺口與 verdict 對應 ----
+
+def _load_gate_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("stage1a_gate_under_test", GATE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_NA_LINUX_ROW = {
+    "verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": True,
+    "not_applicable_steps": [{"step": 8, "action": "cli"}], "platform": "linux",
+}
+_WIN_PASS_ROW = {"verdict": "PASS", "gate_eligible": True, "not_applicable_steps": [], "platform": "windows"}
+
+
+def test_l15_linux_na_only_plus_windows_pass_is_pass():
+    gate = _load_gate_module()
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW), dict(_WIN_PASS_ROW)]) == "PASS"
+
+
+def test_l15_linux_na_only_alone_is_evidence_insufficient():
+    gate = _load_gate_module()
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW)]) == "evidence-insufficient"
+
+
+def test_l15_insufficient_row_is_evidence_insufficient_not_fail():
+    gate = _load_gate_module()
+    row = {"verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": False, "not_applicable_steps": []}
+    assert gate._l15_case_status([row, dict(_WIN_PASS_ROW)]) == "evidence-insufficient"
+
+
+def test_l15_real_fail_still_fails_even_with_na_gap():
+    gate = _load_gate_module()
+    fail = {"verdict": "FAIL", "gate_eligible": False, "na_only_gap": False, "not_applicable_steps": []}
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW), fail]) == "FAIL"
+    assert gate._l15_case_status([dict(_NA_LINUX_ROW), dict(_WIN_PASS_ROW), fail]) == "FAIL"
+
+
+def test_l15_na_flag_without_structured_steps_does_not_exempt_row():
+    gate = _load_gate_module()
+    forged = {"verdict": "INSUFFICIENT_EVIDENCE", "gate_eligible": False, "na_only_gap": True, "not_applicable_steps": []}
+    assert gate._l15_case_status([forged, dict(_WIN_PASS_ROW)]) == "evidence-insufficient"
+
+
+PYT_PARAM_LINUX = "tests/test_rust_param_fixture.py::test_param_case[linux]"
+PYT_PARAM_WIN = "tests/test_rust_param_fixture.py::test_param_case[windows]"
+
+
+def _pytest_full_param_nodes(tree) -> list[str]:
+    """s1_pytest_full 凍結同一函式的兩個參數化 nodeid（S1X Y1：曾因去掉 `[param]` 合併成同 key）。"""
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_PARAM_LINUX, PYT_PARAM_WIN])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    return nodes
+
+
+def test_pytest_full_parametrized_nodeids_are_reconciled_individually(tree):
+    """參數化 nodeid 逐一對帳：`[linux]`／`[windows]` 各在 JUnit 恰一次且 passed → PASS（不得合併成出現 2 次）。"""
+    nodes = _pytest_full_param_nodes(tree)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({n: "passed" for n in nodes})
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert not any("逐列對帳失敗" in r for r in row["reasons"]), row["reasons"]
+    assert row["verdict"] == "PASS", row
+
+
+def test_pytest_full_parametrized_one_param_failed_is_not_pass(tree):
+    """參數化逐一對帳不得放寬：只有 `[windows]` failed 時，`[windows]` 列必須被點名、整列不得 PASS。"""
+    nodes = _pytest_full_param_nodes(tree)
+    outcomes = {n: "passed" for n in nodes}
+    outcomes[PYT_PARAM_WIN] = "failed"
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes,
+        outcomes=outcomes, exit_code=1)
+    tree.pytest_junit_xml = _pytest_full_junit_xml(outcomes)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] != "PASS", row
+    assert rep["overall"] == "FAIL"
+
+
+def test_pytest_full_parametrized_missing_param_is_not_pass(tree):
+    """JUnit 只有 `[linux]`、缺 `[windows]` → 不得以同函式另一參數補位成 PASS。"""
+    nodes = _pytest_full_param_nodes(tree)
+    present = {n: "passed" for n in nodes if n != PYT_PARAM_WIN}
+    present["tests/test_rust_other_fixture.py::test_filler"] = "passed"
+    tree.pytest_junit_xml = _pytest_full_junit_xml(present)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(PYT_PARAM_WIN in r for r in row["reasons"]), row["reasons"]
+
+
+PYT_SAMEMOD_TOP = "tests/test_rust_samemod.py::test_same_name"
+PYT_SAMEMOD_SUB = "tests/contract_blackbox/test_rust_samemod.py::test_same_name"
+
+
+def test_pytest_exact_key_matches_pytest_junit_mangling():
+    """nodeid 與 pytest junitxml（mangle_test_address）的 classname＋name 必須得到同一 key，且保留目錄段。"""
+    gate = _load_gate_module()
+    samples = [
+        ("tests/contract_blackbox/test_x.py::TestA::test_y[a::b.c d]",
+         "tests.contract_blackbox.test_x.TestA", "test_y[a::b.c d]"),
+        ("tests/test_x.py::test_y", "tests.test_x", "test_y"),
+        ("tests/test_data/test_x.py::test_y[linux]", "tests.test_data.test_x", "test_y[linux]"),
+    ]
+    for nodeid, classname, name in samples:
+        assert gate._pytest_exact_key(nodeid) == gate._pytest_exact_key_from_junit(classname, name), nodeid
+    assert gate._pytest_exact_key(PYT_SAMEMOD_TOP) != gate._pytest_exact_key(PYT_SAMEMOD_SUB)
+
+
+def test_pytest_full_same_module_name_in_other_dir_cannot_fill_in(tree):
+    """不同目錄的同名模組：JUnit 只有其中一個 passed → 缺席者不得由另一個補位成 PASS（雲端審查 ead2028#1）。"""
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_SAMEMOD_TOP, PYT_SAMEMOD_SUB])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    present = {n: "passed" for n in nodes if n != PYT_SAMEMOD_SUB}
+    present["tests/test_rust_other_fixture.py::test_filler"] = "passed"
+    tree.pytest_junit_xml = _pytest_full_junit_xml(present)
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "evidence-insufficient", row
+    assert any(PYT_SAMEMOD_SUB in r for r in row["reasons"]), row["reasons"]
+
+
+def test_pytest_full_same_module_name_in_two_dirs_both_present_is_pass(tree):
+    nodes = sorted([PYT_MKBUNDLE, PYT_MANIFEST, PYT_SAMEMOD_TOP, PYT_SAMEMOD_SUB])
+    tree.l1_lock["sets"]["s1_pytest_full"]["linux"]["nodeids"] = nodes
+    tree.l1_reports[("linux", "pytest-full")] = _report(
+        "linux", runner="pytest", argv=_pytest_argv(PYT_FULL_SEL), markexpr="", nodeids=nodes)
+    tree.pytest_junit_xml = _pytest_full_junit_xml({n: "passed" for n in nodes})
+    code, rep = tree.run()
+    row = _pytest_full_row(rep)
+    assert row["verdict"] == "PASS", row
+
+
+# --- OD-30 (2)：Windows transport disconnect 能力缺失 → BLOCKED-OWNER（S1X Y4，CHG-S1X-GATE-OD30-TRANSPORT-01）---
+
+TD_CID = "l15-transport-disconnect"
+_TD_CAP_MISSING = "bridge_control 'transport_disconnect' 失敗: HARNESS_CAPABILITY_UNAVAILABLE"
+
+
+def _td_rows(linux: dict[str, Any] | None, windows: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows = []
+    if linux is not None:
+        rows.append({"case_id": TD_CID, "platform": "linux", **linux})
+    if windows is not None:
+        rows.append({"case_id": TD_CID, "platform": "windows", **windows})
+    return rows
+
+
+_TD_PASS = {"verdict": "PASS", "gate_eligible": True}
+_TD_WIN_CAP = {"verdict": "FAIL", "gate_eligible": False, "message": _TD_CAP_MISSING}
+
+
+def test_od30_windows_transport_disconnect_capability_missing_is_blocked_owner():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_td_rows(_TD_PASS, _TD_WIN_CAP), ["linux", "windows"]) == "BLOCKED-OWNER"
+
+
+def test_od30_linux_failure_still_fails():
+    gate = _load_gate_module()
+    lin_fail = {"verdict": "FAIL", "gate_eligible": False, "message": "x"}
+    assert gate._l15_case_status(_td_rows(lin_fail, _TD_WIN_CAP), ["linux", "windows"]) == "FAIL"
+
+
+def test_od30_linux_row_missing_is_evidence_insufficient():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_td_rows(None, _TD_WIN_CAP), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od30_windows_other_failure_is_not_deferred():
+    gate = _load_gate_module()
+    other = {"verdict": "FAIL", "gate_eligible": False, "message": "assert_command_resolved 失敗"}
+    assert gate._l15_case_status(_td_rows(_TD_PASS, other), ["linux", "windows"]) == "FAIL"
+
+
+def test_od30_deferral_is_scoped_to_case_and_platform():
+    """同訊息出現在其他案例或 Linux 列 → 不得延後（不是一般性的能力缺失放行）。"""
+    gate = _load_gate_module()
+    other_case = [{"case_id": "l15-other", "platform": "linux", **_TD_PASS},
+                  {"case_id": "l15-other", "platform": "windows", **_TD_WIN_CAP}]
+    assert gate._l15_case_status(other_case, ["linux", "windows"]) == "FAIL"
+    lin_cap = {"verdict": "FAIL", "gate_eligible": False, "message": _TD_CAP_MISSING}
+    assert gate._l15_case_status(_td_rows(lin_cap, _TD_PASS), ["linux", "windows"]) == "FAIL"
+
+
+def test_od30_windows_pass_when_capability_available_is_pass():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_td_rows(_TD_PASS, _TD_PASS), ["linux", "windows"]) == "PASS"
+
+
+def test_od30_case_row_blocked_owner_keeps_overall_implemented(tree):
+    tree.cases.append({"case_id": TD_CID, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, TD_CID, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": TD_CID, **_TD_PASS}]}),
+        ("windows", {"results": [{"case_id": TD_CID, **_TD_WIN_CAP}]}),
+    ]
+    _, rep = tree.run()
+    row = _case_row(rep, TD_CID)
+    assert row["status"] == "BLOCKED-OWNER", row
+    assert rep["overall"] == "IMPLEMENTED", rep["errors"]
+
+
+def test_od30_capability_missing_with_harness_stop_failed_is_not_deferred():
+    """能力缺失＋harness 關閉失敗 → 不得藏進 BLOCKED-OWNER（雲端審查 40ba293#1）。"""
+    gate = _load_gate_module()
+    diag = [{"kind": "harness_stop_failed", "error": "daemon 未確認結束"}]
+    win = {**_TD_WIN_CAP, "harness_diagnostics": diag}
+    # 列本身 verdict FAIL → 照原規則 FAIL；verdict INSUFFICIENT_EVIDENCE → 證據不足；兩者皆不得改判 BLOCKED-OWNER。
+    assert gate._l15_case_status(_td_rows(_TD_PASS, win), ["linux", "windows"]) == "FAIL"
+    win_ins = {**win, "verdict": "INSUFFICIENT_EVIDENCE"}
+    assert gate._l15_case_status(_td_rows(_TD_PASS, win_ins), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od30_capability_marker_on_pass_or_skip_verdict_is_not_deferred():
+    """延後只適用登記的 verdict（OD-30：FAIL／INSUFFICIENT_EVIDENCE）；SKIP 帶同訊息不得延後。"""
+    gate = _load_gate_module()
+    win_skip = {"verdict": "SKIP", "gate_eligible": False, "message": _TD_CAP_MISSING}
+    assert gate._l15_case_status(_td_rows(_TD_PASS, win_skip), ["linux", "windows"]) == "evidence-insufficient"
+
+
+# --- OD-31：ev-01-spawn-handler Windows 列 handler 未觸發 → BLOCKED-OWNER（CHG-S1X-GATE-OD31-OD32-01）---
+
+EV_CID = "ev-01-spawn-handler"
+_EV_WIN_NOT_FIRED = {
+    "verdict": "FAIL", "gate_eligible": False,
+    "message": "步驟 7: 等待檔案逾時 8s: C:\\Users\\x\\AppData\\Local\\Temp\\sw-rust-test\\r\\tmp\\sw-func-abc/ev-fired",
+}
+
+
+def _ev_rows(linux: dict[str, Any] | None, windows: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows = []
+    if linux is not None:
+        rows.append({"case_id": EV_CID, "platform": "linux", **linux})
+    if windows is not None:
+        rows.append({"case_id": EV_CID, "platform": "windows", **windows})
+    return rows
+
+
+def test_od31_windows_handler_not_fired_is_blocked_owner():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_ev_rows(_TD_PASS, _EV_WIN_NOT_FIRED), ["linux", "windows"]) == "BLOCKED-OWNER"
+
+
+def test_od31_linux_failure_still_fails():
+    gate = _load_gate_module()
+    lin_fail = {**_EV_WIN_NOT_FIRED}
+    assert gate._l15_case_status(_ev_rows(lin_fail, _EV_WIN_NOT_FIRED), ["linux", "windows"]) == "FAIL"
+
+
+def test_od31_linux_row_missing_is_evidence_insufficient():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_ev_rows(None, _EV_WIN_NOT_FIRED), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od31_windows_other_failure_still_fails():
+    """Windows 列其他失敗型態（非 ev-fired 等待逾時，例如規則載入失敗、其他檔案逾時）照判 FAIL。"""
+    gate = _load_gate_module()
+    for msg in (
+        "步驟 4: cli event add 失敗: rc=1",
+        "步驟 7: 等待檔案逾時 8s: C:\\tmp\\sw-func-abc/ev-rule.json",
+        "步驟 7: 等待檔案逾時 8s: C:\\tmp\\sw-func-abc/ev-fired.bak",
+    ):
+        other = {"verdict": "FAIL", "gate_eligible": False, "message": msg}
+        assert gate._l15_case_status(_ev_rows(_TD_PASS, other), ["linux", "windows"]) == "FAIL", msg
+
+
+def test_od31_windows_not_fired_with_harness_stop_failed_is_not_deferred():
+    gate = _load_gate_module()
+    win = {**_EV_WIN_NOT_FIRED, "harness_diagnostics": [{"kind": "harness_stop_failed", "error": "x"}]}
+    assert gate._l15_case_status(_ev_rows(_TD_PASS, win), ["linux", "windows"]) == "FAIL"
+
+
+def test_od31_windows_pass_is_pass():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_ev_rows(_TD_PASS, _TD_PASS), ["linux", "windows"]) == "PASS"
+
+
+# --- OD-32：sm-04-device-unplug Windows 列 cap_missing:by_id_link SKIP → BLOCKED-OWNER ---
+
+SM_CID = "sm-04-device-unplug"
+_SM_WIN_SKIP = {"verdict": "SKIP", "gate_eligible": False, "message": "cap_missing:by_id_link"}
+
+
+def _sm_rows(linux: dict[str, Any] | None, windows: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows = []
+    if linux is not None:
+        rows.append({"case_id": SM_CID, "platform": "linux", **linux})
+    if windows is not None:
+        rows.append({"case_id": SM_CID, "platform": "windows", **windows})
+    return rows
+
+
+def test_od32_windows_by_id_link_skip_is_blocked_owner():
+    gate = _load_gate_module()
+    assert gate._l15_case_status(_sm_rows(_TD_PASS, _SM_WIN_SKIP), ["linux", "windows"]) == "BLOCKED-OWNER"
+
+
+def test_od32_linux_failure_or_skip_still_blocks():
+    gate = _load_gate_module()
+    lin_fail = {"verdict": "FAIL", "gate_eligible": False, "message": "x"}
+    assert gate._l15_case_status(_sm_rows(lin_fail, _SM_WIN_SKIP), ["linux", "windows"]) == "FAIL"
+    assert gate._l15_case_status(_sm_rows(_SM_WIN_SKIP, _SM_WIN_SKIP), ["linux", "windows"]) == "evidence-insufficient"
+
+
+def test_od32_windows_other_failure_or_skip_reason_not_deferred():
+    gate = _load_gate_module()
+    other_skip = {"verdict": "SKIP", "gate_eligible": False, "message": "cap_missing:transport_disconnect"}
+    assert gate._l15_case_status(_sm_rows(_TD_PASS, other_skip), ["linux", "windows"]) == "evidence-insufficient"
+    fail = {"verdict": "FAIL", "gate_eligible": False, "message": "cap_missing:by_id_link"}
+    assert gate._l15_case_status(_sm_rows(_TD_PASS, fail), ["linux", "windows"]) == "FAIL"
+
+
+def test_od31_od32_case_rows_blocked_owner_keep_overall_implemented(tree):
+    tree.cases.append({"case_id": EV_CID, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.cases.append({"case_id": SM_CID, "layer": "L1.5", "platforms": ["linux", "windows"]})
+    tree.lock["sets"]["cli_1A"] = sorted([A1, EV_CID, SM_CID, Z])
+    tree.l15_reports = [
+        ("linux", {"results": [{"case_id": EV_CID, **_TD_PASS}, {"case_id": SM_CID, **_TD_PASS}]}),
+        ("windows", {"results": [{"case_id": EV_CID, **_EV_WIN_NOT_FIRED}, {"case_id": SM_CID, **_SM_WIN_SKIP}]}),
+    ]
+    _, rep = tree.run()
+    assert _case_row(rep, EV_CID)["status"] == "BLOCKED-OWNER", _case_row(rep, EV_CID)
+    assert _case_row(rep, SM_CID)["status"] == "BLOCKED-OWNER", _case_row(rep, SM_CID)
+    assert rep["overall"] == "IMPLEMENTED", rep["errors"]

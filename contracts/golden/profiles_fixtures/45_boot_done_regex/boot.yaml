@@ -1,0 +1,32 @@
+# #234 boot_done_regex：template 載入（strip、非字串經 str()、falsy → 空字串）與 target 覆寫（truthy 才覆寫）
+profiles:
+  tpl-a:
+    platform: prpl
+    boot_done_regex: "  Please press Enter to activate this console  "
+  tpl-int:
+    platform: shell
+    boot_done_regex: 42
+  tpl-none:
+    platform: shell
+    boot_done_regex: ""
+  tpl-list:
+    platform: shell
+    boot_done_regex: [a, b]
+
+targets:
+  - profile: tpl-a
+    device_by_id: dev-a-inherit
+  - profile: tpl-a
+    device_by_id: dev-a-override
+    boot_done_regex: " T-BOOT-DONE "
+  - profile: tpl-a
+    device_by_id: dev-a-empty
+    boot_done_regex: ""
+  - profile: tpl-none
+    device_by_id: dev-none-null
+    boot_done_regex: null
+  - profile: tpl-int
+    device_by_id: dev-int-bool
+    boot_done_regex: true
+  - profile: tpl-list
+    device_by_id: dev-list

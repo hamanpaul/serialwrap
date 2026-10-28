@@ -2655,7 +2655,7 @@ cases:
   layer: L1.5
   platforms: [linux, windows]
   windows_status: gap
-  windows_gap_reason: assert_peer_closed 需 peer_state；Windows 由 win-com-cancel-close 承接
+  windows_gap_reason: Windows L1.5 案例尚未重跑；virtual com0com 啟用 peer_gate 時可提供 peer_state，win-com-cancel-close 仍是既有補充實測
   capabilities: [posix_pty, process_rpc]
   cli_stage: 1A
   daemon_slice: '2.1'
@@ -4828,4 +4828,678 @@ cases:
   sentinel: null
   evidence: [target/win-test-report/<run_id>.json]
   implemented_by: 08-slice23-login-events.md
+  cross_slice_reason: null
+
+# 凍結鎖增列理由：G4 為 29 個 data-plane 命令補上 Rust CLI→Python daemon FakeTarget E2E；依 P3-T18 逐函式登錄，使用 add-only，不移除或改動既有案例。
+- case_id: bb-alias-assign-persists-device-binding
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_assign_persists_device_binding
+  family: P0
+  title: alias assign 持久化裝置與 profile 綁定
+  contract: assign 後 alias list 與 state.json 都保存 by-id 及指定 profile。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-alias-unassign-removes-device-binding
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_alias_unassign_removes_device_binding
+  family: P0
+  title: alias unassign 移除持久化 alias
+  contract: unassign 後 alias list 與 state.json 都不再包含該 alias。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-cmd-cancel-marks-running-command-canceled
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_cmd_cancel_marks_running_command_canceled
+  family: P0
+  title: cmd cancel 取消執行中的命令
+  contract: 取消後 command record 為 canceled，session 恢復 READY。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-disable-updates-matcher-state
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_disable_updates_matcher_state
+  family: P0
+  title: event disable 停用 daemon matcher
+  contract: disable 後 matcher 將指定 selector 標記為停用。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-enable-updates-matcher-state
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_enable_updates_matcher_state
+  family: P0
+  title: event enable 啟用 daemon matcher
+  contract: enable 後 matcher 將指定 selector 標記為啟用。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-reload-removes-deleted-registry-rule
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_reload_removes_deleted_registry_rule
+  family: P0
+  title: event reload 移除已刪除的 registry 規則
+  contract: 刪除規則檔後 reload 將該 rule 從 daemon matcher 移除。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-reset-clears-fired-rule-counter
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_reset_clears_fired_rule_counter
+  family: P0
+  title: event reset 清除已觸發規則計數
+  contract: 規則觸發後 reset 清除 counter，list 顯示 fires 為零。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-show-returns-registered-rule
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_show_returns_registered_rule
+  family: P0
+  title: event show 回傳已登錄規則與計數
+  contract: show 回傳 daemon matcher 的 rule 欄位與 fires counter。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-status-lists-enabled-daemon-selector
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector
+  family: P0
+  title: event status 列出啟用中的 selector
+  contract: status 回傳 daemon matcher 目前啟用的 selector 清單。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-event-tail-reads-matcher-log
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log
+  family: P0
+  title: event tail 讀取 daemon matcher log
+  contract: tail 回傳 daemon matcher 的 selector 啟用事件。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-file-pull-transfers-bytes-from-target
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_file_pull_transfers_bytes_from_target
+  family: P0
+  title: file pull 將 target bytes 寫入本機
+  contract: 下載檔 bytes 與 CLI 回報的長度及 MD5 一致。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-file-push-transfers-bytes-to-target
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_file_push_transfers_bytes_to_target
+  family: P0
+  title: file push 將本機 bytes 傳至 target
+  contract: target 收到的檔案 bytes 與 CLI 回報的長度及 MD5 一致。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-log-tail-raw-reads-daemon-wal
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal
+  family: P0
+  title: log tail-raw 讀取 daemon WAL
+  contract: 命令輸出可由 tail-raw 讀回，且 from-seq 選項回傳 WAL records。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-activity-reports-live-session
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_activity_reports_live_session
+  family: P0
+  title: session activity 回報實際 session 狀態
+  contract: 提交命令後 activity 回報相同 session_id、READY 與活動分類。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-attach-restarts-cleared-session
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_attach_restarts_cleared_session
+  family: P0
+  title: session attach 重啟已 clear 的 session
+  contract: clear 後 attach 使相同 session_id 再次完成 READY probe。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-bind-switches-device
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_bind_switches_device
+  family: P0
+  title: session bind 將 session 切換至指定 target
+  contract: bind 更新持久化 device binding，並由新 target 完成登入與 READY probe。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-clear-detaches-and-reattaches
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_clear_detaches_and_reattaches
+  family: P0
+  title: session clear 後重新 attach 並回到 READY
+  contract: clear 後 daemon 以相同 session_id 重新探測 target，並恢復 READY。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-log-capture-lifecycle
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_log_capture_lifecycle
+  family: P0
+  title: session log-start／status／stop 擷取 target 輸出
+  contract: capture 生命週期可查詢，且 target RX bytes 寫入 daemon log。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-profile-pin-persists
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_profile_pin_persists
+  family: P0
+  title: session pin 與 unpin 持久化 profile pin
+  contract: pin 寫入 profile_pins；unpin 移除對應項目。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-session-self-test-reports-live-health
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_session_self_test_reports_live_health
+  family: P0
+  title: session self-test 回報 live health
+  contract: self-test 對 READY session 回報 command_capable、狀態與分類。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
+  cross_slice_reason: null
+- case_id: bb-wal-reset-rotates-and-resets-sequence
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_bb_daemon_e2e.py::test_wal_reset_rotates_and_resets_sequence
+  family: P0
+  title: wal reset 輪替檔案並重設序號
+  contract: reset 保留舊 WAL 檔並將目前序號歸零。
+  invariants: []
+  layer: L1
+  platforms:
+  - linux
+  windows_status: gap
+  windows_gap_reason: 此案例使用 POSIX PTY FakeTarget；Windows 原生 L1 由對應 Windows 黑箱集合驗證。
+  capabilities:
+  - posix_pty
+  - process_rpc
+  - needs_py_daemon
+  - py_daemon
+  - faketarget
+  cli_stage: 1A
+  daemon_slice: null
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence:
+  - tests/contract_blackbox/test_bb_daemon_e2e.py
+  implemented_by: 04-stage1a-rust-cli.md
   cross_slice_reason: null

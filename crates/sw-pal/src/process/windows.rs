@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FreeLibrary, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, FreeLibrary, GetHandleInformation, GetLastError, SetHandleInformation, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, SetConsoleCtrlHandler, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -20,7 +21,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -31,6 +32,84 @@ use windows_sys::Win32::System::Threading::{
     DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+
+/// 串行化「暫時取消標準輸出 handle 繼承旗標」的區段，避免並行 spawn 互相還原彼此的旗標。
+///
+/// 本模組內直接以原始標準 handle 呼叫 `CreateProcessW` 的路徑（`exec_or_wait_opts`）也持有此鎖，
+/// 不會在旗標被暫時取消的視窗內把不可繼承的 handle 交給子行程。std `Command` 的 `Stdio::inherit()`
+/// 會另行 `DuplicateHandle` 出可繼承副本，不受此旗標影響。
+///
+/// 鎖只在同一行程多執行緒並行 spawn 時有作用：正式 `sw-cli` 沒有並行建立行程的執行緒（`sysenv` 的
+/// pipe reader 執行緒只讀取子行程輸出、不 spawn）、`exec_or_wait_opts` 只在
+/// `sw-daemon` launcher 另一 binary，實際只保護 cargo test 的並行測試執行緒；正確性以程式碼審查為證（OD-26 (c)）。
+static STD_INHERIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// spawn 背景 daemon 期間暫時取消目前行程 stdout／stderr 的 `HANDLE_FLAG_INHERIT`，drop 時還原。
+///
+/// 子行程的 stdout／stderr 已明確指定為 NUL（std 會另建可繼承的 NUL handle），原始 handle 不需傳給子行程；
+/// 與 stdin 相同的 handle 不動（stdin 依 Python 基線語意繼承）。
+///
+/// 已知限制：std 以 `bInheritHandles=TRUE` 建立行程，只處理標準輸出 handle；CLI 由父行程繼承而來、
+/// 且仍標為可繼承的其他 handle（非標準 handle）仍會傳給 daemon。CLI 自身以 std 開啟的檔案與 pipe
+/// 預設不可繼承，故實務上只剩父行程刻意傳入的額外 handle。完整解法為改以
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 明確列出要繼承的 handle（需改寫成原始 `CreateProcessW`）。
+///
+/// OD-26（2026-10-27）：擁有者裁決維持本半修法（功能面已對齊 Python 基線），不改寫 `CreateProcessW`。
+/// 追蹤項：std 的 `CommandExt::inherit_handles(false)`（feature `windows_process_extensions_inherit_handles`）
+/// 與 `ProcThreadAttributeList`（feature `windows_process_extensions_raw_attribute`）在 1.96.1 stable
+/// 仍為 unstable（E0658）；穩定後改用 `inherit_handles(false)`，並移除本 guard 與 `STD_INHERIT_LOCK`。
+struct StdOutputInheritGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    cleared: Vec<HANDLE>,
+}
+
+impl StdOutputInheritGuard {
+    fn suppress() -> Self {
+        let lock = STD_INHERIT_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut cleared: Vec<HANDLE> = Vec::new();
+        // SAFETY: GetStdHandle 只讀取目前行程的標準 handle 值，不解參考。
+        let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: 同上。
+            let handle = unsafe { GetStdHandle(id) };
+            if handle.is_null()
+                || handle == INVALID_HANDLE_VALUE
+                || handle == stdin
+                || cleared.contains(&handle)
+            {
+                continue;
+            }
+            let mut flags = 0u32;
+            // SAFETY: handle 為目前行程的有效標準 handle；flags 指向可寫 u32。
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0
+                || flags & HANDLE_FLAG_INHERIT == 0
+            {
+                continue;
+            }
+            // SAFETY: 只修改繼承旗標，不關閉或轉移 handle 所有權。
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                cleared.push(handle);
+            }
+        }
+        Self {
+            _lock: lock,
+            cleared,
+        }
+    }
+}
+
+impl Drop for StdOutputInheritGuard {
+    fn drop(&mut self) {
+        for handle in &self.cleared {
+            // SAFETY: 還原 suppress 時清除的繼承旗標；handle 仍為目前行程的標準 handle。
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeProcessCtl;
@@ -198,6 +277,11 @@ impl ProcessCtl for NativeProcessCtl {
         let _spawn_guard = super::WIN_SPAWN_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // 鎖序固定 WIN_SPAWN_LOCK → STD_INHERIT_LOCK（StdOutputInheritGuard 只取後者），不會反向等待。
+        // 傳入的是原始標準 handle：與 StdOutputInheritGuard 串行，避免在其暫時取消繼承旗標時建立行程。
+        let inherit_lock = STD_INHERIT_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // SAFETY: 所有 UTF-16 緩衝區皆以 NUL 結尾，且呼叫期間保持可寫並有效。
         let created = unsafe {
             CreateProcessW(
@@ -215,6 +299,7 @@ impl ProcessCtl for NativeProcessCtl {
                 &mut process_info,
             )
         };
+        drop(inherit_lock);
         if created == 0 {
             // SAFETY: GetLastError 讀取目前執行緒最近一次 Win32 錯誤。
             return unsafe { windows_win32_error(GetLastError()) };
@@ -229,8 +314,10 @@ impl ProcessCtl for NativeProcessCtl {
                 return error;
             }
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            // 只設 KILL_ON_JOB_CLOSE，不設 SILENT_BREAKAWAY_OK：實測（Windows 11 26200）該旗標會讓
+            // 一般 CreateProcess 建立的孫行程靜默脫離 Job（即使未要求 breakaway），launcher 被終止後孫行程仍存活，
+            // 違反委派的終止傳遞不變式。正常結束時的背景子行程保留由 release_kill_on_close 處理。
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             // SAFETY: limits 為正確大小且完整初始化的 Job Object 結構。
             let configured = unsafe {
                 SetInformationJobObject(
@@ -282,6 +369,13 @@ impl ProcessCtl for NativeProcessCtl {
         let got_code = unsafe { GetExitCodeProcess(process_info.hProcess, &mut exit_code) };
         let exit_error = (got_code == 0).then(last_error);
         restore_ctrl_handler();
+        // 子行程已正常結束：先解除 KILL_ON_JOB_CLOSE 再關閉 Job，使背景啟動的孫行程（例如 daemon start 建立的 daemon）
+        // 照常存活，與 Python 基線一致。launcher 若被 TerminateProcess 終止，此步驟不會執行，Job 仍會連帶結束所有子孫。
+        let release_error = if job.is_null() {
+            None
+        } else {
+            release_kill_on_close(job)
+        };
         // SAFETY: thread 與 process handle 各關閉一次；Job Object 若建立也只關閉一次。
         unsafe {
             CloseHandle(process_info.hThread);
@@ -289,6 +383,9 @@ impl ProcessCtl for NativeProcessCtl {
             if !job.is_null() {
                 CloseHandle(job);
             }
+        }
+        if let Some(error) = release_error {
+            return error;
         }
         if let Some(error) = exit_error {
             return error;
@@ -319,6 +416,10 @@ impl ProcessCtl for NativeProcessCtl {
                 .stderr(Stdio::null());
         }
 
+        // std 以 bInheritHandles=TRUE 建立行程：CLI 自身可繼承的 stdout／stderr（呼叫端擷取輸出的 pipe）
+        // 會被背景 daemon 一併繼承，使呼叫端在 CLI 結束後仍等到 daemon 結束才 EOF（SC-18 autostart 卡死）。
+        // 與 Python 基線（close_fds 只傳標準 handle）對齊：spawn 期間暫時取消這兩個 handle 的繼承旗標。
+        let _inherit_guard = detached.then(StdOutputInheritGuard::suppress);
         let child = command.spawn().map_err(process_io_error)?;
         let pid = child.id();
         let mut handle = crate::traits::ChildHandle::new(pid);
@@ -387,6 +488,21 @@ fn process_io_error(error: std::io::Error) -> PalError {
 fn last_error() -> PalError {
     // SAFETY: GetLastError 讀取目前執行緒最近一次 Win32 錯誤。
     unsafe { windows_win32_error(GetLastError()) }
+}
+
+/// 解除 Job 的 KILL_ON_JOB_CLOSE（清空 LimitFlags）。失敗時回傳錯誤；呼叫端仍會關閉 Job，不留下狀態不明的 Job。
+fn release_kill_on_close(job: HANDLE) -> Option<PalError> {
+    let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: limits 為正確大小且完整初始化（LimitFlags 為 0）的 Job Object 結構；job 由呼叫端持有且有效。
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    (configured == 0).then(last_error)
 }
 
 fn restore_ctrl_handler() {

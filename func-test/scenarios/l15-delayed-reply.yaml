@@ -57,9 +57,13 @@ steps:
     op_id: delayed-cmd
   - action: assert_wire_contiguous
     payloads: ["echo L15_DELAY_1\n"]
+  - action: wait_ready
+    timeout_s: 30
   - action: cli
     argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_AFTER"]
     save_as: after_cmd
+    expect:
+      ok: true
   - action: wait_command_done
     cmd_id: "{after_cmd.cmd_id}"
     timeout_s: 15

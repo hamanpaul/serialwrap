@@ -13,7 +13,7 @@ pub const TEXT_NEWLINE: &[u8] = b"\n";
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
-use crate::traits::{FsRead, PalResult};
+use crate::traits::{FsRead, PalError, PalErrorKind, PalResult};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(windows)]
@@ -166,6 +166,11 @@ pub trait FsOps: FsRead {
     /// 刪除單一檔案（不存在由呼叫端判斷）。
     fn remove_file(&self, p: &Path) -> PalResult<()> {
         unimplemented!("P4-T5")
+    }
+    /// 刪除空目錄（`rmdir` 語意；目錄非空或不存在回錯誤，由呼叫端決定是否忽略）。
+    /// 預設回 `Unsupported`（而非 panic），讓 best-effort 呼叫端可在未實作的替身上安全略過。
+    fn remove_dir(&self, p: &Path) -> PalResult<()> {
+        Err(PalError::plain(PalErrorKind::Unsupported, "remove_dir 未實作"))
     }
     /// 複製單一檔案並保留 mode。
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {

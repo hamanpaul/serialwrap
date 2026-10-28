@@ -70,6 +70,7 @@ pub fn load_result_json(res: &sw_proto::config_types::LoadResult) -> String {
                 "bootloader_prompts".into(),
                 PyValue::List(t.bootloader_prompts.iter().map(|s| PyValue::Str(s.clone())).collect()),
             ),
+            ("boot_done_regex".into(), PyValue::Str(t.boot_done_regex.clone())),
             (
                 "max_console_line_chars".into(),
                 match &t.max_console_line_chars {

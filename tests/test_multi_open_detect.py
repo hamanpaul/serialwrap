@@ -36,25 +36,33 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.proc = Path(self._tmp.name) / "proc"
 
+    def _make_tty(self, name: str) -> Path:
+        """#R2：holder 以 inode 身分判定，故以暫存實體檔案代表 tty（字串相同但不存在於本命名空間者不計）。"""
+        dev = Path(self._tmp.name) / "dev" / name
+        dev.parent.mkdir(parents=True, exist_ok=True)
+        dev.write_bytes(b"")
+        return dev
+
     def test_detect_two_serialwrapd(self) -> None:
         from sw_core.multi_open import detect_multi_open
 
+        tty = self._make_tty("ttyUSB0")
         _make_fake_proc(
             self.proc,
             {
                 "2114": {
                     "cmdline": "python\0serialwrapd.py\0--socket\0/run/serialwrap/serialwrapd.sock\0",
-                    "fd": {"5": "/dev/ttyUSB0"},
+                    "fd": {"5": str(tty)},
                 },
                 "9001": {"cmdline": "python\0serialwrapd.py\0", "fd": {}},
                 # 非 serialwrapd 程序，不應計入
                 "3000": {"cmdline": "bash\0", "fd": {}},
             },
         )
-        res = detect_multi_open(proc_root=str(self.proc), tty_paths=["/dev/ttyUSB0"])
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[str(tty)])
         self.assertTrue(res["multi_open"])
         self.assertEqual({d["pid"] for d in res["daemons"]}, {2114, 9001})
-        self.assertEqual(res["holders"]["/dev/ttyUSB0"], 2114)
+        self.assertEqual(res["holders"][str(tty)], 2114)
         self.assertEqual(res["holders_status"], "ok")
 
     def test_single_daemon_ok(self) -> None:
@@ -72,6 +80,7 @@ class TestDetectMultiOpen(unittest.TestCase):
         而漏掉真正的 prod daemon（實機驗證才現形）。"""
         from sw_core.multi_open import detect_multi_open
 
+        tty = self._make_tty("ttyUSB1")
         _make_fake_proc(
             self.proc,
             {
@@ -80,15 +89,15 @@ class TestDetectMultiOpen(unittest.TestCase):
                     # 為 serialwrapd、無 .py、為路徑）。用 /opt 中性路徑避免 R-21 個人路徑誤判。
                     "cmdline": "/opt/serialwrap-venv/bin/python\0"
                     "/opt/serialwrap-venv/bin/serialwrapd\0--socket\0/run/serialwrap/serialwrapd.sock\0",
-                    "fd": {"7": "/dev/ttyUSB1"},
+                    "fd": {"7": str(tty)},
                 },
                 "1200888": {"cmdline": "python3\0/worktree/serialwrapd.py\0", "fd": {}},
             },
         )
-        res = detect_multi_open(proc_root=str(self.proc), tty_paths=["/dev/ttyUSB1"])
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[str(tty)])
         self.assertTrue(res["multi_open"])
         self.assertEqual({d["pid"] for d in res["daemons"]}, {1095518, 1200888})
-        self.assertEqual(res["holders"]["/dev/ttyUSB1"], 1095518)
+        self.assertEqual(res["holders"][str(tty)], 1095518)
 
     def test_argv0_serialwrapd_py_detected(self) -> None:
         """argv0 直接是 serialwrapd.py（直接 exec shim）也要算（回歸：曾把 .py 判定

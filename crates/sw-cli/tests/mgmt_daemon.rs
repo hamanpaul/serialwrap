@@ -219,6 +219,32 @@ fn autostart_only_when_request_never_sent() {
 }
 
 #[test]
+fn autostart_resend_carries_original_command_params() {
+    // SC-18：command.submit 連線被拒（請求從未送出）→ 自動啟動後重送一次；重送的 params 必須與
+    // daemon 存活時同一命令列送出的 params 逐欄相同（cmd 與 selector 不得遺失或改寫），且請求數為 1。
+    let args = ["cmd", "submit", "--selector", "COM0", "--cmd", "echo X"];
+    let direct = TestEnv::windows().with_rpc_ok(TestEnv::win_endpoint(), "command.submit", r#"{"ok":true}"#);
+    let (rc, out, _) = direct.run(&args);
+    assert_eq!(rc, 0, "{out}");
+    let expected = rpc_params(&direct, "command.submit");
+
+    let t = TestEnv::windows()
+        .with_rpc_refused_then_ok(TestEnv::win_endpoint(), "command.submit", r#"{"ok":true}"#)
+        .with_manifest_launcher()
+        .with_process()
+        .with_rpc_after_spawn(TestEnv::win_endpoint(), &["health.ping", "health.status"]);
+    let (rc, out, err) = t.run(&args);
+    assert_eq!(rc, 0, "{out}");
+    assert!(err.contains("已自動啟動"), "須留下 on-demand 自動啟動證據：{err}");
+    assert_eq!(t.process().spawn_count(), 1);
+    assert_eq!(rpc_count(&t, "command.submit"), 1);
+    let resent = rpc_params(&t, "command.submit");
+    assert_eq!(fstr(&resent, "cmd"), "echo X");
+    assert_eq!(fstr(&resent, "selector"), "COM0");
+    assert_eq!(resent, expected, "重送 params 須與原請求相同");
+}
+
+#[test]
 fn no_autostart_or_resend_after_send_phase_failure() {
     // command.submit 已送出後才失敗（send 之後）→ 不自動啟動、不重送。
     // 註：計畫原文未含 `with_rpc_ok`；`fail_after_send` 需要 endpoint 已存活（替身規則）。
@@ -481,6 +507,78 @@ fn start_manifest_relative_path_returns_absolute_launcher() {
         sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx).expect("manifest launcher")
     });
     assert!(PathBuf::from(&argv[0]).is_absolute(), "launcher path 必須正規化為絕對路徑：{argv:?}");
+}
+
+#[test]
+fn start_windows_python_launcher_uses_manifest_runtime() {
+    let t = TestEnv::windows().with_process();
+    let launcher = t.bundle_dir().join("serialwrapd.py");
+    let runtime = t.bundle_dir().join("py").join("python.exe");
+    let manifest = t.bundle_dir().join("release-manifest.json");
+    let body = r#"{"schema_version":1,"bundle_version":"test","stage":"rust-1b-test","target":"x86_64-pc-windows-gnu","git_revision":"test","components":{"cli":{"implementation":"rust","version":"test","path":"bin/serialwrap.exe","sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"python_cli_delegate":{"entry":["py/python.exe","-I","delegate_sentinel.py"]},"daemon":{"launcher":{"path":"serialwrapd.py"},"runtime":{"path":"py/python.exe","python_version":"3.12"}}}}"#;
+    t.write_file(&launcher, b"python daemon shim");
+    t.write_file(&runtime, b"python runtime");
+    t.write_file(&manifest, body.as_bytes());
+
+    let argv = t.with_cli_ctx(|ctx| {
+        sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx).expect("Windows Python launcher")
+    });
+    let expected_path = |path: &PathBuf| path.to_string_lossy().replace('/', "\\");
+    assert_eq!(
+        argv,
+        vec![
+            expected_path(&runtime),
+            "-I".to_string(),
+            "-B".to_string(),
+            expected_path(&launcher),
+        ]
+    );
+}
+
+#[test]
+fn start_windows_python_launcher_without_runtime_does_not_fall_through() {
+    // manifest 宣告 `.py` launcher 卻缺 runtime 時必須 fail-closed；
+    // 不得改走 CLI 同層 serialwrapd.exe，否則會繞過 manifest 的版本配對。
+    let t = TestEnv::windows().with_process();
+    let launcher = t.bundle_dir().join("serialwrapd.py");
+    let manifest = t.bundle_dir().join("release-manifest.json");
+    let body = r#"{"schema_version":1,"bundle_version":"test","stage":"rust-1b-test","target":"x86_64-pc-windows-gnu","git_revision":"test","components":{"cli":{"implementation":"rust","version":"test","path":"bin/serialwrap.exe","sha256":"0000000000000000000000000000000000000000000000000000000000000000"},"python_cli_delegate":{"entry":["py/python.exe","-I","delegate_sentinel.py"]},"daemon":{"launcher":{"path":"serialwrapd.py"},"runtime":{"path":"py/python.exe","python_version":"3.12"}}}}"#;
+    t.write_file(&launcher, b"python daemon shim");
+    t.write_file(&manifest, body.as_bytes());
+    let sibling = t.with_cli_ctx(|ctx| {
+        let exe = ctx.p.env.current_exe().expect("current exe");
+        exe.parent().expect("exe directory").join("serialwrapd.exe")
+    });
+    t.write_file(&sibling, b"sibling daemon");
+
+    let expected_path = |path: &PathBuf| path.to_string_lossy().replace('/', "\\");
+    let located = t.with_cli_ctx(|ctx| sw_cli::commands::daemon_cmd::locate_daemon_argv(ctx));
+    match located {
+        Err(sw_cli::commands::daemon_cmd::DaemonLocateError::ManifestRuntimeMissing {
+            launcher: ref found_launcher,
+            runtime: ref found_runtime,
+        }) => {
+            assert_eq!(found_launcher, &expected_path(&launcher));
+            assert_eq!(
+                found_runtime.as_deref(),
+                Some(expected_path(&t.bundle_dir().join("py").join("python.exe")).as_str())
+            );
+        }
+        other => {
+            panic!("缺 manifest runtime 時不得落到同層或其他候選，且須指出缺 runtime：{other:?}")
+        }
+    }
+
+    // 使用者訊息須指出缺的是 manifest 宣告的 runtime，而非泛稱找不到 daemon。
+    let (rc, out, _err) = t.run(&["daemon", "start"]);
+    assert_eq!(rc, 2);
+    let j = json(&out);
+    assert_eq!(fstr(&j, "error_code"), "DAEMON_BINARY_NOT_FOUND");
+    let message = fstr(&j, "message");
+    assert!(
+        message.contains("runtime") && message.contains("python.exe"),
+        "訊息須帶 manifest runtime 路徑：{message}"
+    );
 }
 
 #[test]

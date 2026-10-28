@@ -89,7 +89,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_clear_detaches_and_reattaches"
+      ],
       "l15": []
     },
     {
@@ -100,7 +102,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_bind_switches_device"
+      ],
       "l15": []
     },
     {
@@ -111,7 +115,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_profile_pin_persists"
+      ],
       "l15": []
     },
     {
@@ -122,7 +128,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_profile_pin_persists"
+      ],
       "l15": []
     },
     {
@@ -133,7 +141,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_attach_restarts_cleared_session"
+      ],
       "l15": []
     },
     {
@@ -144,7 +154,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_self_test_reports_live_health"
+      ],
       "l15": []
     },
     {
@@ -155,7 +167,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_self_test_reports_live_health"
+      ],
       "l15": []
     },
     {
@@ -166,7 +180,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_activity_reports_live_session"
+      ],
       "l15": []
     },
     {
@@ -333,7 +349,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_log_capture_lifecycle"
+      ],
       "l15": []
     },
     {
@@ -344,7 +362,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_log_capture_lifecycle"
+      ],
       "l15": []
     },
     {
@@ -355,7 +375,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_session_log_capture_lifecycle"
+      ],
       "l15": []
     },
     {
@@ -392,7 +414,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_alias_assign_persists_device_binding"
+      ],
       "l15": []
     },
     {
@@ -403,7 +427,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_alias_assign_persists_device_binding"
+      ],
       "l15": []
     },
     {
@@ -414,7 +440,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_alias_unassign_removes_device_binding"
+      ],
       "l15": []
     },
     {
@@ -490,7 +518,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_cmd_cancel_marks_running_command_canceled"
+      ],
       "l15": []
     },
     {
@@ -540,7 +570,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal"
+      ],
       "l15": []
     },
     {
@@ -551,7 +583,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_log_tail_raw_reads_daemon_wal"
+      ],
       "l15": []
     },
     {
@@ -575,7 +609,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_file_push_transfers_bytes_to_target"
+      ],
       "l15": []
     },
     {
@@ -586,7 +622,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_file_push_transfers_bytes_to_target"
+      ],
       "l15": []
     },
     {
@@ -597,7 +635,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_file_pull_transfers_bytes_from_target"
+      ],
       "l15": []
     },
     {
@@ -608,7 +648,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_file_pull_transfers_bytes_from_target"
+      ],
       "l15": []
     },
     {
@@ -632,7 +674,9 @@
       "stub": [
         "test_bb_rpc_params.py::test_rpc_params_wire"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_wal_reset_rotates_and_resets_sequence"
+      ],
       "l15": []
     },
     {
@@ -721,7 +765,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_show_returns_registered_rule"
+      ],
       "l15": []
     },
     {
@@ -732,7 +778,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_enable_updates_matcher_state"
+      ],
       "l15": []
     },
     {
@@ -743,7 +791,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_disable_updates_matcher_state"
+      ],
       "l15": []
     },
     {
@@ -754,7 +804,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_status_lists_enabled_daemon_selector"
+      ],
       "l15": []
     },
     {
@@ -765,7 +817,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_reset_clears_fired_rule_counter"
+      ],
       "l15": []
     },
     {
@@ -776,7 +830,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_reload_removes_deleted_registry_rule"
+      ],
       "l15": []
     },
     {
@@ -787,7 +843,9 @@
       "stub": [
         "test_bb_event.py::test_event_subcommands_wire_params"
       ],
-      "e2e": [],
+      "e2e": [
+        "test_bb_daemon_e2e.py::test_event_tail_reads_matcher_log"
+      ],
       "l15": []
     },
     {

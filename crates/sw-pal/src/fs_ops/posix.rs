@@ -71,6 +71,10 @@ impl FsOps for NativeFsOps {
         fs::remove_file(p).map_err(posix_io_error)
     }
 
+    fn remove_dir(&self, p: &Path) -> PalResult<()> {
+        fs::remove_dir(p).map_err(posix_io_error)
+    }
+
     fn copy_preserving(&self, from: &Path, to: &Path) -> PalResult<()> {
         fs::copy(from, to).map_err(posix_io_error)?;
         copy_file_metadata(from, to)

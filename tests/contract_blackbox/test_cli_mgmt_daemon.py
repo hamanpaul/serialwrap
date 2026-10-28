@@ -9,15 +9,20 @@ A/B 案例同時以 Python 基線與受測 CLI 執行並比對輸出。預設執
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from bb_l15 import bundle_manifest_path
 from bb_harness import cli_prefix, is_rust, python_baseline_prefix, repo_root, run_cli
 
 FAKE_SERIALWRAPD = repo_root() / "tests" / "contract_blackbox" / "bin" / "fake-serialwrapd"
@@ -119,6 +124,144 @@ def _rpc_pid(endpoint: str) -> int | None:
     return pid if isinstance(pid, int) else None
 
 
+def _dut_tx_bytes(wire: str) -> bytes:
+    """DUT 模擬器 wire 記錄中實際寫入 DUT stdin 的 bytes。"""
+    path = Path(wire)
+    if not path.is_file():
+        return b""
+    return _dut_tx_bytes_from_wire(path.read_bytes())
+
+
+def _dut_tx_bytes_from_wire(raw: bytes) -> bytes:
+    rows = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line]
+    return b"".join(
+        base64.b64decode(row["payload_b64"], validate=True)
+        for row in rows
+        if row.get("dir") == "TX" and row.get("observation") == "dut_stdin_write"
+    )
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_checkpointed_dut_tx_includes_frames_written_before_barrier_settles(tmp_path: Path) -> None:
+    """命令回傳後、bridge barrier 完成前落盤的第二筆 TX 必須納入完整窗口。"""
+    wire = tmp_path / "wire.ndjson"
+
+    def row(seq: int, payload: bytes) -> bytes:
+        return (json.dumps({"seq": seq, "dir": "TX", "observation": "dut_stdin_write",
+                            "payload_b64": base64.b64encode(payload).decode("ascii")},
+                           sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+    wire.write_bytes(row(1, b"echo X\n"))
+
+    class DelayedDuplicateControl:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def call(self, action: str, params: dict | None = None) -> dict:
+            self.calls.append(action)
+            if action == "barrier":
+                assert params == {"mode": "passive", "quiet_ms": 500, "timeout_ms": 10000}
+                with wire.open("ab") as stream:
+                    stream.write(row(2, b"echo X\n"))
+                return {"settled": True, "mode": "passive"}
+            assert action == "checkpoint"
+            raw = wire.read_bytes()
+            return {"wire_len": len(raw), "wire_sha256": hashlib.sha256(raw).hexdigest(), "wire_seq": 2}
+
+    control = DelayedDuplicateControl()
+    tx = _checkpointed_dut_tx(str(wire), 0, control)
+    assert control.calls == ["barrier", "checkpoint"]
+    assert tx == b"echo X\necho X\n", "barrier 完成前落盤的重複 TX 不得漏判"
+
+
+def _checkpointed_dut_tx(wire: str, baseline: int, control: Any) -> bytes:
+    """等 bridge 完成靜默 barrier，依 checkpoint 的長度與雜湊讀取完整 DUT TX 視窗。"""
+    barrier = control.call("barrier", {"mode": "passive", "quiet_ms": 500, "timeout_ms": 10000})
+    assert barrier.get("settled") is True, f"UART bridge 未在 barrier 期限內靜止：{barrier!r}"
+    checkpoint = control.call("checkpoint")
+    wire_len = checkpoint.get("wire_len")
+    wire_sha256 = checkpoint.get("wire_sha256")
+    assert isinstance(wire_len, int) and wire_len >= 0, f"checkpoint wire_len 無效：{checkpoint!r}"
+    assert isinstance(wire_sha256, str) and len(wire_sha256) == 64, f"checkpoint wire_sha256 無效：{checkpoint!r}"
+    raw = Path(wire).read_bytes()
+    assert len(raw) >= wire_len, f"wire 短於 checkpoint：{len(raw)} < {wire_len}"
+    prefix = raw[:wire_len]
+    assert prefix.endswith(b"\n") or wire_len == 0, "checkpoint wire 前綴不是完整行"
+    actual_sha256 = hashlib.sha256(prefix).hexdigest()
+    assert actual_sha256 == wire_sha256, f"checkpoint wire SHA-256 不符：{actual_sha256} != {wire_sha256}"
+    return _dut_tx_bytes_from_wire(prefix)[baseline:]
+
+
+def _open_bridge_control(wire: str):
+    bridge_src = repo_root() / "tools" / "uart_stdio_bridge" / "src"
+    if str(bridge_src) not in sys.path:
+        sys.path.insert(0, str(bridge_src))
+    from uart_stdio_bridge.bridge.control import ControlClient
+
+    return ControlClient(Path(wire).with_name("control.json"), timeout_s=15.0)
+
+
+# passthrough 須連續 30 秒無 RX 才升 READY（PASSTHROUGH_READY_QUIET_S）；等待上限另留 attach 與
+# 高負載排程裕度，且不超過首次 CLI 呼叫的 120 秒上限。
+_PASSTHROUGH_READY_WAIT_S = 120.0
+
+
+def _submit_after_on_demand_autostart(env: dict[str, str], wire: str, tx_baseline: int, control: Any):
+    """首次 `cmd submit` 必須經 on-demand 自動啟動 daemon；若 session 尚未 READY，等 READY 後再送一次。
+
+    SC-18 只規定「連線階段被拒才自動啟動並重送一次」，不規定 CLI 等待 READY。passthrough
+    session 在 attach 後須靜默 30 秒才升 READY，因此首次請求允許兩種結果：(a) 直接成功（原驗收形狀）；
+    (b) 被拒絕為 SESSION_NOT_READY——此時被拒請求必須零 TX，之後的單次送出仍須恰好一次 TX。
+    """
+    initial = run_cli(
+        ["cmd", "submit", "--selector", "COM0", "--cmd", "echo X", "--cmd-timeout", "1"],
+        env=env,
+        timeout_s=120.0,
+    )
+    assert "已自動啟動" in initial.stderr.decode("utf-8", errors="replace"), (
+        f"首次 cmd submit 未留下 on-demand autostart 證據：{initial.stderr!r}"
+    )
+    if initial.rc == 0:
+        return initial
+    try:
+        initial_response = json.loads(initial.stdout.decode("utf-8"))
+    except ValueError:
+        initial_response = None
+    assert isinstance(initial_response, dict) and initial_response.get("error_code") == "SESSION_NOT_READY", (
+        "首次需求未成功時只接受 session 尚未 READY 的拒絕；"
+        f"rc={initial.rc} stdout={initial.stdout!r} stderr={initial.stderr!r}"
+    )
+    deadline = time.monotonic() + _PASSTHROUGH_READY_WAIT_S
+    last_session: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        status = run_cli(["session", "list"], env=env, timeout_s=10.0)
+        assert status.rc == 0, status.stderr.decode("utf-8", errors="replace")
+        rows = json.loads(status.stdout.decode("utf-8")).get("sessions", [])
+        last_session = next((row for row in rows if row.get("com") == "COM0"), None)
+        if last_session and last_session.get("state") == "READY":
+            break
+        if last_session and last_session.get("state") == "DETACHED" and last_session.get("last_error"):
+            pytest.fail(f"COM0 attach failed before READY: {last_session!r}")
+        time.sleep(0.25)
+    else:
+        pytest.fail(f"COM0 未於 {_PASSTHROUGH_READY_WAIT_S:.0f} 秒內進入 READY：{last_session!r}")
+
+    # 零 TX 檢查放在 READY 等待之後、唯一送出之前；bridge barrier 排空非同步 writer，checkpoint 封住完整 wire 前綴。
+    assert b"echo X" not in _checkpointed_dut_tx(wire, tx_baseline, control), (
+        "被拒絕的首次請求不得在 DUT 端留下任何 TX"
+    )
+
+    return run_cli(
+        [
+            "cmd", "submit", "--selector", "COM0", "--cmd", "echo X",
+            "--completion-regex", "echo X",
+        ],
+        env=env,
+        timeout_s=30.0,
+    )
+
+
 def test_daemon_start_ab_conflict(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-17／SC-10：同機已有 serialwrapd 綁在其他 socket → 兩實作以相同 stdout 與 rc 2 拒絕再 spawn。"""
     other = _spawn_fake_serialwrapd("/tmp/other")
@@ -164,7 +307,84 @@ def test_daemon_start_stop_ab_real_daemon(tmp_path: Path, env: dict[str, str], p
     assert results["cli"] == results["python"]
 
 
+@pytest.mark.windows_native
+@pytest.mark.process_rpc
+def test_daemon_start_releases_caller_stdio_pipes(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
+    """Windows：`daemon start` 結束後，呼叫端擷取的 stdout／stderr pipe 必須立即 EOF。
+
+    背景 daemon 不得繼承 CLI 的標準輸出 pipe；否則以 `subprocess.run(capture_output)` 呼叫 CLI 的
+    agent 會一直等到 daemon 結束（SC-18 on-demand autostart 在原生 Windows 卡死 3600 秒的根因）。
+    Python 基線以 `close_fds` 只傳標準 handle，兩實作須同樣立即放行。
+    """
+    _assert_daemon_start_releases_pipes(env, subprocess.PIPE)
+
+
+@pytest.mark.windows_native
+@pytest.mark.process_rpc
+def test_daemon_start_releases_caller_merged_stdio_pipe(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
+    """Windows：呼叫端以同一條 pipe 合併 stdout／stderr（`stderr=STDOUT`）時，`daemon start` 結束後該 pipe 也必須立即 EOF。
+
+    兩個標準 handle 指向同一 pipe 是 StdOutputInheritGuard 去重的路徑；與分開兩條 pipe 的案例互補。
+    """
+    _assert_daemon_start_releases_pipes(env, subprocess.STDOUT)
+
+
+def _assert_daemon_start_releases_pipes(env: dict[str, str], stderr: int) -> None:
+    if os.name != "nt":
+        pytest.skip("windows_native：僅原生 Windows 執行")
+    if is_rust():
+        bundle_root = os.environ.get("SW_WIN_DEV_BUNDLE")
+        assert bundle_root, "Windows Rust daemon 案例需要隔離 staging bundle"
+        manifest = bundle_manifest_path(Path(bundle_root))
+        assert manifest.is_file(), f"Windows Rust bundle manifest 不存在：{manifest}"
+        env["SERIALWRAP_RELEASE_MANIFEST"] = str(manifest)
+    # 只放行不存在的 COM99：本案例不得開啟任何序列埠。
+    env["SERIALWRAP_TEST_DEVICE_ALLOWLIST"] = "COM99"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        env["SERIALWRAP_ENDPOINT"] = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+
+    proc = subprocess.Popen(
+        cli_prefix() + ["daemon", "start"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=stderr,
+    )
+    drained = False
+    try:
+        proc.wait(timeout=90)
+        try:
+            out, err = proc.communicate(timeout=15)
+            drained = True
+        except subprocess.TimeoutExpired:
+            pytest.fail("daemon start 已結束，但呼叫端 stdout／stderr pipe 15 秒內未 EOF：背景 daemon 繼承了 CLI 的 pipe")
+        assert proc.returncode == 0, (err or out).decode("utf-8", errors="replace")
+        if stderr == subprocess.STDOUT:
+            # 合併 pipe：stdout 同時含 stderr；成功時 CLI 只輸出一行 JSON。
+            out = out.strip().splitlines()[-1]
+        assert json.loads(out.decode("utf-8")).get("ok") is True, out
+    finally:
+        # stop 的輸出導向 DEVNULL，避免本身也被同一缺陷卡住。
+        subprocess.run(
+            cli_prefix() + ["daemon", "stop"], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False,
+        )
+        if proc.poll() is None:
+            proc.kill()
+        if not drained:
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+
+
 @pytest.mark.case("sc20-daemon-restart")
+@pytest.mark.pidns_rig
+# P0 T14：補唯一平台 marker 與資源 marker。依賴 /proc 與 sh，故為 posix_only；Windows 由 cargo restart_* 承接 sc20，
+# 不在 s1b_20groups windows 收集範圍（-m "core_portable or windows_native"）。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
     """SC-20：on-demand restart 後 pid 改變；兩實作輸出形狀 {ok,restarted,start,stopped} 正規化後相同。
 
@@ -240,18 +460,62 @@ def test_daemon_restart_ab(tmp_path: Path, env: dict[str, str], no_delegation: P
 @pytest.mark.windows_com
 @pytest.mark.case("sc18-windows-ondemand-autostart")
 def test_autostart_l15_tx_once(tmp_path: Path, env: dict[str, str], no_delegation: Path) -> None:
-    """SC-18（原生 Windows）：無 daemon 時 `cmd submit` 經 on-demand 自動啟動，DUT 端 `echo X\\r` 恰出現一次。
+    """SC-18（原生 Windows）：無 daemon 時 `cmd submit` 經 on-demand 自動啟動，本案例基線後 DUT 端 TX 恰為一行 `echo X\\n`
+    （daemon 以 body＋`\\n` 送出；原計畫寫 `\\r`，依 CHG-S1X-SC18-TX-BASELINE-01 更正）。
 
     需 owner 在原生 Windows 提供 COM 配對（`SW_TEST_COM_PAIR`）與 DUT 模擬器寫出的 wire 記錄（`SW_TEST_DUT_WIRE`）。
     """
     if os.name != "nt":
         pytest.skip("windows_native：僅原生 Windows 執行")
-    if not os.environ.get("SW_TEST_COM_PAIR"):
+    if is_rust():
+        bundle_root = os.environ.get("SW_WIN_DEV_BUNDLE")
+        assert bundle_root, "Windows Rust COM 案例需要隔離 staging bundle"
+        manifest = bundle_manifest_path(Path(bundle_root))
+        assert manifest.is_file(), f"Windows Rust COM bundle manifest 不存在：{manifest}"
+        # env fixture 清除外層 SERIALWRAP_*；明確傳入測試 bundle，避免誤查宿主安裝目錄。
+        env["SERIALWRAP_RELEASE_MANIFEST"] = str(manifest)
+    com_pair = os.environ.get("SW_TEST_COM_PAIR")
+    if not com_pair:
         pytest.skip("BLOCKED-OWNER：需 SW_TEST_COM_PAIR（OD-08／OD-15 擁有者 host 的 com0com 配對）")
+    assert com_pair == "COM20:COM21", "本案例只允許 DUT-side pair COM20:COM21"
     wire = os.environ.get("SW_TEST_DUT_WIRE")
     assert wire, "SW_TEST_DUT_WIRE 必須指向 DUT 模擬器的 wire.ndjson"
 
-    res = run_cli(["cmd", "submit", "--selector", "COM0", "--cmd", "echo X"], env=env, timeout_s=120)
-    assert res.rc == 0, res.stderr
-    text = Path(wire).read_text(encoding="utf-8", errors="replace")
-    assert text.count("echo X\r") == 1
+    # fixture 會清除外層 SERIALWRAP_*；重新只放行受測端 COM20，避免掃描其他主機序列埠。
+    env["SERIALWRAP_TEST_DEVICE_ALLOWLIST"] = "COM20"
+    # 本案例驗證 on-demand 自動啟動；固定 COM0 → COM20，避免空 profile 目錄落入動態偵測 fallback。
+    profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "windows-com.yaml").write_text(
+        "profiles:\n"
+        "  live-passthrough:\n"
+        "    platform: passthrough\n"
+        "targets:\n"
+        "  - com: COM0\n"
+        "    profile: live-passthrough\n"
+        "    device_by_id: COM20\n",
+        encoding="utf-8",
+    )
+    # 使用本案例獨有的 loopback endpoint，避免連到主機既有 daemon 或其他 throwaway run。
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        env["SERIALWRAP_ENDPOINT"] = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+
+    # wire 為整個 B 輪共用；先以 bridge barrier/checkpoint 封住前序案例，避免非同步落盤跨過基線。
+    control = _open_bridge_control(wire)
+    try:
+        tx_baseline = len(_checkpointed_dut_tx(wire, 0, control))
+        res = None
+        try:
+            res = _submit_after_on_demand_autostart(env, wire, tx_baseline, control)
+            assert res.rc == 0, res.stderr.decode("utf-8", errors="replace")
+        finally:
+            stop = run_cli(["daemon", "stop"], env=env, timeout_s=60.0)
+            if res is not None and res.rc == 0:
+                assert stop.rc == 0, stop.stderr.decode("utf-8", errors="replace")
+            final_tx = _checkpointed_dut_tx(wire, tx_baseline, control)
+        # 本案例自身的 TX（自基線起）必須恰為一行命令：daemon 以 body＋"\n" 送出（uart_io），
+        # explicit target attach 零 TX（SC-35）；同一 B 輪的其他 COM 案例寫入不計。
+        assert final_tx == b"echo X\n", f"完整 barrier/checkpoint 視窗的 DUT TX 不符：{final_tx!r}"
+    finally:
+        control.close()

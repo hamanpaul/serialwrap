@@ -6,6 +6,7 @@ import os
 import pathlib
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -277,10 +278,13 @@ def write_report(path: pathlib.Path, *, suite: str, mode: str, results: list[dic
     host_uid = os.environ.get("SW_HOST_UID")
     host_gid = os.environ.get("SW_HOST_GID")
     if host_uid and host_gid:
+        uid, gid = int(host_uid), int(host_gid)
         for output in path.parent.rglob("*"):
-            if output.is_file():
-                os.chown(output, int(host_uid), int(host_gid))
-        os.chown(path.parent, int(host_uid), int(host_gid))
+            # 子目錄（如 bridge/、bridge-0/，0700）同樣需 chown，否則 host 無法清除。
+            os.chown(output, uid, gid, follow_symlinks=False)
+            if output.is_dir() and not output.is_symlink():
+                os.chmod(output, output.stat().st_mode | stat.S_IRWXU)
+        os.chown(path.parent, uid, gid)
     return bool(results) and all(row.get("verdict") == "PASS" for row in results)
 
 

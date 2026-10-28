@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 建立 Stage 1A 自含式開發 bundle；`--delegate-sentinel` 保留後續管理面測試用的精簡 bundle。
+# 建立 Stage 1A bundle：開發 bundle 可含測試鉤子；正式候選 bundle 不含故障注入 feature，且自帶 PyYAML。
 set -euo pipefail
 
 usage() {
@@ -7,16 +7,18 @@ usage() {
 用法：
   scripts/rust/mkbundle.sh --dev --out <目錄> [--target <triple>] [--profile debug|release] [--version-override <版本>] [--with-com0com <signed zip>] [--with-com0com-fixture <fixture zip>] [--print-dir]
   scripts/rust/mkbundle.sh --dev --delegate-sentinel --out <目錄> [其他選項]
+  scripts/rust/mkbundle.sh --release-bundle --profile release --out <目錄> [其他選項]
 
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
-  --delegate-sentinel      將委派入口改為 P4 測試 sentinel
+  --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
+  --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
   --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
   --version-override <v>   以同一編譯輸入覆寫 CLI 與 daemon bundle 版本
   --with-com0com <zip>     驗證上游簽章套件雜湊並抽取 x64 driver payload
   --with-com0com-fixture <zip> 僅供測試：略過上游雜湊驗證，仍檢查完整 x64 payload
-  --out <目錄>             指定輸出目錄
+  --out <目錄>             指定輸出目錄；非空且非 mkbundle 建立者拒絕（exit 2，不寫入）；mkbundle 建立者每次整個重建
   --print-dir              保留後續階段介面；成功時 stdout 一律輸出絕對目錄
   -h, --help               顯示此說明
 EOF
@@ -24,6 +26,7 @@ EOF
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 DEV=0
+RELEASE_BUNDLE=0
 SENTINEL=0
 PROFILE=debug
 TARGET=""
@@ -36,6 +39,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --dev) DEV=1; shift ;;
+    --release-bundle) RELEASE_BUNDLE=1; shift ;;
     --delegate-sentinel) SENTINEL=1; shift ;;
     --print-dir) shift ;;
     --out)
@@ -91,8 +95,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DEV" -ne 1 ]]; then
-  echo "mkbundle.sh: 目前只支援 --dev（正式 bundle 由後續階段承接）" >&2
+if [[ "$DEV" -eq 1 && "$RELEASE_BUNDLE" -eq 1 ]]; then
+  echo "mkbundle.sh: --dev 與 --release-bundle 不可並用" >&2
+  exit 2
+fi
+if [[ "$DEV" -eq 0 && "$RELEASE_BUNDLE" -eq 0 ]]; then
+  echo "mkbundle.sh: 必須指定 --dev 或 --release-bundle" >&2
+  exit 2
+fi
+if [[ "$SENTINEL" -eq 1 && "$DEV" -ne 1 ]]; then
+  echo "mkbundle.sh: --delegate-sentinel 僅支援 --dev" >&2
   exit 2
 fi
 if [[ "$PROFILE" != debug && "$PROFILE" != release ]]; then
@@ -107,6 +119,22 @@ if [[ "$SENTINEL" -eq 1 && -n "$COM0COM_ZIP" ]]; then
   echo "mkbundle.sh: com0com 需使用完整 --dev bundle，不能與 --delegate-sentinel 合併" >&2
   exit 2
 fi
+
+# 輸出目錄所有權：mkbundle 建立的目錄會寫入 OWNER_MARKER。非空且無該 marker 的目錄一律拒絕，
+# 且在任何寫入前即退出；否則 sentinel（頂層 release-manifest.json／py／bin）與 dev（versions/）佈局會混在同一目錄，
+# 使 bundle 定位取到過期的頂層 manifest。
+OWNER_MARKER=".mkbundle-owner"
+refuse_foreign_out() {
+  if [[ -e "$OUT" && ! -d "$OUT" ]]; then
+    echo "mkbundle.sh: --out 已存在且不是目錄：$OUT" >&2
+    exit 2
+  fi
+  if [[ -d "$OUT" && ! -f "$OUT/$OWNER_MARKER" && -n "$(ls -A -- "$OUT")" ]]; then
+    echo "mkbundle.sh: 拒絕寫入非空且非 mkbundle 建立的目錄：$OUT（請改用新目錄，或先自行移除後重試）" >&2
+    exit 2
+  fi
+}
+refuse_foreign_out
 
 HOST_TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
 if [[ -z "$TARGET" ]]; then
@@ -126,6 +154,10 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
+# 更新 race barrier 與安裝故障注入僅編入 `--dev` bundle；正式候選不帶測試 feature。
+if [[ "$DEV" -eq 1 ]]; then
+  BUILD_ARGS+=(--features sw-cli/test-fakes)
+fi
 if [[ -n "$COM0COM_ZIP" ]]; then
   BUILD_ARGS+=(-p sw-com0com-helper)
 fi
@@ -135,9 +167,14 @@ fi
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
   BUILD_ARGS+=(--target "$TARGET")
 fi
-(cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$REPO_ROOT/target" cargo "${BUILD_ARGS[@]}" --quiet)
+# 呼叫端可指定隔離的 Cargo target dir；相對路徑一律相對 repo root 解讀。
+BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+if [[ "$BUILD_ROOT" != /* ]]; then
+  BUILD_ROOT="$REPO_ROOT/$BUILD_ROOT"
+fi
+(cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
 
-BUILD_DIR="$REPO_ROOT/target"
+BUILD_DIR="$BUILD_ROOT"
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
   BUILD_DIR+="/$TARGET"
 fi
@@ -156,56 +193,34 @@ if [[ ! -x "$BIN_SRC" || ! -x "$DAEMON_SRC" ]]; then
   echo "mkbundle.sh: cargo build 後仍找不到 $BIN_SRC" >&2
   exit 1
 fi
+# cargo 建置成功後才動輸出目錄（cargo 失敗時既有輸出不受影響）。再檢一次所有權，通過後清空 mkbundle 自有目錄，
+# 確保每次只留下單一佈局（sentinel 或 dev），不殘留另一種佈局或過期檔案。組裝階段失敗會留下帶 owner marker 的半成品，下次執行會重建。
+refuse_foreign_out
+if [[ -d "$OUT" ]]; then
+  OUT="$(cd "$OUT" && pwd -P)"
+  find "$OUT" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+fi
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd -P)"
+printf 'mkbundle.sh 建立的輸出目錄；非空且無此檔案者會被拒絕覆寫\n' > "$OUT/$OWNER_MARKER"
 
 sha256_file() {
   sha256sum -- "$1" | awk '{print $1}'
 }
 
-if [[ "$SENTINEL" -eq 1 ]]; then
-  # P4 管理面測試需要在 bundle bin 下直接執行 sentinel，維持既有精簡格式。
-  mkdir -p "$OUT/bin" "$OUT/py/bin"
-  # 輸出位置可能是指向版本檔的 symlink；先移除 symlink，避免覆寫其目標。
-  cp --remove-destination "$BIN_SRC" "$OUT/bin/$CLI_NAME"
-  chmod +x "$OUT/bin/$CLI_NAME"
-  PY_SRC="$(command -v python3)"
-  ln -sf "$(readlink -f "$PY_SRC")" "$OUT/py/bin/python3"
-
-  SENTINEL_PATH="$REPO_ROOT/tests/contract_blackbox/delegate_sentinel.py"
-  CLI_SHA="$(sha256_file "$OUT/bin/$CLI_NAME")"
-  REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD)"
-  python3 - "$OUT/release-manifest.json" "$VERSION" "$REVISION" "$TARGET" "$CLI_SHA" "$CLI_NAME" "$SENTINEL_PATH" <<'PY'
-import json
-import sys
-
-path, version, revision, target, cli_sha, cli_name, sentinel = sys.argv[1:8]
-manifest = {
-    "schema_version": 1,
-    "bundle_version": version,
-    "stage": "rust-1b-dev",
-    "target": target,
-    "git_revision": revision,
-    "components": {
-        "cli": {
-            "implementation": "rust",
-            "version": version,
-            "path": f"bin/{cli_name}",
-            "sha256": cli_sha,
-        },
-        "python_cli_delegate": {
-            "entry": ["py/bin/python3", "-I", sentinel],
-        },
-    },
-}
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
-    handle.write("\n")
-PY
-else
-  VERSION_DIR="$OUT/versions/$VERSION"
-  if [[ -e "$VERSION_DIR" ]]; then
-    rm -rf -- "$VERSION_DIR"
+# 組裝 bundle 根目錄：dev 與 sentinel 共用同一組成（bin/serialwrapd、py/sw_core、SHA256SUMS、release-manifest.json）。
+# dev：實體目錄為 versions/<V>/，bin/ 內以 symlink 指向之；sentinel：扁平佈局直接組裝於 --out 根目錄，bin/ 為實體檔。
+# sentinel 僅將 python_cli_delegate.entry 改為 P4 測試 sentinel（非委派守門：任何漏網委派都會寫入 DELEGATED marker 並 exit 97）。
+assemble_bundle() {
+  SENTINEL_ENTRY=""
+  if [[ "$SENTINEL" -eq 1 ]]; then
+    VERSION_DIR="$OUT"
+    SENTINEL_ENTRY="$REPO_ROOT/tests/contract_blackbox/delegate_sentinel.py"
+  else
+    VERSION_DIR="$OUT/versions/$VERSION"
+    if [[ -e "$VERSION_DIR" ]]; then
+      rm -rf -- "$VERSION_DIR"
+    fi
   fi
   mkdir -p "$VERSION_DIR/bin" "$OUT/bin"
   cp "$BIN_SRC" "$VERSION_DIR/bin/$CLI_NAME"
@@ -261,13 +276,40 @@ PY
   fi
 
   PY_DIR="$VERSION_DIR/py"
-  python3 -m venv --copies --system-site-packages "$PY_DIR"
+  python3 -m venv --copies "$PY_DIR"
   if [[ -L "$PY_DIR/lib64" ]]; then
     rm -- "$PY_DIR/lib64"
   fi
   PYTHON="$PY_DIR/bin/python3"
   PY_SITE="$("$PYTHON" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
   mkdir -p "$PY_SITE"
+
+  # PyYAML 是 daemon 的執行期依賴；不可仰賴目標主機的 system site-packages。
+  # 複製與 runtime 同版 Python、同平台的已安裝模組及 dist-info，正式 bundle 因而可離線啟動。
+  python3 - "$PY_SITE" <<'PY'
+import importlib.metadata
+import pathlib
+import shutil
+import sys
+import yaml
+
+site = pathlib.Path(sys.argv[1])
+source = pathlib.Path(yaml.__file__).resolve().parent
+shutil.copytree(source, site / "yaml")
+dist = importlib.metadata.distribution("PyYAML")
+dist_path = pathlib.Path(dist._path)
+shutil.copytree(dist_path, site / dist_path.name)
+PY
+  "$PYTHON" -I -B - "$PY_SITE" <<'PY'
+import pathlib
+import sys
+import yaml
+
+site = pathlib.Path(sys.argv[1]).resolve()
+module = pathlib.Path(yaml.__file__).resolve()
+if not module.is_relative_to(site):
+    raise SystemExit(f"PyYAML 未由 bundle runtime 載入：{module}")
+PY
 
   python3 - "$REPO_ROOT/sw_core" "$PY_DIR/sw_core" "$PY_SITE/sw_core" \
     "$REPO_ROOT/serialwrapd.py" "$PY_DIR/serialwrapd.py" "$VERSION" \
@@ -366,7 +408,7 @@ PY
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
-    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" <<'PY'
+    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" <<'PY'
 import datetime
 import json
 import sys
@@ -391,7 +433,8 @@ import sys
     com0com_sha,
     com0com_helper,
     com0com_helper_sha,
-) = sys.argv[1:20]
+    sentinel_entry,
+) = sys.argv[1:21]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -466,20 +509,27 @@ if com0com_sha:
         "helper": {"path": com0com_helper, "sha256": com0com_helper_sha},
         "default_pair": ["COM20", "COM21"],
     }
+if sentinel_entry:
+    # sentinel 佈局：組成與 dev 相同，僅委派入口改為 sentinel；stage 標示 rust-1b-dev 供管理面測試辨識。
+    manifest["stage"] = "rust-1b-dev"
+    manifest["components"]["python_cli_delegate"]["entry"] = ["py/bin/python3", "-I", sentinel_entry]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
     handle.write("\n")
 PY
 
-  ln -sfn "../versions/$VERSION/bin/$CLI_NAME" "$OUT/bin/$CLI_NAME"
-  ln -sfn "../versions/$VERSION/bin/$DAEMON_NAME" "$OUT/bin/$DAEMON_NAME"
-  if [[ "$(realpath "$OUT/bin/$CLI_NAME")" != "$(realpath "$VERSION_DIR/bin/$CLI_NAME")" ]]; then
-    echo "mkbundle.sh: bin/$CLI_NAME symlink 未指向 versions/$VERSION/bin/$CLI_NAME" >&2
-    exit 1
-  fi
-  if [[ "$(realpath "$OUT/bin/$DAEMON_NAME")" != "$(realpath "$VERSION_DIR/bin/$DAEMON_NAME")" ]]; then
-    echo "mkbundle.sh: bin/$DAEMON_NAME symlink 未指向 versions/$VERSION/bin/$DAEMON_NAME" >&2
-    exit 1
+  # sentinel 的 bin/ 為實體檔，不建立指向 versions/ 的 symlink。
+  if [[ "$SENTINEL" -eq 0 ]]; then
+    ln -sfn "../versions/$VERSION/bin/$CLI_NAME" "$OUT/bin/$CLI_NAME"
+    ln -sfn "../versions/$VERSION/bin/$DAEMON_NAME" "$OUT/bin/$DAEMON_NAME"
+    if [[ "$(realpath "$OUT/bin/$CLI_NAME")" != "$(realpath "$VERSION_DIR/bin/$CLI_NAME")" ]]; then
+      echo "mkbundle.sh: bin/$CLI_NAME symlink 未指向 versions/$VERSION/bin/$CLI_NAME" >&2
+      exit 1
+    fi
+    if [[ "$(realpath "$OUT/bin/$DAEMON_NAME")" != "$(realpath "$VERSION_DIR/bin/$DAEMON_NAME")" ]]; then
+      echo "mkbundle.sh: bin/$DAEMON_NAME symlink 未指向 versions/$VERSION/bin/$DAEMON_NAME" >&2
+      exit 1
+    fi
   fi
 
   if find "$VERSION_DIR" -type l -print -quit | grep -q .; then
@@ -503,6 +553,8 @@ for directory, names, files in os.walk(root, followlinks=False):
     for name in files:
         path = pathlib.Path(directory) / name
         relative = path.relative_to(root).as_posix()
+        # 僅 release-manifest.json 與 SHA256SUMS 本身豁免；其餘每個檔案（含 sentinel 扁平佈局根目錄的 .mkbundle-owner）都必須列入，
+        # 與 Rust 驗證器 verify_bundle 的不變量一致（缺列即 CHECKSUM_VERIFY_FAILED）。owner marker 仍由 OWNER_MARKER 守護覆寫拒絕。
         if relative in {"release-manifest.json", "SHA256SUMS"}:
             continue
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -535,6 +587,8 @@ if errors:
         print(f"{list(error.absolute_path)}: {error.message}", file=sys.stderr)
     raise SystemExit(1)
 PY
-fi
+}
+
+assemble_bundle
 
 printf '%s\n' "$OUT"

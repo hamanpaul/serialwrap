@@ -25,6 +25,8 @@ from mgmt_fixtures import (  # noqa: E402,F401
     stub_log,
     stub_path,
 )
+from bb_harness import ISOLATED_ROOTS  # noqa: E402  isolated_env 登記的隔離根（config_digest 紀錄用）
+import config_digest as _config_digest  # noqa: E402
 
 _STANDARD_MARKERS = {
     "core_portable": "Linux 與 Windows 都必跑；禁止以平台原因 SKIP；不得宣稱測到原生 UART",
@@ -44,6 +46,7 @@ _BLACKBOX_MARKERS = {
     "needs_py_daemon": "需要 Python daemon 基線",
     "needs_delegation": "Rust 輪需要 Task 16 委派（Task 14 以 -m 'not needs_delegation' 排除）",
     "case": "P4 驗收案例綁定（對應 tests/acceptance/p4_case_map.yaml）",
+    "pidns_rig": "自啟 daemon 並呼叫 CLI daemon start／restart／update／supervision 的 Linux rig；整段於獨立 pid namespace 重跑",
 }
 
 
@@ -53,23 +56,67 @@ def pytest_configure(config: pytest.Config) -> None:
     for name, desc in _STANDARD_MARKERS.items():
         config.addinivalue_line("markers", f"{name}: {desc}")
 
-    # L1 報告 plugin：不經 tests 套件 import，直接從路徑載入
+    # L1 報告 plugin：不經 tests 套件 import，直接從路徑載入。
+    # 重用已載入的 sys.modules["resource_report_plugin"]（根 conftest 的 import 或先前的載入）：
+    # 另載一份副本會讓 deployed_content 的 env 快照（根 conftest 於清除 env 前擷取）留在別的 module 物件，
+    # 註冊的副本 _ENV_SNAPSHOT 為 None 且 env 已被清除，報告 deployed_content 恆為 null（B 輪 L1 證據失效）。
     if not config.pluginmanager.has_plugin("sw_resource_report"):
         rpt_env = os.environ.get("SW_RESOURCE_REPORT")
         if rpt_env:
-            plugin_path = Path(__file__).resolve().parent.parent / "resource_report_plugin.py"
-            if not plugin_path.exists():
-                raise pytest.UsageError(f"SW_RESOURCE_REPORT 已指定但缺少 plugin: {plugin_path}")
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("resource_report_plugin", plugin_path)
-            if not (spec and spec.loader):
-                raise pytest.UsageError(f"無法載入 plugin spec: {plugin_path}")
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            mod = sys.modules.get("resource_report_plugin")
+            if mod is None:
+                plugin_path = Path(__file__).resolve().parent.parent / "resource_report_plugin.py"
+                if not plugin_path.exists():
+                    raise pytest.UsageError(f"SW_RESOURCE_REPORT 已指定但缺少 plugin: {plugin_path}")
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("resource_report_plugin", plugin_path)
+                if not (spec and spec.loader):
+                    raise pytest.UsageError(f"無法載入 plugin spec: {plugin_path}")
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["resource_report_plugin"] = mod
+                spec.loader.exec_module(mod)
+                # 獨立執行（無根 conftest）時 env 尚未被清除，於此擷取 deployed_content 所需的 CLI／daemon 變數
+                mod.capture_deployed_env(os.environ)
             config.pluginmanager.register(mod, "sw_resource_report")
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
+    """`pidns_rig` 案例於獨立 user+pid+mount namespace 內重跑整個 nodeid（bridge、daemon、CLI 同一 namespace）。
+
+    已位於隔離 namespace 時（ab_blackbox.sh 整段重入、或子行程）回 None 由原函式執行；
+    無法以非特權 unshare 建立 namespace 時 skip 並註明能力原因，絕不 PASS、不退回 --force-spawn。
+    """
+    if pyfuncitem.get_closest_marker("pidns_rig") is None or os.name != "posix":
+        return None
+    from bb_l15 import in_isolated_pidns, run_nodeid_in_pidns
+
+    if in_isolated_pidns():
+        return None
+    outcome, message = run_nodeid_in_pidns(pyfuncitem.nodeid, pyfuncitem.config.rootpath)
+    if outcome in ("unavailable", "skipped"):
+        pytest.skip(message)
+    if outcome == "failed":
+        pytest.fail(message, pytrace=False)
+    return True
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    """夾具（setup）與測試本體建立設定之後，逐案例記錄各隔離根的 config_digest（G4-ab1b-config-digest）。
+
+    僅在 `SW_AB_CONFIGLOG` 有值（A／B 身分執行）時計算摘要；一般 pytest 執行只清空登記表。
+    """
+    yield
+    log = os.environ.get(_config_digest.LOG_ENV)
+    if log:
+        _config_digest.record_items(Path(log), item.nodeid, list(ISOLATED_ROOTS))
+    ISOLATED_ROOTS.clear()
+
+
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    # 每個案例的隔離根由本案例的 setup 與 call 階段登記；開頭清空，避免承接前一案例（含 setup 失敗者）的殘留。
+    ISOLATED_ROOTS.clear()
     # 獨立執行（--confcutdir）不載入 root conftest 的平台 skip；Windows 上 posix_only 案例以
     # applicability.json 的鍵 "posix_only" 為原因 SKIP，比較器才會判為合法的不適用。
     if item.get_closest_marker("posix_only") and os.name == "nt":

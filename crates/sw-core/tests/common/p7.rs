@@ -179,6 +179,8 @@ pub fn profile_from_json(v: &PyValue) -> sw_proto::config_types::SessionProfile 
                 PyValue::Null => None,
                 other => Some(pyint(other)),
             },
+            // #234：舊 golden 無此欄（擷取早於 boot_done_regex）＝ dataclass 預設 ""。
+            boot_done_regex: opt_string(d.get("boot_done_regex")).unwrap_or_default(),
         },
     }
 }

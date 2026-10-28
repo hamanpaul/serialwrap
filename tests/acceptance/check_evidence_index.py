@@ -133,12 +133,12 @@ def l1_artifact_digest(base: pathlib.Path, platforms: list[str]) -> str:
     return hashlib.sha256(json.dumps(table, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _junit_counts(path: pathlib.Path) -> dict[str, int]:
-    """junit.xml 的 testcase 層計數（支援 testsuites 包裝）。
+def _junit_totals(path: pathlib.Path) -> tuple[dict[str, int], dict[str, int]]:
+    """junit.xml 的兩組計數：(testcase 層逐元素計數, testsuite 宣告的 failures／errors 合計)。
 
-    不讀 testsuite 的 tests／failures 屬性：pytest 9 的 subtests 會計入屬性（tests=6 對應 3 個 testcase），
-    但不產生對應的 testcase 元素，屬性計數會與 l1-results 列數永遠不符（P2-T13 審查修正）。
-    failures／errors／skipped 依 testcase 子元素（failure／error／skipped）計數。
+    testcase 層：failures／errors／skipped 依 testcase 子元素（failure／error／skipped）計數；不讀 `tests` 屬性，
+    因為 pytest 9 的 subtests 會計入該屬性（tests=6 對應 3 個 testcase），但不產生對應的 testcase 元素（P2-T13 審查修正）。
+    宣告值：未宣告（屬性缺席）者不計入，即無主張；非整數或負數即 ValueError（fail-closed）。
     """
     root = ET.parse(path).getroot()
     totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
@@ -151,6 +151,36 @@ def _junit_counts(path: pathlib.Path) -> dict[str, int]:
             totals["errors"] += 1
         if "skipped" in children:
             totals["skipped"] += 1
+    declared = {"failures": 0, "errors": 0}
+    for suite in root.iter("testsuite"):
+        for key in declared:
+            raw = suite.get(key)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"junit testsuite 的 {key} 不是整數：{raw!r}") from exc
+            if value < 0:
+                raise ValueError(f"junit testsuite 的 {key} 為負數：{value}")
+            declared[key] += value
+    return totals, declared
+
+
+def _junit_counts(path: pathlib.Path) -> dict[str, int]:
+    """junit.xml 的 testcase 層計數（支援 testsuites 包裝），並以 testsuite 宣告值 fail-closed 核對。
+
+    若 testsuite 宣告的 failures 或 errors **大於** testcase 層計數（例如 subtests 失敗而未留下 testcase 元素，
+    或列數遺漏），即拋出 ValueError；呼叫端一律視為 INVALID／證據不足，不得放行。
+    只拒收「宣告大於實際」的方向：宣告值小於 testcase 層時，testcase 層的失敗仍會由 l1_judge 的逐列交叉核對判為 FAIL，
+    不會因此放行，且既有測試即以此方向作為 testcase 層計數的回歸案例。
+    """
+    totals, declared = _junit_totals(path)
+    for key in ("failures", "errors"):
+        if declared[key] > totals[key]:
+            raise ValueError(
+                f"junit testsuite 宣告 {key}={declared[key]}，大於 testcase 層計數 {totals[key]}（fail-closed，證據不足）"
+            )
     return totals
 
 
@@ -206,7 +236,7 @@ def _check_l1_item(iid: str, item: dict[str, Any], root: pathlib.Path, lock: dic
             report = json.loads((base / plat / L1_REPORT_NAME).read_text(encoding="utf-8"))
             junit = _junit_counts(base / plat / L1_JUNIT_NAME)
         except (OSError, ValueError, ET.ParseError) as exc:
-            blocked.append(f"l1_invalid {iid} {plat}: 報告無法解析（{exc}）")
+            blocked.append(f"l1_invalid {iid} {plat}: 報告或 junit 無法解析／suite 宣告值不一致（{exc}）")
             continue
         schema_errors = sorted(results_schema.iter_errors(report), key=lambda e: list(e.path))
         if schema_errors:

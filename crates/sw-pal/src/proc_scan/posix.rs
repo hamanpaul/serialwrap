@@ -120,7 +120,23 @@ impl ProcScan for PosixProcScan {
         let pids = daemons.iter().map(|daemon| daemon.pid).collect::<Vec<_>>();
         #[cfg(unix)]
         {
-            tty_holders_with(&RealHolderFs, &self.proc_root, &pids, paths)
+            let (holders, mut status) = tty_holders_with(&RealHolderFs, &self.proc_root, &pids, paths);
+            // 主線 #R2（d82a7b9）：產品接線上目標 tty 取不到身分時不得回「無 holder、Ok」（rollback 會當成已確認
+            // 可安全開啟）；`tty_holders_with` 本身保留 Python `detect_multi_open` 的略過語意（P5 F02 測試鎖定）。
+            for path in paths {
+                match fs::metadata(path) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        status = HolderScanStatus::Permission;
+                    }
+                    Err(_) => {
+                        if status == HolderScanStatus::Ok {
+                            status = HolderScanStatus::Unknown;
+                        }
+                    }
+                }
+            }
+            (holders, status)
         }
         // 非 unix 無 inode 身分可比（`/proc` 掃描器在 Windows 不會走到此處）：證據不足即 Unknown。
         #[cfg(not(unix))]

@@ -250,7 +250,7 @@ POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平�
 
 ### Profile YAML 結構
 
-- 三個頂層區段：`defaults`、`profiles`、`targets`。`defaults` 支援 `log_dir`；`profiles` 定義 template（`platform`、`prompt_regex`、`login_regex`、`password_regex`、`user_env`、`pass_env`、`env_file`、`post_login_cmd`、`ready_probe`、`timeout_s`、`uart.*` 等）；`targets` 綁定 COM → template → device_by_id（省略則全走動態偵測）。
+- 三個頂層區段：`defaults`、`profiles`、`targets`。`defaults` 支援 `log_dir`；`profiles` 定義 template（`platform`、`prompt_regex`、`login_regex`、`password_regex`、`user_env`、`pass_env`、`env_file`、`post_login_cmd`、`ready_probe`、`timeout_s`、`bootloader_prompts`、`boot_done_regex`、`uart.*` 等）；`targets` 綁定 COM → template → device_by_id（省略則全走動態偵測）。
 
 ### Platform 行為差異
 

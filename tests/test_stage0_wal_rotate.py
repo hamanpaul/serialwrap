@@ -358,10 +358,229 @@ def test_native_rotate_blocked_by_reader_degrades(tmp_path, fixed_ts):
         assert rec.get("rotation_failed") is True
         assert rec["seq"] == 6
     rec2 = w.append(com="COM0", direction="RX", source="device", payload=b"unblock")
+    # OD-19 oracle 變更：reader 關閉後的首筆仍在退避窗內（10 ms）時不嘗試、不標示；
+    # 輪替須於退避到期後以 append 或 tick() 非阻塞地「最終完成」，故改為有界等待。
     assert "rotation_failed" not in rec2
     assert rec2["seq"] == 7
+    import time as _time
+
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if {n for n in os.listdir(tmp_path) if n.startswith("raw.wal.ndjson.")} - before_archives:
+            break
+        _time.sleep(0.02)
+        w.tick()
     after_archives = {
         n for n in os.listdir(tmp_path) if n.startswith("raw.wal.ndjson.")
     }
     assert len(after_archives) == len(before_archives) + 1
     assert len(after_archives - before_archives) == 1
+    assert w.health()["deferred_delete_pending"] == 0
+
+
+# ---------------------------------------------------------------------------
+# OD-19（2026-10-23）：rotate 遇共用違規／存取拒絕的有界退避、延遲佇列與干擾計數。
+# 防毒等外部程式暫時佔用檔案屬干擾而非資料錯誤：寫入不得阻塞、不得遺失紀錄，
+# 輪替須最終完成，且干擾次數須以 health() 快照可觀測。
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """可手動推進的注入時鐘（與 test_stage0_wal_unlink.Clock 同形，避免跨檔匯入）。"""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, s: float) -> None:
+        self.t += s
+
+
+def _sharing_fs(failures: int, *, err_no: int = errno.EACCES, winerror: int | None = None):
+    """POSIX 替身：前 ``failures`` 次 rename 以指定的共用違規形態失敗（注入，不依賴防毒）。"""
+    (PosixWalFs,) = _load("sw_core.wal_fs", "PosixWalFs")
+
+    class SharingFs(PosixWalFs):
+        def __init__(self) -> None:
+            super().__init__()
+            self.remaining = failures
+            self.rename_attempts = 0
+
+        def rename_noreplace_or_suffix(self, src: str, base_dst: str) -> str:
+            self.rename_attempts += 1
+            if self.remaining > 0:
+                self.remaining -= 1
+                exc = PermissionError(err_no, "injected sharing violation")
+                if winerror is not None:
+                    exc.winerror = winerror  # Windows 的 ERROR_SHARING_VIOLATION＝32
+                raise exc
+            return super().rename_noreplace_or_suffix(src, base_dst)
+
+    return SharingFs()
+
+
+def _append_rx(w: WalWriter) -> dict:
+    # 空 payload：只讓現行 WAL 越過門檻，mirror 不成長，rename 嘗試次數只反映 WAL 路徑。
+    return w.append(com="COM0", direction="RX", source="device", payload=b"")
+
+
+@pytest.mark.core_portable
+def test_od19_sharing_violation_retries_with_bounded_backoff_then_completes(
+    tmp_path, fixed_ts, monkeypatch
+):
+    import time as _time
+
+    monkeypatch.setattr(
+        _time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("寫入路徑不得睡眠"))
+    )
+    fs = _sharing_fs(2, winerror=32)
+    clk = _Clock()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=fs, clock=clk)
+
+    _append_rx(w)  # 先寫入一筆，使現行檔越過門檻
+    first = _append_rx(w)  # 首次輪替嘗試失敗：本筆標示 rotation_failed
+    assert first.get("rotation_failed") is True
+    assert fs.rename_attempts == 1
+    assert w.health()["rotate_retry"] == 1 and w.health()["deferred_delete_pending"] == 0
+
+    _append_rx(w)  # 退避未到期：不嘗試，續寫既有檔
+    assert fs.rename_attempts == 1
+
+    clk.advance(0.011)  # 第一段退避 10 ms 到期 → 第二次嘗試仍失敗
+    _append_rx(w)
+    assert fs.rename_attempts == 2
+
+    clk.advance(0.051)  # 第二段退避 50 ms 到期 → 第三次嘗試成功（最終完成）
+    _append_rx(w)
+    assert fs.rename_attempts == 3
+    assert any(n.startswith("raw.wal.ndjson.") for n in os.listdir(tmp_path))
+    h = w.health()
+    assert h["rotate_retry"] == 2 and h["rotate_deferred"] == 0 and h["deferred_delete_pending"] == 0
+
+
+@pytest.mark.core_portable
+def test_od19_exhausted_immediate_retries_enter_deferred_queue_and_complete(tmp_path, fixed_ts):
+    fs = _sharing_fs(4, winerror=5)  # 初次＋3 次立即退避皆失敗 → 轉入延遲佇列
+    clk = _Clock()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=fs, clock=clk)
+    _append_rx(w)  # 先寫入一筆，使現行檔越過門檻
+    _append_rx(w)  # 第 1 次嘗試失敗
+    for gap in (0.011, 0.051, 0.201):  # 第 2、3、4 次嘗試（第 4 次失敗後即轉入延遲）
+        clk.advance(gap)
+        _append_rx(w)
+    assert fs.rename_attempts == 4
+    h = w.health()
+    assert h["rotate_deferred"] == 1 and h["deferred_delete_pending"] == 1 and h["rotate_retry"] == 4
+
+    clk.advance(0.5)  # 延遲間隔（1 s）未到：不嘗試
+    _append_rx(w)
+    assert fs.rename_attempts == 4
+
+    clk.advance(0.51)  # 延遲間隔到期：第 5 次嘗試成功，佇列清空
+    _append_rx(w)
+    assert fs.rename_attempts == 5
+    h = w.health()
+    assert h["deferred_delete_pending"] == 0 and h["rotate_deferred"] == 1
+    assert any(n.startswith("raw.wal.ndjson.") for n in os.listdir(tmp_path))
+
+
+@pytest.mark.core_portable
+def test_od19_deferred_rotate_failure_warns_again_at_limited_interval(tmp_path, fixed_ts, caplog):
+    import logging
+
+    fs = _sharing_fs(10, winerror=5)
+    clk = _Clock()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=fs, clock=clk)
+    with caplog.at_level(logging.WARNING, logger="serialwrap"):
+        _append_rx(w)
+        _append_rx(w)  # 首次失敗
+        for gap in (0.011, 0.051, 0.201):
+            clk.advance(gap)
+            _append_rx(w)
+        def rotate_warnings() -> list[logging.LogRecord]:
+            return [rec for rec in caplog.records if "WAL 輪替失敗" in rec.getMessage()]
+
+        assert len(rotate_warnings()) == 2  # 首次失敗、轉入延遲佇列
+        clk.advance(1.01)
+        w.tick()
+        assert len(rotate_warnings()) == 2  # 延遲重試未到限頻間隔
+        clk.advance(59.0)
+        w.tick()
+        assert len(rotate_warnings()) == 3  # 長時間持續失敗仍有受限頻率的訊號
+
+
+@pytest.mark.core_portable
+def test_od19_non_transient_rotate_error_keeps_legacy_degrade(tmp_path, fixed_ts):
+    fs = _sharing_fs(99, err_no=errno.EIO)  # EIO 非共用違規：不排程重試，維持既有 degrade
+    clk = _Clock()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=fs, clock=clk)
+    _append_rx(w)  # 先寫入一筆，使現行檔越過門檻
+    rec = _append_rx(w)  # 第 1 次嘗試失敗
+    assert rec.get("rotation_failed") is True
+    _append_rx(w)  # 第 2 次嘗試：非暫時性錯誤不排程退避，每筆仍嘗試（舊語意）
+    assert fs.rename_attempts == 2
+    h = w.health()
+    assert h["rotate_retry"] == 0 and h["deferred_delete_pending"] == 0
+
+
+@pytest.mark.core_portable
+def test_od19_tick_is_non_blocking_and_services_due_deferred_rotation(tmp_path, fixed_ts):
+    fs = _sharing_fs(4)
+    clk = _Clock()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, fs=fs, clock=clk)
+    _append_rx(w)  # 先寫入一筆，使現行檔越過門檻
+    _append_rx(w)  # 第 1 次嘗試失敗
+    for gap in (0.011, 0.051, 0.201):
+        clk.advance(gap)
+        _append_rx(w)
+    assert w.health()["deferred_delete_pending"] == 1
+
+    w._lock.acquire()  # 寫鎖被佔用時 tick 必須立即返回，不得等待
+    try:
+        assert w.tick() is False
+    finally:
+        w._lock.release()
+    assert fs.rename_attempts == 4
+
+    clk.advance(1.01)
+    w.tick()  # 延遲佇列到期：tick 可獨立完成輪替，不需等待下一筆寫入
+    assert fs.rename_attempts == 5
+    assert w.health()["deferred_delete_pending"] == 0
+
+
+@pytest.mark.posix_only
+def test_od19_unlink_fallback_permission_error_is_retried(tmp_path, fixed_ts, monkeypatch):
+    # POSIX 無 renameat2 時走 link＋unlink 降級；unlink 來源名稱遇 EACCES（防毒佔用）即屬干擾。
+    _force_unsupported_atomic_rename(monkeypatch, errno.EINVAL)
+    real_unlink = os.unlink
+    state = {"failed": False}
+
+    def flaky_unlink(path, *args, **kwargs):
+        if not state["failed"] and str(path).endswith("raw.wal.ndjson"):
+            state["failed"] = True
+            raise PermissionError(errno.EACCES, "injected: source name held by scanner")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", flaky_unlink)
+    clk = _Clock()
+    w = WalWriter(wal_dir=str(tmp_path), rotate_bytes=200, clock=clk)
+    _append_rx(w)  # 先寫入一筆，使現行檔越過門檻
+    first = _append_rx(w)
+    assert first.get("rotation_failed") is True and state["failed"] is True
+    assert w.health()["rotate_retry"] == 1
+    clk.advance(0.011)
+    _append_rx(w)
+    assert any(n.startswith("raw.wal.ndjson.") for n in os.listdir(tmp_path))
+    assert w.health()["deferred_delete_pending"] == 0
+
+
+@pytest.mark.core_portable
+def test_od19_health_exposes_interference_counters_on_clean_path(tmp_path):
+    w = WalWriter(wal_dir=str(tmp_path))
+    h = w.health()
+    assert h["rotate_retry"] == 0
+    assert h["rotate_deferred"] == 0
+    assert h["deferred_delete_pending"] == 0
+    assert h["healthy"] is True

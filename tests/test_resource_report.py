@@ -328,6 +328,44 @@ def test_resource_report_deployed_content(tmp_path: Path) -> None:
 
 
 @pytest.mark.process_rpc
+def test_resource_report_contract_blackbox_measures_deployed_content(tmp_path: Path) -> None:
+    """回歸（B 輪 L1 證據）：pytest 目標為 tests/contract_blackbox 且設 SW_RESOURCE_REPORT 時，
+    報告 deployed_content.start／end 必須為 error is None 的量測結果（非 null）。
+
+    修正前：contract_blackbox conftest 另載 plugin 副本，其 env 快照為 None 而根 conftest 已清除 env，
+    deployed_content 恆為 null，P4 登記會把所有 pytest 型案例判為 FAIL。
+    """
+    import realhw.deployed_content as deployed_content
+
+    layout = _install_layout(tmp_path, "case3")
+    inst = layout["inst"]
+    expected_tree_sha, _ = deployed_content.tree_digests(inst)
+
+    report_file = tmp_path / "rb.json"
+    env = dict(os.environ)
+    env["SERIALWRAP_CLI_EXE"] = str(layout["cli"])
+    env["SERIALWRAP_DAEMON_EXE"] = str(layout["daemon"])
+    env["SW_RESOURCE_REPORT"] = str(report_file)
+    # 只做收集（-k 不命中任何案例，exit 5 為 no tests collected）；目的是 sessionstart／sessionfinish 的量測
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/contract_blackbox", "-k", "no_such_case_zz_regression"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert res.returncode in (0, 5), f"pytest failed: {res.stdout}\n{res.stderr}"
+    assert report_file.exists()
+    data = json.loads(report_file.read_text(encoding="utf-8"))
+    dc = data.get("deployed_content")
+    assert isinstance(dc, dict), f"deployed_content 不得為 null：{dc!r}"
+    for side in ("start", "end"):
+        measured = dc[side]
+        assert measured["error"] is None, measured
+        assert measured["bundle_tree_sha256"] == expected_tree_sha
+        assert measured["release_manifest_sha256"] == layout["manifest_sha"]
+
+
+@pytest.mark.process_rpc
 def test_resource_report_cli_without_daemon_env_unmeasured(tmp_path: Path) -> None:
     """同上但不設 SERIALWRAP_DAEMON_EXE → start／end.error == "daemon_env_missing"、digest 皆 None；
     daemon 設為安裝樹外的檔案 → error == "daemon_outside_install"。
@@ -710,8 +748,8 @@ def test_regen_lock_base_check_detects_removal(tmp_path: Path) -> None:
     assert res1.returncode == 1, f"Expected exit 1, got {res1.returncode}: {res1.stdout}\n{res1.stderr}"
     assert "test_b" in res1.stdout or "test_b" in res1.stderr
 
-    # --allow-removal b 應 exit 0
-    cmd2 = [sys.executable, str(acc_dir / "regen_lock.py"), "--check", "--base", "HEAD~1", "--allow-removal", "tests/test_wal.py::test_b"]
+    # --allow-removal 三元組（s0_bc:linux:b）應 exit 0；裸 nodeid 已不被接受（見 test_regen_lock_allow_removal_is_scoped_to_set_and_platform）
+    cmd2 = [sys.executable, str(acc_dir / "regen_lock.py"), "--check", "--base", "HEAD~1", "--allow-removal", "s0_bc:linux:tests/test_wal.py::test_b"]
     res2 = subprocess.run(cmd2, cwd=repo_dir, capture_output=True, text=True)
     assert res2.returncode == 0, f"Expected exit 0 with allow-removal: {res2.stdout}\n{res2.stderr}"
 
@@ -746,6 +784,61 @@ def test_regen_lock_base_check_detects_removal(tmp_path: Path) -> None:
     lock_file.write_text(json.dumps(chg_sel_lock, indent=2), encoding="utf-8")
     res4 = subprocess.run(cmd1, cwd=repo_dir, capture_output=True, text=True)
     assert res4.returncode == 1, f"Expected exit 1 for selector change: {res4.stdout}\n{res4.stderr}"
+
+
+@pytest.mark.process_rpc
+def test_regen_lock_allow_removal_is_scoped_to_set_and_platform(tmp_path: Path) -> None:
+    """移除核准須為 set_id:platform:nodeid 三元組（sol d82d146 Medium 之修正；先寫反例，修正前必 FAIL）。
+
+    真實 L1 鎖（HEAD 版）中 cargo:sw-pal::proc_scan::posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree
+    列於 s1a_cargo.linux。commit 2 僅自 s1a_cargo.linux 移除它：
+    - 只授權 Windows 的三元組（s1a_cargo:windows:…）→ 必須 exit 1，且輸出指名 s1a_cargo.linux；
+    - 舊式裸 nodeid 授權同一移除 → 必須被拒（非 exit 0；舊版因只比對 nodeid 而放行）；
+    - s1a_cargo:linux:… 三元組 → exit 0。
+    """
+    nid = "cargo:sw-pal::proc_scan::posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree"
+    real_lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    assert nid in real_lock["sets"]["s1a_cargo"]["linux"]["nodeids"], "前提：反例 nodeid 須為 s1a_cargo.linux 必要集合成員"
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
+    acc_dir = repo_dir / "tests" / "acceptance"
+    acc_dir.mkdir(parents=True)
+    shutil.copy("tests/acceptance/regen_lock.py", acc_dir / "regen_lock.py")
+    for name in ("cases.yaml", "cases.lock.json", "cases.counts.json"):
+        shutil.copy(f"tests/acceptance/{name}", acc_dir / name)
+
+    lock_file = acc_dir / "l1_required.lock.json"
+    lock_file.write_text(json.dumps(real_lock, indent=2), encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base lock"], cwd=repo_dir, check=True, capture_output=True)
+
+    head_lock = json.loads(json.dumps(real_lock))
+    head_lock["sets"]["s1a_cargo"]["linux"]["nodeids"].remove(nid)
+    lock_file.write_text(json.dumps(head_lock, indent=2), encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "drop linux nodeid"], cwd=repo_dir, check=True, capture_output=True)
+
+    script = str(acc_dir / "regen_lock.py")
+
+    def _check(*allow: str) -> subprocess.CompletedProcess[str]:
+        cmd = [sys.executable, script, "--check", "--base", "HEAD~1"]
+        for token in allow:
+            cmd += ["--allow-removal", token]
+        return subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True, encoding="utf-8")
+
+    windows_only = _check(f"s1a_cargo:windows:{nid}")
+    assert windows_only.returncode == 1, f"Windows 授權不得放行 Linux 移除：{windows_only.stdout}\n{windows_only.stderr}"
+    assert "s1a_cargo.linux" in windows_only.stdout + windows_only.stderr
+
+    bare = _check(nid)
+    assert bare.returncode != 0, f"裸 nodeid 不得授權移除（須為三元組）：{bare.stdout}\n{bare.stderr}"
+
+    linux_ok = _check(f"s1a_cargo:linux:{nid}")
+    assert linux_ok.returncode == 0, f"三元組授權應放行：{linux_ok.stdout}\n{linux_ok.stderr}"
 
 
 @pytest.mark.process_rpc
@@ -1008,17 +1101,559 @@ def test_workflow_ci_l1_gates() -> None:
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
+    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組與 OD-24 的 5 筆 #[ignore] 列
+    # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
     allowed_removals = (
-        "tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
-        "tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
-        "tests/test_docker_l15.py::test_longrun_and_supervision_isolated",
-        "tests/test_docker_l15.py::test_longrun_refuses_before_p1",
-        "tests/test_docker_l15.py::test_run_l15_dry_run_labels_report",
-        "tests/test_docker_l15.py::test_run_l15_dry_run_uses_sandbox_by_id",
-        "tests/test_docker_l15.py::test_run_systemd_dry_run_asserts_dropin",
-        "tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[handoff]",
-        "tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[probe]",
-        "tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[race]",
+        "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
+        "s0_win_pytest:windows:tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
+        "s0_win_pytest:windows:tests/test_docker_l15.py::test_longrun_and_supervision_isolated",
+        "s0_win_pytest:windows:tests/test_docker_l15.py::test_longrun_refuses_before_p1",
+        "s0_win_pytest:windows:tests/test_docker_l15.py::test_run_l15_dry_run_labels_report",
+        "s0_win_pytest:windows:tests/test_docker_l15.py::test_run_l15_dry_run_uses_sandbox_by_id",
+        "s0_win_pytest:windows:tests/test_docker_l15.py::test_run_systemd_dry_run_asserts_dropin",
+        "s0_win_pytest:windows:tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[handoff]",
+        "s0_win_pytest:windows:tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[probe]",
+        "s0_win_pytest:windows:tests/test_stage0_handoff_stop.py::test_handoff_flash_races_prepare[race]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[action_help_session]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[action_session_help_list]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[action_version]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[action_version_session]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_alias_assign_missing_alias]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_cmd_submit_missing_selector]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_cmd_submit_selector_missing_val]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_dashdash_after_group]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_dashdash_after_sub]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_dashdash_before_group]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_dashdash_lone]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_event_reset_mutex_conflict]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_event_rm_extras_after_dashdash]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_event_tail_bad_int]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_event_tail_short_bundle_missing_value]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_file_push_bad_ack_mode]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_log_tail_raw_invalid_int]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_profile_test_ambiguous_equal]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_profile_test_missing_mut]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_session_recover_bad_timeout]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_skill_bad_platform]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[err_vv_missing_group]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_event_tail_with_options]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_alias_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_benches_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_cmd_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_connect_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_daemon_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_device_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_doctor_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_event_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_file_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_log_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_mcu_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_profile_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_remote_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_service_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_session_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_setup_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_skill_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_stream_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_supervision_mode_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_grp_wal_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col20]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col21]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col25]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col30]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col40]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_root_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_assign_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_assign_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_assign_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_assign_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_list_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_list_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_list_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_list_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_set_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_set_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_set_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_set_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_unassign_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_unassign_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_unassign_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_alias_unassign_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_cancel_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_cancel_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_cancel_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_cancel_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_result_tail_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_result_tail_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_result_tail_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_result_tail_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_status_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_status_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_status_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_status_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_submit_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_submit_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_submit_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_cmd_submit_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_attach_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_attach_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_attach_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_attach_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_list_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_list_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_list_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_list_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_release_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_release_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_release_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_device_release_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_add_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_add_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_add_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_add_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_disable_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_disable_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_disable_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_disable_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_enable_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_enable_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_enable_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_enable_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_list_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_list_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_list_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_list_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reload_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reload_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reload_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reload_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reset_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reset_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reset_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_reset_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_rm_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_rm_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_rm_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_rm_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_show_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_show_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_show_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_show_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_status_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_status_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_status_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_status_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_tail_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_tail_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_tail_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_event_tail_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_pull_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_pull_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_pull_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_pull_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_push_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_push_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_push_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_file_push_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_raw_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_raw_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_raw_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_raw_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_text_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_text_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_text_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_log_tail_text_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_patterns_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_patterns_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_patterns_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_patterns_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_status_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_status_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_status_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_mcu_status_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_profile_test_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_profile_test_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_profile_test_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_profile_test_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_activity_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_activity_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_activity_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_activity_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_attach_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_attach_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_attach_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_attach_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_bind_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_bind_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_bind_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_bind_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_clear_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_clear_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_clear_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_clear_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_attach_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_attach_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_attach_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_attach_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_detach_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_detach_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_detach_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_detach_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_list_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_list_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_list_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_console_list_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_close_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_close_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_close_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_close_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_open_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_open_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_open_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_open_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_send_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_send_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_send_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_send_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_status_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_status_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_status_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_interactive_status_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_list_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_list_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_list_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_list_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_start_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_start_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_start_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_start_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_status_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_status_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_status_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_status_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_stop_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_stop_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_stop_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_log_stop_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_pin_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_pin_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_pin_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_pin_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_recover_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_recover_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_recover_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_recover_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_self_test_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_self_test_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_self_test_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_self_test_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_unpin_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_unpin_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_unpin_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_session_unpin_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_stream_tail_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_stream_tail_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_stream_tail_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_stream_tail_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_current_seq_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_current_seq_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_current_seq_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_current_seq_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_export_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_export_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_export_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_export_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_reset_col120]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_reset_col60]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_reset_col80]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[help_sub_wal_reset_col90]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[quirk_retries_neg_one]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[quirk_sock_abbrev]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_cli_help.py::test_help_usage_error_bytes[quirk_stream_tail_neg_seq]",
+        "s1a_blackbox:windows:tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child",
+        "s1a_cargo:linux:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1a_cargo:linux:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
+        "s1a_cargo:linux:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
+        "s1a_cargo:linux:cargo:sw-cli::mgmt_service::service_non_string_mode_date_is_typeerror_exit1_without_stdout",
+        "s1a_cargo:linux:cargo:sw-cli::mgmt_service::service_non_string_mode_mixed_keys_is_typeerror_exit1_without_stdout",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::df05_daemon_locate_order",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::df07_bad_config_yaml",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::df10_system_scope_state_path",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::df12_setup_ran_field",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::df13_minicom_broker_rename",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::df16_windows_skill_copy",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc12_reconcile_wait_old_daemon",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc18_windows_ondemand_autostart",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc20_daemon_restart",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc22_supervision_mode_set",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc23_setup_rollback",
+        "s1a_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc25_release_manifest_version_pairing",
+        "s1a_cargo:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "s1a_cargo:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "s1a_cargo:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+        "s1a_cargo:linux:cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::df05_daemon_locate_order",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::df07_bad_config_yaml",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::df10_system_scope_state_path",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::df12_setup_ran_field",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::df13_minicom_broker_rename",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::df16_windows_skill_copy",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::sc12_reconcile_wait_old_daemon",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::sc18_windows_ondemand_autostart",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::sc20_daemon_restart",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::sc22_supervision_mode_set",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::sc23_setup_rollback",
+        "s1a_cargo:windows:cargo:sw-cli::p4_case_placeholders::sc25_release_manifest_version_pairing",
+        "s1a_cargo:windows:cargo:sw-pal::fs_lock::atomic_write_uses_expected_modes_and_removes_failed_temp_files",
+        "s1a_cargo:windows:cargo:sw-pal::fs_lock::copy_preserving_and_copy_tree_accept_readonly_files",
+        "s1a_cargo:windows:cargo:sw-pal::fs_lock::copy_tree_follows_source_file_symlinks_and_rejects_existing_destination",
+        "s1a_cargo:windows:cargo:sw-pal::fs_lock::realfs_copy_tree_matches_native_destination_and_symlink_contract",
+        "s1a_cargo:windows:cargo:sw-pal::fs_read::exists_follows_symlinks_like_os_path_exists",
+        "s1a_cargo:windows:cargo:sw-pal::osstr::invalid_bytes_become_surrogateescape_code_points",
+        "s1a_cargo:windows:cargo:sw-pal::osstr::join_restores_original_bytes_exactly",
+        "s1a_cargo:windows:cargo:sw-pal::osstr::valid_utf8_is_single_text_piece",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::identity_alive_detects_pid_reuse",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::incomplete_proc_stat_is_conservatively_alive",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::missing_proc_stat_is_not_alive",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::pid_alive_self_true_and_reaped_false",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::pid_and_identity_alive_handle_non_utf8_comm_and_matching_ticks",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::posix_tty_holder_scan_reports_matching_pid_and_ok_status",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::posix_tty_holder_scan_reports_permission_status",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree",
+        "s1a_cargo:windows:cargo:sw-pal::proc_scan::unreadable_proc_stat_is_conservatively_alive",
+        "s1a_cargo:windows:cargo:sw-pal::process_ctl::call_foreground_returns_negative_signal_status",
+        "s1a_cargo:windows:cargo:sw-pal::process_ctl::poll_treats_echild_as_exited_when_sigchld_is_ignored",
+        "s1a_cargo:windows:cargo:sw-pal::process_ctl::spawn_daemon_closes_inherited_non_cloexec_fds_in_both_modes",
+        "s1a_cargo:windows:cargo:sw-pal::process_ctl::spawn_daemon_detached_new_session",
+        "s1a_cargo:windows:cargo:sw-pal::process_ctl::spawn_daemon_poll_preserves_signal_exit_status",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_alive_is_false_after_child_exits",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_alive_is_true_for_a_running_child",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_rejects_invalid_pid_and_process_group_values",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_spawn_detached_does_not_inherit_non_cloexec_parent_fds",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_spawn_detached_reports_missing_and_non_executable_programs",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_terminate_escalates_and_waits_for_term_ignoring_group",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::posix_terminate_kills_whole_group_including_grandchild",
+        "s1a_cargo:windows:cargo:sw-pal::process_tunnel::spawn_detached_no_pipes_stdout_to_log",
+        "s1a_cargo:windows:cargo:sw-pal::registry_view::registry_view_posix_unsupported",
+        "s1a_cargo:windows:cargo:sw-pal::rpc_client_conformance::unix_enoent_matches_python_message",
+        "s1a_cargo:windows:cargo:sw-pal::rpc_client_conformance::unix_fixture_rows_match_python",
+        "s1a_cargo:windows:cargo:sw-pal::rpc_client_conformance::unix_len_107_vs_108",
+        "s1a_cargo:windows:cargo:sw-pal::rpc_client_conformance::unix_path_too_long_has_no_errno",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::fs_ops::posix::tests::atomic_write_temp_file_is_close_on_exec",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::clamped_poll_timeout_does_not_finish_a_later_deadline",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::expired_send_deadline_returns_timeout",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::only_einprogress_is_treated_as_pending_connect",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::sysenv::posix::tests::merged_runner_preserves_stdout_and_stderr_write_order",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::sysenv::posix::tests::retry_buffer_grows_after_erange",
+        "s1a_cargo:windows:cargo:sw-pal::sw_pal::sysenv::posix::tests::retry_buffer_stops_at_one_megabyte",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv::realpath_resolves_symlinks",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv::vars_survive_non_utf8_values",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::has_systemd_false_when_dir_absent",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_invalid_utf8_error_spans_match_python_goldens",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_invalid_utf8_is_decode_error_like_python",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_raw_preserves_nul_bytes_and_crlf",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_raw_replaces_env",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_timeout_covers_pipe_drain_after_parent_exit",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_timeout_covers_pipe_drain_after_parent_is_killed",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::run_universal_newlines_matches_python_golden",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::user_identity_posix_prefers_user_env",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_all_dedups_in_path_order",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_all_keeps_distinct_candidate_strings",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_all_skips_non_executable_posix",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_treats_empty_path_entries_as_current_directory",
+        "s1a_cargo:windows:cargo:sw-pal::sysenv_mgmt::which_uses_default_path_when_path_is_unset",
+        "s1a_delegation:windows:tests/contract_blackbox/test_bb_delegation.py::test_exec_replaces_process_and_sigterm_reaches_child",
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_service::service_non_string_mode_date_is_typeerror_exit1_without_stdout",
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_service::service_non_string_mode_mixed_keys_is_typeerror_exit1_without_stdout",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::df05_daemon_locate_order",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::df07_bad_config_yaml",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::df10_system_scope_state_path",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::df12_setup_ran_field",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::df13_minicom_broker_rename",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::df16_windows_skill_copy",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc12_reconcile_wait_old_daemon",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc18_windows_ondemand_autostart",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc20_daemon_restart",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc22_supervision_mode_set",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc23_setup_rollback",
+        "s1b_cargo:linux:cargo:sw-cli::p4_case_placeholders::sc25_release_manifest_version_pairing",
+        "s1b_cargo:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "s1b_cargo:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "s1b_cargo:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+        "s1b_cargo:linux:cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure",
+        "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
+        "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
+        "s1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
     )
     for nodeid in allowed_removals:
         assert nodeid in lock_command, f"L1 擁有者裁決清單缺少 {nodeid}"
@@ -1043,3 +1678,53 @@ def test_workflow_ci_l1_gates() -> None:
 def test_win_pytest_does_not_add_ineffective_safe_directory() -> None:
     script = Path("scripts/stage0/win-pytest.sh").read_text(encoding="utf-8")
     assert "config --local --add safe.directory" not in script
+
+
+@pytest.mark.memory_only
+def test_od23_removal_triples_are_all_approved_in_ci() -> None:
+    """OD-23：稽核清單所列 36 個既有移除三元組必須逐名出現在 CI 的 --allow-removal 清單中。"""
+    import re
+
+    doc = Path("docs/rust-refactor/reviews/s1x-unauthorized-removals.md").read_text(encoding="utf-8")
+    triples = list(dict.fromkeys(re.findall(r"^\| `([a-z0-9_]+:(?:linux|windows):[^`]+)` \|", doc, re.MULTILINE)))
+    assert len(triples) == 36, triples
+    assert "RESOLVED（OD-23" in doc
+    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    lock_steps = [
+        st for st in wf["jobs"]["pytest"]["steps"]
+        if "regen_lock.py --check --base" in str(st.get("run", ""))
+    ]
+    assert len(lock_steps) == 1
+    tokens = shlex.split(str(lock_steps[0]["run"]))
+    allowed = tokens[tokens.index("--allow-removal") + 1:]
+    missing = [triple for triple in triples if triple not in allowed]
+    assert not missing, missing
+    decisions = Path("docs/rust-refactor/owner-decisions-2026-10-15.md").read_text(encoding="utf-8")
+    assert "| OD-23 | **S1X 凍結鎖既有 36 筆移除補授權**" in decisions
+
+
+@pytest.mark.memory_only
+def test_od24_ignored_removal_triples_are_approved_in_ci() -> None:
+    """OD-24：s1b_cargo 的 5 筆 #[ignore] 列移除三元組必須逐名出現在 OD-24 列與 CI 的 --allow-removal 清單中。"""
+    triples = (
+        "s1b_cargo:linux:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1b_cargo:windows:cargo:sw-cli::mgmt_layout::mkbundle_respects_cargo_target_dir_override",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_delegate_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
+        "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
+    )
+    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    lock_steps = [
+        st for st in wf["jobs"]["pytest"]["steps"]
+        if "regen_lock.py --check --base" in str(st.get("run", ""))
+    ]
+    assert len(lock_steps) == 1
+    tokens = shlex.split(str(lock_steps[0]["run"]))
+    allowed = tokens[tokens.index("--allow-removal") + 1:]
+    assert not [triple for triple in triples if triple not in allowed]
+    decisions = Path("docs/rust-refactor/owner-decisions-2026-10-15.md").read_text(encoding="utf-8")
+    od24 = next(line for line in decisions.splitlines() if line.startswith("| OD-24 |"))
+    assert not [triple for triple in triples if f"`{triple}`" not in od24]
+    addenda = Path("docs/rust-refactor/owner-decisions-addenda.md").read_text(encoding="utf-8")
+    pending = next(line for line in addenda.splitlines() if line.startswith("| PENDING-OD-S1X-L1-IGNORED-READD |"))
+    assert "RESOLVED（OD-24" in pending

@@ -21,8 +21,8 @@ import errno
 import logging
 import os
 import re
-import sys
 import stat
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -103,26 +103,65 @@ class DeviceNotPresentError(FileNotFoundError):
     """開啟裝置時確認裝置路徑已不存在。"""
 
 
+# UNIX98 devpts slave 的 major 範圍（136–143）。各 devpts instance（主機、各容器）皆可能重用 136:N，
+# 故 devpts 不以 st_rdev 判定同一 tty，只看 inode 身分（#R2）。
+_DEVPTS_MAJORS = frozenset(range(136, 144))
+
+
+def tty_stat(path: str) -> os.stat_result | None:
+    """回傳 ``path``（跟隨 symlink）的 stat 結果；無法 stat 或缺 st_dev／st_ino 時回 None。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if getattr(st, "st_dev", None) is None or getattr(st, "st_ino", None) is None:
+        return None
+    return st
+
+
+def same_tty(fd_st: os.stat_result, tty_st: os.stat_result) -> bool:
+    """判定 fd 所指 inode（``fd_st``）是否與 tty（``tty_st``）為同一裝置（#R2）。
+
+    主判準為 ``(st_dev, st_ino)``。字串相等與 ``st_rdev`` 相等都不足為憑：容器內獨立 devpts instance 的
+    ``/dev/pts/N`` 與主機同名、同 ``rdev``（136:N），實為不同裝置（實測主機 0:60、容器 0:140／0:148）。
+
+    另允許一種別名：兩邊皆為字元裝置、``st_rdev`` 相等且非零、且 major 不在 devpts 範圍內（例如容器以
+    mknod 掛入同一實體 UART 節點，inode 不同但 rdev 相同）。devpts 不走此分支。
+    """
+    fd_id = (getattr(fd_st, "st_dev", None), getattr(fd_st, "st_ino", None))
+    tty_id = (getattr(tty_st, "st_dev", None), getattr(tty_st, "st_ino", None))
+    if None not in fd_id and None not in tty_id and fd_id == tty_id:
+        return True
+    if not (stat.S_ISCHR(getattr(fd_st, "st_mode", 0)) and stat.S_ISCHR(getattr(tty_st, "st_mode", 0))):
+        return False
+    rdev = getattr(tty_st, "st_rdev", 0)
+    if not rdev or getattr(fd_st, "st_rdev", 0) != rdev:
+        return False
+    return os.major(rdev) not in _DEVPTS_MAJORS
+
+
 def probe_holders(
     real_path: str,
     *,
     proc_root: str = "/proc",
     exclude_pid: int | None = None,
 ) -> HolderReport:
-    """掃描 POSIX procfs 中指向同一 tty 的行程；不開啟裝置或送出 UART bytes。"""
+    """掃描 POSIX procfs 中與 ``real_path`` 為同一 tty 的行程；不開啟裝置或送出 UART bytes。
+
+    比對見 :func:`same_tty`（#R2）：``os.stat(/proc/<pid>/fd/N)`` 跟隨至 fd 實際指向的 inode，與
+    ``os.stat(real_path)`` 比較。不以 readlink 字串判定——跨 mount namespace（docker 容器）的
+    ``/dev/pts/N`` 字串會與主機相同，卻非同一 tty，造成假 holder，進而使 attach 回 ``DeviceHeldError``。
+    無法取得 ``real_path`` 的身分時（stat 失敗）不得推論為「無 holder」，回 ``holder_unknown=True``。
+    """
     if os.name == "nt":
         return HolderReport((), True, "unsupported")
 
     try:
-        target = os.path.realpath(real_path)
+        target_st = os.stat(real_path)
+    except PermissionError:
+        return HolderReport((), True, "permission")
     except OSError:
-        target = real_path
-    try:
-        target_stat = os.stat(real_path)
-        target_rdev = getattr(target_stat, "st_rdev", 0)
-    except OSError:
-        target_rdev = 0
-
+        return HolderReport((), True, "unknown")
     holders: set[int] = set()
     status: Literal["ok", "permission", "unknown"] = "ok"
     try:
@@ -151,7 +190,7 @@ def probe_holders(
         for fd in fds:
             fd_path = os.path.join(fd_dir, fd)
             try:
-                link = os.readlink(fd_path)
+                fd_stat = os.stat(fd_path)
             except FileNotFoundError:
                 # 行程或 fd 在掃描期間消失屬正常競態。
                 continue
@@ -162,22 +201,7 @@ def probe_holders(
                 if status == "ok":
                     status = "unknown"
                 continue
-            matched = link == target or link == real_path
-            if not matched and target_rdev:
-                try:
-                    fd_stat = os.stat(fd_path)
-                    matched = (
-                        stat.S_ISCHR(fd_stat.st_mode)
-                        and getattr(fd_stat, "st_rdev", 0) == target_rdev
-                    )
-                except FileNotFoundError:
-                    pass
-                except PermissionError:
-                    status = "permission"
-                except OSError:
-                    if status == "ok":
-                        status = "unknown"
-            if matched:
+            if same_tty(fd_stat, target_st):
                 holders.add(pid)
                 break
 

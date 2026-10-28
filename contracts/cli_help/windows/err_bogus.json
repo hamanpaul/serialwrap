@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "bogus"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap [-h] [--version] [-v] [--socket SOCKET]\n                  [--endpoint ENDPOINT] [--bench CODE] [--timeout TIMEOUT_S]\n                  [--retries RETRIES]\n                  <group> ...\nserialwrap: error: argument <group>: invalid choice: 'bogus' (choose from 'daemon', 'device', 'session', 'alias', 'cmd', 'stream', 'log', 'file', 'wal', 'mcu', 'remote', 'connect', 'benches', 'event', 'supervision-mode', 'service', 'setup', 'doctor', 'profile', 'skill')\n",
+  "native": true,
+  "post_parse_effects": false
+}

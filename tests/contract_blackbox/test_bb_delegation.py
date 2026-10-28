@@ -28,7 +28,6 @@ PROBE = REPO / "tests" / "contract_blackbox" / "data" / "delegate_probe.py"
 VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
 pytestmark = [
-    pytest.mark.core_portable,
     pytest.mark.process_rpc,
     pytest.mark.needs_delegation,
 ]
@@ -183,6 +182,7 @@ def broken_entry_bundle(tmp_path: Path, dev_base: _DevBundle, monkeypatch: pytes
 
 
 @pytest.mark.parametrize("argv", SAME_AS_PYTHON)
+@pytest.mark.core_portable
 def test_delegated_output_identical_to_python(env, argv):
     r = run_cli(argv, env=env)
     if bb_harness.is_rust() and argv == ["setup", "--help"]:
@@ -197,6 +197,7 @@ def test_delegated_output_identical_to_python(env, argv):
     assert (r.rc, r.stdout, r.stderr) == (py.returncode, py.stdout, py.stderr)
 
 
+@pytest.mark.core_portable
 def test_daemon_status_via_stub(env, stubd):
     s = stubd({"methods": {"health.status": [{"reply": {"ok": True, "pid": 1, "version": "x"}}]}})
     py = subprocess.run([*python_baseline_prefix(), "--socket", s.endpoint, "daemon", "status"],
@@ -207,6 +208,7 @@ def test_daemon_status_via_stub(env, stubd):
 
 # B：Rust-only 委派機制
 @pytest.mark.rust_only
+@pytest.mark.core_portable
 def test_missing_manifest(tmp_path, env):
     src = Path(bb_harness.cli_prefix()[-1])
     assert src.exists(), f"受測 Rust CLI 不存在（{src}）"
@@ -225,6 +227,7 @@ def test_missing_manifest(tmp_path, env):
 
 
 @pytest.mark.rust_only
+@pytest.mark.core_portable
 @pytest.mark.parametrize("exit_code", [0, 37, 1])
 def test_probe_receives_argv_env_stdin_and_exit_code(probe_bundle, env, tmp_path, exit_code):
     counter = tmp_path / "count"
@@ -245,6 +248,7 @@ def test_probe_receives_argv_env_stdin_and_exit_code(probe_bundle, env, tmp_path
 
 
 @pytest.mark.rust_only
+@pytest.mark.core_portable
 def test_exec_failure_runs_nothing_and_does_not_fall_back(broken_entry_bundle, env, tmp_path):
     # entry[0] 存在但不可執行（chmod 000）→ exec failed；不得改走 PATH 或重試
     marker = tmp_path / "marker"
@@ -264,6 +268,7 @@ def test_exec_failure_runs_nothing_and_does_not_fall_back(broken_entry_bundle, e
 
 
 @pytest.mark.rust_only
+@pytest.mark.core_portable
 def test_recursion_detected_when_entry_points_to_self(self_loop_bundle, env):
     r = run_cli(["doctor"], env=dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="doctor"), timeout_s=20)
     assert r.rc == 1
@@ -271,6 +276,7 @@ def test_recursion_detected_when_entry_points_to_self(self_loop_bundle, env):
 
 
 @pytest.mark.rust_only
+@pytest.mark.core_portable
 def test_never_searches_path(probe_bundle, tmp_path, env):
     fake = tmp_path / "fakebin"
     fake.mkdir()
@@ -306,7 +312,91 @@ def test_exec_replaces_process_and_sigterm_reaches_child(probe_bundle, env):
             p.wait()
 
 
+_WAIT_OBJECT_0 = 0x00000000
+_SYNCHRONIZE = 0x00100000
+_PROCESS_TERMINATE = 0x0001
+
+
+def _win_kernel32():
+    """僅 Windows 測試路徑使用：以行程 handle 追蹤委派子行程（不依賴 pywin32）。"""
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.TerminateProcess.restype = wintypes.BOOL
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+def _read_counter_pid(counter: Path) -> int | None:
+    """讀取委派子行程寫入 PROBE_COUNTER 的 pid；僅在整行寫完（以換行結尾）後回傳。"""
+    try:
+        text = counter.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return int(text.splitlines()[-1]) if text.endswith("\n") else None
+
+
 @pytest.mark.rust_only
+@pytest.mark.windows_native
+def test_windows_exec_or_wait_exit_code_and_terminate_propagation(probe_bundle, env, tmp_path):
+    exit_env = dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="setup", PROBE_EXIT="37")
+    exited = run_cli(["setup"], env=exit_env, timeout_s=30)
+    assert exited.rc == 37, f"exec_or_wait 未保留委派 exit code：{exited.rc}"
+
+    counter = tmp_path / "delegate-child-pid.txt"
+    wait_env = dict(
+        env,
+        SERIALWRAP_TEST_DELEGATE_GROUP="setup",
+        PROBE_READ_STDIN="1",
+        PROBE_COUNTER=str(counter),
+    )
+    child = subprocess.Popen(
+        [*bb_harness.cli_prefix(), "setup"],
+        env=wait_env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    k32 = _win_kernel32()
+    delegated = None
+    try:
+        deadline = time.monotonic() + 10
+        while _read_counter_pid(counter) is None and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        pid = _read_counter_pid(counter)
+        assert pid is not None, "委派子行程未啟動並進入 stdin 等待"
+        delegated = k32.OpenProcess(_SYNCHRONIZE | _PROCESS_TERMINATE, False, pid)
+        assert delegated, f"無法開啟委派子行程 pid={pid}"
+        child.terminate()
+        # 委派子行程阻塞於 stdin 讀取，且 EOF 尚未送出；在確認其死亡前不得關閉 stdin。
+        # terminate 後立即 communicate 會先送 EOF，但 KILL_ON_JOB_CLOSE 須待父行程的 Job handle 隨行程收尾才生效（約數毫秒），
+        # 子行程可能先讀到 EOF 並輸出（競態）。與 sw-pal exec_or_wait_terminate_kills_default_grandchild 相同：以期限內輪詢死亡為準。
+        assert k32.WaitForSingleObject(delegated, 5000) == _WAIT_OBJECT_0, (
+            "委派父行程終止後 5 秒內委派子行程仍存活（未受 kill-on-close Job 約束）"
+        )
+        stdout, stderr = child.communicate(input=b"", timeout=10)
+        assert child.returncode == 1, f"Windows terminate exit code 不符：{child.returncode}"
+        assert stdout == b"", f"委派子行程在父行程終止後仍存活並輸出：{stdout!r}"
+        assert stderr == b"", f"terminate 傳遞期間出現 stderr：{stderr!r}"
+    finally:
+        if delegated:
+            if k32.WaitForSingleObject(delegated, 0) != _WAIT_OBJECT_0:
+                k32.TerminateProcess(delegated, 1)  # 失敗路徑清理：不讓委派子行程殘留
+            k32.CloseHandle(delegated)
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)
+
+
+@pytest.mark.rust_only
+@pytest.mark.core_portable
 def test_no_output_before_delegation(probe_bundle, env):
     r = run_cli(["-v", "--socket", "/nope", "daemon", "status"],
                 env=dict(env, SERIALWRAP_TEST_DELEGATE_GROUP="daemon", SERIALWRAP_LOG_LEVEL="DEBUG"))

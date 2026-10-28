@@ -39,6 +39,9 @@ class ProfileTemplate:
     log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
+    # 開機完成訊號：boot quiet window 期間 RX 命中即提早解除（與 login／prompt regex 同列）；
+    # 不參與登入流程。空字串＝不設（只靠 login／prompt 或 180s 過期）。
+    boot_done_regex: str = ""
     max_console_line_chars: int | None = None
 
     @property
@@ -72,6 +75,9 @@ class SessionProfile:
     log_dir: str | None = None
     uart: UartProfile = dataclasses.field(default_factory=UartProfile)
     bootloader_prompts: tuple[str, ...] = ()
+    # 開機完成訊號：boot quiet window 期間 RX 命中即提早解除（與 login／prompt regex 同列）；
+    # 不參與登入流程。空字串＝不設（只靠 login／prompt 或 180s 過期）。
+    boot_done_regex: str = ""
     max_console_line_chars: int | None = None
 
     @property
@@ -187,6 +193,7 @@ def _template_from_dict(name: str, raw: dict[str, Any], *, base_dir: str) -> Pro
         bootloader_prompts=tuple(s for s in raw["bootloader_prompts"] if isinstance(s, str))
         if isinstance(raw.get("bootloader_prompts"), list)
         else (),
+        boot_done_regex=str(raw.get("boot_done_regex") or "").strip(),
     )
 
 
@@ -300,6 +307,7 @@ def _merge_session(
         ),
         uart=_load_uart(target.get("uart"), default=template.uart),
         bootloader_prompts=template.bootloader_prompts,
+        boot_done_regex=str(target.get("boot_done_regex") or template.boot_done_regex).strip(),
     )
 
 

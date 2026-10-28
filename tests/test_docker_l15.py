@@ -151,6 +151,24 @@ def _bundle_fixture(path: Path) -> Path:
     return path
 
 
+def _copy_present_artifacts(index_data: dict, root: Path) -> None:
+    """夾具：把正式索引中既有 present 項目的 artifact（及 .evidence.json 標記，若有）複製到暫存根目錄。
+
+    checker 對 present 項目一律檢查檔案存在與 sha256；暫存根若只放合成項目，其餘 present 項目
+    （例如 S0-SPIKE1-REMAINING）會判 artifact_missing（exit 1，非本測試預期的 exit 5）。
+    只複製既有檔案，不改動索引、合成項目或任何斷言；目錄型 artifact（L1 set）不在此複製。
+    """
+    for item in index_data.get("items") or []:
+        rel = item.get("artifact_path")
+        if item.get("status") != "present" or not rel:
+            continue
+        for name in (rel, f"{rel}.evidence.json"):
+            src = REPO / name
+            if src.is_file() and not (root / name).exists():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, root / name)
+
+
 def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> subprocess.CompletedProcess:
     """保留 Stage 0 正式索引，只追加不承接 case 覆蓋的合成標記項目。"""
     import yaml  # noqa: PLC0415
@@ -177,6 +195,7 @@ def _checker_run(tmp_path: Path, report: dict, required_layer: str | None) -> su
         item["required_layer"] = required_layer
     # 保留正式 Stage 0 分母與 case 覆蓋，只追加單一合成項目供層級規則測試。
     index = yaml.safe_load((repo / "tests" / "acceptance" / "stage0_evidence_index.yaml").read_text(encoding="utf-8"))
+    _copy_present_artifacts(index, evidence)
     index["items"].append(item)
     (repo / "tests" / "acceptance" / "stage0_evidence_index.yaml").write_text(
         yaml.safe_dump(index, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -212,6 +231,15 @@ def test_compose_two_app_containers():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_systemd_holder_scanner_has_only_ptrace_capability():
+    """systemd L1 holder scanner 需 SYS_PTRACE 讀取非-dumpable process fd；其他 service 不得取得額外 capability。"""
+    services = _compose_services()
+    assert services["systemd"].get("cap_add") == ["SYS_PTRACE"]
+    assert all("cap_add" not in svc for name, svc in services.items() if name != "systemd")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_compose_no_real_serial_devices():
     services = _compose_services()
     for name, svc in services.items():
@@ -221,16 +249,34 @@ def test_compose_no_real_serial_devices():
                 for bad in FORBIDDEN_DEVICES:
                     assert bad not in text, f"{name}.{key} 含真實裝置路徑 {bad}"
         assert svc.get("privileged", False) is False, f"{name} 不得 privileged"
-        assert "cap_add" not in svc, f"{name} 不得新增超出 systemd 容器政策的 capabilities"
         # systemd profile 的例外只允許 cgroup: host 與 /sys/fs/cgroup 掛載；其他服務一律不得使用
         systemd = any(str(p).startswith("systemd") for p in (svc.get("profiles") or []))
         if systemd:
+            assert svc.get("cap_add") == ["SYS_PTRACE"], \
+                f"{name} 只允許 holder scanner 所需的 SYS_PTRACE capability"
             if "cgroup" in svc:
                 assert svc["cgroup"] == "host", f"{name} 的 cgroup 只允許 host"
         else:
+            assert "cap_add" not in svc, f"{name} 不得新增 capabilities"
             assert "cgroup" not in svc, f"{name} 非 systemd profile 不得設定 cgroup"
             assert "/sys/fs/cgroup" not in json.dumps(svc.get("volumes") or []), \
                 f"{name} 非 systemd profile 不得掛載 /sys/fs/cgroup"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_selftest_diag_tolerates_non_object_reports(tmp_path):
+    # 診斷只增加輸出：報告為合法 JSON 但頂層非物件時不得拋例外吞掉原失敗訊息。
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "selftest-report.json").write_text("[1, 2]", encoding="utf-8")
+    (tmp_path / "b").mkdir()
+    (tmp_path / "b" / "selftest-report.json").write_text(
+        json.dumps({"verdict": "FAIL", "complete": True, "checks": [{"id": "ST-01", "verdict": "FAIL", "reason": "x"}]}),
+        encoding="utf-8",
+    )
+    diag = _selftest_diag(tmp_path)
+    assert "頂層非物件（list）" in diag
+    assert "ST-01=FAIL：x" in diag
 
 
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
@@ -437,6 +483,29 @@ def test_resource_report_uart_kind(tmp_path):
         assert data["uart_kind"] == expect
 
 
+def _selftest_diag(out: Path) -> str:
+    """把 bridge selftest 報告的非 PASS 檢查摘要附進失敗訊息。
+
+    POSIX pytest 的短 basetemp 於 unconfigure 時整個刪除，失敗當次的 tmp 證據無法事後查閱；
+    只增加診斷輸出，不影響判定。
+    """
+    lines = []
+    for path in sorted(out.rglob("selftest-report.json")):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            lines.append(f"{path.relative_to(out)}: 無法解析（{type(exc).__name__}: {exc}）")
+            continue
+        if not isinstance(report, dict):
+            lines.append(f"{path.relative_to(out)}: 頂層非物件（{type(report).__name__}）")
+            continue
+        bad = [f"{row.get('id')}={row.get('verdict')}：{row.get('reason')}"
+               for row in report.get("checks") or [] if isinstance(row, dict) and row.get("verdict") != "PASS"]
+        lines.append(f"{path.relative_to(out)}: verdict={report.get('verdict')} complete={report.get('complete')}"
+                     + "".join(f"\n  - {item}" for item in bad))
+    return "\n--- selftest ---\n" + ("\n".join(lines) if lines else "（未產生 selftest-report.json）")
+
+
 # POSIX-only（§10.4）：_run_script（tests/test_docker_l15.py:71）用 bash 執行 scripts/docker/*.sh；run-l15.sh:43／common.sh:7 需 POSIX bash 與 python3（WSL 路徑轉換 rc=127，Git Bash 缺 python3 rc=49）。
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
@@ -446,7 +515,7 @@ def test_docker_smoke_two_container(tmp_path):
         pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
     r = _run_script(RUN_L15, "func-test-bridge", "--case", "sm-01-attach-to-ready", "--out", str(tmp_path),
                     timeout=900)
-    assert r.returncode == 0, _tail(r)
+    assert r.returncode == 0, _tail(r) + _selftest_diag(tmp_path)
     report_path = tmp_path / "l15-docker-report.json"
     assert report_path.is_file(), "run-l15.sh 未寫出 l15-docker-report.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -500,7 +569,7 @@ def test_l15_suite_runtime_import_and_cli_paths_match_serialwrap_image():
 def test_systemd_container_runners_resolve_imports_and_host_bind_paths():
     """回歸：systemd 容器內 runner 的 import、bridge 證據路徑與 runuser argv 必須能在真跑時成立。
 
-    systemd.Dockerfile 只在 /opt/serialwrap/.venv 安裝相依（系統 python3 無 PyYAML、無 scripts／tests 套件路徑），
+    systemd.Dockerfile 只在 /opt/serialwrap/.venv 安裝相依（系統 python3 無 scripts／tests 套件路徑；PyYAML 雖已由 python3-yaml 提供，runner 仍以 venv python 執行），
     故 runner 須以 venv python＋PYTHONPATH=/opt/serialwrap 執行；bridge 經 docker.sock 啟動 DUT 時 bind src 由
     host docker daemon 解析，證據根須為 host 同路徑掛載（SW_HOST_EVIDENCE_DIR）；runuser 不得把含
     SERIALWRAP_DAEMON_EXE=/…/serialwrapd 的環境展開成 argv，否則 #101 多開偵測把 runuser 父行程誤認為 daemon。
@@ -539,3 +608,47 @@ def test_systemd_container_runners_resolve_imports_and_host_bind_paths():
     finally:
         monkey.undo()
     assert captured and not any("serialwrapd" in arg for arg in captured[0]), captured
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_holder_scan_fail_closes_only_on_reachable_uids(monkeypatch):
+    """回歸（G-1）：其他 uid 行程（例如 messagebus）fd 表不可讀時不得誤報 fail-closed；
+    兩輪掃描權限所及 uid（root／swtest）的不可讀現存行程仍須 fail-closed。
+    """
+    sys.path.insert(0, str(REPO / "tools" / "uart_stdio_bridge" / "src"))
+    sys.path.insert(0, str(REPO))
+    try:
+        from scripts.docker import run_systemd_container as rsc  # noqa: PLC0415
+    finally:
+        sys.path.remove(str(REPO))
+        sys.path.remove(str(REPO / "tools" / "uart_stdio_bridge" / "src"))
+
+    def _scans(readable: list[int], pids: list[int], holders: list[int]):
+        def _fake_scan(target, *, as_user):
+            return {"pids": sorted(pids), "readable": sorted(readable), "holders": sorted(holders)}
+        return _fake_scan
+
+    dev = Path("/dev/null")
+
+    # 行程 200 為 messagebus（uid 999）：兩輪皆讀不到，但不在權限所及 uid 內，不得 fail-closed。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[100], pids=[100, 200], holders=[100]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: {100: 0, 200: 999}.get(pid))
+    assert rsc._holder_pids(dev) == [100]
+
+    # 行程 300 為 root（uid 0）且讀不到 fd 表：屬權限所及 uid，須 fail-closed。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[100], pids=[100, 300], holders=[]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: {100: 0, 300: 0}.get(pid))
+    with pytest.raises(RuntimeError, match="300"):
+        rsc._holder_pids(dev)
+
+    # 行程 400 為 swtest（uid 1000）且讀不到 fd 表：同樣須 fail-closed。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[], pids=[400], holders=[]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: {400: 1000}.get(pid))
+    with pytest.raises(RuntimeError, match="400"):
+        rsc._holder_pids(dev)
+
+    # 已結束的行程（uid 解析為 None）不計入 uncovered。
+    monkeypatch.setattr(rsc, "_scan_proc_fds", _scans(readable=[], pids=[500], holders=[]))
+    monkeypatch.setattr(rsc, "_proc_uid", lambda pid: None)
+    assert rsc._holder_pids(dev) == []
