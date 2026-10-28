@@ -29,4 +29,5 @@
 | P7-BU-1 | quiet arm 改呼叫 `invalidate_human_input`（`input_epoch`＋`Log reason=boot_banner`／`QuietRearm`）、owner_gen 不再遞增；`banner_arm_bumps_fsm_gen_once_and_invalidates_human_input` 全名測試 | 07 T6 D-02 |
 | P7-BU-2 | reprobe 的 `human_active`（`lease_context(...)["human_active"]`）；`human_active_blocks_reprobe` | 07 T7 |
 | P7-BU-3 | `session_attach_paths` 的「ATTACHED 且 last_error None」null 子案（需 human lease 持有中的 capable ATTACHED） | 07 T7／T10 |
+| P7-BU-5 | Task 9：force recover 的 drain Phase 1 `invalidate_human_input(Recovery)`（`force_clear_invalidates_human_input`）與 READY recover 前的 `invalidate_deferred("recover")`；Task 10：`slow_capture_fs_does_not_block_actor_control_lane`（需新增 `Effect::CaptureOpen／CaptureClose`，須改 P5 `tests/support` 窮舉 executor） | 07 T6 D-02；P5 測試支援碼 |
 | P7-BU-4 | production executor 對 P6 `Effect::Console*`／`HumanTx`／`LeaseIndex` 為 `todo!`（同 tests/support）；P6 合入前 SessionCore 不產生 | 07 T6／T7／T9 |

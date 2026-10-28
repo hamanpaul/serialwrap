@@ -401,7 +401,9 @@ pub struct SessionCore {
     /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 actor 驅動版）。
     reboot_recovery: Option<RebootRecovery>,
     /// force recover（clear＋reattach＋等待 READY 10 s）的等待者。
-    force_recover: Option<ForceRecover>,
+    /// force recover 的等待者（每個呼叫各自 10 次 × 1 s 輪詢，Python 各 thread 獨立 `_force_recover`）。
+    force_recover: Vec<ForceRecover>,
+    next_force_id: u64,
     /// self-test 的外部觀測注入（RELEASED holder 掃描、哨兵 PTY 存活）。
     self_test_probes: SelfTestProbes,
     /// 最近一筆 RX 的 WAL seq（capture `last_seq`）。
@@ -567,7 +569,8 @@ impl SessionCore {
             capture_observer: crate::capture::CaptureObserver::new(),
             capture_env: CaptureEnv::default(),
             reboot_recovery: None,
-            force_recover: None,
+            force_recover: Vec::new(),
+            next_force_id: 0,
             self_test_probes: SelfTestProbes::default(),
             last_rx_wal_seq: 0,
             pending_release: None,
@@ -730,7 +733,6 @@ impl SessionCore {
                 effects.0.extend(self.console_event(ev, now));
             }
         }
-        effects.0.extend(self.poll_force_recover(now));
         // P7 Task 10：reader 端 agent log 的前景 gate（Python `session.foreground_busy`，只計命令，EVT-D-L1）。
         self.capture_observer
             .set_foreground_busy(self.foreground_busy());
@@ -2920,6 +2922,7 @@ impl SessionCore {
             TimerEvent::DrainTimeout { epoch, stop_id } => {
                 self.mark_drain_timeout(epoch, stop_id, now)
             }
+            TimerEvent::ForceRecoverPoll { id, n } => self.force_recover_poll(id, n, now),
             _ => Vec::new(),
         }
     }
@@ -4706,28 +4709,34 @@ impl SessionCore {
     // ---------------- recover ----------------
 
     fn recover_request(&mut self, timeout_s: f64, force: bool, reply: Reply, now: Mono) -> Vec<Effect> {
-        if self.drain_in_progress() {
-            return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
-        }
-        if self.state == SessionState::Released {
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => true,
-                    "released" => true,
-                    "recommended_action" => "device_attach",
-                    "session" => self.session_value(now),
-                }),
-            )];
-        }
+        use crate::recover::{RecoverPlan, RecoverRequest, plan_recover, plan_resets_progress};
         let flash_busy = self.state == SessionState::Flashing
             || self.deps.fence.with(|f| f.flash_mode != FlashMode::Off);
-        if flash_busy {
-            let mut out = self.selector_error("FLASHING_BUSY");
-            out.insert("session", self.session_value(now));
-            return vec![Effect::Reply(reply, Ok(out))];
+        let plan = plan_recover(
+            self.state.as_str(),
+            self.generations.conn_epoch.is_some(),
+            self.drain_in_progress(),
+            self.device_present,
+            false,
+            flash_busy,
+            &self.profile.com,
+            &RecoverRequest { timeout_s, force },
+        );
+        if plan_resets_progress(&plan) {
+            // 顯式人工 recover 為重新介入：清 reprobe 上限／進度（Finding 4）、允許帳密再告警一次（#140）。
+            crate::reprobe::reset(&mut self.reprobe);
+            self.credentials_warned = false;
         }
-        self.credentials_warned = false;
+        match plan {
+            RecoverPlan::DrainBusy => {
+                return vec![Effect::Reply(reply, Ok(self.session_recovering_reply(now)))];
+            }
+            RecoverPlan::Reply(mut out) => {
+                out.insert("session", self.session_value(now));
+                return vec![Effect::Reply(reply, Ok(out))];
+            }
+            _ => {}
+        }
         if self.generations.conn_epoch.is_none() {
             if self.device_present && self.open_real_path.is_none() && self.pending_attach.is_none()
             {
@@ -4830,39 +4839,48 @@ impl SessionCore {
         }
     }
 
-    /// `_force_recover`：clear＋reattach，最多等 10 s READY。
+    /// `_force_recover`：clear＋reattach，之後 `FORCE_RECOVER_POLLS` 次、每 `FORCE_RECOVER_POLL_S` 檢查一次 READY。
+    /// 並發的 force 各自輪詢（Python 各 thread 獨立）；clear 遇進行中的 drain 不另起 drain（06 去重）。
     fn start_force_recover(&mut self, reply: Reply, kind: ForceKind, now: Mono) -> Vec<Effect> {
-        if let Some(previous) = self.force_recover.take() {
-            // 既有等待者以逾時收尾（同一 session 不疊加 force recover）。
-            let mut effects = self.answer_force_recover(previous, false, now);
-            effects.extend(self.start_force_recover(reply, kind, now));
-            return effects;
+        self.next_force_id = self.next_force_id.saturating_add(1);
+        let id = self.next_force_id;
+        self.force_recover.push(ForceRecover { id, reply, kind });
+        let mut effects = self.begin_stop(StopKind::Clear, None, now).0;
+        effects.push(self.schedule_force_poll(id, 1, now));
+        effects
+    }
+
+    fn schedule_force_poll(&self, id: u64, n: u32, now: Mono) -> Effect {
+        let step = (sw_proto::constants::FORCE_RECOVER_POLL_S * 1e9).round() as Mono;
+        Effect::Schedule {
+            at: now.saturating_add(step),
+            ev: TimerEvent::ForceRecoverPoll { id, n },
         }
-        self.force_recover = Some(ForceRecover {
-            reply,
-            deadline: now.saturating_add(FORCE_RECOVER_WAIT_NS),
-            kind,
-        });
-        self.begin_stop(StopKind::Clear, None, now).0
+    }
+
+    /// 第 `n` 次輪詢（`time.sleep(1.0)` 後 `get_session_state`）：READY → 恢復；第 `FORCE_RECOVER_POLLS` 次仍未 READY →
+    /// 逾時；否則排下一次。等待者已不存在（過期 id）即忽略。
+    fn force_recover_poll(&mut self, id: u64, n: u32, now: Mono) -> Vec<Effect> {
+        let Some(pos) = self.force_recover.iter().position(|w| w.id == id) else {
+            return Vec::new();
+        };
+        let ready = self.state == SessionState::Ready && !self.drain_in_progress();
+        if ready || n >= sw_proto::constants::FORCE_RECOVER_POLLS {
+            let pending = self.force_recover.remove(pos);
+            return self.answer_force_recover(pending, ready, now);
+        }
+        vec![self.schedule_force_poll(id, n + 1, now)]
     }
 
     fn answer_force_recover(&mut self, pending: ForceRecover, recovered: bool, now: Mono) -> Vec<Effect> {
         let session = self.session_value(now);
         let result = match (pending.kind, recovered) {
-            (ForceKind::Direct, true) => pydict! {
-                "ok" => true,
-                "recovering" => false,
-                "action" => "FORCE_CLEAR_REATTACH",
-                "recovered" => true,
-                "session" => session,
-            },
-            (ForceKind::Direct, false) => pydict! {
-                "ok" => false,
-                "error_code" => "FORCE_RECOVER_TIMEOUT",
-                "action" => "FORCE_CLEAR_REATTACH",
-                "recovered" => false,
-                "session" => session,
-            },
+            (ForceKind::Direct, recovered) => {
+                let PyValue::Dict(session) = session else {
+                    unreachable!("session_value 恆為 dict")
+                };
+                crate::recover::force_reply(recovered, Some(session))
+            }
             (ForceKind::AfterPromptTimeout, true) => pydict! {
                 "ok" => true,
                 "error_code" => "PROMPT_TIMEOUT_FORCE_RECOVERED",
@@ -4873,19 +4891,6 @@ impl SessionCore {
             (ForceKind::AfterPromptTimeout, false) => prompt_timeout_none(),
         };
         vec![Effect::Reply(pending.reply, Ok(result))]
-    }
-
-    /// 每個事件後檢查 force recover 等待者（READY 或 10 s 到期）。
-    fn poll_force_recover(&mut self, now: Mono) -> Vec<Effect> {
-        let Some(pending) = self.force_recover.as_ref() else {
-            return Vec::new();
-        };
-        let ready = self.state == SessionState::Ready && !self.drain_in_progress();
-        if !ready && now < pending.deadline {
-            return Vec::new();
-        }
-        let pending = self.force_recover.take().expect("已確認等待者");
-        self.answer_force_recover(pending, ready, now)
     }
 
     /// 再探等待者的回應（attach：`_attach_state_result`；recover：REPROBE payload，SC-34）。
@@ -5529,8 +5534,8 @@ struct RebootRecovery {
 
 /// force recover 的等待者（`_force_recover`：clear 後最多 10 次 × 1 s 等 READY）。
 struct ForceRecover {
+    id: u64,
     reply: Reply,
-    deadline: Mono,
     kind: ForceKind,
 }
 
@@ -5550,8 +5555,6 @@ const BOOTLOADER_RX_TAIL_CHARS: usize = 512;
 const RX_FLOOD_BYTES_PER_10S: u64 = 20_000;
 /// `UBOOT_FALLBACK_PROMPTS`。
 const UBOOT_FALLBACK_PROMPTS: [&str; 3] = ["^=> $", "^U-Boot> $", "^CFE> $"];
-/// `_force_recover` 的等待上限（10 × 1 s）。
-const FORCE_RECOVER_WAIT_NS: Mono = 10_000_000_000;
 /// `BOOT_QUIET_WINDOW_S`。
 const BOOT_QUIET_WINDOW_NS: Mono = 180_000_000_000;
 
