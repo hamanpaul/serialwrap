@@ -445,3 +445,32 @@ def test_preflight_not_frozen_never_ready(case):
     out = _judge_mod().judge(rep, case.expect())
     assert out["verdict"] == "INCOMPLETE"
     assert any("event_latency 未凍結" in r for r in out["verdict_reasons"])
+
+
+def test_cmd_judge_reloads_parity_like_assemble(case, capsys):
+    """sol-backfill p5 #8：`judge` 子命令必須與 `assemble` 一樣重新載入 #104 parity 狀態與來源；
+    來源文件不可得時 parity 為 INCOMPLETE，重新判定不得因漏載 parity 而放寬成 READY_FOR_OWNER_EVIDENCE。"""
+    import yaml
+
+    base = case.base
+    report_path = base / "report.json"
+    report_path.write_text(json.dumps(case.report()), encoding="utf-8")
+    (base / "lock.json").write_text(json.dumps(_lock()), encoding="utf-8")
+    (base / "freeze.json").write_text(json.dumps(FREEZE_SYNTH), encoding="utf-8")
+    (base / "snapshots.ndjson").write_text("", encoding="utf-8")
+    (base / "parity.yaml").write_text(yaml.safe_dump({
+        "schema_version": 1, "source": "", "source_ref": None, "source_sha256": None,
+        "rows": [{"id": "#32", "status": "INCOMPLETE"}],
+    }), encoding="utf-8")
+    expect = {
+        "schema_version": 1, "lock_file": str(base / "lock.json"), "freeze_file": str(base / "freeze.json"),
+        "blocked_owner_file": "tests/acceptance/slice21_bo.yaml",
+        "breaker_snapshots_file": str(base / "snapshots.ndjson"), "stage2_estimate_weeks": 0.0,
+        "parity": {"status_file": str(base / "parity.yaml")}, "sections": [],
+    }
+    expect_path = base / "expect.yaml"
+    expect_path.write_text(yaml.safe_dump(expect, allow_unicode=True), encoding="utf-8")
+    assert _judge_mod().main(["judge", "--report", str(report_path), "--expect", str(expect_path)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "INCOMPLETE", out
+    assert any("#104" in r for r in out["verdict_reasons"]), out

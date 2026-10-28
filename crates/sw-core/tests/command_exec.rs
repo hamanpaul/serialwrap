@@ -1691,3 +1691,65 @@ fn evict_capture_event_drops_local_capture() {
     });
     assert_eq!(after["error_code"], PyValue::from("CMD_NOT_FOUND"));
 }
+
+/// sol-backfill p5 #1：`command.submit {mode:"interactive"}` 的命令 TX 須帶原 `cmd_id` 寫 WAL（Python
+/// `_send_command_with_permit(..., cmd_id=cmd_id)`）；未完整送出時依 `_map_aborted_result` 結算：已確認 >0 bytes
+/// → `COMMAND_ABORTED_IN_FLIGHT`＋META `command_aborted_in_flight`（partial／unknown）。
+fn interactive_tx_rows(h: &ActorRig) -> Vec<PyDict> {
+    h.wal_rows()
+        .into_iter()
+        .filter(|r| r.get("dir").and_then(|v| v.as_str()) == Some("TX"))
+        .collect()
+}
+
+#[test]
+fn interactive_mode_command_tx_carries_cmd_id() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let before = interactive_tx_rows(&h).len();
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("interactive"), "{rec:?}");
+    let rows = interactive_tx_rows(&h);
+    let new_rows = &rows[before..];
+    assert!(!new_rows.is_empty(), "interactive 命令應寫 TX");
+    for row in new_rows {
+        assert_eq!(row.get("cmd_id"), Some(&PyValue::from(id.as_str())), "{row:?}");
+    }
+}
+
+#[test]
+fn interactive_mode_command_partial_send_maps_aborted_in_flight() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::AcceptThenError(
+        4,
+        PalError::io(5, "[Errno 5] Input/output error"),
+    )]);
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(4)));
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("partial")));
+}
+
+#[test]
+fn interactive_mode_command_unknown_send_maps_aborted_in_flight_unknown() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 2,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
+}

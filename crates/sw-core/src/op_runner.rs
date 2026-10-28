@@ -301,10 +301,11 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
         } => run_self_test_probe(ctx, grant, timeout_s, &probe, &nonce),
         OpSpec::InteractiveOpenCmd { command, owner } => {
             let payload = command_payload(&command);
-            lease_send(ctx, grant, payload, TxClass::InteractiveOpenCmd, &owner)
+            // `command.submit {mode:"interactive"}` 的命令：TX 帶原 cmd_id，未完整送出依命令帳結算（sol-backfill p5 #1）。
+            lease_send(ctx, grant, payload, TxClass::InteractiveOpenCmd, &owner, grant.cmd_id.as_deref())
         }
         OpSpec::InteractiveSend { payload, owner } => {
-            lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner)
+            lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner, None)
         }
         OpSpec::RebootRecovery { .. } => OpOutcome::Error(PyErr::value_error(
             "reboot recovery 由 session actor 以登入 run 驅動（OpRunner 不承接）",
@@ -725,18 +726,28 @@ fn run_self_test_probe(
 }
 
 /// lease 擁有者 TX（`interactive_send`／`interactive_open` 的 command）。
+///
+/// `cmd_id` 為 `Some` 時（interactive 模式命令）：TX WAL 帶該 cmd_id；已確認 bytes >0 或結果 Unknown 時以
+/// [`map_send_failure`] 結算（Python `_map_aborted_result`：`COMMAND_ABORTED_IN_FLIGHT`＋META）。
 fn lease_send(
     ctx: &OpCtx,
     grant: &OpGrant,
     payload: Vec<u8>,
     class: TxClass,
     owner: &str,
+    cmd_id: Option<&str>,
 ) -> OpOutcome {
-    let report = send(ctx, grant, &payload, class, owner, None, true);
+    let report = send(ctx, grant, &payload, class, owner, cmd_id, true);
     if fully_sent(&report, payload.len()) {
         return OpOutcome::Sent {
             bytes: payload.len(),
         };
+    }
+    if let Some(cmd_id) = cmd_id {
+        let unknown = matches!(report.result.outcome, TxOutcome::Unknown { .. });
+        if confirmed_of(&report) > 0 || unknown || report.reject.is_none() {
+            return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), cmd_id));
+        }
     }
     match report.reject {
         Some(reject) => OpOutcome::SendRefused(reject),

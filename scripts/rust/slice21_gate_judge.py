@@ -572,22 +572,9 @@ def cmd_assemble(args: argparse.Namespace) -> int:
         p = frag_dir / f"{name}.json"
         if p.is_file():
             sections.append(json.loads(p.read_text(encoding="utf-8")))
-    freeze_path = ROOT / expect_yaml["freeze_file"]
-    freeze = json.loads(freeze_path.read_text(encoding="utf-8")) if freeze_path.is_file() else None
     case_verdicts = {}
     if args.case_verdicts and pathlib.Path(args.case_verdicts).is_file():
         case_verdicts = json.loads(pathlib.Path(args.case_verdicts).read_text(encoding="utf-8"))
-    pcfg = expect_yaml.get("parity") or {}
-    status_file = ROOT / pcfg.get("status_file", "")
-    status_doc = _load_yaml(status_file) if status_file.is_file() else {}
-    src_text, src_where = _parity_source(status_doc or {})
-    parity_in = {
-        "status": status_doc or {},
-        "status_file": pcfg.get("status_file", ""),
-        "source_rows": parity_rows_from_doc(src_text) if src_text is not None else None,
-        "source_sha256_actual": hashlib.sha256(src_text.encode("utf-8")).hexdigest() if src_text is not None else None,
-    }
-    lock = json.loads((ROOT / expect_yaml["lock_file"]).read_text(encoding="utf-8"))
     blocked = []
     for item in bo_doc["items"]:
         evid = None
@@ -606,10 +593,8 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     }
     if args.preflight and pathlib.Path(args.preflight).is_file():
         report["preflight"] = json.loads(pathlib.Path(args.preflight).read_text(encoding="utf-8"))
-    expect = {"lock": lock, "base_dir": run_dir, "freeze": freeze, "case_verdicts": case_verdicts,
-              "daemon_path": args.daemon_path or None, "parity": parity_in,
-              "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
-              "bo_ids": [b["id"] for b in blocked], "breaker": breaker_inputs(expect_yaml)}
+    expect, src_where = build_expect(expect_yaml, base_dir=run_dir, case_verdicts=case_verdicts,
+                                     daemon_path=args.daemon_path or None, bo_ids=[b["id"] for b in blocked])
     out = judge(report, expect)
     report["sections"] = out["sections"]
     report["case_uptake"] = out["case_uptake"]
@@ -626,16 +611,42 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case_verdicts: Mapping[str, Any],
+                 daemon_path: str | None, bo_ids: Sequence[str]) -> tuple[dict[str, Any], str]:
+    """`assemble` 與 `judge` 共用的 expect 建構（sol-backfill p5 #8）：鎖、凍結檔、斷路器輸入與 #104 parity
+    狀態／來源一律由檔案重新載入並驗證；parity 狀態檔或來源不可得時仍帶入（judge_parity 判 INCOMPLETE），
+    不得以「未提供 parity」略過必要條件。回傳 (expect, parity 來源位置)。"""
+    freeze_path = ROOT / expect_yaml["freeze_file"]
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8")) if freeze_path.is_file() else None
+    pcfg = expect_yaml.get("parity") or {}
+    status_rel = str(pcfg.get("status_file", "") or "")
+    status_file = ROOT / status_rel
+    status_doc = _load_yaml(status_file) if status_rel and status_file.is_file() else {}
+    src_text, src_where = _parity_source(status_doc or {})
+    parity_in = {
+        "status": status_doc or {},
+        "status_file": status_rel,
+        "source_rows": parity_rows_from_doc(src_text) if src_text is not None else None,
+        "source_sha256_actual": hashlib.sha256(src_text.encode("utf-8")).hexdigest() if src_text is not None else None,
+    }
+    lock = json.loads((ROOT / expect_yaml["lock_file"]).read_text(encoding="utf-8"))
+    expect = {"lock": lock, "base_dir": base_dir, "freeze": freeze, "case_verdicts": dict(case_verdicts),
+              "daemon_path": daemon_path, "parity": parity_in,
+              "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
+              "bo_ids": list(bo_ids), "breaker": breaker_inputs(expect_yaml)}
+    return expect, src_where
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     report = json.loads(pathlib.Path(args.report).read_text(encoding="utf-8"))
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
-    lock = json.loads((ROOT / expect_yaml["lock_file"]).read_text(encoding="utf-8"))
-    freeze_path = ROOT / expect_yaml["freeze_file"]
-    out = judge(report, {"lock": lock, "base_dir": pathlib.Path(args.report).parent,
-                         "freeze": json.loads(freeze_path.read_text(encoding="utf-8")),
-                         "case_verdicts": {}, "daemon_path": args.daemon_path,
-                         "additional_required_sets": expect_yaml.get("additional_required_sets") or {},
-                         "breaker": breaker_inputs(expect_yaml)})
+    bo_ids = [str(b.get("id")) for b in (report.get("blocked_owner") or []) if isinstance(b, Mapping)]
+    case_verdicts = {}
+    if args.case_verdicts and pathlib.Path(args.case_verdicts).is_file():
+        case_verdicts = json.loads(pathlib.Path(args.case_verdicts).read_text(encoding="utf-8"))
+    expect, _ = build_expect(expect_yaml, base_dir=pathlib.Path(args.report).parent, case_verdicts=case_verdicts,
+                             daemon_path=args.daemon_path, bo_ids=bo_ids)
+    out = judge(report, expect)
     print(json.dumps({"verdict": out["verdict"], "verdict_reasons": out["verdict_reasons"],
                       "sections": {s["name"]: s["status"] for s in out["sections"]}}, ensure_ascii=False, indent=1))
     return 0
@@ -676,6 +687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     j.add_argument("--daemon-path", default=None)
+    j.add_argument("--case-verdicts", default=None)
     args = p.parse_args(argv)
     try:
         if args.cmd == "record-section":

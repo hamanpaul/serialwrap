@@ -1590,6 +1590,31 @@ fn detect_probe_tx_goes_through_fence() {
     );
 }
 
+/// sol-backfill p5 #6：PROBE Fence 必須向 WAL 健康 fanout 註冊。重現順序：PROBE 讀到健康快照、建立 Fence →
+/// 另一處 WAL append 失敗並發布 unhealthy → writer 才提交。Python `_send_bytes_locked` 於送出時讀共用 WAL
+/// unhealthy，自動 TX 應被拒且零 OS 提交、零 PROBE TX WAL；偵測不中 → fallback。
+#[test]
+fn detect_probe_fence_observes_wal_unhealthy_published_before_submit() {
+    let m = ManagerRig::with(&manager_yaml(&[]), LoadedState::default(), None);
+    m.devices(&["/s/by-id/usb-F"]);
+    let real = m.real_of("/s/by-id/usb-F");
+    m.reply_probe(&real, b"root@prpl:/# ");
+    let fanout = m.mgr.wal_health_fanout();
+    m.mgr.set_probe_pre_submit_hook_for_test(Box::new(move || {
+        sw_core::wal::WalHealthSink::set_wal_unhealthy(&*fanout, true);
+    }));
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert_eq!(m.wait_profile_source("COM0"), "fallback");
+    assert_eq!(m.device(&real).os_submits(), 0, "WAL 已 unhealthy 時 PROBE 不得提交任何 bytes 給 OS");
+    let probe_tx = m
+        .wal_rows()
+        .into_iter()
+        .filter(|r| s_of(r, "com").as_deref() == Some("PROBE") && s_of(r, "dir").as_deref() == Some("TX"))
+        .count();
+    assert_eq!(probe_tx, 0, "被拒的 PROBE TX 不得寫 WAL");
+}
+
 #[test]
 fn watcher_tick_services_deferred_wal_rotation() {
     // 審查 F10（OD-19）：Python `Service._on_watcher_tick` 每輪先 `wal.tick()`——延後輪替的完成不得依賴後續 append。
@@ -2036,4 +2061,210 @@ fn global_bg_capture_eviction_reaches_owner_session_via_manager() {
     });
     assert_eq!(tail(&sid1, &ids1[1])["ok"], PyValue::Bool(true), "只淘汰最舊一筆");
     assert_eq!(tail(&sid0, &id0)["ok"], PyValue::Bool(true), "新完成者保留");
+}
+
+#[test]
+fn global_bg_capture_eviction_owner_routing_ignores_alias_collision() {
+    // 同上一案，另加 alias 衝突（sol-backfill p5 #7）。原註：審查 d2d29a6_7af6567 3b5927a #1（F28 manager 接線）：跨 session 淘汰須經 actor `register` →
+    // `ManagerNote::EvictCapture` → manager 依 COM 解析擁有者 → `ControlEvent::EvictCapture`。
+    // Python `SessionManager._background` 為全域 dict，`_evict_background_locked` 直接 `pop`，之後
+    // `result_tail` 回 CMD_NOT_FOUND。輸入：COM1 先完成 64 筆 bg capture，COM0 再完成 1 筆 → 淘汰 COM1 最舊者。
+    let yaml = manager_yaml(&[
+        &t_target("COM0", 1, "/s/by-id/usb-A"),
+        &t_target("COM1", 2, "/s/by-id/usb-B"),
+    ]);
+    let m = ManagerRig::with(&yaml, LoadedState::default(), Some(("/s/by-id/usb-A", "/dev/ttyA")));
+    let dev_b = m.add_device_at("/s/by-id/usb-B", "/dev/ttyB");
+    install_shell_replies(&dev_b);
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "READY");
+    m.wait_state("COM1", "READY");
+    // `on_tx_reply` 只推一次；65 筆命令改用逐行比對的 `on_tx_match`。
+    for dev in [&m.dev, &dev_b] {
+        dev.on_tx_match("dmesg", Box::new(|_| b"dmesg\r\nline1\r\nroot@t:/# ".to_vec()));
+    }
+    let sid0 = m.mgr.resolve("COM0").unwrap();
+    let sid1 = m.mgr.resolve("COM1").unwrap();
+    // sol-backfill p5 #7：COM0 的 alias 設為 "COM1"——使用者 selector 規則會讓 "COM1" 先命中 COM0；
+    // 淘汰通知攜帶的 COM 是內部 owner 身分，必須以 `profile.com` 精確比對，不得走 alias-aware 解析。
+    assert!(is_ok(&rpc(m.mgr.alias_set(&sid0, "COM1"))));
+    let bg = |sid: &str| -> String {
+        let mut req = agent_submit("dmesg");
+        req.mode = "bg".into();
+        let r = rpc(m.mgr.route(sid, SessionRequest::Submit(req), RPC));
+        s_of(&r, "cmd_id").expect("cmd_id")
+    };
+    let tail = |sid: &str, id: &str| -> PyDict {
+        rpc(m.mgr.route(
+            sid,
+            SessionRequest::BackgroundResult {
+                cmd_id: id.to_string(),
+                from_chunk: 0,
+                limit: 200,
+            },
+            RPC,
+        ))
+    };
+    let wait_done = |_sid: &str, id: &str| {
+        wait_until(&format!("{id} 完成"), || {
+            m.reg
+                .get(id)
+                .and_then(|c| c.get("done_at").cloned())
+                .is_some_and(|v| !matches!(v, PyValue::Null))
+        });
+    };
+    let mut ids1 = Vec::new();
+    for _ in 0..64 {
+        let id = bg(&sid1);
+        wait_done(&sid1, &id);
+        ids1.push(id);
+    }
+    // capture 於最後活動後 quiet window 才轉 done（`maybe_finalize`，讀取時評估）：推進時鐘並逐筆讀取，
+    // 使 COM1 的 64 筆在索引中皆為已終結（可淘汰）。
+    m.clock.advance(Duration::from_secs(120));
+    for id in &ids1 {
+        assert_eq!(s_of(&tail(&sid1, id), "status").as_deref(), Some("done"));
+    }
+    let id0 = bg(&sid0);
+    wait_done(&sid0, &id0);
+    wait_until("COM1 最舊 capture 被淘汰", || {
+        s_of(&tail(&sid1, &ids1[0]), "error_code").as_deref() == Some("CMD_NOT_FOUND")
+    });
+    assert_eq!(tail(&sid1, &ids1[1])["ok"], PyValue::Bool(true), "只淘汰最舊一筆");
+    assert_eq!(tail(&sid0, &id0)["ok"], PyValue::Bool(true), "新完成者保留");
+}
+
+/// sol-backfill p5 #2：產品 executor 不得在 actor 執行緒同步等開埠。開埠卡住時 actor 仍須回覆查詢，
+/// pending-open 的 `device.release` 須於 3 s 排空期限回 `DRAIN_STALLED`（CoreHarness 版見
+/// drain_release.rs::release_during_pending_open_drain_stalled；本案經 ManagerExec 實際路徑）。
+#[test]
+fn product_executor_blocked_open_keeps_actor_responsive_and_release_drain_stalled() {
+    let m = ManagerRig::single_target(SHELL_PROFILE);
+    m.serial.block_open("/dev/ttyOLD");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    wait_until("open 進入閘門", || m.serial.open_attempts("/dev/ttyOLD") >= 1);
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let state = m
+        .mgr
+        .route(&sid, SessionRequest::GetState, Duration::from_millis(800))
+        .expect("開埠卡住時 actor 仍須回覆 GetState");
+    assert_eq!(
+        s_of(&session_field(&state), "state").as_deref(),
+        Some("ATTACHING"),
+        "{state:?}"
+    );
+
+    let mgr = m.mgr.clone();
+    let sid2 = sid.clone();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let r = mgr.route(
+            &sid2,
+            SessionRequest::Release {
+                source: "agent".to_string(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(10),
+        );
+        let _ = done_tx.send(r);
+    });
+    // 等 release 進入 actor（排空計時器已排程）後推進 3 s 期限。
+    std::thread::sleep(Duration::from_millis(200));
+    m.clock.advance(Duration::from_millis(3001));
+    let reply = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 須於排空期限內回覆")
+        .expect("release 回 dict");
+    assert_eq!(code_of(&session_field(&reply)).or_else(|| code_of(&reply)), Some("DRAIN_STALLED".to_string()), "{reply:?}");
+    m.serial.release_open("/dev/ttyOLD");
+}
+
+/// sol-backfill p5 #2：release 持久化暫停鉤子卡住 commit 時，actor 仍須回覆查詢（Persist 不得在 actor 執行緒同步等）。
+#[test]
+fn product_executor_blocked_release_commit_keeps_actor_responsive() {
+    struct BlockingPoint {
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl sw_core::session_manager::PersistObserver for BlockingPoint {
+        fn before_release_commit(&self) -> Result<(), sw_pal::PalError> {
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(20));
+            Ok(())
+        }
+        fn after_commit(&self, _release: bool) {}
+    }
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    m.mgr.set_persist_observer(std::sync::Arc::new(BlockingPoint {
+        entered: entered_tx,
+        release: release_rx,
+    }));
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    let mgr = m.mgr.clone();
+    let sid2 = sid.clone();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let r = mgr.route(
+            &sid2,
+            SessionRequest::Release {
+                source: "agent".to_string(),
+                reason: PyValue::Null,
+            },
+            Duration::from_secs(20),
+        );
+        let _ = done_tx.send(r);
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 持久化進入暫停點");
+    let state = m
+        .mgr
+        .route(&sid, SessionRequest::GetState, Duration::from_millis(800));
+    let _ = release_tx.send(());
+    let state = state.expect("release commit 卡住時 actor 仍須回覆 GetState");
+    assert!(is_ok(&state), "{state:?}");
+    let reply = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("release 完成")
+        .expect("release 回 dict");
+    assert!(is_ok(&reply), "{reply:?}");
+}
+
+/// sol-backfill p5 #4：Python `SessionManager.__init__` 尾端 `_save_state()` 失敗（EACCES／ENOSPC）即拋出，
+/// daemon rc 1、尚未掃描／attach。Rust 須以 `startup_error()` 回報 Python 例外末行，不得只 warn 後繼續。
+#[test]
+fn startup_save_failure_reports_python_exception_line() {
+    for (err, prefix) in [
+        (
+            PalError::from_errno(13),
+            "PermissionError: [Errno 13] Permission denied",
+        ),
+        (
+            PalError::from_errno(28),
+            "OSError: [Errno 28] No space left on device",
+        ),
+    ] {
+        let (mgr, serial) = ManagerRig::startup_commit_failure(SHELL_PROFILE, err);
+        let msg = mgr.startup_error().expect("啟動存檔失敗須回報 startup_error");
+        assert!(msg.starts_with(prefix), "{msg:?}");
+        assert_eq!(serial.open_attempts("/dev/ttyOLD"), 0, "啟動存檔失敗不得開埠");
+    }
+}
+
+/// sol-backfill p5 #3：Python `set_alias_for_session` 更新唯一的 session profile——之後經 actor 的
+/// `session.get_state`（以新 alias 解析）與 `session.list` 皆回新 alias，不得只更新 manager 鏡像。
+#[test]
+fn alias_set_reaches_actor_profile_for_get_state() {
+    let m = ManagerRig::single_target(SHELL_PROFILE).ready();
+    let sid = m.mgr.resolve("COM0").expect("COM0 session");
+    assert!(is_ok(&rpc(m.mgr.alias_set(&sid, "dut"))));
+    let via = m.mgr.resolve("dut").expect("新 alias 可解析");
+    let state = rpc(m.mgr.route(&via, SessionRequest::GetState, RPC));
+    assert_eq!(s_of(&session_field(&state), "alias").as_deref(), Some("dut"), "{state:?}");
+    let listed = m.session("COM0");
+    assert_eq!(s_of(&listed, "alias").as_deref(), Some("dut"), "{listed:?}");
 }
