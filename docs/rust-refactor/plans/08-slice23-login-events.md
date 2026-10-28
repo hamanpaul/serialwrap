@@ -1557,6 +1557,8 @@ fn slow_capture_fs_does_not_block_actor_control_lane() {
 - [ ] **Step 4：執行，預期 PASS**：同 Step 2；`--test lease_selftest`（06）不退化。
 - [ ] **Step 5：commit**：`feat(rust-capture): agent log 改由 reader 端寫入並對齊 Python 回應`
 
+**P7 修訂（實作，2026-10-28）：** `CaptureObserver` 不掛在 reader 的 observer 清單，而掛在 session 現行 bridge 的 `RxShared`（`RxShared::set_capture`）：reader 在 `rx.append` 內同步呼叫 `CaptureObserver::write_rx`（與 observer 清單同屬 WAL append 之後的 reader 熱路徑），P5 測試替身 executor（以 `IoWorker::start` 開 bridge、無 observer 清單）也走同一路徑，不需修改 P5 測試支援碼。檔案開關仍在 actor 內同步執行（Python 亦於 manager 鎖內同步 `os.makedirs`／`open`）：不新增 `Effect::CaptureOpen／CaptureClose` 與 `ControlEvent::CaptureOpened／CaptureClosed`（新增 Effect 變體須改 P5 `tests/support` 的窮舉 executor），故 `slow_capture_fs_does_not_block_actor_control_lane` 未承接（登記 p7-fix-responses 第 8 輪 Task 10 列，P5 測試支援碼可修改後補）。簽章修訂：`CaptureObserver::install(capture_id, file: Box<dyn LogFile>)`（06 `CaptureEnv.fs` 的 `LogFs` 抽象）、`log_open_failed_reply(detail: &str)`（`str(OSError)` 由呼叫端以 `os_error_text` 組成）；新增 `CaptureObserver::{write_rx, counts}`。寫檔經 `sw_pal::fs_ops::text_mode_bytes`（Python 文字模式 `open(path, "a")`：Windows `\n`→`\r\n`；計數取轉換前）。`log_responses` golden 的 SESSION_NOT_FOUND 3 列屬 manager selector 解析、makedirs 例外 1 列由 06 `log_capture_dir_not_creatable_is_exception` 覆蓋，其餘 7 列逐位元組比對。
+
 ---
 
 ## Task 11：Event schema＋`pyre/redos.rs`

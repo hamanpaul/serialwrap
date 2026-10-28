@@ -22,7 +22,6 @@ use crate::arbiter::{
 };
 use crate::capture::{
     AgentLogCapture, BG_CAPTURE_MAX_BYTES, BackgroundCapture, CaptureEnv,
-    LogFile,
 };
 use crate::deferred::InvalidateReason;
 use crate::drain::{StopId, StopKind, StopOp, WorkerStoppedReceipt};
@@ -396,7 +395,8 @@ pub struct SessionCore {
     background_seq: u64,
     /// agent log capture（`session.log_start`）。
     log_capture: Option<AgentLogCapture>,
-    log_file: Option<Box<dyn LogFile>>,
+    /// P7 Task 10：reader 端 agent log 寫入者（掛在現行 bridge 的 `RxShared`；不經 actor 佇列）。
+    capture_observer: Arc<crate::capture::CaptureObserver>,
     capture_env: CaptureEnv,
     /// reboot 後自動恢復（`_spawn_reboot_recovery` 的 actor 驅動版）。
     reboot_recovery: Option<RebootRecovery>,
@@ -564,7 +564,7 @@ impl SessionCore {
             background_cmd_ids: Vec::new(),
             background_seq: 0,
             log_capture: None,
-            log_file: None,
+            capture_observer: crate::capture::CaptureObserver::new(),
             capture_env: CaptureEnv::default(),
             reboot_recovery: None,
             force_recover: None,
@@ -731,6 +731,9 @@ impl SessionCore {
             }
         }
         effects.0.extend(self.poll_force_recover(now));
+        // P7 Task 10：reader 端 agent log 的前景 gate（Python `session.foreground_busy`，只計命令，EVT-D-L1）。
+        self.capture_observer
+            .set_foreground_busy(self.foreground_busy());
         // P7 Task 16-wire：發布 foreground_busy 供 `BridgeQueries::active_cmd_id_for`（不經 actor mailbox）。
         let busy = self.foreground.is_some();
         if busy != self.published_foreground_busy {
@@ -2395,6 +2398,11 @@ impl SessionCore {
         } = opened;
         self.generations.conn_epoch = Some(epoch);
         // 新 bridge 的 RX 視窗與哨兵（Python 每次 attach 新建 `UARTBridge`；POSIX 哨兵 primary 算 1 個 console）。
+        // agent log 的 reader 端寫入者跟著現行 bridge（detach 時已停止 capture，此處只是防禦性搬移）。
+        self.deps.rx.set_capture(None);
+        if self.log_capture.is_some() {
+            rx.set_capture(Some(self.capture_observer.clone()));
+        }
         self.deps.rx = rx;
         self.console_count = usize::from(vtty.is_some());
         self.vtty = vtty;
@@ -3579,10 +3587,11 @@ impl SessionCore {
     // -----------------------------------------------------------------------
 
     fn session_value(&self, now: Mono) -> PyValue {
-        PyValue::Dict(self.public(
-            now,
-            &self.public_ctx(),
-        ))
+        PyValue::Dict(self.session_dict(now))
+    }
+
+    fn session_dict(&self, now: Mono) -> PyDict {
+        self.public(now, &self.public_ctx())
     }
 
     fn selector_error(&self, code: &str) -> PyDict {
@@ -4164,7 +4173,8 @@ impl SessionCore {
         self.sync_bg(cmd_id);
     }
 
-    /// RX 進入 background capture 與 agent log（`_on_bridge_rx`；前景執行中不寫 agent log，EVT-D-L1）。
+    /// RX 進入 background capture（`_on_bridge_rx`）；agent log 由 reader 端 `CaptureObserver` 寫入（EVT-D-L1 前景
+    /// gate 由 `publish_capture_foreground` 發布）。
     fn capture_rx(&mut self, chunk: &str, wal_seq: u64, now: Mono) {
         for id in &self.background_cmd_ids {
             if let Some(capture) = self.background.get_mut(id) {
@@ -4176,23 +4186,7 @@ impl SessionCore {
                 capture.last_seq = wal_seq;
             }
         }
-        if self.foreground_busy() {
-            return;
-        }
-        let Some(cap) = self.log_capture.as_mut() else {
-            return;
-        };
-        if cap.status != "active" {
-            return;
-        }
-        if let Some(file) = self.log_file.as_mut() {
-            if file.append_flush(chunk.as_bytes()).is_ok() {
-                cap.byte_count = cap.byte_count.saturating_add(chunk.len() as u64);
-                cap.line_count = cap
-                    .line_count
-                    .saturating_add(chunk.matches('\n').count() as u64);
-            }
-        }
+        // agent log 改由 reader 端 `CaptureObserver` 同步寫入（P7 Task 10；Python `_on_bridge_rx` 於 reader 執行緒寫檔）。
     }
 
     fn result_tail(
@@ -4322,13 +4316,7 @@ impl SessionCore {
 
     fn log_start(&mut self, now: Mono) -> Result<PyDict, PyErr> {
         if let Some(cap) = self.log_capture.as_ref().filter(|c| c.status == "active") {
-            return Ok(pydict! {
-                "ok" => true,
-                "already_active" => true,
-                "capture_id" => cap.capture_id.clone(),
-                "log_path" => cap.log_path.clone(),
-                "session" => self.session_value(now),
-            });
+            return Ok(crate::capture::log_start_reply(cap, true, self.session_dict(now)));
         }
         let log_dir = self.resolve_log_dir();
         // Python `os.makedirs` 在 try 之外：失敗為例外（framing EXCEPTION），不是 LOG_OPEN_FAILED。
@@ -4347,68 +4335,54 @@ impl SessionCore {
         let file = match self.capture_env.fs.open_append(&log_path) {
             Ok(file) => file,
             Err(error) => {
-                return Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "LOG_OPEN_FAILED",
-                    "detail" => os_error_text(&error, &log_path),
-                });
+                return Ok(crate::capture::log_open_failed_reply(&os_error_text(
+                    &error, &log_path,
+                )));
             }
         };
-        self.log_capture = Some(AgentLogCapture {
+        let cap = AgentLogCapture {
             capture_id: capture_id.clone(),
-            log_path: log_path.clone(),
+            log_path,
             started_at: self.wall_iso(),
             line_count: 0,
             byte_count: 0,
             status: "active",
-        });
-        self.log_file = Some(file);
-        Ok(pydict! {
-            "ok" => true,
-            "capture_id" => capture_id,
-            "log_path" => log_path,
-            "session" => self.session_value(now),
-        })
+        };
+        self.capture_observer.install(capture_id, file);
+        self.deps.rx.set_capture(Some(self.capture_observer.clone()));
+        let reply = crate::capture::log_start_reply(&cap, false, self.session_dict(now));
+        self.log_capture = Some(cap);
+        Ok(reply)
     }
 
-    fn stop_log_capture(&mut self) {
-        self.log_file = None;
-        self.log_capture = None;
+    /// 停止 capture（Python `_stop_capture_locked`）；回停止前最後的 `(line_count, byte_count)`。
+    fn stop_log_capture(&mut self) -> (u64, u64) {
+        let counts = self
+            .log_capture
+            .take()
+            .and_then(|cap| self.capture_observer.remove(&cap.capture_id))
+            .unwrap_or((0, 0));
+        self.deps.rx.set_capture(None);
+        counts
     }
 
     fn log_stop(&mut self, now: Mono) -> PyDict {
         let Some(cap) = self.log_capture.clone() else {
-            return pydict! {
-                "ok" => false,
-                "error_code" => "NO_ACTIVE_CAPTURE",
-                "session" => self.session_value(now),
-            };
+            return crate::capture::no_active_capture_reply(self.session_dict(now));
         };
-        self.stop_log_capture();
-        pydict! {
-            "ok" => true,
-            "capture_id" => cap.capture_id,
-            "log_path" => cap.log_path,
-            "line_count" => py_int(cap.line_count as i128),
-            "byte_count" => py_int(cap.byte_count as i128),
-            "started_at" => cap.started_at,
-        }
+        let (line_count, byte_count) = self.stop_log_capture();
+        crate::capture::log_stop_reply(&cap, line_count, byte_count)
     }
 
     fn log_status(&self, now: Mono) -> PyDict {
         let Some(cap) = self.log_capture.as_ref() else {
-            return pydict! { "ok" => true, "active" => false, "session" => self.session_value(now) };
+            return crate::capture::log_status_reply(None, self.session_dict(now));
         };
-        pydict! {
-            "ok" => true,
-            "active" => cap.status == "active",
-            "capture_id" => cap.capture_id.clone(),
-            "log_path" => cap.log_path.clone(),
-            "line_count" => py_int(cap.line_count as i128),
-            "byte_count" => py_int(cap.byte_count as i128),
-            "started_at" => cap.started_at.clone(),
-            "session" => self.session_value(now),
-        }
+        let (line_count, byte_count) = self
+            .capture_observer
+            .counts(&cap.capture_id)
+            .unwrap_or((0, 0));
+        crate::capture::log_status_reply(Some((cap, line_count, byte_count)), self.session_dict(now))
     }
 
     // ---------------- OpFinished ----------------

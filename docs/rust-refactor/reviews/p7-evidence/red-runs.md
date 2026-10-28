@@ -11,3 +11,5 @@ TDD 紅燈在「骨架簽章已調整、本體仍為 `todo!()`」時點以 `carg
 | Task 14（fa7e409） | `cargo test -q -p sw-pal --features test-fakes --test handler_spawner`（以 HEAD 的 todo! 骨架 process.rs 暫代） | `0 passed; 9 failed` | 9 passed |
 | Task 15（91109e7） | `cargo test -q -p sw-core --features test-fakes --test event_dispatcher` | `0 passed; 17 failed` | 17 passed |
 | 審查第 5 輪 | `cargo test -q -p sw-core --features test-fakes --test event_store` | `diff_against_nan_field_is_unchanged`、`tail_filter_list_with_nan_matches_python`、`tail_decode_error_position_is_chunk_relative` 紅 | 全綠 |
+| 審查第 8 輪（0722f75-1） | `cargo test -p sw-daemon --features test-fakes --test event_lifecycle shutdown_closes`（暫時註解 `daemon_main.rs` drain 前的 `engine.close_intake()`） | `__B2__ match_recorded 50 筆` FAILED | 還原後 1 passed |
+| Task 10 | `cargo test -p sw-core --features test-fakes --test capture_p7`（骨架簽章已調整、本體 todo!） | `3 passed; 4 failed`（4 個純函式／observer 測試 todo! panic；3 個 actor 層測試為既有 actor 端寫入的回歸鎖，紅燈前即綠） | 7 passed；另以突變（log_start 不掛 `RxShared::set_capture`）確認 3 個 actor 層測試轉紅（reader 端為唯一寫入路徑） |

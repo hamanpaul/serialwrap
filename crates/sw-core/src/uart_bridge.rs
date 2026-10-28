@@ -110,6 +110,8 @@ pub struct RxShared {
     wakers: Mutex<Vec<Sender<()>>>,
     /// P7 Task 3：測試替身固定 `rx_stats` 的 bytes（`ScriptedBridge.rx_stats`）；`u64::MAX` 為未設定。
     stats_override: AtomicU64,
+    /// P7 Task 10：agent log 的 reader 端寫入者（`append` 內同步呼叫；Python `_on_bridge_rx` 於 reader 執行緒寫檔）。
+    capture: Mutex<Option<Arc<crate::capture::CaptureObserver>>>,
 }
 
 impl RxShared {
@@ -123,7 +125,13 @@ impl RxShared {
             changed: Condvar::new(),
             wakers: Mutex::new(Vec::new()),
             stats_override: AtomicU64::new(u64::MAX),
+            capture: Mutex::new(None),
         })
+    }
+
+    /// P7 Task 10：掛上／卸下 agent log 寫入者（SessionCore 於 log_start／stop／bridge 交接時呼叫）。
+    pub fn set_capture(&self, capture: Option<Arc<crate::capture::CaptureObserver>>) {
+        *self.capture.lock().unwrap_or_else(|e| e.into_inner()) = capture;
     }
 
     /// 喚醒所有 `wait_for_regex_cancellable` 等待者（容量 1、滿則略過；已斷線者移除）。
@@ -152,6 +160,16 @@ impl RxShared {
             window.trim_to_limit();
         }
         drop(window);
+        if !data.is_empty() {
+            let capture = self
+                .capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(capture) = capture {
+                capture.write_rx(data);
+            }
+        }
         self.wake_all();
     }
 

@@ -141,3 +141,9 @@
 | 3030adc-1 | Low | `handler_spawner.rs` 檔頭 Windows 判準仍寫 9 | **fixed**：改為 `passed == 10`（12 個 `#[test]` 扣 2 個 `#[cfg(unix)]`），以 P7-LW-6 為準 |
 | 3030adc-2 | Low | dispatcher `exit_code` emit 未與 `py_returncode` 綁定 | **fixed（部分）**：新增 `event_dispatcher::fire_completed_exit_code_follows_py_returncode`（`-1073741819`、`-9` 兩組，期望值為 helper 本身）；sw-core 不得以 cfg 分辨平台（OD），故不建審查建議的 `#[cfg(windows)]` 版本——Linux 上 helper 為恆等，payload 的 Windows 值於 P7-LW-3 原生執行時驗（helper 平台值由 sw-pal `py_returncode_matches_python_popen` 鎖定）。L1 鎖 add-only +1 |
 | a0cad06-1 | Low | 新增環境類失敗（sm01）無同範圍重跑紀錄 | **fixed**：`p7-evidence/README.md` 本輪列附同範圍兩次重跑結果 |
+
+### 本輪 Task 進度（08 Task 7／9／10／17／18／19）
+
+| Task | 狀態 | 說明 |
+|---|---|---|
+| 10 | **完成（部分偏離）** | reader 端 `CaptureObserver`（掛 `RxShared`）、回應函式對齊 `log_responses` golden、文字模式換行；`capture_p7` 7 項。未承接：`slow_capture_fs_does_not_block_actor_control_lane`（需新增 Effect 變體＝改 P5 `tests/support` 窮舉 executor；P5 正由另一 session 修改，本輪不動 P5 檔案）。08 Task 10「P7 修訂」 |

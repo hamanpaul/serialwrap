@@ -4,6 +4,13 @@
     "p7_gate:cargo-test-workspace": {
       "linux": {
         "nodeids": [
+          "cargo:sw-core::capture_p7::detach_auto_stops_capture",
+          "cargo:sw-core::capture_p7::foreground_rx_is_not_captured_and_counts_match_python_rules",
+          "cargo:sw-core::capture_p7::log_path_uses_local_time",
+          "cargo:sw-core::capture_p7::log_responses_match_python_golden_bytes",
+          "cargo:sw-core::capture_p7::no_drop_under_burst",
+          "cargo:sw-core::capture_p7::observer_writes_clean_text_and_counts_like_python",
+          "cargo:sw-core::capture_p7::stop_waits_for_inflight_write",
           "cargo:sw-core::event_dispatcher::close_intake_rejects_new_dispatch",
           "cargo:sw-core::event_dispatcher::counter_load_error_skips_fire_and_releases_rule",
           "cargo:sw-core::event_dispatcher::fire_completed_exit_code_follows_py_returncode",

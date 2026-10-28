@@ -5,10 +5,11 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use sw_pal::traits::Clock;
-use sw_proto::pycompat::PyErr;
+use sw_proto::pycompat::{PyErr, clean_text, decode_utf8_replace, strftime_local};
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 
 use crate::Mono;
@@ -248,69 +249,185 @@ pub struct AgentLogCapture {
 // ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──
 
 /// agent log capture 的行數／位元組計數（reader 端 observer 更新）。
+#[derive(Debug, Default)]
 pub struct CaptureStats {
-    pub line_count: std::sync::atomic::AtomicU64,
-    pub byte_count: std::sync::atomic::AtomicU64,
+    pub line_count: AtomicU64,
+    pub byte_count: AtomicU64,
+}
+
+impl CaptureStats {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.line_count.load(Ordering::SeqCst),
+            self.byte_count.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// 進行中的 agent log 檔。
+struct ActiveFile {
+    capture_id: String,
+    file: Box<dyn LogFile>,
+    stats: Arc<CaptureStats>,
 }
 
 /// reader 端 agent log 寫入者（DF-15、EVT-D-L1；不經 actor 佇列、無丟棄）。
+///
+/// Python `_on_bridge_rx` 在 reader 執行緒內 `fp.write(chunk); fp.flush()`：本型別掛在 session 的 `RxShared`
+/// （`RxShared::set_capture`），於 reader 的 `rx.append` 內同步寫檔；`remove` 取同一把鎖，保證先前寫入完成。
 pub struct CaptureObserver {
-    _todo: (),
+    active: Mutex<Option<ActiveFile>>,
+    foreground_busy: AtomicBool,
 }
 
 impl CaptureObserver {
-    pub fn new() -> std::sync::Arc<Self> {
-        todo!("P7 Task 10")
+    pub fn new() -> Arc<Self> {
+        Arc::new(CaptureObserver {
+            active: Mutex::new(None),
+            foreground_busy: AtomicBool::new(false),
+        })
     }
-    /// actor 在前景開始／結束時發布（EVT-D-L1）。
-    pub fn set_foreground_busy(&self, _busy: bool) {
-        todo!("P7 Task 10")
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<ActiveFile>> {
+        self.active.lock().unwrap_or_else(|e| e.into_inner())
     }
-    /// executor 呼叫。
-    pub fn install(
-        &self,
-        _capture_id: String,
-        _file: Box<dyn sw_pal::traits::AppendFile>,
-    ) -> std::sync::Arc<CaptureStats> {
-        todo!("P7 Task 10")
+
+    /// actor 在前景開始／結束時發布（EVT-D-L1；Python `session.foreground_busy` 只計命令，審查 F27）。
+    pub fn set_foreground_busy(&self, busy: bool) {
+        self.foreground_busy.store(busy, Ordering::SeqCst);
     }
-    /// executor 呼叫；取鎖保證先前寫入完成；回 `(line_count, byte_count)`。
-    pub fn remove(&self, _capture_id: &str) -> Option<(u64, u64)> {
-        todo!("P7 Task 10")
+
+    /// 開始寫入 `file`（取代既有者）；回傳該 capture 的計數。
+    pub fn install(&self, capture_id: String, file: Box<dyn LogFile>) -> Arc<CaptureStats> {
+        let stats = Arc::new(CaptureStats::default());
+        *self.lock() = Some(ActiveFile {
+            capture_id,
+            file,
+            stats: stats.clone(),
+        });
+        stats
+    }
+
+    /// 停止並關閉 `capture_id` 的檔案；取鎖保證先前寫入完成；回 `(line_count, byte_count)`。
+    pub fn remove(&self, capture_id: &str) -> Option<(u64, u64)> {
+        let mut active = self.lock();
+        if active.as_ref().is_some_and(|a| a.capture_id == capture_id) {
+            return active.take().map(|a| a.stats.snapshot());
+        }
+        None
+    }
+
+    /// 目前計數（`log_status`）。
+    pub fn counts(&self, capture_id: &str) -> Option<(u64, u64)> {
+        self.lock()
+            .as_ref()
+            .filter(|a| a.capture_id == capture_id)
+            .map(|a| a.stats.snapshot())
+    }
+
+    /// 一個 RX chunk：`clean_text(data.decode("utf-8", errors="replace"))` 非空且非前景時寫入（文字模式換行）；
+    /// 寫入失敗吞掉、不計數（Python `except Exception: pass`）。
+    pub fn write_rx(&self, data: &[u8]) {
+        if self.foreground_busy.load(Ordering::SeqCst) {
+            return;
+        }
+        let chunk = clean_text(&decode_utf8_replace(data));
+        if chunk.is_empty() {
+            return;
+        }
+        let mut active = self.lock();
+        let Some(a) = active.as_mut() else {
+            return;
+        };
+        if a.file
+            .append_flush(&sw_pal::fs_ops::text_mode_bytes(&chunk))
+            .is_ok()
+        {
+            a.stats
+                .byte_count
+                .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+            a.stats
+                .line_count
+                .fetch_add(chunk.matches('\n').count() as u64, Ordering::SeqCst);
+        }
     }
 }
 
 impl crate::uart_bridge::RxObserver for CaptureObserver {
-    fn on_rx(&self, _com: &str, _data: &[u8], _wal_seq: u64) {
-        todo!("P7 Task 10")
+    fn on_rx(&self, _com: &str, data: &[u8], _wal_seq: u64) {
+        self.write_rx(data);
     }
 }
 
-/// `"{log_dir}/{com}_{%y%m%d-%H%M%S}.log"`（本地時間）。
-pub fn log_path_for(_log_dir: &str, _com: &str, _unix_s: i64, _offset_s: i32) -> String {
-    todo!("P7 Task 10")
+/// `"{log_dir}/{com}_{%y%m%d-%H%M%S}.log"`（本地時間；`os.path.join`）。
+pub fn log_path_for(log_dir: &str, com: &str, unix_s: i64, offset_s: i32) -> String {
+    let ts = strftime_local(unix_s.saturating_mul(1_000_000), offset_s, "%y%m%d-%H%M%S");
+    std::path::Path::new(log_dir)
+        .join(format!("{com}_{ts}.log"))
+        .to_string_lossy()
+        .into_owned()
 }
 
-pub fn log_start_reply(_cap: &AgentLogCapture, _already_active: bool, _session: PyDict) -> PyDict {
-    todo!("P7 Task 10")
+/// `log_start` 成功（或 `already_active`）回應。
+pub fn log_start_reply(cap: &AgentLogCapture, already_active: bool, session: PyDict) -> PyDict {
+    let mut out = PyDict::new();
+    out.insert("ok", PyValue::Bool(true));
+    if already_active {
+        out.insert("already_active", PyValue::Bool(true));
+    }
+    out.insert("capture_id", PyValue::from(cap.capture_id.as_str()));
+    out.insert("log_path", PyValue::from(cap.log_path.as_str()));
+    out.insert("session", PyValue::Dict(session));
+    out
 }
 
 /// `{"ok":false,"error_code":"LOG_OPEN_FAILED","detail":<str(OSError)>}`。
-pub fn log_open_failed_reply(_err: &sw_pal::traits::PalError) -> PyDict {
-    todo!("P7 Task 10")
+pub fn log_open_failed_reply(detail: &str) -> PyDict {
+    let mut out = PyDict::new();
+    out.insert("ok", PyValue::Bool(false));
+    out.insert("error_code", PyValue::from("LOG_OPEN_FAILED"));
+    out.insert("detail", PyValue::from(detail));
+    out
 }
 
 /// 無 session。
-pub fn log_stop_reply(_cap: &AgentLogCapture, _line_count: u64, _byte_count: u64) -> PyDict {
-    todo!("P7 Task 10")
+pub fn log_stop_reply(cap: &AgentLogCapture, line_count: u64, byte_count: u64) -> PyDict {
+    let mut out = PyDict::new();
+    out.insert("ok", PyValue::Bool(true));
+    out.insert("capture_id", PyValue::from(cap.capture_id.as_str()));
+    out.insert("log_path", PyValue::from(cap.log_path.as_str()));
+    out.insert("line_count", py_int(line_count as i128));
+    out.insert("byte_count", py_int(byte_count as i128));
+    out.insert("started_at", PyValue::from(cap.started_at.as_str()));
+    out
 }
 
-pub fn no_active_capture_reply(_session: PyDict) -> PyDict {
-    todo!("P7 Task 10")
+pub fn no_active_capture_reply(session: PyDict) -> PyDict {
+    let mut out = PyDict::new();
+    out.insert("ok", PyValue::Bool(false));
+    out.insert("error_code", PyValue::from("NO_ACTIVE_CAPTURE"));
+    out.insert("session", PyValue::Dict(session));
+    out
 }
 
-pub fn log_status_reply(_cap: Option<(&AgentLogCapture, u64, u64)>, _session: PyDict) -> PyDict {
-    todo!("P7 Task 10")
+pub fn log_status_reply(cap: Option<(&AgentLogCapture, u64, u64)>, session: PyDict) -> PyDict {
+    let mut out = PyDict::new();
+    out.insert("ok", PyValue::Bool(true));
+    match cap {
+        None => {
+            out.insert("active", PyValue::Bool(false));
+        }
+        Some((cap, line_count, byte_count)) => {
+            out.insert("active", PyValue::Bool(cap.status == "active"));
+            out.insert("capture_id", PyValue::from(cap.capture_id.as_str()));
+            out.insert("log_path", PyValue::from(cap.log_path.as_str()));
+            out.insert("line_count", py_int(line_count as i128));
+            out.insert("byte_count", py_int(byte_count as i128));
+            out.insert("started_at", PyValue::from(cap.started_at.as_str()));
+        }
+    }
+    out.insert("session", PyValue::Dict(session));
+    out
 }
 
 /// agent log 檔案的 append 寫入端（每 chunk flush）。
