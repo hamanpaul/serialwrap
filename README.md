@@ -153,6 +153,20 @@ markers remain available for caller validation. `command.get` and WAL META recor
 setting; reboot continues through its existing recovery flow. See
 [command completion](docs/command-completion.md).
 
+The broker recognizes a reboot only when it is a standalone command (`reboot`,
+`systemctl reboot`, `shutdown -r`, `echo b > /proc/sysrq-trigger`). For chained
+or self-rebooting commands such as `firstboot -y && reboot` or `sysupgrade ...`,
+add `cmd submit --expect-reboot` (RPC `command.submit` boolean `expect_reboot`):
+whatever the command text, it takes the reboot path (boot quiet window armed
+immediately, no Ctrl-C/Ctrl-D, recovery waits for READY). Without the flag a
+chained reboot is run as a normal command and the submit response carries a
+non-fatal `CHAINED_REBOOT_WARNING`; execution is unchanged. `--mode interactive`
+with the flag is rejected (`EXPECT_REBOOT_MODE_UNSUPPORTED`), non-boolean values
+return `INVALID_EXPECT_REBOOT`, `--completion-regex` is ignored (reboot wins), and
+the flag does not bypass `AUTOBOOT_QUIET`. Set `--cmd-timeout` to cover the part
+before the reboot. The submit response echoes `expect_reboot: true` and
+`command.get` reports it. See [explicit reboot](docs/expect-reboot.md).
+
 For local development, run `./install.sh`; it performs the same package install
 and `serialwrap setup` flow from the checkout.
 
@@ -1897,6 +1911,16 @@ Regex 必須可編譯、不超過 1024 UTF-8 bytes 且不能匹配空串；無�
 prompt 擷取，但只裁切完成標記之後的 prompt，保留早先 prompt redraw 之後的結果
 與完成標記供呼叫端驗證；`command.get` 與 WAL META 記錄設定，
 reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-completion.md)。
+
+broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown -r`、
+`echo b > /proc/sysrq-trigger`）。`firstboot -y && reboot`、`sysupgrade …` 這類串接或自帶重開機的命令，
+請加 `cmd submit --expect-reboot`（RPC `command.submit` 的布林 `expect_reboot`）：不管命令文字，
+一律走 reboot 路徑（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 recovery 等板子回 `READY`）。
+沒帶旗標時，串接的 reboot 仍當一般命令執行，submit 回應多一則非致命 `CHAINED_REBOOT_WARNING`，
+執行行為不變。`--mode interactive` 帶旗標會被拒絕（`EXPECT_REBOOT_MODE_UNSUPPORTED`），非布林值回
+`INVALID_EXPECT_REBOOT`，同時帶 `--completion-regex` 時 reboot 優先（regex 不使用），旗標不繞過
+`AUTOBOOT_QUIET`。`--cmd-timeout` 要涵蓋 reboot 之前那一段的耗時。submit 回應回聲 `expect_reboot: true`，
+`command.get` 回報此設定。詳見[明示 reboot](docs/expect-reboot.md)。
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
