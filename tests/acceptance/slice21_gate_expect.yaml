@@ -5,6 +5,10 @@ schema_version: 1
 lock_file: tests/acceptance/l1_required.lock.json
 freeze_file: tests/acceptance/breaker/slice_2.1.json
 blocked_owner_file: tests/acceptance/slice21_bo.yaml
+# 承接率斷路器（judge 以 slice_breaker.evaluate 判定 case_uptake；審查 b7cd852 #1）。
+breaker_snapshots_file: tests/acceptance/breaker/slice_2.1.snapshots.ndjson
+# OD-02 Stage 2 剩餘預估週數：擁有者填值；null 時 case_uptake 為 EVIDENCE_MISSING（不以 0 代入放行）。
+stage2_estimate_weeks: null
 runbook: docs/rust-refactor/slice21-owner-runbook.md
 parity:
   # #104：逐列狀態檔；來源文件位置與 sha256 記在狀態檔內。
@@ -40,8 +44,26 @@ sections:
 # 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
 pending_decisions:
   - id: PA-OD-1
-    scenario: SC-37 候選（daemon 端 backend env 強制非原生後端 → exit 1）與「只可新增、不可修改」原則適用範圍（parity #6／#71）
+    scenario: SC-37（daemon 端 backend env 強制非原生後端 → exit 1）與「只可新增、不可修改」原則（parity #6／#71）；OD-21 已核准 SC-37，待寫入 contracts/behavior_changes.yaml 後解除
     evidence: "origin/docs/parity-amendments:docs/rust-refactor/plans/parity-amendments-2026-10-26.md#pa-od-1"
   - id: NC-P5-02
     scenario: 承接率斷路器窗口採單一固定窗口；「連續三週內」滾動解讀待擁有者確認（Task 0b）
     evidence: docs/rust-refactor/plans/spec-reconciliation.md
+  - id: PA-OD-F67
+    scenario: "parity #32：計畫指名的 no_redetect_during_quiet 經公開輸入不可達，改以 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 替代（審查 4920d90 #1）"
+    evidence: docs/rust-refactor/reviews/p5-fix-responses.md#F67
+  - id: PA-OD-L15-WAL
+    scenario: "P2 凍結情境 l15-wal-interference 為 compare: none，不產 comparison.json，兩個 label 結構上恆為 INSUFFICIENT_EVIDENCE；需裁決改情境（計畫修正）或移出 l15_ab 判定（審查 b7cd852 #2、gaps #7）"
+    evidence: docs/rust-refactor/slice21-l15-gaps.md
+  - id: PA-OD-EVLAT
+    scenario: "event_latency 三輪判定器未實作（讀 resource_limits.yaml measurement_runs）；Rust daemon 尚無 test_fakes.event_latency 計時欄位、runner 無 stop_request（審查 b7cd852 #5、c0d221f #1、gaps #6）"
+    evidence: docs/rust-refactor/slice21-l15-gaps.md
+  - id: PA-OD-L15-GAPS
+    scenario: "s21 情境中 runner 仍無法表達的計畫斷言（gaps #1、#3～#5、#8～#10）；裁決前 gate 的 l15_ab 不計 PASS（EVIDENCE_MISSING；審查 c0d221f #3）"
+    evidence: docs/rust-refactor/slice21-l15-gaps.md
+  - id: PA-OD-REPROBE
+    scenario: "readiness reprobe／#162 再確認 tick（08 計畫 P7-T5，P7 已交付 reprobe.rs）被 Slice 2.1 L1.5 l15-delayed-reply（P2 凍結）、s21-reboot-minimal-guard 與 Slice 2.2 func-test cowork-01-agent-bad-cmd 依賴；Rust 於 PROMPT_TIMEOUT／reboot 後不回 READY。裁決：backport P7-T5 至 P5（Slice 2.1），或將上述案例移至 2.3 gate（上游缺口 U-01）"
+    evidence: docs/rust-refactor/reviews/p5-fix-responses.md#上游缺口-u-01
+  - id: PA-OD-T20
+    scenario: "Task 20 黑箱 11 案與基線／計畫不符（7 案 Python 與 Rust 一致但違反案例斷言、2 案 Python 基線缺陷候選或計時敏感、1 案只適用 Rust、1 案 TX 窗口設計缺陷）；逐案根因與建議見交付報告，裁決前不放寬斷言、不改 skip"
+    evidence: docs/rust-refactor/reviews/p5-t20-blackbox-report.md

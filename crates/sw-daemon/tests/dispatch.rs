@@ -77,7 +77,7 @@ fn submit_blocking(r: &ServiceRig) -> String {
 #[test]
 fn deferred_methods_return_method_not_found_without_side_effects() {
     let r = ServiceRig::ready_shell();
-    let scope = std::fs::read_to_string("../../tests/acceptance/slice21_scope.yaml").unwrap();
+    let scope = std::fs::read_to_string(support::data_root().join("tests/acceptance/slice21_scope.yaml")).unwrap();
     let methods = support::deferred_methods(&scope);
     // P7 Task 16（08 §0.6 退役清單）：10 個 event.* 移入 served，延後清單隨 yaml 縮小為 console_*／file.*。
     assert_eq!(

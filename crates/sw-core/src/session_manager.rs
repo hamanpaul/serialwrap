@@ -50,7 +50,9 @@ use crate::resources::{
 #[cfg(feature = "test-fakes")]
 use crate::session_core::SessionState;
 use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, SessionRequest};
-use crate::state_store::{LoadedState, ReleasedRow, StateDelta, StateModel, StateStore};
+use crate::state_store::{
+    lone_surrogate_encode_error, serialize_state, LoadedState, ReleasedRow, StateDelta, StateModel, StateStore,
+};
 use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, spawn_tx_writer};
 use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
@@ -257,6 +259,10 @@ struct Shared {
     probe_tx_frozen: AtomicBool,
     /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
     rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
+    /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
+    lone_surrogates: bool,
+    /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
+    startup_error: Mutex<Option<String>>,
 }
 
 /// PROBE 的 writer 交給 TxWriter thread 期間留在 `HandleParts` 的占位（任何提交一律 NotSubmitted）。
@@ -382,7 +388,7 @@ fn stopping_error() -> PyErr {
 }
 
 fn commit_error(e: &PalError) -> PyErr {
-    PyErr::value_error(format!("state.json commit failed: {e:?}"))
+    PyErr::value_error(e.py_message.clone())
 }
 
 /// 由 template 物化 session profile（`_session_from_template` 的 `SessionProfile(...)`）。
@@ -1678,6 +1684,15 @@ impl Shared {
             });
         }
         drop(inner);
+        if self.lone_surrogates {
+            // Python `__init__` 尾端 `_save_state`：payload 含孤立 surrogate 時 UTF-8 文字模式寫入拋
+            // `UnicodeEncodeError`（未捕捉 → daemon rc 1）；temp 檔清除、原 state.json 不動（審查 47c7b25 #1）。
+            let payload = String::from_utf8_lossy(&serialize_state(&self.model_snapshot())).into_owned();
+            if let Some(msg) = lone_surrogate_encode_error(&payload) {
+                *lock(&self.startup_error) = Some(msg);
+                return;
+            }
+        }
         if let Err(e) = self.commit_sync(|_| {}) {
             self.warn(format!("state.json 寫入失敗（啟動存檔）：{e:?}"));
         }
@@ -1993,6 +2008,8 @@ impl SessionManager {
             fs,
             warn,
             store: state,
+            lone_surrogates: loaded.lone_surrogates,
+            startup_error: Mutex::new(None),
             model: Mutex::new(StateModel::new(loaded)),
             fanout,
             epochs: EpochAllocator::new(),
@@ -2645,6 +2662,11 @@ impl SessionManager {
     }
 
     /// SC-11 stopping gate：冪等設定 `stopping=true`；之後任何自動或 RPC 路徑的 attach 都不開啟裝置。
+    /// 建構子尾端啟動存檔重現的 Python 未捕捉例外末行（有值時 daemon 應印 traceback 並 exit 1）。
+    pub fn startup_error(&self) -> Option<String> {
+        lock(&self.shared.startup_error).clone()
+    }
+
     pub fn begin_shutdown(&self) {
         lock(&self.shared.inner).stopping = true;
     }

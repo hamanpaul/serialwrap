@@ -1,8 +1,8 @@
 # Slice 2.1 完成校準報告（P5-T23；§12.2、OD-02、OD-13）
 
-> 狀態：**初版（本環境可得資料）**。Slice 2.1 出口尚未通過：本環境 gate 尚未產出 `READY_FOR_OWNER_EVIDENCE`
-> （T21 L1.5 A/B 需 P2 bridge 資格報告與 release artifact，未在本環境執行；T22 gate 僅 `--dry-run`，verdict
-> `INCOMPLETE`），BO-S21-01～16 證據未回填。擁有者欄位一律標「待擁有者補值」，**不得據以重算後續切片工期**。
+> 狀態：**第三輪更新（2026-10-28，本環境可得資料）**。Slice 2.1 出口尚未通過：T22 gate 以 `--evidence-run` 非 dry-run
+> 實跑，verdict `FAIL`（linux_l1 於 root 下的 6 支證據不足、l15_ab、wal_s1w_perf），T20／T21 待裁決項未結，
+> BO-S21-01～16 證據未回填。擁有者欄位一律標「待擁有者補值」，**不得據以重算後續切片工期**。
 >
 > 資料來源：`git log bba1b21^..4920d90`（分支 `feature/rust-refactor-p5`）、`tests/acceptance/breaker/slice_2.1.json`
 > （Task 0b 凍結）、`scripts/rust/slice21_gate.sh --dry-run` 報告、`docs/rust-refactor/reviews/p5-fix-responses.md`。
@@ -13,31 +13,34 @@
 修正輪數為該 Task 範圍內之後 `fix(...)` commit 數（依處理紀錄 F 編號歸屬，跨 Task 的修正各計一次）。時距為牆鐘，
 含排隊與審查等待，非純實作工時。
 
-| Task | 綠燈 commit | 綠燈時間（UTC） | 紅燈→綠燈 | 修正輪數 |
+| Task | 綠燈 commit | 綠燈時間（UTC，`%cI` 換算） | 紅燈→綠燈 | 修正輪數 |
 |---|---|---|---|---|
-| T0a／T0b 範圍清單、資源上限、分母凍結 | `498c304`、`d757a4a` | 10-23 03:18～03:47 | ≈1.5 日 | 0 |
-| T1 sw-proto helper | `dfd5f58` | 10-23 05:09 | ≈1.6 日 | 0 |
-| T2～T7 sw-pal（fake、POSIX／Windows serial、lock、device、WalFs） | `6ccb118`～`df66409` | 10-23 06:47～18:40 | ≈1.6～2.1 日 | 3（`fb76460`、`18358a5`、`e671620`） |
-| T7 WalWriter | `7c084ef` | 10-26 10:22 | ≈4.8 日 | 2（`2d93181`、`5f625a2`） |
-| T8 命令 admission | `0721a4c` | 10-26 10:59 | ≈4.8 日 | 0 |
-| T9 TxWriter／fence | `50345ea` | 10-26 12:45 | ≈4.9 日 | 1（`f346f6b`） |
-| T10 IoWorker reader | `335665e` | 10-26 19:30 | ≈5.2 日 | 1（`10e4ea6`） |
-| T11 SessionCore／Mailbox／Actor | `f20bdd0` | 10-26 22:38 | ≈5.3 日 | 0 |
-| T12／T12b Drain／Release | `afe4853`、`b73da42` | 10-27 08:46／03:04 | ≈5.5～5.7 日 | 2（`0e47d0c`、`7536870`） |
-| T13 登入／boot quiet | `0a187c1` | 10-27 01:52 | ≈5.4 日 | 5（`18abb03`、`177dfd9`、`620ca8e`、`46419db`、`f346f6b`） |
-| T14 命令執行／lease／self-test／capture | `8b8a40f` | 10-27 02:43 | ≈5.5 日 | 3（`348eb2f`、`10e4ea6`、`3b5927a`） |
-| T15a 黑箱 FakeTarget | `b779527` | 10-27 01:38 | ≈5.4 日 | 0 |
-| T15 StateStore | `c96a91c` | 10-27 01:57 | ≈5.4 日 | 1（`47c7b25`） |
-| T16 SessionManager | `73634db` | 10-27 02:45 | ≈5.5 日 | 8（`7a84168`、`9363d9b`、`5270c9d`、`21de0db`、`6aafe8f`、`314eedd`、`e95c5e9`、`b069633`） |
-| T17 RpcListener／framing | `2fcdbbf` | 10-27 01:38 | ≈5.4 日 | 2（`c43bb3e`、`e671620`） |
-| T18 分派器 | `8a7986e` | 10-27 03:31 | ≈5.5 日 | 1（`9fdd89d`） |
-| T19 daemon_main | `3938032` | 10-27 04:20 | ≈5.5 日 | 3（`edfc741`、`d46c323`、`3afdc4f`） |
-| T20 黑箱契約 | `1f5aafa` | 10-27 05:20 | ≈5.6 日（**未完成**，見 F103） | — |
-| T21a P2 runner 動作 | `2af2554` | 10-27 02:57 | ≈5.5 日 | 0 |
-| T21 L1.5 A/B | — | — | 未完成（BLOCKED：bridge 資格報告、release artifact） | — |
-| T22 gate 包 | `b7cd852`、`4920d90` | 10-27 04:00／15:45 | ≈5.5 日（僅 dry-run） | — |
+| T0a／T0b 範圍清單、資源上限、分母凍結 | `498c304`、`d757a4a` | 10-22 19:18～10-22 19:47 | ≈1.5 日 | 0 |
+| T1 sw-proto helper | `dfd5f58` | 10-22 21:09 | ≈1.6 日 | 0 |
+| T2～T7 sw-pal（fake、POSIX／Windows serial、lock、device、WalFs） | `6ccb118`、`df66409` | 10-22 22:47～10-23 10:40 | ≈1.6～2.1 日 | 3（`fb76460`、`18358a5`、`e671620`） |
+| T7 WalWriter | `7c084ef` | 10-26 02:22 | ≈4.8 日 | 2（`2d93181`、`5f625a2`） |
+| T8 命令 admission | `0721a4c` | 10-26 02:59 | ≈4.8 日 | 0 |
+| T9 TxWriter／fence | `50345ea` | 10-26 04:45 | ≈4.9 日 | 1（`f346f6b`） |
+| T10 IoWorker reader | `335665e` | 10-26 11:37 | ≈5.2 日 | 1（`10e4ea6`） |
+| T11 SessionCore／Mailbox／Actor | `f20bdd0` | 10-26 14:38 | ≈5.3 日 | 0 |
+| T12／T12b Drain／Release | `afe4853`、`b73da42` | 10-27 00:46～10-27 03:04 | ≈5.7～5.8 日 | 2（`0e47d0c`、`7536870`） |
+| T13 登入／boot quiet | `0a187c1` | 10-27 01:52 | ≈5.8 日 | 5（`18abb03`、`177dfd9`、`620ca8e`、`46419db`、`f346f6b`） |
+| T14 命令執行／lease／self-test／capture | `8b8a40f` | 10-27 02:43 | ≈5.8 日 | 3（`348eb2f`、`10e4ea6`、`3b5927a`） |
+| T15a 黑箱 FakeTarget | `b779527` | 10-27 03:33 | ≈5.8 日 | 0 |
+| T15 StateStore | `c96a91c` | 10-27 03:33 | ≈5.8 日 | 2（`47c7b25`、`4f4082f`） |
+| T16 SessionManager | `73634db` | 10-27 03:33 | ≈5.8 日 | 9（`7a84168`、`9363d9b`、`5270c9d`、`21de0db`、`6aafe8f`、`314eedd`、`e95c5e9`、`b069633`、`4f4082f`） |
+| T17 RpcListener／framing | `2fcdbbf` | 10-27 03:33 | ≈5.8 日 | 2（`c43bb3e`、`e671620`） |
+| T18 分派器 | `8a7986e` | 10-27 03:33 | ≈5.8 日 | 1（`9fdd89d`） |
+| T19 daemon_main | `3938032` | 10-27 04:20 | ≈5.9 日 | 4（`edfc741`、`d46c323`、`3afdc4f`、`4f4082f`） |
+| T20 黑箱契約 | `1f5aafa` | 10-27 05:20 | ≈5.9 日 | **未完成**：第三輪 release A/B 交付報告 `2be8982`（待裁決 `PA-OD-T20`） |
+| T21a P2 runner 動作 | `2af2554` | 10-27 15:42 | ≈6.3 日 | 0 |
+| T21 L1.5 A/B | `6636694` | 10-28 04:49 | ≈6.9 日 | **未完成**：第三輪實跑（待裁決 `PA-OD-REPROBE`、`PA-OD-L15-*`、`PA-OD-EVLAT`） |
+| T22 gate 包 | `b7cd852` | 10-27 15:43 | ≈6.3 日 | 第三輪 `--evidence-run` 非 dry-run 實跑，verdict FAIL（見回歸重跑段） |
 
-雲端雙審（grok＋Claude Opus）共開出 F01～F111，處置見 `docs/rust-refactor/reviews/p5-fix-responses.md`。
+時間一律以 `git log --format=%cI` 換算 UTC（第三輪更正：初版混用 +0800 本地時間，誤差最多 8 小時；審查 68fd9bf #1）。
+`b779527`～`8a7986e` 的 committer 時間同為 10-27 03:33，係 rebase 時間，實際綠燈早於此，該 5 列時距為上限。
+
+雲端雙審（grok＋Claude Opus）與第三輪單審共開出 F01～F135，處置見 `docs/rust-refactor/reviews/p5-fix-responses.md`。
 
 ## Bench 等待
 
@@ -76,7 +79,7 @@ BLOCKED-OWNER 各項自 2026-10-27 起計；等待天數由擁有者回填時計
 | boot quiet 零 TX（含 drain 保留 quiet） | 有（login_quiet、session_core） | LOCAL-WINDOWS-TODO | BO-S21-10 |
 | 帳密未解析終態 | 有 | LOCAL-WINDOWS-TODO | 未執行 |
 | WAL 常駐 handle、外部刪檔自癒、輪替不覆蓋 | 有 | LOCAL-WINDOWS-TODO（share-delete） | BO-S21-14／16 |
-| 有序關機與 exit code | 有（daemon_process；F91／F111 偶發待追查） | BO-S21-06 | BO-S21-12 |
+| 有序關機與 exit code | 有（daemon_process；F91／F111 根因已查明：外部行程搶開測試 PTY，產品依 #82 正確拒開） | BO-S21-06 | BO-S21-12 |
 
 ## 平台缺陷
 
@@ -98,9 +101,10 @@ BLOCKED-OWNER 各項自 2026-10-27 起計；等待天數由擁有者回填時計
 
 | 層級 | 重跑次數 | 原因 |
 |---|---|---|
-| L1（Linux 全量 pytest，`drive.sh` 分段） | 6 | 每組審查修正推送前各一次；新增失敗只見既有 QUEUE_FULL 兩支 flake（F94 洩漏 daemon 劫持 `/dev/pts/0`） |
-| L1（sw-daemon cargo 全量） | 本輪 2 | 首輪 `kill_before_commit_restores_previous_state` 偶發失敗，第二輪與單獨 2/2 通過（F111） |
-| L1.5 | 0 | 未執行（T21 BLOCKED：P2 bridge 資格報告、release artifact） |
+| L1（Linux 全量 pytest，分段） | 前兩輪 6；第三輪 3（起點基準、G2 組、gate pytest_full） | 每組修正推送前；第三輪三次失敗集合皆不超出起點基準（起點 28、gate 27）。G2 新增的 `test_doctor_ab_shared_checks` 經同範圍重跑 3/3 重現、查明為前一測試殘留 daemon（非 flake）並修正收尾；初版「QUEUE_FULL 兩支 flake」說法無重跑取證，更正為「疑似、未證」（審查 68fd9bf #3） |
+| L1（cargo，`cargo_l1_results.py`） | 第三輪 3 | gate 內首跑 16 failed：sw-daemon 測試支援以 cwd 相對路徑找 FakeTarget／scope 檔，collector 不在 crate 目錄執行（已修，改 `CARGO_MANIFEST_DIR`）；修正後兩次：8 → 6 failed，剩 root 證據不足 6 支（非 root `setpriv` 6/6 passed）。`sw-pal::lock::lock_conformance_suite` 第一次修正後 collector 失敗 1 次、第二次通過、直接連跑 600 次 0 失敗：失敗集合不同，根因未明（collector 不保留 panic 輸出），列 F136 追查 |
+| 黑箱 A/B（release） | 第三輪 Python 2、Rust 2 | T20 交付報告 |
+| L1.5 | 第三輪 1（逐批）＋情境修正後重跑 3 案 | T21 |
 | L2 | 0（待擁有者補值） | BO-S21-07 |
 | L3 | 0（待擁有者補值） | BO-S21-08 |
 
@@ -112,15 +116,15 @@ BLOCKED-OWNER 各項自 2026-10-27 起計；等待天數由擁有者回填時計
 
 | 週（起） | valid_pass | rate | 斷路器 |
 |---|---|---|---|
-| 2026-10-21 | 0 | 0.00 | 未觸發（尚無 gate 判定為 PASS 的案例；完整 gate 未執行） |
+| 2026-10-21 | 0 | 0.00 | 窗口內未觸發；gate `case_uptake` 為 EVIDENCE_MISSING（逐案 `case_verdicts.json` 未彙整、OD-02 `stage2_estimate_weeks` 待擁有者填值） |
 
-`case_uptake.valid_pass` 只計 gate 判定為 PASS 的 `slice_2.1` 案例；本環境 gate 僅 dry-run，故記 0，待完整 gate 後更新。
+`case_uptake.valid_pass` 只計 gate 判定為 PASS 的 `slice_2.1` 案例；第三輪 gate 未產出逐案判定，故記 0。judge 自第三輪起以 `slice_breaker.evaluate` 判定斷路器。
 
 ## OD-02 24 週上限輸入
 
 以下為**規劃估計**，非承諾；擁有者 bench 等待與實機重跑次數未回填前不得據以重算工期。
 
 - Slice 2.1 本環境實作（T0～T19、T21a、T22 骨架）自紅燈至最後一組修正約 6 個日曆日（2026-10-21～10-27），其中雲端雙審修正輪佔約 1 日。
-- 未完成且計入 Slice 2.1 的本環境工作：T20 release artifact A/B 重跑與交付報告、T21 L1.5 A/B（10 個 s21 情境＋8 個 P2 凍結情境 × 2 label）、T22 完整 gate、Windows 原生 L1（LOCAL-WINDOWS-TODO）；粗估 1～2 週（規劃估計）。
+- 未完成且計入 Slice 2.1 的本環境工作：T20 待裁決 11 案（`PA-OD-T20`）、readiness reprobe 依賴（`PA-OD-REPROBE`）、T21 L1.5 A/B 待裁決項（10 個 s21 情境＋11 個 P2 凍結情境 × 2 label，第三輪已實跑；審查 68fd9bf #2 更正 8→11）、T22 完整 gate、Windows 原生 L1（LOCAL-WINDOWS-TODO）；粗估 1～2 週（規劃估計）。
 - 擁有者項（BO-S21-01～16）：待擁有者補值。
 - 外推 Slice 2.2～2.4：若各切片規模與 2.1 相當，本環境部分各約 1.5～3 週（規劃估計），加上擁有者 bench 等待（待擁有者補值）；以 OD-02 24 週上限計，尚餘緩衝需待 bench 等待實測後重算。

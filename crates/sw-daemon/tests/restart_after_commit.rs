@@ -20,19 +20,21 @@ fn kill_between_commit_and_reply_keeps_released_after_restart() {
         return;
     }
     let env = isolated_env_with_pty_target();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "kill_between_commit_and_reply_keeps_released_after_restart", "--nocapture"])
         .env("S21_CHILD", "1")
         .envs(&env.vars)
         .spawn()
-        .unwrap();
+        .unwrap(),
+    );
     wait_ready(&env, "COM0");
     let r = rpc_once(
         &env.socket,
         r#"{"id":1,"method":"device.release","params":{"selector":"COM0"}}"#,
     );
     assert!(r.is_empty(), "reply must not be sent: process aborts right after commit");
-    assert!(!child.wait().unwrap().success());
+    assert!(!child.wait().success());
 
     let mut d2 = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, Duration::from_secs(10));
@@ -54,12 +56,14 @@ fn kill_before_commit_restores_previous_state() {
         return;
     }
     let env = isolated_env_with_pty_target();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let mut child = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "kill_before_commit_restores_previous_state", "--nocapture"])
         .env("S21_CHILD", "before")
         .envs(&env.vars)
         .spawn()
-        .unwrap();
+        .unwrap(),
+    );
     wait_ready(&env, "COM0");
     let state_path = env.state_dir.join("state.json");
     let state_before = fs::read(&state_path).ok();
@@ -68,7 +72,7 @@ fn kill_before_commit_restores_previous_state() {
         r#"{"id":1,"method":"device.release","params":{"selector":"COM0"}}"#,
     );
     assert!(r.is_empty(), "release 未提交前中止：不得回覆成功");
-    assert!(!child.wait().unwrap().success());
+    assert!(!child.wait().success());
 
     // 重啟：state.json 應為 release 前的內容（該 session 不在 released 內）。
     let state_after = fs::read(&state_path).ok();

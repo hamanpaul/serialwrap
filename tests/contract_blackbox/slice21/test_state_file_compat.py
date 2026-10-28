@@ -85,3 +85,73 @@ def test_startup_always_rewrites_state_json(slice21_daemon_factory, tmp_path):
     assert sp.stat().st_mtime_ns > 1_000_000_000
     d.wait_state("COM0", "READY")
     assert sp.read_bytes().endswith(b"\n")
+
+
+_SURROGATE_ROW = {"by_id": "/s/by-id/usb-X", "released_by": "agent:a", "released_at": "2026-10-28T00:00:00+00:00",
+                  "reason": "\ud800"}
+
+
+@pytest.mark.parametrize("form", ["surrogatepass_bytes", "json_escape"])
+def test_lone_surrogate_in_persisted_row_fails_startup_like_python(slice21_daemon_factory, python_daemon_exe,
+                                                                   tmp_path, form):
+    """審查 d2d29a6_7af6567 47c7b25 #1：released 列含孤立 surrogate。
+
+    Python `json.loads(bytes)` 以 surrogatepass 載入成功，`__init__` 尾端 `_save_state` 以 UTF-8 文字模式寫檔時拋
+    `UnicodeEncodeError` → rc 1、原檔不動、無 `.corrupt`（fail closed，不得丟掉 RELEASED 後 attach）。
+    """
+    from harness import DaemonStartError, prepare_root
+
+    obj = {"released": {"t:COM9": _SURROGATE_ROW}}
+    if form == "json_escape":
+        body = json.dumps(obj).encode("ascii")
+    else:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    # 位置取決於 Python 存檔內容（含自動建立的 alias 列）：以同一輸入實跑 Python 基線取得末行作為對照。
+    ref_root = prepare_root(tmp_path / f"ref-{form}", state_json=body)
+    with pytest.raises(DaemonStartError) as ref:
+        slice21_daemon_factory(ref_root, daemon=python_daemon_exe, reuse_dirs=True)
+    expected = ref.value.stderr.splitlines()[-1]
+    assert expected.startswith("UnicodeEncodeError: 'utf-8' codec can't encode character '\\ud800' in position ")
+    assert expected.endswith(": surrogates not allowed")
+    root = prepare_root(tmp_path / f"sur-{form}", state_json=body)
+    with pytest.raises(DaemonStartError) as ei:
+        slice21_daemon_factory(root, reuse_dirs=True)
+    lines = ei.value.stderr.splitlines()
+    assert ei.value.rc == 1
+    assert lines[0] == "Traceback (most recent call last):"
+    assert lines[-1] == expected
+    assert (root / "state" / "state.json").read_bytes() == body
+    assert not (root / "state" / "state.json.corrupt").exists()
+
+
+@pytest.mark.parametrize("form", ["surrogatepass_bytes", "json_escape"])
+def test_lone_surrogate_in_unknown_key_starts_normally(slice21_daemon_factory, tmp_path, form):
+    """同上：孤立 surrogate 只在未知鍵時，存檔丟棄未知鍵 → 正常啟動、無 `.corrupt`、重寫為 5 個 key。"""
+    from harness import prepare_root
+
+    obj = {"zz": "\ud800", "aliases": {}}
+    if form == "json_escape":
+        body = json.dumps(obj).encode("ascii")
+    else:
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8", "surrogatepass")
+    root = prepare_root(tmp_path / f"unk-{form}", state_json=body)
+    d = slice21_daemon_factory(root, reuse_dirs=True)
+    d.wait_state("COM0", "READY")
+    assert sorted(p.name for p in d.state_dir.iterdir()) == ["state.json"]
+    out = json.loads((d.state_dir / "state.json").read_bytes())
+    assert list(out) == ["aliases", "bindings", "profile_detected", "profile_pins", "released"]
+
+
+def test_release_persist_oserror_message_like_python(slice21_daemon_factory, tmp_path):
+    """審查 3afdc4f #4／d2d29a6_7af6567 F115：release 存檔前暫停點的 OSError → `EXCEPTION`，message 為 Python `str(OSError)`
+    （`[Errno 20] Not a directory: '/dev/null/x'`），不得輸出 Rust Debug 結構；session 照常 RELEASED、state.json 的 released 為空。"""
+    from harness import prepare_root
+
+    root = prepare_root(tmp_path / "pause-oserror")
+    d = slice21_daemon_factory(root, extra_env={"SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE": "/dev/null/x"})
+    d.wait_state("COM0", "READY")
+    r = d.rpc("device.release", {"selector": "COM0"})
+    assert r.get("ok") is False and r.get("error_code") == "EXCEPTION", r
+    assert r.get("message") == "[Errno 20] Not a directory: '/dev/null/x'", r
+    d.wait_state("COM0", "RELEASED")
+    assert json.loads((d.state_dir / "state.json").read_bytes())["released"] == {}

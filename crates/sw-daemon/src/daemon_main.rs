@@ -838,8 +838,19 @@ impl Stage0Hooks {
             return Ok(());
         }
         let dir = Path::new(raw);
-        self.fs.mkdirs(dir)?;
-        self.fs.write_file(&dir.join("arrived"), format!("pid={}\n", self.pid).as_bytes())?;
+        // RPC 的 EXCEPTION message 為 Python `str(OSError)`：附上失敗的路徑（`os.makedirs` 為第一個不存在層級；
+        // 審查 3afdc4f #4）。
+        self.fs.mkdirs(dir).map_err(|e| {
+            let mut failed = dir;
+            while let Some(parent) = failed.parent().filter(|p| !p.as_os_str().is_empty() && !self.fs.exists(p)) {
+                failed = parent;
+            }
+            with_filename(e, failed)
+        })?;
+        let arrived = dir.join("arrived");
+        self.fs
+            .write_file(&arrived, format!("pid={}\n", self.pid).as_bytes())
+            .map_err(|e| with_filename(e, &arrived))?;
         let go = dir.join("go");
         let deadline = Instant::now() + Duration::from_secs(600);
         while !self.fs.exists(&go) && Instant::now() < deadline {
@@ -847,6 +858,14 @@ impl Stage0Hooks {
         }
         Ok(())
     }
+}
+
+/// `str(OSError)` 附檔名：`[Errno N] msg: '<path>'`（無 errno／winerror 時不附）。
+fn with_filename(mut e: PalError, path: &Path) -> PalError {
+    if e.os_code.is_some() || e.winerror.is_some() {
+        e.py_message = format!("{}: {}", e.py_message, py_repr_str(&path.to_string_lossy()));
+    }
+    e
 }
 
 impl PersistObserver for Stage0Hooks {
@@ -1058,6 +1077,16 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         fs: p.fs.clone(),
         warn: warn.clone(),
     });
+    if let Some(msg) = manager.startup_error() {
+        // Python `SessionManager.__init__` 的 `_save_state` 拋出未捕捉例外（孤立 surrogate 的 UnicodeEncodeError）：
+        // 尚未掃描／attach、state.json 不動、rc 1（審查 47c7b25 #1）。
+        eprint!("{}\n{msg}\n", sw_core::state_store::PY_TRACEBACK_HEAD);
+        manager.begin_shutdown();
+        let _ = manager.shutdown(DRAIN_BUDGET);
+        let _ = wal.shutdown();
+        lock.release();
+        return 1;
+    }
     // `SessionManager::new` 已完成建構子尾端的啟動存檔（Python `_save_state()`，其內呼叫一次 kill 鉤子(False)）。
     stage0.kill_after_save(false);
     manager.set_persist_observer(stage0);

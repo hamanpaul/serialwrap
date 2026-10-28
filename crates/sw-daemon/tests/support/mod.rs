@@ -20,6 +20,10 @@ use sw_proto::pyjson::{self, PyValue};
 
 pub use sw_daemon::daemon_main::{run_with_hooks, DaemonHooks, TraceEvent};
 
+#[path = "../common/mod.rs"]
+mod common;
+pub use common::data_root;
+
 /// P5-T18：`dispatch.rs` 的 `ServiceRig` 與 `deferred_methods`（追加，不改既有支援碼）。
 mod service_rig;
 pub use service_rig::*;
@@ -289,9 +293,8 @@ ft.stop()
 
 impl FakeTargetProc {
     fn start(workdir: &Path, by_id_dir: &Path, name: &str) -> (FakeTargetProc, PathBuf) {
-        let lib = std::env::current_dir()
-            .expect("測試 cwd")
-            .join("../../tests/contract_blackbox");
+        // 以 repo 根目錄定位（不依賴 cwd：`cargo_l1_results.py` 等 runner 不在 crate 目錄執行測試 binary）。
+        let lib = data_root().join("tests/contract_blackbox");
         let mut child = Command::new("python3")
             .arg("-I")
             .arg("-c")
@@ -529,9 +532,67 @@ pub fn wait_ready(env: &IsolatedEnv, com: &str) {
             return;
         }
         if Instant::now() >= deadline {
-            panic!("{com} 未在 30 s 內進入 READY，最後狀態：{:?}", state["state"]);
+            // F91／F111：逾時時一併輸出 last_error 與假 DUT PTY 的其他持有者（含 cmdline），
+            // 讓「外部行程搶開測試 PTY」（F94）這類環境干擾在失敗訊息中即可辨識，而非只剩狀態名。
+            panic!(
+                "{com} 未在 30 s 內進入 READY，最後狀態：{:?}，last_error：{:?}，{} 的持有者：{:?}",
+                state["state"],
+                state["last_error"],
+                env.pty_slave.display(),
+                path_holders(&env.pty_slave)
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 掃 `/proc/<pid>/fd` 找出開著 `path` 的行程（排除本測試行程），回 `(pid, cmdline)`。
+///
+/// 只用於失敗訊息的診斷：`/proc` 不存在或不可讀時回空清單，不影響判定。
+pub fn path_holders(path: &Path) -> Vec<(u32, String)> {
+    let me = std::process::id();
+    // fd 的 readlink 為實體路徑：傳入 symlink（例如 by-id）時先解析（審查 7af6567_9b81d9a #3）。
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = Vec::new();
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in procs.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        if fds.flatten().any(|fd| fs::read_link(fd.path()).map(|t| t == path).unwrap_or(false)) {
+            let cmd = fs::read(entry.path().join("cmdline"))
+                .map(|b| String::from_utf8_lossy(&b).replace('\0', " ").trim().to_string())
+                .unwrap_or_default();
+            out.push((pid, cmd));
+        }
+    }
+    out
+}
+
+/// 測試自行 spawn 的子行程守衛：測試 panic 時 kill 並回收，避免子行程成為孤兒、
+/// 持有 cargo 的輸出管線使整個 `cargo test` 卡住（F111 的第二段症狀）。
+pub struct ChildGuard(pub Child);
+
+impl ChildGuard {
+    pub fn wait(&mut self) -> ExitStatus {
+        self.0.wait().unwrap()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }
 
@@ -805,9 +866,9 @@ pub mod serde_free {
         pub first_close_bytes: usize,
     }
 
-    /// 由目前工作目錄往上找 repo 相對路徑 `rel`（cargo test 的 cwd 為 crate 目錄）。
+    /// 由 crate 目錄往上找 repo 相對路徑 `rel`（不依賴 cwd，理由同 `FakeTargetProc::start`）。
     pub fn repo_file(rel: &str) -> PathBuf {
-        let mut dir = std::env::current_dir().expect("current_dir");
+        let mut dir = super::data_root();
         loop {
             let candidate = dir.join(rel);
             if candidate.is_file() {

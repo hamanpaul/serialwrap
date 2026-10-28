@@ -17,6 +17,13 @@
 - **回填方式**（各項相同）：把證據目錄相對路徑填入 `report.json` 對應 `blocked_owner[].evidence`，並在 PR 描述的 BLOCKED-OWNER
   清單逐項附上路徑與結論；由審查者核對 artifact sha256、命令逐字一致與結果後，才可在 PR 上記錄「已解除」。未回填前不得宣告 Slice 2.1 出口。
 - **失敗也要回填**：結果 FAIL 時照實回填並保留樣本，不得改列觀察值或重跑挑樣本。
+- **L1.5 A/B 的 bridge 自測報告**：gate 第 9 段只在 `SERIALWRAP_L15_SELFTEST_REPORT` 指向依 Task 8 正式資格判定合格的
+  `selftest-report.json`（`python3 -m tools.uart_stdio_bridge selftest …` 產出，tool tree sha256 等於 `APPROVED_REVISION.json`）時才執行；
+  未設或不合格時 `l15_ab` 記為 `EVIDENCE_MISSING`（不是 FAIL）。完整命令例：
+  `SERIALWRAP_L15_SELFTEST_REPORT=<路徑>/selftest-report.json bash scripts/rust/slice21_gate.sh --run-id <run_id>`。
+- **承接率斷路器**：`case_uptake` 由 judge 以 `slice_breaker.evaluate` 判定（快照檔 `tests/acceptance/breaker/slice_2.1.snapshots.ndjson`、
+  OD-02 剩餘預估 `stage2_estimate_weeks` 取自 `tests/acceptance/slice21_gate_expect.yaml`）；tripped 或超過 OD-02 → FAIL，
+  證據不足（含 `stage2_estimate_weeks` 未填）→ `EVIDENCE_MISSING`。`stage2_estimate_weeks` 由擁有者填值。
 
 ### BO-S21-01
 

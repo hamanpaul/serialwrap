@@ -8,9 +8,10 @@
 #   - status 只能是 PASS／BLOCKED-OWNER／OWNER-DECISION-PENDING／INCOMPLETE。
 #   - PASS 必須附 tests（nodeid）；且每個 nodeid 須在本次 gate 已載入的 l1-results 中恰為 passed，否則降為 INCOMPLETE。
 #   - BLOCKED-OWNER 必須附 bo（BO-S21-NN，須存在於 tests/acceptance/slice21_bo.yaml）。
+#   - OWNER-DECISION-PENDING 必須附 decision（須存在於 slice21_gate_expect.yaml 的 pending_decisions），否則降為 INCOMPLETE。
 #   - 任一列為 INCOMPLETE → gate verdict INCOMPLETE。
 # 初填依據（2026-10-27，分支 p5work @ 8a7986e；同日 P5 審查修正輪更新 #3／#4／#32／#38／#46／#47／#52／#68／#72／A-88／A-92／D-106／F-W13）：Linux `cargo_l1_results.py -- --workspace --features test-fakes -- --skip cap_`
-#   逐案結果（P5-T19～T21 未完成）、`grep` 測試函式是否存在、`tests/acceptance/l1_required.lock.json` 的 s21_core／s21_gate:py_parity。
+#   逐案結果（P5-T19 已完成；T20 A/B 交付報告、T21 L1.5 未完成）、`grep` 測試函式是否存在、`tests/acceptance/l1_required.lock.json` 的 s21_core／s21_gate:py_parity。
 #   PASS 只表示「計畫指名的測試存在且本次 Linux 執行 passed」；Windows 原生證據仍由 gate 的 windows_native_l1 補齊。
 schema_version: 1
 source: docs/rust-refactor/plans/parity-amendments-2026-10-26.md
@@ -26,7 +27,7 @@ rows:
   - id: "#4"
     status: PASS
     tests: ["cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
-  - {id: "#6", status: OWNER-DECISION-PENDING, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
+  - {id: "#6", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
   - id: "#11"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
@@ -98,7 +99,7 @@ rows:
   - id: "#31"
     status: PASS
     tests: ["cargo:sw-core::session_manager::rematerialize_profile_recomputes_session_id_and_alias"]
-  - {id: "#32", status: OWNER-DECISION-PENDING, reason: "pin_applies_on_reattach／fallback_redetects_on_reattach／unresolvable_pin_falls_through 已 passed；計畫指名的 no_redetect_during_quiet 經公開輸入不可達（後備 template 恆為 passthrough，Python 不對 passthrough 武裝 quiet；見 p5-fix-responses F67），語意由 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 鎖住，待擁有者核可以 core 層案例替代"}
+  - {id: "#32", status: OWNER-DECISION-PENDING, decision: PA-OD-F67, reason: "pin_applies_on_reattach／fallback_redetects_on_reattach／unresolvable_pin_falls_through 已 passed；計畫指名的 no_redetect_during_quiet 經公開輸入不可達（後備 template 恆為 passthrough，Python 不對 passthrough 武裝 quiet；見 p5-fix-responses F67），語意由 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 鎖住，待擁有者核可以 core 層案例替代"}
   - id: "#34"
     status: PASS
     tests: ["cargo:sw-core::command_exec::recover_key_refused_frozen_maps_flushed_by_recovery"]
@@ -166,7 +167,7 @@ rows:
   - id: "#69"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::ready_unconfirmed_response_has_session_field"]
-  - {id: "#71", status: OWNER-DECISION-PENDING, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
+  - {id: "#71", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
   - {id: "#72", status: INCOMPLETE, reason: "Rust sigterm_sigint_orderly_stop 已建立並登記 s21_core；windows_console_ctrl_triggers_orderly_stop（LOCAL-WINDOWS-TODO）與 Python test_sigterm_orderly_shutdown_posix 尚未建立"}
   - id: "#73"
     status: PASS

@@ -1,25 +1,43 @@
-# Slice 2.1 L1.5 情境與現行 P2 runner 的表達缺口（P5-T21）
+# Slice 2.1 L1.5 情境與 P2 runner 的表達缺口（P5-T21）
 
-本檔記錄 `func-test/scenarios/s21-*.yaml` 以現行 runner（未修改 `func-test/runner.py`）可表達與不可表達之處。
-T21 A/B 實跑尚未執行（缺 P2 bridge 資格報告 `selftest-report.json` 與 release artifact），以下缺口須在實跑前
-由 runner 擁有者（§10.4 測試資產）裁決是否補動作；不得以放寬斷言取得 PASS。
+本檔記錄 `func-test/scenarios/s21-*.yaml` 以 P2 runner 可表達與不可表達之處，以及第三輪（2026-10-28）L1.5 A/B 實跑結果。
+裁決前，仍有缺口的情境即使 runner PASS 也不得當成完整證據：gate 第 9 段在 `slice21_gate_expect.yaml` 仍列有
+`PA-OD-L15-*` 待裁決項時把 `l15_ab` 記為 EVIDENCE_MISSING（不計 PASS；審查 c0d221f #3）。不得以放寬斷言或近似情境取得 PASS。
 
-1. `s21-exclusive-conflict`／`-plain-open`：steps 在 `harness.start()` 之後才執行，無法在 daemon 啟動前 `external_open`；
-   現以「`device release` → `external_open` → `device attach`」近似，測不到初次自動 attach 路徑，
-   `last_error == ATTACH_FAILED:DeviceHeldError` 與「全段 serial_read 0 byte」無法斷言（只有 op 窗口 `assert_zero_tx`）。
-2. `DEVICE_STILL_HELD.pids` 含外部行程 pid：`expect` 不支援 list contains（`{ext.pid}` 展開為字串）；現只斷言
-   `error_code`、`holder_unknown:false`、`selector`。
-3. `s21-credentials-unresolved`：daemon 啟動到第一個 step 之間的 TX 不在零 TX 窗口內，僅由 `assert_compare`（wire＝WAL）涵蓋。
-4. `s21-partial-tx-abort`：BC-03 條件式映射（bytes>0 → `COMMAND_ABORTED_IN_FLIGHT`、=0 → `FLUSHED_BY_RECOVERY`）與
-   「該 cmd_id TX len 總和 < 16001」無法表達；release 若需等 writer 解除阻塞才回，依序步驟會卡到 CLI 逾時。
-5. `s21-reboot-minimal-guard`：`recovery_action == EXPECT_REBOOT` 或 `done` 的 OR、`dut_generation == 2` 無對應 assertion；
-   為觸發 Quiet，`logical_reboot` 加了與 `l15-reboot-min-guard` 相同的 U-Boot `pre_text`。
-6. `s21-event-latency`：缺 `stop_request`（每筆樣本會停 daemon，runner 無重啟動作；現量 release_request、command_cancel、
-   lease_expiry、drain_receipt）；DUT `flood` 無速率控制；loadavg 超標不會自動重跑；樣本數 500×3 輪預估數千秒，超過
-   測試 subprocess 900 s 逾時；計時欄位依賴 test-fakes，Python 基線可能回 INSUFFICIENT_EVIDENCE。
-7. 既有 P2 情境 `l15-wal-interference` 為 `compare: none`，不產 `comparison.json`，有證據時兩個 label 必失敗（現為明確的
-   INSUFFICIENT_EVIDENCE 訊息）；原檔依規定未改。
-8. `external_open` 只能排在 release 之後（daemon 持 TIOCEXCL 時 EBUSY 依 R0-F3 判 FAIL）。
+## 第三輪 A/B 實跑（Linux PTY／bridge，cloud）
+
+- 命令：`SERIALWRAP_GATE=1 SERIALWRAP_L15_SELFTEST_REPORT=<selftest-report.json> SERIALWRAP_L15_PY_DAEMON=tests/contract_blackbox/bin/py-serialwrapd
+  SERIALWRAP_L15_RUST_DAEMON=target/x86_64-unknown-linux-gnu/release/serialwrapd python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py -k <案例>`
+  （逐批執行；Rust release sha256 `2ea74890…c509`，見 `reviews/p5-t20-blackbox-report.md`）。
+- bridge 自測：`python3 -m uart_stdio_bridge selftest --endpoint posix-pty --transport-mode virtual_pty`，tool tree sha256
+  `9eaed6de…cd1c` 等於 `APPROVED_REVISION.json`，`evaluate_bridge_eligibility` → `('PASS', True)`。
+
+| 情境 | Python | Rust | 說明 |
+|---|---|---|---|
+| P2 凍結 11 個：`l15-half-prompt`、`-slow-reader-backpressure`、`-transport-disconnect`、`-multi-source-contention-cli`、`-stale-event-delay`、`-reject-zero-tx`、`-exclusive-open`、`-reboot-min-guard`、`-release-inflight` | PASS | PASS | — |
+| `l15-delayed-reply`（P2 凍結） | PASS | **FAIL** | 步驟 8 submit 回 `SESSION_NOT_READY`：PROMPT_TIMEOUT 後 Python 由 readiness reprobe（WAL：Ctrl-D 後 2.7 s `TX system \n`）回 READY，Rust 無 reprobe（08 計畫 P7-T5）。同 U-01，裁決項 `PA-OD-REPROBE` |
+| `l15-wal-interference`（P2 凍結） | INSUFFICIENT | INSUFFICIENT | runner 兩邊 PASS，但 `compare: none` 不產 `comparison.json`（#7）；`PA-OD-L15-WAL` |
+| `s21-credentials-unresolved`、`-exclusive-conflict`、`-exclusive-conflict-plain-open`、`-partial-tx-abort`、`-quiet-zero-tx`、`-release-attach-handoff`、`-wire-equals-wal` | PASS | PASS | 其中仍有斷言缺口者見下表 |
+| `s21-reboot-minimal-guard` | PASS（修正後） | **FAIL** | 原情境在 READY 後立即 submit，兩邊皆回 `AUTOBOOT_QUIET`（`ready_reconfirm_pending:true`、`retry_after_s:5`）。依 #162 改為先等 `ready_reconfirm_pending == false`（模擬基線行為，未放寬）：Python PASS；Rust 永不送再確認 probe（同屬 readiness tick），30 s 逾時。`PA-OD-REPROBE` |
+| `s21-wal-unlink-under-traffic` | FAIL | FAIL | `comparison.json` `HARNESS_STREAM_MISMATCH`（WAL 51 筆、wire 135 筆）：外部 unlink 把窗口前的 WAL 紀錄一併刪除，`until_op` 比對無 WAL 可比（#10） |
+| `s21-event-latency` | INSUFFICIENT | INSUFFICIENT | 步驟 1 即 `daemon status 無 test_fakes.event_latency.release_request 計時欄位`：兩個 daemon（含 Rust test-fakes build）皆未提供（#6） |
+
+## 缺口逐項處置
+
+| # | 缺口 | 處置 |
+|---|---|---|
+| 1 | `s21-exclusive-conflict*`：steps 在 `harness.start()` 之後才執行，無法在 daemon 啟動前 `external_open`；初次自動 attach 的 `ATTACH_FAILED:DeviceHeldError` 與「全段 serial_read 0 byte」無法斷言 | 待裁決（需 runner 新增「daemon 啟動前步驟」：harness 須拆成先建 DUT／bridge 端點、再啟 daemon；屬 P2 runner 介面變更） |
+| 2 | `DEVICE_STILL_HELD.pids` 含外部行程 pid 無法斷言 | **已補**：expect 新增 `{list_contains: v}`（list 元素字串相等；`func-test/tests/test_s21_actions.py::test_expect_list_contains_matches_expanded_scalar` 先紅後綠）；兩個 exclusive-conflict 情境三處 attach 斷言加 `pids: {list_contains: "{ext.pid}"}`，Python／Rust 皆 PASS |
+| 3 | `s21-credentials-unresolved`：daemon 啟動到第一個 step 之間的 TX 不在零 TX 窗口內 | 待裁決（同 #1 的「啟動前」能力；現僅由 `assert_compare`（wire＝WAL）涵蓋） |
+| 4 | `s21-partial-tx-abort`：BC-03 條件式映射與「該 cmd_id TX len 總和 < 16001」無法表達 | 待裁決（需條件式／聚合斷言動作） |
+| 5 | `s21-reboot-minimal-guard`：`recovery_action == EXPECT_REBOOT` 或 `done` 的 OR、`dut_generation == 2` | 待裁決（需 OR 斷言與 DUT generation 查詢動作）；另見上表 #162 修正 |
+| 6 | `s21-event-latency`：缺 `stop_request`、flood 無速率控制且量測時 flood 已結束（審查 c0d221f #1）、loadavg 超標不重跑、樣本數超過 900 s、兩個 daemon 皆無計時欄位、INSUFFICIENT_EVIDENCE 與 FAIL 共用 StepError（2af2554 #2） | 待裁決 `PA-OD-EVLAT`：需 daemon 端（Python 與 Rust）提供 `test_fakes.event_latency.<event>` 計時欄位、runner 補 `stop_request`／重啟與 flood 在途檢查（2af2554 #1），判定器讀 `resource_limits.yaml measurement_runs` |
+| 7 | P2 凍結 `l15-wal-interference` 為 `compare: none`，兩個 label 恆 INSUFFICIENT | 待裁決 `PA-OD-L15-WAL`（原檔依規定未改） |
+| 8 | `external_open` 只能排在 release 之後（daemon 持 TIOCEXCL 時 EBUSY 依 R0-F3 判 FAIL） | 同 #1 |
+| 9 | 「從未進入 ATTACHING／READY」只能以 `wait_cli_until` 單點取樣（審查 c0d221f #2） | 待裁決（需以 daemon 事件或 WAL META 判定窗口內狀態序列的動作）；兩個情境的註解已改為如實描述「單點取樣」 |
+| 10 | `s21-wal-unlink-under-traffic`：unlink 後 WAL 無窗口前紀錄可比 | 待裁決（需 runner 在 `wal_control unlink_current` 前保存 WAL 快照並讓比較器納入，或改情境比對範圍；比較器屬已核准 bridge 工具樹，不在本輪改） |
+
+裁決項：`PA-OD-L15-GAPS`（#1、#3～#5、#8～#10）、`PA-OD-EVLAT`（#6）、`PA-OD-L15-WAL`（#7）、`PA-OD-REPROBE`（readiness reprobe 依賴）。
 
 另：`tests/acceptance/l15/test_slice21_l15.py` 的 P2 凍結清單依 `cases.lock.json` `slice_2.1` 為 11 個（計畫程式草稿列 8 個，
 與凍結 lock 不符；repo 內 06 計畫第 4827、4842 行亦為 11 個），總項數 43。

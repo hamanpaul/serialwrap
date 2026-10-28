@@ -332,3 +332,16 @@ def test_wait_cli_until_timeout_raises_step_error(tmp_path, monkeypatch):
     assert "未知 action" not in text, f"動作尚未實作：{text}"
     assert "wait_cli_until" in text and "逾時" in text, f"逾時訊息不符：{text}"
     assert elapsed >= 0.4, f"未等待至 timeout_s 即回傳（{elapsed:.2f}s）"
+
+
+def test_expect_list_contains_matches_expanded_scalar():
+    """第三輪（gaps #2）：`{list_contains: v}` 在 list 中找與 v 字串相等的元素（`{ext.pid}` 展開為字串、pids 為 int）。"""
+    sys.path.insert(0, str(FUNC_TEST / "lib"))
+    from expect_engine import check_expect
+
+    resp = {"error_code": "DEVICE_STILL_HELD", "pids": [101, 4242]}
+    assert check_expect(resp, {"pids": {"list_contains": "4242"}}) == []
+    assert check_expect(resp, {"pids": {"list_contains": 4242}}) == []
+    assert len(check_expect(resp, {"pids": {"list_contains": "999"}})) == 1
+    assert len(check_expect({"pids": "4242"}, {"pids": {"list_contains": "4242"}})) == 1   # 非 list 不得視為命中
+    assert len(check_expect({}, {"pids": {"list_contains": "1"}})) == 1

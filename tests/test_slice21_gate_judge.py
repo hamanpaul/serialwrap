@@ -70,7 +70,10 @@ IDENTITY = {
     "platform": {"os": "linux", "kernel": "6.6.87.2-microsoft-standard-WSL2", "arch": "x86_64"},
     "device": None,
 }
-FREEZE_SYNTH = {"denominator": 3, "required_case_ids": ["c-1", "c-2", "c-3"]}
+FREEZE_SYNTH = {"denominator": 3, "required_case_ids": ["c-1", "c-2", "c-3"],
+                "window": {"start": "2026-10-21", "weeks": 3}, "stage2_started_at": "2026-10-21"}
+# 斷路器輸入（窗口內、未觸發）：case_uptake 依 slice_breaker.evaluate 判定（審查 b7cd852 #1）。
+BREAKER_OK = {"snapshots": [], "today": "2026-10-28", "stage2_estimate_weeks": 0.0}
 
 
 def _judge_mod():
@@ -151,6 +154,9 @@ class _Case:
         self.freeze = FREEZE_SYNTH
         self.case_verdicts: dict[str, str] = {}
         self.daemon_path: pathlib.Path | None = None
+        self.breaker: dict | None = dict(BREAKER_OK)
+        self.parity: dict | None = None
+        self.pending_decisions: list[dict] = []
         for name, (platform, _) in TEST_SECTIONS.items():
             self.l1[name] = self._default_l1(name, platform)
 
@@ -182,13 +188,21 @@ class _Case:
             sections.append(_section(name, l1_results=rel, required_set=required_set,
                                      allowed_missing_bo=allowed, counts=counts))
         for name in NON_TEST_SECTIONS:
-            sections.append(_section(name, exit_code=0))
+            sec = _section(name, exit_code=0)
+            sec["section_verdict"] = "PASS"   # 非測試類 section 須明確帶判定（審查 b7cd852 #3）
+            sections.append(sec)
         sections.extend(self.extra_sections)
-        return {"schema_version": 1, "run_id": "t", "slice": "2.1", "identity": self.identity, "sections": sections}
+        return {"schema_version": 1, "run_id": "t", "slice": "2.1", "identity": self.identity, "sections": sections,
+                "pending_decisions": list(self.pending_decisions)}
 
     def expect(self) -> dict:
-        return {"lock": _lock(), "base_dir": self.base, "freeze": self.freeze,
-                "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path}
+        out = {"lock": _lock(), "base_dir": self.base, "freeze": self.freeze,
+               "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path}
+        if self.breaker is not None:
+            out["breaker"] = self.breaker
+        if self.parity is not None:
+            out["parity"] = self.parity
+        return out
 
 
 def _sec(out: dict, name: str) -> dict:
@@ -350,3 +364,84 @@ def test_case_uptake_from_valid_pass_only(case):
     assert cu["rate"] == cu["valid_pass"] / freeze["denominator"]
     assert cu["denominator"] == freeze["denominator"]
     assert sorted(cu["pass_case_ids"]) == sorted(ids[:3])
+
+
+# --------------------------------------------------------------------------- 第三輪審查（d2d29a6_7af6567）
+
+def test_case_uptake_tripped_is_fail(case):
+    """b7cd852 #1：窗口結束且承接率累計增加 < 10 pp → 斷路器 tripped → case_uptake FAIL（不得固定 PASS）。"""
+    case.breaker = {"snapshots": [{"date": "2026-10-21", "rate": 0.0}, {"date": "2026-11-11", "rate": 0.05}],
+                    "today": "2026-11-20", "stage2_estimate_weeks": 0.0}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "FAIL"
+    assert out["verdict"] == "FAIL"
+
+
+def test_case_uptake_od02_resubmit_is_fail(case):
+    case.breaker = dict(BREAKER_OK, stage2_estimate_weeks=30.0)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "FAIL"
+
+
+def test_case_uptake_insufficient_evidence_is_missing(case):
+    case.breaker = {"snapshots": [], "today": "2026-11-20", "stage2_estimate_weeks": 0.0}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def test_case_uptake_without_breaker_inputs_is_missing(case):
+    case.breaker = None
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "case_uptake")["status"] == "EVIDENCE_MISSING"
+
+
+def test_case_uptake_rate_zero_reported_in_reasons(case):
+    """正向對照：窗口內未觸發 → PASS，且 rate 照實回報（不因 PASS 改寫）。"""
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "case_uptake")
+    assert sec["status"] == "PASS"
+    assert out["case_uptake"]["rate"] == 0.0
+    assert out["case_uptake"]["breaker"]["tripped"] is False
+
+
+def test_non_test_section_requires_explicit_verdict(case):
+    """b7cd852 #3：非測試類 section 只有 exit 0、缺 section_verdict → EVIDENCE_MISSING（不得預設放行）。"""
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "policy_check":
+            sec.pop("section_verdict")
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "policy_check")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+
+
+def _parity_cfg(rows: list[dict]) -> dict:
+    return {"status": {"rows": rows, "source_sha256": None}, "status_file": "x.yaml",
+            "source_rows": [{"id": r["id"], "take": "P5"} for r in rows], "source_sha256_actual": None}
+
+
+def test_owner_decision_pending_requires_registered_decision(case):
+    """4920d90 #1：OWNER-DECISION-PENDING 須帶存在於 pending_decisions 的 decision id，否則降為 INCOMPLETE。"""
+    case.parity = _parity_cfg([{"id": "#32", "status": "OWNER-DECISION-PENDING"}])
+    out = _judge_mod().judge(case.report(), case.expect())
+    row = out["parity_amendments"]["rows"][0]
+    assert row["status"] == "INCOMPLETE"
+    assert out["verdict"] == "INCOMPLETE"
+    case.parity = _parity_cfg([{"id": "#32", "status": "OWNER-DECISION-PENDING", "decision": "PA-OD-F67"}])
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["parity_amendments"]["rows"][0]["status"] == "INCOMPLETE"      # 未登記於 pending_decisions
+    case.pending_decisions = [{"id": "PA-OD-F67", "scenario": "x", "evidence": "y"}]
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["parity_amendments"]["rows"][0]["status"] == "OWNER-DECISION-PENDING"
+    assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_preflight_not_frozen_never_ready(case):
+    """§5.3：event_latency 未凍結（preflight.event_latency_frozen false）時，即使 `--evidence-run` 執行了全部 section
+    且皆 PASS，verdict 仍為 INCOMPLETE（不得 READY）。"""
+    rep = case.report()
+    rep["preflight"] = {"event_latency_frozen": False, "reasons": ["event_latency.freeze_status='pending_review_record'"]}
+    out = _judge_mod().judge(rep, case.expect())
+    assert out["verdict"] == "INCOMPLETE"
+    assert any("event_latency 未凍結" in r for r in out["verdict_reasons"])
