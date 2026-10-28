@@ -18,7 +18,7 @@ from __future__ import annotations
 from unittest import mock
 
 from sw_core.service import SerialwrapService
-from sw_core.version import resolve_version
+from sw_core.version import code_fingerprint, resolve_version
 
 
 def _make_service() -> SerialwrapService:
@@ -53,7 +53,10 @@ def test_rpc_wrapper_adds_version_to_non_health_methods() -> None:
     證明版本欄位由 rpc() wrapper 的 setdefault 統一補上，非逐一 handler 手動加。"""
     svc = _make_service()
     ping = svc.rpc("health.ping", {})
-    assert ping == {"ok": True, "pong": True, "version": resolve_version()}
+    assert ping == {
+        "ok": True, "pong": True, "version": resolve_version(),
+        "code_fingerprint": code_fingerprint(),
+    }
     patterns = svc.rpc("mcu.patterns", {})
     assert patterns.get("ok") is True
     assert patterns.get("version") == resolve_version()

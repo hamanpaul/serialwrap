@@ -156,6 +156,24 @@ setting; reboot continues through its existing recovery flow. See
 For local development, run `./install.sh`; it performs the same package install
 and `serialwrap setup` flow from the checkout.
 
+**Upgrading, and telling which build the daemon runs.** After
+`pipx install --force ...`, run `serialwrap setup` again. The version string
+(`0.3.2`) is the same for a release, a branch build and `main`, so
+`serialwrap --version` also prints a code fingerprint, e.g.
+`serialwrap 0.3.2 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap daemon status` reports the fingerprint of the code the running daemon
+loaded when it started (`code_fingerprint`) and where it loaded it from
+(`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
+every other command prints a one-line warning on stderr (stdout JSON is unchanged);
+`serialwrap doctor` reports it as the advisory check `daemon_code_current`.
+When the systemd service is active and the fingerprints differ, `serialwrap setup`
+restarts the service for you and prints a `daemon_code` field with the result.
+For systemd-system, `setup` only lists `sudo systemctl restart serialwrap` in
+`pending_sudo` unless `--with-sudo` is given; `--no-restart` skips the restart; a
+running flash never triggers it. On-demand mode never stops the daemon on its own:
+run `serialwrap daemon stop` then `serialwrap daemon start`. See
+[spec §8.7](docs/serialwrap-spec.md).
+
 For a human console, use the broker wrapper instead of raw minicom:
 
 ```bash
@@ -1597,6 +1615,7 @@ serialwrap doctor    # 驗證環境
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- **升級與確認 daemon 跑的是哪份程式碼**：`pipx install --force ...` 後再跑一次 `serialwrap setup`。版本字串（`0.3.2`）在 release、分支 build、`main` 之間完全相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`（已安裝的 `sw_core/**/*.py` 的雜湊）；`serialwrap daemon status` 的 `code_fingerprint` 是正在跑的 daemon 啟動時載入的那份、`code_path` 是它載入的位置。兩者不同＝daemon 還在跑升級前的舊碼：其他指令的 stderr 會多一行警告（stdout JSON 不變），`serialwrap doctor` 以 advisory 檢查 `daemon_code_current` 回報。systemd 服務 active 且指紋不同時，`serialwrap setup` 會自動 restart 服務並在輸出的 `daemon_code` 欄位說明結果；systemd-system 未帶 `--with-sudo` 時只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`；`--no-restart` 可略過；flash 進行中不會重啟；on-demand 模式不會自動停 daemon，請 `serialwrap daemon stop` 後 `serialwrap daemon start`。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
 ```bash
@@ -3027,6 +3046,7 @@ serialwrap doctor    # 驗證環境
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- **升級與確認 daemon 跑的是哪份程式碼**：`pipx install --force ...` 後再跑一次 `serialwrap setup`。版本字串（`0.3.2`）在 release、分支 build、`main` 之間完全相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`（已安裝的 `sw_core/**/*.py` 的雜湊）；`serialwrap daemon status` 的 `code_fingerprint` 是正在跑的 daemon 啟動時載入的那份、`code_path` 是它載入的位置。兩者不同＝daemon 還在跑升級前的舊碼：其他指令的 stderr 會多一行警告（stdout JSON 不變），`serialwrap doctor` 以 advisory 檢查 `daemon_code_current` 回報。systemd 服務 active 且指紋不同時，`serialwrap setup` 會自動 restart 服務並在輸出的 `daemon_code` 欄位說明結果；systemd-system 未帶 `--with-sudo` 時只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`；`--no-restart` 可略過；flash 進行中不會重啟；on-demand 模式不會自動停 daemon，請 `serialwrap daemon stop` 後 `serialwrap daemon start`。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
 依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
@@ -3043,7 +3063,7 @@ serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
 options:
   -h, --help           show this help message and exit
-  --version            顯示版本後離開
+  --version            顯示版本與程式碼指紋後離開
   -v, --verbose        提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
