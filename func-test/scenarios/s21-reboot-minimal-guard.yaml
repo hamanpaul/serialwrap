@@ -71,6 +71,13 @@ steps:
     from: rb
     timeout_s: 30
     payload: "reboot\n"
+  # #162：reboot 後回 READY 仍帶 ready_reconfirm_pending，agent 命令回 AUTOBOOT_QUIET（retry_after_s）直到再確認 probe
+  # 成功；Python 由 readiness tick 送確認 probe（第三輪實測：未等待時 Python 與 Rust 皆回 AUTOBOOT_QUIET）。
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.ready_reconfirm_pending"
+    equals: false
+    timeout_s: 30
   - action: cli
     argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo AFTER"]
     save_as: after

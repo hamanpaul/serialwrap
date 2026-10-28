@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Slice 2.1 出口 gate（P5-T22；計畫 docs/rust-refactor/plans/06-slice21-daemon-core.md Task 22 Step 3）。
 #
-# 用法：scripts/rust/slice21_gate.sh [--dry-run] [--with-com-pair] [--run-id ID] [--out DIR]
+# 用法：scripts/rust/slice21_gate.sh [--dry-run] [--evidence-run] [--with-com-pair] [--run-id ID] [--out DIR]
 #   產出 <DIR>/<ID>/report.json（預設 DIR=target/slice21-gate），schema 見 tests/acceptance/slice21_gate_report.schema.json。
 #
 # 原則：
@@ -10,12 +10,15 @@
 # - --dry-run 只產生報告骨架與 BLOCKED-OWNER 清單，各 section EVIDENCE_MISSING，verdict 永遠 INCOMPLETE。
 # - 需 Windows 原生、com0com、bench 或擁有者的證據一律 EVIDENCE_MISSING／BLOCKED-OWNER，不得標 PASS。
 # - §5.3 開工前凍結檢查：event_latency 未凍結時拒絕開跑（INSUFFICIENT_EVIDENCE，exit 3），不得以 skip 或 PASS 代替。
+#   --evidence-run：凍結檢查未通過時仍執行各 section 以取得證據（第三輪新增）；preflight 照實寫入報告，judge 依
+#   `event_latency_frozen: false` 一律判 INCOMPLETE（永不 READY），結束碼同 INCOMPLETE（3）。
 # 結束碼：--dry-run 一律 0；否則 READY_FOR_OWNER_EVIDENCE→0、FAIL→1、INCOMPLETE→3、參數或工具錯誤→2。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 JUDGE="$ROOT/scripts/rust/slice21_gate_judge.py"
 DRY_RUN=0
+EVIDENCE_RUN=0
 WITH_COM_PAIR=0
 RUN_ID=""
 OUT_DIR="$ROOT/target/slice21-gate"
@@ -23,6 +26,7 @@ OUT_DIR="$ROOT/target/slice21-gate"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
+    --evidence-run) EVIDENCE_RUN=1; shift ;;
     --with-com-pair) WITH_COM_PAIR=1; shift ;;
     --run-id)
       [[ $# -ge 2 ]] || { echo "slice21_gate.sh: --run-id 缺少值" >&2; exit 2; }
@@ -30,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     --out)
       [[ $# -ge 2 ]] || { echo "slice21_gate.sh: --out 缺少值" >&2; exit 2; }
       OUT_DIR="$2"; shift 2 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "slice21_gate.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
 done
@@ -131,7 +135,7 @@ exit_for_verdict() {
 
 com_reason="未提供 SW_TEST_COM_PAIR／--with-com-pair（BO-S21-01：擁有者 host COM20:COM21）"
 
-if [[ "$DRY_RUN" == "1" || "$PREFLIGHT_OK" != "1" ]]; then
+if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) ]]; then
   why="dry-run：未執行"
   [[ "$DRY_RUN" == "1" ]] || why="§5.3 開工前凍結檢查未通過：拒絕開跑（INSUFFICIENT_EVIDENCE）"
   record cfg_boundary --reason "$why"
@@ -255,8 +259,13 @@ if [[ "$l15_qualified" != "1" ]]; then
 elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
   run_logged l15_ab env SERIALWRAP_GATE=1 SERIALWRAP_L15_PY_DAEMON="$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
     SERIALWRAP_L15_RUST_DAEMON="$RUST_D" python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py
-  record l15_ab --command "SERIALWRAP_GATE=1 pytest -q tests/acceptance/l15/test_slice21_l15.py" --exit "$LAST_RC" \
-    --log logs/l15_ab.log --section-verdict "$([[ $LAST_RC == 0 ]] && echo PASS || echo FAIL)"
+  # pytest 全綠但仍有 L1.5 待裁決缺口（情境斷言不完整，PA-OD-L15-*）時不計 PASS（審查 c0d221f #3）。
+  l15_rc="$LAST_RC"
+  l15_gaps="$(python3 -c 'import sys, yaml; d=yaml.safe_load(open(sys.argv[1])); print(",".join(x["id"] for x in d.get("pending_decisions") or [] if str(x.get("id","")).startswith("PA-OD-L15")))' \
+    tests/acceptance/slice21_gate_expect.yaml 2>/dev/null || echo "PA-OD-L15-?")"
+  if [[ "$l15_rc" != 0 ]]; then l15_verdict=FAIL; elif [[ -n "$l15_gaps" ]]; then l15_verdict=EVIDENCE_MISSING; else l15_verdict=PASS; fi
+  record l15_ab --command "SERIALWRAP_GATE=1 pytest -q tests/acceptance/l15/test_slice21_l15.py" --exit "$l15_rc" \
+    --log logs/l15_ab.log --section-verdict "$l15_verdict" ${l15_gaps:+--reason "L1.5 待裁決缺口未結：$l15_gaps（slice21-l15-gaps.md）"}
 else
   record l15_ab --reason "tests/acceptance/l15/test_slice21_l15.py 不存在（P5-T21 未完成）"
 fi

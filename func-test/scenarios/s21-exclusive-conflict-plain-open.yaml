@@ -54,12 +54,14 @@ steps:
   - action: cli
     argv: ["device", "attach", "--selector", "COM0"]
     save_as: att_plain
-    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0}
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
+             pids: {list_contains: "{ext.pid}"}}
   - action: cli
     argv: ["device", "attach", "--selector", "COM0", "--force"]
     save_as: att_plain_force
-    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0}
-  # external_close 前 session 不得進 ATTACHING／READY
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
+             pids: {list_contains: "{ext.pid}"}}
+  # 單點取樣：此刻 session 不在 ATTACHING／READY（「external_close 前從未進入」runner 無法表達，見 slice21-l15-gaps.md #9）
   - action: wait_cli_until
     argv: ["session", "list"]
     json_path: "sessions.com=COM0.state"

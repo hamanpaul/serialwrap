@@ -54,8 +54,9 @@ steps:
   - action: cli
     argv: ["device", "attach", "--selector", "COM0"]
     save_as: att_held
-    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0}
-  # session 不得進 READY（attach 被拒後仍停在非 READY 狀態）
+    expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
+             pids: {list_contains: "{ext.pid}"}}
+  # 單點取樣：attach 被拒後此刻不在 READY（「從未進入 READY」runner 無法表達，見 slice21-l15-gaps.md #9）
   - action: wait_cli_until
     argv: ["session", "list"]
     json_path: "sessions.com=COM0.state"

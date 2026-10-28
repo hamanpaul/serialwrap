@@ -435,3 +435,13 @@ def test_owner_decision_pending_requires_registered_decision(case):
     out = _judge_mod().judge(case.report(), case.expect())
     assert out["parity_amendments"]["rows"][0]["status"] == "OWNER-DECISION-PENDING"
     assert out["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+
+
+def test_preflight_not_frozen_never_ready(case):
+    """§5.3：event_latency 未凍結（preflight.event_latency_frozen false）時，即使 `--evidence-run` 執行了全部 section
+    且皆 PASS，verdict 仍為 INCOMPLETE（不得 READY）。"""
+    rep = case.report()
+    rep["preflight"] = {"event_latency_frozen": False, "reasons": ["event_latency.freeze_status='pending_review_record'"]}
+    out = _judge_mod().judge(rep, case.expect())
+    assert out["verdict"] == "INCOMPLETE"
+    assert any("event_latency 未凍結" in r for r in out["verdict_reasons"])

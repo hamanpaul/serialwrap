@@ -193,7 +193,8 @@
 | 實跑對照（本 session，P5 tip 7af6567 debug artifact） | 兩邊 WAL 至救援段**逐 byte 相同**：`bad-hang\n` → 5 s 後 `system:recover` `\x03` → 2 s 後 `\x04` → 轉 `ATTACHED`／`PROMPT_TIMEOUT`。差異只在其後：Python 於轉 ATTACHED 後約 0.7 s 由 `system` 送 `\n`（readiness reprobe），DUT 回 `$ ` 後送 `echo __READY__<nonce>\n` 升 READY；Rust 之後零 TX |
 | 根因 | Python 的回 READY 路徑是 `SessionManager.reconcile_readiness()`（DeviceWatcher 週期 tick → `_prepare_reprobe_locked` 對 `ATTACHED`＋`PROMPT_TIMEOUT` 排 probe → `_spawn_reprobe_probe`），**不是**命令執行／recover 路徑。readiness reprobe 依 `docs/rust-refactor/plans/08-slice23-login-events.md` 屬 **Slice 2.3 P7-T5**（新檔 `crates/sw-core/src/reprobe.rs`）；P5 的 `session_manager.rs` 已註明「Slice 2.1 無 readiness 自動重探（Phase 08）」。P5 擁有的救援段已由 `command_exec::both_keys_fail_prompt_timeout_to_attached` 鎖住且與 Python 一致 |
 | 佐證 | 拋棄式 worktree 建 `origin/feature/rust-refactor-p7`（a0cad06，含 bc82b94 `reprobe.rs`）以同一 runner 執行：步驟 4 `wait_ready` 轉綠、步驟 5～7 通過，止於步驟 8 `session.console_attach` → `METHOD_NOT_FOUND`（console 屬 P6，P7 未疊在 P6 上）。P6＋P7 試合併衝突 16 檔，未在本 session 解 |
-| 處理 | **BLOCKED-OWNER**（未在 P5 修）：在 P5 重做 `reprobe.rs` 會與 P7 已交付的同名新檔重複並在 P7 併回時衝突，且越出 06 計畫範圍；為此在 P5 加一支恆紅的回歸測試則違反「不得引入新的失敗」。需擁有者裁決其一：(a) 將 `cowork-01-agent-bad-cmd` 自 Slice 2.2 func-test gate 移至 Slice 2.3（依賴 08 Task 5）；(b) 核准把 P7-T5 `reprobe.rs` 及其 tick 接線 backport 到 P5／P6。Slice 2.2 gate 在裁決前此案必紅（P6 的 7/8 為此） |
+| 影響範圍（T21 實跑補充） | 同一缺口也使 **Slice 2.1 的 P2 凍結 L1.5 情境 `l15-delayed-reply`**（PROMPT_TIMEOUT 後下一筆命令 `SESSION_NOT_READY`）與 `s21-reboot-minimal-guard`（#162 `ready_reconfirm_pending` 永不解除，agent 命令持續 `AUTOBOOT_QUIET`）在 Rust 失敗、Python PASS；故不只是 2.2 gate 問題，Slice 2.1 出口亦受阻 |
+| 處理 | **BLOCKED-OWNER**（未在 P5 修；裁決項 `PA-OD-REPROBE`）：在 P5 重做 `reprobe.rs` 會與 P7 已交付的同名新檔重複並在 P7 併回時衝突，且越出 06 計畫範圍；為此在 P5 加一支恆紅的回歸測試則違反「不得引入新的失敗」。需擁有者裁決其一：(a) 將 `cowork-01-agent-bad-cmd` 自 Slice 2.2 func-test gate 移至 Slice 2.3（依賴 08 Task 5）；(b) 核准把 P7-T5 `reprobe.rs` 及其 tick 接線 backport 到 P5／P6。Slice 2.2 gate 在裁決前此案必紅（P6 的 7/8 為此） |
 
 ### F91／F111：sw-daemon 間歇失敗
 
@@ -213,10 +214,10 @@
 | F123 | Low | b7cd852 #5 | event_latency 判定器未實作且未追蹤 | `pending_decisions` 新增 `PA-OD-EVLAT`（同時涵蓋 c0d221f #1 的 Rust 計時欄位缺口） |
 | F124 | Medium | 4920d90 #1 | `#32` 改 OWNER-DECISION-PENDING 但無對應裁決項；judge 無條件接受 | fixed（本組 commit）：`pending_decisions` 新增 `PA-OD-F67`，`#32` 列加 `decision: PA-OD-F67`；judge 要求 `decision` 存在於報告 `pending_decisions`，否則 INCOMPLETE（`test_owner_decision_pending_requires_registered_decision`，紅燈先行）；狀態檔檔頭規則補一行 |
 | F125 | Low | 4920d90 #2 | 狀態檔檔頭「P5-T19～T21 未完成」與內容矛盾 | fixed（本組 commit） |
-| F126 | Medium | c0d221f #1 | s21-event-latency flood 輪實為 idle 量測；Rust 無 `test_fakes.event_latency` 欄位 | 見 T21（runner 缺口逐項處理段）；裁決項 `PA-OD-EVLAT` |
-| F127 | Medium | c0d221f #2 | 「從未進 ATTACHING／READY」以單點取樣表達 | 見 T21 |
-| F128 | Medium | c0d221f #3 | gaps #1～#6 未連結 gate，情境仍 `expected: PASS` | 見 T21；裁決項 `PA-OD-L15-GAPS` |
-| F129 | Low | 2af2554 #1／#2 | `load: flood` 不驗 flood 在途；INSUFFICIENT_EVIDENCE 與 FAIL 共用 StepError | 見 T21 |
+| F126 | Medium | c0d221f #1 | s21-event-latency flood 輪實為 idle 量測；Rust 無 `test_fakes.event_latency` 欄位 | 實跑證實（第三輪）：Python 與 Rust 兩個 label 皆在步驟 1 以 INSUFFICIENT_EVIDENCE 結束（兩邊 daemon 都沒有計時欄位，非只有 Rust）；flood 窗口、`stop_request`、計時欄位皆列 `slice21-l15-gaps.md` #6，裁決項 `PA-OD-EVLAT`。未以近似量測冒充 |
+| F127 | Medium | c0d221f #2 | 「從未進 ATTACHING／READY」以單點取樣表達 | fixed（註解如實改為「單點取樣」並登記 gaps #9 待裁決，`PA-OD-L15-GAPS`）；不另造近似斷言 |
+| F128 | Medium | c0d221f #3 | gaps #1～#6 未連結 gate，情境仍 `expected: PASS` | fixed：gate 第 9 段在 `PA-OD-L15-*` 待裁決項仍存在時，L1.5 pytest 即使全綠也把 `l15_ab` 記為 EVIDENCE_MISSING（不計 PASS）；gaps #2 以 runner `list_contains` 補齊（兩 label PASS），其餘逐項列裁決 |
+| F129 | Low | 2af2554 #1／#2 | `load: flood` 不驗 flood 在途；INSUFFICIENT_EVIDENCE 與 FAIL 共用 StepError | deferred：併入 gaps #6（`PA-OD-EVLAT`），計時欄位缺失前 runner 量不到任何樣本，flood 檢查無從驗證 |
 | F130 | Low | b069633 #1 | F98 (a)(b)(c) 無回歸 | deferred：測試強化（(b) 需在途 op 與 Reattach 同時、(c) 需 actor 已結束的 owner；無已知外部行為差異），排入下一輪 |
 | F131 | Low | 7536870 #1 | `pending_open_stop` 的 Phase 1 快照無測試；Clear／Bind 於開埠窗口 Python 走 `_detach_session_locked`（ATTACHING／null） | deferred：需 test-fakes 暫停 open 的黑箱 A/B 取得 Python 實際行為後裁決（可能為 BC）；未取得實測前不改產品 |
 | F132 | Low | 68fd9bf #1～#3 | 校準報告時區、P2 凍結情境數、「flake」措辭 | fixed（T22 組 commit，校準報告更新） |
@@ -227,3 +228,10 @@
 ### 本輪全套 pytest 新增失敗的取證
 
 - `tests/contract_blackbox/test_cli_mgmt_doctor.py::test_doctor_ab_shared_checks`：本組 G2 全套與同範圍（`tests/contract_blackbox --ignore slice21`）重跑皆失敗（3/3），與起點基準不同；把本組變更 `git stash` 後以 9b81d9a 重建仍失敗，非本組造成。根因：前一個檔 `test_cli_mgmt_daemon.py::test_daemon_restart_ab` 收尾只送 `daemon stop` 未等重啟後的 Python `serialwrapd.py`（ppid 1）離開，doctor 測試開始時 `/proc` 仍有該行程（以 pytest 插件在 setup 時列出：`pid=… cmd=… test_daemon_restart_ab0 …`），Python doctor 與 Rust CLI 兩次掃描間該行程結束 → `single_daemon` 1≠0。修正（測試收尾，未放寬斷言）：收尾等重啟後 pid 自 `/proc` 消失（上限 15 s）；同範圍重跑 1/1、兩檔合跑 2/2 通過，失敗集合回到起點基準。
+
+### T21 L1.5 A/B（第三輪）
+
+實跑與逐案結果見 `docs/rust-refactor/slice21-l15-gaps.md`「第三輪 A/B 實跑」：21 個情境中 Python 18 PASS／3 非 PASS（`l15-wal-interference`、`s21-wal-unlink-under-traffic`、`s21-event-latency`）、
+Rust 16 PASS／5 非 PASS；Rust 獨有的 2 項（`l15-delayed-reply`、`s21-reboot-minimal-guard`）皆為 readiness reprobe 缺口（`PA-OD-REPROBE`），其餘兩邊相同。
+情境修正：`s21-reboot-minimal-guard` 依 #162 等待再確認後才送 AFTER（兩邊未修正前皆 `AUTOBOOT_QUIET`）；exclusive-conflict 兩情境加 `pids` 斷言。
+gate：新增 `--evidence-run`（凍結檢查未過仍執行各 section，judge 仍判 INCOMPLETE；`test_preflight_not_frozen_never_ready`）。
