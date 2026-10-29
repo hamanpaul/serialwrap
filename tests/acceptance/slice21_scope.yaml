@@ -36,7 +36,7 @@ session_public_deferred_fields:
   - {field: console_endpoint, platform: windows, value_in_2_1: null, slice: "2.2"}
 cross_slice_cases:
   - {suite: tests/test_human_agent_coexist.py, items: [t1, t5, t6, t7, t8], slice: "2.2"}
-  - {suite: func-test, items: [co-01-line-buffering, ha-01-human-then-agent, hk-01-special-keys-raw, hk-02-agent-preempt-human, hk-03-deferred-input-flush, hk-04-minicom-exit-cleanup, rc-01-interactive-mode-switch], slice: "2.2"}
+  - {suite: func-test, items: [co-01-line-buffering, ha-01-human-then-agent, hk-01-special-keys-raw, hk-02-agent-preempt-human, hk-03-deferred-input-flush, hk-04-minicom-exit-cleanup, rc-01-interactive-mode-switch, co-02-line-backspace], slice: "2.2"}
   - {suite: func-test, items: [brcm-01-login-flow, ev-01-spawn-handler, cowork-01-agent-bad-cmd], slice: "2.3"}   # cowork-01：OD-34（2026-10-28）自 2.2 逐名移出
   - {suite: regression, items: [F5, F6, F8], slice: "2.2"}
   - {suite: regression, items: [F9, F10, F11], slice: "2.3"}
