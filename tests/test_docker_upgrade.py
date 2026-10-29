@@ -12,12 +12,17 @@ host runner `scripts/docker/run-upgrade.sh` 以 `--dry-run` 檢查不碰 docker 
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -87,6 +92,304 @@ def test_scan_tolerates_vanished_process(tmp_path):
     (tmp_path / "31").mkdir()  # 行程在掃描中途結束：cmdline／stat 已不存在
     (tmp_path / "self").mkdir()
     assert uc.scan_daemon_instances(tmp_path) == [30]
+
+
+# ---------- 停止後等待舊 daemon 行程樹與 socket 消失（Docker on-demand 預熱競態裁決） ----------
+
+def _proc_full(root: Path, pid: int, argv: list[str], *, ppid: int = 1, start: int = 1000, state: str = "S") -> None:
+    """含啟動時間（第 22 欄）的假 /proc/<pid>：供 PID 重用與 zombie 判定。"""
+    d = root / str(pid)
+    d.mkdir(parents=True)
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + (b"\0" if argv else b""))
+    rest = [state, str(ppid)] + ["0"] * 17 + [str(start), "0", "0"]
+    (d / "stat").write_text(f"{pid} (x y) {' '.join(rest)}\n", encoding="utf-8")
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_daemon_process_tree_includes_launcher_child_and_descendants(tmp_path):
+    _proc_full(tmp_path, 40, ["/v/0.4.0/bin/serialwrapd"], start=400)
+    _proc_full(tmp_path, 41, ["/v/py/bin/python3", "-I", "-B", "/v/py/serialwrapd.py"], ppid=40, start=410)
+    _proc_full(tmp_path, 42, ["sh", "-c", "sleep 1"], ppid=41, start=420)
+    _proc_full(tmp_path, 43, ["bash"], start=430)
+    assert uc.daemon_process_tree(tmp_path) == {40: "400", 41: "410", 42: "420"}
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_wait_daemon_gone_waits_for_delayed_exit_of_tree_and_socket(tmp_path):
+    """0.3.2 的 daemon.stop 先回應、先刪 socket，行程稍後才結束：須等整棵行程樹與 socket 都消失才算 gone。"""
+    proc = tmp_path / "proc"
+    _proc_full(proc, 40, ["/pipx/bin/python", "/h/.local/bin/serialwrapd"], start=400)
+    _proc_full(proc, 41, ["sh", "-c", "x"], ppid=40, start=410)
+    sock = tmp_path / "serialwrapd.sock"
+    sock.write_text("", encoding="utf-8")
+    before = uc.daemon_process_tree(proc)
+    early = uc.wait_daemon_gone(before, [str(sock)], timeout=0.2, proc_root=proc)
+    assert early["gone"] is False and early["alive"] == [40, 41] and early["sockets_left"] == [str(sock)], early
+    assert early["timeout_s"] == 0.2
+
+    def _exit() -> None:
+        sock.unlink()
+        shutil.rmtree(proc / "40")
+        time.sleep(0.3)
+        shutil.rmtree(proc / "41")
+
+    timer = threading.Timer(0.2, _exit)
+    timer.start()
+    try:
+        r = uc.wait_daemon_gone(before, [str(sock)], timeout=10.0, interval=0.02, proc_root=proc)
+    finally:
+        timer.join()
+    assert r["gone"] is True, r
+    assert not (proc / "41").exists() and not sock.exists()
+    assert r["waited_ms"] >= 400 and r["pids"] == [40, 41] and r["sockets"] == [str(sock)]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_wait_daemon_gone_is_bounded_and_reports_leftovers(tmp_path):
+    proc = tmp_path / "proc"
+    _proc_full(proc, 50, ["/h/.local/bin/serialwrapd"], start=500)
+    t0 = time.monotonic()
+    r = uc.wait_daemon_gone(uc.daemon_process_tree(proc), [], timeout=0.3, interval=0.05, proc_root=proc)
+    assert time.monotonic() - t0 < 2.0
+    assert r["gone"] is False and r["alive"] == [50] and r["instances"] == [50], r
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_wait_daemon_gone_pid_reuse_zombie_new_instance_and_socket(tmp_path):
+    proc = tmp_path / "proc"
+    # PID 重用（啟動時間不同、已非 daemon）與 zombie（已釋放所有資源）都算已結束
+    _proc_full(proc, 60, ["bash"], start=999)
+    _proc_full(proc, 61, [], start=610, state="Z")
+    assert uc.wait_daemon_gone({60: "600", 61: "610"}, [], timeout=0.2, proc_root=proc)["gone"] is True
+    # 停止期間冒出不在快照內的 daemon 實例：不算 gone
+    _proc_full(proc, 62, ["/h/.local/bin/serialwrapd"], start=620)
+    r = uc.wait_daemon_gone({60: "600"}, [], timeout=0.2, proc_root=proc)
+    assert r["gone"] is False and r["instances"] == [62], r
+    shutil.rmtree(proc / "62")
+    # 行程都結束但 socket 檔仍在：不算 gone
+    left = tmp_path / "left.sock"
+    left.write_text("", encoding="utf-8")
+    r = uc.wait_daemon_gone({}, [str(left)], timeout=0.2, proc_root=proc)
+    assert r["gone"] is False and r["sockets_left"] == [str(left)], r
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_daemon_socket_paths_from_argv_and_config(tmp_path):
+    _proc_full(tmp_path, 70, ["python3", "-m", "sw_core.daemon", "--socket", "/run/a.sock"])
+    _proc_full(tmp_path, 71, ["/v/bin/serialwrapd", "--socket=/run/b.sock"])
+    _proc_full(tmp_path, 72, ["/h/.local/bin/serialwrapd"])
+    config = "supervision_mode: on-demand\nsocket_path: '/run/user/1000/serialwrap/serialwrapd.sock'\n"
+    got = uc.daemon_socket_paths([70, 71, 72], config, proc_root=tmp_path)
+    assert got == ["/run/a.sock", "/run/b.sock", "/run/user/1000/serialwrap/serialwrapd.sock"]
+    assert uc.daemon_socket_paths([], "socket_path: tcp://127.0.0.1:48700\n", proc_root=tmp_path) == []
+
+
+def _load_driver():
+    spec = importlib.util.spec_from_file_location("run_upgrade_container_under_test", UPGRADE_CONTAINER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeContainer:
+    """容器內 0.3.2／0.4.0 行為的記憶體替身：假 /proc 與 socket；`daemon stop` 先刪 socket 並回應，舊行程延遲
+    `exit_delay` 秒才結束（None＝永不結束）。行程未結束前 `daemon start` 回 DAEMON_ALREADY_RUNNING_ELSEWHERE、
+    setup／install.sh 回 DEVICE_STILL_HELD，與本機實測的 on-demand 預熱競態相同。"""
+
+    def __init__(self, tmp: Path, drv: Any, *, cli_version: str, exit_delay: float | None) -> None:
+        self.drv = drv
+        self.proc = tmp / "proc"
+        self.proc.mkdir()
+        self.sock = tmp / "run" / "serialwrapd.sock"
+        self.sock.parent.mkdir()
+        self.config = tmp / "config"
+        (self.config / "profiles").mkdir(parents=True)
+        (self.config / "config.yaml").write_text(f"supervision_mode: on-demand\nsocket_path: {self.sock}\n",
+                                                 encoding="utf-8")
+        self.cli = cli_version
+        self.exit_delay = exit_delay
+        self.next_pid = 4242
+        self.daemons: dict[int, str] = {}
+        self.stopping: set[int] = set()
+        self.calls: list[tuple[str, bool]] = []
+        self.timers: list[threading.Timer] = []
+        self._spawn(cli_version)
+
+    def _spawn(self, version: str) -> int:
+        pid, self.next_pid = self.next_pid, self.next_pid + 1
+        _proc_full(self.proc, pid, ["/opt/u/.local/bin/serialwrapd"], start=pid * 10)
+        self.sock.write_text("", encoding="utf-8")
+        self.daemons[pid] = version
+        return pid
+
+    def old_alive(self) -> bool:
+        return any((self.proc / str(pid)).exists() for pid in self.daemons)
+
+    def _exit(self, pid: int) -> None:
+        shutil.rmtree(self.proc / str(pid), ignore_errors=True)
+        self.daemons.pop(pid, None)
+        self.stopping.discard(pid)
+
+    @staticmethod
+    def _done(argv: list[str], rc: int, out: Any = "", err: str = "") -> subprocess.CompletedProcess[str]:
+        text = out if isinstance(out, str) else json.dumps(out)
+        return subprocess.CompletedProcess(argv, rc, text + "\n", err)
+
+    def _guarded(self, what: str, argv: list[str], ok: Any) -> subprocess.CompletedProcess[str]:
+        alive = self.old_alive()
+        self.calls.append((what, alive))
+        if alive:
+            return self._done(argv, 1, {"ok": False, "error_code": "DEVICE_STILL_HELD"})
+        return self._done(argv, 0, ok)
+
+    def sw(self, *args: str, label: str = "", timeout: float = 300.0) -> subprocess.CompletedProcess[str]:
+        argv = ["serialwrap", *args]
+        if args[:2] == ("daemon", "stop"):
+            self.sock.unlink(missing_ok=True)
+            for pid in list(self.daemons):
+                self.stopping.add(pid)
+                if self.exit_delay is not None:
+                    timer = threading.Timer(self.exit_delay, self._exit, args=(pid,))
+                    timer.start()
+                    self.timers.append(timer)
+            return self._done(argv, 0, {"ok": True, "stopping": True})
+        if args[:2] == ("daemon", "start"):
+            alive = self.old_alive()
+            self.calls.append(("daemon start", alive))
+            if alive:
+                return self._done(argv, 2, {"ok": False, "error_code": "DAEMON_ALREADY_RUNNING_ELSEWHERE"})
+            return self._done(argv, 0, {"ok": True, "pid": self._spawn(self.cli)})
+        if args[:2] == ("daemon", "status"):
+            live = [pid for pid in self.daemons if pid not in self.stopping]
+            if not live:
+                return self._done(argv, 1, {"ok": False, "error_code": "DAEMON_NOT_RUNNING"})
+            return self._done(argv, 0, {"ok": True, "running": True, "pid": live[0], "version": self.daemons[live[0]],
+                                        "multi_open": False})
+        if args == ("--version",):
+            return self._done(argv, 0, f"serialwrap {self.cli}")
+        if args[:1] == ("setup",):
+            return self._guarded("setup " + " ".join(args[1:]), argv, {"ok": True})
+        if args[:2] == ("alias", "list"):
+            return self._done(argv, 0, {"ok": True, "aliases": [
+                {"alias": "upgbench", "session_id": "shellboard:COM7"},
+                {"alias": "pinned", "device_by_id": "/dev/serial/by-id/usb-UPGRADE_PIN-if00-port0",
+                 "profile": "shellboard"}]})
+        if args[:2] == ("session", "list"):
+            return self._done(argv, 0, {"ok": True, "sessions": [
+                {"session_id": "shellboard:COM7", "device_by_id": "/dev/serial/by-id/usb-UPGRADE_REBOUND-if00-port0"}]})
+        if args == ("doctor",):
+            return self._done(argv, 0, {"ok": True, "checks": []})
+        return self._done(argv, 0, {"ok": True})
+
+    def run(self, argv: list[str], *, timeout: float = 300.0, label: str = "") -> subprocess.CompletedProcess[str]:
+        if argv[:1] == ["timeout"]:  # 0.3.2 start_daemon 的前景診斷：舊行程在時回 ELSEWHERE（不含 serialwrapd.py）
+            return self._done(argv, 2, "", "DAEMON_ALREADY_RUNNING_ELSEWHERE")
+        if argv[:1] == ["pipx"]:
+            if argv[1:2] == ["install"]:
+                self.cli = "0.3.2"
+            return self._done(argv, 0)
+        if argv and argv[0].endswith("/bin/serialwrap") and argv[1:2] == ["setup"]:
+            self.cli = "0.4.0" if not self.old_alive() else self.cli
+            return self._guarded("0.4.0 setup", argv, {"ok": True, "install": {
+                "op": "install", "from_version": "0.3.2", "to_version": "0.4.0", "steps": []}})
+        if argv[:1] == ["bash"]:
+            self.cli = "0.4.0" if not self.old_alive() else self.cli
+            return self._guarded("install.sh", argv, "可執行 `pipx uninstall serialwrap` 移除舊版\n" + json.dumps(
+                {"ok": True, "install": {"op": "install", "to_version": "0.4.0", "steps": []}}))
+        return self._done(argv, 0)
+
+    def close(self) -> None:
+        for timer in self.timers:
+            timer.cancel()
+
+
+@pytest.fixture
+def fake_driver(tmp_path, monkeypatch):
+    """回傳 make(mode, cli_version, exit_delay, stop_wait_s) → (driver, fake)；driver 的 run／sw 全導向替身。"""
+    drv = _load_driver()
+    made: list[_FakeContainer] = []
+
+    def make(*, cli_version: str, exit_delay: float | None = 0.4, stop_wait_s: float = 10.0):
+        fake = _FakeContainer(tmp_path, drv, cli_version=cli_version, exit_delay=exit_delay)
+        made.append(fake)
+        monkeypatch.setattr(drv, "CONFIG", fake.config)
+        monkeypatch.setattr(drv, "BIN", tmp_path / "bin")
+        # phase_seed 以 subprocess.run 執行 chown：只替換 driver 模組看到的 subprocess，不動全域
+        monkeypatch.setattr(drv, "subprocess", types.SimpleNamespace(
+            run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""), CompletedProcess=subprocess.CompletedProcess,
+            TimeoutExpired=subprocess.TimeoutExpired))
+        out = tmp_path / "out"
+        out.mkdir(exist_ok=True)
+        driver = drv.Driver("on-demand", tmp_path / "w.whl", tmp_path / "bundle", out,
+                            installer=tmp_path / "install.sh", bundle_tarball=tmp_path / "t.tar.gz")
+        driver.proc_root = fake.proc
+        driver.stop_wait_s = stop_wait_s
+        driver.sw = fake.sw
+        driver.run = fake.run
+        orig_wait = driver.wait_daemon
+        driver.wait_daemon = lambda *, version, timeout=60.0: orig_wait(version=version, timeout=min(timeout, 2.0))
+        orig_gone = driver.wait_no_daemon
+        driver.wait_no_daemon = lambda timeout=30.0: orig_gone(timeout=min(timeout, 1.0))
+        driver.cfg_before = drv.uc.snapshot_files(fake.config)
+        driver.baseline = {"aliases": json.loads(fake.sw("alias", "list").stdout)["aliases"],
+                           "sessions": json.loads(fake.sw("session", "list").stdout)["sessions"]}
+        return driver, fake
+
+    yield make
+    for fake in made:
+        fake.close()
+
+
+def _row(driver: Any, check_id: str) -> dict[str, Any]:
+    return next(r for r in driver.rows if r["id"] == check_id)
+
+
+# 替身為 Linux 容器 driver 的行為模型（runuser／pipx／systemd 流程），只在 POSIX 上有意義。
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+@pytest.mark.parametrize("phase,check_id,cli", [
+    ("phase_seed", "seed_user_data", "0.3.2"),
+    ("phase_upgrade_after_stop", "upgrade_after_stop", "0.3.2"),
+    ("phase_install_sh", "old_daemon_stopped", "0.3.2"),
+    ("phase_downgrade", "downgrade_manual", "0.4.0"),
+    ("phase_reupgrade", "reupgrade", "0.3.2"),
+])
+def test_driver_waits_for_old_daemon_exit_before_next_start(fake_driver, phase, check_id, cli):
+    """Docker on-demand 預熱競態（rulings/s1.md）：`daemon stop` 之後舊 daemon 仍在退出時，driver 不得立即
+    start／setup／install.sh；須等舊行程樹與 socket 都消失，該步驟的判定才 PASS，並記錄等待結果。"""
+    driver, fake = fake_driver(cli_version=cli)
+    method = getattr(driver, phase)
+    method(False) if phase == "phase_upgrade_after_stop" else method()
+    assert fake.calls, "替身未記錄任何 start／setup 呼叫"
+    assert [c for c in fake.calls if c[1]] == [], f"舊 daemon 尚未結束就呼叫：{fake.calls}"
+    row = _row(driver, check_id)
+    assert row["verdict"] == "PASS", row
+    wait = row["detail"]["stop_wait"]
+    assert wait["gone"] is True and wait["pids"] and wait["sockets"] == [str(fake.sock)], wait
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+@pytest.mark.parametrize("phase,check_id,cli", [
+    ("phase_seed", "seed_user_data", "0.3.2"),
+    ("phase_reupgrade", "reupgrade", "0.3.2"),
+    ("phase_downgrade", "downgrade_manual", "0.4.0"),
+])
+def test_driver_stop_wait_timeout_fails_and_is_recorded(fake_driver, phase, check_id, cli):
+    """舊 daemon 在有界逾時內未結束：該步驟判 FAIL，detail 記錄殘留行程；seed 不得在逾時後硬起新 daemon。"""
+    driver, fake = fake_driver(cli_version=cli, exit_delay=None, stop_wait_s=0.5)
+    getattr(driver, phase)()
+    row = _row(driver, check_id)
+    assert row["verdict"] == "FAIL", row
+    wait = row["detail"]["stop_wait"]
+    assert wait["gone"] is False and wait["alive"] and wait["timeout_s"] == 0.5, wait
+    if phase == "phase_seed":
+        assert ("daemon start", True) not in fake.calls and ("daemon start", False) not in fake.calls
 
 
 # ---------- two-reader 重疊 ----------
@@ -474,6 +777,104 @@ def test_run_upgrade_dry_run_systemd_system_mode_is_explicit_only(tmp_path):
     assert "--mode systemd-system" not in r.stdout
 
 
+# ---------- release 前置第 2 輪 OWNER-BATCH #2：bundle 比照 release workflow 以 /usr/bin/python3.12 build venv 建立 ----------
+
+def _fake_docker(tmp_path: Path) -> tuple[Path, Path]:
+    """PATH 首位放假 docker：只記錄呼叫並失敗，確保 fail-closed 測試絕不碰真的 docker。"""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    log = tmp_path / "docker-calls.log"
+    fake = bindir / "docker"
+    fake.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexit 1\n', encoding="utf-8")
+    fake.chmod(0o755)
+    return bindir, log
+
+
+def _docker_calls(log: Path) -> list[str]:
+    return log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_builds_bundle_with_system_python312_venv(tmp_path):
+    """bundle 以 /usr/bin/python3.12 建的 build venv 執行 mkbundle（PATH 首位為 build venv），並列出
+    pyvenv.cfg `home = /usr/bin` 檢查；與 release workflow 的 publish-linux-bundle 同一做法與釘版。"""
+    out_dir = tmp_path / "ev"
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--out", str(out_dir)],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    work = out_dir.resolve() / "work"
+    lines = r.stdout.splitlines()
+    assert f"+ /usr/bin/python3.12 -m venv {work}/build-venv" in [line.rstrip() for line in lines], r.stdout
+    pip = next(line for line in lines if f"{work}/build-venv/bin/python3 -m pip install" in line)
+    assert "pyyaml==6.0.3" in pip and "jsonschema==4.10.3" in pip, pip
+    mk = next(line for line in lines if "mkbundle.sh" in line)
+    assert mk.startswith(f"+ env PATH={work}/build-venv/bin:"), mk
+    assert "--release-bundle --profile release --version-override 0.4.0" in mk
+    check = next(line for line in lines if "pyvenv.cfg" in line)
+    assert "home = /usr/bin" in check and "include-system-site-packages = false" in check, check
+    assert lines.index(check) > lines.index(mk)
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("kind", ["missing", "not_usr_bin"])
+def test_run_upgrade_fails_closed_without_system_python312(tmp_path, kind):
+    """主機沒有 /usr/bin/python3.12（或指定的直譯器不在 /usr/bin）→ 建任何東西之前 rc=3 fail-closed，
+    不回退 PATH 上的其他 python，也不碰 docker。"""
+    bindir, log = _fake_docker(tmp_path)
+    if kind == "missing":
+        python = tmp_path / "missing" / "python3.12"
+    else:
+        # 真的可執行的 3.12 直譯器，但實體不在 /usr/bin（如 toolcache／自編 Python）：不得接受
+        python = tmp_path / "other" / "python3.12"
+        python.parent.mkdir()
+        shutil.copy2(os.path.realpath(sys.executable), python)
+    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", SW_UPGRADE_SYSTEM_PYTHON=str(python))
+    out_dir = tmp_path / "ev"
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--out", str(out_dir),
+                        "--wheel", str(tmp_path / "serialwrap-0.3.2-py3-none-any.whl")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "/usr/bin/python3.12" in r.stderr and "不回退" in r.stderr, r.stderr
+    work = out_dir / "work"
+    assert not (work / "build-venv").exists() and not (work / "bundle-0.4.0").exists()
+    assert not list(work.glob("wheels/*.whl"))
+    assert _docker_calls(log) == []
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("cfg", [
+    None,
+    "home = /opt/hostedtoolcache/Python/3.12.3/x64/bin\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+    "home = /usr/local/bin\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+    "home = /usr/bin\ninclude-system-site-packages = true\nversion = 3.12.3\n",
+], ids=["missing_cfg", "toolcache_home", "usr_local_home", "system_site_packages"])
+def test_run_upgrade_rejects_bundle_runtime_not_bound_to_usr_bin(tmp_path, cfg):
+    """`--bundle` 提供的（或自建的）bundle runtime 的 pyvenv.cfg 不是 `home = /usr/bin`＋
+    `include-system-site-packages = false`（或缺檔）→ 建映像之前 rc=3 fail-closed。"""
+    bindir, log = _fake_docker(tmp_path)
+    vdir = tmp_path / "bundle" / "versions" / "0.4.0"
+    (vdir / "py").mkdir(parents=True)
+    (vdir / "release-manifest.json").write_text(json.dumps({"bundle_version": "0.4.0"}), encoding="utf-8")
+    if cfg is not None:
+        (vdir / "py" / "pyvenv.cfg").write_text(cfg, encoding="utf-8")
+    wheel = tmp_path / "serialwrap-0.3.2-py3-none-any.whl"
+    wheel.write_bytes(b"")
+    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--out", str(tmp_path / "ev"), "--wheel", str(wheel),
+                        "--bundle", str(tmp_path / "bundle")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "pyvenv.cfg" in r.stderr, r.stderr
+    calls = _docker_calls(log)
+    assert not [c for c in calls if c.split()[:1] in (["build"], ["run"], ["exec"])], calls
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_upgrade_environment_does_not_hide_missing_pyyaml():
@@ -531,3 +932,127 @@ def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
         assert rep["verdict"] == "PASS", diag
         assert rep["evidence_layer"] == "L1.5-docker"
         assert rep["old_version"] == "0.3.2" and rep["new_version"] == "0.4.0"
+
+
+# ---------- OD-50：install.sh 升級路徑（0.3.2 pipx、daemon 已停止 → install.sh --bundle） ----------
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_install_sh_scenario_required_checks_and_verdict():
+    """install-sh 情境另列必要檢查；升級情境的 REQUIRED_CHECKS 不因 install-sh 而變（OD-48 合入後為下列 19 項，
+    含 legacy_handoff_direct_setup；逐項釘住，不只比長度）。"""
+    assert uc.REQUIRED_CHECKS == (
+        "old_install_0_3_2", "seed_user_data", "doctor_green_old", "upgrade_with_old_daemon_running",
+        "legacy_handoff_direct_setup", "upgrade_after_stop", "entries_replaced", "config_preserved_upgrade",
+        "new_daemon_started", "supervision_reconciled", "state_compatible_upgrade", "doctor_green_new",
+        "rollback_command", "downgrade_manual", "config_preserved_downgrade", "state_compatible_downgrade",
+        "doctor_green_downgrade", "reupgrade", "no_two_reader")
+    assert "install_sh_upgrade" not in uc.REQUIRED_CHECKS
+    assert "old_daemon_stopped" not in uc.REQUIRED_CHECKS
+    required = uc.REQUIRED_INSTALL_SH_CHECKS
+    assert {"old_install_0_3_2", "old_daemon_stopped", "install_sh_upgrade", "entries_replaced",
+            "config_preserved_upgrade", "new_daemon_started", "doctor_green_new", "no_two_reader"} <= set(required)
+    assert "upgrade_with_old_daemon_running" not in required
+    rows = [{"id": cid, "verdict": "PASS"} for cid in required]
+    assert uc.overall_verdict(rows, required=required) == "PASS"
+    assert uc.overall_verdict(rows[:-1], required=required) == "INSUFFICIENT"
+    # 預設仍以升級情境的完整集合判定：install-sh 的檢查集合不足以讓升級情境 PASS
+    assert uc.overall_verdict(rows) == "INSUFFICIENT"
+    # 亦不足以讓 systemd-system（OD-48）情境 PASS：缺 legacy_handoff_direct_setup 等
+    assert uc.overall_verdict(rows, required=uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM) == "INSUFFICIENT"
+
+
+def _install_body(**install):
+    base = {"op": "install", "to_version": "0.4.0"}
+    base.update(install)
+    return {"ok": True, "install": base}
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("kwargs,verdict", [
+    ({}, "PASS"),
+    ({"rc": 1}, "FAIL"),
+    ({"body": {"ok": False, "error_code": "METHOD_NOT_FOUND"}}, "FAIL"),
+    ({"body": _install_body(to_version="0.3.2")}, "FAIL"),
+    ({"output": "[serialwrap] SHA256 驗證通過"}, "FAIL"),  # 缺 pipx uninstall 提示
+    ({"pipx_venv_left": False}, "FAIL"),  # install.sh 不得自動移除舊 pipx
+    ({"leftover_tmp": ["/tmp/serialwrap-install.abc"]}, "FAIL"),
+])
+def test_judge_install_sh(kwargs, verdict):
+    args = {"rc": 0, "body": _install_body(), "output": "可執行 `pipx uninstall serialwrap` 移除舊版",
+            "pipx_venv_left": True, "leftover_tmp": []}
+    args.update(kwargs)
+    r = uc.judge_install_sh("install_sh_upgrade", **args)
+    assert r["verdict"] == verdict, r
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_install_sh_scenario(tmp_path):
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "install-sh", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "--network none" in out
+    assert "install.sh:/opt/sw-installer/install.sh:ro" in out
+    assert "serialwrap-0.4.0-linux-x86_64.tar.gz" in out
+    for mode in ("systemd-user", "on-demand"):
+        assert f"--mode {mode}" in out, out
+    assert out.count("--scenario install-sh") == 2, out
+    assert "/dev/ttyUSB" not in out and "--device" not in out
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_rejects_unknown_scenario(tmp_path):
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "bogus", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_install_sh_scenario_rejects_systemd_system_mode(tmp_path):
+    """OD-48 合入後 --mode 多了 systemd-system；install-sh 情境的 driver 沒有該模式的 phase（setup 需 --with-sudo、
+    監管檢查走 system unit），組合須在 runner 與 driver 兩端都以 rc=2 拒絕，不得跑出錯置判定的報告。"""
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "install-sh", "--mode", "systemd-system",
+                        "--out", str(tmp_path / "ev")], cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "systemd-system" in r.stderr
+    assert "docker run" not in r.stdout
+    r = subprocess.run([sys.executable, str(UPGRADE_CONTAINER), "--mode", "systemd-system", "--wheel", "w.whl",
+                        "--bundle", str(tmp_path / "b"), "--out", str(tmp_path / "out"), "--scenario", "install-sh",
+                        "--installer", "/x/install.sh", "--bundle-tarball", "/x/t.tar.gz"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "systemd-system" in r.stderr
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.supervisor_runtime
+def test_docker_install_sh_upgrade_from_0_3_2(tmp_path):
+    """實跑（OD-50）：兩種監管模式各自 0.3.2 pipx 安裝→停 daemon→`install.sh --bundle <0.4.0 tarball>`→升級成功。"""
+    if not _docker_available():
+        pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
+    if subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/tags/v0.3.2"], cwd=REPO,
+                      capture_output=True).returncode != 0:
+        pytest.skip("cap_missing:tag_v0.3.2：版本庫沒有 v0.3.2 tag（證據不足，非 PASS）")
+    out = tmp_path / "ev"
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--scenario", "install-sh", "--out", str(out)], cwd=REPO,
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    reports = {}
+    for mode in ("systemd-user", "on-demand"):
+        path = out / mode / "upgrade-report.json"
+        reports[mode] = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    diag = json.dumps({m: None if rep is None else [c for c in rep.get("checks", []) if c.get("verdict") != "PASS"]
+                       for m, rep in reports.items()}, ensure_ascii=False)[:4000]
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:] + diag
+    for mode, rep in reports.items():
+        assert rep is not None, f"{mode} 未產生 upgrade-report.json"
+        assert rep["scenario"] == "install-sh"
+        assert rep["verdict"] == "PASS", diag
+        assert {c["id"] for c in rep["checks"]} >= set(uc.REQUIRED_INSTALL_SH_CHECKS)

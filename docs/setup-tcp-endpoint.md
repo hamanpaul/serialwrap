@@ -13,7 +13,7 @@ TCP 格式本身不能證明 daemon 位於遠端，此處是保存既有選擇�
 
 ```bash
 serialwrap setup --on-demand
-# 從本機 checkout 重新安裝；install.sh 會把參數轉交給 setup：
+# 以 install.sh 重新安裝 bundle（OD-50）；install.sh 會把參數轉交給 setup：
 ./install.sh --on-demand
 ```
 

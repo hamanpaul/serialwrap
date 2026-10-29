@@ -19,8 +19,8 @@
 |---|---|---|
 | Linux x86_64 bundle（`serialwrap-0.4.0-linux-x86_64.tar.gz`） | `bin/serialwrap`（Rust CLI，20 個群組原生）、`bin/serialwrapd`（launcher）、`versions/0.4.0/`：`release-manifest.json`、`SHA256SUMS`、`py/`（自帶 PyYAML 的 Python daemon runtime＋`sw_core`，亦為 Python 委派元件 `python_cli_delegate`）；不含 `sw-cli/test-fakes` | `scripts/rust/mkbundle.sh --release-bundle --profile release --out <dir>`（`VERSION` 已改為 0.4.0，**不得**用 `--version-override`） |
 | Windows x86_64 bundle（`serialwrap-0.4.0-windows-x86_64.zip`） | 同上，入口為 `.exe`；可選 com0com 3.0.0.0 元件（`--with-com0com`，含 GPLv2 授權與原始碼連結） | 擁有者 Windows runner 原生建置（P9 BO-P9-17 的同一條路徑）；或 `--target x86_64-pc-windows-gnu` 交叉編譯後於 Windows 原生驗證。**release workflow 不建 Windows bundle**：待 `publish-linux-bundle` job 成功後，由擁有者以 `gh release upload` 附加 zip 並重傳含 zip 雜湊的 `SHA256SUMS`（步驟見下方 RELEASE-TODO-01） |
-| Python wheel（`serialwrap-0.4.0-py3-none-any.whl`） | Python CLI＋daemon（相容路徑：只裝 Python 的使用者、`install.sh`） | 既有 `release.yml` 的 `python3 -m build --wheel` |
-| `install.sh` | 目前仍為 pipx 安裝 Python 套件＋`serialwrap setup`（與 0.3.2 相同）。**0.4.0 Rust CLI 的安裝入口是 bundle 的 `bin/serialwrap setup`** | 見 RELEASE-TODO-02 |
+| Python wheel（`serialwrap-0.4.0-py3-none-any.whl`） | Python CLI＋daemon（照發；OD-50 後標準安裝流程不使用，`install.sh` 不再走 pipx） | 既有 `release.yml` 的 `python3 -m build --wheel` |
+| `install.sh` | OD-50：Linux 安裝 Rust bundle。預設從 GitHub release 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS` 並驗證（未給 `--version` 取 `releases/latest`），或以 `--bundle <目錄或 tar.gz>` 離線安裝；解到暫存目錄後執行 `<bundle>/bin/serialwrap setup` 並回傳其 rc。pipx 路徑退役 | repo 根目錄的 `install.sh`（`tests/test_install_sh.py`）；release 須附上 Linux bundle tarball 與含該列的 `SHA256SUMS`（RELEASE-TODO-01） |
 
 **RELEASE-TODO-01（release workflow）**：原 `.github/workflows/release.yml` 只發佈 wheel 與 PyInstaller exe，沒有 Rust bundle job。release PR 必須新增 Linux bundle job（cargo build＋`mkbundle.sh --release-bundle --profile release`＋打包＋上傳＋`SHA256SUMS`）並登記 Windows bundle 的上傳方式；PyInstaller exe 是否續發由擁有者決定（建議 0.4.0 仍附上，供尚未改用 bundle 的 Windows 使用者）。
 
@@ -42,7 +42,7 @@
 
   若之後重跑 release workflow，`publish-linux-bundle` 會以 `--clobber` 覆寫 `SHA256SUMS`（只剩 Linux 列），須重做上面最後四行把 Windows 列補回。
 
-**RELEASE-TODO-02（install.sh）**：決定 0.4.0 的 `install.sh` 是維持 pipx（Python CLI）還是改為「下載／解開 bundle 後執行 `bin/serialwrap setup`」。在決定前，release notes 必須明寫兩條安裝路徑的差異。
+**RELEASE-TODO-02（install.sh）**：已依擁有者裁決 OD-50（2026-10-29，(b')）決定並實作（分支 `feature/install-sh-bundle`）。新流程：`install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`——安裝前檢查系統需求（x86_64、glibc ≥ 2.39、`/usr/bin/python3.12`；Linux 使用者皆為 Ubuntu 24.04 以上），任一不符 rc=2 且不改動任何東西；未給 `--bundle` 時以 curl（無 curl 用 wget）從 GitHub release 下載 bundle tarball 與 `SHA256SUMS`，以該 tarball 的列驗證，雜湊不符或缺列立即失敗、不執行 setup；解到 mktemp 暫存目錄（結束時清除）後執行 `<bundle>/bin/serialwrap setup "$@"` 並回傳其 rc；setup 成功後偵測到舊 pipx 安裝（`pipx list --short` 含 serialwrap 或 pipx venv 目錄存在）時提示可 `pipx uninstall serialwrap`，不自動移除。pipx 安裝路徑退役（README 主要安裝方式一併改寫）；wheel 仍照發但標準流程不使用。下載基底 URL 可由 `SERIALWRAP_RELEASE_BASE_URL` 覆寫（測試用）。
 
 ## 3. 版號與 changelog 步驟（release PR 內執行）
 
@@ -63,6 +63,8 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
 
 - 容器：`tools/docker/upgrade.Dockerfile`（OD-16 (5) 的 ubuntu:24.04 digest），`--network none`、不帶任何裝置，wheel／bundle／driver 唯讀 bind mount；每種監管模式一個全新容器。不碰本機正式安裝。
 - 0.3.2 來源：容器不連網，預設以 `git archive v0.3.2` 建 wheel；正式驗證時改用 `--wheel` 指向 GitHub release 上的 0.3.2 wheel。
+- 0.4.0 bundle（release 前置第 2 輪 OWNER-BATCH #2）：未給 `--bundle` 時比照 release workflow 的 `publish-linux-bundle`，先確認主機 `/usr/bin/python3.12` 可執行、實體位於 `/usr/bin` 且版本等於 `contracts/cli_help/_meta.json` 的 `python_version`，以它建 build venv（`pyyaml==6.0.3`、`jsonschema==4.10.3`）並置於 PATH 首位執行 `mkbundle.sh --release-bundle --profile release`；任一不符即 rc=3 fail-closed，在任何建置、下載或 docker 動作之前結束，不回退 PATH 上的其他 python。自建或 `--bundle` 提供的 bundle 都必須 `versions/0.4.0/py/pyvenv.cfg` 含 `home = /usr/bin` 與 `include-system-site-packages = false`，否則 rc=3、不建映像。`--scenario install-sh` 只支援 systemd-user／on-demand，與 `--mode systemd-system` 併用時 rc=2。
+- 停止後等待（Docker on-demand 預熱競態裁決，2026-10-29）：0.3.2 的 `daemon.stop` 先回應、先刪 socket，行程稍後才結束；在這段期間 `daemon start` 會回 `DAEMON_ALREADY_RUNNING_ELSEWHERE`，之後沒有 daemon。driver 在每個 `daemon stop` 之後、下一個 start／setup／`install.sh` 之前（基線預熱、停舊後 setup、install.sh 前、手動降級、重新升級），先輪詢停止前快照的 daemon 行程樹（含子孫，以啟動時間辨識 PID 重用）已結束、沒有任何 serialwrapd 實例、且其 socket（argv `--socket` 與 config.yaml `socket_path`）已移除，上限 60 秒。逾時略過後續的 start／setup，並讓該步驟依原判定判 FAIL。等待結果寫進該步驟判定列的 `detail.stop_wait`。
 - 判定：`scripts/docker/upgrade_checks.py`（`tests/test_docker_upgrade.py`）。19 項必要檢查，任一 FAIL 即 FAIL、缺項即 INSUFFICIENT：
   0.3.2 安裝與啟動、建立 profile／alias／binding 基線、0.3.2 doctor、舊 daemon 執行中直接 setup（`upgrade_with_old_daemon_running`：成功切換；拒絕只對「非 legacy 的不支援交接 daemon」以 `METHOD_NOT_FOUND`＋現場未改動判定，0.3.x daemon 被拒絕即 FAIL）、`legacy_handoff_direct_setup`（OD-48：0.3.2 daemon 執行中直接 setup 必須成功切換、報告含 `legacy_stop`、舊 daemon 行程樹結束、新 daemon 由 setup 自己啟動——在 driver 任何啟動動作之前取樣，setup 沒啟動即 FAIL、config／profiles 逐位元組保留、setup 期間無兩個 serialwrapd 同時存在）、停舊後 setup（直接 setup 成功時記為不需要；「先停再升級」路徑與 OBS-UPGRADE-NOT-STARTED 保留於重新升級階段）、`~/.local/bin` 入口取代且備份記下 pipx 入口、config／profiles 逐位元組保留、0.4.0 daemon 由 bundle 啟動、監管模式依 config 收斂（systemd-user：unit active＋enabled、MainPID 為新 daemon、無殘留 hold drop-in；on-demand：unit 未啟用）、alias／binding 語意相容、0.4.0 doctor（非 advisory 全綠＋`version_pairing`；advisory 只容許容器內必然為 0 的 `devices`）、`setup --rollback`（拒絕時現場不得改動）、手動降級回 0.3.2（版本、config、狀態、doctor）、降級後重新升級、全程 /proc 20 ms 取樣不得同時出現兩個 serialwrapd 實例。
 - 首次實跑（2026-10-28，bundle git revision `2a947f6`）：systemd-user 與 on-demand 皆 **PASS**（各約 2,800 筆取樣、0 次重疊）；報告未保存，不作為證據。
@@ -71,6 +73,17 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
 - OD-48 實作後實跑（2026-10-29，run `od48run2`，bundle git revision `014eb2b`，分支 `feature/od48-legacy-handoff`；雲端環境以 HTTPS apt 來源建映像、其餘 driver／判定／`--network none` 不變）：兩模式皆 **PASS**，19 項含 `legacy_handoff_direct_setup`（systemd-user：`systemctl_stop`；on-demand：`rpc_daemon_stop`；兩者 `waited_ms` 約 5.2 s、新 daemon 由 setup 啟動、取樣 1576／1531、0 次重疊）；報告與 `SHA256SUMS` 保存於 `evidence/stage1/upgrade-docker/od48-014eb2b/`。同為開發中 bundle，不取代前置條件 #3。
 - OD-48 第 2 輪實跑（2026-10-29，bundle git revision `2f8f7ed`，`--release-bundle --profile release --version-override 0.4.0`；建映像方式同上）：systemd-user、on-demand 完整流程各 19 項 **PASS**，另以 `--mode systemd-system` 驗「0.3.2 system daemon 執行中直接 `setup --system --with-sudo`」成功路徑 13 項 **PASS**（`systemctl_stop`、`waited_ms` 約 5.2 s、新 daemon 由 setup 啟動、MainPID 為新 daemon、無殘留 drop-in、取樣 1602、0 次重疊）。systemd-system 觀察項：`OBS-0.3.2-SYSTEM-UMASK`（0.3.2 system unit `UMask=0117` 使 daemon 自建目錄缺 x 位元，driver 先以一般 umask 暖機一次 0.3.2 daemon）、`OBS-SYSTEM-PROFILES-MANAGED`（system setup 以套件 profiles 覆寫 `/etc/serialwrap/profiles` 同名檔，0.3.2 同語意）。證據於 `evidence/stage1/upgrade-docker/od48-2f8f7ed/`；同為開發中 bundle，不取代前置條件 #3。
 - OD-48 第 2 輪 sol 修正後重跑（bundle git revision `55cfa03`）：三模式皆 **PASS**（19／19／13 項；`waited_ms` 5351／5214／5311、取樣 1476／1562／1623、0 次重疊）。systemd-system 的套件管理 profile 改為全數保留於快照、只允許覆寫成新 bundle 權威內容（S1-f3c66b4-1）：`/etc/serialwrap/profiles/default.yaml` 記為 `package_updated`。證據於 `evidence/stage1/upgrade-docker/od48-55cfa03/`（`od48-2f8f7ed` 的 systemd-system 判定已被此輪取代）。
+- install.sh 第 2 輪（合入 OD-48 與 release 前置後，2026-10-29，bundle git revision `407ed7e`，bundle 以 `/usr/bin/python3.12` build venv 自建、`py/pyvenv.cfg` 為 `home = /usr/bin`；雲端容器的 apt 以原 HTTP 來源即可建映像，未改來源）：`--mode all` 的 systemd-user、on-demand 完整流程各 19 項 **PASS**（`legacy_stop` 為 `systemctl_stop`／`rpc_daemon_stop`，`waited_ms` 5265／5416，取樣 1522／1590、0 次重疊）；`--mode systemd-system`（`--bundle` 重用同一 bundle，走 pyvenv.cfg 檢查）13 項 **PASS**（`systemctl_stop`、5173 ms、取樣 1573、0 次重疊，`default.yaml` 列 `package_updated`）；`--scenario install-sh` 兩模式各 12 項 **PASS**（取樣 895／951、0 次重疊，`OBS-UPGRADE-NOT-STARTED` 同 §5.1）。五份報告的 `bundle_manifest_sha256`、wheel 雜湊相同；證據與 `SHA256SUMS`、過濾後的 `bundle-pyvenv.txt` 於 `evidence/stage1/upgrade-docker/install-sh-407ed7e/`。同為開發中 bundle（`--version-override 0.4.0`），不取代前置條件 #3。
+- 預熱競態修正後重跑（bundle git revision `a20de1d`，driver 在 stop 後等舊行程樹與 socket 消失）：
+  - `--mode all`：systemd-user、on-demand 各 19 項 **PASS**。
+  - `--mode on-demand` 另以同一 bundle 再跑 2 次，合計連跑 3 次皆 19 項 **PASS**：
+    - `seed_user_data` 的 `stop_wait.waited_ms` 三次皆為 100。0.3.2 `daemon stop` 回應後，舊行程約 0.1 秒才結束，正是原先競態的窗口。
+    - 降級等待約 300 ms，重新升級等待約 200～300 ms。
+    - `legacy_stop` 為 `rpc_daemon_stop`，取樣約 1440、0 次重疊。
+  - `--mode systemd-system` 13 項 **PASS**。
+  - `--scenario install-sh` 兩模式各 12 項 **PASS**。
+  - 7 份報告的 `bundle_manifest_sha256` 與 wheel 雜湊相同。證據於 `evidence/stage1/upgrade-docker/install-sh-a20de1d/`，含 `on-demand-run2`／`on-demand-run3`；driver 修正前的判定由 `install-sh-407ed7e` 取代。
+  - 同為開發中 bundle，不取代前置條件 #3。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 
@@ -123,6 +136,7 @@ while the daemon remains the Python implementation shipped inside the bundle.
 
 ### 繁體中文
 - `serialwrap` CLI 改為 Rust 原生實作（20 個命令群組），daemon 仍為 bundle 內附的 Python 實作（Stage 1）。
+- `install.sh` 改為安裝 Rust bundle（OD-50）：下載 GitHub release 的 `serialwrap-0.4.0-linux-x86_64.tar.gz` 並以 `SHA256SUMS` 驗證後執行 `bin/serialwrap setup`，或以 `--bundle` 離線安裝；系統需求為 x86_64、glibc ≥ 2.39（Ubuntu 24.04 以上）與 `/usr/bin/python3.12`。pipx 安裝路徑退役（wheel 仍照發）。
 - 新增發佈組合（bundle）安裝：`bin/serialwrap setup` 安裝到 `~/.local/share/serialwrap/versions/<版本>`（Windows：`%LOCALAPPDATA%\Programs\serialwrap`），支援原子更新、`setup --rollback` 與 `doctor` 的 `version_pairing` 檢查。
 - Windows：`windows-task` 監管（免管理員）、可選 com0com 虛擬序列埠（`setup --with-com0com`）。
 - 修正：pipx 安裝下 on-demand `daemon start` 找不到 `serialwrapd.py`。
@@ -133,6 +147,7 @@ while the daemon remains the Python implementation shipped inside the bundle.
 
 ### English
 - The `serialwrap` CLI is now native Rust (20 command groups); the daemon is still the bundled Python implementation (Stage 1).
+- `install.sh` now installs the Rust bundle (OD-50): it downloads `serialwrap-0.4.0-linux-x86_64.tar.gz` from the GitHub release, verifies it against `SHA256SUMS`, and runs `bin/serialwrap setup`; `--bundle` installs offline. Requirements: x86_64, glibc >= 2.39 (Ubuntu 24.04 or later), and `/usr/bin/python3.12`. The pipx install path is retired (the wheel is still published).
 - New bundle install: `bin/serialwrap setup` installs into `~/.local/share/serialwrap/versions/<version>` (Windows: `%LOCALAPPDATA%\Programs\serialwrap`) with atomic update, `setup --rollback`, and a `version_pairing` doctor check.
 - Windows: `windows-task` supervision (no admin), optional com0com virtual serial pair (`setup --with-com0com`).
 - Fixed: on-demand `daemon start` could not find `serialwrapd.py` under pipx installs.

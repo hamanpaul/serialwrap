@@ -41,8 +41,9 @@ materializes profiles, the broker minicom wrapper, and daemon supervision, see
 including diagrams and field validation notes, see [繁體中文](#繁體中文).
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup
+# Linux x86_64, glibc >= 2.39, /usr/bin/python3.12 (Ubuntu 24.04 or later)
+git clone https://github.com/hamanpaul/serialwrap && cd serialwrap
+./install.sh            # download the latest release bundle, verify SHA256SUMS, run bin/serialwrap setup
 serialwrap doctor
 ```
 
@@ -93,9 +94,11 @@ console views, command result capture, and diagnostics.
 
 ### Prerequisites
 
-- **Python 3.10+**
-- **pipx**
-- **PyYAML** — installed automatically by the package metadata
+- **Linux x86_64 with glibc >= 2.39** (Ubuntu 24.04 or later)
+- **`/usr/bin/python3.12`** — the Python daemon runtime shipped in the bundle is
+  tied to this interpreter (the requirement goes away in 0.5.0 with the Rust daemon)
+- **curl** or **wget** — to download the release (not needed with `--bundle`)
+- **PyYAML** — shipped inside the bundle; no separate install
 - **jq** — required by the broker minicom route
 - **minicom** — required for human console workflows on Linux/WSL
 
@@ -123,9 +126,10 @@ setup may select systemd and change supervision modes; see the
 ### Quick Start
 
 ```bash
-# Managed install
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup
+# Managed install: download the release bundle, verify it against SHA256SUMS,
+# then run <bundle>/bin/serialwrap setup (extra arguments go to setup)
+./install.sh                     # latest release
+./install.sh --version 0.4.0     # a specific release
 serialwrap doctor
 
 # Check daemon and sessions
@@ -176,8 +180,45 @@ markers remain available for caller validation. `command.get` and WAL META recor
 setting; reboot continues through its existing recovery flow. See
 [command completion](docs/command-completion.md).
 
-For local development, run `./install.sh`; it performs the same package install
-and `serialwrap setup` flow from the checkout.
+#### Installer details
+
+`install.sh` lives at the repository root (clone the repository or download
+that file). `install.sh [--version X.Y.Z] [--bundle <dir or .tar.gz>] [--] [setup args...]`
+checks the requirements first (x86_64, glibc >= 2.39, `/usr/bin/python3.12`)
+and exits 2 without changing anything when one is not met. Without `--bundle`
+it downloads `serialwrap-<version>-linux-x86_64.tar.gz` and `SHA256SUMS` from
+the [GitHub releases](https://github.com/hamanpaul/serialwrap/releases)
+(latest release unless `--version` is given), refuses to continue on a
+checksum mismatch or a missing `SHA256SUMS` row, unpacks into a temporary
+directory, runs `bin/serialwrap setup`, and returns its exit code. Arguments
+after `--` (and unknown options such as `--user` or `--on-demand`) are passed
+to `setup` unchanged. The Python wheel is still published with each release,
+but the standard install no longer uses pipx.
+
+Offline install: copy the release tarball (verify it yourself with
+`sha256sum -c --ignore-missing SHA256SUMS`; `--bundle` does not download or
+check `SHA256SUMS`), then run
+`./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`. `--bundle` also
+accepts an unpacked bundle directory. For local development, build a bundle
+from the checkout and install it; a bare `./install.sh` installs the published
+release, not the checkout:
+
+```bash
+scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
+./install.sh --bundle /tmp/sw-bundle
+```
+
+#### Upgrading from 0.3.x (pipx)
+
+Run the new `install.sh`; no pipx step is needed. Stop the 0.3.x daemon first
+with `serialwrap daemon stop` (TODO(OD-48): this step will be revisited once
+upgrading with the 0.3.2 daemon still running is implemented). Setup takes
+over the `~/.local/bin/serialwrap` and `serialwrapd` entries, keeps
+`config.yaml`, profiles and `state.json`, and does not start a daemon that was
+stopped: start it with `serialwrap service start` (systemd) or
+`serialwrap daemon start` (on-demand), then run `serialwrap doctor`. When an
+old pipx install is detected, the installer prints a hint that you may run
+`pipx uninstall serialwrap`; it never removes it automatically.
 
 For a human console, use the broker wrapper instead of raw minicom:
 
@@ -1482,8 +1523,10 @@ for a newly fixed bug" SOP:
 
 ## 依賴
 
-- Python 3.10+
-- `pyyaml`：`pipx install` 會自動帶入，無需手動安裝
+- Linux x86_64，glibc >= 2.39（Ubuntu 24.04 以上）
+- `/usr/bin/python3.12`：bundle 內附的 Python daemon runtime 綁定此直譯器（0.5.0 改 Rust daemon 後此需求消失）
+- `curl` 或 `wget`：下載 release 用（`--bundle` 離線安裝不需要）
+- `pyyaml`：已內附於 bundle，無需另外安裝
 - `jq`：`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）解析 session 狀態需要，不要直接 `minicom -D /dev/ttyUSBx`
 - `minicom`：human console 路徑需要，一律經 `serialwrap-minicom COMx` 呼叫，不要直接 `minicom -D /dev/ttyUSBx`（會與 daemon 搶 tty，two-reader）
 - 以上三項（`serialwrap-minicom`／`jq`／`minicom`）`serialwrap doctor` 皆會檢查是否在 PATH
@@ -1730,16 +1773,21 @@ flowchart TD
 ## 快速開始
 
 ```bash
-# 安裝（正式流程）
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
-serialwrap doctor    # 驗證環境
+# 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
+./install.sh                     # 最新 release
+./install.sh --version 0.4.0     # 指定 release
+serialwrap doctor                # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
-- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- `install.sh` 位於 repo 根目錄（clone repo 或單獨下載該檔）。
+- 系統需求：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`。`install.sh` 安裝前先檢查，任一項不符即 exit 2 且不改動任何東西。
+- `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
+- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
+- 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
+- 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。升級前請先 `serialwrap daemon stop`（TODO(OD-48)：0.3.2 daemon 執行中直接升級的行為實作後再更新此步驟）。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`，且不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
@@ -3242,18 +3290,19 @@ Handler **建議**：
 ## 安裝
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
-serialwrap doctor    # 驗證環境
+# 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
+./install.sh                     # 最新 release
+./install.sh --version 0.4.0     # 指定 release
+serialwrap doctor                # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
-- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- 系統需求、`--bundle` 離線安裝、本機開發安裝與 0.3.x 升級說明見[快速開始](#快速開始)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
-依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
+依賴：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`（`pyyaml` 已內附於 bundle）；human console 路徑另需 `jq` 與 `minicom`。
 
 ## 使用方式
 

@@ -9,6 +9,11 @@ systemd-system（OD-48 SPEC-GAP #10）只跑「0.3.2 daemon 執行中直接 `set
 0.3.2 以 `setup --system --with-sudo` 安裝 system unit（swtest 免密碼 sudo）→ 建立 profile／alias／binding →
 0.4.0 直接 setup → 入口、設定、監管與 doctor 驗證；必要檢查見 `REQUIRED_CHECKS_SYSTEMD_SYSTEM`。
 
+`--scenario install-sh`（OD-50）：pipx 安裝 0.3.2 並建立基線 → 停 0.3.2 daemon → 以 swtest 執行新
+`install.sh --bundle <0.4.0 release 候選 tarball> -- <模式旗標>` → 驗證入口、設定、daemon、doctor 與舊 pipx 提示。
+必要檢查見 upgrade_checks.REQUIRED_INSTALL_SH_CHECKS；只支援 systemd-user 與 on-demand（systemd-system 不在此情境）。
+舊 daemon 執行中直接 setup 由預設升級情境的 legacy_handoff_direct_setup（OD-48）驗證。
+
 只依賴標準函式庫與同目錄的 upgrade_checks（容器內以系統 python3 執行）。
 """
 from __future__ import annotations
@@ -43,6 +48,8 @@ OLD_VERSION = "0.3.2"
 NEW_VERSION = "0.4.0"
 ENTRY_NAMES = ("serialwrap", "serialwrapd")
 RUNUSER = shutil.which("runuser") or "/usr/sbin/runuser"
+# `daemon stop` 之後等舊 daemon 行程樹與 socket 消失的上限（秒）；逾時該步驟判 FAIL（on-demand 預熱競態裁決）。
+STOP_WAIT_S = 60.0
 
 BENCH_PROFILE = """\
 profiles:
@@ -59,8 +66,13 @@ targets:
 
 
 class Driver:
-    def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path) -> None:
+    def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path, *,
+                 scenario: str = "upgrade", installer: pathlib.Path | None = None,
+                 bundle_tarball: pathlib.Path | None = None) -> None:
         self.mode = mode
+        self.scenario = scenario
+        self.installer = installer
+        self.bundle_tarball = bundle_tarball
         self.flag = {"systemd-user": "--user", "systemd-system": "--system"}.get(mode, "--on-demand")
         self.setup_args = [self.flag, "--with-sudo"] if mode == "systemd-system" else [self.flag]
         self.wheel = wheel
@@ -71,6 +83,8 @@ class Driver:
         self.observations: list[dict[str, Any]] = []
         self.samples: list[tuple[float, list[int]]] = []
         self._stop = threading.Event()
+        self.proc_root = pathlib.Path("/proc")
+        self.stop_wait_s = STOP_WAIT_S
         self._log = (out / "steps.ndjson").open("a", encoding="utf-8")
         self.env = {
             "HOME": str(HOME), "USER": USER, "LOGNAME": USER, "SHELL": "/bin/bash", "LANG": "C.UTF-8",
@@ -143,10 +157,32 @@ class Driver:
     def wait_no_daemon(self, timeout: float = 30.0) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not uc.scan_daemon_instances():
+            if not uc.scan_daemon_instances(self.proc_root):
                 return True
             time.sleep(0.2)
         return False
+
+    def stop_daemon(self, label: str) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+        """`serialwrap daemon stop` 後等舊 daemon 行程樹結束且 socket 移除（有界逾時 stop_wait_s）才回傳。
+
+        0.3.2 的 daemon.stop 先回應，之後才關 server（刪 socket）、收尾 session 與鎖；行程結束前呼叫 `daemon start`
+        會掃到舊行程而回 DAEMON_ALREADY_RUNNING_ELSEWHERE，之後沒有 daemon（Docker on-demand 預熱競態）。
+        回傳的等待結果由呼叫端寫進該步驟判定列的 detail.stop_wait；gone 為 False 時該步驟判 FAIL。"""
+        before = uc.daemon_process_tree(self.proc_root)
+        config = CONFIG / "config.yaml"
+        config_text = config.read_text(encoding="utf-8", errors="replace") if config.is_file() else ""
+        sockets = uc.daemon_socket_paths(before, config_text, proc_root=self.proc_root)
+        proc = self.sw("daemon", "stop", label=label)
+        wait = uc.wait_daemon_gone(before, sockets, timeout=self.stop_wait_s, proc_root=self.proc_root)
+        self._log.write(json.dumps({"label": label + "（等待舊 daemon 行程樹與 socket 消失）", "stop_wait": wait},
+                                   ensure_ascii=False, sort_keys=True) + "\n")
+        self._log.flush()
+        return proc, wait
+
+    @staticmethod
+    def stop_wait_failed(label: str, wait: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        """舊 daemon 逾時未結束時代替被略過的步驟（rc=124），使呼叫端的既有判定照常判 FAIL。"""
+        return subprocess.CompletedProcess([label], 124, "", f"舊 daemon 未於 {wait.get('timeout_s')} 秒內結束，略過：{label}")
 
     def start_daemon(self, label: str) -> subprocess.CompletedProcess[str]:
         if self.mode == "systemd-user":
@@ -180,7 +216,7 @@ class Driver:
     # ---------- 監看 ----------
     def _monitor(self) -> None:
         while not self._stop.is_set():
-            self.samples.append((time.monotonic(), uc.scan_daemon_instances()))
+            self.samples.append((time.monotonic(), uc.scan_daemon_instances(self.proc_root)))
             time.sleep(0.02)
 
     def prepare_user_manager(self) -> None:
@@ -256,7 +292,10 @@ class Driver:
         elif self.mode == "systemd-user":
             restart = [self.sw("service", "restart", label="0.3.2 service restart")]
         else:
-            restart = [self.sw("daemon", "stop", label="0.3.2 daemon stop"), self.start_daemon("0.3.2 daemon start")]
+            stop, seed_wait = self.stop_daemon("0.3.2 daemon stop")
+            start = self.start_daemon("0.3.2 daemon start") if seed_wait["gone"] \
+                else self.stop_wait_failed("0.3.2 daemon start", seed_wait)
+            restart = [stop, start]
         self.wait_daemon(version=OLD_VERSION)
         cmds = [
             self.sw("alias", "set", "--session-id", "shellboard:COM7", "--alias", "upgbench"),
@@ -267,12 +306,15 @@ class Driver:
         ]
         self.baseline = self.state_view()
         self.cfg_before = self.cfg_files()
-        self.add(uc.judge_seed("seed_user_data", rcs=[p.returncode for p in restart + cmds], baseline=self.baseline,
-                               config_files=self.cfg_before))
+        seed = uc.judge_seed("seed_user_data", rcs=[p.returncode for p in restart + cmds], baseline=self.baseline,
+                             config_files=self.cfg_before)
+        if self.mode == "on-demand":
+            seed["detail"]["stop_wait"] = seed_wait
+        self.add(seed)
         self.add(uc.judge_doctor("doctor_green_old", self.doctor("0.3.2 doctor"), require_pairing=False))
 
     def _site(self) -> dict[str, Any]:
-        return {"daemon_pids": uc.scan_daemon_instances(), "entries": self.entries(),
+        return {"daemon_pids": uc.scan_daemon_instances(self.proc_root), "entries": self.entries(),
                 "files": self.cfg_files()}
 
     @staticmethod
@@ -302,7 +344,7 @@ class Driver:
             self.add(uc.row("upgrade_with_old_daemon_running", "PASS", None, outcome="switched"))
             self.add(uc.judge_legacy_direct_setup(
                 "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
-                old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(),
+                old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(self.proc_root),
                 cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=overlaps,
                 new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
             return True
@@ -324,9 +366,10 @@ class Driver:
         if already:
             self.add(uc.row("upgrade_after_stop", "PASS", None, outcome="not_needed_handoff_succeeded"))
         else:
-            stop = self.sw("daemon", "stop", label="0.3.2 daemon stop")
-            gone = self.wait_no_daemon()
-            proc = self.run([str(self.new_cli), "setup", *self.setup_args], label="0.4.0 setup", timeout=600)
+            stop, wait = self.stop_daemon("0.3.2 daemon stop")
+            gone = wait["gone"]
+            proc = self.run([str(self.new_cli), "setup", *self.setup_args], label="0.4.0 setup", timeout=600) if gone \
+                else self.stop_wait_failed("0.4.0 setup", wait)
             body = self.parse(proc) or {}
             install = body.get("install") or {}
             ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
@@ -338,7 +381,10 @@ class Driver:
             self.add(uc.row("upgrade_after_stop", "PASS" if ok else "FAIL", None if ok else "停舊 daemon 後 0.4.0 setup 失敗",
                             stop_rc=stop.returncode, old_gone=gone, setup_rc=proc.returncode,
                             op=install.get("op"), from_version=install.get("from_version"),
-                            error_code=body.get("error_code"), backup_dir=install.get("backup_dir")))
+                            error_code=body.get("error_code"), backup_dir=install.get("backup_dir"), stop_wait=wait))
+        self._judge_entries_and_config()
+
+    def _judge_entries_and_config(self) -> None:
         # 入口：~/.local/bin 兩個入口改指 0.4.0 版本目錄，舊 pipx 入口記錄在備份 entries.json
         entries = self.entries()
         target_dir = str(VERSIONS / NEW_VERSION / "bin")
@@ -359,10 +405,41 @@ class Driver:
                                        self.expected_overwrites())
         self.add(cfg)
 
+    def phase_install_sh(self) -> None:
+        """OD-50：停 0.3.2 daemon 後以新 install.sh 安裝 0.4.0 bundle tarball（離線 --bundle）。"""
+        stop, wait = self.stop_daemon("0.3.2 daemon stop（install.sh 前）")
+        gone = wait["gone"]
+        ok = stop.returncode == 0 and gone
+        self.add(uc.row("old_daemon_stopped", "PASS" if ok else "FAIL", None if ok else "0.3.2 daemon 未停止",
+                        stop_rc=stop.returncode, old_gone=gone, instances=uc.scan_daemon_instances(self.proc_root),
+                        stop_wait=wait))
+        # 容器 /tmp 為 docker tmpfs（預設 noexec），解開的 bundle 無法執行：TMPDIR 改指 swtest 可執行的目錄
+        tmpdir = HOME / ".cache" / "sw-install-tmp"
+        self.run(["mkdir", "-p", str(tmpdir)], label="mkdir TMPDIR")
+        self.env["TMPDIR"] = str(tmpdir)
+        try:
+            proc = self.run(["bash", str(self.installer), "--bundle", str(self.bundle_tarball), "--", self.flag],
+                            label="install.sh --bundle（0.4.0）", timeout=600) if gone \
+                else self.stop_wait_failed("install.sh --bundle（0.4.0）", wait)
+        finally:
+            del self.env["TMPDIR"]
+        body = self.parse(proc) or {}
+        pipx_left = any((HOME / rel / "venvs" / "serialwrap").is_dir() for rel in (".local/share/pipx", ".local/pipx"))
+        leftover = sorted(str(p) for p in tmpdir.glob("serialwrap-install.*"))
+        self.add(uc.judge_install_sh("install_sh_upgrade", rc=proc.returncode, body=body,
+                                     output=proc.stdout + proc.stderr, pipx_venv_left=pipx_left,
+                                     leftover_tmp=leftover, new_version=NEW_VERSION))
+        install = body.get("install") or {}
+        start_step = next((s for s in install.get("steps") or [] if s.get("step") == "start_and_verify"), {})
+        if (start_step.get("detail") or {}).get("started") is False:
+            self.observations.append({"id": "OBS-UPGRADE-NOT-STARTED", "phase": "install_sh_upgrade",
+                                      "detail": start_step.get("detail")})
+        self._judge_entries_and_config()
+
     def phase_new_running(self) -> None:
         start = self.start_daemon("0.4.0 start")
         status = self.wait_daemon(version=NEW_VERSION) or {}
-        pids = uc.scan_daemon_instances()
+        pids = uc.scan_daemon_instances(self.proc_root)
         argv = []
         if status.get("pid"):
             try:
@@ -382,7 +459,7 @@ class Driver:
     def phase_new_running_system(self) -> None:
         """systemd-system：新 daemon 已由 setup 啟動（不得由 driver 代啟），驗證來源、監管收斂、狀態與 doctor。"""
         status = self.wait_daemon(version=NEW_VERSION) or {}
-        pids = uc.scan_daemon_instances()
+        pids = uc.scan_daemon_instances(self.proc_root)
         argv = []
         if status.get("pid"):
             try:
@@ -448,8 +525,9 @@ class Driver:
 
     def phase_downgrade(self) -> None:
         """release-0.4.0-plan.md 的手動降級程序：停 daemon → 移除指向版本目錄的入口 → pipx 重新安裝 0.3.2 → setup → 啟動。"""
-        steps = [self.sw("daemon", "stop", label="0.4.0 daemon stop")]
-        gone = self.wait_no_daemon()
+        stop, wait = self.stop_daemon("0.4.0 daemon stop")
+        steps = [stop]
+        gone = wait["gone"]
         removed = []
         for name in ENTRY_NAMES:
             path = BIN / name
@@ -460,25 +538,28 @@ class Driver:
         steps.append(self.run(["pipx", "install", "--pip-args", "--no-index --find-links=/opt/sw-old", str(self.wheel)],
                               label="pipx install 0.3.2（降級）", timeout=600))
         steps.append(self.sw("setup", self.flag, label="0.3.2 setup（降級）"))
-        steps.append(self.start_daemon("0.3.2 start（降級）"))
+        steps.append(self.start_daemon("0.3.2 start（降級）") if gone else self.stop_wait_failed("0.3.2 start（降級）", wait))
         status = self.wait_daemon(version=OLD_VERSION) or {}
         version = self.cli_version()
         ok = all(p.returncode == 0 for p in steps) and gone and version == f"serialwrap {OLD_VERSION}" \
-            and status.get("version") == OLD_VERSION and uc.scan_daemon_instances() == [status.get("pid")]
+            and status.get("version") == OLD_VERSION and uc.scan_daemon_instances(self.proc_root) == [status.get("pid")]
         self.add(uc.row("downgrade_manual", "PASS" if ok else "FAIL", None if ok else "手動降級回 0.3.2 失敗",
                         rcs=[p.returncode for p in steps], old_gone=gone, removed_entries=removed,
-                        cli_version=version, daemon_version=status.get("version"), entries=self.entries()))
+                        cli_version=version, daemon_version=status.get("version"), entries=self.entries(),
+                        stop_wait=wait))
         self.add(uc.judge_files_preserved("config_preserved_downgrade", self.cfg_before, uc.snapshot_files(CONFIG)))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_downgrade"))
         self.add(uc.judge_doctor("doctor_green_downgrade", self.doctor("0.3.2 doctor（降級）"), require_pairing=False))
 
     def phase_reupgrade(self) -> None:
-        stop = self.sw("daemon", "stop", label="0.3.2 daemon stop（重新升級）")
-        gone = self.wait_no_daemon()
-        proc = self.run([str(self.new_cli), "setup", self.flag], label="0.4.0 setup（重新升級）", timeout=600)
+        stop, wait = self.stop_daemon("0.3.2 daemon stop（重新升級）")
+        gone = wait["gone"]
+        proc = self.run([str(self.new_cli), "setup", self.flag], label="0.4.0 setup（重新升級）", timeout=600) if gone \
+            else self.stop_wait_failed("0.4.0 setup（重新升級）", wait)
         body = self.parse(proc) or {}
         op = (body.get("install") or body.get("update") or {})
-        start = self.start_daemon("0.4.0 start（重新升級）")
+        start = self.start_daemon("0.4.0 start（重新升級）") if gone \
+            else self.stop_wait_failed("0.4.0 start（重新升級）", wait)
         status = self.wait_daemon(version=NEW_VERSION) or {}
         version = self.cli_version()
         ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
@@ -489,7 +570,7 @@ class Driver:
                                       "note": "手動降級後 current-release.json 仍記 0.4.0，重新升級被記為 0.4.0→0.4.0 update"})
         self.add(uc.row("reupgrade", "PASS" if ok else "FAIL", None if ok else "降級後重新升級失敗",
                         setup_rc=proc.returncode, op=op.get("op"), from_version=op.get("from_version"),
-                        daemon_version=status.get("version"), cli_version=version))
+                        daemon_version=status.get("version"), cli_version=version, stop_wait=wait))
         self.sw("daemon", "stop", label="收尾 daemon stop")
         self.wait_no_daemon()
 
@@ -499,6 +580,14 @@ class Driver:
         monitor = threading.Thread(target=self._monitor, daemon=True)
         monitor.start()
         try:
+            if self.scenario == "install-sh":
+                self.phase_old_install()
+                self.phase_seed()
+                self.phase_install_sh()
+                self.phase_new_running()
+                self.sw("daemon", "stop", label="收尾 daemon stop")
+                self.wait_no_daemon()
+                return
             self.phase_old_install()
             self.phase_seed()
             already = self.phase_upgrade_running()
@@ -529,7 +618,14 @@ def main() -> int:
     parser.add_argument("--wheel", required=True)
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--scenario", choices=("upgrade", "install-sh"), default="upgrade")
+    parser.add_argument("--installer", help="install-sh 情境：容器內 install.sh 路徑")
+    parser.add_argument("--bundle-tarball", help="install-sh 情境：0.4.0 release 候選 tarball")
     args = parser.parse_args()
+    if args.scenario == "install-sh" and not (args.installer and args.bundle_tarball):
+        parser.error("--scenario install-sh 需要 --installer 與 --bundle-tarball")
+    if args.scenario == "install-sh" and args.mode == "systemd-system":
+        parser.error("--scenario install-sh 不支援 systemd-system（該模式只驗 OD-48 直接 setup 成功路徑）")
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     wheel = pathlib.Path(args.wheel)
@@ -541,7 +637,9 @@ def main() -> int:
     except (OSError, ValueError):
         pass
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    driver = Driver(args.mode, wheel, bundle, out)
+    driver = Driver(args.mode, wheel, bundle, out, scenario=args.scenario,
+                    installer=pathlib.Path(args.installer) if args.installer else None,
+                    bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None)
     error = None
     try:
         driver.execute()
@@ -551,6 +649,7 @@ def main() -> int:
     report = {
         "schema": "serialwrap.upgrade-report.v1",
         "mode": args.mode,
+        "scenario": args.scenario,
         "evidence_layer": "L1.5-docker",
         "producer": "scripts/docker/run-upgrade.sh",
         "old_version": OLD_VERSION,
@@ -567,8 +666,12 @@ def main() -> int:
         "checks": driver.rows,
         "observations": driver.observations,
     }
-    required = uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM if args.mode == "systemd-system" else uc.REQUIRED_CHECKS
-    report["scope"] = "legacy_direct_setup_success_path" if args.mode == "systemd-system" else "full"
+    if args.scenario == "install-sh":
+        required, report["scope"] = uc.REQUIRED_INSTALL_SH_CHECKS, "install_sh"
+    elif args.mode == "systemd-system":
+        required, report["scope"] = uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM, "legacy_direct_setup_success_path"
+    else:
+        required, report["scope"] = uc.REQUIRED_CHECKS, "full"
     report["verdict"] = uc.overall_verdict(driver.rows, required=required)
     (out / "upgrade-report.json").write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                                              encoding="utf-8")
