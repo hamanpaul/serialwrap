@@ -1,4 +1,8 @@
-### Added
+---
+type: feat
+scope: command
+issue: 229
+---
 
 追蹤 [#229](https://github.com/hamanpaul/serialwrap/issues/229)，驗證紀錄見 [每命令完成條件驗證](../docs/229-command-completion-validation.md)。
 

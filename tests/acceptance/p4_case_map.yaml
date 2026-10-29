@@ -470,6 +470,48 @@ cases:
   - sw-pal::fs_lock::symlink_or_copy_dir_windows_fallback_copies
   evidence: target/p4-evidence/df16-windows-skill-copy.json
   necessity: required
+- case_id: sc39-legacy-daemon-handoff
+  invariants:
+  - no_reopen_before_handoff
+  - zero_tx_on_reject
+  layer: L1
+  platforms:
+  - linux
+  capabilities: []
+  artifact: rust-cli-bundle
+  tests:
+  - sw-cli::mgmt_legacy_handoff::d3_2_foreign_socket_daemon_without_rpc_fails_closed
+  - sw-cli::mgmt_legacy_handoff::d3_2_supervisor_running_without_rpc_daemon_fails_closed
+  - sw-cli::mgmt_legacy_handoff::d8_disabled_running_unit_stays_disabled_after_refusal
+  - sw-cli::mgmt_legacy_handoff::d8_disabled_running_unit_stays_disabled_after_update
+  - sw-cli::mgmt_legacy_handoff::legacy_a_on_demand_install_stops_with_rpc_and_setup_starts_new_daemon
+  - sw-cli::mgmt_legacy_handoff::legacy_a_systemd_user_main_pid_uses_systemctl_stop
+  - sw-cli::mgmt_legacy_handoff::legacy_b_native_exe_in_bundle_path_fails_closed
+  - sw-cli::mgmt_legacy_handoff::legacy_b_python_script_under_versions_fails_closed
+  - sw-cli::mgmt_legacy_handoff::legacy_b_unknown_version_fails_closed
+  - sw-cli::mgmt_legacy_handoff::legacy_b_version_not_below_040_fails_closed
+  - sw-cli::mgmt_legacy_handoff::legacy_c_flashing_at_precheck_refuses_without_stop
+  - sw-cli::mgmt_legacy_handoff::legacy_c_session_busy_at_precheck_refuses_without_stop
+  - sw-cli::mgmt_legacy_handoff::legacy_d_never_exits_is_pending_without_restart
+  - sw-cli::mgmt_legacy_handoff::legacy_e_relaunch_loop_after_three_stops
+  - sw-cli::mgmt_legacy_handoff::legacy_e_single_relaunch_is_restopped
+  - sw-cli::mgmt_legacy_handoff::legacy_f_post_switch_failure_restores_install_without_restart
+  - sw-cli::mgmt_legacy_handoff::legacy_f_pre_switch_failure_releases_hold_without_restart
+  - sw-cli::mgmt_legacy_handoff::legacy_g_main_pid_mismatch_uses_rpc_stop
+  - sw-cli::mgmt_legacy_handoff::legacy_h_other_same_uid_daemon_fails_closed_before_stop
+  - sw-cli::mgmt_legacy_handoff::legacy_h_other_uid_daemon_is_noted_not_blocking
+  - sw-cli::mgmt_legacy_handoff::legacy_i_systemd_system_fixed_socket_detected_for_update_and_install
+  - sw-cli::mgmt_legacy_handoff::legacy_k_relaunch_inside_stability_window_is_not_stopped
+  - sw-cli::mgmt_legacy_handoff::legacy_l_crash_loop_recover_journal
+  - sw-cli::mgmt_legacy_handoff::legacy_l_crash_points_are_separate_from_frozen_list
+  - sw-cli::mgmt_legacy_handoff::s1x_c1_first_install_detects_systemd_system_daemon_on_fixed_socket
+  - sw-cli::mgmt_legacy_handoff::s1x_c1_supervision_switch_detects_systemd_system_daemon_on_fixed_socket
+  - sw-cli::mgmt_legacy_handoff::s1x_c1_update_detects_systemd_system_daemon_on_fixed_socket
+  - tests/test_contracts_catalog.py::test_sc39_registered
+  evidence: target/p4-evidence/sc39-legacy-daemon-handoff.json
+  necessity: required
+  skip_registered:
+    python: rust-only 契約（behavior_changes 已登記，OD-48）
 - case_id: win-task-logon-trigger
   evidence_status: BLOCKED-OWNER
   invariants:

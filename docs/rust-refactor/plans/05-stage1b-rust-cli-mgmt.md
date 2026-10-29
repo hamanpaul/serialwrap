@@ -1941,6 +1941,15 @@ python3 -m pytest -q tests/test_rust_release_manifest_schema.py
 
 ## Task 12：§12.1 首次安裝、更新流程與 `setup --rollback`（SC-23）；`supervision-mode set` 交接護欄（SC-22，R1-F3）
 
+> **OD-48 修訂（2026-10-29，SC-39；逐名授權）**：本 Task 對「不支援交接的 daemon 一律 fail-closed」的語意，對 **0.3.x Python daemon** 改為舊版停止路徑；其餘不支援交接者（例如 P8 Task 14 之前的 Rust daemon）維持 fail-closed，下列凍結節點期望不變：`update_handoff_unsupported_daemon_refuses_without_stop`、`revert_handoff_unsupported_new_daemon_keeps_journal`、`supervision_set_handoff_unsupported_refuses_without_stop`。規格以 `docs/rust-refactor/reviews/od48-design-v2.md`（docs/parity-amendments）D1～D10 為準，摘要：
+> - **判定（D1，全部成立才算）**：`daemon.handoff_stop` 回 `METHOD_NOT_FOUND`；版本 < 0.4.0（取自拒絕回應，缺漏時 `health.status`）；該 pid 正向辨識為 Python 0.3.x daemon（POSIX：`/proc/<pid>/exe` 為 python 直譯器、argv 為 `…/serialwrapd` script 或 `-m sw_core.daemon`；Windows：`python.exe` 或 `serialwrapd.exe` launcher＋子行程樹）；執行檔、argv[0] 與 script 不在 `<install_root>/versions/` 底下。
+> - **套用範圍（D2）**：install／update 的 `stop_supervisor`、install 後段 reconcile（以 `OldStop::AlreadyStopped` 呼叫）、回退 `stop_for_revert_with_hold` 與 `recover_journal`；`supervision-mode set` 不套用（維持 fail-closed）。
+> - **停止前檢查（D3）**：依舊模式解析 instance endpoint（S1X-c-1：systemd-system 固定 `/run/serialwrap/serialwrapd.sock`、Windows 模式 `local_default_endpoint`、其餘 config 可連的 unix `socket_path` 再退回預設）；基準掃描（目標以外的同 uid daemon → `DEVICE_STILL_HELD`）；`mcu.status`／`session.list` 忙碌 → `FLASHING_BUSY`／`SESSION_BUSY`；外部監管者 → fail-closed；送 stop 前寫 `install-journal.legacy.json`（不含 env，sha256 記進 journal）。
+> - **停止手段（D4）**：pid 為 systemd unit 的 `MainPID` → hold 之下 `systemctl [--user] stop`；否則 RPC `daemon.stop`；不硬殺。
+> - **已停判準（D5）**：行程樹結束、無同 uid 行程持有 UART、無新 serialwrapd，連續 5 s；上限 330 s，逾時 `TIMEOUT`／`legacy_stop_pending`（hold 與 journal 保留、不重啟）；重拉者重做 D1＋D3 再停，總共最多 3 次，超過 `relaunch_loop`。
+> - **失敗（D6，OD-48 修訂）**：舊 daemon 停止後任一步失敗 → 還原安裝狀態、不啟動任何 daemon，報告 `legacy_daemon_stopped`、`restored`、`restart_hint`。**成功（D7）**：照常切換，因 `original.daemon.is_some()` 由 setup 啟動新 daemon；報告 `legacy_stop`。
+> - **測試**：`crates/sw-cli/tests/mgmt_legacy_handoff.rs`（D9 (a)～(l)）；legacy 專用 crash point 另立 `LEGACY_CRASH_POINTS`，不加進本 Task 的凍結 `CRASH_POINTS` 迴圈。
+
 **Test author model:** agy-gemini-3.8-flash-high
 **Implementer model:** codex-gpt-6-luna-max
 **Changelog fragment:** `changelog.d/<issue>-rust-p4-update-rollback.md`（`type: feat`，`scope: rust-cli`）
@@ -2061,7 +2070,7 @@ pub fn run_supervision_switch(ctx: &mut Ctx, target: &SupervisionMode, with_sudo
 | 前景／背景命令、lease、recovering | `SESSION_BUSY` | `update_safety_check` | `busy:[…]`（與 P8 SC-23-G 相同碼） |
 | 安全探測 RPC 失敗／逾時／格式異常 | 該 RPC 的碼（`TIMEOUT`、`SOCKET_ERROR`、`INVALID_RESPONSE`…） | `update_safety_check` | `probe:<method>` |
 | 步驟 3 daemon 原子交接判定忙碌（預檢後才進入的 `file.push`、flash 等） | daemon 回的 `FLASHING_BUSY`／`SESSION_BUSY` | `update_safety_check` | `busy:[…]`（daemon 回傳，每筆多 `ops`）、`handoff:"refused"`；hold 已 `release_autostart`（R5-F1）且監管已還原 enabled、未送 `daemon.stop`、未硬停 |
-| 步驟 3 交接無法確認（daemon 不支援回 `METHOD_NOT_FOUND`、回應格式不符、連線／逾時） | 原碼或 `INVALID_RESPONSE`／`TIMEOUT`／`SOCKET_ERROR` | `update_safety_check` | `probe:"daemon.handoff_stop"`、`handoff_outcome:"refused"|"unknown"`；hold 已 `release_autostart`（R5-F1）且監管已還原 enabled、未硬停、不切換 |
+| 步驟 3 交接無法確認（daemon 不支援回 `METHOD_NOT_FOUND` 且不符 OD-48 D1 的 0.3.x 判定、回應格式不符、連線／逾時） | 原碼或 `INVALID_RESPONSE`／`TIMEOUT`／`SOCKET_ERROR` | `update_safety_check` | `probe:"daemon.handoff_stop"`、`handoff_outcome:"refused"|"unknown"`；hold 已 `release_autostart`（R5-F1）且監管已還原 enabled、未硬停、不切換 |
 | ping 不通但仍有 daemon 行程，或身分無法確認 | `DEVICE_STILL_HELD` | `update_safety_check` | `pids`、`holder_unknown` |
 | 舊 daemon 10 s 內未結束 | `TIMEOUT` | `update_confirm_released` | `pids` |
 | tty 仍被持有 | `DEVICE_STILL_HELD` | `update_confirm_released` | `pids`、`paths` |

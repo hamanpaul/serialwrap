@@ -16,6 +16,7 @@ REQUIRED_CHECKS: tuple[str, ...] = (
     "seed_user_data",
     "doctor_green_old",
     "upgrade_with_old_daemon_running",
+    "legacy_handoff_direct_setup",
     "upgrade_after_stop",
     "entries_replaced",
     "config_preserved_upgrade",
@@ -32,6 +33,24 @@ REQUIRED_CHECKS: tuple[str, ...] = (
     "no_two_reader",
 )
 
+# OD-48 SPEC-GAP #10：systemd-system 只驗「0.3.2 daemon 執行中直接 setup」成功路徑（rollback、手動降級與重新升級
+# 屬完整流程，只在 systemd-user／on-demand 跑），必要檢查為完整集合的子集。
+REQUIRED_CHECKS_SYSTEMD_SYSTEM: tuple[str, ...] = (
+    "old_install_0_3_2",
+    "seed_user_data",
+    "doctor_green_old",
+    "upgrade_with_old_daemon_running",
+    "legacy_handoff_direct_setup",
+    "upgrade_after_stop",
+    "entries_replaced",
+    "config_preserved_upgrade",
+    "new_daemon_started",
+    "supervision_reconciled",
+    "state_compatible_upgrade",
+    "doctor_green_new",
+    "no_two_reader",
+)
+
 # 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
 ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
 
@@ -43,7 +62,9 @@ SEED_BINDINGS = {"shellboard:COM7": "/dev/serial/by-id/usb-UPGRADE_REBOUND-if00-
 SEED_CONFIG_FILES = frozenset({"profiles/bench.yaml"})
 
 # 規格上預期的拒絕原因（release-0.4.0-plan.md §6）：現場未改動之外，拒絕原因也必須相符。
+# OD-48 起只用於「非 legacy 的不支援交接」daemon；0.3.x daemon 必須改走舊版停止路徑，拒絕即 FAIL。
 REFUSAL_LEGACY_HANDOFF = {"error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+LEGACY_STOP_METHODS = frozenset({"systemctl_stop", "rpc_daemon_stop"})
 REFUSAL_ROLLBACK_UNAVAILABLE = {"error_code": "INVALID_ARGS", "reason": "rollback_unavailable"}
 
 
@@ -154,13 +175,19 @@ def snapshot_files(root: Path) -> dict[str, str]:
     return result
 
 
-def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str, str]) -> dict[str, Any]:
+def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str, str],
+                          expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
+    """既有檔案逐位元組保留。`expected_overwrites`（路徑 → 新 bundle 權威內容的 sha256）列出 setup 依 0.3.2 同語意
+    覆寫的套件管理檔：只允許變成該權威內容；遺失或其他內容一律 FAIL（S1-f3c66b4-1）。"""
+    expected = expected_overwrites or {}
     missing = sorted(set(before) - set(after))
-    changed = sorted(k for k in before if k in after and before[k] != after[k])
+    package_updated = sorted(k for k in before if k in after and before[k] != after[k] and expected.get(k) == after[k])
+    changed = sorted(k for k in before if k in after and before[k] != after[k] and k not in package_updated)
     added = sorted(set(after) - set(before))
     if missing or changed:
-        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", missing=missing, changed=changed, added=added)
-    return row(check_id, "PASS", None, files=len(before), added=added)
+        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", missing=missing, changed=changed, added=added,
+                   package_updated=package_updated)
+    return row(check_id, "PASS", None, files=len(before), added=added, package_updated=package_updated)
 
 
 def _alias_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -227,6 +254,60 @@ def judge_refusal(check_id: str, before: dict[str, Any], after: dict[str, Any], 
     return result
 
 
+def judge_upgrade_running_refusal(check_id: str, before: dict[str, Any], after: dict[str, Any],
+                                  body: dict[str, Any] | None, *, legacy: bool) -> dict[str, Any]:
+    """舊 daemon 執行中直接 setup 卻被拒絕：0.3.x（legacy）daemon 依 OD-48 不得再拒絕 → FAIL；
+    其他不支援交接的 daemon 才沿用 REFUSAL_LEGACY_HANDOFF 的拒絕判定。"""
+    if legacy:
+        body = body if isinstance(body, dict) else {}
+        return row(check_id, "FAIL", "OD-48：0.3.x daemon 執行中的 setup 必須改走舊版停止路徑，不得拒絕",
+                   outcome="refused", refusal={k: body.get(k) for k in ("error_code", "probe", "reason", "phase")})
+    return judge_refusal(check_id, before, after, body, REFUSAL_LEGACY_HANDOFF)
+
+
+def _step_detail(body: dict[str, Any], name: str) -> dict[str, Any]:
+    report = body.get("install") or body.get("update") or {}
+    step = next((s for s in report.get("steps") or [] if isinstance(s, dict) and s.get("step") == name), {})
+    detail = step.get("detail")
+    return detail if isinstance(detail, dict) else {}
+
+
+def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, Any] | None, old_pids: list[int],
+                              old_alive_after: list[int], status_after: dict[str, Any] | None, instances_after: list[int],
+                              cfg_before: dict[str, str], cfg_after: dict[str, str], overlaps: list[dict[str, Any]],
+                              new_version: str = "0.4.0", old_version: str = "0.3.2",
+                              expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
+    """OD-48：0.3.2 daemon 執行中直接 setup → 成功切換、舊 daemon 行程樹結束、新 daemon 由 setup 自己啟動
+    （判定在 driver 任何啟動動作之前取樣；setup 沒啟動就 FAIL）、config／profiles 逐位元組保留、無兩個 daemon 重疊。"""
+    body = body if isinstance(body, dict) else {}
+    report = body.get("install") or body.get("update") or {}
+    legacy = _step_detail(body, "stop_supervisor").get("legacy_stop") or {}
+    started = _step_detail(body, "start_and_verify").get("started")
+    status = status_after if isinstance(status_after, dict) else {}
+    preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
+    detail = {"setup_rc": setup_rc, "op": report.get("op"), "to_version": report.get("to_version"),
+              "legacy_stop": legacy, "started_by_setup": started, "old_pids": list(old_pids),
+              "old_alive_after": list(old_alive_after), "daemon_version_after": status.get("version"),
+              "daemon_pid_after": status.get("pid"), "instances_after": list(instances_after),
+              "overlaps": overlaps[:20], "config": preserved["detail"], "error_code": body.get("error_code"),
+              "refusal_reason": body.get("reason")}
+    if not old_pids:
+        return row(check_id, "INSUFFICIENT", "setup 前沒有執行中的 0.3.2 daemon，無法驗證", **detail)
+    if setup_rc != 0 or body.get("ok") is not True or report.get("to_version") != new_version:
+        return row(check_id, "FAIL", "0.3.2 daemon 執行中直接 setup 未成功切換", **detail)
+    if legacy.get("method") not in LEGACY_STOP_METHODS or legacy.get("from_version") != old_version:
+        return row(check_id, "FAIL", "報告缺少 legacy_stop 或停止手段／來源版本不符", **detail)
+    if old_alive_after:
+        return row(check_id, "FAIL", "舊 daemon 行程樹在 setup 完成後仍存在", **detail)
+    if started is not True or status.get("version") != new_version or instances_after != [status.get("pid")]:
+        return row(check_id, "FAIL", "新 daemon 不是由 setup 啟動（driver 不得代啟）或未唯一執行", **detail)
+    if preserved["verdict"] != "PASS":
+        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", **detail)
+    if overlaps:
+        return row(check_id, "FAIL", "升級期間同一時間出現兩個以上 serialwrapd 實例（two-reader）", **detail)
+    return row(check_id, "PASS", None, **detail)
+
+
 def judge_seed(check_id: str, *, rcs: list[int], baseline: dict[str, Any], config_files: Iterable[str]) -> dict[str, Any]:
     """基線須含 SEED_ALIASES、SEED_BINDINGS 已生效（session list 的 by-id 為重綁值）與 SEED_CONFIG_FILES。"""
     names = {a.get("alias") for a in baseline.get("aliases") or []}
@@ -254,11 +335,11 @@ def judge_rollback_success(check_id: str, *, cli_version: str | None, daemon_ver
     return row(check_id, "PASS" if ok else "FAIL", None if ok else f"setup --rollback 未完整回到 {old_version}", **detail)
 
 
-def overall_verdict(rows: list[dict[str, Any]]) -> str:
+def overall_verdict(rows: list[dict[str, Any]], required: tuple[str, ...] = REQUIRED_CHECKS) -> str:
     """任一 FAIL 或檢查 id 重複 → FAIL；缺必要檢查或任一 INSUFFICIENT → INSUFFICIENT；否則 PASS。"""
     ids = [r.get("id") for r in rows]
     if len(ids) != len(set(ids)) or any(r.get("verdict") == "FAIL" for r in rows):
         return "FAIL"
-    if set(REQUIRED_CHECKS) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
+    if set(required) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
         return "INSUFFICIENT"
     return "PASS"
