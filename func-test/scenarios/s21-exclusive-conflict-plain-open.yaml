@@ -25,7 +25,9 @@ profile:
   ready_probe: 'echo __READY__${nonce}'
   timeout_s: 15
 # OD-39（gaps #1／#8／#9）：daemon 啟動前以普通 open（不 flock、不 TIOCEXCL，模擬 minicom）占用端點；
-# 「external_close 前從未進入 ATTACHING／READY」以窗口內 COM0 無 RX／TX 的 WAL 紀錄判定。
+# OD-47（CHG-S21-OD39-GAP9-01 APPROVED）判定語意：external_close 前埠未成功開啟且未進 READY；三層替代證據為
+# 窗口內 COM0 無 RX／TX 的 WAL 紀錄、assert_wire_offsets serial_read == 0、關鍵點狀態取樣（Python 基線 attach 失敗前
+# 本就短暫經過 ATTACHING，不列判定）。
 pre_daemon_steps:
   # daemon 啟動前 DUT 輸出暫存於 bridge，快照無法 settled；窗口只取 mono 時間點（assert_wal_window），
   # 零 TX 改以 assert_wire_offsets 的絕對 serial_read == 0 判定（daemon 不存在時不可能有 serial_read）。
@@ -105,7 +107,7 @@ steps:
     save_as: att_plain_force
     expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
              pids: {list_contains: "{ext.pid}"}}
-  # 單點取樣：此刻 session 不在 ATTACHING／READY（「external_close 前從未進入」runner 無法表達，見 slice21-l15-gaps.md #9）
+  # 關鍵點狀態取樣（OD-47 三層證據之一）：此刻 session 不在 ATTACHING／READY
   - action: wait_cli_until
     argv: ["session", "list"]
     json_path: "sessions.com=COM0.state"

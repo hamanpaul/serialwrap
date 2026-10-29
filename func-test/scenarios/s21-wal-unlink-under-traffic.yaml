@@ -1,4 +1,6 @@
 ---
+# OD-46（2026-10-29）：本情境自 l15_ab 判定逐名移出（情境檔保留），改由 slice21_gate_expect.yaml l15_ab_excluded 所列
+# tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_under_sustained_traffic_keeps_evidence 等承擔。
 meta:
   name: s21-wal-unlink-under-traffic
   category: l15-scenario

@@ -49,6 +49,8 @@ resolved_decisions:
   - {id: PA-OD-L15-WAL, decision: OD-40, resolution: "l15-wal-interference 自 l15_ab 判定逐名移出，改由 l15_ab_excluded 所列 pytest 承擔"}
   - {id: PA-OD-L15-GAPS, decision: OD-39, resolution: "runner 擴充 pre_daemon_steps、assert_when／assert_value、assert_wal_tx_total、assert_any、query_dut_generation、assert_wal_window、assert_wire_offsets（gaps #1／#3／#4／#5／#8 已補、#9 部分承接；#10 另列 PA-OD-L15-GAPS-10）"}
   - {id: PA-OD-T20, decision: "OD-36／OD-37／OD-38", resolution: "8 案案例設計修正（CHG-S21-OD36-*）、DF-20／DF-21 判定（CHG-S21-OD37-DF-01；DF-20 Rust 實作 → P6）、METHOD_NOT_FOUND Rust 專屬（CHG-S21-OD38-MNF-01）"}
+  - {id: PA-OD-EVLAT, decision: OD-45, resolution: "event_latency 改以 L1 結構測試為 gate（五事件 at_most_one_data_item_before_control）＋外部只量 stop_request／command_cancel／release_request（RPC 送出 → RPC 回應；idle 與 flood 20000 B/s）；lease_expiry、drain_receipt 只留 L1；method_revision 2026-10-29.1 待獨立審閱重新凍結"}
+  - {id: PA-OD-L15-GAPS-10, decision: "OD-46／OD-47", resolution: "#10 s21-wal-unlink-under-traffic 自 l15_ab 逐名移出（l15_ab_excluded，由持續流量 WAL unlink 黑箱 A/B 承擔）；#9 CHG-S21-OD39-GAP9-01 APPROVED（外部放手前埠未成功開啟且未進 READY，三層替代證據）"}
   - {id: PA-OD-REPROBE, decision: OD-34, resolution: "l15-delayed-reply（凍結修訂 #1）、s21-reboot-minimal-guard 延至 Slice 2.3（deferred_to_s23）；cowork-01-agent-bad-cmd 屬 Slice 2.2，由 P6 分支承接"}
 # OD-34：自 Slice 2.1 gate 逐名移出、改列 Slice 2.3 出口必須 PASS（情境檔保留）。
 deferred_to_s23:
@@ -74,11 +76,15 @@ l15_ab_excluded:
       - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::reset_renames_nonempty_files_independent_suffix"}
       - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::external_unlink_writes_recreate_meta_then_record"}
     windows_todo: "LOCAL-WINDOWS-TODO：tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running、tests/test_stage0_wal_rotate.py::test_native_rotate_blocked_by_reader_degrades（windows_native，Linux 上 skip）與 reader-hold 案例於 Windows 原生執行（BO-S21-13）"
+  # OD-46（2026-10-29）：比照 OD-40 逐名移出；由 unlink 期間維持持續 RX／TX 的黑箱 A/B 承擔（不改 bridge 工具樹、不用硬連結）。
+  - case_id: s21-wal-unlink-under-traffic
+    decision: OD-46
+    covered_by:
+      - {section: blackbox_python, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_under_sustained_traffic_keeps_evidence"}
+      - {section: blackbox_rust, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_under_sustained_traffic_keeps_evidence"}
+      - {section: blackbox_python, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"}
+      - {section: blackbox_rust, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"}
+      - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::external_unlink_writes_recreate_meta_then_record"}
 # 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
-pending_decisions:
-  - id: PA-OD-EVLAT
-    scenario: "OD-41（外部量測：觸發 RPC 時間 vs WAL 對應 META mono_ts_ns）停下回報：stop_request／command_cancel／lease_expiry／drain_receipt／release_request 五種事件在 Python 與 Rust daemon 的 WAL 皆無對應紀錄；不得在 daemon 加計時欄位，需擁有者裁決可觀測點（新增 WAL META 屬對外格式變更）"
-    evidence: docs/rust-refactor/slice21-l15-gaps.md
-  - id: PA-OD-L15-GAPS-10
-    scenario: "OD-39 已裁決 runner 擴充；其中 gaps #10（s21-wal-unlink-under-traffic 比對範圍）在不改 bridge 工具樹下不可實作，#9 以 WAL RX／TX 紀錄替代狀態 META（兩個 daemon 皆無狀態 META）。需擁有者擇一：核准比較器起點窗口，或改以 unlink 前硬連結保存 WAL"
-    evidence: docs/rust-refactor/slice21-l15-gaps.md
+# 2026-10-29：PA-OD-EVLAT（OD-45）、PA-OD-L15-GAPS-10（OD-46／OD-47）已裁決，移入 resolved_decisions。
+pending_decisions: []
