@@ -896,6 +896,37 @@ def test_l1_lock_cargo_sets_exclude_ignored_tests() -> None:
     assert not flagged, f"cargo 凍結集合含 #[ignore] 列（須經擁有者裁決以 --allow-removal 移除）：{flagged}"
 
 
+# OD-55（2026-10-29）：s21_core.linux 的能力列移入 s21_gate:cap_<cap>（selector `--ignored cap_<cap>__`）。
+_S21_LINUX_CAPS = ("posix_pty", "sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime")
+
+
+@pytest.mark.memory_only
+def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
+    """OD-55：s21_core.linux 不得再有 `cap_*` 或其他 `#[ignore]` 列；每個能力的列改登記於 `s21_gate:cap_<cap>.linux`，
+    其 selector 為 OD-53 能力集合（`_selector_explicit_caps` 恰為該 cap）、nodeid 全為 `cap_<cap>__*` 且為 ignored 測試。
+    非能力列三筆（helper `plain_holder_child`、`real_mkbundle_dev_output_verifies`、`windows_switch_running_exe_rename`）
+    直接自 s21_core.linux 移除。s21_core.windows 須待 Windows 原生收集登記能力集合後才移除（LOCAL-WINDOWS-TODO）。"""
+    ignored = _rust_ignored_tests()
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    core = lock["sets"]["s21_core"]["linux"]["nodeids"]
+    assert not [n for n in core if n.rsplit("::", 1)[-1].startswith("cap_")], "s21_core.linux 仍含 cap_* 列"
+    for name in ("plain_holder_child", "real_mkbundle_dev_output_verifies", "windows_switch_running_exe_rename"):
+        assert not [n for n in core if n.endswith(f"::{name}")], name
+    assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_core:linux:")]
+    moved = 0
+    for cap in _S21_LINUX_CAPS:
+        spec = lock["sets"][f"s21_gate:cap_{cap}"]["linux"]
+        assert _selector_explicit_caps(spec["selector"]) == [cap], spec["selector"]
+        assert spec["nodeids"], cap
+        for nid in spec["nodeids"]:
+            pkg, *_mid, name = nid[len("cargo:"):].split("::")
+            assert name.startswith(f"cap_{cap}__"), nid
+            assert any(p == pkg and n == name for p, _t, n in ignored), f"{nid} 不是 ignored 測試"
+        moved += len(spec["nodeids"])
+    assert moved == 24, moved          # 23（OD-55 列舉）＋ cap_interactive_desktop__exec_or_wait_ctrl_c（linux 亦收集）
+    assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_gate:cap_")]
+
+
 @pytest.mark.process_rpc
 def test_l1_add_only_creates_new_set_inline(tmp_path: Path) -> None:
     """新 set／新平台可由行內 selector 建立（P2-T13 審查修正：計畫的 --l1-add-only 呼叫未附 selector，原實作拒絕）。"""

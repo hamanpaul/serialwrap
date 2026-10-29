@@ -27,6 +27,12 @@ from typing import Any, Sequence
 TEST_LINE = re.compile(r"^test (.*?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 CAPABILITY_TEST = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__")
+
+
+def capability_of(name: str) -> str | None:
+    """libtest 名稱 → 能力名稱（`cap_<cap>__*`）；以最後一段比對，lib 單元測試帶模組路徑者亦適用（P5 第 6 輪）。"""
+    matched = CAPABILITY_TEST.match(name.rsplit("::", 1)[-1])
+    return matched.group(1) if matched else None
 # 與 `git status` 的守門範圍一致：repo 根（本檔上兩層）。
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROVENANCE_SCHEMA = "cargo-l1-provenance.v1"
@@ -282,8 +288,7 @@ def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
             skip_kind = None
         else:
             outcome = "skipped"
-            capability = CAPABILITY_TEST.match(name)
-            skip_kind = "capability" if capability else "other"
+            skip_kind = "capability" if capability_of(name) else "other"
         parsed.append(
             {
                 "nodeid": _nodeid(target, name),
@@ -421,11 +426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
         target.results = _parse_results(run_stdout, target)
 
-        available_caps = {
-            matched.group(1)
-            for name in target.ignored_names
-            if (matched := CAPABILITY_TEST.match(name)) is not None
-        }
+        available_caps = {cap for name in target.ignored_names if (cap := capability_of(name)) is not None}
         selected_caps = [cap for cap in args.caps if cap in available_caps]
         for cap in selected_caps:
             cap_rc, cap_stdout, cap_stderr, cap_complete = _run(
@@ -497,10 +498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _read_report(args.out, report)
     if args.summary_out:
         available_caps = {
-            matched.group(1)
-            for target in targets
-            for name in target.ignored_names
-            if (matched := CAPABILITY_TEST.match(name)) is not None
+            cap for target in targets for name in target.ignored_names if (cap := capability_of(name)) is not None
         }
         evidence_insufficient = {
             matched.group(1)

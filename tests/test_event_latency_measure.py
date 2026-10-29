@@ -26,7 +26,8 @@ def _report(**kw) -> dict:
     contract = elm.load_contract()
     l1 = {n: "passed" for ev in contract["events"] for n in ev["l1_gate"]}
     base = {"runs": runs, "repeats_required": 3, "diagnostic": False, "l1_gate": l1, "freeze_status": "frozen",
-            "method_revision": "x"}
+            "method_revision": "x", "identity": {"daemon_sha256": "a" * 64, "source_commit": "b" * 40, "source_tree_dirty": False,
+                                             "artifact_source_commit": "c" * 40}}
     base.update(kw)
     return base
 
@@ -53,7 +54,8 @@ def test_overall_verdict_requires_full_coverage_l1_gate_and_freeze():
     rep["l1_gate"][first] = "failed"
     assert elm.overall_verdict(rep)[0] == "FAIL"
     for kw in ({"freeze_status": "pending_review_record"}, {"diagnostic": True}, {"l1_gate": {}},
-               {"runs": _report()["runs"][:-1]}):
+               {"runs": _report()["runs"][:-1]}, {"identity": {}},
+               {"identity": {"daemon_sha256": "a" * 64, "source_commit": "b" * 40, "source_tree_dirty": True}}):
         v, reasons = elm.overall_verdict(_report(**kw))
         assert v == "INSUFFICIENT_EVIDENCE" and reasons, kw
     rep = _report()
@@ -75,3 +77,214 @@ def test_only_external_events_are_measured():
     contract = elm.load_contract()
     ext = {e["event"] for e in contract["events"] if e.get("measure") == "external"}
     assert ext == set(elm.EXTERNAL_EVENTS)
+
+
+class _FakeRpc:
+    """記憶體替身：`command.get` 依序回 running、done；`command.cancel` 回 `cancel_reply`。"""
+
+    def __init__(self, cancel_reply: dict, status_after_cancel: str = "canceled") -> None:
+        self.cancel_reply = cancel_reply
+        self.status_after_cancel = status_after_cancel
+        self.cancelled = False
+
+    def call(self, method: str, params: dict) -> dict:
+        if method == "command.submit":
+            return {"ok": True, "cmd_id": "c1"}
+        if method == "command.get":
+            status = self.status_after_cancel if self.cancelled else "running"
+            return {"ok": True, "command": {"status": status, "done_at": "t" if self.cancelled else None}}
+        if method == "session.get_state":
+            return {"ok": True, "session": {"state": "READY"}}
+        raise AssertionError(method)
+
+    def timed(self, method: str, params: dict) -> tuple[float, dict]:
+        assert method == "command.cancel"
+        self.cancelled = True
+        return 0.5, dict(self.cancel_reply)
+
+
+def test_cancel_sample_rejects_refused_cancel():
+    """sol P5-3084388-1：running → 自然完成 → 取消被拒（CMD_NOT_CANCELABLE）不得算有效取消樣本。"""
+    with pytest.raises(RuntimeError):
+        elm._sample_cancel(_FakeRpc({"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": "c1"}, "done"))
+    # 回 ok 但命令最終不是 canceled（例如自然完成）也不算
+    with pytest.raises(RuntimeError):
+        elm._sample_cancel(_FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, "done"))
+    assert elm._sample_cancel(_FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"})) == 0.5
+
+
+def test_report_identity_binds_artifact_commit_tool_and_run(tmp_path):
+    """sol P5-3084388-2：報告須可追溯受測 artifact（sha256）、來源 commit、工具／契約 revision 與 run ID。"""
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-fake")
+    ident = elm.report_identity(str(exe), run_id="r-test")
+    import hashlib
+
+    assert ident["daemon_sha256"] == hashlib.sha256(b"\x7fELF-fake").hexdigest()
+    assert ident["run_id"] == "r-test"
+    assert len(ident["source_commit"]) == 40 and isinstance(ident["source_tree_dirty"], bool)
+    assert len(ident["tool_sha256"]) == 64 and len(ident["contract_sha256"]) == 64
+    assert ident["method_revision"] == elm.load_contract()["method_revision"]
+    assert "/" not in ident["daemon"] or not ident["daemon"].startswith("/")   # 不落本機絕對路徑（R-21）
+
+
+def test_sha256_file_works_without_hashlib_file_digest(tmp_path, monkeypatch):
+    """sol P5-2472f78-1：Python 3.10 沒有 `hashlib.file_digest`；雜湊須以分塊 update 計算。"""
+    import hashlib
+
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"a" * 300000)
+    assert elm._sha256_file(str(f)) == hashlib.sha256(b"a" * 300000).hexdigest()
+
+
+def test_identity_binds_artifact_to_build_report(tmp_path):
+    """sol P5-3084388-2（第 3 輪）：來源 commit 須是受測 artifact 的建置來源，不得只取工具工作樹 HEAD。
+    以建置紀錄（gate report.json 的 identity.daemon_sha256＋git_revision）核對 artifact sha256；不符或未提供即不得 PASS。"""
+    import hashlib
+    import json
+
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-fake")
+    sha = hashlib.sha256(b"\x7fELF-fake").hexdigest()
+    good = tmp_path / "report.json"
+    good.write_text(json.dumps({"run_id": "g1", "git_revision": "c" * 40, "identity": {"daemon_sha256": sha}}))
+    ident = elm.report_identity(str(exe), run_id="r", build_report=str(good))
+    assert ident["artifact_source_commit"] == "c" * 40 and ident["artifact_build_run_id"] == "g1"
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"run_id": "g2", "git_revision": "d" * 40, "identity": {"daemon_sha256": "0" * 64}}))
+    assert elm.report_identity(str(exe), run_id="r", build_report=str(bad))["artifact_source_commit"] is None
+    assert elm.overall_verdict(_report())[0] == "PASS"
+    no_bind = _report()
+    no_bind["identity"]["artifact_source_commit"] = None
+    assert elm.overall_verdict(no_bind)[0] == "INSUFFICIENT_EVIDENCE"
+
+
+# --------------------------------------------------------------------------- 方法審閱（Codex gpt-6.1-sol，2026-10-29，rejected）
+
+class _EmitTarget:
+    """flood 替身：`emit` 依 `fail` 拋出 OSError，或正常吞下 bytes。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.bytes = 0
+
+    def emit(self, body: bytes) -> None:
+        if self.fail:
+            raise OSError("EIO")
+        self.bytes += len(body)
+
+
+def test_flood_emit_failure_is_reported_as_invalid_load():
+    """審閱 [High]：flood 送出失敗被吞掉時，量測不得當成有效 flood。"""
+    with elm._Flood(_EmitTarget(fail=True), 20000, 256) as fl:
+        import time
+
+        time.sleep(0.15)
+    stats = fl.stats()
+    assert stats["emit_errors"] > 0 and stats["sent"] == 0
+    problems = elm.flood_problems(stats, bytes_per_s=20000, min_seconds=0.1)
+    assert problems and any("送出失敗" in p for p in problems)
+
+
+def test_flood_requires_actual_rate_and_duration():
+    """審閱 [High]：須驗證實際速率與持續時間（`flood_load.seconds`），不得只看 context 正常結束。"""
+    ok = {"sent": 20000 * 30, "seconds": 30.0, "emit_errors": 0, "first_error": None, "thread_alive": True}
+    assert elm.flood_problems(ok, bytes_per_s=20000, min_seconds=30) == []
+    assert elm.flood_problems({**ok, "sent": 20000 * 10}, bytes_per_s=20000, min_seconds=30)        # 速率不足
+    assert elm.flood_problems({**ok, "seconds": 5.0, "sent": 20000 * 5}, bytes_per_s=20000, min_seconds=30)  # 時間不足
+    assert elm.flood_problems({**ok, "thread_alive": False}, bytes_per_s=20000, min_seconds=30)     # 送出端中途結束
+    with elm._Flood(_EmitTarget(), 20000, 256) as fl:
+        import time
+
+        time.sleep(0.3)
+    st = fl.stats()
+    assert st["emit_errors"] == 0 and st["sent"] > 0 and st["thread_alive"] is True
+    assert elm.flood_problems(st, bytes_per_s=20000, min_seconds=0.2) == []
+
+
+def test_flood_run_judged_insufficient_when_load_invalid_but_over_limit_still_fails():
+    """flood 無效 → 證據不足；但有效樣本已超限仍為 FAIL（不得被負載問題降級）。"""
+    ok = elm.judge_run([1.0, 2.0], want=2, limit=100, load_before=IDLE, load_after=IDLE, errors=[],
+                       load_problems=["flood 送出失敗 3 次"])
+    assert ok["verdict"] == "INSUFFICIENT_EVIDENCE" and ok["load_problems"]
+    bad = elm.judge_run([1.0, 120.0], want=2, limit=100, load_before=IDLE, load_after=IDLE, errors=[],
+                        load_problems=["flood 送出失敗 3 次"])
+    assert bad["verdict"] == "FAIL"
+
+
+def test_over_limit_sample_is_not_downgraded_by_errors():
+    """審閱 [Medium]：有效樣本 80 ms／上限 50 ms 為 FAIL；同輪加一筆取消被拒不得變成 INSUFFICIENT_EVIDENCE。"""
+    assert elm.judge_run([80.0], want=1, limit=50, load_before=IDLE, load_after=IDLE, errors=[])["verdict"] == "FAIL"
+    r = elm.judge_run([80.0], want=2, limit=50, load_before=IDLE, load_after=IDLE,
+                      errors=["command_cancel #1: RuntimeError: command.cancel 未成功取消在途命令"])
+    assert r["verdict"] == "FAIL"
+    # 明確作廢（host 過載）的輪次才不判 FAIL
+    v = elm.judge_run([80.0], want=1, limit=50, load_before=IDLE, load_after=BUSY, errors=[])
+    assert v["void"] is True and v["verdict"] == "INSUFFICIENT_EVIDENCE"
+
+
+class _ReleaseRpc:
+    def __init__(self, attach_ok: bool) -> None:
+        self.attach_ok = attach_ok
+
+    def timed(self, method: str, params: dict) -> tuple[float, dict]:
+        assert method == "device.release"
+        return 7.5, {"ok": True}
+
+    def call(self, method: str, params: dict) -> dict:
+        if method == "device.attach":
+            return {"ok": self.attach_ok, "error_code": None if self.attach_ok else "ATTACH_FAILED"}
+        if method == "session.get_state":
+            return {"ok": True, "session": {"state": "READY"}}
+        raise AssertionError(method)
+
+
+def test_release_timing_is_kept_when_reattach_fails():
+    """審閱 [Medium]：已取得 release 耗時後重新 attach 失敗，不得遺失該耗時（另記準備錯誤）。"""
+    assert elm._sample_release(_ReleaseRpc(True)) == (7.5, None)
+    ms, err = elm._sample_release(_ReleaseRpc(False))
+    assert ms == 7.5 and err and "device.attach" in err
+
+
+def test_host_void_uses_mid_run_peak_and_missing_monitoring_is_insufficient():
+    """審閱 [Medium]：作廢規則須看量測期間取樣的峰值；監測資料缺失時判證據不足，不得 PASS。"""
+    r = elm.judge_run([1.0], want=1, limit=50, load_before=IDLE, load_after=IDLE, errors=[],
+                      host_samples=[IDLE, BUSY, IDLE])
+    assert r["void"] is True and r["verdict"] == "INSUFFICIENT_EVIDENCE"
+    assert r["host_load"]["peak_loadavg_1min"] == 9.0
+    none = {"loadavg_1min": None, "cpu_count": None}
+    m = elm.judge_run([1.0], want=1, limit=50, load_before=none, load_after=none, errors=[], host_samples=[])
+    assert m["verdict"] == "INSUFFICIENT_EVIDENCE" and m["host_monitor_missing"] is True
+    mon = elm._HostMonitor(interval=0.02)
+    with mon:
+        import time
+
+        time.sleep(0.1)
+    assert len(mon.samples) >= 2
+
+
+def test_identity_requires_build_sha_for_explicit_artifact_source(tmp_path):
+    """審閱 [High]：gate 明示來源 commit 時須同時給出建置當下的 artifact sha256；不符（例如建置失敗留下舊 binary）
+    或未給即不得綁定來源。"""
+    import hashlib
+
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-new")
+    sha = hashlib.sha256(b"\x7fELF-new").hexdigest()
+    ok = elm.report_identity(str(exe), run_id="r", artifact_source_commit="c" * 40, artifact_build_run_id="g",
+                             artifact_sha256=sha)
+    assert ok["artifact_source_commit"] == "c" * 40 and ok["artifact_build_mismatch"] is None
+    stale = elm.report_identity(str(exe), run_id="r", artifact_source_commit="c" * 40, artifact_build_run_id="g",
+                                artifact_sha256="0" * 64)
+    assert stale["artifact_source_commit"] is None and stale["artifact_build_mismatch"]
+    unbound = elm.report_identity(str(exe), run_id="r", artifact_source_commit="c" * 40, artifact_build_run_id="g")
+    assert unbound["artifact_source_commit"] is None and unbound["artifact_build_mismatch"]
+
+
+def test_contract_applies_od58_release_limits():
+    """OD-58：release_request 上限 idle 250／flood 300 ms；stop_request／command_cancel 維持 50／100 ms。"""
+    rows = {e["event"]: e for e in elm.load_contract()["events"]}
+    assert (rows["release_request"]["max_ms_idle"], rows["release_request"]["max_ms_flood"]) == (250, 300)
+    for ev in ("stop_request", "command_cancel"):
+        assert (rows[ev]["max_ms_idle"], rows[ev]["max_ms_flood"]) == (50, 100)

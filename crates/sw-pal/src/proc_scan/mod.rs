@@ -83,6 +83,18 @@ pub enum HolderScanStatus {
     Unsupported,
 }
 
+impl HolderScanStatus {
+    /// Python `HolderReport.status` 的字串（`"ok"`／`"permission"`／`"unknown"`／`"unsupported"`）；對外文字一律用此值。
+    pub fn py_name(self) -> &'static str {
+        match self {
+            HolderScanStatus::Ok => "ok",
+            HolderScanStatus::Permission => "permission",
+            HolderScanStatus::Unknown => "unknown",
+            HolderScanStatus::Unsupported => "unsupported",
+        }
+    }
+}
+
 /// 行程掃描失敗錯誤。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanFailure;

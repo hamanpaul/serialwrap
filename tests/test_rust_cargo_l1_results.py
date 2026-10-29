@@ -609,3 +609,17 @@ def test_build_failure_report_still_carries_provenance(tmp_path: Path) -> None:
     assert prov["schema"] == "cargo-l1-provenance.v1"
     assert prov["executables"] == []
     assert prov["git"]["head"] == _git_head()
+
+
+@pytest.mark.process_rpc   # 本檔資源 marker 一律 process_rpc（test_module_resource_marker_not_mixed）
+def test_capability_matched_on_last_path_segment() -> None:
+    """P5 第 6 輪 gate 實跑揭露：lib 單元測試的 libtest 名稱帶模組路徑（`console_pty::posix::tests::cap_posix_pty__x`），
+    只比對名稱開頭會把它當成非能力測試——`--caps posix_pty` 不執行、skip_kind 記成 other，OD-55 移入
+    `s21_gate:cap_posix_pty` 的 4 個 lib 能力測試因此恆 skipped。能力判定須取最後一段。"""
+    spec = importlib.util.spec_from_file_location("cargo_l1_results", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("cargo_l1_results", mod)        # dataclass 需模組已登錄
+    spec.loader.exec_module(mod)
+    assert mod.capability_of("console_pty::posix::tests::cap_posix_pty__new_slave_speed_not_b0") == "posix_pty"
+    assert mod.capability_of("cap_windows_com__open") == "windows_com"
+    assert mod.capability_of("serial::posix::tests::plain_cap_posix_pty__x") is None

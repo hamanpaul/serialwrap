@@ -219,6 +219,7 @@ class Slice21Daemon:
     daemon_cmd: list[str] = dataclasses.field(default_factory=list)
     cli_cmd: list[str] = dataclasses.field(default_factory=list)
     run_dir: Path | None = None
+    owns_targets: bool = True          # False：FakeTarget 與另一 daemon 共用（share_tty_with），stop 時不關閉
     _rc: int | None = None
 
     def sw(self, *args: str, timeout: float = 30.0) -> dict:
@@ -305,8 +306,9 @@ class Slice21Daemon:
             except subprocess.TimeoutExpired:
                 _kill(proc)
         self._rc = proc.returncode if proc.returncode is not None else -1
-        for t in self.targets.values():
-            t.stop()
+        if self.owns_targets:
+            for t in self.targets.values():
+                t.stop()
         if self.run_dir is not None:
             shutil.rmtree(self.run_dir, ignore_errors=True)
         return self._rc
@@ -342,8 +344,12 @@ def start_daemon(
     extra_env: dict[str, str] | None = None,
     reuse_dirs: bool = False,
     ready_timeout: float = 20.0,
+    share_tty_with: "Slice21Daemon | None" = None,
 ) -> Slice21Daemon:
-    """啟動受測 daemon（預設 `daemon_prefix()`）＋COM0 FakeTarget；回傳 `Slice21Daemon`。"""
+    """啟動受測 daemon（預設 `daemon_prefix()`）＋COM0 FakeTarget；回傳 `Slice21Daemon`。
+
+    `share_tty_with`：與既有 daemon 共用同一 tty（兩個 daemon 搶同一 UART）——沿用其 by-id 目錄與 FakeTarget，
+    不另建 FakeTarget、不改寫其 by-id symlink；本 daemon stop 時不關閉共用的 FakeTarget（rulings/p5.md，P6 SPEC-GAP #1）。"""
     root = Path(root)
     if not reuse_dirs and root.exists():
         shutil.rmtree(root)
@@ -365,13 +371,21 @@ def start_daemon(
         run_dir = Path(tempfile.mkdtemp(prefix="sw21-", dir="/tmp" if os.path.isdir("/tmp") else None))
         overrides["SERIALWRAP_RUN_DIR"] = str(run_dir)
         endpoint = str(run_dir / "serialwrapd.sock")
+    if share_tty_with is not None:
+        overrides["SERIALWRAP_BY_ID_DIR"] = share_tty_with.env["SERIALWRAP_BY_ID_DIR"]
     overrides.update(extra_env or {})
     env = isolated_env(root, **overrides)
 
     by_id_dir = Path(env["SERIALWRAP_BY_ID_DIR"])
-    n = sum(1 for p in root.iterdir() if p.name.startswith("fw"))
-    target = _make_target(root / f"fw{n}", prompt=prompt, login=login, boot_banner=boot_banner)
-    link = target.start(by_id_dir, BY_ID_NAME)
+    if share_tty_with is not None:
+        target = share_tty_with.targets["COM0"]
+        link = target.link_path
+        if link is None or Path(link).parent != by_id_dir:
+            raise ValueError("share_tty_with：共用的 FakeTarget 必須已在同一 by-id 目錄啟動")
+    else:
+        n = sum(1 for p in root.iterdir() if p.name.startswith("fw"))
+        target = _make_target(root / f"fw{n}", prompt=prompt, login=login, boot_banner=boot_banner)
+        link = target.start(by_id_dir, BY_ID_NAME)
 
     profile_dir = root / "profiles"
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +413,7 @@ def start_daemon(
         daemon_cmd=daemon_cmd,
         cli_cmd=cli_cmd,
         run_dir=run_dir,
+        owns_targets=share_tty_with is None,
     )
     deadline = time.monotonic() + ready_timeout
     while True:

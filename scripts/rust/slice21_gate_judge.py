@@ -52,6 +52,8 @@ TEST_SECTIONS: dict[str, str] = {
     "existing_suites_rust": "linux",
     "pytest_full": "linux",
 }
+# F108：須以非 root 執行的測試類 section（section 片段 `run_euid` 須為非 0 整數）。
+NON_ROOT_SECTIONS: frozenset[str] = frozenset({"linux_l1"})
 NON_TEST_SECTIONS: tuple[str, ...] = (
     "l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake",
 )
@@ -205,6 +207,67 @@ def _judge_non_test_section(sec: Mapping[str, Any]) -> tuple[str, list[str]]:
     return "PASS", []
 
 
+EVLAT_TOOL_PATH = ROOT / "scripts" / "rust" / "event_latency_measure.py"
+EVLAT_CONTRACT_PATH = ROOT / "contracts" / "resource_limits.yaml"
+
+
+def event_latency_ref() -> dict[str, Any]:
+    """event_latency 證據須對上的工具／契約身分（現行工作樹）：工具與契約 sha256、契約 method_revision。"""
+    ref: dict[str, Any] = {"tool_sha256": None, "contract_sha256": None, "method_revision": None}
+    if EVLAT_TOOL_PATH.is_file():
+        ref["tool_sha256"] = sha256_file(EVLAT_TOOL_PATH)
+    if EVLAT_CONTRACT_PATH.is_file():
+        ref["contract_sha256"] = sha256_file(EVLAT_CONTRACT_PATH)
+        try:
+            ref["method_revision"] = ((_load_yaml(EVLAT_CONTRACT_PATH) or {}).get("event_latency") or {}).get("method_revision")
+        except Exception:  # noqa: BLE001 — 讀不到即 None，核對時判不符
+            pass
+    return ref
+
+
+def judge_event_latency_evidence(sec: Mapping[str, Any], report: Mapping[str, Any],
+                                 expect: Mapping[str, Any]) -> tuple[str | None, list[str]]:
+    """方法審閱 [High]（2026-10-29）：event_latency section 不得只看 gate 片段的 section_verdict——須讀取 `evidence`
+    指向的量測 JSON，以其 verdict 判定，並核對其 identity 與本 run 一致：daemon_sha256＝報告 identity、
+    artifact_source_commit＝報告 git_revision（建置失敗留下的舊 binary 不得綁到目前 HEAD）、artifact_build_run_id 與
+    run_id＝報告 run_id、tool_sha256／contract_sha256／method_revision＝現行工具與契約。
+
+    回傳 (覆寫狀態或 None, 原因)：證據 FAIL → "FAIL"；缺檔、無法讀取、身分不符、verdict 非 PASS → "EVIDENCE_MISSING"；
+    全部相符且 PASS → None（沿用片段判定）。"""
+    rel = sec.get("evidence")
+    if not rel:
+        return "EVIDENCE_MISSING", ["event_latency 未附量測證據（evidence 為 null）"]
+    path = pathlib.Path(str(rel))
+    if not path.is_absolute():
+        path = pathlib.Path(expect.get("base_dir") or ".") / path
+    try:
+        ev = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "EVIDENCE_MISSING", [f"event_latency 量測證據無法讀取：{rel}（{exc}）"]
+    if not isinstance(ev, Mapping):
+        return "EVIDENCE_MISSING", [f"event_latency 量測證據格式錯誤：{rel}"]
+    verdict = ev.get("verdict")
+    if verdict == "FAIL":
+        return "FAIL", [f"event_latency 量測證據 FAIL：{'；'.join(map(str, ev.get('reasons') or [])) or '—'}"]
+    ident = ev.get("identity") if isinstance(ev.get("identity"), Mapping) else {}
+    rep_ident = report.get("identity") if isinstance(report.get("identity"), Mapping) else {}
+    ref = expect.get("event_latency_ref") or event_latency_ref()
+    want = {
+        "daemon_sha256": rep_ident.get("daemon_sha256"),
+        "artifact_source_commit": report.get("git_revision"),
+        "artifact_build_run_id": report.get("run_id"),
+        "run_id": report.get("run_id"),
+        "tool_sha256": ref.get("tool_sha256"),
+        "contract_sha256": ref.get("contract_sha256"),
+        "method_revision": ref.get("method_revision"),
+    }
+    reasons = [f"event_latency 證據 identity.{k}={ident.get(k)!r} 與本 run 不符（應為 {v!r}）"
+               for k, v in want.items() if not v or ident.get(k) != v]
+    if verdict != "PASS":
+        reasons.append(f"event_latency 量測證據 verdict={verdict!r}：{'；'.join(map(str, ev.get('reasons') or [])) or '—'}")
+    return ("EVIDENCE_MISSING", reasons) if reasons else (None, [])
+
+
 # --------------------------------------------------------------------------- identity／承接率／parity
 
 def identity_problems(identity: Any, daemon_path: Any) -> tuple[list[str], list[str]]:
@@ -226,6 +289,16 @@ def identity_problems(identity: Any, daemon_path: Any) -> tuple[list[str], list[
         val = identity.get(key)
         if val not in (None, "") and not (isinstance(val, str) and _SHA256_RE.match(val)):
             mismatch.append(f"identity.{key} 不是 64 位小寫 hex")
+    build = identity.get("build")
+    if isinstance(build, Mapping):
+        # 方法審閱 [High]：Linux release 建置失敗即 FAIL（受測 artifact 不是本 run 的產物）；建置當下 sha256 須等於報告 artifact。
+        if build.get("linux_exit") not in (0, None):
+            mismatch.append(f"Linux release 建置失敗（exit {build.get('linux_exit')}），受測 artifact 不是本 run 產物")
+        at_build = build.get("daemon_sha256_at_build")
+        if at_build and identity.get("daemon_sha256") and at_build != identity.get("daemon_sha256"):
+            mismatch.append("identity.daemon_sha256 與建置當下記錄的 sha256 不符")
+        elif build.get("linux_exit") == 0 and not at_build:
+            missing.append("identity.build.daemon_sha256_at_build")
     if daemon_path:
         p = pathlib.Path(daemon_path)
         if not p.is_file():
@@ -251,6 +324,172 @@ def case_uptake(freeze: Mapping[str, Any] | None, case_verdicts: Mapping[str, An
     window = freeze.get("window") or {}
     return {"denominator": denominator, "valid_pass": len(passed), "rate": rate,
             "window_start": window.get("start"), "pass_case_ids": passed}
+
+
+# --------------------------------------------------------------------------- wal_s1w_perf（OD-61：WSL2 量測匯入）
+
+WAL_S1W_FORMAL_HOSTS = frozenset({"wsl2", "native"})    # OD-61：擁有者 WSL2 主機視為 Linux 實機證據；雲端 vm:* 只作診斷
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _paths_changed_since(rev: str, paths: Sequence[str]) -> list[str] | None:
+    """`rev` 為 HEAD 祖先時回傳 `rev..HEAD` 間變更過的相關路徑（空串列＝未變）；`rev` 不在本分支歷史即 None。"""
+    if _git("merge-base", "--is-ancestor", rev, "HEAD") is None:
+        return None
+    if not paths:
+        return []
+    out = _git("diff", "--name-only", f"{rev}..HEAD", "--", *paths)
+    return [x for x in (out or "").splitlines() if x.strip()]
+
+
+def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, Any] | None = None,
+                    host_label: str | None = None, formal_params: Mapping[str, Any],
+                    relevant_paths: Sequence[str] = ()) -> tuple[str, list[str]]:
+    """wal_s1w_perf section 判定（OD-61）。
+
+    - 有匯入證據（編排者於擁有者 WSL2 主機以 throwaway 環境量測）：須為 `wal_s1w.v1`、Linux 門檻、正式量測參數
+      （`formal_params`）、`env.virtualization` ∈ {wsl2, native}、附主機類型標註（`host_label`）、`env.source_tree_dirty`
+      為 false、`env.git_revision`
+      為本分支歷史中的 commit，且該 commit 之後 WAL 寫入相關路徑（`relevant_paths`）未再變更；符合者以其 verdict 判定，
+      不符即 EVIDENCE_MISSING（證據無法追溯或不代表受測版本）。
+    - 無匯入：gate 本機量測若為 wsl2／native 照其 verdict 判定；雲端 `vm:*`／unknown 只作診斷 → EVIDENCE_MISSING。
+    回傳 (PASS／FAIL／EVIDENCE_MISSING, 原因)。"""
+    def check(doc: Mapping[str, Any], *, need_label: bool) -> list[str]:
+        problems: list[str] = []
+        env = doc.get("env") if isinstance(doc.get("env"), Mapping) else {}
+        if doc.get("schema") != "wal_s1w.v1":
+            problems.append(f"schema={doc.get('schema')!r}（須為 wal_s1w.v1）")
+        if doc.get("verdict") not in ("PASS", "FAIL"):
+            problems.append(f"verdict={doc.get('verdict')!r}")
+        if (doc.get("thresholds") or {}).get("platform") != "linux":
+            problems.append(f"thresholds.platform={(doc.get('thresholds') or {}).get('platform')!r}（須為 linux 門檻）")
+        params = doc.get("params") if isinstance(doc.get("params"), Mapping) else {}
+        diff = {k: params.get(k) for k, v in formal_params.items() if params.get(k) != v}
+        if diff:
+            problems.append(f"params 非正式量測參數：{diff}（應為 {dict(formal_params)}）")
+        virt = str(env.get("virtualization") or "unknown")
+        if virt not in WAL_S1W_FORMAL_HOSTS:
+            problems.append(f"env.virtualization={virt!r}：vm／未知主機只作診斷（OD-61）")
+        if need_label and not (host_label or "").strip():
+            problems.append("匯入證據未附主機類型標註（SW_GATE_WAL_S1W_HOST）")
+        if env.get("source_tree_dirty") is not False:
+            # sol P5-4f8acdf-2：工作樹不乾淨或未記錄時 git_revision 不代表受測碼。
+            problems.append(f"env.source_tree_dirty={env.get('source_tree_dirty')!r}（須為 false）")
+        rev = str(env.get("git_revision") or "")
+        if not _HEX40_RE.match(rev):
+            problems.append(f"env.git_revision={rev!r} 無法追溯 commit")
+        else:
+            changed = _paths_changed_since(rev, list(relevant_paths))
+            if changed is None:
+                problems.append(f"env.git_revision={rev} 不在本分支歷史")
+            elif changed:
+                problems.append(f"量測 commit {rev[:12]} 之後 WAL 寫入相關路徑已變更：{changed[:6]}")
+        return problems
+
+    if imported is not None:
+        problems = check(imported, need_label=True)
+        if problems:
+            return "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據不採用：{p}" for p in problems]
+        return str(imported["verdict"]), [f"匯入證據（{host_label}）：{'；'.join(map(str, imported.get('failures') or [])) or '全數達標'}"]
+    if local is None:
+        return "EVIDENCE_MISSING", ["wal_s1w 量測未產生，且未匯入外部證據（SW_GATE_WAL_S1W_IMPORT）"]
+    problems = check(local, need_label=False)
+    if problems:
+        am = local.get("append_ms") or {}
+        return "EVIDENCE_MISSING", [
+            f"本機量測只作診斷（{'；'.join(problems)}）：append p50 {am.get('p50')}／p95 {am.get('p95')}／p99 {am.get('p99')} ms、"
+            f"rotate max {local.get('rotate_max_ms')} ms、本機 verdict {local.get('verdict')}；正式證據待匯入 WSL2 量測（OD-61）"]
+    return str(local["verdict"]), list(map(str, local.get("failures") or []))
+
+
+# --------------------------------------------------------------------------- case_verdicts 彙整（OD-60／OWNER-BATCH #8）
+
+_VERDICT_RANK = {"PASS": 0, "EVIDENCE_MISSING": 1, "FAIL": 2}
+L15_TEST_PREFIX = "tests/acceptance/l15/test_slice21_l15.py::test_case["
+L15_LABELS = ("python", "rust")
+
+
+def worst_verdict(verdicts: Sequence[str]) -> str:
+    """最差判定：FAIL ＞ EVIDENCE_MISSING ＞ PASS；空串列（缺證據）即 EVIDENCE_MISSING；未知值視為 EVIDENCE_MISSING。"""
+    if not verdicts:
+        return "EVIDENCE_MISSING"
+    return max((v if v in _VERDICT_RANK else "EVIDENCE_MISSING" for v in verdicts), key=_VERDICT_RANK.__getitem__)
+
+
+def _outcome_verdict(outcomes: Sequence[str]) -> str:
+    """單一 nodeid 的 outcome → 判定：恰一列 passed → PASS；failed／error → FAIL；其餘（skip、重複列、缺）→ EVIDENCE_MISSING。"""
+    if any(o in ("failed", "error") for o in outcomes):
+        return "FAIL"
+    return "PASS" if list(outcomes) == ["passed"] else "EVIDENCE_MISSING"
+
+
+def aggregate_case_verdicts(required_ids: Sequence[str], *, l15_rows: Sequence[Mapping[str, Any]],
+                            func_checks: Mapping[str, Any], excluded: Sequence[Mapping[str, Any]],
+                            section_rows: Mapping[str, Sequence[Mapping[str, Any]]],
+                            section_status: Mapping[str, str] | None = None) -> tuple[dict[str, str], dict[str, list]]:
+    """依 Task 20／21 的逐案證據彙整 `case_verdicts`（純函式；rulings/p5.md OWNER-BATCH #8、OD-60）。
+
+    證據來源：
+    - l15_ab：`test_slice21_l15.py::test_case[<label>-…-<case>]` 的 python 與 rust 兩列（A/B 兩邊皆為該案證據）；
+    - 移出 l15_ab 者（`l15_ab_excluded`）：`covered_by` 各 nodeid 在指定 section 的 outcome，`covered_by_sections` 的 section 判定；
+    - func-test：`existing_suites_rust` 的 `func-test:<case>` runner exit（0 → PASS，非 0 → FAIL）。
+    每案取所有證據中最差判定，無任何證據即 EVIDENCE_MISSING。回傳 (case_id → 判定, case_id → 證據明細)。"""
+    by_case: dict[str, dict[str, list[str]]] = {}
+    for row in l15_rows:
+        nid = str(row.get("nodeid") or "")
+        if not nid.startswith(L15_TEST_PREFIX) or not nid.endswith("]"):
+            continue
+        params = nid[len(L15_TEST_PREFIX):-1]
+        label = params.split("-", 1)[0]
+        for cid in required_ids:
+            if params.endswith(f"-{cid}") and label in L15_LABELS:
+                by_case.setdefault(cid, {}).setdefault(label, []).append(str(row.get("outcome")))
+    pools: dict[str, dict[str, list[str]]] = {}
+    for sec, rows in section_rows.items():
+        pool = pools.setdefault(sec, {})
+        for row in rows:
+            pool.setdefault(str(row.get("nodeid")), []).append(str(row.get("outcome")))
+    excl = {str(r.get("case_id")): r for r in excluded}
+    verdicts: dict[str, str] = {}
+    detail: dict[str, list] = {}
+    for cid in required_ids:
+        evidence: list[dict[str, Any]] = []
+        if cid in by_case:
+            for label in L15_LABELS:
+                outs = by_case[cid].get(label, [])
+                evidence.append({"source": f"l15_ab:{label}", "outcomes": outs, "verdict": _outcome_verdict(outs)})
+        if cid in excl:
+            row = excl[cid]
+            for cov in row.get("covered_by") or []:
+                outs = pools.get(str(cov.get("section")), {}).get(str(cov.get("nodeid")), [])
+                evidence.append({"source": f"{cov.get('section')}:{cov.get('nodeid')}", "decision": row.get("decision"),
+                                 "outcomes": outs, "verdict": _outcome_verdict(outs)})
+            for name in row.get("covered_by_sections") or []:
+                st = (section_status or {}).get(str(name))
+                evidence.append({"source": f"section:{name}", "decision": row.get("decision"),
+                                 "verdict": st if st in _VERDICT_RANK else "EVIDENCE_MISSING"})
+        if cid in func_checks:
+            code = func_checks[cid]
+            ok = isinstance(code, int) and not isinstance(code, bool)
+            evidence.append({"source": f"func-test:{cid}", "exit": code,
+                             "verdict": ("PASS" if code == 0 else "FAIL") if ok else "EVIDENCE_MISSING"})
+        verdicts[cid] = worst_verdict([e["verdict"] for e in evidence])
+        detail[cid] = evidence
+    return verdicts, detail
+
+
+def append_breaker_snapshot(path: pathlib.Path, freeze: Mapping[str, Any], case_verdicts: Mapping[str, Any], *,
+                            run_id: str, today: str | None = None) -> dict[str, Any]:
+    """OD-60：gate 每次正式實跑附加一筆斷路器快照（`slice_breaker` 格式＋`passed`／`denominator` 使 rate 可驗證）。"""
+    up = case_uptake(freeze, case_verdicts)
+    body = json.dumps(dict(sorted((str(k), v) for k, v in case_verdicts.items())), ensure_ascii=False,
+                      sort_keys=True, separators=(",", ":"))
+    snap = {"date": today or dt.datetime.now(dt.timezone.utc).date().isoformat(), "rate": up["rate"],
+            "passed": up["valid_pass"], "denominator": up["denominator"], "run_id": run_id,
+            "results_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(snap, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    return snap
 
 
 def judge_breaker(freeze: Mapping[str, Any] | None, breaker: Mapping[str, Any] | None) -> tuple[str, list[str], Any]:
@@ -395,11 +634,22 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         elif name in TEST_SECTIONS:
             pool: set[str] = set()
             status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], pool)
+            if name in NON_ROOT_SECTIONS:
+                # F108（編排者裁決）：須以非 root 執行；euid==0 或未記錄時不得 PASS，也不得因 root 專屬失敗記 FAIL 了事。
+                euid = sec.get("run_euid")
+                if not isinstance(euid, int) or isinstance(euid, bool) or euid == 0:
+                    status = "EVIDENCE_MISSING"
+                    reasons = [f"{name} 須以非 root 執行（run_euid={euid!r}）；請以非 root 補跑"] + list(reasons)
+                    pool = set()
             section_passed[name] = pool
             passed_pool |= pool
         elif name in NON_TEST_SECTIONS:
             status, reasons = _judge_non_test_section(sec)
             l1v = {}
+            if name == "event_latency" and status != "FAIL":
+                ev_status, ev_reasons = judge_event_latency_evidence(sec, report, expect)
+                if ev_status is not None:
+                    status, reasons = ev_status, list(reasons) + ev_reasons
         else:
             status, l1v, reasons = "EVIDENCE_MISSING", {}, [f"未知 section：{name}"]
         sec["status"] = status
@@ -409,6 +659,8 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         out_sections.append(sec)
 
     # OD-40：移出 l15_ab 的情境改由逐名列出的 pytest 測試承擔；每筆須在指定 section 恰為 passed，否則 l15_ab 不得 PASS。
+    # OD-58：另可由整個 section 承擔（`covered_by_sections`，如 s21-event-latency → event_latency），該 section 須為 PASS。
+    status_by_name = {s["name"]: s["status"] for s in out_sections}
     for sec in out_sections:
         if sec["name"] != "l15_ab" or sec["status"] != "PASS":
             continue
@@ -419,7 +671,21 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
                 sec["status"] = "EVIDENCE_MISSING"
                 sec["reasons"] = list(sec["reasons"]) + [
                     f"{row.get('case_id')} 依 {row.get('decision')} 移出 l15_ab，承擔的 pytest 未見 passed：{absent or '（未列）'}"]
+            not_pass = [str(n) for n in (row.get("covered_by_sections") or []) if status_by_name.get(str(n)) != "PASS"]
+            if not_pass:
+                sec["status"] = "EVIDENCE_MISSING"
+                sec["reasons"] = list(sec["reasons"]) + [
+                    f"{row.get('case_id')} 依 {row.get('decision')} 移出 l15_ab，承擔的 section 非 PASS：{not_pass}"]
 
+    # sol P5-4f8acdf-1：鎖中的 `s21_gate:*` 集合須由某個 section（required_set 或 additional_required_sets）承擔，
+    # 否則其 nodeid 從未被執行或判定（例如 OD-55 的能力集合）——不得 READY。
+    carried = {str(s.get("required_set")) for s in out_sections if s.get("required_set")}
+    for name, sets in (expect.get("additional_required_sets") or {}).items():
+        carried |= {str(x) for x in (sets or [])}
+    for s in out_sections:
+        carried |= {str(x) for x in (s.get("additional_required_sets") or [])}
+    uncarried = sorted(sid for sid in ((expect.get("lock") or {}).get("sets") or {})
+                       if sid.startswith("s21_gate:") and sid not in carried)
     missing_id, mismatch_id = identity_problems(report.get("identity"), expect.get("daemon_path"))
     uptake = case_uptake(expect.get("freeze"), expect.get("case_verdicts"))
     b_status, b_reasons, b_res = judge_breaker(expect.get("freeze"), expect.get("breaker"))
@@ -446,6 +712,8 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         verdict_reasons.append(f"EVIDENCE_MISSING section：{missing}")
     if missing_id:
         verdict_reasons.append(f"identity 缺漏：{missing_id}")
+    if uncarried:
+        verdict_reasons.append(f"s21_gate 集合未被任何 section 承擔（從未執行或判定）：{uncarried}")
     if report.get("dry_run"):
         verdict_reasons.append("--dry-run 永不 READY")
     if parity.get("evaluated") and parity.get("incomplete"):
@@ -456,7 +724,7 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
 
     if failed or mismatch_id:
         verdict = "FAIL"
-    elif (missing or missing_id or report.get("dry_run")
+    elif (missing or missing_id or uncarried or report.get("dry_run")
           or (parity.get("evaluated") and parity.get("incomplete"))
           or (isinstance(pre, Mapping) and pre.get("event_latency_frozen") is False)):
         verdict = "INCOMPLETE"
@@ -500,6 +768,8 @@ def cmd_record_section(args: argparse.Namespace) -> int:
         frag["reasons"] = list(args.reason)
     if args.evidence:
         frag["evidence"] = args.evidence
+    if args.run_euid not in (None, ""):
+        frag["run_euid"] = int(args.run_euid)
     if args.extra_check:
         checks = []
         for item in args.extra_check:
@@ -544,6 +814,11 @@ def build_identity(args: argparse.Namespace) -> dict[str, Any]:
         ident["daemon_artifact_id"] = f"{pathlib.Path(args.daemon_path).name}@{ident['daemon_sha256'][:12]}"
     if args.daemon_version:
         ident["daemon_version"] = args.daemon_version
+    # 方法審閱 [High]：release 建置結果（Linux／Windows 分開）與建置成功當下的 daemon sha256。
+    build = {"linux_exit": getattr(args, "build_linux_exit", None), "windows_exit": getattr(args, "build_windows_exit", None),
+             "daemon_sha256_at_build": getattr(args, "built_daemon_sha256", None) or None}
+    if any(v is not None for v in build.values()):
+        ident["build"] = build
     contracts = _git("rev-parse", "HEAD:contracts")
     if contracts:
         ident["contracts_revision"] = contracts.strip()
@@ -609,6 +884,13 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     }
     if args.preflight and pathlib.Path(args.preflight).is_file():
         report["preflight"] = json.loads(pathlib.Path(args.preflight).read_text(encoding="utf-8"))
+    if getattr(args, "append_breaker_snapshot", False) and not args.dry_run and expect_yaml.get("breaker_snapshots_file"):
+        # OD-60：每次正式實跑附加快照（判定前附加，斷路器以含本次的快照判定）。
+        freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
+        snap = append_breaker_snapshot(ROOT / expect_yaml["breaker_snapshots_file"],
+                                       freeze_mod.load_effective_freeze(ROOT / expect_yaml["freeze_file"]),
+                                       case_verdicts, run_id=args.run_id)
+        print(f"slice21_gate_judge: 斷路器快照已附加 {snap}")
     expect, src_where = build_expect(expect_yaml, base_dir=run_dir, case_verdicts=case_verdicts,
                                      daemon_path=args.daemon_path or None, bo_ids=[b["id"] for b in blocked])
     out = judge(report, expect)
@@ -656,6 +938,73 @@ def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case
     return expect, src_where
 
 
+def _load_json(path: pathlib.Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_case_verdicts(args: argparse.Namespace) -> int:
+    """自 run 目錄的 section 片段與逐案證據彙整 `case_verdicts.json`（＋`case_verdicts.detail.json`）。"""
+    run_dir = pathlib.Path(args.run_dir)
+    expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
+    freeze = freeze_mod.load_effective_freeze(ROOT / expect_yaml["freeze_file"])
+    frags = {p.stem: (_load_json(p) or {}) for p in sorted((run_dir / "sections").glob("*.json"))}
+
+    def rows_of(rel: Any) -> list[dict]:
+        doc = _load_json(run_dir / str(rel)) if rel else None
+        return [r for r in ((doc or {}).get("results") or []) if isinstance(r, dict)] if isinstance(doc, dict) else []
+
+    l15 = frags.get("l15_ab") or {}
+    func_checks: dict[str, Any] = {}
+    for chk in (frags.get("existing_suites_rust") or {}).get("extra_checks") or []:
+        name = str(chk.get("name") or "")
+        if name.startswith("func-test:"):
+            func_checks[name[len("func-test:"):]] = chk.get("exit")
+    section_rows = {name: rows_of(frag.get("l1_results")) for name, frag in frags.items() if frag.get("l1_results")}
+    section_status: dict[str, str] = {}
+    ev = frags.get("event_latency") or {}
+    if ev.get("evidence"):
+        doc = _load_json(run_dir / str(ev["evidence"])) or {}
+        section_status["event_latency"] = {"PASS": "PASS", "FAIL": "FAIL"}.get(str(doc.get("verdict")), "EVIDENCE_MISSING")
+    verdicts, detail = aggregate_case_verdicts(
+        [str(x) for x in freeze.get("required_case_ids") or []], l15_rows=rows_of(l15.get("evidence")),
+        func_checks=func_checks, excluded=list(expect_yaml.get("l15_ab_excluded") or []),
+        section_rows=section_rows, section_status=section_status)
+    (run_dir / "case_verdicts.json").write_text(json.dumps(verdicts, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+                                                encoding="utf-8")
+    (run_dir / "case_verdicts.detail.json").write_text(
+        json.dumps(detail, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    summary: dict[str, int] = {}
+    for v in verdicts.values():
+        summary[v] = summary.get(v, 0) + 1
+    print(f"slice21_gate_judge: case_verdicts {summary} → {run_dir / 'case_verdicts.json'}")
+    return 0
+
+
+def cmd_wal_s1w_verdict(args: argparse.Namespace) -> int:
+    """wal_s1w_perf section 判定（OD-61）：輸出 {verdict, reasons, source, host_label, evidence}。"""
+    expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    cfg = expect_yaml.get("wal_s1w") or {}
+    local = _load_json(pathlib.Path(args.local)) if args.local else None
+    imported = _load_json(pathlib.Path(args.import_)) if args.import_ else None
+    if args.import_ and imported is None:
+        verdict, reasons = "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據無法讀取：{args.import_}"]
+    else:
+        verdict, reasons = wal_s1w_verdict(local, imported=imported, host_label=args.host_label,
+                                           formal_params=cfg.get("formal_params") or {},
+                                           relevant_paths=list(cfg.get("relevant_paths") or []))
+    out = {"verdict": verdict, "reasons": reasons, "source": "import" if args.import_ else "local",
+           "host_label": args.host_label or None, "evidence": args.import_ or args.local}
+    text = json.dumps(out, ensure_ascii=False, indent=1) + "\n"
+    if args.out:
+        pathlib.Path(args.out).write_text(text, encoding="utf-8")
+    print(text, end="")
+    return 0
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     report = json.loads(pathlib.Path(args.report).read_text(encoding="utf-8"))
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
@@ -690,6 +1039,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     r.add_argument("--section-verdict", default=None, choices=("PASS", "FAIL", "EVIDENCE_MISSING"))
     r.add_argument("--reason", action="append", default=[])
     r.add_argument("--evidence", default=None)
+    r.add_argument("--run-euid", default=None, help="執行該 section 測試的 euid（F108：linux_l1 須非 0）")
     r.add_argument("--extra-check", action="append", default=[], help="<名稱>=<exit>，可重複")
     a = sub.add_parser("assemble")
     a.add_argument("--run-dir", required=True)
@@ -702,6 +1052,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     a.add_argument("--daemon-version", default=None)
     a.add_argument("--case-verdicts", default=None)
     a.add_argument("--preflight", default=None)
+    a.add_argument("--build-linux-exit", type=int, default=None)
+    a.add_argument("--build-windows-exit", type=int, default=None)
+    a.add_argument("--built-daemon-sha256", default=None)
+    a.add_argument("--append-breaker-snapshot", action="store_true",
+                   help="正式實跑（非 dry-run）時依 case_verdicts 附加一筆斷路器快照（OD-60）")
+    c = sub.add_parser("case-verdicts")
+    c.add_argument("--run-dir", required=True)
+    c.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
+    w = sub.add_parser("wal-s1w-verdict")
+    w.add_argument("--local", default=None, help="gate 本機量測的 wal_s1w.json")
+    w.add_argument("--import", dest="import_", default=None, help="外部匯入的 wal_s1w.json（OD-61：擁有者 WSL2 主機）")
+    w.add_argument("--host-label", default=None, help="匯入證據的主機類型標註（例：owner-wsl2-ext4-vhdx）")
+    w.add_argument("--out", default=None)
+    w.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
@@ -713,6 +1077,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_record_section(args)
         if args.cmd == "assemble":
             return cmd_assemble(args)
+        if args.cmd == "case-verdicts":
+            return cmd_case_verdicts(args)
+        if args.cmd == "wal-s1w-verdict":
+            return cmd_wal_s1w_verdict(args)
         return cmd_judge(args)
     except (OSError, ValueError, KeyError) as exc:
         print(f"slice21_gate_judge: {exc}", file=sys.stderr)

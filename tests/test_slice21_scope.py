@@ -110,7 +110,10 @@ def test_event_latency_contract_values():
     for r in rows.values():
         assert {"accept_point", "complete_point", "max_ms_idle", "max_ms_flood", "load", "l1_bound"} <= set(r)
         assert r["l1_bound"] == "at_most_one_data_item_before_control"
-    assert lat["flood_load"] == {"bytes_per_s": 20000, "seconds": 30, "chunk_bytes": 256}
+    fl = lat["flood_load"]
+    assert {k: fl[k] for k in ("bytes_per_s", "seconds", "chunk_bytes")} == {"bytes_per_s": 20000, "seconds": 30, "chunk_bytes": 256}
+    # method_revision 2026-10-29.2：stop_request 每樣本（新 daemon）的 flood 暖機秒數須為正值；不得有其他未知欄位
+    assert set(fl) == {"bytes_per_s", "seconds", "chunk_bytes", "stop_warmup_s"} and fl["stop_warmup_s"] > 0
 
 
 def test_event_latency_od45_l1_gate_and_external_split():
