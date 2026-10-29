@@ -706,12 +706,21 @@ fn parse_hex4(bytes: &[u8]) -> Option<u16> {
     }
 }
 
+/// 保留孤立 surrogate 時（[`loads_keep_lone_surrogates`]）合法 NUL 的表示：[`crate::pyfmt::ESCAPE_MARK`] 連寫兩次。
+///
+/// 孤立 surrogate 為 `ESCAPE_MARK` 加偏移字元。保留模式的字串中 NUL 只出現在這兩種形式裡，由左而右可唯一切分：
+/// 合法內容（如 NUL 後接 U+FD800）不會與 surrogate 跳脫同形，鍵去重與 Python 一致（S1-f2a23b1-1）。
+pub const KEPT_NUL: &str = "\0\0";
+
 /// 孤立 surrogate 跳脫的解碼方式與出現次數。
 struct LoneSurrogates {
-    /// `true`：以 [`crate::pyfmt::escape_surrogate`] 跳脫保留；`false`：依 RPC-H-03 換成 U+FFFD。
+    /// `true`：以 [`crate::pyfmt::escape_surrogate`] 跳脫保留，合法 NUL 寫成 [`KEPT_NUL`]；
+    /// `false`：依 RPC-H-03 換成 U+FFFD。
     keep: bool,
     /// 累計解碼出的孤立 surrogate 數；[`loads_with`] 以前後差值得出每個字串的個數。
     count: usize,
+    /// 累計寫成 [`KEPT_NUL`] 的合法 NUL 數。
+    nul: usize,
 }
 
 impl LoneSurrogates {
@@ -721,6 +730,16 @@ impl LoneSurrogates {
             crate::pyfmt::escape_surrogate(u32::from(cp), out);
         } else {
             out.push('\u{FFFD}');
+        }
+    }
+
+    /// 非 surrogate 的 `\uXXXX`。
+    fn push_unit(&mut self, out: &mut String, cp: u16) {
+        if cp == 0 && self.keep {
+            self.nul += 1;
+            out.push_str(KEPT_NUL);
+        } else {
+            out.push(char::from_u32(u32::from(cp)).unwrap());
         }
     }
 }
@@ -818,7 +837,7 @@ fn parse_string(
                         // 孤立 low surrogate（RPC-H-03）
                         lone.push(&mut out, uni);
                     } else {
-                        out.push(char::from_u32(uni as u32).unwrap());
+                        lone.push_unit(&mut out, uni);
                     }
                 }
                 _ => {
@@ -926,6 +945,7 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
     let mut lone = LoneSurrogates {
         keep: false,
         count: 0,
+        nul: 0,
     };
     loads_with(s, &mut lone).map(|(value, _)| value)
 }
@@ -933,17 +953,50 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
 /// 同 [`loads`]，但孤立 surrogate 跳脫比照 Python 保留：以 [`crate::pyfmt::escape_surrogate`]
 /// （`ESCAPE_MARK` 加偏移字元）表示，並回傳最終值是否仍含孤立 surrogate（S1X-b-2）。
 ///
+/// 解析期間合法 NUL 寫成 [`KEPT_NUL`]，字串與鍵的表示無碰撞：合法鍵「NUL＋U+FD800」與 `\ud800` 是兩個鍵（S1-f2a23b1-1）。
 /// 重複鍵比照 `json.loads` 以後值覆寫前值；被覆寫掉的值（含其子樹）中的孤立 surrogate 不計（S1-2a65438-1）。
 ///
 /// 供請求端的檔案內容使用：Python `json.load` 保留 surrogate，之後 `json.dumps(...).encode("utf-8")`
-/// 送出前失敗；呼叫端據旗標拒送。旗標為 `false` 時，回傳值與 [`loads`] 相同。
+/// 送出前失敗；呼叫端據旗標拒送，並以此值計算錯誤位置（合法 NUL 仍為 [`KEPT_NUL`]）。
+/// 旗標為 `false` 時，[`KEPT_NUL`] 已還原為 NUL，回傳值與 [`loads`] 相同。
 pub fn loads_keep_lone_surrogates(s: &str) -> Result<(PyValue, bool), JsonError> {
     let mut lone = LoneSurrogates {
         keep: true,
         count: 0,
+        nul: 0,
     };
-    let (value, remaining) = loads_with(s, &mut lone)?;
+    let (mut value, remaining) = loads_with(s, &mut lone)?;
+    if remaining == 0 && lone.nul > 0 {
+        restore_kept_nul(&mut value);
+    }
     Ok((value, remaining > 0))
+}
+
+/// 把值樹內的 [`KEPT_NUL`] 還原為單一 NUL（鍵與字串值）；只用於已無孤立 surrogate 的值樹，
+/// 此時每個 NUL 都屬於一組 [`KEPT_NUL`]。以顯式堆疊走訪，深度不受執行緒堆疊限制。
+fn restore_kept_nul(value: &mut PyValue) {
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            PyValue::Str(text) => {
+                if text.contains(KEPT_NUL) {
+                    *text = text.replace(KEPT_NUL, "\0");
+                }
+            }
+            PyValue::List(items) => stack.extend(items.iter_mut()),
+            PyValue::Dict(dict) => {
+                if dict.0.keys().any(|key| key.contains(KEPT_NUL)) {
+                    // 還原是單射，鍵仍兩兩相異；順序不變。
+                    dict.0 = std::mem::take(&mut dict.0)
+                        .into_iter()
+                        .map(|(key, item)| (key.replace(KEPT_NUL, "\0"), item))
+                        .collect();
+                }
+                stack.extend(dict.0.values_mut());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 解析並回傳值與最終值樹內孤立 surrogate 的個數。
@@ -1128,6 +1181,7 @@ fn loads_with(s: &str, lone: &mut LoneSurrogates) -> Result<(PyValue, usize), Js
                         let (key, key_lone) =
                             pending_key.take().expect("pending_key should be set");
                         // 重複鍵：保留首次的 key（與後來的 key 相等，surrogate 個數相同），值取後者。
+                        // 保留模式下 key 為無碰撞表示（見 KEPT_NUL），相等即 Python 的同一鍵（S1-f2a23b1-1）。
                         match value_lone.insert(key.clone(), val_lone) {
                             Some(old) => *dict_lone = *dict_lone - old + val_lone,
                             None => *dict_lone += key_lone + val_lone,

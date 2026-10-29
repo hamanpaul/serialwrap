@@ -277,11 +277,8 @@ fn read_rule_file(ctx: &CliCtx, file: &str) -> Result<PyValue, String> {
     read_rule_file_lone(ctx, file).map(|(value, _)| value)
 }
 
-/// 讀取並解析規則檔；第二個值為是否含孤立 surrogate 跳脫（值內以 `pyfmt` 跳脫保留，見
-/// [`sw_proto::pyjson::loads_keep_lone_surrogates`]）。
-///
-/// 已知極端情形：檔案同時含孤立 surrogate 與「NUL 後緊接 U+FD800..=U+FDFFF」的合法內容時，
-/// 後者會被 [`encode_error_text`] 誤認為跳脫，錯誤位置可能提前；兩者皆為 INTERNAL_ERROR、皆零請求送出。
+/// 讀取並解析規則檔；第二個值為是否含孤立 surrogate 跳脫（值內以 `pyfmt` 跳脫保留，合法 NUL 為
+/// [`sw_proto::pyjson::KEPT_NUL`]，見 [`sw_proto::pyjson::loads_keep_lone_surrogates`]）。
 fn read_rule_file_lone(ctx: &CliCtx, file: &str) -> Result<(PyValue, bool), String> {
     let path = PathBuf::from(argv::decode(file));
     let bytes = ctx
@@ -377,12 +374,15 @@ fn python_timeout_message(timeout_s: f64) -> &'static str {
 /// 位置為 Python 字元索引：線路格式中，跳脫的 surrogate 為 `\u0000`（6 字元）加偏移字元，在此合併計為 1。
 /// 連續的 surrogate 與 CPython 相同合併為區間（`characters in position a-b`）。
 /// 請求的 `id` 與 [`dispatch_event`] 送出者相同（1）。
+///
+/// 以 [`wire_unit`] 逐單位前進：JSON 跳脫序列整段跳過，合法內容（`\\` 後接 `u0000`、檔案內容的
+/// [`sw_proto::pyjson::KEPT_NUL`]）不會被誤認為 surrogate（S1-f2a23b1-1）。
 fn encode_error_text(method: &str, params: &PyValue) -> Option<String> {
     let encoded = client::encode_request(1, method, params);
     let text = String::from_utf8(encoded).ok()?;
     let mut position = 0usize;
     let mut rest = text.as_str();
-    while let Some(ch) = rest.chars().next() {
+    while !rest.is_empty() {
         if let Some((first, _)) = escaped_surrogate_at(rest) {
             let mut count = 0usize;
             let mut cursor = rest;
@@ -401,10 +401,30 @@ fn encode_error_text(method: &str, params: &PyValue) -> Option<String> {
                 )
             });
         }
-        position += 1;
-        rest = &rest[ch.len_utf8()..];
+        let (len, chars) = wire_unit(rest);
+        position += chars;
+        rest = &rest[len..];
     }
     None
+}
+
+/// `text`（非空的線路文字）開頭一個單位在 `text` 內佔用的位元組數，與它在 Python 請求文字中的字元數。
+///
+/// 單位為 JSON 跳脫序列（`\uXXXX` 6 字元，其餘 2 字元）或單一字元。檔案內容的合法 NUL
+/// （[`sw_proto::pyjson::KEPT_NUL`]）在線路上為 `\u0000\u0000`，在 Python 請求文字中是一個 `\u0000`。
+fn wire_unit(text: &str) -> (usize, usize) {
+    // `KEPT_NUL` 的兩個 NUL 各自序列化為 `\u0000`。
+    const WIRE_KEPT_NUL: &str = "\\u0000\\u0000";
+    if text.starts_with(WIRE_KEPT_NUL) {
+        (WIRE_KEPT_NUL.len(), "\\u0000".len())
+    } else if text.starts_with("\\u") {
+        ("\\u0000".len(), "\\u0000".len())
+    } else if text.starts_with('\\') {
+        (2, 2)
+    } else {
+        let ch = text.chars().next().unwrap_or_default();
+        (ch.len_utf8(), 1)
+    }
 }
 
 /// `text` 開頭為一個跳脫的 surrogate（`\u0000` ＋ 偏移字元）時，回傳其碼位與在 `text` 內佔用的位元組數。

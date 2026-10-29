@@ -90,6 +90,47 @@ fn keep_lone_surrogates_flag_follows_duplicate_key_overwrite() {
     }
 }
 
+/// S1-f2a23b1-1：合法鍵「NUL＋U+FD800」與孤立 surrogate 鍵 `\ud800` 是不同的鍵（Python 3.12.3 `json.loads`
+/// 保留兩者），去重不得合併；後者留在最終值樹，旗標為 `true`。只有合法鍵時旗標為 `false`、值同 `loads`。
+#[test]
+fn keep_lone_surrogates_keys_distinguish_legal_content_from_surrogates() {
+    for (doc, keys) in [
+        (r#"{"\u0000\udbb6\udc00":1,"\ud800":2}"#, 2),
+        (r#"{"\ud800":2,"\u0000\udbb6\udc00":1}"#, 2),
+        (r#"{"\u0000\udbb6\udc00":"\ud800","\ud800":"x"}"#, 2),
+        (
+            r#"{"\u0000\udbb6\udc00":1,"\ud800":2,"\u0000\udbb6\udc00":3,"\ud800":4}"#,
+            2,
+        ),
+    ] {
+        let (v, lone) = pyjson::loads_keep_lone_surrogates(doc).unwrap();
+        assert!(lone, "doc={doc}");
+        let pyjson::PyValue::Dict(dict) = v else {
+            panic!("doc={doc} 應解析為 dict");
+        };
+        assert_eq!(dict.0.len(), keys, "doc={doc}");
+    }
+    let (v, lone) =
+        pyjson::loads_keep_lone_surrogates(r#"{"o":{"\u0000\udbb6\udc00":1,"\ud800":2}}"#).unwrap();
+    assert!(lone);
+    let pyjson::PyValue::Dict(inner) = &v["o"] else {
+        panic!("o 應解析為 dict");
+    };
+    assert_eq!(inner.0.len(), 2);
+
+    for doc in [
+        r#"{"\u0000\udbb6\udc00":1}"#,
+        r#"{"\u0000\udbb6\udc00":1,"\u0000\udbb6\udc00":2}"#,
+        r#"{"\u0000\udbb6\udc00":"\ud800","\u0000\udbb6\udc00":"ok"}"#,
+        r#"{"\u0000":"\u0000\u0000","a":"\udc80","a":"\u0000"}"#,
+        r#"["\u0000","\u0000\u0000",{"\u0000\u0000":"\\u0000"}]"#,
+    ] {
+        let (v, lone) = pyjson::loads_keep_lone_surrogates(doc).unwrap();
+        assert!(!lone, "doc={doc}");
+        assert_eq!(v, pyjson::loads(doc).unwrap(), "doc={doc}");
+    }
+}
+
 #[test]
 fn duplicate_key_keeps_first_position_last_value() {
     let v = pyjson::loads(r#"{"a":1,"b":2,"a":3}"#).unwrap();

@@ -107,3 +107,41 @@ CPython `Tokenizer` 在 `get()` 時就預讀下一個 token；下一個 token �
 ## OWNER-BATCH
 
 無。兩項修正都沒有改 SC／BC／DF、凍結鎖或 oracle 語意；`pyre.tsv` 只新增 50 列（語料第七區 25 筆），既有列逐位元組不變，`pyre.limits.json` 不變；RPC-H-03 回應端行為不變。
+
+---
+
+# 第 3 輪（sol 增量審查 `2a65438_f2a23b1-sol.md`）
+
+> 依據：`origin/docs/parity-amendments` 的 `reviews/s1-cloud/2a65438_f2a23b1-sol.md`（A 段前輪 finding 全為已修；B 段 1 High）。
+> 起點 `450ecebc`（`f2a23b1` 併入 `feature/rust-refactor` 的 `897a3cd`）。實測環境：CPython 3.12.3、Rust 1.96.1，一般使用者執行。
+
+## 處理
+
+| 編號 | 處理 | commit |
+|---|---|---|
+| S1-f2a23b1-1（High） | 照修：保留模式下合法 NUL 改用無碰撞表示 `KEPT_NUL`，鍵去重、surrogate 計數與錯誤位置使用同一個鍵身分 | 本文件所在 commit（`fix(proto): 合法鍵與孤立 surrogate 鍵不再合併…`） |
+
+報告的重現成立。Python 3.12.3 實際 CLI 搭配記錄請求行的 stub：`{"\u0000\udbb6\udc00":1,"\ud800":2}` 連線 1 次、0 筆請求行、exit 1，訊息為 `character '\ud800' in position 57`；交換順序為 position 45。修正前的 Rust CLI 對前者 exit 0，送出只剩一個鍵的請求。
+
+- **根因**：`pyfmt` 的 surrogate 跳脫（`ESCAPE_MARK` 加偏移字元）是給 argv 用的，argv 不可能含 NUL。檔案內容的合法 NUL 後接 U+FD800..=U+FDFFF 與跳脫同形，所以字典去重把兩個鍵當成同一個。
+- **修法**：`loads_keep_lone_surrogates` 解析時，合法 NUL 寫成 `KEPT_NUL`（`ESCAPE_MARK` 連寫兩次）。NUL 只會出現在這兩種形式的開頭，構成前綴碼，表示無歧義。
+  - 旗標為 `false` 時，把 `KEPT_NUL` 還原成 NUL，回傳值與 `loads` 相同，送出內容不變。
+  - 旗標為 `true` 時保留 `KEPT_NUL`。`event_cmd::encode_error_text` 改成以 JSON 跳脫序列為單位前進，把 `\u0000\u0000` 計為 Python 的一個 `\u0000`。
+  - 原註解所記「NUL＋U+FD800 使錯誤位置提前」的已知限制一併消除。`\\` 之後接 `u0000` 的合法文字也不再被誤認。
+- **回歸**（期望值都取自 Python 3.12.3 實測，修正前紅燈）：
+  - `sw-cli` `event_add_document.rs::add_lone_surrogate_key_colliding_with_legal_key_is_rejected`：6 種文件，含報告反例、交換順序、值帶 surrogate、巢狀、陣列、四鍵交錯。
+  - `…::add_legal_content_resembling_surrogate_escape_keeps_python_position`：5 種，位置依 Python。
+  - `…::add_legal_key_resembling_surrogate_escape_is_sent`：4 種，照送並比對確切請求行。
+  - `sw-proto` `pyjson_golden.rs::keep_lone_surrogates_keys_distinguish_legal_content_from_surrogates`。
+  - 黑箱 `test_bb_event.py`：`test_event_add_lone_surrogate_key_colliding_with_legal_key_rejected`（3 個參數化案例），以及 `test_event_add_legal_key_resembling_surrogate_escape_is_sent`。
+- **隨機差分**：以 CPython 3.12.3 的 `json.loads` 加 `json.dumps(...).encode()` 為 oracle，對 Rust CLI 實際執行並比對 rc、stdout、請求行。
+  - 一般模式（種子 1～8 × 500）：修正前 1,250 例不一致，修正後 0。
+  - 碰撞鍵池模式（種子 11～14 × 500）：修正前 769 例不一致，其中 98 例判定相反（應拒送卻送出）；修正後 0。
+
+## 不成立主張
+
+無。
+
+## OWNER-BATCH
+
+無。沒有改 SC／BC／DF、凍結鎖或 oracle 語意。RPC-H-03 回應端行為不變（`loads` 不使用 `KEPT_NUL`）。

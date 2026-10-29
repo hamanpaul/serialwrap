@@ -239,3 +239,48 @@ def test_event_add_overwritten_lone_surrogate_is_sent(env, stubd, tmp_path, doc,
     assert r.rc == 0, r.stderr
     assert r.stdout == b'{"ok":true}' + NL
     assert s.requests() == [b'{"id":1,"method":"event.rule_set","params":' + params + b"}\n"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.parametrize(
+    ("doc", "detail"),
+    [
+        (b'{"\\u0000\\udbb6\\udc00":1,"\\ud800":2}', "character '\\ud800' in position 57"),
+        (b'{"\\ud800":2,"\\u0000\\udbb6\\udc00":1}', "character '\\ud800' in position 45"),
+        (b'{"a":"\\u0000\\udbb6\\udc00","b":"\\ud800"}', "character '\\ud800' in position 63"),
+    ],
+)
+def test_event_add_lone_surrogate_key_colliding_with_legal_key_rejected(env, stubd, tmp_path, doc, detail):
+    """S1-f2a23b1-1：合法鍵「NUL＋U+FD800」與孤立 surrogate 鍵是不同的鍵，後者使請求於送出前拒送（Python 基線）。"""
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "collide.json"
+    f.write_bytes(doc)
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    message = f"'utf-8' codec can't encode {detail}: surrogates not allowed"
+    assert r.rc == 1
+    assert r.stdout == (
+        json.dumps(
+            {"error_code": "INTERNAL_ERROR", "message": message, "ok": False},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + NL
+    )
+    assert r.stderr == f"serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}".encode("utf-8") + NL
+    assert s.requests() == []
+
+
+@pytest.mark.core_portable
+def test_event_add_legal_key_resembling_surrogate_escape_is_sent(env, stubd, tmp_path):
+    """S1-f2a23b1-1：只有合法鍵「NUL＋U+FD800」時照常送出（Python 基線）。"""
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "legal.json"
+    f.write_bytes(b'{"\\u0000\\udbb6\\udc00":1}')
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    assert r.rc == 0, r.stderr
+    assert r.stdout == b'{"ok":true}' + NL
+    assert s.requests() == [
+        b'{"id":1,"method":"event.rule_set","params":{"\\u0000' + "\U000fd800".encode("utf-8") + b'":1}}\n'
+    ]
