@@ -25,6 +25,34 @@ fn lock_conformance_suite() {
     conformance::lock_suite(native().instance_lock, d.path());
 }
 
+/// P5 第 7 輪（r6 gate `lock_conformance_suite` 間歇失敗的根因，本機重現 145/2000）：同一測試執行檔內平行測試 spawn
+/// 子行程時，子行程在 exec 前持有父行程全部 fd 的複本（含 CLOEXEC 者）；lock_suite 以 bind→drop 製造「失效」socket，
+/// 若 drop 落在他測試的 fork 與 exec 之間，複本仍在 listen，探測連線成功而得 `AlreadyRunning`。失效 socket 的情境
+/// 須在任何並行 spawn 下皆成立（不得依賴執行緒排程）。
+#[cfg(unix)]
+#[test]
+#[cfg(feature = "test-fakes")]
+fn lock_conformance_suite_survives_concurrent_spawns() {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let spawner = thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = Command::new("true").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    });
+    let result = std::panic::catch_unwind(|| {
+        for _ in 0..1000 {
+            let d = tempfile::tempdir().unwrap();
+            conformance::lock_suite(native().instance_lock, d.path());
+        }
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    spawner.join().unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn second_acquire_same_lock_is_already_running_and_pid_written() {

@@ -304,6 +304,33 @@ def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
     return parsed
 
 
+_FAILURES_HEAD = re.compile(r"^failures:\s*$")
+
+
+def _failures_section(stdout: str) -> str:
+    """libtest stdout 的失敗段（第一個 `failures:` 起到結尾）；沒有即回空字串。"""
+    lines = stdout.splitlines()
+    for index, line in enumerate(lines):
+        if _FAILURES_HEAD.match(line.strip()):
+            return "\n".join(lines[index:]) + "\n"
+    return ""
+
+
+def _keep_failure_output(out_path: Path, target: TargetRun, label: str, rc: int, stdout: str, stderr: str) -> None:
+    """P5 第 7 輪：測試執行失敗（rc≠0）時，把 libtest stdout 的失敗段（panic 訊息）轉印到 stderr（gate log 可見），
+    並把完整 stdout／stderr 存到 `<報告>.failures/<crate>-<target>[-<label>].{stdout,stderr}.txt`。報告內容不變。"""
+    if rc == 0:
+        return
+    tag = f"{target.crate}-{target.target}" + (f"-{label}" if label else "")
+    section = _failures_section(stdout)
+    print(f"cargo_l1_results.py: {tag} 結束碼 {rc}；失敗段：\n{section or '(stdout 無 failures 段)'}", file=sys.stderr, end="")
+    keep = out_path.parent / f"{out_path.name}.failures"
+    keep.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag)
+    (keep / f"{safe}.stdout.txt").write_text(stdout, encoding="utf-8")
+    (keep / f"{safe}.stderr.txt").write_text(stderr, encoding="utf-8")
+
+
 def _read_report(path: str, value: dict[str, Any]) -> None:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -424,19 +451,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             finished = False
         if run_stderr:
             print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
+        _keep_failure_output(out_path, target, "", run_rc, run_stdout, run_stderr)
         target.results = _parse_results(run_stdout, target)
 
         available_caps = {cap for name in target.ignored_names if (cap := capability_of(name)) is not None}
         selected_caps = [cap for cap in args.caps if cap in available_caps]
         for cap in selected_caps:
+            # P5 第 7 輪：能力測試以單執行緒執行。同執行檔平行測試 fork 子行程時，子行程在 exec 前暫時持有父行程全部 fd
+            # 的複本（含 CLOEXEC 者），會被其他測試的 /proc holder 掃描看成外部 holder（cap_posix_pty__* 並行間歇 Held）。
             cap_rc, cap_stdout, cap_stderr, cap_complete = _run(
-                runner_argv + ["--ignored", f"cap_{cap}__"], args.timeout
+                runner_argv + ["--ignored", f"cap_{cap}__", "--test-threads=1"], args.timeout
             )
             target.exit_codes.append(cap_rc)
             if not cap_complete:
                 finished = False
             if cap_stderr:
                 print(cap_stderr, file=sys.stderr, end="" if cap_stderr.endswith("\n") else "\n")
+            _keep_failure_output(out_path, target, f"cap_{cap}", cap_rc, cap_stdout, cap_stderr)
             cap_results = _parse_results(cap_stdout, target)
             replaced = {row["nodeid"]: row for row in cap_results}
             target.results = [replaced.get(row["nodeid"], row) for row in target.results]

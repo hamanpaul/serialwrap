@@ -163,24 +163,14 @@ impl PeerEnd for PtyPeer {
     }
 }
 
-/// `openpty` 建立一對 PTY：回傳 slave 路徑（`DevicePath`）與 master 對端。
+/// 建立一對 PTY：回傳 slave 路徑（`DevicePath`）與 master 對端。
 /// 建立時先把 slave 設為 raw 並關閉本程序持有的 slave fd（路徑保留，master 持有 tty 物件）；
 /// 否則父程序的 slave fd 會被子程序的鎖後重掃識別為外部 holder。
+/// P5 第 7 輪：master／slave 皆以 CLOEXEC 開啟（Linux 以 `posix_openpt(O_CLOEXEC)`＋`open(O_CLOEXEC)` 原子設定）——
+/// `openpty` 的 fd 不帶 CLOEXEC，同執行檔平行測試 spawn 的子行程（plain holder 等）會繼承而被當成外部 holder。
 #[cfg(unix)]
 pub fn posix_pty_pair() -> (DevicePath, PtyPeer) {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    // SAFETY: 兩個輸出指標皆指向有效的 c_int；其餘參數允許為 null。
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty 失敗: {}", std::io::Error::last_os_error());
+    let (master, slave) = open_pty_cloexec();
     // SAFETY: slave 為 openpty 回傳的有效 fd；ttyname_r 將路徑寫入此呼叫專屬緩衝區。
     let path = unsafe {
         let mut t: libc::termios = std::mem::zeroed();
@@ -210,6 +200,47 @@ pub fn posix_pty_pair() -> (DevicePath, PtyPeer) {
             reading: true,
         },
     )
+}
+
+/// 開一對帶 CLOEXEC 的 PTY fd（master, slave）。
+#[cfg(target_os = "linux")]
+fn open_pty_cloexec() -> (libc::c_int, libc::c_int) {
+    // SAFETY: posix_openpt／grantpt／unlockpt／ptsname_r／open 皆以有效參數呼叫；名稱寫入本呼叫專屬緩衝區。
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        assert!(master >= 0, "posix_openpt 失敗: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::grantpt(master), 0, "grantpt 失敗: {}", std::io::Error::last_os_error());
+        assert_eq!(libc::unlockpt(master), 0, "unlockpt 失敗: {}", std::io::Error::last_os_error());
+        let mut name = vec![0 as libc::c_char; 4096];
+        let rc = libc::ptsname_r(master, name.as_mut_ptr(), name.len());
+        assert_eq!(rc, 0, "ptsname_r 失敗: {}", std::io::Error::from_raw_os_error(rc));
+        let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        assert!(slave >= 0, "開啟 PTY slave 失敗: {}", std::io::Error::last_os_error());
+        (master, slave)
+    }
+}
+
+/// 非 Linux 的 POSIX：`openpty` 後立即設 FD_CLOEXEC（無原子介面；本專案 POSIX 正式平台為 Linux／WSL）。
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_pty_cloexec() -> (libc::c_int, libc::c_int) {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: 兩個輸出指標皆指向有效的 c_int；其餘參數允許為 null。
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty 失敗: {}", std::io::Error::last_os_error());
+    for fd in [master, slave] {
+        // SAFETY: fd 為 openpty 回傳的有效 fd。
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    (master, slave)
 }
 
 /// 子程序（以 `current_exe()` 重入 `plain_holder_child` 測試）：普通 open（不 flock、不 TIOCEXCL）持有 slave，回報 READY 後等待。
@@ -359,5 +390,32 @@ impl PeerEnd for FakePeer {
 impl Drop for FakePeer {
     fn drop(&mut self) {
         self.dev.close_peer();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pty_fd_tests {
+    use super::*;
+
+    /// P5 第 7 輪（cap_posix_pty__* 並行負載下間歇 `Held(pids:[同測試執行檔的子行程])`，本機重現 11/180）：夾具建立的
+    /// PTY fd 須帶 CLOEXEC——否則同執行檔平行測試 spawn 的子行程（plain holder 等）會繼承 master／slave，被測端的鎖後
+    /// holder 掃描把它當成外部 holder。以「建立後才 spawn 的子行程不持有 master」驗證。
+    #[test]
+    fn pty_pair_fds_are_not_inherited_by_spawned_children() {
+        let (_dev, peer) = posix_pty_pair();
+        // SAFETY: master 為 posix_pty_pair 回傳、仍由 peer 持有的有效 fd。
+        let fd_flags = unsafe { libc::fcntl(peer.master, libc::F_GETFD) };
+        assert!(fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0, "master 須帶 FD_CLOEXEC（flags={fd_flags}）");
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let inherited = std::path::Path::new(&format!("/proc/{}/fd/{}", child.id(), peer.master)).exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!inherited, "子行程繼承了 PTY master fd {}", peer.master);
     }
 }
