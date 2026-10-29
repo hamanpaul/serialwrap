@@ -6580,21 +6580,41 @@ class SessionManager:
                     if capture is not None:
                         capture.status = "done"
                 lease = self._open_interactive_locked(session, owner=source, timeout_s=max(timeout_s, session.profile.hard_timeout_s))
+                # S1X-a-1：op_id 必須與 _open_interactive_locked 經 _push_tx_gate 發佈的
+                # lease owner（interactive:<lease_id>）一致，否則提交點必以 lease 拒絕。
                 interactive_permit = TxPermit(
-                    cmd_id,
+                    f"interactive:{lease.interactive_id}",
                     session.bridge_generation,
                     "interactive",
                     owner_gen=getattr(bridge, "owner_gen", 0),
                 )
             if command:
                 self._mark_session_tx(session)
-                self._send_command_with_permit(
-                    bridge,
-                    command,
-                    source=source,
-                    cmd_id=cmd_id,
-                    permit=interactive_permit,
-                )
+                try:
+                    # 取消若早於 lease 開啟，revoke_tx_op 只撤銷得到 cmd_id；此時把同一撤銷
+                    # 延伸到本命令的 lease op，維持「取消後零 TX」。
+                    revoked = getattr(bridge, "_revoked_ops", None)
+                    if revoked is not None and cmd_id in revoked:
+                        revoke = getattr(bridge, "revoke_ops", None)
+                        if callable(revoke):
+                            revoke([interactive_permit.op_id])
+                    self._send_command_with_permit(
+                        bridge,
+                        command,
+                        source=source,
+                        cmd_id=cmd_id,
+                        permit=interactive_permit,
+                    )
+                except BaseException:
+                    # 送出拋例外或被拒：關閉剛開的 lease，避免遺留 lease 讓後續命令
+                    # 拿到 SESSION_INTERACTIVE_BUSY 直到逾時；例外交由 execute_command 映射。
+                    with self._lock:
+                        _, close_post = self._close_interactive_locked(
+                            session,
+                            interactive_id=lease.interactive_id,
+                        )
+                    close_post.execute()
+                    raise
             return {
                 "ok": True,
                 "execution_mode": "interactive",
