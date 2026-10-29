@@ -2,6 +2,6 @@
   "_note": "雲端審查 routine 的進度標記：每條分支記錄最後一個已被有效審查（報告非空）的 commit。routine 審查 <值>..origin/<分支> 後更新此值。",
   "feature/rust-refactor": "8ef93f4",
   "feature/rust-refactor-p5": "464adec",
-  "feature/rust-refactor-p6": "71b1183",
+  "feature/rust-refactor-p6": "bf61e3e",
   "feature/rust-refactor-p7": "9065f14"
 }
