@@ -3287,6 +3287,22 @@ class SessionManager:
             "holder_unknown": report.holder_unknown,
         }
 
+    def _attach_inflight_draining_locked(self, session: SessionRuntime, by_id: str) -> bool:
+        """attach 在途表命中時，判斷是否屬 drain／release 進行中（需持 _lock）。
+
+        只有 pending drain、by_id 正在 drain、在途 op 帶 release 請求或已取消、或 session
+        已 RELEASED 時才算；否則只是 probe／login 進行中的一般 attach（S1X-a-3）。
+        """
+        if session._pending_drain is not None or by_id in self._draining_by_ids:
+            return True
+        if session.state == "RELEASED" or by_id in self._released_by_ids:
+            return True
+        for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops):
+            op = table.get(by_id)
+            if op is not None and (op.release_request is not None or op.cancelled.is_set()):
+                return True
+        return False
+
     def attach_device(self, selector: str, *, force: bool = False) -> dict[str, Any]:
         if self._shutting_down:
             raise RuntimeError("daemon stopping")
@@ -3321,6 +3337,10 @@ class SessionManager:
                 or by_id in self._active_attach_ops
                 or by_id in self._attach_bridges
             ):
+                # S1X-a-3：單純 attach 進行中（probe／login）回 ok＋session（0.3.2 行為）；
+                # SESSION_RECOVERING 只保留給 drain／release 進行中（SC-04）。
+                if not self._attach_inflight_draining_locked(session, by_id):
+                    return {"ok": True, "session": session.to_public_dict()}
                 return {
                     "ok": False,
                     "error_code": "SESSION_RECOVERING",
@@ -3343,6 +3363,8 @@ class SessionManager:
             if self._shutting_down:
                 raise RuntimeError("daemon stopping")
             if self._attach_ops.get(by_id) is not None or self._preopened_ports.get(by_id) is not None:
+                if not self._attach_inflight_draining_locked(session, by_id):
+                    return {"ok": True, "session": session.to_public_dict()}
                 return {
                     "ok": False,
                     "error_code": "SESSION_RECOVERING",
