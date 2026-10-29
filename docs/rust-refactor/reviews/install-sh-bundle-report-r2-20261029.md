@@ -70,9 +70,20 @@
   - `62ffec7_b84ee5b`：NO FINDINGS。
   - `b84ee5b_407ed7e`：可放行。
   - `407ed7e_ed46551`：可放行。
-  - 三份都沒有 High／Medium。
-  - S1-407ed7e-1 [Low]：README 殘留 TODO(OD-48)，累計 1 輪未修。依收斂規則 Low 不修，請編排者記入 `low-backlog.md`。
-  - 既有碼待辦：wheelhouse 的 PyYAML 下載跟隨主機 python3 的標籤。不計入結論，本輪未修。
+  - 結束前 fetch（`93bb8a8`）又看到兩份：`b84ee5b_ed46551`（可放行）、`ed46551_607ea76`（可放行）。
+  - 五份都沒有 High／Medium。
+  - 以下 Low 依收斂規則不修，請編排者記入 `low-backlog.md`：
+    - S1-407ed7e-1：README 殘留 TODO(OD-48)。
+    - S1-ed46551-1：dry-run 在有 `--bundle` 時仍印出 build venv 幾行。
+    - S1-ed46551-2：版本不符與 `_base_executable` 兩道 fail-closed 沒有回歸。
+    - S1-ed46551-3：`require_system_python` 未檢查 venv／ensurepip 是否可用。
+    - S1-607ea76-1：降級逾時時，`pipx` 與 0.3.2 setup 仍會執行，只有 start 被代位。判定仍為 FAIL，不會產生假 PASS。另外，§4.1「逾時略過後續的 start／setup」一句對降級段不精確。
+    - S1-607ea76-2：§4.1「由 `install-sh-407ed7e` 取代」語意顛倒，原意是 `install-sh-407ed7e` 被本輪取代。
+    - S1-607ea76-3：`_start_ticks` 與兩處 cmdline 讀取仍寫死 `/proc`，正式路徑行為不變。
+    - S1-607ea76-4：計時案例在 Windows 可能因 rmtree 撞上開檔而 flake（推論，未實跑）。
+  - 既有碼待辦（不計入結論，本輪未修）：
+    - wheelhouse 的 PyYAML 下載跟隨主機 python3 的標籤。
+    - 報告沒有記錄 driver 的 sha256。
 
 ## 追加指示：Docker on-demand 預熱競態（`a20de1d`）
 
