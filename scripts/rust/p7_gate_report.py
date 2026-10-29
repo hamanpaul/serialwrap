@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Slice 2.3（P7）出口 gate 報告產生器與驗證器（08-slice23-login-events.md Task 19）。
+
+`p7_gate.sh` 只負責「執行並記錄」：每個子程序的 argv、rc、時間、log（落檔＋sha256）、測試計數與 evidence 寫入
+`<run>/results.json`；列狀態一律由本檔計算（gate 腳本本身不判定）。
+
+狀態規則（R5-F3）：
+- 測試列（`TEST_ROWS`）PASS ⇔ rc==0、`required_set` 非 null、`l1_results`（P2 `l1-results.v1`）經 P2
+  `tests/acceptance/l1_judge.judge` 判定 PASS（每個凍結 nodeid 恰一列 passed、無重複、無 skip／未執行、exit 0、
+  finished）、`test_counts` 與 l1 彙總相符、所有 evidence 檔存在且 sha256 相符；l1_judge FAIL 或任一列 failed → FAIL；
+  INSUFFICIENT／INVALID／缺 l1_results／缺 required_set → INCOMPLETE。
+- 非測試列 PASS ⇔ rc==0 且 evidence 相符；rc!=0 → FAIL；evidence 不符 → INCOMPLETE。
+- 能力缺失（`caps_missing`）→ 該列 BLOCKED-OWNER＋B 編號。
+- 擁有者項目 B-01～B-08：只有 `owner_evidence[B-xx]` 的檔案存在且 sha256 相符時 PASS，否則 BLOCKED-OWNER。
+- `REQUIRED_ROWS` 缺列 → INCOMPLETE（未執行）。
+
+用法：
+  python3 scripts/rust/p7_gate_report.py build  --results-dir <run> [--l1-lock <lock>] [--out <md>]
+  python3 scripts/rust/p7_gate_report.py verify --results-dir <run> --md <md>     # 不一致清單非空 → exit 1
+只用 stdlib；不 import sw_core。
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from typing import Any, Mapping
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_L1_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
+
+REQUIRED_ROWS: tuple[str, ...] = (
+    "check_cfg_boundary",
+    "cargo test --workspace",
+    "win-test.sh (non-COM)",
+    "win-test.sh --caps windows_com",
+    "contract_blackbox p7 A",
+    "contract_blackbox p7 B",
+    "contract_blackbox slice21 B",
+    "contract_blackbox slice22 B",
+    "l15 slice21 B",
+    "l15 slice23 B",
+    "func-test brcm-01-login-flow",
+    "func-test ev-01-spawn-handler",
+    "regen_lock --check",
+    "cases.lock slice_2.3 coverage",
+    "python3 -m pytest -q tests/",
+    "policy_check",
+)
+TEST_ROWS: frozenset[str] = frozenset({
+    "cargo test --workspace",
+    "win-test.sh (non-COM)",
+    "win-test.sh --caps windows_com",
+    "contract_blackbox p7 A",
+    "contract_blackbox p7 B",
+    "contract_blackbox slice21 B",
+    "contract_blackbox slice22 B",
+    "l15 slice21 B",
+    "l15 slice23 B",
+    "python3 -m pytest -q tests/",
+})
+# 能力缺失 → BLOCKED-OWNER 的對應（列名 → (cap, B 編號)）。
+CAP_ROWS: Mapping[str, tuple[str, str]] = {
+    "win-test.sh (non-COM)": ("windows_native", "B-06"),
+    "win-test.sh --caps windows_com": ("windows_com", "B-06"),
+}
+OWNER_ITEMS: Mapping[str, str] = {
+    "B-01": "四平台實機登入（bcm、prpl、op3 shell、smart4R console unlock）",
+    "B-02": "L2 F9 六案（destructive）",
+    "B-03": "真實 USB／usbip read-endpoint stall",
+    "B-04": "L2 F10 兩案（destructive）",
+    "B-05": "L2 F11 兩案",
+    "B-06": "原生 Windows COM handle 證據（OD-08、OD-15）",
+    "B-07": "L3 realhw P0＋登入／Recovery／事件 P1 與 remote",
+    "B-08": "測試團隊 Windows 工作站 event handler",
+}
+# parity-amendments-2026-10-26 #188：P7 承接列的必要 L1 集合（Task 0 起登記；py_parity_* 為後續 Task 增列）。
+PARITY_SETS: tuple[str, ...] = ("p7_gate:py_parity", "p7_gate:py_parity_recover", "p7_gate:py_parity_attach")
+
+
+def _load_judge():
+    spec = importlib.util.spec_from_file_location("p7_l1_judge", ROOT / "tests/acceptance/l1_judge.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _resolve(base: Path, p: str) -> Path:
+    q = Path(p)
+    return q if q.is_absolute() else base / q
+
+
+def _evidence_errors(base: Path, evidence: Any) -> list[str]:
+    errs: list[str] = []
+    for item in evidence or []:
+        if isinstance(item, str):
+            item = {"path": item, "sha256": None}
+        if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+            errs.append(f"evidence 格式錯誤：{item!r}")
+            continue
+        path = _resolve(base, item["path"])
+        got = _sha256(path)
+        if got is None:
+            errs.append(f"evidence 缺檔：{item['path']}")
+        elif item.get("sha256") is not None and got != item["sha256"]:
+            errs.append(f"evidence sha256 不符：{item['path']}")
+    return errs
+
+
+def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any] | None, judge) -> tuple[str, str]:
+    counts = row.get("test_counts") or {}
+    rc = row.get("rc")
+    sid = row.get("required_set")
+    l1_path = row.get("l1_results")
+    if counts.get("failed"):
+        # 任一列 failed 即 FAIL（不論是否附 l1_results；OD-15 COM 列依實跑判定）。
+        return "FAIL", f"failed={counts.get('failed')} rc={rc}"
+    if not sid:
+        return "INCOMPLETE", "缺 required_set"
+    if not l1_path:
+        return "INCOMPLETE", "缺 l1_results"
+    try:
+        report = json.loads(_resolve(base, l1_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "INCOMPLETE", f"l1_results 不可讀：{exc}"
+    platform = row.get("platform") or report.get("platform") or "linux"
+    try:
+        required = judge.required_for(lock or {}, sid, platform)
+    except (KeyError, TypeError):
+        return "INCOMPLETE", f"鎖中無 {sid}.{platform}"
+    verdict = judge.judge(report, required, platform=platform)
+    if verdict["verdict"] == "FAIL":
+        return "FAIL", "; ".join(verdict.get("reasons") or [f"failed={counts.get('failed')}"])[:300]
+    if verdict["verdict"] != "PASS":
+        detail = verdict.get("reasons") or []
+        missing = verdict.get("missing") or []
+        text = "; ".join(str(x) for x in detail)
+        if missing:
+            text = f"missing {len(missing)}；" + text
+        return "INCOMPLETE", text[:300] or verdict["verdict"]
+    agg = verdict.get("counts") or {}
+    if counts and (counts.get("passed") != agg.get("passed") or counts.get("failed", 0) != agg.get("failed", 0)):
+        return "INCOMPLETE", f"test_counts 與 l1 彙總不符：{counts} vs {agg}"
+    if rc != 0:
+        return "INCOMPLETE", f"rc={rc}"
+    ev = _evidence_errors(base, row.get("evidence"))
+    if ev:
+        return "INCOMPLETE", "; ".join(ev)
+    return "PASS", f"{sid} {len(required)} 筆"
+
+
+def _row_status(base: Path, row: Mapping[str, Any], caps_missing: set[str], lock, judge) -> tuple[str, str]:
+    name = row.get("name", "")
+    cap = CAP_ROWS.get(name)
+    if cap is not None and cap[0] in caps_missing:
+        return "BLOCKED-OWNER", cap[1]
+    if name in TEST_ROWS:
+        return _test_row_status(base, row, lock, judge)
+    if row.get("rc") != 0:
+        return "FAIL", f"rc={row.get('rc')}"
+    ev = _evidence_errors(base, row.get("evidence"))
+    if ev:
+        return "INCOMPLETE", "; ".join(ev)
+    return "PASS", ""
+
+
+def _owner_status(base: Path, owner_evidence: Mapping[str, Any], bid: str) -> tuple[str, str]:
+    ev = owner_evidence.get(bid)
+    if not ev:
+        return "BLOCKED-OWNER", "證據未提供"
+    errs = _evidence_errors(base, ev)
+    if errs:
+        return "BLOCKED-OWNER", "; ".join(errs)
+    return "PASS", "擁有者證據已核對"
+
+
+def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
+    results_dir = Path(results_dir)
+    data = json.loads((results_dir / "results.json").read_text(encoding="utf-8"))
+    lock_path = Path(l1_lock) if l1_lock is not None else DEFAULT_L1_LOCK
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        lock = None
+    judge = _load_judge()
+    caps_missing = set(data.get("caps_missing") or [])
+    rows = {r.get("name"): r for r in data.get("rows") or [] if isinstance(r, Mapping)}
+    lines = [
+        "# Slice 2.3（P7）出口 gate 報告",
+        "",
+        f"- run_id: `{data.get('run_id')}`",
+        f"- git_head: `{data.get('git_head')}`",
+        f"- worktree_clean: `{data.get('worktree_clean')}`",
+        f"- caps_missing: `{sorted(caps_missing)}`",
+        f"- l1_lock_sha256: `{_sha256(lock_path)}`",
+        "",
+        "## artifacts",
+        "",
+        "| artifact | sha256 |",
+        "|---|---|",
+    ]
+    for name, digest in sorted((data.get("artifacts") or {}).items()):
+        lines.append(f"| {name} | {digest} |")
+    lines += ["", "## 列狀態", "", "| 列 | 狀態 | 說明 | log_sha256 |", "|---|---|---|---|"]
+    statuses: dict[str, str] = {}
+    names = list(REQUIRED_ROWS) + [n for n in rows if n not in REQUIRED_ROWS]
+    for name in names:
+        row = rows.get(name)
+        if row is None:
+            status, detail = "INCOMPLETE", "未執行"
+            log_sha = ""
+        else:
+            status, detail = _row_status(results_dir, row, caps_missing, lock, judge)
+            log_sha = row.get("log_sha256") or ""
+        statuses[name] = status
+        lines.append(f"| {name} | {status} | {detail.replace('|', '/')} | {log_sha} |")
+    lines += ["", "## 擁有者項目", "", "| 項目 | 狀態 | 說明 |", "|---|---|---|"]
+    owner_evidence = data.get("owner_evidence") or {}
+    for bid, title in OWNER_ITEMS.items():
+        status, detail = _owner_status(results_dir, owner_evidence, bid)
+        lines.append(f"| {bid} | {status} | {title}；{detail} |")
+    lines += ["", "## parity_amendments", "", "| 必要集合 | 平台 | nodeid 數 |", "|---|---|---|"]
+    for sid in PARITY_SETS:
+        for plat in ("linux", "windows"):
+            n = len(((lock or {}).get("sets", {}).get(sid, {}).get(plat) or {}).get("nodeids") or [])
+            if n:
+                lines.append(f"| {sid} | {plat} | {n} |")
+    ok = all(s in ("PASS", "BLOCKED-OWNER") for s in statuses.values())
+    lines += ["", f"結論：{'PASS（含 BLOCKED-OWNER）' if ok else 'NOT-PASS'}", ""]
+    return "\n".join(lines)
+
+
+def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = None) -> list[str]:
+    """重算報告並逐行比對；另核對 log sha256 與 results.json 的 git_head／run_id。回傳不一致清單。"""
+    results_dir = Path(results_dir)
+    problems: list[str] = []
+    try:
+        data = json.loads((results_dir / "results.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"results.json 不可讀：{exc}"]
+    text = Path(md_path).read_text(encoding="utf-8")
+    if f"run_id: `{data.get('run_id')}`" not in text:
+        problems.append("run_id 不符")
+    if f"git_head: `{data.get('git_head')}`" not in text:
+        problems.append("git_head 不符")
+    for row in data.get("rows") or []:
+        lp, want = row.get("log_path"), row.get("log_sha256")
+        if lp and want and _sha256(_resolve(results_dir, lp)) != want:
+            problems.append(f"log sha256 不符：{row.get('name')}")
+    expect = build_report(results_dir, l1_lock=l1_lock).splitlines()
+    got = text.splitlines()
+    if expect != got:
+        diff = [f"- {e!r} / + {g!r}" for e, g in zip(expect, got) if e != g][:10]
+        problems.append("列狀態重算不符：" + "; ".join(diff) if diff else "行數不符")
+    return problems
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build")
+    b.add_argument("--results-dir", required=True, type=Path)
+    b.add_argument("--l1-lock", type=Path)
+    b.add_argument("--out", type=Path)
+    v = sub.add_parser("verify")
+    v.add_argument("--results-dir", required=True, type=Path)
+    v.add_argument("--md", required=True, type=Path)
+    v.add_argument("--l1-lock", type=Path)
+    args = ap.parse_args(argv)
+    if args.cmd == "build":
+        md = build_report(args.results_dir, l1_lock=args.l1_lock)
+        if args.out:
+            args.out.write_text(md, encoding="utf-8", newline="\n")
+        else:
+            sys.stdout.write(md)
+        return 0
+    problems = verify_report(args.md, args.results_dir, l1_lock=args.l1_lock)
+    for p in problems:
+        print(p, file=sys.stderr)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
