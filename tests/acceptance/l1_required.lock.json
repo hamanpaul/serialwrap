@@ -11279,6 +11279,7 @@
           "cargo:sw-core::session_core_lease::attached_not_bootloader",
           "cargo:sw-core::session_core_lease::attached_refresh_created_replay_still_opens_recovery",
           "cargo:sw-core::session_core_lease::attached_rescue_open_mid_replay_redefers",
+          "cargo:sw-core::session_core_lease::attached_rescue_uses_manager_bridge_snapshot_for_worker_health",
           "cargo:sw-core::session_core_lease::attached_stashes_human_lease",
           "cargo:sw-core::session_core_lease::attached_unhealthy_not_ready",
           "cargo:sw-core::session_core_lease::canceled_parked_command_releases_pending_slot",

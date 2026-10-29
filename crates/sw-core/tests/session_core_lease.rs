@@ -1271,3 +1271,44 @@ fn canceled_parked_command_then_drain_releases_pending_slot() {
     assert_eq!(h.reg.pending(&sid), 0, "drain 後 canceled 停放命令不得占用 pending");
     assert!(!h.tx_order().iter().any(|(c, _)| *c == TxClass::Command));
 }
+
+/// 接線稽核（review-convergence-rules §5；R3-8 worker health）：ATTACHED 救援的 worker 健康須取自 manager
+/// 正式注入的 `SelfTestProbes::bridge_snapshot`（現行 epoch 的 IoWorker 快照，`session_manager.rs`），不得依賴
+/// 只有測試會呼叫的 `set_worker_health`。Python `interactive_open` ATTACHED 分支 `bridge.snapshot()` 的
+/// running／serial_alive 任一為假 → SESSION_NOT_READY（零 TX）。修正前未注入 worker_health 即視為健康、照開 lease。
+#[test]
+fn attached_rescue_uses_manager_bridge_snapshot_for_worker_health() {
+    use std::sync::Arc;
+    for (running, serial_alive) in [(false, true), (true, false)] {
+        let mut h = attached(BOOT);
+        feed_rx(&mut h, b"\r\n=> ");
+        h.core.set_self_test_probes(sw_core::self_test::SelfTestProbes {
+            bridge_snapshot: Some(Arc::new(move |_epoch| {
+                Some(sw_core::uart_bridge::WorkerSnapshot { running, serial_alive })
+            })),
+            vtty_alive: Some(Arc::new(|| Some(true))),
+            ..Default::default()
+        });
+        let before = h.tx_effect_count();
+        let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
+        assert_eq!(
+            wire(&r),
+            r#"{"ok":false,"error_code":"SESSION_NOT_READY","selector":"COM0"}"#,
+            "running={running} serial_alive={serial_alive}"
+        );
+        assert_eq!(h.tx_effect_count(), before);
+        assert!(h.core.active_lease().is_none());
+    }
+    // 對照：快照健康時照常開救援 lease。
+    let mut h = attached(BOOT);
+    feed_rx(&mut h, b"\r\n=> ");
+    h.core.set_self_test_probes(sw_core::self_test::SelfTestProbes {
+        bridge_snapshot: Some(Arc::new(|_epoch| {
+            Some(sw_core::uart_bridge::WorkerSnapshot { running: true, serial_alive: true })
+        })),
+        vtty_alive: Some(Arc::new(|| Some(true))),
+        ..Default::default()
+    });
+    let r = h.rpc(open_req("agent", 60.0, "", true)).unwrap();
+    assert_eq!(r.get("recovery_mode"), Some(&true.into()), "{r:?}");
+}
