@@ -16,3 +16,19 @@
     - `tests/test_slice21_skeleton_guards.py::test_resource_limit_rust_mirrors_equal_yaml`（`resource_limits.yaml` 新增 9 列未鏡像）
 - 綠燈紀錄（同日，分支 `feature/rust-refactor-p6` HEAD `5ade76c`，同一命令）：**13 passed、0 failed**。
 - 結論：T0 單獨為紅燈、終態綠燈；紅燈原因皆為 T0 之後兩個 commit 已修的測試基礎設施（marker／鏡像），非產品行為。
+
+## 出口 gate 實跑紀錄（第 5 輪，2026-10-29）
+
+- 環境：非 root（一般使用者，CapEff=0）、Rust 1.96.1、Python 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3；報告目錄 `target/s22-gate/r5-261029-051754`（未提交）。
+- `s22_gate_check.py` result = **FAIL**：
+
+| 集合 | 判定 | 數字／原因 |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | PASS | 2132 passed、38 skipped |
+| `s22_gate:console_conformance_pty`/linux | PASS | 31 passed、3 skipped（`--caps posix_pty`） |
+| `s22_gate:py_parity`/linux | PASS | 12 passed |
+| `s22_gate:parity_py`/linux | PASS | 34 passed（指紋 [2.1]／[2.2] 依 OD-52 轉綠） |
+| `s22_gate:blackbox_rust`/linux | FAIL | 116 passed、1 failed、8 skipped；唯一失敗 `slice21/test_safety_core.py::test_two_daemons_same_tty`（P5 harness，SPEC-GAP） |
+| `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
+
+- 逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。

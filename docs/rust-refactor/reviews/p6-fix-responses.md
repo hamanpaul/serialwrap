@@ -455,3 +455,30 @@ result = **FAIL**。
 ### 第四輪續全套 pytest（非 root、同環境、無 pyserial）
 
 起點 24b8012：13 failed／5569 passed／223 skipped；終點 cd80448：12 failed／5578 passed／221 skipped。終點失敗集合為起點的真子集（少 `test_rust_cfg_boundary.py::test_repo_clean`），無超出基準者。c6ddda1 只改 `rpc_console.rs` 測試（重試迴圈），另以 rpc_console 全 binary 連跑 30 次 0 失敗驗證。
+
+## 第五輪（2026-10-29，雲端 session；起點 71b1183）
+
+### 合併
+
+- 主線 `origin/feature/rust-refactor`：無新 commit（Already up to date）。
+- P5 `464adec`（6419612）：event_latency 證據去除本機路徑（R-21）、slice21_gate.sh EVIDENCE_MISSING；無衝突、lock 未變。`policy_check` 回到 fail 0（sol P6-c6ddda1-2 由此解除）。
+
+### 裁決落實（rulings/p6.md）
+
+| 項目 | 處理 |
+|---|---|
+| OD-52（P6-e9b5c61-3、#183） | 0c20ee8（紅燈 69584d0）：`freeze_slice_cases.py --amend --fingerprint-update`；slice_2.1（P5 檔案，依 OD-52 逐名授權只追加修訂列）／slice_2.2 修訂鏈各加 #2；指紋 [2.1]／[2.2] 轉綠。e0aab47 修正 bf61e3e 已 push 的指紋更新測試前置（sol P6-bf61e3e-1）：改以修訂鏈「第一筆 fingerprint_update 之前」的前綴為起點，後續斷言完整保留 |
+| OD-53（P6-e9b5c61-4） | bf61e3e：只豁免 selector 以 `--ignored cap_<cap>__` 明確執行 ignored 能力測試的集合且只豁免該 cap 前綴列；5ade76c 修區域變數名觸發的資源 marker 誤判。P6 七個能力節點已豁免；稽核仍紅，剩餘 40 列皆為 P5 `s21_core`（`--skip cap_` 集合，不屬能力集合；含 3 個非 cap ignored 列），見 OWNER-BATCH。`--caps posix_pty` 記入 selector：L1 鎖 schema（`additionalProperties:false`）、`regen_lock._spec_shape_problems` 與 CI `--check --base`「selector 改變一律拒絕」皆不允許，改以 `_selector_explicit_caps` 由 selector 推導重現命令並列 SPEC-GAP |
+| OD-54（P6-c6ddda1-1） | bf61e3e（紅燈 80556ea）：任一份報告內部重複即 INSUFFICIENT，不被其他報告的單列 passed 遮蔽 |
+| DF-20 範圍 | ad823bc（紅燈 7d60f64）：受理的 recover 與 U-Boot banner 使既有 agent lease 失效；DF-20 文字涵蓋三情境；conditional 案例 `df20-recover-reboot-stale-interactive-id`。`test_stale_context_not_replayed` 於 Rust artifact 轉綠 |
+| #107 | 7549b31：`co-02-line-backspace`（owner console 先 detach），Python 基線與 Rust 皆 PASS；對照表 #107 PASS |
+| #108／#185 | 565369c（紅燈 db6689b）：#108 → BLOCKED-OWNER（Windows TCP 部分 LOCAL-WINDOWS-TODO，file 傳輸部分改列 P8）；#185 → `PROCESS-EVIDENCE`（`slice22-exit-report.md` §#185） |
+| replay_hold 案 | b64dad9：可達等價前置（human lease 於前景命令期間 interactive_close），新增即綠、變異紅 |
+
+### test_two_daemons_same_tty（SPEC-GAP，P5 harness）
+
+非 TIOCEXCL／環境問題：`tests/contract_blackbox/slice21/harness.py::start_daemon` 對第二個 daemon 也建立新的 FakeTarget，並以 `target.start(by_id_dir, BY_ID_NAME)` 把 symlink 寫進（被 `extra_env` 覆寫為第一個 daemon 的）by-id 目錄，覆蓋第一個 daemon 的 `fake-uart0`。實測（非 root）：第一個 daemon 原持 `/dev/pts/0`，第二個 daemon 啟動後開到自己的 `/dev/pts/3` 並 READY，第一個 daemon 的 holder 隨之消失。Python 與 Rust 皆同樣失敗；TIOCEXCL 本身在非 root 下有效（第二次 open 回 EBUSY）。需 P5 讓 `start_daemon` 可共用既有 target（不建新 target、不寫 symlink）。
+
+### 第五輪 Slice 2.2 出口 gate（非 dry-run，非 root，`target/s22-gate/r5-261029-051754`）
+
+result = **FAIL**。cargo_workspace PASS（2132 passed、38 skipped；第一次實跑 `sw-pal::lock::lock_conformance_suite` 失敗一次，單獨連跑 10 次與同範圍重跑皆綠，失敗集合不同，非 P6 檔案）、console_conformance_pty PASS（31 passed、3 skipped，`--caps posix_pty`）、py_parity PASS（12）、parity_py PASS（34）、blackbox_rust FAIL（116 passed、1 failed `test_two_daemons_same_tty`、8 skipped）、win_test INSUFFICIENT（未登記，LOCAL-WINDOWS-TODO）。逐案 93：PASS 31／BLOCKED-OWNER 62。L1.5／func-test 22 個參照於 Rust release artifact 全 PASS。parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）。map 覆蓋 PASS、prereqs PASS。
