@@ -10091,6 +10091,7 @@
           "cargo:sw-pal::sw_pal::wal_fs::posix::tests::link_eperm_with_absent_destination_falls_back_to_rename",
           "cargo:sw-pal::sw_pal::wal_fs::posix::tests::link_eperm_with_existing_destination_returns_exists_for_suffix",
           "cargo:sw-pal::sw_pal::wal_fs::posix::tests::source_unlink_failure_rolls_back_the_created_destination_link",
+          "cargo:sw-pal::sw_pal::wal_fs::posix::tests::writes_initiate_async_writeback_every_chunk",
           "cargo:sw-pal::sysenv::current_exe_matches_std",
           "cargo:sw-pal::sysenv::errno_name_known_code",
           "cargo:sw-pal::sysenv::pid_matches_current_process",
