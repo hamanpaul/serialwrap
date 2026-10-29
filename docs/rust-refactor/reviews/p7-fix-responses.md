@@ -239,3 +239,11 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 |---|---|---|---|
 | P7-030d294-1 | High | SC-30 取消後舊 run 的完成事件被新 run（同 epoch、新 fsm_gen）的種類分派接受：reboot recovery 推 READY、手動再探回覆新等待者 | **fixed（屬實）**：`login_finished` 入口於任何分派前統一核對 `(epoch, fsm_gen)` 與現行 run 完全相符。回歸 `session_core_login::stale_reboot_recovery_result_after_sc30_does_not_hijack_new_run`、`stale_manual_reprobe_result_after_sc30_does_not_answer_new_waiter`（取消 A → 起 B → 注入 A；修前皆紅） |
 | 030d294_2e15878 | — | NO FINDINGS | — |
+
+## 第 11 輪（第五輪雲端）：merge P5（afebff0）、rulings/p7.md、p7-cloud/f8381e0_9d35b01-sol
+
+| # | 嚴重度 | 裁決 | 處理 |
+|---|---|---|---|
+| P7-71fe017-4 | Medium | 照修（rulings/p7.md 2026-10-29） | **fixed**：merge P5（afebff0）帶入 P5 的拆分——`ProcScan::multi_open_tty_holders`（Python `detect_multi_open`：tty stat 失敗略過）供 `health.rs`、`serialwrapd_tty_holders` 改走 `tty_holders_fail_closed_with` 供 `rollback.rs`；本分支補兩條正式路徑各一支會紅的回歸：`sw-daemon::health_multi_open_p7::health_status_vanished_tty_holders_status_ok_like_detect_multi_open`（真實 `PosixProcScan`＋暫存 proc root，session 的 `/fake/tty-A` 不存在 → `holders_status:"ok"`；Python 3.12 同輸入實測 `{'holders': {}, 'holders_status': 'ok'}`；突變 health 改呼叫 `serialwrapd_tty_holders` → `unknown` 紅）、`sw-cli::rollback_holders_p7::update_confirm_released_stays_fail_closed_when_multi_open_scan_says_ok`（fail-closed 掃描 Unknown、多開掃描 ok → 仍 `DEVICE_STILL_HELD`＋`holder_unknown:true`、零 spawn；突變 rollback 改呼叫 `multi_open_tty_holders` → rc 0 紅）。test-fakes `FakeProcScan::set_multi_open_holders` 讓兩方法可回不同結果（未設定時沿用 trait 預設）。P7-BU-9 結案 |
+| P7-71fe017-3 | High | 依裁決不處理（移交 P5） | 不處理（`op_runner.rs` 屬 P5）；merge 後狀態見本輪回報 |
+| f8381e0_9d35b01 B 段 | — | — | NO FINDINGS |

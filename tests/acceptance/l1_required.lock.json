@@ -4,6 +4,7 @@
     "p7_gate:cargo-test-workspace": {
       "linux": {
         "nodeids": [
+          "cargo:sw-cli::rollback_holders_p7::update_confirm_released_stays_fail_closed_when_multi_open_scan_says_ok",
           "cargo:sw-core::capture_p7::detach_auto_stops_capture",
           "cargo:sw-core::capture_p7::first_log_start_reply_session_has_active_capture",
           "cargo:sw-core::capture_p7::foreground_rx_is_not_captured_and_counts_match_python_rules",
@@ -233,6 +234,7 @@
           "cargo:sw-daemon::event_rpc::rule_delete_get_list_and_not_found",
           "cargo:sw-daemon::event_rpc::rule_set_invalid_schema_and_type_error",
           "cargo:sw-daemon::event_rpc::rule_set_response_spreads_raw_with_ok_first",
+          "cargo:sw-daemon::health_multi_open_p7::health_status_vanished_tty_holders_status_ok_like_detect_multi_open",
           "cargo:sw-daemon::session_rpc_p7::attach_credentials_unresolved_last_error_field",
           "cargo:sw-daemon::session_rpc_p7::attach_passthrough_attached_ok_no_probe",
           "cargo:sw-daemon::session_rpc_p7::attach_resets_credentials_warned",

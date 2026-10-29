@@ -35,6 +35,8 @@ pub struct FakeProcScan {
     gates: Mutex<BTreeMap<u32, ConnectGate>>,
     holders: Mutex<(Vec<u32>, Option<HolderScanStatus>)>,
     holders_script: Mutex<Vec<(Vec<u32>, HolderScanStatus)>>,
+    /// `multi_open_tty_holders` 的獨立結果（未設定時沿用 `serialwrapd_tty_holders`，與 trait 預設相同）。
+    multi_open_holders: Mutex<Option<(Vec<u32>, HolderScanStatus)>>,
     replacement: Mutex<Option<(Arc<super::clock::FakeClock>, u64, u32, DaemonProc)>>,
     rpc_relaunch: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
 }
@@ -129,6 +131,15 @@ impl FakeProcScan {
 
     pub fn set_serialwrapd_tty_holders(&self, v: &[u32]) {
         self.holders(v.to_vec(), HolderScanStatus::Ok);
+    }
+
+    /// 讓 `multi_open_tty_holders`（Python `detect_multi_open` 語意）與 fail-closed 的
+    /// `serialwrapd_tty_holders` 回不同結果，用以區分兩條正式呼叫路徑（rulings/p7.md P7-71fe017-4）。
+    pub fn set_multi_open_holders(&self, v: Vec<u32>, st: HolderScanStatus) {
+        *self
+            .multi_open_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((v, st));
     }
 
     /// 在 FakeClock 指定時間以新的 PID 與 start_ticks 取代目前 daemon identity。
@@ -227,6 +238,18 @@ impl ProcScan for FakeProcScan {
         }
         let guard = self.holders.lock().unwrap_or_else(|e| e.into_inner());
         (guard.0.clone(), guard.1.unwrap_or(HolderScanStatus::Ok))
+    }
+
+    fn multi_open_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let preset = self
+            .multi_open_holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match preset {
+            Some(v) => v,
+            None => self.serialwrapd_tty_holders(paths),
+        }
     }
 
     fn pid_alive(&self, pid: u32) -> bool {
