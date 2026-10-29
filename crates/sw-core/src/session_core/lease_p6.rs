@@ -151,6 +151,15 @@ impl SessionCore {
         self.fx_buf.extend(fx);
     }
 
+    /// DF-20（OD-37 範圍，rulings/p6.md round4-cont OWNER-BATCH #4）：`session recover` 受理與重新開機 banner 時，
+    /// 既有 agent lease 失效（一般 close：不留 expired tombstone，舊 id 之後回 `INTERACTIVE_NOT_FOUND`；stash 的
+    /// human lease 依 PostClose 還原）。human console lease 跟隨仍掛著的 console，不在此失效。Python 現行照送。
+    pub(super) fn invalidate_agent_lease_df20(&mut self) {
+        if self.lease.as_ref().is_some_and(|lease| !lease.is_human()) {
+            self.close_lease_p6(false);
+        }
+    }
+
     /// drain Phase 1：lease 移除、stash 丟棄（無 resume／回放）。
     pub(super) fn clear_interactive_p6(&mut self) {
         if let Some(lease) = self.lease.take() {

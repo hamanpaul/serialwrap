@@ -11420,6 +11420,7 @@
           "cargo:sw-daemon::rpc_console::detach_ok_closes_own_lease",
           "cargo:sw-daemon::rpc_console::detach_unknown_client",
           "cargo:sw-daemon::rpc_console::detach_unknown_client_still_closes_own_lease",
+          "cargo:sw-daemon::rpc_console::df20_send_with_pre_recover_or_reboot_id_not_found_zero_tx",
           "cargo:sw-daemon::rpc_console::interactive_open_not_ready_keeps_raw_selector",
           "cargo:sw-daemon::rpc_console::interactive_open_scans_peers_before_refresh",
           "cargo:sw-daemon::rpc_console::list_and_detach_without_bridge",

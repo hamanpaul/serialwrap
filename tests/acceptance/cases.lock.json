@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-29.1",
+  "cases_revision": "2026-10-29.2",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -236,6 +236,7 @@
       "brcm-01-login-flow",
       "co-01-line-buffering",
       "cowork-01-agent-bad-cmd",
+      "df20-recover-reboot-stale-interactive-id",
       "df20-release-reattach-stale-interactive-id",
       "ev-01-spawn-handler",
       "f1-cmdid-survives-timeout",
@@ -1244,6 +1245,19 @@
       "daemon_slice": "2.3",
       "cli_stage": "1B",
       "stage0_required": true
+    },
+    "df20-recover-reboot-stale-interactive-id": {
+      "suite": "contract-blackbox",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
     },
     "df20-release-reattach-stale-interactive-id": {
       "suite": "contract-blackbox",

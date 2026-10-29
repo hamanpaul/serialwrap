@@ -2906,6 +2906,8 @@ impl SessionCore {
                 // 增補 #13：banner／quiet arm 為 BC-02 失效點（07 D-02）。
                 let mut fx = Vec::new();
                 self.invalidate_input(InvalidateReason::BootBanner, &mut fx);
+                // DF-20（OD-37 範圍）：重新開機 banner 使既有 agent interactive lease 失效（Rust-only）。
+                self.invalidate_agent_lease_df20();
                 fx.extend(self.apply_quiet_armed(now));
                 fx
             }
@@ -4651,6 +4653,10 @@ impl SessionCore {
                 )];
             }
             return vec![Effect::Reply(reply, Ok(self.error_session("SESSION_NOT_READY", now)))];
+        }
+        if force || matches!(self.state, SessionState::Ready | SessionState::Attached) {
+            // DF-20（OD-37 範圍，rulings/p6.md）：受理的 recover 使既有 agent interactive lease 失效（Rust-only）。
+            self.invalidate_agent_lease_df20();
         }
         match self.state {
             SessionState::Attached => {

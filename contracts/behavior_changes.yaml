@@ -1532,8 +1532,8 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P6"]
     case_ids: ["df20-stale-interactive-id-no-replay"]
-    compatibility_impact: "release 後重新 attach，以舊 interactive_id 呼叫 interactive-send 時，Rust 回 INTERACTIVE_NOT_FOUND 且 UART TX 為零；Python 0.4.0 現行行為照送。失效上下文不得回放。"
-    approval_conditions: "涵蓋 release→重新 attach 的舊 interactive_id；拒絕回應須為 INTERACTIVE_NOT_FOUND，且健康 wire 觀測窗口內 TX 為零。"
+    compatibility_impact: "release 後重新 attach、session recover 受理後、或 U-Boot banner（重新開機）之後，以先前取得的 interactive_id 呼叫 interactive-send 時，Rust 回 INTERACTIVE_NOT_FOUND 且 UART TX 為零；Python 0.4.0 現行三種情境皆照送。失效上下文不得回放。recover／banner 兩情境只使 agent lease 失效，仍掛著的 human console 的 lease 不受影響。"
+    approval_conditions: "涵蓋三種情境的舊 interactive_id：release→重新 attach（agent 與 human console lease）、session recover（READY／ATTACHED 或 --force 受理）、U-Boot banner 觸發 boot quiet（agent lease）；拒絕回應須為 INTERACTIVE_NOT_FOUND，且健康 wire 觀測窗口內 TX 為零。recover／banner 兩情境依 rulings/p6.md（round4-cont OWNER-BATCH #4，落實 OD-37 對 test_stale_context_not_replayed 的判定）。"
     related_decisions: ["OD-37"]
   - id: "DF-21"
     kind: "DF"
