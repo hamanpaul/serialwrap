@@ -134,6 +134,39 @@ fn attach_rejected_discards_pty() {
     assert_eq!(r.mgr.pending_pty_count(), 0, "拒絕時預建的 PTY 已丟棄");
 }
 
+/// 07 Task 10 `attach_request_timeout_closes_pty`：對 actor 的請求逾時時 RPC handler 回 timeout 類錯誤，預建 PTY 隨
+/// handler 丟棄（fd 不洩漏）；core 之後才處理到的 `ConsoleAttach` 在 executor 找不到 PTY，不留下幽靈 console 與 lease。
+/// 計畫原文以「actor 卡住」觸發 `SendTimeoutError`；卡住 actor 的 fault hook 須改 P5 的 `actor.rs`（SPEC-GAP，見
+/// p6-fix-responses），本測試以 0 逾時走同一個 handler 逾時出口（`ActorHandle::request` 的 send／recv 逾時皆回
+/// `internal timeout`，`console_attach` 之後一律移除暫存 PTY）。
+#[test]
+fn attach_request_timeout_closes_pty() {
+    let r = ServiceRig::with_console_backend("pty");
+    let factory = r.console.as_ref().unwrap();
+    let before = factory.created().len();
+    let err = r
+        .mgr
+        .console_attach("COM0", None, Duration::ZERO)
+        .expect_err("0 逾時：handler 不等 actor 回覆");
+    assert_eq!(err.message, "internal timeout");
+    assert_eq!(r.mgr.pending_pty_count(), 0, "逾時後暫存 PTY 已移除");
+    let created = factory.created();
+    assert_eq!(created.len(), before + 1, "handler 先建 PTY 再送請求");
+    let (_, io) = created[before].clone();
+    wait_for("逾時的 PTY 被 drop（fd 關閉）", || io.closed());
+    // core 處理遲到的請求後，executor 回報 adopt 失敗，core 移除該 console 與其 lease（executor 註解「含其 owner／lease」；
+    // 否則幽靈 `human:<cid>` lease 使之後 attach 的 console 不再取得 lease 與 raw ownership）。
+    wait_for("不留幽靈 console", || {
+        let l = r.call("session.console_list", r#"{"selector":"COM0"}"#);
+        matches!(l.get("consoles"), Some(PyValue::List(v)) if v.len() == 1)
+    });
+    wait_for("不留幽靈 lease", || {
+        r.session("COM0").unwrap().get("interactive_session_id") == Some(&PyValue::Null)
+    });
+    let ok = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_eq!(ok.get("interactive_owner"), Some(&PyValue::Bool(true)), "之後的 attach 照常：{}", j(&ok));
+}
+
 #[test]
 fn detach_missing_client_id() {
     let r = ServiceRig::with_console_backend("pty");

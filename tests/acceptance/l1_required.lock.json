@@ -11400,6 +11400,7 @@
           "cargo:sw-daemon::rpc_console::attach_pty_shape_first",
           "cargo:sw-daemon::rpc_console::attach_pty_shape_second",
           "cargo:sw-daemon::rpc_console::attach_rejected_discards_pty",
+          "cargo:sw-daemon::rpc_console::attach_request_timeout_closes_pty",
           "cargo:sw-daemon::rpc_console::attach_selector_alias_chain",
           "cargo:sw-daemon::rpc_console::attach_selector_com_chain",
           "cargo:sw-daemon::rpc_console::attach_tcp_shape",
