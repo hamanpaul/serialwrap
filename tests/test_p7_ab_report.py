@@ -206,3 +206,20 @@ def test_external_evidence_path_is_locatable(tmp_path, monkeypatch):
     other = tmp_path / "elsewhere" / "a.xml"
     assert ab._rel(other) == "$EXTERNAL/" + str(other.resolve()).lstrip("/")
     assert ab._rel(ROOT / "scripts/rust/p7_ab_report.py") == "scripts/rust/p7_ab_report.py"
+
+
+def test_coverage_crate_sourced_case_uses_cargo_l1(tmp_path):
+    """source_ref 在 crates/ 的案例以 gate 的 cargo L1 報告判定：恰一列 passed 才 PASS；缺報告、缺列、失敗皆缺漏。"""
+    cases = [{"case_id": "df18-x", "suite": "contract-blackbox",
+              "source_ref": "crates/sw-core/tests/event_store.rs::upsert_overwrites_existing_df18"}]
+    nid = "cargo:sw-core::event_store::upsert_overwrites_existing_df18"
+    fx = _cov_fixture(tmp_path, cases)
+    rep_path = tmp_path / "cargo.json"
+    for results, want in (([{"nodeid": nid, "outcome": "passed"}], "PASS"),
+                          ([{"nodeid": nid, "outcome": "failed"}], "GAP"),
+                          ([{"nodeid": nid, "outcome": "passed"}, {"nodeid": nid, "outcome": "passed"}], "GAP"),
+                          ([], "GAP")):
+        rep_path.write_text(json.dumps({"results": results}), encoding="utf-8")
+        rep = cov.build(tmp_path / "ab", *fx, cargo_l1=rep_path)
+        assert rep["rows"][0]["status"] == want, (results, rep["rows"][0])
+    assert cov.build(tmp_path / "ab", *fx)["rows"][0]["status"] == "GAP"     # 未提供 cargo 報告

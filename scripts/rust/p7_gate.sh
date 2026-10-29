@@ -188,7 +188,8 @@ run_row "regen_lock --check" regen-lock-check --evidence "$RUN/logs/regen-lock-c
   python3 tests/acceptance/regen_lock.py --check
 # 14. slice_2.3 必要案例涵蓋
 run_row "cases.lock slice_2.3 coverage" coverage --evidence "$RUN/coverage.json" -- \
-  python3 scripts/rust/p7_case_coverage.py --ab-dir "$AB" --out "$RUN/coverage.json"
+  python3 scripts/rust/p7_case_coverage.py --ab-dir "$AB" --out "$RUN/coverage.json" \
+  --cargo-l1 "$RUN/cargo-test-workspace/l1-results.json"
 # 15. 全套 pytest（p7_gate:python3-m-pytest-q-tests；任何失敗 → 該列 FAIL，l1_judge 規則）
 mkdir -p "$RUN/pytest-full"
 if [[ "$SKIP_FULL" == "1" ]]; then

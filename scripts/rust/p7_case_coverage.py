@@ -15,6 +15,8 @@
   `test_case[<id>-rust-…]`；2.3 的取 `<ab>/l15-slice23/junit.xml` 的 `test_*_rust[<id>]`；func-test 的
   brcm-01-login-flow／ev-01-spawn-handler 另認 `<ab>/func-<id>/` 的 comparison.json。2.2 案例（P6 human console）
   與找不到節點者為缺漏。
+- source_ref 為 `crates/<pkg>/tests/<target>.rs::<fn>` 的案例（任何 suite，windows-native 除外）：取 gate 的 cargo L1 報告
+  （`--cargo-l1`，`l1-results.v1`）中 nodeid `cargo:<pkg>::<target>::<fn>` 恰一列 passed。
 - `windows-native` → BLOCKED-OWNER B-06；`realhw` → B-07；`regression` 依 family：F9 → B-02、F10 → B-04、F11 → B-05；
   其他 family（先前切片 L2 回歸）在 08 BLOCKED-OWNER 總表無 B 編號 → 缺漏（SPEC-GAP，交編排者編號）。
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -86,7 +89,14 @@ def _rust_only(bc_yaml: Path) -> set[str]:
     return {c["id"] for c in data["changes"] if c.get("scope") == "rust_only"}
 
 
-def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dict | None = None) -> tuple[str, str]:
+def _cargo_nodeid(ref: str) -> str | None:
+    """`crates/sw-core/tests/event_store.rs::fn` → `cargo:sw-core::event_store::fn`；非 crate 測試 → None。"""
+    m = re.match(r"^crates/([^/]+)/tests/([^/]+)\.rs::([A-Za-z0-9_]+)$", ref)
+    return f"cargo:{m.group(1)}::{m.group(2)}::{m.group(3)}" if m else None
+
+
+def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dict | None = None,
+               cargo: dict[str, list[str]] | None = None) -> tuple[str, str]:
     lock = lock or {}
     def junit(slug: str):
         if slug not in cache:
@@ -96,6 +106,10 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
     suite, cid = case.get("suite"), case["case_id"]
     if suite in OWNER_BY_SUITE:
         return "BLOCKED-OWNER", OWNER_BY_SUITE[suite]
+    nid = _cargo_nodeid(str(case.get("source_ref") or ""))
+    if nid is not None:
+        why = _once(cargo, [nid], "passed")
+        return ("GAP", f"cargo：{why}") if why else ("PASS", f"cargo {nid}")
     if suite == "regression":
         bid = OWNER_BY_REGRESSION_FAMILY.get(str(case.get("family")))
         return ("BLOCKED-OWNER", bid) if bid else ("GAP", f"regression family {case.get('family')} 無 B 編號")
@@ -137,7 +151,23 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
     return "GAP", f"未知 suite {suite}"
 
 
-def build(ab: Path, cases_yaml: Path, cases_lock: Path, bc_yaml: Path, l1_lock: Path | None = None) -> dict:
+def _cargo_results(path: Path | None) -> dict[str, list[str]] | None:
+    try:
+        rep = json.loads(Path(path).read_text(encoding="utf-8")) if path else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rep, dict):
+        return None
+    out: dict[str, list[str]] = {}
+    for r in rep.get("results") or []:
+        o = r.get("outcome")
+        out.setdefault(str(r.get("nodeid")), []).append("passed" if o == "passed" else "failed" if o in ("failed", "error") else "skipped")
+    return out
+
+
+def build(ab: Path, cases_yaml: Path, cases_lock: Path, bc_yaml: Path, l1_lock: Path | None = None,
+          cargo_l1: Path | None = None) -> dict:
+    cargo = _cargo_results(cargo_l1)
     lock = json.loads(cases_lock.read_text(encoding="utf-8"))
     l1 = json.loads(Path(l1_lock or ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     cases = {c["case_id"]: c for c in yaml.safe_load(cases_yaml.read_text(encoding="utf-8"))["cases"]}
@@ -146,7 +176,7 @@ def build(ab: Path, cases_yaml: Path, cases_lock: Path, bc_yaml: Path, l1_lock: 
     rows = []
     for cid in sorted(lock["sets"]["slice_2.3"]):
         case = cases.get(cid)
-        status, detail = ("GAP", "cases.yaml 無此案例") if case is None else judge_case(case, ab, rust_only, cache, l1)
+        status, detail = ("GAP", "cases.yaml 無此案例") if case is None else judge_case(case, ab, rust_only, cache, l1, cargo)
         rows.append({"case_id": cid, "status": status, "detail": detail})
     gaps = [r for r in rows if r["status"] not in ("PASS", "BLOCKED-OWNER")]
     return {"set": "slice_2.3", "total": len(rows), "pass": sum(r["status"] == "PASS" for r in rows),
@@ -161,8 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cases-lock", type=Path, default=ROOT / "tests/acceptance/cases.lock.json")
     ap.add_argument("--behavior-changes", type=Path, default=ROOT / "contracts/behavior_changes.yaml")
     ap.add_argument("--l1-lock", type=Path, default=ROOT / "tests/acceptance/l1_required.lock.json")
+    ap.add_argument("--cargo-l1", type=Path, help="gate 的 cargo L1 報告（crates/ 來源案例）")
     args = ap.parse_args(argv)
-    report = build(args.ab_dir, args.cases, args.cases_lock, args.behavior_changes, args.l1_lock)
+    report = build(args.ab_dir, args.cases, args.cases_lock, args.behavior_changes, args.l1_lock, args.cargo_l1)
     args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"slice_2.3 coverage：{report['pass']} PASS、{report['blocked_owner']} BLOCKED-OWNER、{report['gaps']} 缺漏"
           f"（共 {report['total']}）")
