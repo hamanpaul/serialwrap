@@ -474,6 +474,104 @@ def test_run_upgrade_dry_run_systemd_system_mode_is_explicit_only(tmp_path):
     assert "--mode systemd-system" not in r.stdout
 
 
+# ---------- release 前置第 2 輪 OWNER-BATCH #2：bundle 比照 release workflow 以 /usr/bin/python3.12 build venv 建立 ----------
+
+def _fake_docker(tmp_path: Path) -> tuple[Path, Path]:
+    """PATH 首位放假 docker：只記錄呼叫並失敗，確保 fail-closed 測試絕不碰真的 docker。"""
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    log = tmp_path / "docker-calls.log"
+    fake = bindir / "docker"
+    fake.write_text(f'#!/bin/sh\necho "$*" >> "{log}"\nexit 1\n', encoding="utf-8")
+    fake.chmod(0o755)
+    return bindir, log
+
+
+def _docker_calls(log: Path) -> list[str]:
+    return log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_builds_bundle_with_system_python312_venv(tmp_path):
+    """bundle 以 /usr/bin/python3.12 建的 build venv 執行 mkbundle（PATH 首位為 build venv），並列出
+    pyvenv.cfg `home = /usr/bin` 檢查；與 release workflow 的 publish-linux-bundle 同一做法與釘版。"""
+    out_dir = tmp_path / "ev"
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--out", str(out_dir)],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    work = out_dir.resolve() / "work"
+    lines = r.stdout.splitlines()
+    assert f"+ /usr/bin/python3.12 -m venv {work}/build-venv" in [line.rstrip() for line in lines], r.stdout
+    pip = next(line for line in lines if f"{work}/build-venv/bin/python3 -m pip install" in line)
+    assert "pyyaml==6.0.3" in pip and "jsonschema==4.10.3" in pip, pip
+    mk = next(line for line in lines if "mkbundle.sh" in line)
+    assert mk.startswith(f"+ env PATH={work}/build-venv/bin:"), mk
+    assert "--release-bundle --profile release --version-override 0.4.0" in mk
+    check = next(line for line in lines if "pyvenv.cfg" in line)
+    assert "home = /usr/bin" in check and "include-system-site-packages = false" in check, check
+    assert lines.index(check) > lines.index(mk)
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("kind", ["missing", "not_usr_bin"])
+def test_run_upgrade_fails_closed_without_system_python312(tmp_path, kind):
+    """主機沒有 /usr/bin/python3.12（或指定的直譯器不在 /usr/bin）→ 建任何東西之前 rc=3 fail-closed，
+    不回退 PATH 上的其他 python，也不碰 docker。"""
+    bindir, log = _fake_docker(tmp_path)
+    if kind == "missing":
+        python = tmp_path / "missing" / "python3.12"
+    else:
+        # 真的可執行的 3.12 直譯器，但實體不在 /usr/bin（如 toolcache／自編 Python）：不得接受
+        python = tmp_path / "other" / "python3.12"
+        python.parent.mkdir()
+        shutil.copy2(os.path.realpath(sys.executable), python)
+    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", SW_UPGRADE_SYSTEM_PYTHON=str(python))
+    out_dir = tmp_path / "ev"
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--out", str(out_dir),
+                        "--wheel", str(tmp_path / "serialwrap-0.3.2-py3-none-any.whl")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "/usr/bin/python3.12" in r.stderr and "不回退" in r.stderr, r.stderr
+    work = out_dir / "work"
+    assert not (work / "build-venv").exists() and not (work / "bundle-0.4.0").exists()
+    assert not list(work.glob("wheels/*.whl"))
+    assert _docker_calls(log) == []
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("cfg", [
+    None,
+    "home = /opt/hostedtoolcache/Python/3.12.3/x64/bin\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+    "home = /usr/local/bin\ninclude-system-site-packages = false\nversion = 3.12.3\n",
+    "home = /usr/bin\ninclude-system-site-packages = true\nversion = 3.12.3\n",
+], ids=["missing_cfg", "toolcache_home", "usr_local_home", "system_site_packages"])
+def test_run_upgrade_rejects_bundle_runtime_not_bound_to_usr_bin(tmp_path, cfg):
+    """`--bundle` 提供的（或自建的）bundle runtime 的 pyvenv.cfg 不是 `home = /usr/bin`＋
+    `include-system-site-packages = false`（或缺檔）→ 建映像之前 rc=3 fail-closed。"""
+    bindir, log = _fake_docker(tmp_path)
+    vdir = tmp_path / "bundle" / "versions" / "0.4.0"
+    (vdir / "py").mkdir(parents=True)
+    (vdir / "release-manifest.json").write_text(json.dumps({"bundle_version": "0.4.0"}), encoding="utf-8")
+    if cfg is not None:
+        (vdir / "py" / "pyvenv.cfg").write_text(cfg, encoding="utf-8")
+    wheel = tmp_path / "serialwrap-0.3.2-py3-none-any.whl"
+    wheel.write_bytes(b"")
+    env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}")
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--out", str(tmp_path / "ev"), "--wheel", str(wheel),
+                        "--bundle", str(tmp_path / "bundle")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120, env=env)
+    assert r.returncode == 3, r.stdout + r.stderr
+    assert "pyvenv.cfg" in r.stderr, r.stderr
+    calls = _docker_calls(log)
+    assert not [c for c in calls if c.split()[:1] in (["build"], ["run"], ["exec"])], calls
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_upgrade_environment_does_not_hide_missing_pyyaml():
