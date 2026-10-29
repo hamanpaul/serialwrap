@@ -247,3 +247,36 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +8（無移除）。
 | P7-71fe017-4 | Medium | 照修（rulings/p7.md 2026-10-29） | **fixed**：merge P5（afebff0）帶入 P5 的拆分——`ProcScan::multi_open_tty_holders`（Python `detect_multi_open`：tty stat 失敗略過）供 `health.rs`、`serialwrapd_tty_holders` 改走 `tty_holders_fail_closed_with` 供 `rollback.rs`；本分支補兩條正式路徑各一支會紅的回歸：`sw-daemon::health_multi_open_p7::health_status_vanished_tty_holders_status_ok_like_detect_multi_open`（真實 `PosixProcScan`＋暫存 proc root，session 的 `/fake/tty-A` 不存在 → `holders_status:"ok"`；Python 3.12 同輸入實測 `{'holders': {}, 'holders_status': 'ok'}`；突變 health 改呼叫 `serialwrapd_tty_holders` → `unknown` 紅）、`sw-cli::rollback_holders_p7::update_confirm_released_stays_fail_closed_when_multi_open_scan_says_ok`（fail-closed 掃描 Unknown、多開掃描 ok → 仍 `DEVICE_STILL_HELD`＋`holder_unknown:true`、零 spawn；突變 rollback 改呼叫 `multi_open_tty_holders` → rc 0 紅）。test-fakes `FakeProcScan::set_multi_open_holders` 讓兩方法可回不同結果（未設定時沿用 trait 預設）。P7-BU-9 結案 |
 | P7-71fe017-3 | High | 依裁決不處理（移交 P5） | 不處理（`op_runner.rs` 屬 P5）；merge 後狀態見本輪回報 |
 | f8381e0_9d35b01 B 段 | — | — | NO FINDINGS |
+
+### Task 18（第 11 輪）
+
+| 檔案 | 案例（case_id 見 cases.yaml） | Python A | Rust B（`target/debug` CLI＋daemon） | 備註 |
+|---|---|---|---|---|
+| `test_p7_login.py` | unresolved-credentials-terminal、creds-file-fixed、creds-fixed-then-attach、platform-matrix[shell/prpl/bcm]、passthrough-uboot、passthrough-others、passthrough-banner、console-unlock | 10 passed | 10 passed | 新增測試資產 `p7_profiles/shell_unresolved.yaml`（env_file 指向 `${ENV_FILE}.unresolved`，可事後補寫） |
+| `test_p7_quiet_reconfirm.py` | spontaneous-reboot、attach-during-quiet、ready-bootloader-tail-d1（慢）、attached-bootloader-stuck（慢）、sc30（Rust-only） | 4 passed、1 skipped（SC-30） | 5 passed | 案例設計修正見下表 |
+| `test_p7_selftest_recover.py` | selftest-classifications×6、sc34、force-timeout-attached、force-on-ready、ready-ctrl-c | 10 passed | 10 passed | released 子案依 BC-04（`ab_participation: diff`）以 /proc 可讀性決定 Rust 期望 |
+| `test_p7_stall.py` | transport-stall-flip | 1 passed | 修前 FAIL → 修後 1 passed | **揭露接線缺口**：`transport_stall::refine_probe_failure` 無正式呼叫端（見下） |
+| `test_p7_events.py` | rule-fire-handler-payload、start-load-order、rule-crud-and-reload、handler-timeout-kills-group、handler-no-inherited-fds、redos | 6 passed | 修前 handler-timeout FAIL → 修後 6 passed | **揭露 handler signal mask 繼承**（見下） |
+| `test_p7_log_capture.py` | capture-skips-foreground | 1 passed | 1 passed | |
+| `test_p7_latency_noise.py` | login-with-delay-and-noise | 1 passed | 1 passed | control-latency-under-flood：SPEC-GAPS（門檻未凍結） |
+| `test_p7_invariants.py` | rejected-requests-zero-tx（含 CREDENTIALS_UNRESOLVED 子案）、release-during-login、no-auto-resend | 4 passed | 4 passed | §11.3-2／-3 BLOCKED-UPSTREAM（P6 human console）；§11.3-6 待 `run_p7_ab.sh` |
+
+案例設計修正（依 Python 基線實測、不改契約語意；依收斂規則 §4 交編排者裁決）：
+
+| 案例 | 計畫原文 | Python 實測 | 本分支寫法 |
+|---|---|---|---|
+| attached-bootloader-probe-sets-stuck、attach-during-quiet（ATTACHED 子案） | 「ATTACHED（無 READY 歷史）」 | capable profile 初次 attach 失敗一律 DETACHED↔ATTACHING 重試（`LOGIN_PROMPT_TIMEOUT`），黑箱到不了無 READY 歷史的 ATTACHED | READY＋banner 期間 `session recover` 收斂 ATTACHED＋`PROMPT_UNAVAILABLE` 後再測 |
+| attached-bootloader-probe-sets-stuck | 先手動 recover 得分類、再自動 reprobe 落 STUCK | quiet 過期瞬間自動 reprobe 與手動 recover 競爭 probe，後到者覆寫 last_error（Python／Rust 同序同結果） | 先等自動 reprobe 落 `BOOTLOADER_STUCK`，再手動 recover 取 `BOOTLOADER` 分類 |
+| sc34-attach-recover-last-error-field | READY_NONCE_TIMEOUT 情境 | 初次 attach 的 nonce 逾時落 DETACHED（attach 回 ok:true） | ATTACHED＋CREDENTIALS_UNRESOLVED 補帳密後 `session recover`（既有 bridge 再探）得 ATTACHED＋READY_NONCE_TIMEOUT |
+| recover-ready-ctrl-c | `PROMPT_TIMEOUT_RECOVERED` | 命令紀錄 `status:"done"`、`error_code:null`、`partial:true`、`recovery_action:"CTRL_C"`、`stdout:"^C"` | 依 Python 斷言 |
+| transport-stall-flip | thaw 後再 stall 共 2 筆 META | 成立，但 READY recover 先回 PROMPT_TIMEOUT，stall 出現在 reattach 的 DETACHED 列 | 輪詢 session list 的 last_error |
+| login-with-delay-and-noise | 每 50 ms 一行 noise | 不換行、直接接在 `login: ` 之後的雜訊使 Python 永遠無法登入（500 ms、無延遲亦然） | 雜訊行以 `\r\n` 起頭（printk 獨立成行） |
+
+Rust 修正（Task 18 黑箱揭露，皆先紅後綠）：
+
+| # | 問題 | Python 基線 | 處理 |
+|---|---|---|---|
+| T18-1 | `transport_stall::refine_probe_failure`（Task 6）沒有正式呼叫端：probe 失敗永不翻轉 `TRANSPORT_STALL`、不寫 META `transport_stall_suspected`（slice 出口「接線＋端到端」缺口） | `_refine_probe_failure`（`session_manager.py:1965`）於 `_probe_existing_bridge`、`_attach_by_id`、dynamic attach 的 probe 失敗點呼叫；`_mark_session_rx` 重臂 | **fixed**：`SessionCore` 於 login run 起點記 `rx_before`（RX 總 bytes），三個失敗收斂點改走 `refine_login_failure`（翻轉→ detail＋一次性 Warn＋WalMeta；未翻轉→ rx tail detail，與原 `login_error_detail` 等價）；`rx_chunk` 重臂。回歸 `sw-core::transport_stall_wiring_p7` 4 支（修前 3 紅、對照組綠）；daemon 級端到端 `test_p7_stall.py`（修前 Rust 紅） |
+| T18-2 | handler 子行程繼承 daemon 執行緒被阻擋的 SIGINT／SIGTERM（`handler_posix` 在 `pre_exec` 內自行 execve，繞過 std 的訊號重設）：dash 的背景 job 以啟動時 mask 建立、SIGTERM 被擋，逾時 `killpg(SIGTERM)` 後等背景 `sleep` 自然結束才回 `fire_timeout` | CPython daemon 執行緒不阻擋訊號、`restore_signals=True` 還原 SIGPIPE／SIGXFSZ | **fixed**：`ExecPlan::reset_signals`（`pthread_sigmask(SIG_SETMASK, ∅)`、SIGPIPE／SIGXFSZ → SIG_DFL）於 setsid 後、exec 前執行。回歸 conformance `child_signal_mask_is_empty_even_if_spawner_blocks_term`（背景 job 的 SigBlk：修前 `0000000000004002`）、`timeout_kills_background_job_when_spawner_blocks_term`（修前 30.0 s）；端到端 `test_p7_events.py::test_handler_timeout_kills_group` |
+
+L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +6。
