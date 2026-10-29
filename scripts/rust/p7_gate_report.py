@@ -12,7 +12,7 @@
   `p7_gate:<slug>`（不得以較小集合替代），lock 的 selector 一併交給 judge 核對。
 - 非測試列 PASS ⇔ rc==0 且至少一項 evidence、每項皆有有效 sha256 且相符；rc!=0 → FAIL；evidence 不符 → INCOMPLETE。
 - 能力缺失（`caps_missing`）→ 該列 BLOCKED-OWNER＋B 編號。
-- 擁有者項目 B-01～B-08：只有 `owner_evidence[B-xx]` 的檔案存在且 sha256 相符時 PASS，否則 BLOCKED-OWNER。
+- 擁有者項目 B-01～B-16：只有 `owner_evidence[B-xx]` 的檔案存在且 sha256 相符時 PASS，否則 BLOCKED-OWNER。
 - `REQUIRED_ROWS` 缺列 → INCOMPLETE（未執行）。
 
 用法：
@@ -83,6 +83,15 @@ OWNER_ITEMS: Mapping[str, str] = {
     "B-06": "原生 Windows COM handle 證據（OD-08、OD-15）",
     "B-07": "L3 realhw P0＋登入／Recovery／事件 P1 與 remote",
     "B-08": "測試團隊 Windows 工作站 event handler",
+    # 先前切片 L2 regression family（08 BLOCKED-OWNER 總表；rulings/p7.md SPEC-GAP #4 (i)）
+    "B-09": "L2 F1 命令契約五案（先前切片）",
+    "B-10": "L2 F2 背壓四案（先前切片）",
+    "B-11": "L2 F3 可觀測性四案（先前切片）",
+    "B-12": "L2 F4 session 語意三案（先前切片）",
+    "B-13": "L2 F5 console 共存五案（先前切片，含 destructive）",
+    "B-14": "L2 F6 RPC 存活兩案（先前切片，two_boards）",
+    "B-15": "L2 F8 daemon 單例兩案（先前切片）",
+    "B-16": "L2 F12 診斷兩案（先前切片）",
 }
 # parity-amendments-2026-10-26 #188：P7 承接列的必要 L1 集合（Task 0 起登記；py_parity_* 為後續 Task 增列）。
 PARITY_SETS: tuple[str, ...] = ("p7_gate:py_parity", "p7_gate:py_parity_recover", "p7_gate:py_parity_attach")

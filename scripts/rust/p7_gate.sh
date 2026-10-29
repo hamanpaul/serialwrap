@@ -119,9 +119,12 @@ win_l1() {  # win_l1 <dir>：取 win-test 最新報告的 l1_results
   return 0
 }
 mkdir -p "$RUN/win-non-com" "$RUN/win-com"
-# 兩列的 win-test.sh 參數（tests/test_p7_gate_report.py 以 `--dry-run` 核對可被 win-test.sh 解析）。
+# 兩列的 win-test.sh 參數（tests/test_p7_gate_win_argv.py 以 `--dry-run` 核對可被 win-test.sh 解析）。
+# COM 列依 OD-53 為能力集合（rulings/p7.md 第 6 輪 SPEC-GAP #5）：test-binary 參數以 `--ignored cap_windows_com__`
+# 明確只執行三個 `#[ignore = "cap:windows_com"]` 案例、`--caps windows_com` 實跑；必要集合
+# `p7_gate:win-test-sh-caps-windows-com`（windows）以同一 argv 為 selector，於原生 Windows 收集登記（P7-LW-9）。
 WIN_NONCOM_ARGS=(--package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_)
-WIN_COM_ARGS=(--caps windows_com --package sw-daemon -- --test cap_windows_com_p7 --features test-fakes)
+WIN_COM_ARGS=(--caps windows_com --package sw-daemon -- --test cap_windows_com_p7 --features test-fakes -- --ignored cap_windows_com__)
 if [[ " ${CAPS[*]} " == *" windows_native "* ]]; then
   echo "caps_missing: windows_native（非 WSL interop 環境；LOCAL-WINDOWS-TODO）" >"$RUN/logs/win-non-com.log"
   record_existing "win-test.sh (non-COM)" - "$RUN/logs/win-non-com.log" '["scripts/rust/win-test.sh"]'
@@ -186,10 +189,24 @@ done
 # 13. 案例鎖
 run_row "regen_lock --check" regen-lock-check --evidence "$RUN/logs/regen-lock-check.log" -- \
   python3 tests/acceptance/regen_lock.py --check
-# 14. slice_2.3 必要案例涵蓋
-run_row "cases.lock slice_2.3 coverage" coverage --evidence "$RUN/coverage.json" -- \
-  python3 scripts/rust/p7_case_coverage.py --ab-dir "$AB" --out "$RUN/coverage.json" \
-  --cargo-l1 "$RUN/cargo-test-workspace/l1-results.json"
+# 14. slice_2.3 必要案例涵蓋。2.1／2.2 先前切片案例不在本 gate 重跑，以對應切片 gate 的逐案證據判定（rulings/p7.md
+#     SPEC-GAP #4 (ii)）：P7_SLICE21_CASE_VERDICTS＝slice21 gate 的 case_verdicts.json、P7_S22_GATE_JSON＝s22_gate_check.py
+#     輸出；未設或檔案不存在時該切片案例記缺漏（不得 PASS）。證據檔複製進 run 目錄後才引用，sha256 隨該列記錄。
+COV_ARGS=(--ab-dir "$AB" --out "$RUN/coverage.json" --cargo-l1 "$RUN/cargo-test-workspace/l1-results.json")
+COV_EV=(--evidence "$RUN/coverage.json")
+mkdir -p "$RUN/prior-slices"
+if [[ -n "${P7_SLICE21_CASE_VERDICTS:-}" && -f "${P7_SLICE21_CASE_VERDICTS}" ]]; then
+  cp -p "$P7_SLICE21_CASE_VERDICTS" "$RUN/prior-slices/slice21-case_verdicts.json"
+  COV_ARGS+=(--slice21-verdicts "$RUN/prior-slices/slice21-case_verdicts.json")
+  COV_EV+=(--evidence "$RUN/prior-slices/slice21-case_verdicts.json")
+fi
+if [[ -n "${P7_S22_GATE_JSON:-}" && -f "${P7_S22_GATE_JSON}" ]]; then
+  cp -p "$P7_S22_GATE_JSON" "$RUN/prior-slices/s22-gate.json"
+  COV_ARGS+=(--slice22-gate "$RUN/prior-slices/s22-gate.json")
+  COV_EV+=(--evidence "$RUN/prior-slices/s22-gate.json")
+fi
+run_row "cases.lock slice_2.3 coverage" coverage "${COV_EV[@]}" -- \
+  python3 scripts/rust/p7_case_coverage.py "${COV_ARGS[@]}"
 # 15. 全套 pytest（p7_gate:python3-m-pytest-q-tests；任何失敗 → 該列 FAIL，l1_judge 規則）
 mkdir -p "$RUN/pytest-full"
 if [[ "$SKIP_FULL" == "1" ]]; then

@@ -18,9 +18,16 @@
 - source_ref 為 `crates/<pkg>/tests/<target>.rs::<fn>` 的案例（任何 suite，windows-native 除外）：取 gate 的 cargo L1 報告
   （`--cargo-l1`，`l1-results.v1`）中 nodeid `cargo:<pkg>::<target>::<fn>` 恰一列 passed。
 - `windows-native` → BLOCKED-OWNER B-06；`realhw` → B-07；`regression` 依 family：F9 → B-02、F10 → B-04、F11 → B-05；
-  其他 family（先前切片 L2 回歸）在 08 BLOCKED-OWNER 總表無 B 編號 → 缺漏（SPEC-GAP，交編排者編號）。
+  先前切片 L2 回歸 F1～F6、F8、F12 依 08 BLOCKED-OWNER 總表 B-09～B-16（rulings/p7.md 2026-10-29 SPEC-GAP #4 (i)）；
+  總表沒有 B 編號的 family → 缺漏。
+- 先前切片（daemon_slice 2.1／2.2）的 contract-blackbox／func-test／l15-scenario 案例不在本 gate 重跑（同裁決 (ii)），
+  一律以對應切片 gate 的逐案證據判定：2.1 取 slice21 gate 的 `case_verdicts.json`（`--slice21-verdicts`，
+  `{case_id: PASS|FAIL|EVIDENCE_MISSING}`），2.2 取 s22 gate（`scripts/rust/s22_gate_check.py`）的輸出 JSON
+  （`--slice22-gate`，`cases[].status`）；該案在匯入證據中須為 PASS，缺檔、缺列或非 PASS 皆為缺漏（不得記 PASS）。
+  本 gate 若另有同案的證據（凍結的 l15-slice21-b 節點、cargo L1 報告中出現的同名 nodeid），也必須通過（取最差）。
 
 用法：python3 scripts/rust/p7_case_coverage.py --ab-dir <run>/ab --out <run>/coverage.json
+      [--cargo-l1 <l1-results.json>] [--slice21-verdicts <case_verdicts.json>] [--slice22-gate <s22-gate.json>]
 只用 stdlib＋PyYAML；不 import sw_core。
 """
 from __future__ import annotations
@@ -36,7 +43,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 OWNER_BY_SUITE = {"windows-native": "B-06", "realhw": "B-07"}
-OWNER_BY_REGRESSION_FAMILY = {"F9": "B-02", "F10": "B-04", "F11": "B-05"}
+OWNER_BY_REGRESSION_FAMILY = {"F9": "B-02", "F10": "B-04", "F11": "B-05",
+                              # 先前切片 L2 回歸（08 BLOCKED-OWNER 總表 B-09～B-16；rulings/p7.md SPEC-GAP #4 (i)）
+                              "F1": "B-09", "F2": "B-10", "F3": "B-11", "F4": "B-12", "F5": "B-13", "F6": "B-14",
+                              "F8": "B-15", "F12": "B-16"}
+PRIOR_SLICES = ("2.1", "2.2")
+PRIOR_SUITES = ("contract-blackbox", "func-test", "l15-scenario")
 
 
 def _junit(path: Path) -> dict[str, list[str]] | None:
@@ -95,8 +107,40 @@ def _cargo_nodeid(ref: str) -> str | None:
     return f"cargo:{m.group(1)}::{m.group(2)}::{m.group(3)}" if m else None
 
 
+def _l15_slice21_nodes(lock: dict, cid: str) -> list[str]:
+    return [n for n in _frozen(lock, "p7_gate:l15-slice21-b")
+            if n.split("::", 1)[-1].startswith("test_case[") and (f"-{cid}]" in n or f"[{cid}-" in n) and "rust" in n]
+
+
+PRIOR_SOURCE = {"2.1": "slice21 gate case_verdicts", "2.2": "s22 gate cases"}
+
+
+def _judge_prior(case: dict, slice_: str, junit, lock: dict, cargo: dict[str, list[str]] | None,
+                 prior: dict[str, dict[str, str] | None]) -> tuple[str, str]:
+    """先前切片案例：匯入對應切片 gate 的逐案證據須為 PASS；本 gate 另有同案證據時也須通過（取最差）。"""
+    cid, src = case["case_id"], PRIOR_SOURCE[slice_]
+    verdicts = prior.get(slice_)
+    if verdicts is None:
+        return "GAP", f"{src} 未提供或無法解析（先前切片逐案證據缺，EVIDENCE_MISSING）"
+    got = verdicts.get(cid)
+    if got != "PASS":
+        return "GAP", f"{src}：{got or '缺列'}"
+    nid = _cargo_nodeid(str(case.get("source_ref") or ""))
+    if nid is not None and cargo is not None and nid in cargo:
+        why = _once(cargo, [nid], "passed")
+        if why:
+            return "GAP", f"{src} PASS，但本 gate cargo：{why}"
+    if case.get("suite") == "l15-scenario" and slice_ == "2.1":
+        nodes = _l15_slice21_nodes(lock, cid)
+        why = _once(junit("l15-slice21-b"), nodes, "passed") if nodes else None
+        if why:
+            return "GAP", f"{src} PASS，但本 gate l15：{why}"
+    return "PASS", f"{src} PASS"
+
+
 def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dict | None = None,
-               cargo: dict[str, list[str]] | None = None) -> tuple[str, str]:
+               cargo: dict[str, list[str]] | None = None,
+               prior: dict[str, dict[str, str] | None] | None = None) -> tuple[str, str]:
     lock = lock or {}
     def junit(slug: str):
         if slug not in cache:
@@ -106,6 +150,9 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
     suite, cid = case.get("suite"), case["case_id"]
     if suite in OWNER_BY_SUITE:
         return "BLOCKED-OWNER", OWNER_BY_SUITE[suite]
+    slice_ = str(case.get("daemon_slice"))
+    if suite in PRIOR_SUITES and slice_ in PRIOR_SLICES:
+        return _judge_prior(case, slice_, junit, lock, cargo, prior or {})
     nid = _cargo_nodeid(str(case.get("source_ref") or ""))
     if nid is not None:
         why = _once(cargo, [nid], "passed")
@@ -128,7 +175,6 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
             why = _once(junit("p7-a"), a_nodes, "passed")
         return ("GAP", f"A 輪：{why}") if why else ("PASS", f"B {len(b_nodes)}／A {len(a_nodes) or len(b_nodes)} 節點")
     if suite in ("l15-scenario", "func-test"):
-        slice_ = str(case.get("daemon_slice"))
         if suite == "func-test" and (ab / f"func-{cid}").is_dir():
             found = next(iter(sorted((ab / f"func-{cid}" / "report").rglob("comparison.json"))), None)
             try:
@@ -138,14 +184,9 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
                 rc, verdict = None, None
             return ("PASS", "func-test comparison PASS") if (verdict == "PASS" and rc == 0) else (
                 "GAP", f"func-test verdict {verdict} rc={rc}")
-        if slice_ == "2.1":
-            slug, nodes = "l15-slice21-b", [n for n in _frozen(lock, "p7_gate:l15-slice21-b")
-                                             if n.split("::", 1)[-1].startswith("test_case[")
-                                             and (f"-{cid}]" in n or f"[{cid}-" in n) and "rust" in n]
-        elif slice_ == "2.3":
-            slug, nodes = "l15-slice23", [n for n in _frozen(lock, "p7_gate:l15-slice23-b") if n.endswith(f"_rust[{cid}]")]
-        else:
-            return "GAP", f"daemon_slice {slice_}（P6 Slice 2.2，BLOCKED-UPSTREAM）"
+        if slice_ != "2.3":
+            return "GAP", f"daemon_slice {slice_} 無承擔來源"
+        slug, nodes = "l15-slice23", [n for n in _frozen(lock, "p7_gate:l15-slice23-b") if n.endswith(f"_rust[{cid}]")]
         why = _once(junit(slug), nodes, "passed")
         return ("GAP", f"l15：{why}") if why else ("PASS", f"l15 {len(nodes)} 節點")
     return "GAP", f"未知 suite {suite}"
@@ -165,9 +206,34 @@ def _cargo_results(path: Path | None) -> dict[str, list[str]] | None:
     return out
 
 
+def _prior_verdicts(slice21: Path | None, slice22: Path | None) -> dict[str, dict[str, str] | None]:
+    """先前切片 gate 的逐案證據：2.1＝`case_verdicts.json`（case_id → 判定）、2.2＝s22 gate 輸出的 `cases[]`。
+    未提供、讀不到或格式不符 → None（該切片案例一律缺漏）。"""
+    def load(path: Path | None):
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8")) if path else None
+        except (OSError, ValueError):
+            return None
+    out: dict[str, dict[str, str] | None] = {"2.1": None, "2.2": None}
+    s21 = load(slice21)
+    if isinstance(s21, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in s21.items()):
+        out["2.1"] = dict(s21)
+    s22 = load(slice22)
+    rows = s22.get("cases") if isinstance(s22, dict) else None
+    if isinstance(rows, list) and all(isinstance(r, dict) and isinstance(r.get("case_id"), str) for r in rows):
+        seen: dict[str, str] = {}
+        for r in rows:
+            cid = r["case_id"]
+            seen[cid] = "DUPLICATE" if cid in seen else str(r.get("status"))
+        out["2.2"] = seen
+    return out
+
+
 def build(ab: Path, cases_yaml: Path, cases_lock: Path, bc_yaml: Path, l1_lock: Path | None = None,
-          cargo_l1: Path | None = None) -> dict:
+          cargo_l1: Path | None = None, slice21_verdicts: Path | None = None,
+          slice22_gate: Path | None = None) -> dict:
     cargo = _cargo_results(cargo_l1)
+    prior = _prior_verdicts(slice21_verdicts, slice22_gate)
     lock = json.loads(cases_lock.read_text(encoding="utf-8"))
     l1 = json.loads(Path(l1_lock or ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
     cases = {c["case_id"]: c for c in yaml.safe_load(cases_yaml.read_text(encoding="utf-8"))["cases"]}
@@ -176,7 +242,7 @@ def build(ab: Path, cases_yaml: Path, cases_lock: Path, bc_yaml: Path, l1_lock: 
     rows = []
     for cid in sorted(lock["sets"]["slice_2.3"]):
         case = cases.get(cid)
-        status, detail = ("GAP", "cases.yaml 無此案例") if case is None else judge_case(case, ab, rust_only, cache, l1, cargo)
+        status, detail = ("GAP", "cases.yaml 無此案例") if case is None else judge_case(case, ab, rust_only, cache, l1, cargo, prior)
         rows.append({"case_id": cid, "status": status, "detail": detail})
     gaps = [r for r in rows if r["status"] not in ("PASS", "BLOCKED-OWNER")]
     return {"set": "slice_2.3", "total": len(rows), "pass": sum(r["status"] == "PASS" for r in rows),
@@ -192,8 +258,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--behavior-changes", type=Path, default=ROOT / "contracts/behavior_changes.yaml")
     ap.add_argument("--l1-lock", type=Path, default=ROOT / "tests/acceptance/l1_required.lock.json")
     ap.add_argument("--cargo-l1", type=Path, help="gate 的 cargo L1 報告（crates/ 來源案例）")
+    ap.add_argument("--slice21-verdicts", type=Path, help="slice21 gate 的 case_verdicts.json（2.1 先前切片案例）")
+    ap.add_argument("--slice22-gate", type=Path, help="s22 gate（s22_gate_check.py）的輸出 JSON（2.2 先前切片案例）")
     args = ap.parse_args(argv)
-    report = build(args.ab_dir, args.cases, args.cases_lock, args.behavior_changes, args.l1_lock, args.cargo_l1)
+    report = build(args.ab_dir, args.cases, args.cases_lock, args.behavior_changes, args.l1_lock, args.cargo_l1,
+                   args.slice21_verdicts, args.slice22_gate)
     args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"slice_2.3 coverage：{report['pass']} PASS、{report['blocked_owner']} BLOCKED-OWNER、{report['gaps']} 缺漏"
           f"（共 {report['total']}）")

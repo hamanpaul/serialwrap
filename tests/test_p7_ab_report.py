@@ -5,8 +5,8 @@
   的節點（替代節點）、無凍結集合、rc 非 0 卻無失敗、缺 junit → INCOMPLETE；`blocked` 標記 → BLOCKED-UPSTREAM；皆不得
   PASS（審查 P7-cd7acf0-1）。func-test 階段：comparison verdict PASS 且 rc 0 才 PASS。
 - 涵蓋：contract-blackbox 案例的必要節點取自凍結 A／B 集合，各恰一次 passed（rust_only SC 的 A 輪為 skip）；
-  windows-native／realhw／F9／F10／F11 regression → BLOCKED-OWNER＋B 編號；其他 regression family（無 B 編號）與
-  2.2 案例 → 缺漏。
+  windows-native／realhw／F1～F6、F8～F12 regression → BLOCKED-OWNER＋B 編號；總表沒有 B 編號的 family → 缺漏；
+  2.1／2.2 先前切片案例以匯入的 slice21／s22 gate 逐案證據判定（缺證據 → 缺漏）。
 """
 from __future__ import annotations
 
@@ -169,6 +169,7 @@ def test_coverage_requires_pass_or_numbered_owner_block(tmp_path):
         {"case_id": "p1-x", "suite": "realhw"},
         {"case_id": "f9-x", "suite": "regression", "family": "F9"},
         {"case_id": "f2-x", "suite": "regression", "family": "F2"},
+        {"case_id": "f7-x", "suite": "regression", "family": "F7"},
         {"case_id": "l15-ctx", "suite": "l15-scenario", "daemon_slice": "2.2"},
     ]
     ab_dir = tmp_path / "ab"
@@ -179,7 +180,9 @@ def test_coverage_requires_pass_or_numbered_owner_block(tmp_path):
     assert got["p7-a"][0] == "PASS" and got["p7-sc30"][0] == "PASS"
     assert got["win-x"] == ("BLOCKED-OWNER", "B-06") and got["p1-x"] == ("BLOCKED-OWNER", "B-07")
     assert got["f9-x"] == ("BLOCKED-OWNER", "B-02")
-    assert got["f2-x"][0] == "GAP" and got["l15-ctx"][0] == "GAP"
+    # rulings/p7.md SPEC-GAP #4 (i)：先前切片 L2 回歸依 08 總表 B-09～B-16；總表沒有 B 編號的 family 仍為缺漏
+    assert got["f2-x"] == ("BLOCKED-OWNER", "B-10")
+    assert got["f7-x"][0] == "GAP" and got["l15-ctx"][0] == "GAP"
     assert rep["gaps"] == 2
     # B 輪任一節點非 passed、或 A 輪非登記 skip → 缺漏
     _junit(ab_dir / "p7-b" / "junit.xml", {ref + "[p1]": "passed", ref + "[p2]": "failed", sc30: "passed"})
@@ -239,3 +242,60 @@ def test_report_header_run_dir_is_restorable(tmp_path):
     md = (tmp_path / "out.md").read_text(encoding="utf-8")
     assert f"- run_dir: `$EXTERNAL/{str(run.resolve()).lstrip('/')}`" in md, md.splitlines()[:16]
     assert "$RUN_DIR/." not in md
+
+
+def test_coverage_b_numbers_for_prior_slice_regression_families(tmp_path):
+    """rulings/p7.md SPEC-GAP #4 (i)：F1～F6、F8、F12 依 08 BLOCKED-OWNER 總表 B-09～B-16 記 BLOCKED-OWNER。"""
+    want = {"F1": "B-09", "F2": "B-10", "F3": "B-11", "F4": "B-12", "F5": "B-13", "F6": "B-14", "F8": "B-15", "F12": "B-16"}
+    cases = [{"case_id": f"{fam.lower()}-x", "suite": "regression", "family": fam} for fam in want]
+    rep = cov.build(tmp_path / "ab", *_cov_fixture(tmp_path, cases))
+    assert {r["case_id"]: (r["status"], r["detail"]) for r in rep["rows"]} == {
+        f"{fam.lower()}-x": ("BLOCKED-OWNER", bid) for fam, bid in want.items()}
+    plan = (ROOT / "docs/rust-refactor/plans/08-slice23-login-events.md").read_text(encoding="utf-8")
+    for fam, bid in want.items():
+        assert f"| {bid} | L2 {fam} " in plan, (fam, bid)       # 編號須登記於 08 BLOCKED-OWNER 總表
+
+
+def test_coverage_prior_slice_cases_use_imported_slice_gate_evidence(tmp_path):
+    """rulings/p7.md SPEC-GAP #4 (ii)：2.1／2.2 先前切片案例不在本 gate 重跑，以 slice21 gate `case_verdicts.json`
+    與 s22 gate 輸出逐案判定——須為 PASS；缺檔、缺列、非 PASS、重複列皆缺漏。本 gate 另有同案證據時也須通過。"""
+    l15 = "tests/acceptance/l15/test_slice21_l15.py::test_case"
+    cases = [
+        {"case_id": "sm-01", "suite": "func-test", "daemon_slice": "2.1"},
+        {"case_id": "l15-a", "suite": "l15-scenario", "daemon_slice": "2.1"},
+        {"case_id": "l15-b", "suite": "l15-scenario", "daemon_slice": "2.1"},
+        {"case_id": "bc02-x", "suite": "contract-blackbox", "daemon_slice": "2.2",
+         "source_ref": "crates/sw-core/tests/deferred_bc02.rs::overflow_x"},
+        {"case_id": "co-01", "suite": "func-test", "daemon_slice": "2.2"},
+    ]
+    cy, lk, bc, l1 = _cov_fixture(tmp_path, cases)
+    lock = json.loads(l1.read_text(encoding="utf-8"))
+    lock["sets"]["p7_gate:l15-slice21-b"] = {"linux": {"selector": {"argv": [], "markexpr": "", "paths": []},
+                                                        "nodeids": [f"{l15}[rust-s21-l15-b]"]}}
+    l1.write_text(json.dumps(lock), encoding="utf-8")
+    ab_dir = tmp_path / "ab"
+    _junit(ab_dir / "l15-slice21-b" / "junit.xml", {f"{l15}[rust-s21-l15-b]": "failed"})
+    # 未提供匯入證據 → 全數缺漏（即使本 gate 自己的 l15 節點存在）
+    rep = cov.build(ab_dir, cy, lk, bc, l1)
+    assert {r["status"] for r in rep["rows"]} == {"GAP"} and rep["gaps"] == 5, rep["rows"]
+    s21 = tmp_path / "case_verdicts.json"
+    s21.write_text(json.dumps({"sm-01": "PASS", "l15-a": "EVIDENCE_MISSING", "l15-b": "PASS"}), encoding="utf-8")
+    s22 = tmp_path / "s22.json"
+    s22.write_text(json.dumps({"cases": [{"case_id": "bc02-x", "status": "PASS"}, {"case_id": "co-01", "status": "PASS"},
+                                         {"case_id": "co-01", "status": "PASS"}], "result": "INSUFFICIENT"}), encoding="utf-8")
+    cargo = tmp_path / "cargo.json"
+    cargo.write_text(json.dumps({"results": [{"nodeid": "cargo:sw-core::deferred_bc02::overflow_x", "outcome": "failed"}]}),
+                     encoding="utf-8")
+    rep = cov.build(ab_dir, cy, lk, bc, l1, cargo_l1=cargo, slice21_verdicts=s21, slice22_gate=s22)
+    got = {r["case_id"]: r["status"] for r in rep["rows"]}
+    assert got == {"sm-01": "PASS", "l15-a": "GAP",          # 匯入非 PASS
+                   "l15-b": "GAP",                           # 匯入 PASS 但本 gate 的同案 l15 節點 failed（取最差）
+                   "bc02-x": "GAP",                          # 匯入 PASS 但本 gate 的 cargo 同名 nodeid failed
+                   "co-01": "GAP"}, rep["rows"]              # s22 輸出同案重複列
+    _junit(ab_dir / "l15-slice21-b" / "junit.xml", {f"{l15}[rust-s21-l15-b]": "passed"})
+    cargo.write_text(json.dumps({"results": []}), encoding="utf-8")   # 本 gate 無同案 cargo 證據 → 只看匯入
+    s22.write_text(json.dumps({"cases": [{"case_id": "bc02-x", "status": "PASS"}, {"case_id": "co-01", "status": "BLOCKED-OWNER"}]}),
+                   encoding="utf-8")
+    rep = cov.build(ab_dir, cy, lk, bc, l1, cargo_l1=cargo, slice21_verdicts=s21, slice22_gate=s22)
+    got = {r["case_id"]: r["status"] for r in rep["rows"]}
+    assert got == {"sm-01": "PASS", "l15-a": "GAP", "l15-b": "PASS", "bc02-x": "PASS", "co-01": "GAP"}, rep["rows"]

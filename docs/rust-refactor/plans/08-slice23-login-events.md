@@ -2397,7 +2397,7 @@ class P7Rig:                                                            # fixtur
 
 **Files:**
 - Create: `tests/contract_blackbox/test_p7_login.py`、`test_p7_quiet_reconfirm.py`、`test_p7_selftest_recover.py`、`test_p7_stall.py`、`test_p7_events.py`、`test_p7_log_capture.py`、`test_p7_latency_noise.py`、`test_p7_invariants.py`
-- Create: `tests/acceptance/l15/slice23/{s23-login-wire-equals-wal,s23-quiet-mid-login-zero-tx,s23-login-no-resend,s23-interleave-login-agent-human,s23-reboot-recovery-no-replay,s23-recover-force-handoff}.yaml`、`tests/acceptance/l15/test_slice23_l15.py`（P2 l15 harness，bridge 模式外部 byte 證據）
+- Create: `func-test/scenarios/{s23-login-wire-equals-wal,s23-quiet-mid-login-zero-tx,s23-login-no-resend,s23-interleave-login-agent-human,s23-reboot-recovery-no-replay,s23-recover-force-handoff}.yaml`、`tests/acceptance/l15/test_slice23_l15.py`（P2 l15 harness，bridge 模式外部 byte 證據）（P7 修訂：原計畫路徑 `tests/acceptance/l15/slice23/*.yaml`；P2 runner `--scenarios` 只探索 `func-test/scenarios/`，路徑更正不改語意——`slice23-chg-register.md` CHG-S23-L15-PATH-01，rulings/p7.md 2026-10-29 第 6 輪 SPEC-GAP #6 編排者裁決接受）
 - Create: `scripts/rust/run_p7_ab.sh`
 - Create: `docs/rust-refactor/evidence/p7-ab-<YYMMDD>.md`（由 `run_p7_ab.sh` 產生；檔名日期為執行當日）
 
@@ -2465,7 +2465,7 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 | `test_p7_events.py::test_redos_rejected_no_re2` | `event add` `a+b+` | exit 2、stdout `INVALID_RULE_SCHEMA`（Python 基線若可 import re2 → `pytest.skip("baseline_variant_re2")`，cases.yaml 已登記此變體） |
 | `test_p7_log_capture.py::test_capture_skips_foreground` | log-start、背景 RX、`cmd submit` 輸出 | 檔案含背景 RX、不含前景命令輸出 |
 | `test_p7_latency_noise.py::test_login_with_delay_and_noise` | 每步 800 ms 延遲＋每 50 ms 一行 kernel noise | 仍進 READY（timeout_s 15） |
-| `test_p7_latency_noise.py::test_control_latency_under_flood_with_events` | 20000 B/10 s ×10 洪水＋一條 ALL 規則 | 另一 session `session get-state` p99 ≤ `contracts/resource_limits.yaml` 的 `control_latency_flood_p99_ms`（06 T21 凍結值，200 次取樣）；matcher `event_dropped` 有界出現。daemon RSS 增量只記錄為**診斷值**（OD-09：RSS 預算待 Python 48h 基線後凍結），不作 gate |
+| `test_p7_latency_noise.py::test_control_latency_under_flood_with_events` | 20000 B/10 s ×10 洪水＋一條 ALL 規則 | ~~另一 session `session get-state` p99 ≤ `contracts/resource_limits.yaml` 的 `control_latency_flood_p99_ms`（06 T21 凍結值，200 次取樣）~~**P7 修訂（OD-59）**：不新增 `control_latency_flood_p99_ms`；以 `event_latency` 的 flood 規則判定——stop_request／command_cancel 每輪有效樣本最大值 ≤ `max_ms_flood`（100 ms，`gate_rule: every_run_max_le_max_ms`），工具與口徑沿用 `scripts/rust/event_latency_measure.py`（command_cancel 200 筆、stop_request 20 個新 daemon；CHG-S23-CTRL-LATENCY-OD59-01）；matcher `event_dropped` 有界出現（≥ 1 且 ≤ 送出洪水行數）。daemon RSS 增量只記錄為**診斷值**（OD-09：RSS 預算待 Python 48h 基線後凍結），不作 gate |
 
 `test_p7_invariants.py`（§11.3 六項，外部 CLI＋FakeTarget 觀測）：
 
@@ -2478,7 +2478,9 @@ def test_creds_file_fixed_does_not_auto_probe_until_attach(p7, tmp_path):
 | `test_no_auto_resend_after_partial_or_timeout` | 5 | 命令逾時救援、login 被 SC-30 中止後，target 收到的每個 payload 恰一次 |
 | `test_evidence_insufficient_is_not_pass` | 6 | `run_p7_ab.sh` 在任何案例缺 evidence 檔時該列為 `INCOMPLETE`、整體 exit 非 0（以注入缺檔驗證） |
 
-`tests/acceptance/l15/slice23/*.yaml`：沿用 P2 l15 harness 與 06 T21 的 bridge 模式（wire 證據＝`tools/uart_stdio_bridge` 的 `bridge.v1`），斷言 wire 與 WAL 一致、SC-30 中止後 wire 零 byte、login 不重送、三來源不交錯、reboot recovery 不回放、force recover 回條後才重開；每個 case 的 `manifest.json` 為 `l15-manifest.v1`。
+`func-test/scenarios/s23-*.yaml`（P7 修訂，同 CHG-S23-L15-PATH-01）：沿用 P2 l15 harness 與 06 T21 的 bridge 模式（wire 證據＝`tools/uart_stdio_bridge` 的 `bridge.v1`），斷言 wire 與 WAL 一致、SC-30 中止後 wire 零 byte、login 不重送、三來源不交錯、reboot recovery 不回放、force recover 回條後才重開；每個 case 的 `manifest.json` 為 `l15-manifest.v1`。
+
+> **P7 修訂（第 13 輪；rulings/p7.md 2026-10-29 第 6 輪 SPEC-GAP #7「以 WAL 先後判定」）**：三來源不交錯中「nonce probe 送出後到 READY 前不得有 agent／human bytes」這段界線，P2 runner 的字面 payload 比對無法表達隨機 nonce；不改 runner，由 `test_slice23_l15.py` 於 runner PASS 後讀 runner 保存的 WAL，以 seq 先後切出每個 ready probe 窗口（`system` 來源的 `echo __READY__<nonce>` TX 起，到 RX 先見 `__READY__<nonce>`、其後見 prompt 止；與 Python `login_fsm` 先等 nonce 再等 prompt 的 READY 條件一致），窗口內不得有非 `system` 來源的 TX、已收窗口 ≥ 2（`s23_probe_ready_windows`，CHG-S23-INTERLEAVE-WAL-03，附 Python 基線實測）。
 
 **先前切片必要回歸（§11.5、§11.6「先前必要回歸」）：** Rust artifact 上重跑 `tests/contract_blackbox/slice21/`（06 T20）、`tests/acceptance/l15/slice21/`（06 T21）、P6 的 `tests/contract_blackbox/test_console_*.py`、`test_interactive_lease.py`、`test_slice22_family_mirrors.py`，以及 func-test 外部 bridge 模式 `brcm-01-login-flow`、`ev-01-spawn-handler`（06 `cross_slice_cases` 交給 2.3 者）。
 
@@ -2660,6 +2662,22 @@ def test_full_required_set_passes(tmp_path):
 | B-06 | 原生 Windows COM handle 證據（OD-08：動到 PAL 的 PR 與切片出口必備）：登入 FSM、quiet、事件端到端，及 Task 6／13／14 的 PAL 變更在 COM handle 環境下的回歸 | OD-15 起為擁有者 host 可執行 gate：Spike 1 已通過的 com0com DUT-side pair `COM20:COM21`（實體 USB-UART 直連 Windows 為備援）；orchestrator 經 WSL interop 代跑 | `SW_TEST_COM_PAIR=COM20:COM21 scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7`（Task 19 三案）；`scripts/rust/win-test.sh --package sw-pal --package sw-core`（PAL 回歸）；Windows 黑箱 `scripts/rust/win-blackbox.ps1 -Tests tests\contract_blackbox\test_p7_events.py,…`（`-Tests` 於 Task 18A 新增，預設值維持 P3 行為） | 6、7、13、14、16-wire、19 |
 | B-07 | L3 realhw P0＋登入／Recovery／事件相關 P1 與 remote 案例 | bench、`two_boards`、`deployed_recent`、remote 容器環境 | `realhw` 以 Rust bundle 為 `serialwrap_exe`，分開執行並各自留報告：(1) `python3 -m realhw --tier p0`（P0 全部 8 案）；(2) `python3 -m realhw --only p1-rst-reboot`、`--only p1-rst-bootwindow`、`--only p1-rst-recover`（`--only` 一次一個精確 ID，`realhw/__main__.py:19`、`harness.select_cases`）；(3) `python3 -m realhw --tier remote`（8 案：`rm-topo-*`、`rm-live-*`）；(4) 先前切片必要回歸：06 Task 20／22 與 07 出口表列出的 realhw ID，逐一 `--only`。執行後以 `realhw --list` 對照 `cases.lock.json` 的 `slice_2.3` 集合確認無漏案 | 9、18 |
 | B-08 | 測試團隊 Windows 工作站（`windows-task`、第三方 EDR）上 event handler 實際觸發、Job 終止與逾時延遲 | 測試團隊工作站 | `scripts/rust/win-blackbox.ps1 -Tests tests\contract_blackbox\test_p7_events.py` 程序與判定欄位 | 14 |
+| B-09 | L2 F1 命令契約五案（`f1-cmdid-survives-timeout`、`f1-limits-queryable`、`f1-near-limit-no-logout`、`f1-newline-rejected`、`f1-too-long-rejected`；Slice 2.1 先前切片必要回歸） | bench 實板（`physical_uart`） | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-10 | L2 F2 背壓四案（`f2-history-bounded-rss`、`f2-queue-full-backpressure`、`f2-recovery-flushes-queue`、`f2-rx-window-crossing-prompt`；2.1） | bench 實板（`physical_uart`） | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-11 | L2 F3 可觀測性四案（`f3-cmd-fail-observable`、`f3-device-error-names-selector`、`f3-fail-error-code`、`f3-log-tail-latest`；2.1） | bench 實板（`physical_uart`） | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-12 | L2 F4 session 語意三案（`f4-activity-classification`、`f4-background-result-tail-consistent`（2.1）、`f4-interactive-line-cmd-defined`（2.2）） | bench 實板（`physical_uart`） | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-13 | L2 F5 console 共存五案（`f5-console-peer-gone-recycled`、`f5-deferred-bytes-flushed`、`f5-deferred-dropped-after-reboot`（destructive）、`f5-raw-ownership-survives-agent-rounds`、`f5-second-console-linebuffer`；2.2） | bench 實板、human frontend（tmux／minicom）、destructive 授權 | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-14 | L2 F6 RPC 存活兩案（`f6-ping-during-long-op`、`f6-two-boards-no-starvation`；2.2） | bench 實板（`two_boards`） | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-15 | L2 F8 daemon 單例兩案（`f8-second-daemon-detected`、`f8-tty-holders-reported`；2.2） | bench 實板、POSIX throwaway daemon | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+| B-16 | L2 F12 診斷兩案（`f12-version-reported-consistent`、`f12-wal-path-live`；2.1） | bench 實板（`physical_uart`） | `testpilot run serialwrap_regression --case <id>`（逐一 case；`testbed.yaml` 的 `serialwrap_exe` 指 pinned Rust bundle） | 18、19（先前切片必要回歸） |
+
+> **P7 修訂（第 13 輪；rulings/p7.md 2026-10-29「第 6 輪 SPEC-GAP #4／OWNER-BATCH #4」）**：(i) slice_2.3 必要集合中先前切片的 L2
+> regression family F1～F6、F8、F12 依上表 B-09～B-16 記 BLOCKED-OWNER（`scripts/rust/p7_case_coverage.py`
+> `OWNER_BY_REGRESSION_FAMILY`；現行 `cases.lock.json` slice_2.3 中這八個 family 共 27 案，裁決文字記 29 案，以鎖檔為準）。
+> (ii) daemon_slice 2.1／2.2 的先前切片案例（contract-blackbox、func-test、l15-scenario，如 `sm-01`、`sm-04`、`ha-05`、
+> `l15-wal-interference`）不在本 gate 重跑，coverage 改以 slice21 gate 的 `case_verdicts.json`（`--slice21-verdicts`）與
+> s22 gate（`scripts/rust/s22_gate_check.py`）輸出（`--slice22-gate`）逐案判定；`p7_gate.sh` 由
+> `P7_SLICE21_CASE_VERDICTS`／`P7_S22_GATE_JSON` 指定兩份證據（並記入該列 evidence 的 sha256），缺證據即缺漏、不得記 PASS。
 
 ## Slice 2.3 出口對照（規格 §11.6）
 
@@ -2674,6 +2692,6 @@ def test_full_required_set_passes(tmp_path):
 | 先前切片必要回歸（L1.5） | Task 18 slice21／slice22／l15 slice21 於 Rust artifact；func-test `brcm-01-login-flow`、`ev-01-spawn-handler` | 本環境可產出 |
 | 必要案例集合完整 | Task 0 凍結；Task 19 `cases.lock slice_2.3 coverage` 列 | 本環境可產出 |
 | L2／L3 前置：同一批情境於 docker 兩容器拓樸（P2 Task 17 `scripts/docker/run-l15.sh`） | `L1.5-docker` 報告 | 本環境可產出（OD-15；不計為 L2／L3） |
-| L2：F9、F10、F11 切片清單＋先前必要回歸 | B-02、B-04、B-05 | BLOCKED-OWNER |
+| L2：F9、F10、F11 切片清單＋先前必要回歸 | B-02、B-04、B-05；先前切片 F1～F6、F8、F12 為 B-09～B-16（P7 第 13 輪修訂） | BLOCKED-OWNER |
 | Windows 原生 COM | B-06（擁有者 host `COM20:COM21`） | 擁有者 host 可執行（OD-15） |
 | L3／平台：P0＋登入／Recovery／事件 P1、適用 remote | B-07 | BLOCKED-OWNER |

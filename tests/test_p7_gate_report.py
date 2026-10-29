@@ -289,3 +289,14 @@ def test_report_records_tool_versions(tmp_path):
     assert data["tool_versions"]["pytest"] == _pytest.__version__ and data["tool_versions"]["python"]
     md = g.build_report(tmp_path / "run")
     assert f'"pytest": "{_pytest.__version__}"' in md
+
+
+def test_owner_items_cover_every_coverage_b_number(tmp_path):
+    """rulings/p7.md SPEC-GAP #4 (i)：coverage 引用的每個 B 編號（含先前切片 B-09～B-16）都須是報告的擁有者項目，
+    無證據時列為 BLOCKED-OWNER（不得 PASS）。"""
+    import p7_case_coverage as cov
+    used = set(cov.OWNER_BY_SUITE.values()) | set(cov.OWNER_BY_REGRESSION_FAMILY.values())
+    assert {f"B-{i:02d}" for i in range(9, 17)} <= used <= set(g.OWNER_ITEMS), sorted(used - set(g.OWNER_ITEMS))
+    md = g.build_report(_results(tmp_path, []))
+    for bid in sorted(used):
+        assert f"| {bid} | BLOCKED-OWNER |" in md, bid

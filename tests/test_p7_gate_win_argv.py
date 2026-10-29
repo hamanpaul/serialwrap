@@ -53,3 +53,24 @@ def test_gate_snapshots_artifacts_before_cargo_rebuilds():
     l1 = text.index('run_row "cargo test --workspace"')
     assert build < snap < l1
     assert "target/debug/serialwrapd" not in text[snap + 60:], "快照之後不得再引用 target/debug 的 daemon"
+
+
+def test_com_row_is_od53_capability_set():
+    """rulings/p7.md 第 6 輪 SPEC-GAP #5（適用 OD-53）：Windows COM 列為能力集合——test-binary 參數以
+    `--ignored cap_windows_com__` 明確只執行 ignored 能力測試，且 `--caps windows_com` 實跑。以 L1 鎖 OD-24 防線的
+    `_selector_explicit_caps` 推導（不另寫規則）：推導結果須恰為 `--caps` 指定的能力。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_l1_judge_tests", ROOT / "tests" / "test_l1_judge.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    text = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    args = shlex.split(re.search(r"^WIN_COM_ARGS=\((.*)\)$", text, re.M).group(1))
+    caps = [args[i + 1] for i, a in enumerate(args) if a == "--caps"]
+    cut = args.index("--")
+    packages = [x for i, a in enumerate(args[:cut]) if a == "--package" for x in (a, args[i + 1])]
+    selector = {"argv": [*packages, *args[cut + 1:]], "markexpr": "", "paths": []}
+    assert caps == ["windows_com"], args
+    assert mod._selector_explicit_caps(selector) == caps, selector
+    noncom = shlex.split(re.search(r"^WIN_NONCOM_ARGS=\((.*)\)$", text, re.M).group(1))
+    assert mod._selector_explicit_caps({"argv": noncom}) == [], noncom      # non-COM 列仍是 --skip cap_，不是能力集合

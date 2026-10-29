@@ -364,3 +364,33 @@ BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-
 | P7-9065f14-1 | Medium（6 輪） | slice22 map | 維持 NEEDS-RULING（OWNER-BATCH） |
 | P7-cd7acf0-4 | Medium（3 輪） | slice22-b 集合 | 審查者已核對不成立主張屬實（P6 檔案不在本分支、gate 記 BLOCKED-UPSTREAM 不誤判 PASS）；維持至 P6 合入 |
 | P7-de7a95a-1～3、P7-b85eec5-2 | Low | — | 依收斂規則不修 |
+
+## 第 13 輪（第七輪雲端）：merge 主線（733381e6）＋P5（056046fb）、rulings/p7.md 第 6 輪裁決、p7-cloud/b85eec5_a04aa69-sol
+
+### merge
+
+| merge | 內容 | 衝突處理 |
+|---|---|---|
+| `733381e6` | origin/feature/rust-refactor `8963d07`（OD-48 legacy handoff、0.4.0 release 前置、Docker scope cgroup 判定） | `contracts/behavior_changes.yaml`：保留 P7 的 SC-30／DF-18／DF-23 與 revision 8，於 SC-37 後加入主線 SC-39；`test_bc_real_sc_df_ranges` SC 集合取聯集；`crates/sw-pal/src/proc_scan/posix.rs`（P5 擁有）採 P5 合併同一主線的解法（`d657a7c3`）再加回 P7 既有 `held_fd_targets` |
+| `056046fb` | origin/feature/rust-refactor-p5 `1b83da9`（OD-55 能力集合、OD-58／64／65／66、`test_two_daemons_same_tty` harness 修正） | 表頭註解與 SC 範圍測試取 P7 端（內容為聯集）。L1 鎖對 P7 父節點消失的 27 筆 s21_core.linux 皆為 P5 依 OD-55 的逐名移除（24 筆移入 `s21_gate:cap_*`、3 筆非能力列直接移除）；對 PR base（主線）`regen_lock --check --base` OK |
+
+S1X-a 修正（`origin/feature/s1x-a-fixes`）尚未合入主線：rulings/s1.md「S1X-a 修正對 Rust 的連帶」、OD-62／OD-63 與 OD-57「S1X-a 合入後重測 Python、可能改 parity 結案」依指示列待辦（本輪不處理）。
+
+### rulings/p7.md 第 6 輪裁決（末 7 列）與 OD-67
+
+| 裁決 | 處理 |
+|---|---|
+| OD-59（control_latency 沿用 event_latency flood 規則） | **done**：新增 `tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events`——工具與口徑沿用 `scripts/rust/event_latency_measure.py`（`_Rpc.timed`、`_Flood` 20000 B/s、`flood_problems`、`judge_run`），command_cancel 200 筆（同一 daemon、整輪洪水）與 stop_request 20 個新 daemon（各暖機 1 s），每輪最大值 ≤ `max_ms_flood`（100 ms），負載期間載入比對每一行洪水的規則（scope any、handler 0.2 s），另斷言 `match_recorded` ≥ 1、`event_dropped` ≥ 1 且 ≤ 送出洪水行數、selector 皆 COM0。案例設計修正 CHG-S23-CTRL-LATENCY-OD59-01；cases.yaml 該案 `contract` 文字與計畫 08 該列同步（不改分母屬性） |
+| P7-9065f14-1（由 P6 移除） | 依裁決不處理（P6 第 7 輪移除 `l15-delayed-reply`）；`test_slice22_case_set_frozen_and_mapped` 維持 BLOCKED-UPSTREAM |
+| OD-55 已由 P5 交付（P7-BO-4） | merge P5 後重驗 `test_l1_judge` 兩支 OD-24 防線：s21_core.linux 已無 ignored 列（`test_s21_core_linux_capability_rows_moved_to_cap_sets_od55` PASS）；兩支仍紅，剩餘列全屬 `s21_core.windows`（P5 集合，OD-55 要求 Windows 原生收集後才移除，P5 LOCAL-WINDOWS-TODO）。P7 不改該集合 |
+| SPEC-GAP #4／OWNER-BATCH #4（coverage 承擔來源） | **done**：(i) 08 BLOCKED-OWNER 總表補 B-09～B-16（F1、F2、F3、F4、F5、F6、F8、F12；現行 cases.lock slice_2.3 共 27 案，裁決文字記 29 案，以鎖檔為準），`p7_case_coverage.OWNER_BY_REGRESSION_FAMILY` 與 `p7_gate_report.OWNER_ITEMS` 同步；(ii) daemon_slice 2.1／2.2 的 contract-blackbox／func-test／l15-scenario 案例改以匯入的 slice21 gate `case_verdicts.json`（`--slice21-verdicts`）與 s22 gate 輸出（`--slice22-gate`）逐案判定，須為 PASS，缺檔、缺列、非 PASS、重複列皆缺漏；本 gate 另有同案證據時取最差。`p7_gate.sh` 由 `P7_SLICE21_CASE_VERDICTS`／`P7_S22_GATE_JSON` 帶入並記 sha256。回歸 `test_coverage_b_numbers_for_prior_slice_regression_families`、`test_coverage_prior_slice_cases_use_imported_slice_gate_evidence`、`test_owner_items_cover_every_coverage_b_number`（修前皆紅）；既有 `test_coverage_requires_pass_or_numbered_owner_block` 的 F2 期望依裁決由缺漏改 B-10，另加無 B 編號的 F7 保留缺漏路徑（缺漏數維持 2） |
+| SPEC-GAP #5（Windows COM 列，適用 OD-53） | **done（Linux 端）**：`WIN_COM_ARGS` 改為 test-binary `--ignored cap_windows_com__`（`--caps windows_com` 實跑）；回歸 `test_com_row_is_od53_capability_set` 以 OD-24 防線的 `_selector_explicit_caps` 推導核對（修前紅）。`p7_gate:win-test-sh-caps-windows-com` 的原生收集登記列 LOCAL-WINDOWS-TODO P7-LW-9（程序已更新） |
+| SPEC-GAP #6（l15 slice23 路徑） | **done**：計畫 08 Task 18 兩處路徑改為 `func-test/scenarios/s23-*.yaml` 並加 P7 修訂註記；CHG-S23-L15-PATH-01 狀態註明編排者裁決接受 |
+| SPEC-GAP #7（s23 interleave 以 WAL 先後判定） | **done**：`tests/acceptance/l15/test_slice23_l15.py` 新增純函式 `s23_probe_ready_windows`——以 WAL seq 先後切出 ready probe 窗口（`system` 來源 `echo __READY__<nonce>` TX 起，至 RX 先見 `__READY__<nonce>`、其後見 prompt 止，與 Python `login_fsm` 先等 nonce 再等 prompt 一致），窗口內不得有非 `system` 來源的 TX、已收窗口 ≥ 2；`s23-interleave-login-agent-human` 於 runner PASS 後套用。回歸 `test_wal_probe_ready_window_oracle`（修前紅）；不改 P2 runner。CHG-S23-INTERLEAVE-WAL-03 |
+| OD-67（三支參數化測試舊自動 id） | **部分**：`test_cargo_toml_bypass` 已由 P5（`7facc75c`）給明確 ids，且新 id 與 `p7_gate:python3-m-pytest-q-tests` 凍結的舊 id 逐字相同（pytest 9.0.3／9.2.0 收集皆 4 筆、與鎖一致），P7 集合無須移除；`test_invalid_regex_rpc_and_arbiter_reject_without_enqueue`（`tests/test_command_completion.py`）與 `test_classify_pyserial_open_error`（`tests/test_stage0_uart_exclusive.py`）在主線、P5、P6、S1X 各分支皆尚未給明確 ids（9.2.0 下 `[aaa…(1025)]`→`[invalid2]`、`[…COM9…-expected2]`→`[msg2-expected2]`），依裁決「新 id 須先由擁有該測試檔的分支改好」列待辦，P7 不改他人測試檔 |
+
+驗證（本組 commit，4 CPU、ubuntu 非 root、CPython 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3＋pyserial 3.5）：
+OD-59 案例 A（Python）／B（Rust 快照）皆 1 passed（cancel max 1.703／2.358 ms、stop max 0.706／0.367 ms，上限 100 ms；
+突變上限 0.5 ms → FAIL）；s23 interleave Python 基線 1 passed、WAL 窗口 2、無問題（注入 agent TX → 報錯）；新回歸 6 支修前紅、
+修後綠；觸及的 Python 測試 235 passed／19 skipped；`regen_lock --check --base HEAD` OK（4 個 p7_gate 集合 add-only 共 +9 筆）。
+證據與數字見 `slice23-chg-register.md` 附錄 P4／P5。
