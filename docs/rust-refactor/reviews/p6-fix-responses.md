@@ -436,3 +436,22 @@ Python daemon 側 `ATTACH_FAILED:DeviceHeldError`：起點基準執行時洩漏�
 
 - `attach_request_timeout_closes_pty`：完成（上表）。
 - `attach_interactive_owner_false_during_replay_hold`：**SPEC-GAP**。計畫前置狀態「回放 hold 存在、前景已清、且 attach 會開 lease」在 Python 與 Rust 都不會發生：`console_attach` 只在無 lease 時開 lease；鍵入而產生回放的 human console 本身必已由 attach 開了 lease（PTY），soft preempt／lazy expiry 後 PostClose 也會還原它的 lease；TCP 後端的 attach 不開 lease、哨兵 primary 的輸入被丟棄。實測 ATTACHED 救援 lazy expiry 變體：c2 attach 時 c1 的 lease 已還原，回應無 `interactive_session_id`。D-22(2) 的「hold 期間 attach 回 owner=false」在程式上為 `!fg_slot_busy()`，但無可達的前置狀態可驗；請計畫擁有者改寫案例或撤列。
+
+### 第四輪續 Slice 2.2 出口 gate（非 dry-run，HEAD c6ddda1，`target/s22-gate/r4b-261029-035247`，非 root）
+
+result = **FAIL**。
+
+| 集合 | 判定 | 數字 |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | PASS | 2130 passed、38 skipped（ignored） |
+| `s22_gate:console_conformance_pty`/linux | PASS | 31 passed、3 skipped（cap_windows_com）；`cargo_l1_results.py --caps posix_pty` |
+| `s22_gate:py_parity`/linux | PASS | 12 passed |
+| `s22_gate:parity_py`/linux | FAIL | 32 passed、2 failed（指紋 2 案，OWNER-BATCH） |
+| `s22_gate:blackbox_rust`/linux | FAIL | 115 passed、2 failed、8 skipped；失敗皆 slice21：`test_stale_context_not_replayed`（步驟 2 `session recover` 後舊 id 照送；DF-20 核准條件只涵蓋 release→attach，recover／reboot 兩步超出 DF-20，OWNER-BATCH）、`test_two_daemons_same_tty`（Python daemon 與 P5 tip Rust artifact 於本環境同樣失敗，環境／P5） |
+| `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
+
+逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0（L1.5 21 個 runner 參照於 c6ddda1 release artifact 皆 PASS；`l15-wal-interference` 依 OD-40 改證據後 PASS）。parity_rows 23：PASS 19／OWNER-DECISION-PENDING 3（#107、#108、#185）／FAIL 1（#183 指紋）。prereqs PASS。
+
+### 第四輪續全套 pytest（非 root、同環境、無 pyserial）
+
+起點 24b8012：13 failed／5569 passed／223 skipped；終點 cd80448：12 failed／5578 passed／221 skipped。終點失敗集合為起點的真子集（少 `test_rust_cfg_boundary.py::test_repo_clean`），無超出基準者。c6ddda1 只改 `rpc_console.rs` 測試（重試迴圈），另以 rpc_console 全 binary 連跑 30 次 0 失敗驗證。
