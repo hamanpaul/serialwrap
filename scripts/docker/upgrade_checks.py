@@ -175,13 +175,19 @@ def snapshot_files(root: Path) -> dict[str, str]:
     return result
 
 
-def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str, str]) -> dict[str, Any]:
+def judge_files_preserved(check_id: str, before: dict[str, str], after: dict[str, str],
+                          expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
+    """既有檔案逐位元組保留。`expected_overwrites`（路徑 → 新 bundle 權威內容的 sha256）列出 setup 依 0.3.2 同語意
+    覆寫的套件管理檔：只允許變成該權威內容；遺失或其他內容一律 FAIL（S1-f3c66b4-1）。"""
+    expected = expected_overwrites or {}
     missing = sorted(set(before) - set(after))
-    changed = sorted(k for k in before if k in after and before[k] != after[k])
+    package_updated = sorted(k for k in before if k in after and before[k] != after[k] and expected.get(k) == after[k])
+    changed = sorted(k for k in before if k in after and before[k] != after[k] and k not in package_updated)
     added = sorted(set(after) - set(before))
     if missing or changed:
-        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", missing=missing, changed=changed, added=added)
-    return row(check_id, "PASS", None, files=len(before), added=added)
+        return row(check_id, "FAIL", "既有設定或 profile 遺失／被改寫", missing=missing, changed=changed, added=added,
+                   package_updated=package_updated)
+    return row(check_id, "PASS", None, files=len(before), added=added, package_updated=package_updated)
 
 
 def _alias_key(entry: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -269,7 +275,8 @@ def _step_detail(body: dict[str, Any], name: str) -> dict[str, Any]:
 def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, Any] | None, old_pids: list[int],
                               old_alive_after: list[int], status_after: dict[str, Any] | None, instances_after: list[int],
                               cfg_before: dict[str, str], cfg_after: dict[str, str], overlaps: list[dict[str, Any]],
-                              new_version: str = "0.4.0", old_version: str = "0.3.2") -> dict[str, Any]:
+                              new_version: str = "0.4.0", old_version: str = "0.3.2",
+                              expected_overwrites: dict[str, str] | None = None) -> dict[str, Any]:
     """OD-48：0.3.2 daemon 執行中直接 setup → 成功切換、舊 daemon 行程樹結束、新 daemon 由 setup 自己啟動
     （判定在 driver 任何啟動動作之前取樣；setup 沒啟動就 FAIL）、config／profiles 逐位元組保留、無兩個 daemon 重疊。"""
     body = body if isinstance(body, dict) else {}
@@ -277,7 +284,7 @@ def judge_legacy_direct_setup(check_id: str, *, setup_rc: int, body: dict[str, A
     legacy = _step_detail(body, "stop_supervisor").get("legacy_stop") or {}
     started = _step_detail(body, "start_and_verify").get("started")
     status = status_after if isinstance(status_after, dict) else {}
-    preserved = judge_files_preserved(check_id, cfg_before, cfg_after)
+    preserved = judge_files_preserved(check_id, cfg_before, cfg_after, expected_overwrites)
     detail = {"setup_rc": setup_rc, "op": report.get("op"), "to_version": report.get("to_version"),
               "legacy_stop": legacy, "started_by_setup": started, "old_pids": list(old_pids),
               "old_alive_after": list(old_alive_after), "daemon_version_after": status.get("version"),

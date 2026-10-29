@@ -378,6 +378,39 @@ def test_systemd_system_mode_required_checks_cover_legacy_direct_setup():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_managed_profile_overwrite_must_match_bundle_content():
+    """S1-f3c66b4-1：套件管理的 profile 只允許被覆寫成新 bundle 的權威內容；遺失或其他內容必須 FAIL，
+    其餘檔案維持逐位元組比較。"""
+    managed = "/etc/serialwrap/profiles/default.yaml"
+    before = {"config.yaml": "c0", "profiles/bench.yaml": "b0", managed: "old", "/etc/serialwrap/profiles/bench.yaml": "b1"}
+    expected = {managed: "new"}
+    ok = dict(before, **{managed: "new"})
+    assert uc.judge_files_preserved("cfg", before, ok, expected_overwrites=expected)["verdict"] == "PASS"
+    assert uc.judge_files_preserved("cfg", before, dict(before), expected_overwrites=expected)["verdict"] == "PASS"
+    corrupted = dict(before, **{managed: "garbage"})
+    r = uc.judge_files_preserved("cfg", before, corrupted, expected_overwrites=expected)
+    assert r["verdict"] == "FAIL" and r["detail"]["changed"] == [managed]
+    deleted = {k: v for k, v in before.items() if k != managed}
+    r = uc.judge_files_preserved("cfg", before, deleted, expected_overwrites=expected)
+    assert r["verdict"] == "FAIL" and r["detail"]["missing"] == [managed]
+    # 沒有權威內容的檔案（使用者自加的 /etc profile）被改寫仍 FAIL。
+    user_changed = dict(ok, **{"/etc/serialwrap/profiles/bench.yaml": "x"})
+    assert uc.judge_files_preserved("cfg", before, user_changed, expected_overwrites=expected)["verdict"] == "FAIL"
+    # 預設（未給權威內容）語意不變。
+    assert uc.judge_files_preserved("cfg", before, ok)["verdict"] == "FAIL"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_system_driver_keeps_managed_profiles_in_snapshot():
+    """S1-f3c66b4-1：driver 不得把套件管理檔從快照排除。"""
+    text = UPGRADE_CONTAINER.read_text(encoding="utf-8")
+    assert "if k not in managed" not in text
+    assert "expected_overwrites" in text
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_upgrade_image_grants_swtest_sudo_for_system_mode():
     """systemd-system 模式以 swtest 執行 `setup --system --with-sudo`，映像需提供免密碼 sudo。"""
     text = DOCKERFILE.read_text(encoding="utf-8")

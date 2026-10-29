@@ -223,12 +223,18 @@ class Driver:
         """設定快照：使用者 config；systemd-system 另含 system daemon 讀取的 /etc/serialwrap/profiles。"""
         files = uc.snapshot_files(CONFIG)
         if self.mode == "systemd-system":
-            # 套件內 profiles 由 system setup 每次以 `sudo cp -r <staging>/. /etc/serialwrap/profiles` 覆寫（0.3.2 同語意），
-            # 屬 setup 管理檔而非使用者資料；只比對使用者自加的檔案。
-            managed = getattr(self, "system_managed_profiles", set())
-            files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()
-                          if k not in managed})
+            files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()})
         return files
+
+    def expected_overwrites(self) -> dict[str, str]:
+        """S1-f3c66b4-1：system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 同名檔（0.3.2 `sudo cp -r`
+        同語意）。只允許這些檔案變成新 bundle 的權威內容（bundle 內 sw_core/assets/profiles）；其餘逐位元組比較。"""
+        if self.mode != "systemd-system":
+            return {}
+        assets = self.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+        managed = getattr(self, "system_managed_profiles", set())
+        return {f"/etc/serialwrap/profiles/{name}": digest for name, digest in uc.snapshot_files(assets).items()
+                if name in managed}
 
     def phase_seed(self) -> None:
         (CONFIG / "profiles").mkdir(parents=True, exist_ok=True)
@@ -242,7 +248,7 @@ class Driver:
                 if staging.is_dir() else set()
             self.observations.append({"id": "OBS-SYSTEM-PROFILES-MANAGED", "phase": "seed_user_data",
                                       "managed": sorted(self.system_managed_profiles),
-                                      "note": "system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 的同名檔（0.3.2 同語意）；保留判定只比對使用者自加的檔案"})
+                                      "note": "system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 的同名檔（0.3.2 同語意）；這些檔案只允許變成新 bundle 的權威內容，遺失或其他內容判 FAIL"})
             SYSTEM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
             (SYSTEM_PROFILE_DIR / "bench.yaml").write_text(BENCH_PROFILE, encoding="utf-8")
         if self.mode == "systemd-system":
@@ -298,7 +304,7 @@ class Driver:
                 "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
                 old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(),
                 cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=overlaps,
-                new_version=NEW_VERSION, old_version=OLD_VERSION))
+                new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
             return True
         self.observations.append({"id": "OBS-UPGRADE-LEGACY-HANDOFF", "phase": "upgrade_with_old_daemon_running",
                                   "error_code": body.get("error_code"), "probe": body.get("probe"),
@@ -311,7 +317,7 @@ class Driver:
             "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
             old_alive_after=sorted(after["daemon_pids"]), status_after=None, instances_after=after["daemon_pids"],
             cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=[],
-            new_version=NEW_VERSION, old_version=OLD_VERSION))
+            new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
         return False
 
     def phase_upgrade_after_stop(self, already: bool) -> None:
@@ -349,7 +355,8 @@ class Driver:
         self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else "入口未切到 0.4.0 或未記錄舊 pipx 入口",
                         entries=entries, cli_version=version, backup_targets=recorded,
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
-        cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, self.cfg_files())
+        cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, self.cfg_files(),
+                                       self.expected_overwrites())
         self.add(cfg)
 
     def phase_new_running(self) -> None:
