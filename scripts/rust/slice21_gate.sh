@@ -276,6 +276,8 @@ mkdir -p "$RUN_DIR/event_latency"
 run_logged event_latency python3 scripts/rust/event_latency_measure.py --daemon "$RUST_D" --cli "$RUST_CLI" --label rust \
   --l1-results "$RUN_DIR/linux_l1/l1-results.json" --out "$RUN_DIR/event_latency/rust.json" --work-dir "$RUN_DIR/event_latency/work"
 evlat_rc="$LAST_RC"
+# 工具結束碼：PASS 0、FAIL 1、INSUFFICIENT_EVIDENCE 3。證據不足照實記 EVIDENCE_MISSING（exit 0），不得記成 FAIL 或 PASS。
+evlat_exit="$evlat_rc"; [[ "$evlat_rc" == 3 ]] && evlat_exit=0
 run_logged event_latency_python python3 scripts/rust/event_latency_measure.py --daemon "$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
   --label python-diagnostic --samples "${SW_EVLAT_PY_SAMPLES:-50}" --l1-results "$RUN_DIR/linux_l1/l1-results.json" \
   --out "$RUN_DIR/event_latency/python-diagnostic.json" --work-dir "$RUN_DIR/event_latency/work-py" || true
@@ -285,7 +287,7 @@ evlat_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys
   "$RUN_DIR/event_latency/rust.json" 2>/dev/null || echo "rust.json 未產生")"
 rm -rf "$RUN_DIR/event_latency/work" "$RUN_DIR/event_latency/work-py"
 record event_latency --command "python3 scripts/rust/event_latency_measure.py --label rust --l1-results linux_l1/l1-results.json" \
-  --exit "$evlat_rc" --log logs/event_latency.log --section-verdict "$evlat_verdict" --evidence event_latency/rust.json \
+  --exit "$evlat_exit" --log logs/event_latency.log --section-verdict "$evlat_verdict" --evidence event_latency/rust.json \
   --reason "OD-45（L1 結構 gate＋外部量測 stop_request／command_cancel／release_request）：$evlat_reason"
 
 # 9 補：§1.2 WAL 效能（超標記 FAIL 並保留樣本，不得改列觀察值）
