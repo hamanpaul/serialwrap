@@ -713,6 +713,29 @@ fn attach_handoff_pid(error: &mut HandoffError, pid: Option<u32>) {
     }
 }
 
+thread_local! {
+    /// OD-48 D1.2：最近一次 `daemon.handoff_stop` 拒絕回應（`ok:false`）的原文，供 legacy 判定取 `version`。
+    /// 只在同一執行緒、同一 endpoint 的下一次判定讀取；不影響交接本身的錯誤分類。
+    static LAST_REFUSAL: std::cell::RefCell<Option<(String, PyDict)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 取出 `endpoint` 最近一次 `daemon.handoff_stop` 的拒絕回應（取後清除）。
+pub(crate) fn take_last_handoff_refusal(endpoint: &str) -> Option<PyDict> {
+    LAST_REFUSAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(at, _)| at == endpoint) {
+            slot.take().map(|(_, response)| response)
+        } else {
+            None
+        }
+    })
+}
+
+/// legacy 停止（OD-48）對重拉 daemon 重做 D1 時，以同一判準送一次 `daemon.handoff_stop`。
+pub(crate) fn request_handoff_once(ctx: &CliCtx<'_>, endpoint: &str, reason: &str) -> Result<String, HandoffError> {
+    request_handoff(ctx, endpoint, reason)
+}
+
 fn request_handoff(ctx: &CliCtx<'_>, endpoint: &str, reason: &str) -> Result<String, HandoffError> {
     let params = PyValue::Dict(PyDict::from_pairs(vec![(
         "reason".to_string(),
@@ -759,6 +782,7 @@ fn request_handoff(ctx: &CliCtx<'_>, endpoint: &str, reason: &str) -> Result<Str
             })
         }
         Some(PyValue::Bool(false)) => {
+            LAST_REFUSAL.with(|slot| *slot.borrow_mut() = Some((endpoint.to_string(), outcome.resp.clone())));
             let code = outcome
                 .resp
                 .get("error_code")

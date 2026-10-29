@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use crate::fs_ops::FsOps;
 use crate::service_ctl::{
-    cmd_record, error_summary, is_not_found, needs_sudo_systemd, no_systemd, parse_key_values,
-    service_error, service_result, AutostartHoldKind, AutostartHoldRecord, CmdRecord, HoldState,
-    ServiceAction, ServiceCtl, ServiceResult, SupervisionMode, SupervisorDefinition, TaskQuery,
+    cmd_record, error_summary, is_not_found, needs_sudo_systemd, no_systemd, parse_is_enabled,
+    parse_key_values, parse_main_pid, service_error, service_result, AutostartHoldKind, AutostartHoldRecord, CmdRecord, HoldState,
+    EnabledQuery, ServiceAction, ServiceCtl, ServiceResult, SupervisionMode, SupervisorDefinition,
+    TaskQuery,
 };
 use crate::traits::{Clock, CmdOutput, SysEnv};
 
@@ -700,6 +701,40 @@ impl ServiceCtl for SystemdCtl {
         with_sudo: bool,
     ) -> Result<AutostartHoldRecord, ServiceResult> {
         self.hold_named(mode, name, with_sudo)
+    }
+
+    fn query_enabled(&self, mode: &SupervisionMode) -> EnabledQuery {
+        if !matches!(
+            mode,
+            SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem
+        ) {
+            return EnabledQuery::NotSupported;
+        }
+        // `is-enabled` 對 disabled／static 等狀態回非零，stdout 仍為狀態字；只有無法執行才算查詢失敗。
+        let argv = Self::systemctl_argv(mode, false, &strings(["is-enabled", "serialwrap"]));
+        match self.env.run(&argv, Some(Duration::from_secs(5))) {
+            Ok(output) => EnabledQuery::Known(parse_is_enabled(&output.stdout)),
+            Err(error) => EnabledQuery::Failed(error_summary(&error)),
+        }
+    }
+
+    fn main_pid(&self, mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        if !matches!(
+            mode,
+            SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem
+        ) {
+            return Ok(None);
+        }
+        let argv = Self::systemctl_argv(
+            mode,
+            false,
+            &strings(["show", "serialwrap", "-p", "MainPID", "--value"]),
+        );
+        match self.env.run(&argv, Some(Duration::from_secs(5))) {
+            Ok(output) if output.rc == 0 => Ok(parse_main_pid(&output.stdout)),
+            Ok(output) => Err(format!("rc={} stderr={}", output.rc, output.stderr.trim())),
+            Err(error) => Err(error_summary(&error)),
+        }
     }
 }
 
