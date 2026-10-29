@@ -30,10 +30,13 @@ mkdir -p "$(dirname "$OUT")"
 cd "$ROOT"
 TESTS=(tests/contract_blackbox/test_p7_*.py)
 
+# 必要節點清單（含參數化）：同一 commit 的 collect-only。
+python3 -m pytest -q -p no:cacheprovider --collect-only "${TESTS[@]}" >"$RUN_DIR/collected.txt" 2>&1 || true
 # A：Python 基線
 set +e
 env -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_CLI_EXE -u SERIALWRAP_AB_LABEL SW_AB_PIDLOG="$RUN_DIR/a.pids" \
   python3 -m pytest -q -p no:cacheprovider "${TESTS[@]}" --junitxml="$RUN_DIR/a.xml" >"$RUN_DIR/a.log" 2>&1
+RC_A=$?
 set -e
 # A 的 daemon 必須全數結束（PTY 釋放）後才開始 B。
 if [[ -f "$RUN_DIR/a.pids" ]]; then
@@ -53,6 +56,8 @@ fi
 set +e
 SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_CLI_EXE="$RUST_CLI" SERIALWRAP_AB_LABEL=rust-p7 \
   python3 -m pytest -q -p no:cacheprovider "${TESTS[@]}" --junitxml="$RUN_DIR/b.xml" >"$RUN_DIR/b.log" 2>&1
+RC_B=$?
 set -e
 exec python3 scripts/rust/p7_ab_report.py --run-id "$RUN_ID" --junit-a "$RUN_DIR/a.xml" --junit-b "$RUN_DIR/b.xml" \
+  --collected "$RUN_DIR/collected.txt" --rc-a "$RC_A" --rc-b "$RC_B" \
   --rust-cli "$RUST_CLI" --rust-daemon "$RUST_D" --out "$OUT"

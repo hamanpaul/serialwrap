@@ -186,15 +186,27 @@ def test_no_auto_resend_after_partial_or_timeout(p7, tmp_path):
             rig.stop()
 
 
-def _junit(path, cases, drop=()):
+def _nodeids(cases):
+    """合成的 collect-only 清單：每案一個節點；platform_matrix 另含三個參數節點（審查 P7-c5f0fc9-5）。"""
+    out = []
+    for c in cases:
+        if c["source_ref"].endswith("::test_platform_matrix"):
+            out += [f"{c['source_ref']}[{p}]" for p in ("shell", "prpl", "bcm")]
+        else:
+            out.append(c["source_ref"])
+    return out
+
+
+def _junit(path, nodeids, drop=(), fail=()):
     import xml.sax.saxutils as su
     rows = []
-    for c in cases:
-        file, func = c["source_ref"].split("::", 1)
-        if c["case_id"] in drop:
+    for nid in nodeids:
+        if nid in drop:
             continue
+        file, name = nid.split("::", 1)
         cls = file[:-3].replace("/", ".")
-        rows.append(f'<testcase classname="{su.escape(cls)}" name="{su.escape(func)}" time="0.1"/>')
+        body = '<failure message="boom"/>' if nid in fail else ""
+        rows.append(f'<testcase classname="{su.escape(cls)}" name="{su.escape(name)}" time="0.1">{body}</testcase>')
     path.write_text('<?xml version="1.0"?><testsuites><testsuite name="pytest">' + "".join(rows)
                     + "</testsuite></testsuites>", encoding="utf-8")
 
@@ -211,13 +223,18 @@ def test_evidence_insufficient_is_not_pass(tmp_path):
     cases = [c for c in yaml.safe_load((root / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))["cases"]
              if c.get("suite") == "contract-blackbox" and str(c.get("source_ref", "")).startswith("tests/contract_blackbox/test_p7_")]
     assert len(cases) >= 30, len(cases)
+    nodes = _nodeids(cases)
+    extra = "tests/contract_blackbox/test_p7_invariants.py::test_unmapped_extra_case"
+    collected = tmp_path / "collected.txt"
+    collected.write_text("\n".join(nodes + [extra]) + "\n", encoding="utf-8")
     full = tmp_path / "full.xml"
-    _junit(full, cases)
+    _junit(full, nodes + [extra])
 
-    def run(a, b):
+    def run(a, b, rc_b="0"):
         out = tmp_path / "ab.md"
         r = subprocess.run([sys.executable, str(script), "--run-id", "t", "--junit-a", str(a), "--junit-b", str(b),
-                            "--out", str(out)], capture_output=True, text=True)
+                            "--collected", str(collected), "--rc-a", "0", "--rc-b", rc_b, "--out", str(out)],
+                           capture_output=True, text=True)
         return r.returncode, out.read_text(encoding="utf-8")
 
     rc, md = run(full, full)
@@ -226,6 +243,17 @@ def test_evidence_insufficient_is_not_pass(tmp_path):
     assert rc == 3 and "| INCOMPLETE |" in md and "結論：INCOMPLETE" in md, md
     one = cases[0]["case_id"]
     partial = tmp_path / "partial.xml"
-    _junit(partial, cases, drop={one})
+    _junit(partial, nodes + [extra], drop={cases[0]["source_ref"]})
     rc, md = run(full, partial)                                          # B 缺一案
     assert rc == 3 and f"| {one} | PASS | INCOMPLETE |" in md, md
+    param = tmp_path / "param.xml"                                       # 參數化案例缺參數節點
+    pm = next(c for c in cases if c["source_ref"].endswith("::test_platform_matrix"))
+    _junit(param, nodes + [extra], drop={pm["source_ref"] + "[prpl]"})
+    rc, md = run(full, param)
+    assert rc == 3 and f"| {pm['case_id']} | PASS | INCOMPLETE |" in md, md
+    bad = tmp_path / "unmapped-fail.xml"                                 # 未映射節點失敗必須阻擋（審查 P7-c5f0fc9-4）
+    _junit(bad, nodes + [extra], fail={extra})
+    rc, md = run(full, bad, rc_b="1")
+    assert rc == 1 and "結論：FAIL" in md and "test_unmapped_extra_case" in md, md
+    rc, md = run(full, full, rc_b="1")                                   # pytest 結束碼非 0 但 junit 全綠 → 不得 PASS
+    assert rc == 3 and "結論：INCOMPLETE" in md, md

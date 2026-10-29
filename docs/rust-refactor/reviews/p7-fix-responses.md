@@ -298,3 +298,14 @@ BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-
 
 案例設計補記：`release-during-login` 於 Python 基線 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError` 且
 不再自動重試，Rust 回 READY——A/B 外部可觀察差異，列 OWNER-BATCH（是否須 1:1 重現）；案例只斷言 §11.3-4 的 handle 時序。
+
+### p7-cloud/9065f14_c5f0fc9（Codex sol，incr；第 11 輪結束前處理）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-c5f0fc9-1 | High | `required_set` 完全採信輸入，可以較小集合替代 | **fixed**：列名 → `p7_gate:<slug>` 固定對應，不符即 INCOMPLETE；lock selector 交 judge 核對。回歸 `test_substitute_smaller_required_set_is_rejected`（修前 PASS 2 筆、紅） |
+| P7-c5f0fc9-2 | High | 非測試列 `evidence=[]`、證據缺 sha256、擁有者證據缺 hash 仍 PASS | **fixed**：非測試列與擁有者項目至少一項證據且每項皆須有效 64 hex sha256 並相符；測試列附帶證據同樣須有 hash。回歸 `test_non_test_row_without_evidence_or_hash_is_not_pass`（修前紅） |
+| P7-c5f0fc9-3 | Medium | `verify` 未核對目前 HEAD 與 artifact | **fixed**：`verify` 比對 `git rev-parse HEAD` 並重算每個 artifact sha256（缺檔／不符皆回報）。回歸 `test_verify_checks_head_and_artifacts`；`test_verify_detects_tampering` 的 fixture 改用目前 HEAD（斷言不變） |
+| P7-c5f0fc9-4 | High | 未映射測試（如 `test_rejected_requests_zero_tx_credentials_unresolved`）的 FAIL 被忽略、shell 丟棄 pytest 結束碼 | **fixed**：整份 junit 的 failure／error 一律 FAIL（列出節點）；`run_p7_ab.sh` 傳 `--rc-a/--rc-b`，缺或非 0／1、或 rc=1 卻無失敗節點 → INCOMPLETE。回歸擴充 `test_p7_invariants.py::test_evidence_insufficient_is_not_pass`（修前紅） |
+| P7-c5f0fc9-5 | High | 參數化案例只要求現存列通過（缺 `[prpl]`／`[bcm]` 仍 PASS） | **fixed**：必要節點改以同 commit 的 `pytest --collect-only -q`（完整 nodeid 含參數）為準，逐節點恰一次；缺漏／重複 → INCOMPLETE。回歸同上（缺 `test_platform_matrix[prpl]` → INCOMPLETE）。以新規則重判 r11-261029 實跑 junit，結果與已入庫紀錄相同 |
+| P7-c5f0fc9-6 | Medium | 預設輸出目錄不存在 | 已於 29aaa7b 修正（建立 OUT 父目錄；`docs/rust-refactor/evidence/` 已建立） |

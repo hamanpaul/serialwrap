@@ -3,11 +3,15 @@
 
 輸入兩輪 pytest junit（A＝Python 基線、B＝Rust CLI＋daemon），依 `tests/acceptance/cases.yaml` 中 suite 為
 `contract-blackbox`、`source_ref` 指向 `tests/contract_blackbox/test_p7_*.py` 的案例逐列判定：
-- PASS：該 test function 的所有 testcase（含 parametrize）皆通過。
+- 必要節點＝`--collected`（同一 commit 的 `pytest --collect-only -q`）中屬於該案例的完整 nodeid（含 `[參數]`）；每個
+  節點須在 junit 恰出現一次，缺漏或重複 → INCOMPLETE（審查 P7-c5f0fc9-5）。
+- PASS：所有必要節點皆通過。
 - FAIL：任一 failure／error。
 - SKIP＋原因：全數 skip，且僅限 cases.yaml 已登記的平台限定——A 輪 skip 只在案例的 behavior_changes 含
   `scope: rust_only` 的 SC（如 SC-30）或原因為 `baseline_variant_re2` 時接受；B 輪 skip 一律不接受。
 - INCOMPLETE：junit 缺檔／不可解析，或該案例無任何 testcase（證據不足不得 PASS，§11.3-6）。
+- 整份 junit 的任何 failure／error（含未映射到案例的節點）→ FAIL；pytest 結束碼（`--rc-a`／`--rc-b`）缺或非 0／1、
+  或為 1 卻無失敗節點 → INCOMPLETE（審查 P7-c5f0fc9-4）。
 結束碼：全列 A∈{PASS,可接受 SKIP} 且 B＝PASS → 0；有 FAIL → 1；否則（含 INCOMPLETE）→ 3；參數錯誤 → 2。
 只用 stdlib＋PyYAML；不 import sw_core。
 """
@@ -67,37 +71,57 @@ def rust_only_sc(bc_yaml: Path) -> set[str]:
     return {c["id"] for c in data["changes"] if c.get("scope") == "rust_only"}
 
 
-def parse_junit(path: Path | None) -> dict[tuple[str, str], list[tuple[str, str]]] | None:
-    """回傳 {(file, function): [(outcome, message)]}；缺檔或不可解析 → None。"""
+def parse_junit(path: Path | None) -> dict[str, list[tuple[str, str]]] | None:
+    """回傳 {完整 nodeid（含 `[參數]`）: [(outcome, message)]}；缺檔或不可解析 → None。"""
     if path is None:
         return None
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError):
         return None
-    out: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    out: dict[str, list[tuple[str, str]]] = {}
     for tc in root.iter("testcase"):
-        cls = tc.get("classname") or ""
-        name = tc.get("name") or ""
-        file = cls.replace(".", "/") + ".py"
-        func = name.split("[", 1)[0]
+        nodeid = (tc.get("classname") or "").replace(".", "/") + ".py::" + (tc.get("name") or "")
         outcome, msg = "passed", ""
         for child in tc:
             if child.tag in ("failure", "error"):
                 outcome, msg = "failed", child.get("message") or ""
             elif child.tag == "skipped":
                 outcome, msg = "skipped", child.get("message") or ""
-        out.setdefault((file, func), []).append((outcome, msg))
+        out.setdefault(nodeid, []).append((outcome, msg))
     return out
 
 
-def judge_side(results, case: dict, side: str, rust_only: set[str]) -> tuple[str, str]:
+def load_collected(path: Path | None) -> list[str] | None:
+    """`pytest --collect-only -q` 的 nodeid 清單（必要節點的凍結來源，含參數化）；缺檔 → None。"""
+    if path is None:
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    return [ln.strip() for ln in lines if "::" in ln and not ln.startswith(" ")]
+
+
+def case_nodes(case: dict, collected: list[str]) -> list[str]:
+    ref = case["source_ref"]
+    return [n for n in collected if n == ref or n.startswith(ref + "[")]
+
+
+def judge_side(results, case: dict, side: str, rust_only: set[str], collected: list[str] | None) -> tuple[str, str]:
     if results is None:
         return "INCOMPLETE", "junit 缺檔或不可解析"
-    file, func = case["source_ref"].split("::", 1)
-    rows = results.get((file, func))
-    if not rows:
-        return "INCOMPLETE", "無 testcase"
+    if collected is None:
+        return "INCOMPLETE", "缺 collect-only 清單（必要節點無法核對）"
+    nodes = case_nodes(case, collected)
+    if not nodes:
+        return "INCOMPLETE", "無 testcase（collect-only 未收集到）"
+    rows: list[tuple[str, str]] = []
+    for n in nodes:
+        got = results.get(n) or []
+        if len(got) != 1:
+            return "INCOMPLETE", f"{'缺' if not got else '重複'}節點：{n.split('::', 1)[1]}"
+        rows.extend(got)
     if any(o == "failed" for o, _ in rows):
         return "FAIL", next(m for o, m in rows if o == "failed")[:200]
     if all(o == "passed" for o, _ in rows):
@@ -115,6 +139,7 @@ def build(args) -> tuple[str, int]:
     cases = load_cases(args.cases)
     rust_only = rust_only_sc(args.behavior_changes)
     ja, jb = parse_junit(args.junit_a), parse_junit(args.junit_b)
+    collected = load_collected(args.collected)
     lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
     s23 = lock["sets"]["slice_2.3"]
     head = [
@@ -139,12 +164,24 @@ def build(args) -> tuple[str, int]:
     rc = 0
     any_fail = any_incomplete = False
     for c in cases:
-        a, ad = judge_side(ja, c, "A", rust_only)
-        b, bd = judge_side(jb, c, "B", rust_only)
+        a, ad = judge_side(ja, c, "A", rust_only, collected)
+        b, bd = judge_side(jb, c, "B", rust_only, collected)
         any_fail |= "FAIL" in (a, b)
         any_incomplete |= "INCOMPLETE" in (a, b) or b == "SKIP"
         note = "；".join(x for x in (f"A：{ad}" if a != "PASS" else "", f"B：{bd}" if b != "PASS" else "") if x)
         head.append(f"| {c['case_id']} | {a} | {b} | {note.replace('|', '/')} |")
+    # 整份 junit 的 failure／error 一律阻擋（含未映射到案例的節點，審查 P7-c5f0fc9-4）；pytest 結束碼非 0 不得 PASS。
+    for side, res, prc in (("A", ja, args.rc_a), ("B", jb, args.rc_b)):
+        failed = sorted(n for n, rows in (res or {}).items() if any(o == "failed" for o, _ in rows))
+        if failed:
+            any_fail = True
+            head.append(f"| （{side} 輪失敗節點） | FAIL | | {', '.join(x.split('::', 1)[1] for x in failed)[:500]} |")
+        if prc is None or prc not in (0, 1):
+            any_incomplete = True
+            head.append(f"| （{side} 輪 pytest 結束碼） | INCOMPLETE | | rc={prc} |")
+        elif prc == 1 and not failed:
+            any_incomplete = True
+            head.append(f"| （{side} 輪 pytest 結束碼） | INCOMPLETE | | rc=1 但 junit 無失敗節點 |")
     rc = 1 if any_fail else (3 if any_incomplete else 0)
     head += ["", f"結論：{ {0: 'PASS', 1: 'FAIL', 3: 'INCOMPLETE'}[rc] }", ""]
     return "\n".join(head), rc
@@ -155,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--junit-a", type=Path)
     ap.add_argument("--junit-b", type=Path)
     ap.add_argument("--run-id", required=True)
+    ap.add_argument("--collected", type=Path, help="pytest --collect-only -q 輸出（必要節點）")
+    ap.add_argument("--rc-a", type=int)
+    ap.add_argument("--rc-b", type=int)
     ap.add_argument("--out", type=Path)
     ap.add_argument("--rust-cli", type=Path)
     ap.add_argument("--rust-daemon", type=Path)

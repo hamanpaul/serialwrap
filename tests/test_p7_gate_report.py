@@ -64,10 +64,13 @@ def test_owner_items_blocked_without_evidence_and_pass_with_verified_evidence(tm
 
 def test_verify_detects_tampering(tmp_path):
     d = _results(tmp_path, [_row("cargo test --workspace")])
+    data = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    data["git_head"] = g.current_head()          # verify 核對目前 HEAD（P7-c5f0fc9-3）
+    (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md = tmp_path / "gate.md"
     md.write_text(g.build_report(d), encoding="utf-8")
     assert g.verify_report(md, d) == []
-    md.write_text(md.read_text(encoding="utf-8").replace("| INCOMPLETE |", "| PASS |").replace("abc", "zzz"), encoding="utf-8")
+    md.write_text(md.read_text(encoding="utf-8").replace("| INCOMPLETE |", "| PASS |").replace(data["git_head"], "zzz"), encoding="utf-8")
     assert g.verify_report(md, d), "竄改後必須驗證失敗"
 
 
@@ -153,7 +156,54 @@ def test_full_required_set_passes(tmp_path):
 def test_non_test_row_evidence_mismatch_is_incomplete(tmp_path):
     ev = tmp_path / "ev.txt"
     ev.write_text("x", encoding="utf-8")
-    row = _row("regen_lock --check", ev=[{"path": str(ev), "sha256": "0" * 64}])
+    row = _row("regen_lock --check", ev=[{"path": str(ev), "sha256": "0" * 64}])  # hash 不符
     assert "| regen_lock --check | INCOMPLETE |" in g.build_report(_results(tmp_path, [row]))
     row = _row("policy_check", rc=1)
     assert "| policy_check | FAIL |" in g.build_report(_results(tmp_path, [row], name="run_pc"))
+
+
+# ---- 審查 9065f14_c5f0fc9（Codex sol）回歸 ----
+def test_substitute_smaller_required_set_is_rejected(tmp_path):
+    """P7-c5f0fc9-1：列名對應的必要集合固定，不得以較小集合替代。"""
+    lock = tmp_path / "l1.lock.json"
+    lock.write_text(json.dumps({"schema_version": 1, "sets": {
+        "p7_gate:cargo-test-workspace": {"linux": {"selector": {"paths": [], "markexpr": ""}, "nodeids": sorted(REQ)}},
+        "p7_gate:py_parity_attach": {"linux": {"selector": {"paths": [], "markexpr": ""}, "nodeids": [REQ[0]]}}}}), encoding="utf-8")
+    row = _l1_row(tmp_path, [(REQ[0], "passed")], sid="p7_gate:py_parity_attach", tag="sub")
+    md = g.build_report(_results(tmp_path, [row]), l1_lock=lock)
+    assert "| cargo test --workspace | INCOMPLETE |" in md, md
+
+
+def test_non_test_row_without_evidence_or_hash_is_not_pass(tmp_path):
+    """P7-c5f0fc9-2：非測試列缺證據、或證據缺有效 sha256 → 不得 PASS；擁有者證據缺 hash → BLOCKED-OWNER。"""
+    md = g.build_report(_results(tmp_path, [_row("func-test ev-01-spawn-handler")]))
+    assert "| func-test ev-01-spawn-handler | INCOMPLETE |" in md
+    ev = tmp_path / "e.txt"
+    ev.write_text("x", encoding="utf-8")
+    md = g.build_report(_results(tmp_path, [_row("policy_check", ev=[{"path": str(ev)}])], name="r2"))
+    assert "| policy_check | INCOMPLETE |" in md
+    md = g.build_report(_results(tmp_path, [], name="r3", owner_evidence={"B-02": [{"path": str(ev)}]}))
+    assert "| B-02 | BLOCKED-OWNER |" in md
+
+
+def test_verify_checks_head_and_artifacts(tmp_path):
+    """P7-c5f0fc9-3：verify 核對目前 HEAD 與 artifact 實際 sha256。"""
+    d = _results(tmp_path, [_row("cargo test --workspace")])
+    data = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    data["git_head"] = g.current_head()
+    art = tmp_path / "bin"
+    art.write_bytes(b"artifact")
+    data["artifacts"] = {str(art): "0" * 64}
+    (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    md = tmp_path / "gate.md"
+    md.write_text(g.build_report(d), encoding="utf-8")
+    assert any("artifact" in p for p in g.verify_report(md, d))
+    import hashlib
+    data["artifacts"] = {str(art): hashlib.sha256(b"artifact").hexdigest()}
+    (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    md.write_text(g.build_report(d), encoding="utf-8")
+    assert g.verify_report(md, d) == []
+    data["git_head"] = "0" * 40
+    (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    md.write_text(g.build_report(d), encoding="utf-8")
+    assert any("HEAD" in p for p in g.verify_report(md, d))

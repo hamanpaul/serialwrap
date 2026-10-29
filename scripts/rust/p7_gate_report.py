@@ -8,8 +8,9 @@
 - 測試列（`TEST_ROWS`）PASS ⇔ rc==0、`required_set` 非 null、`l1_results`（P2 `l1-results.v1`）經 P2
   `tests/acceptance/l1_judge.judge` 判定 PASS（每個凍結 nodeid 恰一列 passed、無重複、無 skip／未執行、exit 0、
   finished）、`test_counts` 與 l1 彙總相符、所有 evidence 檔存在且 sha256 相符；l1_judge FAIL 或任一列 failed → FAIL；
-  INSUFFICIENT／INVALID／缺 l1_results／缺 required_set → INCOMPLETE。
-- 非測試列 PASS ⇔ rc==0 且 evidence 相符；rc!=0 → FAIL；evidence 不符 → INCOMPLETE。
+  INSUFFICIENT／INVALID／缺 l1_results／缺 required_set → INCOMPLETE；`required_set` 必須等於列名對應的
+  `p7_gate:<slug>`（不得以較小集合替代），lock 的 selector 一併交給 judge 核對。
+- 非測試列 PASS ⇔ rc==0 且至少一項 evidence、每項皆有有效 sha256 且相符；rc!=0 → FAIL；evidence 不符 → INCOMPLETE。
 - 能力缺失（`caps_missing`）→ 該列 BLOCKED-OWNER＋B 編號。
 - 擁有者項目 B-01～B-08：只有 `owner_evidence[B-xx]` 的檔案存在且 sha256 相符時 PASS，否則 BLOCKED-OWNER。
 - `REQUIRED_ROWS` 缺列 → INCOMPLETE（未執行）。
@@ -25,6 +26,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -81,6 +84,27 @@ OWNER_ITEMS: Mapping[str, str] = {
 PARITY_SETS: tuple[str, ...] = ("p7_gate:py_parity", "p7_gate:py_parity_recover", "p7_gate:py_parity_attach")
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def slug(name: str) -> str:
+    """列名 → 必要集合 slug（`cargo test --workspace` → `cargo-test-workspace`）。"""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def expected_set(name: str) -> str:
+    """列名對應的必要集合固定為 `p7_gate:<slug>`，不得以其他集合替代（審查 P7-c5f0fc9-1）。"""
+    return f"p7_gate:{slug(name)}"
+
+
+def current_head() -> str | None:
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                              check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def _load_judge():
     spec = importlib.util.spec_from_file_location("p7_l1_judge", ROOT / "tests/acceptance/l1_judge.py")
     assert spec is not None and spec.loader is not None
@@ -101,19 +125,24 @@ def _resolve(base: Path, p: str) -> Path:
     return q if q.is_absolute() else base / q
 
 
-def _evidence_errors(base: Path, evidence: Any) -> list[str]:
+def _evidence_errors(base: Path, evidence: Any, *, required: bool) -> list[str]:
+    """每項證據須有路徑與有效 sha256 且相符；`required` 時不得為空（審查 P7-c5f0fc9-2）。"""
+    items = list(evidence or [])
+    if required and not items:
+        return ["缺必要證據"]
     errs: list[str] = []
-    for item in evidence or []:
-        if isinstance(item, str):
-            item = {"path": item, "sha256": None}
+    for item in items:
         if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
             errs.append(f"evidence 格式錯誤：{item!r}")
             continue
-        path = _resolve(base, item["path"])
-        got = _sha256(path)
+        want = item.get("sha256")
+        if not (isinstance(want, str) and _SHA256_RE.match(want)):
+            errs.append(f"evidence 缺有效 sha256：{item['path']}")
+            continue
+        got = _sha256(_resolve(base, item["path"]))
         if got is None:
             errs.append(f"evidence 缺檔：{item['path']}")
-        elif item.get("sha256") is not None and got != item["sha256"]:
+        elif got != want:
             errs.append(f"evidence sha256 不符：{item['path']}")
     return errs
 
@@ -128,6 +157,8 @@ def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any]
         return "FAIL", f"failed={counts.get('failed')} rc={rc}"
     if not sid:
         return "INCOMPLETE", "缺 required_set"
+    if sid != expected_set(row.get("name", "")):
+        return "INCOMPLETE", f"required_set {sid} 與列名對應的 {expected_set(row.get('name', ''))} 不符"
     if not l1_path:
         return "INCOMPLETE", "缺 l1_results"
     try:
@@ -137,9 +168,10 @@ def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any]
     platform = row.get("platform") or report.get("platform") or "linux"
     try:
         required = judge.required_for(lock or {}, sid, platform)
+        selector = lock["sets"][sid][platform].get("selector")
     except (KeyError, TypeError):
         return "INCOMPLETE", f"鎖中無 {sid}.{platform}"
-    verdict = judge.judge(report, required, platform=platform)
+    verdict = judge.judge(report, required, platform=platform, selector=selector)
     if verdict["verdict"] == "FAIL":
         return "FAIL", "; ".join(verdict.get("reasons") or [f"failed={counts.get('failed')}"])[:300]
     if verdict["verdict"] != "PASS":
@@ -154,7 +186,7 @@ def _test_row_status(base: Path, row: Mapping[str, Any], lock: Mapping[str, Any]
         return "INCOMPLETE", f"test_counts 與 l1 彙總不符：{counts} vs {agg}"
     if rc != 0:
         return "INCOMPLETE", f"rc={rc}"
-    ev = _evidence_errors(base, row.get("evidence"))
+    ev = _evidence_errors(base, row.get("evidence"), required=False)
     if ev:
         return "INCOMPLETE", "; ".join(ev)
     return "PASS", f"{sid} {len(required)} 筆"
@@ -169,7 +201,7 @@ def _row_status(base: Path, row: Mapping[str, Any], caps_missing: set[str], lock
         return _test_row_status(base, row, lock, judge)
     if row.get("rc") != 0:
         return "FAIL", f"rc={row.get('rc')}"
-    ev = _evidence_errors(base, row.get("evidence"))
+    ev = _evidence_errors(base, row.get("evidence"), required=True)
     if ev:
         return "INCOMPLETE", "; ".join(ev)
     return "PASS", ""
@@ -179,7 +211,7 @@ def _owner_status(base: Path, owner_evidence: Mapping[str, Any], bid: str) -> tu
     ev = owner_evidence.get(bid)
     if not ev:
         return "BLOCKED-OWNER", "證據未提供"
-    errs = _evidence_errors(base, ev)
+    errs = _evidence_errors(base, ev, required=True)
     if errs:
         return "BLOCKED-OWNER", "; ".join(errs)
     return "PASS", "擁有者證據已核對"
@@ -254,6 +286,13 @@ def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = No
         problems.append("run_id 不符")
     if f"git_head: `{data.get('git_head')}`" not in text:
         problems.append("git_head 不符")
+    head = current_head()
+    if not data.get("git_head") or data.get("git_head") != head:
+        problems.append(f"results.json git_head {data.get('git_head')} 與目前 HEAD {head} 不符")
+    for path, want in (data.get("artifacts") or {}).items():
+        got = _sha256(_resolve(ROOT, path))
+        if got is None or got != want:
+            problems.append(f"artifact sha256 不符或缺檔：{path}")
     for row in data.get("rows") or []:
         lp, want = row.get("log_path"), row.get("log_sha256")
         if lp and want and _sha256(_resolve(results_dir, lp)) != want:
