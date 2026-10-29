@@ -1231,6 +1231,6 @@ def test_l1_lock_ignored_scan_exempts_only_explicit_capability_selectors() -> No
     ]
     # 現行 L1 鎖：P6 的能力集合實際落在豁免範圍（豁免不是空集合）
     real = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
-    pty = real["sets"]["s22_gate:console_conformance_pty"]["linux"]
-    assert _selector_explicit_caps(pty["selector"]) == ["posix_pty"]
+    cap_spec = real["sets"]["s22_gate:console_conformance_pty"]["linux"]
+    assert _selector_explicit_caps(cap_spec["selector"]) == ["posix_pty"]
     assert not [r for r in _ignored_lock_rows(real, _rust_ignored_tests()) if r.startswith("s22_gate:")]
