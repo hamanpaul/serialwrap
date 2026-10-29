@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 14,
+  "x-catalog-revision": 15,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -4386,7 +4386,13 @@
           "what": "detach（REBOUND）、離開 RELEASED、_binding_overrides[sid]=by_id、_save_state()、spawn attach",
           "when": "on_success",
           "idempotent": false,
-          "x-condition": "OD-63 佔位 session 早退（回 released:true、recommended_action:device_attach）時不執行：佔位不離開 RELEASED，不解除 by_id 阻擋、不寫 _binding_overrides、不取消在途 attach、不開埠"
+          "x-condition": "非 OD-63 佔位 session 時才執行；佔位早退見下一筆"
+        },
+        {
+          "what": "OD-63 佔位早退：佔位不離開 RELEASED，無其他副作用（不 detach、不解除 by_id 阻擋、不寫 _binding_overrides、不 _save_state()、不取消在途 attach、不 spawn attach、不開埠）",
+          "when": "on_success",
+          "idempotent": true,
+          "x-condition": "僅 OD-63 RELEASED 佔位 session（回 released:true、recommended_action:device_attach）"
         }
       ],
       "retryable_readonly": false,

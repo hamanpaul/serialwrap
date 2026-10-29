@@ -116,11 +116,21 @@ def test_bind_result_mirrors_attach_released_branch() -> None:
 
 
 def test_bind_side_effects_note_placeholder_stays_released() -> None:
-    """side_effects 須註明佔位不離開 RELEASED（不解除阻擋、不寫 override、不 spawn）。"""
+    """side_effects 須註明佔位不離開 RELEASED（不解除阻擋、不寫 override、不 spawn）。
+
+    sol 增量審查 S1-109f659-1 確切修法 2：另補一筆帶 x-condition 的佔位早退項；一般路徑
+    那筆的 x-condition 排除佔位。
+    """
     effects = _schema()["x-methods"]["session.bind"]["side_effects"]
     texts = [json.dumps(e, ensure_ascii=False) for e in effects]
     assert any("佔位不離開 RELEASED" in t for t in texts), texts
     assert any("OD-63" in t for t in texts), texts
+    rebind = next(e for e in effects if "離開 RELEASED、" in e["what"])
+    assert "佔位" in rebind.get("x-condition", ""), rebind
+    placeholder = [e for e in effects if e is not rebind and "OD-63" in e.get("x-condition", "")]
+    assert len(placeholder) == 1, effects
+    assert "佔位不離開 RELEASED" in placeholder[0]["what"], placeholder
+    assert placeholder[0]["when"] == "on_success" and placeholder[0]["idempotent"] is True
 
 
 def test_df04_compatibility_impact_covers_bind_and_no_fallback_open_failure() -> None:
