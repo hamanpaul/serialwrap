@@ -208,8 +208,17 @@ else
 fi
 
 # 6. release artifact（identity 與黑箱用）
+# 方法審閱 [High]（2026-10-29）：建置前先移除舊 artifact，建置失敗時不得留下舊 binary 被後續 section 與量測證據
+# 綁到目前 HEAD；Linux／Windows 建置結果分開保存，建置成功當下記錄 daemon sha256（event_latency 量測核對用）。
+rm -f "$RUST_D" "$RUST_CLI"
 run_logged build_linux cargo build --release -p sw-daemon -p sw-cli --target "$LINUX_TARGET"
+BUILD_LINUX_RC="$LAST_RC"
+BUILT_D_SHA=""
+if [[ "$BUILD_LINUX_RC" == 0 && -f "$RUST_D" ]]; then
+  BUILT_D_SHA="$(sha256sum "$RUST_D" | cut -d' ' -f1)"
+fi
 run_logged build_windows cargo build --release -p sw-daemon -p sw-cli --target "$WIN_TARGET"
+BUILD_WINDOWS_RC="$LAST_RC"
 
 pytest_l1() {  # pytest_l1 <section> <log> <env…> -- <pytest 參數…>：帶 SW_RESOURCE_REPORT 與 junit
   local sec="$1" log="$2"; shift 2
@@ -273,9 +282,14 @@ fi
 # OD-45：event_latency = L1 結構 gate（五事件 l1_gate 須在 linux_l1 passed）＋外部量測三項（RPC 送出 → RPC 回應；
 #        idle 與 flood 20000 B/s；Rust 為判定對象，Python 基線以診斷樣本數另記供對照，不計入判定）。
 mkdir -p "$RUN_DIR/event_latency"
+evlat_bind=()
+# 只有本 run 建置成功且 artifact 仍為建置當下的 sha256 時，才明示建置來源（否則量測報告不綁來源 → 證據不足）。
+if [[ -n "$BUILT_D_SHA" ]]; then
+  evlat_bind=(--artifact-source-commit "$(git -C "$ROOT" rev-parse HEAD)" --artifact-build-run-id "$RUN_ID" --artifact-sha256 "$BUILT_D_SHA")
+fi
 run_logged event_latency python3 scripts/rust/event_latency_measure.py --daemon "$RUST_D" --cli "$RUST_CLI" --label rust \
   --l1-results "$RUN_DIR/linux_l1/l1-results.json" --run-id "$RUN_ID" \
-  --artifact-source-commit "$(git -C "$ROOT" rev-parse HEAD)" --artifact-build-run-id "$RUN_ID" --out "$RUN_DIR/event_latency/rust.json" --work-dir "$RUN_DIR/event_latency/work"
+  "${evlat_bind[@]}" --out "$RUN_DIR/event_latency/rust.json" --work-dir "$RUN_DIR/event_latency/work"
 evlat_rc="$LAST_RC"
 # 工具結束碼：PASS 0、FAIL 1、INSUFFICIENT_EVIDENCE 3。證據不足照實記 EVIDENCE_MISSING（exit 0），不得記成 FAIL 或 PASS。
 evlat_exit="$evlat_rc"; [[ "$evlat_rc" == 3 ]] && evlat_exit=0
@@ -337,5 +351,6 @@ if [[ -x "$RUST_D" ]]; then
 fi
 ver_args=()
 [[ -n "$daemon_version" ]] && ver_args=(--daemon-version "$daemon_version")
-assemble --cli-path "$RUST_CLI" --daemon-path "$RUST_D" "${ver_args[@]}" "${cv_args[@]}"
+assemble --cli-path "$RUST_CLI" --daemon-path "$RUST_D" "${ver_args[@]}" "${cv_args[@]}" \
+  --build-linux-exit "$BUILD_LINUX_RC" --build-windows-exit "$BUILD_WINDOWS_RC" --built-daemon-sha256 "$BUILT_D_SHA"
 exit_for_verdict

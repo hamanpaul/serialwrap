@@ -165,6 +165,33 @@ pub struct Mailbox {
     full_backlog_notifier: Option<Sender<()>>,
     #[cfg(feature = "test-fakes")]
     full_backlog_notified: bool,
+    #[cfg(feature = "test-fakes")]
+    witness: Witness,
+}
+
+/// 測試用（方法審閱 [High]，2026-10-29）：逐事件的 data 見證數——事件送入 mailbox 後、被取出前，mailbox 回傳了幾個
+/// data item。control／safety lane 以影子佇列（FIFO 位置 ↔ 累計數）計算，`stopped` 中的 receipt 以平行佇列計算；
+/// 依賴 RX 的暫存事件（stash／pending／deferred）不追蹤（回 `None`）。
+#[cfg(feature = "test-fakes")]
+#[derive(Default)]
+struct Witness {
+    control: VecDeque<u64>,
+    safety: VecDeque<u64>,
+    stopped: VecDeque<u64>,
+    /// 本次 `recv_next` 自 lane 取出之事件的見證數（尚未回傳或移入 `stopped`）。
+    current: Option<u64>,
+    /// 最近一次回傳的 control 項目之見證數（`take_control_witness` 取走）。
+    last: Option<u64>,
+}
+
+#[cfg(feature = "test-fakes")]
+fn bump_first(queue: &mut VecDeque<u64>, len: usize) {
+    while queue.len() < len {
+        queue.push_back(0);
+    }
+    for w in queue.iter_mut().take(len) {
+        *w += 1;
+    }
 }
 
 impl Mailbox {
@@ -191,7 +218,16 @@ impl Mailbox {
             full_backlog_notifier: None,
             #[cfg(feature = "test-fakes")]
             full_backlog_notified: false,
+            #[cfg(feature = "test-fakes")]
+            witness: Witness::default(),
         }
+    }
+
+    /// 測試用（延遲探針）：最近一次 `recv_next` 回傳的 control 項目，在 mailbox 中等待期間被回傳的 data item 數。
+    /// data 項目、actor 內部事件或依賴暫存事件回 `None`。
+    #[cfg(feature = "test-fakes")]
+    pub fn take_control_witness(&mut self) -> Option<u64> {
+        self.witness.last.take()
     }
 
     /// 一般控制與依賴 RX watermark 的完成事件使用此有界 lane。
@@ -213,7 +249,7 @@ impl Mailbox {
     /// 測試用（Task 12b 延遲探針）：safety／control lane 尚有未取出的事件。
     #[cfg(feature = "test-fakes")]
     pub fn control_waiting(&self) -> bool {
-        !self.safety_rx.is_empty() || !self.control_rx.is_empty()
+        !self.safety_rx.is_empty() || !self.control_rx.is_empty() || !self.stopped.is_empty()
     }
 
     /// 測試用（Task 12b 延遲探針）：data lane 目前積壓筆數。
@@ -229,6 +265,48 @@ impl Mailbox {
     /// `deadline` 以 `Mono` 表示；實作以不超過 50 ms 的接收輪詢並每次醒來重讀 clock。
     /// `current_epoch` 用於丟棄舊 epoch 依賴。
     pub fn recv_next(
+        &mut self,
+        processed: (u64, u64),
+        current_epoch: Option<u64>,
+        deadline: Option<Mono>,
+        clock: &dyn Clock,
+    ) -> Option<MailboxItem> {
+        #[cfg(feature = "test-fakes")]
+        {
+            self.witness.current = None;
+            self.witness.last = None;
+        }
+        let item = self.recv_next_inner(processed, current_epoch, deadline, clock);
+        #[cfg(feature = "test-fakes")]
+        match &item {
+            Some(MailboxItem::Data(_)) => {
+                // 此 data item 超越了目前仍在 lane／stopped 中等待的每個事件。
+                bump_first(&mut self.witness.control, self.control_rx.len());
+                bump_first(&mut self.witness.safety, self.safety_rx.len());
+                for w in self.witness.stopped.iter_mut() {
+                    *w += 1;
+                }
+                self.witness.current = None;
+            }
+            Some(MailboxItem::Control(_)) => self.witness.last = self.witness.current.take(),
+            None => self.witness.current = None,
+        }
+        item
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn note_lane_recv(&mut self, safety: bool) {
+        let queue = if safety { &mut self.witness.safety } else { &mut self.witness.control };
+        self.witness.current = Some(queue.pop_front().unwrap_or(0));
+    }
+
+    #[cfg(feature = "test-fakes")]
+    fn note_stopped_push(&mut self) {
+        let w = self.witness.current.take().unwrap_or(0);
+        self.witness.stopped.push_back(w);
+    }
+
+    fn recv_next_inner(
         &mut self,
         processed: (u64, u64),
         current_epoch: Option<u64>,
@@ -300,6 +378,10 @@ impl Mailbox {
                     }
                 }
                 if let Some(receipt) = self.stopped.pop_front() {
+                    #[cfg(feature = "test-fakes")]
+                    {
+                        self.witness.current = self.witness.stopped.pop_front();
+                    }
                     return Some(MailboxItem::Control(ControlEvent::WorkerStopped(receipt)));
                 }
             }
@@ -345,9 +427,15 @@ impl Mailbox {
                         Ok(ControlEvent::WorkerStopped(receipt))
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
+                            #[cfg(feature = "test-fakes")]
+                            { self.note_lane_recv(true); self.note_stopped_push(); }
                             self.stopped.push_back(receipt);
                         }
-                        Ok(ev) => return Some(MailboxItem::Control(ev)),
+                        Ok(ev) => {
+                            #[cfg(feature = "test-fakes")]
+                            self.note_lane_recv(true);
+                            return Some(MailboxItem::Control(ev));
+                        }
                         Err(_) => {
                             self.safety_closed = true;
                             if self.control_closed && self.data_closed { return None; }
@@ -368,9 +456,15 @@ impl Mailbox {
                         Ok(ControlEvent::WorkerStopped(receipt))
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
+                            #[cfg(feature = "test-fakes")]
+                            { self.note_lane_recv(true); self.note_stopped_push(); }
                             self.stopped.push_back(receipt);
                         }
-                        Ok(ev) => return Some(MailboxItem::Control(ev)),
+                        Ok(ev) => {
+                            #[cfg(feature = "test-fakes")]
+                            self.note_lane_recv(true);
+                            return Some(MailboxItem::Control(ev));
+                        }
                         Err(_) => {
                             self.safety_closed = true;
                             if self.control_closed && self.data_closed { return None; }
@@ -380,9 +474,16 @@ impl Mailbox {
                         Ok(ControlEvent::WorkerStopped(receipt))
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
+                            #[cfg(feature = "test-fakes")]
+                            { self.note_lane_recv(false); self.note_stopped_push(); }
                             self.stopped.push_back(receipt);
                         }
                         Ok(ev) if dependency_waits(&ev, processed, current_epoch) => {
+                            #[cfg(feature = "test-fakes")]
+                            {
+                                self.note_lane_recv(false);
+                                self.witness.current = None; // 依賴暫存事件不追蹤
+                            }
                             if self.stash.len() < crate::resources::MAILBOX_STASH_MAX {
                                 self.stash.push_back(ev);
                             } else if self.pending_control.is_none() {
@@ -391,7 +492,11 @@ impl Mailbox {
                                 self.deferred_control.push_back(ev);
                             }
                         }
-                        Ok(ev) => return Some(MailboxItem::Control(ev)),
+                        Ok(ev) => {
+                            #[cfg(feature = "test-fakes")]
+                            self.note_lane_recv(false);
+                            return Some(MailboxItem::Control(ev));
+                        }
                         Err(_) => {
                             self.control_closed = true;
                             if self.data_closed && self.safety_closed {

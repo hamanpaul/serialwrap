@@ -37,10 +37,13 @@ limits:
 #       審閱並附入 reviewed_by／reviewed_at／review_conclusion 後才改 frozen；若需改數值屬擁有者裁決（OWNER-BATCH，附三輪實測）。
 #   不在 daemon 加計時欄位、不改 WAL。
 event_latency:
-  method_revision: "2026-10-29.1"
-  previous_method_revision: "2026-10-15.1"
+  method_revision: "2026-10-29.2"
+  previous_method_revision: "2026-10-29.1"
   owner: codex-gpt-6-luna-max          # PAL／Actor 實作負責人
-  # 獨立審閱紀錄：尚未附入。實作者／測試作者不得自填為審閱者。
+  # 審閱歷程：2026-10-29.1 經 Codex gpt-6.1-sol 獨立審閱（2026-10-29）結論 rejected
+  #   （reviews/p5-cloud/event-latency-method-review-20261029.md：flood 失效未判、drain_receipt 探針漏算、建置失敗舊 binary
+  #   被綁 HEAD、超限被降級、未套 OD-58、作廢規則只看兩端）；P5 第 6 輪修正後改 2026-10-29.2，待編排者重新提交獨立審閱。
+  # 獨立審閱紀錄（approved 時才填下列三欄）：尚未附入。實作者／測試作者不得自填為審閱者。
   reviewed_by: null                    # 獨立審閱者姓名（附入時填）
   reviewed_at: null                    # 審閱日期 YYYY-MM-DD（附入時填）
   review_conclusion: null              # 審閱結論（附入時填，例如 approved）
@@ -50,8 +53,11 @@ event_latency:
   repeats: 3
   samples_per_run: 500
   gate_rule: every_run_max_le_max_ms   # 每輪樣本最大值都 ≤ 上限才通過；p99 只作診斷值，不作判定
-  flood_load: {bytes_per_s: 20000, seconds: 30, chunk_bytes: 256}   # = 規格門檻 20000 B／10 s 的 10 倍；外部量測期間 DUT 全程持續送出
-  host_load: "量測期間記錄 /proc/loadavg 與 CPU 數；loadavg 1min > CPU 數時該輪作廢重跑"
+  flood_load: {bytes_per_s: 20000, seconds: 30, chunk_bytes: 256, stop_warmup_s: 1.0}   # = 規格門檻 20000 B／10 s 的 10 倍；外部量測期間 DUT 全程持續送出
+  # 2026-10-29.2：flood 實際負載須驗證（送出失敗、送出端中途停止、實際速率 < 90%、持續時間不足 → 該輪證據不足）；
+  #   release／cancel 每輪 flood 至少持續 seconds；stop_request 每樣本為新 daemon，送出前 flood 暖機 stop_warmup_s 秒並驗證該段負載。
+  host_load: "量測期間每秒取樣 /proc/loadavg 與 CPU 數（含前後）；峰值 loadavg 1min > CPU 數時該輪作廢重跑；監測資料缺失判證據不足"
+  # 判定：未作廢輪次的有效樣本最大值超過上限即 FAIL，不因同輪錯誤、缺樣或負載無效降級（2026-10-29.2）。
   external_method: {start: "client 連線建立後、寫出 RPC 請求前（time.monotonic_ns）", end: "讀到完整 RPC 回應行（time.monotonic_ns）", tool: "scripts/rust/event_latency_measure.py", includes_connect: false}
   events:
     - {event: stop_request, accept_point: "daemon.stop 回應 stopping:true 寫出", complete_point: "actor 收到 Shutdown 並送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
@@ -66,6 +72,10 @@ event_latency:
     - {event: drain_receipt, accept_point: "finisher 送出 WorkerStopped", complete_point: "actor 處理該 receipt 完成", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
        measure: l1_only,
        l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood", "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood"]}
-    - {event: release_request, accept_point: "device.release RPC 收到", complete_point: "actor 送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+    # OD-58（2026-10-29）：release_request 放寬為 idle 250／flood 300 ms（新口徑含 release 回應前的排空；Python 基線 idle 153～155 ms、
+    #   Rust 負載下離群 157／212 ms）。附帶條件：0.5.0（Slice 2.4 出口／Stage 2 release 前）的 daemon 整合測試必須以同一工具
+    #   （scripts/rust/event_latency_measure.py）重測三輪，屆時依實測重新提交擁有者確認；未重測不得出 0.5.0。
+    - {event: release_request, accept_point: "device.release RPC 收到", complete_point: "actor 送出 BeginDrain", max_ms_idle: 250, max_ms_flood: 300, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+       retest_before: "0.5.0", owner_decision_ref: OD-58,
        measure: external, external_point: "device.release RPC 送出 → 回應（ok:true）讀到；之後 device.attach 回 READY 不計時",
        l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}

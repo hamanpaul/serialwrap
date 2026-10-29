@@ -594,3 +594,44 @@ fn op_finished_waits_for_dependent_rx() {
     }
     assert_eq!(order, ["D1", "D2", "D3", "D4", "D5", "C", "D6"]);
 }
+
+/// 方法審閱 [High]（2026-10-29）：延遲探針須以事件自己的送入／處理界點計數。`WorkerStopped` 因同 epoch 依賴而移入
+/// `stopped` 後，mailbox 仍先取 data；探針不得因 `control_waiting()` 看不到 `stopped` 而少算。D,D,D,L,W 情境下
+/// receipt 送入後 actor 實際處理了 3 個 data item，見證數須為 3（drain_receipt 的 `at_most_one_data_item_before_control`
+/// 與此排空順序衝突，列 OWNER-BATCH）。
+#[cfg(feature = "test-fakes")]
+#[test]
+fn witness_counts_data_overtaking_stopped_receipt() {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender()
+        .send(login_after(1, 9))
+        .expect("control 送出");
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    mb.control_sender()
+        .send(ControlEvent::WorkerStopped(receipt(1, 1)))
+        .expect("receipt 送出");
+    let mut processed = (1u64, 0u64);
+    let mut witnesses: Vec<(&'static str, Option<u64>)> = Vec::new();
+    for _ in 0..5 {
+        let item = mb
+            .recv_next(processed, Some(1), None, &*clock)
+            .expect("項目");
+        let w = mb.take_control_witness();
+        match &item {
+            MailboxItem::Data(DataEvent::UartRxChunk { rx_seq, .. }) => {
+                processed = (1, *rx_seq);
+                witnesses.push(("D", w));
+            }
+            MailboxItem::Control(ControlEvent::LoginFinished { .. }) => witnesses.push(("L", w)),
+            MailboxItem::Control(ControlEvent::WorkerStopped(_)) => witnesses.push(("W", w)),
+            _ => witnesses.push(("?", w)),
+        }
+    }
+    assert_eq!(witnesses.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["D", "D", "D", "L", "W"]);
+    assert_eq!(witnesses[4].1, Some(3), "receipt 等待期間處理了 3 個 data item：{witnesses:?}");
+    assert!(witnesses[..3].iter().all(|(_, w)| w.is_none()), "data item 不帶見證數：{witnesses:?}");
+}

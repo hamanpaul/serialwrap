@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OD-45：event_latency 外部端到端量測（`contracts/resource_limits.yaml` `event_latency`，method_revision 2026-10-29.1）。
+"""OD-45：event_latency 外部端到端量測（`contracts/resource_limits.yaml` `event_latency`，method_revision 見契約）。
 
 只量 `measure: external` 的三個事件（stop_request、command_cancel、release_request）；lease_expiry、drain_receipt
 依 OD-45 只留 L1 結構測試（`l1_gate`），本工具不量。口徑為「RPC 送出 → RPC 回應」：client 先連上 daemon 端點，
@@ -8,10 +8,14 @@
 負載：
 - idle：DUT 不主動送資料。
 - flood：DUT 以 `flood_load`（20000 B/s、每塊 256 bytes）持續送出 RX，涵蓋整輪量測（含觸發前的準備）。
+  實際負載須經驗證（method_revision 2026-10-29.2；方法審閱 rejected 後修正）：送出失敗、送出端中途結束、
+  實際速率低於 `bytes_per_s × FLOOD_MIN_RATE_RATIO`、或持續時間不足（release／cancel 每輪至少 `seconds`；
+  stop 每樣本暖機 `stop_warmup_s`）→ 該輪 `load_problems`，不得當成有效 flood（證據不足）。
 
 每輪（repeat × load × event）`samples_per_run` 筆；每輪樣本最大值 ≤ `max_ms_<load>` 才通過（`gate_rule:
-every_run_max_le_max_ms`，p99 只作診斷）。量測期間 `loadavg 1min > CPU 數` 的輪次作廢並重跑（最多 `--void-retries` 次），
-重跑仍作廢即該輪 INSUFFICIENT_EVIDENCE。
+every_run_max_le_max_ms`，p99 只作診斷）。有效樣本已超限即 FAIL，不因同輪的錯誤、缺樣或負載問題降級（明確作廢的輪次除外）。
+量測期間以 `_HostMonitor` 每秒取樣 loadavg（含前後），峰值 `> CPU 數` 的輪次作廢並重跑（最多 `--void-retries` 次），
+重跑仍作廢即該輪 INSUFFICIENT_EVIDENCE；監測資料缺失（取不到 loadavg 或 CPU 數）同為證據不足。
 
 用法：
   python3 scripts/rust/event_latency_measure.py --daemon <serialwrapd> --label rust --out <report.json>
@@ -39,6 +43,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIMITS = ROOT / "contracts" / "resource_limits.yaml"
 EXTERNAL_EVENTS = ("stop_request", "command_cancel", "release_request")
 SCHEMA = "event_latency_external.v1"
+FLOOD_MIN_RATE_RATIO = 0.9          # 實際平均速率須 ≥ bytes_per_s 的 90%（送出端排程抖動容許值）
 
 
 def load_contract(path: pathlib.Path = LIMITS) -> dict[str, Any]:
@@ -69,6 +74,30 @@ def host_load() -> dict[str, Any]:
     return {"loadavg_1min": load1, "cpu_count": os.cpu_count()}
 
 
+class _HostMonitor:
+    """量測期間每 `interval` 秒取樣一次 host_load（方法審閱 [Medium]：作廢規則不得只看輪次兩端）。"""
+
+    def __init__(self, interval: float = 1.0) -> None:
+        self.interval = interval
+        self.samples: list[dict[str, Any]] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while True:
+            self.samples.append(host_load())
+            if self._stop.wait(self.interval):
+                return
+
+    def __enter__(self) -> "_HostMonitor":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+
 def _sha256_file(path: str) -> str | None:
     import hashlib
 
@@ -83,13 +112,16 @@ def _sha256_file(path: str) -> str | None:
 
 
 def report_identity(daemon: str, *, run_id: str, build_report: str | None = None,
-                    artifact_source_commit: str | None = None, artifact_build_run_id: str | None = None) -> dict[str, Any]:
+                    artifact_source_commit: str | None = None, artifact_build_run_id: str | None = None,
+                    artifact_sha256: str | None = None) -> dict[str, Any]:
     """sol P5-3084388-2：量測證據的受測身分——daemon binary sha256、artifact 建置來源 commit、量測工具所在 commit
     （與工作樹是否乾淨）、本工具與契約檔的 sha256、method_revision、run ID。daemon 只記檔名（policy R-21）。
 
     artifact 建置來源不取工具工作樹 HEAD：以 `build_report`（建置該 artifact 的 gate `report.json`，其
     `identity.daemon_sha256` 須等於受測 binary 的 sha256）取得 `git_revision`；或由建置與量測同一 run 的 gate
-    明示 `artifact_source_commit`／`artifact_build_run_id`。兩者皆無或 sha256 不符時 `artifact_source_commit` 為 None。"""
+    明示 `artifact_source_commit`／`artifact_build_run_id`，此時須一併給出建置成功當下記錄的 `artifact_sha256`，且須等於
+    受測 binary 的 sha256（方法審閱 [High]：建置失敗留下的舊 binary 不得被綁到目前 HEAD）。兩者皆無或 sha256 不符時
+    `artifact_source_commit` 為 None。"""
     import subprocess
 
     def _git(*args: str) -> str:
@@ -112,6 +144,11 @@ def report_identity(daemon: str, *, run_id: str, build_report: str | None = None
         else:
             artifact_source_commit = artifact_build_run_id = None
             mismatch = f"建置紀錄 daemon_sha256={built_sha} 與受測 binary {daemon_sha} 不符或缺 git_revision"
+    elif artifact_source_commit or artifact_build_run_id:
+        if not artifact_sha256 or not daemon_sha or artifact_sha256 != daemon_sha:
+            mismatch = (f"gate 明示的建置來源未附建置成功當下的 artifact sha256，或與受測 binary 不符"
+                        f"（build {artifact_sha256}、受測 {daemon_sha}）")
+            artifact_source_commit = artifact_build_run_id = None
     return {
         "artifact_source_commit": artifact_source_commit,
         "artifact_build_run_id": artifact_build_run_id,
@@ -128,20 +165,35 @@ def report_identity(daemon: str, *, run_id: str, build_report: str | None = None
 
 
 def judge_run(samples: list[float], *, want: int, limit: float | None, load_before: dict, load_after: dict,
-              errors: list[str]) -> dict[str, Any]:
-    """單輪判定（純函式）：樣本數不足／有錯誤／host 過載 → INSUFFICIENT_EVIDENCE；最大值超過上限 → FAIL。"""
+              errors: list[str], load_problems: list[str] | tuple[str, ...] = (),
+              host_samples: list[dict] | None = None) -> dict[str, Any]:
+    """單輪判定（純函式）。
+
+    - 作廢：量測期間（`host_samples`＋前後）loadavg 峰值 > CPU 數 → void，該輪 INSUFFICIENT_EVIDENCE（不判 FAIL）。
+    - 未作廢且上限有效時，有效樣本最大值 > 上限 → FAIL（方法審閱 [Medium]：不因錯誤、缺樣或負載問題降級）。
+    - 其餘：錯誤、樣本數不足、負載無效（`load_problems`）、host 監測資料缺失、上限缺漏 → INSUFFICIENT_EVIDENCE。
+    """
     summary = summarize(samples)
-    cpu = load_after.get("cpu_count") or load_before.get("cpu_count")
-    loads = [x for x in (load_before.get("loadavg_1min"), load_after.get("loadavg_1min")) if isinstance(x, (int, float))]
-    void = isinstance(cpu, int) and bool(loads) and max(loads) > cpu
-    if errors or summary["count"] != want or void or not isinstance(limit, (int, float)):
+    seen = [load_before, *(host_samples or []), load_after]
+    cpus = [x.get("cpu_count") for x in seen if isinstance(x.get("cpu_count"), int)]
+    loads = [x.get("loadavg_1min") for x in seen if isinstance(x.get("loadavg_1min"), (int, float))]
+    cpu = cpus[-1] if cpus else None
+    peak = max(loads) if loads else None
+    monitor_missing = cpu is None or peak is None
+    void = not monitor_missing and peak > cpu
+    has_limit = isinstance(limit, (int, float))
+    if void:
         verdict = "INSUFFICIENT_EVIDENCE"
-    elif summary["max_ms"] <= limit:
-        verdict = "PASS"
-    else:
+    elif has_limit and summary["count"] and summary["max_ms"] > limit:
         verdict = "FAIL"
+    elif errors or summary["count"] != want or load_problems or monitor_missing or not has_limit:
+        verdict = "INSUFFICIENT_EVIDENCE"
+    else:
+        verdict = "PASS"
     return {**summary, "limit_ms": limit, "void": void, "verdict": verdict, "errors": errors[:5],
-            "host_load": {"before": load_before, "after": load_after}}
+            "load_problems": list(load_problems)[:5], "host_monitor_missing": monitor_missing,
+            "host_load": {"before": load_before, "after": load_after, "samples": len(host_samples or []),
+                          "peak_loadavg_1min": peak, "cpu_count": cpu}}
 
 
 def l1_gate_status(contract: dict[str, Any], l1_results: dict[str, Any] | None) -> dict[str, str]:
@@ -233,12 +285,20 @@ class _Rpc:
 
 
 class _Flood:
-    """DUT 端持續送 RX：`bytes_per_s`、每塊 `chunk_bytes`（以時間表補償，維持平均速率）。"""
+    """DUT 端持續送 RX：`bytes_per_s`、每塊 `chunk_bytes`（以時間表補償，維持平均速率）。
+
+    方法審閱 [High]：送出失敗不得被吞掉——逐次計數 `emit_errors`（保留第一筆），並記錄起訖時刻與送出端在結束前
+    是否仍存活；`stats()` 給 `flood_problems()` 驗證實際負載。送出失敗時以排程速率退避，避免空轉。"""
 
     def __init__(self, target: Any, bytes_per_s: int, chunk_bytes: int) -> None:
         self.target, self.rate, self.chunk = target, bytes_per_s, chunk_bytes
         self.stop_evt = threading.Event()
         self.sent = 0
+        self.emit_errors = 0
+        self.first_error: str | None = None
+        self.started_at: float | None = None
+        self.stopped_at: float | None = None
+        self.alive_at_exit: bool | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
@@ -249,21 +309,56 @@ class _Flood:
             try:
                 self.target.emit(body)
                 self.sent += len(body)
-            except (OSError, RuntimeError):
-                pass
+            except (OSError, RuntimeError) as exc:
+                self.emit_errors += 1
+                if self.first_error is None:
+                    self.first_error = f"{type(exc).__name__}: {exc}"
             n += 1
-            due = start + self.sent / self.rate
+            due = start + n * self.chunk / self.rate
             delay = due - time.monotonic()
             if delay > 0:
                 self.stop_evt.wait(delay)
 
+    def elapsed(self) -> float:
+        if self.started_at is None:
+            return 0.0
+        return (self.stopped_at or time.monotonic()) - self.started_at
+
+    def stats(self) -> dict[str, Any]:
+        seconds = self.elapsed()
+        return {"sent": self.sent, "seconds": round(seconds, 3),
+                "rate_bytes_per_s": round(self.sent / seconds, 1) if seconds > 0 else 0.0,
+                "emit_errors": self.emit_errors, "first_error": self.first_error,
+                "thread_alive": bool(self.alive_at_exit if self.alive_at_exit is not None else self.thread.is_alive())}
+
     def __enter__(self) -> "_Flood":
+        self.started_at = time.monotonic()
         self.thread.start()
         return self
 
     def __exit__(self, *exc: Any) -> None:
+        self.alive_at_exit = self.thread.is_alive()
         self.stop_evt.set()
         self.thread.join(timeout=5)
+        self.stopped_at = time.monotonic()
+
+
+def flood_problems(stats: dict[str, Any], *, bytes_per_s: float, min_seconds: float) -> list[str]:
+    """flood 實際負載驗證（純函式；方法審閱 [High]）：送出失敗、送出端中途結束、實際平均速率低於
+    `bytes_per_s × FLOOD_MIN_RATE_RATIO`、持續時間短於 `min_seconds` → 回傳問題（空串列即有效 flood）。"""
+    problems: list[str] = []
+    seconds = float(stats.get("seconds") or 0.0)
+    sent = int(stats.get("sent") or 0)
+    if stats.get("emit_errors"):
+        problems.append(f"flood 送出失敗 {stats['emit_errors']} 次（{stats.get('first_error')}）")
+    if not stats.get("thread_alive"):
+        problems.append("flood 送出端在量測結束前已停止")
+    if seconds + 1e-9 < min_seconds:
+        problems.append(f"flood 持續 {seconds:.3f}s < 要求 {min_seconds}s")
+    rate = sent / seconds if seconds > 0 else 0.0
+    if rate < bytes_per_s * FLOOD_MIN_RATE_RATIO:
+        problems.append(f"flood 實際速率 {rate:.0f} B/s < {bytes_per_s * FLOOD_MIN_RATE_RATIO:.0f} B/s（送出 {sent} bytes）")
+    return problems
 
 
 def _import_harness():
@@ -286,15 +381,20 @@ def _wait_state(rpc: _Rpc, state: str, timeout: float = 30.0) -> None:
     raise TimeoutError(f"COM0 未於 {timeout}s 內進入 {state}（最後 {last}）")
 
 
-def _sample_release(rpc: _Rpc) -> float:
+def _sample_release(rpc: _Rpc) -> tuple[float, str | None]:
+    """回 (release 耗時, 之後重新 attach 的準備錯誤或 None)。release 成功後的重新 attach 不計時；其失敗另記為準備錯誤，
+    不得遺失已取得的 release 耗時（方法審閱 [Medium]）。release 本身非 ok 時拋例外（不是有效樣本）。"""
     ms, r = rpc.timed("device.release", {"selector": "COM0", "source": "agent:lat"})
     if r.get("ok") is not True:
         raise RuntimeError(f"device.release 非 ok：{r}")
-    r = rpc.call("device.attach", {"selector": "COM0"})
-    if r.get("ok") is not True:
-        raise RuntimeError(f"device.attach 非 ok：{r}")
-    _wait_state(rpc, "READY")
-    return ms
+    try:
+        r = rpc.call("device.attach", {"selector": "COM0"})
+        if r.get("ok") is not True:
+            raise RuntimeError(f"device.attach 非 ok：{r}")
+        _wait_state(rpc, "READY")
+    except Exception as exc:  # noqa: BLE001 — 準備錯誤，不吞掉 release 耗時
+        return ms, f"{type(exc).__name__}: {exc}"
+    return ms, None
 
 
 def _sample_cancel(rpc: _Rpc) -> float:
@@ -357,6 +457,12 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
         _wait_state(rpc, "READY")
         return d, rpc
 
+    rate, chunk = int(flood_cfg.get("bytes_per_s") or 0), int(flood_cfg.get("chunk_bytes") or 0)
+    run_seconds = float(flood_cfg.get("seconds") or 0)          # release／cancel：每輪 flood 至少持續秒數
+    warmup = float(flood_cfg.get("stop_warmup_s") or 0)          # stop：每樣本（新 daemon）送出前的 flood 暖機
+    if "flood" in loads and (rate <= 0 or chunk <= 2 or run_seconds <= 0 or warmup <= 0):
+        raise SystemExit("契約 flood_load 缺 bytes_per_s／chunk_bytes／seconds／stop_warmup_s")
+
     for rep in range(1, repeats + 1):
         for load in loads:
             for event in events:
@@ -364,7 +470,11 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
                 for attempt in range(args.void_retries + 1):
                     values: list[float] = []
                     errors: list[str] = []
+                    load_problems: list[str] = []
+                    flood_stats: list[dict[str, Any]] = []
                     before = host_load()
+                    monitor = _HostMonitor()
+                    monitor.__enter__()
                     root = work / f"r{rep}-{load}-{event}-{attempt}"
                     if event == "stop_request":
                         setup_failures: list[str] = []
@@ -385,9 +495,15 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
                                     continue
                                 tgt = d.targets["COM0"]
                                 if load == "flood":
-                                    with _Flood(tgt, int(flood_cfg["bytes_per_s"]), int(flood_cfg["chunk_bytes"])):
-                                        time.sleep(0.05)
+                                    fl = _Flood(tgt, rate, chunk)
+                                    with fl:
+                                        fl.stop_evt.wait(warmup)  # 暖機：daemon 已在持續 RX 下才送 stop
                                         ms, r = rpc.timed("daemon.stop", {})
+                                    st = fl.stats()
+                                    flood_stats.append(st)
+                                    bad = flood_problems(st, bytes_per_s=rate, min_seconds=warmup)
+                                    if bad:
+                                        load_problems.append(f"stop #{n}：{'；'.join(bad)}")
                                 else:
                                     ms, r = rpc.timed("daemon.stop", {})
                                 if r.get("ok") is not True:
@@ -405,33 +521,52 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
                     else:
                         d, rpc = start(root)
                         try:
-                            ctx = (_Flood(d.targets["COM0"], int(flood_cfg["bytes_per_s"]), int(flood_cfg["chunk_bytes"]))
-                                   if load == "flood" else None)
-                            if ctx is not None:
-                                ctx.__enter__()
+                            fl = _Flood(d.targets["COM0"], rate, chunk) if load == "flood" else None
+                            if fl is not None:
+                                fl.__enter__()
                             try:
-                                fn = _sample_release if event == "release_request" else _sample_cancel
                                 for n in range(samples):
                                     try:
-                                        values.append(fn(rpc))
+                                        if event == "release_request":
+                                            ms, post = _sample_release(rpc)
+                                            values.append(ms)
+                                            if post:
+                                                errors.append(f"{event} #{n}（release 已計時）準備失敗：{post}")
+                                        else:
+                                            values.append(_sample_cancel(rpc))
                                     except Exception as exc:  # noqa: BLE001
                                         errors.append(f"{event} #{n}: {type(exc).__name__}: {exc}")
-                                        if len(errors) > 5:
-                                            break
+                                    if len(errors) > 5:
+                                        break
+                                if fl is not None and fl.elapsed() < run_seconds:
+                                    fl.stop_evt.wait(run_seconds - fl.elapsed())   # 每輪 flood 至少持續 seconds
                             finally:
-                                if ctx is not None:
-                                    ctx.__exit__(None, None, None)
+                                if fl is not None:
+                                    fl.__exit__(None, None, None)
+                                    st = fl.stats()
+                                    flood_stats.append(st)
+                                    load_problems.extend(flood_problems(st, bytes_per_s=rate, min_seconds=run_seconds))
                         finally:
                             rpc.close()
                             d.stop()
+                    monitor.__exit__(None, None, None)
                     run = judge_run(values, want=samples, limit=limit, load_before=before, load_after=host_load(),
-                                    errors=errors)
+                                    errors=errors, load_problems=load_problems, host_samples=monitor.samples)
                     run.update({"repeat": rep, "load": load, "event": event, "attempt": attempt})
+                    if flood_stats:
+                        run["flood"] = {
+                            "periods": len(flood_stats),
+                            "sent_bytes": sum(x["sent"] for x in flood_stats),
+                            "seconds": round(sum(x["seconds"] for x in flood_stats), 3),
+                            "min_rate_bytes_per_s": min(x["rate_bytes_per_s"] for x in flood_stats),
+                            "emit_errors": sum(x["emit_errors"] for x in flood_stats),
+                            "invalid_periods": len(load_problems),
+                        }
                     if event == "stop_request":
                         run["setup_failures"] = setup_failures[:5]
                         run["setup_failure_count"] = len(setup_failures)
                     log(f"[{args.label}] r{rep} {load} {event}: {run['verdict']} max={run['max_ms']} p99={run['p99_ms']}"
-                        f" n={run['count']} void={run['void']} err={len(errors)}")
+                        f" n={run['count']} void={run['void']} err={len(errors)} load_problems={len(load_problems)}")
                     if not args.keep_work:
                         shutil.rmtree(root, ignore_errors=True)
                     if run["void"] and attempt < args.void_retries:
@@ -460,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--artifact-build-report", help="建置受測 artifact 的 gate report.json（核對 daemon_sha256 後取 git_revision）")
     ap.add_argument("--artifact-source-commit", help="gate 同一 run 建置 artifact 時的來源 commit")
     ap.add_argument("--artifact-build-run-id", help="gate 同一 run 建置 artifact 時的 run ID")
+    ap.add_argument("--artifact-sha256", help="gate 建置成功當下記錄的受測 daemon sha256（明示來源時必填，須與受測 binary 相符）")
     args = ap.parse_args(argv)
     contract = load_contract()
     report = measure(args, contract, lambda m: print(m, flush=True))
@@ -470,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     report["identity"] = report_identity(
         args.daemon, run_id=args.run_id or time.strftime("evlat-%Y%m%dT%H%M%SZ", time.gmtime()),
         build_report=args.artifact_build_report, artifact_source_commit=args.artifact_source_commit,
-        artifact_build_run_id=args.artifact_build_run_id)
+        artifact_build_run_id=args.artifact_build_run_id, artifact_sha256=args.artifact_sha256)
     report["daemon"] = report["identity"]["daemon"]
     report["verdict"], report["reasons"] = overall_verdict(report)
     out = pathlib.Path(args.out)

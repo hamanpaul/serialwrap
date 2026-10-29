@@ -76,6 +76,17 @@ FREEZE_SYNTH = {"denominator": 3, "required_case_ids": ["c-1", "c-2", "c-3"],
 BREAKER_OK = {"snapshots": [], "today": "2026-10-28", "stage2_estimate_weeks": 0.0}
 
 
+# event_latency 證據（方法審閱 [High]：judge 須讀證據內容並核對 artifact／commit／run／工具／契約身分）。
+EVLAT_REF = {"tool_sha256": _sha("evlat-tool"), "contract_sha256": _sha("contract"), "method_revision": "2026-10-29.2"}
+
+
+def _evlat_evidence(**identity) -> dict:
+    ident = {"artifact_source_commit": "e" * 40, "artifact_build_run_id": "t",       # daemon_sha256 預設跟隨報告 identity
+             "run_id": "t", "source_commit": "e" * 40, "source_tree_dirty": False, **EVLAT_REF}
+    ident.update(identity)
+    return {"schema": "event_latency_external.v1", "verdict": "PASS", "reasons": [], "identity": ident}
+
+
 def _judge_mod():
     """載入判定器腳本（紅燈階段檔案不存在，於此拋 FileNotFoundError）。"""
     spec = importlib.util.spec_from_file_location("slice21_gate_judge", ROOT / "scripts/rust/slice21_gate_judge.py")
@@ -157,6 +168,7 @@ class _Case:
         self.breaker: dict | None = dict(BREAKER_OK)
         self.parity: dict | None = None
         self.pending_decisions: list[dict] = []
+        self.evlat: dict | None = _evlat_evidence()
         for name, (platform, _) in TEST_SECTIONS.items():
             self.l1[name] = self._default_l1(name, platform)
 
@@ -190,14 +202,22 @@ class _Case:
         for name in NON_TEST_SECTIONS:
             sec = _section(name, exit_code=0)
             sec["section_verdict"] = "PASS"   # 非測試類 section 須明確帶判定（審查 b7cd852 #3）
+            if name == "event_latency" and self.evlat is not None:
+                rel = "event_latency/rust.json"
+                (self.base / rel).parent.mkdir(parents=True, exist_ok=True)
+                ev = json.loads(json.dumps(self.evlat))
+                ev.setdefault("identity", {}).setdefault("daemon_sha256", self.identity.get("daemon_sha256"))
+                (self.base / rel).write_text(json.dumps(ev), encoding="utf-8")
+                sec["evidence"] = rel
             sections.append(sec)
         sections.extend(self.extra_sections)
-        return {"schema_version": 1, "run_id": "t", "slice": "2.1", "identity": self.identity, "sections": sections,
-                "pending_decisions": list(self.pending_decisions)}
+        return {"schema_version": 1, "run_id": "t", "git_revision": "e" * 40, "slice": "2.1", "identity": self.identity,
+                "sections": sections, "pending_decisions": list(self.pending_decisions)}
 
     def expect(self) -> dict:
         out = {"lock": _lock(), "base_dir": self.base, "freeze": self.freeze,
-               "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path}
+               "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path,
+               "event_latency_ref": dict(EVLAT_REF)}
         if self.breaker is not None:
             out["breaker"] = self.breaker
         if self.parity is not None:
@@ -495,3 +515,68 @@ def test_l15_ab_excluded_case_requires_covering_pytest_passed(case):
     exp["l15_ab_excluded"][0]["covered_by"] = [{"section": "blackbox_python", "nodeid": nid}]
     out = _judge_mod().judge(case.report(), exp)
     assert _sec(out, "l15_ab")["status"] == "EVIDENCE_MISSING"
+
+
+def test_event_latency_section_requires_readable_evidence(case):
+    """方法審閱 [High]：judge 須讀取 event_latency 證據內容；`evidence: missing.json` 不得判 PASS。"""
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "PASS"
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "event_latency":
+            sec["evidence"] = "missing.json"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+    case.evlat = None
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "EVIDENCE_MISSING"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("daemon_sha256", "0" * 64),          # 量測的不是本 run 的 artifact
+    ("artifact_source_commit", "f" * 40),  # 建置來源不是本 run 的 git_revision（如建置失敗留下舊 binary）
+    ("artifact_source_commit", None),
+    ("artifact_build_run_id", "other-run"),
+    ("run_id", "other-run"),
+    ("tool_sha256", "1" * 64),
+    ("contract_sha256", "2" * 64),
+    ("method_revision", "2026-10-29.1"),
+])
+def test_event_latency_evidence_identity_must_match_run(case, field, value):
+    """方法審閱 [High]：量測 JSON 的 artifact、commit、run、工具與契約身分須與 gate 本 run 一致，否則不得 PASS。"""
+    case.evlat = _evlat_evidence(**{field: value})
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "event_latency")
+    assert sec["status"] == "EVIDENCE_MISSING", (field, sec)
+    assert any(field in r for r in sec["reasons"]), sec["reasons"]
+
+
+def test_event_latency_evidence_verdict_drives_section(case):
+    """證據 verdict FAIL → section FAIL（即使 gate 片段帶 PASS）；INSUFFICIENT_EVIDENCE → EVIDENCE_MISSING。"""
+    case.evlat = {**_evlat_evidence(), "verdict": "FAIL", "reasons": ["外部量測超過上限：1/idle/stop_request"]}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "event_latency")["status"] == "FAIL" and out["verdict"] == "FAIL"
+    case.evlat = {**_evlat_evidence(), "verdict": "INSUFFICIENT_EVIDENCE", "reasons": ["x"]}
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "EVIDENCE_MISSING"
+
+
+def test_release_build_failure_is_fail_and_build_sha_must_match(case):
+    """方法審閱 [High]：Linux release 建置失敗（舊 binary 可能留存）→ FAIL；建置當下 sha256 與報告 artifact 不符 → FAIL。"""
+    case.identity["build"] = {"linux_exit": 0, "windows_exit": 0, "daemon_sha256_at_build": IDENTITY["daemon_sha256"]}
+    assert _judge_mod().judge(case.report(), case.expect())["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    case.identity["build"] = {"linux_exit": 101, "windows_exit": 0, "daemon_sha256_at_build": None}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "FAIL" and any("建置失敗" in r for r in out["verdict_reasons"])
+    case.identity["build"] = {"linux_exit": 0, "windows_exit": 0, "daemon_sha256_at_build": "0" * 64}
+    assert _judge_mod().judge(case.report(), case.expect())["verdict"] == "FAIL"
+
+
+def test_gate_script_removes_stale_artifact_and_binds_build_sha():
+    """方法審閱 [High]：gate 建置前移除舊 artifact；只在建置成功時把來源 commit／run／建置當下 sha256 傳給量測工具。"""
+    text = (ROOT / "scripts" / "rust" / "slice21_gate.sh").read_text(encoding="utf-8")
+    build_at = text.index("run_logged build_linux")
+    assert text.rindex('rm -f "$RUST_D" "$RUST_CLI"', 0, build_at) > 0
+    assert 'BUILD_LINUX_RC="$LAST_RC"' in text and 'BUILD_WINDOWS_RC="$LAST_RC"' in text
+    assert '--artifact-sha256 "$BUILT_D_SHA"' in text
+    evlat = text[text.index("run_logged event_latency "):]
+    assert '"${evlat_bind[@]}"' in evlat.splitlines()[2] or '"${evlat_bind[@]}"' in evlat[:400]
+    assert "--build-linux-exit" in text and "--built-daemon-sha256" in text

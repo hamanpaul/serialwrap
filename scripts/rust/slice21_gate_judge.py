@@ -205,6 +205,67 @@ def _judge_non_test_section(sec: Mapping[str, Any]) -> tuple[str, list[str]]:
     return "PASS", []
 
 
+EVLAT_TOOL_PATH = ROOT / "scripts" / "rust" / "event_latency_measure.py"
+EVLAT_CONTRACT_PATH = ROOT / "contracts" / "resource_limits.yaml"
+
+
+def event_latency_ref() -> dict[str, Any]:
+    """event_latency 證據須對上的工具／契約身分（現行工作樹）：工具與契約 sha256、契約 method_revision。"""
+    ref: dict[str, Any] = {"tool_sha256": None, "contract_sha256": None, "method_revision": None}
+    if EVLAT_TOOL_PATH.is_file():
+        ref["tool_sha256"] = sha256_file(EVLAT_TOOL_PATH)
+    if EVLAT_CONTRACT_PATH.is_file():
+        ref["contract_sha256"] = sha256_file(EVLAT_CONTRACT_PATH)
+        try:
+            ref["method_revision"] = ((_load_yaml(EVLAT_CONTRACT_PATH) or {}).get("event_latency") or {}).get("method_revision")
+        except Exception:  # noqa: BLE001 — 讀不到即 None，核對時判不符
+            pass
+    return ref
+
+
+def judge_event_latency_evidence(sec: Mapping[str, Any], report: Mapping[str, Any],
+                                 expect: Mapping[str, Any]) -> tuple[str | None, list[str]]:
+    """方法審閱 [High]（2026-10-29）：event_latency section 不得只看 gate 片段的 section_verdict——須讀取 `evidence`
+    指向的量測 JSON，以其 verdict 判定，並核對其 identity 與本 run 一致：daemon_sha256＝報告 identity、
+    artifact_source_commit＝報告 git_revision（建置失敗留下的舊 binary 不得綁到目前 HEAD）、artifact_build_run_id 與
+    run_id＝報告 run_id、tool_sha256／contract_sha256／method_revision＝現行工具與契約。
+
+    回傳 (覆寫狀態或 None, 原因)：證據 FAIL → "FAIL"；缺檔、無法讀取、身分不符、verdict 非 PASS → "EVIDENCE_MISSING"；
+    全部相符且 PASS → None（沿用片段判定）。"""
+    rel = sec.get("evidence")
+    if not rel:
+        return "EVIDENCE_MISSING", ["event_latency 未附量測證據（evidence 為 null）"]
+    path = pathlib.Path(str(rel))
+    if not path.is_absolute():
+        path = pathlib.Path(expect.get("base_dir") or ".") / path
+    try:
+        ev = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "EVIDENCE_MISSING", [f"event_latency 量測證據無法讀取：{rel}（{exc}）"]
+    if not isinstance(ev, Mapping):
+        return "EVIDENCE_MISSING", [f"event_latency 量測證據格式錯誤：{rel}"]
+    verdict = ev.get("verdict")
+    if verdict == "FAIL":
+        return "FAIL", [f"event_latency 量測證據 FAIL：{'；'.join(map(str, ev.get('reasons') or [])) or '—'}"]
+    ident = ev.get("identity") if isinstance(ev.get("identity"), Mapping) else {}
+    rep_ident = report.get("identity") if isinstance(report.get("identity"), Mapping) else {}
+    ref = expect.get("event_latency_ref") or event_latency_ref()
+    want = {
+        "daemon_sha256": rep_ident.get("daemon_sha256"),
+        "artifact_source_commit": report.get("git_revision"),
+        "artifact_build_run_id": report.get("run_id"),
+        "run_id": report.get("run_id"),
+        "tool_sha256": ref.get("tool_sha256"),
+        "contract_sha256": ref.get("contract_sha256"),
+        "method_revision": ref.get("method_revision"),
+    }
+    reasons = [f"event_latency 證據 identity.{k}={ident.get(k)!r} 與本 run 不符（應為 {v!r}）"
+               for k, v in want.items() if not v or ident.get(k) != v]
+    if verdict != "PASS":
+        reasons.append(f"event_latency 量測證據 verdict={verdict!r}：{'；'.join(map(str, ev.get('reasons') or [])) or '—'}")
+    return ("EVIDENCE_MISSING", reasons) if reasons else (None, [])
+
+
 # --------------------------------------------------------------------------- identity／承接率／parity
 
 def identity_problems(identity: Any, daemon_path: Any) -> tuple[list[str], list[str]]:
@@ -226,6 +287,16 @@ def identity_problems(identity: Any, daemon_path: Any) -> tuple[list[str], list[
         val = identity.get(key)
         if val not in (None, "") and not (isinstance(val, str) and _SHA256_RE.match(val)):
             mismatch.append(f"identity.{key} 不是 64 位小寫 hex")
+    build = identity.get("build")
+    if isinstance(build, Mapping):
+        # 方法審閱 [High]：Linux release 建置失敗即 FAIL（受測 artifact 不是本 run 的產物）；建置當下 sha256 須等於報告 artifact。
+        if build.get("linux_exit") not in (0, None):
+            mismatch.append(f"Linux release 建置失敗（exit {build.get('linux_exit')}），受測 artifact 不是本 run 產物")
+        at_build = build.get("daemon_sha256_at_build")
+        if at_build and identity.get("daemon_sha256") and at_build != identity.get("daemon_sha256"):
+            mismatch.append("identity.daemon_sha256 與建置當下記錄的 sha256 不符")
+        elif build.get("linux_exit") == 0 and not at_build:
+            missing.append("identity.build.daemon_sha256_at_build")
     if daemon_path:
         p = pathlib.Path(daemon_path)
         if not p.is_file():
@@ -400,6 +471,10 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         elif name in NON_TEST_SECTIONS:
             status, reasons = _judge_non_test_section(sec)
             l1v = {}
+            if name == "event_latency" and status != "FAIL":
+                ev_status, ev_reasons = judge_event_latency_evidence(sec, report, expect)
+                if ev_status is not None:
+                    status, reasons = ev_status, list(reasons) + ev_reasons
         else:
             status, l1v, reasons = "EVIDENCE_MISSING", {}, [f"未知 section：{name}"]
         sec["status"] = status
@@ -544,6 +619,11 @@ def build_identity(args: argparse.Namespace) -> dict[str, Any]:
         ident["daemon_artifact_id"] = f"{pathlib.Path(args.daemon_path).name}@{ident['daemon_sha256'][:12]}"
     if args.daemon_version:
         ident["daemon_version"] = args.daemon_version
+    # 方法審閱 [High]：release 建置結果（Linux／Windows 分開）與建置成功當下的 daemon sha256。
+    build = {"linux_exit": getattr(args, "build_linux_exit", None), "windows_exit": getattr(args, "build_windows_exit", None),
+             "daemon_sha256_at_build": getattr(args, "built_daemon_sha256", None) or None}
+    if any(v is not None for v in build.values()):
+        ident["build"] = build
     contracts = _git("rev-parse", "HEAD:contracts")
     if contracts:
         ident["contracts_revision"] = contracts.strip()
@@ -702,6 +782,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     a.add_argument("--daemon-version", default=None)
     a.add_argument("--case-verdicts", default=None)
     a.add_argument("--preflight", default=None)
+    a.add_argument("--build-linux-exit", type=int, default=None)
+    a.add_argument("--build-windows-exit", type=int, default=None)
+    a.add_argument("--built-daemon-sha256", default=None)
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
