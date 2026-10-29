@@ -332,3 +332,47 @@ def test_overlapping_sections_same_nodeid_once_each_is_pass(tmp_path: Path) -> N
         "linux", "cargo", PTY_ARGV, [_row(PTY_CAP), _row(shared, "failed")], exit_code=101)
     rc, out = _run(tmp_path / "c", reports, lock=lock, emap=emap)
     assert _case(out, "f5-second-console-linebuffer")["status"] == "FAIL", out
+
+
+def test_duplicate_within_one_report_not_masked_by_other_report_pass(tmp_path: Path) -> None:
+    """OD-54（sol P6-c6ddda1-1）：跨集合皆 passed、無 failed → PASS（cd80448 追認），但同一份報告（集合×平台）內部
+    重複仍判 INSUFFICIENT，不得被另一份報告的單列 passed 遮蔽；逐案與 parity_rows 皆同。"""
+    shared = "cargo:sw-pal::console_conformance::tcp_accept_sets_nodelay_and_label_shape"
+    emap = _emap()
+    emap["cases"]["f5-second-console-linebuffer"]["tests"] = [
+        RAW_OWNER, "crates/sw-pal/tests/console_conformance.rs::tcp_accept_sets_nodelay_and_label_shape"]
+    lock = _lock()
+    lock["sets"]["s22_gate:cargo_workspace"]["linux"]["nodeids"] = sorted([PARTIAL, shared])
+    reports = _good_reports()
+    # cargo_workspace 內部重複兩列 passed、console_conformance_pty 單列 passed
+    reports[("cargo_workspace", "linux")] = _report("linux", "cargo", CARGO_ARGV, [_row(PARTIAL), _row(shared), _row(shared)])
+    reports[("console_conformance_pty", "linux")] = _report("linux", "cargo", PTY_ARGV, [_row(PTY_CAP), _row(shared)])
+    rc, out = _run(tmp_path / "a", reports, lock=lock, emap=emap)
+    case = _case(out, "f5-second-console-linebuffer")
+    assert case["status"] == "INSUFFICIENT", case
+    assert "crates/sw-pal/tests/console_conformance.rs::tcp_accept_sets_nodelay_and_label_shape" in case["missing_tests"]
+    # 反向：重複出現在 console_conformance_pty、cargo_workspace 單列 passed
+    reports[("cargo_workspace", "linux")] = _report("linux", "cargo", CARGO_ARGV, [_row(PARTIAL), _row(shared)])
+    reports[("console_conformance_pty", "linux")] = _report("linux", "cargo", PTY_ARGV, [_row(PTY_CAP), _row(shared), _row(shared)])
+    rc, out = _run(tmp_path / "b", reports, lock=lock, emap=emap)
+    assert _case(out, "f5-second-console-linebuffer")["status"] == "INSUFFICIENT", out
+    # failed 仍優先於重複
+    reports[("console_conformance_pty", "linux")] = _report(
+        "linux", "cargo", PTY_ARGV, [_row(PTY_CAP), _row(shared), _row(shared, "failed")], exit_code=101)
+    rc, out = _run(tmp_path / "c", reports, lock=lock, emap=emap)
+    assert _case(out, "f5-second-console-linebuffer")["status"] == "FAIL", out
+
+
+def test_judge_tests_duplicate_in_one_report_is_insufficient_unit() -> None:
+    """OD-54 判定器單元：`judge_tests` 直接以 rows 判定（不經檔案），確認同報告重複不被他報告 passed 遮蔽。"""
+    spec = importlib.util.spec_from_file_location("s22_gate_check", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    nid = "cargo:sw-core::m::t"
+    ref = "crates/sw-core/tests/m.rs::t"
+    dup = [{"nodeid": nid, "outcome": "passed", "_platform": "linux", "_section": "s22_gate:a"},
+           {"nodeid": nid, "outcome": "passed", "_platform": "linux", "_section": "s22_gate:a"},
+           {"nodeid": nid, "outcome": "passed", "_platform": "linux", "_section": "s22_gate:b"}]
+    assert mod.judge_tests([ref], {nid: dup}, None)[0] == "INSUFFICIENT"
+    assert mod.judge_tests([ref], {nid: dup[1:]}, None)[0] == "PASS"
+    assert mod.judge_tests([ref], {nid: dup[:1]}, None)[0] == "PASS"
