@@ -10980,6 +10980,9 @@
     "s22_gate:blackbox_rust": {
       "linux": {
         "nodeids": [
+          "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reader_hold_does_not_block_records",
+          "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reset_archives_and_next_command_recorded",
+          "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta",
           "tests/contract_blackbox/slice22/test_console_bc02.py::test_banner_during_suspend_drops_deferred",
           "tests/contract_blackbox/slice22/test_console_bc02.py::test_input_during_recovery_not_replayed",
           "tests/contract_blackbox/slice22/test_console_bc02.py::test_normal_suspend_loses_no_keystroke",
@@ -11389,6 +11392,9 @@
           "cargo:sw-core::telnet_filter::wont_gets_no_reply",
           "cargo:sw-core::telnet_filter::xorshift_nonzero_seed_is_reproducible",
           "cargo:sw-core::telnet_filter::xorshift_zero_seed_does_not_stall",
+          "cargo:sw-core::wal_writer::external_unlink_writes_recreate_meta_then_record",
+          "cargo:sw-core::wal_writer::reset_renames_nonempty_files_independent_suffix",
+          "cargo:sw-core::wal_writer::rotate_before_write_at_threshold_utc_suffix",
           "cargo:sw-daemon::deferred_methods::deferred_methods_excludes_delivered_slices",
           "cargo:sw-daemon::deferred_methods::deferred_methods_only_reads_deferred_section",
           "cargo:sw-daemon::rpc_console::attach_interactive_owner_false_when_fg_busy",

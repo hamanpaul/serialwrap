@@ -209,9 +209,19 @@ cases:
   l15-transport-disconnect:
     status: AUTOMATED
     tests: [func-test/runner.py --mode bridge --scenarios --case l15-transport-disconnect]
+  # OD-40（2026-10-28）：自 L1.5 判定逐名移出（compare: none 不產 comparison.json，linux 上 not_applicable 段恆
+  # INSUFFICIENT），情境檔與必要案例保留；改由 slice21_gate_expect.yaml l15_ab_excluded 所列 Rust 側測試承擔，
+  # 於 2.2 artifact 重跑（Python 側 pytest_full 由 P5 s21 gate 承擔；Windows 原生屬 BO-S21-13）。
   l15-wal-interference:
     status: AUTOMATED
-    tests: [func-test/runner.py --mode bridge --scenarios --case l15-wal-interference]
+    decision: OD-40
+    tests:
+      - "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"
+      - "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reset_archives_and_next_command_recorded"
+      - "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reader_hold_does_not_block_records"
+      - "crates/sw-core/tests/wal_writer.rs::rotate_before_write_at_threshold_utc_suffix"
+      - "crates/sw-core/tests/wal_writer.rs::reset_renames_nonempty_files_independent_suffix"
+      - "crates/sw-core/tests/wal_writer.rs::external_unlink_writes_recreate_meta_then_record"
   p0-blog-clean:
     blocked_item: BO-S22-05
     evidence_schema: &id002 [engine_result, release_gate_result]
