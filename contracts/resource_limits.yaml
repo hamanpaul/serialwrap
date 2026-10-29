@@ -42,12 +42,18 @@ event_latency:
   owner: codex-gpt-6-luna-max          # PAL／Actor 實作負責人
   # 審閱歷程：2026-10-29.1 經 Codex gpt-6.1-sol 獨立審閱（2026-10-29）結論 rejected
   #   （reviews/p5-cloud/event-latency-method-review-20261029.md：flood 失效未判、drain_receipt 探針漏算、建置失敗舊 binary
-  #   被綁 HEAD、超限被降級、未套 OD-58、作廢規則只看兩端）；P5 第 6 輪修正後改 2026-10-29.2，待編排者重新提交獨立審閱。
-  # 獨立審閱紀錄（approved 時才填下列三欄）：尚未附入。實作者／測試作者不得自填為審閱者。
-  reviewed_by: null                    # 獨立審閱者姓名（附入時填）
-  reviewed_at: null                    # 審閱日期 YYYY-MM-DD（附入時填）
-  review_conclusion: null              # 審閱結論（附入時填，例如 approved）
-  # 凍結狀態：pending_review_record。附入上列三欄（且 reviewed_by != owner）後，才改 freeze_status: frozen。
+  #   被綁 HEAD、超限被降級、未套 OD-58、作廢規則只看兩端）；P5 第 6 輪修正後改 2026-10-29.2。
+  #   2026-10-29.2 經雲端 Claude Opus xhigh 第 2 次獨立審閱（2026-10-29，≠ owner）結論 approved-with-conditions
+  #   （reviews/p5-cloud/event-latency-method-review-2-20261029.md）：凍結前須完成條件 C1～C5（C1–C3 OD-64 契約／探針／
+  #   依賴情境 L1 gate＋變異證明；C4 每標籤重複 20 次＋lane 見證數正向自測＋M1／M5 變異紀錄；C5 OD-65 與 stop_request 註記）。
+  #   P5 第 7 輪完成條件（逐條 commit 與證據見 p5-fix-responses.md 第七輪、p5-evidence/evlat-review2-conditions-r7/）；
+  #   method_revision 維持 2026-10-29.2——外部量測口徑未改，本審閱涵蓋 2026-10-29.2 加上 C1–C5 的增量。
+  # 獨立審閱紀錄（依審閱報告「審閱紀錄欄位」節填入；實作者／測試作者不得自填為審閱者）。
+  reviewed_by: cloud-claude-opus-xhigh # 獨立審閱者（≠ owner）
+  reviewed_at: "2026-10-29"            # 審閱日期
+  review_conclusion: approved-with-conditions   # 條件 C1～C5 須經編排者核對完成
+  # 凍結狀態：pending_review_record。approved-with-conditions：條件 C1～C5 經編排者核對完成後，才改 freeze_status: frozen
+  # （編排者裁決 2026-10-29：條件完成後先維持 pending_review_record，於回報列出每條條件的 commit 與證據）。
   # 未凍結時 tests/test_slice21_scope.py 的凍結測試 skip 並標 INSUFFICIENT_EVIDENCE；Task 22 gate 開頭同樣拒絕開跑。
   freeze_status: pending_review_record
   repeats: 3
@@ -60,22 +66,49 @@ event_latency:
   # 判定：未作廢輪次的有效樣本最大值超過上限即 FAIL，不因同輪錯誤、缺樣或負載無效降級（2026-10-29.2）。
   external_method: {start: "client 連線建立後、寫出 RPC 請求前（time.monotonic_ns）", end: "讀到完整 RPC 回應行（time.monotonic_ns）", tool: "scripts/rust/event_latency_measure.py", includes_connect: false}
   events:
+    # 審閱 2 C5（L-1）：daemon.stop 先寫出 stopping:true 回應、再 request_stop()（Python `_rpc_after_write` 同序），故外部量測值
+    #   止於 accept_point，不含 Shutdown→BeginDrain；50／100 ms 只約束 RPC 寫回路徑，actor 端只受 l1_bound（資料筆數）約束、無時間上限。
     - {event: stop_request, accept_point: "daemon.stop 回應 stopping:true 寫出", complete_point: "actor 收到 Shutdown 並送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
        measure: external, external_point: "daemon.stop RPC 送出 → 回應（ok:true）讀到；每樣本一個新 daemon（READY 後送出）",
-       l1_gate: ["cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood"]}
+       external_scope_note: "外部值止於 accept_point（回應先於 request_stop 寫出），不含 Shutdown→BeginDrain；不得引為停止延遲 ≤ 50 ms 的保證",
+       l1_gate: ["cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood",
+                 "cargo:sw-core::mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths"]}
     - {event: command_cancel, accept_point: "command.cancel RPC 收到", complete_point: "在途命令的 CancelToken::cancel 被呼叫", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
        measure: external, external_point: "在途（running）命令的 command.cancel RPC 送出 → 回應讀到",
-       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}
+       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood",
+                 "cargo:sw-core::mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths"]}
     - {event: lease_expiry, accept_point: "lease 期限到達（mono）", complete_point: "lease 移入 tombstone", max_ms_idle: 1100, max_ms_flood: 1200, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
        measure: l1_only,
        l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}
-    - {event: drain_receipt, accept_point: "finisher 送出 WorkerStopped", complete_point: "actor 處理該 receipt 完成", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+    # OD-64（擁有者裁決 (a)，2026-10-29）＋審閱 2 C1：同 epoch 有依賴 RX 的 control（OpFinished／LoginFinished）等待時，receipt 依設計
+    #   在該 epoch 已讀 RX 處理完後才被處理（mailbox `stopped`；與 Python `UARTBridge.stop()`→reader join 後才有 receipt 同序），
+    #   原界限 at_most_one_data_item_before_control 在此情境不成立。界限定義（l1_bound_definition）：
+    #     N_pre＝receipt 進入依賴等待（移入 `stopped`）當下，data lane 中同 epoch 的 data 筆數（探針 `ProbeEntry.pre_dependency_data`，
+    #           以 FIFO 逐筆核對 epoch）；
+    #     界限＝receipt 被處理前、送入 mailbox 後，mailbox 回傳的 data（探針 `data_while_waiting`）≤ N_pre＋1；
+    #     跨 epoch 的 data，或 receipt 進入等待後才到的 data，一律計入「＋1」。
+    #   無依賴等待的 receipt N_pre 為 0（界限即 1 筆）。外部量測口徑不變（drain_receipt 仍為 l1_only）。
+    - {event: drain_receipt, accept_point: "finisher 送出 WorkerStopped", complete_point: "actor 處理該 receipt 完成", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_pre_dependency_data_plus_one_after_receipt,
+       owner_decision_ref: OD-64,
+       l1_bound_rule: "WorkerStopped receipt 送出後，至多處理同 epoch 於依賴等待前已讀入 mailbox 的 data，再加 1 筆；排空順序維持與 Python 基線 1:1（D,D,D,L,W）",
+       l1_bound_definition: {n_pre: "receipt 移入 stopped（依賴等待開始）當下 data lane 中同 epoch 的 data 筆數（ProbeEntry.pre_dependency_data）",
+                             bound: "receipt 送入後、被處理前 mailbox 回傳的 data（ProbeEntry.data_while_waiting）≤ n_pre + 1",
+                             counted_in_plus_one: "跨 epoch 的 data、receipt 進入等待後才到的 data", no_dependency: "n_pre = 0（即 ≤ 1）"},
        measure: l1_only,
-       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood", "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood"]}
+       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood", "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood",
+                 "cargo:sw-core::mailbox::stopped_receipt_records_pre_dependency_data", "cargo:sw-core::mailbox::pre_dependency_data_excludes_later_and_other_epoch_data",
+                 "cargo:sw-core::mailbox::actor_probe_records_pre_dependency_data_for_drain_receipt",
+                 "cargo:sw-core::mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths",
+                 "cargo:sw-core::drain_release_e2e::drain_receipt_dependency_wait_on_release_within_od64_bound",
+                 "cargo:sw-core::drain_release_e2e::drain_receipt_dependency_wait_on_shutdown_within_od64_bound"]}
     # OD-58（2026-10-29）：release_request 放寬為 idle 250／flood 300 ms（新口徑含 release 回應前的排空；Python 基線 idle 153～155 ms、
     #   Rust 負載下離群 157／212 ms）。附帶條件：0.5.0（Slice 2.4 出口／Stage 2 release 前）的 daemon 整合測試必須以同一工具
     #   （scripts/rust/event_latency_measure.py）重測三輪，屆時依實測重新提交擁有者確認；未重測不得出 0.5.0。
+    # OD-65（擁有者裁決，2026-10-29）＋審閱 2 C5：維持 idle 250／flood 300 ms（gate 只判 Rust）。凍結紀錄：gate r6-261029 的 Python 基線
+    #   （診斷 50 樣本）idle release_request 三輪 max 154.4／255.4／157.7 ms——有一輪 255.4 ms 超過 250；Rust r6（500 樣本×3 輪）
+    #   最大 42.7 ms。0.5.0 前依 OD-58 以同一工具重測三輪並重新提交擁有者確認（retest_before 保留）。
     - {event: release_request, accept_point: "device.release RPC 收到", complete_point: "actor 送出 BeginDrain", max_ms_idle: 250, max_ms_flood: 300, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
        retest_before: "0.5.0", owner_decision_ref: OD-58,
+       freeze_note: "OD-65：維持 250／300 ms；Python 基線（gate r6-261029 診斷 50 樣本）曾有一輪 idle max 255.4 ms（> 250，另兩輪 154.4／157.7 ms），gate 只判 Rust；0.5.0 前依 OD-58 重測時一併確認",
        measure: external, external_point: "device.release RPC 送出 → 回應（ok:true）讀到；之後 device.attach 回 READY 不計時",
        l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}

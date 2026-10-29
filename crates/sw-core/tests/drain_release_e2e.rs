@@ -306,10 +306,41 @@ fn assert_within_one_data_item(h: &ActorRig, label: &str) {
     }
 }
 
+/// OD-64（擁有者裁決 (a)，2026-10-29）：drain_receipt（`WorkerStopped`）的界限——receipt 送出後至多處理「依賴等待前已讀入
+/// mailbox 的同 epoch data」再加 1 筆（`ProbeEntry::pre_dependency_data`；無依賴等待者為 0，即 1 筆）。
+fn assert_drain_receipt_within_od64_bound(h: &ActorRig) {
+    let entries = h.actor_probe().entries("WorkerStopped");
+    assert!(!entries.is_empty(), "探針應記錄 WorkerStopped");
+    for e in &entries {
+        assert!(
+            e.data_while_waiting <= e.pre_dependency_data + 1,
+            "WorkerStopped 等待期間處理了 {} 個 data item（OD-64 上限 {}＋1）：{e:?}",
+            e.data_while_waiting,
+            e.pre_dependency_data
+        );
+    }
+}
+
+/// event_latency 審閱 2 C4：l1_gate 每個標籤（Release、CancelQueued、LeaseExpiry、Shutdown、WorkerStopped）的 flood 情境
+/// 重複次數——單次取樣對間歇性違規（如 data 越過 control 至多 3 筆、timer 延後檢查）的偵測力不足。
+const L1_GATE_REPEATS: usize = 20;
+
 /// §5.2.4／`resource_limits.event_latency.l1_bound`：data lane 滿載時 release／cancel／lease expiry
-/// 皆在最多再處理 1 個 data item 後被處理。
+/// 皆在最多再處理 1 個 data item 後被處理（各重複 `L1_GATE_REPEATS` 次）。
 #[test]
 fn release_handled_within_one_data_item_under_flood() {
+    for _ in 0..L1_GATE_REPEATS {
+        release_flood_round();
+    }
+    for _ in 0..L1_GATE_REPEATS {
+        cancel_flood_round();
+    }
+    for _ in 0..L1_GATE_REPEATS {
+        lease_flood_round();
+    }
+}
+
+fn release_flood_round() {
     // release
     let h = ActorRig::new(SHELL_PROFILE).ready();
     let flood = Flood::start(&h);
@@ -324,9 +355,13 @@ fn release_handled_within_one_data_item_under_flood() {
     flood.finish();
     assert_within_one_data_item(&h, "Release");
     h.wait_state("RELEASED");
-    // OD-45 drain_receipt：release 的排空回條（WorkerStopped）同樣最多再處理 1 個 data item。
+    // OD-45 drain_receipt：release 的排空回條（WorkerStopped）同樣最多再處理 1 個 data item（本情境無同 epoch 依賴，
+    // OD-64 界限亦為 1 筆）。
     assert_within_one_data_item(&h, "WorkerStopped");
+    assert_drain_receipt_within_od64_bound(&h);
+}
 
+fn cancel_flood_round() {
     // command.cancel（排隊中的命令）
     let h = ActorRig::new(SHELL_PROFILE).ready();
     h.dev.script_write(vec![FakeWriteStep::BlockForever]);
@@ -343,7 +378,9 @@ fn release_handled_within_one_data_item_under_flood() {
     flood.finish();
     assert_within_one_data_item(&h, "CancelQueued");
     h.dev.release_block();
+}
 
+fn lease_flood_round() {
     // agent interactive lease expiry
     let h = ActorRig::new(SHELL_PROFILE).ready();
     let open = h.request(SessionRequest::InteractiveOpen {
@@ -369,9 +406,16 @@ fn release_handled_within_one_data_item_under_flood() {
 }
 
 /// OD-45：`stop_request`（daemon.stop → actor 收到 Shutdown）與 `drain_receipt`（WorkerStopped）的 L1 結構 gate——
-/// data lane 滿載時兩者皆在最多再處理 1 個 data item 後被處理（`resource_limits.event_latency.l1_bound`）。
+/// data lane 滿載時兩者皆在最多再處理 1 個 data item 後被處理（`resource_limits.event_latency.l1_bound`；重複
+/// `L1_GATE_REPEATS` 次，審閱 2 C4）。
 #[test]
 fn shutdown_and_drain_receipt_handled_within_one_data_item_under_flood() {
+    for _ in 0..L1_GATE_REPEATS {
+        shutdown_flood_round();
+    }
+}
+
+fn shutdown_flood_round() {
     let h = ActorRig::new(SHELL_PROFILE).ready();
     let flood = Flood::start(&h);
     wait_flowing(&h, 200);
@@ -386,6 +430,106 @@ fn shutdown_and_drain_receipt_handled_within_one_data_item_under_flood() {
     flood.finish();
     assert_within_one_data_item(&h, "Shutdown");
     assert_within_one_data_item(&h, "WorkerStopped");
+    assert_drain_receipt_within_od64_bound(&h);
+}
+
+/// 依賴情境 gate 的 executor：`BeginDrain` 即以同 `(epoch, stop_id)` 送出 `WorkerStopped`（模擬 finisher），其餘只回覆。
+struct DrainReceiptExec;
+
+impl sw_core::actor::EffectExecutor for DrainReceiptExec {
+    fn execute(
+        &mut self,
+        effect: Effect,
+        _tx: &crossbeam_channel::Sender<ControlEvent>,
+        safety: &crossbeam_channel::Sender<ControlEvent>,
+    ) {
+        match effect {
+            Effect::BeginDrain { stop_id, epoch } => {
+                let _ = safety.send(ControlEvent::WorkerStopped(receipt(epoch, stop_id.0)));
+            }
+            Effect::Reply(reply, result) => {
+                let _ = reply.try_send(result);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// OD-64／event_latency 審閱 2 C3：在途命令的 `OpFinished` 帶 `after_rx_seq = backlog`、data lane 有限 backlog（前置 1 筆
+/// 舊 epoch data，其後 `backlog` 筆同 epoch data）時觸發排空（release 或 shutdown）。receipt 因同 epoch 依賴移入 `stopped`，
+/// N_pre＝`backlog`（舊 epoch 那筆計入「＋1」）；回傳 receipt 的探針紀錄。
+fn receipt_entry_with_dependency_backlog(backlog: u64, stop_event: ControlEvent) -> sw_core::actor::ProbeEntry {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let started = h.start_foreground_command("sleep 5");
+    let epoch = h.epoch();
+    let clock: std::sync::Arc<dyn sw_pal::traits::Clock> = h.clock.clone();
+    let core = h.core;
+    let mb = sw_core::mailbox::Mailbox::new(256, 1024);
+    mb.control_sender()
+        .send(ControlEvent::OpFinished {
+            op_id: started.op_id,
+            epoch,
+            outcome: sw_core::op_runner::OpOutcome::SendFailed,
+            after_rx_seq: Some(backlog),
+        })
+        .expect("OpFinished 送出");
+    let data = mb.data_sender();
+    data.send(DataEvent::UartRxChunk { epoch: epoch - 1, rx_seq: 99, wal_seq: 0, bytes: b"stale".to_vec() })
+        .expect("舊 epoch data 送出");
+    for seq in 1..=backlog {
+        data.send(DataEvent::UartRxChunk { epoch, rx_seq: seq, wal_seq: seq, bytes: b"rx".to_vec() })
+            .expect("data 送出");
+    }
+    mb.control_sender().send(stop_event).expect("排空請求送出");
+    let handle = sw_core::actor::spawn_actor(core, mb, Box::new(DrainReceiptExec), clock);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle.probe.entries("WorkerStopped").is_empty() {
+        assert!(std::time::Instant::now() < deadline, "actor 未處理 receipt");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let entry = handle.probe.entries("WorkerStopped")[0].clone();
+    // 在途命令的 OpFinished 須在 receipt 之前被處理（Python 同序：reader join 後才有回條）。
+    assert_eq!(handle.probe.entries("Control").len(), 1, "OpFinished 應先於 receipt 被處理：{entry:?}");
+    entry
+}
+
+/// 審閱 2 C3／C4：同一情境重複次數（間歇性違規的偵測力）。
+const DEPENDENCY_GATE_REPEATS: usize = 20;
+
+fn assert_dependency_receipt_within_od64_bound(e: &sw_core::actor::ProbeEntry, backlog: u64) {
+    assert_eq!(e.pre_dependency_data, backlog, "receipt 須走到依賴等待（`stopped`），N_pre＝同 epoch backlog：{e:?}");
+    assert_eq!(e.data_while_waiting, backlog + 1, "receipt 送入後處理 backlog＋1 筆舊 epoch data：{e:?}");
+    assert!(
+        e.data_while_waiting <= e.pre_dependency_data + 1,
+        "OD-64：receipt 等待期間處理了 {} 個 data item（上限 N_pre {}＋1）：{e:?}",
+        e.data_while_waiting,
+        e.pre_dependency_data
+    );
+}
+
+/// OD-64（drain_receipt l1_only）＋審閱 2 C3：release 排空時 receipt 因在途命令的同 epoch 依賴進入等待，
+/// 至多處理依賴等待前已讀入的同 epoch data＋1 筆。
+#[test]
+fn drain_receipt_dependency_wait_on_release_within_od64_bound() {
+    for round in 0..DEPENDENCY_GATE_REPEATS {
+        let backlog = 3 + round as u64 % 5;
+        let e = receipt_entry_with_dependency_backlog(
+            backlog,
+            ControlEvent::Request { req: release_cli(), reply: crossbeam_channel::bounded(1).0 },
+        );
+        assert_dependency_receipt_within_od64_bound(&e, backlog);
+    }
+}
+
+/// OD-64＋審閱 2 C3：shutdown 排空的 receipt 同上。
+#[test]
+fn drain_receipt_dependency_wait_on_shutdown_within_od64_bound() {
+    for round in 0..DEPENDENCY_GATE_REPEATS {
+        let backlog = 3 + round as u64 % 5;
+        let e = receipt_entry_with_dependency_backlog(backlog, ControlEvent::Shutdown { reply: crossbeam_channel::bounded(1).0 });
+        assert_dependency_receipt_within_od64_bound(&e, backlog);
+    }
 }
 
 /// release→attach→READY 後，舊 epoch writer 晚到的 `UartTxCompleted` 不改變新 session；WAL 保有該 TX 紀錄。
