@@ -6656,17 +6656,13 @@ class SessionManager:
                     session.bridge_generation,
                     "interactive",
                     owner_gen=getattr(bridge, "owner_gen", 0),
+                    cancel_op_id=cmd_id,
                 )
             if command:
                 self._mark_session_tx(session)
                 try:
-                    # 取消若早於 lease 開啟，revoke_tx_op 只撤銷得到 cmd_id；此時把同一撤銷
-                    # 延伸到本命令的 lease op，維持「取消後零 TX」。
-                    revoked = getattr(bridge, "_revoked_ops", None)
-                    if revoked is not None and cmd_id in revoked:
-                        revoke = getattr(bridge, "revoke_ops", None)
-                        if callable(revoke):
-                            revoke([interactive_permit.op_id])
+                    # 取消以原 cmd_id 撤銷；permit 的 cancel_op_id 讓提交點（fence 內）同時
+                    # 檢查 cmd_id 與 lease op，不論取消落在 lease 開啟前或送出途中都零 TX。
                     self._send_command_with_permit(
                         bridge,
                         command,

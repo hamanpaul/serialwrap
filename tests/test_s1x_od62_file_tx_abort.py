@@ -173,3 +173,25 @@ def test_od62_compatibility_impact_mentions_file_methods() -> None:
         assert "file.push" in entry["compatibility_impact"], change_id
         assert "file.pull" in entry["compatibility_impact"], change_id
         assert "OD-62" in entry["related_decisions"], change_id
+
+
+def test_pull_first_write_partially_confirmed_then_drained_returns_aborted(tmp_path: Path) -> None:
+    """第一筆寫入只確認 1 byte 即因 drain 中止（sol S1-6485e90-2 重現）：已寫出 → COMMAND_ABORTED_IN_FLIGHT。"""
+    from sw_core.serial_port import TxResult
+
+    mgr, s, _bridge, port, target = _ready(tmp_path)
+    target.files["/tmp/y"] = b"hello"
+    original_write = port.write
+
+    def first_write_partial(data: bytes, **kwargs):
+        if not port.writes:
+            port.writes.append(data[:1])
+            return TxResult("completed", 1, len(data), "draining")
+        return original_write(data, **kwargs)
+
+    port.write = first_write_partial
+    result = _pull(mgr, tmp_path)
+
+    assert result["ok"] is False, result
+    assert result["error_code"] == "COMMAND_ABORTED_IN_FLIGHT", result
+    assert s.foreground_busy is False

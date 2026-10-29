@@ -47,6 +47,9 @@ class TxPermit:
     ]
     owner_gen: int | None = None
     login_gen: int | None = None
+    # 發放此 permit 的原命令身分（S1-6485e90-1）：interactive 命令改以 lease op 送出時，
+    # 原 cmd_id 的撤銷仍須在提交點（fence 內）擋下 TX。
+    cancel_op_id: str | None = None
 
 
 def open_serial_port(
@@ -629,7 +632,10 @@ class UARTBridge:
             and permit.bridge_generation != getattr(self, "_gate_generation", 0)
         ):
             return "stale_generation"
-        if permit.op_id in (getattr(self, "_revoked_ops", None) or {}):
+        revoked = getattr(self, "_revoked_ops", None) or {}
+        if permit.op_id in revoked or (
+            permit.cancel_op_id is not None and permit.cancel_op_id in revoked
+        ):
             return "cancelled"
         if permit.tx_class == "agent" and getattr(self, "_gate_quiet", False):
             return "quiet"
