@@ -192,7 +192,36 @@ def _is_reboot_command(command: str) -> bool:
     return any(token == "-r" or token == "--reboot" or token.startswith("-r") for token in tokens[1:])
 
 
-_WHITESPACE_RE = re.compile(r"\s+")
+# 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt），也以此保守估計回顯最多佔幾行
+_WRAP_MIN_SEGMENT = 20
+
+
+def _match_wrapped_echo(text: str, start: int, command: str) -> int | None:
+    """從 ``text[start]`` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
+
+    終端折行只會「插入」字元，不會刪掉命令本身的字元：BusyBox ash 插入換行，
+    bash readline 插入一個空白。因此命令的每個字元（含空白）都必須依序出現；
+    只有換行或多出的空白可以跳過，而且插入點彼此至少相隔 ``_WRAP_MIN_SEGMENT``
+    個字元（第一個插入點以第一行的欄位計，含前面殘留的 prompt）。
+    """
+    i, j = start, 0
+    last_wrap: int | None = None
+    while j < len(command):
+        if i >= len(text):
+            return None
+        ch = text[i]
+        if ch == command[j]:
+            i += 1
+            j += 1
+            continue
+        if j == 0 or ch not in "\n ":
+            return None
+        column = start + j if last_wrap is None else j - last_wrap
+        if column < _WRAP_MIN_SEGMENT:
+            return None
+        last_wrap = j
+        i += 1
+    return i
 
 
 def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
@@ -200,22 +229,19 @@ def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
 
     shell 回顯打到終端寬度（serial console 常見 80 欄）時會在回顯中插入換行
     （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）或補一個空白（bash readline
-    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡把開頭幾行
-    接回去、去掉空白後比較：命令必須從第一行開始（容許第一行前面殘留 prompt），
-    且接回的內容以完整命令結尾，才把這幾行視為回顯。
+    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡只接受「命令原文
+    加上折行插入字元」：命令必須從第一行開始（容許第一行前面殘留 prompt），完整
+    結束在某一行的行尾，才把這幾行視為回顯。命令本身的空白不能少，避免把
+    「輸出剛好等於命令去掉空白」（例如 echo 關閉時 ``cat file`` 印出 ``catfile``）誤當回顯。
     """
-    target = _WHITESPACE_RE.sub("", command)
-    if not target or not lines:
+    if not command or not lines:
         return lines
-    first_len = len(_WHITESPACE_RE.sub("", lines[0]))
-    joined = ""
-    # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
-    for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
-        joined += _WHITESPACE_RE.sub("", line)
-        if joined.endswith(target):
-            if len(joined) - len(target) < first_len:
-                return lines[n:]
-            return lines
+    window = lines[: len(command) // _WRAP_MIN_SEGMENT + 2]
+    text = "\n".join(window)
+    for start in range(len(lines[0])):
+        end = _match_wrapped_echo(text, start, command)
+        if end is not None and (end == len(text) or text[end] == "\n"):
+            return lines[text[:end].count("\n") + 1:]
     return lines
 
 
