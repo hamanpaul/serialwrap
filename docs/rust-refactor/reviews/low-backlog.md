@@ -22,3 +22,5 @@
 | s1-exit/opus-b-20261029.md | S1X-b-6 | crates/sw-cli/src/endpoint_resolve.rs:229-256 | 非字串 config 值的兩處 stderr 文字與 Python 不同 |  | 待處理 |
 | s1-exit/opus-b-20261029.md | S1X-b-7 | crates/sw-cli/src/commands/daemon_cmd.rs:1260-1275 | process_home／process_cwd 繞過 PAL 直接讀行程環境 |  | 待處理 |
 | s1x-b-fixes-report-20261029.md §5（既有碼待辦） | S1X-b-X1 | crates/sw-proto/src/pyre | 樣式以單獨 `\` 結尾時 CPython tokenizer 預讀的 `bad escape (end of pattern)` 優先於前一 token 錯誤（如 `[z\A\`、`a\8\`、`(?P<\`），Rust 回報前一 token；影響 `profile test` 的 error 文字 | ★（對外 JSON 欄位） | 待處理 |
+| S1-109f659-2 | Low | sw_core OD-63 佔位：template 已移除且舊板永久離線時，沒有 RPC／CLI 出口可移除佔位 | 候選 (a) `session bind` 目標 by_id 在線時佔位 retire 並交 dynamic；(b) 追認已知限制並寫明處置（加回 template 名後 `device attach`，或停 daemon 改 state.json） | Stage 3 |
+| S1X-a-既有碼-revoke_tx_op | Low | `revoke_tx_op`：取消落在 interactive TX 完成後時一併撤銷 `interactive:<lease_id>`，lease 之後持續回 `SESSION_BUSY` | 先以 Python 實測確認可達性，再定修法或開 issue | Stage 3 |
