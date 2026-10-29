@@ -1,0 +1,63 @@
+---
+meta:
+  name: s23-recover-force-handoff
+  category: l15-scenario
+  severity: critical
+  description: "ATTACHED（帳密未解析）且 DUT 靜默：`session recover --force` 走 FORCE_CLEAR_REATTACH（drain 回條後才重開），期間 wire serial_read 零 byte（不送空帳密、不送 probe），回覆 FORCE_RECOVER_TIMEOUT 後 session 仍為 ATTACHED＋CREDENTIALS_UNRESOLVED（§5.2.4、§11.3，Slice 2.3 Task 18）"
+  scenario:
+    revision: "2026-10-29.1"
+    seed: 1023
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 120
+    invariants: [zero_tx_on_reject, insufficient_evidence_not_pass]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.3"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: shell
+  boot_banner: "\r\nop3 login: "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@op3:~# "
+profile:
+  prompt_regex: '(?m)^root@op3:.*# '
+  login_regex: '(?mi)login:\s*$'
+  password_regex: '(?mi)password:\s*$'
+  # 刻意不提供 env_file，且測試環境不得設定這兩個變數 → 帳密未解析
+  user_env: 'SW_S23_UNSET_USER'
+  pass_env: 'SW_S23_UNSET_PASS'
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  # 宣告帳密但未解析 → ATTACHED＋CREDENTIALS_UNRESOLVED（終態，不自動重探）
+  - action: wait_state
+    selector: COM0
+    state: ATTACHED
+    timeout_s: 30
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.last_error"
+    equals: CREDENTIALS_UNRESOLVED
+    timeout_s: 15
+  - action: op_begin
+    op_id: force
+  - action: cli
+    argv: ["session", "recover", "--selector", "COM0", "--force"]
+    timeout: 60
+    save_as: fr
+    expect: {ok: false, error_code: FORCE_RECOVER_TIMEOUT, action: FORCE_CLEAR_REATTACH, recovered: false}
+  - action: op_end
+    op_id: force
+  - action: assert_zero_tx
+    op_id: force
+  - action: wait_state
+    selector: COM0
+    state: ATTACHED
+    timeout_s: 15
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.last_error"
+    equals: CREDENTIALS_UNRESOLVED
+    timeout_s: 15
+  - action: assert_compare

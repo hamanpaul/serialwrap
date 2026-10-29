@@ -1,0 +1,71 @@
+---
+meta:
+  name: s23-quiet-mid-login-zero-tx
+  category: l15-scenario
+  severity: critical
+  description: "登入進行中（帳號已送出）DUT 改吐 U-Boot autoboot banner：quiet arm 之後 wire serial_read 零 byte——隨後出現的 Password prompt 不得引來 secret，帳號不重送（SC-30 的 0 byte 部分；Python P1 T20 後同樣 arm 之後 0 byte，見 behavior_changes.yaml SC-30；Slice 2.3 Task 18，§11.3）"
+  scenario:
+    revision: "2026-10-29.1"
+    seed: 1023
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 90
+    invariants: [zero_tx_on_reject, no_auto_resend, insufficient_evidence_not_pass]
+    behavior_changes: ["SC-30"]
+    expected: PASS
+    daemon_slice: "2.3"
+bridge:
+  applicable: true
+  only: true
+  compare: full
+  secrets_from_env_file: {file: p7.env, keys: [P7_PASS]}
+target:
+  platform: shell
+  boot_banner: "\r\nop3 login: "
+  login_steps:
+    - {expect: "root", respond: "\r\nU-Boot 2024.01\r\nHit any key to stop autoboot:  3 \r\n"}
+    - {expect: "s3cretP7", respond: "\r\nroot@op3:~# "}
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@op3:~# "
+profile:
+  prompt_regex: '(?m)^root@op3:.*# '
+  login_regex: '(?mi)login:\s*$'
+  password_regex: '(?mi)password:\s*$'
+  user_env: 'P7_USER'
+  pass_env: 'P7_PASS'
+  env_file: 'p7.env'
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+env_files:
+  p7.env: |
+    P7_USER=root
+    P7_PASS=s3cretP7
+steps:
+  # daemon 送出帳號後 DUT 回 U-Boot banner（quiet arm）
+  - action: wait_wire_marker
+    marker: "Hit any key"
+    observation: "serial_write"
+    timeout_s: 30
+  # bridge 寫出 banner 後留 1 s 讓 daemon 讀入並 arm（同步點為上方 wire marker）
+  - action: sleep
+    seconds: 1
+  - action: op_begin
+    op_id: quiet
+  # quiet 期間 DUT 出現 Password prompt：不得送 secret、不得重送帳號、不得送 probe
+  - action: dut_control
+    action_name: emit
+    params:
+      payload_b64: "DQpQYXNzd29yZDog"
+  - action: wait_wire_marker
+    marker: "Password: "
+    observation: "serial_write"
+    timeout_s: 10
+  - action: sleep
+    seconds: 6
+  - action: op_end
+    op_id: quiet
+  - action: assert_zero_tx
+    op_id: quiet
+  - action: assert_wire_contiguous
+    payloads: ["root\n"]
+  - action: assert_compare

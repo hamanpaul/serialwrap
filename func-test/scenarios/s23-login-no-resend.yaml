@@ -1,0 +1,91 @@
+---
+meta:
+  name: s23-login-no-resend
+  category: l15-scenario
+  severity: critical
+  description: "登入完成後不重送：READY 期間 DUT 再吐 Password prompt 不引來 secret；逾時救援後命令 payload 不自動重送；整段 wire 上帳號、secret、逾時命令各恰一次（§11.3「不得自動重送」，Slice 2.3 Task 18）"
+  scenario:
+    revision: "2026-10-29.1"
+    seed: 1023
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 120
+    invariants: [no_auto_resend, insufficient_evidence_not_pass]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.3"
+bridge:
+  applicable: true
+  only: true
+  compare: full
+  secrets_from_env_file: {file: p7.env, keys: [P7_PASS]}
+target:
+  platform: shell
+  boot_banner: "\r\nop3 login: "
+  login_steps:
+    - {expect: "root", respond: "\r\nPassword: "}
+    - {expect: "s3cretP7", respond: "\r\nroot@op3:~# "}
+  noise: {enabled: false}
+  commands:
+    overrides:
+      "sleep 60":
+        interactive: true
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@op3:~# "
+profile:
+  prompt_regex: '(?m)^root@op3:.*# '
+  login_regex: '(?mi)login:\s*$'
+  password_regex: '(?mi)password:\s*$'
+  user_env: 'P7_USER'
+  pass_env: 'P7_PASS'
+  env_file: 'p7.env'
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+env_files:
+  p7.env: |
+    P7_USER=root
+    P7_PASS=s3cretP7
+steps:
+  - action: wait_ready
+    timeout_s: 30
+  - action: op_begin
+    op_id: after_login
+  - action: op_end
+    op_id: after_login
+  # READY 期間 DUT 主動再吐 Password prompt：daemon 不得回送 secret
+  - action: dut_control
+    action_name: emit
+    params:
+      payload_b64: "DQpQYXNzd29yZDog"
+  - action: wait_wire_marker
+    marker: "Password: "
+    observation: "serial_write"
+    timeout_s: 10
+  - action: sleep
+    seconds: 3
+  # 逾時救援（CTRL_C）後不得自動重送命令
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "sleep 60", "--cmd-timeout", "2"]
+    save_as: slow
+    expect: {ok: true}
+  - action: assert_command_resolved
+    from: slow
+    timeout_s: 30
+    payload: "sleep 60\n"
+  - action: sleep
+    seconds: 5
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo AFTER"]
+    save_as: after
+    expect: {ok: true}
+  - action: wait_cli_until
+    argv: ["cmd", "status", "--cmd-id", "{after.cmd_id}"]
+    json_path: "command.status"
+    in: [done, error, canceled, interactive]
+    timeout_s: 30
+  - action: assert_wire_absent
+    marker: "s3cretP7"
+    after_op: after_login
+  - action: assert_wire_contiguous
+    payloads: ["root\ns3cretP7\n", "sleep 60\n", "echo AFTER\n"]
+  - action: assert_wire_contiguous
+    payloads: ["root\n"]
+  - action: assert_compare
