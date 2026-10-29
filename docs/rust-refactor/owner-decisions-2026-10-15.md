@@ -45,6 +45,9 @@
 | OD-42 | **PA-OD-F67 接受替代案例**：以 `boot_quiet_survives_clear_drain_and_blocks_reattach_probe` 替代原 F67 案例 | 2026-10-28 | 由對應切片保留替代測試的完整判準與必要性；本分支只登錄裁決 |
 | OD-43 | **NC-P5-01 登記 DF**：Rust RX 速率視窗達上限時合併最舊樣本，保留 bytes 總量，避免低估 RX_FLOOD 判定 | 2026-10-28 | `contracts/behavior_changes.yaml` 新增 DF-22；P5 實作與測試承接，不改 Stage 1 Python daemon |
 | OD-44 | **NC-P5-02 固定承接率斷路器觀測窗口**：依規格 §12.2，窗口起訖於切片開始時固定 | 2026-10-28 | `docs/rust-refactor/plans/09-slice24-transfer-flash.md` 將「任一連續三週」改為固定三週窗口判定；不得移動窗口起訖或調整承接率門檻 |
+| OD-45 | **PA-OD-EVLAT 後續（OD-41 選項 (b) 不可行）採選項 (a)**：五事件的 accept／complete 點皆為 actor 內部點、Python 與 Rust WAL 皆無對應紀錄。改為：(1)「控制事件不被資料擠掉」以 L1 結構測試為 gate（五事件皆保留 `at_most_one_data_item_before_control`）；(2) 外部量測只量 `stop_request`、`command_cancel`、`release_request`，口徑為「RPC 送出 → RPC 回應或對外可見狀態變化」，idle 與 flood 兩種負載；(3) `lease_expiry`、`drain_receipt` 只留 L1；(4) 依新 `method_revision` 重新凍結上限值並附獨立審閱紀錄 | 2026-10-29 | 仍不在 daemon 加計時欄位、不改 WAL；P5 承接（`reviews/rulings/p5.md`） |
+| OD-46 | **PA-OD-L15-GAPS-10 之 gaps #10 採選項 (c)**：`s21-wal-unlink-under-traffic` 比照 OD-40 自 `l15_ab` 判定逐名移出（情境檔與必要案例保留），由 pytest WAL unlink 黑箱 A/B 承擔，且須在 unlink 期間維持持續 RX／TX 並斷言重建後證據不漏 | 2026-10-29 | 不改 `tools/uart_stdio_bridge`（比較器加起點窗口會使 bridge revision 與全部自測報告失效）；不採 hardlink（Rust 以 `nlink()==0` 偵測外部 unlink，hardlink 會遮蔽偵測） |
+| OD-47 | **PA-OD-L15-GAPS-10 之 gaps #9 採選項 (a)**：核准 CHG-S21-OD39-GAP9-01 偏離 OD-39 字面。兩個 daemon 皆不寫狀態轉移 META，`s21-exclusive-conflict`／`-plain-open` 以三層替代證據判定：WAL 窗口內 COM0 無 RX／TX、bridge 端 `assert_wire_offsets serial_read == 0`、關鍵點狀態取樣；判定語意改為「外部放手前埠未成功開啟且未進 READY」 | 2026-10-29 | Python 基線 attach 失敗前本就短暫經過 ATTACHING，不列判定；不在任一 daemon 新增狀態 META、不改 WAL 格式 |
 
 ## 全部裁決完成（2026-10-15）
 
