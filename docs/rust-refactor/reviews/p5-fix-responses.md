@@ -349,3 +349,13 @@ gate 逐 section 判定見 `docs/rust-refactor/reviews/p5-t22-gate-run.md`。
 | F191 | Medium | P5-4f8acdf-2：OD-61 匯入只依 `env.git_revision`，未記工作樹乾淨與否；`relevant_paths` 缺 `Cargo.toml` | fixed：`wal_s1w` 的 env 新增 `source_tree_dirty`（`git status --porcelain --untracked-files=no`；取不到為 "unknown"）；judge 要求為 false；`relevant_paths` 加 `Cargo.toml`、`crates/sw-core/Cargo.toml`、`crates/sw-pal/Cargo.toml`。紅燈：`test_imported_evidence_requires_clean_source_tree`（true／缺／unknown 三案）、`test_relevant_paths_cover_build_profile_manifests`、`test_wal_s1w_example_records_source_tree_dirty`。附註：`wal-rotate-writeback-r6/rust-fix*.json` 為診斷證據（README 已揭露於未提交工作樹量測），不作 gate 匯入 |
 | F192 | Medium | P5-4f8acdf-3：Rust WARNING 印 `status=Permission`（enum 名稱），Python 為 `status=permission`；新回歸測試鎖住偏差 | fixed：`HolderScanStatus::py_name()`，`open_sequence` 的 WARNING 改用之；`daemon_process::non_root_holder_scan_permission_does_not_block_open` 改斷言 `（status=permission），BC-04 僅保證 serialwrap 實例互斥`。紅燈 `sw-pal serial::posix::tests::accept_unverified_warning_matches_python_template`（Permission／Unknown 逐字比對，並核對 `daemon_logging.yaml` 模板字串；修正前 FAIL），已 add-only 登記 s21_core.linux |
 | — | Low×4 | P5-4f8acdf-4～7 | 依收斂規則 Low 不修，記入 low-backlog（由編排者彙整） |
+
+## 第七輪（2026-10-29 cloud session）
+
+### 報告 `p5-cloud/4f8acdf_86b54d8-sol.md`（雲端 Opus xhigh 代理 sol 單審；Medium 2、Low 3）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F193 | Medium | P5-86b54d8-1：未承擔集合判定只看集合 id——(a) 不分平台（windows section 承擔同名集合即視 linux 列已承擔）、(b) 非測試類 section 片段自帶 `additional_required_sets` 亦算承擔 | fixed（本組 commit）：`carried` 改為（集合, 平台）對，只自 `TEST_SECTIONS` 內的 section 收集（`required_set`、expect `additional_required_sets[name]`、片段 `additional_required_sets`），平台取 `TEST_SECTIONS[name]`；`uncarried` 列 `set.platform`。紅燈先行：`test_uncarried_gate_set_is_judged_per_platform`、`test_non_test_section_fragment_cannot_carry_gate_set`（修正前兩支皆得 READY） |
+| F194 | Medium | P5-86b54d8-2：`wal_s1w.relevant_paths` 未涵蓋 sw-proto（append 熱路徑的 `crc32_hex`、`WalRecord::to_line`／pyjson、pycompat） | fixed（本組 commit）：`relevant_paths` 加入整個 `crates/sw-proto`。紅燈先行：`test_relevant_paths_cover_build_profile_manifests` 補 sw-proto 四路徑；新增 `tests/test_slice21_wal_s1w_import_git.py`（臨時 git repo 實跑：量測 commit 後只改 `sw-proto/src/wal_types.rs`／`pyjson.rs`／`sw-pal/src/wal_fs/posix.rs` → EVIDENCE_MISSING，只改無關檔 → PASS；修正前 sw-proto 兩案得 PASS）。該檔以子行程執行 git，依模組層資源 marker 不混用規則與原檔分開（process_rpc） |
+| — | Low×3 | P5-86b54d8-3～5 | 依收斂規則不修（交 low-backlog） |

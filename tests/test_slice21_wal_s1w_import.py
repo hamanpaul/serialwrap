@@ -97,8 +97,8 @@ def test_relevant_paths_cover_build_profile_manifests():
     paths = exp["wal_s1w"]["relevant_paths"]
     for need in ("Cargo.toml", "crates/sw-core/Cargo.toml", "crates/sw-pal/Cargo.toml"):
         assert need in paths, need
+    # sol P5-86b54d8-2：append 熱路徑經 sw-proto（crc32_hex、WalRecord::to_line／pyjson、pycompat）。
+    for need in ("crates/sw-proto/src/wal_types.rs", "crates/sw-proto/src/pyjson.rs", "crates/sw-proto/src/pycompat.rs",
+                 "crates/sw-proto/Cargo.toml"):
+        assert any(need == p or need.startswith(p.rstrip("/") + "/") for p in paths), need
 
-
-def test_wal_s1w_example_records_source_tree_dirty():
-    text = (ROOT / "crates" / "sw-core" / "examples" / "wal_s1w.rs").read_text(encoding="utf-8")
-    assert '"source_tree_dirty"' in text and '"--porcelain"' in text

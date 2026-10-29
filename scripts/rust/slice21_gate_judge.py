@@ -679,13 +679,18 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
 
     # sol P5-4f8acdf-1：鎖中的 `s21_gate:*` 集合須由某個 section（required_set 或 additional_required_sets）承擔，
     # 否則其 nodeid 從未被執行或判定（例如 OD-55 的能力集合）——不得 READY。
-    carried = {str(s.get("required_set")) for s in out_sections if s.get("required_set")}
-    for name, sets in (expect.get("additional_required_sets") or {}).items():
-        carried |= {str(x) for x in (sets or [])}
+    # sol P5-86b54d8-1：承擔以（集合, 平台）為粒度，且只計測試類 section（平台取 TEST_SECTIONS，與
+    # `_judge_test_section` 實際判定的集合相同）；非測試類 section 不判集合，其片段自帶的宣告不算承擔。
+    extra_cfg = expect.get("additional_required_sets") or {}
+    carried: set[tuple[str, str]] = set()
     for s in out_sections:
-        carried |= {str(x) for x in (s.get("additional_required_sets") or [])}
-    uncarried = sorted(sid for sid in ((expect.get("lock") or {}).get("sets") or {})
-                       if sid.startswith("s21_gate:") and sid not in carried)
+        plat = TEST_SECTIONS.get(str(s.get("name")))
+        if plat is None:
+            continue
+        sids = [s.get("required_set"), *(extra_cfg.get(s["name"]) or []), *(s.get("additional_required_sets") or [])]
+        carried |= {(str(x), plat) for x in sids if x}
+    uncarried = sorted(f"{sid}.{plat}" for sid, spec in ((expect.get("lock") or {}).get("sets") or {}).items()
+                       if sid.startswith("s21_gate:") for plat in (spec or {}) if (sid, plat) not in carried)
     missing_id, mismatch_id = identity_problems(report.get("identity"), expect.get("daemon_path"))
     uptake = case_uptake(expect.get("freeze"), expect.get("case_verdicts"))
     b_status, b_reasons, b_res = judge_breaker(expect.get("freeze"), expect.get("breaker"))

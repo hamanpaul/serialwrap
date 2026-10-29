@@ -647,3 +647,42 @@ def test_uncarried_gate_set_blocks_ready(case):
     exp["additional_required_sets"] = {"linux_cap_posix_pty": ["s21_gate:cap_sys_admin"]}
     out = _judge_mod().judge(case.report(), exp)
     assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"])
+
+
+def test_uncarried_gate_set_is_judged_per_platform(case):
+    """sol P5-86b54d8-1 (a)：承擔以（集合, 平台）為粒度——windows section 承擔同名集合時，該集合的 linux 列
+    從未被任何 linux section 執行，仍須判 INCOMPLETE 並列出 linux 平台。"""
+    exp = case.expect()
+    sel = {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-daemon::launcher::cap_example__linux_only"], "selector": sel},
+        "windows": {"nodeids": [CORE_NODEIDS[0]], "selector": sel}}
+    exp["additional_required_sets"] = {"windows_native_l1": ["s21_gate:cap_example"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "windows_native_l1")["status"] == "PASS"   # windows 列確實由 windows section 判定
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert not any("s21_gate:cap_example.windows" in r for r in out["verdict_reasons"])
+
+
+def test_non_test_section_fragment_cannot_carry_gate_set(case):
+    """sol P5-86b54d8-1 (b)：非測試類 section 不判集合，其片段自帶的 additional_required_sets 不得算承擔
+    （不接受報告自行宣告承擔）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_example__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}}}
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "l15_ab":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 測試類 section 片段自帶者照常由該 section 判定，故算承擔
+    for sec in rep["sections"]:
+        if sec["name"] == "linux_cap_posix_pty":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "EVIDENCE_MISSING"   # 該 nodeid 未執行 → 不得 PASS
