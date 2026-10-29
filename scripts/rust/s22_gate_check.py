@@ -11,7 +11,8 @@
 - 每個 `s22_gate:*` 集合／平台以 P2 `tests/acceptance/l1_judge.judge`（依路徑載入，本檔不另寫判定規則）判定；
   報告不存在 → INSUFFICIENT。
 - 對照表每個 `AUTOMATED` 條目的每個 `.py`／`.rs` 測試須在任一份報告（集合×平台）中恰一列 `passed`（`.rs` 轉為
-  `cargo:<crate>::<檔名 stem>::<函式>`）；有 failed 列 → FAIL；缺列、重複或非 passed → INSUFFICIENT。
+  `cargo:<crate>::<檔名 stem>::<函式>`）；有 failed 列 → FAIL；缺列、非 passed，或**任一份報告內部重複**
+  （不論其他報告是否單列 passed，OD-54）→ INSUFFICIENT。
   其他來源（func-test、scenario）須在 `--l15-results`（`s22-l15-results.v1`：`{"format","runs":[{"ref","outcome",
   "exit_code"}]}`）中恰一列 `outcome == "passed"` 且 `exit_code == 0`；未提供或不符 → INSUFFICIENT（審查
   3317987_d6e3b3c-opus High #1：函式／腳本存在不等於已執行且通過）。
@@ -142,11 +143,13 @@ def judge_tests(tests: list[str], rows_by_nodeid: dict[str, list[dict]],
             failed.append(ref)
             continue
         # 「恰一列」逐份報告（集合×平台）計算：selector 重疊的集合（例：console_conformance_pty 執行整個
-        # console_conformance binary，其非 cap 測試也在 cargo_workspace）各自恰一列 passed 即可，單一報告內重複仍不計。
+        # console_conformance binary，其非 cap 測試也在 cargo_workspace）各自恰一列 passed 即可（OD-54）。
+        # 任一份報告內部重複即證據不足，不得被另一份報告的單列 passed 遮蔽（sol P6-c6ddda1-1）。
         per_report: dict[tuple[str, str], list[dict]] = {}
         for r in rows:
             per_report.setdefault((r["_platform"], r.get("_section", "")), []).append(r)
-        if not any(len(rs) == 1 and rs[0].get("outcome") == "passed" for rs in per_report.values()):
+        if any(len(rs) > 1 for rs in per_report.values()) or not any(
+                rs[0].get("outcome") == "passed" for rs in per_report.values()):
             missing.append(ref)
     if not tests:
         status = "INSUFFICIENT"
