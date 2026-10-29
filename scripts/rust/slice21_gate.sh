@@ -196,13 +196,26 @@ else
     --reason "F108：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_l1 須以非 root 補跑"
 fi
 
+# OD-53 --caps 推導（rulings/p5.md 第 7 輪：與 s22 gate 相同規則）：收集器的 --caps 與 argv 一律由鎖中該 section 必要集合的
+# selector 推導（`--ignored cap_<cap>__` → `--caps <cap>`；不含 ignored 篩選 → 不需 caps；argv＝required_set 的 selector），
+# 不在 gate 內手寫；推導不出即不執行、記 EVIDENCE_MISSING。
+caps_args() {  # caps_args <section>：設定 CAPS_ARGV＝(--caps <cap>… -- <selector argv>)；推導不出回 1
+  local plan
+  plan="$(python3 "$JUDGE" caps-plan --section "$1" 2>/dev/null)" || return 1
+  mapfile -t CAPS_ARGV < <(python3 -c 'import json,sys; p=json.loads(sys.argv[1]); [print(x) for c in p["caps"] for x in ("--caps", c)]; print("--"); [print(a) for a in p["argv"]]' "$plan")
+}
+
 # 3. Linux cap_posix_pty
 mkdir -p "$RUN_DIR/linux_cap_posix_pty"
-run_logged linux_cap_posix_pty python3 scripts/rust/cargo_l1_results.py --platform linux --caps posix_pty \
-  --out "$RUN_DIR/linux_cap_posix_pty/l1-results.json" -- -p sw-pal --features test-fakes
-record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty \
-  --command "cargo_l1_results.py --platform linux --caps posix_pty -- -p sw-pal --features test-fakes" \
-  --exit "$LAST_RC" --log logs/linux_cap_posix_pty.log --l1-results linux_cap_posix_pty/l1-results.json
+if caps_args linux_cap_posix_pty; then
+  run_logged linux_cap_posix_pty python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_cap_posix_pty/l1-results.json" "${CAPS_ARGV[@]}"
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty \
+    --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
+    --exit "$LAST_RC" --log logs/linux_cap_posix_pty.log --l1-results linux_cap_posix_pty/l1-results.json
+else
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
+fi
 
 # 3b. OD-55 linux 能力集合（P5 第 6 輪 SPEC-GAP #2，編排者裁決）：先探測能力，具備才以 --caps <cap> 實跑；
 #     否則記 EVIDENCE_MISSING 並附探測證據（所需能力、處置與實跑方式由 judge CAPABILITY_SECTIONS 補上），不得記 PASS。
@@ -229,14 +242,16 @@ cap_probe() {  # cap_probe <cap>：印出 available:<證據> 或 unavailable:<�
 }
 for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do
   sec="linux_cap_$cap"
-  crate=sw-pal; [[ "$cap" == windows_native ]] && crate=sw-daemon
   probe="$(cap_probe "$cap")"
-  if [[ "$probe" == available:* ]]; then
+  if [[ "$probe" == available:* ]] && ! caps_args "$sec"; then
+    record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
+      --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
+  elif [[ "$probe" == available:* ]]; then
     mkdir -p "$RUN_DIR/$sec"
-    run_logged "$sec" python3 scripts/rust/cargo_l1_results.py --platform linux --caps "$cap" \
-      --out "$RUN_DIR/$sec/l1-results.json" -- -p "$crate" --features test-fakes
+    run_logged "$sec" python3 scripts/rust/cargo_l1_results.py --platform linux \
+      --out "$RUN_DIR/$sec/l1-results.json" "${CAPS_ARGV[@]}"
     record "$sec" --required-set "s21_gate:cap_$cap" \
-      --command "cargo_l1_results.py --platform linux --caps $cap -- -p $crate --features test-fakes" \
+      --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
       --exit "$LAST_RC" --log "logs/$sec.log" --l1-results "$sec/l1-results.json" --capability-probe "$cap=$probe"
   else
     record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \

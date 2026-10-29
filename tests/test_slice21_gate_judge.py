@@ -779,4 +779,61 @@ def test_gate_script_runs_capability_and_py_parity_sections():
     assert text.count("record py_parity ") >= 2                 # ＋實跑分支
     # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
     assert "for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do" in text
-    assert '--caps "$cap"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
+    # 第 7 輪（OD-53 推導）：--caps 由 caps_args 依鎖 selector 推導，不再手寫 `--caps "$cap"`
+    assert '"${CAPS_ARGV[@]}"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
+
+
+# --------------------------------------------------------------------------- 第 7 輪：OD-53 --caps 推導（rulings/p5.md 最新列）
+
+def test_derive_caps_matches_s22_rule():
+    """rulings/p5.md：slice21_gate.sh 的 `--caps` 改用與 s22 gate 相同的 OD-53 推導規則（rulings/p6.md「OD-53 selector 記錄
+    caps」）：test-binary 參數（`--` 之後）恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需 caps；
+    其餘帶 ignored 意圖者推導不出（None）。"""
+    j = _judge_mod()
+    cap_argv = ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]
+    assert j.derive_caps({"argv": cap_argv}) == ["posix_pty"]
+    assert j.derive_caps({"argv": ["-p", "x", "--", "--ignored", "cap_posix_pty__", "cap_windows_com__"]}) == [
+        "posix_pty", "windows_com"]
+    assert j.derive_caps({"argv": ["--workspace", "--features", "test-fakes", "--", "--skip", "cap_"]}) == []
+    assert j.derive_caps({"argv": ["-p", "sw-pal", "--features", "test-fakes"]}) == []
+    assert j.derive_caps({"argv": ["-q", "tests/"]}) == []
+    for tail in (["--ignored"], ["--include-ignored"], ["--include-ignored", "cap_posix_pty__"],
+                 ["--ignored", "cap_posix_pty__", "other_filter"], ["--ignored", "cap_posix_pty"],
+                 ["--ignored", "--skip", "x", "cap_posix_pty__"], ["--ignored", "cap_posix_pty__", "--exact"]):
+        assert j.derive_caps({"argv": ["-p", "x", "--", *tail]}) is None, tail
+    assert j.derive_caps({"argv": ["--ignored", "cap_posix_pty__"]}) is None
+
+
+def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
+    """現行鎖的每個 s21 集合皆可推導；gate 的收集計畫（`caps-plan`）以各 section 必要集合的 selector 推導 `--caps` 與 argv：
+    linux_cap_posix_pty → `--caps posix_pty -- -p sw-pal --features test-fakes`、linux_cap_<cap> → `--caps <cap>` 加該集合
+    selector argv。"""
+    j = _judge_mod()
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    derived = {(sid, plat): j.derive_caps(spec["selector"]) for sid, plats in lock["sets"].items()
+               if sid == "s21_core" or sid.startswith("s21_gate:") for plat, spec in plats.items()}
+    assert all(v is not None for v in derived.values()), derived
+    import yaml
+
+    exp = yaml.safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    plan = j.caps_plan("linux_cap_posix_pty", exp, lock)
+    assert plan == {"caps": ["posix_pty"], "argv": ["-p", "sw-pal", "--features", "test-fakes"]}, plan
+    for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
+        plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
+        assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["linux"]["selector"]["argv"]}, plan
+
+
+def test_underivable_caps_selector_is_evidence_missing(case):
+    """推導不出 `--caps` 的必要集合 → 該 section EVIDENCE_MISSING（即使 l1 全 passed）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:linux_cap_posix_pty"]["linux"]["selector"] = {
+        "argv": ["-p", "sw-pal", "--", "--include-ignored", "cap_posix_pty__"]}
+    out = _judge_mod().judge(case.report(), exp)
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING" and any("OD-53" in r for r in sec["reasons"]), sec["reasons"]
+
+
+def test_gate_script_derives_caps_from_lock():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    assert "caps-plan" in text
+    assert "--caps posix_pty \\" not in text and "-- -p sw-pal --features test-fakes\nrecord linux_cap_posix_pty" not in text

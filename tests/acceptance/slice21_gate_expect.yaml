@@ -52,15 +52,15 @@ sections:
   - {name: linux_l1, kind: test, platform: linux, required_set: s21_core,
      command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_l1/l1-results.json -- --workspace --features test-fakes -- --skip cap_"}
   - {name: linux_cap_posix_pty, kind: test, platform: linux, required_set: "s21_gate:linux_cap_posix_pty",
-     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --caps posix_pty --out <run>/linux_cap_posix_pty/l1-results.json -- -p sw-pal --features test-fakes"}
+     command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_posix_pty/l1-results.json <caps-plan（OD-53 由鎖 selector 推導）：--caps posix_pty -- -p sw-pal --features test-fakes>"}
   - {name: linux_cap_sys_admin, kind: test, platform: linux, required_set: "s21_gate:cap_sys_admin",
-     command: "能力探測（euid 0 且 CapEff 含 CAP_SYS_ADMIN）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --caps sys_admin --out <run>/linux_cap_sys_admin/l1-results.json -- -p sw-pal --features test-fakes"}
+     command: "能力探測（euid 0 且 CapEff 含 CAP_SYS_ADMIN）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json <caps-plan：--caps sys_admin -- 集合 selector argv>"}
   - {name: linux_cap_windows_native, kind: test, platform: linux, required_set: "s21_gate:cap_windows_native",
      command: "linux 主機恆不具備（原生 Windows）：記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
   - {name: linux_cap_interactive_desktop, kind: test, platform: linux, required_set: "s21_gate:cap_interactive_desktop",
      command: "linux 主機恆不具備（Windows 互動 console）：記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
   - {name: linux_cap_supervisor_runtime, kind: test, platform: linux, required_set: "s21_gate:cap_supervisor_runtime",
-     command: "能力探測（systemctl --user is-system-running 為 running／degraded）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --caps supervisor_runtime --out <run>/linux_cap_supervisor_runtime/l1-results.json -- -p sw-pal --features test-fakes"}
+     command: "能力探測（systemctl --user is-system-running 為 running／degraded）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_supervisor_runtime/l1-results.json <caps-plan：--caps supervisor_runtime -- 集合 selector argv>"}
   - {name: windows_native_l1, kind: test, platform: windows, required_set: s21_core,
      command: "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon"}
   - {name: windows_cap_windows_com, kind: test, platform: windows, required_set: "s21_gate:windows_cap_windows_com",

@@ -10,6 +10,8 @@ pub mod serial_suite;
 pub mod wal_fs_suite;
 
 pub use lock_suite::lock_suite;
+#[cfg(unix)]
+pub use lock_suite::bind_stale_unix_socket;
 pub use rpc_suite::rpc_suite;
 pub use wal_fs_suite::{wal_fs_suite, ExternalFsOps, FakeExternalFs, NativeExternalFs};
 
@@ -413,9 +415,19 @@ mod pty_fd_tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn sleep");
-        let inherited = std::path::Path::new(&format!("/proc/{}/fd/{}", child.id(), peer.master)).exists();
+        // 以連結目標比對（PTY master 連到 ptmx）：子行程自己開的檔（例如 sleep 啟動時讀 locale 用到 fd 3）不得誤判。
+        let master_link = std::fs::read_link(format!("/proc/self/fd/{}", peer.master)).expect("讀 master fd 連結");
+        let inherited: Vec<String> = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| std::fs::read_link(e.path()).ok().as_ref() == Some(&master_link))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!inherited, "子行程繼承了 PTY master fd {}", peer.master);
+        assert!(inherited.is_empty(), "子行程繼承了 PTY master（{}）：fd {inherited:?}", master_link.display());
     }
 }

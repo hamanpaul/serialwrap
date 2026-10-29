@@ -237,8 +237,8 @@ gate 為 OD-55 的 linux 能力集合各設一個 section（`linux_cap_<cap>`）
 
 | section | 集合 | 所需能力 | 處置 | 可行的實跑方式 |
 |---|---|---|---|---|
-| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 root 於可丟棄容器（例：`docker run --cap-add SYS_ADMIN`，掛載 repo）跑 gate，或單獨執行 `python3 scripts/rust/cargo_l1_results.py --platform linux --caps sys_admin --out <run>/linux_cap_sys_admin/l1-results.json -- -p sw-pal --features test-fakes` |
-| `linux_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime` | `systemctl --user is-system-running` 為 running／degraded | BLOCKED-OWNER | 於隔離的 systemd 容器（`tools/docker/systemd.Dockerfile`，OD-15）以一般使用者登入 session 跑 gate，或單獨執行 `... --caps supervisor_runtime --out <run>/linux_cap_supervisor_runtime/l1-results.json -- -p sw-pal --features test-fakes`；測試會建立並清除暫時 user unit |
+| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 root 於可丟棄容器（例：`docker run --cap-add SYS_ADMIN`，掛載 repo）跑 gate，或單獨執行 `python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json --caps sys_admin -- --workspace --features test-fakes -- --ignored cap_sys_admin__`（gate 以 `slice21_gate_judge.py caps-plan` 由鎖 selector 推導，OD-53） |
+| `linux_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime` | `systemctl --user is-system-running` 為 running／degraded | BLOCKED-OWNER | 於隔離的 systemd 容器（`tools/docker/systemd.Dockerfile`，OD-15）以一般使用者登入 session 跑 gate，或單獨執行 `... --out <run>/linux_cap_supervisor_runtime/l1-results.json --caps supervisor_runtime -- --workspace --features test-fakes -- --ignored cap_supervisor_runtime__`；測試會建立並清除暫時 user unit |
 | `linux_cap_windows_native` | `s21_gate:cap_windows_native` | 原生 Windows | LOCAL-WINDOWS-TODO | linux 列的測試本體需 PowerShell／Job Object，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔 |
 | `linux_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop` | Windows 互動 console | LOCAL-WINDOWS-TODO | 非 Windows 版刻意 panic；同上 |
 
