@@ -226,19 +226,49 @@ class Driver:
         return {"daemon_pids": uc.scan_daemon_instances(), "entries": self.entries(),
                 "files": uc.snapshot_files(CONFIG)}
 
+    @staticmethod
+    def _start_ticks(pid: int) -> str | None:
+        try:
+            stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        fields = stat[stat.rfind(")") + 2:].split()
+        return fields[19] if len(fields) > 19 else None
+
     def phase_upgrade_running(self) -> bool:
         before = self._site()
+        old_status = self.daemon_status() or {}
+        legacy = str(old_status.get("version") or OLD_VERSION).startswith("0.3.")
+        old_ids = {pid: self._start_ticks(pid) for pid in before["daemon_pids"]}
+        t0 = time.monotonic()
         proc = self.run([str(self.new_cli), "setup", self.flag], label="0.4.0 setup（舊 daemon 執行中）", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
+            # OD-48：在 driver 任何啟動動作之前取樣，確認新 daemon 由 setup 自己啟動。
+            status = self.wait_daemon(version=NEW_VERSION, timeout=20.0)
+            t1 = time.monotonic()
+            alive = [pid for pid, ticks in old_ids.items() if ticks is not None and self._start_ticks(pid) == ticks]
+            overlaps = [{"t": round(t - t0, 3), "pids": sorted(pids)} for t, pids in list(self.samples)
+                        if t0 <= t <= t1 and len(pids) > 1]
             self.add(uc.row("upgrade_with_old_daemon_running", "PASS", None, outcome="switched"))
+            self.add(uc.judge_legacy_direct_setup(
+                "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
+                old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(),
+                cfg_before=self.cfg_before, cfg_after=uc.snapshot_files(CONFIG), overlaps=overlaps,
+                new_version=NEW_VERSION, old_version=OLD_VERSION))
             return True
         self.observations.append({"id": "OBS-UPGRADE-LEGACY-HANDOFF", "phase": "upgrade_with_old_daemon_running",
                                   "error_code": body.get("error_code"), "probe": body.get("probe"),
                                   "message": body.get("message"), "hint": body.get("hint")})
-        r = uc.judge_refusal("upgrade_with_old_daemon_running", before, self._site(), body, uc.REFUSAL_LEGACY_HANDOFF)
+        after = self._site()
+        r = uc.judge_upgrade_running_refusal("upgrade_with_old_daemon_running", before, after, body, legacy=legacy)
         r["detail"]["outcome"] = "refused"
         self.add(r)
+        self.add(uc.judge_legacy_direct_setup(
+            "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
+            old_alive_after=sorted(after["daemon_pids"]), status_after=None, instances_after=after["daemon_pids"],
+            cfg_before=self.cfg_before, cfg_after=uc.snapshot_files(CONFIG), overlaps=[],
+            new_version=NEW_VERSION, old_version=OLD_VERSION))
         return False
 
     def phase_upgrade_after_stop(self, already: bool) -> None:

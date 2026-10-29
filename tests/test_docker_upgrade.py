@@ -237,6 +237,78 @@ def test_refusal_with_wrong_reason_fails():
         "verdict"] == "INSUFFICIENT"
 
 
+def _legacy_body(*, started=True, method="rpc_daemon_stop", ok=True):
+    return {"ok": ok, "install": {"op": "install", "to_version": "0.4.0", "steps": [
+        {"step": "stop_supervisor", "ok": True, "detail": {"handoff": "legacy_stopped", "legacy_stop": {
+            "method": method, "from_version": "0.3.2", "waited_ms": 7000, "relaunch_count": 0,
+            "stability_window_ms": 5000}}},
+        {"step": "start_and_verify", "ok": True, "detail": {"started": started, "daemon_version": "0.4.0"}},
+    ]}}
+
+
+def _legacy_judge(**override):
+    args = dict(setup_rc=0, body=_legacy_body(), old_pids=[101], old_alive_after=[],
+                status_after={"ok": True, "version": "0.4.0", "pid": 202}, instances_after=[202],
+                cfg_before={"config.yaml": "a", "profiles/bench.yaml": "b"},
+                cfg_after={"config.yaml": "a", "profiles/bench.yaml": "b"}, overlaps=[])
+    args.update(override)
+    return uc.judge_legacy_direct_setup("legacy_handoff_direct_setup", **args)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_direct_setup_is_required_check():
+    """OD-48：新增檢查 id 列入必要檢查；舊 id 保留（不改語意）。"""
+    assert "legacy_handoff_direct_setup" in uc.REQUIRED_CHECKS
+    assert "upgrade_with_old_daemon_running" in uc.REQUIRED_CHECKS and "upgrade_after_stop" in uc.REQUIRED_CHECKS
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_direct_setup_passes_only_when_setup_started_new_daemon():
+    """0.3.2 daemon 執行中直接 setup：切換成功、舊行程樹結束、新 daemon 由 setup 啟動、設定保留、無重疊 → PASS。"""
+    assert _legacy_judge()["verdict"] == "PASS"
+    assert _legacy_judge(body=_legacy_body(method="systemctl_stop"))["verdict"] == "PASS"
+    # setup 沒有啟動新 daemon（driver 不得代啟）→ FAIL
+    row = _legacy_judge(body=_legacy_body(started=False))
+    assert row["verdict"] == "FAIL" and "由 setup 啟動" in row["reason"], row
+    row = _legacy_judge(status_after=None, instances_after=[])
+    assert row["verdict"] == "FAIL" and "由 setup 啟動" in row["reason"], row
+    # 新舊兩個 daemon 同時存在
+    assert _legacy_judge(instances_after=[202, 303])["verdict"] == "FAIL"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_direct_setup_failure_modes():
+    """舊行程樹未結束、設定被改寫、升級期間重疊、缺 legacy_stop 或 setup 失敗 → FAIL；沒有舊 daemon → INSUFFICIENT。"""
+    row = _legacy_judge(old_alive_after=[101])
+    assert row["verdict"] == "FAIL" and "舊 daemon" in row["reason"], row
+    row = _legacy_judge(cfg_after={"config.yaml": "changed", "profiles/bench.yaml": "b"})
+    assert row["verdict"] == "FAIL" and "設定" in row["reason"], row
+    row = _legacy_judge(overlaps=[{"t": 1.0, "pids": [101, 202]}])
+    assert row["verdict"] == "FAIL" and "two-reader" in row["reason"], row
+    body = _legacy_body()
+    body["install"]["steps"][0]["detail"].pop("legacy_stop")
+    assert _legacy_judge(body=body)["verdict"] == "FAIL"
+    refused = {"ok": False, "error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+    assert _legacy_judge(setup_rc=2, body=refused)["verdict"] == "FAIL"
+    assert _legacy_judge(old_pids=[])["verdict"] == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_refusal_no_longer_accepted_for_0_3_x():
+    """REFUSAL_LEGACY_HANDOFF 只用於非 legacy 的不支援交接 daemon；0.3.x daemon 被拒絕即 FAIL（OD-48）。"""
+    before = {"daemon_pids": [101], "entries": {"serialwrap": "/pipx/bin/serialwrap"}, "files": {"config.yaml": "a"}}
+    after = json.loads(json.dumps(before))
+    refused = {"ok": False, "error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+    row = uc.judge_upgrade_running_refusal("upgrade_with_old_daemon_running", before, after, refused, legacy=True)
+    assert row["verdict"] == "FAIL" and "OD-48" in row["reason"], row
+    row = uc.judge_upgrade_running_refusal("upgrade_with_old_daemon_running", before, after, refused, legacy=False)
+    assert row["verdict"] == "PASS", row
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_seed_requires_binding_effective_in_baseline():
