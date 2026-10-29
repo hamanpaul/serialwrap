@@ -294,12 +294,22 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
                     before = host_load()
                     root = work / f"r{rep}-{load}-{event}-{attempt}"
                     if event == "stop_request":
-                        for n in range(samples):
+                        setup_failures: list[str] = []
+                        n = 0
+                        while len(values) + len(errors) < samples:
+                            n += 1
                             d = rpc = None
                             try:
-                                d = harness.start_daemon(root / f"s{n % 2}", daemon=daemon_cmd, cli=cli_cmd, login=False)
-                                rpc = _Rpc(d.endpoint)
-                                _wait_state(rpc, "READY")
+                                try:                       # 準備（起 daemon 到 READY）不計時；失敗另記並重試，不算量測錯誤
+                                    d = harness.start_daemon(root / f"s{n % 2}", daemon=daemon_cmd, cli=cli_cmd, login=False)
+                                    rpc = _Rpc(d.endpoint)
+                                    _wait_state(rpc, "READY")
+                                except Exception as exc:  # noqa: BLE001
+                                    setup_failures.append(f"setup #{n}: {type(exc).__name__}: {exc}")
+                                    if len(setup_failures) > max(5, samples // 50):
+                                        errors.append(f"準備失敗過多（{len(setup_failures)}）：{setup_failures[-1]}")
+                                        break
+                                    continue
                                 tgt = d.targets["COM0"]
                                 if load == "flood":
                                     with _Flood(tgt, int(flood_cfg["bytes_per_s"]), int(flood_cfg["chunk_bytes"])):
@@ -312,6 +322,8 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
                                 values.append(ms)
                             except Exception as exc:  # noqa: BLE001 — 逐筆記錄，不中斷整輪
                                 errors.append(f"stop #{n}: {type(exc).__name__}: {exc}")
+                                if len(errors) > 5:
+                                    break
                             finally:
                                 if rpc is not None:
                                     rpc.close()
@@ -342,6 +354,9 @@ def measure(args: argparse.Namespace, contract: dict[str, Any], log: Callable[[s
                     run = judge_run(values, want=samples, limit=limit, load_before=before, load_after=host_load(),
                                     errors=errors)
                     run.update({"repeat": rep, "load": load, "event": event, "attempt": attempt})
+                    if event == "stop_request":
+                        run["setup_failures"] = setup_failures[:5]
+                        run["setup_failure_count"] = len(setup_failures)
                     log(f"[{args.label}] r{rep} {load} {event}: {run['verdict']} max={run['max_ms']} p99={run['p99_ms']}"
                         f" n={run['count']} void={run['void']} err={len(errors)}")
                     if not args.keep_work:
