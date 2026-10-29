@@ -40,7 +40,8 @@ impl SessionCore {
         )
     }
 
-    /// worker 健康（`snapshot()["running"]`／`["serial_alive"]`；executor 注入，未注入視為健康）。
+    /// worker 健康覆寫（`snapshot()["running"]`／`["serial_alive"]`；只供測試注入）。正式路徑取
+    /// `SelfTestProbes::bridge_snapshot`（manager 注入）；兩者皆未設定時視為健康。
     pub fn set_worker_health(&mut self, probe: Arc<dyn Fn() -> WorkerSnapshot + Send + Sync>) {
         self.worker_health = Some(probe);
     }
@@ -377,7 +378,19 @@ impl SessionCore {
         if self.state != SessionState::Attached {
             return Err(self.selector_error("SESSION_NOT_READY"));
         }
-        let health = self.worker_health.as_ref().map(|probe| probe());
+        // Python `bridge.snapshot()` 的 running／serial_alive：正式路徑取 manager 注入的現行 epoch IoWorker 快照
+        // （`SelfTestProbes::bridge_snapshot`，與 self-test 共用；接線稽核 R3-8）；探針有設但查無該 epoch 的 worker
+        // 視為未運行。兩者皆未注入（單元 harness）時視為健康。
+        let health = match self.worker_health.as_ref() {
+            Some(probe) => Some(probe()),
+            None => match (self.self_test_probes.bridge_snapshot.as_ref(), self.generations.conn_epoch) {
+                (Some(snapshot), Some(epoch)) => Some(snapshot(epoch).unwrap_or(WorkerSnapshot {
+                    serial_alive: false,
+                    running: false,
+                })),
+                _ => None,
+            },
+        };
         let worker_ok = health.is_none_or(|h| h.running && h.serial_alive);
         if !worker_ok || self.vtty_alive() == Some(false) {
             return Err(self.selector_error("SESSION_NOT_READY"));
