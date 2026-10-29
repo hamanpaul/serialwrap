@@ -208,8 +208,9 @@ fn console_input_reaches_uart_and_rx_fans_out() {
 #[test]
 fn console_methods_no_longer_deferred() {
     let r = ServiceRig::with_console_backend("pty");
-    // 依 crate 目錄定位（cargo_l1_results.py 以 repo 根為 cwd 執行測試執行檔，相對路徑會失敗）。
-    let scope = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/acceptance/slice21_scope.yaml")).unwrap();
+    // 依 repo 根定位（cargo_l1_results.py 不在 crate 目錄執行測試執行檔，相對路徑會失敗；
+    // CARGO_MANIFEST_DIR 只允許出現在 tests/common/mod.rs，見 check_cfg_boundary.py）。
+    let scope = std::fs::read_to_string(support::data_root().join("tests/acceptance/slice21_scope.yaml")).unwrap();
     let still = support::deferred_methods(&scope, &["2.1", sw_core::SLICE]);
     assert!(still.iter().all(|m| !m.starts_with("session.console_")), "{still:?}");
     for m in ["session.console_attach", "session.console_detach", "session.console_list"] {
