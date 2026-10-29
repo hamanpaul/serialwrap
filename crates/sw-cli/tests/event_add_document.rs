@@ -315,3 +315,81 @@ fn stdout_write_failure_follows_python_except_path() {
         "serialwrap: event.rule_list failed: INTERNAL_ERROR: [Errno 32] Broken pipe\n"
     );
 }
+
+/// S1X-b-2：`--file` 內含孤立 surrogate 跳脫時，Python `json.load` 保留 surrogate，`json.dumps(...).encode("utf-8")`
+/// 於連線成功後、送出前拋 `UnicodeEncodeError` → INTERNAL_ERROR（context=event.rule_set）、exit 1、daemon 收到 0 筆請求行。
+/// 期望值取自 Python 3.12.3 CLI 對記錄請求行的 echo stub 實測（stub 端連線建立但收到 0 bytes）。
+#[test]
+fn add_lone_surrogate_in_document_fails_after_connect_without_sending() {
+    let cases: [(&str, &str); 7] = [
+        (r#"{"lone":"\udc80"}"#, "character '\\udc80' in position 52"),
+        (r#"{"a":"\ud800"}"#, "character '\\ud800' in position 49"),
+        (r#"{"a":"\ud800A"}"#, "character '\\ud800' in position 49"),
+        (r#"{"a":"x\udc80\udc81y"}"#, "characters in position 50-51"),
+        (r#"{"k\udcff":1}"#, "character '\\udcff' in position 46"),
+        (
+            r#"{"n":"\u0000","a":["é","\udfff"]}"#,
+            "character '\\udfff' in position 67",
+        ),
+        (
+            r#"{"name":"r","pattern":"x","lone":"\udc80"}"#,
+            "character '\\udc80' in position 77",
+        ),
+    ];
+    for (doc, detail) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        let message = format!("'utf-8' codec can't encode {detail}: surrogates not allowed");
+        assert_eq!(rc, 1, "doc={doc} out={out}");
+        assert_eq!(
+            out,
+            format!(
+                "{{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"{}\",\"ok\":false}}\n",
+                message.replace('\\', "\\\\")
+            ),
+            "doc={doc}"
+        );
+        assert_eq!(
+            err,
+            format!("serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}\n"),
+            "doc={doc}"
+        );
+        assert_eq!(conn.connect_count(), 1, "doc={doc}");
+        assert!(
+            sent_text(&conn).is_empty(),
+            "doc={doc} sent={:?}",
+            sent_text(&conn)
+        );
+    }
+}
+
+#[test]
+fn add_lone_surrogate_connect_failure_reports_socket_error_first() {
+    // Python 先連線：連線失敗時回 SOCKET_ERROR（exit 2），不會走到編碼錯誤。
+    let (p, conn) = platform(
+        &[("/f.json", br#"{"lone":"\udc80"}"#.to_vec())],
+        vec![FakeConn::refuse_errno(
+            111,
+            "[Errno 111] Connection refused",
+        )],
+    );
+    let (rc, out, _) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 2, "out={out}");
+    assert!(out.contains("\"error_code\":\"SOCKET_ERROR\""), "out={out}");
+    assert!(sent_text(&conn).is_empty());
+}
+
+#[test]
+fn add_paired_surrogate_escape_is_sent_as_one_code_point() {
+    // 合法的 surrogate pair 仍組成單一碼位送出（回歸防線：不得誤判為孤立 surrogate）。
+    let (p, conn) = platform(
+        &[("/f.json", br#"{"e":"\ud83d\ude00"}"#.to_vec())],
+        ok_reply(),
+    );
+    let (rc, _, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 0, "stderr={err}");
+    assert_eq!(
+        sent_text(&conn),
+        vec!["{\"id\":1,\"method\":\"event.rule_set\",\"params\":{\"e\":\"😀\"}}\n".to_string()]
+    );
+}

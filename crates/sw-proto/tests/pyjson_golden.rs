@@ -36,6 +36,35 @@ fn lone_surrogate_becomes_replacement() {
     assert_eq!(pyjson::dumps(&v, &RPC_WIRE), "\"\u{FFFD}x\"");
 }
 
+/// S1X-b-2：請求端檔案內容保留孤立 surrogate（`pyfmt` 跳脫）並回報旗標；`loads` 的 RPC-H-03 行為不變。
+#[test]
+fn keep_lone_surrogates_escapes_and_flags() {
+    let (v, lone) =
+        pyjson::loads_keep_lone_surrogates(r#"{"k\udcff":["\ud800\u0041","\udc80"]}"#).unwrap();
+    assert!(lone);
+    let mut k = String::from("k");
+    sw_proto::pyfmt::escape_surrogate(0xDCFF, &mut k);
+    let mut a = String::new();
+    sw_proto::pyfmt::escape_surrogate(0xD800, &mut a);
+    a.push('A');
+    let mut b = String::new();
+    sw_proto::pyfmt::escape_surrogate(0xDC80, &mut b);
+    let mut want = pyjson::PyDict::new();
+    want.insert(&k, pyjson::PyValue::List(vec![a.into(), b.into()]));
+    assert_eq!(v, pyjson::PyValue::Dict(want));
+
+    let (v, lone) =
+        pyjson::loads_keep_lone_surrogates(r#"{"e":"\ud83d\ude00","n":"\u0000"}"#).unwrap();
+    assert!(!lone);
+    assert_eq!(
+        v,
+        pyjson::loads(r#"{"e":"\ud83d\ude00","n":"\u0000"}"#).unwrap()
+    );
+
+    let v = pyjson::loads(r#""\udc80""#).unwrap();
+    assert_eq!(pyjson::dumps(&v, &RPC_WIRE), "\"\u{FFFD}\"");
+}
+
 #[test]
 fn duplicate_key_keeps_first_position_last_value() {
     let v = pyjson::loads(r#"{"a":1,"b":2,"a":3}"#).unwrap();

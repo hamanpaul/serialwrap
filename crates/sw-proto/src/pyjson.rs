@@ -4,6 +4,7 @@
 //!
 //! 已登記非契約差異（arch §3.3、spec §11.3）：
 //! - `RPC-H-03`：孤立 surrogate（lone surrogate，U+D800..=U+DFFF）轉譯為 U+FFFD 替換字元。
+//!   只涵蓋回應端；請求端的檔案內容改用 [`loads_keep_lone_surrogates`] 保留 surrogate（S1X-b-2）。
 //! - `JSON_MAX_DEPTH`：2900（顯式堆疊巢狀深度上限，超過時回傳 `JsonError::Recursion`）。
 //! - 整數字面量長度：CPython 3.12 預設限制 4300 位（CVE-2020-10735 `ValueError`），此處以 `PyInt::Big` 接受大於 i128 的整數。
 
@@ -704,8 +705,31 @@ fn parse_hex4(bytes: &[u8]) -> Option<u16> {
     }
 }
 
+/// 孤立 surrogate 跳脫的解碼方式與是否出現過。
+struct LoneSurrogates {
+    /// `true`：以 [`crate::pyfmt::escape_surrogate`] 跳脫保留；`false`：依 RPC-H-03 換成 U+FFFD。
+    keep: bool,
+    found: bool,
+}
+
+impl LoneSurrogates {
+    fn push(&mut self, out: &mut String, cp: u16) {
+        self.found = true;
+        if self.keep {
+            crate::pyfmt::escape_surrogate(u32::from(cp), out);
+        } else {
+            out.push('\u{FFFD}');
+        }
+    }
+}
+
 /// 解析 JSON 字串（含跳脫字元與 surrogate pair 轉譯）。
-fn parse_string(s: &str, bytes: &[u8], start_quote: usize) -> Result<(String, usize), JsonError> {
+fn parse_string(
+    s: &str,
+    bytes: &[u8],
+    start_quote: usize,
+    lone: &mut LoneSurrogates,
+) -> Result<(String, usize), JsonError> {
     let mut out = String::new();
     let mut idx = start_quote + 1;
 
@@ -782,15 +806,15 @@ fn parse_string(s: &str, bytes: &[u8], start_quote: usize) -> Result<(String, us
                             } else {
                                 // 接續不是 low surrogate，依 RPC-H-03 當前 high surrogate 為孤立 surrogate
                                 // 不消耗接續的 \uXXXX，留待下一輪作為一般 escape 解析
-                                out.push('\u{FFFD}');
+                                lone.push(&mut out, uni);
                             }
                         } else {
                             // 無接續的 \u，當前 high surrogate 為孤立 surrogate
-                            out.push('\u{FFFD}');
+                            lone.push(&mut out, uni);
                         }
                     } else if (0xDC00..=0xDFFF).contains(&uni) {
                         // 孤立 low surrogate（RPC-H-03）
-                        out.push('\u{FFFD}');
+                        lone.push(&mut out, uni);
                     } else {
                         out.push(char::from_u32(uni as u32).unwrap());
                     }
@@ -886,8 +910,30 @@ enum ContainerFrame {
     },
 }
 
-/// `json.loads`（strict=True）。
+/// `json.loads`（strict=True）。孤立 surrogate 依 RPC-H-03 換成 U+FFFD。
 pub fn loads(s: &str) -> Result<PyValue, JsonError> {
+    let mut lone = LoneSurrogates {
+        keep: false,
+        found: false,
+    };
+    loads_with(s, &mut lone)
+}
+
+/// 同 [`loads`]，但孤立 surrogate 跳脫比照 Python 保留：以 [`crate::pyfmt::escape_surrogate`]
+/// （`ESCAPE_MARK` 加偏移字元）表示，並回傳是否出現過孤立 surrogate（S1X-b-2）。
+///
+/// 供請求端的檔案內容使用：Python `json.load` 保留 surrogate，之後 `json.dumps(...).encode("utf-8")`
+/// 送出前失敗；呼叫端據旗標拒送。旗標為 `false` 時，回傳值與 [`loads`] 相同。
+pub fn loads_keep_lone_surrogates(s: &str) -> Result<(PyValue, bool), JsonError> {
+    let mut lone = LoneSurrogates {
+        keep: true,
+        found: false,
+    };
+    let value = loads_with(s, &mut lone)?;
+    Ok((value, lone.found))
+}
+
+fn loads_with(s: &str, lone: &mut LoneSurrogates) -> Result<PyValue, JsonError> {
     if s.starts_with('\u{FEFF}') {
         return Err(JsonError::Decode(JsonDecodeError {
             msg: "Unexpected UTF-8 BOM (decode using utf-8-sig)".to_string(),
@@ -925,7 +971,7 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                 let b = bytes[idx];
                 match b {
                     b'"' => {
-                        let (val_str, new_idx) = parse_string(s, bytes, idx)?;
+                        let (val_str, new_idx) = parse_string(s, bytes, idx, lone)?;
                         idx = new_idx;
                         action = Action::PassUp(PyValue::Str(val_str));
                     }
@@ -964,7 +1010,7 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                                     "Expecting property name enclosed in double quotes",
                                 ));
                             }
-                            let (key, new_idx) = parse_string(s, bytes, idx)?;
+                            let (key, new_idx) = parse_string(s, bytes, idx, lone)?;
                             idx = skip_ws(bytes, new_idx);
                             if idx >= bytes.len() || bytes[idx] != b':' {
                                 return Err(decode_error(s, idx, "Expecting ':' delimiter"));
@@ -1068,7 +1114,7 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                                     "Expecting property name enclosed in double quotes",
                                 ));
                             }
-                            let (next_key, new_idx) = parse_string(s, bytes, idx)?;
+                            let (next_key, new_idx) = parse_string(s, bytes, idx, lone)?;
                             idx = skip_ws(bytes, new_idx);
                             if idx >= bytes.len() || bytes[idx] != b':' {
                                 return Err(decode_error(s, idx, "Expecting ':' delimiter"));
