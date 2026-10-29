@@ -387,3 +387,21 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 - 本輪改以一般使用者 `ubuntu`（非 root）執行全套與 cargo 測試；起點 e9b5c61 於獨立 clone 跑基準。
 - 上輪「`test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread` 在 root 下不成立」：非 root 重跑 17/17 passed，確認為 root 環境因素。
 - `test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only` 的 `COM9` 參數 id：本機 pytest 9.2.0 對長字串參數改產 `msg2` id；以 CI 釘定的 pytest 9.0.3 重跑即通過（環境因素；起點與本輪同環境比較）。
+
+### 第四輪 Slice 2.2 出口 gate（`s22_gate_check.py` 非 dry-run，`target/s22-gate/261029-r4b`，HEAD 24b8012）
+
+result = FAIL。cargo_workspace PASS（2123 passed）、console_conformance_pty PASS（需 `cargo_l1_results.py --caps posix_pty`）、
+py_parity PASS、parity_py FAIL（指紋 2 案，OWNER-BATCH）、blackbox_rust FAIL（slice21 `test_stale_context_not_replayed`、
+`test_two_daemons_same_tty`，P5）、win_test INSUFFICIENT（LOCAL-WINDOWS-TODO）。逐案 93：PASS 23／BLOCKED-OWNER 62／FAIL 8
+（Slice 2.1 繼承 L1.5 情境，非 root 下 Rust holder 掃描 fail-closed，root 下 PASS，交 P5）。parity_rows：PASS 17／FAIL 1／INSUFFICIENT 5。
+首次實跑另抓到 `console_methods_no_longer_deferred` 依賴 cwd（24b8012、a8c57f0 修正）。
+
+### 第四輪全套 pytest（非 root、同一環境）
+
+起點 e9b5c61：25 failed／5528 passed／226 skipped；終點 24b8012：20 failed＋1 error／5561 passed／223 skipped。超出基準 8 項：
+`tests/test_rust_cfg_boundary.py::test_repo_clean` 為 24b8012 引入的真實回歸（執行期讀檔被判 test-data-path），a8c57f0 修正
+（33 passed）；其餘 7 項（`test_mgmt_stubs::test_live_daemon_fixture_serves_attached_console_list`、slice21
+`test_queue_full_backpressure`、`test_reject_paths_zero_tx[CMD_TOO_LONG]`、`test_cli_mgmt_l15::test_restart_no_stale_console_replay`、
+`test_functest_bridge_smoke::test_bridge_smoke_sm01`、`test_l15_smoke::test_{reject_zero_tx,release_inflight}_runs_on_python`）皆為
+Python daemon 側 `ATTACH_FAILED:DeviceHeldError`：起點基準執行時洩漏的 throwaway Python daemon（pid 19168，持有 /dev/pts/1、/dev/pts/2）
+於整段終點全套期間存活。清除後同範圍連跑兩次：第一次 7/7 passed、第二次僅 `test_queue_full_backpressure` 失敗（失敗集合不同）。
