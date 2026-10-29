@@ -24,7 +24,7 @@ def _doc(verdict="PASS", virt="wsl2", rev=HEAD, **params):
     return {"schema": "wal_s1w.v1", "verdict": verdict, "failures": [] if verdict == "PASS" else ["append_p99 0.05 ms > 0.02 ms"],
             "params": {**FORMAL, **params}, "thresholds": {"platform": "linux"},
             "append_ms": {"p50": 0.003, "p95": 0.008, "p99": 0.015}, "rotate_max_ms": 2.1,
-            "env": {"virtualization": virt, "git_revision": rev, "fs_type": "ext4", "os": "posix"}}
+            "env": {"virtualization": virt, "git_revision": rev, "source_tree_dirty": False, "fs_type": "ext4", "os": "posix"}}
 
 
 def test_imported_wsl2_evidence_is_formal():
@@ -75,3 +75,30 @@ def test_cli_and_gate_wiring(tmp_path):
 
     exp = yaml.safe_load((ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml").read_text(encoding="utf-8"))
     assert exp["wal_s1w"]["formal_params"] == FORMAL and exp["wal_s1w"]["relevant_paths"]
+
+
+@pytest.mark.parametrize("dirty", [True, None, "unknown"])
+def test_imported_evidence_requires_clean_source_tree(dirty):
+    """sol P5-4f8acdf-2：量測時工作樹不乾淨（或未記錄）時 git_revision 不代表受測碼 → EVIDENCE_MISSING。"""
+    doc = _doc()
+    if dirty is None:
+        doc["env"].pop("source_tree_dirty")
+    else:
+        doc["env"]["source_tree_dirty"] = dirty
+    st, reasons = judge.wal_s1w_verdict(None, imported=doc, host_label="owner-wsl2", formal_params=FORMAL)
+    assert st == "EVIDENCE_MISSING" and any("source_tree_dirty" in r for r in reasons), reasons
+
+
+def test_relevant_paths_cover_build_profile_manifests():
+    """sol P5-4f8acdf-2：release profile（workspace Cargo.toml）與 crate manifest 變更也使舊證據失效。"""
+    import yaml
+
+    exp = yaml.safe_load((ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    paths = exp["wal_s1w"]["relevant_paths"]
+    for need in ("Cargo.toml", "crates/sw-core/Cargo.toml", "crates/sw-pal/Cargo.toml"):
+        assert need in paths, need
+
+
+def test_wal_s1w_example_records_source_tree_dirty():
+    text = (ROOT / "crates" / "sw-core" / "examples" / "wal_s1w.rs").read_text(encoding="utf-8")
+    assert '"source_tree_dirty"' in text and '"--porcelain"' in text

@@ -348,7 +348,8 @@ def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, A
     """wal_s1w_perf section 判定（OD-61）。
 
     - 有匯入證據（編排者於擁有者 WSL2 主機以 throwaway 環境量測）：須為 `wal_s1w.v1`、Linux 門檻、正式量測參數
-      （`formal_params`）、`env.virtualization` ∈ {wsl2, native}、附主機類型標註（`host_label`）、`env.git_revision`
+      （`formal_params`）、`env.virtualization` ∈ {wsl2, native}、附主機類型標註（`host_label`）、`env.source_tree_dirty`
+      為 false、`env.git_revision`
       為本分支歷史中的 commit，且該 commit 之後 WAL 寫入相關路徑（`relevant_paths`）未再變更；符合者以其 verdict 判定，
       不符即 EVIDENCE_MISSING（證據無法追溯或不代表受測版本）。
     - 無匯入：gate 本機量測若為 wsl2／native 照其 verdict 判定；雲端 `vm:*`／unknown 只作診斷 → EVIDENCE_MISSING。
@@ -371,6 +372,9 @@ def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, A
             problems.append(f"env.virtualization={virt!r}：vm／未知主機只作診斷（OD-61）")
         if need_label and not (host_label or "").strip():
             problems.append("匯入證據未附主機類型標註（SW_GATE_WAL_S1W_HOST）")
+        if env.get("source_tree_dirty") is not False:
+            # sol P5-4f8acdf-2：工作樹不乾淨或未記錄時 git_revision 不代表受測碼。
+            problems.append(f"env.source_tree_dirty={env.get('source_tree_dirty')!r}（須為 false）")
         rev = str(env.get("git_revision") or "")
         if not _HEX40_RE.match(rev):
             problems.append(f"env.git_revision={rev!r} 無法追溯 commit")
@@ -673,6 +677,15 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
                 sec["reasons"] = list(sec["reasons"]) + [
                     f"{row.get('case_id')} 依 {row.get('decision')} 移出 l15_ab，承擔的 section 非 PASS：{not_pass}"]
 
+    # sol P5-4f8acdf-1：鎖中的 `s21_gate:*` 集合須由某個 section（required_set 或 additional_required_sets）承擔，
+    # 否則其 nodeid 從未被執行或判定（例如 OD-55 的能力集合）——不得 READY。
+    carried = {str(s.get("required_set")) for s in out_sections if s.get("required_set")}
+    for name, sets in (expect.get("additional_required_sets") or {}).items():
+        carried |= {str(x) for x in (sets or [])}
+    for s in out_sections:
+        carried |= {str(x) for x in (s.get("additional_required_sets") or [])}
+    uncarried = sorted(sid for sid in ((expect.get("lock") or {}).get("sets") or {})
+                       if sid.startswith("s21_gate:") and sid not in carried)
     missing_id, mismatch_id = identity_problems(report.get("identity"), expect.get("daemon_path"))
     uptake = case_uptake(expect.get("freeze"), expect.get("case_verdicts"))
     b_status, b_reasons, b_res = judge_breaker(expect.get("freeze"), expect.get("breaker"))
@@ -699,6 +712,8 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         verdict_reasons.append(f"EVIDENCE_MISSING section：{missing}")
     if missing_id:
         verdict_reasons.append(f"identity 缺漏：{missing_id}")
+    if uncarried:
+        verdict_reasons.append(f"s21_gate 集合未被任何 section 承擔（從未執行或判定）：{uncarried}")
     if report.get("dry_run"):
         verdict_reasons.append("--dry-run 永不 READY")
     if parity.get("evaluated") and parity.get("incomplete"):
@@ -709,7 +724,7 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
 
     if failed or mismatch_id:
         verdict = "FAIL"
-    elif (missing or missing_id or report.get("dry_run")
+    elif (missing or missing_id or uncarried or report.get("dry_run")
           or (parity.get("evaluated") and parity.get("incomplete"))
           or (isinstance(pre, Mapping) and pre.get("event_latency_frozen") is False)):
         verdict = "INCOMPLETE"

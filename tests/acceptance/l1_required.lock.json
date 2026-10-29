@@ -10154,6 +10154,7 @@
           "cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::expired_send_deadline_returns_timeout",
           "cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::only_einprogress_is_treated_as_pending_connect",
           "cargo:sw-pal::sw_pal::rpc_transport::tests::py_repr_matches_python",
+          "cargo:sw-pal::sw_pal::serial::posix::tests::accept_unverified_warning_matches_python_template",
           "cargo:sw-pal::sw_pal::serial::posix::tests::close_sequence_close_fd_failure",
           "cargo:sw-pal::sw_pal::serial::posix::tests::close_sequence_nxcl_hangup_errno_is_cleared",
           "cargo:sw-pal::sw_pal::serial::posix::tests::close_sequence_nxcl_other_errno_still_closes",

@@ -338,8 +338,8 @@ pub fn open_sequence(ops: &mut dyn TtyOpenOps, dev: &str) -> Result<(), OpenErro
             return Err(OpenError::Held(holders));
         }
         PostLockVerdict::AcceptUnverified => ops.warn(&format!(
-            "serialwrap: 無法確認 {dev} 的外部 holder（status={:?}），BC-04 僅保證 serialwrap 實例互斥",
-            holders.status
+            "serialwrap: 無法確認 {dev} 的外部 holder（status={}），BC-04 僅保證 serialwrap 實例互斥",
+            holders.status.py_name()
         )),
         PostLockVerdict::Accept => {}
     }
@@ -1935,6 +1935,36 @@ mod tests {
             "flock 失敗時不得 TIOCNXCL：{:?}",
             ops.ops
         );
+    }
+
+    /// sol P5-4f8acdf-3：鎖後重掃不完整時的 WARNING 須與 Python 逐字相同——`contracts/daemon_logging.yaml`
+    /// `uart_holder_scan_unknown` 以 `report.status`（"permission"／"unknown"）格式化，不得印 Rust enum 名稱。
+    #[test]
+    fn accept_unverified_warning_matches_python_template() {
+        for (status, text) in [
+            (HolderScanStatus::Permission, "permission"),
+            (HolderScanStatus::Unknown, "unknown"),
+        ] {
+            let mut ops = RecOpen {
+                probe: Some(HolderReport {
+                    pids: vec![],
+                    holder_unknown: true,
+                    status,
+                }),
+                ..RecOpen::default()
+            };
+            assert!(open_sequence(&mut ops, "/dev/pts/4").is_ok());
+            assert_eq!(
+                ops.warns,
+                vec![format!(
+                    "serialwrap: 無法確認 /dev/pts/4 的外部 holder（status={text}），BC-04 僅保證 serialwrap 實例互斥"
+                )]
+            );
+        }
+        let template = include_str!("../../../../contracts/daemon_logging.yaml");
+        assert!(template.contains(
+            "serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥"
+        ));
     }
 
     #[test]

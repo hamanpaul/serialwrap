@@ -524,7 +524,8 @@ fn non_root_holder_scan_permission_does_not_block_open() {
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_socket(&env.socket, SHORT);
     wait_ready(&env, "COM0");
-    d.wait_stderr_contains("的外部 holder（status=Permission）", SHORT);
+    // 與 Python `serial_port.py` 逐字相同（`report.status`＝"permission"；daemon_logging.yaml uart_holder_scan_unknown）。
+    d.wait_stderr_contains("的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥", SHORT);
     let h = health_status(&env.socket);
     let holders = format!("{:?}", h["foreign_holders"]);
     assert!(holders.contains("holder_unknown"), "foreign_holders 應回報 holder 未知的裝置：{holders}");

@@ -630,3 +630,20 @@ def test_gate_script_linux_l1_non_root_and_daemon_version_from_rpc():
     assert "id -u" in l1 and "SW_GATE_L1_USER" in l1 and "--run-euid" in l1 and "EVIDENCE_MISSING" in l1
     assert "probe_daemon_version.py" in text
     assert '"$RUST_D" --version' not in text      # serialwrapd 依 Python 1:1 不提供 --version
+
+
+def test_uncarried_gate_set_blocks_ready(case):
+    """sol P5-4f8acdf-1（High）：鎖中有 `s21_gate:*` 集合未被任何 section（含 additional_required_sets）承擔時，
+    其 nodeid 從未被執行或判定——不得 READY，verdict 須為 INCOMPLETE 並列出該集合。"""
+    exp = case.expect()
+    assert _judge_mod().judge(case.report(), exp)["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    exp["lock"]["sets"]["s21_gate:cap_sys_admin"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_sys_admin__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_sys_admin__"]}}}
+    out = _judge_mod().judge(case.report(), exp)
+    assert out["verdict"] == "INCOMPLETE"
+    assert any("s21_gate:cap_sys_admin" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 以 additional_required_sets 指派給 section 即視為承擔（由該 section 判定）
+    exp["additional_required_sets"] = {"linux_cap_posix_pty": ["s21_gate:cap_sys_admin"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"])
