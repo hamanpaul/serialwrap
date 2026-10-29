@@ -35,7 +35,8 @@ from test_holder_probe_namespace import (  # noqa: E402
     proc_root,  # noqa: F401 — pytest fixture
 )
 
-OTHER_UID = os.getuid() + 4242
+# Windows 無 os.getuid：模組須仍可收集（各測試另以 posix_only 標記）。
+OTHER_UID = (os.getuid() if hasattr(os, "getuid") else 0) + 4242
 
 
 def _owner(monkeypatch: pytest.MonkeyPatch, mapping: dict[int, int]) -> None:
@@ -158,7 +159,7 @@ def _ctx(status: dict[str, Any]) -> Any:
     )
 
 
-@pytest.mark.core_portable
+@pytest.mark.posix_only
 @pytest.mark.memory_only
 @pytest.mark.parametrize(
     ("entry", "verdict"),

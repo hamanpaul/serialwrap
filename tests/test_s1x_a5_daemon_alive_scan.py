@@ -21,7 +21,8 @@ from sw_core.constants import DEFAULT_ENDPOINT
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.memory_only]
 
-OTHER_UID = os.getuid() + 4242
+# Windows 無 os.getuid：模組須仍可收集（各測試另以 posix_only 標記）。
+OTHER_UID = (os.getuid() if hasattr(os, "getuid") else 0) + 4242
 
 
 def _proc(tmp_path: Path) -> Path:
