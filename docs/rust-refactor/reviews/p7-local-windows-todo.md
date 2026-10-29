@@ -9,7 +9,7 @@
 |---|---|---|---|
 | P7-BO-1 | `s21_core.linux` 依 08 §0.6 退役清單以替換測試逐名移除 `cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx`（→ `post_login_cmd_profile_logs_in`）與 `cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported`（→ `detect_skips_passthrough_and_console_unlock`） | OD-16：縮減／替換須擁有者明示核准；P7 PR 的 CI `regen_lock.py --check --base … --allow-removal` 清單需由擁有者加入上述兩個 nodeid（本分支不自行修改 CI 白名單） | fa847c7、94526b4 |
 | P7-BO-3 | **RESOLVED（OD-35，2026-10-28）**：擁有者裁決維持 SC-30；P5 F15 對應測試期望改為 SC-30 行為並登記「被已核准 SC-30 取代」（非削弱），`TxPermit.fsm_gen` 定案為 06 既有 `u64`＋`FsmMismatch`（見 08 Task 7「P7 修訂（OD-35 定案）」） | — | merge a089f9f；OD-35 |
-| P7-BO-4 | merge 主線（9d21ef7）帶入的 OD-24 防線 `tests/test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests` 對 P5 凍結集合 `s21_core`（linux 27 筆、windows 13 筆，`cap_*` 與 `plain_holder_child` 等 `#[ignore]` 列）報錯 | 擁有者逐名核准 `--allow-removal s21_core:<platform>:<nodeid>` 並加入 CI 白名單（OD-24 只核准 s1b_cargo 5 筆）；屬 P5 集合，本分支不自行移除 | merge 9d21ef7 |
+| P7-BO-4 | **linux 部分 RESOLVED（OD-55，P5 交付；第 13 輪 merge 37471d33 後重驗 `test_s21_core_linux_capability_rows_moved_to_cap_sets_od55` PASS）；剩 `s21_core.windows` 能力列待 P5 以 Windows 原生收集移入能力集合**。原文：merge 主線（9d21ef7）帶入的 OD-24 防線 `tests/test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests` 對 P5 凍結集合 `s21_core`（linux 27 筆、windows 13 筆，`cap_*` 與 `plain_holder_child` 等 `#[ignore]` 列）報錯 | 擁有者逐名核准 `--allow-removal s21_core:<platform>:<nodeid>` 並加入 CI 白名單（OD-24 只核准 s1b_cargo 5 筆）；屬 P5 集合，本分支不自行移除 | merge 9d21ef7 |
 | P7-BO-2 | Task 14 B-08：測試團隊 Windows 工作站（`windows-task` 監管、第三方 EDR）實際觸發 handler 的行為與延遲；B-06（OD-08）：本 PR 動到 PAL，需原生 Windows COM handle 環境的回歸證據 | 擁有者於實機環境執行並提供報告 | Task 14 |
 
 ## LOCAL-WINDOWS-TODO

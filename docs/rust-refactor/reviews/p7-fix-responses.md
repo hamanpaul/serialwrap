@@ -394,3 +394,14 @@ OD-59 案例 A（Python）／B（Rust 快照）皆 1 passed（cancel max 1.703�
 突變上限 0.5 ms → FAIL）；s23 interleave Python 基線 1 passed、WAL 窗口 2、無問題（注入 agent TX → 報錯）；新回歸 6 支修前紅、
 修後綠；觸及的 Python 測試 235 passed／19 skipped；`regen_lock --check --base HEAD` OK（4 個 p7_gate 集合 add-only 共 +9 筆）。
 證據與數字見 `slice23-chg-register.md` 附錄 P4／P5。
+
+### Slice 2.3 出口 gate 第 13 輪實跑（r13b-261029，`38c150ca`；紀錄 `docs/rust-refactor/evidence/p7-gate-261029-r13.md`，verify rc 0）
+
+非 dry-run、ubuntu 非 root、4 CPU；開跑前無洩漏 daemon，loadavg 0.56→0.71（16:59Z→19:32Z）。結論 NOT-PASS：
+cfg 邊界、cargo L1（272 筆）、contract_blackbox p7 A（40）／B（41）、func-test 兩案、regen_lock、policy_check PASS；
+Windows 兩列 BLOCKED-OWNER B-06；slice21 B INCOMPLETE（凍結集合含 Linux 必 skip 的 7 個 windows_native 與 1 個 DF-20
+deferred 節點，OWNER-BATCH）；slice22 B INCOMPLETE（P6）；l15 slice21 B INCOMPLETE（`s21-event-latency` 依 OD-58 自 P5 l15_ab
+移出後不再收集，P7 集合的逐名移除待擁有者裁決，OWNER-BATCH）；l15 slice23 B FAIL（4 筆皆 P6 `session.console_attach`）；
+coverage FAIL（154 案：37 PASS、82 BLOCKED-OWNER、35 缺漏——2.2 匯入 19、2.1 匯入 13、P6 相關 3）；全套 pytest FAIL
+（5 failed／5766 passed／224 skipped，失敗集合為起點基準子集）。gate 後以實跑 l1-results 將 merge 帶入、已通過的 147 個節點
+add-only 登記至 `p7_gate:python3-m-pytest-q-tests`（skip／xfail 不納入，口徑同 b85eec5），集合 5624→5771。
