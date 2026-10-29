@@ -393,3 +393,69 @@ fn add_paired_surrogate_escape_is_sent_as_one_code_point() {
         vec!["{\"id\":1,\"method\":\"event.rule_set\",\"params\":{\"e\":\"😀\"}}\n".to_string()]
     );
 }
+
+/// S1-2a65438-1：重複鍵以後值覆寫前值（Python `json.loads` 語意），被覆寫掉的孤立 surrogate 不得讓請求被拒；
+/// 只依最終物件判定。期望請求行取自 Python 3.12.3 `json.dumps` 實測。
+#[test]
+fn add_overwritten_lone_surrogate_by_duplicate_key_is_sent() {
+    let cases: [(&str, &str); 5] = [
+        (r#"{"lone":"\ud800","lone":"ok"}"#, r#"{"lone":"ok"}"#),
+        (
+            r#"{"a":{"x":"\udc80"},"a":{"x":"ok"}}"#,
+            r#"{"a":{"x":"ok"}}"#,
+        ),
+        (r#"{"a":["\udc80"],"b":1,"a":[1]}"#, r#"{"a":[1],"b":1}"#),
+        (
+            r#"{"o":{"a":"\udfff","a":2},"o":{"a":"\ud801","a":3}}"#,
+            r#"{"o":{"a":3}}"#,
+        ),
+        // 合法內容「NUL 後緊接 U+FD800」與 pyfmt 跳脫外形相同，不得被誤認為殘留的孤立 surrogate。
+        (
+            r#"{"a":"\udc80","a":"\u0000\udbb6\udc00"}"#,
+            "{\"a\":\"\\u0000\u{FD800}\"}",
+        ),
+    ];
+    for (doc, params) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        assert_eq!(rc, 0, "doc={doc} out={out} stderr={err}");
+        assert_eq!(
+            sent_text(&conn),
+            vec![format!(
+                "{{\"id\":1,\"method\":\"event.rule_set\",\"params\":{params}}}\n"
+            )],
+            "doc={doc}"
+        );
+    }
+}
+
+/// S1-2a65438-1：最終物件仍含孤立 surrogate（後值帶入，或重複鍵本身含 surrogate）時照樣拒送；位置依最終請求行。
+#[test]
+fn add_lone_surrogate_surviving_duplicate_key_is_rejected() {
+    let cases: [(&str, &str); 3] = [
+        (
+            r#"{"a":"ok","a":"\udc80"}"#,
+            "character '\\udc80' in position 49",
+        ),
+        (
+            r#"{"k\udcff":1,"k\udcff":2}"#,
+            "character '\\udcff' in position 46",
+        ),
+        (
+            r#"{"a":"\ud800","b":"x","a":"y","c":"\udc81"}"#,
+            "character '\\udc81' in position 65",
+        ),
+    ];
+    for (doc, detail) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        let message = format!("'utf-8' codec can't encode {detail}: surrogates not allowed");
+        assert_eq!(rc, 1, "doc={doc} out={out}");
+        assert_eq!(
+            err,
+            format!("serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}\n"),
+            "doc={doc}"
+        );
+        assert!(sent_text(&conn).is_empty(), "doc={doc}");
+    }
+}

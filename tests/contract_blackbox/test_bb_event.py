@@ -219,3 +219,23 @@ def test_event_add_lone_surrogate_rejected_before_send(env, stubd, tmp_path):
     )
     assert r.stderr == f"serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}".encode("utf-8") + NL
     assert s.requests() == []
+
+
+@pytest.mark.core_portable
+@pytest.mark.parametrize(
+    ("doc", "params"),
+    [
+        (b'{"lone":"\\ud800","lone":"ok"}', b'{"lone":"ok"}'),
+        (b'{"a":{"x":"\\udc80"},"a":{"x":"ok"}}', b'{"a":{"x":"ok"}}'),
+    ],
+)
+def test_event_add_overwritten_lone_surrogate_is_sent(env, stubd, tmp_path, doc, params):
+    """S1-2a65438-1：重複鍵後值覆寫前值（``json.load`` 語意），被覆寫掉的孤立 surrogate 不影響送出（Python 基線）。"""
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "dup.json"
+    f.write_bytes(doc)
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    assert r.rc == 0, r.stderr
+    assert r.stdout == b'{"ok":true}' + NL
+    assert s.requests() == [b'{"id":1,"method":"event.rule_set","params":' + params + b"}\n"]

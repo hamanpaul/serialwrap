@@ -65,6 +65,31 @@ fn keep_lone_surrogates_escapes_and_flags() {
     assert_eq!(pyjson::dumps(&v, &RPC_WIRE), "\"\u{FFFD}\"");
 }
 
+/// S1-2a65438-1：旗標只反映最終值樹；被重複鍵覆寫掉的孤立 surrogate 不計。
+#[test]
+fn keep_lone_surrogates_flag_follows_duplicate_key_overwrite() {
+    for doc in [
+        r#"{"lone":"\ud800","lone":"ok"}"#,
+        r#"{"a":{"x":"\udc80"},"a":{"x":"ok"}}"#,
+        r#"{"a":["\udc80"],"b":1,"a":[1]}"#,
+        r#"{"o":{"a":"\udfff","a":2},"o":{"a":"\ud801","a":3}}"#,
+        r#"{"a":"\udc80","a":"\u0000\udbb6\udc00"}"#,
+    ] {
+        let (v, lone) = pyjson::loads_keep_lone_surrogates(doc).unwrap();
+        assert!(!lone, "doc={doc}");
+        assert_eq!(v, pyjson::loads(doc).unwrap(), "doc={doc}");
+    }
+    for doc in [
+        r#"{"a":"ok","a":"\udc80"}"#,
+        r#"{"k\udcff":1,"k\udcff":2}"#,
+        r#"{"a":"\ud800","b":"x","a":"y","c":"\udc81"}"#,
+        r#"[{"a":"\udc80","a":1},"\ud800"]"#,
+    ] {
+        let (_, lone) = pyjson::loads_keep_lone_surrogates(doc).unwrap();
+        assert!(lone, "doc={doc}");
+    }
+}
+
 #[test]
 fn duplicate_key_keeps_first_position_last_value() {
     let v = pyjson::loads(r#"{"a":1,"b":2,"a":3}"#).unwrap();
