@@ -30,10 +30,11 @@ pub fn lock_suite(factory: Arc<dyn InstanceLockFactory>, dir: &Path) {
 
     #[cfg(unix)]
     {
-        use std::os::unix::net::UnixListener;
-
+        // 失效 socket：只 bind、不 listen 即關閉（P5 第 7 輪）。以 UnixListener bind→drop 製造時，同程序他執行緒 spawn 的
+        // 子行程在 exec 前持有 listener 複本，drop 後該複本仍在 listen，探測連線成功而得 AlreadyRunning（r6 gate 間歇失敗）；
+        // 未 listen 的 socket 不論有無複本，連線一律 ECONNREFUSED，與 daemon 結束後殘留的 socket 檔相同。
         let socket = dir.join("lock-suite/stale.sock");
-        drop(UnixListener::bind(&socket).expect("[stale_socket_setup] 建立 socket"));
+        bind_without_listen(&socket);
         let stale_guard = factory
             .acquire(
                 &dir.join("lock-suite/stale.lock"),
@@ -76,4 +77,29 @@ pub fn lock_suite(factory: Arc<dyn InstanceLockFactory>, dir: &Path) {
         expected.2,
         "[normalize_home] 路徑應展開 home"
     );
+}
+
+/// 在 `path` 建立一個只 bind、從未 listen 的 Unix stream socket 檔後關閉 fd（失效 socket 情境）。
+#[cfg(unix)]
+fn bind_without_listen(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: sockaddr_un 為純資料結構，全零為合法初值。
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    assert!(bytes.len() < addr.sun_path.len(), "[stale_socket_setup] socket 路徑過長：{}", path.display());
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *dst = src as libc::c_char;
+    }
+    let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+    // SAFETY: 參數皆為常數；回傳 fd 由下方 close 釋放。
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(fd >= 0, "[stale_socket_setup] socket: {}", std::io::Error::last_os_error());
+    // SAFETY: addr 為已初始化的 sockaddr_un，len 不超過其大小；fd 為上方取得的有效 fd。
+    let rc = unsafe { libc::bind(fd, (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(), len) };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: fd 有效且只關閉一次。
+    unsafe { libc::close(fd) };
+    assert_eq!(rc, 0, "[stale_socket_setup] bind: {err}");
 }

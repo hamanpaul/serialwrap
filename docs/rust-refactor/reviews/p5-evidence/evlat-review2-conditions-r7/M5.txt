@@ -1,0 +1,21 @@
+applied M5
+== run 1
+test release_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 2
+test release_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 3
+test release_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 4
+test release_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.11s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 5
+test release_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.94s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`

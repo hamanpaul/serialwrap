@@ -141,6 +141,11 @@ if [[ "$DRY_RUN" == "1" || ( "$PREFLIGHT_OK" != "1" && "$EVIDENCE_RUN" != "1" ) 
   record cfg_boundary --reason "$why"
   record linux_l1 --required-set s21_core --reason "$why"
   record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "$why"
+  record linux_cap_sys_admin --required-set s21_gate:cap_sys_admin --reason "$why"
+  record linux_cap_windows_native --required-set s21_gate:cap_windows_native --reason "$why"
+  record linux_cap_interactive_desktop --required-set s21_gate:cap_interactive_desktop --reason "$why"
+  record linux_cap_supervisor_runtime --required-set s21_gate:cap_supervisor_runtime --reason "$why"
+  record py_parity --required-set s21_gate:py_parity_full --reason "$why"
   record windows_native_l1 --required-set s21_core --reason "$why；需原生 Windows（win-test.sh）"
   record windows_cap_windows_com --required-set s21_gate:windows_cap_windows_com --reason "$com_reason"
   record blackbox_python --required-set s21_gate:blackbox_python --reason "$why"
@@ -198,6 +203,46 @@ run_logged linux_cap_posix_pty python3 scripts/rust/cargo_l1_results.py --platfo
 record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty \
   --command "cargo_l1_results.py --platform linux --caps posix_pty -- -p sw-pal --features test-fakes" \
   --exit "$LAST_RC" --log logs/linux_cap_posix_pty.log --l1-results linux_cap_posix_pty/l1-results.json
+
+# 3b. OD-55 linux 能力集合（P5 第 6 輪 SPEC-GAP #2，編排者裁決）：先探測能力，具備才以 --caps <cap> 實跑；
+#     否則記 EVIDENCE_MISSING 並附探測證據（所需能力、處置與實跑方式由 judge CAPABILITY_SECTIONS 補上），不得記 PASS。
+cap_probe() {  # cap_probe <cap>：印出 available:<證據> 或 unavailable:<證據>
+  local eff st
+  case "$1" in
+    sys_admin)
+      eff="$(awk '/^CapEff:/{print $2}' /proc/self/status 2>/dev/null || true)"
+      if [[ "$(id -u)" == 0 && -n "$eff" ]] && (( (16#$eff >> 21) & 1 )); then
+        echo "available:euid=0 CapEff=$eff"
+      else
+        echo "unavailable:euid=$(id -u) CapEff=${eff:-unknown}"
+      fi ;;
+    supervisor_runtime)
+      st="$(systemctl --user is-system-running 2>/dev/null || true)"
+      if [[ "$st" == running || "$st" == degraded ]]; then
+        echo "available:systemctl --user is-system-running=$st"
+      else
+        echo "unavailable:systemctl --user is-system-running=${st:-unavailable}"
+      fi ;;
+    *)
+      echo "unavailable:linux 主機（$(uname -s)）無法提供 cap_$1（需原生 Windows）" ;;
+  esac
+}
+for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do
+  sec="linux_cap_$cap"
+  crate=sw-pal; [[ "$cap" == windows_native ]] && crate=sw-daemon
+  probe="$(cap_probe "$cap")"
+  if [[ "$probe" == available:* ]]; then
+    mkdir -p "$RUN_DIR/$sec"
+    run_logged "$sec" python3 scripts/rust/cargo_l1_results.py --platform linux --caps "$cap" \
+      --out "$RUN_DIR/$sec/l1-results.json" -- -p "$crate" --features test-fakes
+    record "$sec" --required-set "s21_gate:cap_$cap" \
+      --command "cargo_l1_results.py --platform linux --caps $cap -- -p $crate --features test-fakes" \
+      --exit "$LAST_RC" --log "logs/$sec.log" --l1-results "$sec/l1-results.json" --capability-probe "$cap=$probe"
+  else
+    record "$sec" --required-set "s21_gate:cap_$cap" --capability-probe "$cap=$probe" \
+      --reason "能力探測：${probe#unavailable:}；未執行 --caps $cap"
+  fi
+done
 
 # 4／5. Windows 原生 L1 與 COM pair（win-test.sh；報告的 l1_results 複製進本 run）
 win_l1_into() {  # win_l1_into <section>：取 win-test 最新報告的 l1_results
@@ -341,10 +386,22 @@ rm -rf "$RUN_DIR/wal_s1w_perf/walroot"
 s1w_args=()
 [[ -f "$RUN_DIR/wal_s1w_perf/wal_s1w.json" ]] && s1w_args+=(--local "$RUN_DIR/wal_s1w_perf/wal_s1w.json")
 s1w_evidence=wal_s1w_perf/wal_s1w.json
+# SW_GATE_WAL_S1W_IMPORT 可列多輪證據（以 : 分隔，如三輪），judge 取最差判定；OD-66：WSL2 證據另以
+# SW_GATE_WAL_S1W_PY_BASELINE 匯入同主機同時段的 Python 基線（wal_microbench.py），門檻依主機類型選並記入 verdict.json。
 if [[ -n "${SW_GATE_WAL_S1W_IMPORT:-}" ]]; then
-  cp "$SW_GATE_WAL_S1W_IMPORT" "$RUN_DIR/wal_s1w_perf/wal_s1w.imported.json" 2>/dev/null || true
-  s1w_args+=(--import "$RUN_DIR/wal_s1w_perf/wal_s1w.imported.json" --host-label "${SW_GATE_WAL_S1W_HOST:-}")
-  s1w_evidence=wal_s1w_perf/wal_s1w.imported.json
+  s1w_n=0
+  IFS=':' read -r -a s1w_imports <<<"$SW_GATE_WAL_S1W_IMPORT"
+  for s1w_src in "${s1w_imports[@]}"; do
+    s1w_n=$((s1w_n + 1))
+    cp "$s1w_src" "$RUN_DIR/wal_s1w_perf/wal_s1w.imported-$s1w_n.json" 2>/dev/null || true
+    s1w_args+=(--import "$RUN_DIR/wal_s1w_perf/wal_s1w.imported-$s1w_n.json")
+  done
+  s1w_args+=(--host-label "${SW_GATE_WAL_S1W_HOST:-}")
+  s1w_evidence=wal_s1w_perf/verdict.json
+fi
+if [[ -n "${SW_GATE_WAL_S1W_PY_BASELINE:-}" ]]; then
+  cp "$SW_GATE_WAL_S1W_PY_BASELINE" "$RUN_DIR/wal_s1w_perf/python-baseline.imported.json" 2>/dev/null || true
+  s1w_args+=(--python-baseline "$RUN_DIR/wal_s1w_perf/python-baseline.imported.json")
 fi
 python3 "$JUDGE" wal-s1w-verdict "${s1w_args[@]}" --out "$RUN_DIR/wal_s1w_perf/verdict.json" >/dev/null 2>>"$RUN_DIR/logs/wal_s1w_perf.log" || true
 s1w_verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo EVIDENCE_MISSING)"
@@ -352,13 +409,25 @@ s1w_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.a
 s1w_exit="$s1w_rc"; [[ "$s1w_verdict" == EVIDENCE_MISSING ]] && s1w_exit=0
 record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w（＋SW_GATE_WAL_S1W_IMPORT 匯入）" --exit "$s1w_exit" \
   --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence "$s1w_evidence" \
-  --reason "Linux 門檻（規格 §1.2；OD-61 WSL2 量測為準）：$s1w_reason" \
+  --reason "Linux 門檻依主機類型（OD-66：WSL2 另訂門檻＋不劣於 Python 基線；原生 §1.2）：$s1w_reason" \
   --reason "Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
 
 # 10. Windows 無 COM 黑箱（BO-S21-13 承接 Windows 全套；此處只保留紀錄，不計入 section）。
 #     注意：win-blackbox.ps1 目前仍為 P3 介面，-Suite／-Daemon 尚未支援；失敗只留 log，不影響判定。
 if command -v pwsh.exe >/dev/null 2>&1 && [[ -f "$WIN_D" ]]; then
   run_logged windows_nocom pwsh.exe -File scripts/rust/win-blackbox.ps1 -Suite slice21-nocom -Daemon "$WIN_D"
+fi
+
+# 10b. Python 基線 parity（P5 第 6 輪 SPEC-GAP #1，編排者裁決）：以 s21_gate:py_parity_full 的完整 selector 實跑；
+#      舊集合 s21_gate:py_parity 不改不刪，仍由 pytest_full 承擔（兩者皆由 gate 執行）。
+mapfile -t pyp_argv < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["sets"]["s21_gate:py_parity_full"]["linux"]["selector"]["argv"]))' \
+  tests/acceptance/l1_required.lock.json 2>/dev/null || true)
+if [[ "${#pyp_argv[@]}" -gt 0 ]]; then
+  pytest_l1 py_parity py_parity -- "${pyp_argv[@]}"
+  record py_parity --required-set s21_gate:py_parity_full --command "pytest <s21_gate:py_parity_full selector.argv>" \
+    --exit "$LAST_RC" --log logs/py_parity.log --l1-results py_parity/l1-results.json
+else
+  record py_parity --required-set s21_gate:py_parity_full --reason "l1_required.lock.json 無 s21_gate:py_parity_full.linux selector"
 fi
 
 # 11. 全套 pytest（s21_gate:pytest_full＋s21_gate:py_parity）

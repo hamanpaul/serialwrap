@@ -178,7 +178,12 @@ def test_invalid_regex_direct_execute_rejects_before_any_tx(device, invalid):
     assert producer.tx == []
 
 
-@pytest.mark.parametrize("invalid", ["(", "", "a" * 1025, 12, ".*"])
+# OD-67（擁有者裁決）／P5 第 6 輪 SPEC-GAP #3：明確 ids，沿用 pytest 9.0.3 的自動 id 形式（pytest 9.2 起過長字串參數
+# 改以 `invalid2` 呈現、nodeid 隨版本變動）；已凍結的 nodeid 全數不變（舊 id → 新 id 為恆等），無須移除。
+_INVALID_RPC_CASES = ["(", "", "a" * 1025, 12, ".*"]
+
+
+@pytest.mark.parametrize("invalid", _INVALID_RPC_CASES, ids=[str(case) for case in _INVALID_RPC_CASES])
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_invalid_regex_rpc_and_arbiter_reject_without_enqueue(invalid):

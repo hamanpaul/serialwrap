@@ -42,13 +42,22 @@ TEST_SECTIONS = {
     "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
     "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
     "pytest_full": ("linux", "s21_gate:pytest_full"),
+    # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
+    "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
+    "linux_cap_windows_native": ("linux", "s21_gate:cap_windows_native"),
+    "linux_cap_interactive_desktop": ("linux", "s21_gate:cap_interactive_desktop"),
+    "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
+    # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
+    "py_parity": ("linux", "s21_gate:py_parity_full"),
 }
+CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_windows_native": "windows_native",
+          "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime"}
 NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
 CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core::wal::c"]
 GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
     name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
     for name in ("linux_cap_posix_pty", "windows_cap_windows_com", "blackbox_python", "blackbox_rust",
-                 "existing_suites_rust", "pytest_full")
+                 "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity")
 }
 
 
@@ -124,9 +133,9 @@ def _lock() -> dict:
         "linux": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
         "windows": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
     }}
-    for name, ids in GATE_NODEIDS.items():
-        platform = "windows" if name.startswith("windows_") else "linux"
-        sets[f"s21_gate:{name}"] = {platform: {"nodeids": list(ids), "selector": {"argv": ["pytest", "-q"]}}}
+    for name, (platform, set_id) in TEST_SECTIONS.items():
+        if set_id.startswith("s21_gate:"):
+            sets[set_id] = {platform: {"nodeids": list(GATE_NODEIDS[name]), "selector": {"argv": ["pytest", "-q"]}}}
     return {"schema_version": 1, "sets": sets}
 
 
@@ -201,6 +210,8 @@ class _Case:
                                      allowed_missing_bo=allowed, counts=counts))
             if name == "linux_l1":
                 sections[-1]["run_euid"] = 1000             # F108：linux_l1 以非 root 執行
+            if name in CAP_OF:                                # SPEC-GAP #2：能力探測（本夾具假設具備能力）
+                sections[-1]["capability_probe"] = {"cap": CAP_OF[name], "available": True, "evidence": "fixture"}
         for name in NON_TEST_SECTIONS:
             sec = _section(name, exit_code=0)
             sec["section_verdict"] = "PASS"   # 非測試類 section 須明確帶判定（審查 b7cd852 #3）
@@ -637,13 +648,135 @@ def test_uncarried_gate_set_blocks_ready(case):
     其 nodeid 從未被執行或判定——不得 READY，verdict 須為 INCOMPLETE 並列出該集合。"""
     exp = case.expect()
     assert _judge_mod().judge(case.report(), exp)["verdict"] == "READY_FOR_OWNER_EVIDENCE"
-    exp["lock"]["sets"]["s21_gate:cap_sys_admin"] = {
-        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_sys_admin__x"],
-                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_sys_admin__"]}}}
+    # 第 7 輪：s21_gate:cap_sys_admin 已由 linux_cap_sys_admin section 承擔（SPEC-GAP #2），改以未承擔的集合名驗證守門。
+    exp["lock"]["sets"]["s21_gate:cap_uncarried"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_uncarried__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_uncarried__"]}}}
     out = _judge_mod().judge(case.report(), exp)
     assert out["verdict"] == "INCOMPLETE"
-    assert any("s21_gate:cap_sys_admin" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert any("s21_gate:cap_uncarried" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
     # 以 additional_required_sets 指派給 section 即視為承擔（由該 section 判定）
-    exp["additional_required_sets"] = {"linux_cap_posix_pty": ["s21_gate:cap_sys_admin"]}
+    exp["additional_required_sets"] = {"linux_cap_posix_pty": ["s21_gate:cap_uncarried"]}
     out = _judge_mod().judge(case.report(), exp)
     assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"])
+
+
+def test_uncarried_gate_set_is_judged_per_platform(case):
+    """sol P5-86b54d8-1 (a)：承擔以（集合, 平台）為粒度——windows section 承擔同名集合時，該集合的 linux 列
+    從未被任何 linux section 執行，仍須判 INCOMPLETE 並列出 linux 平台。"""
+    exp = case.expect()
+    sel = {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-daemon::launcher::cap_example__linux_only"], "selector": sel},
+        "windows": {"nodeids": [CORE_NODEIDS[0]], "selector": sel}}
+    exp["additional_required_sets"] = {"windows_native_l1": ["s21_gate:cap_example"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "windows_native_l1")["status"] == "PASS"   # windows 列確實由 windows section 判定
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert not any("s21_gate:cap_example.windows" in r for r in out["verdict_reasons"])
+
+
+def test_non_test_section_fragment_cannot_carry_gate_set(case):
+    """sol P5-86b54d8-1 (b)：非測試類 section 不判集合，其片段自帶的 additional_required_sets 不得算承擔
+    （不接受報告自行宣告承擔）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_example__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}}}
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "l15_ab":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 測試類 section 片段自帶者照常由該 section 判定，故算承擔
+    for sec in rep["sections"]:
+        if sec["name"] == "linux_cap_posix_pty":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "EVIDENCE_MISSING"   # 該 nodeid 未執行 → 不得 PASS
+
+
+# --------------------------------------------------------------------------- 第 7 輪：SPEC-GAP #1／#2（編排者裁決）
+
+DISPOSITION = {"sys_admin": "BLOCKED-OWNER", "supervisor_runtime": "BLOCKED-OWNER",
+               "windows_native": "LOCAL-WINDOWS-TODO", "interactive_desktop": "LOCAL-WINDOWS-TODO"}
+NEEDS = {"sys_admin": "CAP_SYS_ADMIN", "supervisor_runtime": "systemd", "windows_native": "Windows",
+         "interactive_desktop": "Windows"}
+
+
+@pytest.mark.parametrize("name", sorted(CAP_OF))
+def test_capability_section_never_passes_without_capability_probe(case, name):
+    """SPEC-GAP #2：能力集合 section 以 --caps <cap> 實跑；本機無該能力時記 EVIDENCE_MISSING 並標所需能力與處置
+    （sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；windows_native／interactive_desktop → LOCAL-WINDOWS-TODO），
+    不得記 PASS——即使 l1 結果全 passed（例如 cap_sys_admin 測試在無權限時 early return 仍回 ok）。"""
+    cap = CAP_OF[name]
+    j = _judge_mod()
+    for probe in (None, {"cap": cap, "available": False, "evidence": "euid=1000"},
+                  {"cap": "posix_pty", "available": True, "evidence": "錯的能力"}):
+        rep = case.report()
+        sec = [s for s in rep["sections"] if s["name"] == name][0]
+        sec.pop("capability_probe")
+        if probe is not None:
+            sec["capability_probe"] = probe
+        out = j.judge(rep, case.expect())
+        s = _sec(out, name)
+        assert s["status"] == "EVIDENCE_MISSING", (probe, s["reasons"])
+        assert any(NEEDS[cap] in r and DISPOSITION[cap] in r for r in s["reasons"]), s["reasons"]
+        assert out["verdict"] == "INCOMPLETE"
+    assert _sec(j.judge(case.report(), case.expect()), name)["status"] == "PASS"   # 具備能力且全 passed
+
+
+def test_capability_section_failure_with_capability_is_fail(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_sys_admin"]
+    case.l1["linux_cap_sys_admin"] = _l1("linux", "cargo", [_row(n1), _row(n2, "failed")], exit_code=101)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_sys_admin")["status"] == "FAIL"
+
+
+def test_capability_sections_and_py_parity_match_expect_and_lock():
+    """SPEC-GAP #1／#2：expect 的測試類 section 與判定器 TEST_SECTIONS 一致；鎖中每個（s21_gate 集合, 平台）都有 section 承擔
+    （OD-55 能力集合不再落入「未承擔集合」）；py_parity section 用新集合 py_parity_full，pytest_full 仍承擔舊 py_parity。"""
+    import yaml
+
+    j = _judge_mod()
+    exp = yaml.safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    test_secs = {s["name"]: (s["platform"], s["required_set"]) for s in exp["sections"] if s["kind"] == "test"}
+    assert {n: p for n, (p, _) in test_secs.items()} == j.TEST_SECTIONS
+    assert {n for n, _ in test_secs.items()} <= set(j.SECTION_ORDER)
+    assert {test_secs[n][1] for n in CAP_OF} == {f"s21_gate:cap_{c}" for c in CAP_OF.values()}
+    assert {n: c["cap"] for n, c in j.CAPABILITY_SECTIONS.items()} == CAP_OF
+    assert test_secs["py_parity"] == ("linux", "s21_gate:py_parity_full")
+    assert "s21_gate:py_parity" in exp["additional_required_sets"]["pytest_full"]
+    carried = {(sid, test_secs[n][0]) for n, (_, sid) in test_secs.items()}
+    carried |= {(sid, test_secs[n][0]) for n, sids in exp["additional_required_sets"].items() for sid in sids}
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    uncarried = sorted(f"{sid}.{plat}" for sid, spec in lock["sets"].items() if sid.startswith("s21_gate:")
+                       for plat in spec if (sid, plat) not in carried)
+    assert uncarried == [], uncarried
+
+
+def test_py_parity_full_has_complete_selector_and_keeps_old_set():
+    """SPEC-GAP #1：s21_gate:py_parity（凍結、selector 只有 1 筆）不改不刪；新集合 py_parity_full 的 selector 須涵蓋
+    舊集合全部 nodeid（完整 selector），nodeid 為實際收集結果且 ⊇ 舊集合。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    old = lock["sets"]["s21_gate:py_parity"]["linux"]
+    full = lock["sets"]["s21_gate:py_parity_full"]["linux"]
+    assert old["selector"]["paths"] == ["tests/test_stage0_session_drain.py::test_release_persist_failure_retried"]
+    assert set(old["nodeids"]) <= set(full["nodeids"])
+    paths = full["selector"]["paths"]
+    assert all(any(n == p or n.startswith(p.rstrip("/") + "::") for p in paths) for n in old["nodeids"]), paths
+    assert full["selector"]["argv"][-len(paths):] == paths
+
+
+def test_gate_script_runs_capability_and_py_parity_sections():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    for name in (*CAP_OF, "py_parity"):
+        assert f"record {name} " in text, name                  # dry-run／拒絕開跑分支
+    assert text.count("record py_parity ") >= 2                 # ＋實跑分支
+    # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
+    assert "for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do" in text
+    assert '--caps "$cap"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text

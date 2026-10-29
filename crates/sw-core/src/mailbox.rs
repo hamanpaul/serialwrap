@@ -195,16 +195,34 @@ pub struct Mailbox {
 /// 測試用（方法審閱 [High]，2026-10-29）：逐事件的 data 見證數——事件送入 mailbox 後、被取出前，mailbox 回傳了幾個
 /// data item。control／safety lane 以影子佇列（FIFO 位置 ↔ 累計數）計算，`stopped` 中的 receipt 以平行佇列計算；
 /// 依賴 RX 的暫存事件（stash／pending／deferred）不追蹤（回 `None`）。
+///
+/// OD-64（2026-10-29）：receipt 因同 epoch 依賴移入 `stopped`（依賴等待開始）時，另記當下 data lane 中已讀入的筆數，
+/// 之後依 FIFO 逐筆核對其 epoch，得「依賴等待前已讀入 mailbox 的同 epoch data」筆數（`stopped_pre`，與 `stopped` 平行）。
 #[cfg(feature = "test-fakes")]
 #[derive(Default)]
 struct Witness {
     control: VecDeque<u64>,
     safety: VecDeque<u64>,
     stopped: VecDeque<u64>,
+    stopped_pre: VecDeque<PreDependency>,
     /// 本次 `recv_next` 自 lane 取出之事件的見證數（尚未回傳或移入 `stopped`）。
     current: Option<u64>,
+    /// 本次 `recv_next` 取出之事件的依賴等待前已讀入筆數（lane 事件為 0）。
+    current_pre: Option<u64>,
     /// 最近一次回傳的 control 項目之見證數（`take_control_witness` 取走）。
     last: Option<u64>,
+    /// 最近一次回傳的 control 項目之依賴等待前已讀入筆數（`take_control_pre_dependency_data` 取走）。
+    last_pre: Option<u64>,
+}
+
+/// OD-64：單一 `stopped` receipt 的依賴等待前已讀入 data 計數。
+#[cfg(feature = "test-fakes")]
+struct PreDependency {
+    epoch: u64,
+    /// 依賴等待開始時 data lane 中、尚未回傳的筆數（之後回傳的前 `remaining` 筆即依賴等待前已讀入者）。
+    remaining: usize,
+    /// 其中屬同 epoch 者。
+    same_epoch: u64,
 }
 
 #[cfg(feature = "test-fakes")]
@@ -253,6 +271,14 @@ impl Mailbox {
         self.witness.last.take()
     }
 
+    /// 測試用（OD-64 延遲探針）：最近一次 `recv_next` 回傳的 control 項目，於依賴等待開始前已讀入 mailbox 的同 epoch
+    /// data 筆數——因同 epoch 依賴移入 `stopped` 的 receipt 為該數；其他 lane 事件為 0；data 項目、actor 內部事件或依賴
+    /// 暫存事件回 `None`。drain_receipt 的 l1 界限為「見證數 ≤ 此數＋1」。
+    #[cfg(feature = "test-fakes")]
+    pub fn take_control_pre_dependency_data(&mut self) -> Option<u64> {
+        self.witness.last_pre.take()
+    }
+
     /// 一般控制與依賴 RX watermark 的完成事件使用此有界 lane。
     pub fn control_sender(&self) -> Sender<ControlEvent> {
         self.control_tx.clone()
@@ -297,22 +323,43 @@ impl Mailbox {
         #[cfg(feature = "test-fakes")]
         {
             self.witness.current = None;
+            self.witness.current_pre = None;
             self.witness.last = None;
+            self.witness.last_pre = None;
         }
         let item = self.recv_next_inner(processed, current_epoch, deadline, clock);
         #[cfg(feature = "test-fakes")]
         match &item {
-            Some(MailboxItem::Data(_)) => {
+            Some(MailboxItem::Data(data)) => {
                 // 此 data item 超越了目前仍在 lane／stopped 中等待的每個事件。
                 bump_first(&mut self.witness.control, self.control_rx.len());
                 bump_first(&mut self.witness.safety, self.safety_rx.len());
                 for w in self.witness.stopped.iter_mut() {
                     *w += 1;
                 }
+                // OD-64：data lane 為 FIFO，依賴等待開始時已在 lane 中的筆數即其後最先回傳的那幾筆。
+                // P6 console 事件（ConsoleInputBytes／ConsoleDisconnected）同走 data lane：佔 FIFO 位置，但不是同 epoch RX data。
+                let rx_epoch = match data {
+                    DataEvent::UartRxChunk { epoch, .. } => Some(*epoch),
+                    _ => None,
+                };
+                for pre in self.witness.stopped_pre.iter_mut().filter(|p| p.remaining > 0) {
+                    pre.remaining -= 1;
+                    if rx_epoch == Some(pre.epoch) {
+                        pre.same_epoch += 1;
+                    }
+                }
                 self.witness.current = None;
+                self.witness.current_pre = None;
             }
-            Some(MailboxItem::Control(_)) => self.witness.last = self.witness.current.take(),
-            None => self.witness.current = None,
+            Some(MailboxItem::Control(_)) => {
+                self.witness.last = self.witness.current.take();
+                self.witness.last_pre = self.witness.current_pre.take();
+            }
+            None => {
+                self.witness.current = None;
+                self.witness.current_pre = None;
+            }
         }
         item
     }
@@ -321,12 +368,20 @@ impl Mailbox {
     fn note_lane_recv(&mut self, safety: bool) {
         let queue = if safety { &mut self.witness.safety } else { &mut self.witness.control };
         self.witness.current = Some(queue.pop_front().unwrap_or(0));
+        self.witness.current_pre = Some(0);
     }
 
+    /// receipt 因同 epoch 依賴移入 `stopped`：依賴等待由此開始，記下當下 data lane 已讀入的筆數（OD-64）。
     #[cfg(feature = "test-fakes")]
-    fn note_stopped_push(&mut self) {
+    fn note_stopped_push(&mut self, epoch: u64) {
         let w = self.witness.current.take().unwrap_or(0);
+        self.witness.current_pre = None;
         self.witness.stopped.push_back(w);
+        self.witness.stopped_pre.push_back(PreDependency {
+            epoch,
+            remaining: self.data_rx.len(),
+            same_epoch: 0,
+        });
     }
 
     fn recv_next_inner(
@@ -404,6 +459,8 @@ impl Mailbox {
                     #[cfg(feature = "test-fakes")]
                     {
                         self.witness.current = self.witness.stopped.pop_front();
+                        self.witness.current_pre =
+                            self.witness.stopped_pre.pop_front().map(|p| p.same_epoch);
                     }
                     return Some(MailboxItem::Control(ControlEvent::WorkerStopped(receipt)));
                 }
@@ -451,7 +508,7 @@ impl Mailbox {
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
                             #[cfg(feature = "test-fakes")]
-                            { self.note_lane_recv(true); self.note_stopped_push(); }
+                            { self.note_lane_recv(true); self.note_stopped_push(receipt.epoch); }
                             self.stopped.push_back(receipt);
                         }
                         Ok(ev) => {
@@ -480,7 +537,7 @@ impl Mailbox {
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
                             #[cfg(feature = "test-fakes")]
-                            { self.note_lane_recv(true); self.note_stopped_push(); }
+                            { self.note_lane_recv(true); self.note_stopped_push(receipt.epoch); }
                             self.stopped.push_back(receipt);
                         }
                         Ok(ev) => {
@@ -498,7 +555,7 @@ impl Mailbox {
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
                             #[cfg(feature = "test-fakes")]
-                            { self.note_lane_recv(false); self.note_stopped_push(); }
+                            { self.note_lane_recv(false); self.note_stopped_push(receipt.epoch); }
                             self.stopped.push_back(receipt);
                         }
                         Ok(ev) if dependency_waits(&ev, processed, current_epoch) => {
@@ -506,6 +563,7 @@ impl Mailbox {
                             {
                                 self.note_lane_recv(false);
                                 self.witness.current = None; // 依賴暫存事件不追蹤
+                                self.witness.current_pre = None;
                             }
                             if self.stash.len() < crate::resources::MAILBOX_STASH_MAX {
                                 self.stash.push_back(ev);
