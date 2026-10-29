@@ -58,3 +58,19 @@
 | `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
 
 - 逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。
+
+## 出口 gate 實跑紀錄（第 6 輪，2026-10-29）
+
+- 環境：非 root（uid 1000）、Rust 1.96.1、Python 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3；HEAD `c74f158`（含主線 `8963d07` 與 P5 `86b54d8`）；報告目錄 `target/s22-gate/r6-261029-133213`（未提交）。cargo 集合的收集命令取自 `s22_gate_check.py --plan`（OD-53：由 selector 推導 `--caps`）。loadavg 開跑 0.25／0.41／0.48、結束 0.51／0.30／0.39。
+- `s22_gate_check.py` result = **FAIL**：
+
+| 集合 | 判定 | 數字／原因 |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | FAIL | 2184 passed、1 failed、38 skipped；唯一失敗 `sw-pal::serial::posix::tests::invalid_serial_fd_is_a_poll_wait_error`（P5 檔案，fd 重用競態；同範圍重跑兩次皆 2185 passed、0 failed） |
+| `s22_gate:console_conformance_pty`/linux | PASS | 31 passed、3 skipped（`--caps posix_pty`） |
+| `s22_gate:py_parity`/linux | PASS | 12 passed |
+| `s22_gate:parity_py`/linux | PASS | 34 passed |
+| `s22_gate:blackbox_rust`/linux | PASS | 117 passed、8 skipped（`test_two_daemons_same_tty` 依 P5 `4f8acdf` 轉綠） |
+| `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
+
+- 逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；L1.5／func-test 22 個參照於 Rust release artifact 全 PASS；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。

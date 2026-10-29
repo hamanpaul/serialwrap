@@ -482,3 +482,33 @@ result = **FAIL**。
 ### 第五輪 Slice 2.2 出口 gate（非 dry-run，非 root，`target/s22-gate/r5-261029-051754`）
 
 result = **FAIL**。cargo_workspace PASS（2132 passed、38 skipped；第一次實跑 `sw-pal::lock::lock_conformance_suite` 失敗一次，單獨連跑 10 次與同範圍重跑皆綠，失敗集合不同，非 P6 檔案）、console_conformance_pty PASS（31 passed、3 skipped，`--caps posix_pty`）、py_parity PASS（12）、parity_py PASS（34）、blackbox_rust FAIL（116 passed、1 failed `test_two_daemons_same_tty`、8 skipped）、win_test INSUFFICIENT（未登記，LOCAL-WINDOWS-TODO）。逐案 93：PASS 31／BLOCKED-OWNER 62。L1.5／func-test 22 個參照於 Rust release artifact 全 PASS。parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）。map 覆蓋 PASS、prereqs PASS。
+
+## 第六輪（2026-10-29，雲端 session；起點 2b6f8ee）
+
+### 合併
+
+- 主線 `897a3cd`（8caf6c4）：只改 `tests/test_rust_win_scripts.py`，無衝突。
+- 主線 `8963d07`（4cc7f02；0.4.0 release 前置、OD-48 legacy handoff、Docker scope cgroup）：三檔衝突——`behavior_changes.yaml` SC-37／SC-39 同處新增，兩筆皆保留（與 P5 `d657a7c` 的合併結果逐字相同）；`test_contracts_catalog.py` SC 集合取聯集；`crates/sw-pal/src/proc_scan/posix.rs`（P5 檔案）取 P5 `d657a7c` 對同一衝突的解法，再套回 P6 Task 8 的 `held_fd_targets`／`held_tty_paths_with`（P6 版與 P5 合併前版只差這 56 行）。L1 鎖只增 98 列。
+- P5 `86b54d8`（c74f158；P5 第 6 輪回報 `reviews/p5-cloud/round6-report-20261029.md` 於 13:12Z 出現後合併）：L1 鎖三方合併＝P6 ∪ P5 − P5 依 OD-55 以 `--allow-removal` 逐名移除的 `s21_core.linux` 27 列；相對 P5 純新增、selector 不變，`regen_lock --check`／`--check --base origin/feature/rust-refactor` 皆 OK。`test_contracts_catalog.py` 取 P6 版（P5 版為其子集）。
+
+### 裁決落實與 sol 報告
+
+| 項目 | 處理 |
+|---|---|
+| OD-53 selector 記錄 caps（rulings/p6.md） | 12318a5（紅燈 d72afac）：不改鎖 schema；`s22_gate_check.derive_caps` 由 selector 推導 `--caps`（test-binary 參數恰為 `--ignored cap_<cap>__…`），推導不出（`--include-ignored`、無篩選、混非 cap 篩選或旗標、`--` 之前）→ 該集合 EVIDENCE_MISSING（result 併入 INSUFFICIENT），其 passed 列不充當逐案證據、failed 列仍判 FAIL；各集合輸出 `caps`／`collect_argv`，`--plan` 只依鎖印出前置收集命令。本輪 gate 的 cargo 收集命令全取自 `--plan` |
+| P6-e9b5c61-4 | 依 rulings/p6.md 不處理。merge P5 後重驗 `test_l1_lock_cargo_sets_exclude_ignored_tests`：linux 已清，只剩 `s21_core.windows` 13 列（OD-55 待 Windows 原生收集，P5 LOCAL-WINDOWS-TODO）；`test_l1_lock_frozen_set_excludes_capability_gated` 同屬 `s21_core.windows` |
+| `45b82e4_2b6f8ee-sol.md` | B 段 NO FINDINGS；A 段只剩 P6-e9b5c61-4（依裁決不處理） |
+| `test_two_daemons_same_tty` | P5 `4f8acdf` 修 harness（`share_tty_with`）；merge 後 Python 基線 passed、Rust artifact（gate blackbox_rust）passed |
+
+### 第六輪 Slice 2.2 出口 gate（非 dry-run，非 root，`target/s22-gate/r6-261029-133213`，HEAD c74f158）
+
+result = **FAIL**。cargo_workspace FAIL（2184 passed、1 failed、38 skipped；唯一失敗 `sw-pal::serial::posix::tests::invalid_serial_fd_is_a_poll_wait_error`，同範圍重跑兩次皆 2185 passed／0 failed，失敗集合不同，根因見下）、console_conformance_pty PASS（31 passed、3 skipped，`--caps posix_pty` 由 `--plan` 推導）、blackbox_rust **PASS**（117 passed、8 skipped；`test_two_daemons_same_tty` 轉綠）、py_parity PASS（12）、parity_py PASS（34）、win_test INSUFFICIENT（未登記，LOCAL-WINDOWS-TODO）。逐案 93：PASS 31／BLOCKED-OWNER 62；L1.5／func-test 22 個參照於 Rust release artifact（daemon sha256 `10326582050f…`）全 PASS；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS、prereqs PASS。loadavg 開跑 0.25／0.41／0.48、結束 0.51／0.30／0.39。
+
+### 第六輪全套 pytest（非 root、同環境、無 pyserial、獨立 clone、序列執行）
+
+起點 8caf6c4：11 failed／5585 passed／221 skipped；終點 c74f158：11 failed／5688 passed／219 skipped。終點相對起點轉綠 1 項（`test_two_daemons_same_tty`），超出基準 1 項：`tests/test_contracts_slice22.py::test_sc30_reserved_for_p7`——4cc7f02 併入主線後多出 SC-39（OD-48），本檔精確 SC 集合未同步的確定性回歸（合併時漏跑本檔），04d5f25 修正（只把 SC-39 加入期望集合，SC-30 仍須不存在；`test_contracts_slice22.py`＋`test_contracts_catalog.py`＋`test_resource_markers.py` 140 passed）；修正後失敗集合為起點的真子集。其餘 10 項起點即紅：`test_l1_judge` 2（`s21_core.windows`，OD-55 windows）、pyserial 未安裝 4＋`test_doctor::test_pyserial_ok_when_importable`、`test_rust_bench_tools::test_cargo_workspace_tests_windows_native`、`test_p4_required_cases_have_passing_evidence`（EVIDENCE_MISSING）、slice21 `test_queue_full_backpressure`（P5 既有碼待辦）。
+
+### 既有碼待辦（P5 檔案，不修）
+
+- `crates/sw-pal/src/serial/posix.rs::invalid_serial_fd_is_a_poll_wait_error`：測試 `close()` pipe fd 後以同一號碼 poll 期望 POLLNVAL；同 binary 他執行緒會立即重用該號碼（實得 `EINVAL`）。sw_pal lib 測試整支連跑 100 次 5 敗、單跑該案 200 次 0 敗。建議改用不可能被配置的 fd（如超過 `RLIMIT_NOFILE` 的號碼）。
+- `crates/sw-pal/src/conformance/lock_suite.rs` 的 `[stale_socket_reclaimed]`（第五輪起出現的 `lock_conformance_suite` 失敗）：`lock` 測試整支連跑 150 次 2 敗（皆 `AlreadyRunning`）、單跑 150 次 0 敗。推測同 binary 其他測試 spawn 子行程時，fork 至 exec 之間子行程持有剛 drop 的 listener fd，使 probe 連線成功。
