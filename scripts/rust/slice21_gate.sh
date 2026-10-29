@@ -165,11 +165,31 @@ record cfg_boundary --command "python3 scripts/rust/check_cfg_boundary.py" --exi
   --log logs/cfg_boundary.log --section-verdict "$([[ $LAST_RC == 0 ]] && echo PASS || echo FAIL)"
 
 # 2. Linux L1（s21_core）
+# F108（編排者裁決）：linux_l1 以非 root 執行。euid==0 時須以 SW_GATE_L1_USER（使用者名稱）經 setpriv 降權執行；
+# 無法降權即不執行、記 EVIDENCE_MISSING 並要求非 root 補跑（不得記 PASS，也不得以 root 專屬失敗記 FAIL）。
 mkdir -p "$RUN_DIR/linux_l1"
-run_logged linux_l1 python3 scripts/rust/cargo_l1_results.py --platform linux --out "$RUN_DIR/linux_l1/l1-results.json" \
-  -- --workspace --features test-fakes -- --skip cap_
-record linux_l1 --required-set s21_core --command "cargo_l1_results.py --platform linux -- --workspace --features test-fakes -- --skip cap_" \
-  --exit "$LAST_RC" --log logs/linux_l1.log --l1-results linux_l1/l1-results.json
+l1_cmd=(python3 scripts/rust/cargo_l1_results.py --platform linux --out "$RUN_DIR/linux_l1/l1-results.json"
+  -- --workspace --features test-fakes -- --skip cap_)
+l1_euid="$(id -u)"
+l1_run=1
+if [[ "$l1_euid" == 0 ]]; then
+  if [[ -n "${SW_GATE_L1_USER:-}" ]] && command -v setpriv >/dev/null 2>&1 && id -u "$SW_GATE_L1_USER" >/dev/null 2>&1; then
+    l1_euid="$(id -u "$SW_GATE_L1_USER")"
+    chown -R "$SW_GATE_L1_USER" "$RUN_DIR/linux_l1"
+    l1_cmd=(setpriv --reuid="$l1_euid" --regid="$(id -g "$SW_GATE_L1_USER")" --init-groups
+      env HOME="$(getent passwd "$SW_GATE_L1_USER" | cut -d: -f6)" "${l1_cmd[@]}")
+  else
+    l1_run=0
+  fi
+fi
+if [[ "$l1_run" == 1 ]]; then
+  run_logged linux_l1 "${l1_cmd[@]}"
+  record linux_l1 --required-set s21_core --command "cargo_l1_results.py --platform linux -- --workspace --features test-fakes -- --skip cap_" \
+    --exit "$LAST_RC" --log logs/linux_l1.log --l1-results linux_l1/l1-results.json --run-euid "$l1_euid"
+else
+  record linux_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING --run-euid 0 \
+    --reason "F108：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_l1 須以非 root 補跑"
+fi
 
 # 3. Linux cap_posix_pty
 mkdir -p "$RUN_DIR/linux_cap_posix_pty"
@@ -352,9 +372,11 @@ record policy_check --command "python3 -m policy_check --repo ." --exit "$LAST_R
   --section-verdict "$([[ $LAST_RC == 0 ]] && echo PASS || echo FAIL)"
 
 # 9c. identity（CLI／daemon sha256、版本）＋判定
+# F139：serialwrapd 依 Python 1:1 不提供 --version；版本取自 throwaway daemon 的 daemon.status RPC 回應 `version`。
 daemon_version=""
 if [[ -x "$RUST_D" ]]; then
-  daemon_version="$("$RUST_D" --version 2>/dev/null | head -n1 || true)"
+  daemon_version="$(python3 scripts/rust/probe_daemon_version.py --daemon "$RUST_D" --cli "$RUST_CLI" \
+    --work-dir "$RUN_DIR/daemon_version" 2>>"$RUN_DIR/logs/daemon_version.log" | tail -n1 || true)"
 fi
 ver_args=()
 [[ -n "$daemon_version" ]] && ver_args=(--daemon-version "$daemon_version")

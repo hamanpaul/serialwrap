@@ -199,6 +199,8 @@ class _Case:
             allowed = "BO-S21-01" if name == "windows_cap_windows_com" else None
             sections.append(_section(name, l1_results=rel, required_set=required_set,
                                      allowed_missing_bo=allowed, counts=counts))
+            if name == "linux_l1":
+                sections[-1]["run_euid"] = 1000             # F108：linux_l1 以非 root 執行
         for name in NON_TEST_SECTIONS:
             sec = _section(name, exit_code=0)
             sec["section_verdict"] = "PASS"   # 非測試類 section 須明確帶判定（審查 b7cd852 #3）
@@ -595,3 +597,36 @@ def test_l15_ab_excluded_case_covered_by_section_requires_section_pass(case):
     assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
     sec = _sec(out, "l15_ab")
     assert sec["status"] == "EVIDENCE_MISSING" and any("OD-58" in r and "event_latency" in r for r in sec["reasons"])
+
+
+def test_linux_l1_run_as_root_is_evidence_missing(case):
+    """F108（P5 第 5 輪 OWNER-BATCH #4，編排者裁決）：linux_l1 須以非 root 執行；euid==0 時不得記 PASS，也不得因
+    root 專屬失敗記 FAIL 了事，一律 EVIDENCE_MISSING 並要求非 root 補跑。未記錄 euid 同為證據不足。"""
+    def with_euid(euid, outcome="passed"):
+        rep = case.report()
+        for sec in rep["sections"]:
+            if sec["name"] == "linux_l1":
+                if euid is None:
+                    sec.pop("run_euid", None)
+                else:
+                    sec["run_euid"] = euid
+                if outcome != "passed":
+                    l1 = _l1("linux", "cargo", [_row(CORE_NODEIDS[0], outcome)] + [_row(i) for i in CORE_NODEIDS[1:]])
+                    sec["l1_results"] = case.write_l1("linux_l1_x", l1)
+                    sec.update(_counts(l1))
+        return _sec(_judge_mod().judge(rep, case.expect()), "linux_l1")
+    assert with_euid(1000)["status"] == "PASS"
+    assert with_euid(1000, "failed")["status"] == "FAIL"
+    root = with_euid(0)
+    assert root["status"] == "EVIDENCE_MISSING" and any("非 root" in r for r in root["reasons"])
+    assert with_euid(0, "failed")["status"] == "EVIDENCE_MISSING"
+    assert with_euid(None)["status"] == "EVIDENCE_MISSING"
+
+
+def test_gate_script_linux_l1_non_root_and_daemon_version_from_rpc():
+    """F108／F139：gate 的 linux_l1 於 euid==0 且無法降權時不執行並記 EVIDENCE_MISSING；daemon_version 取自 RPC。"""
+    text = (ROOT / "scripts" / "rust" / "slice21_gate.sh").read_text(encoding="utf-8")
+    l1 = text[text.index("# 2. Linux L1"):text.index("# 3. Linux cap_posix_pty")]
+    assert "id -u" in l1 and "SW_GATE_L1_USER" in l1 and "--run-euid" in l1 and "EVIDENCE_MISSING" in l1
+    assert "probe_daemon_version.py" in text
+    assert '"$RUST_D" --version' not in text      # serialwrapd 依 Python 1:1 不提供 --version

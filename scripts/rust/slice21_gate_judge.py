@@ -52,6 +52,8 @@ TEST_SECTIONS: dict[str, str] = {
     "existing_suites_rust": "linux",
     "pytest_full": "linux",
 }
+# F108：須以非 root 執行的測試類 section（section 片段 `run_euid` 須為非 0 整數）。
+NON_ROOT_SECTIONS: frozenset[str] = frozenset({"linux_l1"})
 NON_TEST_SECTIONS: tuple[str, ...] = (
     "l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake",
 )
@@ -556,6 +558,13 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         elif name in TEST_SECTIONS:
             pool: set[str] = set()
             status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], pool)
+            if name in NON_ROOT_SECTIONS:
+                # F108（編排者裁決）：須以非 root 執行；euid==0 或未記錄時不得 PASS，也不得因 root 專屬失敗記 FAIL 了事。
+                euid = sec.get("run_euid")
+                if not isinstance(euid, int) or isinstance(euid, bool) or euid == 0:
+                    status = "EVIDENCE_MISSING"
+                    reasons = [f"{name} 須以非 root 執行（run_euid={euid!r}）；請以非 root 補跑"] + list(reasons)
+                    pool = set()
             section_passed[name] = pool
             passed_pool |= pool
         elif name in NON_TEST_SECTIONS:
@@ -672,6 +681,8 @@ def cmd_record_section(args: argparse.Namespace) -> int:
         frag["reasons"] = list(args.reason)
     if args.evidence:
         frag["evidence"] = args.evidence
+    if args.run_euid not in (None, ""):
+        frag["run_euid"] = int(args.run_euid)
     if args.extra_check:
         checks = []
         for item in args.extra_check:
@@ -920,6 +931,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     r.add_argument("--section-verdict", default=None, choices=("PASS", "FAIL", "EVIDENCE_MISSING"))
     r.add_argument("--reason", action="append", default=[])
     r.add_argument("--evidence", default=None)
+    r.add_argument("--run-euid", default=None, help="執行該 section 測試的 euid（F108：linux_l1 須非 0）")
     r.add_argument("--extra-check", action="append", default=[], help="<名稱>=<exit>，可重複")
     a = sub.add_parser("assemble")
     a.add_argument("--run-dir", required=True)
