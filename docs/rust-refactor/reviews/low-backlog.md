@@ -21,3 +21,4 @@
 | s1-exit/opus-b-20261029.md | S1X-b-5 | crates/sw-cli/src/commands/supervision_cmd.rs:59-92 | supervision-mode <非 set 字詞> 錯誤形狀與 Python 不同 |  | 待處理 |
 | s1-exit/opus-b-20261029.md | S1X-b-6 | crates/sw-cli/src/endpoint_resolve.rs:229-256 | 非字串 config 值的兩處 stderr 文字與 Python 不同 |  | 待處理 |
 | s1-exit/opus-b-20261029.md | S1X-b-7 | crates/sw-cli/src/commands/daemon_cmd.rs:1260-1275 | process_home／process_cwd 繞過 PAL 直接讀行程環境 |  | 待處理 |
+| s1x-b-fixes-report-20261029.md §5（既有碼待辦） | S1X-b-X1 | crates/sw-proto/src/pyre | 樣式以單獨 `\` 結尾時 CPython tokenizer 預讀的 `bad escape (end of pattern)` 優先於前一 token 錯誤（如 `[z\A\`、`a\8\`、`(?P<\`），Rust 回報前一 token；影響 `profile test` 的 error 文字 | ★（對外 JSON 欄位） | 待處理 |
