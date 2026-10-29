@@ -1,0 +1,20 @@
+host_kind=wsl2
+Linux 9900X 6.18.54.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Tue Oct  6 19:13:07 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+24
+model name	: AMD Ryzen 9 9900X 12-Core Processor
+/dev/sdd       ext4 1055762868 427043552 575015844  43% /
+source_commit=110bd5858d2559e5faab4e7c867b77ca6e1ecd3e
+852549972ef6000c917c41f4a4371bf0c9eea0d2ee49516259b4a60ace962845  /tmp/claude-1000/-home-paul-chen-prj-pri-serialwrap/be4f04c4-b21b-4415-a044-92b2063f0bed/scratchpad/evlat-review/target/release/examples/wal_s1w
+loadavg_before=2.10 2.98 5.39 3/673 3333311
+run1 loadavg_start=2.10 2.98 5.39 2/673 3333312
+run1 rc=0
+run1 loadavg_end=2.09 2.96 5.38 2/680 3333614
+run2 loadavg_start=2.09 2.96 5.38 2/680 3333616
+run2 rc=0
+run2 loadavg_end=2.08 2.95 5.36 2/679 3333626
+run3 loadavg_start=2.08 2.95 5.36 2/679 3333628
+run3 rc=0
+run3 loadavg_end=2.08 2.93 5.34 3/680 3333771
+py loadavg_start=1.85 2.82 5.25 2/676 3334129
+py rc=0
+py loadavg_end=2.76 2.94 5.20 3/678 3334545

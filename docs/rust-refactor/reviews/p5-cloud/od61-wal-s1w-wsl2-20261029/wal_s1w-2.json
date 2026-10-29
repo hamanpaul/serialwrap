@@ -1,0 +1,87 @@
+{
+  "append_ms": {
+    "p50": 0.02204,
+    "p95": 0.032158,
+    "p99": 0.050107
+  },
+  "append_ns": {
+    "n": 39996,
+    "p50": 22040,
+    "p95": 32158,
+    "p99": 50107
+  },
+  "env": {
+    "contract_tree": "c924c27992198233f8fccdf7f563911a9f27481a",
+    "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
+    "cpu_count": 24,
+    "endpoint_av": "unknown",
+    "fs_type": "ext4",
+    "git_revision": "110bd5858d2559e5faab4e7c867b77ca6e1ecd3e",
+    "implementation": "rust",
+    "memory_bytes": 101247266816,
+    "mix": {
+      "ansi": 0.2,
+      "prompt": 0.2,
+      "text": 0.6
+    },
+    "os": "posix",
+    "os_build": "6.18.54.1-microsoft-standard-WSL2",
+    "power": "unknown",
+    "serial": "none",
+    "storage_device": "/dev/sdd",
+    "timing_method": "std::time::Instant",
+    "tool_revision": "d479ae8ede81009cb92919172a79c3ca8cdb100a",
+    "virtualization": "wsl2",
+    "wal_fs": "sw_pal::native().wal_fs",
+    "wal_writer": "sw_core::wal::WalWriter"
+  },
+  "failures": [
+    "append_p50 0.022040 ms > 0.005 ms",
+    "append_p95 0.032158 ms > 0.01 ms",
+    "append_p99 0.050107 ms > 0.02 ms",
+    "rotate_max 858.993295 ms > 3 ms"
+  ],
+  "ordinary_samples": 39996,
+  "params": {
+    "payload": 1024,
+    "prefill_ratio": 0.9375,
+    "rate": 0,
+    "records": 10000,
+    "rotate_bytes": 67108864,
+    "streams": 4
+  },
+  "prefill_bytes": [
+    62915031,
+    62915031,
+    62915031,
+    62915031
+  ],
+  "rotate_bytes": 67108864,
+  "rotate_max_ms": 858.993295,
+  "rotate_max_ns": 858993295,
+  "rotate_pauses_ns": [
+    854686756,
+    854142406,
+    857097773,
+    858993295
+  ],
+  "rotate_samples": 4,
+  "rotations_per_stream": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "schema": "wal_s1w.v1",
+  "thresholds": {
+    "append_p50_ms": 0.005,
+    "append_p95_ms": 0.01,
+    "append_p99_ms": 0.02,
+    "platform": "linux",
+    "rotate_max_ms": 3.0,
+    "source": "serialwrap-rust-spec-final.md §1.2"
+  },
+  "total_records": 40000,
+  "verdict": "FAIL",
+  "write_failures": 0
+}
