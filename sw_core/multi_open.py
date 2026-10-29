@@ -207,8 +207,19 @@ def daemon_process_alive(
     except OSError:
         return None
 
+    # S1X-a-5：只看自身 uid 的行程——他人的 daemon 綁不到本使用者的 endpoint，其 cmdline
+    # 不可讀（hidepid 等）也不代表掃描不完整；同 uid 但不帶 --socket 的 daemon（如
+    # systemd-user unit）綁預設 endpoint，以之比對而非直接放棄判定。
+    my_uid = os.getuid()
     scan_incomplete = False
     for candidate_pid in pids:
+        owner_uid = _proc_uid(proc_root, candidate_pid)
+        if owner_uid is None:
+            if os.path.exists(f"{proc_root}/{candidate_pid}"):
+                scan_incomplete = True
+            continue
+        if owner_uid != my_uid:
+            continue
         status = _serialwrapd_status(proc_root, candidate_pid)
         if status is None:
             scan_incomplete = True
@@ -217,7 +228,17 @@ def daemon_process_alive(
             continue
         socket_path = _extract_socket_arg(proc_root, candidate_pid)
         if socket_path is None:
-            return None
+            from .constants import DEFAULT_ENDPOINT  # noqa: PLC0415
+
+            socket_path = DEFAULT_ENDPOINT
         if normalize_endpoint_path(socket_path) == normalize_endpoint_path(endpoint):
             return True
     return None if scan_incomplete else False
+
+
+def _proc_uid(proc_root: str, pid: int) -> int | None:
+    """回傳 ``/proc/<pid>`` 的擁有者 uid；行程已消失或無法 stat 時回 None。"""
+    try:
+        return os.stat(f"{proc_root}/{pid}").st_uid
+    except OSError:
+        return None
