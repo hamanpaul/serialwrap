@@ -18,12 +18,12 @@
 
 | 變異 | 內容 | 結果（修正後的 gate） | 審閱報告中修正前的結果 |
 |---|---|---|---|
-| M1 | data 可越過 control 至多 3 筆 | 5/5 紅：兩支 flood gate＋兩支依賴 gate（`M1.log`） | 12/12 紅，但單看 Release 標籤 4/12 |
-| M2 | 拿掉 lane 見證數累加 | `drain_release_e2e` 綠、`mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths` 紅（`M2.log`；該測試已列入 stop／cancel／release／drain_receipt 的 `l1_gate`，gate 不再靜默） | e2e gate 10/10 綠（靜默） |
-| M3 | `stopped` 非空即 panic | 兩支依賴 gate 紅（`M3.log`） | 兩支 l1_gate 綠（從未走到 `stopped`） |
-| M5 | timer 每 4 輪才檢查＋deadline 過後仍回最多 3 筆 data | 5/5 紅：`release_handled_within_one_data_item_under_flood`（lease 段 20 輪）（`M5.log`） | 1/6 紅 |
-| M6 | `stopped` 路徑不先排空已讀 data（receipt 越過已讀 RX，與 Python 排空順序不符） | 兩支依賴 gate 紅（`M6.log`） | — |
-| M7 | N_pre 不分 epoch | 兩支依賴 gate 紅（`M7.log`） | — |
+| M1 | data 可越過 control 至多 3 筆 | 5/5 紅：兩支 flood gate＋兩支依賴 gate（`M1.txt`） | 12/12 紅，但單看 Release 標籤 4/12 |
+| M2 | 拿掉 lane 見證數累加 | `drain_release_e2e` 綠、`mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths` 紅（`M2.txt`；該測試已列入 stop／cancel／release／drain_receipt 的 `l1_gate`，gate 不再靜默） | e2e gate 10/10 綠（靜默） |
+| M3 | `stopped` 非空即 panic | 兩支依賴 gate 紅（`M3.txt`） | 兩支 l1_gate 綠（從未走到 `stopped`） |
+| M5 | timer 每 4 輪才檢查＋deadline 過後仍回最多 3 筆 data | 5/5 紅：`release_handled_within_one_data_item_under_flood`（lease 段 20 輪）（`M5.txt`） | 1/6 紅 |
+| M6 | `stopped` 路徑不先排空已讀 data（receipt 越過已讀 RX，與 Python 排空順序不符） | 兩支依賴 gate 紅（`M6.txt`） | — |
+| M7 | N_pre 不分 epoch | 兩支依賴 gate 紅（`M7.txt`） | — |
 
 ## 不在本輪修改的審閱 Low（依收斂規則）
 
