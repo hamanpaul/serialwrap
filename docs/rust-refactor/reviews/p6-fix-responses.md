@@ -354,3 +354,36 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 | `test_slice21_case_freeze.py::test_freeze_case_fingerprints_match_current_cases[2.1／2.2]` | 主線改 `l15-release-inflight` 文字欄 | BLOCKED-OWNER（見合併表） |
 | `test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests` | 主線 OD-24 測試禁止 cargo 凍結集合含 `#[ignore]` 列；P5 `s21_core` 與 P6 `s22_gate:console_conformance_pty`（計畫 07 Task 13 Step 4 以 `--include-ignored cap_posix_pty__` 執行的 7 列）皆命中 | BLOCKED-OWNER：OD-24 與 07 Task 13 的 cap 集合設計衝突；移除須擁有者以 `--allow-removal` 逐名裁決（或裁定 `--include-ignored` selector 的集合豁免），P6 不自行移除 |
 | `test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread` | 主線新測試（4ad9b39）預期 PermissionError，root 下不會發生 | 環境（root），與 P6 無關；非 root 環境應重跑確認 |
+
+## 第四輪 Slice 2.2（2026-10-29 cloud session）
+
+### 合併（320329a 主線 8ef93f4、73897df P5 cca5ba8）
+
+| 項目 | 處理 |
+|---|---|
+| DF-20 編號 | 主線已依 OD-37 登錄 DF-20（scope both、case `df20-stale-interactive-id-no-replay`）→ 依「以主線為準」改用主線條目；P6 先前自配的 DF-20 條目撤回。已凍結的 P6 案例 `df20-release-reattach-stale-interactive-id`（lock add-only 不得刪）保留，`behavior_changes: [DF-20]` 仍指同一裁決 |
+| P5 開埠移出 actor（`OpenCtx`／`JobQueue`） | P6 哨兵 PTY 與 TCP listener 改為 `OpenCtx` 方法、隨 `BridgeOpened` 同一事件交給 core；listener epoch 於 `AdoptBridge` 接手，未接手即 `BeginDrain` 亦停止 |
+| `regen_lock.py` 兩種延後核准 | P5 `--allow-defer case:from:to:OD` 與 P6 `--authorize-deferral case:OD` 並存，兩支測試皆保留 |
+| OD-34 `l15-delayed-reply`（P5 自 2.1 延至 2.3） | `cases.yaml` revision 2026-10-29.1；slice_2.2 分母 94→93；`breaker/slice_2.2.json` 還原凍結本體（c2924a5），兩筆 OD-34 延後以 P5 的 `freeze_slice_cases.py --amend` 寫入 `slice_2.2.amendments.json`（凍結本體不再改寫）；`slice22_evidence_map.yaml` 移除該鍵 |
+| `breaker/slice_2.1.json` | 還原 P5 凍結本體位元組（P5 修訂鏈 `base_freeze_sha256` 以之為錨）；#183 當時寫入的 `case_fingerprints` 原值移到 `slice_2.1.case_fingerprints.json`；指紋檢查改對有效分母逐案比對 |
+| proc_scan 目標 tty 不可 stat（上輪 BLOCKED-OWNER） | P5 已改為 `tty_holders_fail_closed_with`（PermissionDenied → Permission、其他 → Unknown），與主線 s1b_cargo 語意一致；本分支取 P5 版本，該矛盾解除 |
+
+### Codex sol `d6e3b3c_e9b5c61-sol.md`
+
+| # | 等級 | 位置 | 處理 |
+|---|---|---|---|
+| P6-e9b5c61-1 | High | `session_core.rs` 共用 `self_test_suspended` | fixed 7370b8f（紅燈 0123679）：旗標存入各自 `PendingOp::SelfTest.suspended`（帶 drain 世代），Recover 等其他 op 完成不再 resume；daemon 級 `rpc_console::overlapping_self_tests_replay_human_input_end_to_end`（fcbb564；還原修正前原始碼時 FAIL） |
+| P6-e9b5c61-2 | High | `session_core.rs` 取消停放命令 | fixed 7370b8f（紅燈 0123679）：`settle_parked_terminal` 以 `registry.complete` 清在途指標、保留 canceled、零 TX；`start_next` 與 `abort_parked_command` 兩條退出路徑皆結算 |
+| P6-e9b5c61-3 | Medium | `cases.yaml` `l15-release-inflight` 指紋 | OWNER-BATCH：該欄位變更出自主線擁有者 commit dbbc1f7（`fix(bridge): 收緊 Windows 序列埠期限與 peer gate`），P5 亦已帶入；sol 的修法 1（本分支還原文字）會與主線／P5 分歧並於下次合併再衝突，修法 2 須逐名核准。合併帶入的另一個指紋差異（`l15-delayed-reply`）已依 OD-34 修訂鏈排除 |
+| P6-e9b5c61-4 | Medium | `test_l1_judge.py` OD-24 與 `s22_gate:console_conformance_pty` | OWNER-BATCH：OD-24 (2) 字面禁止 cargo 凍結集合含 `#[ignore]` 列；該集合的 selector 以 `--ignored cap_posix_pty__` 實跑，與 OD-24 的立論（官方 selector 不執行 ignored）不同。移列須 `--allow-removal` 逐名核准；P5 的 `s21_core` 同類列屬 P5 |
+
+### 接線＋端到端驗收（`p6-wiring-e2e.md`）
+
+- R3-8（worker health 未注入）：fixed 30475b8（紅燈 d2a6e67），ATTACHED 救援改取 manager 注入的現行 epoch IoWorker 快照。
+- M1～M11 no-op 變異皆 RED；新增 daemon 級測試 4 支（fcbb564）。
+
+### 第四輪全套 pytest 與環境
+
+- 本輪改以一般使用者 `ubuntu`（非 root）執行全套與 cargo 測試；起點 e9b5c61 於獨立 clone 跑基準。
+- 上輪「`test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread` 在 root 下不成立」：非 root 重跑 17/17 passed，確認為 root 環境因素。
+- `test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only` 的 `COM9` 參數 id：本機 pytest 9.2.0 對長字串參數改產 `msg2` id；以 CI 釘定的 pytest 9.0.3 重跑即通過（環境因素；起點與本輪同環境比較）。
