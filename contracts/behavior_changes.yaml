@@ -1049,7 +1049,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["df04-released-persist-restarts"]
-    compatibility_impact: "動態 session 的 RELEASED 可跨任意次數重啟保留；裝置離線的 tick 不再把 RELEASED 降為 DETACHED。所屬 template 已不存在的 RELEASED 紀錄（OD-63）實體化為 RELEASED 佔位 session（passthrough、command_capable:false），by_id 維持阻擋；`device attach COMx` 時佔位移除自身並解除 by_id，再交 template 偵測建立正式 session（保留原 COM，不降級 profile；無 template 可匹配時依現行 dynamic 偵測）。0.3.2 只阻擋一輪即丟棄此類紀錄。"
+    compatibility_impact: "動態 session 的 RELEASED 可跨任意次數重啟保留；裝置離線的 tick 不再把 RELEASED 降為 DETACHED。所屬 template 已不存在的 RELEASED 紀錄（OD-63）實體化為 RELEASED 佔位 session（passthrough、command_capable:false），by_id 維持阻擋；`device attach COMx` 時佔位移除自身並解除 by_id，再交 template 偵測建立正式 session（保留原 COM，不降級 profile；無 template 可匹配時依現行 dynamic 偵測）。`device attach` 開埠遇一般 OSError（如權限不足）時佔位同樣移除自身並交 dynamic 偵測（保留原 COM）；仍開不了埠時依現行 dynamic 開埠失敗語意：有 passthrough fallback template 即在原 COM 留下 `DETACHED`（`last_error=ATTACH_FAILED:<例外名>`）列，無 passthrough fallback template 時不留列（`device attach COMx` 回 `SESSION_NOT_FOUND`）、以 `_pending_com` 保留原 COM 至裝置拔除或 daemon 重啟為止（期間不分配給其他裝置），之後由熱插或重啟重新偵測建立 session，COM 依 dynamic 指派規則重新分配、不保證沿用原 COM（與 dynamic 對新裝置開埠失敗相同，不新增錯誤碼或回應形狀）。對佔位 `session.bind` 比照 `session.attach` 的 RELEASED 早退，回 `ok:true`、`released:true`、`recommended_action:device_attach`，佔位不離開 RELEASED（不解除阻擋、不寫 binding override、不取消在途 attach、不開埠）。0.3.2 只阻擋一輪即丟棄此類紀錄。"
     approval_conditions: "安全交接缺陷；交接安全；「缺 template 不得實體化」僅於 OD-63 佔位用途放寬，佔位不可下命令、不以佔位 profile attach，不新增 RPC／CLI 表面"
     related_decisions: ["OD-63"]
   - id: "DF-05"

@@ -4334,9 +4334,12 @@
       },
       "result": {
         "type": "object",
+        "x-note": "OD-63 佔位 session 比照 session.attach 的 RELEASED 早退，另回 released、recommended_action（與 already_bound 互斥）；x-order 對應回應鍵序",
         "x-order": [
           "ok",
           "already_bound",
+          "released",
+          "recommended_action",
           "session"
         ],
         "properties": {
@@ -4347,6 +4350,13 @@
           "already_bound": {
             "type": "boolean",
             "const": true
+          },
+          "released": {
+            "type": "boolean",
+            "const": true
+          },
+          "recommended_action": {
+            "type": "string"
           },
           "session": {
             "$ref": "#/$defs/SessionPublic"
@@ -4375,7 +4385,8 @@
         {
           "what": "detach（REBOUND）、離開 RELEASED、_binding_overrides[sid]=by_id、_save_state()、spawn attach",
           "when": "on_success",
-          "idempotent": false
+          "idempotent": false,
+          "x-condition": "OD-63 佔位 session 早退（回 released:true、recommended_action:device_attach）時不執行：佔位不離開 RELEASED，不解除 by_id 阻擋、不寫 _binding_overrides、不取消在途 attach、不開埠"
         }
       ],
       "retryable_readonly": false,
