@@ -14,8 +14,34 @@
     - `tests/test_resource_markers.py::test_every_item_has_resource_marker_and_memory_only_is_exclusive`
     - `tests/test_resource_markers.py::test_detected_resources_are_marked`（`('test_contracts_slice22.py', 'test_slice22_case_set_frozen_and_mapped', ['process_rpc'])` 等 marker 缺漏）
     - `tests/test_slice21_skeleton_guards.py::test_resource_limit_rust_mirrors_equal_yaml`（`resource_limits.yaml` 新增 9 列未鏡像）
-- 綠燈紀錄（同日，分支 `feature/rust-refactor-p6` HEAD `5ade76c`，同一命令）：**13 passed、0 failed**。
+- 綠燈紀錄（同日，分支 `feature/rust-refactor-p6` HEAD `5ade76c`，同一命令）：**13 passed、0 failed**；HEAD `2184235` 重跑同一命令亦 13 passed、退出碼 0。
 - 結論：T0 單獨為紅燈、終態綠燈；紅燈原因皆為 T0 之後兩個 commit 已修的測試基礎設施（marker／鏡像），非產品行為。
+- 結構化證據（`scripts/rust/s22_gate_check.py` 只依此區塊判定；第 5 輪以一般使用者重跑兩端取得退出碼，綠燈 commit 為重跑當下的分支 HEAD）：
+
+```json process-evidence
+{
+ "red": {
+  "commit": "ae33e28",
+  "command": "python3 -m pytest -q tests/test_resource_markers.py tests/test_slice21_skeleton_guards.py",
+  "exit_code": 1,
+  "passed": 9,
+  "failed": 4,
+  "failed_tests": [
+   "tests/test_resource_markers.py::test_every_item_has_exactly_one_platform_marker",
+   "tests/test_resource_markers.py::test_every_item_has_resource_marker_and_memory_only_is_exclusive",
+   "tests/test_resource_markers.py::test_detected_resources_are_marked",
+   "tests/test_slice21_skeleton_guards.py::test_resource_limit_rust_mirrors_equal_yaml"
+  ]
+ },
+ "green": {
+  "commit": "2184235",
+  "command": "python3 -m pytest -q tests/test_resource_markers.py tests/test_slice21_skeleton_guards.py",
+  "exit_code": 0,
+  "passed": 13,
+  "failed": 0
+ }
+}
+```
 
 ## 出口 gate 實跑紀錄（第 5 輪，2026-10-29）
 

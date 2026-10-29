@@ -23,7 +23,8 @@
   `parity_rows["#N"].status`（`PASS` 須附 `tests` 並同 AUTOMATED 規則判定；`BLOCKED-OWNER` 須附 `procedure`；
   `OWNER-DECISION-PENDING` 或未登記 → INSUFFICIENT，result 不得為 PASS）。
   `PROCESS-EVIDENCE`（rulings/p6.md：#185 流程項的證據形式）只限 `PROCESS_EVIDENCE_ROWS` 逐名列出的承接編號：
-  `report` 檔須有 `## #N` 段落，段落內含 `commit` 的 hash 與「紅燈」「綠燈」紀錄 → PASS；否則 INSUFFICIENT。
+  `report` 檔 `## #N` 段落內的 `json process-evidence` 區塊須有核准 commit 的紅燈（非零退出、failed>0、列出失敗測試）
+  與另一 commit、同一命令的綠燈（退出碼 0、failed==0、passed>0）→ PASS；否則 INSUFFICIENT（sol P6-b64dad9-1）。
 - `BLOCKED-OWNER` 條目回報為 BLOCKED-OWNER（不得標 PASS，也不改變 `result`）；`PENDING` → INSUFFICIENT；
   `NOT_APPLICABLE` 略過。
 輸出 `{"sections":[{set_id,platform,verdict,reasons}],"cases":[{case_id,status,missing_tests,...}],"result"}`；
@@ -245,12 +246,20 @@ def p6_parity_numbers(text: str) -> list[str]:
     return [f"#{n}" for n in sorted(nums)]
 
 
+_COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
 def _process_evidence_problems(num: str, entry: dict[str, Any]) -> list[str]:
-    """`PROCESS-EVIDENCE` 列的證據檢查；回傳問題清單（空＝通過）。"""
+    """`PROCESS-EVIDENCE` 列的證據檢查；回傳問題清單（空＝通過）。
+
+    證據為 `report` 中 `## #N` 段落內唯一的 ```` ```json process-evidence ```` 區塊（不以說明文字關鍵字判定，
+    sol P6-b64dad9-1）：`red` 須為 `entry.commit`、退出碼非 0、`failed > 0` 且 `failed_tests` 非空；`green` 須為另一個
+    commit、與 `red` 同一 `command`、退出碼 0、`failed == 0`、`passed > 0`。
+    """
     if num not in PROCESS_EVIDENCE_ROWS:
         return [f"{num} 未逐名核准以 PROCESS-EVIDENCE 為證據（只限 {sorted(PROCESS_EVIDENCE_ROWS)}）"]
     report, commit = entry.get("report"), str(entry.get("commit") or "")
-    if not report or not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+    if not report or not _COMMIT_RE.fullmatch(commit):
         return ["PROCESS-EVIDENCE 須附 report 與 commit"]
     path = ROOT / str(report)
     if not path.is_file():
@@ -267,9 +276,40 @@ def _process_evidence_problems(num: str, entry: dict[str, Any]) -> list[str]:
             section.append(line)
     if section is None:
         return [f"report 缺 `## {num}` 段落"]
-    body = "\n".join(section)
-    missing = [w for w in (commit, "紅燈", "綠燈") if w not in body]
-    return [f"`## {num}` 段落缺：{missing}"] if missing else []
+    blocks = re.findall(r"^```json process-evidence\n(.*?)^```", "\n".join(section) + "\n", re.S | re.M)
+    if len(blocks) != 1:
+        return [f"`## {num}` 段落須恰有一個 json process-evidence 區塊（實得 {len(blocks)}）"]
+    try:
+        data = json.loads(blocks[0])
+    except ValueError as exc:
+        return [f"process-evidence 區塊不是合法 JSON：{exc}"]
+    red = data.get("red") if isinstance(data, dict) else None
+    green = data.get("green") if isinstance(data, dict) else None
+    if not isinstance(red, dict) or not isinstance(green, dict):
+        return ["process-evidence 須含 red 與 green 物件"]
+
+    def _int(rec: dict, key: str) -> int | None:
+        value = rec.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    problems: list[str] = []
+    if red.get("commit") != commit:
+        problems.append(f"red.commit 須為核准的 {commit}")
+    if not isinstance(red.get("command"), str) or not red["command"]:
+        problems.append("red.command 缺漏")
+    if (_int(red, "exit_code") or 0) == 0 or (_int(red, "failed") or 0) <= 0:
+        problems.append("red 須為非零退出且 failed > 0")
+    tests = red.get("failed_tests")
+    if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t for t in tests):
+        problems.append("red.failed_tests 須列出失敗測試")
+    gcommit = green.get("commit")
+    if not isinstance(gcommit, str) or not _COMMIT_RE.fullmatch(gcommit) or gcommit == commit:
+        problems.append("green.commit 須為另一個有效 commit")
+    if green.get("command") != red.get("command"):
+        problems.append("green.command 須與 red 相同")
+    if _int(green, "exit_code") != 0 or _int(green, "failed") != 0 or (_int(green, "passed") or 0) <= 0:
+        problems.append("green 須為退出碼 0、failed == 0、passed > 0")
+    return problems
 
 
 def judge_parity(numbers: list[str], emap: dict[str, Any], rows_by_nodeid: dict[str, list[dict]],
