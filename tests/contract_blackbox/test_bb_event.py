@@ -193,3 +193,94 @@ def test_event_bench_not_remembered(env):
     assert data["ok"] is False
     assert data["error_code"] == "BENCH_ENDPOINT_NOT_REMEMBERED"
     assert b"serialwrap: event.rule_list failed: BENCH_ENDPOINT_NOT_REMEMBERED:" in r.stderr
+
+
+@pytest.mark.core_portable
+def test_event_add_lone_surrogate_rejected_before_send(env, stubd, tmp_path):
+    """S1X-b-2：規則 JSON 內的孤立 surrogate 跳脫在連線成功後、送出前以 INTERNAL_ERROR 拒送（Python 基線）。
+
+    Python ``json.load`` 保留 surrogate，``json.dumps(...).encode("utf-8")`` 拋 ``UnicodeEncodeError``；
+    Rust CLI 不得改寫成 U+FFFD 後照送（RPC-H-03 只涵蓋回應端）。stub 必須收不到任何請求行。
+    """
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "lone.json"
+    f.write_bytes(b'{"lone":"\\udc80"}')
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    message = "'utf-8' codec can't encode character '\\udc80' in position 52: surrogates not allowed"
+    assert r.rc == 1
+    assert r.stdout == (
+        json.dumps(
+            {"error_code": "INTERNAL_ERROR", "message": message, "ok": False},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + NL
+    )
+    assert r.stderr == f"serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}".encode("utf-8") + NL
+    assert s.requests() == []
+
+
+@pytest.mark.core_portable
+@pytest.mark.parametrize(
+    ("doc", "params"),
+    [
+        (b'{"lone":"\\ud800","lone":"ok"}', b'{"lone":"ok"}'),
+        (b'{"a":{"x":"\\udc80"},"a":{"x":"ok"}}', b'{"a":{"x":"ok"}}'),
+    ],
+)
+def test_event_add_overwritten_lone_surrogate_is_sent(env, stubd, tmp_path, doc, params):
+    """S1-2a65438-1：重複鍵後值覆寫前值（``json.load`` 語意），被覆寫掉的孤立 surrogate 不影響送出（Python 基線）。"""
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "dup.json"
+    f.write_bytes(doc)
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    assert r.rc == 0, r.stderr
+    assert r.stdout == b'{"ok":true}' + NL
+    assert s.requests() == [b'{"id":1,"method":"event.rule_set","params":' + params + b"}\n"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.parametrize(
+    ("doc", "detail"),
+    [
+        (b'{"\\u0000\\udbb6\\udc00":1,"\\ud800":2}', "character '\\ud800' in position 57"),
+        (b'{"\\ud800":2,"\\u0000\\udbb6\\udc00":1}', "character '\\ud800' in position 45"),
+        (b'{"a":"\\u0000\\udbb6\\udc00","b":"\\ud800"}', "character '\\ud800' in position 63"),
+    ],
+)
+def test_event_add_lone_surrogate_key_colliding_with_legal_key_rejected(env, stubd, tmp_path, doc, detail):
+    """S1-f2a23b1-1：合法鍵「NUL＋U+FD800」與孤立 surrogate 鍵是不同的鍵，後者使請求於送出前拒送（Python 基線）。"""
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "collide.json"
+    f.write_bytes(doc)
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    message = f"'utf-8' codec can't encode {detail}: surrogates not allowed"
+    assert r.rc == 1
+    assert r.stdout == (
+        json.dumps(
+            {"error_code": "INTERNAL_ERROR", "message": message, "ok": False},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + NL
+    )
+    assert r.stderr == f"serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}".encode("utf-8") + NL
+    assert s.requests() == []
+
+
+@pytest.mark.core_portable
+def test_event_add_legal_key_resembling_surrogate_escape_is_sent(env, stubd, tmp_path):
+    """S1-f2a23b1-1：只有合法鍵「NUL＋U+FD800」時照常送出（Python 基線）。"""
+    s = stubd({"methods": {"event.rule_set": [{"reply": {"ok": True}}]}})
+    f = tmp_path / "legal.json"
+    f.write_bytes(b'{"\\u0000\\udbb6\\udc00":1}')
+
+    r = run_cli(["--socket", s.endpoint, "event", "add", "--file", str(f)], env=env)
+    assert r.rc == 0, r.stderr
+    assert r.stdout == b'{"ok":true}' + NL
+    assert s.requests() == [
+        b'{"id":1,"method":"event.rule_set","params":{"\\u0000' + "\U000fd800".encode("utf-8") + b'":1}}\n'
+    ]

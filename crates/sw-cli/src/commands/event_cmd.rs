@@ -21,7 +21,7 @@ use crate::output::{mirror_err, print_internal_error, print_json, warn_version_m
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pycompat::{decode_utf8_strict, universal_newlines};
 use sw_proto::pyfmt::{py_repr_argv, surrogate_of_escape};
-use sw_proto::pyjson::{loads, PyDict, PyInt, PyValue};
+use sw_proto::pyjson::{loads_keep_lone_surrogates, PyDict, PyInt, PyValue};
 
 /// 子指令名 → RPC method（與 Python `_EVENT_CMD_METHOD` 同序、同值）。
 pub const EVENT_CMD_METHOD: [(&str, &str); 10] = [
@@ -108,14 +108,9 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
     };
 
     let timeout_s = effective_timeout_s(ns, method);
-    let params = match event_params(ctx, ns) {
-        Ok(params) => params,
+    let (params, origin) = match event_params_origin(ctx, ns) {
+        Ok(found) => found,
         Err(message) => return print_internal_error(&mut ctx.io, &context, &message),
-    };
-    // `add` 的參數來自檔案內容（JSON），其 NUL 等碼位是合法資料；其餘子指令的參數來自 argv（見 `ParamOrigin`）。
-    let origin = match subcommand {
-        Some("add") => ParamOrigin::Document,
-        _ => ParamOrigin::Argv,
     };
 
     let (mut outcome, failure) = match client::call_with_failure_origin(
@@ -132,13 +127,10 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
         Err(ClientCrash::InvalidTimeout(_)) => {
             return print_internal_error(&mut ctx.io, &context, python_timeout_message(timeout_s));
         }
-        // 參數含非 UTF-8 原文：Python 於 `json.dumps(...).encode("utf-8")` 拋 UnicodeEncodeError，文字含位置（Q-19 b）。
+        // 參數含非 UTF-8 原文或孤立 surrogate：Python 於 `json.dumps(...).encode("utf-8")` 拋 UnicodeEncodeError，
+        // 文字含位置（Q-19 b、S1X-b-2）。
         Err(ClientCrash::EncodeError(message)) => {
-            let text = if origin == ParamOrigin::Argv && argv::value_is_tainted(&params) {
-                encode_error_text(method, &params).unwrap_or(message)
-            } else {
-                message
-            };
+            let text = encode_crash_text(method, &params, origin, message);
             return print_internal_error(&mut ctx.io, &context, &text);
         }
     };
@@ -174,7 +166,8 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
                     );
                 }
                 Err(ClientCrash::EncodeError(message)) => {
-                    return print_internal_error(&mut ctx.io, &context, &message);
+                    let text = encode_crash_text(method, &params, origin, message);
+                    return print_internal_error(&mut ctx.io, &context, &text);
                 }
             }
         }
@@ -198,7 +191,8 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
                     );
                 }
                 Err(ClientCrash::EncodeError(message)) => {
-                    return print_internal_error(&mut ctx.io, &context, &message);
+                    let text = encode_crash_text(method, &params, origin, message);
+                    return print_internal_error(&mut ctx.io, &context, &text);
                 }
             }
         }
@@ -243,7 +237,49 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
 }
 
 /// `add --file` 的讀取與解析（`cli.py:_dispatch_event` 的 `open` + `json.load`）。
+/// 同 [`event_params`]，另回傳參數來源（見 [`ParamOrigin`]）。
+///
+/// `add` 的參數來自檔案內容（JSON），其 NUL 等碼位是合法資料；檔案含孤立 surrogate 跳脫時為
+/// [`ParamOrigin::DocumentLoneSurrogate`]（S1X-b-2，送出前拒送）。其餘子指令的參數來自 argv。
+pub fn event_params_origin(ctx: &CliCtx, ns: &Namespace) -> Result<(PyValue, ParamOrigin), String> {
+    if ns.str("event_cmd") == Some("add") {
+        let (value, lone) = read_rule_file_lone(ctx, ns.str("file").unwrap_or(""))?;
+        let origin = if lone {
+            ParamOrigin::DocumentLoneSurrogate
+        } else {
+            ParamOrigin::Document
+        };
+        return Ok((value, origin));
+    }
+    Ok((event_params(ctx, ns)?, ParamOrigin::Argv))
+}
+
+/// `ClientCrash::EncodeError` 的 `str(exc)`：參數含跳脫的 lone surrogate 時依 CPython 重算位置，否則沿用 client 訊息。
+fn encode_crash_text(
+    method: &str,
+    params: &PyValue,
+    origin: ParamOrigin,
+    message: String,
+) -> String {
+    let surrogate = match origin {
+        ParamOrigin::Argv => argv::value_is_tainted(params),
+        ParamOrigin::DocumentLoneSurrogate => true,
+        ParamOrigin::Document => false,
+    };
+    if surrogate {
+        encode_error_text(method, params).unwrap_or(message)
+    } else {
+        message
+    }
+}
+
 fn read_rule_file(ctx: &CliCtx, file: &str) -> Result<PyValue, String> {
+    read_rule_file_lone(ctx, file).map(|(value, _)| value)
+}
+
+/// 讀取並解析規則檔；第二個值為是否含孤立 surrogate 跳脫（值內以 `pyfmt` 跳脫保留，合法 NUL 為
+/// [`sw_proto::pyjson::KEPT_NUL`]，見 [`sw_proto::pyjson::loads_keep_lone_surrogates`]）。
+fn read_rule_file_lone(ctx: &CliCtx, file: &str) -> Result<(PyValue, bool), String> {
     let path = PathBuf::from(argv::decode(file));
     let bytes = ctx
         .p
@@ -251,9 +287,10 @@ fn read_rule_file(ctx: &CliCtx, file: &str) -> Result<PyValue, String> {
         .read(&path)
         .map_err(|error| format!("{}: {}", error.py_message, py_repr_argv(file)))?;
     let text = decode_utf8_strict(&bytes).map_err(|error| error.to_string())?;
-    let value = loads(&universal_newlines(&text)).map_err(|error| error.to_string())?;
+    let (value, lone) = loads_keep_lone_surrogates(&universal_newlines(&text))
+        .map_err(|error| error.to_string())?;
     check_int_digits(&value)?;
-    Ok(value)
+    Ok((value, lone))
 }
 
 /// CPython 3.12 預設的整數字串轉換位數上限（CVE-2020-10735）。
@@ -337,12 +374,15 @@ fn python_timeout_message(timeout_s: f64) -> &'static str {
 /// 位置為 Python 字元索引：線路格式中，跳脫的 surrogate 為 `\u0000`（6 字元）加偏移字元，在此合併計為 1。
 /// 連續的 surrogate 與 CPython 相同合併為區間（`characters in position a-b`）。
 /// 請求的 `id` 與 [`dispatch_event`] 送出者相同（1）。
+///
+/// 以 [`wire_unit`] 逐單位前進：JSON 跳脫序列整段跳過，合法內容（`\\` 後接 `u0000`、檔案內容的
+/// [`sw_proto::pyjson::KEPT_NUL`]）不會被誤認為 surrogate（S1-f2a23b1-1）。
 fn encode_error_text(method: &str, params: &PyValue) -> Option<String> {
     let encoded = client::encode_request(1, method, params);
     let text = String::from_utf8(encoded).ok()?;
     let mut position = 0usize;
     let mut rest = text.as_str();
-    while let Some(ch) = rest.chars().next() {
+    while !rest.is_empty() {
         if let Some((first, _)) = escaped_surrogate_at(rest) {
             let mut count = 0usize;
             let mut cursor = rest;
@@ -361,10 +401,30 @@ fn encode_error_text(method: &str, params: &PyValue) -> Option<String> {
                 )
             });
         }
-        position += 1;
-        rest = &rest[ch.len_utf8()..];
+        let (len, chars) = wire_unit(rest);
+        position += chars;
+        rest = &rest[len..];
     }
     None
+}
+
+/// `text`（非空的線路文字）開頭一個單位在 `text` 內佔用的位元組數，與它在 Python 請求文字中的字元數。
+///
+/// 單位為 JSON 跳脫序列（`\uXXXX` 6 字元，其餘 2 字元）或單一字元。檔案內容的合法 NUL
+/// （[`sw_proto::pyjson::KEPT_NUL`]）在線路上為 `\u0000\u0000`，在 Python 請求文字中是一個 `\u0000`。
+fn wire_unit(text: &str) -> (usize, usize) {
+    // `KEPT_NUL` 的兩個 NUL 各自序列化為 `\u0000`。
+    const WIRE_KEPT_NUL: &str = "\\u0000\\u0000";
+    if text.starts_with(WIRE_KEPT_NUL) {
+        (WIRE_KEPT_NUL.len(), "\\u0000".len())
+    } else if text.starts_with("\\u") {
+        ("\\u0000".len(), "\\u0000".len())
+    } else if text.starts_with('\\') {
+        (2, 2)
+    } else {
+        let ch = text.chars().next().unwrap_or_default();
+        (ch.len_utf8(), 1)
+    }
 }
 
 /// `text` 開頭為一個跳脫的 surrogate（`\u0000` ＋ 偏移字元）時，回傳其碼位與在 `text` 內佔用的位元組數。

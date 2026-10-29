@@ -205,3 +205,64 @@ fn password_value_error_wins_over_later_boot_done_overflow() {
     assert!(err.contains("ASCII and UNICODE flags are incompatible"), "err={err}");
     assert!(!err.contains("repetition"), "err={err}");
 }
+
+#[test]
+fn class_range_error_precedes_unterminated_and_later_escape() {
+    // S1X-b-1：CPython 讀到 `a-b` 當下即檢查範圍；`bad character range` 先於其後的未封閉與跳脫錯誤，
+    // `-` 後直接 EOF 仍為 unterminated（Python 3.12.3 `profile test` 實測文字）。
+    let cases = [
+        ("[z-a", "bad character range z-a at position 1"),
+        ("[z-ab", "bad character range z-a at position 1"),
+        (r"[z-a\A]", "bad character range z-a at position 1"),
+        (r"[\d-z", r"bad character range \\d-z at position 1"),
+        ("[z-", "unterminated character set at position 0"),
+    ];
+    for (pattern, error) in cases {
+        let yaml = format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '{pattern}'\n    login_regex: \"x\"\n    password_regex: \"x\"\n"
+        );
+        let (rc, out, err) = run_profile(&yaml);
+        assert_eq!((rc, err.as_str()), (0, ""), "pattern={pattern} out={out}");
+        let want = format!(
+            "\"prompt_regex\":{{\"error\":\"{error}\",\"matched\":false,\"matched_line\":null,\"pattern\":\"{}\"}}",
+            pattern.replace('\\', "\\\\")
+        );
+        assert!(
+            out.contains(&want),
+            "pattern={pattern}\nout={out}\nwant={want}"
+        );
+    }
+}
+
+#[test]
+fn trailing_lone_backslash_error_precedes_earlier_token_errors() {
+    // S1-2a65438-2、S1X-b-X1：CPython tokenizer 取走倒數第二個 token 時即預讀到結尾單獨的 `\`，
+    // `bad escape (end of pattern)` 優先於該 token 之後才判定的錯誤（含 `(?x)` 註解內讀到結尾而原本通過者）；
+    // 之前已判定者（`++\`）與偶數個反斜線結尾者不變（Python 3.12.3 `profile test` 實測文字）。
+    let cases = [
+        (r"[z-a\", "bad escape (end of pattern) at position 4"),
+        (r"[\d-z\", "bad escape (end of pattern) at position 5"),
+        (r"[z\A\", "bad escape (end of pattern) at position 4"),
+        (r"a\8\", "bad escape (end of pattern) at position 3"),
+        (r"(?P<\", "bad escape (end of pattern) at position 4"),
+        (r"(?x)a#c\", "bad escape (end of pattern) at position 7"),
+        (r"a{2,1}\", "bad escape (end of pattern) at position 6"),
+        (r"++\", "nothing to repeat at position 0"),
+        (r"[z-a\\]", "bad character range z-a at position 1"),
+    ];
+    for (pattern, error) in cases {
+        let yaml = format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '{pattern}'\n    login_regex: \"x\"\n    password_regex: \"x\"\n"
+        );
+        let (rc, out, err) = run_profile(&yaml);
+        assert_eq!((rc, err.as_str()), (0, ""), "pattern={pattern} out={out}");
+        let want = format!(
+            "\"prompt_regex\":{{\"error\":\"{error}\",\"matched\":false,\"matched_line\":null,\"pattern\":\"{}\"}}",
+            pattern.replace('\\', "\\\\")
+        );
+        assert!(
+            out.contains(&want),
+            "pattern={pattern}\nout={out}\nwant={want}"
+        );
+    }
+}

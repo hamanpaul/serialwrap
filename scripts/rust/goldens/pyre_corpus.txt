@@ -128,3 +128,49 @@ x*
 $
 a<U+000A>
 (?i)
+#
+# 第六區：字元類別範圍的錯誤優先序（S1X-b-1）。CPython 讀到 `a-b` 當下即檢查範圍，
+# `bad character range` 先於其後的未封閉與跳脫錯誤；`-` 後直接 EOF 仍為 unterminated。
+[z-a
+[z-ab
+[z-a\A]
+[\d-z
+[^z-a
+[z-a-
+[\x7a-a
+[z-
+[]-a
+[a-\A
+[\x7a-a]
+[a-\x41]
+[\N{LATIN SMALL LETTER Z}-a]
+[\d-z]
+#
+# 第七區：樣式以單獨 `\` 結尾（S1-2a65438-2、S1X-b-X1）。CPython tokenizer 取走每個 token 時即預讀下一個，
+# 取走倒數第二個 token 的當下就拋 `bad escape (end of pattern)`，優先於該 token 之後才判定的錯誤；
+# 在此之前已判定的錯誤（如 `++\` 的 nothing to repeat）與偶數個反斜線結尾者不受影響。
+[z-a\
+[\d-z\
+[z\A\
+a\8\
+(?P<\
+\
+a\\\
+a\\
+a{2,1}\
+(?<\Z\
+(?Px\
+(?P<>\
+(?i\0\
+++\
++?\
+a**\
+*\
+(?#x\
+(?x)a#c\
+[a\
+a|\
+(a)\1\
+(?z\
+\x4\
+[z-a\\]
