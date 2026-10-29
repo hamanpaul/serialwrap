@@ -69,6 +69,40 @@ def host_load() -> dict[str, Any]:
     return {"loadavg_1min": load1, "cpu_count": os.cpu_count()}
 
 
+def _sha256_file(path: str) -> str | None:
+    import hashlib
+
+    try:
+        with open(path, "rb") as f:
+            return hashlib.file_digest(f, "sha256").hexdigest()
+    except OSError:
+        return None
+
+
+def report_identity(daemon: str, *, run_id: str) -> dict[str, Any]:
+    """sol P5-3084388-2：量測證據的受測身分——daemon binary sha256、來源 commit（與工作樹是否乾淨）、本工具與
+    契約檔的 sha256、method_revision、run ID。daemon 只記檔名（不落本機絕對路徑，policy R-21）。"""
+    import subprocess
+
+    def _git(*args: str) -> str:
+        try:
+            return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, timeout=30).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    return {
+        "run_id": run_id,
+        "daemon": pathlib.Path(daemon).name,
+        "daemon_sha256": _sha256_file(daemon),
+        "source_commit": _git("rev-parse", "HEAD"),
+        "source_tree_dirty": bool(dirty),
+        "tool_sha256": _sha256_file(__file__),
+        "contract_sha256": _sha256_file(str(LIMITS)),
+        "method_revision": load_contract().get("method_revision"),
+    }
+
+
 def judge_run(samples: list[float], *, want: int, limit: float | None, load_before: dict, load_after: dict,
               errors: list[str]) -> dict[str, Any]:
     """單輪判定（純函式）：樣本數不足／有錯誤／host 過載 → INSUFFICIENT_EVIDENCE；最大值超過上限 → FAIL。"""
@@ -119,6 +153,11 @@ def overall_verdict(report: dict[str, Any]) -> tuple[str, list[str]]:
         reasons.append(f"外部量測輪次未全數 PASS：缺 {sorted(want - got)[:6]}")
     if not l1 or any(o != "passed" for o in l1.values()):
         reasons.append(f"L1 結構 gate 證據不足：{sorted(n for n, o in l1.items() if o != 'passed') or '未提供 l1-results'}")
+    ident = report.get("identity") or {}
+    if not ident.get("daemon_sha256") or not ident.get("source_commit"):
+        reasons.append("受測身分不全（daemon sha256／來源 commit），量測證據無法追溯")
+    elif ident.get("source_tree_dirty"):
+        reasons.append(f"來源工作樹不乾淨（{ident.get('source_commit')}），量測證據無法對應 commit")
     if report.get("freeze_status") != "frozen":
         reasons.append(f"event_latency 上限值未凍結（freeze_status={report.get('freeze_status')!r}，method_revision "
                        f"{report.get('method_revision')}）")
@@ -245,14 +284,21 @@ def _sample_cancel(rpc: _Rpc) -> float:
             raise RuntimeError(f"命令未進入 running（{st}）")
         time.sleep(0.005)
     ms, r = rpc.timed("command.cancel", {"cmd_id": cmd_id})
-    if "ok" not in r:
-        raise RuntimeError(f"command.cancel 回應格式無效：{r}")
+    # sol P5-3084388-1：取消須成功（ok:true、status canceled）才是有效樣本；命令已自然完成而被拒（CMD_NOT_CANCELABLE）
+    # 或最終不是 canceled 者記為錯誤（該輪 INSUFFICIENT_EVIDENCE），不得把拒絕回應的耗時算成取消延遲。
+    if r.get("ok") is not True or r.get("status") != "canceled":
+        raise RuntimeError(f"command.cancel 未成功取消在途命令：{r}")
     _wait_state(rpc, "READY")
     deadline = time.monotonic() + 15
-    while not (rpc.call("command.get", {"cmd_id": cmd_id}).get("command") or {}).get("done_at"):
+    while True:
+        cmd = rpc.call("command.get", {"cmd_id": cmd_id}).get("command") or {}
+        if cmd.get("done_at"):
+            break
         if time.monotonic() > deadline:
             raise RuntimeError("被取消的在途命令未結束")
         time.sleep(0.02)
+    if cmd.get("status") != "canceled":
+        raise RuntimeError(f"取消後命令最終狀態不是 canceled：{cmd.get('status')}")
     return ms
 
 
@@ -383,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-work", action="store_true")
     ap.add_argument("--void-retries", type=int, default=2)
     ap.add_argument("--l1-results", help="linux_l1 的 l1-results.json（OD-45 L1 結構 gate）")
+    ap.add_argument("--run-id", help="量測 run ID（預設依時間產生）")
     args = ap.parse_args(argv)
     contract = load_contract()
     report = measure(args, contract, lambda m: print(m, flush=True))
@@ -390,6 +437,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.l1_results and pathlib.Path(args.l1_results).is_file():
         l1 = json.loads(pathlib.Path(args.l1_results).read_text(encoding="utf-8"))
     report["l1_gate"] = l1_gate_status(contract, l1)
+    report["identity"] = report_identity(args.daemon, run_id=args.run_id or time.strftime("evlat-%Y%m%dT%H%M%SZ", time.gmtime()))
+    report["daemon"] = report["identity"]["daemon"]
     report["verdict"], report["reasons"] = overall_verdict(report)
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
