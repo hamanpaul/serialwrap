@@ -26,6 +26,7 @@ done
 RUN_DIR="$ROOT/target/p7-ab/$RUN_ID"
 mkdir -p "$RUN_DIR"
 [[ -n "$OUT" ]] || OUT="$ROOT/docs/rust-refactor/evidence/p7-ab-$(date +%y%m%d).md"
+mkdir -p "$(dirname "$OUT")"
 cd "$ROOT"
 TESTS=(tests/contract_blackbox/test_p7_*.py)
 
