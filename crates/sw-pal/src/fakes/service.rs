@@ -63,6 +63,7 @@ pub struct FakeServiceCtl {
     stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
     stop_signal: Arc<AtomicBool>,
     main_pids: Mutex<std::collections::BTreeMap<String, Result<Option<u32>, String>>>,
+    strict_dropin: AtomicBool,
 }
 
 /// 有狀態監管模型的快照（`FakeServiceCtl::set_model`／`query_now`）：`enabled` 為 `None` 表示未註冊。
@@ -78,6 +79,12 @@ impl FakeServiceCtl {
             modes,
             ..Self::default()
         })
+    }
+
+    /// S1-f3c66b4-2：開啟後 systemd hold 紀錄帶 drop-in 路徑，release 缺 drop-in 路徑的 systemd hold 即失敗
+    /// （對齊 `SystemdCtl::release_named`）。預設關閉，既有替身行為不變。
+    pub fn set_strict_dropin(&self, strict: bool) {
+        self.strict_dropin.store(strict, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 依呼叫順序回傳記錄 `(mode, action, with_sudo)`。
@@ -401,7 +408,9 @@ impl ServiceCtl for FakeServiceCtl {
             mode: mode.clone(),
             kind: kind_for(mode),
             name: None,
-            dropin_path: None,
+            dropin_path: (self.strict_dropin.load(std::sync::atomic::Ordering::SeqCst)
+                && kind_for(mode) == AutostartHoldKind::SystemdDropIn)
+                .then(|| std::path::PathBuf::from(format!("/fake/{}/serialwrap.service.d/zz-serialwrap-hold.conf", mode.as_str()))),
             prior_enabled: None,
             prior_restart: self
                 .hold_prior_restart
@@ -424,6 +433,16 @@ impl ServiceCtl for FakeServiceCtl {
             None => "keep",
         };
         self.log(&hold.mode, &format!("release_autostart:{tag}"), with_sudo);
+        if self.strict_dropin.load(std::sync::atomic::Ordering::SeqCst)
+            && hold.kind == AutostartHoldKind::SystemdDropIn
+            && hold.dropin_path.is_none()
+        {
+            return Err(ServiceResult {
+                ok: false, mode: hold.mode.as_str().to_string(), action: "release_autostart".into(), rc: Some(1),
+                stdout: None, stderr: None, error_code: Some("INTERNAL_ERROR"),
+                hint: Some("hold 紀錄缺少 drop-in 路徑".into()), phase: Some("autostart_release"),
+            });
+        }
         let scripted = self.next_result(&hold.mode, "release_autostart");
         if !scripted.ok {
             return Err(scripted);

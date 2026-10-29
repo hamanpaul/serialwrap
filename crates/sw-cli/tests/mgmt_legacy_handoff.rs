@@ -748,3 +748,46 @@ fn legacy_spec_gap5_recover_restore_failure_lists_unrestored_items() {
     );
     assert!(t.journal_json().is_some());
 }
+
+/// S1-f3c66b4-2：跨模式中斷的第一次恢復停止目標 instance、取得目標 hold 後再次中斷
+/// （`restore_supervisor_and_daemon:after_registration`），下一次恢復不得重用缺 drop-in 路徑的 hold 計畫；
+/// 替身以 strict drop-in 模式對齊 `SystemdCtl::release_named`（缺路徑即拒絕撤銷）。
+#[test]
+fn s1_f3c66b4_2_recover_reinterrupted_after_target_hold_completes() {
+    let old = "/tmp/sw-od48-x/serialwrapd.sock";
+    let t = TestEnv::posix()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle("0.4.1")
+        .with_systemd(true)
+        .with_var("USER", "alice")
+        .with_supervisor_state("on-demand", false, false)
+        .with_config(&format!("supervision_mode: on-demand\nsocket_path: {old}\n"))
+        .with_idle_daemon(old, 4242)
+        .with_new_daemon_reporting_version("0.4.1")
+        .with_crash_at("start_and_verify:started");
+    t.service().set_strict_dropin(true);
+    assert_eq!(t.run_from_bundle(&["setup", "--user"]).0, 137);
+    let mut t = t;
+    t.clear_crash();
+    let old_ep = t.isolated_endpoint(old);
+    t.rpc().revive_after_spawn(&old_ep, t.process().spawn_counter(), 4243);
+    t.rpc().respond_after_relaunch(&old_ep, "health.ping", "{\"ok\":true,\"pid\":4243}");
+    t.rpc().respond_after_relaunch(&old_ep, "health.status", "{\"ok\":true,\"pid\":4243,\"version\":\"0.4.0\",\"wal\":{\"healthy\":true}}");
+    t.rpc().respond_after_relaunch(&old_ep, "session.list", "{\"ok\":true,\"sessions\":[]}");
+    t.rpc().respond_after_relaunch(&old_ep, "alias.list", "{\"ok\":true,\"aliases\":[]}");
+    t.rpc().respond_after_relaunch(&old_ep, "device.list", "{\"ok\":true,\"devices\":[]}");
+    // 第一次恢復：停止 Y、取得目標 hold 後於還原註冊後中斷。
+    sw_cli::rollback::set_test_crash_point(Some("restore_supervisor_and_daemon:after_registration".into()));
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| t.recover()));
+    sw_cli::rollback::set_test_crash_point(None);
+    assert!(interrupted.is_err(), "第一次恢復必須在還原註冊後中斷");
+    assert!(t.journal_json().is_some(), "中斷後 journal 必須保留");
+    // 第二次恢復必須完成，且撤銷目標 hold 時帶 drop-in 路徑。
+    let recovered = t.recover().expect("journal");
+    assert_ne!(recovered.reason.as_deref(), Some("autostart_release_failed"), "{recovered:?}");
+    assert!(recovered.ok, "{recovered:?}");
+    assert!(t.journal_json().is_none());
+    assert_eq!(t.service().hold_state_now(), HoldState::NotHeld);
+}

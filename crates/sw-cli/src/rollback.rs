@@ -836,8 +836,11 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
     });
     let mut target_instance_hold = None;
     if let Some(target) = target_instance.as_ref() {
+        // S1-f3c66b4-2：只有完整的計畫（systemd drop-in 須有路徑）才可重用；缺欄位時重新取得 hold（drop-in 冪等），
+        // 取得的完整紀錄立即寫回 journal，供恢復再次中斷時重用。
         let reusable_target_hold = journal.target_autostart.as_ref()
             .filter(|plan| plan.kind != AutostartHoldKind::NoSupervisor && ctx.p.service.autostart_hold_state(&target.mode) == HoldState::Held)
+            .filter(|plan| plan.kind != AutostartHoldKind::SystemdDropIn || plan.dropin_path.is_some())
             .map(|plan| hold_record_from_autostart(&target.mode, plan));
         match stop_for_revert_with_hold(ctx, &target.mode, &target.endpoint, false, "install_recover", reusable_target_hold, None) {
             Ok(RevertStop::Stopped { hold, .. }) | Ok(RevertStop::Absent { hold }) => target_instance_hold = hold,
@@ -845,6 +848,12 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
                 return Some(recovery_deferred(&from_step, error, ctx, &target.endpoint, "install_recover"));
             }
             Err(error) => return Some(recovery_stop_error(&from_step, &error, ctx, &target.endpoint)),
+        }
+        if let Some(hold) = target_instance_hold.as_ref() {
+            journal.target_autostart = Some(autostart_plan(hold, hold.prior_enabled));
+            if let Err(error) = write_journal(ctx, root, &journal) {
+                return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "journal_write_failed", error.to_string()));
+            }
         }
         if let Err(failure) = confirm_released(ctx, &target.endpoint, None) {
             return Some(recovery_error_from_op(&from_step, "tty_holder_remains", failure));
