@@ -42,6 +42,16 @@ def _git(*args: str) -> str | None:
         return None
 
 
+def _rel(p: Path | None) -> str | None:
+    """證據路徑以 repo 相對路徑呈現（R-21：不得寫入主機絕對路徑）。"""
+    if p is None:
+        return None
+    try:
+        return str(Path(p).resolve().relative_to(ROOT))
+    except ValueError:
+        return Path(p).name
+
+
 def load_cases(cases_yaml: Path) -> list[dict]:
     data = yaml.safe_load(cases_yaml.read_text(encoding="utf-8"))
     out = []
@@ -120,8 +130,8 @@ def build(args) -> tuple[str, int]:
         f"- rust_cli_sha256: `{_sha256_file(args.rust_cli)}`",
         f"- rust_daemon_sha256: `{_sha256_file(args.rust_daemon)}`",
         f"- platform: `{_platform.system().lower()}`；transport: `faketarget_pty`",
-        f"- evidence A: `{args.junit_a}` sha256 `{_sha256_file(args.junit_a)}`",
-        f"- evidence B: `{args.junit_b}` sha256 `{_sha256_file(args.junit_b)}`",
+        f"- evidence A: `{_rel(args.junit_a)}` sha256 `{_sha256_file(args.junit_a)}`",
+        f"- evidence B: `{_rel(args.junit_b)}` sha256 `{_sha256_file(args.junit_b)}`",
         "",
         "| case_id | A | B | 說明 |",
         "|---|---|---|---|",
