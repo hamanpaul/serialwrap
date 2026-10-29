@@ -1,5 +1,5 @@
 {
-  "daemon": "<release>/serialwrapd（commit 8134806 之後的 release build，非 root 建置）",
+  "daemon": "serialwrapd",
   "diagnostic": false,
   "flood_load": {
     "bytes_per_s": 20000,
@@ -8,16 +8,24 @@
   },
   "freeze_status": "pending_review_record",
   "gate_rule": "every_run_max_le_max_ms",
+  "identity": {
+    "contract_sha256": "3b7a99512cdbe935652e2293970ebae46ae16c54642da020d378c804770e87c0",
+    "daemon": "serialwrapd",
+    "daemon_sha256": "8aae8fc322c57589c79beb8b98586183274ceb1183ac51870c9748c9f2799cf6",
+    "method_revision": "2026-10-29.1",
+    "run_id": "evlat-r5-2472f78",
+    "source_commit": "2472f780c860a3ca742dac67d5f17eae02dff2a6",
+    "source_tree_dirty": false,
+    "tool_sha256": "836b986d8d21c086edd15f4efcf43241d1ac41364352fac0397031b8722f6f8a"
+  },
   "l1_gate": {
-    "cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood": "missing",
-    "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood": "missing"
+    "cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood": "passed",
+    "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood": "passed"
   },
   "label": "rust",
   "method_revision": "2026-10-29.1",
   "reasons": [
-    "外部量測超過上限：1/idle/release_request max 157.380462 ms > 50 ms",
-    "外部量測超過上限：2/idle/stop_request max 61.548646 ms > 50 ms",
-    "外部量測超過上限：3/idle/release_request max 211.824527 ms > 50 ms"
+    "event_latency 上限值未凍結（freeze_status='pending_review_record'，method_revision 2026-10-29.1）"
   ],
   "repeats": 3,
   "repeats_required": 3,
@@ -30,18 +38,20 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.04
+          "loadavg_1min": 0.16
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.46
+          "loadavg_1min": 0.2
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 2.125292,
-      "p99_ms": 0.305138,
+      "max_ms": 0.435226,
+      "p99_ms": 0.198495,
       "repeat": 1,
+      "setup_failure_count": 0,
+      "setup_failures": [],
       "verdict": "PASS",
       "void": false
     },
@@ -53,17 +63,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.55
+          "loadavg_1min": 0.12
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 1.04
+          "loadavg_1min": 0.16
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 2.551657,
-      "p99_ms": 0.782106,
+      "max_ms": 1.070698,
+      "p99_ms": 0.625699,
       "repeat": 1,
       "verdict": "PASS",
       "void": false
@@ -76,88 +86,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.22
+          "loadavg_1min": 0.26
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.55
+          "loadavg_1min": 0.12
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 157.380462,
-      "p99_ms": 21.584465,
-      "repeat": 1,
-      "verdict": "FAIL",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 499,
-      "errors": [
-        "stop #316: TimeoutError: COM0 未於 30.0s 內進入 READY（最後 DETACHED）"
-      ],
-      "event": "stop_request",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 1.0
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 1.22
-        }
-      },
-      "limit_ms": 100,
-      "load": "flood",
-      "max_ms": 3.259257,
-      "p99_ms": 1.065089,
-      "repeat": 1,
-      "verdict": "INSUFFICIENT_EVIDENCE",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "command_cancel",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.9
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 1.0
-        }
-      },
-      "limit_ms": 100,
-      "load": "flood",
-      "max_ms": 44.096113,
-      "p99_ms": 0.9204,
-      "repeat": 1,
-      "verdict": "PASS",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "release_request",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.96
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.9
-        }
-      },
-      "limit_ms": 100,
-      "load": "flood",
-      "max_ms": 8.30088,
-      "p99_ms": 4.358766,
+      "max_ms": 17.784949,
+      "p99_ms": 4.165526,
       "repeat": 1,
       "verdict": "PASS",
       "void": false
@@ -170,19 +109,21 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.84
+          "loadavg_1min": 0.32
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.96
+          "loadavg_1min": 0.26
         }
       },
-      "limit_ms": 50,
-      "load": "idle",
-      "max_ms": 61.548646,
-      "p99_ms": 0.218324,
-      "repeat": 2,
-      "verdict": "FAIL",
+      "limit_ms": 100,
+      "load": "flood",
+      "max_ms": 0.793379,
+      "p99_ms": 0.370989,
+      "repeat": 1,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
       "void": false
     },
     {
@@ -193,17 +134,88 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.96
+          "loadavg_1min": 0.12
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.84
+          "loadavg_1min": 0.32
+        }
+      },
+      "limit_ms": 100,
+      "load": "flood",
+      "max_ms": 2.181349,
+      "p99_ms": 0.70496,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "release_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.25
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.12
+        }
+      },
+      "limit_ms": 100,
+      "load": "flood",
+      "max_ms": 6.82227,
+      "p99_ms": 3.653901,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "stop_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.2
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.25
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 3.064077,
-      "p99_ms": 0.744997,
+      "max_ms": 2.21035,
+      "p99_ms": 0.238891,
+      "repeat": 2,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "command_cancel",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.1
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.2
+        }
+      },
+      "limit_ms": 50,
+      "load": "idle",
+      "max_ms": 0.761561,
+      "p99_ms": 0.589784,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -216,17 +228,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.99
+          "loadavg_1min": 0.13
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.96
+          "loadavg_1min": 0.1
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 24.096656,
-      "p99_ms": 17.257248,
+      "max_ms": 26.15924,
+      "p99_ms": 4.173747,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -239,18 +251,20 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.02
+          "loadavg_1min": 0.1
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.99
+          "loadavg_1min": 0.13
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 0.8497,
-      "p99_ms": 0.346724,
+      "max_ms": 0.472713,
+      "p99_ms": 0.366211,
       "repeat": 2,
+      "setup_failure_count": 0,
+      "setup_failures": [],
       "verdict": "PASS",
       "void": false
     },
@@ -262,17 +276,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.04
+          "loadavg_1min": 0.19
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 1.02
+          "loadavg_1min": 0.1
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 3.633459,
-      "p99_ms": 0.838414,
+      "max_ms": 3.968729,
+      "p99_ms": 0.723648,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -285,17 +299,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.02
+          "loadavg_1min": 0.34
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 1.04
+          "loadavg_1min": 0.19
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 24.934215,
-      "p99_ms": 13.647198,
+      "max_ms": 15.389027,
+      "p99_ms": 5.138235,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -308,18 +322,20 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.62
+          "loadavg_1min": 0.25
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 1.02
+          "loadavg_1min": 0.34
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 0.837394,
-      "p99_ms": 0.239471,
+      "max_ms": 0.682482,
+      "p99_ms": 0.236514,
       "repeat": 3,
+      "setup_failure_count": 0,
+      "setup_failures": [],
       "verdict": "PASS",
       "void": false
     },
@@ -331,17 +347,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.92
+          "loadavg_1min": 0.1
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.62
+          "loadavg_1min": 0.25
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 2.318361,
-      "p99_ms": 0.613506,
+      "max_ms": 2.760165,
+      "p99_ms": 1.034053,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
@@ -354,19 +370,19 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.17
+          "loadavg_1min": 0.04
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.92
+          "loadavg_1min": 0.1
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 211.824527,
-      "p99_ms": 16.206809,
+      "max_ms": 21.400648,
+      "p99_ms": 5.766314,
       "repeat": 3,
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "void": false
     },
     {
@@ -377,18 +393,20 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 1.32
+          "loadavg_1min": 0.04
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 1.17
+          "loadavg_1min": 0.04
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 3.643232,
-      "p99_ms": 0.732798,
+      "max_ms": 2.474893,
+      "p99_ms": 0.523733,
       "repeat": 3,
+      "setup_failure_count": 0,
+      "setup_failures": [],
       "verdict": "PASS",
       "void": false
     },
@@ -400,17 +418,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.57
+          "loadavg_1min": 0.0
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 1.32
+          "loadavg_1min": 0.04
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 1.229752,
-      "p99_ms": 0.667346,
+      "max_ms": 2.00435,
+      "p99_ms": 0.708608,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
@@ -423,17 +441,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.49
+          "loadavg_1min": 0.1
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.57
+          "loadavg_1min": 0.0
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 54.45742,
-      "p99_ms": 24.010301,
+      "max_ms": 12.573576,
+      "p99_ms": 4.900024,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
@@ -442,5 +460,5 @@
   "samples_per_run": 500,
   "samples_required": 500,
   "schema": "event_latency_external.v1",
-  "verdict": "FAIL"
+  "verdict": "INSUFFICIENT_EVIDENCE"
 }

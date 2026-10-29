@@ -117,3 +117,9 @@ pytest_full 13 failed：root 環境 `test_bb_l15_holder_observer.py::test_observ
 ## 第四輪未結（更新）
 
 - Python 基線 `SESSION_QUEUE_FULL` 兩案本輪 gate 內通過（blackbox_python 與 pytest_full 皆然）。首跑 `r5-261029` 時殘留 throwaway daemon 使相關案例失敗，推測第四輪的不穩定可能同源（同機殘留 daemon／PTY holder），未能證實；維持觀察，不以 flaky 放行。
+
+## 第五輪 event_latency 證據重採（sol P5-3084388-2）
+
+- gate 內的 `event_latency/rust.json` 由 `464adec` 版工具產生，缺受測身分；`2472f78` 補上 identity 後，以乾淨工作樹、gate 同一 release artifact
+  （daemon sha256 `8aae8fc3…f6cf6`）重採三輪，存為 `p5-evidence/event-latency-od45-rust-evlat-r5-2472f78.json`：18 輪全 PASS、L1 gate 2 支 passed，
+  verdict INSUFFICIENT_EVIDENCE 的唯一原因為上限值未重新凍結。
