@@ -16,3 +16,8 @@
 | s1-exit/opus-a-20261029.md | S1X-a-15 | sw_core/serial_port.py probe_holders | 對所有 /proc/*/fd/* os.stat 未以 /dev/ 前綴過濾，卡住的 NFS／FUSE fd 會讓 attach 卡住 | ★ | 待處理 |
 | s1-exit/opus-a-20261029.md | S1X-a-16 | sw_core/session_manager.py:4277 | _detach_by_id 在 DeviceWatcher 執行緒同步等 drain，1 s tick 最多延後 3 s |  | 待處理 |
 | s1-exit/opus-a-20261029.md | S1X-a-17 | sw_core/service.py _ADMISSION_METHODS | 唯讀 session.interactive_status／command.result_tail／result.tail 列在 admission 內，凍結窗回 FLUSHED_BY_SHUTDOWN |  | 待處理 |
+| s1-exit/opus-b-20261029.md | S1X-b-3 | crates/sw-proto/src/pyre | CPython 對可疑集合語法的 FutureWarning 未重現 |  | 待處理 |
+| s1-exit/opus-b-20261029.md | S1X-b-4 | crates/sw-cli/src/lib.rs:131-145 | 測試用 SERIALWRAP_TEST_DELEGATE_GROUP 無 feature 閘，編進正式 binary | ★ | 待處理 |
+| s1-exit/opus-b-20261029.md | S1X-b-5 | crates/sw-cli/src/commands/supervision_cmd.rs:59-92 | supervision-mode <非 set 字詞> 錯誤形狀與 Python 不同 |  | 待處理 |
+| s1-exit/opus-b-20261029.md | S1X-b-6 | crates/sw-cli/src/endpoint_resolve.rs:229-256 | 非字串 config 值的兩處 stderr 文字與 Python 不同 |  | 待處理 |
+| s1-exit/opus-b-20261029.md | S1X-b-7 | crates/sw-cli/src/commands/daemon_cmd.rs:1260-1275 | process_home／process_cwd 繞過 PAL 直接讀行程環境 |  | 待處理 |
