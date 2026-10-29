@@ -9699,6 +9699,7 @@
           "cargo:sw-daemon::dispatch::alias_set_empty_alias_allowed",
           "cargo:sw-daemon::dispatch::command_cancel_queued_command",
           "cargo:sw-daemon::dispatch::command_result_tail_unknown_and_invalid",
+          "cargo:sw-daemon::dispatch::command_submit_line_mode_wrapped_echo_end_to_end",
           "cargo:sw-daemon::dispatch::deferred_methods_return_method_not_found_without_side_effects",
           "cargo:sw-daemon::dispatch::device_attach_force_string_false_is_truthy",
           "cargo:sw-daemon::dispatch::device_list_sorted_by_by_id",
