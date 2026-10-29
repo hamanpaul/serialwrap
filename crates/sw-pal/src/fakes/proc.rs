@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::rpc::FakeRpcConnector;
-use crate::proc_scan::{DaemonProc, HolderScanStatus, ProcIdentity, ProcScan, ScanFailure};
+use crate::proc_scan::{
+    DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
+};
 use crate::traits::Clock;
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,9 @@ pub struct FakeProcScan {
     holders_script: Mutex<Vec<(Vec<u32>, HolderScanStatus)>>,
     replacement: Mutex<Option<(Arc<super::clock::FakeClock>, u64, u32, DaemonProc)>>,
     rpc_relaunch: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
+    details: Mutex<BTreeMap<u32, ProcDetails>>,
+    current_uid: Mutex<Option<u32>>,
+    uart_holders: Mutex<Option<Vec<(Vec<u32>, HolderScanStatus)>>>,
 }
 
 impl FakeProcScan {
@@ -113,6 +118,24 @@ impl FakeProcScan {
             Some(g) => !Self::gate_alive(g),
             None => false,
         }
+    }
+
+    /// OD-48：登記 `proc_details(pid)` 的回應（行程仍存活時才回傳，見 `proc_details`）。
+    pub fn set_details(&self, details: ProcDetails) {
+        self.details
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(details.pid, details);
+    }
+
+    /// OD-48：`current_uid` 的回應（未設定 → `None`）。
+    pub fn set_current_uid(&self, uid: Option<u32>) {
+        *self.current_uid.lock().unwrap_or_else(|e| e.into_inner()) = uid;
+    }
+
+    /// OD-48 D5：`uart_holders_same_uid` 的腳本（依序；用盡後保持最後一筆）。未設定時沿用 serialwrapd holder 替身。
+    pub fn uart_holders_script(&self, seq: Vec<(Vec<u32>, HolderScanStatus)>) {
+        *self.uart_holders.lock().unwrap_or_else(|e| e.into_inner()) = Some(seq);
     }
 
     pub fn holders(&self, v: Vec<u32>, st: HolderScanStatus) {
@@ -255,6 +278,36 @@ impl ProcScan for FakeProcScan {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|d| d.pid == pid)
+    }
+
+    fn proc_details(&self, pid: u32) -> Option<ProcDetails> {
+        let details = self
+            .details
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()?;
+        // 與 `pid_alive` 同一存活判定：已結束的行程查不到辨識資訊（不消耗存活腳本）。
+        if self.gate_says_gone(pid) {
+            return None;
+        }
+        Some(details)
+    }
+
+    fn current_uid(&self) -> Option<u32> {
+        *self.current_uid.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let mut guard = self.uart_holders.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(seq) if seq.len() > 1 => seq.remove(0),
+            Some(seq) if !seq.is_empty() => seq[0].clone(),
+            _ => {
+                drop(guard);
+                self.serialwrapd_tty_holders(paths)
+            }
+        }
     }
 
     fn identity_alive(&self, id: &ProcIdentity) -> bool {

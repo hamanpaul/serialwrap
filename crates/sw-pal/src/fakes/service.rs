@@ -11,7 +11,7 @@ use std::sync::{
 };
 
 use crate::service_ctl::{
-    AutostartHoldKind, AutostartHoldRecord, CmdRecord, HoldState, ServiceAction, ServiceCtl,
+    AutostartHoldKind, AutostartHoldRecord, CmdRecord, EnabledQuery, HoldState, ServiceAction, ServiceCtl,
     ServiceResult, SupervisionMode, SupervisorDefinition, TaskQuery,
 };
 
@@ -59,6 +59,8 @@ pub struct FakeServiceCtl {
     model: Mutex<Option<ServiceModelState>>,
     hard_stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
     start_spawn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
+    enabled_query: Mutex<Option<EnabledQuery>>,
+    main_pids: Mutex<std::collections::BTreeMap<String, Result<Option<u32>, String>>>,
 }
 
 /// 有狀態監管模型的快照（`FakeServiceCtl::set_model`／`query_now`）：`enabled` 為 `None` 表示未註冊。
@@ -157,6 +159,19 @@ impl FakeServiceCtl {
             .hold_prior_restart
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = restart;
+    }
+
+    /// OD-48 D8：之後 `query_enabled` 回傳此結果（未設定時回 `NotSupported`，沿用 `query` 映射）。
+    pub fn set_enabled_query(&self, query: Option<EnabledQuery>) {
+        *self.enabled_query.lock().unwrap_or_else(|e| e.into_inner()) = query;
+    }
+
+    /// OD-48 D4：指定監管模式回報的 `MainPID`（未設定 → `Ok(None)`）。
+    pub fn set_main_pid(&self, mode: &SupervisionMode, pid: Result<Option<u32>, String>) {
+        self.main_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mode_name(mode), pid);
     }
 
     /// 記錄被監管拉起的 pid 清單。
@@ -411,5 +426,22 @@ impl ServiceCtl for FakeServiceCtl {
         let mut hold = self.hold_autostart(mode, with_sudo)?;
         hold.name = Some(name.to_string());
         Ok(hold)
+    }
+
+    fn query_enabled(&self, _mode: &SupervisionMode) -> EnabledQuery {
+        self.enabled_query
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or(EnabledQuery::NotSupported)
+    }
+
+    fn main_pid(&self, mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        self.main_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mode_name(mode))
+            .cloned()
+            .unwrap_or(Ok(None))
     }
 }

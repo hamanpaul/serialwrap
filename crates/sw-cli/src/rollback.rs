@@ -217,6 +217,22 @@ fn busy_session(value: &PyValue) -> Result<Option<PyValue>, ()> {
     Ok(busy.then(|| PyValue::Dict(session.clone())))
 }
 
+/// 與目前行程同 uid 的 serialwrapd（uid 取不到者保守視為同 uid）。
+pub(crate) fn same_uid_daemons(
+    ctx: &CliCtx<'_>,
+    daemons: &[sw_pal::proc_scan::DaemonProc],
+) -> Vec<sw_pal::proc_scan::DaemonProc> {
+    let me = ctx.p.procs.current_uid();
+    daemons
+        .iter()
+        .filter(|daemon| {
+            let uid = ctx.p.procs.proc_details(daemon.pid).and_then(|details| details.uid);
+            !matches!((me, uid), (Some(me), Some(uid)) if me != uid)
+        })
+        .cloned()
+        .collect()
+}
+
 fn matching_daemons(
     _ctx: &CliCtx<'_>,
     endpoint: &str,
@@ -421,10 +437,16 @@ pub fn safety_check(
             detail.insert("holder_unknown", PyValue::Bool(true));
             (ErrorCode::DeviceStillHeld.as_str(), detail)
         })?;
-        let matches = matching_daemons(ctx, endpoint, &daemons);
-        if !matches.is_empty() {
+        // S1X-c-1／OD-48 D3.2：endpoint 不可 RPC 時，任何同 uid 的 serialwrapd（socket 不符或無 --socket 皆然）
+        // 都可能是偵測不到的舊 daemon，fail-closed；他 uid 的行程不在掃描範圍。
+        let held = same_uid_daemons(ctx, &daemons);
+        if !held.is_empty() {
             let mut detail = PyDict::new();
-            detail.insert("pids", PyValue::List(matches.iter().map(|proc| PyValue::Int(PyInt::Small(i128::from(proc.pid)))).collect()));
+            detail.insert("pids", PyValue::List(held.iter().map(|proc| PyValue::Int(PyInt::Small(i128::from(proc.pid)))).collect()));
+            if held.iter().any(|proc| proc.socket.as_deref().is_some_and(|socket| socket != endpoint)) {
+                detail.insert("sockets", PyValue::List(held.iter().map(|proc| opt_str(proc.socket.as_deref())).collect()));
+                detail.insert("endpoint", str_value(endpoint.to_string()));
+            }
             return Err((ErrorCode::DeviceStillHeld.as_str(), detail));
         }
         return Ok(None);
@@ -826,7 +848,8 @@ fn stop_for_revert_with_hold(
     phase: &'static str,
     existing_hold: Option<AutostartHoldRecord>,
 ) -> Result<RevertStop, StopFailure> {
-    let enabled = mode_enabled(&ctx.p.service.query(mode));
+    let state = ctx.p.service.query(mode);
+    let enabled = supervisor_enabled(ctx, mode, &state).unwrap_or_else(|_| mode_enabled(&state));
     let hold = if *mode == SupervisionMode::OnDemand {
         acquire_switch_autostart_lock(ctx).map_err(|code| {
             let mut failure = service_result_failure(mode, "hold_autostart", "無法取得 autostart.lock；請稍後重試".into());
@@ -1257,7 +1280,22 @@ fn execute_change_with_restore(
     journal.step = JournalStep::SafetyCheck;
     if let Err(error) = write_journal(ctx, &root, &journal) { return journal_failure(report, StepName::SafetyCheck, "safety_check", error); }
     crash_if("safety_check:before_effect");
-    let endpoint = crate::endpoint_resolve::local_default_endpoint(ctx);
+    // systemd-system 無 --with-sudo 時無法抑制自動啟動：在任何探測之前拒絕（不需 daemon 狀態即可判定）。
+    if old_mode == SupervisionMode::SystemdSystem && !with_sudo {
+        fail_report(&mut report, StepName::StopSupervisor, OpFailure {
+            code: ErrorCode::NeedsSudo.as_str(),
+            phase: "update_autostart_hold",
+            reason: Some("autostart_hold_unverified"),
+            message: Some("systemd-system 更新須加 --with-sudo 才能抑制自動啟動".into()),
+            detail: PyDict::new(),
+        });
+        clear_journal(ctx, &root, &journal);
+        drop(lock);
+        return report;
+    }
+    // S1X-c-1／OD-48 D3.1：停舊用舊模式的 instance endpoint，啟新／驗證用目標模式的 endpoint。
+    let endpoint = crate::endpoint_resolve::instance_endpoint(ctx, &old_mode);
+    let target_endpoint = crate::endpoint_resolve::target_instance_endpoint(ctx, target_mode, &old_mode, &endpoint);
     let daemon = match safety_check(ctx, &endpoint) {
         Ok(snapshot) => snapshot,
         Err((code, detail)) => {
@@ -1278,13 +1316,21 @@ fn execute_change_with_restore(
             return report;
         }
     };
-    if old_mode == SupervisionMode::SystemdSystem && !with_sudo {
-        fail_report(&mut report, StepName::StopSupervisor, OpFailure {
-            code: ErrorCode::NeedsSudo.as_str(),
-            phase: "update_autostart_hold",
-            reason: Some("autostart_hold_unverified"),
-            message: Some("systemd-system 更新須加 --with-sudo 才能抑制自動啟動".into()),
-            detail: PyDict::new(),
+    if daemon.is_none() && sup.running && matches!(old_mode, SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem) {
+        // OD-48 D3.2：監管顯示 running 卻沒有可 RPC 的 daemon（例如偵測不到的 endpoint），不得當成未執行。
+        // 只套用 systemd（`is-active` 反映 unit 主行程）；windows-task 的 Running 套用會改變 13 個凍結節點
+        // （mgmt_com0com），列 OWNER-BATCH，維持現行。
+        let mut detail = PyDict::new();
+        detail.insert("pids", PyValue::List(Vec::new()));
+        detail.insert("holder_unknown", PyValue::Bool(true));
+        detail.insert("supervisor_running", PyValue::Bool(true));
+        detail.insert("endpoint", str_value(endpoint.clone()));
+        fail_report(&mut report, StepName::SafetyCheck, OpFailure {
+            code: ErrorCode::DeviceStillHeld.as_str(),
+            phase: "update_safety_check",
+            reason: None,
+            message: Some("監管顯示 daemon 執行中，但無法在 instance endpoint 連上 daemon；拒絕更新".into()),
+            detail,
         });
         clear_journal(ctx, &root, &journal);
         drop(lock);
@@ -1408,7 +1454,7 @@ fn execute_change_with_restore(
             return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
         }
     } else if op != "install" {
-        if let Err(error) = install_supervisor_held(ctx, &root, target_mode, &endpoint, with_sudo) {
+        if let Err(error) = install_supervisor_held(ctx, &root, target_mode, &target_endpoint, with_sudo) {
             let failure = service_failure_as_op(error, "update_start_and_verify", "supervisor_install_failed");
             return revert_after_failure(ctx, root, journal, original, backup, report, StepName::BackupAndSwitch, failure, &mut held, with_sudo, target_mode);
         }
@@ -1470,7 +1516,7 @@ fn execute_change_with_restore(
         } else if matches!(target_mode, SupervisionMode::WindowsTask | SupervisionMode::WindowsService)
             || endpoint_resolve::rpc_backend_is_win(ctx)
         {
-            endpoint.clone()
+            target_endpoint.clone()
         } else if old_mode == SupervisionMode::OnDemand
             && target_mode == &SupervisionMode::OnDemand
             && explicit_endpoint.is_none()
@@ -1480,9 +1526,9 @@ fn execute_change_with_restore(
                 sw_proto::yaml11::YValue::Str(socket)
                     if matches!(sw_proto::endpoint::parse_endpoint(socket), Ok(sw_proto::endpoint::Endpoint::Tcp { .. })) => Some(socket.clone()),
                 _ => None,
-            }).unwrap_or_else(|| endpoint.clone())
+            }).unwrap_or_else(|| target_endpoint.clone())
         } else {
-            endpoint.clone()
+            target_endpoint.clone()
         };
         let setup_req = crate::setup_cmd::ReconcileRequest {
             old_mode: old_mode.clone(),
@@ -1558,9 +1604,9 @@ fn execute_change_with_restore(
         config.socket_path().and_then(|value| match value {
             sw_proto::yaml11::YValue::Str(socket) if matches!(sw_proto::endpoint::parse_endpoint(socket), Ok(sw_proto::endpoint::Endpoint::Tcp { .. })) => Some(socket.clone()),
             _ => None,
-        }).unwrap_or_else(|| endpoint.clone())
+        }).unwrap_or_else(|| target_endpoint.clone())
     } else {
-        endpoint.clone()
+        target_endpoint.clone()
     };
     config.set_mode(target_mode.as_str(), Some(&effective_socket));
     if let Err(error) = endpoint_resolve::save_runtime_config(ctx, &config) {
@@ -1585,7 +1631,7 @@ fn execute_change_with_restore(
     if let Err(error) = graceful_stop::ensure_released_or_rehandoff(
         ctx,
         target_mode,
-        &endpoint,
+        &target_endpoint,
         with_sudo,
         if op == "rollback" { "rollback" } else { "update" },
         "update_start_and_verify",
@@ -1595,7 +1641,7 @@ fn execute_change_with_restore(
         return revert_after_failure(ctx, root, journal, original, backup, report, StepName::StartAndVerify, failure, &mut held, with_sudo, target_mode);
     }
     let desired_target_enabled = restore_previous.map(|set| set.supervisor.enabled).unwrap_or_else(|| {
-        if target_mode == &original.supervisor.mode { original.supervisor.enabled } else { Some(true) }
+        if target_mode == &original.supervisor.mode { hold_prior_enabled(&held, original.supervisor.enabled) } else { Some(true) }
     });
     let source_release_enabled = if target_mode == &original.supervisor.mode { desired_target_enabled } else { Some(false) };
     if let Err(failure) = release_held_checked(ctx, &mut held, source_release_enabled) {
@@ -1621,7 +1667,7 @@ fn execute_change_with_restore(
             return report;
         }
     }
-    let started = start_and_verify(ctx, &root, target_mode, &endpoint, original.daemon.is_some(), original.daemon.is_some(), &manifest, with_sudo, original.daemon.as_ref());
+    let started = start_and_verify(ctx, &root, target_mode, &target_endpoint, original.daemon.is_some(), original.daemon.is_some(), &manifest, with_sudo, original.daemon.as_ref());
     crash_if("start_and_verify:started");
     test_pause_after("start_and_verify:started");
     let started = test_force_verify_failure(started);
@@ -1665,6 +1711,7 @@ fn service_result_failure(mode: &SupervisionMode, action: &str, message: String)
 
 fn release_held(ctx: &mut CliCtx<'_>, held: &mut HeldAutostart, enabled: Option<bool>) {
     if held.record.kind != AutostartHoldKind::NoSupervisor {
+        let enabled = hold_prior_enabled(held, enabled);
         let _ = ctx.p.service.release_autostart(&held.record, enabled, held.with_sudo);
     }
     ctx.autostart_lock.take();
@@ -2085,9 +2132,11 @@ fn revert_after_failure(
         && held.record.kind != AutostartHoldKind::NoSupervisor
         && ctx.p.service.autostart_hold_state(target_mode) == HoldState::Held)
         .then(|| held.record.clone());
-    match stop_for_revert_with_hold(ctx, target_mode, &original.supervisor.endpoint, with_sudo, "update_revert", reusable_hold) {
+    // S1X-c-1：新 daemon 在目標模式的 endpoint；回退先停它，再確認原 endpoint 也已釋放。
+    let revert_endpoint = crate::endpoint_resolve::target_instance_endpoint(ctx, target_mode, &original.supervisor.mode, &original.supervisor.endpoint);
+    match stop_for_revert_with_hold(ctx, target_mode, &revert_endpoint, with_sudo, "update_revert", reusable_hold) {
         Ok(RevertStop::Deferred(error)) => {
-            let recovery = recovery_deferred("start_and_verify", error, ctx, &original.supervisor.endpoint, "update_revert");
+            let recovery = recovery_deferred("start_and_verify", error, ctx, &revert_endpoint, "update_revert");
             report.revert_pending = true;
             report.revert_error = Some(recovery.detail.clone());
             failure_doc.insert("revert_deferred", PyValue::Bool(true));
@@ -2097,7 +2146,7 @@ fn revert_after_failure(
             return report;
         }
         Err(error) => {
-            let recovery = recovery_stop_error("start_and_verify", &error, ctx, &original.supervisor.endpoint);
+            let recovery = recovery_stop_error("start_and_verify", &error, ctx, &revert_endpoint);
             report.revert_pending = true;
             report.revert_error = Some(recovery.detail.clone());
             failure_doc.insert("revert_deferred", PyValue::Bool(true));
@@ -2110,7 +2159,13 @@ fn revert_after_failure(
         Ok(RevertStop::Stopped { hold: Some(new_hold), .. }) => target_hold = Some(new_hold),
         Ok(RevertStop::Stopped { hold: None, .. }) => {}
     }
-    let holders_status = match confirm_released(ctx, &original.supervisor.endpoint, original.daemon.as_ref()) {
+    let released = if revert_endpoint == original.supervisor.endpoint {
+        confirm_released(ctx, &original.supervisor.endpoint, original.daemon.as_ref())
+    } else {
+        confirm_released(ctx, &revert_endpoint, None)
+            .and_then(|_| confirm_released(ctx, &original.supervisor.endpoint, original.daemon.as_ref()))
+    };
+    let holders_status = match released {
         Ok(status) => status,
         Err(failure) => {
             let detail = op_failure_detail(&failure);
@@ -2469,11 +2524,12 @@ fn query_supervisor(ctx: &CliCtx<'_>, mode: &SupervisionMode, endpoint: &str, da
         return Ok(SupervisorSnapshot { mode: mode.clone(), endpoint: endpoint.to_string(), enabled: None, running: daemon_running, registration: None });
     }
     let state = ctx.p.service.query(mode);
-    let enabled = mode_enabled(&state);
     let running = matches!(state, TaskQuery::Running);
     if let TaskQuery::QueryFailed(message) = state {
         return Err(OpFailure { code: ErrorCode::InternalError.as_str(), phase: "update_safety_check", reason: Some("supervisor_query_failed"), message: Some(message), detail: PyDict::new() });
     }
+    let enabled = supervisor_enabled(ctx, mode, &state)
+        .map_err(|message| OpFailure { code: ErrorCode::InternalError.as_str(), phase: "update_safety_check", reason: Some("supervisor_query_failed"), message: Some(message), detail: PyDict::new() })?;
     let root = install_layout::resolve_install_root(ctx);
     let registration = match mode {
         SupervisionMode::WindowsTask => Some(root.supervisor.join("serialwrap.task.xml")),
@@ -2554,6 +2610,24 @@ fn autostart_record_value(hold: &AutostartHoldRecord, enabled: Option<bool>) -> 
         ("prior_enabled".into(), opt_bool(hold.prior_enabled.or(enabled))),
         ("prior_restart".into(), opt_str(hold.prior_restart.as_deref())),
     ]))
+}
+
+/// OD-48 D8：enabled 以後端的獨立查詢為準（systemd `is-enabled`）；`is-active` 的 running 不代表 enabled。
+/// 後端不支援獨立查詢時（windows-task／windows-service）沿用 `query` 的既有映射。
+fn supervisor_enabled(ctx: &CliCtx<'_>, mode: &SupervisionMode, state: &TaskQuery) -> Result<Option<bool>, String> {
+    if matches!(state, TaskQuery::NotFound | TaskQuery::QueryFailed(_)) {
+        return Ok(None);
+    }
+    match ctx.p.service.query_enabled(mode) {
+        sw_pal::service_ctl::EnabledQuery::Known(enabled) => Ok(enabled),
+        sw_pal::service_ctl::EnabledQuery::NotSupported => Ok(mode_enabled(state)),
+        sw_pal::service_ctl::EnabledQuery::Failed(message) => Err(message),
+    }
+}
+
+/// 撤銷 hold 時要還原的 enabled：hold 取得當下記錄的原值優先（D8），缺漏時才用監管快照。
+fn hold_prior_enabled(held: &HeldAutostart, fallback: Option<bool>) -> Option<bool> {
+    held.record.prior_enabled.or(fallback)
 }
 
 fn mode_enabled(state: &TaskQuery) -> Option<bool> {
@@ -3549,7 +3623,8 @@ pub fn run_supervision_switch(
             return emit(ctx, response, "supervision-mode", 2);
         }
     };
-    let endpoint = crate::endpoint_resolve::local_default_endpoint(ctx);
+    // S1X-c-1：以舊模式的 instance endpoint 探測舊 daemon；新 socket 依目標模式決定。
+    let endpoint = crate::endpoint_resolve::instance_endpoint(ctx, &old);
     let snapshot = match safety_check(ctx, &endpoint) {
         Ok(snapshot) => snapshot,
         Err((code, mut detail)) => {
@@ -3562,7 +3637,7 @@ pub fn run_supervision_switch(
     crash_if("supervision_set:after_safety_check");
     let root = install_layout::resolve_install_root(ctx);
     let home = ctx.p.env.current_user_home().map(PathBuf::from).or_else(|| ctx.env.get("HOME").map(PathBuf::from)).unwrap_or_default();
-    let socket = switch_socket(ctx, target, &endpoint);
+    let socket = switch_socket(ctx, target, &crate::endpoint_resolve::target_instance_endpoint(ctx, target, &old, &endpoint));
     let mut request = crate::setup_cmd::ReconcileRequest {
         old_mode: old.clone(),
         target_mode: target.clone(),
@@ -3589,10 +3664,10 @@ pub fn run_supervision_switch(
     } else {
         ctx.p.service.query(&old)
     };
-    let enabled_before = match &service_state {
-        TaskQuery::NotRunning(state) if state.eq_ignore_ascii_case("disabled") => Some(false),
-        TaskQuery::Running | TaskQuery::NotRunning(_) => Some(true),
-        TaskQuery::NotFound | TaskQuery::QueryFailed(_) => None,
+    let enabled_before = if old == SupervisionMode::OnDemand {
+        None
+    } else {
+        supervisor_enabled(ctx, &old, &service_state).unwrap_or_else(|_| mode_enabled(&service_state))
     };
     let running_before = if old == SupervisionMode::OnDemand {
         snapshot.is_some()
