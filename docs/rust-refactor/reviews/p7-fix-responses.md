@@ -353,3 +353,14 @@ BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-
 | OD-57（OWNER-BATCH #2） | 擁有者裁決 | release-during-login 收斂差異 | **done**：`contracts/behavior_changes.yaml` 登記 DF-23（scope both、ab_participation diff、APPROVED，basis 依 catalog 規則為 reconciliation、decision_ref OD-57），案例 `p7-invariants-release-during-login-waits-for-handle-close` 掛 DF-23；測試依 DF 分判（Rust READY；Python DETACHED＋`ATTACH_FAILED:TxIncompleteError` 且 10 s 不重試），兩邊實跑 1 passed；`test_bc_real_sc_df_ranges` 範圍 DF-01～DF-23 |
 
 第 12 輪 gate 實跑另揭露並修正：func-test 列 comparison.json 查找深度（efb8580）、受測 artifact 被 cargo L1 列重建（6df20d2，改為建置後快照）、crates/ 來源案例的涵蓋判定（de7a95a）。
+
+### p7-cloud/de7a95a_b85eec5（雲端 Opus xhigh 代理 sol，incr）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-f9e90a9-4 | High（2 輪） | interleave 未涵蓋 probe 送出後到 READY 前、nonce 本身 | **SPEC-GAP**：runner 的字面 payload 比對無法表達隨機 nonce 之後的界線（需 runner 支援帶 nonce 的樣式，或依 WAL 先後判定，屬測試工具獨立 PR）；已涵蓋到 `echo __READY__` 前綴為止。交編排者裁決 |
+| P7-f9e90a9-5 | High（2 輪） | 「回條前重開」錯誤實作須轉紅 | **fixed（fd 層級 oracle）**：新增黑箱 `test_p7_invariants.py::test_force_recover_attached_closes_before_reopen`——ATTACHED＋CREDENTIALS_UNRESOLVED 起手，`recover --force` 期間 5 ms 取樣 daemon 指向該 tty 的 fd 峰值須 ==1（回條前重開 → 2）、`bridge_generation` 1→2（no-op 必紅）、零 TX；Python／Rust 實跑皆 1 passed。依審查提醒不採 wire peer_state（Rust close→reopen 約 1.6 ms，peer_watch 50 ms 看不到）；原 SPEC-GAP 撤回。新節點 add-only 入 p7-a／p7-b／全套 pytest 集合 |
+| P7-b85eec5-1 | Medium | 全套 pytest 集合凍結了 3 個會隨 pytest 9.2.0 改名的參數 id | **依賴 P5 裁決＋部分 fixed**：(1) 登記依賴——rulings/p5.md「P5 第 6 輪 SPEC-GAP #3」對三支測試補明確 `ids=`，請編排者將同一裁決擴及 `p7_gate:python3-m-pytest-q-tests`（OWNER-BATCH／編排者）；(2) 該修正合入 P7 後以 `regen_lock --l1-add-only` 登記新 id、3 個舊 id 逐名 `--allow-removal p7_gate:python3-m-pytest-q-tests:linux:<舊 id>`；(3) 本輪 gate 的 results.json 與報告記 `tool_versions`（python、pytest），回歸 `test_report_records_tool_versions`。本輪實跑 pytest 9.0.3，三筆存在 |
+| P7-9065f14-1 | Medium（6 輪） | slice22 map | 維持 NEEDS-RULING（OWNER-BATCH） |
+| P7-cd7acf0-4 | Medium（3 輪） | slice22-b 集合 | 審查者已核對不成立主張屬實（P6 檔案不在本分支、gate 記 BLOCKED-UPSTREAM 不誤判 PASS）；維持至 P6 合入 |
+| P7-de7a95a-1～3、P7-b85eec5-2 | Low | — | 依收斂規則不修 |

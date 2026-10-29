@@ -167,6 +167,46 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
         rig.stop()
 
 
+def test_force_recover_attached_closes_before_reopen(p7, tmp_path):
+    """§11.3-4／§5.2.4（審查 P7-f9e90a9-5）：ATTACHED＋CREDENTIALS_UNRESOLVED 起手的 `session recover --force`
+    （FORCE_CLEAR_REATTACH）必須實際關閉並重開恰一次，且任何時刻至多持有一個指向該 tty 的 fd（舊 fd 關閉回條後才重開）。
+
+    fd 層級 oracle：以 5 ms 取樣 daemon 的 fd 數峰值（Rust 實測舊 worker close 與重開只隔約 1.6 ms，bridge 的
+    peer_state 50 ms 取樣看不到，故不以 wire peer_state 判順序）；重開以 `bridge_generation` 1→2 證明（no-op 實作必紅）。"""
+    tgt = FakeTarget(tmp_path / "t0", prompt="root@op3:~# ", login_steps=[{"expect": "", "respond": "\r\nop3 login: "}])
+    p7.start("shell_unresolved", [tgt])
+    s = wait_state(p7.env, "COM0", "ATTACHED")
+    deadline = time.monotonic() + 15.0
+    while s["last_error"] != "CREDENTIALS_UNRESOLVED":
+        assert time.monotonic() < deadline, s
+        time.sleep(0.2)
+        s = wait_state(p7.env, "COM0", "ATTACHED")
+    assert s["bridge_generation"] == 1, s
+    slave = tgt.slave_path
+    assert _daemon_fds_to(p7, slave) == 1, "ATTACHED 時 daemon 應恰持有一個 tty fd"
+    peak = [0]
+    stop = threading.Event()
+
+    def sample() -> None:
+        while not stop.is_set():
+            peak[0] = max(peak[0], _daemon_fds_to(p7, slave))
+            time.sleep(0.005)
+
+    th = threading.Thread(target=sample, daemon=True)
+    th.start()
+    try:
+        rc, j = p7.cli("session", "recover", "--selector", "COM0", "--force", timeout_s=60.0)
+    finally:
+        stop.set()
+        th.join(timeout=5.0)
+    assert (j or {}).get("action") == "FORCE_CLEAR_REATTACH", (rc, j)
+    assert peak[0] == 1, f"REATTACH 期間不得同時持有新舊 fd：peak={peak[0]}"
+    s = wait_state(p7.env, "COM0", "ATTACHED", timeout_s=15.0)
+    assert s["bridge_generation"] == 2, f"force recover 須實際關閉並重開恰一次：{s!r}"
+    assert _daemon_fds_to(p7, slave) == 1
+    assert tgt.rx_log() == b"", "帳密未解析：force reattach 不得送任何 byte"
+
+
 def test_no_auto_resend_after_partial_or_timeout(p7, tmp_path):
     tgt = FakeTarget(tmp_path / "t0")
     p7.start("shell", [tgt])

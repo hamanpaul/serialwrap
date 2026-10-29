@@ -280,3 +280,12 @@ def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
         rep_path.write_text(json.dumps(rep), encoding="utf-8")
         status, detail = g._test_row_status(tmp_path, row, lock, judge)
         assert status == want, (len(subset), status, detail)
+
+
+def test_report_records_tool_versions(tmp_path):
+    """審查 P7-b85eec5-1：results.json 與報告須記受測 pytest／Python 版本（凍結 nodeid 的參數 id 依 pytest 版本而異）。"""
+    import pytest as _pytest
+    data = g.init_results(tmp_path / "run", "rv", caps_missing=[], artifacts=[])
+    assert data["tool_versions"]["pytest"] == _pytest.__version__ and data["tool_versions"]["python"]
+    md = g.build_report(tmp_path / "run")
+    assert f'"pytest": "{_pytest.__version__}"' in md

@@ -242,6 +242,7 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
         f"- git_head: `{data.get('git_head')}`",
         f"- worktree_clean: `{data.get('worktree_clean')}`",
         f"- caps_missing: `{sorted(caps_missing)}`",
+        f"- tool_versions: `{json.dumps(data.get('tool_versions'), sort_keys=True)}`",
         f"- l1_lock_sha256: `{_sha256(lock_path)}`",
         "",
         "## artifacts",
@@ -323,6 +324,16 @@ def _rel_to(base: Path, p: Path) -> str:
         return str(p)
 
 
+def _tool_versions() -> dict[str, str | None]:
+    out: dict[str, str | None] = {"python": sys.version.split()[0]}
+    try:
+        import pytest  # noqa: PLC0415
+        out["pytest"] = pytest.__version__
+    except ImportError:
+        out["pytest"] = None
+    return out
+
+
 def init_results(results_dir: Path, run_id: str, *, caps_missing: list[str], artifacts: list[Path]) -> dict[str, Any]:
     """`p7_gate.sh` 起點：寫 results.json 的身分欄位（HEAD、工作樹是否乾淨、artifact sha256，路徑為 repo 相對）。"""
     status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True)
@@ -332,6 +343,9 @@ def init_results(results_dir: Path, run_id: str, *, caps_missing: list[str], art
         "worktree_clean": status.returncode == 0 and not status.stdout.strip(),
         "caps_missing": sorted(set(caps_missing)),
         "artifacts": {_rel_to(ROOT, a): _sha256(a) for a in artifacts},
+        # 受測工具版本（審查 P7-b85eec5-1：pytest 9.2.0 對過長字串參數改用 `<argname><index>` id，3 個凍結 nodeid
+        # 會因此缺測；報告須註明版本以判讀 INCOMPLETE 原因）。
+        "tool_versions": _tool_versions(),
         "rows": [],
         "owner_evidence": {},
     }
