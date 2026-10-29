@@ -117,3 +117,49 @@ pytest_full 13 failed：root 環境 `test_bb_l15_holder_observer.py::test_observ
 ## 第四輪未結（更新）
 
 - Python 基線 `SESSION_QUEUE_FULL` 兩案本輪 gate 內通過（blackbox_python 與 pytest_full 皆然）。首跑 `r5-261029` 時殘留 throwaway daemon 使相關案例失敗，推測第四輪的不穩定可能同源（同機殘留 daemon／PTY holder），未能證實；維持觀察，不以 flaky 放行。
+
+## 第五輪 event_latency 證據重採（sol P5-3084388-2）
+
+- gate 內的 `event_latency/rust.json` 由 `464adec` 版工具產生，缺受測身分；`2472f78` 補上 identity 後，以乾淨工作樹、gate 同一 release artifact
+  （daemon sha256 `8aae8fc3…f6cf6`）重採三輪，存為 `p5-evidence/event-latency-od45-rust-evlat-r5-2472f78.json`：18 輪全 PASS、L1 gate 2 支 passed，
+  verdict INSUFFICIENT_EVIDENCE 的唯一原因為上限值未重新凍結。
+- 再依 sol P5-3084388-2 第 3 輪綁定 artifact 建置來源：`c4cfb96` 起報告以 gate `r5b-261029` 的 `report.json` 核對 daemon sha256 並取 `git_revision`（`464adec5`）；重採證據 `p5-evidence/event-latency-od45-rust-evlat-r5-c4cfb96.json` 18 輪全 PASS，取代 `…-2472f78.json`。
+
+# 第六輪實跑（2026-10-29，run id `r6-261029`）
+
+- 命令（**非 root**，uid 1000；`--evidence-run`，非 dry-run）：`SERIALWRAP_L15_SELFTEST_REPORT=<posix-pty selftest-report.json> bash scripts/rust/slice21_gate.sh --evidence-run --run-id r6-261029`。
+- 受測版本：`c2f68820`（乾淨工作樹）；identity：CLI sha256 `a4be6b3e…`、daemon sha256 `b3e385f5…`（release，建置當下 sha256 相符，`identity.build` Linux／Windows exit 0）；`daemon_version` `0.3.2`（F139：`daemon.status` RPC）。
+  bridge 自測本輪重新產生，`evaluate_bridge_eligibility` → `('PASS', True)`。
+- 開跑前確認無洩漏的 daemon／bridge 行程；loadavg 開跑 0.33／0.66／0.63（08:43:50Z）、結束 0.69／0.74／0.75（11:03:56Z），4 核；約 140 分鐘。
+- **verdict：FAIL**（gate exit 1）；§5.3 凍結檢查未過（`event_latency` method_revision `2026-10-29.2`、`pending_review_record`）。
+
+| section | 判定 | 數字 | 缺漏／原因 | 處置 |
+|---|---|---|---|---|
+| cfg_boundary | PASS | rc 0 | — | — |
+| linux_l1 | **PASS** | 1728／0／28 | 非 root（run_euid 1000）；第五輪 root 下 7 支證據不足已消失 | F108 |
+| linux_cap_posix_pty | FAIL | 350／1／8 | (1) `sw-pal::lock::lock_conformance_suite` 失敗 1 次（同 gate 的 linux_l1 內 passed；gate 外同範圍連跑 3 次皆 PASS；根因未明，不以 flaky 放行）；(2) OD-55 移入 `s21_gate:cap_posix_pty` 的 4 個 lib 能力測試 skipped——`cargo_l1_results.py` 只以名稱開頭比對 `cap_*`，模組路徑下的 lib 測試從未被 `--caps` 執行（本輪修正 `capability_of`，gate 外以修正後工具重跑該 section：355 passed／0 failed／4 skipped〔非 cap 的 ignored〕，cap_posix_pty 全數 passed） | 修正於本組 commit；待下一輪 gate 重驗 |
+| windows_native_l1 | EVIDENCE_MISSING | runner exit 127 | 無原生 Windows | LOCAL-WINDOWS-TODO |
+| windows_cap_windows_com | EVIDENCE_MISSING | — | BO-S21-01 | 允許豁免 |
+| blackbox_python | FAIL | 43／2／4 | `test_two_daemons_same_tty`（起點基準即失敗）、`test_f2_backpressure.py::test_queue_full_backpressure`（Python 基線未回 `SESSION_QUEUE_FULL`；起點 commit 單獨跑同樣失敗，見下） | 既有；見回報 |
+| blackbox_rust | FAIL | 47／1／1 | `test_two_daemons_same_tty`（起點基準即失敗） | 既有 |
+| existing_suites_rust | **PASS** | 4／0；func-test 3/3 | F57 登記後首次 PASS | — |
+| l15_ab | EVIDENCE_MISSING | pytest 全綠 | OD-58 移出的 `s21-event-latency` 由 event_latency 承擔，該 section 未 PASS | 待 event_latency 凍結 |
+| event_latency | EVIDENCE_MISSING | Rust 18 輪全 PASS；L1 gate passed；證據身分核對通過 | 唯一原因：未凍結（方法審閱 rejected 後修正，待重新審閱） | 編排者重新提交審閱 |
+| wal_s1w_perf | EVIDENCE_MISSING | 本機 append p50 0.0245／p95 0.0438／p99 0.0683 ms、rotate max 444 ms | OD-61：雲端 `vm:docker` 只作診斷；待匯入 WSL2 量測 | 編排者本機量測 |
+| case_uptake | **PASS** | valid_pass 13／48（rate 0.271） | `case_verdicts.json` 首次彙整（PASS 13、EVIDENCE_MISSING 35：實機／Windows／L2 回歸案例無雲端證據）；斷路器窗口內未觸發；OD-02：已耗 1.14 週＋剩餘 6 週 ≤ 24 | 快照已附加 `breaker/slice_2.1.snapshots.ndjson` |
+| pytest_full | FAIL | 5526／7／205 | 7 failed：`test_l1_judge.py` 3 支、`test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`、`test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native`、`test_two_daemons_same_tty`（皆在起點基準 6 failed 內）＋`test_queue_full_backpressure`（見下） | 見回報 |
+| policy_check | PASS | fail 0 | — | — |
+
+event_latency 三輪（`p5-evidence/event-latency-od45-rust-r6-261029.json`；method_revision `2026-10-29.2`，artifact＝本 run 建置 `c2f68820`）：
+| 負載 | 事件 | 三輪 max ms | 上限 ms |
+|---|---|---|---|
+| idle | stop_request | 1.00／2.69／3.37 | 50 |
+| idle | command_cancel | 4.19／2.81／3.01 | 50 |
+| idle | release_request | 9.72／42.70／36.77 | 250 |
+| flood | stop_request | 2.27／4.16／2.44 | 100 |
+| flood | command_cancel | 8.47／5.88／50.58 | 100 |
+| flood | release_request | 28.34／13.52／12.77 | 300 |
+
+flood 實際速率 19944～20004 B/s、送出失敗 0、host 峰值 loadavg ≤ 1.15（4 核），無作廢。Python 診斷（50 樣本，`…-python-diagnostic-r6-261029.json`）：idle release_request 三輪 max 154.4／**255.4**／157.7 ms——第 2 輪超過 OD-58 的 250 ms（Python 基線本身）。
+
+`test_queue_full_backpressure`：起點基準全套時 passed；本輪全套、gate 內、以及 gate 外單檔連跑 2 次皆 FAIL，且**起點 commit（乾淨 worktree）單檔跑亦 FAIL**——與本輪變更無關（本輪未改 Python daemon 與該測試）。症狀同第四輪未結項（前景 `sleep 30` 期間連送 300 筆未見 `SESSION_QUEUE_FULL`），推測與 CLI 往返耗時使佇列排空有關，根因未明，不以 flaky 放行。

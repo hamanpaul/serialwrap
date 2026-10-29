@@ -61,9 +61,11 @@
         "required": ["name", "status", "command", "exit", "passed", "failed", "skipped", "deselected", "ignored",
                      "required_set", "l1_results", "l1_verdict", "allowed_missing_bo", "log"],
         "properties": {
-          "name": {"enum": ["linux_l1", "linux_cap_posix_pty", "windows_native_l1", "windows_cap_windows_com",
-                            "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency",
-                            "wal_s1w_perf", "cfg_boundary", "pytest_full", "policy_check", "case_uptake"]},
+          "name": {"enum": ["linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin", "linux_cap_windows_native",
+                            "linux_cap_interactive_desktop", "linux_cap_supervisor_runtime", "windows_native_l1",
+                            "windows_cap_windows_com", "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab",
+                            "event_latency", "wal_s1w_perf", "cfg_boundary", "py_parity", "pytest_full", "policy_check",
+                            "case_uptake"]},
           "status": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"]},
           "command": {"type": "string"},
           "exit": {"type": ["integer", "null"]},
@@ -94,6 +96,11 @@
           "evidence": {"type": ["string", "null"]},
           "section_verdict": {"enum": ["PASS", "FAIL", "EVIDENCE_MISSING"],
                               "description": "非測試類 section 自身報告的判定（如 wal_s1w verdict）；判定器只當輸入條件之一。"},
+          "capability_probe": {
+            "type": "object", "required": ["cap", "available", "evidence"],
+            "description": "能力集合 section（SPEC-GAP #2）的 gate 能力探測；available 非 true 時判定器一律 EVIDENCE_MISSING。",
+            "properties": {"cap": {"type": "string"}, "available": {"type": "boolean"}, "evidence": {"type": "string"}}
+          },
           "extra_checks": {
             "type": "array",
             "items": {"type": "object", "required": ["name", "exit"],

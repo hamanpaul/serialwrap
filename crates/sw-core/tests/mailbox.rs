@@ -594,3 +594,244 @@ fn op_finished_waits_for_dependent_rx() {
     }
     assert_eq!(order, ["D1", "D2", "D3", "D4", "D5", "C", "D6"]);
 }
+
+/// 方法審閱 [High]（2026-10-29）：延遲探針須以事件自己的送入／處理界點計數。`WorkerStopped` 因同 epoch 依賴而移入
+/// `stopped` 後，mailbox 仍先取 data；探針不得因 `control_waiting()` 看不到 `stopped` 而少算。D,D,D,L,W 情境下
+/// receipt 送入後 actor 實際處理了 3 個 data item，見證數須為 3（drain_receipt 的 `at_most_one_data_item_before_control`
+/// 與此排空順序衝突；OD-64 已裁決界限改為「依賴等待前已讀入筆數＋1」，見 `stopped_receipt_records_pre_dependency_data`）。
+#[cfg(feature = "test-fakes")]
+#[test]
+fn witness_counts_data_overtaking_stopped_receipt() {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender()
+        .send(login_after(1, 9))
+        .expect("control 送出");
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    mb.control_sender()
+        .send(ControlEvent::WorkerStopped(receipt(1, 1)))
+        .expect("receipt 送出");
+    let mut processed = (1u64, 0u64);
+    let mut witnesses: Vec<(&'static str, Option<u64>)> = Vec::new();
+    for _ in 0..5 {
+        let item = mb
+            .recv_next(processed, Some(1), None, &*clock)
+            .expect("項目");
+        let w = mb.take_control_witness();
+        match &item {
+            MailboxItem::Data(DataEvent::UartRxChunk { rx_seq, .. }) => {
+                processed = (1, *rx_seq);
+                witnesses.push(("D", w));
+            }
+            MailboxItem::Control(ControlEvent::LoginFinished { .. }) => witnesses.push(("L", w)),
+            MailboxItem::Control(ControlEvent::WorkerStopped(_)) => witnesses.push(("W", w)),
+            _ => witnesses.push(("?", w)),
+        }
+    }
+    assert_eq!(witnesses.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["D", "D", "D", "L", "W"]);
+    assert_eq!(witnesses[4].1, Some(3), "receipt 等待期間處理了 3 個 data item：{witnesses:?}");
+    assert!(witnesses[..3].iter().all(|(_, w)| w.is_none()), "data item 不帶見證數：{witnesses:?}");
+}
+
+/// OD-64（擁有者裁決 (a)，2026-10-29）：drain_receipt 的 l1_only 界限為「receipt 送出後，至多處理同 epoch 於依賴等待前
+/// 已讀入 mailbox 的 data，再加 1 筆」；排空順序維持與 Python 1:1（D,D,D,L,W）。探針須同時記錄 receipt 開始依賴等待
+/// （移入 `stopped`）時已讀入 mailbox 的同 epoch data 筆數，供依新界限判定。
+#[cfg(feature = "test-fakes")]
+#[test]
+fn stopped_receipt_records_pre_dependency_data() {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender()
+        .send(login_after(1, 9))
+        .expect("control 送出");
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    mb.control_sender()
+        .send(ControlEvent::WorkerStopped(receipt(1, 1)))
+        .expect("receipt 送出");
+    let mut processed = (1u64, 0u64);
+    let mut rows: Vec<(&'static str, Option<u64>, Option<u64>)> = Vec::new();
+    for _ in 0..5 {
+        let item = mb
+            .recv_next(processed, Some(1), None, &*clock)
+            .expect("項目");
+        let w = mb.take_control_witness();
+        let pre = mb.take_control_pre_dependency_data();
+        let kind = match &item {
+            MailboxItem::Data(DataEvent::UartRxChunk { rx_seq, .. }) => {
+                processed = (1, *rx_seq);
+                "D"
+            }
+            MailboxItem::Control(ControlEvent::LoginFinished { .. }) => "L",
+            MailboxItem::Control(ControlEvent::WorkerStopped(_)) => "W",
+            _ => "?",
+        };
+        rows.push((kind, w, pre));
+    }
+    assert_eq!(rows.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(), ["D", "D", "D", "L", "W"], "{rows:?}");
+    let (_, w, pre) = rows[4];
+    assert_eq!(pre, Some(3), "receipt 依賴等待前 mailbox 已有 3 筆同 epoch data：{rows:?}");
+    assert_eq!(w, Some(3), "{rows:?}");
+    assert!(w.unwrap() <= pre.unwrap() + 1, "OD-64 界限：{rows:?}");
+}
+
+/// OD-64：只計 receipt 開始依賴等待「之前」已讀入的同 epoch data——之後才讀入的 data 與其他 epoch 的 data 不計入，
+/// 使超越者被探針揭露（見證數 > 已讀入筆數＋1）。
+#[cfg(feature = "test-fakes")]
+#[test]
+fn pre_dependency_data_excludes_later_and_other_epoch_data() {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender()
+        .send(login_after(2, 9))
+        .expect("control 送出");
+    let dtx = mb.data_sender();
+    dtx.send(rx_chunk(1, 7)).expect("舊 epoch data 送出");
+    dtx.send(rx_chunk(2, 1)).expect("data 送出");
+    dtx.send(rx_chunk(2, 2)).expect("data 送出");
+    mb.control_sender()
+        .send(ControlEvent::WorkerStopped(receipt(2, 1)))
+        .expect("receipt 送出");
+    // 第一次取出：LoginFinished 進 stash、receipt 移入 stopped（此刻已讀入 1 筆舊 epoch＋2 筆同 epoch），回傳第一筆 data。
+    let mut processed = (2u64, 0u64);
+    let first = mb.recv_next(processed, Some(2), None, &*clock).expect("項目");
+    assert!(matches!(first, MailboxItem::Data(DataEvent::UartRxChunk { epoch: 1, .. })));
+    // 依賴等待開始之後才讀入的同 epoch data。
+    for i in 3..=5 {
+        dtx.send(rx_chunk(2, i)).expect("data 送出");
+    }
+    let mut receipt_row = None;
+    for _ in 0..7 {
+        let item = mb
+            .recv_next(processed, Some(2), None, &*clock)
+            .expect("項目");
+        let w = mb.take_control_witness();
+        let pre = mb.take_control_pre_dependency_data();
+        match &item {
+            MailboxItem::Data(DataEvent::UartRxChunk { epoch: 2, rx_seq, .. }) => processed = (2, *rx_seq),
+            MailboxItem::Control(ControlEvent::WorkerStopped(_)) => {
+                receipt_row = Some((w, pre));
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (w, pre) = receipt_row.expect("receipt 應被取出");
+    assert_eq!(pre, Some(2), "只計依賴等待前已讀入的同 epoch data（舊 epoch 與之後讀入者不計）");
+    assert_eq!(w, Some(6), "receipt 送入後共處理 6 筆 data");
+    assert!(w.unwrap() > pre.unwrap() + 1, "超越者須可被探針揭露");
+}
+
+/// OD-64：無同 epoch 依賴的 receipt 不進 `stopped`，依賴等待前筆數為 0（界限即原本的 1 筆）。
+#[cfg(feature = "test-fakes")]
+#[test]
+fn receipt_without_dependency_has_zero_pre_dependency_data() {
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    mb.safety_sender()
+        .send(ControlEvent::WorkerStopped(receipt(1, 1)))
+        .expect("receipt 送出");
+    let item = mb.recv_next((1, 0), Some(1), None, &*clock).expect("項目");
+    assert!(matches!(item, MailboxItem::Control(ControlEvent::WorkerStopped(_))), "safety lane 優先於 data");
+    assert_eq!(mb.take_control_witness(), Some(0));
+    assert_eq!(mb.take_control_pre_dependency_data(), Some(0));
+}
+
+/// OD-64 接線：actor 探針把 mailbox 的「依賴等待前已讀入筆數」記入 `ProbeEntry::pre_dependency_data`，
+/// drain_receipt 依新界限（見證數 ≤ 依賴等待前筆數＋1）判定。
+#[test]
+fn actor_probe_records_pre_dependency_data_for_drain_receipt() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let epoch = h.epoch();
+    let clock: Arc<dyn Clock> = h.clock.clone();
+    let core = h.core;
+    let mb = Mailbox::new(256, 1024);
+    mb.control_sender()
+        .send(login_after(epoch, 9))
+        .expect("control 送出");
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(epoch, i)).expect("data 送出");
+    }
+    mb.control_sender()
+        .send(ControlEvent::WorkerStopped(receipt(epoch, 99)))
+        .expect("receipt 送出");
+    let handle = spawn_actor(core, mb, Box::new(ReplyExec), clock);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.probe.entries("WorkerStopped").is_empty() {
+        assert!(Instant::now() < deadline, "actor 未處理 receipt");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let e = handle.probe.entries("WorkerStopped")[0].clone();
+    assert_eq!(e.pre_dependency_data, 3, "{e:?}");
+    assert_eq!(e.data_while_waiting, 3, "{e:?}");
+    assert!(e.data_while_waiting <= e.pre_dependency_data + 1, "OD-64 界限：{e:?}");
+}
+
+/// event_latency 審閱 2 C4（L-10）：lane 見證數的正向自測——事件停在 control lane 期間，mailbox 經 `stopped` 路徑或
+/// `pending_control` 路徑回傳 N 筆 data，該事件被取出時見證數須恰為 N（探針退化成 0 時 l1_gate 不得靜默放行）。
+#[cfg(feature = "test-fakes")]
+#[test]
+fn lane_witness_counts_data_returned_via_stopped_and_pending_paths() {
+    // stopped 路徑：L（同 epoch 依賴）、3 筆 data、W（移入 stopped）之後，G 停在 control lane。
+    let mut mb = Mailbox::new(256, 1024);
+    let clock = FakeClock::at(0, 0);
+    mb.control_sender().send(login_after(1, 9)).expect("control 送出");
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    mb.control_sender()
+        .send(ControlEvent::WorkerStopped(receipt(1, 1)))
+        .expect("receipt 送出");
+    mb.control_sender().send(get_state_req()).expect("G 送出");
+    let mut processed = (1u64, 0u64);
+    let mut g_witness = None;
+    for _ in 0..6 {
+        let item = mb.recv_next(processed, Some(1), None, &*clock).expect("項目");
+        let w = mb.take_control_witness();
+        match &item {
+            MailboxItem::Data(DataEvent::UartRxChunk { rx_seq, .. }) => processed = (1, *rx_seq),
+            MailboxItem::Control(ControlEvent::Request { .. }) => g_witness = Some(w),
+            _ => {}
+        }
+    }
+    assert_eq!(g_witness, Some(Some(3)), "G 在 control lane 等待期間 stopped 路徑回傳 3 筆 data");
+
+    // pending 路徑：stash 滿（16）＋第 17 個依賴事件成為 pending 時，mailbox 改取 data；G 停在 control lane。
+    let mut mb = Mailbox::new(256, 1024);
+    let ctl = mb.control_sender();
+    for _ in 0..=sw_core::resources::MAILBOX_STASH_MAX {
+        ctl.send(login_after(1, 100)).expect("control 送出");
+    }
+    let dtx = mb.data_sender();
+    for i in 1..=3 {
+        dtx.send(rx_chunk(1, i)).expect("data 送出");
+    }
+    ctl.send(get_state_req()).expect("G 送出");
+    let mut processed = (1u64, 0u64);
+    let mut g_witness = None;
+    for _ in 0..4 {
+        let item = mb.recv_next(processed, Some(1), None, &*clock).expect("項目");
+        let w = mb.take_control_witness();
+        match &item {
+            MailboxItem::Data(DataEvent::UartRxChunk { rx_seq, .. }) => processed = (1, *rx_seq),
+            MailboxItem::Control(ControlEvent::Request { .. }) => {
+                g_witness = Some(w);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(g_witness, Some(Some(3)), "G 在 control lane 等待期間 pending 路徑回傳 3 筆 data");
+}

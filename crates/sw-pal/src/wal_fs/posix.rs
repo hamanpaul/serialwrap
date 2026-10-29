@@ -14,13 +14,51 @@ use crate::wal_fs::{FileIdentity, WalFile, WalFs, WalWriteError};
 /// POSIX WAL 檔案系統。
 pub struct PosixWalFs;
 
+/// 每寫出這麼多 bytes 主動啟動一次非同步回寫（Linux `sync_file_range(SYNC_FILE_RANGE_WRITE)`）。
+///
+/// rulings/p5.md OD-61 WSL2 實測：rotate 的 close(sync) 須 fsync 整個檔案的髒頁，Rust append 遠快於 Python，
+/// 預填後立即輪替時幾乎整個 64 MiB 檔都未回寫，四流同時 fsync 約 855 ms（Python 108～132 ms）。啟動回寫只提早把
+/// 已寫入的資料送往磁碟、不等待完成，WAL 的持久性語意（rotate 前 fsync、append 不 fsync）與 Python 相同。
+const WRITEBACK_CHUNK_BYTES: u64 = 1 << 20;
+
 struct PosixWalFile {
     file: Option<File>,
+    /// 上次啟動回寫後新寫入、尚未啟動回寫的 bytes。
+    unhinted_bytes: u64,
+    /// 已啟動非同步回寫的次數（單元測試觀測用）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    writeback_hints: u64,
 }
 
 impl PosixWalFile {
+    fn new(file: File) -> Self {
+        Self {
+            file: Some(file),
+            unhinted_bytes: 0,
+            writeback_hints: 0,
+        }
+    }
+
     fn file(&self) -> &File {
         self.file.as_ref().expect("WAL handle 尚未關閉")
+    }
+
+    /// 已寫出 `count` bytes：累計達 `WRITEBACK_CHUNK_BYTES` 即啟動非同步回寫。失敗不影響寫入結果（只是提示）。
+    fn note_written(&mut self, count: usize) {
+        self.unhinted_bytes += count as u64;
+        if self.unhinted_bytes < WRITEBACK_CHUNK_BYTES {
+            return;
+        }
+        self.unhinted_bytes %= WRITEBACK_CHUNK_BYTES;
+        self.writeback_hints += 1;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // 安全性：fd 為本結構持有的有效描述符；offset 0／nbytes 0 表示整個檔案，只啟動回寫、不等待。
+            let _ = unsafe {
+                libc::sync_file_range(self.file().as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+            };
+        }
     }
 }
 
@@ -35,7 +73,10 @@ impl WalFile for PosixWalFile {
                         error: PalError::from_errno(libc::EIO),
                     });
                 }
-                Ok(count) => sent += count,
+                Ok(count) => {
+                    sent += count;
+                    self.note_written(count);
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     return Err(WalWriteError {
@@ -90,7 +131,7 @@ impl WalFs for PosixWalFs {
         }
         // 安全性：fd 是剛取得且尚未交給其他物件的有效描述符。
         let file = unsafe { File::from_raw_fd(fd) };
-        Ok(Box::new(PosixWalFile { file: Some(file) }))
+        Ok(Box::new(PosixWalFile::new(file)))
     }
 
     fn path_identity(&self, path: &Path) -> PalResult<Option<FileIdentity>> {
@@ -311,6 +352,40 @@ fn rename_noreplace_with(
 mod tests {
     use std::ffi::{CStr, CString};
     use std::io;
+
+    /// rulings/p5.md OD-61 WSL2 實測（rotate 停頓約 855 ms）：根因為 rotate 時 close(sync) 的 fsync 須寫出整個
+    /// 檔案仍在 page cache 的髒頁（預填 60 MiB 後立即量測，Python 因 append 慢 47 倍而早已由背景回寫）。
+    /// 寫入路徑須每 `WRITEBACK_CHUNK_BYTES` 主動啟動非同步回寫（不等待完成、不改持久性語意），使 rotate 的 fsync
+    /// 只需寫出最後一段。以回寫啟動次數斷言（不依賴計時）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writes_initiate_async_writeback_every_chunk() {
+        use crate::wal_fs::WalFile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.wal.ndjson");
+        let raw = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let mut file = super::PosixWalFile::new(raw);
+        let chunk = vec![b'x'; 64 * 1024];
+        let total = 3 * super::WRITEBACK_CHUNK_BYTES as usize + 1;
+        let mut written = 0;
+        while written < total {
+            let n = chunk.len().min(total - written);
+            file.write_all_flush(&chunk[..n]).unwrap();
+            written += n;
+        }
+        assert_eq!(
+            file.writeback_hints,
+            3,
+            "每寫滿 {} bytes 應啟動一次非同步回寫",
+            super::WRITEBACK_CHUNK_BYTES
+        );
+        assert!(file.unhinted_bytes < super::WRITEBACK_CHUNK_BYTES);
+        file.sync().unwrap();
+    }
 
     use super::{rename_noreplace_with, RenameOps};
 

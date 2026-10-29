@@ -609,3 +609,75 @@ def test_build_failure_report_still_carries_provenance(tmp_path: Path) -> None:
     assert prov["schema"] == "cargo-l1-provenance.v1"
     assert prov["executables"] == []
     assert prov["git"]["head"] == _git_head()
+
+
+@pytest.mark.process_rpc   # 本檔資源 marker 一律 process_rpc（test_module_resource_marker_not_mixed）
+def test_capability_matched_on_last_path_segment() -> None:
+    """P5 第 6 輪 gate 實跑揭露：lib 單元測試的 libtest 名稱帶模組路徑（`console_pty::posix::tests::cap_posix_pty__x`），
+    只比對名稱開頭會把它當成非能力測試——`--caps posix_pty` 不執行、skip_kind 記成 other，OD-55 移入
+    `s21_gate:cap_posix_pty` 的 4 個 lib 能力測試因此恆 skipped。能力判定須取最後一段。"""
+    spec = importlib.util.spec_from_file_location("cargo_l1_results", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("cargo_l1_results", mod)        # dataclass 需模組已登錄
+    spec.loader.exec_module(mod)
+    assert mod.capability_of("console_pty::posix::tests::cap_posix_pty__new_slave_speed_not_b0") == "posix_pty"
+    assert mod.capability_of("cap_windows_com__open") == "windows_com"
+    assert mod.capability_of("serial::posix::tests::plain_cap_posix_pty__x") is None
+
+
+@pytest.mark.process_rpc
+def test_failure_output_is_echoed_and_saved(tmp_path: Path) -> None:
+    """P5 第 7 輪：libtest 把失敗段（panic 訊息）印在 stdout；收集器只解析 stdout，失敗時 gate log 只剩兩行、無從追根因
+    （r6 gate 的 lock_conformance_suite）。失敗時須把 stdout 的 failures 段轉印到 stderr，並把完整 stdout／stderr
+    存到報告旁的 `<報告>.failures/`。"""
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_b_failed.txt", exit_code=101)
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    rep = _report(out, r)
+    assert _rows(rep)[B]["outcome"] == "failed"
+    assert "---- b stdout ----" in r.stderr and "panicked at" in r.stderr, r.stderr
+    saved = sorted((tmp_path / "l1.json.failures").glob("*.stdout.txt"))
+    assert saved, list(tmp_path.iterdir())
+    text = saved[0].read_text(encoding="utf-8")
+    assert "---- b stdout ----" in text and "test b ... FAILED" in text
+
+
+@pytest.mark.process_rpc
+def test_passing_run_saves_no_failure_output(tmp_path: Path) -> None:
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_a_ok.txt")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--out", str(out)])
+    _report(out, r)
+    assert not (tmp_path / "l1.json.failures").exists()
+
+
+@pytest.mark.process_rpc
+def test_capability_runs_are_single_threaded(tmp_path: Path) -> None:
+    """P5 第 7 輪：能力測試（`--caps`）改以 `--test-threads=1` 執行。同執行檔平行測試 fork 子行程時，子行程在 exec 前
+    暫時持有父行程全部 fd 的複本（含 CLOEXEC 者），被其他測試的 /proc holder 掃描看成外部 holder（cap_posix_pty__*
+    並行負載下 5～11/180 間歇 `Held(pids:[同執行檔子行程])`；單執行緒 0/180）。預設（非能力）執行不變。"""
+    if os.name == "nt":
+        pytest.skip("POSIX 假 libtest（argv 紀錄）")
+    _assert_script()
+    exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_ignored_cap.txt")
+    real = exe.with_name(exe.name + ".real")
+    exe.rename(real)
+    exe.write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path}/argv.log"\nexec "{real}" "$@"\n', encoding="utf-8")
+    exe.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--caps", "posix_pty", "--out", str(out)])
+    _report(out, r)
+    runs = [line.split() for line in (tmp_path / "argv.log").read_text(encoding="utf-8").splitlines()
+            if "--list" not in line.split()]
+    cap_runs = [a for a in runs if "--ignored" in a]
+    default_runs = [a for a in runs if "--ignored" not in a]
+    assert cap_runs and all("--test-threads=1" in a for a in cap_runs), runs
+    assert default_runs and not any("--test-threads=1" in a for a in default_runs), runs

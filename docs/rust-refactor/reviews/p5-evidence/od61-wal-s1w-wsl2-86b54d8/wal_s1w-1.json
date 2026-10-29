@@ -1,0 +1,88 @@
+{
+  "append_ms": {
+    "p50": 0.021592,
+    "p95": 0.030161,
+    "p99": 0.052252
+  },
+  "append_ns": {
+    "n": 39996,
+    "p50": 21592,
+    "p95": 30161,
+    "p99": 52252
+  },
+  "env": {
+    "contract_tree": "1e13fbe2dcf64e8d9d7a1c873ba449b519181857",
+    "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
+    "cpu_count": 24,
+    "endpoint_av": "unknown",
+    "fs_type": "ext4",
+    "git_revision": "86b54d8d54bbfcfb2b3d2ec016c056649bf8aa0e",
+    "implementation": "rust",
+    "memory_bytes": 101247266816,
+    "mix": {
+      "ansi": 0.2,
+      "prompt": 0.2,
+      "text": 0.6
+    },
+    "os": "posix",
+    "os_build": "6.18.54.1-microsoft-standard-WSL2",
+    "power": "unknown",
+    "serial": "none",
+    "source_tree_dirty": false,
+    "storage_device": "/dev/sdd",
+    "timing_method": "std::time::Instant",
+    "tool_revision": "ce5340e276d4dde4448f29ae60fee2e2abf23447",
+    "virtualization": "wsl2",
+    "wal_fs": "sw_pal::native().wal_fs",
+    "wal_writer": "sw_core::wal::WalWriter"
+  },
+  "failures": [
+    "append_p50 0.021592 ms > 0.005 ms",
+    "append_p95 0.030161 ms > 0.01 ms",
+    "append_p99 0.052252 ms > 0.02 ms",
+    "rotate_max 48.255355 ms > 3 ms"
+  ],
+  "ordinary_samples": 39996,
+  "params": {
+    "payload": 1024,
+    "prefill_ratio": 0.9375,
+    "rate": 0,
+    "records": 10000,
+    "rotate_bytes": 67108864,
+    "streams": 4
+  },
+  "prefill_bytes": [
+    62915031,
+    62915031,
+    62915031,
+    62915031
+  ],
+  "rotate_bytes": 67108864,
+  "rotate_max_ms": 48.255355,
+  "rotate_max_ns": 48255355,
+  "rotate_pauses_ns": [
+    40537945,
+    42509825,
+    48255355,
+    42551480
+  ],
+  "rotate_samples": 4,
+  "rotations_per_stream": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "schema": "wal_s1w.v1",
+  "thresholds": {
+    "append_p50_ms": 0.005,
+    "append_p95_ms": 0.01,
+    "append_p99_ms": 0.02,
+    "platform": "linux",
+    "rotate_max_ms": 3.0,
+    "source": "serialwrap-rust-spec-final.md §1.2"
+  },
+  "total_records": 40000,
+  "verdict": "FAIL",
+  "write_failures": 0
+}

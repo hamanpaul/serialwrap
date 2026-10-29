@@ -42,13 +42,22 @@ TEST_SECTIONS = {
     "blackbox_rust": ("linux", "s21_gate:blackbox_rust"),
     "existing_suites_rust": ("linux", "s21_gate:existing_suites_rust"),
     "pytest_full": ("linux", "s21_gate:pytest_full"),
+    # P5 第 6 輪 SPEC-GAP #2（編排者裁決）：OD-55 linux 能力集合各一個 section（以 --caps <cap> 實跑，須附能力探測）
+    "linux_cap_sys_admin": ("linux", "s21_gate:cap_sys_admin"),
+    "linux_cap_windows_native": ("linux", "s21_gate:cap_windows_native"),
+    "linux_cap_interactive_desktop": ("linux", "s21_gate:cap_interactive_desktop"),
+    "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
+    # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
+    "py_parity": ("linux", "s21_gate:py_parity_full"),
 }
+CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_windows_native": "windows_native",
+          "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime"}
 NON_TEST_SECTIONS = ["l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake"]
 CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core::wal::c"]
 GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
     name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
     for name in ("linux_cap_posix_pty", "windows_cap_windows_com", "blackbox_python", "blackbox_rust",
-                 "existing_suites_rust", "pytest_full")
+                 "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity")
 }
 
 
@@ -74,6 +83,17 @@ FREEZE_SYNTH = {"denominator": 3, "required_case_ids": ["c-1", "c-2", "c-3"],
                 "window": {"start": "2026-10-21", "weeks": 3}, "stage2_started_at": "2026-10-21"}
 # 斷路器輸入（窗口內、未觸發）：case_uptake 依 slice_breaker.evaluate 判定（審查 b7cd852 #1）。
 BREAKER_OK = {"snapshots": [], "today": "2026-10-28", "stage2_estimate_weeks": 0.0}
+
+
+# event_latency 證據（方法審閱 [High]：judge 須讀證據內容並核對 artifact／commit／run／工具／契約身分）。
+EVLAT_REF = {"tool_sha256": _sha("evlat-tool"), "contract_sha256": _sha("contract"), "method_revision": "2026-10-29.2"}
+
+
+def _evlat_evidence(**identity) -> dict:
+    ident = {"artifact_source_commit": "e" * 40, "artifact_build_run_id": "t",       # daemon_sha256 預設跟隨報告 identity
+             "run_id": "t", "source_commit": "e" * 40, "source_tree_dirty": False, **EVLAT_REF}
+    ident.update(identity)
+    return {"schema": "event_latency_external.v1", "verdict": "PASS", "reasons": [], "identity": ident}
 
 
 def _judge_mod():
@@ -113,9 +133,9 @@ def _lock() -> dict:
         "linux": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
         "windows": {"nodeids": list(CORE_NODEIDS), "selector": {"argv": ["cargo", "test", "--workspace"]}},
     }}
-    for name, ids in GATE_NODEIDS.items():
-        platform = "windows" if name.startswith("windows_") else "linux"
-        sets[f"s21_gate:{name}"] = {platform: {"nodeids": list(ids), "selector": {"argv": ["pytest", "-q"]}}}
+    for name, (platform, set_id) in TEST_SECTIONS.items():
+        if set_id.startswith("s21_gate:"):
+            sets[set_id] = {platform: {"nodeids": list(GATE_NODEIDS[name]), "selector": {"argv": ["pytest", "-q"]}}}
     return {"schema_version": 1, "sets": sets}
 
 
@@ -157,6 +177,7 @@ class _Case:
         self.breaker: dict | None = dict(BREAKER_OK)
         self.parity: dict | None = None
         self.pending_decisions: list[dict] = []
+        self.evlat: dict | None = _evlat_evidence()
         for name, (platform, _) in TEST_SECTIONS.items():
             self.l1[name] = self._default_l1(name, platform)
 
@@ -187,17 +208,29 @@ class _Case:
             allowed = "BO-S21-01" if name == "windows_cap_windows_com" else None
             sections.append(_section(name, l1_results=rel, required_set=required_set,
                                      allowed_missing_bo=allowed, counts=counts))
+            if name == "linux_l1":
+                sections[-1]["run_euid"] = 1000             # F108：linux_l1 以非 root 執行
+            if name in CAP_OF:                                # SPEC-GAP #2：能力探測（本夾具假設具備能力）
+                sections[-1]["capability_probe"] = {"cap": CAP_OF[name], "available": True, "evidence": "fixture"}
         for name in NON_TEST_SECTIONS:
             sec = _section(name, exit_code=0)
             sec["section_verdict"] = "PASS"   # 非測試類 section 須明確帶判定（審查 b7cd852 #3）
+            if name == "event_latency" and self.evlat is not None:
+                rel = "event_latency/rust.json"
+                (self.base / rel).parent.mkdir(parents=True, exist_ok=True)
+                ev = json.loads(json.dumps(self.evlat))
+                ev.setdefault("identity", {}).setdefault("daemon_sha256", self.identity.get("daemon_sha256"))
+                (self.base / rel).write_text(json.dumps(ev), encoding="utf-8")
+                sec["evidence"] = rel
             sections.append(sec)
         sections.extend(self.extra_sections)
-        return {"schema_version": 1, "run_id": "t", "slice": "2.1", "identity": self.identity, "sections": sections,
-                "pending_decisions": list(self.pending_decisions)}
+        return {"schema_version": 1, "run_id": "t", "git_revision": "e" * 40, "slice": "2.1", "identity": self.identity,
+                "sections": sections, "pending_decisions": list(self.pending_decisions)}
 
     def expect(self) -> dict:
         out = {"lock": _lock(), "base_dir": self.base, "freeze": self.freeze,
-               "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path}
+               "case_verdicts": dict(self.case_verdicts), "daemon_path": self.daemon_path,
+               "event_latency_ref": dict(EVLAT_REF)}
         if self.breaker is not None:
             out["breaker"] = self.breaker
         if self.parity is not None:
@@ -495,3 +528,255 @@ def test_l15_ab_excluded_case_requires_covering_pytest_passed(case):
     exp["l15_ab_excluded"][0]["covered_by"] = [{"section": "blackbox_python", "nodeid": nid}]
     out = _judge_mod().judge(case.report(), exp)
     assert _sec(out, "l15_ab")["status"] == "EVIDENCE_MISSING"
+
+
+def test_event_latency_section_requires_readable_evidence(case):
+    """方法審閱 [High]：judge 須讀取 event_latency 證據內容；`evidence: missing.json` 不得判 PASS。"""
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "PASS"
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "event_latency":
+            sec["evidence"] = "missing.json"
+    out = _judge_mod().judge(rep, case.expect())
+    assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
+    assert out["verdict"] == "INCOMPLETE"
+    case.evlat = None
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "EVIDENCE_MISSING"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("daemon_sha256", "0" * 64),          # 量測的不是本 run 的 artifact
+    ("artifact_source_commit", "f" * 40),  # 建置來源不是本 run 的 git_revision（如建置失敗留下舊 binary）
+    ("artifact_source_commit", None),
+    ("artifact_build_run_id", "other-run"),
+    ("run_id", "other-run"),
+    ("tool_sha256", "1" * 64),
+    ("contract_sha256", "2" * 64),
+    ("method_revision", "2026-10-29.1"),
+])
+def test_event_latency_evidence_identity_must_match_run(case, field, value):
+    """方法審閱 [High]：量測 JSON 的 artifact、commit、run、工具與契約身分須與 gate 本 run 一致，否則不得 PASS。"""
+    case.evlat = _evlat_evidence(**{field: value})
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "event_latency")
+    assert sec["status"] == "EVIDENCE_MISSING", (field, sec)
+    assert any(field in r for r in sec["reasons"]), sec["reasons"]
+
+
+def test_event_latency_evidence_verdict_drives_section(case):
+    """證據 verdict FAIL → section FAIL（即使 gate 片段帶 PASS）；INSUFFICIENT_EVIDENCE → EVIDENCE_MISSING。"""
+    case.evlat = {**_evlat_evidence(), "verdict": "FAIL", "reasons": ["外部量測超過上限：1/idle/stop_request"]}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "event_latency")["status"] == "FAIL" and out["verdict"] == "FAIL"
+    case.evlat = {**_evlat_evidence(), "verdict": "INSUFFICIENT_EVIDENCE", "reasons": ["x"]}
+    assert _sec(_judge_mod().judge(case.report(), case.expect()), "event_latency")["status"] == "EVIDENCE_MISSING"
+
+
+def test_release_build_failure_is_fail_and_build_sha_must_match(case):
+    """方法審閱 [High]：Linux release 建置失敗（舊 binary 可能留存）→ FAIL；建置當下 sha256 與報告 artifact 不符 → FAIL。"""
+    case.identity["build"] = {"linux_exit": 0, "windows_exit": 0, "daemon_sha256_at_build": IDENTITY["daemon_sha256"]}
+    assert _judge_mod().judge(case.report(), case.expect())["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    case.identity["build"] = {"linux_exit": 101, "windows_exit": 0, "daemon_sha256_at_build": None}
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert out["verdict"] == "FAIL" and any("建置失敗" in r for r in out["verdict_reasons"])
+    case.identity["build"] = {"linux_exit": 0, "windows_exit": 0, "daemon_sha256_at_build": "0" * 64}
+    assert _judge_mod().judge(case.report(), case.expect())["verdict"] == "FAIL"
+
+
+def test_gate_script_removes_stale_artifact_and_binds_build_sha():
+    """方法審閱 [High]：gate 建置前移除舊 artifact；只在建置成功時把來源 commit／run／建置當下 sha256 傳給量測工具。"""
+    text = (ROOT / "scripts" / "rust" / "slice21_gate.sh").read_text(encoding="utf-8")
+    build_at = text.index("run_logged build_linux")
+    assert text.rindex('rm -f "$RUST_D" "$RUST_CLI"', 0, build_at) > 0
+    assert 'BUILD_LINUX_RC="$LAST_RC"' in text and 'BUILD_WINDOWS_RC="$LAST_RC"' in text
+    assert '--artifact-sha256 "$BUILT_D_SHA"' in text
+    evlat = text[text.index("run_logged event_latency "):]
+    assert '"${evlat_bind[@]}"' in evlat.splitlines()[2] or '"${evlat_bind[@]}"' in evlat[:400]
+    assert "--build-linux-exit" in text and "--built-daemon-sha256" in text
+
+
+def test_l15_ab_excluded_case_covered_by_section_requires_section_pass(case):
+    """OD-58：`s21-event-latency` 移出 l15_ab 後由 event_latency section 承擔（`covered_by_sections`）；
+    承擔 section 非 PASS 時 l15_ab 不得 PASS。"""
+    exp = case.expect()
+    exp["l15_ab_excluded"] = [{"case_id": "s21-event-latency", "decision": "OD-58",
+                               "covered_by": [{"section": "linux_l1", "nodeid": CORE_NODEIDS[0]}],
+                               "covered_by_sections": ["event_latency"]}]
+    assert _sec(_judge_mod().judge(case.report(), exp), "l15_ab")["status"] == "PASS"
+    case.evlat = None                                    # event_latency 證據缺 → EVIDENCE_MISSING
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
+    sec = _sec(out, "l15_ab")
+    assert sec["status"] == "EVIDENCE_MISSING" and any("OD-58" in r and "event_latency" in r for r in sec["reasons"])
+
+
+def test_linux_l1_run_as_root_is_evidence_missing(case):
+    """F108（P5 第 5 輪 OWNER-BATCH #4，編排者裁決）：linux_l1 須以非 root 執行；euid==0 時不得記 PASS，也不得因
+    root 專屬失敗記 FAIL 了事，一律 EVIDENCE_MISSING 並要求非 root 補跑。未記錄 euid 同為證據不足。"""
+    def with_euid(euid, outcome="passed"):
+        rep = case.report()
+        for sec in rep["sections"]:
+            if sec["name"] == "linux_l1":
+                if euid is None:
+                    sec.pop("run_euid", None)
+                else:
+                    sec["run_euid"] = euid
+                if outcome != "passed":
+                    l1 = _l1("linux", "cargo", [_row(CORE_NODEIDS[0], outcome)] + [_row(i) for i in CORE_NODEIDS[1:]])
+                    sec["l1_results"] = case.write_l1("linux_l1_x", l1)
+                    sec.update(_counts(l1))
+        return _sec(_judge_mod().judge(rep, case.expect()), "linux_l1")
+    assert with_euid(1000)["status"] == "PASS"
+    assert with_euid(1000, "failed")["status"] == "FAIL"
+    root = with_euid(0)
+    assert root["status"] == "EVIDENCE_MISSING" and any("非 root" in r for r in root["reasons"])
+    assert with_euid(0, "failed")["status"] == "EVIDENCE_MISSING"
+    assert with_euid(None)["status"] == "EVIDENCE_MISSING"
+
+
+def test_gate_script_linux_l1_non_root_and_daemon_version_from_rpc():
+    """F108／F139：gate 的 linux_l1 於 euid==0 且無法降權時不執行並記 EVIDENCE_MISSING；daemon_version 取自 RPC。"""
+    text = (ROOT / "scripts" / "rust" / "slice21_gate.sh").read_text(encoding="utf-8")
+    l1 = text[text.index("# 2. Linux L1"):text.index("# 3. Linux cap_posix_pty")]
+    assert "id -u" in l1 and "SW_GATE_L1_USER" in l1 and "--run-euid" in l1 and "EVIDENCE_MISSING" in l1
+    assert "probe_daemon_version.py" in text
+    assert '"$RUST_D" --version' not in text      # serialwrapd 依 Python 1:1 不提供 --version
+
+
+def test_uncarried_gate_set_blocks_ready(case):
+    """sol P5-4f8acdf-1（High）：鎖中有 `s21_gate:*` 集合未被任何 section（含 additional_required_sets）承擔時，
+    其 nodeid 從未被執行或判定——不得 READY，verdict 須為 INCOMPLETE 並列出該集合。"""
+    exp = case.expect()
+    assert _judge_mod().judge(case.report(), exp)["verdict"] == "READY_FOR_OWNER_EVIDENCE"
+    # 第 7 輪：s21_gate:cap_sys_admin 已由 linux_cap_sys_admin section 承擔（SPEC-GAP #2），改以未承擔的集合名驗證守門。
+    exp["lock"]["sets"]["s21_gate:cap_uncarried"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_uncarried__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_uncarried__"]}}}
+    out = _judge_mod().judge(case.report(), exp)
+    assert out["verdict"] == "INCOMPLETE"
+    assert any("s21_gate:cap_uncarried" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 以 additional_required_sets 指派給 section 即視為承擔（由該 section 判定）
+    exp["additional_required_sets"] = {"linux_cap_posix_pty": ["s21_gate:cap_uncarried"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"])
+
+
+def test_uncarried_gate_set_is_judged_per_platform(case):
+    """sol P5-86b54d8-1 (a)：承擔以（集合, 平台）為粒度——windows section 承擔同名集合時，該集合的 linux 列
+    從未被任何 linux section 執行，仍須判 INCOMPLETE 並列出 linux 平台。"""
+    exp = case.expect()
+    sel = {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-daemon::launcher::cap_example__linux_only"], "selector": sel},
+        "windows": {"nodeids": [CORE_NODEIDS[0]], "selector": sel}}
+    exp["additional_required_sets"] = {"windows_native_l1": ["s21_gate:cap_example"]}
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "windows_native_l1")["status"] == "PASS"   # windows 列確實由 windows section 判定
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert not any("s21_gate:cap_example.windows" in r for r in out["verdict_reasons"])
+
+
+def test_non_test_section_fragment_cannot_carry_gate_set(case):
+    """sol P5-86b54d8-1 (b)：非測試類 section 不判集合，其片段自帶的 additional_required_sets 不得算承擔
+    （不接受報告自行宣告承擔）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:cap_example"] = {
+        "linux": {"nodeids": ["cargo:sw-pal::serial_posix_process::cap_example__x"],
+                  "selector": {"argv": ["--workspace", "--", "--ignored", "cap_example__"]}}}
+    rep = case.report()
+    for sec in rep["sections"]:
+        if sec["name"] == "l15_ab":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert out["verdict"] == "INCOMPLETE", out["verdict_reasons"]
+    assert any("s21_gate:cap_example.linux" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    # 測試類 section 片段自帶者照常由該 section 判定，故算承擔
+    for sec in rep["sections"]:
+        if sec["name"] == "linux_cap_posix_pty":
+            sec["additional_required_sets"] = ["s21_gate:cap_example"]
+    out = _judge_mod().judge(rep, exp)
+    assert not any("未被任何 section 承擔" in r for r in out["verdict_reasons"]), out["verdict_reasons"]
+    assert _sec(out, "linux_cap_posix_pty")["status"] == "EVIDENCE_MISSING"   # 該 nodeid 未執行 → 不得 PASS
+
+
+# --------------------------------------------------------------------------- 第 7 輪：SPEC-GAP #1／#2（編排者裁決）
+
+DISPOSITION = {"sys_admin": "BLOCKED-OWNER", "supervisor_runtime": "BLOCKED-OWNER",
+               "windows_native": "LOCAL-WINDOWS-TODO", "interactive_desktop": "LOCAL-WINDOWS-TODO"}
+NEEDS = {"sys_admin": "CAP_SYS_ADMIN", "supervisor_runtime": "systemd", "windows_native": "Windows",
+         "interactive_desktop": "Windows"}
+
+
+@pytest.mark.parametrize("name", sorted(CAP_OF))
+def test_capability_section_never_passes_without_capability_probe(case, name):
+    """SPEC-GAP #2：能力集合 section 以 --caps <cap> 實跑；本機無該能力時記 EVIDENCE_MISSING 並標所需能力與處置
+    （sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；windows_native／interactive_desktop → LOCAL-WINDOWS-TODO），
+    不得記 PASS——即使 l1 結果全 passed（例如 cap_sys_admin 測試在無權限時 early return 仍回 ok）。"""
+    cap = CAP_OF[name]
+    j = _judge_mod()
+    for probe in (None, {"cap": cap, "available": False, "evidence": "euid=1000"},
+                  {"cap": "posix_pty", "available": True, "evidence": "錯的能力"}):
+        rep = case.report()
+        sec = [s for s in rep["sections"] if s["name"] == name][0]
+        sec.pop("capability_probe")
+        if probe is not None:
+            sec["capability_probe"] = probe
+        out = j.judge(rep, case.expect())
+        s = _sec(out, name)
+        assert s["status"] == "EVIDENCE_MISSING", (probe, s["reasons"])
+        assert any(NEEDS[cap] in r and DISPOSITION[cap] in r for r in s["reasons"]), s["reasons"]
+        assert out["verdict"] == "INCOMPLETE"
+    assert _sec(j.judge(case.report(), case.expect()), name)["status"] == "PASS"   # 具備能力且全 passed
+
+
+def test_capability_section_failure_with_capability_is_fail(case):
+    n1, n2 = GATE_NODEIDS["linux_cap_sys_admin"]
+    case.l1["linux_cap_sys_admin"] = _l1("linux", "cargo", [_row(n1), _row(n2, "failed")], exit_code=101)
+    out = _judge_mod().judge(case.report(), case.expect())
+    assert _sec(out, "linux_cap_sys_admin")["status"] == "FAIL"
+
+
+def test_capability_sections_and_py_parity_match_expect_and_lock():
+    """SPEC-GAP #1／#2：expect 的測試類 section 與判定器 TEST_SECTIONS 一致；鎖中每個（s21_gate 集合, 平台）都有 section 承擔
+    （OD-55 能力集合不再落入「未承擔集合」）；py_parity section 用新集合 py_parity_full，pytest_full 仍承擔舊 py_parity。"""
+    import yaml
+
+    j = _judge_mod()
+    exp = yaml.safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    test_secs = {s["name"]: (s["platform"], s["required_set"]) for s in exp["sections"] if s["kind"] == "test"}
+    assert {n: p for n, (p, _) in test_secs.items()} == j.TEST_SECTIONS
+    assert {n for n, _ in test_secs.items()} <= set(j.SECTION_ORDER)
+    assert {test_secs[n][1] for n in CAP_OF} == {f"s21_gate:cap_{c}" for c in CAP_OF.values()}
+    assert {n: c["cap"] for n, c in j.CAPABILITY_SECTIONS.items()} == CAP_OF
+    assert test_secs["py_parity"] == ("linux", "s21_gate:py_parity_full")
+    assert "s21_gate:py_parity" in exp["additional_required_sets"]["pytest_full"]
+    carried = {(sid, test_secs[n][0]) for n, (_, sid) in test_secs.items()}
+    carried |= {(sid, test_secs[n][0]) for n, sids in exp["additional_required_sets"].items() for sid in sids}
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    uncarried = sorted(f"{sid}.{plat}" for sid, spec in lock["sets"].items() if sid.startswith("s21_gate:")
+                       for plat in spec if (sid, plat) not in carried)
+    assert uncarried == [], uncarried
+
+
+def test_py_parity_full_has_complete_selector_and_keeps_old_set():
+    """SPEC-GAP #1：s21_gate:py_parity（凍結、selector 只有 1 筆）不改不刪；新集合 py_parity_full 的 selector 須涵蓋
+    舊集合全部 nodeid（完整 selector），nodeid 為實際收集結果且 ⊇ 舊集合。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    old = lock["sets"]["s21_gate:py_parity"]["linux"]
+    full = lock["sets"]["s21_gate:py_parity_full"]["linux"]
+    assert old["selector"]["paths"] == ["tests/test_stage0_session_drain.py::test_release_persist_failure_retried"]
+    assert set(old["nodeids"]) <= set(full["nodeids"])
+    paths = full["selector"]["paths"]
+    assert all(any(n == p or n.startswith(p.rstrip("/") + "::") for p in paths) for n in old["nodeids"]), paths
+    assert full["selector"]["argv"][-len(paths):] == paths
+
+
+def test_gate_script_runs_capability_and_py_parity_sections():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    for name in (*CAP_OF, "py_parity"):
+        assert f"record {name} " in text, name                  # dry-run／拒絕開跑分支
+    assert text.count("record py_parity ") >= 2                 # ＋實跑分支
+    # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
+    assert "for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do" in text
+    assert '--caps "$cap"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text

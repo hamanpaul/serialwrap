@@ -307,6 +307,14 @@ fn collect_env(backend: BackendKind, wal_root: &Path) -> PyDict {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let repo_s = repo.to_string_lossy().to_string();
     let git_rev = run_cmd("git", &["-C", &repo_s, "rev-parse", "HEAD"]).unwrap_or_else(unknown);
+    // sol P5-4f8acdf-2：工作樹是否乾淨（已追蹤檔有未提交變更即 true）；取不到為 "unknown"，gate 匯入判證據不足。
+    let source_tree_dirty = match Command::new("git")
+        .args(["-C", &repo_s, "status", "--porcelain", "--untracked-files=no"])
+        .output()
+    {
+        Ok(out) if out.status.success() => PyValue::Bool(!out.stdout.iter().all(u8::is_ascii_whitespace)),
+        _ => text("unknown"),
+    };
     let contract_tree =
         run_cmd("git", &["-C", &repo_s, "rev-parse", "HEAD:contracts"]).unwrap_or_else(unknown);
     let tool_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/wal_s1w.rs");
@@ -337,6 +345,7 @@ fn collect_env(backend: BackendKind, wal_root: &Path) -> PyDict {
     env.insert("wal_writer", text("sw_core::wal::WalWriter"));
     env.insert("wal_fs", text("sw_pal::native().wal_fs"));
     env.insert("git_revision", text(git_rev));
+    env.insert("source_tree_dirty", source_tree_dirty);
     env.insert("contract_tree", text(contract_tree));
     env.insert("tool_revision", text(tool_revision));
     env.insert("timing_method", text("std::time::Instant"));

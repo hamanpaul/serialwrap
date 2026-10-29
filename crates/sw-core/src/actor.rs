@@ -30,8 +30,12 @@ pub struct ActorHandle {
 
 /// 測試用（Task 12b）：記錄非 data 事件「在 lane 中等待期間」actor 又處理了幾個 data item。
 ///
-/// 每處理完一個 data item，若 safety／control lane 仍有事件或已有到期 timer／tick，等待計數加一，
-/// 否則歸零；處理非 data 事件時記錄（標籤、等待計數、當下 data 積壓）並歸零。
+/// 方法審閱 [High]（2026-10-29）後改為逐事件計數，不再共用一個會被其他 control 事件歸零的計數：
+/// - mailbox 事件（control／safety lane、`stopped` 中的 receipt）：取 `Mailbox::take_control_witness()`——事件送入
+///   mailbox 後、被取出前 mailbox 回傳的 data item 數；依賴暫存事件不追蹤（記 0）。
+/// - actor 內部 timer／tick：到期時刻之後才開始處理的 data item 數（以 data 開始處理的單調時刻計）。
+/// - OD-64（2026-10-29）：另記 `Mailbox::take_control_pre_dependency_data()`——receipt 因同 epoch 依賴移入 `stopped`
+///   時已讀入 mailbox 的同 epoch data 筆數；drain_receipt 的界限為「見證數 ≤ 此數＋1」，其餘事件此數為 0（界限 1）。
 #[cfg(feature = "test-fakes")]
 #[derive(Default)]
 pub struct ActorLatencyProbe {
@@ -41,8 +45,9 @@ pub struct ActorLatencyProbe {
 #[cfg(feature = "test-fakes")]
 #[derive(Default)]
 struct ProbeInner {
-    streak: u64,
     data_items: u64,
+    /// 最近處理的 data item 之開始時刻（單調 ns；上限 `PROBE_LOG_MAX`），timer／tick 見證數用。
+    data_started: std::collections::VecDeque<u64>,
     log: std::collections::VecDeque<ProbeEntry>,
 }
 
@@ -59,6 +64,8 @@ pub struct ProbeEntry {
     pub data_while_waiting: u64,
     /// 處理此事件時 data lane 的積壓筆數。
     pub data_backlog: usize,
+    /// OD-64：此事件依賴等待開始前已讀入 mailbox 的同 epoch data 筆數（無依賴等待者為 0）。
+    pub pre_dependency_data: u64,
 }
 
 #[cfg(feature = "test-fakes")]
@@ -80,15 +87,23 @@ impl ActorLatencyProbe {
             .collect()
     }
 
-    fn after_data(&self, waiting: bool) {
+    fn after_data(&self, started_ns: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.data_items += 1;
-        g.streak = if waiting { g.streak + 1 } else { 0 };
+        if g.data_started.len() >= PROBE_LOG_MAX {
+            g.data_started.pop_front();
+        }
+        g.data_started.push_back(started_ns);
     }
 
-    fn before_other(&self, label: &'static str, data_backlog: usize) {
+    /// actor 內部 timer／tick：到期時刻 `due_ns` 之後才開始處理的 data item 數。
+    fn data_since(&self, due_ns: u64) -> u64 {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.data_started.iter().filter(|at| **at >= due_ns).count() as u64
+    }
+
+    fn before_other(&self, label: &'static str, data_backlog: usize, data_while_waiting: u64, pre_dependency_data: u64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let data_while_waiting = std::mem::take(&mut g.streak);
         if g.log.len() >= PROBE_LOG_MAX {
             g.log.pop_front();
         }
@@ -96,6 +111,7 @@ impl ActorLatencyProbe {
             label,
             data_while_waiting,
             data_backlog,
+            pre_dependency_data,
         });
     }
 }
@@ -108,9 +124,9 @@ mod probe_tests {
     fn probe_log_is_bounded_and_keeps_newest() {
         let probe = ActorLatencyProbe::default();
         for _ in 0..PROBE_LOG_MAX + 10 {
-            probe.before_other("Tick", 0);
+            probe.before_other("Tick", 0, 0, 0);
         }
-        probe.before_other("Release", 7);
+        probe.before_other("Release", 7, 0, 0);
         assert_eq!(probe.entries("Tick").len(), PROBE_LOG_MAX - 1);
         assert_eq!(probe.entries("Release")[0].data_backlog, 7);
     }
@@ -127,7 +143,8 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
         }),
         MailboxItem::Control(ControlEvent::Timer(ev)) => Some(timer_label(ev)),
         MailboxItem::Control(ControlEvent::Tick) => Some("Tick"),
-        // OD-45：stop_request／drain_receipt 的 L1 結構 gate（`at_most_one_data_item_before_control`）。
+        // OD-45：stop_request 的 L1 結構 gate（`at_most_one_data_item_before_control`）；drain_receipt 依 OD-64 為
+        // `at_most_pre_dependency_data_plus_one`（見 `ProbeEntry::pre_dependency_data`）。
         MailboxItem::Control(ControlEvent::Shutdown { .. }) => Some("Shutdown"),
         MailboxItem::Control(ControlEvent::WorkerStopped(_)) => Some("WorkerStopped"),
         MailboxItem::Control(_) => Some("Control"),
@@ -217,9 +234,9 @@ pub fn spawn_actor(
             loop {
                 let now = clock.mono_ns();
                 if let Some(index) = timers.iter().position(|(at, _)| *at <= now) {
-                    let (_, event) = timers.remove(index);
+                    let (_due, event) = timers.remove(index);
                     #[cfg(feature = "test-fakes")]
-                    thread_probe.before_other(timer_label(&event), mailbox.data_backlog());
+                    thread_probe.before_other(timer_label(&event), mailbox.data_backlog(), thread_probe.data_since(_due), 0);
                     if dispatch(
                         &mut core,
                         MailboxItem::Control(ControlEvent::Timer(event)),
@@ -238,11 +255,13 @@ pub fn spawn_actor(
                     continue;
                 }
                 if now >= next_tick {
+                    #[cfg(feature = "test-fakes")]
+                    let tick_due = next_tick;
                     while next_tick <= now {
                         next_tick = next_tick.saturating_add(1_000_000_000);
                     }
                     #[cfg(feature = "test-fakes")]
-                    thread_probe.before_other("Tick", mailbox.data_backlog());
+                    thread_probe.before_other("Tick", mailbox.data_backlog(), thread_probe.data_since(tick_due), 0);
                     if dispatch(
                         &mut core,
                         MailboxItem::Control(ControlEvent::Tick),
@@ -276,8 +295,12 @@ pub fn spawn_actor(
                 #[cfg(feature = "test-fakes")]
                 let label = probe_label(&item);
                 #[cfg(feature = "test-fakes")]
+                let data_started = clock.mono_ns();
+                #[cfg(feature = "test-fakes")]
                 if let Some(label) = label {
-                    thread_probe.before_other(label, mailbox.data_backlog());
+                    let witness = mailbox.take_control_witness().unwrap_or(0);
+                    let pre = mailbox.take_control_pre_dependency_data().unwrap_or(0);
+                    thread_probe.before_other(label, mailbox.data_backlog(), witness, pre);
                 }
                 let data_mark = match &item {
                     MailboxItem::Data(DataEvent::UartRxChunk { epoch, rx_seq, .. }) => {
@@ -305,11 +328,7 @@ pub fn spawn_actor(
                 }
                 #[cfg(feature = "test-fakes")]
                 if label.is_none() {
-                    let now = clock.mono_ns();
-                    let waiting = mailbox.control_waiting()
-                        || now >= next_tick
-                        || timers.iter().any(|(at, _)| *at <= now);
-                    thread_probe.after_data(waiting);
+                    thread_probe.after_data(data_started);
                 }
                 if done {
                     break;

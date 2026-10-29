@@ -27,6 +27,12 @@ from typing import Any, Sequence
 TEST_LINE = re.compile(r"^test (.*?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
 LIST_LINE = re.compile(r"^(.+?):\s+test\s*$")
 CAPABILITY_TEST = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__")
+
+
+def capability_of(name: str) -> str | None:
+    """libtest 名稱 → 能力名稱（`cap_<cap>__*`）；以最後一段比對，lib 單元測試帶模組路徑者亦適用（P5 第 6 輪）。"""
+    matched = CAPABILITY_TEST.match(name.rsplit("::", 1)[-1])
+    return matched.group(1) if matched else None
 # 與 `git status` 的守門範圍一致：repo 根（本檔上兩層）。
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROVENANCE_SCHEMA = "cargo-l1-provenance.v1"
@@ -282,8 +288,7 @@ def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
             skip_kind = None
         else:
             outcome = "skipped"
-            capability = CAPABILITY_TEST.match(name)
-            skip_kind = "capability" if capability else "other"
+            skip_kind = "capability" if capability_of(name) else "other"
         parsed.append(
             {
                 "nodeid": _nodeid(target, name),
@@ -297,6 +302,33 @@ def _parse_results(text: str, target: TargetRun) -> list[dict[str, Any]]:
             }
         )
     return parsed
+
+
+_FAILURES_HEAD = re.compile(r"^failures:\s*$")
+
+
+def _failures_section(stdout: str) -> str:
+    """libtest stdout 的失敗段（第一個 `failures:` 起到結尾）；沒有即回空字串。"""
+    lines = stdout.splitlines()
+    for index, line in enumerate(lines):
+        if _FAILURES_HEAD.match(line.strip()):
+            return "\n".join(lines[index:]) + "\n"
+    return ""
+
+
+def _keep_failure_output(out_path: Path, target: TargetRun, label: str, rc: int, stdout: str, stderr: str) -> None:
+    """P5 第 7 輪：測試執行失敗（rc≠0）時，把 libtest stdout 的失敗段（panic 訊息）轉印到 stderr（gate log 可見），
+    並把完整 stdout／stderr 存到 `<報告>.failures/<crate>-<target>[-<label>].{stdout,stderr}.txt`。報告內容不變。"""
+    if rc == 0:
+        return
+    tag = f"{target.crate}-{target.target}" + (f"-{label}" if label else "")
+    section = _failures_section(stdout)
+    print(f"cargo_l1_results.py: {tag} 結束碼 {rc}；失敗段：\n{section or '(stdout 無 failures 段)'}", file=sys.stderr, end="")
+    keep = out_path.parent / f"{out_path.name}.failures"
+    keep.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag)
+    (keep / f"{safe}.stdout.txt").write_text(stdout, encoding="utf-8")
+    (keep / f"{safe}.stderr.txt").write_text(stderr, encoding="utf-8")
 
 
 def _read_report(path: str, value: dict[str, Any]) -> None:
@@ -419,23 +451,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             finished = False
         if run_stderr:
             print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
+        _keep_failure_output(out_path, target, "", run_rc, run_stdout, run_stderr)
         target.results = _parse_results(run_stdout, target)
 
-        available_caps = {
-            matched.group(1)
-            for name in target.ignored_names
-            if (matched := CAPABILITY_TEST.match(name)) is not None
-        }
+        available_caps = {cap for name in target.ignored_names if (cap := capability_of(name)) is not None}
         selected_caps = [cap for cap in args.caps if cap in available_caps]
         for cap in selected_caps:
+            # P5 第 7 輪：能力測試以單執行緒執行。同執行檔平行測試 fork 子行程時，子行程在 exec 前暫時持有父行程全部 fd
+            # 的複本（含 CLOEXEC 者），會被其他測試的 /proc holder 掃描看成外部 holder（cap_posix_pty__* 並行間歇 Held）。
             cap_rc, cap_stdout, cap_stderr, cap_complete = _run(
-                runner_argv + ["--ignored", f"cap_{cap}__"], args.timeout
+                runner_argv + ["--ignored", f"cap_{cap}__", "--test-threads=1"], args.timeout
             )
             target.exit_codes.append(cap_rc)
             if not cap_complete:
                 finished = False
             if cap_stderr:
                 print(cap_stderr, file=sys.stderr, end="" if cap_stderr.endswith("\n") else "\n")
+            _keep_failure_output(out_path, target, f"cap_{cap}", cap_rc, cap_stdout, cap_stderr)
             cap_results = _parse_results(cap_stdout, target)
             replaced = {row["nodeid"]: row for row in cap_results}
             target.results = [replaced.get(row["nodeid"], row) for row in target.results]
@@ -497,10 +529,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _read_report(args.out, report)
     if args.summary_out:
         available_caps = {
-            matched.group(1)
-            for target in targets
-            for name in target.ignored_names
-            if (matched := CAPABILITY_TEST.match(name)) is not None
+            cap for target in targets for name in target.ignored_names if (cap := capability_of(name)) is not None
         }
         evidence_insufficient = {
             matched.group(1)

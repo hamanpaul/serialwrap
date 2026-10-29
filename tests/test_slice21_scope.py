@@ -111,10 +111,45 @@ def test_event_latency_contract_values():
     assert lat["gate_rule"] == "every_run_max_le_max_ms"           # p99 只作診斷值
     rows = {r["event"]: r for r in lat["events"]}
     assert set(rows) == EVENTS
-    for r in rows.values():
+    for event, r in rows.items():
         assert {"accept_point", "complete_point", "max_ms_idle", "max_ms_flood", "load", "l1_bound"} <= set(r)
-        assert r["l1_bound"] == "at_most_one_data_item_before_control"
-    assert lat["flood_load"] == {"bytes_per_s": 20000, "seconds": 30, "chunk_bytes": 256}
+        # OD-64（擁有者裁決 (a)，2026-10-29）：drain_receipt 的界限對齊 Python 1:1 排空順序（D,D,D,L,W）；其餘四事件不變。
+        want = OD64_DRAIN_RECEIPT_BOUND if event == "drain_receipt" else "at_most_one_data_item_before_control"
+        assert r["l1_bound"] == want, (event, r["l1_bound"])
+    fl = lat["flood_load"]
+    assert {k: fl[k] for k in ("bytes_per_s", "seconds", "chunk_bytes")} == {"bytes_per_s": 20000, "seconds": 30, "chunk_bytes": 256}
+    # method_revision 2026-10-29.2：stop_request 每樣本（新 daemon）的 flood 暖機秒數須為正值；不得有其他未知欄位
+    assert set(fl) == {"bytes_per_s", "seconds", "chunk_bytes", "stop_warmup_s"} and fl["stop_warmup_s"] > 0
+
+
+OD64_DRAIN_RECEIPT_BOUND = "at_most_pre_dependency_data_plus_one_after_receipt"
+
+
+def test_event_latency_od64_od65_records():
+    """OD-64：drain_receipt 改為「receipt 送出後至多處理同 epoch 於依賴等待前已讀入 mailbox 的 data，再加 1 筆」，
+    契約須附裁決出處、界限文字與承擔的探針測試（依賴等待前筆數的記錄與判定）；OD-65：release_request 維持 250／300 ms，
+    凍結紀錄須註明 Python 基線曾有一輪 255.4 ms。"""
+    rows = {r["event"]: r for r in _limits_doc()["event_latency"]["events"]}
+    dr = rows["drain_receipt"]
+    assert dr["l1_bound"] == OD64_DRAIN_RECEIPT_BOUND and dr.get("owner_decision_ref") == "OD-64"
+    assert "依賴等待前已讀入" in dr.get("l1_bound_rule", "") and "D,D,D,L,W" in dr["l1_bound_rule"]
+    # event_latency 審閱 2 C1：界限明確定義 N_pre、界限式與「＋1」涵蓋的 data。
+    assert set(dr.get("l1_bound_definition") or {}) == {"n_pre", "bound", "counted_in_plus_one", "no_dependency"}
+    assert "同 epoch" in dr["l1_bound_definition"]["n_pre"] and "n_pre + 1" in dr["l1_bound_definition"]["bound"]
+    assert "跨 epoch" in dr["l1_bound_definition"]["counted_in_plus_one"]
+    # 審閱 2 C3：依賴情境的 actor 層 gate（release／shutdown 各一）與探針測試皆在 l1_gate；C4：lane 見證數正向自測。
+    for nid in ("cargo:sw-core::mailbox::stopped_receipt_records_pre_dependency_data",
+                "cargo:sw-core::mailbox::pre_dependency_data_excludes_later_and_other_epoch_data",
+                "cargo:sw-core::mailbox::actor_probe_records_pre_dependency_data_for_drain_receipt",
+                "cargo:sw-core::mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths",
+                "cargo:sw-core::drain_release_e2e::drain_receipt_dependency_wait_on_release_within_od64_bound",
+                "cargo:sw-core::drain_release_e2e::drain_receipt_dependency_wait_on_shutdown_within_od64_bound"):
+        assert nid in dr["l1_gate"], nid
+    rel = rows["release_request"]
+    assert (rel["max_ms_idle"], rel["max_ms_flood"]) == (250, 300)
+    assert "OD-65" in rel.get("freeze_note", "") and "255.4" in rel["freeze_note"]
+    # 審閱 2 C5（L-1）：stop_request 的外部值止於 accept_point。
+    assert "accept_point" in rows["stop_request"].get("external_scope_note", "")
 
 
 def test_event_latency_od45_l1_gate_and_external_split():

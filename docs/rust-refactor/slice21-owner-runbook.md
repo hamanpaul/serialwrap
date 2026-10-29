@@ -228,3 +228,19 @@
 - 命令：`py -3.12 scripts\stage0\spike3_win_wal.py --case win-wal-f12-progress --evidence-dir <dir> --edr-product "<產品>" --edr-status on`，
   並以 Rust daemon 執行 `testpilot run serialwrap_regression --case f12-wal-path-live`。
 - 預期證據：spike3 證據、TestPilot 報告與 WAL 檔。
+
+## 能力集合 section（P5 第 6 輪 SPEC-GAP #2，編排者裁決；P5 第 7 輪）
+
+gate 為 OD-55 的 linux 能力集合各設一個 section（`linux_cap_<cap>`）。gate 先探測能力，具備才實跑；否則記 EVIDENCE_MISSING 並附
+探測證據、所需能力與處置，**不得記 PASS**（judge `CAPABILITY_SECTIONS`；即使 l1 結果全 passed 也一樣，例如
+`cap_sys_admin__tiocexcl_bypass_documented` 在無權限時 early return 仍回 ok）。
+
+| section | 集合 | 所需能力 | 處置 | 可行的實跑方式 |
+|---|---|---|---|---|
+| `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 root 於可丟棄容器（例：`docker run --cap-add SYS_ADMIN`，掛載 repo）跑 gate，或單獨執行 `python3 scripts/rust/cargo_l1_results.py --platform linux --caps sys_admin --out <run>/linux_cap_sys_admin/l1-results.json -- -p sw-pal --features test-fakes` |
+| `linux_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime` | `systemctl --user is-system-running` 為 running／degraded | BLOCKED-OWNER | 於隔離的 systemd 容器（`tools/docker/systemd.Dockerfile`，OD-15）以一般使用者登入 session 跑 gate，或單獨執行 `... --caps supervisor_runtime --out <run>/linux_cap_supervisor_runtime/l1-results.json -- -p sw-pal --features test-fakes`；測試會建立並清除暫時 user unit |
+| `linux_cap_windows_native` | `s21_gate:cap_windows_native` | 原生 Windows | LOCAL-WINDOWS-TODO | linux 列的測試本體需 PowerShell／Job Object，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔 |
+| `linux_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop` | Windows 互動 console | LOCAL-WINDOWS-TODO | 非 Windows 版刻意 panic；同上 |
+
+單獨執行後若要併入 gate 判定，以 `slice21_gate_judge.py record-section --name linux_cap_<cap> --required-set s21_gate:cap_<cap>
+--l1-results <cap>/l1-results.json --exit <rc> --capability-probe "<cap>=available:<證據>"` 寫入該 run 的 section 片段後重新 `assemble`。

@@ -1,0 +1,36 @@
+applied M1
+== run 1
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... FAILED
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... FAILED
+test release_handled_within_one_data_item_under_flood ... FAILED
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 8 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 2
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... FAILED
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... FAILED
+test release_handled_within_one_data_item_under_flood ... FAILED
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 8 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 3
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... FAILED
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... FAILED
+test release_handled_within_one_data_item_under_flood ... FAILED
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 8 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 4
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... FAILED
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... FAILED
+test release_handled_within_one_data_item_under_flood ... FAILED
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 8 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`
+== run 5
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... FAILED
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... FAILED
+test release_handled_within_one_data_item_under_flood ... FAILED
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... FAILED
+test result: FAILED. 8 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`

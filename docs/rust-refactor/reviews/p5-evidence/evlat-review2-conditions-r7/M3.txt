@@ -1,0 +1,6 @@
+applied M3
+== run 1
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... FAILED
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... FAILED
+test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`

@@ -17,12 +17,19 @@ def _vmrss_kib(pid: int) -> int:
     raise AssertionError(f"/proc/{pid}/status 缺少 VmRSS")
 
 
+# CLI `cmd submit` 的參數預設值（sw_core/cli.py `p_cs`）；填佇列的 RPC 與 CLI 送出同一組參數。
+_CLI_SUBMIT_DEFAULTS = {"source": "agent", "mode": "line", "priority": 10, "timeout_s": 10.0}
+
+
 def test_queue_full_backpressure(shell_daemon):
+    # P5 第 7 輪（案例設計修正，編排者裁決允許）：原案以 CLI 逐筆送 300 筆，Python 基線每次 CLI 行程約 0.12～0.18 s，
+    # 256 筆需 33～40 s，超過前景 sleep 30，佇列在填滿前即開始消化而恆不回 SESSION_QUEUE_FULL（送出速率前提錯，
+    # 非 daemon 行為）。改以 command.submit RPC（與 CLI 同參數）在前景執行期間填佇列，再以 CLI 驗證溢位回應。
     fg = shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", "sleep 30", "--cmd-timeout", "60")
     accepted = [fg["cmd_id"]]
     full: list[dict] = []
     for i in range(300):
-        r = shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", f"echo p{i}")
+        r = shell_daemon.rpc("command.submit", {"selector": "COM0", "cmd": f"echo p{i}", **_CLI_SUBMIT_DEFAULTS})
         if r.get("error_code") == "SESSION_QUEUE_FULL":
             full.append(r)
         elif "cmd_id" in r:
@@ -30,6 +37,9 @@ def test_queue_full_backpressure(shell_daemon):
     assert full, "前景 sleep 30 期間連送 300 筆，至少一筆應回 SESSION_QUEUE_FULL"
     assert full[0]["pending"] == 256
     assert full[0]["limit"] == 256
+    over = shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", "echo over")   # CLI 層的溢位回應
+    assert over.get("error_code") == "SESSION_QUEUE_FULL", over
+    assert over["pending"] == 256 and over["limit"] == 256
     for cid in accepted:
         shell_daemon.sw("cmd", "cancel", "--cmd-id", cid)
     ok = shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", "echo ok")
