@@ -1029,14 +1029,19 @@ class TestManagerAttach:
         finally:
             sp._set_holder_unknown(device, False)
 
+    _PYSERIAL_OPEN_ERRORS = [
+        ("could not open port 'COM3': PermissionError(13, 'Access is denied.', None, 5)", ("held", 5)),
+        ("could not open port 'COM3': OSError(22, 'The semaphore timeout period has expired.', None, 121)", ("other", 121)),
+        ("could not open port 'COM9': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)", ("not_found", 2)),
+        ("garbage", ("other", None)),
+    ]
+
+    # OD-67（擁有者裁決）／P5 第 6 輪 SPEC-GAP #3：明確 ids，沿用 pytest 9.0.3 的自動 id 形式（`<msg>-expected<i>`；pytest 9.2
+    # 起過長字串改以 `msg2` 呈現）；已凍結的 nodeid 全數不變（舊 id → 新 id 為恆等），無須移除。
     @pytest.mark.parametrize(
         "msg,expected",
-        [
-            ("could not open port 'COM3': PermissionError(13, 'Access is denied.', None, 5)", ("held", 5)),
-            ("could not open port 'COM3': OSError(22, 'The semaphore timeout period has expired.', None, 121)", ("other", 121)),
-            ("could not open port 'COM9': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)", ("not_found", 2)),
-            ("garbage", ("other", None)),
-        ],
+        _PYSERIAL_OPEN_ERRORS,
+        ids=[f"{msg}-expected{i}" for i, (msg, _) in enumerate(_PYSERIAL_OPEN_ERRORS)],
     )
     def test_classify_pyserial_open_error(self, msg, expected):
         assert sp.classify_pyserial_open_error(msg) == expected
