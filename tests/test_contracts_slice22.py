@@ -46,9 +46,9 @@ def test_sc30_reserved_for_p7() -> None:
     rows = _changes()
     ids = {i for i in rows if i.startswith("SC-")}
     # SC-34／SC-35 由 P1-OC 登記；SC-36 由 P4 Task 19 登記（OD-15）；SC-37 由 P5 依 OD-21 登記（merge afebff0）；
-    # SC-08 依 OD-14 #3 撤回（編號不重用）。
+    # SC-39 由主線依 OD-48 登記（merge 733381e6）；SC-08 依 OD-14 #3 撤回（編號不重用）。
     # P7 Task 0（08 §0.5）登記 SC-30 後：保留號確實由 P7 取用（phases 只有 P7），P6 未搶號。
-    assert ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36", "SC-37"}) - {"SC-08"}
+    assert ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36", "SC-37", "SC-39"}) - {"SC-08"}
     assert rows["SC-30"]["phases"] == ["P7"]
     assert rows["SC-30"]["scope"] == "rust_only"
 
