@@ -347,6 +347,56 @@ fn attach_interactive_owner_false_when_fg_busy() {
     assert_eq!(s(&resp, "interactive_session_id").len(), 32, "lease 仍開");
 }
 
+/// 07 Task 10 `attach_interactive_owner_false_during_replay_hold`（R2-F4，D-22(2)）的可達等價案例
+/// （rulings/p6.md round4-cont OWNER-BATCH #6；CHG-S22-REPLAYHOLD-01）：原前置「回放 hold 存在、前景已清、attach 會開
+/// lease」在產生回放的 console 自己持 lease 時不可達。改由該 console 的 human lease 在前景命令期間以
+/// `session.interactive_close` 關閉（console 仍掛著、其 deferred 輸入保留；human 之間的 owner 變更不撤銷回放，D-22(5)），
+/// 命令結束後回放以 `PauseBeforeSubmit` 停在 OS 提交前——此時 hold 存在、`foreground` 已清、無 lease。第二個 console
+/// attach：回 `"interactive_owner":false`、lease 仍開（owner 進 pending）；`release_pause()` 且回放結算後
+/// `foreground_busy==false`，回放的按鍵恰寫出一次。
+#[test]
+fn attach_interactive_owner_false_during_replay_hold() {
+    use sw_pal::fakes::serial::FakeWriteStep;
+    let r = ServiceRig::with_console_backend("pty");
+    let a1 = attach(&r, r#"{"selector":"COM0"}"#);
+    let l1 = s(&a1, "interactive_session_id");
+    let (_, io1) = r.console.as_ref().unwrap().created()[1].clone();
+    let dev = r.device(REAL_A);
+    let sub = r.call("command.submit", r#"{"selector":"COM0","cmd":"sleep 99","timeout_s":30}"#);
+    let cmd_id = s(&sub, "cmd_id");
+    wait_for("前景命令開始執行", || {
+        let g = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        matches!(g.get("command"), Some(PyValue::Dict(c)) if s(c, "status") == "running")
+    });
+    let _ = dev.take_tx();
+    io1.push_input(b"k");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!dev.take_tx().contains(&b'k'), "前景命令期間 human 按鍵 defer");
+    let close = r.call("session.interactive_close", &format!(r#"{{"interactive_id":"{l1}"}}"#));
+    assert_eq!(close.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&close));
+    dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    dev.push_rx(b"sleep 99\r\nroot@t:/# ");
+    assert!(dev.wait_paused(Duration::from_secs(10)), "命令結束後回放停在 OS 提交前");
+    let st = r.call("session.get_state", r#"{"selector":"COM0"}"#);
+    let sess = match st.get("session") { Some(PyValue::Dict(d)) => d.clone(), _ => st.clone() };
+    assert_eq!(sess.get("foreground_busy"), Some(&PyValue::Bool(true)), "回放 hold 期間前景忙：{}", j(&st));
+    assert_eq!(sess.get("interactive_session_id"), Some(&PyValue::Null), "hold 期間無 lease：{}", j(&st));
+    let a2 = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_eq!(a2.get("interactive_owner"), Some(&PyValue::Bool(false)), "{}", j(&a2));
+    assert_eq!(s(&a2, "interactive_session_id").len(), 32, "lease 仍開（owner 進 pending）：{}", j(&a2));
+    dev.release_pause();
+    let mut seen = Vec::new();
+    wait_for("回放結算後前景空閒", || {
+        seen.extend(dev.take_tx());
+        let st = r.call("session.get_state", r#"{"selector":"COM0"}"#);
+        let sess = match st.get("session") { Some(PyValue::Dict(d)) => d.clone(), _ => st };
+        sess.get("foreground_busy") == Some(&PyValue::Bool(false))
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    seen.extend(dev.take_tx());
+    assert_eq!(seen.iter().filter(|b| **b == b'k').count(), 1, "回放的按鍵恰寫出一次：{seen:?}");
+}
+
 #[test]
 fn detach_unknown_client_still_closes_own_lease() {
     let r = ServiceRig::with_console_backend("pty");

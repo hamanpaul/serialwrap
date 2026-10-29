@@ -11397,6 +11397,7 @@
           "cargo:sw-core::wal_writer::rotate_before_write_at_threshold_utc_suffix",
           "cargo:sw-daemon::deferred_methods::deferred_methods_excludes_delivered_slices",
           "cargo:sw-daemon::deferred_methods::deferred_methods_only_reads_deferred_section",
+          "cargo:sw-daemon::rpc_console::attach_interactive_owner_false_during_replay_hold",
           "cargo:sw-daemon::rpc_console::attach_interactive_owner_false_when_fg_busy",
           "cargo:sw-daemon::rpc_console::attach_invalid_args",
           "cargo:sw-daemon::rpc_console::attach_label_coerced",
