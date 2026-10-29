@@ -359,6 +359,34 @@ def test_rollback_success_path_requires_old_daemon_and_config():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_systemd_system_mode_required_checks_cover_legacy_direct_setup():
+    """OD-48 SPEC-GAP #10：systemd-system 只驗「0.3.2 daemon 執行中直接 setup」成功路徑，另立必要檢查集合；
+    完整流程（rollback／降級／重新升級）的必要集合不變。"""
+    required = uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM
+    for cid in ("old_install_0_3_2", "legacy_handoff_direct_setup", "upgrade_with_old_daemon_running",
+                "entries_replaced", "config_preserved_upgrade", "new_daemon_started", "supervision_reconciled",
+                "doctor_green_new", "no_two_reader"):
+        assert cid in required, cid
+    assert set(required) <= set(uc.REQUIRED_CHECKS)
+    assert "rollback_command" not in required and "downgrade_manual" not in required
+    rows = [{"id": cid, "verdict": "PASS"} for cid in required]
+    assert uc.overall_verdict(rows, required=required) == "PASS"
+    assert uc.overall_verdict(rows, required=uc.REQUIRED_CHECKS) == "INSUFFICIENT"
+    missing = [r for r in rows if r["id"] != "legacy_handoff_direct_setup"]
+    assert uc.overall_verdict(missing, required=required) == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_image_grants_swtest_sudo_for_system_mode():
+    """systemd-system 模式以 swtest 執行 `setup --system --with-sudo`，映像需提供免密碼 sudo。"""
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert " sudo " in text
+    assert "swtest ALL=(ALL) NOPASSWD: ALL" in text
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_upgrade_image_pins_same_base_as_systemd_image():
     """升級容器與 OD-16 (5) systemd 容器使用同一個 ubuntu:24.04 digest，且不放 repo 內容、不連網安裝依賴。"""
     def base(path: Path) -> str:
@@ -395,6 +423,22 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     for mode in ("systemd-user", "on-demand"):
         assert f"--mode {mode}" in out, out
     assert "/dev/ttyUSB" not in out and "--device" not in out
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_systemd_system_mode_is_explicit_only(tmp_path):
+    """OD-48 SPEC-GAP #10：systemd-system 只能明確指定；預設（all）仍是 systemd-user 與 on-demand 兩種。"""
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--mode", "systemd-system", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--mode systemd-system" in r.stdout and "--mode systemd-user" not in r.stdout
+    assert "--network none" in r.stdout
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--out", str(tmp_path / "ev2")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--mode systemd-system" not in r.stdout
 
 
 @pytest.mark.core_portable

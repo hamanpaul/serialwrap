@@ -33,6 +33,24 @@ REQUIRED_CHECKS: tuple[str, ...] = (
     "no_two_reader",
 )
 
+# OD-48 SPEC-GAP #10：systemd-system 只驗「0.3.2 daemon 執行中直接 setup」成功路徑（rollback、手動降級與重新升級
+# 屬完整流程，只在 systemd-user／on-demand 跑），必要檢查為完整集合的子集。
+REQUIRED_CHECKS_SYSTEMD_SYSTEM: tuple[str, ...] = (
+    "old_install_0_3_2",
+    "seed_user_data",
+    "doctor_green_old",
+    "upgrade_with_old_daemon_running",
+    "legacy_handoff_direct_setup",
+    "upgrade_after_stop",
+    "entries_replaced",
+    "config_preserved_upgrade",
+    "new_daemon_started",
+    "supervision_reconciled",
+    "state_compatible_upgrade",
+    "doctor_green_new",
+    "no_two_reader",
+)
+
 # 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
 ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
 
@@ -310,11 +328,11 @@ def judge_rollback_success(check_id: str, *, cli_version: str | None, daemon_ver
     return row(check_id, "PASS" if ok else "FAIL", None if ok else f"setup --rollback 未完整回到 {old_version}", **detail)
 
 
-def overall_verdict(rows: list[dict[str, Any]]) -> str:
+def overall_verdict(rows: list[dict[str, Any]], required: tuple[str, ...] = REQUIRED_CHECKS) -> str:
     """任一 FAIL 或檢查 id 重複 → FAIL；缺必要檢查或任一 INSUFFICIENT → INSUFFICIENT；否則 PASS。"""
     ids = [r.get("id") for r in rows]
     if len(ids) != len(set(ids)) or any(r.get("verdict") == "FAIL" for r in rows):
         return "FAIL"
-    if set(REQUIRED_CHECKS) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
+    if set(required) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
         return "INSUFFICIENT"
     return "PASS"

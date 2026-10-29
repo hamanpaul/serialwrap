@@ -21,7 +21,8 @@ while (($#)); do
         --mode)
             (($# >= 2)) || { echo "--mode 需要參數" >&2; exit 2; }
             case "$2" in
-                systemd-user|on-demand) MODES=("$2") ;;
+                # systemd-system（OD-48 SPEC-GAP #10）只驗直接 setup 成功路徑，須明確指定，不屬 all。
+                systemd-user|on-demand|systemd-system) MODES=("$2") ;;
                 all) MODES=(systemd-user on-demand) ;;
                 *) echo "不支援的模式：$2" >&2; exit 2 ;;
             esac
@@ -32,7 +33,7 @@ while (($#)); do
         --bundle) (($# >= 2)) || { echo "--bundle 需要目錄" >&2; exit 2; }; BUNDLE="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help)
-            echo "用法：$0 [--mode systemd-user|on-demand|all] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
+            echo "用法：$0 [--mode systemd-user|on-demand|systemd-system|all] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
             exit 0
             ;;
         *) echo "不支援的參數：$1" >&2; exit 2 ;;
