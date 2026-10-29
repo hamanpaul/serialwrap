@@ -35,7 +35,11 @@ parity:
 # OD-55（2026-10-29）：s21_core.linux 的 cap_posix_pty__* 移入 s21_gate:cap_posix_pty（selector `--ignored cap_posix_pty__`），
 #   由 linux_cap_posix_pty section（cargo_l1_results.py --caps posix_pty）實跑承擔。其餘 linux 能力集合
 #   s21_gate:cap_{sys_admin,windows_native,interactive_desktop,supervisor_runtime} 需 CAP_SYS_ADMIN／原生 Windows／
-#   互動桌面／systemd 監管執行期，雲端 gate 無對應 section（SPEC-GAP；BLOCKED-OWNER／LOCAL-WINDOWS-TODO）。
+#   互動桌面／systemd 監管執行期；P5 第 6 輪 SPEC-GAP #2（編排者裁決）起各有一個 section（linux_cap_<cap>），gate 先探測能力，
+#   具備才以 --caps <cap> 實跑，否則記 EVIDENCE_MISSING 並標所需能力（sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；
+#   windows_native／interactive_desktop → LOCAL-WINDOWS-TODO），不得記 PASS（judge CAPABILITY_SECTIONS）。
+# SPEC-GAP #1（編排者裁決）：s21_gate:py_parity（凍結，selector 只有 1 筆）不改不刪、仍由 pytest_full 承擔；新集合
+#   s21_gate:py_parity_full（完整 selector＝舊集合全部 nodeid）由 py_parity section 以其 selector 實跑。
 #   s21_core.windows 的能力列待 Windows 原生收集登記 s21_gate:cap_<cap>.windows 後才移除（LOCAL-WINDOWS-TODO）。
 additional_required_sets:
   pytest_full: ["s21_gate:py_parity"]
@@ -46,6 +50,14 @@ sections:
      command: "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_l1/l1-results.json -- --workspace --features test-fakes -- --skip cap_"}
   - {name: linux_cap_posix_pty, kind: test, platform: linux, required_set: "s21_gate:linux_cap_posix_pty",
      command: "python3 scripts/rust/cargo_l1_results.py --platform linux --caps posix_pty --out <run>/linux_cap_posix_pty/l1-results.json -- -p sw-pal --features test-fakes"}
+  - {name: linux_cap_sys_admin, kind: test, platform: linux, required_set: "s21_gate:cap_sys_admin",
+     command: "能力探測（euid 0 且 CapEff 含 CAP_SYS_ADMIN）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --caps sys_admin --out <run>/linux_cap_sys_admin/l1-results.json -- -p sw-pal --features test-fakes"}
+  - {name: linux_cap_windows_native, kind: test, platform: linux, required_set: "s21_gate:cap_windows_native",
+     command: "linux 主機恆不具備（原生 Windows）：記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
+  - {name: linux_cap_interactive_desktop, kind: test, platform: linux, required_set: "s21_gate:cap_interactive_desktop",
+     command: "linux 主機恆不具備（Windows 互動 console）：記 EVIDENCE_MISSING（LOCAL-WINDOWS-TODO）"}
+  - {name: linux_cap_supervisor_runtime, kind: test, platform: linux, required_set: "s21_gate:cap_supervisor_runtime",
+     command: "能力探測（systemctl --user is-system-running 為 running／degraded）通過時：python3 scripts/rust/cargo_l1_results.py --platform linux --caps supervisor_runtime --out <run>/linux_cap_supervisor_runtime/l1-results.json -- -p sw-pal --features test-fakes"}
   - {name: windows_native_l1, kind: test, platform: windows, required_set: s21_core,
      command: "scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon"}
   - {name: windows_cap_windows_com, kind: test, platform: windows, required_set: "s21_gate:windows_cap_windows_com",
@@ -62,6 +74,8 @@ sections:
      command: "cargo run --release -p sw-core --example wal_s1w -- --out <run>/wal_s1w_perf/wal_s1w.json",
      note: "門檻逐字取規格 §1.2（Linux p50≤0.005／p95≤0.01／p99≤0.02 ms、rotate≤3 ms）；Windows 原生與 EDR 下正式量測屬 BO-S21-14"}
   - {name: case_uptake, kind: non_test, required_set: null, command: "slice_breaker.acceptance_rate（Task 0b）"}
+  - {name: py_parity, kind: test, platform: linux, required_set: "s21_gate:py_parity_full",
+     command: "SW_RESOURCE_REPORT=<run>/py_parity/l1-results.json python3 -m pytest <s21_gate:py_parity_full selector.argv>"}
   - {name: pytest_full, kind: test, platform: linux, required_set: "s21_gate:pytest_full",
      command: "SW_RESOURCE_REPORT=<run>/pytest_full/resource-report.json python3 -m pytest -q tests/ --junitxml=<run>/pytest_full/junit.xml"}
   - {name: policy_check, kind: non_test, required_set: null, command: "python3 -m policy_check --repo ."}

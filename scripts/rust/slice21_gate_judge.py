@@ -51,6 +51,36 @@ TEST_SECTIONS: dict[str, str] = {
     "blackbox_rust": "linux",
     "existing_suites_rust": "linux",
     "pytest_full": "linux",
+    # P5 第 6 輪 SPEC-GAP #2（編排者裁決，第 7 輪）：OD-55 linux 能力集合各一個 section（--caps <cap> 實跑）。
+    "linux_cap_sys_admin": "linux",
+    "linux_cap_windows_native": "linux",
+    "linux_cap_interactive_desktop": "linux",
+    "linux_cap_supervisor_runtime": "linux",
+    # P5 第 6 輪 SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合 s21_gate:py_parity_full 判定；
+    # 舊集合 s21_gate:py_parity 不改不刪、仍由 pytest_full 承擔（兩者皆由 gate 執行）。
+    "py_parity": "linux",
+}
+# SPEC-GAP #2：能力集合 section 須附 gate 的能力探測（`capability_probe`：{cap, available, evidence}）且 available 為 true
+# 才可依 l1 結果判定；否則一律 EVIDENCE_MISSING 並標所需能力、處置與實跑方式（不得記 PASS——例如 cap_sys_admin 測試在
+# 無權限時 early return 仍回 ok）。
+CAPABILITY_SECTIONS: dict[str, dict[str, str]] = {
+    "linux_cap_sys_admin": {
+        "cap": "sys_admin", "needs": "root（euid 0）且具 CAP_SYS_ADMIN", "disposition": "BLOCKED-OWNER",
+        "how_to_run": "以 root 於可丟棄容器（例：docker run --cap-add SYS_ADMIN，掛載 repo）執行 "
+                      "python3 scripts/rust/cargo_l1_results.py --platform linux --caps sys_admin "
+                      "--out <run>/linux_cap_sys_admin/l1-results.json -- -p sw-pal --features test-fakes"},
+    "linux_cap_supervisor_runtime": {
+        "cap": "supervisor_runtime", "needs": "運作中的 systemd user 執行期（systemctl --user is-system-running 為 running／degraded）",
+        "disposition": "BLOCKED-OWNER",
+        "how_to_run": "於隔離的 systemd 容器（tools/docker/systemd.Dockerfile，OD-15）以一般使用者登入 session 執行 "
+                      "python3 scripts/rust/cargo_l1_results.py --platform linux --caps supervisor_runtime "
+                      "--out <run>/linux_cap_supervisor_runtime/l1-results.json -- -p sw-pal --features test-fakes"},
+    "linux_cap_windows_native": {
+        "cap": "windows_native", "needs": "原生 Windows（PowerShell、Job Object、PE Subsystem）", "disposition": "LOCAL-WINDOWS-TODO",
+        "how_to_run": "linux 列的測試本體需原生 Windows，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔（OWNER-BATCH）"},
+    "linux_cap_interactive_desktop": {
+        "cap": "interactive_desktop", "needs": "Windows 互動 console（非 Windows 版刻意 panic）", "disposition": "LOCAL-WINDOWS-TODO",
+        "how_to_run": "linux 列的測試本體需 Windows 互動 console，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔（OWNER-BATCH）"},
 }
 # F108：須以非 root 執行的測試類 section（section 片段 `run_euid` 須為非 0 整數）。
 NON_ROOT_SECTIONS: frozenset[str] = frozenset({"linux_l1"})
@@ -58,9 +88,10 @@ NON_TEST_SECTIONS: tuple[str, ...] = (
     "l15_ab", "event_latency", "wal_s1w_perf", "cfg_boundary", "policy_check", "case_uptake",
 )
 SECTION_ORDER: tuple[str, ...] = (
-    "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "windows_native_l1", "windows_cap_windows_com",
+    "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin", "linux_cap_windows_native",
+    "linux_cap_interactive_desktop", "linux_cap_supervisor_runtime", "windows_native_l1", "windows_cap_windows_com",
     "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency", "wal_s1w_perf",
-    "case_uptake", "pytest_full", "policy_check",
+    "case_uptake", "py_parity", "pytest_full", "policy_check",
 )
 # 計畫判定規則：只有此 section 可在 EVIDENCE_MISSING 下不阻擋（不接受報告自行宣告的豁免）。
 ALLOWED_MISSING: dict[str, str] = {"windows_cap_windows_com": "BO-S21-01"}
@@ -751,6 +782,18 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         elif name in TEST_SECTIONS:
             pool: set[str] = set()
             status, l1v, reasons = _judge_test_section(sec, expect, TEST_SECTIONS[name], pool)
+            cap_cfg = CAPABILITY_SECTIONS.get(name)
+            if cap_cfg is not None:
+                # SPEC-GAP #2：無能力探測、探測為不可用或能力不符 → EVIDENCE_MISSING（不得 PASS，也不因缺能力的失敗記 FAIL）。
+                probe = sec.get("capability_probe")
+                ok = (isinstance(probe, Mapping) and probe.get("cap") == cap_cfg["cap"] and probe.get("available") is True)
+                if not ok:
+                    ev = probe.get("evidence") if isinstance(probe, Mapping) else None
+                    status = "EVIDENCE_MISSING"
+                    reasons = [f"{name} 需能力 cap_{cap_cfg['cap']}：{cap_cfg['needs']}（{cap_cfg['disposition']}）；"
+                               f"能力探測 {probe!r}" + (f"（{ev}）" if ev else ""),
+                               f"實跑方式：{cap_cfg['how_to_run']}"] + [r for r in reasons if r]
+                    pool = set()
             if name in NON_ROOT_SECTIONS:
                 # F108（編排者裁決）：須以非 root 執行；euid==0 或未記錄時不得 PASS，也不得因 root 專屬失敗記 FAIL 了事。
                 euid = sec.get("run_euid")
@@ -892,6 +935,11 @@ def cmd_record_section(args: argparse.Namespace) -> int:
         frag["evidence"] = args.evidence
     if args.run_euid not in (None, ""):
         frag["run_euid"] = int(args.run_euid)
+    if args.capability_probe:
+        # SPEC-GAP #2：`<cap>=available:<evidence>` 或 `<cap>=unavailable:<evidence>`
+        cap, _, rest = args.capability_probe.partition("=")
+        state, _, evidence = rest.partition(":")
+        frag["capability_probe"] = {"cap": cap, "available": state == "available", "evidence": evidence}
     if args.extra_check:
         checks = []
         for item in args.extra_check:
@@ -1173,6 +1221,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     r.add_argument("--reason", action="append", default=[])
     r.add_argument("--evidence", default=None)
     r.add_argument("--run-euid", default=None, help="執行該 section 測試的 euid（F108：linux_l1 須非 0）")
+    r.add_argument("--capability-probe", default=None,
+                   help="能力集合 section 的能力探測（SPEC-GAP #2）：<cap>=available:<證據> 或 <cap>=unavailable:<證據>")
     r.add_argument("--extra-check", action="append", default=[], help="<名稱>=<exit>，可重複")
     a = sub.add_parser("assemble")
     a.add_argument("--run-dir", required=True)

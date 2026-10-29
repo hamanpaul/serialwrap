@@ -11678,6 +11678,74 @@
         }
       }
     },
+    "s21_gate:py_parity_full": {
+      "linux": {
+        "nodeids": [
+          "tests/test_daemon_lock.py::test_no_profiles_loaded_stderr_and_continue_posix",
+          "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]",
+          "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]",
+          "tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices",
+          "tests/test_session_bind.py::TestSessionBind::test_bind_empty_device_by_id_is_invalid_args",
+          "tests/test_stage0_session_drain.py::test_clear_during_shutdown_raises_daemon_stopping",
+          "tests/test_stage0_session_drain.py::test_device_attach_during_shutdown_raises_daemon_stopping",
+          "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain",
+          "tests/test_stage0_session_drain.py::test_release_persist_failure_retried",
+          "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[int]",
+          "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[list-int]",
+          "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[none]",
+          "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[str]",
+          "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[unhashable-key]",
+          "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[int]",
+          "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[list]",
+          "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[null]",
+          "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[str]"
+        ],
+        "selector": {
+          "argv": [
+            "-q",
+            "tests/test_daemon_lock.py::test_no_profiles_loaded_stderr_and_continue_posix",
+            "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]",
+            "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]",
+            "tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices",
+            "tests/test_session_bind.py::TestSessionBind::test_bind_empty_device_by_id_is_invalid_args",
+            "tests/test_stage0_session_drain.py::test_clear_during_shutdown_raises_daemon_stopping",
+            "tests/test_stage0_session_drain.py::test_device_attach_during_shutdown_raises_daemon_stopping",
+            "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain",
+            "tests/test_stage0_session_drain.py::test_release_persist_failure_retried",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[int]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[list-int]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[none]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[str]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[unhashable-key]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[int]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[list]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[null]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[str]"
+          ],
+          "markexpr": "",
+          "paths": [
+            "tests/test_daemon_lock.py::test_no_profiles_loaded_stderr_and_continue_posix",
+            "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGINT]",
+            "tests/test_daemon_lock.py::test_sigterm_orderly_shutdown_posix[SIGTERM]",
+            "tests/test_multi_open_detect.py::TestDaemonStatusMultiOpen::test_health_status_warnings_no_profiles_no_devices",
+            "tests/test_session_bind.py::TestSessionBind::test_bind_empty_device_by_id_is_invalid_args",
+            "tests/test_stage0_session_drain.py::test_clear_during_shutdown_raises_daemon_stopping",
+            "tests/test_stage0_session_drain.py::test_device_attach_during_shutdown_raises_daemon_stopping",
+            "tests/test_stage0_session_drain.py::test_dynamic_attach_skipped_during_shutdown_or_drain",
+            "tests/test_stage0_session_drain.py::test_release_persist_failure_retried",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[int]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[list-int]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[none]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[str]",
+            "tests/test_state_persistence_atomic.py::test_load_state_alias_row_not_dict_raises_uncaught[unhashable-key]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[int]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[list]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[null]",
+            "tests/test_state_persistence_atomic.py::test_load_state_non_dict_json_not_backed_up[str]"
+          ]
+        }
+      }
+    },
     "s21_gate:pytest_full": {
       "linux": {
         "nodeids": [
@@ -15438,6 +15506,7 @@
           "tests/test_rust_cfg_boundary_bypass.py::test_cargo_toml_bypass[[package]\\nname = \"sw-core\"\\nversion = \"0.0.0\"\\n\"build\" = \"tools/build.rs\"\\n-build-script]",
           "tests/test_rust_cfg_boundary_bypass.py::test_cargo_toml_bypass[[package]\\nname = \"sw-core\"\\nversion = \"0.0.0\"\\n[build-dependencies.cc]\\nversion = \"1\"\\n-build-script]",
           "tests/test_rust_cfg_boundary_bypass.py::test_cargo_toml_bypass[[package]\\nname = \"sw-core\"\\nversion = \"0.0.0\"\\n[target.'cfg(unix)'.build-dependencies]\\ncc = \"1\"\\n-build-script]",
+          "tests/test_rust_cfg_boundary_bypass.py::test_cargo_toml_bypass[[package]\\nname = \"sw-core\"\\nversion = \"0.0.0\"\\n[target.x86_64-pc-windows-gnu.dependencies]\\nfoo = { path = \"../foo\" }\\n-target-section]",
           "tests/test_rust_cfg_boundary_bypass.py::test_detects_bypass[# [cfg(unix)]\\nfn a() {}\\n-cfg-predicate]",
           "tests/test_rust_cfg_boundary_bypass.py::test_detects_bypass[#[ cfg ( unix ) ]\\nfn a() {}\\n-cfg-predicate]",
           "tests/test_rust_cfg_boundary_bypass.py::test_detects_bypass[#[cfg_attr(not(test), cfg(unix))]\\nfn a() {}\\n-cfg-predicate]",
