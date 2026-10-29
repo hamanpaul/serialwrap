@@ -3573,6 +3573,15 @@ class SessionManager:
             current = self.get_session(selector)
             if current is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if current.released_placeholder:
+                # OD-63：佔位只能經 device attach 解除後交 template 偵測；比照 attach_session 的
+                # RELEASED 早退，不解除阻擋、不寫 override、不取消在途 attach、不 spawn。
+                return {
+                    "ok": True,
+                    "released": True,
+                    "recommended_action": "device_attach",
+                    "session": current.to_public_dict(),
+                }
             old_by_id = current.profile.device_by_id
             pending_attach = (
                 self._active_attach_ops.get(old_by_id or "")
@@ -4038,6 +4047,7 @@ class SessionManager:
                         and by_id not in self._draining_by_ids
                         and by_id in self._devices
                         and session is not None
+                        and not session.released_placeholder
                         and session.bridge is None
                         and session.state == "ATTACHING"
                     )
@@ -4751,6 +4761,8 @@ class SessionManager:
             preopened_op = self._preopened_ports.pop(by_id, None)
             if preopened_op is not None:
                 self._active_attach_ops[by_id] = preopened_op
+            # OD-63 防線：佔位 session 一律不建 bridge（只能經 device attach 交 template 偵測）。
+            placeholder_blocked = session is not None and session.released_placeholder
             if session is None and not dynamic_only:
                 candidates = sorted(
                     [s for s in self._sessions.values() if s.state == "DETACHED" and s.profile.device_by_id not in self._devices],
@@ -4773,6 +4785,11 @@ class SessionManager:
                     dynamic_created = True
         if save_needed:
             self._save_state()
+
+        if placeholder_blocked:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
 
         # --- 動態偵測路徑 ---
         if dynamic_created:
