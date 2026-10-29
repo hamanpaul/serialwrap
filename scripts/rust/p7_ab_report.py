@@ -94,6 +94,18 @@ def _rel(p: Path | None) -> str | None:
     return "$EXTERNAL/" + str(q).lstrip("/")
 
 
+def _run_dir_label(p: Path | None) -> str | None:
+    """表頭的 run_dir 本身：repo 內 → repo 相對；repo 外 → `$EXTERNAL/<完整路徑>`（不經 `$RUN_DIR` 規則，否則恆為
+    `$RUN_DIR/.`，無法還原基準；審查 P7-7bb9cfd-1 第三輪）。"""
+    if p is None:
+        return None
+    q = Path(p).resolve()
+    try:
+        return str(q.relative_to(ROOT))
+    except ValueError:
+        return "$EXTERNAL/" + str(q).lstrip("/")
+
+
 def load_cases(cases_yaml: Path) -> list[dict]:
     data = yaml.safe_load(cases_yaml.read_text(encoding="utf-8"))
     out = []
@@ -275,7 +287,7 @@ def build(args) -> tuple[str, int]:
         f"- rust_cli_sha256: `{_sha256_file(args.rust_cli)}`",
         f"- rust_daemon_sha256: `{_sha256_file(args.rust_daemon)}`",
         f"- platform: `{_platform.system().lower()}`；transport: `faketarget_pty`",
-        f"- run_dir: `{_rel(args.run_dir) if args.run_dir else None}`",
+        f"- run_dir: `{_run_dir_label(args.run_dir)}`（`$RUN_DIR/…` 證據路徑的基準）",
         f"- l1_lock_sha256: `{_sha256_file(args.l1_lock)}`（凍結必要集合 {SET_A}、{SET_B}）",
         f"- evidence A: `{_rel(args.junit_a)}` sha256 `{_sha256_file(args.junit_a)}`",
         f"- evidence B: `{_rel(args.junit_b)}` sha256 `{_sha256_file(args.junit_b)}`",

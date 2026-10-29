@@ -101,8 +101,9 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     """登入進行中 `device release`：回成功的當下 daemon 已無指向該 tty 的 fd；`device attach` 之前不重開；
     `session recover --force` 的 REATTACH 任何時刻至多持有一個 fd（舊 fd 關閉後才重開）。
 
-    註：Python 基線（2026-10-29 實測）於本情境 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError`
-    且不再自動重試，Rust 則回到 READY；此 A/B 差異已列 OWNER-BATCH，本案只斷言 §11.3-4 的 handle 時序。"""
+    DF-23（OD-57，2026-10-29）：Python 基線於本情境 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError`
+    且不再自動重試（擁有者視為 Python 缺陷），Rust 回到 READY；收斂結果依 DF-23 分別判定（`ab_participation: diff`），
+    §11.3-4 的 handle 時序兩邊同斷言。"""
     tgt = FakeTarget(tmp_path / "t0", delay_ms=1500)       # 每個回應延遲 1.5 s：login 進行中可插入 release
     p7.start("shell", [tgt])
     deadline = time.monotonic() + 20.0
@@ -124,6 +125,19 @@ def test_release_during_login_waits_for_handle_close(p7, tmp_path):
     while _daemon_fds_to(p7, slave) == 0:
         assert time.monotonic() < deadline, "device attach 後應重新開啟 tty"
         time.sleep(0.05)
+    # DF-23：attach 之後的收斂結果（Rust 回 READY；Python 落 DETACHED＋ATTACH_FAILED:TxIncompleteError 且不自動重試）
+    if is_rust():
+        s = wait_state(p7.env, "COM0", "READY", timeout_s=60.0)
+        assert s["last_error"] is None, s
+    else:
+        s = wait_state(p7.env, "COM0", "DETACHED", timeout_s=60.0)
+        assert str(s["last_error"]).startswith("ATTACH_FAILED:TxIncompleteError"), s
+        t_end = time.monotonic() + 10.0
+        while time.monotonic() < t_end:                     # 不自動重試：維持 DETACHED
+            _, j = p7.cli("session", "list")
+            row = [x for x in (j or {}).get("sessions", []) if x["com"] == "COM0"][0]
+            assert row["state"] == "DETACHED", row
+            time.sleep(0.5)
 
     # REATTACH：另一個 rig（READY 起手），RX 凍結下 recover --force，取樣 daemon 對 tty 的 fd 數峰值。
     rig = P7Rig(tmp_path / "p7-reattach")

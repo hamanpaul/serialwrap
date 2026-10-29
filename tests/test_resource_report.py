@@ -1101,7 +1101,8 @@ def test_workflow_ci_l1_gates() -> None:
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
-    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組與 OD-24 的 5 筆 #[ignore] 列
+    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組、OD-24 的 5 筆 #[ignore] 列與
+    # OD-56 的 2 筆 s21_core.linux 替換
     # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
     allowed_removals = (
         "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
@@ -1654,6 +1655,9 @@ def test_workflow_ci_l1_gates() -> None:
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
         "s1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
+        # OD-56（2026-10-29，rulings/p7.md P7-BO-1）：s21_core.linux 兩個語意已變的舊 nodeid（只限這兩名）
+        "s21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx",
+        "s21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
     )
     for nodeid in allowed_removals:
         assert nodeid in lock_command, f"L1 擁有者裁決清單缺少 {nodeid}"

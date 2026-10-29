@@ -86,3 +86,37 @@ def test_s23_case_list():
 @pytest.mark.parametrize("label,daemon_env", [("python", "SERIALWRAP_L15_PY_DAEMON"), ("rust", "SERIALWRAP_L15_RUST_DAEMON")])
 def test_s23_scenario(case, label, daemon_env, tmp_path):
     _run(case, True, tmp_path, label=label, daemon_env=daemon_env)
+
+
+def _s23(name: str) -> dict:
+    return __import__("yaml").safe_load((ROOT / "func-test/scenarios" / f"{name}.yaml").read_text(encoding="utf-8"))
+
+
+def _actions(doc: dict) -> list[dict]:
+    return list(doc.get("steps") or [])
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_s23_oracle_windows_cover_the_violation_points():
+    """審查 P7-f9e90a9-3／-4／-5：s23 情境的判定窗口與 oracle 必須涵蓋各自的違規點（結構回歸）。"""
+    # -3：quiet 零 TX 窗口須在測試送出 banner 之前開始，DUT 不得在登入步驟自行吐 banner
+    q = _s23("s23-quiet-mid-login-zero-tx")
+    steps = _actions(q)
+    begin = next(i for i, s in enumerate(steps) if s.get("action") == "op_begin" and s.get("op_id") == "quiet")
+    import base64
+    banner = next(i for i, s in enumerate(steps) if s.get("action") == "dut_control"
+                  and b"Hit any key" in base64.b64decode(str((s.get("params") or {}).get("payload_b64") or "")))
+    assert begin < banner, "零 TX 窗口須早於 banner"
+    assert all("Hit any key" not in str(st.get("respond")) for st in q["target"]["login_steps"])
+    # -4：interleave 須核對帳號、secret 到 READY nonce probe 的完整登入區間，恰兩次
+    il = _s23("s23-interleave-login-agent-human")
+    payloads = [p for s in _actions(il) if s.get("action") == "assert_wire_contiguous" for p in s["payloads"]]
+    assert payloads.count("root\ns3cretP7\necho __READY__") == 2, payloads
+    # -5：force handoff 須證明實際重開一次（bridge_generation 1 → 2 跨過 force 窗口）
+    fh = _actions(_s23("s23-recover-force-handoff"))
+    gens = [(i, s.get("equals")) for i, s in enumerate(fh) if s.get("action") == "wait_cli_until"
+            and str(s.get("json_path", "")).endswith(".bridge_generation")]
+    fb = next(i for i, s in enumerate(fh) if s.get("action") == "op_begin" and s.get("op_id") == "force")
+    fe = next(i for i, s in enumerate(fh) if s.get("action") == "op_end" and s.get("op_id") == "force")
+    assert any(i < fb and v == 1 for i, v in gens) and any(i > fe and v == 2 for i, v in gens), gens

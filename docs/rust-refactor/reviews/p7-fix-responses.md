@@ -335,3 +335,21 @@ BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-
 
 紅燈證據：以 HEAD（61edbd8）版 `p7_ab_report.py`／`p7_case_coverage.py`／`p7_gate_report.py`／`p7_gate.sh` 執行新版測試
 20 failed，修後 41 passed；cap_windows_com_p7 兩支 oracle 測試以突變（lossy 比較、晚取樣）各自轉紅。
+
+### p7-cloud/cd7acf0_f9e90a9（Codex sol）與 f9e90a9_de7a95a（雲端 Opus xhigh 代理 sol）；rulings/p7.md OD-56、OD-57
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-f9e90a9-1 | High | 全套 pytest 必要集合只凍結 49 節點 | **fixed**：以正式 `-q tests/` 收集、扣除 r12b 實跑於 Linux skip／xfail 的 227 筆後 add-only 登記（5616 筆，含本輪新增節點）；回歸 `test_full_pytest_row_needs_whole_frozen_set`（只有 49 列 → INCOMPLETE、完整集合 → PASS；修前前者為 PASS） |
+| P7-f9e90a9-2 | Medium | 參數改變使六個已凍結 nodeid 消失 | **fixed**：`test_regression_phase_status` 以明確 `ids` 保留 `rows0-0-PASS`…`None-0-INCOMPLETE`，新增反例另給 id 並入鎖（collect-only 核對鎖內 p7_gate 節點皆存在） |
+| P7-f9e90a9-3 | High | quiet 零 TX 窗口在 banner 之後才開 | **fixed**：`s23-quiet-mid-login-zero-tx` revision 2026-10-29.2——DUT 收到帳號後停住，窗口於測試主動 emit banner **之前**開始；結構回歸 `test_s23_oracle_windows_cover_the_violation_points`（舊情境紅）；Python／Rust 實跑 PASS |
+| P7-f9e90a9-4 | High | interleave 只核帳號＋secret | **fixed**：改核 `root\ns3cretP7\necho __READY__` 完整登入區間恰兩次（夾入 human／agent bytes 即紅）；Python 實測 agent 命令於 recover 開始前（READY）即送出，故不要求 agent 位於 READY 之後；Python PASS、Rust FAIL（P6 console，BLOCKED-UPSTREAM） |
+| P7-f9e90a9-5 | High | force handoff 未驗證關閉／重開 | **部分 fixed＋SPEC-GAP**：加 `bridge_generation` 交接前 1、交接後 2（Python／Rust 實測皆 1→2；no-op 實作必紅）。「舊 handle 關閉回條前不得重開」的 wire 順序需 runner 新增 peer_state 順序斷言（測試工具獨立 PR），列 SPEC-GAPS；同一不變量已由黑箱 `test_release_during_login_waits_for_handle_close` 的 REATTACH fd 峰值 ==1 承擔 |
+| P7-7bb9cfd-1 | Medium（3 輪） | 表頭缺可還原的 run_dir | **fixed**：表頭 run_dir 不經 `$RUN_DIR` 規則（原恆為 `$RUN_DIR/.`），repo 外記 `$EXTERNAL/<完整路徑>`；回歸 `test_report_header_run_dir_is_restorable` |
+| P7-cd7acf0-4 | Medium（2 輪） | 缺 `p7_gate:contract-blackbox-slice22-b` | **不成立主張／BLOCKED-UPSTREAM**：該列測試檔屬 P6、不在本分支（不 merge P6），無法收集登記；報告照實 INCOMPLETE，P6 合入後登記 |
+| P7-9065f14-1 | Medium（5 輪） | slice22 evidence map | 維持 NEEDS-RULING（OWNER-BATCH）；P6 檔案 |
+| P7-de7a95a-1～3 | Low | — | 依收斂規則不修，記 low-backlog |
+| OD-56（P7-BO-1） | 擁有者裁決 | 兩個 s21_core.linux 舊 nodeid 移除追認 | **done**：`.github/workflows/tests.yml` 的 `--allow-removal` 只加這兩名（linux）；回歸 `tests/test_p7_od56_ci_allow.py`（修前紅；windows 同名不得豁免、替換測試仍在集合）；`regen_lock --check --base 2472f78 --allow-removal <兩名>` OK |
+| OD-57（OWNER-BATCH #2） | 擁有者裁決 | release-during-login 收斂差異 | **done**：`contracts/behavior_changes.yaml` 登記 DF-23（scope both、ab_participation diff、APPROVED，basis 依 catalog 規則為 reconciliation、decision_ref OD-57），案例 `p7-invariants-release-during-login-waits-for-handle-close` 掛 DF-23；測試依 DF 分判（Rust READY；Python DETACHED＋`ATTACH_FAILED:TxIncompleteError` 且 10 s 不重試），兩邊實跑 1 passed；`test_bc_real_sc_df_ranges` 範圍 DF-01～DF-23 |
+
+第 12 輪 gate 實跑另揭露並修正：func-test 列 comparison.json 查找深度（efb8580）、受測 artifact 被 cargo L1 列重建（6df20d2，改為建置後快照）、crates/ 來源案例的涵蓋判定（de7a95a）。

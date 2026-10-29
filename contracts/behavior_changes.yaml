@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57 由 P7 登記。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
@@ -1641,6 +1641,33 @@ changes:
     compatibility_impact: "RX 速率視窗達 4096 筆上限時採 merge_oldest，合併最舊兩筆並保留 bytes 總和、使用較新時間戳；高負載下不得低估 RX_FLOOD 判定。"
     approval_conditions: "10000 個 1-byte chunk 的 capped window 長度不得超過 4096，rx_stats 的有效 bytes 不得低於未設上限時的值。"
     related_decisions: ["OD-43"]
+  - id: "DF-23"
+    kind: "DF"
+    title: "login 進行中 release 後 attach 回到 READY（Python 落 ATTACH_FAILED:TxIncompleteError）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-29"
+      decision_ref: "OD-57"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 6
+    spec_refs: ["§11.3"]
+    reconciliation_refs: []
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P7"]
+    case_ids: ["p7-invariants-release-during-login-waits-for-handle-close"]
+    compatibility_impact: "Python 基線（2026-10-29 實測，CPython 3.12）：login 進行中 `device release` 後 `device attach`，session 落 DETACHED＋`last_error: ATTACH_FAILED:TxIncompleteError` 且不再自動重試（擁有者 OD-57 視為 Python 缺陷）；Rust 重新 attach 並回到 READY。對外差異：同一操作序列後 session.state／last_error 不同。"
+    approval_conditions: "只限「login 進行中 device release → device attach」的收斂結果；§11.3-4 handle 時序（release 回成功即無 fd、attach 前不重開）兩邊相同照常判定。S1X-a 修正合入 feature/rust-refactor 後重測 Python，若 Python 也回 READY，本 DF 改為 parity 結案。"
+    related_decisions: ["OD-57"]
 pending_owner_confirmations: []
 safety_invariants:
   - id: zero_tx_on_reject

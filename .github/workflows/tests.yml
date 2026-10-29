@@ -45,6 +45,8 @@ jobs:
         # 1e24d68＝Linux 占位 12＋12（核准只涵蓋 Linux，見 owner-decisions-s1x-g-list.md）；1ea2bdc＝s1b_cargo.linux 舊名 2；e25aec0＝舊 10 筆 docker／stage0 裁決保留（s0_win_pytest.windows）。
         # 1e24d68（24）、1ea2bdc（2）、e25aec0（10）三組共 36 個三元組由 OD-23（2026-10-27）逐名補授權；清單見 docs/rust-refactor/reviews/s1x-unauthorized-removals.md。
         # OD-24（2026-10-27）：s1b_cargo 的 5 筆 #[ignore] 列（68d0941 夾帶新增）逐名移除；承擔者見 owner-decisions-2026-10-15.md OD-24 列。
+        # OD-56（2026-10-29，rulings/p7.md P7-BO-1）：s21_core.linux 兩個語意已變的舊 nodeid 由替換測試承擔（只限這兩名；
+        # windows 集合待原生一對一替換，P7-LW-1）。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
           python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }} --allow-removal
@@ -598,6 +600,8 @@ jobs:
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry'
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry'
           's1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip'
+          's21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx'
+          's21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported'
 
   bridge-tools:
     if: github.event.action != 'labeled'

@@ -66,6 +66,11 @@ ALL_PASS = {n: "passed" for n in FROZEN}
     ({**ALL_PASS, "tests/a.py::t3": "passed"}, 0, FROZEN, "INCOMPLETE"),
     # 鎖中無凍結集合 → 不得 PASS
     (ALL_PASS, 0, None, "INCOMPLETE"),
+], ids=[
+    # 前六個 id 沿用已凍結的 nodeid（審查 P7-f9e90a9-2：不得因改參數而讓凍結節點消失）
+    "rows0-0-PASS", "rows1-1-FAIL", "rows2-0-INCOMPLETE", "rows3-0-INCOMPLETE", "rows4-2-INCOMPLETE",
+    "None-0-INCOMPLETE",
+    "unrelated-only", "param-missing", "extra-node", "no-frozen-set",
 ])
 def test_regression_phase_status(tmp_path, rows, rc, frozen, want):
     assert ab.judge_phase(_phase(tmp_path, "slice21-b", rows, rc), frozen)[0] == want
@@ -223,3 +228,14 @@ def test_coverage_crate_sourced_case_uses_cargo_l1(tmp_path):
         rep = cov.build(tmp_path / "ab", *fx, cargo_l1=rep_path)
         assert rep["rows"][0]["status"] == want, (results, rep["rows"][0])
     assert cov.build(tmp_path / "ab", *fx)["rows"][0]["status"] == "GAP"     # 未提供 cargo 報告
+
+
+def test_report_header_run_dir_is_restorable(tmp_path):
+    """審查 P7-7bb9cfd-1（第三輪）：repo 外 run 的表頭須記下可還原的 run_dir 基準（不得為 `$RUN_DIR/.`）。"""
+    run = tmp_path / "ext-run"
+    run.mkdir()
+    args = _report_args(tmp_path, None) + ["--run-dir", str(run)]
+    ab.main(args)
+    md = (tmp_path / "out.md").read_text(encoding="utf-8")
+    assert f"- run_dir: `$EXTERNAL/{str(run.resolve()).lstrip('/')}`" in md, md.splitlines()[:16]
+    assert "$RUN_DIR/." not in md

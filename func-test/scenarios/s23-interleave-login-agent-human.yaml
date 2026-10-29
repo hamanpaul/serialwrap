@@ -5,7 +5,7 @@ meta:
   severity: critical
   description: "READY 後 DUT 重回 login 狀態，`session recover` 觸發重新登入；同時 agent 送命令、human raw console 輸入。wire 上兩次登入序列（帳號＋secret）各自連續、不被 agent／human bytes 夾入（§11.3-2「login 與 agent／human 不交錯」；需 P6 human console，Rust BLOCKED-UPSTREAM；Slice 2.3 Task 18）"
   scenario:
-    revision: "2026-10-29.1"
+    revision: "2026-10-29.2"
     seed: 1023
     capabilities: [posix_pty, process_rpc]
     timeout_s: 150
@@ -73,7 +73,9 @@ steps:
     selector: COM0
     state: READY
     timeout_s: 60
-  # 兩次登入（初次＋recover）的帳號＋secret 各自連續（中間無其他 TX）、恰兩次
+  # 兩次登入（初次＋recover）的完整登入區間——帳號、secret 到 READY nonce probe——各自連續（中間無 human／agent
+  # bytes）、恰兩次（審查 P7-f9e90a9-4：只核帳號＋secret 會放過夾在 secret 與 nonce probe 之間的 bytes）。
+  # Python 基線實測：agent 命令在 recover 開始前（session 仍 READY）即送出，故不要求 agent bytes 位於 READY 之後。
   - action: assert_wire_contiguous
-    payloads: ["root\ns3cretP7\n", "root\ns3cretP7\n"]
+    payloads: ["root\ns3cretP7\necho __READY__", "root\ns3cretP7\necho __READY__"]
   - action: assert_compare

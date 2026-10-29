@@ -3,9 +3,9 @@ meta:
   name: s23-recover-force-handoff
   category: l15-scenario
   severity: critical
-  description: "ATTACHED（帳密未解析）且 DUT 靜默：`session recover --force` 走 FORCE_CLEAR_REATTACH（drain 回條後才重開），期間 wire serial_read 零 byte（不送空帳密、不送 probe），回覆 FORCE_RECOVER_TIMEOUT 後 session 仍為 ATTACHED＋CREDENTIALS_UNRESOLVED（§5.2.4、§11.3，Slice 2.3 Task 18）"
+  description: "ATTACHED（帳密未解析）且 DUT 靜默：`session recover --force` 走 FORCE_CLEAR_REATTACH，實際關閉並重開 bridge 恰一次（`bridge_generation` 1→2；關閉回條與重開的 wire 順序斷言待 runner 支援），期間 wire serial_read 零 byte（不送空帳密、不送 probe），回覆 FORCE_RECOVER_TIMEOUT 後 session 仍為 ATTACHED＋CREDENTIALS_UNRESOLVED（§5.2.4、§11.3，Slice 2.3 Task 18）"
   scenario:
-    revision: "2026-10-29.1"
+    revision: "2026-10-29.2"
     seed: 1023
     capabilities: [posix_pty, process_rpc]
     timeout_s: 120
@@ -40,6 +40,12 @@ steps:
     json_path: "sessions.com=COM0.last_error"
     equals: CREDENTIALS_UNRESOLVED
     timeout_s: 15
+  # 交接前的 bridge 世代（審查 P7-f9e90a9-5：須證明實際關閉並重開一次，no-op 實作不得通過）
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.bridge_generation"
+    equals: 1
+    timeout_s: 5
   - action: op_begin
     op_id: force
   - action: cli
@@ -51,6 +57,13 @@ steps:
     op_id: force
   - action: assert_zero_tx
     op_id: force
+  # FORCE_CLEAR_REATTACH 實際關閉舊 bridge 並重開恰一次（Python／Rust 實測 bridge_generation 1→2）。「舊 handle 關閉回條
+  # 之前不得重開」的 wire 順序證據需 runner 新增 peer_state 順序斷言（測試工具獨立 PR），列 SPEC-GAP。
+  - action: wait_cli_until
+    argv: ["session", "list"]
+    json_path: "sessions.com=COM0.bridge_generation"
+    equals: 2
+    timeout_s: 15
   - action: wait_state
     selector: COM0
     state: ATTACHED

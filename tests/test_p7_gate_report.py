@@ -261,3 +261,22 @@ def test_verify_requires_cli_and_daemon_artifacts(tmp_path):
         problems = g.verify_report(md, d)
         assert {p.split("：", 1)[1] for p in problems if p.startswith("缺必要 artifact")} == missing, problems
 
+
+
+def test_full_pytest_row_needs_whole_frozen_set(tmp_path):
+    """審查 P7-f9e90a9-1：`python3 -m pytest -q tests/` 列的凍結集合須為完整 `-q tests/` 收集（扣除 Linux 平台 skip），
+    只提供 49 列 passed 的報告不得 PASS；完整集合全 passed 才 PASS。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    frozen = lock["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]["nodeids"]
+    assert len(frozen) > 5000, len(frozen)
+    assert "tests/test_p7_gate_win_argv.py::test_gate_snapshots_artifacts_before_cargo_rebuilds" in frozen
+    name, sid = "python3 -m pytest -q tests/", "p7_gate:python3-m-pytest-q-tests"
+    judge = g._load_judge()
+    for subset, want in ((frozen[:49], "INCOMPLETE"), (frozen, "PASS")):
+        row = _l1_row(tmp_path, [(n, "passed") for n in subset], name=name, sid=sid, tag=f"n{len(subset)}")
+        rep_path = tmp_path / row["l1_results"]
+        rep = json.loads(rep_path.read_text(encoding="utf-8"))
+        rep.update(runner="pytest", argv=["pytest/__main__.py", "-q", "tests/"])
+        rep_path.write_text(json.dumps(rep), encoding="utf-8")
+        status, detail = g._test_row_status(tmp_path, row, lock, judge)
+        assert status == want, (len(subset), status, detail)

@@ -18,6 +18,9 @@
 | CHG-S23-NOISE-LINE-01 | `p7-latency-noise-login-with-delay-and-noise` | 每 50 ms 一行 noise（未規定換行） | 雜訊行以 `\r\n` 起頭（printk 獨立成行） | 否：斷言仍為延遲＋雜訊下最終 READY；不換行雜訊在 Python 永不 READY，非可通過情境 | 附錄 E6（對照 E6b） | 附錄 P1 | APPLIED（Review-pending） |
 | CHG-S23-L15-PATH-01 | l15 slice23 六案 | `tests/acceptance/l15/slice23/*.yaml` | 情境檔放 `func-test/scenarios/s23-*.yaml`（P2 runner `--scenarios` 只探索該目錄；runner 屬測試工具、改動須獨立 PR），比照 06 T21 的 `s21-*` | 否（檔案位置） | 不適用 | 附錄 P2 | APPLIED（Review-pending） |
 | CHG-S23-REPLAY-BOUNDARY-01 | l15 `s23-reboot-recovery-no-replay`（本輪新建） | §11.3-3「Recovery／Reboot 不回放舊輸入」 | 判定窗口自重開機邊界（U-Boot banner 上 wire 後的 `rebooted` op）起算，而非自 human 輸入起算 | 否：不回放判準不變；Python 在 agent 命令進行中即透傳 human raw 輸入（非 deferred），屬既有外部行為 | 附錄 P2 說明 | 附錄 P2 | APPLIED（Review-pending） |
+| CHG-S23-QUIET-WINDOW-02 | l15 `s23-quiet-mid-login-zero-tx` revision 2026-10-29.2 | SC-30 的 0 byte 部分 | DUT 收到帳號後停住，零 TX 窗口於測試主動 emit banner 之前開始（原 DUT 自吐 banner、窗口在其後才開） | 否：判準收緊（窗口更早） | 附錄 P3 | 附錄 P3 | APPLIED（Review-pending） |
+| CHG-S23-INTERLEAVE-02 | l15 `s23-interleave-login-agent-human` revision 2026-10-29.2 | §11.3-2 | 核對 `root\ns3cretP7\necho __READY__` 完整登入區間恰兩次（原只核帳號＋secret）；不要求 agent bytes 位於 READY 之後（Python 實測 agent 於 recover 開始前、session 仍 READY 時送出） | 否：判準收緊 | 附錄 P3 | 附錄 P3（Python） | APPLIED（Review-pending；Rust BLOCKED-UPSTREAM P6） |
+| CHG-S23-FORCE-GEN-02 | l15 `s23-recover-force-handoff` revision 2026-10-29.2 | 「force recover 回條後才重開」 | 加 `bridge_generation` 交接前 1／交接後 2；關閉回條與重開的 wire 順序需 runner 新斷言，列 SPEC-GAP | 否：判準收緊 | 附錄 P3（Python／Rust 實測 1→2） | 附錄 P3 | APPLIED（Review-pending） |
 
 ## 附錄：Python 基線實測輸出
 
@@ -114,3 +117,13 @@ FAILED tests/acceptance/l15/test_slice23_l15.py::test_s23_scenario[rust-SERIALWR
 
 Python 六案兩次皆 PASS。Rust 兩案 FAIL 均為步驟 1 `attach_console` 回 `METHOD_NOT_FOUND`（`session.console_attach` 屬 P6 human console，BLOCKED-UPSTREAM P7-BU-7）。
 第一次執行時 `s23-reboot-recovery-no-replay` 的 Python 列 FAIL：Python 基線在 agent `reboot` 命令進行中把 human raw 輸入**直接透傳**上 wire（seq 24，早於 U-Boot banner），並非重開機後回放；情境原本「重開機前輸入須被 deferred、整段不得出現」的前提與 Python 不符，改為「重開機邊界（`rebooted` op）之後不得再出現重開機前的輸入」（§11.3-3 原意），未放寬不回放判準。
+
+### P3：第 12 輪第二批情境修訂（revision 2026-10-29.2）
+
+```text
+$ SERIALWRAP_GATE=1 … python3 -m pytest -q tests/acceptance/l15/test_slice23_l15.py -k "quiet-mid or interleave or force-handoff"
+FAILED tests/acceptance/l15/test_slice23_l15.py::test_s23_scenario[rust-SERIALWRAP_L15_RUST_DAEMON-s23-interleave-login-agent-human]
+1 failed, 5 passed, 15 deselected in 154.32s (0:02:34)
+```
+
+Rust interleave FAIL 為步驟 1 `session.console_attach` METHOD_NOT_FOUND（P6）。force handoff 於修訂前實跑紀錄（cli.ndjson）即見 Python／Rust 皆 `bridge_generation` 1→2。

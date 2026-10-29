@@ -1376,8 +1376,9 @@ def test_bc_real_sc_df_ranges() -> None:
     # SC-37 依 OD-21 登記；SC-08 依 OD-14 #3 撤回、編號不重用。
     assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36", "SC-37"}) - {"SC-08"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
-    # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記；DF-20～DF-22 依 OD-34～OD-44 登記。
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 23)}
+    # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記；DF-20～DF-22 依 OD-34～OD-44 登記；
+    # DF-23 依 OD-57（P7）登記。
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 24)}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"

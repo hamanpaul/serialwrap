@@ -4672,7 +4672,7 @@ cases:
   prerequisites: [login_full, drain_release]
   necessity: required
   issues: []
-  behavior_changes: []
+  behavior_changes: [DF-23]
   destructive: false
   expected: PASS
   sentinel: null
