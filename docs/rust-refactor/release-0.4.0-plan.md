@@ -18,11 +18,29 @@
 | 產物 | 內容 | 產生方式 |
 |---|---|---|
 | Linux x86_64 bundle（`serialwrap-0.4.0-linux-x86_64.tar.gz`） | `bin/serialwrap`（Rust CLI，20 個群組原生）、`bin/serialwrapd`（launcher）、`versions/0.4.0/`：`release-manifest.json`、`SHA256SUMS`、`py/`（自帶 PyYAML 的 Python daemon runtime＋`sw_core`，亦為 Python 委派元件 `python_cli_delegate`）；不含 `sw-cli/test-fakes` | `scripts/rust/mkbundle.sh --release-bundle --profile release --out <dir>`（`VERSION` 已改為 0.4.0，**不得**用 `--version-override`） |
-| Windows x86_64 bundle（`serialwrap-0.4.0-windows-x86_64.zip`） | 同上，入口為 `.exe`；可選 com0com 3.0.0.0 元件（`--with-com0com`，含 GPLv2 授權與原始碼連結） | 擁有者 Windows runner 原生建置（P9 BO-P9-17 的同一條路徑）；或 `--target x86_64-pc-windows-gnu` 交叉編譯後於 Windows 原生驗證 |
+| Windows x86_64 bundle（`serialwrap-0.4.0-windows-x86_64.zip`） | 同上，入口為 `.exe`；可選 com0com 3.0.0.0 元件（`--with-com0com`，含 GPLv2 授權與原始碼連結） | 擁有者 Windows runner 原生建置（P9 BO-P9-17 的同一條路徑）；或 `--target x86_64-pc-windows-gnu` 交叉編譯後於 Windows 原生驗證。**release workflow 不建 Windows bundle**：待 `publish-linux-bundle` job 成功後，由擁有者以 `gh release upload` 附加 zip 並重傳含 zip 雜湊的 `SHA256SUMS`（步驟見下方 RELEASE-TODO-01） |
 | Python wheel（`serialwrap-0.4.0-py3-none-any.whl`） | Python CLI＋daemon（照發；OD-50 後標準安裝流程不使用，`install.sh` 不再走 pipx） | 既有 `release.yml` 的 `python3 -m build --wheel` |
 | `install.sh` | OD-50：Linux 安裝 Rust bundle。預設從 GitHub release 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS` 並驗證（未給 `--version` 取 `releases/latest`），或以 `--bundle <目錄或 tar.gz>` 離線安裝；解到暫存目錄後執行 `<bundle>/bin/serialwrap setup` 並回傳其 rc。pipx 路徑退役 | repo 根目錄的 `install.sh`（`tests/test_install_sh.py`）；release 須附上 Linux bundle tarball 與含該列的 `SHA256SUMS`（RELEASE-TODO-01） |
 
-**RELEASE-TODO-01（release workflow）**：現行 `.github/workflows/release.yml` 只發佈 wheel 與 PyInstaller exe，沒有 Rust bundle job。release PR 必須新增 Linux bundle job（cargo build＋`mkbundle.sh --release-bundle --profile release`＋打包＋上傳＋`SHA256SUMS`）並登記 Windows bundle 的上傳方式；PyInstaller exe 是否續發由擁有者決定（建議 0.4.0 仍附上，供尚未改用 bundle 的 Windows 使用者）。
+**RELEASE-TODO-01（release workflow）**：原 `.github/workflows/release.yml` 只發佈 wheel 與 PyInstaller exe，沒有 Rust bundle job。release PR 必須新增 Linux bundle job（cargo build＋`mkbundle.sh --release-bundle --profile release`＋打包＋上傳＋`SHA256SUMS`）並登記 Windows bundle 的上傳方式；PyInstaller exe 是否續發由擁有者決定（建議 0.4.0 仍附上，供尚未改用 bundle 的 Windows 使用者）。
+
+- **Linux（已備，`feature/release-0.4.0-prep`）**：`release.yml` 新增 `publish-linux-bundle` job（tag push 觸發、`needs: publish`、`runs-on: ubuntu-24.04`；既有 `publish`／`publish-windows-exe` 不動）。步驟依序：tag 與 `VERSION`、`Cargo.toml` `[workspace.package] version` 三者一致檢查（不一致即 `::error::` 失敗）→ 以系統 `/usr/bin/python3.12` 建 build venv（apt 安裝 `python3.12-venv`；版本須等於 `contracts/cli_help/_meta.json` 的 `python_version`；venv 內裝 `pyyaml==6.0.3`、`jsonschema==4.10.3` 並置於 PATH 首位），使 bundle runtime 的 `pyvenv.cfg` 為 `home = /usr/bin`（OD-50；**不得**用 `actions/setup-python`：hosted toolcache Python 建的 runtime 依賴 `/opt/hostedtoolcache` 的 libpython 與標準函式庫，搬到使用者主機即無法啟動，S1-3185c6d-1）→ `cargo build --release --workspace --locked` → `scripts/rust/mkbundle.sh --release-bundle --profile release --out "$RUNNER_TEMP/bundle/serialwrap-${VERSION}-linux-x86_64"` → `tar` 打包為 `dist/serialwrap-${VERSION}-linux-x86_64.tar.gz`（保留 `bin/` 相對 symlink、排除 `.mkbundle-owner`）並產生 `dist/SHA256SUMS` → 解開後 smoke（外層 `sha256sum -c`、`bin/serialwrap --version` 等於 `serialwrap ${VERSION}`、`bin/serialwrap --help`、`versions/${VERSION}/release-manifest.json` 存在且 `bundle_version`／cli／daemon／pairing 版本一致且非 sentinel、內層 `SHA256SUMS` 核對、`versions/${VERSION}/bin` 不含 `SW_TEST_UPDATE_PAUSE_AFTER`／`SW_TEST_UPDATE_FORCE_VERIFY_FAIL` 故障注入鉤子字串、不含 delegate sentinel、`versions/${VERSION}/py/pyvenv.cfg` 含 `home = /usr/bin` 與 `include-system-site-packages = false`）→ 容器 smoke（以 OD-16 (5) 同一 digest 的 `ubuntu:24.04` 只加裝 `python3.12`——無 PyYAML、無 libpython 共享庫、無 toolcache——`docker run --network none`，只唯讀掛載上一步解開的實際 tarball 內容；容器內以 bundle runtime `-I -B` 匯入 `sw_core.daemon` 與 `yaml`，再以 bundle 的 `bin/serialwrap daemon start`／`daemon status`／`daemon stop` 啟停 on-demand daemon（獨立暫存 config／state／run／WAL 目錄、空 by-id 目錄、不碰裝置），status 須 `ok`、`running` 且版本等於 `VERSION`，stop 後行程須結束；任一失敗即阻擋上傳）→ `gh release upload "$TAG_NAME" dist/serialwrap-${VERSION}-linux-x86_64.tar.gz dist/SHA256SUMS --clobber`。結構與步驟行為由 `tests/test_release_workflow.py` 守護。
+- **Windows（擁有者 runner，workflow 不建）**：目前 `mkbundle.sh` 拒絕 Windows target，Windows 正式 bundle 的建置腳本屬 BO-P9-17 同一條路徑、由擁有者 runner 承接（現有 `win-blackbox.ps1` 的 `New-WindowsDevBundle` 只產生測試用 dev bundle，不得作為 release 產物）。建出並在 Windows 原生驗證後（`bin\serialwrap.exe --version` 等於 `serialwrap <V>`、`--help`、`versions\<V>\release-manifest.json` 版本一致、內層 `SHA256SUMS` 核對、不含 test-fakes 鉤子），**等 release workflow 的 `publish-linux-bundle` job 成功之後**於 runner 的 WSL 或 Git Bash 執行：
+
+  ```bash
+  V="$(tr -d ' \n' < VERSION)"                       # 必須等於 tag 去掉 v
+  cd <Windows bundle 根目錄的上一層>                   # 其下為 serialwrap-${V}-windows-x86_64/（bin\、versions\<V>\）
+  zip -r -X "serialwrap-${V}-windows-x86_64.zip" "serialwrap-${V}-windows-x86_64"
+  #（無 zip 時可用 PowerShell：Compress-Archive -Path serialwrap-<V>-windows-x86_64 -DestinationPath serialwrap-<V>-windows-x86_64.zip）
+  gh release download "v${V}" --pattern SHA256SUMS --clobber   # 取回 Linux job 上傳的 SHA256SUMS
+  grep -q "  serialwrap-${V}-linux-x86_64.tar.gz$" SHA256SUMS  # 必須已含 Linux tarball 列
+  sed -i "/  serialwrap-${V}-windows-x86_64.zip$/d" SHA256SUMS
+  sha256sum "serialwrap-${V}-windows-x86_64.zip" >> SHA256SUMS # LF 行尾、與 Linux 列同格式
+  gh release upload "v${V}" "serialwrap-${V}-windows-x86_64.zip" SHA256SUMS --clobber
+  gh release download "v${V}" --pattern 'serialwrap-*' --pattern SHA256SUMS --dir verify-dl && (cd verify-dl && sha256sum -c SHA256SUMS)
+  ```
+
+  若之後重跑 release workflow，`publish-linux-bundle` 會以 `--clobber` 覆寫 `SHA256SUMS`（只剩 Linux 列），須重做上面最後四行把 Windows 列補回。
 
 **RELEASE-TODO-02（install.sh）**：已依擁有者裁決 OD-50（2026-10-29，(b')）決定並實作（分支 `feature/install-sh-bundle`）。新流程：`install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`——安裝前檢查系統需求（x86_64、glibc ≥ 2.39、`/usr/bin/python3.12`；Linux 使用者皆為 Ubuntu 24.04 以上），任一不符 rc=2 且不改動任何東西；未給 `--bundle` 時以 curl（無 curl 用 wget）從 GitHub release 下載 bundle tarball 與 `SHA256SUMS`，以該 tarball 的列驗證，雜湊不符或缺列立即失敗、不執行 setup；解到 mktemp 暫存目錄（結束時清除）後執行 `<bundle>/bin/serialwrap setup "$@"` 並回傳其 rc；setup 成功後偵測到舊 pipx 安裝（`pipx list --short` 含 serialwrap 或 pipx venv 目錄存在）時提示可 `pipx uninstall serialwrap`，不自動移除。pipx 安裝路徑退役（README 主要安裝方式一併改寫）；wheel 仍照發但標準流程不使用。下載基底 URL 可由 `SERIALWRAP_RELEASE_BASE_URL` 覆寫（測試用）。
 
@@ -30,6 +48,7 @@
 
 1. `VERSION`：`0.3.2` → `0.4.0`；`Cargo.toml` 的 `[workspace.package] version` 同步改為 `0.4.0` 並更新 `Cargo.lock`（`cargo update -w`）。`pyproject.toml` 的 dynamic version 由 `VERSION` 讀取。
 2. 收斂 changelog：`python3 -m policy_check.changelog collate --version 0.4.0 --date <發佈日 YYYY-MM-DD>`（把 `changelog.d/*.md` 依 type 收斂成 `CHANGELOG.md` 的 dated 段並清空目錄）。collate 前先修正缺 frontmatter 的既存 fragment（第 3 輪報告列為範圍外的 5 個壞檔），否則分類會錯。
+   - 2026-10-29 試跑（暫存 clone、`--date 2026-11-01`，結果未提交）：原始 217 個 fragment 中 5 個缺 frontmatter（`229-late-unlock-prompt.md`、`rust-p4-win-test-l1-set.md`、`st06-command-completion.md`、`st06-smart4-prompt-window.md`、`st06-smart4r-console-unlock.md`），collate 於第一個壞檔即 `FragmentError` 中止且不改任何檔。`feature/release-0.4.0-prep` 已只補 frontmatter／格式（`st06-smart4r-console-unlock.md` 同時含 Added 與 Fixed，依原條目拆為 `-a-profile`／`-b-recovery`／`-c-sysrq-reboot`（feat）與 `-d-prompt-boundary`（fix）四檔，文字不變）；重跑 collate 成功收斂 220 個 fragment（Added 73、Changed 39、Fixed 106、Security 2）。release PR 執行前若再有新 fragment，仍須重跑本步驟確認。
 3. 重新產生 bundle（§2）並重跑 §4 升級驗證，證據綁 release HEAD。
 4. `python3 -m policy_check --repo .`、全套測試通過。
 

@@ -116,3 +116,232 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: gh release upload "$env:TAG_NAME" dist/serialwrap.exe dist/serialwrapd.exe --clobber
+
+  publish-linux-bundle:
+    # Linux x86_64 Rust bundle（RELEASE-TODO-01；docs/rust-refactor/release-0.4.0-plan.md §2）：
+    # cargo build --release＋mkbundle 正式候選（不含 sw-cli/test-fakes）→ tar.gz＋SHA256SUMS → 解開後 smoke → 附加到同一個 release。
+    # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳。
+    # Windows bundle 不在此建置：由擁有者 Windows runner 原生建置後以 gh release upload 附加（release 計畫 §2）。
+    # OD-50：Linux 使用者皆為 Ubuntu 24.04 以上，bundle 內附 Python runtime 綁定 /usr/bin/python3.12；
+    # 故釘 ubuntu-24.04 並以系統 Python 建 runtime，不用 actions/setup-python（hosted toolcache 不可搬移，S1-3185c6d-1）。
+    runs-on: ubuntu-24.04
+    needs: publish
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain 1.96.1
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Verify tag matches VERSION and Cargo workspace version
+        id: verify-version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          file_version="$(tr -d ' \n' < VERSION)"
+          if [ "$TAG_NAME" != "v${file_version}" ]; then
+            echo "::error::release tag ${TAG_NAME} does not match v${file_version} (VERSION file)"
+            exit 1
+          fi
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "$cargo_version" != "$file_version" ]; then
+            echo "::error::Cargo.toml [workspace.package] version ${cargo_version} does not match VERSION ${file_version}"
+            exit 1
+          fi
+          echo "release tag ${TAG_NAME} matches VERSION ${file_version}"
+          echo "VERSION=${file_version}" >> "$GITHUB_ENV"
+
+      - name: Prepare system Python 3.12 build venv
+        id: system-python
+        # mkbundle 以 PATH 上的 python3 執行 `python3 -m venv --copies`，pyvenv.cfg 的 home 取自其基底直譯器目錄。
+        # 以 /usr/bin/python3.12 建 build venv，再由它建 bundle runtime：home = /usr/bin，與使用者主機（OD-50）一致；
+        # PyYAML（複製進 bundle runtime）與 jsonschema（驗 release-manifest.json）裝在 build venv，不動系統套件。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3.12 python3.12-venv
+          expected="$(/usr/bin/python3.12 -I -c 'import json; print(json.load(open("contracts/cli_help/_meta.json"))["python_version"])')"
+          actual="$(/usr/bin/python3.12 -I -c 'import platform; print(platform.python_version())')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::/usr/bin/python3.12 is ${actual}, contracts/cli_help/_meta.json expects ${expected}"
+            exit 1
+          fi
+          build_venv="$RUNNER_TEMP/build-venv"
+          /usr/bin/python3.12 -m venv "$build_venv"
+          "$build_venv/bin/python3" -m pip install --disable-pip-version-check pyyaml==6.0.3 jsonschema==4.10.3
+          base="$("$build_venv/bin/python3" -I -c 'import os, sys; print(os.path.dirname(sys._base_executable))')"
+          if [ "$base" != "/usr/bin" ]; then
+            echo "::error::build venv base interpreter is under ${base}, expected /usr/bin"
+            exit 1
+          fi
+          echo "$build_venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build Rust workspace (release)
+        id: cargo-build
+        run: cargo build --release --workspace --locked
+
+      - name: Build release bundle
+        id: mkbundle
+        run: scripts/rust/mkbundle.sh --release-bundle --profile release --out "$RUNNER_TEMP/bundle/serialwrap-${VERSION}-linux-x86_64"
+
+      - name: Package bundle and SHA256SUMS
+        id: package
+        run: |
+          mkdir -p dist
+          # bin/ 內為指向 versions/<V>/bin/ 的相對 symlink，tar 原樣保留；mkbundle 的 owner marker 不屬於發佈內容。
+          tar -C "$RUNNER_TEMP/bundle" --exclude=.mkbundle-owner --owner=0 --group=0 --numeric-owner \
+            -czf "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" "serialwrap-${VERSION}-linux-x86_64"
+          (cd dist && sha256sum "serialwrap-${VERSION}-linux-x86_64.tar.gz" > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Smoke test extracted bundle
+        id: smoke
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          smoke_dir="$RUNNER_TEMP/smoke"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir"
+          tar -xzf "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" -C "$smoke_dir"
+          root="$smoke_dir/serialwrap-${VERSION}-linux-x86_64"
+          version_dir="$root/versions/${VERSION}"
+
+          actual="$("$root/bin/serialwrap" --version)"
+          if [ "$actual" != "serialwrap ${VERSION}" ]; then
+            echo "::error::bin/serialwrap --version printed '${actual}', expected 'serialwrap ${VERSION}'"
+            exit 1
+          fi
+          "$root/bin/serialwrap" --help > /dev/null
+
+          manifest="$version_dir/release-manifest.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::missing versions/${VERSION}/release-manifest.json"
+            exit 1
+          fi
+          python3 - "$manifest" "$VERSION" <<'PY'
+          import json
+          import sys
+
+          path, version = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          values = {
+              "bundle_version": manifest.get("bundle_version"),
+              "components.cli.version": manifest.get("components", {}).get("cli", {}).get("version"),
+              "components.daemon.version": manifest.get("components", {}).get("daemon", {}).get("version"),
+              "pairing.cli_version": manifest.get("pairing", {}).get("cli_version"),
+              "pairing.daemon_version": manifest.get("pairing", {}).get("daemon_version"),
+          }
+          wrong = {key: value for key, value in values.items() if value != version}
+          if wrong:
+              raise SystemExit(f"::error::release-manifest.json version mismatch (expected {version}): {wrong}")
+          if manifest.get("stage") == "rust-1b-dev":
+              raise SystemExit("::error::release-manifest.json is a delegate-sentinel test bundle")
+          PY
+          (cd "$version_dir" && sha256sum -c --quiet SHA256SUMS)
+
+          # bundle runtime 必須綁定使用者主機的 /usr/bin/python3.12（OD-50），不得指向建置機專有路徑（S1-3185c6d-1）。
+          pyvenv_cfg="$version_dir/py/pyvenv.cfg"
+          if [ ! -f "$pyvenv_cfg" ]; then
+            echo "::error::missing versions/${VERSION}/py/pyvenv.cfg"
+            exit 1
+          fi
+          if ! grep -qxF "home = /usr/bin" "$pyvenv_cfg"; then
+            echo "::error::py/pyvenv.cfg must contain 'home = /usr/bin' (OD-50): $(grep '^home' "$pyvenv_cfg" || echo 'no home line')"
+            exit 1
+          fi
+          if ! grep -qxF "include-system-site-packages = false" "$pyvenv_cfg"; then
+            echo "::error::py/pyvenv.cfg must contain 'include-system-site-packages = false'"
+            exit 1
+          fi
+
+          # 正式候選不得編入 sw-cli/test-fakes 的故障注入鉤子（crates/sw-cli/src/rollback.rs）。
+          for marker in SW_TEST_UPDATE_PAUSE_AFTER SW_TEST_UPDATE_FORCE_VERIFY_FAIL; do
+            if grep -rlaF "$marker" "$version_dir/bin"; then
+              echo "::error::bundle binaries contain test-fakes hook ${marker}"
+              exit 1
+            fi
+          done
+          if find "$root" -name 'delegate_sentinel*' | grep -q .; then
+            echo "::error::bundle contains delegate sentinel test entry"
+            exit 1
+          fi
+          echo "smoke passed for serialwrap-${VERSION}-linux-x86_64"
+
+      - name: Smoke test bundle daemon in clean Ubuntu 24.04 container
+        id: container-smoke
+        # 使用者主機模型（OD-50）：乾淨 ubuntu:24.04＋系統 python3.12，無 toolcache、無 PyYAML、無 libpython 共享庫；
+        # --network none，只唯讀掛載 smoke 解開的實際 tarball 內容；以 bundle 自身的 CLI 啟停 on-demand daemon（獨立暫存目錄、不碰裝置）。
+        run: |
+          root="$RUNNER_TEMP/smoke/serialwrap-${VERSION}-linux-x86_64"
+          image="serialwrap-bundle-smoke:ubuntu-24.04"
+          docker build -q -t "$image" - <<'DOCKERFILE'
+          FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends python3.12 \
+              && rm -rf /var/lib/apt/lists/* \
+              && test -x /usr/bin/python3.12 \
+              && test ! -e /usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0
+          DOCKERFILE
+          log="$RUNNER_TEMP/container-smoke.log"
+          status=0
+          docker run --rm -i --network none --user 1000:1000 -e VERSION="$VERSION" \
+            -v "$root:/opt/serialwrap:ro" "$image" bash -s > "$log" 2>&1 <<'CONTAINER' || status=$?
+          set -euo pipefail
+          B=/opt/serialwrap
+          PY="$B/versions/$VERSION/py/bin/python3"
+          T="$(mktemp -d /tmp/sw-smoke.XXXXXX)"
+          export HOME="$T/home" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/xdg-run"
+          export SERIALWRAP_CONFIG_DIR="$T/config/serialwrap" SERIALWRAP_RUN_DIR="$T/sw-run" SERIALWRAP_STATE_DIR="$T/sw-state"
+          export SERIALWRAP_WAL_DIR="$T/sw-wal" SERIALWRAP_LOG_DIR="$T/sw-log" SERIALWRAP_BY_ID_DIR="$T/by-id"
+          mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$SERIALWRAP_CONFIG_DIR" "$SERIALWRAP_BY_ID_DIR"
+          install -d -m 700 "$XDG_RUNTIME_DIR"
+          printf 'supervision_mode: on-demand\n' > "$SERIALWRAP_CONFIG_DIR/config.yaml"
+          "$PY" -I -B -c 'import sw_core.daemon, yaml; print("bundle python runtime ok:", yaml.__file__)'
+          "$B/bin/serialwrap" daemon start
+          "$B/bin/serialwrap" daemon status > "$T/status.json"
+          daemon_pid="$("$PY" -I -B - "$T/status.json" "$VERSION" <<'PY'
+          import json
+          import sys
+
+          path, version = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              status = json.load(handle)
+          if status.get("ok") is not True or status.get("running") is not True or status.get("version") != version:
+              raise SystemExit(f"daemon status is not healthy: {status}")
+          print(status["pid"])
+          PY
+          )"
+          "$B/bin/serialwrap" daemon stop
+          for _ in $(seq 1 100); do
+            kill -0 "$daemon_pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if kill -0 "$daemon_pid" 2>/dev/null; then
+            echo "daemon pid ${daemon_pid} still running after daemon stop"
+            exit 1
+          fi
+          if "$B/bin/serialwrap" daemon status > /dev/null 2>&1; then
+            echo "daemon status still succeeds after daemon stop"
+            exit 1
+          fi
+          echo "container smoke passed for serialwrap-${VERSION}"
+          CONTAINER
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::bundle daemon failed in clean ubuntu:24.04 container (exit ${status})"
+            exit 1
+          fi
+          if ! grep -qF "container smoke passed for serialwrap-${VERSION}" "$log"; then
+            echo "::error::container smoke did not report success"
+            exit 1
+          fi
+
+      - name: Upload bundle to release
+        id: upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release upload "$TAG_NAME" "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" dist/SHA256SUMS --clobber
