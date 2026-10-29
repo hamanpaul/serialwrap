@@ -172,25 +172,27 @@ record cfg_boundary --command "python3 scripts/rust/check_cfg_boundary.py" --exi
 # 2. Linux L1（s21_core）
 # F108（編排者裁決）：linux_l1 以非 root 執行。euid==0 時須以 SW_GATE_L1_USER（使用者名稱）經 setpriv 降權執行；
 # 無法降權即不執行、記 EVIDENCE_MISSING 並要求非 root 補跑（不得記 PASS，也不得以 root 專屬失敗記 FAIL）。
-mkdir -p "$RUN_DIR/linux_l1"
-l1_cmd=(python3 scripts/rust/cargo_l1_results.py --platform linux --out "$RUN_DIR/linux_l1/l1-results.json"
-  -- --workspace --features test-fakes -- --skip cap_)
-l1_euid="$(id -u)"
-l1_run=1
-if [[ "$l1_euid" == 0 ]]; then
+# sol P5-54dd588-2：同一降權規則亦用於 linux_cap_posix_pty（其必要集合含 root 下必紅的 sw-pal 預設測試）。
+nonroot_cmd() {  # nonroot_cmd <輸出目錄> <命令…>：設定 NONROOT_CMD／NONROOT_EUID；euid==0 且無法降權回 1
+  local dir="$1"; shift
+  NONROOT_CMD=("$@")
+  NONROOT_EUID="$(id -u)"
+  [[ "$NONROOT_EUID" != 0 ]] && return 0
   if [[ -n "${SW_GATE_L1_USER:-}" ]] && command -v setpriv >/dev/null 2>&1 && id -u "$SW_GATE_L1_USER" >/dev/null 2>&1; then
-    l1_euid="$(id -u "$SW_GATE_L1_USER")"
-    chown -R "$SW_GATE_L1_USER" "$RUN_DIR/linux_l1"
-    l1_cmd=(setpriv --reuid="$l1_euid" --regid="$(id -g "$SW_GATE_L1_USER")" --init-groups
-      env HOME="$(getent passwd "$SW_GATE_L1_USER" | cut -d: -f6)" "${l1_cmd[@]}")
-  else
-    l1_run=0
+    NONROOT_EUID="$(id -u "$SW_GATE_L1_USER")"
+    chown -R "$SW_GATE_L1_USER" "$dir"
+    NONROOT_CMD=(setpriv --reuid="$NONROOT_EUID" --regid="$(id -g "$SW_GATE_L1_USER")" --init-groups
+      env HOME="$(getent passwd "$SW_GATE_L1_USER" | cut -d: -f6)" "$@")
+    return 0
   fi
-fi
-if [[ "$l1_run" == 1 ]]; then
-  run_logged linux_l1 "${l1_cmd[@]}"
+  return 1
+}
+mkdir -p "$RUN_DIR/linux_l1"
+if nonroot_cmd "$RUN_DIR/linux_l1" python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_l1/l1-results.json" -- --workspace --features test-fakes -- --skip cap_; then
+  run_logged linux_l1 "${NONROOT_CMD[@]}"
   record linux_l1 --required-set s21_core --command "cargo_l1_results.py --platform linux -- --workspace --features test-fakes -- --skip cap_" \
-    --exit "$LAST_RC" --log logs/linux_l1.log --l1-results linux_l1/l1-results.json --run-euid "$l1_euid"
+    --exit "$LAST_RC" --log logs/linux_l1.log --l1-results linux_l1/l1-results.json --run-euid "$NONROOT_EUID"
 else
   record linux_l1 --required-set s21_core --section-verdict EVIDENCE_MISSING --run-euid 0 \
     --reason "F108：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_l1 須以非 root 補跑"
@@ -198,23 +200,28 @@ fi
 
 # OD-53 --caps 推導（rulings/p5.md 第 7 輪：與 s22 gate 相同規則）：收集器的 --caps 與 argv 一律由鎖中該 section 必要集合的
 # selector 推導（`--ignored cap_<cap>__` → `--caps <cap>`；不含 ignored 篩選 → 不需 caps；argv＝required_set 的 selector），
-# 不在 gate 內手寫；推導不出即不執行、記 EVIDENCE_MISSING。
-caps_args() {  # caps_args <section>：設定 CAPS_ARGV＝(--caps <cap>… -- <selector argv>)；推導不出回 1
+# 不在 gate 內手寫；推導不出即不執行、記 EVIDENCE_MISSING。sol P5-54dd588-2：計畫的 caps_only 為 true（每個必要集合都只選
+# ignored 能力列）時另帶 --caps-only，收集器略過預設 run、其餘收集列記 deselected。
+caps_args() {  # caps_args <section>：設定 CAPS_ARGV＝([--caps-only] --caps <cap>… -- <selector argv>)；推導不出回 1
   local plan
   plan="$(python3 "$JUDGE" caps-plan --section "$1" 2>/dev/null)" || return 1
-  mapfile -t CAPS_ARGV < <(python3 -c 'import json,sys; p=json.loads(sys.argv[1]); [print(x) for c in p["caps"] for x in ("--caps", c)]; print("--"); [print(a) for a in p["argv"]]' "$plan")
+  mapfile -t CAPS_ARGV < <(python3 -c 'import json,sys; p=json.loads(sys.argv[1]); p["caps_only"] and print("--caps-only"); [print(x) for c in p["caps"] for x in ("--caps", c)]; print("--"); [print(a) for a in p["argv"]]' "$plan")
 }
 
 # 3. Linux cap_posix_pty
+#    sol P5-54dd588-2：必要集合含 sw-pal 預設測試（root 下數支必紅），比照 F108 以非 root 執行；無法降權即不執行、記 EVIDENCE_MISSING。
 mkdir -p "$RUN_DIR/linux_cap_posix_pty"
-if caps_args linux_cap_posix_pty; then
-  run_logged linux_cap_posix_pty python3 scripts/rust/cargo_l1_results.py --platform linux \
-    --out "$RUN_DIR/linux_cap_posix_pty/l1-results.json" "${CAPS_ARGV[@]}"
+if ! caps_args linux_cap_posix_pty; then
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
+elif nonroot_cmd "$RUN_DIR/linux_cap_posix_pty" python3 scripts/rust/cargo_l1_results.py --platform linux \
+    --out "$RUN_DIR/linux_cap_posix_pty/l1-results.json" "${CAPS_ARGV[@]}"; then
+  run_logged linux_cap_posix_pty "${NONROOT_CMD[@]}"
   record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty \
     --command "cargo_l1_results.py --platform linux ${CAPS_ARGV[*]}" \
-    --exit "$LAST_RC" --log logs/linux_cap_posix_pty.log --l1-results linux_cap_posix_pty/l1-results.json
+    --exit "$LAST_RC" --log logs/linux_cap_posix_pty.log --l1-results linux_cap_posix_pty/l1-results.json --run-euid "$NONROOT_EUID"
 else
-  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --reason "必要集合的 selector 推導不出收集器 --caps（OD-53）"
+  record linux_cap_posix_pty --required-set s21_gate:linux_cap_posix_pty --section-verdict EVIDENCE_MISSING --run-euid 0 \
+    --reason "F108／sol P5-54dd588-2：gate 以 root 執行且無法降權（未設 SW_GATE_L1_USER 或無 setpriv）；linux_cap_posix_pty 須以非 root 補跑"
 fi
 
 # 3b. OD-55 linux 能力集合（P5 第 6 輪 SPEC-GAP #2，編排者裁決）：先探測能力，具備才以 --caps <cap> 實跑；

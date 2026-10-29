@@ -61,11 +61,15 @@ def _write_exe(exe_dir: Path, name: str, *, run_out: str, exit_code: int = 0) ->
     exe_dir.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         exe = exe_dir / f"{name}.cmd"
+        # 與 fake_libtest.sh 同語意：參數附加到 argv.log；`--list`／`--ignored --list` 輸出清單；能力 run（`--ignored
+        # <filter>…`）有 run_cap_out.txt 時輸出該檔；其餘輸出 run_out.txt。
         exe.write_text(
             "@echo off\r\n"
             'set "base=%~dp0"\r\n'
-            'if /i "%~1"=="--ignored" (type "%base%list_ignored.txt" & exit /b 0)\r\n'
+            '>>"%base%argv.log" echo(%*\r\n'
             'if /i "%~1"=="--list" (type "%base%list_all.txt" & exit /b 0)\r\n'
+            'if /i "%~1"=="--ignored" if /i "%~2"=="--list" (type "%base%list_ignored.txt" & exit /b 0)\r\n'
+            'if /i "%~1"=="--ignored" if exist "%base%run_cap_out.txt" (type "%base%run_cap_out.txt" & exit /b 0)\r\n'
             'type "%base%run_out.txt"\r\n'
             'for /f "usebackq delims=" %%I in ("%base%exit_code") do exit /b %%I\r\n'
             "exit /b 0\r\n",
@@ -661,23 +665,95 @@ def test_passing_run_saves_no_failure_output(tmp_path: Path) -> None:
 def test_capability_runs_are_single_threaded(tmp_path: Path) -> None:
     """P5 第 7 輪：能力測試（`--caps`）改以 `--test-threads=1` 執行。同執行檔平行測試 fork 子行程時，子行程在 exec 前
     暫時持有父行程全部 fd 的複本（含 CLOEXEC 者），被其他測試的 /proc holder 掃描看成外部 holder（cap_posix_pty__*
-    並行負載下 5～11/180 間歇 `Held(pids:[同執行檔子行程])`；單執行緒 0/180）。預設（非能力）執行不變。"""
-    if os.name == "nt":
-        pytest.skip("POSIX 假 libtest（argv 紀錄）")
+    並行負載下 5～11/180 間歇 `Held(pids:[同執行檔子行程])`；單執行緒 0/180）。預設（非能力）執行不變。
+    （sol P5-54dd588-2 時改由假 libtest 自身記錄參數，移除原本的平台條件 SKIP——本檔為 core_portable。）"""
     _assert_script()
     exe = _write_exe(tmp_path / "exe_a", TARGET, run_out="run_ignored_cap.txt")
-    real = exe.with_name(exe.name + ".real")
-    exe.rename(real)
-    exe.write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path}/argv.log"\nexec "{real}" "$@"\n', encoding="utf-8")
-    exe.chmod(0o755)
     bin_dir = tmp_path / "bin"
     _write_cargo(bin_dir, [_artifact(exe, TARGET)])
     out = tmp_path / "l1.json"
     r = _run(tmp_path, bin_dir, ["--platform", "linux", "--caps", "posix_pty", "--out", str(out)])
     _report(out, r)
-    runs = [line.split() for line in (tmp_path / "argv.log").read_text(encoding="utf-8").splitlines()
-            if "--list" not in line.split()]
+    runs = _test_runs(exe)
     cap_runs = [a for a in runs if "--ignored" in a]
     default_runs = [a for a in runs if "--ignored" not in a]
     assert cap_runs and all("--test-threads=1" in a for a in cap_runs), runs
     assert default_runs and not any("--test-threads=1" in a for a in default_runs), runs
+
+
+def _test_runs(exe: Path) -> list[list[str]]:
+    """假 libtest 的 argv.log 中非 `--list` 的呼叫（即實際的測試 run）。"""
+    lines = (exe.parent / "argv.log").read_text(encoding="utf-8").splitlines()
+    return [line.split() for line in lines if "--list" not in line.split()]
+
+
+# --------------------------------------------------------------------------- sol P5-54dd588-2（Medium）：--caps-only
+
+def _exe_with_failing_default_and_ok_cap(exe_dir: Path) -> Path:
+    """預設 run 有一列失敗（b FAILED、exit 101，模擬 root 下 sw-pal 必紅的預設測試），能力 run 只回 cap 列 passed。"""
+    exe = _write_exe(exe_dir, TARGET, run_out="run_b_failed.txt", exit_code=101)
+    shutil.copyfile(FIXTURE / "run_cap_c_ok.txt", exe_dir / "run_cap_out.txt")
+    return exe
+
+
+@pytest.mark.process_rpc
+def test_caps_without_caps_only_runs_default_tests_and_fails(tmp_path: Path) -> None:
+    """失敗情境（sol P5-54dd588-2）：能力 section 原命令 `--caps <cap>` 先跑預設 run；預設列失敗 → l1_judge 規則
+    「任何列失敗 → FAIL」，即使必要集合只有能力列且能力列通過。"""
+    _assert_script()
+    exe = _exe_with_failing_default_and_ok_cap(tmp_path / "exe_a")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--caps", "posix_pty", "--out", str(out)])
+    rep = _report(out, r)
+    assert [a for a in _test_runs(exe) if "--ignored" not in a], "未帶 --caps-only 時仍執行預設 run"
+    assert _rows(rep)[C]["outcome"] == "passed"
+    assert _load_judge().judge(rep, [C], platform="linux")["verdict"] == "FAIL"
+
+
+@pytest.mark.process_rpc
+def test_caps_only_skips_default_run_and_deselects_other_rows(tmp_path: Path) -> None:
+    """sol P5-54dd588-2（Medium）：`--caps-only` 略過預設 run，只跑 `--ignored cap_<cap>__ --test-threads=1`；其餘收集列
+    記為 deselected（結果與收集一致），報告 argv 為呼叫端交付的 selector argv；能力列通過 → l1_judge PASS。"""
+    _assert_script()
+    exe = _exe_with_failing_default_and_ok_cap(tmp_path / "exe_a")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--caps-only", "--caps", "posix_pty", "--out", str(out)])
+    rep = _report(out, r)
+    assert r.returncode == 0, r.stderr
+    assert _test_runs(exe) == [["--ignored", "cap_posix_pty__", "--test-threads=1"]]
+    assert set(_rows(rep)) == {C} and _rows(rep)[C]["outcome"] == "passed"
+    assert sorted(rep["deselected"]) == sorted([A, B]) and sorted(rep["collected"]) == sorted([A, B, C])
+    assert rep["argv"] == ["--workspace"] and rep["exit_code"] == 0 and rep["finished"] is True
+    res = _load_judge().judge(rep, [C], platform="linux")
+    assert res["verdict"] == "PASS", res["reasons"]
+    # 必要集合含非能力列時，--caps-only 的結果不得被當成已執行（deselected required → 非 PASS）
+    assert _load_judge().judge(rep, [A, C], platform="linux")["verdict"] != "PASS"
+
+
+@pytest.mark.process_rpc
+def test_caps_only_target_without_selected_cap_is_not_run(tmp_path: Path) -> None:
+    """`--caps-only` 時不含所選能力測試的執行檔完全不執行，其收集列全數 deselected；沒有任何執行檔含該能力 → 非 0 結束。"""
+    _assert_script()
+    exe = _exe_with_failing_default_and_ok_cap(tmp_path / "exe_a")
+    bin_dir = tmp_path / "bin"
+    _write_cargo(bin_dir, [_artifact(exe, TARGET)])
+    out = tmp_path / "l1.json"
+    r = _run(tmp_path, bin_dir, ["--platform", "linux", "--caps-only", "--caps", "sys_admin", "--out", str(out)])
+    rep = _report(out, r)
+    assert r.returncode != 0
+    assert _test_runs(exe) == []
+    assert rep["results"] == [] and sorted(rep["deselected"]) == sorted([A, B, C])
+
+
+@pytest.mark.process_rpc
+def test_caps_only_requires_caps(tmp_path: Path) -> None:
+    """`--caps-only` 未指定任何 `--caps` 無意義（會什麼都不跑），拒絕並以 2 結束、不寫報告。"""
+    _assert_script()
+    out = tmp_path / "l1.json"
+    r = subprocess.run([sys.executable, str(SCRIPT), "--caps-only", "--out", str(out), "--", "--workspace"],
+                       cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert r.returncode == 2 and not out.exists(), (r.returncode, r.stderr)
