@@ -105,3 +105,33 @@ def test_slice22_case_set_frozen_and_mapped() -> None:
     assert "l15-delayed-reply" not in lock and "l15-delayed-reply" in set(sets["slice_2.3"])
     emap = yaml.safe_load((ROOT / "tests/acceptance/slice22_evidence_map.yaml").read_text(encoding="utf-8"))["cases"]
     assert set(emap) == lock, "evidence map 的分母必須等於凍結的 slice_2.2 集合"
+
+
+def _od34_deferred_map_problems(emap: dict, amendments: list[dict], sets: dict[str, list[str]]) -> list[str]:
+    """Slice 2.2 修訂鏈逐名延後的案例，若仍出現在 Slice 2.2 對照表或承擔歸屬不符，回傳問題清單。"""
+    problems: list[str] = []
+    for amend in amendments:
+        for row in amend.get("removed", []):
+            cid = row["case_id"]
+            if cid in emap:
+                problems.append(f"{cid}：已依 {row['decision']} 延至 Slice {row['to_slice']}，不得列在 slice22_evidence_map.yaml")
+            if cid in sets["slice_2.2"] or cid not in sets[f"slice_{row['to_slice']}"]:
+                problems.append(f"{cid}：cases.lock.json 歸屬不符（應不在 slice_2.2、在 slice_{row['to_slice']}）")
+    return problems
+
+
+@pytest.mark.memory_only
+def test_od34_deferred_cases_absent_from_slice22_evidence_map() -> None:
+    # rulings/p7.md P7-9065f14-1：l15-delayed-reply 的承擔依 OD-34 現行歸屬（Slice 2.3，P7），Slice 2.2 對照表
+    # 不得再列（含 Task 0 骨架的 `{status: PENDING}` 佔位）；cowork-01-agent-bad-cmd 同屬 OD-34 修訂 #1。
+    amendments = json.loads((ROOT / "tests/acceptance/breaker/slice_2.2.amendments.json").read_text(encoding="utf-8"))
+    removed = {row["case_id"]: row for a in amendments for row in a.get("removed", [])}
+    for cid in ("l15-delayed-reply", "cowork-01-agent-bad-cmd"):
+        assert removed.get(cid, {}).get("decision") == "OD-34" and removed[cid]["to_slice"] == "2.3", cid
+    sets = json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))["sets"]
+    emap = yaml.safe_load((ROOT / "tests/acceptance/slice22_evidence_map.yaml").read_text(encoding="utf-8"))["cases"]
+    assert _od34_deferred_map_problems(emap, amendments, sets) == []
+    # 判定器自檢：P7 分支殘留的舊版對照表（`l15-delayed-reply: {status: PENDING}`）必須被抓到。
+    stale = {**emap, "l15-delayed-reply": {"status": "PENDING"}}
+    assert _od34_deferred_map_problems(stale, amendments, sets) == [
+        "l15-delayed-reply：已依 OD-34 延至 Slice 2.3，不得列在 slice22_evidence_map.yaml"]
