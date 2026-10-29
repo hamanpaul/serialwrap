@@ -2675,9 +2675,11 @@ def test_full_required_set_passes(tmp_path):
 > regression family F1～F6、F8、F12 依上表 B-09～B-16 記 BLOCKED-OWNER（`scripts/rust/p7_case_coverage.py`
 > `OWNER_BY_REGRESSION_FAMILY`；現行 `cases.lock.json` slice_2.3 中這八個 family 共 27 案，裁決文字記 29 案，以鎖檔為準）。
 > (ii) daemon_slice 2.1／2.2 的先前切片案例（contract-blackbox、func-test、l15-scenario，如 `sm-01`、`sm-04`、`ha-05`、
-> `l15-wal-interference`）不在本 gate 重跑，coverage 改以 slice21 gate 的 `case_verdicts.json`（`--slice21-verdicts`）與
-> s22 gate（`scripts/rust/s22_gate_check.py`）輸出（`--slice22-gate`）逐案判定；`p7_gate.sh` 由
-> `P7_SLICE21_CASE_VERDICTS`／`P7_S22_GATE_JSON` 指定兩份證據（並記入該列 evidence 的 sha256），缺證據即缺漏、不得記 PASS。
+> `l15-wal-interference`）不在本 gate 重跑，coverage 改以 slice21 gate 的 run 目錄（`report.json`＋`case_verdicts.json`，
+> `--slice21-run`）與 s22 gate（`scripts/rust/s22_gate_check.py`）輸出（`--slice22-gate`，須含 `identity`）逐案判定；`p7_gate.sh` 由
+> `P7_SLICE21_GATE_RUN`／`P7_S22_GATE_JSON` 指定兩份證據（並記入該列 evidence 的 sha256），缺證據即缺漏、不得記 PASS。
+> 匯入證據須綁定本 gate（審查 P7-38c150c-3）：來源 `git_revision` 等於本 run `results.json` 的 `git_head`、受測 daemon sha256
+> 等於本 run 快照的 serialwrapd，否則該切片匯入證據不採用（`coverage.json` 的 `prior_sources` 記錄採用與否與原因）。
 
 ## Slice 2.3 出口對照（規格 §11.6）
 

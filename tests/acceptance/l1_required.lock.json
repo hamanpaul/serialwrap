@@ -3862,6 +3862,7 @@
           "tests/test_p7_ab_report.py::test_coverage_b_numbers_for_prior_slice_regression_families",
           "tests/test_p7_ab_report.py::test_coverage_crate_sourced_case_uses_cargo_l1",
           "tests/test_p7_ab_report.py::test_coverage_prior_slice_cases_use_imported_slice_gate_evidence",
+          "tests/test_p7_ab_report.py::test_coverage_prior_slice_evidence_must_match_p7_head_and_artifact",
           "tests/test_p7_ab_report.py::test_coverage_requires_pass_or_numbered_owner_block",
           "tests/test_p7_ab_report.py::test_external_evidence_path_is_locatable",
           "tests/test_p7_ab_report.py::test_func_phase_status[FAIL-1-FAIL]",

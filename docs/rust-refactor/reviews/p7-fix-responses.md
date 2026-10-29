@@ -365,14 +365,15 @@ BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-
 | P7-cd7acf0-4 | Medium（3 輪） | slice22-b 集合 | 審查者已核對不成立主張屬實（P6 檔案不在本分支、gate 記 BLOCKED-UPSTREAM 不誤判 PASS）；維持至 P6 合入 |
 | P7-de7a95a-1～3、P7-b85eec5-2 | Low | — | 依收斂規則不修 |
 
-## 第 13 輪（第七輪雲端）：merge 主線（733381e6）＋P5（056046fb）、rulings/p7.md 第 6 輪裁決、p7-cloud/b85eec5_a04aa69-sol
+## 第 13 輪（第七輪雲端）：merge 主線（733381e6）＋P5（37471d33、903c0525）、rulings/p7.md 第 6 輪裁決、p7-cloud/b85eec5_a04aa69-sol
 
 ### merge
 
 | merge | 內容 | 衝突處理 |
 |---|---|---|
 | `733381e6` | origin/feature/rust-refactor `8963d07`（OD-48 legacy handoff、0.4.0 release 前置、Docker scope cgroup 判定） | `contracts/behavior_changes.yaml`：保留 P7 的 SC-30／DF-18／DF-23 與 revision 8，於 SC-37 後加入主線 SC-39；`test_bc_real_sc_df_ranges` SC 集合取聯集；`crates/sw-pal/src/proc_scan/posix.rs`（P5 擁有）採 P5 合併同一主線的解法（`d657a7c3`）再加回 P7 既有 `held_fd_targets` |
-| `056046fb` | origin/feature/rust-refactor-p5 `1b83da9`（OD-55 能力集合、OD-58／64／65／66、`test_two_daemons_same_tty` harness 修正） | 表頭註解與 SC 範圍測試取 P7 端（內容為聯集）。L1 鎖對 P7 父節點消失的 27 筆 s21_core.linux 皆為 P5 依 OD-55 的逐名移除（24 筆移入 `s21_gate:cap_*`、3 筆非能力列直接移除）；對 PR base（主線）`regen_lock --check --base` OK |
+| `37471d33` | origin/feature/rust-refactor-p5 `1b83da9`（OD-55 能力集合、OD-58／64／65／66、`test_two_daemons_same_tty` harness 修正） | 表頭註解與 SC 範圍測試取 P7 端（內容為聯集）。L1 鎖對 P7 父節點消失的 27 筆 s21_core.linux 皆為 P5 依 OD-55 的逐名移除（24 筆移入 `s21_gate:cap_*`、3 筆非能力列直接移除）；對 PR base（主線）`regen_lock --check --base` OK。語意衝突：`crates/sw-core/src/mailbox.rs`（P5 OD-64 探針）把 `Data(_)` 收窄為 `UartRxChunk`，與 P7 分支既有的 console DataEvent 合起來 `--features test-fakes` 編譯失敗（E0004），改為接受所有 data 變體（非 UART data 佔 FIFO 位置、不計同 epoch；與 P6 `09115d77` 等價） |
+| `903c0525` | origin/feature/rust-refactor-p5 `3bbb40e`（OD-67 明確 ids） | 無衝突；P7 集合舊 id → 新 id 恆等（見下表 OD-67 列） |
 
 S1X-a 修正（`origin/feature/s1x-a-fixes`）尚未合入主線：rulings/s1.md「S1X-a 修正對 Rust 的連帶」、OD-62／OD-63 與 OD-57「S1X-a 合入後重測 Python、可能改 parity 結案」依指示列待辦（本輪不處理）。
 
@@ -387,7 +388,7 @@ S1X-a 修正（`origin/feature/s1x-a-fixes`）尚未合入主線：rulings/s1.md
 | SPEC-GAP #5（Windows COM 列，適用 OD-53） | **done（Linux 端）**：`WIN_COM_ARGS` 改為 test-binary `--ignored cap_windows_com__`（`--caps windows_com` 實跑）；回歸 `test_com_row_is_od53_capability_set` 以 OD-24 防線的 `_selector_explicit_caps` 推導核對（修前紅）。`p7_gate:win-test-sh-caps-windows-com` 的原生收集登記列 LOCAL-WINDOWS-TODO P7-LW-9（程序已更新） |
 | SPEC-GAP #6（l15 slice23 路徑） | **done**：計畫 08 Task 18 兩處路徑改為 `func-test/scenarios/s23-*.yaml` 並加 P7 修訂註記；CHG-S23-L15-PATH-01 狀態註明編排者裁決接受 |
 | SPEC-GAP #7（s23 interleave 以 WAL 先後判定） | **done**：`tests/acceptance/l15/test_slice23_l15.py` 新增純函式 `s23_probe_ready_windows`——以 WAL seq 先後切出 ready probe 窗口（`system` 來源 `echo __READY__<nonce>` TX 起，至 RX 先見 `__READY__<nonce>`、其後見 prompt 止，與 Python `login_fsm` 先等 nonce 再等 prompt 一致），窗口內不得有非 `system` 來源的 TX、已收窗口 ≥ 2；`s23-interleave-login-agent-human` 於 runner PASS 後套用。回歸 `test_wal_probe_ready_window_oracle`（修前紅）；不改 P2 runner。CHG-S23-INTERLEAVE-WAL-03 |
-| OD-67（三支參數化測試舊自動 id） | **部分**：`test_cargo_toml_bypass` 已由 P5（`7facc75c`）給明確 ids，且新 id 與 `p7_gate:python3-m-pytest-q-tests` 凍結的舊 id 逐字相同（pytest 9.0.3／9.2.0 收集皆 4 筆、與鎖一致），P7 集合無須移除；`test_invalid_regex_rpc_and_arbiter_reject_without_enqueue`（`tests/test_command_completion.py`）與 `test_classify_pyserial_open_error`（`tests/test_stage0_uart_exclusive.py`）在主線、P5、P6、S1X 各分支皆尚未給明確 ids（9.2.0 下 `[aaa…(1025)]`→`[invalid2]`、`[…COM9…-expected2]`→`[msg2-expected2]`），依裁決「新 id 須先由擁有該測試檔的分支改好」列待辦，P7 不改他人測試檔 |
+| OD-67（三支參數化測試舊自動 id） | **done（`903c0525`）**：P5 `3bbb40e` 為 `test_invalid_regex_rpc_and_arbiter_reject_without_enqueue`、`test_classify_pyserial_open_error` 給明確 ids（`test_cargo_toml_bypass` 已於 `7facc75c`），皆沿用 pytest 9.0.3 自動 id 形式；`p7_gate:python3-m-pytest-q-tests.linux` 的舊 id → 新 id 逐筆恆等 5→5、4→4、4→4（pytest 9.0.3 與 9.2.0 收集 13 筆相同且等於凍結清單），收集數不變，`--allow-removal` 0 筆（本列原寫「部分／待辦」，為本輪 merge 前的狀態，審查 P7-38c150c-4 指出後更正） |
 
 驗證（本組 commit，4 CPU、ubuntu 非 root、CPython 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3＋pyserial 3.5）：
 OD-59 案例 A（Python）／B（Rust 快照）皆 1 passed（cancel max 1.703／2.358 ms、stop max 0.706／0.367 ms，上限 100 ms；
@@ -405,3 +406,14 @@ deferred 節點，OWNER-BATCH）；slice22 B INCOMPLETE（P6）；l15 slice21 B 
 coverage FAIL（154 案：37 PASS、82 BLOCKED-OWNER、35 缺漏——2.2 匯入 19、2.1 匯入 13、P6 相關 3）；全套 pytest FAIL
 （5 failed／5766 passed／224 skipped，失敗集合為起點基準子集）。gate 後以實跑 l1-results 將 merge 帶入、已通過的 147 個節點
 add-only 登記至 `p7_gate:python3-m-pytest-q-tests`（skip／xfail 不納入，口徑同 b85eec5），集合 5624→5771。
+
+### p7-cloud/a04aa69_38c150c（雲端 Opus xhigh 代理 sol，incr）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-38c150c-1 | Medium | merge 帶入 P5 OD-58（`bebefe97`）後，`p7_gate:l15-slice21-b` 仍凍結已不收集的 `test_case[rust-…-s21-event-latency]`，「l15 slice21 B」列恆 INCOMPLETE（r13b 實跑同） | **OWNER-BATCH**：OD-58 授權自 P5 l15_ab 逐名移出該案，但未明列 P7 的 `p7_gate:l15-slice21-b`；依審查建議先請編排者確認 OD-58 涵蓋此集合再以 `regen_lock --l1-add-only --allow-removal 'p7_gate:l15-slice21-b:linux:tests/acceptance/l15/test_slice21_l15.py::test_case[rust-SERIALWRAP_L15_RUST_DAEMON-s21-event-latency]'` 移除（PR base 為主線、主線鎖無 p7_gate 集合，CI 白名單不需改）。「凍結節點皆可收集」的回歸在移除前加入會恆紅，待裁決後與移除同 commit 補 |
+| P7-38c150c-2 | Medium | OD-59 案例樣本量（cancel 200×1、stop 20×1）少於 event_latency 契約 500×3，週期性停頓（第 250 次）漏抓 | **OWNER-BATCH**：照契約跑滿 500×3 估計 A 輪約 45 分鐘、B 輪約 30 分鐘（stop_request 每樣本一個新 daemon），會使全套 pytest 與 CI 預設 job 各增加約 45 分鐘；屬量測口徑／成本取捨，請裁定 (a) 跑滿契約值、(b) 核准縮減值並記為偏離、或 (c) 移到 gate 專屬 section。CHG-S23-CTRL-LATENCY-OD59-01 已改記「樣本量偏離、待裁決」，裁決前不視為 OD-59 口徑下的 gate 證據 |
+| P7-38c150c-3 | Medium | 匯入的先前切片證據無來源綁定（手寫 verdicts 或他 commit 的輸出可轉 PASS） | **fixed**：coverage 改吃 slice21 gate run 目錄（`report.json`＋`case_verdicts.json`，`--slice21-run`）與含 `identity` 的 s22 輸出，並以本 run `results.json`（`--p7-results`）核對——`git_revision` 等於 `git_head`、daemon sha256 等於快照 serialwrapd，否則該切片匯入不採用（全為缺漏）；`coverage.json` 新增 `prior_sources`（採用與否、原因）。`p7_gate.sh` 改用 `P7_SLICE21_GATE_RUN` 並傳 `--p7-results`。回歸 `test_coverage_prior_slice_evidence_must_match_p7_head_and_artifact`（手寫／他 commit／他 artifact／缺身分／缺 results 皆缺漏；修前紅）、`test_coverage_prior_slice_cases_use_imported_slice_gate_evidence` 改用新介面（修前紅）。s22 gate 輸出目前無 `identity` 欄位（P6 檔案），列 SPEC-GAP |
+| P7-38c150c-4 | Low | fix-responses 的 merge commit 編號、mailbox 調整未揭露、OD-67 列過時 | 本輪紀錄筆誤，已順帶更正上方兩表（不涉程式） |
+| P7-38c150c-5、-6 | Low | interleave 接線無 memory-only 回歸；`_judge_prior` 的 BLOCKED-OWNER 與取最差範圍 | 依收斂規則不修（記 low-backlog） |
+| P7-cd7acf0-4 | Medium（5 輪） | 缺 `p7_gate:contract-blackbox-slice22-b` | 維持 BLOCKED-UPSTREAM（P6 檔案不在本分支），累計 ≥3 輪，列 OWNER-BATCH 請裁定「延後至 P6 合入」 |

@@ -190,15 +190,23 @@ done
 run_row "regen_lock --check" regen-lock-check --evidence "$RUN/logs/regen-lock-check.log" -- \
   python3 tests/acceptance/regen_lock.py --check
 # 14. slice_2.3 必要案例涵蓋。2.1／2.2 先前切片案例不在本 gate 重跑，以對應切片 gate 的逐案證據判定（rulings/p7.md
-#     SPEC-GAP #4 (ii)）：P7_SLICE21_CASE_VERDICTS＝slice21 gate 的 case_verdicts.json、P7_S22_GATE_JSON＝s22_gate_check.py
-#     輸出；未設或檔案不存在時該切片案例記缺漏（不得 PASS）。證據檔複製進 run 目錄後才引用，sha256 隨該列記錄。
-COV_ARGS=(--ab-dir "$AB" --out "$RUN/coverage.json" --cargo-l1 "$RUN/cargo-test-workspace/l1-results.json")
+#     SPEC-GAP #4 (ii)）：P7_SLICE21_GATE_RUN＝slice21 gate 的 run 目錄（report.json＋case_verdicts.json）、
+#     P7_S22_GATE_JSON＝s22_gate_check.py 輸出（須含 identity）；未設或檔案不存在時該切片案例記缺漏（不得 PASS）。
+#     匯入證據的 git_revision 與受測 daemon sha256 須等於本 run 的 results.json（審查 P7-38c150c-3），否則不採用。
+#     證據檔複製進 run 目錄後才引用，sha256 隨該列記錄。
+COV_ARGS=(--ab-dir "$AB" --out "$RUN/coverage.json" --cargo-l1 "$RUN/cargo-test-workspace/l1-results.json"
+          --p7-results "$RUN/results.json")
 COV_EV=(--evidence "$RUN/coverage.json")
 mkdir -p "$RUN/prior-slices"
-if [[ -n "${P7_SLICE21_CASE_VERDICTS:-}" && -f "${P7_SLICE21_CASE_VERDICTS}" ]]; then
-  cp -p "$P7_SLICE21_CASE_VERDICTS" "$RUN/prior-slices/slice21-case_verdicts.json"
-  COV_ARGS+=(--slice21-verdicts "$RUN/prior-slices/slice21-case_verdicts.json")
-  COV_EV+=(--evidence "$RUN/prior-slices/slice21-case_verdicts.json")
+if [[ -n "${P7_SLICE21_GATE_RUN:-}" && -f "${P7_SLICE21_GATE_RUN}/report.json" ]]; then
+  mkdir -p "$RUN/prior-slices/slice21"
+  cp -p "$P7_SLICE21_GATE_RUN/report.json" "$RUN/prior-slices/slice21/report.json"
+  COV_EV+=(--evidence "$RUN/prior-slices/slice21/report.json")
+  if [[ -f "$P7_SLICE21_GATE_RUN/case_verdicts.json" ]]; then
+    cp -p "$P7_SLICE21_GATE_RUN/case_verdicts.json" "$RUN/prior-slices/slice21/case_verdicts.json"
+    COV_EV+=(--evidence "$RUN/prior-slices/slice21/case_verdicts.json")
+  fi
+  COV_ARGS+=(--slice21-run "$RUN/prior-slices/slice21")
 fi
 if [[ -n "${P7_S22_GATE_JSON:-}" && -f "${P7_S22_GATE_JSON}" ]]; then
   cp -p "$P7_S22_GATE_JSON" "$RUN/prior-slices/s22-gate.json"

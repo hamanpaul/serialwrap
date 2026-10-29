@@ -256,9 +256,44 @@ def test_coverage_b_numbers_for_prior_slice_regression_families(tmp_path):
         assert f"| {bid} | L2 {fam} " in plan, (fam, bid)       # 編號須登記於 08 BLOCKED-OWNER 總表
 
 
+HEAD = "a" * 40
+DAEMON_SHA = "d" * 64
+
+
+def _p7_results(tmp: pathlib.Path, head: str = HEAD, daemon_sha: str = DAEMON_SHA) -> pathlib.Path:
+    """P7 gate 的 results.json（只含 coverage 綁定用的 git_head 與受測 daemon sha256）。"""
+    p = tmp / "p7-results.json"
+    p.write_text(json.dumps({"git_head": head, "artifacts": {"target/p7-gate/r/artifacts/serialwrapd": daemon_sha,
+                                                           "target/p7-gate/r/artifacts/serialwrap": "c" * 64}}),
+                 encoding="utf-8")
+    return p
+
+
+def _slice21_run(tmp: pathlib.Path, verdicts: dict, head: str = HEAD, daemon_sha: str = DAEMON_SHA,
+                 name: str = "s21-run") -> pathlib.Path:
+    """slice21 gate run 目錄：report.json（git_revision、identity.daemon_sha256）＋case_verdicts.json。"""
+    d = tmp / name
+    d.mkdir(exist_ok=True)
+    (d / "report.json").write_text(json.dumps({"run_id": "s21g", "git_revision": head,
+                                               "identity": {"daemon_sha256": daemon_sha}}), encoding="utf-8")
+    (d / "case_verdicts.json").write_text(json.dumps(verdicts), encoding="utf-8")
+    return d
+
+
+def _s22_gate(tmp: pathlib.Path, cases: list[dict], head: str | None = HEAD, daemon_sha: str | None = DAEMON_SHA,
+             name: str = "s22.json") -> pathlib.Path:
+    p = tmp / name
+    doc: dict = {"cases": cases, "result": "INSUFFICIENT"}
+    if head is not None:
+        doc["identity"] = {"git_revision": head, "daemon_sha256": daemon_sha}
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    return p
+
+
 def test_coverage_prior_slice_cases_use_imported_slice_gate_evidence(tmp_path):
-    """rulings/p7.md SPEC-GAP #4 (ii)：2.1／2.2 先前切片案例不在本 gate 重跑，以 slice21 gate `case_verdicts.json`
-    與 s22 gate 輸出逐案判定——須為 PASS；缺檔、缺列、非 PASS、重複列皆缺漏。本 gate 另有同案證據時也須通過。"""
+    """rulings/p7.md SPEC-GAP #4 (ii)：2.1／2.2 先前切片案例不在本 gate 重跑，以 slice21 gate（run 目錄的
+    `case_verdicts.json`）與 s22 gate 輸出逐案判定——須為 PASS；缺檔、缺列、非 PASS、重複列皆缺漏。本 gate 另有同案
+    證據時也須通過。匯入證據須綁定本 gate 的 HEAD 與受測 daemon（見下一支）。"""
     l15 = "tests/acceptance/l15/test_slice21_l15.py::test_case"
     cases = [
         {"case_id": "sm-01", "suite": "func-test", "daemon_slice": "2.1"},
@@ -275,18 +310,17 @@ def test_coverage_prior_slice_cases_use_imported_slice_gate_evidence(tmp_path):
     l1.write_text(json.dumps(lock), encoding="utf-8")
     ab_dir = tmp_path / "ab"
     _junit(ab_dir / "l15-slice21-b" / "junit.xml", {f"{l15}[rust-s21-l15-b]": "failed"})
+    res = _p7_results(tmp_path)
     # 未提供匯入證據 → 全數缺漏（即使本 gate 自己的 l15 節點存在）
-    rep = cov.build(ab_dir, cy, lk, bc, l1)
+    rep = cov.build(ab_dir, cy, lk, bc, l1, p7_results=res)
     assert {r["status"] for r in rep["rows"]} == {"GAP"} and rep["gaps"] == 5, rep["rows"]
-    s21 = tmp_path / "case_verdicts.json"
-    s21.write_text(json.dumps({"sm-01": "PASS", "l15-a": "EVIDENCE_MISSING", "l15-b": "PASS"}), encoding="utf-8")
-    s22 = tmp_path / "s22.json"
-    s22.write_text(json.dumps({"cases": [{"case_id": "bc02-x", "status": "PASS"}, {"case_id": "co-01", "status": "PASS"},
-                                         {"case_id": "co-01", "status": "PASS"}], "result": "INSUFFICIENT"}), encoding="utf-8")
+    s21 = _slice21_run(tmp_path, {"sm-01": "PASS", "l15-a": "EVIDENCE_MISSING", "l15-b": "PASS"})
+    s22 = _s22_gate(tmp_path, [{"case_id": "bc02-x", "status": "PASS"}, {"case_id": "co-01", "status": "PASS"},
+                               {"case_id": "co-01", "status": "PASS"}])
     cargo = tmp_path / "cargo.json"
     cargo.write_text(json.dumps({"results": [{"nodeid": "cargo:sw-core::deferred_bc02::overflow_x", "outcome": "failed"}]}),
                      encoding="utf-8")
-    rep = cov.build(ab_dir, cy, lk, bc, l1, cargo_l1=cargo, slice21_verdicts=s21, slice22_gate=s22)
+    rep = cov.build(ab_dir, cy, lk, bc, l1, cargo_l1=cargo, slice21_run=s21, slice22_gate=s22, p7_results=res)
     got = {r["case_id"]: r["status"] for r in rep["rows"]}
     assert got == {"sm-01": "PASS", "l15-a": "GAP",          # 匯入非 PASS
                    "l15-b": "GAP",                           # 匯入 PASS 但本 gate 的同案 l15 節點 failed（取最差）
@@ -294,8 +328,43 @@ def test_coverage_prior_slice_cases_use_imported_slice_gate_evidence(tmp_path):
                    "co-01": "GAP"}, rep["rows"]              # s22 輸出同案重複列
     _junit(ab_dir / "l15-slice21-b" / "junit.xml", {f"{l15}[rust-s21-l15-b]": "passed"})
     cargo.write_text(json.dumps({"results": []}), encoding="utf-8")   # 本 gate 無同案 cargo 證據 → 只看匯入
-    s22.write_text(json.dumps({"cases": [{"case_id": "bc02-x", "status": "PASS"}, {"case_id": "co-01", "status": "BLOCKED-OWNER"}]}),
-                   encoding="utf-8")
-    rep = cov.build(ab_dir, cy, lk, bc, l1, cargo_l1=cargo, slice21_verdicts=s21, slice22_gate=s22)
+    s22 = _s22_gate(tmp_path, [{"case_id": "bc02-x", "status": "PASS"}, {"case_id": "co-01", "status": "BLOCKED-OWNER"}])
+    rep = cov.build(ab_dir, cy, lk, bc, l1, cargo_l1=cargo, slice21_run=s21, slice22_gate=s22, p7_results=res)
     got = {r["case_id"]: r["status"] for r in rep["rows"]}
     assert got == {"sm-01": "PASS", "l15-a": "GAP", "l15-b": "PASS", "bc02-x": "PASS", "co-01": "GAP"}, rep["rows"]
+    assert rep["prior_sources"]["2.1"]["git_revision"] == HEAD and rep["prior_sources"]["2.1"]["accepted"] is True
+
+
+def test_coverage_prior_slice_evidence_must_match_p7_head_and_artifact(tmp_path):
+    """審查 P7-38c150c-3：匯入的先前切片證據須綁定本 gate——來源 commit 等於 P7 `results.json` 的 git_head、受測
+    daemon sha256 等於 P7 快照；手寫 verdicts、其他 commit 或其他 artifact 的輸出、缺 P7 results 或缺身分欄位一律
+    不採用（該切片案例全為缺漏）。"""
+    cases = [{"case_id": "sm-01", "suite": "func-test", "daemon_slice": "2.1"},
+             {"case_id": "co-01", "suite": "func-test", "daemon_slice": "2.2"}]
+    cy, lk, bc, l1 = _cov_fixture(tmp_path, cases)
+    ab_dir = tmp_path / "ab"
+    res = _p7_results(tmp_path)
+    ok21 = {"sm-01": "PASS"}
+    ok22 = [{"case_id": "co-01", "status": "PASS"}]
+    rep = cov.build(ab_dir, cy, lk, bc, l1, slice21_run=_slice21_run(tmp_path, ok21),
+                    slice22_gate=_s22_gate(tmp_path, ok22), p7_results=res)
+    assert {r["case_id"]: r["status"] for r in rep["rows"]} == {"sm-01": "PASS", "co-01": "PASS"}, rep["rows"]
+    bad = [  # (slice21 run, s22 輸出, slice21 是否應不採用)
+        (_slice21_run(tmp_path, ok21, head="b" * 40, name="h"), _s22_gate(tmp_path, ok22, head="b" * 40, name="h.json"), True),
+        (_slice21_run(tmp_path, ok21, daemon_sha="e" * 64, name="d"),
+         _s22_gate(tmp_path, ok22, daemon_sha="e" * 64, name="d.json"), True),
+        (_slice21_run(tmp_path, ok21, name="n"), _s22_gate(tmp_path, ok22, head=None, name="n.json"), False),
+    ]
+    for s21_dir, s22_path, s21_bad in bad:
+        rep = cov.build(ab_dir, cy, lk, bc, l1, p7_results=res, slice21_run=s21_dir, slice22_gate=s22_path)
+        got = {r["case_id"]: (r["status"], r["detail"]) for r in rep["rows"]}
+        assert got["co-01"][0] == "GAP" and ("身分" in got["co-01"][1] or "不符" in got["co-01"][1]), got
+        assert (got["sm-01"][0] == "GAP" and "不符" in got["sm-01"][1]) if s21_bad else got["sm-01"][0] == "PASS", got
+    # 只有 case_verdicts.json（無 report.json）或缺 P7 results → 不採用
+    only = tmp_path / "only"
+    only.mkdir()
+    (only / "case_verdicts.json").write_text(json.dumps(ok21), encoding="utf-8")
+    rep = cov.build(ab_dir, cy, lk, bc, l1, slice21_run=only, p7_results=res)
+    assert {r["case_id"]: r["status"] for r in rep["rows"]}["sm-01"] == "GAP"
+    rep = cov.build(ab_dir, cy, lk, bc, l1, slice21_run=_slice21_run(tmp_path, ok21))
+    assert {r["case_id"]: r["status"] for r in rep["rows"]}["sm-01"] == "GAP"
