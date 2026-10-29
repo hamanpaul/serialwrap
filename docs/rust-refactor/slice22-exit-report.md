@@ -74,3 +74,22 @@
 | `s22_gate:win_test`/windows | INSUFFICIENT | 未登記（LOCAL-WINDOWS-TODO） |
 
 - 逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；L1.5／func-test 22 個參照於 Rust release artifact 全 PASS；parity_rows 23：PASS 22／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。
+
+## 出口 gate 實跑紀錄（第 7 輪，2026-10-29）
+
+- 環境：非 root（uid 1000、CapEff=0、乾淨 PATH）、Rust 1.96.1、Python 3.12.3＋pytest 9.0.3＋PyYAML 6.0.3＋jsonschema 4.10.3；cargo 集合的收集命令取自 `s22_gate_check.py --plan`；pytest 集合依 L1 鎖 selector 以 `SW_RESOURCE_REPORT` 收集；L1.5／func-test 22 個參照逐一以 Rust release artifact 執行（bridge 參照帶 `--selftest-report`）。報告目錄未提交。
+- 兩次實跑（release artifact 相同：daemon sha256 `ba7b7f4d7b00…`，CLI `63e281ccde61…`；26 份 manifest 皆 `artifacts.daemon.implementation=rust`）：
+
+| 集合 | `r7-261029-163920`（HEAD `eb34a01`） | `r7b-261029-170104`（HEAD `09115d7`） |
+|---|---|---|
+| `s22_gate:cargo_workspace`/linux | PASS（2194 passed、38 skipped） | **FAIL**（2193 passed、1 failed、38 skipped；`sw-core::lease_selftest::selftest_probe_drain_race_golden`） |
+| `s22_gate:console_conformance_pty`/linux | PASS（31 passed、3 skipped，`--caps posix_pty`） | PASS（同左） |
+| `s22_gate:blackbox_rust`/linux | PASS（117 passed、8 skipped） | PASS（同左） |
+| `s22_gate:py_parity`/linux | PASS（12 passed） | PASS（同左） |
+| `s22_gate:parity_py`/linux | PASS（34 passed） | PASS（同左） |
+| `s22_gate:win_test`/windows | INSUFFICIENT（未登記，LOCAL-WINDOWS-TODO） | INSUFFICIENT（同左） |
+| result | **INSUFFICIENT** | **FAIL** |
+
+- 兩次皆：逐案 93：PASS 31／BLOCKED-OWNER 62／FAIL 0／INSUFFICIENT 0；L1.5 22 參照全 PASS；parity_rows 23：PASS 22（含 #185 PROCESS-EVIDENCE）／BLOCKED-OWNER 1（#108）；map 覆蓋 PASS（93）；prereqs PASS。
+- `r7b` 的唯一失敗為 P5 測試的間歇失敗（release 回 `ok=false`，第 ~250 輪即中止）：同一收集命令重跑兩次皆 2194 passed／0 failed；該測試執行檔單獨連跑 60 次、4 路並行連跑 140 次（每次 1000 輪）皆 0 敗；跑前無洩漏的 serialwrapd，開跑至結束 loadavg ≤ 0.64。根因未定，不作放行理由；`r7b` 的 result 維持 FAIL。
+- loadavg：`r7` 開跑 0.70／0.85／0.92（16:39:20Z）、結束 0.24／0.23／0.52（16:56:24Z），步驟邊界最高 1.46；`r7b` 開跑 0.84／0.55／0.57（17:01:04Z）、結束 0.36／0.32／0.40（17:16:58Z），步驟邊界最高 0.64。

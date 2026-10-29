@@ -514,3 +514,25 @@ result = **FAIL**。cargo_workspace FAIL（2184 passed、1 failed、38 skipped�
 
 - `crates/sw-pal/src/serial/posix.rs::invalid_serial_fd_is_a_poll_wait_error`：測試 `close()` pipe fd 後以同一號碼 poll 期望 POLLNVAL；同 binary 他執行緒會立即重用該號碼（實得 `EINVAL`）。sw_pal lib 測試整支連跑 100 次 5 敗、單跑該案 200 次 0 敗。建議改用不可能被配置的 fd（如超過 `RLIMIT_NOFILE` 的號碼）。
 - `crates/sw-pal/src/conformance/lock_suite.rs` 的 `[stale_socket_reclaimed]`（第五輪起出現的 `lock_conformance_suite` 失敗）：`lock` 測試整支連跑 150 次 2 敗（皆 `AlreadyRunning`）、單跑 150 次 0 敗。推測同 binary 其他測試 spawn 子行程時，fork 至 exec 之間子行程持有剛 drop 的 listener fd，使 probe 連線成功。
+
+## 第七輪（2026-10-29，雲端 session；起點 2fb3db0）
+
+### 合併
+
+- P5 `3bbb40e`（2fc1486；P5 第 7 輪 OD-64／OD-66／OD-67、gate section、sw-pal 測試競態追根因）：文字層無衝突，L1 鎖相對 P6 與 P5 皆只增不減。**語意衝突**（編譯失敗 E0004）：P5 `67b7e26` 把 `crates/sw-core/src/mailbox.rs` test-fakes witness 的 `Some(MailboxItem::Data(_))` 改為只比對 `DataEvent::UartRxChunk`，未涵蓋 P6 的 `ConsoleInputBytes`／`ConsoleDisconnected`。於 merge 內解決：恢復比對全部 data item（console 事件同走 data lane，照舊計入超車與 OD-64 FIFO 位置 `remaining`），只有 UartRxChunk 且 epoch 相同者計入 `same_epoch`；只動量測碼，產品路徑不變。
+- P5 `8d824b3`（eb34a01；sw-pal fd 重用／fork 時窗競態、slice21 gate `--caps` 改 OD-53 推導）、P5 `cc25b01`（09115d7；`cargo_l1_results.py --caps-only`，s22 gate 不使用、預設路徑不變）：皆無衝突。
+- 每次 merge 後依 rulings/p6.md 跑完整 `tests/test_contracts_*.py`（與同批觸及測試合跑，三次皆無失敗；另 2fc1486 的 P5 觸及測試合跑 800 passed、3 failed，3 項皆為起點基準既有：`test_l1_judge` 2 支〔`s21_core.windows`〕、pyserial 1 支）。
+
+### 裁決落實與 sol 報告
+
+| 項目 | 處理 |
+|---|---|
+| rulings/p6.md「P6 第 6 輪回歸 `test_sc30_reserved_for_p7`」（照修） | 已於第六輪 `04d5f25` 修正（精確集合加入 SC-39，未放寬為子集斷言）；本輪起點與終點皆 passed |
+| rulings/p7.md P7-9065f14-1（P6 自 `slice22_evidence_map.yaml` 移除 `l15-delayed-reply` 並補測試） | 對照表自 OD-34 修訂 #1 起即無此鍵；**5cf0306** 補 `test_od34_deferred_cases_absent_from_slice22_evidence_map`：逐筆讀 `breaker/slice_2.2.amendments.json` 的 removed 列，斷言對照表無該鍵、`cases.lock.json` 不在 slice_2.2 而在目標 slice，並以 P7 分支殘留的 `{status: PENDING}` 自檢判定器。P7 分支舊版對照表代入判定器得 2 筆問題（cowork-01-agent-bad-cmd、l15-delayed-reply），本分支 0 筆 |
+| `2b6f8ee_4cc7f02-sol.md` A 段 | P6-e9b5c61-4 依裁決不處理；merge P5 後重驗：`test_l1_lock_cargo_sets_exclude_ignored_tests`／`test_l1_lock_frozen_set_excludes_capability_gated` 仍只剩 `s21_core.windows`（OD-55 windows） |
+| `4cc7f02_c74f158-sol.md`（A：P6-4cc7f02-1 未修 1 輪；B：NO FINDINGS） | 審查範圍止於 c74f158，早於修正 `04d5f25`；本輪 HEAD 上該測試 passed。P6-4cc7f02-2 Low 依收斂規則不修 |
+| `2b6f8ee_c74f158-sol.md` B | P6-c74f158-1 Medium＝P6-4cc7f02-1 同一缺陷，已修 `04d5f25`；P6-c74f158-2 Low（`derive_caps` 推導不出時不判報告中的 failed 列）依收斂規則不修（現行鎖 selector 皆可推導，結果為 INSUFFICIENT、不會誤判 PASS） |
+
+### 第七輪 Slice 2.2 出口 gate（非 dry-run，非 root）
+
+見 `docs/rust-refactor/slice22-exit-report.md`「第 7 輪」：`r7`（eb34a01）result **INSUFFICIENT**（Linux 五集合全 PASS，只缺 `s22_gate:win_test`）；`r7b`（09115d7，release artifact 相同）result **FAIL**——唯一失敗 `sw-core::lease_selftest::selftest_probe_drain_race_golden`（P5 測試，間歇；同範圍重跑兩次與 200 次壓測皆 0 敗，不作放行理由）。sw-pal 的兩個測試競態（`invalid_serial_fd_is_a_poll_wait_error`、`[stale_socket_reclaimed]`）本輪乾淨環境下 6 次 workspace 執行（commit 驗證 2、gate 2、同範圍重跑 2）皆未出現（P5 `54dd588`／`8d824b3` 已修）。
