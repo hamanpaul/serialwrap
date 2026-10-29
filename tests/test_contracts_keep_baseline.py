@@ -222,8 +222,8 @@ def test_last_error_logging_templates_match():
     by_source = {m["source"]: m for m in dl["messages"]}
     named = {v["value"]: v for v in le["values"] if v.get("kind") == "named"}
     pairs = (
-        ("CREDENTIALS_UNRESOLVED", "sw_core/session_manager.py:1909"),
-        ("TRANSPORT_STALL", "sw_core/session_manager.py:2009"),
+        ("CREDENTIALS_UNRESOLVED", "sw_core/session_manager.py:1915"),
+        ("TRANSPORT_STALL", "sw_core/session_manager.py:2015"),
     )
     for code, source in pairs:
         msg = by_source.get(source)

@@ -1023,9 +1023,9 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["df04-released-persist-restarts"]
-    compatibility_impact: "動態 session 的 RELEASED 可跨任意次數重啟保留；裝置離線的 tick 不再把 RELEASED 降為 DETACHED。"
-    approval_conditions: "安全交接缺陷；交接安全"
-    related_decisions: []
+    compatibility_impact: "動態 session 的 RELEASED 可跨任意次數重啟保留；裝置離線的 tick 不再把 RELEASED 降為 DETACHED。所屬 template 已不存在的 RELEASED 紀錄（OD-63）實體化為 RELEASED 佔位 session（passthrough、command_capable:false），by_id 維持阻擋；`device attach COMx` 時佔位移除自身並解除 by_id，再交 template 偵測建立正式 session（保留原 COM，不降級 profile；無 template 可匹配時依現行 dynamic 偵測）。0.3.2 只阻擋一輪即丟棄此類紀錄。"
+    approval_conditions: "安全交接缺陷；交接安全；「缺 template 不得實體化」僅於 OD-63 佔位用途放寬，佔位不可下命令、不以佔位 profile attach，不新增 RPC／CLI 表面"
+    related_decisions: ["OD-63"]
   - id: "DF-05"
     kind: "DF"
     title: "daemon start 的 daemon 定位順序"

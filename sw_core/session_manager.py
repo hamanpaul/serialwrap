@@ -488,6 +488,9 @@ class SessionRuntime:
     released_by: str | None = None
     released_at: str | None = None
     released_reason: str | None = None
+    # OD-63：template 已不存在的 RELEASED 紀錄所實體化的佔位（passthrough、不可下命令）；
+    # device attach 時移除自身並交 template 偵測建立正式 session。
+    released_placeholder: bool = False
     # 動態 profile 來源（#95）：unknown / pin / sticky / detected / fallback / yaml-target
     profile_source: str = "unknown"
     # U-Boot autoboot 保護（#130）：boot quiet window 截止時刻（monotonic；0.0=未啟用）。
@@ -977,24 +980,26 @@ class SessionManager:
                 detected_name = self._profile_detected.get(by_id)
                 template_name = pinned_name or detected_name or sid_profile
                 tpl = self._template_by_name(template_name) or self._template_by_name(sid_profile)
-                if tpl is None and sid_profile in {"passthrough", "others-template"}:
-                    # 舊 state.json 不保存 template 內容；只對無命令能力的通用 passthrough
-                    # 名稱使用最小 profile。uboot-template 有 ready_probe 契約，缺少定義時
-                    # 必須保留未實體化的 RELEASED 阻擋，不能降級成另一種 profile。
+                placeholder = False
+                if tpl is None:
+                    # 舊 state.json 不保存 template 內容。通用 passthrough 名稱直接以最小
+                    # profile 還原；其餘 template 已不存在者（OD-63）實體化為 RELEASED 佔位
+                    # （passthrough、不可下命令），只供 device attach 解除阻擋：解除時佔位
+                    # 移除自身並交 template 偵測建立正式 session，不得降級成另一種 profile。
+                    placeholder = sid_profile not in {"passthrough", "others-template"}
+                    if placeholder:
+                        import logging
+
+                        logging.getLogger("serialwrap").warning(
+                            "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋",
+                            sid,
+                            template_name,
+                        )
                     tpl = ProfileTemplate(
                         profile_name=sid_profile,
                         platform="passthrough",
                         ready_probe="",
                     )
-                if tpl is None:
-                    import logging
-
-                    logging.getLogger("serialwrap").warning(
-                        "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋",
-                        sid,
-                        template_name,
-                    )
-                    continue
                 com = sid_com
                 if not isinstance(com, str) or not com:
                     import logging
@@ -1029,6 +1034,7 @@ class SessionManager:
                 )
                 source = "pin" if pinned_name else "detected" if detected_name else "fallback"
                 s.profile_source = source
+                s.released_placeholder = placeholder
             if s is not None:
                 s.state = "RELEASED"
                 s.released_by = meta.get("released_by")
@@ -3450,6 +3456,9 @@ class SessionManager:
                         session.released_by = None
                         session.released_at = None
                         session.released_reason = None
+                        if session.released_placeholder:
+                            # OD-63：阻擋已解除；佔位不保留，之後的熱插走 template 偵測。
+                            self._retire_released_placeholder_locked(session)
                         public = session.to_public_dict()
                     else:
                         public = session.to_public_dict()
@@ -3472,6 +3481,7 @@ class SessionManager:
 
         assert port is not None
         invalid_reason: str | None = None
+        dynamic_handoff = False
         with self._lock:
             current_device = self._devices.get(by_id)
             if current_device is None or current_device.real_path != real_path:
@@ -3500,6 +3510,13 @@ class SessionManager:
                 session.last_error = None
                 self._reset_reprobe_progress_locked(session)
                 public = session.to_public_dict()
+                if session.released_placeholder:
+                    # OD-63：佔位先移除自身並解除 by_id，已取得的 UART 交 template 偵測
+                    # 建立正式 session（保留原 COM）；不以佔位的 passthrough profile attach。
+                    self._retire_released_placeholder_locked(session)
+                    self._pending_com[by_id] = session.profile.com
+                    op.session_id = f"dynamic:{by_id}"
+                    dynamic_handoff = True
             else:
                 if self._attach_ops.get(by_id) is op:
                     self._attach_ops.pop(by_id, None)
@@ -3524,8 +3541,26 @@ class SessionManager:
             }
 
         self._save_state()
-        self._spawn_attach(by_id)
+        if dynamic_handoff:
+            self._spawn_attach(by_id, dynamic_only=True)
+        else:
+            self._spawn_attach(by_id)
         return {"ok": True, "session": public}
+
+    def _retire_released_placeholder_locked(self, session: SessionRuntime) -> None:
+        """OD-63：移除 RELEASED 佔位 session 與其持久化阻擋（須持 self._lock）。"""
+        sid = session.session_id
+        if self._sessions.get(sid) is session:
+            del self._sessions[sid]
+        self._loaded_released.pop(sid, None)
+        self._binding_overrides.pop(sid, None)
+        by_id = session.profile.device_by_id
+        if by_id:
+            self._released_by_ids.discard(by_id)
+        for name, row in self._aliases.dump().items():
+            if row.get("session_id") == sid:
+                self._aliases.unassign(name)
+        session.released_placeholder = False
 
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
@@ -3965,7 +4000,8 @@ class SessionManager:
         if session is not None and session.state == "ATTACHING" and session.bridge is None:
             session.state = "DETACHED"
 
-    def _spawn_attach(self, by_id: str) -> None:
+    def _spawn_attach(self, by_id: str, *, dynamic_only: bool = False) -> None:
+        """啟動 attach worker；``dynamic_only``（OD-63 佔位交接）略過 DETACHED 空槽改綁。"""
         with self._lock:
             if self._shutting_down:
                 import logging
@@ -3984,7 +4020,10 @@ class SessionManager:
         def _run() -> None:
             retry_after_worker = False
             try:
-                self._attach_by_id(by_id)
+                if dynamic_only:
+                    self._attach_by_id(by_id, dynamic_only=True)
+                else:
+                    self._attach_by_id(by_id)
             finally:
                 with self._lock:
                     self._attach_inflight.discard(by_id)
@@ -4693,7 +4732,7 @@ class SessionManager:
             self._on_ready(session.session_id)
         return {"ok": True, "session": result}
 
-    def _attach_by_id(self, by_id: str) -> None:
+    def _attach_by_id(self, by_id: str, *, dynamic_only: bool = False) -> None:
         save_needed = False
         dynamic_created = False
         capacity_rejected = False
@@ -4712,7 +4751,7 @@ class SessionManager:
             preopened_op = self._preopened_ports.pop(by_id, None)
             if preopened_op is not None:
                 self._active_attach_ops[by_id] = preopened_op
-            if session is None:
+            if session is None and not dynamic_only:
                 candidates = sorted(
                     [s for s in self._sessions.values() if s.state == "DETACHED" and s.profile.device_by_id not in self._devices],
                     key=lambda row: row.profile.act_no,
@@ -4746,6 +4785,9 @@ class SessionManager:
             return
 
         if session is None:
+            if dynamic_only:
+                with self._lock:
+                    self._pending_com.pop(by_id, None)
             if preopened_op is not None:
                 self._finish_attach_op(preopened_op)
             return
