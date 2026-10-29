@@ -41,29 +41,44 @@ sections:
   - {name: pytest_full, kind: test, platform: linux, required_set: "s21_gate:pytest_full",
      command: "SW_RESOURCE_REPORT=<run>/pytest_full/resource-report.json python3 -m pytest -q tests/ --junitxml=<run>/pytest_full/junit.xml"}
   - {name: policy_check, kind: non_test, required_set: null, command: "python3 -m policy_check --repo ."}
+# 已由擁有者裁決解除的項目（2026-10-28；原 pending_decisions，保留出處供審查）：
+resolved_decisions:
+  - {id: PA-OD-1, decision: "OD-21 (1)", resolution: "SC-37 已登記 contracts/behavior_changes.yaml；parity #6／#71 改 PASS"}
+  - {id: NC-P5-02, decision: OD-44, resolution: "承接率斷路器維持單一固定窗口（實作不改）；plan 09 斷路器段改為固定窗口寫法"}
+  - {id: PA-OD-F67, decision: OD-42, resolution: "parity #32 以 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 替代；plan 06 #32 列改名附不可達理由"}
+  - {id: PA-OD-L15-WAL, decision: OD-40, resolution: "l15-wal-interference 自 l15_ab 判定逐名移出，改由 l15_ab_excluded 所列 pytest 承擔"}
+  - {id: PA-OD-L15-GAPS, decision: OD-39, resolution: "runner 擴充 pre_daemon_steps、assert_when／assert_value、assert_wal_tx_total、assert_any、query_dut_generation、assert_wal_window、assert_wire_offsets（gaps #1／#3／#4／#5／#8 已補、#9 部分承接；#10 另列 PA-OD-L15-GAPS-10）"}
+  - {id: PA-OD-T20, decision: "OD-36／OD-37／OD-38", resolution: "8 案案例設計修正（CHG-S21-OD36-*）、DF-20／DF-21 判定（CHG-S21-OD37-DF-01；DF-20 Rust 實作 → P6）、METHOD_NOT_FOUND Rust 專屬（CHG-S21-OD38-MNF-01）"}
+  - {id: PA-OD-REPROBE, decision: OD-34, resolution: "l15-delayed-reply（凍結修訂 #1）、s21-reboot-minimal-guard 延至 Slice 2.3（deferred_to_s23）；cowork-01-agent-bad-cmd 屬 Slice 2.2，由 P6 分支承接"}
+# OD-34：自 Slice 2.1 gate 逐名移出、改列 Slice 2.3 出口必須 PASS（情境檔保留）。
+deferred_to_s23:
+  - {case_id: l15-delayed-reply, kind: l15-scenario, decision: OD-34, lock: "cases.lock.json slice_2.1→slice_2.3（regen_lock --allow-defer）；breaker/slice_2.1.amendments.json #1"}
+  - {case_id: s21-reboot-minimal-guard, kind: s21-scenario, decision: OD-34, lock: "非 cases.yaml 案例；tests/acceptance/l15/test_slice21_l15.py DEFERRED_TO_S23"}
+# OD-40：自 l15_ab 判定逐名移出的情境與承擔的 pytest（judge 要求每筆在指定 section 恰為 passed，否則 l15_ab 不得 PASS）。
+#   輪替：daemon 層以 wal reset 的歸檔改名承擔（rotate_bytes 為 64 MiB 常數、兩個 daemon 皆不可設定）；寫入門檻的輪替
+#         由 Python tests/test_stage0_wal_rotate.py（pytest_full）與 Rust cargo sw-core::wal_writer::rotate_*（linux_l1）承擔。
+#   讀取鎖定：POSIX 以 reader-hold 案例驗證不漏記；Windows 原生（真正的共用鎖定）屬 LOCAL-WINDOWS-TODO（BO-S21-13 Windows 黑箱）。
+l15_ab_excluded:
+  - case_id: l15-wal-interference
+    decision: OD-40
+    covered_by:
+      - {section: blackbox_python, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"}
+      - {section: blackbox_rust, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"}
+      - {section: blackbox_python, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reset_archives_and_next_command_recorded"}
+      - {section: blackbox_rust, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reset_archives_and_next_command_recorded"}
+      - {section: blackbox_python, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reader_hold_does_not_block_records"}
+      - {section: blackbox_rust, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_reader_hold_does_not_block_records"}
+      - {section: pytest_full, nodeid: "tests/test_stage0_wal_rotate.py::test_rotate_threshold_is_ge_and_checked_before_write"}
+      - {section: pytest_full, nodeid: "tests/test_stage0_wal_unlink.py::test_external_unlink_recreates_and_writes_meta_first"}
+      - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::rotate_before_write_at_threshold_utc_suffix"}
+      - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::reset_renames_nonempty_files_independent_suffix"}
+      - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::external_unlink_writes_recreate_meta_then_record"}
+    windows_todo: "LOCAL-WINDOWS-TODO：tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running、tests/test_stage0_wal_rotate.py::test_native_rotate_blocked_by_reader_degrades（windows_native，Linux 上 skip）與 reader-hold 案例於 Windows 原生執行（BO-S21-13）"
 # 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
 pending_decisions:
-  - id: PA-OD-1
-    scenario: SC-37（daemon 端 backend env 強制非原生後端 → exit 1）與「只可新增、不可修改」原則（parity #6／#71）；OD-21 已核准 SC-37，待寫入 contracts/behavior_changes.yaml 後解除
-    evidence: "origin/docs/parity-amendments:docs/rust-refactor/plans/parity-amendments-2026-10-26.md#pa-od-1"
-  - id: NC-P5-02
-    scenario: 承接率斷路器窗口採單一固定窗口；「連續三週內」滾動解讀待擁有者確認（Task 0b）
-    evidence: docs/rust-refactor/plans/spec-reconciliation.md
-  - id: PA-OD-F67
-    scenario: "parity #32：計畫指名的 no_redetect_during_quiet 經公開輸入不可達，改以 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 替代（審查 4920d90 #1）"
-    evidence: docs/rust-refactor/reviews/p5-fix-responses.md#F67
-  - id: PA-OD-L15-WAL
-    scenario: "P2 凍結情境 l15-wal-interference 為 compare: none，不產 comparison.json，兩個 label 結構上恆為 INSUFFICIENT_EVIDENCE；需裁決改情境（計畫修正）或移出 l15_ab 判定（審查 b7cd852 #2、gaps #7）"
-    evidence: docs/rust-refactor/slice21-l15-gaps.md
   - id: PA-OD-EVLAT
-    scenario: "event_latency 三輪判定器未實作（讀 resource_limits.yaml measurement_runs）；Rust daemon 尚無 test_fakes.event_latency 計時欄位、runner 無 stop_request（審查 b7cd852 #5、c0d221f #1、gaps #6）"
+    scenario: "OD-41（外部量測：觸發 RPC 時間 vs WAL 對應 META mono_ts_ns）停下回報：stop_request／command_cancel／lease_expiry／drain_receipt／release_request 五種事件在 Python 與 Rust daemon 的 WAL 皆無對應紀錄；不得在 daemon 加計時欄位，需擁有者裁決可觀測點（新增 WAL META 屬對外格式變更）"
     evidence: docs/rust-refactor/slice21-l15-gaps.md
-  - id: PA-OD-L15-GAPS
-    scenario: "s21 情境中 runner 仍無法表達的計畫斷言（gaps #1、#3～#5、#8～#10）；裁決前 gate 的 l15_ab 不計 PASS（EVIDENCE_MISSING；審查 c0d221f #3）"
+  - id: PA-OD-L15-GAPS-10
+    scenario: "OD-39 已裁決 runner 擴充；其中 gaps #10（s21-wal-unlink-under-traffic 比對範圍）在不改 bridge 工具樹下不可實作，#9 以 WAL RX／TX 紀錄替代狀態 META（兩個 daemon 皆無狀態 META）。需擁有者擇一：核准比較器起點窗口，或改以 unlink 前硬連結保存 WAL"
     evidence: docs/rust-refactor/slice21-l15-gaps.md
-  - id: PA-OD-REPROBE
-    scenario: "readiness reprobe／#162 再確認 tick（08 計畫 P7-T5，P7 已交付 reprobe.rs）被 Slice 2.1 L1.5 l15-delayed-reply（P2 凍結）、s21-reboot-minimal-guard 與 Slice 2.2 func-test cowork-01-agent-bad-cmd 依賴；Rust 於 PROMPT_TIMEOUT／reboot 後不回 READY。裁決：backport P7-T5 至 P5（Slice 2.1），或將上述案例移至 2.3 gate（上游缺口 U-01）"
-    evidence: docs/rust-refactor/reviews/p5-fix-responses.md#上游缺口-u-01
-  - id: PA-OD-T20
-    scenario: "Task 20 黑箱 11 案與基線／計畫不符（7 案 Python 與 Rust 一致但違反案例斷言、2 案 Python 基線缺陷候選或計時敏感、1 案只適用 Rust、1 案 TX 窗口設計缺陷）；逐案根因與建議見交付報告，裁決前不放寬斷言、不改 skip"
-    evidence: docs/rust-refactor/reviews/p5-t20-blackbox-report.md

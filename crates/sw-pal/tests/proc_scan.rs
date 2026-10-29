@@ -490,6 +490,18 @@ fn posix_tty_holder_scan_reports_unknown_when_target_unstatable() {
 
 #[cfg(unix)]
 #[test]
+fn posix_multi_open_holder_scan_skips_unstatable_target_like_detect_multi_open() {
+    // daemon status／doctor 走 Python `detect_multi_open`：`tty_stat` 回 None 即略過該 tty，status 維持 ok；
+    // 與 fail-closed 的 `serialwrapd_tty_holders`（上一案）刻意不同。
+    let tmp = tempfile::tempdir().unwrap();
+    let (holders, status) = PosixProcScan::with_root(tmp.path())
+        .multi_open_tty_holders(&[tmp.path().join("tty-missing")]);
+    assert!(holders.is_empty());
+    assert_eq!(status, HolderScanStatus::Ok);
+}
+
+#[cfg(unix)]
+#[test]
 fn posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let process_dir = tmp.path().join("205");

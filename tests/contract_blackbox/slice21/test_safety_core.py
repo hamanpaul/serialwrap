@@ -188,15 +188,73 @@ def test_wal_unlink_recreates_with_meta(shell_daemon):
     assert m["potentially_lost_seq_range"][1] < recs[1]["seq"]
 
 
+def _tx_payloads(recs: list[dict]) -> list[bytes]:
+    import base64
+
+    return [base64.b64decode(r.get("payload_b64") or "") for r in recs if r.get("dir") == "TX"]
+
+
+def test_wal_reset_archives_and_next_command_recorded(shell_daemon):
+    """OD-40：l15-wal-interference 的 reset 段改由本案承擔——`wal reset` 把現行 WAL 改名歸檔（輪替），
+    之後的命令 TX 記於新現行檔、seq 自頭起算；reset 前的紀錄只留在歸檔檔。"""
+    d = shell_daemon
+    before = _submit(d, "echo wal-before-reset")
+    d.wait_command_done(before["cmd_id"], timeout=15)
+    r = d.sw("wal", "reset")
+    assert r.get("ok") is True, r
+    archived = sorted(d.wal_dir.glob("raw.wal.ndjson.*"))
+    assert archived, f"reset 須把現行 WAL 改名歸檔：{sorted(p.name for p in d.wal_dir.iterdir())}"
+    assert any(b"echo wal-before-reset\n" in p.read_bytes() or b"ZWNobyB3YWwtYmVmb3JlLXJlc2V0Cg" in p.read_bytes()
+               for p in archived), "reset 前的 TX 須留在歸檔檔"
+    d.wait_state("COM0", "READY")
+    after = _submit(d, "echo wal-after-reset")
+    d.wait_command_done(after["cmd_id"], timeout=15)
+    recs = d.wal_records()
+    payloads = _tx_payloads(recs)
+    assert b"echo wal-after-reset\n" in payloads, payloads
+    assert b"echo wal-before-reset\n" not in payloads, "reset 前的紀錄不得出現在新現行檔"
+    assert recs and recs[0]["seq"] < 10, f"reset 後 seq 須自頭起算：{recs[:2]}"
+
+
+def test_wal_reader_hold_does_not_block_records(shell_daemon):
+    """OD-40：l15-wal-interference 的讀取鎖定段——外部持有 WAL 讀取 handle 期間，命令照常完成且 TX 照記
+    （Windows 原生執行時才是真正的共用鎖定情境；POSIX 上 reader 不阻擋，仍驗證不漏記）。"""
+    d = shell_daemon
+    wal = d.wal_dir / "raw.wal.ndjson"
+    assert wal.exists()
+    with open(wal, "rb"):
+        sub = _submit(d, "echo wal-during-hold")
+        d.wait_command_done(sub["cmd_id"], timeout=15)
+        assert b"echo wal-during-hold\n" in _tx_payloads(d.wal_records())
+    after = _submit(d, "echo wal-after-hold")
+    d.wait_command_done(after["cmd_id"], timeout=15)
+    assert b"echo wal-after-hold\n" in _tx_payloads(d.wal_records())
+
+
+def _wait_io_error_observed(d, com: str = "COM0", timeout: float = 10.0) -> dict:
+    """OD-36 同步點：等到 daemon 已觀察到 FakeTarget 的 I/O error／裝置消失（session 離開 READY）。
+    未設此同步點時，stop() 後立即 submit 兩個 daemon 都尚未察覺，案例前置不成立（T20 報告）。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        s = _session(d, com)
+        if s.get("state") != "READY":
+            return s
+        if time.monotonic() > deadline:
+            raise AssertionError(f"逾時：daemon 未觀察到 I/O error（仍 READY）：{s}")
+        time.sleep(0.02)
+
+
 def test_recovering_submit_session_recovering(shell_daemon):
-    _tgt(shell_daemon).stop()                                              # FakeTarget I/O error 瞬間
+    _tgt(shell_daemon).stop()                                              # FakeTarget I/O error
+    _wait_io_error_observed(shell_daemon)
     r = _submit(shell_daemon, "echo x")
     assert r.get("ok") is False, "I/O error 瞬間的 submit 絕不可 ok:true"
     assert r.get("error_code") in ("SESSION_RECOVERING", "SESSION_NOT_READY")
 
 
 def _fill_queue(d) -> None:
-    first = _submit(d, "sleep 30", "--cmd-timeout", "60")
+    # OD-36：前景命令須不會在填滿佇列前自行結束（Python CLI 逐筆 submit 256 筆可能超過 30 s，佇列會開始排出）。
+    first = _submit(d, "sleep 3600", "--cmd-timeout", "3700")
     assert "cmd_id" in first, first
     for i in range(400):
         r = _submit(d, f"echo fill{i}")
@@ -228,7 +286,9 @@ def _prepare_reject(row: str, request):
         d.wait_state("COM0", "RELEASED", timeout=10)
         _tgt(d).pause_responding(15)                                        # 目標不回應 → 停在 attach 過程
         d.sw("device", "attach", "--selector", "COM0")
-        return d, lambda d: _submit(d, "echo x"), {"SESSION_NOT_READY"}
+        # OD-36：attach 合法的登入／ready probe 序列（source=system）可能在拒絕之後才送出（兩個 daemon 時點不同），
+        # 零 TX 窗口只計「被拒請求可歸屬的 TX」：被拒命令 payload 不得出現在 wire，且不得有非 system 來源的 TX WAL。
+        return d, lambda d: _submit(d, "echo x"), {"SESSION_NOT_READY"}, ("attributable", b"echo x")
     if row == "SESSION_NOT_READY-RELEASED":
         d = request.getfixturevalue("shell_daemon")
         d.sw("device", "release", "--selector", "COM0", "--source", "agent:t", "--reason", "flash")
@@ -237,6 +297,7 @@ def _prepare_reject(row: str, request):
     if row == "SESSION_RECOVERING":
         d = request.getfixturevalue("shell_daemon")
         _tgt(d).stop()
+        _wait_io_error_observed(d)                                          # OD-36 同步點
         return d, lambda d: _submit(d, "echo x"), {"SESSION_RECOVERING", "SESSION_NOT_READY"}
     if row == "SESSION_NOT_READY-PASSTHROUGH":
         factory = request.getfixturevalue("slice21_daemon_factory")
@@ -253,19 +314,63 @@ def _prepare_reject(row: str, request):
         d.wait_state("COM0", "ATTACHED", timeout=15)
         return d, lambda d: _submit(d, "echo x"), {"PROFILE_NOT_COMMAND_CAPABLE"}
     if row == "READY_UNCONFIRMED":
+        # OD-36：READY_UNCONFIRMED 只在 #162 READY 再確認 pending 逾時（READY_RECONFIRM_MAX_S＝300 s）或逾次
+        # （READY_RECONFIRM_MAX_ATTEMPTS）後出現：READY 中收到 boot banner（quiet＋再確認 pending）且目標不回應，
+        # 等到 `ready_reconfirm_failed` 落終態才送被拒命令。
+        #   DUT 持續吐出非 prompt 的 bootloader 行（RX 不 idle）：兩個 daemon 都不會在期限內送確認 probe，
+        #   以純逾時（READY_RECONFIRM_MAX_S）落終態；不依賴 readiness reprobe（Rust 屬 Slice 2.3，OD-34）。
+        import threading
+
         d = request.getfixturevalue("shell_daemon")
-        _tgt(d).pause_responding(60)                                        # ready probe 無回應
-        d.sw("session", "recover", "--selector", "COM0")
+        t = _tgt(d)
+        stop = threading.Event()
+
+        def _chatter() -> None:
+            while not stop.wait(0.5):
+                try:
+                    t.emit(b"=> \r\n")
+                except Exception:  # noqa: BLE001 — target 已關閉即停止
+                    return
+
+        t.emit(UBOOT_BANNER)
+        th = threading.Thread(target=_chatter, daemon=True)
+        th.start()
+        try:
+            deadline = time.monotonic() + 340.0
+            while True:
+                s = _session(d)
+                if s.get("ready_reconfirm_failed") is True:
+                    break
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"#162 再確認未在 340 s 內落終態：{s}")
+                time.sleep(1.0)
+        finally:
+            stop.set()
+            th.join(timeout=5)
+        assert s.get("state") == "READY", f"再確認逾時終態應維持 READY：{s}"
         return d, lambda d: _submit(d, "echo x"), {"READY_UNCONFIRMED"}
     if row == "AUTOBOOT_QUIET":
-        d = request.getfixturevalue("banner_target")
-        time.sleep(0.5)
+        # OD-36：先 READY 再送 banner（開機即送 banner 的 session 未曾 READY，兩邊皆回 SESSION_NOT_READY）。
+        d = request.getfixturevalue("shell_daemon")
+        _tgt(d).emit(UBOOT_BANNER)
+        deadline = time.monotonic() + 5.0
+        while _session(d).get("boot_quiet_remaining_s") is None:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"banner 後 quiet 未 arm：{_session(d)}")
+            time.sleep(0.05)
         return d, lambda d: _submit(d, "echo should-not-send"), {"AUTOBOOT_QUIET"}
     if row == "SESSION_INTERACTIVE_BUSY":
+        # OD-36：lease 期間的拒絕屬執行期（submit 先 accepted），斷言命令終態的 error_code。
         d = request.getfixturevalue("shell_daemon")
         lease = d.sw("session", "interactive-open", "--selector", "COM0", "--owner", "agent")
         assert "interactive_id" in lease, lease
-        return d, lambda d: _submit(d, "echo x"), {"SESSION_INTERACTIVE_BUSY"}
+
+        def _busy(d):
+            sub = _submit(d, "echo x")
+            assert "cmd_id" in sub, sub
+            return d.wait_command_done(sub["cmd_id"], timeout=15)
+
+        return d, _busy, {"SESSION_INTERACTIVE_BUSY"}
     if row == "INVALID_COMPLETION_REGEX":
         d = request.getfixturevalue("shell_daemon")
         return d, lambda d: _submit(d, "echo x", "--completion-regex", "("), {"INVALID_COMPLETION_REGEX"}
@@ -294,15 +399,32 @@ REJECT_ROWS = [
 
 
 @pytest.mark.parametrize("row", REJECT_ROWS, ids=REJECT_ROWS)
+def reject_tx_clean(scope, new_wire: bytes, new_tx_rows: list[dict]) -> bool:
+    """拒絕路徑零 TX 判定：預設 wire 與 TX WAL 皆零增量；`("attributable", payload)` 只排除合法的
+    system 來源（attach 登入序列）——被拒 payload 不得上 wire，且不得有非 system 來源的 TX WAL（OD-36）。"""
+    if scope is None:
+        return new_wire == b"" and not new_tx_rows
+    kind, payload = scope
+    assert kind == "attributable", scope
+    return payload not in new_wire and all(r.get("source") == "system" for r in new_tx_rows)
+
+
+@pytest.mark.parametrize("row", REJECT_ROWS, ids=REJECT_ROWS)
 def test_reject_paths_zero_tx(row, request):
-    d, trigger, expected = _prepare_reject(row, request)
+    from ab_rows import gate_row
+
+    gate_row(f"test_reject_paths_zero_tx[{row}]")
+    prepared = _prepare_reject(row, request)
+    d, trigger, expected = prepared[:3]
+    scope = prepared[3] if len(prepared) > 3 else None
     before = len(_tgt(d).written())
     tx0 = _tx_count(d)
     resp = trigger(d)
     assert resp.get("error_code") in expected, f"{row}：回應 {resp}"
     time.sleep(1.0)
-    assert _tgt(d).written()[before:] == b"", f"{row}：拒絕路徑不得送出任何 byte"
-    assert _tx_count(d) == tx0, f"{row}：拒絕路徑不得寫入新的 TX WAL 行"
+    new_wire = _tgt(d).written()[before:]
+    new_tx = [r for r in d.wal_records() if r.get("dir") == "TX"][tx0:]
+    assert reject_tx_clean(scope, new_wire, new_tx), f"{row}：拒絕路徑不得送出任何 byte／TX WAL：{new_wire!r} {new_tx}"
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +433,11 @@ def test_reject_paths_zero_tx(row, request):
 
 
 def test_stale_context_not_replayed(shell_daemon):
+    """DF-20（OD-37）：舊 interactive_id 回 INTERACTIVE_NOT_FOUND 且零 TX（Rust 判定；Python 輪逐列標記 DF 差異；
+    Rust 實作屬 Slice 2.2 interactive lease，P5 只登記，見 ab_rows.RUST_S21_DEFERRED）。"""
+    from ab_rows import gate_row
+
+    gate_row("test_stale_context_not_replayed")
     t = shell_daemon.targets["COM0"]
 
     def _lease() -> str:

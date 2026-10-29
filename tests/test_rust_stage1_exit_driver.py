@@ -267,10 +267,74 @@ def _gate_with_owner_deferred_case(case_id: str, status: str, windows_verdict: s
             "evidence": [
                 {"platform": "linux", "verdict": "PASS", "gate_eligible": True},
                 {"platform": "windows", "verdict": windows_verdict, "gate_eligible": False,
-                 "message": message},
+                 "message": message, "harness_diagnostics": []},
             ],
         }],
     }
+
+
+def _windows_l15_report(rows: list[dict], *, report_subdir: str = "report") -> dict:
+    results = [
+        {"case_id": row["case_id"], "mode": "bridge", "run_index": row.get("run_index", 0),
+         "verdict": row["verdict"], "message": row["message"], "harness_diagnostics": [],
+         "evidence_dir": f"C:/Users/test/AppData/Local/Temp/sw-rust-test/run-1/{report_subdir}/"
+                         f"{row['case_id']}/bridge/{row.get('run_index', 0)}"}
+        for row in rows
+    ]
+    verdicts = [row["verdict"] for row in results]
+    return {
+        "schema_version": "func-test-report.v1", "complete": True,
+        "independent_cases": len({row["case_id"] for row in results}),
+        "modes": {"bridge": {
+            "runs": len(results), "pass": verdicts.count("PASS"), "fail": verdicts.count("FAIL"),
+            "insufficient": verdicts.count("INSUFFICIENT_EVIDENCE"), "skip": verdicts.count("SKIP"),
+        }},
+        "results": results,
+    }
+
+
+def _passing_windows_scenarios_report() -> dict:
+    return _windows_l15_report([
+        {"case_id": "l15-reboot-min-guard", "verdict": "PASS", "message": "OK"},
+    ])
+
+
+def _windows_l15_meta(scenarios: dict, basic: dict) -> dict:
+    def runner_exit(report: dict) -> int:
+        return int(any(row.get("verdict") != "PASS" for row in report["results"]))
+
+    def argv(*, include_scenarios: bool, report_dir: str) -> list[str]:
+        args = ["-3.12", "func-test/runner.py", "--mode", "bridge"]
+        if include_scenarios:
+            args.append("--scenarios")
+        return args + ["--daemon-com", "COM20", "--bridge-com", "COM21", "--transport-mode",
+                       "virtual_com0com", "--report-dir", report_dir]
+
+    scenario_argv = argv(
+        include_scenarios=True,
+        report_dir="C:/Users/test/AppData/Local/Temp/sw-rust-test/run-1/report",
+    )
+    basic_argv = argv(
+        include_scenarios=False,
+        report_dir="C:/Users/test/AppData/Local/Temp/sw-rust-test/run-1/report-basic",
+    )
+    return {
+        "schema_version": "win-func-test-meta.v2", "run_id": "run-1", "git_head": "a" * 40,
+        "git_tree": "b" * 40, "git_clean": True, "com_pair": {"daemon": "COM20", "bridge": "COM21"},
+        "transport_mode": "virtual_com0com", "runner_timeout_s": 5400,
+        "cli_exe_sha256": "c" * 64, "selftest_report_sha256": "d" * 64, "tool_tree_sha256": "e" * 64,
+        "runner_argv": scenario_argv, "runner_exit": runner_exit(scenarios),
+        "runs": {
+            "scenarios": {"report": "func-test-report.json", "runner_argv": scenario_argv,
+                          "runner_exit": runner_exit(scenarios)},
+            "basic": {"report": "basic/func-test-report.json", "runner_argv": basic_argv,
+                      "runner_exit": runner_exit(basic)},
+        },
+    }
+
+
+def _windows_l15_evidence(scenarios: dict, basic: dict) -> dict:
+    return {"scenarios": scenarios, "basic": basic, "metadata": _windows_l15_meta(scenarios, basic)}
 
 
 @pytest.mark.parametrize("case_id,windows_verdict,message", [
@@ -280,12 +344,80 @@ def _gate_with_owner_deferred_case(case_id: str, status: str, windows_verdict: s
     ("sm-04-device-unplug", "SKIP", "cap_missing:by_id_link"),
 ])
 def test_exit_driver_accepts_only_gate_approved_windows_owner_deferred_l15_rc(case_id, windows_verdict, message):
+    gate = _gate_with_owner_deferred_case(case_id, "BLOCKED-OWNER", windows_verdict, message)
+    if case_id == "l15-transport-disconnect":
+        scenarios = _windows_l15_report([{"case_id": case_id, "verdict": windows_verdict, "message": message}])
+        basic_rows = [{"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"}]
+    else:
+        scenarios = _passing_windows_scenarios_report()
+        basic_rows = [
+            {"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"},
+            {"case_id": case_id, "verdict": windows_verdict, "message": message},
+        ]
+    basic = _windows_l15_report(basic_rows, report_subdir="report-basic")
     unresolved, suppressed = l15_exit_driver.unresolved_steps(
-        "win_l15_func_test 1\nstage1a_gate 0\n",
-        _gate_with_owner_deferred_case(case_id, "BLOCKED-OWNER", windows_verdict, message),
+        "win_l15_func_test 1\nstage1a_gate 0\n", gate, _windows_l15_evidence(scenarios, basic),
     )
     assert unresolved == []
     assert suppressed == [{"step": "win_l15_func_test", "rc": 1}]
+
+
+def test_exit_driver_accepts_complete_declared_five_run_case_with_owner_defer():
+    deferred_message = r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired"
+    gate = _gate_with_owner_deferred_case("ev-01-spawn-handler", "BLOCKED-OWNER", "FAIL", deferred_message)
+    scenarios = _passing_windows_scenarios_report()
+    basic = _windows_l15_report([
+        {"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"},
+        {"case_id": "ev-01-spawn-handler", "verdict": "FAIL", "message": deferred_message},
+        *[
+            {"case_id": "rc-01-interactive-mode-switch", "run_index": index,
+             "verdict": "PASS", "message": "OK"}
+            for index in range(5)
+        ],
+    ], report_subdir="report-basic")
+
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n", gate, _windows_l15_evidence(scenarios, basic),
+    )
+
+    assert unresolved == []
+    assert suppressed == [{"step": "win_l15_func_test", "rc": 1}]
+
+
+@pytest.mark.parametrize("repeat_rows", [
+    [
+        {"case_id": "rc-01-interactive-mode-switch", "run_index": index,
+         "verdict": "PASS", "message": "OK"}
+        for index in (0, 1, 2, 4)
+    ],
+    [
+        {"case_id": "rc-01-interactive-mode-switch", "run_index": index,
+         "verdict": "PASS", "message": "OK"}
+        for index in (0, 1, 2, 3, 3, 4)
+    ],
+    [
+        {"case_id": "rc-01-interactive-mode-switch", "run_index": index,
+         "verdict": "FAIL" if index == 3 else "PASS",
+         "message": "unauthorized failure" if index == 3 else "OK"}
+        for index in range(5)
+    ],
+], ids=["missing-run", "duplicate-run-index", "unauthorized-repeat-failure"])
+def test_exit_driver_rejects_incomplete_or_failing_declared_repeat(repeat_rows):
+    deferred_message = r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired"
+    gate = _gate_with_owner_deferred_case("ev-01-spawn-handler", "BLOCKED-OWNER", "FAIL", deferred_message)
+    scenarios = _passing_windows_scenarios_report()
+    basic = _windows_l15_report([
+        {"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"},
+        {"case_id": "ev-01-spawn-handler", "verdict": "FAIL", "message": deferred_message},
+        *repeat_rows,
+    ], report_subdir="report-basic")
+
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n", gate, _windows_l15_evidence(scenarios, basic),
+    )
+
+    assert unresolved == [{"step": "win_l15_func_test", "rc": 1}]
+    assert suppressed == []
 
 
 @pytest.mark.parametrize("rc_text,gate", [
@@ -322,9 +454,92 @@ def test_exit_driver_requires_an_explicit_od30_to_od32_blocked_owner_row():
     assert suppressed == []
 
 
+def test_exit_driver_does_not_suppress_owner_blocker_with_another_l15_failure():
+    gate = _gate_with_owner_deferred_case(
+        "ev-01-spawn-handler", "BLOCKED-OWNER", "FAIL",
+        r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired",
+    )
+    gate["cases"].append({
+        "id": "co-01-line-buffering", "layer": "L1.5", "status": "FAIL",
+        "evidence": [{"platform": "windows", "verdict": "FAIL", "gate_eligible": True,
+                      "message": "TX payload mismatch"}],
+    })
+
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n", gate,
+    )
+
+    assert unresolved == [{"step": "win_l15_func_test", "rc": 1}]
+    assert suppressed == []
+
+
+def test_exit_driver_checks_raw_reports_for_failures_missing_from_gate():
+    deferred_message = r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired"
+    gate = _gate_with_owner_deferred_case("ev-01-spawn-handler", "BLOCKED-OWNER", "FAIL", deferred_message)
+    scenarios = _passing_windows_scenarios_report()
+    basic = _windows_l15_report([
+        {"case_id": "ev-01-spawn-handler", "verdict": "FAIL", "message": deferred_message},
+        {"case_id": "co-01-line-buffering", "verdict": "FAIL", "message": "TX payload mismatch"},
+        {"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"},
+    ], report_subdir="report-basic")
+    gate["_windows_l15_evidence"] = _windows_l15_evidence(scenarios, basic)
+
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n", gate,
+    )
+
+    assert unresolved == [{"step": "win_l15_func_test", "rc": 1}]
+    assert suppressed == []
+
+
+def test_exit_driver_cli_reads_both_raw_reports_and_execution_metadata(capsys, tmp_path):
+    deferred_message = r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired"
+    gate = _gate_with_owner_deferred_case("ev-01-spawn-handler", "BLOCKED-OWNER", "FAIL", deferred_message)
+    scenarios = _passing_windows_scenarios_report()
+    basic = _windows_l15_report([
+        {"case_id": "ev-01-spawn-handler", "verdict": "FAIL", "message": deferred_message},
+        {"case_id": "co-01-line-buffering", "verdict": "FAIL", "message": "TX payload mismatch"},
+        {"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"},
+    ], report_subdir="report-basic")
+    evidence = _windows_l15_evidence(scenarios, basic)
+    paths = [tmp_path / name for name in ("rc.txt", "gate.json", "scenarios.json", "basic.json", "meta.json")]
+    paths[0].write_text("win_l15_func_test 1\nstage1a_gate 0\n", encoding="utf-8")
+    for path, document in zip(paths[1:], (gate, scenarios, basic, evidence["metadata"])):
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert l15_exit_driver.main([str(path) for path in paths]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["unresolved"] == [{"step": "win_l15_func_test", "rc": 1}]
+    assert summary["suppressed"] == []
+
+
+def test_exit_driver_rejects_raw_report_from_another_windows_run():
+    deferred_message = r"步驟 7: 等待檔案逾時 8s: C:\\temp\\ev-fired"
+    gate = _gate_with_owner_deferred_case("ev-01-spawn-handler", "BLOCKED-OWNER", "FAIL", deferred_message)
+    scenarios = _passing_windows_scenarios_report()
+    basic = _windows_l15_report([
+        {"case_id": "ev-01-spawn-handler", "verdict": "FAIL", "message": deferred_message},
+        {"case_id": "brcm-01-login-flow", "verdict": "PASS", "message": "OK"},
+    ], report_subdir="report-basic")
+    basic["results"][0]["evidence_dir"] = (
+        "C:/Users/test/AppData/Local/Temp/sw-rust-test/other-run/report-basic/"
+        "ev-01-spawn-handler/bridge/0"
+    )
+
+    unresolved, suppressed = l15_exit_driver.unresolved_steps(
+        "win_l15_func_test 1\nstage1a_gate 0\n", gate, _windows_l15_evidence(scenarios, basic),
+    )
+
+    assert unresolved == [{"step": "win_l15_func_test", "rc": 1}]
+    assert suppressed == []
+
+
 def test_driver_filters_windows_l15_rc_only_through_owner_deferred_gate_summary():
-    text = _driver_text()
-    assert 'scripts/rust/l15_exit_driver.py "$EV/rc.txt" "$EV/stage1a-gate.json"' in text
+    text = _joined()
+    assert ('scripts/rust/l15_exit_driver.py "$EV/rc.txt" "$EV/stage1a-gate.json" '
+            '"$EV/func-test-windows/func-test-report.json" '
+            '"$EV/func-test-windows/basic/func-test-report.json" '
+            '"$EV/func-test-windows/win-func-test-meta.json"') in text
     assert 'awk \'$2 != 0\' "$EV/rc.txt"' not in text
 
 

@@ -97,6 +97,24 @@ fn unreadable_state_json_exits_3_and_releases_lock() {
 }
 
 #[test]
+fn unwritable_state_dir_startup_save_exits_1_before_attach() {
+    // sol-backfill p5 #4：Python 基線實測（非 root、state 目錄 555）——`SessionManager.__init__` 的 `_save_state()`
+    // 於 mkstemp 拋 `PermissionError: [Errno 13] Permission denied: '<state>/state.json.tmp.XXXX'`，traceback 後 rc 1，
+    // 尚未 attach（假 DUT 收到 0 bytes）、state 目錄無新檔。
+    assert!(!is_root(), "證據不足：root 下 chmod 無效，state 目錄唯讀路徑須以非 root 執行");
+    let mut env = isolated_env_with_pty_target();
+    chmod(&env.state_dir, "555");
+    let out = run_to_exit(&env, &env.vars, &[]);
+    chmod(&env.state_dir, "755");
+    assert_eq!(out.code, Some(1), "{}", out.stderr);
+    assert!(out.stderr.contains("Traceback (most recent call last):"), "{}", out.stderr);
+    let last = out.stderr.lines().last().unwrap_or_default();
+    assert!(last.starts_with("PermissionError: [Errno 13] Permission denied"), "{}", out.stderr);
+    assert!(env.target_rx().is_empty(), "啟動存檔失敗不得對 DUT 送出任何 bytes");
+    assert_eq!(fs::read_dir(&env.state_dir).unwrap().count(), 0, "state 目錄不得留下檔案");
+}
+
+#[test]
 fn no_profiles_message_and_continue() {
     let env = isolated_env();
     let mut d = DaemonProc::spawn(&env, &[]);
@@ -121,6 +139,33 @@ fn unknown_arg_exit_2_usage() {
         "usage: serialwrapd [-h] [--profile-dir PROFILE_DIR] [--socket SOCKET]\n                   [--lock LOCK]\n\
          serialwrapd: error: unrecognized arguments: --bogus\n"
     );
+}
+
+#[test]
+fn bare_double_dash_is_unrecognized_exit_2() {
+    // sol-backfill p5 #5：Python 3.12 argparse 實測——無 positional 的 parser 不消耗 `--`，留在 extras：
+    // `serialwrapd --`、`--profile-dir x --`、`-- -h` 皆 rc 2、末行 `unrecognized arguments: ...`，不得啟動。
+    for (args, tail) in [
+        (vec!["--"], "--"),
+        (vec!["--profile-dir", "x", "--"], "--"),
+        (vec!["--", "-h"], "-- -h"),
+    ] {
+        let env = isolated_env();
+        let mut vars = env.vars.clone();
+        vars.insert("COLUMNS".to_string(), "80".to_string());
+        let out = run_to_exit(&env, &vars, &args);
+        assert_eq!(out.code, Some(2), "{args:?}: {}", out.stderr);
+        assert!(
+            out.stderr.ends_with(&format!("serialwrapd: error: unrecognized arguments: {tail}\n")),
+            "{args:?}: {}",
+            out.stderr
+        );
+        assert!(!env.socket.exists(), "{args:?}：不得 bind socket");
+        assert!(
+            !env.state_dir.join("state.json").exists(),
+            "{args:?}：不得寫 state.json"
+        );
+    }
 }
 
 #[test]

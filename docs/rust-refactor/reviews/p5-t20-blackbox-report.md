@@ -110,3 +110,16 @@ skipped：`test_slice_scope.py::test_deferred_methods` 只在 Rust 標籤執行�
 | `test_safety_core.py::test_wal_unlink_recreates_with_meta` | PASS | PASS | PASS | PASS |
 | `test_safety_core.py::test_zero_tx_while_autoboot_quiet` | PASS | PASS | PASS | PASS |
 | `test_slice_scope.py::test_deferred_methods` | SKIP | SKIP | PASS | PASS |
+
+## 擁有者裁決後處置（2026-10-28，P5 第四輪）
+
+- OD-36：上表第一類 8 案依裁決修正案例設計（逐案見 `docs/rust-refactor/slice21-chg-register.md` CHG-S21-OD36-*），
+  「錯誤實作仍會紅」以 `tests/contract_blackbox/slice21/test_oracle_redproof.py` 證明；修正後 Python 與 Rust release 皆 PASS
+  （`reject[READY_UNCONFIRMED]` 兩邊各約 302 s）。
+- OD-37：`test_recovery_flushes_queue` 為外部可觀察差異（Python 送出 q0、Rust 5 筆皆 flush），已登記 DF-21，Rust 依 DF 判定（PASS），
+  Python 輪逐列標記 DF 差異；`test_stale_context_not_replayed` 登記 DF-20，Rust 實作屬 Slice 2.2（P6），P5 只登記。
+  原結論「無 Rust 對 Python 的待修差異」不再適用（審查 9b81d9a_c66f65e 2be8982 #1）。
+- OD-38：`reject[METHOD_NOT_FOUND]` 為 Rust 專屬，Python 輪 not_applicable 逐列列名。
+- 未列入 OD-36 的 `test_f2_backpressure.py::test_queue_full_backpressure` 在本 session 環境 Python 輪起點即 FAIL
+  （Python CLI 逐筆 submit 300 筆超過前景 `sleep 30`，與 `reject[SESSION_QUEUE_FULL]` 同一根因），Rust 輪 PASS；
+  未自行改案例，列為待擁有者確認是否比照 OD-36 修正前景時長。

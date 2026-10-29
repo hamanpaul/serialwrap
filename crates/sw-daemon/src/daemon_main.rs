@@ -298,7 +298,10 @@ fn parse_args_width(argv: &[String], paths: &RuntimePaths, width: usize) -> Resu
             continue;
         }
         if arg == "--" {
+            // Python 3.12 argparse：`--` 只在被 positional 消耗時才移除；本 parser 無 positional，`--` 連同其後參數
+            // 一律留在 extras → `unrecognized arguments: -- ...`、rc 2（sol-backfill p5 #5）。
             only_positional = true;
+            extras.push(arg.clone());
             continue;
         }
         if !is_optional_like(arg) {

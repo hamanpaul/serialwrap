@@ -58,11 +58,11 @@ fn detect_multi_open(svc: &Service, tty_paths: &[PathBuf]) -> (bool, Vec<PyValue
         }
     };
     if tty_paths.is_empty() {
-        let (_, st) = svc.procs.serialwrapd_tty_holders(&[]);
+        let (_, st) = svc.procs.multi_open_tty_holders(&[]);
         merge(st);
     }
     for tty in tty_paths {
-        let (pids, st) = svc.procs.serialwrapd_tty_holders(std::slice::from_ref(tty));
+        let (pids, st) = svc.procs.multi_open_tty_holders(std::slice::from_ref(tty));
         merge(st);
         // Python `holders[tty] = pid`：同一 tty 多個持有者時保留最後一個（pid 升冪掃描）。
         if let Some(pid) = pids.iter().max() {

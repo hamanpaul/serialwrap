@@ -9,10 +9,17 @@ import json, os, pathlib, subprocess, sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-P2_21 = ["l15-delayed-reply", "l15-half-prompt", "l15-slow-reader-backpressure", "l15-transport-disconnect",
+P2_21 = ["l15-half-prompt", "l15-slow-reader-backpressure", "l15-transport-disconnect",
          "l15-multi-source-contention-cli", "l15-stale-event-delay", "l15-wal-interference", "l15-reject-zero-tx",
          "l15-exclusive-open", "l15-reboot-min-guard", "l15-release-inflight"]
 S21 = sorted(p.stem for p in (ROOT / "func-test/scenarios").glob("s21-*.yaml"))
+# OD-34（2026-10-28）：依賴 readiness reprobe（P7-T5）的情境逐名延至 Slice 2.3 出口（情境檔保留，2.3 須 PASS）。
+#   l15-delayed-reply 已自 cases.lock.json 的 slice_2.1 延後（凍結修訂 #1），故不在 P2_21。
+DEFERRED_TO_S23 = {"l15-delayed-reply": "OD-34", "s21-reboot-minimal-guard": "OD-34"}
+# OD-40（2026-10-28）：l15-wal-interference 自 l15_ab 判定逐名移出（情境檔與 2.1 必要案例保留），改由
+# tests/acceptance/slice21_gate_expect.yaml 的 `l15_ab_excluded` 所列 pytest WAL 測試承擔。
+L15_AB_EXCLUDED = {"l15-wal-interference": "OD-40"}
+L15_AB_CASES = [c for c in P2_21 + S21 if c not in DEFERRED_TO_S23 and c not in L15_AB_EXCLUDED]
 GATE = os.environ.get("SERIALWRAP_GATE") == "1"
 RECORD_ONLY: set[str] = set()   # s21-exclusive-conflict-plain-open 已依規格 §6.2 定案為拒絕（§0.2），改為正式判定
 
@@ -26,13 +33,23 @@ def test_case_list_matches_freeze():
     l15 = {c["case_id"] for c in cases["cases"] if c.get("suite") == "l15-scenario" and c["case_id"] in lock["sets"]["slice_2.1"]}
     assert l15 == set(P2_21)
     assert len(S21) == 10
+    # 延後與移出皆逐名且情境檔仍在（不得以刪檔縮小範圍）。
+    for case in list(DEFERRED_TO_S23) + list(L15_AB_EXCLUDED):
+        assert (ROOT / "func-test/scenarios" / f"{case}.yaml").is_file(), case
+    assert "l15-delayed-reply" not in lock["sets"]["slice_2.1"] and "l15-delayed-reply" in lock["sets"]["slice_2.3"]
+    assert "l15-wal-interference" in lock["sets"]["slice_2.1"], "OD-40 只移出 l15_ab 判定，不移出 2.1 分母"
+    expect = __import__("yaml").safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    excluded = {row["case_id"]: row for row in expect.get("l15_ab_excluded") or []}
+    assert set(excluded) == set(L15_AB_EXCLUDED)
+    for case, od in L15_AB_EXCLUDED.items():
+        assert excluded[case]["decision"] == od and excluded[case]["covered_by"], case
 
 
 @pytest.mark.posix_only
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
 @pytest.mark.cap_posix_pty
-@pytest.mark.parametrize("case", P2_21 + S21)
+@pytest.mark.parametrize("case", L15_AB_CASES)
 @pytest.mark.parametrize("label,daemon_env", [("python", "SERIALWRAP_L15_PY_DAEMON"), ("rust", "SERIALWRAP_L15_RUST_DAEMON")])
 def test_case(case, label, daemon_env, tmp_path):
     exe, report = os.environ.get(daemon_env), os.environ.get("SERIALWRAP_L15_SELFTEST_REPORT")

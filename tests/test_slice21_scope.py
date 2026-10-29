@@ -135,8 +135,9 @@ LOCK = ROOT / "tests" / "acceptance" / "cases.lock.json"
 PLAN06 = ROOT / "docs" / "rust-refactor" / "plans" / "06-slice21-daemon-core.md"
 # Task 0b 文件化的 L1.5／Windows 必要案例列舉（11 個 l15-scenario ＋ 7 個 windows-native，共 18 個）。
 # 分母以 cases.lock.json 為權威；本清單只作可讀記錄，須與 lock 交集完全相等（見 test_l15_and_windows_required_listed）。
+# OD-34（2026-10-28）：l15-delayed-reply 依賴 readiness reprobe（P7-T5），已逐名延至 Slice 2.3（凍結修訂 #1），不再屬 2.1 分母。
 L15_WIN_LISTED = [
-    "l15-delayed-reply", "l15-half-prompt", "l15-slow-reader-backpressure", "l15-transport-disconnect",
+    "l15-half-prompt", "l15-slow-reader-backpressure", "l15-transport-disconnect",
     "l15-multi-source-contention-cli", "l15-stale-event-delay", "l15-wal-interference", "l15-reject-zero-tx",
     "l15-exclusive-open", "l15-reboot-min-guard", "l15-release-inflight",
     "win-com-open-exclusive", "win-com-txrx-bridge", "win-com-cancel-close", "win-wal-av-rotate",

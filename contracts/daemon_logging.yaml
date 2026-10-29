@@ -144,7 +144,7 @@ messages:
     template: "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:6108"
+    source: "sw_core/session_manager.py:6111"
 
   - id: console_rx_handler_exception
     logger: serialwrap
@@ -377,25 +377,25 @@ messages:
     template: "reboot-recovery ensure_ready TX 例外（session=%s）"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:6102"
+    source: "sw_core/session_manager.py:6105"
 
   - id: test_kill_after_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1 已忽略：%s（非隔離實例不得終止行程）"
     args: [reason]
-    source: "sw_core/session_manager.py:8192"
+    source: "sw_core/session_manager.py:8195"
 
   - id: test_kill_after_save_fired
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1：state 已落盤，於回應前以 os._exit(137) 模擬程序被殺（隔離實例）"
     args: []
-    source: "sw_core/session_manager.py:8197"
+    source: "sw_core/session_manager.py:8200"
 
   - id: test_pause_before_release_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE 已忽略：%s（非隔離實例不得暫停）"
     args: [reason]
-    source: "sw_core/session_manager.py:8219"
+    source: "sw_core/session_manager.py:8222"

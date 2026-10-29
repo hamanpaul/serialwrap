@@ -259,6 +259,10 @@ struct Shared {
     probe_tx_frozen: AtomicBool,
     /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
     rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
+    /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 建立後、交給 TxWriter 提交前呼叫（重現「健康快照之後才發布
+    /// WAL unhealthy」的競態；sol-backfill p5 #6）。
+    #[cfg(feature = "test-fakes")]
+    probe_pre_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -430,8 +434,8 @@ fn minimal_passthrough_template(name: &str) -> ProfileTemplate {
         log_dir: None,
         uart: UartProfile::default(),
         bootloader_prompts: Vec::new(),
-        max_console_line_chars: None,
         boot_done_regex: String::new(),
+        max_console_line_chars: None,
     }
 }
 
@@ -684,6 +688,9 @@ impl Shared {
             data: mailbox.data_sender(),
             workers,
             runners: HashMap::new(),
+            open_jobs: JobQueue::new("open"),
+            persist_jobs: JobQueue::new("persist"),
+            opened_rx: Arc::new(Mutex::new(HashMap::new())),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
         inner.sessions.insert(
@@ -1170,6 +1177,13 @@ impl Shared {
             f.frozen = frozen;
             f.wal_unhealthy = wal_unhealthy;
         });
+        // sol-backfill p5 #6：比照 session fence 向全域 fanout 註冊——快照讀取之後才發布的 unhealthy 也會送達；
+        // 註冊協定與通知串行化，取得的必為最新狀態（Python 於送出時才讀共用 WAL unhealthy）。
+        self.fanout.register(fence.clone());
+        #[cfg(feature = "test-fakes")]
+        if let Some(hook) = lock(&self.probe_pre_submit_hook).as_ref() {
+            hook();
+        }
         let writer = std::mem::replace(&mut parts.writer, Box::new(DetachedWriter));
         let (control_tx, _control_rx) = crossbeam_channel::unbounded();
         let cancel = CancelToken::new(parts.waker.clone());
@@ -1486,7 +1500,13 @@ impl Shared {
                 lock(&self.inner).interactive.insert(interactive_id, sid);
             }
             ManagerNote::EvictCapture { com, cmd_id } => {
-                let actor = lock(&self.inner).resolve(&com).map(|e| e.actor.clone());
+                // 內部 owner 身分：以 `profile.com` 精確比對，不走使用者 selector 規則（alias 可能與他人 COM 同名；
+                // sol-backfill p5 #7）。
+                let actor = lock(&self.inner)
+                    .sessions
+                    .values()
+                    .find(|e| e.profile.com == com)
+                    .map(|e| e.actor.clone());
                 if let Some(actor) = actor {
                     let _ = actor.control.send(ControlEvent::EvictCapture { cmd_id });
                 }
@@ -1694,7 +1714,9 @@ impl Shared {
             }
         }
         if let Err(e) = self.commit_sync(|_| {}) {
-            self.warn(format!("state.json 寫入失敗（啟動存檔）：{e:?}"));
+            // Python 建構子尾端 `_save_state()` 的 OSError（EACCES／ENOSPC 等）未捕捉 → daemon traceback、rc 1，
+            // 尚未掃描／attach（sol-backfill p5 #4）；daemon 以 `startup_error()` 判定並以此末行結束。
+            *lock(&self.startup_error) = Some(format!("{}: {}", e.py_exc_name(), e.py_message));
         }
     }
 }
@@ -1713,16 +1735,61 @@ struct ManagerExec {
     /// 各 epoch 的 IoWorker；與 self-test 的 bridge 快照探針共用（審查 F32：`snapshot()` 的 running／serial_alive）。
     workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
     runners: HashMap<u64, OpRunner>,
+    /// 開埠工作者：`OpenBridge` 的同步開埠在 actor 外執行，完成以 `BridgeOpened` 回報（sol-backfill p5 #2）。
+    open_jobs: JobQueue,
+    /// 持久化工作者：`Persist` 的 commit 等待在 actor 外執行，完成以 `StateCommitted` 回報（同上）。
+    persist_jobs: JobQueue,
+    /// 開埠工作者建立、尚待 `AdoptBridge` 接手的 RX 視窗（epoch → 視窗；接手時成為本 executor 的 `rx`）。
+    opened_rx: Arc<Mutex<HashMap<u64, Arc<RxShared>>>>,
 }
 
-impl ManagerExec {
-    fn com(&self) -> String {
-        lock(&self.io.profile).com.clone()
+/// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
+/// 佇列滿時 `submit` 回 `false`，呼叫端須立即以失敗結果回報，不得阻塞 actor。
+struct JobQueue {
+    name: &'static str,
+    tx: Option<Sender<Box<dyn FnOnce() + Send>>>,
+}
+
+/// 每個 session 的開埠／持久化工作者佇列上限（actor 同時只會有一個 pending open；commit 依序完成）。
+const JOB_QUEUE_CAP: usize = 16;
+
+impl JobQueue {
+    fn new(name: &'static str) -> JobQueue {
+        JobQueue { name, tx: None }
     }
 
+    fn submit(&mut self, job: Box<dyn FnOnce() + Send>) -> bool {
+        if self.tx.is_none() {
+            let (tx, rx) = crossbeam_channel::bounded::<Box<dyn FnOnce() + Send>>(JOB_QUEUE_CAP);
+            let spawned = std::thread::Builder::new()
+                .name(format!("serialwrap-{}", self.name))
+                .spawn(move || {
+                    for job in rx {
+                        let _ = catch_unwind(AssertUnwindSafe(job));
+                    }
+                });
+            if spawned.is_err() {
+                return false;
+            }
+            self.tx = Some(tx);
+        }
+        self.tx.as_ref().is_some_and(|tx| tx.try_send(job).is_ok())
+    }
+}
+
+/// 開埠所需、可移出 actor 的狀態。
+struct OpenCtx {
+    shared: Arc<Shared>,
+    io: Arc<SessionIo>,
+    fence: Arc<Fence>,
+    data: Sender<DataEvent>,
+    com: String,
+}
+
+impl OpenCtx {
     /// `OpenBridge`：stopping gate → 預開 handle（同路徑則原樣交接，#51）或 `open_exclusive` → IoWorker。
     fn open_bridge(
-        &mut self,
+        &self,
         dev: DevicePath,
         cfg: SerialConfig,
         precheck_holders: bool,
@@ -1784,7 +1851,7 @@ impl ManagerExec {
         let worker = IoWorker::start_observed(
             handle,
             IoWorkerArgs {
-                com: self.com(),
+                com: self.com.clone(),
                 epoch,
                 wal: self.shared.wal.clone(),
                 rx: rx.clone(),
@@ -1797,7 +1864,6 @@ impl ManagerExec {
             },
             observers,
         );
-        self.rx = rx.clone();
         Ok(OpenedBridge {
             epoch,
             worker,
@@ -1805,6 +1871,13 @@ impl ManagerExec {
             rx,
             vtty,
         })
+    }
+
+}
+
+impl ManagerExec {
+    fn com(&self) -> String {
+        lock(&self.io.profile).com.clone()
     }
 
     /// `StartOp`：交給該 epoch 的 `OpRunner`（Task 14）；無法啟動時以 `SendFailed` 結束 op，避免 actor 永久等待。
@@ -1824,6 +1897,7 @@ impl ManagerExec {
                     clock: self.shared.clock.clone(),
                     control: control.clone(),
                     rng: Arc::new(fill_random),
+                    registry: self.shared.registry.clone(),
                 };
                 self.runners.insert(epoch, OpRunner::spawn(ctx));
             }
@@ -1907,16 +1981,54 @@ impl EffectExecutor for ManagerExec {
                 cfg,
                 precheck_holders,
             } => {
-                let result = self.open_bridge(dev, cfg, precheck_holders, tx);
-                let _ = tx.send(ControlEvent::BridgeOpened {
-                    epoch_hint: 0,
-                    result,
-                });
+                let ctx = OpenCtx {
+                    shared: self.shared.clone(),
+                    io: self.io.clone(),
+                    fence: self.fence.clone(),
+                    data: self.data.clone(),
+                    com: self.com(),
+                };
+                let control = tx.clone();
+                let opened_rx = self.opened_rx.clone();
+                let submitted = self.open_jobs.submit(Box::new(move || {
+                    let result = ctx.open_bridge(dev, cfg, precheck_holders, &control);
+                    if let Ok(opened) = &result {
+                        lock(&opened_rx).insert(opened.epoch, opened.rx.clone());
+                    }
+                    let sent = control.send(ControlEvent::BridgeOpened {
+                        epoch_hint: 0,
+                        result,
+                    });
+                    // actor 已結束（開埠期間 session 被移除）：沒有人會 adopt／drain，就地關閉以免 handle 懸置。
+                    if let Err(crossbeam_channel::SendError(ControlEvent::BridgeOpened {
+                        result: Ok(opened),
+                        ..
+                    })) = sent
+                    {
+                        lock(&opened_rx).remove(&opened.epoch);
+                        opened
+                            .worker
+                            .finish_async(crate::drain::StopId(0), control.clone());
+                    }
+                }));
+                if !submitted {
+                    let _ = tx.send(ControlEvent::BridgeOpened {
+                        epoch_hint: 0,
+                        result: Err(OpenFailure::Other(PalError::plain(
+                            PalErrorKind::Io,
+                            "開埠工作者無法受理",
+                        ))),
+                    });
+                }
             }
             Effect::AdoptBridge { epoch, worker, .. } => {
+                if let Some(rx) = lock(&self.opened_rx).remove(&epoch) {
+                    self.rx = rx;
+                }
                 lock(&self.workers).insert(epoch, worker);
             }
             Effect::BeginDrain { stop_id, epoch } => {
+                lock(&self.opened_rx).remove(&epoch);
                 self.runners.remove(&epoch);
                 let worker = lock(&self.workers).remove(&epoch);
                 if let Some(worker) = worker {
@@ -1946,8 +2058,22 @@ impl EffectExecutor for ManagerExec {
             }
             Effect::Persist { commit_id, delta } => {
                 let release = matches!(delta, StateDelta::Released { .. });
-                let result = self.shared.commit_sync_kind(|m| m.apply(delta), release);
-                let _ = tx.send(ControlEvent::StateCommitted { commit_id, result });
+                // sol P5-5cc4623-1：delta 依 actor 順序同步套入 model；工作者只跑 release 暫停鉤子並提交「當下」快照。
+                // 若延到工作者才套 delta，release 暫停期間完成的 bind（Unreleased＋新 binding）會被舊 Released 覆寫
+                // （Python `_save_release_state` 暫停後重建當前快照，不回放已失效的 delta）。
+                self.shared.model_apply(delta);
+                let shared = self.shared.clone();
+                let control = tx.clone();
+                let submitted = self.persist_jobs.submit(Box::new(move || {
+                    let result = shared.commit_sync_kind(|_| {}, release);
+                    let _ = control.send(ControlEvent::StateCommitted { commit_id, result });
+                }));
+                if !submitted {
+                    let _ = tx.send(ControlEvent::StateCommitted {
+                        commit_id,
+                        result: Err(PalError::plain(PalErrorKind::Io, "持久化工作者無法受理")),
+                    });
+                }
             }
             Effect::Notify(note) => {
                 let _ = self.shared.note_tx.send(note);
@@ -2034,6 +2160,8 @@ impl SessionManager {
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
             rx_observers: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-fakes")]
+            probe_pre_submit_hook: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -2502,6 +2630,17 @@ impl SessionManager {
             e.profile.alias = alias.to_string();
             lock(&e.io.profile).alias = alias.to_string();
         }
+        // actor 持有的 profile 一併更新並等確認（GetState／submit 等回應中的 `session.alias`；sol-backfill p5 #3）。
+        let applied = self.shared.request(
+            sid,
+            SessionRequest::SetAlias {
+                alias: alias.to_string(),
+            },
+            QUERY_TIMEOUT,
+        )?;
+        if !is_ok(&applied) {
+            return Ok(applied);
+        }
         let row = alias_row(sid, alias, &self.shared.now_iso());
         let name = alias.to_string();
         self.shared
@@ -2654,6 +2793,12 @@ impl SessionManager {
     #[cfg(feature = "test-fakes")]
     pub fn freeze_probe_tx_for_test(&self, frozen: bool) {
         self.shared.probe_tx_frozen.store(frozen, Ordering::SeqCst);
+    }
+
+    /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 建立後、提交前執行 `hook`（見 `probe_pre_submit_hook`）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_probe_pre_submit_hook_for_test(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *lock(&self.shared.probe_pre_submit_hook) = Some(hook);
     }
 
     /// 設定 state.json 持久化觀察者（P5-T19 #3／#4／#68；daemon 組裝點於 `new()` 之後、任何 attach 之前呼叫）。

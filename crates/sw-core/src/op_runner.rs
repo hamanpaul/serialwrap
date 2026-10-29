@@ -77,6 +77,8 @@ pub struct OpCtx {
     pub clock: Arc<dyn Clock>,
     pub control: crossbeam_channel::Sender<ControlEvent>,
     pub rng: Arc<dyn Fn(&mut [u8]) + Send + Sync>,
+    /// `command_aborted_in_flight` META 寫入權（與 drain 回條互斥；`CommandRegistry::claim_abort_meta`）。
+    pub registry: Arc<crate::arbiter::CommandRegistry>,
 }
 
 /// 前景 op 執行器（thread pool size 1 per session，ForegroundSlot；Task 14 Produces）。
@@ -143,6 +145,54 @@ pub fn extract_command_stdout(
     prompt_regex: &PyRegex,
     completion: Option<&PyRegex>,
 ) -> String {
+    let mut lines = prompt_cut_lines(raw, prompt_regex, completion);
+    if !command.is_empty() {
+        let stripped = py_strip(command);
+        let mut removed = false;
+        while lines
+            .first()
+            .is_some_and(|line| py_strip(line).ends_with(stripped))
+        {
+            lines.remove(0);
+            removed = true;
+        }
+        if !removed {
+            // 只把原始串流中 BusyBox 的雙 CR＋LF 視為折行證據；一般 stdout 換行不可拼接（sol P5-70f6ce7-1）。
+            let mut wrapped = false;
+            if raw.contains("\r\r\n") {
+                if let Some(n) = strip_wrapped_command_echo(&lines, stripped) {
+                    lines.drain(..n);
+                    wrapped = true;
+                }
+            }
+            // bash readline 會在長回顯折行處寫入「空白＋CR」再接續同一行：以原始控制字元辨識後重新抽取。
+            if !wrapped && raw.contains(" \r") {
+                let chars: Vec<char> = raw.chars().collect();
+                let cmd: Vec<char> = stripped.chars().collect();
+                if let Some((start, end)) = match_readline_wrapped_echo(&chars, &cmd) {
+                    let echo: String = chars[start..end].iter().collect();
+                    let candidate: String = chars[..start]
+                        .iter()
+                        .copied()
+                        .chain(echo.replace(" \r", "").chars())
+                        .chain(chars[end..].iter().copied())
+                        .collect();
+                    let candidate_lines = prompt_cut_lines(&candidate, prompt_regex, completion);
+                    if candidate_lines
+                        .first()
+                        .is_some_and(|line| py_strip(line).ends_with(stripped))
+                    {
+                        lines = candidate_lines[1..].to_vec();
+                    }
+                }
+            }
+        }
+    }
+    lines.join("\n").trim_matches('\n').to_string()
+}
+
+/// `clean_text` 後依最後一個 prompt（completion 模式下只裁完成標記之後的尾 prompt）截斷並切行。
+fn prompt_cut_lines(raw: &str, prompt_regex: &PyRegex, completion: Option<&PyRegex>) -> Vec<String> {
     let cleaned = clean_text(raw);
     let prompt_start = last_match_start(prompt_regex, &cleaned);
     let completion_end = completion
@@ -158,18 +208,89 @@ pub fn extract_command_stdout(
             text = char_prefix(&cleaned, start);
         }
     }
-    let trimmed = text.trim_start_matches('\n');
-    let mut lines: Vec<&str> = splitlines(trimmed);
-    if !command.is_empty() {
-        let stripped = py_strip(command);
-        while lines
-            .first()
-            .is_some_and(|line| py_strip(line).ends_with(stripped))
-        {
-            lines.remove(0);
+    splitlines(text.trim_start_matches('\n'))
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// 終端寬度扣掉 prompt 後每段回顯仍至少約 20 字元（Python `_READLINE_WRAP_MIN_SEGMENT`；BusyBox 路徑以此估計最多佔幾行）。
+const WRAP_MIN_SEGMENT: usize = 20;
+
+/// Python `_strip_wrapped_command_echo`：移除含 BusyBox 雙 CR 折行標記的命令回顯；`lines` 已 `clean_text` 並切行。
+/// 只接合不同輸出行（行內空白保持原樣），前綴（殘留 prompt）須短於第一行；回傳要移除的行數。
+fn strip_wrapped_command_echo(lines: &[String], command: &str) -> Option<usize> {
+    if command.is_empty() || lines.len() < 2 {
+        return None;
+    }
+    let cmd_len = command.chars().count();
+    let first_len = lines[0].chars().count();
+    let mut joined = String::new();
+    for (i, line) in lines.iter().take(cmd_len / WRAP_MIN_SEGMENT + 2).enumerate() {
+        joined.push_str(line);
+        if joined.ends_with(command) && joined.chars().count() - cmd_len < first_len {
+            return Some(i + 1);
         }
     }
-    lines.join("\n").trim_matches('\n').to_string()
+    None
+}
+
+/// Python `_match_readline_wrapped_echo`（842c014 後語意）：於原始文字首個非空行內，找「命令原文＋readline 折行標記
+/// `" \r"`」的起訖位置（字元索引）。標記不得在第一個命令字元前，彼此（第一個自命令起點）至少相隔
+/// [`WRAP_MIN_SEGMENT`] 個命令字元；標記優先於命令字元比對（折行點緊貼命令原有空白時仍可辨識），回顯須結束於行尾。
+fn match_readline_wrapped_echo(text: &[char], command: &[char]) -> Option<(usize, usize)> {
+    if text.is_empty() || command.is_empty() {
+        return None;
+    }
+    let mut line_start = 0usize;
+    let line_end = loop {
+        if line_start >= text.len() {
+            return None;
+        }
+        let line_end = text[line_start..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map_or(text.len(), |p| line_start + p);
+        if text[line_start..line_end].iter().any(|c| *c != '\r') {
+            break line_end;
+        }
+        if line_end == text.len() {
+            return None;
+        }
+        line_start = line_end + 1;
+    };
+    let line = &text[line_start..line_end];
+    for command_start in 0..line.len() {
+        if line[command_start] != command[0] {
+            continue;
+        }
+        let (mut cursor, mut matched) = (command_start, 0usize);
+        let mut last_wrap: Option<usize> = None;
+        while matched < command.len() && cursor < line.len() {
+            if matched > 0 && line[cursor] == ' ' && line.get(cursor + 1) == Some(&'\r') {
+                let segment = last_wrap.map_or(matched, |w| matched - w);
+                if segment < WRAP_MIN_SEGMENT {
+                    break;
+                }
+                last_wrap = Some(matched);
+                cursor += 2;
+                continue;
+            }
+            if line[cursor] == command[matched] {
+                cursor += 1;
+                matched += 1;
+                continue;
+            }
+            break;
+        }
+        if matched != command.len() {
+            continue;
+        }
+        if cursor == line.len() || line[cursor..] == ['\r'] {
+            return Some((line_start + command_start, line_start + cursor));
+        }
+    }
+    None
 }
 
 /// Python `str.encode("ascii")` 的 `UnicodeEncodeError` 訊息：回報第一段連續非 ASCII 字元（以 code point 計位置），
@@ -305,10 +426,11 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
         } => run_self_test_probe(ctx, grant, timeout_s, &probe, &nonce),
         OpSpec::InteractiveOpenCmd { command, owner } => {
             let payload = command_payload(&command);
-            lease_send(ctx, grant, payload, TxClass::InteractiveOpenCmd, &owner)
+            // `command.submit {mode:"interactive"}` 的命令：TX 帶原 cmd_id，未完整送出依命令帳結算（sol-backfill p5 #1）。
+            lease_send(ctx, grant, payload, TxClass::InteractiveOpenCmd, &owner, grant.cmd_id.as_deref())
         }
         OpSpec::InteractiveSend { payload, owner } => {
-            lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner)
+            lease_send(ctx, grant, payload, TxClass::LeaseOwner, &owner, None)
         }
         OpSpec::RebootRecovery { .. } => OpOutcome::Error(PyErr::value_error(
             "reboot recovery 由 session actor 以登入 run 驅動（OpRunner 不承接）",
@@ -407,15 +529,17 @@ fn map_send_failure(
         meta.insert("event", PyValue::from("command_aborted_in_flight"));
         meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
         meta.insert("tx_outcome", PyValue::from(tx_outcome));
-        let _ = ctx.wal.append(WalAppendReq {
-            com: &ctx.com,
-            dir: "META",
-            source: "system",
-            payload: b"",
-            cmd_id: Some(cmd_id),
-            loss_flag: false,
-            meta: Some(meta),
-        });
+        if ctx.registry.claim_abort_meta(cmd_id) {
+            let _ = ctx.wal.append(WalAppendReq {
+                com: &ctx.com,
+                dir: "META",
+                source: "system",
+                payload: b"",
+                cmd_id: Some(cmd_id),
+                loss_flag: false,
+                meta: Some(meta),
+            });
+        }
         return pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" };
     }
     if unknown {
@@ -655,15 +779,17 @@ fn recover_after_failure(
                         meta.insert("event", PyValue::from("command_aborted_in_flight"));
                         meta.insert("confirmed_tx_bytes", py_int(confirmed as i128));
                         meta.insert("tx_outcome", PyValue::from(tx_outcome));
-                        let _ = ctx.wal.append(WalAppendReq {
-                            com: &ctx.com,
-                            dir: "META",
-                            source: "system",
-                            payload: b"",
-                            cmd_id: Some(cmd_id),
-                            loss_flag: false,
-                            meta: Some(meta),
-                        });
+                        if ctx.registry.claim_abort_meta(cmd_id) {
+                            let _ = ctx.wal.append(WalAppendReq {
+                                com: &ctx.com,
+                                dir: "META",
+                                source: "system",
+                                payload: b"",
+                                cmd_id: Some(cmd_id),
+                                loss_flag: false,
+                                meta: Some(meta),
+                            });
+                        }
                         return OpOutcome::CommandResult(
                             pydict! { "ok" => false, "error_code" => "COMMAND_ABORTED_IN_FLIGHT" },
                         );
@@ -731,18 +857,28 @@ fn run_self_test_probe(
 }
 
 /// lease 擁有者 TX（`interactive_send`／`interactive_open` 的 command）。
+///
+/// `cmd_id` 為 `Some` 時（interactive 模式命令）：TX WAL 帶該 cmd_id；已確認 bytes >0 或結果 Unknown 時以
+/// [`map_send_failure`] 結算（Python `_map_aborted_result`：`COMMAND_ABORTED_IN_FLIGHT`＋META）。
 fn lease_send(
     ctx: &OpCtx,
     grant: &OpGrant,
     payload: Vec<u8>,
     class: TxClass,
     owner: &str,
+    cmd_id: Option<&str>,
 ) -> OpOutcome {
-    let report = send(ctx, grant, &payload, class, owner, None, true);
+    let report = send(ctx, grant, &payload, class, owner, cmd_id, true);
     if fully_sent(&report, payload.len()) {
         return OpOutcome::Sent {
             bytes: payload.len(),
         };
+    }
+    if let Some(cmd_id) = cmd_id {
+        let unknown = matches!(report.result.outcome, TxOutcome::Unknown { .. });
+        if confirmed_of(&report) > 0 || unknown || report.reject.is_none() {
+            return OpOutcome::CommandResult(map_send_failure(ctx, &report, payload.len(), cmd_id));
+        }
     }
     match report.reject {
         Some(reject) => OpOutcome::SendRefused(reject),

@@ -249,3 +249,53 @@ gate：新增 `--evidence-run`（凍結檢查未過仍執行各 section，judge 
 | F142 | Low | 9b81d9a #3 | `path_holders` 對 symlink 路徑找不到持有者 | fixed：比對前 `canonicalize` |
 
 gate 逐 section 判定見 `docs/rust-refactor/reviews/p5-t22-gate-run.md`。
+
+## 第四輪（2026-10-28 cloud session，排程第四輪）
+
+### 報告 `sol-backfill/p5-20261028.md`（Codex sol 額度中斷期間補審；High 2、Medium 6）
+
+所有項目皆先寫會紅的回歸、確認修正前 FAIL，再修產品（以 Python 基線實際行為為準）。
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F143 | High | 73634db（sol #2） | 產品 executor 在 actor 執行緒同步等開埠與 state commit：開埠卡住時 actor 無法回 GetState、release 的 3 s 排空計時器失效；release 持久化暫停鉤子同樣卡住 actor | fixed：`ManagerExec` 新增兩個 actor 外的有界 FIFO 工作者（`JobQueue`，容量 16、延遲建立）：`OpenBridge` 的開埠與 `Persist` 的 commit 等待移出 actor，完成以 `BridgeOpened`／`StateCommitted` 回報；佇列滿即以失敗結果回報、不阻塞。新 bridge 的 RX 視窗暫存於 `opened_rx`，`AdoptBridge` 時接手（原本開埠當下就改 `self.rx`）；actor 已結束時開埠結果就地 `finish_async` 關閉 handle。紅燈先行（ManagerRig，經產品 executor）：`session_manager::product_executor_blocked_open_keeps_actor_responsive_and_release_drain_stalled`（`block_open` 後 GetState 須回覆、release 推進 3001 ms 須回 `DRAIN_STALLED`）、`…_blocked_release_commit_keeps_actor_responsive`（persist observer 卡在 `before_release_commit` 時 GetState 須回覆）；修正前兩案皆於 GetState 逾時 FAIL |
+| F144 | High | 7a84168（sol #6） | PROBE fence 未註冊 WAL 健康 fanout：快照讀到健康後才發布的 unhealthy 送不到，WAL 已失效仍送出 `\n` | fixed：`probe_send` 初始化 fence 後 `self.fanout.register(fence.clone())`（序列化註冊協定取得最新狀態）。紅燈先行：`session_manager::detect_probe_fence_observes_wal_unhealthy_published_before_submit`（test-fakes 鉤子 `set_probe_pre_submit_hook_for_test` 於 fence 建立後、提交前發布 unhealthy；斷言 fallback、零 OS 提交、零 PROBE TX WAL）；修正前 `detected` FAIL |
+| F145 | Medium | 8b8a40f（sol #1） | interactive 模式命令的 TX WAL 不帶 cmd_id；部分送出收成 `SEND_FAILED`、無 META | fixed：`OpSpec::InteractiveOpenCmd` 的 `lease_send` 帶 `grant.cmd_id`；已確認 >0 bytes、Unknown 或無 reject 的未完整送出改以 `map_send_failure` 結算（`COMMAND_ABORTED_IN_FLIGHT`＋`command_aborted_in_flight` META），`PendingOp::InteractiveCmd` 接受 `CommandResult`；Fence 拒絕且零 bytes 維持原 `lease_refused_command_code`。紅燈先行：`command_exec::interactive_mode_command_tx_carries_cmd_id`、`…_partial_send_maps_aborted_in_flight`（4 bytes、partial）、`…_unknown_send_maps_aborted_in_flight_unknown`（confirmed 2、unknown） |
+| F146 | Medium | 73634db（sol #3） | `alias.set` 只改 manager 鏡像，actor 的 GetState 仍回舊 alias | fixed：新增 `SessionRequest::SetAlias`（任何狀態原地更新 actor profile，回活 session），`alias_set` 更新鏡像後送出並等確認、再 commit（與 Python 先改 profile 再 `_save_state` 同序）。紅燈先行：`session_manager::alias_set_reaches_actor_profile_for_get_state` |
+| F147 | Medium | 73634db（sol #4） | 啟動存檔失敗（EACCES／ENOSPC）只 warn，仍掃描／attach | fixed：建構子尾端 commit 失敗即記錄 Python 例外末行（`py_exc_name: py_message`）於 `startup_error()`，daemon 走既有 traceback＋rc 1 路徑。Python 基線實測（非 root、state 目錄 555）：mkstemp 拋 `PermissionError: [Errno 13] Permission denied: '<state>/state.json.tmp.XXXX'`、rc 1。紅燈先行：`session_manager::startup_save_failure_reports_python_exception_line`（EACCES／ENOSPC、零開埠）、`daemon_process::unwritable_state_dir_startup_save_exits_1_before_attach`（rc 1、traceback、DUT 零 bytes、state 目錄無檔；非 root 執行） |
+| F148 | Medium | 3938032（sol #5） | 裸 `--` 被丟掉，`serialwrapd --` 啟動 daemon | fixed：`--` 保留於 extras（Python 3.12 argparse：無 positional 時不消耗）。Python 實測 `--`、`--profile-dir x --`、`-- -h`、`-- --bogus` 皆 rc 2、`unrecognized arguments: -- …`。紅燈先行：`daemon_process::bare_double_dash_is_unrecognized_exit_2`（rc、stderr 末行、未 bind socket、未寫 state.json） |
+| F149 | Medium | 3b5927a（sol #7） | capture 淘汰以 alias-aware `resolve()` 找 owner，alias 與他人 COM 同名時找錯 session | fixed：`ManagerNote::EvictCapture` 以 `profile.com == com` 精確比對。紅燈先行：`session_manager::global_bg_capture_eviction_owner_routing_ignores_alias_collision`（COM0 alias 設為 `COM1`，其餘同 F118） |
+| F150 | Medium | b7cd852（sol #8） | `judge` 子命令未載入 parity，重新判定把 INCOMPLETE 放寬成 READY | fixed：抽出 `build_expect()` 供 `assemble`／`judge` 共用（鎖、凍結檔、斷路器、#104 parity 狀態與來源一律由檔案重新載入；狀態檔或來源缺失仍帶入 → INCOMPLETE）；`judge` 另讀報告的 `blocked_owner` 與可選 `--case-verdicts`。紅燈先行：`test_slice21_gate_judge.py::test_cmd_judge_reloads_parity_like_assemble`（修正前 `READY_FOR_OWNER_EVIDENCE`） |
+
+### 報告 `p5-cloud/9b81d9a_c66f65e-opus.md`（High 0、Medium 1、Low 2）
+
+| ID | 嚴重度 | Commit | 發現 | 處理 |
+|---|---|---|---|---|
+| F151 | Medium | 2be8982 #1 | `test_recovery_flushes_queue`：Python 先送 q0、Rust 全 flush，卻寫成無差異 | 擁有者 OD-37 已裁決：Rust 採 DF 行為（recover 原子 flush），Python 輪逐列標記 DF 差異並登記 `contracts/behavior_changes.yaml`；見本輪 OD 段 |
+| F152 | Low | 2be8982 #2 | ATTACHING 案 RPC 回覆與 probe TX 先後 | 併入 OD-36（該案零 TX 窗口排除合法 attach 登入序列）；見本輪 OD 段 |
+| F153 | Low | 4f4082f #1 | 孤立 surrogate 位於鍵且同層有 ≥U+E000 鍵時，`position N` 與 Python 不同 | deferred：Low，僅影響錯誤末行的位置數字（rc、traceback、原檔不動皆一致），排入下一輪 |
+
+### 報告 `p5-cloud/c66f65e_1393573-sol.md`（Codex sol incr；本輪 merge 審查）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| — | A 1～8 | 前輪 sol-backfill 8 項未修（審查時點為 1393573） | 已於 `25ad3900` 修正（F143～F150） |
+| F154 | High | P5-1393573-1：PR 237 折行回顯修正未接上 Rust（逐行 `ends_with`） | fixed：`op_runner::strip_wrapped_command_echo`／`match_wrapped_echo` 承接修正後語意（origin/fix/wrapped-echo-false-positive 34c3a84b；擁有者指定不採主線現行 s1v13 版）。紅燈先行：`command_exec::wrapped_echo_*` 11 案，修正前 BusyBox／三行／readline／prompt 前綴 4 案 FAIL；審查反例 `cmd[:65]+"\r\r\n"+cmd[65:]+"\r\nOUT"` 即 `wrapped_echo_busybox_wrap_is_stripped`。CHG-S21-PR237-ECHO-01 |
+| F155 | Medium | P5-1393573-2：合入主線 cases.yaml 後凍結 provenance 不符 | fixed：OD-34 凍結修訂 #1（`d8ac988c`；`slice_2.1.amendments.json` 記錄當下 provenance，凍結檔本體與窗口不動，cases revision 升 `2026-10-28.1`），未刪雜湊斷言 |
+
+### 報告 `p5-cloud/1393573_5cc4623-sol.md`／`p5-cloud/5cc4623_70f6ce7-sol.md`（Codex sol incr；High 2、Medium 1）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| F156 | High | P5-5cc4623-1：`Persist` 把整個 model delta 延到工作者才套用；release 卡在 `before_release_commit` 時 bind 到離線裝置 B 成功，恢復後舊 `Released{A}` 被回放落盤，重啟又成 RELEASED | fixed：`ManagerExec` 處理 `Effect::Persist` 時依 actor 順序**同步** `model_apply(delta)`，工作者只跑 release 暫停鉤子並提交當下快照（`commit_sync_kind(|_| {}, release)`）；Python `_save_release_state` 暫停後重建當前快照、不回放 delta。紅燈先行：`session_manager::release_commit_paused_then_bind_keeps_binding_without_stale_released_row`（修正前 `released` 仍含 `t:COM0 → usb-A`；修正後 binding B 落盤、無 released 列）。F143 的 actor 不阻塞性質不變（`…_blocked_release_commit_keeps_actor_responsive` 仍綠） |
+| F157 | Medium | P5-5cc4623-2：Python readline 折行點接命令空白時，貪婪消耗空白導致回顯殘留 | fixed（Python 主線 `842c014`，本輪 merge 併入）：標記 `" \r"` 優先於命令字元比對。Rust 同語意承接，回歸 `command_exec::wrapped_echo_readline_wrap_before_command_space_is_stripped`（前置 `\n`／`\r\n`、cuts 30/79） |
+| F158 | High | P5-70f6ce7-1：Rust 在 `clean_text()` 後無條件拼接，遺失原始折行證據；echo 關閉時 `cat` 印出恰為命令兩段的普通 CRLF stdout 被刪 | fixed：改為逐句承接 Python 主線（842c014）——BusyBox 拼接僅於原始串流含 `\r\r\n` 時進行（`_strip_wrapped_command_echo`：只接合行、前綴短於第一行）；readline 僅於原始串流含 `" \r"` 時，於原始文字首個非空行以 `_match_readline_wrapped_echo` 比對（首段自命令起點計 ≥20、結束於行尾），去標記後重新 `clean_text`／prompt 截斷再判定首行。Python 基線實跑反例 → `cmd[:40]+"\n"+cmd[40:]+"\nOUT"`。紅燈先行：`command_exec::wrapped_echo_plain_crlf_stdout_spelling_command_is_kept`（修正前只剩 `OUT`）、`…_readline_python_golden_cases`（Python `test_wrapped_echo_strip.py` 其餘 readline 案；修正前「prompt 前綴不計距離」案 FAIL）。原 11 案（F154）全數仍綠。注意：F154 依擁有者指示採 `34c3a84b` 語意，該 matcher 本身即有此誤刪；本輪以合入後的 Python 基線（主線 842c014）為 1:1 依據，CHG-S21-PR237-ECHO-01 同步改記 |
+
+### 報告 `p5-cloud/70f6ce7_3c4e051-sol.md`（Codex sol incr；Medium 2；A 段三項未修）
+
+| ID | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| — | A：P5-5cc4623-1／-2、P5-70f6ce7-1 | 審查時點 3c4e051 仍未修 | 已於 `3988f07e`（merge 842c014）與 `0a7d0929` 修正（F156～F158） |
+| F159 | Medium | P5-3c4e051-1：`s21-partial-tx-abort` 以產品寫的 `cmd_id` 計 WAL TX 再選錯誤碼，錯置 `cmd_id: null` 的錯誤 daemon（已送完整 16001 bytes）會被判 0 bytes 而通過 | fixed：新增 runner 動作 `assert_wire_tx_window`——以 op 窗口兩端 settled 快照的 `serial_read` 差值獨立計量 wire TX，要求等於該 cmd_id 的 WAL TX 總和（不符即紅；快照未 settled → INSUFFICIENT_EVIDENCE），再以 wire 計量套 `lt 16001`；情境改以 `{big_wire.wire_tx_bytes}` 判定 `FLUSHED_BY_RECOVERY`／`COMMAND_ABORTED_IN_FLIGHT`。紅燈先行：`func-test/tests/test_s21_actions.py::test_assert_wire_tx_window_counts_wire_independently_of_cmd_id`（審查反例：wire 16001、WAL `cmd_id:null` → 必紅；正確歸屬但完整送出 → 必紅；4096 部分送出 → 通過）。L1.5 實跑 Python／Rust 皆 PASS（兩邊 wire＝WAL＝15360 bytes，`COMMAND_ABORTED_IN_FLIGHT`） |
+| F160 | Medium | P5-3c4e051-2：`assert_any` 只檢查分支第一層，`assert_when` 的 `then`／`else` 可夾帶副作用（CLI 已被呼叫後失敗分支被吞） | fixed：`_assert_any_side_effects` 遞迴檢查 `then`／`else`／`of`，`wait_cli_until` 限唯讀查詢前綴（`session list／get-state／get`、`cmd status／get`、`daemon status`），全部在執行任何分支前驗證。紅燈先行：`test_assert_any_rejects_nested_side_effects_before_running_any_branch`（審查反例 CLI 呼叫次數 0；`cmd submit` 的 wait_cli_until 拒絕；巢狀 `dut_control` 拒絕；唯讀 `session list` 照常）。現有情境（`s21-reboot-minimal-guard`）逐分支驗證無副作用 |
+| F161 | Medium（自查） | 核對 F159 實跑時發現：Rust release 中止部分送出命令時寫出兩筆相同的 `command_aborted_in_flight` META（op runner `map_send_failure` 與 drain 回條 `apply_aborted_receipt` 各一；Python 只由 worker `_map_aborted_result` 寫一筆） | fixed：`CommandRegistry::claim_abort_meta(cmd_id)`（FIFO ≤ `CMD_HISTORY_MAX`）為兩方共用的一次性寫入權，`OpCtx` 帶入 registry。紅燈先行：`session_manager::release_partial_in_flight_command_writes_single_aborted_meta`（產品 executor；修正前 seq 6／7 兩筆）；L1.5 `s21-partial-tx-abort` Rust WAL META 2 → 1 筆，與 Python 相同 |

@@ -5,7 +5,7 @@ meta:
   severity: critical
   description: "reboot 後 Quiet 窗口內命令被拒（AUTOBOOT_QUIET／READY_UNCONFIRMED）且零 TX，DUT 回 prompt 後重新 READY 並可執行命令（§11.6 最小 reboot 防護，Slice 2.1 Task 21）"
   scenario:
-    revision: "2026-10-27.1"
+    revision: "2026-10-28.1"
     seed: 1021
     capabilities: [posix_pty, process_rpc]
     timeout_s: 90
@@ -89,4 +89,18 @@ steps:
     timeout_s: 20
   - action: assert_wire_contiguous
     payloads: ["echo AFTER\n"]
+  # OD-39（gaps #5）：reboot 命令終態 recovery_action == EXPECT_REBOOT 或 status == done（OR），DUT generation == 2
+  - action: cli
+    argv: ["cmd", "status", "--cmd-id", "{rb.cmd_id}"]
+    save_as: rb_done
+  - action: assert_any
+    of:
+      - - action: assert_value
+          value: "{rb_done.command.recovery_action}"
+          equals: EXPECT_REBOOT
+      - - action: assert_value
+          value: "{rb_done.command.status}"
+          equals: done
+  - action: query_dut_generation
+    expect: {dut_generation: 2}
   - action: assert_compare

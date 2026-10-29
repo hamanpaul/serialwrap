@@ -904,6 +904,8 @@ struct RigExec {
     runners: HashMap<u64, OpRunner>,
     /// Task 14：現行 worker 的 TX 入口（`tx_ledger_gauge()` 用）。
     current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
+    /// 與 actor 共用的命令登錄表（op runner 的 abort META 寫入權）。
+    registry: Arc<CommandRegistry>,
 }
 
 /// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
@@ -1084,6 +1086,7 @@ impl EffectExecutor for RigExec {
                                 *b = i as u8;
                             }
                         }),
+                        registry: self.registry.clone(),
                     });
                     self.runners.insert(epoch, runner);
                 }
@@ -1219,6 +1222,7 @@ impl ActorRig {
             env: env.clone(),
             runners: HashMap::new(),
             current_tx: current_tx.clone(),
+            registry: reg.clone(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -1451,7 +1455,7 @@ impl ActorRig {
             .unwrap_or_else(|| panic!("找不到命令 {id}"))
     }
 
-    fn wal_rows(&self) -> Vec<PyDict> {
+    pub fn wal_rows(&self) -> Vec<PyDict> {
         let bytes = self.wfs.contents(&self.wal.wal_path()).unwrap_or_default();
         String::from_utf8_lossy(&bytes)
             .lines()
@@ -2101,6 +2105,25 @@ impl ManagerRig {
             shared,
             console,
         }
+    }
+
+    /// 建構前令啟動存檔（建構子尾端第一次 state.json commit）以 `err` 失敗；回傳 manager 與其 serial 替身。
+    pub fn startup_commit_failure(yaml: &str, err: PalError) -> (Arc<SessionManager>, Arc<RigSerial>) {
+        let serial = RigSerial::new();
+        let _dev = serial.add_device("/dev/ttyOLD");
+        let fs = RigFs::new();
+        fs.fail_next_atomic_write(err);
+        let (mgr, _wal, _reg) = assemble_manager(
+            yaml,
+            LoadedState::default(),
+            fs,
+            FakeWalFs::new(),
+            FakeClock::new(),
+            serial.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(RigConsole),
+        );
+        (mgr, serial)
     }
 
     /// 只有 `manager_yaml` 模板、無 target（rank／動態 session 測試用）。

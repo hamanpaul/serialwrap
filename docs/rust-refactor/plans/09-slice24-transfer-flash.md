@@ -262,7 +262,7 @@ def acceptance_rate(lock: dict, results: list[dict], *, set_name: str) -> float 
 def evaluate(freeze: dict, snapshots: list[dict], *, today: str, stage2_estimate_weeks: float) -> dict
 #   snapshots：[{"date","rate","results_sha256"}]（每週一筆，check-in 至 tests/acceptance/breaker/slice_2.4.snapshots.ndjson）
 #   回 {"tripped": bool, "insufficient_evidence": bool, "reason": str|None, "window_delta_pp": float, "elapsed_weeks": float, "stage2_estimate_weeks": float, "od02_resubmit": bool}（沿用 06 Task 0b 實作）
-#   tripped：依 §12.2「觀測窗口起訖於切片開始時固定」，三週窗口內首尾快照 rate 累計增加 < 10 個百分點（單一固定窗口；「連續三週內」之滾動解讀見 NC-P5-02，待擁有者確認）；od02_resubmit：stage2_started_at 至今已耗週數＋剩餘預估 > 24（剩餘預估須為有限且 >= 0）
+#   tripped：依 §12.2「觀測窗口起訖於切片開始時固定」，自切片開始時凍結的三週固定觀測窗口內，首尾快照 rate 累計增加 < 10 個百分點（OD-44：固定窗口，不採滾動解讀、不移動窗口起訖）；od02_resubmit：stage2_started_at 至今已耗週數＋剩餘預估 > 24（剩餘預估須為有限且 >= 0）
 def main(argv=None) -> int      # tripped 或 od02_resubmit → exit 1，stderr 指示「停止擴大部署、退守 Stage 1 artifact、提請擁有者審查／重提 OD-02」
 ```
 
