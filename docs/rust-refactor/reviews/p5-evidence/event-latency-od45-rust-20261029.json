@@ -1,5 +1,5 @@
 {
-  "daemon": "/home/ubuntu/target/release/serialwrapd",
+  "daemon": "<release>/serialwrapd（commit 8134806 之後的 release build，非 root 建置）",
   "diagnostic": false,
   "flood_load": {
     "bytes_per_s": 20000,
