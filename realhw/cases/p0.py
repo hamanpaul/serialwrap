@@ -198,9 +198,15 @@ def p0_multiopen(ctx):
     # 欄位核對（#122）：daemon status 的 foreign_holders 是「所有 serialwrapd 對已 attach
     # tty 的持有者 map（tty→pid）」，健康的單一 daemon 一定含自身 pid（非空）。真正的
     # two-reader 訊號＝multi_open 為真，或 holders 內出現 daemon 自身 pid 以外的 pid。
+    # S1X-a-6：entry 亦可能是 BC-04 的 {device, holder_unknown:true, pids?}；holder_unknown 本身
+    # 只是診斷，只有 pids 含本 daemon 以外的 pid 才算外來持有者（比照 acceptance/gate.py）。
     own_pid = st.get("pid")
     holders = st.get("foreign_holders") or {}
-    foreign = {tty: p for tty, p in holders.items() if p != own_pid}
+    foreign = {}
+    for tty, entry in holders.items():
+        pids = list(entry.get("pids") or []) if isinstance(entry, dict) else [entry]
+        if any(p != own_pid for p in pids):
+            foreign[tty] = entry
     if st.get("multi_open") or foreign:
         return CaseResult("FAIL", reason=f"multi_open={st.get('multi_open')} 外來持有者={foreign}",
                           category="environment", reason_code="foreign_tty_holder")

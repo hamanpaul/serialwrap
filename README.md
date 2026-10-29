@@ -269,6 +269,20 @@ or `READY`.
   reach it after a usable prompt and `ready_probe` round-trip; passthrough
   sessions reach it after 30 seconds without RX (see below).
 - `RELEASED` means the real device has been handed off to an external tool.
+  It survives daemon restarts. If the record's template was renamed or removed
+  meanwhile, the daemon keeps a `RELEASED` placeholder (passthrough, not
+  command-capable) for that COM; `device attach` on it removes the placeholder,
+  unblocks the device and lets template detection create the real session on
+  the same COM (OD-63). `session bind` on the placeholder does not unblock it
+  (it answers `released: true`, `recommended_action: device_attach`); if
+  opening the port fails, the device is still handed to dynamic detection on
+  the same COM, whose open-failure handling leaves a retryable `DETACHED` row
+  when a passthrough fallback template exists. Without one, no row is left
+  (`device attach` answers `SESSION_NOT_FOUND`); the COM stays reserved for
+  that device until it is unplugged or the daemon restarts, after which
+  hotplug or restart re-detects it and assigns the COM by the usual dynamic
+  rules (the original COM is not guaranteed), the same as any new device whose
+  port cannot be opened.
 - `FLASHING` means the MCU flash endpoint is currently bridging an external
   flasher.
 
@@ -445,6 +459,20 @@ derived from the profile's `timeout_s` (`max(profile.timeout_s, 5.0)`, same
 spirit as #157's `chunk_timeout_s`), so boards with a widened `timeout_s` get a
 proportionally wider echo window. It only bounds the failure path: when echo
 arrives normally the wait returns immediately.
+
+If the session is drained (release, recovery, clear, rebind), its bridge
+generation moves on, or the transfer is cancelled while `file push`/`file pull`
+is running, the transfer stops sending and returns (OD-62, mirroring BC-03):
+`FLUSHED_BY_RECOVERY` when no byte of the transfer had reached the UART yet
+(safe to retry once the session is `READY` again), or `COMMAND_ABORTED_IN_FLIGHT`
+once at least one byte was written (do not retry blindly; check the target
+first — a partial `/tmp/.sw_upload_*` may remain). `file push` attaches
+`chunks_sent`/`chunks_total`. Like any command aborted in flight, the WAL then
+gets a `command_aborted_in_flight` META record whose `cmd_id` is the transfer's
+`ft-<8hex>` prefix (each sub-command's TX records use `ft-<8hex>-<step>`) and
+whose `confirmed_tx_bytes` counts the whole transfer. In 0.3.2 these situations ended with
+`TRANSFER_TIMEOUT` instead; a boot quiet window during the transfer still
+returns `AUTOBOOT_QUIET` with `retry_after_s`.
 
 ### MCU Firmware Workflows
 
@@ -1654,7 +1682,7 @@ broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）�
 
 ### `RELEASED` / `FLASHING`
 
-- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。詳見 `openspec/specs/device-handoff/spec.md`。
+- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。所屬 template 已改名或刪除的 released 紀錄，會以 `RELEASED` 佔位 session（passthrough、不可下命令）保留阻擋；對該 COM `device attach` 時佔位移除自身並解除阻擋，由 template 偵測在同一 COM 建立正式 session（OD-63）；對佔位 `session bind` 不解除阻擋（回 `released: true`、`recommended_action: device_attach`），開埠失敗時仍交 dynamic 偵測（保留原 COM），有 passthrough fallback template 時在原 COM 留下可重試的 `DETACHED` 列；沒有時不留列（`device attach` 回 `SESSION_NOT_FOUND`），原 COM 保留給該裝置至拔除或 daemon 重啟為止，之後由熱插或重啟重新偵測，COM 依 dynamic 規則重新分配、不保證沿用原 COM（與任何開不了埠的新裝置相同）。詳見 `openspec/specs/device-handoff/spec.md`。
 - `FLASHING`（#55）：外部 flasher 經 `/dev/ttyMCU` 認線後 session 進入，期間 `cmd submit` 回 `FLASHING_BUSY`、其他 COM 不受影響、daemon 不死；flash 結束自動恢復先前狀態。詳見 `openspec/specs/mcu-flash-broker/spec.md`。
 
 ## Agent / Human Co-work 時序圖
@@ -2181,6 +2209,8 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 **適用範圍＝小檔**。`file push` 針對設定檔、腳本、探針這類數十 KB 內的檔案。UART 115200 baud 的原始上限約 11 KB/s，再加上下述 echo-ACK 節流會更低——一顆 81 MB 的 firmware image 即使通道完全穩定也要數小時。只要 DUT 有 SSH／TFTP／HTTP 可達，大檔一律走 SCP／TFTP，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。大檔用 `file push` 只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 
 長命令可能超過 console 的輸入上限；#166 已分別確認工具缺失及一塊 prpl 板約 505-byte 的行長限制，增加 timeout 不能修復截斷。`file push` 仍預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時該命令未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s`）。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變；不把加大 timeout 當成 #166 的修法。
+
+`file push`／`file pull` 傳輸中若 session 進入 drain（release、recovery、clear、rebind）、bridge 世代前進或傳輸被取消，傳輸即停止送出並回應（OD-62，比照 BC-03）：本次傳輸尚未有任何 byte 寫入 UART → `FLUSHED_BY_RECOVERY`（session 回 `READY` 後可重送）；已寫出至少 1 byte → `COMMAND_ABORTED_IN_FLIGHT`（勿直接重送，先確認目標狀態；目標端可能殘留部分寫入的 `/tmp/.sw_upload_*`）。`file push` 附 `chunks_sent`／`chunks_total`。回 `COMMAND_ABORTED_IN_FLIGHT` 時與一般命令相同，WAL 另寫一筆 `command_aborted_in_flight` META：`cmd_id` 為該次傳輸的 cmd_id 前綴 `ft-<8hex>`（各子命令 TX 紀錄的 cmd_id 為 `ft-<8hex>-<子命令>`），`confirmed_tx_bytes` 為整段傳輸累計。0.3.2 在這些情境回 `TRANSFER_TIMEOUT`；傳輸中進入 boot quiet 仍回 `AUTOBOOT_QUIET`＋`retry_after_s`。
 
 詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 

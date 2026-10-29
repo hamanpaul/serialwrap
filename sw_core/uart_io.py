@@ -47,6 +47,9 @@ class TxPermit:
     ]
     owner_gen: int | None = None
     login_gen: int | None = None
+    # 發放此 permit 的原命令身分（S1-6485e90-1）：interactive 命令改以 lease op 送出時，
+    # 原 cmd_id 的撤銷仍須在提交點（fence 內）擋下 TX。
+    cancel_op_id: str | None = None
 
 
 def open_serial_port(
@@ -478,9 +481,23 @@ class UARTBridge:
             self._tx_permit_context = context
         previous = getattr(context, "operation_permit", None)
         context.operation_permit = permit
+        # OD-62：累計本操作已確認寫出的 bytes；被拒時附在例外上，供呼叫端區分
+        # FLUSHED_BY_RECOVERY（零寫出）與 COMMAND_ABORTED_IN_FLIGHT（已寫出）。
+        tallies = getattr(self, "_operation_tx_confirmed", None)
+        if tallies is None:
+            tallies = {}
+            self._operation_tx_confirmed = tallies
+        owns_tally = permit.op_id not in tallies
+        if owns_tally:
+            tallies[permit.op_id] = 0
         try:
             yield
+        except TxIncompleteError as exc:
+            exc.operation_confirmed = tallies.get(permit.op_id, 0)
+            raise
         finally:
+            if owns_tally:
+                tallies.pop(permit.op_id, None)
             if previous is None:
                 try:
                     del context.operation_permit
@@ -615,7 +632,10 @@ class UARTBridge:
             and permit.bridge_generation != getattr(self, "_gate_generation", 0)
         ):
             return "stale_generation"
-        if permit.op_id in (getattr(self, "_revoked_ops", None) or {}):
+        revoked = getattr(self, "_revoked_ops", None) or {}
+        if permit.op_id in revoked or (
+            permit.cancel_op_id is not None and permit.cancel_op_id in revoked
+        ):
             return "cancelled"
         if permit.tx_class == "agent" and getattr(self, "_gate_quiet", False):
             return "quiet"
@@ -2187,6 +2207,9 @@ class UARTBridge:
                 )
 
             self._tx_account_result_locked(cmd_id, result)
+            tallies = getattr(self, "_operation_tx_confirmed", None)
+            if tallies and active_permit is not None and active_permit.op_id in tallies:
+                tallies[active_permit.op_id] += result.confirmed
             if log and result.confirmed > 0:
                 self._append_tx_record_locked(
                     payload[: result.confirmed],

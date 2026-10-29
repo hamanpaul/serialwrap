@@ -47,14 +47,14 @@ messages:
     level: WARNING
     template: "serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥"
     args: [self._device_path, report.status]
-    source: "sw_core/serial_port.py:403"
+    source: "sw_core/serial_port.py:424"
 
   - id: uart_tiocncl_failed
     logger: serialwrap
     level: WARNING
     template: "serialwrap: TIOCNXCL failed on %s: %s"
     args: [self._device_path, exc]
-    source: "sw_core/serial_port.py:445"
+    source: "sw_core/serial_port.py:466"
 
   - id: device_watcher_tick_failed
     logger: serialwrap
@@ -92,35 +92,35 @@ messages:
     level: WARNING
     template: "state.json 解析失敗（JSON 損毀），略過載入並備份至 %s：%s"
     args: [backup, exc]
-    source: "sw_core/session_manager.py:1322"
+    source: "sw_core/session_manager.py:1328"
 
   - id: released_restore_missing_by_id
     logger: serialwrap
     level: WARNING
     template: "released session 無法還原（session=%s、缺少 by_id），保留持久化阻擋"
     args: [sid]
-    source: "sw_core/session_manager.py:970"
+    source: "sw_core/session_manager.py:973"
 
   - id: released_restore_template_missing
     logger: serialwrap
     level: WARNING
     template: "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋"
     args: [sid, template_name]
-    source: "sw_core/session_manager.py:992"
+    source: "sw_core/session_manager.py:993"
 
   - id: released_restore_missing_com
     logger: serialwrap
     level: WARNING
     template: "released session 無法還原（session=%s、缺少 COM），保留持久化阻擋"
     args: [sid]
-    source: "sw_core/session_manager.py:1002"
+    source: "sw_core/session_manager.py:1007"
 
   - id: credentials_unresolved
     logger: serialwrap
     level: WARNING
     template: "session %s 帳密解析未完成（reason=%s, env_file=%s）：不對 login prompt 送空帳密，標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover"
     args: [com, reason, env_file_or_dash]
-    source: "sw_core/session_manager.py:1909"
+    source: "sw_core/session_manager.py:1915"
     dedup: credentials_warned
 
   - id: transport_stall_suspected
@@ -128,7 +128,7 @@ messages:
     level: WARNING
     template: "session %s 疑似 transport stall（零 RX %.1fs、probe 全程無 echo，real_path=%s）：%s"
     args: [com, rx_age_s, real_path_or_dash, detail]
-    source: "sw_core/session_manager.py:2009"
+    source: "sw_core/session_manager.py:2015"
     dedup: transport_stall_warned
 
   - id: max_sessions_reached
@@ -136,7 +136,7 @@ messages:
     level: WARNING
     template: "已達 max_sessions=%d，忽略裝置 %s"
     args: [max_sessions, by_id]
-    source: "sw_core/session_manager.py:4702"
+    source: "sw_core/session_manager.py:4787"
 
   - id: reboot_recovery_ensure_ready_exception
     logger: serialwrap
@@ -144,7 +144,7 @@ messages:
     template: "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:6111"
+    source: "sw_core/session_manager.py:6204"
 
   - id: console_rx_handler_exception
     logger: serialwrap
@@ -152,7 +152,7 @@ messages:
     template: "console RX handler 例外（com=%s），略過此塊、console 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1420"
+    source: "sw_core/uart_io.py:1440"
 
   - id: rx_handler_exception_pyserial
     logger: serialwrap
@@ -160,7 +160,7 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1938"
+    source: "sw_core/uart_io.py:1958"
 
   - id: rx_handler_exception_posix
     logger: serialwrap
@@ -168,21 +168,21 @@ messages:
     template: "RX handler 例外（com=%s），略過此塊、reader 續行"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1985"
+    source: "sw_core/uart_io.py:2005"
 
   - id: deferred_invalidation
     logger: serialwrap
     level: WARNING
     template: "serialwrap: deferred 輸入因 %s 失效，丟棄 %d bytes（BC-02）"
     args: [reason, dropped]
-    source: "sw_core/uart_io.py:683"
+    source: "sw_core/uart_io.py:703"
 
   - id: deferred_overflow
     logger: serialwrap
     level: WARNING
     template: "serialwrap: deferred 輸入溢位，client=%s 丟棄 %d bytes（BC-02）"
     args: [client_id, total]
-    source: "sw_core/uart_io.py:1005"
+    source: "sw_core/uart_io.py:1025"
 
   - id: stale_console_input_dropped
     logger: serialwrap
@@ -190,14 +190,14 @@ messages:
     dropped: true
     template: "serialwrap: 丟棄過期 console 輸入，com=%s client=%s captured_owner_gen=%s current_owner_gen=%s"
     args: [com, client_id, captured_owner_gen, current_owner_gen]
-    source: "sw_core/uart_io.py:1020"
+    source: "sw_core/uart_io.py:1040"
 
   - id: tx_account_evicted
     logger: serialwrap
     level: WARNING
     template: "tx account evicted (cmd_id=%s)"
     args: [oldest_cmd]
-    source: "sw_core/uart_io.py:2272"
+    source: "sw_core/uart_io.py:2295"
 
   - id: drain_pending_write_cancel_failed
     logger: serialwrap
@@ -205,7 +205,7 @@ messages:
     template: "UART pending write 取消失敗（com=%s）"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:922"
+    source: "sw_core/uart_io.py:942"
 
   - id: drain_late_receipt_callback_failed_during_finish
     logger: serialwrap
@@ -213,7 +213,7 @@ messages:
     template: "UART drain 遲到回條回呼失敗（com=%s）"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1055"
+    source: "sw_core/uart_io.py:1075"
 
   - id: drain_late_receipt_callback_failed_after_schedule
     logger: serialwrap
@@ -221,14 +221,14 @@ messages:
     template: "UART drain 遲到回條回呼失敗（com=%s）"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1235"
+    source: "sw_core/uart_io.py:1255"
 
   - id: drain_background_receipt_missing
     logger: serialwrap
     level: ERROR
     template: "背景 UART drain 未能產生回條（com=%s）"
     args: [com]
-    source: "sw_core/uart_io.py:1227"
+    source: "sw_core/uart_io.py:1247"
 
   - id: drain_late_receipt_callback_failed_in_worker
     logger: serialwrap
@@ -236,21 +236,21 @@ messages:
     template: "UART drain 遲到回條回呼失敗（com=%s）"
     args: [com]
     exc_info: true
-    source: "sw_core/uart_io.py:1215"
+    source: "sw_core/uart_io.py:1235"
 
   - id: bridge_drain_timeout
     logger: serialwrap
     level: WARNING
     template: "serialwrap: bridge %s drain 逾時，handle 於背景關閉"
     args: [com]
-    source: "sw_core/uart_io.py:1283"
+    source: "sw_core/uart_io.py:1303"
 
   - id: bridge_drain_unsafe_receipt
     logger: serialwrap
     level: WARNING
     template: "UART drain 未能安全收斂（com=%s epoch=%s error=%s）"
     args: [com, epoch, error]
-    source: "sw_core/uart_io.py:1289"
+    source: "sw_core/uart_io.py:1309"
 
   - id: wal_rotate_failed
     logger: serialwrap
@@ -302,21 +302,21 @@ messages:
     level: ERROR
     template: "serialwrap: release 持久化失敗（session=%s）：%s"
     args: [job.session_id, exc]
-    source: "sw_core/session_manager.py:2789"
+    source: "sw_core/session_manager.py:2795"
 
   - id: preopened_uart_handle_close_failed
     logger: serialwrap
     level: WARNING
     template: "預開 UART handle 關閉失敗（by_id=%s）：%s"
     args: [op.by_id, exc]
-    source: "sw_core/session_manager.py:4163"
+    source: "sw_core/session_manager.py:4246"
 
   - id: attach_op_release_state_persist_failed
     logger: serialwrap
     level: ERROR
     template: "release 持久化失敗（session=%s）：%s"
     args: [session.session_id, exc]
-    source: "sw_core/session_manager.py:4193"
+    source: "sw_core/session_manager.py:4276"
 
   - id: shutdown_skip_device_update
     logger: serialwrap
@@ -324,7 +324,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過裝置更新"
     args: []
-    source: "sw_core/session_manager.py:3866"
+    source: "sw_core/session_manager.py:3944"
 
   - id: shutdown_skip_profile_attach
     logger: serialwrap
@@ -332,7 +332,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:3945"
+    source: "sw_core/session_manager.py:4024"
 
   - id: shutdown_skip_attach_start
     logger: serialwrap
@@ -340,7 +340,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:4677"
+    source: "sw_core/session_manager.py:4760"
 
   - id: shutdown_skip_dynamic_attach
     logger: serialwrap
@@ -348,7 +348,7 @@ messages:
     dropped: true
     template: "shutdown 或 drain 中，略過動態 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:5348"
+    source: "sw_core/session_manager.py:5441"
 
   - id: console_line_rejected
     logger: serialwrap
@@ -362,14 +362,14 @@ messages:
     level: WARNING
     template: "serialwrap: interactive lease 到期後還原失敗（interactive_id=%s error=%s）"
     args: [interactive_id, type(exc).__name__]
-    source: "sw_core/session_manager.py:2364"
+    source: "sw_core/session_manager.py:2370"
 
   - id: console_line_overflow
     logger: serialwrap
     level: WARNING
     template: "serialwrap: console 行超過 %d bytes 已丟棄（client=%s）"
     args: [CONSOLE_LINE_MAX_BYTES, client.client_id]
-    source: "sw_core/uart_io.py:1752"
+    source: "sw_core/uart_io.py:1772"
 
   - id: reboot_recovery_ensure_ready_tx_exception
     logger: serialwrap
@@ -377,25 +377,25 @@ messages:
     template: "reboot-recovery ensure_ready TX 例外（session=%s）"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:6105"
+    source: "sw_core/session_manager.py:6198"
 
   - id: test_kill_after_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1 已忽略：%s（非隔離實例不得終止行程）"
     args: [reason]
-    source: "sw_core/session_manager.py:8195"
+    source: "sw_core/session_manager.py:8384"
 
   - id: test_kill_after_save_fired
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1：state 已落盤，於回應前以 os._exit(137) 模擬程序被殺（隔離實例）"
     args: []
-    source: "sw_core/session_manager.py:8200"
+    source: "sw_core/session_manager.py:8389"
 
   - id: test_pause_before_release_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE 已忽略：%s（非隔離實例不得暫停）"
     args: [reason]
-    source: "sw_core/session_manager.py:8222"
+    source: "sw_core/session_manager.py:8411"

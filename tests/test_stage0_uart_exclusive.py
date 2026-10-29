@@ -1675,9 +1675,44 @@ class TestManagerAttach:
 
         mgr2 = _make_manager(tmp_path, [])
 
-        assert "uboot-template:COM0" not in mgr2._sessions
+        # OD-63：template 已不存在 → RELEASED 佔位（passthrough、不可下命令），阻擋保留；
+        # 不得以佔位的 passthrough profile attach（不降級 profile）。
+        placeholder = mgr2._sessions.get("uboot-template:COM0")
+        assert placeholder is not None
+        assert placeholder.released_placeholder is True
+        assert placeholder.state == "RELEASED"
+        assert placeholder.profile.platform == "passthrough"
+        assert placeholder.profile.command_capable is False
         assert by_id in mgr2._released_by_ids
-        assert "uboot-template:COM0" in mgr2._loaded_released
+        push = mgr2.file_push("COM0", local_path=str(tmp_path / "x"), remote_path="/tmp/x")
+        assert push["ok"] is False
+        assert push["error_code"] == "PROFILE_NOT_COMMAND_CAPABLE"
+        assert placeholder.bridge is None
+
+        # device attach COM0：佔位移除自身、解除 by_id，UART 交 template 偵測（保留 COM0）。
+        from sw_core.device_watcher import DeviceInfo
+
+        handed_off: list[tuple[str, bool]] = []
+        port = mock.MagicMock()
+        with mgr2._lock:
+            mgr2._devices[by_id] = DeviceInfo(by_id=by_id, real_path="/dev/ttyUBOOT")
+        with mock.patch.object(sp, "open_serial_port", lambda *a, **k: port), mock.patch.object(
+            mgr2, "_probe_external_holder", lambda _path: {"pids": []}
+        ), mock.patch.object(
+            mgr2,
+            "_spawn_attach",
+            lambda b, *, dynamic_only=False: handed_off.append((b, dynamic_only)),
+        ):
+            result = mgr2.attach_device("COM0")
+
+        assert result["ok"] is True, result
+        assert result["session"]["com"] == "COM0"
+        assert "uboot-template:COM0" not in mgr2._sessions
+        assert by_id not in mgr2._released_by_ids
+        assert "uboot-template:COM0" not in mgr2._loaded_released
+        assert handed_off == [(by_id, True)]
+        assert mgr2._preopened_ports[by_id].port is port
+        assert mgr2._pending_com[by_id] == "COM0"
 
     def test_offline_tick_keeps_released(self, tmp_path):
         from sw_core.device_watcher import DeviceInfo

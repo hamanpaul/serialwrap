@@ -59,6 +59,15 @@ session_id 為鍵）。`_load_state` SHALL 在 `bootstrap_attach` 之前還原�
 - **AND** 模擬 daemon 重啟：重新 `_load_state` 後執行 `bootstrap_attach`
 - **THEN** 該 session 仍為 `RELEASED`，`bootstrap_attach` 不會開啟該裝置
 
+#### Scenario: 所屬 template 已不存在的 released 紀錄以佔位 session 解除（OD-63）
+
+- **WHEN** state 內的 released 紀錄所屬 template 已被改名或刪除
+- **THEN** 載入時實體化為 `RELEASED` 佔位 session（`platform=passthrough`、`command_capable:false`），by_id 仍被阻擋、跨重啟保留
+- **AND** 對該 COM 執行 `device attach` 時，佔位移除自身並解除 by_id，已取得的 UART 交 template 偵測建立正式 session（保留原 COM，不以佔位的 passthrough profile attach）；無 template 可匹配時依現行 dynamic 偵測
+- **AND** `device attach` 開埠遇一般 OSError（如權限不足）時，佔位同樣移除自身並交 dynamic 偵測（保留原 COM）；仍開不了埠時依現行 dynamic 開埠失敗語意：有 passthrough fallback template 即在原 COM 留下 `DETACHED`（`last_error=ATTACH_FAILED:<例外名>`）列，可再 `device attach`
+- **AND** 無 passthrough fallback template 時不留列（`device attach COMx` 回 `SESSION_NOT_FOUND`），以 `_pending_com` 保留原 COM 至裝置拔除或 daemon 重啟為止（期間不分配給其他裝置）；之後由熱插或重啟重新偵測建立 session，COM 依 dynamic 指派規則重新分配（熱插依 runtime 規則繼承 DETACHED 空槽或取最低空號、重啟依 by-id 排序預配），不保證沿用原 COM。與 dynamic 對新裝置開埠失敗的現行語意相同，不新增錯誤碼或回應形狀
+- **AND** 對佔位執行 `session bind` 時不解除阻擋、不寫 binding override、不開埠，比照 `session attach` 的 RELEASED 回應回 `ok:true`、`released:true`、`recommended_action:"device_attach"`
+
 ### Requirement: device.attach SHALL 收回裝置並還原 session
 
 `device.attach`（RPC）／`serialwrap device attach --selector <COM>`（CLI）SHALL 清除 session 的

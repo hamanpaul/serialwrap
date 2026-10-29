@@ -67,7 +67,7 @@ from .login_fsm import (
     probe_ready,
 )
 from .transport_stall import classify_probe_failure, transport_stall_hint
-from .serial_port import SerialPort
+from .serial_port import SerialPort, TxResult
 from .uart_io import (
     PreservedConsoles,
     TxIncompleteError,
@@ -488,6 +488,9 @@ class SessionRuntime:
     released_by: str | None = None
     released_at: str | None = None
     released_reason: str | None = None
+    # OD-63：template 已不存在的 RELEASED 紀錄所實體化的佔位（passthrough、不可下命令）；
+    # device attach 時移除自身並交 template 偵測建立正式 session。
+    released_placeholder: bool = False
     # 動態 profile 來源（#95）：unknown / pin / sticky / detected / fallback / yaml-target
     profile_source: str = "unknown"
     # U-Boot autoboot 保護（#130）：boot quiet window 截止時刻（monotonic；0.0=未啟用）。
@@ -977,24 +980,26 @@ class SessionManager:
                 detected_name = self._profile_detected.get(by_id)
                 template_name = pinned_name or detected_name or sid_profile
                 tpl = self._template_by_name(template_name) or self._template_by_name(sid_profile)
-                if tpl is None and sid_profile in {"passthrough", "others-template"}:
-                    # 舊 state.json 不保存 template 內容；只對無命令能力的通用 passthrough
-                    # 名稱使用最小 profile。uboot-template 有 ready_probe 契約，缺少定義時
-                    # 必須保留未實體化的 RELEASED 阻擋，不能降級成另一種 profile。
+                placeholder = False
+                if tpl is None:
+                    # 舊 state.json 不保存 template 內容。通用 passthrough 名稱直接以最小
+                    # profile 還原；其餘 template 已不存在者（OD-63）實體化為 RELEASED 佔位
+                    # （passthrough、不可下命令），只供 device attach 解除阻擋：解除時佔位
+                    # 移除自身並交 template 偵測建立正式 session，不得降級成另一種 profile。
+                    placeholder = sid_profile not in {"passthrough", "others-template"}
+                    if placeholder:
+                        import logging
+
+                        logging.getLogger("serialwrap").warning(
+                            "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋",
+                            sid,
+                            template_name,
+                        )
                     tpl = ProfileTemplate(
                         profile_name=sid_profile,
                         platform="passthrough",
                         ready_probe="",
                     )
-                if tpl is None:
-                    import logging
-
-                    logging.getLogger("serialwrap").warning(
-                        "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋",
-                        sid,
-                        template_name,
-                    )
-                    continue
                 com = sid_com
                 if not isinstance(com, str) or not com:
                     import logging
@@ -1029,6 +1034,7 @@ class SessionManager:
                 )
                 source = "pin" if pinned_name else "detected" if detected_name else "fallback"
                 s.profile_source = source
+                s.released_placeholder = placeholder
             if s is not None:
                 s.state = "RELEASED"
                 s.released_by = meta.get("released_by")
@@ -2833,6 +2839,9 @@ class SessionManager:
                 session.released_by = job.source
                 session.released_at = session.released_at or now_iso()
                 session.released_reason = job.release_reason
+                # S1X-a-7：比照 0.3.2 release（_detach_session_locked）更新 detached_at 並重置 reprobe 進度。
+                session.detached_at = now_iso()
+                self._reset_reprobe_progress_locked(session)
                 if by_id:
                     self._released_by_ids.add(by_id)
                 session._release_persist_pending = True
@@ -2857,6 +2866,8 @@ class SessionManager:
                 self._reset_reprobe_progress_locked(session)
                 if job.kind == "clear" and by_id and by_id in self._devices:
                     session.state = "ATTACHING"
+                    # S1X-a-7：0.3.2 clear 在裝置在場時清掉 last_error（不留 CLEARED）。
+                    session.last_error = None
                     should_attach = True
                 elif job.kind == "bind":
                     target = job.target_by_id
@@ -3287,6 +3298,22 @@ class SessionManager:
             "holder_unknown": report.holder_unknown,
         }
 
+    def _attach_inflight_draining_locked(self, session: SessionRuntime, by_id: str) -> bool:
+        """attach 在途表命中時，判斷是否屬 drain／release 進行中（需持 _lock）。
+
+        只有 pending drain、by_id 正在 drain、在途 op 帶 release 請求或已取消、或 session
+        已 RELEASED 時才算；否則只是 probe／login 進行中的一般 attach（S1X-a-3）。
+        """
+        if session._pending_drain is not None or by_id in self._draining_by_ids:
+            return True
+        if session.state == "RELEASED" or by_id in self._released_by_ids:
+            return True
+        for table in (self._attach_ops, self._preopened_ports, self._active_attach_ops):
+            op = table.get(by_id)
+            if op is not None and (op.release_request is not None or op.cancelled.is_set()):
+                return True
+        return False
+
     def attach_device(self, selector: str, *, force: bool = False) -> dict[str, Any]:
         if self._shutting_down:
             raise RuntimeError("daemon stopping")
@@ -3321,6 +3348,10 @@ class SessionManager:
                 or by_id in self._active_attach_ops
                 or by_id in self._attach_bridges
             ):
+                # S1X-a-3：單純 attach 進行中（probe／login）回 ok＋session（0.3.2 行為）；
+                # SESSION_RECOVERING 只保留給 drain／release 進行中（SC-04）。
+                if not self._attach_inflight_draining_locked(session, by_id):
+                    return {"ok": True, "session": session.to_public_dict()}
                 return {
                     "ok": False,
                     "error_code": "SESSION_RECOVERING",
@@ -3343,6 +3374,8 @@ class SessionManager:
             if self._shutting_down:
                 raise RuntimeError("daemon stopping")
             if self._attach_ops.get(by_id) is not None or self._preopened_ports.get(by_id) is not None:
+                if not self._attach_inflight_draining_locked(session, by_id):
+                    return {"ok": True, "session": session.to_public_dict()}
                 return {
                     "ok": False,
                     "error_code": "SESSION_RECOVERING",
@@ -3410,6 +3443,7 @@ class SessionManager:
                 "device_by_id": by_id,
             }
         except OSError as exc:
+            placeholder_handoff = False
             with self._lock:
                 cancelled = op.cancelled.is_set() or op.release_request is not None
                 if not cancelled and self._attach_ops.get(by_id) is op:
@@ -3423,6 +3457,13 @@ class SessionManager:
                         session.released_by = None
                         session.released_at = None
                         session.released_reason = None
+                        if session.released_placeholder:
+                            # OD-63：比照成功分支交接——佔位移除自身、保留原 COM，交 dynamic
+                            # 偵測重新開埠；仍失敗時由 _record_dynamic_open_failure 在原 COM
+                            # 留下可再 attach 的 DETACHED 列，不讓裝置成為孤兒。
+                            self._retire_released_placeholder_locked(session)
+                            self._pending_com[by_id] = session.profile.com
+                            placeholder_handoff = True
                         public = session.to_public_dict()
                     else:
                         public = session.to_public_dict()
@@ -3431,6 +3472,8 @@ class SessionManager:
             self._finish_attach_op(op)
             if not cancelled:
                 self._save_state()
+                if placeholder_handoff:
+                    self._spawn_attach(by_id, dynamic_only=True)
                 return {"ok": True, "session": public}
             return {
                 "ok": False,
@@ -3445,6 +3488,7 @@ class SessionManager:
 
         assert port is not None
         invalid_reason: str | None = None
+        dynamic_handoff = False
         with self._lock:
             current_device = self._devices.get(by_id)
             if current_device is None or current_device.real_path != real_path:
@@ -3473,6 +3517,13 @@ class SessionManager:
                 session.last_error = None
                 self._reset_reprobe_progress_locked(session)
                 public = session.to_public_dict()
+                if session.released_placeholder:
+                    # OD-63：佔位先移除自身並解除 by_id，已取得的 UART 交 template 偵測
+                    # 建立正式 session（保留原 COM）；不以佔位的 passthrough profile attach。
+                    self._retire_released_placeholder_locked(session)
+                    self._pending_com[by_id] = session.profile.com
+                    op.session_id = f"dynamic:{by_id}"
+                    dynamic_handoff = True
             else:
                 if self._attach_ops.get(by_id) is op:
                     self._attach_ops.pop(by_id, None)
@@ -3497,8 +3548,26 @@ class SessionManager:
             }
 
         self._save_state()
-        self._spawn_attach(by_id)
+        if dynamic_handoff:
+            self._spawn_attach(by_id, dynamic_only=True)
+        else:
+            self._spawn_attach(by_id)
         return {"ok": True, "session": public}
+
+    def _retire_released_placeholder_locked(self, session: SessionRuntime) -> None:
+        """OD-63：移除 RELEASED 佔位 session 與其持久化阻擋（須持 self._lock）。"""
+        sid = session.session_id
+        if self._sessions.get(sid) is session:
+            del self._sessions[sid]
+        self._loaded_released.pop(sid, None)
+        self._binding_overrides.pop(sid, None)
+        by_id = session.profile.device_by_id
+        if by_id:
+            self._released_by_ids.discard(by_id)
+        for name, row in self._aliases.dump().items():
+            if row.get("session_id") == sid:
+                self._aliases.unassign(name)
+        session.released_placeholder = False
 
     def bind_session(self, selector: str, device_by_id: str) -> dict[str, Any]:
         device_by_id = device_by_id.strip()
@@ -3511,6 +3580,15 @@ class SessionManager:
             current = self.get_session(selector)
             if current is None:
                 return {"ok": False, "error_code": "SESSION_NOT_FOUND", "selector": selector}
+            if current.released_placeholder:
+                # OD-63：佔位只能經 device attach 解除後交 template 偵測；比照 attach_session 的
+                # RELEASED 早退，不解除阻擋、不寫 override、不取消在途 attach、不 spawn。
+                return {
+                    "ok": True,
+                    "released": True,
+                    "recommended_action": "device_attach",
+                    "session": current.to_public_dict(),
+                }
             old_by_id = current.profile.device_by_id
             pending_attach = (
                 self._active_attach_ops.get(old_by_id or "")
@@ -3938,7 +4016,8 @@ class SessionManager:
         if session is not None and session.state == "ATTACHING" and session.bridge is None:
             session.state = "DETACHED"
 
-    def _spawn_attach(self, by_id: str) -> None:
+    def _spawn_attach(self, by_id: str, *, dynamic_only: bool = False) -> None:
+        """啟動 attach worker；``dynamic_only``（OD-63 佔位交接）略過 DETACHED 空槽改綁。"""
         with self._lock:
             if self._shutting_down:
                 import logging
@@ -3957,7 +4036,10 @@ class SessionManager:
         def _run() -> None:
             retry_after_worker = False
             try:
-                self._attach_by_id(by_id)
+                if dynamic_only:
+                    self._attach_by_id(by_id, dynamic_only=True)
+                else:
+                    self._attach_by_id(by_id)
             finally:
                 with self._lock:
                     self._attach_inflight.discard(by_id)
@@ -3972,6 +4054,7 @@ class SessionManager:
                         and by_id not in self._draining_by_ids
                         and by_id in self._devices
                         and session is not None
+                        and not session.released_placeholder
                         and session.bridge is None
                         and session.state == "ATTACHING"
                     )
@@ -4666,7 +4749,7 @@ class SessionManager:
             self._on_ready(session.session_id)
         return {"ok": True, "session": result}
 
-    def _attach_by_id(self, by_id: str) -> None:
+    def _attach_by_id(self, by_id: str, *, dynamic_only: bool = False) -> None:
         save_needed = False
         dynamic_created = False
         capacity_rejected = False
@@ -4685,7 +4768,9 @@ class SessionManager:
             preopened_op = self._preopened_ports.pop(by_id, None)
             if preopened_op is not None:
                 self._active_attach_ops[by_id] = preopened_op
-            if session is None:
+            # OD-63 防線：佔位 session 一律不建 bridge（只能經 device attach 交 template 偵測）。
+            placeholder_blocked = session is not None and session.released_placeholder
+            if session is None and not dynamic_only:
                 candidates = sorted(
                     [s for s in self._sessions.values() if s.state == "DETACHED" and s.profile.device_by_id not in self._devices],
                     key=lambda row: row.profile.act_no,
@@ -4708,6 +4793,11 @@ class SessionManager:
         if save_needed:
             self._save_state()
 
+        if placeholder_blocked:
+            if preopened_op is not None:
+                self._finish_attach_op(preopened_op)
+            return
+
         # --- 動態偵測路徑 ---
         if dynamic_created:
             self._attach_by_id_dynamic(by_id, preopened_op=preopened_op)
@@ -4719,6 +4809,9 @@ class SessionManager:
             return
 
         if session is None:
+            if dynamic_only:
+                with self._lock:
+                    self._pending_com.pop(by_id, None)
             if preopened_op is not None:
                 self._finish_attach_op(preopened_op)
             return
@@ -6502,6 +6595,41 @@ class SessionManager:
                         with self._lock:
                             self._aborted_cmd_ids.discard(cmd_id)
 
+    def _append_aborted_in_flight_meta(
+        self,
+        bridge: UARTBridge,
+        cmd_id: str,
+        confirmed: int,
+        tx_result: TxResult | None,
+        *,
+        unknown: bool,
+    ) -> None:
+        """BC-03：已確認寫出 ≥1 byte 後中止時寫 command_aborted_in_flight META。
+
+        一般命令（``_map_aborted_result``）與 file.push／file.pull（OD-62）共用，確保欄位與
+        寫入時機相同；file.* 的 ``cmd_id`` 為該次傳輸的 cmd_id 前綴、``confirmed`` 為整段累計。
+        """
+        if unknown:
+            tx_outcome = "unknown"
+        elif tx_result is not None and (
+            tx_result.outcome != "completed" or tx_result.confirmed < tx_result.requested
+        ):
+            tx_outcome = "partial"
+        else:
+            tx_outcome = "complete"
+        self._wal.append(
+            com=bridge.com,
+            direction="META",
+            source="system",
+            cmd_id=cmd_id,
+            payload=b"",
+            meta={
+                "event": "command_aborted_in_flight",
+                "confirmed_tx_bytes": confirmed,
+                "tx_outcome": tx_outcome,
+            },
+        )
+
     def _map_aborted_result(
         self,
         cmd_id: str,
@@ -6518,25 +6646,8 @@ class SessionManager:
             tx_result is not None and tx_result.outcome == "unknown"
         )
         if confirmed > 0:
-            if unknown:
-                tx_outcome = "unknown"
-            elif tx_result is not None and (
-                tx_result.outcome != "completed" or tx_result.confirmed < tx_result.requested
-            ):
-                tx_outcome = "partial"
-            else:
-                tx_outcome = "complete"
-            self._wal.append(
-                com=bridge.com,
-                direction="META",
-                source="system",
-                cmd_id=cmd_id,
-                payload=b"",
-                meta={
-                    "event": "command_aborted_in_flight",
-                    "confirmed_tx_bytes": confirmed,
-                    "tx_outcome": tx_outcome,
-                },
+            self._append_aborted_in_flight_meta(
+                bridge, cmd_id, confirmed, tx_result, unknown=unknown
             )
             return {"ok": False, "error_code": "COMMAND_ABORTED_IN_FLIGHT"}
         if unknown:
@@ -6580,21 +6691,39 @@ class SessionManager:
                     if capture is not None:
                         capture.status = "done"
                 lease = self._open_interactive_locked(session, owner=source, timeout_s=max(timeout_s, session.profile.hard_timeout_s))
+                # S1X-a-1：op_id 必須與 _open_interactive_locked 經 _push_tx_gate 發佈的
+                # lease owner（interactive:<lease_id>）一致，否則提交點必以 lease 拒絕。
                 interactive_permit = TxPermit(
-                    cmd_id,
+                    f"interactive:{lease.interactive_id}",
                     session.bridge_generation,
                     "interactive",
                     owner_gen=getattr(bridge, "owner_gen", 0),
+                    cancel_op_id=cmd_id,
                 )
             if command:
                 self._mark_session_tx(session)
-                self._send_command_with_permit(
-                    bridge,
-                    command,
-                    source=source,
-                    cmd_id=cmd_id,
-                    permit=interactive_permit,
-                )
+                try:
+                    # 取消以原 cmd_id 撤銷；permit 的 cancel_op_id 讓提交點（fence 內）同時
+                    # 檢查 cmd_id 與 lease op，不論取消落在 lease 開啟前或送出途中都零 TX。
+                    self._send_command_with_permit(
+                        bridge,
+                        command,
+                        source=source,
+                        cmd_id=cmd_id,
+                        permit=interactive_permit,
+                    )
+                except BaseException:
+                    # 送出拋例外或被拒：關閉剛開的 lease，避免遺留 lease 讓後續命令
+                    # 拿到 SESSION_INTERACTIVE_BUSY 直到逾時；例外交由 execute_command 映射。
+                    close_post = _PostCloseAction()
+                    with self._lock:
+                        if session.interactive_session_id == lease.interactive_id:
+                            _, close_post = self._close_interactive_locked(
+                                session,
+                                interactive_id=lease.interactive_id,
+                            )
+                    close_post.execute()
+                    raise
             return {
                 "ok": True,
                 "execution_mode": "interactive",
@@ -7972,6 +8101,60 @@ class SessionManager:
 
     # ── 檔案傳輸 ──────────────────────────────────────────────
 
+    def _file_tx_rejected_result(
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        permit: TxPermit,
+        exc: TxIncompleteError,
+    ) -> dict[str, Any]:
+        """把檔案傳輸中被拒的 TX 映射為 file.* 錯誤碼（S1X-a-4、OD-62）。
+
+        - ``quiet`` 且被拒的這筆零寫出 → ``AUTOBOOT_QUIET``＋``retry_after_s``（SC-03）。
+        - drain、世代過期、取消（OD-62，比照 BC-03）：整段傳輸已確認寫出 ≥1 byte →
+          ``COMMAND_ABORTED_IN_FLIGHT``，並比照一般命令寫 command_aborted_in_flight WAL
+          META（cmd_id 為傳輸的 cmd_id 前綴）；零寫出 → ``FLUSHED_BY_RECOVERY``。``quiet``
+          但該筆已部分寫出者同屬已寫出。
+        - 其餘（結果不明、flashing 等）→ 傳輸自身的 ``TRANSFER_TIMEOUT``（0.3.2 結束碼）。
+
+        push 另附 ``chunks_sent``／``chunks_total``。
+        """
+        progress = {
+            key: getattr(exc, key)
+            for key in ("chunks_sent", "chunks_total")
+            if getattr(exc, key, None) is not None
+        }
+        reason = (exc.result.error or "").removeprefix("revoked:")
+        if reason == "quiet" and exc.result.confirmed == 0:
+            if session.boot_quiet_active():
+                retry_after_s = round(
+                    max(session.boot_quiet_until - time.monotonic(), 0.0), 1
+                )
+            else:
+                retry_after_s = READY_RECONFIRM_RETRY_S
+            return {
+                "ok": False,
+                "error_code": ERROR_AUTOBOOT_QUIET,
+                "selector": session.profile.com,
+                "retry_after_s": retry_after_s,
+                **progress,
+            }
+        if reason in {"quiet", "cancelled", "stale_generation", "draining"}:
+            written = getattr(exc, "operation_confirmed", None)
+            if written is None:
+                written = exc.result.confirmed
+            if written > 0:
+                self._append_aborted_in_flight_meta(
+                    bridge,
+                    getattr(exc, "transfer_cmd_id", None) or permit.op_id,
+                    written,
+                    exc.result,
+                    unknown=isinstance(exc, TxUnknownError) or exc.result.outcome == "unknown",
+                )
+                return {"ok": False, "error_code": "COMMAND_ABORTED_IN_FLIGHT", **progress}
+            return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY", **progress}
+        return {"ok": False, "error_code": "TRANSFER_TIMEOUT", **progress}
+
     def file_push(
         self,
         selector: str,
@@ -8064,19 +8247,22 @@ class SessionManager:
                 bridge.suspend_interactive()
                 human_suspended = True
             assert transfer_permit is not None
-            with self._operation_permit_context(bridge, transfer_permit):
-                return push_file(
-                    bridge,
-                    local_path,
-                    remote_path,
-                    chunk_size=chunk_size,
-                    timeout_s=effective_timeout_s,
-                    prompt_regex=prompt_regex,
-                    source=source,
-                    ack_mode=ack_mode,
-                    echo_timeout_s=effective_echo_timeout_s,
-                    max_console_line_chars=max_console_line_chars,
-                )
+            try:
+                with self._operation_permit_context(bridge, transfer_permit):
+                    return push_file(
+                        bridge,
+                        local_path,
+                        remote_path,
+                        chunk_size=chunk_size,
+                        timeout_s=effective_timeout_s,
+                        prompt_regex=prompt_regex,
+                        source=source,
+                        ack_mode=ack_mode,
+                        echo_timeout_s=effective_echo_timeout_s,
+                        max_console_line_chars=max_console_line_chars,
+                    )
+            except TxIncompleteError as exc:
+                return self._file_tx_rejected_result(session, bridge, transfer_permit, exc)
         finally:
             try:
                 if human_suspended:
@@ -8158,16 +8344,19 @@ class SessionManager:
                 bridge.suspend_interactive()
                 human_suspended = True
             assert transfer_permit is not None
-            with self._operation_permit_context(bridge, transfer_permit):
-                return pull_file(
-                    bridge,
-                    remote_path,
-                    local_path,
-                    timeout_s=effective_timeout_s,
-                    prompt_regex=prompt_regex,
-                    source=source,
-                    max_console_line_chars=max_console_line_chars,
-                )
+            try:
+                with self._operation_permit_context(bridge, transfer_permit):
+                    return pull_file(
+                        bridge,
+                        remote_path,
+                        local_path,
+                        timeout_s=effective_timeout_s,
+                        prompt_regex=prompt_regex,
+                        source=source,
+                        max_console_line_chars=max_console_line_chars,
+                    )
+            except TxIncompleteError as exc:
+                return self._file_tx_rejected_result(session, bridge, transfer_permit, exc)
         finally:
             try:
                 if human_suspended:

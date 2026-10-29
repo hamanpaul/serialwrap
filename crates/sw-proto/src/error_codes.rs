@@ -29,7 +29,7 @@ pub enum ErrorCode {
     CmdNotFound,
     /// 命令的 UTF-8 長度超過硬上限 16384 bytes，拒絕提交
     CmdTooLong,
-    /// 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止
+    /// 已確認至少寫出 1 byte 後，因 release 或 recovery 而中止；file.push／file.pull 為傳輸已寫出至少 1 byte 後，因 drain、世代過期或取消而中止（OD-62）
     CommandAbortedInFlight,
     /// 命令結果為 ok:false 但未帶 error_code 時的後備碼
     CommandFailed,
@@ -71,7 +71,7 @@ pub enum ErrorCode {
     FlashingBusy,
     /// 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行
     FlashTargetIsConsole,
-    /// 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）
+    /// 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）；file.push／file.pull 為傳輸尚未寫出任何 byte 即因 drain、世代過期或取消而中止（OD-62）
     FlushedByRecovery,
     /// daemon 停止時，尚未執行的排隊命令被清空（未送出，可重送）；原子交接凍結後的有副作用 RPC 回 reason:"handoff_frozen"
     FlushedByShutdown,
@@ -320,7 +320,7 @@ impl ErrorCode {
         },
         ErrorMeta {
             code: "COMMAND_ABORTED_IN_FLIGHT",
-            interfaces: &[Interface::Rec],
+            interfaces: &[Interface::Rpc, Interface::Rec],
             retryable: Retryable::No,
             reachable: true,
             status: Status::Implemented,
@@ -467,7 +467,7 @@ impl ErrorCode {
         },
         ErrorMeta {
             code: "FLUSHED_BY_RECOVERY",
-            interfaces: &[Interface::Rec],
+            interfaces: &[Interface::Rpc, Interface::Rec],
             retryable: Retryable::Yes,
             reachable: true,
             status: Status::Existing,

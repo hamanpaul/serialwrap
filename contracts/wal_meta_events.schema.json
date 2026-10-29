@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "serialwrap WAL META events contract",
-  "x-catalog-revision": 4,
+  "x-catalog-revision": 5,
   "type": "object",
   "oneOf": [
     {
@@ -262,13 +262,13 @@
     },
     {
       "title": "command_aborted_in_flight",
-      "description": "已確認 UART 寫出至少 1 byte 後，命令在 drain 中止",
+      "description": "已確認 UART 寫出至少 1 byte 後，命令在 drain 中止；file.push／file.pull 傳輸中因 drain、世代過期或取消中止且整段傳輸已確認寫出至少 1 byte 時亦寫此事件（OD-62，比照 BC-03）",
       "x-status": "IMPLEMENTED",
       "x-behavior-change": "BC-03",
       "x-outer-record": {
         "dir": "META",
         "source": "system",
-        "cmd_id": "string（非 null）"
+        "cmd_id": "string（非 null）：一般命令為該命令的 cmd_id；file.push／file.pull 為該次傳輸的 cmd_id 前綴 ft-<8hex>（各子命令 TX 紀錄的 cmd_id 為 ft-<8hex>-<子命令>）"
       },
       "type": "object",
       "additionalProperties": false,
@@ -283,7 +283,8 @@
         },
         "confirmed_tx_bytes": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "description": "該命令已確認寫出的 bytes；file.push／file.pull 為整段傳輸累計"
         },
         "tx_outcome": {
           "type": "string",

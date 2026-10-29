@@ -162,14 +162,14 @@ codes:
     status: "IMPLEMENTED"
     reachable: true
     unreachable_reason: null
-    scope: {interfaces: [rec], methods: ["command.get"], platforms: [posix, windows]}
-    meaning: "已確認至少寫出 1 byte 後，因 release 或 recovery 而中止"
-    side_effect: "命令紀錄 status 為 error；已送出部分位元組，不得自動重送"
+    scope: {interfaces: [rpc, rec], methods: ["command.get", "file.pull", "file.push"], platforms: [posix, windows]}
+    meaning: "已確認至少寫出 1 byte 後，因 release 或 recovery 而中止；file.push／file.pull 為傳輸已寫出至少 1 byte 後，因 drain、世代過期或取消而中止（OD-62）"
+    side_effect: "命令紀錄 status 為 error；已送出部分位元組，不得自動重送；file.* 直接回應，目標端可能留有部分寫入的暫存檔"
     retryable: "no"
     uart_tx: possible
-    agent_action: "命令已部分送出：勿重送；先以 session self-test 確認目標狀態"
-    extra_fields: []
-    contract_tests: ["tests/test_stage0_session_drain.py::test_bc03_abort_mapping", "tests/test_stage0_session_drain.py::test_running_command_aborted_by_release_records_code"]
+    agent_action: "命令已部分送出：勿重送；先以 session self-test 確認目標狀態；file.push 另需確認 remote_path 與 /tmp/.sw_upload_* 後再決定是否重新傳輸"
+    extra_fields: ["chunks_sent", "chunks_total"]
+    contract_tests: ["tests/test_stage0_session_drain.py::test_bc03_abort_mapping", "tests/test_stage0_session_drain.py::test_running_command_aborted_by_release_records_code", "tests/test_s1x_od62_file_tx_abort.py::test_push_cancelled_mid_transfer_returns_aborted", "tests/test_s1x_a4_transfer_tx_reject.py::test_pull_drain_before_read_returns_aborted_in_flight"]
     behavior_change: ["BC-03"]
   - code: COMMAND_FAILED
     status: EXISTING
@@ -444,15 +444,15 @@ codes:
   - code: FLUSHED_BY_RECOVERY
     status: EXISTING
     reachable: true
-    scope: {interfaces: [rec], methods: ["command.get", "command.result_tail", "result.tail"], platforms: [posix, windows]}
-    meaning: "命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）"
-    side_effect: "命令紀錄 status 為 error；未送出，不會寫入 UART"
+    scope: {interfaces: [rpc, rec], methods: ["command.get", "command.result_tail", "file.pull", "file.push", "result.tail"], platforms: [posix, windows]}
+    meaning: "命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）；file.push／file.pull 為傳輸尚未寫出任何 byte 即因 drain、世代過期或取消而中止（OD-62）"
+    side_effect: "命令紀錄 status 為 error；未送出，不會寫入 UART；file.* 直接回應，未寫入 UART"
     retryable: "yes"
     uart_tx: none
     agent_action: "確認 session 已回到 READY 後才可重送"
     extra_fields: []
-    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_flush_keeps_flushed_records_gettable_then_converges", "tests/test_arbiter_flush_on_recovery.py::test_flushed_command_get_reports_flushed_by_recovery"]
-    behavior_change: []
+    contract_tests: ["tests/test_arbiter_flush_on_recovery.py::test_flush_keeps_flushed_records_gettable_then_converges", "tests/test_arbiter_flush_on_recovery.py::test_flushed_command_get_reports_flushed_by_recovery", "tests/test_s1x_od62_file_tx_abort.py::test_pull_drain_before_first_tx_returns_flushed", "tests/test_s1x_od62_file_tx_abort.py::test_push_stale_generation_before_first_tx_returns_flushed"]
+    behavior_change: ["SC-04"]
     sources: ["sw_core/arbiter.py:60", "sw_core/arbiter.py:86"]
   - code: FLUSHED_BY_SHUTDOWN
     status: EXISTING

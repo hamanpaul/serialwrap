@@ -80,7 +80,8 @@ class HolderReport:
 
     pids: tuple[int, ...]
     holder_unknown: bool
-    status: Literal["ok", "permission", "unknown", "unsupported"]
+    # partial_other_uid（S1X-a-6）：僅他 uid 行程不可讀；同 uid 行程皆已掃描，不升為 holder_unknown。
+    status: Literal["ok", "partial_other_uid", "permission", "unknown", "unsupported"]
 
 
 class DeviceHeldError(OSError):
@@ -164,6 +165,8 @@ def probe_holders(
         return HolderReport((), True, "unknown")
     holders: set[int] = set()
     status: Literal["ok", "permission", "unknown"] = "ok"
+    other_uid_unreadable = False
+    my_uid = os.getuid()
     try:
         entries = os.listdir(proc_root)
     except PermissionError:
@@ -181,7 +184,10 @@ def probe_holders(
         try:
             fds = os.listdir(fd_dir)
         except PermissionError:
-            status = "permission"
+            if _proc_owner_uid(proc_root, pid) not in (None, my_uid):
+                other_uid_unreadable = True
+            else:
+                status = "permission"
             continue
         except OSError:
             if status == "ok":
@@ -195,7 +201,10 @@ def probe_holders(
                 # 行程或 fd 在掃描期間消失屬正常競態。
                 continue
             except PermissionError:
-                status = "permission"
+                if _proc_owner_uid(proc_root, pid) not in (None, my_uid):
+                    other_uid_unreadable = True
+                else:
+                    status = "permission"
                 continue
             except OSError:
                 if status == "ok":
@@ -206,7 +215,19 @@ def probe_holders(
                 break
 
     pids = tuple(sorted(holders))
+    if status == "ok" and other_uid_unreadable:
+        # S1X-a-6：一般使用者讀不到他 uid 行程的 fd 是常態；同 uid 行程皆可讀時，serialwrap
+        # 對自身使用者的互斥保證並未減弱，故不升為 holder_unknown（foreign_holders 維持 0.3.2 形狀）。
+        return HolderReport(pids, False, "partial_other_uid")
     return HolderReport(pids, not pids and status != "ok", status)
+
+
+def _proc_owner_uid(proc_root: str, pid: int) -> int | None:
+    """回傳 ``/proc/<pid>`` 的擁有者 uid；無法 stat 時回 None（呼叫端視同同 uid，保守處理）。"""
+    try:
+        return os.stat(os.path.join(proc_root, str(pid))).st_uid
+    except OSError:
+        return None
 
 
 def classify_pyserial_open_error(message: str) -> tuple[Literal["held", "not_found", "other"], int | None]:
@@ -399,7 +420,7 @@ class _PosixSerialPort(SerialPort):
             )
             if report.pids:
                 raise DeviceHeldError(self._device_path, holder=report)
-            if report.status != "ok":
+            if report.status not in ("ok", "partial_other_uid"):
                 logging.getLogger("serialwrap").warning(
                     "serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥",
                     self._device_path,
