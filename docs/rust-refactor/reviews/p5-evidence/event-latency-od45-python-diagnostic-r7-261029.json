@@ -1,0 +1,638 @@
+{
+  "daemon": "py-serialwrapd",
+  "diagnostic": true,
+  "flood_load": {
+    "bytes_per_s": 20000,
+    "chunk_bytes": 256,
+    "seconds": 30,
+    "stop_warmup_s": 1.0
+  },
+  "freeze_status": "pending_review_record",
+  "gate_rule": "every_run_max_le_max_ms",
+  "identity": {
+    "artifact_build_mismatch": null,
+    "artifact_build_run_id": null,
+    "artifact_source_commit": null,
+    "contract_sha256": "108da4a25a71ca28ef108c5d91ea6478541577f085453ddaebc88e29ac56d791",
+    "daemon": "py-serialwrapd",
+    "daemon_sha256": "bb92efd70ab6add176d2db88a4429f7309b435bb0fa558dd562e26a1e085bf41",
+    "method_revision": "2026-10-29.2",
+    "run_id": "evlat-20261029T162737Z",
+    "source_commit": "1b83da9d2a040f0d9854232248ec9e1c811a858f",
+    "source_tree_dirty": false,
+    "tool_sha256": "aa8e8bb1f668c3c0efb419cc63f64e16656f0ebe7c78bfba2fdcbf016a3fafd9"
+  },
+  "l1_gate": {
+    "cargo:sw-core::drain_release_e2e::drain_receipt_dependency_wait_on_release_within_od64_bound": "passed",
+    "cargo:sw-core::drain_release_e2e::drain_receipt_dependency_wait_on_shutdown_within_od64_bound": "passed",
+    "cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood": "passed",
+    "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood": "passed",
+    "cargo:sw-core::mailbox::actor_probe_records_pre_dependency_data_for_drain_receipt": "passed",
+    "cargo:sw-core::mailbox::lane_witness_counts_data_returned_via_stopped_and_pending_paths": "passed",
+    "cargo:sw-core::mailbox::pre_dependency_data_excludes_later_and_other_epoch_data": "passed",
+    "cargo:sw-core::mailbox::stopped_receipt_records_pre_dependency_data": "passed"
+  },
+  "label": "python-diagnostic",
+  "method_revision": "2026-10-29.2",
+  "reasons": [
+    "診斷模式（samples／repeats 小於契約值），不得作為 gate 證據",
+    "受測 artifact 的建置來源未綁定（需 --artifact-build-report 或 gate 同 run 建置）：未提供",
+    "event_latency 上限值未凍結（freeze_status='pending_review_record'，method_revision 2026-10-29.2）"
+  ],
+  "repeats": 3,
+  "repeats_required": 3,
+  "runs": [
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "stop_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.14
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.21
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.21,
+        "samples": 28
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 50,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 1.293062,
+      "p99_ms": 1.293062,
+      "repeat": 1,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "command_cancel",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.16
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.14
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.21,
+        "samples": 16
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 50,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 0.810143,
+      "p99_ms": 0.810143,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "release_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.14
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.16
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.16,
+        "samples": 14
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 250,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 156.378472,
+      "p99_ms": 156.378472,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "stop_request",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20095.0,
+        "periods": 50,
+        "seconds": 50.058,
+        "sent_bytes": 1011200
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.14
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.14
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.16,
+        "samples": 88
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 100,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 1.314336,
+      "p99_ms": 1.314336,
+      "repeat": 1,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "command_cancel",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20001.9,
+        "periods": 1,
+        "seconds": 30.0,
+        "sent_bytes": 600064
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.09
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.14
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.14,
+        "samples": 31
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 100,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 0.637348,
+      "p99_ms": 0.637348,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "release_request",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20001.6,
+        "periods": 1,
+        "seconds": 30.001,
+        "sent_bytes": 600064
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.11
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.09
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.15,
+        "samples": 31
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 300,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 15.51563,
+      "p99_ms": 15.51563,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "stop_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.22
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.11
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.22,
+        "samples": 28
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 50,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 0.837177,
+      "p99_ms": 0.837177,
+      "repeat": 2,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "command_cancel",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.17
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.22
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.22,
+        "samples": 16
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 50,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 0.760257,
+      "p99_ms": 0.760257,
+      "repeat": 2,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "release_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.13
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.17
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.17,
+        "samples": 14
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 250,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 154.275153,
+      "p99_ms": 154.275153,
+      "repeat": 2,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "stop_request",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20152.2,
+        "periods": 50,
+        "seconds": 50.064,
+        "sent_bytes": 1011200
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.37
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.13
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.37,
+        "samples": 89
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 100,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 0.736645,
+      "p99_ms": 0.736645,
+      "repeat": 2,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "command_cancel",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20001.8,
+        "periods": 1,
+        "seconds": 30.0,
+        "sent_bytes": 600064
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.22
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.37
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.37,
+        "samples": 31
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 100,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 1.034039,
+      "p99_ms": 1.034039,
+      "repeat": 2,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "release_request",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20001.8,
+        "periods": 1,
+        "seconds": 30.0,
+        "sent_bytes": 600064
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.34
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.22
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.37,
+        "samples": 31
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 300,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 14.732342,
+      "p99_ms": 14.732342,
+      "repeat": 2,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "stop_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.38
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.34
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.48,
+        "samples": 29
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 50,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 3.416222,
+      "p99_ms": 3.416222,
+      "repeat": 3,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "command_cancel",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.29
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.38
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.38,
+        "samples": 16
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 50,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 2.571912,
+      "p99_ms": 2.571912,
+      "repeat": 3,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "release_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.23
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.29
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.29,
+        "samples": 14
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 250,
+      "load": "idle",
+      "load_problems": [],
+      "max_ms": 154.18947,
+      "p99_ms": 154.18947,
+      "repeat": 3,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "stop_request",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20173.4,
+        "periods": 50,
+        "seconds": 50.059,
+        "sent_bytes": 1011200
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.76
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.23
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.83,
+        "samples": 89
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 100,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 0.882719,
+      "p99_ms": 0.882719,
+      "repeat": 3,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "command_cancel",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20000.3,
+        "periods": 1,
+        "seconds": 30.003,
+        "sent_bytes": 600064
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.86
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.76
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.86,
+        "samples": 31
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 100,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 3.188321,
+      "p99_ms": 3.188321,
+      "repeat": 3,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 50,
+      "errors": [],
+      "event": "release_request",
+      "flood": {
+        "emit_errors": 0,
+        "invalid_periods": 0,
+        "min_rate_bytes_per_s": 20001.7,
+        "periods": 1,
+        "seconds": 30.001,
+        "sent_bytes": 600064
+      },
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.97
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.86
+        },
+        "cpu_count": 4,
+        "peak_loadavg_1min": 0.97,
+        "samples": 31
+      },
+      "host_monitor_missing": false,
+      "limit_ms": 300,
+      "load": "flood",
+      "load_problems": [],
+      "max_ms": 28.251016,
+      "p99_ms": 28.251016,
+      "repeat": 3,
+      "verdict": "PASS",
+      "void": false
+    }
+  ],
+  "samples_per_run": 50,
+  "samples_required": 500,
+  "schema": "event_latency_external.v1",
+  "verdict": "INSUFFICIENT_EVIDENCE"
+}
