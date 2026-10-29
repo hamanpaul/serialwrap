@@ -2338,12 +2338,21 @@ impl EffectExecutor for ManagerExec {
                 };
                 if !adopted {
                     // PTY 已不在（RPC 逾時已丟棄）或 hub 佇列滿：讓 core 移除這個沒有 fd 的 console（含其 owner／lease），
-                    // 不留下幽靈 console（審查 1fb9612 Medium）。
+                    // 不留下幽靈 console（審查 1fb9612 Medium）。以 detach 語意（ERR-7.5-b：一併關閉自己的 human lease）
+                    // 送 control lane；斷線語意（`ConsoleDisconnected`）會保留 lease，使之後 attach 的 console 取不到
+                    // lease 與 raw ownership。此 console 從未交給 hub，data lane 上沒有它的輸入可被超車。
                     self.shared.warn(format!(
                         "console 註冊失敗（com={} client_id={client_id}）：PTY 不存在或 hub 佇列已滿",
                         self.com()
                     ));
-                    let _ = self.data.try_send(DataEvent::ConsoleDisconnected { client_id, client_lifetime });
+                    let (reply, _ignored) = crossbeam_channel::bounded(1);
+                    let detach = ControlEvent::Request {
+                        req: SessionRequest::ConsoleDetach { client_id: client_id.clone() },
+                        reply,
+                    };
+                    if tx.try_send(detach).is_err() {
+                        let _ = self.data.try_send(DataEvent::ConsoleDisconnected { client_id, client_lifetime });
+                    }
                 }
             }
             Effect::ConsoleDiscard { token } => {
