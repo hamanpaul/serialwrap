@@ -473,8 +473,11 @@ parity_rows:
       - "tests/test_stage0_bridge_drain.py::test_unsafe_stop_receipt_closes_preserved_consoles"
       - "tests/test_stage0_bridge_drain.py::test_concurrent_stop_delivers_preserved_consoles_once"
   '#107':
-    status: OWNER-DECISION-PENDING
-    note: "Python 基線 tests/test_agent_defer_tx.py::TestUARTBridgeConsoles::test_console_input_supports_backspace_and_local_echo 在 s22_gate:py_parity；計畫另要求的 L1.5 func-test 0x08／0x7F 案例未交付：line-buffer 只出現在非 owner console，其整行提交在 owner console 持有 human lease 時被 SESSION_INTERACTIVE_BUSY 拒絕（Python 實測 co-02 草稿失敗），案例設計待計畫擁有者釐清（SPEC-GAP）"
+    status: PASS
+    note: "rulings/p6.md OWNER-BATCH #5 案例設計（CHG-S22-107-CASE-01）：owner console 先 detach 關閉其 human lease，第二個 console 仍走 line-buffer，0x08／0x7F 退格後整行提交；Python 基線 PASS"
+    tests:
+      - "tests/test_agent_defer_tx.py::TestUARTBridgeConsoles::test_console_input_supports_backspace_and_local_echo"
+      - "func-test/runner.py --case co-02-line-backspace"
   '#108':
     status: OWNER-DECISION-PENDING
     note: "Windows TCP attach_console 不開 lease 屬 Windows 原生（LOCAL-WINDOWS-TODO；Linux SC-28 tcp 後端由 rpc_console::attach_tcp_shape 承接）；file 傳輸 suspend 的既有 human 視窗 defer 屬 P8（Slice 2.4）——承接 Phase 待擁有者裁決"

@@ -12,7 +12,7 @@
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-29.2
+revision: 2026-10-29.3
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -4603,5 +4603,33 @@ cases:
   expected: PASS
   sentinel: null
   evidence: [crates/sw-daemon/tests/rpc_console.rs]
+  implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+# --- P6 Slice 2.2 第五輪：#107（B:E-87）L1.5 func-test 0x08／0x7F 案例（rulings/p6.md OWNER-BATCH #5 案例設計；add-only；conditional 不改變切片凍結分母） ---
+- case_id: co-02-line-backspace
+  suite: func-test
+  source_ref: func-test/cases/co-02-line-backspace.yaml
+  family: L15
+  title: line-buffer console 的 0x08／0x7F 退格編輯後整行提交
+  contract: '#107：owner console 先 detach（關閉其 human lease）後，第二個 console 仍走 line-buffer；輸入含 0x08（BS）或 0x7F（DEL）的整行時，daemon 依 line editor 刪去前一字元，UART 只收到編輯後的整行（echo abc／echo def），target 回應照常 fan-out 到該 console。Python 基線 PASS。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: ported
+  windows_gap_reason: null
+  capabilities: [posix_pty, process_rpc]
+  platform_capabilities:
+    windows: [windows_com, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.2'
+  stage0_required: false
+  prerequisites: [console_pty, raw_line_mode]
+  necessity: conditional
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: [manifest.json, cli.ndjson, daemon.log, wal/]
   implemented_by: 07-slice22-console.md
   cross_slice_reason: null

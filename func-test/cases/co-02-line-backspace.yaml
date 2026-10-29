@@ -1,0 +1,82 @@
+---
+meta:
+  name: co-02-line-backspace
+  category: console-io
+  severity: medium
+  description: "#107（B:E-87）：line-buffer console 的 0x08／0x7F 退格編輯——owner console 先 detach（關閉其 human lease），第二個 console 仍走 line-buffer，退格後整行提交，UART 只收到編輯後的整行"
+  tags: ["console", "line-buffering", "backspace", "human"]
+
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise:
+    enabled: false
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+
+steps:
+  - action: wait_ready
+    timeout_s: 20
+
+  # 第一個 console 取得 raw ownership（human lease）；第二個 console 走 line-buffer
+  - action: attach_console
+    selector: COM0
+    label: owner
+    save_as: owner
+  - action: attach_console
+    selector: COM0
+    label: line-edit
+    save_as: con
+
+  # owner console 先 detach：其 human lease 關閉，之後第二個 console 的整行提交不再被 SESSION_INTERACTIVE_BUSY 拒絕
+  - action: detach_console
+    console_id: "{owner.client_id}"
+    selector: COM0
+  - action: sleep
+    seconds: 0.5
+
+  # 0x08（BS）：echo abx<BS>c → echo abc
+  - action: console_write
+    console_id: "{con.client_id}"
+    input: "echo abx\bc\n"
+    delay_ms: 20
+  - action: console_read
+    console_id: "{con.client_id}"
+    timeout_s: 5
+    expect:
+      contains: "RESULT:echo abc:OK"
+
+  # 0x7F（DEL）：echo dex<DEL>f → echo def
+  - action: console_write
+    console_id: "{con.client_id}"
+    input: "echo dex\x7ff\n"
+    delay_ms: 20
+  - action: console_read
+    console_id: "{con.client_id}"
+    timeout_s: 5
+    expect:
+      contains: "RESULT:echo def:OK"
+
+  # UART 只收到編輯後的整行（退格字元與被刪字元不上線）
+  - action: assert_wal
+    selector: COM0
+    expect:
+      any_tx_contains_raw: ["echo abc", "echo def"]
+
+  - action: detach_console
+    console_id: "{con.client_id}"
+    selector: COM0
+  - action: assert_state
+    selector: COM0
+    expect:
+      state: "READY"
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]

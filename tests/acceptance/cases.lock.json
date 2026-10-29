@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-29.2",
+  "cases_revision": "2026-10-29.3",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -235,6 +235,7 @@
       "bc02-normal-replay-53",
       "brcm-01-login-flow",
       "co-01-line-buffering",
+      "co-02-line-backspace",
       "cowork-01-agent-bad-cmd",
       "df20-recover-reboot-stale-interactive-id",
       "df20-release-reattach-stale-interactive-id",
@@ -1232,6 +1233,19 @@
       "daemon_slice": "2.2",
       "cli_stage": "1B",
       "stage0_required": true
+    },
+    "co-02-line-backspace": {
+      "suite": "func-test",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
     },
     "cowork-01-agent-bad-cmd": {
       "suite": "func-test",

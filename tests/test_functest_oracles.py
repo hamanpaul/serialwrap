@@ -221,9 +221,20 @@ def test_any_tx_contains_raw_list_and_prefix():
 
 
 def test_case_yaml_ids_and_descriptions_unchanged():
-    """驗證 13 個 case 的 ID、描述、分類、嚴重度與基線一致，且 hk-01 不再含有重複 key。"""
+    """驗證 13 個 case 的 ID、描述、分類、嚴重度與基線一致，且 hk-01 不再含有重複 key。
+
+    基線之後新增的 case 須逐名列於 POST_BASELINE_CASES（附承接編號），其餘檔案集合必須恰等於基線 13 個。
+    """
     cases_dir = FUNC_TEST_DIR / "cases"
-    case_files = sorted(cases_dir.glob("*.yaml"))
+    # #107（B:E-87，07 Task 11）：line-buffer 0x08／0x7F 退格案例，P6 第五輪新增（slice22-chg-register CHG-S22-107-CASE-01）
+    post_baseline_cases = {"co-02-line-backspace.yaml"}
+    baseline_names = set(os.popen("git ls-tree --name-only 93553e6 func-test/cases/").read().split())
+    baseline_names = {pathlib.PurePosixPath(n).name for n in baseline_names}
+    assert len(baseline_names) == 13
+    all_files = {cf.name for cf in cases_dir.glob("*.yaml")}
+    assert all_files - post_baseline_cases == baseline_names
+    assert post_baseline_cases <= all_files
+    case_files = sorted(cf for cf in cases_dir.glob("*.yaml") if cf.name in baseline_names)
     assert len(case_files) == 13
 
     for cf in case_files:

@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-29.2",
-  "total": 170,
+  "cases_revision": "2026-10-29.3",
+  "total": 171,
   "by_suite": {
     "contract-blackbox": 44,
-    "func-test": 13,
+    "func-test": 14,
     "l15-scenario": 15,
     "manual-procedure": 1,
     "realhw": 37,
@@ -13,14 +13,14 @@
   },
   "by_layer": {
     "L1": 39,
-    "L1.5": 45,
+    "L1.5": 46,
     "L2": 43,
     "L3": 42,
     "manual": 1
   },
   "by_slice": {
     "2.1": 48,
-    "2.2": 47,
+    "2.2": 48,
     "2.3": 29,
     "2.4": 11,
     "None": 35
