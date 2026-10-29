@@ -72,3 +72,106 @@ fn fake_service_main_pid_and_enabled_are_scriptable() {
     assert_eq!(fake.main_pid(&sm("systemd-user")), Ok(Some(77)));
     assert_eq!(fake.main_pid(&sm("systemd-system")), Ok(None));
 }
+
+// ───────── 行程辨識（D1.3／D3.2／D5.2） ─────────
+
+use sw_pal::proc_scan::*;
+
+fn stat_line(pid: u32, ppid: u32, start_ticks: u64) -> String {
+    // 欄位：pid (comm) state ppid … 第 22 欄 starttime（`)` 之後第 20 個欄位）。
+    let mut fields = vec!["S".to_string(), ppid.to_string()];
+    while fields.len() < 19 {
+        fields.push("0".into());
+    }
+    fields.push(start_ticks.to_string());
+    format!("{pid} (python3) {}\n", fields.join(" "))
+}
+
+#[cfg(unix)]
+fn fake_proc(root: &std::path::Path, pid: u32, ppid: u32, uid: u32, argv: &[&str], exe: &str) {
+    let dir = root.join(pid.to_string());
+    std::fs::create_dir_all(dir.join("fd")).unwrap();
+    std::fs::write(dir.join("stat"), stat_line(pid, ppid, 1000 + u64::from(pid))).unwrap();
+    std::fs::write(dir.join("status"), format!("Name:\tpython3\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n")).unwrap();
+    let mut cmdline = Vec::new();
+    for part in argv {
+        cmdline.extend_from_slice(part.as_bytes());
+        cmdline.push(0);
+    }
+    std::fs::write(dir.join("cmdline"), cmdline).unwrap();
+    std::os::unix::fs::symlink(exe, dir.join("exe")).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_proc_details_reads_ppid_uid_exe_argv_and_start_ticks() {
+    let tmp = tempfile::tempdir().unwrap();
+    fake_proc(tmp.path(), 4242, 1, 1000, &["/usr/bin/python3", "/home/a/.local/bin/serialwrapd", "--socket", "/run/u/s.sock"], "/usr/bin/python3.12");
+    let details = PosixProcScan::with_root(tmp.path()).proc_details(4242).expect("details");
+    assert_eq!(details.ppid, Some(1));
+    assert_eq!(details.uid, Some(1000));
+    assert_eq!(details.exe.as_deref(), Some("/usr/bin/python3.12"));
+    assert_eq!(details.argv[1], "/home/a/.local/bin/serialwrapd");
+    assert_eq!(details.start_ticks, Some(5242));
+    assert!(PosixProcScan::with_root(tmp.path()).proc_details(9999).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_covers_any_same_uid_process_and_skips_other_uids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    std::fs::write(&tty, b"").unwrap();
+    // 同 uid 的非 serialwrapd 行程（例如 minicom）持有 tty → 必須列出。
+    fake_proc(tmp.path(), 700, 1, me, &["minicom", "-D", "/dev/ttyUSB0"], "/usr/bin/minicom");
+    std::os::unix::fs::symlink(&tty, tmp.path().join("700/fd/3")).unwrap();
+    // 他 uid 的行程不在掃描範圍。
+    fake_proc(tmp.path(), 701, 1, me.wrapping_add(1), &["minicom"], "/usr/bin/minicom");
+    std::os::unix::fs::symlink(&tty, tmp.path().join("701/fd/3")).unwrap();
+    let scan = PosixProcScan::with_root(tmp.path());
+    let (holders, status) = scan.uart_holders_same_uid(std::slice::from_ref(&tty));
+    assert_eq!(holders, vec![700]);
+    assert_eq!(status, HolderScanStatus::Ok);
+    // serialwrapd 專用掃描維持原語意（minicom 不是 serialwrapd）。
+    assert!(scan.serialwrapd_tty_holders(std::slice::from_ref(&tty)).0.is_empty());
+}
+
+#[test]
+fn python_interpreter_detection() {
+    for yes in ["/usr/bin/python3", "/usr/bin/python3.12", "/opt/py/bin/python", "C:\\Python312\\python.exe", "pythonw3"] {
+        assert_eq!(is_python_interpreter(yes), !yes.ends_with("pythonw3"), "{yes}");
+    }
+    for no in ["/usr/bin/serialwrapd", "/home/a/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd", "/usr/bin/pythonista", ""] {
+        assert!(!is_python_interpreter(no), "{no}");
+    }
+}
+
+#[test]
+fn python_daemon_script_detection() {
+    let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        python_daemon_script(&argv(&["/usr/bin/python3", "/home/a/.local/bin/serialwrapd", "--socket", "x"]), ArgvFlavor::Posix),
+        Some(Some("/home/a/.local/bin/serialwrapd".into()))
+    );
+    assert_eq!(python_daemon_script(&argv(&["python3", "-m", "sw_core.daemon"]), ArgvFlavor::Posix), Some(None));
+    assert_eq!(
+        python_daemon_script(&argv(&["python.exe", "C:\\Users\\a\\pipx\\venvs\\serialwrap\\Scripts\\serialwrapd-script.py"]), ArgvFlavor::Windows),
+        Some(Some("C:\\Users\\a\\pipx\\venvs\\serialwrap\\Scripts\\serialwrapd-script.py".into()))
+    );
+    assert_eq!(python_daemon_script(&argv(&["/opt/serialwrap/bin/serialwrapd", "--socket", "x"]), ArgvFlavor::Posix), None);
+    assert_eq!(python_daemon_script(&argv(&["python3", "serialwrapd"]), ArgvFlavor::Posix), None, "無路徑的 argv 不視為 script");
+}
+
+#[test]
+fn fake_proc_details_follow_liveness() {
+    let rpc = FakeRpcConnector::new();
+    let procs = FakeProcScan::new(vec![DaemonProc { pid: 9, socket: None, tree: vec![ProcIdentity { pid: 9, start_ticks: Some(1) }] }]);
+    procs.set_details(ProcDetails { pid: 9, ppid: Some(1), uid: Some(5), exe: Some("/usr/bin/python3".into()), argv: vec![], start_ticks: Some(1) });
+    procs.set_current_uid(Some(5));
+    assert_eq!(procs.proc_details(9).and_then(|d| d.uid), Some(5));
+    assert_eq!(procs.current_uid(), Some(5));
+    procs.alive_until_stopped(9, rpc.clone(), "unix:///x");
+    rpc.stop_endpoint("unix:///x");
+    assert!(procs.proc_details(9).is_none(), "已結束的行程不得回傳辨識資訊");
+}
