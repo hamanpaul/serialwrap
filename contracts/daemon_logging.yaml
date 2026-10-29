@@ -47,14 +47,14 @@ messages:
     level: WARNING
     template: "serialwrap: 無法確認 %s 的外部 holder（status=%s），BC-04 僅保證 serialwrap 實例互斥"
     args: [self._device_path, report.status]
-    source: "sw_core/serial_port.py:403"
+    source: "sw_core/serial_port.py:424"
 
   - id: uart_tiocncl_failed
     logger: serialwrap
     level: WARNING
     template: "serialwrap: TIOCNXCL failed on %s: %s"
     args: [self._device_path, exc]
-    source: "sw_core/serial_port.py:445"
+    source: "sw_core/serial_port.py:466"
 
   - id: device_watcher_tick_failed
     logger: serialwrap
