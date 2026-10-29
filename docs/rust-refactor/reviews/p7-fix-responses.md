@@ -287,3 +287,14 @@ L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +6。
 |---|---|---|---|
 | A 段 | — | 前輪全數已修（含 P7-71fe017-3 經 P5 `0a7d092`／merge `afebff0` 合入、P7-71fe017-4 經 `afebff0`＋`0baf6e8`） | — |
 | P7-9065f14-1 | Medium | merge 帶入 OD-34 延後 `l15-delayed-reply` 後，`slice22_evidence_map.yaml` 仍列該案，`test_contracts_slice22.py::test_slice22_case_set_frozen_and_mapped` 必紅 | **屬實；SPEC-GAPS／BLOCKED-UPSTREAM P7-BU-10（P6）**：`tests/acceptance/slice22_evidence_map.yaml` 與該測試為 P6（Slice 2.2）擁有（ae33e28），審查者修法亦為「由 P6 同步移除後合入」；本分支依指示不 merge P6、不改其他 Phase 檔案。P6 移除該列並由 P7 合入後此測試轉綠（OD-34 的 cowork-01-agent-bad-cmd 自 2.2 移出時同一 map 亦需同步） |
+
+### OD-34／OD-31（第 11 輪，merge P5 後於 Rust daemon 重跑）
+
+`SERIALWRAP_GATE=1 SERIALWRAP_L15_RUST_DAEMON=target/debug/serialwrapd`、bridge 自測 `uart_stdio_bridge selftest --endpoint
+posix-pty` PASS：`tests/acceptance/l15/test_slice23_l15.py` 5 passed、2 failed——`l15-delayed-reply`、`s21-reboot-minimal-guard`、
+`l15-dut-silent`、`ev-01-spawn-handler`（Linux）、`brcm-01-login-flow` PASS；`cowork-01-agent-bad-cmd`（步驟 8）與
+`l15-dut-reboot-port-alive`（步驟 1）皆因 `session.console_attach` 回 METHOD_NOT_FOUND（P6 human console）FAIL，
+BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-31 Windows 列維持 LOCAL-WINDOWS-TODO P7-LW-7。
+
+案例設計補記：`release-during-login` 於 Python 基線 `device attach` 後落 DETACHED＋`ATTACH_FAILED:TxIncompleteError` 且
+不再自動重試，Rust 回 READY——A/B 外部可觀察差異，列 OWNER-BATCH（是否須 1:1 重現）；案例只斷言 §11.3-4 的 handle 時序。

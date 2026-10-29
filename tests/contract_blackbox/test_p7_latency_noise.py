@@ -34,7 +34,9 @@ def test_login_with_delay_and_noise(p7, tmp_path):
         commands={"overrides": {"sh": {"response": "\r\n# "}}},
     )
     p7.start("bcm", [tgt])                                     # bcm：timeout_s 15
-    s = wait_state(p7.env, "COM0", "READY", timeout_s=90.0)
+    # 雜訊下單次 attach 可能失敗而進入 DETACHED↔ATTACHING 重試（backoff 上限 15 s）；全套負載下 90 s 曾不足
+    # （第 11 輪 g2 全套 1 次，同範圍連跑 2 次與 4 份並行皆綠），上限取 180 s，斷言仍為最終 READY。
+    s = wait_state(p7.env, "COM0", "READY", timeout_s=180.0)
     assert s["last_error"] is None, s
     sent = tgt.rx_log()
     assert b"root\n" in sent and b"pw-noise\n" in sent and b"sh\n" in sent and b"echo __READY__" in sent, sent

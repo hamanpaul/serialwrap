@@ -1,0 +1,14 @@
+# 53ed5c9 全套 pytest 失敗清單（ubuntu 非 root，g2 worktree，1:08:59；13 筆）
+FAILED tests/contract_blackbox/slice21/test_safety_core.py::test_two_daemons_same_tty
+FAILED tests/contract_blackbox/test_p7_latency_noise.py::test_login_with_delay_and_noise
+FAILED tests/test_contracts_slice22.py::test_slice22_case_set_frozen_and_mapped
+FAILED tests/test_doctor.py::TestWindowsDoctor::test_pyserial_ok_when_importable
+FAILED tests/test_l1_judge.py::test_l1_lock_cargo_sets_exclude_ignored_tests
+FAILED tests/test_l1_judge.py::test_l1_lock_frozen_set_excludes_capability_gated
+FAILED tests/test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only
+FAILED tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native
+FAILED tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
+FAILED tests/test_stage0_tx_outcome.py::test_pyserial_port_write_maps_timeout_to_unknown
+FAILED tests/test_stage0_tx_permit.py::test_pyserial_chunked_write_drain_stops_after_inflight_chunk
+FAILED tests/test_stage0_tx_permit.py::test_pyserial_partial_cancel_keeps_cancelled_reason
+FAILED tests/test_stage0_uart_exclusive.py::TestManagerAttach::test_pyserial_access_denied_raises_device_held_unknown

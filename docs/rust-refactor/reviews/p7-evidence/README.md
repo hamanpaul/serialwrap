@@ -234,3 +234,16 @@ $ （76de0cf worktree）timeout 200 python3.12 -m pytest -q -p no:cacheprovider 
 cargo（`--workspace --features test-fakes`）失敗 6 筆皆為 root 使 chmod 無效的環境類（`daemon_process` 3、sw-pal
 `holder_scan_permission`、`file_eacces_matches_golden`、`unix_fixture_rows_match_python`），訊息皆為「證據不足：root 下 chmod
 無效…」。
+
+### 第 11 輪（第五輪雲端，ubuntu 非 root 執行）
+
+- 起點 `9d35b01`：`pytest-fail-start-9d35b01.txt`（5464 passed、21 failed；slice21 黑箱 10 筆為與 g1 並行時的負載／競態，
+  g1、g2 皆未重現）。
+- `afebff0`＋`0baf6e8`（g1 worktree）：新增 42 筆中 40 筆為 worktree gitdir 由 root 建立、ubuntu 執行 git 觸發
+  dubious ownership 的環境因素，設 `safe.directory` 後同範圍連跑兩次皆 40 passed；真實新增 2 筆：
+  `test_sc30_reserved_for_p7`（已修 9065f14）、`test_slice22_case_set_frozen_and_mapped`（P6 檔案，P7-BU-10）。
+- `53ed5c9`（g2 worktree）：`pytest-fail-53ed5c9.txt`（5538 passed、13 failed）。相對起點 +2／−10：
+  `+ test_slice22_case_set_frozen_and_mapped`（P7-BU-10）、`+ test_p7_latency_noise.py::test_login_with_delay_and_noise`
+  （本輪新增案例；同範圍連跑 2 次、4 份並行皆綠，失敗快照為 DETACHED 重試循環，等待上限 90→180 s 修正於後續 commit）。
+- cargo（`--workspace --features test-fakes`，非 root）：全綠；`sw-pal::lock::lock_conformance_suite` 於 workspace
+  平行跑曾 1 次間歇紅（`stale_socket_reclaimed: AlreadyRunning`），單獨連跑 4 次皆綠（既有碼待辦）。
