@@ -16094,6 +16094,7 @@
           "tests/test_slice21_gate_report.py::test_bo_case_ids_cover_frozen_windows_cases",
           "tests/test_slice21_gate_report.py::test_gate_dry_run_lists_all_blocked_owner_items",
           "tests/test_slice21_gate_report.py::test_runbook_has_anchor_per_item",
+          "tests/test_slice21_harness_shared_tty.py::test_second_daemon_sharing_tty_keeps_first_by_id_link",
           "tests/test_slice21_prereqs.py::test_func_test_runner_flags",
           "tests/test_slice21_prereqs.py::test_prereq_files_exist",
           "tests/test_slice21_scope.py::test_event_latency_contract_values",

@@ -620,11 +620,9 @@ def test_two_daemons_same_tty(shell_daemon, slice21_daemon_factory, tmp_path):
         pytest.skip("EVIDENCE_MISSING: root 下 TIOCEXCL 不生效（§6.2），證據不足")
     t = shell_daemon.targets["COM0"]
     snap = len(t.written())
-    # 第二個 daemon：不同 RUN／STATE／socket／lock，BY_ID 目錄指向第一個 daemon 的 FakeTarget
-    second = slice21_daemon_factory(
-        tmp_path / "second-daemon",
-        extra_env={"SERIALWRAP_BY_ID_DIR": shell_daemon.env["SERIALWRAP_BY_ID_DIR"]},
-    )
+    # 第二個 daemon：不同 RUN／STATE／socket／lock，共用第一個 daemon 的 FakeTarget 與 by-id symlink（不另建、不改寫；
+    # rulings/p5.md P6 SPEC-GAP #1：舊寫法另建 FakeTarget 並蓋掉第一個 daemon 的 fake-uart0，兩者實際不是同一 tty）
+    second = slice21_daemon_factory(tmp_path / "second-daemon", share_tty_with=shell_daemon)
     deadline = time.monotonic() + 20.0
     while True:
         s = _session(second)
