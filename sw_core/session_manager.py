@@ -5755,28 +5755,31 @@ class SessionManager:
                 if "\r\r\n" in text:
                     lines = _strip_wrapped_command_echo(lines, command_stripped)
                 # bash readline 會在長回顯折行處寫入「空白＋CR」再接續同一行。
-                # 只在移除這個明確控制字元後，首行確實以完整命令結尾時才剝除；
-                # 一般單行 stdout 不因忽略空白而取得回顯資格。
+                # 只接受首個非空行中，原命令與至少相隔 20 字元的折行標記；
+                # 不把 stdout 的任意空白或較短片段當成回顯。
                 if lines is original_lines and " \r" in text:
-                    candidate_text = text.replace(" \r", "", 1)
-                    candidate_cleaned = clean_text(candidate_text)
-                    candidate_prompt_start = self._last_prompt_start(candidate_cleaned, prompt_regex)
-                    candidate_completion = (
-                        re.search(completion_regex, candidate_text) if completion_regex is not None else None
-                    )
-                    candidate_completion_end = (
-                        len(clean_text(candidate_text[:candidate_completion.end()]))
-                        if candidate_completion is not None else None
-                    )
-                    if candidate_prompt_start is not None and (
-                        completion_regex is None
-                        or (candidate_completion_end is not None
-                            and candidate_prompt_start >= candidate_completion_end)
-                    ):
-                        candidate_cleaned = candidate_cleaned[:candidate_prompt_start]
-                    candidate_lines = candidate_cleaned.lstrip("\n").splitlines()
-                    if candidate_lines and candidate_lines[0].strip().endswith(command_stripped):
-                        lines = candidate_lines[1:]
+                    match = _match_readline_wrapped_echo(text, command_stripped)
+                    if match is not None:
+                        start, end = match
+                        candidate_text = text[:start] + text[start:end].replace(" \r", "") + text[end:]
+                        candidate_cleaned = clean_text(candidate_text)
+                        candidate_prompt_start = self._last_prompt_start(candidate_cleaned, prompt_regex)
+                        candidate_completion = (
+                            re.search(completion_regex, candidate_text) if completion_regex is not None else None
+                        )
+                        candidate_completion_end = (
+                            len(clean_text(candidate_text[:candidate_completion.end()]))
+                            if candidate_completion is not None else None
+                        )
+                        if candidate_prompt_start is not None and (
+                            completion_regex is None
+                            or (candidate_completion_end is not None
+                                and candidate_prompt_start >= candidate_completion_end)
+                        ):
+                            candidate_cleaned = candidate_cleaned[:candidate_prompt_start]
+                        candidate_lines = candidate_cleaned.lstrip("\n").splitlines()
+                        if candidate_lines and candidate_lines[0].strip().endswith(command_stripped):
+                            lines = candidate_lines[1:]
         return "\n".join(lines).strip("\n")
 
     def _open_interactive_locked(
@@ -8241,3 +8244,51 @@ def _save_release_state(manager: "SessionManager") -> None:
     release_kill_point = _test_release_persist_point()
     manager._save_state()
     _test_kill_after_save_hook(release_kill_point)
+
+
+_READLINE_WRAP_MIN_SEGMENT = 20
+
+
+def _match_readline_wrapped_echo(text: str, command: str) -> tuple[int, int] | None:
+    """回傳首個非空行內「命令原文＋readline 折行標記」的起訖位置。"""
+    if not text or not command:
+        return None
+
+    line_start = 0
+    while line_start < len(text):
+        line_end = text.find("\n", line_start)
+        if line_end < 0:
+            line_end = len(text)
+        line = text[line_start:line_end]
+        if line.strip("\r"):
+            break
+        if line_end == len(text):
+            return None
+        line_start = line_end + 1
+    else:
+        return None
+
+    for command_start in range(len(line)):
+        if line[command_start] != command[0]:
+            continue
+        cursor = command_start
+        matched = 0
+        last_wrap: int | None = None
+        while matched < len(command) and cursor < len(line):
+            if line.startswith(" \r", cursor) and matched > 0:
+                segment = matched if last_wrap is None else matched - last_wrap
+                if segment < _READLINE_WRAP_MIN_SEGMENT:
+                    break
+                last_wrap = matched
+                cursor += 2
+                continue
+            if line[cursor] == command[matched]:
+                cursor += 1
+                matched += 1
+                continue
+            break
+        if matched != len(command):
+            continue
+        if cursor == len(line) or line[cursor:] == "\r":
+            return line_start + command_start, line_start + cursor
+    return None

@@ -1376,12 +1376,7 @@ def test_bc_real_sc_df_ranges() -> None:
     # SC-08 依 OD-14 #3 撤回、編號不重用。
     assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36"}) - {"SC-08"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
-    # DF-20 由 P6 依 OD-37（2026-10-28）登記（rust_only）。
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20"}
-    df20 = by_id["DF-20"]
-    assert df20.scope == "rust_only" and list(df20.phases) == ["P6"]
-    assert df20.case_ids == ("df20-release-reattach-stale-interactive-id",)
-    assert df20.applies_rust_stage == "slice-2.2"
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20", "DF-21", "DF-22"}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
@@ -1389,6 +1384,27 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df19.case_ids == ("df19-self-test-probe-quiet-fence",)
     assert "SES-16.6-08" in df19.reconciliation_refs
     assert df19.applies_rust_stage == "slice-2.1"
+
+    df20 = by_id["DF-20"]
+    assert df20.scope == "both" and df20.applies_python_min == "0.4.0"
+    assert df20.applies_rust_stage == "slice-2.2"
+    assert df20.case_ids == ("df20-stale-interactive-id-no-replay",)
+    assert "OD-37" in df20.related_decisions
+    assert "INTERACTIVE_NOT_FOUND" in df20.compatibility_impact and "UART TX 為零" in df20.compatibility_impact
+
+    df21 = by_id["DF-21"]
+    assert df21.scope == "both" and df21.applies_python_min == "0.4.0"
+    assert df21.applies_rust_stage == "slice-2.1"
+    assert df21.case_ids == ("df21-recover-flush-atomic",)
+    assert "OD-37" in df21.related_decisions
+    assert "FLUSHED_BY_RECOVERY" in df21.compatibility_impact and "UART TX 為零" in df21.compatibility_impact
+
+    df22 = by_id["DF-22"]
+    assert df22.scope == "rust_only" and df22.applies_python_min is None
+    assert df22.applies_rust_stage == "slice-2.1"
+    assert df22.case_ids == ("df22-rx-window-merge-oldest",)
+    assert "OD-43" in df22.related_decisions
+    assert "merge_oldest" in df22.compatibility_impact and "不得低估" in df22.compatibility_impact
 
 
 def test_bc_real_rust_only_python_null() -> None:
