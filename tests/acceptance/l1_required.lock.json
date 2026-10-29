@@ -8825,7 +8825,6 @@
           "cargo:sw-cli::mgmt_layout::pairing_reports_daemon_version_mismatch",
           "cargo:sw-cli::mgmt_layout::pairing_undeclared_digest_never_matches_missing_evidence",
           "cargo:sw-cli::mgmt_layout::posix_symlink_switch_atomic",
-          "cargo:sw-cli::mgmt_layout::real_mkbundle_dev_output_verifies",
           "cargo:sw-cli::mgmt_layout::revert_entries_attempts_remaining_entries_after_one_failure",
           "cargo:sw-cli::mgmt_layout::stage_version_existing_corrupt_refused",
           "cargo:sw-cli::mgmt_layout::stage_version_idempotent",
@@ -8847,7 +8846,6 @@
           "cargo:sw-cli::mgmt_layout::verify_windows_bundle_fixture_uses_native_temp_paths",
           "cargo:sw-cli::mgmt_layout::windows_copy_switch_keeps_old_and_writes_new",
           "cargo:sw-cli::mgmt_layout::windows_install_root_override_preserves_absolute_host_path",
-          "cargo:sw-cli::mgmt_layout::windows_switch_running_exe_rename",
           "cargo:sw-cli::mgmt_remote::autossh_prefix",
           "cargo:sw-cli::mgmt_remote::bind_loopback_only_cases",
           "cargo:sw-cli::mgmt_remote::close_dead_pid_not_signalled",
@@ -9377,6 +9375,7 @@
           "cargo:sw-core::mailbox::request_timeout_returns_internal_timeout",
           "cargo:sw-core::mailbox::stale_epoch_dependency_released_immediately",
           "cargo:sw-core::mailbox::stash_bounded_16",
+          "cargo:sw-core::mailbox::witness_counts_data_overtaking_stopped_receipt",
           "cargo:sw-core::mailbox::zero_rx_dependency_is_ready_on_current_epoch",
           "cargo:sw-core::rx_reader::completion_cannot_overtake_its_rx_chunk",
           "cargo:sw-core::rx_reader::data_lane_backpressure_blocks_reader_after_wal",
@@ -9759,8 +9758,6 @@
           "cargo:sw-daemon::framing::stop_bounds_total_write_time_with_trickle_reader",
           "cargo:sw-daemon::framing::stop_waits_for_in_handler_connection",
           "cargo:sw-daemon::framing::trailing_line_without_newline_at_eof_is_processed",
-          "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
-          "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
           "cargo:sw-daemon::launcher::dispatch_to_rust_daemon_for_dev_build_and_rust_manifest",
           "cargo:sw-daemon::launcher::executable_file_busy_retries_until_spawn_succeeds",
           "cargo:sw-daemon::launcher::launcher_argv_matches_multi_open_rule2",
@@ -9816,7 +9813,6 @@
           "cargo:sw-pal::device_source::windows_allowlist_matches_complete_com_name",
           "cargo:sw-pal::device_source::windows_scan_applies_bthenum_exclude_coms_and_bthmodem",
           "cargo:sw-pal::device_source::windows_scan_maps_real_path",
-          "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
           "cargo:sw-pal::exec_delegate::exec_or_wait_propagates_exit_code_and_env",
           "cargo:sw-pal::exec_delegate::exec_or_wait_reports_missing_program",
           "cargo:sw-pal::fakes_selftest::block_forever_release_during_submit_window_is_not_lost",
@@ -9982,27 +9978,10 @@
           "cargo:sw-pal::rpc_listener::uds_missing_parent_not_created",
           "cargo:sw-pal::rpc_listener::uds_mode_0660_baseline",
           "cargo:sw-pal::select::select_backend_matches_platform_backends",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__accept_unverified_registers_unknown_holder_device",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__blocked_write_cancel_returns_partial_completed",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__conformance_suite",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__external_plain_open_before_daemon_is_held",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__open_failure_after_tiocexcl_clears_excl",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__probe_close_reopen_with_master_open",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__reader_woken_within_50ms",
-          "cargo:sw-pal::serial_posix::cap_posix_pty__second_open_in_process_is_held",
           "cargo:sw-pal::serial_posix::conflict_holder_unknown_when_no_pids",
           "cargo:sw-pal::serial_posix::fakes_conformance_suite",
           "cargo:sw-pal::serial_posix::flock_eacces_is_held",
           "cargo:sw-pal::serial_posix::open_errno_maps_like_python",
-          "cargo:sw-pal::serial_posix::plain_holder_child",
-          "cargo:sw-pal::serial_posix_process::cap_posix_pty__concurrent_wake_reaches_reader_and_writer",
-          "cargo:sw-pal::serial_posix_process::cap_posix_pty__fd_not_inherited_by_child",
-          "cargo:sw-pal::serial_posix_process::cap_posix_pty__holder_exit_releases_flock_excl_persists_while_master_open",
-          "cargo:sw-pal::serial_posix_process::cap_posix_pty__release_then_external_plain_open_succeeds",
-          "cargo:sw-pal::serial_posix_process::cap_posix_pty__second_process_open_is_held",
-          "cargo:sw-pal::serial_posix_process::cap_posix_pty__two_symlinks_same_tty_is_held",
-          "cargo:sw-pal::serial_posix_process::cap_sys_admin__tiocexcl_bypass_documented",
           "cargo:sw-pal::serial_windows::access_denied_is_not_a_holder_claim",
           "cargo:sw-pal::serial_windows::comm_timeouts_follow_pyserial_constants",
           "cargo:sw-pal::serial_windows::dcb_flags_clear_inherited_error_and_null_modes",
@@ -10011,7 +9990,6 @@
           "cargo:sw-pal::serial_windows::missing_com_error_code_maps_to_not_found",
           "cargo:sw-pal::serial_windows::overlapped_completion_mapping",
           "cargo:sw-pal::serial_windows::read_wait_and_operation_errors_keep_distinct_sources",
-          "cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure",
           "cargo:sw-pal::service_ctl::composite_service_ctl_dispatches_and_rejects_unsupported_modes",
           "cargo:sw-pal::service_ctl::on_demand_hold_is_noop_record",
           "cargo:sw-pal::service_ctl::on_demand_returns_no_systemd_shape",
@@ -10070,8 +10048,6 @@
           "cargo:sw-pal::sw_pal::com0com::tests::registry_errors_are_returned_for_caller_to_handle",
           "cargo:sw-pal::sw_pal::com0com::tests::setupc_command_uses_payload_directory_and_noninteractive_wait_args",
           "cargo:sw-pal::sw_pal::com0com::tests::validates_com_port_names",
-          "cargo:sw-pal::sw_pal::console_pty::posix::tests::cap_posix_pty__new_slave_speed_not_b0",
-          "cargo:sw-pal::sw_pal::console_pty::posix::tests::cap_posix_pty__zero_timeout_reads_ready_data_and_wake",
           "cargo:sw-pal::sw_pal::console_pty::posix::tests::external_peer_held_paths_fail_closed_when_unknown",
           "cargo:sw-pal::sw_pal::fs_ops::posix::tests::atomic_write_temp_file_is_close_on_exec",
           "cargo:sw-pal::sw_pal::osstr::tests::os_string_from_bytes_preserves_invalid_posix_bytes",
@@ -10079,8 +10055,6 @@
           "cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::expired_send_deadline_returns_timeout",
           "cargo:sw-pal::sw_pal::rpc_transport::posix::review_regression_tests::only_einprogress_is_treated_as_pending_connect",
           "cargo:sw-pal::sw_pal::rpc_transport::tests::py_repr_matches_python",
-          "cargo:sw-pal::sw_pal::serial::posix::tests::cap_posix_pty__dropping_close_token_keeps_reader_fd_open",
-          "cargo:sw-pal::sw_pal::serial::posix::tests::cap_posix_pty__zero_timeout_reads_ready_data_and_wake",
           "cargo:sw-pal::sw_pal::serial::posix::tests::close_sequence_close_fd_failure",
           "cargo:sw-pal::sw_pal::serial::posix::tests::close_sequence_nxcl_hangup_errno_is_cleared",
           "cargo:sw-pal::sw_pal::serial::posix::tests::close_sequence_nxcl_other_errno_still_closes",
@@ -10937,6 +10911,120 @@
             "--",
             "--skip",
             "cap_"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s21_gate:cap_interactive_desktop": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_interactive_desktop__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s21_gate:cap_posix_pty": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-pal::serial_posix::cap_posix_pty__accept_unverified_registers_unknown_holder_device",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__blocked_write_cancel_returns_partial_completed",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__conformance_suite",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__external_plain_open_before_daemon_is_held",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__open_failure_after_tiocexcl_clears_excl",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__probe_close_reopen_with_master_open",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__reader_woken_within_50ms",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__second_open_in_process_is_held",
+          "cargo:sw-pal::serial_posix_process::cap_posix_pty__concurrent_wake_reaches_reader_and_writer",
+          "cargo:sw-pal::serial_posix_process::cap_posix_pty__fd_not_inherited_by_child",
+          "cargo:sw-pal::serial_posix_process::cap_posix_pty__holder_exit_releases_flock_excl_persists_while_master_open",
+          "cargo:sw-pal::serial_posix_process::cap_posix_pty__release_then_external_plain_open_succeeds",
+          "cargo:sw-pal::serial_posix_process::cap_posix_pty__second_process_open_is_held",
+          "cargo:sw-pal::serial_posix_process::cap_posix_pty__two_symlinks_same_tty_is_held",
+          "cargo:sw-pal::sw_pal::console_pty::posix::tests::cap_posix_pty__new_slave_speed_not_b0",
+          "cargo:sw-pal::sw_pal::console_pty::posix::tests::cap_posix_pty__zero_timeout_reads_ready_data_and_wake",
+          "cargo:sw-pal::sw_pal::serial::posix::tests::cap_posix_pty__dropping_close_token_keeps_reader_fd_open",
+          "cargo:sw-pal::sw_pal::serial::posix::tests::cap_posix_pty__zero_timeout_reads_ready_data_and_wake"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_posix_pty__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s21_gate:cap_supervisor_runtime": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-pal::service_ctl::cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_supervisor_runtime__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s21_gate:cap_sys_admin": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-pal::serial_posix_process::cap_sys_admin__tiocexcl_bypass_documented"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_sys_admin__"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
+    "s21_gate:cap_windows_native": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+          "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child"
+        ],
+        "selector": {
+          "argv": [
+            "--workspace",
+            "--features",
+            "test-fakes",
+            "--",
+            "--ignored",
+            "cap_windows_native__"
           ],
           "markexpr": "",
           "paths": []

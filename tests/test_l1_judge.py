@@ -839,21 +839,30 @@ def _rust_ignored_tests() -> set[tuple[str, str | None, str]]:
     return found
 
 
-@pytest.mark.memory_only
-def test_l1_lock_cargo_sets_exclude_ignored_tests() -> None:
-    """OD-24（2026-10-27）：所有 cargo 凍結集合（linux 與 windows）不得含 `#[ignore]` 列。
+_CAP_FILTER_RE = re.compile(r"^cap_([a-z0-9_]+?)__$")
 
-    官方 cargo L1 selector 不執行 ignored 測試，鎖入後只能得到 skipped；cap_* 與委派 entry
-    由其他已鎖案例或 capability gate 承擔。補足只擋 Windows cap_* 的
-    test_l1_lock_frozen_set_excludes_capability_gated。以原始碼 `#[ignore]` 屬性判定。
-    """
-    ignored = _rust_ignored_tests()
-    # 非空洞檢查：掃描器必須認得已知的 ignored 測試，否則斷言形同虛設
-    assert ("sw-cli", "mgmt_layout", "mkbundle_respects_cargo_target_dir_override") in ignored, sorted(ignored)
-    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+
+def _selector_explicit_caps(selector: dict) -> list[str]:
+    """OD-53：selector 在 test-binary 參數（`--` 之後）以 `--ignored cap_<cap>__` 明確只執行 ignored 能力測試時，
+    回傳其 caps（重現命令為 `cargo_l1_results.py --caps <cap> -- <selector argv>`）；否則回空串列。
+    `--include-ignored`、`--skip cap_` 或混有非 cap 篩選者不算能力集合。"""
+    argv = [str(x) for x in (selector.get("argv") or [])]
+    if "--" not in argv:
+        return []
+    tail = argv[argv.index("--") + 1:]
+    if "--ignored" not in tail:
+        return []
+    filters = [t for t in tail if not t.startswith("-")]
+    caps = [m.group(1) for t in filters if (m := _CAP_FILTER_RE.match(t))]
+    return caps if caps and len(caps) == len(filters) else []
+
+
+def _ignored_lock_rows(lock: dict, ignored: set[tuple[str, str | None, str]]) -> list[str]:
+    """L1 鎖中 OD-24 (2) 禁止的 `#[ignore]` 列（`<set>:<platform>:<nodeid>`）；OD-53 能力集合內符合其 cap 前綴者豁免。"""
     flagged: list[str] = []
     for set_id, platforms in lock["sets"].items():
         for plat, spec in platforms.items():
+            caps = _selector_explicit_caps(spec["selector"])
             for nid in spec["nodeids"]:
                 if not nid.startswith("cargo:"):
                     continue
@@ -861,9 +870,61 @@ def test_l1_lock_cargo_sets_exclude_ignored_tests() -> None:
                 if len(parts) < 3:
                     continue
                 pkg, target, name = parts[0], parts[1], parts[-1]
-                if (pkg, target, name) in ignored or (pkg, None, name) in ignored:
-                    flagged.append(f"{set_id}:{plat}:{nid}")
+                if (pkg, target, name) not in ignored and (pkg, None, name) not in ignored:
+                    continue
+                if any(name.startswith(f"cap_{cap}__") for cap in caps):
+                    continue  # OD-53：selector 明確以 --ignored 執行的能力測試
+                flagged.append(f"{set_id}:{plat}:{nid}")
+    return flagged
+
+
+@pytest.mark.memory_only
+def test_l1_lock_cargo_sets_exclude_ignored_tests() -> None:
+    """OD-24（2026-10-27）：所有 cargo 凍結集合（linux 與 windows）不得含 `#[ignore]` 列。
+
+    官方 cargo L1 selector 不執行 ignored 測試，鎖入後只能得到 skipped；cap_* 與委派 entry
+    由其他已鎖案例或 capability gate 承擔。補足只擋 Windows cap_* 的
+    test_l1_lock_frozen_set_excludes_capability_gated。以原始碼 `#[ignore]` 屬性判定。
+    OD-53（2026-10-29）：selector 明確以 `--ignored cap_<cap>__` 執行 ignored 能力測試的集合，其 cap 列豁免
+    （`_selector_explicit_caps`）；其他集合仍禁止 `#[ignore]` 列。
+    """
+    ignored = _rust_ignored_tests()
+    # 非空洞檢查：掃描器必須認得已知的 ignored 測試，否則斷言形同虛設
+    assert ("sw-cli", "mgmt_layout", "mkbundle_respects_cargo_target_dir_override") in ignored, sorted(ignored)
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    flagged = _ignored_lock_rows(lock, ignored)
     assert not flagged, f"cargo 凍結集合含 #[ignore] 列（須經擁有者裁決以 --allow-removal 移除）：{flagged}"
+
+
+# OD-55（2026-10-29）：s21_core.linux 的能力列移入 s21_gate:cap_<cap>（selector `--ignored cap_<cap>__`）。
+_S21_LINUX_CAPS = ("posix_pty", "sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime")
+
+
+@pytest.mark.memory_only
+def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
+    """OD-55：s21_core.linux 不得再有 `cap_*` 或其他 `#[ignore]` 列；每個能力的列改登記於 `s21_gate:cap_<cap>.linux`，
+    其 selector 為 OD-53 能力集合（`_selector_explicit_caps` 恰為該 cap）、nodeid 全為 `cap_<cap>__*` 且為 ignored 測試。
+    非能力列三筆（helper `plain_holder_child`、`real_mkbundle_dev_output_verifies`、`windows_switch_running_exe_rename`）
+    直接自 s21_core.linux 移除。s21_core.windows 須待 Windows 原生收集登記能力集合後才移除（LOCAL-WINDOWS-TODO）。"""
+    ignored = _rust_ignored_tests()
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    core = lock["sets"]["s21_core"]["linux"]["nodeids"]
+    assert not [n for n in core if n.rsplit("::", 1)[-1].startswith("cap_")], "s21_core.linux 仍含 cap_* 列"
+    for name in ("plain_holder_child", "real_mkbundle_dev_output_verifies", "windows_switch_running_exe_rename"):
+        assert not [n for n in core if n.endswith(f"::{name}")], name
+    assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_core:linux:")]
+    moved = 0
+    for cap in _S21_LINUX_CAPS:
+        spec = lock["sets"][f"s21_gate:cap_{cap}"]["linux"]
+        assert _selector_explicit_caps(spec["selector"]) == [cap], spec["selector"]
+        assert spec["nodeids"], cap
+        for nid in spec["nodeids"]:
+            pkg, *_mid, name = nid[len("cargo:"):].split("::")
+            assert name.startswith(f"cap_{cap}__"), nid
+            assert any(p == pkg and n == name for p, _t, n in ignored), f"{nid} 不是 ignored 測試"
+        moved += len(spec["nodeids"])
+    assert moved == 24, moved          # 23（OD-55 列舉）＋ cap_interactive_desktop__exec_or_wait_ctrl_c（linux 亦收集）
+    assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_gate:cap_")]
 
 
 @pytest.mark.process_rpc
