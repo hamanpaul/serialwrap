@@ -62,3 +62,48 @@ CPython `Tokenizer` 在 `get()` 時就預讀下一個 token；下一個 token �
 
 - `pyre.tsv` golden 只新增列，既有列逐位元組不變；產生器與 oracle（CPython 3.12.3 `re`）都沒有改。
 - RPC-H-03 回應端行為不變（`pyjson::loads` 仍把孤立 surrogate 換成 U+FFFD）。
+
+---
+
+# 第 2 輪（sol 增量審查 `62ffec7_2a65438-sol.md`）
+
+> 依據：`origin/docs/parity-amendments` 的 `reviews/s1-cloud/62ffec7_2a65438-sol.md`（A 段前輪 finding 全為已修；B 段 1 High＋1 Medium）、`reviews/low-backlog.md` 的 S1X-b-X1。
+> 起點 `2a65438`。實測環境同上。
+
+## 處理
+
+| 編號 | 處理 | commit |
+|---|---|---|
+| S1-2a65438-1（High） | 照修：孤立 surrogate 個數隨值附帶，重複鍵覆寫時更新，只依最終值樹判定是否拒送 | `9a9955d` |
+| S1-2a65438-2（Medium） | 照修：比照 CPython tokenizer 預讀，結尾單獨 `\` 的 end of pattern 優先 | 本文件所在 commit（`fix(pyre): 樣式以單獨反斜線結尾時…`） |
+| S1X-b-X1（low-backlog） | 與 S1-2a65438-2 同一機制，一併修正（`[z\A\`、`a\8\`、`(?P<\` 已收進 golden） | 本文件所在 commit（`fix(pyre): 樣式以單獨反斜線結尾時…`） |
+
+報告的重現全部成立（修正前：`{"lone":"\ud800","lone":"ok"}` Rust exit 1 拒送、Python 送出 `{"lone":"ok"}`；`[z-a\` Rust 回 `bad character range z-a at position 1`、Python 回 `bad escape (end of pattern) at position 4`）。
+
+## 不成立主張
+
+無。
+
+## 範圍外的新觀察（未處理，請編排者裁決）
+
+### pyre：與結尾反斜線無關的既有錯誤訊息差異
+
+隨機差分（CPython 3.12.3 `re.compile` 對 Rust `pyre::compile`，種子 5～12 × 字元類別／一般各 5000 例，共 80,000 例；產生器刻意偏重錯誤構造）中，
+結尾反斜線以外仍有 17,389 例不一致。這些樣式在修正前的 binary（`2a65438`）同樣不一致，不是本輪引入；本輪修正前後，不一致的樣式集合相同（無新增、無減少）。主要類別：
+
+| 例數 | Python 3.12.3 | Rust | 例 |
+|---|---|---|---|
+| 11,107 | `incomplete escape \x4`／`\u00`（已讀到的跳脫原文） | `incomplete escape \x`（固定文字） | `\x4`、`[\u00[` |
+| 2,688 | `unknown extension ?<\Z`、`?Px`（含完整 token） | `unknown extension ?<\`、`?P` | `(?<\Z`、`(?Px` |
+| 2,120 | `missing }, unterminated name`／`missing character name` | `missing } in character name` | `\N{`、`[\N{]` |
+| 440＋79 | `missing ), unterminated name`／`missing group name` | `missing ), unterminated name reference` | `(?P=` |
+| 427＋76 | `missing >, unterminated name`（位置為名稱長度）／`missing group name` | 同訊息但位置 0／`missing >, unterminated name` | `(?P<\1A`、`(?P<` |
+| 238 | `unexpected end of pattern` | `unknown extension ?` | `(?` |
+| 151 | `bad character in group name '…'` | `unknown group name '…'` | `(?P=,` |
+| 22 | `cannot refer to an open group` | `cannot refer to group defined in the same lookbehind subpattern` | `(?<=(?(1)` |
+
+影響面同 S1X-b-1（`profile test` 的 `checks.<regex>.error` 文字；`ok`／錯誤的判定一致，僅訊息文字或位置不同）。修法分散在各跳脫與群組擴充的讀取點，超出本輪裁決範圍，建議另立 finding。
+
+## OWNER-BATCH
+
+無。兩項修正都沒有改 SC／BC／DF、凍結鎖或 oracle 語意；`pyre.tsv` 只新增 50 列（語料第七區 25 筆），既有列逐位元組不變，`pyre.limits.json` 不變；RPC-H-03 回應端行為不變。

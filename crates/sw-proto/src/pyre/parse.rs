@@ -173,7 +173,16 @@ pub(super) fn parse(pattern: &str, flags: PyFlags) -> Result<ParsedPattern, Comp
         lookbehind_groups: None,
         lookbehind_checks: Vec::new(),
     };
-    let expression = parser.parse_alternation(false, 0, 0)?;
+    let parsed = parser.parse_alternation(false, 0, 0);
+    // CPython tokenizer 每取走一個 token 即預讀下一個；樣式以單獨 `\` 結尾時，取走倒數第二個 token
+    // 的當下就拋 `bad escape (end of pattern)`，優先於該 token 之後才會判定的任何錯誤（含解析成功後的檢查）。
+    // 解析器的位置已到達結尾反斜線（或解析完成）即表示 CPython 已預讀到它。
+    if let Some(slash) = parser.trailing_lone_backslash() {
+        if parsed.is_ok() || parser.pos >= slash {
+            return Err(parser.error("bad escape (end of pattern)", Some(slash)));
+        }
+    }
+    let expression = parsed?;
     if parser.pos < parser.chars.len() {
         return Err(parser.error("unbalanced parenthesis", Some(parser.pos)));
     }
@@ -271,13 +280,19 @@ impl Parser<'_> {
             if is_simple_repeat(ch) || ch == '{' {
                 let repeat_start = self.pos;
                 if let Some((min, max, mode)) = self.parse_repeat()? {
+                    // CPython 先判定可否重複，之後才取走 `?`／`+` 修飾字元（單一字元）；
+                    // 報錯時位置退回修飾字元之前，結尾反斜線的預讀判定才與 CPython 一致。
+                    let modifier = usize::from(mode != RepeatMode::Greedy);
                     let Some(previous) = items.last() else {
+                        self.pos -= modifier;
                         return Err(self.error("nothing to repeat", Some(repeat_start)));
                     };
                     if previous_was_repeat || matches!(previous, Expr::Repeat { .. }) {
+                        self.pos -= modifier;
                         return Err(self.error("multiple repeat", Some(repeat_start)));
                     }
                     if matches!(previous, Expr::Anchor(_) | Expr::WordBoundary { .. }) {
+                        self.pos -= modifier;
                         return Err(self.error("nothing to repeat", Some(repeat_start)));
                     }
                     let atom = items.pop().expect("已確認存在前一項");
@@ -403,6 +418,7 @@ impl Parser<'_> {
                     }
                     _ => {
                         let suffix = self.peek().unwrap_or('\0');
+                        self.consume_token();
                         let ext = format!("?<{suffix}");
                         Err(self.error(&format!("unknown extension {ext}"), Some(open + 1)))
                     }
@@ -411,7 +427,10 @@ impl Parser<'_> {
             'a' | 'i' | 'L' | 'm' | 's' | 't' | 'u' | 'x' | '-' => {
                 self.parse_flags_group(open, nested_depth)
             }
-            _ => Err(self.error(&format!("unknown extension ?{kind}"), Some(open + 1))),
+            _ => {
+                self.consume_token();
+                Err(self.error(&format!("unknown extension ?{kind}"), Some(open + 1)))
+            }
         }
     }
 
@@ -485,6 +504,7 @@ impl Parser<'_> {
                     return Err(self.error("missing >, unterminated name", Some(open)));
                 }
                 if name.is_empty() {
+                    self.pos += 1; // CPython getuntil 取走 `>` 後才報錯
                     return Err(self.error("missing group name", Some(name_pos)));
                 }
                 self.pos += 1;
@@ -506,7 +526,10 @@ impl Parser<'_> {
                 }
                 Ok((Expr::Backreference { index }, true))
             }
-            _ => Err(self.error("unknown extension ?P", Some(open + 1))),
+            _ => {
+                self.consume_token();
+                Err(self.error("unknown extension ?P", Some(open + 1)))
+            }
         }
     }
 
@@ -588,7 +611,9 @@ impl Parser<'_> {
                     } else {
                         "missing -, : or )"
                     };
-                    return Err(self.error(message, Some(self.pos.saturating_sub(1))));
+                    let at = self.pos.saturating_sub(1);
+                    self.finish_backslash_token(delimiter);
+                    return Err(self.error(message, Some(at)));
                 };
                 add |= bit;
                 if bit & (FLAG_A | FLAG_L | FLAG_U) != 0 && add & (FLAG_A | FLAG_L | FLAG_U) != bit
@@ -640,7 +665,9 @@ impl Parser<'_> {
                     } else {
                         "missing flag"
                     };
-                    return Err(self.error(message, Some(self.pos.saturating_sub(1))));
+                    let at = self.pos.saturating_sub(1);
+                    self.finish_backslash_token(flag);
+                    return Err(self.error(message, Some(at)));
                 };
                 if bit & (FLAG_A | FLAG_L | FLAG_U) != 0 {
                     return Err(self.error(
@@ -877,13 +904,12 @@ impl Parser<'_> {
 
     fn parse_hex_escape(&mut self, slash: usize, digits: usize) -> Result<char, CompileError> {
         let mut value = 0u32;
+        // CPython `getwhile` 只取走符合的數字；不符的字元留在預讀位置，不算取走。
         for _ in 0..digits {
-            let Some(ch) = self.next() else {
+            let Some(d) = self.peek().and_then(|ch| ch.to_digit(16)) else {
                 return Err(self.error("incomplete escape \\x", Some(slash)));
             };
-            let Some(d) = ch.to_digit(16) else {
-                return Err(self.error("incomplete escape \\x", Some(slash)));
-            };
+            self.pos += 1;
             value = value * 16 + d;
         }
         if (0xd800..=0xdfff).contains(&value) {
@@ -1005,6 +1031,8 @@ impl Parser<'_> {
         if self.chars.get(i) != Some(&'}') || (min_digits.is_empty() && !is_range) {
             return Ok(None);
         }
+        // CPython 取走 `}` 後才轉換次數並檢查大小。
+        self.pos = i + 1;
 
         let parse_count = |digits: &[char]| -> Result<usize, CompileError> {
             let text: String = digits.iter().collect();
@@ -1028,7 +1056,6 @@ impl Parser<'_> {
         if max.is_some_and(|max| min > max) {
             return Err(self.error("min repeat greater than max repeat", Some(start + 1)));
         }
-        self.pos = i + 1;
         Ok(Some((min, max)))
     }
 
@@ -1051,6 +1078,12 @@ impl Parser<'_> {
         }
     }
 
+    /// 樣式結尾為單獨的 `\`（tokenizer 自頭切分時落單）時回傳其位置。
+    fn trailing_lone_backslash(&self) -> Option<usize> {
+        let run = self.chars.iter().rev().take_while(|ch| **ch == '\\').count();
+        (run % 2 == 1).then(|| self.chars.len() - 1)
+    }
+
     fn error(&self, msg: &str, pos: Option<usize>) -> CompileError {
         re_error(msg, pos, self.pattern)
     }
@@ -1063,6 +1096,20 @@ impl Parser<'_> {
         let ch = self.peek()?;
         self.pos += 1;
         Some(ch)
+    }
+
+    /// 取走一個 CPython tokenizer token：`\` 連同其後一個字元，否則單一字元。
+    fn consume_token(&mut self) {
+        if let Some(ch) = self.next() {
+            self.finish_backslash_token(ch);
+        }
+    }
+
+    /// 剛取走的字元 `ch` 若為 `\`，連同其後一個字元一起取走（CPython 的跳脫 token 為兩個字元）。
+    fn finish_backslash_token(&mut self, ch: char) {
+        if ch == '\\' {
+            self.next();
+        }
     }
 
     fn read_until(&mut self, end: char) -> String {
