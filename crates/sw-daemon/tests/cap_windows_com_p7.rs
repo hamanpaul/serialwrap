@@ -31,10 +31,18 @@ const PROMPT: &str = "root@prplOS:/# ";
 const SECRET: &str = "pw";
 const BANNER: &[u8] = b"\r\nU-Boot 2024.01\r\nHit any key to stop autoboot:  3 \r\n";
 
-/// COM pair（cap 案例只在明確要求 ignored 測試時執行；缺變數即失敗而非 PASS）。
-fn pair() -> (String, String) {
-    com_peer::com_pair()
-        .expect("cap:windows_com 需設定 SW_TEST_COM_PAIR=COMa:COMb（擁有者 host 為 COM20:COM21）")
+/// 三案共用同一 COM pair（peer 端以 share_mode 0 獨占開啟）：整個測試生命週期持有此鎖，避免 cargo 測試平行
+/// 執行時互搶 COMb（審查 P7-cd7acf0-6）。
+static COM_PAIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// COM pair（cap 案例只在明確要求 ignored 測試時執行；缺變數即失敗而非 PASS）＋整案持有的互斥鎖。
+fn pair() -> (std::sync::MutexGuard<'static, ()>, String, String) {
+    let guard = COM_PAIR_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (a, b) = com_peer::com_pair()
+        .expect("cap:windows_com 需設定 SW_TEST_COM_PAIR=COMa:COMb（擁有者 host 為 COM20:COM21）");
+    (guard, a, b)
 }
 
 fn on_windows() -> bool {
@@ -227,17 +235,48 @@ fn assert_peer_matches_wal(peer: &[u8], wal: &[u8]) {
     );
     let mut expect = peer[..hits[0]].to_vec();
     expect.extend_from_slice(&peer[hits[0] + secret_line.len()..]);
-    assert_eq!(
+    // 逐位元組比對；lossy 字串只用於失敗訊息（審查 P7-cd7acf0-2：`\xff` 與 `\xfe` 經 lossy 皆為 U+FFFD）。
+    assert!(
+        expect == wal,
+        "peer bytes 與 WAL TX 不一致：peer {:?} / wal {:?}",
         String::from_utf8_lossy(&expect),
-        String::from_utf8_lossy(wal),
-        "peer bytes 與 WAL TX 不一致"
+        String::from_utf8_lossy(wal)
     );
+}
+
+/// quiet 零 TX 視窗：自 **送出 banner 之前** 的取樣點起，peer 不得收到任何 byte（審查 P7-cd7acf0-3：起點若取在 quiet
+/// 狀態可見之後，會漏掉「收到 banner 後、發布 quiet 前」送出的 byte）。
+fn assert_zero_tx_since_banner(received: &[u8], mark_before_banner: usize) {
+    let after = &received[mark_before_banner.min(received.len())..];
+    assert!(
+        after.is_empty(),
+        "banner 之後 peer 必須收到 0 byte，實際 {:?}",
+        String::from_utf8_lossy(after)
+    );
+}
+
+#[test]
+fn peer_wal_oracle_compares_raw_bytes() {
+    assert_peer_matches_wal(b"root\npw\nls\n", b"root\nls\n");
+    let mismatch = std::panic::catch_unwind(|| assert_peer_matches_wal(b"pw\n\xff", b"\xfe"));
+    assert!(mismatch.is_err(), "不同的原始 bytes（\\xff≠\\xfe）不得通過");
+}
+
+#[test]
+fn zero_tx_window_starts_before_banner() {
+    let before: &[u8] = b"root\npw\necho __READY__1\n";
+    // 正確實作：banner 前的登入與 probe bytes 不計入。
+    assert_zero_tx_since_banner(before, before.len());
+    // 錯誤實作：收到 banner 後、發布 quiet 狀態前送出一個 `\n`——以 banner 前的取樣點必須攔下。
+    let leaked = [before, b"\n"].concat();
+    let caught = std::panic::catch_unwind(|| assert_zero_tx_since_banner(&leaked, before.len()));
+    assert!(caught.is_err(), "banner 與 quiet 可見之間的 TX 必須被計入");
 }
 
 #[test]
 #[ignore = "cap:windows_com"]
 fn cap_windows_com__p7_login_ready() {
-    let (a, b) = pair();
+    let (_com, a, b) = pair();
     let peer = ComPeer::open(&b, prpl_reactions());
     let rig = Rig::start(&a, &[]);
     rig.wait_ready();
@@ -257,15 +296,15 @@ fn cap_windows_com__p7_login_ready() {
 #[test]
 #[ignore = "cap:windows_com"]
 fn cap_windows_com__p7_quiet_banner_zero_tx() {
-    let (a, b) = pair();
+    let (_com, a, b) = pair();
     let peer = ComPeer::open(&b, prpl_reactions());
     let rig = Rig::start(&a, &[]);
     rig.wait_ready();
+    let mark = peer.mark();
     peer.emit(BANNER);
     rig.wait(Duration::from_secs(10), "boot quiet 生效", |r| {
         !r.state()["boot_quiet_remaining_s"].is_null()
     });
-    let mark = peer.mark();
     let sub = rig.call(
         "command.submit",
         r#"{"selector":"COM0","cmd":"echo X","source":"agent:cap"}"#,
@@ -273,18 +312,14 @@ fn cap_windows_com__p7_quiet_banner_zero_tx() {
     assert_eq!(sub["ok"], false, "{sub:?}");
     assert_eq!(sub["error_code"], "AUTOBOOT_QUIET", "{sub:?}");
     std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(
-        peer.received_since(mark),
-        b"",
-        "banner 之後 peer 必須收到 0 byte"
-    );
+    assert_zero_tx_since_banner(&peer.received(), mark);
     assert_peer_matches_wal(&peer.received(), &rig.wal_tx());
 }
 
 #[test]
 #[ignore = "cap:windows_com"]
 fn cap_windows_com__p7_event_fire() {
-    let (a, b) = pair();
+    let (_com, a, b) = pair();
     let peer = ComPeer::open(&b, prpl_reactions());
     let rig = Rig::start(&a, &[]);
     let marker = rig.env.root.join("ev-fired");

@@ -114,27 +114,27 @@ win_l1() {  # win_l1 <dir>：取 win-test 最新報告的 l1_results
   return 0
 }
 mkdir -p "$RUN/win-non-com" "$RUN/win-com"
+# 兩列的 win-test.sh 參數（tests/test_p7_gate_report.py 以 `--dry-run` 核對可被 win-test.sh 解析）。
+WIN_NONCOM_ARGS=(--package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --skip cap_)
+WIN_COM_ARGS=(--caps windows_com --package sw-daemon -- --test cap_windows_com_p7 --features test-fakes)
 if [[ " ${CAPS[*]} " == *" windows_native "* ]]; then
   echo "caps_missing: windows_native（非 WSL interop 環境；LOCAL-WINDOWS-TODO）" >"$RUN/logs/win-non-com.log"
   record_existing "win-test.sh (non-COM)" - "$RUN/logs/win-non-com.log" '["scripts/rust/win-test.sh"]'
 else
-  exec_logged win-non-com bash scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon \
-    -- --features test-fakes -- --skip cap_
+  exec_logged win-non-com bash scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}"
   win_l1 "$RUN/win-non-com"
   record_existing "win-test.sh (non-COM)" "$LAST_RC" "$RUN/logs/win-non-com.log" \
-    '["scripts/rust/win-test.sh","--package","sw-pal","--package","sw-core","--package","sw-daemon"]' \
-    --l1 "$RUN/win-non-com/l1-results.json" --platform-windows
+    "$(argv_json scripts/rust/win-test.sh "${WIN_NONCOM_ARGS[@]}")" --l1 "$RUN/win-non-com/l1-results.json" --platform-windows
 fi
 if [[ " ${CAPS[*]} " == *" windows_com "* ]]; then
   echo "caps_missing: windows_com（未設 SW_TEST_COM_PAIR 或無 Windows；B-06 擁有者 host COM20:COM21）" >"$RUN/logs/win-com.log"
   record_existing "win-test.sh --caps windows_com" - "$RUN/logs/win-com.log" '["scripts/rust/win-test.sh","--caps","windows_com"]'
 else
-  exec_logged win-com bash scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7 \
-    -- --features test-fakes
+  # win-test.sh 只在 `--` 之後接受 cargo 參數（審查 P7-cd7acf0-5）。
+  exec_logged win-com bash scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}"
   win_l1 "$RUN/win-com"
   record_existing "win-test.sh --caps windows_com" "$LAST_RC" "$RUN/logs/win-com.log" \
-    '["scripts/rust/win-test.sh","--caps","windows_com","--package","sw-daemon","--test","cap_windows_com_p7"]' \
-    --l1 "$RUN/win-com/l1-results.json" --platform-windows
+    "$(argv_json scripts/rust/win-test.sh "${WIN_COM_ARGS[@]}")" --l1 "$RUN/win-com/l1-results.json" --platform-windows
 fi
 
 # 5～12. 黑箱 A/B、先前切片必要回歸、func-test 兩案（run_p7_ab.sh 一次產出，逐階段成列）。

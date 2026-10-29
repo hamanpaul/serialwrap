@@ -212,6 +212,7 @@ def _junit(path, nodeids, drop=(), fail=()):
 
 
 def test_evidence_insufficient_is_not_pass(tmp_path):
+    import json
     import subprocess
     import sys
     from pathlib import Path
@@ -229,11 +230,17 @@ def test_evidence_insufficient_is_not_pass(tmp_path):
     collected.write_text("\n".join(nodes + [extra]) + "\n", encoding="utf-8")
     full = tmp_path / "full.xml"
     _junit(full, nodes + [extra])
+    # 必要節點取自預先凍結的 L1 鎖集合（審查 P7-c5f0fc9-5 第二輪），以合成鎖提供（A＝B＝合成節點）。
+    lock = tmp_path / "l1.json"
+    frozen = {"nodeids": nodes + [extra]}
+    lock.write_text(json.dumps({"sets": {"p7_gate:contract-blackbox-p7-a": {"linux": frozen},
+                                         "p7_gate:contract-blackbox-p7-b": {"linux": frozen}}}), encoding="utf-8")
 
-    def run(a, b, rc_b="0"):
+    def run(a, b, rc_b="0", col=collected):
         out = tmp_path / "ab.md"
         r = subprocess.run([sys.executable, str(script), "--run-id", "t", "--junit-a", str(a), "--junit-b", str(b),
-                            "--collected", str(collected), "--rc-a", "0", "--rc-b", rc_b, "--out", str(out)],
+                            "--collected", str(col), "--rc-a", "0", "--rc-b", rc_b, "--out", str(out),
+                            "--l1-lock", str(lock)],
                            capture_output=True, text=True)
         return r.returncode, out.read_text(encoding="utf-8")
 
@@ -251,6 +258,14 @@ def test_evidence_insufficient_is_not_pass(tmp_path):
     _junit(param, nodes + [extra], drop={pm["source_ref"] + "[prpl]"})
     rc, md = run(full, param)
     assert rc == 3 and f"| {pm['case_id']} | PASS | INCOMPLETE |" in md, md
+    # 審查 P7-c5f0fc9-5 第二輪重播：collect-only 與 junit 都只有 [shell]（缺凍結的 [prpl]／[bcm]）→ 不得 PASS
+    shell_only = [n for n in nodes + [extra] if not (n.startswith(pm["source_ref"] + "[") and not n.endswith("[shell]"))]
+    col2 = tmp_path / "collected-shell.txt"
+    col2.write_text("\n".join(shell_only) + "\n", encoding="utf-8")
+    only = tmp_path / "shell-only.xml"
+    _junit(only, shell_only)
+    rc, md = run(only, only, col=col2)
+    assert rc == 3 and f"| {pm['case_id']} | INCOMPLETE | INCOMPLETE |" in md, md
     bad = tmp_path / "unmapped-fail.xml"                                 # 未映射節點失敗必須阻擋（審查 P7-c5f0fc9-4）
     _junit(bad, nodes + [extra], fail={extra})
     rc, md = run(full, bad, rc_b="1")

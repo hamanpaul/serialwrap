@@ -89,6 +89,9 @@ PARITY_SETS: tuple[str, ...] = ("p7_gate:py_parity", "p7_gate:py_parity_recover"
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# verify 必須核對的受測 artifact（Rust CLI 與 daemon；路徑為 repo 相對，檔名可帶 `.exe`）：缺任一 → 驗證失敗
+#（審查 P7-c5f0fc9-3：`artifacts:{}` 不得通過）。
+REQUIRED_ARTIFACTS: tuple[str, ...] = ("serialwrap", "serialwrapd")
 
 
 def slug(name: str) -> str:
@@ -293,6 +296,10 @@ def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = No
     head = current_head()
     if not data.get("git_head") or data.get("git_head") != head:
         problems.append(f"results.json git_head {data.get('git_head')} 與目前 HEAD {head} 不符")
+    names = {Path(p).name.removesuffix(".exe") for p in (data.get("artifacts") or {})}
+    for need in REQUIRED_ARTIFACTS:
+        if need not in names:
+            problems.append(f"缺必要 artifact：{need}")
     for path, want in (data.get("artifacts") or {}).items():
         got = _sha256(_resolve(ROOT, path))
         if got is None or got != want:

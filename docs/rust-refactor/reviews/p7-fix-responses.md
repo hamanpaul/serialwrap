@@ -309,3 +309,29 @@ BLOCKED-UPSTREAM P7-BU-7（後者為本輪補列後新增的同因 FAIL）。OD-
 | P7-c5f0fc9-4 | High | 未映射測試（如 `test_rejected_requests_zero_tx_credentials_unresolved`）的 FAIL 被忽略、shell 丟棄 pytest 結束碼 | **fixed**：整份 junit 的 failure／error 一律 FAIL（列出節點）；`run_p7_ab.sh` 傳 `--rc-a/--rc-b`，缺或非 0／1、或 rc=1 卻無失敗節點 → INCOMPLETE。回歸擴充 `test_p7_invariants.py::test_evidence_insufficient_is_not_pass`（修前紅） |
 | P7-c5f0fc9-5 | High | 參數化案例只要求現存列通過（缺 `[prpl]`／`[bcm]` 仍 PASS） | **fixed**：必要節點改以同 commit 的 `pytest --collect-only -q`（完整 nodeid 含參數）為準，逐節點恰一次；缺漏／重複 → INCOMPLETE。回歸同上（缺 `test_platform_matrix[prpl]` → INCOMPLETE）。以新規則重判 r11-261029 實跑 junit，結果與已入庫紀錄相同 |
 | P7-c5f0fc9-6 | Medium | 預設輸出目錄不存在 | 已於 29aaa7b 修正（建立 OUT 父目錄；`docs/rust-refactor/evidence/` 已建立） |
+
+## 第 12 輪（第六輪雲端）：merge P5（b93849e）、rulings/p7.md 第 5 輪案例設計修正、p7-cloud/7bb9cfd_cd7acf0-sol
+
+### rulings/p7.md：第 5 輪「案例設計修正」
+
+逐列登記於 `docs/rust-refactor/slice23-chg-register.md`（CHG-S23-ATTACHED-PATH-01、-REPROBE-ORDER-01、-SC34-NONCE-01、
+-CTRLC-FIELDS-01、-STALL-OBS-01、-NOISE-LINE-01、-L15-PATH-01、-REPLAY-BOUNDARY-01），每列附 `scripts/rust/p7_chg_probe.py`
+的 Python 基線實測輸出與受影響案例 Python 基線 PASS（14 passed）。八列皆不改對外欄位、錯誤碼或狀態語意，無改列 OWNER-BATCH 者。
+
+### p7-cloud/7bb9cfd_cd7acf0（Codex sol，incr）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| P7-9065f14-1 | Medium（A，累計 3 輪） | slice22 evidence map 多 `l15-delayed-reply` | **NEEDS-RULING（收斂規則 §4：累計 3 輪未收斂即升級）**：檔案屬 P6，本分支依指示不 merge P6、不改他 Phase 檔；列 OWNER-BATCH／BLOCKED-UPSTREAM P7-BU-10 |
+| P7-c5f0fc9-3 | Medium（A，2 輪） | verify 未核對必要 artifact 集合（`artifacts:{}` 通過） | **fixed**：`REQUIRED_ARTIFACTS`（serialwrap、serialwrapd）缺任一 → verify 回報；回歸 `test_verify_requires_cli_and_daemon_artifacts`（修前紅），既有兩支 verify 測試 fixture 補上必要 artifact（斷言不變） |
+| P7-c5f0fc9-5 | High（A，2 輪） | A/B 必要節點採信當輪 collected | **fixed**：必要節點改取 L1 鎖預先凍結的 `p7_gate:contract-blackbox-p7-a`／`-p7-b`（61edbd8 登記）；collect-only 只作交叉核對（不同 → INCOMPLETE）；junit 含凍結集合以外節點 → INCOMPLETE。回歸擴充 `test_evidence_insufficient_is_not_pass`（collect＋junit 皆只有 `[shell]` → INCOMPLETE，修前 PASS） |
+| P7-7bb9cfd-1 | Medium（A，1 輪） | repo 外證據只記 basename | **fixed**：`--run-dir` 內記 `$RUN_DIR/<相對>`、其外記 `$EXTERNAL/<完整路徑>`（不留主機絕對前綴）；表頭另記 run_dir。回歸 `test_external_evidence_path_is_locatable` |
+| P7-cd7acf0-1 | High | 回歸階段與 coverage 未核對完整必要節點 | **fixed**：`judge_phase(d, frozen)` 與 `p7_case_coverage` 皆以 L1 鎖凍結集合逐節點核對（恰一次、拒絕缺漏／重複／替代節點）；回歸 `test_regression_phase_status`（無關節點、只 `[shell]`、額外節點、無凍結集合）、`test_regression_phase_duplicate_node_is_not_pass`、`test_coverage_requires_pass_or_numbered_owner_block` 補兩個重播（修前紅） |
+| P7-cd7acf0-2 | High | wire／WAL oracle 以 lossy 字串比較 | **fixed**：逐位元組比較，lossy 只供訊息；回歸 `cap_windows_com_p7::peer_wal_oracle_compares_raw_bytes`（非 ignored；`pw\n\xff` vs `\xfe` 必紅，以 lossy 突變驗證紅） |
+| P7-cd7acf0-3 | High | quiet 零 TX 取樣起點在 quiet 可見之後 | **fixed**：`peer.mark()` 移到 `peer.emit(BANNER)` 之前，視窗判定抽成 `assert_zero_tx_since_banner`；回歸 `zero_tx_window_starts_before_banner`（「發布 quiet 前送一 byte」必紅，以晚取樣突變驗證紅）。原生端到端仍屬 LOCAL-WINDOWS-TODO P7-LW-8 |
+| P7-cd7acf0-4 | Medium | gate 測試列缺 `p7_gate:*` 集合 | **fixed `61edbd8`**：以 `regen_lock --l1-add-only` 登記 p7-a、p7-b、slice21-b、l15-slice21-b、l15-slice23-b、python3-m-pytest-q-tests；`contract-blackbox-slice22-b`（P6 檔案不在本分支）與兩個 Windows 列（P7-LW-9）未登記，報告照實 INCOMPLETE／BLOCKED-OWNER |
+| P7-cd7acf0-5 | Medium | Windows COM argv 解析失敗 | **fixed**：兩列參數改為 `WIN_NONCOM_ARGS`／`WIN_COM_ARGS`（cargo 參數全在 `--` 之後）；回歸 `tests/test_p7_gate_win_argv.py`（以 `win-test.sh --dry-run` 解析，舊 argv 回 rc 2「未知參數 --test」） |
+| P7-cd7acf0-6 | Medium | 三案平行獨占同一 COM pair | **fixed**：`COM_PAIR_LOCK` 於整案生命週期持有（`pair()` 回傳 guard）；原生並行驗證列 P7-LW-8 |
+
+紅燈證據：以 HEAD（61edbd8）版 `p7_ab_report.py`／`p7_case_coverage.py`／`p7_gate_report.py`／`p7_gate.sh` 執行新版測試
+20 failed，修後 41 passed；cap_windows_com_p7 兩支 oracle 測試以突變（lossy 比較、晚取樣）各自轉紅。

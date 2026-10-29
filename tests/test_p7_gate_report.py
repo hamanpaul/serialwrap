@@ -62,10 +62,22 @@ def test_owner_items_blocked_without_evidence_and_pass_with_verified_evidence(tm
     assert "| B-02 | BLOCKED-OWNER |" in md
 
 
+def _artifacts(tmp):
+    """必要 artifact（serialwrap／serialwrapd）的合成檔與正確 sha256。"""
+    import hashlib
+    out = {}
+    for name in g.REQUIRED_ARTIFACTS:
+        f = tmp / name
+        f.write_bytes(name.encode())
+        out[str(f)] = hashlib.sha256(name.encode()).hexdigest()
+    return out
+
+
 def test_verify_detects_tampering(tmp_path):
     d = _results(tmp_path, [_row("cargo test --workspace")])
     data = json.loads((d / "results.json").read_text(encoding="utf-8"))
     data["git_head"] = g.current_head()          # verify 核對目前 HEAD（P7-c5f0fc9-3）
+    data["artifacts"] = _artifacts(tmp_path)     # verify 要求必要 artifact（P7-c5f0fc9-3 第二輪）
     (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md = tmp_path / "gate.md"
     md.write_text(g.build_report(d), encoding="utf-8")
@@ -191,15 +203,16 @@ def test_verify_checks_head_and_artifacts(tmp_path):
     d = _results(tmp_path, [_row("cargo test --workspace")])
     data = json.loads((d / "results.json").read_text(encoding="utf-8"))
     data["git_head"] = g.current_head()
-    art = tmp_path / "bin"
+    arts = _artifacts(tmp_path)
+    art = tmp_path / "serialwrapd"
     art.write_bytes(b"artifact")
-    data["artifacts"] = {str(art): "0" * 64}
+    data["artifacts"] = {**arts, str(art): "0" * 64}
     (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md = tmp_path / "gate.md"
     md.write_text(g.build_report(d), encoding="utf-8")
     assert any("artifact" in p for p in g.verify_report(md, d))
     import hashlib
-    data["artifacts"] = {str(art): hashlib.sha256(b"artifact").hexdigest()}
+    data["artifacts"] = {**arts, str(art): hashlib.sha256(b"artifact").hexdigest()}
     (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md.write_text(g.build_report(d), encoding="utf-8")
     assert g.verify_report(md, d) == []
@@ -232,3 +245,19 @@ def test_init_and_record_only_record_identity_and_counts(tmp_path):
     assert [r["rc"] for r in rows] == [0]
     nt = g.record_row(run, name="policy_check", rc=0, log=log, argv=["p"], started_at="t0", ended_at="t1")
     assert "required_set" not in nt and "test_counts" not in nt
+
+
+def test_verify_requires_cli_and_daemon_artifacts(tmp_path):
+    """審查 P7-c5f0fc9-3（第二輪）：`artifacts:{}` 或缺 CLI／daemon 任一者，verify 必須回報不一致。"""
+    d = _results(tmp_path, [_row("cargo test --workspace")])
+    data = json.loads((d / "results.json").read_text(encoding="utf-8"))
+    data["git_head"] = g.current_head()
+    md = tmp_path / "gate.md"
+    for arts, missing in (({}, {"serialwrap", "serialwrapd"}),
+                          ({k: v for k, v in _artifacts(tmp_path).items() if k.endswith("serialwrapd")}, {"serialwrap"})):
+        data["artifacts"] = arts
+        (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
+        md.write_text(g.build_report(d), encoding="utf-8")
+        problems = g.verify_report(md, d)
+        assert {p.split("：", 1)[1] for p in problems if p.startswith("缺必要 artifact")} == missing, problems
+
