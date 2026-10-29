@@ -6635,11 +6635,13 @@ class SessionManager:
                 except BaseException:
                     # 送出拋例外或被拒：關閉剛開的 lease，避免遺留 lease 讓後續命令
                     # 拿到 SESSION_INTERACTIVE_BUSY 直到逾時；例外交由 execute_command 映射。
+                    close_post = _PostCloseAction()
                     with self._lock:
-                        _, close_post = self._close_interactive_locked(
-                            session,
-                            interactive_id=lease.interactive_id,
-                        )
+                        if session.interactive_session_id == lease.interactive_id:
+                            _, close_post = self._close_interactive_locked(
+                                session,
+                                interactive_id=lease.interactive_id,
+                            )
                     close_post.execute()
                     raise
             return {

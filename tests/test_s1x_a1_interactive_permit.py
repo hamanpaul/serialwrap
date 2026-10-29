@@ -145,3 +145,23 @@ def test_rejected_interactive_send_closes_opened_lease(tmp_path: Path) -> None:
     assert nxt.get("error_code") != "SESSION_INTERACTIVE_BUSY", nxt
     assert nxt["ok"] is True, nxt
     assert b"".join(port.writes) == b"top\n"
+
+
+def test_rejected_send_does_not_close_lease_replaced_meanwhile(tmp_path: Path) -> None:
+    """送出被拒時，若 session 的 lease 已不是本命令所開（期間被收回／更換），不得誤關現行 lease。"""
+    port = FakePort()
+    mgr, s, bridge = _ready(tmp_path, port)
+    original_send = mgr._send_command_with_permit
+
+    def swap_then_reject(*args: Any, **kwargs: Any) -> Any:
+        with mgr._lock:
+            s.interactive_session_id = "other-lease"
+        bridge._tx_frozen = True
+        return original_send(*args, **kwargs)
+
+    mgr._send_command_with_permit = swap_then_reject  # type: ignore[method-assign]
+
+    result = mgr.execute_command(s.session_id, "top", "agent:test", "cmd-x1", mode="interactive")
+
+    assert result["ok"] is False, result
+    assert s.interactive_session_id == "other-lease"
