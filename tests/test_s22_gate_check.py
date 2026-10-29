@@ -378,36 +378,53 @@ def test_judge_tests_duplicate_in_one_report_is_insufficient_unit() -> None:
     assert mod.judge_tests([ref], {nid: dup[:1]}, None)[0] == "PASS"
 
 
-def test_process_evidence_row_requires_report_section_with_red_and_green(tmp_path: Path) -> None:
-    """rulings/p6.md OWNER-BATCH #4（#185 證據形式）：流程項不需可執行測試，證據為 Slice 2.2 出口報告中引用 T0 commit
-    的紅燈紀錄與終態綠燈段落。`PROCESS-EVIDENCE` 只限逐名核准的承接編號（#185）；報告缺檔、缺 `## #185` 段落、
-    段落內缺 commit、缺紅燈或綠燈紀錄皆 INSUFFICIENT；其他承接編號使用此狀態一律 INSUFFICIENT。"""
+def _process_report(red: dict | None = None, green: dict | None = None, heading: str = "## #185 T0 單獨紅燈") -> str:
+    red = {"commit": "ae33e28", "command": "python3 -m pytest -q tests/a.py", "exit_code": 1, "passed": 9, "failed": 4,
+           "failed_tests": ["tests/a.py::test_x"]} if red is None else red
+    green = {"commit": "5ade76c", "command": "python3 -m pytest -q tests/a.py", "exit_code": 0, "passed": 13,
+             "failed": 0} if green is None else green
+    block = json.dumps({"red": red, "green": green}, ensure_ascii=False, indent=1)
+    return f"# 出口報告\n\n{heading}\n\n說明文字：紅燈、綠燈。\n\n```json process-evidence\n{block}\n```\n\n## 其他\n"
+
+
+def test_process_evidence_row_requires_structured_red_and_green(tmp_path: Path) -> None:
+    """rulings/p6.md OWNER-BATCH #4（#185 證據形式）＋sol P6-b64dad9-1：流程項以出口報告 `## #185` 段落內的
+    `json process-evidence` 區塊為證據（不以說明文字關鍵字判定）。紅燈須為核准的 commit、非零退出、failed>0 且列出失敗測試；
+    綠燈須為另一 commit、同一命令、退出碼 0、failed==0、passed>0。缺區塊、缺綠燈、綠燈失敗、缺檔、非逐名核准者皆 INSUFFICIENT。"""
     doc = PARITY_DOC.replace("| 179 | F1 | Medium | gate | 07 Task 1 |",
                              "| 179 | F1 | Medium | gate | 07 Task 1 |\n| 185 | F3 | Medium | T0 紅燈 | 07 Task 0 |")
     report = tmp_path / "exit-report.md"
-    good = ("# Slice 2.2 出口報告\n\n## #185 T0 單獨紅燈\n\nT0 commit `ae33e28` 單獨執行：紅燈 4 failed。\n"
-            "終態 HEAD：綠燈 13 passed。\n\n## 其他\n")
-    report.write_text(good, encoding="utf-8")
     emap = _emap()
     emap["parity_rows"]["#185"] = {"status": "PROCESS-EVIDENCE", "report": str(report), "commit": "ae33e28"}
-    rc, out = _run(tmp_path / "a", _good_reports(), emap=emap, parity_doc=doc)
-    row = next(r for r in out["parity_rows"] if r["row"] == "#185")
-    assert row["verdict"] == "PASS", row
-    for bad in (
-        good.replace("## #185", "## #186"),                       # 缺段落
-        good.replace("`ae33e28`", "`deadbee`"),                  # 段落內缺 commit
-        good.replace("紅燈", "結果"),                              # 缺紅燈
-        good.replace("綠燈", "結果"),                              # 缺綠燈
-        good.replace("終態 HEAD：綠燈 13 passed。\n", "") + "綠燈 在別段\n",  # 綠燈不在 #185 段落內
-    ):
-        report.write_text(bad, encoding="utf-8")
-        rc, out = _run(tmp_path / "b", _good_reports(), emap=emap, parity_doc=doc)
-        row = next(r for r in out["parity_rows"] if r["row"] == "#185")
-        assert row["verdict"] == "INSUFFICIENT", (bad, row)
-        assert rc == 1
-    report.write_text(good, encoding="utf-8")
+
+    def verdict(text: str, sub: str) -> str:
+        report.write_text(text, encoding="utf-8")
+        _rc, out = _run(tmp_path / sub, _good_reports(), emap=emap, parity_doc=doc)
+        return next(r for r in out["parity_rows"] if r["row"] == "#185")["verdict"]
+
+    assert verdict(_process_report(), "ok") == "PASS"
+    good_green = {"commit": "5ade76c", "command": "python3 -m pytest -q tests/a.py", "exit_code": 0, "passed": 13, "failed": 0}
+    bad = {
+        "no_block": "# r\n\n## #185 T0\n\nT0 commit `ae33e28` 紅燈 4 failed；終態綠燈 13 passed。\n",
+        "no_green": _process_report(green={}),
+        "green_failed": _process_report(green={**good_green, "passed": 0, "failed": 13, "exit_code": 1}),
+        "green_nonzero_exit": _process_report(green={**good_green, "exit_code": 2}),
+        "green_other_command": _process_report(green={**good_green, "command": "python3 -m pytest -q tests/b.py"}),
+        "green_same_commit": _process_report(green={**good_green, "commit": "ae33e28"}),
+        "red_other_commit": _process_report(red={"commit": "deadbee", "command": good_green["command"], "exit_code": 1,
+                                                 "passed": 9, "failed": 4, "failed_tests": ["tests/a.py::test_x"]}),
+        "red_not_red": _process_report(red={"commit": "ae33e28", "command": good_green["command"], "exit_code": 0,
+                                            "passed": 13, "failed": 0, "failed_tests": []}),
+        "red_no_tests": _process_report(red={"commit": "ae33e28", "command": good_green["command"], "exit_code": 1,
+                                             "passed": 9, "failed": 4, "failed_tests": []}),
+        "wrong_section": _process_report(heading="## #186 其他"),
+        "bad_json": _process_report().replace('"red"', "'red'"),
+    }
+    for name, text in bad.items():
+        assert verdict(text, name) == "INSUFFICIENT", name
+    report.write_text(_process_report(), encoding="utf-8")
     emap["parity_rows"]["#185"]["report"] = str(tmp_path / "missing.md")
-    rc, out = _run(tmp_path / "c", _good_reports(), emap=emap, parity_doc=doc)
+    _rc, out = _run(tmp_path / "missing", _good_reports(), emap=emap, parity_doc=doc)
     assert next(r for r in out["parity_rows"] if r["row"] == "#185")["verdict"] == "INSUFFICIENT"
     # 非逐名核准的承接編號不得以 PROCESS-EVIDENCE 充當證據
     emap = _emap()
