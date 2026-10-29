@@ -143,11 +143,24 @@ fn attach_rejected_discards_pty() {
 fn attach_request_timeout_closes_pty() {
     let r = ServiceRig::with_console_backend("pty");
     let factory = r.console.as_ref().unwrap();
-    let before = factory.created().len();
-    let err = r
-        .mgr
-        .console_attach("COM0", None, Duration::ZERO)
-        .expect_err("0 逾時：handler 不等 actor 回覆");
+    // actor 偶爾在 send 與 0 逾時 recv 之間就回覆（全 binary 並行時約 1/10）：該次 attach 正常成功，detach 後重試，
+    // 直到取得逾時出口；之後的斷言不放寬。
+    let mut timed_out = None;
+    for _ in 0..50 {
+        let before = factory.created().len();
+        match r.mgr.console_attach("COM0", None, Duration::ZERO) {
+            Err(e) => {
+                timed_out = Some((before, e));
+                break;
+            }
+            Ok(resp) => {
+                let cid = s(&resp, "client_id");
+                let d = r.call("session.console_detach", &format!(r#"{{"selector":"COM0","client_id":"{cid}"}}"#));
+                assert_eq!(d.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&d));
+            }
+        }
+    }
+    let (before, err) = timed_out.expect("50 次皆未取得 handler 逾時出口");
     assert_eq!(err.message, "internal timeout");
     assert_eq!(r.mgr.pending_pty_count(), 0, "逾時後暫存 PTY 已移除");
     let created = factory.created();
