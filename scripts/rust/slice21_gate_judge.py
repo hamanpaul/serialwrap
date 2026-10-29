@@ -330,6 +330,87 @@ def case_uptake(freeze: Mapping[str, Any] | None, case_verdicts: Mapping[str, An
 
 WAL_S1W_FORMAL_HOSTS = frozenset({"wsl2", "native"})    # OD-61：擁有者 WSL2 主機視為 Linux 實機證據；雲端 vm:* 只作診斷
 _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+# OD-66（擁有者裁決 (a)，2026-10-29）：依主機類型選門檻（與 slice21_gate_expect.yaml `wal_s1w.host_thresholds` 一致）。
+#   WSL2：固定門檻，且每項不劣於同主機同時段的 Python 基線（`scripts/stage0/wal_microbench.py` 證據一併匯入）；
+#   原生 Linux／Windows：規格 §1.2 原門檻。判定一律以證據的數值重算，不採證據自報的 verdict（其門檻固定為 §1.2）。
+WAL_S1W_HOST_THRESHOLDS: dict[str, dict[str, Any]] = {
+    "wsl2": {"append_p50_ms": 0.050, "append_p95_ms": 0.100, "append_p99_ms": 0.200, "rotate_max_ms": 100.0,
+             "not_worse_than_python_baseline": True, "source": "OD-66（2026-10-29，WSL2 另訂門檻）"},
+    "native": {"append_p50_ms": 0.005, "append_p95_ms": 0.010, "append_p99_ms": 0.020, "rotate_max_ms": 3.0,
+               "not_worse_than_python_baseline": False, "source": "serialwrap-rust-spec-final.md §1.2"},
+}
+# Python 基線須與 Rust 證據同主機（env）且同工作量（頂層）才可比較。
+_PY_BASELINE_HOST_KEYS: tuple[str, ...] = ("virtualization", "cpu", "cpu_count", "memory_bytes", "os_build",
+                                           "storage_device", "fs_type")
+_PY_BASELINE_WORKLOAD_KEYS: tuple[str, ...] = ("total_records", "rotate_bytes", "prefill_bytes")
+
+
+def wal_s1w_thresholds(host: str, host_thresholds: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """OD-66：依主機類型（`env.virtualization`）取 wal_s1w 門檻；不在表內（vm:*／unknown）回空 dict（只作診斷）。"""
+    table = host_thresholds if host_thresholds is not None else WAL_S1W_HOST_THRESHOLDS
+    row = table.get(host) if isinstance(table, Mapping) else None
+    return {"host": host, **dict(row)} if isinstance(row, Mapping) else {}
+
+
+def _wal_s1w_metrics(doc: Mapping[str, Any]) -> dict[str, float] | None:
+    am = doc.get("append_ms") if isinstance(doc.get("append_ms"), Mapping) else {}
+    vals = {"append_p50_ms": am.get("p50"), "append_p95_ms": am.get("p95"), "append_p99_ms": am.get("p99"),
+            "rotate_max_ms": doc.get("rotate_max_ms")}
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals.values()):
+        return None
+    return {k: float(v) for k, v in vals.items()}
+
+
+def _python_baseline_metrics(py: Mapping[str, Any]) -> dict[str, float] | None:
+    an = py.get("append_ns") if isinstance(py.get("append_ns"), Mapping) else {}
+    vals = {"append_p50_ms": an.get("p50"), "append_p95_ms": an.get("p95"), "append_p99_ms": an.get("p99"),
+            "rotate_max_ms": py.get("rotate_max_ns")}
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in vals.values()):
+        return None
+    return {k: v / 1e6 for k, v in vals.items()}
+
+
+def python_baseline_problems(doc: Mapping[str, Any], py: Mapping[str, Any] | None) -> list[str]:
+    """OD-66：Python 基線須存在、可讀出 append p50／p95／p99 與 rotate_max_ns，且與 Rust 證據同主機、同工作量。"""
+    if not isinstance(py, Mapping):
+        return ["OD-66：WSL2 證據須附同主機同時段的 Python 基線（wal_microbench.py；SW_GATE_WAL_S1W_PY_BASELINE／--python-baseline）"]
+    problems: list[str] = []
+    if _python_baseline_metrics(py) is None:
+        problems.append("Python 基線缺 append_ns.p50／p95／p99 或 rotate_max_ns（整數 ns）")
+    env = doc.get("env") if isinstance(doc.get("env"), Mapping) else {}
+    penv = py.get("env") if isinstance(py.get("env"), Mapping) else {}
+    for key in _PY_BASELINE_HOST_KEYS:
+        if env.get(key) is None or penv.get(key) != env.get(key):
+            problems.append(f"Python 基線與 Rust 證據不同主機：env.{key} {penv.get(key)!r} ≠ {env.get(key)!r}")
+    for key in _PY_BASELINE_WORKLOAD_KEYS:
+        if doc.get(key) is None or py.get(key) != doc.get(key):
+            problems.append(f"Python 基線與 Rust 證據工作量不同：{key} {py.get(key)!r} ≠ {doc.get(key)!r}")
+    return problems
+
+
+def _wal_s1w_judge_numbers(doc: Mapping[str, Any], thr: Mapping[str, Any],
+                           py: Mapping[str, Any] | None) -> tuple[str, list[str]]:
+    """以數值重算單輪判定：超過主機門檻或（WSL2）劣於 Python 基線即 FAIL。回傳 (PASS／FAIL, 失敗項)。"""
+    got = _wal_s1w_metrics(doc)
+    if got is None:
+        return "EVIDENCE_MISSING", ["證據缺 append_ms.p50／p95／p99 或 rotate_max_ms"]
+    failures = [f"{k[:-3]} {got[k]:g} ms > {thr[k]:g} ms（{thr.get('source')}）" for k in
+                ("append_p50_ms", "append_p95_ms", "append_p99_ms", "rotate_max_ms") if got[k] > float(thr[k])]
+    if thr.get("not_worse_than_python_baseline"):
+        base = _python_baseline_metrics(py or {}) or {}
+        failures += [f"{k[:-3]} {got[k]:g} ms 劣於同主機同時段 Python 基線 {base[k]:g} ms（OD-66）"
+                     for k in ("append_p50_ms", "append_p95_ms", "append_p99_ms", "rotate_max_ms") if k in base and got[k] > base[k]]
+    return ("FAIL" if failures else "PASS"), failures
+
+
+def _wal_s1w_threshold_text(thr: Mapping[str, Any], py: Mapping[str, Any] | None) -> str:
+    text = (f"門檻（{thr.get('source')}；host={thr.get('host')}）：append p50≤{thr['append_p50_ms']:g}／p95≤{thr['append_p95_ms']:g}／"
+            f"p99≤{thr['append_p99_ms']:g} ms、rotate≤{thr['rotate_max_ms']:g} ms")
+    if thr.get("not_worse_than_python_baseline"):
+        base = _python_baseline_metrics(py or {}) or {}
+        text += ("；且每項不劣於同主機同時段 Python 基線（" +
+                 "／".join(f"{k[:-3]} {base[k]:g} ms" for k in base) + "）") if base else "；且每項不劣於同主機同時段 Python 基線"
+    return text
 
 
 def _paths_changed_since(rev: str, paths: Sequence[str]) -> list[str] | None:
@@ -342,17 +423,21 @@ def _paths_changed_since(rev: str, paths: Sequence[str]) -> list[str] | None:
     return [x for x in (out or "").splitlines() if x.strip()]
 
 
-def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, Any] | None = None,
+def wal_s1w_verdict(local: Mapping[str, Any] | None, *,
+                    imported: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
                     host_label: str | None = None, formal_params: Mapping[str, Any],
-                    relevant_paths: Sequence[str] = ()) -> tuple[str, list[str]]:
+                    relevant_paths: Sequence[str] = (), python_baseline: Mapping[str, Any] | None = None,
+                    host_thresholds: Mapping[str, Any] | None = None) -> tuple[str, list[str]]:
     """wal_s1w_perf section 判定（OD-61）。
 
     - 有匯入證據（編排者於擁有者 WSL2 主機以 throwaway 環境量測）：須為 `wal_s1w.v1`、Linux 門檻、正式量測參數
       （`formal_params`）、`env.virtualization` ∈ {wsl2, native}、附主機類型標註（`host_label`）、`env.source_tree_dirty`
       為 false、`env.git_revision`
       為本分支歷史中的 commit，且該 commit 之後 WAL 寫入相關路徑（`relevant_paths`）未再變更；符合者以其 verdict 判定，
-      不符即 EVIDENCE_MISSING（證據無法追溯或不代表受測版本）。
-    - 無匯入：gate 本機量測若為 wsl2／native 照其 verdict 判定；雲端 `vm:*`／unknown 只作診斷 → EVIDENCE_MISSING。
+      不符即 EVIDENCE_MISSING（證據無法追溯或不代表受測版本）。可匯入多輪（如三輪），取最差判定。
+    - 無匯入：gate 本機量測若為 wsl2／native 照判；雲端 `vm:*`／unknown 只作診斷 → EVIDENCE_MISSING。
+    - OD-66：判定門檻依 `env.virtualization` 選（`wal_s1w_thresholds`）並以數值重算；WSL2 另須附同主機同時段 Python 基線
+      （`python_baseline`；缺或不同主機／工作量 → EVIDENCE_MISSING），且每項不劣於基線。第一個原因標明所用門檻。
     回傳 (PASS／FAIL／EVIDENCE_MISSING, 原因)。"""
     def check(doc: Mapping[str, Any], *, need_label: bool) -> list[str]:
         problems: list[str] = []
@@ -386,11 +471,42 @@ def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, A
                 problems.append(f"量測 commit {rev[:12]} 之後 WAL 寫入相關路徑已變更：{changed[:6]}")
         return problems
 
+    def judge_one(doc: Mapping[str, Any]) -> tuple[str, list[str], str]:
+        virt = str((doc.get("env") or {}).get("virtualization") or "unknown") if isinstance(doc.get("env"), Mapping) else "unknown"
+        thr = wal_s1w_thresholds(virt, host_thresholds)
+        if not thr:
+            return "EVIDENCE_MISSING", [f"主機類型 {virt!r} 無對應門檻（OD-66）"], ""
+        if thr.get("not_worse_than_python_baseline"):
+            bp = python_baseline_problems(doc, python_baseline)
+            if bp:
+                return "EVIDENCE_MISSING", bp, _wal_s1w_threshold_text(thr, None)
+        st, fails = _wal_s1w_judge_numbers(doc, thr, python_baseline)
+        return st, fails, _wal_s1w_threshold_text(thr, python_baseline)
+
     if imported is not None:
-        problems = check(imported, need_label=True)
-        if problems:
-            return "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據不採用：{p}" for p in problems]
-        return str(imported["verdict"]), [f"匯入證據（{host_label}）：{'；'.join(map(str, imported.get('failures') or [])) or '全數達標'}"]
+        runs = [imported] if isinstance(imported, Mapping) else list(imported)
+        if not runs:
+            return "EVIDENCE_MISSING", ["匯入的 wal_s1w 證據為空"]
+        statuses: list[str] = []
+        reasons: list[str] = []
+        texts: list[str] = []
+        for idx, doc in enumerate(runs, start=1):
+            tag = f"第 {idx} 輪" if len(runs) > 1 else "匯入證據"
+            if not isinstance(doc, Mapping):
+                statuses.append("EVIDENCE_MISSING")
+                reasons.append(f"{tag}：匯入的 wal_s1w 證據不採用：無法讀取")
+                continue
+            problems = check(doc, need_label=True)
+            if problems:
+                statuses.append("EVIDENCE_MISSING")
+                reasons.extend(f"{tag}：匯入的 wal_s1w 證據不採用：{p}" for p in problems)
+                continue
+            st, fails, text = judge_one(doc)
+            statuses.append(st)
+            if text and text not in texts:
+                texts.append(text)
+            reasons.append(f"{tag}（{host_label}）：{st}；{'；'.join(fails) or '全數達標'}")
+        return worst_verdict(statuses), texts + reasons
     if local is None:
         return "EVIDENCE_MISSING", ["wal_s1w 量測未產生，且未匯入外部證據（SW_GATE_WAL_S1W_IMPORT）"]
     problems = check(local, need_label=False)
@@ -399,7 +515,8 @@ def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, A
         return "EVIDENCE_MISSING", [
             f"本機量測只作診斷（{'；'.join(problems)}）：append p50 {am.get('p50')}／p95 {am.get('p95')}／p99 {am.get('p99')} ms、"
             f"rotate max {local.get('rotate_max_ms')} ms、本機 verdict {local.get('verdict')}；正式證據待匯入 WSL2 量測（OD-61）"]
-    return str(local["verdict"]), list(map(str, local.get("failures") or []))
+    st, fails, text = judge_one(local)
+    return st, ([text] if text else []) + fails
 
 
 # --------------------------------------------------------------------------- case_verdicts 彙整（OD-60／OWNER-BATCH #8）
@@ -994,15 +1111,26 @@ def cmd_wal_s1w_verdict(args: argparse.Namespace) -> int:
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
     cfg = expect_yaml.get("wal_s1w") or {}
     local = _load_json(pathlib.Path(args.local)) if args.local else None
-    imported = _load_json(pathlib.Path(args.import_)) if args.import_ else None
-    if args.import_ and imported is None:
-        verdict, reasons = "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據無法讀取：{args.import_}"]
+    imports = list(args.import_ or [])
+    imported = [_load_json(pathlib.Path(x)) for x in imports] if imports else None
+    py = _load_json(pathlib.Path(args.python_baseline)) if args.python_baseline else None
+    host_thresholds = cfg.get("host_thresholds") or WAL_S1W_HOST_THRESHOLDS
+    if imported is not None and any(doc is None for doc in imported):
+        verdict, reasons = "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據無法讀取：{[x for x, d in zip(imports, imported) if d is None]}"]
+    elif args.python_baseline and py is None:
+        verdict, reasons = "EVIDENCE_MISSING", [f"匯入的 Python 基線無法讀取：{args.python_baseline}"]
     else:
         verdict, reasons = wal_s1w_verdict(local, imported=imported, host_label=args.host_label,
                                            formal_params=cfg.get("formal_params") or {},
-                                           relevant_paths=list(cfg.get("relevant_paths") or []))
-    out = {"verdict": verdict, "reasons": reasons, "source": "import" if args.import_ else "local",
-           "host_label": args.host_label or None, "evidence": args.import_ or args.local}
+                                           relevant_paths=list(cfg.get("relevant_paths") or []),
+                                           python_baseline=py, host_thresholds=host_thresholds)
+    # OD-66：報告標明所用門檻（依第一份證據的主機類型）。
+    first = (imported or [local])[0] if (imported or local) else None
+    virt = str(((first or {}).get("env") or {}).get("virtualization") or "unknown") if isinstance(first, Mapping) else "unknown"
+    out = {"verdict": verdict, "reasons": reasons, "source": "import" if imports else "local",
+           "host_label": args.host_label or None, "evidence": imports or args.local,
+           "python_baseline": args.python_baseline or None,
+           "thresholds": wal_s1w_thresholds(virt, host_thresholds) or None}
     text = json.dumps(out, ensure_ascii=False, indent=1) + "\n"
     if args.out:
         pathlib.Path(args.out).write_text(text, encoding="utf-8")
@@ -1067,7 +1195,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     c.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     w = sub.add_parser("wal-s1w-verdict")
     w.add_argument("--local", default=None, help="gate 本機量測的 wal_s1w.json")
-    w.add_argument("--import", dest="import_", default=None, help="外部匯入的 wal_s1w.json（OD-61：擁有者 WSL2 主機）")
+    w.add_argument("--import", dest="import_", action="append", default=None,
+                   help="外部匯入的 wal_s1w.json（OD-61：擁有者 WSL2 主機；可重複，取最差判定）")
+    w.add_argument("--python-baseline", default=None,
+                   help="同主機同時段的 Python 基線 wal_microbench.json（OD-66：WSL2 證據必附）")
     w.add_argument("--host-label", default=None, help="匯入證據的主機類型標註（例：owner-wsl2-ext4-vhdx）")
     w.add_argument("--out", default=None)
     w.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))

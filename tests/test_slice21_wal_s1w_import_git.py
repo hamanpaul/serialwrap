@@ -21,9 +21,10 @@ FORMAL = {"streams": 4, "records": 10000, "payload": 1024, "rotate_bytes": 67108
 
 
 def _doc(rev: str) -> dict:
+    # 原生主機（§1.2 門檻、免 Python 基線；OD-66）：本檔只驗可追溯性。
     return {"schema": "wal_s1w.v1", "verdict": "PASS", "failures": [], "params": dict(FORMAL), "thresholds": {"platform": "linux"},
             "append_ms": {"p50": 0.003, "p95": 0.008, "p99": 0.015}, "rotate_max_ms": 2.1,
-            "env": {"virtualization": "wsl2", "git_revision": rev, "source_tree_dirty": False, "fs_type": "ext4", "os": "posix"}}
+            "env": {"virtualization": "native", "git_revision": rev, "source_tree_dirty": False, "fs_type": "ext4", "os": "posix"}}
 
 
 def _git(repo: pathlib.Path, *args: str) -> str:
@@ -56,7 +57,7 @@ def test_import_rejected_after_wal_dependency_change_in_real_repo(tmp_path, monk
     (repo / changed).write_text("v2\n", encoding="utf-8")
     _git(repo, "commit", "-q", "-am", "later")
     monkeypatch.setattr(judge, "ROOT", repo)
-    st, reasons = judge.wal_s1w_verdict(None, imported=_doc(measured), host_label="owner-wsl2", formal_params=FORMAL,
+    st, reasons = judge.wal_s1w_verdict(None, imported=_doc(measured), host_label="owner-native", formal_params=FORMAL,
                                         relevant_paths=paths)
     assert st == expected, reasons
     if expected == "EVIDENCE_MISSING":

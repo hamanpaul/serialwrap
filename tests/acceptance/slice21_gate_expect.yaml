@@ -17,6 +17,14 @@ runbook: docs/rust-refactor/slice21-owner-runbook.md
 #   sol P5-86b54d8-2：append 熱路徑經 sw-proto（wal_types::crc32_hex、WalRecord::to_line／pyjson、pycompat），整個 crate 列入。
 wal_s1w:
   formal_params: {streams: 4, records: 10000, payload: 1024, rotate_bytes: 67108864, prefill_ratio: 0.9375, rate: 0}
+  # OD-66（擁有者裁決 (a)，2026-10-29）：依 env.virtualization 選門檻（judge 以數值重算，不採證據自報的 §1.2 verdict）。
+  #   wsl2：固定門檻，且每項不劣於同主機同時段的 Python 基線（wal_microbench.py，SW_GATE_WAL_S1W_PY_BASELINE 一併匯入）；
+  #   native：規格 §1.2 原門檻（原生 Linux／Windows 正式量測，BO）。須與 slice21_gate_judge.WAL_S1W_HOST_THRESHOLDS 一致。
+  host_thresholds:
+    wsl2: {append_p50_ms: 0.050, append_p95_ms: 0.100, append_p99_ms: 0.200, rotate_max_ms: 100.0,
+           not_worse_than_python_baseline: true, source: "OD-66（2026-10-29，WSL2 另訂門檻）"}
+    native: {append_p50_ms: 0.005, append_p95_ms: 0.010, append_p99_ms: 0.020, rotate_max_ms: 3.0,
+             not_worse_than_python_baseline: false, source: "serialwrap-rust-spec-final.md §1.2"}
   relevant_paths: [crates/sw-core/src/wal.rs, crates/sw-core/examples/wal_s1w.rs, crates/sw-pal/src/wal_fs.rs,
                    crates/sw-pal/src/wal_fs, crates/sw-pal/src/fs_ops.rs, crates/sw-pal/src/fs_ops, Cargo.lock, rust-toolchain.toml,
                    Cargo.toml, crates/sw-core/Cargo.toml, crates/sw-pal/Cargo.toml, crates/sw-proto]

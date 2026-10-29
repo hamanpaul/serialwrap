@@ -341,10 +341,22 @@ rm -rf "$RUN_DIR/wal_s1w_perf/walroot"
 s1w_args=()
 [[ -f "$RUN_DIR/wal_s1w_perf/wal_s1w.json" ]] && s1w_args+=(--local "$RUN_DIR/wal_s1w_perf/wal_s1w.json")
 s1w_evidence=wal_s1w_perf/wal_s1w.json
+# SW_GATE_WAL_S1W_IMPORT 可列多輪證據（以 : 分隔，如三輪），judge 取最差判定；OD-66：WSL2 證據另以
+# SW_GATE_WAL_S1W_PY_BASELINE 匯入同主機同時段的 Python 基線（wal_microbench.py），門檻依主機類型選並記入 verdict.json。
 if [[ -n "${SW_GATE_WAL_S1W_IMPORT:-}" ]]; then
-  cp "$SW_GATE_WAL_S1W_IMPORT" "$RUN_DIR/wal_s1w_perf/wal_s1w.imported.json" 2>/dev/null || true
-  s1w_args+=(--import "$RUN_DIR/wal_s1w_perf/wal_s1w.imported.json" --host-label "${SW_GATE_WAL_S1W_HOST:-}")
-  s1w_evidence=wal_s1w_perf/wal_s1w.imported.json
+  s1w_n=0
+  IFS=':' read -r -a s1w_imports <<<"$SW_GATE_WAL_S1W_IMPORT"
+  for s1w_src in "${s1w_imports[@]}"; do
+    s1w_n=$((s1w_n + 1))
+    cp "$s1w_src" "$RUN_DIR/wal_s1w_perf/wal_s1w.imported-$s1w_n.json" 2>/dev/null || true
+    s1w_args+=(--import "$RUN_DIR/wal_s1w_perf/wal_s1w.imported-$s1w_n.json")
+  done
+  s1w_args+=(--host-label "${SW_GATE_WAL_S1W_HOST:-}")
+  s1w_evidence=wal_s1w_perf/verdict.json
+fi
+if [[ -n "${SW_GATE_WAL_S1W_PY_BASELINE:-}" ]]; then
+  cp "$SW_GATE_WAL_S1W_PY_BASELINE" "$RUN_DIR/wal_s1w_perf/python-baseline.imported.json" 2>/dev/null || true
+  s1w_args+=(--python-baseline "$RUN_DIR/wal_s1w_perf/python-baseline.imported.json")
 fi
 python3 "$JUDGE" wal-s1w-verdict "${s1w_args[@]}" --out "$RUN_DIR/wal_s1w_perf/verdict.json" >/dev/null 2>>"$RUN_DIR/logs/wal_s1w_perf.log" || true
 s1w_verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo EVIDENCE_MISSING)"
@@ -352,7 +364,7 @@ s1w_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.a
 s1w_exit="$s1w_rc"; [[ "$s1w_verdict" == EVIDENCE_MISSING ]] && s1w_exit=0
 record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w（＋SW_GATE_WAL_S1W_IMPORT 匯入）" --exit "$s1w_exit" \
   --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence "$s1w_evidence" \
-  --reason "Linux 門檻（規格 §1.2；OD-61 WSL2 量測為準）：$s1w_reason" \
+  --reason "Linux 門檻依主機類型（OD-66：WSL2 另訂門檻＋不劣於 Python 基線；原生 §1.2）：$s1w_reason" \
   --reason "Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
 
 # 10. Windows 無 COM 黑箱（BO-S21-13 承接 Windows 全套；此處只保留紀錄，不計入 section）。
