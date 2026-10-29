@@ -580,3 +580,18 @@ def test_gate_script_removes_stale_artifact_and_binds_build_sha():
     evlat = text[text.index("run_logged event_latency "):]
     assert '"${evlat_bind[@]}"' in evlat.splitlines()[2] or '"${evlat_bind[@]}"' in evlat[:400]
     assert "--build-linux-exit" in text and "--built-daemon-sha256" in text
+
+
+def test_l15_ab_excluded_case_covered_by_section_requires_section_pass(case):
+    """OD-58：`s21-event-latency` 移出 l15_ab 後由 event_latency section 承擔（`covered_by_sections`）；
+    承擔 section 非 PASS 時 l15_ab 不得 PASS。"""
+    exp = case.expect()
+    exp["l15_ab_excluded"] = [{"case_id": "s21-event-latency", "decision": "OD-58",
+                               "covered_by": [{"section": "linux_l1", "nodeid": CORE_NODEIDS[0]}],
+                               "covered_by_sections": ["event_latency"]}]
+    assert _sec(_judge_mod().judge(case.report(), exp), "l15_ab")["status"] == "PASS"
+    case.evlat = None                                    # event_latency 證據缺 → EVIDENCE_MISSING
+    out = _judge_mod().judge(case.report(), exp)
+    assert _sec(out, "event_latency")["status"] == "EVIDENCE_MISSING"
+    sec = _sec(out, "l15_ab")
+    assert sec["status"] == "EVIDENCE_MISSING" and any("OD-58" in r and "event_latency" in r for r in sec["reasons"])

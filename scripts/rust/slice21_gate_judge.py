@@ -484,6 +484,8 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
         out_sections.append(sec)
 
     # OD-40：移出 l15_ab 的情境改由逐名列出的 pytest 測試承擔；每筆須在指定 section 恰為 passed，否則 l15_ab 不得 PASS。
+    # OD-58：另可由整個 section 承擔（`covered_by_sections`，如 s21-event-latency → event_latency），該 section 須為 PASS。
+    status_by_name = {s["name"]: s["status"] for s in out_sections}
     for sec in out_sections:
         if sec["name"] != "l15_ab" or sec["status"] != "PASS":
             continue
@@ -494,6 +496,11 @@ def judge(report: Mapping[str, Any], expect: Mapping[str, Any]) -> dict[str, Any
                 sec["status"] = "EVIDENCE_MISSING"
                 sec["reasons"] = list(sec["reasons"]) + [
                     f"{row.get('case_id')} 依 {row.get('decision')} 移出 l15_ab，承擔的 pytest 未見 passed：{absent or '（未列）'}"]
+            not_pass = [str(n) for n in (row.get("covered_by_sections") or []) if status_by_name.get(str(n)) != "PASS"]
+            if not_pass:
+                sec["status"] = "EVIDENCE_MISSING"
+                sec["reasons"] = list(sec["reasons"]) + [
+                    f"{row.get('case_id')} 依 {row.get('decision')} 移出 l15_ab，承擔的 section 非 PASS：{not_pass}"]
 
     missing_id, mismatch_id = identity_problems(report.get("identity"), expect.get("daemon_path"))
     uptake = case_uptake(expect.get("freeze"), expect.get("case_verdicts"))

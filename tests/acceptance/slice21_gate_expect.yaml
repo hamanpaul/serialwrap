@@ -57,6 +57,7 @@ resolved_decisions:
   - {id: PA-OD-T20, decision: "OD-36／OD-37／OD-38", resolution: "8 案案例設計修正（CHG-S21-OD36-*）、DF-20／DF-21 判定（CHG-S21-OD37-DF-01；DF-20 Rust 實作 → P6）、METHOD_NOT_FOUND Rust 專屬（CHG-S21-OD38-MNF-01）"}
   - {id: PA-OD-EVLAT, decision: OD-45, resolution: "event_latency 改以 L1 結構測試為 gate（五事件 at_most_one_data_item_before_control）＋外部只量 stop_request／command_cancel／release_request（RPC 送出 → RPC 回應；idle 與 flood 20000 B/s）；lease_expiry、drain_receipt 只留 L1；method_revision 2026-10-29.1 待獨立審閱重新凍結"}
   - {id: PA-OD-L15-GAPS-10, decision: "OD-46／OD-47", resolution: "#10 s21-wal-unlink-under-traffic 自 l15_ab 逐名移出（l15_ab_excluded，由持續流量 WAL unlink 黑箱 A/B 承擔）；#9 CHG-S21-OD39-GAP9-01 APPROVED（外部放手前埠未成功開啟且未進 READY，三層替代證據）"}
+  - {id: OWNER-BATCH-P5R5-1, decision: OD-58, resolution: "s21-event-latency 自 l15_ab 逐名移出（l15_ab_excluded，covered_by_sections: event_latency）；release_request 上限 idle 250／flood 300 ms，0.5.0 前同工具重測三輪"}
   - {id: PA-OD-REPROBE, decision: OD-34, resolution: "l15-delayed-reply（凍結修訂 #1）、s21-reboot-minimal-guard 延至 Slice 2.3（deferred_to_s23）；cowork-01-agent-bad-cmd 屬 Slice 2.2，由 P6 分支承接"}
 # OD-34：自 Slice 2.1 gate 逐名移出、改列 Slice 2.3 出口必須 PASS（情境檔保留）。
 deferred_to_s23:
@@ -91,6 +92,15 @@ l15_ab_excluded:
       - {section: blackbox_python, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"}
       - {section: blackbox_rust, nodeid: "tests/contract_blackbox/slice21/test_safety_core.py::test_wal_unlink_recreates_with_meta"}
       - {section: linux_l1, nodeid: "cargo:sw-core::wal_writer::external_unlink_writes_recreate_meta_then_record"}
+  # OD-58（2026-10-29）：s21-event-latency 逐名移出（OD-45 下兩個 daemon 皆無計時欄位而恆 INSUFFICIENT_EVIDENCE，且
+  #   stop_request 每樣本須重啟 daemon、單一 bridge 情境無法取得 500 樣本）；改由 event_latency section（L1 結構 gate
+  #   ＋外部量測）承擔，情境檔保留。該情境不在 cases.lock.json／l1_required.lock.json，無凍結列可 --allow-removal。
+  - case_id: s21-event-latency
+    decision: OD-58
+    covered_by_sections: [event_latency]
+    covered_by:
+      - {section: linux_l1, nodeid: "cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"}
+      - {section: linux_l1, nodeid: "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood"}
 # 待擁有者裁決（本 Phase 相關）；s21-exclusive-conflict-plain-open 已定案（§0.2），不列入。
 # 2026-10-29：PA-OD-EVLAT（OD-45）、PA-OD-L15-GAPS-10（OD-46／OD-47）已裁決，移入 resolved_decisions。
 pending_decisions: []

@@ -19,7 +19,9 @@ DEFERRED_TO_S23 = {"l15-delayed-reply": "OD-34", "s21-reboot-minimal-guard": "OD
 # OD-40（2026-10-28）：l15-wal-interference 自 l15_ab 判定逐名移出（情境檔與 2.1 必要案例保留），改由
 # tests/acceptance/slice21_gate_expect.yaml 的 `l15_ab_excluded` 所列 pytest WAL 測試承擔。
 # OD-46（2026-10-29）：s21-wal-unlink-under-traffic 比照 OD-40 逐名移出，改由持續流量 WAL unlink 黑箱 A/B 承擔。
-L15_AB_EXCLUDED = {"l15-wal-interference": "OD-40", "s21-wal-unlink-under-traffic": "OD-46"}
+# OD-58（2026-10-29）：s21-event-latency 逐名移出（OD-45 下兩個 daemon 皆無計時欄位而恆 INSUFFICIENT），改由
+# event_latency section（L1 結構 gate＋scripts/rust/event_latency_measure.py 外部量測）承擔；情境檔保留。
+L15_AB_EXCLUDED = {"l15-wal-interference": "OD-40", "s21-wal-unlink-under-traffic": "OD-46", "s21-event-latency": "OD-58"}
 L15_AB_CASES = [c for c in P2_21 + S21 if c not in DEFERRED_TO_S23 and c not in L15_AB_EXCLUDED]
 GATE = os.environ.get("SERIALWRAP_GATE") == "1"
 RECORD_ONLY: set[str] = set()   # s21-exclusive-conflict-plain-open 已依規格 §6.2 定案為拒絕（§0.2），改為正式判定
@@ -44,6 +46,8 @@ def test_case_list_matches_freeze():
     assert set(excluded) == set(L15_AB_EXCLUDED)
     for case, od in L15_AB_EXCLUDED.items():
         assert excluded[case]["decision"] == od and excluded[case]["covered_by"], case
+    # OD-58：event_latency 移出者須以 event_latency section 承擔（covered_by_sections），不得只列 L1 節點
+    assert excluded["s21-event-latency"].get("covered_by_sections") == ["event_latency"]
 
 
 @pytest.mark.posix_only
