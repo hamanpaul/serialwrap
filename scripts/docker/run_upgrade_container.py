@@ -196,6 +196,19 @@ class Driver:
     def phase_old_install(self) -> None:
         inst = self.run(["pipx", "install", "--pip-args", "--no-index --find-links=/opt/sw-old", str(self.wheel)],
                         label="pipx install 0.3.2", timeout=600)
+        if self.mode == "systemd-system":
+            # 0.3.2 既有缺陷：system unit 的 UMask=0117 使 daemon 自建的目錄缺 x 位元（0660），接著建立子目錄即
+            # PermissionError、unit 反覆重啟。一般使用者先前以 on-demand 用過 serialwrap 時這些目錄已存在；此處以 swtest
+            # 的一般 umask 前景啟動一次 0.3.2 daemon（隔離 socket）讓它自建全部目錄後結束，並記為觀察項（與 0.4.0 無關）。
+            # system unit 沒有 XDG_RUNTIME_DIR（RUN_DIR 落在 STATE_DIR/run），暖機須同樣不帶該變數。
+            warm = self.run(["env", "-u", "XDG_RUNTIME_DIR", "timeout", "-s", "INT", "8", str(BIN / "serialwrapd"),
+                             "--socket", "/tmp/sw-warmup.sock"],
+                            label="0.3.2 daemon 前景暖機（建立目錄）", timeout=30)
+            self.wait_no_daemon()
+            self.observations.append({"id": "OBS-0.3.2-SYSTEM-UMASK", "phase": "old_install_0_3_2",
+                                      "detail": "0.3.2 system unit UMask=0117：daemon 自建目錄為 0660，ensure_runtime_dirs／ttyMCU 目錄 PermissionError",
+                                      "workaround": "以 swtest 一般 umask 前景啟動一次 0.3.2 daemon 建立目錄",
+                                      "warmup_rc": warm.returncode})
         setup = self.sw("setup", *self.setup_args, label="0.3.2 setup")
         start = self.start_daemon("0.3.2 start") if self.mode == "on-demand" else None
         status = self.wait_daemon(version=OLD_VERSION)
@@ -210,19 +223,28 @@ class Driver:
         """設定快照：使用者 config；systemd-system 另含 system daemon 讀取的 /etc/serialwrap/profiles。"""
         files = uc.snapshot_files(CONFIG)
         if self.mode == "systemd-system":
-            files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()})
+            # 套件內 profiles 由 system setup 每次以 `sudo cp -r <staging>/. /etc/serialwrap/profiles` 覆寫（0.3.2 同語意），
+            # 屬 setup 管理檔而非使用者資料；只比對使用者自加的檔案。
+            managed = getattr(self, "system_managed_profiles", set())
+            files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()
+                          if k not in managed})
         return files
 
     def phase_seed(self) -> None:
+        (CONFIG / "profiles").mkdir(parents=True, exist_ok=True)
+        bench = CONFIG / "profiles" / "bench.yaml"
+        bench.write_text(BENCH_PROFILE, encoding="utf-8")
+        subprocess.run(["chown", f"{USER}:{USER}", str(bench)], check=True)
         if self.mode == "systemd-system":
-            # system daemon 固定讀 /etc/serialwrap/profiles（0.3.2 setup_cmd SYSTEM_PROFILE_DIR）。
+            # system daemon 固定讀 /etc/serialwrap/profiles（0.3.2 setup_cmd SYSTEM_PROFILE_DIR）；使用者 profile 另放一份。
+            staging = HOME / ".local" / "share" / "serialwrap" / "system-profiles"
+            self.system_managed_profiles = {str(p.relative_to(staging)) for p in staging.rglob("*") if p.is_file()} \
+                if staging.is_dir() else set()
+            self.observations.append({"id": "OBS-SYSTEM-PROFILES-MANAGED", "phase": "seed_user_data",
+                                      "managed": sorted(self.system_managed_profiles),
+                                      "note": "system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 的同名檔（0.3.2 同語意）；保留判定只比對使用者自加的檔案"})
             SYSTEM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
             (SYSTEM_PROFILE_DIR / "bench.yaml").write_text(BENCH_PROFILE, encoding="utf-8")
-        else:
-            (CONFIG / "profiles").mkdir(parents=True, exist_ok=True)
-            bench = CONFIG / "profiles" / "bench.yaml"
-            bench.write_text(BENCH_PROFILE, encoding="utf-8")
-            subprocess.run(["chown", f"{USER}:{USER}", str(bench)], check=True)
         if self.mode == "systemd-system":
             restart = [self.run(["sudo", "systemctl", "restart", "serialwrap"], label="0.3.2 sudo systemctl restart")]
         elif self.mode == "systemd-user":
