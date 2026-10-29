@@ -1368,11 +1368,11 @@ def test_bc_real_bc_case_ids_frozen() -> None:
 
 
 def test_bc_real_sc_df_ranges() -> None:
-    """SC 範圍合併 OD-14 與 P4 的 SC-36，且撤回 SC-08。"""
+    """SC 範圍合併 OD-14 與 P4 的 SC-36、OD-48 的 SC-39，且撤回 SC-08。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36"}
+    assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36", "SC-39"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
     assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20", "DF-21", "DF-22"}
 
@@ -1439,6 +1439,28 @@ def test_sc36_registered() -> None:
     assert list(sc36.phases) == ["P4", "P8"]
     assert sc36.approval.decision_ref == "OD-15"
     assert sc36.case_ids == ("sc36-win-installer-com0com-optional",)
+
+
+def test_sc39_registered() -> None:
+    """SC-39（OD-48 含修訂：0.3.x 舊 daemon 改走舊版停止路徑、失敗不自動重啟）登記為 Rust-only、僅絕對值比對、P4 階段。"""
+    sc39 = _bc_by_id()["SC-39"]
+    assert sc39.scope == "rust_only" and sc39.applies_python_min is None
+    assert sc39.ab_participation == "absolute_only"
+    assert list(sc39.phases) == ["P4"]
+    assert sc39.approval.decision_ref == "OD-48"
+    assert sc39.case_ids == ("sc39-legacy-daemon-handoff",)
+    assert "OD-48" in sc39.related_decisions and "OD-51" in sc39.related_decisions
+    for phrase in ("METHOD_NOT_FOUND", "TOCTOU", "不送 SIGKILL", "連續維持 5 s", "不自動重啟任何 daemon", "supervision-mode set 維持拒絕"):
+        assert phrase in sc39.compatibility_impact, phrase
+
+
+def test_sc01_sc02_cover_file_transfer_per_od51() -> None:
+    """OD-51：SC-01／SC-02 的 compatibility_impact 涵蓋 file.push／file.pull，並在 related_decisions 加 OD-51。"""
+    by_id = _bc_by_id()
+    for sc_id in ("SC-01", "SC-02"):
+        change = by_id[sc_id]
+        assert "file.push" in change.compatibility_impact and "file.pull" in change.compatibility_impact, sc_id
+        assert "OD-51" in change.related_decisions, sc_id
 
 
 def test_bc_real_ab_participation() -> None:
