@@ -32,6 +32,27 @@ REQUIRED_CHECKS: tuple[str, ...] = (
     "no_two_reader",
 )
 
+# OD-50 install.sh 情境（`run-upgrade.sh --scenario install-sh`）：0.3.2 pipx 已安裝且 daemon 已停止 →
+# `install.sh --bundle <0.4.0 release 候選 tarball>`。與上列 18 項分開判定，不改其語意；
+# 與升級情境同名者沿用同一判定（同 driver phase）。「舊 daemon 執行中」的情境留給 OD-48。
+REQUIRED_INSTALL_SH_CHECKS: tuple[str, ...] = (
+    "old_install_0_3_2",
+    "seed_user_data",
+    "doctor_green_old",
+    "old_daemon_stopped",
+    "install_sh_upgrade",
+    "entries_replaced",
+    "config_preserved_upgrade",
+    "new_daemon_started",
+    "supervision_reconciled",
+    "state_compatible_upgrade",
+    "doctor_green_new",
+    "no_two_reader",
+)
+
+# install.sh 偵測到舊 pipx 安裝時必須印出的提示（不得自動移除）
+PIPX_UNINSTALL_HINT = "pipx uninstall serialwrap"
+
 # 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
 ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
 
@@ -254,11 +275,35 @@ def judge_rollback_success(check_id: str, *, cli_version: str | None, daemon_ver
     return row(check_id, "PASS" if ok else "FAIL", None if ok else f"setup --rollback 未完整回到 {old_version}", **detail)
 
 
-def overall_verdict(rows: list[dict[str, Any]]) -> str:
-    """任一 FAIL 或檢查 id 重複 → FAIL；缺必要檢查或任一 INSUFFICIENT → INSUFFICIENT；否則 PASS。"""
+def judge_install_sh(check_id: str, *, rc: int, body: dict[str, Any] | None, output: str, pipx_venv_left: bool,
+                     leftover_tmp: list[str], new_version: str = "0.4.0") -> dict[str, Any]:
+    """install.sh 升級：rc 0、setup 回 install→new_version、印出 pipx 移除提示但未移除 pipx venv、暫存目錄已清除。"""
+    body = body if isinstance(body, dict) else {}
+    install = body.get("install") or {}
+    problems = []
+    if rc != 0:
+        problems.append("rc")
+    if body.get("ok") is not True or install.get("op") != "install" or install.get("to_version") != new_version:
+        problems.append("setup")
+    if PIPX_UNINSTALL_HINT not in output:
+        problems.append("pipx_hint")
+    if not pipx_venv_left:
+        problems.append("pipx_removed")
+    if leftover_tmp:
+        problems.append("tmp_left")
+    detail = {"rc": rc, "op": install.get("op"), "to_version": install.get("to_version"),
+              "error_code": body.get("error_code"), "pipx_venv_left": pipx_venv_left, "leftover_tmp": leftover_tmp,
+              "problems": problems}
+    if problems:
+        return row(check_id, "FAIL", "install.sh 升級未符合 OD-50：" + "、".join(problems), **detail)
+    return row(check_id, "PASS", None, **detail)
+
+
+def overall_verdict(rows: list[dict[str, Any]], *, required: Iterable[str] = REQUIRED_CHECKS) -> str:
+    """任一 FAIL 或檢查 id 重複 → FAIL；缺必要檢查（預設為升級情境 18 項）或任一 INSUFFICIENT → INSUFFICIENT；否則 PASS。"""
     ids = [r.get("id") for r in rows]
     if len(ids) != len(set(ids)) or any(r.get("verdict") == "FAIL" for r in rows):
         return "FAIL"
-    if set(REQUIRED_CHECKS) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
+    if set(required) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
         return "INSUFFICIENT"
     return "PASS"

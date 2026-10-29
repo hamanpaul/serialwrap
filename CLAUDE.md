@@ -134,13 +134,17 @@ policy_version: 1.0.19
 
 ## 實際命令
 
-> 開發/操作速查（由 `.github/copilot-instructions.md` 併入，並對齊現行 pipx + systemd + XDG 流程）。
+> 開發/操作速查（由 `.github/copilot-instructions.md` 併入，並對齊現行 bundle（OD-50）+ systemd + XDG 流程）。
 
 執行期依賴：`PyYAML`；`pyserial` 為 **Windows 序列埠後端**（`sw_core/serial_port.py` 的 `_PySerialPort`，#84 PORT-1）依賴，`pyproject` 以 `sys_platform=='win32'` 條件安裝（Linux/WSL 預設走 termios 後端不需要；亦可手動裝以 `SERIALWRAP_SERIAL_BACKEND=pyserial` 覆寫）。human console 路徑另需 `jq`、`minicom`。套件以 `pyproject.toml`（setuptools）打包，console_scripts `serialwrap` / `serialwrapd`，內嵌資產在 `sw_core/assets/`。
 
 ```bash
-# 安裝（pipx 隔離 venv + serialwrap setup；有 systemd → systemd-user，無 → on-demand 降級）
-./install.sh
+# 安裝（OD-50：下載 GitHub release bundle＋SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup；
+#       有 systemd → systemd-user，無 → on-demand 降級；需 x86_64、glibc ≥ 2.39、/usr/bin/python3.12）
+./install.sh [--version X.Y.Z] [--] [setup 參數...]
+# 離線／開發：--bundle 接 bundle 目錄或 tar.gz（開發者先由 checkout 建 bundle）
+scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
+./install.sh --bundle /tmp/sw-bundle
 serialwrap doctor                 # 驗證環境（python/pyyaml/PATH/dialout/systemd/監管模式/裝置）
 
 # 測試（CI 與政策以 pytest 為準）
@@ -271,7 +275,7 @@ POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平�
 
 - `tests/test_multiagent_e2e.py` 會啟動真實 daemon，再用 PTY 假 target 驗證 `READY` 流程與多 agent 序列化，任何跨 `service / arbiter / session_manager / uart_io` 的改動都適合先看這個測試。
 - `tests/test_wal.py`、`tests/test_login_fsm.py`、`tests/test_session_bind.py` 分別對應 WAL、登入狀態機與綁定/持久化行為。
-- 安裝走 `install.sh`（pipx install + `serialwrap setup`），不是單純複製檔案；setup 會物化資產、reconcile 監管模式（先停舊再起新）、並以 `detect_legacy_install` 偵測舊版 `~/.paul_tools` 安裝給退役指引（只指引不刪除）。
+- 安裝走 `install.sh`（下載 bundle tarball＋`SHA256SUMS` 驗證或 `--bundle` 離線，再執行 `<bundle>/bin/serialwrap setup`；pipx 路徑已退役，OD-50），不是單純複製檔案；setup 會物化資產、reconcile 監管模式（先停舊再起新）、並以 `detect_legacy_install` 偵測舊版 `~/.paul_tools` 安裝給退役指引（只指引不刪除）。
 
 ## v1.0.1 新增規則（issue 連結 / docs 對齊 / 語言）
 > 本段於 policy 1.0.1 隨 R-17 / R-18 與語言規範新增。

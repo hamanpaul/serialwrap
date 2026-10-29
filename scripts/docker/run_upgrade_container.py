@@ -5,6 +5,10 @@
 驗證入口取代、設定保留、監管 reconcile、狀態相容與 doctor → `setup --rollback` → 手動降級回 0.3.2 →
 重新升級。全程以 /proc 取樣監看 serialwrapd 實例數。判定見 upgrade_checks.py。
 
+`--scenario install-sh`（OD-50）：pipx 安裝 0.3.2 並建立基線 → 停 0.3.2 daemon → 以 swtest 執行新
+`install.sh --bundle <0.4.0 release 候選 tarball> -- <模式旗標>` → 驗證入口、設定、daemon、doctor 與舊 pipx 提示。
+必要檢查見 upgrade_checks.REQUIRED_INSTALL_SH_CHECKS；舊 daemon 執行中的情境不在此（OD-48）。
+
 只依賴標準函式庫與同目錄的 upgrade_checks（容器內以系統 python3 執行）。
 """
 from __future__ import annotations
@@ -53,8 +57,13 @@ targets:
 
 
 class Driver:
-    def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path) -> None:
+    def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path, *,
+                 scenario: str = "upgrade", installer: pathlib.Path | None = None,
+                 bundle_tarball: pathlib.Path | None = None) -> None:
         self.mode = mode
+        self.scenario = scenario
+        self.installer = installer
+        self.bundle_tarball = bundle_tarball
         self.flag = "--user" if mode == "systemd-user" else "--on-demand"
         self.wheel = wheel
         self.bundle = bundle
@@ -260,6 +269,9 @@ class Driver:
                             stop_rc=stop.returncode, old_gone=gone, setup_rc=proc.returncode,
                             op=install.get("op"), from_version=install.get("from_version"),
                             error_code=body.get("error_code"), backup_dir=install.get("backup_dir")))
+        self._judge_entries_and_config()
+
+    def _judge_entries_and_config(self) -> None:
         # 入口：~/.local/bin 兩個入口改指 0.4.0 版本目錄，舊 pipx 入口記錄在備份 entries.json
         entries = self.entries()
         target_dir = str(VERSIONS / NEW_VERSION / "bin")
@@ -278,6 +290,35 @@ class Driver:
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
         cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, uc.snapshot_files(CONFIG))
         self.add(cfg)
+
+    def phase_install_sh(self) -> None:
+        """OD-50：停 0.3.2 daemon 後以新 install.sh 安裝 0.4.0 bundle tarball（離線 --bundle）。"""
+        stop = self.sw("daemon", "stop", label="0.3.2 daemon stop（install.sh 前）")
+        gone = self.wait_no_daemon()
+        ok = stop.returncode == 0 and gone
+        self.add(uc.row("old_daemon_stopped", "PASS" if ok else "FAIL", None if ok else "0.3.2 daemon 未停止",
+                        stop_rc=stop.returncode, old_gone=gone, instances=uc.scan_daemon_instances()))
+        # 容器 /tmp 為 docker tmpfs（預設 noexec），解開的 bundle 無法執行：TMPDIR 改指 swtest 可執行的目錄
+        tmpdir = HOME / ".cache" / "sw-install-tmp"
+        self.run(["mkdir", "-p", str(tmpdir)], label="mkdir TMPDIR")
+        self.env["TMPDIR"] = str(tmpdir)
+        try:
+            proc = self.run(["bash", str(self.installer), "--bundle", str(self.bundle_tarball), "--", self.flag],
+                            label="install.sh --bundle（0.4.0）", timeout=600)
+        finally:
+            del self.env["TMPDIR"]
+        body = self.parse(proc) or {}
+        pipx_left = any((HOME / rel / "venvs" / "serialwrap").is_dir() for rel in (".local/share/pipx", ".local/pipx"))
+        leftover = sorted(str(p) for p in tmpdir.glob("serialwrap-install.*"))
+        self.add(uc.judge_install_sh("install_sh_upgrade", rc=proc.returncode, body=body,
+                                     output=proc.stdout + proc.stderr, pipx_venv_left=pipx_left,
+                                     leftover_tmp=leftover, new_version=NEW_VERSION))
+        install = body.get("install") or {}
+        start_step = next((s for s in install.get("steps") or [] if s.get("step") == "start_and_verify"), {})
+        if (start_step.get("detail") or {}).get("started") is False:
+            self.observations.append({"id": "OBS-UPGRADE-NOT-STARTED", "phase": "install_sh_upgrade",
+                                      "detail": start_step.get("detail")})
+        self._judge_entries_and_config()
 
     def phase_new_running(self) -> None:
         start = self.start_daemon("0.4.0 start")
@@ -386,6 +427,14 @@ class Driver:
         monitor = threading.Thread(target=self._monitor, daemon=True)
         monitor.start()
         try:
+            if self.scenario == "install-sh":
+                self.phase_old_install()
+                self.phase_seed()
+                self.phase_install_sh()
+                self.phase_new_running()
+                self.sw("daemon", "stop", label="收尾 daemon stop")
+                self.wait_no_daemon()
+                return
             self.phase_old_install()
             self.phase_seed()
             already = self.phase_upgrade_running()
@@ -413,7 +462,12 @@ def main() -> int:
     parser.add_argument("--wheel", required=True)
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--scenario", choices=("upgrade", "install-sh"), default="upgrade")
+    parser.add_argument("--installer", help="install-sh 情境：容器內 install.sh 路徑")
+    parser.add_argument("--bundle-tarball", help="install-sh 情境：0.4.0 release 候選 tarball")
     args = parser.parse_args()
+    if args.scenario == "install-sh" and not (args.installer and args.bundle_tarball):
+        parser.error("--scenario install-sh 需要 --installer 與 --bundle-tarball")
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     wheel = pathlib.Path(args.wheel)
@@ -425,7 +479,9 @@ def main() -> int:
     except (OSError, ValueError):
         pass
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    driver = Driver(args.mode, wheel, bundle, out)
+    driver = Driver(args.mode, wheel, bundle, out, scenario=args.scenario,
+                    installer=pathlib.Path(args.installer) if args.installer else None,
+                    bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None)
     error = None
     try:
         driver.execute()
@@ -435,6 +491,7 @@ def main() -> int:
     report = {
         "schema": "serialwrap.upgrade-report.v1",
         "mode": args.mode,
+        "scenario": args.scenario,
         "evidence_layer": "L1.5-docker",
         "producer": "scripts/docker/run-upgrade.sh",
         "old_version": OLD_VERSION,
@@ -451,7 +508,8 @@ def main() -> int:
         "checks": driver.rows,
         "observations": driver.observations,
     }
-    report["verdict"] = uc.overall_verdict(driver.rows)
+    required = uc.REQUIRED_INSTALL_SH_CHECKS if args.scenario == "install-sh" else uc.REQUIRED_CHECKS
+    report["verdict"] = uc.overall_verdict(driver.rows, required=required)
     (out / "upgrade-report.json").write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                                              encoding="utf-8")
     uid, gid = os.environ.get("SW_HOST_UID"), os.environ.get("SW_HOST_GID")

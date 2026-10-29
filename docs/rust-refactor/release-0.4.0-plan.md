@@ -19,12 +19,12 @@
 |---|---|---|
 | Linux x86_64 bundle（`serialwrap-0.4.0-linux-x86_64.tar.gz`） | `bin/serialwrap`（Rust CLI，20 個群組原生）、`bin/serialwrapd`（launcher）、`versions/0.4.0/`：`release-manifest.json`、`SHA256SUMS`、`py/`（自帶 PyYAML 的 Python daemon runtime＋`sw_core`，亦為 Python 委派元件 `python_cli_delegate`）；不含 `sw-cli/test-fakes` | `scripts/rust/mkbundle.sh --release-bundle --profile release --out <dir>`（`VERSION` 已改為 0.4.0，**不得**用 `--version-override`） |
 | Windows x86_64 bundle（`serialwrap-0.4.0-windows-x86_64.zip`） | 同上，入口為 `.exe`；可選 com0com 3.0.0.0 元件（`--with-com0com`，含 GPLv2 授權與原始碼連結） | 擁有者 Windows runner 原生建置（P9 BO-P9-17 的同一條路徑）；或 `--target x86_64-pc-windows-gnu` 交叉編譯後於 Windows 原生驗證 |
-| Python wheel（`serialwrap-0.4.0-py3-none-any.whl`） | Python CLI＋daemon（相容路徑：只裝 Python 的使用者、`install.sh`） | 既有 `release.yml` 的 `python3 -m build --wheel` |
-| `install.sh` | 目前仍為 pipx 安裝 Python 套件＋`serialwrap setup`（與 0.3.2 相同）。**0.4.0 Rust CLI 的安裝入口是 bundle 的 `bin/serialwrap setup`** | 見 RELEASE-TODO-02 |
+| Python wheel（`serialwrap-0.4.0-py3-none-any.whl`） | Python CLI＋daemon（照發；OD-50 後標準安裝流程不使用，`install.sh` 不再走 pipx） | 既有 `release.yml` 的 `python3 -m build --wheel` |
+| `install.sh` | OD-50：Linux 安裝 Rust bundle。預設從 GitHub release 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS` 並驗證（未給 `--version` 取 `releases/latest`），或以 `--bundle <目錄或 tar.gz>` 離線安裝；解到暫存目錄後執行 `<bundle>/bin/serialwrap setup` 並回傳其 rc。pipx 路徑退役 | repo 根目錄的 `install.sh`（`tests/test_install_sh.py`）；release 須附上 Linux bundle tarball 與含該列的 `SHA256SUMS`（RELEASE-TODO-01） |
 
 **RELEASE-TODO-01（release workflow）**：現行 `.github/workflows/release.yml` 只發佈 wheel 與 PyInstaller exe，沒有 Rust bundle job。release PR 必須新增 Linux bundle job（cargo build＋`mkbundle.sh --release-bundle --profile release`＋打包＋上傳＋`SHA256SUMS`）並登記 Windows bundle 的上傳方式；PyInstaller exe 是否續發由擁有者決定（建議 0.4.0 仍附上，供尚未改用 bundle 的 Windows 使用者）。
 
-**RELEASE-TODO-02（install.sh）**：決定 0.4.0 的 `install.sh` 是維持 pipx（Python CLI）還是改為「下載／解開 bundle 後執行 `bin/serialwrap setup`」。在決定前，release notes 必須明寫兩條安裝路徑的差異。
+**RELEASE-TODO-02（install.sh）**：已依擁有者裁決 OD-50（2026-10-29，(b')）決定並實作（分支 `feature/install-sh-bundle`）。新流程：`install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`——安裝前檢查系統需求（x86_64、glibc ≥ 2.39、`/usr/bin/python3.12`；Linux 使用者皆為 Ubuntu 24.04 以上），任一不符 rc=2 且不改動任何東西；未給 `--bundle` 時以 curl（無 curl 用 wget）從 GitHub release 下載 bundle tarball 與 `SHA256SUMS`，以該 tarball 的列驗證，雜湊不符或缺列立即失敗、不執行 setup；解到 mktemp 暫存目錄（結束時清除）後執行 `<bundle>/bin/serialwrap setup "$@"` 並回傳其 rc；setup 成功後偵測到舊 pipx 安裝（`pipx list --short` 含 serialwrap 或 pipx venv 目錄存在）時提示可 `pipx uninstall serialwrap`，不自動移除。pipx 安裝路徑退役（README 主要安裝方式一併改寫）；wheel 仍照發但標準流程不使用。下載基底 URL 可由 `SERIALWRAP_RELEASE_BASE_URL` 覆寫（測試用）。
 
 ## 3. 版號與 changelog 步驟（release PR 內執行）
 
@@ -98,6 +98,7 @@ while the daemon remains the Python implementation shipped inside the bundle.
 
 ### 繁體中文
 - `serialwrap` CLI 改為 Rust 原生實作（20 個命令群組），daemon 仍為 bundle 內附的 Python 實作（Stage 1）。
+- `install.sh` 改為安裝 Rust bundle（OD-50）：下載 GitHub release 的 `serialwrap-0.4.0-linux-x86_64.tar.gz` 並以 `SHA256SUMS` 驗證後執行 `bin/serialwrap setup`，或以 `--bundle` 離線安裝；系統需求為 x86_64、glibc ≥ 2.39（Ubuntu 24.04 以上）與 `/usr/bin/python3.12`。pipx 安裝路徑退役（wheel 仍照發）。
 - 新增發佈組合（bundle）安裝：`bin/serialwrap setup` 安裝到 `~/.local/share/serialwrap/versions/<版本>`（Windows：`%LOCALAPPDATA%\Programs\serialwrap`），支援原子更新、`setup --rollback` 與 `doctor` 的 `version_pairing` 檢查。
 - Windows：`windows-task` 監管（免管理員）、可選 com0com 虛擬序列埠（`setup --with-com0com`）。
 - 修正：pipx 安裝下 on-demand `daemon start` 找不到 `serialwrapd.py`。
@@ -106,6 +107,7 @@ while the daemon remains the Python implementation shipped inside the bundle.
 
 ### English
 - The `serialwrap` CLI is now native Rust (20 command groups); the daemon is still the bundled Python implementation (Stage 1).
+- `install.sh` now installs the Rust bundle (OD-50): it downloads `serialwrap-0.4.0-linux-x86_64.tar.gz` from the GitHub release, verifies it against `SHA256SUMS`, and runs `bin/serialwrap setup`; `--bundle` installs offline. Requirements: x86_64, glibc >= 2.39 (Ubuntu 24.04 or later), and `/usr/bin/python3.12`. The pipx install path is retired (the wheel is still published).
 - New bundle install: `bin/serialwrap setup` installs into `~/.local/share/serialwrap/versions/<version>` (Windows: `%LOCALAPPDATA%\Programs\serialwrap`) with atomic update, `setup --rollback`, and a `version_pairing` doctor check.
 - Windows: `windows-task` supervision (no admin), optional com0com virtual serial pair (`setup --with-com0com`).
 - Fixed: on-demand `daemon start` could not find `serialwrapd.py` under pipx installs.

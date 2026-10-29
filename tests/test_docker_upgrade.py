@@ -382,3 +382,98 @@ def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
         assert rep["verdict"] == "PASS", diag
         assert rep["evidence_layer"] == "L1.5-docker"
         assert rep["old_version"] == "0.3.2" and rep["new_version"] == "0.4.0"
+
+
+# ---------- OD-50：install.sh 升級路徑（0.3.2 pipx、daemon 已停止 → install.sh --bundle） ----------
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_install_sh_scenario_required_checks_and_verdict():
+    """install-sh 情境另列必要檢查；既有 18 項升級情境的 REQUIRED_CHECKS 不變。"""
+    assert len(uc.REQUIRED_CHECKS) == 18
+    assert "install_sh_upgrade" not in uc.REQUIRED_CHECKS
+    required = uc.REQUIRED_INSTALL_SH_CHECKS
+    assert {"old_install_0_3_2", "old_daemon_stopped", "install_sh_upgrade", "entries_replaced",
+            "config_preserved_upgrade", "new_daemon_started", "doctor_green_new", "no_two_reader"} <= set(required)
+    assert "upgrade_with_old_daemon_running" not in required
+    rows = [{"id": cid, "verdict": "PASS"} for cid in required]
+    assert uc.overall_verdict(rows, required=required) == "PASS"
+    assert uc.overall_verdict(rows[:-1], required=required) == "INSUFFICIENT"
+    # 預設仍以 18 項判定：install-sh 的檢查集合不足以讓升級情境 PASS
+    assert uc.overall_verdict(rows) == "INSUFFICIENT"
+
+
+def _install_body(**install):
+    base = {"op": "install", "to_version": "0.4.0"}
+    base.update(install)
+    return {"ok": True, "install": base}
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("kwargs,verdict", [
+    ({}, "PASS"),
+    ({"rc": 1}, "FAIL"),
+    ({"body": {"ok": False, "error_code": "METHOD_NOT_FOUND"}}, "FAIL"),
+    ({"body": _install_body(to_version="0.3.2")}, "FAIL"),
+    ({"output": "[serialwrap] SHA256 驗證通過"}, "FAIL"),  # 缺 pipx uninstall 提示
+    ({"pipx_venv_left": False}, "FAIL"),  # install.sh 不得自動移除舊 pipx
+    ({"leftover_tmp": ["/tmp/serialwrap-install.abc"]}, "FAIL"),
+])
+def test_judge_install_sh(kwargs, verdict):
+    args = {"rc": 0, "body": _install_body(), "output": "可執行 `pipx uninstall serialwrap` 移除舊版",
+            "pipx_venv_left": True, "leftover_tmp": []}
+    args.update(kwargs)
+    r = uc.judge_install_sh("install_sh_upgrade", **args)
+    assert r["verdict"] == verdict, r
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_install_sh_scenario(tmp_path):
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "install-sh", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "--network none" in out
+    assert "install.sh:/opt/sw-installer/install.sh:ro" in out
+    assert "serialwrap-0.4.0-linux-x86_64.tar.gz" in out
+    for mode in ("systemd-user", "on-demand"):
+        assert f"--mode {mode}" in out, out
+    assert out.count("--scenario install-sh") == 2, out
+    assert "/dev/ttyUSB" not in out and "--device" not in out
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_rejects_unknown_scenario(tmp_path):
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "bogus", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.supervisor_runtime
+def test_docker_install_sh_upgrade_from_0_3_2(tmp_path):
+    """實跑（OD-50）：兩種監管模式各自 0.3.2 pipx 安裝→停 daemon→`install.sh --bundle <0.4.0 tarball>`→升級成功。"""
+    if not _docker_available():
+        pytest.skip("cap_missing:docker：本機無可用 docker daemon（能力式 SKIP，證據不足，非 PASS）")
+    if subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/tags/v0.3.2"], cwd=REPO,
+                      capture_output=True).returncode != 0:
+        pytest.skip("cap_missing:tag_v0.3.2：版本庫沒有 v0.3.2 tag（證據不足，非 PASS）")
+    out = tmp_path / "ev"
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--scenario", "install-sh", "--out", str(out)], cwd=REPO,
+                       capture_output=True, text=True, timeout=1800, env=dict(os.environ))
+    reports = {}
+    for mode in ("systemd-user", "on-demand"):
+        path = out / mode / "upgrade-report.json"
+        reports[mode] = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    diag = json.dumps({m: None if rep is None else [c for c in rep.get("checks", []) if c.get("verdict") != "PASS"]
+                       for m, rep in reports.items()}, ensure_ascii=False)[:4000]
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:] + diag
+    for mode, rep in reports.items():
+        assert rep is not None, f"{mode} 未產生 upgrade-report.json"
+        assert rep["scenario"] == "install-sh"
+        assert rep["verdict"] == "PASS", diag
+        assert {c["id"] for c in rep["checks"]} >= set(uc.REQUIRED_INSTALL_SH_CHECKS)
