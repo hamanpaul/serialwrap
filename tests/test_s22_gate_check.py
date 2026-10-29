@@ -432,3 +432,102 @@ def test_process_evidence_row_requires_structured_red_and_green(tmp_path: Path) 
     rc, out = _run(tmp_path / "d", _good_reports(), emap=emap)
     row = next(r for r in out["parity_rows"] if r["row"] == "#179")
     assert row["verdict"] == "INSUFFICIENT" and rc == 1, row
+
+
+def _gate_module():
+    spec = importlib.util.spec_from_file_location("s22_gate_check", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_derive_caps_from_selector_unit() -> None:
+    """rulings/p6.md「OD-53 selector 記錄 caps」：不改鎖 schema，由現有 selector 推導收集器 `--caps`。
+    test-binary 參數（`--` 之後）恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需 caps；
+    其餘帶 ignored 意圖者（`--include-ignored`、`--ignored` 無篩選、混有非 cap 篩選或其他旗標、`--` 之前）推導不出（None）。"""
+    mod = _gate_module()
+    assert mod.derive_caps({"argv": PTY_ARGV}) == ["posix_pty"]
+    assert mod.derive_caps({"argv": ["-p", "x", "--", "--ignored", "cap_posix_pty__", "cap_windows_com__"]}) == [
+        "posix_pty", "windows_com"]
+    assert mod.derive_caps({"argv": [*CARGO_ARGV, "--", "--skip", "cap_"]}) == []
+    assert mod.derive_caps({"argv": CARGO_ARGV}) == []
+    assert mod.derive_caps({"argv": BB_ARGV}) == []
+    for tail in (["--ignored"], ["--include-ignored"], ["--include-ignored", "cap_posix_pty__"],
+                 ["--ignored", "cap_posix_pty__", "other_filter"], ["--ignored", "cap_posix_pty"],
+                 ["--ignored", "--skip", "x", "cap_posix_pty__"], ["--ignored", "cap_posix_pty__", "--exact"]):
+        assert mod.derive_caps({"argv": ["-p", "x", "--", *tail]}) is None, tail
+    assert mod.derive_caps({"argv": ["--ignored", "cap_posix_pty__"]}) is None, "`--` 之前的 --ignored 無法以 --caps 重現"
+
+
+def test_real_lock_s22_cargo_sets_caps_derivable() -> None:
+    """現行 L1 鎖的每個 `s22_gate:*` 集合皆可推導：`console_conformance_pty` → `posix_pty`，其餘不需 caps。"""
+    mod = _gate_module()
+    lock = json.loads((ROOT / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+    derived = {(sid, plat): mod.derive_caps(spec["selector"])
+               for sid, plats in lock["sets"].items() if sid.startswith("s22_gate:") for plat, spec in plats.items()}
+    assert derived[("s22_gate:console_conformance_pty", "linux")] == ["posix_pty"], derived
+    assert derived[("s22_gate:cargo_workspace", "linux")] == [], derived
+    assert all(v is not None for v in derived.values()), derived
+
+
+def test_underivable_caps_selector_is_evidence_missing(tmp_path: Path) -> None:
+    """推導不出 `--caps` 的集合（例：計畫 07 Task 13 Step 4 原文 `--include-ignored cap_posix_pty__`，收集器不轉交）→
+    該集合 EVIDENCE_MISSING、result 不得 PASS，即使報告各列皆 passed、argv 與 selector 相符；該報告的 passed 列不得
+    充當逐案證據，failed 列仍判 FAIL。可推導時輸出推導的 caps 與收集命令（`cargo_l1_results.py --caps <cap>`）。"""
+    bad_argv = [*PTY_ARGV[:-2], "--include-ignored", "cap_posix_pty__"]
+    lock = _lock()
+    lock["sets"]["s22_gate:console_conformance_pty"]["linux"]["selector"]["argv"] = bad_argv
+    cap_ref = "crates/sw-pal/tests/console_conformance.rs::cap_posix_pty__mux_mixed_pty_and_tcp"
+    emap = _emap()
+    emap["cases"]["sc28-cap-mux"] = {"status": "AUTOMATED", "tests": [cap_ref]}
+    reports = _good_reports()
+    reports[("console_conformance_pty", "linux")] = _report("linux", "cargo", bad_argv, [_row(PTY_CAP)])
+    rc, out = _run(tmp_path / "a", reports, lock=lock, emap=emap)
+    sec = _section(out, "s22_gate:console_conformance_pty", "linux")
+    assert sec["verdict"] == "EVIDENCE_MISSING" and sec["caps"] is None and sec["collect_argv"] is None, sec
+    case = _case(out, "sc28-cap-mux")
+    assert case["status"] == "INSUFFICIENT" and cap_ref in case["missing_tests"], case
+    assert out["result"] == "INSUFFICIENT" and rc == 1
+
+    reports[("console_conformance_pty", "linux")] = _report(
+        "linux", "cargo", bad_argv, [_row(PTY_CAP, "failed")], exit_code=101)
+    rc, out = _run(tmp_path / "b", reports, lock=lock, emap=emap)
+    assert _case(out, "sc28-cap-mux")["status"] == "FAIL" and out["result"] == "FAIL" and rc == 1, out
+
+    rc, out = _run(tmp_path / "c", _good_reports(), emap=emap)
+    sec = _section(out, "s22_gate:console_conformance_pty", "linux")
+    assert sec["verdict"] == "PASS" and sec["caps"] == ["posix_pty"], sec
+    argv = sec["collect_argv"]
+    assert argv[:2] == ["python3", "scripts/rust/cargo_l1_results.py"] and argv[argv.index("--caps") + 1] == "posix_pty"
+    assert argv[argv.index("--") + 1:] == PTY_ARGV, argv
+    work = _section(out, "s22_gate:cargo_workspace", "linux")
+    assert work["caps"] == [] and "--caps" not in work["collect_argv"], work
+    assert _section(out, "s22_gate:blackbox_rust", "linux")["collect_argv"] is None, "pytest 集合不由 cargo 收集器收集"
+    assert _case(out, "sc28-cap-mux")["status"] == "PASS" and out["result"] == "PASS" and rc == 0, out
+
+
+def test_plan_lists_derived_cargo_collect_commands(tmp_path: Path) -> None:
+    """`--plan`：只依 L1 鎖輸出各 cargo `s22_gate:*` 集合的收集命令（前置收集由 gate 推導，不手打 `--caps`）；
+    推導不出者 `collect_argv` 為 null、exit 1。Windows 集合由 win-test.sh 原生收集，只列 caps。"""
+    def plan(lock: dict, sub: str) -> tuple[int, list[dict]]:
+        lock_path = tmp_path / f"{sub}.json"
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(SCRIPT), "--plan", "--l1-results", str(tmp_path / sub),
+                               "--lock", str(lock_path)], capture_output=True, text=True, timeout=60)
+        return proc.returncode, json.loads(proc.stdout)
+
+    rc, entries = plan(_lock(), "ok")
+    by_set = {(e["set_id"], e["platform"]): e for e in entries}
+    assert set(by_set) == {("s22_gate:cargo_workspace", "linux"), ("s22_gate:console_conformance_pty", "linux"),
+                           ("s22_gate:win_test", "windows")}, entries
+    cap_entry = by_set[("s22_gate:console_conformance_pty", "linux")]
+    assert cap_entry["caps"] == ["posix_pty"] and "--caps" in cap_entry["collect_argv"]
+    out_arg = cap_entry["collect_argv"][cap_entry["collect_argv"].index("--out") + 1]
+    assert out_arg == str(tmp_path / "ok" / "console_conformance_pty" / "linux" / "resource-report.json")
+    assert by_set[("s22_gate:win_test", "windows")]["collect_argv"] is None
+    assert rc == 0
+    bad = _lock()
+    bad["sets"]["s22_gate:console_conformance_pty"]["linux"]["selector"]["argv"] = [*PTY_ARGV[:-2], "--include-ignored"]
+    rc, entries = plan(bad, "bad")
+    entry = next(e for e in entries if e["set_id"] == "s22_gate:console_conformance_pty")
+    assert entry["caps"] is None and entry["collect_argv"] is None and rc == 1, entries
