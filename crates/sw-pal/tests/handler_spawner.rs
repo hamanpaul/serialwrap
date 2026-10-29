@@ -122,3 +122,17 @@ fn py_returncode_matches_python_popen() {
     #[cfg(not(windows))]
     assert_eq!(py_returncode(-9), -9);
 }
+
+/// 審查第 11 輪（Task 18 黑箱 `test_handler_timeout_kills_group` 揭露）：daemon 的 sigwait 設計阻擋 INT／TERM，
+/// handler 子行程不得繼承（POSIX）。
+#[cfg(unix)]
+#[test]
+fn native_child_signal_mask_is_empty_even_if_spawner_blocks_term() {
+    suite::child_signal_mask_is_empty_even_if_spawner_blocks_term(native());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_timeout_kills_background_job_when_spawner_blocks_term() {
+    suite::timeout_kills_background_job_when_spawner_blocks_term(native());
+}

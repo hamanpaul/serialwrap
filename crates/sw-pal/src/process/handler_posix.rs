@@ -34,6 +34,8 @@ struct ExecPlan {
     candidates: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
     envp_ptrs: Vec<*const libc::c_char>,
+    /// fork 前備妥的空 signal mask（子行程 `pthread_sigmask(SIG_SETMASK)` 用）。
+    empty_mask: libc::sigset_t,
 }
 
 // SAFETY: 指標只指向本結構自有、建立後不再變動的 CString 緩衝；僅在 fork 後的子行程中讀取。
@@ -82,13 +84,36 @@ impl ExecPlan {
         argv_ptrs.push(std::ptr::null());
         let mut envp_ptrs: Vec<*const libc::c_char> = envp.iter().map(|c| c.as_ptr()).collect();
         envp_ptrs.push(std::ptr::null());
+        // SAFETY: sigemptyset 只初始化堆疊上的 sigset_t。
+        let empty_mask = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            set
+        };
         Ok(Self {
             _argv: argv,
             _envp: envp,
             candidates,
             argv_ptrs,
             envp_ptrs,
+            empty_mask,
         })
+    }
+
+    /// CPython 子行程的訊號狀態：signal mask 為空（CPython daemon 執行緒不阻擋訊號；Rust daemon 以 sigwait 阻擋
+    /// INT／TERM，見 `crate::signal`），`restore_signals=True` 把 SIGPIPE／SIGXFSZ 還原為預設（daemon 端忽略 SIGPIPE）。
+    /// 本模組在 `pre_exec` 內自行 `execve`，std 於 closure 之後的訊號重設不會執行，故於此處明做（async-signal-safe）。
+    fn reset_signals(&self) -> io::Result<()> {
+        // SAFETY: fork 後單執行緒子行程內，只呼叫 async-signal-safe 的 pthread_sigmask／signal。
+        unsafe {
+            let rc = libc::pthread_sigmask(libc::SIG_SETMASK, &self.empty_mask, std::ptr::null_mut());
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
+        }
+        Ok(())
     }
 
     /// 逐一 `execve`；成功不返回。回報第一個非 ENOENT／ENOTDIR 的 errno，否則最後一個（不配置記憶體）。
@@ -159,7 +184,7 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: closure 只呼叫 async-signal-safe 的 setsid／close_range／fcntl／execve，於 fork 後、exec 前執行，
+    // SAFETY: closure 只呼叫 async-signal-safe 的 setsid／pthread_sigmask／signal／close_range／fcntl／execve，於 fork 後、exec 前執行，
     // 不配置記憶體（argv／envp／候選路徑皆於 fork 前備妥）；只「標記」CLOEXEC（不直接關閉），保留 std 回報
     // exec 失敗用的 CLOEXEC pipe。execve 全數失敗時回 Err，由 std 經該 pipe 回報 errno。
     unsafe {
@@ -167,6 +192,7 @@ pub(super) fn run(spec: &HandlerSpec, abort: &HandlerAbort) -> HandlerOutcome {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
+            plan.reset_signals()?;
             mark_inherited_fds_cloexec(max_fd)?;
             Err(plan.exec())
         });

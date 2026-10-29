@@ -624,3 +624,62 @@ pub fn huge_timeout_overflow_keeps_pipes_open(s: &dyn HandlerSpawner) {
     assert!(!eof, "stdin 不得在溢位後提前收到 EOF");
     assert!(alive, "等待 stdin 的 handler 仍存活");
 }
+
+/// 在 SIGINT／SIGTERM 已被 `pthread_sigmask` 阻擋的執行緒內執行 `f`（重現 daemon 的 sigwait 設計：
+/// `sw_pal::signal` 於所有執行緒阻擋 INT／TERM，交由專屬 thread `sigwait`）。
+#[cfg(unix)]
+fn with_term_blocked<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::spawn(move || {
+        // SAFETY: 只修改本（新建）執行緒自身的 signal mask；sigset 於堆疊上初始化。
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGINT);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+        }
+        f()
+    })
+    .join()
+    .expect("blocked-mask thread")
+}
+
+/// Python 基線的 handler 子行程 signal mask 為空（CPython daemon 執行緒不阻擋訊號）；Rust daemon 以 sigwait
+/// 阻擋 INT／TERM，spawn 時必須清空，否則 handler 收不到 SIGTERM（POSIX）。
+#[cfg(unix)]
+pub fn child_signal_mask_is_empty_even_if_spawner_blocks_term(s: std::sync::Arc<dyn HandlerSpawner>) {
+    let sp = spec(
+        // 背景 job：dash 以啟動時的 mask 建立 async 子行程，直接子行程的 mask 不足以觀察。
+        s.shell_argv("grep -E '^SigBlk:' /proc/self/status & wait"),
+        minimal_env(&*s),
+        b"",
+        Duration::from_secs(10),
+    );
+    let out = with_term_blocked(move || s.run(&sp, &HandlerAbort::new()));
+    let HandlerOutcome::Completed { exit_code, stdout_tail, .. } = out else {
+        panic!("{out:?}");
+    };
+    assert_eq!(exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&stdout_tail), "SigBlk:\t0000000000000000\n");
+}
+
+/// 逾時以 `killpg(SIGTERM)` 收尾：背景孫行程（`sleep & sleep`，持有 stdout 管線）必須隨 SIGTERM 結束，
+/// 不得因繼承被阻擋的 SIGTERM 而存活到自然結束（Python：`fire_timeout` 於逾時＋寬限內產生）。
+#[cfg(unix)]
+pub fn timeout_kills_background_job_when_spawner_blocks_term(s: std::sync::Arc<dyn HandlerSpawner>) {
+    let marker = unique_marker();
+    let sp = spec(
+        s.shell_argv(&format!("sleep 30 & sleep 30; : {marker}")),
+        minimal_env(&*s),
+        b"",
+        Duration::from_millis(300),
+    );
+    let t0 = Instant::now();
+    let out = with_term_blocked(move || s.run(&sp, &HandlerAbort::new()));
+    assert!(matches!(out, HandlerOutcome::TimedOut), "{out:?}");
+    assert!(
+        t0.elapsed() < Duration::from_millis(300) + Duration::from_secs(1) + Duration::from_secs(3),
+        "逾時收尾不得等背景 sleep 自然結束：{:?}",
+        t0.elapsed()
+    );
+}
