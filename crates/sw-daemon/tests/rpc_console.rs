@@ -208,9 +208,9 @@ fn console_input_reaches_uart_and_rx_fans_out() {
 #[test]
 fn console_methods_no_longer_deferred() {
     let r = ServiceRig::with_console_backend("pty");
-    // 依 crate 目錄定位（cargo_l1_results.py 以 repo 根為 cwd 執行測試執行檔，相對路徑會失敗）。
-    let scope = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/acceptance/slice21_scope.yaml")).unwrap();
-    let still = support::deferred_methods(&scope, &["2.1", sw_core::SLICE]);
+    // 編譯期內嵌（cargo_l1_results.py 以 repo 根為 cwd 執行測試執行檔，執行期相對路徑會失敗）。
+    let scope = include_str!("../../../tests/acceptance/slice21_scope.yaml");
+    let still = support::deferred_methods(scope, &["2.1", sw_core::SLICE]);
     assert!(still.iter().all(|m| !m.starts_with("session.console_")), "{still:?}");
     for m in ["session.console_attach", "session.console_detach", "session.console_list"] {
         let resp = r.call(m, r#"{"selector":"COM0","client_id":"x"}"#);
