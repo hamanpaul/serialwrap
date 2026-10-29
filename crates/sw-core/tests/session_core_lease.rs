@@ -1213,3 +1213,61 @@ fn dequeue_parked_command_aborted_on_drain() {
         h.tx_order()
     );
 }
+
+/// 建立停在回放 hold 的命令 B（同 `dequeue_lazy_expiry_replays_before_next_command` 的序列），回傳 (B 的 cmd_id, session_id)。
+fn parked_command(h: &mut CoreHarness) -> (String, String) {
+    h.set_auto_complete_human_tx(false);
+    h.attach_pty_console("c1", true);
+    let r = h.rpc(open_req("agent:a", 1.0, "", false)).unwrap();
+    assert_eq!(r.get("soft_preempted"), Some(&true.into()));
+    h.input("c1", b"Q");
+    h.clock.advance(Duration::from_millis(1500));
+    let resp = h.rpc(SessionRequest::Submit(agent_submit("echo B"))).unwrap();
+    let cmd_id = resp["cmd_id"].as_str().unwrap().to_string();
+    let row = h.reg.get(&cmd_id).unwrap();
+    assert_eq!(row["status"], PyValue::from("running"), "B 已出列、停在回放 hold：{row:?}");
+    let sid = row["session_id"].as_str().unwrap().to_string();
+    assert_eq!(h.reg.pending(&sid), 1);
+    (cmd_id, sid)
+}
+
+/// sol P6-e9b5c61-2（High）：停放命令被 `command.cancel` 後，回放結算的 kick 跳過該命令時必須結算 registry
+/// 的在途指標（Python worker 收尾 `_running.pop`）；修正前 canceled＋in_flight 永久多算一筆 pending。
+#[test]
+fn canceled_parked_command_releases_pending_slot() {
+    let mut h = ready();
+    let (cmd_id, sid) = parked_command(&mut h);
+    assert_eq!(h.reg.cancel(&cmd_id, "wall")["ok"], PyValue::from(true));
+    h.rpc(SessionRequest::CancelQueued { cmd_id: cmd_id.clone() }).unwrap();
+    let fx = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert!(
+        !fx.iter().any(|e| matches!(e, Effect::StartOp { spec: OpSpec::Command(_), .. })),
+        "canceled 的停放命令不送出"
+    );
+    assert!(!h.tx_order().iter().any(|(c, _)| *c == TxClass::Command), "零 Command TX");
+    assert_eq!(h.reg.get(&cmd_id).unwrap()["status"], PyValue::from("canceled"), "保留 canceled 紀錄");
+    assert_eq!(h.reg.pending(&sid), 0, "停放命令取消後不得占用 pending 額度");
+    // 後續命令照常出列、完成後 pending 歸零（容量完整恢復）。
+    let c = h.start_foreground_command("echo C");
+    assert_eq!(h.reg.get(&c.cmd_id).unwrap()["status"], PyValue::from("running"));
+    let epoch = h.epoch();
+    h.feed(ControlEvent::OpFinished {
+        op_id: c.op_id,
+        epoch,
+        outcome: OpOutcome::CommandResult(pydict! { "ok" => true, "stdout" => "C" }),
+        after_rx_seq: None,
+    });
+    assert_eq!(h.reg.pending(&sid), 0);
+}
+
+/// 同上：停放命令取消後才遇 drain，同樣結算在途指標（`abort_parked_command` 不得因已取消而略過收尾）。
+#[test]
+fn canceled_parked_command_then_drain_releases_pending_slot() {
+    let mut h = ready();
+    let (cmd_id, sid) = parked_command(&mut h);
+    assert_eq!(h.reg.cancel(&cmd_id, "wall")["ok"], PyValue::from(true));
+    h.begin_stop(StopKind::IoError);
+    assert_eq!(h.reg.get(&cmd_id).unwrap()["status"], PyValue::from("canceled"));
+    assert_eq!(h.reg.pending(&sid), 0, "drain 後 canceled 停放命令不得占用 pending");
+    assert!(!h.tx_order().iter().any(|(c, _)| *c == TxClass::Command));
+}

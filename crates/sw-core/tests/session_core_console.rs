@@ -696,3 +696,73 @@ fn late_console_connected_after_release_is_rejected() {
     assert!(h.core.human_console().consoles.contains_key("t2"));
     assert_eq!(owner(&h).as_deref(), Some("human:t2"));
 }
+
+/// 取 rpc_deferred 回傳效果中的 SelfTestProbe／Recover StartOp grant。
+fn side_grant(fx: &[Effect]) -> OpGrant {
+    fx.iter()
+        .find_map(|e| match e {
+            Effect::StartOp {
+                grant,
+                spec: OpSpec::SelfTestProbe { .. } | OpSpec::Recover { .. },
+            } => Some(grant.clone()),
+            _ => None,
+        })
+        .expect("StartOp(SelfTestProbe／Recover)")
+}
+
+fn self_test_ok() -> OpOutcome {
+    OpOutcome::SelfTest(pydict! { "probe_ok" => true, "rx_bytes_last_10s" => 0 })
+}
+
+/// sol P6-e9b5c61-1（High）：並行 self-test 各自保留 suspend 旗標並於各自完成時配對 resume
+/// （Python `self_test` 的區域變數 `suspend_human_interactive`＋`finally: bridge.resume_interactive()`，
+/// `session_manager.py:7599,7622,7693`）。修正前共用單一布林：S2 覆寫 S1 的旗標，S1 完成時不再 resume，
+/// suspend_depth 留在 1、後續按鍵永久 deferred。
+#[test]
+fn overlapping_self_tests_each_resume_their_own_suspend() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    let (_r1, fx1) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
+    let s1 = side_grant(&fx1);
+    let (_r2, fx2) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
+    let s2 = side_grant(&fx2);
+    assert_ne!(s1.op_id, s2.op_id);
+    let fx = h.input("c1", b"k");
+    assert!(human_txs(&fx).is_empty(), "兩個 probe 期間無 HumanRaw");
+    let epoch = h.epoch();
+    let fx = h.feed(ControlEvent::OpFinished { op_id: s2.op_id, epoch, outcome: self_test_ok(), after_rx_seq: None });
+    assert!(human_txs(&fx).is_empty(), "S1 仍在 probe：S2 完成不得回放");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "S2 只結算自己的 suspend");
+    let fx = h.feed(ControlEvent::OpFinished { op_id: s1.op_id, epoch, outcome: self_test_ok(), after_rx_seq: None });
+    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0, "兩次 suspend 都已配對 resume");
+    let fx = h.input("c1", b"z");
+    assert_eq!(human_txs(&fx), vec![(TxClass::HumanRaw, "human:c1".to_string(), b"z".to_vec())], "resume 後按鍵直送");
+}
+
+/// sol P6-e9b5c61-1（High）：READY recover 並行 side op 完成時不得解除另一個 self-test probe 的 suspend
+/// （Python `recover_session` 不碰 self-test 的 suspend 旗標）。修正前 Recover 完成無條件 `self_test_suspend_end`。
+#[test]
+fn recover_side_op_does_not_resume_self_test_suspend() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    let (_r1, fx1) = h.rpc_deferred(SessionRequest::SelfTest { timeout_s: 2.0, strict_human_lock: false });
+    let s1 = side_grant(&fx1);
+    h.input("c1", b"k");
+    let (_rr, fxr) = h.rpc_deferred(SessionRequest::Recover { timeout_s: 2.0, force: false });
+    let rec = side_grant(&fxr);
+    let epoch = h.epoch();
+    let fx = h.feed(ControlEvent::OpFinished {
+        op_id: rec.op_id,
+        epoch,
+        outcome: OpOutcome::Recovered { key: "CTRL_C", stdout: String::new() },
+        after_rx_seq: None,
+    });
+    assert!(human_txs(&fx).is_empty(), "self-test probe 仍在途：recover 完成不得回放");
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 1, "recover 不解除 self-test 的 suspend");
+    let fx = h.feed(ControlEvent::OpFinished { op_id: s1.op_id, epoch, outcome: self_test_ok(), after_rx_seq: None });
+    assert_eq!(human_txs(&fx), vec![(TxClass::HumanReplay, "human:c1".to_string(), b"k".to_vec())]);
+    assert_eq!(h.core.human_console().ownership.suspend_depth, 0);
+}
