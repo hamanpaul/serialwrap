@@ -1,0 +1,296 @@
+{
+  "bundle_git_revision": "2f8f7ed368d44d5668af4e08c101dff8af5b7c51",
+  "bundle_manifest_sha256": "86586c577cba0852422d80f3c2b850f3aee1ee8dc581c6766c3e73eb7b5af3b8",
+  "bundle_version": "0.4.0",
+  "checks": [
+    {
+      "detail": {
+        "cli_version": "serialwrap 0.3.2",
+        "daemon_version": "0.3.2",
+        "entries": {
+          "serialwrap": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrap",
+          "serialwrapd": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrapd"
+        },
+        "pipx_rc": 0,
+        "setup_rc": 0
+      },
+      "id": "old_install_0_3_2",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "aliases": [
+          "pinned",
+          "shellboard+7",
+          "upgbench"
+        ],
+        "config_files": [
+          "/etc/serialwrap/profiles/bench.yaml",
+          "config.yaml",
+          "profiles/bench.yaml",
+          "profiles/brcm.env.example",
+          "profiles/default.yaml"
+        ],
+        "rcs": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "sessions": [
+          {
+            "act_no": 7,
+            "activity_classification": "offline",
+            "alias": "upgbench",
+            "attached_real_path": null,
+            "boot_quiet_remaining_s": null,
+            "bridge_generation": 0,
+            "capture": null,
+            "com": "COM7",
+            "command_capable": true,
+            "console_count": 0,
+            "detached_at": "2026-10-29T06:30:40.243011+00:00",
+            "device_by_id": "/dev/serial/by-id/usb-UPGRADE_REBOUND-if00-port0",
+            "fg_cmd_expected_duration_s": null,
+            "foreground_busy": false,
+            "idle_for_ms": null,
+            "interactive_session_id": null,
+            "last_error": "DEVICE_NOT_FOUND",
+            "last_error_detail": null,
+            "last_probe_at": null,
+            "last_ready_at": null,
+            "last_rx_age_s": null,
+            "last_rx_at": null,
+            "last_state_change_at": null,
+            "last_tx_age_s": null,
+            "last_tx_at": null,
+            "next_reprobe_at": null,
+            "outstanding_commands": 0,
+            "platform": "shell",
+            "profile": "shellboard",
+            "profile_source": "yaml-target",
+            "ready_reconfirm_failed": false,
+            "ready_reconfirm_pending": false,
+            "ready_reconfirm_remaining_s": null,
+            "recovering": false,
+            "released_at": null,
+            "released_by": null,
+            "released_reason": null,
+            "reprobe_attempts": 0,
+            "reprobe_exhausted": false,
+            "rx_bytes_last_10s": null,
+            "rx_rate_bps": null,
+            "session_id": "shellboard:COM7",
+            "state": "DETACHED",
+            "vtty": null
+          }
+        ]
+      },
+      "id": "seed_user_data",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "advisory_failed": [
+          "devices"
+        ],
+        "failed": [],
+        "ok": true,
+        "version_pairing": null
+      },
+      "id": "doctor_green_old",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "outcome": "switched"
+      },
+      "id": "upgrade_with_old_daemon_running",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "config": {
+          "added": [],
+          "files": 5
+        },
+        "daemon_pid_after": 377,
+        "daemon_version_after": "0.4.0",
+        "error_code": null,
+        "instances_after": [
+          377
+        ],
+        "legacy_stop": {
+          "from_version": "0.3.2",
+          "method": "systemctl_stop",
+          "relaunch_count": 0,
+          "stability_window_ms": 5000,
+          "stopped": [
+            {
+              "pid": 175,
+              "start_ticks": 297843
+            }
+          ],
+          "waited_ms": 5219
+        },
+        "old_alive_after": [],
+        "old_pids": [
+          175
+        ],
+        "op": "install",
+        "overlaps": [],
+        "refusal_reason": null,
+        "setup_rc": 0,
+        "started_by_setup": true,
+        "to_version": "0.4.0"
+      },
+      "id": "legacy_handoff_direct_setup",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "outcome": "not_needed_handoff_succeeded"
+      },
+      "id": "upgrade_after_stop",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "backup_targets": [
+          "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrap",
+          "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrapd"
+        ],
+        "cli_version": "serialwrap 0.4.0",
+        "entries": {
+          "serialwrap": "/home/swtest/.local/share/serialwrap/versions/0.4.0/bin/serialwrap",
+          "serialwrapd": "/home/swtest/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd"
+        },
+        "pipx_venv_left": true
+      },
+      "id": "entries_replaced",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "added": [],
+        "files": 5
+      },
+      "id": "config_preserved_upgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "argv": [
+          "/home/swtest/.local/share/serialwrap/versions/0.4.0/py/bin/python3",
+          "-I",
+          "-B",
+          "/home/swtest/.local/share/serialwrap/versions/0.4.0/py/serialwrapd.py",
+          "--socket",
+          "/run/serialwrap/serialwrapd.sock"
+        ],
+        "instances": [
+          377
+        ],
+        "multi_open": false,
+        "pid": 377,
+        "started_by": "setup",
+        "version": "0.4.0"
+      },
+      "id": "new_daemon_started",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "active": "active",
+        "daemon_pid": 377,
+        "dropins": [],
+        "enabled": "enabled",
+        "main_pid": "377",
+        "mode_in_config": true
+      },
+      "id": "supervision_reconciled",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "aliases_added": [],
+        "aliases_missing": [],
+        "bindings_changed": []
+      },
+      "id": "state_compatible_upgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "advisory_failed": [
+          "devices"
+        ],
+        "failed": [],
+        "ok": true,
+        "version_pairing": true
+      },
+      "id": "doctor_green_new",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "instances_seen": [
+          110,
+          158,
+          175,
+          377
+        ],
+        "overlap_count": 0,
+        "overlaps": [],
+        "samples": 1602
+      },
+      "id": "no_two_reader",
+      "reason": null,
+      "verdict": "PASS"
+    }
+  ],
+  "evidence_layer": "L1.5-docker",
+  "finished": "2026-10-29T06:30:49Z",
+  "image": "serialwrap-upgrade:od48r2f-systemd-system",
+  "image_id": "sha256:aeb4b9fbcbd37aab8922655810387e7538ecbb3cb902eb9f26d5a68906b78f24",
+  "mode": "systemd-system",
+  "new_version": "0.4.0",
+  "observations": [
+    {
+      "detail": "0.3.2 system unit UMask=0117：daemon 自建目錄為 0660，ensure_runtime_dirs／ttyMCU 目錄 PermissionError",
+      "id": "OBS-0.3.2-SYSTEM-UMASK",
+      "phase": "old_install_0_3_2",
+      "warmup_rc": 124,
+      "workaround": "以 swtest 一般 umask 前景啟動一次 0.3.2 daemon 建立目錄"
+    },
+    {
+      "id": "OBS-SYSTEM-PROFILES-MANAGED",
+      "managed": [
+        "brcm.env.example",
+        "default.yaml"
+      ],
+      "note": "system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 的同名檔（0.3.2 同語意）；保留判定只比對使用者自加的檔案",
+      "phase": "seed_user_data"
+    }
+  ],
+  "old_version": "0.3.2",
+  "producer": "scripts/docker/run-upgrade.sh",
+  "schema": "serialwrap.upgrade-report.v1",
+  "scope": "legacy_direct_setup_success_path",
+  "started": "2026-10-29T06:30:16Z",
+  "verdict": "PASS",
+  "wheel": "serialwrap-0.3.2-py3-none-any.whl",
+  "wheel_sha256": "64f95b8aa3385ebc1f591bd4e4c2c49f173a710126e0bdcf86455865c6f70952"
+}
