@@ -32,8 +32,10 @@ mkdir -p "$RUN/logs"
 [[ -n "$OUT_MD" ]] || OUT_MD="$ROOT/docs/rust-refactor/evidence/p7-gate-$(date +%y%m%d).md"
 cd "$ROOT"
 REPORT=(python3 scripts/rust/p7_gate_report.py)
-RUST_CLI="$ROOT/target/debug/serialwrap"
-RUST_D="$ROOT/target/debug/serialwrapd"
+# 受測 artifact 於建置後立即快照到 run 目錄：之後的 cargo L1 列（--features test-fakes）與全套 pytest 會重建
+# target/debug/ 的同名執行檔，若直接引用會讓黑箱跑到 test-fakes 版、verify 的 sha256 也對不上（第 12 輪實跑揭露）。
+RUST_CLI="$RUN/artifacts/serialwrap"
+RUST_D="$RUN/artifacts/serialwrapd"
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 argv_json() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
@@ -91,6 +93,9 @@ record_existing() {
 
 # 0. 受測 artifact：Rust CLI＋daemon（非 test-fakes）。
 cargo build --workspace --bins >"$RUN/logs/build.log" 2>&1 || { echo "p7_gate.sh: cargo build 失敗（$RUN/logs/build.log）" >&2; exit 1; }
+mkdir -p "$RUN/artifacts"
+cp -p "$ROOT/target/debug/serialwrap" "$RUST_CLI"
+cp -p "$ROOT/target/debug/serialwrapd" "$RUST_D"
 CAPS=()
 if ! [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then CAPS+=(windows_native windows_com); fi
 [[ -n "${SW_TEST_COM_PAIR:-}" ]] || CAPS+=(windows_com)

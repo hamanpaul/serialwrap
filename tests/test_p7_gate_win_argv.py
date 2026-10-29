@@ -41,3 +41,15 @@ def test_gate_func_comparison_lookup_finds_nested_report(tmp_path):
     (nested / "comparison.json").write_text("{}", encoding="utf-8")
     r = subprocess.run(["bash", "-c", f'd="{tmp_path}"; {line}; printf %s "$cmp"'], capture_output=True, text=True, timeout=30)
     assert r.stdout == str(nested / "comparison.json"), (r.stdout, r.stderr)
+
+
+def test_gate_snapshots_artifacts_before_cargo_rebuilds():
+    """受測 CLI／daemon 須在 cargo build 後、cargo L1 列（--features test-fakes 會重建 target/debug）之前快照到 run
+    目錄，黑箱與 verify 皆引用快照（第 12 輪實跑：引用 target/debug 使 verify 的 artifact sha256 不符）。"""
+    text = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
+    assert 'RUST_D="$RUN/artifacts/serialwrapd"' in text and 'RUST_CLI="$RUN/artifacts/serialwrap"' in text
+    build = text.index("cargo build --workspace --bins")
+    snap = text.index('cp -p "$ROOT/target/debug/serialwrapd" "$RUST_D"')
+    l1 = text.index('run_row "cargo test --workspace"')
+    assert build < snap < l1
+    assert "target/debug/serialwrapd" not in text[snap + 60:], "快照之後不得再引用 target/debug 的 daemon"
