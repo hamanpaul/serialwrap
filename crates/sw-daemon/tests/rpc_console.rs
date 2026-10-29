@@ -707,3 +707,111 @@ fn od37_send_with_pre_release_id_after_reattach_not_found_zero_tx() {
         assert!(!dev.take_tx().contains(&b'x'), "human={human}：零 TX");
     }
 }
+
+/// 接線＋端到端（review-convergence-rules §5；sol P6-e9b5c61-1）：daemon 級（真 SessionManager＋Service＋ConsoleHub＋
+/// human TX pump）兩個重疊的 `session.self_test` probe 各自 suspend／resume human——S1 的 probe 寫入停在提交前、
+/// S2 隨後提交，期間 c1 鍵入 `k` 不得上 UART；兩個 probe 完成後 `k` 回放到 UART、之後按鍵直送。
+/// 修正前共用旗標使一次 resume 遺失，`k` 永不回放（等待逾時）。
+#[test]
+fn overlapping_self_tests_replay_human_input_end_to_end() {
+    use sw_pal::fakes::serial::FakeWriteStep;
+    let r = ServiceRig::with_console_backend("pty");
+    attach(&r, r#"{"selector":"COM0"}"#);
+    let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
+    dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    std::thread::scope(|scope| {
+        let s1 = scope.spawn(|| r.call("session.self_test", r#"{"selector":"COM0"}"#));
+        assert!(dev.wait_paused(Duration::from_secs(5)), "S1 probe 寫入停在提交前");
+        let s2 = scope.spawn(|| r.call("session.self_test", r#"{"selector":"COM0"}"#));
+        std::thread::sleep(Duration::from_millis(300)); // S2 已進 core（suspend）並排在 TX writer 後
+        io.push_input(b"k");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!dev.take_tx().contains(&b'k'), "probe 期間 human 按鍵不得上 UART");
+        dev.release_pause();
+        let (a, b) = (s1.join().unwrap(), s2.join().unwrap());
+        assert_eq!(a.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&a));
+        assert_eq!(b.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&b));
+    });
+    let mut seen = Vec::new();
+    wait_for("兩個 probe 完成後回放 k", || {
+        seen.extend(dev.take_tx());
+        seen.contains(&b'k')
+    });
+    io.push_input(b"z");
+    wait_for("resume 後按鍵直送", || {
+        seen.extend(dev.take_tx());
+        seen.contains(&b'z')
+    });
+}
+
+/// 接線＋端到端（§5）：core 的 `Effect::ConsoleOut` 經 manager executor 交給 hub 寫到該 console——第二個 console
+/// 走 line-buffer，按鍵的本地回顯（`uart_io.py` line mode echo）出現在該 console 的輸出、不上 UART。
+#[test]
+fn second_console_local_echo_reaches_its_console() {
+    let r = ServiceRig::with_console_backend("pty");
+    attach(&r, r#"{"selector":"COM0"}"#);
+    let second = attach(&r, r#"{"selector":"COM0"}"#);
+    assert_eq!(second.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&second));
+    let (_, io2) = r.console.as_ref().unwrap().created()[2].clone();
+    let dev = r.device(REAL_A);
+    let _ = dev.take_tx();
+    io2.push_input(b"ab");
+    wait_for("第二個 console 的本地回顯", || String::from_utf8_lossy(&io2.written()).contains("ab"));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!dev.take_tx().windows(2).any(|w| w == b"ab"), "line-buffer 未送出前不上 UART");
+}
+
+/// 接線＋端到端（§5）：release（BeginDrain）停止 TCP console listener——之後連入的 client 不被 accept
+/// （無 Telnet greeting；Python `uart_io.py:1113-1115` 關閉 listener）。
+#[test]
+fn tcp_release_stops_listener_accepting() {
+    let r = ServiceRig::with_console_backend("tcp");
+    assert!(is_loopback_endpoint(&s(&session_row(&r), "console_endpoint")));
+    let rel = r.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&rel));
+    let late = r.console.as_ref().unwrap().fake.connect();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(late.written().is_empty(), "release 後 listener 已停止，不得 accept 並送 greeting");
+}
+
+/// 接線＋端到端（§5；07 D-09）：`console_attach` 前的 RPC ConsoleScan——既有 human console 的 peer 消失並經
+/// refresh 記下 `peer_lost_at`、逾 grace 後：attach 當下 minicom 已重開 → 即時掃描判定 peer 存在、既有 human lease
+/// 保留；仍未重開 → attach 的 refresh 拆除該 lease（Python `attach_console` → `_refresh_interactive_locked` 即時
+/// `console_has_external_peer`，`session_manager.py` peer-loss grace）。
+#[test]
+fn console_attach_rescans_peers_before_refresh() {
+    for reopened in [true, false] {
+        let r = ServiceRig::with_console_backend("pty");
+        let a = attach(&r, r#"{"selector":"COM0"}"#);
+        let iid = s(&a, "interactive_session_id");
+        let fake = &r.console.as_ref().unwrap().fake;
+        fake.set_held(Some([s(&a, "vtty")].into_iter().collect()));
+        let (_, io) = r.console.as_ref().unwrap().created()[1].clone();
+        let dev = r.device(REAL_A);
+        let _ = dev.take_tx();
+        io.push_input(b"a"); // human active（agent open 回 BUSY 而非 soft preempt）
+        let mut seen = Vec::new();
+        wait_for("按鍵到 UART", || {
+            seen.extend(dev.take_tx());
+            seen.contains(&b'a')
+        });
+        fake.set_held(Some(Default::default())); // minicom 關閉
+        let busy = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#); // refresh 記下 peer 消失
+        assert_eq!(s(&busy, "error_code"), "SESSION_INTERACTIVE_BUSY", "{}", j(&busy));
+        r.clock.advance(Duration::from_millis(3500));
+        if reopened {
+            fake.set_held(Some([s(&a, "vtty")].into_iter().collect())); // attach 前 minicom 重開
+        }
+        let b = attach(&r, r#"{"selector":"COM0"}"#);
+        assert_eq!(b.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&b));
+        let st = r.call("session.interactive_status", &format!(r#"{{"interactive_id":"{iid}"}}"#));
+        if reopened {
+            assert_eq!(st.get("ok"), Some(&PyValue::Bool(true)), "peer 已回來，既有 human lease 不得被拆：{}", j(&st));
+        } else {
+            assert_ne!(st.get("ok"), Some(&PyValue::Bool(true)), "peer 逾 grace 未回，attach 的 refresh 須拆除：{}", j(&st));
+            assert!(!s(&b, "interactive_session_id").is_empty(), "拆除後新 console 取得 human lease：{}", j(&b));
+        }
+    }
+}
