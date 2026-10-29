@@ -57,7 +57,9 @@ steps:
   - action: assert_wire_offsets
     observation: serial_read
     equals: 0
-  # 窗口內 COM0 無任何 RX／TX：daemon 從未開埠、未進 ATTACHING／READY（兩個 daemon 皆無狀態 META，見 gaps #9）
+  # OD-47（CHG-S21-OD39-GAP9-01 APPROVED）判定語意：外部放手前埠未成功開啟且未進 READY。三層替代證據：窗口內 COM0
+  # 無 RX／TX（本步）、assert_wire_offsets serial_read == 0、關鍵點狀態取樣；兩個 daemon 皆不寫狀態 META。
+  # Python 基線 attach 失敗前本就短暫經過 ATTACHING，不列判定。
   - action: assert_wal_window
     op_id: prehold
     com: COM0
@@ -97,7 +99,7 @@ steps:
     save_as: att_held
     expect: {ok: false, error_code: DEVICE_STILL_HELD, holder_unknown: false, selector: COM0,
              pids: {list_contains: "{ext.pid}"}}
-  # 單點取樣：attach 被拒後此刻不在 READY（「從未進入 READY」runner 無法表達，見 slice21-l15-gaps.md #9）
+  # 關鍵點狀態取樣（OD-47 三層證據之一）：attach 被拒後此刻不在 READY
   - action: wait_cli_until
     argv: ["session", "list"]
     json_path: "sessions.com=COM0.state"
