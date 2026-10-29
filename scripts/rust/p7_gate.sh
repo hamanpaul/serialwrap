@@ -161,7 +161,8 @@ phase_row "l15 slice21 B" l15-slice21-b
 phase_row "l15 slice23 B" l15-slice23
 for c in brcm-01-login-flow ev-01-spawn-handler; do
   d="$AB/func-$c"
-  cmp="$(ls "$d"/report/*/comparison.json "$d"/report/*/*/comparison.json "$d"/report/comparison.json 2>/dev/null | head -n1 || true)"
+  # runner 報告為 report/<case>/<mode>/<run>/comparison.json，深度不固定，以 find 取（與 p7_ab_report.judge_func 同）。
+  cmp="$(find "$d/report" -name comparison.json 2>/dev/null | sort | head -n1 || true)"
   # 非測試列：rc 0 只在 runner rc 0 且 comparison verdict PASS 時成立（證據＝comparison.json）。
   rc="$(python3 - "$d/rc" "${cmp:-/nonexistent}" <<'PY'
 import json, sys
