@@ -30,7 +30,7 @@ use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::out_ring::OutItem;
 use crate::lease::{InteractiveLease, Tombstones};
 use crate::login_fsm::{
-    LoginPlan, choose_login_plan, detect_boot_banner, login_error_detail,
+    LoginPlan, choose_login_plan, detect_boot_banner,
     matches_login_or_password,
 };
 use crate::mailbox::{
@@ -358,6 +358,12 @@ pub struct SessionCore {
     device_present: bool,
     /// P7 Task 5：readiness reprobe 進度（`reprobe_attempts`／`next_reprobe_at`／`reprobe_exhausted`、single-flight）。
     reprobe: crate::reprobe::ReprobeState,
+    /// P7 Task 6 接線：login run 啟動當下的 RX 總 bytes（Python `_bridge_rx_total(bridge)` 的 `rx_before`）。
+    login_rx_before: Option<u64>,
+    /// `transport_stall_warned`：transport stall 一次性告警去重；每筆 RX 重臂（Python `_mark_session_rx`）。
+    transport_stall_warned: bool,
+    /// `resolve_usb_busid` 來源（transport stall 提示的 busid）；預設原生實作，測試可替換。
+    usb: Arc<dyn sw_pal::traits::UsbTopology>,
     console_count: usize,
     /// 現行 bridge 的哨兵 PTY slave 路徑（`public()["vtty"]`、self-test `attached_vtty`）。
     vtty: Option<String>,
@@ -544,6 +550,9 @@ impl SessionCore {
             known_real_path: None,
             device_present: false,
             reprobe: crate::reprobe::ReprobeState::default(),
+            login_rx_before: None,
+            transport_stall_warned: false,
+            usb: Arc::new(sw_pal::device_source::NativeUsbTopology),
             console_count: 0,
             vtty: None,
             queue: SessionQueue::new(),
@@ -2506,6 +2515,7 @@ impl SessionCore {
                 effects
             }
             plan => {
+                self.login_rx_before = Some(self.deps.rx.total_bytes());
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Attach,
@@ -2575,6 +2585,43 @@ impl SessionCore {
                 self.profile.com
             )),
         ]
+    }
+
+    /// `_refine_probe_failure`（#150 單一 choke point）：probe 真的送出且失敗時，依 run 期間 RX 計數差、session 最後
+    /// RX 時刻精煉失敗碼——翻轉為 `TRANSPORT_STALL` 時 detail 帶 host 層復原提示，並做一次性 stderr WARNING＋WAL META
+    /// `transport_stall_suspected`（`transport_stall_warned` 去重、RX 恢復重臂）；未翻轉時 login FSM 失敗碼帶 rx tail
+    /// detail（#174）。quiet／新世代撤銷的拒絕走 `Aborted`，不經此（Python `probe_refused` 排除）。
+    fn refine_login_failure(&mut self, error: String, now: Mono, effects: &mut Vec<Effect>) -> (String, Option<String>) {
+        let rx_before = self.login_rx_before.take();
+        let real_path = self
+            .attached_real_path
+            .clone()
+            .or_else(|| self.open_real_path.clone())
+            .or_else(|| self.known_real_path.clone());
+        let refined = crate::transport_stall::refine_probe_failure(
+            error,
+            rx_before,
+            Some(self.deps.rx.total_bytes()),
+            (self.last_rx_mono != 0).then_some(self.last_rx_mono),
+            now,
+            real_path.as_deref(),
+            &*self.usb,
+            self.transport_stall_warned,
+            &self.deps.rx.tail(4096), // Python `bridge.rx_tail()` 預設 4096（同 login_fsm `RX_TAIL_CHARS`）
+            &self.profile.com,
+        );
+        if let Some(warning) = refined.stall_warning {
+            self.transport_stall_warned = true;
+            effects.push(Effect::Warn(warning.log_line));
+            effects.push(Effect::WalMeta { cmd_id: None, meta: warning.wal_meta });
+        }
+        (refined.err, refined.detail)
+    }
+
+    /// 只供測試（test-fakes）：替換 transport stall 提示用的 `UsbTopology`。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_usb_topology(&mut self, usb: Arc<dyn sw_pal::traits::UsbTopology>) {
+        self.usb = usb;
     }
 
     fn adopt_bridge(&mut self, now: Mono) {
@@ -2707,7 +2754,7 @@ impl SessionCore {
                     self.adopt_bridge(now);
                 }
                 self.last_probe_at = Some(self.wall_iso());
-                let detail = login_error_detail(&self.deps.rx, &error);
+                let (error, detail) = self.refine_login_failure(error, now, &mut effects);
                 self.set_last_error(Some(error), detail);
                 if reprobe {
                     self.pending_auto_login = false;
@@ -2715,7 +2762,7 @@ impl SessionCore {
                 self.set_state(SessionState::Attached, now);
             }
             crate::login_fsm::LoginOutcome::Failed(error) => {
-                let detail = login_error_detail(&self.deps.rx, &error);
+                let (error, detail) = self.refine_login_failure(error, now, &mut effects);
                 self.set_last_error(Some(error), detail);
                 if reprobe {
                     self.pending_auto_login = false;
@@ -2818,6 +2865,7 @@ impl SessionCore {
                 self.reprobe_reply(reply, kind, now)
             }
             plan => {
+                self.login_rx_before = Some(self.deps.rx.total_bytes());
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::Reprobe,
@@ -2840,6 +2888,8 @@ impl SessionCore {
         self.last_rx_mono = now;
         self.last_rx_at = Some(self.wall_iso());
         self.last_rx_wal_seq = wal_seq;
+        // RX 恢復即重臂 transport stall 一次性告警（#150，Python `_mark_session_rx`）。
+        self.transport_stall_warned = false;
         let chunk = clean_text(&String::from_utf8_lossy(bytes));
         if self.is_passthrough() {
             // SC-35：passthrough 不 arm quiet，只重設安靜視窗。
@@ -3180,6 +3230,7 @@ impl SessionCore {
                 Vec::new()
             }
             plan => {
+                self.login_rx_before = Some(self.deps.rx.total_bytes());
                 self.login_run = Some(LoginRun {
                     epoch,
                     kind: LoginRunKind::AutoReprobe,
@@ -3282,7 +3333,7 @@ impl SessionCore {
                 self.recovering = false;
                 self.pending_auto_login = false;
                 self.last_probe_at = Some(self.wall_iso());
-                let detail = login_error_detail(&self.deps.rx, &error);
+                let (error, detail) = self.refine_login_failure(error, now, &mut effects);
                 self.set_last_error(Some(error), detail);
                 self.set_state(SessionState::Attached, now);
             }
@@ -5106,6 +5157,7 @@ impl SessionCore {
             return effects;
         }
         self.begin_login_generation(now);
+        self.login_rx_before = Some(self.deps.rx.total_bytes());
         self.login_run = Some(LoginRun {
             epoch,
             kind: LoginRunKind::RebootRecovery,
