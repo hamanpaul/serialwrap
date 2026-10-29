@@ -27,8 +27,13 @@
   與另一 commit、同一命令的綠燈（退出碼 0、failed==0、passed>0）→ PASS；否則 INSUFFICIENT（sol P6-b64dad9-1）。
 - `BLOCKED-OWNER` 條目回報為 BLOCKED-OWNER（不得標 PASS，也不改變 `result`）；`PENDING` → INSUFFICIENT；
   `NOT_APPLICABLE` 略過。
-輸出 `{"sections":[{set_id,platform,verdict,reasons}],"cases":[{case_id,status,missing_tests,...}],"result"}`；
-exit 0 只在 `result == "PASS"`。只用 stdlib＋PyYAML，不得匯入 sw_core。
+- OD-53 selector 記錄 caps（rulings/p6.md：不改鎖 schema）：收集器 `cargo_l1_results.py --caps` 由 L1 鎖 selector
+  推導（`derive_caps`：test-binary 參數恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需
+  caps）。推導不出的集合 → EVIDENCE_MISSING（不判報告；其 passed 列不充當逐案證據，failed 列仍判 FAIL）。
+  各集合輸出推導的 `caps` 與 linux cargo 集合的收集命令 `collect_argv`；`--plan` 只依鎖印出這些收集命令（前置收集）。
+輸出 `{"sections":[{set_id,platform,verdict,reasons,caps,collect_argv}],"cases":[{case_id,status,missing_tests,...}],
+"result"}`（`result` 為 PASS／FAIL／INSUFFICIENT；EVIDENCE_MISSING 併入 INSUFFICIENT）；exit 0 只在 `result == "PASS"`。
+只用 stdlib＋PyYAML，不得匯入 sw_core。
 """
 from __future__ import annotations
 
@@ -62,7 +67,9 @@ L15_FORMAT = "s22-l15-results.v1"
 PARITY_STATUSES = ("PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "PROCESS-EVIDENCE")
 # rulings/p6.md（P6 OWNER-BATCH #4，#185 證據形式）：流程項以出口報告段落為證據，逐名核准，不得擴及其他承接編號。
 PROCESS_EVIDENCE_ROWS = frozenset({"#185"})
-_RANK = {"PASS": 0, "INSUFFICIENT": 1, "FAIL": 2, "INVALID": 3}
+_RANK = {"PASS": 0, "INSUFFICIENT": 1, "EVIDENCE_MISSING": 1, "FAIL": 2, "INVALID": 3}
+CARGO_COLLECTOR = "scripts/rust/cargo_l1_results.py"
+_CAP_FILTER_RE = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__$")
 
 
 def _load_judge():
@@ -89,6 +96,53 @@ def to_nodeid(ref: str) -> str | None:
     return None
 
 
+def derive_caps(selector: dict[str, Any] | None) -> list[str] | None:
+    """OD-53：L1 鎖 selector → 收集器 `cargo_l1_results.py --caps`（rulings/p6.md：不新增 `selector.caps`）。
+
+    收集器只以 `<exe> --ignored cap_<cap>__` 另執行 ignored 能力測試，不轉交 selector 的 test-binary 參數，故：
+    argv 不含 `--ignored`／`--include-ignored` → `[]`（不需 caps）；第一個 `--` 之後恰為 `--ignored` 加一個以上
+    `cap_<cap>__` 篩選 → 依序回傳各 `<cap>`；其餘帶 ignored 意圖者（`--include-ignored`、無篩選、混有非 cap 篩選或
+    其他旗標、出現在 `--` 之前）→ None（推導不出）。
+    """
+    argv = [str(x) for x in ((selector or {}).get("argv") or [])]
+    if not {"--ignored", "--include-ignored"} & set(argv):
+        return []
+    if "--" not in argv:
+        return None
+    tail = argv[argv.index("--") + 1:]
+    filters = [t for t in tail if t != "--ignored"]
+    caps = [m.group(1) for t in filters if (m := _CAP_FILTER_RE.match(t))]
+    if tail.count("--ignored") != 1 or not caps or len(caps) != len(filters):
+        return None
+    return caps
+
+
+def _cargo_set(spec: dict[str, Any]) -> bool:
+    nodeids = list(spec.get("nodeids") or [])
+    return bool(nodeids) and all(str(n).startswith("cargo:") for n in nodeids)
+
+
+def collect_argv(set_id: str, platform: str, spec: dict[str, Any], results_dir: pathlib.Path) -> list[str] | None:
+    """linux cargo 集合的前置收集命令（`--caps` 由 `derive_caps` 推導）；pytest 集合、Windows（win-test.sh 原生收集）
+    與推導不出者回 None。"""
+    caps = derive_caps(spec.get("selector"))
+    if caps is None or platform != "linux" or not _cargo_set(spec):
+        return None
+    out = results_dir / set_id[len(SET_PREFIX):] / platform / "resource-report.json"
+    return ["python3", CARGO_COLLECTOR, "--platform", platform, *(a for cap in caps for a in ("--caps", cap)),
+            "--out", str(out), "--", *[str(x) for x in (spec.get("selector") or {}).get("argv") or []]]
+
+
+def collect_plan(lock: dict[str, Any], results_dir: pathlib.Path) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    for set_id in sorted(k for k in lock.get("sets", {}) if k.startswith(SET_PREFIX)):
+        for platform, spec in sorted(lock["sets"][set_id].items()):
+            if _cargo_set(spec):
+                plan.append({"set_id": set_id, "platform": platform, "caps": derive_caps(spec.get("selector")),
+                             "collect_argv": collect_argv(set_id, platform, spec, results_dir)})
+    return plan
+
+
 def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tuple[list[dict], dict[str, list[dict]]]:
     sections: list[dict] = []
     rows_by_nodeid: dict[str, list[dict]] = {}
@@ -101,25 +155,31 @@ def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tu
     for set_id in sorted(k for k in sets if k.startswith(SET_PREFIX)):
         for platform, spec in sorted(lock["sets"][set_id].items()):
             section = set_id[len(SET_PREFIX):]
+            caps = derive_caps(spec.get("selector"))
+            entry = {"set_id": set_id, "platform": platform, "caps": caps,
+                     "collect_argv": collect_argv(set_id, platform, spec, results_dir)}
             path = results_dir / section / platform / "resource-report.json"
-            if not path.is_file():
-                sections.append({"set_id": set_id, "platform": platform, "verdict": "INSUFFICIENT",
-                                 "reasons": [f"report missing：{path}"]})
+            report: dict[str, Any] | None = None
+            if path.is_file():
+                try:
+                    report = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    sections.append({**entry, "verdict": "INVALID", "reasons": [f"report unreadable：{exc}"]})
+                    continue
+            if caps is None:
+                sections.append({**entry, "verdict": "EVIDENCE_MISSING",
+                                 "reasons": ["selector 推導不出收集器 --caps（OD-53：只接受 `--ignored cap_<cap>__`）"]})
+            elif report is None:
+                sections.append({**entry, "verdict": "INSUFFICIENT", "reasons": [f"report missing：{path}"]})
                 continue
-            try:
-                report = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                sections.append({"set_id": set_id, "platform": platform, "verdict": "INVALID",
-                                 "reasons": [f"report unreadable：{exc}"]})
-                continue
-            verdict = judge.judge(report, list(spec.get("nodeids") or []), platform=platform,
-                                  selector=spec.get("selector"))
-            sections.append({"set_id": set_id, "platform": platform, "verdict": verdict["verdict"],
-                             "reasons": list(verdict.get("reasons") or [])})
-            for row in report.get("results") or []:
+            else:
+                verdict = judge.judge(report, list(spec.get("nodeids") or []), platform=platform,
+                                      selector=spec.get("selector"))
+                sections.append({**entry, "verdict": verdict["verdict"], "reasons": list(verdict.get("reasons") or [])})
+            for row in (report or {}).get("results") or []:
                 if isinstance(row, dict):
                     rows_by_nodeid.setdefault(str(row.get("nodeid")), []).append(
-                        {**row, "_platform": platform, "_section": set_id})
+                        {**row, "_platform": platform, "_section": set_id, "_evidence": caps is not None})
     return sections, rows_by_nodeid
 
 
@@ -150,9 +210,11 @@ def judge_tests(tests: list[str], rows_by_nodeid: dict[str, list[dict]],
         # 「恰一列」逐份報告（集合×平台）計算：selector 重疊的集合（例：console_conformance_pty 執行整個
         # console_conformance binary，其非 cap 測試也在 cargo_workspace）各自恰一列 passed 即可（OD-54）。
         # 任一份報告內部重複即證據不足，不得被另一份報告的單列 passed 遮蔽（sol P6-c6ddda1-1）。
+        # 推導不出 --caps 的集合（OD-53，EVIDENCE_MISSING）其 passed 列不計入（failed 列已於上方判 FAIL）。
         per_report: dict[tuple[str, str], list[dict]] = {}
         for r in rows:
-            per_report.setdefault((r["_platform"], r.get("_section", "")), []).append(r)
+            if r.get("_evidence", True):
+                per_report.setdefault((r["_platform"], r.get("_section", "")), []).append(r)
         if any(len(rs) > 1 for rs in per_report.values()) or not any(
                 rs[0].get("outcome") == "passed" for rs in per_report.values()):
             missing.append(ref)
@@ -356,16 +418,23 @@ def run_prereqs(script: pathlib.Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--l1-results", required=True, type=pathlib.Path)
-    ap.add_argument("--map", required=True, type=pathlib.Path)
+    ap.add_argument("--map", type=pathlib.Path)
     ap.add_argument("--lock", type=pathlib.Path, default=DEFAULT_LOCK)
     ap.add_argument("--cases-lock", type=pathlib.Path, default=DEFAULT_CASES_LOCK)
     ap.add_argument("--l15-results", type=pathlib.Path, default=None)
     ap.add_argument("--parity-doc", type=pathlib.Path, default=DEFAULT_PARITY_DOC)
     ap.add_argument("--prereqs-script", type=pathlib.Path, default=DEFAULT_PREREQS)
-    ap.add_argument("--out", required=True, type=pathlib.Path)
+    ap.add_argument("--out", type=pathlib.Path)
+    ap.add_argument("--plan", action="store_true", help="只依 L1 鎖印出 cargo 集合的前置收集命令（OD-53 推導 --caps）")
     args = ap.parse_args(argv)
 
     lock = json.loads(args.lock.read_text(encoding="utf-8"))
+    if args.plan:
+        plan = collect_plan(lock, args.l1_results)
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return 1 if any(e["caps"] is None for e in plan) else 0
+    if args.map is None or args.out is None:
+        ap.error("判定模式須指定 --map 與 --out")
     emap = yaml.safe_load(args.map.read_text(encoding="utf-8")) or {}
     cases_lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
     l15, l15_reasons = load_l15(args.l15_results)
@@ -380,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
     result = _worst([s["verdict"] for s in sections] + case_verdicts + parity_verdicts + extra)
     if result == "INVALID":
         result = "FAIL"
+    elif result == "EVIDENCE_MISSING":
+        result = "INSUFFICIENT"
     payload = {"sections": sections, "cases": cases, "map_coverage": coverage, "parity_rows": parity,
                "prereqs": prereqs, "l15_reasons": l15_reasons, "result": result}
     args.out.parent.mkdir(parents=True, exist_ok=True)
