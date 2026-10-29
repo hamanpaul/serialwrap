@@ -44,6 +44,9 @@
 | M10 | self-test 各自 resume（`console.rs` `self_test_suspend_end`） | 永不 resume | `rpc_console::overlapping_self_tests_replay_human_input_end_to_end`（本輪新增） | RED |
 | M11 | 取消的停放命令結算 registry（`session_core.rs` `settle_parked_terminal`） | 不結算 | `session_core_lease::canceled_parked_command_releases_pending_slot`、`…_then_drain_releases_pending_slot` | RED |
 
+| M12 | adopt 失敗以 detach 語意撤回（`session_manager.rs` `Effect::ConsoleAdopt` 失敗分支送 `SessionRequest::ConsoleDetach`；第四輪續） | 改回只送 `DataEvent::ConsoleDisconnected`（修正前行為） | `rpc_console::attach_request_timeout_closes_pty`（第四輪續新增） | RED（9979795 紅燈：幽靈 lease 留下） |
+| M13 | RPC handler 逾時後移除暫存 PTY（`SessionManager::console_attach`） | 不移除 | `rpc_console::attach_request_timeout_closes_pty` | RED（「逾時後暫存 PTY 已移除」） |
+
 另以「還原為修正前原始碼（0123679）」驗證 M10 的偵測測試：`overlapping_self_tests_replay_human_input_end_to_end` 於修正前 FAIL（「兩個 probe 完成後回放 k」等待逾時），修正後 PASS。
 
 M5 首次以 `send_routes_by_lease_index` 偵測時為 GREEN：agent lease 另由 `ManagerNote::InteractiveOpened` 與 `route_session` 的 open 回應寫入索引，只有 human console lease 只靠 `Effect::LeaseIndex`，故改以 human lease 的 `attach_then_status_has_no_false_not_found` 偵測。M6／M7／M8 首次無偵測測試，本輪補上三支 daemon 級測試後皆 RED。
@@ -51,4 +54,4 @@ M5 首次以 `send_routes_by_lease_index` 偵測時為 GREEN：agent lease 另�
 ## 3. 本包仍未有 daemon 級端到端者（記錄）
 
 - Windows 原生 console（WSAPoll mux、com0com Serial console、W-1～W-7）：LOCAL-WINDOWS-TODO，只能在擁有者 Windows host 驗證。
-- R3-7（`HumanTxCompleted` 回報 `try_send` 失敗的一格重試槽）、R3-4／R5-L6（hub 佇列滿、AdoptPty 失敗）：需 fault-injection hook，仍 deferred。
+- R3-7（`HumanTxCompleted` 回報 `try_send` 失敗的一格重試槽）、R3-4／R5-L6（hub 佇列滿使 AdoptPty 失敗）：需 fault-injection hook，仍 deferred。AdoptPty 失敗的另一來源「PTY 已隨 RPC 逾時丟棄」於第四輪續以 0 逾時取得（M12／M13），與 hub 佇列滿共用同一個撤回分支。

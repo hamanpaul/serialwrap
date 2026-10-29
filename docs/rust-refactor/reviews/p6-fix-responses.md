@@ -387,3 +387,35 @@ FakeDevice 的確認 TX（新增非破壞性 `tx_len`／`tx_since`）看到該 b
 - 本輪改以一般使用者 `ubuntu`（非 root）執行全套與 cargo 測試；起點 e9b5c61 於獨立 clone 跑基準。
 - 上輪「`test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread` 在 root 下不成立」：非 root 重跑 17/17 passed，確認為 root 環境因素。
 - `test_l1_judge.py::test_l1_lock_nodeids_subset_of_collect_only` 的 `COM9` 參數 id：本機 pytest 9.2.0 對長字串參數改產 `msg2` id；以 CI 釘定的 pytest 9.0.3 重跑即通過（環境因素；起點與本輪同環境比較）。
+
+## 第四輪續（2026-10-29 第二個 cloud session）
+
+### 合併（e14b4c8 主線 62ffec7、7faa3c6 P5 3084388）
+
+| 項目 | 處理 |
+|---|---|
+| 主線 62ffec7 | 只登錄 OD-45～OD-47（`owner-decisions-2026-10-15.md` 三列），無衝突 |
+| P5 3084388（OD-45 event_latency L1 結構 gate、OD-46／OD-47 WAL unlink 黑箱 A/B、折行回顯修正） | 無衝突；`l1_required.lock.json` 只增 5 列（`command_exec` 3、`drain_release_e2e` 1、`dispatch` 1） |
+| OD-45～OD-47 | 皆為 P5 承接（event_latency、`s21-wal-unlink-under-traffic`、`s21-exclusive-conflict*`），P6 無對應工作；合併後 P6 檔案不受影響 |
+
+### sol 報告
+
+| 報告 | # | 處理 |
+|---|---|---|
+| `d6e3b3c_e9b5c61-sol.md`／`e9b5c61_73897df-sol.md` | P6-e9b5c61-1、-2（High） | 已於 7370b8f 修正（紅燈 0123679）；`e9b5c61_73897df` 審到 73897df（修正之前）故標「未修」，`73897df_24b8012-sol.md` 已核對為「已修 7370b8f」 |
+| 同上 | P6-e9b5c61-3、-4（Medium） | 維持 OWNER-BATCH（見下），累計未修 2 輪 |
+| `73897df_24b8012-sol.md` | B 段 | NO FINDINGS |
+
+### 本輪自行發現並修正
+
+| 項目 | 紅燈 | 修正 | 說明 |
+|---|---|---|---|
+| `check_cfg_boundary.py` test-data-path 違規（24b8012 自己引入） | `check_cfg_boundary.py` exit 1 | 4e3cd8a | `rpc_console.rs` 直接用 `CARGO_MANIFEST_DIR`；改經 `support::data_root()` |
+| console_attach 逾時後留下幽靈 human lease（07 Task 10 `attach_request_timeout_closes_pty`） | 9979795 | 52d49d2 | 0 逾時取得 handler 逾時出口；遲到的 `ConsoleAttach` 在 executor 找不到 PTY 時原送 `ConsoleDisconnected`（斷線語意保留 lease），之後 attach 的 console 拿不到 lease 與 raw ownership。改送 control lane `ConsoleDetach`（ERR-7.5-b）。Python attach 同步、無此出口，Python 行為不受影響。計畫原文「actor 卡住」所需的 fault hook 須改 P5 `actor.rs`，列 SPEC-GAP |
+| s22 出口 `l15-wal-interference` 恆 FAIL | 實跑 r4 | 76c78b2 | OD-40 已裁決移出 L1.5 判定；對照表改指 `l15_ab_excluded` 所列 Rust 側 WAL 黑箱 3 案與 `wal_writer` L1 3 案（add-only 入鎖） |
+| s22_gate_check 跨集合重疊 nodeid 誤判證據不足（parity #40／#109） | 237b1c2 | cd80448 | 「恰一列 passed」改逐份報告（集合×平台）；單一報告內重複照舊不計 |
+
+### 07 Task 10 兩個 deferred 案例
+
+- `attach_request_timeout_closes_pty`：完成（上表）。
+- `attach_interactive_owner_false_during_replay_hold`：**SPEC-GAP**。計畫前置狀態「回放 hold 存在、前景已清、且 attach 會開 lease」在 Python 與 Rust 都不會發生：`console_attach` 只在無 lease 時開 lease；鍵入而產生回放的 human console 本身必已由 attach 開了 lease（PTY），soft preempt／lazy expiry 後 PostClose 也會還原它的 lease；TCP 後端的 attach 不開 lease、哨兵 primary 的輸入被丟棄。實測 ATTACHED 救援 lazy expiry 變體：c2 attach 時 c1 的 lease 已還原，回應無 `interactive_session_id`。D-22(2) 的「hold 期間 attach 回 owner=false」在程式上為 `!fg_slot_busy()`，但無可達的前置狀態可驗；請計畫擁有者改寫案例或撤列。
