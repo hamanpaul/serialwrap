@@ -2833,6 +2833,9 @@ class SessionManager:
                 session.released_by = job.source
                 session.released_at = session.released_at or now_iso()
                 session.released_reason = job.release_reason
+                # S1X-a-7：比照 0.3.2 release（_detach_session_locked）更新 detached_at 並重置 reprobe 進度。
+                session.detached_at = now_iso()
+                self._reset_reprobe_progress_locked(session)
                 if by_id:
                     self._released_by_ids.add(by_id)
                 session._release_persist_pending = True
@@ -2857,6 +2860,8 @@ class SessionManager:
                 self._reset_reprobe_progress_locked(session)
                 if job.kind == "clear" and by_id and by_id in self._devices:
                     session.state = "ATTACHING"
+                    # S1X-a-7：0.3.2 clear 在裝置在場時清掉 last_error（不留 CLEARED）。
+                    session.last_error = None
                     should_attach = True
                 elif job.kind == "bind":
                     target = job.target_by_id
