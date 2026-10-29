@@ -1,11 +1,16 @@
-"""OD-63 佔位 session 的 `session bind` 路徑（sol 增量審查 5b05626..9990b18 B 段）。
+"""OD-63 佔位 session 的另外兩條路徑（sol 增量審查 5b05626..9990b18 B 段）。
 
 - S1-9990b18-1：`session bind` 對佔位走既有 RELEASED 解除路徑，丟棄阻擋、寫 binding
   override 後以佔位的 passthrough profile 真實 attach。依 OD-63，佔位只能經
   `device attach` 解除後交 template 偵測；bind 比照 `session attach` 的 RELEASED 早退，
   不解除阻擋、不寫 override、不開埠。
+- S1-9990b18-2：`device attach` 開埠遇一般 OSError（如 dialout 權限不足的
+  `PermissionError`）時，佔位被移除、阻擋解除，卻沒有交 template 偵測，裝置成為孤兒。
+  修正後比照成功分支交接：保留原 COM 交 dynamic 偵測，仍開不了埠時由
+  `_record_dynamic_open_failure` 在原 COM 留下可再 attach 的 DETACHED 列。
 
-修正前：bind 回 `ok:true` 並以 passthrough 佔位 profile 開埠。
+修正前：bind 回 `ok:true` 並以 passthrough 佔位 profile 開埠；OSError 後 `_sessions`
+為空，`device attach COM3` 回 `SESSION_NOT_FOUND`。
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from sw_core.config import ProfileTemplate, UartProfile
 from sw_core.device_watcher import DeviceInfo
 from test_s1x_od63_released_placeholder import (
     BY_ID,
@@ -24,6 +30,7 @@ from test_s1x_od63_released_placeholder import (
     _persisted_released,
     _plug,
     _seed_state,
+    _templates,
 )
 
 pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
@@ -63,6 +70,18 @@ def _patch_open(
 def _join_attach_workers(mgr: Any) -> None:
     for worker in list(mgr._attach_threads.values()):
         worker.join(timeout=5)
+
+
+def _with_passthrough_fallback() -> list[ProfileTemplate]:
+    return [
+        *_templates(),
+        ProfileTemplate(
+            profile_name="others-template",
+            platform="passthrough",
+            ready_probe="",
+            uart=UartProfile(),
+        ),
+    ]
 
 
 @pytest.mark.parametrize("target", [BY_ID, OTHER_BY_ID], ids=["same_by_id", "other_by_id"])
@@ -144,3 +163,66 @@ def test_attach_by_id_never_builds_bridge_for_placeholder(
     assert opens == []
     assert mgr._sessions[SID].bridge is None
     assert BY_ID not in mgr._attach_bridges
+
+
+def test_device_attach_oserror_hands_off_and_stays_reattachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S1-9990b18-2：開埠遇 PermissionError 時交 dynamic 偵測，原 COM 留下可再 attach 的 DETACHED 列。"""
+    _seed_state(tmp_path)
+    mgr = _manager(tmp_path, templates=_with_passthrough_fallback())
+    _plug(mgr)
+    _no_holder(monkeypatch, mgr)
+    opens: list[str] = []
+    _patch_open(monkeypatch, opens, PermissionError(13, "Permission denied"))
+
+    result = mgr.attach_device("COM3")
+    _join_attach_workers(mgr)
+
+    assert result["ok"] is True, result
+    assert result["session"]["state"] == "DETACHED", result
+    assert result["session"]["last_error"] == "ATTACH_FAILED:PermissionError", result
+    assert SID not in mgr._sessions, "佔位須移除自身"
+    assert BY_ID not in mgr._released_by_ids
+    assert SID not in _persisted_released(tmp_path)
+    assert len(opens) == 2, "佔位移除後須交 dynamic 偵測重新開埠"
+    row = mgr.get_session("COM3")
+    assert row is not None, "裝置成為孤兒：原 COM 沒有可再 attach 的列"
+    assert row.released_placeholder is False
+    assert row.profile.device_by_id == BY_ID
+    assert row.state == "DETACHED"
+    assert row.last_error == "ATTACH_FAILED:PermissionError"
+    assert row.profile_source == "fallback"
+
+    # 權限修好後，device attach COM3 找得到該列並重新 attach（fallback 列的 profile 由
+    # _reresolve_profile_on_reattach 重新偵測，不在本案範圍）。
+    _patch_open(monkeypatch, opens)
+    spawned: list[str] = []
+    monkeypatch.setattr(mgr, "_spawn_attach", lambda by_id, **_kw: spawned.append(by_id))
+
+    again = mgr.attach_device("COM3")
+
+    assert again["ok"] is True, again
+    assert again["session"]["com"] == "COM3"
+    assert spawned == [BY_ID]
+
+
+def test_device_attach_oserror_without_fallback_template_still_hands_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """沒有 passthrough fallback template 時，同樣解除阻擋並交 dynamic 偵測、保留原 COM（現行 dynamic 語意）。"""
+    _seed_state(tmp_path)
+    mgr = _manager(tmp_path)
+    _plug(mgr)
+    _no_holder(monkeypatch, mgr)
+    opens: list[str] = []
+    _patch_open(monkeypatch, opens, PermissionError(13, "Permission denied"))
+
+    result = mgr.attach_device("COM3")
+    _join_attach_workers(mgr)
+
+    assert result["ok"] is True, result
+    assert SID not in mgr._sessions
+    assert BY_ID not in mgr._released_by_ids
+    assert len(opens) == 2, "佔位移除後須交 dynamic 偵測重新開埠"
+    assert mgr._pending_com.get(BY_ID) == "COM3"

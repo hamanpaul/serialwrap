@@ -3443,6 +3443,7 @@ class SessionManager:
                 "device_by_id": by_id,
             }
         except OSError as exc:
+            placeholder_handoff = False
             with self._lock:
                 cancelled = op.cancelled.is_set() or op.release_request is not None
                 if not cancelled and self._attach_ops.get(by_id) is op:
@@ -3457,8 +3458,12 @@ class SessionManager:
                         session.released_at = None
                         session.released_reason = None
                         if session.released_placeholder:
-                            # OD-63：阻擋已解除；佔位不保留，之後的熱插走 template 偵測。
+                            # OD-63：比照成功分支交接——佔位移除自身、保留原 COM，交 dynamic
+                            # 偵測重新開埠；仍失敗時由 _record_dynamic_open_failure 在原 COM
+                            # 留下可再 attach 的 DETACHED 列，不讓裝置成為孤兒。
                             self._retire_released_placeholder_locked(session)
+                            self._pending_com[by_id] = session.profile.com
+                            placeholder_handoff = True
                         public = session.to_public_dict()
                     else:
                         public = session.to_public_dict()
@@ -3467,6 +3472,8 @@ class SessionManager:
             self._finish_attach_op(op)
             if not cancelled:
                 self._save_state()
+                if placeholder_handoff:
+                    self._spawn_attach(by_id, dynamic_only=True)
                 return {"ok": True, "session": public}
             return {
                 "ok": False,

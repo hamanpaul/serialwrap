@@ -64,6 +64,7 @@ session_id 為鍵）。`_load_state` SHALL 在 `bootstrap_attach` 之前還原�
 - **WHEN** state 內的 released 紀錄所屬 template 已被改名或刪除
 - **THEN** 載入時實體化為 `RELEASED` 佔位 session（`platform=passthrough`、`command_capable:false`），by_id 仍被阻擋、跨重啟保留
 - **AND** 對該 COM 執行 `device attach` 時，佔位移除自身並解除 by_id，已取得的 UART 交 template 偵測建立正式 session（保留原 COM，不以佔位的 passthrough profile attach）；無 template 可匹配時依現行 dynamic 偵測
+- **AND** `device attach` 開埠遇一般 OSError（如權限不足）時，佔位同樣移除自身並交 dynamic 偵測（保留原 COM）；仍開不了埠時依現行 dynamic 開埠失敗語意：有 passthrough fallback template 即在原 COM 留下 `DETACHED`（`last_error=ATTACH_FAILED:<例外名>`）列，可再 `device attach`
 - **AND** 對佔位執行 `session bind` 時不解除阻擋、不寫 binding override、不開埠，比照 `session attach` 的 RELEASED 回應回 `ok:true`、`released:true`、`recommended_action:"device_attach"`
 
 ### Requirement: device.attach SHALL 收回裝置並還原 session

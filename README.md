@@ -233,7 +233,10 @@ or `READY`.
   command-capable) for that COM; `device attach` on it removes the placeholder,
   unblocks the device and lets template detection create the real session on
   the same COM (OD-63). `session bind` on the placeholder does not unblock it
-  (it answers `released: true`, `recommended_action: device_attach`).
+  (it answers `released: true`, `recommended_action: device_attach`); if
+  opening the port fails, the device is still handed to dynamic detection on
+  the same COM, whose open-failure handling leaves a retryable `DETACHED` row
+  when a passthrough fallback template exists.
 - `FLASHING` means the MCU flash endpoint is currently bridging an external
   flasher.
 
@@ -1628,7 +1631,7 @@ broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）�
 
 ### `RELEASED` / `FLASHING`
 
-- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。所屬 template 已改名或刪除的 released 紀錄，會以 `RELEASED` 佔位 session（passthrough、不可下命令）保留阻擋；對該 COM `device attach` 時佔位移除自身並解除阻擋，由 template 偵測在同一 COM 建立正式 session（OD-63）；對佔位 `session bind` 不解除阻擋（回 `released: true`、`recommended_action: device_attach`）。詳見 `openspec/specs/device-handoff/spec.md`。
+- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。所屬 template 已改名或刪除的 released 紀錄，會以 `RELEASED` 佔位 session（passthrough、不可下命令）保留阻擋；對該 COM `device attach` 時佔位移除自身並解除阻擋，由 template 偵測在同一 COM 建立正式 session（OD-63）；對佔位 `session bind` 不解除阻擋（回 `released: true`、`recommended_action: device_attach`），開埠失敗時仍交 dynamic 偵測（保留原 COM），有 passthrough fallback template 時在原 COM 留下可重試的 `DETACHED` 列。詳見 `openspec/specs/device-handoff/spec.md`。
 - `FLASHING`（#55）：外部 flasher 經 `/dev/ttyMCU` 認線後 session 進入，期間 `cmd submit` 回 `FLASHING_BUSY`、其他 COM 不受影響、daemon 不死；flash 結束自動恢復先前狀態。詳見 `openspec/specs/mcu-flash-broker/spec.md`。
 
 ## Agent / Human Co-work 時序圖
