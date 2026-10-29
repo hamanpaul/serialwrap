@@ -611,8 +611,7 @@ def test_build_failure_report_still_carries_provenance(tmp_path: Path) -> None:
     assert prov["git"]["head"] == _git_head()
 
 
-@pytest.mark.core_portable
-@pytest.mark.memory_only
+@pytest.mark.process_rpc   # 本檔資源 marker 一律 process_rpc（test_module_resource_marker_not_mixed）
 def test_capability_matched_on_last_path_segment() -> None:
     """P5 第 6 輪 gate 實跑揭露：lib 單元測試的 libtest 名稱帶模組路徑（`console_pty::posix::tests::cap_posix_pty__x`），
     只比對名稱開頭會把它當成非能力測試——`--caps posix_pty` 不執行、skip_kind 記成 other，OD-55 移入
