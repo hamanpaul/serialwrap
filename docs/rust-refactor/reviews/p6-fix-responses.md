@@ -499,6 +499,8 @@ result = **FAIL**。cargo_workspace PASS（2132 passed、38 skipped；第一次�
 | P6-e9b5c61-4 | 依 rulings/p6.md 不處理。merge P5 後重驗 `test_l1_lock_cargo_sets_exclude_ignored_tests`：linux 已清，只剩 `s21_core.windows` 13 列（OD-55 待 Windows 原生收集，P5 LOCAL-WINDOWS-TODO）；`test_l1_lock_frozen_set_excludes_capability_gated` 同屬 `s21_core.windows` |
 | `45b82e4_2b6f8ee-sol.md` | B 段 NO FINDINGS；A 段只剩 P6-e9b5c61-4（依裁決不處理） |
 | `test_two_daemons_same_tty` | P5 `4f8acdf` 修 harness（`share_tty_with`）；merge 後 Python 基線 passed、Rust artifact（gate blackbox_rust）passed |
+| `2b6f8ee_4cc7f02-sol.md`（本輪期間到） | P6-4cc7f02-1 Medium（`test_sc30_reserved_for_p7` 未納入 SC-39）：**已修 04d5f25**（與審查建議的修法相同，未放寬為子集合比對）；P6-4cc7f02-2 Low（OD-53 推導規則在 `test_l1_judge._selector_explicit_caps` 與 gate `derive_caps` 兩份實作）依收斂規則不修；A 段 P6-e9b5c61-4 依裁決不處理 |
+| rulings/p7.md P7-9065f14-1（交付點 P6 第 7 輪：自 `slice22_evidence_map.yaml` 移除 `l15-delayed-reply`） | 本分支早已落實：map 無此鍵（OD-34 修訂 #1），`test_contracts_slice22.py::test_slice22_case_set_frozen_and_mapped` 斷言其不在 `slice_2.2`、在 `slice_2.3`，且 map 鍵＝凍結 `slice_2.2`；P7 分支的 map 為舊版（`l15-delayed-reply: {status: PENDING}`），P7 merge 本分支即解除 |
 
 ### 第六輪 Slice 2.2 出口 gate（非 dry-run，非 root，`target/s22-gate/r6-261029-133213`，HEAD c74f158）
 
