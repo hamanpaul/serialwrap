@@ -157,33 +157,16 @@ pub fn extract_command_stdout(
             removed = true;
         }
         if !removed {
-            // 只把原始串流中 BusyBox 的雙 CR＋LF 視為折行證據；一般 stdout 換行不可拼接（sol P5-70f6ce7-1）。
-            let mut wrapped = false;
-            if raw.contains("\r\r\n") {
-                if let Some(n) = strip_wrapped_command_echo(&lines, stripped) {
+            // 修正 PR（fix/wrapped-echo-false-positive 34c3a84）語意：只接受「命令原文＋終端折行插入字元」。
+            // 插入字元須有原始串流證據（rulings/p5.md P5-70f6ce7-1）：換行只在 raw 含 BusyBox `\r\r\n`、
+            // 多一個空白只在 raw 含 readline `" \r"` 時可跳過；一般 CRLF stdout 不得拼接（sol P5-70f6ce7-1）。
+            let wraps = WrapEvidence {
+                newline: raw.contains("\r\r\n"),
+                space: raw.contains(" \r"),
+            };
+            if wraps.newline || wraps.space {
+                if let Some(n) = strip_wrapped_command_echo(&lines, stripped, wraps) {
                     lines.drain(..n);
-                    wrapped = true;
-                }
-            }
-            // bash readline 會在長回顯折行處寫入「空白＋CR」再接續同一行：以原始控制字元辨識後重新抽取。
-            if !wrapped && raw.contains(" \r") {
-                let chars: Vec<char> = raw.chars().collect();
-                let cmd: Vec<char> = stripped.chars().collect();
-                if let Some((start, end)) = match_readline_wrapped_echo(&chars, &cmd) {
-                    let echo: String = chars[start..end].iter().collect();
-                    let candidate: String = chars[..start]
-                        .iter()
-                        .copied()
-                        .chain(echo.replace(" \r", "").chars())
-                        .chain(chars[end..].iter().copied())
-                        .collect();
-                    let candidate_lines = prompt_cut_lines(&candidate, prompt_regex, completion);
-                    if candidate_lines
-                        .first()
-                        .is_some_and(|line| py_strip(line).ends_with(stripped))
-                    {
-                        lines = candidate_lines[1..].to_vec();
-                    }
                 }
             }
         }
@@ -214,80 +197,57 @@ fn prompt_cut_lines(raw: &str, prompt_regex: &PyRegex, completion: Option<&PyReg
         .collect()
 }
 
-/// 終端寬度扣掉 prompt 後每段回顯仍至少約 20 字元（Python `_READLINE_WRAP_MIN_SEGMENT`；BusyBox 路徑以此估計最多佔幾行）。
+/// 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt；修正 PR `_WRAP_MIN_SEGMENT`），也以此保守估計回顯最多佔幾行。
 const WRAP_MIN_SEGMENT: usize = 20;
 
-/// Python `_strip_wrapped_command_echo`：移除含 BusyBox 雙 CR 折行標記的命令回顯；`lines` 已 `clean_text` 並切行。
-/// 只接合不同輸出行（行內空白保持原樣），前綴（殘留 prompt）須短於第一行；回傳要移除的行數。
-fn strip_wrapped_command_echo(lines: &[String], command: &str) -> Option<usize> {
-    if command.is_empty() || lines.len() < 2 {
-        return None;
-    }
-    let cmd_len = command.chars().count();
-    let first_len = lines[0].chars().count();
-    let mut joined = String::new();
-    for (i, line) in lines.iter().take(cmd_len / WRAP_MIN_SEGMENT + 2).enumerate() {
-        joined.push_str(line);
-        if joined.ends_with(command) && joined.chars().count() - cmd_len < first_len {
-            return Some(i + 1);
-        }
-    }
-    None
+/// 原始串流中的終端折行證據：`newline` 為 BusyBox `\r\r\n`、`space` 為 bash readline `" \r"`。
+#[derive(Clone, Copy)]
+struct WrapEvidence {
+    newline: bool,
+    space: bool,
 }
 
-/// Python `_match_readline_wrapped_echo`（842c014 後語意）：於原始文字首個非空行內，找「命令原文＋readline 折行標記
-/// `" \r"`」的起訖位置（字元索引）。標記不得在第一個命令字元前，彼此（第一個自命令起點）至少相隔
-/// [`WRAP_MIN_SEGMENT`] 個命令字元；標記優先於命令字元比對（折行點緊貼命令原有空白時仍可辨識），回顯須結束於行尾。
-fn match_readline_wrapped_echo(text: &[char], command: &[char]) -> Option<(usize, usize)> {
-    if text.is_empty() || command.is_empty() {
+/// 修正 PR `_match_wrapped_echo`：從 `text[start]` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
+/// 命令的每個字元（含空白）都必須依序出現；只有換行或多出的空白（且原始串流有對應證據）可以跳過，
+/// 第一個命令字元前不得插入，插入點彼此至少相隔 [`WRAP_MIN_SEGMENT`] 個字元（第一個插入點以第一行欄位計，含殘留 prompt）。
+fn match_wrapped_echo(text: &[char], start: usize, command: &[char], wraps: WrapEvidence) -> Option<usize> {
+    let (mut i, mut j) = (start, 0usize);
+    let mut last_wrap: Option<usize> = None;
+    while j < command.len() {
+        let ch = *text.get(i)?;
+        if ch == command[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let allowed = (ch == '\n' && wraps.newline) || (ch == ' ' && wraps.space);
+        if j == 0 || !allowed {
+            return None;
+        }
+        let column = last_wrap.map_or(start + j, |w| j - w);
+        if column < WRAP_MIN_SEGMENT {
+            return None;
+        }
+        last_wrap = Some(j);
+        i += 1;
+    }
+    Some(i)
+}
+
+/// 修正 PR `_strip_wrapped_command_echo`：`lines` 已 `clean_text` 並切行；命令須從第一行開始（容許殘留 prompt），
+/// 完整結束在某一行的行尾，才把這幾行視為回顯。回傳要移除的行數。
+fn strip_wrapped_command_echo(lines: &[String], command: &str, wraps: WrapEvidence) -> Option<usize> {
+    if command.is_empty() || lines.is_empty() {
         return None;
     }
-    let mut line_start = 0usize;
-    let line_end = loop {
-        if line_start >= text.len() {
-            return None;
-        }
-        let line_end = text[line_start..]
-            .iter()
-            .position(|c| *c == '\n')
-            .map_or(text.len(), |p| line_start + p);
-        if text[line_start..line_end].iter().any(|c| *c != '\r') {
-            break line_end;
-        }
-        if line_end == text.len() {
-            return None;
-        }
-        line_start = line_end + 1;
-    };
-    let line = &text[line_start..line_end];
-    for command_start in 0..line.len() {
-        if line[command_start] != command[0] {
-            continue;
-        }
-        let (mut cursor, mut matched) = (command_start, 0usize);
-        let mut last_wrap: Option<usize> = None;
-        while matched < command.len() && cursor < line.len() {
-            if matched > 0 && line[cursor] == ' ' && line.get(cursor + 1) == Some(&'\r') {
-                let segment = last_wrap.map_or(matched, |w| matched - w);
-                if segment < WRAP_MIN_SEGMENT {
-                    break;
-                }
-                last_wrap = Some(matched);
-                cursor += 2;
-                continue;
+    let cmd: Vec<char> = command.chars().collect();
+    let window = &lines[..lines.len().min(cmd.len() / WRAP_MIN_SEGMENT + 2)];
+    let text: Vec<char> = window.join("\n").chars().collect();
+    for start in 0..lines[0].chars().count() {
+        if let Some(end) = match_wrapped_echo(&text, start, &cmd, wraps) {
+            if end == text.len() || text[end] == '\n' {
+                return Some(text[..end].iter().filter(|c| **c == '\n').count() + 1);
             }
-            if line[cursor] == command[matched] {
-                cursor += 1;
-                matched += 1;
-                continue;
-            }
-            break;
-        }
-        if matched != command.len() {
-            continue;
-        }
-        if cursor == line.len() || line[cursor..] == ['\r'] {
-            return Some((line_start + command_start, line_start + cursor));
         }
     }
     None

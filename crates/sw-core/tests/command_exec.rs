@@ -1912,13 +1912,46 @@ fn wrapped_echo_readline_python_golden_cases() {
             assert_eq!(wrap_extract(&raw, &c200), "OUT", "prefix={prefix:?} cuts={cuts:?}");
         }
     }
-    // 標記距命令起點不足 20 字元：不接受；殘留 prompt 不計入距離。
+    // 標記距命令起點不足 20 字元（且首行無殘留 prompt）：不接受。
     let x60 = "x".repeat(60);
     let raw = format!("{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&x60, &[10]));
     assert_eq!(wrap_extract(&raw, &x60), format!("{} {}\nOUT", &x60[..10], &x60[10..]));
+    // 原 842c014 主線「殘留 prompt 不計入距離」案依 rulings/p5.md P5-70f6ce7-1 改依修正 PR 語意
+    // （第一個插入點以首行欄位計、含殘留 prompt）：見 `wrapped_echo_first_insertion_counts_first_line_column`。
+}
+
+/// rulings/p5.md P5-70f6ce7-1（修正 PR 34c3a84 語意）：第一個插入點以首行欄位計（含殘留 prompt）——
+/// prompt 15 欄＋命令 10 字元＝第 25 欄折行，視為終端折行回顯而剝除。
+#[test]
+fn wrapped_echo_first_insertion_counts_first_line_column() {
+    let x60 = "x".repeat(60);
     let raw = format!("{WRAP_PROMPT}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&x60, &[10]));
+    assert_eq!(wrap_extract(&raw, &x60), "OUT");
+    let c = wrap_cmd96();
+    let raw = format!("{WRAP_PROMPT}{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..10], &c[10..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+/// rulings/p5.md P5-70f6ce7-1：即使原始串流有 BusyBox `\r\r\n` 折行證據，插入點彼此（第一個以首行欄位計）
+/// 不足 20 字元者不是終端折行，全文保留（842c014 主線只接合行、不檢查間距，會誤剝）。
+#[test]
+fn wrapped_echo_busybox_insertions_closer_than_20_are_kept() {
+    let c = wrap_cmd96();
+    let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..10], &c[10..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\nOUT", &c[..10], &c[10..]));
+    let raw = format!("{}\r\r\n{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..30], &c[30..40], &c[40..]);
     assert_eq!(
-        wrap_extract(&raw, &x60),
-        format!("{WRAP_PROMPT}{} {}\nOUT", &x60[..10], &x60[10..])
+        wrap_extract(&raw, &c),
+        format!("{}\n{}\n{}\nOUT", &c[..30], &c[30..40], &c[40..])
     );
+}
+
+/// rulings/p5.md P5-70f6ce7-1：BusyBox 折行只插入換行；命令本身的空白不能少（換行取代命令空白者不是回顯）。
+#[test]
+fn wrapped_echo_busybox_newline_replacing_command_space_is_kept() {
+    let c = wrap_cmd96();
+    // 第 55 字元為命令原有空白：以 `\r\r\n` 取代它（而非插入）→ 少一個命令字元，不得剝除。
+    assert_eq!(&c[55..56], " ");
+    let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..55], &c[56..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\nOUT", &c[..55], &c[56..]));
 }

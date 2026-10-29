@@ -2339,6 +2339,14 @@ fn release_commit_paused_then_bind_keeps_binding_without_stale_released_row() {
         "已改綁的 session 不得留下舊 released 列（重啟會再次成為 RELEASED）：{:?}",
         saved.released
     );
+    // rulings/p5.md P5-5cc4623-1：重啟後實體化——COM0 依 binding B 建立、不得因舊 delta 成為 RELEASED。
+    let r = m.restart();
+    r.mgr.update_devices(&r.snapshot());
+    r.mgr.bootstrap_attach();
+    let after = r.session("COM0");
+    assert_ne!(s_of(&after, "state").as_deref(), Some("RELEASED"), "{after:?}");
+    assert_eq!(s_of(&after, "device_by_id").as_deref(), Some(OFFLINE_B), "{after:?}");
+    assert!(r.load_state_now().released.is_empty(), "重啟後不得重新出現 released 列");
 }
 
 /// sol-backfill p5 #4：Python `SessionManager.__init__` 尾端 `_save_state()` 失敗（EACCES／ENOSPC）即拋出，
