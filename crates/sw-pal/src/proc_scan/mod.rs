@@ -297,6 +297,64 @@ pub trait ProcScan: Send + Sync {
     fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
         self.serialwrapd_tty_holders(paths)
     }
+    /// OD-48 OWNER-BATCH #3：`/proc/<pid>/cgroup` 原文（Linux）；行程不存在或平台不支援 → `None`。
+    /// 由 [`classify_cgroup`] 判定該行程所屬的監管者。
+    fn proc_cgroup(&self, _pid: u32) -> Option<String> {
+        None
+    }
+}
+
+/// OD-48 OWNER-BATCH #3：依 cgroup 判定的行程監管歸屬。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CgroupOwner {
+    /// serialwrap 自己的 systemd unit（`serialwrap.service`，system 或 user manager 底下）。
+    SerialwrapUnit,
+    /// 非 serialwrap 的 systemd service unit，或 system.slice 底下其他監管者的 transient scope（容器執行環境等）。
+    ForeignUnit(String),
+    /// 使用者登入 session、終端機或 user manager 的 app scope（一般 shell 啟動）。
+    Session,
+    /// 無法判定（根 cgroup、格式不明或讀不到）；呼叫端退回父行程判定。
+    Unknown,
+}
+
+/// OD-48 OWNER-BATCH #3：解析 `/proc/<pid>/cgroup`。cgroup v2 取 `0::<path>`，v1 取 `name=systemd` 階層；
+/// 以路徑最後一段判定：`*.service` 為 systemd service unit（`serialwrap.service` 以外即外部監管者），
+/// system.slice 底下的 `*.scope` 視為其他監管者，其餘 `*.scope` 為一般 session。
+pub fn classify_cgroup(content: &str) -> CgroupOwner {
+    let mut path = None;
+    for line in content.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(value)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if id == "0" && controllers.is_empty() {
+            path = Some(value);
+            break;
+        }
+        if controllers == "name=systemd" {
+            path = Some(value);
+        }
+    }
+    let Some(path) = path.map(str::trim) else {
+        return CgroupOwner::Unknown;
+    };
+    let parts = path.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let Some(leaf) = parts.last() else {
+        return CgroupOwner::Unknown;
+    };
+    if leaf.ends_with(".service") {
+        if *leaf == "serialwrap.service" {
+            return CgroupOwner::SerialwrapUnit;
+        }
+        return CgroupOwner::ForeignUnit((*leaf).to_string());
+    }
+    if leaf.ends_with(".scope") {
+        if parts.first() == Some(&"system.slice") {
+            return CgroupOwner::ForeignUnit((*leaf).to_string());
+        }
+        return CgroupOwner::Session;
+    }
+    CgroupOwner::Unknown
 }
 
 /// OD-48 D1.3：執行檔是否為 Python 直譯器（basename `python`、`python3`、`python3.12`…；Windows 另含 `.exe`）。

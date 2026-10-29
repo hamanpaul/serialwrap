@@ -377,8 +377,19 @@ pub(crate) fn precheck(
         detail.insert("hint", str_value("config.yaml 的 supervision_mode 與實際監管 unit 不符；請以 --user／--system 指定實際模式後重試 setup"));
         return Err(refused(ErrorCode::DeviceStillHeld, "supervisor_mode_mismatch", "舊 daemon 由與設定不同的 systemd 模式監管；拒絕停止", detail));
     }
-    // D3.4：外部監管者（非預期父行程）→ 停止前 fail-closed。
+    // D3.4（OWNER-BATCH #3 裁決）：Linux 以 `/proc/<pid>/cgroup` 判定——daemon 落在非 serialwrap 的 systemd
+    // service unit 或其他監管者的 cgroup → 停止前 fail-closed。父行程 basename 清單保留為輔助判定。
     if unit_mode.is_none() {
+        for item in &daemon.tree {
+            let owner = ctx.p.procs.proc_cgroup(item.pid).map(|content| sw_pal::proc_scan::classify_cgroup(&content));
+            if let Some(sw_pal::proc_scan::CgroupOwner::ForeignUnit(unit)) = owner {
+                let mut detail = PyDict::new();
+                detail.insert("pid", int(u64::from(item.pid)));
+                detail.insert("cgroup_unit", str_value(unit));
+                detail.insert("hint", str_value("舊 daemon 位於 serialwrap 以外的 systemd unit 或監管者 cgroup；請先停用該監管者再重試 setup"));
+                return Err(refused(ErrorCode::DeviceStillHeld, "external_supervisor", "舊 daemon 由外部監管者管理；拒絕停止", detail));
+            }
+        }
         if let Some(parent) = daemon.details.ppid.and_then(|ppid| ctx.p.procs.proc_details(ppid)) {
             let name = parent.exe.as_deref().map(basename_lower).unwrap_or_default();
             let wrapped = EXTERNAL_SUPERVISORS.contains(&name.as_str())

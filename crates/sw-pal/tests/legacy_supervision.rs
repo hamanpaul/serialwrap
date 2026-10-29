@@ -175,3 +175,46 @@ fn fake_proc_details_follow_liveness() {
     rpc.stop_endpoint("unix:///x");
     assert!(procs.proc_details(9).is_none(), "已結束的行程不得回傳辨識資訊");
 }
+
+/// OD-48 OWNER-BATCH #3（rulings/s1.md）：Linux 以 `/proc/<pid>/cgroup` 判定外部監管者。
+#[test]
+fn cgroup_classification_distinguishes_foreign_service_units() {
+    use sw_pal::proc_scan::{classify_cgroup, CgroupOwner};
+    // cgroup v2 unified 與 v1 name=systemd 兩種格式。
+    let foreign_system = "0::/system.slice/my-wrapper.service\n";
+    assert_eq!(classify_cgroup(foreign_system), CgroupOwner::ForeignUnit("my-wrapper.service".into()));
+    let foreign_user = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sw-custom.service\n";
+    assert_eq!(classify_cgroup(foreign_user), CgroupOwner::ForeignUnit("sw-custom.service".into()));
+    let v1 = "12:cpu,cpuacct:/\n1:name=systemd:/system.slice/supervisord.service\n";
+    assert_eq!(classify_cgroup(v1), CgroupOwner::ForeignUnit("supervisord.service".into()));
+    // 其他監管者的 transient scope（容器執行環境等）位於 system.slice。
+    assert_eq!(classify_cgroup("0::/system.slice/docker-0123abcd.scope\n"), CgroupOwner::ForeignUnit("docker-0123abcd.scope".into()));
+    // serialwrap 自己的 unit 與一般使用者 session／終端機 scope 不算外部監管者。
+    assert_eq!(classify_cgroup("0::/system.slice/serialwrap.service\n"), CgroupOwner::SerialwrapUnit);
+    assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/serialwrap.service\n"), CgroupOwner::SerialwrapUnit);
+    assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), CgroupOwner::Session);
+    assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-1.scope\n"), CgroupOwner::Session);
+    assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-9.scope\n"), CgroupOwner::Session);
+    // 容器內的根 cgroup 或讀不到 → 無法判定（呼叫端退回父行程判定）。
+    assert_eq!(classify_cgroup("0::/\n"), CgroupOwner::Unknown);
+    assert_eq!(classify_cgroup(""), CgroupOwner::Unknown);
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_proc_cgroup_reads_proc_pid_cgroup() {
+    let tmp = tempfile::tempdir().unwrap();
+    fake_proc(tmp.path(), 4242, 1, 1000, &["/usr/bin/python3", "/opt/a/.local/bin/serialwrapd"], "/usr/bin/python3.12");
+    std::fs::write(tmp.path().join("4242/cgroup"), "0::/system.slice/my-wrapper.service\n").unwrap();
+    let scan = PosixProcScan::with_root(tmp.path());
+    assert_eq!(scan.proc_cgroup(4242).as_deref(), Some("0::/system.slice/my-wrapper.service\n"));
+    assert!(scan.proc_cgroup(9999).is_none());
+}
+
+#[test]
+fn fake_proc_cgroup_is_scriptable() {
+    let procs = FakeProcScan::new(Vec::new());
+    assert!(procs.proc_cgroup(9).is_none());
+    procs.set_cgroup(9, "0::/system.slice/x.service\n");
+    assert_eq!(procs.proc_cgroup(9).as_deref(), Some("0::/system.slice/x.service\n"));
+}

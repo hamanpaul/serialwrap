@@ -136,6 +136,12 @@ impl ProcScan for PosixProcScan {
         }
     }
 
+    fn proc_cgroup(&self, pid: u32) -> Option<String> {
+        fs::read(self.proc_root.join(pid.to_string()).join("cgroup"))
+            .ok()
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+    }
+
     fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
         let Ok(entries) = fs::read_dir(&self.proc_root) else {
             return (Vec::new(), HolderScanStatus::Unknown);

@@ -53,6 +53,7 @@ pub struct FakeProcScan {
     alive_fns: Mutex<BTreeMap<u32, AliveFn>>,
     current_uid: Mutex<Option<u32>>,
     uart_holders: Mutex<Option<Vec<(Vec<u32>, HolderScanStatus)>>>,
+    cgroups: Mutex<BTreeMap<u32, String>>,
 }
 
 impl FakeProcScan {
@@ -168,6 +169,14 @@ impl FakeProcScan {
     /// OD-48：`current_uid` 的回應（未設定 → `None`）。
     pub fn set_current_uid(&self, uid: Option<u32>) {
         *self.current_uid.lock().unwrap_or_else(|e| e.into_inner()) = uid;
+    }
+
+    /// OD-48 OWNER-BATCH #3：指定 pid 的 `/proc/<pid>/cgroup` 內容（未設定 → `None`）。
+    pub fn set_cgroup(&self, pid: u32, content: &str) {
+        self.cgroups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, content.to_string());
     }
 
     /// OD-48 D5：`uart_holders_same_uid` 的腳本（依序；用盡後保持最後一筆）。未設定時沿用 serialwrapd holder 替身。
@@ -336,6 +345,14 @@ impl ProcScan for FakeProcScan {
 
     fn current_uid(&self) -> Option<u32> {
         *self.current_uid.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn proc_cgroup(&self, pid: u32) -> Option<String> {
+        self.cgroups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()
     }
 
     fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {

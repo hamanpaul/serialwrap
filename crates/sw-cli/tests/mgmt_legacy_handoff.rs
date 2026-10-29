@@ -578,3 +578,35 @@ fn legacy_l_crash_loop_recover_journal() {
         }
     }
 }
+
+/// OD-48 OWNER-BATCH #3（rulings/s1.md 編排者裁決）：daemon 落在非 serialwrap 的 systemd service unit
+/// （或其他監管者的 cgroup）→ 停止前 fail-closed；父行程為一般 init／shell 也不得放行。
+#[test]
+fn legacy_d3_4_foreign_service_cgroup_fails_closed_before_stop() {
+    for cgroup in [
+        "0::/system.slice/my-wrapper.service\n",
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sw-custom.service\n",
+        "0::/system.slice/docker-0123abcd.scope\n",
+    ] {
+        let t = legacy_on_demand_install();
+        t.procs().set_cgroup(4242, cgroup);
+        let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+        assert_eq!(rc, 2, "{cgroup}: {out}");
+        let j = json(&out);
+        assert_eq!(s(&j, "error_code"), "DEVICE_STILL_HELD", "{cgroup}: {out}");
+        assert!(out.contains("external_supervisor"), "{cgroup}: {out}");
+        assert!(methods(&t).iter().all(|m| m != "daemon.stop"), "{cgroup}：停止前就必須拒絕");
+        assert!(sw_cli::install_layout::read_current(&t.root()).unwrap().is_none());
+        assert_eq!(t.process().spawn_count(), 0);
+    }
+}
+
+/// OD-48 OWNER-BATCH #3：一般使用者 session／終端機 scope 的 on-demand 舊 daemon 照常停止。
+#[test]
+fn legacy_d3_4_session_scope_cgroup_is_not_external() {
+    let t = legacy_on_demand_install();
+    t.procs().set_cgroup(4242, "0::/user.slice/user-1000.slice/session-3.scope\n");
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "{out}");
+    assert_eq!(methods(&t).iter().filter(|m| *m == "daemon.stop").count(), 1);
+}
