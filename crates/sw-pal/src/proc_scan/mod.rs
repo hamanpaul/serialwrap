@@ -319,7 +319,7 @@ pub enum CgroupOwner {
 
 /// OD-48 OWNER-BATCH #3：解析 `/proc/<pid>/cgroup`。cgroup v2 取 `0::<path>`，v1 取 `name=systemd` 階層；
 /// 以路徑最後一段判定：`*.service` 為 systemd service unit（`serialwrap.service` 以外即外部監管者），
-/// system.slice 底下的 `*.scope` 視為其他監管者，其餘 `*.scope` 為一般 session。
+/// `*.scope` 一律視為一般 session，不因位於 `system.slice` 或 `user.slice` 而轉為外部監管者。
 pub fn classify_cgroup(content: &str) -> CgroupOwner {
     let mut path = None;
     for line in content.lines() {
@@ -349,9 +349,6 @@ pub fn classify_cgroup(content: &str) -> CgroupOwner {
         return CgroupOwner::ForeignUnit((*leaf).to_string());
     }
     if leaf.ends_with(".scope") {
-        if parts.first() == Some(&"system.slice") {
-            return CgroupOwner::ForeignUnit((*leaf).to_string());
-        }
         return CgroupOwner::Session;
     }
     CgroupOwner::Unknown

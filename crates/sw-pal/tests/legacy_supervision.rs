@@ -187,13 +187,18 @@ fn cgroup_classification_distinguishes_foreign_service_units() {
     assert_eq!(classify_cgroup(foreign_user), CgroupOwner::ForeignUnit("sw-custom.service".into()));
     let v1 = "12:cpu,cpuacct:/\n1:name=systemd:/system.slice/supervisord.service\n";
     assert_eq!(classify_cgroup(v1), CgroupOwner::ForeignUnit("supervisord.service".into()));
-    // 其他監管者的 transient scope（容器執行環境等）位於 system.slice。
-    assert_eq!(classify_cgroup("0::/system.slice/docker-0123abcd.scope\n"), CgroupOwner::ForeignUnit("docker-0123abcd.scope".into()));
+    // scope 結尾不論位於 system.slice 或 user.slice 都是一般 session／終端機 scope，不算外部監管者。
+    assert_eq!(classify_cgroup("0::/system.slice/docker-0123abcd.scope\n"), CgroupOwner::Session);
+    assert_eq!(classify_cgroup("0::/system.slice/init.scope\n"), CgroupOwner::Session);
+    assert_eq!(classify_cgroup("0::/system.slice/docker-0123abcd.scope/init.scope\n"), CgroupOwner::Session);
+    let v1_scope = "12:cpu,cpuacct:/\n1:name=systemd:/system.slice/docker-0123abcd.scope\n";
+    assert_eq!(classify_cgroup(v1_scope), CgroupOwner::Session);
     // serialwrap 自己的 unit 與一般使用者 session／終端機 scope 不算外部監管者。
     assert_eq!(classify_cgroup("0::/system.slice/serialwrap.service\n"), CgroupOwner::SerialwrapUnit);
     assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/serialwrap.service\n"), CgroupOwner::SerialwrapUnit);
     assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), CgroupOwner::Session);
     assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-1.scope\n"), CgroupOwner::Session);
+    assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-tmux.slice/tmux-spawn-9.scope\n"), CgroupOwner::Session);
     assert_eq!(classify_cgroup("0::/user.slice/user-1000.slice/user@1000.service/tmux-spawn-9.scope\n"), CgroupOwner::Session);
     // 容器內的根 cgroup 或讀不到 → 無法判定（呼叫端退回父行程判定）。
     assert_eq!(classify_cgroup("0::/\n"), CgroupOwner::Unknown);

@@ -673,13 +673,13 @@ fn s1_4baca8c_2_cross_mode_crash_after_start_stops_target_instance_first() {
 }
 
 /// OD-48 OWNER-BATCH #3（rulings/s1.md 編排者裁決）：daemon 落在非 serialwrap 的 systemd service unit
-/// （或其他監管者的 cgroup）→ 停止前 fail-closed；父行程為一般 init／shell 也不得放行。
+/// → 停止前 fail-closed；父行程為一般 init／shell 也不得放行。
 #[test]
 fn legacy_d3_4_foreign_service_cgroup_fails_closed_before_stop() {
     for cgroup in [
         "0::/system.slice/my-wrapper.service\n",
         "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sw-custom.service\n",
-        "0::/system.slice/docker-0123abcd.scope\n",
+        "0::/system.slice/foo.service\n",
     ] {
         let t = legacy_on_demand_install();
         t.procs().set_cgroup(4242, cgroup);
@@ -694,14 +694,23 @@ fn legacy_d3_4_foreign_service_cgroup_fails_closed_before_stop() {
     }
 }
 
-/// OD-48 OWNER-BATCH #3：一般使用者 session／終端機 scope 的 on-demand 舊 daemon 照常停止。
+/// OD-48 OWNER-BATCH #3：system.slice／user.slice 的 scope 皆視為一般 session，不得拒絕。
 #[test]
 fn legacy_d3_4_session_scope_cgroup_is_not_external() {
-    let t = legacy_on_demand_install();
-    t.procs().set_cgroup(4242, "0::/user.slice/user-1000.slice/session-3.scope\n");
-    let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
-    assert_eq!(rc, 0, "{out}");
-    assert_eq!(methods(&t).iter().filter(|m| *m == "daemon.stop").count(), 1);
+    for cgroup in [
+        "0::/system.slice/docker-0123abcd.scope\n",
+        "0::/system.slice/init.scope\n",
+        "0::/system.slice/boot-foo.scope\n",
+        "0::/user.slice/user-1000.slice/session-3.scope\n",
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-tmux.slice/tmux-spawn-9.scope\n",
+        "12:cpu,cpuacct:/\n1:name=systemd:/system.slice/docker-0123abcd.scope\n",
+    ] {
+        let t = legacy_on_demand_install();
+        t.procs().set_cgroup(4242, cgroup);
+        let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+        assert_eq!(rc, 0, "{cgroup}: {out}");
+        assert_eq!(methods(&t).iter().filter(|m| *m == "daemon.stop").count(), 1, "{cgroup}: {out}");
+    }
 }
 
 /// SPEC-GAP #5（rulings/s1.md 編排者裁決）：legacy stop 後切換失敗、還原本身也失敗 → revert_pending、journal 保留，
