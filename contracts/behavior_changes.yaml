@@ -1,5 +1,5 @@
 # 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
-# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57 由 P7 登記。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-37（SC-37 依 OD-21）、SC-39（OD-48）、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導；SC-30、DF-18 由 P7 Task 0 登記（08 §0.5）；DF-23 依 OD-57 由 P7 登記。
 # SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
 # SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
 # 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
@@ -167,9 +167,9 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["sc01-recovering-submit-open"]
-    compatibility_impact: "RECOVERING 下 CmdSubmit 與 InteractiveOpen 改回 SESSION_RECOVERING（原 SESSION_NOT_READY）；依碼分支的 agent 需新增 SESSION_RECOVERING 處理。"
+    compatibility_impact: "RECOVERING 下 CmdSubmit、InteractiveOpen 與 file.push／file.pull 改回 SESSION_RECOVERING（原 SESSION_NOT_READY）；依碼分支的 agent 需新增 SESSION_RECOVERING 處理。file.push／file.pull 依 plan 09 §0.1 與 error_codes.yaml 納入本 SC 範圍（OD-51 補正登記漏項，程式不改）。"
     approval_conditions: "規格明文"
-    related_decisions: []
+    related_decisions: ["OD-51"]
   - id: "SC-02"
     kind: "SC"
     title: "FLASHING 下 submit 與 open 回 FLASHING_BUSY"
@@ -194,9 +194,9 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["sc02-flashing-submit-open"]
-    compatibility_impact: "FLASHING 下 CmdSubmit 與 InteractiveOpen 改回 FLASHING_BUSY（原 SESSION_NOT_READY）；依碼分支的 agent 需新增 FLASHING_BUSY 處理。"
+    compatibility_impact: "FLASHING 下 CmdSubmit、InteractiveOpen 與 file.push／file.pull 改回 FLASHING_BUSY（原 SESSION_NOT_READY）；依碼分支的 agent 需新增 FLASHING_BUSY 處理。file.push／file.pull 依 plan 09 §0.1 與 error_codes.yaml 納入本 SC 範圍（OD-51 補正登記漏項，程式不改）。"
     approval_conditions: "規格明文"
-    related_decisions: []
+    related_decisions: ["OD-51"]
   - id: "SC-03"
     kind: "SC"
     title: "execute-time 與 file.* 的 AUTOBOOT_QUIET 附 retry_after_s"
@@ -1048,6 +1048,32 @@ changes:
     compatibility_impact: "serialwrapd 的 SERIALWRAP_RPC_BACKEND／SERIALWRAP_LOCK_BACKEND／SERIALWRAP_DEVICE_BACKEND 設為非本平台後端（例如 Linux 上 win）時，Rust daemon 於 Python 選擇該後端的同一時點報錯並 exit 1；Python 會在 POSIX 上改建 TCP RPC 等非原生後端。合法值與本平台值行為不變。"
     approval_conditions: "依 OD-21 (1) 擁有者逐項核准；A/B manifest 以 absolute_only 精確排除，比較器只驗 Rust 側 exit 1 與 stderr；argparse 錯誤（rc 2）與 SC-19 allowlist 檢查的先後順序維持 Python 時點（cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1、backend_env_checked_where_python_selects_it）。"
     related_decisions: ["OD-21"]
+  - id: "SC-39"
+    kind: "SC"
+    title: "0.4.0 setup 遇到 0.3.x 舊 daemon 時改走舊版停止路徑（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-29"
+      decision_ref: "OD-48"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 7
+    spec_refs: ["§12.1", "OD-48"]
+    reconciliation_refs: ["SC-23"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["sc39-legacy-daemon-handoff"]
+    compatibility_impact: "setup（install／update）對 daemon.handoff_stop 回 METHOD_NOT_FOUND 的 daemon 不再一律 fail-closed：D1 判定全部成立（版本 < 0.4.0，取自拒絕回應、缺漏時 health.status；行程正向辨識為 Python 0.3.x daemon；執行檔、argv[0] 與 script 不在 <install_root>/versions/ 底下）才改走舊版停止路徑，否則維持現行拒絕。停止前檢查其他同 uid daemon、mcu.status flash 與 session.list 忙碌、外部監管者（Linux 以 /proc/<pid>/cgroup 判定：daemon 位於 serialwrap 以外的 systemd service unit 即拒絕；`*.scope` 結尾一律視為一般 session，不因位於 `system.slice` 或 `user.slice` 而判為外部監管者，父行程清單為輔助；Windows 以父行程判定），並先寫 install-journal.legacy.json（不含 env）；0.3.2 沒有 admission freeze，檢查與送出 stop 之間的 TOCTOU 為已接受偏離。停止手段：pid 為 systemd unit 的 MainPID 時在 autostart hold 之下 systemctl stop，否則 RPC daemon.stop；不送 SIGKILL／TerminateProcess。已停判準：行程樹結束、無同 uid 行程持有該 session 的 UART（Windows 以行程樹結束推定並標註 holders_status unsupported）、與基準相比沒有新的 serialwrapd，連續維持 5 s；上限 330 s，逾時回 TIMEOUT／legacy_stop_pending 並保留 hold 與 journal；被重拉時重做判定後再停，總共最多 3 次，超過回 relaunch_loop。舊 daemon 停止後任一步失敗：還原入口、config、unit 註冊、enabled 狀態與 current，不自動重啟任何 daemon，報告附 legacy_daemon_stopped、restored 與啟動指令（OD-48 修訂）。成功報告新增 legacy_stop。還原本身失敗時 revert_pending、保留 journal，並以 unrestored 逐項列出未還原項（entries／config／unit／enabled／current）。範圍：「監管顯示 running 卻無可 RPC daemon → DEVICE_STILL_HELD」只套 systemd-user／systemd-system（0.3.2 沒有 windows-task 模式，windows-task 期望不變）；MainPID 相符的 unit 模式與 config 舊模式不一致時停止前 DEVICE_STILL_HELD（reason supervisor_mode_mismatch），hint 要求以 --user／--system 指定實際模式，不另取第二個模式的 hold。supervision-mode set 維持拒絕。不新增錯誤碼與 phase。"
+    approval_conditions: "依 OD-48（含 2026-10-29 修訂：失敗不自動重啟舊 daemon）與設計 v2 D1～D10；S1X-c-1（依舊／新模式解析 instance endpoint、safety_check 掃到 socket 不符的同 uid serialwrapd fail-closed）一併實作；legacy 專用中斷注入點另立清單，不加進凍結的 CRASH_POINTS 迴圈。"
+    related_decisions: ["OD-48", "OD-49", "OD-51"]
   - id: "DF-01"
     kind: "DF"
     title: "event rule_id 路徑穿越防護"

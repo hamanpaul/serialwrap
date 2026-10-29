@@ -5,7 +5,7 @@ use std::slice;
 
 use crate::proc_scan::{
     dedup_launcher_children, is_launcher_image, is_python_image, DaemonProc, HolderScanStatus,
-    ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
+    ProcDetails, ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
 };
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
@@ -18,7 +18,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Windows 行程快照掃描器。
@@ -144,6 +145,63 @@ impl ProcScan for WindowsProcScan {
         unsafe { CloseHandle(handle) };
         identity_query_means_alive(query_succeeded, exit_code, creation_time, id.start_ticks)
     }
+
+    fn proc_details(&self, pid: u32) -> Option<ProcDetails> {
+        let (parent_pid, image) = snapshot_entry(pid)?;
+        let exe = full_image_path(pid).unwrap_or(image);
+        Some(ProcDetails {
+            pid,
+            ppid: Some(parent_pid),
+            uid: None,
+            exe: Some(exe),
+            argv: read_process_command_line(pid).unwrap_or_default(),
+            start_ticks: process_creation_time(pid),
+        })
+    }
+
+    fn uart_holders_same_uid(&self, _paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        (Vec::new(), HolderScanStatus::Unsupported)
+    }
+}
+
+/// Toolhelp 快照中指定 pid 的父 pid 與映像名稱。
+fn snapshot_entry(pid: u32) -> Option<(u32, String)> {
+    // SAFETY: 快照使用 process-list flag 與 system-wide pid 0。
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W::default();
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let mut found = None;
+    // SAFETY: entry.dwSize 已設定，snapshot 是有效快照 handle。
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32ProcessID == pid {
+            found = Some((entry.th32ParentProcessID, decode_wide_nul(&entry.szExeFile)));
+            break;
+        }
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: 同上。
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: snapshot 由本函式建立，且只在此處關閉一次。
+    unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// `QueryFullProcessImageNameW`（Win32 路徑形式）；權限不足或行程已結束 → `None`。
+fn full_image_path(pid: u32) -> Option<String> {
+    let handle = open_query_handle(pid).ok()?;
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    // SAFETY: buffer 可寫入 size 個 u16，handle 為有效的查詢 handle。
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
+    } != 0;
+    // SAFETY: handle 由 open_query_handle 取得，且只在此處關閉一次。
+    unsafe { CloseHandle(handle) };
+    ok.then(|| String::from_utf16_lossy(&buffer[..size as usize]))
 }
 
 #[repr(C)]

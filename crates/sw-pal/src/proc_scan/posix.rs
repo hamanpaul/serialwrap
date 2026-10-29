@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::proc_holders::posix::{same_tty, HolderFs, RealHolderFs, TtyStat};
 use crate::proc_scan::{
     extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScanStatus,
-    ProcIdentity, ProcScan, ScanFailure,
+    ProcDetails, ProcIdentity, ProcScan, ScanFailure,
 };
 
 /// POSIX `/proc` 檔案系統掃描器。
@@ -147,6 +147,82 @@ impl ProcScan for PosixProcScan {
         }
     }
 
+    fn proc_details(&self, pid: u32) -> Option<ProcDetails> {
+        let dir = self.proc_root.join(pid.to_string());
+        let ProcStatRead::Parsed(stat) = read_proc_stat(&self.proc_root, pid) else {
+            return None;
+        };
+        if stat.state == b'Z' || stat.state == b'X' {
+            return None;
+        }
+        let argv = fs::read(dir.join("cmdline"))
+            .map(|raw| {
+                raw.split(|byte| *byte == 0)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let exe = fs::read_link(dir.join("exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        Some(ProcDetails {
+            pid,
+            ppid: stat.ppid,
+            uid: proc_uid(&dir),
+            exe,
+            argv,
+            start_ticks: stat.start_ticks,
+        })
+    }
+
+    fn current_uid(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            // SAFETY: getuid 無參數、不會失敗。
+            Some(unsafe { libc::getuid() })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    fn proc_cgroup(&self, pid: u32) -> Option<String> {
+        fs::read(self.proc_root.join(pid.to_string()).join("cgroup"))
+            .ok()
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        let Ok(entries) = fs::read_dir(&self.proc_root) else {
+            return (Vec::new(), HolderScanStatus::Unknown);
+        };
+        let me = self.current_uid();
+        let mut pids = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+                continue;
+            };
+            // 他 uid 的行程不在掃描範圍（D3.2／D5.2）；uid 讀不到者保守納入。
+            match (me, proc_uid(&entry.path())) {
+                (Some(me), Some(uid)) if uid != me => continue,
+                _ => pids.push(pid),
+            }
+        }
+        // 與 `serialwrapd_tty_holders` 同為 fail-closed 判準（升級／回滾的安全檢查；P7-71fe017-4）。
+        #[cfg(unix)]
+        {
+            tty_holders_fail_closed_with(&RealHolderFs, &self.proc_root, &pids, paths)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (pids, paths);
+            (Vec::new(), HolderScanStatus::Unknown)
+        }
+    }
+
     fn pid_alive(&self, pid: u32) -> bool {
         match read_proc_stat(&self.proc_root, pid) {
             ProcStatRead::Missing => false,
@@ -174,7 +250,18 @@ impl ProcScan for PosixProcScan {
 
 struct ProcStat {
     state: u8,
+    ppid: Option<u32>,
     start_ticks: Option<u64>,
+}
+
+/// `/proc/<pid>/status` 的 `Uid:` 第一欄（real uid）。
+fn proc_uid(dir: &Path) -> Option<u32> {
+    let status = fs::read_to_string(dir.join("status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|uid| uid.parse::<u32>().ok())
 }
 
 enum ProcStatRead {
@@ -217,7 +304,16 @@ fn read_proc_stat(root: &Path, pid: u32) -> ProcStatRead {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
     });
-    ProcStatRead::Parsed(ProcStat { state, start_ticks })
+    let ppid = fields.get(1).and_then(|value| {
+        std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+    });
+    ProcStatRead::Parsed(ProcStat {
+        state,
+        ppid,
+        start_ticks,
+    })
 }
 
 #[cfg(unix)]

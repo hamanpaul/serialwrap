@@ -77,6 +77,14 @@ pub const CRASH_POINTS: &[&str] = &[
     "revert_to_previous:after_effect",
 ];
 
+/// OD-48 D9(l)：legacy 停止專用的中斷注入點，另立清單並由獨立迴圈測試（`mgmt_legacy_handoff`）涵蓋。
+/// 「擷取後 stop 前」「stop 送出後」「已停、切換前」。
+pub const LEGACY_CRASH_POINTS: &[&str] = &[
+    "legacy_stop:after_capture",
+    "legacy_stop:after_stop_sent",
+    "legacy_stop:after_stopped",
+];
+
 struct EventFs {
     inner: Arc<dyn FsOps>,
     events: Arc<Mutex<Vec<(u64, String)>>>,
@@ -186,6 +194,8 @@ pub struct TestEnv {
     instance_appears: Option<(String, String, u32, Vec<String>)>,
     /// 群組成員（`build_env` 逐一套用；`without_group` 可移除）。
     groups: Vec<String>,
+    /// OD-48：0.3.x daemon 替身在停止後仍存活的時間（`u64::MAX`＝永不結束）。
+    legacy_linger_ns: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 pub trait IntoSupervisionMode {
@@ -246,6 +256,7 @@ impl TestEnv {
             new_daemon_handoff_pids: None,
             instance_appears: None,
             groups: Vec::new(),
+            legacy_linger_ns: None,
         };
         for dir in [
             t.home(),
@@ -652,6 +663,124 @@ impl TestEnv {
         self
     }
 
+    /// OD-48：0.3.2 Python daemon 替身。RPC 形狀對齊 `v0.3.2:sw_core/daemon.py`／`service.py`：
+    /// `daemon.handoff_stop` → `METHOD_NOT_FOUND`（帶 `version`）；`daemon.stop` 立即回 `stopping:true` 後 endpoint 消失，
+    /// 但行程在 `with_legacy_linger` 指定時間後才結束（socket 消失不代表 UART 已釋放）。行程辨識為 pipx 的 Python script。
+    pub fn with_legacy_daemon(mut self, ep: &str, pid: u32) -> Self {
+        self.ensure_process();
+        self.ensure_test_service(false);
+        let ep = self.isolated_endpoint(ep);
+        let socket = ep.strip_prefix("unix://").unwrap_or(&ep).to_string();
+        self.rpc.respond(&ep, "health.ping", r#"{"ok":true,"pong":true,"version":"0.3.2"}"#);
+        self.rpc.respond(&ep, "health.status", &format!(r#"{{"ok":true,"pid":{pid},"version":"0.3.2","wal":{{"healthy":true}}}}"#));
+        self.rpc.respond(&ep, "mcu.status", r#"{"ok":true,"flashing":false,"flashing_com":null,"version":"0.3.2"}"#);
+        self.rpc.respond(&ep, "session.list", LEGACY_SESSION_LIST);
+        self.rpc.respond(&ep, "daemon.handoff_stop", LEGACY_METHOD_NOT_FOUND);
+        self.rpc.respond(&ep, "daemon.stop", r#"{"ok":true,"stopping":true}"#);
+        self.rpc.stop_after_send(&ep, "daemon.stop");
+        self.procs = FakeProcScan::new(vec![DaemonProc {
+            pid,
+            socket: Some(socket.clone()),
+            tree: vec![ProcIdentity { pid, start_ticks: Some(70_000 + u64::from(pid)) }],
+        }]);
+        self.procs.follow_rpc_relaunch(Arc::clone(&self.rpc), &ep);
+        self.procs.set_current_uid(Some(LEGACY_UID));
+        self.procs.set_details(legacy_details(pid, &socket));
+        let linger = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let latch = Arc::new(Mutex::new(None::<u64>));
+        let rpc = Arc::clone(&self.rpc);
+        let clock = Arc::clone(&self.clock);
+        let stop_signal = self.service.as_ref().expect("test service configured").stop_signal();
+        let gate_ep = ep.clone();
+        let gate_linger = Arc::clone(&linger);
+        self.procs.alive_while(pid, Arc::new(move || {
+            let stopped = rpc.request_count(&gate_ep, "daemon.stop") > 0 || stop_signal.load(std::sync::atomic::Ordering::SeqCst);
+            if !stopped {
+                return true;
+            }
+            let now = clock.mono_ns();
+            let mut at = latch.lock().unwrap_or_else(|e| e.into_inner());
+            let since = *at.get_or_insert(now);
+            let linger = gate_linger.load(std::sync::atomic::Ordering::SeqCst);
+            linger == u64::MAX || now.saturating_sub(since) < linger
+        }));
+        if let Some(service) = &self.service {
+            service.stop_rpc_on_stop(Arc::clone(&self.rpc), &ep);
+        }
+        self.legacy_linger_ns = Some(linger);
+        self.active_daemon_endpoint = Some(ep);
+        self.active_daemon_pid = Some(pid);
+        self
+    }
+
+    /// OD-48 D7：0.3.x daemon 停止後由 setup 啟動的新版 daemon（列出同一組 session、支援 `daemon.handoff_stop`）。
+    pub fn with_new_daemon_after_legacy(self, v: &str) -> Self {
+        let t = self.with_new_daemon_reporting_version(v);
+        let ep = t.active_daemon_endpoint.clone().expect("with_new_daemon_after_legacy 須在 with_legacy_daemon 之後");
+        let token = &sha256_hex("handoff-5252")[..32];
+        let sessions = r#"{"ok":true,"sessions":[{"com":"COM0","state":"READY","foreground_busy":false,"outstanding_commands":0,"interactive_session_id":null,"recovering":false,"attached_real_path":"/dev/ttyUSB0"}]}"#;
+        t.rpc.respond_after_relaunch_seq(&ep, "session.list", &[sessions, sessions]);
+        t.rpc.respond_after_relaunch(&ep, "daemon.handoff_stop", &format!(r#"{{"ok":true,"stopping":true,"handoff_token":"{token}"}}"#));
+        t
+    }
+
+    /// OD-48 D1：改寫 0.3.x daemon 替身的行程辨識資訊（例如 bundle 路徑、原生執行檔）。
+    pub fn with_legacy_details(self, edit: impl FnOnce(&mut sw_pal::proc_scan::ProcDetails)) -> Self {
+        let pid = self.active_daemon_pid.expect("with_legacy_details 須在 with_legacy_daemon 之後");
+        let ep = self.active_daemon_endpoint.clone().unwrap_or_default();
+        let mut details = legacy_details(pid, ep.strip_prefix("unix://").unwrap_or(&ep));
+        edit(&mut details);
+        self.procs.set_details(details);
+        self
+    }
+
+    /// OD-48 D3.2：另一個 serialwrapd 實例（`uid` 決定是否與 setup 同一使用者）。
+    pub fn with_other_serialwrapd(self, pid: u32, socket: Option<&str>, uid: u32) -> Self {
+        self.procs.add_instance(DaemonProc {
+            pid,
+            socket: socket.map(str::to_string),
+            tree: vec![ProcIdentity { pid, start_ticks: Some(80_000 + u64::from(pid)) }],
+        });
+        let mut details = legacy_details(pid, socket.unwrap_or(""));
+        details.uid = Some(uid);
+        self.procs.set_details(details);
+        self
+    }
+
+    /// OD-48 D5：0.3.x daemon 在停止後仍存活 `linger`（`None`＝永不結束，模擬 executor 收尾逾時）。
+    pub fn with_legacy_linger(self, linger: Option<std::time::Duration>) -> Self {
+        let ns = linger.map_or(u64::MAX, |value| value.as_nanos().min(u64::MAX as u128 - 1) as u64);
+        self.legacy_linger_ns
+            .as_ref()
+            .expect("with_legacy_linger 須在 with_legacy_daemon 之後")
+            .store(ns, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// OD-48 D4：0.3.x daemon 為 `mode` 這個 systemd unit 的 MainPID。
+    pub fn with_legacy_main_pid(self, mode: &str) -> Self {
+        let pid = self.active_daemon_pid.expect("with_legacy_main_pid 須在 with_legacy_daemon 之後");
+        self.service().set_main_pid(&mode.into_supervision_mode(), Ok(Some(pid)));
+        self
+    }
+
+    /// OD-48 D5.3：每次 `daemon.stop` 後依序以 `pids` 重新拉起 0.3.x daemon（例如 minicom_router 的 AUTO_START_DAEMON）。
+    pub fn with_legacy_relaunches(self, pids: &[u32]) -> Self {
+        let ep = self.active_daemon_endpoint.clone().expect("with_legacy_relaunches 須在 with_legacy_daemon 之後");
+        let socket = ep.strip_prefix("unix://").unwrap_or(&ep).to_string();
+        self.rpc.relaunch_after_send(&ep, "daemon.stop", pids);
+        self.rpc.respond_relaunch_template(&ep, "health.status", pids, r#"{"ok":true,"pid":{pid},"version":"0.3.2","wal":{"healthy":true}}"#);
+        self.rpc.respond_relaunch_template(&ep, "health.ping", pids, r#"{"ok":true,"pong":true,"version":"0.3.2"}"#);
+        self.rpc.respond_relaunch_template(&ep, "daemon.handoff_stop", pids, LEGACY_METHOD_NOT_FOUND);
+        for (index, pid) in pids.iter().copied().enumerate() {
+            self.procs.set_details(legacy_details(pid, &socket));
+            let rpc = Arc::clone(&self.rpc);
+            let gate_ep = ep.clone();
+            self.procs.alive_while(pid, Arc::new(move || rpc.request_count(&gate_ep, "daemon.stop") < index + 2));
+        }
+        self
+    }
+
     /// 以本 TestEnv 的預設 POSIX endpoint 配置閒置 daemon。
     pub fn with_idle_daemon_default(self, pid: u32) -> Self {
         let endpoint = self.default_socket();
@@ -1053,6 +1182,13 @@ impl TestEnv {
     /// 中斷注入點（R1-F5）。`run` 會因未接線而 panic（見 `run`），避免靜默略過。
     pub fn with_crash_at(mut self, point: &str) -> Self {
         assert!(CRASH_POINTS.contains(&point), "未知的 crash point：{point}");
+        self.crash_point = Some(point.to_string());
+        self
+    }
+
+    /// OD-48 legacy 停止專用的中斷注入點（`LEGACY_CRASH_POINTS`；不屬凍結的 `CRASH_POINTS` 迴圈）。
+    pub fn with_legacy_crash_at(mut self, point: &str) -> Self {
+        assert!(LEGACY_CRASH_POINTS.contains(&point), "未知的 legacy crash point：{point}");
         self.crash_point = Some(point.to_string());
         self
     }
@@ -2223,6 +2359,30 @@ pub fn alive_state_with_identity(role: &str, pid: u32, id: &str) -> PyDict {
 }
 
 /// 僅含 pid 與自身 identity 的 daemon 行程（POSIX 形狀；Windows 的 launcher 樹由 P4-T4 承接）。
+/// OD-48 替身：0.3.x daemon 與 setup 的 uid。
+pub const LEGACY_UID: u32 = 1000;
+/// `v0.3.2:sw_core/service.py` 對未知 method 的回應（`rpc()` 以 setdefault 補 `version`）。
+pub const LEGACY_METHOD_NOT_FOUND: &str = r#"{"ok":false,"error_code":"METHOD_NOT_FOUND","method":"daemon.handoff_stop","version":"0.3.2"}"#;
+/// 0.3.2 `session.list`（閒置 COM0，附掛 UART）。
+pub const LEGACY_SESSION_LIST: &str = r#"{"ok":true,"sessions":[{"com":"COM0","state":"READY","foreground_busy":false,"outstanding_commands":0,"interactive_session_id":null,"recovering":false,"attached_real_path":"/dev/ttyUSB0","capture":null}],"version":"0.3.2"}"#;
+
+/// 0.3.2 pipx 安裝的 daemon 行程：venv python 執行 `~/.local/bin/serialwrapd` script。
+pub fn legacy_details(pid: u32, socket: &str) -> sw_pal::proc_scan::ProcDetails {
+    sw_pal::proc_scan::ProcDetails {
+        pid,
+        ppid: Some(1),
+        uid: Some(LEGACY_UID),
+        exe: Some("/usr/bin/python3.12".into()),
+        argv: vec![
+            "/opt/legacy-home/.local/pipx/venvs/serialwrap/bin/python".into(),
+            "/opt/legacy-home/.local/bin/serialwrapd".into(),
+            "--socket".into(),
+            socket.into(),
+        ],
+        start_ticks: Some(70_000 + u64::from(pid)),
+    }
+}
+
 fn daemon_proc(pid: u32) -> DaemonProc {
     DaemonProc {
         pid,

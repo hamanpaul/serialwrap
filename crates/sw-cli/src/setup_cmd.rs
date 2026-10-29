@@ -935,6 +935,8 @@ fn check_windows_task_install(records: &[CmdRecord]) -> Result<(), ReconcileErro
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OldStop {
     Reconcile,
+    /// OD-48 D2：舊 daemon 已由 legacy 路徑停止並確認結束；不得再送停止，只停用舊監管項。
+    AlreadyStopped,
     HandedOff {
         token: String,
         ran: Vec<Vec<String>>,
@@ -1124,6 +1126,18 @@ fn stop_old(
         } => {
             let _ = token;
             ran.extend(handed_ran.iter().cloned());
+            if matches!(
+                req.old_mode,
+                SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem
+            ) {
+                let commands = ctx
+                    .p
+                    .service
+                    .set_enabled(&req.old_mode, false, req.with_sudo);
+                extend_records(ran, &commands);
+            }
+        }
+        OldStop::AlreadyStopped => {
             if matches!(
                 req.old_mode,
                 SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem
