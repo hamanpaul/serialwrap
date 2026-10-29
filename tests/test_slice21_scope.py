@@ -117,6 +117,27 @@ def test_event_latency_contract_values():
     assert lat["flood_load"] == {"bytes_per_s": 20000, "seconds": 30, "chunk_bytes": 256}
 
 
+def test_event_latency_od45_l1_gate_and_external_split():
+    """OD-45：五事件皆有 L1 結構 gate（nodeid 須在 s21_core.linux 凍結鎖），外部只量三項；口徑改變須換 method_revision。"""
+    lat = _limits_doc()["event_latency"]
+    assert lat["method_revision"] != lat.get("previous_method_revision") and lat["method_revision"] != "2026-10-15.1"
+    rows = {r["event"]: r for r in lat["events"]}
+    assert {e for e, r in rows.items() if r.get("measure") == "external"} == {"stop_request", "command_cancel", "release_request"}
+    assert {e for e, r in rows.items() if r.get("measure") == "l1_only"} == {"lease_expiry", "drain_receipt"}
+    lock = json.loads((ROOT / "tests" / "acceptance" / "l1_required.lock.json").read_text(encoding="utf-8"))
+    frozen = set(lock["sets"]["s21_core"]["linux"]["nodeids"])
+    for event, r in rows.items():
+        assert r.get("l1_gate"), event
+        assert set(r["l1_gate"]) <= frozen, (event, set(r["l1_gate"]) - frozen)
+        if r["measure"] == "external":
+            assert r.get("external_point"), event
+    assert lat["external_method"]["tool"] == "scripts/rust/event_latency_measure.py"
+    assert lat["external_method"]["includes_connect"] is False
+    # 獨立審閱紀錄不得由實作者自填：未附入時三欄皆為 null 且未 frozen
+    if lat.get("reviewed_by") is None:
+        assert lat["freeze_status"] != "frozen" and lat.get("reviewed_at") is None and lat.get("review_conclusion") is None
+
+
 def test_event_latency_contract_frozen_before_slice_start():
     """§5.3：開工前凍結並有獨立審閱紀錄。證據不足時 skip（INSUFFICIENT_EVIDENCE），不得 PASS 放行。"""
     gaps = _freeze_gaps(_limits_doc())

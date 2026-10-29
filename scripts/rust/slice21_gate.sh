@@ -270,8 +270,25 @@ elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
 else
   record l15_ab --reason "tests/acceptance/l15/test_slice21_l15.py 不存在（P5-T21 未完成）"
 fi
-record event_latency --reason "event_latency 三輪量測結果（Task 21 寫入 resource_limits.yaml measurement_runs）尚無判定器；不得以 skip 代替" \
-  --section-verdict EVIDENCE_MISSING --exit 0
+# OD-45：event_latency = L1 結構 gate（五事件 l1_gate 須在 linux_l1 passed）＋外部量測三項（RPC 送出 → RPC 回應；
+#        idle 與 flood 20000 B/s；Rust 為判定對象，Python 基線以診斷樣本數另記供對照，不計入判定）。
+mkdir -p "$RUN_DIR/event_latency"
+run_logged event_latency python3 scripts/rust/event_latency_measure.py --daemon "$RUST_D" --cli "$RUST_CLI" --label rust \
+  --l1-results "$RUN_DIR/linux_l1/l1-results.json" --run-id "$RUN_ID" --out "$RUN_DIR/event_latency/rust.json" --work-dir "$RUN_DIR/event_latency/work"
+evlat_rc="$LAST_RC"
+# 工具結束碼：PASS 0、FAIL 1、INSUFFICIENT_EVIDENCE 3。證據不足照實記 EVIDENCE_MISSING（exit 0），不得記成 FAIL 或 PASS。
+evlat_exit="$evlat_rc"; [[ "$evlat_rc" == 3 ]] && evlat_exit=0
+run_logged event_latency_python python3 scripts/rust/event_latency_measure.py --daemon "$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
+  --label python-diagnostic --samples "${SW_EVLAT_PY_SAMPLES:-50}" --l1-results "$RUN_DIR/linux_l1/l1-results.json" \
+  --out "$RUN_DIR/event_latency/python-diagnostic.json" --work-dir "$RUN_DIR/event_latency/work-py" || true
+evlat_verdict="$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1]))["verdict"]; print({"PASS":"PASS","FAIL":"FAIL"}.get(v,"EVIDENCE_MISSING"))' \
+  "$RUN_DIR/event_latency/rust.json" 2>/dev/null || echo EVIDENCE_MISSING)"
+evlat_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.argv[1])).get("reasons") or []) or "—")' \
+  "$RUN_DIR/event_latency/rust.json" 2>/dev/null || echo "rust.json 未產生")"
+rm -rf "$RUN_DIR/event_latency/work" "$RUN_DIR/event_latency/work-py"
+record event_latency --command "python3 scripts/rust/event_latency_measure.py --label rust --l1-results linux_l1/l1-results.json" \
+  --exit "$evlat_exit" --log logs/event_latency.log --section-verdict "$evlat_verdict" --evidence event_latency/rust.json \
+  --reason "OD-45（L1 結構 gate＋外部量測 stop_request／command_cancel／release_request）：$evlat_reason"
 
 # 9 補：§1.2 WAL 效能（超標記 FAIL 並保留樣本，不得改列觀察值）
 mkdir -p "$RUN_DIR/wal_s1w_perf"

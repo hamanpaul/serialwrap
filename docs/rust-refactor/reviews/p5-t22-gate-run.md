@@ -78,3 +78,42 @@ pytest_full 14 failed：`test_safety_core.py::test_reject_paths_zero_tx[SESSION_
 
 - Python 基線 `SESSION_QUEUE_FULL` 兩案於 gate 內失敗、gate 外同檔重跑通過；`0a7d0929` 上全套 pytest 同範圍重跑 13 failed（為 gate 14 failed 的子集，僅少 `test_reject_paths_zero_tx[SESSION_QUEUE_FULL]`），即同範圍兩次失敗集合不同。根因仍未明（未出現時佇列持續被接受，推測前景 `sleep` 提早結束），不以 flaky 放行，列為待查（OD-36 延伸候選）。
 - gate 本身於本輪 sol 增量修正（`0a7d0929`）之前的 `3c4e051a` 執行；修正後以 cargo／全套 pytest 重驗（見 commit 說明），未重跑整個 gate。
+
+# 第五輪實跑（2026-10-29，run id `r5b-261029`）
+
+- 命令：`SERIALWRAP_L15_SELFTEST_REPORT=<posix-pty selftest-report.json> bash scripts/rust/slice21_gate.sh --evidence-run --run-id r5b-261029`（非 dry-run）。
+- 受測版本：`464adec5`（第五輪 rulings／OD-45～OD-47 套用後）；identity：CLI sha256 `3a5b8f52…a303a`、daemon sha256 `8aae8fc3…f6cf6`（release）。
+  bridge 自測：本輪重新產生（`python3 -m uart_stdio_bridge selftest --endpoint posix-pty --transport-mode virtual_pty`），`evaluate_bridge_eligibility` → `('PASS', True)`。
+- **作廢的首跑 `r5-261029`（照實揭露）**：首跑期間殘留一個先前中止的基線 pytest 所留下的 Python throwaway daemon（PID 存活自 00:51），
+  L1.5 兩邊 7 案皆在步驟 0 以 `ATTACH_FAILED:DeviceHeldError` 失敗、黑箱 Python／Rust 各 1 案失敗；另 event_latency 的「未凍結」被誤記為 FAIL、
+  量測證據檔含本機路徑使 policy R-21 FAIL。清掉殘留 daemon、修正 gate（`464adec5`）後整包重跑即本節結果；首跑不採為證據。
+- 耗時約 70 分鐘；**verdict：FAIL**（gate exit 1）。§5.3 凍結檢查未過（`event_latency` method_revision `2026-10-29.1`、`freeze_status='pending_review_record'`）。
+
+| section | 判定 | 數字 | 缺漏／原因 | 處置 |
+|---|---|---|---|---|
+| cfg_boundary | PASS | rc 0 | — | — |
+| linux_l1 | FAIL | 1719 passed／7 failed／28 skipped | 7 支皆 root 下證據不足（同第四輪）：`daemon_process::{endpoint_written_after_bind, unwritable_state_dir_startup_save_exits_1_before_attach, wal_dir_readonly_at_start_blocks_login_probe, wal_fault_after_ready_splits_agent_and_auto_tx}`、`oserror_golden::file_eacces_matches_golden`、`rpc_client_conformance::unix_fixture_rows_match_python`、`serial::posix::tests::holder_scan_permission`；非 root（`tcargo`，uid 1000）重跑：`daemon_process` 32/32、`oserror_golden` 5/5、`rpc_client_conformance` 7/7、`holder_scan_permission` 1/1 皆 passed | F108（BLOCKED-OWNER） |
+| linux_cap_posix_pty | EVIDENCE_MISSING | 347／4／8 | 集合未登記 | BLOCKED-OWNER（F50／F57） |
+| windows_native_l1 | EVIDENCE_MISSING | runner exit 1 | cross build 成功；`.exe` 無法於 Linux 執行 | LOCAL-WINDOWS-TODO（BO-S21-13） |
+| windows_cap_windows_com | EVIDENCE_MISSING | — | 無 COM pair | BO-S21-01 |
+| blackbox_python | EVIDENCE_MISSING | **43／0／6** | 集合未登記；第四輪的 `SESSION_QUEUE_FULL` 兩案本輪通過（見下方「第四輪未結」更新） | BLOCKED-OWNER（F57） |
+| blackbox_rust | EVIDENCE_MISSING | **46／0／3** | 集合未登記（含 OD-46 新案 `test_wal_unlink_under_sustained_traffic_keeps_evidence` passed） | BLOCKED-OWNER（F57） |
+| existing_suites_rust | EVIDENCE_MISSING | 4／0；func-test 3/3 rc 0 | 集合未登記 | BLOCKED-OWNER（F57） |
+| l15_ab | FAIL | 33 passed／2 failed（35 項） | 只剩 `s21-event-latency` 兩邊（以 daemon 計時欄位量測，OD-45 下恆 INSUFFICIENT_EVIDENCE）。`s21-wal-unlink-under-traffic` 依 OD-46 移出（第四輪 4 failed） | OWNER-BATCH（建議比照 OD-40／46 移出） |
+| event_latency | EVIDENCE_MISSING | Rust 18 輪全 PASS；L1 gate 2 支 passed | 唯一原因：上限值未重新凍結（`pending_review_record`）。Rust 每輪 max：stop 0.96～3.93 ms、cancel 1.41～8.23 ms、release 5.47～38.36 ms（上限 idle 50／flood 100）。Python 診斷（50 樣本）：idle release_request 三輪 153～155 ms（> 50），其餘 PASS | OWNER-BATCH（獨立審閱＋重新凍結） |
+| wal_s1w_perf | FAIL | append p50 0.028／p95 0.041／p99 0.068 ms；rotate max 378 ms | 規格 §1.2 Linux 門檻於 cloud virtio 未達（同前兩輪）；照實記 FAIL | 待擁有者實機量測 |
+| case_uptake | EVIDENCE_MISSING | — | `case_verdicts.json` 未彙整；`stage2_estimate_weeks` 未填 | 擁有者填 OD-02 輸入 |
+| pytest_full | EVIDENCE_MISSING | 5454 passed／13 failed／226 skipped | 集合未登記；13 failed 全數屬起點基準（`cca5ba8`，乾淨 worktree，24 failed）之子集，無新增 | BLOCKED-OWNER（F57） |
+| policy_check | PASS | fail 0 | — | — |
+
+其餘 verdict 原因：identity 缺 `daemon_version`（F139 deferred）；parity 105 列：PASS 57、INCOMPLETE 46、BLOCKED-OWNER 2（同第四輪）；pending decisions 已清空（OD-45～OD-47）。
+
+pytest_full 13 failed：root 環境 `test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread`、`test_rust_agent_perm_verifier.py::test_directory_target_probes_inside_directory`、`test_bench_tools_cli.py::test_bench_issue_post_route_local_failure_restores_old_bundle_and_benches`；
+鎖／擁有者：`test_l1_judge.py::{test_l1_lock_cargo_sets_exclude_ignored_tests, test_l1_lock_frozen_set_excludes_capability_gated, test_l1_lock_nodeids_subset_of_collect_only}`、`test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`；
+無 Windows／pyserial：`test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native`、`test_doctor.py::TestWindowsDoctor::test_pyserial_ok_when_importable`、`test_stage0_tx_outcome.py::test_pyserial_port_write_maps_timeout_to_unknown`、`test_stage0_tx_permit.py::{test_pyserial_chunked_write_drain_stops_after_inflight_chunk, test_pyserial_partial_cancel_keeps_cancelled_reason}`、`test_stage0_uart_exclusive.py::TestManagerAttach::test_pyserial_access_denied_raises_device_held_unknown`。
+
+起點基準（`cca5ba8`，`/tmp` 下乾淨 worktree，python3.12，root）：24 failed／5436 passed／227 skipped。比 gate 多出的 11 支：9 支 `test_rust_no_onefile_private_tmp.py`（worktree 位於 `/tmp`，`--private-tmp` namespace 內看不到工作目錄，位置性）、`test_rust_goldens_fresh.py::test_golden_is_fresh[gen_allowlist_unreadable_config.py-…]`、`test_safety_core.py::test_reject_paths_zero_tx[CMD_TOO_LONG]`；基準期間同樣有上述殘留 daemon，僅作「不得超出」的上界使用。
+
+## 第四輪未結（更新）
+
+- Python 基線 `SESSION_QUEUE_FULL` 兩案本輪 gate 內通過（blackbox_python 與 pytest_full 皆然）。首跑 `r5-261029` 時殘留 throwaway daemon 使相關案例失敗，推測第四輪的不穩定可能同源（同機殘留 daemon／PTY holder），未能證實；維持觀察，不以 flaky 放行。

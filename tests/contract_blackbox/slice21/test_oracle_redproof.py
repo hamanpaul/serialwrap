@@ -169,3 +169,61 @@ def test_redproof_recovery_flush_sends_queued(monkeypatch):
 
     with pytest.raises(AssertionError):
         f2.test_recovery_flushes_queue(_Fake(_submit))
+
+
+# ---------------------------------------------------------------------------
+# OD-46：WAL unlink 持續流量判定（`wal_unlink_evidence_gaps`）的紅燈證明
+# ---------------------------------------------------------------------------
+
+
+def _wal_rec(seq: int, direction: str, payload: bytes = b"", mono: int = 0, **extra) -> dict:
+    import base64
+
+    return {"seq": seq, "dir": direction, "com": extra.pop("com", "COM0"), "mono_ts_ns": mono,
+            "payload_b64": base64.b64encode(payload).decode(), **extra}
+
+
+def _unlink_fixture():
+    old = [_wal_rec(1, "RX", b"UNLRX00000\r\n", 10), _wal_rec(2, "TX", b"echo UNLTX0000\n", 20),
+           _wal_rec(3, "RX", b"UNLRX00001\r\n", 200), _wal_rec(4, "TX", b"echo UNLTX0001\n", 210)]
+    meta = {"seq": 5, "dir": "META", "com": "WAL", "loss_flag": True, "mono_ts_ns": 300,
+            "meta": {"event": "WAL_RECREATED_AFTER_EXTERNAL_UNLINK", "potentially_lost_seq_range": [1, 4]}}
+    new = [meta, _wal_rec(6, "RX", b"UNLRX00002\r\n", 400), _wal_rec(7, "TX", b"echo UNLTX0002\n", 410)]
+    rx = [b"UNLRX00000", b"UNLRX00001", b"UNLRX00002"]
+    tx = [b"echo UNLTX0000\n", b"echo UNLTX0001\n", b"echo UNLTX0002\n"]
+    return old, new, rx, tx
+
+
+def test_redproof_wal_unlink_evidence_gaps():
+    old, new, rx, tx = _unlink_fixture()
+    assert sc.wal_unlink_evidence_gaps(old, new, rx_markers=rx, tx_markers=tx, unlink_mono_ns=100) == []
+    # 重建後漏記一筆 RX（seq 缺口＋標記缺）
+    o, n, r, t = _unlink_fixture()
+    del n[1]
+    assert sc.wal_unlink_evidence_gaps(o, n, rx_markers=r, tx_markers=t, unlink_mono_ns=100)
+    # unlink 與偵測之間寫入舊 inode 的 TX 遺失
+    o, n, r, t = _unlink_fixture()
+    del o[3]
+    n[0]["meta"]["potentially_lost_seq_range"] = [1, 3]
+    assert sc.wal_unlink_evidence_gaps(o, n, rx_markers=r, tx_markers=t, unlink_mono_ns=100)
+    # 重建檔首筆不是 META
+    o, n, r, t = _unlink_fixture()
+    assert sc.wal_unlink_evidence_gaps(o, n[1:], rx_markers=r, tx_markers=t, unlink_mono_ns=100)
+    # loss_flag 未標
+    o, n, r, t = _unlink_fixture()
+    n[0]["loss_flag"] = False
+    assert sc.wal_unlink_evidence_gaps(o, n, rx_markers=r, tx_markers=t, unlink_mono_ns=100)
+    # TX 重複記錄
+    o, n, r, t = _unlink_fixture()
+    n.append(_wal_rec(8, "TX", b"echo UNLTX0002\n", 420))
+    assert sc.wal_unlink_evidence_gaps(o, n, rx_markers=r, tx_markers=t, unlink_mono_ns=100)
+    # 流量未橫跨 unlink（重建後無 TX）
+    o, n, r, t = _unlink_fixture()
+    assert sc.wal_unlink_evidence_gaps(o, n[:2], rx_markers=r, tx_markers=t[:2], unlink_mono_ns=100)
+    # unlink 前無流量（unlink 時點早於所有紀錄）
+    o, n, r, t = _unlink_fixture()
+    assert sc.wal_unlink_evidence_gaps(o, n, rx_markers=r, tx_markers=t, unlink_mono_ns=0)
+    # potentially_lost_seq_range 與舊 inode 不符
+    o, n, r, t = _unlink_fixture()
+    n[0]["meta"]["potentially_lost_seq_range"] = [1, 2]
+    assert sc.wal_unlink_evidence_gaps(o, n, rx_markers=r, tx_markers=t, unlink_mono_ns=100)

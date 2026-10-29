@@ -324,6 +324,8 @@ fn release_handled_within_one_data_item_under_flood() {
     flood.finish();
     assert_within_one_data_item(&h, "Release");
     h.wait_state("RELEASED");
+    // OD-45 drain_receipt：release 的排空回條（WorkerStopped）同樣最多再處理 1 個 data item。
+    assert_within_one_data_item(&h, "WorkerStopped");
 
     // command.cancel（排隊中的命令）
     let h = ActorRig::new(SHELL_PROFILE).ready();
@@ -364,6 +366,26 @@ fn release_handled_within_one_data_item_under_flood() {
     flood.finish();
     assert_within_one_data_item(&h, "LeaseExpiry");
     h.wait_for("lease 到期收回", |h| h.get_state()["interactive_session_id"].is_null());
+}
+
+/// OD-45：`stop_request`（daemon.stop → actor 收到 Shutdown）與 `drain_receipt`（WorkerStopped）的 L1 結構 gate——
+/// data lane 滿載時兩者皆在最多再處理 1 個 data item 後被處理（`resource_limits.event_latency.l1_bound`）。
+#[test]
+fn shutdown_and_drain_receipt_handled_within_one_data_item_under_flood() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let flood = Flood::start(&h);
+    wait_flowing(&h, 200);
+    flood.wait_full();
+    let (reply, rx) = crossbeam_channel::bounded(1);
+    h.send_control(ControlEvent::Shutdown { reply });
+    let resp = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("Shutdown 須於排空期限內回覆")
+        .expect("Shutdown 回 dict");
+    assert!(resp.get("ok").is_some(), "{resp:?}");
+    flood.finish();
+    assert_within_one_data_item(&h, "Shutdown");
+    assert_within_one_data_item(&h, "WorkerStopped");
 }
 
 /// release→attach→READY 後，舊 epoch writer 晚到的 `UartTxCompleted` 不改變新 session；WAL 保有該 TX 紀錄。

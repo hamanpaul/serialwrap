@@ -18,7 +18,8 @@ S21 = sorted(p.stem for p in (ROOT / "func-test/scenarios").glob("s21-*.yaml"))
 DEFERRED_TO_S23 = {"l15-delayed-reply": "OD-34", "s21-reboot-minimal-guard": "OD-34"}
 # OD-40（2026-10-28）：l15-wal-interference 自 l15_ab 判定逐名移出（情境檔與 2.1 必要案例保留），改由
 # tests/acceptance/slice21_gate_expect.yaml 的 `l15_ab_excluded` 所列 pytest WAL 測試承擔。
-L15_AB_EXCLUDED = {"l15-wal-interference": "OD-40"}
+# OD-46（2026-10-29）：s21-wal-unlink-under-traffic 比照 OD-40 逐名移出，改由持續流量 WAL unlink 黑箱 A/B 承擔。
+L15_AB_EXCLUDED = {"l15-wal-interference": "OD-40", "s21-wal-unlink-under-traffic": "OD-46"}
 L15_AB_CASES = [c for c in P2_21 + S21 if c not in DEFERRED_TO_S23 and c not in L15_AB_EXCLUDED]
 GATE = os.environ.get("SERIALWRAP_GATE") == "1"
 RECORD_ONLY: set[str] = set()   # s21-exclusive-conflict-plain-open 已依規格 §6.2 定案為拒絕（§0.2），改為正式判定

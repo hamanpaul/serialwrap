@@ -37,24 +37,45 @@ limits:
   - {name: fence_cancelled_ops_max, value: 512, unit: ops, overflow: drop_oldest, source: "parity-amendments-2026-10-26 #38：撤銷 op tombstone（Python `UARTBridge._revoked_ops`、`_TX_ACCOUNT_MAX`）FIFO 淘汰最舊；Rust `tx_writer::CANCELLED_OPS_MAX`"}
 
 # §5.3 事件延遲契約：開工前凍結。owner 與 reviewed_by 必須不同。
+# OD-45（2026-10-29）：method_revision 2026-10-15.1 的 accept／complete 點皆為 actor 內部點，Python／Rust WAL 皆無對應紀錄
+# （OD-41 (b) 不可行）。新口徑：
+#   (1)「控制事件不被資料擠掉」以 L1 結構測試為 gate：五事件皆保留 l1_bound，l1_gate 列出承擔的 cargo nodeid（linux_l1 須 passed）；
+#   (2) 外部只量 measure: external 的 stop_request／command_cancel／release_request，口徑「RPC 送出 → RPC 回應」
+#       （client 連線建立後、寫出請求前取 monotonic，讀到完整回應行再取一次；scripts/rust/event_latency_measure.py），idle 與 flood 各一輪；
+#   (3) lease_expiry、drain_receipt 為 measure: l1_only（max_ms_* 不作判定，保留舊值供追溯）；
+#   (4) 量測口徑改變，上限值依新 method_revision 重新凍結：下列 max_ms_* 沿用舊值、未經重新審閱——須由獨立審閱者（≠ owner）
+#       審閱並附入 reviewed_by／reviewed_at／review_conclusion 後才改 frozen；若需改數值屬擁有者裁決（OWNER-BATCH，附三輪實測）。
+#   不在 daemon 加計時欄位、不改 WAL。
 event_latency:
-  method_revision: "2026-10-15.1"
+  method_revision: "2026-10-29.1"
+  previous_method_revision: "2026-10-15.1"
   owner: codex-gpt-6-luna-max          # PAL／Actor 實作負責人
-  # 獨立審閱紀錄（P5 Task 0 雙審修正）：尚未附入。Task 0 測試作者不得自填為審閱者（前版誤填 agy-gemini-3.8-flash-high，已清除）。
+  # 獨立審閱紀錄：尚未附入。實作者／測試作者不得自填為審閱者。
   reviewed_by: null                    # 獨立審閱者姓名（附入時填）
   reviewed_at: null                    # 審閱日期 YYYY-MM-DD（附入時填）
   review_conclusion: null              # 審閱結論（附入時填，例如 approved）
-  # 凍結狀態：pending_review_record。附入上列三欄（且 reviewed_by != owner）並消除 NC-P5-01 後，才改 freeze_status: frozen。
-  # 未凍結時 tests/test_slice21_scope.py 的凍結測試 skip 並標 INSUFFICIENT_EVIDENCE；Task 21／22 gate 開頭同樣拒絕開跑。
+  # 凍結狀態：pending_review_record。附入上列三欄（且 reviewed_by != owner）後，才改 freeze_status: frozen。
+  # 未凍結時 tests/test_slice21_scope.py 的凍結測試 skip 並標 INSUFFICIENT_EVIDENCE；Task 22 gate 開頭同樣拒絕開跑。
   freeze_status: pending_review_record
   repeats: 3
   samples_per_run: 500
   gate_rule: every_run_max_le_max_ms   # 每輪樣本最大值都 ≤ 上限才通過；p99 只作診斷值，不作判定
-  flood_load: {bytes_per_s: 20000, seconds: 30, chunk_bytes: 256}   # = 規格門檻 20000 B／10 s 的 10 倍
+  flood_load: {bytes_per_s: 20000, seconds: 30, chunk_bytes: 256}   # = 規格門檻 20000 B／10 s 的 10 倍；外部量測期間 DUT 全程持續送出
   host_load: "量測期間記錄 /proc/loadavg 與 CPU 數；loadavg 1min > CPU 數時該輪作廢重跑"
+  external_method: {start: "client 連線建立後、寫出 RPC 請求前（time.monotonic_ns）", end: "讀到完整 RPC 回應行（time.monotonic_ns）", tool: "scripts/rust/event_latency_measure.py", includes_connect: false}
   events:
-    - {event: stop_request, accept_point: "daemon.stop 回應 stopping:true 寫出", complete_point: "actor 收到 Shutdown 並送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
-    - {event: command_cancel, accept_point: "command.cancel RPC 收到", complete_point: "在途命令的 CancelToken::cancel 被呼叫", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
-    - {event: lease_expiry, accept_point: "lease 期限到達（mono）", complete_point: "lease 移入 tombstone", max_ms_idle: 1100, max_ms_flood: 1200, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
-    - {event: drain_receipt, accept_point: "finisher 送出 WorkerStopped", complete_point: "actor 處理該 receipt 完成", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
-    - {event: release_request, accept_point: "device.release RPC 收到", complete_point: "actor 送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control}
+    - {event: stop_request, accept_point: "daemon.stop 回應 stopping:true 寫出", complete_point: "actor 收到 Shutdown 並送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+       measure: external, external_point: "daemon.stop RPC 送出 → 回應（ok:true）讀到；每樣本一個新 daemon（READY 後送出）",
+       l1_gate: ["cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood"]}
+    - {event: command_cancel, accept_point: "command.cancel RPC 收到", complete_point: "在途命令的 CancelToken::cancel 被呼叫", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+       measure: external, external_point: "在途（running）命令的 command.cancel RPC 送出 → 回應讀到",
+       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}
+    - {event: lease_expiry, accept_point: "lease 期限到達（mono）", complete_point: "lease 移入 tombstone", max_ms_idle: 1100, max_ms_flood: 1200, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+       measure: l1_only,
+       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}
+    - {event: drain_receipt, accept_point: "finisher 送出 WorkerStopped", complete_point: "actor 處理該 receipt 完成", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+       measure: l1_only,
+       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood", "cargo:sw-core::drain_release_e2e::shutdown_and_drain_receipt_handled_within_one_data_item_under_flood"]}
+    - {event: release_request, accept_point: "device.release RPC 收到", complete_point: "actor 送出 BeginDrain", max_ms_idle: 50, max_ms_flood: 100, load: "idle|flood", l1_bound: at_most_one_data_item_before_control,
+       measure: external, external_point: "device.release RPC 送出 → 回應（ok:true）讀到；之後 device.attach 回 READY 不計時",
+       l1_gate: ["cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood"]}

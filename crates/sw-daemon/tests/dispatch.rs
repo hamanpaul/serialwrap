@@ -1081,3 +1081,43 @@ fn result_tail_stale_owner_finds_capture_in_other_session() {
         j(&tail)
     );
 }
+
+// ---------------------------------------------------------------------------
+// 第五輪接線＋端到端驗收（rulings/p5.md P5-70f6ce7-1）
+// ---------------------------------------------------------------------------
+
+/// service `command.submit` → actor → OpRunner → `extract_command_stdout` 的折行回顯剝除（line mode）。
+/// BusyBox `\r\r\n` 折行回顯須剝除；沒有折行證據、恰為命令兩段的一般 CRLF stdout 須全文保留。
+/// 把 `strip_wrapped_command_echo` 改成 no-op 時第一案紅；改成無條件拼接（不看原始證據）時第二案紅。
+#[test]
+fn command_submit_line_mode_wrapped_echo_end_to_end() {
+    let r = ServiceRig::ready_shell();
+    let wrapped = format!("echo {} {}", "x".repeat(50), "y".repeat(40));
+    let plain = format!("cat /tmp/{}", "x".repeat(60));
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(
+        format!("{wrapped}\n").as_bytes(),
+        format!("{}\r\r\n{}\r\nOUT\r\nroot@t:/# ", &wrapped[..65], &wrapped[65..]).as_bytes(),
+    );
+    dev.on_tx_reply(
+        format!("{plain}\n").as_bytes(),
+        format!("{}\r\n{}\r\nOUT\r\nroot@t:/# ", &plain[..40], &plain[40..]).as_bytes(),
+    );
+    for (cmd, want) in [
+        (wrapped.clone(), "OUT".to_string()),
+        (plain.clone(), format!("{}\n{}\nOUT", &plain[..40], &plain[40..])),
+    ] {
+        let resp = r.call(
+            "command.submit",
+            &format!(r#"{{"selector":"COM0","cmd":"{cmd}","timeout_s":10}}"#),
+        );
+        assert_eq!(resp.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&resp));
+        let id = s(&resp, "cmd_id").to_string();
+        let mut got = PyDict::default();
+        wait_until("命令完成", || {
+            got = sub(&r.call("command.get", &format!(r#"{{"cmd_id":"{id}"}}"#)), "command");
+            !matches!(got.get("done_at"), None | Some(PyValue::Null))
+        });
+        assert_eq!(got.get("stdout"), Some(&PyValue::from(want.as_str())), "{}", j(&got));
+    }
+}

@@ -5,6 +5,7 @@
 - 拒絕路徑一律以 `t.written()` 與 WAL TX 行零增量判定（§11.3 不變量 1）。
 """
 import errno
+import json
 import os
 import stat
 import time
@@ -186,6 +187,148 @@ def test_wal_unlink_recreates_with_meta(shell_daemon):
     assert m["event"] == "WAL_RECREATED_AFTER_EXTERNAL_UNLINK"
     assert m.get("loss_flag", recs[0].get("loss_flag")) is True
     assert m["potentially_lost_seq_range"][1] < recs[1]["seq"]
+
+
+def _payload(rec: dict) -> bytes:
+    import base64
+
+    return base64.b64decode(rec.get("payload_b64") or "")
+
+
+def wal_unlink_evidence_gaps(old_recs: list[dict], new_recs: list[dict], *, rx_markers: list[bytes],
+                             tx_markers: list[bytes], unlink_mono_ns: int) -> list[str]:
+    """OD-46：外部 unlink 期間持續 RX／TX 時，「舊 inode（unlink 前開啟的 fd 讀回）＋重建後現行檔」的 WAL 證據不得漏。
+
+    回傳缺口清單（空 list 才算通過）：
+    - 重建檔第一筆為 `WAL_RECREATED_AFTER_EXTERNAL_UNLINK` META（loss_flag true），`potentially_lost_seq_range`
+      恰為舊 inode 的 [首 seq, 末 seq]，且重建 META 的 seq 緊接舊 inode 末 seq；
+    - 兩檔合併後 seq 自首筆起逐一連續、無重複（unlink 與偵測之間寫入舊 inode 的紀錄也在）；
+    - 每個 DUT 送出的 RX 標記與每個 agent 命令的 TX 標記在合併 WAL 中恰出現一次（RX 依送出順序）；
+    - 流量確實橫跨 unlink：unlink 之前舊 inode、重建 META 之後新檔，皆有 RX 與 TX 標記。
+    """
+    gaps: list[str] = []
+    if not old_recs:
+        gaps.append("舊 inode 無紀錄（unlink 前未持有 fd 或檔案為空）")
+    if not new_recs:
+        return gaps + ["unlink 後未重建現行 WAL"]
+    head = new_recs[0]
+    meta = head.get("meta") if isinstance(head.get("meta"), dict) else head
+    if head.get("dir") != "META" or meta.get("event") != "WAL_RECREATED_AFTER_EXTERNAL_UNLINK":
+        gaps.append(f"重建檔第一筆不是 WAL_RECREATED_AFTER_EXTERNAL_UNLINK META：{head}")
+    elif meta.get("loss_flag", head.get("loss_flag")) is not True:
+        gaps.append(f"重建 META 未標 loss_flag：{head}")
+    if old_recs and head.get("dir") == "META":
+        lost = meta.get("potentially_lost_seq_range")
+        want = [old_recs[0]["seq"], old_recs[-1]["seq"]]
+        if lost != want:
+            gaps.append(f"potentially_lost_seq_range={lost!r}，舊 inode 實際 seq 範圍 {want}")
+        if head.get("seq") != old_recs[-1]["seq"] + 1:
+            gaps.append(f"重建 META seq={head.get('seq')} 未緊接舊 inode 末 seq {old_recs[-1]['seq']}")
+    seqs = [r.get("seq") for r in old_recs + new_recs]
+    if seqs and seqs != list(range(seqs[0], seqs[0] + len(seqs))):
+        missing = sorted(set(range(min(seqs), max(seqs) + 1)) - set(seqs))
+        dup = sorted({x for x in seqs if seqs.count(x) > 1})
+        gaps.append(f"合併 WAL seq 不連續：缺 {missing[:10]}、重複 {dup[:10]}")
+    def _stream(recs: list[dict], direction: str) -> bytes:
+        return b"".join(_payload(r) for r in recs if r.get("dir") == direction and r.get("com") == "COM0")
+    all_rx, all_tx = _stream(old_recs + new_recs, "RX"), _stream(old_recs + new_recs, "TX")
+    pos = 0
+    for m in rx_markers:
+        n = all_rx.count(m)
+        if n != 1:
+            gaps.append(f"RX 標記 {m!r} 在合併 WAL 出現 {n} 次（須恰 1 次）")
+            continue
+        at = all_rx.find(m)
+        if at < pos:
+            gaps.append(f"RX 標記 {m!r} 順序與 DUT 送出順序不符")
+        pos = at
+    for m in tx_markers:
+        n = all_tx.count(m)
+        if n != 1:
+            gaps.append(f"TX 標記 {m!r} 在合併 WAL 出現 {n} 次（須恰 1 次）")
+    before = [r for r in old_recs if int(r.get("mono_ts_ns") or 0) < unlink_mono_ns]
+    after = new_recs[1:]
+    for label, recs in (("unlink 之前（舊 inode）", before), ("重建之後（新檔）", after)):
+        rx, tx = _stream(recs, "RX"), _stream(recs, "TX")
+        if not any(m in rx for m in rx_markers):
+            gaps.append(f"{label}無 RX 標記：流量未橫跨 unlink")
+        if not any(m in tx for m in tx_markers):
+            gaps.append(f"{label}無 TX 標記：流量未橫跨 unlink")
+    return gaps
+
+
+def test_wal_unlink_under_sustained_traffic_keeps_evidence(shell_daemon):
+    """OD-46：`s21-wal-unlink-under-traffic` 移出 l15_ab 後由本案承擔——unlink 期間 DUT 持續送 RX、agent 持續送命令（TX），
+    重建後證據不得漏（判定見 `wal_unlink_evidence_gaps`）。舊 inode 以 unlink 前開啟的唯讀 fd 讀回：不建硬連結
+    （硬連結會使 Rust 的 `nlink()==0` 外部 unlink 偵測失真），唯讀 fd 不改變 link 數。"""
+    import threading
+
+    d = shell_daemon
+    tgt = _tgt(d)
+    wal = d.wal_dir / "raw.wal.ndjson"
+    stop = threading.Event()
+    rx_markers: list[bytes] = []
+    tx_markers: list[bytes] = []
+    errors: list[str] = []
+
+    def _rx_pump() -> None:
+        n = 0
+        while not stop.is_set():
+            m = b"UNLRX%05d" % n
+            tgt.emit(m + b"\r\n")
+            rx_markers.append(m)
+            n += 1
+            time.sleep(0.01)
+
+    def _tx_pump() -> None:
+        n = 0
+        while not stop.is_set():
+            cmd = f"echo UNLTX{n:04d}"
+            sub = _submit(d, cmd)
+            if sub.get("ok") is not True:
+                errors.append(f"submit {cmd} 失敗：{sub}")
+                return
+            try:
+                d.wait_command_done(sub["cmd_id"], timeout=15)
+            except AssertionError as exc:
+                errors.append(str(exc))
+                return
+            tx_markers.append(f"{cmd}\n".encode())
+            n += 1
+
+    held = open(wal, "rb")
+    try:
+        threads = [threading.Thread(target=_rx_pump, daemon=True), threading.Thread(target=_tx_pump, daemon=True)]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + 20
+        while len(tx_markers) < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        unlink_mono_ns = time.monotonic_ns()
+        wal.unlink()
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if wal.exists() and any(r.get("dir") == "TX" for r in d.wal_records()):
+                    break                                  # 已重建且新檔已記到 agent TX
+            except ValueError:
+                pass                                       # 讀到寫入中的半行
+
+            time.sleep(0.05)
+        time.sleep(1.0)                                    # 重建後再維持一段流量
+        stop.set()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, errors
+        time.sleep(0.5)                                    # 等最後的 RX 落盤
+        held.seek(0)
+        old_recs = [json.loads(line) for line in held.read().decode("utf-8").splitlines() if line.strip()]
+    finally:
+        held.close()
+    new_recs = d.wal_records()
+    gaps = wal_unlink_evidence_gaps(old_recs, new_recs, rx_markers=rx_markers, tx_markers=tx_markers,
+                                    unlink_mono_ns=unlink_mono_ns)
+    assert not gaps, gaps
 
 
 def _tx_payloads(recs: list[dict]) -> list[bytes]:

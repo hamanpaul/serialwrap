@@ -68,7 +68,7 @@ impl ActorLatencyProbe {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).data_items
     }
 
-    /// 指定標籤的紀錄（`Release`、`CancelQueued`、`LeaseExpiry`、`Request`、`Timer`、`Tick`、`Control`）。
+    /// 指定標籤的紀錄（`Release`、`CancelQueued`、`LeaseExpiry`、`Shutdown`、`WorkerStopped`、`Request`、`Timer`、`Tick`、`Control`）。
     pub fn entries(&self, label: &str) -> Vec<ProbeEntry> {
         self.inner
             .lock()
@@ -127,6 +127,9 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
         }),
         MailboxItem::Control(ControlEvent::Timer(ev)) => Some(timer_label(ev)),
         MailboxItem::Control(ControlEvent::Tick) => Some("Tick"),
+        // OD-45：stop_request／drain_receipt 的 L1 結構 gate（`at_most_one_data_item_before_control`）。
+        MailboxItem::Control(ControlEvent::Shutdown { .. }) => Some("Shutdown"),
+        MailboxItem::Control(ControlEvent::WorkerStopped(_)) => Some("WorkerStopped"),
         MailboxItem::Control(_) => Some("Control"),
     }
 }
