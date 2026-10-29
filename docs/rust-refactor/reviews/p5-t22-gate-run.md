@@ -123,3 +123,4 @@ pytest_full 13 failed：root 環境 `test_bb_l15_holder_observer.py::test_observ
 - gate 內的 `event_latency/rust.json` 由 `464adec` 版工具產生，缺受測身分；`2472f78` 補上 identity 後，以乾淨工作樹、gate 同一 release artifact
   （daemon sha256 `8aae8fc3…f6cf6`）重採三輪，存為 `p5-evidence/event-latency-od45-rust-evlat-r5-2472f78.json`：18 輪全 PASS、L1 gate 2 支 passed，
   verdict INSUFFICIENT_EVIDENCE 的唯一原因為上限值未重新凍結。
+- 再依 sol P5-3084388-2 第 3 輪綁定 artifact 建置來源：`c4cfb96` 起報告以 gate `r5b-261029` 的 `report.json` 核對 daemon sha256 並取 `git_revision`（`464adec5`）；重採證據 `p5-evidence/event-latency-od45-rust-evlat-r5-c4cfb96.json` 18 輪全 PASS，取代 `…-2472f78.json`。

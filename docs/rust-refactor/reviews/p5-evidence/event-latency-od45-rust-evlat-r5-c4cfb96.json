@@ -9,14 +9,17 @@
   "freeze_status": "pending_review_record",
   "gate_rule": "every_run_max_le_max_ms",
   "identity": {
+    "artifact_build_mismatch": null,
+    "artifact_build_run_id": "r5b-261029",
+    "artifact_source_commit": "464adec57dab2f01d85bd93b1d7228762372fa48",
     "contract_sha256": "3b7a99512cdbe935652e2293970ebae46ae16c54642da020d378c804770e87c0",
     "daemon": "serialwrapd",
     "daemon_sha256": "8aae8fc322c57589c79beb8b98586183274ceb1183ac51870c9748c9f2799cf6",
     "method_revision": "2026-10-29.1",
-    "run_id": "evlat-r5-2472f78",
-    "source_commit": "2472f780c860a3ca742dac67d5f17eae02dff2a6",
+    "run_id": "evlat-r5-c4cfb96",
+    "source_commit": "c4cfb96638c8d28222ee450fc42642baae785ce9",
     "source_tree_dirty": false,
-    "tool_sha256": "836b986d8d21c086edd15f4efcf43241d1ac41364352fac0397031b8722f6f8a"
+    "tool_sha256": "6a60b3eac73d946df9a18a6aaeaf7b3b49138f80a381b00acd5fc86984010d72"
   },
   "l1_gate": {
     "cargo:sw-core::drain_release_e2e::release_handled_within_one_data_item_under_flood": "passed",
@@ -38,20 +41,137 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
+          "loadavg_1min": 0.33
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.29
+        }
+      },
+      "limit_ms": 50,
+      "load": "idle",
+      "max_ms": 0.662986,
+      "p99_ms": 0.241631,
+      "repeat": 1,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "command_cancel",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.04
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.33
+        }
+      },
+      "limit_ms": 50,
+      "load": "idle",
+      "max_ms": 2.659183,
+      "p99_ms": 0.616327,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "release_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.02
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.04
+        }
+      },
+      "limit_ms": 50,
+      "load": "idle",
+      "max_ms": 22.337999,
+      "p99_ms": 5.692869,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "stop_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.24
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.02
+        }
+      },
+      "limit_ms": 100,
+      "load": "flood",
+      "max_ms": 2.453583,
+      "p99_ms": 0.351534,
+      "repeat": 1,
+      "setup_failure_count": 0,
+      "setup_failures": [],
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "command_cancel",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.07
+        },
+        "before": {
+          "cpu_count": 4,
+          "loadavg_1min": 0.24
+        }
+      },
+      "limit_ms": 100,
+      "load": "flood",
+      "max_ms": 1.943013,
+      "p99_ms": 0.611438,
+      "repeat": 1,
+      "verdict": "PASS",
+      "void": false
+    },
+    {
+      "attempt": 0,
+      "count": 500,
+      "errors": [],
+      "event": "release_request",
+      "host_load": {
+        "after": {
+          "cpu_count": 4,
           "loadavg_1min": 0.16
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.2
+          "loadavg_1min": 0.07
         }
       },
-      "limit_ms": 50,
-      "load": "idle",
-      "max_ms": 0.435226,
-      "p99_ms": 0.198495,
+      "limit_ms": 100,
+      "load": "flood",
+      "max_ms": 6.349312,
+      "p99_ms": 4.206098,
       "repeat": 1,
-      "setup_failure_count": 0,
-      "setup_failures": [],
       "verdict": "PASS",
       "void": false
     },
@@ -59,11 +179,11 @@
       "attempt": 0,
       "count": 500,
       "errors": [],
-      "event": "command_cancel",
+      "event": "stop_request",
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.12
+          "loadavg_1min": 0.41
         },
         "before": {
           "cpu_count": 4,
@@ -72,125 +192,8 @@
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 1.070698,
-      "p99_ms": 0.625699,
-      "repeat": 1,
-      "verdict": "PASS",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "release_request",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.26
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.12
-        }
-      },
-      "limit_ms": 50,
-      "load": "idle",
-      "max_ms": 17.784949,
-      "p99_ms": 4.165526,
-      "repeat": 1,
-      "verdict": "PASS",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "stop_request",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.32
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.26
-        }
-      },
-      "limit_ms": 100,
-      "load": "flood",
-      "max_ms": 0.793379,
-      "p99_ms": 0.370989,
-      "repeat": 1,
-      "setup_failure_count": 0,
-      "setup_failures": [],
-      "verdict": "PASS",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "command_cancel",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.12
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.32
-        }
-      },
-      "limit_ms": 100,
-      "load": "flood",
-      "max_ms": 2.181349,
-      "p99_ms": 0.70496,
-      "repeat": 1,
-      "verdict": "PASS",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "release_request",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.25
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.12
-        }
-      },
-      "limit_ms": 100,
-      "load": "flood",
-      "max_ms": 6.82227,
-      "p99_ms": 3.653901,
-      "repeat": 1,
-      "verdict": "PASS",
-      "void": false
-    },
-    {
-      "attempt": 0,
-      "count": 500,
-      "errors": [],
-      "event": "stop_request",
-      "host_load": {
-        "after": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.2
-        },
-        "before": {
-          "cpu_count": 4,
-          "loadavg_1min": 0.25
-        }
-      },
-      "limit_ms": 50,
-      "load": "idle",
-      "max_ms": 2.21035,
-      "p99_ms": 0.238891,
+      "max_ms": 3.735456,
+      "p99_ms": 0.394122,
       "repeat": 2,
       "setup_failure_count": 0,
       "setup_failures": [],
@@ -205,17 +208,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.24
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.2
+          "loadavg_1min": 0.41
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 0.761561,
-      "p99_ms": 0.589784,
+      "max_ms": 2.432182,
+      "p99_ms": 0.810559,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -228,17 +231,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.13
+          "loadavg_1min": 0.16
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.24
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 26.15924,
-      "p99_ms": 4.173747,
+      "max_ms": 7.428236,
+      "p99_ms": 6.00036,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -251,17 +254,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.03
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.13
+          "loadavg_1min": 0.16
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 0.472713,
-      "p99_ms": 0.366211,
+      "max_ms": 7.800534,
+      "p99_ms": 0.86204,
       "repeat": 2,
       "setup_failure_count": 0,
       "setup_failures": [],
@@ -280,13 +283,13 @@
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.03
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 3.968729,
-      "p99_ms": 0.723648,
+      "max_ms": 2.703836,
+      "p99_ms": 0.90532,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -299,7 +302,7 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.34
+          "loadavg_1min": 0.11
         },
         "before": {
           "cpu_count": 4,
@@ -308,8 +311,8 @@
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 15.389027,
-      "p99_ms": 5.138235,
+      "max_ms": 9.952684,
+      "p99_ms": 5.331366,
       "repeat": 2,
       "verdict": "PASS",
       "void": false
@@ -322,17 +325,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.25
+          "loadavg_1min": 0.31
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.34
+          "loadavg_1min": 0.11
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 0.682482,
-      "p99_ms": 0.236514,
+      "max_ms": 2.288753,
+      "p99_ms": 0.282737,
       "repeat": 3,
       "setup_failure_count": 0,
       "setup_failures": [],
@@ -347,17 +350,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.06
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.25
+          "loadavg_1min": 0.31
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 2.760165,
-      "p99_ms": 1.034053,
+      "max_ms": 3.591629,
+      "p99_ms": 1.642461,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
@@ -370,17 +373,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.04
+          "loadavg_1min": 0.06
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.06
         }
       },
       "limit_ms": 50,
       "load": "idle",
-      "max_ms": 21.400648,
-      "p99_ms": 5.766314,
+      "max_ms": 11.760612,
+      "p99_ms": 6.17741,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
@@ -393,17 +396,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.04
+          "loadavg_1min": 0.14
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.04
+          "loadavg_1min": 0.06
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 2.474893,
-      "p99_ms": 0.523733,
+      "max_ms": 1.653932,
+      "p99_ms": 0.484376,
       "repeat": 3,
       "setup_failure_count": 0,
       "setup_failures": [],
@@ -418,17 +421,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.0
+          "loadavg_1min": 0.03
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.04
+          "loadavg_1min": 0.14
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 2.00435,
-      "p99_ms": 0.708608,
+      "max_ms": 15.621709,
+      "p99_ms": 1.636021,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
@@ -441,17 +444,17 @@
       "host_load": {
         "after": {
           "cpu_count": 4,
-          "loadavg_1min": 0.1
+          "loadavg_1min": 0.17
         },
         "before": {
           "cpu_count": 4,
-          "loadavg_1min": 0.0
+          "loadavg_1min": 0.03
         }
       },
       "limit_ms": 100,
       "load": "flood",
-      "max_ms": 12.573576,
-      "p99_ms": 4.900024,
+      "max_ms": 19.28888,
+      "p99_ms": 5.704091,
       "repeat": 3,
       "verdict": "PASS",
       "void": false
