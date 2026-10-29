@@ -106,11 +106,22 @@ def _fp_bdir(tmp_path, monkeypatch, freeze, slice_id: str) -> pathlib.Path:
     bdir = tmp_path / "breaker"
     bdir.mkdir()
     monkeypatch.setattr(freeze, "BREAKER_DIR", bdir)
-    for name in (f"slice_{slice_id}.json", f"slice_{slice_id}.case_fingerprints.json",
-                 f"slice_{slice_id}.amendments.json"):
+    for name in (f"slice_{slice_id}.json", f"slice_{slice_id}.case_fingerprints.json"):
         src = ACC / "breaker" / name
         if src.exists():
             (bdir / name).write_bytes(src.read_bytes())
+    # 修訂鏈只取 OD-52 指紋更新之前的前綴（模擬核准前狀態；前綴的鏈雜湊不受後續修訂影響）
+    src = ACC / "breaker" / f"slice_{slice_id}.amendments.json"
+    if src.exists():
+        entries = json.loads(src.read_text(encoding="utf-8"))
+        prefix = []
+        for entry in entries:
+            if entry.get("kind") == "fingerprint_update":
+                break
+            prefix.append(entry)
+        if prefix:
+            (bdir / src.name).write_text(
+                json.dumps(prefix, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
     return bdir / f"slice_{slice_id}.json"
 
 
