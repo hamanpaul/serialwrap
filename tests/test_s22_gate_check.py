@@ -376,3 +376,42 @@ def test_judge_tests_duplicate_in_one_report_is_insufficient_unit() -> None:
     assert mod.judge_tests([ref], {nid: dup}, None)[0] == "INSUFFICIENT"
     assert mod.judge_tests([ref], {nid: dup[1:]}, None)[0] == "PASS"
     assert mod.judge_tests([ref], {nid: dup[:1]}, None)[0] == "PASS"
+
+
+def test_process_evidence_row_requires_report_section_with_red_and_green(tmp_path: Path) -> None:
+    """rulings/p6.md OWNER-BATCH #4（#185 證據形式）：流程項不需可執行測試，證據為 Slice 2.2 出口報告中引用 T0 commit
+    的紅燈紀錄與終態綠燈段落。`PROCESS-EVIDENCE` 只限逐名核准的承接編號（#185）；報告缺檔、缺 `## #185` 段落、
+    段落內缺 commit、缺紅燈或綠燈紀錄皆 INSUFFICIENT；其他承接編號使用此狀態一律 INSUFFICIENT。"""
+    doc = PARITY_DOC.replace("| 179 | F1 | Medium | gate | 07 Task 1 |",
+                             "| 179 | F1 | Medium | gate | 07 Task 1 |\n| 185 | F3 | Medium | T0 紅燈 | 07 Task 0 |")
+    report = tmp_path / "exit-report.md"
+    good = ("# Slice 2.2 出口報告\n\n## #185 T0 單獨紅燈\n\nT0 commit `ae33e28` 單獨執行：紅燈 4 failed。\n"
+            "終態 HEAD：綠燈 13 passed。\n\n## 其他\n")
+    report.write_text(good, encoding="utf-8")
+    emap = _emap()
+    emap["parity_rows"]["#185"] = {"status": "PROCESS-EVIDENCE", "report": str(report), "commit": "ae33e28"}
+    rc, out = _run(tmp_path / "a", _good_reports(), emap=emap, parity_doc=doc)
+    row = next(r for r in out["parity_rows"] if r["row"] == "#185")
+    assert row["verdict"] == "PASS", row
+    for bad in (
+        good.replace("## #185", "## #186"),                       # 缺段落
+        good.replace("`ae33e28`", "`deadbee`"),                  # 段落內缺 commit
+        good.replace("紅燈", "結果"),                              # 缺紅燈
+        good.replace("綠燈", "結果"),                              # 缺綠燈
+        good.replace("終態 HEAD：綠燈 13 passed。\n", "") + "綠燈 在別段\n",  # 綠燈不在 #185 段落內
+    ):
+        report.write_text(bad, encoding="utf-8")
+        rc, out = _run(tmp_path / "b", _good_reports(), emap=emap, parity_doc=doc)
+        row = next(r for r in out["parity_rows"] if r["row"] == "#185")
+        assert row["verdict"] == "INSUFFICIENT", (bad, row)
+        assert rc == 1
+    report.write_text(good, encoding="utf-8")
+    emap["parity_rows"]["#185"]["report"] = str(tmp_path / "missing.md")
+    rc, out = _run(tmp_path / "c", _good_reports(), emap=emap, parity_doc=doc)
+    assert next(r for r in out["parity_rows"] if r["row"] == "#185")["verdict"] == "INSUFFICIENT"
+    # 非逐名核准的承接編號不得以 PROCESS-EVIDENCE 充當證據
+    emap = _emap()
+    emap["parity_rows"]["#179"] = {"status": "PROCESS-EVIDENCE", "report": str(report), "commit": "ae33e28"}
+    rc, out = _run(tmp_path / "d", _good_reports(), emap=emap)
+    row = next(r for r in out["parity_rows"] if r["row"] == "#179")
+    assert row["verdict"] == "INSUFFICIENT" and rc == 1, row
