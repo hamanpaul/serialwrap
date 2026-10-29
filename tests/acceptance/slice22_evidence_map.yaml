@@ -412,3 +412,131 @@ cases:
     evidence_schema: *id001
     procedure: docs/rust-refactor/slice21-owner-runbook.md
     status: BLOCKED-OWNER
+# 增補 #187（07 Task 13）：parity-amendments-2026-10-26 承接 Phase 為 P6 的 23 列（s22_gate_check.py p6_parity_numbers）。
+# PASS 的 tests 同 AUTOMATED 規則判定（須在 s22_gate:* 凍結集合內恰一列 passed）；OWNER-DECISION-PENDING 不得計 PASS。
+parity_rows:
+  '#35':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/session_core_lease.rs::open_with_command_reply_waits_tx_and_expired_maps"
+  '#36':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/session_core_lease.rs::send_checks_order"
+  '#37':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/console_hub.rs::hub_mux_wait_error_backoff_20ms_then_rebuild"
+  '#40':
+    status: PASS
+    tests:
+      - "crates/sw-pal/tests/console_conformance.rs::console_reaper_ignores_other_namespace_same_name_pts"
+  '#41':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/session_core_lease.rs::attached_unhealthy_not_ready"
+      - "crates/sw-core/tests/session_core_lease.rs::attached_rescue_uses_manager_bridge_snapshot_for_worker_health"
+  '#54':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/session_core_lease.rs::lazy_expiry_keeps_tombstone_expired"
+  '#56':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/session_core_lease.rs::tick_close_restore_returns_session_interactive_busy"
+  '#89':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/console_hub.rs::console_rx_handler_panic_isolated"
+  '#105':
+    status: PASS
+    tests:
+      - "tests/test_holder_probe_namespace.py::TestUartBridgeHeldPathsNamespace::test_foreign_namespace_string_not_in_held"
+      - "tests/test_holder_probe_namespace.py::TestUartBridgeHeldPathsNamespace::test_same_inode_string_in_held"
+      - "tests/test_holder_probe_namespace.py::TestUartBridgeHeldPathsNamespace::test_non_devpts_mknod_alias_in_held"
+      - "tests/test_holder_probe_namespace.py::TestUartBridgeHeldPathsNamespace::test_non_dev_link_is_not_stat_resolved"
+      - "tests/test_holder_probe_namespace.py::TestUartBridgeHeldPathsNamespace::test_missing_proc_returns_none"
+  '#106':
+    status: PASS
+    tests:
+      - "tests/test_stage0_bridge_drain.py::test_drain_timeout_closes_preserved_consoles_that_cannot_be_returned"
+      - "tests/test_stage0_bridge_drain.py::test_unsafe_stop_receipt_closes_preserved_consoles"
+      - "tests/test_stage0_bridge_drain.py::test_concurrent_stop_delivers_preserved_consoles_once"
+  '#107':
+    status: OWNER-DECISION-PENDING
+    note: "Python 基線 tests/test_agent_defer_tx.py::TestUARTBridgeConsoles::test_console_input_supports_backspace_and_local_echo 在 s22_gate:py_parity；計畫另要求的 L1.5 func-test 0x08／0x7F 案例未交付：line-buffer 只出現在非 owner console，其整行提交在 owner console 持有 human lease 時被 SESSION_INTERACTIVE_BUSY 拒絕（Python 實測 co-02 草稿失敗），案例設計待計畫擁有者釐清（SPEC-GAP）"
+  '#108':
+    status: OWNER-DECISION-PENDING
+    note: "Windows TCP attach_console 不開 lease 屬 Windows 原生（LOCAL-WINDOWS-TODO；Linux SC-28 tcp 後端由 rpc_console::attach_tcp_shape 承接）；file 傳輸 suspend 的既有 human 視窗 defer 屬 P8（Slice 2.4）——承接 Phase 待擁有者裁決"
+  '#109':
+    status: PASS
+    tests:
+      - "crates/sw-pal/tests/console_conformance.rs::tcp_accept_sets_nodelay_and_label_shape"
+  '#177':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/line_editor.rs::overflow_warning_at_trigger_byte"
+      - "crates/sw-core/tests/line_editor.rs::overflow_without_terminator_still_warns"
+      - "crates/sw-core/tests/line_editor.rs::overflow_across_chunks_warns_once"
+      - "crates/sw-core/tests/line_editor.rs::golden_warn_count_matches_python"
+  '#178':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/out_ring.rs::partially_written_front_drops_newest_reported"
+  '#179':
+    status: PASS
+    tests:
+      - "tests/test_compare_test_baseline.py::test_parse_groups_by_binary"
+      - "tests/test_compare_test_baseline.py::test_identical_results_pass"
+      - "tests/test_compare_test_baseline.py::test_base_red_staying_red_is_not_a_regression_but_green_to_red_is"
+      - "tests/test_compare_test_baseline.py::test_missing_binary_or_test_fails"
+      - "tests/test_compare_test_baseline.py::test_head_only_tests_and_improvements_are_informational"
+      - "tests/test_compare_test_baseline.py::test_strict_flags_any_status_change"
+      - "tests/test_compare_test_baseline.py::test_cli_compare_exit_codes"
+      - "tests/test_compare_test_baseline.py::test_failed_to_ignored_is_a_reduction_and_fails"
+      - "tests/test_compare_test_baseline.py::test_ignored_staying_ignored_and_ignored_to_failed_are_not_reductions"
+      - "tests/test_compare_test_baseline.py::test_approved_ignore_is_allowed_only_by_exact_name"
+      - "tests/test_compare_test_baseline.py::test_cli_failed_to_ignored_exits_nonzero"
+  '#180':
+    status: PASS
+    tests:
+      - "tests/test_check_p6_prereqs.py::test_max_task_last_line_reports_remaining"
+      - "tests/test_check_p6_prereqs.py::test_max_task_last_line_even_when_nothing_remains"
+      - "tests/test_check_p6_prereqs.py::test_strict_is_full_table_nonzero"
+      - "tests/test_check_p6_prereqs.py::test_strict_rejects_max_task"
+      - "tests/test_check_p6_prereqs.py::test_blocked_upstream_registry_names_t10_t11"
+  '#181':
+    status: PASS
+    tests:
+      - "crates/sw-core/tests/telnet_filter.rs::xorshift_zero_seed_does_not_stall"
+      - "crates/sw-core/tests/telnet_filter.rs::xorshift_nonzero_seed_is_reproducible"
+      - "tests/test_rust_goldens_fresh.py::test_golden_gitattributes_force_lf"
+  '#182':
+    status: PASS
+    tests:
+      - "tests/test_rust_goldens_fresh.py::test_tsv_write_raw_is_single_source"
+      - "tests/test_rust_goldens_fresh.py::test_tsv_raw_roundtrip_and_hex_mode"
+      - "tests/test_rust_goldens_fresh.py::test_tsv_write_raw_rejects_duplicates_and_separators"
+  '#183':
+    status: PASS
+    tests:
+      - "tests/test_slice21_case_freeze.py::test_revision_key_orders_numerically"
+      - "tests/test_slice21_case_freeze.py::test_freeze_case_fingerprints_match_current_cases[2.1]"
+      - "tests/test_slice21_case_freeze.py::test_freeze_case_fingerprints_match_current_cases[2.2]"
+      - "tests/test_slice21_case_freeze.py::test_freeze_writes_case_fingerprints"
+  '#184':
+    status: PASS
+    tests:
+      - "tests/test_acceptance_cases.py::test_contract_blackbox_cases_match_test_functions"
+      - "tests/test_acceptance_cases.py::test_contract_blackbox_grouping_is_structural[bad0]"
+      - "tests/test_acceptance_cases.py::test_contract_blackbox_grouping_is_structural[bad1]"
+      - "tests/test_acceptance_cases.py::test_contract_blackbox_grouping_is_structural[bad2]"
+      - "tests/test_acceptance_cases.py::test_contract_blackbox_grouping_is_structural[bad3]"
+  '#185':
+    status: OWNER-DECISION-PENDING
+    note: "流程項（T0 ae33e28 單獨為紅燈、終態綠燈；不重寫歷史時 PR 描述須明載）：無可執行測試，證據形式待擁有者裁決"
+  '#186':
+    status: PASS
+    tests:
+      - "crates/sw-daemon/tests/deferred_methods.rs::deferred_methods_excludes_delivered_slices"
+      - "crates/sw-daemon/tests/deferred_methods.rs::deferred_methods_only_reads_deferred_section"
