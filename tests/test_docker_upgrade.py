@@ -237,6 +237,78 @@ def test_refusal_with_wrong_reason_fails():
         "verdict"] == "INSUFFICIENT"
 
 
+def _legacy_body(*, started=True, method="rpc_daemon_stop", ok=True):
+    return {"ok": ok, "install": {"op": "install", "to_version": "0.4.0", "steps": [
+        {"step": "stop_supervisor", "ok": True, "detail": {"handoff": "legacy_stopped", "legacy_stop": {
+            "method": method, "from_version": "0.3.2", "waited_ms": 7000, "relaunch_count": 0,
+            "stability_window_ms": 5000}}},
+        {"step": "start_and_verify", "ok": True, "detail": {"started": started, "daemon_version": "0.4.0"}},
+    ]}}
+
+
+def _legacy_judge(**override):
+    args = dict(setup_rc=0, body=_legacy_body(), old_pids=[101], old_alive_after=[],
+                status_after={"ok": True, "version": "0.4.0", "pid": 202}, instances_after=[202],
+                cfg_before={"config.yaml": "a", "profiles/bench.yaml": "b"},
+                cfg_after={"config.yaml": "a", "profiles/bench.yaml": "b"}, overlaps=[])
+    args.update(override)
+    return uc.judge_legacy_direct_setup("legacy_handoff_direct_setup", **args)
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_direct_setup_is_required_check():
+    """OD-48：新增檢查 id 列入必要檢查；舊 id 保留（不改語意）。"""
+    assert "legacy_handoff_direct_setup" in uc.REQUIRED_CHECKS
+    assert "upgrade_with_old_daemon_running" in uc.REQUIRED_CHECKS and "upgrade_after_stop" in uc.REQUIRED_CHECKS
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_direct_setup_passes_only_when_setup_started_new_daemon():
+    """0.3.2 daemon 執行中直接 setup：切換成功、舊行程樹結束、新 daemon 由 setup 啟動、設定保留、無重疊 → PASS。"""
+    assert _legacy_judge()["verdict"] == "PASS"
+    assert _legacy_judge(body=_legacy_body(method="systemctl_stop"))["verdict"] == "PASS"
+    # setup 沒有啟動新 daemon（driver 不得代啟）→ FAIL
+    row = _legacy_judge(body=_legacy_body(started=False))
+    assert row["verdict"] == "FAIL" and "由 setup 啟動" in row["reason"], row
+    row = _legacy_judge(status_after=None, instances_after=[])
+    assert row["verdict"] == "FAIL" and "由 setup 啟動" in row["reason"], row
+    # 新舊兩個 daemon 同時存在
+    assert _legacy_judge(instances_after=[202, 303])["verdict"] == "FAIL"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_direct_setup_failure_modes():
+    """舊行程樹未結束、設定被改寫、升級期間重疊、缺 legacy_stop 或 setup 失敗 → FAIL；沒有舊 daemon → INSUFFICIENT。"""
+    row = _legacy_judge(old_alive_after=[101])
+    assert row["verdict"] == "FAIL" and "舊 daemon" in row["reason"], row
+    row = _legacy_judge(cfg_after={"config.yaml": "changed", "profiles/bench.yaml": "b"})
+    assert row["verdict"] == "FAIL" and "設定" in row["reason"], row
+    row = _legacy_judge(overlaps=[{"t": 1.0, "pids": [101, 202]}])
+    assert row["verdict"] == "FAIL" and "two-reader" in row["reason"], row
+    body = _legacy_body()
+    body["install"]["steps"][0]["detail"].pop("legacy_stop")
+    assert _legacy_judge(body=body)["verdict"] == "FAIL"
+    refused = {"ok": False, "error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+    assert _legacy_judge(setup_rc=2, body=refused)["verdict"] == "FAIL"
+    assert _legacy_judge(old_pids=[])["verdict"] == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_legacy_refusal_no_longer_accepted_for_0_3_x():
+    """REFUSAL_LEGACY_HANDOFF 只用於非 legacy 的不支援交接 daemon；0.3.x daemon 被拒絕即 FAIL（OD-48）。"""
+    before = {"daemon_pids": [101], "entries": {"serialwrap": "/pipx/bin/serialwrap"}, "files": {"config.yaml": "a"}}
+    after = json.loads(json.dumps(before))
+    refused = {"ok": False, "error_code": "METHOD_NOT_FOUND", "probe": "daemon.handoff_stop"}
+    row = uc.judge_upgrade_running_refusal("upgrade_with_old_daemon_running", before, after, refused, legacy=True)
+    assert row["verdict"] == "FAIL" and "OD-48" in row["reason"], row
+    row = uc.judge_upgrade_running_refusal("upgrade_with_old_daemon_running", before, after, refused, legacy=False)
+    assert row["verdict"] == "PASS", row
+
+
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_seed_requires_binding_effective_in_baseline():
@@ -287,6 +359,67 @@ def test_rollback_success_path_requires_old_daemon_and_config():
 
 @pytest.mark.core_portable
 @pytest.mark.memory_only
+def test_systemd_system_mode_required_checks_cover_legacy_direct_setup():
+    """OD-48 SPEC-GAP #10：systemd-system 只驗「0.3.2 daemon 執行中直接 setup」成功路徑，另立必要檢查集合；
+    完整流程（rollback／降級／重新升級）的必要集合不變。"""
+    required = uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM
+    for cid in ("old_install_0_3_2", "legacy_handoff_direct_setup", "upgrade_with_old_daemon_running",
+                "entries_replaced", "config_preserved_upgrade", "new_daemon_started", "supervision_reconciled",
+                "doctor_green_new", "no_two_reader"):
+        assert cid in required, cid
+    assert set(required) <= set(uc.REQUIRED_CHECKS)
+    assert "rollback_command" not in required and "downgrade_manual" not in required
+    rows = [{"id": cid, "verdict": "PASS"} for cid in required]
+    assert uc.overall_verdict(rows, required=required) == "PASS"
+    assert uc.overall_verdict(rows, required=uc.REQUIRED_CHECKS) == "INSUFFICIENT"
+    missing = [r for r in rows if r["id"] != "legacy_handoff_direct_setup"]
+    assert uc.overall_verdict(missing, required=required) == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_managed_profile_overwrite_must_match_bundle_content():
+    """S1-f3c66b4-1：套件管理的 profile 只允許被覆寫成新 bundle 的權威內容；遺失或其他內容必須 FAIL，
+    其餘檔案維持逐位元組比較。"""
+    managed = "/etc/serialwrap/profiles/default.yaml"
+    before = {"config.yaml": "c0", "profiles/bench.yaml": "b0", managed: "old", "/etc/serialwrap/profiles/bench.yaml": "b1"}
+    expected = {managed: "new"}
+    ok = dict(before, **{managed: "new"})
+    assert uc.judge_files_preserved("cfg", before, ok, expected_overwrites=expected)["verdict"] == "PASS"
+    assert uc.judge_files_preserved("cfg", before, dict(before), expected_overwrites=expected)["verdict"] == "PASS"
+    corrupted = dict(before, **{managed: "garbage"})
+    r = uc.judge_files_preserved("cfg", before, corrupted, expected_overwrites=expected)
+    assert r["verdict"] == "FAIL" and r["detail"]["changed"] == [managed]
+    deleted = {k: v for k, v in before.items() if k != managed}
+    r = uc.judge_files_preserved("cfg", before, deleted, expected_overwrites=expected)
+    assert r["verdict"] == "FAIL" and r["detail"]["missing"] == [managed]
+    # 沒有權威內容的檔案（使用者自加的 /etc profile）被改寫仍 FAIL。
+    user_changed = dict(ok, **{"/etc/serialwrap/profiles/bench.yaml": "x"})
+    assert uc.judge_files_preserved("cfg", before, user_changed, expected_overwrites=expected)["verdict"] == "FAIL"
+    # 預設（未給權威內容）語意不變。
+    assert uc.judge_files_preserved("cfg", before, ok)["verdict"] == "FAIL"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_system_driver_keeps_managed_profiles_in_snapshot():
+    """S1-f3c66b4-1：driver 不得把套件管理檔從快照排除。"""
+    text = UPGRADE_CONTAINER.read_text(encoding="utf-8")
+    assert "if k not in managed" not in text
+    assert "expected_overwrites" in text
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_image_grants_swtest_sudo_for_system_mode():
+    """systemd-system 模式以 swtest 執行 `setup --system --with-sudo`，映像需提供免密碼 sudo。"""
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    assert " sudo " in text
+    assert "swtest ALL=(ALL) NOPASSWD: ALL" in text
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_upgrade_image_pins_same_base_as_systemd_image():
     """升級容器與 OD-16 (5) systemd 容器使用同一個 ubuntu:24.04 digest，且不放 repo 內容、不連網安裝依賴。"""
     def base(path: Path) -> str:
@@ -323,6 +456,22 @@ def test_run_upgrade_dry_run_lists_both_modes_and_isolation(tmp_path):
     for mode in ("systemd-user", "on-demand"):
         assert f"--mode {mode}" in out, out
     assert "/dev/ttyUSB" not in out and "--device" not in out
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_systemd_system_mode_is_explicit_only(tmp_path):
+    """OD-48 SPEC-GAP #10：systemd-system 只能明確指定；預設（all）仍是 systemd-user 與 on-demand 兩種。"""
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--mode", "systemd-system", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--mode systemd-system" in r.stdout and "--mode systemd-user" not in r.stdout
+    assert "--network none" in r.stdout
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--out", str(tmp_path / "ev2")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--mode systemd-system" not in r.stdout
 
 
 @pytest.mark.core_portable
@@ -389,9 +538,16 @@ def test_docker_upgrade_0_3_2_to_0_4_0(tmp_path):
 @pytest.mark.core_portable
 @pytest.mark.memory_only
 def test_install_sh_scenario_required_checks_and_verdict():
-    """install-sh 情境另列必要檢查；既有 18 項升級情境的 REQUIRED_CHECKS 不變。"""
-    assert len(uc.REQUIRED_CHECKS) == 18
+    """install-sh 情境另列必要檢查；升級情境的 REQUIRED_CHECKS 不因 install-sh 而變（OD-48 合入後為下列 19 項，
+    含 legacy_handoff_direct_setup；逐項釘住，不只比長度）。"""
+    assert uc.REQUIRED_CHECKS == (
+        "old_install_0_3_2", "seed_user_data", "doctor_green_old", "upgrade_with_old_daemon_running",
+        "legacy_handoff_direct_setup", "upgrade_after_stop", "entries_replaced", "config_preserved_upgrade",
+        "new_daemon_started", "supervision_reconciled", "state_compatible_upgrade", "doctor_green_new",
+        "rollback_command", "downgrade_manual", "config_preserved_downgrade", "state_compatible_downgrade",
+        "doctor_green_downgrade", "reupgrade", "no_two_reader")
     assert "install_sh_upgrade" not in uc.REQUIRED_CHECKS
+    assert "old_daemon_stopped" not in uc.REQUIRED_CHECKS
     required = uc.REQUIRED_INSTALL_SH_CHECKS
     assert {"old_install_0_3_2", "old_daemon_stopped", "install_sh_upgrade", "entries_replaced",
             "config_preserved_upgrade", "new_daemon_started", "doctor_green_new", "no_two_reader"} <= set(required)
@@ -399,8 +555,10 @@ def test_install_sh_scenario_required_checks_and_verdict():
     rows = [{"id": cid, "verdict": "PASS"} for cid in required]
     assert uc.overall_verdict(rows, required=required) == "PASS"
     assert uc.overall_verdict(rows[:-1], required=required) == "INSUFFICIENT"
-    # 預設仍以 18 項判定：install-sh 的檢查集合不足以讓升級情境 PASS
+    # 預設仍以升級情境的完整集合判定：install-sh 的檢查集合不足以讓升級情境 PASS
     assert uc.overall_verdict(rows) == "INSUFFICIENT"
+    # 亦不足以讓 systemd-system（OD-48）情境 PASS：缺 legacy_handoff_direct_setup 等
+    assert uc.overall_verdict(rows, required=uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM) == "INSUFFICIENT"
 
 
 def _install_body(**install):
@@ -450,6 +608,26 @@ def test_run_upgrade_rejects_unknown_scenario(tmp_path):
     r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "bogus", "--out", str(tmp_path / "ev")],
                        cwd=REPO, capture_output=True, text=True, timeout=120)
     assert r.returncode == 2, r.stdout + r.stderr
+
+
+# POSIX-only：bash runner 需 POSIX bash、git 與 python3。
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_install_sh_scenario_rejects_systemd_system_mode(tmp_path):
+    """OD-48 合入後 --mode 多了 systemd-system；install-sh 情境的 driver 沒有該模式的 phase（setup 需 --with-sudo、
+    監管檢查走 system unit），組合須在 runner 與 driver 兩端都以 rc=2 拒絕，不得跑出錯置判定的報告。"""
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "install-sh", "--mode", "systemd-system",
+                        "--out", str(tmp_path / "ev")], cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "systemd-system" in r.stderr
+    assert "docker run" not in r.stdout
+    r = subprocess.run([sys.executable, str(UPGRADE_CONTAINER), "--mode", "systemd-system", "--wheel", "w.whl",
+                        "--bundle", str(tmp_path / "b"), "--out", str(tmp_path / "out"), "--scenario", "install-sh",
+                        "--installer", "/x/install.sh", "--bundle-tarball", "/x/t.tar.gz"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "systemd-system" in r.stderr
+    assert not (tmp_path / "out").exists()
 
 
 @pytest.mark.posix_only

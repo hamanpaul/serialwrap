@@ -84,6 +84,70 @@ pub fn local_default_endpoint(ctx: &CliCtx) -> String {
     }
 }
 
+/// systemd-system unit 固定的 daemon socket（0.3.2 與 0.4.0 相同）。
+pub const SYSTEMD_SYSTEM_SOCKET: &str = "/run/serialwrap/serialwrapd.sock";
+
+/// OD-48 D3.1／S1X-c-1：某監管模式下 daemon instance 的 endpoint（安裝／更新／監管切換用，不經 `--endpoint`）。
+/// systemd-system → 固定 socket；Windows 模式（或 Win RPC 後端）→ `local_default_endpoint`；其餘依序取
+/// config 的 unix `socket_path`（可連者優先，對齊 #108 #2），再退回 `local_default_endpoint`。
+/// TCP `socket_path` 代表遠端 daemon，不視為本機 instance。
+pub fn instance_endpoint(ctx: &CliCtx, mode: &sw_pal::service_ctl::SupervisionMode) -> String {
+    use sw_pal::service_ctl::SupervisionMode;
+    match mode {
+        SupervisionMode::SystemdSystem => return SYSTEMD_SYSTEM_SOCKET.to_string(),
+        SupervisionMode::WindowsTask | SupervisionMode::WindowsService => {
+            return local_default_endpoint(ctx);
+        }
+        _ => {}
+    }
+    let fallback = local_default_endpoint(ctx);
+    if rpc_backend_is_win(ctx) {
+        return fallback;
+    }
+    let configured = load_runtime_config(ctx).ok().and_then(|config| match config.socket_path() {
+        Some(YValue::Str(socket)) if !socket.is_empty() => match parse_endpoint(socket) {
+            Ok(Endpoint::Unix(_)) => Some(socket.clone()),
+            _ => None,
+        },
+        _ => None,
+    });
+    match configured {
+        Some(socket) if socket != fallback && endpoint_answers_ping(ctx, &socket) => socket,
+        _ => fallback,
+    }
+}
+
+/// 目標模式的 instance endpoint（啟新／驗證用）：與舊模式相同時沿用舊端點；否則依模式取固定值，
+/// 不探測 config（新 daemon 尚未啟動，探測沒有意義）。
+pub fn target_instance_endpoint(
+    ctx: &CliCtx,
+    target: &sw_pal::service_ctl::SupervisionMode,
+    old: &sw_pal::service_ctl::SupervisionMode,
+    old_endpoint: &str,
+) -> String {
+    use sw_pal::service_ctl::SupervisionMode;
+    if target == old {
+        return old_endpoint.to_string();
+    }
+    match target {
+        SupervisionMode::SystemdSystem => SYSTEMD_SYSTEM_SOCKET.to_string(),
+        _ => local_default_endpoint(ctx),
+    }
+}
+
+fn endpoint_answers_ping(ctx: &CliCtx, endpoint: &str) -> bool {
+    crate::client::call(
+        ctx,
+        endpoint,
+        "health.ping",
+        &sw_proto::pyjson::PyValue::Dict(sw_proto::pyjson::PyDict::new()),
+        0.5,
+        &sw_proto::pyjson::PyInt::Small(0),
+    )
+    .ok()
+    .is_some_and(|outcome| outcome.resp.get_truthy("ok"))
+}
+
 /// 01 §4.4，探測 0.2 s。
 pub fn endpoint_alive(ctx: &CliCtx, ep: &str) -> bool {
     if ep.is_empty() {

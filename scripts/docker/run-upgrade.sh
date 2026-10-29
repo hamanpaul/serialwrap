@@ -4,7 +4,8 @@
 # 建升級映像，每種監管模式起一個全新容器（--network none、不帶任何裝置），以唯讀 bind mount 提供 wheel、bundle 與
 # 容器內 driver，結果寫 <out>/<mode>/upgrade-report.json。不碰本機正式安裝、/dev/ttyUSB* 或其他容器。
 # `--scenario install-sh`（OD-50）：另將 bundle 打包成 release 同名 tarball，並唯讀掛載 repo 的 install.sh，
-# 驗證「0.3.2 pipx 已安裝且 daemon 已停止 → install.sh --bundle <tarball>」；預設 upgrade 情境（18 項）不變。
+# 驗證「0.3.2 pipx 已安裝且 daemon 已停止 → install.sh --bundle <tarball>」；預設 upgrade 情境的必要檢查不變。
+# install-sh 情境只支援 systemd-user／on-demand；systemd-system（OD-48）只在預設 upgrade 情境以 `--mode systemd-system` 明確指定。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +25,8 @@ while (($#)); do
         --mode)
             (($# >= 2)) || { echo "--mode 需要參數" >&2; exit 2; }
             case "$2" in
-                systemd-user|on-demand) MODES=("$2") ;;
+                # systemd-system（OD-48 SPEC-GAP #10）只驗直接 setup 成功路徑，須明確指定，不屬 all。
+                systemd-user|on-demand|systemd-system) MODES=("$2") ;;
                 all) MODES=(systemd-user on-demand) ;;
                 *) echo "不支援的模式：$2" >&2; exit 2 ;;
             esac
@@ -43,7 +45,7 @@ while (($#)); do
             ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help)
-            echo "用法：$0 [--mode systemd-user|on-demand|all] [--scenario upgrade|install-sh] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
+            echo "用法：$0 [--mode systemd-user|on-demand|systemd-system|all] [--scenario upgrade|install-sh] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
             exit 0
             ;;
         *) echo "不支援的參數：$1" >&2; exit 2 ;;
@@ -61,6 +63,10 @@ for mode in "${MODES[@]}"; do
         exit 2
     fi
 done
+if [[ "$SCENARIO" == install-sh && " ${MODES[*]} " == *" systemd-system "* ]]; then
+    echo "--scenario install-sh 不支援 systemd-system（該模式只驗 OD-48 直接 setup 成功路徑）" >&2
+    exit 2
+fi
 WORK="$OUT/work"
 IMAGE="serialwrap-upgrade:$RUN_ID"
 TARBALL_NAME="serialwrap-$NEW_VERSION-linux-x86_64.tar.gz"

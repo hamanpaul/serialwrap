@@ -4,9 +4,10 @@
     "63c2095f524a4e6a0de2619f6c65ed1bb653b231",
     "7f032cddea6a7260a8e20b795951e834d6681694",
     "640e8386528f5ab0184bad8f891b2129cacc83ba",
-    "313d792863ab380c7dc10c43d756aac0debf2f19"
+    "313d792863ab380c7dc10c43d756aac0debf2f19",
+    "4baca8c3d922ec210ee2cc25cae2a8121560c7ae"
   ],
-  "case_set_sha256": "44656f22129e31603081bb7cba2991afa1c34109f14ef207f4a317333698bb90",
+  "case_set_sha256": "eb609051bc65e5aaa5fa6b083b2c823f74a635e1b3e5e30324d1248e46b9c989",
   "cases": [
     {
       "case_id": "bc05-process-lifecycle-stop-restart",
@@ -389,6 +390,40 @@
         "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_readme_com0com_both_languages",
         "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_signed_zip_hash_mismatch_fails_before_extraction",
         "tests/test_contracts_catalog.py::test_sc36_registered"
+      ]
+    },
+    {
+      "case_id": "sc39-legacy-daemon-handoff",
+      "sha256": "193b1436558ebe7ff888f37d8ddcd8beb2663bfaed67b0aed3b59b6969472fbf",
+      "tests": [
+        "sw-cli::mgmt_legacy_handoff::d3_2_foreign_socket_daemon_without_rpc_fails_closed",
+        "sw-cli::mgmt_legacy_handoff::d3_2_supervisor_running_without_rpc_daemon_fails_closed",
+        "sw-cli::mgmt_legacy_handoff::d8_disabled_running_unit_stays_disabled_after_refusal",
+        "sw-cli::mgmt_legacy_handoff::d8_disabled_running_unit_stays_disabled_after_update",
+        "sw-cli::mgmt_legacy_handoff::legacy_a_on_demand_install_stops_with_rpc_and_setup_starts_new_daemon",
+        "sw-cli::mgmt_legacy_handoff::legacy_a_systemd_user_main_pid_uses_systemctl_stop",
+        "sw-cli::mgmt_legacy_handoff::legacy_b_native_exe_in_bundle_path_fails_closed",
+        "sw-cli::mgmt_legacy_handoff::legacy_b_python_script_under_versions_fails_closed",
+        "sw-cli::mgmt_legacy_handoff::legacy_b_unknown_version_fails_closed",
+        "sw-cli::mgmt_legacy_handoff::legacy_b_version_not_below_040_fails_closed",
+        "sw-cli::mgmt_legacy_handoff::legacy_c_flashing_at_precheck_refuses_without_stop",
+        "sw-cli::mgmt_legacy_handoff::legacy_c_session_busy_at_precheck_refuses_without_stop",
+        "sw-cli::mgmt_legacy_handoff::legacy_d_never_exits_is_pending_without_restart",
+        "sw-cli::mgmt_legacy_handoff::legacy_e_relaunch_loop_after_three_stops",
+        "sw-cli::mgmt_legacy_handoff::legacy_e_single_relaunch_is_restopped",
+        "sw-cli::mgmt_legacy_handoff::legacy_f_post_switch_failure_restores_install_without_restart",
+        "sw-cli::mgmt_legacy_handoff::legacy_f_pre_switch_failure_releases_hold_without_restart",
+        "sw-cli::mgmt_legacy_handoff::legacy_g_main_pid_mismatch_uses_rpc_stop",
+        "sw-cli::mgmt_legacy_handoff::legacy_h_other_same_uid_daemon_fails_closed_before_stop",
+        "sw-cli::mgmt_legacy_handoff::legacy_h_other_uid_daemon_is_noted_not_blocking",
+        "sw-cli::mgmt_legacy_handoff::legacy_i_systemd_system_fixed_socket_detected_for_update_and_install",
+        "sw-cli::mgmt_legacy_handoff::legacy_k_relaunch_inside_stability_window_is_not_stopped",
+        "sw-cli::mgmt_legacy_handoff::legacy_l_crash_loop_recover_journal",
+        "sw-cli::mgmt_legacy_handoff::legacy_l_crash_points_are_separate_from_frozen_list",
+        "sw-cli::mgmt_legacy_handoff::s1x_c1_first_install_detects_systemd_system_daemon_on_fixed_socket",
+        "sw-cli::mgmt_legacy_handoff::s1x_c1_supervision_switch_detects_systemd_system_daemon_on_fixed_socket",
+        "sw-cli::mgmt_legacy_handoff::s1x_c1_update_detects_systemd_system_daemon_on_fixed_socket",
+        "tests/test_contracts_catalog.py::test_sc39_registered"
       ]
     },
     {

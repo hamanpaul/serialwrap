@@ -21,6 +21,7 @@ pub mod remote_tunnel;
 pub mod doctor_cmd;
 pub mod graceful_stop;
 pub mod install_layout;
+pub(crate) mod legacy_handoff;
 pub mod pairing;
 pub mod rollback;
 pub mod setup_cmd;
