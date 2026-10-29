@@ -67,7 +67,7 @@ from .login_fsm import (
     probe_ready,
 )
 from .transport_stall import classify_probe_failure, transport_stall_hint
-from .serial_port import SerialPort
+from .serial_port import SerialPort, TxResult
 from .uart_io import (
     PreservedConsoles,
     TxIncompleteError,
@@ -6595,6 +6595,41 @@ class SessionManager:
                         with self._lock:
                             self._aborted_cmd_ids.discard(cmd_id)
 
+    def _append_aborted_in_flight_meta(
+        self,
+        bridge: UARTBridge,
+        cmd_id: str,
+        confirmed: int,
+        tx_result: TxResult | None,
+        *,
+        unknown: bool,
+    ) -> None:
+        """BC-03：已確認寫出 ≥1 byte 後中止時寫 command_aborted_in_flight META。
+
+        一般命令（``_map_aborted_result``）與 file.push／file.pull（OD-62）共用，確保欄位與
+        寫入時機相同；file.* 的 ``cmd_id`` 為該次傳輸的 cmd_id 前綴、``confirmed`` 為整段累計。
+        """
+        if unknown:
+            tx_outcome = "unknown"
+        elif tx_result is not None and (
+            tx_result.outcome != "completed" or tx_result.confirmed < tx_result.requested
+        ):
+            tx_outcome = "partial"
+        else:
+            tx_outcome = "complete"
+        self._wal.append(
+            com=bridge.com,
+            direction="META",
+            source="system",
+            cmd_id=cmd_id,
+            payload=b"",
+            meta={
+                "event": "command_aborted_in_flight",
+                "confirmed_tx_bytes": confirmed,
+                "tx_outcome": tx_outcome,
+            },
+        )
+
     def _map_aborted_result(
         self,
         cmd_id: str,
@@ -6611,25 +6646,8 @@ class SessionManager:
             tx_result is not None and tx_result.outcome == "unknown"
         )
         if confirmed > 0:
-            if unknown:
-                tx_outcome = "unknown"
-            elif tx_result is not None and (
-                tx_result.outcome != "completed" or tx_result.confirmed < tx_result.requested
-            ):
-                tx_outcome = "partial"
-            else:
-                tx_outcome = "complete"
-            self._wal.append(
-                com=bridge.com,
-                direction="META",
-                source="system",
-                cmd_id=cmd_id,
-                payload=b"",
-                meta={
-                    "event": "command_aborted_in_flight",
-                    "confirmed_tx_bytes": confirmed,
-                    "tx_outcome": tx_outcome,
-                },
+            self._append_aborted_in_flight_meta(
+                bridge, cmd_id, confirmed, tx_result, unknown=unknown
             )
             return {"ok": False, "error_code": "COMMAND_ABORTED_IN_FLIGHT"}
         if unknown:
@@ -8083,16 +8101,20 @@ class SessionManager:
 
     # ── 檔案傳輸 ──────────────────────────────────────────────
 
-    @staticmethod
     def _file_tx_rejected_result(
-        session: SessionRuntime, exc: TxIncompleteError
+        self,
+        session: SessionRuntime,
+        bridge: UARTBridge,
+        permit: TxPermit,
+        exc: TxIncompleteError,
     ) -> dict[str, Any]:
         """把檔案傳輸中被拒的 TX 映射為 file.* 錯誤碼（S1X-a-4、OD-62）。
 
         - ``quiet`` 且被拒的這筆零寫出 → ``AUTOBOOT_QUIET``＋``retry_after_s``（SC-03）。
         - drain、世代過期、取消（OD-62，比照 BC-03）：整段傳輸已確認寫出 ≥1 byte →
-          ``COMMAND_ABORTED_IN_FLIGHT``；零寫出 → ``FLUSHED_BY_RECOVERY``。``quiet`` 但
-          該筆已部分寫出者同屬已寫出。
+          ``COMMAND_ABORTED_IN_FLIGHT``，並比照一般命令寫 command_aborted_in_flight WAL
+          META（cmd_id 為傳輸的 cmd_id 前綴）；零寫出 → ``FLUSHED_BY_RECOVERY``。``quiet``
+          但該筆已部分寫出者同屬已寫出。
         - 其餘（結果不明、flashing 等）→ 傳輸自身的 ``TRANSFER_TIMEOUT``（0.3.2 結束碼）。
 
         push 另附 ``chunks_sent``／``chunks_total``。
@@ -8122,6 +8144,13 @@ class SessionManager:
             if written is None:
                 written = exc.result.confirmed
             if written > 0:
+                self._append_aborted_in_flight_meta(
+                    bridge,
+                    getattr(exc, "transfer_cmd_id", None) or permit.op_id,
+                    written,
+                    exc.result,
+                    unknown=isinstance(exc, TxUnknownError) or exc.result.outcome == "unknown",
+                )
                 return {"ok": False, "error_code": "COMMAND_ABORTED_IN_FLIGHT", **progress}
             return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY", **progress}
         return {"ok": False, "error_code": "TRANSFER_TIMEOUT", **progress}
@@ -8233,7 +8262,7 @@ class SessionManager:
                         max_console_line_chars=max_console_line_chars,
                     )
             except TxIncompleteError as exc:
-                return self._file_tx_rejected_result(session, exc)
+                return self._file_tx_rejected_result(session, bridge, transfer_permit, exc)
         finally:
             try:
                 if human_suspended:
@@ -8327,7 +8356,7 @@ class SessionManager:
                         max_console_line_chars=max_console_line_chars,
                     )
             except TxIncompleteError as exc:
-                return self._file_tx_rejected_result(session, exc)
+                return self._file_tx_rejected_result(session, bridge, transfer_permit, exc)
         finally:
             try:
                 if human_suspended:

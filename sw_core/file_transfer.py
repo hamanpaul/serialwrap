@@ -113,7 +113,48 @@ def push_file(
     md5_expected = hashlib.md5(data).hexdigest()
     tmp_name = f"/tmp/.sw_upload_{uuid.uuid4().hex[:12]}"
     cmd_id_prefix = f"ft-{uuid.uuid4().hex[:8]}"
+    try:
+        return _push_file_tx(
+            bridge,
+            remote_path,
+            data=data,
+            md5_expected=md5_expected,
+            tmp_name=tmp_name,
+            cmd_id_prefix=cmd_id_prefix,
+            chunk_size=chunk_size,
+            timeout_s=timeout_s,
+            prompt_regex=prompt_regex,
+            source=source,
+            paced_send=paced_send,
+            echo_slice_size=echo_slice_size,
+            echo_timeout_s=echo_timeout_s,
+            max_console_line_chars=max_console_line_chars,
+        )
+    except TxIncompleteError as exc:
+        # 傳輸中 TX 被拒：附上本次傳輸的 cmd_id 前綴（各子命令 cmd_id 為 `<前綴>-<子命令>`），
+        # 供 SessionManager 比照 BC-03 寫 command_aborted_in_flight WAL META（OD-62）。
+        exc.transfer_cmd_id = cmd_id_prefix
+        raise
 
+
+def _push_file_tx(
+    bridge: UARTBridge,
+    remote_path: str,
+    *,
+    data: bytes,
+    md5_expected: str,
+    tmp_name: str,
+    cmd_id_prefix: str,
+    chunk_size: int,
+    timeout_s: float,
+    prompt_regex: str,
+    source: str,
+    paced_send: Any,
+    echo_slice_size: int,
+    echo_timeout_s: float,
+    max_console_line_chars: int | None,
+) -> dict[str, Any]:
+    """``push_file`` 產生 cmd_id 前綴之後的本體（含全部 TX）。"""
     # 先檢查不依賴工具選擇的固定命令。任何一條固定命令放不進 profile
     # 預算時都必須在第一個 TX 前拒絕，避免留下半成品。
     fixed_commands = (
@@ -289,7 +330,35 @@ def pull_file(
         return budget_error
 
     cmd_id_prefix = f"ft-{uuid.uuid4().hex[:8]}"
+    try:
+        return _pull_file_tx(
+            bridge,
+            remote_path,
+            local_path,
+            cmd_id_prefix=cmd_id_prefix,
+            timeout_s=timeout_s,
+            prompt_regex=prompt_regex,
+            source=source,
+            max_console_line_chars=max_console_line_chars,
+        )
+    except TxIncompleteError as exc:
+        # 同 push_file：附上本次傳輸的 cmd_id 前綴供 WAL META 使用。
+        exc.transfer_cmd_id = cmd_id_prefix
+        raise
 
+
+def _pull_file_tx(
+    bridge: UARTBridge,
+    remote_path: str,
+    local_path: str,
+    *,
+    cmd_id_prefix: str,
+    timeout_s: float,
+    prompt_regex: str,
+    source: str,
+    max_console_line_chars: int | None,
+) -> dict[str, Any]:
+    """``pull_file`` 產生 cmd_id 前綴之後的本體（含全部 TX）。"""
     md5_cmd = _md5_command(remote_path)
     probe_cmd = _encoder_probe_command()
     if _line_budget_exceeded((probe_cmd, md5_cmd), max_console_line_chars):

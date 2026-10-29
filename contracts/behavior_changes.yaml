@@ -86,7 +86,7 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["bc03-aborted-in-flight-after-1byte", "bc03-unknown-outcome-send-failed", "bc03-no-auto-resend"]
-    compatibility_impact: "已確認寫出至少 1 byte 後中止的命令改回 COMMAND_ABORTED_IN_FLIGHT（retryable:false）；結果不明時沿用既有 SEND_FAILED 映射。依碼分支的 agent 需新增 COMMAND_ABORTED_IN_FLIGHT 處理；不得因此自動重送。file.push／file.pull（OD-62）：傳輸已寫出至少 1 byte 後因 drain、世代過期或取消中止時，同步回應改為 COMMAND_ABORTED_IN_FLIGHT（push 附 chunks_sent／chunks_total）；0.3.2 的 file.* 用戶端在此情境原本收到 TRANSFER_TIMEOUT（或例外），需新增此碼處理，且不得自動重送。"
+    compatibility_impact: "已確認寫出至少 1 byte 後中止的命令改回 COMMAND_ABORTED_IN_FLIGHT（retryable:false）；結果不明時沿用既有 SEND_FAILED 映射。依碼分支的 agent 需新增 COMMAND_ABORTED_IN_FLIGHT 處理；不得因此自動重送。file.push／file.pull（OD-62）：傳輸已寫出至少 1 byte 後因 drain、世代過期或取消中止時，同步回應改為 COMMAND_ABORTED_IN_FLIGHT（push 附 chunks_sent／chunks_total）；0.3.2 的 file.* 用戶端在此情境原本收到 TRANSFER_TIMEOUT（或例外），需新增此碼處理，且不得自動重送；此時比照一般命令寫 command_aborted_in_flight WAL META（cmd_id 為該次傳輸的 cmd_id 前綴 ft-<8hex>，confirmed_tx_bytes 為整段傳輸累計）。"
     approval_conditions: "已確認寫出至少 1 byte 後中止，`retryable:false`；結果不明須另凍結相容映射，不得混入安全重試"
     related_decisions: ["OD-04", "OD-62"]
   - id: "BC-04"
