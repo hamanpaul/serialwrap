@@ -23,6 +23,8 @@ FORMAL = {"streams": 4, "records": 10000, "payload": 1024, "rotate_bytes": 67108
 HOST = {"cpu": "AMD Test CPU", "cpu_count": 24, "memory_bytes": 1 << 36, "os_build": "6.18.54.1-microsoft-standard-WSL2",
         "storage_device": "/dev/sdd", "fs_type": "ext4"}
 WORKLOAD = {"total_records": 40000, "rotate_bytes": 67108864, "prefill_bytes": [62915031] * 4}
+# sol P5-5d5314e-1：數值重算須保留 wal_s1w 自報 FAIL 的兩個非門檻條件（寫入失敗、每流至少一次 rotate §1.1.3）。
+HEALTH = {"write_failures": 0, "rotations_per_stream": [1, 1, 1, 1]}
 # OD-66 以數值重算判定（不採證據自報的 verdict）：PASS 夾具的數值同時符合 §1.2 與 OD-66；FAIL 夾具兩者皆超標。
 _GOOD = ({"p50": 0.003, "p95": 0.008, "p99": 0.015}, 2.1)
 _BAD = ({"p50": 0.3, "p95": 0.4, "p99": 0.5}, 150.0)
@@ -33,6 +35,7 @@ def _doc(verdict="PASS", virt="wsl2", rev=HEAD, append=None, rotate=None, **para
     return {"schema": "wal_s1w.v1", "verdict": verdict, "failures": [] if verdict == "PASS" else ["append_p99 0.5 ms > 0.02 ms"],
             "params": {**FORMAL, **params}, "thresholds": {"platform": "linux"},
             "append_ms": dict(append or good_append), "rotate_max_ms": good_rotate if rotate is None else rotate, **WORKLOAD,
+            **HEALTH,
             "env": {"virtualization": virt, "git_revision": rev, "source_tree_dirty": False, "os": "posix", **HOST}}
 
 
@@ -125,7 +128,10 @@ def test_relevant_paths_cover_build_profile_manifests():
         assert need in paths, need
     # sol P5-86b54d8-2：append 熱路徑經 sw-proto（crc32_hex、WalRecord::to_line／pyjson、pycompat）。
     for need in ("crates/sw-proto/src/wal_types.rs", "crates/sw-proto/src/pyjson.rs", "crates/sw-proto/src/pycompat.rs",
-                 "crates/sw-proto/Cargo.toml"):
+                 "crates/sw-proto/Cargo.toml",
+                 # sol P5-b9ae1d2-1：append／rotate 熱路徑的時鐘（NativeClock）、組裝點 native()、WalFs／Clock trait
+                 "crates/sw-pal/src/clock.rs", "crates/sw-pal/src/clock/posix.rs", "crates/sw-pal/src/lib.rs",
+                 "crates/sw-pal/src/traits.rs"):
         assert any(need == p or need.startswith(p.rstrip("/") + "/") for p in paths), need
 
 
@@ -223,3 +229,37 @@ def test_od66_rejudge_86b54d8_wsl2_evidence(monkeypatch):
     st, reasons = judge.wal_s1w_verdict(None, imported=runs, host_label="owner-wsl2-ext4-vhdx", formal_params=FORMAL,
                                         python_baseline=py)
     assert st == "PASS", reasons
+
+
+# --------------------------------------------------------------------------- sol P5-5d5314e-1（High）
+
+@pytest.mark.parametrize("virt", ["native", "wsl2"])
+@pytest.mark.parametrize("change,expected,why", [
+    ({"write_failures": 3}, "FAIL", "write_failures"),              # WAL 寫入失敗＝資料遺失
+    ({"rotations_per_stream": [1, 1, 0, 1]}, "FAIL", "rotate"),     # §1.1.3 每流至少一次 rotate
+    ({"write_failures": None}, "EVIDENCE_MISSING", "write_failures"),
+    ({"write_failures": True}, "EVIDENCE_MISSING", "write_failures"),
+    ({"rotations_per_stream": [1, 1, 1]}, "EVIDENCE_MISSING", "rotations_per_stream"),
+    ({"rotations_per_stream": None}, "EVIDENCE_MISSING", "rotations_per_stream"),
+])
+def test_recompute_keeps_write_failure_and_rotation_conditions(virt, change, expected, why):
+    """延遲數值重算之外，自報 FAIL 的兩個非門檻條件不得被丟掉：`write_failures > 0`、任一流未跨越 rotate → FAIL；
+    缺欄或型別／長度不符 → EVIDENCE_MISSING（全數寫入失敗時延遲反而更漂亮，不得因此 PASS）。"""
+    doc = _doc(virt=virt)
+    for key, value in change.items():
+        if value is None:
+            doc.pop(key)
+        else:
+            doc[key] = value
+    st, reasons = judge.wal_s1w_verdict(None, imported=doc, host_label=f"owner-{virt}", formal_params=FORMAL,
+                                        python_baseline=_py() if virt == "wsl2" else None)
+    assert st == expected and any(why in r for r in reasons), reasons
+    st, reasons = judge.wal_s1w_verdict(doc, formal_params=FORMAL, python_baseline=_py() if virt == "wsl2" else None)
+    assert st == expected, reasons                                    # 本機量測路徑同樣適用
+
+
+def test_all_writes_failed_with_pretty_latency_is_fail():
+    doc = _doc(virt="native", append={"p50": 0.001, "p95": 0.002, "p99": 0.003}, rotate=0.0)
+    doc.update(write_failures=40000, rotations_per_stream=[0, 0, 0, 0])
+    st, reasons = judge.wal_s1w_verdict(None, imported=doc, host_label="owner-native", formal_params=FORMAL)
+    assert st == "FAIL" and any("write_failures" in r for r in reasons), reasons

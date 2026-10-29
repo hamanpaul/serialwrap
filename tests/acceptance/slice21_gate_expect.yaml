@@ -17,7 +17,9 @@ runbook: docs/rust-refactor/slice21-owner-runbook.md
 #   sol P5-86b54d8-2：append 熱路徑經 sw-proto（wal_types::crc32_hex、WalRecord::to_line／pyjson、pycompat），整個 crate 列入。
 wal_s1w:
   formal_params: {streams: 4, records: 10000, payload: 1024, rotate_bytes: 67108864, prefill_ratio: 0.9375, rate: 0}
-  # OD-66（擁有者裁決 (a)，2026-10-29）：依 env.virtualization 選門檻（judge 以數值重算，不採證據自報的 §1.2 verdict）。
+  # sol P5-b9ae1d2-1：另含 append／rotate 熱路徑的時鐘（NativeClock：mono_ns／wall_unix_us）、組裝點 native() 與 WalFs／Clock trait。
+  # OD-66（擁有者裁決 (a)，2026-10-29）：依 env.virtualization 選門檻（judge 以數值重算延遲門檻，不採證據自報的 §1.2 verdict；
+  #   寫入失敗 write_failures>0 與任一流未跨越 rotate 仍判 FAIL、缺欄判 EVIDENCE_MISSING——sol P5-5d5314e-1）。
   #   wsl2：固定門檻，且每項不劣於同主機同時段的 Python 基線（wal_microbench.py，SW_GATE_WAL_S1W_PY_BASELINE 一併匯入）；
   #   native：規格 §1.2 原門檻（原生 Linux／Windows 正式量測，BO）。須與 slice21_gate_judge.WAL_S1W_HOST_THRESHOLDS 一致。
   host_thresholds:
@@ -27,7 +29,8 @@ wal_s1w:
              not_worse_than_python_baseline: false, source: "serialwrap-rust-spec-final.md §1.2"}
   relevant_paths: [crates/sw-core/src/wal.rs, crates/sw-core/examples/wal_s1w.rs, crates/sw-pal/src/wal_fs.rs,
                    crates/sw-pal/src/wal_fs, crates/sw-pal/src/fs_ops.rs, crates/sw-pal/src/fs_ops, Cargo.lock, rust-toolchain.toml,
-                   Cargo.toml, crates/sw-core/Cargo.toml, crates/sw-pal/Cargo.toml, crates/sw-proto]
+                   Cargo.toml, crates/sw-core/Cargo.toml, crates/sw-pal/Cargo.toml, crates/sw-proto,
+                   crates/sw-pal/src/clock.rs, crates/sw-pal/src/clock, crates/sw-pal/src/lib.rs, crates/sw-pal/src/traits.rs]
 parity:
   # #104：逐列狀態檔；來源文件位置與 sha256 記在狀態檔內。
   status_file: tests/acceptance/slice21_parity_status.yaml

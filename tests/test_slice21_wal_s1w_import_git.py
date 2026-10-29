@@ -24,6 +24,7 @@ def _doc(rev: str) -> dict:
     # 原生主機（§1.2 門檻、免 Python 基線；OD-66）：本檔只驗可追溯性。
     return {"schema": "wal_s1w.v1", "verdict": "PASS", "failures": [], "params": dict(FORMAL), "thresholds": {"platform": "linux"},
             "append_ms": {"p50": 0.003, "p95": 0.008, "p99": 0.015}, "rotate_max_ms": 2.1,
+            "write_failures": 0, "rotations_per_stream": [1, 1, 1, 1],
             "env": {"virtualization": "native", "git_revision": rev, "source_tree_dirty": False, "fs_type": "ext4", "os": "posix"}}
 
 
@@ -36,6 +37,8 @@ def _git(repo: pathlib.Path, *args: str) -> str:
     ("crates/sw-proto/src/wal_types.rs", "EVIDENCE_MISSING"),   # WAL append 熱路徑的 crc32_hex
     ("crates/sw-proto/src/pyjson.rs", "EVIDENCE_MISSING"),      # WalRecord::to_line
     ("crates/sw-pal/src/wal_fs/posix.rs", "EVIDENCE_MISSING"),
+    ("crates/sw-pal/src/clock/posix.rs", "EVIDENCE_MISSING"),   # sol P5-b9ae1d2-1：append 每筆取 mono／wall 時鐘
+    ("crates/sw-pal/src/lib.rs", "EVIDENCE_MISSING"),           # native() 組裝受測 WalFs／Clock
     ("docs/unrelated.md", "PASS"),                              # 對照：與 WAL 無關的變更不使證據失效
 ])
 def test_import_rejected_after_wal_dependency_change_in_real_repo(tmp_path, monkeypatch, changed, expected):
@@ -48,7 +51,7 @@ def test_import_rejected_after_wal_dependency_change_in_real_repo(tmp_path, monk
     repo.mkdir()
     _git(repo, "init", "-q")
     for rel in ("crates/sw-proto/src/wal_types.rs", "crates/sw-proto/src/pyjson.rs", "crates/sw-pal/src/wal_fs/posix.rs",
-                "docs/unrelated.md"):
+                "crates/sw-pal/src/clock/posix.rs", "crates/sw-pal/src/lib.rs", "docs/unrelated.md"):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text("v1\n", encoding="utf-8")
     _git(repo, "add", "-A")

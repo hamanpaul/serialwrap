@@ -419,13 +419,36 @@ def python_baseline_problems(doc: Mapping[str, Any], py: Mapping[str, Any] | Non
     return problems
 
 
+def _wal_s1w_health(doc: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """sol P5-5d5314e-1：延遲門檻以外、wal_s1w 自報 FAIL 的兩個非門檻條件，以數值重算時不得丟掉。
+    回傳 (缺漏→EVIDENCE_MISSING, 失敗→FAIL)：`write_failures` 須為非 bool 整數且為 0（寫入失敗＝資料遺失）；
+    `rotations_per_stream` 須為長度等於 `params.streams` 的整數串列且每流 ≥ 1（規格 §1.1.3）。"""
+    missing: list[str] = []
+    failures: list[str] = []
+    wf = doc.get("write_failures")
+    if not isinstance(wf, int) or isinstance(wf, bool):
+        missing.append(f"證據缺 write_failures（或非整數：{wf!r}）")
+    elif wf > 0:
+        failures.append(f"write_failures={wf}（WAL 寫入失敗）")
+    rot = doc.get("rotations_per_stream")
+    streams = (doc.get("params") or {}).get("streams") if isinstance(doc.get("params"), Mapping) else None
+    if (not isinstance(rot, list) or not all(isinstance(x, int) and not isinstance(x, bool) for x in rot)
+            or not isinstance(streams, int) or len(rot) != streams):
+        missing.append(f"證據的 rotations_per_stream {rot!r} 須為長度等於 params.streams（{streams!r}）的整數串列")
+    elif any(x < 1 for x in rot):
+        failures.append(f"rotations_per_stream={rot}：有流未跨越 rotate（§1.1.3 每流至少一次）")
+    return missing, failures
+
+
 def _wal_s1w_judge_numbers(doc: Mapping[str, Any], thr: Mapping[str, Any],
                            py: Mapping[str, Any] | None) -> tuple[str, list[str]]:
-    """以數值重算單輪判定：超過主機門檻或（WSL2）劣於 Python 基線即 FAIL。回傳 (PASS／FAIL, 失敗項)。"""
+    """以數值重算單輪判定：超過主機門檻或（WSL2）劣於 Python 基線即 FAIL；「不採自報 verdict」只限延遲門檻——
+    寫入失敗與未跨越 rotate（`_wal_s1w_health`）照樣 FAIL，缺欄即 EVIDENCE_MISSING。回傳 (PASS／FAIL／EVIDENCE_MISSING, 原因)。"""
     got = _wal_s1w_metrics(doc)
-    if got is None:
-        return "EVIDENCE_MISSING", ["證據缺 append_ms.p50／p95／p99 或 rotate_max_ms"]
-    failures = [f"{k[:-3]} {got[k]:g} ms > {thr[k]:g} ms（{thr.get('source')}）" for k in
+    health_missing, health_failures = _wal_s1w_health(doc)
+    if got is None or health_missing:
+        return "EVIDENCE_MISSING", (["證據缺 append_ms.p50／p95／p99 或 rotate_max_ms"] if got is None else []) + health_missing
+    failures = list(health_failures) + [f"{k[:-3]} {got[k]:g} ms > {thr[k]:g} ms（{thr.get('source')}）" for k in
                 ("append_p50_ms", "append_p95_ms", "append_p99_ms", "rotate_max_ms") if got[k] > float(thr[k])]
     if thr.get("not_worse_than_python_baseline"):
         base = _python_baseline_metrics(py or {}) or {}
