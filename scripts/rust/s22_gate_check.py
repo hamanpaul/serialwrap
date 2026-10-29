@@ -10,7 +10,7 @@
 `<dir>/<section>/<platform>/resource-report.json`（`l1-results.v1`）；`<section>` 為 `s22_gate:<section>` 的後段。
 - 每個 `s22_gate:*` 集合／平台以 P2 `tests/acceptance/l1_judge.judge`（依路徑載入，本檔不另寫判定規則）判定；
   報告不存在 → INSUFFICIENT。
-- 對照表每個 `AUTOMATED` 條目的每個 `.py`／`.rs` 測試須在任一平台的報告中恰一列 `passed`（`.rs` 轉為
+- 對照表每個 `AUTOMATED` 條目的每個 `.py`／`.rs` 測試須在任一份報告（集合×平台）中恰一列 `passed`（`.rs` 轉為
   `cargo:<crate>::<檔名 stem>::<函式>`）；有 failed 列 → FAIL；缺列、重複或非 passed → INSUFFICIENT。
   其他來源（func-test、scenario）須在 `--l15-results`（`s22-l15-results.v1`：`{"format","runs":[{"ref","outcome",
   "exit_code"}]}`）中恰一列 `outcome == "passed"` 且 `exit_code == 0`；未提供或不符 → INSUFFICIENT（審查
@@ -112,7 +112,8 @@ def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tu
                              "reasons": list(verdict.get("reasons") or [])})
             for row in report.get("results") or []:
                 if isinstance(row, dict):
-                    rows_by_nodeid.setdefault(str(row.get("nodeid")), []).append({**row, "_platform": platform})
+                    rows_by_nodeid.setdefault(str(row.get("nodeid")), []).append(
+                        {**row, "_platform": platform, "_section": set_id})
     return sections, rows_by_nodeid
 
 
@@ -140,10 +141,12 @@ def judge_tests(tests: list[str], rows_by_nodeid: dict[str, list[dict]],
         if any(r.get("outcome") in ("failed", "error") for r in rows):
             failed.append(ref)
             continue
-        per_platform: dict[str, list[dict]] = {}
+        # 「恰一列」逐份報告（集合×平台）計算：selector 重疊的集合（例：console_conformance_pty 執行整個
+        # console_conformance binary，其非 cap 測試也在 cargo_workspace）各自恰一列 passed 即可，單一報告內重複仍不計。
+        per_report: dict[tuple[str, str], list[dict]] = {}
         for r in rows:
-            per_platform.setdefault(r["_platform"], []).append(r)
-        if not any(len(rs) == 1 and rs[0].get("outcome") == "passed" for rs in per_platform.values()):
+            per_report.setdefault((r["_platform"], r.get("_section", "")), []).append(r)
+        if not any(len(rs) == 1 and rs[0].get("outcome") == "passed" for rs in per_report.values()):
             missing.append(ref)
     if not tests:
         status = "INSUFFICIENT"
