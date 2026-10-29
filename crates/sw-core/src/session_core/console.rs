@@ -971,7 +971,8 @@ impl SessionCore {
         self.tick_close_interactive.clear();
         self.fg_adm = None;
         self.fg_origin = None;
-        self.self_test_suspended = false;
+        // ownership 於下方 reset_for_stop 歸零；在途 probe 的 suspend 旗標隨世代失效，完成時不再 resume。
+        self.self_test_suspend_gen = self.self_test_suspend_gen.wrapping_add(1);
         let reason = if *kind == StopKind::Release {
             InvalidateReason::Release
         } else {
@@ -1024,14 +1025,16 @@ impl SessionCore {
         }
     }
 
-    /// self-test probe 的 suspend 與回放（增補 #12）。
-    pub(super) fn self_test_suspend_begin(&mut self) {
+    /// self-test probe 的 suspend 與回放（增補 #12）：回傳本 probe 的 suspend 憑證（未 suspend 為 `None`），
+    /// 由呼叫端存入該 op 的 `PendingOp::SelfTest`（sol P6-e9b5c61-1：並行 probe 不得共用旗標）。
+    pub(super) fn self_test_suspend_begin(&mut self) -> Option<u64> {
         let mut fx = Effects(Vec::new());
-        self.self_test_suspended = self.human_suspend_begin(&mut fx);
+        self.human_suspend_begin(&mut fx).then_some(self.self_test_suspend_gen)
     }
 
-    pub(super) fn self_test_suspend_end(&mut self, fx: &mut Vec<Effect>) {
-        if std::mem::take(&mut self.self_test_suspended) {
+    /// 結算單一 probe 的 suspend：只有同世代（期間未經 drain Phase 1 重設 ownership）者 resume。
+    pub(super) fn self_test_suspend_end(&mut self, token: Option<u64>, fx: &mut Vec<Effect>) {
+        if token.is_some_and(|gen| gen == self.self_test_suspend_gen) {
             let mut out = Effects(Vec::new());
             self.human_suspend_end(true, &mut out);
             fx.extend(out.0);

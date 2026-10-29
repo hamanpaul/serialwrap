@@ -421,8 +421,9 @@ pub struct SessionCore {
     retained_human: Option<(String, f64)>,
     /// P6 Task 6：目前前景命令的 admission（`fg_finish` 依此 resume）。
     fg_adm: Option<FgAdmission>,
-    /// P6 增補 #12：self-test probe 期間是否 suspend 了 human。
-    self_test_suspended: bool,
+    /// P6 增補 #12：self-test suspend 的世代（drain Phase 1 重設 ownership 時遞增）；各 probe 的 suspend 旗標
+    /// 記在自己的 `PendingOp::SelfTest`，只有同世代者完成時才 resume（sol P6-e9b5c61-1）。
+    self_test_suspend_gen: u64,
     /// P6 D-19：輸入丟棄 WARNING 的限速鍵。
     input_drop_warned: std::collections::HashSet<(String, &'static str, u64)>,
     /// P6 Task 3／6：human line mode 的 basename 路徑風格（`Pal.caps.path_flavor`；預設 POSIX）。
@@ -610,7 +611,7 @@ impl SessionCore {
             human: crate::human_console::HumanConsoleState::new(),
             retained_human: None,
             fg_adm: None,
-            self_test_suspended: false,
+            self_test_suspend_gen: 0,
             input_drop_warned: std::collections::HashSet::new(),
             path_flavor: sw_pal::PalPathFlavor::Posix,
             stashed_human: None,
@@ -3770,6 +3771,9 @@ impl SessionCore {
         loop {
             let command = if let Some(parked) = self.replay_parked.take() {
                 if self.parked_terminal(&parked.cmd_id) {
+                    // 已取消（Python `revoke_tx_op` 使其零 TX）：仍須結算 `mark_running` 登記的在途指標，
+                    // 否則 canceled＋in_flight 永久占用 pending 額度（sol P6-e9b5c61-2）。
+                    self.settle_parked_terminal(&parked.cmd_id);
                     continue;
                 }
                 parked
@@ -3913,10 +3917,30 @@ impl SessionCore {
         })
     }
 
-    /// drain／flush：停在 `replay_parked` 的命令尚未有任何 TX，以 NotSubmitted 結束（同在途前景的中止分類）。
+    /// 已終結（取消）的停放命令：只結算 registry 在途指標。`complete()` 不覆寫 canceled 紀錄；紀錄已淘汰時
+    /// 同樣只清指標（Python worker 收尾 `_running.pop`）。其他終態已由其完成者結算，不重複寫入。
+    fn settle_parked_terminal(&mut self, cmd_id: &str) {
+        let canceled_or_gone = self
+            .deps
+            .registry
+            .get(cmd_id)
+            .is_none_or(|record| record.get("status").and_then(PyValue::as_str) == Some("canceled"));
+        if canceled_or_gone {
+            self.deps.registry.complete(
+                cmd_id,
+                CmdOutcome::Aborted(crate::arbiter::AbortClass::NotSubmitted),
+                &self.wall_iso(),
+            );
+        }
+    }
+
+    /// drain／flush：停在 `replay_parked` 的命令尚未有任何 TX，以 NotSubmitted 結束（同在途前景的中止分類）；
+    /// 已取消者同樣結算在途指標（sol P6-e9b5c61-2）。
     fn abort_parked_command(&mut self) {
         if let Some(parked) = self.replay_parked.take() {
-            if !self.parked_terminal(&parked.cmd_id) {
+            if self.parked_terminal(&parked.cmd_id) {
+                self.settle_parked_terminal(&parked.cmd_id);
+            } else {
                 self.deps.registry.complete(
                     &parked.cmd_id,
                     CmdOutcome::Aborted(crate::arbiter::AbortClass::NotSubmitted),
@@ -4261,13 +4285,15 @@ impl SessionCore {
         {
             // 並行 op（READY recover／self-test）：不動前景槽。
             self.side_ops.remove(&op_id);
+            let suspended = PendingOp::self_test_suspend_token(pending.as_ref());
             let mut effects = match pending {
                 Some(PendingOp::Recover { reply }) => self.finish_recover(reply, outcome, now),
                 Some(other) => self.answer_op(other, outcome, now, true),
                 None => Vec::new(),
             };
-            // P6 增補 #12：self-test probe 結束時 resume human（回放於此建立 hold）；未 suspend 時為 no-op。
-            self.self_test_suspend_end(&mut effects);
+            // P6 增補 #12：self-test probe 結束時 resume 自己 suspend 的 human（回放於此建立 hold）；
+            // recover 等其他 side op 與未 suspend 的 probe 為 no-op（sol P6-e9b5c61-1）。
+            self.self_test_suspend_end(suspended, &mut effects);
             effects.push(Effect::SettleTx { epoch, op_id });
             effects.extend(self.start_next(now));
             return effects;
@@ -4285,6 +4311,7 @@ impl SessionCore {
         }
         let grant = self.foreground.take().expect("已確認前景");
         self.foreground_reboot = false;
+        let suspended = PendingOp::self_test_suspend_token(pending.as_ref());
         let mut effects = Vec::new();
         match pending {
             Some(PendingOp::Command {
@@ -4326,7 +4353,7 @@ impl SessionCore {
         }
         // P6：前景命令 resume／admission 開放與 self-test resume 的回放（07 D-22 hold 建立於此）。
         self.command_fg_finish(&mut effects);
-        self.self_test_suspend_end(&mut effects);
+        self.self_test_suspend_end(suspended, &mut effects);
         effects.push(Effect::SettleTx { epoch, op_id });
         effects.extend(self.start_next(now));
         effects
@@ -4407,6 +4434,7 @@ impl SessionCore {
                 probe_len,
                 base,
                 lease_ctx,
+                ..
             } => {
                 let result = match outcome {
                     OpOutcome::SelfTestRefused(FenceReject::Quiet | FenceReject::ReconfirmPending) => {
@@ -5052,6 +5080,9 @@ impl SessionCore {
                 self.last_probe_at = Some(self.wall_iso());
                 let probe_len = probe.len() + usize::from(!probe.ends_with('\n'));
                 let grant = self.new_grant(None);
+                // 增補 #12：有 human lease 時只 suspend、不動 admission（`session_manager.py:7430,7454`）。
+                // 旗標隨本 op 保存（Python 為 `self_test` 的區域變數），完成時只結算自己的 suspend。
+                let suspended = self.self_test_suspend_begin();
                 self.pending_ops.insert(
                     grant.op_id,
                     PendingOp::SelfTest {
@@ -5059,10 +5090,9 @@ impl SessionCore {
                         probe_len,
                         base: need.base,
                         lease_ctx: self.lease_ctx(),
+                        suspended,
                     },
                 );
-                // 增補 #12：有 human lease 時只 suspend、不動 admission（`session_manager.py:7430,7454`）。
-                self.self_test_suspend_begin();
                 self.side_ops.insert(grant.op_id, grant.clone());
                 vec![Effect::StartOp {
                     grant,
@@ -5348,6 +5378,8 @@ enum PendingOp {
         probe_len: usize,
         base: SelfTestBase,
         lease_ctx: Vec<(&'static str, PyValue)>,
+        /// 本 probe 開始時是否 suspend 了 human（`Some(世代)`）；只由本 op 完成時結算。
+        suspended: Option<u64>,
     },
     InteractiveSend {
         reply: Reply,
@@ -5357,6 +5389,16 @@ enum PendingOp {
         reply: Reply,
         result: PyDict,
     },
+}
+
+impl PendingOp {
+    /// self-test probe 的 suspend 憑證（其他 op 為 `None`）。
+    fn self_test_suspend_token(op: Option<&PendingOp>) -> Option<u64> {
+        match op {
+            Some(PendingOp::SelfTest { suspended, .. }) => *suspended,
+            _ => None,
+        }
+    }
 }
 
 /// reboot 後自動恢復的期限（`_spawn_reboot_recovery`：`deadline_cap = start + 180 + timeout`）。
