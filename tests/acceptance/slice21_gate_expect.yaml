@@ -8,7 +8,8 @@ blocked_owner_file: tests/acceptance/slice21_bo.yaml
 # 承接率斷路器（judge 以 slice_breaker.evaluate 判定 case_uptake；審查 b7cd852 #1）。
 breaker_snapshots_file: tests/acceptance/breaker/slice_2.1.snapshots.ndjson
 # OD-02 Stage 2 剩餘預估週數：擁有者填值；null 時 case_uptake 為 EVIDENCE_MISSING（不以 0 代入放行）。
-stage2_estimate_weeks: null
+# OD-60（2026-10-29）：6 週（起算 2026-10-21）；各 slice 出口依實測速率重新校準一次，已耗＋剩餘 > 24 週照規則重提 OD-02。
+stage2_estimate_weeks: 6
 runbook: docs/rust-refactor/slice21-owner-runbook.md
 parity:
   # #104：逐列狀態檔；來源文件位置與 sha256 記在狀態檔內。

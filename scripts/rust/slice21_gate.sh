@@ -267,15 +267,19 @@ if [[ "$l15_qualified" != "1" ]]; then
   record l15_ab --exit 0 --section-verdict EVIDENCE_MISSING \
     --reason "SERIALWRAP_L15_SELFTEST_REPORT 未提供或 bridge 自測報告不合格（Task 8 資格判定）：L1.5 A/B 未執行"
 elif [[ -f tests/acceptance/l15/test_slice21_l15.py ]]; then
+  mkdir -p "$RUN_DIR/l15_ab"
+  # 逐案 outcome（l1-results.v1）供 case_verdicts 彙整（OD-60／OWNER-BATCH #8）。
   run_logged l15_ab env SERIALWRAP_GATE=1 SERIALWRAP_L15_PY_DAEMON="$ROOT/tests/contract_blackbox/bin/py-serialwrapd" \
-    SERIALWRAP_L15_RUST_DAEMON="$RUST_D" python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py
+    SERIALWRAP_L15_RUST_DAEMON="$RUST_D" SW_RESOURCE_REPORT="$RUN_DIR/l15_ab/l1-results.json" \
+    python3 -m pytest -q tests/acceptance/l15/test_slice21_l15.py
   # pytest 全綠但仍有 L1.5 待裁決缺口（情境斷言不完整，PA-OD-L15-*）時不計 PASS（審查 c0d221f #3）。
   l15_rc="$LAST_RC"
   l15_gaps="$(python3 -c 'import sys, yaml; d=yaml.safe_load(open(sys.argv[1])); print(",".join(x["id"] for x in d.get("pending_decisions") or [] if str(x.get("id","")).startswith("PA-OD-L15")))' \
     tests/acceptance/slice21_gate_expect.yaml 2>/dev/null || echo "PA-OD-L15-?")"
   if [[ "$l15_rc" != 0 ]]; then l15_verdict=FAIL; elif [[ -n "$l15_gaps" ]]; then l15_verdict=EVIDENCE_MISSING; else l15_verdict=PASS; fi
   record l15_ab --command "SERIALWRAP_GATE=1 pytest -q tests/acceptance/l15/test_slice21_l15.py" --exit "$l15_rc" \
-    --log logs/l15_ab.log --section-verdict "$l15_verdict" ${l15_gaps:+--reason "L1.5 待裁決缺口未結：$l15_gaps（slice21-l15-gaps.md）"}
+    --log logs/l15_ab.log --section-verdict "$l15_verdict" --evidence l15_ab/l1-results.json \
+    ${l15_gaps:+--reason "L1.5 待裁決缺口未結：$l15_gaps（slice21-l15-gaps.md）"}
 else
   record l15_ab --reason "tests/acceptance/l15/test_slice21_l15.py 不存在（P5-T21 未完成）"
 fi
@@ -316,18 +320,6 @@ record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w"
   --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence wal_s1w_perf/wal_s1w.json \
   --reason "Linux 門檻（規格 §1.2）；Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
 
-# 9b. 承接率（case_verdicts.json 由 Task 20／21 的逐案證據彙整；缺檔即證據不足）。
-#     此處的 PASS 只表示「輸入已備齊」；judge 另以 slice_breaker.evaluate 判定斷路器（tripped／OD-02 → FAIL、
-#     證據不足 → EVIDENCE_MISSING；審查 b7cd852 #1），快照檔與 OD-02 預估由 slice21_gate_expect.yaml 指定。
-cv_args=()
-if [[ -f "$RUN_DIR/case_verdicts.json" ]]; then
-  record case_uptake --command "slice_breaker.acceptance_rate" --exit 0 --section-verdict PASS \
-    --evidence case_verdicts.json
-  cv_args=(--case-verdicts "$RUN_DIR/case_verdicts.json")
-else
-  record case_uptake --reason "case_verdicts.json 不存在：逐案 gate 判定尚未彙整" --section-verdict EVIDENCE_MISSING --exit 0
-fi
-
 # 10. Windows 無 COM 黑箱（BO-S21-13 承接 Windows 全套；此處只保留紀錄，不計入 section）。
 #     注意：win-blackbox.ps1 目前仍為 P3 介面，-Suite／-Daemon 尚未支援；失敗只留 log，不影響判定。
 if command -v pwsh.exe >/dev/null 2>&1 && [[ -f "$WIN_D" ]]; then
@@ -338,6 +330,21 @@ fi
 pytest_l1 pytest_full pytest_full -- -q tests/
 record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/" \
   --exit "$LAST_RC" --log logs/pytest_full.log --l1-results pytest_full/l1-results.json
+
+# 11b. 承接率：case_verdicts.json 由 Task 20／21 的逐案證據（l15_ab 兩邊、移出 l15_ab 者的承擔測試、func-test）彙整，
+#     每案取最差判定（FAIL＞EVIDENCE_MISSING＞PASS），缺證據即 EVIDENCE_MISSING（OD-60／OWNER-BATCH #8）；須在承擔測試
+#     （pytest_full 等）之後彙整。此處的 PASS 只表示「輸入已備齊」；judge 另以 slice_breaker.evaluate 判定斷路器
+#     （tripped／OD-02 → FAIL、證據不足 → EVIDENCE_MISSING；審查 b7cd852 #1），assemble 於正式實跑附加本次快照。
+cv_args=()
+run_logged case_verdicts python3 "$JUDGE" case-verdicts --run-dir "$RUN_DIR"
+if [[ "$LAST_RC" == 0 && -f "$RUN_DIR/case_verdicts.json" ]]; then
+  record case_uptake --command "slice21_gate_judge.py case-verdicts＋slice_breaker.acceptance_rate" --exit 0 --section-verdict PASS \
+    --evidence case_verdicts.json --log logs/case_verdicts.log
+  cv_args=(--case-verdicts "$RUN_DIR/case_verdicts.json" --append-breaker-snapshot)
+else
+  record case_uptake --reason "case_verdicts.json 彙整失敗（exit $LAST_RC）" --section-verdict EVIDENCE_MISSING --exit 0 \
+    --log logs/case_verdicts.log
+fi
 
 # 12. policy check
 run_logged policy_check python3 -m policy_check --repo .

@@ -324,6 +324,96 @@ def case_uptake(freeze: Mapping[str, Any] | None, case_verdicts: Mapping[str, An
             "window_start": window.get("start"), "pass_case_ids": passed}
 
 
+# --------------------------------------------------------------------------- case_verdicts 彙整（OD-60／OWNER-BATCH #8）
+
+_VERDICT_RANK = {"PASS": 0, "EVIDENCE_MISSING": 1, "FAIL": 2}
+L15_TEST_PREFIX = "tests/acceptance/l15/test_slice21_l15.py::test_case["
+L15_LABELS = ("python", "rust")
+
+
+def worst_verdict(verdicts: Sequence[str]) -> str:
+    """最差判定：FAIL ＞ EVIDENCE_MISSING ＞ PASS；空串列（缺證據）即 EVIDENCE_MISSING；未知值視為 EVIDENCE_MISSING。"""
+    if not verdicts:
+        return "EVIDENCE_MISSING"
+    return max((v if v in _VERDICT_RANK else "EVIDENCE_MISSING" for v in verdicts), key=_VERDICT_RANK.__getitem__)
+
+
+def _outcome_verdict(outcomes: Sequence[str]) -> str:
+    """單一 nodeid 的 outcome → 判定：恰一列 passed → PASS；failed／error → FAIL；其餘（skip、重複列、缺）→ EVIDENCE_MISSING。"""
+    if any(o in ("failed", "error") for o in outcomes):
+        return "FAIL"
+    return "PASS" if list(outcomes) == ["passed"] else "EVIDENCE_MISSING"
+
+
+def aggregate_case_verdicts(required_ids: Sequence[str], *, l15_rows: Sequence[Mapping[str, Any]],
+                            func_checks: Mapping[str, Any], excluded: Sequence[Mapping[str, Any]],
+                            section_rows: Mapping[str, Sequence[Mapping[str, Any]]],
+                            section_status: Mapping[str, str] | None = None) -> tuple[dict[str, str], dict[str, list]]:
+    """依 Task 20／21 的逐案證據彙整 `case_verdicts`（純函式；rulings/p5.md OWNER-BATCH #8、OD-60）。
+
+    證據來源：
+    - l15_ab：`test_slice21_l15.py::test_case[<label>-…-<case>]` 的 python 與 rust 兩列（A/B 兩邊皆為該案證據）；
+    - 移出 l15_ab 者（`l15_ab_excluded`）：`covered_by` 各 nodeid 在指定 section 的 outcome，`covered_by_sections` 的 section 判定；
+    - func-test：`existing_suites_rust` 的 `func-test:<case>` runner exit（0 → PASS，非 0 → FAIL）。
+    每案取所有證據中最差判定，無任何證據即 EVIDENCE_MISSING。回傳 (case_id → 判定, case_id → 證據明細)。"""
+    by_case: dict[str, dict[str, list[str]]] = {}
+    for row in l15_rows:
+        nid = str(row.get("nodeid") or "")
+        if not nid.startswith(L15_TEST_PREFIX) or not nid.endswith("]"):
+            continue
+        params = nid[len(L15_TEST_PREFIX):-1]
+        label = params.split("-", 1)[0]
+        for cid in required_ids:
+            if params.endswith(f"-{cid}") and label in L15_LABELS:
+                by_case.setdefault(cid, {}).setdefault(label, []).append(str(row.get("outcome")))
+    pools: dict[str, dict[str, list[str]]] = {}
+    for sec, rows in section_rows.items():
+        pool = pools.setdefault(sec, {})
+        for row in rows:
+            pool.setdefault(str(row.get("nodeid")), []).append(str(row.get("outcome")))
+    excl = {str(r.get("case_id")): r for r in excluded}
+    verdicts: dict[str, str] = {}
+    detail: dict[str, list] = {}
+    for cid in required_ids:
+        evidence: list[dict[str, Any]] = []
+        if cid in by_case:
+            for label in L15_LABELS:
+                outs = by_case[cid].get(label, [])
+                evidence.append({"source": f"l15_ab:{label}", "outcomes": outs, "verdict": _outcome_verdict(outs)})
+        if cid in excl:
+            row = excl[cid]
+            for cov in row.get("covered_by") or []:
+                outs = pools.get(str(cov.get("section")), {}).get(str(cov.get("nodeid")), [])
+                evidence.append({"source": f"{cov.get('section')}:{cov.get('nodeid')}", "decision": row.get("decision"),
+                                 "outcomes": outs, "verdict": _outcome_verdict(outs)})
+            for name in row.get("covered_by_sections") or []:
+                st = (section_status or {}).get(str(name))
+                evidence.append({"source": f"section:{name}", "decision": row.get("decision"),
+                                 "verdict": st if st in _VERDICT_RANK else "EVIDENCE_MISSING"})
+        if cid in func_checks:
+            code = func_checks[cid]
+            ok = isinstance(code, int) and not isinstance(code, bool)
+            evidence.append({"source": f"func-test:{cid}", "exit": code,
+                             "verdict": ("PASS" if code == 0 else "FAIL") if ok else "EVIDENCE_MISSING"})
+        verdicts[cid] = worst_verdict([e["verdict"] for e in evidence])
+        detail[cid] = evidence
+    return verdicts, detail
+
+
+def append_breaker_snapshot(path: pathlib.Path, freeze: Mapping[str, Any], case_verdicts: Mapping[str, Any], *,
+                            run_id: str, today: str | None = None) -> dict[str, Any]:
+    """OD-60：gate 每次正式實跑附加一筆斷路器快照（`slice_breaker` 格式＋`passed`／`denominator` 使 rate 可驗證）。"""
+    up = case_uptake(freeze, case_verdicts)
+    body = json.dumps(dict(sorted((str(k), v) for k, v in case_verdicts.items())), ensure_ascii=False,
+                      sort_keys=True, separators=(",", ":"))
+    snap = {"date": today or dt.datetime.now(dt.timezone.utc).date().isoformat(), "rate": up["rate"],
+            "passed": up["valid_pass"], "denominator": up["denominator"], "run_id": run_id,
+            "results_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(snap, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    return snap
+
+
 def judge_breaker(freeze: Mapping[str, Any] | None, breaker: Mapping[str, Any] | None) -> tuple[str, list[str], Any]:
     """承接率斷路器（審查 b7cd852 #1）：以 `slice_breaker.evaluate` 判定，回 (status, reasons, evaluate 結果)。
 
@@ -696,6 +786,13 @@ def cmd_assemble(args: argparse.Namespace) -> int:
     }
     if args.preflight and pathlib.Path(args.preflight).is_file():
         report["preflight"] = json.loads(pathlib.Path(args.preflight).read_text(encoding="utf-8"))
+    if getattr(args, "append_breaker_snapshot", False) and not args.dry_run and expect_yaml.get("breaker_snapshots_file"):
+        # OD-60：每次正式實跑附加快照（判定前附加，斷路器以含本次的快照判定）。
+        freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
+        snap = append_breaker_snapshot(ROOT / expect_yaml["breaker_snapshots_file"],
+                                       freeze_mod.load_effective_freeze(ROOT / expect_yaml["freeze_file"]),
+                                       case_verdicts, run_id=args.run_id)
+        print(f"slice21_gate_judge: 斷路器快照已附加 {snap}")
     expect, src_where = build_expect(expect_yaml, base_dir=run_dir, case_verdicts=case_verdicts,
                                      daemon_path=args.daemon_path or None, bo_ids=[b["id"] for b in blocked])
     out = judge(report, expect)
@@ -741,6 +838,52 @@ def build_expect(expect_yaml: Mapping[str, Any], *, base_dir: pathlib.Path, case
               "bo_ids": list(bo_ids), "breaker": breaker_inputs(expect_yaml),
               "l15_ab_excluded": list(expect_yaml.get("l15_ab_excluded") or [])}
     return expect, src_where
+
+
+def _load_json(path: pathlib.Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_case_verdicts(args: argparse.Namespace) -> int:
+    """自 run 目錄的 section 片段與逐案證據彙整 `case_verdicts.json`（＋`case_verdicts.detail.json`）。"""
+    run_dir = pathlib.Path(args.run_dir)
+    expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    freeze_mod = _load_module("freeze_slice_cases", ROOT / "scripts" / "rust" / "freeze_slice_cases.py")
+    freeze = freeze_mod.load_effective_freeze(ROOT / expect_yaml["freeze_file"])
+    frags = {p.stem: (_load_json(p) or {}) for p in sorted((run_dir / "sections").glob("*.json"))}
+
+    def rows_of(rel: Any) -> list[dict]:
+        doc = _load_json(run_dir / str(rel)) if rel else None
+        return [r for r in ((doc or {}).get("results") or []) if isinstance(r, dict)] if isinstance(doc, dict) else []
+
+    l15 = frags.get("l15_ab") or {}
+    func_checks: dict[str, Any] = {}
+    for chk in (frags.get("existing_suites_rust") or {}).get("extra_checks") or []:
+        name = str(chk.get("name") or "")
+        if name.startswith("func-test:"):
+            func_checks[name[len("func-test:"):]] = chk.get("exit")
+    section_rows = {name: rows_of(frag.get("l1_results")) for name, frag in frags.items() if frag.get("l1_results")}
+    section_status: dict[str, str] = {}
+    ev = frags.get("event_latency") or {}
+    if ev.get("evidence"):
+        doc = _load_json(run_dir / str(ev["evidence"])) or {}
+        section_status["event_latency"] = {"PASS": "PASS", "FAIL": "FAIL"}.get(str(doc.get("verdict")), "EVIDENCE_MISSING")
+    verdicts, detail = aggregate_case_verdicts(
+        [str(x) for x in freeze.get("required_case_ids") or []], l15_rows=rows_of(l15.get("evidence")),
+        func_checks=func_checks, excluded=list(expect_yaml.get("l15_ab_excluded") or []),
+        section_rows=section_rows, section_status=section_status)
+    (run_dir / "case_verdicts.json").write_text(json.dumps(verdicts, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+                                                encoding="utf-8")
+    (run_dir / "case_verdicts.detail.json").write_text(
+        json.dumps(detail, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    summary: dict[str, int] = {}
+    for v in verdicts.values():
+        summary[v] = summary.get(v, 0) + 1
+    print(f"slice21_gate_judge: case_verdicts {summary} → {run_dir / 'case_verdicts.json'}")
+    return 0
 
 
 def cmd_judge(args: argparse.Namespace) -> int:
@@ -792,6 +935,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     a.add_argument("--build-linux-exit", type=int, default=None)
     a.add_argument("--build-windows-exit", type=int, default=None)
     a.add_argument("--built-daemon-sha256", default=None)
+    a.add_argument("--append-breaker-snapshot", action="store_true",
+                   help="正式實跑（非 dry-run）時依 case_verdicts 附加一筆斷路器快照（OD-60）")
+    c = sub.add_parser("case-verdicts")
+    c.add_argument("--run-dir", required=True)
+    c.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
@@ -803,6 +951,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_record_section(args)
         if args.cmd == "assemble":
             return cmd_assemble(args)
+        if args.cmd == "case-verdicts":
+            return cmd_case_verdicts(args)
         return cmd_judge(args)
     except (OSError, ValueError, KeyError) as exc:
         print(f"slice21_gate_judge: {exc}", file=sys.stderr)
