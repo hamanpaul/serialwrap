@@ -26,7 +26,8 @@ def _report(**kw) -> dict:
     contract = elm.load_contract()
     l1 = {n: "passed" for ev in contract["events"] for n in ev["l1_gate"]}
     base = {"runs": runs, "repeats_required": 3, "diagnostic": False, "l1_gate": l1, "freeze_status": "frozen",
-            "method_revision": "x", "identity": {"daemon_sha256": "a" * 64, "source_commit": "b" * 40, "source_tree_dirty": False}}
+            "method_revision": "x", "identity": {"daemon_sha256": "a" * 64, "source_commit": "b" * 40, "source_tree_dirty": False,
+                                             "artifact_source_commit": "c" * 40}}
     base.update(kw)
     return base
 
@@ -125,3 +126,35 @@ def test_report_identity_binds_artifact_commit_tool_and_run(tmp_path):
     assert len(ident["tool_sha256"]) == 64 and len(ident["contract_sha256"]) == 64
     assert ident["method_revision"] == elm.load_contract()["method_revision"]
     assert "/" not in ident["daemon"] or not ident["daemon"].startswith("/")   # 不落本機絕對路徑（R-21）
+
+
+def test_sha256_file_works_without_hashlib_file_digest(tmp_path, monkeypatch):
+    """sol P5-2472f78-1：Python 3.10 沒有 `hashlib.file_digest`；雜湊須以分塊 update 計算。"""
+    import hashlib
+
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"a" * 300000)
+    assert elm._sha256_file(str(f)) == hashlib.sha256(b"a" * 300000).hexdigest()
+
+
+def test_identity_binds_artifact_to_build_report(tmp_path):
+    """sol P5-3084388-2（第 3 輪）：來源 commit 須是受測 artifact 的建置來源，不得只取工具工作樹 HEAD。
+    以建置紀錄（gate report.json 的 identity.daemon_sha256＋git_revision）核對 artifact sha256；不符或未提供即不得 PASS。"""
+    import hashlib
+    import json
+
+    exe = tmp_path / "serialwrapd"
+    exe.write_bytes(b"\x7fELF-fake")
+    sha = hashlib.sha256(b"\x7fELF-fake").hexdigest()
+    good = tmp_path / "report.json"
+    good.write_text(json.dumps({"run_id": "g1", "git_revision": "c" * 40, "identity": {"daemon_sha256": sha}}))
+    ident = elm.report_identity(str(exe), run_id="r", build_report=str(good))
+    assert ident["artifact_source_commit"] == "c" * 40 and ident["artifact_build_run_id"] == "g1"
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"run_id": "g2", "git_revision": "d" * 40, "identity": {"daemon_sha256": "0" * 64}}))
+    assert elm.report_identity(str(exe), run_id="r", build_report=str(bad))["artifact_source_commit"] is None
+    assert elm.overall_verdict(_report())[0] == "PASS"
+    no_bind = _report()
+    no_bind["identity"]["artifact_source_commit"] = None
+    assert elm.overall_verdict(no_bind)[0] == "INSUFFICIENT_EVIDENCE"

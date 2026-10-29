@@ -72,16 +72,24 @@ def host_load() -> dict[str, Any]:
 def _sha256_file(path: str) -> str | None:
     import hashlib
 
+    h = hashlib.sha256()                       # 分塊 update（`hashlib.file_digest` 需 Python 3.11+；sol P5-2472f78-1）
     try:
         with open(path, "rb") as f:
-            return hashlib.file_digest(f, "sha256").hexdigest()
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
     except OSError:
         return None
+    return h.hexdigest()
 
 
-def report_identity(daemon: str, *, run_id: str) -> dict[str, Any]:
-    """sol P5-3084388-2：量測證據的受測身分——daemon binary sha256、來源 commit（與工作樹是否乾淨）、本工具與
-    契約檔的 sha256、method_revision、run ID。daemon 只記檔名（不落本機絕對路徑，policy R-21）。"""
+def report_identity(daemon: str, *, run_id: str, build_report: str | None = None,
+                    artifact_source_commit: str | None = None, artifact_build_run_id: str | None = None) -> dict[str, Any]:
+    """sol P5-3084388-2：量測證據的受測身分——daemon binary sha256、artifact 建置來源 commit、量測工具所在 commit
+    （與工作樹是否乾淨）、本工具與契約檔的 sha256、method_revision、run ID。daemon 只記檔名（policy R-21）。
+
+    artifact 建置來源不取工具工作樹 HEAD：以 `build_report`（建置該 artifact 的 gate `report.json`，其
+    `identity.daemon_sha256` 須等於受測 binary 的 sha256）取得 `git_revision`；或由建置與量測同一 run 的 gate
+    明示 `artifact_source_commit`／`artifact_build_run_id`。兩者皆無或 sha256 不符時 `artifact_source_commit` 為 None。"""
     import subprocess
 
     def _git(*args: str) -> str:
@@ -91,11 +99,27 @@ def report_identity(daemon: str, *, run_id: str) -> dict[str, Any]:
             return ""
 
     dirty = _git("status", "--porcelain", "--untracked-files=no")
+    daemon_sha = _sha256_file(daemon)
+    mismatch = None
+    if build_report:
+        try:
+            rep = json.loads(pathlib.Path(build_report).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            rep = {}
+        built_sha = (rep.get("identity") or {}).get("daemon_sha256")
+        if daemon_sha and built_sha == daemon_sha and rep.get("git_revision"):
+            artifact_source_commit, artifact_build_run_id = rep["git_revision"], rep.get("run_id")
+        else:
+            artifact_source_commit = artifact_build_run_id = None
+            mismatch = f"建置紀錄 daemon_sha256={built_sha} 與受測 binary {daemon_sha} 不符或缺 git_revision"
     return {
+        "artifact_source_commit": artifact_source_commit,
+        "artifact_build_run_id": artifact_build_run_id,
+        "artifact_build_mismatch": mismatch,
         "run_id": run_id,
         "daemon": pathlib.Path(daemon).name,
-        "daemon_sha256": _sha256_file(daemon),
-        "source_commit": _git("rev-parse", "HEAD"),
+        "daemon_sha256": daemon_sha,
+        "source_commit": _git("rev-parse", "HEAD"),           # 量測工具所在 commit
         "source_tree_dirty": bool(dirty),
         "tool_sha256": _sha256_file(__file__),
         "contract_sha256": _sha256_file(str(LIMITS)),
@@ -156,6 +180,9 @@ def overall_verdict(report: dict[str, Any]) -> tuple[str, list[str]]:
     ident = report.get("identity") or {}
     if not ident.get("daemon_sha256") or not ident.get("source_commit"):
         reasons.append("受測身分不全（daemon sha256／來源 commit），量測證據無法追溯")
+    elif not ident.get("artifact_source_commit"):
+        reasons.append("受測 artifact 的建置來源未綁定（需 --artifact-build-report 或 gate 同 run 建置）："
+                       f"{ident.get('artifact_build_mismatch') or '未提供'}")
     elif ident.get("source_tree_dirty"):
         reasons.append(f"來源工作樹不乾淨（{ident.get('source_commit')}），量測證據無法對應 commit")
     if report.get("freeze_status") != "frozen":
@@ -430,6 +457,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--void-retries", type=int, default=2)
     ap.add_argument("--l1-results", help="linux_l1 的 l1-results.json（OD-45 L1 結構 gate）")
     ap.add_argument("--run-id", help="量測 run ID（預設依時間產生）")
+    ap.add_argument("--artifact-build-report", help="建置受測 artifact 的 gate report.json（核對 daemon_sha256 後取 git_revision）")
+    ap.add_argument("--artifact-source-commit", help="gate 同一 run 建置 artifact 時的來源 commit")
+    ap.add_argument("--artifact-build-run-id", help="gate 同一 run 建置 artifact 時的 run ID")
     args = ap.parse_args(argv)
     contract = load_contract()
     report = measure(args, contract, lambda m: print(m, flush=True))
@@ -437,7 +467,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.l1_results and pathlib.Path(args.l1_results).is_file():
         l1 = json.loads(pathlib.Path(args.l1_results).read_text(encoding="utf-8"))
     report["l1_gate"] = l1_gate_status(contract, l1)
-    report["identity"] = report_identity(args.daemon, run_id=args.run_id or time.strftime("evlat-%Y%m%dT%H%M%SZ", time.gmtime()))
+    report["identity"] = report_identity(
+        args.daemon, run_id=args.run_id or time.strftime("evlat-%Y%m%dT%H%M%SZ", time.gmtime()),
+        build_report=args.artifact_build_report, artifact_source_commit=args.artifact_source_commit,
+        artifact_build_run_id=args.artifact_build_run_id)
     report["daemon"] = report["identity"]["daemon"]
     report["verdict"], report["reasons"] = overall_verdict(report)
     out = pathlib.Path(args.out)
