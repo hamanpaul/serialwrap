@@ -1441,6 +1441,7 @@ def test_sc36_registered() -> None:
     assert sc36.case_ids == ("sc36-win-installer-com0com-optional",)
 
 
+@pytest.mark.case("sc39-legacy-daemon-handoff")
 def test_sc39_registered() -> None:
     """SC-39（OD-48 含修訂：0.3.x 舊 daemon 改走舊版停止路徑、失敗不自動重啟）登記為 Rust-only、僅絕對值比對、P4 階段。"""
     sc39 = _bc_by_id()["SC-39"]
