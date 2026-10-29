@@ -59,3 +59,16 @@
 
 **規格 §1.2 Console 按鍵至回顯 SLO（總表 #7）**：`docs/rust-refactor/procedures/console-echo-loopback.md`（in-process 回歸門檻為
 `crates/sw-core/tests/console_echo_latency.rs`，不得以之取代實體 loopback 量測）。
+
+### #108（parity 承接，LOCAL-WINDOWS-TODO）
+
+**Windows TCP `attach_console` 不開 lease（B:D-61、D-101；rulings/p6.md P6 OWNER-BATCH #4 承接拆分）**
+
+- 承接拆分：file 傳輸 suspend 時既有 human 視窗 defer（`tests/test_refine_ownership.py::TestRefineOwnership::test_existing_human_owner_window_is_deferred_before_suspend`）改列 P8（Slice 2.4）必要案例，不在本節；本節只承擔 Windows TCP console 後端部分。
+- Linux 可驗部分：SC-28 TCP 後端的回應形狀由 `crates/sw-daemon/tests/rpc_console.rs::attach_tcp_shape` 承擔（s22_gate:cargo_workspace）。
+- 前置：Windows 11 host（擁有者 Windows runner），Python 3.12＋PyYAML＋pytest；Rust workspace 以原生 `x86_64-pc-windows-gnu` 建置。
+- 命令：
+  1. `python -m pytest -q tests/test_refine_ownership.py::TestRefineOwnership::test_tcp_accept_during_operation_gate_does_not_get_raw_owner`（Python 基線：TCP accept 不取得 raw owner、admission 關閉期間不 TX）。
+  2. `bash scripts/rust/win-test.sh --package sw-daemon -- --features test-fakes`（含 07 Task 12 的 `windows_console_native.rs`：Windows TCP console 的 `session.console_attach` 回應不含 `interactive_session_id`、不開 human lease，之後 interactive_open 不被該 console 擋）。
+- 預期證據：pytest junit、`target/win-test-report/*.json` 與其 `l1-results`。
+- PASS 條件：兩者皆無 failed／error；Rust 側斷言與 Python 行為一致。LOCAL-WINDOWS-TODO：`windows_console_native.rs`（07 Task 12）尚未撰寫。

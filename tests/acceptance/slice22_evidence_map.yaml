@@ -479,8 +479,9 @@ parity_rows:
       - "tests/test_agent_defer_tx.py::TestUARTBridgeConsoles::test_console_input_supports_backspace_and_local_echo"
       - "func-test/runner.py --case co-02-line-backspace"
   '#108':
-    status: OWNER-DECISION-PENDING
-    note: "Windows TCP attach_console 不開 lease 屬 Windows 原生（LOCAL-WINDOWS-TODO；Linux SC-28 tcp 後端由 rpc_console::attach_tcp_shape 承接）；file 傳輸 suspend 的既有 human 視窗 defer 屬 P8（Slice 2.4）——承接 Phase 待擁有者裁決"
+    status: BLOCKED-OWNER
+    note: "rulings/p6.md P6 OWNER-BATCH #4（#108 承接）：file 傳輸 suspend 的既有 human 視窗 defer 改列 P8（Slice 2.4）必要案例；Windows TCP attach_console 不開 lease 屬 P6 LOCAL-WINDOWS-TODO（擁有者 Windows 原生執行）；Linux SC-28 tcp 後端由 rpc_console::attach_tcp_shape 承接"
+    procedure: docs/rust-refactor/slice22-owner-runbook.md
   '#109':
     status: PASS
     tests:
@@ -546,8 +547,10 @@ parity_rows:
       - "tests/test_acceptance_cases.py::test_contract_blackbox_grouping_is_structural[bad2]"
       - "tests/test_acceptance_cases.py::test_contract_blackbox_grouping_is_structural[bad3]"
   '#185':
-    status: OWNER-DECISION-PENDING
-    note: "流程項（T0 ae33e28 單獨為紅燈、終態綠燈；不重寫歷史時 PR 描述須明載）：無可執行測試，證據形式待擁有者裁決"
+    status: PROCESS-EVIDENCE
+    note: "rulings/p6.md P6 OWNER-BATCH #4（#185 證據形式）：流程項，證據為 T0 commit ae33e28 的紅燈紀錄與終態綠燈，見出口報告 §#185"
+    report: docs/rust-refactor/slice22-exit-report.md
+    commit: ae33e28
   '#186':
     status: PASS
     tests:

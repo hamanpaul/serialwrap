@@ -22,6 +22,8 @@
 - 增補 #187：`parity-amendments-2026-10-26.md` 中承接 Phase 為 P6 的承接編號逐列輸出於 `parity_rows`；狀態取對照表
   `parity_rows["#N"].status`（`PASS` 須附 `tests` 並同 AUTOMATED 規則判定；`BLOCKED-OWNER` 須附 `procedure`；
   `OWNER-DECISION-PENDING` 或未登記 → INSUFFICIENT，result 不得為 PASS）。
+  `PROCESS-EVIDENCE`（rulings/p6.md：#185 流程項的證據形式）只限 `PROCESS_EVIDENCE_ROWS` 逐名列出的承接編號：
+  `report` 檔須有 `## #N` 段落，段落內含 `commit` 的 hash 與「紅燈」「綠燈」紀錄 → PASS；否則 INSUFFICIENT。
 - `BLOCKED-OWNER` 條目回報為 BLOCKED-OWNER（不得標 PASS，也不改變 `result`）；`PENDING` → INSUFFICIENT；
   `NOT_APPLICABLE` 略過。
 輸出 `{"sections":[{set_id,platform,verdict,reasons}],"cases":[{case_id,status,missing_tests,...}],"result"}`；
@@ -56,7 +58,9 @@ REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
     "s22_gate:py_parity": ("linux",),
 }
 L15_FORMAT = "s22-l15-results.v1"
-PARITY_STATUSES = ("PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING")
+PARITY_STATUSES = ("PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "PROCESS-EVIDENCE")
+# rulings/p6.md（P6 OWNER-BATCH #4，#185 證據形式）：流程項以出口報告段落為證據，逐名核准，不得擴及其他承接編號。
+PROCESS_EVIDENCE_ROWS = frozenset({"#185"})
 _RANK = {"PASS": 0, "INSUFFICIENT": 1, "FAIL": 2, "INVALID": 3}
 
 
@@ -241,6 +245,33 @@ def p6_parity_numbers(text: str) -> list[str]:
     return [f"#{n}" for n in sorted(nums)]
 
 
+def _process_evidence_problems(num: str, entry: dict[str, Any]) -> list[str]:
+    """`PROCESS-EVIDENCE` 列的證據檢查；回傳問題清單（空＝通過）。"""
+    if num not in PROCESS_EVIDENCE_ROWS:
+        return [f"{num} 未逐名核准以 PROCESS-EVIDENCE 為證據（只限 {sorted(PROCESS_EVIDENCE_ROWS)}）"]
+    report, commit = entry.get("report"), str(entry.get("commit") or "")
+    if not report or not re.fullmatch(r"[0-9a-f]{7,40}", commit):
+        return ["PROCESS-EVIDENCE 須附 report 與 commit"]
+    path = ROOT / str(report)
+    if not path.is_file():
+        return [f"report 不存在：{report}"]
+    section: list[str] | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            if section is not None:
+                break
+            if re.match(rf"^## {re.escape(num)}(?:\s|$)", line):
+                section = []
+            continue
+        if section is not None:
+            section.append(line)
+    if section is None:
+        return [f"report 缺 `## {num}` 段落"]
+    body = "\n".join(section)
+    missing = [w for w in (commit, "紅燈", "綠燈") if w not in body]
+    return [f"`## {num}` 段落缺：{missing}"] if missing else []
+
+
 def judge_parity(numbers: list[str], emap: dict[str, Any], rows_by_nodeid: dict[str, list[dict]],
                  l15: dict[str, list[dict]] | None) -> list[dict]:
     rows = emap.get("parity_rows") or {}
@@ -257,6 +288,11 @@ def judge_parity(numbers: list[str], emap: dict[str, Any], rows_by_nodeid: dict[
         elif status == "BLOCKED-OWNER":
             proc = entry.get("procedure")
             row["verdict"] = "BLOCKED-OWNER" if proc and (ROOT / str(proc)).is_file() else "INSUFFICIENT"
+        elif status == "PROCESS-EVIDENCE":
+            reasons = _process_evidence_problems(num, entry)
+            row["verdict"] = "INSUFFICIENT" if reasons else "PASS"
+            if reasons:
+                row["reasons"] = reasons
         else:
             row["verdict"] = "INSUFFICIENT"
             if status not in PARITY_STATUSES:
