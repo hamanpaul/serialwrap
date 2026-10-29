@@ -67,14 +67,14 @@ CAPABILITY_SECTIONS: dict[str, dict[str, str]] = {
     "linux_cap_sys_admin": {
         "cap": "sys_admin", "needs": "root（euid 0）且具 CAP_SYS_ADMIN", "disposition": "BLOCKED-OWNER",
         "how_to_run": "以 root 於可丟棄容器（例：docker run --cap-add SYS_ADMIN，掛載 repo）執行 "
-                      "python3 scripts/rust/cargo_l1_results.py --platform linux --caps sys_admin "
-                      "--out <run>/linux_cap_sys_admin/l1-results.json -- -p sw-pal --features test-fakes"},
+                      "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json "
+                      "--caps sys_admin -- --workspace --features test-fakes -- --ignored cap_sys_admin__（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
     "linux_cap_supervisor_runtime": {
         "cap": "supervisor_runtime", "needs": "運作中的 systemd user 執行期（systemctl --user is-system-running 為 running／degraded）",
         "disposition": "BLOCKED-OWNER",
         "how_to_run": "於隔離的 systemd 容器（tools/docker/systemd.Dockerfile，OD-15）以一般使用者登入 session 執行 "
-                      "python3 scripts/rust/cargo_l1_results.py --platform linux --caps supervisor_runtime "
-                      "--out <run>/linux_cap_supervisor_runtime/l1-results.json -- -p sw-pal --features test-fakes"},
+                      "python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_supervisor_runtime/l1-results.json "
+                      "--caps supervisor_runtime -- --workspace --features test-fakes -- --ignored cap_supervisor_runtime__（gate 以 caps-plan 由鎖 selector 推導，OD-53）"},
     "linux_cap_windows_native": {
         "cap": "windows_native", "needs": "原生 Windows（PowerShell、Job Object、PE Subsystem）", "disposition": "LOCAL-WINDOWS-TODO",
         "how_to_run": "linux 列的測試本體需原生 Windows，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔（OWNER-BATCH）"},
@@ -155,6 +155,52 @@ def _passed_ids(l1: Mapping[str, Any]) -> set[str]:
     return {nid for nid, outs in by_id.items() if len(outs) == 1 and outs[0] == "passed"}
 
 
+# --------------------------------------------------------------------------- OD-53 --caps 推導
+
+# rulings/p5.md（P5 第 7 輪）：與 s22 gate 相同的 OD-53 推導規則（rulings/p6.md「OD-53 selector 記錄 caps」：不改鎖 schema）。
+_CAP_FILTER_RE = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__$")
+
+
+def derive_caps(selector: Mapping[str, Any] | None) -> list[str] | None:
+    """L1 鎖 selector → 收集器 `cargo_l1_results.py --caps`。收集器只以 `<exe> --ignored cap_<cap>__` 另執行 ignored 能力
+    測試、不轉交 selector 的 test-binary 參數，故：argv 不含 `--ignored`／`--include-ignored` → `[]`（不需 caps）；第一個
+    `--` 之後恰為 `--ignored` 加一個以上 `cap_<cap>__` 篩選 → 依序回傳各 `<cap>`；其餘帶 ignored 意圖者 → None（推導不出）。"""
+    argv = [str(x) for x in ((selector or {}).get("argv") or [])]
+    if not {"--ignored", "--include-ignored"} & set(argv):
+        return []
+    if "--" not in argv:
+        return None
+    tail = argv[argv.index("--") + 1:]
+    filters = [t for t in tail if t != "--ignored"]
+    caps = [m.group(1) for t in filters if (m := _CAP_FILTER_RE.match(t))]
+    if tail.count("--ignored") != 1 or not caps or len(caps) != len(filters):
+        return None
+    return caps
+
+
+def caps_plan(section: str, expect_yaml: Mapping[str, Any], lock: Mapping[str, Any]) -> dict[str, Any] | None:
+    """gate 測試類 section 的收集計畫：`caps`＝該 section 全部必要集合（required_set＋additional_required_sets）的
+    `derive_caps` 依序聯集，`argv`＝required_set 的 selector argv。任一集合不在鎖或推導不出 → None。"""
+    platform = TEST_SECTIONS.get(section)
+    row = next((s for s in (expect_yaml.get("sections") or []) if s.get("name") == section), None)
+    if platform is None or not row or not row.get("required_set"):
+        return None
+    set_ids = [str(row["required_set"]), *map(str, (expect_yaml.get("additional_required_sets") or {}).get(section) or [])]
+    caps: list[str] = []
+    argv: list[str] | None = None
+    for sid in set_ids:
+        spec = ((lock.get("sets") or {}).get(sid) or {}).get(platform)
+        if not isinstance(spec, Mapping):
+            return None
+        derived = derive_caps(spec.get("selector"))
+        if derived is None:
+            return None
+        caps += [c for c in derived if c not in caps]
+        if argv is None:
+            argv = [str(x) for x in (spec.get("selector") or {}).get("argv") or []]
+    return {"caps": caps, "argv": argv or []}
+
+
 # --------------------------------------------------------------------------- section 判定
 
 def _empty_l1_verdict(reason: str) -> dict[str, Any]:
@@ -176,6 +222,10 @@ def _judge_test_section(sec: Mapping[str, Any], expect: Mapping[str, Any], platf
     set_ids += [str(s) for s in (sec.get("additional_required_sets") or []) if str(s) not in set_ids]
     required: list[str] = []
     for sid in set_ids:
+        spec = ((lock.get("sets") or {}).get(sid) or {}).get(platform)
+        if isinstance(spec, Mapping) and derive_caps(spec.get("selector")) is None:
+            return ("EVIDENCE_MISSING", _empty_l1_verdict(f"selector 推導不出 --caps：{sid}/{platform}"),
+                    [f"必要集合 {sid}（{platform}）的 selector 推導不出收集器 --caps（OD-53：只接受 `--ignored cap_<cap>__`）"])
         try:
             for nid in l1j.required_for(lock, sid, platform):
                 if nid not in required:
@@ -1209,6 +1259,18 @@ def cmd_wal_s1w_verdict(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_caps_plan(args: argparse.Namespace) -> int:
+    """gate 用：印出 section 的 OD-53 收集計畫 JSON（{caps, argv}）；推導不出 exit 3。"""
+    expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    lock = json.loads((ROOT / expect_yaml["lock_file"]).read_text(encoding="utf-8"))
+    plan = caps_plan(args.section, expect_yaml, lock)
+    if plan is None:
+        print(f"slice21_gate_judge: {args.section} 的必要集合推導不出收集器 --caps（OD-53）", file=sys.stderr)
+        return 3
+    print(json.dumps(plan, ensure_ascii=False))
+    return 0
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     report = json.loads(pathlib.Path(args.report).read_text(encoding="utf-8"))
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
@@ -1275,6 +1337,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     w.add_argument("--host-label", default=None, help="匯入證據的主機類型標註（例：owner-wsl2-ext4-vhdx）")
     w.add_argument("--out", default=None)
     w.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
+    cp = sub.add_parser("caps-plan", help="OD-53：由鎖 selector 推導 section 的收集器 --caps 與 argv")
+    cp.add_argument("--section", required=True)
+    cp.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
@@ -1290,6 +1355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_case_verdicts(args)
         if args.cmd == "wal-s1w-verdict":
             return cmd_wal_s1w_verdict(args)
+        if args.cmd == "caps-plan":
+            return cmd_caps_plan(args)
         return cmd_judge(args)
     except (OSError, ValueError, KeyError) as exc:
         print(f"slice21_gate_judge: {exc}", file=sys.stderr)
