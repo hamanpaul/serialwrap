@@ -755,6 +755,68 @@ fn od37_send_with_pre_release_id_after_reattach_not_found_zero_tx() {
     }
 }
 
+/// DF-20 範圍（rulings/p6.md round4-cont OWNER-BATCH #4，落實 OD-37）：`session recover` 與 U-Boot banner（重新開機）
+/// 之後，以先前取得的 agent `interactive_id` 呼叫 interactive_send，Rust 同樣回 `INTERACTIVE_NOT_FOUND`（帶
+/// interactive_id）且零 TX；新開的 lease 照常可用。Python 現行兩種情境皆照送（`ab_rows` 標 DF 差異）。
+#[test]
+fn df20_send_with_pre_recover_or_reboot_id_not_found_zero_tx() {
+    for step in ["recover", "banner"] {
+        let r = ServiceRig::with_console_backend("pty");
+        let open = |r: &ServiceRig| {
+            let o = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent"}"#);
+            assert_eq!(o.get("ok"), Some(&PyValue::Bool(true)), "{step}：{}", j(&o));
+            s(&o, "interactive_id")
+        };
+        let old = open(&r);
+        let dev = r.device(REAL_A);
+        match step {
+            "recover" => {
+                dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+                // recover op 的等待以 FakeClock 計時：呼叫期間持續推進時鐘直到回覆。
+                let rec = std::thread::scope(|scope| {
+                    let h = scope.spawn(|| r.call("session.recover", r#"{"selector":"COM0"}"#));
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while !h.is_finished() {
+                        assert!(Instant::now() < deadline, "session.recover 未回覆");
+                        r.clock.advance(Duration::from_millis(20));
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    h.join().unwrap()
+                });
+                assert_eq!(rec.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&rec));
+                wait_for("recover 後 READY", || s(&session_row(&r), "state") == "READY");
+            }
+            _ => {
+                dev.push_rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+                wait_for("banner 使 boot quiet arm", || {
+                    session_row(&r).get("boot_quiet_remaining_s").is_some_and(|v| !v.is_null())
+                });
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = dev.take_tx();
+        let send = r.call(
+            "session.interactive_send",
+            &format!(r#"{{"interactive_id":"{old}","data":"STALE\n"}}"#),
+        );
+        assert_eq!(
+            j(&send),
+            format!(
+                r#"{{"ok":false,"error_code":"INTERACTIVE_NOT_FOUND","interactive_id":"{old}","version":"{}"}}"#,
+                r.version
+            ),
+            "{step}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let tx = dev.take_tx();
+        assert!(!tx.windows(5).any(|w| w == b"STALE"), "{step}：零 TX，實得 {tx:?}");
+        if step == "recover" {
+            let fresh = open(&r);
+            assert_ne!(fresh, old, "recover 後新 lease 換新 id");
+        }
+    }
+}
+
 /// 接線＋端到端（review-convergence-rules §5；sol P6-e9b5c61-1）：daemon 級（真 SessionManager＋Service＋ConsoleHub＋
 /// human TX pump）兩個重疊的 `session.self_test` probe 各自 suspend／resume human——S1 的 probe 寫入停在提交前、
 /// S2 隨後提交，期間 c1 鍵入 `k` 不得上 UART；兩個 probe 完成後 `k` 回放到 UART、之後按鍵直送。
