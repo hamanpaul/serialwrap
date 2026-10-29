@@ -505,6 +505,33 @@ fn wal_dir_readonly_at_start_blocks_login_probe() {
     assert_eq!(d.wait(LONG).code(), Some(0));
 }
 
+/// rulings/p5.md P6 SPEC-GAP #4（2026-10-29）：Rust daemon 以一般使用者執行時，鎖後 holder 掃描讀不到他人行程的
+/// `/proc/<pid>/fd`（EACCES → `Permission`）不得使開埠 fail-closed。對齊 Python `serial_port.probe_holders`：
+/// pids 空且 status 非 ok → 警告「無法確認 … 的外部 holder（status=…）」並照常開啟（`_set_holder_unknown`），
+/// `health.status.foreign_holders` 以 `{device, holder_unknown:true}` 回報，session 照常 READY。保守判定只保留在
+/// CLI 升級／回滾的安全檢查（`serialwrapd_tty_holders`，rulings/p7.md P7-71fe017-4）。
+#[test]
+fn non_root_holder_scan_permission_does_not_block_open() {
+    // root 可讀所有 /proc/<pid>/fd，無法覆蓋權限不足路徑＝證據不足，必須 FAIL（不得 return 計為 PASS）。
+    assert!(!is_root(), "證據不足：須以非 root 執行（root 下 holder 掃描不會遇到 EACCES）");
+    let denied = fs::read_dir("/proc")
+        .expect("讀 /proc")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
+        .any(|e| matches!(fs::read_dir(e.path().join("fd")), Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied));
+    assert!(denied, "證據不足：本機沒有 fd 目錄不可讀的他人行程，無法覆蓋權限不足路徑");
+    let env = isolated_env_with_pty_target();
+    let mut d = DaemonProc::spawn(&env, &[]);
+    wait_socket(&env.socket, SHORT);
+    wait_ready(&env, "COM0");
+    d.wait_stderr_contains("的外部 holder（status=Permission）", SHORT);
+    let h = health_status(&env.socket);
+    let holders = format!("{:?}", h["foreign_holders"]);
+    assert!(holders.contains("holder_unknown"), "foreign_holders 應回報 holder 未知的裝置：{holders}");
+    rpc_once(&env.socket, STOP);
+    assert_eq!(d.wait(LONG).code(), Some(0));
+}
+
 #[test]
 fn wal_fault_after_ready_splits_agent_and_auto_tx() {
     // 審查 F81：root 下 chmod 無效＝證據不足，必須 FAIL（不得 return 計為 PASS）。

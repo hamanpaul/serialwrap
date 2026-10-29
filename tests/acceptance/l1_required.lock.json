@@ -9672,6 +9672,7 @@
           "cargo:sw-daemon::daemon_process::handler_panic_does_not_kill_daemon",
           "cargo:sw-daemon::daemon_process::no_args_uses_env_paths",
           "cargo:sw-daemon::daemon_process::no_profiles_message_and_continue",
+          "cargo:sw-daemon::daemon_process::non_root_holder_scan_permission_does_not_block_open",
           "cargo:sw-daemon::daemon_process::real_sigterm_to_started_daemon_exits_0_after_flush",
           "cargo:sw-daemon::daemon_process::release_kill_hook_env_isolated_only",
           "cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only",
