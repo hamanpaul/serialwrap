@@ -207,3 +207,28 @@ def test_verify_checks_head_and_artifacts(tmp_path):
     (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md.write_text(g.build_report(d), encoding="utf-8")
     assert any("HEAD" in p for p in g.verify_report(md, d))
+
+
+def test_init_and_record_only_record_identity_and_counts(tmp_path):
+    """`init`／`record` 只記錄不判定：artifact 為 repo 相對路徑＋sha256；測試列附列名對應的 required_set 與 l1 計數，
+    log／evidence 落 sha256；同名列覆寫（審查 P7-c5f0fc9-1：required_set 不由呼叫端決定）。"""
+    run = tmp_path / "run"
+    art = ROOT / "scripts/rust/p7_gate_report.py"
+    data = g.init_results(run, "r9", caps_missing=["windows_com", "windows_com"], artifacts=[art])
+    assert data["caps_missing"] == ["windows_com"] and data["git_head"] == g.current_head()
+    assert data["artifacts"] == {"scripts/rust/p7_gate_report.py": g._sha256(art)}
+    log = run / "x.log"
+    log.write_text("hello", encoding="utf-8")
+    l1 = run / "l1.json"
+    l1.write_text(json.dumps({"results": [{"outcome": "passed"}, {"outcome": "failed"}, {"outcome": "skipped"}]}),
+                  encoding="utf-8")
+    row = g.record_row(run, name="cargo test --workspace", rc=1, log=log, argv=["cargo"], started_at="t0",
+                       ended_at="t1", l1_results=l1, evidence=[log])
+    assert row["required_set"] == "p7_gate:cargo-test-workspace" and row["l1_results"] == "l1.json"
+    assert row["test_counts"] == {"passed": 1, "failed": 1, "ignored": 1}
+    assert row["log_path"] == "x.log" and row["evidence"] == [{"path": "x.log", "sha256": g._sha256(log)}]
+    g.record_row(run, name="cargo test --workspace", rc=0, log=log, argv=["cargo"], started_at="t0", ended_at="t1")
+    rows = json.loads((run / "results.json").read_text(encoding="utf-8"))["rows"]
+    assert [r["rc"] for r in rows] == [0]
+    nt = g.record_row(run, name="policy_check", rc=0, log=log, argv=["p"], started_at="t0", ended_at="t1")
+    assert "required_set" not in nt and "test_counts" not in nt

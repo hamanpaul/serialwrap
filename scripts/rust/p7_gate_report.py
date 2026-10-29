@@ -16,6 +16,10 @@
 - `REQUIRED_ROWS` 缺列 → INCOMPLETE（未執行）。
 
 用法：
+  python3 scripts/rust/p7_gate_report.py init   --results-dir <run> --run-id <id> [--caps-missing c …] [--artifact p …]
+  python3 scripts/rust/p7_gate_report.py record --results-dir <run> --name <列名> --rc <n> --log <p> --argv-json <j>
+                                                --started-at <t> --ended-at <t> [--l1-results <p>] [--platform linux]
+                                                [--evidence <p> …]       # 只記錄（log／evidence 落 sha256、測試計數取自 l1）
   python3 scripts/rust/p7_gate_report.py build  --results-dir <run> [--l1-lock <lock>] [--out <md>]
   python3 scripts/rust/p7_gate_report.py verify --results-dir <run> --md <md>     # 不一致清單非空 → exit 1
 只用 stdlib；不 import sw_core。
@@ -305,9 +309,80 @@ def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = No
     return problems
 
 
+def _rel_to(base: Path, p: Path) -> str:
+    try:
+        return str(Path(p).resolve().relative_to(Path(base).resolve()))
+    except ValueError:
+        return str(p)
+
+
+def init_results(results_dir: Path, run_id: str, *, caps_missing: list[str], artifacts: list[Path]) -> dict[str, Any]:
+    """`p7_gate.sh` 起點：寫 results.json 的身分欄位（HEAD、工作樹是否乾淨、artifact sha256，路徑為 repo 相對）。"""
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True)
+    data = {
+        "run_id": run_id,
+        "git_head": current_head(),
+        "worktree_clean": status.returncode == 0 and not status.stdout.strip(),
+        "caps_missing": sorted(set(caps_missing)),
+        "artifacts": {_rel_to(ROOT, a): _sha256(a) for a in artifacts},
+        "rows": [],
+        "owner_evidence": {},
+    }
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    (Path(results_dir) / "results.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return data
+
+
+def record_row(results_dir: Path, *, name: str, rc: int | None, log: Path, argv: list[str], started_at: str,
+               ended_at: str, l1_results: Path | None = None, platform: str = "linux",
+               evidence: list[Path] = ()) -> dict[str, Any]:
+    """只記錄、不判定：同名列覆寫；測試列附 `required_set`（列名對應集合）與 l1 的測試計數。"""
+    results_dir = Path(results_dir)
+    path = results_dir / "results.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    row: dict[str, Any] = {
+        "name": name, "argv": argv, "rc": rc, "started_at": started_at, "ended_at": ended_at,
+        "log_path": _rel_to(results_dir, log), "log_sha256": _sha256(Path(log)), "platform": platform,
+        "evidence": [{"path": _rel_to(results_dir, e), "sha256": _sha256(Path(e))} for e in evidence],
+    }
+    if name in TEST_ROWS:
+        row["required_set"] = expected_set(name)
+        counts = {"passed": 0, "failed": 0, "ignored": 0}
+        if l1_results is not None and Path(l1_results).is_file():
+            row["l1_results"] = _rel_to(results_dir, l1_results)
+            try:
+                rep = json.loads(Path(l1_results).read_text(encoding="utf-8"))
+            except ValueError:
+                rep = {}
+            for r in rep.get("results") or []:
+                o = r.get("outcome")
+                key = "passed" if o == "passed" else "failed" if o in ("failed", "error") else "ignored"
+                counts[key] += 1
+        row["test_counts"] = counts
+    data["rows"] = [r for r in data.get("rows") or [] if r.get("name") != name] + [row]
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return row
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init")
+    i.add_argument("--results-dir", required=True, type=Path)
+    i.add_argument("--run-id", required=True)
+    i.add_argument("--caps-missing", nargs="*", default=[])
+    i.add_argument("--artifact", nargs="*", default=[], type=Path)
+    r = sub.add_parser("record")
+    r.add_argument("--results-dir", required=True, type=Path)
+    r.add_argument("--name", required=True)
+    r.add_argument("--rc", type=int)
+    r.add_argument("--log", required=True, type=Path)
+    r.add_argument("--argv-json", required=True)
+    r.add_argument("--started-at", required=True)
+    r.add_argument("--ended-at", required=True)
+    r.add_argument("--l1-results", type=Path)
+    r.add_argument("--platform", default="linux")
+    r.add_argument("--evidence", nargs="*", default=[], type=Path)
     b = sub.add_parser("build")
     b.add_argument("--results-dir", required=True, type=Path)
     b.add_argument("--l1-lock", type=Path)
@@ -317,6 +392,14 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--md", required=True, type=Path)
     v.add_argument("--l1-lock", type=Path)
     args = ap.parse_args(argv)
+    if args.cmd == "init":
+        init_results(args.results_dir, args.run_id, caps_missing=args.caps_missing, artifacts=args.artifact)
+        return 0
+    if args.cmd == "record":
+        record_row(args.results_dir, name=args.name, rc=args.rc, log=args.log, argv=json.loads(args.argv_json),
+                   started_at=args.started_at, ended_at=args.ended_at, l1_results=args.l1_results,
+                   platform=args.platform, evidence=args.evidence)
+        return 0
     if args.cmd == "build":
         md = build_report(args.results_dir, l1_lock=args.l1_lock)
         if args.out:

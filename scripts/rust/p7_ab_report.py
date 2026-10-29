@@ -12,7 +12,13 @@
 - INCOMPLETE：junit 缺檔／不可解析，或該案例無任何 testcase（證據不足不得 PASS，§11.3-6）。
 - 整份 junit 的任何 failure／error（含未映射到案例的節點）→ FAIL；pytest 結束碼（`--rc-a`／`--rc-b`）缺或非 0／1、
   或為 1 卻無失敗節點 → INCOMPLETE（審查 P7-c5f0fc9-4）。
-結束碼：全列 A∈{PASS,可接受 SKIP} 且 B＝PASS → 0；有 FAIL → 1；否則（含 INCOMPLETE）→ 3；參數錯誤 → 2。
+先前切片必要回歸（`--regression-dir`，`run_p7_ab.sh` 的 run 目錄；§11.5／§11.6）逐階段判定：
+- pytest 階段（`REGRESSION_PHASES`）：目錄或 junit 缺／不可解析 → INCOMPLETE；`blocked` 標記檔 → BLOCKED-UPSTREAM；
+  任一 failure／error → FAIL；無 testcase、任一 skip、或 rc 非 0 卻無失敗節點 → INCOMPLETE；其餘 PASS。
+- func-test 階段（`FUNC_CASES`）：`comparison.json` verdict PASS 且 rc 0 → PASS；verdict FAIL 或 rc 1 → FAIL；
+  缺 comparison.json 或其他 → INCOMPLETE（證據不足不得 PASS）。
+結束碼：全列 A∈{PASS,可接受 SKIP} 且 B＝PASS（且回歸各階段 PASS）→ 0；有 FAIL → 1；否則（含 INCOMPLETE、
+BLOCKED-UPSTREAM）→ 3；參數錯誤 → 2。
 只用 stdlib＋PyYAML；不 import sw_core。
 """
 from __future__ import annotations
@@ -30,6 +36,14 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 PREFIX = "tests/contract_blackbox/test_p7_"
+# 先前切片必要回歸的 pytest 階段（run 目錄下的子目錄名 → 說明）。
+REGRESSION_PHASES: tuple[tuple[str, str], ...] = (
+    ("slice21-b", "contract_blackbox slice21（Rust）"),
+    ("slice22-b", "contract_blackbox slice22（Rust；P6 human console）"),
+    ("l15-slice21-b", "l15 slice21（Rust 參數＋凍結清單）"),
+    ("l15-slice23", "l15 slice23（Rust；s23 情境含 Python 基線）"),
+)
+FUNC_CASES: tuple[str, ...] = ("brcm-01-login-flow", "ev-01-spawn-handler")
 
 
 def _sha256_file(p: Path | None) -> str | None:
@@ -135,6 +149,52 @@ def judge_side(results, case: dict, side: str, rust_only: set[str], collected: l
     return "INCOMPLETE", "部分 skip"
 
 
+def _read_rc(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def judge_phase(d: Path) -> tuple[str, str]:
+    """pytest 回歸階段：見模組說明。"""
+    blocked = d / "blocked"
+    if blocked.is_file():
+        return "BLOCKED-UPSTREAM", blocked.read_text(encoding="utf-8").strip()[:200]
+    res = parse_junit(d / "junit.xml")
+    if res is None:
+        return "INCOMPLETE", "junit 缺檔或不可解析"
+    rc = _read_rc(d / "rc")
+    failed = sorted(n for n, rows in res.items() if any(o == "failed" for o, _ in rows))
+    if failed:
+        return "FAIL", ", ".join(x.split("::", 1)[1] for x in failed)[:400]
+    if not res:
+        return "INCOMPLETE", "無 testcase"
+    skipped = sorted(n for n, rows in res.items() if any(o == "skipped" for o, _ in rows))
+    if skipped:
+        return "INCOMPLETE", f"skip {len(skipped)} 筆：" + ", ".join(x.split("::", 1)[1] for x in skipped)[:300]
+    if rc != 0:
+        return "INCOMPLETE", f"rc={rc}"
+    return "PASS", f"{len(res)} testcase"
+
+
+def judge_func(d: Path) -> tuple[str, str]:
+    """func-test 回歸階段：comparison.json 的 verdict 與 runner 結束碼。"""
+    rc = _read_rc(d / "rc")
+    found = next(iter(sorted((d / "report").rglob("comparison.json"))), None) if (d / "report").is_dir() else None
+    if found is None:
+        return ("FAIL", f"rc={rc}，無 comparison.json") if rc == 1 else ("INCOMPLETE", f"無 comparison.json（rc={rc}）")
+    try:
+        verdict = json.loads(found.read_text(encoding="utf-8")).get("verdict")
+    except (OSError, ValueError):
+        return "INCOMPLETE", "comparison.json 不可解析"
+    if verdict == "PASS" and rc == 0:
+        return "PASS", f"verdict PASS（{_rel(found)} sha256 {_sha256_file(found)}）"
+    if verdict == "FAIL" or rc == 1:
+        return "FAIL", f"verdict {verdict}、rc={rc}"
+    return "INCOMPLETE", f"verdict {verdict}、rc={rc}"
+
+
 def build(args) -> tuple[str, int]:
     cases = load_cases(args.cases)
     rust_only = rust_only_sc(args.behavior_changes)
@@ -182,6 +242,16 @@ def build(args) -> tuple[str, int]:
         elif prc == 1 and not failed:
             any_incomplete = True
             head.append(f"| （{side} 輪 pytest 結束碼） | INCOMPLETE | | rc=1 但 junit 無失敗節點 |")
+    if args.regression_dir is not None:
+        head += ["", "## 先前切片必要回歸（Rust artifact）", "", "| 階段 | 結果 | 說明 | evidence sha256 |", "|---|---|---|---|"]
+        rows = [(slug, title, judge_phase(args.regression_dir / slug), args.regression_dir / slug / "junit.xml")
+                for slug, title in REGRESSION_PHASES]
+        rows += [(f"func-{c}", f"func-test {c}（bridge，Rust）", judge_func(args.regression_dir / f"func-{c}"),
+                  args.regression_dir / f"func-{c}" / "log") for c in FUNC_CASES]
+        for slug, title, (st, detail), ev in rows:
+            any_fail |= st == "FAIL"
+            any_incomplete |= st != "PASS"
+            head.append(f"| {title} | {st} | {detail.replace('|', '/')} | `{_rel(ev)}` {_sha256_file(ev)} |")
     rc = 1 if any_fail else (3 if any_incomplete else 0)
     head += ["", f"結論：{ {0: 'PASS', 1: 'FAIL', 3: 'INCOMPLETE'}[rc] }", ""]
     return "\n".join(head), rc
@@ -195,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--collected", type=Path, help="pytest --collect-only -q 輸出（必要節點）")
     ap.add_argument("--rc-a", type=int)
     ap.add_argument("--rc-b", type=int)
+    ap.add_argument("--regression-dir", type=Path, help="run_p7_ab.sh 的 run 目錄（先前切片必要回歸各階段）")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--rust-cli", type=Path)
     ap.add_argument("--rust-daemon", type=Path)

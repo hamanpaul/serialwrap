@@ -38,3 +38,10 @@
 | P7-BU-9 | **RESOLVED（rulings/p7.md 照修；merge afebff0＋第 11 輪回歸）**：審查 71fe017_27b5bf4 P7-71fe017-4（Medium）：health `multi_open_detail.holders_status` 對已消失的 tty 應為 `ok`（Python 略過），merge 後的產品接線回 `unknown`；修法為 `health.rs` 先濾掉取不到身分的 tty | P5 `sw-daemon/src/health.rs`（或主線改 rollback 自行判定） |
 | P7-BU-10 | 審查 9d35b01_9065f14 P7-9065f14-1（Medium）：OD-34 將 `l15-delayed-reply` 延至 2.3 後，`tests/acceptance/slice22_evidence_map.yaml` 仍列該案（`test_contracts_slice22.py::test_slice22_case_set_frozen_and_mapped` 紅） | P6 移除該列（及 OD-34 的 `cowork-01-agent-bad-cmd` 移出 2.2 時的同步）後由 P7 合入 |
 | P7-BU-4 | production executor 對 P6 `Effect::Console*`／`HumanTx`／`LeaseIndex` 為 `todo!`（同 tests/support）；P6 合入前 SessionCore 不產生 | 07 T6／T7／T9 |
+
+## 第 12 輪新增（第六輪雲端）
+
+| ID | 項目 | 程序 | 來源 |
+|---|---|---|---|
+| P7-LW-8 | Task 19 `crates/sw-daemon/tests/cap_windows_com_p7.rs` 三案（`cap_windows_com__p7_login_ready`、`__p7_quiet_banner_zero_tx`、`__p7_event_fire`）與 `tests/support/com_peer.rs` 的原生執行：本輪只在 Linux 建置並 `cargo check --tests --features test-fakes --target x86_64-pc-windows-gnu`，未原生跑過；COM peer 的 reaction DSL、TCP endpoint（`SERIALWRAP_ENDPOINT=tcp://127.0.0.1:<port>`）與 `cmd.exe` handler 行程樹查詢皆待原生核對（= B-06） | 擁有者 host：`SW_TEST_COM_PAIR=COM20:COM21 scripts/rust/win-test.sh --caps windows_com --package sw-daemon --test cap_windows_com_p7 -- --features test-fakes`，判準三案 passed、`ignored == 0` | 08 Task 19 |
+| P7-LW-9 | `p7_gate:win-test-sh-non-com`（windows）與 `p7_gate:win-test-sh-caps-windows-com`（windows）尚未登記：前者須原生 `cargo test -- --list` 收集後以 `regen_lock.py --l1-add-only --set p7_gate:win-test-sh-non-com --platform windows --collect <list>` 登記；後者三案為 `#[ignore = "cap:windows_com"]`，與 OD-24「cargo 凍結集合不得含 ignored 列」衝突，登記方式列 SPEC-GAPS（第 12 輪回報） | `scripts/rust/win-test.sh --package sw-pal --package sw-core --package sw-daemon -- --features test-fakes -- --list` | 08 Task 19 Step 3 |
