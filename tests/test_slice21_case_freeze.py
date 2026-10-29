@@ -38,13 +38,27 @@ def _freeze() -> dict:
     return json.loads(FREEZE.read_text(encoding="utf-8"))
 
 
+def _effective() -> dict:
+    """凍結檔＋擁有者逐名核准的修訂（`slice_2.1.amendments.json`；OD-34 起）的有效凍結內容。"""
+    return _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py").load_effective_freeze(FREEZE)
+
+
 def test_freeze_matches_lock():
-    """分母以凍結時的 required_case_ids 為準，並與 lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，
-    後續切片只新增 slice_2.1 以外的案例）。cases_lock_sha256 僅作 provenance：lock 每次 add-only 重算都會改位元組，
-    只有 cases_revision 相同時才比對。分母指紋 denominator_sha256 以 lock 現行的 case_attrs 重算比對，
-    確認 required 案例的屬性未被改動。另釘住凍結欄位（schema、slice、窗口、Stage 2 起算日）與 cases.yaml 重算的集合，
-    cases_yaml_sha256 同樣只在 cases_revision 相同時比對。"""
-    fr = _freeze()
+    """分母以凍結時的 required_case_ids 為準（扣除擁有者逐名核准、記於修訂檔的延後案例），並與
+    lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，後續切片只新增 slice_2.1 以外的案例）。
+    cases_lock_sha256 僅作 provenance：lock 每次 add-only 重算都會改位元組，只有 cases_revision 相同時才比對。
+    分母指紋 denominator_sha256 以 lock 現行的 case_attrs 重算比對，確認 required 案例的屬性未被改動。
+    另釘住凍結欄位（schema、slice、窗口、Stage 2 起算日）與 cases.yaml 重算的集合，
+    cases_yaml_sha256 同樣只在 cases_revision 相同時比對。凍結檔本體不因修訂改寫：有效分母恆為其子集，
+    且被扣除者每一筆都附 OD 編號（OD-34）。"""
+    base = _freeze()
+    fr = _effective()
+    assert set(fr["required_case_ids"]) <= set(base["required_case_ids"])
+    removed = {r["case_id"]: r["decision"] for a in fr["amendments"] for r in a["removed"]}
+    assert set(base["required_case_ids"]) - set(fr["required_case_ids"]) == set(removed)
+    assert all(od.startswith("OD-") for od in removed.values())
+    for key in ("frozen_at", "window", "stage2_started_at", "schema_version", "slice", "denominator_set"):
+        assert fr[key] == base[key], key
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
     cases_doc = yaml.safe_load(CASES.read_text(encoding="utf-8"))
     assert fr["required_case_ids"] == lock["sets"]["slice_2.1"]
@@ -92,12 +106,23 @@ def test_freeze_case_fingerprints_match_current_cases(slice_id):
     """parity-amendments-2026-10-26 #183（P6 審查 F4）：revision 前進後整檔位元組指紋（cases_yaml_sha256）不再比對，
     必要案例的非 case_attrs 欄位（source_ref、title、implemented_by…）被改動會無聲通過；凍結檔因此記錄每個必要案例
     完整 YAML 映射的 sha256（canonical JSON），此處逐案重算比對（補強，非削弱）。"""
-    fr = json.loads((ACC / "breaker" / f"slice_{slice_id}.json").read_text(encoding="utf-8"))
+    base_path = ACC / "breaker" / f"slice_{slice_id}.json"
+    fr = json.loads(base_path.read_text(encoding="utf-8"))
     cases = {c["case_id"]: c for c in yaml.safe_load(CASES.read_text(encoding="utf-8"))["cases"]}
     fps = fr.get("case_fingerprints")
-    assert isinstance(fps, dict), f"slice_{slice_id}.json 缺 case_fingerprints"
+    if fps is None:
+        # 凍結本體早於 #183（Slice 2.1）：本體不改寫（OD-34 修訂鏈以本體雜湊為錨），指紋記於旁置檔，
+        # 數值即 #183 當時（c2924a5）寫入本體者。
+        side = base_path.with_name(f"slice_{slice_id}.case_fingerprints.json")
+        assert side.exists(), f"slice_{slice_id}.json 缺 case_fingerprints，且無旁置檔 {side.name}"
+        fps = json.loads(side.read_text(encoding="utf-8"))
+    assert isinstance(fps, dict), f"slice_{slice_id} 的 case_fingerprints 必須為物件"
     assert sorted(fps) == sorted(fr["required_case_ids"])
-    changed = [cid for cid in fr["required_case_ids"] if _case_fingerprint(cases[cid]) != fps[cid]]
+    # 有效分母（扣除擁有者逐名核准、記於 `slice_<X>.amendments.json` 的延後案例，OD-34）逐案比對；
+    # 被延後者已不在本切片分母內，其 daemon_slice 依裁決改變。
+    effective = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py").load_effective_freeze(base_path)
+    assert set(effective["required_case_ids"]) <= set(fr["required_case_ids"])
+    changed = [cid for cid in effective["required_case_ids"] if _case_fingerprint(cases[cid]) != fps[cid]]
     assert not changed, f"凍結後必要案例內容被改動：{changed}"
 
 
@@ -372,3 +397,4 @@ def test_breaker_stdio_is_utf8_under_cp1252(monkeypatch):
     sb._force_utf8_stdio()
     print("證據不足", file=sys.stderr)
     assert "證據不足".encode("utf-8") in raw_err.getvalue()
+

@@ -44,8 +44,8 @@ def test_new_sc_rows_follow_p0_schema() -> None:
 @pytest.mark.memory_only
 def test_sc30_reserved_for_p7() -> None:
     ids = {i for i in _changes() if i.startswith("SC-")}
-    # SC-34／SC-35 由 P1-OC 登記；SC-36 由 P4 Task 19 登記（OD-15）；SC-08 依 OD-14 #3 撤回（編號不重用）
-    assert ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36"}) - {"SC-08"}
+    # SC-34／SC-35 由 P1-OC 登記；SC-36 由 P4 Task 19 登記（OD-15）；SC-37 由 P5 依 OD-21 登記；SC-08 依 OD-14 #3 撤回（編號不重用）
+    assert ids == ({f"SC-{i:02d}" for i in range(1, 30)} | {"SC-31", "SC-34", "SC-35", "SC-36", "SC-37"}) - {"SC-08"}
 
 
 @pytest.mark.memory_only
@@ -100,5 +100,7 @@ def test_slice22_case_set_frozen_and_mapped() -> None:
     # OD-34（擁有者裁決 2026-10-28）：cowork-01-agent-bad-cmd 逐名移至 Slice 2.3（不在 2.2 分母、仍在 2.3／2.4）。
     sets = json.loads((ROOT / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))["sets"]
     assert "cowork-01-agent-bad-cmd" not in lock and "cowork-01-agent-bad-cmd" in set(sets["slice_2.3"])
+    # OD-34 同列的 l15-delayed-reply（P5 以 --allow-defer 延至 2.3，合併帶入）：同樣不在 2.2、在 2.3。
+    assert "l15-delayed-reply" not in lock and "l15-delayed-reply" in set(sets["slice_2.3"])
     emap = yaml.safe_load((ROOT / "tests/acceptance/slice22_evidence_map.yaml").read_text(encoding="utf-8"))["cases"]
     assert set(emap) == lock, "evidence map 的分母必須等於凍結的 slice_2.2 集合"

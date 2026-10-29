@@ -3,7 +3,8 @@
 # AUTOMATED：.py／.rs 參照須在 s22_gate:* 凍結集合內；func-test／scenario 參照由 s22_gate_check.py --l15-results 判定。
 # BLOCKED-OWNER：procedure 為擁有者證據手冊（slice22-owner-runbook.md BO-S22-NN；Slice 2.1 繼承者沿用 BO-S21-NN），不得標 PASS。
 # frozen_lock_sha1＝凍結當下 cases.lock.json 的 git blob sha1。
-# OD-34（擁有者裁決 2026-10-28）：cowork-01-agent-bad-cmd 逐名移至 Slice 2.3，自本對照表移除（breaker/slice_2.2.json amendments）。
+# OD-34（擁有者裁決 2026-10-28）：cowork-01-agent-bad-cmd 與 l15-delayed-reply（P5 鎖延後，合併帶入）逐名移至 Slice 2.3，
+# 自本對照表移除（breaker/slice_2.2.amendments.json 修訂 #1；凍結本體不改寫）。
 schema_version: 1
 frozen_lock_sha1: dc692da1787818230b0b119ff4d0f652b31554d4
 cases:
@@ -178,9 +179,6 @@ cases:
   l15-context-switch-deferred-input:
     status: AUTOMATED
     tests: [func-test/runner.py --mode bridge --scenarios --case l15-context-switch-deferred-input]
-  l15-delayed-reply:
-    status: AUTOMATED
-    tests: [func-test/runner.py --mode bridge --scenarios --case l15-delayed-reply]
   l15-exclusive-open:
     status: AUTOMATED
     tests: [func-test/runner.py --mode bridge --scenarios --case l15-exclusive-open]

@@ -187,6 +187,11 @@ pub enum SessionRequest {
         profile: SessionProfile,
         profile_source: String,
     },
+    /// `alias.set`（Python `set_alias_for_session`）：任何狀態皆原地更新 profile 的 alias，回套用後的活 session
+    /// （sol-backfill p5 #3：manager 鏡像與 actor 回應須一致）。
+    SetAlias {
+        alias: String,
+    },
     /// bind 等待舊 by_id 的 attach op 逾時（#26；Python `bind_session` 直接寫活 session）：state RECOVERING、
     /// `drain_stalled=true`、`drain_timeout_epoch=epoch`，回 SESSION_RECOVERING 回應（審查 F64）。
     MarkAttachStalled {
@@ -1789,6 +1794,10 @@ impl SessionCore {
                 self.profile_source = profile_source;
                 vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
             }
+            SessionRequest::SetAlias { alias } => {
+                self.profile.alias = alias;
+                vec![Effect::Reply(reply, Ok(self.ok_session(now)))]
+            }
             SessionRequest::DeviceOnline { by_id, real_path } => {
                 // 回覆先於 OpenBridge（executor 依序執行；開埠可能阻塞）。
                 let opened = self.device_attached(&by_id, &real_path, now);
@@ -3324,10 +3333,13 @@ impl SessionCore {
                     "partial"
                 }),
             );
-            effects.push(Effect::WalMeta {
-                cmd_id: Some(cmd_id.clone()),
-                meta,
-            });
+            // op runner 可能已於 `map_send_failure` 寫出同一筆（回條與 OpFinished 先後不定）：只寫一次。
+            if self.deps.registry.claim_abort_meta(cmd_id) {
+                effects.push(Effect::WalMeta {
+                    cmd_id: Some(cmd_id.clone()),
+                    meta,
+                });
+            }
         }
     }
 
@@ -4283,6 +4295,8 @@ impl SessionCore {
             Some(PendingOp::InteractiveCmd { cmd_id, result }) => {
                 let outcome = match outcome {
                     OpOutcome::Sent { .. } => CmdOutcome::Result(result),
+                    // 未完整送出：OpRunner 已依命令帳結算（`map_send_failure`；sol-backfill p5 #1）。
+                    OpOutcome::CommandResult(failure) => CmdOutcome::Result(failure),
                     OpOutcome::SendRefused(reject) => CmdOutcome::Result(pydict! {
                         "ok" => false,
                         "error_code" => lease_refused_command_code(reject),

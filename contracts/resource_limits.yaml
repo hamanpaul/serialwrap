@@ -12,8 +12,9 @@ limits:
   - {name: bg_capture_max_count, value: 64, unit: captures, overflow: evict_oldest_done, source: "arch §5.10 BackgroundCapture 數量"}
   - {name: bg_capture_max_chars, value: 4194304, unit: chars, overflow: truncate_head, source: "arch §5.10 BackgroundCapture 字元上限（每筆）"}
   - {name: rx_window_max_chars, value: 131072, unit: chars, overflow: truncate_head, source: "arch §5.10 RxWindow；_rx_trimmed 累計"}
-  # NC-P5-01（P5 Task 0 雙審修正）：overflow 與 Python 基線（丟棄最舊）衝突，尚未由擁有者裁決；裁決前不得視為凍結、不得作為 Task 10／20 A/B 比對基準。
-  - {name: rx_rate_window_entries, value: 4096, unit: entries, overflow: merge_oldest, source: "arch §5.10 RX 速率視窗；合併最舊兩筆、保留 bytes 總和（flood 下不低估 RX_FLOOD 判定）", python_baseline_deviation: "NC-P5-01（spec-reconciliation §7，待擁有者裁決登記類別）", owner_decision: {id: NC-P5-01, status: pending_owner_decision, python_baseline: "丟棄最舊（collections.deque(maxlen=4096)）", counterexample: "10 s 內先收 3 筆 8192 B，再收 4096 筆 1 B：Python 統計 4096 B；merge_oldest 統計 28672 B（RX_FLOOD 判定不一致）"}}
+  # NC-P5-01（P5 Task 0 雙審修正）：overflow 與 Python 基線（丟棄最舊）衝突；已由 OD-43（2026-10-28）裁決登記 DF-22（contracts/behavior_changes.yaml），
+  # Rust 維持 merge_oldest（不低估 RX_FLOOD）；A/B 以 absolute_only 排除（cargo sw-core::rx_reader::rx_rate_window_capped_4096、rate_window_merge_oldest_keeps_byte_sum）。
+  - {name: rx_rate_window_entries, value: 4096, unit: entries, overflow: merge_oldest, source: "arch §5.10 RX 速率視窗；合併最舊兩筆、保留 bytes 總和（flood 下不低估 RX_FLOOD 判定）", python_baseline_deviation: "NC-P5-01→DF-22（OD-43）", owner_decision: {id: NC-P5-01, status: resolved, decision: OD-43, behavior_change: DF-22, python_baseline: "丟棄最舊（collections.deque(maxlen=4096)）", counterexample: "10 s 內先收 3 筆 8192 B，再收 4096 筆 1 B：Python 統計 4096 B；merge_oldest 統計 28672 B（RX_FLOOD 判定不一致）"}}
   - {name: deferred_input_max_bytes, value: 262144, unit: bytes, overflow: clear_all, source: "arch §5.10 DeferredBuffer（BC-02）；整段清空並 WARNING"}
   - {name: rpc_connections, value: 128, unit: connections, overflow: pause_accept, source: "arch §5.10 RPC 連線上限"}
   - {name: rpc_request_line_bytes, value: 65536, unit: bytes, overflow: close_connection, source: "arch §5.10 RPC 請求行（RPC-H-02）"}

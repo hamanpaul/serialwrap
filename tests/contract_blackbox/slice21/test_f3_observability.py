@@ -13,9 +13,19 @@ def test_fail_error_code(shell_daemon):
     assert r["_stderr"]
 
 
+def names_selector(r: dict, selector: str) -> bool:
+    """F3 oracle（TestPilot f3-device-error-names-selector 原文；OD-36）：stderr **或** stdout JSON 任一含 selector。"""
+    import json
+
+    stdout = {k: v for k, v in r.items() if not k.startswith("_")}
+    return selector in (r.get("_stderr") or "") or selector in json.dumps(stdout, ensure_ascii=False) \
+        or selector in str(r.get("_raw") or "")
+
+
 def test_device_error_names_selector(shell_daemon):
     r = shell_daemon.sw("session", "attach", "--selector", "NOSUCH")
-    assert "NOSUCH" in r["_stderr"]
+    assert r["_rc"] != 0, r
+    assert names_selector(r, "NOSUCH"), r
 
 
 def test_cmd_fail_observable(shell_daemon):

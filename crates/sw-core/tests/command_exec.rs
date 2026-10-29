@@ -1691,3 +1691,234 @@ fn evict_capture_event_drops_local_capture() {
     });
     assert_eq!(after["error_code"], PyValue::from("CMD_NOT_FOUND"));
 }
+
+/// sol-backfill p5 #1：`command.submit {mode:"interactive"}` 的命令 TX 須帶原 `cmd_id` 寫 WAL（Python
+/// `_send_command_with_permit(..., cmd_id=cmd_id)`）；未完整送出時依 `_map_aborted_result` 結算：已確認 >0 bytes
+/// → `COMMAND_ABORTED_IN_FLIGHT`＋META `command_aborted_in_flight`（partial／unknown）。
+fn interactive_tx_rows(h: &ActorRig) -> Vec<PyDict> {
+    h.wal_rows()
+        .into_iter()
+        .filter(|r| r.get("dir").and_then(|v| v.as_str()) == Some("TX"))
+        .collect()
+}
+
+#[test]
+fn interactive_mode_command_tx_carries_cmd_id() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let before = interactive_tx_rows(&h).len();
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("interactive"), "{rec:?}");
+    let rows = interactive_tx_rows(&h);
+    let new_rows = &rows[before..];
+    assert!(!new_rows.is_empty(), "interactive 命令應寫 TX");
+    for row in new_rows {
+        assert_eq!(row.get("cmd_id"), Some(&PyValue::from(id.as_str())), "{row:?}");
+    }
+}
+
+#[test]
+fn interactive_mode_command_partial_send_maps_aborted_in_flight() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::AcceptThenError(
+        4,
+        PalError::io(5, "[Errno 5] Input/output error"),
+    )]);
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("confirmed_tx_bytes"), Some(&PyValue::from(4)));
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("partial")));
+}
+
+#[test]
+fn interactive_mode_command_unknown_send_maps_aborted_in_flight_unknown() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::Unknown {
+        confirmed: 2,
+        error: PalError::io(5, "[Errno 5] Input/output error"),
+    }]);
+    let id = h.submit_with("echo x", |r| r.mode = "interactive".into());
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["error_code"], PyValue::from("COMMAND_ABORTED_IN_FLIGHT"), "{rec:?}");
+    let meta = h
+        .wal_meta_events()
+        .into_iter()
+        .find(|m| m.get("event") == Some(&PyValue::from("command_aborted_in_flight")))
+        .expect("應寫 command_aborted_in_flight META");
+    assert_eq!(meta.get("tx_outcome"), Some(&PyValue::from("unknown")));
+}
+
+// ---------------------------------------------------------------------------
+// PR 237 承接（修正後語意，origin/fix/wrapped-echo-false-positive 34c3a84b）：長命令回顯被終端折行拆開時的剝除。
+// 只接受「命令原文＋折行插入字元」：命令每個字元（含空白）依序出現，只有換行或多出的一個空白可跳過，
+// 插入點彼此至少相隔 20 字元（第一個插入點以第一行欄位計、含殘留 prompt），第一個命令字元前不得插入，
+// 回顯須從第一行開始並結束在行尾。期望值與 Python 修正版 tests/test_wrapped_echo_strip.py 相同。
+// ---------------------------------------------------------------------------
+
+const WRAP_PROMPT_RE: &str = "(?m)^root@prplOS:.*# ";
+const WRAP_PROMPT: &str = "root@prplOS:~# ";
+
+fn wrap_cmd96() -> String {
+    format!("echo {} {}", "x".repeat(50), "y".repeat(40))
+}
+
+fn wrap_cmd200() -> String {
+    format!("echo {} {} {}", "a".repeat(60), "b".repeat(60), "c".repeat(73))
+}
+
+fn wrap_extract(raw: &str, command: &str) -> String {
+    let prompt = compile(WRAP_PROMPT_RE, PyFlags(0)).expect("prompt regex");
+    extract_command_stdout(raw, command, &prompt, None)
+}
+
+#[test]
+fn wrapped_echo_busybox_wrap_is_stripped() {
+    let c = wrap_cmd96();
+    let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_three_line_wrap_is_stripped() {
+    let c = wrap_cmd200();
+    let raw = format!("{}\r\r\n{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..65], &c[65..145], &c[145..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_readline_space_wrap_is_stripped() {
+    let c = wrap_cmd96();
+    let raw = format!("{} \r{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..79], &c[79..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_prompt_prefix_on_first_echo_line() {
+    let c = wrap_cmd96();
+    let raw = format!("{WRAP_PROMPT}{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+    // readline 折行＋prompt 前綴
+    let raw = format!("{WRAP_PROMPT}{} \r{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..64], &c[64..]);
+    assert_eq!(wrap_extract(&raw, &c), "OUT");
+}
+
+#[test]
+fn wrapped_echo_short_command_and_no_echo_unchanged() {
+    let raw = format!("cut -d. -f1 /proc/uptime\r\n65\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "cut -d. -f1 /proc/uptime"), "65");
+    let raw = format!("line1\r\nline2\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, &wrap_cmd96()), "line1\nline2");
+}
+
+#[test]
+fn wrapped_echo_not_starting_on_first_line_is_kept() {
+    let c = wrap_cmd96();
+    let raw = format!("header\r\n{}\r\n{}\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("header\n{}\n{}", &c[..65], &c[65..]));
+}
+
+#[test]
+fn wrapped_echo_single_line_echo_not_stripped_twice() {
+    let c = wrap_cmd96();
+    let raw = format!("{c}\r\n{}\r\n{}\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}", &c[..65], &c[65..]));
+}
+
+#[test]
+fn wrapped_echo_output_equal_to_command_without_spaces_is_kept() {
+    // echo 關閉時 `cat file` 印出 `catfile`：不得被當成回顯。
+    let raw = format!("catfile\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "cat file"), "catfile");
+}
+
+#[test]
+fn wrapped_echo_short_output_split_like_command_is_kept() {
+    let raw = format!("ls -la\r\n/tmp\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "ls -la /tmp"), "ls -la\n/tmp");
+}
+
+#[test]
+fn wrapped_echo_long_output_missing_command_space_is_kept() {
+    let squeezed = wrap_cmd96().replace(' ', "");
+    let raw = format!("{}\r\n{}\r\n{WRAP_PROMPT}", &squeezed[..60], &squeezed[60..]);
+    assert_eq!(
+        wrap_extract(&raw, &wrap_cmd96()),
+        format!("{}\n{}", &squeezed[..60], &squeezed[60..])
+    );
+}
+
+#[test]
+fn wrapped_echo_insertion_before_first_char_or_too_close_is_kept() {
+    let c = wrap_cmd96();
+    // 插入點距離不足 20 字元（第二段只有 10 字元就再折行）→ 不是終端折行。
+    let raw = format!("{}\r\n{}\r\n{}\r\n{WRAP_PROMPT}", &c[..30], &c[30..40], &c[40..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\n{}", &c[..30], &c[30..40], &c[40..]));
+    // 回顯未結束在行尾（命令後同行還有其他字）→ 不剝。
+    let raw = format!("{}\r\r\n{}TAIL\r\n{WRAP_PROMPT}", &c[..65], &c[65..]);
+    assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}TAIL", &c[..65], &c[65..]));
+}
+
+/// 以 readline 折行標記 `" \r"` 於 `cuts` 處切開 `command`（Python `" \r".join(parts)`）。
+fn readline_wrapped(command: &str, cuts: &[usize]) -> String {
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(cuts);
+    bounds.push(command.len());
+    bounds
+        .windows(2)
+        .map(|w| &command[w[0]..w[1]])
+        .collect::<Vec<_>>()
+        .join(" \r")
+}
+
+#[test]
+fn wrapped_echo_plain_crlf_stdout_spelling_command_is_kept() {
+    // sol P5-70f6ce7-1：echo 關閉時 `cat` 的檔案內容恰為命令兩段＋OUT；原始串流沒有 `\r\r\n`／`" \r"`
+    // 折行證據，Python 基線全文保留（不得當成折行回顯刪掉有效 stdout）。
+    let cmd = format!("cat /tmp/{}", "x".repeat(60));
+    let raw = format!("{}\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &cmd[..40], &cmd[40..]);
+    assert_eq!(wrap_extract(&raw, &cmd), format!("{}\n{}\nOUT", &cmd[..40], &cmd[40..]));
+    // 普通換行切在命令空白處也一樣（Python `test_normal_newline_output_is_not_treated_as_terminal_wrap`）。
+    let raw = format!("echo x \r\ny\r\n{WRAP_PROMPT}");
+    assert_eq!(wrap_extract(&raw, "echo x y"), "echo x \ny");
+}
+
+#[test]
+fn wrapped_echo_readline_wrap_before_command_space_is_stripped() {
+    // sol P5-5cc4623-2（Python 842c014）：readline 折行點緊貼命令原有空白時，標記須優先於命令字元比對。
+    let command = format!("echo {} {}", "x".repeat(74), "y".repeat(20));
+    for prefix in ["\n", "\r\n"] {
+        let raw = format!("{prefix}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&command, &[30, 79]));
+        assert_eq!(wrap_extract(&raw, &command), "OUT", "prefix={prefix:?}");
+    }
+}
+
+#[test]
+fn wrapped_echo_readline_python_golden_cases() {
+    // Python `tests/test_wrapped_echo_strip.py`（主線 842c014）其餘 readline 案例逐案對照。
+    let c200 = wrap_cmd200();
+    for cuts in [&[79usize, 159][..], &[50, 100, 150][..]] {
+        let raw = format!("{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&c200, cuts));
+        assert_eq!(wrap_extract(&raw, &c200), "OUT", "cuts={cuts:?}");
+    }
+    for prefix in ["\n", "\r\n"] {
+        for cuts in [&[79usize][..], &[79, 159][..]] {
+            let raw = format!("{prefix}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&c200, cuts));
+            assert_eq!(wrap_extract(&raw, &c200), "OUT", "prefix={prefix:?} cuts={cuts:?}");
+        }
+    }
+    // 標記距命令起點不足 20 字元：不接受；殘留 prompt 不計入距離。
+    let x60 = "x".repeat(60);
+    let raw = format!("{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&x60, &[10]));
+    assert_eq!(wrap_extract(&raw, &x60), format!("{} {}\nOUT", &x60[..10], &x60[10..]));
+    let raw = format!("{WRAP_PROMPT}{}\r\nOUT\r\n{WRAP_PROMPT}", readline_wrapped(&x60, &[10]));
+    assert_eq!(
+        wrap_extract(&raw, &x60),
+        format!("{WRAP_PROMPT}{} {}\nOUT", &x60[..10], &x60[10..])
+    );
+}

@@ -40,3 +40,41 @@ PA-OD-1 已由 OD-21 核准 SC-37，但 SC-37 尚未寫入任何分支的 `contr
 - gate 集合 `s21_gate:{linux_cap_posix_pty,blackbox_python,blackbox_rust,existing_suites_rust,pytest_full}` 登記（F50／F57）與 root 下 L1 收集規則（F108）。
 - 待裁決：`PA-OD-REPROBE`（Slice 2.1 L1.5 與 2.2 func-test 依賴 P7-T5 reprobe）、`PA-OD-T20`、`PA-OD-L15-*`、`PA-OD-EVLAT`、`PA-OD-F67`、`NC-P5-02`、`PA-OD-1`（已核准、待登記 SC-37）。
 - `event_latency` 凍結審閱紀錄（§5.3）、OD-02 `stage2_estimate_weeks`。
+
+# 第四輪實跑（2026-10-28，run id `r4-261028`）
+
+- 命令：`SERIALWRAP_L15_SELFTEST_REPORT=<posix-pty selftest-report.json> bash scripts/rust/slice21_gate.sh --evidence-run --run-id r4-261028`（非 dry-run）。
+- 受測版本：`3c4e051a`（OD-34～OD-44／PA-OD-1 套用後、本輪 sol 增量修正前）；identity：CLI sha256 `3a5b8f52…a303a`、daemon sha256 `8bbcba2f…0fe2`（release）。
+- **中斷與續跑（照實揭露）**：§1～§8 完成後 container 重啟，gate 行程遺失。§9 起以同一腳本截取的續跑副本於同一 run 目錄接續
+  （未重跑已記錄段落、未改工作樹；第一次續跑漏帶 `pytest_l1` 定義於 §11 中止，再以第二份副本自 §11 續跑）；`report.json` 的
+  `started_at` 因此為續跑時刻（`2026-10-28T21:32:04Z`），實際開跑約 20:53Z。
+- **verdict：FAIL**（gate exit 1）。§5.3 凍結檢查未過（`event_latency.freeze_status='pending_review_record'`、審閱紀錄未附）。
+
+| section | 判定 | 數字 | 缺漏／原因 | 處置 |
+|---|---|---|---|---|
+| cfg_boundary | PASS | rc 0 | — | — |
+| linux_l1 | FAIL | 1709 passed／7 failed／28 skipped | 7 支皆 root 下證據不足：`daemon_process::{endpoint_written_after_bind, unwritable_state_dir_startup_save_exits_1_before_attach, wal_dir_readonly_at_start_blocks_login_probe, wal_fault_after_ready_splits_agent_and_auto_tx}`、`oserror_golden::file_eacces_matches_golden`、`rpc_client_conformance::unix_fixture_rows_match_python`、`serial::posix::tests::holder_scan_permission`；非 root（`tcargo`）重跑 `daemon_process` 32/32 passed | root 下 L1 收集規則屬 F108（BLOCKED-OWNER） |
+| linux_cap_posix_pty | EVIDENCE_MISSING | 348／3／8 | 3 failed 同上 root 類；`s21_gate:linux_cap_posix_pty` 未登記於 L1 鎖 | BLOCKED-OWNER（F50／F57） |
+| windows_native_l1 | EVIDENCE_MISSING | runner exit 1 | cross build 成功，`.exe` 於 Linux `Exec format error` | LOCAL-WINDOWS-TODO（BO-S21-13） |
+| windows_cap_windows_com | EVIDENCE_MISSING | — | 無 COM pair | BO-S21-01（允許的豁免） |
+| blackbox_python | EVIDENCE_MISSING | 40／2／6 | 集合未登記；2 failed 皆 Python 基線未出現 `SESSION_QUEUE_FULL`（`test_queue_full_backpressure`、`test_reject_paths_zero_tx[SESSION_QUEUE_FULL]`）。gate 外以同檔範圍重跑 `test_safety_core.py` 25 passed（第 255 筆回 `SESSION_QUEUE_FULL`、pending 256），根因未明，**不以 flaky 放行** | 待查（見下方「未結」） |
+| blackbox_rust | EVIDENCE_MISSING | **45／0／3** | 集合未登記（第三輪 36／8／2） | BLOCKED-OWNER（F57） |
+| existing_suites_rust | EVIDENCE_MISSING | 4／0；func-test 3/3 rc 0 | 集合未登記 | BLOCKED-OWNER（F57） |
+| l15_ab | FAIL | 33 passed／4 failed（37 項） | 兩邊皆非 PASS：`s21-event-latency`（兩個 daemon 皆無 `test_fakes.event_latency.*` 計時欄位，INSUFFICIENT_EVIDENCE）、`s21-wal-unlink-under-traffic`（`HARNESS_STREAM_MISMATCH`，WAL 51／wire 135、131）；第三輪 8 failed。OD-34 移出的 2 案、OD-40 排除的 `l15-wal-interference` 已不在集合 | `PA-OD-EVLAT`、`PA-OD-L15-GAPS-10` |
+| event_latency | EVIDENCE_MISSING | — | 判定器未實作；OD-41 停下回報 | `PA-OD-EVLAT` |
+| wal_s1w_perf | FAIL | append p50 0.022／p95 0.042／p99 0.068 ms；rotate max 1067 ms（4 次 1018～1067 ms） | 規格 §1.2 Linux 門檻（p50≤0.005／p95≤0.01／p99≤0.02 ms、rotate≤3 ms）於 cloud virtio 未達；照實記 FAIL、保留樣本 | 待擁有者實機量測（同第三輪建議） |
+| case_uptake | EVIDENCE_MISSING | valid_pass 0／48（OD-34 修訂後分母） | `case_verdicts.json` 未彙整 | 擁有者填 OD-02 輸入 |
+| pytest_full | EVIDENCE_MISSING | 5445 passed／14 failed／227 skipped | 集合未登記；14 failed 對照起點基準（27）無新增產品回歸，詳見下方 | BLOCKED-OWNER（F57） |
+| policy_check | PASS | fail 0 | — | — |
+
+其餘 verdict 原因：identity 缺 `daemon_version`（F139 deferred）；parity 105 列：PASS 57、INCOMPLETE 46、BLOCKED-OWNER 2（第三輪 PASS 50）；pending decisions 只剩 `PA-OD-EVLAT`、`PA-OD-L15-GAPS-10`。
+
+pytest_full 14 failed：`test_safety_core.py::test_reject_paths_zero_tx[SESSION_QUEUE_FULL]`（同上未結）；root 環境 `test_bb_l15_holder_observer.py::test_observer_does_not_ignore_zombie_leader_with_live_thread`、`test_rust_agent_perm_verifier.py::test_directory_target_probes_inside_directory`；
+鎖／擁有者：`test_l1_judge.py::{test_l1_lock_cargo_sets_exclude_ignored_tests, test_l1_lock_frozen_set_excludes_capability_gated, test_l1_lock_nodeids_subset_of_collect_only}`、`test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence`；
+無 Windows：`test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native`、`test_doctor.py::TestWindowsDoctor::test_pyserial_ok_when_importable`、`test_stage0_tx_outcome.py::test_pyserial_port_write_maps_timeout_to_unknown`、`test_stage0_tx_permit.py::{test_pyserial_chunked_write_drain_stops_after_inflight_chunk, test_pyserial_partial_cancel_keeps_cancelled_reason}`、`test_stage0_uart_exclusive.py::TestManagerAttach::test_pyserial_access_denied_raises_device_held_unknown`；
+其他：`test_bench_tools_cli.py::test_bench_issue_post_route_local_failure_restores_old_bundle_and_benches`。
+
+## 第四輪未結
+
+- Python 基線 `SESSION_QUEUE_FULL` 兩案於 gate 內失敗、gate 外同檔重跑通過；`0a7d0929` 上全套 pytest 同範圍重跑 13 failed（為 gate 14 failed 的子集，僅少 `test_reject_paths_zero_tx[SESSION_QUEUE_FULL]`），即同範圍兩次失敗集合不同。根因仍未明（未出現時佇列持續被接受，推測前景 `sleep` 提早結束），不以 flaky 放行，列為待查（OD-36 延伸候選）。
+- gate 本身於本輪 sol 增量修正（`0a7d0929`）之前的 `3c4e051a` 執行；修正後以 cargo／全套 pytest 重驗（見 commit 說明），未重跑整個 gate。

@@ -12,7 +12,7 @@
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-28.1
+revision: 2026-10-29.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -2419,7 +2419,7 @@ cases:
   platform_capabilities:
     windows: [windows_com, process_rpc]
   cli_stage: 1A
-  daemon_slice: '2.1'
+  daemon_slice: '2.3'  # OD-34（2026-10-28）：依賴 readiness reprobe（P7-T5），自 Slice 2.1 延至 2.3
   stage0_required: true
   prerequisites: [arbiter]
   necessity: required

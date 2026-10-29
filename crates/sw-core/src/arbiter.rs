@@ -72,6 +72,8 @@ struct RegistryInner {
     records: IndexMap<String, PyDict>,
     counter: u64,
     in_flight: HashMap<String, String>,
+    /// 已寫出 `command_aborted_in_flight` META 的 cmd_id（FIFO，≤ `CMD_HISTORY_MAX`）。
+    abort_meta: indexmap::IndexSet<String>,
 }
 
 /// 命令登錄表：保留 admission 順序，並追蹤每個 session 的在途命令。
@@ -85,6 +87,19 @@ impl CommandRegistry {
         Arc::new(CommandRegistry {
             inner: Mutex::new(RegistryInner::default()),
         })
+    }
+
+    /// BC-03：`command_aborted_in_flight` META 每個 cmd_id 只寫一次（Python 只由 worker 的 `_map_aborted_result` 寫）。
+    /// op runner 與 drain 回條（`apply_aborted_receipt`）先後不定，寫入前須先取得此權；回 false 表示已由另一方寫出。
+    pub fn claim_abort_meta(&self, cmd_id: &str) -> bool {
+        let mut inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
+        if !inner.abort_meta.insert(cmd_id.to_string()) {
+            return false;
+        }
+        while inner.abort_meta.len() > crate::resources::CMD_HISTORY_MAX {
+            inner.abort_meta.shift_remove_index(0);
+        }
+        true
     }
 
     /// 依 Python 基線的檢查順序執行 admission，建立命令紀錄與佇列項目。

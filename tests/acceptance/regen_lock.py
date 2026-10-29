@@ -10,6 +10,9 @@
   python3 tests/acceptance/regen_lock.py --add-only --authorize-deferral <case_id>:OD-<n> …
                                                       # 擁有者裁決逐名授權的延後切片（OD-34 起）：只放行該案例 daemon_slice 往後移
                                                       # 及因此自較早 slice_X 消失；其他屬性改動、其他案例或未對應實際延後的授權仍拒絕
+  python3 tests/acceptance/regen_lock.py --add-only --allow-defer <case_id>:<from>:<to>:<OD-NN> [...]
+                                                      # 擁有者裁決逐名核准的延後切片（OD-34 起）：只允許該案例 daemon_slice 由 from 改為較晚的 to，
+                                                      # 其餘屬性不得改；核准須與實際延後集合完全相符（多列、少列、OD 編號不合法皆拒絕且不寫檔）
   python3 tests/acceptance/regen_lock.py --l1-add-only --set <id> --platform <linux|windows> --collect <檔>
           (--selector <json檔> | --argv-json <json> [--paths-json <json>] [--markexpr <str>])
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
@@ -217,8 +220,33 @@ def _is_authorized_deferral(old_a: dict[str, Any] | None, new_a: dict[str, Any] 
     return isinstance(old_s, str) and isinstance(new_s, str) and _slice_tuple(new_s) > _slice_tuple(old_s)
 
 
+# 延後切片核准：(case_id, from_slice, to_slice, OD 編號)；OD 編號須為擁有者裁決 `OD-<數字>`。
+DeferApproval = tuple[str, str, str, str]
+_OD_RE = re.compile(r"^OD-\d+$")
+
+
+def parse_defer_approval(token: str) -> DeferApproval:
+    parts = token.split(":")
+    if len(parts) != 4 or not all(parts):
+        raise ValueError(f"--allow-defer 須為 case_id:from:to:OD-NN：{token!r}")
+    cid, src, dst, od = parts
+    if src not in SLICES or dst not in SLICES or _slice_key(dst) <= _slice_key(src):
+        raise ValueError(f"--allow-defer 的切片須為 {SLICES} 且 to 晚於 from：{token!r}")
+    if not _OD_RE.match(od):
+        raise ValueError(f"--allow-defer 須引用擁有者裁決 OD-NN：{token!r}")
+    return cid, src, dst, od
+
+
+def _slice_key(slice_id: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in slice_id.split("."))
+
+
 def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
+                 defers: set[DeferApproval] | None = None,
                  deferrals: dict[str, str] | None = None) -> int:
+    # 兩種逐名核准並存（合併 P5 `--allow-defer` 與 P6 `--authorize-deferral`）：前者明列 from／to，
+    # 後者由鎖與 cases 的 daemon_slice 推得；兩者皆只放行該案例 daemon_slice 往後移、其餘屬性不變。
+    defers = set(defers or ())
     deferrals = deferrals or {}
     cases_data = _load_yaml(cases_path)
     new_sets = compute_sets(cases_data)
@@ -230,12 +258,27 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
     old_attrs = old.get("case_attrs")
     authorized = {cid for cid in deferrals
                   if _is_authorized_deferral((old_attrs or {}).get(cid), new_attrs.get(cid))}
+    # 核准的延後：該案例只有 daemon_slice 由 from 改為 to；其從較早切片集合消失屬核准範圍。
+    approved: dict[str, DeferApproval] = {}
+    unused: list[str] = []
+    for item in sorted(defers):
+        cid, src, dst, od = item
+        old_a = (old_attrs or {}).get(cid)
+        new_a = new_attrs.get(cid)
+        if (old_a is None or new_a is None or old_a.get("daemon_slice") != src or new_a.get("daemon_slice") != dst
+                or {k: v for k, v in old_a.items() if k != "daemon_slice"}
+                != {k: v for k, v in new_a.items() if k != "daemon_slice"}):
+            unused.append(f"{cid}:{src}:{dst}:{od}（與實際變更不符或未使用）")
+            continue
+        approved[cid] = item
     removed: list[str] = []
     for name, old_ids in (old.get("sets") or {}).items():
         gone = sorted(set(old_ids) - set(new_sets.get(name, [])))
         for cid in gone:
             if (cid in authorized and name.startswith("slice_")
                     and _slice_tuple(name[len("slice_"):]) < _slice_tuple(new_attrs[cid]["daemon_slice"])):
+                continue
+            if cid in approved and name.startswith("slice_") and _slice_key(name[len("slice_"):]) < _slice_key(approved[cid][2]):
                 continue
             removed.append(f"{cid}（集合 {name}）")
     changed: list[str] = []
@@ -244,13 +287,18 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
             if cid not in new_attrs:
                 removed.append(f"{cid}（案例已不存在）")
                 continue
-            if new_attrs[cid] != old_a and cid not in authorized:
+            if new_attrs[cid] != old_a and cid not in authorized and cid not in approved:
                 diff = {k: (old_a.get(k), new_attrs[cid].get(k)) for k in ATTR_KEYS if old_a.get(k) != new_attrs[cid].get(k)}
                 changed.append(f"{cid}（分母屬性變更：{diff}）")
     stale = sorted(set(deferrals) - authorized)
     if stale and not (removed or changed):
         print("[regen_lock] REFUSED：--authorize-deferral 未對應任何實際延後（只允許 daemon_slice 往後移且其餘屬性不變）："
               + "、".join(f"{cid}:{deferrals[cid]}" for cid in stale), file=sys.stderr)
+        return 1
+    if unused:
+        print("[regen_lock] REFUSED：--allow-defer 核准與實際延後不符，鎖檔未變更：", file=sys.stderr)
+        for line in unused:
+            print(f"  - {line}", file=sys.stderr)
         return 1
     if removed or changed:
         print("[regen_lock] REFUSED：既有 case 從集合消失、被延後切片或分母屬性被改動，鎖檔未變更：", file=sys.stderr)
@@ -276,6 +324,8 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
         print(f"[regen_lock] AUTHORIZED 逐名延後：{cid} daemon_slice {old_attrs[cid]['daemon_slice']}→"
               f"{new_attrs[cid]['daemon_slice']}（{deferrals[cid]}）")
     print(f"[regen_lock] wrote {lock_path.name} 與 {COUNTS_NAME}（新增集合條目 {total_added}）")
+    for cid, (_c, src, dst, od) in sorted(approved.items()):
+        print(f"[regen_lock] 核准延後切片：{cid} {src}→{dst}（{od}）")
     return 0
 
 
@@ -547,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="驗證案例鎖（若存在）與 L1 鎖結構")
     mode.add_argument("--add-only", action="store_true", help="重算並寫回；既有 ID 消失或分母屬性改動即拒絕")
+    parser.add_argument("--allow-defer", action="append", default=[], metavar="CASE:FROM:TO:OD-NN",
+                        help="--add-only：擁有者裁決逐名核准的延後切片（只改 daemon_slice；核准須與實際延後完全相符）")
     mode.add_argument("--l1-add-only", action="store_true", help="L1 必要集合只增登記；核准替換可逐名搭配 --allow-removal")
     parser.add_argument("--cases", type=pathlib.Path, default=DEFAULT_CASES, help="cases.yaml 路徑")
     parser.add_argument("--lock", type=pathlib.Path, default=DEFAULT_LOCK, help="cases.lock.json 路徑")
@@ -570,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         approvals = {parse_removal_approval(token) for token in args.allow_removal}
+        defers = {parse_defer_approval(token) for token in args.allow_defer}
         deferrals = dict(parse_deferral_authorization(token) for token in args.authorize_deferral)
     except ValueError as exc:
         print(f"[regen_lock] 用法錯誤：{exc}", file=sys.stderr)
@@ -591,7 +644,10 @@ def main(argv: list[str] | None = None) -> int:
         # L1 鎖缺檔即失敗（P2-T13 審查修正）：刪除 l1_required.lock.json 不得讓 --check 通過。
         rc |= cmd_check_l1(args.lock_file, args.base, approvals)
         return 1 if rc else 0
-    return cmd_add_only(args.cases, args.lock, deferrals)
+    if defers and not args.add_only:
+        print("[regen_lock] 用法錯誤：--allow-defer 只用於 --add-only", file=sys.stderr)
+        return 2
+    return cmd_add_only(args.cases, args.lock, defers, deferrals)
 
 
 if __name__ == "__main__":

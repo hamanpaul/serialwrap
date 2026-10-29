@@ -27,7 +27,10 @@ rows:
   - id: "#4"
     status: PASS
     tests: ["cargo:sw-daemon::daemon_process::release_pause_hook_env_isolated_only"]
-  - {id: "#6", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "SC-37 候選（daemon backend env exit 1），待擁有者裁決 PA-OD-1"}
+  - id: "#6"
+    status: PASS
+    # PA-OD-1／OD-21 (1)：SC-37 已登記於 contracts/behavior_changes.yaml（rust_only、absolute_only）。
+    tests: ["cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1", "cargo:sw-daemon::daemon_process::backend_env_checked_where_python_selects_it"]
   - id: "#11"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::health_status_foreign_holders_holder_unknown_object"]
@@ -99,7 +102,10 @@ rows:
   - id: "#31"
     status: PASS
     tests: ["cargo:sw-core::session_manager::rematerialize_profile_recomputes_session_id_and_alias"]
-  - {id: "#32", status: OWNER-DECISION-PENDING, decision: PA-OD-F67, reason: "pin_applies_on_reattach／fallback_redetects_on_reattach／unresolvable_pin_falls_through 已 passed；計畫指名的 no_redetect_during_quiet 經公開輸入不可達（後備 template 恆為 passthrough，Python 不對 passthrough 武裝 quiet；見 p5-fix-responses F67），語意由 session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe 鎖住，待擁有者核可以 core 層案例替代"}
+  - id: "#32"
+    status: PASS
+    # OD-42（2026-10-28）：計畫指名的 no_redetect_during_quiet 經公開輸入不可達，擁有者接受以 core 層案例替代（plan 06 #32 列已改名並附理由）。
+    tests: ["cargo:sw-core::session_manager::pin_applies_on_reattach", "cargo:sw-core::session_manager::fallback_redetects_on_reattach", "cargo:sw-core::session_core::boot_quiet_survives_clear_drain_and_blocks_reattach_probe", "cargo:sw-core::session_manager::unresolvable_pin_falls_through"]
   - id: "#34"
     status: PASS
     tests: ["cargo:sw-core::command_exec::recover_key_refused_frozen_maps_flushed_by_recovery"]
@@ -167,7 +173,10 @@ rows:
   - id: "#69"
     status: PASS
     tests: ["cargo:sw-daemon::dispatch::ready_unconfirmed_response_has_session_field"]
-  - {id: "#71", status: OWNER-DECISION-PENDING, decision: PA-OD-1, reason: "併 #6：SC-37 候選，待擁有者裁決 PA-OD-1"}
+  - id: "#71"
+    status: PASS
+    # PA-OD-1／OD-21 (1)：SC-37 已登記於 contracts/behavior_changes.yaml（rust_only、absolute_only）。
+    tests: ["cargo:sw-daemon::daemon_process::backend_env_invalid_exit_1", "cargo:sw-daemon::daemon_process::backend_env_checked_where_python_selects_it"]
   - {id: "#72", status: INCOMPLETE, reason: "Rust sigterm_sigint_orderly_stop 已建立並登記 s21_core；windows_console_ctrl_triggers_orderly_stop（LOCAL-WINDOWS-TODO）與 Python test_sigterm_orderly_shutdown_posix 尚未建立"}
   - id: "#73"
     status: PASS

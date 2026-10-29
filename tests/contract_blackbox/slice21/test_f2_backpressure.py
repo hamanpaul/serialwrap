@@ -57,6 +57,12 @@ def test_history_bounded(shell_daemon):
 
 
 def test_recovery_flushes_queue(shell_daemon):
+    """DF-21（OD-37）：recover flush 原子化——Ctrl-C 後佇列全部 FLUSHED_BY_RECOVERY 且佇列命令零 TX。
+    Python 輪逐列標記 DF 差異（ab_rows.PY_DF_DIFFERENCE），只在 Rust 判定。"""
+    from ab_rows import gate_row
+
+    gate_row("test_recovery_flushes_queue")
+    t = shell_daemon.targets["COM0"]
     shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", "sleep 30", "--cmd-timeout", "60")
     queued = [
         shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", f"echo q{i}")["cmd_id"]
@@ -66,6 +72,8 @@ def test_recovery_flushes_queue(shell_daemon):
     for cid in queued:
         done = shell_daemon.wait_command_done(cid, timeout=20)
         assert done.get("error_code") == "FLUSHED_BY_RECOVERY"
+    written = t.written()
+    assert not any(f"echo q{i}".encode() in written for i in range(5)), "被 flush 的佇列命令不得送出任何 byte"
     t0 = time.monotonic()
     ok = shell_daemon.sw("cmd", "submit", "--selector", "COM0", "--cmd", "echo ok")
     done = shell_daemon.wait_command_done(ok["cmd_id"], timeout=10)

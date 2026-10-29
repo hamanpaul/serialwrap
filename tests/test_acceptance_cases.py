@@ -669,3 +669,54 @@ def test_regen_lock_authorized_deferral_is_per_name(tmp_path: pathlib.Path):
 
     proc, lock = run("badref", defer, "--authorize-deferral", f"{cid}:owner")
     assert proc.returncode == 2, proc.stderr
+def _defer_fixture(tmp_path: pathlib.Path, case_id: str, to_slice: str) -> tuple[pathlib.Path, pathlib.Path, str]:
+    cases_data = _load_cases()
+    target = next(c for c in cases_data["cases"] if c["case_id"] == case_id)
+    target["daemon_slice"] = to_slice
+    tmp_cases = tmp_path / "cases.yaml"
+    tmp_cases.write_text(yaml.safe_dump(cases_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    tmp_lock = tmp_path / "cases.lock.json"
+    orig_lock = (REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8")
+    tmp_lock.write_text(orig_lock, encoding="utf-8")
+    (tmp_path / "cases.counts.json").write_text(
+        (REPO / "tests/acceptance/cases.counts.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return tmp_cases, tmp_lock, orig_lock
+
+
+def _regen(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(REPO / "tests/acceptance/regen_lock.py"), *args],
+                          cwd=REPO, capture_output=True, text=True, encoding="utf-8")
+
+
+@pytest.mark.process_rpc
+def test_regen_lock_defer_requires_named_owner_decision(tmp_path: pathlib.Path):
+    """OD-34：既有案例延後切片只能逐名以 `--allow-defer case_id:from:to:OD-NN` 核准；未核准、核准不符或多列
+    未使用的核准皆拒絕且鎖檔不變；核准後只改該案例的 daemon_slice 與早期切片集合，其餘屬性與集合不動。"""
+    lock0 = json.loads((REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8"))
+    cid = next(c for c in lock0["sets"]["slice_2.1"]
+               if lock0["case_attrs"][c]["daemon_slice"] == "2.1" and c.startswith("l15-"))
+    tmp_cases, tmp_lock, orig_lock = _defer_fixture(tmp_path, cid, "2.3")
+    base = ["--add-only", "--cases", str(tmp_cases), "--lock", str(tmp_lock)]
+    plain = _regen(*base)
+    assert plain.returncode == 1 and tmp_lock.read_text(encoding="utf-8") == orig_lock
+    for bad in (f"{cid}:2.1:2.2:OD-34", f"{cid}:2.1:2.3:", "nosuch-case:2.1:2.3:OD-34", f"{cid}:2.1:2.3:OD-x"):
+        r = _regen(*base, "--allow-defer", bad)
+        assert r.returncode != 0, (bad, r.stdout, r.stderr)
+        assert tmp_lock.read_text(encoding="utf-8") == orig_lock, bad
+    extra = _regen(*base, "--allow-defer", f"{cid}:2.1:2.3:OD-34", "--allow-defer", "f1-too-long-rejected:2.1:2.3:OD-34")
+    assert extra.returncode != 0 and tmp_lock.read_text(encoding="utf-8") == orig_lock
+    ok = _regen(*base, "--allow-defer", f"{cid}:2.1:2.3:OD-34")
+    assert ok.returncode == 0, ok.stderr
+    assert "OD-34" in ok.stdout
+    lock1 = json.loads(tmp_lock.read_text(encoding="utf-8"))
+    assert cid not in lock1["sets"]["slice_2.1"] and cid not in lock1["sets"]["slice_2.2"]
+    assert cid in lock1["sets"]["slice_2.3"] and cid in lock1["sets"]["slice_2.4"]
+    assert lock1["case_attrs"][cid] == dict(lock0["case_attrs"][cid], daemon_slice="2.3")
+    for name, ids in lock0["sets"].items():
+        if name not in ("slice_2.1", "slice_2.2"):
+            assert set(ids) <= set(lock1["sets"][name]), name
+        else:
+            assert set(ids) - set(lock1["sets"][name]) == {cid}, name
+    chk = _regen("--check", "--cases-only", "--cases", str(tmp_cases), "--lock", str(tmp_lock))
+    assert chk.returncode == 0, chk.stderr
