@@ -7,7 +7,9 @@
 - `test_no_auto_resend_after_partial_or_timeout`（§11.3-5；SC-30 子案 Rust-only，cases.yaml 平台限定）。
 未承接（依賴 P6 human console，`session.console_attach` 於本分支 Rust 為 METHOD_NOT_FOUND，BLOCKED-UPSTREAM）：
 `test_login_bytes_not_interleaved_with_agent_or_human`（§11.3-2）、`test_recovery_and_reboot_do_not_replay_stale_input`
-（§11.3-3）；`test_evidence_insufficient_is_not_pass`（§11.3-6）依賴 `scripts/rust/run_p7_ab.sh`（尚未建立）。
+（§11.3-3）。
+`test_evidence_insufficient_is_not_pass`（§11.3-6）：以合成 junit 驗證 `scripts/rust/p7_ab_report.py`（`run_p7_ab.sh` 的判定器）
+缺證據時該列 INCOMPLETE、整體結束碼非 0。
 stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
@@ -182,3 +184,48 @@ def test_no_auto_resend_after_partial_or_timeout(p7, tmp_path):
             assert log.count(b"root") == 1 and tgt2.password.encode() not in log, log
         finally:
             rig.stop()
+
+
+def _junit(path, cases, drop=()):
+    import xml.sax.saxutils as su
+    rows = []
+    for c in cases:
+        file, func = c["source_ref"].split("::", 1)
+        if c["case_id"] in drop:
+            continue
+        cls = file[:-3].replace("/", ".")
+        rows.append(f'<testcase classname="{su.escape(cls)}" name="{su.escape(func)}" time="0.1"/>')
+    path.write_text('<?xml version="1.0"?><testsuites><testsuite name="pytest">' + "".join(rows)
+                    + "</testsuite></testsuites>", encoding="utf-8")
+
+
+def test_evidence_insufficient_is_not_pass(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    script = root / "scripts/rust/p7_ab_report.py"
+    cases = [c for c in yaml.safe_load((root / "tests/acceptance/cases.yaml").read_text(encoding="utf-8"))["cases"]
+             if c.get("suite") == "contract-blackbox" and str(c.get("source_ref", "")).startswith("tests/contract_blackbox/test_p7_")]
+    assert len(cases) >= 30, len(cases)
+    full = tmp_path / "full.xml"
+    _junit(full, cases)
+
+    def run(a, b):
+        out = tmp_path / "ab.md"
+        r = subprocess.run([sys.executable, str(script), "--run-id", "t", "--junit-a", str(a), "--junit-b", str(b),
+                            "--out", str(out)], capture_output=True, text=True)
+        return r.returncode, out.read_text(encoding="utf-8")
+
+    rc, md = run(full, full)
+    assert rc == 0 and "結論：PASS" in md, md
+    rc, md = run(full, tmp_path / "missing-b.xml")                       # B 證據缺檔
+    assert rc == 3 and "| INCOMPLETE |" in md and "結論：INCOMPLETE" in md, md
+    one = cases[0]["case_id"]
+    partial = tmp_path / "partial.xml"
+    _junit(partial, cases, drop={one})
+    rc, md = run(full, partial)                                          # B 缺一案
+    assert rc == 3 and f"| {one} | PASS | INCOMPLETE |" in md, md

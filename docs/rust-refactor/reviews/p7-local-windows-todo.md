@@ -36,4 +36,5 @@
 | P7-BU-7 | OD-34：`cowork-01-agent-bad-cmd` 收進 Slice 2.3 gate 後於 Rust daemon 仍 FAIL——步驟 8 `attach_console` 回 `METHOD_NOT_FOUND`（`session.console_attach` 屬 P6 human console）；reprobe 依賴已由 P7 滿足 | P6（07 T10 console attach）；不 merge P6 的前提下本分支無法 PASS |
 | P7-BU-8 | 審查 71fe017_27b5bf4 P7-71fe017-3（High）：main #237 的折行回顯剝除（`_strip_wrapped_command_echo`）未移植到 Rust `op_runner.rs` 的命令輸出擷取 | P5（Slice 2.1 命令執行；`op_runner.rs` 為 P5 檔案） |
 | P7-BU-9 | **RESOLVED（rulings/p7.md 照修；merge afebff0＋第 11 輪回歸）**：審查 71fe017_27b5bf4 P7-71fe017-4（Medium）：health `multi_open_detail.holders_status` 對已消失的 tty 應為 `ok`（Python 略過），merge 後的產品接線回 `unknown`；修法為 `health.rs` 先濾掉取不到身分的 tty | P5 `sw-daemon/src/health.rs`（或主線改 rollback 自行判定） |
+| P7-BU-10 | 審查 9d35b01_9065f14 P7-9065f14-1（Medium）：OD-34 將 `l15-delayed-reply` 延至 2.3 後，`tests/acceptance/slice22_evidence_map.yaml` 仍列該案（`test_contracts_slice22.py::test_slice22_case_set_frozen_and_mapped` 紅） | P6 移除該列（及 OD-34 的 `cowork-01-agent-bad-cmd` 移出 2.2 時的同步）後由 P7 合入 |
 | P7-BU-4 | production executor 對 P6 `Effect::Console*`／`HumanTx`／`LeaseIndex` 為 `todo!`（同 tests/support）；P6 合入前 SessionCore 不產生 | 07 T6／T7／T9 |

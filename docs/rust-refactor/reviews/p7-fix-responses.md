@@ -280,3 +280,10 @@ Rust 修正（Task 18 黑箱揭露，皆先紅後綠）：
 | T18-2 | handler 子行程繼承 daemon 執行緒被阻擋的 SIGINT／SIGTERM（`handler_posix` 在 `pre_exec` 內自行 execve，繞過 std 的訊號重設）：dash 的背景 job 以啟動時 mask 建立、SIGTERM 被擋，逾時 `killpg(SIGTERM)` 後等背景 `sleep` 自然結束才回 `fire_timeout` | CPython daemon 執行緒不阻擋訊號、`restore_signals=True` 還原 SIGPIPE／SIGXFSZ | **fixed**：`ExecPlan::reset_signals`（`pthread_sigmask(SIG_SETMASK, ∅)`、SIGPIPE／SIGXFSZ → SIG_DFL）於 setsid 後、exec 前執行。回歸 conformance `child_signal_mask_is_empty_even_if_spawner_blocks_term`（背景 job 的 SigBlk：修前 `0000000000004002`）、`timeout_kills_background_job_when_spawner_blocks_term`（修前 30.0 s）；端到端 `test_p7_events.py::test_handler_timeout_kills_group` |
 
 L1 鎖 add-only：`p7_gate:cargo-test-workspace.linux` +6。
+
+### p7-cloud/9d35b01_9065f14（Codex sol，incr）
+
+| # | 嚴重度 | 發現 | 處理 |
+|---|---|---|---|
+| A 段 | — | 前輪全數已修（含 P7-71fe017-3 經 P5 `0a7d092`／merge `afebff0` 合入、P7-71fe017-4 經 `afebff0`＋`0baf6e8`） | — |
+| P7-9065f14-1 | Medium | merge 帶入 OD-34 延後 `l15-delayed-reply` 後，`slice22_evidence_map.yaml` 仍列該案，`test_contracts_slice22.py::test_slice22_case_set_frozen_and_mapped` 必紅 | **屬實；SPEC-GAPS／BLOCKED-UPSTREAM P7-BU-10（P6）**：`tests/acceptance/slice22_evidence_map.yaml` 與該測試為 P6（Slice 2.2）擁有（ae33e28），審查者修法亦為「由 P6 同步移除後合入」；本分支依指示不 merge P6、不改其他 Phase 檔案。P6 移除該列並由 P7 合入後此測試轉綠（OD-34 的 cowork-01-agent-bad-cmd 自 2.2 移出時同一 map 亦需同步） |

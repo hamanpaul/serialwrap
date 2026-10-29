@@ -6,6 +6,8 @@ Slice 2.3 gate，須在 Rust daemon 下 PASS。
 - `cowork-01-agent-bad-cmd`（Slice 2.2 func-test 案例）：`--mode bridge --case <id>`；另依賴 P6 human console
   （`session.console_attach`），P6 合入前 Rust daemon 回 METHOD_NOT_FOUND（BLOCKED-UPSTREAM，見
   `docs/rust-refactor/reviews/p7-local-windows-todo.md` P7-BU-7）。
+- `l15-dut-reboot-port-alive`、`l15-dut-silent`（P2 凍結情境）與 `brcm-01-login-flow`（func-test 案例）：cases.yaml
+  `daemon_slice: 2.3` 的必要 L1.5 列（第 11 輪補列）。
 - `ev-01-spawn-handler`（daemon_slice 2.3）：Linux 列於本檔驗證；Windows 列（OD-31，SC-26 `cmd.exe /d /s /c` shell
   handler）須原生 PASS，列 LOCAL-WINDOWS-TODO P7-LW-7。
 
@@ -16,8 +18,8 @@ import json, os, pathlib, subprocess, sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
-SCENARIOS = ["l15-delayed-reply", "s21-reboot-minimal-guard"]
-CASES = ["cowork-01-agent-bad-cmd", "ev-01-spawn-handler"]
+SCENARIOS = ["l15-delayed-reply", "s21-reboot-minimal-guard", "l15-dut-reboot-port-alive", "l15-dut-silent"]
+CASES = ["cowork-01-agent-bad-cmd", "ev-01-spawn-handler", "brcm-01-login-flow"]
 GATE = os.environ.get("SERIALWRAP_GATE") == "1"
 
 
