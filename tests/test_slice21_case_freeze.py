@@ -122,7 +122,13 @@ def test_freeze_case_fingerprints_match_current_cases(slice_id):
     # 被延後者已不在本切片分母內，其 daemon_slice 依裁決改變。
     effective = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py").load_effective_freeze(base_path)
     assert set(effective["required_case_ids"]) <= set(fr["required_case_ids"])
-    changed = [cid for cid in effective["required_case_ids"] if _case_fingerprint(cases[cid]) != fps[cid]]
+    # OD-52：擁有者逐名核准的凍結後欄位變更以「指紋更新」修訂記錄（舊指紋須等於前一版有效指紋，見
+    # `load_effective_freeze`）；有效指紋只換掉被逐名核准的案例，其餘仍以凍結時的指紋比對。
+    eff_fps = effective["case_fingerprints"]
+    updated = {u["case_id"] for a in effective["amendments"] for u in a.get("fingerprint_updates", [])}
+    assert {cid for cid in fps if eff_fps[cid] != fps[cid]} == updated
+    assert all(od.startswith("OD-") for a in effective["amendments"] for od in a["decisions"])
+    changed = [cid for cid in effective["required_case_ids"] if _case_fingerprint(cases[cid]) != eff_fps[cid]]
     assert not changed, f"凍結後必要案例內容被改動：{changed}"
 
 
