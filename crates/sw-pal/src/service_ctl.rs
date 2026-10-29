@@ -154,6 +154,31 @@ pub struct AutostartHoldRecord {
     pub ran: Vec<CmdRecord>,
 }
 
+/// 監管項 enabled 狀態查詢結果（OD-48 D8）：`Known(None)` 表示狀態存在但不是 enabled／disabled
+/// （例如 static、indirect、generated），呼叫端不得據此改寫 enabled。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnabledQuery {
+    Known(Option<bool>),
+    /// 後端沒有獨立的 enabled 查詢；呼叫端沿用 `query` 的既有映射。
+    NotSupported,
+    Failed(String),
+}
+
+/// `systemctl is-enabled` 的 stdout 映射（OD-48 D8）：enabled → true；disabled／masked → false；
+/// 其餘（static、indirect、enabled-runtime、linked、generated、transient、alias、not-found、空白）→ 未知。
+pub fn parse_is_enabled(stdout: &str) -> Option<bool> {
+    match stdout.trim() {
+        "enabled" => Some(true),
+        "disabled" | "masked" | "masked-runtime" => Some(false),
+        _ => None,
+    }
+}
+
+/// `systemctl show -p MainPID --value` 的 stdout 映射：0 或無法解析 → 沒有 MainPID。
+pub fn parse_main_pid(stdout: &str) -> Option<u32> {
+    stdout.trim().parse::<u32>().ok().filter(|pid| *pid != 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldState {
     Held,
@@ -591,6 +616,14 @@ pub trait ServiceCtl: Send + Sync {
         name: &str,
         with_sudo: bool,
     ) -> Result<AutostartHoldRecord, ServiceResult>;
+    /// OD-48 D8：監管項的 enabled 狀態（與 running 分開查詢）。預設不支援，呼叫端沿用 `query` 映射。
+    fn query_enabled(&self, _mode: &SupervisionMode) -> EnabledQuery {
+        EnabledQuery::NotSupported
+    }
+    /// OD-48 D4：監管項目前的主行程 pid（systemd `MainPID`）；沒有或不支援 → `Ok(None)`。
+    fn main_pid(&self, _mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        Ok(None)
+    }
 }
 
 /// 組合式監管控制（arch §4.8）：依 `modes` 分派到 systemd／windows-task／windows-service 實作。
@@ -779,5 +812,17 @@ impl ServiceCtl for CompositeServiceCtl {
                 )
             })?
             .hold_autostart_named(mode, name, with_sudo)
+    }
+
+    fn query_enabled(&self, mode: &SupervisionMode) -> EnabledQuery {
+        self.backend(mode)
+            .map(|backend| backend.query_enabled(mode))
+            .unwrap_or(EnabledQuery::NotSupported)
+    }
+
+    fn main_pid(&self, mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        self.backend(mode)
+            .map(|backend| backend.main_pid(mode))
+            .unwrap_or(Ok(None))
     }
 }

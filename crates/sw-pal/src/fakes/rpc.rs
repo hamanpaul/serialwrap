@@ -244,6 +244,7 @@ struct RpcState {
     recv_timeout_once_after: BTreeMap<(String, String), usize>,
     requests: Vec<(String, String, String)>,
     request_seq: Vec<u64>,
+    relaunch_templates: BTreeMap<(String, String), (BTreeSet<u32>, String)>,
 }
 
 fn record_refused_connect(st: &mut RpcState, key: &str) {
@@ -524,6 +525,31 @@ impl FakeRpcConnector {
         );
     }
 
+    /// 監管或其他行程重新拉起 `pids` 中的 daemon 時，`(ep, method)` 以 `template`（`{pid}` 代換為目前 PID）回應，
+    /// 優先於 `respond_after_relaunch`（OD-48：重拉的 0.3.x daemon 以自身 PID 回應）。
+    pub fn respond_relaunch_template(&self, ep: &str, method: &str, pids: &[u32], template: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .relaunch_templates
+            .insert(
+                (canonical_endpoint(ep), method.to_string()),
+                (pids.iter().copied().collect(), template.to_string()),
+            );
+    }
+
+    /// `(ep, method)` 已收到的請求數（不推進任何計數）。
+    pub fn request_count(&self, ep: &str, method: &str) -> usize {
+        let key = canonical_endpoint(ep);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requests
+            .iter()
+            .filter(|request| request.0 == key && request.1 == method)
+            .count()
+    }
+
     /// `ep` 是否已因 `stop_after_send` 進入停止狀態（不推進任何計數）。
     pub fn is_stopped(&self, ep: &str) -> bool {
         self.state
@@ -756,7 +782,15 @@ impl RpcStream for FakeRpcStream {
             };
             let reply = {
                 let dynamic_pid = st.relaunched_pid.get(&self.key).copied();
-                if let Some(pid) = dynamic_pid.filter(|_| method == "health.ping") {
+                let templated = dynamic_pid.and_then(|pid| {
+                    st.relaunch_templates
+                        .get(&slot)
+                        .filter(|(pids, _)| pids.contains(&pid))
+                        .map(|(_, template)| template.replace("{pid}", &pid.to_string()))
+                });
+                if templated.is_some() {
+                    templated
+                } else if let Some(pid) = dynamic_pid.filter(|_| method == "health.ping") {
                     Some(format!(r#"{{"ok":true,"pid":{pid},"version":"test"}}"#))
                 } else if dynamic_pid.is_some() {
                     st.post_relaunch_responses
