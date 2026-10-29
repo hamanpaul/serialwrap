@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -137,6 +138,88 @@ def _read_ppid(pid_dir: Path) -> int | None:
         return int(fields[1])
     except (IndexError, ValueError):
         return None
+
+
+def _read_stat_fields(pid_dir: Path) -> list[str] | None:
+    """/proc/<pid>/stat 在 comm 之後的欄位（[0] 為 state、[19] 為啟動時間 starttime）。"""
+    try:
+        text = (pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return text[text.rfind(")") + 1:].split()
+
+
+def _start_ticks(pid_dir: Path) -> str | None:
+    fields = _read_stat_fields(pid_dir)
+    return fields[19] if fields and len(fields) > 19 else None
+
+
+def daemon_process_tree(proc_root: Path = Path("/proc")) -> dict[int, str | None]:
+    """所有 serialwrapd 行程（含 launcher 與其 python 子行程）及其子孫的 PID → 啟動時間（PID 重用以此辨識）。"""
+    try:
+        entries = [e for e in proc_root.iterdir() if e.name.isdigit()]
+    except OSError:
+        return {}
+    parents: dict[int, int | None] = {}
+    tree: set[int] = set()
+    for entry in entries:
+        pid = int(entry.name)
+        parents[pid] = _read_ppid(entry)
+        argv = _read_argv(entry)
+        if argv and is_daemon_argv(argv):
+            tree.add(pid)
+    grown = True
+    while grown:
+        grown = False
+        for pid, ppid in parents.items():
+            if pid not in tree and ppid in tree:
+                tree.add(pid)
+                grown = True
+    return {pid: _start_ticks(proc_root / str(pid)) for pid in sorted(tree)}
+
+
+def daemon_socket_paths(pids: Iterable[int], config_text: str, *, proc_root: Path = Path("/proc")) -> list[str]:
+    """daemon 綁定的 unix socket：各行程 argv 的 `--socket`，加上 config.yaml 的 `socket_path`（daemon 啟動後寫入的
+    有效 endpoint；0.3.2 pipx 入口以預設 endpoint 起時 argv 沒有 --socket）。tcp:// 等非路徑值略過。"""
+    found: set[str] = set()
+    for pid in pids:
+        argv = _read_argv(proc_root / str(pid)) or []
+        for i, arg in enumerate(argv):
+            if arg == "--socket" and i + 1 < len(argv):
+                found.add(argv[i + 1])
+            elif arg.startswith("--socket="):
+                found.add(arg.split("=", 1)[1])
+    for line in config_text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "socket_path":
+            found.add(value.split("#", 1)[0].strip().strip("'\""))
+    return sorted(path for path in found if path.startswith("/"))
+
+
+def wait_daemon_gone(before: dict[int, str | None], sockets: Iterable[str], *, timeout: float, interval: float = 0.1,
+                     proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    """`daemon stop` 之後的有界等待（Docker on-demand 預熱競態裁決）：`before`（停止前的 daemon_process_tree）中每個
+    行程都已結束（同 PID 但啟動時間不同視為已結束、zombie 已釋放資源亦然）、沒有任何 serialwrapd 實例、且 `sockets`
+    的 socket 檔都已移除，才回 gone=True。逾時回 gone=False 並列出殘留項，由呼叫端判 FAIL 並記錄。"""
+    sockets = sorted(set(sockets))
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+    while True:
+        alive = []
+        for pid, ticks in sorted(before.items()):
+            fields = _read_stat_fields(proc_root / str(pid))
+            if fields and fields[0] != "Z" and (ticks is None or len(fields) <= 19 or fields[19] == ticks):
+                alive.append(pid)
+        instances = scan_daemon_instances(proc_root)
+        left = [path for path in sockets if os.path.lexists(path)]
+        gone = not alive and not instances and not left
+        if gone or time.monotonic() >= deadline:
+            detail: dict[str, Any] = {"gone": gone, "waited_ms": int((time.monotonic() - t0) * 1000),
+                                      "timeout_s": timeout, "pids": sorted(before), "sockets": sockets}
+            if not gone:
+                detail.update(alive=alive, instances=instances, sockets_left=left)
+            return detail
+        time.sleep(interval)
 
 
 def scan_daemon_instances(proc_root: Path = Path("/proc")) -> list[int]:
