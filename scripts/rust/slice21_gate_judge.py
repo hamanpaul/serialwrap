@@ -326,6 +326,78 @@ def case_uptake(freeze: Mapping[str, Any] | None, case_verdicts: Mapping[str, An
             "window_start": window.get("start"), "pass_case_ids": passed}
 
 
+# --------------------------------------------------------------------------- wal_s1w_perf（OD-61：WSL2 量測匯入）
+
+WAL_S1W_FORMAL_HOSTS = frozenset({"wsl2", "native"})    # OD-61：擁有者 WSL2 主機視為 Linux 實機證據；雲端 vm:* 只作診斷
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _paths_changed_since(rev: str, paths: Sequence[str]) -> list[str] | None:
+    """`rev` 為 HEAD 祖先時回傳 `rev..HEAD` 間變更過的相關路徑（空串列＝未變）；`rev` 不在本分支歷史即 None。"""
+    if _git("merge-base", "--is-ancestor", rev, "HEAD") is None:
+        return None
+    if not paths:
+        return []
+    out = _git("diff", "--name-only", f"{rev}..HEAD", "--", *paths)
+    return [x for x in (out or "").splitlines() if x.strip()]
+
+
+def wal_s1w_verdict(local: Mapping[str, Any] | None, *, imported: Mapping[str, Any] | None = None,
+                    host_label: str | None = None, formal_params: Mapping[str, Any],
+                    relevant_paths: Sequence[str] = ()) -> tuple[str, list[str]]:
+    """wal_s1w_perf section 判定（OD-61）。
+
+    - 有匯入證據（編排者於擁有者 WSL2 主機以 throwaway 環境量測）：須為 `wal_s1w.v1`、Linux 門檻、正式量測參數
+      （`formal_params`）、`env.virtualization` ∈ {wsl2, native}、附主機類型標註（`host_label`）、`env.git_revision`
+      為本分支歷史中的 commit，且該 commit 之後 WAL 寫入相關路徑（`relevant_paths`）未再變更；符合者以其 verdict 判定，
+      不符即 EVIDENCE_MISSING（證據無法追溯或不代表受測版本）。
+    - 無匯入：gate 本機量測若為 wsl2／native 照其 verdict 判定；雲端 `vm:*`／unknown 只作診斷 → EVIDENCE_MISSING。
+    回傳 (PASS／FAIL／EVIDENCE_MISSING, 原因)。"""
+    def check(doc: Mapping[str, Any], *, need_label: bool) -> list[str]:
+        problems: list[str] = []
+        env = doc.get("env") if isinstance(doc.get("env"), Mapping) else {}
+        if doc.get("schema") != "wal_s1w.v1":
+            problems.append(f"schema={doc.get('schema')!r}（須為 wal_s1w.v1）")
+        if doc.get("verdict") not in ("PASS", "FAIL"):
+            problems.append(f"verdict={doc.get('verdict')!r}")
+        if (doc.get("thresholds") or {}).get("platform") != "linux":
+            problems.append(f"thresholds.platform={(doc.get('thresholds') or {}).get('platform')!r}（須為 linux 門檻）")
+        params = doc.get("params") if isinstance(doc.get("params"), Mapping) else {}
+        diff = {k: params.get(k) for k, v in formal_params.items() if params.get(k) != v}
+        if diff:
+            problems.append(f"params 非正式量測參數：{diff}（應為 {dict(formal_params)}）")
+        virt = str(env.get("virtualization") or "unknown")
+        if virt not in WAL_S1W_FORMAL_HOSTS:
+            problems.append(f"env.virtualization={virt!r}：vm／未知主機只作診斷（OD-61）")
+        if need_label and not (host_label or "").strip():
+            problems.append("匯入證據未附主機類型標註（SW_GATE_WAL_S1W_HOST）")
+        rev = str(env.get("git_revision") or "")
+        if not _HEX40_RE.match(rev):
+            problems.append(f"env.git_revision={rev!r} 無法追溯 commit")
+        else:
+            changed = _paths_changed_since(rev, list(relevant_paths))
+            if changed is None:
+                problems.append(f"env.git_revision={rev} 不在本分支歷史")
+            elif changed:
+                problems.append(f"量測 commit {rev[:12]} 之後 WAL 寫入相關路徑已變更：{changed[:6]}")
+        return problems
+
+    if imported is not None:
+        problems = check(imported, need_label=True)
+        if problems:
+            return "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據不採用：{p}" for p in problems]
+        return str(imported["verdict"]), [f"匯入證據（{host_label}）：{'；'.join(map(str, imported.get('failures') or [])) or '全數達標'}"]
+    if local is None:
+        return "EVIDENCE_MISSING", ["wal_s1w 量測未產生，且未匯入外部證據（SW_GATE_WAL_S1W_IMPORT）"]
+    problems = check(local, need_label=False)
+    if problems:
+        am = local.get("append_ms") or {}
+        return "EVIDENCE_MISSING", [
+            f"本機量測只作診斷（{'；'.join(problems)}）：append p50 {am.get('p50')}／p95 {am.get('p95')}／p99 {am.get('p99')} ms、"
+            f"rotate max {local.get('rotate_max_ms')} ms、本機 verdict {local.get('verdict')}；正式證據待匯入 WSL2 量測（OD-61）"]
+    return str(local["verdict"]), list(map(str, local.get("failures") or []))
+
+
 # --------------------------------------------------------------------------- case_verdicts 彙整（OD-60／OWNER-BATCH #8）
 
 _VERDICT_RANK = {"PASS": 0, "EVIDENCE_MISSING": 1, "FAIL": 2}
@@ -897,6 +969,27 @@ def cmd_case_verdicts(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wal_s1w_verdict(args: argparse.Namespace) -> int:
+    """wal_s1w_perf section 判定（OD-61）：輸出 {verdict, reasons, source, host_label, evidence}。"""
+    expect_yaml = _load_yaml(pathlib.Path(args.expect))
+    cfg = expect_yaml.get("wal_s1w") or {}
+    local = _load_json(pathlib.Path(args.local)) if args.local else None
+    imported = _load_json(pathlib.Path(args.import_)) if args.import_ else None
+    if args.import_ and imported is None:
+        verdict, reasons = "EVIDENCE_MISSING", [f"匯入的 wal_s1w 證據無法讀取：{args.import_}"]
+    else:
+        verdict, reasons = wal_s1w_verdict(local, imported=imported, host_label=args.host_label,
+                                           formal_params=cfg.get("formal_params") or {},
+                                           relevant_paths=list(cfg.get("relevant_paths") or []))
+    out = {"verdict": verdict, "reasons": reasons, "source": "import" if args.import_ else "local",
+           "host_label": args.host_label or None, "evidence": args.import_ or args.local}
+    text = json.dumps(out, ensure_ascii=False, indent=1) + "\n"
+    if args.out:
+        pathlib.Path(args.out).write_text(text, encoding="utf-8")
+    print(text, end="")
+    return 0
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     report = json.loads(pathlib.Path(args.report).read_text(encoding="utf-8"))
     expect_yaml = _load_yaml(pathlib.Path(args.expect))
@@ -952,6 +1045,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     c = sub.add_parser("case-verdicts")
     c.add_argument("--run-dir", required=True)
     c.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
+    w = sub.add_parser("wal-s1w-verdict")
+    w.add_argument("--local", default=None, help="gate 本機量測的 wal_s1w.json")
+    w.add_argument("--import", dest="import_", default=None, help="外部匯入的 wal_s1w.json（OD-61：擁有者 WSL2 主機）")
+    w.add_argument("--host-label", default=None, help="匯入證據的主機類型標註（例：owner-wsl2-ext4-vhdx）")
+    w.add_argument("--out", default=None)
+    w.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
     j = sub.add_parser("judge")
     j.add_argument("--report", required=True)
     j.add_argument("--expect", default=str(ROOT / "tests" / "acceptance" / "slice21_gate_expect.yaml"))
@@ -965,6 +1064,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_assemble(args)
         if args.cmd == "case-verdicts":
             return cmd_case_verdicts(args)
+        if args.cmd == "wal-s1w-verdict":
+            return cmd_wal_s1w_verdict(args)
         return cmd_judge(args)
     except (OSError, ValueError, KeyError) as exc:
         print(f"slice21_gate_judge: {exc}", file=sys.stderr)

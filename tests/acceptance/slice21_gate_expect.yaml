@@ -11,6 +11,13 @@ breaker_snapshots_file: tests/acceptance/breaker/slice_2.1.snapshots.ndjson
 # OD-60（2026-10-29）：6 週（起算 2026-10-21）；各 slice 出口依實測速率重新校準一次，已耗＋剩餘 > 24 週照規則重提 OD-02。
 stage2_estimate_weeks: 6
 runbook: docs/rust-refactor/slice21-owner-runbook.md
+# OD-61（2026-10-29）：wal_s1w_perf 的 Linux 門檻以擁有者 WSL2 主機（ext4 vhdx）量測為準（編排者以 throwaway 環境量測後
+#   以 SW_GATE_WAL_S1W_IMPORT／SW_GATE_WAL_S1W_HOST 匯入）；雲端 virtio（vm:*）結果只作診斷。匯入證據須為正式參數、
+#   env.git_revision 在本分支歷史且其後下列路徑未變更（judge `wal_s1w_verdict`）。
+wal_s1w:
+  formal_params: {streams: 4, records: 10000, payload: 1024, rotate_bytes: 67108864, prefill_ratio: 0.9375, rate: 0}
+  relevant_paths: [crates/sw-core/src/wal.rs, crates/sw-core/examples/wal_s1w.rs, crates/sw-pal/src/wal_fs.rs,
+                   crates/sw-pal/src/wal_fs, crates/sw-pal/src/fs_ops.rs, crates/sw-pal/src/fs_ops, Cargo.lock, rust-toolchain.toml]
 parity:
   # #104：逐列狀態檔；來源文件位置與 sha256 記在狀態檔內。
   status_file: tests/acceptance/slice21_parity_status.yaml

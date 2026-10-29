@@ -330,15 +330,30 @@ record event_latency --command "python3 scripts/rust/event_latency_measure.py --
   --reason "OD-45（L1 結構 gate＋外部量測 stop_request／command_cancel／release_request）：$evlat_reason"
 
 # 9 補：§1.2 WAL 效能（超標記 FAIL 並保留樣本，不得改列觀察值）
+# OD-61：Linux 門檻以擁有者 WSL2 主機量測為準。編排者於本機量測後以
+#   SW_GATE_WAL_S1W_IMPORT=<wal_s1w.json> SW_GATE_WAL_S1W_HOST=<主機類型標註> 匯入；本機（雲端 vm）量測照跑但只作診斷。
+#   判定由 slice21_gate_judge.py wal-s1w-verdict 依可追溯性與主機類型決定（不得以雲端結果判 PASS／FAIL）。
 mkdir -p "$RUN_DIR/wal_s1w_perf"
 run_logged wal_s1w_perf cargo run --release -p sw-core --example wal_s1w -- --out "$RUN_DIR/wal_s1w_perf/wal_s1w.json" \
   --wal-root "$RUN_DIR/wal_s1w_perf/walroot"
-s1w_verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verdict","EVIDENCE_MISSING"))' \
-  "$RUN_DIR/wal_s1w_perf/wal_s1w.json" 2>/dev/null || echo EVIDENCE_MISSING)"
+s1w_rc="$LAST_RC"
 rm -rf "$RUN_DIR/wal_s1w_perf/walroot"
-record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w" --exit "$LAST_RC" \
-  --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence wal_s1w_perf/wal_s1w.json \
-  --reason "Linux 門檻（規格 §1.2）；Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
+s1w_args=()
+[[ -f "$RUN_DIR/wal_s1w_perf/wal_s1w.json" ]] && s1w_args+=(--local "$RUN_DIR/wal_s1w_perf/wal_s1w.json")
+s1w_evidence=wal_s1w_perf/wal_s1w.json
+if [[ -n "${SW_GATE_WAL_S1W_IMPORT:-}" ]]; then
+  cp "$SW_GATE_WAL_S1W_IMPORT" "$RUN_DIR/wal_s1w_perf/wal_s1w.imported.json" 2>/dev/null || true
+  s1w_args+=(--import "$RUN_DIR/wal_s1w_perf/wal_s1w.imported.json" --host-label "${SW_GATE_WAL_S1W_HOST:-}")
+  s1w_evidence=wal_s1w_perf/wal_s1w.imported.json
+fi
+python3 "$JUDGE" wal-s1w-verdict "${s1w_args[@]}" --out "$RUN_DIR/wal_s1w_perf/verdict.json" >/dev/null 2>>"$RUN_DIR/logs/wal_s1w_perf.log" || true
+s1w_verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo EVIDENCE_MISSING)"
+s1w_reason="$(python3 -c 'import json,sys; print("；".join(json.load(open(sys.argv[1]))["reasons"]) or "—")' "$RUN_DIR/wal_s1w_perf/verdict.json" 2>/dev/null || echo "wal-s1w-verdict 未產生")"
+s1w_exit="$s1w_rc"; [[ "$s1w_verdict" == EVIDENCE_MISSING ]] && s1w_exit=0
+record wal_s1w_perf --command "cargo run --release -p sw-core --example wal_s1w（＋SW_GATE_WAL_S1W_IMPORT 匯入）" --exit "$s1w_exit" \
+  --log logs/wal_s1w_perf.log --section-verdict "$s1w_verdict" --evidence "$s1w_evidence" \
+  --reason "Linux 門檻（規格 §1.2；OD-61 WSL2 量測為準）：$s1w_reason" \
+  --reason "Windows 原生與 EDR 下正式量測屬 BO-S21-14（EVIDENCE_MISSING）"
 
 # 10. Windows 無 COM 黑箱（BO-S21-13 承接 Windows 全套；此處只保留紀錄，不計入 section）。
 #     注意：win-blackbox.ps1 目前仍為 P3 介面，-Suite／-Daemon 尚未支援；失敗只留 log，不影響判定。
