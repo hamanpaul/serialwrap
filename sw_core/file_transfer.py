@@ -14,6 +14,7 @@ import shlex
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from .uart_io import TxIncompleteError
 from .util import strip_ansi
 
 if TYPE_CHECKING:
@@ -184,28 +185,37 @@ def push_file(
             _cleanup_remote(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
             return _line_limit_error(max_console_line_chars)
         pre = bridge.rx_snapshot_len()
-        if callable(paced_send):
-            paced = paced_send(
-                cmd,
-                source=source,
-                cmd_id=f"{cmd_id_prefix}-{idx}",
-                slice_size=echo_slice_size,
-                echo_timeout_s=echo_timeout_s,
-            )
-            if not paced.get("ok"):
-                # echo 停滯：換行未送出＝命令未執行；清半行復原後回報（可安全重試）。
-                bridge.cancel_input_line(source=source)
-                _cleanup_remote(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
-                return {
-                    "ok": False,
-                    "error_code": "TRANSFER_ECHO_STALL",
-                    "chunks_sent": idx,
-                    "chunks_total": total,
-                    "acked_chars": paced.get("acked_chars"),
-                    "sent_chars": paced.get("sent_chars"),
-                }
-        else:
-            bridge.send_command(cmd, source=source, cmd_id=f"{cmd_id_prefix}-{idx}")
+        try:
+            if callable(paced_send):
+                paced = paced_send(
+                    cmd,
+                    source=source,
+                    cmd_id=f"{cmd_id_prefix}-{idx}",
+                    slice_size=echo_slice_size,
+                    echo_timeout_s=echo_timeout_s,
+                )
+                if not paced.get("ok"):
+                    # echo 停滯：換行未送出＝命令未執行；清半行復原後回報（可安全重試）。
+                    bridge.cancel_input_line(source=source)
+                    _cleanup_remote(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
+                    return {
+                        "ok": False,
+                        "error_code": "TRANSFER_ECHO_STALL",
+                        "chunks_sent": idx,
+                        "chunks_total": total,
+                        "acked_chars": paced.get("acked_chars"),
+                        "sent_chars": paced.get("sent_chars"),
+                    }
+            else:
+                bridge.send_command(cmd, source=source, cmd_id=f"{cmd_id_prefix}-{idx}")
+        except TxIncompleteError as exc:
+            # S1X-a-4：傳輸中 TX 被拒（boot quiet／drain／世代過期／取消）。best-effort
+            # 清半行與暫存檔（被拒時吞掉，不送 bytes 進 autoboot 倒數），附上進度後交由
+            # SessionManager 映射為對外錯誤碼，例外不得穿越 RPC 邊界。
+            _best_effort_after_reject(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
+            exc.chunks_sent = idx
+            exc.chunks_total = total
+            raise
         if not bridge.wait_for_regex_from(prompt_regex, pre, timeout_s):
             _cleanup_remote(bridge, tmp_name, prompt_regex, timeout_s, source, cmd_id_prefix)
             return {
@@ -572,6 +582,22 @@ def _remote_md5(
         if match:
             return match.group(1).lower()
     return None
+
+
+def _best_effort_after_reject(
+    bridge: UARTBridge,
+    path: str,
+    prompt_regex: str,
+    timeout_s: float,
+    source: str,
+    cmd_id_prefix: str,
+) -> None:
+    """TX 被拒後盡力清半行並清除暫存檔；任一步再被拒即停（S1X-a-4）。"""
+    try:
+        bridge.cancel_input_line(source=source)
+        _cleanup_remote(bridge, path, prompt_regex, timeout_s, source, cmd_id_prefix)
+    except TxIncompleteError:
+        pass
 
 
 def _cleanup_remote(

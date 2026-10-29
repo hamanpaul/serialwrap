@@ -8014,6 +8014,38 @@ class SessionManager:
 
     # ── 檔案傳輸 ──────────────────────────────────────────────
 
+    @staticmethod
+    def _file_tx_rejected_result(
+        session: SessionRuntime, exc: TxIncompleteError
+    ) -> dict[str, Any]:
+        """把檔案傳輸中被拒的 TX 映射為 file.* 既有錯誤碼（S1X-a-4）。
+
+        ``quiet`` 且零寫出 → ``AUTOBOOT_QUIET``＋``retry_after_s``（SC-03）；其餘
+        （drain、世代過期、取消、部分寫出等）→ 傳輸自身的 ``TRANSFER_TIMEOUT``（0.3.2
+        結束碼）。push 另附 ``chunks_sent``／``chunks_total``。
+        """
+        progress = {
+            key: getattr(exc, key)
+            for key in ("chunks_sent", "chunks_total")
+            if getattr(exc, key, None) is not None
+        }
+        reason = (exc.result.error or "").removeprefix("revoked:")
+        if reason == "quiet" and exc.result.confirmed == 0:
+            if session.boot_quiet_active():
+                retry_after_s = round(
+                    max(session.boot_quiet_until - time.monotonic(), 0.0), 1
+                )
+            else:
+                retry_after_s = READY_RECONFIRM_RETRY_S
+            return {
+                "ok": False,
+                "error_code": ERROR_AUTOBOOT_QUIET,
+                "selector": session.profile.com,
+                "retry_after_s": retry_after_s,
+                **progress,
+            }
+        return {"ok": False, "error_code": "TRANSFER_TIMEOUT", **progress}
+
     def file_push(
         self,
         selector: str,
@@ -8106,19 +8138,22 @@ class SessionManager:
                 bridge.suspend_interactive()
                 human_suspended = True
             assert transfer_permit is not None
-            with self._operation_permit_context(bridge, transfer_permit):
-                return push_file(
-                    bridge,
-                    local_path,
-                    remote_path,
-                    chunk_size=chunk_size,
-                    timeout_s=effective_timeout_s,
-                    prompt_regex=prompt_regex,
-                    source=source,
-                    ack_mode=ack_mode,
-                    echo_timeout_s=effective_echo_timeout_s,
-                    max_console_line_chars=max_console_line_chars,
-                )
+            try:
+                with self._operation_permit_context(bridge, transfer_permit):
+                    return push_file(
+                        bridge,
+                        local_path,
+                        remote_path,
+                        chunk_size=chunk_size,
+                        timeout_s=effective_timeout_s,
+                        prompt_regex=prompt_regex,
+                        source=source,
+                        ack_mode=ack_mode,
+                        echo_timeout_s=effective_echo_timeout_s,
+                        max_console_line_chars=max_console_line_chars,
+                    )
+            except TxIncompleteError as exc:
+                return self._file_tx_rejected_result(session, exc)
         finally:
             try:
                 if human_suspended:
@@ -8200,16 +8235,19 @@ class SessionManager:
                 bridge.suspend_interactive()
                 human_suspended = True
             assert transfer_permit is not None
-            with self._operation_permit_context(bridge, transfer_permit):
-                return pull_file(
-                    bridge,
-                    remote_path,
-                    local_path,
-                    timeout_s=effective_timeout_s,
-                    prompt_regex=prompt_regex,
-                    source=source,
-                    max_console_line_chars=max_console_line_chars,
-                )
+            try:
+                with self._operation_permit_context(bridge, transfer_permit):
+                    return pull_file(
+                        bridge,
+                        remote_path,
+                        local_path,
+                        timeout_s=effective_timeout_s,
+                        prompt_regex=prompt_regex,
+                        source=source,
+                        max_console_line_chars=max_console_line_chars,
+                    )
+            except TxIncompleteError as exc:
+                return self._file_tx_rejected_result(session, exc)
         finally:
             try:
                 if human_suspended:
