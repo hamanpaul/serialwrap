@@ -74,6 +74,16 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
 - OD-48 第 2 輪實跑（2026-10-29，bundle git revision `2f8f7ed`，`--release-bundle --profile release --version-override 0.4.0`；建映像方式同上）：systemd-user、on-demand 完整流程各 19 項 **PASS**，另以 `--mode systemd-system` 驗「0.3.2 system daemon 執行中直接 `setup --system --with-sudo`」成功路徑 13 項 **PASS**（`systemctl_stop`、`waited_ms` 約 5.2 s、新 daemon 由 setup 啟動、MainPID 為新 daemon、無殘留 drop-in、取樣 1602、0 次重疊）。systemd-system 觀察項：`OBS-0.3.2-SYSTEM-UMASK`（0.3.2 system unit `UMask=0117` 使 daemon 自建目錄缺 x 位元，driver 先以一般 umask 暖機一次 0.3.2 daemon）、`OBS-SYSTEM-PROFILES-MANAGED`（system setup 以套件 profiles 覆寫 `/etc/serialwrap/profiles` 同名檔，0.3.2 同語意）。證據於 `evidence/stage1/upgrade-docker/od48-2f8f7ed/`；同為開發中 bundle，不取代前置條件 #3。
 - OD-48 第 2 輪 sol 修正後重跑（bundle git revision `55cfa03`）：三模式皆 **PASS**（19／19／13 項；`waited_ms` 5351／5214／5311、取樣 1476／1562／1623、0 次重疊）。systemd-system 的套件管理 profile 改為全數保留於快照、只允許覆寫成新 bundle 權威內容（S1-f3c66b4-1）：`/etc/serialwrap/profiles/default.yaml` 記為 `package_updated`。證據於 `evidence/stage1/upgrade-docker/od48-55cfa03/`（`od48-2f8f7ed` 的 systemd-system 判定已被此輪取代）。
 - install.sh 第 2 輪（合入 OD-48 與 release 前置後，2026-10-29，bundle git revision `407ed7e`，bundle 以 `/usr/bin/python3.12` build venv 自建、`py/pyvenv.cfg` 為 `home = /usr/bin`；雲端容器的 apt 以原 HTTP 來源即可建映像，未改來源）：`--mode all` 的 systemd-user、on-demand 完整流程各 19 項 **PASS**（`legacy_stop` 為 `systemctl_stop`／`rpc_daemon_stop`，`waited_ms` 5265／5416，取樣 1522／1590、0 次重疊）；`--mode systemd-system`（`--bundle` 重用同一 bundle，走 pyvenv.cfg 檢查）13 項 **PASS**（`systemctl_stop`、5173 ms、取樣 1573、0 次重疊，`default.yaml` 列 `package_updated`）；`--scenario install-sh` 兩模式各 12 項 **PASS**（取樣 895／951、0 次重疊，`OBS-UPGRADE-NOT-STARTED` 同 §5.1）。五份報告的 `bundle_manifest_sha256`、wheel 雜湊相同；證據與 `SHA256SUMS`、過濾後的 `bundle-pyvenv.txt` 於 `evidence/stage1/upgrade-docker/install-sh-407ed7e/`。同為開發中 bundle（`--version-override 0.4.0`），不取代前置條件 #3。
+- 預熱競態修正後重跑（bundle git revision `a20de1d`，driver 在 stop 後等舊行程樹與 socket 消失）：
+  - `--mode all`：systemd-user、on-demand 各 19 項 **PASS**。
+  - `--mode on-demand` 另以同一 bundle 再跑 2 次，合計連跑 3 次皆 19 項 **PASS**：
+    - `seed_user_data` 的 `stop_wait.waited_ms` 三次皆為 100。0.3.2 `daemon stop` 回應後，舊行程約 0.1 秒才結束，正是原先競態的窗口。
+    - 降級等待約 300 ms，重新升級等待約 200～300 ms。
+    - `legacy_stop` 為 `rpc_daemon_stop`，取樣約 1440、0 次重疊。
+  - `--mode systemd-system` 13 項 **PASS**。
+  - `--scenario install-sh` 兩模式各 12 項 **PASS**。
+  - 7 份報告的 `bundle_manifest_sha256` 與 wheel 雜湊相同。證據於 `evidence/stage1/upgrade-docker/install-sh-a20de1d/`，含 `on-demand-run2`／`on-demand-run3`；driver 修正前的判定由 `install-sh-407ed7e` 取代。
+  - 同為開發中 bundle，不取代前置條件 #3。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 
