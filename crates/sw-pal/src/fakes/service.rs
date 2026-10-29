@@ -60,6 +60,8 @@ pub struct FakeServiceCtl {
     hard_stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
     start_spawn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
     enabled_query: Mutex<Option<EnabledQuery>>,
+    stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
+    stop_signal: Arc<AtomicBool>,
     main_pids: Mutex<std::collections::BTreeMap<String, Result<Option<u32>, String>>>,
 }
 
@@ -161,6 +163,16 @@ impl FakeServiceCtl {
             .unwrap_or_else(|error| error.into_inner()) = restart;
     }
 
+    /// OD-48 D4：`action(Stop)`（systemctl stop）時停止的測試 RPC endpoint（與 hard stop 分開設定）。
+    pub fn stop_rpc_on_stop(&self, rpc: Arc<super::rpc::FakeRpcConnector>, endpoint: &str) {
+        *self.stop_rpc.lock().unwrap_or_else(|e| e.into_inner()) = Some((rpc, endpoint.to_string()));
+    }
+
+    /// 是否曾執行 `action(Stop)` 的共享旗標（供行程替身判定監管停止後的存活）。
+    pub fn stop_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_signal)
+    }
+
     /// OD-48 D8：之後 `query_enabled` 回傳此結果（未設定時回 `NotSupported`，沿用 `query` 映射）。
     pub fn set_enabled_query(&self, query: Option<EnabledQuery>) {
         *self.enabled_query.lock().unwrap_or_else(|e| e.into_inner()) = query;
@@ -203,6 +215,17 @@ impl FakeServiceCtl {
                 "set_enabled:true" => m.enabled = Some(true),
                 "set_enabled:false" => m.enabled = Some(false),
                 _ => {}
+            }
+        }
+        if action == "stop" {
+            self.stop_signal.store(true, Ordering::SeqCst);
+            if let Some((rpc, endpoint)) = self
+                .stop_rpc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                rpc.stop_endpoint(endpoint);
             }
         }
         if action == "hard_stop" {

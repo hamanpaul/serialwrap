@@ -106,12 +106,12 @@ fn fake_proc(root: &std::path::Path, pid: u32, ppid: u32, uid: u32, argv: &[&str
 #[test]
 fn posix_proc_details_reads_ppid_uid_exe_argv_and_start_ticks() {
     let tmp = tempfile::tempdir().unwrap();
-    fake_proc(tmp.path(), 4242, 1, 1000, &["/usr/bin/python3", "/home/a/.local/bin/serialwrapd", "--socket", "/run/u/s.sock"], "/usr/bin/python3.12");
+    fake_proc(tmp.path(), 4242, 1, 1000, &["/usr/bin/python3", "/opt/a/.local/bin/serialwrapd", "--socket", "/run/u/s.sock"], "/usr/bin/python3.12");
     let details = PosixProcScan::with_root(tmp.path()).proc_details(4242).expect("details");
     assert_eq!(details.ppid, Some(1));
     assert_eq!(details.uid, Some(1000));
     assert_eq!(details.exe.as_deref(), Some("/usr/bin/python3.12"));
-    assert_eq!(details.argv[1], "/home/a/.local/bin/serialwrapd");
+    assert_eq!(details.argv[1], "/opt/a/.local/bin/serialwrapd");
     assert_eq!(details.start_ticks, Some(5242));
     assert!(PosixProcScan::with_root(tmp.path()).proc_details(9999).is_none());
 }
@@ -142,7 +142,7 @@ fn python_interpreter_detection() {
     for yes in ["/usr/bin/python3", "/usr/bin/python3.12", "/opt/py/bin/python", "C:\\Python312\\python.exe", "pythonw3"] {
         assert_eq!(is_python_interpreter(yes), !yes.ends_with("pythonw3"), "{yes}");
     }
-    for no in ["/usr/bin/serialwrapd", "/home/a/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd", "/usr/bin/pythonista", ""] {
+    for no in ["/usr/bin/serialwrapd", "/opt/a/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd", "/usr/bin/pythonista", ""] {
         assert!(!is_python_interpreter(no), "{no}");
     }
 }
@@ -151,8 +151,8 @@ fn python_interpreter_detection() {
 fn python_daemon_script_detection() {
     let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     assert_eq!(
-        python_daemon_script(&argv(&["/usr/bin/python3", "/home/a/.local/bin/serialwrapd", "--socket", "x"]), ArgvFlavor::Posix),
-        Some(Some("/home/a/.local/bin/serialwrapd".into()))
+        python_daemon_script(&argv(&["/usr/bin/python3", "/opt/a/.local/bin/serialwrapd", "--socket", "x"]), ArgvFlavor::Posix),
+        Some(Some("/opt/a/.local/bin/serialwrapd".into()))
     );
     assert_eq!(python_daemon_script(&argv(&["python3", "-m", "sw_core.daemon"]), ArgvFlavor::Posix), Some(None));
     assert_eq!(

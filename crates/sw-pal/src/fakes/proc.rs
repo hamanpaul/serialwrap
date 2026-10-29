@@ -28,6 +28,16 @@ struct ConnectGate {
     kind: GateKind,
 }
 
+/// 以閉包判定存活的閘門（OD-48：0.3.x daemon 在 stop 後延遲結束、被重拉等情境）。
+#[derive(Clone)]
+pub struct AliveFn(pub Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for AliveFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AliveFn")
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FakeProcScan {
     base: Mutex<Vec<DaemonProc>>,
@@ -40,6 +50,7 @@ pub struct FakeProcScan {
     replacement: Mutex<Option<(Arc<super::clock::FakeClock>, u64, u32, DaemonProc)>>,
     rpc_relaunch: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
     details: Mutex<BTreeMap<u32, ProcDetails>>,
+    alive_fns: Mutex<BTreeMap<u32, AliveFn>>,
     current_uid: Mutex<Option<u32>>,
     uart_holders: Mutex<Option<Vec<(Vec<u32>, HolderScanStatus)>>>,
 }
@@ -55,6 +66,11 @@ impl FakeProcScan {
     /// 之後的 `serialwrapd_instances` 依序回傳這些清單；用盡後回到基底清單。
     pub fn script(&self, seq: Vec<Vec<DaemonProc>>) {
         *self.script.lock().unwrap_or_else(|e| e.into_inner()) = seq;
+    }
+
+    /// 在基底清單加入一個 serialwrapd 實例（OD-48：其他同 uid／他 uid daemon）。
+    pub fn add_instance(&self, daemon: DaemonProc) {
+        self.base.lock().unwrap_or_else(|e| e.into_inner()).push(daemon);
     }
 
     /// 之後的 `serialwrapd_instances` 一律失敗。
@@ -109,6 +125,9 @@ impl FakeProcScan {
 
     /// 非消耗性查詢：`pid` 是否已由連線閘門判定為不存活（不推進任何腳本序列）。
     fn gate_says_gone(&self, pid: u32) -> bool {
+        if let Some(alive) = self.alive_fn(pid) {
+            return !alive;
+        }
         match self
             .gates
             .lock()
@@ -118,6 +137,24 @@ impl FakeProcScan {
             Some(g) => !Self::gate_alive(g),
             None => false,
         }
+    }
+
+    /// OD-48：`pid` 的存活改由 `alive` 判定（優先於其他閘門與存活腳本；不在基底清單者亦適用）。
+    pub fn alive_while(&self, pid: u32, alive: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.alive_fns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pid, AliveFn(alive));
+    }
+
+    fn alive_fn(&self, pid: u32) -> Option<bool> {
+        let gate = self
+            .alive_fns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .cloned()?;
+        Some((gate.0)())
     }
 
     /// OD-48：登記 `proc_details(pid)` 的回應（行程仍存活時才回傳，見 `proc_details`）。
@@ -254,6 +291,9 @@ impl ProcScan for FakeProcScan {
 
     fn pid_alive(&self, pid: u32) -> bool {
         self.apply_replacement();
+        if let Some(alive) = self.alive_fn(pid) {
+            return alive;
+        }
         if let Some(gate) = self
             .gates
             .lock()

@@ -50,6 +50,11 @@ fn crash_if(point: &str) {
     }
 }
 
+/// OD-48 legacy 停止專用的中斷注入點（`legacy_stop:*`；另立清單，不屬凍結的 CRASH_POINTS 迴圈）。
+pub(crate) fn legacy_crash_if(point: &str) {
+    crash_if(point);
+}
+
 /// 開發 bundle 的環境變數屏障；正式 bundle 會編譯成無操作。
 #[cfg(feature = "test-fakes")]
 pub(crate) fn test_pause_after(point: &str) {
@@ -584,6 +589,14 @@ pub struct Journal {
     pub backup_dir: Option<String>,
     pub backup_manifest_sha256: Option<String>,
     pub target_autostart: Option<AutostartPlan>,
+    /// OD-48 D3.5：legacy 擷取檔的 sha256 與停止進度（`captured`／`stop_sent`／`stopped`）。
+    pub legacy: Option<LegacyJournal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyJournal {
+    pub sha256: String,
+    pub stage: String,
 }
 
 pub fn write_journal(ctx: &CliCtx, root: &InstallRoot, j: &Journal) -> Result<(), LayoutError> {
@@ -702,7 +715,7 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         Err(error) => return Some(recovery_error("unknown", ErrorCode::InternalError.as_str(), "journal_corrupt", error.to_string())),
     };
     let from_step = parsed.get("step").and_then(as_str).unwrap_or("unknown").to_string();
-    let journal = match parse_journal(&parsed) {
+    let mut journal = match parse_journal(&parsed) {
         Ok(journal) => journal,
         Err(message) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "journal_corrupt", message)),
     };
@@ -710,7 +723,8 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         return finish_recovery(ctx, root, &journal_path, &journal, false, PyDict::new());
     }
 
-    let original = match journal.original.as_ref() {
+    let original_owned = journal.original.clone();
+    let original = match original_owned.as_ref() {
         Some(original) => original,
         None => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "journal_corrupt", "snapshot_taken 之後的 journal 缺少 original")),
     };
@@ -720,6 +734,24 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
     if let Err((reason, message)) = verify_snapshot(ctx, &journal) {
         return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), reason, message));
     }
+    // OD-48 D5：legacy 停止中斷後，先確認擷取的 pid＋start_ticks 已結束，再依 D6 還原（不重啟任何 daemon）。
+    let legacy_capture = match read_legacy_capture(ctx, root, &journal) {
+        Ok(capture) => capture,
+        Err(message) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "legacy_capture_mismatch", message)),
+    };
+    let mut legacy_stopped = false;
+    if let Some(capture) = legacy_capture.as_ref() {
+        let alive = crate::legacy_handoff::captured_alive(ctx, capture);
+        let stop_sent = journal.legacy.as_ref().is_some_and(|legacy| legacy.stage != "captured");
+        if !alive.is_empty() && stop_sent {
+            let mut report = recovery_error(&from_step, ErrorCode::Timeout.as_str(), "legacy_stop_pending", "舊 daemon 停止後仍未結束；保留 journal 與自動啟動 hold，未重啟任何 daemon");
+            report.detail.insert("pids", PyValue::List(alive.iter().map(|pid| PyValue::Int(PyInt::Small(i128::from(*pid)))).collect()));
+            return Some(report);
+        }
+        // 擷取後、stop 送出前中斷且舊 daemon 仍在跑：沿用現行補償（撤銷 hold），舊 daemon 繼續服務。
+        legacy_stopped = alive.is_empty();
+    }
+    let legacy_argv = legacy_capture.as_ref().map(crate::legacy_handoff::captured_argv).unwrap_or_default();
 
     let pre_switch = matches!(journal.step,
         JournalStep::SnapshotTaken | JournalStep::StopSupervisor | JournalStep::ConfirmReleased |
@@ -770,7 +802,8 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
             }
             ctx.autostart_lock.take();
         }
-        let restored = match verify_restored(ctx, root, original, original.daemon.is_some(), false) {
+        // legacy daemon 不以 bundle 版本驗證（它本來就是 0.3.x）。
+        let restored = match verify_restored(ctx, root, original, original.daemon.is_some() && legacy_capture.is_none(), false) {
             Ok(value) => value,
             Err(message) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "restore_verify_failed", message)),
         };
@@ -784,7 +817,12 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         && original.autostart.kind != AutostartHoldKind::NoSupervisor
         && ctx.p.service.autostart_hold_state(&recovery_mode) == HoldState::Held)
         .then(|| hold_record_from_plan(original));
-    let (recovery_handoff, recovery_target_hold) = match stop_for_revert_with_hold(ctx, &recovery_mode, endpoint, false, "install_recover", reusable_hold) {
+    let stop_result = {
+        let mut persist = JournalPersist::new(root, &mut journal);
+        let legacy = legacy_capture.is_some().then_some(&mut persist);
+        stop_for_revert_with_hold(ctx, &recovery_mode, endpoint, false, "install_recover", reusable_hold, legacy)
+    };
+    let (recovery_handoff, recovery_target_hold) = match stop_result {
         Ok(RevertStop::Stopped { token, hold, .. }) => {
             (Some(token), hold)
         }
@@ -806,7 +844,7 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
     if let Err(message) = restore_original(ctx, root, &journal, backup.as_deref()) {
         return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "restore_failed", message));
     }
-    let restored = match restore_supervisor_and_daemon(ctx, root, original, backup.as_deref(), recovery_handoff.as_deref(), recovery_target_hold.as_ref(), false) {
+    let restored = match restore_supervisor_and_daemon(ctx, root, original, backup.as_deref(), recovery_handoff.as_deref(), recovery_target_hold.as_ref(), false, legacy_capture.is_some()) {
         Ok(value) => value,
         Err(message) => {
             if let Some(message) = message.strip_prefix("AUTOSTART_RELEASE_FAILED:") {
@@ -819,6 +857,9 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
     let mut completed = finish_recovery(ctx, root, &journal_path, &journal, backup.is_some(), restored)?;
     if let Some(status) = holders_status {
         completed.detail.insert("holders_status", str_value(status));
+    }
+    if legacy_stopped {
+        crate::legacy_handoff::annotate_failure(&mut completed.detail, true, completed.ok, &original.supervisor.mode, &legacy_argv);
     }
     Some(completed)
 }
@@ -837,7 +878,7 @@ pub fn stop_for_revert(
     with_sudo: bool,
     phase: &'static str,
 ) -> Result<RevertStop, StopFailure> {
-    stop_for_revert_with_hold(ctx, mode, endpoint, with_sudo, phase, None)
+    stop_for_revert_with_hold(ctx, mode, endpoint, with_sudo, phase, None, None)
 }
 
 fn stop_for_revert_with_hold(
@@ -847,6 +888,7 @@ fn stop_for_revert_with_hold(
     with_sudo: bool,
     phase: &'static str,
     existing_hold: Option<AutostartHoldRecord>,
+    legacy: Option<&mut JournalPersist<'_>>,
 ) -> Result<RevertStop, StopFailure> {
     let state = ctx.p.service.query(mode);
     let enabled = supervisor_enabled(ctx, mode, &state).unwrap_or_else(|_| mode_enabled(&state));
@@ -907,6 +949,21 @@ fn stop_for_revert_with_hold(
             hold: report.hold,
         }),
         Err(error) => {
+            // OD-48 D2：回退／recover 遇到 legacy daemon（例如被 minicom_router 重拉）以同一套 D3～D5 停止。
+            if let Some(persist) = legacy.filter(|_| crate::legacy_handoff::is_method_not_found(&error)) {
+                let refusal = graceful_stop::take_last_handoff_refusal(endpoint);
+                let versions = persist.root.versions.clone();
+                if let Ok(daemon) = crate::legacy_handoff::identify(ctx, endpoint, refusal.as_ref(), &versions) {
+                    let id = DaemonIdentity { pid: Some(daemon.pid), tree: daemon.tree.clone(), known: true };
+                    match crate::legacy_handoff::stop(ctx, daemon, mode, with_sudo, &versions, persist) {
+                        Ok(_) => return Ok(RevertStop::Stopped { token: String::new(), graceful: true, hold: error.hold().cloned() }),
+                        Err(crate::legacy_handoff::LegacyFailure::AfterStop { pending: true, .. }) => {
+                            return Err(StopFailure::Timeout { phase, id, ran: Vec::new() });
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
             if !matches!(error.cause(), StopFailure::Timeout { .. }) {
                 if let Some(hold) = error.hold() {
                     let _ = ctx.p.service.release_autostart(hold, enabled, with_sudo);
@@ -1254,6 +1311,7 @@ fn execute_change_with_restore(
         op: op.to_string(), from: from.clone(), to: manifest.bundle_version.clone(), step: JournalStep::Lock,
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().to_string(),
         original: None, snapshot_dir: None, snapshot_sha256: None, backup_dir: None, backup_manifest_sha256: None, target_autostart: None,
+        legacy: None,
     };
     if let Err(error) = write_journal(ctx, &root, &journal) {
         let failed = journal_failure(report, StepName::Lock, "lock", error);
@@ -1365,10 +1423,13 @@ fn execute_change_with_restore(
     journal.step = JournalStep::StopSupervisor;
     if let Err(error) = write_journal(ctx, &root, &journal) { return journal_failure(report, StepName::StopSupervisor, "stop_supervisor", error); }
     crash_if("stop_supervisor:before_effect");
-    let (mut held, initial_handoff_chain) = match stop_supervisor(ctx, &old_mode, &endpoint, with_sudo, daemon.as_ref(), original.supervisor.enabled, &mut journal, &root) {
-        Ok((held, detail, chain)) => {
+    let (mut held, initial_handoff_chain, legacy_stopped) = match stop_supervisor(ctx, &old_mode, &endpoint, with_sudo, daemon.as_ref(), original.supervisor.enabled, &mut journal, &root) {
+        Ok((held, detail, chain, legacy)) => {
             add_step(&mut report, StepName::StopSupervisor, true, detail);
-            (held, chain)
+            if let Some(legacy) = legacy.as_ref() {
+                report.detail.insert("legacy_stop", legacy.value());
+            }
+            (held, chain, legacy)
         }
         Err((failure, keep_journal)) => {
             fail_report(&mut report, StepName::StopSupervisor, failure);
@@ -1394,6 +1455,7 @@ fn execute_change_with_restore(
         Err(failure) => {
             fail_report(&mut report, StepName::ConfirmReleased, failure);
             release_held(ctx, &mut held, original.supervisor.enabled);
+            annotate_legacy(&mut report, legacy_stopped.as_ref(), &old_mode, true);
             drop(lock);
             return report;
         }
@@ -1411,6 +1473,7 @@ fn execute_change_with_restore(
             let mut failed = layout_failure(op, from.clone(), manifest.bundle_version.clone(), StepName::BackupAndSwitch, "update_journal", error);
             failed.reason = Some("journal_write_failed".into());
             release_held(ctx, &mut held, original.supervisor.enabled);
+            annotate_legacy(&mut failed, legacy_stopped.as_ref(), &old_mode, true);
             return failed;
         }
     };
@@ -1440,6 +1503,7 @@ fn execute_change_with_restore(
         let failure = stop_failure_to_op(&error, "update_confirm_released", &backup_handoff_chain);
         fail_report(&mut report, StepName::ConfirmReleased, failure);
         release_held(ctx, &mut held, original.supervisor.enabled);
+        annotate_legacy(&mut report, legacy_stopped.as_ref(), &old_mode, true);
         clear_journal(ctx, &root, &journal);
         drop(lock);
         return report;
@@ -1534,8 +1598,9 @@ fn execute_change_with_restore(
             old_mode: old_mode.clone(),
             target_mode: target_mode.clone(),
             home: home.clone(),
-            daemon_running: daemon.is_some(),
-            daemon_id: daemon.as_ref().map(|snapshot| snapshot.id.clone()).unwrap_or_default(),
+            // OD-48 D2：legacy 已停止 → 以「已停止」狀態呼叫，不得再走舊停止路徑。
+            daemon_running: daemon.is_some() && legacy_stopped.is_none(),
+            daemon_id: if legacy_stopped.is_some() { Default::default() } else { daemon.as_ref().map(|snapshot| snapshot.id.clone()).unwrap_or_default() },
             old_endpoint: endpoint.clone(),
             any_flashing: false,
             with_sudo,
@@ -1543,7 +1608,7 @@ fn execute_change_with_restore(
             hold_target: true,
             socket_path: Some(socket_path),
             config_path: endpoint_resolve::config_write_path(ctx),
-            old_stop: crate::setup_cmd::OldStop::Reconcile,
+            old_stop: if legacy_stopped.is_some() { crate::setup_cmd::OldStop::AlreadyStopped } else { crate::setup_cmd::OldStop::Reconcile },
         };
         let setup_result = match crate::setup_cmd::reconcile(ctx, &setup_req) {
             Ok(result) => result,
@@ -1667,6 +1732,20 @@ fn execute_change_with_restore(
             return report;
         }
     }
+    if let Some(legacy) = legacy_stopped.as_ref() {
+        // OD-48 D5：實際 start 之前的最後閘門以 D3 基準差分判定（不只比對 target socket）。
+        let unexpected = match ctx.p.procs.serialwrapd_instances() {
+            Ok(daemons) => daemons.into_iter().filter(|daemon| !legacy.other_uid.contains(&daemon.pid)).map(|daemon| daemon.pid).collect::<Vec<_>>(),
+            Err(_) => vec![0],
+        };
+        if !unexpected.is_empty() {
+            let mut detail = PyDict::new();
+            detail.insert("pids", PyValue::List(unexpected.iter().filter(|pid| **pid != 0).map(|pid| PyValue::Int(PyInt::Small(i128::from(*pid)))).collect()));
+            detail.insert("holder_unknown", PyValue::Bool(unexpected.contains(&0)));
+            let failure = OpFailure { code: ErrorCode::DeviceStillHeld.as_str(), phase: "update_start_and_verify", reason: Some("relaunched_before_start"), message: Some("舊 daemon 停止後、啟動新版前出現新的 serialwrapd；拒絕啟動".into()), detail };
+            return revert_after_failure(ctx, root, journal, original, backup, report, StepName::StartAndVerify, failure, &mut held, with_sudo, target_mode);
+        }
+    }
     let started = start_and_verify(ctx, &root, target_mode, &target_endpoint, original.daemon.is_some(), original.daemon.is_some(), &manifest, with_sudo, original.daemon.as_ref());
     crash_if("start_and_verify:started");
     test_pause_after("start_and_verify:started");
@@ -1739,10 +1818,12 @@ fn release_held_checked(
     }
 }
 
+type StopSupervisorOk = (HeldAutostart, PyDict, Vec<HandoffLink>, Option<crate::legacy_handoff::LegacyStopped>);
+
 fn stop_supervisor(
     ctx: &mut CliCtx<'_>, mode: &SupervisionMode, endpoint: &str, with_sudo: bool,
     daemon: Option<&DaemonSnapshot>, enabled: Option<bool>, journal: &mut Journal, root: &InstallRoot,
-) -> Result<(HeldAutostart, PyDict, Vec<HandoffLink>), (OpFailure, bool)> {
+) -> Result<StopSupervisorOk, (OpFailure, bool)> {
     let hold_plan = journal.original.as_ref().map(hold_record_from_plan);
     let hold = if mode == &SupervisionMode::OnDemand {
         AutostartHoldRecord {
@@ -1802,7 +1883,7 @@ fn stop_supervisor(
         }
         detail.insert("handoff", str_value("not_requested"));
         detail.insert("autostart_hold", autostart_record_value(&held.record, enabled));
-        return Ok((held, detail, chain));
+        return Ok((held, detail, chain, None));
     };
     match stop {
         Ok(report) => {
@@ -1816,7 +1897,16 @@ fn stop_supervisor(
                 ("token".into(), str_value(link.token.clone())),
             ]))).collect()));
             if let Some(record) = report.hold { held.record = record; }
-            Ok((held, detail, chain))
+            Ok((held, detail, chain, None))
+        }
+        Err(error) if journal.op != "rollback" && crate::legacy_handoff::is_method_not_found(&error) => {
+            // OD-48 D1／D2：install／update 遇到不支援交接的舊 daemon；判定成立才走舊版停止路徑，否則維持 fail-closed。
+            if let Some(record) = error.hold() { held.record = record.clone(); }
+            let refusal = graceful_stop::take_last_handoff_refusal(endpoint);
+            match crate::legacy_handoff::identify(ctx, endpoint, refusal.as_ref(), &root.versions) {
+                Ok(legacy) => stop_legacy_daemon(ctx, mode, with_sudo, enabled, journal, root, held, legacy),
+                Err(_) => Err(refuse_handoff_failure(ctx, &error, &mut held, enabled)),
+            }
         }
         Err(error) => {
             let timeout = matches!(error.cause(), StopFailure::Timeout { .. });
@@ -1838,6 +1928,64 @@ fn stop_supervisor(
                 release_held(ctx, &mut held, enabled);
             }
             Err((failure, timeout))
+        }
+    }
+}
+
+/// 交接被拒的既有 fail-closed（撤銷 hold；舊 daemon 仍在跑）。
+fn refuse_handoff_failure(ctx: &mut CliCtx<'_>, error: &StopFailure, held: &mut HeldAutostart, enabled: Option<bool>) -> (OpFailure, bool) {
+    let failure = stop_failure_to_op(error, "update_safety_check", error.chain());
+    release_held(ctx, held, enabled);
+    (failure, false)
+}
+
+/// OD-48 D3～D5：在既有 hold 之下停止 0.3.x daemon；D6 失敗語意（不重啟任何 daemon）。
+#[allow(clippy::too_many_arguments)]
+fn stop_legacy_daemon(
+    ctx: &mut CliCtx<'_>,
+    mode: &SupervisionMode,
+    with_sudo: bool,
+    enabled: Option<bool>,
+    journal: &mut Journal,
+    root: &InstallRoot,
+    mut held: HeldAutostart,
+    legacy: crate::legacy_handoff::LegacyDaemon,
+) -> Result<StopSupervisorOk, (OpFailure, bool)> {
+    use crate::legacy_handoff::LegacyFailure;
+    let fallback_argv = legacy.details.argv.clone();
+    let mut persist = JournalPersist::new(root, journal);
+    let result = crate::legacy_handoff::stop(ctx, legacy, mode, with_sudo, &root.versions, &mut persist);
+    let argv = { let argv = persist.argv(); if argv.is_empty() { fallback_argv } else { argv } };
+    match result {
+        Ok(stopped) => {
+            let mut detail = PyDict::new();
+            detail.insert("autostart_hold", autostart_record_value(&held.record, enabled));
+            detail.insert("graceful", PyValue::Bool(true));
+            detail.insert("handoff", str_value("legacy_stopped"));
+            detail.insert("handoff_chain", PyValue::List(Vec::new()));
+            detail.insert("legacy_stop", stopped.value());
+            Ok((held, detail, Vec::new(), Some(stopped)))
+        }
+        Err(LegacyFailure::Refused { code, reason, message, mut detail }) => {
+            // 送出 stop 之前拒絕：沿用現行補償（撤銷 hold），舊 daemon 仍在跑。
+            detail.insert("legacy_daemon_stopped", PyValue::Bool(false));
+            let phase = if reason == "journal_write_failed" { "update_journal" } else { "update_safety_check" };
+            release_held(ctx, &mut held, enabled);
+            Err((OpFailure { code, phase, reason: Some(reason), message: Some(message), detail }, false))
+        }
+        Err(LegacyFailure::AfterStop { code, reason, message, mut detail, pending: true, .. }) => {
+            // D5 逾時：hold 與 journal 保留，不重啟任何 daemon；下一次 setup 的 recover_journal 先確認舊行程已結束。
+            detail.insert("legacy_daemon_stopped", PyValue::Bool(false));
+            detail.insert("restored", PyValue::Bool(false));
+            detail.insert("journal_kept", PyValue::Bool(true));
+            Err((OpFailure { code, phase: "update_confirm_released", reason: Some(reason), message: Some(message), detail }, true))
+        }
+        Err(LegacyFailure::AfterStop { code, reason, message, mut detail, stopped, .. }) => {
+            // 已送出 stop、尚未切換：安裝狀態未動，只撤銷 hold（release 不觸發 start），不重啟任何 daemon。
+            let restore_enabled = hold_prior_enabled(&held, enabled);
+            let restored = release_held_checked(ctx, &mut held, restore_enabled).is_ok();
+            crate::legacy_handoff::annotate_failure(&mut detail, stopped, restored, mode, &argv);
+            Err((OpFailure { code, phase: "update_confirm_released", reason: Some(reason), message: Some(message), detail }, false))
         }
     }
 }
@@ -2134,7 +2282,21 @@ fn revert_after_failure(
         .then(|| held.record.clone());
     // S1X-c-1：新 daemon 在目標模式的 endpoint；回退先停它，再確認原 endpoint 也已釋放。
     let revert_endpoint = crate::endpoint_resolve::target_instance_endpoint(ctx, target_mode, &original.supervisor.mode, &original.supervisor.endpoint);
-    match stop_for_revert_with_hold(ctx, target_mode, &revert_endpoint, with_sudo, "update_revert", reusable_hold) {
+    // OD-48 修訂：legacy daemon 已被停止 → 還原安裝狀態但不重啟任何 daemon，報告附啟動指令。
+    let legacy_argv = journal.legacy.is_some().then(|| read_legacy_capture(ctx, &root, &journal).ok().flatten()
+        .map(|capture| crate::legacy_handoff::captured_argv(&capture)).unwrap_or_default());
+    let stop_result = {
+        let mut persist = JournalPersist::new(&root, &mut journal);
+        let legacy = legacy_argv.is_some().then_some(&mut persist);
+        stop_for_revert_with_hold(ctx, target_mode, &revert_endpoint, with_sudo, "update_revert", reusable_hold, legacy)
+    };
+    let legacy_note = |report: &mut UpdateReport| {
+        if let Some(argv) = legacy_argv.as_ref() {
+            let restored = report.reverted;
+            crate::legacy_handoff::annotate_failure(&mut report.detail, true, restored, &original.supervisor.mode, argv);
+        }
+    };
+    match stop_result {
         Ok(RevertStop::Deferred(error)) => {
             let recovery = recovery_deferred("start_and_verify", error, ctx, &revert_endpoint, "update_revert");
             report.revert_pending = true;
@@ -2143,6 +2305,7 @@ fn revert_after_failure(
             failure_doc.insert("revert_error", PyValue::Dict(recovery.detail));
             let _ = write_json(ctx, &failure_path, &PyValue::Dict(failure_doc));
             release_held(ctx, held, original.supervisor.enabled);
+            legacy_note(&mut report);
             return report;
         }
         Err(error) => {
@@ -2153,6 +2316,7 @@ fn revert_after_failure(
             failure_doc.insert("revert_error", PyValue::Dict(recovery.detail));
             let _ = write_json(ctx, &failure_path, &PyValue::Dict(failure_doc));
             release_held(ctx, held, original.supervisor.enabled);
+            legacy_note(&mut report);
             return report;
         }
         Ok(RevertStop::Absent { hold }) => target_hold = hold,
@@ -2173,19 +2337,21 @@ fn revert_after_failure(
             report.revert_error = Some(detail.clone());
             failure_doc.insert("revert_error", PyValue::Dict(detail));
             let _ = write_json(ctx, &failure_path, &PyValue::Dict(failure_doc));
+            legacy_note(&mut report);
             return report;
         }
     };
     journal.step = JournalStep::RevertToPrevious;
     if write_journal(ctx, &root, &journal).is_err() {
         report.revert_pending = true;
+        legacy_note(&mut report);
         return report;
     }
     crash_if("revert_to_previous:before_effect");
     let backup_used = backup.dir.as_path();
     let restore_result = restore_original(ctx, &root, &journal, Some(backup_used));
     if restore_result.is_ok() {
-        match restore_supervisor_and_daemon(ctx, &root, &original, Some(backup_used), None, target_hold.as_ref(), with_sudo) {
+        match restore_supervisor_and_daemon(ctx, &root, &original, Some(backup_used), None, target_hold.as_ref(), with_sudo, legacy_argv.is_some()) {
             Ok(mut measured) => {
                 if let Some(status) = holders_status {
                     measured.insert("holders_status", str_value(status));
@@ -2201,6 +2367,7 @@ fn revert_after_failure(
                 failure_doc.insert("revert_error", PyValue::Dict(detail.clone()));
                 let _ = write_json(ctx, &failure_path, &PyValue::Dict(failure_doc));
                 report.revert_error = Some(detail);
+                legacy_note(&mut report);
                 return report;
             }
         }
@@ -2208,6 +2375,7 @@ fn revert_after_failure(
         report.revert_pending = true;
         report.revert_error = Some(PyDict::from_pairs(vec![("message".into(), str_value(restore_result.unwrap_err()))]));
     }
+    legacy_note(&mut report);
     let _ = with_sudo;
     crash_if("revert_to_previous:after_effect");
     report
@@ -2401,6 +2569,8 @@ fn journal_failure(mut report: UpdateReport, step: StepName, journal_step: &'sta
 fn clear_journal(ctx: &CliCtx<'_>, root: &InstallRoot, _journal: &Journal) {
     let path = root.root.join("install-journal.json");
     if ctx.p.fs.exists(&path) { let _ = ctx.p.fs.remove_file(&path); }
+    let capture = legacy_capture_path(root);
+    if ctx.p.fs.exists(&capture) { let _ = ctx.p.fs.remove_file(&capture); }
     let snapshot = root.root.join("install-journal.snapshot");
     if ctx.p.fs.exists(&snapshot) { let _ = ctx.p.fs.remove_tree(&snapshot); }
     let _ = ctx.p.fs.sync_dir(&root.root);
@@ -2734,6 +2904,10 @@ fn parse_journal(value: &PyDict) -> Result<Journal, String> {
             Some(target) => Some(parse_autostart_plan(target)?),
             None => None,
         },
+        legacy: match dict_value(value.get("legacy")) {
+            Some(legacy) => Some(LegacyJournal { sha256: string_field(legacy, "sha256")?, stage: string_field(legacy, "stage")? }),
+            None => None,
+        },
     })
 }
 
@@ -2918,6 +3092,12 @@ fn finish_recovery(
             return Some(recovery_error(journal.step.as_str(), ErrorCode::InternalError.as_str(), "snapshot_cleanup_failed", error.py_message));
         }
     }
+    let capture = legacy_capture_path(root);
+    if ctx.p.fs.exists(&capture) {
+        if let Err(error) = ctx.p.fs.remove_file(&capture) {
+            return Some(recovery_error(journal.step.as_str(), ErrorCode::InternalError.as_str(), "snapshot_cleanup_failed", error.py_message));
+        }
+    }
     let _ = ctx.p.fs.sync_dir(&root.root);
     Some(RecoveryReport {
         ok: true,
@@ -3098,6 +3278,7 @@ fn restore_supervisor_and_daemon(
     _handoff: Option<&str>,
     target_hold: Option<&AutostartHoldRecord>,
     with_sudo: bool,
+    no_restart: bool,
 ) -> Result<PyDict, String> {
     let registration_dir = backup.map(Path::to_path_buf).unwrap_or_else(|| journal_snapshot_path(root));
     restore_registration(ctx, &registration_dir, &original.supervisor).map_err(|error| error.to_string())?;
@@ -3139,7 +3320,9 @@ fn restore_supervisor_and_daemon(
             if records.iter().any(|record| record.rc != 0) { return Err("監管 enabled 狀態還原失敗".into()); }
         }
     }
-    verify_restored(ctx, root, original, original.daemon.is_some(), original.daemon.is_some())
+    // OD-48 修訂：legacy daemon 已停止時只還原安裝狀態，不啟動任何 daemon。
+    let restart = original.daemon.is_some() && !no_restart;
+    verify_restored(ctx, root, original, restart, restart)
 }
 
 fn hold_record_from_plan(original: &OriginalSnapshot) -> AutostartHoldRecord {
@@ -3603,7 +3786,88 @@ fn journal_value(journal: &Journal) -> PyValue {
     value.insert("step", str_value(journal.step.as_str().to_string()));
     value.insert("target_autostart", journal.target_autostart.as_ref().map(autostart_value).unwrap_or(PyValue::Null));
     value.insert("to", str_value(journal.to.clone()));
+    if let Some(legacy) = journal.legacy.as_ref() {
+        // 只在 legacy 路徑出現，既有 journal 位元組不變。
+        value.insert("legacy", PyValue::Dict(PyDict::from_pairs(vec![
+            ("sha256".into(), str_value(legacy.sha256.clone())),
+            ("stage".into(), str_value(legacy.stage.clone())),
+        ])));
+    }
     PyValue::Dict(value)
+}
+
+fn legacy_capture_path(root: &InstallRoot) -> PathBuf {
+    root.root.join(crate::legacy_handoff::CAPTURE_FILE)
+}
+
+/// OD-48 D3.5：擷取檔讀取並核對 journal 記錄的 sha256。
+fn read_legacy_capture(ctx: &CliCtx<'_>, root: &InstallRoot, journal: &Journal) -> Result<Option<PyDict>, String> {
+    let Some(legacy) = journal.legacy.as_ref() else { return Ok(None); };
+    let path = legacy_capture_path(root);
+    let bytes = ctx.p.fs.read(&path).map_err(|error| format!("legacy 擷取檔無法讀取：{}", error.py_message))?;
+    if sha256_hex(&bytes) != legacy.sha256 {
+        return Err("legacy 擷取檔的 SHA-256 與 journal 不符".into());
+    }
+    match pyjson::loads(&String::from_utf8_lossy(&bytes)) {
+        Ok(PyValue::Dict(capture)) => Ok(Some(capture)),
+        _ => Err("legacy 擷取檔格式無效".into()),
+    }
+}
+
+/// OD-48 D3.5：`install-journal.legacy.json` 與 journal 的寫入（送 stop 之前完成並 fsync）。
+pub(crate) struct JournalPersist<'a> {
+    root: &'a InstallRoot,
+    journal: &'a mut Journal,
+    records: Option<Vec<PyValue>>,
+}
+
+impl<'a> JournalPersist<'a> {
+    fn new(root: &'a InstallRoot, journal: &'a mut Journal) -> Self {
+        Self { root, journal, records: None }
+    }
+
+    fn argv(&self) -> Vec<String> {
+        let capture = PyDict::from_pairs(vec![("daemons".into(), PyValue::List(self.records.clone().unwrap_or_default()))]);
+        crate::legacy_handoff::captured_argv(&capture)
+    }
+}
+
+impl crate::legacy_handoff::LegacyPersist for JournalPersist<'_> {
+    fn captured(&mut self, ctx: &mut CliCtx<'_>, record: &PyDict) -> Result<(), String> {
+        if self.records.is_none() {
+            let existing = read_legacy_capture(ctx, self.root, self.journal).ok().flatten()
+                .and_then(|capture| match capture.get("daemons") { Some(PyValue::List(items)) => Some(items.clone()), _ => None })
+                .unwrap_or_default();
+            self.records = Some(existing);
+        }
+        let records = self.records.as_mut().expect("records loaded");
+        records.push(PyValue::Dict(record.clone()));
+        let document = PyValue::Dict(PyDict::from_pairs(vec![
+            ("daemons".into(), PyValue::List(records.clone())),
+            ("schema_version".into(), PyValue::Int(PyInt::Small(1))),
+        ]));
+        let bytes = json_bytes(&document);
+        let path = legacy_capture_path(self.root);
+        ctx.p.fs.atomic_write(&path, &bytes, None).map_err(|error| error.py_message)?;
+        ctx.p.fs.sync_dir(&self.root.root).map_err(|error| error.py_message)?;
+        self.journal.legacy = Some(LegacyJournal { sha256: sha256_hex(&bytes), stage: "captured".into() });
+        write_journal(ctx, self.root, self.journal).map_err(|error| error.to_string())
+    }
+
+    fn stage(&mut self, ctx: &mut CliCtx<'_>, stage: &'static str) -> Result<(), String> {
+        if let Some(legacy) = self.journal.legacy.as_mut() {
+            legacy.stage = stage.to_string();
+        }
+        write_journal(ctx, self.root, self.journal).map_err(|error| error.to_string())
+    }
+}
+
+/// OD-48 D6：legacy 停止後的失敗，在報告加上 `legacy_daemon_stopped`、`restored` 與啟動指令。
+fn annotate_legacy(report: &mut UpdateReport, legacy: Option<&crate::legacy_handoff::LegacyStopped>, original_mode: &SupervisionMode, restored: bool) {
+    if let Some(legacy) = legacy {
+        crate::legacy_handoff::annotate_failure(&mut report.detail, true, restored, original_mode, &legacy.argv);
+        report.detail.insert("legacy_stop", legacy.value());
+    }
 }
 
 pub fn run_supervision_switch(
