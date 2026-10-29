@@ -305,3 +305,30 @@ def test_module_importable_without_sw_core() -> None:
     assert callable(mod.main)
     src = SCRIPT.read_text(encoding="utf-8")
     assert "import sw_core" not in src and "from sw_core" not in src, "只用 stdlib＋PyYAML，判定委派 l1_judge"
+
+
+def test_overlapping_sections_same_nodeid_once_each_is_pass(tmp_path: Path) -> None:
+    """實跑（第 4 輪 r4）：`console_conformance_pty` 的 selector 會執行整個 `console_conformance` binary，其非 cap 測試
+    同時出現在 `cargo_workspace` 報告；兩個集合各恰一列 `passed` 時不得因跨集合合計兩列而判證據不足。
+    單一報告內重複仍為證據不足（不放寬「每份報告恰一列」）。"""
+    shared = "cargo:sw-pal::console_conformance::tcp_accept_sets_nodelay_and_label_shape"
+    emap = _emap()
+    emap["cases"]["f5-second-console-linebuffer"]["tests"] = [
+        RAW_OWNER, "crates/sw-pal/tests/console_conformance.rs::tcp_accept_sets_nodelay_and_label_shape"]
+    lock = _lock()
+    lock["sets"]["s22_gate:cargo_workspace"]["linux"]["nodeids"] = sorted([PARTIAL, shared])
+    reports = _good_reports()
+    reports[("cargo_workspace", "linux")] = _report("linux", "cargo", CARGO_ARGV, [_row(PARTIAL), _row(shared)])
+    reports[("console_conformance_pty", "linux")] = _report("linux", "cargo", PTY_ARGV, [_row(PTY_CAP), _row(shared)])
+    rc, out = _run(tmp_path / "a", reports, lock=lock, emap=emap)
+    assert _case(out, "f5-second-console-linebuffer")["status"] == "PASS", out
+    reports[("cargo_workspace", "linux")] = _report("linux", "cargo", CARGO_ARGV, [_row(PARTIAL), _row(shared), _row(shared)])
+    reports[("console_conformance_pty", "linux")] = _report("linux", "cargo", PTY_ARGV, [_row(PTY_CAP)])
+    rc, out = _run(tmp_path / "b", reports, lock=lock, emap=emap)
+    case = _case(out, "f5-second-console-linebuffer")
+    assert case["status"] == "INSUFFICIENT", case
+    reports[("cargo_workspace", "linux")] = _report("linux", "cargo", CARGO_ARGV, [_row(PARTIAL), _row(shared)])
+    reports[("console_conformance_pty", "linux")] = _report(
+        "linux", "cargo", PTY_ARGV, [_row(PTY_CAP), _row(shared, "failed")], exit_code=101)
+    rc, out = _run(tmp_path / "c", reports, lock=lock, emap=emap)
+    assert _case(out, "f5-second-console-linebuffer")["status"] == "FAIL", out
