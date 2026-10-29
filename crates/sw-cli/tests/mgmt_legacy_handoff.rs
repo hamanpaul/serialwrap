@@ -579,6 +579,99 @@ fn legacy_l_crash_loop_recover_journal() {
     }
 }
 
+/// S1-4baca8c-1：首次 pipx 升級（無 current-release.json）在 legacy 中斷點中斷後，`recover_journal` 必須以
+/// 「不要求 bundle current」的 legacy 驗證收尾：擷取後 stop 前中斷 → 舊 daemon 繼續服務、journal 清除、不得回
+/// `restore_verify_failed`；其餘中斷點 → 舊 daemon 已停、還原安裝但不重啟。
+#[test]
+fn legacy_l_first_install_crash_loop_recovers_without_current() {
+    for point in LEGACY_CRASH_POINTS {
+        let mut t = legacy_on_demand_install().with_legacy_linger(Some(std::time::Duration::from_secs(40))).with_legacy_crash_at(point);
+        let (rc, _, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+        assert_eq!(rc, 137, "{point}");
+        t.clear_crash();
+        assert!(t.journal_json().is_some() && legacy_capture_path(&t).exists(), "{point}：中斷後 journal 與擷取檔保留");
+        if *point == "legacy_stop:after_stop_sent" {
+            let pending = t.recover().expect("journal");
+            assert_eq!(pending.reason.as_deref(), Some("legacy_stop_pending"), "{point}: {pending:?}");
+            t.clock().advance(std::time::Duration::from_secs(60));
+        }
+        let recovered = t.recover().expect("journal");
+        assert!(recovered.ok, "{point}: {recovered:?}");
+        assert_ne!(recovered.reason.as_deref(), Some("restore_verify_failed"), "{point}: {recovered:?}");
+        assert!(t.journal_json().is_none() && !legacy_capture_path(&t).exists(), "{point}");
+        assert!(sw_cli::install_layout::read_current(&t.root()).unwrap().is_none(), "{point}：首次安裝不得留下 current");
+        assert_eq!(t.process().spawn_count(), 0, "{point}：recover 不得啟動任何 daemon");
+        let stopped = *point != "legacy_stop:after_capture";
+        assert_eq!(recovered.detail.get("legacy_daemon_stopped").cloned().unwrap_or(PyValue::Bool(false)), PyValue::Bool(stopped), "{point}: {recovered:?}");
+        if !stopped {
+            assert_eq!(methods(&t).iter().filter(|m| *m == "daemon.stop").count(), 0, "擷取後 stop 前中斷：舊 daemon 繼續服務");
+        }
+    }
+}
+
+/// S1-4baca8c-1 反例：首次安裝沒有 current、也沒有 legacy 擷取時，endpoint 上出現的 daemon 不得被當成已還原。
+#[test]
+fn legacy_l_first_install_recover_still_rejects_unknown_daemon_without_capture() {
+    let mut t = legacy_on_demand_install().with_legacy_crash_at("legacy_stop:after_capture");
+    assert_eq!(t.run_from_bundle(&["setup", "--on-demand"]).0, 137);
+    t.clear_crash();
+    // 擷取檔遺失（或被移除）→ journal 的 sha256 對不上，必須拒絕而非當成 legacy 已還原。
+    std::fs::remove_file(legacy_capture_path(&t)).unwrap();
+    let recovered = t.recover().expect("journal");
+    assert!(!recovered.ok, "{recovered:?}");
+    assert!(t.journal_json().is_some(), "拒絕時 journal 必須保留");
+}
+
+/// S1-4baca8c-2：跨模式升級（舊 on-demand socket X → 目標 systemd-user socket Y）在 `start_and_verify:started`
+/// 中斷、新版 daemon 仍在 Y 持有 UART 時，`recover_journal` 必須以 journal 保存的目標模式與 endpoint 先停止 Y，
+/// 確認釋放後才還原；不得只以舊 endpoint X 判定而啟動第二個 daemon 或回 `tty_holder_remains`。
+#[test]
+fn s1_4baca8c_2_cross_mode_crash_after_start_stops_target_instance_first() {
+    let old = "/tmp/sw-od48-x/serialwrapd.sock";
+    let t = TestEnv::posix()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle("0.4.1")
+        .with_systemd(true)
+        .with_var("USER", "alice")
+        .with_supervisor_state("on-demand", false, false)
+        .with_config(&format!("supervision_mode: on-demand\nsocket_path: {old}\n"))
+        .with_idle_daemon(old, 4242)
+        .with_new_daemon_reporting_version("0.4.1")
+        .with_crash_at("start_and_verify:started");
+    let target = t.default_socket();
+    assert_ne!(t.isolated_endpoint(old), t.isolated_endpoint(&target));
+    assert_eq!(t.run_from_bundle(&["setup", "--user"]).0, 137);
+    let mut t = t;
+    t.clear_crash();
+    let journal = t.journal_json().expect("journal");
+    assert_eq!(s(&journal, "step"), "start_and_verify");
+    let target_ep = t.isolated_endpoint(&target);
+    let before = t.rpc().request_count(&target_ep, "daemon.handoff_stop");
+    // 還原後舊版 daemon 由 recover 以舊 endpoint X 重新啟動（下一次 spawn 後 X 才回應）。
+    let old_ep = t.isolated_endpoint(old);
+    t.rpc().revive_after_spawn(&old_ep, t.process().spawn_counter(), 4243);
+    t.rpc().respond_after_relaunch(&old_ep, "health.ping", "{\"ok\":true,\"pid\":4243}");
+    t.rpc().respond_after_relaunch(&old_ep, "health.status", "{\"ok\":true,\"pid\":4243,\"version\":\"0.4.0\",\"wal\":{\"healthy\":true}}");
+    t.rpc().respond_after_relaunch(&old_ep, "session.list", "{\"ok\":true,\"sessions\":[]}");
+    t.rpc().respond_after_relaunch(&old_ep, "alias.list", "{\"ok\":true,\"aliases\":[]}");
+    t.rpc().respond_after_relaunch(&old_ep, "device.list", "{\"ok\":true,\"devices\":[]}");
+    let recovered = t.recover().expect("journal");
+    assert!(
+        t.rpc().request_count(&target_ep, "daemon.handoff_stop") > before,
+        "恢復必須先以目標 endpoint 停止新版 daemon：{recovered:?}"
+    );
+    assert_ne!(recovered.reason.as_deref(), Some("tty_holder_remains"), "{recovered:?}");
+    assert!(recovered.ok, "{recovered:?}");
+    assert!(t.journal_json().is_none());
+    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.0");
+    let spawned = t.process().spawns();
+    let last = spawned.last().expect("舊版 daemon 由 recover 重新啟動");
+    let socket_arg = last.0.iter().position(|arg| arg == "--socket").map(|index| last.0[index + 1].clone());
+    assert_eq!(socket_arg.as_deref().map(|value| t.isolated_endpoint(value)), Some(old_ep), "{spawned:?}");
+}
+
 /// OD-48 OWNER-BATCH #3（rulings/s1.md 編排者裁決）：daemon 落在非 serialwrap 的 systemd service unit
 /// （或其他監管者的 cgroup）→ 停止前 fail-closed；父行程為一般 init／shell 也不得放行。
 #[test]
@@ -609,4 +702,49 @@ fn legacy_d3_4_session_scope_cgroup_is_not_external() {
     let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
     assert_eq!(rc, 0, "{out}");
     assert_eq!(methods(&t).iter().filter(|m| *m == "daemon.stop").count(), 1);
+}
+
+/// SPEC-GAP #5（rulings/s1.md 編排者裁決）：legacy stop 後切換失敗、還原本身也失敗 → revert_pending、journal 保留，
+/// 報告逐項列出未還原項（entries／config／unit／enabled／current；已還原者不列）。
+#[test]
+fn legacy_spec_gap5_restore_failure_lists_unrestored_items() {
+    let t = legacy_on_demand_update()
+        .with_new_daemon_after_legacy("0.4.0")
+        .with_spawn_exits(1)
+        .with_fs_fault_replace_source_contains("current-release.restore.tmp");
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    let update = dict(&j, "update");
+    assert!(b(update, "revert_pending"), "{out}");
+    let error = dict(update, "revert_error");
+    assert_eq!(
+        error.get_key("unrestored"),
+        Some(&list(vec![PyValue::Str("entries".into()), PyValue::Str("unit".into()), PyValue::Str("enabled".into()), PyValue::Str("current".into())])),
+        "config 已還原、current 失敗後的 entries／unit／enabled 未還原：{out}"
+    );
+    assert_eq!(j.get_key("legacy_daemon_stopped"), Some(&PyValue::Bool(true)));
+    assert_eq!(j.get_key("restored"), Some(&PyValue::Bool(false)), "{out}");
+    assert!(t.journal_json().is_some(), "還原失敗時 journal 必須保留");
+    assert_eq!(t.process().spawn_count(), 1, "還原失敗也不得重啟任何 daemon");
+}
+
+/// SPEC-GAP #5：recover_journal 在 legacy 停止後還原失敗時，同樣逐項列出未還原項。
+#[test]
+fn legacy_spec_gap5_recover_restore_failure_lists_unrestored_items() {
+    let mut t = legacy_on_demand_update()
+        .with_legacy_linger(Some(std::time::Duration::from_secs(1)))
+        .with_legacy_crash_at("legacy_stop:after_stopped");
+    assert_eq!(t.run_from_bundle(&["setup", "--on-demand"]).0, 137);
+    t.clear_crash();
+    let t = t.with_fs_fault_replace_source_contains("current-release.restore.tmp");
+    let recovered = t.recover().expect("journal");
+    assert!(!recovered.ok, "{recovered:?}");
+    assert_eq!(recovered.reason.as_deref(), Some("restore_failed"), "{recovered:?}");
+    assert_eq!(
+        recovered.detail.get("unrestored"),
+        Some(&list(vec![PyValue::Str("entries".into()), PyValue::Str("unit".into()), PyValue::Str("enabled".into()), PyValue::Str("current".into())])),
+        "{recovered:?}"
+    );
+    assert!(t.journal_json().is_some());
 }

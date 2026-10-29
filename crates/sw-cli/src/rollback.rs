@@ -591,6 +591,15 @@ pub struct Journal {
     pub target_autostart: Option<AutostartPlan>,
     /// OD-48 D3.5：legacy 擷取檔的 sha256 與停止進度（`captured`／`stop_sent`／`stopped`）。
     pub legacy: Option<LegacyJournal>,
+    /// S1-4baca8c-2：跨模式且目標 endpoint 與舊 endpoint 不同時，記錄目標模式與 endpoint，
+    /// 供 `recover_journal` 先停止目標 instance（同 endpoint 時為 None，既有 journal 位元組不變）。
+    pub target: Option<JournalTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalTarget {
+    pub mode: SupervisionMode,
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -802,8 +811,14 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
             }
             ctx.autostart_lock.take();
         }
-        // legacy daemon 不以 bundle 版本驗證（它本來就是 0.3.x）。
-        let restored = match verify_restored(ctx, root, original, original.daemon.is_some() && legacy_capture.is_none(), false) {
+        // legacy daemon 不以 bundle 版本驗證（它本來就是 0.3.x）。S1-4baca8c-1：首次 pipx 升級沒有 current，
+        // 改以 D1 正向辨識確認 endpoint 上仍是 0.3.x 舊 daemon（不要求 bundle current）。
+        let verified = if legacy_capture.is_some() && original.current.is_none() {
+            verify_legacy_restored(ctx, root, original, endpoint)
+        } else {
+            verify_restored(ctx, root, original, original.daemon.is_some() && legacy_capture.is_none(), false)
+        };
+        let restored = match verified {
             Ok(value) => value,
             Err(message) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "restore_verify_failed", message)),
         };
@@ -813,10 +828,36 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         Ok(mode) => mode,
         Err(message) => return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "config_read_failed", message)),
     };
-    let reusable_hold = (recovery_mode == original.supervisor.mode
+    // S1-4baca8c-2：切換後中斷的跨模式升級，新版 daemon 位於目標模式的 endpoint；先以 journal 保存的
+    // 目標模式與 endpoint 停止它並確認釋放，再處理舊 endpoint（對齊 `revert_after_failure`）。
+    let target_instance = journal.target.clone().filter(|target| {
+        target.endpoint != endpoint
+            && matches!(journal.step, JournalStep::EntriesSwitching | JournalStep::StartAndVerify | JournalStep::RevertToPrevious)
+    });
+    let mut target_instance_hold = None;
+    if let Some(target) = target_instance.as_ref() {
+        let reusable_target_hold = journal.target_autostart.as_ref()
+            .filter(|plan| plan.kind != AutostartHoldKind::NoSupervisor && ctx.p.service.autostart_hold_state(&target.mode) == HoldState::Held)
+            .map(|plan| hold_record_from_autostart(&target.mode, plan));
+        match stop_for_revert_with_hold(ctx, &target.mode, &target.endpoint, false, "install_recover", reusable_target_hold, None) {
+            Ok(RevertStop::Stopped { hold, .. }) | Ok(RevertStop::Absent { hold }) => target_instance_hold = hold,
+            Ok(RevertStop::Deferred(error)) => {
+                return Some(recovery_deferred(&from_step, error, ctx, &target.endpoint, "install_recover"));
+            }
+            Err(error) => return Some(recovery_stop_error(&from_step, &error, ctx, &target.endpoint)),
+        }
+        if let Err(failure) = confirm_released(ctx, &target.endpoint, None) {
+            return Some(recovery_error_from_op(&from_step, "tty_holder_remains", failure));
+        }
+    }
+    let reusable_hold = if recovery_mode == original.supervisor.mode
         && original.autostart.kind != AutostartHoldKind::NoSupervisor
-        && ctx.p.service.autostart_hold_state(&recovery_mode) == HoldState::Held)
-        .then(|| hold_record_from_plan(original));
+        && ctx.p.service.autostart_hold_state(&recovery_mode) == HoldState::Held
+    {
+        Some(hold_record_from_plan(original))
+    } else {
+        target_instance_hold.clone().filter(|hold| hold.mode == recovery_mode)
+    };
     let stop_result = {
         let mut persist = JournalPersist::new(root, &mut journal);
         let legacy = legacy_capture.is_some().then_some(&mut persist);
@@ -832,6 +873,8 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
         }
         Err(error) => return Some(recovery_stop_error(&from_step, &error, ctx, endpoint)),
     };
+    // 目標模式的 hold 由 restore_supervisor_and_daemon 以 target_hold 撤銷；舊模式的 hold 由其 old_hold 路徑撤銷。
+    let recovery_target_hold = target_instance_hold.or(recovery_target_hold);
 
     let holders_status = match confirm_released(ctx, endpoint, original.daemon.as_ref()) {
         Ok(status) => status,
@@ -841,17 +884,25 @@ pub fn recover_journal(ctx: &mut CliCtx, root: &InstallRoot) -> Option<RecoveryR
     if journal.step == JournalStep::BackupStarted {
         preserve_partial_backup(ctx, &journal);
     }
-    if let Err(message) = restore_original(ctx, root, &journal, backup.as_deref()) {
-        return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "restore_failed", message));
+    let mut progress = RestoreProgress::default();
+    // SPEC-GAP #5：legacy 停止後的還原失敗，報告逐項列出未還原項（Rust 對 Rust 路徑輸出不變）。
+    let legacy_unrestored = |mut report: RecoveryReport, progress: &RestoreProgress| {
+        if legacy_capture.is_some() {
+            report.detail.insert("unrestored", progress.unrestored());
+        }
+        report
+    };
+    if let Err(message) = restore_original(ctx, root, &journal, backup.as_deref(), &mut progress) {
+        return Some(legacy_unrestored(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "restore_failed", message), &progress));
     }
-    let restored = match restore_supervisor_and_daemon(ctx, root, original, backup.as_deref(), recovery_handoff.as_deref(), recovery_target_hold.as_ref(), false, legacy_capture.is_some()) {
+    let restored = match restore_supervisor_and_daemon(ctx, root, original, backup.as_deref(), recovery_handoff.as_deref(), recovery_target_hold.as_ref(), false, legacy_capture.is_some(), &mut progress) {
         Ok(value) => value,
         Err(message) => {
             if let Some(message) = message.strip_prefix("AUTOSTART_RELEASE_FAILED:") {
-                return Some(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "autostart_release_failed", message));
+                return Some(legacy_unrestored(recovery_error(&from_step, ErrorCode::InternalError.as_str(), "autostart_release_failed", message), &progress));
             }
             let code = if message.starts_with("DAEMON_EXITED:") { ErrorCode::DaemonExited.as_str() } else { ErrorCode::InternalError.as_str() };
-            return Some(recovery_error(&from_step, code, "restore_verify_failed", message));
+            return Some(legacy_unrestored(recovery_error(&from_step, code, "restore_verify_failed", message), &progress));
         }
     };
     let mut completed = finish_recovery(ctx, root, &journal_path, &journal, backup.is_some(), restored)?;
@@ -1311,7 +1362,7 @@ fn execute_change_with_restore(
         op: op.to_string(), from: from.clone(), to: manifest.bundle_version.clone(), step: JournalStep::Lock,
         started_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs().to_string(),
         original: None, snapshot_dir: None, snapshot_sha256: None, backup_dir: None, backup_manifest_sha256: None, target_autostart: None,
-        legacy: None,
+        legacy: None, target: None,
     };
     if let Err(error) = write_journal(ctx, &root, &journal) {
         let failed = journal_failure(report, StepName::Lock, "lock", error);
@@ -1376,8 +1427,8 @@ fn execute_change_with_restore(
     };
     if daemon.is_none() && sup.running && matches!(old_mode, SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem) {
         // OD-48 D3.2：監管顯示 running 卻沒有可 RPC 的 daemon（例如偵測不到的 endpoint），不得當成未執行。
-        // 只套用 systemd（`is-active` 反映 unit 主行程）；windows-task 的 Running 套用會改變 13 個凍結節點
-        // （mgmt_com0com），列 OWNER-BATCH，維持現行。
+        // 只套用 systemd（`is-active` 反映 unit 主行程）；依 OD-48 第 2 輪編排者裁決不套 windows-task
+        // （0.3.2 沒有該模式，`mgmt_com0com` 的 13 個凍結節點期望不變）。
         let mut detail = PyDict::new();
         detail.insert("pids", PyValue::List(Vec::new()));
         detail.insert("holder_unknown", PyValue::Bool(true));
@@ -1415,6 +1466,10 @@ fn execute_change_with_restore(
         dropin_path: None,
         prior_enabled: None,
         prior_restart: None,
+    });
+    journal.target = (target_mode != &old_mode && target_endpoint != endpoint).then(|| JournalTarget {
+        mode: target_mode.clone(),
+        endpoint: target_endpoint.clone(),
     });
     journal.step = JournalStep::SnapshotTaken;
     if let Err(error) = write_journal(ctx, &root, &journal) { return journal_failure(report, StepName::SafetyCheck, "snapshot_taken", error); }
@@ -2298,7 +2353,8 @@ fn revert_after_failure(
     };
     match stop_result {
         Ok(RevertStop::Deferred(error)) => {
-            let recovery = recovery_deferred("start_and_verify", error, ctx, &revert_endpoint, "update_revert");
+            let mut recovery = recovery_deferred("start_and_verify", error, ctx, &revert_endpoint, "update_revert");
+            if legacy_argv.is_some() { recovery.detail.insert("unrestored", RestoreProgress::default().unrestored()); }
             report.revert_pending = true;
             report.revert_error = Some(recovery.detail.clone());
             failure_doc.insert("revert_deferred", PyValue::Bool(true));
@@ -2309,7 +2365,8 @@ fn revert_after_failure(
             return report;
         }
         Err(error) => {
-            let recovery = recovery_stop_error("start_and_verify", &error, ctx, &revert_endpoint);
+            let mut recovery = recovery_stop_error("start_and_verify", &error, ctx, &revert_endpoint);
+            if legacy_argv.is_some() { recovery.detail.insert("unrestored", RestoreProgress::default().unrestored()); }
             report.revert_pending = true;
             report.revert_error = Some(recovery.detail.clone());
             failure_doc.insert("revert_deferred", PyValue::Bool(true));
@@ -2332,7 +2389,8 @@ fn revert_after_failure(
     let holders_status = match released {
         Ok(status) => status,
         Err(failure) => {
-            let detail = op_failure_detail(&failure);
+            let mut detail = op_failure_detail(&failure);
+            if legacy_argv.is_some() { detail.insert("unrestored", RestoreProgress::default().unrestored()); }
             report.revert_pending = true;
             report.revert_error = Some(detail.clone());
             failure_doc.insert("revert_error", PyValue::Dict(detail));
@@ -2349,9 +2407,10 @@ fn revert_after_failure(
     }
     crash_if("revert_to_previous:before_effect");
     let backup_used = backup.dir.as_path();
-    let restore_result = restore_original(ctx, &root, &journal, Some(backup_used));
+    let mut progress = RestoreProgress::default();
+    let restore_result = restore_original(ctx, &root, &journal, Some(backup_used), &mut progress);
     if restore_result.is_ok() {
-        match restore_supervisor_and_daemon(ctx, &root, &original, Some(backup_used), None, target_hold.as_ref(), with_sudo, legacy_argv.is_some()) {
+        match restore_supervisor_and_daemon(ctx, &root, &original, Some(backup_used), None, target_hold.as_ref(), with_sudo, legacy_argv.is_some(), &mut progress) {
             Ok(mut measured) => {
                 if let Some(status) = holders_status {
                     measured.insert("holders_status", str_value(status));
@@ -2363,7 +2422,8 @@ fn revert_after_failure(
             }
             Err(message) => {
                 report.revert_pending = true;
-                let detail = PyDict::from_pairs(vec![("message".into(), str_value(message))]);
+                let mut detail = PyDict::from_pairs(vec![("message".into(), str_value(message))]);
+                if legacy_argv.is_some() { detail.insert("unrestored", progress.unrestored()); }
                 failure_doc.insert("revert_error", PyValue::Dict(detail.clone()));
                 let _ = write_json(ctx, &failure_path, &PyValue::Dict(failure_doc));
                 report.revert_error = Some(detail);
@@ -2373,7 +2433,9 @@ fn revert_after_failure(
         }
     } else {
         report.revert_pending = true;
-        report.revert_error = Some(PyDict::from_pairs(vec![("message".into(), str_value(restore_result.unwrap_err()))]));
+        let mut detail = PyDict::from_pairs(vec![("message".into(), str_value(restore_result.unwrap_err()))]);
+        if legacy_argv.is_some() { detail.insert("unrestored", progress.unrestored()); }
+        report.revert_error = Some(detail);
     }
     legacy_note(&mut report);
     let _ = with_sudo;
@@ -2908,6 +2970,13 @@ fn parse_journal(value: &PyDict) -> Result<Journal, String> {
             Some(legacy) => Some(LegacyJournal { sha256: string_field(legacy, "sha256")?, stage: string_field(legacy, "stage")? }),
             None => None,
         },
+        target: match dict_value(value.get("target")) {
+            Some(target) => Some(JournalTarget {
+                mode: SupervisionMode::parse(&string_field(target, "mode")?),
+                endpoint: string_field(target, "endpoint")?,
+            }),
+            None => None,
+        },
     })
 }
 
@@ -3217,7 +3286,29 @@ fn preserve_partial_backup(ctx: &CliCtx<'_>, journal: &Journal) {
     }
 }
 
-fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal, backup: Option<&Path>) -> Result<(), String> {
+/// OD-48 D6／SPEC-GAP #5：還原進度；還原本身失敗時，報告以 `unrestored` 逐項列出未還原項。
+#[derive(Clone, Copy, Debug, Default)]
+struct RestoreProgress {
+    entries: bool,
+    config: bool,
+    unit: bool,
+    enabled: bool,
+    current: bool,
+}
+
+impl RestoreProgress {
+    fn unrestored(&self) -> PyValue {
+        PyValue::List(
+            [("entries", self.entries), ("config", self.config), ("unit", self.unit), ("enabled", self.enabled), ("current", self.current)]
+                .into_iter()
+                .filter(|(_, done)| !done)
+                .map(|(name, _)| str_value(name))
+                .collect(),
+        )
+    }
+}
+
+fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal, backup: Option<&Path>, progress: &mut RestoreProgress) -> Result<(), String> {
     let original = journal.original.as_ref().ok_or("journal 缺少 original snapshot")?;
     let snapshot = journal.snapshot_dir.as_deref().map(PathBuf::from).ok_or("journal 缺少 snapshot_dir")?;
     let source = backup.unwrap_or(&snapshot);
@@ -3240,12 +3331,14 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
             sync_tree(ctx, &target).map_err(|error| error.to_string())?;
         }
     }
+    progress.config = true;
     let current_snapshot = snapshot.join("current-release.json");
     if ctx.p.fs.exists(&current_snapshot) {
         copy_replace(ctx, &current_snapshot, &root.current_file).map_err(|error| error.to_string())?;
     } else if ctx.p.fs.exists(&root.current_file) {
         ctx.p.fs.remove_file(&root.current_file).map_err(|error| error.py_message)?;
     }
+    progress.current = true;
     let entry_snapshot = snapshot.join("entries");
     for entry in &original.entries {
         let name = match entry { EntrySnapshot::Symlink { name, .. } | EntrySnapshot::Copy { name, .. } | EntrySnapshot::Absent { name } => name };
@@ -3267,6 +3360,7 @@ fn restore_original(ctx: &mut CliCtx<'_>, root: &InstallRoot, journal: &Journal,
         }
     }
     let _ = original;
+    progress.entries = true;
     Ok(())
 }
 
@@ -3279,9 +3373,11 @@ fn restore_supervisor_and_daemon(
     target_hold: Option<&AutostartHoldRecord>,
     with_sudo: bool,
     no_restart: bool,
+    progress: &mut RestoreProgress,
 ) -> Result<PyDict, String> {
     let registration_dir = backup.map(Path::to_path_buf).unwrap_or_else(|| journal_snapshot_path(root));
     restore_registration(ctx, &registration_dir, &original.supervisor).map_err(|error| error.to_string())?;
+    progress.unit = true;
     crash_if("restore_supervisor_and_daemon:after_registration");
     let mode = &original.supervisor.mode;
     let active_mode = target_hold.map(|hold| &hold.mode).unwrap_or(mode);
@@ -3320,9 +3416,40 @@ fn restore_supervisor_and_daemon(
             if records.iter().any(|record| record.rc != 0) { return Err("監管 enabled 狀態還原失敗".into()); }
         }
     }
+    progress.enabled = true;
     // OD-48 修訂：legacy daemon 已停止時只還原安裝狀態，不啟動任何 daemon。
     let restart = original.daemon.is_some() && !no_restart;
     verify_restored(ctx, root, original, restart, restart)
+}
+
+/// S1-4baca8c-2：由 journal `target_autostart` 重建目標模式的 hold 紀錄（recover 重用中斷前取得的 hold）。
+fn hold_record_from_autostart(mode: &SupervisionMode, plan: &AutostartPlan) -> AutostartHoldRecord {
+    AutostartHoldRecord {
+        mode: mode.clone(),
+        kind: plan.kind,
+        name: None,
+        dropin_path: plan.dropin_path.as_deref().map(PathBuf::from),
+        prior_enabled: plan.prior_enabled,
+        prior_restart: plan.prior_restart.clone(),
+        ran: Vec::new(),
+    }
+}
+
+/// S1-4baca8c-1：首次 pipx 升級（原始安裝沒有 current）在 legacy 停止前中斷、舊 daemon 繼續服務時的還原驗證。
+/// 不要求 bundle current；以 D1.2～D1.4 正向辨識 endpoint 上的 daemon 仍是 bundle 外的 0.3.x Python daemon。
+fn verify_legacy_restored(
+    ctx: &mut CliCtx<'_>,
+    root: &InstallRoot,
+    original: &OriginalSnapshot,
+    endpoint: &str,
+) -> Result<PyDict, String> {
+    let daemon = crate::legacy_handoff::identify(ctx, endpoint, None, &root.versions)
+        .map_err(|reason| format!("原始安裝沒有 current，endpoint 上的 daemon 無法辨識為 0.3.x 舊 daemon（{reason}）"))?;
+    let mut restored = restored_value(original);
+    restored.insert("daemon_version", str_value(daemon.version));
+    restored.insert("legacy_daemon_running", PyValue::Bool(true));
+    restored.insert("started", PyValue::Bool(false));
+    Ok(restored)
 }
 
 fn hold_record_from_plan(original: &OriginalSnapshot) -> AutostartHoldRecord {
@@ -3791,6 +3918,13 @@ fn journal_value(journal: &Journal) -> PyValue {
         value.insert("legacy", PyValue::Dict(PyDict::from_pairs(vec![
             ("sha256".into(), str_value(legacy.sha256.clone())),
             ("stage".into(), str_value(legacy.stage.clone())),
+        ])));
+    }
+    if let Some(target) = journal.target.as_ref() {
+        // 只在跨模式且 endpoint 不同時出現，既有 journal 位元組不變。
+        value.insert("target", PyValue::Dict(PyDict::from_pairs(vec![
+            ("endpoint".into(), str_value(target.endpoint.clone())),
+            ("mode".into(), str_value(target.mode.as_str().to_string())),
         ])));
     }
     PyValue::Dict(value)
