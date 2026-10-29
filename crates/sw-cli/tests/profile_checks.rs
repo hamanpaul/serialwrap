@@ -205,3 +205,31 @@ fn password_value_error_wins_over_later_boot_done_overflow() {
     assert!(err.contains("ASCII and UNICODE flags are incompatible"), "err={err}");
     assert!(!err.contains("repetition"), "err={err}");
 }
+
+#[test]
+fn class_range_error_precedes_unterminated_and_later_escape() {
+    // S1X-b-1：CPython 讀到 `a-b` 當下即檢查範圍；`bad character range` 先於其後的未封閉與跳脫錯誤，
+    // `-` 後直接 EOF 仍為 unterminated（Python 3.12.3 `profile test` 實測文字）。
+    let cases = [
+        ("[z-a", "bad character range z-a at position 1"),
+        ("[z-ab", "bad character range z-a at position 1"),
+        (r"[z-a\A]", "bad character range z-a at position 1"),
+        (r"[\d-z", r"bad character range \\d-z at position 1"),
+        ("[z-", "unterminated character set at position 0"),
+    ];
+    for (pattern, error) in cases {
+        let yaml = format!(
+            "profiles:\n  t:\n    platform: shell\n    prompt_regex: '{pattern}'\n    login_regex: \"x\"\n    password_regex: \"x\"\n"
+        );
+        let (rc, out, err) = run_profile(&yaml);
+        assert_eq!((rc, err.as_str()), (0, ""), "pattern={pattern} out={out}");
+        let want = format!(
+            "\"prompt_regex\":{{\"error\":\"{error}\",\"matched\":false,\"matched_line\":null,\"pattern\":\"{}\"}}",
+            pattern.replace('\\', "\\\\")
+        );
+        assert!(
+            out.contains(&want),
+            "pattern={pattern}\nout={out}\nwant={want}"
+        );
+    }
+}

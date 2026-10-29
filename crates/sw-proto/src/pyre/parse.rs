@@ -35,12 +35,12 @@ pub(super) enum ClassItem {
     Category(Category),
 }
 
+/// 字元類別內的一個 token。`raw` 為 CPython tokenizer 的原文（跳脫只取反斜線與其後一個字元），
+/// 用於 `bad character range` 訊息。
 #[derive(Clone, Debug)]
 struct ClassToken {
     item: ClassItem,
     raw: String,
-    start: usize,
-    is_range_operator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,68 +705,63 @@ impl Parser<'_> {
             negated = true;
             self.pos += 1;
         }
-        let mut raw = Vec::new();
-        let mut first = true;
-        let mut closed = false;
-        while let Some(ch) = self.peek() {
-            if ch == ']' && !first {
+        // 對照 CPython `sre_parse._parse` 的 `[` 分支：逐 token 讀取，讀到 `a-b` 當下就檢查範圍，
+        // 所以 `bad character range` 先於其後的未封閉與跳脫錯誤（S1X-b-1）。
+        let mut items = Vec::new();
+        loop {
+            let Some(ch) = self.peek() else {
+                return Err(self.error("unterminated character set", Some(open)));
+            };
+            if ch == ']' && !items.is_empty() {
                 self.pos += 1;
-                closed = true;
                 break;
             }
-            let token = if ch == '\\' {
-                let slash = self.pos;
-                self.pos += 1;
-                self.parse_class_escape(slash)?
-            } else {
-                let start = self.pos;
-                self.pos += 1;
-                ClassToken {
-                    item: ClassItem::Character(ch),
-                    raw: ch.to_string(),
-                    start,
-                    is_range_operator: ch == '-',
-                }
-            };
-            raw.push(token);
-            first = false;
-        }
-        if !closed {
-            return Err(self.error("unterminated character set", Some(open)));
-        }
-
-        let mut items = Vec::new();
-        let mut i = 0;
-        while i < raw.len() {
-            if i + 1 < raw.len() && raw[i + 1].is_range_operator {
-                if i + 2 == raw.len() {
-                    items.push(raw[i].item.clone());
-                    items.push(ClassItem::Character('-'));
-                    i += 2;
-                    continue;
-                }
-                let (ClassItem::Character(start), ClassItem::Character(end)) =
-                    (&raw[i].item, &raw[i + 2].item)
-                else {
-                    return Err(self.error(
-                        &format!("bad character range {}-{}", raw[i].raw, raw[i + 2].raw),
-                        Some(raw[i].start),
-                    ));
-                };
-                if start > end {
-                    return Err(self.error(
-                        &format!("bad character range {}-{}", raw[i].raw, raw[i + 2].raw),
-                        Some(raw[i].start),
-                    ));
-                }
-                items.push(ClassItem::Range(*start, *end));
-                i += 3;
+            let first = self.parse_class_token()?;
+            if self.peek() != Some('-') {
+                items.push(first.item);
                 continue;
             }
-            items.push(raw[i].item.clone());
-            i += 1;
+            self.pos += 1;
+            match self.peek() {
+                None => return Err(self.error("unterminated character set", Some(open))),
+                Some(']') => {
+                    self.pos += 1;
+                    items.push(first.item);
+                    items.push(ClassItem::Character('-'));
+                    break;
+                }
+                Some(_) => {}
+            }
+            let second = self.parse_class_token()?;
+            match (&first.item, &second.item) {
+                (ClassItem::Character(start), ClassItem::Character(end)) if start <= end => {
+                    items.push(ClassItem::Range(*start, *end));
+                }
+                _ => {
+                    // CPython 位置為 `tell − (len(this) + 1 + len(that))`；跳脫的 token 原文只有兩個字元，
+                    // 故 `\x7a-a` 這類範圍的位置不等於第一個 token 的起點。
+                    let span = first.raw.chars().count() + 1 + second.raw.chars().count();
+                    return Err(self.error(
+                        &format!("bad character range {}-{}", first.raw, second.raw),
+                        Some(self.pos.saturating_sub(span)),
+                    ));
+                }
+            }
         }
         Ok(Expr::CharacterClass { negated, items })
+    }
+
+    /// 讀取字元類別內的一個 token（呼叫端保證未到 EOF）。
+    fn parse_class_token(&mut self) -> Result<ClassToken, CompileError> {
+        let start = self.pos;
+        let ch = self.next().unwrap_or_default();
+        if ch == '\\' {
+            return self.parse_class_escape(start);
+        }
+        Ok(ClassToken {
+            item: ClassItem::Character(ch),
+            raw: ch.to_string(),
+        })
     }
 
     fn parse_class_escape(&mut self, slash: usize) -> Result<ClassToken, CompileError> {
@@ -796,9 +791,9 @@ impl Parser<'_> {
         };
         Ok(ClassToken {
             item,
-            raw: self.chars[slash..self.pos].iter().collect(),
-            start: slash,
-            is_range_operator: false,
+            raw: self.chars[slash..(slash + 2).min(self.pos)]
+                .iter()
+                .collect(),
         })
     }
 
