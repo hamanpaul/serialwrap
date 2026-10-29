@@ -43,6 +43,20 @@ pub struct ProcIdentity {
     pub start_ticks: Option<u64>,
 }
 
+/// 單一行程的辨識資訊（OD-48 D1／D3：正向辨識 0.3.x Python daemon、同 uid 判定與父行程檢查）。
+/// 取不到的欄位為 `None`／空，呼叫端一律視為「無法正向辨識」而 fail-closed。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcDetails {
+    pub pid: u32,
+    pub ppid: Option<u32>,
+    /// POSIX real uid；Windows 為 `None`。
+    pub uid: Option<u32>,
+    /// POSIX `/proc/<pid>/exe` 解析結果；Windows 為完整映像路徑（取不到時退回映像名稱）。
+    pub exe: Option<String>,
+    pub argv: Vec<String>,
+    pub start_ticks: Option<u64>,
+}
+
 /// Windows 行程快照資訊。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WinProcInfo {
@@ -270,4 +284,109 @@ pub trait ProcScan: Send + Sync {
     fn serialwrapd_tty_holders(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus);
     fn pid_alive(&self, pid: u32) -> bool;
     fn identity_alive(&self, id: &ProcIdentity) -> bool;
+    /// OD-48 D1／D3：指定 pid 的辨識資訊；行程不存在或平台不支援 → `None`。
+    fn proc_details(&self, _pid: u32) -> Option<ProcDetails> {
+        None
+    }
+    /// 目前行程的 real uid（POSIX）；Windows 與替身預設為 `None`（呼叫端視為同 uid）。
+    fn current_uid(&self) -> Option<u32> {
+        None
+    }
+    /// OD-48 D5：與目前行程同 uid 的**任何**行程是否仍持有 `paths`（不限 serialwrapd）。
+    /// 預設沿用 serialwrapd holder 掃描；POSIX 實作掃全部同 uid 行程，Windows 回 `Unsupported`。
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+        self.serialwrapd_tty_holders(paths)
+    }
+    /// OD-48 OWNER-BATCH #3：`/proc/<pid>/cgroup` 原文（Linux）；行程不存在或平台不支援 → `None`。
+    /// 由 [`classify_cgroup`] 判定該行程所屬的監管者。
+    fn proc_cgroup(&self, _pid: u32) -> Option<String> {
+        None
+    }
+}
+
+/// OD-48 OWNER-BATCH #3：依 cgroup 判定的行程監管歸屬。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CgroupOwner {
+    /// serialwrap 自己的 systemd unit（`serialwrap.service`，system 或 user manager 底下）。
+    SerialwrapUnit,
+    /// 非 serialwrap 的 systemd service unit，或 system.slice 底下其他監管者的 transient scope（容器執行環境等）。
+    ForeignUnit(String),
+    /// 使用者登入 session、終端機或 user manager 的 app scope（一般 shell 啟動）。
+    Session,
+    /// 無法判定（根 cgroup、格式不明或讀不到）；呼叫端退回父行程判定。
+    Unknown,
+}
+
+/// OD-48 OWNER-BATCH #3：解析 `/proc/<pid>/cgroup`。cgroup v2 取 `0::<path>`，v1 取 `name=systemd` 階層；
+/// 以路徑最後一段判定：`*.service` 為 systemd service unit（`serialwrap.service` 以外即外部監管者），
+/// `*.scope` 一律視為一般 session，不因位於 `system.slice` 或 `user.slice` 而轉為外部監管者。
+pub fn classify_cgroup(content: &str) -> CgroupOwner {
+    let mut path = None;
+    for line in content.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(id), Some(controllers), Some(value)) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if id == "0" && controllers.is_empty() {
+            path = Some(value);
+            break;
+        }
+        if controllers == "name=systemd" {
+            path = Some(value);
+        }
+    }
+    let Some(path) = path.map(str::trim) else {
+        return CgroupOwner::Unknown;
+    };
+    let parts = path.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let Some(leaf) = parts.last() else {
+        return CgroupOwner::Unknown;
+    };
+    if leaf.ends_with(".service") {
+        if *leaf == "serialwrap.service" {
+            return CgroupOwner::SerialwrapUnit;
+        }
+        return CgroupOwner::ForeignUnit((*leaf).to_string());
+    }
+    if leaf.ends_with(".scope") {
+        return CgroupOwner::Session;
+    }
+    CgroupOwner::Unknown
+}
+
+/// OD-48 D1.3：執行檔是否為 Python 直譯器（basename `python`、`python3`、`python3.12`…；Windows 另含 `.exe`）。
+pub fn is_python_interpreter(path: &str) -> bool {
+    let base = path.rsplit(|ch| ch == '/' || ch == '\\').next().unwrap_or(path);
+    let base = base
+        .get(base.len().saturating_sub(4)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        .and_then(|_| base.get(..base.len() - 4))
+        .unwrap_or(base);
+    let lower = base.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("python") else {
+        return false;
+    };
+    rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+}
+
+/// OD-48 D1.3：argv 是否為 0.3.x Python daemon（`…/serialwrapd` script 或 `-m sw_core.daemon`）；
+/// 回傳 script 路徑（`-m` 形式為 `None`）。
+pub fn python_daemon_script(argv: &[String], flavor: ArgvFlavor) -> Option<Option<String>> {
+    if argv
+        .windows(2)
+        .any(|pair| pair[0] == "-m" && pair[1] == "sw_core.daemon")
+    {
+        return Some(None);
+    }
+    argv.iter().skip(1).find_map(|part| {
+        let script = match flavor {
+            ArgvFlavor::Posix => part.contains('/') && posix_basename(part) == "serialwrapd",
+            ArgvFlavor::Windows => {
+                (part.contains('/') || part.contains('\\'))
+                    && (windows_name_eq(part, "serialwrapd")
+                        || windows_basename(part).eq_ignore_ascii_case("serialwrapd-script.py"))
+            }
+        } || part.ends_with("serialwrapd.py");
+        script.then(|| Some(part.clone()))
+    })
 }

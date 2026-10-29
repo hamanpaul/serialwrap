@@ -5,6 +5,10 @@
 驗證入口取代、設定保留、監管 reconcile、狀態相容與 doctor → `setup --rollback` → 手動降級回 0.3.2 →
 重新升級。全程以 /proc 取樣監看 serialwrapd 實例數。判定見 upgrade_checks.py。
 
+systemd-system（OD-48 SPEC-GAP #10）只跑「0.3.2 daemon 執行中直接 `setup --system --with-sudo`」成功路徑：
+0.3.2 以 `setup --system --with-sudo` 安裝 system unit（swtest 免密碼 sudo）→ 建立 profile／alias／binding →
+0.4.0 直接 setup → 入口、設定、監管與 doctor 驗證；必要檢查見 `REQUIRED_CHECKS_SYSTEMD_SYSTEM`。
+
 只依賴標準函式庫與同目錄的 upgrade_checks（容器內以系統 python3 執行）。
 """
 from __future__ import annotations
@@ -33,6 +37,8 @@ CONFIG = HOME / ".config" / "serialwrap"
 VERSIONS = HOME / ".local" / "share" / "serialwrap" / "versions"
 BACKUPS = HOME / ".local" / "share" / "serialwrap" / "backups"
 UNIT_DIR = HOME / ".config" / "systemd" / "user"
+SYSTEM_UNIT_DIR = pathlib.Path("/etc/systemd/system")
+SYSTEM_PROFILE_DIR = pathlib.Path("/etc/serialwrap/profiles")
 OLD_VERSION = "0.3.2"
 NEW_VERSION = "0.4.0"
 ENTRY_NAMES = ("serialwrap", "serialwrapd")
@@ -55,7 +61,8 @@ targets:
 class Driver:
     def __init__(self, mode: str, wheel: pathlib.Path, bundle: pathlib.Path, out: pathlib.Path) -> None:
         self.mode = mode
-        self.flag = "--user" if mode == "systemd-user" else "--on-demand"
+        self.flag = {"systemd-user": "--user", "systemd-system": "--system"}.get(mode, "--on-demand")
+        self.setup_args = [self.flag, "--with-sudo"] if mode == "systemd-system" else [self.flag]
         self.wheel = wheel
         self.bundle = bundle
         self.new_cli = bundle / "bin" / "serialwrap"
@@ -189,7 +196,20 @@ class Driver:
     def phase_old_install(self) -> None:
         inst = self.run(["pipx", "install", "--pip-args", "--no-index --find-links=/opt/sw-old", str(self.wheel)],
                         label="pipx install 0.3.2", timeout=600)
-        setup = self.sw("setup", self.flag, label="0.3.2 setup")
+        if self.mode == "systemd-system":
+            # 0.3.2 既有缺陷：system unit 的 UMask=0117 使 daemon 自建的目錄缺 x 位元（0660），接著建立子目錄即
+            # PermissionError、unit 反覆重啟。一般使用者先前以 on-demand 用過 serialwrap 時這些目錄已存在；此處以 swtest
+            # 的一般 umask 前景啟動一次 0.3.2 daemon（隔離 socket）讓它自建全部目錄後結束，並記為觀察項（與 0.4.0 無關）。
+            # system unit 沒有 XDG_RUNTIME_DIR（RUN_DIR 落在 STATE_DIR/run），暖機須同樣不帶該變數。
+            warm = self.run(["env", "-u", "XDG_RUNTIME_DIR", "timeout", "-s", "INT", "8", str(BIN / "serialwrapd"),
+                             "--socket", "/tmp/sw-warmup.sock"],
+                            label="0.3.2 daemon 前景暖機（建立目錄）", timeout=30)
+            self.wait_no_daemon()
+            self.observations.append({"id": "OBS-0.3.2-SYSTEM-UMASK", "phase": "old_install_0_3_2",
+                                      "detail": "0.3.2 system unit UMask=0117：daemon 自建目錄為 0660，ensure_runtime_dirs／ttyMCU 目錄 PermissionError",
+                                      "workaround": "以 swtest 一般 umask 前景啟動一次 0.3.2 daemon 建立目錄",
+                                      "warmup_rc": warm.returncode})
+        setup = self.sw("setup", *self.setup_args, label="0.3.2 setup")
         start = self.start_daemon("0.3.2 start") if self.mode == "on-demand" else None
         status = self.wait_daemon(version=OLD_VERSION)
         version = self.cli_version()
@@ -199,12 +219,41 @@ class Driver:
                         pipx_rc=inst.returncode, setup_rc=setup.returncode, cli_version=version,
                         daemon_version=(status or {}).get("version"), entries=self.entries()))
 
+    def cfg_files(self) -> dict[str, str]:
+        """設定快照：使用者 config；systemd-system 另含 system daemon 讀取的 /etc/serialwrap/profiles。"""
+        files = uc.snapshot_files(CONFIG)
+        if self.mode == "systemd-system":
+            files.update({f"/etc/serialwrap/profiles/{k}": v for k, v in uc.snapshot_files(SYSTEM_PROFILE_DIR).items()})
+        return files
+
+    def expected_overwrites(self) -> dict[str, str]:
+        """S1-f3c66b4-1：system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 同名檔（0.3.2 `sudo cp -r`
+        同語意）。只允許這些檔案變成新 bundle 的權威內容（bundle 內 sw_core/assets/profiles）；其餘逐位元組比較。"""
+        if self.mode != "systemd-system":
+            return {}
+        assets = self.bundle / "versions" / NEW_VERSION / "py" / "sw_core" / "assets" / "profiles"
+        managed = getattr(self, "system_managed_profiles", set())
+        return {f"/etc/serialwrap/profiles/{name}": digest for name, digest in uc.snapshot_files(assets).items()
+                if name in managed}
+
     def phase_seed(self) -> None:
         (CONFIG / "profiles").mkdir(parents=True, exist_ok=True)
         bench = CONFIG / "profiles" / "bench.yaml"
         bench.write_text(BENCH_PROFILE, encoding="utf-8")
         subprocess.run(["chown", f"{USER}:{USER}", str(bench)], check=True)
-        if self.mode == "systemd-user":
+        if self.mode == "systemd-system":
+            # system daemon 固定讀 /etc/serialwrap/profiles（0.3.2 setup_cmd SYSTEM_PROFILE_DIR）；使用者 profile 另放一份。
+            staging = HOME / ".local" / "share" / "serialwrap" / "system-profiles"
+            self.system_managed_profiles = {str(p.relative_to(staging)) for p in staging.rglob("*") if p.is_file()} \
+                if staging.is_dir() else set()
+            self.observations.append({"id": "OBS-SYSTEM-PROFILES-MANAGED", "phase": "seed_user_data",
+                                      "managed": sorted(self.system_managed_profiles),
+                                      "note": "system setup 每次以套件內 profiles 覆寫 /etc/serialwrap/profiles 的同名檔（0.3.2 同語意）；這些檔案只允許變成新 bundle 的權威內容，遺失或其他內容判 FAIL"})
+            SYSTEM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            (SYSTEM_PROFILE_DIR / "bench.yaml").write_text(BENCH_PROFILE, encoding="utf-8")
+        if self.mode == "systemd-system":
+            restart = [self.run(["sudo", "systemctl", "restart", "serialwrap"], label="0.3.2 sudo systemctl restart")]
+        elif self.mode == "systemd-user":
             restart = [self.sw("service", "restart", label="0.3.2 service restart")]
         else:
             restart = [self.sw("daemon", "stop", label="0.3.2 daemon stop"), self.start_daemon("0.3.2 daemon start")]
@@ -217,28 +266,58 @@ class Driver:
                     "--profile", "shellboard"),
         ]
         self.baseline = self.state_view()
-        self.cfg_before = uc.snapshot_files(CONFIG)
+        self.cfg_before = self.cfg_files()
         self.add(uc.judge_seed("seed_user_data", rcs=[p.returncode for p in restart + cmds], baseline=self.baseline,
                                config_files=self.cfg_before))
         self.add(uc.judge_doctor("doctor_green_old", self.doctor("0.3.2 doctor"), require_pairing=False))
 
     def _site(self) -> dict[str, Any]:
         return {"daemon_pids": uc.scan_daemon_instances(), "entries": self.entries(),
-                "files": uc.snapshot_files(CONFIG)}
+                "files": self.cfg_files()}
+
+    @staticmethod
+    def _start_ticks(pid: int) -> str | None:
+        try:
+            stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        fields = stat[stat.rfind(")") + 2:].split()
+        return fields[19] if len(fields) > 19 else None
 
     def phase_upgrade_running(self) -> bool:
         before = self._site()
-        proc = self.run([str(self.new_cli), "setup", self.flag], label="0.4.0 setup（舊 daemon 執行中）", timeout=600)
+        old_status = self.daemon_status() or {}
+        legacy = str(old_status.get("version") or OLD_VERSION).startswith("0.3.")
+        old_ids = {pid: self._start_ticks(pid) for pid in before["daemon_pids"]}
+        t0 = time.monotonic()
+        proc = self.run([str(self.new_cli), "setup", *self.setup_args], label="0.4.0 setup（舊 daemon 執行中）", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
+            # OD-48：在 driver 任何啟動動作之前取樣，確認新 daemon 由 setup 自己啟動。
+            status = self.wait_daemon(version=NEW_VERSION, timeout=20.0)
+            t1 = time.monotonic()
+            alive = [pid for pid, ticks in old_ids.items() if ticks is not None and self._start_ticks(pid) == ticks]
+            overlaps = [{"t": round(t - t0, 3), "pids": sorted(pids)} for t, pids in list(self.samples)
+                        if t0 <= t <= t1 and len(pids) > 1]
             self.add(uc.row("upgrade_with_old_daemon_running", "PASS", None, outcome="switched"))
+            self.add(uc.judge_legacy_direct_setup(
+                "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
+                old_alive_after=alive, status_after=status, instances_after=uc.scan_daemon_instances(),
+                cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=overlaps,
+                new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
             return True
         self.observations.append({"id": "OBS-UPGRADE-LEGACY-HANDOFF", "phase": "upgrade_with_old_daemon_running",
                                   "error_code": body.get("error_code"), "probe": body.get("probe"),
                                   "message": body.get("message"), "hint": body.get("hint")})
-        r = uc.judge_refusal("upgrade_with_old_daemon_running", before, self._site(), body, uc.REFUSAL_LEGACY_HANDOFF)
+        after = self._site()
+        r = uc.judge_upgrade_running_refusal("upgrade_with_old_daemon_running", before, after, body, legacy=legacy)
         r["detail"]["outcome"] = "refused"
         self.add(r)
+        self.add(uc.judge_legacy_direct_setup(
+            "legacy_handoff_direct_setup", setup_rc=proc.returncode, body=body, old_pids=sorted(old_ids),
+            old_alive_after=sorted(after["daemon_pids"]), status_after=None, instances_after=after["daemon_pids"],
+            cfg_before=self.cfg_before, cfg_after=self.cfg_files(), overlaps=[],
+            new_version=NEW_VERSION, old_version=OLD_VERSION, expected_overwrites=self.expected_overwrites()))
         return False
 
     def phase_upgrade_after_stop(self, already: bool) -> None:
@@ -247,7 +326,7 @@ class Driver:
         else:
             stop = self.sw("daemon", "stop", label="0.3.2 daemon stop")
             gone = self.wait_no_daemon()
-            proc = self.run([str(self.new_cli), "setup", self.flag], label="0.4.0 setup", timeout=600)
+            proc = self.run([str(self.new_cli), "setup", *self.setup_args], label="0.4.0 setup", timeout=600)
             body = self.parse(proc) or {}
             install = body.get("install") or {}
             ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
@@ -276,7 +355,8 @@ class Driver:
         self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else "入口未切到 0.4.0 或未記錄舊 pipx 入口",
                         entries=entries, cli_version=version, backup_targets=recorded,
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
-        cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, uc.snapshot_files(CONFIG))
+        cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, self.cfg_files(),
+                                       self.expected_overwrites())
         self.add(cfg)
 
     def phase_new_running(self) -> None:
@@ -298,6 +378,39 @@ class Driver:
         self._check_supervision("supervision_reconciled", status.get("pid"))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
         self.add(uc.judge_doctor("doctor_green_new", self.doctor("0.4.0 doctor"), require_pairing=True))
+
+    def phase_new_running_system(self) -> None:
+        """systemd-system：新 daemon 已由 setup 啟動（不得由 driver 代啟），驗證來源、監管收斂、狀態與 doctor。"""
+        status = self.wait_daemon(version=NEW_VERSION) or {}
+        pids = uc.scan_daemon_instances()
+        argv = []
+        if status.get("pid"):
+            try:
+                argv = pathlib.Path(f"/proc/{status['pid']}/cmdline").read_bytes().decode("utf-8", "replace").split("\0")
+            except OSError:
+                argv = []
+        from_bundle = any(str(VERSIONS / NEW_VERSION) in a for a in argv)
+        ok = status.get("version") == NEW_VERSION and status.get("multi_open") is False \
+            and pids == [status.get("pid")] and from_bundle
+        self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else "0.4.0 daemon 未由 setup 正確啟動",
+                        started_by="setup", version=status.get("version"), pid=status.get("pid"),
+                        multi_open=status.get("multi_open"), instances=pids, argv=argv[:6]))
+        config_text = (CONFIG / "config.yaml").read_text(encoding="utf-8") if (CONFIG / "config.yaml").is_file() else ""
+        mode_line = "supervision_mode: systemd-system" in config_text.splitlines()
+        systemctl = lambda *a: self.run(["systemctl", *a], label="systemctl " + " ".join(a), timeout=30).stdout.strip()  # noqa: E731
+        active = systemctl("is-active", "serialwrap")
+        enabled = systemctl("is-enabled", "serialwrap")
+        main_pid = systemctl("show", "serialwrap", "-p", "MainPID", "--value")
+        dropin_dir = SYSTEM_UNIT_DIR / "serialwrap.service.d"
+        dropins = sorted(p.name for p in dropin_dir.glob("*")) if dropin_dir.is_dir() else []
+        ok = mode_line and active == "active" and enabled == "enabled" and main_pid == str(status.get("pid")) and not dropins
+        self.add(uc.row("supervision_reconciled", "PASS" if ok else "FAIL", None if ok else "systemd-system 監管未依 config 收斂",
+                        mode_in_config=mode_line, active=active, enabled=enabled, main_pid=main_pid,
+                        daemon_pid=status.get("pid"), dropins=dropins))
+        self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
+        self.add(uc.judge_doctor("doctor_green_new", self.doctor("0.4.0 doctor"), require_pairing=True))
+        self.run(["sudo", "systemctl", "stop", "serialwrap"], label="收尾 sudo systemctl stop")
+        self.wait_no_daemon()
 
     def _check_supervision(self, check_id: str, pid: Any) -> None:
         config_text = (CONFIG / "config.yaml").read_text(encoding="utf-8") if (CONFIG / "config.yaml").is_file() else ""
@@ -390,6 +503,9 @@ class Driver:
             self.phase_seed()
             already = self.phase_upgrade_running()
             self.phase_upgrade_after_stop(already)
+            if self.mode == "systemd-system":
+                self.phase_new_running_system()
+                return
             self.phase_new_running()
             self.phase_rollback_command()
             self.phase_downgrade()
@@ -409,7 +525,7 @@ def _sha256(path: pathlib.Path) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", required=True, choices=("systemd-user", "on-demand"))
+    parser.add_argument("--mode", required=True, choices=("systemd-user", "on-demand", "systemd-system"))
     parser.add_argument("--wheel", required=True)
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--out", required=True)
@@ -451,7 +567,9 @@ def main() -> int:
         "checks": driver.rows,
         "observations": driver.observations,
     }
-    report["verdict"] = uc.overall_verdict(driver.rows)
+    required = uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM if args.mode == "systemd-system" else uc.REQUIRED_CHECKS
+    report["scope"] = "legacy_direct_setup_success_path" if args.mode == "systemd-system" else "full"
+    report["verdict"] = uc.overall_verdict(driver.rows, required=required)
     (out / "upgrade-report.json").write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                                              encoding="utf-8")
     uid, gid = os.environ.get("SW_HOST_UID"), os.environ.get("SW_HOST_GID")

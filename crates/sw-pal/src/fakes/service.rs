@@ -11,7 +11,7 @@ use std::sync::{
 };
 
 use crate::service_ctl::{
-    AutostartHoldKind, AutostartHoldRecord, CmdRecord, HoldState, ServiceAction, ServiceCtl,
+    AutostartHoldKind, AutostartHoldRecord, CmdRecord, EnabledQuery, HoldState, ServiceAction, ServiceCtl,
     ServiceResult, SupervisionMode, SupervisorDefinition, TaskQuery,
 };
 
@@ -59,6 +59,11 @@ pub struct FakeServiceCtl {
     model: Mutex<Option<ServiceModelState>>,
     hard_stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
     start_spawn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
+    enabled_query: Mutex<Option<EnabledQuery>>,
+    stop_rpc: Mutex<Option<(Arc<super::rpc::FakeRpcConnector>, String)>>,
+    stop_signal: Arc<AtomicBool>,
+    main_pids: Mutex<std::collections::BTreeMap<String, Result<Option<u32>, String>>>,
+    strict_dropin: AtomicBool,
 }
 
 /// 有狀態監管模型的快照（`FakeServiceCtl::set_model`／`query_now`）：`enabled` 為 `None` 表示未註冊。
@@ -74,6 +79,12 @@ impl FakeServiceCtl {
             modes,
             ..Self::default()
         })
+    }
+
+    /// S1-f3c66b4-2：開啟後 systemd hold 紀錄帶 drop-in 路徑，release 缺 drop-in 路徑的 systemd hold 即失敗
+    /// （對齊 `SystemdCtl::release_named`）。預設關閉，既有替身行為不變。
+    pub fn set_strict_dropin(&self, strict: bool) {
+        self.strict_dropin.store(strict, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 依呼叫順序回傳記錄 `(mode, action, with_sudo)`。
@@ -159,6 +170,29 @@ impl FakeServiceCtl {
             .unwrap_or_else(|error| error.into_inner()) = restart;
     }
 
+    /// OD-48 D4：`action(Stop)`（systemctl stop）時停止的測試 RPC endpoint（與 hard stop 分開設定）。
+    pub fn stop_rpc_on_stop(&self, rpc: Arc<super::rpc::FakeRpcConnector>, endpoint: &str) {
+        *self.stop_rpc.lock().unwrap_or_else(|e| e.into_inner()) = Some((rpc, endpoint.to_string()));
+    }
+
+    /// 是否曾執行 `action(Stop)` 的共享旗標（供行程替身判定監管停止後的存活）。
+    pub fn stop_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_signal)
+    }
+
+    /// OD-48 D8：之後 `query_enabled` 回傳此結果（未設定時回 `NotSupported`，沿用 `query` 映射）。
+    pub fn set_enabled_query(&self, query: Option<EnabledQuery>) {
+        *self.enabled_query.lock().unwrap_or_else(|e| e.into_inner()) = query;
+    }
+
+    /// OD-48 D4：指定監管模式回報的 `MainPID`（未設定 → `Ok(None)`）。
+    pub fn set_main_pid(&self, mode: &SupervisionMode, pid: Result<Option<u32>, String>) {
+        self.main_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(mode_name(mode), pid);
+    }
+
     /// 記錄被監管拉起的 pid 清單。
     pub fn relaunches(&self) -> Vec<u32> {
         Vec::new()
@@ -188,6 +222,17 @@ impl FakeServiceCtl {
                 "set_enabled:true" => m.enabled = Some(true),
                 "set_enabled:false" => m.enabled = Some(false),
                 _ => {}
+            }
+        }
+        if action == "stop" {
+            self.stop_signal.store(true, Ordering::SeqCst);
+            if let Some((rpc, endpoint)) = self
+                .stop_rpc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                rpc.stop_endpoint(endpoint);
             }
         }
         if action == "hard_stop" {
@@ -363,7 +408,9 @@ impl ServiceCtl for FakeServiceCtl {
             mode: mode.clone(),
             kind: kind_for(mode),
             name: None,
-            dropin_path: None,
+            dropin_path: (self.strict_dropin.load(std::sync::atomic::Ordering::SeqCst)
+                && kind_for(mode) == AutostartHoldKind::SystemdDropIn)
+                .then(|| std::path::PathBuf::from(format!("/fake/{}/serialwrap.service.d/zz-serialwrap-hold.conf", mode.as_str()))),
             prior_enabled: None,
             prior_restart: self
                 .hold_prior_restart
@@ -386,6 +433,16 @@ impl ServiceCtl for FakeServiceCtl {
             None => "keep",
         };
         self.log(&hold.mode, &format!("release_autostart:{tag}"), with_sudo);
+        if self.strict_dropin.load(std::sync::atomic::Ordering::SeqCst)
+            && hold.kind == AutostartHoldKind::SystemdDropIn
+            && hold.dropin_path.is_none()
+        {
+            return Err(ServiceResult {
+                ok: false, mode: hold.mode.as_str().to_string(), action: "release_autostart".into(), rc: Some(1),
+                stdout: None, stderr: None, error_code: Some("INTERNAL_ERROR"),
+                hint: Some("hold 紀錄缺少 drop-in 路徑".into()), phase: Some("autostart_release"),
+            });
+        }
         let scripted = self.next_result(&hold.mode, "release_autostart");
         if !scripted.ok {
             return Err(scripted);
@@ -411,5 +468,22 @@ impl ServiceCtl for FakeServiceCtl {
         let mut hold = self.hold_autostart(mode, with_sudo)?;
         hold.name = Some(name.to_string());
         Ok(hold)
+    }
+
+    fn query_enabled(&self, _mode: &SupervisionMode) -> EnabledQuery {
+        self.enabled_query
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or(EnabledQuery::NotSupported)
+    }
+
+    fn main_pid(&self, mode: &SupervisionMode) -> Result<Option<u32>, String> {
+        self.main_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&mode_name(mode))
+            .cloned()
+            .unwrap_or(Ok(None))
     }
 }
