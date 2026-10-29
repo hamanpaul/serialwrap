@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -240,8 +241,11 @@ def test_windows_com_runner_is_confined_and_wires_the_frozen_case():
     assert '["device", "attach", "--selector", "COM0"]' in powershell
     assert 'cmd-status-poll' in powershell
     assert 'status_deadline = time.monotonic() + 20' in powershell
-    # daemon 以 body＋"\\n" 送出 agent 命令（sw_core/uart_io.py）；案例須比對本案例基線後恰一行。
-    assert '_dut_tx_bytes(wire)[tx_baseline:]' in com_test
+    # daemon 以 body＋"\\n" 送出 agent 命令（sw_core/uart_io.py）；案例須在 barrier/checkpoint 後比對本案例基線。
+    assert 'control = _open_bridge_control(wire)' in com_test
+    assert '_checkpointed_dut_tx(wire, tx_baseline, control)' in com_test
+    assert 'hashlib.sha256(prefix).hexdigest()' in com_test
+    assert 'wire_sha256' in com_test and 'wire_len' in com_test
     assert 'b"echo X\\n"' in com_test
     assert 'row.get("dir") == "TX" and row.get("observation") == "dut_stdin_write"' in com_test
     assert 'base64.b64decode(row["payload_b64"], validate=True)' in com_test
@@ -559,7 +563,9 @@ def test_windows_com_autostart_case_supplies_release_manifest():
     body = source.split("def test_autostart_l15_tx_once(", 1)[1]
     assert "bundle_manifest_path(" in body
     assert 'env["SERIALWRAP_RELEASE_MANIFEST"]' in body
-    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index("_submit_after_on_demand_autostart(env, wire, tx_baseline)")
+    assert body.index('env["SERIALWRAP_RELEASE_MANIFEST"]') < body.index(
+        "_submit_after_on_demand_autostart(env, wire, tx_baseline, control)"
+    )
 
 
 def test_windows_com_autostart_case_pins_com20_profile():
@@ -570,7 +576,9 @@ def test_windows_com_autostart_case_pins_com20_profile():
     assert 'profile_dir = Path(env["SERIALWRAP_CONFIG_DIR"]) / "profiles"' in body
     assert "device_by_id: COM20" in body
     assert "com: COM0" in body
-    assert body.index("device_by_id: COM20") < body.index("_submit_after_on_demand_autostart(env, wire, tx_baseline)")
+    assert body.index("device_by_id: COM20") < body.index(
+        "_submit_after_on_demand_autostart(env, wire, tx_baseline, control)"
+    )
 
 
 def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(tmp_path, monkeypatch):
@@ -605,8 +613,8 @@ def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(t
     )
     monkeypatch.setattr(module, "is_rust", lambda: True)
     monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
-    monkeypatch.setattr(module, "_WIRE_SETTLE_S", 0.05)
-    monkeypatch.setattr(module, "_WIRE_FLUSH_WAIT_S", 1.0)
+    control = _FakeBridgeControl(wire)
+    monkeypatch.setattr(module, "_open_bridge_control", lambda _: control)
 
     calls = []
     states = ["ATTACHED", "READY"]
@@ -623,11 +631,7 @@ def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(t
                     stdout=b'{"ok":false,"error_code":"SESSION_NOT_READY","session":{"com":"COM0","state":"ATTACHED"}}',
                     stderr="serialwrap: on-demand：已自動啟動\n".encode(),
                 )
-            wire.write_text(
-                '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
-                base64.b64encode(b"echo X\n").decode("ascii") + '"}\n',
-                encoding="utf-8",
-            )
+            _write_echo_tx(wire)
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
         if args == ["session", "list"]:
             state = states.pop(0) if states else "READY"
@@ -649,6 +653,44 @@ def test_windows_com_autostart_waits_for_passthrough_ready_before_final_submit(t
     assert commands[1][-2:] == ["--completion-regex", "echo X"]
     assert calls[1:3] == [["session", "list"], ["session", "list"]]
     assert calls[3:] == [commands[1], ["daemon", "stop"]]
+    assert [action for action, _ in control.calls] == ["barrier", "checkpoint"] * 3
+
+
+class _FakeBridgeControl:
+    """在 barrier 返回前排空排程中的寫入，checkpoint 封住當下完整 wire 前綴。"""
+
+    def __init__(self, wire: Path) -> None:
+        self.wire = wire
+        self.calls: list[tuple[str, dict | None]] = []
+        self._deferred_writes = []
+        self.completed_deferred_writes = 0
+        self.closed = False
+
+    def defer_until_next_barrier(self, write) -> None:
+        self._deferred_writes.append(write)
+
+    def call(self, action: str, params: dict | None = None) -> dict:
+        self.calls.append((action, params))
+        if action == "barrier":
+            assert params == {"mode": "passive", "quiet_ms": 500, "timeout_ms": 10000}
+            pending, self._deferred_writes = self._deferred_writes, []
+            for write in pending:
+                write()
+                self.completed_deferred_writes += 1
+            return {"settled": True, "mode": "passive"}
+        assert action == "checkpoint"
+        if not self.wire.exists():
+            self.wire.write_bytes(b"")
+        raw = self.wire.read_bytes() if self.wire.is_file() else b""
+        assert not raw or raw.endswith(b"\n"), "假 bridge wire 必須只在完整記錄行後建立 checkpoint"
+        return {
+            "wire_len": len(raw),
+            "wire_sha256": hashlib.sha256(raw).hexdigest(),
+            "wire_seq": len(raw.splitlines()),
+        }
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _load_sc18_case(tmp_path, monkeypatch):
@@ -681,22 +723,27 @@ def _load_sc18_case(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(module, "is_rust", lambda: True)
     monkeypatch.setattr(module, "bundle_manifest_path", lambda _: manifest)
-    monkeypatch.setattr(module, "_WIRE_SETTLE_S", 0.05)
-    monkeypatch.setattr(module, "_WIRE_FLUSH_WAIT_S", 1.0)
-    return module, {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, wire
+    control = _FakeBridgeControl(wire)
+    monkeypatch.setattr(module, "_open_bridge_control", lambda _: control)
+    return module, {"SERIALWRAP_CONFIG_DIR": str(tmp_path / "config")}, wire, control
 
 
 def _write_echo_tx(wire):
-    wire.write_text(
-        '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
-        base64.b64encode(b"echo X\n").decode("ascii") + '"}\n',
-        encoding="utf-8",
-    )
+    path = Path(wire)
+    rows = path.read_bytes().splitlines() if path.is_file() else []
+    record = {
+        "seq": len(rows) + 1,
+        "dir": "TX",
+        "observation": "dut_stdin_write",
+        "payload_b64": base64.b64encode(b"echo X\n").decode("ascii"),
+    }
+    with path.open("ab") as stream:
+        stream.write((json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
 
 
 def test_windows_com_autostart_first_submit_success_is_single_request(tmp_path, monkeypatch):
     """首次 autostart 請求直接成功（原驗收形狀）時不得再送第二次。"""
-    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    module, env, wire, _control = _load_sc18_case(tmp_path, monkeypatch)
     calls = []
 
     def fake_run_cli(args, *, env, timeout_s=120.0):
@@ -725,7 +772,7 @@ def test_windows_com_autostart_rejects_unexpected_first_failure(
     tmp_path, monkeypatch, first_stdout, tx_on_reject, message,
 ):
     """首次請求失敗時只接受零 TX 的 SESSION_NOT_READY；其他錯誤或已 TX 皆 FAIL。"""
-    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    module, env, wire, _control = _load_sc18_case(tmp_path, monkeypatch)
 
     def fake_run_cli(args, *, env, timeout_s=120.0):
         if args[:2] == ["cmd", "submit"]:
@@ -747,18 +794,14 @@ def test_windows_com_autostart_rejects_unexpected_first_failure(
 
 def test_windows_com_autostart_counts_only_its_own_tx(tmp_path, monkeypatch):
     """共用 wire 已含其他案例的 `echo X` 時仍以基線後的 TX 判定；本案例多送一次即 FAIL。"""
-    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    module, env, wire, control = _load_sc18_case(tmp_path, monkeypatch)
     _write_echo_tx(wire)  # 同一 B 輪較早案例留下的 TX
     sends = []
 
     def fake_run_cli(args, *, env, timeout_s=120.0):
         if args[:2] == ["cmd", "submit"]:
             sends.append(args)
-            with wire.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
-                    base64.b64encode(b"echo X\n").decode("ascii") + '"}\n'
-                )
+            _write_echo_tx(wire)
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
         if args == ["daemon", "stop"]:
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
@@ -768,16 +811,12 @@ def test_windows_com_autostart_counts_only_its_own_tx(tmp_path, monkeypatch):
     module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
 
     # 同一案例若寫出兩行命令（重送）必須 FAIL。
-    module2, env2, wire2 = _load_sc18_case(tmp_path / "dup", monkeypatch)
+    module2, env2, wire2, _control2 = _load_sc18_case(tmp_path / "dup", monkeypatch)
 
     def duplicate_run_cli(args, *, env, timeout_s=120.0):
         if args[:2] == ["cmd", "submit"]:
             for _ in range(2):
-                with wire2.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        '{"dir":"TX","observation":"dut_stdin_write","payload_b64":"' +
-                        base64.b64encode(b"echo X\n").decode("ascii") + '"}\n'
-                    )
+                _write_echo_tx(wire2)
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
         if args == ["daemon", "stop"]:
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
@@ -789,45 +828,32 @@ def test_windows_com_autostart_counts_only_its_own_tx(tmp_path, monkeypatch):
 
 
 def test_windows_com_autostart_waits_for_lagging_wire_record(tmp_path, monkeypatch):
-    """bridge 證據 writer 非同步落盤：CLI 回傳後才寫入的 TX 列仍須被計入（有界等待）。"""
-    import threading
-
-    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
-    writers = []
+    """CLI 回傳後才落盤的 TX 列會在 barrier 完成前寫入，checkpoint 仍須計入。"""
+    module, env, wire, control = _load_sc18_case(tmp_path, monkeypatch)
 
     def fake_run_cli(args, *, env, timeout_s=120.0):
         if args[:2] == ["cmd", "submit"]:
-            timer = threading.Timer(0.3, _write_echo_tx, args=(wire,))
-            timer.start()
-            writers.append(timer)
+            control.defer_until_next_barrier(lambda: _write_echo_tx(wire))
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr="serialwrap: on-demand：已自動啟動\n".encode())
         if args == ["daemon", "stop"]:
             return SimpleNamespace(rc=0, stdout=b'{"ok":true}', stderr=b"")
         raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
 
     monkeypatch.setattr(module, "run_cli", fake_run_cli)
-    try:
-        module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
-    finally:
-        for timer in writers:
-            timer.join(2)
+    module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+    assert control.completed_deferred_writes == 1
 
 
 def test_windows_com_autostart_rejected_request_delayed_tx_is_counted(tmp_path, monkeypatch):
     """被拒請求的 TX 延遲落盤、READY 立即、最後一次送出遺失 → 必須 FAIL（不得以延遲 TX 冒充最後一次送出）。"""
-    import threading
-
-    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
-    writers = []
+    module, env, wire, control = _load_sc18_case(tmp_path, monkeypatch)
     submits = []
 
     def fake_run_cli(args, *, env, timeout_s=120.0):
         if args[:2] == ["cmd", "submit"]:
             submits.append(args)
             if len(submits) == 1:
-                timer = threading.Timer(0.3, _write_echo_tx, args=(wire,))
-                timer.start()
-                writers.append(timer)
+                control.defer_until_next_barrier(lambda: _write_echo_tx(wire))
                 return SimpleNamespace(
                     rc=2, stdout=b'{"ok":false,"error_code":"SESSION_NOT_READY"}',
                     stderr="serialwrap: on-demand：已自動啟動\n".encode(),
@@ -842,17 +868,14 @@ def test_windows_com_autostart_rejected_request_delayed_tx_is_counted(tmp_path, 
         raise AssertionError(f"未預期的 CLI 呼叫：{args!r}")
 
     monkeypatch.setattr(module, "run_cli", fake_run_cli)
-    try:
-        with pytest.raises(AssertionError, match="被拒絕的首次請求不得在 DUT 端留下任何 TX"):
-            module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
-    finally:
-        for timer in writers:
-            timer.join(2)
+    with pytest.raises(AssertionError, match="被拒絕的首次請求不得在 DUT 端留下任何 TX"):
+        module.test_autostart_l15_tx_once(tmp_path, env, tmp_path / "DELEGATED")
+    assert control.completed_deferred_writes == 1
 
 
 def test_windows_com_autostart_requires_autostart_evidence(tmp_path, monkeypatch):
     """首次請求即使成功，也必須留下 on-demand 自動啟動證據。"""
-    module, env, wire = _load_sc18_case(tmp_path, monkeypatch)
+    module, env, wire, _control = _load_sc18_case(tmp_path, monkeypatch)
 
     def fake_run_cli(args, *, env, timeout_s=120.0):
         if args[:2] == ["cmd", "submit"]:
