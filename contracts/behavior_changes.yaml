@@ -86,9 +86,9 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["bc03-aborted-in-flight-after-1byte", "bc03-unknown-outcome-send-failed", "bc03-no-auto-resend"]
-    compatibility_impact: "已確認寫出至少 1 byte 後中止的命令改回 COMMAND_ABORTED_IN_FLIGHT（retryable:false）；結果不明時沿用既有 SEND_FAILED 映射。依碼分支的 agent 需新增 COMMAND_ABORTED_IN_FLIGHT 處理；不得因此自動重送。"
+    compatibility_impact: "已確認寫出至少 1 byte 後中止的命令改回 COMMAND_ABORTED_IN_FLIGHT（retryable:false）；結果不明時沿用既有 SEND_FAILED 映射。依碼分支的 agent 需新增 COMMAND_ABORTED_IN_FLIGHT 處理；不得因此自動重送。file.push／file.pull（OD-62）：傳輸已寫出至少 1 byte 後因 drain、世代過期或取消中止時，同步回應改為 COMMAND_ABORTED_IN_FLIGHT（push 附 chunks_sent／chunks_total）；0.3.2 的 file.* 用戶端在此情境原本收到 TRANSFER_TIMEOUT（或例外），需新增此碼處理，且不得自動重送。"
     approval_conditions: "已確認寫出至少 1 byte 後中止，`retryable:false`；結果不明須另凍結相容映射，不得混入安全重試"
-    related_decisions: ["OD-04"]
+    related_decisions: ["OD-04", "OD-62"]
   - id: "BC-04"
     kind: "BC"
     title: "Per-UART 獨占、衝突阻斷與 holder 診斷"
@@ -248,9 +248,9 @@ changes:
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["sc04-drain-recovering-release-timeout"]
-    compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 的 release drain 逾時回 DRAIN_STALLED，並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。"
+    compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 的 release drain 逾時回 DRAIN_STALLED，並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。file.push／file.pull（OD-62）：傳輸中遇 drain、世代過期或取消且尚未寫出任何 byte 時，同步回應改為 FLUSHED_BY_RECOVERY（可在 READY 後重送）；0.3.2 的 file.* 用戶端在此情境原本收到 TRANSFER_TIMEOUT（或例外），需新增此碼處理；已寫出者見 BC-03。"
     approval_conditions: "ADR-06 安全骨架；OD-14 #4 裁決 release drain 逾時回 DRAIN_STALLED；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_zero_tx`）"
-    related_decisions: ["OD-14"]
+    related_decisions: ["OD-14", "OD-62"]
   - id: "SC-05"
     kind: "SC"
     title: "device.attach 同步重新取得獨占"

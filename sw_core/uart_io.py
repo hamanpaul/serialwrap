@@ -478,9 +478,23 @@ class UARTBridge:
             self._tx_permit_context = context
         previous = getattr(context, "operation_permit", None)
         context.operation_permit = permit
+        # OD-62：累計本操作已確認寫出的 bytes；被拒時附在例外上，供呼叫端區分
+        # FLUSHED_BY_RECOVERY（零寫出）與 COMMAND_ABORTED_IN_FLIGHT（已寫出）。
+        tallies = getattr(self, "_operation_tx_confirmed", None)
+        if tallies is None:
+            tallies = {}
+            self._operation_tx_confirmed = tallies
+        owns_tally = permit.op_id not in tallies
+        if owns_tally:
+            tallies[permit.op_id] = 0
         try:
             yield
+        except TxIncompleteError as exc:
+            exc.operation_confirmed = tallies.get(permit.op_id, 0)
+            raise
         finally:
+            if owns_tally:
+                tallies.pop(permit.op_id, None)
             if previous is None:
                 try:
                     del context.operation_permit
@@ -2187,6 +2201,9 @@ class UARTBridge:
                 )
 
             self._tx_account_result_locked(cmd_id, result)
+            tallies = getattr(self, "_operation_tx_confirmed", None)
+            if tallies and active_permit is not None and active_permit.op_id in tallies:
+                tallies[active_permit.op_id] += result.confirmed
             if log and result.confirmed > 0:
                 self._append_tx_record_locked(
                     payload[: result.confirmed],

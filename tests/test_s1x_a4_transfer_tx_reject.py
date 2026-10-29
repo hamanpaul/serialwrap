@@ -6,9 +6,10 @@ Stage 1 出口審查 A 指出：傳輸中目標重開機觸發 `arm_boot_quiet`�
 
 修正後：
 - `quiet` → `AUTOBOOT_QUIET`＋`retry_after_s`（SC-03 已核准此碼用於 file.*）。
-- 其餘拒絕（drain、世代過期、取消、部分寫出）→ 傳輸自身的 `TRANSFER_TIMEOUT`
-  （0.3.2 結束碼，`contracts/rpc_schema.json` file.* 既有錯誤碼），push 附 `chunks_sent`／
-  `chunks_total`。
+- drain、世代過期、取消（OD-62，比照 BC-03）：本次傳輸已寫出 ≥1 byte →
+  `COMMAND_ABORTED_IN_FLIGHT`；尚未寫出任何 byte → `FLUSHED_BY_RECOVERY`。push 附
+  `chunks_sent`／`chunks_total`。零寫出與其他拒絕原因的案例見
+  `tests/test_s1x_od62_file_tx_abort.py`。
 
 本檔以真 `UARTBridge`＋`FakePort`＋最小 shell 模擬器重現「第 3 個 chunk 後翻 quiet」。
 """
@@ -164,8 +165,8 @@ def test_push_quiet_mid_transfer_returns_autoboot_quiet(tmp_path: Path, ack_mode
 
 
 @pytest.mark.parametrize("ack_mode", ["none", "echo"])
-def test_push_drain_mid_transfer_returns_transfer_timeout(tmp_path: Path, ack_mode: str) -> None:
-    """傳輸中 bridge 進入 drain：回傳輸自身的 TRANSFER_TIMEOUT（附 chunks_sent），不拋例外。"""
+def test_push_drain_mid_transfer_returns_aborted_in_flight(tmp_path: Path, ack_mode: str) -> None:
+    """傳輸中 bridge 進入 drain（已寫出 probe 與 2 個 chunk）：回 COMMAND_ABORTED_IN_FLIGHT（OD-62），附 chunks_sent，不拋例外。"""
     mgr, s, bridge, _port, target = _ready(tmp_path)
 
     def freeze(line: str) -> None:
@@ -182,9 +183,10 @@ def test_push_drain_mid_transfer_returns_transfer_timeout(tmp_path: Path, ack_mo
     )
 
     assert result["ok"] is False, result
-    assert result["error_code"] == "TRANSFER_TIMEOUT", result
+    assert result["error_code"] == "COMMAND_ABORTED_IN_FLIGHT", result
     assert result["chunks_sent"] == 2
     assert result["chunks_total"] == 6
+    assert len(_chunk_lines(target)) == 2, "drain 後不得再送 chunk"
     assert s.foreground_busy is False
 
 
@@ -209,8 +211,8 @@ def test_pull_quiet_before_read_returns_autoboot_quiet(tmp_path: Path) -> None:
     assert s.foreground_busy is False
 
 
-def test_pull_drain_before_read_returns_transfer_timeout(tmp_path: Path) -> None:
-    """pull 中 bridge 進入 drain：回 TRANSFER_TIMEOUT，不拋例外。"""
+def test_pull_drain_before_read_returns_aborted_in_flight(tmp_path: Path) -> None:
+    """pull 在 encoder probe 已寫出後 bridge 進入 drain：回 COMMAND_ABORTED_IN_FLIGHT（OD-62），不拋例外。"""
     mgr, s, bridge, _port, target = _ready(tmp_path)
     target.files["/tmp/y"] = b"hello"
 
@@ -224,5 +226,6 @@ def test_pull_drain_before_read_returns_transfer_timeout(tmp_path: Path) -> None
     )
 
     assert result["ok"] is False, result
-    assert result["error_code"] == "TRANSFER_TIMEOUT", result
+    assert result["error_code"] == "COMMAND_ABORTED_IN_FLIGHT", result
+    assert not any("base64 < " in line for line in target.lines)
     assert s.foreground_busy is False

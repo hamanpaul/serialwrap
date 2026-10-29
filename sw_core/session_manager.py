@@ -8025,11 +8025,15 @@ class SessionManager:
     def _file_tx_rejected_result(
         session: SessionRuntime, exc: TxIncompleteError
     ) -> dict[str, Any]:
-        """把檔案傳輸中被拒的 TX 映射為 file.* 既有錯誤碼（S1X-a-4）。
+        """把檔案傳輸中被拒的 TX 映射為 file.* 錯誤碼（S1X-a-4、OD-62）。
 
-        ``quiet`` 且零寫出 → ``AUTOBOOT_QUIET``＋``retry_after_s``（SC-03）；其餘
-        （drain、世代過期、取消、部分寫出等）→ 傳輸自身的 ``TRANSFER_TIMEOUT``（0.3.2
-        結束碼）。push 另附 ``chunks_sent``／``chunks_total``。
+        - ``quiet`` 且被拒的這筆零寫出 → ``AUTOBOOT_QUIET``＋``retry_after_s``（SC-03）。
+        - drain、世代過期、取消（OD-62，比照 BC-03）：整段傳輸已確認寫出 ≥1 byte →
+          ``COMMAND_ABORTED_IN_FLIGHT``；零寫出 → ``FLUSHED_BY_RECOVERY``。``quiet`` 但
+          該筆已部分寫出者同屬已寫出。
+        - 其餘（結果不明、flashing 等）→ 傳輸自身的 ``TRANSFER_TIMEOUT``（0.3.2 結束碼）。
+
+        push 另附 ``chunks_sent``／``chunks_total``。
         """
         progress = {
             key: getattr(exc, key)
@@ -8051,6 +8055,13 @@ class SessionManager:
                 "retry_after_s": retry_after_s,
                 **progress,
             }
+        if reason in {"quiet", "cancelled", "stale_generation", "draining"}:
+            written = getattr(exc, "operation_confirmed", None)
+            if written is None:
+                written = exc.result.confirmed
+            if written > 0:
+                return {"ok": False, "error_code": "COMMAND_ABORTED_IN_FLIGHT", **progress}
+            return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY", **progress}
         return {"ok": False, "error_code": "TRANSFER_TIMEOUT", **progress}
 
     def file_push(

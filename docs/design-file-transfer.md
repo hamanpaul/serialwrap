@@ -54,6 +54,7 @@ serialwrap file pull --selector COM0 --remote /etc/config --local ./config
 - **Resumable**：中斷時可檢查既有暫存檔大小
 - **Binary safety**：base64 編碼處理二進位檔案
 - **Cleanup**：成功或明確取消後清除暫存檔
+- **傳輸中 TX 被拒**（OD-62，比照 BC-03）：drain、世代過期或取消時停止送出；本次傳輸零寫出回 `FLUSHED_BY_RECOVERY`，已寫出 ≥1 byte 回 `COMMAND_ABORTED_IN_FLIGHT`（push 附 `chunks_sent`／`chunks_total`）；boot quiet 回 `AUTOBOOT_QUIET`（SC-03）。「已寫出」以整段傳輸共用的操作 permit 累計（`UARTBridge.operation_permit`）
 
 ## 曾考慮的替代方案
 
