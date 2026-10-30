@@ -100,6 +100,12 @@ pub enum HandoffWait {
 
 pub const MAX_HANDOFF_CHAIN: usize = 3;
 
+/// 已交接實例「關閉監聽後」的結束等待上限（SC-12：ping 不通且行程消失，上限 10 s）。
+///
+/// 交接 grant 後 daemon 先保留排空窗口（OD-16 (3)，Python 基線 `HANDOFF_DRAIN_GRACE_S`＝3 s）仍回 ping，
+/// 窗口結束才關閉監聽並進入 SC-11 有序關機；SC-12 的 10 s 自此起算，不得被排空窗口吃掉。
+pub const HANDOFF_EXIT_WAIT: Duration = Duration::from_secs(10);
+
 pub fn graceful_stop(
     ctx: &mut CliCtx<'_>,
     mode: &SupervisionMode,
@@ -449,6 +455,8 @@ fn with_handoff_context(
     }
 }
 
+/// 等待已取得 grant 的實例結束。`timeout` 約束實例仍回應 `health.ping` 的期間（排空窗口在其內）；
+/// 一旦觀察到 ping 不通而舊行程樹仍在（已關閉監聽、正在有序關機），改以 [`HANDOFF_EXIT_WAIT`] 自該時刻起算。
 pub fn wait_handoff_gone(
     ctx: &CliCtx<'_>,
     endpoint: &str,
@@ -457,6 +465,8 @@ pub fn wait_handoff_gone(
 ) -> HandoffWait {
     let started = ctx.p.clock.mono_ns();
     let limit = timeout.as_nanos().min(u64::MAX as u128) as u64;
+    let exit_limit = HANDOFF_EXIT_WAIT.as_nanos().min(u64::MAX as u128) as u64;
+    let mut exiting_since: Option<u64> = None;
     loop {
         let ping = client::call(
             ctx,
@@ -531,7 +541,13 @@ pub fn wait_handoff_gone(
                 }
             }
         }
-        if ctx.p.clock.mono_ns().saturating_sub(started) >= limit {
+        let now = ctx.p.clock.mono_ns();
+        let timed_out = if ping {
+            now.saturating_sub(started) >= limit
+        } else {
+            now.saturating_sub(*exiting_since.get_or_insert(now)) >= exit_limit
+        };
+        if timed_out {
             return HandoffWait::TimedOut;
         }
         ctx.p.clock.sleep(Duration::from_millis(200));
