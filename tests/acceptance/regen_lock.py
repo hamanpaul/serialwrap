@@ -15,7 +15,7 @@
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
                                                       # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
                                                       # 且清單必須與該集合消失集合完全相符；新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
-                                                      # OD-24：collect JSON 的 ignored 名單（cargo_l1_results.py --list-only）新增時排除；
+                                                      # OD-24：collect JSON 的 ignored 列新增時預設排除；明確 `-- --ignored cap_<cap>__` 僅納入同能力列；
                                                       # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
   核准移除格式（收緊，2026-10-23）：`--allow-removal` 僅接受三元組 `set_id:platform:nodeid`（platform ∈ linux|windows）。
   裸 nodeid 不再被接受（舊版只比對 nodeid，Windows 之核准會放行 Linux 必要集合中同名 nodeid 之刪除；sol d82d146）。
@@ -467,6 +467,28 @@ def _read_collect(path: pathlib.Path) -> tuple[list[str], set[str]]:
     return ids, set()
 
 
+_CAP_IGNORED_FILTER_RE = re.compile(r"cap_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)__")
+
+
+def _explicit_ignored_capability_nodeids(selector: dict[str, Any] | None, ignored: set[str]) -> set[str]:
+    """只對精確的 `-- --ignored cap_<cap>__` selector 回傳同能力 ignored 列。"""
+    if not isinstance(selector, dict):
+        return set()
+    argv = selector.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return set()
+    if argv.count("--") != 1:
+        return set()
+    libtest_args = argv[argv.index("--") + 1:]
+    if len(libtest_args) != 2 or libtest_args[0] != "--ignored":
+        return set()
+    match = _CAP_IGNORED_FILTER_RE.fullmatch(libtest_args[1])
+    if match is None:
+        return set()
+    prefix = f"cap_{match.group(1)}__"
+    return {nid for nid in ignored if nid.rsplit("::", 1)[-1].startswith(prefix)}
+
+
 def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None, str | None]:
     """由 CLI 組出 selector：`--selector <檔>` 或行內 `--argv-json` 等（兩者互斥）。回傳 (selector, 錯誤訊息)。"""
     inline = args.argv_json is not None or args.paths_json is not None or args.markexpr is not None
@@ -521,13 +543,16 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         if approvals:
             print(f"[regen_lock] REFUSED 新增集合 {set_id}.{platform} 無既有 nodeid 可移除，--allow-removal 須為空，鎖檔未變更", file=sys.stderr)
             return 1
-        # OD-24：#[ignore] 列不由官方 selector 執行，新增時一律排除
-        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored)}
+        # OD-24：預設排除 #[ignore]；明確能力 selector 僅納入同能力列。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(selector, ignored)
+        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored_excluded)}
         added_count = len(new_spec["nodeids"])
     else:
         if selector is not None and selector != spec["selector"]:
             print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
             return 1
+        # 既有集合的 selector 以鎖內版本為準；未傳 CLI selector 時不可退回「全部 ignored」。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(spec["selector"], ignored)
         allowed = {nid for _s, _p, nid in approvals}
         # 既有 ignored 列仍在 collected 內，不視為消失（plan 04 Task 17）；OD-24 起可逐名核准移除
         removed = sorted((set(spec["nodeids"]) - set(collected)) | (allowed & set(spec["nodeids"]) & ignored))
@@ -541,7 +566,7 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
                 print(f"  - 未消失 {set_id}.{platform} {nid}", file=sys.stderr)
             print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
-        added = sorted(set(collected) - set(spec["nodeids"]) - ignored)
+        added = sorted(set(collected) - set(spec["nodeids"]) - ignored_excluded)
         if not added and not removed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
