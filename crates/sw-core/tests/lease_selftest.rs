@@ -1283,13 +1283,26 @@ fn selftest_probe_drain_race_golden() {
             },
             reply: release_tx,
         });
+        // 先等真實 worker drain／release 完成，再推進等待 self-test nonce 的 FakeClock。
+        // 若在 release 等待期間每 1 ms 推進 100 ms，可能先於 worker receipt 觸發 3 s drain timeout，
+        // 將測試時鐘飆速誤報成 release DRAIN_STALLED。
+        let rel = release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release 回覆")
+            .expect("release ok");
+        assert_eq!(
+            rel["ok"],
+            PyValue::Bool(true),
+            "第 {i} 輪 release 回覆：{rel:?}"
+        );
+
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = loop {
             if let Ok(v) = probe_rx.try_recv() {
                 break v;
             }
             assert!(Instant::now() < deadline, "第 {i} 輪 self-test 未回覆");
-            // probe 已提交但 nonce 回應被 drain 截斷時，以 FakeClock 推進讓 nonce 等待逾時。
+            // release 已完成；若 probe 已提交但 nonce 回應被 drain 截斷，再推時鐘使它逾時。
             h.clock.advance(Duration::from_millis(100));
             std::thread::sleep(Duration::from_millis(1));
         };
@@ -1313,11 +1326,6 @@ fn selftest_probe_drain_race_golden() {
                 refused += 1;
             }
         }
-        let rel = release_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("release 回覆")
-            .expect("release ok");
-        assert_eq!(rel["ok"], PyValue::Bool(true));
         h.wait_state("RELEASED");
         let _ = h.dev.take_tx();
         h.dev.on_tx_reply(b"\n", b"root@t:/# ");
