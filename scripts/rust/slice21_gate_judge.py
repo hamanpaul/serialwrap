@@ -59,6 +59,8 @@ TEST_SECTIONS: dict[str, str] = {
     # P5 第 6 輪 SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合 s21_gate:py_parity_full 判定；
     # 舊集合 s21_gate:py_parity 不改不刪、仍由 pytest_full 承擔（兩者皆由 gate 執行）。
     "py_parity": "linux",
+    # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 的 add-only parity 集合。
+    "py_parity_76_80": "linux",
 }
 # SPEC-GAP #2：能力集合 section 須附 gate 的能力探測（`capability_probe`：{cap, available, evidence}）且 available 為 true
 # 才可依 l1 結果判定；否則一律 EVIDENCE_MISSING 並標所需能力、處置與實跑方式（不得記 PASS——例如 cap_sys_admin 測試在
@@ -94,7 +96,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "cfg_boundary", "linux_l1", "linux_cap_posix_pty", "linux_cap_sys_admin", "linux_cap_windows_native",
     "linux_cap_interactive_desktop", "linux_cap_supervisor_runtime", "windows_native_l1", "windows_cap_windows_com",
     "blackbox_python", "blackbox_rust", "existing_suites_rust", "l15_ab", "event_latency", "wal_s1w_perf",
-    "case_uptake", "py_parity", "pytest_full", "policy_check",
+    "case_uptake", "py_parity", "py_parity_76_80", "pytest_full", "policy_check",
 )
 # 計畫判定規則：只有此 section 可在 EVIDENCE_MISSING 下不阻擋（不接受報告自行宣告的豁免）。
 ALLOWED_MISSING: dict[str, str] = {"windows_cap_windows_com": "BO-S21-01"}
