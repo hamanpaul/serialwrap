@@ -45,6 +45,7 @@ jobs:
         # 1e24d68＝Linux 占位 12＋12（核准只涵蓋 Linux，見 owner-decisions-s1x-g-list.md）；1ea2bdc＝s1b_cargo.linux 舊名 2；e25aec0＝舊 10 筆 docker／stage0 裁決保留（s0_win_pytest.windows）。
         # 1e24d68（24）、1ea2bdc（2）、e25aec0（10）三組共 36 個三元組由 OD-23（2026-10-27）逐名補授權；清單見 docs/rust-refactor/reviews/s1x-unauthorized-removals.md。
         # OD-24（2026-10-27）：s1b_cargo 的 5 筆 #[ignore] 列（68d0941 夾帶新增）逐名移除；承擔者見 owner-decisions-2026-10-15.md OD-24 列。
+        # OD-68（2026-10-30）：逐名核准 windows-only 能力集合的 3 筆 linux 列移除；Windows 承擔列與 LOCAL-WINDOWS-TODO 見 slice21-owner-runbook.md。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
           python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }} --allow-removal
@@ -598,6 +599,9 @@ jobs:
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry'
           's1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry'
           's1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip'
+          's21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem'
+          's21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child'
+          's21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c'
 
   bridge-tools:
     if: github.event.action != 'labeled'

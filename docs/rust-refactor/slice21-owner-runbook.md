@@ -239,8 +239,16 @@ gate 為 OD-55 的 linux 能力集合各設一個 section（`linux_cap_<cap>`）
 |---|---|---|---|---|
 | `linux_cap_sys_admin` | `s21_gate:cap_sys_admin` | root（euid 0）且 `CapEff` 含 CAP_SYS_ADMIN | BLOCKED-OWNER | 以 root 於可丟棄容器（例：`docker run --cap-add SYS_ADMIN`，掛載 repo）跑 gate（須設 `SW_GATE_L1_USER` 讓 linux_l1／linux_cap_posix_pty 降權為非 root，F108），或單獨執行 `python3 scripts/rust/cargo_l1_results.py --platform linux --out <run>/linux_cap_sys_admin/l1-results.json --caps-only --caps sys_admin -- --workspace --features test-fakes -- --ignored cap_sys_admin__`（`--caps-only`：只跑能力列；root 下 sw-pal 預設測試數支必紅，不得一併執行。gate 以 `slice21_gate_judge.py caps-plan` 由鎖 selector 推導，OD-53） |
 | `linux_cap_supervisor_runtime` | `s21_gate:cap_supervisor_runtime` | `systemctl --user is-system-running` 為 running／degraded | BLOCKED-OWNER | 於隔離的 systemd 容器（`tools/docker/systemd.Dockerfile`，OD-15）以一般使用者登入 session 跑 gate，或單獨執行 `... --out <run>/linux_cap_supervisor_runtime/l1-results.json --caps-only --caps supervisor_runtime -- --workspace --features test-fakes -- --ignored cap_supervisor_runtime__`；測試會建立並清除暫時 user unit |
-| `linux_cap_windows_native` | `s21_gate:cap_windows_native` | 原生 Windows | LOCAL-WINDOWS-TODO | linux 列的測試本體需 PowerShell／Job Object，linux 主機無法滿足；待擁有者裁決改由 Windows 原生集合承擔 |
-| `linux_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop` | Windows 互動 console | LOCAL-WINDOWS-TODO | 非 Windows 版刻意 panic；同上 |
+| `linux_cap_windows_native` | `s21_gate:cap_windows_native` | 原生 Windows | LOCAL-WINDOWS-TODO | OD-68 已核准移除 Linux 兩列；其 Windows 承擔映射與完整 nodeid 見下表。Windows 原生收集／實跑仍待完成，不得記 PASS |
+| `linux_cap_interactive_desktop` | `s21_gate:cap_interactive_desktop` | Windows 互動 console | LOCAL-WINDOWS-TODO | OD-68 已核准移除 Linux 列；其 Windows 承擔映射與完整 nodeid 見下表。Windows 原生收集／實跑仍待完成，不得記 PASS |
+
+OD-68 的逐筆核准與 Windows 承擔列如下。凍結鎖目前在 `s21_core.windows` 保留完整 Windows nodeid；尚未完成 Windows 原生收集／實跑，因此相關能力仍是 `LOCAL-WINDOWS-TODO`，缺測必須阻擋完成判定。
+
+| 已核准移除的 Linux 三元組 | Windows 承擔集合 | 完整 Windows nodeid | 狀態 |
+|---|---|---|---|
+| `s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem` | `s21_core.windows` | `cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem` | `LOCAL-WINDOWS-TODO` |
+| `s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child` | `s21_core.windows` | `cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child` | `LOCAL-WINDOWS-TODO` |
+| `s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c` | `s21_core.windows` | `cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c` | `LOCAL-WINDOWS-TODO` |
 
 單獨執行後若要併入 gate 判定，以 `slice21_gate_judge.py record-section --name linux_cap_<cap> --required-set s21_gate:cap_<cap>
 --l1-results <cap>/l1-results.json --exit <rc> --capability-probe "<cap>=available:<證據>"` 寫入該 run 的 section 片段後重新 `assemble`。
