@@ -417,3 +417,31 @@ add-only 登記至 `p7_gate:python3-m-pytest-q-tests`（skip／xfail 不納入�
 | P7-38c150c-4 | Low | fix-responses 的 merge commit 編號、mailbox 調整未揭露、OD-67 列過時 | 本輪紀錄筆誤，已順帶更正上方兩表（不涉程式） |
 | P7-38c150c-5、-6 | Low | interleave 接線無 memory-only 回歸；`_judge_prior` 的 BLOCKED-OWNER 與取最差範圍 | 依收斂規則不修（記 low-backlog） |
 | P7-cd7acf0-4 | Medium（5 輪） | 缺 `p7_gate:contract-blackbox-slice22-b` | 維持 BLOCKED-UPSTREAM（P6 檔案不在本分支），累計 ≥3 輪，列 OWNER-BATCH 請裁定「延後至 P6 合入」 |
+
+## P7-r8-c（OD-71／OD-73；起點 `62e430d43768f0b543eb36e328efa47124ded27f`）
+
+### High／Medium finding 處理
+
+| finding | 嚴重度 | 處理 |
+|---|---|---|
+| P7-38c150c-1 | Medium | **依裁決延後**：OD-70 的逐名移除與凍結節點回歸等 P5 `tests/acceptance/regen_lock.py` 修正合入後再做；本輪未碰該工具或鎖列。 |
+| P7-38c150c-2 | Medium | **fixed `8dce2dec`（OD-71）**：預設 pytest／CI 維持 200／20×1 快速檢查並明示不代表契約；P7 gate 新增 OD-59 專屬 A／B 量測列，讀取 `event_latency` 契約 500×3、以原 judge 與作廢規則逐輪判定。報表及 coverage 不再以小樣本 A／B 列宣稱契約 PASS；CHG-S23-CTRL-LATENCY-OD59-01、計畫與案例說明已同步。 |
+| P7-cd7acf0-4 | Medium | **依裁決延後至 P6 合入**：本輪不改 P6 案例或凍結集合；保持 BLOCKED-UPSTREAM。 |
+| P7-62e430d-1 | Medium | **fixed `8dce2dec`**：P7 gate 額外建置及快照 slice21 同類型 release daemon，置於 `prior_slice_artifacts.serialwrapd_release`；來源綁定改比對該 SHA，保留 debug daemon 作為本次受測 artifact。新增 debug／release SHA 不同的回歸。 |
+
+### OD-73
+
+**fixed `29a5eb9b`**：新增 DF-24，記錄 Python force recover 持 SessionManager lock 約 10 秒期間，同窗 6 秒 `session list` 逾時；Rust actor timer 不阻塞 list，list 於 1 秒內回覆，而 force recover 維持 10～13 秒並以 `FORCE_RECOVER_TIMEOUT` 收斂。`test_recover_force_timeout_attached` 加入兩邊並行量測；Python 基線 1 passed（12.13 秒），Rust 1 passed（11.42 秒）。
+
+### 驗證與失敗處理
+
+- OD-71／artifact binding 修復前，`tests/test_p7_ab_report.py` 新增的兩支 regression 皆紅；修後受影響測試 `tests/test_p7_ab_report.py`、`tests/test_p7_gate_report.py`、`tests/test_p7_gate_win_argv.py`、`tests/test_contracts_catalog.py` 共 **176 passed**（2 warnings）。OD-59 Rust 快速檢查 1 passed；Python 快速檢查保留嚴格 judge，兩次單項與全套 pytest 都回報 `INSUFFICIENT_EVIDENCE`，沒有轉成 PASS。
+- 全套 `python3 -m pytest -q tests/`（前景一次）：**5813 passed、175 skipped、1 xfailed、10 failed、14 warnings、98 subtests passed，exit 1，5840.95 秒**。失敗 ID：`test_login_with_delay_and_noise`、`test_control_latency_under_flood_with_events`、`test_slice22_case_set_frozen_and_mapped`、`test_l1_lock_frozen_set_excludes_capability_gated`、`test_l1_lock_cargo_sets_exclude_ignored_tests`、`test_cargo_workspace_tests_windows_native`、`test_p4_required_cases_have_passing_evidence`、`test_win_test_report_schema`、`test_blackbox_pytest_argv_matches_frozen_l1_selectors`、`test_win_staging_covers_contract_blackbox_scripts_refs`。
+- 起點報告已記載其中五項既有失敗：slice22 evidence map 多出 `l15-delayed-reply`、`s21_core.windows` 的兩支 L1 檢查、Windows cargo L1 報告缺失、P4 必要證據缺失。其餘靜態 Windows argv／staging 失敗的測試與 runner 在起點未變；兩個 staging 缺檔引用（`scripts/rust/event_latency_measure.py`、`scripts/rust/p7_ab_report.py`）也已存在起點。`test_win_test_report_schema` 同一測試單項重跑 **1 passed**；全套失敗時另有同 worktree runner 執行，記錄其首次失敗，不將重跑通過回填為全套 PASS。`test_login_with_delay_and_noise` 的案例本體、harness 與 production Rust/Python 實作未由本輪修改；全套實際觀察到 `POST_LOGIN_CMD_TIMEOUT`，保留為起點既有行為證據，不標作 flaky。
+- 其餘門檻：`cargo test --workspace` exit 0；`cargo check --workspace --target x86_64-pc-windows-gnu`、`scripts/rust/check_cfg_boundary.py`、`tools.contracts check`、`tests/acceptance/regen_lock.py --check`、policy check 皆 exit 0。Policy 25 pass／0 fail／2 pre-existing warnings。L1 鎖只以 `tests/acceptance/regen_lock.py --l1-add-only` 新增 229 筆、移除 0 筆。
+
+### SPEC-GAPS 與未執行項目
+
+- P6 的 s22 gate 尚未輸出 `identity.git_revision`／`identity.daemon_sha256`；依裁決由 P6 補齊，本輪不改範圍外檔案。
+- 未執行 P7 出口證據 driver、slice gate 或 OD-59 500×3 runtime；OD-59 契約列的正式 A／B 結果仍待後續出口 gate。
+- OD-70／OD-72 等待 P5 `tests/acceptance/regen_lock.py` 修正；P7-cd7acf0-4 等待 P6 合入。
