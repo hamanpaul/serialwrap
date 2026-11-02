@@ -22,6 +22,14 @@ unix://C:\Users\haman\AppData\Local\Temp\.tmpQj2k2l\run/serialwrapd.sock
 
 `crates/sw-cli/src/legacy_handoff.rs:585-586` 直接把 `relaunched.socket` 傳給 `restop()`。`crates/sw-cli/src/client.rs:319-322` 在 `parse_endpoint()` 失敗時產生 `INVALID_ENDPOINT`；`crates/sw-proto/src/endpoint.rs:343-349` 拒絕 `unix://` URL 中非空的 netloc。上述字串被拆成 scheme `unix`、netloc `C:\Users\...`，因此在送出 RPC 前即被拒絕。
 
+第 2 輪在目前 HEAD `11c81d77` 重新以 Windows 原生執行檔執行指定案例：
+
+```text
+target/x86_64-pc-windows-gnu/debug/deps/mgmt_legacy_handoff-0da86b76821a468d.exe --test-threads=1 --exact legacy_e_single_relaunch_is_restopped
+```
+
+結果仍為 `0 passed; 1 failed`，exit code `101`。臨時在 `restop()` 輸出的 endpoint 為 `unix://C:\Users\haman\AppData\Local\Temp\.tmpBomyF8\run/serialwrapd.sock`，回報仍是 `INVALID_ENDPOINT`；此為具體重現時的 temp 路徑，實際片段每次測試會改變。追蹤行已移除；重建 Windows 測試執行檔後再跑同一 exact case，仍為 `0 passed; 1 failed`，確認失敗不由追蹤碼造成，`legacy_handoff.rs` 無差異。
+
 ## 根因與平台差異
 
 `TestEnv::posix()` 建立 POSIX 能力的測試環境，但 `tempfile` 在原生 Windows 上仍回傳 `C:\Users\...`。`default_socket()` 再以 `/` 串上 `serialwrapd.sock`（`crates/sw-cli/tests/support/mod.rs:365-370`），`isolated_endpoint()` 將它包成 `unix://C:\...`（同檔 `907-915`）。
@@ -40,7 +48,7 @@ Windows 原生執行 `legacy_` 子集合共 26 支，23 支通過、3 支因相�
 
 建議修正 `crates/sw-pal/src/fakes/proc.rs:264-279` 的 `FakeProcScan::serialwrapd_instances()`：合成 Unix daemon 時，將 `unix://` endpoint 轉成與實際 `--socket` argv 一致的裸路徑，再填入 `DaemonProc.socket`；TCP endpoint 維持原樣。保留現有測試斷言，以這三支 Windows 原生案例驗證修復。無需在 `crates/sw-cli/src/legacy_handoff.rs:628-650` 的 `restop()` 對產品 endpoint 做額外正規化。
 
-## 驗證
+## 第 1 輪驗證（基準 `a0d4e0e6`）
 
 | 命令／範圍 | 結果 |
 |---|---|
@@ -54,4 +62,19 @@ Windows 原生執行 `legacy_` 子集合共 26 支，23 支通過、3 支因相�
 | `python3 tests/acceptance/regen_lock.py --check` | 通過，鎖檔與案例快照一致 |
 | `python3 -m policy_check --repo .` | 25 pass、0 fail、2 warn（R-19 CI gate parser advisory、R-22 既有文件引用警告） |
 
-本輪只新增本診斷文件；沒有修改產品碼、測試、凍結鎖或 changelog。未執行全套 pytest、slice gate、Docker；沒有 Python 測試檔被觸及。
+第 1 輪只新增本診斷文件；沒有修改產品碼、測試、凍結鎖或 changelog。未執行全套 pytest、slice gate、Docker；沒有 Python 測試檔被觸及。
+
+## 第 2 輪驗證（HEAD `11c81d77`）
+
+| 命令／範圍 | 結果 |
+|---|---|
+| Windows 原生 exact `legacy_e_single_relaunch_is_restopped` | `0 passed; 1 failed`，exit `101`；`INVALID_ENDPOINT`。移除追蹤碼後重建並重跑，結果相同 |
+| Linux `mgmt_legacy_handoff` 完整測試檔 | 35 passed、0 failed |
+| `cargo test -p sw-cli --features test-fakes` | exit `0`，所有測試目標通過 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | 通過 |
+| `python3 scripts/rust/check_cfg_boundary.py` | 通過 |
+| `python3 -m tools.contracts check` | `ok: true`，0 findings |
+| `python3 tests/acceptance/regen_lock.py --check` | 通過 |
+| `python3 -m policy_check --repo .` | 25 pass、0 fail、2 warn（R-19、R-22） |
+
+本輪只更新本診斷文件；產品碼的臨時 `eprintln!` 已還原，Windows 測試執行檔亦在還原後重建。沒有 Python 檔被觸及；依 brief 未執行全套 pytest、slice gate、Docker 或出口證據 driver。
