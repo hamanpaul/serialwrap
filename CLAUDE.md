@@ -73,6 +73,7 @@ policy_version: 1.0.19
 ## PR 政策
 
 - 所有 PR 必須填寫 `.github/pull_request_template.md` 的 Policy Checklist（R-11）。
+- Rust 重構（`docs/rust-refactor/`）完成前，改動 Python 基線（`sw_core/`、`serialwrap.py`、`serialwrapd.py`、`sw_core/assets/`）或外部可觀察行為的 PR，須填範本「Rust 重構跟進」段，寫明 Rust 端要跟進的 Phase 與位置；合併後由重構主線 merge main 並依 TDD 承接。
 - PR checklist 項目：
   - [ ] 分支不是 `main`
   - [ ] 變更已記錄：新增 `changelog.d/<issue>-<slug>.md` fragment（code 變更必備；純文件／release PR 可改動 `CHANGELOG.md` 或免記）
