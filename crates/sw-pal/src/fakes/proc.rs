@@ -269,9 +269,10 @@ impl ProcScan for FakeProcScan {
         {
             if let Some(pid) = rpc.relaunched_pid(endpoint) {
                 if !base.iter().any(|daemon| daemon.pid == pid) {
+                    let socket = endpoint.strip_prefix("unix://").unwrap_or(endpoint);
                     base.push(DaemonProc {
                         pid,
-                        socket: Some(endpoint.clone()),
+                        socket: Some(socket.to_string()),
                         tree: vec![ProcIdentity {
                             pid,
                             start_ticks: None,
