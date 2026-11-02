@@ -1,0 +1,3 @@
+[run-upgrade] bundle runtime pyvenv.cfg：home = /usr/bin、include-system-site-packages = false（/home/paul_chen/prj_pri/serialwrap-worktrees/release-0.4.0/evidence/stage1/upgrade-docker/release-0.4.0-35d5449/work/bundle-0.4.0/versions/0.4.0/py/pyvenv.cfg）
+{"mode": "on-demand", "verdict": "PASS", "failed": []}
+[on-demand] rc=0 report=/home/paul_chen/prj_pri/serialwrap-worktrees/release-0.4.0/evidence/stage1/upgrade-docker/release-0.4.0-35d5449/on-demand/upgrade-report.json

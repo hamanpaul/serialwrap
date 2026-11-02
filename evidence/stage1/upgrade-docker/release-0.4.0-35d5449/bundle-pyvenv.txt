@@ -1,0 +1,17 @@
+release bundle 證據摘要
+bundle_version=0.4.0
+bundle_git_revision=35d5449bd4afa7cd82151c04f54b0328c15f746c
+bundle_manifest_sha256=113f66ee9858eae114220bdb56afbf612ab4f594a3bd2d2ae1a435d7179263f0
+build_python=/usr/bin/python3.12
+build_python_version=3.12.3
+build_command=mkbundle.sh --release-bundle --profile release --version-override 0.4.0
+pyvenv.cfg:
+home = /usr/bin
+include-system-site-packages = false
+version = 3.12.3
+executable = /usr/bin/python3.12
+test_hook_scan=SW_TEST_UPDATE_PAUSE_AFTER,SW_TEST_UPDATE_FORCE_VERIFY_FAIL,SERIALWRAP_TEST_DELEGATE_GROUP
+test_hook_counts_serialwrap={"SERIALWRAP_TEST_DELEGATE_GROUP": 1, "SW_TEST_UPDATE_FORCE_VERIFY_FAIL": 0, "SW_TEST_UPDATE_PAUSE_AFTER": 0}
+test_hook_counts_serialwrapd={"SERIALWRAP_TEST_DELEGATE_GROUP": 0, "SW_TEST_UPDATE_FORCE_VERIFY_FAIL": 0, "SW_TEST_UPDATE_PAUSE_AFTER": 0}
+scan_method=strings exact-string count on versions/0.4.0/bin/serialwrap and bin/serialwrapd
+結論=兩個 release update test-fakes 鉤子不存在；SERIALWRAP_TEST_DELEGATE_GROUP 存在，符合既有 S1X-b-4 Low，不符合 brief 的無測試鉤子要求。

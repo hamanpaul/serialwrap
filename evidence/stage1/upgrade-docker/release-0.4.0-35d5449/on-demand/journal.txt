@@ -1,0 +1,185 @@
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd-journald[25]: Journal started
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd-journald[25]: Runtime Journal (/run/log/journal/543a2564f5af4109b6280b89bc95ecf0) is 8.0M, max 4.0G, 3.9G free.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-sysusers.service - Create System Users.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-journal-flush.service - Flush Journal to Persistent Storage...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-tmpfiles-setup-dev.service - Create Static Device Nodes in /dev...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd-journald[25]: Time spent on flushing to /var/log/journal/543a2564f5af4109b6280b89bc95ecf0 is 1.477ms for 5 entries.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd-journald[25]: System Journal (/var/log/journal/543a2564f5af4109b6280b89bc95ecf0) is 8.0M, max 4.0G, 3.9G free.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-tmpfiles-setup-dev.service - Create Static Device Nodes in /dev.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target local-fs-pre.target - Preparation for Local File Systems.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target local-fs.target - Local File Systems.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-sysext.socket - System Extension Image Management (Varlink) was skipped because of an unmet condition check (ConditionCapability=CAP_SYS_ADMIN).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target sockets.target - Socket Units.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting ldconfig.service - Rebuild Dynamic Linker Cache...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-binfmt.service - Set Up Additional Binary Formats was skipped because of an unmet condition check (ConditionPathIsMountPoint=/proc/sys/fs/binfmt_misc).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-journal-flush.service - Flush Journal to Persistent Storage.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-tmpfiles-setup.service - Create Volatile Files and Directories...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished ldconfig.service - Rebuild Dynamic Linker Cache.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-tmpfiles-setup.service - Create Volatile Files and Directories.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-firstboot.service - First Boot Wizard was skipped because of an unmet condition check (ConditionFirstBoot=yes).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: first-boot-complete.target - First Boot Complete was skipped because of an unmet condition check (ConditionFirstBoot=yes).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-journal-catalog-update.service - Rebuild Journal Catalog...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-machine-id-commit.service - Commit a transient machine-id on disk was skipped because of an unmet condition check (ConditionPathIsMountPoint=/etc/machine-id).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-update-utmp.service - Record System Boot/Shutdown in UTMP...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-update-utmp.service - Record System Boot/Shutdown in UTMP.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-journal-catalog-update.service - Rebuild Journal Catalog.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-update-done.service - Update is Completed...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-update-done.service - Update is Completed.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target sysinit.target - System Initialization.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started apt-daily.timer - Daily apt download activities.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started apt-daily-upgrade.timer - Daily apt upgrade and clean activities.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started dpkg-db-backup.timer - Daily dpkg database backup timer.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started e2scrub_all.timer - Periodic ext4 Online Metadata Check for All Filesystems.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: fstrim.timer - Discard unused filesystem blocks once a week was skipped because of an unmet condition check (ConditionVirtualization=!container).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started motd-news.timer - Message of the Day.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started systemd-tmpfiles-clean.timer - Daily Cleanup of Temporary Directories.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target timers.target - Timer Units.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Listening on dbus.socket - D-Bus System Message Bus Socket.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-pcrphase-sysinit.service - TPM2 PCR Barrier (Initialization) was skipped because of an unmet condition check (ConditionSecurity=measured-uki).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target basic.target - Basic System.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting dbus.service - D-Bus System Message Bus...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: e2scrub_reap.service - Remove Stale Online ext4 Metadata Check Snapshots was skipped because of an unmet condition check (ConditionCapability=CAP_SYS_RAWIO).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: getty-static.service - getty on tty2-tty6 if dbus and logind are not available was skipped because of an unmet condition check (ConditionPathExists=!/usr/bin/dbus-daemon).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-logind.service - User Login Management...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-pcrphase.service - TPM2 PCR Barrier (User) was skipped because of an unmet condition check (ConditionSecurity=measured-uki).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-user-sessions.service - Permit User Sessions...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started dbus.service - D-Bus System Message Bus.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 (d-logind)[48]: systemd-logind.service: ProtectHostname=yes is configured, but UTS namespace setup is prohibited (container manager?), ignoring namespace setup.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-user-sessions.service - Permit User Sessions.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: console-getty.service - Console Getty was skipped because of an unmet condition check (ConditionPathExists=/dev/console).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: getty@tty1.service - Getty on tty1 was skipped because of an unmet condition check (ConditionPathExists=/dev/tty0).
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target getty.target - Login Prompts.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd-logind[48]: New seat seat0.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started systemd-logind.service - User Login Management.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Created slice user-1000.slice - User Slice of UID 1000.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting user-runtime-dir@1000.service - User Runtime Directory /run/user/1000...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Finished user-runtime-dir@1000.service - User Runtime Directory /run/user/1000.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Starting user@1000.service - User Manager for UID 1000...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 (systemd)[55]: pam_unix(systemd-user:session): session opened for user swtest(uid=1000) by swtest(uid=0)
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Queued start job for default target default.target.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Created slice app.slice - User Application Slice.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Reached target paths.target - Paths.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Reached target timers.target - Timers.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Starting dbus.socket - D-Bus User Message Bus Socket...
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Listening on dbus.socket - D-Bus User Message Bus Socket.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Reached target sockets.target - Sockets.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Reached target basic.target - Basic System.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Reached target default.target - Main User Target.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[55]: Startup finished in 23ms.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Started user@1000.service - User Manager for UID 1000.
+2026-11-02T23:20:10+00:00 c0c389d2aac8 systemd[1]: Startup finished in 252ms.
+2026-11-02T23:20:11+00:00 c0c389d2aac8 runuser[79]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:23+00:00 c0c389d2aac8 runuser[79]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:23+00:00 c0c389d2aac8 runuser[109]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:23+00:00 c0c389d2aac8 runuser[109]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:23+00:00 c0c389d2aac8 runuser[111]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:23+00:00 c0c389d2aac8 runuser[111]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:23+00:00 c0c389d2aac8 runuser[114]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[114]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[116]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[116]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[120]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[120]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[123]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[123]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[128]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[128]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:24+00:00 c0c389d2aac8 runuser[131]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[131]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[134]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[134]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[137]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[137]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[140]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[140]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[142]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[142]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[146]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[146]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[149]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:25+00:00 c0c389d2aac8 runuser[149]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[154]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[154]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[157]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[157]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[159]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[159]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[161]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[161]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[163]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[163]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:26+00:00 c0c389d2aac8 runuser[165]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:27+00:00 c0c389d2aac8 runuser[165]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:27+00:00 c0c389d2aac8 runuser[167]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:27+00:00 c0c389d2aac8 runuser[167]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:27+00:00 c0c389d2aac8 runuser[169]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:27+00:00 c0c389d2aac8 runuser[169]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:27+00:00 c0c389d2aac8 runuser[171]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[171]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[188]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[188]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[190]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[190]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[192]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[192]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[194]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[194]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[196]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[196]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[198]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[198]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[200]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[200]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[202]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[202]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:33+00:00 c0c389d2aac8 runuser[204]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[204]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[206]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[206]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[214]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[214]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[216]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[216]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[219]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[219]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:34+00:00 c0c389d2aac8 runuser[223]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[223]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[245]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[245]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[247]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[247]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[250]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[250]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:35+00:00 c0c389d2aac8 runuser[252]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[252]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[256]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[256]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[259]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[259]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[264]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[264]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[267]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[267]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:36+00:00 c0c389d2aac8 runuser[269]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[269]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[271]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[271]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[273]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[273]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[275]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[275]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:37+00:00 c0c389d2aac8 runuser[278]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[278]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[283]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[283]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[290]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[290]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[292]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[292]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[294]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:38+00:00 c0c389d2aac8 runuser[294]: pam_unix(runuser:session): session closed for user swtest

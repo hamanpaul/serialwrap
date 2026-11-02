@@ -89,6 +89,11 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
   - systemd-system 的 `scope=legacy_direct_setup_success_path`，13 項 **PASS**；覆蓋 0.3.2 system daemon 執行時直接 setup 的 OD-48 成功路徑，不是 systemd-user／on-demand 的完整 19 項升級流程。`legacy_handoff_direct_setup` 等待 5204 ms，setup 啟動新 daemon；套件管理的 `default.yaml` 記為 `package_updated`。
   - `no_two_reader` 三模式皆 **PASS**，取樣 1499／1520／1365 次，重疊均為 0。三份報告及 journal／steps 記錄、bundle runtime 與 hook 掃描摘要、pytest gate 摘要及 `SHA256SUMS` 保存於 `evidence/stage1/upgrade-docker/release-0.4.0-6a21235/`；`sha256sum -c` 全部 11 項 OK。每個模式只實跑一次，沒有 Docker 判定失敗，因此未重跑；腳本建立的三個容器與映像均已清除。
   - bundle 符合 `--release-bundle --profile release`；`SW_TEST_UPDATE_PAUSE_AFTER`、`SW_TEST_UPDATE_FORCE_VERIFY_FAIL` 未出現在 release binaries。不過 `serialwrap` binary 含一個 `SERIALWRAP_TEST_DELEGATE_GROUP` 字串（兩次獨立掃描皆為 1 次），符合既有 Low finding S1X-b-4；因此本次 Docker 三模式雖 PASS，brief 的「無測試鉤子」候選條件仍未通過。依本輪指示未修此 Low，列為既有碼待辦。
+- REL-040-r2 再驗（2026-11-03，分支 `feature/release-0.4.0`，候選 HEAD `35d5449bd4afa7cd82151c04f54b0328c15f746c`）：由 `scripts/docker/run-upgrade.sh` 以 `/usr/bin/python3.12`（3.12.3）建立一份 `--release-bundle --profile release --version-override 0.4.0` bundle，三種模式共用，manifest SHA256 `113f66ee9858eae114220bdb56afbf612ab4f594a3bd2d2ae1a435d7179263f0`；runtime 的 `pyvenv.cfg` 為 `home = /usr/bin`、`include-system-site-packages = false`。
+  - systemd-user **19/19 PASS**；OD-48 `legacy_handoff_direct_setup` 以 `systemctl_stop` 停止 0.3.2，等待 5342 ms 後 setup 啟動 0.4.0，舊行程已結束；`no_two_reader` 取樣 1430 次、重疊 0。
+  - systemd-system 的 `scope=legacy_direct_setup_success_path`，**13/13 PASS**；OD-48 direct-setup 以 `systemctl_stop` 停止 0.3.2，等待 5103 ms 後 setup 啟動 0.4.0，舊行程已結束；`no_two_reader` 取樣 1595 次、重疊 0。此模式仍只覆蓋計畫 §4.1 指定的 13 項範圍。
+  - on-demand **19/19 PASS**；OD-48 `legacy_handoff_direct_setup` 以 `rpc_daemon_stop` 停止 0.3.2，等待 5424 ms 後 setup 啟動 0.4.0，舊行程已結束；`no_two_reader` 取樣 1408 次、重疊 0。三模式各實跑一次，均無失敗，故無同條件重跑；腳本清除本次建立的容器與映像。
+  - 三份報告、journal／steps、driver 輸出、bundle runtime／hook 掃描、執行摘要與 `SHA256SUMS` 存於 `evidence/stage1/upgrade-docker/release-0.4.0-35d5449/`。靜態掃描確認兩個 release update test-fakes 鉤子不存在，但 `serialwrap` binary 仍含 1 個 `SERIALWRAP_TEST_DELEGATE_GROUP` 字串，對應既有 S1X-b-4；因此三模式 Docker 驗證通過，brief 的「不含測試鉤子」候選條件仍未通過，未改產品碼。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 

@@ -1,0 +1,253 @@
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd-journald[25]: Journal started
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd-journald[25]: Runtime Journal (/run/log/journal/543a2564f5af4109b6280b89bc95ecf0) is 8.0M, max 4.0G, 3.9G free.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-journal-flush.service - Flush Journal to Persistent Storage...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-sysusers.service - Create System Users.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-tmpfiles-setup-dev.service - Create Static Device Nodes in /dev...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd-journald[25]: Time spent on flushing to /var/log/journal/543a2564f5af4109b6280b89bc95ecf0 is 2.100ms for 5 entries.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd-journald[25]: System Journal (/var/log/journal/543a2564f5af4109b6280b89bc95ecf0) is 8.0M, max 4.0G, 3.9G free.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-tmpfiles-setup-dev.service - Create Static Device Nodes in /dev.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target local-fs-pre.target - Preparation for Local File Systems.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target local-fs.target - Local File Systems.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-sysext.socket - System Extension Image Management (Varlink) was skipped because of an unmet condition check (ConditionCapability=CAP_SYS_ADMIN).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target sockets.target - Socket Units.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting ldconfig.service - Rebuild Dynamic Linker Cache...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-binfmt.service - Set Up Additional Binary Formats was skipped because of an unmet condition check (ConditionPathIsMountPoint=/proc/sys/fs/binfmt_misc).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-journal-flush.service - Flush Journal to Persistent Storage.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-tmpfiles-setup.service - Create Volatile Files and Directories...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished ldconfig.service - Rebuild Dynamic Linker Cache.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-tmpfiles-setup.service - Create Volatile Files and Directories.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-firstboot.service - First Boot Wizard was skipped because of an unmet condition check (ConditionFirstBoot=yes).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: first-boot-complete.target - First Boot Complete was skipped because of an unmet condition check (ConditionFirstBoot=yes).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-journal-catalog-update.service - Rebuild Journal Catalog...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-machine-id-commit.service - Commit a transient machine-id on disk was skipped because of an unmet condition check (ConditionPathIsMountPoint=/etc/machine-id).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-update-utmp.service - Record System Boot/Shutdown in UTMP...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-update-utmp.service - Record System Boot/Shutdown in UTMP.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-journal-catalog-update.service - Rebuild Journal Catalog.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-update-done.service - Update is Completed...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-update-done.service - Update is Completed.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target sysinit.target - System Initialization.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started apt-daily.timer - Daily apt download activities.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started apt-daily-upgrade.timer - Daily apt upgrade and clean activities.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started dpkg-db-backup.timer - Daily dpkg database backup timer.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started e2scrub_all.timer - Periodic ext4 Online Metadata Check for All Filesystems.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: fstrim.timer - Discard unused filesystem blocks once a week was skipped because of an unmet condition check (ConditionVirtualization=!container).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started motd-news.timer - Message of the Day.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started systemd-tmpfiles-clean.timer - Daily Cleanup of Temporary Directories.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target timers.target - Timer Units.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Listening on dbus.socket - D-Bus System Message Bus Socket.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-pcrphase-sysinit.service - TPM2 PCR Barrier (Initialization) was skipped because of an unmet condition check (ConditionSecurity=measured-uki).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target basic.target - Basic System.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting dbus.service - D-Bus System Message Bus...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: e2scrub_reap.service - Remove Stale Online ext4 Metadata Check Snapshots was skipped because of an unmet condition check (ConditionCapability=CAP_SYS_RAWIO).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: getty-static.service - getty on tty2-tty6 if dbus and logind are not available was skipped because of an unmet condition check (ConditionPathExists=!/usr/bin/dbus-daemon).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-logind.service - User Login Management...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-pcrphase.service - TPM2 PCR Barrier (User) was skipped because of an unmet condition check (ConditionSecurity=measured-uki).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-user-sessions.service - Permit User Sessions...
+2026-11-02T23:19:34+00:00 7ecd0f92362f (d-logind)[48]: systemd-logind.service: ProtectHostname=yes is configured, but UTS namespace setup is prohibited (container manager?), ignoring namespace setup.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started dbus.service - D-Bus System Message Bus.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-user-sessions.service - Permit User Sessions.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: console-getty.service - Console Getty was skipped because of an unmet condition check (ConditionPathExists=/dev/console).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: getty@tty1.service - Getty on tty1 was skipped because of an unmet condition check (ConditionPathExists=/dev/tty0).
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target getty.target - Login Prompts.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd-logind[48]: New seat seat0.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started systemd-logind.service - User Login Management.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Created slice user-1000.slice - User Slice of UID 1000.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting user-runtime-dir@1000.service - User Runtime Directory /run/user/1000...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Finished user-runtime-dir@1000.service - User Runtime Directory /run/user/1000.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Starting user@1000.service - User Manager for UID 1000...
+2026-11-02T23:19:34+00:00 7ecd0f92362f (systemd)[55]: pam_unix(systemd-user:session): session opened for user swtest(uid=1000) by swtest(uid=0)
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Queued start job for default target default.target.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Created slice app.slice - User Application Slice.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Reached target paths.target - Paths.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Reached target timers.target - Timers.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Starting dbus.socket - D-Bus User Message Bus Socket...
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Listening on dbus.socket - D-Bus User Message Bus Socket.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Reached target sockets.target - Sockets.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Reached target basic.target - Basic System.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Reached target default.target - Main User Target.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[55]: Startup finished in 32ms.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Started user@1000.service - User Manager for UID 1000.
+2026-11-02T23:19:34+00:00 7ecd0f92362f systemd[1]: Startup finished in 378ms.
+2026-11-02T23:19:34+00:00 7ecd0f92362f runuser[79]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:47+00:00 7ecd0f92362f runuser[79]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:47+00:00 7ecd0f92362f runuser[109]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:55+00:00 7ecd0f92362f runuser[109]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:55+00:00 7ecd0f92362f runuser[115]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[117]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[117]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/install -m 0644 /home/swtest/.local/share/serialwrap/serialwrap.service /etc/systemd/system/serialwrap.service
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[117]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[117]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[119]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[119]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/mkdir -p /etc/serialwrap/profiles
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[119]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[119]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[121]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[121]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/cp -r /home/swtest/.local/share/serialwrap/system-profiles/. /etc/serialwrap/profiles
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[121]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[121]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[123]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[123]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl daemon-reload
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[123]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 124 ('systemctl') (unit init.scope)...
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Reloading finished in 93 ms.
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[123]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[140]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[140]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl enable serialwrap
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[140]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 141 ('systemctl') (unit init.scope)...
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Reloading finished in 98 ms.
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[140]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[157]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[157]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl start serialwrap
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[157]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:55+00:00 7ecd0f92362f systemd[1]: Started serialwrap.service - serialwrap UART broker daemon (system).
+2026-11-02T23:19:55+00:00 7ecd0f92362f sudo[157]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[115]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[160]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[160]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[165]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[165]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[168]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[168]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:56+00:00 7ecd0f92362f runuser[171]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:56+00:00 7ecd0f92362f sudo[172]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:56+00:00 7ecd0f92362f sudo[172]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl restart serialwrap
+2026-11-02T23:19:56+00:00 7ecd0f92362f sudo[172]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:56+00:00 7ecd0f92362f systemd[1]: Stopping serialwrap.service - serialwrap UART broker daemon (system)...
+2026-11-02T23:19:57+00:00 7ecd0f92362f systemd[1]: serialwrap.service: Deactivated successfully.
+2026-11-02T23:19:57+00:00 7ecd0f92362f systemd[1]: Stopped serialwrap.service - serialwrap UART broker daemon (system).
+2026-11-02T23:19:57+00:00 7ecd0f92362f systemd[1]: Started serialwrap.service - serialwrap UART broker daemon (system).
+2026-11-02T23:19:57+00:00 7ecd0f92362f sudo[172]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:57+00:00 7ecd0f92362f runuser[171]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:57+00:00 7ecd0f92362f runuser[177]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:57+00:00 7ecd0f92362f runuser[177]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:57+00:00 7ecd0f92362f runuser[182]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:57+00:00 7ecd0f92362f runuser[182]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:57+00:00 7ecd0f92362f runuser[185]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[185]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[187]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[187]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[189]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[189]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[191]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[191]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[193]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[193]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[195]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[195]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:58+00:00 7ecd0f92362f runuser[197]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:59+00:00 7ecd0f92362f runuser[197]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:19:59+00:00 7ecd0f92362f runuser[199]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[216]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[216]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/install -D -m 0644 /home/swtest/.local/share/serialwrap/update-hold.conf /etc/systemd/system/serialwrap.service.d/90-serialwrap-update-hold.conf
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[216]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[216]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[220]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[220]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl daemon-reload
+2026-11-02T23:19:59+00:00 7ecd0f92362f sudo[220]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:19:59+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 223 ('systemctl') (unit init.scope)...
+2026-11-02T23:19:59+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: Reloading finished in 89 ms.
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[220]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[240]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[240]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl disable serialwrap
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[240]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 243 ('systemctl') (unit init.scope)...
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: Reloading finished in 92 ms.
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[240]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[269]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[269]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl stop serialwrap
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[269]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: Stopping serialwrap.service - serialwrap UART broker daemon (system)...
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: serialwrap.service: Deactivated successfully.
+2026-11-02T23:20:00+00:00 7ecd0f92362f systemd[1]: Stopped serialwrap.service - serialwrap UART broker daemon (system).
+2026-11-02T23:20:00+00:00 7ecd0f92362f sudo[269]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[275]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[275]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/install -m 0644 /home/swtest/.local/share/serialwrap/serialwrap.service /etc/systemd/system/serialwrap.service
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[275]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[275]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[279]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[279]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/mkdir -p /etc/serialwrap/profiles
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[279]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[279]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[283]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[283]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/cp -r /home/swtest/.local/share/serialwrap/system-profiles/. /etc/serialwrap/profiles
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[283]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[283]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[287]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[287]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl daemon-reload
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[287]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 290 ('systemctl') (unit init.scope)...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading finished in 76 ms.
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[287]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[306]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[306]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl enable serialwrap
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[306]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 309 ('systemctl') (unit init.scope)...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading finished in 92 ms.
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[306]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[325]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[325]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/rm -f /etc/systemd/system/serialwrap.service.d/90-serialwrap-update-hold.conf
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[325]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[325]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[329]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[329]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/rmdir --ignore-fail-on-non-empty /etc/systemd/system/serialwrap.service.d
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[329]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[329]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[333]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[333]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl daemon-reload
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[333]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 336 ('systemctl') (unit init.scope)...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading finished in 77 ms.
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[333]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[352]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[352]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl enable serialwrap
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[352]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading requested from client PID 355 ('systemctl') (unit init.scope)...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Reloading...
+2026-11-02T23:20:06+00:00 7ecd0f92362f systemd[1]: Reloading finished in 93 ms.
+2026-11-02T23:20:06+00:00 7ecd0f92362f sudo[352]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:06+00:00 7ecd0f92362f sudo[374]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:06+00:00 7ecd0f92362f sudo[374]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl start serialwrap
+2026-11-02T23:20:06+00:00 7ecd0f92362f sudo[374]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:06+00:00 7ecd0f92362f sudo[374]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:06+00:00 7ecd0f92362f systemd[1]: Started serialwrap.service - serialwrap UART broker daemon (system).
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[199]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[386]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[386]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[389]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[389]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[391]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[391]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[393]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[393]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[396]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[396]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[398]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[398]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[400]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[400]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[402]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[402]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[404]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[404]: pam_unix(runuser:session): session closed for user swtest
+2026-11-02T23:20:04+00:00 7ecd0f92362f runuser[412]: pam_unix(runuser:session): session opened for user swtest(uid=1000) by (uid=0)
+2026-11-02T23:20:04+00:00 7ecd0f92362f sudo[413]:   swtest : unable to resolve host 7ecd0f92362f: Temporary failure in name resolution
+2026-11-02T23:20:04+00:00 7ecd0f92362f sudo[413]:   swtest : PWD=/home/swtest ; USER=root ; COMMAND=/usr/bin/systemctl stop serialwrap
+2026-11-02T23:20:04+00:00 7ecd0f92362f sudo[413]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)
+2026-11-02T23:20:04+00:00 7ecd0f92362f systemd[1]: Stopping serialwrap.service - serialwrap UART broker daemon (system)...
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: serialwrap.service: Deactivated successfully.
+2026-11-02T23:20:05+00:00 7ecd0f92362f systemd[1]: Stopped serialwrap.service - serialwrap UART broker daemon (system).
+2026-11-02T23:20:05+00:00 7ecd0f92362f sudo[413]: pam_unix(sudo:session): session closed for user root
+2026-11-02T23:20:05+00:00 7ecd0f92362f runuser[412]: pam_unix(runuser:session): session closed for user swtest

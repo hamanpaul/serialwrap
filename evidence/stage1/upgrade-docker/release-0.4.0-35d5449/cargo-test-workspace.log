@@ -1,0 +1,1599 @@
+warning: unused import: `sw_pal::fakes::service::ServiceModelState`
+  --> crates/sw-cli/tests/support/mod.rs:21:9
+   |
+21 | pub use sw_pal::fakes::service::ServiceModelState;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `HoldState`, `ServiceAction`, and `ServiceCtl`
+  --> crates/sw-cli/tests/support/mod.rs:29:26
+   |
+29 |     CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl,
+   |                          ^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused import: `super::*`
+    --> crates/sw-cli/tests/support/mod.rs:2119:9
+     |
+2119 |     use super::*;
+     |         ^^^^^^^^
+
+warning: unused import: `crate::json_val as json`
+    --> crates/sw-cli/tests/support/mod.rs:2127:13
+     |
+2127 |     pub use crate::json_val as json;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `ServiceAction` and `ServiceCtl`
+  --> crates/sw-cli/tests/support/mod.rs:29:37
+   |
+29 |     CompositeServiceCtl, HoldState, ServiceAction, ServiceCtl, SystemdCtl, WindowsServiceCtl,
+   |                                     ^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: `sw-cli` (test "mgmt_remote") generated 4 warnings (run `cargo fix --test "mgmt_remote" -p sw-cli` to apply 4 suggestions)
+warning: `sw-cli` (test "mgmt_terminal") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "rollback_entry_symlink") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_supervision_switch") generated 4 warnings (3 duplicates) (run `cargo fix --test "mgmt_supervision_switch" -p sw-cli` to apply 1 suggestion)
+warning: `sw-cli` (test "mgmt_layout") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "support_selftest") generated 4 warnings (4 duplicates)
+warning: struct `Row` is never constructed
+   --> crates/sw-proto/tests/common/mod.rs:112:12
+    |
+112 | pub struct Row {
+    |            ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `unhex_pub` is never used
+   --> crates/sw-proto/tests/common/mod.rs:127:8
+    |
+127 | pub fn unhex_pub(s: &str) -> Vec<u8> {
+    |        ^^^^^^^^^
+
+warning: function `golden` is never used
+   --> crates/sw-proto/tests/common/mod.rs:132:8
+    |
+132 | pub fn golden(name: &str) -> Vec<Row> {
+    |        ^^^^^^
+
+warning: function `oserror_from_case` is never used
+   --> crates/sw-proto/tests/common/mod.rs:154:8
+    |
+154 | pub fn oserror_from_case(s: &str) -> sw_proto::pycompat::PyOsError {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: function `pypath_dispatch` is never used
+   --> crates/sw-proto/tests/common/mod.rs:192:8
+    |
+192 | pub fn pypath_dispatch(
+    |        ^^^^^^^^^^^^^^^
+
+warning: field `op` is never read
+   --> crates/sw-proto/tests/common/mod.rs:114:9
+    |
+112 | pub struct Row {
+    |            --- field in this struct
+113 |     pub id: String,
+114 |     pub op: String,
+    |         ^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `unhex_pub` is never used
+   --> crates/sw-proto/tests/common/mod.rs:127:8
+    |
+127 | pub fn unhex_pub(s: &str) -> Vec<u8> {
+    |        ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-cli` (test "mgmt_update") generated 2 warnings (2 duplicates)
+warning: `sw-cli` (test "mgmt_com0com") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_connect") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_doctor") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_setup") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_daemon") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_legacy_handoff") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_service") generated 4 warnings (4 duplicates)
+warning: `sw-cli` (test "mgmt_graceful_stop") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "constants_sync") generated 5 warnings
+warning: `sw-proto` (test "runtime_paths_golden") generated 4 warnings (3 duplicates)
+warning: `sw-proto` (test "error_codes_sync") generated 5 warnings (5 duplicates)
+warning: `sw-proto` (test "pyjson_golden") generated 3 warnings (2 duplicates)
+warning: `sw-proto` (test "pyre_golden") generated 3 warnings (3 duplicates)
+warning: fields `id` and `op` are never read
+   --> crates/sw-proto/tests/common/mod.rs:113:9
+    |
+112 | pub struct Row {
+    |            --- fields in this struct
+113 |     pub id: String,
+    |         ^^
+114 |     pub op: String,
+    |         ^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sw-proto` (test "yaml11_golden") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "config_types_golden") generated 4 warnings (3 duplicates)
+warning: `sw-proto` (test "endpoint_golden") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "wal_types_golden") generated 4 warnings (4 duplicates)
+warning: `sw-proto` (test "release_manifest") generated 5 warnings (5 duplicates)
+warning: `sw-proto` (test "rpc_types") generated 5 warnings (5 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/sw_cli-0ff112cfc2800c84)
+
+running 1 test
+test remote_tunnel::tests::posix_os_error_includes_python_filename ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/serialwrap-99eb118dfb454424)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/argparse_golden.rs (target/debug/deps/argparse_golden-c12966553c60ef60)
+
+running 3 tests
+test help_width_rules ... ok
+test stage1b_group_help_goldens_match_python_at_every_width ... ok
+test native_paths_match_python_3_12_golden ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/argparse_synth.rs (target/debug/deps/argparse_synth-c8349b7e8562f6bc)
+
+running 1 test
+test test_argparse_synth_all_cases ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/argv_taint.rs (target/debug/deps/argv_taint-06045142b25a2c36)
+
+running 6 tests
+test display_renders_escapes_as_backslashreplace_text ... ok
+test encode_decode_round_trip_preserves_escapes ... ok
+test invalid_argv_is_tainted_wherever_it_sits ... ok
+test repr_matches_plain_repr_without_escapes ... ok
+test repr_renders_escapes_as_python_surrogate_text ... ok
+test valid_argv_is_unchanged_and_untainted ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli_spec_schema.rs (target/debug/deps/cli_spec_schema-5687d05709f8aac4)
+
+running 1 test
+test cli_spec_matches_schema ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/cli_trace.rs (target/debug/deps/cli_trace-326cb216ceee91c1)
+
+running 6 tests
+test test_cli_trace_describe_trace_endpoint ... ok
+test trace_line_ok_response ... ok
+test trace_line_exact ... ok
+test test_cli_trace_trace_enabled ... ok
+test test_cli_trace_resolve_cli_trace_level ... ok
+test test_cli_trace_parse_log_level ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/client_retry.rs (target/debug/deps/client_retry-d2f224a5419d4761)
+
+running 29 tests
+test backoff_caps_at_5s ... ok
+test big_retries_saturates ... ok
+test errno_from_last_main_attempt ... ok
+test etimedout_is_timeout ... ok
+test empty_response ... ok
+test elapsed_ms ... ok
+test negative_retries_one_attempt ... ok
+test no_af_unix_message ... ok
+test invalid_timeout_crashes_only_after_endpoint_parse ... ok
+test invalid_response_not_transient ... ok
+test non_json_is_invalid_response ... ok
+test no_id_check ... ok
+test non_transient_no_retry ... ok
+test probe_deadline ... ok
+test probe_unreachable ... ok
+test probe_bool_counts ... ok
+test probe_only_sends_health_methods ... ok
+test response_cap ... ok
+test strip_vertical_tab ... ok
+test tcp_resolution_precedes_timeout_validation ... ok
+test timeout_enrich_reachable_busy_int_only ... ok
+test utf8_replace ... ok
+test whitespace_line_empty ... ok
+test recv_timeout ... ok
+test whitelist_method_retries_socket_error_with_backoff ... ok
+test split_chunks_and_trailing ... ok
+test non_whitelist_never_retries ... ok
+test timeout_conversion_matches_python_nanosecond_rounding_and_limit ... ok
+test large_response_ok ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+
+     Running tests/delegate_resolve.rs (target/debug/deps/delegate_resolve-1ac3920571f80fb9)
+
+running 6 tests
+test invalid_manifest_is_reported ... ok
+test directory_delegate_entry_is_reported ... ok
+test current_release_resolves_manifest_without_parent_components ... ok
+test invalid_current_release_is_reported ... ok
+test run_delegate_increments_depth_and_executes_once_with_three_environment_values ... ok
+test missing_delegate_entry_is_reported ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/delegate_route.rs (target/debug/deps/delegate_route-0ef8633b1a36d285)
+
+running 4 tests
+test argv_sha_stable ... ok
+test non_utf8_tokens ... ok
+test classify_table ... ok
+test recursion_rules ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/emitted_codes.rs (target/debug/deps/emitted_codes-139e2dbbfefb3b04)
+
+running 13 tests
+test negative_self_test_const_string_forwarding_fails ... ok
+test negative_self_test_lifetime_does_not_hide_error_code_use ... ok
+test error_resp_type_enforcement_and_execution ... ok
+test emitted_code_extractor_ignores_associated_methods ... ok
+test negative_self_test_char_literal_quote_does_not_open_string ... ok
+test package_version_build_variable_is_not_an_error_code ... ok
+test negative_self_test_lifetime_does_not_hide_following_string_literal ... ok
+test negative_self_test_line_comment_marker_inside_string_does_not_hide_code ... ok
+test negative_self_test_undocumented_error_code_fails ... ok
+test negative_self_test_block_comment_marker_inside_string_does_not_hide_code ... ok
+test negative_self_test_unknown_code_string_literal_fails ... ok
+test extracted_emitted_codes_documented_and_written_to_target ... ok
+test no_forbidden_uppercase_string_literals_in_sw_cli_src ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/endpoint_resolve.rs (target/debug/deps/endpoint_resolve-3b156eb1512896b0)
+
+running 36 tests
+test bench_missing_file ... ok
+test bench_bad_json ... ok
+test bench_nested_format ... ok
+test bench_bad_utf8 ... ok
+test bench_non_loopback ... ok
+test bench_not_object ... ok
+test bench_ok ... ok
+test bench_benches_not_object ... ok
+test bench_unix_value ... ok
+test bench_state_is_dir ... ok
+test bogus_backend_uses_platform ... ok
+test config_broken_yaml ... ok
+test config_alive ... ok
+test config_dangling_canonical_dead ... ok
+test config_dangling_fallback ... ok
+test config_dangling_system ... ok
+test config_dangling_same_value ... ok
+test empty_endpoint_alive_true ... ok
+test config_tcp_not_probed_posix ... ok
+test empty_endpoint_falls_through ... ok
+test posix_ignores_serialwrap_endpoint ... ok
+test config_int_socket_path ... ok
+test sc09_explicit_missing_is_empty ... ok
+test config_zero_socket_path ... ok
+test sc09_explicit_blank_ignored ... ok
+test sc09_explicit_config_env ... ok
+test sc09_system_fallback ... ok
+test win_backend_default_tcp ... ok
+test endpoint_wins ... ok
+test win_backend_custom_port ... ok
+test explicit_empty_socket ... ok
+test no_af_unix_unix_dead ... ok
+test sc09_user_beats_system ... ok
+test win_backend_probes_tcp ... ok
+test print_error_writes_stdout_json_and_stderr_line ... ok
+test socket_equal_default_is_still_explicit ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/event_add_document.rs (target/debug/deps/event_add_document-23532da982461999)
+
+running 17 tests
+test add_keeps_key_order_nan_and_non_ascii_on_the_wire ... ok
+test add_legal_key_resembling_surrogate_escape_is_sent ... ok
+test add_keeps_nul_in_key_and_value_on_the_wire ... ok
+test add_lone_surrogate_connect_failure_reports_socket_error_first ... ok
+test add_integer_digit_limit_matches_python_boundary ... ok
+test argv_non_utf8_is_rejected_before_send_with_python_range_text ... ok
+test add_document_errors_match_python_text_and_send_nothing ... ok
+test argv_single_surrogate_uses_code_point_text ... ok
+test argv_three_surrogate_run_uses_range ... ok
+test add_lone_surrogate_surviving_duplicate_key_is_rejected ... ok
+test add_legal_content_resembling_surrogate_escape_keeps_python_position ... ok
+test add_paired_surrogate_escape_is_sent_as_one_code_point ... ok
+test add_sends_non_object_document_unchanged ... ok
+test stdout_write_failure_follows_python_except_path ... ok
+test add_lone_surrogate_in_document_fails_after_connect_without_sending ... ok
+test add_lone_surrogate_key_colliding_with_legal_key_is_rejected ... ok
+test add_overwritten_lone_surrogate_by_duplicate_key_is_sent ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/event_cmd.rs (target/debug/deps/event_cmd-4b12ba3b52050d67)
+
+running 2 tests
+test event_cmd_method_table_matches ... ok
+test event_params_and_dispatch_fail_until_implemented ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/event_params.rs (target/debug/deps/event_params-7f2475a16a063c81)
+
+running 9 tests
+test reload_sends_empty_params ... ok
+test rm_sends_rule_id ... ok
+test reset_sends_rule_id_or_selector_with_the_other_null ... ok
+test enable_and_disable_send_selector ... ok
+test rm_keeps_valid_utf8_argv_unchanged ... ok
+test list_sends_selector_and_owner_with_nulls_when_absent ... ok
+test show_sends_rule_id ... ok
+test status_sends_selector_or_null ... ok
+test tail_defaults_and_explicit_values ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mgmt_com0com.rs (target/debug/deps/mgmt_com0com-03ab8210113d53c9)
+
+running 23 tests
+test bundle_helper_sha_mismatch_rejected ... ok
+test malformed_com0com_helper_fields_rejected ... ok
+test spawn_elevated_unsupported_on_posix ... ok
+test manifest_com0com_component_optional ... ok
+test rollback_rejects_com0com_flags ... ok
+test bundle_component_sha_mismatch_rejected ... ok
+test bundle_without_component_verifies ... ok
+test version_pairing_checks_optional_component_and_helper_digests ... ok
+test tampered_optional_payload_blocks_install_and_remove_before_elevation ... ok
+test remove_uses_installed_bundle_ignoring_manifest_override ... ok
+test component_absent_with_flag ... ok
+test experimental_stderr_line ... ok
+test existing_pair_not_reinstalled ... ok
+test remove_com0com_plan ... ok
+test registry_probe_error_does_not_skip_elevated_install ... ok
+test plain_setup_reports_existing_pair_without_elevation ... ok
+test helper_failure_reported ... ok
+test uac_declined_keeps_base_ok ... ok
+test with_com0com_elevates_exactly_helper ... ok
+test standalone_remove_failure_is_nonzero ... ok
+test update_reports_existing_pair_even_when_new_bundle_omits_component ... ok
+test rollback_does_not_touch_driver ... ok
+test base_install_never_elevates ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running tests/mgmt_connect.rs (target/debug/deps/mgmt_connect-3549873347877735)
+
+running 17 tests
+test bench_state_writer_helper ... ok
+test benches_status_tunnels_from_error_shapes ... ok
+test connect_close_clears_memory ... ok
+test connect_close_still_active ... ok
+test connect_missing_code_json_boundary ... ok
+test connect_remember_failure_rolls_back ... ok
+test connect_nested_state_preserved ... ok
+test connect_unknown_code ... ok
+test bench_state_lock_held_refuses_write ... ok
+test connect_open_remembers_flat_endpoint ... ok
+test windows_connect_supported ... ok
+test connect_invalid_config_extra_key ... ok
+test benches_sorted_with_alive ... ok
+test connect_close_refuses_mismatched_identity ... ok
+test connect_target_requires_user_at_host ... ok
+test bench_state_lock_cross_process ... ok
+test bench_state_concurrent_writers_keep_all_entries ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/mgmt_daemon.rs (target/debug/deps/mgmt_daemon-34e34aa3c58af920)
+
+running 63 tests
+test autostart_not_for_daemon_status ... ok
+test autostart_disabled_on_posix_caps ... ok
+test autostart_not_for_timeout ... ok
+test autostart_loser_daemon_exited_but_healthy_is_success ... ok
+test autostart_failure_reports_stderr ... ok
+test autostart_not_for_explicit_endpoint ... ok
+test autostart_permission_denied_no_resend ... ok
+test autostart_connect_timeout_no_resend ... ok
+test autostart_nested_start_already_running_without_pid_is_reused ... ok
+test restart_on_demand_output_matches_p1_shape ... ok
+test no_autostart_or_resend_after_send_phase_failure ... ok
+test autostart_concurrent_second_cli_reuses_daemon ... ok
+test autostart_only_when_request_never_sent ... ok
+test start_conflict_unknown_socket_hint ... ok
+test restart_keeps_nested_start_stderr ... ok
+test restart_supervised_systemd_equals_service_restart ... ok
+test restart_on_demand_timeout_is_p1_shape ... ok
+test restart_waits_for_process_when_ping_is_already_down ... ok
+test start_endpoint_socket_mismatch_invalid_args ... ok
+test start_already_running ... ok
+test start_env_file_source_failure ... ok
+test restart_on_demand_stop_wait_start ... ok
+test autostart_rechecks_install_journal_after_waiting_for_lock ... ok
+test start_manifest_relative_path_returns_absolute_launcher ... ok
+test start_posix_endpoint_rejection_precedes_socket_mismatch ... ok
+test start_not_ready_windows_50_attempts ... ok
+test start_conflict_normalization_expands_user_home ... ok
+test restart_on_demand_not_running_wraps_start ... ok
+test autostart_not_for_daemon_stop ... ok
+test start_endpoint_rejected_posix ... ok
+test autostart_suppressed_while_install_journal_present ... ok
+test start_env_files_default_list ... ok
+test start_preserves_non_string_supervision_mode_json_type ... ok
+test start_not_ready_posix_15_attempts ... ok
+test start_daemon_exited ... ok
+test start_binary_not_found ... ok
+test start_conflict_detects_module_form_daemon ... ok
+test start_windows_python_launcher_without_runtime_does_not_fall_through ... ok
+test start_env_file_win_simple_parse ... ok
+test start_routes_systemd_user_to_service ... ok
+test start_refuses_other_daemon_on_different_socket_without_stderr_mirror ... ok
+test start_force_spawn_skips_precheck ... ok
+test start_routes_windows_task_to_schtasks ... ok
+test start_foreground_returns_child_rc ... ok
+test start_scan_failure_is_no_conflict ... ok
+test start_windows_python_launcher_uses_manifest_runtime ... ok
+test start_treats_normalized_same_socket_as_no_conflict ... ok
+test start_locate_honors_release_manifest_env ... ok
+test start_locate_order_sibling_then_runtime ... ok
+test stop_unknown_systemd_prefix_preserves_no_systemd_route ... ok
+test stop_rpc_timeout_fixed_2s_no_retries ... ok
+test stop_bench_unremembered_exit1 ... ok
+test start_unknown_mode_routes_no_systemd ... ok
+test wait_gone_launcher_child_still_alive_blocks ... ok
+test start_success_omits_empty_warnings ... ok
+test start_success_includes_warnings_and_env_files ... ok
+test autostart_resend_carries_original_command_params ... ok
+test wait_gone_zombie_counts_as_gone ... ok
+test start_env_file_non_utf8_value_preserved ... ok
+test start_endpoint_loopback_allowed_windows ... ok
+test stop_empty_endpoint_routes_systemd_like_python ... ok
+test autostart_waits_on_update_hold_lock ... ok
+test stop_routes_supervised_unless_explicit_target ... ok
+
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/mgmt_doctor.rs (target/debug/deps/mgmt_doctor-895d71271d308577)
+
+running 32 tests
+test devices_linux_counts_dangling ... ok
+test devices_windows_excluded_suffix ... ok
+test endpoint_reachable_tcp_always_alive_posix ... ok
+test devices_windows_registry_error ... ok
+test bootloader_prompts_drift ... ok
+test doctor_ignores_timeout_and_retries ... ok
+test doctor_exit_always_zero ... ok
+test bootloader_prompts_not_materialized ... ok
+test other_installs_single ... ok
+test endpoint_reachable_unreachable ... ok
+test endpoint_reachable_no_daemons ... ok
+test other_installs_multi_versions_differ ... ok
+test version_pairing_parse_only_optional_field_key ... ok
+test linux_check_order_and_advisory_stamp ... ok
+test python_runtime_missing_manifest ... ok
+test wal_dir_mismatch ... ok
+test single_daemon_multi_open ... ok
+test version_pairing_invalid_manifest ... ok
+test pyyaml_import_failure_is_not_installed_with_fix ... ok
+test runtime_path_outside_bundle_is_not_executed ... ok
+test wal_writable_unhealthy_reasons ... ok
+test version_pairing_unreadable_manifest ... ok
+test windows_check_order ... ok
+test python_runtime_nonzero_rc_is_unrunnable ... ok
+test version_pairing_daemon_down_is_unreachable ... ok
+test version_pairing_schema_version_float_one_is_valid ... ok
+test runtime_spawn_error_is_unrunnable_not_not_installed ... ok
+test wal_writable_recreated_suffix ... ok
+test version_pairing_mismatch_detail ... ok
+test windows_pyserial_import_failure_is_not_installed_with_fix ... ok
+test runtime_timeout_is_unrunnable_not_not_installed ... ok
+test overall_ok_ignores_advisory_failures_only ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/mgmt_graceful_stop.rs (target/debug/deps/mgmt_graceful_stop-ff0bba29101f29de)
+
+running 23 tests
+test graceful_handoff_hold_prevents_restart_on_failure_relaunch ... ok
+test graceful_handoff_gone_requires_process_scan_confirmation ... ok
+test graceful_handoff_relaunch_loop_capped ... ok
+test graceful_handoff_rejection_returns_hold_context ... ok
+test windows_service_plain_stop_requires_sudo_before_sc_config ... ok
+test graceful_handoff_relaunched_instance_rehandoff_no_hard_stop ... ok
+test graceful_handoff_lock_timeout_reports_timeout ... ok
+test on_demand_handoff_waits_for_granted_instance_ordered_shutdown ... ok
+test capture_identity_requires_process_scan_evidence ... ok
+test on_demand_handoff_single_ping_recv_timeout_does_not_start_exit_wait ... ok
+test graceful_handoff_hard_stop_only_same_identity ... ok
+test windows_task_restart_aborts_when_daemon_never_exits ... ok
+test graceful_handoff_process_scan_failure_is_not_released ... ok
+test graceful_handoff_marks_first_link_when_identity_changes_during_hold ... ok
+test graceful_handoff_hold_failure_sends_no_stop ... ok
+test on_demand_handoff_exit_wait_is_bounded_from_listener_close ... ok
+test graceful_handoff_relaunched_busy_is_refused ... ok
+test on_demand_handoff_still_answering_keeps_grant_limit ... ok
+test windows_task_stop_sends_daemon_stop_before_end ... ok
+test handoff_wait_does_not_call_any_pid_a_relaunch_when_identity_is_unknown ... ok
+test on_demand_handoff_persistent_ping_recv_timeout_keeps_grant_limit ... ok
+test graceful_handoff_rejects_incomplete_or_invalid_grants ... ok
+test graceful_handoff_holds_before_any_stop_rpc ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/mgmt_layout.rs (target/debug/deps/mgmt_layout-84f109152fd5fe9b)
+
+running 44 tests
+test mkbundle_respects_cargo_target_dir_override ... ignored, 由 tests/test_rust_mkbundle.py 驅動；需要 POSIX bash
+test manifest_optional_metadata_rejects_non_strings ... ok
+test real_mkbundle_dev_output_verifies ... ignored, 由 tests/test_rust_release_manifest_schema.py 驅動；實測 mkbundle 產物
+test classify_exe_three_cases ... ok
+test install_root_posix_default_is_data_dir ... ok
+test current_release_roundtrip_and_unknown_keys ... ok
+test install_root_windows_default ... ok
+test install_root_env_override ... ok
+test pairing_exact_all_ok ... ok
+test install_lock_error_uses_clean_pal_message ... ok
+test install_lock_creates_missing_root_for_first_install ... ok
+test task_xml_template_hash_is_golden_and_includes_working_directory_slot ... ok
+test pairing_daemon_absent_skips_daemon_field ... ok
+test cleanup_old_entries_removes_only_generated_entry_backups ... ok
+test install_lock_second_updater_times_out_without_changes ... ok
+test switch_entries_rejects_relative_version_dir_without_mutation ... ok
+test pairing_item_matches_p1_shape ... ok
+test switch_failure_reports_revert_failure ... ok
+test stage_version_existing_corrupt_refused ... ok
+test pairing_reports_daemon_version_mismatch ... ok
+test windows_switch_running_exe_rename ... ignored, BLOCKED-OWNER: 原生 Windows 執行中 exe 改名（擁有者 host；scripts/rust/win-test.sh --package sw-cli -- mgmt_layout）
+test revert_entries_attempts_remaining_entries_after_one_failure ... ok
+test pairing_rejects_component_paths_outside_bundle ... ok
+test posix_symlink_switch_atomic ... ok
+test windows_install_root_override_preserves_absolute_host_path ... ok
+test pairing_undeclared_digest_never_matches_missing_evidence ... ok
+test switch_entries_validates_all_sources_before_touching_existing_entries ... ok
+test pairing_item_respects_symlink_or_copy_package_directories ... ok
+test switch_entries_rejects_non_regular_source_before_mutation ... ok
+test pairing_item_rejects_non_exact_rule ... ok
+test verify_bundle_errors_do_not_include_pal_debug_structs ... ok
+test verify_bundle_detects_tree_tamper ... ok
+test stage_version_rejects_non_semver_path_components ... ok
+test tree_sha256_matches_python_reference ... ok
+test verify_bundle_checks_declared_and_undeclared_python_bytecode ... ok
+test verify_bundle_rejects_missing_digest_and_component_paths_that_escape ... ok
+test windows_copy_switch_keeps_old_and_writes_new ... ok
+test switch_failure_mid_way_restores_previous_entries ... ok
+test verify_bundle_rejects_windows_drive_component_paths ... ok
+test locate_manifest_env_override_first ... ok
+test verify_windows_bundle_fixture_uses_native_temp_paths ... ok
+test stage_version_verification_error_caps_rendered_diffs ... ok
+test stage_version_refuses_missing_malformed_or_mismatched_existing_manifest ... ok
+test stage_version_idempotent ... ok
+
+test result: ok. 41 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.21s
+
+     Running tests/mgmt_legacy_handoff.rs (target/debug/deps/mgmt_legacy_handoff-77e9d0a3d3e1698b)
+
+running 35 tests
+test legacy_c_flashing_at_precheck_refuses_without_stop ... ok
+test d3_2_foreign_socket_daemon_without_rpc_fails_closed ... ok
+test legacy_l_crash_points_are_separate_from_frozen_list ... ok
+test legacy_b_unknown_version_fails_closed ... ok
+test d3_2_supervisor_running_without_rpc_daemon_fails_closed ... ok
+test legacy_h_other_same_uid_daemon_fails_closed_before_stop ... ok
+test legacy_c_session_busy_at_precheck_refuses_without_stop ... ok
+test legacy_b_version_not_below_040_fails_closed ... ok
+test legacy_b_native_exe_in_bundle_path_fails_closed ... ok
+test legacy_b_python_script_under_versions_fails_closed ... ok
+test d8_disabled_running_unit_stays_disabled_after_refusal ... ok
+test s1x_c1_supervision_switch_detects_systemd_system_daemon_on_fixed_socket ... ok
+test legacy_e_relaunch_loop_after_three_stops ... ok
+test legacy_f_pre_switch_failure_releases_hold_without_restart ... ok
+test legacy_a_on_demand_install_stops_with_rpc_and_setup_starts_new_daemon ... ok
+test legacy_i_systemd_system_fixed_socket_detected_for_update_and_install ... ok
+test s1x_c1_first_install_detects_systemd_system_daemon_on_fixed_socket ... ok
+test legacy_e_single_relaunch_is_restopped ... ok
+test legacy_a_systemd_user_main_pid_uses_systemctl_stop ... ok
+test legacy_l_first_install_recover_still_rejects_unknown_daemon_without_capture ... ok
+test legacy_d_never_exits_is_pending_without_restart ... ok
+test legacy_k_relaunch_inside_stability_window_is_not_stopped ... ok
+test legacy_h_other_uid_daemon_is_noted_not_blocking ... ok
+test s1x_c1_update_detects_systemd_system_daemon_on_fixed_socket ... ok
+test d8_disabled_running_unit_stays_disabled_after_update ... ok
+test legacy_f_post_switch_failure_restores_install_without_restart ... ok
+test legacy_g_main_pid_mismatch_uses_rpc_stop ... ok
+test legacy_spec_gap5_recover_restore_failure_lists_unrestored_items ... ok
+test legacy_d3_4_foreign_service_cgroup_fails_closed_before_stop ... ok
+test legacy_spec_gap5_restore_failure_lists_unrestored_items ... ok
+test s1_4baca8c_2_cross_mode_crash_after_start_stops_target_instance_first ... ok
+test s1_f3c66b4_2_recover_reinterrupted_after_target_hold_completes ... ok
+test legacy_l_first_install_crash_loop_recovers_without_current ... ok
+test legacy_l_crash_loop_recover_journal ... ok
+test legacy_d3_4_session_scope_cgroup_is_not_external ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running tests/mgmt_remote.rs (target/debug/deps/mgmt_remote-6d9b7dd96b4b6aac)
+
+running 32 tests
+test autossh_prefix ... ok
+test connect_argv_default_dest ... ok
+test bind_loopback_only_cases ... ok
+test posix_expose_argv_is_byte_exact ... ok
+test parse_target_errors ... ok
+test windows_argv_drops_control_master_but_identity_unchanged ... ok
+test close_terminate_error_marks_error ... ok
+test open_role_probe_preserves_merged_stdout_stderr_order ... ok
+test close_dead_pid_not_signalled ... ok
+test open_r_and_l_invalid_args ... ok
+test open_spawn_failed_empty_tail_uses_error_code_as_message ... ok
+test windows_expose_wildcard_bind_fails_closed ... ok
+test registry_write_disk_stable ... ok
+test open_already_running_same_identity ... ok
+test open_local_on_expose_invalid_args ... ok
+test windows_wildcard_probe_retains_error_state_when_terminate_fails ... ok
+test open_role_probe_unverified_no_retry ... ok
+test remote_close_empty_selector_closes_nothing ... ok
+test open_conflict_different_identity ... ok
+test open_spawn_failed_reports_tail ... ok
+test open_starting_when_deadline_exceeded ... ok
+test open_local_validation_matches_python_order_and_big_integer ... ok
+test status_prunes_dead_and_lists_orphan ... ok
+test windows_state_matches_p1_schema ... ok
+test remote_ssh_resolution_precedes_endpoint_and_registry ... ok
+test open_role_probe_runner_error_fails_and_cleans_up ... ok
+test remote_stop_is_alias_of_close ... ok
+test windows_expose_probe_rc_nonzero_is_not_ready ... ok
+test windows_role_probe_tcp_uses_new_connection ... ok
+test registry_reads_python_written_pgid_null ... ok
+test windows_expose_probe_before_forward_ready_retries ... ok
+test windows_connect_ready_via_ping ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/mgmt_service.rs (target/debug/deps/mgmt_service-30442597e7c20101)
+
+running 15 tests
+test service_invalid_action_argparse_exit2 ... ok
+test service_bad_yaml_json_internal_error ... ok
+test config_save_never_writes_system_fallback ... ok
+test service_bad_constructor_tag_reports_line_and_column ... ok
+test service_non_string_mode_bool_keys_match_python_json ... ok
+test service_non_string_mode_mixed_keys_reports_internal_error_json ... ok
+test service_non_string_mode_null_key_matches_python_json ... ok
+test service_on_demand_prints_no_systemd_and_mirrors_stderr ... ok
+test service_systemd_system_start_needs_sudo ... ok
+test supervision_mode_bad_yaml_is_one_stderr_line_exit1 ... ok
+test service_windows_task_start_runs_schtasks ... ok
+test service_systemd_user_status_passthrough ... ok
+test supervision_mode_bad_yaml_summary_has_problem_line_and_column ... ok
+test supervision_mode_prints_plain_text_unvalidated ... ok
+test service_non_string_mode_date_reports_internal_error_json ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/mgmt_setup.rs (target/debug/deps/mgmt_setup-f94457014da1d0e3)
+
+running 37 tests
+test assets_embedded_sha256_match_repo ... ok
+test legacy_detect_shape ... ok
+test flashing_busy_before_materialize ... ok
+test reconcile_stops_old_matrix ... ok
+test supervision_set_bad_words ... ok
+test df10_system_state_migration_target ... ok
+test materialize_skill_always_refreshed_and_linked ... ok
+test same_mode_systemd_user_enables_without_start ... ok
+test out_of_system_without_sudo_blocks ... ok
+test system_with_sudo_unit_content ... ok
+test windows_service_target_pending_only ... ok
+test materialize_removes_legacy_mcp_link_only_when_matching ... ok
+test preserve_remote_tcp_socket_on_demand ... ok
+test plain_setup_does_not_create_install_lock ... ok
+test setup_bad_config_yaml_reports_internal_error_before_side_effects ... ok
+test materialize_profiles_not_overwritten_without_force ... ok
+test setup_waits_for_matching_process_when_on_demand_ping_is_down ... ok
+test plain_setup_waits_for_existing_install_lock_holder ... ok
+test on_demand_to_systemd_user_stops_waits_then_starts ... ok
+test wslconf_merge_matches_configparser_golden ... ok
+test reconcile_setup_path_unchanged_plain_stop ... ok
+test windows_task_to_on_demand_end_only_after_timeout ... ok
+test setup_rollback_stub_is_rejected_before_side_effects ... ok
+test setup_fails_closed_when_old_daemon_scan_fails ... ok
+test reconcile_aborts_when_old_daemon_never_exits ... ok
+test windows_task_to_on_demand_graceful_stop_order ... ok
+test supervision_set_invalid_mode_no_probe ... ok
+test user_flag_on_windows_invalid_args ... ok
+test setup_continues_after_linger_command_failure ... ok
+test materialize_wrappers_posix_only ... ok
+test wsl_systemd_target_with_sudo_installs ... ok
+test wsl_without_sudo_never_runs_sudo_install ... ok
+test reconcile_waits_on_status_pid_not_unrelated_socketless_daemon ... ok
+test reconcile_timeout_keeps_wsl_pending_sudo_commands ... ok
+test system_without_sudo_pending_only ... ok
+test windows_default_target_is_windows_task ... ok
+test reconcile_handed_off_never_sends_daemon_stop ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/mgmt_supervision_switch.rs (target/debug/deps/mgmt_supervision_switch-05802af9268268e2)
+
+running 23 tests
+test supervision_set_hold_record_write_failure_no_side_effects ... ok
+test supervision_set_flash_races_handoff_refused ... ok
+test supervision_set_recover_ambiguous_state_refuses ... ok
+test supervision_set_force_refuses_flashing ... ok
+test supervision_set_procscan_failure_refuses ... ok
+test supervision_set_ping_down_process_alive_refuses ... ok
+test supervision_set_no_daemon_precheck_relaunch_flash_refused ... ok
+test supervision_set_same_mode_or_pending_only_never_hands_off ... ok
+test supervision_set_probe_bad_response_refuses ... ok
+test supervision_set_crash_after_hold_recovers_on_next_setup ... ok
+test supervision_set_file_push_after_probe_handoff_refused ... ok
+test supervision_set_handoff_recv_timeout_no_hard_stop ... ok
+test supervision_set_release_failure_keeps_hold_record ... ok
+test supervision_set_handoff_unsupported_refuses_without_stop ... ok
+test supervision_set_relaunched_busy_releases_hold ... ok
+test supervision_set_refuses_interactive_or_recovering_or_command ... ok
+test supervision_set_idle_uses_handoff_not_daemon_stop ... ok
+test supervision_set_systemd_exit1_after_handoff_not_relaunched ... ok
+test supervision_set_probe_failure_has_no_side_effects ... ok
+test supervision_set_no_daemon_switches_without_stop_rpc ... ok
+test supervision_set_timeout_after_grant_exit1 ... ok
+test supervision_set_force_idle_same_result_as_without ... ok
+test supervision_set_timeout_does_not_leave_orphan_hold ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/mgmt_terminal.rs (target/debug/deps/mgmt_terminal-609ae24e3c4669c9)
+
+running 5 tests
+test delegate_mechanism_still_guards_recursion ... ok
+test delegated_groups_empty ... ok
+test console_attach_long_timeout_floor ... ok
+test console_attach_windows_endpoint_passthrough ... ok
+test console_attach_label_omitted_when_empty ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/mgmt_update.rs (target/debug/deps/mgmt_update-b37bf035c7a3082e)
+
+running 93 tests
+test crash_points_cover_every_journal_step ... ok
+test journal_write_failure_aborts_before_effect ... ok
+test journal_persists_original_snapshot_before_disable ... ok
+test fresh_install_materializes_profiles_and_sets_windows_task ... ok
+test rollback_force_does_not_override_file_transfer ... ok
+test journal_recovery_restarts_original_on_demand_daemon_after_stop ... ok
+test journal_recovery_keeps_journal_when_tty_holder_remains ... ok
+test rollback_force_does_not_override_flashing ... ok
+test journal_recovery_failure_keeps_journal_and_skips_op ... ok
+test revert_handoff_unsupported_new_daemon_keeps_journal ... ok
+test journal_recovery_with_unverifiable_backup_keeps_journal ... ok
+test revert_handoff_recv_timeout_no_hard_stop ... ok
+test revert_new_daemon_rpc_down_process_alive_defers ... ok
+test rollback_without_previous_is_unavailable ... ok
+test rollback_refuses_incompatible_state_schema ... ok
+test journal_recovery_backup_started_never_uses_partial_backup ... ok
+test journal_recovery_rejects_missing_or_mismatched_snapshot_without_side_effects ... ok
+test revert_deferred_on_demand_recovery_waits_for_new_daemon_ordered_shutdown ... ok
+test rollback_cross_mode_windows_task_to_on_demand ... ok
+test revert_rehold_before_new_daemon_handoff ... ok
+test journal_recovery_releases_persistent_systemd_hold ... ok
+test revert_rehands_daemon_that_appears_after_registration_restore ... ok
+test pairing_failure_after_switch_reverts_to_complete_previous ... ok
+test journal_recovery_release_failure_keeps_journal ... ok
+test journal_recovery_refuses_while_new_daemon_flashing ... ok
+test revert_refuses_while_new_daemon_pushing ... ok
+test update_busy_background_command ... ok
+test revert_deferred_releases_hold ... ok
+test update_busy_interactive_lease ... ok
+test update_busy_recovering ... ok
+test rollback_cross_mode_failure_recovers_current ... ok
+test update_force_does_not_override_file_transfer ... ok
+test update_flashing_busy ... ok
+test update_force_does_not_override_flashing ... ok
+test update_busy_appears_after_disable_aborts ... ok
+test update_busy_handoff_releases_hold ... ok
+test rollback_keeps_current_state_same_schema ... ok
+test rollback_not_cli_only ... ok
+test update_file_push_after_last_probe ... ok
+test update_flash_races_prepare ... ok
+test switch_never_starts_before_backup_committed ... ok
+test update_handoff_malformed_grant_refuses ... ok
+test rollback_reregisters_previous_task ... ok
+test update_force_recheck_after_disable_still_aborts ... ok
+test systemd_rollback_daemon_reload_after_unit_restore ... ok
+test update_handoff_recv_timeout_no_hard_stop ... ok
+test update_identity_unknown_blocks ... ok
+test rollback_revert_refuses_while_previous_daemon_pushing ... ok
+test update_accepts_ready_and_released_sessions_together ... ok
+test journal_recovery_after_crash_mid_switch ... ok
+test update_force_does_not_override_interactive_or_recovering ... ok
+test update_lock_contention_no_side_effects ... ok
+test update_lock_contention_does_not_recover_residual_journal ... ok
+test update_force_does_not_skip_identity_or_probe ... ok
+test update_hold_failure_sends_no_stop_rpc ... ok
+test update_handoff_unsupported_daemon_refuses_without_stop ... ok
+test update_hard_stop_never_targets_relaunched_identity ... ok
+test update_journal_persists_systemd_hold_plan_before_hold_side_effect ... ok
+test update_backup_contains_required_files ... ok
+test update_refuses_incompatible_state_schema ... ok
+test update_happy_path_steps_in_order ... ok
+test update_rpc_down_child_holds_com_blocks ... ok
+test update_refuses_while_file_transfer_in_progress ... ok
+test update_safety_malformed_session_list_refuses ... ok
+test update_safety_probe_timeout_refuses ... ok
+test update_old_daemon_never_exits_aborts_without_switch ... ok
+test update_instance_before_start_rehandoff ... ok
+test update_verify_failed_no_side_effects ... ok
+test update_relaunch_loop_aborts_without_switch ... ok
+test rollback_twice_rolls_forward ... ok
+test journal_recovery_restores_original_enabled_and_running_windows_task ... ok
+test update_on_demand_holds_autostart_lock_until_new_daemon_started ... ok
+test update_no_daemon_still_holds_until_switch ... ok
+test update_systemd_system_hold_needs_sudo ... ok
+test update_relaunched_instance_during_backup_rehandoff_refuses_flash ... ok
+test update_materializes_assets_preserving_profiles ... ok
+test update_never_sends_plain_daemon_stop ... ok
+test update_on_demand_not_running_skips_daemon_start ... ok
+test update_relaunched_instance_rehandoff_ok_continues ... ok
+test update_tty_still_held_posix_aborts ... ok
+test update_revert_keeps_journal_when_previous_tty_holder_remains ... ok
+test update_force_idle_same_result_as_without ... ok
+test update_systemd_exit1_after_handoff_not_relaunched ... ok
+test update_released_session_auto_attached_reverts ... ok
+test update_start_failure_writes_failure_json ... ok
+test update_smoke_failure_reverts ... ok
+test update_windows_task_exit1_after_handoff_not_relaunched ... ok
+test update_windows_task_graceful_before_switch ... ok
+test update_wal_unhealthy_reverts ... ok
+test update_version_ok_but_health_fails_reverts ... ok
+test update_release_then_rollback_keeps_released ... ok
+test update_interrupt_injection_every_point_releases_hold ... ok
+test update_interrupt_injection_every_point_recovers_to_previous ... ok
+
+test result: ok. 93 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.68s
+
+     Running tests/output_format.rs (target/debug/deps/output_format-5a1a7d2e25dbed37)
+
+running 20 tests
+test bool_hint ... ok
+test code_and_message ... ok
+test crlf ... ok
+test empty_strings_skipped ... ok
+test embedded_newline_escaped ... ok
+test hint_fullwidth ... ok
+test int_code_str ... ok
+test list_message_repr ... ok
+test message_only ... ok
+test nothing ... ok
+test print_internal_error_behavior ... ok
+test nan_inf ... ok
+test sorted_nested ... ok
+test mirror_err_on_ok_true ... ok
+test warn_version_mismatch_different ... ok
+test mirror_err_on_ok_false ... ok
+test warn_version_mismatch_same ... ok
+test warn_version_mismatch_unknown_cli ... ok
+test warn_version_mismatch_whitespace_or_missing ... ok
+test falsy_code_uses_message ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/parser_mgmt.rs (target/debug/deps/parser_mgmt-a3ac70b75e031b64)
+
+running 4 tests
+test setup_help_matches_rust_only_golden ... ok
+test setup_rollback_and_user_mutually_exclusive ... ok
+test supervision_mode_words_nargs_star ... ok
+test supervision_mode_help_matches_rust_only_golden ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/profile_checks.rs (target/debug/deps/profile_checks-0834e996c9badd92)
+
+running 11 tests
+test ascii_and_unicode_flags_are_the_uncaught_value_error_case ... ok
+test bad_inline_flag_l_is_reported_as_re_error ... ok
+test login_value_error_wins_over_later_bootloader_overflow ... ok
+test password_value_error_wins_over_later_boot_done_overflow ... ok
+test reported_re_error_keeps_exit_zero_and_error_field ... ok
+test boot_done_regex_is_reported_like_python ... ok
+test boot_done_value_error_wins_over_later_bootloader_overflow ... ok
+test trailing_lone_backslash_error_precedes_earlier_token_errors ... ok
+test class_range_error_precedes_unterminated_and_later_escape ... ok
+test prompt_overflow_wins_over_later_login_value_error ... ok
+test boot_done_regex_unset_reports_empty_pattern ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/profile_cmd.rs (target/debug/deps/profile_cmd-7d0487ef5d243e9c)
+
+running 4 tests
+test empty_pattern_not_matched ... ok
+test invalid_regex_reports_python_message ... ok
+test matched_line_is_full_line ... ok
+test bootloader_uses_last_nonblank_line ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rollback_entry_symlink.rs (target/debug/deps/rollback_entry_symlink-ad207ed375c3a26c)
+
+running 1 test
+test on_demand_rollback_spawns_through_symlink_entry ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/rpc_params.rs (target/debug/deps/rpc_params-dba6ea07dfa32bbd)
+
+running 3 tests
+test json_boundary_quirks ... ok
+test long_timeout_floor ... ok
+test params_wire_exact ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/run_process.rs (target/debug/deps/run_process-8f57e03cc838455f)
+
+running 3 tests
+test test_run_process_flush_fail ... ok
+test test_run_process_write_fail ... ok
+test test_run_process_panic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/skill_cmd.rs (target/debug/deps/skill_cmd-6d7993334f41ea93)
+
+running 2 tests
+test skill_assets_match_fs ... ok
+test skill_default_windows_outputs_skill_windows ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/support_selftest.rs (target/debug/deps/support_selftest-8a6bd63e7aee04ef)
+
+running 7 tests
+test spawn_gate_and_journal_reads ... ok
+test daemon_alive_then_gone_flips_on_nth_poll ... ok
+test event_order_merges_by_clock_then_sequence ... ok
+test system_config_dir_is_isolated ... ok
+test isolated_endpoints_stay_distinct ... ok
+test unconfigured_fake_panics_with_name ... ok
+test real_fs_fake_performs_real_operations ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/text_io.rs (target/debug/deps/text_io-19d5534904bacfed)
+
+running 6 tests
+test crlf_print_json_is_single_translated_write ... ok
+test crlf_small_output_defers_error_to_flush ... ok
+test crlf_8192_boundary_fails_at_write_time ... ok
+test merged_stream_order_crlf_8190_matches_python ... ok
+test mirror_err_crlf_is_single_write ... ok
+test err_str_crlf_single_write_then_flush ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/sw_com0com_helper-29084f7e817c356f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/sw_core-eb31c5e17756fcce)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/sw_daemon-5a3c9830bf9d2b41)
+
+running 2 tests
+test launcher::tests::current_release_rejects_parent_traversal ... ok
+test launcher::tests::current_release_resolves_manifest_from_memfs ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/serialwrapd-57be17a8f76a0ce4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/launcher.rs (target/debug/deps/launcher-22e4f2599ccc3ee0)
+
+running 13 tests
+test cap_windows_native__launcher_gui_subsystem ... ignored, 原生 Windows 專用（PE Subsystem 與無 console 啟動）；由 windows_native capability gate 執行
+test cap_windows_native__launcher_parent_kill_kills_child ... ignored, 原生 Windows 專用（Job Object kill-on-close）；由 windows_native capability gate 執行
+test launcher_argv_matches_multi_open_rule2 ... ok
+test launcher_argv_preserves_shell_argument_containing_slash ... ok
+test launcher_argv_python_entry_absolute_and_tail_preserved ... ok
+test launcher_rejects_bare_program_that_would_search_path ... ok
+test executable_file_busy_retries_until_spawn_succeeds ... ok
+test launcher_process_start_error_names_program_without_manifest_label ... ok
+test launcher_manifest_errors_do_not_expose_debug_variant ... ok
+test launcher_rejects_rust_implementation_in_stage1 ... ok
+test launcher_posix_exec_replaces_process ... ok
+test launcher_current_release_pointer_selects_version_manifest ... ok
+test launcher_exit_code_passthrough ... ok
+
+test result: ok. 11 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (target/debug/deps/sw_pal-9167520ed637eef3)
+
+running 14 tests
+test com0com::tests::ignores_malformed_or_incomplete_setupc_rows ... ok
+test com0com::tests::lists_complete_pairs_from_registry_without_setupc ... ok
+test com0com::tests::validates_com_port_names ... ok
+test com0com::tests::setupc_command_uses_payload_directory_and_noninteractive_wait_args ... ok
+test osstr::tests::os_string_from_bytes_preserves_invalid_posix_bytes ... ok
+test rpc_transport::posix::review_regression_tests::expired_send_deadline_returns_timeout ... ok
+test rpc_transport::posix::review_regression_tests::clamped_poll_timeout_does_not_finish_a_later_deadline ... ok
+test com0com::tests::registry_errors_are_returned_for_caller_to_handle ... ok
+test com0com::tests::parses_complete_com0com_pairs ... ok
+test fs_ops::posix::tests::atomic_write_temp_file_is_close_on_exec ... ok
+test rpc_transport::posix::review_regression_tests::only_einprogress_is_treated_as_pending_connect ... ok
+test sysenv::posix::tests::retry_buffer_grows_after_erange ... ok
+test sysenv::posix::tests::retry_buffer_stops_at_one_megabyte ... ok
+test sysenv::posix::tests::merged_runner_preserves_stdout_and_stderr_write_order ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/com0com.rs (target/debug/deps/com0com-0690e0b6377fb57b)
+
+running 5 tests
+test parses_complete_com0com_pairs ... ok
+test ignores_malformed_or_incomplete_setupc_rows ... ok
+test lists_complete_pairs_from_registry_without_setupc ... ok
+test registry_errors_are_returned_for_caller_to_handle ... ok
+test validates_com_port_names ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/exec_delegate.rs (target/debug/deps/exec_delegate-e74ba60120ede4ae)
+
+running 3 tests
+test cap_interactive_desktop__exec_or_wait_ctrl_c ... ignored, cap:interactive_desktop
+test exec_or_wait_reports_missing_program ... ok
+test exec_or_wait_propagates_exit_code_and_env ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fakes_selftest.rs (target/debug/deps/fakes_selftest-816f8aa6bf1cfb86)
+
+running 3 tests
+test fake_sysenv_records_calls_and_scripted_rc ... ok
+test fake_platform_unconfigured_component_panics_not_real_os ... ok
+test p3_alias_still_compiles ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fs_lock.rs (target/debug/deps/fs_lock-efb4347150d9ec7c)
+
+running 13 tests
+test cross_process_lock_holder_helper ... ok
+test copy_preserving_copies_file_contents ... ok
+test copy_tree_follows_source_file_symlinks_and_rejects_existing_destination ... ok
+test copy_preserving_and_copy_tree_accept_readonly_files ... ok
+test realfs_copy_tree_matches_native_destination_and_symlink_contract ... ok
+test copy_tree_and_remove_tree ... ok
+test symlink_or_copy_dir_replaces_real_dir ... ok
+test file_lock_nonblocking_contention_wouldblock ... ok
+test symlink_or_copy_dir_creates_missing_link_parent ... ok
+test write_mkdirs_replace_and_remove_file_operate_on_paths ... ok
+test read_link_set_mode_sync_dir_and_symlink_file_follow_contract ... ok
+test atomic_write_uses_expected_modes_and_removes_failed_temp_files ... ok
+test file_lock_cross_process ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running tests/fs_read.rs (target/debug/deps/fs_read-377636dd3346bec8)
+
+running 5 tests
+test exists_and_is_dir_follow_os_path_semantics ... ok
+test exists_follows_symlinks_like_os_path_exists ... ok
+test read_missing_file_is_not_found ... ok
+test list_dir_returns_entry_names ... ok
+test read_returns_file_bytes_unchanged ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/legacy_supervision.rs (target/debug/deps/legacy_supervision-a1308b3dfde7fae2)
+
+running 14 tests
+test cgroup_classification_distinguishes_foreign_service_units ... ok
+test fake_proc_cgroup_is_scriptable ... ok
+test non_systemd_backends_do_not_claim_enabled_or_main_pid ... ok
+test python_daemon_script_detection ... ok
+test fake_service_main_pid_and_enabled_are_scriptable ... ok
+test is_enabled_mapping_distinguishes_disabled_masked_and_static ... ok
+test systemd_query_enabled_uses_is_enabled_not_is_active ... ok
+test systemd_system_query_enabled_and_main_pid_never_use_sudo ... ok
+test systemd_main_pid_zero_means_no_main_process ... ok
+test fake_proc_details_follow_liveness ... ok
+test python_interpreter_detection ... ok
+test posix_proc_cgroup_reads_proc_pid_cgroup ... ok
+test posix_uart_holder_scan_covers_any_same_uid_process_and_skips_other_uids ... ok
+test posix_proc_details_reads_ppid_uid_exe_argv_and_start_ticks ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/oserror_golden.rs (target/debug/deps/oserror_golden-43bee23e96eebd94)
+
+running 5 tests
+test errno_names_match_golden ... ok
+test file_eacces_matches_golden ... ok
+test file_enoent_matches_golden ... ok
+test file_isdir_matches_golden ... ok
+test listdir_enoent_matches_golden ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/osstr.rs (target/debug/deps/osstr-2396373e54953907)
+
+running 4 tests
+test valid_utf8_is_single_text_piece ... ok
+test join_of_text_only_matches_utf8 ... ok
+test join_restores_original_bytes_exactly ... ok
+test invalid_bytes_become_surrogateescape_code_points ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/proc_scan.rs (target/debug/deps/proc_scan-1e010678bf94ce42)
+
+running 28 tests
+test extract_socket_equals_form_and_trailing_flag ... ok
+test identity_alive_detects_pid_reuse ... ok
+test is_serialwrapd_rule1_basename ... ok
+test is_serialwrapd_rule2_py_suffix_anywhere ... ok
+test is_serialwrapd_rule3_requires_slash ... ok
+test is_serialwrapd_rule4_module_form ... ok
+test is_serialwrapd_windows_exe_case_insensitive ... ok
+test launcher_parent_cycle_does_not_merge_processes ... ok
+test reused_launcher_pid_does_not_swallow_launcher_child ... ok
+test reused_parent_pid_does_not_swallow_child ... ok
+test windows_launcher_and_python_child_count_as_one_daemon ... ok
+test pid_alive_self_true_and_reaped_false ... ok
+test windows_launcher_only_counts_one ... ok
+test windows_launcher_with_unknown_creation_time_is_kept_without_ticks ... ok
+test windows_pyinstaller_onefile_pair_counts_as_one_daemon ... ok
+test windows_unreadable_launcher_cmdline_kept_as_unknown_socket ... ok
+test incomplete_proc_stat_is_conservatively_alive ... ok
+test missing_proc_stat_is_not_alive ... ok
+test posix_scan_missing_root_is_scan_failure ... ok
+test posix_tty_holder_scan_ignores_unrelated_tty_file ... ok
+test pid_alive_false_for_zombie ... ok
+test posix_tty_holder_scan_reports_permission_status ... ok
+test posix_tty_holder_scan_reports_matching_pid_and_ok_status ... ok
+test unreadable_proc_stat_is_conservatively_alive ... ok
+test posix_tty_holder_scan_reports_unknown_on_unreadable_fd_tree ... ok
+test pid_and_identity_alive_handle_non_utf8_comm_and_matching_ticks ... ok
+test posix_tty_holder_scan_reports_unknown_when_target_unstatable ... ok
+test posix_scan_reads_fake_proc_root_sorted_by_pid ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/process_ctl.rs (target/debug/deps/process_ctl-2bd4330f9462fa1b)
+
+running 7 tests
+test call_foreground_returns_exit_code ... ok
+test call_foreground_returns_negative_signal_status ... ok
+test spawn_daemon_poll_preserves_signal_exit_status ... ok
+test spawn_daemon_detached_new_session ... ok
+test poll_treats_echild_as_exited_when_sigchld_is_ignored ... ok
+test spawn_daemon_closes_inherited_non_cloexec_fds_in_both_modes ... ok
+test spawn_daemon_poll_is_nonblocking_and_returns_exit_code ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/process_tunnel.rs (target/debug/deps/process_tunnel-75ca3862fce58f96)
+
+running 11 tests
+test alive_false_after_pid_reuse_ticks_mismatch ... ok
+test posix_rejects_invalid_pid_and_process_group_values ... ok
+test supports_control_master_by_platform ... ok
+test stderr_tail_returns_last_500_bytes_decoded ... ok
+test posix_spawn_detached_reports_missing_and_non_executable_programs ... ok
+test posix_spawn_detached_does_not_inherit_non_cloexec_parent_fds ... ok
+test posix_alive_is_false_after_child_exits ... ok
+test posix_alive_is_true_for_a_running_child ... ok
+test spawn_detached_no_pipes_stdout_to_log ... ok
+test posix_terminate_escalates_and_waits_for_term_ignoring_group ... ok
+test posix_terminate_kills_whole_group_including_grandchild ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/registry_view.rs (target/debug/deps/registry_view-11390e9344dc2f16)
+
+running 4 tests
+test exclude_bluetooth_matches_python_rules_and_keeps_order ... ok
+test exclude_bluetooth_deduplicates_after_bluetooth_filtering ... ok
+test registry_view_posix_unsupported ... ok
+test read_bt_ports_reads_fake_registry_values_and_swallows_errors ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/review_regressions.rs (target/debug/deps/review_regressions-6863055d076f9985)
+
+running 1 test
+test scripted_delay_advances_fake_clock_then_returns_reply ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rpc_client_conformance.rs (target/debug/deps/rpc_client_conformance-b971e9c767541eb8)
+
+running 7 tests
+test unix_path_too_long_has_no_errno ... ok
+test unix_enoent_matches_python_message ... ok
+test unix_len_107_vs_108 ... ok
+test unix_fixture_rows_match_python ... ok
+test tcp_refused_and_gai_and_timeout0_match_python ... ok
+test resolve_tcp_gai_matches_python ... ok
+test recv_times_out_per_call ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/select.rs (target/debug/deps/select-1058a1223f339845)
+
+running 1 test
+test select_backend_matches_platform_backends ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/service_ctl.rs (target/debug/deps/service_ctl-e34e6f86c8a69ff5)
+
+running 47 tests
+test cap_supervisor_runtime__systemd_hold_blocks_restart_on_failure ... ignored, cap:supervisor_runtime
+test on_demand_returns_no_systemd_shape ... ok
+test on_demand_hold_is_noop_record ... ok
+test shell_join_split_windows_roundtrip_golden ... ok
+test composite_service_ctl_dispatches_and_rejects_unsupported_modes ... ok
+test supervision_mode_parse_roundtrip ... ok
+test supervision_controllers_set_enabled_and_uninstall_use_expected_argv ... ok
+test systemd_install_register_held_never_enables_or_starts ... ok
+test systemd_system_release_rmdirs_dropin_dir_ignoring_non_empty ... ok
+test systemd_system_start_with_sudo_prefixes_sudo ... ok
+test systemd_query_maps_is_active ... ok
+test systemd_system_status_never_uses_sudo ... ok
+test systemd_hold_over_existing_dropin_does_not_record_post_hold_values ... ok
+test systemd_system_privileged_without_sudo_returns_needs_sudo_and_runs_nothing ... ok
+test systemd_system_hold_rollback_rmdirs_dropin_dir_best_effort ... ok
+test systemd_hold_verify_mismatch_reverts_and_fails ... ok
+test task_xml_disabled_for_update_hold ... ok
+test task_xml_is_byte_exact_golden ... ok
+test task_xml_omits_empty_working_directory ... ok
+test unknown_mode_foo_returns_no_systemd ... ok
+test systemd_system_hold_without_sudo_needs_sudo ... ok
+test windows_service_hold_state_uses_return_code_not_error_text ... ok
+test windows_service_install_never_executes ... ok
+test windows_service_named_hold_release_restores_the_same_service ... ok
+test windows_service_query_parses_state_code ... ok
+test windows_service_start_without_sudo_needs_sudo ... ok
+test windows_task_hold_is_disable_and_release_restores ... ok
+test windows_task_hold_rolls_back_when_running_or_query_is_ambiguous ... ok
+test windows_task_hold_state_parses_utf16_bom_and_ansi_xml ... ok
+test windows_task_named_hold_release_uses_the_registered_name ... ok
+test windows_task_query_failure_is_never_stopped ... ok
+test windows_task_install_write_failures_report_nonzero_without_running_create ... ok
+test systemd_release_removes_dropin_and_restores ... ok
+test systemd_user_start_runs_user_scope ... ok
+test windows_service_install_plan_register_held_is_disabled_and_not_started ... ok
+test task_xml_escapes_ampersand_in_path ... ok
+test windows_task_query_object_not_found ... ok
+test windows_task_query_ready_is_not_running ... ok
+test windows_task_start_status_hard_stop_argv ... ok
+test windows_task_install_writes_xml_then_creates_task ... ok
+test windows_task_install_register_held_writes_disabled_xml ... ok
+test systemd_home_and_staging_paths_prefer_home_over_passwd_home ... ok
+test windows_task_set_enabled_false ... ok
+test windows_task_stop_and_restart_are_not_composed_in_pal ... ok
+test systemd_user_hold_writes_dropin_reload_disable_verify ... ok
+test systemd_user_hold_rollback_removes_empty_dropin_dir ... ok
+test systemd_user_release_removes_empty_dropin_dir_but_keeps_foreign_dropins ... ok
+
+test result: ok. 46 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/sysenv.rs (target/debug/deps/sysenv-fc2e20a183ffdb05)
+
+running 9 tests
+test pid_matches_current_process ... ok
+test current_exe_matches_std ... ok
+test errno_name_known_code ... ok
+test system_config_dir_is_platform_constant ... ok
+test terminal_columns_ignores_columns_env ... ok
+test var_reads_process_environment ... ok
+test stdout_is_terminal_matches_std_io ... ok
+test vars_survive_non_utf8_values ... ok
+test realpath_resolves_symlinks ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sysenv_mgmt.rs (target/debug/deps/sysenv_mgmt-1efa11727f08c78d)
+
+running 17 tests
+test has_systemd_false_when_dir_absent ... ok
+test run_invalid_utf8_is_decode_error_like_python ... ok
+test run_raw_replaces_env ... ok
+test run_timeout_covers_pipe_drain_after_parent_is_killed ... ok
+test run_timeout_returns_minus1_timeout ... ok
+test run_universal_newlines_matches_python_golden ... ok
+test which_all_empty_path_returns_empty ... ok
+test which_all_keeps_distinct_candidate_strings ... ok
+test user_identity_posix_prefers_user_env ... ok
+test which_all_dedups_in_path_order ... ok
+test run_raw_preserves_nul_bytes_and_crlf ... ok
+test run_missing_exe_is_notfound_with_py_message ... ok
+test which_all_skips_non_executable_posix ... ok
+test run_timeout_covers_pipe_drain_after_parent_exit ... ok
+test which_treats_empty_path_entries_as_current_directory ... ok
+test run_invalid_utf8_error_spans_match_python_goldens ... ok
+test which_uses_default_path_when_path_is_unset ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running unittests src/lib.rs (target/debug/deps/sw_proto-5605fbfdac400721)
+
+running 54 tests
+test pycompat::tests::embedded_tables_equal_cpython_golden ... ok
+test pycompat::tests::char_and_byte_index_conversion ... ok
+test endpoint::tests::port_digit_limit_counts_leading_zeros_like_python ... ok
+test pycompat::tests::isdigit_recorded_cases ... ok
+test pycompat::tests::repr_str_separator_escapes_recorded_cases ... ok
+test pycompat::tests::py_truthy_matches_python_bool ... ok
+test pycompat::tests::strip_and_bytes_strip_recorded_cases ... ok
+test pycompat::tests::splitlines_and_universal_newlines_recorded_cases ... ok
+test pyjson::tests::allow_nan_false_panics - should panic ... ok
+test pycompat::tests::sha256_hex_known_vectors ... ok
+test pyfmt::tests::repr_nested_containers_recorded_cases ... ok
+test pyjson::tests::big_int_representation ... ok
+test pyjson::tests::repr_float_ties_to_even ... ok
+test pyjson::tests::del_escape_with_ensure_ascii ... ok
+test pypath::tests::expanduser_win_homepath_branch_and_no_env ... ok
+test pypath::tests::expanduser_win_missing_username_matches_cpython ... ok
+test pypath::tests::expanduser_win_with_username_matches_cpython ... ok
+test pypath::tests::normpath_windows_c_impl_difference_recorded_nc04 ... ok
+test pypath::tests::windows_drive_is_char_indexed_for_multibyte_first_char ... ok
+test pycompat::tests::int_digit_limit_matches_cpython ... ok
+test pyfmt::tests::repr_deep_nesting_does_not_overflow ... ok
+test pyjson::tests::illegal_unicode_escapes_rejected ... ok
+test pyre::review_regression_tests::comments_are_transparent_to_repeat_attachment ... ok
+test pyre::review_regression_tests::conditional_groups_validate_branch_count_and_forward_references_after_parse ... ok
+test pyre::review_regression_tests::rust_parse_depth_matches_python_oracle_measurement ... ok
+test runtime_paths::tests::fold_upper_snapshot_is_case_insensitive ... ok
+test pyre::review_regression_tests::zero_width_escape_atoms_cannot_be_repeated ... ok
+test runtime_paths::tests::exact_snapshot_is_case_sensitive_and_last_duplicate_wins ... ok
+test pyre::review_regression_tests::search_from_clamps_positions_to_python_string_length ... ok
+test pyre::review_regression_tests::scoped_flags_keep_their_group_boundary ... ok
+test pyre::review_regression_tests::template_flag_and_surrogates_are_not_misclassified ... ok
+test pyre::review_regression_tests::unicode_character_names_do_not_guess_and_cover_unicode_15_names ... ok
+test pyre::review_regression_tests::only_unescaped_hyphen_forms_character_ranges ... ok
+test yaml11::tests::test_big_int_map_key_equality ... ok
+test pyre::review_regression_tests::numeric_escapes_follow_python_octal_and_backreference_limits ... ok
+test pyre::review_regression_tests::possessive_repeat_boundaries_match_python_for_simple_alternatives ... ok
+test yaml11::tests::test_big_integers_radix ... ok
+test pyre::review_regression_tests::empty_lower_bound_brace_repeat_is_unbounded ... ok
+test pyre::review_regression_tests::inline_flag_syntax_and_scoped_ascii_overrides_match_python ... ok
+test pyre::review_regression_tests::lookbehind_rejects_references_to_groups_defined_inside_it ... ok
+test pyre::review_regression_tests::oversized_empty_capable_repeat_uses_cli_and_daemon_validation_contracts ... ok
+test yaml11::tests::test_binary_decode_stops_at_padding ... ok
+test pyre::review_regression_tests::oversized_repeats_are_never_approximated ... ok
+test runtime_paths::tests::windows_without_home_env_keeps_tilde_like_python ... ok
+test pyre::review_regression_tests::group_names_use_python_identifier_and_repr_rules ... ok
+test pyre::review_regression_tests::possessive_repeats_do_not_backtrack_between_iterations ... ok
+test yaml11::tests::test_py_repr_bytes_formatting ... ok
+test yaml11::tests::test_pairs_and_non_specific_tag ... ok
+test yaml11::tests::test_relax_flow_indent_and_lone_dash ... ok
+test yaml11::tests::test_valid_yaml_block_scalars_and_regexes ... ok
+test pyre::review_regression_tests::ignorecase_uses_python_ascii_and_unicode_folding ... ok
+test pyre::review_regression_tests::python_category_complements_and_unicode_15_tables_are_used ... ok
+test yaml11::tests::test_deep_nesting_and_alias_bomb_bounded ... ok
+test pycompat::tests::predicates_match_cpython_for_every_codepoint ... ok
+
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/bench_registry.rs (target/debug/deps/bench_registry-a8824e7876875e8c)
+
+running 20 tests
+test bench_entry_not_object_is_rejected ... ok
+test bench_code_empty_is_rejected ... ok
+test bench_code_not_string_is_rejected ... ok
+test autossh_not_bool_is_rejected ... ok
+test missing_required_entry_fields_are_rejected_sorted ... ok
+test extra_entry_fields_are_rejected_sorted ... ok
+test local_port_out_of_range_is_rejected ... ok
+test resolve_unknown_code_is_rejected ... ok
+test root_not_object_is_rejected ... ok
+test local_port_not_integer_is_rejected ... ok
+test remote_socket_empty_is_rejected ... ok
+test benches_not_object_is_rejected ... ok
+test target_empty_is_rejected ... ok
+test ssh_opts_not_string_array_is_rejected ... ok
+test remote_socket_not_string_is_rejected ... ok
+test target_not_string_is_rejected ... ok
+test strings_strip_python_control_whitespace ... ok
+test yaml_syntax_errors_keep_internal_error_classification ... ok
+test unknown_root_keys_are_rejected_sorted ... ok
+test target_not_user_at_host_is_rejected ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/config_types_golden.rs (target/debug/deps/config_types_golden-e3083f0b011a8053)
+
+running 2 tests
+test runtime_config_semantics ... ok
+test load_profiles_golden ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/constants_sync.rs (target/debug/deps/constants_sync-835e8f1b620c3cc7)
+
+running 1 test
+test test_constants_sync_with_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/endpoint_golden.rs (target/debug/deps/endpoint_golden-6a6288d9f66ebde6)
+
+running 2 tests
+test test_is_loopback_tcp ... ok
+test test_endpoint_golden ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/error_codes_sync.rs (target/debug/deps/error_codes_sync-e24cb636e4bd2b55)
+
+running 3 tests
+test cli_codes_used_by_p3_exist_with_cli_interface ... ok
+test credentials_unresolved_is_not_an_rpc_error_code_variant ... ok
+test every_yaml_code_has_variant_and_meta_in_order ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/pycompat_golden.rs (target/debug/deps/pycompat_golden-443d81e409f9ebf9)
+
+running 4 tests
+test py_repr_float_forwards_to_pyjson ... ok
+test pypath_posix_golden ... ok
+test pypath_windows_golden ... ok
+test pycompat_golden ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/pyjson_golden.rs (target/debug/deps/pyjson_golden-21b9b87bc8690b76)
+
+running 9 tests
+test keep_lone_surrogates_escapes_and_flags ... ok
+test duplicate_key_keeps_first_position_last_value ... ok
+test depth_limit_is_iterative_and_bounded ... ok
+test lone_surrogate_becomes_replacement ... ok
+test non_finite_repr_vs_dumps ... ok
+test rpc_early_exact_bytes ... ok
+test keep_lone_surrogates_keys_distinguish_legal_content_from_surrogates ... ok
+test keep_lone_surrogates_flag_follows_duplicate_key_overwrite ... ok
+test golden_cases ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/pyre_golden.rs (target/debug/deps/pyre_golden-c6becd357846b59c)
+
+running 4 tests
+test completion_none_is_valid_and_empty_invalid ... ok
+test search_reports_code_point_offsets ... ok
+test residuals_file_hygiene ... ok
+test golden_compile_search_completion ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/release_manifest.rs (target/debug/deps/release_manifest-099ea45cd796ffe1)
+
+running 11 tests
+test test_parse_current_release ... ok
+test test_parse_manifest_entry_contains_number ... ok
+test test_parse_manifest_fixture_normal ... ok
+test test_parse_manifest_entry_empty_list ... ok
+test test_parse_manifest_invalid_json ... ok
+test test_parse_manifest_missing_entry ... ok
+test test_parse_manifest_schema_version_2 ... ok
+test test_parse_manifest_rejects_missing_or_non_exact_pairing_rule ... ok
+test test_version_line_and_package_sync ... ok
+test test_parse_manifest_schema_version_float_one_matches_python ... ok
+test test_schema_contract_present ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rpc_types.rs (target/debug/deps/rpc_types-ca3a4ce0abe9a4f5)
+
+running 4 tests
+test known_has_55_unique ... ok
+test long_timeout_is_exactly_4 ... ok
+test retry_whitelist_is_exactly_11 ... ok
+test known_equals_p0_rpc_schema_methods ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/runtime_config_write.rs (target/debug/deps/runtime_config_write-603fdae1787bddef)
+
+running 3 tests
+test runtime_config_set_mode_keeps_other_keys ... ok
+test yaml_error_summary_is_single_line_problem_with_position ... ok
+test runtime_config_to_yaml_matches_pyyaml_golden ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runtime_paths_golden.rs (target/debug/deps/runtime_paths_golden-31dddb3251721ec3)
+
+running 5 tests
+test test_bench_state_path ... ok
+test test_benches_yaml_path ... ok
+test test_resolve_config_path_sc09 ... ok
+test posix ... ok
+test windows ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/wal_types_golden.rs (target/debug/deps/wal_types_golden-5f42a8954de661f1)
+
+running 2 tests
+test test_wal_record_to_line_golden ... ok
+test test_wal_recreated_meta ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/yaml11_golden.rs (target/debug/deps/yaml11_golden-2caf6f28702bc3c0)
+
+running 1 test
+test yaml11_golden ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/yaml_emit.rs (target/debug/deps/yaml_emit-4445617b75dbda29)
+
+running 5 tests
+test root_binary_has_no_document_end_marker ... ok
+test non_string_scalar_mapping_keys_are_sorted ... ok
+test boolean_float_and_timestamp_mapping_keys_are_sorted ... ok
+test nested_sequence_mapping_round_trips_without_extra_sequence ... ok
+test yaml_emit_matches_pyyaml_golden ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests sw_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests sw_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests sw_daemon
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests sw_pal
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests sw_proto
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
