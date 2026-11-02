@@ -2846,6 +2846,60 @@ fn revert_deferred_releases_hold() {
 }
 
 #[test]
+fn revert_deferred_on_demand_recovery_waits_for_new_daemon_ordered_shutdown() {
+    // S1 出口 A/B B 輪（2026-10-30）黑箱 test_revert_new_daemon_push_not_aborted_l15 的確定性對應：on-demand 更新驗證失敗，
+    // 回退因 file.push 延後（revert_pending）；push 完成後 recover_journal 對 0.4.1 daemon 交接成功，daemon 於 3 s 排空窗口後
+    // 關閉監聽，SC-11 有序關機使行程於 grant 後 12 s 才結束。舊實作 grant 起 10 s 即回 TIMEOUT／handoff_timeout 並保留 journal。
+    let t = TestEnv::posix()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle("0.4.1")
+        .with_supervisor_state("on-demand", true, true)
+        .with_config("supervision_mode: on-demand\n")
+        .with_idle_daemon_default(4242)
+        .with_new_daemon_reporting_version("0.4.0")
+        .with_new_daemon_handoff_script(&[BUSY_PUSH]);
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!(j["update"]["revert_pending"], true, "{out}");
+    assert_eq!(j["update"]["revert_error"]["error_code"], "SESSION_BUSY", "{out}");
+    let journal_path = t.root().root.join("install-journal.json");
+    assert!(journal_path.exists());
+    let endpoint = t.isolated_endpoint(&t.default_socket());
+    let new_pid = 5252;
+    t.rpc().respond(&endpoint, "daemon.handoff_stop", "{\"ok\":true,\"stopping\":true,\"handoff_token\":\"0123456789abcdef0123456789abcdef\"}");
+    t.rpc().clear_stop_after_send(&endpoint, "daemon.handoff_stop");
+    let rpc = std::sync::Arc::clone(t.rpc());
+    let clock = std::sync::Arc::clone(t.clock());
+    let gate_endpoint = endpoint.clone();
+    let handoffs_before = t.rpc().request_count(&endpoint, "daemon.handoff_stop");
+    let granted_at = std::sync::Mutex::new(None);
+    let listener_closed = std::sync::atomic::AtomicBool::new(false);
+    t.procs().alive_while(new_pid, std::sync::Arc::new(move || {
+        if rpc.request_count(&gate_endpoint, "daemon.handoff_stop") == handoffs_before {
+            return !rpc.is_stopped(&gate_endpoint);
+        }
+        let now = clock.elapsed();
+        let at = *granted_at.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(now);
+        if now < at + std::time::Duration::from_secs(3) {
+            return true;
+        }
+        if !listener_closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            rpc.stop_endpoint(&gate_endpoint);
+        }
+        // 12 s 前為有序關機中的舊行程；之後只剩復原後重新拉起的實例（endpoint 復活）才算存活。
+        now < at + std::time::Duration::from_secs(12) || !rpc.is_stopped(&gate_endpoint)
+    }));
+    let recovered = t.recover().expect("deferred revert must remain recoverable");
+    assert!(recovered.ok, "{:?} {:?} {:?}", recovered.error_code, recovered.reason, recovered.message);
+    assert_eq!(recovered.restored["daemon_version"], "0.4.0");
+    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.0");
+    assert!(!journal_path.exists());
+}
+
+#[test]
 fn journal_recovery_release_failure_keeps_journal() {
     let t = TestEnv::posix()
         .with_install_root()
