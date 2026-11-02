@@ -14,6 +14,7 @@ from realhw.harness import CaseResult
 
 from ..harness import Case, register
 from .. import guards
+from .f09_brcm_reboot_login import _read_boot_id
 
 
 def _case(id, title, issues, hints=(), requires=(), destructive=True):
@@ -158,6 +159,122 @@ def f9_quiet_window_agent_passthrough(ctx):
                           evidence={"after-boot-echo": follow_path})
     finally:
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
+
+
+@_case(
+    "f9-reboot-stale-ready",
+    "單獨 reboot 後，banner 前舊 shell 應答 nonce 不得讓 READY 提早確認（stale-READY）",
+    issues=("#162",),
+    hints=(
+        "prplOS／BusyBox 的 `reboot` 是非同步：shell 立刻重印 prompt，但 shutdown 很慢（IB8 實測 U-Boot"
+        " banner 在 reboot 後 17～26 秒）。舊行為在 +3～6 秒就送確認 probe，舊 shell 照常回應 nonce → 提早"
+        "確認 READY，agent 命令落進關機中的系統、讀到舊 boot_id。",
+        "oracle：reboot 後持續送 `cat /proc/sys/kernel/random/boot_id`——banner 前必須被擋（AUTOBOOT_QUIET）；"
+        "任何一次讀到『reboot 前的 boot_id』＝FAIL（stale-READY，或板子根本沒重開）；最終 boot_id 改變並回（真）READY。",
+        "此 case 寫成後尚未在真板跑過；上板前需在 allow_destructive 的 bench 執行並確認結果。",
+    ),
+)
+def f9_reboot_stale_ready(ctx):
+    """#162 延伸：非同步 reboot 後，舊 shell 在 banner 前應答確認 probe 的 nonce，不得讓 READY 提早確認。
+
+    當初的錯誤行為＝reboot 送出後 3～4 秒（RX 閒置 `REPROBE_RX_IDLE_S`）daemon 就送
+    `\\n`＋`echo __READY__<nonce>`，關機中的舊 shell 回應 → `confirm_ready()` 清掉 pending →
+    session 在板子真正重開前就是 stale-READY，隨後的 agent 命令通過 gate、讀到舊 boot_id。
+    修正後確認 probe 要等 RX 出現 boot banner 才送（寬限內沒有 banner 則照常確認）。
+
+    判讀：reboot 之後以 1 秒週期送 boot_id 讀取命令——
+    - 被 `AUTOBOOT_QUIET`／`READY_UNCONFIRMED` 擋下：預期（零 UART 副作用）；
+    - 被接受且讀到 reboot 前的 boot_id（或通過 gate 卻沒讀到）：FAIL（stale-READY）；
+    - 讀到新的 boot_id：板子已重開並回（真）READY，PASS。
+    """
+    com = ctx.cfg["boards"][0]["com"]
+    boot_wait_s = float(ctx.cfg["timeouts"]["boot_wait_s"])
+    if ctx.sw.session(com).get("state") != "READY":
+        return CaseResult("SKIP", reason=f"{com} 尚非 READY", category="environment", reason_code="board_not_ready")
+    before, before_cmd = _read_boot_id(ctx, com)
+    if not before:
+        return CaseResult("SKIP", reason=f"無法取得 reboot 前 boot ID（{before_cmd}）",
+                          category="environment", reason_code="boot_id_unavailable")
+    submitted = False
+    try:
+        t0 = time.monotonic()
+        reboot_resp = ctx.sw.submit_and_wait(com, "reboot", cmd_timeout=8.0)
+        submitted = True
+        ctx.note("reboot-submit.json", str(reboot_resp))
+
+        timeline: list[str] = []
+        blocked = 0
+        new_boot_id: str | None = None
+        stale_at: float | None = None
+        stale_info = ""
+        while time.monotonic() - t0 < boot_wait_s:
+            current, info = _read_boot_id(ctx, com)
+            elapsed = time.monotonic() - t0
+            accepted = not info.startswith("submit:")  # _read_boot_id：被 gate 拒絕時 info 以 "submit:" 開頭
+            if current is None and not accepted:
+                timeline.append(f"+{elapsed:.1f}s rejected {info}")
+                if info.startswith("submit:AUTOBOOT_QUIET"):
+                    blocked += 1
+                elif info.startswith("submit:READY_UNCONFIRMED"):
+                    break  # 有界化終態，等下去也不會好
+            elif current is None:
+                # 命令通過 gate 卻沒讀到 boot_id：被關機中的系統吃掉（逾時／被打斷）。
+                timeline.append(f"+{elapsed:.1f}s accepted_but_lost {info}")
+                stale_at, stale_info = elapsed, f"命令通過 gate 但沒有讀到 boot_id（{info}）"
+                break
+            elif current == before:
+                timeline.append(f"+{elapsed:.1f}s accepted old_boot_id {info}")
+                stale_at, stale_info = elapsed, "讀到 reboot 前的 boot_id"
+                break
+            else:
+                timeline.append(f"+{elapsed:.1f}s accepted new_boot_id {info}")
+                new_boot_id = current
+                break
+            time.sleep(1.0)
+        timeline_path = ctx.note("stale-ready-timeline.txt", "\n".join(timeline))
+
+        if stale_at is not None:
+            return CaseResult(
+                "FAIL",
+                reason=f"reboot 後 +{stale_at:.1f}s agent 命令在 banner 前被放行：{stale_info}"
+                "（stale-READY：舊 shell 應答 nonce 讓 READY 提早確認；或板子根本沒重開）",
+                category="test", reason_code="stale_ready_old_boot_id",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        if new_boot_id is None:
+            return CaseResult(
+                "FAIL",
+                reason=f"{boot_wait_s:.0f}s 內沒有讀到新的 boot_id（被擋 {blocked} 次）：未回可下命令的 READY",
+                category="test", reason_code="boot_not_ready",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        if blocked == 0:
+            # 第一個被接受的命令就是新 boot_id：沒有觀測到 banner 前的受測窗口，gate 沒被驗到。
+            return CaseResult(
+                "SKIP",
+                reason="未觀測到 banner 前被 AUTOBOOT_QUIET 擋下的命令（受測窗口未現形），無法驗證 stale-READY 防線",
+                category="environment", reason_code="stale_window_not_observed",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        cleared, last_sess = _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
+        ctx.note("quiet-cleared.json", str({"cleared": cleared, "session": last_sess}))
+        if not cleared:
+            return CaseResult(
+                "FAIL",
+                reason=f"讀到新 boot_id 後 {boot_wait_s:.0f}s 內 session 未回可下命令的 READY"
+                f"（state={last_sess.get('state')!r}）",
+                category="test", reason_code="boot_not_ready",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        return CaseResult(
+            "PASS",
+            reason=f"banner 前 agent 命令被擋 {blocked} 次（零 UART 副作用），重開後 boot_id 改變並回（真）READY",
+            evidence={"stale-ready-timeline": timeline_path},
+        )
+    finally:
+        if submitted:
+            guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
+            _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
 
 
 @_case(
