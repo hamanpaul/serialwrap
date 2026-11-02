@@ -200,6 +200,7 @@ sequenceDiagram
 - `background_capture_id`
 - `interactive_session_id`
 - `recovery_action`
+- `expect_reboot`（`cmd submit --expect-reboot` 的設定，未明示為 `false`）
 - `error_code`
 - `started_at`
 - `done_at`
@@ -345,6 +346,18 @@ session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unre
 適用場景：`apt upgrade`、`make`、`python -m unittest`、`opkg install` 等長時間但有間歇輸出的命令。
 
 詳見設計文件：[`docs/design-heartbeat-keepalive.md`](./design-heartbeat-keepalive.md)。
+
+### 6.6 明示 reboot（`--expect-reboot`）
+
+`_is_reboot_command` 只認單獨一條的 `reboot`、`systemctl reboot`、`shutdown -r` 與 `echo b > /proc/sysrq-trigger`，不猜 shell 串接。`command.submit` 的選填布林 `expect_reboot`（CLI：`cmd submit --expect-reboot`）讓呼叫端明示「這條命令會重開機」，不管命令文字一律走 `_handle_reboot_command`（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 `_spawn_reboot_recovery` 等板子回 `READY`）。
+
+- 傳遞：CLI → RPC → service submit-time gate → arbiter queue → `execute_command`；未帶旗標時 arbiter callback 維持既有七參數，只有帶旗標才多傳 `expect_reboot=True` keyword。命令記錄與 `command.get` 一律回報 `expect_reboot`；帶旗標時 submit 回應回聲 `expect_reboot: true`，執行前於 WAL 寫 `META event=command_expect_reboot`。
+- 驗證：只接受 JSON 布林（`null` 視同 `false`），其餘型別 `INVALID_EXPECT_REBOOT`；`mode=interactive` 帶旗標 `EXPECT_REBOOT_MODE_UNSUPPORTED`。兩者在 CLI、RPC、arbiter、`execute_command` 皆於排隊／TX 前拒絕。
+- 互動：同時帶 `completion_regex` 時 reboot 優先（regex 通過驗證但不使用）；旗標不繞過 §9.3 的 `AUTOBOOT_QUIET`／`READY_UNCONFIRMED` gate。
+- 串接命令的 prompt 等待：單獨 reboot 等 `min(timeout_s, 2.0)`；帶旗標且 `_is_reboot_command` 認不出的命令（`A && reboot`）等 `max(timeout_s, expected_duration_s)`。2s 內（或等待期間內）prompt 回來＝非同步 reboot 的 prompt 回顯，與單獨 reboot 相同處理（`clear_boot_quiet()`、不 `confirm_ready()`、回 `ok`／`partial=false`）；沒等到才走 recovery（`status=recovering`、`recovery_action=EXPECT_REBOOT`）。若串接命令仍只等 2s，前段超過 2s 會誤入 recovery 分支，prompt 隨後回來被 recovery 迴圈當成開機完成而過早 `confirm_ready()`（stale-READY，#162）。
+- 非致命提示：未帶旗標、非 `interactive`、命令在 `&&`／`||`／`;`／`&` 之後含 `_is_reboot_command` 認得的區段時，submit 回應多一則 `CHAINED_REBOOT_WARNING`（`warning` 維持單一欄位、`CMD_LENGTH_WARNING` 優先，`warnings` 列出全部）；不改變執行。
+
+詳見 [`docs/expect-reboot.md`](./expect-reboot.md)。
 
 ## 7. 呼叫流程圖
 
@@ -508,7 +521,7 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 
 **觸發（arm）**：
 
-1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。
+1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。命令文字認不出的串接命令可用 `--expect-reboot` 明示走此路徑（§6.6）。
 2. RX 路徑（`_on_bridge_rx`）偵測到 boot banner——以 `BOOT_BANNER_PATTERNS`（`U-Boot`、`Hit any key to stop autoboot`；大小寫敏感 substring）比對 rolling tail（`BOOT_BANNER_TAIL_CHARS=256` 字元，跨 chunk 邊界）。倒數每 tick 會延長視窗。此路徑涵蓋 DUT 自行重開／斷電重開。
 
 **效果**：視窗內（`BOOT_QUIET_WINDOW_S=180s`）gate 所有 `source=system` 的自動 probe TX——這裡的「自動」指呼叫端不需人為觸發 UART 寫入本身，**手動觸發的 RPC（`session attach`／`session recover`）一樣受 gate**，因為它們最終都會走到下列同一批共用 probe/按鍵函式（#130 review 收斂前，這幾條路徑各自遺漏過 gate，現已逐一補上）：
