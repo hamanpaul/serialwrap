@@ -1,0 +1,17 @@
+release bundle 證據摘要
+bundle_version=0.4.0
+bundle_git_revision=6a21235c355010787dcc26a7f144eafbbe3dc6fc
+bundle_manifest_sha256=fa051a2c404260cb302ae1193852e2dc76dd0d55a50a382ec4df1765fce99a26
+build_python=/usr/bin/python3.12
+build_python_version=3.12.3
+build_command=mkbundle.sh --release-bundle --profile release --version-override 0.4.0
+pyvenv.cfg:
+home = /usr/bin
+include-system-site-packages = false
+version = 3.12.3
+executable = /usr/bin/python3.12
+command = /home/paul_chen/prj_pri/serialwrap-worktrees/release-0.4.0/evidence/stage1/upgrade-docker/release-0.4.0-6a21235/work/build-venv/bin/python3 -m venv --copies /home/paul_chen/prj_pri/serialwrap-worktrees/release-0.4.0/evidence/stage1/upgrade-docker/release-0.4.0-6a21235/work/bundle-0.4.0/versions/0.4.0/py
+test_hook_scan=SW_TEST_UPDATE_PAUSE_AFTER,SW_TEST_UPDATE_FORCE_VERIFY_FAIL,SERIALWRAP_TEST_DELEGATE_GROUP
+test_hook_counts_serialwrap={"SERIALWRAP_TEST_DELEGATE_GROUP": 1, "SW_TEST_UPDATE_FORCE_VERIFY_FAIL": 0, "SW_TEST_UPDATE_PAUSE_AFTER": 0}
+test_hook_counts_serialwrapd={"SERIALWRAP_TEST_DELEGATE_GROUP": 0, "SW_TEST_UPDATE_FORCE_VERIFY_FAIL": 0, "SW_TEST_UPDATE_PAUSE_AFTER": 0}
+結論=兩個 release update test-fakes 鉤子不存在；SERIALWRAP_TEST_DELEGATE_GROUP 存在，符合既有 S1X-b-4 Low，不符合 brief 的無測試鉤子要求。

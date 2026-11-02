@@ -84,6 +84,11 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
   - `--scenario install-sh` 兩模式各 12 項 **PASS**。
   - 7 份報告的 `bundle_manifest_sha256` 與 wheel 雜湊相同。證據於 `evidence/stage1/upgrade-docker/install-sh-a20de1d/`，含 `on-demand-run2`／`on-demand-run3`；driver 修正前的判定由 `install-sh-407ed7e` 取代。
   - 同為開發中 bundle，不取代前置條件 #3。
+- REL-040-r2 release 候選重跑（2026-11-03，分支 `feature/release-0.4.0`，HEAD `6a21235c355010787dcc26a7f144eafbbe3dc6fc`）：同一個 `--release-bundle --profile release --version-override 0.4.0` bundle 以 `/usr/bin/python3.12`（3.12.3）建置，`pyvenv.cfg` 為 `home = /usr/bin`、`include-system-site-packages = false`，manifest SHA256 `fa051a2c404260cb302ae1193852e2dc76dd0d55a50a382ec4df1765fce99a26`。
+  - systemd-user 與 on-demand 各完整 19 項 **PASS**；OD-48 `legacy_handoff_direct_setup` 分別以 `systemctl_stop`／`rpc_daemon_stop` 停止 0.3.2，等待 5381／5227 ms 後由 setup 啟動 0.4.0 daemon，舊行程已結束。
+  - systemd-system 的 `scope=legacy_direct_setup_success_path`，13 項 **PASS**；覆蓋 0.3.2 system daemon 執行時直接 setup 的 OD-48 成功路徑，不是 systemd-user／on-demand 的完整 19 項升級流程。`legacy_handoff_direct_setup` 等待 5204 ms，setup 啟動新 daemon；套件管理的 `default.yaml` 記為 `package_updated`。
+  - `no_two_reader` 三模式皆 **PASS**，取樣 1499／1520／1365 次，重疊均為 0。三份報告及 journal／steps 記錄、bundle runtime 與 hook 掃描摘要、pytest gate 摘要及 `SHA256SUMS` 保存於 `evidence/stage1/upgrade-docker/release-0.4.0-6a21235/`；`sha256sum -c` 全部 11 項 OK。每個模式只實跑一次，沒有 Docker 判定失敗，因此未重跑；腳本建立的三個容器與映像均已清除。
+  - bundle 符合 `--release-bundle --profile release`；`SW_TEST_UPDATE_PAUSE_AFTER`、`SW_TEST_UPDATE_FORCE_VERIFY_FAIL` 未出現在 release binaries。不過 `serialwrap` binary 含一個 `SERIALWRAP_TEST_DELEGATE_GROUP` 字串（兩次獨立掃描皆為 1 次），符合既有 Low finding S1X-b-4；因此本次 Docker 三模式雖 PASS，brief 的「無測試鉤子」候選條件仍未通過。依本輪指示未修此 Low，列為既有碼待辦。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 
