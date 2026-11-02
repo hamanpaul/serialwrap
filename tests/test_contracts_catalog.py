@@ -1377,8 +1377,8 @@ def test_bc_real_sc_df_ranges() -> None:
     assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36", "SC-37", "SC-39"}) - {"SC-08"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
     # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記；DF-20～DF-22 依 OD-34～OD-44 登記；
-    # DF-23 依 OD-57（P7）登記。
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 24)}
+    # DF-23／DF-24 依 OD-57／OD-73（P7）登記。
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 25)}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
@@ -1408,6 +1408,15 @@ def test_bc_real_sc_df_ranges() -> None:
     assert df21.case_ids == ("df21-recover-flush-atomic",)
     assert "OD-37" in df21.related_decisions
     assert "FLUSHED_BY_RECOVERY" in df21.compatibility_impact and "UART TX 為零" in df21.compatibility_impact
+
+    df24 = by_id["DF-24"]
+    assert df24.status == "IMPLEMENTED" and df24.scope == "both" and df24.applies_python_min == "0.4.0"
+    assert df24.applies_rust_stage == "slice-2.3" and df24.ab_participation == "diff"
+    assert list(df24.phases) == ["P7"]
+    assert df24.case_ids == ("p7-selftest-recover-recover-force-timeout-attached",)
+    assert "OD-73" in df24.related_decisions
+    assert "6 秒" in df24.compatibility_impact and "session list" in df24.compatibility_impact
+    assert "不把 Python 的長時間 lock 行為複製到 Rust" in df24.compatibility_impact
 
     df22 = by_id["DF-22"]
     assert df22.scope == "rust_only" and df22.applies_python_min is None

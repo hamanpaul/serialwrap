@@ -16,7 +16,9 @@ stdlib＋PyYAML＋PTY，不得 import sw_core／serialwrap／serialwrapd。
 from __future__ import annotations
 
 import os
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -178,13 +180,28 @@ def test_attach_recover_last_error_field(p7, tmp_path):
 
 
 def test_recover_force_timeout_attached(p7, tmp_path):
-    """ATTACHED、target 靜默：`recover --force` → `FORCE_RECOVER_TIMEOUT`、`FORCE_CLEAR_REATTACH`，10～13 s。"""
+    """ATTACHED、target 靜默：force recover 逾時 10～13 s，並核對 OD-73 的並行 session list 差異。"""
     tgt = FakeTarget(tmp_path / "t0", prompt="root@op3:~# ", login_steps=[{"expect": "", "respond": "\r\nop3 login: "}])
     p7.start("shell_unresolved", [tgt])
     wait_state(p7.env, "COM0", "ATTACHED")
     time.sleep(1.0)
     t0 = time.monotonic()
-    rc, j = p7.cli("session", "recover", "--selector", "COM0", "--force", timeout_s=60.0)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        recovery = pool.submit(p7.cli, "session", "recover", "--selector", "COM0", "--force", timeout_s=60.0)
+        time.sleep(1.0)  # 確認 force recover 已開始；Python 基線此時持有 SessionManager lock
+        list_t0 = time.monotonic()
+        if is_rust():
+            list_rc, list_j = p7.cli("session", "list", timeout_s=6.0)
+            list_elapsed = time.monotonic() - list_t0
+            assert list_rc == 0 and list_j and list_j.get("ok") is True, (list_rc, list_j)
+            assert list_elapsed < 1.0, f"Rust session list 被 force recover 阻塞 {list_elapsed:.2f} s"
+        else:
+            with pytest.raises(subprocess.TimeoutExpired):
+                p7.cli("session", "list", timeout_s=6.0)
+            list_elapsed = time.monotonic() - list_t0
+            assert 5.5 <= list_elapsed <= 8.0, f"Python session list 未依 6 s client timeout 逾時：{list_elapsed:.2f} s"
+        assert not recovery.done(), "session list 測量必須與 force recover 等待窗口重疊"
+        rc, j = recovery.result(timeout=60.0)
     elapsed = time.monotonic() - t0
     assert rc == 2, (rc, j)
     assert (j["ok"], j["error_code"], j["action"], j["recovered"]) == (
