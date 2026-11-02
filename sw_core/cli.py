@@ -38,14 +38,21 @@ from .sysenv import force_utf8_stdio
 from .setup_cmd import (
     SYSTEM_SOCKET,
     FlashingBusy,
+    daemon_code_assessment,
     detect_legacy_install,
     ensure_wsl_systemd,
     materialize_assets,
     reconcile,
+    service_is_active,
 )
 # 版本解析（#154：邏輯搬到 sw_core/version.py，daemon 端也能共用；此處保留原名
 # 重新匯出，既有呼叫點（含 --version flag、其餘既有引用）原樣不動）。
-from .version import _repo_version_path, resolve_version as _resolve_version
+from .version import (
+    _repo_version_path,
+    code_fingerprint as _code_fingerprint,
+    format_version_with_fingerprint as _format_version_with_fingerprint,
+    resolve_version as _resolve_version,
+)
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -911,21 +918,36 @@ def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
 
 
 def _warn_version_mismatch(resp: dict[str, Any]) -> None:
-    """client／daemon 版本不一致時在 stderr 印一行警告（#154，勿擋、純副作用）。
+    """client／daemon 版本或程式碼不一致時在 stderr 印一行警告（#154，勿擋、純副作用）。
 
     daemon 端 ``SerialwrapService.rpc()`` wrapper 對每個回應都會 ``setdefault``
-    帶上 ``version`` 欄位；本函式在 CLI 收到回應後就地比對。舊版 daemon（本欄位
-    加入前部署）回應無此欄位時靜默略過——不是新增的假警報，只是無從比對。
+    帶上 ``version`` 與 ``code_fingerprint`` 欄位；本函式在 CLI 收到回應後就地比對。
+    舊版 daemon（欄位加入前部署）回應無此欄位時靜默略過——不是新增的假警報，只是
+    無從比對（``serialwrap setup`` 與 ``doctor`` 會把「不回報指紋的 daemon」當舊碼處理）。
+
+    版本字串不同時只印版本那一行（指紋必然也不同，不重複吵）；版本相同但指紋不同
+    ——``pipx install --force`` 後 systemd 服務仍在跑升級前的 daemon、或分支 build 與
+    release 同版號——才印指紋那一行。只寫 stderr，stdout 的 JSON 不受影響。
     """
     daemon_version = resp.get("version")
-    if not isinstance(daemon_version, str) or not daemon_version.strip():
+    if isinstance(daemon_version, str) and daemon_version.strip():
+        cli_version = _resolve_version()
+        if cli_version not in ("unknown", daemon_version):
+            sys.stderr.write(
+                f"serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致"
+                "（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+            )
+            return
+    daemon_fp = resp.get("code_fingerprint")
+    if not isinstance(daemon_fp, str) or not daemon_fp:
         return
-    cli_version = _resolve_version()
-    if cli_version in ("unknown", daemon_version):
+    cli_fp = _code_fingerprint()
+    if cli_fp is None or cli_fp == daemon_fp:
         return
     sys.stderr.write(
-        f"serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致"
-        "（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+        f"serialwrap: client 程式碼 {cli_fp} 與 daemon 程式碼 {daemon_fp} 不一致"
+        "（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`"
+        "（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n"
     )
 
 
@@ -1670,6 +1692,43 @@ def _resolve_target_mode(args: argparse.Namespace, fx) -> str:
     return "systemd-user" if fx.has_systemd() else "on-demand"
 
 
+# setup 判定 daemon 為舊碼、但沒有（或不能）自動重啟時，附在 daemon_code.hint 的操作提示。
+_DAEMON_CODE_HINTS = {
+    "skipped_no_restart_flag": "已依 --no-restart 略過；準備好後執行 `serialwrap service restart`",
+    "manual_restart": "on-demand 模式不自動重啟；請執行 `serialwrap daemon stop` 後 `serialwrap daemon start`",
+    "skipped_flashing": "flash 進行中不重啟 daemon；完成後執行 `serialwrap service restart`",
+    "service_inactive": (
+        "在跑的 daemon 不是 systemd 服務啟動的（可能是手動 start 的）；先停掉它，"
+        "再 `serialwrap service restart`"
+    ),
+}
+
+# 重啟後等 daemon 重新回應並核對指紋的上限／間隔（測試會 monkeypatch 成極小值）。
+_RESTART_VERIFY_TIMEOUT_S = 10.0
+_RESTART_VERIFY_INTERVAL_S = 0.5
+
+
+def _verify_daemon_code_after_restart(args: argparse.Namespace, installed_fingerprint: str | None) -> str:
+    """setup 重啟 daemon 後輪詢 ``health.ping``，回 ``match``／``mismatch``／``unreachable``。
+
+    ``systemctl restart`` 在新行程綁好 socket 前就回傳，所以要等；``mismatch`` 代表
+    重啟了但 unit 的 ExecStart 指向的不是這份安裝（例如從 checkout 跑 setup），須讓
+    呼叫端知道，而不是回報成功。
+    """
+    deadline = time.monotonic() + _RESTART_VERIFY_TIMEOUT_S
+    while True:
+        try:
+            resolved = _resolve_local_endpoint_info(args)
+            ping = _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5)
+            if ping.get("ok"):
+                return "match" if ping.get("code_fingerprint") == installed_fingerprint else "mismatch"
+        except Exception:  # noqa: BLE001 — 驗證 best-effort，連不上就繼續等
+            pass
+        if time.monotonic() >= deadline:
+            return "unreachable"
+        time.sleep(_RESTART_VERIFY_INTERVAL_S)
+
+
 def _run_setup(args: argparse.Namespace) -> int:
     """物化資產並 reconcile 監管模式，輸出 legacy 偵測與 setup 結果。"""
     from .sysenv import SystemEffects
@@ -1687,14 +1746,18 @@ def _run_setup(args: argparse.Namespace) -> int:
     #    setup 仍是本機操作，probe 必須忽略 --bench；flash 偵測須在物化「之前」——
     #    否則燒錄中仍會先覆寫 profiles/wrappers/skill 才報錯（Codex #1c）。
     daemon_running = False
+    daemon_fingerprint: str | None = None
     any_flashing = False
     try:
         resolved = _resolve_local_endpoint_info(args)
-        daemon_running = bool(
-            _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5).get("ok")
-        )
+        ping = _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5)
+        daemon_running = bool(ping.get("ok"))
+        # 不另開 RPC：SerialwrapService.rpc() 對每個回應都補 code_fingerprint。
+        _fp = ping.get("code_fingerprint")
+        daemon_fingerprint = _fp if isinstance(_fp, str) and _fp else None
     except Exception:
         daemon_running = False
+        daemon_fingerprint = None
     try:
         resolved = _resolve_local_endpoint_info(args)
         any_flashing = bool(
@@ -1758,6 +1821,32 @@ def _run_setup(args: argparse.Namespace) -> int:
         else (SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH)
     )
 
+    # 6b. 正在跑的 daemon 載入的是不是剛安裝的程式碼（指紋比對，見 sw_core/version.py）。
+    #     本行程就是剛安裝的那份，所以 _code_fingerprint() 即「安裝版」。只有同模式的
+    #     systemd 服務確實 active 時才安排 restart；其餘情況只回報，不動 daemon。
+    code_state = daemon_code_assessment(
+        daemon_running=daemon_running,
+        daemon_fingerprint=daemon_fingerprint,
+        installed_fingerprint=_code_fingerprint(),
+    )
+    restart_daemon = False
+    if code_state["stale"]:
+        if getattr(args, "no_restart", False):
+            code_state["action"] = "skipped_no_restart_flag"
+        elif old != target:
+            code_state["action"] = "mode_transition"  # 轉換本身停舊起新，daemon 必為新碼
+        elif target == "on-demand":
+            code_state["action"] = "manual_restart"
+        elif any_flashing:
+            code_state["action"] = "skipped_flashing"  # 即使 --force 也不在燒錄中重啟
+        elif not service_is_active(fx, target):
+            code_state["action"] = "service_inactive"  # 在跑的 daemon 不是 systemd 服務起的
+        else:
+            restart_daemon = True
+            code_state["action"] = "restart"
+    elif code_state["checked"]:
+        code_state["action"] = "none"
+
     # 7. reconcile（先停舊、再起新）；flash 進行中除非 force 否則拒絕。
     try:
         result = reconcile(
@@ -1773,6 +1862,7 @@ def _run_setup(args: argparse.Namespace) -> int:
             # config 寫入路徑須與所有讀取端（_default_runtime_config→CONFIG_DIR）一致，
             # 否則自訂 XDG_CONFIG_HOME/SERIALWRAP_CONFIG_DIR 下 writer≠reader 會分歧（I-1）。
             config_path=os.path.join(CONFIG_DIR, "config.yaml"),
+            restart_daemon=restart_daemon,
         )
     except FlashingBusy as exc:
         resp = {
@@ -1797,6 +1887,30 @@ def _run_setup(args: argparse.Namespace) -> int:
     pending_sudo = result.get("pending_sudo")
     if pending_sudo:
         payload["pending_sudo"] = pending_sudo
+    if restart_daemon:
+        outcome = result.get("daemon_restart")
+        if outcome == "ran":
+            code_state["action"] = "restarted"
+            code_state["after"] = _verify_daemon_code_after_restart(args, code_state["installed"])
+            if code_state["after"] != "match":
+                msg = (
+                    "serialwrap: setup 已重啟 daemon，但它仍未回報與安裝版相同的程式碼指紋"
+                    f"（after={code_state['after']}）；用 `serialwrap daemon status` 看 code_path，"
+                    "確認 systemd unit 的 ExecStart 指向這份安裝"
+                )
+                code_state["hint"] = msg
+                sys.stderr.write(msg + "\n")
+        elif outcome == "pending_sudo":
+            code_state["action"] = "pending_sudo"
+            code_state["hint"] = "system scope 需 root：請執行 pending_sudo 內的 restart 指令，或加 --with-sudo 重跑 setup"
+        elif outcome == "failed":
+            code_state["action"] = "restart_failed"
+            code_state["hint"] = "systemctl restart 失敗；請手動執行 `serialwrap service restart` 並查 journalctl"
+    elif code_state.get("action") in _DAEMON_CODE_HINTS:
+        code_state["hint"] = _DAEMON_CODE_HINTS[code_state["action"]]
+    if code_state["checked"]:
+        # 欄位只在 daemon 可達且比對得出結果時出現；daemon 連不上時 setup 輸出與過去完全相同。
+        payload["daemon_code"] = {k: v for k, v in code_state.items() if k != "checked"}
     _print(payload)
     return 0
 
@@ -1906,6 +2020,22 @@ def _run_profile_test(args: argparse.Namespace) -> int:
     return 0
 
 
+class _VersionAction(argparse.Action):
+    """``--version``：印 ``serialwrap <版本> (code <指紋>)`` 後離開。
+
+    不用 argparse 內建的 ``action="version"``：它要在建構 parser 時就給定字串，
+    而每次 CLI 呼叫都會建 parser；指紋要讀全部 ``sw_core`` 原始碼，只有真的被問
+    ``--version`` 時才算，其他子命令不為此多花時間。
+    """
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):  # noqa: A002
+        super().__init__(option_strings=option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: ANN001
+        sys.stdout.write(f"serialwrap {_format_version_with_fingerprint()}\n")
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="serialwrap",
@@ -1918,7 +2048,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
+    p.add_argument("--version", action=_VersionAction, help="顯示版本與程式碼指紋後離開")
     p.add_argument("-v", "--verbose", action="count", default=0, help="提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
@@ -2376,7 +2506,9 @@ def build_parser() -> argparse.ArgumentParser:
             "物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，"
             "並 reconcile 監管模式（先停舊、再起新）。\n"
             "未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。\n"
-            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。"
+            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。\n"
+            "systemd 服務已在跑、但 daemon 載入的程式碼指紋與剛安裝的不同時（例如 pipx install --force\n"
+            "之後），自動 restart 服務讓 daemon 換新碼；--no-restart 可略過，輸出的 daemon_code 欄位說明判定。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -2395,7 +2527,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="with_sudo",
         action="store_true",
         default=False,
-        help="systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）",
+        help="systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start／restart）",
+    )
+    p_setup.add_argument(
+        "--no-restart",
+        dest="no_restart",
+        action="store_true",
+        default=False,
+        help=(
+            "daemon 載入的程式碼與剛安裝的不同時，不自動 restart 服務"
+            "（預設：systemd 模式且服務 active 時自動 restart，讓 daemon 換新碼）"
+        ),
     )
 
     sub.add_parser(

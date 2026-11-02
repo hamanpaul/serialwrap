@@ -53,7 +53,11 @@ class TestVersionFlag:
         with pytest.raises(SystemExit) as ei:
             cli.build_parser().parse_args(["--version"])
         assert ei.value.code == 0
-        assert capsys.readouterr().out.strip() == f"serialwrap {_REPO_VERSION}"
+        out = capsys.readouterr().out.strip()
+        # 形如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`：版本之後附程式碼指紋（build fingerprint）。
+        fingerprint = version_module.code_fingerprint()
+        assert fingerprint, "原始碼 checkout 下必能算出指紋"
+        assert out == f"serialwrap {_REPO_VERSION} (code {fingerprint})"
 
 
 class TestProfileDirHelp:
