@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -74,6 +75,13 @@ pub enum ControlEvent {
         op_id: OpId,
         confirmed_bytes: usize,
         unknown: bool,
+    },
+    /// IoWorker 在 receipt 前等待同 epoch 已排入 data lane 的 RX 完成 actor dispatch。
+    DrainDataBarrier {
+        epoch: u64,
+        rx_seq: u64,
+        reply: Sender<()>,
+        expired: Arc<AtomicBool>,
     },
     WorkerStopped(WorkerStoppedReceipt),
     WorkerDrainTimeout {
@@ -157,6 +165,7 @@ pub struct Mailbox {
     pending_control: Option<ControlEvent>,
     deferred_control: VecDeque<ControlEvent>,
     deferred_control_cap: usize,
+    drain_barriers: VecDeque<ControlEvent>,
     stopped: VecDeque<WorkerStoppedReceipt>,
     control_closed: bool,
     safety_closed: bool,
@@ -228,6 +237,7 @@ impl Mailbox {
             pending_control: None,
             deferred_control: VecDeque::with_capacity(control_cap.max(1)),
             deferred_control_cap: control_cap.max(1),
+            drain_barriers: VecDeque::new(),
             stopped: VecDeque::new(),
             control_closed: false,
             safety_closed: false,
@@ -266,6 +276,18 @@ impl Mailbox {
         self.safety_tx.clone()
     }
 
+    /// 測試用：觀察 data lane 積壓，不取走事件。
+    #[cfg(feature = "test-fakes")]
+    pub fn data_receiver_for_test(&self) -> Receiver<DataEvent> {
+        self.data_rx.clone()
+    }
+
+    /// 測試用：觀察 safety lane 積壓，不取走事件。
+    #[cfg(feature = "test-fakes")]
+    pub fn safety_receiver_for_test(&self) -> Receiver<ControlEvent> {
+        self.safety_rx.clone()
+    }
+
     /// 測試用：依賴暫存、pending 與 deferred queue 全滿時通知同步端。
     #[cfg(feature = "test-fakes")]
     pub fn notify_when_dependency_backlog_full(&mut self, notifier: Sender<()>) {
@@ -275,7 +297,7 @@ impl Mailbox {
     /// 測試用（Task 12b 延遲探針）：safety／control lane 尚有未取出的事件。
     #[cfg(feature = "test-fakes")]
     pub fn control_waiting(&self) -> bool {
-        !self.safety_rx.is_empty() || !self.control_rx.is_empty() || !self.stopped.is_empty()
+        !self.safety_rx.is_empty() || !self.control_rx.is_empty() || !self.drain_barriers.is_empty() || !self.stopped.is_empty()
     }
 
     /// 測試用（Task 12b 延遲探針）：data lane 目前積壓筆數。
@@ -396,6 +418,32 @@ impl Mailbox {
                 }
             }
 
+            // OD-69：barrier 帶 reader join 時最後成功入列的 watermark；只等到該 RX 完成 dispatch，
+            // 不必排空 reader 停止後仍可能持續收到的其他 data。actor 每次只取一筆，下一輪已更新 processed。
+            if !self.drain_barriers.is_empty() {
+                let (epoch, rx_seq, expired) = match self.drain_barriers.front() {
+                    Some(ControlEvent::DrainDataBarrier {
+                        epoch,
+                        rx_seq,
+                        expired,
+                        ..
+                    }) => (*epoch, *rx_seq, expired.load(std::sync::atomic::Ordering::Acquire)),
+                    _ => unreachable!("drain_barriers 僅存放 DrainDataBarrier"),
+                };
+                if rx_seq == 0 || processed >= (epoch, rx_seq) || expired {
+                    let barrier = self.drain_barriers.pop_front().expect("front 已確認存在");
+                    #[cfg(feature = "test-fakes")]
+                    {
+                        self.witness.current = Some(0);
+                        self.witness.current_pre = Some(0);
+                    }
+                    return Some(MailboxItem::Control(barrier));
+                }
+                if let Ok(data) = self.data_rx.try_recv() {
+                    return Some(MailboxItem::Data(data));
+                }
+            }
+
             if let Some(receipt) = self.stopped.front() {
                 if let Ok(data) = self.data_rx.try_recv() {
                     return Some(MailboxItem::Data(data));
@@ -476,6 +524,11 @@ impl Mailbox {
                 }
                 crossbeam_channel::select_biased! {
                     recv(safety_rx) -> safety => match safety {
+                        Ok(ev @ ControlEvent::DrainDataBarrier { .. }) => {
+                            #[cfg(feature = "test-fakes")]
+                            self.note_lane_recv(true);
+                            self.drain_barriers.push_back(ev);
+                        }
                         Ok(ControlEvent::WorkerStopped(receipt))
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
@@ -505,6 +558,11 @@ impl Mailbox {
             } else {
                 crossbeam_channel::select_biased! {
                     recv(safety_rx) -> safety => match safety {
+                        Ok(ev @ ControlEvent::DrainDataBarrier { .. }) => {
+                            #[cfg(feature = "test-fakes")]
+                            self.note_lane_recv(true);
+                            self.drain_barriers.push_back(ev);
+                        }
                         Ok(ControlEvent::WorkerStopped(receipt))
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {
@@ -523,6 +581,11 @@ impl Mailbox {
                         }
                     },
                     recv(control_rx) -> control => match control {
+                        Ok(ev @ ControlEvent::DrainDataBarrier { .. }) => {
+                            #[cfg(feature = "test-fakes")]
+                            self.note_lane_recv(false);
+                            self.drain_barriers.push_back(ev);
+                        }
                         Ok(ControlEvent::WorkerStopped(receipt))
                             if self.has_dependency_epoch(receipt.epoch) =>
                         {

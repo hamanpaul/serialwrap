@@ -4,7 +4,7 @@
 //! `_mark_drain_stalled`）為準；`ActorRig` 由 Task 13／14 建立。
 #![cfg(feature = "test-fakes")]
 mod support;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::*;
 use sw_core::mailbox::{ControlEvent, DataEvent};
 use sw_core::session_core::*;
@@ -83,6 +83,130 @@ fn release_cli() -> SessionRequest {
         reason: PyValue::Null,
     }
 }
+
+
+/// OD-69：reader 已送入的同 epoch RX 必須先完成 actor capture，再處理 WorkerStopped receipt。
+#[test]
+fn release_receipt_follows_queued_rx_capture_and_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_dir = tmp.path().join("logs");
+    let yaml = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 2.0\n    log_dir: {}\ntargets:\n  - {{com: COM0, profile: t, act_no: 1, alias: t+1, device_by_id: /s/by-id/usb-A}}\n",
+        log_dir.display()
+    );
+    let h = ActorRig::new(&yaml).ready();
+    let capture = h.request(SessionRequest::LogStart);
+    let log_path = capture["log_path"].as_str().unwrap().to_string();
+    let initial_rx_rows = h
+        .wal_rows()
+        .iter()
+        .filter(|row| row.get("dir").and_then(|value| value.as_str()) == Some("RX"))
+        .count();
+    let (epoch, initial_rx_seq) = h.rx.watermark();
+    assert!(epoch > 0, "READY 後應有 bridge epoch");
+
+    let drain_pause = h.pause_next_begin_drain();
+    let receipt_pause = h.pause_before_event("WorkerStopped");
+    let release = h.request_async(release_cli());
+    drain_pause
+        .before_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 應進入 BeginDrain");
+
+    let idle_deadline = Instant::now() + Duration::from_secs(5);
+    while h.data_backlog() != 0 {
+        assert!(Instant::now() < idle_deadline, "push RX 前 data lane 應先排空");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    h.dev.push_rx(b"OD69-RX\n");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.rx.watermark().1 <= initial_rx_seq || h.data_backlog() == 0 {
+        assert!(Instant::now() < deadline, "reader 應把 RX 排入 data lane");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(h.data_backlog(), 1, "指定 RX 必須是 data lane 唯一既有事件");
+    assert!(
+        h.wal_rows()
+            .iter()
+            .filter(|row| row.get("dir").and_then(|value| value.as_str()) == Some("RX"))
+            .count()
+            > initial_rx_rows,
+        "reader 應先把 RX 寫入 WAL"
+    );
+
+    // 以同 epoch 已排入的 data item 保持 backlog，確保 receipt 不能靠排程碰巧落在 RX 後。
+    let data = h.data_sender();
+    for _ in 0..128u64 {
+        data.send(DataEvent::UartRxChunk {
+            epoch,
+            // 這些是 test-only lane markers，沒有 reader watermark，不得讓 barrier 誤認已涵蓋 RX。
+            rx_seq: 0,
+            wal_seq: 0,
+            bytes: b"queued\n".to_vec(),
+        })
+        .expect("測試 backlog 應可排入 data lane");
+    }
+    assert_eq!(
+        h.data_backlog(),
+        129,
+        "實際 RX 與測試 backlog 須全在 lane 中"
+    );
+
+    drain_pause.resume_before.send(()).expect("放行 BeginDrain");
+    drain_pause
+        .after_entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("BeginDrain 應啟動 IoWorker 收尾");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.safety_backlog() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "worker 應送出 drain barrier 或 receipt"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drain_pause.resume_after.send(()).expect("放行 actor");
+
+    receipt_pause
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("actor 應處理 WorkerStopped");
+    let entry = h
+        .actor_probe()
+        .entries("WorkerStopped")
+        .last()
+        .cloned()
+        .expect("應記錄 WorkerStopped 探針");
+    assert!(
+        entry.data_backlog <= 128,
+        "reader watermark dispatch 必須先於 receipt；後續 test data 可留在 lane: {entry:?}"
+    );
+    assert!(
+        entry.data_while_waiting <= entry.pre_dependency_data + 1,
+        "receipt 送入後處理的 data 不得超出 OD-64 界限: {entry:?}"
+    );
+    let captured = std::fs::read_to_string(&log_path).expect("capture 檔應存在");
+    assert!(
+        captured.contains("OD69-RX"),
+        "receipt 處理前 RX 應已進 capture: {captured:?}"
+    );
+    assert!(
+        h.wal_rows()
+            .iter()
+            .filter(|row| row.get("dir").and_then(|value| value.as_str()) == Some("RX"))
+            .count()
+            > initial_rx_rows,
+        "receipt 處理前 RX 應已在 WAL"
+    );
+
+    receipt_pause.resume.send(()).expect("放行 WorkerStopped");
+    let response = release
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 應完成")
+        .expect("release 成功");
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)));
+}
+
 
 /// §5.2.4：drain 進行中 mailbox 不阻塞，GetState 立即回 `RECOVERING`（原列於 Task 11）。
 #[test]

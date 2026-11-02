@@ -52,10 +52,10 @@ event_latency:
   reviewed_by: cloud-claude-opus-xhigh # 獨立審閱者（≠ owner）
   reviewed_at: "2026-10-29"            # 審閱日期
   review_conclusion: approved-with-conditions   # 條件 C1～C5 須經編排者核對完成
-  # 凍結狀態：pending_review_record。approved-with-conditions：條件 C1～C5 經編排者核對完成後，才改 freeze_status: frozen
-  # （編排者裁決 2026-10-29：條件完成後先維持 pending_review_record，於回報列出每條條件的 commit 與證據）。
+  # 凍結狀態：C1～C5 已由編排者核對（reviews/p5-cloud/event-latency-method-review-2-conditions-20261030.md）；
+  # 2026-10-30 裁決要求 P5 第 8 輪完成 OD-69 且不改量測方法或門檻後凍結。
   # 未凍結時 tests/test_slice21_scope.py 的凍結測試 skip 並標 INSUFFICIENT_EVIDENCE；Task 22 gate 開頭同樣拒絕開跑。
-  freeze_status: pending_review_record
+  freeze_status: frozen
   repeats: 3
   samples_per_run: 500
   gate_rule: every_run_max_le_max_ms   # 每輪樣本最大值都 ≤ 上限才通過；p99 只作診斷值，不作判定

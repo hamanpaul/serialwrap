@@ -10,6 +10,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+#[cfg(feature = "test-fakes")]
+use crossbeam_channel::{bounded, Receiver};
 use sw_pal::traits::Clock;
 use sw_proto::pycompat::PyErr;
 use sw_proto::pyjson::PyDict;
@@ -26,6 +28,12 @@ pub struct ActorHandle {
     /// 測試用（Task 12b）：事件延遲探針（`resource_limits.event_latency.l1_bound`）。
     #[cfg(feature = "test-fakes")]
     pub probe: Arc<ActorLatencyProbe>,
+    /// 測試用：觀察 mailbox data lane 積壓，不取走事件。
+    #[cfg(feature = "test-fakes")]
+    pub data_observer: Receiver<DataEvent>,
+    /// 測試用：觀察 safety lane 積壓，不取走事件。
+    #[cfg(feature = "test-fakes")]
+    pub safety_observer: Receiver<ControlEvent>,
 }
 
 /// 測試用（Task 12b）：記錄非 data 事件「在 lane 中等待期間」actor 又處理了幾個 data item。
@@ -49,6 +57,14 @@ struct ProbeInner {
     /// 最近處理的 data item 之開始時刻（單調 ns；上限 `PROBE_LOG_MAX`），timer／tick 見證數用。
     data_started: std::collections::VecDeque<u64>,
     log: std::collections::VecDeque<ProbeEntry>,
+    pause: Option<ProbePause>,
+}
+
+#[cfg(feature = "test-fakes")]
+struct ProbePause {
+    label: &'static str,
+    entered: Sender<()>,
+    resume: Receiver<()>,
 }
 
 /// 探針紀錄上限：超過即丟最舊（長跑的 test-fakes daemon 不無限累積；審查 F49）。
@@ -70,6 +86,18 @@ pub struct ProbeEntry {
 
 #[cfg(feature = "test-fakes")]
 impl ActorLatencyProbe {
+    /// 測試用：暫停下一筆指定標籤事件的 dispatch，回傳進入與繼續通道。
+    pub fn pause_before_next(&self, label: &'static str) -> (Receiver<()>, Sender<()>) {
+        let (entered_tx, entered_rx) = bounded(1);
+        let (resume_tx, resume_rx) = bounded(1);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).pause = Some(ProbePause {
+            label,
+            entered: entered_tx,
+            resume: resume_rx,
+        });
+        (entered_rx, resume_tx)
+    }
+
     /// 累計處理的 data item 數。
     pub fn data_items(&self) -> u64 {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).data_items
@@ -113,6 +141,25 @@ impl ActorLatencyProbe {
             data_backlog,
             pre_dependency_data,
         });
+    }
+
+    fn pause_before_dispatch(&self, label: &'static str) {
+        let pause = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner
+                .pause
+                .as_ref()
+                .is_some_and(|pause| pause.label == label)
+            {
+                inner.pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.resume.recv();
+        }
     }
 }
 
@@ -210,6 +257,10 @@ pub fn spawn_actor(
     let control = mailbox.control_sender();
     let safety = mailbox.safety_sender();
     let data = mailbox.data_sender();
+    #[cfg(feature = "test-fakes")]
+    let data_observer = mailbox.data_receiver_for_test();
+    #[cfg(feature = "test-fakes")]
+    let safety_observer = mailbox.safety_receiver_for_test();
     let thread_control = control.clone();
     let thread_safety = safety.clone();
     #[cfg(feature = "test-fakes")]
@@ -301,6 +352,7 @@ pub fn spawn_actor(
                     let witness = mailbox.take_control_witness().unwrap_or(0);
                     let pre = mailbox.take_control_pre_dependency_data().unwrap_or(0);
                     thread_probe.before_other(label, mailbox.data_backlog(), witness, pre);
+                    thread_probe.pause_before_dispatch(label);
                 }
                 let data_mark = match &item {
                     MailboxItem::Data(DataEvent::UartRxChunk { epoch, rx_seq, .. }) => {
@@ -322,9 +374,9 @@ pub fn spawn_actor(
                     &mut panic_count,
                 );
                 if let Some(mark) = data_mark {
-                    if core.generations().conn_epoch == Some(mark.0) {
-                        processed = processed.max(mark);
-                    }
+                    // 依賴事件只會在 current epoch 時判定；保留舊 epoch 的 dispatch watermark，
+                    // 讓 OD-69 drain barrier 在 release 已清除 conn_epoch 後仍能確認 reader RX 已處理。
+                    processed = processed.max(mark);
                 }
                 #[cfg(feature = "test-fakes")]
                 if label.is_none() {
@@ -343,6 +395,10 @@ pub fn spawn_actor(
         join,
         #[cfg(feature = "test-fakes")]
         probe,
+        #[cfg(feature = "test-fakes")]
+        data_observer,
+        #[cfg(feature = "test-fakes")]
+        safety_observer,
     }
 }
 
@@ -375,6 +431,7 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::BridgeOpened { .. }) => (None, "BridgeOpened"),
         MailboxItem::Control(ControlEvent::UartIoError { .. }) => (None, "UartIoError"),
         MailboxItem::Control(ControlEvent::UartTxCompleted { .. }) => (None, "UartTxCompleted"),
+        MailboxItem::Control(ControlEvent::DrainDataBarrier { .. }) => (None, "DrainDataBarrier"),
         MailboxItem::Control(ControlEvent::WorkerStopped(_)) => (None, "WorkerStopped"),
         MailboxItem::Control(ControlEvent::WorkerDrainTimeout { .. }) => {
             (None, "WorkerDrainTimeout")

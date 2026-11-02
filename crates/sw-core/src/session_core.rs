@@ -642,6 +642,12 @@ impl SessionCore {
                     ));
                 }
             }
+            MailboxItem::Control(ControlEvent::DrainDataBarrier { reply, .. }) => {
+                // Python RX callback 在取得 drain lock 前同步完成 capture；Rust 的 RX 先進 data lane。
+                // Mailbox 僅在 barrier 前的 data dispatch 完成後交付此事件，故此處才停止 capture。
+                self.detach_captures();
+                let _ = reply.try_send(());
+            }
             MailboxItem::Control(ControlEvent::WorkerStopped(receipt)) => {
                 effects.0.extend(self.worker_stopped(receipt, now));
             }
@@ -1098,8 +1104,8 @@ impl SessionCore {
     }
 
     /// Python `_begin_drain_locked` Phase 1（等回條前）：非 shutdown 設 `last_error=<reason>`（Removed／Rebound／
-    /// IoError 已由呼叫端設定），清前景欄位並停 log／background capture；`aborted_op` 已抄進 stop，BC-03 不受影響
-    /// （審查 F41）。
+    /// IoError 已由呼叫端設定）並清前景欄位；Rust 的 RX capture 延至 reader dispatch barrier 後停止，以符合同步
+    /// Python callback 的既有排序；`aborted_op` 已抄進 stop，BC-03 不受影響（審查 F41、OD-69）。
     fn phase1_detach(&mut self, kind: &StopKind, already_released: bool) {
         let reason = match kind {
             StopKind::Release if !already_released => Some("RELEASED"),
@@ -1111,7 +1117,6 @@ impl SessionCore {
             self.set_last_error(Some(reason.to_string()), None);
         }
         self.foreground = None;
-        self.detach_captures();
     }
 
     fn finish_stop_without_worker(
