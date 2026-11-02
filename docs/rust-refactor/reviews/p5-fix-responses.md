@@ -435,3 +435,14 @@ gate 逐 section 判定見 `docs/rust-refactor/reviews/p5-t22-gate-run.md`。
 - regen_lock add-only 登記三列（s21_core.linux 1739 → 1742，無移除／改 selector）。Windows cross-check、cfg 邊界、契約（0 findings）、政策（25 pass／0 fail／2 warn）及本輪基準鎖檢查通過。對 8c0c942 的無核准參數原命令仍為 FAIL（三列已核准 OD-68 移除）；逐名帶既有 OD-68 核准參數後通過，未修改該裁決或鎖分母。
 
 完整 file:line 接線核對、前審 28 條 High／Medium 的 already fixed／裁決延後處置、命令／HEAD／exit code／逐輪原始輸出及 SPEC-GAPS：[OD-69 驗收證據](p5-evidence/od69-r8-a5d/README.md)。未跑全套 pytest、slice gate、Docker 或出口 driver（依專項編排者註另派）；Windows 原生／能力證據未取得，owner／硬體項仍 BLOCKED-OWNER。不宣稱 T22、Slice 2.1 出口、push／PR／merge 或部署完成。
+
+### P5-r8-a5d 第 2 輪（2026-11-03）：起點 3bf93828 的當前驗收
+
+前審 A 段八項（Medium 1／3／4／5／7／8、High 2／6）逐項核對均為 already fixed `25ad3900`；B 段 NO FINDINGS，無本輪需要修正的 High／Medium，沒有不成立主張。保留既有產品接線與測試，沒有新增 nodeid、改凍結契約、改鎖或修其他子項。
+
+- 當前 drain 15 passed、mailbox 22 passed、sw-core 560 passed；OD-69 三路徑各 20 輪（N_pre=0、見證數≤1、480 標記全部先入 capture／WAL、無缺口），OD-64 兩條各 20 輪（N_pre=backlog、見證數=backlog+1、OpFinished 先於 receipt），flood 四段各 20 輪全綠。
+- workspace `--features test-fakes --no-fail-fast` 為 1791 passed／0 failed／29 ignored；預設 `--no-fail-fast` 為 1161 passed／0 failed／29 ignored；兩者皆 0 filtered，未執行 ignored 能力列。Windows cross-check、cfg 與契約通過，政策 25 pass／0 fail／2 warn；未取得 Windows 原生／能力證據。
+- 鎖結構與相對本輪起點檢查通過。相對 `8c0c942` 的原命令仍 exit 1（三筆 OD-68 列），逐名帶既有核准參數後 exit 0；與起點鎖及 regen 程式無差異，並非本輪新失敗。原 FAIL 與核准對照均保留。
+- 全套 pytest **未執行**：`tests/conftest.py:31`～`:41` 在 collection 前讀 production state／WAL／config 並探測 live daemon，與本輪明示嚴格邊界衝突。沒有改 guard 或以隔離變數假稱免探測，也沒有把缺測記成 PASS；Python 產品及測試均未改。Windows／硬體及出口 driver 亦未執行，owner／硬體項維持 BLOCKED-OWNER。
+
+逐項 file:line、當前命令／HEAD／exit code／摘要與 SHA-256、180 輪輸出、原失敗 id 與 SPEC-GAPS：[第 2 輪驗收](p5-evidence/od69-r8-a5d/round2/README.md)。本輪交付僅為 OD-69 局部驗收紀錄，不宣稱 T22、Slice 2.1 出口、push／PR／merge 或部署完成。

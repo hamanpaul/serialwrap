@@ -1,0 +1,61 @@
+   Compiling version_check v0.9.5
+    Checking typenum v1.20.1
+   Compiling crossbeam-utils v0.8.23
+    Checking foldhash v0.1.5
+    Checking memchr v2.8.3
+   Compiling crc32fast v1.5.0
+    Checking windows-link v0.2.1
+    Checking regex-syntax v0.8.11
+    Checking bit-vec v0.8.0
+    Checking cfg-if v1.0.5
+    Checking hashbrown v0.16.1
+    Checking arraydeque v0.5.1
+    Checking cpufeatures v0.2.17
+    Checking equivalent v1.0.2
+    Checking windows-sys v0.61.2
+    Checking hashbrown v0.15.5
+    Checking bit-set v0.8.0
+   Compiling generic-array v0.14.7
+    Checking aho-corasick v1.1.5
+    Checking indexmap v2.11.4
+    Checking crossbeam-channel v0.5.15
+    Checking hashlink v0.10.0
+    Checking yaml-rust2 v0.10.4
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking digest v0.10.7
+    Checking sha2 v0.10.9
+    Checking regex-automata v0.4.18
+    Checking fancy-regex v0.16.2
+    Checking sw-proto v0.3.2 ($WORKTREE/crates/sw-proto)
+    Checking sw-pal v0.3.2 ($WORKTREE/crates/sw-pal)
+warning: unused import: `posix::PosixDeviceSource`
+  --> crates/sw-pal/src/device_source/mod.rs:12:16
+   |
+12 | pub(crate) use posix::PosixDeviceSource;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `PosixDeviceSource` is never constructed
+  --> crates/sw-pal/src/device_source/posix.rs:49:19
+   |
+49 | pub(crate) struct PosixDeviceSource {
+   |                   ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `new` is never used
+  --> crates/sw-pal/src/device_source/posix.rs:55:19
+   |
+54 | impl PosixDeviceSource {
+   | ---------------------- associated function in this implementation
+55 |     pub(crate) fn new(dirs: Vec<PathBuf>, allowlist: Option<Vec<String>>) -> Self {
+   |                   ^^^
+
+warning: `sw-pal` (lib) generated 3 warnings (run `cargo fix --lib -p sw-pal` to apply 1 suggestion)
+    Checking sw-core v0.3.2 ($WORKTREE/crates/sw-core)
+    Checking sw-cli v0.3.2 ($WORKTREE/crates/sw-cli)
+    Checking sw-com0com-helper v0.3.2 ($WORKTREE/crates/sw-com0com-helper)
+    Checking sw-daemon v0.3.2 ($WORKTREE/crates/sw-daemon)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.11s

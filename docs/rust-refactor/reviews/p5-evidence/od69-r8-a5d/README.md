@@ -1,5 +1,7 @@
 # OD-69 接線整體驗收（P5-r8-a5d）
 
+第 2 輪於 `3bf93828` 的當前重跑、前審八項處置及嚴格邊界阻塞，另見 [第 2 輪驗收](round2/README.md)；本頁保留第 1 輪證據與結果，不用舊結果替代當前驗收。
+
 起點 HEAD：`9d8e31bc604e5d1593a60aa0ee012a933a232125`，分支 `feature/rust-refactor-p5`。受測為此 HEAD 加本項測試差異，測試檔 SHA-256 見 `commands.json`；這是局部驗收，沒有執行出口證據 driver，不代表 T22／Slice 2.1 出口、部署、push 或 PR 完成。
 
 裁決依據為本機已存在的 `origin/docs/parity-amendments`，固定於 `3854d4534c62d6d7cc85add2adadcf1bf3e3f3ef`：`reviews/rulings/p5.md:32`（OD-64）、`:38`（OD-69）、`:45`（本輪無新 High／Medium）、`:46`（receipt 送出前排空，不改契約）。本輪未 fetch／移動其他分支。S1 裁決已唯讀核對，未承接其他分支工作。
