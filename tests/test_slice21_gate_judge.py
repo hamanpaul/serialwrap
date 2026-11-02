@@ -49,6 +49,8 @@ TEST_SECTIONS = {
     "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
     # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
     "py_parity": ("linux", "s21_gate:py_parity_full"),
+    # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 另以 add-only 新集合承擔。
+    "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
 }
 CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_windows_native": "windows_native",
           "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime"}
@@ -57,7 +59,7 @@ CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core
 GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
     name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
     for name in ("linux_cap_posix_pty", "windows_cap_windows_com", "blackbox_python", "blackbox_rust",
-                 "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity")
+                 "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity", "py_parity_76_80")
 }
 
 
@@ -208,8 +210,8 @@ class _Case:
             allowed = "BO-S21-01" if name == "windows_cap_windows_com" else None
             sections.append(_section(name, l1_results=rel, required_set=required_set,
                                      allowed_missing_bo=allowed, counts=counts))
-            if name == "linux_l1":
-                sections[-1]["run_euid"] = 1000             # F108：linux_l1 以非 root 執行
+            if name in ("linux_l1", "linux_cap_posix_pty"):
+                sections[-1]["run_euid"] = 1000             # F108：linux_l1／linux_cap_posix_pty 以非 root 執行
             if name in CAP_OF:                                # SPEC-GAP #2：能力探測（本夾具假設具備能力）
                 sections[-1]["capability_probe"] = {"cap": CAP_OF[name], "available": True, "evidence": "fixture"}
         for name in NON_TEST_SECTIONS:
@@ -772,11 +774,197 @@ def test_py_parity_full_has_complete_selector_and_keeps_old_set():
     assert full["selector"]["argv"][-len(paths):] == paths
 
 
+def test_py_parity_76_80_has_additive_plan_scope():
+    """第 8 輪 #76～#80 另立集合；保留被其他 slice 承擔的兩組既有排除案例。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    added = lock["sets"]["s21_gate:py_parity_76_80"]["linux"]
+    ids = added["nodeids"]
+    selector = added["selector"]
+    assert ids and len(ids) == len(set(ids))
+    assert set(ids) == set(selector["paths"])
+    assert selector["argv"][-len(ids):] == ids
+    required_files = {
+        "tests/test_holder_probe_namespace.py", "tests/test_p1oc_drain_stalled.py",
+        "tests/test_p1oc_sc35_state.py", "tests/test_p1oc_sc35_commands.py",
+        "tests/test_p1oc_sc34_last_error.py", "tests/test_p1oc_socket_perm.py",
+        "tests/test_p1oc_pt_quiet_oracle.py", "tests/test_p1oc_catalog.py", "tests/test_p1oc_docs.py",
+        "tests/test_daemon_lock.py", "tests/test_contracts_gap_codes.py",
+        "tests/test_stage0_bridge_drain.py", "tests/test_serial_port.py", "tests/test_wal.py",
+        "tests/test_stage0_platform_mgmt.py", "tests/test_codex_fixes.py",
+        "tests/test_daemon_service_selector.py",
+    }
+    assert required_files == {node.split("::", 1)[0] for node in ids}
+    assert not any("TestUartBridgeHeldPathsNamespace" in node for node in ids)
+    assert not any("test_file_push_pull_passthrough_rejected" in node for node in ids)
+    assert "tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock" in ids
+    assert "tests/test_stage0_bridge_drain.py::test_eagain_writer_is_cancelled_by_drain" in ids
+    assert "tests/test_serial_port.py::TestPosixSerialPortRoundtrip::test_set_baud_runs" in ids
+    assert "tests/test_wal.py::TestWalWindowsDirFsync::test_reset_on_posix_still_fsyncs_directory" in ids
+
+
 def test_gate_script_runs_capability_and_py_parity_sections():
     text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
-    for name in (*CAP_OF, "py_parity"):
+    for name in (*CAP_OF, "py_parity", "py_parity_76_80"):
         assert f"record {name} " in text, name                  # dry-run／拒絕開跑分支
     assert text.count("record py_parity ") >= 2                 # ＋實跑分支
+    assert text.count("record py_parity_76_80 ") >= 2
     # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
     assert "for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do" in text
-    assert '--caps "$cap"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
+    # 第 7 輪（OD-53 推導）：--caps 由 caps_args 依鎖 selector 推導，不再手寫 `--caps "$cap"`
+    assert '"${CAPS_ARGV[@]}"' in text and '--capability-probe "$cap=$probe"' in text and "cap_probe()" in text
+
+
+# --------------------------------------------------------------------------- 第 7 輪：OD-53 --caps 推導（rulings/p5.md 最新列）
+
+def test_derive_caps_matches_s22_rule():
+    """rulings/p5.md：slice21_gate.sh 的 `--caps` 改用與 s22 gate 相同的 OD-53 推導規則（rulings/p6.md「OD-53 selector 記錄
+    caps」）：test-binary 參數（`--` 之後）恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需 caps；
+    其餘帶 ignored 意圖者推導不出（None）。"""
+    j = _judge_mod()
+    cap_argv = ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"]
+    assert j.derive_caps({"argv": cap_argv}) == ["posix_pty"]
+    assert j.derive_caps({"argv": ["-p", "x", "--", "--ignored", "cap_posix_pty__", "cap_windows_com__"]}) == [
+        "posix_pty", "windows_com"]
+    assert j.derive_caps({"argv": ["--workspace", "--features", "test-fakes", "--", "--skip", "cap_"]}) == []
+    assert j.derive_caps({"argv": ["-p", "sw-pal", "--features", "test-fakes"]}) == []
+    assert j.derive_caps({"argv": ["-q", "tests/"]}) == []
+    for tail in (["--ignored"], ["--include-ignored"], ["--include-ignored", "cap_posix_pty__"],
+                 ["--ignored", "cap_posix_pty__", "other_filter"], ["--ignored", "cap_posix_pty"],
+                 ["--ignored", "--skip", "x", "cap_posix_pty__"], ["--ignored", "cap_posix_pty__", "--exact"]):
+        assert j.derive_caps({"argv": ["-p", "x", "--", *tail]}) is None, tail
+    assert j.derive_caps({"argv": ["--ignored", "cap_posix_pty__"]}) is None
+
+
+def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
+    """現行鎖的每個 s21 集合皆可推導；gate 的收集計畫（`caps-plan`）以各 section 必要集合的 selector 推導 `--caps` 與 argv：
+    linux_cap_posix_pty → `--caps posix_pty -- -p sw-pal --features test-fakes`、linux_cap_<cap> → `--caps <cap>` 加該集合
+    selector argv。"""
+    j = _judge_mod()
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    derived = {(sid, plat): j.derive_caps(spec["selector"]) for sid, plats in lock["sets"].items()
+               if sid == "s21_core" or sid.startswith("s21_gate:") for plat, spec in plats.items()}
+    assert all(v is not None for v in derived.values()), derived
+    import yaml
+
+    exp = yaml.safe_load((ROOT / "tests/acceptance/slice21_gate_expect.yaml").read_text(encoding="utf-8"))
+    plan = j.caps_plan("linux_cap_posix_pty", exp, lock)
+    assert plan == {"caps": ["posix_pty"], "argv": ["-p", "sw-pal", "--features", "test-fakes"], "caps_only": False}, plan
+    for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
+        plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
+        if cap in ("windows_native", "interactive_desktop"):
+            # OD-68 核准移除這兩個 Linux-only 集合；沒有 selector 時 gate 不可建立執行計畫。
+            assert f"s21_gate:cap_{cap}" not in lock["sets"]
+            assert plan is None, plan
+            continue
+        assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["linux"]["selector"]["argv"],
+                        "caps_only": True}, plan
+
+
+def test_underivable_caps_selector_is_evidence_missing(case):
+    """推導不出 `--caps` 的必要集合 → 該 section EVIDENCE_MISSING（即使 l1 全 passed）。"""
+    exp = case.expect()
+    exp["lock"]["sets"]["s21_gate:linux_cap_posix_pty"]["linux"]["selector"] = {
+        "argv": ["-p", "sw-pal", "--", "--include-ignored", "cap_posix_pty__"]}
+    out = _judge_mod().judge(case.report(), exp)
+    sec = _sec(out, "linux_cap_posix_pty")
+    assert sec["status"] == "EVIDENCE_MISSING" and any("OD-53" in r for r in sec["reasons"]), sec["reasons"]
+
+
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop"])
+def test_od68_removed_linux_capability_set_is_evidence_missing(case, cap):
+    """OD-68 移除 Linux-only lock 集合後，對應 gate section 必須明確保持 EVIDENCE_MISSING。"""
+    set_id = f"s21_gate:cap_{cap}"
+    expect = case.expect()
+    expect["lock"]["sets"].pop(set_id)
+    out = _judge_mod().judge(case.report(), expect)
+    section = _sec(out, f"linux_cap_{cap}")
+    assert section["status"] == "EVIDENCE_MISSING"
+    assert section["l1_verdict"]["verdict"] == "INSUFFICIENT"
+    assert any(set_id in reason and "不在 l1_required.lock.json" in reason for reason in section["reasons"])
+
+
+def test_gate_script_derives_caps_from_lock():
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    assert "caps-plan" in text
+    assert "--caps posix_pty \\" not in text and "-- -p sw-pal --features test-fakes\nrecord linux_cap_posix_pty" not in text
+
+
+# --------------------------------------------------------------------------- sol P5-54dd588-2（Medium）：能力 section 只跑能力列
+
+def test_caps_plan_caps_only_when_every_set_selects_only_ignored_caps():
+    """section 的每個必要集合 selector 都只選 ignored 能力列（derive_caps 非空）→ `caps_only`（收集器 --caps-only，不跑預設
+    run）；任一集合含預設列（derive_caps 為 []）→ 須跑預設 run。"""
+    j = _judge_mod()
+    sel_cap = {"argv": ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_sys_admin__"]}
+    sel_default = {"argv": ["-p", "sw-pal", "--features", "test-fakes"]}
+    exp = {"sections": [{"name": "linux_cap_sys_admin", "required_set": "s21_gate:cap_sys_admin"},
+                        {"name": "linux_cap_posix_pty", "required_set": "s21_gate:linux_cap_posix_pty"}],
+           "additional_required_sets": {"linux_cap_posix_pty": ["s21_gate:cap_posix_pty"]}}
+    lock = {"sets": {"s21_gate:cap_sys_admin": {"linux": {"selector": sel_cap}},
+                     "s21_gate:linux_cap_posix_pty": {"linux": {"selector": sel_default}},
+                     "s21_gate:cap_posix_pty": {"linux": {"selector": {
+                         "argv": ["--workspace", "--", "--ignored", "cap_posix_pty__"]}}}}}
+    assert j.caps_plan("linux_cap_sys_admin", exp, lock) == {"caps": ["sys_admin"], "argv": sel_cap["argv"], "caps_only": True}
+    assert j.caps_plan("linux_cap_posix_pty", exp, lock) == {"caps": ["posix_pty"], "argv": sel_default["argv"],
+                                                             "caps_only": False}
+    exp["additional_required_sets"] = {"linux_cap_sys_admin": ["s21_gate:linux_cap_posix_pty"]}   # 混入預設列集合
+    assert j.caps_plan("linux_cap_sys_admin", exp, lock)["caps_only"] is False
+
+
+def test_capability_section_with_only_capability_rows_passes(case):
+    """sol P5-54dd588-2：能力 section 的 l1 結果（--caps-only）只含能力列且 passed、其餘收集列 deselected → PASS；
+    deselected 列不在必要集合內，不影響判定。"""
+    n1, n2 = GATE_NODEIDS["linux_cap_sys_admin"]
+    others = ["cargo:sw-pal::serial::posix::tests::holder_scan_permission", "cargo:sw-pal::oserror_golden::x"]
+    case.l1["linux_cap_sys_admin"] = _l1("linux", "cargo", [_row(n1), _row(n2)], deselected=others)
+    out = _judge_mod().judge(case.report(), case.expect())
+    sec = _sec(out, "linux_cap_sys_admin")
+    assert sec["status"] == "PASS", sec["reasons"]
+
+
+def test_linux_cap_posix_pty_run_as_root_is_evidence_missing(case):
+    """sol P5-54dd588-2：linux_cap_posix_pty 的必要集合含 sw-pal 預設測試，其中數支在 root 下必紅（holder_scan_permission
+    等）。比照 F108：須以非 root 執行；run_euid 為 0 或未記錄 → EVIDENCE_MISSING（不得 PASS，也不因 root 專屬失敗記 FAIL）。"""
+    def with_euid(euid, outcome="passed"):
+        rep = case.report()
+        for sec in rep["sections"]:
+            if sec["name"] == "linux_cap_posix_pty":
+                if euid is None:
+                    sec.pop("run_euid", None)
+                else:
+                    sec["run_euid"] = euid
+                if outcome != "passed":
+                    n1, n2 = GATE_NODEIDS["linux_cap_posix_pty"]
+                    l1 = _l1("linux", "cargo", [_row(n1, outcome), _row(n2)], exit_code=101)
+                    sec["l1_results"] = case.write_l1("linux_cap_posix_pty_x", l1)
+                    sec.update(_counts(l1))
+        return _sec(_judge_mod().judge(rep, case.expect()), "linux_cap_posix_pty")
+    assert with_euid(1000)["status"] == "PASS"
+    assert with_euid(1000, "failed")["status"] == "FAIL"
+    root = with_euid(0)
+    assert root["status"] == "EVIDENCE_MISSING" and any("非 root" in r for r in root["reasons"])
+    assert with_euid(0, "failed")["status"] == "EVIDENCE_MISSING"
+    assert with_euid(None)["status"] == "EVIDENCE_MISSING"
+
+
+def test_capability_how_to_run_uses_caps_only():
+    """sol P5-54dd588-2：能力 section 的單獨執行命令（judge 原因文字與 runbook）須帶 --caps-only，否則先跑預設 run 必 FAIL。"""
+    j = _judge_mod()
+    for name in ("linux_cap_sys_admin", "linux_cap_supervisor_runtime"):
+        assert "--caps-only" in j.CAPABILITY_SECTIONS[name]["how_to_run"], name
+    runbook = (ROOT / "docs/rust-refactor/slice21-owner-runbook.md").read_text(encoding="utf-8")
+    rows = [ln for ln in runbook.splitlines() if ln.startswith("| `linux_cap_sys_admin`")
+            or ln.startswith("| `linux_cap_supervisor_runtime`")]
+    assert len(rows) == 2 and all("--caps-only" in ln for ln in rows), rows
+
+
+def test_gate_script_capability_sections_caps_only_and_posix_pty_non_root():
+    """sol P5-54dd588-2：gate 依 caps-plan 的 caps_only 帶 --caps-only；linux_cap_posix_pty 比照 linux_l1 於 root 時以
+    SW_GATE_L1_USER 降權、無法降權即不執行並記 EVIDENCE_MISSING，且記錄 --run-euid。"""
+    text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
+    caps_fn = text[text.index("caps_args() {"):text.index("# 3. Linux cap_posix_pty")]
+    assert "caps_only" in caps_fn and "--caps-only" in caps_fn
+    sec3 = text[text.index("# 3. Linux cap_posix_pty"):text.index("# 3b.")]
+    assert "nonroot_cmd" in sec3 and "--run-euid" in sec3 and "EVIDENCE_MISSING" in sec3
+    l1 = text[text.index("# 2. Linux L1"):text.index("# 3. Linux cap_posix_pty")]
+    assert "nonroot_cmd() {" in l1 and "SW_GATE_L1_USER" in l1 and "setpriv" in l1

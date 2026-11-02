@@ -595,6 +595,16 @@ impl CoreHarness {
         self.core.force_state(s);
     }
 
+    /// 只供 IoWorker 測試：消化已排入的 RX，模擬 actor 在 drain barrier 前完成 dispatch。
+    pub fn drain_data_lane_for_test(&mut self) -> usize {
+        let mut drained = 0;
+        while let Ok(data) = self._keep.0.try_recv() {
+            self.deliver(MailboxItem::Data(data));
+            drained += 1;
+        }
+        drained
+    }
+
     /// 送入事件並處理效果：Reply 立即送回、Schedule 內部排程，其餘回傳。
     fn deliver(&mut self, item: MailboxItem) -> Vec<Effect> {
         let mut rest = Vec::new();
@@ -609,6 +619,10 @@ impl CoreHarness {
                                 && actual.stop_id == receipt.stop_id =>
                         {
                             break;
+                        }
+                        Ok(ControlEvent::DrainDataBarrier { reply, .. }) => {
+                            self.drain_data_lane_for_test();
+                            let _ = reply.try_send(());
                         }
                         Ok(_) => {}
                         Err(_) => {}
@@ -906,6 +920,40 @@ struct RigExec {
     current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
     /// 與 actor 共用的命令登錄表（op runner 的 abort META 寫入權）。
     registry: Arc<CommandRegistry>,
+    /// 測試用：在 BeginDrain 前後暫停 actor，建立可控的 data lane backlog。
+    drain_pause: Arc<Mutex<Option<DrainPauseState>>>,
+}
+
+struct DrainPauseState {
+    before_entered: Sender<()>,
+    resume_before: Receiver<()>,
+    after_entered: Sender<()>,
+    resume_after: Receiver<()>,
+}
+
+pub struct DrainPauseHandle {
+    pub before_entered: Receiver<()>,
+    pub resume_before: Sender<()>,
+    pub after_entered: Receiver<()>,
+    pub resume_after: Sender<()>,
+}
+
+pub struct EventPauseHandle {
+    pub entered: Receiver<()>,
+    pub resume: Sender<()>,
+}
+
+impl Drop for EventPauseHandle {
+    fn drop(&mut self) {
+        let _ = self.resume.try_send(());
+    }
+}
+
+impl Drop for DrainPauseHandle {
+    fn drop(&mut self) {
+        let _ = self.resume_before.try_send(());
+        let _ = self.resume_after.try_send(());
+    }
 }
 
 /// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
@@ -915,7 +963,7 @@ fn rig_nonce() -> String {
 }
 
 impl EffectExecutor for RigExec {
-    fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, _safety: &Sender<ControlEvent>) {
+    fn execute(&mut self, e: Effect, tx: &Sender<ControlEvent>, safety: &Sender<ControlEvent>) {
         match e {
             Effect::Reply(reply, result) => {
                 let _ = reply.try_send(result);
@@ -1006,8 +1054,21 @@ impl EffectExecutor for RigExec {
                 });
             }
             Effect::BeginDrain { stop_id, epoch } => {
+                let pause = self
+                    .drain_pause
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                if let Some(pause) = pause.as_ref() {
+                    let _ = pause.before_entered.send(());
+                    let _ = pause.resume_before.recv();
+                }
                 if let Some(worker) = self.workers.remove(&epoch) {
-                    worker.finish_async(stop_id, tx.clone());
+                    worker.finish_async(stop_id, safety.clone());
+                }
+                if let Some(pause) = pause {
+                    let _ = pause.after_entered.send(());
+                    let _ = pause.resume_after.recv();
                 }
             }
             Effect::StartLogin {
@@ -1127,6 +1188,7 @@ pub struct ActorRig {
     reg: Arc<CommandRegistry>,
     stderr: Arc<Mutex<Vec<String>>>,
     files: Arc<Mutex<BTreeMap<String, String>>>,
+    drain_pause: Arc<Mutex<Option<DrainPauseState>>>,
     actor: ActorHandle,
 }
 
@@ -1205,6 +1267,7 @@ impl ActorRig {
         let data = mailbox.data_sender();
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let state_store = FakeStateStore::new();
+        let drain_pause = Arc::new(Mutex::new(None));
         let rig_fence = fence.clone();
         let rig_rx = rx.clone();
         let exec = RigExec {
@@ -1223,6 +1286,7 @@ impl ActorRig {
             runners: HashMap::new(),
             current_tx: current_tx.clone(),
             registry: reg.clone(),
+            drain_pause: drain_pause.clone(),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), clock.clone());
         ActorRig {
@@ -1238,8 +1302,45 @@ impl ActorRig {
             reg,
             stderr,
             files,
+            drain_pause,
             actor,
         }
+    }
+
+    /// 測試用：暫停下一次 BeginDrain 效果前後的 actor，便於填入已讀 RX backlog。
+    pub fn pause_next_begin_drain(&self) -> DrainPauseHandle {
+        let (before_entered_tx, before_entered) = bounded(1);
+        let (resume_before, resume_before_rx) = bounded(1);
+        let (after_entered_tx, after_entered) = bounded(1);
+        let (resume_after, resume_after_rx) = bounded(1);
+        *self.drain_pause.lock().unwrap_or_else(|e| e.into_inner()) = Some(DrainPauseState {
+            before_entered: before_entered_tx,
+            resume_before: resume_before_rx,
+            after_entered: after_entered_tx,
+            resume_after: resume_after_rx,
+        });
+        DrainPauseHandle {
+            before_entered,
+            resume_before,
+            after_entered,
+            resume_after,
+        }
+    }
+
+    /// 測試用：目前 data lane 內等待 dispatch 的項目數。
+    pub fn data_backlog(&self) -> usize {
+        self.actor.data_observer.len()
+    }
+
+    /// 測試用：目前 safety lane 內等待 dispatch 的項目數。
+    pub fn safety_backlog(&self) -> usize {
+        self.actor.safety_observer.len()
+    }
+
+    /// 測試用：暫停下一筆指定標籤事件的 dispatch。
+    pub fn pause_before_event(&self, label: &'static str) -> EventPauseHandle {
+        let (entered, resume) = self.actor.probe.pause_before_next(label);
+        EventPauseHandle { entered, resume }
     }
 
     /// 設定 process env（`resolve_session_auth` 讀取；attach／recover 時重新解析）。

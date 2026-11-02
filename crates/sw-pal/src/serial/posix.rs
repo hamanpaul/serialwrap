@@ -1412,14 +1412,17 @@ mod tests {
         // SAFETY: pipe 回傳的 fd 由 OwnedFd 接管。
         let _wake_write = unsafe { OwnedFd::from_raw_fd(wake_fds[1]) };
 
-        let mut serial_fds = [-1; 2];
-        // SAFETY: serial_fds 提供兩個有效輸出欄位。
-        assert_eq!(unsafe { libc::pipe(serial_fds.as_mut_ptr()) }, 0);
-        let serial_fd = serial_fds[0];
-        // SAFETY: serial_fds[1] 是 pipe 回傳的唯一寫入 fd，交由 OwnedFd 關閉。
-        let _serial_write = unsafe { OwnedFd::from_raw_fd(serial_fds[1]) };
-        // SAFETY: serial_fd 是 pipe 回傳的有效讀取 fd；刻意關閉以重現 poll(POLLNVAL)。
-        assert_eq!(unsafe { libc::close(serial_fd) }, 0);
+        // P5 第 7 輪（P6 第 6 輪實測 100 次 5 敗、本機 200 次 16 敗）：原以 pipe 開啟後 close 製造無效 fd，同執行檔他執行緒
+        // 隨即可能取得同號 fd，poll 不再回 POLLNVAL。改用永不可能被配置的 fd 號——Linux `fs.nr_open` 上限為
+        // INT_MAX & -BITS_PER_LONG，`c_int::MAX` 恆超出可配置範圍（其他 POSIX 亦遠超 RLIMIT_NOFILE）。
+        let serial_fd: libc::c_int = libc::c_int::MAX;
+        // SAFETY: F_GETFD 只查詢 fd 旗標；無效 fd 回 -1／EBADF，不影響任何資源。
+        let probe = unsafe { libc::fcntl(serial_fd, libc::F_GETFD) };
+        assert_eq!(
+            (probe, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EBADF)),
+            "前置：fd {serial_fd} 必須為無效 fd"
+        );
 
         let close = Arc::new(Mutex::new(PosixClose {
             fd: None,

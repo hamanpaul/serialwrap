@@ -191,15 +191,28 @@ fn wal_unwritable_during_drain_lists_gap() {
     device.push_rx(b"x");
     assert!(wait_until(Duration::from_secs(2), || h.rx.total_bytes() == 1));
 
-    let receipt = stopped(&finish(worker, 5), Duration::from_secs(2));
+    // 不回覆 actor barrier，確認有界逾時仍會交付 receipt，並明確留下排序證據缺口。
+    let (stopped_tx, stopped_rx) = bounded(2);
+    worker.finish_async(StopId(5), stopped_tx);
+    let (reply, expired) = match stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+        ControlEvent::DrainDataBarrier { reply, expired, .. } => (reply, expired),
+        _ => panic!("預期先收到 drain barrier"),
+    };
+    let receipt = stopped(&stopped_rx, Duration::from_secs(8));
     assert!(receipt.handle_closed);
     assert!(!receipt.unrecorded.is_empty());
+    assert!(receipt
+        .unrecorded
+        .iter()
+        .any(|gap| gap.dir == "RX" && gap.len == 1));
+    assert!(receipt.unrecorded.iter().any(|gap| {
+        gap.dir == "RX" && gap.len == 0 && gap.error.py_message.contains("逾時")
+    }));
     assert!(
-        receipt
-            .unrecorded
-            .iter()
-            .any(|gap| gap.dir == "RX" && gap.len == 1)
+        expired.load(std::sync::atomic::Ordering::Acquire),
+        "逾時須釋放 actor mailbox 中的 barrier"
     );
+    assert!(reply.try_send(()).is_err(), "receipt 交付後 barrier receiver 已關閉");
 }
 
 #[test]

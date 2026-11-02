@@ -59,6 +59,10 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--runner", help="執行測試 exe 的 runner 路徑")
     parser.add_argument("--list-only", action="store_true", help="只輸出已收集的 nodeid")
     parser.add_argument("--caps", action="append", default=[], help="另執行 ignored 的指定資源測試，可重複")
+    parser.add_argument(
+        "--caps-only", action="store_true",
+        help="只執行 --caps 指定的能力測試（略過預設 run），其餘收集列記為 deselected；必要集合 selector 只選 ignored 能力列時使用",
+    )
     parser.add_argument("--timeout", type=float, default=900.0, help="每次測試執行的逾時秒數")
     parser.add_argument("--summary-out", help=argparse.SUPPRESS)
     parser.add_argument("--out", required=True, help="JSON 報告路徑")
@@ -340,6 +344,9 @@ def _read_report(path: str, value: dict[str, Any]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     out_path = Path(args.out)
+    if args.caps_only and not args.caps:
+        print("cargo_l1_results.py: --caps-only 須至少指定一個 --caps", file=sys.stderr)
+        return 2
     manifest_error = _manifest_error(args.cargo_args)
     if manifest_error is not None:
         print(f"cargo_l1_results.py: {manifest_error}", file=sys.stderr)
@@ -445,17 +452,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not target.collected_names:
             continue
         runner_argv = [args.runner, target.executable] if args.runner else [target.executable]
-        run_rc, run_stdout, run_stderr, run_complete = _run(runner_argv, args.timeout)
-        target.exit_codes.append(run_rc)
-        if not run_complete:
-            finished = False
-        if run_stderr:
-            print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
-        _keep_failure_output(out_path, target, "", run_rc, run_stdout, run_stderr)
-        target.results = _parse_results(run_stdout, target)
-
         available_caps = {cap for name in target.ignored_names if (cap := capability_of(name)) is not None}
         selected_caps = [cap for cap in args.caps if cap in available_caps]
+        if args.caps_only and not selected_caps:
+            continue                     # sol P5-54dd588-2：--caps-only 時不含所選能力的執行檔不執行（其收集列記 deselected）
+        if not args.caps_only:
+            run_rc, run_stdout, run_stderr, run_complete = _run(runner_argv, args.timeout)
+            target.exit_codes.append(run_rc)
+            if not run_complete:
+                finished = False
+            if run_stderr:
+                print(run_stderr, file=sys.stderr, end="" if run_stderr.endswith("\n") else "\n")
+            _keep_failure_output(out_path, target, "", run_rc, run_stdout, run_stderr)
+            target.results = _parse_results(run_stdout, target)
+
         for cap in selected_caps:
             # P5 第 7 輪：能力測試以單執行緒執行。同執行檔平行測試 fork 子行程時，子行程在 exec 前暫時持有父行程全部 fd
             # 的複本（含 CLOEXEC 者），會被其他測試的 /proc holder 掃描看成外部 holder（cap_posix_pty__* 並行間歇 Held）。
@@ -499,6 +509,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"cargo_l1_results.py: 測試執行檔於執行期間被改寫或移除，拒絕視為完整證據：{changed}", file=sys.stderr)
 
     results = [row for target in targets for row in target.results]
+    # sol P5-54dd588-2：--caps-only 只執行能力測試；未執行的收集列記為 deselected（結果與收集一致，l1_judge 規則 8），
+    # 必要集合若含這些列即判 deselected required（不得當成已執行）。預設模式不 deselect 任何列。
+    deselected: list[str] = []
+    if args.caps_only:
+        ran = {row["nodeid"] for row in results}
+        deselected = [nodeid for nodeid in collected if nodeid not in ran]
     tally = {"passed": 0, "failed": 0, "skipped": 0}
     for result in results:
         outcome = result["outcome"]
@@ -518,7 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "uart_kind": "native",
         "not_collected_platform": [],
         "collected": collected,
-        "deselected": [],
+        "deselected": deselected,
         "results": results,
         "exit_code": exit_code,
         "finished": finished,

@@ -33,6 +33,20 @@ fn lock_conformance_suite() {
 #[test]
 #[cfg(feature = "test-fakes")]
 fn lock_conformance_suite_survives_concurrent_spawns() {
+    // 壓力（持續 spawn）只在重入的單執行緒子行程內進行，不放大同執行檔其他測試的 fork 時窗。
+    if std::env::var_os("S21_SPAWN_STRESS_CHILD").is_none() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "lock_conformance_suite_survives_concurrent_spawns", "--test-threads=1"])
+            .env("S21_SPAWN_STRESS_CHILD", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut child = ChildGuard::spawn(&mut command);
+        let status = wait_child_with_timeout(&mut child.child, Duration::from_secs(60))
+            .expect("壓力子行程應於期限內完成");
+        assert!(status.success(), "lock_suite 在並行 spawn 下失敗：{status}");
+        return;
+    }
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
     let spawner = thread::spawn(move || {
@@ -117,7 +131,8 @@ fn socket_probe_preserves_symlink_parent_resolution_order() {
 fn stale_socket_is_unlinked_then_acquired() {
     let d = tempfile::tempdir().unwrap();
     let sock = d.path().join("s.sock");
-    drop(UnixListener::bind(&sock).unwrap());
+    // P5 第 7 輪：不以 UnixListener bind→drop 製造失效 socket（他測試 fork 後 exec 前的複本仍在 listen）。
+    conformance::bind_stale_unix_socket(&sock);
     let g = native()
         .instance_lock
         .acquire(
@@ -219,21 +234,23 @@ fn socket_probe_eacces_is_socket_unavailable() {
         return;
     }
 
+    // P5 第 7 輪：斷言一律在單執行緒子行程執行。「第二次仍走到 socket 探測（lock fd 已關閉）」在多執行緒測試程序內，
+    // 會被他測試 fork 後 exec 前暫持的 lock fd 複本干擾（flock 仍被持有）；子行程內無其他測試，斷言語意不變。
     let d = tempfile::tempdir().unwrap();
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "socket_probe_eacces_is_socket_unavailable",
+            "--test-threads=1",
+        ])
+        .env("S21_EACCES_CHILD", "1")
+        .env("S21_EACCES_ROOT", d.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
     if unsafe { libc::geteuid() } == 0 {
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        use std::os::unix::process::CommandExt;
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "socket_probe_eacces_is_socket_unavailable",
-                "--test-threads=1",
-            ])
-            .env("S21_EACCES_CHILD", "1")
-            .env("S21_EACCES_ROOT", d.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
         // SAFETY: 僅在 root 測試程序的子行程中降權，讓 chmod 000 的目錄確實不可讀。
         unsafe {
             command.pre_exec(|| {
@@ -243,13 +260,11 @@ fn socket_probe_eacces_is_socket_unavailable() {
                 Ok(())
             });
         }
-        let mut child = ChildGuard::spawn(&mut command);
-        let status = wait_child_with_timeout(&mut child.child, Duration::from_secs(5))
-            .expect("權限子行程應於期限內完成");
-        assert!(status.success(), "非 root 權限斷言失敗：{status}");
-        return;
     }
-    assert_socket_probe_eacces(d.path());
+    let mut child = ChildGuard::spawn(&mut command);
+    let status = wait_child_with_timeout(&mut child.child, Duration::from_secs(5))
+        .expect("權限子行程應於期限內完成");
+    assert!(status.success(), "非 root 權限斷言失敗：{status}");
 }
 
 #[cfg(unix)]

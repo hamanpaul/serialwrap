@@ -8,6 +8,7 @@
 #![allow(non_snake_case)]
 
 use std::{
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     thread,
     time::{Duration, Instant},
 };
@@ -290,6 +291,84 @@ fn cap_posix_pty__accept_unverified_registers_unknown_holder_device() {
         "鎖後重掃 ok 不登記"
     );
     drop(h);
+}
+
+/// 模擬 daemon 在鎖後 holder 重掃期間 spawn 子行程：子行程短暫繼承 daemon 已開啟的 tty fd，
+/// 不應被當成另一個外部 holder。子行程停在 fork 後、exec 前的窗口，確保重掃能穩定觀察到它。
+struct ForkWindowHolders;
+
+impl UartExclusive for ForkWindowHolders {
+    fn probe_holders(&self, real_path: &str) -> HolderReport {
+        let mut gate = [0; 2];
+        // SAFETY: gate 指向兩個可寫 fd 槽位；pipe 成功後由本函式關閉兩端。
+        assert_eq!(unsafe { libc::pipe(gate.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: fork 後子行程只呼叫 async-signal-safe 的 close/read/_exit。
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            // SAFETY: 子行程只讀取 gate，並以 _exit 結束，不回到 Rust runtime。
+            unsafe {
+                libc::close(gate[1]);
+                let mut byte = 0u8;
+                let _ = libc::read(gate[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: 父行程不讀 gate，掃描後寫一 byte 讓子行程退出。
+        unsafe {
+            libc::close(gate[0]);
+        }
+        let report = sw_pal::serial::posix::PosixUartExclusive.probe_holders(real_path);
+        let byte = 1u8;
+        // SAFETY: gate[1] 仍由本函式持有，子行程正阻塞於對應 read。
+        assert_eq!(
+            unsafe { libc::write(gate[1], (&byte as *const u8).cast(), 1) },
+            1
+        );
+        // SAFETY: 父行程關閉 gate 寫端並回收剛建立的子行程。
+        unsafe {
+            libc::close(gate[1]);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(child, &mut status, 0), child);
+            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        }
+        report
+    }
+}
+
+#[test]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__own_child_inherited_tty_is_not_foreign_holder() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let (dev, _peer) = posix_pty_pair();
+    // 在 TIOCEXCL 前先開啟 tty，並以 dup 建立非 CLOEXEC fd；模擬 daemon-owned
+    // process_tunnel/sysenv 子行程在 fork→exec 間暫時繼承的 descriptor。
+    let parent_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&dev.0)
+        .expect("預先開啟 tty");
+    // SAFETY: parent_fd 是有效 fd；F_DUPFD 建立由下方 OwnedFd 管理且不帶 CLOEXEC 的副本。
+    let inherited_fd = unsafe { libc::fcntl(parent_fd.as_raw_fd(), libc::F_DUPFD, 3) };
+    assert!(
+        inherited_fd >= 0,
+        "dup: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: inherited_fd 為 fcntl 成功回傳的新 fd，交由 OwnedFd 單獨關閉。
+    let _inherited_fd = unsafe { OwnedFd::from_raw_fd(inherited_fd) };
+
+    let be = sw_pal::serial::posix::PosixSerialBackend::with_uart_exclusive(std::sync::Arc::new(
+        ForkWindowHolders,
+    ));
+    let opened = be.open_exclusive(&dev, &cfg());
+    assert!(
+        opened.is_ok(),
+        "daemon 自身尚未 exec 的子行程不應造成外部 holder 拒絕：{}",
+        show_open(&opened)
+    );
 }
 
 #[test]

@@ -34,7 +34,7 @@ pub fn lock_suite(factory: Arc<dyn InstanceLockFactory>, dir: &Path) {
         // 子行程在 exec 前持有 listener 複本，drop 後該複本仍在 listen，探測連線成功而得 AlreadyRunning（r6 gate 間歇失敗）；
         // 未 listen 的 socket 不論有無複本，連線一律 ECONNREFUSED，與 daemon 結束後殘留的 socket 檔相同。
         let socket = dir.join("lock-suite/stale.sock");
-        bind_without_listen(&socket);
+        bind_stale_unix_socket(&socket);
         let stale_guard = factory
             .acquire(
                 &dir.join("lock-suite/stale.lock"),
@@ -80,8 +80,9 @@ pub fn lock_suite(factory: Arc<dyn InstanceLockFactory>, dir: &Path) {
 }
 
 /// 在 `path` 建立一個只 bind、從未 listen 的 Unix stream socket 檔後關閉 fd（失效 socket 情境）。
+/// 測試以此取代 `UnixListener::bind`→drop：後者在同執行檔他測試 fork 後、exec 前會留下仍在 listen 的複本。
 #[cfg(unix)]
-fn bind_without_listen(path: &Path) {
+pub fn bind_stale_unix_socket(path: &Path) {
     use std::os::unix::ffi::OsStrExt;
 
     let bytes = path.as_os_str().as_bytes();
