@@ -25,6 +25,7 @@ from .constants import (
     BG_CAPTURE_MAX_COUNT,
     BOOT_BANNER_PATTERNS,
     BOOT_BANNER_TAIL_CHARS,
+    BOOT_EVIDENCE_GRACE_S,
     BOOT_QUIET_WINDOW_S,
     BOOTLOADER_RX_TAIL_BYTES,
     ERROR_AUTOBOOT_QUIET,
@@ -224,7 +225,36 @@ def find_chained_reboot_segment(command: str) -> str | None:
     return None
 
 
-_WHITESPACE_RE = re.compile(r"\s+")
+# 終端折行後每段回顯至少約 20 字元（80 欄扣掉 prompt），也以此保守估計回顯最多佔幾行
+_WRAP_MIN_SEGMENT = 20
+
+
+def _match_wrapped_echo(text: str, start: int, command: str) -> int | None:
+    """從 ``text[start]`` 比對一段可能被折行的命令回顯，成功時回傳回顯結束位置。
+
+    終端折行只會「插入」字元，不會刪掉命令本身的字元：BusyBox ash 插入換行，
+    bash readline 插入一個空白。因此命令的每個字元（含空白）都必須依序出現；
+    只有換行或多出的空白可以跳過，而且插入點彼此至少相隔 ``_WRAP_MIN_SEGMENT``
+    個字元（第一個插入點以第一行的欄位計，含前面殘留的 prompt）。
+    """
+    i, j = start, 0
+    last_wrap: int | None = None
+    while j < len(command):
+        if i >= len(text):
+            return None
+        ch = text[i]
+        if ch == command[j]:
+            i += 1
+            j += 1
+            continue
+        if j == 0 or ch not in "\n ":
+            return None
+        column = start + j if last_wrap is None else j - last_wrap
+        if column < _WRAP_MIN_SEGMENT:
+            return None
+        last_wrap = j
+        i += 1
+    return i
 
 
 def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
@@ -232,22 +262,19 @@ def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
 
     shell 回顯打到終端寬度（serial console 常見 80 欄）時會在回顯中插入換行
     （BusyBox ash 為 ``\\r\\r\\n``，clean_text 後成為換行）或補一個空白（bash readline
-    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡把開頭幾行
-    接回去、去掉空白後比較：命令必須從第一行開始（容許第一行前面殘留 prompt），
-    且接回的內容以完整命令結尾，才把這幾行視為回顯。
+    的 ``" \\r"``）。逐行 ``endswith(command)`` 比對因此剝不掉。這裡只接受「命令原文
+    加上折行插入字元」：命令必須從第一行開始（容許第一行前面殘留 prompt），完整
+    結束在某一行的行尾，才把這幾行視為回顯。命令本身的空白不能少，避免把
+    「輸出剛好等於命令去掉空白」（例如 echo 關閉時 ``cat file`` 印出 ``catfile``）誤當回顯。
     """
-    target = _WHITESPACE_RE.sub("", command)
-    if not target or not lines:
+    if not command or not lines:
         return lines
-    first_len = len(_WHITESPACE_RE.sub("", lines[0]))
-    joined = ""
-    # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
-    for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
-        joined += _WHITESPACE_RE.sub("", line)
-        if joined.endswith(target):
-            if len(joined) - len(target) < first_len:
-                return lines[n:]
-            return lines
+    window = lines[: len(command) // _WRAP_MIN_SEGMENT + 2]
+    text = "\n".join(window)
+    for start in range(len(lines[0])):
+        end = _match_wrapped_echo(text, start, command)
+        if end is not None and (end == len(text) or text[end] == "\n"):
+            return lines[text[:end].count("\n") + 1:]
     return lines
 
 
@@ -447,6 +474,15 @@ class SessionRuntime:
     ready_reconfirm_deadline: float = 0.0
     ready_reconfirm_attempts: int = 0
     ready_reconfirm_failed: bool = False
+    # 非同步 reboot 的「開機證據」等待截止時刻（monotonic；0.0=未等待，#162 延伸）：
+    # reboot 命令送出後 2s 內 prompt 就回來（prpl/OpenWrt 非同步 reboot）時，板子其實剛要
+    # 開始關機、舊 shell 還活著，會照常回應確認 probe 的 nonce——該回應不是 READY 實證。
+    # 實機（IB8，shutdown 慢）：prompt 回來後約 3s RX idle 即送確認 probe，舊 shell 應答，
+    # pending 被清、session 變 stale-READY，agent 命令落進關機中的系統（#162 防線被繞過）。
+    # 等待期間不送確認 probe（reprobe／attach／self-test 共用的 probe 入口皆擋）；
+    # 出現 boot banner（note_boot_evidence）即解除；超過 BOOT_EVIDENCE_GRACE_S 仍無 banner
+    # 則視為板子其實沒重開，過期後照常確認。transient，不進 _save_state。
+    boot_evidence_wait_until: float = 0.0
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -549,6 +585,7 @@ class SessionRuntime:
         清 pending 的同時清掉全部有界化欄位，維持「成功是唯一正常出口」語意。
         """
         self.clear_boot_quiet()
+        self.boot_evidence_wait_until = 0.0
         self.ready_reconfirm_pending = False
         self.ready_reconfirm_deadline = 0.0
         self.ready_reconfirm_attempts = 0
@@ -574,6 +611,8 @@ class SessionRuntime:
                 return False
         self.ready_reconfirm_pending = False
         self.ready_reconfirm_failed = True
+        # 終態後 operator 的下一步是 self-test；不得讓殘留的證據等待把它擋住。
+        self.boot_evidence_wait_until = 0.0
         return True
 
     def ready_reconfirm_remaining_s(self, now: float | None = None) -> float | None:
@@ -582,6 +621,25 @@ class SessionRuntime:
             return None
         base = time.monotonic() if now is None else now
         return round(max(self.ready_reconfirm_deadline - base, 0.0), 1)
+
+    def begin_boot_evidence_wait(self, now: float | None = None) -> None:
+        """非同步 reboot 判定成立：READY 再確認須等開機證據（或寬限過期）才接受。
+
+        寬限為 ``BOOT_EVIDENCE_GRACE_S``，自本次呼叫起算；**不**延長
+        ``ready_reconfirm_deadline``（#162 有界化維持以 arm 時刻為準）。
+        """
+        base = time.monotonic() if now is None else now
+        self.boot_evidence_wait_until = base + BOOT_EVIDENCE_GRACE_S
+
+    def note_boot_evidence(self) -> None:
+        """RX 見到 boot banner＝板子確實在重開，解除開機證據等待。"""
+        self.boot_evidence_wait_until = 0.0
+
+    def boot_evidence_wait_active(self, now: float | None = None) -> bool:
+        """是否仍在等開機證據（寬限未過期、banner 尚未出現）。"""
+        if self.boot_evidence_wait_until <= 0.0:
+            return False
+        return (time.monotonic() if now is None else now) < self.boot_evidence_wait_until
 
     def agent_gate_active(self, now: float | None = None) -> bool:
         """agent 顯式命令 gate 的統一判定（#162）。
@@ -665,6 +723,13 @@ class SessionRuntime:
             # retry_after_s）。remaining 供 operator 判讀還有多久落終態。
             "ready_reconfirm_failed": self.ready_reconfirm_failed,
             "ready_reconfirm_remaining_s": self.ready_reconfirm_remaining_s(),
+            # 非同步 reboot 後等開機證據的剩餘寬限秒數（None＝未等待／已見 banner／已過期）。
+            # 非 None 期間確認 probe 不送、agent 命令維持 AUTOBOOT_QUIET。
+            "boot_evidence_wait_remaining_s": (
+                round(self.boot_evidence_wait_until - now_mono, 1)
+                if self.boot_evidence_wait_active(now_mono)
+                else None
+            ),
             "idle_for_ms": self.compute_idle_ms(),
             # RX/TX 單邊年齡（#150）：idle_for_ms 取 max(rx,tx) 會被 probe/human TX 拉小，
             # stall（RX 單邊凍結）在 session list 看不出來；此兩欄讓 operator 一眼判讀。
@@ -1495,6 +1560,11 @@ class SessionManager:
         # 下一個 tick 立即恢復既有 reprobe 流程。
         if self._boot_quiet_blocks_probe(session, now):
             return None
+        # 非同步 reboot 的開機證據等待：舊 shell 還活著，確認 probe 的 nonce 會被它應答，
+        # 該應答不是 READY 實證。同 quiet——不累加 attempts、不排 backoff，等 banner 出現
+        # 或寬限過期後，下一個 tick 立即恢復。
+        if session.boot_evidence_wait_active(now):
+            return None
         # #162：READY 再確認分支不看 last_error（名義 READY 的 last_error 恆 None，
         # _is_reprobe_prompt_error 對 READY 必回 False）；其餘守衛（backoff／RX idle／
         # human-active／inflight）與 ATTACHED 分支完全共用。
@@ -1604,6 +1674,9 @@ class SessionManager:
         # #130：job 收集後、worker 實際寫入前 boot banner 才抵達 → 最終驗證擋下，
         # 不得對 autoboot 倒數中的 UART 送 probe bytes。
         if self._boot_quiet_blocks_probe(session, now):
+            return False
+        # 同上：job 收集後、寫入前才進入開機證據等待（例如 reboot 剛送出）→ 不送 probe。
+        if session.boot_evidence_wait_active(now):
             return False
         if self._human_active_locked(session, now):
             return False
@@ -1866,6 +1939,9 @@ class SessionManager:
         session.state = "DETACHED"
         session.detached_at = now_iso()
         session.last_error = reason
+        # bridge 已撤：「這條連線上的舊 shell 還在應答」的觀察不再成立，重新 attach 走自己的
+        # probe／quiet gate（USB-UART 隨板子重開而重新列舉時，裝置消失本身就是重開機證據）。
+        session.boot_evidence_wait_until = 0.0
         self._reset_reprobe_progress_locked(session)
         if session.interactive_session_id is not None:
             lease = self._interactive.pop(session.interactive_session_id, None)
@@ -2411,6 +2487,9 @@ class SessionManager:
         """
         window = session.boot_banner_tail[-BOOT_BANNER_TAIL_CHARS:] + chunk
         if detect_boot_banner(window):
+            # banner＝板子確實在重開：非同步 reboot 的開機證據等待在此解除（先於 arm，
+            # 兩者互不依賴；arm 只管 TX 靜默與 pending，不碰證據等待）。
+            session.note_boot_evidence()
             session.arm_boot_quiet()
             return
         tail = window[-BOOT_BANNER_TAIL_CHARS:]
@@ -2540,7 +2619,10 @@ class SessionManager:
             current = self._sessions.get(session.session_id)
             if current is None or current.bridge is not bridge:
                 return {"ok": False, "error_code": "SESSION_NOT_READY"}
-            if self._boot_quiet_blocks_probe(current):
+            # 開機證據等待與 quiet 同屬「現在送 probe 不可信或不安全」，共用此單點早退：
+            # 非同步 reboot 後舊 shell 仍活著，nonce 應答不是 READY 實證，confirm_ready 不得
+            # 在 banner 出現（或寬限過期）前被走到。
+            if self._boot_quiet_blocks_probe(current) or current.boot_evidence_wait_active():
                 # #162：READY（再確認 pending）走到這裡＝quiet 又被 re-arm——不得以
                 # 合成 PROMPT_UNAVAILABLE 覆寫 READY 的 last_error（名義 READY 的
                 # last_error 恆 None，覆寫會讓 session list 呈現矛盾）；ATTACHED
@@ -3617,6 +3699,9 @@ class SessionManager:
         # 若 target 其實沒重開（2s 內 prompt 回來），RX 解除檢查會立即清掉本視窗。
         with self._lock:
             session.arm_boot_quiet()
+            # 新一輪 reboot：上一輪（尚未過期）的證據等待作廢，只有下方「prompt 很快回來」
+            # 的非同步分支才重新起算；recovery 分支由 quiet＋recovery 迴圈自己把關。
+            session.boot_evidence_wait_until = 0.0
         if session.profile.console_unlock_env:
             # 已重開的舊 root prompt 不可在 recovery 中被當成解鎖證據。
             bridge.clear_rx_buffer()
@@ -3643,8 +3728,18 @@ class SessionManager:
             # 升級成 CTRL-C/CTRL-D 強制按鍵，正好打在 U-Boot autoboot 倒數上。
             # 保留 pending → 後續真 banner 抵達時 gate 已是關的，且 agent 命令要等
             # 確認 probe（nonce 實證）成功才放行。
+            #
+            # 但光保留 pending 不夠：quiet 一清，reprobe 在 RX idle 3s 後就送 "\n"+nonce，
+            # 這時板子**還沒真的開始關機**（IB8 實機：shutdown 慢，SMCOS rebooting 在 +8.9
+            # 到 +17.8s、U-Boot banner 在 +16.9 到 +25.9s，而 nonce 在 +3.1 到 +6.3s 就被舊
+            # shell 應答），舊 shell 照常回應 → confirm_ready 清掉 pending → stale-READY，
+            # agent 命令落進關機中的系統。故此處另起「開機證據等待」：確認 probe 要等 RX
+            # 出現 boot banner（板子確實在重開）才放行；BOOT_EVIDENCE_GRACE_S 內都沒看到
+            # banner 則視為其實沒重開、照常確認（不卡死）。串接命令（--expect-reboot 的
+            # ``A && reboot``）走同一條路：寬限自 prompt 回來這一刻起算。
             with self._lock:
                 session.clear_boot_quiet()
+                session.begin_boot_evidence_wait()
             raw_text = bridge.rx_text_from(pre_offset)
             stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
             return {
@@ -4576,7 +4671,9 @@ class SessionManager:
                             **extra,
                             **lease_context,
                         }
-                    elif session.boot_quiet_active():
+                    elif session.boot_quiet_active() or session.boot_evidence_wait_active():
+                        # 非同步 reboot 後的開機證據等待同樣回 AUTOBOOT_QUIET＋wait：舊 shell
+                        # 仍會應答 nonce，self-test 的 confirm_ready 不得在此時落定。
                         # #130 review Finding 1b（必修）：session.state 仍是 READY，但
                         # RX 已見到 boot banner——因 boot quiet 只設 boot_quiet_until
                         # 不改 session.state，會出現「state=READY 但已在 quiet window」
