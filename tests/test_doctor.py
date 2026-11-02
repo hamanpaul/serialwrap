@@ -14,6 +14,8 @@
 - #162：新增 `profile_bootloader_prompts`（線上 profile 是否漏了出貨資產有的
   `bootloader_prompts`；配置漂移會讓 bootloader 卡死偵測整條 no-op），兩份清單同步
   更新、同為 advisory（偵測本身另有 UBOOT_FALLBACK_PROMPTS 兜底）。
+- build fingerprint：新增 `daemon_code_current`（daemon 載入的程式碼是否為目前安裝的
+  那份；不一致僅提醒重啟，advisory），兩份清單同步更新。
 """
 from __future__ import annotations
 
@@ -42,6 +44,7 @@ LINUX_CHECKS = [
     "single_daemon",
     # #173：本 client 解析到的 endpoint 是否與實際執行中 daemon 一致且可連。
     "endpoint_reachable",
+    "daemon_code_current",
     "wal_dir",
     "wal_writable",
     "profile_bootloader_prompts",
@@ -58,6 +61,7 @@ WINDOWS_CHECKS = [
     "other_serialwrap_installs",
     "supervision_mode",
     "daemon_endpoint",
+    "daemon_code_current",
     "wal_dir",
     "wal_writable",
     "profile_bootloader_prompts",
@@ -292,7 +296,7 @@ class TestCliAdvisorySets:
         assert cli._DOCTOR_ADVISORY_CHECKS == {
             "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
             "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
-            "profile_bootloader_prompts",
+            "profile_bootloader_prompts", "daemon_code_current",
         }
 
 
@@ -384,7 +388,8 @@ class TestWalDirCheck:
 
     def _item(self, monkeypatch, *, reachable, wal_path=None, env=None, platform="linux"):
         def _fake_rpc(endpoint, method, params, timeout_s=0.5, **kw):
-            assert method == "health.status"
+            # daemon_code_current 檢查走 health.ping；其餘檢查走 health.status。
+            assert method in ("health.status", "health.ping")
             if not reachable:
                 return {"ok": False, "error_code": "SOCKET_ERROR"}
             return {"ok": True, "wal_path": wal_path}
