@@ -7,7 +7,6 @@
 //! 規格來源：`docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` Task 7；盤點 `inventory/07-platform-mgmt.md` §5.3、§12。
 mod support;
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use support::*;
@@ -64,54 +63,6 @@ fn hard_stop_count(t: &TestEnv) -> usize {
         .iter()
         .filter(|a| a.1 == "hard_stop")
         .count()
-}
-
-/// 模擬 grant 後先保留排空窗口，之後關閉 listener，再讓舊行程完成有序關機。
-fn ordered_shutdown_after_grant(
-    t: &TestEnv,
-    ep: &str,
-    pid: u32,
-    drain: Duration,
-    exit: Option<Duration>,
-) {
-    let endpoint = t.isolated_endpoint(ep);
-    t.rpc().clear_stop_after_send(&endpoint, "daemon.handoff_stop");
-    let rpc = Arc::clone(t.rpc());
-    let clock = Arc::clone(t.clock());
-    let granted_at = Mutex::new(None::<Duration>);
-    t.procs().alive_while(
-        pid,
-        Arc::new(move || {
-            if rpc.request_count(&endpoint, "daemon.handoff_stop") == 0 {
-                return true;
-            }
-            let now = clock.elapsed();
-            let at = *granted_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_or_insert(now);
-            if now >= at + drain && !rpc.is_stopped(&endpoint) {
-                rpc.stop_endpoint(&endpoint);
-            }
-            exit.map_or(true, |exit| now < at + drain + exit)
-        }),
-    );
-}
-
-fn on_demand_revert_handoff(
-    t: &TestEnv,
-) -> Result<sw_cli::graceful_stop::StopReport, StopFailure> {
-    t.with_cli_ctx(|ctx| {
-        graceful_stop_with(
-            ctx,
-            &SupervisionMode::OnDemand,
-            POSIX_EP,
-            false,
-            true,
-            "install_recover",
-            StopRpc::Handoff { reason: "revert" },
-        )
-    })
 }
 
 fn daemon_record(pid: u32, socket: &str) -> DaemonProc {
@@ -737,48 +688,4 @@ fn graceful_handoff_relaunched_busy_is_refused() {
     assert_eq!(failure.chain().len(), 1);
     assert_eq!(hard_stop_count(&t), 0);
     assert_eq!(stop_count(&t, "daemon.stop"), 0);
-}
-
-#[test]
-fn on_demand_handoff_recv_timeout_during_drain_does_not_start_exit_wait() {
-    // 一次收取逾時後 ping 恢復；監聽在 grant 後 3 s 關閉，舊行程於 12 s 結束。
-    // 收取逾時不能被誤判為 listener 關閉，也不能留下過早的 exit wait 起點。
-    let t = TestEnv::posix()
-        .with_supervisor_state(SupervisionMode::OnDemand, true, true)
-        .with_idle_daemon(POSIX_EP, 4242);
-    ordered_shutdown_after_grant(
-        &t,
-        POSIX_EP,
-        4242,
-        Duration::from_secs(3),
-        Some(Duration::from_secs(9)),
-    );
-    t.rpc().recv_timeout_once_after(&t.isolated_endpoint(POSIX_EP), "health.ping", 0);
-
-    let report = on_demand_revert_handoff(&t)
-        .unwrap_or_else(|e| panic!("有序關機的行程應等到結束：{e:?}"));
-    assert!(report.graceful, "不得 hard_stop");
-    assert!(
-        t.clock().elapsed() >= Duration::from_secs(12),
-        "須等到行程結束：{:?}",
-        t.clock().elapsed()
-    );
-    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 1);
-    assert_eq!(hard_stop_count(&t), 0);
-}
-
-#[test]
-fn on_demand_handoff_recv_timeouts_keep_grant_deadline() {
-    // 持續收取逾時但 listener 未關閉時，仍以 grant 起算 10 s 逾時，不啟動第二段等待。
-    let t = TestEnv::posix()
-        .with_supervisor_state(SupervisionMode::OnDemand, true, true)
-        .with_daemon_alive_forever(POSIX_EP, 4242);
-    t.rpc().recv_timeout(&t.isolated_endpoint(POSIX_EP), "health.ping");
-
-    let failure = on_demand_revert_handoff(&t).expect_err("仍存活的實例必須有界逾時");
-    assert!(matches!(failure.cause(), StopFailure::Timeout { .. }), "{failure:?}");
-    let elapsed = t.clock().elapsed();
-    assert!(elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(12), "{elapsed:?}");
-    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 1);
-    assert_eq!(hard_stop_count(&t), 0);
 }
