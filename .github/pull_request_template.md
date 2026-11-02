@@ -22,7 +22,7 @@
 
 ## Rust 重構跟進
 
-<!-- Rust 重構（docs/rust-refactor/）完成前，凡改動 `sw_core/`、`serialwrap.py`、`serialwrapd.py`、`sw_core/assets/` 或外部可觀察行為的 PR，須寫明 Rust 端要跟進的 Phase 與位置；不影響者寫「不需要」並附理由。P5～P8 即 docs/rust-refactor/serialwrap-rust-spec-final.md「Stage 2 驗收」的 Slice 2.1～2.4（對應 docs/rust-refactor/plans/06～09）。 -->
+<!-- Rust 重構（docs/rust-refactor/）完成前，凡改動 `sw_core/`、`serialwrap.py`、`serialwrapd.py`、`sw_core/assets/` 或外部可觀察行為的 PR，須寫明 Rust 端要跟進的 Phase 與位置；不影響者寫「不需要」並附理由。P5～P8 即 docs/rust-refactor/serialwrap-rust-spec-final.md「Stage 2 驗收」的 Slice 2.1～2.4。 -->
 
 - 需跟進的 Phase：<!-- Stage 1（Rust CLI）／P5（Slice 2.1，daemon 核心）／P6（Slice 2.2，console）／P7（Slice 2.3，登入與事件）／P8（Slice 2.4，傳輸與燒錄）／不需要 -->
 - Rust 對應位置與要做的事：
