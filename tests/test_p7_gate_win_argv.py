@@ -49,10 +49,19 @@ def test_gate_snapshots_artifacts_before_cargo_rebuilds():
     text = (ROOT / "scripts/rust/p7_gate.sh").read_text(encoding="utf-8")
     assert 'RUST_D="$RUN/artifacts/serialwrapd"' in text and 'RUST_CLI="$RUN/artifacts/serialwrap"' in text
     build = text.index("cargo build --workspace --bins")
-    snap = text.index('cp -p "$ROOT/target/debug/serialwrapd" "$RUST_D"')
+    assert 'TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"' in text
+    snap = text.index('cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"')
+    release = text.index("cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu")
+    release_snap = text.index('cp -p "$TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" "$PRIOR_RELEASE_D"')
     l1 = text.index('run_row "cargo test --workspace"')
-    assert build < snap < l1
-    assert "target/debug/serialwrapd" not in text[snap + 60:], "快照之後不得再引用 target/debug 的 daemon"
+    assert build < snap < release < release_snap < l1
+    assert "--prior-slice-artifact serialwrapd_release" in text
+    assert "--od59-contract" in text
+    assert 'cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"' not in text[snap + 1:], \
+        "debug artifact 快照之後不得再以 target/debug 的 daemon 取代 run 目錄快照"
+    ab_text = (ROOT / "scripts/rust/run_p7_ab.sh").read_text(encoding="utf-8")
+    assert 'latency["samples_per_run"]' in ab_text and 'latency["repeats"]' in ab_text
+    assert "P7_OD59_REQUIRE_CONTRACT=1" in ab_text and "od59-contract-a" in ab_text and "od59-contract-b" in ab_text
 
 
 def test_com_row_is_od53_capability_set():

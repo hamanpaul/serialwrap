@@ -10,7 +10,8 @@
   節點須在 junit 恰出現一次（缺漏、重複皆為缺漏；審查 P7-cd7acf0-1）。
 - `contract-blackbox`：凍結 `p7_gate:contract-blackbox-p7-b` 中 nodeid 為 `source_ref` 或 `source_ref[參數]` 的節點須在
   `<ab>/p7-b/junit.xml` 各恰一次 passed；A 輪取 `-p7-a` 的同名節點各恰一次 passed（rust_only SC 案例：A 集合不含、
-  A 輪 junit 中 B 的節點須各恰一次 skip 或 passed）。
+  A 輪 junit 中 B 的節點須各恰一次 skip 或 passed）。OD-59 控制延遲案例改由 `od59-contract-a`／`od59-contract-b` 專屬
+  契約量測階段承擔，不採用小樣本 p7-a／p7-b 結果。
 - `l15-scenario`／`func-test`：daemon_slice 2.1 的 l15 情境取 `<ab>/l15-slice21-b/junit.xml` 的
   `test_case[<id>-rust-…]`；2.3 的取 `<ab>/l15-slice23/junit.xml` 的 `test_*_rust[<id>]`；func-test 的
   brcm-01-login-flow／ev-01-spawn-handler 另認 `<ab>/func-<id>/` 的 comparison.json。2.2 案例（P6 human console）
@@ -27,7 +28,7 @@
   PASS）。本 gate 若另有同案的證據（凍結的 l15-slice21-b 節點、cargo L1 報告中出現的同名 nodeid），也必須通過（取最差）。
   匯入證據須綁定本 gate（審查 P7-38c150c-3）：來源 commit（slice21 `report.json` 的 `git_revision`、s22 輸出的
   `identity.git_revision`）等於本 gate `results.json`（`--p7-results`）的 `git_head`，且受測 daemon sha256（slice21
-  `identity.daemon_sha256`、s22 `identity.daemon_sha256`）等於本 gate 快照的 serialwrapd sha256；任一不符、缺身分欄位或
+  `identity.daemon_sha256`、s22 `identity.daemon_sha256`）等於本 gate 獨立建立並記錄的 `serialwrapd_release` SHA-256；任一不符、缺身分欄位或
   缺 `--p7-results` → 該切片的匯入證據不採用（案例全為缺漏）。採用與否及來源記於輸出的 `prior_sources`。
 
 用法：python3 scripts/rust/p7_case_coverage.py --ab-dir <run>/ab --out <run>/coverage.json
@@ -54,6 +55,8 @@ OWNER_BY_REGRESSION_FAMILY = {"F9": "B-02", "F10": "B-04", "F11": "B-05",
                               "F8": "B-15", "F12": "B-16"}
 PRIOR_SLICES = ("2.1", "2.2")
 PRIOR_SUITES = ("contract-blackbox", "func-test", "l15-scenario")
+OD59_CASE_ID = "p7-latency-noise-control-latency-under-flood-with-events"
+OD59_GATE_PHASES = ("od59-contract-a", "od59-contract-b")
 
 
 def _junit(path: Path) -> dict[str, list[str]] | None:
@@ -168,6 +171,12 @@ def judge_case(case: dict, ab: Path, rust_only: set[str], cache: dict, lock: dic
         return ("BLOCKED-OWNER", bid) if bid else ("GAP", f"regression family {case.get('family')} 無 B 編號")
     if suite == "contract-blackbox":
         ref = str(case.get("source_ref") or "")
+        if cid == OD59_CASE_ID:
+            for phase in OD59_GATE_PHASES:
+                why = _once(junit(phase), [ref], "passed")
+                if why:
+                    return "GAP", f"OD-59 契約量測 {phase}：{why}"
+            return "PASS", "OD-59 專屬契約量測 A／B 皆 PASS"
         b_nodes = _match(_frozen(lock, "p7_gate:contract-blackbox-p7-b"), ref)
         a_nodes = _match(_frozen(lock, "p7_gate:contract-blackbox-p7-a"), ref)
         why = _once(junit("p7-b"), b_nodes, "passed")
@@ -220,27 +229,27 @@ def _load_json(path: Path | None):
 
 
 def _p7_identity(p7_results: Path | None) -> tuple[str | None, str | None]:
-    """本 gate 的 (git_head, 受測 serialwrapd sha256)；取不到即 None。"""
+    """本 gate 的 (git_head, 供先前切片比對的 release serialwrapd sha256)；取不到即 None。"""
     doc = _load_json(p7_results)
     if not isinstance(doc, dict):
         return None, None
-    arts = doc.get("artifacts") if isinstance(doc.get("artifacts"), dict) else {}
-    daemon = [v for k, v in arts.items() if Path(str(k)).name in ("serialwrapd", "serialwrapd.exe")]
+    prior = doc.get("prior_slice_artifacts") if isinstance(doc.get("prior_slice_artifacts"), dict) else {}
     head = doc.get("git_head") if isinstance(doc.get("git_head"), str) else None
-    return head or None, (daemon[0] if len(daemon) == 1 and isinstance(daemon[0], str) else None)
+    release = prior.get("serialwrapd_release")
+    return head or None, (release if isinstance(release, str) and release else None)
 
 
 def _bind(label: str, rev, daemon_sha, p7: tuple[str | None, str | None]) -> str | None:
-    """匯入證據的來源綁定（審查 P7-38c150c-3）：回傳不採用的原因，或 None（採用）。"""
-    head, p7_daemon = p7
-    if not head or not p7_daemon:
-        return "缺本 gate results.json 的 git_head／serialwrapd sha256（--p7-results），無法綁定來源"
+    """匯入證據綁定來源 revision 與同類型 release artifact（審查 P7-62e430d-1）。"""
+    head, p7_release = p7
+    if not head or not p7_release:
+        return "缺本 gate results.json 的 git_head／serialwrapd_release sha256（--p7-results），無法綁定來源"
     if not isinstance(rev, str) or not rev or not isinstance(daemon_sha, str) or not daemon_sha:
         return f"{label} 缺來源身分（git_revision／daemon_sha256）"
     if rev != head:
         return f"{label} git_revision {rev[:12]} 與本 gate HEAD {head[:12]} 不符"
-    if daemon_sha != p7_daemon:
-        return f"{label} daemon sha256 {daemon_sha[:12]} 與本 gate 快照 {p7_daemon[:12]} 不符"
+    if daemon_sha != p7_release:
+        return f"{label} daemon sha256 {daemon_sha[:12]} 與本 gate release 快照 {p7_release[:12]} 不符"
     return None
 
 

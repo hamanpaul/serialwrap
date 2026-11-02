@@ -4559,7 +4559,7 @@ cases:
   source_ref: tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events
   family: L15
   title: 'RX 洪水＋ALL 規則下 control 延遲有界'
-  contract: '08 Task 18（OD-59 修訂）：20000 B/s 洪水＋ALL 規則下 stop_request／command_cancel 每輪最大值 ≤ resource_limits.yaml event_latency max_ms_flood（every_run_max_le_max_ms，量測沿用 event_latency_measure.py）；matcher event_dropped 有界出現；RSS 增量只作診斷值（OD-09）。'
+  contract: 'OD-59／OD-71：一般 pytest／CI A/B 以 command_cancel 200、stop_request 20×1 輪作快速檢查，不宣稱達契約；P7 gate 專屬 A／B 列依 resource_limits.yaml event_latency.samples_per_run×repeats（500×3）實跑，兩事件每一輪最大值皆須 ≤ max_ms_flood 並通過負載與作廢規則；matcher event_dropped 有界出現；RSS 增量只作診斷值（OD-09）。'
   invariants: []
   layer: L1.5
   platforms: [linux]

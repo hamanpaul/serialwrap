@@ -260,12 +260,15 @@ HEAD = "a" * 40
 DAEMON_SHA = "d" * 64
 
 
-def _p7_results(tmp: pathlib.Path, head: str = HEAD, daemon_sha: str = DAEMON_SHA) -> pathlib.Path:
-    """P7 gate 的 results.json（只含 coverage 綁定用的 git_head 與受測 daemon sha256）。"""
+def _p7_results(tmp: pathlib.Path, head: str = HEAD, daemon_sha: str = DAEMON_SHA,
+                release_sha: str | None = DAEMON_SHA) -> pathlib.Path:
+    """P7 gate 的 results.json（git_head、debug daemon 與先前切片 release daemon）。"""
     p = tmp / "p7-results.json"
-    p.write_text(json.dumps({"git_head": head, "artifacts": {"target/p7-gate/r/artifacts/serialwrapd": daemon_sha,
-                                                           "target/p7-gate/r/artifacts/serialwrap": "c" * 64}}),
-                 encoding="utf-8")
+    doc = {"git_head": head, "artifacts": {"target/p7-gate/r/artifacts/serialwrapd": daemon_sha,
+                                            "target/p7-gate/r/artifacts/serialwrap": "c" * 64}}
+    if release_sha is not None:
+        doc["prior_slice_artifacts"] = {"serialwrapd_release": release_sha}
+    p.write_text(json.dumps(doc), encoding="utf-8")
     return p
 
 
@@ -368,3 +371,47 @@ def test_coverage_prior_slice_evidence_must_match_p7_head_and_artifact(tmp_path)
     assert {r["case_id"]: r["status"] for r in rep["rows"]}["sm-01"] == "GAP"
     rep = cov.build(ab_dir, cy, lk, bc, l1, slice21_run=_slice21_run(tmp_path, ok21))
     assert {r["case_id"]: r["status"] for r in rep["rows"]}["sm-01"] == "GAP"
+    no_release = _p7_results(tmp_path, release_sha=None)
+    rep = cov.build(ab_dir, cy, lk, bc, l1, slice21_run=_slice21_run(tmp_path, ok21), p7_results=no_release)
+    assert {r["case_id"]: r["status"] for r in rep["rows"]}["sm-01"] == "GAP"
+
+
+def test_coverage_prior_slice_evidence_binds_to_p7_release_artifact(tmp_path):
+    """slice21 release 與 P7 debug SHA 不同時，須以 P7 專用 release 快照綁定來源。"""
+    debug_sha, release_sha = "d" * 64, "e" * 64
+    cases = [{"case_id": "sm-01", "suite": "func-test", "daemon_slice": "2.1"}]
+    cy, lk, bc, l1 = _cov_fixture(tmp_path, cases)
+    s21 = _slice21_run(tmp_path, {"sm-01": "PASS"}, daemon_sha=release_sha)
+    results = _p7_results(tmp_path, daemon_sha=debug_sha, release_sha=release_sha)
+
+    rep = cov.build(tmp_path / "ab", cy, lk, bc, l1, slice21_run=s21, p7_results=results)
+
+    assert rep["prior_sources"]["2.1"]["accepted"] is True, rep["prior_sources"]["2.1"]
+    assert rep["rows"] == [{"case_id": "sm-01", "status": "PASS", "detail": "slice21 gate case_verdicts PASS"}]
+
+
+def test_od59_coverage_requires_dedicated_contract_500x3_evidence(tmp_path):
+    """pytest 預設的小樣本 A/B 只作快檢；slice_2.3 覆蓋須由 OD-59 專屬 500×3 A/B 列判定。"""
+    ref = "tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events"
+    case = {"case_id": "p7-latency-noise-control-latency-under-flood-with-events",
+            "suite": "contract-blackbox", "source_ref": ref, "behavior_changes": []}
+    cy, lk, bc, l1 = _cov_fixture(tmp_path, [case])
+    lock = json.loads(l1.read_text(encoding="utf-8"))
+    lock["sets"]["p7_gate:contract-blackbox-p7-b"]["linux"]["nodeids"] = [ref]
+    lock["sets"]["p7_gate:contract-blackbox-p7-a"]["linux"]["nodeids"] = [ref]
+    l1.write_text(json.dumps(lock), encoding="utf-8")
+    ab_dir = tmp_path / "ab"
+    _junit(ab_dir / "p7-a" / "junit.xml", {ref: "passed"})
+    _junit(ab_dir / "p7-b" / "junit.xml", {ref: "passed"})
+
+    rep = cov.build(ab_dir, cy, lk, bc, l1)
+    assert rep["rows"][0]["status"] == "GAP", rep["rows"][0]
+
+    _junit(ab_dir / "od59-contract-a" / "junit.xml", {ref: "passed"})
+    _junit(ab_dir / "od59-contract-b" / "junit.xml", {ref: "passed"})
+    rep = cov.build(ab_dir, cy, lk, bc, l1)
+    assert rep["rows"][0]["status"] == "PASS", rep["rows"][0]
+
+    _junit(ab_dir / "od59-contract-b" / "junit.xml", {ref: "failed"})
+    rep = cov.build(ab_dir, cy, lk, bc, l1)
+    assert rep["rows"][0]["status"] == "GAP", rep["rows"][0]

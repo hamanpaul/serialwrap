@@ -2,7 +2,9 @@
 # P7（Slice 2.3）黑箱 A/B 與先前切片必要回歸（08 Task 18 Step 3；規格 §15.9.1、§11.5／§11.6）。
 #
 # 用法：scripts/rust/run_p7_ab.sh [--run-id ID] [--out DIR] [--run-dir DIR] [--rust-cli PATH] [--rust-daemon PATH]
+#        [--od59-contract]
 #   1. p7-a／p7-b：先跑 Python 基線（A）並確認其 daemon 全數結束，再以新的 FakeTarget 實例跑 Rust（B）。
+#      其中一般 `test_control_latency_under_flood_with_events` 為快速檢查；只有 `--od59-contract` 才另跑契約樣本量 A／B。
 #   2. 先前切片必要回歸（Rust artifact）：slice21-b（tests/contract_blackbox/slice21/）、slice22-b（P6 的
 #      test_console_*.py／test_interactive_lease.py／test_slice22_family_mirrors.py；本分支不 merge P6，檔案不存在時
 #      記為 BLOCKED-UPSTREAM）、l15-slice21-b（test_slice21_l15.py 的 rust 參數＋凍結清單）、l15-slice23
@@ -20,6 +22,7 @@ OUT=""
 RUN_DIR=""
 RUST_CLI="$ROOT/target/debug/serialwrap"
 RUST_D="$ROOT/target/debug/serialwrapd"
+OD59_CONTRACT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --run-id) RUN_ID="$2"; shift 2 ;;
@@ -27,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --rust-cli) RUST_CLI="$2"; shift 2 ;;
     --rust-daemon) RUST_D="$2"; shift 2 ;;
+    --od59-contract) OD59_CONTRACT=1; shift ;;
     -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "run_p7_ab.sh: 未知參數 $1" >&2; exit 2 ;;
   esac
@@ -56,16 +60,12 @@ run_phase() {
   set -e
 }
 
-# 必要節點清單（含參數化）：同一 commit 的 collect-only。
-python3 -m pytest -q -p no:cacheprovider --collect-only "${TESTS[@]}" >"$RUN_DIR/collected.txt" 2>&1 || true
-# A：Python 基線
-run_phase p7-a -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_CLI_EXE -u SERIALWRAP_AB_LABEL SW_AB_PIDLOG="$RUN_DIR/a.pids" \
-  -- "${TESTS[@]}"
-# A 的 daemon 必須全數結束（PTY 釋放）後才開始 B。
-if [[ -f "$RUN_DIR/a.pids" ]]; then
-  python3 - "$RUN_DIR/a.pids" <<'PY'
+wait_pidlog_drained() {
+  local pidlog="$1"
+  [[ -f "$pidlog" ]] || return 0
+  python3 - "$pidlog" <<'PY'
 import json, os, sys, time
-pids = [json.loads(l)["pid"] for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+pids = [json.loads(line)["pid"] for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 deadline = time.monotonic() + 30
 alive = pids
 while alive and time.monotonic() < deadline:
@@ -74,9 +74,41 @@ while alive and time.monotonic() < deadline:
 if alive:
     sys.exit(f"A 輪 daemon 未結束：{alive}")
 PY
+}
+
+# 必要節點清單（含參數化）：同一 commit 的 collect-only。
+python3 -m pytest -q -p no:cacheprovider --collect-only "${TESTS[@]}" >"$RUN_DIR/collected.txt" 2>&1 || true
+# A：Python 基線
+run_phase p7-a -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_CLI_EXE -u SERIALWRAP_AB_LABEL SW_AB_PIDLOG="$RUN_DIR/a.pids" \
+  -- "${TESTS[@]}"
+# A 的 daemon 必須全數結束（PTY 釋放）後才開始 B。
+if [[ -f "$RUN_DIR/a.pids" ]]; then
+  wait_pidlog_drained "$RUN_DIR/a.pids"
 fi
 # B：Rust CLI＋daemon
 run_phase p7-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-p7 -- "${TESTS[@]}"
+
+# OD-71：一般 p7-a／p7-b 仍用小樣本快檢，不作契約判定；出口 gate 另以 event_latency 的正式樣本數與輪數跑 A／B。
+if [[ "$OD59_CONTRACT" == "1" ]]; then
+  read -r OD59_SAMPLES OD59_REPEATS < <(python3 - <<'PY'
+import pathlib, yaml
+latency = yaml.safe_load(pathlib.Path("contracts/resource_limits.yaml").read_text(encoding="utf-8"))["event_latency"]
+print(latency["samples_per_run"], latency["repeats"])
+PY
+  )
+  [[ "$OD59_SAMPLES" =~ ^[1-9][0-9]*$ && "$OD59_REPEATS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "run_p7_ab.sh: event_latency 契約樣本設定無效" >&2; exit 2;
+  }
+  OD59_TEST=tests/contract_blackbox/test_p7_latency_noise.py::test_control_latency_under_flood_with_events
+  OD59_ENV=(P7_OD59_CANCEL_SAMPLES="$OD59_SAMPLES" P7_OD59_STOP_SAMPLES="$OD59_SAMPLES"
+            P7_OD59_REPEATS="$OD59_REPEATS" P7_OD59_REQUIRE_CONTRACT=1)
+  run_phase od59-contract-a -u SERIALWRAP_DAEMON_EXE -u SERIALWRAP_CLI_EXE -u SERIALWRAP_AB_LABEL \
+    SW_AB_PIDLOG="$RUN_DIR/od59-contract-a.pids" "${OD59_ENV[@]}" -- -s "$OD59_TEST"
+  wait_pidlog_drained "$RUN_DIR/od59-contract-a.pids"
+  run_phase od59-contract-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-p7 \
+    SW_AB_PIDLOG="$RUN_DIR/od59-contract-b.pids" "${OD59_ENV[@]}" -- -s "$OD59_TEST"
+  wait_pidlog_drained "$RUN_DIR/od59-contract-b.pids"
+fi
 
 # 先前切片必要回歸（Rust artifact）。
 run_phase slice21-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s21 -- tests/contract_blackbox/slice21/

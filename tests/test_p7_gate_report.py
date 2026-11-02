@@ -78,17 +78,25 @@ def test_verify_detects_tampering(tmp_path):
     data = json.loads((d / "results.json").read_text(encoding="utf-8"))
     data["git_head"] = g.current_head()          # verify 核對目前 HEAD（P7-c5f0fc9-3）
     data["artifacts"] = _artifacts(tmp_path)     # verify 要求必要 artifact（P7-c5f0fc9-3 第二輪）
+    prior = d / "prior-slice-artifacts" / "serialwrapd-release"
+    prior.parent.mkdir(parents=True)
+    prior.write_bytes(b"release daemon")
+    import hashlib
+    data["prior_slice_artifacts"] = {"serialwrapd_release": hashlib.sha256(prior.read_bytes()).hexdigest()}
+    data["prior_slice_artifact_paths"] = {"serialwrapd_release": "prior-slice-artifacts/serialwrapd-release"}
     (d / "results.json").write_text(json.dumps(data), encoding="utf-8")
     md = tmp_path / "gate.md"
     md.write_text(g.build_report(d), encoding="utf-8")
     assert g.verify_report(md, d) == []
+    prior.write_bytes(b"tampered release daemon")
+    assert any("先前切片 artifact sha256" in problem for problem in g.verify_report(md, d))
     md.write_text(md.read_text(encoding="utf-8").replace("| INCOMPLETE |", "| PASS |").replace(data["git_head"], "zzz"), encoding="utf-8")
     assert g.verify_report(md, d), "竄改後必須驗證失敗"
 
 
 def test_required_rows_complete():
     assert set(g.REQUIRED_ROWS) >= {"check_cfg_boundary", "cargo test --workspace", "win-test.sh (non-COM)", "win-test.sh --caps windows_com",
-        "contract_blackbox p7 A", "contract_blackbox p7 B", "contract_blackbox slice21 B", "contract_blackbox slice22 B",
+        "contract_blackbox p7 A", "contract_blackbox p7 B", *g.OD59_ROWS, "contract_blackbox slice21 B", "contract_blackbox slice22 B",
         "l15 slice21 B", "l15 slice23 B", "func-test brcm-01-login-flow", "func-test ev-01-spawn-handler",
         "regen_lock --check", "cases.lock slice_2.3 coverage", "python3 -m pytest -q tests/", "policy_check"}
 
@@ -96,6 +104,11 @@ def test_required_rows_complete():
 def test_missing_required_row_is_incomplete(tmp_path):
     md = g.build_report(_results(tmp_path, []))
     assert "| policy_check | INCOMPLETE | 未執行 |" in md
+    assert "一般 p7 A／B 列只作小樣本快速檢查，不代表達成 500×3 契約" in md
+    contract_section = md.index("## OD-59 契約量測")
+    assert md.index("| OD-59 control latency 500x3 A | INCOMPLETE | 未執行 |", contract_section) > contract_section
+    assert md.index("| OD-59 control latency 500x3 B | INCOMPLETE | 未執行 |", contract_section) > contract_section
+    assert md.index("## 列狀態") < contract_section < md.index("## 擁有者項目")
     assert "結論：NOT-PASS" in md
 
 
@@ -227,9 +240,15 @@ def test_init_and_record_only_record_identity_and_counts(tmp_path):
     log／evidence 落 sha256；同名列覆寫（審查 P7-c5f0fc9-1：required_set 不由呼叫端決定）。"""
     run = tmp_path / "run"
     art = ROOT / "scripts/rust/p7_gate_report.py"
-    data = g.init_results(run, "r9", caps_missing=["windows_com", "windows_com"], artifacts=[art])
+    prior = run / "prior-slice-artifacts" / "serialwrapd-release"
+    prior.parent.mkdir(parents=True)
+    prior.write_bytes(b"release daemon")
+    data = g.init_results(run, "r9", caps_missing=["windows_com", "windows_com"], artifacts=[art],
+                          prior_slice_artifacts=[("serialwrapd_release", prior)])
     assert data["caps_missing"] == ["windows_com"] and data["git_head"] == g.current_head()
     assert data["artifacts"] == {"scripts/rust/p7_gate_report.py": g._sha256(art)}
+    assert data["prior_slice_artifacts"] == {"serialwrapd_release": g._sha256(prior)}
+    assert data["prior_slice_artifact_paths"] == {"serialwrapd_release": "prior-slice-artifacts/serialwrapd-release"}
     log = run / "x.log"
     log.write_text("hello", encoding="utf-8")
     l1 = run / "l1.json"

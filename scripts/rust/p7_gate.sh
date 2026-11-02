@@ -31,11 +31,14 @@ RUN="$ROOT/target/p7-gate/$RUN_ID"
 mkdir -p "$RUN/logs"
 [[ -n "$OUT_MD" ]] || OUT_MD="$ROOT/docs/rust-refactor/evidence/p7-gate-$(date +%y%m%d).md"
 cd "$ROOT"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+[[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$ROOT/$TARGET_DIR"
 REPORT=(python3 scripts/rust/p7_gate_report.py)
 # 受測 artifact 於建置後立即快照到 run 目錄：之後的 cargo L1 列（--features test-fakes）與全套 pytest 會重建
 # target/debug/ 的同名執行檔，若直接引用會讓黑箱跑到 test-fakes 版、verify 的 sha256 也對不上（第 12 輪實跑揭露）。
 RUST_CLI="$RUN/artifacts/serialwrap"
 RUST_D="$RUN/artifacts/serialwrapd"
+PRIOR_RELEASE_D="$RUN/prior-slice-artifacts/serialwrapd-release"
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 argv_json() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
@@ -91,15 +94,23 @@ record_existing() {
     --started-at "$(now)" --ended-at "$(now)" "${extra[@]}" $([[ ${#ev[@]} -gt 0 ]] && echo --evidence) "${ev[@]}"
 }
 
-# 0. 受測 artifact：Rust CLI＋daemon（非 test-fakes）。
+# 0. 受測 artifact：Rust CLI＋daemon（非 test-fakes）。先前切片 gate 使用 release daemon，另建同類型
+#    release 快照供來源 SHA 綁定；不放入一般 artifacts，避免混淆本次黑箱受測 debug daemon。
 cargo build --workspace --bins >"$RUN/logs/build.log" 2>&1 || { echo "p7_gate.sh: cargo build 失敗（$RUN/logs/build.log）" >&2; exit 1; }
-mkdir -p "$RUN/artifacts"
-cp -p "$ROOT/target/debug/serialwrap" "$RUST_CLI"
-cp -p "$ROOT/target/debug/serialwrapd" "$RUST_D"
+mkdir -p "$RUN/artifacts" "$RUN/prior-slice-artifacts"
+cp -p "$TARGET_DIR/debug/serialwrap" "$RUST_CLI"
+cp -p "$TARGET_DIR/debug/serialwrapd" "$RUST_D"
+cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu \
+  >"$RUN/logs/build-prior-slice-release.log" 2>&1 || {
+  echo "p7_gate.sh: slice21 同類型 release 建置失敗（$RUN/logs/build-prior-slice-release.log）" >&2
+  exit 1
+}
+cp -p "$TARGET_DIR/x86_64-unknown-linux-gnu/release/serialwrapd" "$PRIOR_RELEASE_D"
 CAPS=()
 if ! [[ -n "${WSL_DISTRO_NAME:-}" || -e /proc/sys/fs/binfmt_misc/WSLInterop ]]; then CAPS+=(windows_native windows_com); fi
 [[ -n "${SW_TEST_COM_PAIR:-}" ]] || CAPS+=(windows_com)
-"${REPORT[@]}" init --results-dir "$RUN" --run-id "$RUN_ID" --caps-missing "${CAPS[@]}" --artifact "$RUST_CLI" "$RUST_D"
+"${REPORT[@]}" init --results-dir "$RUN" --run-id "$RUN_ID" --caps-missing "${CAPS[@]}" \
+  --artifact "$RUST_CLI" "$RUST_D" --prior-slice-artifact serialwrapd_release "$PRIOR_RELEASE_D"
 
 # 1. cfg 邊界
 run_row "check_cfg_boundary" check-cfg-boundary --evidence "$RUN/logs/check-cfg-boundary.log" -- \
@@ -150,6 +161,7 @@ AB="$RUN/ab"
 AB_MD="$RUN/p7-ab.md"
 set +e
 bash scripts/rust/run_p7_ab.sh --run-id "$RUN_ID" --run-dir "$AB" --out "$AB_MD" --rust-cli "$RUST_CLI" \
+  --od59-contract \
   --rust-daemon "$RUST_D" >"$RUN/logs/run-p7-ab.log" 2>&1
 AB_RC=$?
 set -e
@@ -163,6 +175,8 @@ phase_row() {  # phase_row <列名> <階段目錄名>
 }
 phase_row "contract_blackbox p7 A" p7-a
 phase_row "contract_blackbox p7 B" p7-b
+phase_row "OD-59 control latency 500x3 A" od59-contract-a
+phase_row "OD-59 control latency 500x3 B" od59-contract-b
 phase_row "contract_blackbox slice21 B" slice21-b
 phase_row "contract_blackbox slice22 B" slice22-b
 phase_row "l15 slice21 B" l15-slice21-b

@@ -292,6 +292,8 @@ def build(args) -> tuple[str, int]:
         f"- evidence A: `{_rel(args.junit_a)}` sha256 `{_sha256_file(args.junit_a)}`",
         f"- evidence B: `{_rel(args.junit_b)}` sha256 `{_sha256_file(args.junit_b)}`",
         "",
+        "- OD-59：本表 p7-a／p7-b 的控制延遲案例只作小樣本快速檢查；即使顯示 PASS，也不代表達成 500×3 契約。契約判定由 P7 gate 專屬 A／B 列承擔。",
+        "",
         "| case_id | A | B | 說明 |",
         "|---|---|---|---|",
     ]

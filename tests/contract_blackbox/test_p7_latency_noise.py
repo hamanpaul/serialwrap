@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,8 +31,10 @@ from bb_p7 import wait_state
 pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parents[2]
-CANCEL_SAMPLES = 200        # 計畫 08 Task 18 該列「200 次取樣」
-STOP_SAMPLES = 20           # stop_request 每樣本為一個新 daemon（event_latency 口徑），控制案例時長
+CANCEL_SAMPLES = int(os.environ.get("P7_OD59_CANCEL_SAMPLES", "200"))
+STOP_SAMPLES = int(os.environ.get("P7_OD59_STOP_SAMPLES", "20"))
+OD59_REPEATS = int(os.environ.get("P7_OD59_REPEATS", "1"))
+REQUIRE_OD59_CONTRACT = os.environ.get("P7_OD59_REQUIRE_CONTRACT") == "1"
 VOID_RETRIES = 2            # 同 event_latency_measure.py 預設：loadavg 峰值 > CPU 數的輪次作廢重跑
 FLOOD_MARK = "LATFLOOD"     # `_Flood` 每行開頭
 
@@ -164,35 +167,59 @@ def test_login_with_delay_and_noise(p7, tmp_path):
 def test_control_latency_under_flood_with_events(tmp_path):
     """RX 洪水＋ALL 規則下的控制延遲（OD-59：event_latency flood 規則）。
 
-    兩個外部量測事件各一輪：command_cancel（CANCEL_SAMPLES 筆、同一 daemon、整輪洪水）與 stop_request
-    （STOP_SAMPLES 個新 daemon、各暖機 stop_warmup_s）。每輪由 `judge_run` 判定——有效樣本最大值 > `max_ms_flood`
-    即 FAIL；錯誤、缺樣、負載無效即證據不足（不得 PASS）；loadavg 峰值 > CPU 數的輪次作廢重跑，重跑仍作廢即證據不足。
+    預設 pytest／CI 使用 200 筆 command_cancel、20 個 stop_request daemon、各 1 輪，僅作快速檢查；不代表達成 OD-59
+    契約。P7 gate 專屬列以 resource_limits.yaml 的 samples_per_run 與 repeats 執行兩事件，並要求兩者逐字符合契約。
+    command_cancel 每輪共用 daemon 且整輪洪水，stop_request 每筆使用新 daemon 並於送出前暖機 stop_warmup_s。每輪由
+    `judge_run` 判定——有效樣本最大值 > `max_ms_flood` 即 FAIL；錯誤、缺樣、負載無效即證據不足（不得 PASS）；
+    loadavg 峰值 > CPU 數的輪次作廢重跑，重跑仍作廢即證據不足。
     另斷言洪水期間規則確有比對（match_recorded ≥ 1），且 `event_dropped` 出現、筆數 ≤ 送出的洪水行數、皆屬 COM0。"""
     tool = _measure_tool()
     harness = tool._import_harness()
     contract = tool.load_contract()
     assert contract.get("gate_rule") == "every_run_max_le_max_ms", contract.get("gate_rule")
+    contract_samples = int(contract["samples_per_run"])
+    contract_repeats = int(contract["repeats"])
+    if REQUIRE_OD59_CONTRACT:
+        assert (CANCEL_SAMPLES, STOP_SAMPLES, OD59_REPEATS) == (contract_samples, contract_samples, contract_repeats), {
+            "configured": (CANCEL_SAMPLES, STOP_SAMPLES, OD59_REPEATS),
+            "contract": (contract_samples, contract_repeats),
+        }
     rows = {str(e.get("event")): e for e in contract.get("events") or []}
     flood_cfg = contract["flood_load"]
-    verdicts: dict[str, dict] = {}
-    events: dict | None = None
-    for event in ("command_cancel", "stop_request"):
-        assert rows[event].get("measure") == "external", rows[event]
-        limit = rows[event]["max_ms_flood"]
-        for attempt in range(VOID_RETRIES + 1):
-            root = tmp_path / f"{event}-{attempt}"
-            if event == "command_cancel":
-                run, events = _cancel_run(tool, harness, root, limit, flood_cfg)
-            else:
-                run = _stop_run(tool, harness, root, limit, flood_cfg)
-            if not (run["void"] and attempt < VOID_RETRIES):
-                break
-            time.sleep(5.0)
-        verdicts[event] = run
-    summary = {ev: {k: r.get(k) for k in ("verdict", "max_ms", "p99_ms", "count", "limit_ms", "void", "errors",
-                                          "load_problems", "host_load")} for ev, r in verdicts.items()}
-    print("control_latency_summary", json.dumps({"runs": summary, "events": events}, ensure_ascii=False, sort_keys=True))
-    assert all(r["verdict"] == "PASS" for r in verdicts.values()), summary
-    assert events is not None and events["matched"] >= 1, events
-    assert 1 <= events["dropped"] <= events["lines_sent"], events
-    assert events["dropped_selectors"] == ["COM0"], events
+    verdicts: dict[str, list[dict]] = {"command_cancel": [], "stop_request": []}
+    event_rows: list[dict] = []
+    for repeat in range(OD59_REPEATS):
+        for event in ("command_cancel", "stop_request"):
+            assert rows[event].get("measure") == "external", rows[event]
+            limit = rows[event]["max_ms_flood"]
+            for attempt in range(VOID_RETRIES + 1):
+                root = tmp_path / f"{event}-r{repeat + 1}-{attempt}"
+                if event == "command_cancel":
+                    run, events = _cancel_run(tool, harness, root, limit, flood_cfg)
+                else:
+                    run = _stop_run(tool, harness, root, limit, flood_cfg)
+                    events = None
+                if not (run["void"] and attempt < VOID_RETRIES):
+                    break
+                time.sleep(5.0)
+            verdicts[event].append(run)
+            if events is not None:
+                event_rows.append({"repeat": repeat + 1, **events})
+    summary = {ev: [{k: r.get(k) for k in ("verdict", "max_ms", "p99_ms", "count", "limit_ms", "void", "errors",
+                                           "load_problems", "host_load")} for r in runs]
+               for ev, runs in verdicts.items()}
+    full_contract = REQUIRE_OD59_CONTRACT and (CANCEL_SAMPLES, STOP_SAMPLES, OD59_REPEATS) == (
+        contract_samples, contract_samples, contract_repeats)
+    evidence_class = "OD-59 契約量測" if full_contract else "quick_check_only"
+    print("control_latency_summary", json.dumps({
+        "evidence_class": evidence_class,
+        "sample_plan": {"command_cancel_per_run": CANCEL_SAMPLES, "stop_request_per_run": STOP_SAMPLES,
+                        "repeats": OD59_REPEATS},
+        "runs": summary,
+        "events": event_rows,
+    }, ensure_ascii=False, sort_keys=True))
+    assert all(run["verdict"] == "PASS" for runs in verdicts.values() for run in runs), summary
+    assert len(event_rows) == OD59_REPEATS, event_rows
+    assert all(events["matched"] >= 1 for events in event_rows), event_rows
+    assert all(1 <= events["dropped"] <= events["lines_sent"] for events in event_rows), event_rows
+    assert all(events["dropped_selectors"] == ["COM0"] for events in event_rows), event_rows

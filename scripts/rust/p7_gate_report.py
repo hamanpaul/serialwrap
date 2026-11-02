@@ -34,10 +34,11 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_L1_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
+OD59_ROWS: tuple[str, ...] = ("OD-59 control latency 500x3 A", "OD-59 control latency 500x3 B")
 
 REQUIRED_ROWS: tuple[str, ...] = (
     "check_cfg_boundary",
@@ -46,6 +47,7 @@ REQUIRED_ROWS: tuple[str, ...] = (
     "win-test.sh --caps windows_com",
     "contract_blackbox p7 A",
     "contract_blackbox p7 B",
+    *OD59_ROWS,
     "contract_blackbox slice21 B",
     "contract_blackbox slice22 B",
     "l15 slice21 B",
@@ -63,6 +65,7 @@ TEST_ROWS: frozenset[str] = frozenset({
     "win-test.sh --caps windows_com",
     "contract_blackbox p7 A",
     "contract_blackbox p7 B",
+    *OD59_ROWS,
     "contract_blackbox slice21 B",
     "contract_blackbox slice22 B",
     "l15 slice21 B",
@@ -261,19 +264,27 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
     ]
     for name, digest in sorted((data.get("artifacts") or {}).items()):
         lines.append(f"| {name} | {digest} |")
-    lines += ["", "## 列狀態", "", "| 列 | 狀態 | 說明 | log_sha256 |", "|---|---|---|---|"]
+    prior_artifacts = data.get("prior_slice_artifacts") or {}
+    if prior_artifacts:
+        lines += ["", "## 先前切片 artifact", "", "| artifact | sha256 |", "|---|---|"]
+        for name, digest in sorted(prior_artifacts.items()):
+            lines.append(f"| {name} | {digest} |")
+    lines += ["", "OD-59 的一般 p7 A／B 列只作小樣本快速檢查，不代表達成 500×3 契約；契約判定只看下方專屬量測列。"]
     statuses: dict[str, str] = {}
     names = list(REQUIRED_ROWS) + [n for n in rows if n not in REQUIRED_ROWS]
-    for name in names:
-        row = rows.get(name)
-        if row is None:
-            status, detail = "INCOMPLETE", "未執行"
-            log_sha = ""
-        else:
-            status, detail = _row_status(results_dir, row, caps_missing, lock, judge)
-            log_sha = row.get("log_sha256") or ""
-        statuses[name] = status
-        lines.append(f"| {name} | {status} | {detail.replace('|', '/')} | {log_sha} |")
+    for heading, section_rows in (("## 列狀態", [n for n in names if n not in OD59_ROWS]),
+                                  ("## OD-59 契約量測", [n for n in OD59_ROWS if n in names])):
+        lines += ["", heading, "", "| 列 | 狀態 | 說明 | log_sha256 |", "|---|---|---|---|"]
+        for name in section_rows:
+            row = rows.get(name)
+            if row is None:
+                status, detail = "INCOMPLETE", "未執行"
+                log_sha = ""
+            else:
+                status, detail = _row_status(results_dir, row, caps_missing, lock, judge)
+                log_sha = row.get("log_sha256") or ""
+            statuses[name] = status
+            lines.append(f"| {name} | {status} | {detail.replace('|', '/')} | {log_sha} |")
     lines += ["", "## 擁有者項目", "", "| 項目 | 狀態 | 說明 |", "|---|---|---|"]
     owner_evidence = data.get("owner_evidence") or {}
     for bid, title in OWNER_ITEMS.items():
@@ -291,7 +302,7 @@ def build_report(results_dir: Path, *, l1_lock: Path | None = None) -> str:
 
 
 def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = None) -> list[str]:
-    """重算報告並逐行比對；另核對 log sha256 與 results.json 的 git_head／run_id。回傳不一致清單。"""
+    """重算報告並逐行比對；另核對 artifact、log sha256 與 results.json 的 git_head／run_id。"""
     results_dir = Path(results_dir)
     problems: list[str] = []
     try:
@@ -314,6 +325,12 @@ def verify_report(md_path: Path, results_dir: Path, *, l1_lock: Path | None = No
         got = _sha256(_resolve(ROOT, path))
         if got is None or got != want:
             problems.append(f"artifact sha256 不符或缺檔：{path}")
+    prior_paths = data.get("prior_slice_artifact_paths") or {}
+    for name, want in (data.get("prior_slice_artifacts") or {}).items():
+        path = prior_paths.get(name)
+        got = _sha256(_resolve(results_dir, path)) if isinstance(path, str) else None
+        if got is None or got != want:
+            problems.append(f"先前切片 artifact sha256 不符或缺檔：{name}")
     for row in data.get("rows") or []:
         lp, want = row.get("log_path"), row.get("log_sha256")
         if lp and want and _sha256(_resolve(results_dir, lp)) != want:
@@ -343,15 +360,20 @@ def _tool_versions() -> dict[str, str | None]:
     return out
 
 
-def init_results(results_dir: Path, run_id: str, *, caps_missing: list[str], artifacts: list[Path]) -> dict[str, Any]:
-    """`p7_gate.sh` 起點：寫 results.json 的身分欄位（HEAD、工作樹是否乾淨、artifact sha256，路徑為 repo 相對）。"""
+def init_results(results_dir: Path, run_id: str, *, caps_missing: list[str], artifacts: list[Path],
+                 prior_slice_artifacts: Sequence[tuple[str, Path]] = ()) -> dict[str, Any]:
+    """`p7_gate.sh` 起點：記錄 HEAD、受測 artifact 與獨立的先前切片 artifact 身分。"""
     status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True)
+    prior_sha = {name: _sha256(path) for name, path in prior_slice_artifacts}
+    prior_paths = {name: _rel_to(results_dir, path) for name, path in prior_slice_artifacts}
     data = {
         "run_id": run_id,
         "git_head": current_head(),
         "worktree_clean": status.returncode == 0 and not status.stdout.strip(),
         "caps_missing": sorted(set(caps_missing)),
         "artifacts": {_rel_to(ROOT, a): _sha256(a) for a in artifacts},
+        "prior_slice_artifacts": prior_sha,
+        "prior_slice_artifact_paths": prior_paths,
         # 受測工具版本（審查 P7-b85eec5-1：pytest 9.2.0 對過長字串參數改用 `<argname><index>` id，3 個凍結 nodeid
         # 會因此缺測；報告須註明版本以判讀 INCOMPLETE 原因）。
         "tool_versions": _tool_versions(),
@@ -402,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("--run-id", required=True)
     i.add_argument("--caps-missing", nargs="*", default=[])
     i.add_argument("--artifact", nargs="*", default=[], type=Path)
+    i.add_argument("--prior-slice-artifact", nargs=2, action="append", default=[], metavar=("NAME", "PATH"))
     r = sub.add_parser("record")
     r.add_argument("--results-dir", required=True, type=Path)
     r.add_argument("--name", required=True)
@@ -423,7 +446,8 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--l1-lock", type=Path)
     args = ap.parse_args(argv)
     if args.cmd == "init":
-        init_results(args.results_dir, args.run_id, caps_missing=args.caps_missing, artifacts=args.artifact)
+        init_results(args.results_dir, args.run_id, caps_missing=args.caps_missing, artifacts=args.artifact,
+                     prior_slice_artifacts=[(name, Path(path)) for name, path in args.prior_slice_artifact])
         return 0
     if args.cmd == "record":
         record_row(args.results_dir, name=args.name, rc=args.rc, log=args.log, argv=json.loads(args.argv_json),
