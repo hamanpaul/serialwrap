@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use sw_pal::proc_scan::ProcIdentity;
 use sw_pal::service_ctl::{AutostartHoldRecord, ServiceResult, SupervisionMode};
+use sw_pal::traits::PalErrorKind;
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 
@@ -455,8 +456,8 @@ fn with_handoff_context(
     }
 }
 
-/// 等待已取得 grant 的實例結束。`timeout` 約束實例仍回應 `health.ping` 的期間（排空窗口在其內）；
-/// 一旦觀察到 ping 不通而舊行程樹仍在（已關閉監聽、正在有序關機），改以 [`HANDOFF_EXIT_WAIT`] 自該時刻起算。
+/// 等待已取得 grant 的實例結束。`timeout` 約束監聽尚未關閉的期間（排空窗口在其內）；
+/// 只有 ping 於連線階段以 `ConnectionRefused`／`NotFound` 失敗且舊行程樹仍在時，才以 [`HANDOFF_EXIT_WAIT`] 起算。
 pub fn wait_handoff_gone(
     ctx: &CliCtx<'_>,
     endpoint: &str,
@@ -468,16 +469,29 @@ pub fn wait_handoff_gone(
     let exit_limit = HANDOFF_EXIT_WAIT.as_nanos().min(u64::MAX as u128) as u64;
     let mut exiting_since: Option<u64> = None;
     loop {
-        let ping = client::call(
+        let (ping, listener_closed) = match client::call_with_failure(
             ctx,
             endpoint,
             "health.ping",
             &PyValue::Dict(PyDict::new()),
             0.5,
             &PyInt::Small(0),
-        )
-        .ok()
-        .is_some_and(|outcome| outcome.resp.get_truthy("ok"));
+        ) {
+            Ok((outcome, failure)) => (
+                outcome.resp.get_truthy("ok"),
+                failure.is_some_and(|failure| {
+                    failure.phase == client::FailPhase::Connect
+                        && matches!(
+                            failure.pal_kind,
+                            Some(PalErrorKind::ConnectionRefused | PalErrorKind::NotFound)
+                        )
+                }),
+            ),
+            Err(_) => (false, false),
+        };
+        if ping {
+            exiting_since = None;
+        }
         let old_alive = id
             .tree
             .iter()
@@ -542,10 +556,10 @@ pub fn wait_handoff_gone(
             }
         }
         let now = ctx.p.clock.mono_ns();
-        let timed_out = if ping {
-            now.saturating_sub(started) >= limit
-        } else {
+        let timed_out = if listener_closed {
             now.saturating_sub(*exiting_since.get_or_insert(now)) >= exit_limit
+        } else {
+            now.saturating_sub(started) >= limit
         };
         if timed_out {
             return HandoffWait::TimedOut;

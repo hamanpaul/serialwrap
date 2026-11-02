@@ -767,6 +767,69 @@ fn on_demand_handoff_exit_wait_is_bounded_from_listener_close() {
 }
 
 #[test]
+fn on_demand_handoff_single_ping_recv_timeout_does_not_start_exit_wait() {
+    // 排空窗口內一次 recv 逾時不代表監聽已關閉；恢復回 ping 後，結束等待應從 3 s 關監聽時起算。
+    let t = TestEnv::posix()
+        .with_supervisor_state(SupervisionMode::OnDemand, true, true)
+        .with_idle_daemon(POSIX_EP, 4242);
+    ordered_shutdown_after_grant(
+        &t,
+        POSIX_EP,
+        4242,
+        Duration::from_secs(3),
+        Some(Duration::from_secs(9)),
+    );
+    let endpoint = t.isolated_endpoint(POSIX_EP);
+    t.rpc().recv_timeout_once_after(&endpoint, "health.ping", 0);
+
+    let report = on_demand_revert_handoff(&t)
+        .unwrap_or_else(|error| panic!("單次 ping recv 逾時後仍須等到行程結束：{error:?}"));
+    assert!(report.graceful, "未 hard_stop 即結束");
+    assert!(
+        t.clock().elapsed() >= Duration::from_secs(12),
+        "須等到行程結束：{:?}",
+        t.clock().elapsed()
+    );
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 1);
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[test]
+fn on_demand_handoff_persistent_ping_recv_timeout_keeps_grant_limit() {
+    // 先正常回 ping 3 s，再持續 recv 逾時；監聽仍開且行程存活時，逾時仍自 grant 起算 10 s。
+    let t = TestEnv::posix()
+        .with_supervisor_state(SupervisionMode::OnDemand, true, true)
+        .with_idle_daemon(POSIX_EP, 4242);
+    let endpoint = t.isolated_endpoint(POSIX_EP);
+    t.rpc()
+        .clear_stop_after_send(&endpoint, "daemon.handoff_stop");
+    let rpc = Arc::clone(t.rpc());
+    let clock = Arc::clone(t.clock());
+    t.procs().alive_while(
+        4242,
+        Arc::new(move || {
+            if clock.elapsed() >= Duration::from_secs(3) {
+                rpc.recv_timeout(&endpoint, "health.ping");
+            }
+            true
+        }),
+    );
+
+    let failure = on_demand_revert_handoff(&t).expect_err("持續 recv 逾時且行程存活時必須逾時");
+    assert!(
+        matches!(failure.cause(), StopFailure::Timeout { .. }),
+        "{failure:?}"
+    );
+    let elapsed = t.clock().elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(12),
+        "逾時須自 grant 起算，實際：{elapsed:?}"
+    );
+    assert_eq!(stop_count(&t, "daemon.handoff_stop"), 1);
+    assert_eq!(hard_stop_count(&t), 0);
+}
+
+#[test]
 fn on_demand_handoff_still_answering_keeps_grant_limit() {
     // grant 後一直回 ping（未進入停止序列）：仍以 grant 起算 10 s 回 Timeout，結束等待不延長此情形。
     let t = TestEnv::posix()
