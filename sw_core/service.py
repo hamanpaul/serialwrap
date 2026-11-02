@@ -19,6 +19,7 @@ from .arbiter import (
 )
 from .config import ProfileTemplate, SessionProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+from .expect_reboot import add_submit_warning, chained_reboot_warning, expect_reboot_rejection
 from .constants import (
     CONFIG_DIR,
     DEVICE_BY_ID_DIR,
@@ -41,9 +42,9 @@ from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
-from .session_manager import SessionManager
+from .session_manager import SessionManager, find_chained_reboot_segment
 from .util import now_iso
-from .version import resolve_version
+from .version import code_dir, code_fingerprint, resolve_version
 from .wal import WalWriter, rows_to_text_lines
 
 _HUMAN_INTERACTIVE_COMMANDS = {
@@ -235,6 +236,9 @@ class SerialwrapService:
         self._profile_count = len(profiles)
         # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
         self._version = resolve_version()
+        # 程式碼指紋同樣啟動時算一次常駐：它代表「daemon 啟動當下載入的那份程式碼」，
+        # 升級覆蓋磁碟上的檔案後，CLI 現算的值會與此分歧（見 sw_core/version.py）。
+        self._code_fingerprint = code_fingerprint()
 
         self._arbiter = CommandArbiter(self._send_cb)
         self._sessions = SessionManager(
@@ -304,10 +308,12 @@ class SerialwrapService:
         for line in buf.feed(data):
             self._engine.feed_line(com, line, wal_seq)
 
-    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None) -> dict[str, Any]:
+    def _send_cb(self, session_id: str, command: str, source: str, cmd_id: str, timeout_s: float, mode: str, expected_duration_s: float | None = None, completion_regex: str | None = None, expect_reboot: bool = False) -> dict[str, Any]:
         options: dict[str, Any] = {"timeout_s": timeout_s, "mode": mode, "expected_duration_s": expected_duration_s}
         if completion_regex is not None:
             options["completion_regex"] = completion_regex
+        if expect_reboot:
+            options["expect_reboot"] = True
         return self._sessions.execute_command(session_id, command, source, cmd_id, **options)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
@@ -575,6 +581,10 @@ class SerialwrapService:
                 "ok": True,
                 "pid": os.getpid(),
                 "version": self._version,  # #154：CLI/daemon 版本可診斷性
+                # 程式碼指紋與載入路徑：版本字串在 release／分支 build／main 間完全相同，
+                # 無從分辨 daemon 跑的是哪份程式碼；None（凍結包）時兩欄皆照給，值為 null。
+                "code_fingerprint": self._code_fingerprint,
+                "code_path": code_dir(),
                 "running": self._running,
                 "started_at": self._started_at,
                 "sessions": len(sessions),
@@ -689,9 +699,10 @@ class SerialwrapService:
 
     def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """RPC 平面分派器的薄包裝（#154）：委派 `_dispatch()`，並在回應為 dict 時
-        補上 daemon 版本欄位。`health()` 已顯式帶 `version`，`setdefault` 對它是
-        no-op（同一個 `self._version`）；對其餘所有 method（health.ping／mcu.*／
-        session.*／event.*…）則是唯一補上版本欄位的地方——不需要逐一 handler 加。
+        補上 daemon 版本與程式碼指紋欄位（`code_fingerprint`，凍結包算不出時略過）。
+        `health()` 已顯式帶這些欄位，`setdefault` 對它是 no-op（同一個值）；對其餘
+        所有 method（health.ping／mcu.*／session.*／event.*…）則是唯一補上的地方——
+        不需要逐一 handler 加，CLI 的 client↔daemon 比對因此每個指令都看得到。
         `getattr` 防呆：既有測試會以 `__new__` 繞過 `__init__` 建構輕量 stub 物件
         （如 `tests/test_profile_pin_sticky.py::TestRpc`），此時 `_version` 未設，
         版本欄位就此略過而非拋 AttributeError。
@@ -700,6 +711,9 @@ class SerialwrapService:
         version = getattr(self, "_version", None)
         if isinstance(result, dict) and version is not None:
             result.setdefault("version", version)
+        fingerprint = getattr(self, "_code_fingerprint", None)
+        if isinstance(result, dict) and fingerprint:
+            result.setdefault("code_fingerprint", fingerprint)
         return result
 
     def _dispatch(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -892,10 +906,14 @@ class SerialwrapService:
             completion_regex = params.get("completion_regex")
             if not valid_completion_regex(completion_regex):
                 return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
+            expect_reboot = params.get("expect_reboot")
             selector = str(params.get("selector") or params.get("com") or params.get("alias") or "")
             cmd = str(params.get("cmd") or params.get("command") or "")
             source = str(params.get("source") or "agent")
             mode = str(params.get("mode") or "line")
+            rejection = expect_reboot_rejection(expect_reboot, {"fg": "line", "bg": "background"}.get(mode, mode))
+            if rejection is not None:
+                return rejection
             timeout_s = float(params.get("timeout_s") or 10.0)
             priority = int(params.get("priority") or 10)
             raw_ed = params.get("expected_duration_s")
@@ -906,7 +924,7 @@ class SerialwrapService:
             if err is not None:
                 return err
             assert session_id is not None
-            return self._arbiter.submit(
+            result = self._arbiter.submit(
                 session_id=session_id,
                 command=cmd,
                 source=source,
@@ -915,7 +933,14 @@ class SerialwrapService:
                 priority=priority,
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
+                expect_reboot=expect_reboot is True,
             )
+            if result.get("ok") and expect_reboot is not True and mode != "interactive":
+                # 非致命提示：沒帶 --expect-reboot 的串接 reboot 不會走 reboot 路徑。僅提示、不改變執行。
+                segment = find_chained_reboot_segment(cmd)
+                if segment is not None:
+                    add_submit_warning(result, chained_reboot_warning(segment))
+            return result
 
         if method == "command.get":
             cmd_id = str(params.get("cmd_id") or "")

@@ -200,6 +200,7 @@ sequenceDiagram
 - `background_capture_id`
 - `interactive_session_id`
 - `recovery_action`
+- `expect_reboot`（`cmd submit --expect-reboot` 的設定，未明示為 `false`）
 - `error_code`
 - `started_at`
 - `done_at`
@@ -345,6 +346,18 @@ session 因 recovery/re-attach 離開 `READY`（`_on_detached` → `arbiter.unre
 適用場景：`make`、`python -m unittest` 等長時間**且持續有輸出**的命令。會靜默的長命令不適用——改在板上 `setsid sh -c '…' </dev/null >/dev/null 2>&1 &` 丟背景，再以短命令輪詢。
 
 詳見設計文件：[`docs/design-heartbeat-keepalive.md`](./design-heartbeat-keepalive.md)。
+
+### 6.6 明示 reboot（`--expect-reboot`）
+
+`_is_reboot_command` 只認單獨一條的 `reboot`、`systemctl reboot`、`shutdown -r` 與 `echo b > /proc/sysrq-trigger`，不猜 shell 串接。`command.submit` 的選填布林 `expect_reboot`（CLI：`cmd submit --expect-reboot`）讓呼叫端明示「這條命令會重開機」，不管命令文字一律走 `_handle_reboot_command`（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 `_spawn_reboot_recovery` 等板子回 `READY`）。
+
+- 傳遞：CLI → RPC → service submit-time gate → arbiter queue → `execute_command`；未帶旗標時 arbiter callback 維持既有七參數，只有帶旗標才多傳 `expect_reboot=True` keyword。命令記錄與 `command.get` 一律回報 `expect_reboot`；帶旗標時 submit 回應回聲 `expect_reboot: true`，執行前於 WAL 寫 `META event=command_expect_reboot`。
+- 驗證：只接受 JSON 布林（`null` 視同 `false`），其餘型別 `INVALID_EXPECT_REBOOT`；`mode=interactive` 帶旗標 `EXPECT_REBOOT_MODE_UNSUPPORTED`。兩者在 CLI、RPC、arbiter、`execute_command` 皆於排隊／TX 前拒絕。
+- 互動：同時帶 `completion_regex` 時 reboot 優先（regex 通過驗證但不使用）；旗標不繞過 §9.3 的 `AUTOBOOT_QUIET`／`READY_UNCONFIRMED` gate。
+- 串接命令的 prompt 等待：單獨 reboot 等 `min(timeout_s, 2.0)`；帶旗標且 `_is_reboot_command` 認不出的命令（`A && reboot`）等 `max(timeout_s, expected_duration_s)`。2s 內（或等待期間內）prompt 回來＝非同步 reboot 的 prompt 回顯，與單獨 reboot 相同處理（`clear_boot_quiet()`、不 `confirm_ready()`、回 `ok`／`partial=false`）；沒等到才走 recovery（`status=recovering`、`recovery_action=EXPECT_REBOOT`）。若串接命令仍只等 2s，前段超過 2s 會誤入 recovery 分支，prompt 隨後回來被 recovery 迴圈當成開機完成而過早 `confirm_ready()`（stale-READY，#162）。
+- 非致命提示：未帶旗標、非 `interactive`、命令在 `&&`／`||`／`;`／`&` 之後含 `_is_reboot_command` 認得的區段時，submit 回應多一則 `CHAINED_REBOOT_WARNING`（`warning` 維持單一欄位、`CMD_LENGTH_WARNING` 優先，`warnings` 列出全部）；不改變執行。
+
+詳見 [`docs/expect-reboot.md`](./expect-reboot.md)。
 
 ## 7. 呼叫流程圖
 
@@ -508,17 +521,17 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 
 **觸發（arm）**：
 
-1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。
+1. `_handle_reboot_command` 收到 reboot 類指令**當下**（送出命令前）即設定，不等 banner。命令文字認不出的串接命令可用 `--expect-reboot` 明示走此路徑（§6.6）。
 2. RX 路徑（`_on_bridge_rx`）偵測到 boot banner——以 `BOOT_BANNER_PATTERNS`（`U-Boot`、`Hit any key to stop autoboot`；大小寫敏感 substring）比對 rolling tail（`BOOT_BANNER_TAIL_CHARS=256` 字元，跨 chunk 邊界）。倒數每 tick 會延長視窗。此路徑涵蓋 DUT 自行重開／斷電重開。
 
 **效果**：視窗內（`BOOT_QUIET_WINDOW_S=180s`）gate 所有 `source=system` 的自動 probe TX——這裡的「自動」指呼叫端不需人為觸發 UART 寫入本身，**手動觸發的 RPC（`session attach`／`session recover`）一樣受 gate**，因為它們最終都會走到下列同一批共用 probe/按鍵函式（#130 review 收斂前，這幾條路徑各自遺漏過 gate，現已逐一補上）：
 
 - reboot recovery 迴圈（`_spawn_reboot_recovery`）：純被動等 RX；deadline 延伸至「視窗結束 + 一輪 `hard_timeout_s`」，上限為「一個完整視窗 + 一輪 probe 預算」（防 boot-loop 板反覆吐 banner 使執行緒無限延命）。
-- readiness reprobe（`_prepare_reprobe_locked` 與 worker 寫入前的最終驗證 `_reprobe_target_still_valid_locked`）：不 fire、不累加 attempts、不排 backoff。（#162：兩函式另放行「READY＋`ready_reconfirm_pending` 且 quiet 已結束」的**確認 probe**——沿用既有 RX-idle／backoff／human-active／single-flight 守衛，見下方 #162 段。）
+- readiness reprobe（`_prepare_reprobe_locked` 與 worker 寫入前的最終驗證 `_reprobe_target_still_valid_locked`）：不 fire、不累加 attempts、不排 backoff。（#162：兩函式另放行「READY＋`ready_reconfirm_pending` 且 quiet 已結束」的**確認 probe**——沿用既有 RX-idle／backoff／human-active／single-flight 守衛，見下方 #162 段。非同步 reboot 後另受「開機證據等待」約束：banner 出現（或寬限過期）前同樣不 fire、不累加 attempts、不排 backoff，見下方「#162 非同步 reboot 的開機證據等待」段。）
 - attach probe（`_probe_existing_bridge`）：`session attach`（`attach_session` 的 ATTACHED 分支、無 human lease 時）與 `session recover`（`recover_session` 的 ATTACHED 分支重探）共用同一個 probe 入口，於此單點 gate 同時涵蓋兩條呼叫路徑；掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`。
 - 初次 attach（`_attach_by_id`）：掛 bridge 純收 RX，以 `PROMPT_UNAVAILABLE` 停在 `ATTACHED`，視窗解除後由 reprobe／recovery 接手（涵蓋 reboot 期間序列裝置 re-enumerate 的 re-attach）。
 - 命令逾時後的強制按鍵迴圈（`_recover_after_failure` 的 CTRL_C/CTRL_D）：跳過強制按鍵，直接落到既有 timeout 收尾（session 轉 `ATTACHED`）——這是最容易觸發的路徑，agent 正常送命令途中 target 自發重開機、逾時即進入本函式。
-- `session self-test`（`_self_test_impl` 的 READY 分支 nonce probe）：回報 `classification: "AUTOBOOT_QUIET"`，不送 probe。
+- `session self-test`（`_self_test_impl` 的 READY 分支 nonce probe）：回報 `classification: "AUTOBOOT_QUIET"`，不送 probe（非同步 reboot 後的開機證據等待期間亦同）。
 
 **解除（clear）**：RX 匹配該 session 的 `login_regex` / `prompt_regex`，或 profile 選配的 `boot_done_regex`（開機完成訊號，例：askconsole 的「`Please press Enter to activate this console`」）即刻解除並恢復探測；否則過期自動解除。例外：若命中的尾行本身就是該 session `bootloader_prompts` 名單中的一員（如 U-Boot 自己的 `=> `），視為仍在 bootloader、非開機完成，本輪不解除——寬鬆撰寫的 `prompt_regex`（如 brcm-template `(?m)[>#]\s*$`）會誤配 bootloader 自身 prompt，若不先排除會在板子正卡 bootloader 的最危險時刻誤解除（`_update_boot_quiet_locked` 於解除前先呼叫 `_matches_any_bootloader_prompt`）。（#162：解除／過期只結束 **TX 靜默**維度；agent 顯式命令 gate 的解除另綁 READY 再確認，見下方 #162 段。）
 
@@ -533,6 +546,8 @@ DUT 重開機時，U-Boot autoboot 倒數窗（`Hit any key to stop autoboot`）
 **#162 有界化與失敗終態（回歸修）**：`ready_reconfirm_pending` 必須有界——初版只有一個 clearer（`confirm_ready()`，且要求對 UART probe 成功），只要確認 probe 的任一守衛長期不成立（`reprobe_exhausted` latch 僅於 READY **轉移**點解開，而「已經是 READY」的 session 不會再轉移；RX 洪水下 `_rx_idle_enough` 永不成立；human console 持續活躍；RX 週期性出現字面 `U-Boot` 重臂 quiet），pending 就永久 `true`，`AUTOBOOT_QUIET`（可重試）遂成為**永遠不可能成功的可重試錯誤**。修法：`arm_boot_quiet()` 於 pending 由 `false` 翻 `true` 的**那一刻**起算 `READY_RECONFIRM_MAX_S`（300s＝180s quiet＋120s）deadline 與 `READY_RECONFIRM_MAX_ATTEMPTS`（5）次數上限，**重臂不延長 deadline**；新增 pending 的第二個也是最後一個 clearer `expire_ready_reconfirm(now, *, force=False)`，逾越即置 `ready_reconfirm_failed=True`。終態後四個 gate（`execute_command`／`file_push`／`file_pull`／`service._resolve_session_id`）改回**不可重試**的 `READY_UNCONFIRMED`（不帶 `retry_after_s`、帶 `recommended_action="self_test"`）。`_prepare_reprobe_locked` 的 `reprobe_exhausted` 早退在 READY 再確認分支不再靜默凍結 gate，改為 `force` 落終態。
 
 **#162 autoboot 保護補強（回歸修，實機事故 2026-07-31）**：(1) `_recover_after_failure` 的 CTRL_C/CTRL_D gate 改為**逐 byte 重驗**——兩次寫入間隔 `min(timeout_s, 2.0)`，恰好落在 U-Boot autoboot 3s 倒數窗內，只在迴圈外評估一次會讓 CTRL-D 在 quiet armed 之後仍寫出（WAL 物證：`\x03`@23:39:11.414 → banner arm@23:39:11.948 → `\x04`@23:39:13.424 → `=> `）；(2) `_update_boot_quiet_locked` 的 banner 比對窗改為「舊 tail 尾段＋**整個** chunk」，只有保存才截 `BOOT_BANNER_TAIL_CHARS`——舊式 `(tail+chunk)[-256:]` 會截掉大 chunk 的**開頭**，實機兩個含 `U-Boot` 的 banner chunk（345/354 字元）都因此漏判；(3) `_handle_reboot_command` 的 2s prompt-return **移出** READY 確認點清單、改回只 `clear_boot_quiet()`——prpl/OpenWrt 的 `reboot` 非同步、shell 於 11ms 內重印 prompt 但板子確實在重開，該回顯不是 READY 實證。
+
+**#162 非同步 reboot 的開機證據等待（stale-READY 修正）**：`_handle_reboot_command` 在 2s 內 prompt 回來（prpl/OpenWrt 非同步 reboot）時只 `clear_boot_quiet()`、保留 `ready_reconfirm_pending`，但這只擋住「板子還沒重開就放行」的一半：quiet 一清，readiness reprobe 在 RX 閒置 `REPROBE_RX_IDLE_S`（3s）後就送 `\n`＋`echo __READY__<nonce>`，此時板子**還沒真正開始關機**，舊 shell 照常回應 nonce，`confirm_ready()` 清掉 pending → session 變 stale-READY，agent 命令通過 gate、落進關機中的系統（讀到舊 boot_id 或被重開打斷），之後 banner 才重臂 quiet。實機（IB8，prplOS／BusyBox，WAL 8 次單獨 `reboot`）：nonce 在 reboot 後 +3.1～+6.3s 被舊 shell 應答，`SMCOS: rebooting` 在 +8.9～+17.8s，`U-Boot` banner 在 +16.9～+25.9s（`Hit any key` +20.7～+29.7s）。修法：判定為非同步 reboot 的那一刻（`SessionRuntime.begin_boot_evidence_wait()`，寬限 `BOOT_EVIDENCE_GRACE_S=60s`）起，**確認 probe 不送、READY 不確認**，直到 (a) RX 出現 boot banner（`_update_boot_quiet_locked` 偵測到 `BOOT_BANNER_PATTERNS` → `note_boot_evidence()`，開機證據只認既有 banner 判定、不寫死平台字串），或 (b) 寬限過期——超過寬限仍沒看到 banner 視為板子其實沒重開（或開機不印 banner），照常確認，不卡死。等待期間 agent 顯式命令維持可重試的 `AUTOBOOT_QUIET`（pending 撐住 gate，`retry_after_s` 為固定 `READY_RECONFIRM_RETRY_S`）；擋的是確認 probe 的送出，涵蓋共用入口：`_prepare_reprobe_locked`／`_reprobe_target_still_valid_locked`（不累加 attempts、不排 backoff）、`_probe_existing_bridge`（attach／recover／reprobe 共用）、`_self_test_impl` READY 分支（回 `classification: "AUTOBOOT_QUIET"`）。寬限自 prompt 回來那一刻起算，所以串接命令（`--expect-reboot` 的 `A && reboot`）的 A 執行時間不計入；判斷掛在 `_handle_reboot_command` 而非命令文字，`_is_reboot_command` 猜到的單獨 reboot 與明示的串接 reboot 走同一條路。有界性不變：寬限不延長 `ready_reconfirm_deadline`（`READY_RECONFIRM_MAX_S=300s` 仍自 arm 起算），pending 逾時／逾次照樣落 `READY_UNCONFIRMED`，並同步清除證據等待，讓 operator 的 `session self-test` 不被擋；下一次 reboot 命令、`confirm_ready()`、bridge detach 也都會清除它。不受影響的路徑：自發重開機（daemon 沒送 reboot，從不起等待）、2s 內沒 prompt 的 recovery 分支與 human 來源（不起等待）、非 reboot 命令。代價：2s 內 prompt 回來但其實沒重開的命令（例如 reboot 被拒）最多多等 `BOOT_EVIDENCE_GRACE_S` 才恢復 agent 命令。觀測：session 公開欄位 `boot_evidence_wait_remaining_s`（剩餘寬限秒數；`null`＝未等待／已見 banner／已過期）。數值依據：寬限 60s ≈ 最慢觀測 banner（25.9s）的 2.3 倍，且小於 `READY_RECONFIRM_MAX_S`。`console_unlock_env` profile 的 quiet 本來就不擋 probe，但舊 root shell 的 nonce 應答同樣不是實證，故一體適用本等待。
 
 **#162 bootloader 卡死的可診斷終態**：readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 時，`_finish_probe_reprobe` 落`last_error=BOOTLOADER_STUCK`（附 `last_error_detail=matched_prompt=<pattern>`）＋`reprobe_exhausted=True`＋`expire_ready_reconfirm(force=True)`，取代舊版「第 10 次靜默 exhausted、state/last_error 不變、不發事件」；`self_test`／`recover_session` 據此回 `classification="BOOTLOADER"` ＋ `recommended_action="recover_interactive"`。比對樣式優先 `profile.bootloader_prompts`，缺配置時退回 `UBOOT_FALLBACK_PROMPTS`（`^=> $`／`^U-Boot> $`／`^CFE> $`），使線上 profile 漂移下偵測仍成立；漂移由 `serialwrap doctor` 的 advisory 檢查 `profile_bootloader_prompts` 指出。READY 再確認 probe 於寫 bytes 前亦先驗 bootloader 證據，命中即不送、直接落終態。
 
@@ -593,7 +608,7 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 - background mode：`command.result_tail`（含 `from_chunk` / `next_chunk` 分頁）
 - interactive mode：`interactive_status.screen`
 
-line mode 的 `stdout` 會剝掉命令本身的回顯。回顯打到終端寬度（serial console 常見 80 欄）時 shell 會把它折成多行（BusyBox ash 插入 `\r\r\n`、bash readline 補 `" \r"`），此時把開頭幾行接回、去空白後與完整命令比對再剝；命令字樣必須從第一行開始（容許前面殘留 prompt），單行回顯已剝掉時不再重複比對，避免把恰好拼得出命令的輸出誤剝。
+line mode 的 `stdout` 會剝掉命令本身的回顯。回顯打到終端寬度（serial console 常見 80 欄）時 shell 會把它折成多行（BusyBox ash 插入 `\r\r\n`、bash readline 補 `" \r"`），此時把開頭幾行接回，只接受「命令原文加上折行插入的字元」：命令本身的每個字元（含空白）都必須依序出現，只有換行或多出的一個空白可以跳過，插入點彼此至少相隔 20 個字元，回顯須從第一行開始（容許前面殘留 prompt）並結束在行尾；單行回顯已剝掉時不再重複比對。因此 echo 關閉時，輸出剛好等於命令去掉空白（例如 `cat file` 印出 `catfile`）不會被誤當回顯。
 
 background mode 的 `command.result_tail` 在 capture 尚未建立時，會回傳 `from_seq=0, last_seq=0` sentinel（詳見 6.2 fallback 說明）。
 
@@ -627,6 +642,56 @@ background mode 的 `command.result_tail` 在 capture 尚未建立時，會回�
 - Target 必須有 `base64`、`md5sum` 或 `sha256sum`
 
 詳見設計文件：[`docs/design-file-transfer.md`](./design-file-transfer.md)。
+
+### 8.7 程式碼指紋與升級後 daemon 換新碼（build fingerprint）
+
+**根因**：版本字串只來自 `VERSION`，release、分支 build、main 全印同一個 `0.3.2`；而
+`pipx install --force` 之後 `serialwrap setup` 的同模式刷新只重寫 unit／`daemon-reload`／
+`enable`、從不 `start`，模式轉換送的 `systemctl start` 在服務已 active 時也是 no-op——
+正在跑的 daemon 靜默沿用舊碼，外面看不出來，也無從用版本比對抓到。
+
+**指紋定義**（`sw_core/version.py` 的 `compute_code_fingerprint()`）：對 `sw_core/**/*.py`
+（含 `event_engine`、`assets/__init__.py`）依相對路徑排序後，逐檔把「相對路徑、長度、內容」
+餵進 sha256，取前 12 碼十六進位。不含 `sw_core/assets/` 下的 skill／profile／shell wrapper
+（改文件或範本不需重啟 daemon，納入只會製造假警報）、不含 `__pycache__`、不含 `VERSION`
+（版本另有比對）。wheel 安裝與 git checkout 讀到相同的 `.py` 位元組，所以同一個 commit 在兩處
+指紋一致。找不到任何 `.py`（PyInstaller 凍結包）或有檔案讀不到時為 `None`，一律視為「無從
+比對」而靜默略過、不當作不一致。
+
+**三個 surface**：
+
+- **daemon**：`SerialwrapService` 建立時算一次、常駐（代表「daemon 啟動當下載入的程式碼」）。
+  `health.status`（`daemon status`）回 `code_fingerprint` 與 `code_path`（daemon 載入的
+  `sw_core` 目錄）；`rpc()` wrapper 對**每個** RPC 回應 `setdefault` 帶 `code_fingerprint`
+  （與 #154 的 `version` 同機制，不逐一 handler 加），算不出時略過該欄位。
+- **CLI `--version`**：印 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`；只在被問 `--version` 時才
+  算（argparse 自訂 action，一般子命令不為它多讀一次原始碼）。
+- **client↔daemon 比對**（`cli._warn_version_mismatch`）：版本字串不同 → 既有的版本警告
+  （只印這一行）；版本相同但 `code_fingerprint` 不同 → stderr 一行
+  `serialwrap: client 程式碼 X 與 daemon 程式碼 Y 不一致…請執行 serialwrap service restart`。
+  只寫 stderr、exit code 與 stdout JSON 不變。daemon 回應無此欄位（舊 build）或 client 算不出
+  指紋時靜默。
+- **`doctor` 的 `daemon_code_current`**（advisory）：以 `health.ping` 取 daemon 指紋與本行程
+  比對；daemon 沒回報 `code_fingerprint` 視為舊 build（不一致）；daemon 連不上或本行程算不出
+  指紋 → informational ok。
+
+**`serialwrap setup` 的行為**（`cli._run_setup` + `setup_cmd.reconcile(restart_daemon=…)`）：
+以既有的 `health.ping` 探測回應取 daemon 指紋（不多一次 RPC），與本行程（＝剛安裝的版本）比對：
+
+| 情境 | 動作 |
+|---|---|
+| daemon 連不上 | 同過去，輸出不含 `daemon_code` |
+| 指紋相同 | 不重啟（`daemon_code.action = "none"`，連 `is-active` 都不查） |
+| 不同／daemon 不回報指紋，同模式 systemd-user／systemd-system，服務 `is-active` | 刷新 unit 後 `systemctl [--user] restart serialwrap`（system scope 為 `sudo systemctl restart`，未帶 `--with-sudo` 時只列入 `pending_sudo`），再輪詢 `health.ping` 核對指紋，`daemon_code.after` 為 `match`／`mismatch`／`unreachable` |
+| 同上但服務非 active（daemon 是手動 start 的） | 不動，`action = "service_inactive"` 並附提示 |
+| 模式轉換 | 轉換本來就停舊起新，不另補 restart（`action = "mode_transition"`） |
+| on-demand | 不自動停 daemon，`action = "manual_restart"` 並提示 `daemon stop`／`daemon start` |
+| flash 進行中（含 `--force`） | 不重啟，`action = "skipped_flashing"` |
+| `--no-restart` | 不重啟，`action = "skipped_no_restart_flag"` |
+
+`daemon_code.after = "mismatch"` 代表重啟了但 unit 的 ExecStart 指向的不是這份安裝（例如從 checkout
+跑 `./serialwrap setup`），setup 會在 stderr 明講，不回報成功。注意此處與 `ensure_wsl_systemd`
+回傳的 `needs_restart` 無關——那個是「須在 Windows 端 `wsl --shutdown` 讓 systemd 生效」。
 
 ## 11. Public Interface
 

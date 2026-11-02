@@ -497,6 +497,75 @@ def _start_new(
     # target_mode == "on-demand"：無需啟動，daemon 依需求自生。
 
 
+# ═════════════ daemon 載入的程式碼是否過期（build fingerprint）═════════════
+#
+# 問題：``pipx install --force`` 換掉磁碟上的程式碼後，``serialwrap setup`` 的同模式
+# 刷新只重寫 unit／daemon-reload／enable，從不 start；轉換路徑送的 ``systemctl start``
+# 在服務已 active 時也是 no-op。結果是正在跑的 daemon 靜默沿用舊碼，且版本字串不變
+# （0.3.2 → 0.3.2）所以版本比對也看不出來。這裡以程式碼指紋（sw_core/version.py）判定，
+# 判定為舊碼且服務確實由 systemd 管理時，在同模式刷新末端補一個 restart。
+#
+# 注意：與 ``ensure_wsl_systemd`` 回傳的 ``needs_restart`` 無關——那個是「須在 Windows 端
+# ``wsl --shutdown`` 讓 systemd 生效」，這裡是「重啟 serialwrap 服務讓 daemon 換新碼」。
+
+
+def daemon_code_assessment(
+    *,
+    daemon_running: bool,
+    daemon_fingerprint: str | None,
+    installed_fingerprint: str | None,
+) -> dict:
+    """比對正在跑的 daemon 與本行程（＝剛安裝的版本）的程式碼指紋（純函式）。
+
+    Returns:
+        ``{"checked", "stale", "reason", "daemon", "installed"}``：
+
+        - daemon 連不上 → ``checked=False``（維持 setup 既有行為，不做任何判斷）。
+        - 本行程算不出指紋（凍結包）→ ``checked=False``。
+        - daemon 可達但回應沒有 ``code_fingerprint`` → ``stale=True``，
+          ``reason="daemon_no_fingerprint"``：本版本的 daemon 一定會回報，不回報的必然
+          是更舊的 build（升級到第一個帶指紋的版本時，正是這種情況）。
+        - 兩者不同 → ``stale=True``，``reason="fingerprint_mismatch"``。
+    """
+    state = {
+        "checked": False,
+        "stale": False,
+        "reason": None,
+        "daemon": daemon_fingerprint or None,
+        "installed": installed_fingerprint,
+    }
+    if not daemon_running:
+        state["reason"] = "daemon_unreachable"
+        return state
+    if not installed_fingerprint:
+        state["reason"] = "installed_fingerprint_unavailable"
+        return state
+    state["checked"] = True
+    if not daemon_fingerprint:
+        state.update(stale=True, reason="daemon_no_fingerprint")
+    elif daemon_fingerprint != installed_fingerprint:
+        state.update(stale=True, reason="fingerprint_mismatch")
+    else:
+        state["reason"] = "match"
+    return state
+
+
+def service_is_active(fx, mode: str) -> bool:
+    """systemd 服務目前是否 active（唯讀、免 sudo；非 systemd 模式一律 False）。
+
+    ``is-active`` 的 rc 為 0 且 stdout 為 ``active`` 才算；``activating``／``failed``
+    等狀態都不算——對還沒起來或壞掉的服務補 restart 不是 setup 該做的事。
+    """
+    if mode == "systemd-user":
+        cmd = ["systemctl", "--user", "is-active", "serialwrap"]
+    elif mode == "systemd-system":
+        cmd = ["systemctl", "is-active", "serialwrap"]
+    else:
+        return False
+    rc, out, _err = fx.run(cmd)
+    return rc == 0 and out.strip() == "active"
+
+
 def reconcile(
     *,
     old_mode,
@@ -509,6 +578,7 @@ def reconcile(
     force: bool = False,
     socket_path=None,
     config_path=None,
+    restart_daemon: bool = False,
 ) -> dict:
     """決定並套用監管模式；模式改變時以「先停舊、再起新」嚴格順序轉換。
 
@@ -530,6 +600,12 @@ def reconcile(
         socket_path:    寫入 config 的有效 socket 路徑（可為 ``None``）。
         config_path:    config.yaml 路徑；``None`` 時用
                         ``home/.config/serialwrap/config.yaml``。
+        restart_daemon: 同模式（systemd-user／systemd-system）刷新末端補一個
+                        ``systemctl restart serialwrap``，讓已在跑的 daemon 載入剛安裝
+                        的程式碼。呼叫端須已確認服務 active 且 daemon 為舊碼（見
+                        :func:`daemon_code_assessment`、:func:`service_is_active`）。
+                        預設 ``False`` ＝ 維持「冪等刷新、不打斷正在跑的 daemon」。
+                        模式轉換路徑本來就會停舊起新，不受此旗標影響。
 
     Returns:
         摘要字典::
@@ -540,6 +616,10 @@ def reconcile(
                 "ran": [已實際執行的指令字串清單],
                 "pending_sudo": [未授權待執行的特權指令清單],
             }
+
+        帶 ``restart_daemon=True`` 時另有 ``"daemon_restart"``：``"ran"``（restart 指令
+        成功）、``"failed"``（rc 非 0）、``"pending_sudo"``（system scope 未帶
+        ``with_sudo``，指令已列入 ``pending_sudo``）、``None``（此路徑不適用，如模式轉換）。
 
     Raises:
         FlashingBusy: ``any_flashing`` 為真且未帶 ``force``。
@@ -567,7 +647,10 @@ def reconcile(
             pending.append(["sudo", "systemctl", "disable", "serialwrap"])
         if _system_target:
             pending.extend(_system_install_cmds(home, include_start=(old_mode != target_mode)))
-        return {
+        restart_pending = restart_daemon and _system_target and old_mode == target_mode
+        if restart_pending:
+            pending.append(["sudo", "systemctl", "restart", "serialwrap"])
+        early: dict = {
             "mode": old_mode,            # 實際生效模式未變（config 不寫）
             "requested_mode": target_mode,
             "transitioned": False,
@@ -575,9 +658,13 @@ def reconcile(
             "ran": [],
             "pending_sudo": pending,
         }
+        if restart_daemon:
+            early["daemon_restart"] = "pending_sudo" if restart_pending else None
+        return early
 
     # ── 情境 A：同模式 → 冪等刷新（不 stop、不啟新、不打斷正在跑的 daemon）──
     if target_mode == old_mode:
+        daemon_restart: str | None = None
         if target_mode == "systemd-user":
             # 只重寫 unit + reload + enable，不 start churn。
             unit_path = home / _USER_UNIT_REL
@@ -585,23 +672,36 @@ def reconcile(
             unit_path.write_text(render_user_unit(_USER_EXEC_START), encoding="utf-8")
             fx.run(["systemctl", "--user", "daemon-reload"])
             fx.run(["systemctl", "--user", "enable", "serialwrap"])
+            if restart_daemon:
+                # 呼叫端已確認 daemon 載入的是舊碼：unit 刷新完才 restart，新 unit 一併生效。
+                rc, _out, _err = fx.run(["systemctl", "--user", "restart", "serialwrap"])
+                daemon_restart = "ran" if rc == 0 else "failed"
         elif target_mode == "systemd-system":
             # 同模式刷新：不含 start（已在跑）。未授權路徑已於上游早退。
             cmds = _system_install_cmds(home, include_start=False)
             if with_sudo:
                 for c in cmds:
                     fx.run(c)
+                if restart_daemon:
+                    rc, _out, _err = fx.run(["sudo", "systemctl", "restart", "serialwrap"])
+                    daemon_restart = "ran" if rc == 0 else "failed"
             else:
                 pending_sudo.extend(cmds)
-        # on-demand 同模式：無 unit 可刷新，僅寫 config。
+                if restart_daemon:
+                    pending_sudo.append(["sudo", "systemctl", "restart", "serialwrap"])
+                    daemon_restart = "pending_sudo"
+        # on-demand 同模式：無 unit 可刷新，僅寫 config（沒有服務可 restart）。
         cfg.set_mode(target_mode, socket_path=socket_path)
-        return {
+        refreshed: dict = {
             "mode": target_mode,
             "transitioned": False,
             "applied": True,
             "ran": [list(c) for c in getattr(fx, "calls", [])],
             "pending_sudo": pending_sudo,
         }
+        if restart_daemon:
+            refreshed["daemon_restart"] = daemon_restart
+        return refreshed
 
     # ── 情境 B：模式改變 → 嚴格順序轉換 ────────────────────────────────────
     # a. 先停舊（釋放 tty FD）——務必先於起新，避免 two-reader。
@@ -635,10 +735,13 @@ def reconcile(
     # d. 寫 config（單一事實來源）。此處必為已實際套用（system-no-sudo 已於上游早退）。
     cfg.set_mode(target_mode, socket_path=socket_path)
 
-    return {
+    transitioned: dict = {
         "mode": target_mode,
         "transitioned": True,
         "applied": True,
         "ran": [list(c) for c in getattr(fx, "calls", [])],
         "pending_sudo": pending_sudo,
     }
+    if restart_daemon:
+        transitioned["daemon_restart"] = None  # 轉換本身已停舊起新，不另補 restart
+    return transitioned

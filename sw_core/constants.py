@@ -166,6 +166,21 @@ READY_RECONFIRM_MAX_ATTEMPTS: int = 5
 與 ``REPROBE_MAX_ATTEMPTS``（10，ATTACHED readiness 重探）刻意分離：READY 再確認
 是「已 READY 的 session 補一次實證」，連 5 次拿不到 prompt 即應交回 operator，
 不必耗完整個 ATTACHED 重探預算。"""
+BOOT_EVIDENCE_GRACE_S: float = 60.0
+"""非同步 reboot 後「等開機證據才接受 READY 再確認」的寬限秒數（#162 延伸）。
+
+reboot 命令送出後 2s 內 prompt 就回來＝prpl/OpenWrt 的非同步 reboot：板子其實剛要開始
+關機，舊 shell 還活著，會照常回應確認 probe 的 nonce。這段期間 nonce 回應不是 READY 實證，
+``confirm_ready()`` 的 probe 必須等到 boot banner（``BOOT_BANNER_PATTERNS``）出現才放行。
+
+超過本寬限仍沒看到 banner → 視為板子其實沒重開（或開機不印 banner），照常允許確認，
+不讓 gate 卡死。寬限自「prompt 回來、判定為非同步 reboot」那一刻起算（串接命令
+``A && reboot`` 的 A 執行時間不計入）。
+
+數值依據：IB8（prplOS，shutdown 慢）8 次單獨 ``reboot`` 的 WAL，``U-Boot`` banner 出現在
+reboot TX 之後 16.9–25.9s（``Hit any key`` 20.7–29.7s）；取 60s ≈ 最慢觀測值的 2.3 倍。
+上限必須小於 ``READY_RECONFIRM_MAX_S``（300s，自 arm 起算、本寬限不延長它）。代價：
+「其實沒重開」的命令（例如 reboot 被拒）最多多等本秒數才恢復 agent 命令。"""
 ERROR_READY_UNCONFIRMED: str = "READY_UNCONFIRMED"
 """READY 再確認落終態的**不可重試**錯誤碼（#162 有界化）。
 

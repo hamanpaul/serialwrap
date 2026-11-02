@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import base64
 import random
 import time
 
@@ -14,6 +15,7 @@ from realhw.harness import CaseResult
 
 from ..harness import Case, register
 from .. import guards
+from .f09_brcm_reboot_login import _read_boot_id
 
 
 def _case(id, title, issues, hints=(), requires=(), destructive=True):
@@ -158,6 +160,122 @@ def f9_quiet_window_agent_passthrough(ctx):
                           evidence={"after-boot-echo": follow_path})
     finally:
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
+
+
+@_case(
+    "f9-reboot-stale-ready",
+    "單獨 reboot 後，banner 前舊 shell 應答 nonce 不得讓 READY 提早確認（stale-READY）",
+    issues=("#162",),
+    hints=(
+        "prplOS／BusyBox 的 `reboot` 是非同步：shell 立刻重印 prompt，但 shutdown 很慢（IB8 實測 U-Boot"
+        " banner 在 reboot 後 17～26 秒）。舊行為在 +3～6 秒就送確認 probe，舊 shell 照常回應 nonce → 提早"
+        "確認 READY，agent 命令落進關機中的系統、讀到舊 boot_id。",
+        "oracle：reboot 後持續送 `cat /proc/sys/kernel/random/boot_id`——banner 前必須被擋（AUTOBOOT_QUIET）；"
+        "任何一次讀到『reboot 前的 boot_id』＝FAIL（stale-READY，或板子根本沒重開）；最終 boot_id 改變並回（真）READY。",
+        "此 case 寫成後尚未在真板跑過；上板前需在 allow_destructive 的 bench 執行並確認結果。",
+    ),
+)
+def f9_reboot_stale_ready(ctx):
+    """#162 延伸：非同步 reboot 後，舊 shell 在 banner 前應答確認 probe 的 nonce，不得讓 READY 提早確認。
+
+    當初的錯誤行為＝reboot 送出後 3～4 秒（RX 閒置 `REPROBE_RX_IDLE_S`）daemon 就送
+    `\\n`＋`echo __READY__<nonce>`，關機中的舊 shell 回應 → `confirm_ready()` 清掉 pending →
+    session 在板子真正重開前就是 stale-READY，隨後的 agent 命令通過 gate、讀到舊 boot_id。
+    修正後確認 probe 要等 RX 出現 boot banner 才送（寬限內沒有 banner 則照常確認）。
+
+    判讀：reboot 之後以 1 秒週期送 boot_id 讀取命令——
+    - 被 `AUTOBOOT_QUIET`／`READY_UNCONFIRMED` 擋下：預期（零 UART 副作用）；
+    - 被接受且讀到 reboot 前的 boot_id（或通過 gate 卻沒讀到）：FAIL（stale-READY）；
+    - 讀到新的 boot_id：板子已重開並回（真）READY，PASS。
+    """
+    com = ctx.cfg["boards"][0]["com"]
+    boot_wait_s = float(ctx.cfg["timeouts"]["boot_wait_s"])
+    if ctx.sw.session(com).get("state") != "READY":
+        return CaseResult("SKIP", reason=f"{com} 尚非 READY", category="environment", reason_code="board_not_ready")
+    before, before_cmd = _read_boot_id(ctx, com)
+    if not before:
+        return CaseResult("SKIP", reason=f"無法取得 reboot 前 boot ID（{before_cmd}）",
+                          category="environment", reason_code="boot_id_unavailable")
+    submitted = False
+    try:
+        t0 = time.monotonic()
+        reboot_resp = ctx.sw.submit_and_wait(com, "reboot", cmd_timeout=8.0)
+        submitted = True
+        ctx.note("reboot-submit.json", str(reboot_resp))
+
+        timeline: list[str] = []
+        blocked = 0
+        new_boot_id: str | None = None
+        stale_at: float | None = None
+        stale_info = ""
+        while time.monotonic() - t0 < boot_wait_s:
+            current, info = _read_boot_id(ctx, com)
+            elapsed = time.monotonic() - t0
+            accepted = not info.startswith("submit:")  # _read_boot_id：被 gate 拒絕時 info 以 "submit:" 開頭
+            if current is None and not accepted:
+                timeline.append(f"+{elapsed:.1f}s rejected {info}")
+                if info.startswith("submit:AUTOBOOT_QUIET"):
+                    blocked += 1
+                elif info.startswith("submit:READY_UNCONFIRMED"):
+                    break  # 有界化終態，等下去也不會好
+            elif current is None:
+                # 命令通過 gate 卻沒讀到 boot_id：被關機中的系統吃掉（逾時／被打斷）。
+                timeline.append(f"+{elapsed:.1f}s accepted_but_lost {info}")
+                stale_at, stale_info = elapsed, f"命令通過 gate 但沒有讀到 boot_id（{info}）"
+                break
+            elif current == before:
+                timeline.append(f"+{elapsed:.1f}s accepted old_boot_id {info}")
+                stale_at, stale_info = elapsed, "讀到 reboot 前的 boot_id"
+                break
+            else:
+                timeline.append(f"+{elapsed:.1f}s accepted new_boot_id {info}")
+                new_boot_id = current
+                break
+            time.sleep(1.0)
+        timeline_path = ctx.note("stale-ready-timeline.txt", "\n".join(timeline))
+
+        if stale_at is not None:
+            return CaseResult(
+                "FAIL",
+                reason=f"reboot 後 +{stale_at:.1f}s agent 命令在 banner 前被放行：{stale_info}"
+                "（stale-READY：舊 shell 應答 nonce 讓 READY 提早確認；或板子根本沒重開）",
+                category="test", reason_code="stale_ready_old_boot_id",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        if new_boot_id is None:
+            return CaseResult(
+                "FAIL",
+                reason=f"{boot_wait_s:.0f}s 內沒有讀到新的 boot_id（被擋 {blocked} 次）：未回可下命令的 READY",
+                category="test", reason_code="boot_not_ready",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        if blocked == 0:
+            # 第一個被接受的命令就是新 boot_id：沒有觀測到 banner 前的受測窗口，gate 沒被驗到。
+            return CaseResult(
+                "SKIP",
+                reason="未觀測到 banner 前被 AUTOBOOT_QUIET 擋下的命令（受測窗口未現形），無法驗證 stale-READY 防線",
+                category="environment", reason_code="stale_window_not_observed",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        cleared, last_sess = _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
+        ctx.note("quiet-cleared.json", str({"cleared": cleared, "session": last_sess}))
+        if not cleared:
+            return CaseResult(
+                "FAIL",
+                reason=f"讀到新 boot_id 後 {boot_wait_s:.0f}s 內 session 未回可下命令的 READY"
+                f"（state={last_sess.get('state')!r}）",
+                category="test", reason_code="boot_not_ready",
+                evidence={"stale-ready-timeline": timeline_path},
+            )
+        return CaseResult(
+            "PASS",
+            reason=f"banner 前 agent 命令被擋 {blocked} 次（零 UART 副作用），重開後 boot_id 改變並回（真）READY",
+            evidence={"stale-ready-timeline": timeline_path},
+        )
+    finally:
+        if submitted:
+            guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
+            _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
 
 
 @_case(
@@ -487,3 +605,117 @@ def f9_spontaneous_reboot_agent_gated(ctx):
         ctx.tmux.kill(ses)
         guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
         _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
+
+
+def _tx_control_bytes(ctx, com: str, start_seq: int) -> tuple[list[int], str | None]:
+    """掃 start_seq 之後的 WAL，回傳 TX 為單獨 Ctrl-C／Ctrl-D 的 seq（只留序號，不存 RX 原文）。"""
+    hits: list[int] = []
+    cursor = start_seq
+    for _ in range(40):
+        page = ctx.sw.run("log", "tail-raw", "--selector", com, "--from-seq", str(cursor), "--limit", "200")
+        if not page.get("ok") or not page.get("wal_file_exists", True):
+            return hits, "wal_unavailable"
+        records = page.get("records") or []
+        if not records and page.get("truncated"):
+            return hits, "wal_page_stalled"
+        for rec in records:
+            if rec.get("dir") == "TX":
+                try:
+                    payload = base64.b64decode(rec.get("payload_b64") or "", validate=True)
+                except (ValueError, TypeError):
+                    return hits, "wal_decode_failed"
+                if payload in (b"\x03", b"\x04"):
+                    hits.append(int(rec.get("seq") or 0))
+            cursor = max(cursor, int(rec.get("seq") or cursor))
+        if not page.get("truncated"):
+            return hits, None
+    return hits, "wal_page_limit"
+
+
+@_case(
+    "f9-expect-reboot-chained",
+    "cmd submit --expect-reboot：串接 reboot 走 reboot 路徑，不送 Ctrl-C／Ctrl-D、自動回 READY",
+    issues=("#130", "#162"),
+    hints=(
+        "命令是 `sync && reboot`（串接，_is_reboot_command 認不出）加 --expect-reboot。沒帶旗標的對照"
+        "（不 arm quiet window，shell 不回 prompt 時逾時送 Ctrl-C／Ctrl-D）會打在 autoboot 窗上，故不在真板重現。",
+        "oracle：submit 回應帶 expect_reboot 回聲（舊 daemon 會默默忽略旗標）、command.get 回報 expect_reboot、"
+        "命令送出後 WAL 沒有單獨的 TX 0x03／0x04、boot_id 改變並回（真）READY。",
+        "此 case 寫成後尚未在真板跑過；上板前需在 allow_destructive 的 bench 執行並確認結果。",
+    ),
+)
+def f9_expect_reboot_chained(ctx):
+    """串接 reboot 加 --expect-reboot：與單獨 reboot 同一條 reboot 路徑。
+
+    當初的錯誤行為＝串接命令被當一般命令，等 prompt 逾時後送 Ctrl-C／Ctrl-D，正好打在
+    U-Boot autoboot 倒數上。oracle 以 WAL 的 TX 控制位元組與 boot_id 改變判定。
+    """
+    com = ctx.cfg["boards"][0]["com"]
+    boot_wait_s = float(ctx.cfg["timeouts"]["boot_wait_s"])
+    if ctx.sw.session(com).get("state") != "READY":
+        return CaseResult("SKIP", reason=f"{com} 尚非 READY", category="environment", reason_code="board_not_ready")
+    before, before_cmd = _read_boot_id(ctx, com)
+    if not before:
+        return CaseResult("SKIP", reason=f"無法取得 reboot 前 boot ID（{before_cmd}）",
+                          category="environment", reason_code="boot_id_unavailable")
+    wal = ctx.sw.run("wal", "current-seq")
+    if not wal.get("ok") or not isinstance(wal.get("seq"), int):
+        return CaseResult("SKIP", reason="無法取得 reboot 前 WAL seq", category="environment",
+                          reason_code="wal_unavailable")
+    start_seq = int(wal["seq"])
+    submitted = False
+    try:
+        sub = ctx.sw.run("cmd", "submit", "--selector", com, "--cmd", "sync && reboot",
+                         "--source", "agent:serialwrap-regression", "--mode", "line",
+                         "--cmd-timeout", "20", "--expect-reboot")
+        sub_path = ctx.note("expect-reboot-submit.json", str(sub))
+        cmd_id = sub.get("cmd_id")
+        if not cmd_id:
+            return CaseResult("FAIL", reason=f"--expect-reboot 命令未被接受：{sub.get('error_code')}",
+                              category="test", reason_code="expect_reboot_submit_failed",
+                              evidence={"expect-reboot-submit": sub_path})
+        submitted = True
+        if sub.get("expect_reboot") is not True:
+            return CaseResult("FAIL", reason="submit 回應沒有 expect_reboot 回聲（daemon 版本過舊而忽略旗標？）",
+                              category="test", reason_code="expect_reboot_not_acknowledged",
+                              evidence={"expect-reboot-submit": sub_path})
+
+        time.sleep(5.0)  # 避免把 reboot 尚未執行時的舊 READY 當成重開後已恢復
+        cleared, last_sess = _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)
+        ctx.note("quiet-cleared.json", str({"cleared": cleared, "session": last_sess}))
+        if not cleared:
+            tail = ctx.sw.run("log", "tail-text", "--selector", com)
+            tail_path = ctx.note("boot-log-tail.txt", "\n".join(tail.get("lines") or []))
+            return CaseResult("FAIL", reason=f"{boot_wait_s:.0f}s 內未回可下命令的 READY",
+                              category="test", reason_code="boot_not_ready",
+                              evidence={"boot-log-tail": tail_path})
+
+        after, after_cmd = _read_boot_id(ctx, com)
+        record = (ctx.sw.run("cmd", "status", "--cmd-id", str(cmd_id)).get("command") or {})
+        ctrl, wal_error = _tx_control_bytes(ctx, com, start_seq)
+        ctx.note("expect-reboot-result.json", str({
+            "boot_id_changed": bool(after and after != before), "after_cmd": after_cmd,
+            "record_expect_reboot": record.get("expect_reboot"), "record_status": record.get("status"),
+            "tx_ctrl_seqs": ctrl, "wal_error": wal_error,
+        }))
+        if ctrl:
+            return CaseResult("FAIL", reason=f"命令送出後 WAL 出現單獨 TX Ctrl-C／Ctrl-D（seq={ctrl}）：串接命令仍被當一般命令",
+                              category="test", reason_code="ctrl_bytes_sent")
+        if wal_error:
+            return CaseResult("SKIP", reason=f"WAL 證據不完整：{wal_error}", category="environment",
+                              reason_code=wal_error)
+        if not after or after == before:
+            # 讀到舊 boot ID 有兩種成因：板子真的沒重開，或 daemon 在非同步 reboot 的關機期間
+            # 就確認了 READY（舊 shell 回應 nonce 探測，stale-READY），讀 boot ID 的命令落在
+            # 重開之前。2026-10-28 IB8 實機首跑屬後者：TX reboot 後 +3.9 s nonce 被舊 shell
+            # 回應，+5.2 s 讀到舊 boot ID，+8.6 s 板子才開始重開。
+            return CaseResult("FAIL", reason="boot ID 未改變：板子沒有重開機，或 daemon 在關機期間就確認了 READY（stale-READY）",
+                              category="test", reason_code="boot_id_unchanged")
+        if record.get("expect_reboot") is not True:
+            return CaseResult("FAIL", reason="command.get 沒有回報 expect_reboot=true", category="test",
+                              reason_code="record_missing_flag")
+        return CaseResult("PASS", reason="串接 reboot 加 --expect-reboot：boot ID 改變、WAL 無 Ctrl-C／Ctrl-D、回（真）READY")
+    finally:
+        if submitted:
+            guards.ensure_ready(ctx, com, timeout_s=boot_wait_s)
+            _wait_quiet_cleared(ctx, com, timeout_s=boot_wait_s)

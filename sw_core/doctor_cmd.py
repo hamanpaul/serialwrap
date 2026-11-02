@@ -483,6 +483,68 @@ def _check_endpoint_reachable(proc_root: str = "/proc") -> dict:
     }
 
 
+def _check_daemon_code_current() -> dict:
+    """正在跑的 daemon 載入的程式碼，是否就是目前安裝（本行程這份）的程式碼。
+
+    版本字串在 release／分支 build／main 之間完全相同，``pipx install --force`` 之後
+    systemd 服務還在跑的 daemon 也不會自動換新碼，所以只比版本看不出來；這裡比
+    ``health.ping`` 回應內的 ``code_fingerprint``（見 ``sw_core/version.py``）與本行程
+    現算的值。
+
+    advisory：不一致只是『需要重啟』，不拉低整體 ok（與 ``other_serialwrap_installs`` 同
+    哲學）；daemon 未在跑／連不上、或本行程算不出指紋（凍結包）時降級為 informational。
+    回應完全沒有 ``code_fingerprint`` 的 daemon 是更舊的 build，視為不一致。
+    """
+    from sw_core.cli import _local_default_endpoint, _safe_runtime_config  # 延遲匯入避免循環
+    from sw_core.client import rpc_call
+    from sw_core.version import code_fingerprint
+
+    installed = code_fingerprint()
+    rc = _safe_runtime_config()
+    cfg_sock = None
+    if rc is not None:
+        try:
+            cfg_sock = rc.socket_path()
+        except Exception:  # noqa: BLE001
+            cfg_sock = None
+    endpoint = cfg_sock or _local_default_endpoint()
+
+    resp = rpc_call(endpoint, "health.ping", {}, timeout_s=0.5)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return {
+            "check": "daemon_code_current",
+            "ok": True,
+            "detail": "daemon 未在跑或無法連線，略過",
+            "fix": "",
+        }
+    if not installed:
+        return {
+            "check": "daemon_code_current",
+            "ok": True,
+            "detail": "本行程無法計算程式碼指紋（凍結包或原始碼不可讀），略過",
+            "fix": "",
+        }
+    daemon_fp = resp.get("code_fingerprint")
+    if isinstance(daemon_fp, str) and daemon_fp == installed:
+        return {
+            "check": "daemon_code_current",
+            "ok": True,
+            "detail": f"daemon 與目前安裝的程式碼相同（code {installed}）",
+            "fix": "",
+        }
+    shown = daemon_fp if isinstance(daemon_fp, str) and daemon_fp else "未回報（升級前的舊版 daemon）"
+    return {
+        "check": "daemon_code_current",
+        "ok": False,
+        "detail": f"daemon 載入的程式碼（code {shown}）與目前安裝的（code {installed}）不同",
+        "fix": (
+            "serialwrap service restart（或 serialwrap setup，指紋不符時會自動重啟 systemd 服務；"
+            "on-demand 模式：serialwrap daemon stop 後 serialwrap daemon start）；"
+            "serialwrap daemon status 的 code_path 可看 daemon 載入的是哪份安裝"
+        ),
+    }
+
+
 def _profile_templates_missing_bootloader_prompts(
     asset_text: str, live_text: str
 ) -> list[str]:
@@ -566,12 +628,12 @@ def _check_profile_bootloader_prompts() -> dict:
 DOCTOR_ADVISORY_CHECKS = frozenset({
     "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
     "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
-    "profile_bootloader_prompts",
+    "profile_bootloader_prompts", "daemon_code_current",
 })
 DOCTOR_ADVISORY_CHECKS_WIN = frozenset({
     "serialwrap_on_path", "serialwrapd_on_path", "daemon_endpoint",
     "devices", "other_serialwrap_installs", "wal_dir",
-    "profile_bootloader_prompts",
+    "profile_bootloader_prompts", "daemon_code_current",
 })
 
 
@@ -615,6 +677,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_other_serialwrap_installs(fx),
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
+            _check_daemon_code_current(),
             _check_wal_dir(),
             _check_wal_writable(),
             _check_profile_bootloader_prompts(),
@@ -644,6 +707,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_supervision_mode(home),
         _check_single_daemon(),
         _check_endpoint_reachable(),
+        _check_daemon_code_current(),
         _check_wal_dir(),
         _check_wal_writable(),
         _check_profile_bootloader_prompts(),
