@@ -100,6 +100,9 @@ pub enum HandoffWait {
 
 pub const MAX_HANDOFF_CHAIN: usize = 3;
 
+/// 已交接實例關閉 listener 後的結束等待上限（SC-12）。
+pub const HANDOFF_EXIT_WAIT: Duration = Duration::from_secs(10);
+
 pub fn graceful_stop(
     ctx: &mut CliCtx<'_>,
     mode: &SupervisionMode,
@@ -457,8 +460,10 @@ pub fn wait_handoff_gone(
 ) -> HandoffWait {
     let started = ctx.p.clock.mono_ns();
     let limit = timeout.as_nanos().min(u64::MAX as u128) as u64;
+    let exit_limit = HANDOFF_EXIT_WAIT.as_nanos().min(u64::MAX as u128) as u64;
+    let mut exiting_since: Option<u64> = None;
     loop {
-        let ping = client::call(
+        let (ping, listener_closed) = client::call_with_failure(
             ctx,
             endpoint,
             "health.ping",
@@ -467,13 +472,32 @@ pub fn wait_handoff_gone(
             &PyInt::Small(0),
         )
         .ok()
-        .is_some_and(|outcome| outcome.resp.get_truthy("ok"));
+        .map(|(outcome, failure)| {
+            let listener_closed = failure.is_some_and(|failure| {
+                failure.phase == client::FailPhase::Connect
+                    && matches!(
+                        failure.pal_kind,
+                        Some(
+                            sw_pal::traits::PalErrorKind::ConnectionRefused
+                                | sw_pal::traits::PalErrorKind::NotFound
+                        )
+                    )
+            });
+            (outcome.resp.get_truthy("ok"), listener_closed)
+        })
+        .unwrap_or((false, false));
+        if ping {
+            exiting_since = None;
+        }
         let old_alive = id
             .tree
             .iter()
             .any(|identity| ctx.p.procs.identity_alive(identity));
         if !ping && !old_alive {
             return HandoffWait::Gone;
+        }
+        if !ping && listener_closed {
+            exiting_since.get_or_insert_with(|| ctx.p.clock.mono_ns());
         }
         if ping {
             let status = client::call(
@@ -531,7 +555,11 @@ pub fn wait_handoff_gone(
                 }
             }
         }
-        if ctx.p.clock.mono_ns().saturating_sub(started) >= limit {
+        let now = ctx.p.clock.mono_ns();
+        let timed_out = exiting_since
+            .map(|at| now.saturating_sub(at) >= exit_limit)
+            .unwrap_or_else(|| now.saturating_sub(started) >= limit);
+        if timed_out {
             return HandoffWait::TimedOut;
         }
         ctx.p.clock.sleep(Duration::from_millis(200));
