@@ -153,8 +153,40 @@ markers remain available for caller validation. `command.get` and WAL META recor
 setting; reboot continues through its existing recovery flow. See
 [command completion](docs/command-completion.md).
 
+The broker recognizes a reboot only when it is a standalone command (`reboot`,
+`systemctl reboot`, `shutdown -r`, `echo b > /proc/sysrq-trigger`). For chained
+or self-rebooting commands such as `firstboot -y && reboot` or `sysupgrade ...`,
+add `cmd submit --expect-reboot` (RPC `command.submit` boolean `expect_reboot`):
+whatever the command text, it takes the reboot path (boot quiet window armed
+immediately, no Ctrl-C/Ctrl-D, recovery waits for READY). Without the flag a
+chained reboot is run as a normal command and the submit response carries a
+non-fatal `CHAINED_REBOOT_WARNING`; execution is unchanged. `--mode interactive`
+with the flag is rejected (`EXPECT_REBOOT_MODE_UNSUPPORTED`), non-boolean values
+return `INVALID_EXPECT_REBOOT`, `--completion-regex` is ignored (reboot wins), and
+the flag does not bypass `AUTOBOOT_QUIET`. Set `--cmd-timeout` to cover the part
+before the reboot. The submit response echoes `expect_reboot: true` and
+`command.get` reports it. See [explicit reboot](docs/expect-reboot.md).
+
 For local development, run `./install.sh`; it performs the same package install
 and `serialwrap setup` flow from the checkout.
+
+**Upgrading, and telling which build the daemon runs.** After
+`pipx install --force ...`, run `serialwrap setup` again. The version string
+(`0.3.2`) is the same for a release, a branch build and `main`, so
+`serialwrap --version` also prints a code fingerprint, e.g.
+`serialwrap 0.3.2 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap daemon status` reports the fingerprint of the code the running daemon
+loaded when it started (`code_fingerprint`) and where it loaded it from
+(`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
+every other command prints a one-line warning on stderr (stdout JSON is unchanged);
+`serialwrap doctor` reports it as the advisory check `daemon_code_current`.
+When the systemd service is active and the fingerprints differ, `serialwrap setup`
+restarts the service for you and prints a `daemon_code` field with the result.
+For systemd-system, `setup` only lists `sudo systemctl restart serialwrap` in
+`pending_sudo` unless `--with-sudo` is given; `--no-restart` skips the restart; a
+running flash never triggers it. On-demand mode never stops the daemon on its own:
+run `serialwrap daemon stop` then `serialwrap daemon start`. See
+[spec §8.7](docs/serialwrap-spec.md).
 
 For a human console, use the broker wrapper instead of raw minicom:
 
@@ -1619,6 +1651,7 @@ serialwrap doctor    # 驗證環境
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- **升級與確認 daemon 跑的是哪份程式碼**：`pipx install --force ...` 後再跑一次 `serialwrap setup`。版本字串（`0.3.2`）在 release、分支 build、`main` 之間完全相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`（已安裝的 `sw_core/**/*.py` 的雜湊）；`serialwrap daemon status` 的 `code_fingerprint` 是正在跑的 daemon 啟動時載入的那份、`code_path` 是它載入的位置。兩者不同＝daemon 還在跑升級前的舊碼：其他指令的 stderr 會多一行警告（stdout JSON 不變），`serialwrap doctor` 以 advisory 檢查 `daemon_code_current` 回報。systemd 服務 active 且指紋不同時，`serialwrap setup` 會自動 restart 服務並在輸出的 `daemon_code` 欄位說明結果；systemd-system 未帶 `--with-sudo` 時只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`；`--no-restart` 可略過；flash 進行中不會重啟；on-demand 模式不會自動停 daemon，請 `serialwrap daemon stop` 後 `serialwrap daemon start`。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
 ```bash
@@ -1919,6 +1952,16 @@ Regex 必須可編譯、不超過 1024 UTF-8 bytes 且不能匹配空串；無�
 prompt 擷取，但只裁切完成標記之後的 prompt，保留早先 prompt redraw 之後的結果
 與完成標記供呼叫端驗證；`command.get` 與 WAL META 記錄設定，
 reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-completion.md)。
+
+broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown -r`、
+`echo b > /proc/sysrq-trigger`）。`firstboot -y && reboot`、`sysupgrade …` 這類串接或自帶重開機的命令，
+請加 `cmd submit --expect-reboot`（RPC `command.submit` 的布林 `expect_reboot`）：不管命令文字，
+一律走 reboot 路徑（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 recovery 等板子回 `READY`）。
+沒帶旗標時，串接的 reboot 仍當一般命令執行，submit 回應多一則非致命 `CHAINED_REBOOT_WARNING`，
+執行行為不變。`--mode interactive` 帶旗標會被拒絕（`EXPECT_REBOOT_MODE_UNSUPPORTED`），非布林值回
+`INVALID_EXPECT_REBOOT`，同時帶 `--completion-regex` 時 reboot 優先（regex 不使用），旗標不繞過
+`AUTOBOOT_QUIET`。`--cmd-timeout` 要涵蓋 reboot 之前那一段的耗時。submit 回應回聲 `expect_reboot: true`，
+`command.get` 回報此設定。詳見[明示 reboot](docs/expect-reboot.md)。
 
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
@@ -3067,6 +3110,7 @@ serialwrap doctor    # 驗證環境
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
 - 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- **升級與確認 daemon 跑的是哪份程式碼**：`pipx install --force ...` 後再跑一次 `serialwrap setup`。版本字串（`0.3.2`）在 release、分支 build、`main` 之間完全相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`（已安裝的 `sw_core/**/*.py` 的雜湊）；`serialwrap daemon status` 的 `code_fingerprint` 是正在跑的 daemon 啟動時載入的那份、`code_path` 是它載入的位置。兩者不同＝daemon 還在跑升級前的舊碼：其他指令的 stderr 會多一行警告（stdout JSON 不變），`serialwrap doctor` 以 advisory 檢查 `daemon_code_current` 回報。systemd 服務 active 且指紋不同時，`serialwrap setup` 會自動 restart 服務並在輸出的 `daemon_code` 欄位說明結果；systemd-system 未帶 `--with-sudo` 時只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`；`--no-restart` 可略過；flash 進行中不會重啟；on-demand 模式不會自動停 daemon，請 `serialwrap daemon stop` 後 `serialwrap daemon start`。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
 依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
@@ -3083,7 +3127,7 @@ serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
 options:
   -h, --help           show this help message and exit
-  --version            顯示版本後離開
+  --version            顯示版本與程式碼指紋後離開
   -v, --verbose        提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）

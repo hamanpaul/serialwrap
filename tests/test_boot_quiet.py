@@ -730,7 +730,11 @@ class TestRebootPromptReturnKeepsPending(_ManagerMixin):
         self.assertEqual(bridge.sent, sent_before, "gate 拒絕必須零 TX 副作用")
 
     def test_confirm_probe_after_reboot_restores_execute(self) -> None:
-        """#139 不變量維持：真 READY（nonce probe 實證）後 agent 命令必成功。"""
+        """#139 不變量維持：真 READY（nonce probe 實證）後 agent 命令必成功。
+
+        非同步 reboot 後，確認 probe 須等開機證據（boot banner）才會送——舊 shell 在
+        banner 前的 nonce 應答不是實證（``tests/test_async_reboot_evidence.py``）。本案例
+        模擬板子確實重開：banner 到達、開機完成（prompt 回來）解除 quiet 後才有確認 probe。"""
         mgr, session = self._make_manager()
         bridge = FakeBridge(prompt_within_2s=True)
         session.bridge = bridge
@@ -740,6 +744,8 @@ class TestRebootPromptReturnKeepsPending(_ManagerMixin):
             session, bridge, command="reboot", source="agent:test",
             cmd_id="cmd-1", timeout_s=10.0, execution_mode="line",
         )
+        self._rx(mgr, session, "U-Boot 2024.04 (Oct 27 2026)\r\n")
+        self._rx(mgr, session, "root@prplOS:~# ")
         session.last_rx_mono = time.monotonic() - constants.REPROBE_RX_IDLE_S - 0.5
         mgr.reconcile_readiness()
         mgr.join_reprobe_workers(5.0)
