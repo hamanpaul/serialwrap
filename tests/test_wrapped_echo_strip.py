@@ -57,6 +57,22 @@ class TestWrappedEchoStrip(unittest.TestCase):
         raw = CMD96 + "\r\n" + CMD96[:65] + "\r\n" + CMD96[65:] + "\r\n" + PROMPT
         self.assertEqual(_extract(raw, CMD96), CMD96[:65] + "\n" + CMD96[65:])
 
+    def test_output_equal_to_command_without_spaces_is_kept(self) -> None:
+        """echo 關閉時，輸出剛好等於命令去掉空白（`cat file` → `catfile`）不得被當成回顯。"""
+        raw = "catfile\r\n" + PROMPT
+        self.assertEqual(_extract(raw, "cat file"), "catfile")
+
+    def test_short_output_split_like_command_is_kept(self) -> None:
+        """短命令不會折行：輸出恰好是命令拆成兩行時不得剝掉。"""
+        raw = "ls -la\r\n/tmp\r\n" + PROMPT
+        self.assertEqual(_extract(raw, "ls -la /tmp"), "ls -la\n/tmp")
+
+    def test_long_output_missing_command_space_is_kept(self) -> None:
+        """回顯只會多插換行或空白，不會吃掉命令本身的空白；少了空白的長輸出不是回顯。"""
+        squeezed = CMD96.replace(" ", "")
+        raw = squeezed[:60] + "\r\n" + squeezed[60:] + "\r\n" + PROMPT
+        self.assertEqual(_extract(raw, CMD96), squeezed[:60] + "\n" + squeezed[60:])
+
     def test_helper_handles_empty_inputs(self) -> None:
         self.assertEqual(_strip_wrapped_command_echo([], CMD96), [])
         self.assertEqual(_strip_wrapped_command_echo(["a", "b"], "   "), ["a", "b"])

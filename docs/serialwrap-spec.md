@@ -593,7 +593,7 @@ Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟�
 - background mode：`command.result_tail`（含 `from_chunk` / `next_chunk` 分頁）
 - interactive mode：`interactive_status.screen`
 
-line mode 的 `stdout` 會剝掉命令本身的回顯。回顯打到終端寬度（serial console 常見 80 欄）時 shell 會把它折成多行（BusyBox ash 插入 `\r\r\n`、bash readline 補 `" \r"`），此時把開頭幾行接回、去空白後與完整命令比對再剝；命令字樣必須從第一行開始（容許前面殘留 prompt），單行回顯已剝掉時不再重複比對，避免把恰好拼得出命令的輸出誤剝。
+line mode 的 `stdout` 會剝掉命令本身的回顯。回顯打到終端寬度（serial console 常見 80 欄）時 shell 會把它折成多行（BusyBox ash 插入 `\r\r\n`、bash readline 補 `" \r"`），此時把開頭幾行接回，只接受「命令原文加上折行插入的字元」：命令本身的每個字元（含空白）都必須依序出現，只有換行或多出的一個空白可以跳過，插入點彼此至少相隔 20 個字元，回顯須從第一行開始（容許前面殘留 prompt）並結束在行尾；單行回顯已剝掉時不再重複比對。因此 echo 關閉時，輸出剛好等於命令去掉空白（例如 `cat file` 印出 `catfile`）不會被誤當回顯。
 
 background mode 的 `command.result_tail` 在 capture 尚未建立時，會回傳 `from_seq=0, last_seq=0` sentinel（詳見 6.2 fallback 說明）。
 
