@@ -283,7 +283,8 @@ fn legacy_b_native_exe_in_bundle_path_fails_closed() {
 #[test]
 fn legacy_b_python_script_under_versions_fails_closed() {
     let t = legacy_on_demand_install();
-    let script = t.install_root().join("versions/0.3.9/py/serialwrapd.py").display().to_string();
+    // 此測試使用 POSIX caps；用 POSIX 字串連接，避免 Windows host 的 PathBuf::join 混入反斜線。
+    let script = format!("{}/versions/0.3.9/py/serialwrapd.py", t.install_root().display());
     let t = t.with_legacy_details(|details| {
         details.argv = vec!["/usr/bin/python3".into(), "-I".into(), "-B".into(), script.clone()];
     });
