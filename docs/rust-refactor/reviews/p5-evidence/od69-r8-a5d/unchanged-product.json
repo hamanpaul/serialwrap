@@ -1,0 +1,8 @@
+{
+  "crates/sw-core/src/actor.rs": "3c3741b4970b2ef8ebd50ee1c9eb2fb52f9110dcd8879be0a85d1c1cb09bd42e",
+  "crates/sw-core/src/mailbox.rs": "0b418b25ec703c1bb7126bb6426174d7913fa9092916c8dacba111acd4f6b0f8",
+  "crates/sw-core/src/session_core.rs": "7e1c2332dcf04ed84ef6c659bc57b019dbe09af52b31932b1d9058cccc3e8b24",
+  "crates/sw-core/src/session_manager.rs": "b2cb572641f8e03ec0a97af5d0f9d803e8257d461b0ce17c0a0fbb9ea7df217c",
+  "crates/sw-core/src/uart_bridge.rs": "11ef29000583683ce1123029b129e5488cd101c728b7a19065b53281ba407b24",
+  "contracts/resource_limits.yaml": "d633e2bd2945ad0059a610ca03264c61e2f35a6f39fbd3f8b8b4ff3d99837e04"
+}

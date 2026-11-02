@@ -1,0 +1,1 @@
+[regen_lock] wrote l1_required.lock.json：s21_core.linux 新增 3 筆、核准移除 0 筆 nodeid
