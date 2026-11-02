@@ -138,9 +138,9 @@ while the daemon remains the Python implementation shipped inside the bundle.
 - `serialwrap` CLI 改為 Rust 原生實作（20 個命令群組），daemon 仍為 bundle 內附的 Python 實作（Stage 1）。
 - `install.sh` 改為安裝 Rust bundle（OD-50）：下載 GitHub release 的 `serialwrap-0.4.0-linux-x86_64.tar.gz` 並以 `SHA256SUMS` 驗證後執行 `bin/serialwrap setup`，或以 `--bundle` 離線安裝；系統需求為 x86_64、glibc ≥ 2.39（Ubuntu 24.04 以上）與 `/usr/bin/python3.12`。pipx 安裝路徑退役（wheel 仍照發）。
 - 新增發佈組合（bundle）安裝：`bin/serialwrap setup` 安裝到 `~/.local/share/serialwrap/versions/<版本>`（Windows：`%LOCALAPPDATA%\Programs\serialwrap`），支援原子更新、`setup --rollback` 與 `doctor` 的 `version_pairing` 檢查。
-- Windows：`windows-task` 監管（免管理員）、可選 com0com 虛擬序列埠（`setup --with-com0com`）。
+- Windows：`windows-task` 監管（一般安裝不需管理員）；可選 com0com 3.0.0.0 虛擬序列埠（`setup --with-com0com`），此元件仍屬實驗性。
 - 修正：pipx 安裝下 on-demand `daemon start` 找不到 `serialwrapd.py`。
-- 升級注意：從 0.3.2 升級時 0.3.2 daemon 可以維持執行；`setup` 會在確認閒置後停止舊 daemon，等它完全結束才切換，再啟動 0.4.0 daemon。舊 daemon 停止後若升級失敗，安裝會還原但舊 daemon 不會自動重啟，請依回應中的啟動指令手動啟動。
+- 升級注意：正向辨識到舊 pipx daemon、且沒有燒錄或其他忙碌操作時，可在 0.3.2 daemon 執行中直接升級。`setup` 透過原監管者（或 `daemon.stop`）停止舊 daemon，等待舊行程樹結束及同使用者 UART holder 連續 5 秒消失後，才切換並啟動 0.4.0 daemon。舊 daemon 停止後若後續步驟失敗，安裝會還原但舊 daemon 不會自動重啟，請依回應中的 `restart_hint` 處理。
 - 升級時請**明確指定目前的監管模式**（`--user`／`--system --with-sudo`／`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇，可能改變模式與 `config.yaml`。
 - 不支援降級回 0.3.2：`setup --rollback` 不能回到 pipx 的 0.3.2（OD-49 已知限制）；文件中的手動程序僅供參考。
 - 行為變更清單見 `contracts/behavior_changes.yaml`（BC／SC／DF）與 CHANGELOG。
@@ -149,11 +149,12 @@ while the daemon remains the Python implementation shipped inside the bundle.
 - The `serialwrap` CLI is now native Rust (20 command groups); the daemon is still the bundled Python implementation (Stage 1).
 - `install.sh` now installs the Rust bundle (OD-50): it downloads `serialwrap-0.4.0-linux-x86_64.tar.gz` from the GitHub release, verifies it against `SHA256SUMS`, and runs `bin/serialwrap setup`; `--bundle` installs offline. Requirements: x86_64, glibc >= 2.39 (Ubuntu 24.04 or later), and `/usr/bin/python3.12`. The pipx install path is retired (the wheel is still published).
 - New bundle install: `bin/serialwrap setup` installs into `~/.local/share/serialwrap/versions/<version>` (Windows: `%LOCALAPPDATA%\Programs\serialwrap`) with atomic update, `setup --rollback`, and a `version_pairing` doctor check.
-- Windows: `windows-task` supervision (no admin), optional com0com virtual serial pair (`setup --with-com0com`).
+- Windows: `windows-task` supervision (the normal installation needs no admin); the optional com0com 3.0.0.0 virtual serial pair (`setup --with-com0com`) remains experimental.
 - Fixed: on-demand `daemon start` could not find `serialwrapd.py` under pipx installs.
-- Upgrade note: the 0.3.2 daemon may keep running while you upgrade; `setup` stops it once it is idle, waits until the old process tree has fully exited, switches, and then starts the 0.4.0 daemon. If the upgrade fails after the old daemon was stopped, the install is restored but the old daemon is not restarted automatically; use the start command printed in the response.
+- Upgrade note: when setup positively identifies the legacy pipx daemon and no flash or other busy operation is active, you can upgrade while the 0.3.2 daemon is running. Setup stops it through its supervisor (or calls `daemon.stop`), waits for its process tree to exit and for same-user UART holders to be absent for five consecutive seconds, then switches and starts the 0.4.0 daemon. If a later step fails after the old daemon was stopped, the install is restored but the old daemon is not restarted automatically; follow the response's `restart_hint`.
 - Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, or `--on-demand`). Without a flag, `setup` picks a mode automatically exactly like 0.3.2, which may change your mode and `config.yaml`.
 - Downgrading to 0.3.2 is not supported: `setup --rollback` cannot return to a pipx 0.3.2 install (known limitation, OD-49); the documented manual procedure is for reference only.
+- Behavior changes are listed in `contracts/behavior_changes.yaml` (BC / SC / DF) and the changelog.
 ```
 
 ## 8. PR 政策（release PR）

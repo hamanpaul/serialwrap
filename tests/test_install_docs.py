@@ -1,8 +1,8 @@
-"""OD-50：安裝文件改以 `install.sh`／bundle 為主要方式（README 英文與繁中兩段內容一致）。
+"""OD-50：安裝文件改以 `install.sh`／bundle 為主要方式，並同步維護升級說明。
 
 - README 的 English 章與 繁體中文 章（含頂部 Install 導覽段）不再以 `pipx install git+...@v0.3.2` 為安裝方式；
 - 兩段都寫明 `install.sh`、`--bundle` 離線安裝、系統需求（x86_64、glibc ≥ 2.39、`/usr/bin/python3.12`、Ubuntu 24.04）
-  與「0.3.x 使用者升級」說明（升級前 `serialwrap daemon stop`，標註 TODO(OD-48)）；
+  與「0.3.x 使用者升級」說明（busy 拒絕、舊行程與 UART holder 等待、失敗時 `restart_hint`）；
 - CLAUDE.md「實際命令」段與 release 計畫 RELEASE-TODO-02 同步。
 """
 
@@ -32,8 +32,18 @@ def test_readme_install_uses_bundle(index):
     assert LEGACY_PIPX not in text
     for token in ("./install.sh", "--bundle", "--version", "x86_64", "2.39", "/usr/bin/python3.12",
                   "Ubuntu 24.04", "SHA256SUMS", "mkbundle.sh --release-bundle --profile release",
-                  "serialwrap daemon stop", "TODO(OD-48)", "pipx uninstall serialwrap", "0.3.x"):
+                  "pipx uninstall serialwrap", "0.3.x", "restart_hint"):
         assert token in text, token
+    assert "TODO(OD-48)" not in text
+    assert "serialwrap daemon stop" not in text
+    if index == 0:
+        assert "flashing or another busy operation is active" in text
+        assert "same-user UART" in text
+        assert "Pass the current supervision mode explicitly" in text
+    else:
+        assert "燒錄或其他忙碌操作會拒絕升級" in text
+        assert "連續 5 秒沒有同使用者行程持有 UART" in text
+        assert "明確指定目前監管模式" in text
 
 
 def test_claude_md_install_command_synced():

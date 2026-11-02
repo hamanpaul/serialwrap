@@ -210,15 +210,20 @@ scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
 
 #### Upgrading from 0.3.x (pipx)
 
-Run the new `install.sh`; no pipx step is needed. Stop the 0.3.x daemon first
-with `serialwrap daemon stop` (TODO(OD-48): this step will be revisited once
-upgrading with the 0.3.2 daemon still running is implemented). Setup takes
-over the `~/.local/bin/serialwrap` and `serialwrapd` entries, keeps
-`config.yaml`, profiles and `state.json`, and does not start a daemon that was
-stopped: start it with `serialwrap service start` (systemd) or
-`serialwrap daemon start` (on-demand), then run `serialwrap doctor`. When an
-old pipx install is detected, the installer prints a hint that you may run
-`pipx uninstall serialwrap`; it never removes it automatically.
+Run the new `install.sh`; no pipx step is needed. You can upgrade while the
+0.3.x daemon is running when setup positively identifies the legacy pipx
+daemon. Setup refuses while flashing or another busy operation is active.
+Otherwise it records the old daemon, asks its supervisor to stop it (or calls
+`daemon.stop`), waits for its process tree to exit and for same-user UART
+holders to be absent for five consecutive seconds, then switches to 0.4.0 and
+starts the new daemon. If a later step fails after the old daemon was stopped,
+setup restores the installation but does not restart the old daemon; follow the
+`restart_hint` in its response. Pass the current supervision mode explicitly
+(`--user`, `--system --with-sudo`, or `--on-demand`); without a flag, automatic
+selection works as in 0.3.2 and may change the supervision mode and
+`config.yaml`. When an old pipx install is detected, the installer prints a
+hint that you may run `pipx uninstall serialwrap`; it never removes it
+automatically.
 
 For a human console, use the broker wrapper instead of raw minicom:
 
@@ -1815,7 +1820,7 @@ serialwrap doctor                # 驗證環境
 - `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
 - 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
-- 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。升級前請先 `serialwrap daemon stop`（TODO(OD-48)：0.3.2 daemon 執行中直接升級的行為實作後再更新此步驟）。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`，且不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
+- 舊版 0.3.x（pipx）使用者升級：可在 0.3.x daemon 執行中直接執行新的 `install.sh`；setup 正向辨識舊 pipx daemon 後，若正有燒錄或其他忙碌操作會拒絕升級。否則先記錄舊行程，透過原監管者停止（或呼叫 `daemon.stop`），等待舊行程樹結束，並確認連續 5 秒沒有同使用者行程持有 UART，才切換至 0.4.0 並啟動新 daemon。舊 daemon 停止後若後續步驟失敗，setup 會還原安裝，但不會重啟舊 daemon；依回應中的 `restart_hint` 處理。升級時請明確指定目前監管模式（`--user`、`--system --with-sudo`、`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇，可能改變監管模式與 `config.yaml`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
