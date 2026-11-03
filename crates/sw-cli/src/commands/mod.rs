@@ -35,9 +35,72 @@ pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
         ["doctor"] => return crate::doctor_cmd::run_doctor_cmd(ns, ctx),
         ["supervision-mode"] => return supervision_cmd::run_supervision_mode(ns, ctx),
         ["profile", "test"] => return profile_cmd::run_profile_test(ctx, ns),
+        ["device", "release"] => {
+            if rpc_cmds::reject_reserved_source(
+                ctx,
+                ns,
+                "source",
+                "cli",
+                "source",
+                "device.release",
+                true,
+            ) {
+                return 1;
+            }
+        }
+        ["session", "interactive-open"] => {
+            if rpc_cmds::reject_reserved_source(
+                ctx,
+                ns,
+                "owner",
+                "agent",
+                "owner",
+                "session.interactive_open",
+                false,
+            ) {
+                return 1;
+            }
+        }
+        ["file", "push"] => {
+            if rpc_cmds::reject_reserved_source(
+                ctx,
+                ns,
+                "source",
+                "agent",
+                "source",
+                "file.push",
+                true,
+            ) {
+                return 1;
+            }
+        }
+        ["file", "pull"] => {
+            if rpc_cmds::reject_reserved_source(
+                ctx,
+                ns,
+                "source",
+                "agent",
+                "source",
+                "file.pull",
+                true,
+            ) {
+                return 1;
+            }
+        }
         ["cmd", "submit"] => {
             if let Some(code) = rpc_cmds::check_completion_regex(ctx, ns) {
                 return code;
+            }
+            if rpc_cmds::reject_reserved_source(
+                ctx,
+                ns,
+                "source",
+                "agent",
+                "source",
+                "command.submit",
+                true,
+            ) {
+                return 1;
             }
             if let Some(code) = rpc_cmds::check_expect_reboot(ctx, ns) {
                 return code;

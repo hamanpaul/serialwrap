@@ -363,6 +363,26 @@ pub fn run_rpc(ctx: &mut CliCtx, ns: &Namespace, method: &str, params: PyValue) 
     }
 }
 
+/// 檢查 CLI 外部來源；只拒絕 daemon 保留前綴，合法值仍以原字串送進 RPC。
+pub fn reject_reserved_source(
+    ctx: &mut CliCtx,
+    ns: &Namespace,
+    arg_name: &str,
+    default: &str,
+    field: &str,
+    context: &str,
+    normalize_human: bool,
+) -> bool {
+    let check =
+        crate::source_policy::check_source(ns.str(arg_name), default, field, normalize_human);
+    let Some(response) = check.error else {
+        return false;
+    };
+    let _ = print_json(&mut ctx.io, &response);
+    let _ = crate::output::mirror_err(&mut ctx.io, &response, Some(context));
+    true
+}
+
 /// `cmd submit` 的本地 completion regex 檢查（Q-25）。
 ///
 /// 回傳 `None` 表示通過；`Some(code)` 表示已輸出並以該 exit code 結束（不連 daemon）。

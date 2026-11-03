@@ -17,6 +17,7 @@ pub mod delegate;
 pub mod endpoint_resolve;
 pub mod output;
 pub mod remote_tunnel;
+pub mod source_policy;
 // P4-T1 空殼：以下模組的實作由 Stage 1B 各 Task 承接（見 docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md）。
 pub mod doctor_cmd;
 pub mod graceful_stop;
