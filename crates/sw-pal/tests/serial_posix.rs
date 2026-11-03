@@ -342,6 +342,124 @@ fn run_external_opener_role() {
     write_role_message(&format!("S21_OPENER_REOPENED {opener_pid}"));
 }
 
+#[cfg(target_os = "linux")]
+struct PausedSysenvSpawn<T> {
+    call: sw_pal::conformance::SysenvSpawnPauseCall<T>,
+    child_pid: u32,
+    _held_slave: std::fs::File,
+}
+
+/// 普通開啟 PTY slave 後，透過正式 SysEnv spawn 停在 fork→exec 窗口並確認子行程繼承相同 inode。
+#[cfg(target_os = "linux")]
+fn pause_sysenv_spawn_while_holding_slave<T, F>(dev: &DevicePath, run: F) -> PausedSysenvSpawn<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    use std::sync::mpsc::TryRecvError;
+
+    let held_slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(&dev.0)
+        .expect("以普通 open 持有 PTY slave");
+    let slave_metadata = held_slave.metadata().expect("取得 PTY slave inode");
+    // SAFETY: held_slave 仍開啟且由本函式持有，是有效 fd。
+    let fd_flags = unsafe { libc::fcntl(held_slave.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0,
+        "普通 open 的 slave fd 必須保留 CLOEXEC（flags={fd_flags}）"
+    );
+
+    let mut call = sw_pal::conformance::SysenvSpawnPauseCall::spawn(Duration::from_secs(5), run)
+        .expect("建立 sysenv spawn 暫停呼叫");
+    let child_pid = call
+        .wait_for_pre_exec(Duration::from_secs(2))
+        .expect("未收到子行程進入 pre-exec 的 PID 通知");
+    assert!(
+        matches!(call.try_result(), Err(TryRecvError::Empty)),
+        "pre-exec 放行前 native().env.run() 不得完成；暫停子行程 PID={child_pid}"
+    );
+
+    // SAFETY: pid 是剛由 SysEnv spawn 回報且仍應停在 pre-exec 的子行程。
+    assert_eq!(
+        unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+        0,
+        "暫停子行程 PID={child_pid} 必須仍存活"
+    );
+
+    let fd_dir = format!("/proc/{child_pid}/fd");
+    let inherited_fds: Vec<String> = std::fs::read_dir(&fd_dir)
+        .unwrap_or_else(|error| panic!("讀取 {fd_dir} 失敗，子行程 PID={child_pid}: {error}"))
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = std::fs::metadata(entry.path()).ok()?;
+            (metadata.dev() == slave_metadata.dev() && metadata.ino() == slave_metadata.ino())
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    assert!(
+        !inherited_fds.is_empty(),
+        "暫停子行程 PID={child_pid} 的 /proc fd 中必須有與 PTY slave 相同 inode 的描述符"
+    );
+
+    PausedSysenvSpawn {
+        call,
+        child_pid,
+        _held_slave: held_slave,
+    }
+}
+
+#[test]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__native_attach_spawn_sysenv() {
+    let (dev, mut peer) = posix_pty_pair();
+    let mut paused = pause_sysenv_spawn_while_holding_slave(&dev, || {
+        sw_pal::native()
+            .env
+            .run(&["/bin/true".to_string()], Some(Duration::from_secs(8)))
+    });
+    let child_pid = paused.child_pid;
+
+    let serial_handle = match sw_pal::native().serial.open_exclusive(&dev, &cfg()) {
+        Ok(handle) => handle,
+        Err(OpenError::Held(report)) => panic!(
+            "暫停的 sysenv 子行程 PID={child_pid} 不得被判為外部 holder；open_exclusive 回 Held(pids={:?}, holder_unknown={})",
+            report.pids, report.holder_unknown
+        ),
+        Err(error) => panic!(
+            "暫停的 sysenv 子行程 PID={child_pid} 期間 open_exclusive 應成功，實際錯誤：{error:?}"
+        ),
+    };
+    assert_eq!(
+        peer.read_available(Duration::from_millis(100)),
+        Vec::<u8>::new(),
+        "sysenv spawn 與 attach 開埠不得向 PTY 對端送出資料"
+    );
+
+    paused.call.release().expect("放行 pre-exec 子行程");
+    let output = paused
+        .call
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 後 native().env.run() 未完成")
+        .expect("native().env.run() 失敗");
+    assert_eq!(output.rc, 0, "子行程 PID={child_pid} 應以 rc=0 結束");
+    paused.call.join().expect("回收 sysenv 呼叫執行緒");
+    drop(serial_handle);
+    drop(paused);
+
+    assert_eq!(
+        peer.read_available(Duration::from_millis(100)),
+        Vec::<u8>::new(),
+        "關閉 serial handle 後 PTY 對端仍不得有資料"
+    );
+}
+
 /// R0-F3：TIOCEXCL 是 tty 物件旗標，不隨 fd 關閉清除；PTY master 持續開啟時，CloseToken 必須先 TIOCNXCL 才關 fd，
 /// 否則 PROBE→close→正式 open 與 release→外部工具 open 都會 EBUSY。本測試在修正前必定 FAIL（第一次 reopen 即 EBUSY）。
 #[test]

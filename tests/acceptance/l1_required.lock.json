@@ -11167,6 +11167,7 @@
           "cargo:sw-pal::serial_posix::cap_posix_pty__conformance_suite",
           "cargo:sw-pal::serial_posix::cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy",
           "cargo:sw-pal::serial_posix::cap_posix_pty__external_plain_open_before_daemon_is_held",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_sysenv",
           "cargo:sw-pal::serial_posix::cap_posix_pty__open_failure_after_tiocexcl_clears_excl",
           "cargo:sw-pal::serial_posix::cap_posix_pty__own_child_inherited_tty_is_not_foreign_holder",
           "cargo:sw-pal::serial_posix::cap_posix_pty__probe_close_reopen_with_master_open",
