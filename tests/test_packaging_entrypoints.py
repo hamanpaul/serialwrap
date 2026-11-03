@@ -1,5 +1,7 @@
 import importlib
 
+import pytest
+
 
 def test_daemon_main_importable_from_package():
     mod = importlib.import_module("sw_core.daemon")
@@ -34,7 +36,8 @@ def test_copy_tree_handles_nested_skill_dir(tmp_path):
 
 
 def test_pyproject_declares_entrypoints_and_deps():
-    import tomllib, pathlib
+    tomllib = pytest.importorskip("tomllib", reason="tomllib 需要 Python 3.11+")
+    import pathlib
     data = tomllib.loads((pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml").read_text())
     scripts = data["project"]["scripts"]
     assert scripts["serialwrap"] == "sw_core.cli:main"
@@ -47,7 +50,8 @@ def test_reliability_dev_only_dist_contract():
     import importlib
     import pathlib
     import sys
-    import tomllib
+
+    tomllib = pytest.importorskip("tomllib", reason="tomllib 需要 Python 3.11+")
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
     data = tomllib.loads((repo_root / "reliability" / "pyproject.toml").read_text(encoding="utf-8"))
