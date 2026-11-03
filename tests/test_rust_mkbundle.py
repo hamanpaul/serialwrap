@@ -112,6 +112,55 @@ def test_manifest_validates_against_p1_schema(bundle):
     assert not errors, "; ".join(f"{list(e.absolute_path)}: {e.message}" for e in errors)
 
 
+def test_s1m241_manifest_fingerprint_matches_bundled_python(bundle):
+    out = bundle.out()
+    version_dir = _vdir(out)
+    python = version_dir / "py" / "bin" / "python3"
+    script = """
+import json
+import pathlib
+import sys
+import sysconfig
+
+import sw_core.version as version
+
+loaded = pathlib.Path(version.__file__).resolve().parent
+installed = pathlib.Path(sysconfig.get_path("purelib")).resolve() / "sw_core"
+bundled = pathlib.Path(sys.argv[1]).resolve()
+print(json.dumps({
+    "loaded": str(loaded),
+    "installed": str(installed),
+    "loaded_fingerprint": version.compute_code_fingerprint(str(loaded)),
+    "installed_fingerprint": version.compute_code_fingerprint(str(installed)),
+    "bundled_fingerprint": version.compute_code_fingerprint(str(bundled)),
+}))
+"""
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(version_dir / "py" / "sw_core"),
+        ],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    fingerprints = json.loads(result.stdout)
+    assert Path(fingerprints["loaded"]) == Path(fingerprints["installed"]), (
+        "隔離的 bundle runtime 必須載入 site-packages 內 daemon 使用的 sw_core"
+    )
+    assert fingerprints["loaded_fingerprint"] == fingerprints["installed_fingerprint"]
+    assert fingerprints["loaded_fingerprint"] == fingerprints["bundled_fingerprint"]
+    assert _manifest(out)["components"]["daemon"]["code_fingerprint"] == fingerprints[
+        "loaded_fingerprint"
+    ]
+
+
 def test_bin_serialwrap_is_symlink_into_versions(bundle):
     out = bundle.out()
     link = out / "bin" / "serialwrap"

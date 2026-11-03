@@ -1345,6 +1345,17 @@ pub fn locate_manifest(ctx: &Ctx<'_>) -> Result<(PathBuf, ReleaseManifest), Layo
     ))
 }
 
+/// 依既有定位規則讀取 bundle 宣告的 Python daemon 程式碼指紋。
+///
+/// 開發建置沒有 manifest、或舊 manifest 未提供欄位時回傳 `Ok(None)`；manifest 存在但無法解析時保留原錯誤。
+pub fn code_fingerprint(ctx: &Ctx<'_>) -> Result<Option<String>, LayoutError> {
+    match locate_manifest(ctx) {
+        Ok((_, manifest)) => Ok(manifest.code_fingerprint().map(str::to_owned)),
+        Err(LayoutError::ManifestNotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn dict_string(dict: &mut PyDict, key: &str, value: impl Into<String>) {
     dict.insert(key, PyValue::Str(value.into()));
 }

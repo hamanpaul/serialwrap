@@ -43,10 +43,68 @@ fn test_parse_manifest_fixture_normal() {
                 "sw_core.cli".into(),
             ],
             state_schema: None,
+            code_fingerprint: None,
             task_xml_template_sha256: None,
             raw: manifest.raw.clone(),
         }
     );
+}
+
+#[test]
+fn s1m241_manifest_fingerprint_optional() {
+    let base = r#"{
+      "schema_version": 1,
+      "bundle_version": "0.3.2",
+      "stage": "1A",
+      "target": "x86_64-unknown-linux-gnu",
+      "git_revision": "abcdef0123456789",
+      "components": {
+        "python_cli_delegate": {"entry": ["py/python"]},
+        "daemon": {}
+      }
+    }"#;
+    let missing = parse_manifest(base).expect("缺少選用指紋仍可解析");
+    assert_eq!(missing.code_fingerprint, None);
+
+    let with_fingerprint = base.replace(
+        "\"daemon\": {}",
+        "\"daemon\": {\"code_fingerprint\": \"a1b2c3d4e5f6\"}",
+    );
+    let parsed = parse_manifest(&with_fingerprint).expect("有效指紋應可解析");
+    assert_eq!(parsed.code_fingerprint.as_deref(), Some("a1b2c3d4e5f6"));
+
+    let legacy = r#"{
+      "schema_version": 1,
+      "bundle_version": "0.3.2",
+      "stage": "1A",
+      "target": "x86_64-unknown-linux-gnu",
+      "git_revision": "abcdef0123456789",
+      "components": {"python_cli_delegate": {"entry": ["py/python"]}}
+    }"#;
+    assert_eq!(
+        parse_manifest(legacy)
+            .expect("舊 manifest 仍有效")
+            .code_fingerprint,
+        None
+    );
+
+    for invalid in [
+        "7",
+        "true",
+        "null",
+        "\"ABCDEF012345\"",
+        "\"abc123\"",
+        "\"0123456789g1\"",
+    ] {
+        let text = base.replace(
+            "\"daemon\": {}",
+            &format!("\"daemon\": {{\"code_fingerprint\": {invalid}}}"),
+        );
+        assert!(
+            matches!(parse_manifest(&text), Err(ManifestError::Schema(_))),
+            "錯誤指紋必須拒絕：{invalid}"
+        );
+    }
 }
 
 #[test]

@@ -374,6 +374,25 @@ for number, line in enumerate(golden_path.read_text(encoding="utf-8").splitlines
 PY
 
   PACKAGE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m; print(m.package_tree_sha256())')"
+  CODE_FINGERPRINT="$("$PYTHON" -I -B - "$PY_DIR/sw_core" "$PY_SITE/sw_core" <<'PY'
+import pathlib
+import sys
+
+import sw_core.version as version
+
+bundled_package, installed_package = (pathlib.Path(value).resolve() for value in sys.argv[1:])
+loaded_package = pathlib.Path(version.__file__).resolve().parent
+if loaded_package != installed_package:
+    raise SystemExit(f"daemon bundle runtime 載入了非預期 sw_core：{loaded_package}")
+fingerprints = [
+    version.compute_code_fingerprint(str(root))
+    for root in (installed_package, bundled_package)
+]
+if fingerprints[0] is None or fingerprints[0] != fingerprints[1]:
+    raise SystemExit(f"bundle 的兩份 sw_core 指紋不一致：{fingerprints}")
+print(fingerprints[0])
+PY
+  )"
   PROFILE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m, sys; print(m.tree_sha256(sys.argv[1]))' "$REPO_ROOT/sw_core/assets/profiles")"
   CLI_SHA="$(sha256_file "$VERSION_DIR/bin/$CLI_NAME")"
   LAUNCHER_SHA="$(sha256_file "$VERSION_DIR/bin/$DAEMON_NAME")"
@@ -408,7 +427,8 @@ PY
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
-    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" <<'PY'
+    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" \
+    "$CODE_FINGERPRINT" <<'PY'
 import datetime
 import json
 import sys
@@ -434,7 +454,8 @@ import sys
     com0com_helper,
     com0com_helper_sha,
     sentinel_entry,
-) = sys.argv[1:21]
+    code_fingerprint,
+) = sys.argv[1:22]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -463,6 +484,7 @@ manifest = {
             "git_revision": revision,
             "entry": ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"],
             "state_schema": "python-state-v0",
+            "code_fingerprint": code_fingerprint,
             "launcher": {"path": "bin/serialwrapd", "sha256": launcher_sha},
             "runtime": {
                 "path": "py/bin/python3",
