@@ -472,6 +472,133 @@ fn cap_posix_pty__native_attach_spawn_sysenv() {
     );
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__native_attach_spawn_process_tunnel() {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let (dev, mut peer) = posix_pty_pair();
+    let inherited_slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&dev.0)
+        .expect("以普通 open 持有非 CLOEXEC PTY slave");
+    let slave_metadata = inherited_slave.metadata().expect("取得 PTY slave inode");
+    let inherited_fd = inherited_slave.as_raw_fd();
+    // SAFETY: inherited_slave 仍開啟且由本測試持有，是有效 fd。
+    let fd_flags = unsafe { libc::fcntl(inherited_fd, libc::F_GETFD) };
+    assert!(
+        fd_flags >= 0,
+        "讀取 inherited slave fd flags 失敗：{fd_flags}"
+    );
+    // SAFETY: inherited_slave 仍開啟；只清除此 fd 的 close-on-exec 旗標。
+    assert_eq!(
+        unsafe { libc::fcntl(inherited_fd, libc::F_SETFD, fd_flags & !libc::FD_CLOEXEC) },
+        0,
+        "清除 inherited slave fd 的 FD_CLOEXEC 失敗"
+    );
+    // SAFETY: inherited_slave 仍開啟且由本測試持有，是有效 fd。
+    let inherited_flags = unsafe { libc::fcntl(inherited_fd, libc::F_GETFD) };
+    assert!(
+        inherited_flags >= 0 && inherited_flags & libc::FD_CLOEXEC == 0,
+        "spawn 前 PTY slave fd 必須非 CLOEXEC（flags={inherited_flags}）"
+    );
+
+    let log_dir = tempfile::tempdir().expect("建立 process_tunnel log 暫存目錄");
+    let log = log_dir.path().join("process-tunnel.log");
+    let argv = vec!["/bin/sleep".to_string(), "30".to_string()];
+    let tunnel = sw_pal::native().tunnel.clone();
+    let spawn_tunnel = tunnel.clone();
+    let (cleanup_sender, cleanup_result) = mpsc::channel();
+    let fixture_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pause_sysenv_spawn_while_holding_slave(&dev, move || {
+            let result = spawn_tunnel.spawn_detached(&argv, &log);
+            let cleanup_copy = result
+                .as_ref()
+                .map(Clone::clone)
+                .map_err(|error| format!("{error:?}"));
+            let _ = cleanup_sender.send(cleanup_copy);
+            result
+        })
+    }));
+
+    let mut paused = match fixture_result {
+        Ok(paused) => paused,
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("暫停夾具發生非字串 panic");
+            let spawn_result = cleanup_result.recv_timeout(Duration::from_secs(2));
+            let cleanup_result = match spawn_result {
+                Ok(Ok(process)) => tunnel
+                    .terminate(&process, Duration::from_millis(100))
+                    .err()
+                    .map(|error| format!("terminate 失敗：{error:?}")),
+                Ok(Err(error)) => Some(format!("spawn_detached 失敗：{error}")),
+                Err(error) => Some(format!("收取 spawn 結果失敗：{error}")),
+            };
+            drop(inherited_slave);
+            panic!(
+                "未取得 process_tunnel pre-exec 通知；暫停接線缺漏紅燈（{reason}）；清理結果：{cleanup_result:?}"
+            );
+        }
+    };
+
+    let child_pid = paused.child_pid;
+    let inherited_fd_path = format!("/proc/{child_pid}/fd/{inherited_fd}");
+    let inherited_fd_check = std::fs::metadata(&inherited_fd_path).map(|metadata| {
+        metadata.dev() == slave_metadata.dev() && metadata.ino() == slave_metadata.ino()
+    });
+    let attach_result = sw_pal::native().serial.open_exclusive(&dev, &cfg());
+    let peer_bytes = peer.read_available(Duration::from_millis(100));
+
+    let release_result = paused.call.release();
+    let spawn_result = paused.call.recv_timeout(Duration::from_secs(8));
+    let join_result = paused.call.join();
+    drop(paused);
+    let cleanup_spawn_result = cleanup_result.recv_timeout(Duration::from_secs(2));
+    let terminate_result = match &cleanup_spawn_result {
+        Ok(Ok(process)) => tunnel.terminate(process, Duration::from_millis(100)),
+        Ok(Err(_)) | Err(_) => Ok(()),
+    };
+    drop(inherited_slave);
+
+    assert!(
+        matches!(&spawn_result, Ok(Ok(_))),
+        "release 後 native().tunnel.spawn_detached() 應成功，實際結果：{spawn_result:?}"
+    );
+    assert!(join_result.is_ok(), "回收 process_tunnel 呼叫執行緒失敗");
+    assert!(
+        release_result.is_ok(),
+        "放行 process_tunnel pre-exec 失敗：{release_result:?}"
+    );
+    assert!(
+        matches!(&inherited_fd_check, Ok(true)),
+        "pre-exec 子行程 PID={child_pid} 必須仍持有同編號、同 inode 的非 CLOEXEC slave fd，實際：{inherited_fd_check:?}"
+    );
+    assert!(
+        matches!(&cleanup_spawn_result, Ok(Ok(_))),
+        "清理通道應收到 process_tunnel spawn 結果：{cleanup_spawn_result:?}"
+    );
+    assert!(
+        terminate_result.is_ok(),
+        "回收 process_tunnel 建立的行程群組失敗：{terminate_result:?}"
+    );
+    assert!(
+        attach_result.is_ok(),
+        "暫停的 process_tunnel 子行程 PID={child_pid} 不得被判為外部 holder；open_exclusive 結果：{}",
+        show_open(&attach_result)
+    );
+    assert!(
+        peer_bytes.is_empty(),
+        "process_tunnel spawn 與 attach 開埠不得向 PTY 對端送出資料：{peer_bytes:?}"
+    );
+}
+
 /// R0-F3：TIOCEXCL 是 tty 物件旗標，不隨 fd 關閉清除；PTY master 持續開啟時，CloseToken 必須先 TIOCNXCL 才關 fd，
 /// 否則 PROBE→close→正式 open 與 release→外部工具 open 都會 EBUSY。本測試在修正前必定 FAIL（第一次 reopen 即 EBUSY）。
 #[test]
