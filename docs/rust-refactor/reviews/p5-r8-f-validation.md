@@ -73,3 +73,34 @@
 | workspace selector 200 輪 | 未執行；無輪次報告檔。 |
 
 REMAINING: 依裁決透過獲派的出口證據流程完成完整 workspace selector 200/200；在不觸及 production live 資源的環境取得 pytest 證據；補齊 ITEM 1/2 原始條件與紅燈輸出索引。Windows 原生及硬體項維持 BLOCKED-OWNER。
+
+## 第 2 輪整體驗收（2026-11-03）
+
+- 起點：`3c8cd7d5`，`feature/rust-refactor-p5`；開始時工作樹乾淨，HEAD 與 `origin/feature/rust-refactor-p5` 相同。本輪只補整體驗收證據，沒有改產品碼、測試、golden、契約、selector 或凍結鎖。
+- 裁決：`origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/p5.md:44` 要求根因修正後同條件 workspace selector 連續至少 200 次零失敗；`:46` 要求 `WorkerStopped` receipt 送出前有界等待同 epoch 已入列 RX 完成 dispatch，且不改 OD-64 契約。
+- 接線核對：原測試維持於 `crates/sw-core/tests/lease_selftest.rs:1254-1345`；control FIFO 為 `:1277-1285`，0～1.9 ms 錯開為 `:1275-1276`，未設定 `SW_T14_RACE_ITERS` 時預設 1000 為 `:1265-1268`，golden／OS submit 計數為 `:1257-1264`、`:1273`、`:1316`、`:1325`，release／reattach 為 `:1289-1297`、`:1329-1338`，兩分支必要斷言為 `:1340-1345`。`bedc8deb` 的時鐘次序修正仍在 `:1286-1308`。OD-69 barrier 於 `crates/sw-core/src/uart_bridge.rs:687-716` 先等 dispatch，再送 receipt；有界等待與逾時證據缺口位於 `:722-756`。OD-64／OD-69 的逐項依據另見原第 1 輪紀錄。
+- 紅綠證據：可追溯的既有紅燈仍是 `docs/rust-refactor/reviews/p5-fix-responses.md:50` 記載的 F92 第 863 輪分類不符。第 2 輪以未改名原測試、預設 1000 次實跑通過，`committed=872`、`refused=128`；輸出 `target/p5-r8-f-validation/round2/race-exact.log`，1 passed、0 failed、33 filtered，12.67 秒。未取得 ITEM 2 時鐘次序修正的獨立 pre-fix 紅燈輸出，因此不宣稱已有該紅燈證據。
+
+### 第 2 輪命令結果
+
+所有命令以前景執行並等候結束；原始輸出位於 `target/p5-r8-f-validation/round2/`。
+
+| 命令 | 結果 | 輸出 |
+|---|---|---|
+| `cargo test -p sw-core --features test-fakes --test lease_selftest selftest_probe_drain_race_golden -- --exact --nocapture` | exit 0；1 passed、0 failed、33 filtered；1000 次內部競態，兩分支皆出現 | `race-exact.log` |
+| `cargo test -p sw-core --features test-fakes` | exit 0；560 passed、0 failed、0 ignored | `sw-core-test-fakes.log` |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；完成 cross-check，有 3 個既有 unused/dead-code warnings；不是 Windows 原生實跑 | `windows-check.log` |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出 | `cfg-boundary.log` |
+| `python3 -m tools.contracts check` | exit 0；`ok=true`、`findings=[]` | `contracts-check.log` |
+| `python3 tests/acceptance/regen_lock.py --check` | exit 0；鎖檔、案例屬性快照、統計與 L1 必要集合結構一致 | `regen-lock-check.log` |
+| `python3 -m policy_check --repo .` | exit 0；25 pass、0 fail、2 warn（R-19 workflow 解析、R-22 既有懸空引用） | `policy-check.log` |
+
+本輪沒有修改 Python 程式或測試，故沒有觸及 Python 測試。依本輪編排者註，未執行全套 pytest、slice gate、Docker 或出口證據 driver；其中完整 workspace selector 200 輪仍未取得，不以單次 `sw-core` 測試替代。pytest 的 live guard／production 存取限制沿用第 1 輪 SPEC-GAP 說明。
+
+### 審查處理與未結項
+
+- 前審 A-1～A-8 的 High／Medium 均已由 `25ad3900` 修復；本輪沒有新 High／Medium，B 段仍為 `NO FINDINGS`。本輪未重做範圍外修復。
+- 既有碼待辦仍限於 `tests/test_l1_judge.py:932` 的 `moved == 22` 計數與實際能力列數差異，以及 `tests/acceptance/l1_required.lock.json` 的 Windows ignored 能力列；本輪未跑 pytest、未改 judge 或鎖。
+- Windows 原生與硬體項目沒有執行，維持 `BLOCKED-OWNER`；Windows GNU 編譯只證明 cross-check 通過。
+
+REMAINING: 依裁決完成同條件完整 workspace selector 200/200；於本輪允許範圍以外另行取得全套 pytest 證據；補齊 ITEM 1/2 環境對照與 ITEM 2 獨立 pre-fix 紅燈索引。Windows 原生及硬體項維持 BLOCKED-OWNER。
