@@ -253,6 +253,7 @@ name = "sw-cli"
 version = "0.3.2"
 dependencies = [
  "indexmap",
+ "sw-cli",
  "sw-pal",
  "sw-proto",
  "tempfile",

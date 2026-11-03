@@ -22,7 +22,7 @@ const RELEASED_SESSION_STATE: &[u8] = b"released";
 
 // 中斷注入點（Task 12 R1-F5）：只由整合測試經 `set_test_crash_point`／`set_test_hook` 設定，
 // 產品路徑不設定時 `crash_if` 只做一次 thread-local 讀取、無任何副作用。不以 `debug_assertions`
-// 切換編譯（arch §2.1 cfg 邊界只允許 `test`／`feature = "test-fakes"`；sw-cli 整合測試無法啟用自身 feature）。
+// 切換編譯（arch §2.1 cfg 邊界只允許 `test`／`feature = "test-fakes"`；整合測試透過 dev-dependency 啟用自身 feature）。
 thread_local! {
     static TEST_CRASH_POINT: RefCell<Option<String>> = RefCell::new(None);
     static TEST_HOOK: RefCell<Option<(String, Box<dyn FnOnce()>)>> = RefCell::new(None);

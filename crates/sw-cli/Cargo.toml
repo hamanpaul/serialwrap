@@ -24,5 +24,6 @@ sw-pal = { path = "../sw-pal" }
 indexmap = { workspace = true }
 
 [dev-dependencies]
+sw-cli = { path = ".", features = ["test-fakes"] }
 sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
 tempfile = { workspace = true }

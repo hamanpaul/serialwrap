@@ -156,7 +156,7 @@ fi
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
 # 更新 race barrier 與安裝故障注入僅編入 `--dev` bundle；正式候選不帶測試 feature。
 if [[ "$DEV" -eq 1 ]]; then
-  BUILD_ARGS+=(--features sw-cli/test-fakes)
+  BUILD_ARGS+=(--features test-fakes)
 fi
 if [[ -n "$COM0COM_ZIP" ]]; then
   BUILD_ARGS+=(-p sw-com0com-helper)
