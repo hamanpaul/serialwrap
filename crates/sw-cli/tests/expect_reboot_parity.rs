@@ -1,13 +1,49 @@
-//! `cmd submit --expect-reboot` 的 Python／Rust CLI 黑箱對照。
+//! `cmd submit --expect-reboot` 的 Python 3.12 CLI 基線位元組對照。
 
-mod common;
+use std::ffi::OsString;
+use std::sync::Arc;
 
-use std::process::Command;
+use sw_pal::fakes::{FakeClock, FakeConn, FakeEnv, MemFs, RecordingProcess, ScriptedConnector};
+use sw_pal::{
+    BackendKind, ClientCaps, ClientPlatform, Clock, PalPathFlavor, RpcConnector, SkillPlatform,
+};
+
+fn platform() -> (ClientPlatform, Arc<ScriptedConnector>) {
+    let clock = Arc::new(FakeClock::default());
+    let conn = Arc::new(ScriptedConnector::new(
+        vec![FakeConn::Timeout],
+        Arc::clone(&clock),
+        true,
+    ));
+    let p = ClientPlatform {
+        env: Arc::new(FakeEnv::default()),
+        fs: Arc::new(MemFs::default()),
+        clock: clock as Arc<dyn Clock>,
+        rpc: Arc::clone(&conn) as Arc<dyn RpcConnector>,
+        process: Arc::new(RecordingProcess::default()),
+        procs: sw_pal::fakes::FakeProcScan::new(Vec::new()),
+        tunnel: sw_pal::fakes::FakeTunnel::new(false),
+        service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
+        registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        caps: ClientCaps {
+            path_flavor: PalPathFlavor::Posix,
+            af_unix: true,
+            native_backend: BackendKind::Posix,
+            default_skill: SkillPlatform::Linux,
+            text_newline: "\n",
+            exec_replace: true,
+            on_demand_autostart: false,
+            console_kind: sw_pal::ConsoleKind::Pty,
+        },
+    };
+    (p, conn)
+}
 
 #[test]
-fn interactive_rejection_matches_python_cli_byte_for_byte() {
-    let root = common::data_root();
-    let args = [
+fn interactive_rejection_matches_python_cli_baseline_byte_for_byte() {
+    let (p, conn) = platform();
+    let argv = [
+        "serialwrap",
         "--socket",
         "/tmp/serialwrap-s1m242-never-connect.sock",
         "cmd",
@@ -19,31 +55,23 @@ fn interactive_rejection_matches_python_cli_byte_for_byte() {
         "--mode",
         "interactive",
         "--expect-reboot",
-    ];
-    let rust = Command::new(env!("CARGO_BIN_EXE_serialwrap"))
-        .args(args)
-        .current_dir(&root)
-        .env("COLUMNS", "80")
-        .output()
-        .expect("Rust CLI 執行失敗");
-    let python = Command::new("python3")
-        .args(["-m", "sw_core.cli"])
-        .args(args)
-        .current_dir(&root)
-        .env("COLUMNS", "80")
-        .output()
-        .expect("Python CLI 執行失敗");
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let rc = sw_cli::run(argv, &p, &mut stdout, &mut stderr);
 
+    // 預期 bytes 取自 Python 3.12 `python3 -m sw_core.cli` 基線輸出。
     let expected = concat!(
         "{\"error_code\":\"EXPECT_REBOOT_MODE_UNSUPPORTED\",",
         "\"hint\":\"--expect-reboot 只適用 line／background 模式；",
         "interactive 是 lease 按鍵通道，不走 reboot 路徑。\",",
         "\"ok\":false}\n"
     );
-    assert_eq!(python.status.code(), Some(1));
-    assert_eq!(python.stdout, expected.as_bytes());
-    assert!(python.stderr.is_empty());
-    assert_eq!(rust.status.code(), python.status.code());
-    assert_eq!(rust.stdout, python.stdout);
-    assert_eq!(rust.stderr, python.stderr);
+    assert_eq!(rc, 1);
+    assert_eq!(stdout, expected.as_bytes());
+    assert!(stderr.is_empty());
+    assert!(conn.sent().is_empty(), "interactive 拒絕不得送出 RPC");
 }
