@@ -147,8 +147,13 @@ pub fn run(
         return delegate::run_delegate(&mut ctx, tail, group);
     }
 
+    let version_line = install_layout::code_fingerprint(&ctx)
+        .ok()
+        .flatten()
+        .map(|fingerprint| format!("serialwrap {CLI_VERSION} (code {fingerprint})"))
+        .unwrap_or_else(|| format!("serialwrap {CLI_VERSION}"));
     let spec = root_spec(&SpecDefaults {
-        version_line: format!("serialwrap {CLI_VERSION}"),
+        version_line,
         profile_dir: ctx.paths.profile_dir.clone(),
         lock_path: ctx.paths.lock_path.clone(),
     });

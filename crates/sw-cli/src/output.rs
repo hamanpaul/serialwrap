@@ -71,20 +71,48 @@ pub fn mirror_err(io: &mut TextIo, resp: &PyDict, context: Option<&str>) -> std:
     io.err_str(&format!("{}\n", format_err_line(resp, context)))
 }
 
-/// Q-28：版本警告（`_warn_version_mismatch`）。
+/// Q-28：版本／程式碼指紋警告（`_warn_version_mismatch`）。
 ///
-/// 回應 `version` 非字串或 strip 後為空時靜默略過；CLI 版本為 `unknown` 或與 daemon 版本相同時亦不輸出。
+/// 有效 daemon 版本與已知 CLI 版本不同時只輸出版本警告；否則再比較可用的程式碼指紋。
 pub fn warn_version_mismatch(io: &mut TextIo, resp: &PyDict, cli_version: &str) -> std::io::Result<()> {
+    warn_version_mismatch_with_fingerprint(io, resp, cli_version, None)
+}
+
+/// 帶 CLI 程式碼指紋的版本警告；舊呼叫端可繼續使用 [`warn_version_mismatch`]。
+pub fn warn_version_mismatch_with_fingerprint(
+    io: &mut TextIo,
+    resp: &PyDict,
+    cli_version: &str,
+    cli_fingerprint: Option<&str>,
+) -> std::io::Result<()> {
     let daemon_version = match resp.get("version") {
-        Some(PyValue::Str(s)) if !py_strip(s).is_empty() => s.as_str(),
+        Some(PyValue::Str(s)) if !py_strip(s).is_empty() => Some(s.as_str()),
+        _ => None,
+    };
+    if let Some(daemon_version) = daemon_version {
+        if cli_version != "unknown" && cli_version != daemon_version {
+            io.err_str(&format!(
+                "serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致\
+（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+            ))?;
+            return Ok(());
+        }
+    }
+
+    let daemon_fingerprint = match resp.get("code_fingerprint") {
+        Some(PyValue::Str(value)) if !value.is_empty() => value.as_str(),
         _ => return Ok(()),
     };
-    if cli_version == "unknown" || cli_version == daemon_version {
+    let Some(cli_fingerprint) = cli_fingerprint else {
+        return Ok(());
+    };
+    if cli_fingerprint == daemon_fingerprint {
         return Ok(());
     }
+
     io.err_str(&format!(
-        "serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致\
-（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+        "serialwrap: client 程式碼 {cli_fingerprint} 與 daemon 程式碼 {daemon_fingerprint} 不一致\
+（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n"
     ))
 }
 

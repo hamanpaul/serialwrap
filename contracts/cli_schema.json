@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 7,
+  "x-catalog-revision": 8,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -3079,20 +3079,22 @@
   ],
   "x-version": {
     "flag_output": "serialwrap <VERSION> (code <FINGERPRINT>)\n",
+    "fingerprint_source": "Rust CLI uses components.daemon.code_fingerprint from the release-manifest.json located for its bundle; the value fingerprints the bundled sw_core/**/*.py files with the sw_core/version.py algorithm, not the Rust executable.",
     "stream": "stdout",
     "mismatch_warning": {
       "stream": "stderr",
       "blocking": false,
       "template": "serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n",
-      "precedence": "版本不符時只輸出版本警告並返回；版本相同或缺省時才檢查程式碼指紋"
+      "precedence": "有效且非空白的 daemon version 與已知 CLI version 不同時只輸出版本警告並返回；否則繼續檢查指紋，包括 daemon version 相同、CLI version 為 unknown，或 daemon version 缺失、非字串、空白的情況"
     },
     "flag_output_without_fingerprint": "serialwrap <VERSION>\n",
+    "fingerprint_fallback": "沒有 release manifest 或 manifest 缺少 components.daemon.code_fingerprint 時，--version 只輸出純版本字串；一般命令不啟動 Python 子行程來計算指紋",
     "fingerprint_format": "(code <12 lowercase hex characters>)",
     "code_mismatch_warning": {
       "stream": "stderr",
       "blocking": false,
       "template": "serialwrap: client 程式碼 {cli_fingerprint} 與 daemon 程式碼 {daemon_fingerprint} 不一致（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n",
-      "when": "daemon 回報非空指紋且與本 client 可計算出的指紋不同；舊 daemon 或本地指紋不可用時靜默略過"
+      "when": "daemon 回報非空字串指紋，且同 bundle manifest 提供的 CLI 指紋不同；舊 daemon 或本地指紋不可用時靜默略過"
     }
   },
   "x-delegation-1a": [
