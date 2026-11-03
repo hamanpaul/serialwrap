@@ -141,6 +141,163 @@ fn s1m241_setup_assessment_matrix() {
     );
 }
 
+/// 建立真正的安裝目錄形狀，讓 `setup` 由正式 reconcile 路徑讀取 manifest。
+fn s1m241_installed_setup_env(installed_fingerprint: Option<&str>) -> TestEnv {
+    let version = sw_cli::CLI_VERSION;
+    let t = TestEnv::posix()
+        .with_real_service()
+        .with_config("supervision_mode: on-demand\n");
+    let root = t.bundle_dir();
+    let version_dir = root.join("versions").join(version);
+    support::write_complete_bundle(
+        &version_dir,
+        version,
+        "x86_64-unknown-linux-gnu",
+        false,
+        &[],
+        &[],
+    );
+
+    if let Some(fingerprint) = installed_fingerprint {
+        let manifest_path = version_dir.join("release-manifest.json");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("manifest 讀取失敗");
+        let needle = "\"state_schema\":\"python-state-v0\"";
+        let replacement = format!("\"code_fingerprint\":\"{fingerprint}\",{needle}");
+        let updated = manifest.replacen(needle, &replacement, 1);
+        assert_ne!(updated, manifest, "測試 manifest 缺少 daemon state_schema");
+        std::fs::write(&manifest_path, updated).expect("manifest 指紋寫入失敗");
+    }
+
+    let stable_bin = root.join("bin");
+    std::fs::create_dir_all(&stable_bin).expect("安裝入口目錄建立失敗");
+    for name in ["serialwrap", "serialwrapd"] {
+        std::fs::copy(version_dir.join("bin").join(name), stable_bin.join(name))
+            .expect("安裝入口複製失敗");
+    }
+    let current = format!(r#"{{"bundle_version":"{version}","dir":"versions/{version}"}}"#);
+    std::fs::write(root.join("current-release.json"), current)
+        .expect("current-release.json 寫入失敗");
+
+    let manifest = version_dir.join("release-manifest.json");
+    t.with_var("SERIALWRAP_INSTALL_ROOT", root.to_str().expect("安裝根路徑非 UTF-8"))
+        .with_var(
+            "SERIALWRAP_RELEASE_MANIFEST",
+            manifest.to_str().expect("manifest 路徑非 UTF-8"),
+        )
+}
+
+#[test]
+fn s1m241_assessment_matching_ping_is_reported_once() {
+    const FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_rpc_ok(
+            &endpoint,
+            "health.ping",
+            &format!(
+                r#"{{"ok":true,"pid":1234,"version":"{}","code_fingerprint":"{FINGERPRINT}"}}"#,
+                sw_cli::CLI_VERSION
+            ),
+        )
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+
+    let (rc, out, err) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    assert_eq!(err, "");
+    assert_eq!(out.lines().count(), 1, "setup stdout 必須只有一行 JSON");
+    let result = json(&out);
+    let daemon_code = dict_field(&result, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), "none");
+    assert_eq!(str_field(&daemon_code, "daemon"), FINGERPRINT);
+    assert_eq!(str_field(&daemon_code, "installed"), FINGERPRINT);
+    assert!(matches!(
+        &daemon_code,
+        PyValue::Dict(fields) if fields.get("checked").is_none()
+    ));
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+    assert!(t.calls().iter().all(|argv| {
+        !argv.iter().any(|arg| arg == "is-active" || arg == "restart")
+    }));
+}
+
+#[test]
+fn s1m241_assessment_is_omitted_without_installed_fingerprint() {
+    const DAEMON_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(None);
+    let endpoint = t.default_socket();
+    let t = t
+        .with_rpc_ok(
+            &endpoint,
+            "health.ping",
+            &format!(r#"{{"ok":true,"pid":1234,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#),
+        )
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+
+    let (rc, out, err) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    let result = json(&out);
+    assert!(matches!(
+        &result,
+        PyValue::Dict(fields) if fields.get("daemon_code").is_none()
+    ));
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+}
+
+#[test]
+fn s1m241_assessment_is_omitted_when_manifest_is_missing() {
+    const FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(FINGERPRINT));
+    let endpoint = t.default_socket();
+    std::fs::remove_file(
+        t.bundle_dir()
+            .join("versions")
+            .join(sw_cli::CLI_VERSION)
+            .join("release-manifest.json"),
+    )
+    .expect("測試 manifest 移除失敗");
+    let t = t
+        .with_rpc_ok(
+            &endpoint,
+            "health.ping",
+            &format!(r#"{{"ok":true,"pid":1234,"code_fingerprint":"{FINGERPRINT}"}}"#),
+        )
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+
+    let (rc, out, err) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    let result = json(&out);
+    assert!(matches!(
+        &result,
+        PyValue::Dict(fields) if fields.get("daemon_code").is_none()
+    ));
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+}
+
+#[test]
+fn s1m241_assessment_is_omitted_when_initial_ping_is_unreachable() {
+    const FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t.with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":false}"#);
+
+    let (rc, out, err) = t.run(&["setup", "--on-demand"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    let result = json(&out);
+    assert!(matches!(
+        &result,
+        PyValue::Dict(fields) if fields.get("daemon_code").is_none()
+    ));
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+}
+
 #[test]
 fn s1m241_setup_restart_decision_order() {
     use sw_cli::setup_cmd::{

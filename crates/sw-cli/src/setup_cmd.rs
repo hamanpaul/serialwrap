@@ -1630,6 +1630,39 @@ fn rpc_response(ctx: &CliCtx<'_>, endpoint: &str, method: &str, timeout: f64) ->
     .map(|outcome| outcome.resp)
 }
 
+fn daemon_code_value(assessment: &DaemonCodeAssessment, action: DaemonRestartAction) -> PyDict {
+    let mut value = PyDict::new();
+    value.insert("stale", PyValue::Bool(assessment.stale));
+    value.insert(
+        "reason",
+        assessment
+            .reason
+            .as_ref()
+            .map(|reason| PyValue::Str(reason.clone()))
+            .unwrap_or(PyValue::Null),
+    );
+    value.insert(
+        "daemon",
+        assessment
+            .daemon
+            .as_ref()
+            .map(|fingerprint| PyValue::Str(fingerprint.clone()))
+            .unwrap_or(PyValue::Null),
+    );
+    value.insert(
+        "installed",
+        assessment
+            .installed
+            .as_ref()
+            .map(|fingerprint| PyValue::Str(fingerprint.clone()))
+            .unwrap_or(PyValue::Null),
+    );
+    if let Some(action) = action.as_str() {
+        value.insert("action", PyValue::Str(action.to_string()));
+    }
+    value
+}
+
 /// 驗證 restart 後 daemon 首次可連線時回報的程式碼指紋。
 pub fn verify_daemon_code_after_restart(
     ctx: &CliCtx<'_>,
@@ -1881,8 +1914,17 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         .as_ref()
         .map(|resolved| resolved.endpoint.clone())
         .unwrap_or_else(|_| endpoint_resolve::local_default_endpoint(ctx));
-    let daemon_running = rpc_response(ctx, &old_endpoint, "health.ping", 0.5)
+    let ping = rpc_response(ctx, &old_endpoint, "health.ping", 0.5);
+    let daemon_running = ping
+        .as_ref()
         .is_some_and(|response| response.get_truthy("ok"));
+    let daemon_fingerprint = ping
+        .as_ref()
+        .and_then(|response| response.get("code_fingerprint"))
+        .and_then(|value| match value {
+            PyValue::Str(fingerprint) if !fingerprint.is_empty() => Some(fingerprint.clone()),
+            _ => None,
+        });
     let any_flashing = rpc_response(ctx, &old_endpoint, "mcu.status", 0.5)
         .is_some_and(|response| response.get_truthy("flashing"));
     if any_flashing && !force {
@@ -2027,10 +2069,32 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         setup.insert("pending_sudo", PyValue::List(pending.clone()));
     }
 
+    let installed_fingerprint = install_layout::code_fingerprint(ctx).ok().flatten();
+    let assessment = daemon_code_assessment(
+        daemon_running,
+        daemon_fingerprint.as_deref(),
+        installed_fingerprint.as_deref(),
+    );
+    let restart_action = select_daemon_restart_action(
+        ctx,
+        &req.old_mode,
+        &req.target_mode,
+        &assessment,
+        flag(ns, "no_restart"),
+        any_flashing,
+        force,
+    );
+
     let mut response = PyDict::new();
     response.insert("ok", PyValue::Bool(true));
     response.insert("legacy", legacy);
     response.insert("setup", PyValue::Dict(setup));
+    if assessment.checked {
+        response.insert(
+            "daemon_code",
+            PyValue::Dict(daemon_code_value(&assessment, restart_action)),
+        );
+    }
     if let Some(recovered) = recovered_autostart_hold {
         response.insert("recovered_autostart_hold", PyValue::Dict(recovered));
     }
