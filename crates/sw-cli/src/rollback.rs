@@ -1673,6 +1673,7 @@ fn execute_change_with_restore(
             socket_path: Some(socket_path),
             config_path: endpoint_resolve::config_write_path(ctx),
             old_stop: if legacy_stopped.is_some() { crate::setup_cmd::OldStop::AlreadyStopped } else { crate::setup_cmd::OldStop::Reconcile },
+            restart_daemon: false,
         };
         let setup_result = match crate::setup_cmd::reconcile(ctx, &setup_req) {
             Ok(result) => result,
@@ -4059,6 +4060,7 @@ pub fn run_supervision_switch(
         socket_path: Some(socket),
         config_path: crate::endpoint_resolve::config_write_path(ctx),
         old_stop: crate::setup_cmd::OldStop::Reconcile,
+        restart_daemon: false,
     };
     let must_handoff = old != *target && crate::setup_cmd::reconcile_stops_old(ctx, &request);
     if !must_handoff {

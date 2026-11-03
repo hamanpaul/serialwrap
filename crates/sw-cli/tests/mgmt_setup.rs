@@ -1256,6 +1256,7 @@ fn reconcile_handed_off_never_sends_daemon_stop() {
                     "handoff_stop".into(),
                 ]],
             },
+            restart_daemon: false,
         };
         t.with_cli_ctx(|ctx| {
             let res = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
@@ -1312,6 +1313,7 @@ fn reconcile_handed_off_never_sends_daemon_stop() {
                 "handoff_stop".into(),
             ]],
         },
+        restart_daemon: false,
     };
     t2.with_cli_ctx(|ctx| {
         let err = sw_cli::setup_cmd::reconcile(ctx, &req2).unwrap_err();
@@ -1351,6 +1353,7 @@ fn reconcile_stops_old_matrix() {
             socket_path: None,
             config_path: t.config_path(),
             old_stop: sw_cli::setup_cmd::OldStop::Reconcile,
+            restart_daemon: false,
         };
         assert!(!sw_cli::setup_cmd::reconcile_stops_old(ctx, &req));
 
@@ -1454,4 +1457,230 @@ fn plain_setup_waits_for_existing_install_lock_holder() {
     assert_eq!(str_field(&result, "error_code"), "TIMEOUT");
     assert_eq!(str_field(&result, "phase"), "install_lock");
     assert!(t.rpc().requests().is_empty());
+}
+
+fn restart_request(
+    t: &TestEnv,
+    old_mode: sw_pal::traits::SupervisionMode,
+    target_mode: sw_pal::traits::SupervisionMode,
+    with_sudo: bool,
+    restart_daemon: bool,
+) -> sw_cli::setup_cmd::ReconcileRequest {
+    sw_cli::setup_cmd::ReconcileRequest {
+        old_mode,
+        target_mode,
+        home: t.home(),
+        daemon_running: false,
+        daemon_id: sw_cli::graceful_stop::DaemonIdentity::default(),
+        old_endpoint: t.default_socket(),
+        any_flashing: false,
+        with_sudo,
+        force: false,
+        hold_target: false,
+        socket_path: Some(t.default_socket()),
+        config_path: t.config_path(),
+        old_stop: sw_cli::setup_cmd::OldStop::Reconcile,
+        restart_daemon,
+    }
+}
+
+#[test]
+fn s1m241_reconcile_restart_after_refresh() {
+    use sw_pal::traits::SupervisionMode;
+
+    for (mode, with_sudo, reload, enable, restart) in [
+        (
+            SupervisionMode::SystemdUser,
+            false,
+            vec!["systemctl", "--user", "daemon-reload"],
+            vec!["systemctl", "--user", "enable", "serialwrap"],
+            vec!["systemctl", "--user", "restart", "serialwrap"],
+        ),
+        (
+            SupervisionMode::SystemdSystem,
+            true,
+            vec!["sudo", "systemctl", "daemon-reload"],
+            vec!["sudo", "systemctl", "enable", "serialwrap"],
+            vec!["sudo", "systemctl", "restart", "serialwrap"],
+        ),
+    ] {
+        let t = TestEnv::posix().with_real_service().with_systemd(true);
+        let req = restart_request(&t, mode.clone(), mode, with_sudo, true);
+        t.with_cli_ctx(|ctx| {
+            let result = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
+            assert_eq!(
+                str_field(&PyValue::Dict(result.clone()), "daemon_restart"),
+                "ran"
+            );
+        });
+        let calls = t.calls();
+        let position = |expected: &[&str]| {
+            calls
+                .iter()
+                .position(|argv| argv.iter().map(String::as_str).eq(expected.iter().copied()))
+                .unwrap_or_else(|| panic!("missing command {expected:?} in {calls:?}"))
+        };
+        assert!(position(&reload) < position(&enable));
+        assert!(position(&enable) < position(&restart));
+    }
+
+    let t = TestEnv::posix().with_real_service().with_systemd(true);
+    let req = restart_request(
+        &t,
+        SupervisionMode::SystemdSystem,
+        SupervisionMode::SystemdSystem,
+        false,
+        true,
+    );
+    t.with_cli_ctx(|ctx| {
+        let result = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
+        assert_eq!(
+            str_field(&PyValue::Dict(result.clone()), "daemon_restart"),
+            "pending_sudo"
+        );
+        assert!(argv_list_field(&PyValue::Dict(result), "pending_sudo")
+            .last()
+            .is_some_and(|argv| argv == &["sudo", "systemctl", "restart", "serialwrap"]));
+    });
+    assert!(t.calls().is_empty());
+}
+
+#[test]
+fn s1m241_reconcile_restart_outcomes() {
+    use sw_pal::traits::SupervisionMode;
+
+    let failed = TestEnv::posix()
+        .with_real_service()
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "restart", "serialwrap"],
+            1,
+            "",
+            "failed",
+        );
+    let req = restart_request(
+        &failed,
+        SupervisionMode::SystemdUser,
+        SupervisionMode::SystemdUser,
+        false,
+        true,
+    );
+    failed.with_cli_ctx(|ctx| {
+        let result = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
+        assert_eq!(
+            str_field(&PyValue::Dict(result), "daemon_restart"),
+            "failed"
+        );
+    });
+
+    let no_restart = TestEnv::posix().with_real_service().with_systemd(true);
+    let req = restart_request(
+        &no_restart,
+        SupervisionMode::SystemdUser,
+        SupervisionMode::SystemdUser,
+        false,
+        false,
+    );
+    no_restart.with_cli_ctx(|ctx| {
+        let result = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
+        assert!(result.get("daemon_restart").is_none());
+    });
+    assert!(!no_restart
+        .calls()
+        .iter()
+        .any(|argv| argv.iter().any(|arg| arg == "restart")));
+
+    let transition = TestEnv::posix().with_real_service().with_systemd(true);
+    let req = restart_request(
+        &transition,
+        SupervisionMode::OnDemand,
+        SupervisionMode::SystemdUser,
+        false,
+        true,
+    );
+    transition.with_cli_ctx(|ctx| {
+        let result = sw_cli::setup_cmd::reconcile(ctx, &req).unwrap();
+        assert!(matches!(result.get("daemon_restart"), Some(PyValue::Null)));
+    });
+    assert!(!transition
+        .calls()
+        .iter()
+        .any(|argv| argv.iter().any(|arg| arg == "restart")));
+}
+
+#[test]
+fn s1m241_verify_restart_fingerprint() {
+    let expected = "a1b2c3d4e5f6";
+
+    let temporarily_unavailable = TestEnv::posix();
+    let endpoint = temporarily_unavailable.default_socket();
+    let temporarily_unavailable = temporarily_unavailable.with_rpc_refused_then_ok(
+        &endpoint,
+        "health.ping",
+        &format!(r#"{{"ok":true,"code_fingerprint":"{expected}"}}"#),
+    );
+    temporarily_unavailable.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            "match"
+        );
+    });
+    assert_eq!(
+        temporarily_unavailable.clock().elapsed(),
+        Duration::from_millis(500)
+    );
+    assert_eq!(temporarily_unavailable.rpc().timeouts_s(), vec![0.5, 0.5]);
+
+    let mismatch = TestEnv::posix();
+    let endpoint = mismatch.default_socket();
+    mismatch.rpc().respond_seq(
+        &endpoint,
+        "health.ping",
+        &[
+            r#"{"ok":true,"code_fingerprint":"different"}"#,
+            r#"{"ok":true,"code_fingerprint":"a1b2c3d4e5f6"}"#,
+        ],
+    );
+    mismatch.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            "mismatch"
+        );
+    });
+    assert_eq!(mismatch.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert!(mismatch.clock().sleeps_s().is_empty());
+
+    let missing_fingerprint = TestEnv::posix();
+    let endpoint = missing_fingerprint.default_socket();
+    let missing_fingerprint =
+        missing_fingerprint.with_rpc_ok(&endpoint, "health.ping", r#"{"ok":true}"#);
+    missing_fingerprint.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            "mismatch"
+        );
+    });
+    assert!(missing_fingerprint.clock().sleeps_s().is_empty());
+
+    let unreachable = TestEnv::posix();
+    let endpoint = unreachable.default_socket();
+    unreachable.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            "unreachable"
+        );
+    });
+    assert_eq!(unreachable.clock().elapsed(), Duration::from_secs(10));
+    assert_eq!(unreachable.clock().sleeps_s().len(), 20);
+    assert!(unreachable
+        .clock()
+        .sleeps_s()
+        .iter()
+        .all(|sleep| *sleep == 0.5));
+    assert_eq!(unreachable.rpc().timeouts_s().len(), 21);
+    assert!(unreachable
+        .rpc()
+        .timeouts_s()
+        .iter()
+        .all(|timeout| *timeout == 0.5));
 }

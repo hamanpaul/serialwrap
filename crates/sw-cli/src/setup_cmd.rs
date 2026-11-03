@@ -1088,6 +1088,8 @@ pub struct ReconcileRequest {
     pub socket_path: Option<String>,
     pub config_path: PathBuf,
     pub old_stop: OldStop,
+    /// 僅由上層在同模式 systemd 刷新後明確要求時執行 daemon restart。
+    pub restart_daemon: bool,
 }
 
 #[derive(Debug)]
@@ -1200,6 +1202,14 @@ fn pending_privileged(
         );
     }
 
+    let restart_pending = req.restart_daemon
+        && req.old_mode == req.target_mode
+        && req.target_mode == SupervisionMode::SystemdSystem
+        && !req.with_sudo;
+    if restart_pending {
+        pending.push(service_argv(&req.target_mode, ServiceAction::Restart, true));
+    }
+
     if windows_service_transition {
         if req.target_mode == SupervisionMode::WindowsService {
             let def =
@@ -1221,7 +1231,18 @@ fn pending_privileged(
     }
 
     if !pending.is_empty() {
-        return Ok(Some(pending_only(req, &pending, None)));
+        let mut result = pending_only(req, &pending, None);
+        if req.restart_daemon {
+            result.insert(
+                "daemon_restart",
+                if restart_pending {
+                    PyValue::Str("pending_sudo".into())
+                } else {
+                    PyValue::Null
+                },
+            );
+        }
+        return Ok(Some(result));
     }
     Ok(None)
 }
@@ -1554,6 +1575,34 @@ pub fn reconcile(ctx: &mut CliCtx<'_>, req: &ReconcileRequest) -> Result<PyDict,
     }
     start_new(ctx, req, same_mode, &mut ran)?;
 
+    let daemon_restart = if req.restart_daemon {
+        if same_mode
+            && matches!(
+                req.target_mode,
+                SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem
+            )
+        {
+            let restarted =
+                ctx.p
+                    .service
+                    .action(&req.target_mode, ServiceAction::Restart, req.with_sudo);
+            ran.push(service_argv(
+                &req.target_mode,
+                ServiceAction::Restart,
+                req.with_sudo,
+            ));
+            Some(PyValue::Str(if restarted.rc == Some(0) {
+                "ran".into()
+            } else {
+                "failed".into()
+            }))
+        } else {
+            Some(PyValue::Null)
+        }
+    } else {
+        None
+    };
+
     let mut config = endpoint_resolve::load_runtime_config(ctx)
         .map_err(|error| ReconcileError::Config(error.to_string()))?;
     config.set_mode(req.target_mode.as_str(), req.socket_path.as_deref());
@@ -1562,6 +1611,9 @@ pub fn reconcile(ctx: &mut CliCtx<'_>, req: &ReconcileRequest) -> Result<PyDict,
 
     let mut result = result_base(req, &req.target_mode, &ran, &[]);
     result.insert("transitioned", PyValue::Bool(!same_mode));
+    if let Some(outcome) = daemon_restart {
+        result.insert("daemon_restart", outcome);
+    }
     Ok(result)
 }
 
@@ -1576,6 +1628,40 @@ fn rpc_response(ctx: &CliCtx<'_>, endpoint: &str, method: &str, timeout: f64) ->
     )
     .ok()
     .map(|outcome| outcome.resp)
+}
+
+/// 驗證 restart 後 daemon 首次可連線時回報的程式碼指紋。
+pub fn verify_daemon_code_after_restart(
+    ctx: &CliCtx<'_>,
+    endpoint: &str,
+    installed_fingerprint: Option<&str>,
+) -> &'static str {
+    const TIMEOUT_NS: u64 = 10_000_000_000;
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+    let deadline = ctx.p.clock.mono_ns().saturating_add(TIMEOUT_NS);
+    loop {
+        if let Some(response) = rpc_response(ctx, endpoint, "health.ping", 0.5) {
+            if response.get_truthy("ok") {
+                let daemon_fingerprint =
+                    response
+                        .get("code_fingerprint")
+                        .and_then(|value| match value {
+                            PyValue::Str(fingerprint) => Some(fingerprint.as_str()),
+                            _ => None,
+                        });
+                return if daemon_fingerprint == installed_fingerprint {
+                    "match"
+                } else {
+                    "mismatch"
+                };
+            }
+        }
+        if ctx.p.clock.mono_ns() >= deadline {
+            return "unreachable";
+        }
+        ctx.p.clock.sleep(POLL_INTERVAL);
+    }
 }
 
 fn emit_error(ctx: &mut CliCtx<'_>, response: &PyDict, context: &str, exit: i32) -> i32 {
@@ -1883,6 +1969,7 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         socket_path: Some(socket_path),
         config_path: endpoint_resolve::config_write_path(ctx),
         old_stop: OldStop::Reconcile,
+        restart_daemon: false,
     };
     let mut setup = match reconcile(ctx, &req) {
         Ok(result) => result,
