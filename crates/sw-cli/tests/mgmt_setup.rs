@@ -482,6 +482,361 @@ fn s1m241_assessment_restart_after_unreachable_is_reported() {
 }
 
 #[test]
+fn s1m241_skips_no_restart_flag() {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_config("supervision_mode: systemd-user\n")
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            0,
+            "active\n",
+            "",
+        )
+        .with_rpc_ok(
+            &endpoint,
+            "health.ping",
+            &format!(
+                r#"{{"ok":true,"pid":1234,"version":"{}","code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#,
+                sw_cli::CLI_VERSION
+            ),
+        )
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+
+    let (rc, out, err) = t.run(&["setup", "--user", "--no-restart"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    assert_eq!(err, "");
+    assert_eq!(out.lines().count(), 1, "setup stdout 必須只有一行 JSON");
+    let result = json(&out);
+    let daemon_code = dict_field(&result, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), "skipped_no_restart_flag");
+    assert_eq!(
+        str_field(&daemon_code, "hint"),
+        "已依 --no-restart 略過；準備好後執行 `serialwrap service restart`"
+    );
+    assert_eq!(str_field(&daemon_code, "daemon"), DAEMON_FINGERPRINT);
+    assert_eq!(str_field(&daemon_code, "installed"), INSTALLED_FINGERPRINT);
+    assert_eq!(dict_field(&daemon_code, "stale"), PyValue::Bool(true));
+    assert!(matches!(
+        &daemon_code,
+        PyValue::Dict(fields) if fields.get("after").is_none()
+    ));
+    assert!(matches!(
+        dict_field(&result, "setup"),
+        PyValue::Dict(fields) if fields.get("daemon_restart").is_none()
+    ));
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+    assert!(t.clock().sleeps_s().is_empty(), "跳過時不得輪詢指紋");
+    assert!(
+        t.calls().iter().all(|argv| {
+            !argv.iter().any(|arg| {
+                arg == "is-active" || arg == "restart" || arg == "start" || arg == "stop"
+            })
+        }),
+        "--no-restart 不得查服務或追加重啟：{:?}",
+        t.calls()
+    );
+}
+
+#[test]
+fn s1m241_skips_decision_priority() {
+    struct Case {
+        old: &'static str,
+        flags: &'static [&'static str],
+        flashing: bool,
+        action: &'static str,
+        hint: Option<&'static str>,
+    }
+    // 各列同時符合後續條件，鎖住 Python _run_setup 的第一個命中分支。
+    let cases = [
+        Case {
+            old: "systemd-user",
+            flags: &["--user", "--no-restart", "--force"],
+            flashing: true,
+            action: "skipped_no_restart_flag",
+            hint: Some("已依 --no-restart 略過；準備好後執行 `serialwrap service restart`"),
+        },
+        Case {
+            old: "systemd-user",
+            flags: &["--on-demand", "--force"],
+            flashing: true,
+            action: "mode_transition",
+            hint: None,
+        },
+        Case {
+            old: "on-demand",
+            flags: &["--on-demand", "--force"],
+            flashing: true,
+            action: "manual_restart",
+            hint: Some("on-demand 模式不自動重啟；請執行 `serialwrap daemon stop` 後 `serialwrap daemon start`"),
+        },
+        Case {
+            old: "systemd-user",
+            flags: &["--user", "--force"],
+            flashing: true,
+            action: "skipped_flashing",
+            hint: Some("flash 進行中不重啟 daemon；完成後執行 `serialwrap service restart`"),
+        },
+        Case {
+            old: "systemd-user",
+            flags: &["--user"],
+            flashing: false,
+            action: "service_inactive",
+            hint: Some("在跑的 daemon 不是 systemd 服務啟動的（可能是手動 start 的）；先停掉它，再 `serialwrap service restart`"),
+        },
+        Case {
+            old: "systemd-system",
+            flags: &["--system"],
+            flashing: false,
+            action: "service_inactive",
+            hint: Some("在跑的 daemon 不是 systemd 服務啟動的（可能是手動 start 的）；先停掉它，再 `serialwrap service restart`"),
+        },
+    ];
+
+    for case in cases {
+        let t = s1m241_installed_setup_env(Some("a1b2c3d4e5f6"))
+            .with_config(&format!("supervision_mode: {}\n", case.old))
+            .with_systemd(true)
+            .with_command(
+                &["systemctl", "--user", "is-active", "serialwrap"],
+                3,
+                "inactive\n",
+                "",
+            )
+            .with_command(
+                &["systemctl", "is-active", "serialwrap"],
+                3,
+                "inactive\n",
+                "",
+            )
+            .with_command(&["systemctl", "--user", "stop", "serialwrap"], 0, "", "")
+            .with_command(&["systemctl", "--user", "disable", "serialwrap"], 0, "", "");
+        let endpoint = t.default_socket();
+        let transitioning = case.action == "mode_transition";
+        let t = if transitioning {
+            // ping、flash、身分查詢後，停止舊服務；第 4 次連線證明已退出。
+            t.with_daemon_alive_then_gone(&endpoint, 1234, 4)
+                .with_gone_ping_event()
+        } else {
+            t
+        };
+        let t = t
+            .with_rpc_ok(
+                &endpoint,
+                "health.ping",
+                &format!(
+                    r#"{{"ok":true,"pid":1234,"version":"{}","code_fingerprint":"deadbeef0001"}}"#,
+                    sw_cli::CLI_VERSION
+                ),
+            )
+            .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+            .with_rpc_ok(
+                &endpoint,
+                "mcu.status",
+                &format!(r#"{{"ok":true,"flashing":{}}}"#, case.flashing),
+            );
+        let mut argv = vec!["--endpoint", &endpoint, "setup"];
+        argv.extend_from_slice(case.flags);
+        let (rc, out, err) = t.run(&argv);
+        assert_eq!(rc, 0, "{argv:?}：stdout={out:?}, stderr={err:?}");
+        assert_eq!(err, "", "{argv:?}");
+        assert_eq!(out.lines().count(), 1, "{argv:?}");
+        let result = json(&out);
+        let daemon_code = dict_field(&result, "daemon_code");
+        assert_eq!(str_field(&daemon_code, "action"), case.action, "{argv:?}");
+        assert_eq!(str_field(&daemon_code, "reason"), "fingerprint_mismatch");
+        assert_eq!(dict_field(&daemon_code, "stale"), PyValue::Bool(true));
+        assert_eq!(str_field(&daemon_code, "daemon"), "deadbeef0001");
+        assert_eq!(str_field(&daemon_code, "installed"), "a1b2c3d4e5f6");
+        let PyValue::Dict(fields) = &daemon_code else {
+            panic!("daemon_code 必須是物件")
+        };
+        assert_eq!(
+            fields.get("hint"),
+            case.hint.map(|hint| PyValue::Str(hint.into())).as_ref()
+        );
+        assert!(fields.get("after").is_none(), "跳過時不得驗證新指紋");
+        assert!(fields.get("checked").is_none(), "內部欄位不得出現在輸出");
+        let setup = dict_field(&result, "setup");
+        let PyValue::Dict(fields) = &setup else {
+            panic!("setup 必須是物件")
+        };
+        assert!(fields.get("daemon_restart").is_none());
+        assert_eq!(
+            dict_field(&setup, "transitioned"),
+            PyValue::Bool(transitioning)
+        );
+        assert!(argv_list_field(&setup, "ran")
+            .iter()
+            .all(|cmd| !cmd.iter().any(|arg| arg == "restart" || arg == "start")));
+        assert!(argv_list_field(&setup, "pending_sudo")
+            .iter()
+            .all(|cmd| !cmd.iter().any(|arg| arg == "restart" || arg == "start")));
+        assert!(t
+            .calls()
+            .iter()
+            .all(|cmd| !cmd.iter().any(|arg| arg == "restart" || arg == "start")));
+        let queries: Vec<_> = t
+            .calls()
+            .into_iter()
+            .filter(|cmd| cmd.iter().any(|arg| arg == "is-active"))
+            .collect();
+        let expected_queries = if case.action == "service_inactive" {
+            vec![if case.old == "systemd-user" {
+                vec!["systemctl", "--user", "is-active", "serialwrap"]
+            } else {
+                vec!["systemctl", "is-active", "serialwrap"]
+            }]
+        } else {
+            vec![]
+        };
+        assert_eq!(queries, expected_queries, "{argv:?}");
+        // 舊 daemon 的退出探測在連線階段被拒，沒有送出第 2 個 ping 請求。
+        assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+        assert_eq!(
+            t.rpc().connect_count(&endpoint),
+            if transitioning { 4 } else { 3 }
+        );
+        if transitioning {
+            let order = t.event_order();
+            assert!(
+                order.index_of("run:systemctl --user stop serialwrap")
+                    < order.index_of("rpc:health.ping#gone")
+            );
+        }
+        assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+        assert!(
+            t.clock().sleeps_s().is_empty(),
+            "跳過時不得進入重啟後輪詢：{argv:?}"
+        );
+    }
+}
+
+#[test]
+fn s1m241_skips_no_restart_flag_preserves_mode_transition() {
+    for no_restart in [false, true] {
+        let t = s1m241_installed_setup_env(Some("a1b2c3d4e5f6"))
+            .with_systemd(true)
+            .with_var("USER", "alice");
+        let endpoint = t.default_socket();
+        let t = t
+            .with_daemon_alive_then_gone(&endpoint, 1234, 5)
+            .with_gone_ping_event()
+            .with_rpc_ok(
+                &endpoint,
+                "health.ping",
+                r#"{"ok":true,"pid":1234,"code_fingerprint":"deadbeef0001"}"#,
+            )
+            .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":true}"#);
+        let mut argv = vec!["setup", "--user", "--force"];
+        if no_restart {
+            argv.push("--no-restart");
+        }
+        let (rc, out, err) = t.run(&argv);
+        assert_eq!(rc, 0, "{argv:?}：stdout={out:?}, stderr={err:?}");
+        let result = json(&out);
+        let daemon_code = dict_field(&result, "daemon_code");
+        assert_eq!(
+            str_field(&daemon_code, "action"),
+            if no_restart {
+                "skipped_no_restart_flag"
+            } else {
+                "mode_transition"
+            }
+        );
+        if no_restart {
+            assert_eq!(
+                str_field(&daemon_code, "hint"),
+                "已依 --no-restart 略過；準備好後執行 `serialwrap service restart`"
+            );
+        } else {
+            assert!(matches!(&daemon_code, PyValue::Dict(fields) if fields.get("hint").is_none()));
+        }
+        assert!(matches!(&daemon_code, PyValue::Dict(fields) if fields.get("after").is_none()));
+        let setup = dict_field(&result, "setup");
+        assert_eq!(dict_field(&setup, "transitioned"), PyValue::Bool(true));
+        assert!(matches!(&setup, PyValue::Dict(fields) if fields.get("daemon_restart").is_none()));
+        assert_eq!(
+            argv_list_field(&setup, "ran"),
+            vec![
+                vec!["serialwrap", "daemon", "stop"],
+                vec!["systemctl", "--user", "daemon-reload"],
+                vec!["systemctl", "--user", "enable", "serialwrap"],
+                vec!["systemctl", "--user", "start", "serialwrap"],
+                vec!["loginctl", "enable-linger", "alice"],
+            ]
+        );
+        assert!(t
+            .calls()
+            .iter()
+            .all(|cmd| !cmd.iter().any(|arg| arg == "restart" || arg == "is-active")));
+        let order = t.event_order();
+        assert!(order.index_of("rpc:daemon.stop") < order.index_of("rpc:health.ping#gone"));
+        assert!(
+            order.index_of("rpc:health.ping#gone")
+                < order.index_of("run:systemctl --user start serialwrap")
+        );
+        assert_eq!(t.rpc().request_count(&endpoint, "daemon.stop"), 1);
+        assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+        assert_eq!(
+            t.rpc().connect_count(&endpoint),
+            5,
+            "包含退出探測，不得追加指紋驗證連線"
+        );
+        assert!(t.clock().sleeps_s().is_empty(), "模式轉換不得追加指紋輪詢");
+    }
+}
+
+#[test]
+fn s1m241_skips_flashing_without_force_before_materialize() {
+    for no_restart in [false, true] {
+        let t = s1m241_installed_setup_env(Some("a1b2c3d4e5f6"))
+            .with_config("supervision_mode: systemd-user\n")
+            .with_systemd(true);
+        let config_before = std::fs::read(t.config_path()).unwrap();
+        let endpoint = t.default_socket();
+        let t = t
+            .with_rpc_ok(
+                &endpoint,
+                "health.ping",
+                r#"{"ok":true,"code_fingerprint":"deadbeef0001"}"#,
+            )
+            .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":true}"#);
+        let mut argv = vec!["setup", "--user"];
+        if no_restart {
+            argv.push("--no-restart");
+        }
+        let (rc, out, err) = t.run(&argv);
+        assert_eq!(rc, 2, "{argv:?}：stdout={out:?}, stderr={err:?}");
+        let result = json(&out);
+        assert_eq!(dict_field(&result, "ok"), PyValue::Bool(false));
+        assert_eq!(str_field(&result, "error_code"), "FLASHING_BUSY");
+        assert_eq!(
+            str_field(&result, "message"),
+            "flash 進行中，拒絕 setup（可用 --force 覆寫）"
+        );
+        assert!(
+            !t.config_dir().join("profiles").exists(),
+            "不得先物化 profiles"
+        );
+        assert!(
+            !t.home().join(".local/bin/serialwrap-minicom").exists(),
+            "不得先物化 wrapper"
+        );
+        assert_eq!(std::fs::read(t.config_path()).unwrap(), config_before);
+        assert!(t.calls().is_empty(), "拒絕前不得執行監管命令");
+        assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+        assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+        assert!(t.clock().sleeps_s().is_empty());
+    }
+}
+
+#[test]
 fn s1m241_setup_restart_decision_order() {
     use sw_cli::setup_cmd::{
         daemon_code_assessment, select_daemon_restart_action, DaemonRestartAction,
