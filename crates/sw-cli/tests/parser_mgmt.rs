@@ -35,7 +35,7 @@ fn setup_help_matches_rust_only_golden() {
         profile_dir: "/golden/config/profiles".into(),
         lock_path: "/golden/run/serialwrapd.lock".into(),
     });
-    for cols in [80, 120] {
+    for cols in [20, 21, 25, 30, 40, 60, 80, 90, 120] {
         let golden_path = root.join(format!("contracts/cli_help/rust_only/setup.{cols}.txt"));
         let want = std::fs::read_to_string(&golden_path).expect("golden 檔案必須存在");
         let result = parse_args(&spec, &["setup".into(), "--help".into()], cols - 2);
@@ -85,17 +85,13 @@ fn s1m241_setup_no_restart_defaults_and_help() {
         ParseResult::Exit(x) => {
             assert_eq!(x.code, 0);
             assert!(x.stdout.contains(
-                "systemd 服務已在跑、但 daemon 載入的程式碼指紋與剛安裝的不同時（例如 pipx install --force"
+                "systemd 服務已在跑但 daemon 程式碼指紋過期時，預設自動 restart；--no-restart 可略過。"
             ));
             assert!(x.stdout.contains(
-                "之後），自動 restart 服務讓 daemon 換新碼；--no-restart 可略過，輸出的 daemon_code 欄位說明判定。"
+                "systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）"
             ));
-            assert!(x.stdout.contains(
-                "systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start／restart）"
-            ));
-            assert!(x.stdout.contains(
-                "daemon 載入的程式碼與剛安裝的不同時，不自動 restart 服務（預設：systemd 模式且服務 active 時自動 restart，讓 daemon 換新碼）"
-            ));
+            assert!(x.stdout
+                .contains("daemon 指紋過期時不自動 restart systemd service"));
         }
         _ => panic!("預期 ParseResult::Exit(0)"),
     }
