@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -174,6 +175,118 @@ def _isolated_pidns_prefix() -> list[str]:
     return prefix
 
 
+def _pid_is_running(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return False
+    return stat[stat.rfind(")") + 2] != "Z"
+
+
+def _write_systemctl_shim(fake_bin: Path) -> Path:
+    """建立只服務本測試的 systemctl 替身，restart 會重拉隔離 Python daemon。"""
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    script = fake_bin / "systemctl"
+    script.write_text(
+        r'''#!/usr/bin/python3
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def rpc(method):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect(os.environ["SERIALWRAP_TEST_ENDPOINT"])
+        data = json.dumps({"id": 1, "method": method, "params": {}}).encode() + b"\n"
+        sock.sendall(data)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None
+            buf += chunk
+        return json.loads(buf.split(b"\n", 1)[0])
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+args = sys.argv[1:]
+with open(os.environ["SERIALWRAP_TEST_SYSTEMCTL_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\n")
+if args == ["--user", "is-active", "serialwrap"]:
+    print("active")
+    raise SystemExit(0)
+if args != ["--user", "restart", "serialwrap"]:
+    raise SystemExit(0)
+
+rpc("daemon.stop")
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    if rpc("health.ping") is None:
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit("隔離舊 daemon 未停止")
+
+source = Path(os.environ["SERIALWRAP_TEST_DAEMON_SOURCE"])
+pristine = Path(os.environ["SERIALWRAP_TEST_DAEMON_PRISTINE"])
+shutil.rmtree(source / "sw_core")
+shutil.copytree(pristine / "sw_core", source / "sw_core")
+command = [
+    sys.executable,
+    str(source / "serialwrapd.py"),
+    "--socket",
+    os.environ["SERIALWRAP_TEST_ENDPOINT"],
+    "--lock",
+    os.environ["SERIALWRAP_TEST_LOCK"],
+    "--profile-dir",
+    os.environ["SERIALWRAP_TEST_PROFILE_DIR"],
+]
+with open(os.environ["SERIALWRAP_TEST_DAEMON_LOG"], "a", encoding="utf-8") as log:
+    proc = subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        cwd=os.environ["SERIALWRAP_TEST_WORK"],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+pid = proc.pid
+try:
+    status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    for line in status.splitlines():
+        if line.startswith("NSpid:"):
+            pid = int(line.split()[1])
+            break
+except OSError:
+    pass
+Path(os.environ["SERIALWRAP_TEST_PID_FILE"]).write_text(str(pid), encoding="ascii")
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline:
+    response = rpc("health.ping")
+    if response and response.get("ok") is True:
+        raise SystemExit(0)
+    if proc.poll() is not None:
+        raise SystemExit(f"隔離新 daemon 提早結束 rc={proc.returncode}")
+    time.sleep(0.1)
+raise SystemExit("隔離新 daemon 未就緒")
+''',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
 def test_s1m241_setup_current_manifest_is_reported(bundle, tmp_path: Path) -> None:
     bundle_root = bundle.out()
     install_root = tmp_path / "installed"
@@ -243,6 +356,124 @@ def test_s1m241_setup_current_manifest_is_reported(bundle, tmp_path: Path) -> No
                 _send_rpc(str(endpoint), "daemon.stop")
                 daemon.wait(timeout=5.0)
             except (OSError, subprocess.TimeoutExpired):
+                daemon.terminate()
+                try:
+                    daemon.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    daemon.kill()
+                    daemon.wait(timeout=5.0)
+
+
+def test_s1m241_setup_stale_systemd_restarts_and_verifies(bundle, tmp_path: Path) -> None:
+    bundle_root = bundle.out()
+    install_root = tmp_path / "installed"
+    cli, manifest_path, manifest_fingerprint = _installed_layout(bundle_root, install_root)
+    work = tmp_path / "isolated"
+    run_dir = work / "run"
+    run_dir.mkdir(parents=True)
+    endpoint = run_dir / "serialwrapd.sock"
+    env = _isolated_env(work, install_root, manifest_path, endpoint)
+    Path(env["SERIALWRAP_CONFIG"]).write_text("supervision_mode: systemd-user\n", encoding="utf-8")
+
+    daemon_source = work / "daemon-source"
+    pristine_source = work / "daemon-pristine"
+    for source in (daemon_source, pristine_source):
+        source.mkdir()
+        shutil.copytree(REPO / "sw_core", source / "sw_core")
+        shutil.copy2(REPO / "serialwrapd.py", source / "serialwrapd.py")
+    with (daemon_source / "sw_core" / "version.py").open("a", encoding="utf-8") as source:
+        source.write("\n# 測試用舊版指紋\n")
+
+    fake_bin = work / "fake-bin"
+    _write_systemctl_shim(fake_bin)
+    env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "/usr/bin:/bin")
+    pid_file = work / "daemon.pid"
+    systemctl_log = work / "systemctl.ndjson"
+    daemon_log = work / "python-daemon.log"
+    env.update(
+        {
+            "SERIALWRAP_TEST_DAEMON_SOURCE": str(daemon_source),
+            "SERIALWRAP_TEST_DAEMON_PRISTINE": str(pristine_source),
+            "SERIALWRAP_TEST_ENDPOINT": str(endpoint),
+            "SERIALWRAP_TEST_LOCK": str(run_dir / "serialwrapd.lock"),
+            "SERIALWRAP_TEST_PROFILE_DIR": env["SERIALWRAP_PROFILE_DIR"],
+            "SERIALWRAP_TEST_WORK": str(work),
+            "SERIALWRAP_TEST_PID_FILE": str(pid_file),
+            "SERIALWRAP_TEST_SYSTEMCTL_LOG": str(systemctl_log),
+            "SERIALWRAP_TEST_DAEMON_LOG": str(daemon_log),
+        }
+    )
+    daemon: subprocess.Popen | None = None
+    try:
+        with daemon_log.open("w", encoding="utf-8") as log:
+            daemon = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(daemon_source / "serialwrapd.py"),
+                    "--socket",
+                    str(endpoint),
+                    "--lock",
+                    str(run_dir / "serialwrapd.lock"),
+                    "--profile-dir",
+                    env["SERIALWRAP_PROFILE_DIR"],
+                ],
+                env=env,
+                cwd=str(work),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        pid_file.write_text(str(daemon.pid), encoding="ascii")
+        ping = _wait_ready(str(endpoint), daemon)
+        assert ping.get("code_fingerprint") != manifest_fingerprint
+
+        result = subprocess.run(
+            _isolated_pidns_prefix() + [str(cli), "setup", "--user"],
+            env=env,
+            cwd=str(work),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"installed Rust CLI setup 失敗（rc={result.returncode}）："
+            f"stdout={result.stdout!r}, stderr={result.stderr!r}, daemon={daemon_log.read_text(encoding='utf-8')}"
+        )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert len(lines) == 1, f"setup stdout 必須只有一個 JSON：{result.stdout!r}"
+        payload = json.loads(lines[0])
+        daemon_code = payload["daemon_code"]
+        assert daemon_code["stale"] is True
+        assert daemon_code["reason"] == "fingerprint_mismatch"
+        assert daemon_code["action"] == "restarted", (
+            f"daemon_code={daemon_code!r}, setup={payload.get('setup')!r}, "
+            f"systemctl={systemctl_log.read_text(encoding='utf-8')!r}, "
+            f"daemon={daemon_log.read_text(encoding='utf-8')!r}"
+        )
+        assert daemon_code["after"] == "match"
+        assert "checked" not in daemon_code
+        assert payload["setup"]["daemon_restart"] == "ran"
+        assert result.stderr == ""
+        calls = [json.loads(line) for line in systemctl_log.read_text(encoding="utf-8").splitlines()]
+        assert ["--user", "is-active", "serialwrap"] in calls
+        assert ["--user", "restart", "serialwrap"] in calls
+    finally:
+        current_pid = int(pid_file.read_text(encoding="ascii")) if pid_file.exists() else None
+        _send_rpc(str(endpoint), "daemon.stop")
+        if current_pid is not None:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and _pid_is_running(current_pid):
+                time.sleep(0.05)
+            if _pid_is_running(current_pid):
+                os.kill(current_pid, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and _pid_is_running(current_pid):
+                    time.sleep(0.05)
+        if daemon is not None and daemon.poll() is None:
+            try:
+                daemon.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
                 daemon.terminate()
                 try:
                     daemon.wait(timeout=5.0)

@@ -299,6 +299,189 @@ fn s1m241_assessment_is_omitted_when_initial_ping_is_unreachable() {
 }
 
 #[test]
+fn s1m241_assessment_stale_systemd_restarts_and_verifies() {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_config("supervision_mode: systemd-user\n")
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            0,
+            "active\n",
+            "",
+        )
+        .with_command(&["systemctl", "--user", "daemon-reload"], 0, "", "")
+        .with_command(&["systemctl", "--user", "enable", "serialwrap"], 0, "", "")
+        .with_command(&["systemctl", "--user", "restart", "serialwrap"], 0, "", "")
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+    t.rpc().respond_seq(
+        &endpoint,
+        "health.ping",
+        &[
+            &format!(r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#),
+            &format!(r#"{{"ok":true,"code_fingerprint":"{INSTALLED_FINGERPRINT}"}}"#),
+        ],
+    );
+
+    let (rc, out, err) = t.run(&["setup", "--user"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    assert_eq!(err, "");
+    assert_eq!(out.lines().count(), 1, "setup stdout 必須只有一行 JSON");
+    let result = json(&out);
+    let daemon_code = match &result {
+        PyValue::Dict(fields) => fields
+            .get("daemon_code")
+            .unwrap_or_else(|| panic!("daemon_code 缺失：stdout={out:?}, stderr={err:?}"))
+            .clone(),
+        other => panic!("setup 回應不是 object：{other:?}; stdout={out:?}"),
+    };
+    assert_eq!(str_field(&daemon_code, "action"), "restarted");
+    assert_eq!(str_field(&daemon_code, "after"), "match");
+    let setup = dict_field(&result, "setup");
+    assert_eq!(str_field(&setup, "daemon_restart"), "ran");
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 2);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+    assert!(t
+        .calls()
+        .iter()
+        .any(|argv| { argv == &["systemctl", "--user", "restart", "serialwrap"] }));
+}
+
+#[test]
+fn s1m241_assessment_stale_systemd_pending_sudo_is_reported() {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_config("supervision_mode: systemd-system\n")
+        .with_systemd(true)
+        .with_command(&["systemctl", "is-active", "serialwrap"], 0, "active\n", "")
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+    t.rpc().respond_seq(
+        &endpoint,
+        "health.ping",
+        &[&format!(
+            r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#
+        )],
+    );
+
+    let (rc, out, err) = t.run(&["setup", "--system"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    assert_eq!(err, "");
+    let result = json(&out);
+    let daemon_code = dict_field(&result, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), "pending_sudo");
+    assert_eq!(
+        str_field(&daemon_code, "hint"),
+        "system scope 需 root：請執行 pending_sudo 內的 restart 指令，或加 --with-sudo 重跑 setup"
+    );
+    assert_eq!(
+        str_field(&dict_field(&result, "setup"), "daemon_restart"),
+        "pending_sudo"
+    );
+}
+
+#[test]
+fn s1m241_assessment_stale_systemd_restart_failure_is_reported() {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_config("supervision_mode: systemd-user\n")
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            0,
+            "active\n",
+            "",
+        )
+        .with_command(&["systemctl", "--user", "daemon-reload"], 0, "", "")
+        .with_command(&["systemctl", "--user", "enable", "serialwrap"], 0, "", "")
+        .with_command(
+            &["systemctl", "--user", "restart", "serialwrap"],
+            1,
+            "",
+            "失敗",
+        )
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+    t.rpc().respond_seq(
+        &endpoint,
+        "health.ping",
+        &[&format!(
+            r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#
+        )],
+    );
+
+    let (rc, out, err) = t.run(&["setup", "--user"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    assert_eq!(err, "");
+    let result = json(&out);
+    let daemon_code = dict_field(&result, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), "restart_failed");
+    assert_eq!(
+        str_field(&daemon_code, "hint"),
+        "systemctl restart 失敗；請手動執行 `serialwrap service restart` 並查 journalctl"
+    );
+    assert_eq!(
+        str_field(&dict_field(&result, "setup"), "daemon_restart"),
+        "failed"
+    );
+}
+
+#[test]
+fn s1m241_assessment_restart_after_unreachable_is_reported() {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_config("supervision_mode: systemd-user\n")
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            0,
+            "active\n",
+            "",
+        )
+        .with_command(&["systemctl", "--user", "daemon-reload"], 0, "", "")
+        .with_command(&["systemctl", "--user", "enable", "serialwrap"], 0, "", "")
+        .with_command(&["systemctl", "--user", "restart", "serialwrap"], 0, "", "")
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+    t.rpc().respond_seq(
+        &endpoint,
+        "health.ping",
+        &[
+            &format!(r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#),
+            r#"{"ok":false}"#,
+        ],
+    );
+
+    let (rc, out, err) = t.run(&["setup", "--user"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    assert!(err.contains("after=unreachable"), "stderr={err:?}");
+    assert_eq!(out.lines().count(), 1, "setup stdout 必須只有一行 JSON");
+    let result = json(&out);
+    let daemon_code = dict_field(&result, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), "restarted");
+    assert_eq!(str_field(&daemon_code, "after"), "unreachable");
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 22);
+    assert_eq!(t.rpc().request_count(&endpoint, "mcu.status"), 1);
+    assert!(t
+        .calls()
+        .iter()
+        .any(|argv| { argv == &["systemctl", "--user", "restart", "serialwrap"] }));
+}
+
+#[test]
 fn s1m241_setup_restart_decision_order() {
     use sw_cli::setup_cmd::{
         daemon_code_assessment, select_daemon_restart_action, DaemonRestartAction,
