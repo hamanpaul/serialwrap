@@ -151,6 +151,9 @@ pub fn request_for(ns: &Namespace) -> Option<(&'static str, PyValue)> {
             if present(ns, "completion_regex") {
                 pairs.push(("completion_regex", text(ns, "completion_regex")));
             }
+            if matches!(ns.get("expect_reboot"), ArgValue::Bool(true)) {
+                pairs.push(("expect_reboot", PyValue::Bool(true)));
+            }
             ("command.submit", obj(pairs))
         }
         ["cmd", "status"] => ("command.get", obj(vec![("cmd_id", text(ns, "cmd_id"))])),
@@ -381,6 +384,28 @@ pub fn check_completion_regex(ctx: &mut CliCtx, ns: &Namespace) -> Option<i32> {
         }
         CompletionCheck::Crash(message) => Some(internal_error(ctx, &message)),
     }
+}
+
+/// `cmd submit --expect-reboot` 的本地模式相容檢查（#242）。
+///
+/// `interactive` 是 lease 按鍵通道，不走 reboot 路徑；拒絕時輸出與 Python CLI 相同的 JSON，且不連 daemon。
+pub fn check_expect_reboot(ctx: &mut CliCtx, ns: &Namespace) -> Option<i32> {
+    if !matches!(ns.get("expect_reboot"), ArgValue::Bool(true))
+        || ns.str("mode") != Some("interactive")
+    {
+        return None;
+    }
+
+    let mut response = error_resp(ErrorCode::ExpectRebootModeUnsupported, None);
+    response.insert(
+        "hint",
+        PyValue::Str(
+            "--expect-reboot 只適用 line／background 模式；interactive 是 lease 按鍵通道，不走 reboot 路徑。"
+                .to_string(),
+        ),
+    );
+    let _ = print_json(&mut ctx.io, &response);
+    Some(1)
 }
 
 /// Python 未攔截例外的 stderr 形式（exit 1，stdout 不寫）。

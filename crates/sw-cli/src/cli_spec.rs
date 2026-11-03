@@ -713,6 +713,7 @@ fn spec_cmd() -> ParserSpec {
             ActionSpec { option_strings: vec!["--cmd-timeout"], dest: "cmd_timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::Float(10.0), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--expected-duration"], dest: "expected_duration_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::None, choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--completion-regex"], dest: "completion_regex", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("每命令完成 regex（最多 1024 UTF-8 bytes）；省略則等待 profile prompt".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--expect-reboot"], dest: "expect_reboot", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("明示此命令會重開機（如 `firstboot -y && reboot`、`sysupgrade`）：不管命令文字一律走 reboot 路徑；不可與 --mode interactive 併用".to_string()), metavar: None, version: None },
         ],
         mutex: vec![
         ],

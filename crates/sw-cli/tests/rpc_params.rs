@@ -95,6 +95,43 @@ fn params_wire_exact() {
 }
 
 #[test]
+fn cmd_submit_expect_reboot_is_only_transmitted_when_true() {
+    use sw_proto::pyjson::PyValue;
+
+    let mut enabled = vec![
+        "cmd", "submit", "--selector", "COM0", "--cmd", "firstboot -y && reboot",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    enabled.push("--expect-reboot".to_string());
+    let (method, params) = request_for(&ns_argv(&enabled)).expect("cmd submit 應產生 RPC");
+    assert_eq!(method, "command.submit");
+    let PyValue::Dict(params) = params else {
+        panic!("command.submit 參數必須為物件");
+    };
+    assert_eq!(params.get("expect_reboot"), Some(&PyValue::Bool(true)));
+
+    let disabled = [
+        "cmd",
+        "submit",
+        "--selector",
+        "COM0",
+        "--cmd",
+        "firstboot -y && reboot",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let (method, params) = request_for(&ns_argv(&disabled)).expect("cmd submit 應產生 RPC");
+    assert_eq!(method, "command.submit");
+    let PyValue::Dict(params) = params else {
+        panic!("command.submit 參數必須為物件");
+    };
+    assert!(params.get("expect_reboot").is_none());
+}
+
+#[test]
 fn long_timeout_floor() {
     for (argv, want) in [
         ("session attach --selector A", 45.0),

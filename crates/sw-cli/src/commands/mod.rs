@@ -39,6 +39,9 @@ pub fn dispatch(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
             if let Some(code) = rpc_cmds::check_completion_regex(ctx, ns) {
                 return code;
             }
+            if let Some(code) = rpc_cmds::check_expect_reboot(ctx, ns) {
+                return code;
+            }
         }
         _ => {}
     }
