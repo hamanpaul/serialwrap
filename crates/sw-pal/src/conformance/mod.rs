@@ -9,7 +9,6 @@ pub mod rpc_suite;
 pub mod serial_suite;
 pub mod wal_fs_suite;
 
-#[cfg(unix)]
 pub use lock_suite::lock_suite;
 #[cfg(unix)]
 pub use lock_suite::bind_stale_unix_socket;
