@@ -933,6 +933,29 @@ def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
     assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_gate:cap_")]
 
 
+@pytest.mark.memory_only
+def test_native_attach_spawn_regressions_registered_in_cap_set() -> None:
+    """attach/spawn 的 ignored PTY 回歸只能由其明確能力集合承擔。"""
+    expected = {
+        "cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_sysenv",
+        "cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_process_tunnel",
+    }
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    sets = lock["sets"]
+    cap_set_id = "s21_gate:cap_posix_pty"
+    cap_nodeids = set(sets[cap_set_id]["linux"]["nodeids"])
+    assert expected <= cap_nodeids, sorted(expected - cap_nodeids)
+
+    misplaced = sorted(
+        f"{set_id}:{platform}:{nodeid}"
+        for set_id, platforms in sets.items()
+        for platform, spec in platforms.items()
+        if set_id != cap_set_id
+        for nodeid in expected & set(spec["nodeids"])
+    )
+    assert not misplaced, f"attach/spawn 能力案例重複登記於其他集合：{misplaced}"
+
+
 @pytest.mark.process_rpc
 def test_l1_add_only_creates_new_set_inline(tmp_path: Path) -> None:
     """新 set／新平台可由行內 selector 建立（P2-T13 審查修正：計畫的 --l1-add-only 呼叫未附 selector，原實作拒絕）。"""

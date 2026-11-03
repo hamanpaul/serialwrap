@@ -608,3 +608,49 @@ cargo test -p sw-pal --features test-fakes --test serial_posix cap_posix_pty__na
 本輪未完成 Python 哨兵與 Python pytest gates；因此不宣稱 P5-r8-d5e 或 P5 出口全綠，也沒有執行 slice gate、出口證據 driver、Docker、push、PR、部署或實體 UART 操作。
 
 REMAINING: 新增並以 pytest 驗證 `test_native_attach_spawn_regressions_registered_in_cap_set`，依實際收集結果 add-only 登記 Python nodeid；在不觸碰 production daemon/config/state 的方式下完成 `tests/test_l1_judge.py` 與全套 pytest。
+
+### P5-r8-d5e 第 2 輪（2026-11-03）：能力集合哨兵與 Python 鎖列
+
+起點為 `49f572812d56c1af1482a51b5097c60a0ef64912`，分支 `feature/rust-refactor-p5`。僅修改 `tests/test_l1_judge.py`、`tests/acceptance/l1_required.lock.json` 與本回覆文件；未改 production code、合約、selector 或既有 Rust 案例。
+
+#### 前審 High／Medium
+
+- 前審 A-1～A-8 依上一輪審查報告均為 already fixed `25ad3900`；B 段為 `NO FINDINGS`。本輪沒有新的 High／Medium 或不成立主張。
+
+#### 哨兵、收集與鎖檔
+
+- 新增 `test_native_attach_spawn_regressions_registered_in_cap_set`，標記 `memory_only`。它要求 `native_attach_spawn_sysenv` 與 `native_attach_spawn_process_tunnel` 的完整 cargo nodeid 位於 `s21_gate:cap_posix_pty.linux`，且不重複出現在任何其他集合。
+- 49f57281 起點鎖檔已含兩個 Rust nodeid，且只在上述能力集合；因此 brief 預期的真實「先紅」條件不存在。本輪沒有手動移除凍結列或偽造紅燈。新增哨兵直接 pytest 實跑為 `1 passed`。
+- 兩個既有 pytest selector 的 `--collect-only -q tests/` 實際收集均為 5,867 個唯一 nodeid；新哨兵各收集一次，`s1_pytest_full.linux` 原有 15 列、`s21_gate:pytest_full.linux` 原有 5,534 列均在報告中。為保留既有必要集合分母，將各 selector 的實際收集報告與其既有必要列相交，再把完整舊列及新 nodeid 交給 add-only generator。
+- `regen_lock.py --l1-add-only` 分別更新 `s1_pytest_full.linux` 與 `s21_gate:pytest_full.linux`：各新增 1 列、移除 0 列；selector 未變。Rust 能力集合未改動。無 production code 變更，故不需 changelog fragment。
+
+#### 第 1 輪證據沿用
+
+- 正式接線核對仍見 `crates/sw-pal/src/lib.rs:202-205` 組裝 native tunnel、serial backend 與 scanner；`crates/sw-pal/src/serial/posix.rs:308-345,486-490` 在 TIOCEXCL 後、termios 前執行正式 scanner；`crates/sw-core/src/session_manager.rs:1014-1028` 的 attach 委派到 serial backend；`contracts/behavior_changes.yaml:116,278` 的外部 holder 阻斷與零 TX 契約不變。
+- 指定兩條 native attach/spawn 回歸上一輪已逐輪跑 20/20：每輪恰為 2 passed、0 failed、0 ignored，累計 40 passed。完整輸出仍在 `p5-evidence/p5-r8-d5e-native-attach-spawn/native-attach-spawn-20-rounds.txt`；原始與能力篩選收集分別在同目錄 `cargo-l1-raw.json`、`cargo-l1-cap-posix-pty-filtered.json`。本輪沒有重跑這 20 輪。
+
+#### 驗收
+
+| 命令 | 結果 |
+|---|---|
+| `python3 -m pytest -q tests/test_l1_judge.py::test_native_attach_spawn_regressions_registered_in_cap_set` | exit 0：1 passed；live guard 使用工作樹隔離 XDG 與私有不可連線 bus，daemon 維度為 SKIP，未連 production daemon。 |
+| `python3 -m pytest -q tests/test_l1_judge.py` | exit 1：36 passed、3 failed。三個失敗均為起點既存的 `test_l1_lock_frozen_set_excludes_capability_gated`、`test_l1_lock_cargo_sets_exclude_ignored_tests`、`test_s21_core_linux_capability_rows_moved_to_cap_sets_od55`；前兩者仍指出 `s21_core.windows` 的 13 個 ignored 能力列，第三者斷言 22、實際計得 24。49f57281 的斷言／Rust lock 列與本輪相同；本輪 diff 只新增哨兵與兩個 Python nodeid，未改失敗點。 |
+| `python3 -m pytest -q tests/` | exit 1：5,684 passed、158 skipped、1 xfailed、24 failed、98 subtests passed、14 warnings，53:16。首次隔離命令另有 19 個環境設定造成的失敗（daemon 被指向 `.py` shebang、隔離 HOME 未指定 Rustup/Cargo home）；以正確來源 daemon 預設與 `RUSTUP_HOME`／`CARGO_HOME` 重跑相關案例為 `20 passed`。其餘 5 個為上述 3 個起點失敗，以及 P4 evidence 缺失 2 個案例，詳見 SPEC-GAPS。故本命令不記 PASS。 |
+| `cargo test -p sw-pal --features test-fakes` | exit 0：355 passed、0 failed、26 ignored。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0：1,791 passed、0 failed、4 ignored、28 filtered。 |
+| `cargo test --workspace` | exit 0：1,162 passed、0 failed、31 ignored。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；3 個 sw-pal unused/dead-code warnings；不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base 38525fc8` | 均 exit 0；結構與既有起點比對通過。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow test gate 解析、R-22 既有懸空文件引用）。 |
+
+#### SPEC-GAPS 與既有碼待辦
+
+1. `tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native` 找不到 `target/p4-evidence/l1/windows/cargo/resource-report.json`；`tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence` 回報 28 項 P4 evidence 缺檔。依本輪明令未執行出口證據 driver，未生成或偽造這些文件；兩項保持 evidence-incomplete，不能計 PASS。
+2. 三個 `tests/test_l1_judge.py` 失敗如上，在起點 49f57281 已存在；本輪不改 judge、硬編碼斷言、Windows 能力列或 gate 分母。
+3. `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍由 d3d 依最新 ruling 承擔；本輪未執行、接手或改斷言。
+
+本輪沒有操作 production daemon/config/state、`/dev/ttyUSB*`、真實序列埠、com0com、Docker container、其他 worktree 或 checkout；全套 pytest 使用臨時 Docker stub，Docker 能力仍以 SKIP 計。未跑出口證據 driver、slice gate、部署、push 或 PR。
+
+REMAINING: Windows 原生 L1／P4 evidence artifacts 尚缺且依本 brief 不執行 evidence driver；三個起點既存的 L1 judge 測試失敗待其所屬治理處理；external_plain_open_before_daemon_is_held 由 d3d 承擔。
