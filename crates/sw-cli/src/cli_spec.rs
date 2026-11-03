@@ -1822,9 +1822,13 @@ on-demand 模式：不可用。",
 fn spec_setup(_d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap setup".to_string(),
-        description: Some("物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。
-未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。
-system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。"),
+        description: Some(concat!(
+            "物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。\n",
+            "未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。\n",
+            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。\n",
+            "systemd 服務已在跑、但 daemon 載入的程式碼指紋與剛安裝的不同時（例如 pipx install --force\n",
+            "之後），自動 restart 服務讓 daemon 換新碼；--no-restart 可略過，輸出的 daemon_code 欄位說明判定。"
+        )),
         epilog: None,
         raw_text: true,
         raw_description: false,
@@ -1836,7 +1840,8 @@ system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo �
             ActionSpec { option_strings: vec!["--system"], dest: "system", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("設為 systemd-system 模式（特權動作需 --with-sudo）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--on-demand"], dest: "on_demand", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("設為 on-demand 模式（無 systemd 時的降級備援）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--force"], dest: "force", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("覆蓋既有 profiles，並在 flash 進行中仍強制切換".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start／restart）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--no-restart"], dest: "no_restart", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("daemon 載入的程式碼與剛安裝的不同時，不自動 restart 服務（預設：systemd 模式且服務 active 時自動 restart，讓 daemon 換新碼）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--windows-task"], dest: "windows_task", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以工作排程器登入自啟監管（Windows 預設）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--windows-service"], dest: "windows_service", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以 Windows 服務監管（OD-12：只列出待執行指令）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--rollback"], dest: "rollback", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("回滾到上一個完整發佈組合（Previous）".to_string()), metavar: None, version: None },

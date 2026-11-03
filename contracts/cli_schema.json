@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 8,
+  "x-catalog-revision": 9,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -2862,6 +2862,16 @@
       "name": "setup_daemon_restart_verify_timeout_s",
       "value": 10.0,
       "source": "sw_core/cli.py:1787"
+    },
+    {
+      "name": "setup_daemon_restart_verify_interval_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:1788"
+    },
+    {
+      "name": "setup_daemon_restart_verify_rpc_timeout_s",
+      "value": 0.5,
+      "source": "sw_core/cli.py:1799"
     }
   ],
   "x-hybrid-rpc": [
@@ -3094,6 +3104,7 @@
       "stream": "stderr",
       "blocking": false,
       "template": "serialwrap: client 程式碼 {cli_fingerprint} 與 daemon 程式碼 {daemon_fingerprint} 不一致（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n",
+      "precedence": "版本不一致警告優先；僅未輸出版本警告時才檢查並可能輸出此指紋警告",
       "when": "daemon 回報非空字串指紋，且同 bundle manifest 提供的 CLI 指紋不同；舊 daemon 或本地指紋不可用時靜默略過"
     }
   },
@@ -3227,7 +3238,7 @@
         ],
         "hint": "string"
       },
-      "restart_conditions": "僅指紋過期且為同模式 systemd service、service active、未 flash、未帶 --no-restart 時自動 restart；重啟後以 health.ping 最多等 10 s 驗證。",
+      "restart_conditions": "僅指紋過期且為同模式 systemd service、service active、未 flash、未帶 --no-restart 時自動 restart；重啟後以 health.ping 每 0.5 s 輪詢（每次 RPC timeout 0.5 s），最多等 10 s 驗證。結果寫入 after；非 match 僅輸出 stderr 提示，不改變成功 exit code。",
       "no_restart": "--no-restart 略過自動重啟並附提示；模式轉換保留既有 stop-old/start-new 流程；on-demand 不自動重啟；flash 中不重啟；inactive service 不重啟。"
     },
     "nested_setup.daemon_restart": {

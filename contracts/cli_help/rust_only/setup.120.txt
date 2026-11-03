@@ -1,9 +1,11 @@
 usage: serialwrap setup [-h] [--user | --system | --on-demand | --windows-task | --windows-service | --rollback]
-                        [--force] [--with-sudo] [--with-com0com | --remove-com0com]
+                        [--force] [--with-sudo] [--no-restart] [--with-com0com | --remove-com0com]
 
 物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。
 未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。
 system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。
+systemd 服務已在跑、但 daemon 載入的程式碼指紋與剛安裝的不同時（例如 pipx install --force
+之後），自動 restart 服務讓 daemon 換新碼；--no-restart 可略過，輸出的 daemon_code 欄位說明判定。
 
 options:
   -h, --help         show this help message and exit
@@ -11,7 +13,8 @@ options:
   --system           設為 systemd-system 模式（特權動作需 --with-sudo）
   --on-demand        設為 on-demand 模式（無 systemd 時的降級備援）
   --force            覆蓋既有 profiles，並在 flash 進行中仍強制切換
-  --with-sudo        systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）
+  --with-sudo        systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start／restart）
+  --no-restart       daemon 載入的程式碼與剛安裝的不同時，不自動 restart 服務（預設：systemd 模式且服務 active 時自動 restart，讓 daemon 換新碼）
   --windows-task     Windows：以工作排程器登入自啟監管（Windows 預設）
   --windows-service  Windows：以 Windows 服務監管（OD-12：只列出待執行指令）
   --rollback         回滾到上一個完整發佈組合（Previous）
