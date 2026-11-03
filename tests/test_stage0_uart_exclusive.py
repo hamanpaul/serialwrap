@@ -1008,6 +1008,7 @@ class TestManagerAttach:
         svc._profile_count = 1
         svc._arbiter = SimpleNamespace(snapshot=lambda: [])
         svc._version = "test"
+        svc._code_fingerprint = None
         svc._running = True
         svc._started_at = "test"
         try:

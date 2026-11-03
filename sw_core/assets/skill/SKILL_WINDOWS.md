@@ -241,6 +241,7 @@ serialwrap device attach --selector COM0
 | `EMPTY_RESPONSE` | cli_client／posix、windows | 視情況 | 連線已關閉但未收到任何一行回應 | 僅白名單唯讀方法可由 CLI 重試；其他方法先以 health.ping 確認 daemon 狀態 |
 | `ENV_FILE_SOURCE_FAILED` | cli_local／posix、windows | 修正參數後 | env 檔以 bash -lc source 執行失敗（非 0 退出），或 Windows 讀取檔案時發生 OS 錯誤 | 確認 env_file 路徑與內容後重試 |
 | `EXCEPTION` | rpc_frame／posix、windows | 否 | handler 拋出未預期例外，framing 層以 message 回傳（回應無 version） | 視為結果不明：先以 command.get 或 session get_state 確認狀態，不可假設未執行而直接重送 |
+| `EXPECT_REBOOT_MODE_UNSUPPORTED` | rpc、cli_local／posix、windows | 修正參數後 | expect_reboot=true 與 interactive lease 按鍵模式不相容 | 移除 --expect-reboot 或改用 line／background 模式 |
 | `FLASHING_BUSY` | rpc、rec、cli_local／posix、windows | 是 | session 處於 FLASHING 或 flash 臨界區，命令或操作被拒；Rust phase 包含 update_safety_check、supervision_set_safety_check | 等待燒錄結束（session 回到 ATTACHED 或 READY）後再重試 |
 | `FLASH_TARGET_IS_CONSOLE` | rpc／posix、windows | 修正參數後 | 燒錄目標是可下命令的 console 裝置，且未指定 force，拒絕執行 | 改選非 console 的燒錄目標；此碼目前 production 不可達，僅作為契約保留 |
 | `FLUSHED_BY_RECOVERY` | rpc、rec／posix、windows | 是 | 命令尚未執行即因 recovery 或 detach 被清空（未送出，可在 READY 後重送）；file.push／file.pull 為傳輸尚未寫出任何 byte 即因 drain、世代過期或取消而中止（OD-62） | 確認 session 已回到 READY 後才可重送 |
@@ -254,6 +255,7 @@ serialwrap device attach --selector COM0
 | `INVALID_BENCH_STATE` | cli_local／posix、windows | 修正參數後 | benches.state.json 結構錯誤 | 檢查 benches.state.json 內容，結構損壞時需人工修復後重試 |
 | `INVALID_COMPLETION_REGEX` | rpc、rec、cli_local／posix、windows | 修正參數後 | completion_regex 驗證失敗（空字串、超過 1024 bytes、無法編譯，或可匹配空字串） | 修正 completion_regex 後重送 |
 | `INVALID_ENDPOINT` | cli_client、cli_local／posix、windows | 修正參數後 | endpoint 格式錯誤（tcp 缺 host 或 port、unix 路徑非絕對、未知 scheme） | 改用 tcp://host:port 或絕對 unix socket 路徑格式後重試 |
+| `INVALID_EXPECT_REBOOT` | rpc、cli_local／posix、windows | 修正參數後 | expect_reboot 必須為布林值或 null；字串、整數等不做真值轉換 | 以 --expect-reboot 開啟旗標或省略旗標，不要傳字串／整數 |
 | `INVALID_JSON` | rpc_frame／posix、windows | 修正參數後 | 該行不是合法 JSON，連線保持並續讀下一行（回應無 id 與 version，且為非緊湊分隔符） | 修正請求的 JSON 格式後重送 |
 | `INVALID_METHOD` | rpc_frame／posix、windows | 修正參數後 | 請求的 method 欄位不是字串（回應保留 id，無 version） | 以字串形式的 method 重送 |
 | `INVALID_REQUEST` | rpc_frame／posix、windows | 修正參數後 | 請求 JSON 不是 object（回應無 id 與 version，且為非緊湊分隔符） | 以 JSON object 格式重送 |
@@ -289,6 +291,7 @@ serialwrap device attach --selector COM0
 | `SESSION_RECOVERING` | rpc、rec／posix、windows | 是 | session 恢復中（RECOVERING），操作暫不可用 | 等待恢復完成（session get_state 不再顯示 RECOVERING）後重試 |
 | `SOCKET_ERROR` | cli_client／posix、windows | 視情況 | 連線失敗（connect 或 send／recv 的 OS 錯誤，或平台不支援 AF_UNIX） | 僅白名單唯讀方法可由 CLI 自動重試；其他方法先以 health.ping 確認 daemon 狀態再決定 |
 | `SOCKET_UNAVAILABLE` | proc／posix | 否 | socket 路徑存在但 connect 失敗（非 ENOENT 與 ECONNREFUSED），非 JSON 回應，以 stderr 行與 exit 2 表示 | 檢查 socket 路徑的權限與殘留檔案後重試 |
+| `SOURCE_RESERVED` | rpc、cli_local／posix、windows | 修正參數後 | 外部來源或 owner 使用 daemon 內部保留的 system 前綴 | 自動化使用 agent:<名>；人工操作使用 human:<名>，不可使用 system 或 system:* |
 | `SSH_NOT_FOUND` | cli_local／posix、windows | 修正參數後 | PATH 中找不到 ssh 或 autossh | 安裝 OpenSSH 客戶端（ssh 或 autossh）並確認 PATH 後重試 |
 | `STATE_CHANGED` | rpc／posix、windows | 視情況 | probe 期間 session 狀態被其他操作改變（進入 FLASHING 或 RELEASED） | 以 session get_state 確認當前狀態後再決定是否重試 |
 | `TARGET_DECODER_FAILED` | rpc／posix、windows | 視情況 | chunk 的 sentinel 未見，目標端 decoder 失敗 | 重新傳輸；若持續失敗，檢查目標端 decoder |

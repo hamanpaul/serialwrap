@@ -229,8 +229,9 @@ def test_rpc_attach_response_matches_schema(tmp_path: Path, monkeypatch: pytest.
     assert resp["error_code"] == "SESSION_NOT_READY"
     assert resp["last_error"] == "CREDENTIALS_UNRESOLVED"
     expected_order = ["ok", "error_code", "last_error", "last_error_detail", "session"]
-    assert list(resp.keys()) == [*expected_order, "version"]
+    assert list(resp.keys()) == [*expected_order, "version", "code_fingerprint"]
     assert resp["version"] == svc._version
+    assert resp["code_fingerprint"] == svc._code_fingerprint
 
     schema_doc = json.loads((ROOT / "contracts" / "rpc_schema.json").read_text(encoding="utf-8"))
     attach_res = schema_doc["x-methods"]["session.attach"]["result"]
@@ -239,4 +240,4 @@ def test_rpc_attach_response_matches_schema(tmp_path: Path, monkeypatch: pytest.
     assert fail_schema is not None, "rpc_schema.json 必須包含 attach 失敗分支（x-order: [ok, error_code, last_error, last_error_detail, session]）"
     resolver = jsonschema.RefResolver.from_schema(schema_doc)
     jsonschema.validate(instance=resp, schema=fail_schema, resolver=resolver)
-    assert [key for key in resp if key != "version"] == fail_schema.get("x-order")
+    assert [key for key in resp if key not in {"version", "code_fingerprint"}] == fail_schema.get("x-order")

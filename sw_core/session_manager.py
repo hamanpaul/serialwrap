@@ -24,6 +24,7 @@ from .alias_registry import AliasRegistry
 from .auth import AuthResolution, resolve_session_auth
 from .config import ProfileTemplate, SessionProfile, UartProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+from .expect_reboot import expect_reboot_rejection
 from .constants import (
     BG_CAPTURE_MAX_BYTES,
     BG_CAPTURE_MAX_COUNT,
@@ -31,6 +32,7 @@ from .constants import (
     ERROR_DRAIN_STALLED,
     BOOT_BANNER_PATTERNS,
     BOOT_BANNER_TAIL_CHARS,
+    BOOT_EVIDENCE_GRACE_S,
     BOOT_QUIET_WINDOW_S,
     BOOTLOADER_RX_TAIL_BYTES,
     ERROR_AUTOBOOT_QUIET,
@@ -227,6 +229,32 @@ def _is_reboot_command(command: str) -> bool:
     return any(token == "-r" or token == "--reboot" or token.startswith("-r") for token in tokens[1:])
 
 
+_CHAIN_OPERATORS = frozenset({"&&", "||", ";", "&"})
+
+
+def find_chained_reboot_segment(command: str) -> str | None:
+    """找出沒帶 ``--expect-reboot`` 時串接命令中的 reboot 區段，僅供提示使用。"""
+    if _is_reboot_command(command):
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in _CHAIN_OPERATORS:
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    for segment in segments[1:]:
+        text = " ".join(segment)
+        if segment and _is_reboot_command(text):
+            return text
+    return None
+
+
 def _passthrough_completion_pattern(
     profile: SessionProfile,
     completion_regex: str | None,
@@ -256,17 +284,41 @@ def _strip_wrapped_command_echo(lines: list[str], command: str) -> list[str]:
     誤認為命令。bash readline 的單行 ``" \\r"`` 插入空白由呼叫端以原始控制字元
     單獨辨識。
     """
-    if not command or len(lines) < 2:
+    if not command or not lines:
         return lines
-    joined = ""
-    # 終端寬度扣掉 prompt 後每段仍至少約 20 字元，以此保守估計回顯最多佔幾行
-    for n, line in enumerate(lines[: len(command) // 20 + 2], 1):
-        joined += line
-        if joined.endswith(command):
-            prefix = joined[:-len(command)]
-            if len(prefix) < len(lines[0]):
-                return lines[n:]
+    # 呼叫端只在原始串流含 BusyBox 的 ``\\r\\r\\n`` 時進入；此處的換行是
+    # clean_text 後的標記。命令原文不可缺字，且每段須至少 20 字元才算折行。
+    window = lines[: len(command) // _WRAP_MIN_SEGMENT + 2]
+    text = "\n".join(window)
+    for start in range(len(lines[0])):
+        end = _match_wrapped_echo(text, start, command, marker="\n")
+        if end is not None and (end == len(text) or text[end] == "\n"):
+            return lines[text[:end].count("\n") + 1:]
     return lines
+
+
+_WRAP_MIN_SEGMENT = 20
+
+
+def _match_wrapped_echo(text: str, start: int, command: str, *, marker: str) -> int | None:
+    """比對完整命令原文，只略過呼叫端已驗證的折行標記。"""
+    i, matched = start, 0
+    last_wrap: int | None = None
+    while matched < len(command):
+        if i >= len(text):
+            return None
+        if text[i] == command[matched]:
+            i += 1
+            matched += 1
+            continue
+        if matched == 0 or text[i] != marker:
+            return None
+        segment = start + matched if last_wrap is None else matched - last_wrap
+        if segment < _WRAP_MIN_SEGMENT:
+            return None
+        last_wrap = matched
+        i += 1
+    return i
 
 
 @dataclasses.dataclass
@@ -535,6 +587,8 @@ class SessionRuntime:
     ready_reconfirm_deadline: float = 0.0
     ready_reconfirm_attempts: int = 0
     ready_reconfirm_failed: bool = False
+    # 非同步 reboot 後確認 probe 等待 boot banner 的 transient deadline。
+    boot_evidence_wait_until: float = 0.0
     # MCU 燒錄狀態（issue #55）：僅 runtime transient，不寫 _save_state / to_public_dict
     flash_prev_state: str | None = None
     # recovery lease stash（Phase B issue #44）
@@ -661,6 +715,7 @@ class SessionRuntime:
         """
         with self._boot_quiet_lock:
             self.clear_boot_quiet()
+            self.boot_evidence_wait_until = 0.0
             self.ready_reconfirm_pending = False
             self.ready_reconfirm_deadline = 0.0
             self.ready_reconfirm_attempts = 0
@@ -676,6 +731,7 @@ class SessionRuntime:
             self.ready_reconfirm_deadline = 0.0
             self.ready_reconfirm_attempts = 0
             self.ready_reconfirm_failed = False
+            self.boot_evidence_wait_until = 0.0
             self._push_probe_gate()
             self._push_tx_gate()
 
@@ -700,6 +756,7 @@ class SessionRuntime:
                     return False
             self.ready_reconfirm_pending = False
             self.ready_reconfirm_failed = True
+            self.boot_evidence_wait_until = 0.0
             self._push_tx_gate()
             return True
 
@@ -739,6 +796,20 @@ class SessionRuntime:
             return None
         base = time.monotonic() if now is None else now
         return round(max(self.ready_reconfirm_deadline - base, 0.0), 1)
+
+    def begin_boot_evidence_wait(self, now: float | None = None) -> None:
+        """非同步 reboot 後暫緩 nonce 確認，直到 banner 或寬限到期。"""
+        base = time.monotonic() if now is None else now
+        self.boot_evidence_wait_until = base + BOOT_EVIDENCE_GRACE_S
+
+    def note_boot_evidence(self) -> None:
+        """RX 看見 boot banner，解除非同步 reboot 的證據等待。"""
+        self.boot_evidence_wait_until = 0.0
+
+    def boot_evidence_wait_active(self, now: float | None = None) -> bool:
+        if self.boot_evidence_wait_until <= 0.0:
+            return False
+        return (time.monotonic() if now is None else now) < self.boot_evidence_wait_until
 
     def agent_gate_active(self, now: float | None = None) -> bool:
         """agent 顯式命令 gate 的統一判定（#162）。
@@ -824,6 +895,11 @@ class SessionRuntime:
             # retry_after_s）。remaining 供 operator 判讀還有多久落終態。
             "ready_reconfirm_failed": self.ready_reconfirm_failed,
             "ready_reconfirm_remaining_s": self.ready_reconfirm_remaining_s(),
+            "boot_evidence_wait_remaining_s": (
+                round(self.boot_evidence_wait_until - now_mono, 1)
+                if self.boot_evidence_wait_active(now_mono)
+                else None
+            ),
             "idle_for_ms": self.compute_idle_ms(),
             # RX/TX 單邊年齡（#150）：idle_for_ms 取 max(rx,tx) 會被 probe/human TX 拉小，
             # stall（RX 單邊凍結）在 session list 看不出來；此兩欄讓 operator 一眼判讀。
@@ -2141,6 +2217,10 @@ class SessionManager:
         # 下一個 tick 立即恢復既有 reprobe 流程。
         if self._boot_quiet_blocks_probe(session, now):
             return None
+        # 非同步 reboot 的舊 shell 仍可能回應 nonce；等 banner 或寬限到期，
+        # 此等待不排 backoff，也不增加 reprobe attempts。
+        if session.boot_evidence_wait_active(now):
+            return None
         # #162：READY 再確認分支不看 last_error（名義 READY 的 last_error 恆 None，
         # _is_reprobe_prompt_error 對 READY 必回 False）；其餘守衛（backoff／RX idle／
         # human-active／inflight）與 ATTACHED 分支完全共用。
@@ -2255,6 +2335,8 @@ class SessionManager:
         # #130：job 收集後、worker 實際寫入前 boot banner 才抵達 → 最終驗證擋下，
         # 不得對 autoboot 倒數中的 UART 送 probe bytes。
         if self._boot_quiet_blocks_probe(session, now):
+            return False
+        if session.boot_evidence_wait_active(now):
             return False
         if self._human_active_locked(session, now):
             return False
@@ -2619,6 +2701,7 @@ class SessionManager:
         )
         session.attached_real_path = None
         session.state = "DETACHED"
+        session.boot_evidence_wait_until = 0.0
         session.detached_at = now_iso()
         session.last_error = reason
         self._reset_reprobe_progress_locked(session)
@@ -4476,6 +4559,7 @@ class SessionManager:
             return
         window = session.boot_banner_tail[-BOOT_BANNER_TAIL_CHARS:] + chunk
         if detect_boot_banner(window):
+            session.note_boot_evidence()
             session.arm_boot_quiet()
             return
         tail = window[-BOOT_BANNER_TAIL_CHARS:]
@@ -4659,7 +4743,7 @@ class SessionManager:
             if self._handoff_frozen:
                 # SC-11：交接已凍結，不得再開始 probe（登入世代與 probe 授權亦不得在凍結後產生）。
                 return self._handoff_frozen_probe_result_locked(current)
-            if self._boot_quiet_blocks_probe(current):
+            if self._boot_quiet_blocks_probe(current) or current.boot_evidence_wait_active():
                 # #162：READY（再確認 pending）走到這裡＝quiet 又被 re-arm——不得以
                 # 合成 PROMPT_UNAVAILABLE 覆寫 READY 的 last_error（名義 READY 的
                 # last_error 恆 None，覆寫會讓 session list 呈現矛盾）；ATTACHED
@@ -6307,6 +6391,7 @@ class SessionManager:
         cmd_id: str,
         timeout_s: float,
         execution_mode: str,
+        prompt_wait_s: float | None = None,
         operation: _ForegroundOperation | None = None,
         trusted_human: bool | None = None,
         permit: TxPermit | None = None,
@@ -6321,6 +6406,9 @@ class SessionManager:
         with self._lock:
             if not self._foreground_operation_current_locked(session, bridge, operation):
                 return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
+            # 新一輪 reboot 不承接舊的非同步 reboot 證據期限；若 prompt 很快回來，
+            # 下面會從該時刻重新起算寬限。
+            session.boot_evidence_wait_until = 0.0
             invalidate_deferred = getattr(bridge, "invalidate_deferred", None)
             if callable(invalidate_deferred):
                 invalidate_deferred("reboot")
@@ -6357,7 +6445,8 @@ class SessionManager:
                 raise
             else:
                 session.arm_boot_quiet()
-        if bridge.wait_for_regex_from(prompt_regex, pre_offset, min(timeout_s, 2.0)):
+        prompt_wait = min(timeout_s, 2.0) if prompt_wait_s is None else prompt_wait_s
+        if bridge.wait_for_regex_from(prompt_regex, pre_offset, prompt_wait):
             # #139（belt-and-suspenders）：2s 內 prompt 回來，RX 解除檢查
             # （_update_boot_quiet_locked）通常已清 quiet，但 prompt 被 RX chunk 切割
             # miss 時，若不補清，READY session 會白白被 TX 靜默擋到 180s 過期。
@@ -6374,6 +6463,7 @@ class SessionManager:
                 if not self._foreground_operation_current_locked(session, bridge, operation):
                     return {"ok": False, "error_code": "FLUSHED_BY_RECOVERY"}
                 session.clear_boot_quiet()
+                session.begin_boot_evidence_wait()
             raw_text = bridge.rx_text_from(pre_offset)
             stdout = self._extract_command_stdout(raw_text, command, prompt_regex)
             return {
@@ -6447,10 +6537,15 @@ class SessionManager:
         expected_duration_s: float | None = None,
         completion_regex: str | None = None,
         trusted_human: bool | None = None,
+        expect_reboot: bool | None = False,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
         normalized_mode = {"fg": "line", "bg": "background"}.get(mode, mode)
+        rejection = expect_reboot_rejection(expect_reboot, normalized_mode)
+        if rejection is not None:
+            return rejection
+        expect_reboot_enabled = expect_reboot is True
         human = source.startswith("human:") if trusted_human is None else trusted_human
         suspend_human_interactive = False
         post = _PostCloseAction()
@@ -6541,6 +6636,7 @@ class SessionManager:
                 operation=operation,
                 trusted_human=human,
                 command_permit=command_permit,
+                expect_reboot=expect_reboot_enabled,
             )
             with self._lock:
                 aborted_by_drain = cmd_id in self._aborted_cmd_ids
@@ -6678,6 +6774,7 @@ class SessionManager:
         operation: _ForegroundOperation | None = None,
         trusted_human: bool | None = None,
         command_permit: TxPermit | None = None,
+        expect_reboot: bool = False,
     ) -> dict[str, Any]:
         human = source.startswith("human:") if trusted_human is None else trusted_human
         if normalized_mode == "interactive":
@@ -6741,7 +6838,17 @@ class SessionManager:
                     if capture is not None:
                         capture.status = "done"
         passthrough = session.profile.platform == "passthrough"
-        if not passthrough and _is_reboot_command(command):
+        guessed_reboot = not passthrough and _is_reboot_command(command)
+        if expect_reboot:
+            self._wal.append(
+                com=session.profile.com,
+                direction="META",
+                source="system",
+                cmd_id=cmd_id,
+                payload=b"",
+                meta={"event": "command_expect_reboot", "expect_reboot": True},
+            )
+        if expect_reboot or guessed_reboot:
             return self._handle_reboot_command(
                 session,
                 bridge,
@@ -6750,6 +6857,11 @@ class SessionManager:
                 cmd_id=cmd_id,
                 timeout_s=timeout_s,
                 execution_mode=normalized_mode,
+                prompt_wait_s=(
+                    max(timeout_s, expected_duration_s or 0.0)
+                    if expect_reboot and not guessed_reboot
+                    else None
+                ),
                 operation=operation,
                 trusted_human=human,
                 permit=command_permit,
@@ -7701,7 +7813,7 @@ class SessionManager:
                             **extra,
                             **lease_context,
                         }
-                    elif session.boot_quiet_active():
+                    elif session.boot_quiet_active() or session.boot_evidence_wait_active():
                         # #130 review Finding 1b（必修）：session.state 仍是 READY，但
                         # RX 已見到 boot banner——因 boot quiet 只設 boot_quiet_until
                         # 不改 session.state，會出現「state=READY 但已在 quiet window」
@@ -8435,9 +8547,6 @@ def _save_release_state(manager: "SessionManager") -> None:
     _test_kill_after_save_hook(release_kill_point)
 
 
-_READLINE_WRAP_MIN_SEGMENT = 20
-
-
 def _match_readline_wrapped_echo(text: str, command: str) -> tuple[int, int] | None:
     """回傳首個非空行內「命令原文＋readline 折行標記」的起訖位置。"""
     if not text or not command:
@@ -8466,7 +8575,7 @@ def _match_readline_wrapped_echo(text: str, command: str) -> tuple[int, int] | N
         while matched < len(command) and cursor < len(line):
             if line.startswith(" \r", cursor) and matched > 0:
                 segment = matched if last_wrap is None else matched - last_wrap
-                if segment < _READLINE_WRAP_MIN_SEGMENT:
+                if segment < _WRAP_MIN_SEGMENT:
                     break
                 last_wrap = matched
                 cursor += 2

@@ -686,12 +686,16 @@ def test_version_output_matches():
     import io
     from contextlib import redirect_stdout
     from sw_core.cli import main
-    from sw_core.version import resolve_version
+    from sw_core.version import code_fingerprint, resolve_version
 
     schema = _schema()
     flag_output = schema["x-version"]["flag_output"]
     version_str = resolve_version()
-    expected = flag_output.replace("<VERSION>", version_str)
+    fingerprint = code_fingerprint()
+    if fingerprint:
+        expected = flag_output.replace("<VERSION>", version_str).replace("<FINGERPRINT>", fingerprint)
+    else:
+        expected = schema["x-version"]["flag_output_without_fingerprint"].replace("<VERSION>", version_str)
 
     buf = io.StringIO()
     with redirect_stdout(buf):

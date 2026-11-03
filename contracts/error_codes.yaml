@@ -6,7 +6,7 @@
 # extra_fields 不含共通欄位 ok、error_code、id、version（見盤點 03 §1.1）。
 # retryable：yes＝可在條件滿足後重送；no＝不可直接重送；conditional＝視條件；fix_args＝修正參數或設定後再送。
 schema_version: 1
-revision: 1
+revision: 2
 namespace: error_code
 codes:
   - code: ALIAS_NOT_FOUND
@@ -413,6 +413,21 @@ codes:
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_framing_exception_bytes"]
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:59"]
+  - code: EXPECT_REBOOT_MODE_UNSUPPORTED
+    status: IMPLEMENTED
+    reachable: true
+    constant: ERROR_EXPECT_REBOOT_MODE
+    scope: {interfaces: [rpc, cli_local], methods: ["command.submit", "cmd submit"], platforms: [posix, windows]}
+    meaning: "expect_reboot=true 與 interactive lease 按鍵模式不相容"
+    side_effect: "無（命令不入列，零 UART TX）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "移除 --expect-reboot 或改用 line／background 模式"
+    extra_fields: ["hint"]
+    exit_codes: {"cmd submit": 1}
+    contract_tests: ["tests/test_expect_reboot.py::test_flag_in_interactive_mode_rejected_with_zero_tx"]
+    behavior_change: []
+    sources: ["sw_core/expect_reboot.py:8", "sw_core/cli.py:2883", "sw_core/service.py:1237"]
   - code: FLASHING_BUSY
     status: IMPLEMENTED
     reachable: true
@@ -591,6 +606,21 @@ codes:
     contract_tests: ["tests/test_remote_cli.py::test_remote_malformed_endpoint_returns_json_error", "tests/test_remote_endpoint.py::TestRpcCallEndpointBranch::test_invalid_endpoint_returns_structured_error"]
     behavior_change: []
     sources: ["sw_core/client.py:232", "sw_core/cli.py:1585"]
+  - code: INVALID_EXPECT_REBOOT
+    status: IMPLEMENTED
+    reachable: true
+    constant: ERROR_INVALID_EXPECT_REBOOT
+    scope: {interfaces: [rpc, cli_local], methods: ["command.submit", "cmd submit"], platforms: [posix, windows]}
+    meaning: "expect_reboot 必須為布林值或 null；字串、整數等不做真值轉換"
+    side_effect: "無（命令不入列，零 UART TX）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "以 --expect-reboot 開啟旗標或省略旗標，不要傳字串／整數"
+    extra_fields: []
+    exit_codes: {"cmd submit": 1}
+    contract_tests: ["tests/test_expect_reboot.py::test_invalid_flag_type_rejected_with_zero_tx"]
+    behavior_change: []
+    sources: ["sw_core/expect_reboot.py:7", "sw_core/cli.py:2883", "sw_core/service.py:1237"]
   - code: INVALID_JSON
     status: EXISTING
     reachable: true
@@ -1057,6 +1087,21 @@ codes:
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock"]
     behavior_change: []
     sources: ["sw_core/lock_posix.py:37"]
+  - code: SOURCE_RESERVED
+    status: IMPLEMENTED
+    reachable: true
+    constant: ERROR_SOURCE_RESERVED
+    scope: {interfaces: [rpc, cli_local], methods: ["command.submit", "file.push", "file.pull", "device.release", "session.interactive_open", "cmd submit", "file push", "file pull", "device release", "session interactive-open"], platforms: [posix, windows]}
+    meaning: "外部來源或 owner 使用 daemon 內部保留的 system 前綴"
+    side_effect: "無（送出／排隊前拒絕，零 UART TX）"
+    retryable: "fix_args"
+    uart_tx: none
+    agent_action: "自動化使用 agent:<名>；人工操作使用 human:<名>，不可使用 system 或 system:*"
+    extra_fields: ["field", "value", "reserved_prefix", "hint"]
+    exit_codes: {"cmd submit": 1}
+    contract_tests: ["tests/test_source_policy.py::TestCheckSource::test_reserved_prefix_rejected"]
+    behavior_change: []
+    sources: ["sw_core/source_policy.py:38", "sw_core/cli.py:160", "sw_core/service.py:1056", "sw_core/service.py:1228", "sw_core/service.py:1445", "sw_core/service.py:1483"]
   - code: SSH_NOT_FOUND
     status: EXISTING
     reachable: true

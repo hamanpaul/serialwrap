@@ -220,6 +220,36 @@ stopped: start it with `serialwrap service start` (systemd) or
 old pipx install is detected, the installer prints a hint that you may run
 `pipx uninstall serialwrap`; it never removes it automatically.
 
+For chained or self-rebooting commands such as `firstboot -y && reboot` or
+`sysupgrade ...`, use `cmd submit --expect-reboot` (RPC
+`command.submit.expect_reboot: true`). It arms the boot quiet window immediately
+and follows the reboot recovery path. Without the flag, a chained reboot remains
+an ordinary command and the submit response may carry a non-fatal
+`CHAINED_REBOOT_WARNING`. `--mode interactive` with the flag is rejected
+(`EXPECT_REBOOT_MODE_UNSUPPORTED`), non-boolean RPC values return
+`INVALID_EXPECT_REBOOT`, completion regex does not override reboot handling, and
+the flag does not bypass `AUTOBOOT_QUIET`. Set `--cmd-timeout` to cover the work
+before reboot. The submit response echoes `expect_reboot: true` and `command.get`
+reports it. See [explicit reboot](docs/expect-reboot.md).
+
+**Upgrading, and telling which build the daemon runs.** The bundle installer
+runs `serialwrap setup`; after a manual package update, run setup again. The version string
+(`0.3.2`) is the same for a release, a branch build and `main`, so
+`serialwrap --version` also prints a code fingerprint, e.g.
+`serialwrap 0.3.2 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap daemon status` reports the fingerprint of the code the running daemon
+loaded when it started (`code_fingerprint`) and where it loaded it from
+(`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
+every other command prints a one-line warning on stderr (stdout JSON is unchanged);
+`serialwrap doctor` reports it as the advisory check `daemon_code_current`.
+When the systemd service is active and the fingerprints differ, `serialwrap setup`
+restarts the service for you and prints a `daemon_code` field with the result.
+For systemd-system, `setup` only lists `sudo systemctl restart serialwrap` in
+`pending_sudo` unless `--with-sudo` is given; `--no-restart` skips the restart; a
+running flash never triggers it. On-demand mode never stops the daemon on its own:
+run `serialwrap daemon stop` then `serialwrap daemon start`. See
+[spec §8.7](docs/serialwrap-spec.md).
+
 For a human console, use the broker wrapper instead of raw minicom:
 
 ```bash
@@ -380,6 +410,33 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 
 Supported key encodings include `enter`, `tab`, `escape`, `ctrl-c`, `ctrl-d`,
 `up`, `down`, `left`, and `right`.
+
+#### Source labels (`--source`)
+
+`--source` (`cmd submit`, `file push`, `file pull`, `device release`) is not just
+a tracking label: the daemon uses the raw RPC value to decide command timeout
+behavior. `interactive-open --owner` identifies the lease owner; it does not grant
+human command authority.
+
+| Prefix | Class | On command timeout (no prompt came back) |
+|--------|-------|------------------------------------------|
+| `agent:<name>`, or any other string (`agent`, `codex`, ...) | agent | Sends CTRL-C, then CTRL-D, to get a prompt back — CTRL-D **logs out** a console sitting at a shell; no keys inside the boot quiet window |
+| Bare RPC source `human` / `human:` | Normalized to `human:cli`; human per OD-74 | Sends **no keys**; command timeout promotes to an interactive lease; passes the human gate |
+| Explicit `human:<name>` (including `human:cli`) | Display class is human; agent per DF-02 | Agent timeout and boot quiet behavior; `source_class` does not grant permission |
+| `system`, `system:*` | reserved | Internal only (forced recovery, self-test, login probes); external callers get `SOURCE_RESERVED` |
+
+- Only the raw RPC values `human` and `human:` (no name) are **normalized to `human:cli`**
+  and receive the OD-74 human gate and timeout behavior; successful responses carry `source`
+  and `source_normalized_from`. An explicit `human:<name>` (including `human:cli`) follows
+  DF-02 agent behavior even though its display class is human. `source_class` is not authority.
+  `session interactive-open --owner` does not normalize bare `human` or grant human command rights.
+- `system` / `system:*` are rejected by both the CLI and the daemon
+  (`error_code: SOURCE_RESERVED`) before anything is queued or written to the UART.
+  Look-alikes such as `systemd:x` are unaffected.
+- Any other unknown prefix (`codex`, `cli`, `agent`, ...) keeps the agent behavior.
+- `cmd submit` responses and the `command` record of `cmd status` carry `source_class`
+  (`human` or `agent`) for display only; it does not tell whether the raw RPC source received
+  human authorization.
 
 ### Human Console Coexistence
 
@@ -1816,6 +1873,7 @@ serialwrap doctor                # 驗證環境
 - 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
 - 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。升級前請先 `serialwrap daemon stop`（TODO(OD-48)：0.3.2 daemon 執行中直接升級的行為實作後再更新此步驟）。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`，且不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.3.2`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
@@ -2122,17 +2180,27 @@ prompt 擷取，但只裁切完成標記之後的 prompt，保留早先 prompt r
 與完成標記供呼叫端驗證；`command.get` 與 WAL META 記錄設定，
 reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-completion.md)。
 
+broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown -r`、
+`echo b > /proc/sysrq-trigger`）。`firstboot -y && reboot`、`sysupgrade …` 這類串接或自帶重開機的命令，
+請加 `cmd submit --expect-reboot`（RPC `command.submit` 的布林 `expect_reboot`）：不管命令文字，
+一律走 reboot 路徑（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 recovery 等板子回 `READY`）。
+沒帶旗標時，串接的 reboot 仍當一般命令執行，submit 回應多一則非致命 `CHAINED_REBOOT_WARNING`，
+執行行為不變。`--mode interactive` 帶旗標會被拒絕（`EXPECT_REBOOT_MODE_UNSUPPORTED`），非布林值回
+`INVALID_EXPECT_REBOOT`，同時帶 `--completion-regex` 時 reboot 優先（regex 不使用），旗標不繞過
+`AUTOBOOT_QUIET`。`--cmd-timeout` 要涵蓋 reboot 之前那一段的耗時。submit 回應回聲 `expect_reboot: true`，
+`command.get` 回報此設定。詳見[明示 reboot](docs/expect-reboot.md)。
+
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
-**長命令 keepalive**：對於 `apt upgrade`、`make`、`python -m unittest` 等長時間命令，可加 `--expected-duration` 提示 broker 延長等待：
+**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
 ```bash
 serialwrap cmd submit --selector COM0 --mode line --source agent:ci \
   --cmd "python3 -m unittest discover -s tests -v" \
-  --timeout 300 --expected-duration 120
+  --cmd-timeout 30 --expected-duration 300
 ```
 
-broker 會在命令執行期間監控 UART RX 活動，有輸出時自動延長等待。詳見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
+會靜默的長命令（如 `sleep 60`）請在板上用 `setsid sh -c '…' </dev/null >/dev/null 2>&1 &` 丟背景，再以短命令輪詢結果；`--mode background` 與 `line` 共用同一段期限邏輯，不是長命令的出口。歷史設計記錄見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
 
 ### 2. `background`
 
@@ -2161,6 +2229,28 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 ```
 
 `--encoding key` 目前支援：`enter`、`tab`、`escape`、`ctrl-c`、`ctrl-d`、`up`、`down`、`left`、`right`。
+
+#### 來源標籤（`--source`）
+
+`--source`（`cmd submit`／`file push`／`file pull`／`device release`）不只是追蹤標籤：
+daemon 依 RPC 原始來源決定命令逾時（沒等到 prompt）時怎麼處理。
+`session interactive-open --owner` 只標示 lease 擁有者，不授予命令的 human 權限。
+
+| 前綴 | 歸類 | 命令逾時時 |
+|------|------|-----------|
+| `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 先送 CTRL-C、再送 CTRL-D 嘗試把 prompt 叫回來——停在 shell 的 console 會被 CTRL-D **登出**；boot quiet window 內不送按鍵 |
+| RPC 原始來源恰為 bare `human`／`human:` | 正規化為 `human:cli`；依 OD-74 為 human | **不送任何按鍵**，命令逾時升級成 interactive lease；可通過 human gate |
+| 明寫 `human:<名>`（包括 `human:cli`） | 顯示分類為 human；依 DF-02 為 agent | 逾時與 boot quiet gate 照 agent 處理；`source_class` 不授權 |
+| `system`、`system:*` | 保留 | daemon 內部（強制恢復、self-test、登入探測）專用，外部呼叫回 `SOURCE_RESERVED` |
+
+- 只有 RPC 原始輸入恰為 bare `human` 或 `human:`（沒名字）才依 OD-74 **正規化為 `human:cli`**
+  並取得 human gate／逾時行為；成功回應帶 `source`（正規化後的值）與 `source_normalized_from`
+  （原字串）。明寫 `human:<名>`（包括 `human:cli`）依 DF-02 照 agent gate／逾時處理；
+  `source_class` 僅供顯示，不授權。`session interactive-open --owner` 不正規化 bare `human`。
+- `system`／`system:*` 由 CLI 與 daemon 兩端拒絕（`error_code: SOURCE_RESERVED`），在排隊與送 UART 之前就擋下；
+  `systemd:x` 之類只是長得像的字串不受影響。
+- 其他沒見過的前綴（`codex`、`cli`、`agent`…）維持 agent 行為，不報錯。
+- `cmd submit` 的回應與 `cmd status` 的 `command` 記錄帶 `source_class`（`human`／`agent`）供顯示；不能據此判定原始來源是否獲得 human 權限。
 
 #### Bootloader Recovery Lease
 
@@ -3346,7 +3436,7 @@ serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
 options:
   -h, --help           show this help message and exit
-  --version            顯示版本後離開
+  --version            顯示版本與程式碼指紋後離開
   -v, --verbose        提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）

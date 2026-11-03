@@ -92,35 +92,35 @@ messages:
     level: WARNING
     template: "state.json 解析失敗（JSON 損毀），略過載入並備份至 %s：%s"
     args: [backup, exc]
-    source: "sw_core/session_manager.py:1328"
+    source: "sw_core/session_manager.py:1404"
 
   - id: released_restore_missing_by_id
     logger: serialwrap
     level: WARNING
     template: "released session 無法還原（session=%s、缺少 by_id），保留持久化阻擋"
     args: [sid]
-    source: "sw_core/session_manager.py:973"
+    source: "sw_core/session_manager.py:1049"
 
   - id: released_restore_template_missing
     logger: serialwrap
     level: WARNING
     template: "released session 的 template 不存在（session=%s、profile=%s），保留持久化阻擋"
     args: [sid, template_name]
-    source: "sw_core/session_manager.py:993"
+    source: "sw_core/session_manager.py:1069"
 
   - id: released_restore_missing_com
     logger: serialwrap
     level: WARNING
     template: "released session 無法還原（session=%s、缺少 COM），保留持久化阻擋"
     args: [sid]
-    source: "sw_core/session_manager.py:1007"
+    source: "sw_core/session_manager.py:1083"
 
   - id: credentials_unresolved
     logger: serialwrap
     level: WARNING
     template: "session %s 帳密解析未完成（reason=%s, env_file=%s）：不對 login prompt 送空帳密，標記 CREDENTIALS_UNRESOLVED 終態，請補齊帳密後手動 attach/recover"
     args: [com, reason, env_file_or_dash]
-    source: "sw_core/session_manager.py:1915"
+    source: "sw_core/session_manager.py:1991"
     dedup: credentials_warned
 
   - id: transport_stall_suspected
@@ -128,7 +128,7 @@ messages:
     level: WARNING
     template: "session %s 疑似 transport stall（零 RX %.1fs、probe 全程無 echo，real_path=%s）：%s"
     args: [com, rx_age_s, real_path_or_dash, detail]
-    source: "sw_core/session_manager.py:2015"
+    source: "sw_core/session_manager.py:2091"
     dedup: transport_stall_warned
 
   - id: max_sessions_reached
@@ -136,7 +136,7 @@ messages:
     level: WARNING
     template: "已達 max_sessions=%d，忽略裝置 %s"
     args: [max_sessions, by_id]
-    source: "sw_core/session_manager.py:4787"
+    source: "sw_core/session_manager.py:4871"
 
   - id: reboot_recovery_ensure_ready_exception
     logger: serialwrap
@@ -144,7 +144,7 @@ messages:
     template: "reboot-recovery ensure_ready 例外（session=%s），續迴圈待逾時收尾"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:6204"
+    source: "sw_core/session_manager.py:6288"
 
   - id: console_rx_handler_exception
     logger: serialwrap
@@ -295,28 +295,28 @@ messages:
     level: ERROR
     template: "serialwrapd: 有序關機逾時，未收斂 session=%s（非優雅停止，SC-11 不計 PASS）"
     args: [shutdown.stalled]
-    source: "sw_core/service.py:617"
+    source: "sw_core/service.py:628"
 
   - id: release_state_persist_failed
     logger: serialwrap
     level: ERROR
     template: "serialwrap: release 持久化失敗（session=%s）：%s"
     args: [job.session_id, exc]
-    source: "sw_core/session_manager.py:2795"
+    source: "sw_core/session_manager.py:2878"
 
   - id: preopened_uart_handle_close_failed
     logger: serialwrap
     level: WARNING
     template: "預開 UART handle 關閉失敗（by_id=%s）：%s"
     args: [op.by_id, exc]
-    source: "sw_core/session_manager.py:4246"
+    source: "sw_core/session_manager.py:4329"
 
   - id: attach_op_release_state_persist_failed
     logger: serialwrap
     level: ERROR
     template: "release 持久化失敗（session=%s）：%s"
     args: [session.session_id, exc]
-    source: "sw_core/session_manager.py:4276"
+    source: "sw_core/session_manager.py:4359"
 
   - id: shutdown_skip_device_update
     logger: serialwrap
@@ -324,7 +324,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過裝置更新"
     args: []
-    source: "sw_core/session_manager.py:3944"
+    source: "sw_core/session_manager.py:4027"
 
   - id: shutdown_skip_profile_attach
     logger: serialwrap
@@ -332,7 +332,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:4024"
+    source: "sw_core/session_manager.py:4107"
 
   - id: shutdown_skip_attach_start
     logger: serialwrap
@@ -340,7 +340,7 @@ messages:
     dropped: true
     template: "shutdown 中，略過 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:4760"
+    source: "sw_core/session_manager.py:4844"
 
   - id: shutdown_skip_dynamic_attach
     logger: serialwrap
@@ -348,21 +348,21 @@ messages:
     dropped: true
     template: "shutdown 或 drain 中，略過動態 attach %s"
     args: [by_id]
-    source: "sw_core/session_manager.py:5441"
+    source: "sw_core/session_manager.py:5525"
 
   - id: console_line_rejected
     logger: serialwrap
     level: WARNING
     template: "serialwrap: console 行被拒（session=%s client=%s error_code=%s bytes=%d）"
     args: [session_id, client.client_id, error_code, len(line.encode("utf-8"))]
-    source: "sw_core/service.py:387"
+    source: "sw_core/service.py:398"
 
   - id: interactive_lease_restore_failed
     logger: serialwrap
     level: WARNING
     template: "serialwrap: interactive lease 到期後還原失敗（interactive_id=%s error=%s）"
     args: [interactive_id, type(exc).__name__]
-    source: "sw_core/session_manager.py:2370"
+    source: "sw_core/session_manager.py:2452"
 
   - id: console_line_overflow
     logger: serialwrap
@@ -377,25 +377,25 @@ messages:
     template: "reboot-recovery ensure_ready TX 例外（session=%s）"
     args: [session_id]
     exc_info: true
-    source: "sw_core/session_manager.py:6198"
+    source: "sw_core/session_manager.py:6282"
 
   - id: test_kill_after_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1 已忽略：%s（非隔離實例不得終止行程）"
     args: [reason]
-    source: "sw_core/session_manager.py:8384"
+    source: "sw_core/session_manager.py:8496"
 
   - id: test_kill_after_save_fired
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_KILL_AFTER_SAVE=1：state 已落盤，於回應前以 os._exit(137) 模擬程序被殺（隔離實例）"
     args: []
-    source: "sw_core/session_manager.py:8389"
+    source: "sw_core/session_manager.py:8501"
 
   - id: test_pause_before_release_save_ignored_non_isolated
     logger: serialwrap
     level: WARNING
     template: "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE 已忽略：%s（非隔離實例不得暫停）"
     args: [reason]
-    source: "sw_core/session_manager.py:8411"
+    source: "sw_core/session_manager.py:8523"

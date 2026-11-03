@@ -6,7 +6,7 @@
 # applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
 # 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
 schema_version: 1
-revision: 7
+revision: 8
 changes:
   - id: "BC-01"
     kind: "BC"
@@ -973,12 +973,12 @@ changes:
     related_decisions: []
   - id: "DF-02"
     kind: "DF"
-    title: "RPC 帶入 human: source 以 agent 對待"
+    title: "RPC 明寫 human: source 以 agent 對待"
     status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
-      date: "2026-10-15"
-      decision_ref: "spec-reconciliation.md §1.2"
+      date: "2026-11-03"
+      decision_ref: "OD-74"
       basis: "reconciliation"
     owner_confirmation: "confirmed"
     owner_item: 5
@@ -988,16 +988,16 @@ changes:
         min_version: "0.4.0"
       rust:
         stage: "slice-2.1"
-    approved_at_revision: 1
+    approved_at_revision: 8
     spec_refs: ["§5.2.1"]
     reconciliation_refs: ["RPC-H-05", "SES-16.6-03"]
     scope: "both"
     ab_participation: "diff"
     phases: ["P1", "P5"]
     case_ids: ["df02-human-source-spoof"]
-    compatibility_impact: "RPC 帶入的 source 以 human: 開頭時一律以 agent 對待（gate 與升格都比照 agent）；依賴 human source 的既有 client 行為改變。daemon 內部 human console 路徑不受影響。"
-    approval_conditions: "安全 gate 可被偽造繞過"
-    related_decisions: ["OD-14"]
+    compatibility_impact: "依 RPC 原始 source 判定：明寫 human:<x>（含 human:cli）於 gate 與逾時升格皆比照 agent；bare human 依 OD-74 正規化為 human:cli，於 gate 與逾時升格皆視為 human。不得由正規化後字串或 source_class 推定權限；daemon 內部 human console 的 trusted_human 路徑不變。"
+    approval_conditions: "依原始 RPC source 分辨 bare human 與明寫 human:<x>；保留 DF-02 防止明寫前綴繞過 gate 與逾時升格的條件"
+    related_decisions: ["OD-14", "OD-74"]
   - id: "DF-03"
     kind: "DF"
     title: "WAL／mirror 歸檔同名不覆蓋"
@@ -1516,7 +1516,7 @@ safety_invariants:
     title: "被拒絕且依契約應為零副作用的請求，外部 TX 必須為零"
     spec_ref: "§11.3"
     # 注意（待決 plan item，見 01-stage0-contracts.md T3 uart_tx 說明）：SESSION_NOT_READY 於 session.attach／session.recover 的 probe 之後回此碼時，probe 位元組可能已送出，不滿足零 TX。本清單依碼推導並保留此碼，以符合 T5 的資料推導測試；P2 zero-TX oracle 不得僅以碼推導，須以 (碼, method) 排除這兩個 method 的 SESSION_NOT_READY（機器可讀排除需 T1 schema 變更，待擁有者與 plan 決定）。
-    error_codes: ["ALIAS_NOT_FOUND", "AUTOBOOT_QUIET", "CMD_CONTAINS_NEWLINE", "CMD_NOT_CANCELABLE", "CMD_NOT_FOUND", "CMD_TOO_LONG", "CONSOLE_NOT_FOUND", "DEVICE_ALREADY_BOUND", "DEVICE_NOT_BOUND", "DEVICE_NOT_FOUND", "DEVICE_NOT_PRESENT", "DEVICE_STILL_HELD", "ECHO_ACK_UNSUPPORTED", "FLASHING_BUSY", "FLASH_TARGET_IS_CONSOLE", "FLUSHED_BY_RECOVERY", "FLUSHED_BY_SHUTDOWN", "INTERACTIVE_NOT_FOUND", "INVALID_ARGS", "INVALID_COMPLETION_REGEX", "INVALID_RULE_SCHEMA", "LOCAL_FILE_NOT_FOUND", "LOG_OPEN_FAILED", "METHOD_NOT_FOUND", "NOT_READY", "NO_ACTIVE_CAPTURE", "PROFILE_IS_EXPLICIT", "PROFILE_NOT_COMMAND_CAPABLE", "READY_UNCONFIRMED", "RULE_NOT_FOUND", "SESSION_BUSY", "SESSION_INTERACTIVE_BUSY", "SESSION_NOT_FOUND", "SESSION_NOT_READY", "SESSION_QUEUE_FULL", "SESSION_RECOVERING", "UNKNOWN_PROFILE", "WAL_MISSING"]
+    error_codes: ["ALIAS_NOT_FOUND", "AUTOBOOT_QUIET", "CMD_CONTAINS_NEWLINE", "CMD_NOT_CANCELABLE", "CMD_NOT_FOUND", "CMD_TOO_LONG", "CONSOLE_NOT_FOUND", "DEVICE_ALREADY_BOUND", "DEVICE_NOT_BOUND", "DEVICE_NOT_FOUND", "DEVICE_NOT_PRESENT", "DEVICE_STILL_HELD", "ECHO_ACK_UNSUPPORTED", "EXPECT_REBOOT_MODE_UNSUPPORTED", "FLASHING_BUSY", "FLASH_TARGET_IS_CONSOLE", "FLUSHED_BY_RECOVERY", "FLUSHED_BY_SHUTDOWN", "INTERACTIVE_NOT_FOUND", "INVALID_ARGS", "INVALID_COMPLETION_REGEX", "INVALID_EXPECT_REBOOT", "INVALID_RULE_SCHEMA", "LOCAL_FILE_NOT_FOUND", "LOG_OPEN_FAILED", "METHOD_NOT_FOUND", "NOT_READY", "NO_ACTIVE_CAPTURE", "PROFILE_IS_EXPLICIT", "PROFILE_NOT_COMMAND_CAPABLE", "READY_UNCONFIRMED", "RULE_NOT_FOUND", "SESSION_BUSY", "SESSION_INTERACTIVE_BUSY", "SESSION_NOT_FOUND", "SESSION_NOT_READY", "SESSION_QUEUE_FULL", "SESSION_RECOVERING", "SOURCE_RESERVED", "UNKNOWN_PROFILE", "WAL_MISSING"]
     case_ids: ["sc01-recovering-submit-open", "sc02-flashing-submit-open", "sc03-quiet-retry-after-execute-file", "df19-self-test-probe-quiet-fence"]
   - id: no_forbidden_interleave
     title: "不得將不同來源的 bytes 以契約禁止的方式交錯"

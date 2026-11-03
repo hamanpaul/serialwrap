@@ -266,7 +266,7 @@ def test_early_response_bytes_match_framing():
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
 def test_version_absent_for_matches_runtime():
-    """驗證 version_absent_for 表列的情境回應皆不含 version，且 health.ping 回應末尾含 version。"""
+    """驗證 framing 早退不含共通識別欄位，health.ping 以 version／fingerprint 收尾。"""
     schema = _schema()
     expected_absent = set(schema["x-wire"]["version_absent_for"])
     assert expected_absent == {
@@ -305,7 +305,8 @@ def test_version_absent_for_matches_runtime():
     svc = SerialwrapService([])
     ping_resp = svc.rpc("health.ping", {})
     assert "version" in ping_resp
-    assert list(ping_resp.keys())[-1] == "version"
+    assert "code_fingerprint" in ping_resp
+    assert list(ping_resp.keys())[-2:] == ["version", "code_fingerprint"]
 
 
 @pytest.mark.core_portable
@@ -385,7 +386,15 @@ def _oracle_regex(value: Any) -> bool:
     return True
 
 
-_VALIDATORS = {"valid_completion_regex": _oracle_regex}
+def _oracle_expect_reboot(value: Any) -> bool:
+    """expect_reboot 僅接受 bool／None，拒絕其他型別而不轉成 truthy／falsy。"""
+    return value is None or isinstance(value, bool)
+
+
+_VALIDATORS = {
+    "valid_completion_regex": _oracle_regex,
+    "valid_expect_reboot": _oracle_expect_reboot,
+}
 
 
 def _chain_keys(spec: dict[str, Any]) -> list[str]:
@@ -558,8 +567,12 @@ def test_params_coercion_match_runtime():
                 checked += 1
                 if "x-validator" in p and kind == "ok" and value is not MISSING:
                     if not _VALIDATORS[p["x-validator"]](value):
-                        if not (resp.get("error_code") == "INVALID_COMPLETION_REGEX" and not rec.calls):
-                            failures.append(f"{m}.{k}[{label}] invalid-expected got {resp!r}")
+                        expected_code = {
+                            "valid_completion_regex": "INVALID_COMPLETION_REGEX",
+                            "valid_expect_reboot": "INVALID_EXPECT_REBOOT",
+                        }[p["x-validator"]]
+                        if not (resp.get("error_code") == expected_code and not rec.calls):
+                            failures.append(f"{m}.{k}[{label}] invalid-expected {expected_code} got {resp!r}")
                         continue
                 if p.get("x-forwarded", True) is False and kind == "ok" and "x-enum" not in p:
                     continue  # 服務層本地使用、不轉傳（wal.range.to_seq）；由 test_wal_range_to_seq_filters_locally 驗證
@@ -698,6 +711,9 @@ def test_error_order_precedence():
     resp, _ = _run(svc, "command.submit", {"completion_regex": "("}, forced="SESSION_NOT_FOUND")
     assert resp.get("error_code") == "INVALID_COMPLETION_REGEX", resp
     covered.add("command.submit")
+    resp, _ = _run(svc, "session.interactive_open", {"owner": "system:spoof"}, forced="SESSION_NOT_FOUND")
+    assert resp.get("error_code") == "SOURCE_RESERVED", resp
+    covered.add("session.interactive_open")
     not_testable = {m: reason for m, reason in _NOT_SERVICE_TESTABLE.items()}
     assert multi - covered == set(not_testable), sorted(multi - covered - set(not_testable))
 

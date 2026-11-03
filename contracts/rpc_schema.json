@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 15,
+  "x-catalog-revision": 16,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
@@ -15,9 +15,10 @@
     "key_order": [
       "id",
       "<handler insertion order>",
-      "version"
+      "version if absent",
+      "code_fingerprint if available and absent"
     ],
-    "version_position": "last（經 service.rpc 的 setdefault 附加；version_absent_for 之外的回應皆有）",
+    "version_position": "service.rpc 只在欄位不存在時附加；health.status 於 pid 後顯式輸出",
     "allow_nan": true,
     "compact_separators": [
       ",",
@@ -34,6 +35,10 @@
       "EXCEPTION",
       "daemon.stop",
       "daemon.handoff_stop"
+    ],
+    "code_fingerprint_position": "service.rpc 只在啟動時指紋可用且欄位不存在時附加於末尾；health.status 於 version 後顯式輸出；未知時一般回應省略",
+    "code_fingerprint_absent_for": [
+      "所有未能於 daemon 啟動時計算出指紋的一般 RPC 回應"
     ]
   },
   "x-generic-errors": [
@@ -93,6 +98,7 @@
         "ready_reconfirm_pending",
         "ready_reconfirm_failed",
         "ready_reconfirm_remaining_s",
+        "boot_evidence_wait_remaining_s",
         "idle_for_ms",
         "last_rx_age_s",
         "last_tx_age_s",
@@ -295,6 +301,14 @@
           "x-unit": "s",
           "x-updated-by": "非 pending 時為 null；隨 1 s tick 與 session 狀態同步"
         },
+        "boot_evidence_wait_remaining_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-unit": "s",
+          "x-note": "舊 shell nonce 可能在重開機後存活；等待新開機 banner 或 60 s grace 到期，僅供觀察、不持久化"
+        },
         "idle_for_ms": {
           "type": [
             "integer",
@@ -473,7 +487,8 @@
         "released_reason",
         "capture",
         "drain_stalled",
-        "drain_timeout_epoch"
+        "drain_timeout_epoch",
+        "boot_evidence_wait_remaining_s"
       ],
       "additionalProperties": false
     },
@@ -523,6 +538,7 @@
         "timeout_s",
         "expected_duration_s",
         "completion_regex",
+        "expect_reboot",
         "priority",
         "status",
         "created_at",
@@ -572,6 +588,10 @@
             "string",
             "null"
           ]
+        },
+        "expect_reboot": {
+          "type": "boolean",
+          "x-note": "命令建立時固定記錄；未指定為 false"
         },
         "priority": {
           "type": "integer"
@@ -657,6 +677,14 @@
             "string",
             "null"
           ]
+        },
+        "source_class": {
+          "type": "string",
+          "enum": [
+            "human",
+            "agent"
+          ],
+          "x-note": "command.get 由 service 追加的顯示分類；不屬於 arbiter 原始 record，亦不作授權依據"
         }
       },
       "required": [
@@ -672,9 +700,15 @@
         "created_at",
         "accepted_at",
         "stdout",
-        "partial"
+        "partial",
+        "expect_reboot"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "x-runtime-appended-fields": {
+        "command.get": [
+          "source_class"
+        ]
+      }
     },
     "WalRecord": {
       "type": "object",
@@ -977,6 +1011,94 @@
         "next_chunk",
         "chunks"
       ]
+    },
+    "CommandSubmitWarning": {
+      "type": "object",
+      "oneOf": [
+        {
+          "title": "cmd_length_warning",
+          "type": "object",
+          "additionalProperties": false,
+          "x-order": [
+            "code",
+            "cmd_length",
+            "soft_limit",
+            "hint"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "CMD_LENGTH_WARNING"
+            },
+            "cmd_length": {
+              "type": "integer"
+            },
+            "soft_limit": {
+              "type": "integer",
+              "const": 4096
+            },
+            "hint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "cmd_length",
+            "soft_limit",
+            "hint"
+          ]
+        },
+        {
+          "title": "chained_reboot_warning",
+          "type": "object",
+          "additionalProperties": false,
+          "x-order": [
+            "code",
+            "segment",
+            "hint"
+          ],
+          "properties": {
+            "code": {
+              "type": "string",
+              "const": "CHAINED_REBOOT_WARNING"
+            },
+            "segment": {
+              "type": "string",
+              "minLength": 1
+            },
+            "hint": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "segment",
+            "hint"
+          ]
+        }
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "CMD_LENGTH_WARNING",
+            "CHAINED_REBOOT_WARNING"
+          ]
+        },
+        "cmd_length": {
+          "type": "integer"
+        },
+        "soft_limit": {
+          "type": "integer"
+        },
+        "segment": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hint": {
+          "type": "string"
+        }
+      }
     }
   },
   "x-methods": {
@@ -1394,6 +1516,16 @@
           ],
           "x-coercion": "float(params.get(k)) if params.get(k) is not None else None",
           "default": null
+        },
+        "expect_reboot": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "x-coercion": "params.get(k)",
+          "default": null,
+          "x-validator": "valid_expect_reboot",
+          "x-note": "只接受 bool／null；true 僅支援 line／background，未指定不加入 RPC 參數"
         }
       },
       "result": {
@@ -1403,7 +1535,12 @@
           "cmd_id",
           "status",
           "session_id",
-          "warning"
+          "expect_reboot",
+          "warning",
+          "warnings",
+          "source",
+          "source_normalized_from",
+          "source_class"
         ],
         "properties": {
           "ok": {
@@ -1421,47 +1558,69 @@
           "session_id": {
             "type": "string"
           },
+          "expect_reboot": {
+            "type": "boolean",
+            "const": true,
+            "x-note": "僅 command.submit 明確傳入 true 時回聲；未指定或 false 時省略"
+          },
           "warning": {
-            "type": "object",
-            "x-order": [
-              "code",
-              "cmd_length",
-              "soft_limit",
-              "hint"
-            ],
-            "properties": {
-              "code": {
-                "type": "string",
-                "const": "CMD_LENGTH_WARNING"
-              },
-              "cmd_length": {
-                "type": "integer"
-              },
-              "soft_limit": {
-                "type": "integer",
-                "const": 4096
-              },
-              "hint": {
-                "type": "string"
-              }
+            "$ref": "#/$defs/CommandSubmitWarning"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/CommandSubmitWarning"
             },
-            "required": [
-              "code",
-              "cmd_length",
-              "soft_limit",
-              "hint"
-            ]
+            "x-note": "僅串接命令含 reboot 且未明示 expect_reboot 時出現；warning 維持相容的首則警告"
+          },
+          "source": {
+            "type": "string",
+            "x-conditional": "僅外部輸入經正規化時回傳正規化值"
+          },
+          "source_normalized_from": {
+            "type": "string",
+            "x-conditional": "僅 bare human／human: 正規化時回傳原始輸入"
+          },
+          "source_class": {
+            "type": "string",
+            "enum": [
+              "human",
+              "agent"
+            ],
+            "x-note": "顯示分類；永不作授權依據。command.submit 成功回應必有此欄"
           }
         },
         "required": [
           "ok",
           "cmd_id",
           "status",
-          "session_id"
-        ]
+          "session_id",
+          "source_class"
+        ],
+        "errors": [
+          "INVALID_COMPLETION_REGEX",
+          "SOURCE_RESERVED",
+          "INVALID_EXPECT_REBOOT",
+          "EXPECT_REBOOT_MODE_UNSUPPORTED",
+          "INVALID_ARGS",
+          "SESSION_NOT_FOUND",
+          "SESSION_RECOVERING",
+          "FLASHING_BUSY",
+          "PROFILE_NOT_COMMAND_CAPABLE",
+          "SESSION_NOT_READY",
+          "READY_UNCONFIRMED",
+          "AUTOBOOT_QUIET",
+          "CMD_TOO_LONG",
+          "CMD_CONTAINS_NEWLINE",
+          "SESSION_QUEUE_FULL"
+        ],
+        "x-conditional-order": "expect_reboot 僅 true 時出現；warning/warnings 僅有警告時出現；來源標註在成功結果末端，common version/code_fingerprint 依 x-wire 規則補入"
       },
       "errors": [
         "INVALID_COMPLETION_REGEX",
+        "SOURCE_RESERVED",
+        "INVALID_EXPECT_REBOOT",
+        "EXPECT_REBOOT_MODE_UNSUPPORTED",
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
         "SESSION_RECOVERING",
@@ -1476,6 +1635,9 @@
       ],
       "error_order": [
         "INVALID_COMPLETION_REGEX",
+        "SOURCE_RESERVED",
+        "INVALID_EXPECT_REBOOT",
+        "EXPECT_REBOOT_MODE_UNSUPPORTED",
         "INVALID_ARGS",
         "SESSION_NOT_FOUND",
         "SESSION_RECOVERING",
@@ -1500,9 +1662,9 @@
       "long_timeout": false,
       "selector_chain": "selector>com>alias",
       "status": "EXISTING",
-      "source": "sw_core/service.py:891-918 → arbiter.submit sw_core/arbiter.py:127",
+      "source": "sw_core/service.py:1224-1271 → arbiter.submit sw_core/arbiter.py:194",
       "x-notes": {
-        "error_order_basis": "03 §4 gate 順序：regex→selector→state→READY_UNCONFIRMED→quiet→長度→換行→queue（pending）",
+        "error_order_basis": "完成 regex→原始 source 驗證→expect_reboot 型別／模式驗證→selector→state→READY／quiet→長度／換行→queue",
         "coercion_exception_precedes_validation": "轉型例外（EXCEPTION）先於 INVALID_ARGS 驗證（02 §5.2）；errors／error_order 無法表示此先後，故註記於此"
       },
       "x-error-results": {
@@ -1941,7 +2103,9 @@
           "already_released",
           "session",
           "closed_consoles",
-          "aborted_cmd"
+          "aborted_cmd",
+          "source",
+          "source_normalized_from"
         ],
         "properties": {
           "ok": {
@@ -1960,15 +2124,25 @@
           },
           "aborted_cmd": {
             "type": "boolean"
+          },
+          "source": {
+            "type": "string",
+            "x-conditional": "僅外部輸入經正規化時回傳正規化值"
+          },
+          "source_normalized_from": {
+            "type": "string",
+            "x-conditional": "僅 bare human／human: 正規化時回傳原始輸入"
           }
         },
         "required": [
           "ok",
           "session"
-        ]
+        ],
+        "x-conditional-order": "source 與 source_normalized_from 僅正規化成功時出現"
       },
       "errors": [
         "INVALID_ARGS",
+        "SOURCE_RESERVED",
         "SESSION_NOT_FOUND",
         "FLASHING_BUSY",
         "SESSION_RECOVERING",
@@ -1976,6 +2150,7 @@
       ],
       "error_order": [
         "INVALID_ARGS",
+        "SOURCE_RESERVED",
         "SESSION_NOT_FOUND",
         "FLASHING_BUSY",
         "SESSION_RECOVERING",
@@ -2814,7 +2989,9 @@
           "ok",
           "bytes",
           "md5",
-          "local_path"
+          "local_path",
+          "source",
+          "source_normalized_from"
         ],
         "properties": {
           "ok": {
@@ -2830,6 +3007,14 @@
           },
           "local_path": {
             "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "x-conditional": "僅外部輸入經正規化時回傳正規化值"
+          },
+          "source_normalized_from": {
+            "type": "string",
+            "x-conditional": "僅 bare human／human: 正規化時回傳原始輸入"
           }
         },
         "required": [
@@ -2837,10 +3022,12 @@
           "bytes",
           "md5",
           "local_path"
-        ]
+        ],
+        "x-conditional-order": "source 與 source_normalized_from 僅正規化成功時出現"
       },
       "errors": [
         "INVALID_ARGS",
+        "SOURCE_RESERVED",
         "SESSION_NOT_FOUND",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
@@ -2864,6 +3051,7 @@
       ],
       "error_order": [
         "INVALID_ARGS",
+        "SOURCE_RESERVED",
         "SESSION_NOT_FOUND",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
@@ -2960,7 +3148,9 @@
           "bytes",
           "chunks",
           "md5",
-          "remote_path"
+          "remote_path",
+          "source",
+          "source_normalized_from"
         ],
         "properties": {
           "ok": {
@@ -2979,6 +3169,14 @@
           },
           "remote_path": {
             "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "x-conditional": "僅外部輸入經正規化時回傳正規化值"
+          },
+          "source_normalized_from": {
+            "type": "string",
+            "x-conditional": "僅 bare human／human: 正規化時回傳原始輸入"
           }
         },
         "required": [
@@ -2987,10 +3185,12 @@
           "chunks",
           "md5",
           "remote_path"
-        ]
+        ],
+        "x-conditional-order": "source 與 source_normalized_from 僅正規化成功時出現"
       },
       "errors": [
         "INVALID_ARGS",
+        "SOURCE_RESERVED",
         "SESSION_NOT_FOUND",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
@@ -3017,6 +3217,7 @@
       ],
       "error_order": [
         "INVALID_ARGS",
+        "SOURCE_RESERVED",
         "SESSION_NOT_FOUND",
         "PROFILE_NOT_COMMAND_CAPABLE",
         "SESSION_RECOVERING",
@@ -3110,6 +3311,8 @@
           "ok",
           "pid",
           "version",
+          "code_fingerprint",
+          "code_path",
           "running",
           "started_at",
           "sessions",
@@ -3137,6 +3340,17 @@
           "version": {
             "type": "string",
             "x-note": "health() 內顯式放置於 pid 之後（setdefault 為 no-op）"
+          },
+          "code_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "x-note": "daemon 啟動時計算的 sw_core Python 程式碼指紋；無法計算時為 null"
+          },
+          "code_path": {
+            "type": "string",
+            "x-note": "daemon 啟動時載入的 sw_core 程式碼目錄"
           },
           "running": {
             "type": "boolean"
@@ -3447,7 +3661,9 @@
           "limits",
           "multi_open",
           "foreign_holders",
-          "multi_open_detail"
+          "multi_open_detail",
+          "code_fingerprint",
+          "code_path"
         ]
       },
       "errors": [],
@@ -4977,7 +5193,8 @@
         "owner": {
           "type": "string",
           "x-coercion": "str(params.get(k) or \"agent\")",
-          "default": "agent"
+          "default": "agent",
+          "x-note": "來源字串；system:* 保留並拒絕，normalize_human=false，bare human 不改寫且不授權"
         },
         "timeout_s": {
           "type": "number",
@@ -5042,6 +5259,7 @@
         ]
       },
       "errors": [
+        "SOURCE_RESERVED",
         "INVALID_ARGS",
         "SESSION_RECOVERING",
         "FLASHING_BUSY",
@@ -5050,6 +5268,7 @@
         "SESSION_INTERACTIVE_BUSY"
       ],
       "error_order": [
+        "SOURCE_RESERVED",
         "INVALID_ARGS",
         "SESSION_RECOVERING",
         "FLASHING_BUSY",

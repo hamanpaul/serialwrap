@@ -24,6 +24,15 @@ SCHEMA = REPO / "contracts" / "release_manifest.schema.json"
 META = REPO / "contracts" / "cli_help" / "_meta.json"
 VERSION = (REPO / "VERSION").read_text(encoding="utf-8").strip()
 
+
+def _expected_python_version(version: str) -> str:
+    """Python bundle 依版本字串附上同一份 sw_core 原始碼指紋。"""
+    from sw_core.version import compute_code_fingerprint
+
+    fingerprint = compute_code_fingerprint()
+    suffix = f" (code {fingerprint})" if fingerprint else ""
+    return f"serialwrap {version}{suffix}"
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.process_rpc,
@@ -126,7 +135,7 @@ def test_venv_python_runs_cli_version(bundle):
         check=False,
     )
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == f"serialwrap {VERSION}"
+    assert r.stdout.strip() == _expected_python_version(VERSION)
 
 
 def test_cli_sha256_matches_binary_file(bundle):
@@ -584,7 +593,7 @@ def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
             cwd=str(tmp_path),
             check=False,
         )
-        assert py.returncode == 0 and py.stdout.strip() == f"serialwrap {version}", py.stderr
+        assert py.returncode == 0 and py.stdout.strip() == _expected_python_version(version), py.stderr
 
         m = json.loads((vdir / "release-manifest.json").read_text(encoding="utf-8"))
         assert m["bundle_version"] == version

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 6,
+  "x-catalog-revision": 7,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
@@ -22,8 +22,9 @@
       "flags": [
         "--version"
       ],
-      "action": "version",
-      "dest": null
+      "action": "_VersionAction",
+      "dest": "version",
+      "default": "==SUPPRESS=="
     },
     {
       "flags": [
@@ -1152,6 +1153,14 @@
               "dest": "completion_regex",
               "type": "str",
               "default": null
+            },
+            {
+              "flags": [
+                "--expect-reboot"
+              ],
+              "action": "store_true",
+              "dest": "expect_reboot",
+              "default": false
             }
           ],
           "mutex": [],
@@ -1165,17 +1174,23 @@
               "priority": "priority",
               "timeout_s": "cmd_timeout_s",
               "expected_duration_s": "expected_duration_s",
-              "completion_regex": "completion_regex"
+              "completion_regex": "completion_regex",
+              "expect_reboot": "expect_reboot"
             },
             "omit_when_none": [
               "completion_regex",
               "expected_duration_s"
             ],
-            "omit_when_falsy": [],
+            "omit_when_falsy": [
+              "expect_reboot"
+            ],
             "local_reject_empty": [
               "completion_regex"
             ],
             "send_null": []
+          },
+          "x-option-help": {
+            "--expect-reboot": "串接命令明示包含 reboot；只適用 line／background，非法型別或 interactive 組合在 RPC／UART 前拒絕"
           }
         },
         {
@@ -2301,6 +2316,14 @@
           "action": "store_true",
           "dest": "with_sudo",
           "default": false
+        },
+        {
+          "flags": [
+            "--no-restart"
+          ],
+          "action": "store_true",
+          "dest": "no_restart",
+          "default": false
         }
       ],
       "mutex": [
@@ -2572,7 +2595,10 @@
       "success": 0,
       "failure": 2,
       "codes": {
-        "INVALID_COMPLETION_REGEX": 1
+        "INVALID_COMPLETION_REGEX": 1,
+        "SOURCE_RESERVED": 1,
+        "INVALID_EXPECT_REBOOT": 1,
+        "EXPECT_REBOOT_MODE_UNSUPPORTED": 1
       },
       "note": "INVALID_COMPLETION_REGEX 不連 daemon 為 1；其餘 RPC 失敗為 2"
     },
@@ -2691,25 +2717,24 @@
       "timeout_s": 5.0
     },
     "sources": [
-      "sw_core/cli.py:101",
-      "sw_core/cli.py:103"
+      "sw_core/cli.py:109-111"
     ]
   },
   "x-fixed-timeouts": [
     {
       "name": "daemon_stop_wait_s",
       "value": 2.0,
-      "source": "sw_core/cli.py:664"
+      "source": "sw_core/cli.py:693"
     },
     {
       "name": "daemon_start_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:616"
+      "source": "sw_core/cli.py:645"
     },
     {
       "name": "daemon_start_status_timeout_s",
       "value": 1.0,
-      "source": "sw_core/cli.py:627"
+      "source": "sw_core/cli.py:656"
     },
     {
       "name": "daemon_ready_poll",
@@ -2721,27 +2746,27 @@
         "tries": 50,
         "interval_s": 0.2
       },
-      "source": "sw_core/cli.py:603-605"
+      "source": "sw_core/cli.py:632-634"
     },
     {
       "name": "healthy_daemon_probe_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:383-394"
+      "source": "sw_core/cli.py:411-423"
     },
     {
       "name": "setup_ping_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1764"
+      "source": "sw_core/cli.py:1799-1834"
     },
     {
       "name": "setup_mcu_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1771"
+      "source": "sw_core/cli.py:1844"
     },
     {
       "name": "setup_old_daemon_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:1787"
+      "source": "sw_core/cli.py:1860"
     },
     {
       "name": "doctor_health_status_timeout_s",
@@ -2776,22 +2801,22 @@
     {
       "name": "unix_endpoint_liveness_socket_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:837"
+      "source": "sw_core/cli.py:866"
     },
     {
       "name": "daemon_restart_status_timeout_s",
       "value": 0.5,
-      "source": "sw_core/cli.py:721"
+      "source": "sw_core/cli.py:750"
     },
     {
       "name": "daemon_restart_ping_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:738"
+      "source": "sw_core/cli.py:767"
     },
     {
       "name": "setup_reconcile_ping_timeout_s",
       "value": 0.2,
-      "source": "sw_core/cli.py:1853"
+      "source": "sw_core/cli.py:1949"
     },
     {
       "name": "daemon_restart_wait_s",
@@ -2832,6 +2857,11 @@
       "name": "doctor_other_install_version_timeout_s",
       "value": 2.0,
       "source": "sw_core/doctor_cmd.py:95"
+    },
+    {
+      "name": "setup_daemon_restart_verify_timeout_s",
+      "value": 10.0,
+      "source": "sw_core/cli.py:1787"
     }
   ],
   "x-hybrid-rpc": [
@@ -3048,12 +3078,21 @@
     }
   ],
   "x-version": {
-    "flag_output": "serialwrap <VERSION>\n",
+    "flag_output": "serialwrap <VERSION> (code <FINGERPRINT>)\n",
     "stream": "stdout",
     "mismatch_warning": {
       "stream": "stderr",
       "blocking": false,
-      "template": "serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+      "template": "serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n",
+      "precedence": "版本不符時只輸出版本警告並返回；版本相同或缺省時才檢查程式碼指紋"
+    },
+    "flag_output_without_fingerprint": "serialwrap <VERSION>\n",
+    "fingerprint_format": "(code <12 lowercase hex characters>)",
+    "code_mismatch_warning": {
+      "stream": "stderr",
+      "blocking": false,
+      "template": "serialwrap: client 程式碼 {cli_fingerprint} 與 daemon 程式碼 {daemon_fingerprint} 不一致（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n",
+      "when": "daemon 回報非空指紋且與本 client 可計算出的指紋不同；舊 daemon 或本地指紋不可用時靜默略過"
     }
   },
   "x-delegation-1a": [
@@ -3109,5 +3148,94 @@
       "default": false
     }
   ],
-  "x-pending": []
+  "x-pending": [],
+  "x-source-policy": {
+    "help": "system／system:* 為保留來源並會拒絕；bare human 正規化為 human:cli 並走 human 行為；明寫 human:<名> 依 DF-02 走 agent 行為。",
+    "cli_preflight": [
+      "cmd submit --source",
+      "file push --source",
+      "file pull --source",
+      "device release --source",
+      "session interactive-open --owner"
+    ],
+    "rpc_inputs": {
+      "command.submit": "source 原始值",
+      "file.push": "source 原始值",
+      "file.pull": "source 原始值",
+      "device.release": "source 原始值",
+      "session.interactive_open": "owner 原始值"
+    },
+    "normalization": "RPC 保留原始輸入判權；bare human／human: 正規化為 human:cli，成功回應帶 source_normalized_from；明寫 human:<x>（含 human:cli）仍照 DF-02 比照 agent。source_class 僅顯示分類，不作授權依據。",
+    "interactive_owner": "normalize_human=false；human 字串不正規化，僅 system:* 保留前綴拒絕"
+  },
+  "x-expect-reboot": {
+    "cli_flag": "cmd submit --expect-reboot",
+    "wire_param": "command.submit.expect_reboot",
+    "transmission": "只在 CLI 旗標為 true 時送 true；false／未指定不送新增參數",
+    "warning": "串接命令含 reboot 而未明示旗標時仍送命令，submit warning=CHAINED_REBOOT_WARNING，warnings 收錄全部警告且 warning 維持首則相容欄位",
+    "errors": [
+      "INVALID_EXPECT_REBOOT",
+      "EXPECT_REBOOT_MODE_UNSUPPORTED"
+    ],
+    "unsupported_mode": "interactive；提交前拒絕且零 TX"
+  },
+  "x-doctor-checks": {
+    "daemon_code_current": {
+      "advisory": true,
+      "shape": {
+        "check": "daemon_code_current",
+        "ok": "boolean",
+        "detail": "string",
+        "fix": "string"
+      },
+      "when": "每次 doctor 加入；daemon 不可達或本地指紋不可用時 ok=true 並略過；可比對時不同則 ok=false，但不拉低整體 doctor ok",
+      "fix": "提示 service restart；on-demand 提示 daemon stop/start；daemon status 的 code_path 可定位載入目錄"
+    }
+  },
+  "x-setup-output": {
+    "top_level": {
+      "daemon_code": "僅 daemon_code_assessment.checked=true 時輸出；不含內部 checked 欄"
+    },
+    "daemon_code": {
+      "fields": {
+        "stale": "boolean",
+        "reason": [
+          "match",
+          "daemon_no_fingerprint",
+          "fingerprint_mismatch"
+        ],
+        "daemon": "string|null",
+        "installed": "string",
+        "action": [
+          "none",
+          "skipped_no_restart_flag",
+          "mode_transition",
+          "manual_restart",
+          "skipped_flashing",
+          "service_inactive",
+          "restart",
+          "restarted",
+          "pending_sudo",
+          "restart_failed"
+        ],
+        "after": [
+          "match",
+          "mismatch",
+          "unreachable"
+        ],
+        "hint": "string"
+      },
+      "restart_conditions": "僅指紋過期且為同模式 systemd service、service active、未 flash、未帶 --no-restart 時自動 restart；重啟後以 health.ping 最多等 10 s 驗證。",
+      "no_restart": "--no-restart 略過自動重啟並附提示；模式轉換保留既有 stop-old/start-new 流程；on-demand 不自動重啟；flash 中不重啟；inactive service 不重啟。"
+    },
+    "nested_setup.daemon_restart": {
+      "values": [
+        "ran",
+        "failed",
+        "pending_sudo",
+        null
+      ],
+      "condition": "僅 reconcile 收到 restart_daemon=true 時加入；systemd-system 未授權時為 pending_sudo，逾時／模式轉換為 null"
+    }
+  }
 }
