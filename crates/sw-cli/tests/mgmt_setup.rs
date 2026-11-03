@@ -635,6 +635,191 @@ fn s1m241_assessment_restart_after_unreachable_is_reported() {
         .any(|argv| { argv == &["systemctl", "--user", "restart", "serialwrap"] }));
 }
 
+fn s1m241_failure_setup_fixture(post_restart_pings: &[&str], restart_rc: i32) -> (TestEnv, String) {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let endpoint = t.default_socket();
+    let t = t
+        .with_config("supervision_mode: systemd-user\n")
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            0,
+            "active\n",
+            "",
+        )
+        .with_command(&["systemctl", "--user", "daemon-reload"], 0, "", "")
+        .with_command(&["systemctl", "--user", "enable", "serialwrap"], 0, "", "")
+        .with_command(
+            &["systemctl", "--user", "restart", "serialwrap"],
+            restart_rc,
+            "",
+            if restart_rc == 0 {
+                ""
+            } else {
+                "restart failed"
+            },
+        )
+        .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
+
+    let mut pings = vec![format!(
+        r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#
+    )];
+    pings.extend(post_restart_pings.iter().map(|line| (*line).to_string()));
+    let ping_refs: Vec<&str> = pings.iter().map(String::as_str).collect();
+    t.rpc().respond_seq(&endpoint, "health.ping", &ping_refs);
+    (t, endpoint)
+}
+
+fn s1m241_failure_assert_report(
+    rc: i32,
+    stdout: &str,
+    stderr: &str,
+    expected_action: &str,
+    expected_after: Option<&str>,
+    expected_hint: Option<&str>,
+    expected_stderr: &str,
+) -> PyValue {
+    assert_eq!(
+        rc, 0,
+        "setup 應以 exit 0 結束：stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout 必須恰為單一 JSON：{stdout:?}"
+    );
+    assert_eq!(stderr, expected_stderr, "stderr 必須逐字符合 Python 基線");
+
+    let response = json(stdout);
+    let daemon_code = dict_field(&response, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), expected_action);
+    match expected_after {
+        Some(after) => assert_eq!(str_field(&daemon_code, "after"), after),
+        None => assert!(
+            matches!(
+                &daemon_code,
+                PyValue::Dict(fields) if fields.get("after").is_none()
+            ),
+            "不應輸出 after：{daemon_code:?}"
+        ),
+    }
+    match expected_hint {
+        Some(hint) => assert_eq!(str_field(&daemon_code, "hint"), hint),
+        None => assert!(
+            matches!(
+                &daemon_code,
+                PyValue::Dict(fields) if fields.get("hint").is_none()
+            ),
+            "不應輸出 hint：{daemon_code:?}"
+        ),
+    }
+    assert!(
+        matches!(
+            &daemon_code,
+            PyValue::Dict(fields) if fields.get("checked").is_none()
+        ),
+        "checked 不得外洩：{daemon_code:?}"
+    );
+    response
+}
+
+#[test]
+fn s1m241_failure_after_mismatch_preserves_python_stderr_and_exit_zero() {
+    let (t, endpoint) =
+        s1m241_failure_setup_fixture(&[r#"{"ok":true,"code_fingerprint":"different0001"}"#], 0);
+    let (rc, stdout, stderr) = t.run(&["setup", "--user"]);
+    let hint = "serialwrap: setup 已重啟 daemon，但它仍未回報與安裝版相同的程式碼指紋（after=mismatch）；用 `serialwrap daemon status` 看 code_path，確認 systemd unit 的 ExecStart 指向這份安裝";
+
+    let response = s1m241_failure_assert_report(
+        rc,
+        &stdout,
+        &stderr,
+        "restarted",
+        Some("mismatch"),
+        Some(hint),
+        &format!("{hint}\n"),
+    );
+    let daemon_code = dict_field(&response, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "reason"), "fingerprint_mismatch");
+    assert_eq!(str_field(&daemon_code, "daemon"), "deadbeef0001");
+    assert_eq!(str_field(&daemon_code, "installed"), "a1b2c3d4e5f6");
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 2);
+    assert!(
+        t.clock().sleeps_s().is_empty(),
+        "首次成功但指紋不同時須立即結束驗證"
+    );
+}
+
+#[test]
+fn s1m241_failure_after_unreachable_preserves_python_stderr_and_exit_zero() {
+    let (t, endpoint) = s1m241_failure_setup_fixture(&[r#"{"ok":false}"#], 0);
+    let (rc, stdout, stderr) = t.run(&["setup", "--user"]);
+    let hint = "serialwrap: setup 已重啟 daemon，但它仍未回報與安裝版相同的程式碼指紋（after=unreachable）；用 `serialwrap daemon status` 看 code_path，確認 systemd unit 的 ExecStart 指向這份安裝";
+
+    s1m241_failure_assert_report(
+        rc,
+        &stdout,
+        &stderr,
+        "restarted",
+        Some("unreachable"),
+        Some(hint),
+        &format!("{hint}\n"),
+    );
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 22);
+    assert_eq!(t.clock().elapsed(), Duration::from_secs(10));
+    assert_eq!(t.clock().sleeps_s().len(), 20);
+    assert!(t.clock().sleeps_s().iter().all(|sleep| *sleep == 0.5));
+}
+
+#[test]
+fn s1m241_failure_restart_error_preserves_python_hint_without_postcheck() {
+    let (t, endpoint) =
+        s1m241_failure_setup_fixture(&[r#"{"ok":true,"code_fingerprint":"a1b2c3d4e5f6"}"#], 1);
+    let (rc, stdout, stderr) = t.run(&["setup", "--user"]);
+    let hint = "systemctl restart 失敗；請手動執行 `serialwrap service restart` 並查 journalctl";
+
+    let response =
+        s1m241_failure_assert_report(rc, &stdout, &stderr, "restart_failed", None, Some(hint), "");
+    assert_eq!(
+        str_field(&dict_field(&response, "setup"), "daemon_restart"),
+        "failed"
+    );
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(
+        t.calls()
+            .iter()
+            .filter(|argv| argv.as_slice() == ["systemctl", "--user", "restart", "serialwrap"])
+            .count(),
+        1,
+        "restart 失敗時只能執行一次，且不可進入成功後驗證"
+    );
+}
+
+#[test]
+fn s1m241_failure_retries_unreachable_then_reports_match() {
+    let (t, endpoint) = s1m241_failure_setup_fixture(
+        &[
+            r#"{"ok":false}"#,
+            r#"{"ok":true,"code_fingerprint":"a1b2c3d4e5f6"}"#,
+        ],
+        0,
+    );
+    let (rc, stdout, stderr) = t.run(&["setup", "--user"]);
+
+    let response =
+        s1m241_failure_assert_report(rc, &stdout, &stderr, "restarted", Some("match"), None, "");
+    let daemon_code = dict_field(&response, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "daemon"), "deadbeef0001");
+    assert_eq!(str_field(&daemon_code, "installed"), "a1b2c3d4e5f6");
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 3);
+    assert_eq!(t.clock().elapsed(), Duration::from_millis(500));
+    assert_eq!(t.clock().sleeps_s(), vec![0.5]);
+}
+
 #[test]
 fn s1m241_skips_no_restart_flag() {
     const DAEMON_FINGERPRINT: &str = "deadbeef0001";
