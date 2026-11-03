@@ -346,7 +346,43 @@ fn run_external_opener_role() {
 struct PausedSysenvSpawn<T> {
     call: sw_pal::conformance::SysenvSpawnPauseCall<T>,
     child_pid: u32,
+    slave_identity: (u64, u64),
     _held_slave: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: Send + 'static> PausedSysenvSpawn<T> {
+    fn assert_child_still_holds_slave(&self) {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::mpsc::TryRecvError;
+
+        let child_pid = self.child_pid;
+        assert!(
+            matches!(self.call.try_result(), Err(TryRecvError::Empty)),
+            "pre-exec 放行前 native().env.run() 不得完成；暫停子行程 PID={child_pid}"
+        );
+        // SAFETY: pid 是剛由 SysEnv spawn 回報且仍應停在 pre-exec 的子行程。
+        assert_eq!(
+            unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+            0,
+            "暫停子行程 PID={child_pid} 必須仍存活"
+        );
+
+        let fd_dir = format!("/proc/{child_pid}/fd");
+        let inherited_fds: Vec<String> = std::fs::read_dir(&fd_dir)
+            .unwrap_or_else(|error| panic!("讀取 {fd_dir} 失敗，子行程 PID={child_pid}: {error}"))
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = std::fs::metadata(entry.path()).ok()?;
+                (metadata.dev() == self.slave_identity.0 && metadata.ino() == self.slave_identity.1)
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(
+            !inherited_fds.is_empty(),
+            "暫停子行程 PID={child_pid} 的 /proc fd 中必須有與 PTY slave 相同 inode 的描述符"
+        );
+    }
 }
 
 /// 普通開啟 PTY slave 後，透過正式 SysEnv spawn 停在 fork→exec 窗口並確認子行程繼承相同 inode。
@@ -360,7 +396,6 @@ where
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
-    use std::sync::mpsc::TryRecvError;
 
     let held_slave = std::fs::OpenOptions::new()
         .read(true)
@@ -381,38 +416,14 @@ where
     let child_pid = call
         .wait_for_pre_exec(Duration::from_secs(2))
         .expect("未收到子行程進入 pre-exec 的 PID 通知");
-    assert!(
-        matches!(call.try_result(), Err(TryRecvError::Empty)),
-        "pre-exec 放行前 native().env.run() 不得完成；暫停子行程 PID={child_pid}"
-    );
-
-    // SAFETY: pid 是剛由 SysEnv spawn 回報且仍應停在 pre-exec 的子行程。
-    assert_eq!(
-        unsafe { libc::kill(child_pid as libc::pid_t, 0) },
-        0,
-        "暫停子行程 PID={child_pid} 必須仍存活"
-    );
-
-    let fd_dir = format!("/proc/{child_pid}/fd");
-    let inherited_fds: Vec<String> = std::fs::read_dir(&fd_dir)
-        .unwrap_or_else(|error| panic!("讀取 {fd_dir} 失敗，子行程 PID={child_pid}: {error}"))
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let metadata = std::fs::metadata(entry.path()).ok()?;
-            (metadata.dev() == slave_metadata.dev() && metadata.ino() == slave_metadata.ino())
-                .then(|| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    assert!(
-        !inherited_fds.is_empty(),
-        "暫停子行程 PID={child_pid} 的 /proc fd 中必須有與 PTY slave 相同 inode 的描述符"
-    );
-
-    PausedSysenvSpawn {
+    let paused = PausedSysenvSpawn {
         call,
         child_pid,
+        slave_identity: (slave_metadata.dev(), slave_metadata.ino()),
         _held_slave: held_slave,
-    }
+    };
+    paused.assert_child_still_holds_slave();
+    paused
 }
 
 #[test]
@@ -436,6 +447,7 @@ fn cap_posix_pty__native_attach_spawn_sysenv() {
             "暫停的 sysenv 子行程 PID={child_pid} 期間 open_exclusive 應成功，實際錯誤：{error:?}"
         ),
     };
+    paused.assert_child_still_holds_slave();
     assert_eq!(
         peer.read_available(Duration::from_millis(100)),
         Vec::<u8>::new(),
