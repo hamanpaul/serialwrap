@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -196,6 +197,20 @@ def _joined_command(script: str, start: str) -> str:
     return matches[0]
 
 
+def _cargo_target_dir(env: dict[str, str]) -> Path:
+    """依 cargo 執行環境解析 target 根目錄；相對路徑以 repo 根目錄為基準。"""
+    configured = Path(env.get("CARGO_TARGET_DIR") or "target")
+    return configured if configured.is_absolute() else REPO_ROOT / configured
+
+
+@pytest.mark.memory_only
+def test_cargo_target_dir_honors_relative_and_absolute_overrides():
+    relative = "target/release-workflow-custom"
+    absolute = REPO_ROOT / relative
+    assert _cargo_target_dir({"CARGO_TARGET_DIR": relative}) == absolute
+    assert _cargo_target_dir({"CARGO_TARGET_DIR": str(absolute)}) == absolute
+
+
 @pytest.mark.memory_only
 def test_linux_bundle_job_step_order():
     order = ["verify-version", "cargo-build", "mkbundle", "package", "smoke", "upload"]
@@ -216,35 +231,41 @@ def test_linux_bundle_job_build_commands():
 @pytest.mark.process_rpc
 def test_release_profile_binary_excludes_test_hooks():
     """正式 release binary 不得包含委派覆寫或故障注入環境變數。"""
-    build = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--target",
-            "x86_64-unknown-linux-gnu",
-            "-p",
-            "sw-cli",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert build.returncode == 0, f"release profile 建置失敗：{build.stderr}"
+    target_root = REPO_ROOT / "target"
+    target_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="release-workflow-", dir=target_root) as target_dir:
+        build_env = os.environ.copy()
+        build_env["CARGO_TARGET_DIR"] = target_dir
+        build = subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-p",
+                "sw-cli",
+            ],
+            cwd=REPO_ROOT,
+            env=build_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert build.returncode == 0, f"release profile 建置失敗：{build.stderr}"
 
-    binary = REPO_ROOT / "target" / "x86_64-unknown-linux-gnu" / "release" / "serialwrap"
-    assert binary.is_file(), f"release binary 不存在：{binary}"
-    result = subprocess.run(
-        ["strings", str(binary)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, f"strings 無法讀取 release binary：{result.stderr}"
-    assert "SERIALWRAP_TEST_" not in result.stdout
-    for marker in TEST_FAKE_MARKERS[1:]:
-        assert marker not in result.stdout, f"release binary 含測試鉤子 {marker}"
+        binary = _cargo_target_dir(build_env) / "x86_64-unknown-linux-gnu" / "release" / "serialwrap"
+        assert binary.is_file(), f"release binary 不存在：{binary}"
+        result = subprocess.run(
+            ["strings", str(binary)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"strings 無法讀取 release binary：{result.stderr}"
+        assert "SERIALWRAP_TEST_" not in result.stdout
+        for marker in TEST_FAKE_MARKERS[1:]:
+            assert marker not in result.stdout, f"release binary 含測試鉤子 {marker}"
 
 
 @pytest.mark.memory_only
