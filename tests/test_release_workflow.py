@@ -31,8 +31,12 @@ RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 JOB = "publish-linux-bundle"
 BUNDLE_NAME = "serialwrap-${VERSION}-linux-x86_64"
 TARBALL = f"dist/{BUNDLE_NAME}.tar.gz"
-# 只在 `sw-cli/test-fakes` 編入的故障注入鉤子字串（crates/sw-cli/src/rollback.rs）；正式候選二進位不得含有。
-TEST_FAKE_MARKERS = ("SW_TEST_UPDATE_PAUSE_AFTER", "SW_TEST_UPDATE_FORCE_VERIFY_FAIL")
+# 測試鉤子字串；正式候選二進位不得含有。
+TEST_FAKE_MARKERS = (
+    "SERIALWRAP_TEST_",
+    "SW_TEST_UPDATE_PAUSE_AFTER",
+    "SW_TEST_UPDATE_FORCE_VERIFY_FAIL",
+)
 
 
 def _load() -> dict[str, Any]:
@@ -207,6 +211,40 @@ def test_linux_bundle_job_build_commands():
     assert "--version-override" not in mkbundle, "正式 bundle 不得以 --version-override 改版號（release 計畫 §2）"
     assert "--dev" not in mkbundle and "test-fakes" not in mkbundle
     assert BUNDLE_NAME in mkbundle
+
+
+@pytest.mark.process_rpc
+def test_release_profile_binary_excludes_test_hooks():
+    """正式 release binary 不得包含委派覆寫或故障注入環境變數。"""
+    build = subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-p",
+            "sw-cli",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, f"release profile 建置失敗：{build.stderr}"
+
+    binary = REPO_ROOT / "target" / "x86_64-unknown-linux-gnu" / "release" / "serialwrap"
+    assert binary.is_file(), f"release binary 不存在：{binary}"
+    result = subprocess.run(
+        ["strings", str(binary)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"strings 無法讀取 release binary：{result.stderr}"
+    assert "SERIALWRAP_TEST_" not in result.stdout
+    for marker in TEST_FAKE_MARKERS[1:]:
+        assert marker not in result.stdout, f"release binary 含測試鉤子 {marker}"
 
 
 @pytest.mark.memory_only

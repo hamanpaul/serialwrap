@@ -130,6 +130,8 @@ pub fn run(
     };
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
+    // 測試用委派覆寫只存在於 test-fakes 建置；正式 binary 不讀取此環境變數。
+    #[cfg(feature = "test-fakes")]
     let delegate_route = if let Some(test_group) = ctx.env.get("SERIALWRAP_TEST_DELEGATE_GROUP") {
         const CANDIDATES: [&'static str; 8] = [
             "daemon", "service", "supervision-mode", "remote", "connect", "benches", "setup",
@@ -143,6 +145,9 @@ pub fn run(
     } else {
         delegate::classify(tail)
     };
+
+    #[cfg(not(feature = "test-fakes"))]
+    let delegate_route = delegate::classify(tail);
     if let delegate::Route::Delegate { group } = delegate_route {
         return delegate::run_delegate(&mut ctx, tail, group);
     }

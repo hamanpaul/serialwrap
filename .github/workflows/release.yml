@@ -257,10 +257,10 @@ jobs:
             exit 1
           fi
 
-          # 正式候選不得編入 sw-cli/test-fakes 的故障注入鉤子（crates/sw-cli/src/rollback.rs）。
-          for marker in SW_TEST_UPDATE_PAUSE_AFTER SW_TEST_UPDATE_FORCE_VERIFY_FAIL; do
+          # 正式候選不得編入測試鉤子（crates/sw-cli/src/lib.rs、rollback.rs）。
+          for marker in SERIALWRAP_TEST_ SW_TEST_UPDATE_PAUSE_AFTER SW_TEST_UPDATE_FORCE_VERIFY_FAIL; do
             if grep -rlaF "$marker" "$version_dir/bin"; then
-              echo "::error::bundle binaries contain test-fakes hook ${marker}"
+              echo "::error::bundle binaries contain test hook ${marker}"
               exit 1
             fi
           done
