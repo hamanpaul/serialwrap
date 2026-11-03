@@ -1190,7 +1190,7 @@
             "send_null": []
           },
           "x-option-help": {
-            "--expect-reboot": "串接命令明示包含 reboot；只適用 line／background，非法型別或 interactive 組合在 RPC／UART 前拒絕"
+            "--expect-reboot": "明示此命令會重開機（如 `firstboot -y && reboot`、`sysupgrade`）：不管命令文字一律走 reboot 路徑；不可與 --mode interactive 併用"
           }
         },
         {
