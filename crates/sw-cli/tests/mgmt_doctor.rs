@@ -283,8 +283,8 @@ fn s1m241_doctor_daemon_code_current_matrix() {
         );
         assert_eq!(s(check, "fix"), "");
         assert!(t.rpc().request_count(&endpoint, "health.ping") > 0);
-        // 第一筆為平台檢查／一般 endpoint resolver 的 0.2 s 探測；第二筆是本項 health.ping。
-        let expected_timeouts = vec![0.2, 0.5, 0.5, 0.5, 0.2, 0.5];
+        // 前兩筆為一般與本項 endpoint resolver 的 0.2 s 探測；health.ping 本身固定 0.5 s。
+        let expected_timeouts = vec![0.2, 0.2, 0.5, 0.5, 0.5, 0.2, 0.5];
         assert_eq!(
             t.rpc().timeouts_s(),
             expected_timeouts,
@@ -336,12 +336,63 @@ fn s1m241_doctor_daemon_code_current_matrix() {
         let check = find_check(&doc, "daemon_code_current");
         assert!(b(check, "ok"));
         assert!(b(check, "advisory"));
-        assert_eq!(
-            s(check, "detail"),
-            "本行程無法計算程式碼指紋（凍結包或原始碼不可讀），略過"
-        );
+        assert_eq!(s(check, "detail"), "本行程無法計算程式碼指紋，略過");
         assert_eq!(s(check, "fix"), "");
         assert!(t.rpc().request_count(&endpoint, "health.ping") > 0);
+    }
+}
+
+#[test]
+fn s1m241_doctor_code_current_uses_resolved_endpoint() {
+    for windows in [false, true] {
+        let t = if windows {
+            TestEnv::windows()
+                .with_fake_registry(FakeRegistry::new(vec![], &[]))
+                .with_doctor_bundle("3.12.7")
+        } else {
+            TestEnv::posix().with_doctor_bundle("3.12.7")
+        };
+        let configured_endpoint = "/tmp/serialwrap-dead.sock";
+        let resolved_endpoint = if windows {
+            TestEnv::win_endpoint().to_string()
+        } else {
+            t.default_socket()
+        };
+        let t = t.with_config(&format!("socket_path: {configured_endpoint}\n"));
+        let manifest_path = t.bundle_dir().join("release-manifest.json");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("測試 manifest 應可讀");
+        let marker = "\"state_schema\":\"python-state-v0\"";
+        assert!(manifest.contains(marker), "測試 manifest 欄位形狀改變");
+        let updated = manifest.replace(
+            marker,
+            &format!("{marker},\"code_fingerprint\":\"{DOCTOR_INSTALLED_FP}\""),
+        );
+        t.write_file(&manifest_path, updated.as_bytes());
+        let stale_ping = format!(r#"{{"ok":true,"code_fingerprint":"{DOCTOR_STALE_FP}"}}"#);
+        let version = format!(r#"{{"ok":true,"version":"{}"}}"#, sw_cli::CLI_VERSION);
+        let t = t
+            .with_rpc_refused(configured_endpoint)
+            .with_rpc_ok(&resolved_endpoint, "health.ping", &stale_ping)
+            .with_rpc_ok(&resolved_endpoint, "health.status", &version);
+
+        let (rc, out, _) = t.run(&["doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "daemon_code_current");
+        assert!(
+            !b(check, "ok"),
+            "必須從解析後的 canonical endpoint 取得舊指紋"
+        );
+        assert!(b(check, "advisory"));
+        assert_eq!(
+            s(check, "detail"),
+            format!(
+                "daemon 載入的程式碼（code {DOCTOR_STALE_FP}）與目前安裝的（code {DOCTOR_INSTALLED_FP}）不同"
+            )
+        );
+        assert_eq!(s(check, "fix"), FIX_DAEMON_CODE_CURRENT);
+        assert!(t.rpc().request_count(&resolved_endpoint, "health.ping") > 0);
+        assert_eq!(t.rpc().request_count(configured_endpoint, "health.ping"), 0);
     }
 }
 

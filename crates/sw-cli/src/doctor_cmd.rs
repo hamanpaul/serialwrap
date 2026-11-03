@@ -311,19 +311,31 @@ fn health_status(ctx: &CliCtx, endpoint: &str) -> PyDict {
 }
 
 /// `daemon_code_current`（advisory）：以本機 bundle manifest 指紋比對 daemon `health.ping`。
-fn check_daemon_code_current(ctx: &CliCtx, state: &ManifestState) -> Check {
-    // Python `_check_daemon_code_current` 不套用 CLI 的 --bench；只讀 config endpoint 或平台預設 endpoint。
-    let endpoint = plain_endpoint(ctx);
-    let response = client::call(
+fn check_daemon_code_current(ctx: &mut CliCtx, state: &ManifestState) -> Check {
+    // 比照 Python `_resolve_default_endpoint_with_source`：不套用 CLI 的 --bench，並沿用
+    // config socket 失聯時的 canonical fallback 與 Windows 非 TCP endpoint 過濾。
+    let endpoint = endpoint_resolve::resolve_endpoint_info(
         ctx,
-        &endpoint,
-        "health.ping",
-        &PyValue::Dict(PyDict::new()),
-        HEALTH_TIMEOUT_S,
-        &PyInt::Small(0),
+        &EndpointArgs {
+            endpoint: None,
+            socket: None,
+            bench: None,
+        },
     )
     .ok()
-    .map(|outcome| outcome.resp);
+    .map(|resolved| resolved.endpoint);
+    let response = endpoint.and_then(|endpoint| {
+        client::call(
+            ctx,
+            &endpoint,
+            "health.ping",
+            &PyValue::Dict(PyDict::new()),
+            HEALTH_TIMEOUT_S,
+            &PyInt::Small(0),
+        )
+        .ok()
+        .map(|outcome| outcome.resp)
+    });
     let Some(response) = response.filter(|response| truthy(response.get("ok"))) else {
         return Check {
             check: "daemon_code_current",
@@ -343,7 +355,7 @@ fn check_daemon_code_current(ctx: &CliCtx, state: &ManifestState) -> Check {
         return Check {
             check: "daemon_code_current",
             ok: true,
-            detail: "本行程無法計算程式碼指紋（凍結包或原始碼不可讀），略過".to_string(),
+            detail: "本行程無法計算程式碼指紋，略過".to_string(),
             fix: Some(String::new()),
             advisory: false,
             extra: PyDict::new(),
