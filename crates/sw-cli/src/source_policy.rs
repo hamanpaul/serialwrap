@@ -1,6 +1,7 @@
 //! 對齊 `sw_core/source_policy.py` 的外部來源檢查與分類。
 
 use sw_proto::error_codes::ErrorCode;
+use sw_proto::pycompat::py_strip;
 use sw_proto::pyjson::{PyDict, PyValue};
 
 pub const SOURCE_CLASS_HUMAN: &str = "human";
@@ -24,8 +25,8 @@ impl SourceCheck {
         let Some(raw) = self.raw_source.as_deref() else {
             return false;
         };
-        let (head, tail) = split_source(raw.trim());
-        casefold(head) == "human" && tail.map_or(true, |value| value.trim().is_empty())
+        let (head, tail) = split_source(py_strip(raw));
+        casefold(head) == "human" && tail.map_or(true, |value| py_strip(value).is_empty())
     }
 }
 
@@ -46,7 +47,7 @@ pub fn check_source(
     normalize_human: bool,
 ) -> SourceCheck {
     let text = raw.unwrap_or_default().to_string();
-    if text.trim().is_empty() {
+    if py_strip(&text).is_empty() {
         return SourceCheck {
             source: default.to_string(),
             normalized_from: None,
@@ -56,7 +57,7 @@ pub fn check_source(
     }
 
     let (head, tail) = split_source(&text);
-    let token = casefold(head.trim());
+    let token = casefold(py_strip(head));
     if RESERVED_PREFIXES.contains(&token.as_str()) {
         let mut error = PyDict::new();
         error.insert("ok", PyValue::Bool(false));
@@ -77,7 +78,7 @@ pub fn check_source(
     }
 
     if token == "human" && normalize_human {
-        let name = tail.map(str::trim).filter(|name| !name.is_empty());
+        let name = tail.map(py_strip).filter(|name| !name.is_empty());
         let canonical = format!("human:{}", name.unwrap_or(DEFAULT_HUMAN_NAME));
         let normalized_from = (canonical != text).then(|| text.clone());
         return SourceCheck {
