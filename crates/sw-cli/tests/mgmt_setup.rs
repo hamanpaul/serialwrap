@@ -52,6 +52,376 @@ fn argv_list_field(v: &PyValue, key: &str) -> Vec<Vec<String>> {
 }
 
 #[test]
+fn s1m241_setup_assessment_matrix() {
+    use sw_cli::setup_cmd::{daemon_code_assessment, DaemonCodeAssessment};
+
+    fn assert_case(
+        daemon_running: bool,
+        daemon_fingerprint: Option<&str>,
+        installed_fingerprint: Option<&str>,
+        expected: DaemonCodeAssessment,
+    ) {
+        assert_eq!(
+            daemon_code_assessment(daemon_running, daemon_fingerprint, installed_fingerprint),
+            expected
+        );
+    }
+
+    assert_case(
+        false,
+        Some("daemon-old"),
+        Some("installed-new"),
+        DaemonCodeAssessment {
+            checked: false,
+            stale: false,
+            reason: Some("daemon_unreachable".to_string()),
+            daemon: Some("daemon-old".to_string()),
+            installed: Some("installed-new".to_string()),
+        },
+    );
+    assert_case(
+        true,
+        Some("daemon-old"),
+        None,
+        DaemonCodeAssessment {
+            checked: false,
+            stale: false,
+            reason: Some("installed_fingerprint_unavailable".to_string()),
+            daemon: Some("daemon-old".to_string()),
+            installed: None,
+        },
+    );
+    assert_case(
+        true,
+        Some("daemon-old"),
+        Some(""),
+        DaemonCodeAssessment {
+            checked: false,
+            stale: false,
+            reason: Some("installed_fingerprint_unavailable".to_string()),
+            daemon: Some("daemon-old".to_string()),
+            installed: Some("".to_string()),
+        },
+    );
+    assert_case(
+        true,
+        None,
+        Some("installed-new"),
+        DaemonCodeAssessment {
+            checked: true,
+            stale: true,
+            reason: Some("daemon_no_fingerprint".to_string()),
+            daemon: None,
+            installed: Some("installed-new".to_string()),
+        },
+    );
+    assert_case(
+        true,
+        Some("same"),
+        Some("same"),
+        DaemonCodeAssessment {
+            checked: true,
+            stale: false,
+            reason: Some("match".to_string()),
+            daemon: Some("same".to_string()),
+            installed: Some("same".to_string()),
+        },
+    );
+    assert_case(
+        true,
+        Some("daemon-old"),
+        Some("installed-new"),
+        DaemonCodeAssessment {
+            checked: true,
+            stale: true,
+            reason: Some("fingerprint_mismatch".to_string()),
+            daemon: Some("daemon-old".to_string()),
+            installed: Some("installed-new".to_string()),
+        },
+    );
+}
+
+#[test]
+fn s1m241_setup_restart_decision_order() {
+    use sw_cli::setup_cmd::{
+        daemon_code_assessment, select_daemon_restart_action, DaemonRestartAction,
+    };
+    use sw_pal::traits::SupervisionMode;
+
+    assert_eq!(DaemonRestartAction::NotChecked.as_str(), None);
+    assert_eq!(DaemonRestartAction::None.as_str(), Some("none"));
+    assert_eq!(
+        DaemonRestartAction::SkippedNoRestartFlag.as_str(),
+        Some("skipped_no_restart_flag")
+    );
+    assert_eq!(
+        DaemonRestartAction::ModeTransition.as_str(),
+        Some("mode_transition")
+    );
+    assert_eq!(
+        DaemonRestartAction::ManualRestart.as_str(),
+        Some("manual_restart")
+    );
+    assert_eq!(
+        DaemonRestartAction::SkippedFlashing.as_str(),
+        Some("skipped_flashing")
+    );
+    assert_eq!(
+        DaemonRestartAction::ServiceInactive.as_str(),
+        Some("service_inactive")
+    );
+    assert_eq!(DaemonRestartAction::Restart.as_str(), Some("restart"));
+
+    let stale = daemon_code_assessment(true, Some("daemon-old"), Some("installed-new"));
+
+    let t = TestEnv::posix().with_command(
+        &["systemctl", "--user", "is-active", "serialwrap"],
+        0,
+        "active\n",
+        "",
+    );
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::SystemdSystem,
+                &stale,
+                true,
+                true,
+                true,
+            ),
+            DaemonRestartAction::SkippedNoRestartFlag
+        );
+    });
+    assert!(t.calls().is_empty(), "--no-restart 必須先於其他判斷");
+
+    let t = TestEnv::posix();
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::OnDemand,
+                &stale,
+                false,
+                true,
+                true,
+            ),
+            DaemonRestartAction::ModeTransition
+        );
+    });
+    assert!(t.calls().is_empty(), "模式轉換不應查詢服務狀態");
+
+    let t = TestEnv::posix();
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::OnDemand,
+                &SupervisionMode::OnDemand,
+                &stale,
+                false,
+                true,
+                true,
+            ),
+            DaemonRestartAction::ManualRestart
+        );
+    });
+    assert!(t.calls().is_empty(), "on-demand 不應查詢 systemd");
+
+    let t = TestEnv::posix().with_command(
+        &["systemctl", "--user", "is-active", "serialwrap"],
+        0,
+        "active\n",
+        "",
+    );
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::SystemdUser,
+                &stale,
+                false,
+                true,
+                true,
+            ),
+            DaemonRestartAction::SkippedFlashing
+        );
+    });
+    assert!(
+        t.calls().is_empty(),
+        "flash 中不得因 --force 查狀態或安排重啟"
+    );
+
+    let windows = TestEnv::windows();
+    windows.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::WindowsTask,
+                &SupervisionMode::WindowsTask,
+                &stale,
+                false,
+                false,
+                false,
+            ),
+            DaemonRestartAction::ServiceInactive
+        );
+    });
+    assert!(windows.calls().is_empty(), "Windows 模式不得擴張成自動重啟");
+
+    let inactive = TestEnv::posix().with_command(
+        &["systemctl", "--user", "is-active", "serialwrap"],
+        3,
+        "active\n",
+        "",
+    );
+    inactive.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::SystemdUser,
+                &stale,
+                false,
+                false,
+                false,
+            ),
+            DaemonRestartAction::ServiceInactive
+        );
+    });
+    assert_eq!(
+        inactive.calls(),
+        vec![vec![
+            "systemctl".to_string(),
+            "--user".to_string(),
+            "is-active".to_string(),
+            "serialwrap".to_string()
+        ]]
+    );
+
+    let active = TestEnv::posix().with_command(
+        &["systemctl", "--user", "is-active", "serialwrap"],
+        0,
+        "active\n",
+        "",
+    );
+    active.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::SystemdUser,
+                &stale,
+                false,
+                false,
+                false,
+            ),
+            DaemonRestartAction::Restart
+        );
+    });
+    assert_eq!(active.calls().len(), 1, "符合條件時只查一次 is-active");
+
+    let matching = daemon_code_assessment(true, Some("same"), Some("same"));
+    let same = TestEnv::posix();
+    same.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::SystemdUser,
+                &matching,
+                false,
+                false,
+                false,
+            ),
+            DaemonRestartAction::None
+        );
+    });
+    assert!(same.calls().is_empty(), "指紋相同時不得查詢 is-active");
+
+    let unchecked = daemon_code_assessment(false, None, Some("installed-new"));
+    let unreachable = TestEnv::posix();
+    unreachable.with_cli_ctx(|ctx| {
+        assert_eq!(
+            select_daemon_restart_action(
+                ctx,
+                &SupervisionMode::SystemdUser,
+                &SupervisionMode::SystemdUser,
+                &unchecked,
+                false,
+                false,
+                false,
+            ),
+            DaemonRestartAction::NotChecked
+        );
+    });
+    assert!(unreachable.calls().is_empty());
+}
+
+#[test]
+fn s1m241_setup_active_requires_exact_active() {
+    use sw_cli::setup_cmd::service_is_active;
+    use sw_pal::traits::SupervisionMode;
+
+    let active_user = TestEnv::posix().with_command(
+        &["systemctl", "--user", "is-active", "serialwrap"],
+        0,
+        " \t\u{001c}active\u{001f}\r\n",
+        "",
+    );
+    active_user.with_cli_ctx(|ctx| {
+        assert!(service_is_active(ctx, &SupervisionMode::SystemdUser));
+    });
+    assert_eq!(active_user.calls().len(), 1);
+
+    let active_system =
+        TestEnv::posix().with_command(&["systemctl", "is-active", "serialwrap"], 0, "active\n", "");
+    active_system.with_cli_ctx(|ctx| {
+        assert!(service_is_active(ctx, &SupervisionMode::SystemdSystem));
+    });
+    assert_eq!(
+        active_system.calls(),
+        vec![vec![
+            "systemctl".to_string(),
+            "is-active".to_string(),
+            "serialwrap".to_string()
+        ]]
+    );
+
+    for (rc, stdout) in [(1, "active\n"), (0, "activating\n"), (0, "Active\n")] {
+        let t = TestEnv::posix().with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            rc,
+            stdout,
+            "",
+        );
+        t.with_cli_ctx(|ctx| {
+            assert!(!service_is_active(ctx, &SupervisionMode::SystemdUser));
+        });
+        assert_eq!(t.calls().len(), 1);
+    }
+
+    let non_systemd = TestEnv::posix();
+    non_systemd.with_cli_ctx(|ctx| {
+        for mode in [
+            SupervisionMode::OnDemand,
+            SupervisionMode::WindowsTask,
+            SupervisionMode::WindowsService,
+            SupervisionMode::Other("custom".to_string()),
+        ] {
+            assert!(!service_is_active(ctx, &mode));
+        }
+    });
+    assert!(
+        non_systemd.calls().is_empty(),
+        "非 systemd 模式不得執行 systemctl"
+    );
+}
+
+#[test]
 fn on_demand_to_systemd_user_stops_waits_then_starts() {
     let t = TestEnv::posix()
         .with_real_service()

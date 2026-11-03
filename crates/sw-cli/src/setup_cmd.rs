@@ -17,6 +17,7 @@ use sw_pal::{ConsoleKind, PalPathFlavor, SupervisionMode};
 use sw_proto::config_types::RuntimeConfig;
 use sw_proto::endpoint::{parse_endpoint, Endpoint};
 use sw_proto::error_codes::ErrorCode;
+use sw_proto::pycompat::py_strip;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::runtime_paths::EnvSnapshot;
 use sw_proto::yaml11::{py_str_of, py_truthy_of, YValue};
@@ -889,6 +890,136 @@ fn run_command(ctx: &CliCtx<'_>, argv: &[String]) -> CmdRecord {
 
 fn run_records(ctx: &CliCtx<'_>, argvs: &[Vec<String>]) -> Vec<CmdRecord> {
     argvs.iter().map(|argv| run_command(ctx, argv)).collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonCodeAssessment {
+    pub checked: bool,
+    pub stale: bool,
+    pub reason: Option<String>,
+    pub daemon: Option<String>,
+    pub installed: Option<String>,
+}
+
+/// 純函式：依 Python `daemon_code_assessment` 的順序比較兩端指紋。
+pub fn daemon_code_assessment(
+    daemon_running: bool,
+    daemon_fingerprint: Option<&str>,
+    installed_fingerprint: Option<&str>,
+) -> DaemonCodeAssessment {
+    let mut assessment = DaemonCodeAssessment {
+        checked: false,
+        stale: false,
+        reason: None,
+        daemon: daemon_fingerprint
+            .filter(|fingerprint| !fingerprint.is_empty())
+            .map(str::to_string),
+        installed: installed_fingerprint.map(str::to_string),
+    };
+    if !daemon_running {
+        assessment.reason = Some("daemon_unreachable".to_string());
+        return assessment;
+    }
+    if installed_fingerprint.is_none_or(str::is_empty) {
+        assessment.reason = Some("installed_fingerprint_unavailable".to_string());
+        return assessment;
+    }
+
+    assessment.checked = true;
+    if daemon_fingerprint.is_none_or(str::is_empty) {
+        assessment.stale = true;
+        assessment.reason = Some("daemon_no_fingerprint".to_string());
+    } else if daemon_fingerprint != installed_fingerprint {
+        assessment.stale = true;
+        assessment.reason = Some("fingerprint_mismatch".to_string());
+    } else {
+        assessment.reason = Some("match".to_string());
+    }
+    assessment
+}
+
+/// 只在 systemd 模式查詢服務；`active` 必須同時符合成功 rc 與精確狀態字串。
+pub fn service_is_active(ctx: &CliCtx<'_>, mode: &SupervisionMode) -> bool {
+    let argv = match mode {
+        SupervisionMode::SystemdUser => vec![
+            "systemctl".to_string(),
+            "--user".to_string(),
+            "is-active".to_string(),
+            "serialwrap".to_string(),
+        ],
+        SupervisionMode::SystemdSystem => vec![
+            "systemctl".to_string(),
+            "is-active".to_string(),
+            "serialwrap".to_string(),
+        ],
+        _ => return false,
+    };
+    ctx.p
+        .env
+        .run(&argv, None)
+        .is_ok_and(|output| output.rc == 0 && py_strip(&output.stdout) == "active")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonRestartAction {
+    NotChecked,
+    None,
+    SkippedNoRestartFlag,
+    ModeTransition,
+    ManualRestart,
+    SkippedFlashing,
+    ServiceInactive,
+    Restart,
+}
+
+impl DaemonRestartAction {
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::NotChecked => None,
+            Self::None => Some("none"),
+            Self::SkippedNoRestartFlag => Some("skipped_no_restart_flag"),
+            Self::ModeTransition => Some("mode_transition"),
+            Self::ManualRestart => Some("manual_restart"),
+            Self::SkippedFlashing => Some("skipped_flashing"),
+            Self::ServiceInactive => Some("service_inactive"),
+            Self::Restart => Some("restart"),
+        }
+    }
+}
+
+/// 選擇指紋更新動作；除最後一關外不查服務，`force` 不會解除 flash 重啟護欄。
+pub fn select_daemon_restart_action(
+    ctx: &CliCtx<'_>,
+    old_mode: &SupervisionMode,
+    target_mode: &SupervisionMode,
+    assessment: &DaemonCodeAssessment,
+    no_restart: bool,
+    any_flashing: bool,
+    _force: bool,
+) -> DaemonRestartAction {
+    if !assessment.stale {
+        return if assessment.checked {
+            DaemonRestartAction::None
+        } else {
+            DaemonRestartAction::NotChecked
+        };
+    }
+    if no_restart {
+        return DaemonRestartAction::SkippedNoRestartFlag;
+    }
+    if old_mode != target_mode {
+        return DaemonRestartAction::ModeTransition;
+    }
+    if target_mode == &SupervisionMode::OnDemand {
+        return DaemonRestartAction::ManualRestart;
+    }
+    if any_flashing {
+        return DaemonRestartAction::SkippedFlashing;
+    }
+    if !service_is_active(ctx, target_mode) {
+        return DaemonRestartAction::ServiceInactive;
+    }
+    DaemonRestartAction::Restart
 }
 
 fn service_argv(mode: &SupervisionMode, action: ServiceAction, with_sudo: bool) -> Vec<String> {
