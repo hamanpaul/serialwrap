@@ -413,6 +413,7 @@ codes:
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapFramingTcp::test_framing_exception_bytes"]
     behavior_change: []
     sources: ["sw_core/rpc_posix.py:59"]
+  # #242：`cmd submit --expect-reboot` 不支援 interactive 模式。
   - code: EXPECT_REBOOT_MODE_UNSUPPORTED
     status: IMPLEMENTED
     reachable: true
@@ -606,6 +607,7 @@ codes:
     contract_tests: ["tests/test_remote_cli.py::test_remote_malformed_endpoint_returns_json_error", "tests/test_remote_endpoint.py::TestRpcCallEndpointBranch::test_invalid_endpoint_returns_structured_error"]
     behavior_change: []
     sources: ["sw_core/client.py:232", "sw_core/cli.py:1585"]
+  # #242：`command.submit.expect_reboot` 僅接受 JSON boolean 或 null。
   - code: INVALID_EXPECT_REBOOT
     status: IMPLEMENTED
     reachable: true
@@ -1087,6 +1089,7 @@ codes:
     contract_tests: ["tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock"]
     behavior_change: []
     sources: ["sw_core/lock_posix.py:37"]
+  # #240：保留 `system`／`system:*` 來源前綴，CLI／RPC 送出前拒絕。
   - code: SOURCE_RESERVED
     status: IMPLEMENTED
     reachable: true

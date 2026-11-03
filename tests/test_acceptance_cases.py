@@ -540,6 +540,66 @@ def test_regen_lock_refuses_removal(tmp_path: pathlib.Path):
 
 
 @pytest.mark.memory_only
+def test_regen_lock_p4_error_codes_are_add_only(tmp_path: pathlib.Path):
+    """P4 錯誤碼基線只接受逐名核准的新增，並保留案例與既有凍結碼。"""
+    import importlib.util
+
+    script = REPO / "tests/acceptance/regen_lock.py"
+    spec = importlib.util.spec_from_file_location("regen_lock_p4_error_codes", script)
+    assert spec is not None and spec.loader is not None
+    regen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(regen)
+
+    lock_path = tmp_path / "p4_required.lock.json"
+    contract_path = tmp_path / "error_codes.yaml"
+    original = {
+        "schema_version": 2,
+        "frozen_commit": "base",
+        "amended_commits": ["prior-amendment"],
+        "cases": [{"case_id": "keep-me"}],
+        "error_codes_at_freeze": ["EXISTING_CODE"],
+    }
+    lock_path.write_text(json.dumps(original), encoding="utf-8")
+    contract_path.write_text(
+        yaml.safe_dump({"codes": [{"code": "EXISTING_CODE"}, {"code": "APPROVED_CODE"}]}),
+        encoding="utf-8",
+    )
+
+    assert regen.cmd_p4_error_codes_add_only(
+        lock_path, contract_path, ["APPROVED_CODE"], "amendment-commit"
+    ) == 0
+    updated_bytes = lock_path.read_bytes()
+    updated = json.loads(updated_bytes)
+    assert updated["error_codes_at_freeze"] == ["APPROVED_CODE", "EXISTING_CODE"]
+    assert updated["cases"] == original["cases"]
+    assert updated["frozen_commit"] == original["frozen_commit"]
+    assert updated["amended_commits"] == ["prior-amendment", "amendment-commit"]
+
+    contract_path.write_text(
+        yaml.safe_dump({
+            "codes": [
+                {"code": "EXISTING_CODE"},
+                {"code": "APPROVED_CODE"},
+                {"code": "UNAPPROVED_CODE"},
+            ]
+        }),
+        encoding="utf-8",
+    )
+    assert regen.cmd_p4_error_codes_add_only(
+        lock_path, contract_path, ["APPROVED_CODE"], "next-commit"
+    ) == 1
+    assert lock_path.read_bytes() == updated_bytes
+
+    contract_path.write_text(
+        yaml.safe_dump({"codes": [{"code": "APPROVED_CODE"}]}), encoding="utf-8"
+    )
+    assert regen.cmd_p4_error_codes_add_only(
+        lock_path, contract_path, ["EXISTING_CODE"], "next-commit"
+    ) == 1
+    assert lock_path.read_bytes() == updated_bytes
+
+
+@pytest.mark.memory_only
 def test_counts_report():
     counts_path = REPO / "tests/acceptance/cases.counts.json"
     counts = json.loads(counts_path.read_text(encoding="utf-8"))
