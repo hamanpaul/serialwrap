@@ -25,8 +25,17 @@ from mgmt_fixtures import (  # noqa: E402,F401
     stub_log,
     stub_path,
 )
-from bb_harness import ISOLATED_ROOTS  # noqa: E402  isolated_env 登記的隔離根（config_digest 紀錄用）
+from bb_harness import (  # noqa: E402
+    ISOLATED_ROOTS,
+    is_rust,
+    snapshot_systemd_user_unit,
+)  # isolated_env 登記的隔離根與 session 防線
 import config_digest as _config_digest  # noqa: E402
+
+_RUST_SESSION: bool | None = None
+_USER_UNIT_PATH: Path | None = None
+_USER_UNIT_START: tuple[bool, int | None, str | None] | None = None
+_USER_UNIT_START_ERROR: str | None = None
 
 _STANDARD_MARKERS = {
     "core_portable": "Linux 與 Windows 都必跑；禁止以平台原因 SKIP；不得宣稱測到原生 UART",
@@ -78,6 +87,25 @@ def pytest_configure(config: pytest.Config) -> None:
                 # 獨立執行（無根 conftest）時 env 尚未被清除，於此擷取 deployed_content 所需的 CLI／daemon 變數
                 mod.capture_deployed_env(os.environ)
             config.pluginmanager.register(mod, "sw_resource_report")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """在任何案例 fixture 改 env 前固定並擷取 Rust 輪的 user unit。"""
+    global _RUST_SESSION, _USER_UNIT_PATH, _USER_UNIT_START, _USER_UNIT_START_ERROR
+    try:
+        _RUST_SESSION = is_rust()
+    except Exception as exc:
+        _RUST_SESSION = True
+        _USER_UNIT_START_ERROR = f"無法判定 Rust artifact：{type(exc).__name__}: {exc}"
+        return
+    if not _RUST_SESSION:
+        return
+
+    try:
+        _USER_UNIT_PATH = Path.home() / ".config" / "systemd" / "user" / "serialwrap.service"
+        _USER_UNIT_START = snapshot_systemd_user_unit(_USER_UNIT_PATH)
+    except Exception as exc:
+        _USER_UNIT_START_ERROR = f"起始快照讀取失敗：{type(exc).__name__}: {exc}"
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -234,7 +262,25 @@ def _artifact_identity() -> None:
             pytest.fail("A/B 標籤與受測 artifact 不符")
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if _RUST_SESSION:
+        failure = _USER_UNIT_START_ERROR
+        if failure is None and (_USER_UNIT_PATH is None or _USER_UNIT_START is None):
+            failure = "起始快照未建立"
+        if failure is None:
+            try:
+                current = snapshot_systemd_user_unit(_USER_UNIT_PATH)
+            except Exception as exc:
+                failure = f"結束快照讀取失敗：{type(exc).__name__}: {exc}"
+            else:
+                if current != _USER_UNIT_START:
+                    failure = f"user unit 快照改變：{_USER_UNIT_PATH} 起始={_USER_UNIT_START!r} 結束={current!r}"
+        if failure is not None:
+            print(f"Rust 黑箱 user unit 防線失敗：{failure}", file=sys.stderr)
+            if session.exitstatus in (None, pytest.ExitCode.OK):
+                session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
     confcutdir = session.config.getoption("confcutdir", None)
     if confcutdir:
         here = Path(__file__).resolve().parent

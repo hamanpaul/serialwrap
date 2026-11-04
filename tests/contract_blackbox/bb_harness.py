@@ -5,6 +5,7 @@ stdlib-only，不得 import sw_core／serialwrap／serialwrapd。
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -18,6 +19,19 @@ NL: bytes = b"\r\n" if os.name == "nt" else b"\n"
 # 本行程內 isolated_env 登記的 (隔離根, env)；conftest 於每個案例 call 階段結束時據以記錄 config_digest
 # （見 config_digest.py）。env 保存同一物件參考，夾具之後的修改會反映在摘要中。
 ISOLATED_ROOTS: list[tuple[Path, dict[str, str]]] = []
+
+
+def snapshot_systemd_user_unit(path: Path) -> tuple[bool, int | None, str | None]:
+    """唯讀擷取明確指定的 systemd user unit 存在性、mtime 與內容摘要。
+
+    只有檔案不存在時回傳 absent；其他 stat／讀取錯誤由呼叫端處理，不能視為未變。
+    """
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return False, None, None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return True, stat.st_mtime_ns, digest
 
 
 @dataclass(frozen=True)
