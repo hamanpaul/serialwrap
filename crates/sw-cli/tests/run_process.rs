@@ -1,10 +1,8 @@
 //! P3-T14 run_process / run_process_with 錯誤處理與 exit code 契約測試。
-#[cfg(feature = "test-fakes")]
 mod support;
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "test-fakes")]
 use support::TestEnv;
 use sw_cli::ctx::TextIo;
 use sw_cli::output::{print_json, warn_version_mismatch_with_fingerprint};
@@ -98,7 +96,6 @@ fn test_run_process_flush_fail() {
     assert_eq!(code, 120);
 }
 
-#[cfg(feature = "test-fakes")]
 #[test]
 fn s1m241_version_uses_manifest_fingerprint() {
     let t = TestEnv::posix().with_bundle("0.4.0");
@@ -119,7 +116,6 @@ fn s1m241_version_uses_manifest_fingerprint() {
     assert!(t.calls().is_empty(), "--version 不得啟動 Python 子行程");
 }
 
-#[cfg(feature = "test-fakes")]
 #[test]
 fn s1m241_version_fingerprint_falls_back_without_manifest_or_field() {
     let without_manifest = TestEnv::posix();

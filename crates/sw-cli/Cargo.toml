@@ -24,6 +24,8 @@ sw-pal = { path = "../sw-pal" }
 indexmap = { workspace = true }
 
 [dev-dependencies]
-sw-cli = { path = ".", features = ["test-fakes"] }
+# 不依賴自身來打開 test-fakes（arch §1.3：sw-cli 不得依賴 sw-cli）。
+# 需要鉤子的整合測試以 `#[cfg(feature = "test-fakes")]` 宣告，由
+# `cargo test --features test-fakes` 啟用；正式建置不含此 feature。
 sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
 tempfile = { workspace = true }

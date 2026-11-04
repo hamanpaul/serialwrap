@@ -1,19 +1,25 @@
 //! Stage 1A 委派目標定位與執行環境回歸測試（P3-T16）。
 
+#[cfg(feature = "test-fakes")]
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sw_cli::delegate::{argv_sha256, resolve_target, DelegateError, DelegateTarget};
+#[cfg(feature = "test-fakes")]
+use sw_cli::delegate::argv_sha256;
+use sw_cli::delegate::{resolve_target, DelegateError, DelegateTarget};
 use sw_pal::fakes::{platform as fake_platform, FakeEnv, MemFs, RecordingProcess};
 use sw_pal::{ClientPlatform, FsOps, ProcessCtl, SysEnv};
 
 struct Fixture {
     root: PathBuf,
     exe: PathBuf,
+    // 只有 test-fakes 的委派執行測試會讀這兩個欄位；平台組裝仍使用區域變數。
+    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     env: Arc<FakeEnv>,
     fs: Arc<MemFs>,
+    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     process: Arc<RecordingProcess>,
     platform: ClientPlatform,
 }
@@ -192,6 +198,8 @@ fn directory_delegate_entry_is_reported() {
     assert!(message.starts_with("delegate entry not found:"));
 }
 
+// 程式庫只在 test-fakes 建置讀取 SERIALWRAP_TEST_DELEGATE_GROUP；不以自我依賴打開 feature。
+#[cfg(feature = "test-fakes")]
 #[test]
 fn run_delegate_increments_depth_and_executes_once_with_three_environment_values() {
     let fixture = Fixture::new(Some("1"));
