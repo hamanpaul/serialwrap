@@ -17,7 +17,7 @@
 
 ## B. Python daemon 基線的已知缺陷（來自 main 已合入的 PR）——**Stage 1 不修**
 
-> 2026-11-05 擁有者指示：Stage 1 是過渡版，用來驗證 Rust CLI 能否完整承接 Python CLI 與 Python daemon 的對口；Python daemon 盡可能維持現況，它是 Stage 2 Rust daemon 的對齊基線，Stage 1 修改它會讓 Stage 2 的依據改變。以下各項改列為「基線已知缺陷」：0.4.0 照現況發出，並在 release notes 的已知問題中揭露；Stage 2 Rust daemon 對齊時，由擁有者逐項裁決要沿用現行行為，還是以 DF 登記修正。B1 的修正草稿與回歸測試存於 `exec/s1m/bb1-wip/`，未提交。
+> 2026-11-05 擁有者指示：Stage 1 是過渡版，用來驗證 Rust CLI 能否完整承接 Python CLI 與 Python daemon 的對口；Python daemon 盡可能維持現況，它是 Stage 2 Rust daemon 的對齊基線，Stage 1 修改它會讓 Stage 2 的依據改變。**不是禁止修改**：Rust CLI 與 Python daemon 在架構／對接上必須調整時照改（例如 Rust bundle 下 pipx 無用）；Python daemon 自身的既有行為缺陷才不在 Stage 1 修。B1～B5 都是 daemon 內部既有行為，與 Rust 對接無關，因此不修。以下各項改列為「基線已知缺陷」：0.4.0 照現況發出，並在 release notes 的已知問題中揭露；Stage 2 Rust daemon 對齊時，由擁有者逐項裁決要沿用現行行為，還是以 DF 登記修正。B1 的修正草稿與回歸測試存於 `exec/s1m/bb1-wip/`，未提交。
 
 | # | 項目 | 位置 | 來源審查 | 狀態 |
 |---|---|---|---|---|
@@ -58,5 +58,5 @@
 | E1 | Rust daemon 對齊 main 的 7 個 PR（含 OD-74 DF-02 修訂） | 計畫分段：Rust daemon 屬 Stage 2（P5～P8），Stage 1 是 Rust CLI＋Python daemon |
 | E2 | 8 項 BLOCKED-OWNER 機台證據（OD-27～OD-32）、Windows L1.5 實體 USB（OD-30(2)） | 需要擁有者的實機，擁有者裁決 |
 | E3 | `l15-wal-interference` 在 Linux 判 INSUFFICIENT_EVIDENCE | OD-40 裁決 |
-| E5 | B1～B5 Python daemon 基線已知缺陷 | 擁有者 2026-11-05：Stage 1 不修改 Python daemon（見 B 段說明） |
+| E5 | B1～B5 Python daemon 基線已知缺陷 | 擁有者 2026-11-05：Python daemon 盡可能不改，只有 Rust↔Python 架構／對接需要才改；B1～B5 屬 daemon 既有行為，不在 Stage 1 修（見 B 段說明） |
 | E4 | S1-0733627-2 strace 黑箱實證沒有存進版本庫 | 2026-10-30 編排者裁決不擋放行，以出口 driver 重跑結果為準（待擁有者確認此裁決） |
