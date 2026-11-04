@@ -2,7 +2,7 @@
 
 來源：`docs/parity-amendments` 的 `docs/rust-refactor/reviews/s1-cloud/` 最近 60 份審查報告，內容包括 Low finding、「既有碼待辦（不計入結論）」與 SPEC-GAPS。
 起因：審查收斂規則只擋本輪 diff 引入的 High／Medium。既有問題與 Low 依規則應收進 low-backlog，但這個檔一直沒有建立，造成漏追。
-規則（自本清單起）：0.4.0 release PR 開出前，本清單 **A、C、D 類必須全部是「已修」並有 commit**；B 類依擁有者指示不修，但要寫進 0.4.0 release notes 的已知問題；E 類需寫明不在 Stage 1 修的依據（計畫分段或擁有者裁決），不得只寫「延後」。
+規則（自本清單起）：0.4.0 release PR 開出前，本清單 **A、C、D 類必須全部是「已修」並有 commit**；B 類依擁有者指示不修，但要寫進 0.4.0 release notes 的已知問題；依 OD-75，B 類缺陷若在出口 driver 造成失敗，登記後不擋出口（gate 實作見 S1M-bg1）；E 類需寫明不在 Stage 1 修的依據（計畫分段或擁有者裁決），不得只寫「延後」。
 
 狀態：`待修`／`進行中 <分支>`／`已修 <commit>`／`不修：<依據>`
 
@@ -59,4 +59,4 @@
 | E2 | 8 項 BLOCKED-OWNER 機台證據（OD-27～OD-32）、Windows L1.5 實體 USB（OD-30(2)） | 需要擁有者的實機，擁有者裁決 |
 | E3 | `l15-wal-interference` 在 Linux 判 INSUFFICIENT_EVIDENCE | OD-40 裁決 |
 | E5 | B1～B5 Python daemon 基線已知缺陷 | 擁有者 2026-11-05：Python daemon 盡可能不改，只有 Rust↔Python 架構／對接需要才改；B1～B5 屬 daemon 既有行為，不在 Stage 1 修（見 B 段說明） |
-| E4 | S1-0733627-2 strace 黑箱實證沒有存進版本庫 | 2026-10-30 編排者裁決不擋放行，以出口 driver 重跑結果為準（待擁有者確認此裁決） |
+| E4 | S1-0733627-2 strace 黑箱實證沒有存進版本庫 | 2026-10-30 編排者裁決不擋放行，以出口 driver 重跑結果為準；**擁有者 2026-11-05 確認沿用，不擋放行** |
