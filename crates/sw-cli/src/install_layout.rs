@@ -1345,13 +1345,53 @@ pub fn locate_manifest(ctx: &Ctx<'_>) -> Result<(PathBuf, ReleaseManifest), Layo
     ))
 }
 
+/// `mkbundle.sh` 在編譯前記入的 CLI 指紋占位。
+///
+/// 格式為 `SWFP1:` 加 12 位小寫十六進位。開發建置維持 12 個 `0`，視為沒有指紋。
+/// bundle 建置時改寫成與 `sw_core/version.py` 相同演算法算出的 Python daemon 指紋，
+/// 讓執行檔被複製離開 `release-manifest.json` 之後仍保有同一份 CLI 指紋。
+const EMBEDDED_CODE_FINGERPRINT_STAMP: &[u8] = include_bytes!("embedded_code_fingerprint.bin");
+const EMBEDDED_STAMP_PREFIX: &[u8] = b"SWFP1:";
+const EMBEDDED_STAMP_PLACEHOLDER: &[u8] = b"000000000000";
+
+/// 解析編譯期印入的指紋；占位、長度或字元不符時回傳 `None`（不得改用執行檔雜湊）。
+fn parse_embedded_stamp(stamp: &[u8]) -> Option<String> {
+    let prefix_len = EMBEDDED_STAMP_PREFIX.len();
+    let (prefix, rest) = stamp.split_at_checked(prefix_len)?;
+    if prefix != EMBEDDED_STAMP_PREFIX || rest.len() != EMBEDDED_STAMP_PLACEHOLDER.len() {
+        return None;
+    }
+    if rest == EMBEDDED_STAMP_PLACEHOLDER {
+        return None;
+    }
+    let text = std::str::from_utf8(rest).ok()?;
+    if !is_embedded_fingerprint(text) {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+fn is_embedded_fingerprint(value: &str) -> bool {
+    value.len() == EMBEDDED_STAMP_PLACEHOLDER.len()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// 編譯期印入的 bundle Python daemon 指紋；開發建置為 `None`。
+pub(crate) fn embedded_bundle_fingerprint() -> Option<String> {
+    parse_embedded_stamp(EMBEDDED_CODE_FINGERPRINT_STAMP)
+}
+
 /// 依既有定位規則讀取 bundle 宣告的 Python daemon 程式碼指紋。
 ///
-/// 開發建置沒有 manifest、或舊 manifest 未提供欄位時回傳 `Ok(None)`；manifest 存在但無法解析時保留原錯誤。
+/// manifest 存在時只用其中的 `code_fingerprint`（欄位缺失為 `Ok(None)`，不退回編譯期指紋）。
+/// 找不到 manifest 時才用編譯期印入的指紋；開發建置沒有該指紋，與 Python 無法取得指紋時一樣。
+/// manifest 存在但無法解析時保留原錯誤。
 pub fn code_fingerprint(ctx: &Ctx<'_>) -> Result<Option<String>, LayoutError> {
     match locate_manifest(ctx) {
         Ok((_, manifest)) => Ok(manifest.code_fingerprint().map(str::to_owned)),
-        Err(LayoutError::ManifestNotFound(_)) => Ok(None),
+        Err(LayoutError::ManifestNotFound(_)) => Ok(embedded_bundle_fingerprint()),
         Err(err) => Err(err),
     }
 }
@@ -1407,5 +1447,31 @@ pub fn install_lock(ctx: &Ctx<'_>, root: &InstallRoot) -> Result<FileLockGuard, 
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod embedded_stamp_tests {
+    use super::{is_embedded_fingerprint, parse_embedded_stamp};
+
+    #[test]
+    fn placeholder_is_not_a_fingerprint() {
+        assert_eq!(parse_embedded_stamp(b"SWFP1:000000000000"), None);
+    }
+
+    #[test]
+    fn twelve_hex_is_the_embedded_fingerprint() {
+        assert_eq!(
+            parse_embedded_stamp(b"SWFP1:347ea96fa479").as_deref(),
+            Some("347ea96fa479")
+        );
+    }
+
+    #[test]
+    fn invalid_stamp_is_ignored() {
+        assert_eq!(parse_embedded_stamp(b"SWFP1:GGGGGGGGGGGG"), None);
+        assert_eq!(parse_embedded_stamp(b"SWFP1:abc"), None);
+        assert_eq!(parse_embedded_stamp(b"nope"), None);
+        assert!(!is_embedded_fingerprint("347EA96FA479"));
     }
 }

@@ -48,6 +48,15 @@
 - `test_s1m241_setup_stale_on_demand_reports_manual_restart`：stale 指紋實跑 `setup --on-demand` 報告 `action=manual_restart`。
 - `test_s1m241_setup_stale_systemd_no_restart_reports_skipped`：stale 指紋實跑 `setup --user --no-restart` 報告 `action=skipped_no_restart_flag` 且不執行 restart。
 
+### 4.5 複製離開 manifest 的 CLI（S1M-x2）
+
+A/B 的 setup reconcile 會把 bundle CLI 複製到沒有 `release-manifest.json` 的目錄，避免走 SC-23。裁決仍要求這份 CLI 的指紋等於同一 bundle 內 Python daemon 的程式碼指紋，不得改用執行檔雜湊。
+
+- `mkbundle.sh` 在 `cargo` 前以 `sw_core/version.py` 計算 repo `sw_core` 指紋，寫入 `crates/sw-cli/src/embedded_code_fingerprint.bin`（`SWFP1:` 加 12 位小寫十六進位）。`cargo` 結束或失敗都還原占位 `SWFP1:000000000000`，工作樹不留下真指紋。開發建置維持占位，視為沒有指紋。
+- `code_fingerprint`：找到 manifest 時只用其中欄位（缺欄位為 `Ok(None)`，不退回編譯期值）；`ManifestNotFound` 才讀編譯期戳記；manifest 損壞仍回錯誤。
+- `doctor` 的 `daemon_code_current`：manifest 有效時用欄位，找不到 manifest 時用編譯期戳記，manifest 損壞維持無法計算。
+- `tests/test_rust_mkbundle.py::test_s1m_x2_copied_cli_setup_matches_python_daemon_code`：複製後的 `--version` 與 `setup --user`（mock daemon 不回報指紋）必須與 Python 基線的 `daemon_code` 相同，且占位檔已還原。
+
 ## 5. 未完成平台項目與測試屬性
 
 - 本變更已完全由 pytest 及 mock / subprocess 測試覆蓋。

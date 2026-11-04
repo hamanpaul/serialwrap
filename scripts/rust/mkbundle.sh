@@ -172,7 +172,41 @@ BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 if [[ "$BUILD_ROOT" != /* ]]; then
   BUILD_ROOT="$REPO_ROOT/$BUILD_ROOT"
 fi
+
+# 編譯期把 bundle 內 Python daemon 的程式碼指紋印進 CLI（#241）。
+# 占位檔在開發建置維持 SWFP1: 加 12 個 0；這裡只在 cargo 期間改寫，結束或失敗都還原，
+# 讓執行檔離開 release-manifest.json 之後仍回報同一份指紋，且工作樹不留下真指紋。
+STAMP_FILE="$REPO_ROOT/crates/sw-cli/src/embedded_code_fingerprint.bin"
+STAMP_PLACEHOLDER='SWFP1:000000000000'
+stamp_active=0
+restore_code_fingerprint_stamp() {
+  if [[ "${stamp_active:-0}" -eq 1 ]]; then
+    printf '%s' "$STAMP_PLACEHOLDER" > "$STAMP_FILE"
+    stamp_active=0
+  fi
+}
+trap restore_code_fingerprint_stamp EXIT
+EARLY_FP="$(python3 -I -B - "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+from sw_core.version import compute_code_fingerprint
+
+print(compute_code_fingerprint(str(root / "sw_core")) or "")
+PY
+)"
+if [[ -n "$EARLY_FP" ]]; then
+  if [[ ! "$EARLY_FP" =~ ^[0-9a-f]{12}$ ]]; then
+    echo "mkbundle.sh: 程式碼指紋格式不符：$EARLY_FP" >&2
+    exit 1
+  fi
+  printf 'SWFP1:%s' "$EARLY_FP" > "$STAMP_FILE"
+  stamp_active=1
+fi
 (cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
+restore_code_fingerprint_stamp
 
 BUILD_DIR="$BUILD_ROOT"
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
@@ -192,6 +226,22 @@ fi
 if [[ ! -x "$BIN_SRC" || ! -x "$DAEMON_SRC" ]]; then
   echo "mkbundle.sh: cargo build 後仍找不到 $BIN_SRC" >&2
   exit 1
+fi
+if [[ -n "$EARLY_FP" ]]; then
+  # 複製到沒有 manifest 的目錄再問 --version，確認指紋在執行檔裡，而不是靠旁邊的 manifest。
+  verify_dir="$(mktemp -d)"
+  cp "$BIN_SRC" "$verify_dir/serialwrap"
+  chmod +x "$verify_dir/serialwrap"
+  version_out="$(env -u SERIALWRAP_RELEASE_MANIFEST "$verify_dir/serialwrap" --version 2>"$verify_dir/err" || true)"
+  verify_err="$(cat "$verify_dir/err" 2>/dev/null || true)"
+  rm -rf "$verify_dir"
+  case "$version_out" in
+    *" (code ${EARLY_FP})"*) ;;
+    *)
+      echo "mkbundle.sh: 離開 manifest 的 CLI 未回報程式碼指紋 ${EARLY_FP}：${version_out}${verify_err}" >&2
+      exit 1
+      ;;
+  esac
 fi
 # cargo 建置成功後才動輸出目錄（cargo 失敗時既有輸出不受影響）。再檢一次所有權，通過後清空 mkbundle 自有目錄，
 # 確保每次只留下單一佈局（sentinel 或 dev），不殘留另一種佈局或過期檔案。組裝階段失敗會留下帶 owner marker 的半成品，下次執行會重建。
@@ -393,6 +443,10 @@ if fingerprints[0] is None or fingerprints[0] != fingerprints[1]:
 print(fingerprints[0])
 PY
   )"
+  if [[ "$CODE_FINGERPRINT" != "$EARLY_FP" ]]; then
+    echo "mkbundle.sh: 編譯時嵌入的指紋 ${EARLY_FP} 與 bundle sw_core 指紋 ${CODE_FINGERPRINT} 不一致" >&2
+    exit 1
+  fi
   PROFILE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m, sys; print(m.tree_sha256(sys.argv[1]))' "$REPO_ROOT/sw_core/assets/profiles")"
   CLI_SHA="$(sha256_file "$VERSION_DIR/bin/$CLI_NAME")"
   LAUNCHER_SHA="$(sha256_file "$VERSION_DIR/bin/$DAEMON_NAME")"

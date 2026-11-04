@@ -349,7 +349,10 @@ fn check_daemon_code_current(ctx: &mut CliCtx, state: &ManifestState) -> Check {
 
     let installed = match state {
         ManifestState::Valid { manifest, .. } => manifest.code_fingerprint().map(str::to_string),
-        ManifestState::Missing | ManifestState::Invalid { .. } => None,
+        // 執行檔被複製離開 manifest 時，仍用編譯期印入的同一份 bundle 指紋。
+        // 開發建置沒有該指紋，維持「無法計算」。manifest 損壞不改用編譯期值。
+        ManifestState::Missing => install_layout::embedded_bundle_fingerprint(),
+        ManifestState::Invalid { .. } => None,
     };
     let Some(installed) = installed.filter(|fingerprint| !fingerprint.is_empty()) else {
         return Check {
