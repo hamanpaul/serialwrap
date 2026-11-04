@@ -38,24 +38,25 @@ code_paths:
   - "rust-toolchain.toml"
   - ".cargo/**"
 cli:
-  - command: "./serialwrap"
+  # R-16 的 help golden 以 Python 3.12 argparse 擷取，固定直譯器避免 PATH 版本改變輸出。
+  - command: "python3.12 ./serialwrap"
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-help"
   # 群組 help（列出各群組子命令）——新增子命令但未同步 README 時 R-16 FAIL，補掉子命令層的漏記
-  - command: "./serialwrap daemon"
+  - command: "python3.12 ./serialwrap daemon"
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-daemon-help"
-  - command: "./serialwrap session"
+  - command: "python3.12 ./serialwrap session"
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-session-help"
-  - command: "./serialwrap device"
+  - command: "python3.12 ./serialwrap device"
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-device-help"
-  - command: "./serialwrap remote"
+  - command: "python3.12 ./serialwrap remote"
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-remote-help"
