@@ -1,25 +1,19 @@
 //! Stage 1A 委派目標定位與執行環境回歸測試（P3-T16）。
 
-#[cfg(feature = "test-fakes")]
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "test-fakes")]
-use sw_cli::delegate::argv_sha256;
-use sw_cli::delegate::{resolve_target, DelegateError, DelegateTarget};
+use sw_cli::delegate::{argv_sha256, resolve_target, DelegateError, DelegateTarget};
 use sw_pal::fakes::{platform as fake_platform, FakeEnv, MemFs, RecordingProcess};
 use sw_pal::{ClientPlatform, FsOps, ProcessCtl, SysEnv};
 
 struct Fixture {
     root: PathBuf,
     exe: PathBuf,
-    // 只有 test-fakes 的委派執行測試會讀這兩個欄位；平台組裝仍使用區域變數。
-    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     env: Arc<FakeEnv>,
     fs: Arc<MemFs>,
-    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     process: Arc<RecordingProcess>,
     platform: ClientPlatform,
 }
@@ -198,10 +192,11 @@ fn directory_delegate_entry_is_reported() {
     assert!(message.starts_with("delegate entry not found:"));
 }
 
-// 程式庫只在 test-fakes 建置讀取 SERIALWRAP_TEST_DELEGATE_GROUP；不以自我依賴打開 feature。
-#[cfg(feature = "test-fakes")]
+// 行程內 override 讓凍結 selector（未開 test-fakes）編譯本測試。
+// 環境變數仍寫入，`--features test-fakes` 時程式庫優先走該鉤子。
 #[test]
 fn run_delegate_increments_depth_and_executes_once_with_three_environment_values() {
+    let _group = sw_cli::delegate::override_test_group("doctor");
     let fixture = Fixture::new(Some("1"));
     fixture
         .env

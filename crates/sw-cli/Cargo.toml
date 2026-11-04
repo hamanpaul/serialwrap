@@ -25,7 +25,7 @@ indexmap = { workspace = true }
 
 [dev-dependencies]
 # 不依賴自身來打開 test-fakes（arch §1.3：sw-cli 不得依賴 sw-cli）。
-# 需要鉤子的整合測試以 `#[cfg(feature = "test-fakes")]` 宣告，由
-# `cargo test --features test-fakes` 啟用；正式建置不含此 feature。
+# SERIALWRAP_TEST_／SW_TEST_UPDATE_ 只在 `cargo test --features test-fakes` 啟用。
+# 凍結的 `cargo test --workspace` 以行程內 override 編譯委派整合測試；正式 release 不含那些字串。
 sw-pal = { path = "../sw-pal", features = ["test-fakes"] }
 tempfile = { workspace = true }

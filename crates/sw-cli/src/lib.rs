@@ -73,6 +73,17 @@ impl HomeLookup for PlatformHome<'_> {
     }
 }
 
+/// 測試注入的委派群組。環境變數只在 `test-fakes` 建置讀取；行程內 override 讓未開 feature 的整合測試也能編譯。
+fn injected_delegate_group(ctx: &CliCtx<'_>) -> Option<String> {
+    #[cfg(feature = "test-fakes")]
+    if let Some(group) = ctx.env.get("SERIALWRAP_TEST_DELEGATE_GROUP") {
+        return Some(group.to_string());
+    }
+    #[cfg(not(feature = "test-fakes"))]
+    let _ = ctx;
+    delegate::test_group_override().map(str::to_string)
+}
+
 /// 環境快照：Windows（`PathFlavor` 為 Windows）採大小寫不敏感語意（`os.environ`）。
 fn env_snapshot(p: &sw_pal::ClientPlatform) -> EnvSnapshot {
     let pairs = p.env.vars();
@@ -130,24 +141,10 @@ pub fn run(
     };
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
-    // 測試用委派覆寫只存在於 test-fakes 建置；正式 binary 不讀取此環境變數。
-    #[cfg(feature = "test-fakes")]
-    let delegate_route = if let Some(test_group) = ctx.env.get("SERIALWRAP_TEST_DELEGATE_GROUP") {
-        const CANDIDATES: [&'static str; 8] = [
-            "daemon", "service", "supervision-mode", "remote", "connect", "benches", "setup",
-            "doctor",
-        ];
-        if let Some(&matched) = CANDIDATES.iter().find(|g| **g == test_group) {
-            delegate::classify_with_groups(tail, &[matched])
-        } else {
-            delegate::classify(tail)
-        }
-    } else {
-        delegate::classify(tail)
-    };
-
-    #[cfg(not(feature = "test-fakes"))]
-    let delegate_route = delegate::classify(tail);
+    // 環境變數鉤子只在 test-fakes 建置讀取。凍結 selector 的整合測試改走行程內 override，
+    // 正式 release binary 兩者皆不作用，且不含 SERIALWRAP_TEST_ 字串。
+    let injected = injected_delegate_group(&ctx);
+    let delegate_route = delegate::classify_with_test_group(tail, injected.as_deref());
     if let delegate::Route::Delegate { group } = delegate_route {
         return delegate::run_delegate(&mut ctx, tail, group);
     }
