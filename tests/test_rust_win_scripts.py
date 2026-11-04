@@ -178,6 +178,41 @@ def test_blackbox_pytest_argv_matches_frozen_l1_selectors():
     assert "-k" not in invoke
 
 
+def test_windows_help_root_col80_matches_python_baseline():
+    """Windows help_root_col80 必須等於 Python 3.12.3 基線（含程式碼指紋的 --version 說明）。"""
+    windows = json.loads(
+        (ROOT / "contracts/cli_help/windows/help_root_col80.json").read_text(encoding="utf-8")
+    )
+    linux = json.loads(
+        (ROOT / "contracts/cli_help/linux/help_root_col80.json").read_text(encoding="utf-8")
+    )
+    assert windows["argv"] == ["--help"] and windows["columns"] == 80 and windows["rc"] == 0
+    assert windows["stdout"] == linux["stdout"]
+    assert "顯示版本與程式碼指紋後離開" in windows["stdout"]
+    assert "顯示版本後離開" not in windows["stdout"]
+
+
+def test_win_blackbox_uses_test_fakes_cli_and_keeps_release_unhooked():
+    """B 輪委派比照 Linux dev bundle 使用 test-fakes；標準 release 路徑最後覆寫且不得留鉤子。"""
+    text = WIN_BLACKBOX_SH.read_text(encoding="utf-8")
+    builds = re.findall(r"^.*\bcargo build\b.*$", text, re.M)
+    fakes_lines = [line for line in builds if "--features test-fakes" in line]
+    release_lines = [line for line in builds if "--features test-fakes" not in line]
+    assert fakes_lines == [
+        "if ! cargo build -p sw-cli --release --target x86_64-pc-windows-gnu --features test-fakes; then"
+    ]
+    assert release_lines == [
+        "if ! cargo build -p sw-cli --release --target x86_64-pc-windows-gnu; then"
+    ]
+    assert text.index(fakes_lines[0]) < text.index('cp -- "$release_exe" "$fakes_exe"')
+    assert text.index('cp -- "$release_exe" "$fakes_exe"') < text.index(release_lines[0])
+    assert 'cp -- "$fakes_exe" "$stage_exe"' in text
+    assert 'python3 - "$ROOT" "$out_dir" "$fakes_exe"' in text
+    assert 'check_win_imports.py" "$fakes_exe"' in text
+    assert 'b"SERIALWRAP_TEST_"' in text
+    assert 'b"SW_TEST_UPDATE_"' in text
+
+
 def test_blackbox_selector_keeps_purity_guards_in_every_required_platform_set():
     lock = json.loads(L1_LOCK.read_text(encoding="utf-8"))["sets"]
     for platform in ("linux", "windows"):
