@@ -1,7 +1,8 @@
 # Stage 1 漏追項目清單（2026-11-05 建立）
 
 來源：`docs/parity-amendments` 的 `docs/rust-refactor/reviews/s1-cloud/` 最近 60 份審查報告，內容包括 Low finding、「既有碼待辦（不計入結論）」與 SPEC-GAPS。
-起因：審查收斂規則只擋本輪 diff 引入的 High／Medium。既有問題與 Low 依規則應收進 low-backlog，但這個檔一直沒有建立，造成漏追。
+起因：審查收斂規則只擋本輪 diff 引入的 High／Medium。既有問題與 Low 依規則應收進 `docs/rust-refactor/reviews/low-backlog.md`（docs/parity-amendments）。**更正（11-05）**：該檔存在（21 列，收到 10-30 為止），但 11-02 改由自動審查鏈跑之後就沒有再收錄，11-01 起的 Low 與既有碼待辦因此漏追。編排者一度誤稱「從未建立」，原因是只查了 exec 目錄。
+測試與審查的分界（擁有者 11-05）：「Low 不修／推遲」只適用審查 finding；TDD、回歸、gate 等測試抓到的問題不論嚴重度都要修。例外只有兩種：依 OD-75 登記的 Python daemon 基線缺陷，以及擁有者裁決過的平台或硬體限制（OD-27～OD-32、OD-40）。
 規則（自本清單起）：0.4.0 release PR 開出前，本清單 **A、C、D 類必須全部是「已修」並有 commit**；B 類依擁有者指示不修，但要寫進 0.4.0 release notes 的已知問題；依 OD-75，B 類缺陷若在出口 driver 造成失敗，登記後不擋出口（gate 實作見 S1M-bg1）；E 類需寫明不在 Stage 1 修的依據（計畫分段或擁有者裁決），不得只寫「延後」。
 
 狀態：`待修`／`進行中 <分支>`／`已修 <commit>`／`不修：<依據>`
