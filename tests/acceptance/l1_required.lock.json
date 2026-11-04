@@ -5183,6 +5183,7 @@
           "cargo:sw-cli::mgmt_doctor::runtime_timeout_is_unrunnable_not_not_installed",
           "cargo:sw-cli::mgmt_doctor::single_daemon_multi_open",
           "cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable",
+          "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_code_fingerprint_uses_its_own_key",
           "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_manifest",
           "cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail",
           "cargo:sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key",
@@ -6142,6 +6143,7 @@
           "cargo:sw-cli::mgmt_doctor::runtime_timeout_is_unrunnable_not_not_installed",
           "cargo:sw-cli::mgmt_doctor::single_daemon_multi_open",
           "cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable",
+          "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_code_fingerprint_uses_its_own_key",
           "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_manifest",
           "cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail",
           "cargo:sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key",
@@ -7169,6 +7171,7 @@
           "cargo:sw-cli::mgmt_doctor::runtime_timeout_is_unrunnable_not_not_installed",
           "cargo:sw-cli::mgmt_doctor::single_daemon_multi_open",
           "cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable",
+          "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_code_fingerprint_uses_its_own_key",
           "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_manifest",
           "cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail",
           "cargo:sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key",
@@ -8132,6 +8135,7 @@
           "cargo:sw-cli::mgmt_doctor::runtime_timeout_is_unrunnable_not_not_installed",
           "cargo:sw-cli::mgmt_doctor::single_daemon_multi_open",
           "cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable",
+          "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_code_fingerprint_uses_its_own_key",
           "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_manifest",
           "cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail",
           "cargo:sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key",
@@ -8895,6 +8899,7 @@
           "cargo:sw-cli::mgmt_doctor::s1m241_doctor_daemon_code_current_matrix",
           "cargo:sw-cli::mgmt_doctor::single_daemon_multi_open",
           "cargo:sw-cli::mgmt_doctor::version_pairing_daemon_down_is_unreachable",
+          "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_code_fingerprint_uses_its_own_key",
           "cargo:sw-cli::mgmt_doctor::version_pairing_invalid_manifest",
           "cargo:sw-cli::mgmt_doctor::version_pairing_mismatch_detail",
           "cargo:sw-cli::mgmt_doctor::version_pairing_parse_only_optional_field_key",
@@ -9553,7 +9558,8 @@
           "tests/test_s1m241_cli_fingerprint_parity.py::test_s1m241_setup_current_manifest_is_reported",
           "tests/test_s1m241_cli_fingerprint_parity.py::test_s1m241_setup_stale_on_demand_reports_manual_restart",
           "tests/test_s1m241_cli_fingerprint_parity.py::test_s1m241_setup_stale_systemd_no_restart_reports_skipped",
-          "tests/test_s1m241_cli_fingerprint_parity.py::test_s1m241_setup_stale_systemd_restarts_and_verifies"
+          "tests/test_s1m241_cli_fingerprint_parity.py::test_s1m241_setup_stale_systemd_restarts_and_verifies",
+          "tests/test_s1m241_cli_fingerprint_parity.py::test_s1m241_systemctl_shim_waits_for_lock_and_keeps_outer_pid"
         ],
         "selector": {
           "argv": [
