@@ -488,12 +488,17 @@ def make_push_file(path: Path, size: int = 1024 * 1024) -> tuple[str, str]:
     return hashlib.md5(path.read_bytes()).hexdigest(), f"/tmp/{path.name}"
 
 
+def complete_ndjson_lines(path: Path) -> list[str]:
+    """只回傳以 LF 結尾的完整 NDJSON 行；檔尾殘段留待下次輪詢。"""
+    return [line.decode("utf-8") for line in path.read_bytes().split(b"\n")[:-1]]
+
+
 def wire_payloads(evidence_dir: Path, direction: str) -> list[bytes]:
     path = evidence_dir / "wire.ndjson"
     if not path.is_file():
         return []
     result: list[bytes] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in complete_ndjson_lines(path):
         row = json.loads(line)
         if row.get("dir") == direction:
             result.append(base64.b64decode(row["payload_b64"], validate=True))
@@ -525,7 +530,7 @@ def wal_rows(env: dict[str, str]) -> list[dict[str, Any]]:
         return []
     return [
         json.loads(line.rstrip("\r\n"))
-        for line in path.read_text(encoding="utf-8").splitlines()
+        for line in complete_ndjson_lines(path)
         if line.strip()
     ]
 
@@ -761,7 +766,7 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     return [
-        row for row in (json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+        row for row in (json.loads(line) for line in complete_ndjson_lines(path))
         if row.get("action") == "mark" and row.get("phase") == "completed"
     ]
 

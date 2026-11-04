@@ -6842,6 +6842,8 @@
     "s1b_20groups": {
       "linux": {
         "nodeids": [
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_ignores_incomplete_trailing_line",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_rejects_corrupt_complete_line",
           "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present",
           "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_suite_execution",
           "tests/contract_blackbox/test_cli_mgmt_com0com.py::test_bundle_license_files_present",
@@ -6901,6 +6903,8 @@
       },
       "windows": {
         "nodeids": [
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_ignores_incomplete_trailing_line",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_rejects_corrupt_complete_line",
           "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present",
           "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_suite_execution",
           "tests/contract_blackbox/test_cli_mgmt_daemon.py::test_autostart_l15_tx_once"
