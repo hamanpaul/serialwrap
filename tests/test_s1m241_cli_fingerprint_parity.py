@@ -1,6 +1,7 @@
 """S1M-241 ITEM 2：setup 以既有 ping 和已安裝 manifest 輸出 daemon 程式碼指紋。"""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -189,6 +190,7 @@ def _write_systemctl_shim(fake_bin: Path) -> Path:
     script = fake_bin / "systemctl"
     script.write_text(
         r'''#!/usr/bin/python3
+import fcntl
 import json
 import os
 import shutil
@@ -228,12 +230,36 @@ if args == ["--user", "is-active", "serialwrap"]:
 if args != ["--user", "restart", "serialwrap"]:
     raise SystemExit(0)
 
+def lock_is_free(path):
+    """非阻塞取得排他鎖後立刻放開，確認舊 daemon 已執行 lock.release()。"""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
 rpc("daemon.stop")
+endpoint = os.environ["SERIALWRAP_TEST_ENDPOINT"]
+lock_path = os.environ["SERIALWRAP_TEST_LOCK"]
 deadline = time.monotonic() + 15
 while time.monotonic() < deadline:
-    if rpc("health.ping") is None:
+    # socket 關閉後 health.ping 會先失敗；flock 要等 service.stop() 之後的 lock.release()。
+    if (
+        rpc("health.ping") is None
+        and not os.path.exists(endpoint)
+        and lock_is_free(lock_path)
+    ):
         break
-    time.sleep(0.1)
+    time.sleep(0.05)
 else:
     raise SystemExit("隔離舊 daemon 未停止")
 
@@ -261,16 +287,8 @@ with open(os.environ["SERIALWRAP_TEST_DAEMON_LOG"], "a", encoding="utf-8") as lo
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-pid = proc.pid
-try:
-    status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
-    for line in status.splitlines():
-        if line.startswith("NSpid:"):
-            pid = int(line.split()[1])
-            break
-except OSError:
-    pass
-Path(os.environ["SERIALWRAP_TEST_PID_FILE"]).write_text(str(pid), encoding="ascii")
+# 不把子 PID namespace 的局部 PID 寫回外層 SERIALWRAP_TEST_PID_FILE。
+# 外層 finally 只對啟動前寫入的舊 daemon PID 與 Popen 回收，避免 os.kill 打到外層其他行程。
 deadline = time.monotonic() + 20
 while time.monotonic() < deadline:
     response = rpc("health.ping")
@@ -285,6 +303,127 @@ raise SystemExit("隔離新 daemon 未就緒")
     )
     script.chmod(0o755)
     return script
+
+
+def test_s1m241_systemctl_shim_waits_for_lock_and_keeps_outer_pid(tmp_path: Path) -> None:
+    """restart 替身必須等舊 daemon 釋放 flock，且不得覆寫外層 PID 檔。
+
+    ``daemon.stop`` 關閉 socket 後，``health.ping`` 會先失敗，但 ``lock.release()``
+    仍在 ``service.stop()`` 之後。替身若在此時拉起新 daemon，會搶不到
+    ``serialwrapd.lock``。替身又跑在 setup 的子 PID namespace，把該 namespace 的
+    局部 PID 寫回外層 pid 檔會讓外層 ``os.kill`` 打到錯誤行程。
+    """
+    work = tmp_path / "work"
+    source = work / "daemon-source"
+    pristine = work / "daemon-pristine"
+    for root in (source, pristine):
+        (root / "sw_core").mkdir(parents=True)
+        (root / "sw_core" / "marker.py").write_text("# pristine\n", encoding="utf-8")
+    started = work / "daemon-started"
+    (source / "serialwrapd.py").write_text(
+        "import json, os, socket, time\n"
+        "from pathlib import Path\n"
+        "endpoint = os.environ['SERIALWRAP_TEST_ENDPOINT']\n"
+        "Path(os.environ['SERIALWRAP_TEST_STARTED']).write_text(str(os.getpid()), encoding='ascii')\n"
+        "try:\n"
+        "    os.unlink(endpoint)\n"
+        "except FileNotFoundError:\n"
+        "    pass\n"
+        "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "sock.bind(endpoint)\n"
+        "sock.listen(8)\n"
+        "sock.settimeout(0.2)\n"
+        "deadline = time.monotonic() + 25\n"
+        "while time.monotonic() < deadline:\n"
+        "    try:\n"
+        "        conn, _addr = sock.accept()\n"
+        "    except socket.timeout:\n"
+        "        continue\n"
+        "    with conn:\n"
+        "        buf = b''\n"
+        "        while b'\\n' not in buf:\n"
+        "            chunk = conn.recv(4096)\n"
+        "            if not chunk:\n"
+        "                break\n"
+        "            buf += chunk\n"
+        "        if not buf:\n"
+        "            continue\n"
+        "        request = json.loads(buf.split(b'\\n', 1)[0])\n"
+        "        conn.sendall(json.dumps({'id': request.get('id', 1), 'ok': True}).encode() + b'\\n')\n"
+        "        if request.get('method') == 'daemon.stop':\n"
+        "            break\n",
+        encoding="utf-8",
+    )
+    endpoint = work / "run" / "serialwrapd.sock"
+    endpoint.parent.mkdir(parents=True)
+    lock_path = work / "run" / "serialwrapd.lock"
+    lock_path.touch()
+    profile_dir = work / "profiles"
+    profile_dir.mkdir()
+    pid_file = work / "daemon.pid"
+    outer_pid = "424242"
+    pid_file.write_text(outer_pid, encoding="ascii")
+    log_path = work / "daemon.log"
+    systemctl_log = work / "systemctl.ndjson"
+    fake_bin = work / "fake-bin"
+    shim = _write_systemctl_shim(fake_bin)
+    env = os.environ.copy()
+    env.update(
+        {
+            "SERIALWRAP_TEST_DAEMON_SOURCE": str(source),
+            "SERIALWRAP_TEST_DAEMON_PRISTINE": str(pristine),
+            "SERIALWRAP_TEST_ENDPOINT": str(endpoint),
+            "SERIALWRAP_TEST_LOCK": str(lock_path),
+            "SERIALWRAP_TEST_PROFILE_DIR": str(profile_dir),
+            "SERIALWRAP_TEST_WORK": str(work),
+            "SERIALWRAP_TEST_PID_FILE": str(pid_file),
+            "SERIALWRAP_TEST_SYSTEMCTL_LOG": str(systemctl_log),
+            "SERIALWRAP_TEST_DAEMON_LOG": str(log_path),
+            "SERIALWRAP_TEST_STARTED": str(started),
+        }
+    )
+    lock_fd = os.open(lock_path, os.O_RDWR)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    proc = subprocess.Popen(
+        [sys.executable, str(shim), "--user", "restart", "serialwrap"],
+        env=env,
+        cwd=str(work),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.6)
+        problems: list[str] = []
+        if started.exists():
+            problems.append("舊 daemon 仍持有 flock 時，替身已啟動新 daemon")
+        if pid_file.read_text(encoding="ascii") != outer_pid:
+            problems.append(
+                "外層 PID 檔被改寫為 "
+                f"{pid_file.read_text(encoding='ascii')!r}，不得寫入子 namespace 的局部 PID"
+            )
+        assert not problems, "; ".join(problems)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        lock_fd = -1
+        stdout, stderr = proc.communicate(timeout=20)
+        assert proc.returncode == 0, f"替身應在鎖釋放後就緒：rc={proc.returncode} stdout={stdout!r} stderr={stderr!r}"
+        assert started.exists(), "鎖釋放後應啟動新 daemon"
+        assert pid_file.read_text(encoding="ascii") == outer_pid
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if started.exists():
+            try:
+                os.kill(int(started.read_text(encoding="ascii")), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        if endpoint.exists():
+            endpoint.unlink()
 
 
 def test_s1m241_setup_current_manifest_is_reported(bundle, tmp_path: Path) -> None:
