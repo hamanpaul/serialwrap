@@ -488,8 +488,12 @@ def make_push_file(path: Path, size: int = 1024 * 1024) -> tuple[str, str]:
     return hashlib.md5(path.read_bytes()).hexdigest(), f"/tmp/{path.name}"
 
 
+_NDJSON_READ_RETRY_TIMEOUT_S = 0.25
+_NDJSON_READ_RETRY_INTERVAL_S = 0.01
+
+
 def read_ndjson_snapshot(path: Path) -> tuple[list[str], bytes]:
-    """回傳 LF 完整行與檔尾殘段；呼叫端可在輪詢與最終快照間選擇判準。"""
+    """讀取單次快照，回傳 LF 完整行與檔尾殘段。"""
     raw = path.read_bytes()
     lines = [line.decode("utf-8") for line in raw.split(b"\n")[:-1]]
     trailing = b"" if not raw or raw.endswith(b"\n") else raw.rsplit(b"\n", 1)[-1]
@@ -503,6 +507,38 @@ def _require_closed_ndjson(path: Path, trailing: bytes) -> None:
         )
 
 
+def read_closed_ndjson_snapshot(path: Path) -> list[str]:
+    """重讀活躍檔案直到快照以 LF 結尾，或確認殘段穩定／證據不足。"""
+    deadline = time.monotonic() + _NDJSON_READ_RETRY_TIMEOUT_S
+    previous: tuple[int, bytes] | None = None
+
+    while True:
+        lines, trailing = read_ndjson_snapshot(path)
+        if not trailing:
+            return lines
+
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise AssertionError(
+                f"{path.name} 讀取期間無法確認檔案大小，證據不足"
+            ) from exc
+
+        sample = (size, trailing)
+        if sample == previous:
+            _require_closed_ndjson(path, trailing)
+
+        now = time.monotonic()
+        if previous is not None and now >= deadline:
+            raise AssertionError(
+                f"{path.name} 重試期間檔案大小或殘段持續變動且仍未以 LF 結尾，證據不足"
+            )
+
+        previous = sample
+        if now < deadline:
+            time.sleep(min(_NDJSON_READ_RETRY_INTERVAL_S, deadline - now))
+
+
 def wire_payloads(
     evidence_dir: Path,
     direction: str,
@@ -513,13 +549,14 @@ def wire_payloads(
     if not path.is_file():
         return []
     result: list[bytes] = []
-    lines, trailing = read_ndjson_snapshot(path)
+    if allow_incomplete_tail:
+        lines, _trailing = read_ndjson_snapshot(path)
+    else:
+        lines = read_closed_ndjson_snapshot(path)
     for line in lines:
         row = json.loads(line)
         if row.get("dir") == direction:
             result.append(base64.b64decode(row["payload_b64"], validate=True))
-    if not allow_incomplete_tail:
-        _require_closed_ndjson(path, trailing)
     return result
 
 
@@ -548,13 +585,12 @@ def wal_rows(env: dict[str, str]) -> list[dict[str, Any]]:
     path = Path(env["SERIALWRAP_WAL_DIR"]) / "raw.wal.ndjson"
     if not path.is_file():
         return []
-    lines, trailing = read_ndjson_snapshot(path)
+    lines = read_closed_ndjson_snapshot(path)
     rows = [
         json.loads(line.rstrip("\r\n"))
         for line in lines
         if line.strip()
     ]
-    _require_closed_ndjson(path, trailing)
     return rows
 
 
@@ -788,12 +824,11 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
     path = evidence_dir / "control.ndjson"
     if not path.is_file():
         return []
-    lines, trailing = read_ndjson_snapshot(path)
+    lines = read_closed_ndjson_snapshot(path)
     rows = [
         row for row in (json.loads(line) for line in lines)
         if row.get("action") == "mark" and row.get("phase") == "completed"
     ]
-    _require_closed_ndjson(path, trailing)
     return rows
 
 
