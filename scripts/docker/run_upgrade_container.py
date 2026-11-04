@@ -250,7 +250,7 @@ class Driver:
         status = self.wait_daemon(version=OLD_VERSION)
         version = self.cli_version()
         ok = (inst.returncode == 0 and setup.returncode == 0 and (start is None or start.returncode == 0)
-              and version == f"serialwrap {OLD_VERSION}" and bool(status) and status.get("version") == OLD_VERSION)
+              and uc.cli_version_identifies(version, OLD_VERSION) and bool(status) and status.get("version") == OLD_VERSION)
         self.add(uc.row("old_install_0_3_2", "PASS" if ok else "FAIL", None if ok else "0.3.2 正式安裝或啟動失敗",
                         pipx_rc=inst.returncode, setup_rc=setup.returncode, cli_version=version,
                         daemon_version=(status or {}).get("version"), entries=self.entries()))
@@ -397,7 +397,7 @@ class Driver:
             except (OSError, ValueError, AttributeError):
                 pass
         pipx_recorded = any(isinstance(t, str) and "/pipx/venvs/serialwrap/" in t for t in recorded)
-        ok = switched and version == f"serialwrap {NEW_VERSION}" and pipx_recorded
+        ok = switched and uc.cli_version_identifies(version, NEW_VERSION) and pipx_recorded
         self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else "入口未切到 0.4.0 或未記錄舊 pipx 入口",
                         entries=entries, cli_version=version, backup_targets=recorded,
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
@@ -541,7 +541,7 @@ class Driver:
         steps.append(self.start_daemon("0.3.2 start（降級）") if gone else self.stop_wait_failed("0.3.2 start（降級）", wait))
         status = self.wait_daemon(version=OLD_VERSION) or {}
         version = self.cli_version()
-        ok = all(p.returncode == 0 for p in steps) and gone and version == f"serialwrap {OLD_VERSION}" \
+        ok = all(p.returncode == 0 for p in steps) and gone and uc.cli_version_identifies(version, OLD_VERSION) \
             and status.get("version") == OLD_VERSION and uc.scan_daemon_instances(self.proc_root) == [status.get("pid")]
         self.add(uc.row("downgrade_manual", "PASS" if ok else "FAIL", None if ok else "手動降級回 0.3.2 失敗",
                         rcs=[p.returncode for p in steps], old_gone=gone, removed_entries=removed,
@@ -563,7 +563,8 @@ class Driver:
         status = self.wait_daemon(version=NEW_VERSION) or {}
         version = self.cli_version()
         ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
-            and start.returncode == 0 and status.get("version") == NEW_VERSION and version == f"serialwrap {NEW_VERSION}"
+            and start.returncode == 0 and status.get("version") == NEW_VERSION \
+            and uc.cli_version_identifies(version, NEW_VERSION)
         if op.get("from_version") not in (None, OLD_VERSION):
             self.observations.append({"id": "OBS-UPGRADE-STALE-CURRENT", "phase": "reupgrade",
                                       "op": op.get("op"), "from_version": op.get("from_version"),
