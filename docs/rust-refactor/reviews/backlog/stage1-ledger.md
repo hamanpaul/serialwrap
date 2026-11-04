@@ -2,7 +2,7 @@
 
 來源：`docs/parity-amendments` 的 `docs/rust-refactor/reviews/s1-cloud/` 最近 60 份審查報告，內容包括 Low finding、「既有碼待辦（不計入結論）」與 SPEC-GAPS。
 起因：審查收斂規則只擋本輪 diff 引入的 High／Medium。既有問題與 Low 依規則應收進 low-backlog，但這個檔一直沒有建立，造成漏追。
-規則（自本清單起）：0.4.0 release PR 開出前，本清單 **A～D 類必須全部是「已修」並有 commit**；E 類需寫明不在 Stage 1 修的依據（計畫分段或擁有者裁決），不得只寫「延後」。
+規則（自本清單起）：0.4.0 release PR 開出前，本清單 **A、C、D 類必須全部是「已修」並有 commit**；B 類依擁有者指示不修，但要寫進 0.4.0 release notes 的已知問題；E 類需寫明不在 Stage 1 修的依據（計畫分段或擁有者裁決），不得只寫「延後」。
 
 狀態：`待修`／`進行中 <分支>`／`已修 <commit>`／`不修：<依據>`
 
@@ -15,15 +15,17 @@
 | A3 | 0.3.2 wheelhouse 用主機 `python3` 下載 PyYAML，wheel 標籤跟著主機版本走（主機 3.13 時容器 3.12 不能用） | `scripts/docker/run-upgrade.sh:226` | b84ee5b_ed46551、407ed7e_ed46551、b84ee5b_407ed7e | 待修 |
 | A4 | 升級報告沒記錄容器內實際用的 driver 雜湊；`mkbundle.sh`／`run-upgrade.sh` 不檢查工作樹是否乾淨（證據完整性） | `scripts/docker/run_upgrade_container.py`、`mkbundle.sh`、`run-upgrade.sh` | ed46551_607ea76 | 待修 |
 
-## B. 0.4.0 內附的 Python daemon 產品 bug（來自 main 已合入的 PR）
+## B. Python daemon 基線的已知缺陷（來自 main 已合入的 PR）——**Stage 1 不修**
+
+> 2026-11-05 擁有者指示：Stage 1 是過渡版，用來驗證 Rust CLI 能否完整承接 Python CLI 與 Python daemon 的對口；Python daemon 盡可能維持現況，它是 Stage 2 Rust daemon 的對齊基線，Stage 1 修改它會讓 Stage 2 的依據改變。以下各項改列為「基線已知缺陷」：0.4.0 照現況發出，並在 release notes 的已知問題中揭露；Stage 2 Rust daemon 對齊時，由擁有者逐項裁決要沿用現行行為，還是以 DF 登記修正。B1 的修正草稿與回歸測試存於 `exec/s1m/bb1-wip/`，未提交。
 
 | # | 項目 | 位置 | 來源審查 | 狀態 |
 |---|---|---|---|---|
-| B1 | 取消落在 interactive TX 完成後、`execute_command` 返回前，會一併撤銷 `interactive:<lease_id>`，lease 開著但之後每次 `interactive send` 都回 `SESSION_BUSY` 直到逾時（已以記憶體替身重現） | `sw_core/session_manager.py` `revoke_tx_op`（約 4595） | 5b05626_9990b18、9990b18_109f659、109f659_f457eb3 | 待修 |
-| B2 | file.* 子命令的 TX 帳本沒有結算（`_tx_account_result_locked` 以 `ft-<8hex>-<n>` 記帳） | `sw_core/uart_io.py:2209`／`:2278` | 109f659_f457eb3 | 待修 |
-| B3 | `_record_dynamic_open_failure` 在沒有 passthrough fallback template 時不留任何列 | `sw_core/session_manager.py`（約 4318） | 9990b18_109f659 | 待修 |
-| B4 | 佔位的舊裝置永久不回來時，沒有任何 RPC／CLI 出口可以移除佔位（S1-109f659-2，Low） | `sw_core/session_manager.py:3583` | 109f659 | 待修 |
-| B5 | 契約沒寫明 `session.bind` 佔位早退早於 `FLASHING_BUSY`／`DEVICE_ALREADY_BOUND` 等錯誤閘（S1-f457eb3-1，Low） | `contracts/rpc_schema.json:4392` | f457eb3 | 待修 |
+| B1 | 取消落在 interactive TX 完成後、`execute_command` 返回前，會一併撤銷 `interactive:<lease_id>`，lease 開著但之後每次 `interactive send` 都回 `SESSION_BUSY` 直到逾時（已以記憶體替身重現） | `sw_core/session_manager.py` `revoke_tx_op`（約 4595） | 5b05626_9990b18、9990b18_109f659、109f659_f457eb3 | 不修：Python daemon 基線（擁有者 11-05） |
+| B2 | file.* 子命令的 TX 帳本沒有結算（`_tx_account_result_locked` 以 `ft-<8hex>-<n>` 記帳） | `sw_core/uart_io.py:2209`／`:2278` | 109f659_f457eb3 | 不修：Python daemon 基線（擁有者 11-05） |
+| B3 | `_record_dynamic_open_failure` 在沒有 passthrough fallback template 時不留任何列 | `sw_core/session_manager.py`（約 4318） | 9990b18_109f659 | 不修：Python daemon 基線（擁有者 11-05） |
+| B4 | 佔位的舊裝置永久不回來時，沒有任何 RPC／CLI 出口可以移除佔位（S1-109f659-2，Low） | `sw_core/session_manager.py:3583` | 109f659 | 不修：Python daemon 基線（擁有者 11-05） |
+| B5 | 契約沒寫明 `session.bind` 佔位早退早於 `FLASHING_BUSY`／`DEVICE_ALREADY_BOUND` 等錯誤閘（S1-f457eb3-1，Low） | `contracts/rpc_schema.json:4392` | f457eb3 | 不修：Python daemon 基線（擁有者 11-05） |
 
 ## C. Rust CLI 與 Python 基線的對齊差異（Stage 1 本身的範圍）
 
@@ -56,4 +58,5 @@
 | E1 | Rust daemon 對齊 main 的 7 個 PR（含 OD-74 DF-02 修訂） | 計畫分段：Rust daemon 屬 Stage 2（P5～P8），Stage 1 是 Rust CLI＋Python daemon |
 | E2 | 8 項 BLOCKED-OWNER 機台證據（OD-27～OD-32）、Windows L1.5 實體 USB（OD-30(2)） | 需要擁有者的實機，擁有者裁決 |
 | E3 | `l15-wal-interference` 在 Linux 判 INSUFFICIENT_EVIDENCE | OD-40 裁決 |
+| E5 | B1～B5 Python daemon 基線已知缺陷 | 擁有者 2026-11-05：Stage 1 不修改 Python daemon（見 B 段說明） |
 | E4 | S1-0733627-2 strace 黑箱實證沒有存進版本庫 | 2026-10-30 編排者裁決不擋放行，以出口 driver 重跑結果為準（待擁有者確認此裁決） |
