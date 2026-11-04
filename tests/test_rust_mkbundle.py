@@ -9,10 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -159,6 +162,164 @@ print(json.dumps({
     assert _manifest(out)["components"]["daemon"]["code_fingerprint"] == fingerprints[
         "loaded_fingerprint"
     ]
+
+
+def _isolated_setup_env(work: Path) -> dict[str, str]:
+    """隔離 setup 子程序，避免碰到 production daemon、使用者設定與真實 systemctl。"""
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("SERIALWRAP_"):
+            del env[key]
+    dirs = {
+        "SERIALWRAP_STATE_DIR": work / "state",
+        "SERIALWRAP_RUN_DIR": work / "run",
+        "SERIALWRAP_WAL_DIR": work / "wal",
+        "SERIALWRAP_CONFIG_DIR": work / "config",
+        "SERIALWRAP_LOG_DIR": work / "blog",
+        "SERIALWRAP_EVENTS_DIR": work / "events.d",
+        "SERIALWRAP_EVENTS_RUNTIME_DIR": work / "events-rt",
+        "SERIALWRAP_BY_ID_DIR": work / "by-id",
+        "SERIALWRAP_BY_PATH_DIR": work / "by-path",
+    }
+    for name, path in dirs.items():
+        path.mkdir(parents=True, exist_ok=True)
+        env[name] = str(path)
+    home = work / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(home)
+    env["XDG_CONFIG_HOME"] = str(work / "xdg-config")
+    env["XDG_STATE_HOME"] = str(work / "xdg-state")
+    (work / "xdg-config").mkdir(parents=True, exist_ok=True)
+    (work / "xdg-state").mkdir(parents=True, exist_ok=True)
+    for key in ("XDG_RUNTIME_DIR", "XDG_DATA_HOME", "SW_BUNDLE"):
+        env.pop(key, None)
+    bin_dir = work / "exec_bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    sw_link = bin_dir / "serialwrap"
+    if not sw_link.exists():
+        sw_link.symlink_to(REPO / "serialwrap")
+    stubs = REPO / "tests" / "contract_blackbox" / "stubs" / "bin"
+    env["PATH"] = os.pathsep.join([str(bin_dir), str(stubs), "/usr/bin", "/bin"])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _serve_ping_without_fingerprint(sock_path: Path) -> tuple[socket.socket, threading.Thread]:
+    """回應 ping／status／flashing，且不帶 code_fingerprint；收到 stop 後結束。"""
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    srv.listen(5)
+    srv.settimeout(1.0)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                data = conn.recv(1024)
+                if b"health.ping" in data:
+                    conn.sendall(b'{"ok":true}\n')
+                elif b"health.status" in data:
+                    conn.sendall(b'{"ok":true,"pid":4321}\n')
+                elif b"mcu.status" in data:
+                    conn.sendall(b'{"ok":true,"flashing":false}\n')
+                elif b"daemon.stop" in data:
+                    conn.sendall(b'{"ok":true,"stopping":true}\n')
+                    conn.close()
+                    break
+                conn.close()
+            except OSError:
+                break
+        try:
+            srv.close()
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return srv, thread
+
+
+def _normalize_setup_text(text: str, work: Path) -> str:
+    normalized = text.replace(str(work), "<work>")
+    return re.sub(r"/tmp/[^\"'\s\\]+", "<tmp>", normalized)
+
+
+def test_s1m_x2_copied_cli_setup_matches_python_daemon_code(bundle, tmp_path: Path):
+    """複製離開 manifest 的 bundle CLI，setup --user 的 daemon_code 必須與 Python 基線相同。
+
+    A/B reconcile 故意不讓執行檔旁留下 release-manifest.json，以免走安裝／更新流程。
+    裁決仍要求 CLI 指紋等於 bundle 內 Python daemon 程式碼指紋；mock daemon 不回報指紋時，
+    兩邊都要給 mode_transition／daemon_no_fingerprint，且 installed 為同一指紋。
+    """
+    from sw_core.version import compute_code_fingerprint
+
+    out = bundle.out()
+    # mkbundle 只在 cargo 期間寫入真指紋，結束後必須還原占位，工作樹不得留下本次指紋。
+    stamp = REPO / "crates" / "sw-cli" / "src" / "embedded_code_fingerprint.bin"
+    assert stamp.read_bytes() == b"SWFP1:000000000000"
+    manifest_fp = _manifest(out)["components"]["daemon"]["code_fingerprint"]
+    assert manifest_fp == compute_code_fingerprint()
+    source = _vdir(out) / "bin" / "serialwrap"
+    copied = tmp_path / "rust-cli" / "bin" / "serialwrap"
+    copied.parent.mkdir(parents=True)
+    shutil.copy2(source, copied)
+    assert not (copied.resolve().parent.parent / "release-manifest.json").is_file()
+
+    version = subprocess.run(
+        [str(copied), "--version"],
+        cwd=str(REPO),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert version.returncode == 0, version.stderr
+    assert version.stdout.strip() == f"serialwrap {VERSION} (code {manifest_fp})"
+
+    results: dict[str, str] = {}
+    for label, argv in (
+        ("python", [str(REPO / "serialwrap")]),
+        ("cli", [str(copied)]),
+    ):
+        work = tmp_path / label
+        work.mkdir()
+        env = _isolated_setup_env(work)
+        sock_path = Path(env["SERIALWRAP_RUN_DIR"]) / "serialwrapd.sock"
+        srv, thread = _serve_ping_without_fingerprint(sock_path)
+        try:
+            proc = subprocess.run(
+                [*argv, "setup", "--user"],
+                cwd=str(REPO),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+            thread.join(timeout=2.0)
+        assert proc.returncode == 0, f"{label} stderr={proc.stderr} stdout={proc.stdout}"
+        results[label] = _normalize_setup_text(proc.stdout, work)
+
+    assert results["cli"] == results["python"]
+    payload = json.loads(results["python"])
+    assert payload["daemon_code"] == {
+        "action": "mode_transition",
+        "daemon": None,
+        "installed": manifest_fp,
+        "reason": "daemon_no_fingerprint",
+        "stale": True,
+    }
 
 
 def test_bin_serialwrap_is_symlink_into_versions(bundle):
