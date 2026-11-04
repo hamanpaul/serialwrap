@@ -633,7 +633,7 @@ def test_bundle_two_versions_have_distinct_tree_sha256(tmp_path):
             text=True,
             check=False,
         )
-        assert cli.returncode == 0 and cli.stdout.strip() == f"serialwrap {version}", cli.stderr
+        assert cli.returncode == 0 and cli.stdout.strip() == _expected_python_version(version), cli.stderr
 
         py = subprocess.run(
             [str(vdir / "py" / "bin" / "python3"), "-I", "-m", "sw_core.cli", "--version"],
