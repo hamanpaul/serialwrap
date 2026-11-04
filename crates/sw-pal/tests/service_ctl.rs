@@ -815,6 +815,111 @@ fn systemd_user_hold_writes_dropin_reload_disable_verify() {
 }
 
 #[test]
+fn s1mx6b2_systemd_user_hold_root_matches_home_unit() {
+    for xdg_value in [None, Some(""), Some("xdg")] {
+        for home_present in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let passwd_home = tmp.path().join("passwd-home");
+            let xdg = tmp.path().join("xdg");
+            let mut builder = FakeSysEnv::builder()
+                .home(&home)
+                .passwd_home(&passwd_home)
+                .command(
+                    &[
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "serialwrap",
+                        "-p",
+                        "Restart",
+                        "--value",
+                    ],
+                    0,
+                    "on-failure\n",
+                    "",
+                )
+                .command(
+                    &["systemctl", "--user", "is-enabled", "serialwrap"],
+                    0,
+                    "enabled\n",
+                    "",
+                )
+                .command(
+                    &[
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "serialwrap",
+                        "-p",
+                        "Restart",
+                        "-p",
+                        "RefuseManualStart",
+                        "-p",
+                        "UnitFileState",
+                    ],
+                    0,
+                    HOLD_VERIFY,
+                    "",
+                )
+                .command(
+                    &[
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "serialwrap",
+                        "-p",
+                        "Restart",
+                        "-p",
+                        "RefuseManualStart",
+                    ],
+                    0,
+                    RELEASE_OK,
+                    "",
+                );
+            if !home_present {
+                builder = builder.var("HOME", "");
+            }
+            if let Some(value) = xdg_value {
+                builder = builder.var(
+                    "XDG_CONFIG_HOME",
+                    if value.is_empty() {
+                        ""
+                    } else {
+                        xdg.to_str().unwrap()
+                    },
+                );
+            }
+            let ctl = SystemdCtl::new(builder.build(), real_fs(), FakeClock::new());
+            let expected = user_dropin(if home_present { &home } else { &passwd_home });
+            let hold = ctl
+                .hold_autostart(&sm("systemd-user"), false)
+                .expect("hold");
+            assert_eq!(
+                hold.dropin_path.as_ref(),
+                Some(&expected),
+                "HOME 有值={home_present}，XDG={xdg_value:?}"
+            );
+            assert_eq!(std::fs::read(&expected).unwrap(), DROPIN_BYTES.as_bytes());
+            assert_eq!(
+                ctl.autostart_hold_state(&sm("systemd-user")),
+                HoldState::Held
+            );
+            assert!(!xdg
+                .join("systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf")
+                .exists());
+            ctl.release_autostart(&hold, Some(true), false)
+                .expect("release");
+            assert!(!expected.exists());
+            assert_eq!(
+                ctl.autostart_hold_state(&sm("systemd-user")),
+                HoldState::NotHeld
+            );
+        }
+    }
+}
+
+#[test]
 fn systemd_home_and_staging_paths_prefer_home_over_passwd_home() {
     let home = tempfile::tempdir().unwrap();
     let passwd_home = tempfile::tempdir().unwrap();

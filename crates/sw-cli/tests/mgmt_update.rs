@@ -1853,6 +1853,143 @@ fn update_tty_still_held_posix_aborts() {
 }
 
 #[test]
+fn s1mx6b2_real_systemd_update_hold_recovers_only_owned_dropin() {
+    for with_xdg in [false, true] {
+        let base = TestEnv::posix()
+            .with_systemd(true)
+            .with_real_service()
+            .with_install_root()
+            .with_installed("0.4.0")
+            .with_current("0.4.0", None)
+            .with_bundle("0.4.1")
+            .with_config("supervision_mode: systemd-user\n")
+            .with_var("USER", "alice");
+        let xdg = base.home().with_file_name("xdg-config");
+        let base = if with_xdg {
+            base.with_var("XDG_CONFIG_HOME", xdg.to_str().unwrap())
+        } else {
+            base
+        };
+        let mut t = base
+            .with_command(
+                &["systemctl", "--user", "is-active", "serialwrap"],
+                3,
+                "inactive\n",
+                "",
+            )
+            .with_command(
+                &["systemctl", "--user", "is-enabled", "serialwrap"],
+                0,
+                "enabled\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "--value",
+                ],
+                0,
+                "on-failure\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RefuseManualStart",
+                    "-p",
+                    "UnitFileState",
+                ],
+                0,
+                "Restart=no\nRefuseManualStart=yes\nUnitFileState=disabled\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RefuseManualStart",
+                ],
+                0,
+                "Restart=on-failure\nRefuseManualStart=no\n",
+                "",
+            )
+            .with_crash_at("stop_supervisor:after_hold");
+        let unit = t.home().join(".config/systemd/user/serialwrap.service");
+        let expected = unit
+            .parent()
+            .unwrap()
+            .join("serialwrap.service.d/90-serialwrap-update-hold.conf");
+        let xdg_hold = xdg.join("systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf");
+        let other = expected.with_file_name("10-owner.conf");
+        let unit_bytes = b"[Service]\nRestart=on-failure\n";
+        let sentinel = "# 擁有者的既有檔案，不屬於本次更新\n".as_bytes();
+        t.write_file(&unit, unit_bytes);
+        t.write_file(&other, sentinel);
+        let (rc, out, _) = t.run_from_bundle(&["setup"]);
+        assert_eq!(rc, 137, "{out}");
+        let journal = t.journal_json().expect("中斷時 journal 必須已持久化");
+        let planned = std::path::PathBuf::from(
+            journal["original"]["autostart"]["dropin_path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(planned, expected);
+        // 先從磁碟辨識真正寫入的檔案，恢復後檢查它，避免只檢查未曾存在的計畫路徑。
+        let written = if expected.exists() {
+            expected.clone()
+        } else {
+            xdg_hold.clone()
+        };
+        let dropin = std::fs::read_to_string(&written).expect("真實控制器須已寫入 drop-in");
+        assert!(dropin.contains("Restart=no\n") && dropin.contains("RefuseManualStart=yes\n"));
+        // 同名 XDG 檔在本次 hold 之後建立，用來驗證 recovery 不會刪除其他根目錄的檔案。
+        if written != xdg_hold {
+            t.write_file(&xdg_hold, sentinel);
+        }
+        t.clear_crash();
+        let recovered = t.recover().expect("殘留 journal");
+        assert!(recovered.ok, "{recovered:?}");
+        assert!(
+            !written.exists(),
+            "恢復必須移除實際建立的 drop-in：{}",
+            written.display()
+        );
+        assert_eq!(planned, written, "journal 計畫與實際 hold 必須一致");
+        assert_eq!(std::fs::read(&xdg_hold).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&other).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&unit).unwrap(), unit_bytes);
+        assert!(t.journal_json().is_none());
+        assert!(t.calls().iter().any(|call| call
+            == &vec![
+                "systemctl",
+                "--user",
+                "show",
+                "serialwrap",
+                "-p",
+                "Restart",
+                "-p",
+                "RefuseManualStart"
+            ]));
+    }
+}
+
+#[test]
 fn s1mx6_unit_snapshot_restore_ignores_xdg() {
     for with_xdg in [false, true] {
         let base = TestEnv::posix();

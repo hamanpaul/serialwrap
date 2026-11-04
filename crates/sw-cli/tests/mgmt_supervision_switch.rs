@@ -528,6 +528,109 @@ fn s1mx6_unit_hold_ignores_xdg() {
 }
 
 #[test]
+fn s1mx6b2_real_systemd_hold_plan_matches_written_path() {
+    for with_xdg in [false, true] {
+        let base = TestEnv::posix()
+            .with_systemd(true)
+            .with_real_service()
+            .with_config("supervision_mode: systemd-user\n")
+            .with_var("USER", "alice");
+        let xdg = base.home().with_file_name("xdg-config");
+        let base = if with_xdg {
+            base.with_var("XDG_CONFIG_HOME", xdg.to_str().unwrap())
+        } else {
+            base
+        };
+        let t = base
+            .with_command(
+                &["systemctl", "--user", "is-active", "serialwrap"],
+                3,
+                "inactive\n",
+                "",
+            )
+            .with_command(
+                &["systemctl", "--user", "is-enabled", "serialwrap"],
+                0,
+                "enabled\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "--value",
+                ],
+                0,
+                "on-failure\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RefuseManualStart",
+                    "-p",
+                    "UnitFileState",
+                ],
+                0,
+                "Restart=no\nRefuseManualStart=yes\nUnitFileState=disabled\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RefuseManualStart",
+                ],
+                0,
+                "Restart=on-failure\nRefuseManualStart=no\n",
+                "",
+            )
+            .with_fault_at("supervision_set:after_hold");
+        let unit = t.home().join(".config/systemd/user/serialwrap.service");
+        let unit_bytes = sw_cli::setup_cmd::render_user_unit("%h/.local/bin/serialwrapd");
+        t.write_file(&unit, unit_bytes.as_bytes());
+        let (rc, out, _) = t.run(&["supervision-mode", "set", "on-demand"]);
+        assert_eq!(rc, 137, "{out}");
+        let hold_path = t.state_dir().join("autostart-hold.json");
+        let hold: serde_json::Value =
+            serde_json::from_slice::<()>(&std::fs::read(&hold_path).unwrap()).unwrap();
+        let expected = unit
+            .parent()
+            .unwrap()
+            .join("serialwrap.service.d/90-serialwrap-update-hold.conf");
+        for record in [&hold, &hold["plan"]] {
+            let recorded = std::path::PathBuf::from(record["dropin_path"].as_str().unwrap());
+            assert_eq!(recorded, expected);
+            assert!(
+                recorded.exists(),
+                "計畫必須指向真實 SystemdCtl 寫入的檔案，XDG 已設定={with_xdg}"
+            );
+        }
+        let (rc, out, _) = t.run(&["setup"]);
+        assert_eq!(rc, 0, "{out}");
+        assert_eq!(json(&out)["recovered_autostart_hold"]["action"], "restored");
+        assert!(!expected.exists());
+        assert!(!hold_path.exists());
+        assert_eq!(std::fs::read(unit).unwrap(), unit_bytes.as_bytes());
+    }
+}
+
+#[test]
 fn supervision_set_crash_after_hold_recovers_on_next_setup() {
     let base = TestEnv::posix()
         .with_systemd(true)
