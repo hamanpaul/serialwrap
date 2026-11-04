@@ -392,6 +392,157 @@ def test_driver_stop_wait_timeout_fails_and_is_recorded(fake_driver, phase, chec
         assert ("daemon start", True) not in fake.calls and ("daemon start", False) not in fake.calls
 
 
+_BASELINE_FP = "347ea96fa479"
+_VERSION_WITH_FP = f"serialwrap 0.4.0 (code {_BASELINE_FP})"
+
+
+def _with_baseline_fingerprint(fake, driver):
+    """0.4.0 的 `--version` 改成 Python 基線整行；0.3.2 維持純版本。"""
+    orig = fake.sw
+
+    def sw(*args, **kwargs):
+        proc = orig(*args, **kwargs)
+        if args == ("--version",) and proc.stdout.strip() == "serialwrap 0.4.0":
+            return subprocess.CompletedProcess(proc.args, proc.returncode, _VERSION_WITH_FP + "\n", proc.stderr)
+        return proc
+
+    driver.sw = sw
+    return sw
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_reupgrade_identifies_0_4_0_when_version_line_has_baseline_fingerprint(fake_driver):
+    """#241 之後 `--version` 為 `serialwrap 0.4.0 (code <12 hex>)`。重新升級仍須指認 0.4.0，
+    不得把基線指紋後綴當成版本不符。"""
+    driver, fake = fake_driver(cli_version="0.3.2")
+    _with_baseline_fingerprint(fake, driver)
+    driver.phase_reupgrade()
+    row = _row(driver, "reupgrade")
+    assert row["verdict"] == "PASS", row
+    assert row["detail"]["cli_version"] == _VERSION_WITH_FP
+    assert row["detail"]["daemon_version"] == "0.4.0"
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_entries_replaced_identifies_0_4_0_when_version_line_has_baseline_fingerprint(fake_driver, tmp_path, monkeypatch):
+    """入口已切到 0.4.0 版本目錄且備份記有舊 pipx 入口時，基線指紋版 `--version` 仍須 PASS。"""
+    driver, fake = fake_driver(cli_version="0.4.0")
+    # importlib 載入的 driver 模組不在 sys.modules；判定讀的是函式全域。
+    globals_ = driver._judge_entries_and_config.__func__.__globals__
+    versions = tmp_path / "versions"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    target = versions / "0.4.0" / "bin"
+    target.mkdir(parents=True)
+    for name in ("serialwrap", "serialwrapd"):
+        (target / name).write_text("", encoding="utf-8")
+        (bin_dir / name).symlink_to(target / name)
+    backups = tmp_path / "backups" / "20260101T000000Z-to-0.4.0-1"
+    backups.mkdir(parents=True)
+    (backups / "entries.json").write_text(json.dumps([
+        {"name": "serialwrap", "target": "/opt/old/pipx/venvs/serialwrap/bin/serialwrap"},
+        {"name": "serialwrapd", "target": "/opt/old/pipx/venvs/serialwrap/bin/serialwrapd"},
+    ]), encoding="utf-8")
+    home = tmp_path / "home"
+    (home / ".local/share/pipx/venvs/serialwrap").mkdir(parents=True)
+    monkeypatch.setitem(globals_, "BIN", bin_dir)
+    monkeypatch.setitem(globals_, "VERSIONS", versions)
+    monkeypatch.setitem(globals_, "BACKUPS", tmp_path / "backups")
+    monkeypatch.setitem(globals_, "HOME", home)
+    _with_baseline_fingerprint(fake, driver)
+    driver._judge_entries_and_config()
+    row = _row(driver, "entries_replaced")
+    assert row["verdict"] == "PASS", row
+    assert row["detail"]["cli_version"] == _VERSION_WITH_FP
+    assert row["detail"]["pipx_venv_left"] is True
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("text,version,ok", [
+    ("serialwrap 0.4.0", "0.4.0", True),
+    ("serialwrap 0.4.0 (code 347ea96fa479)", "0.4.0", True),
+    ("serialwrap 0.3.2", "0.3.2", True),
+    ("serialwrap 0.3.2 (code 347ea96fa479)", "0.3.2", True),
+    ("serialwrap 0.4.0 (code 347ea96fa479)", "0.3.2", False),
+    ("serialwrap 0.4.0", "0.4", False),
+    ("serialwrap 0.4.0.1", "0.4.0", False),
+    ("serialwrap 0.40.0", "0.4.0", False),
+    ("serialwrap 0.4.0 (code 347EA96FA479)", "0.4.0", False),
+    ("serialwrap 0.4.0 (code 347ea96fa47)", "0.4.0", False),
+    ("serialwrap 0.4.0 (code 347ea96fa4790)", "0.4.0", False),
+    ("serialwrap 0.4.0 (code 347ea96fa47g)", "0.4.0", False),
+    ("serialwrap 0.4.0 (code 347ea96fa479) extra", "0.4.0", False),
+    ("serialwrap 0.4.0 extra", "0.4.0", False),
+    (" serialwrap 0.4.0 (code 347ea96fa479)", "0.4.0", False),
+    ("serialwrap 0.4.0 (code 347ea96fa479)\n", "0.4.0", False),
+    ("serialwrap 0.4.0 (code )", "0.4.0", False),
+    ("", "0.4.0", False),
+    (None, "0.4.0", False),
+    ("serialwrap 0.4.0", "", False),
+])
+def test_cli_version_identifies_only_baseline_version_line(text, version, ok):
+    """指紋後綴只接受基線格式；版本號仍須整段相等，不得用前綴或尾碼放行。"""
+    assert uc.cli_version_identifies(text, version) is ok
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_cli_version_fingerprint_length_matches_python_baseline():
+    from sw_core.version import FINGERPRINT_HEX_LEN
+    assert uc.FINGERPRINT_HEX_LEN == FINGERPRINT_HEX_LEN
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_rollback_accepts_baseline_fingerprint_but_not_other_version():
+    cfg = {"config.yaml": "a"}
+    fp = "serialwrap 0.3.2 (code 347ea96fa479)"
+    good = uc.judge_rollback_success("rollback_command", cli_version=fp, daemon_version="0.3.2",
+                                     cfg_before=cfg, cfg_after=dict(cfg))
+    assert good["verdict"] == "PASS", good
+    bad = uc.judge_rollback_success("rollback_command", cli_version="serialwrap 0.4.0 (code 347ea96fa479)",
+                                    daemon_version="0.3.2", cfg_before=cfg, cfg_after=dict(cfg))
+    assert bad["verdict"] == "FAIL", bad
+    # daemon 版本與設定位元組仍是必要條件，指紋行不能單獨過關
+    assert uc.judge_rollback_success("rollback_command", cli_version=fp, daemon_version="0.4.0",
+                                     cfg_before=cfg, cfg_after=dict(cfg))["verdict"] == "FAIL"
+    assert uc.judge_rollback_success("rollback_command", cli_version=fp, daemon_version="0.3.2",
+                                     cfg_before=cfg, cfg_after={})["verdict"] == "FAIL"
+
+
+@pytest.mark.posix_only
+@pytest.mark.memory_only
+def test_entries_replaced_still_fails_when_symlink_or_pipx_record_is_wrong(fake_driver, tmp_path, monkeypatch):
+    """指紋行不得取代入口切換與舊 pipx 備份這兩項必要條件。"""
+    driver, fake = fake_driver(cli_version="0.4.0")
+    globals_ = driver._judge_entries_and_config.__func__.__globals__
+    versions = tmp_path / "versions"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    wrong = versions / "0.3.2" / "bin"
+    wrong.mkdir(parents=True)
+    for name in ("serialwrap", "serialwrapd"):
+        (wrong / name).write_text("", encoding="utf-8")
+        (bin_dir / name).symlink_to(wrong / name)
+    backups = tmp_path / "backups" / "20260101T000000Z-to-0.4.0-1"
+    backups.mkdir(parents=True)
+    (backups / "entries.json").write_text("[]", encoding="utf-8")
+    home = tmp_path / "home"
+    (home / ".local/share/pipx/venvs/serialwrap").mkdir(parents=True)
+    monkeypatch.setitem(globals_, "BIN", bin_dir)
+    monkeypatch.setitem(globals_, "VERSIONS", versions)
+    monkeypatch.setitem(globals_, "BACKUPS", tmp_path / "backups")
+    monkeypatch.setitem(globals_, "HOME", home)
+    _with_baseline_fingerprint(fake, driver)
+    driver._judge_entries_and_config()
+    row = _row(driver, "entries_replaced")
+    assert row["verdict"] == "FAIL", row
+    assert row["detail"]["cli_version"] == _VERSION_WITH_FP
+
+
 # ---------- two-reader 重疊 ----------
 
 @pytest.mark.core_portable

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -430,13 +431,40 @@ def judge_seed(check_id: str, *, rcs: list[int], baseline: dict[str, Any], confi
     return row(check_id, "PASS", None, **detail)
 
 
+# 與 sw_core.version.FINGERPRINT_HEX_LEN、release manifest 的 code_fingerprint 相同：12 位小寫十六進位。
+FINGERPRINT_HEX_LEN = 12
+_FINGERPRINT_RE = re.compile(rf"[0-9a-f]{{{FINGERPRINT_HEX_LEN}}}\Z")
+
+
+def cli_version_identifies(text: str | None, version: str) -> bool:
+    """``--version`` 整行是否指認 ``version``。
+
+    Python 基線 ``format_version_with_fingerprint`` 只輸出兩種整行：``serialwrap <version>``，
+    或 ``serialwrap <version> (code <12 位小寫十六進位>)``。版本號必須整段相等；指紋可缺，
+    出現時長度、字元與括號都必須與基線一致。較長版本號、多餘尾碼、大寫或過短指紋都不是該版本。
+    """
+    if not isinstance(text, str) or not isinstance(version, str) or not version:
+        return False
+    if any(ch.isspace() for ch in version) or "(" in version or ")" in version:
+        return False
+    plain = f"serialwrap {version}"
+    if text == plain:
+        return True
+    prefix = plain + " (code "
+    if not text.startswith(prefix) or not text.endswith(")") or text.count(" ") != 3:
+        return False
+    fingerprint = text[len(prefix):-1]
+    return _FINGERPRINT_RE.fullmatch(fingerprint) is not None
+
+
 def judge_rollback_success(check_id: str, *, cli_version: str | None, daemon_version: str | None,
                            cfg_before: dict[str, str], cfg_after: dict[str, str], old_version: str = "0.3.2") -> dict[str, Any]:
     """setup --rollback 成功路徑：CLI 與 daemon 都回到 old_version，且設定逐位元組保留。"""
     preserved = judge_files_preserved(check_id, cfg_before, cfg_after)
     detail = {"outcome": "rolled_back", "cli_version": cli_version, "daemon_version": daemon_version,
               "config": preserved["detail"]}
-    ok = cli_version == f"serialwrap {old_version}" and daemon_version == old_version and preserved["verdict"] == "PASS"
+    ok = (cli_version_identifies(cli_version, old_version) and daemon_version == old_version
+          and preserved["verdict"] == "PASS")
     return row(check_id, "PASS" if ok else "FAIL", None if ok else f"setup --rollback 未完整回到 {old_version}", **detail)
 
 
