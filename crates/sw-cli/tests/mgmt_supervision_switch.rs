@@ -375,6 +375,159 @@ fn supervision_set_no_daemon_precheck_relaunch_flash_refused() {
 }
 
 #[test]
+fn s1mx6_config_state_override_matrix() {
+    use sw_proto::pypath::{HomeLookup, PathFlavor};
+    use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
+
+    struct PasswdHome<'a>(&'a dyn sw_pal::SysEnv);
+    impl HomeLookup for PasswdHome<'_> {
+        fn current_user_home(&self) -> Option<String> {
+            self.0.current_user_home()
+        }
+        fn user_home(&self, user: &str) -> Option<String> {
+            self.0.user_home(user)
+        }
+    }
+
+    let t = TestEnv::posix().with_passwd_home(std::path::Path::new("/passwd-home"));
+    for home_env in [None, Some("/env-home")] {
+        for xdg in [false, true] {
+            for overrides in [false, true] {
+                for explicit_config in [false, true] {
+                    t.with_cli_ctx(|ctx| {
+                        // 僅替換此 context 的快照，不改寫全域行程環境。
+                        let mut pairs = Vec::new();
+                        if let Some(home) = home_env {
+                            pairs.push(("HOME", home));
+                        }
+                        if xdg {
+                            pairs.extend([
+                                ("XDG_CONFIG_HOME", "/xdg-config"),
+                                ("XDG_STATE_HOME", "/xdg-state"),
+                            ]);
+                        }
+                        if overrides {
+                            pairs.extend([
+                                ("SERIALWRAP_CONFIG_DIR", "/override-config"),
+                                ("SERIALWRAP_STATE_DIR", "/override-state"),
+                            ]);
+                        }
+                        if explicit_config {
+                            pairs.push(("SERIALWRAP_CONFIG", "~/explicit.yaml"));
+                        }
+                        ctx.env = EnvSnapshot::from_pairs(
+                            pairs.into_iter().map(|(k, v)| (k.into(), v.into())),
+                        );
+                        ctx.paths = RuntimePaths::resolve(
+                            &ctx.env,
+                            NativeTraits {
+                                default_endpoint_is_tcp: false,
+                                path_flavor: PathFlavor::Posix,
+                            },
+                            &PasswdHome(ctx.p.env.as_ref()),
+                        )
+                        .unwrap();
+                        let home = std::path::Path::new(home_env.unwrap_or("/passwd-home"));
+                        let config = if overrides {
+                            "/override-config".into()
+                        } else if xdg {
+                            "/xdg-config/serialwrap".into()
+                        } else {
+                            home.join(".config/serialwrap")
+                        };
+                        let state = if overrides {
+                            "/override-state".into()
+                        } else if xdg {
+                            "/xdg-state/serialwrap".into()
+                        } else {
+                            home.join(".local/state/serialwrap")
+                        };
+                        assert_eq!(std::path::PathBuf::from(&ctx.paths.config_dir), config);
+                        assert_eq!(std::path::PathBuf::from(&ctx.paths.state_dir), state);
+                        assert_eq!(sw_cli::setup_cmd::user_dirs(&ctx.env, home).config, config);
+                        let expected_write = if explicit_config {
+                            home.join("explicit.yaml")
+                        } else {
+                            config.join("config.yaml")
+                        };
+                        assert_eq!(
+                            sw_cli::endpoint_resolve::config_write_path(ctx),
+                            expected_write
+                        );
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn s1mx6_unit_hold_ignores_xdg() {
+    for with_xdg in [false, true] {
+        let base = TestEnv::posix()
+            .with_systemd(true)
+            .with_var("USER", "alice")
+            .with_supervisor_state("systemd-user", true, true);
+        let passwd_home = base.home().with_file_name("passwd-home");
+        let xdg = base.home().with_file_name("xdg-config");
+        let base = base.with_passwd_home(&passwd_home);
+        let base = if with_xdg {
+            base.with_var("XDG_CONFIG_HOME", &xdg.to_string_lossy())
+        } else {
+            base
+        };
+        let ep = base.default_socket();
+        let t = base
+            .with_idle_daemon(&ep, 4242)
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "--value",
+                ],
+                0,
+                "on-failure\n",
+                "",
+            )
+            .with_fault_at("supervision_set:after_hold");
+        let (rc, out, _) = t.run(&["supervision-mode", "set", "on-demand"]);
+        assert_eq!(rc, 137, "XDG 已設定={with_xdg}：{out}");
+        let hold_path = t.state_dir().join("autostart-hold.json");
+        let hold = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&hold_path).unwrap())
+            .unwrap();
+        let expected = t
+            .home()
+            .join(".config/systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf");
+        for record in [&hold, &hold["plan"]] {
+            assert_eq!(
+                std::path::PathBuf::from(record["dropin_path"].as_str().unwrap()),
+                expected,
+                "實際 hold 與預存計畫都須使用 HOME，XDG 已設定={with_xdg}"
+            );
+            assert_eq!(record["prior_restart"], "on-failure");
+        }
+
+        let (rc, out, _) = t.run(&["setup"]);
+        assert_eq!(rc, 0, "{out}");
+        assert_eq!(json(&out)["recovered_autostart_hold"]["action"], "restored");
+        assert_eq!(t.service().hold_state_now(), HoldState::NotHeld);
+        assert!(!hold_path.exists(), "復原後不得殘留 hold 記錄");
+        for path in [
+            expected,
+            xdg.join("systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf"),
+            passwd_home
+                .join(".config/systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf"),
+        ] {
+            assert!(!path.exists(), "復原後不得殘留 drop-in：{}", path.display());
+        }
+    }
+}
+
+#[test]
 fn supervision_set_crash_after_hold_recovers_on_next_setup() {
     let base = TestEnv::posix()
         .with_systemd(true)

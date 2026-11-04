@@ -1365,6 +1365,11 @@ fn stop_old(
     Ok(())
 }
 
+/// User unit 固定放在已解析的 HOME 下；一般設定仍依各自的 XDG／SERIALWRAP 覆寫規則。
+pub(crate) fn systemd_user_unit_path(home: &Path) -> PathBuf {
+    home.join(".config/systemd/user/serialwrap.service")
+}
+
 fn start_new(
     ctx: &mut CliCtx<'_>,
     req: &ReconcileRequest,
@@ -1374,7 +1379,7 @@ fn start_new(
     match req.target_mode {
         SupervisionMode::OnDemand => {}
         SupervisionMode::SystemdUser => {
-            let unit = req.home.join(".config/systemd/user/serialwrap.service");
+            let unit = systemd_user_unit_path(&req.home);
             write_asset(
                 ctx,
                 &unit,

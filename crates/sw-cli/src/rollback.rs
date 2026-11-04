@@ -4255,12 +4255,7 @@ fn configured_mode_checked(ctx: &CliCtx<'_>) -> Result<SupervisionMode, String> 
 }
 
 fn systemd_user_unit_path(ctx: &CliCtx<'_>) -> PathBuf {
-    let config_home = ctx.p.env.var("XDG_CONFIG_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| ctx.p.env.current_user_home().map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(&ctx.paths.config_dir).parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
-    config_home.join("systemd/user/serialwrap.service")
+    crate::setup_cmd::systemd_user_unit_path(&crate::setup_cmd::home_dir(ctx))
 }
 
 fn switch_socket(ctx: &CliCtx<'_>, target: &SupervisionMode, endpoint: &str) -> String {

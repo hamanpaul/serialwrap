@@ -1853,6 +1853,75 @@ fn update_tty_still_held_posix_aborts() {
 }
 
 #[test]
+fn s1mx6_unit_snapshot_restore_ignores_xdg() {
+    for with_xdg in [false, true] {
+        let base = TestEnv::posix();
+        let passwd_home = base.home().with_file_name("passwd-home");
+        let xdg = base.home().with_file_name("xdg-config");
+        let base = base.with_passwd_home(&passwd_home);
+        let base = if with_xdg {
+            base.with_var("XDG_CONFIG_HOME", &xdg.to_string_lossy())
+        } else {
+            base
+        };
+        let t = base
+            .with_install_root()
+            .with_installed("0.4.0")
+            .with_current("0.4.0", None)
+            .with_bundle("0.4.1")
+            .with_systemd(true)
+            .with_var("USER", "alice")
+            .with_supervisor_state("systemd-user", true, true)
+            .with_idle_daemon_default(4242)
+            .with_new_daemon_reporting_version("0.4.1")
+            .with_rpc_after_relaunch("health.status", "{\"ok\":false}");
+        let home_unit = t.home().join(".config/systemd/user/serialwrap.service");
+        let xdg_unit = xdg.join("systemd/user/serialwrap.service");
+        let passwd_unit = passwd_home.join(".config/systemd/user/serialwrap.service");
+        let original = b"[Service]\nExecStart=/home-unit-before-update\n";
+        let xdg_bytes = b"[Service]\nExecStart=/xdg-unit-must-not-change\n";
+        let passwd_bytes = b"[Service]\nExecStart=/passwd-unit-must-not-change\n";
+        t.write_file(&home_unit, original);
+        t.write_file(&xdg_unit, xdg_bytes);
+        t.write_file(&passwd_unit, passwd_bytes);
+
+        let (rc, out, _) = t.run_from_bundle(&["setup"]);
+        assert_eq!(rc, 2, "XDG 已設定={with_xdg}：{out}");
+        let response = json(&out);
+        assert_eq!(s(&response, "reason"), "health_failed", "{out}");
+        assert!(b(&dict(&response, "update"), "reverted"), "{out}");
+        let backup = t.backup_dir_of(&response);
+        assert_eq!(
+            std::fs::read(backup.join("registered.unit")).unwrap(),
+            original,
+            "快照必須取自 HOME unit，XDG 已設定={with_xdg}"
+        );
+        assert_eq!(
+            std::fs::read(&home_unit).unwrap(),
+            original,
+            "失敗須還原 HOME unit"
+        );
+        assert_eq!(
+            std::fs::read(&xdg_unit).unwrap(),
+            xdg_bytes,
+            "XDG 同名 unit 不得變更"
+        );
+        assert_eq!(
+            std::fs::read(&passwd_unit).unwrap(),
+            passwd_bytes,
+            "passwd 同名 unit 不得變更"
+        );
+        assert_eq!(t.service().hold_state_now(), HoldState::NotHeld);
+        assert!(!t.state_dir().join("autostart-hold.json").exists());
+        assert!(!home_unit
+            .parent()
+            .unwrap()
+            .join("serialwrap.service.d/90-serialwrap-update-hold.conf")
+            .exists());
+    }
+}
+
+#[test]
 fn update_backup_contains_required_files() {
     let t = TestEnv::windows()
         .with_install_root()
