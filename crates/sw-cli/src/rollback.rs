@@ -4046,7 +4046,7 @@ pub fn run_supervision_switch(
     };
     crash_if("supervision_set:after_safety_check");
     let root = install_layout::resolve_install_root(ctx);
-    let home = ctx.p.env.current_user_home().map(PathBuf::from).or_else(|| ctx.env.get("HOME").map(PathBuf::from)).unwrap_or_default();
+    let home = crate::setup_cmd::home_dir(ctx);
     let socket = switch_socket(ctx, target, &crate::endpoint_resolve::target_instance_endpoint(ctx, target, &old, &endpoint));
     let mut request = crate::setup_cmd::ReconcileRequest {
         old_mode: old.clone(),

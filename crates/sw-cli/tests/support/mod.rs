@@ -384,6 +384,12 @@ impl TestEnv {
         self.push_env_op(Box::new(move |b| b.var(&k, &v)))
     }
 
+    /// 設定與隔離 `HOME` 不同的 passwd 家目錄，用於驗證 HOME 優先序。
+    pub fn with_passwd_home(self, home: &Path) -> Self {
+        let home = home.to_path_buf();
+        self.push_env_op(Box::new(move |b| b.passwd_home(&home)))
+    }
+
     pub fn with_systemd(self, flag: bool) -> Self {
         let mut env = self.push_env_op(Box::new(move |b| b.systemd(flag)));
         if flag && env.service.is_none() {

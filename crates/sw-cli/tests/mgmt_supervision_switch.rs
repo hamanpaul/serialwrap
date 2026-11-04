@@ -319,6 +319,27 @@ fn supervision_set_idle_uses_handoff_not_daemon_stop() {
 }
 
 #[test]
+fn s1mx6_supervision_home_precedes_passwd() {
+    let passwd_home = std::path::PathBuf::from(
+        std::env::var_os("HOME").expect("外層 HOME 應保留真實家目錄"),
+    );
+    let base = TestEnv::posix()
+        .with_systemd(true)
+        .with_passwd_home(&passwd_home)
+        .with_config("supervision_mode: on-demand\n");
+    let isolated_home = base.home();
+    assert_ne!(isolated_home, passwd_home, "測試 HOME 必須與 passwd 家目錄不同");
+    let expected_unit = isolated_home.join(".config/systemd/user/serialwrap.service");
+    let ep = base.default_socket();
+    let t = base.with_idle_daemon(&ep, 4321);
+
+    let (rc, out, _) = t.run(&["supervision-mode", "set", "systemd-user"]);
+
+    assert_eq!(rc, 0, "{out}");
+    assert!(expected_unit.is_file(), "systemd-user unit 應寫入隔離 HOME：{}", expected_unit.display());
+}
+
+#[test]
 fn supervision_set_no_daemon_switches_without_stop_rpc() {
     let ep = TestEnv::posix().default_socket();
     let t = TestEnv::posix()
