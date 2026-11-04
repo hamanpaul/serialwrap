@@ -1210,7 +1210,13 @@ fn trace(
 fn emit_rpc_response(ctx: &mut CliCtx<'_>, resp: &PyDict, method: &str) -> i32 {
     let _ = output::print_json(&mut ctx.io, resp);
     let _ = output::mirror_err(&mut ctx.io, resp, Some(method));
-    let _ = output::warn_version_mismatch(&mut ctx.io, resp, ctx.cli_version);
+    let cli_fingerprint = crate::install_layout::code_fingerprint(ctx).ok().flatten();
+    let _ = output::warn_version_mismatch_with_fingerprint(
+        &mut ctx.io,
+        resp,
+        ctx.cli_version,
+        cli_fingerprint.as_deref(),
+    );
     if resp.get_truthy("ok") {
         0
     } else {

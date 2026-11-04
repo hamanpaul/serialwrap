@@ -17,7 +17,9 @@ use crate::ctx::CliCtx;
 use crate::endpoint_resolve::{
     print_endpoint_resolution_error, resolve_endpoint_info, EndpointArgs, ResolveFailure,
 };
-use crate::output::{mirror_err, print_internal_error, print_json, warn_version_mismatch};
+use crate::output::{
+    mirror_err, print_internal_error, print_json, warn_version_mismatch_with_fingerprint,
+};
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pycompat::{decode_utf8_strict, universal_newlines};
 use sw_proto::pyfmt::{py_repr_argv, surrogate_of_escape};
@@ -227,7 +229,13 @@ pub fn dispatch_event(ctx: &mut CliCtx, ns: &Namespace) -> i32 {
     if let Err(error) = print_json(&mut ctx.io, &resp) {
         return print_internal_error(&mut ctx.io, &context, &py_io_error_text(&error));
     }
-    let _ = warn_version_mismatch(&mut ctx.io, &resp, ctx.cli_version);
+    let cli_fingerprint = crate::install_layout::code_fingerprint(ctx).ok().flatten();
+    let _ = warn_version_mismatch_with_fingerprint(
+        &mut ctx.io,
+        &resp,
+        ctx.cli_version,
+        cli_fingerprint.as_deref(),
+    );
     let _ = mirror_err(&mut ctx.io, &resp, Some(&context));
     if resp.get_truthy("ok") {
         0

@@ -12,7 +12,9 @@ use crate::ctx::CliCtx;
 use crate::endpoint_resolve::{
     print_endpoint_resolution_error, resolve_endpoint_info, EndpointArgs, ResolveFailure,
 };
-use crate::output::{error_resp, format_err_line, print_json, warn_version_mismatch};
+use crate::output::{
+    error_resp, format_err_line, print_json, warn_version_mismatch_with_fingerprint,
+};
 use sw_proto::constants::{DEFAULT_RPC_TIMEOUT_S, LONG_RPC_METHODS, LONG_RPC_TIMEOUT_FLOOR_S};
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -355,7 +357,13 @@ pub fn run_rpc(ctx: &mut CliCtx, ns: &Namespace, method: &str, params: PyValue) 
             .io
             .err_str(&format!("{}\n", format_err_line(&resp, Some(method))));
     }
-    let _ = warn_version_mismatch(&mut ctx.io, &resp, ctx.cli_version);
+    let cli_fingerprint = crate::install_layout::code_fingerprint(ctx).ok().flatten();
+    let _ = warn_version_mismatch_with_fingerprint(
+        &mut ctx.io,
+        &resp,
+        ctx.cli_version,
+        cli_fingerprint.as_deref(),
+    );
     if ok {
         0
     } else {

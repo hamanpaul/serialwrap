@@ -2213,7 +2213,8 @@ fn start_and_verify(
     }
     let version_out = ctx.p.env.run(&[cli_path.to_string_lossy().into_owned(), "--version".into()], Some(Duration::from_secs(5)))
         .map_err(|error| OpFailure { code: ErrorCode::InternalError.as_str(), phase: "update_start_and_verify", reason: Some("cli_version_failed"), message: Some(error.py_message), detail: PyDict::new() })?;
-    let cli_version = version_out.stdout.trim().strip_prefix("serialwrap ").unwrap_or("").trim();
+    let raw_version = version_out.stdout.trim().strip_prefix("serialwrap ").unwrap_or("").trim();
+    let cli_version = raw_version.split_whitespace().next().unwrap_or("").trim();
     if version_out.rc != 0 || cli_version.is_empty() {
         let mut detail = PyDict::new();
         detail.insert("returncode", PyValue::Int(PyInt::Small(i128::from(version_out.rc))));
