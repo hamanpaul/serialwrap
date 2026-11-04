@@ -450,6 +450,11 @@ fn parse_only_rejection_key(root: &PyDict) -> String {
     if matches!(state_schema, Some(value) if !matches!(value, PyValue::Str(_))) {
         return "components.daemon.state_schema".to_string();
     }
+    // 與 parse_manifest 相同順序：code_fingerprint 在 task_xml 之前，且只用自己的 dotted key。
+    let fingerprint = lookup(root, "components.daemon.code_fingerprint");
+    if fingerprint_rejected(fingerprint) {
+        return "components.daemon.code_fingerprint".to_string();
+    }
     let task_xml = lookup(root, "components.supervisor.task_xml_template_sha256");
     let task_xml_bad = match task_xml {
         None => false,
@@ -468,6 +473,20 @@ fn is_lower_sha256_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 12 位小寫十六進位；缺欄為合法（舊 manifest），型別錯誤或格式不符才拒絕。
+fn fingerprint_rejected(value: Option<&PyValue>) -> bool {
+    match value {
+        None => false,
+        Some(PyValue::Str(fingerprint)) => {
+            fingerprint.len() != 12
+                || !fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        Some(_) => true,
+    }
 }
 
 fn manifest_dir(path: &Path) -> PathBuf {

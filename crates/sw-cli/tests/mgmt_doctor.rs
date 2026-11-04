@@ -918,6 +918,33 @@ fn version_pairing_unreadable_manifest() {
 }
 
 #[test]
+fn version_pairing_invalid_code_fingerprint_uses_its_own_key() {
+    // 結構驗證通過、僅指紋格式被 sw_proto 拒絕時，必須回報該欄位自己的 key。
+    // 不得落成 unreadable，也不得與其他可選欄位共用一個錯誤鍵。
+    let t = TestEnv::posix();
+    let manifest = manifest_fixture(sw_cli::CLI_VERSION, &"0".repeat(64)).replacen(
+        "\"state_schema\":\"python-state-v0\"",
+        "\"state_schema\":\"python-state-v0\",\"code_fingerprint\":\"ABC\"",
+        1,
+    );
+    assert!(manifest.contains("\"code_fingerprint\":\"ABC\""));
+    t.write_file(
+        &t.bundle_dir().join("release-manifest.json"),
+        manifest.as_bytes(),
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "version_pairing");
+    assert!(!b(check, "ok"));
+    assert_eq!(
+        s(check, "detail"),
+        "invalid release manifest: components.daemon.code_fingerprint"
+    );
+    assert!(list(check, "mismatches").is_empty());
+}
+
+#[test]
 fn version_pairing_parse_only_optional_field_key() {
     // 結構驗證通過、僅 sw_proto 嚴格解析拒絕的可選欄位：回報該欄位 key，不得為 unreadable。
     let t = TestEnv::posix();
