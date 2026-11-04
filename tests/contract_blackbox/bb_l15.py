@@ -488,29 +488,47 @@ def make_push_file(path: Path, size: int = 1024 * 1024) -> tuple[str, str]:
     return hashlib.md5(path.read_bytes()).hexdigest(), f"/tmp/{path.name}"
 
 
-def complete_ndjson_lines(path: Path) -> list[str]:
-    """只回傳以 LF 結尾的完整 NDJSON 行；檔尾殘段留待下次輪詢。"""
-    return [line.decode("utf-8") for line in path.read_bytes().split(b"\n")[:-1]]
+def read_ndjson_snapshot(path: Path) -> tuple[list[str], bytes]:
+    """回傳 LF 完整行與檔尾殘段；呼叫端可在輪詢與最終快照間選擇判準。"""
+    raw = path.read_bytes()
+    lines = [line.decode("utf-8") for line in raw.split(b"\n")[:-1]]
+    trailing = b"" if not raw or raw.endswith(b"\n") else raw.rsplit(b"\n", 1)[-1]
+    return lines, trailing
 
 
-def wire_payloads(evidence_dir: Path, direction: str) -> list[bytes]:
+def _require_closed_ndjson(path: Path, trailing: bytes) -> None:
+    if trailing:
+        raise AssertionError(
+            f"{path.name} 有未以 LF 結尾的 NDJSON 殘段（{len(trailing)} bytes）"
+        )
+
+
+def wire_payloads(
+    evidence_dir: Path,
+    direction: str,
+    *,
+    allow_incomplete_tail: bool = True,
+) -> list[bytes]:
     path = evidence_dir / "wire.ndjson"
     if not path.is_file():
         return []
     result: list[bytes] = []
-    for line in complete_ndjson_lines(path):
+    lines, trailing = read_ndjson_snapshot(path)
+    for line in lines:
         row = json.loads(line)
         if row.get("dir") == direction:
             result.append(base64.b64decode(row["payload_b64"], validate=True))
+    if not allow_incomplete_tail:
+        _require_closed_ndjson(path, trailing)
     return result
 
 
-def tx_payloads(evidence_dir: Path) -> list[bytes]:
-    return wire_payloads(evidence_dir, "TX")
+def tx_payloads(evidence_dir: Path, *, allow_incomplete_tail: bool = True) -> list[bytes]:
+    return wire_payloads(evidence_dir, "TX", allow_incomplete_tail=allow_incomplete_tail)
 
 
-def tx_bytes(evidence_dir: Path) -> bytes:
-    return b"".join(tx_payloads(evidence_dir))
+def tx_bytes(evidence_dir: Path, *, allow_incomplete_tail: bool = False) -> bytes:
+    return b"".join(tx_payloads(evidence_dir, allow_incomplete_tail=allow_incomplete_tail))
 
 
 def assert_no_tx_after(evidence_dir: Path, baseline: bytes, marker: bytes) -> None:
@@ -520,19 +538,24 @@ def assert_no_tx_after(evidence_dir: Path, baseline: bytes, marker: bytes) -> No
     assert marker not in current, "凍結期間 console 輸入的 marker 出現於 DUT TX"
 
 
-def rx_bytes(evidence_dir: Path) -> bytes:
-    return b"".join(wire_payloads(evidence_dir, "RX"))
+def rx_bytes(evidence_dir: Path, *, allow_incomplete_tail: bool = False) -> bytes:
+    return b"".join(
+        wire_payloads(evidence_dir, "RX", allow_incomplete_tail=allow_incomplete_tail)
+    )
 
 
 def wal_rows(env: dict[str, str]) -> list[dict[str, Any]]:
     path = Path(env["SERIALWRAP_WAL_DIR"]) / "raw.wal.ndjson"
     if not path.is_file():
         return []
-    return [
+    lines, trailing = read_ndjson_snapshot(path)
+    rows = [
         json.loads(line.rstrip("\r\n"))
-        for line in complete_ndjson_lines(path)
+        for line in lines
         if line.strip()
     ]
+    _require_closed_ndjson(path, trailing)
+    return rows
 
 
 def _read_ready(proc: subprocess.Popen[str], timeout_s: float = 20.0) -> dict[str, Any]:
@@ -765,10 +788,13 @@ def control_marks(evidence_dir: Path) -> list[dict[str, Any]]:
     path = evidence_dir / "control.ndjson"
     if not path.is_file():
         return []
-    return [
-        row for row in (json.loads(line) for line in complete_ndjson_lines(path))
+    lines, trailing = read_ndjson_snapshot(path)
+    rows = [
+        row for row in (json.loads(line) for line in lines)
         if row.get("action") == "mark" and row.get("phase") == "completed"
     ]
+    _require_closed_ndjson(path, trailing)
+    return rows
 
 
 # ── 持有者取樣觀測器（restart 交接判準）────────────────────────────────────────
@@ -1126,7 +1152,7 @@ def start_file_push(
 def wait_wire_contains(evidence_dir: Path, needle: bytes, *, timeout_s: float = 10.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if needle in tx_bytes(evidence_dir):
+        if needle in tx_bytes(evidence_dir, allow_incomplete_tail=True):
             return
         time.sleep(0.02)
     raise AssertionError(f"P2 wire.ndjson 未觀察到 TX：{needle!r}")
@@ -1135,7 +1161,7 @@ def wait_wire_contains(evidence_dir: Path, needle: bytes, *, timeout_s: float = 
 def wait_rx_contains(evidence_dir: Path, needle: bytes, *, timeout_s: float = 10.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if needle in rx_bytes(evidence_dir):
+        if needle in rx_bytes(evidence_dir, allow_incomplete_tail=True):
             return
         time.sleep(0.02)
     raise AssertionError(f"P2 wire.ndjson 未觀察到 RX：{needle!r}")

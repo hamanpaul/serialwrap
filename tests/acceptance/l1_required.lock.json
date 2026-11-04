@@ -6842,6 +6842,11 @@
     "s1b_20groups": {
       "linux": {
         "nodeids": [
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_assert_no_tx_after_rejects_unterminated_late_tx",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_control_marks_rejects_unterminated_evidence",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_rx_bytes_rejects_unterminated_evidence",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wait_wire_contains_retries_until_trailing_record_is_terminated",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wal_rows_rejects_unterminated_negative_evidence",
           "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_ignores_incomplete_trailing_line",
           "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_rejects_corrupt_complete_line",
           "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present",
@@ -6903,6 +6908,11 @@
       },
       "windows": {
         "nodeids": [
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_assert_no_tx_after_rejects_unterminated_late_tx",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_control_marks_rejects_unterminated_evidence",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_rx_bytes_rejects_unterminated_evidence",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wait_wire_contains_retries_until_trailing_record_is_terminated",
+          "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wal_rows_rejects_unterminated_negative_evidence",
           "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_ignores_incomplete_trailing_line",
           "tests/contract_blackbox/test_bb_l15_wire_payloads.py::test_wire_payloads_rejects_corrupt_complete_line",
           "tests/contract_blackbox/test_cli_mgmt_ab_suite.py::test_cli_mgmt_ab_cases_lock_present",
