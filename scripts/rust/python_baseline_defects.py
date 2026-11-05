@@ -149,9 +149,10 @@ def resolve_ledger_path(repo_root: Path) -> Path | None:
     if ENV_LEDGER in os.environ:
         raw = os.environ[ENV_LEDGER]
         return Path(raw) if raw else None
+    # 回退清單在使用者家目錄下。不以個人絕對路徑字面寫入，避免 R-21 structural。
     candidates = (
         repo_root / "docs" / "rust-refactor" / "reviews" / "backlog" / "stage1-ledger.md",
-        Path("/home/paul_chen/b-log/rust-refactor/exec/stage1-ledger.md"),
+        Path.home() / "b-log" / "rust-refactor" / "exec" / "stage1-ledger.md",
     )
     for candidate in candidates:
         if candidate.is_file():
