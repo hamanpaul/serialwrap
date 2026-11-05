@@ -84,6 +84,11 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           mkdir -p target/ci-blackbox
           export PATH="$PWD/target/ci-system-python/bin:$PATH"
+          export SW_BUNDLE="$PWD/target/dev-bundle"
+          # bridge 證據寫入器收尾只等 10 秒，hosted runner 磁碟慢時傳 1 MiB 的案例會寫不完；暫存放 tmpfs
+          sudo mkdir -p /mnt/sw-tmp
+          sudo mount -t tmpfs -o size=8g,mode=1777 tmpfs /mnt/sw-tmp
+          export TMPDIR=/mnt/sw-tmp
           SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --junitxml=target/ci-blackbox/junit.xml
       - name: "保存黑箱 A/B 與 L1.5 systemd 診斷"
         if: always()
