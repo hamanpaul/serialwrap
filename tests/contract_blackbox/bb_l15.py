@@ -730,7 +730,10 @@ class BridgeTarget:
             if shutdown_error is not None:
                 raise RuntimeError(f"P2 bridge 未完成 shutdown RPC：{shutdown_error}") from shutdown_error
             if self.process.returncode != 0:
-                raise RuntimeError(f"P2 bridge exit={self.process.returncode}")
+                # bridge 的 HARNESS_* 錯誤碼只寫在 stderr 檔，暫存目錄清掉後就看不到，所以帶進例外訊息
+                self.stderr_file.flush()
+                tail = (self.root / "bridge.stderr").read_bytes()[-2000:].decode("utf-8", "replace")
+                raise RuntimeError(f"P2 bridge exit={self.process.returncode}: {tail}")
         finally:
             if self.process.poll() is None:
                 if os.name == "posix":
