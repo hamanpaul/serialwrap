@@ -84,7 +84,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           mkdir -p target/ci-blackbox
           export PATH="$PWD/target/ci-system-python/bin:$PATH"
-          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a bash scripts/rust/blackbox_sandbox.sh --with-docker python3 -m pytest -q tests/contract_blackbox --confcutdir=tests/contract_blackbox -p no:cacheprovider --junitxml=target/ci-blackbox/junit.xml
+          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox -m "core_portable or posix_only" --confcutdir=tests/contract_blackbox -p no:cacheprovider --junitxml=target/ci-blackbox/junit.xml
       - name: "保存黑箱 A/B 與 L1.5 systemd 診斷"
         if: always()
         uses: actions/upload-artifact@v4

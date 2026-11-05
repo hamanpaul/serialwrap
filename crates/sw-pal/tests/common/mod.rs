@@ -130,7 +130,8 @@ impl OsErrCase {
                 let text = python_utf8(
                     r#"import ctypes, sys
 e = ctypes.WinError(int(sys.argv[1]))
-fields = [type(e).__name__, str(e.errno), str(e.winerror), e.strerror]
+# 真實 OSError 由 CPython 去掉結尾空白與句點；ctypes.WinError 不去，要自行對齊
+fields = [type(e).__name__, str(e.errno), str(e.winerror), e.strerror.rstrip(' .\r\n\t')]
 sys.stdout.buffer.write('\0'.join(fields).encode('utf-8'))
 "#,
                     &[&code.to_string()],
