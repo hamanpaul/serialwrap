@@ -21,6 +21,8 @@ NEW_VERSION=0.4.0
 SYSTEM_PYTHON="${SW_UPGRADE_SYSTEM_PYTHON:-/usr/bin/python3.12}"
 # 與 release workflow 的 build venv 同一釘版
 BUILD_PIP_PINS=(pyyaml==6.0.3 jsonschema==4.10.3)
+# wheelhouse 與固定的 linux/amd64 Ubuntu 24.04 映像對齊，不繼承主機 pip 的 Python／ABI／平台。
+OLD_WHEEL_TARGET=(--python-version 3.12 --implementation cp --abi cp312 --platform manylinux_2_17_x86_64)
 MODES=(systemd-user on-demand)
 OUT=""
 WHEEL=""
@@ -94,7 +96,7 @@ print_command() {
 
 container_run() {
     local mode="$1" wheel_dir="$2" bundle="$3"
-    run_cmd=(docker run -d --name "sw-upgrade-$RUN_ID-$mode" --network none --cgroupns host
+    run_cmd=(docker run -d --platform linux/amd64 --name "sw-upgrade-$RUN_ID-$mode" --network none --cgroupns host
         -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock --tmpfs /tmp
         -v "$wheel_dir:/opt/sw-old:ro" -v "$bundle:/opt/sw-new:ro"
         -v "$SCRIPT_DIR:/opt/sw-driver:ro" -v "$OUT/$mode:/evidence" ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"}
@@ -163,12 +165,12 @@ if ((DRY_RUN)); then
     print_command env "PATH=$WORK/build-venv/bin:$PATH" "$REPO_ROOT/scripts/rust/mkbundle.sh" --release-bundle --profile release \
         --version-override "$NEW_VERSION" --out "$WORK/bundle-$NEW_VERSION"
     echo "+ require ${BUNDLE:-$WORK/bundle-$NEW_VERSION}/versions/$NEW_VERSION/py/pyvenv.cfg: home = /usr/bin, include-system-site-packages = false"
-    print_command python3 -m pip download --only-binary=:all: --dest "$WORK/wheels" 'PyYAML>=6'
+    print_command python3 -m pip download --only-binary=:all: "${OLD_WHEEL_TARGET[@]}" --dest "$WORK/wheels" 'PyYAML>=6'
     if [[ "$SCENARIO" == install-sh ]]; then
         print_command tar -czf "$WORK/dist/$TARBALL_NAME" --transform "s,^\.,serialwrap-$NEW_VERSION-linux-x86_64,SH" \
             -C "${BUNDLE:-$WORK/bundle-$NEW_VERSION}" .
     fi
-    print_command docker build -f "$DOCKERFILE" -t "$IMAGE" "$WORK/empty-context"
+    print_command docker build --platform linux/amd64 -f "$DOCKERFILE" -t "$IMAGE" "$WORK/empty-context"
     for mode in "${MODES[@]}"; do
         container_run "$mode" "$WORK/wheels" "${BUNDLE:-$WORK/bundle-$NEW_VERSION}"
         print_command "${run_cmd[@]}"
@@ -179,6 +181,25 @@ if ((DRY_RUN)); then
     echo "+ evidence_layer=L1.5-docker producer=run-upgrade.sh old=$OLD_VERSION new=$NEW_VERSION"
     exit 0
 fi
+
+# 正式證據必須能由提交重建；含未追蹤來源的工作樹也不得冒充 HEAD。dry-run 不產證據，免此限制。
+SOURCE_REVISION=""
+require_clean_source() {
+    local status revision
+    status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" || {
+        echo "升級證據需要可核對的 Git 工作樹" >&2; exit 3;
+    }
+    if [[ -n "$status" ]]; then
+        echo "升級證據需要乾淨工作樹：請先提交來源變更（含未追蹤檔案）" >&2
+        exit 3
+    fi
+    revision="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    if [[ -n "$SOURCE_REVISION" && "$SOURCE_REVISION" != "$revision" ]]; then
+        echo "升級驗證期間 HEAD 已變更，無法確認來源版本" >&2; exit 3
+    fi
+    SOURCE_REVISION="$revision"
+}
+require_clean_source
 
 # 需自建 bundle 時，主機前置條件先於任何建置、下載或 docker 動作檢查
 if [[ -z "$BUNDLE" ]]; then
@@ -223,7 +244,8 @@ if manifest.get("bundle_version") != sys.argv[2]:
     raise SystemExit(f"bundle 版本應為 {sys.argv[2]}：{manifest.get('bundle_version')}")
 PY
 check_bundle_runtime
-python3 -m pip download --quiet --only-binary=:all: --dest "$WORK/wheels" 'PyYAML>=6'
+require_clean_source
+python3 -m pip download --quiet --only-binary=:all: "${OLD_WHEEL_TARGET[@]}" --dest "$WORK/wheels" 'PyYAML>=6'
 if [[ "$SCENARIO" == install-sh ]]; then
     # 與 release 同名的 tarball：頂層為 serialwrap-<版本>-linux-x86_64/（S／H：不改寫 symlink／hardlink 目標）
     rm -rf "$WORK/dist"
@@ -232,7 +254,7 @@ if [[ "$SCENARIO" == install-sh ]]; then
 fi
 
 mkdir -p "$WORK/empty-context"
-docker build -q -f "$DOCKERFILE" -t "$IMAGE" "$WORK/empty-context" >/dev/null
+docker build -q --platform linux/amd64 -f "$DOCKERFILE" -t "$IMAGE" "$WORK/empty-context" >/dev/null
 IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$IMAGE")"
 
 overall=0
@@ -255,7 +277,8 @@ for mode in "${MODES[@]}"; do
     fi
     rc=0
     docker exec -e SW_HOST_UID="$(id -u)" -e SW_HOST_GID="$(id -g)" -e SW_UPGRADE_IMAGE="$IMAGE" \
-        -e SW_UPGRADE_IMAGE_ID="$IMAGE_ID" "$name" python3 /opt/sw-driver/run_upgrade_container.py \
+        -e SW_UPGRADE_IMAGE_ID="$IMAGE_ID" -e SW_UPGRADE_DRIVER_REVISION="$SOURCE_REVISION" \
+        "$name" python3 /opt/sw-driver/run_upgrade_container.py \
         --mode "$mode" --wheel "/opt/sw-old/$(basename "$WHEEL")" --bundle /opt/sw-new --out /evidence \
         ${EXTRA_DRIVER_ARGS[@]+"${EXTRA_DRIVER_ARGS[@]}"} || rc=$?
     docker exec "$name" journalctl --no-pager -o short-iso > "$OUT/$mode/journal.txt" 2>/dev/null || true
@@ -263,4 +286,5 @@ for mode in "${MODES[@]}"; do
     if ((rc != 0)); then overall=1; fi
     echo "[$mode] rc=$rc report=$OUT/$mode/upgrade-report.json"
 done
+require_clean_source
 exit "$overall"

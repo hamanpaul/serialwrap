@@ -13,6 +13,7 @@ host runner `scripts/docker/run-upgrade.sh` 以 `--dry-run` 檢查不碰 docker 
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -943,6 +944,113 @@ def _fake_docker(tmp_path: Path) -> tuple[Path, Path]:
 
 def _docker_calls(log: Path) -> list[str]:
     return log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+
+
+def _runner_repo(tmp_path: Path, script: Path) -> tuple[Path, Path]:
+    """只複製受測入口到獨立 Git fixture，不修改正在開發的工作樹。"""
+    repo = tmp_path / "repo"
+    entry = repo / script.relative_to(REPO)
+    entry.parent.mkdir(parents=True)
+    shutil.copy2(script, entry)
+    (repo / "input.txt").write_text("原始輸入\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("/target/\n", encoding="utf-8")
+    for args in (["init", "-q"], ["add", "."],
+                 ["-c", "user.name=測試", "-c", "user.email=test@example.invalid",
+                  "commit", "-qm", "test: 建立隔離輸入"]):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    return repo, entry
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_wheel_download_targets_container_python_even_on_host313(tmp_path):
+    """主機 pip 以 3.13 選 wheel 的替身；runner 必須明確指定容器的 CPython／ABI／平台。"""
+    repo, entry = _runner_repo(tmp_path, RUN_UPGRADE)
+    bindir, docker_log = _fake_docker(tmp_path)
+    pip_log = tmp_path / "pip.json"
+    fake = bindir / "python3"
+    fake.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        f"if sys.argv[1:4] == ['-m', 'pip', 'download']:\n"
+        f"    open({str(pip_log)!r}, 'w').write(json.dumps(sys.argv[4:]))\n"
+        "    sys.exit(0)\n"
+        f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    vdir = tmp_path / "bundle" / "versions" / "0.4.0"
+    (vdir / "py").mkdir(parents=True)
+    (vdir / "release-manifest.json").write_text('{"bundle_version":"0.4.0"}', encoding="utf-8")
+    (vdir / "py" / "pyvenv.cfg").write_text(
+        "home = /usr/bin\ninclude-system-site-packages = false\n", encoding="utf-8")
+    wheel = tmp_path / "serialwrap-0.3.2-py3-none-any.whl"
+    wheel.write_bytes(b"wheel fixture")
+    result = subprocess.run(
+        ["bash", str(entry), "--out", str(repo / "target" / "ev"), "--wheel", str(wheel),
+         "--bundle", str(vdir.parents[1])], cwd=repo, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}"),
+    )
+    assert pip_log.exists(), result.stdout + result.stderr
+    args = json.loads(pip_log.read_text(encoding="utf-8"))
+    for option, value in (("--python-version", "3.12"), ("--implementation", "cp"),
+                          ("--abi", "cp312"), ("--platform", "manylinux_2_17_x86_64")):
+        assert option in args and args[args.index(option) + 1] == value, args
+    assert any(c.startswith("build ") for c in _docker_calls(docker_log)), result.stderr
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("script", [RUN_UPGRADE, REPO / "scripts" / "rust" / "mkbundle.sh"],
+                         ids=["upgrade", "release_bundle"])
+@pytest.mark.parametrize("dirty", ["tracked", "staged", "untracked"])
+def test_evidence_entry_refuses_dirty_source_before_side_effects(tmp_path, script, dirty):
+    """未提交來源不得以 HEAD 冒充證據版本，且須在建置／下載／Docker 前拒絕。"""
+    repo, entry = _runner_repo(tmp_path, script)
+    if dirty == "untracked":
+        (repo / "unknown.py").write_text("# 未追蹤來源\n", encoding="utf-8")
+    else:
+        (repo / "input.txt").write_text("未提交輸入\n", encoding="utf-8")
+        if dirty == "staged":
+            subprocess.run(["git", "add", "input.txt"], cwd=repo, check=True)
+    bindir, docker_log = _fake_docker(tmp_path)
+    tool_log = tmp_path / "build-calls.log"
+    for name in ("cargo", "rustc"):
+        tool = bindir / name
+        tool.write_text(f'#!/bin/sh\necho "$*" >> "{tool_log}"\nexit 97\n', encoding="utf-8")
+        tool.chmod(0o755)
+    out = repo / "target" / "evidence"
+    args = ["--out", str(out)]
+    if script.name == "mkbundle.sh":
+        args += ["--release-bundle", "--profile", "release"]
+    result = subprocess.run(["bash", str(entry), *args], cwd=repo, capture_output=True, text=True,
+                            timeout=30, env=dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}"))
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "工作樹" in result.stderr and "乾淨" in result.stderr, result.stderr
+    assert not out.exists()
+    assert not tool_log.exists()
+    assert _docker_calls(docker_log) == []
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_upgrade_report_hashes_actual_container_driver(tmp_path, monkeypatch):
+    """只替代執行 phase，仍走真正報告輸出，雜湊綁定實際載入的兩支 driver。"""
+    drv = _load_driver()
+
+    def execute(driver):
+        driver.rows = [uc.row(cid, "PASS", "隔離替身") for cid in uc.REQUIRED_CHECKS]
+
+    monkeypatch.setattr(drv.Driver, "execute", execute)
+    monkeypatch.setenv("SW_UPGRADE_DRIVER_REVISION", "a" * 40)
+    monkeypatch.setattr(sys, "argv", [str(UPGRADE_CONTAINER), "--mode", "on-demand", "--wheel", "w.whl",
+                                    "--bundle", str(tmp_path / "bundle"), "--out", str(tmp_path / "ev")])
+    assert drv.main() == 0
+    report = json.loads((tmp_path / "ev" / "upgrade-report.json").read_text(encoding="utf-8"))
+    expected = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (UPGRADE_CONTAINER, Path(drv.uc.__file__))}
+    assert report.get("driver_sha256") == expected
+    assert report["driver_git_revision"] == "a" * 40
+    assert str(REPO) not in json.dumps(report)
 
 
 # POSIX-only：bash runner 需 POSIX bash、git 與 python3。

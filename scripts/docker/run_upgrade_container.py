@@ -638,6 +638,9 @@ def main() -> int:
     except (OSError, ValueError):
         pass
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # 於執行 phase 前記錄容器實際載入的來源；只輸出檔名，避免洩露宿主掛載路徑。
+    driver_sha256 = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                     for path in (pathlib.Path(__file__), pathlib.Path(uc.__file__))}
     driver = Driver(args.mode, wheel, bundle, out, scenario=args.scenario,
                     installer=pathlib.Path(args.installer) if args.installer else None,
                     bundle_tarball=pathlib.Path(args.bundle_tarball) if args.bundle_tarball else None)
@@ -653,6 +656,8 @@ def main() -> int:
         "scenario": args.scenario,
         "evidence_layer": "L1.5-docker",
         "producer": "scripts/docker/run-upgrade.sh",
+        "driver_sha256": driver_sha256,
+        "driver_git_revision": os.environ.get("SW_UPGRADE_DRIVER_REVISION"),
         "old_version": OLD_VERSION,
         "new_version": NEW_VERSION,
         "wheel": wheel.name,

@@ -12,6 +12,7 @@ usage() {
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
   --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
+                           須使用乾淨 Git 工作樹（含未追蹤檔案），否則 exit 3；--dev 允許開發中來源
   --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
   --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
@@ -120,6 +121,26 @@ if [[ "$SENTINEL" -eq 1 && -n "$COM0COM_ZIP" ]]; then
   exit 2
 fi
 
+# 正式候選以提交作為來源證據；開發 bundle 保留供先紅後綠測試使用。
+SOURCE_REVISION=""
+require_clean_release_source() {
+  [[ "$RELEASE_BUNDLE" -eq 1 ]] || return 0
+  local status revision
+  status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" || {
+    echo "mkbundle.sh: 正式候選需要可核對的 Git 工作樹" >&2; exit 3;
+  }
+  if [[ -n "$status" ]]; then
+    echo "mkbundle.sh: 正式候選需要乾淨工作樹：請先提交來源變更（含未追蹤檔案）" >&2
+    exit 3
+  fi
+  revision="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if [[ -n "$SOURCE_REVISION" && "$SOURCE_REVISION" != "$revision" ]]; then
+    echo "mkbundle.sh: 建置期間 HEAD 已變更，無法確認來源版本" >&2; exit 3
+  fi
+  SOURCE_REVISION="$revision"
+}
+require_clean_release_source
+
 # 輸出目錄所有權：mkbundle 建立的目錄會寫入 OWNER_MARKER。非空且無該 marker 的目錄一律拒絕，
 # 且在任何寫入前即退出；否則 sentinel（頂層 release-manifest.json／py／bin）與 dev（versions/）佈局會混在同一目錄，
 # 使 bundle 定位取到過期的頂層 manifest。
@@ -207,6 +228,7 @@ if [[ -n "$EARLY_FP" ]]; then
 fi
 (cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
 restore_code_fingerprint_stamp
+require_clean_release_source
 
 BUILD_DIR="$BUILD_ROOT"
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
@@ -666,5 +688,6 @@ PY
 }
 
 assemble_bundle
+require_clean_release_source
 
 printf '%s\n' "$OUT"
