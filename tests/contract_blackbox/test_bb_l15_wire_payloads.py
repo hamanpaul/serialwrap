@@ -128,43 +128,66 @@ def test_rx_bytes_rejects_unterminated_evidence(tmp_path: Path) -> None:
         rx_bytes(tmp_path)
 
 
-def test_wait_wire_contains_retries_until_trailing_record_is_terminated(tmp_path: Path) -> None:
-    path = tmp_path / "wire.ndjson"
-    path.write_bytes(_wire_row(b"late-probe")[:-1])
-    terminated = threading.Event()
-    termination_lock = threading.Lock()
+def test_wait_wire_contains_retries_until_trailing_record_is_terminated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """等待函式必須先看到未以 LF 結尾的紀錄且不返回，測試才補上 LF。
 
-    def terminate_record() -> None:
-        time.sleep(0.05)
-        with termination_lock:
+    寫入緒若先睡再補 LF、斷言又放在 join() 之後，寫入緒結束就一定已設旗標，
+    無法證明等待不是在殘段上返回。
+    """
+    path = tmp_path / "wire.ndjson"
+    state = {"partial": b""}
+    observed = threading.Event()
+    original_read_bytes = Path.read_bytes
+
+    def spy_read_bytes(self: Path) -> bytes:
+        data = original_read_bytes(self)
+        if self == path and data == state["partial"]:
+            observed.set()
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", spy_read_bytes)
+
+    def expect_block(direction: str, needle: bytes, wait, message: str) -> None:
+        partial = _wire_row(needle, direction=direction)[:-1]
+        path.write_bytes(partial)
+        state["partial"] = partial
+        observed.clear()
+        reader = tx_bytes if direction == "TX" else rx_bytes
+        assert needle not in reader(tmp_path, allow_incomplete_tail=True)
+        observed.clear()
+
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def run_wait() -> None:
+            try:
+                wait(tmp_path, needle, timeout_s=5.0)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        waiter = threading.Thread(target=run_wait)
+        waiter.start()
+        try:
+            assert observed.wait(2.0), f"{message}沒有觀察到尚未以 LF 結尾的紀錄"
+            time.sleep(0.05)
+            assert not done.is_set(), f"{message}在紀錄 LF 寫入前就返回"
             with path.open("ab") as stream:
                 stream.write(b"\n")
-            terminated.set()
+            assert done.wait(2.0), f"補上 LF 後 {message}沒有返回"
+        finally:
+            if not original_read_bytes(path).endswith(b"\n"):
+                with path.open("ab") as stream:
+                    stream.write(b"\n")
+            waiter.join(timeout=2.0)
+        assert not waiter.is_alive(), f"{message}執行緒未結束"
+        assert not errors, errors
 
-    writer = threading.Thread(target=terminate_record)
-    writer.start()
-    try:
-        wait_wire_contains(tmp_path, b"late-probe", timeout_s=1.0)
-    finally:
-        writer.join(timeout=1.0)
-
-    assert not writer.is_alive(), "合成證據寫入器未結束"
-    with termination_lock:
-        assert terminated.is_set(), "wait_wire_contains 在紀錄 LF 寫入前就返回"
-
-    path.write_bytes(_wire_row(b"late-rx", direction="RX")[:-1])
-    terminated.clear()
-    termination_lock = threading.Lock()
-    writer = threading.Thread(target=terminate_record)
-    writer.start()
-    try:
-        wait_rx_contains(tmp_path, b"late-rx", timeout_s=1.0)
-    finally:
-        writer.join(timeout=1.0)
-
-    assert not writer.is_alive(), "合成 RX 證據寫入器未結束"
-    with termination_lock:
-        assert terminated.is_set(), "wait_rx_contains 在紀錄 LF 寫入前就返回"
+    expect_block("TX", b"late-probe", wait_wire_contains, "wait_wire_contains ")
+    expect_block("RX", b"late-rx", wait_rx_contains, "wait_rx_contains ")
 
 
 def test_wal_rows_rejects_unterminated_negative_evidence(tmp_path: Path) -> None:
