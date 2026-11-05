@@ -14,6 +14,9 @@ S1X 規則（計畫 04 Task 18、§3 B3；owner_gated.py 為擁有者機台列�
 - L1.5 擁有者延後列（`L15_OWNER_DEFERRED`；OD-30 (2) 的 Windows `l15-transport-disconnect`、OD-31 的 Windows
   `ev-01-spawn-handler`、OD-32 的 Windows `sm-04-device-unplug`）：僅在列的 verdict 與訊息完整符合登記型態、且無
   harness 關閉失敗時，該列改判 BLOCKED-OWNER（不阻擋、不計 PASS）；其他平台列仍須 PASS，其他失敗照判 FAIL。
+- OD-75：`tests/acceptance/python_baseline_defects.json` 登記的 Python daemon 基線缺陷，若平台、狀態與訊息特徵都符合，
+  該失敗維持 FAIL（不改 PASS／SKIP／BLOCKED-OWNER），另列「基線已知缺陷（不擋）」，不擋整體。未登記、只有 B 輪失敗、
+  特徵不符仍擋。A/B 同一 nodeid 兩輪都失敗且未登記者列「疑似基線問題，待分類」並照擋。登記損壞則整體 FAIL。
 - Windows COM（OD-15、計畫 04 §3 B1）：可執行 gate。`--windows-com` 缺席、目錄無 `windows-com.json` 或任何驗證不符 → evidence-insufficient（整體 FAIL）；明示 `windows_com: FAIL` → FAIL。不再列為 BLOCKED-OWNER。
 """
 from __future__ import annotations
@@ -34,6 +37,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import owner_gated  # noqa: E402  同目錄登記模組（擁有者機台相依 cargo 列）
+import python_baseline_defects  # noqa: E402  OD-75 基線缺陷登記
 
 
 def _normalize_case_id(cid: str) -> str:
@@ -392,6 +396,312 @@ def _pytest_nodes_junit_problems(nodes: list[str], pytest_cases_exact: dict[str,
         if outcomes != ["passed"]:
             problems.append(f"pytest JUnit 逐列對帳失敗：{nodeid} 出現 {len(outcomes)} 次，結果 {outcomes}（須恰一次且 passed）")
     return problems
+
+
+_BASELINE_KNOWN = "基線已知缺陷（不擋）"
+_BASELINE_PENDING = "疑似基線問題，待分類"
+_PYTEST_JUNIT_FAILURE = "pytest JUnit 報告含失敗或錯誤"
+_AB_NON_BLOCKING = frozenset({"ok", "rust-only-ok", "not-applicable"})
+_AB_FAIL = frozenset({"fail", "error"})
+_CASE_NON_BLOCKING = frozenset({"ok", "rust-only-ok", "PASS", "BLOCKED-OWNER", "not-applicable"})
+
+
+def _known_defect(
+    entry: python_baseline_defects.DefectEntry,
+    *,
+    kind: str,
+    ident: object,
+    platform: object,
+    status: object,
+    message: object,
+) -> dict[str, Any]:
+    return {
+        "defect_id": entry.defect_id,
+        "kind": kind,
+        "id": ident,
+        "platform": platform,
+        "status": status,
+        "message": message,
+        "root_cause": entry.root_cause,
+        "classification": _BASELINE_KNOWN,
+        "blocking": False,
+    }
+
+
+def _dedup_known(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    unique: list[dict[str, Any]] = []
+    for row in rows:
+        key = tuple(row.get(name) for name in ("defect_id", "kind", "id", "platform", "status", "message"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def _junit_failure_rows(path: Path | None) -> list[tuple[str, str, str]] | None:
+    """失敗或錯誤的 testcase：(exact key, failed|error, message)。讀不到回 None。"""
+    if path is None or not path.is_file():
+        return None
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    rows: list[tuple[str, str, str]] = []
+    for testcase in root.iter("testcase"):
+        failure = testcase.find("failure")
+        error = testcase.find("error")
+        element = failure if failure is not None else error
+        if element is None:
+            continue
+        status = "failed" if failure is not None else "error"
+        message = element.get("message") or element.text or ""
+        nodeid = testcase.get("nodeid")
+        key = (
+            _pytest_exact_key(nodeid) if nodeid
+            else _pytest_exact_key_from_junit(testcase.get("classname", ""), testcase.get("name", ""))
+        )
+        rows.append((key, status, message))
+    return rows
+
+
+def _suppress_registered_pytest_blanket(
+    errors: list[str],
+    path: Path | None,
+    registry: python_baseline_defects.Registry,
+) -> None:
+    """每一筆 JUnit 失敗都符合登記時，才拿掉整份失敗的概括錯誤。屬性有失敗但沒有元素時不拿。"""
+    if _PYTEST_JUNIT_FAILURE not in errors:
+        return
+    rows = _junit_failure_rows(path)
+    if not rows:
+        return
+    if not all(
+        registry.match_node(key, "linux", status, message) is not None
+        for key, status, message in rows
+    ):
+        return
+    errors.remove(_PYTEST_JUNIT_FAILURE)
+
+
+def _ab_side_message(row: dict[str, Any], side: str) -> str | None:
+    key = f"{side}_message"
+    if key in row and isinstance(row[key], str):
+        return row[key]
+    if side == "b" and isinstance(row.get("reason"), str):
+        return row["reason"]
+    return None
+
+
+def _find_ab_row(
+    nodeid: str,
+    ab_cases: dict[str, dict[str, Any]],
+    ab_cases_by_norm: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    if nodeid in ab_cases:
+        return ab_cases[nodeid]
+    found: list[dict[str, Any]] = []
+    seen: set[object] = set()
+    for key in (python_baseline_defects.normalize_nodeid(nodeid), _normalize_case_id(nodeid)):
+        for row in ab_cases_by_norm.get(key, []):
+            ident = row.get("id")
+            if ident in seen:
+                continue
+            seen.add(ident)
+            found.append(row)
+    if len(found) == 1:
+        return found[0]
+    return None
+
+
+def _match_ab_entry(
+    registry: python_baseline_defects.Registry,
+    row: dict[str, Any],
+    platform: str,
+    status: object,
+    message: str | None,
+) -> python_baseline_defects.DefectEntry | None:
+    if message is None or platform not in ("linux", "windows") or not isinstance(status, str):
+        return None
+    for ident in (row.get("id"), row.get("case")):
+        hit = registry.match_node(ident, platform, status, message)
+        if hit is not None:
+            return hit
+    return None
+
+
+def _ab_allows_pytest_exemption(
+    registry: python_baseline_defects.Registry,
+    entry: python_baseline_defects.DefectEntry,
+    nodeid: str,
+    ab_cases: dict[str, dict[str, Any]],
+    ab_cases_by_norm: dict[str, list[dict[str, Any]]],
+    ab_platform: str,
+) -> bool:
+    """沒有 A/B 列時，單一訊息符合即可。只有一輪失敗不豁免。兩輪都失敗須同一筆登記同時符合。"""
+    row = _find_ab_row(nodeid, ab_cases, ab_cases_by_norm)
+    if row is None:
+        return True
+    out_a = row.get("a")
+    out_b = row.get("b")
+    a_failed = out_a in _AB_FAIL
+    b_failed = out_b in _AB_FAIL
+    if b_failed and not a_failed:
+        return False
+    if a_failed and not b_failed:
+        return False
+    if a_failed and b_failed:
+        entry_a = _match_ab_entry(registry, row, ab_platform, out_a, _ab_side_message(row, "a"))
+        entry_b = _match_ab_entry(registry, row, ab_platform, out_b, _ab_side_message(row, "b"))
+        return entry_a is not None and entry_a is entry_b and entry_a is entry
+    return True
+
+
+def _l1_baseline_rows(
+    registry: python_baseline_defects.Registry,
+    *,
+    subfolder: str,
+    platform: str,
+    verdict: str,
+    judged: dict[str, Any],
+    junit_error: str | None,
+    junit_path: Path | None,
+    head: str | None,
+    ab_cases: dict[str, dict[str, Any]],
+    ab_cases_by_norm: dict[str, list[dict[str, Any]]],
+    ab_platform: str,
+) -> list[dict[str, Any]] | None:
+    """僅在 FAIL 完全來自已登記的 nodeid 時回傳列報；否則回 None（呼叫端照擋）。"""
+    if subfolder == "cargo" or verdict != "FAIL" or junit_error is not None:
+        return None
+    failed = [node for node in (judged.get("failed") or []) if isinstance(node, str)]
+    other_reasons = [item for item in judged.get("reasons", []) if not str(item).startswith("failed:")]
+    if not failed or other_reasons:
+        return None
+    if subfolder == "pytest-full" and junit_path is not None and junit_path.is_file():
+        try:
+            provenance = _junit_provenance_errors(ET.parse(junit_path).getroot(), head)
+        except (ET.ParseError, OSError):
+            return None
+        if provenance:
+            return None
+    parsed = _junit_failure_rows(junit_path)
+    if parsed is None:
+        return None
+    by_key: dict[str, list[tuple[str, str]]] = {}
+    for key, status, message in parsed:
+        by_key.setdefault(key, []).append((status, message))
+    rows: list[dict[str, Any]] = []
+    for nodeid in failed:
+        bucket = by_key.get(_pytest_exact_key(nodeid), [])
+        if len(bucket) != 1:
+            return None
+        status, message = bucket[0]
+        entry = registry.match_node(nodeid, platform, status, message)
+        if entry is None:
+            return None
+        if not _ab_allows_pytest_exemption(
+            registry, entry, nodeid, ab_cases, ab_cases_by_norm, ab_platform,
+        ):
+            return None
+        rows.append(_known_defect(
+            entry, kind="pytest", ident=nodeid, platform=platform, status=status, message=message,
+        ))
+    return rows
+
+
+def _classify_baseline_ab(
+    ab_cases: dict[str, dict[str, Any]],
+    ab_result: str,
+    ab_errors: list[Any],
+    ab_platform: str,
+    registry: python_baseline_defects.Registry,
+) -> tuple[set[str], list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """回傳豁免 id、不擋列、待分類列，以及 A/B 是否仍擋整體。"""
+    non_ok = [
+        row for row in ab_cases.values()
+        if isinstance(row, dict) and row.get("class") not in _AB_NON_BLOCKING
+    ]
+    exempt_ids: set[str] = set()
+    known: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    all_exempt = bool(non_ok)
+    for row in non_ok:
+        out_a = row.get("a")
+        out_b = row.get("b")
+        if out_a in _AB_FAIL and out_b in _AB_FAIL:
+            message_a = _ab_side_message(row, "a")
+            message_b = _ab_side_message(row, "b")
+            entry_a = _match_ab_entry(registry, row, ab_platform, out_a, message_a)
+            entry_b = _match_ab_entry(registry, row, ab_platform, out_b, message_b)
+            if entry_a is not None and entry_a is entry_b:
+                for ident in (row.get("id"), row.get("case")):
+                    if isinstance(ident, str) and ident:
+                        exempt_ids.add(ident)
+                        exempt_ids.add(python_baseline_defects.normalize_nodeid(ident))
+                known.append(_known_defect(
+                    entry_a, kind="ab", ident=row.get("id"), platform=ab_platform,
+                    status=out_a, message=message_a or "",
+                ))
+                known.append(_known_defect(
+                    entry_b, kind="ab", ident=row.get("id"), platform=ab_platform,
+                    status=out_b, message=message_b or "",
+                ))
+                continue
+            pending.append({
+                "id": row.get("id"),
+                "platform": ab_platform,
+                "a_status": out_a,
+                "b_status": out_b,
+                "a_message": message_a or "",
+                "b_message": message_b or "",
+                "classification": _BASELINE_PENDING,
+                "blocking": True,
+            })
+        all_exempt = False
+    blocks = ab_result != "pass" and not (all_exempt and non_ok and not ab_errors)
+    return exempt_ids, known, pending, blocks
+
+
+def _l15_baseline_rows(
+    case_rows: list[dict[str, Any]],
+    registry: python_baseline_defects.Registry,
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """狀態維持原判。每一條會擋的證據列都符合登記時，該案例不擋整體。"""
+    exempt: set[str] = set()
+    known: list[dict[str, Any]] = []
+    for case in case_rows:
+        if case.get("layer") != "L1.5" or case.get("status") in _CASE_NON_BLOCKING:
+            continue
+        evidence = case.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            continue
+        matched: list[tuple[python_baseline_defects.DefectEntry, dict[str, Any]]] = []
+        covered = True
+        for row in evidence:
+            if not isinstance(row, dict):
+                covered = False
+                break
+            if row.get("verdict") == "PASS" or _l15_row_na_only(row):
+                continue
+            entry = registry.match_l15(
+                case.get("id"), row.get("platform"), row.get("verdict"),
+                row.get("message"), row.get("harness_diagnostics"),
+            )
+            if entry is None:
+                covered = False
+                break
+            matched.append((entry, row))
+        if not covered or not matched:
+            continue
+        exempt.add(str(case.get("id")))
+        for entry, row in matched:
+            known.append(_known_defect(
+                entry, kind="l15", ident=case.get("id"), platform=row.get("platform"),
+                status=row.get("verdict"), message=row.get("message"),
+            ))
+    return exempt, known
 
 
 WINDOWS_COM_FORMAT = "windows-com-evidence.v1"
@@ -1009,10 +1319,13 @@ def judge_stage1a(
     windows_com_dir: Path | None = None,
     repo_root: Path | None = None,
     spike3_dir: Path | None = None,
+    baseline_defects_path: Path | None = None,
+    baseline_ledger_path: Path | None = None,
+    expected_head: str | None = None,
 ) -> int:
     if repo_root is None:
         repo_root = Path(__file__).resolve().parents[2]
-    head = _git_head(repo_root)
+    head = expected_head if expected_head else _git_head(repo_root)
 
     acc_dir = repo_root / "tests" / "acceptance"
     cases_yaml_path = acc_dir / "cases.yaml"
@@ -1021,6 +1334,16 @@ def judge_stage1a(
     coverage_path = repo_root / "tests" / "contract_blackbox" / "data" / "coverage_1a.json"
 
     errors: list[str] = []
+    known_defects: list[dict[str, Any]] = []
+    try:
+        registry = python_baseline_defects.load_for_gate(
+            repo_root,
+            registry_path=baseline_defects_path,
+            ledger_path=baseline_ledger_path,
+        )
+    except python_baseline_defects.BaselineDefectRegistryError as exc:
+        errors.append(f"Python daemon 基線缺陷登記無效：{exc}")
+        registry = python_baseline_defects.Registry(())
 
     # 1. 分母（cases.lock.json 與 coverage_1a.json）
     if not cases_lock_path.is_file():
@@ -1069,10 +1392,21 @@ def judge_stage1a(
     ab_cases: dict[str, dict[str, Any]] = {}
     ab_cases_by_norm: dict[str, list[dict[str, Any]]] = {}
     ab_result = "fail"
+    ab_errors: list[Any] = []
+    ab_platform = ""
     if ab_report_path and ab_report_path.is_file():
         try:
             ab_data = json.loads(ab_report_path.read_text(encoding="utf-8"))
+            if not isinstance(ab_data, dict):
+                raise ValueError("ab-report 不是 object")
             ab_result = ab_data.get("result", "fail")
+            raw_ab_errors = ab_data.get("errors", [])
+            ab_errors = raw_ab_errors if isinstance(raw_ab_errors, list) else [raw_ab_errors]
+            identity = ab_data.get("identity")
+            if isinstance(identity, dict) and isinstance(identity.get("a"), dict):
+                platform_name = identity["a"].get("platform")
+                if isinstance(platform_name, str):
+                    ab_platform = platform_name
             for c in ab_data.get("cases", []):
                 if isinstance(c, dict) and "id" in c:
                     ab_cases[c["id"]] = c
@@ -1105,6 +1439,7 @@ def judge_stage1a(
     pytest_cases = _pytest_junit_cases(pytest_junit_path, errors, head)
     # 逐列對帳用（保留參數化 id）；錯誤訊息已由上一次解析記錄，此處不重複加入。
     pytest_cases_exact = _pytest_junit_cases(pytest_junit_path, [], head, exact=True)
+    _suppress_registered_pytest_blanket(errors, pytest_junit_path, registry)
 
     # 5. Windows COM：--windows-com 指向 OutDir；逐項驗證 windows-com.json 與其引用的子證據。
     # OD-15：Windows COM 為可執行 gate，缺席即證據不足（FAIL），不是 BLOCKED-OWNER。
@@ -1471,9 +1806,9 @@ def judge_stage1a(
                         })
 
                 judged: dict[str, Any] = {}
+                junit_error: str | None = None
                 if judge_mod and hasattr(judge_mod, "judge"):
                     junit_dict = None
-                    junit_error: str | None = None
                     if subfolder == "blackbox":
                         # 與 pytest-full 同一計數慣例（testcase 層）；缺檔或不可解析為 None，維持原本「不做 junit 交叉核對」的語意。
                         try:
@@ -1544,9 +1879,28 @@ def judge_stage1a(
                             verdict = "evidence-insufficient"
                         reasons = reasons + [f"owner-gated 登記列缺席於報告：{owner_info['absent_expected']}"]
 
+                junit_path = pytest_junit_path if subfolder == "pytest-full" else (
+                    l1_results_dir / platform / subfolder / "junit.xml" if subfolder == "blackbox" else None
+                )
+                baseline_rows = _l1_baseline_rows(
+                    registry,
+                    subfolder=subfolder,
+                    platform=platform,
+                    verdict=verdict,
+                    judged=judged,
+                    junit_error=junit_error,
+                    junit_path=junit_path,
+                    head=head,
+                    ab_cases=ab_cases,
+                    ab_cases_by_norm=ab_cases_by_norm,
+                    ab_platform=ab_platform,
+                )
+                if baseline_rows is not None:
+                    known_defects.extend(baseline_rows)
+
                 if verdict == "BLOCKED-OWNER":
                     l1_blocked = True
-                elif verdict != "PASS":
+                elif verdict != "PASS" and baseline_rows is None:
                     l1_ok = False
 
                 l1_rows.append(
@@ -1562,8 +1916,16 @@ def judge_stage1a(
                 )
 
     # 11. 整體判定
+    l15_exempt, l15_known = _l15_baseline_rows(case_rows, registry)
+    known_defects.extend(l15_known)
+    ab_exempt, ab_known, pending_classification, ab_blocks = _classify_baseline_ab(
+        ab_cases, ab_result, ab_errors, ab_platform, registry,
+    )
+    known_defects.extend(ab_known)
+    known_defects = _dedup_known(known_defects)
+    exempt_ids = l15_exempt | ab_exempt
     has_case_fail = any(
-        r["status"] not in ("ok", "rust-only-ok", "PASS", "BLOCKED-OWNER", "not-applicable") for r in case_rows
+        r["status"] not in _CASE_NON_BLOCKING and r.get("id") not in exempt_ids for r in case_rows
     )
     if (
         errors
@@ -1572,7 +1934,7 @@ def judge_stage1a(
         or not invariants_ok
         or not l1_ok
         or windows_l1 != "PASS"
-        or ab_result != "pass"
+        or ab_blocks
         or windows_com in ("FAIL", "evidence-insufficient")
     ):
         overall = "FAIL"
@@ -1596,6 +1958,8 @@ def judge_stage1a(
         "windows_l1": windows_l1,
         "overall": overall,
         "errors": errors,
+        "baseline_known_defects": known_defects,
+        "baseline_pending_classification": pending_classification,
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1647,6 +2011,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--repo", type=Path, default=None, help="Repo 根目錄（預設自動推算）"
     )
+    parser.add_argument(
+        "--baseline-defects", type=Path, default=None,
+        help="OD-75 Python daemon 基線缺陷登記 JSON（預設 tests/acceptance/python_baseline_defects.json）",
+    )
+    parser.add_argument(
+        "--baseline-ledger", type=Path, default=None,
+        help="Stage 1 清單（須含 B 段）；未給時依環境變數或預設路徑",
+    )
+    parser.add_argument(
+        "--expected-head", default=None,
+        help="受測 revision。未給時用 repo_root 的 git HEAD。重判既有證據時傳該次 HEAD",
+    )
 
     args = parser.parse_args(argv)
     return judge_stage1a(
@@ -1659,6 +2035,9 @@ def main(argv: list[str] | None = None) -> int:
         windows_com_dir=args.windows_com,
         repo_root=args.repo,
         spike3_dir=args.spike3_evidence,
+        baseline_defects_path=args.baseline_defects,
+        baseline_ledger_path=args.baseline_ledger,
+        expected_head=args.expected_head,
     )
 
 

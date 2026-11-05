@@ -267,6 +267,8 @@ class GateTree:
         (self.root / "scripts" / "rust").mkdir(parents=True, exist_ok=True)
         shutil.copy2(GATE, self.root / "scripts" / "rust" / "stage1a_gate.py")
         shutil.copy2(ROOT / "scripts" / "rust" / "owner_gated.py", self.root / "scripts" / "rust" / "owner_gated.py")
+        shutil.copy2(ROOT / "scripts" / "rust" / "python_baseline_defects.py",
+                     self.root / "scripts" / "rust" / "python_baseline_defects.py")
         (self.root / "scripts" / "stage0").mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / "scripts" / "stage0" / "spike3_evidence.schema.json",
                      self.root / "scripts" / "stage0" / "spike3_evidence.schema.json")
@@ -276,6 +278,7 @@ class GateTree:
             shutil.copy2(ACC / "l1_judge.py", acc / "l1_judge.py")
         # junit 計數的唯一實作（P2 check_evidence_index._junit_counts）；閘門依路徑載入，缺檔即 fail-closed。
         shutil.copy2(ACC / "check_evidence_index.py", acc / "check_evidence_index.py")
+        shutil.copy2(ACC / "python_baseline_defects.json", acc / "python_baseline_defects.json")
         (acc / "cases.yaml").write_text(yaml.safe_dump({"schema_version": 1, "cases": self.cases}, allow_unicode=True),
                                         encoding="utf-8")
         if self.lock is not None:

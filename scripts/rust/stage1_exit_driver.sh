@@ -17,7 +17,9 @@
 #   - 自測報告以 tools/uart_stdio_bridge/APPROVED_REVISION.json 的 tree_sha256 挑選，找不到即 exit 非 0，不退回舊報告。
 #   - 報告路徑一律取工具自己印出的 run_id（win-test.sh、win-blackbox.sh、ab_blackbox.sh），不以 ls -t 猜測。
 #   - 每步記錄 rc（$EV/rc.txt）後繼續。結尾由 l15_exit_driver.py 做第二層判定：
-#     唯一核准的 win_l15_func_test 1 可不擋出口；摘要不是合法 JSON、缺少非負整數
+#     gate 已核准的 Windows 擁有者延後列（OD-30～OD-32）可解釋 win_l15_func_test 1。
+#     OD-75 已登記且訊息符合的 Python daemon 基線缺陷可解釋對應的 L1.5 producer rc 1
+#     （證據維持 FAIL，不改判 PASS 或 SKIP）。摘要不是合法 JSON、缺少非負整數
 #     failed_steps，或 failed_steps 非 0，即以非 0 結束。
 #
 # 可覆寫環境變數：
