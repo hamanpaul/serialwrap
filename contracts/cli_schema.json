@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/cli_schema.json",
   "title": "serialwrap CLI contract",
-  "x-catalog-revision": 9,
+  "x-catalog-revision": 10,
   "x-prog": "serialwrap",
   "x-conventions": {
     "params_source": "rpc.params 的值為來源：字串為該子命令 argparse namespace 的 dest，送出 args.<dest> 原值；\"selector|com\" 表示 args.selector or args.com（盤點 01 §6.6 stream tail、§6.7 log tail-raw／tail-text）；{\"$document\": \"file\"} 表示 --file 讀入的整份 JSON 物件即為 RPC params（event add）。",
