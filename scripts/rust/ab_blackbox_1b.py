@@ -584,7 +584,8 @@ def _record_approved_a_skip_environment(
 def _package_tree_sha256() -> str:
     """在子行程算 Python 套件樹雜湊：黑箱測試行程不得 import sw_core（conftest 的洩漏哨兵）。"""
     code = "from sw_core.release_manifest import package_tree_sha256 as f; print(f())"
-    return subprocess.check_output([sys.executable, "-c", code], cwd=ROOT, text=True).strip()
+    repo_root = Path(__file__).resolve().parents[2]  # 不用 ROOT：測試會把它換成暫存目錄
+    return subprocess.check_output([sys.executable, "-c", code], cwd=repo_root, text=True).strip()
 
 
 def _lock_applicability_sha256() -> str:
