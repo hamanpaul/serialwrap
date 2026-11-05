@@ -905,9 +905,11 @@ impl Parser<'_> {
     fn parse_hex_escape(&mut self, slash: usize, digits: usize) -> Result<char, CompileError> {
         let mut value = 0u32;
         // CPython `getwhile` 只取走符合的數字；不符的字元留在預讀位置，不算取走。
+        // 位數不足時，訊息是已取走的跳脫原文（`\x`、`\x4`、`\u12`、`\U0001`），位置在反斜線。
         for _ in 0..digits {
             let Some(d) = self.peek().and_then(|ch| ch.to_digit(16)) else {
-                return Err(self.error("incomplete escape \\x", Some(slash)));
+                let escape: String = self.chars[slash..self.pos].iter().collect();
+                return Err(self.error(&format!("incomplete escape {escape}"), Some(slash)));
             };
             self.pos += 1;
             value = value * 16 + d;
