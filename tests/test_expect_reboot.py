@@ -10,6 +10,13 @@ from __future__ import annotations
 import io
 import json
 import os
+
+import pytest
+
+# POSIX-only：本檔頂層 import pty、tty（→ termios），原生 Windows 沒有 termios，會在收集階段失敗。
+if os.name == "nt":
+    pytest.skip("expect-reboot 測試依賴 POSIX pty／termios", allow_module_level=True)
+
 import pty
 import select
 import threading

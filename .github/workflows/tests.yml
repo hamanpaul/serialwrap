@@ -27,7 +27,7 @@ jobs:
         # pyserial：讓 #84 PORT-1 的 pyserial 後端單元測試（_PySerialPort read/write/例外轉譯）
         # 在 Linux CI 亦可執行（生產 Linux 預設走 termios 後端，但 CI 需覆蓋 Windows 後端邏輯）。
         # jsonschema：contracts/ 契約測試（tests/test_contracts_*.py）以 Draft 2020-12 驗證 schema，僅 tests/ 使用。
-        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial jsonschema==4.10.3
+        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial jsonschema==4.10.3 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: 執行測試套件（預設安裝，無 re2 → fail-closed 拒絕 ReDoS 類）
         # 覆蓋 #91 預設安裝路徑（無 google-re2）：matcher 走標準 re、schema 對指數＋多項式
         # fail-closed 拒絕；re2 專屬測試以 importorskip 自動跳過。
@@ -652,7 +652,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: 安裝免驅動 Windows L1 相依
-        run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5
+        run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: 執行免驅動 Windows L1（含資源報告與 junit）
         env:
           SW_RESOURCE_REPORT: resource-report-windows.json
