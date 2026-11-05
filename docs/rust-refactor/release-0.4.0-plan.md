@@ -19,7 +19,19 @@
 python3 scripts/rust/l15_exit_driver.py --rejudge <evidence_dir>
 ```
 
-命令讀取 `<evidence_dir>/driver.log` 的 `GATE_ARGS` 與 `<evidence_dir>/HEAD`，以該次受測 revision 重跑 `scripts/rust/stage1a_gate.py`，並把新報告寫到暫存檔，不改證據目錄。stdout 是 JSON。`same_judgment` 為 true 且行程碼為 0，表示與該次存檔的 gate 判定相同（比對時略過新增的 `baseline_known_defects` 與 `baseline_pending_classification`）。行程碼 0 只表示與存檔判定相同。
+命令讀取 `<evidence_dir>/driver.log` 的 `GATE_ARGS` 與 `<evidence_dir>/HEAD`，以該次受測 revision 重跑 `scripts/rust/stage1a_gate.py`，並把新報告寫到暫存檔，不改證據目錄。另讀取 `rc.txt`，只在記憶體中將唯一的 `stage1a_gate` 步驟退出碼替換為重判退出碼，再執行第二層 producer 核對（含 Windows L1.5 報告與 metadata）。尾端 `DONE` 為 driver 結束標記，不視為測試步驟。
+
+stdout JSON 包含 `baseline_known_defects`、`baseline_pending_classification`、`rejudge_overall`、`rejudge_rc`、`failed_steps`、`unresolved`、`suppressed` 與 `exit_passed`。預設行程碼為 0 的條件是新 gate 通過且沒有未解釋的失敗步驟；新 gate 仍為 FAIL 時，命令回傳非 0。`same_judgment` 僅供比對存檔 gate（略過新增的兩個基線分類欄位），不決定預設退出碼。若只是確認空登記時與既有證據的判定相同，可用：
+
+```bash
+python3 scripts/rust/l15_exit_driver.py --rejudge <evidence_dir> --assert-same-judgment
+```
+
+此旗標以 `same_judgment` 決定退出碼；必須另外查看 `exit_passed`，不能把「相同的 FAIL」當成出口通過。缺少重判所需報告或登記損毀時仍回傳非 0。
+
+每個 rc=1 的 producer 都須有自己的完整原始報告，且全部失敗均符合登記與 gate 的不擋列，才列入 `suppressed`。Linux L1.5 依該步驟的 cases／scenarios 宣告逐案核對 repeat；pytest 的 resource report 仍由既有 `l1_judge.py` 判定，並與 JUnit 逐列核對；A/B 必須兩輪同一個精確 nodeid 都失敗且符合相同登記。參數、類別及路徑皆保留，不能以同函式其他參數的登記代替。證據內的 FAIL 不改寫。
+
+出口 driver 會保存 BB-proc 的 resource report 與 JUnit（`bbproc-multiagent-coexist/`、`bbproc-1b/`），並將本次 Stage 1B 的 `target/p4-evidence` 複製到 `<evidence_dir>/p4/`；目的地已存在（含符號連結）時拒絕保存並擋出口，避免混入舊報告。重判只讀該次快照，不借用後續 run 的 Stage 1B 報告。舊證據若沒有這些逐步報告，對應失敗維持擋住；只有一份 gate 核准列不足以解釋 producer 退出碼。
 
 ## 2. 發佈內容
 
