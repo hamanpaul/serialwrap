@@ -299,6 +299,21 @@ def unresolved_steps(
     return malformed + rows, suppressed
 
 
+def parse_failed_steps(summary_text: str) -> int:
+    """解析出口摘要。不是合法 JSON、不是 object，或 failed_steps 不是非負整數時拒絕。"""
+    try:
+        summary = json.loads(summary_text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("RC_SUMMARY 不是合法 JSON") from exc
+    if not isinstance(summary, dict) or "failed_steps" not in summary:
+        raise ValueError("RC_SUMMARY 缺少 failed_steps")
+    failed_steps = summary["failed_steps"]
+    # bool 是 int 的子類別，但不是步驟計數。
+    if isinstance(failed_steps, bool) or not isinstance(failed_steps, int) or failed_steps < 0:
+        raise ValueError("RC_SUMMARY 的 failed_steps 必須是非負整數")
+    return failed_steps
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     try:

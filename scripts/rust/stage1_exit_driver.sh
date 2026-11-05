@@ -16,7 +16,9 @@
 #   - 開頭檢查 git status 乾淨並記錄 HEAD；不改寫任何 tracked 檔（工具只寫 target/ 與 scratch 目錄）。
 #   - 自測報告以 tools/uart_stdio_bridge/APPROVED_REVISION.json 的 tree_sha256 挑選，找不到即 exit 非 0，不退回舊報告。
 #   - 報告路徑一律取工具自己印出的 run_id（win-test.sh、win-blackbox.sh、ab_blackbox.sh），不以 ls -t 猜測。
-#   - 每步記錄 rc（$EV/rc.txt）後繼續；最後任一步 rc 非 0 即以 1 結束。
+#   - 每步記錄 rc（$EV/rc.txt）後繼續。結尾由 l15_exit_driver.py 做第二層判定：
+#     唯一核准的 win_l15_func_test 1 可不擋出口；摘要不是合法 JSON、缺少非負整數
+#     failed_steps，或 failed_steps 非 0，即以非 0 結束。
 #
 # 可覆寫環境變數：
 #   RUN_ID               證據目錄名稱（預設 s1exit-<時間戳>）
@@ -416,15 +418,24 @@ main() {
   step tools_contracts python3 -m tools.contracts check
   step git_status_end bash -c 'git status --short; echo "HEAD=$(git rev-parse HEAD)"'
 
-  RC_SUMMARY="$(python3 scripts/rust/l15_exit_driver.py "$EV/rc.txt" "$EV/stage1a-gate.json" \
+  # l15 未捕捉例外時 stdout 可能是空的且行程非 0；空字串再經 [[ -eq 0 ]] 會被當成通過。
+  if ! RC_SUMMARY="$(python3 scripts/rust/l15_exit_driver.py "$EV/rc.txt" "$EV/stage1a-gate.json" \
     "$EV/func-test-windows/func-test-report.json" \
     "$EV/func-test-windows/basic/func-test-report.json" \
-    "$EV/func-test-windows/win-func-test-meta.json")"
+    "$EV/func-test-windows/win-func-test-meta.json")"; then
+    log "DRIVER DONE l15_exit_driver failed"
+    echo "DONE" >> "$EV/rc.txt"
+    return 1
+  fi
   log "RC_SUMMARY=$RC_SUMMARY"
-  rc_fail="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["failed_steps"])' <<<"$RC_SUMMARY")"
+  if ! rc_fail="$(PYTHONPATH="$REPO" python3 -c 'import sys; from scripts.rust.l15_exit_driver import parse_failed_steps; print(parse_failed_steps(sys.stdin.read()))' <<<"$RC_SUMMARY")"; then
+    log "DRIVER DONE invalid RC_SUMMARY"
+    echo "DONE" >> "$EV/rc.txt"
+    return 1
+  fi
   log "DRIVER DONE failed_steps=$rc_fail"
   echo "DONE" >> "$EV/rc.txt"
-  [[ "$rc_fail" -eq 0 ]]
+  [[ "$rc_fail" == "0" ]]
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
