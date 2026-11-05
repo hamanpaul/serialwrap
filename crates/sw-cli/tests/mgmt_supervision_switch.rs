@@ -319,24 +319,96 @@ fn supervision_set_idle_uses_handoff_not_daemon_stop() {
 }
 
 #[test]
+#[should_panic(expected = "passwd 家目錄不得指向測試行程的真實家目錄")]
+fn s1mx6e_passwd_home_refuses_process_home() {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .expect("外層 HOME 或 USERPROFILE 應存在，才能證明拒絕真實家目錄");
+    let _env = TestEnv::posix().with_passwd_home(std::path::Path::new(&home));
+}
+
+/// 與 x6c `snapshot_systemd_user_unit` 相同的三元組：存在性、mtime_ns、內容。
+/// 讀取失敗不得當成未變；此函式只讀，不建立也不改寫。
+fn snapshot_user_unit(path: &std::path::Path) -> (bool, Option<i128>, Option<Vec<u8>>) {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (false, None, None),
+        Err(err) => panic!(
+            "讀取 user unit 中繼資料失敗，不得當成未變：{}：{err}",
+            path.display()
+        ),
+    };
+    let bytes = std::fs::read(path).unwrap_or_else(|err| {
+        panic!(
+            "讀取 user unit 失敗，不得當成未變：{}：{err}",
+            path.display()
+        )
+    });
+    (true, Some(user_unit_mtime_ns(&meta)), Some(bytes))
+}
+
+fn user_unit_mtime_ns(meta: &std::fs::Metadata) -> i128 {
+    // 只用可攜的 modified()。cfg 與 std::os 會被 check_cfg_boundary 擋下。
+    // 讀取失敗必須失敗，不得把缺時間戳當成「未變」。
+    let modified = meta.modified().unwrap_or_else(|err| {
+        panic!("讀取 user unit mtime 失敗，不得當成未變：{err}")
+    });
+    let nanos = modified
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_else(|err| panic!("user unit mtime 早於 epoch，不得當成未變：{err}"));
+    i128::try_from(nanos.as_nanos()).unwrap_or_else(|err| {
+        panic!("user unit mtime 超出可比較範圍，不得當成未變：{err}")
+    })
+}
+
+fn process_user_unit() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .expect("外層 HOME 或 USERPROFILE 應存在，才能比對真實 user unit");
+    std::path::PathBuf::from(home).join(".config/systemd/user/serialwrap.service")
+}
+
+#[test]
 fn s1mx6_supervision_home_precedes_passwd() {
-    let passwd_home = std::path::PathBuf::from(
-        std::env::var_os("HOME").expect("外層 HOME 應保留真實家目錄"),
-    );
+    let real_unit = process_user_unit();
+    let real_before = snapshot_user_unit(&real_unit);
     let base = TestEnv::posix()
         .with_systemd(true)
-        .with_passwd_home(&passwd_home)
         .with_config("supervision_mode: on-demand\n");
+    // passwd 家目錄放在測試暫存根下，與隔離 HOME 並列；不得使用行程真實 HOME。
+    let passwd_home = base.home().with_file_name("passwd-home");
+    let base = base.with_passwd_home(&passwd_home);
     let isolated_home = base.home();
     assert_ne!(isolated_home, passwd_home, "測試 HOME 必須與 passwd 家目錄不同");
+    assert!(
+        passwd_home.starts_with(isolated_home.parent().expect("隔離 HOME 應位於暫存目錄")),
+        "passwd 家目錄必須在測試暫存目錄：{}",
+        passwd_home.display()
+    );
     let expected_unit = isolated_home.join(".config/systemd/user/serialwrap.service");
+    let passwd_unit = passwd_home.join(".config/systemd/user/serialwrap.service");
     let ep = base.default_socket();
     let t = base.with_idle_daemon(&ep, 4321);
 
     let (rc, out, _) = t.run(&["supervision-mode", "set", "systemd-user"]);
 
     assert_eq!(rc, 0, "{out}");
-    assert!(expected_unit.is_file(), "systemd-user unit 應寫入隔離 HOME：{}", expected_unit.display());
+    assert!(
+        expected_unit.is_file(),
+        "systemd-user unit 應寫入隔離 HOME：{}",
+        expected_unit.display()
+    );
+    assert!(
+        !passwd_unit.exists(),
+        "passwd 家目錄不得出現 systemd user unit：{}",
+        passwd_unit.display()
+    );
+    assert_eq!(
+        snapshot_user_unit(&real_unit),
+        real_before,
+        "真實 user unit 不得改變：{}",
+        real_unit.display()
+    );
 }
 
 #[test]
