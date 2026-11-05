@@ -79,7 +79,8 @@ class TestStaleShellNonceBeforeBanner(_AsyncRebootBase):
         self.assertTrue(session.boot_evidence_wait_active())
         remaining = session.to_public_dict()["boot_evidence_wait_remaining_s"]
         self.assertIsNotNone(remaining)
-        self.assertLessEqual(remaining, constants.BOOT_EVIDENCE_GRACE_S)
+        # remaining 由浮點相減而來，容許 1 微秒的數值誤差（hosted Windows 實測多 6e-14）
+        self.assertLessEqual(remaining, constants.BOOT_EVIDENCE_GRACE_S + 1e-6)
         self.assertGreater(remaining, constants.BOOT_EVIDENCE_GRACE_S - 5.0)
 
     def test_stale_shell_nonce_does_not_confirm_ready(self) -> None:

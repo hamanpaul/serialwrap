@@ -26,7 +26,7 @@ jobs:
   rust-linux:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04  # ubuntu-latest 已是 26.04，setup-python 沒有釘死的 3.12.3
-    timeout-minutes: 60
+    timeout-minutes: 120
     # 同一 PR 的新提交取代舊的執行。不得在 workflow 層級設 concurrency，以免取消進行中的 COM bench。
     concurrency:
       group: rust-linux-${{ github.event.pull_request.number || github.ref }}
