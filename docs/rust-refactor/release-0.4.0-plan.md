@@ -7,11 +7,19 @@
 
 | # | 條件 | 證據 |
 |---|---|---|
-| 1 | Stage 1 出口 gate：Stage 1A `stage1a_gate.py` overall 為 `VERIFIED`，或為 `IMPLEMENTED` 且只剩 OD-27～OD-32 明確允許的 `BLOCKED-OWNER`；Stage 1B 只剩同範圍擁有者項，沒有 FAIL／INSUFFICIENT | 出口 driver `scripts/rust/stage1_exit_driver.sh` 於最終 HEAD 的報告 |
+| 1 | Stage 1 出口 gate：Stage 1A `stage1a_gate.py` overall 為 `VERIFIED`，或為 `IMPLEMENTED` 且只剩 OD-27～OD-32 明確允許的 `BLOCKED-OWNER`；Stage 1B 只剩同範圍擁有者項，沒有未登記的 FAIL／INSUFFICIENT。OD-75 已登記且平台、狀態、訊息特徵都符合的 Python daemon 基線缺陷不擋出口，證據維持 FAIL（不改判 BLOCKED-OWNER、PASS 或 SKIP），gate 另列「基線已知缺陷（不擋）」 | 出口 driver `scripts/rust/stage1_exit_driver.sh` 於最終 HEAD 的報告 |
 | 2 | 全套 `python3 -m pytest -q tests/`、`cargo test --workspace`、`python3 -m tools.contracts check`、`python3 -m policy_check --repo .` 在 release HEAD 通過 | 同上 |
 | 3 | Linux 升級驗證（§4）在 release 候選 bundle 上兩種監管模式皆 PASS | `scripts/docker/run-upgrade.sh` 的 `<out>/<mode>/upgrade-report.json` |
 | 4 | §6 列的待擁有者裁決項已裁決（或擁有者明示接受以已知限制發佈） | `owner-decisions-2026-10-15.md` |
 | 5 | release workflow 已能產出 §2 的 bundle（RELEASE-TODO-01） | release PR 的 CI |
+
+已登記新的基線缺陷後，不必重跑出口測試，用該次證據目錄重判 gate：
+
+```bash
+python3 scripts/rust/l15_exit_driver.py --rejudge <evidence_dir>
+```
+
+命令讀取 `<evidence_dir>/driver.log` 的 `GATE_ARGS` 與 `<evidence_dir>/HEAD`，以該次受測 revision 重跑 `scripts/rust/stage1a_gate.py`，並把新報告寫到暫存檔，不改證據目錄。stdout 是 JSON。`same_judgment` 為 true 且行程碼為 0，表示與該次存檔的 gate 判定相同（比對時略過新增的 `baseline_known_defects` 與 `baseline_pending_classification`）。行程碼 0 只表示與存檔判定相同。
 
 ## 2. 發佈內容
 
