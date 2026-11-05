@@ -644,7 +644,7 @@ jobs:
     # 指令必須與鎖檔 selector.argv 一致（去掉 --junitxml 後逐字相同，P2-T13 審查修正）。
     if: github.event.action != 'labeled'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
