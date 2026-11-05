@@ -289,6 +289,8 @@ def compare_ab(
     for cid in sorted_case_ids:
         in_a = cid in cases_a
         in_b = cid in cases_b
+        a_message = cases_a[cid]["message"] if in_a else None
+        b_message = cases_b[cid]["message"] if in_b else None
 
         if not in_a and not in_b:
             cls = "required-missing"
@@ -305,8 +307,8 @@ def compare_ab(
         else:
             out_a = cases_a[cid]["outcome"]
             out_b = cases_b[cid]["outcome"]
-            msg_a = cases_a[cid]["message"]
-            msg_b = cases_b[cid]["message"]
+            msg_a = a_message or ""
+            msg_b = b_message or ""
             reason = msg_b or msg_a or ""
             case_name = cases_a[cid].get("case") or cases_b[cid].get("case") or _normalize_case_id(cid)
 
@@ -363,6 +365,8 @@ def compare_ab(
                 "a": out_a,
                 "b": out_b,
                 "reason": reason,
+                "a_message": a_message,
+                "b_message": b_message,
             }
         )
 

@@ -7,11 +7,31 @@
 
 | # | 條件 | 證據 |
 |---|---|---|
-| 1 | Stage 1 出口 gate：Stage 1A `stage1a_gate.py` overall 為 `VERIFIED`，或為 `IMPLEMENTED` 且只剩 OD-27～OD-32 明確允許的 `BLOCKED-OWNER`；Stage 1B 只剩同範圍擁有者項，沒有 FAIL／INSUFFICIENT | 出口 driver `scripts/rust/stage1_exit_driver.sh` 於最終 HEAD 的報告 |
+| 1 | Stage 1 出口 gate：Stage 1A `stage1a_gate.py` overall 為 `VERIFIED`，或為 `IMPLEMENTED` 且只剩 OD-27～OD-32 明確允許的 `BLOCKED-OWNER`；Stage 1B 只剩同範圍擁有者項，沒有未登記的 FAIL／INSUFFICIENT。OD-75 已登記且平台、狀態、訊息特徵都符合的 Python daemon 基線缺陷不擋出口，證據維持 FAIL（不改判 BLOCKED-OWNER、PASS 或 SKIP），gate 另列「基線已知缺陷（不擋）」 | 出口 driver `scripts/rust/stage1_exit_driver.sh` 於最終 HEAD 的報告 |
 | 2 | 全套 `python3 -m pytest -q tests/`、`cargo test --workspace`、`python3 -m tools.contracts check`、`python3 -m policy_check --repo .` 在 release HEAD 通過 | 同上 |
 | 3 | Linux 升級驗證（§4）在 release 候選 bundle 上兩種監管模式皆 PASS | `scripts/docker/run-upgrade.sh` 的 `<out>/<mode>/upgrade-report.json` |
 | 4 | §6 列的待擁有者裁決項已裁決（或擁有者明示接受以已知限制發佈） | `owner-decisions-2026-10-15.md` |
 | 5 | release workflow 已能產出 §2 的 bundle（RELEASE-TODO-01） | release PR 的 CI |
+
+已登記新的基線缺陷後，不必重跑出口測試，用該次證據目錄重判 gate：
+
+```bash
+python3 scripts/rust/l15_exit_driver.py --rejudge <evidence_dir>
+```
+
+命令讀取 `<evidence_dir>/driver.log` 的 `GATE_ARGS` 與 `<evidence_dir>/HEAD`，以該次受測 revision 重跑 `scripts/rust/stage1a_gate.py`，並把新報告寫到暫存檔，不改證據目錄。另讀取 `rc.txt`，只在記憶體中將唯一的 `stage1a_gate` 步驟退出碼替換為重判退出碼，再執行第二層 producer 核對（含 Windows L1.5 報告與 metadata）。尾端 `DONE` 為 driver 結束標記，不視為測試步驟。
+
+stdout JSON 包含 `baseline_known_defects`、`baseline_pending_classification`、`rejudge_overall`、`rejudge_rc`、`failed_steps`、`unresolved`、`suppressed` 與 `exit_passed`。預設行程碼為 0 的條件是新 gate 通過且沒有未解釋的失敗步驟；新 gate 仍為 FAIL 時，命令回傳非 0。`same_judgment` 僅供比對存檔 gate（略過新增的兩個基線分類欄位），不決定預設退出碼。若只是確認空登記時與既有證據的判定相同，可用：
+
+```bash
+python3 scripts/rust/l15_exit_driver.py --rejudge <evidence_dir> --assert-same-judgment
+```
+
+此旗標以 `same_judgment` 決定退出碼；必須另外查看 `exit_passed`，不能把「相同的 FAIL」當成出口通過。缺少重判所需報告或登記損毀時仍回傳非 0。
+
+每個 rc=1 的 producer 都須有自己的完整原始報告，且全部失敗均符合登記與 gate 的不擋列，才列入 `suppressed`。Linux L1.5 依該步驟的 cases／scenarios 宣告逐案核對 repeat；pytest 的 resource report 仍由既有 `l1_judge.py` 判定，並與 JUnit 逐列核對；A/B 必須兩輪同一個精確 nodeid 都失敗且符合相同登記。參數、類別及路徑皆保留，不能以同函式其他參數的登記代替。證據內的 FAIL 不改寫。
+
+出口 driver 會保存 BB-proc 的 resource report 與 JUnit（`bbproc-multiagent-coexist/`、`bbproc-1b/`），並將本次 Stage 1B 的 `target/p4-evidence` 複製到 `<evidence_dir>/p4/`；目的地已存在（含符號連結）時拒絕保存並擋出口，避免混入舊報告。重判只讀該次快照，不借用後續 run 的 Stage 1B 報告。舊證據若沒有這些逐步報告，對應失敗維持擋住；只有一份 gate 核准列不足以解釋 producer 退出碼。
 
 ## 2. 發佈內容
 
