@@ -210,15 +210,16 @@ scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
 
 #### Upgrading from 0.3.x (pipx)
 
-Run the new `install.sh`; no pipx step is needed. Stop the 0.3.x daemon first
-with `serialwrap daemon stop` (TODO(OD-48): this step will be revisited once
-upgrading with the 0.3.2 daemon still running is implemented). Setup takes
-over the `~/.local/bin/serialwrap` and `serialwrapd` entries, keeps
-`config.yaml`, profiles and `state.json`, and does not start a daemon that was
-stopped: start it with `serialwrap service start` (systemd) or
-`serialwrap daemon start` (on-demand), then run `serialwrap doctor`. When an
-old pipx install is detected, the installer prints a hint that you may run
-`pipx uninstall serialwrap`; it never removes it automatically.
+Run the new `install.sh` directly; no pipx step is needed. You can upgrade
+while the 0.3.x daemon is still running by passing the current supervision
+mode explicitly (`--user`, `--system --with-sudo`, or `--on-demand`). Stopping
+first with `serialwrap daemon stop` is also fine, but setup does not start a
+daemon that was already stopped: start it with `serialwrap service start`
+(systemd) or `serialwrap daemon start` (on-demand), then run
+`serialwrap doctor`. Setup takes over the `~/.local/bin/serialwrap` and
+`serialwrapd` entries and keeps `config.yaml`, profiles and `state.json`.
+When an old pipx install is detected, the installer prints a hint that you may
+run `pipx uninstall serialwrap`; it never removes it automatically.
 
 For chained or self-rebooting commands such as `firstboot -y && reboot` or
 `sysupgrade ...`, use `cmd submit --expect-reboot` (RPC
@@ -1872,7 +1873,7 @@ serialwrap doctor                # 驗證環境
 - `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
 - 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
-- 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。升級前請先 `serialwrap daemon stop`（TODO(OD-48)：0.3.2 daemon 執行中直接升級的行為實作後再更新此步驟）。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`，且不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
+- 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
 - **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.3.2`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
