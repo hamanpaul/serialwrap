@@ -26,6 +26,7 @@ import random
 import sys
 import types
 from pathlib import Path
+from unittest import mock
 
 # 將 scripts/rust/goldens 目錄加入 sys.path 以載入 _tsv.py
 _DIR = Path(__file__).resolve().parent
@@ -60,9 +61,7 @@ def patched_environ(values: dict[str, str]):
 @contextlib.contextmanager
 def fake_pwd_table():
     """以假的 pwd 表取代 ``pwd.getpwnam``／``getpwuid``，使 posixpath.expanduser 的 ``~user`` 結果固定。"""
-    import pwd
-
-    saved = (pwd.getpwnam, pwd.getpwuid)
+    pwd = types.ModuleType("pwd")
 
     def getpwnam(name: str):
         if name == "bob":
@@ -73,10 +72,9 @@ def fake_pwd_table():
         return types.SimpleNamespace(pw_dir="/golden/pw-home")
 
     pwd.getpwnam, pwd.getpwuid = getpwnam, getpwuid
-    try:
+    # Windows 沒有 pwd；oracle 原本就使用固定表，以模組替身保留同一份 POSIX 語意。
+    with mock.patch.dict(sys.modules, {"pwd": pwd}):
         yield
-    finally:
-        pwd.getpwnam, pwd.getpwuid = saved
 
 # ---------------------------------------------------------------------------
 # 1. pycompat.tsv 產生器

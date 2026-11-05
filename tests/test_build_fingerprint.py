@@ -299,6 +299,8 @@ def setup_env(tmp_path, monkeypatch):
 
     state = {"reachable": True, "flashing": False, "daemon_fp": _STALE_FP,
              "fp_after_restart": _INSTALLED_FP, "restarts": 0}
+    # 行程生命週期也用同一份替身狀態；Windows 無 PID 時的真實探測會回 unknown。
+    monkeypatch.setattr("sw_core.multi_open.daemon_process_alive", lambda pid, endpoint: state["reachable"])
     fx_holder: dict = {}
 
     def make_fx(*, active=("user",), system=True):
