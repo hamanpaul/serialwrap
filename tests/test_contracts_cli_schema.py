@@ -810,3 +810,38 @@ def test_doctor_and_profile_test_always_exit_0():
     assert by_context["profile test"]["failure"] == 0, (
         f"profile test 的 failure exit code 必須為 0，實際為 {by_context['profile test']['failure']}"
     )
+
+
+# e8aa5aa6 寫入的 --expect-reboot 說明。當時 x-catalog-revision 停在 7。
+_EXPECT_REBOOT_HELP = (
+    "明示此命令會重開機（如 `firstboot -y && reboot`、`sysupgrade`）："
+    "不管命令文字一律走 reboot 路徑；不可與 --mode interactive 併用"
+)
+# 4f27ea12 之後為 7；e8aa5aa6 漏 +1；a494670c 與 ac9e0e0c 各只為自己的修改 +1。補上漏計後至少為 10。
+_EXPECT_REBOOT_HELP_MIN_REVISION = 7 + 1 + 1 + 1
+
+
+def _expect_reboot_help(node: object) -> str | None:
+    """回傳 schema 內 `--expect-reboot` 的 x-option-help 文字。"""
+    if isinstance(node, dict):
+        help_map = node.get("x-option-help")
+        if isinstance(help_map, dict) and "--expect-reboot" in help_map:
+            text = help_map["--expect-reboot"]
+            return text if isinstance(text, str) else None
+        for value in node.values():
+            found = _expect_reboot_help(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _expect_reboot_help(item)
+            if found is not None:
+                return found
+    return None
+
+
+def test_expect_reboot_help_catalog_revision_counts_e8aa5aa():
+    """S1-e8aa5aa-3：修改 cli_schema 的說明文字必須計入 x-catalog-revision。"""
+    schema = _schema()
+    assert _expect_reboot_help(schema) == _EXPECT_REBOOT_HELP
+    assert schema["x-catalog-revision"] >= _EXPECT_REBOOT_HELP_MIN_REVISION
