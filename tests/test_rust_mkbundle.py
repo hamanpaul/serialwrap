@@ -487,6 +487,55 @@ def test_windows_target_is_rejected_before_build(tmp_path):
     assert not cargo_called.exists()
 
 
+def _cargo_feature_names(recorded: str) -> list[str]:
+    """從 fake cargo 逐行記錄的 argv 取出 `--features` 的 feature 名稱。"""
+    argv = recorded.splitlines()
+    names: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--features":
+            assert index + 1 < len(argv), recorded
+            names.extend(part for part in argv[index + 1].split(",") if part)
+            index += 2
+            continue
+        prefix = "--features="
+        if arg.startswith(prefix):
+            names.extend(part for part in arg[len(prefix):].split(",") if part)
+        index += 1
+    return names
+
+
+def _enables_test_fakes(name: str) -> bool:
+    return name == "test-fakes" or name.endswith("/test-fakes")
+
+
+def _assert_release_cargo_omits_test_fakes(recorded: str) -> None:
+    """正式配方不得啟用 test-fakes。
+
+    mkbundle 傳的是分開的 `--features` 與 `test-fakes` 兩個參數，整段 argv
+    不會出現 `sw-cli/test-fakes` 這個字串；只搜那個字串時，加回 feature 仍會通過。
+    """
+    names = _cargo_feature_names(recorded)
+    assert not any(_enables_test_fakes(name) for name in names), recorded
+    assert "sw-cli/test-fakes" not in recorded
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        "build\n-p\nsw-cli\n-p\nsw-daemon\n--features\ntest-fakes\n--release\n",
+        "build\n-p\nsw-cli\n--features=test-fakes\n--release\n",
+        "build\n-p\nsw-cli\n--features\nsw-pal/test-fakes,test-fakes\n--release\n",
+    ],
+)
+def test_release_feature_guard_rejects_test_fakes_feature_args(recorded: str):
+    """舊守門只找 `sw-cli/test-fakes` 字串；feature 分成獨立 argv 時必須仍失敗。"""
+    assert "sw-cli/test-fakes" not in recorded
+    with pytest.raises(AssertionError):
+        _assert_release_cargo_omits_test_fakes(recorded)
+
+
 def test_release_bundle_build_does_not_enable_test_fakes(tmp_path):
     """正式 bundle 的 cargo invocation 不得啟用 setup 故障注入 feature。"""
     fake_bin = tmp_path / "fake-bin"
@@ -511,7 +560,7 @@ def test_release_bundle_build_does_not_enable_test_fakes(tmp_path):
 
     assert cargo_args.is_file(), result.stderr
     args = cargo_args.read_text(encoding="utf-8")
-    assert "sw-cli/test-fakes" not in args
+    _assert_release_cargo_omits_test_fakes(args)
     assert "--release" in args
     assert result.returncode != 0, "fake cargo 未產生 binaries，後續 bundle 組裝應 fail-closed"
 
