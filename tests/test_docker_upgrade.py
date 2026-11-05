@@ -1152,7 +1152,8 @@ def test_release_plan_accepts_only_real_stage1_gate_outcomes():
     plan = (REPO / "docs" / "rust-refactor" / "release-0.4.0-plan.md").read_text(encoding="utf-8")
     assert "`stage1a_gate.py` overall PASS" not in plan
     assert "VERIFIED" in plan and "IMPLEMENTED" in plan
-    assert "沒有 FAIL／INSUFFICIENT" in plan
+    # OD-75：只放行已登記且符合特徵的 Python daemon 基線缺陷，未登記的失敗照擋
+    assert "沒有未登記的 FAIL／INSUFFICIENT" in plan
 
 
 @pytest.mark.posix_only
