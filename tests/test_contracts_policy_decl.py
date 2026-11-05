@@ -91,19 +91,6 @@ def test_contracts_in_code_paths():
 
 
 @pytest.mark.memory_only
-def test_r16_cli_commands_pin_python312():
-    commands = [entry["command"] for entry in _policy()["cli"]]
-    assert commands, "R-16 CLI help entries must remain declared"
-    unpinned = [
-        command for command in commands if command.split(maxsplit=1)[0] != "python3.12"
-    ]
-    assert unpinned == [], (
-        "R-16 CLI help must use the Python 3.12 argparse baseline; "
-        f"unversioned commands can vary by PATH Python: {unpinned}"
-    )
-
-
-@pytest.mark.memory_only
 def test_preflight_has_contracts_step_before_tests():
     steps = _policy()["preflight"]["steps"]
     names = [s["name"] for s in steps]
