@@ -1,0 +1,6 @@
+取自 release bundle 的 `versions/0.4.0/py/pyvenv.cfg`。
+
+home = /usr/bin
+include-system-site-packages = false
+version = 3.12.3
+executable = /usr/bin/python3.12

@@ -107,6 +107,11 @@ scripts/docker/run-upgrade.sh --mode systemd-user --bundle <release bundle 目�
   - `--scenario install-sh` 兩模式各 12 項 **PASS**。
   - 7 份報告的 `bundle_manifest_sha256` 與 wheel 雜湊相同。證據於 `evidence/stage1/upgrade-docker/install-sh-a20de1d/`，含 `on-demand-run2`／`on-demand-run3`；driver 修正前的判定由 `install-sh-407ed7e` 取代。
   - 同為開發中 bundle，不取代前置條件 #3。
+- REL-040-r2 release 候選重跑（2026-11-05，分支 `feature/s1m-rel040`，來源與 bundle revision `29772118e099a972b38169c816f57e57e27ff9d9`，run `rel040-29772118`）：由 `run-upgrade.sh` 以 `/usr/bin/python3.12` 3.12.3 建立同一份 `--release-bundle --profile release --version-override 0.4.0` bundle，三模式依序以前景執行；沒有測試失敗，故未重跑。三份報告的 `bundle_manifest_sha256` 均為 `07c073a0805a1c83554a7d7d7b2b4c18eefbcead9fd46fb4bbf531f2ce122332`，0.3.2 wheel 雜湊均為 `ba7eb2a93afea17305a3a3f974548da7e824ce3de53a8432c43d88a2367208ef`。runtime `pyvenv.cfg` 為 `home = /usr/bin`、`include-system-site-packages = false`；內層 `SHA256SUMS` 1,196 項全數通過，release `bin/serialwrap`／`bin/serialwrapd` 未找到 `SERIALWRAP_TEST_`、`SW_TEST_UPDATE_PAUSE_AFTER`、`SW_TEST_UPDATE_FORCE_VERIFY_FAIL` 標記。
+  - systemd-user：19/19 **PASS**；legacy handoff 使用 `systemctl_stop`、等待 5,178 ms；1,158 次 `no_two_reader` 取樣、0 次重疊。
+  - on-demand：19/19 **PASS**；legacy handoff 使用 `rpc_daemon_stop`、等待 5,446 ms；1,174 次取樣、0 次重疊。
+  - systemd-system：計畫限定的 direct-setup 範圍 13/13 **PASS**；legacy handoff 使用 `systemctl_stop`、等待 5,073 ms；1,344 次取樣、0 次重疊。`legacy_handoff_direct_setup` 三模式均確認舊行程樹結束且新 0.4.0 daemon 由 setup 啟動。
+  - 證據（3 份原始 `upgrade-report.json`、過濾後的 `bundle-pyvenv.txt`、`SHA256SUMS`）位於 `evidence/stage1/upgrade-docker/rel040-29772118/`；`test_upgrade_evidence_only_container_home_paths` 1 passed。§6 補列本輪觀察到的既有 systemd-system 行為。
 
 ### 4.2 Windows（LOCAL-WINDOWS-TODO）
 
@@ -148,6 +153,10 @@ release 後於已安裝 0.3.2 的其他電腦（含接有真板者）以 release
 | OBS-UPGRADE-NOT-STARTED | 使用者先停 daemon 再 setup 時，setup 的 `start_and_verify` 為 `daemon_was_not_running`、不啟動新 daemon | 需手動 `service start`／`daemon start` | 規格行為（維持原執行狀態），release notes 明寫 |
 | OBS-UPGRADE-STALE-CURRENT | 手動降級後 `current-release.json` 仍記 0.4.0；重新升級被記為 `0.4.0→0.4.0` update、Previous 指向 0.4.0 本身 | 重新升級本身成功；但之後的 `setup --rollback` 不會回到 0.3.2 | **已知限制（OD-49）**，與 OBS-UPGRADE-ROLLBACK-PIPX 一併列入 release notes；殘留 current 的 0.3.2 daemon 由 OD-48 的 `op=update` 路徑同樣處理 |
 | OBS-0.3.2-ONDEMAND-START | 0.3.2 在 pipx 安裝下 on-demand `daemon start` 必然 `DAEMON_EXITED`（以 site-packages 上一層的 `serialwrapd.py` 啟動，wheel 不含該檔） | 0.3.2 既有缺陷，0.4.0 以 DF-05 定位順序（manifest launcher）修正 | release notes 記為「0.4.0 修正」；升級測試以 pipx 的 `serialwrapd` 入口背景啟動 0.3.2 並記為觀察項 |
+| OBS-0.3.2-SYSTEM-UMASK | 0.3.2 system unit 的 `UMask=0117` 使 daemon 自建目錄缺少搜尋權限，可能觸發 `ensure_runtime_dirs`／`ttyMCU` `PermissionError`；本輪 warm-up 的 `warmup_rc=124` 照報告保留 | 舊版 systemd-system 安裝需先建立 runtime 目錄 | 0.3.2 既有行為；driver 以 swtest 一般 umask 暖機。本輪 systemd-system 的 13 項必要檢查仍逐項記為 PASS，未把 warm-up 退出碼改判為檢查結果 |
+| OBS-SYSTEM-PROFILES-MANAGED | system setup 會以套件 profiles 覆寫 `/etc/serialwrap/profiles` 同名檔，與 0.3.2 語意相同；本輪 `default.yaml` 記為 `package_updated` | system 管理的 profile 以新 bundle 內容為準 | 依 OD-48 後續判定保留完整快照，只允許套件權威內容更新；本輪記為既有行為，未改產品碼 |
+
+2026-11-05 REL-040-r2 三模式 release 候選重跑沒有意外的 `FAIL`／`INSUFFICIENT`，也沒有觸發同條件重跑；本表保留的觀察與 OD-49 已知限制照原狀記錄，未更改判定。
 
 ## 7. release notes 草稿
 
