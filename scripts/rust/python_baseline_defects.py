@@ -98,17 +98,14 @@ def _harness_stop_failed(diagnostics: object) -> bool:
 
 
 def normalize_nodeid(nodeid: str) -> str:
-    """路徑或 dotted classname 收成 `檔名.py::其餘`，保留 `[param]`。"""
+    """轉成 JUnit 的完整 classname::name，保留目錄、類別與參數。"""
     base, bracket, params = nodeid.partition("[")
-    if "::" not in base:
+    names = base.split("::")
+    if len(names) < 2:
         return nodeid
-    head, tail = base.split("::", 1)
-    name = Path(head).name
-    if name.endswith(".py"):
-        module = name
-    else:
-        module = f"{head.split('.')[-1]}.py"
-    return f"{module}::{tail}{bracket}{params}"
+    path = names[0].removeprefix("./").removesuffix(".py").replace("/", ".")
+    classname = ".".join([path, *names[1:-1]])
+    return f"{classname}::{names[-1]}{bracket}{params}"
 
 
 def nodeids_equal(registered: str, observed: str) -> bool:

@@ -18,7 +18,7 @@
 #   - 報告路徑一律取工具自己印出的 run_id（win-test.sh、win-blackbox.sh、ab_blackbox.sh），不以 ls -t 猜測。
 #   - 每步記錄 rc（$EV/rc.txt）後繼續。結尾由 l15_exit_driver.py 做第二層判定：
 #     gate 已核准的 Windows 擁有者延後列（OD-30～OD-32）可解釋 win_l15_func_test 1。
-#     OD-75 已登記且訊息符合的 Python daemon 基線缺陷可解釋對應的 L1.5 producer rc 1
+#     OD-75 已登記且訊息符合的 Python daemon 基線缺陷可解釋對應的 L1／L1.5 producer rc 1
 #     （證據維持 FAIL，不改判 PASS 或 SKIP）。摘要不是合法 JSON、缺少非負整數
 #     failed_steps，或 failed_steps 非 0，即以非 0 結束。
 #
@@ -76,6 +76,14 @@ ok = isinstance(report, dict) and report.get("verdict") == "PASS" \
     and report.get("tmp_isolation") == "mount-ns-private-tmp"
 sys.exit(0 if ok else 1)
 PY
+}
+
+# 保存 Stage 1B 原始報告；目的地已存在（含符號連結）即拒絕，避免混入先前 run。
+snapshot_p4_evidence() {
+  if [[ -e "$2" || -L "$2" ]]; then
+    return 1
+  fi
+  cp -a "$1" "$2"
 }
 
 # printed_path <步驟名> <ERE>：取出工具輸出中符合的最後一個路徑（即工具自己報告的 run_id 路徑）。
@@ -306,7 +314,9 @@ main() {
     --out "$EV/l1/linux/cargo/resource-report.json" -- --workspace --all-features
   fresh_or_fail cargo_l1_linux_1a "$EV/l1/linux/cargo/resource-report.json"
   step bbproc_multiagent_coexist env SERIALWRAP_CLI_EXE="$DEV_BUNDLE/bin/serialwrap" \
-    python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py
+    SW_RESOURCE_REPORT="$EV/bbproc-multiagent-coexist/resource-report.json" \
+    python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py \
+    --junitxml="$EV/bbproc-multiagent-coexist/junit.xml"
   step l15_linux_bridge env SERIALWRAP_CLI_EXE="$DEV_BUNDLE/bin/serialwrap" \
     python3 func-test/runner.py --mode bridge --selftest-report "$SELFTEST_LINUX_PATH" --report-dir "$EV/func-test"
   step l15_linux_bridge_scenarios env SERIALWRAP_CLI_EXE="$DEV_BUNDLE/bin/serialwrap" \
@@ -354,7 +364,9 @@ main() {
     --out "$P4/l1/linux/cargo/resource-report.json" -- --workspace
   fresh_or_fail cargo_l1_linux_1b "$P4/l1/linux/cargo/resource-report.json"
   step bbproc_1b env SERIALWRAP_CLI_EXE="$SW_BUNDLE/bin/serialwrap" \
-    python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py
+    SW_RESOURCE_REPORT="$EV/bbproc-1b/resource-report.json" \
+    python3 -m pytest -q tests/test_multiagent_e2e.py tests/test_human_agent_coexist.py \
+    --junitxml="$EV/bbproc-1b/junit.xml"
   step l15_linux_1b_bridge env SERIALWRAP_CLI_EXE="$SW_BUNDLE/bin/serialwrap" \
     python3 func-test/runner.py --mode bridge --selftest-report "$SELFTEST_LINUX_PATH" \
     --report-dir "$P4/l15-linux"
@@ -397,6 +409,8 @@ main() {
     --linux-cli "$SW_BUNDLE/bin/serialwrap" --linux-unit-junit "$P4/l1/linux/20groups/junit.xml" \
     --l1-dir "$P4/l1" --windows-cli "$WIN_CLI" --windows-unit-junit "$WIN_UNIT_JUNIT"
   step check_p4_cases python3 scripts/rust/check_p4_cases.py --check
+  # 保存本次 producer 原始報告；重判不得讀取其後被其他 run 覆寫的 target/p4-evidence。
+  step baseline_evidence_snapshot snapshot_p4_evidence "$P4" "$EV/p4"
 
   # 唯一一次完整 pytest（同一 HEAD；JUnit 與 resource report 於 1B 登記之後產生）。
   step pytest_full_junit env PYTHONPATH=scripts/rust SW_REQUIRE_CARGO=1 \

@@ -348,17 +348,19 @@ def _pytest_junit_cases(path: Path | None, errors: list[str],
     for suite in root.iter("testsuite"):
         try:
             if int(suite.attrib.get("failures", 0)) or int(suite.attrib.get("errors", 0)):
-                errors.append("pytest JUnit 報告含失敗或錯誤")
+                if _PYTEST_JUNIT_FAILURE not in errors:
+                    errors.append(_PYTEST_JUNIT_FAILURE)
                 report_failed = True
-                break
         except (TypeError, ValueError):
             errors.append("pytest JUnit 報告的失敗計數無效")
             report_failed = True
-            break
 
     testcases = list(root.iter("testcase"))
     if any(testcase.find("failure") is not None or testcase.find("error") is not None for testcase in testcases):
         report_failed = True
+        if _PYTEST_JUNIT_FAILURE not in errors:
+            errors.append(_PYTEST_JUNIT_FAILURE)
+    unexplained_failure = report_failed and not _junit_failures_accounted(root)
 
     for testcase in testcases:
         nodeid = testcase.get("nodeid")
@@ -373,7 +375,7 @@ def _pytest_junit_cases(path: Path | None, errors: list[str],
             case_id = _normalize_case_id(f"{testcase.get('classname', '')}::{testcase.get('name', '')}")
         if not case_id:
             continue
-        if report_failed or testcase.find("failure") is not None or testcase.find("error") is not None:
+        if unexplained_failure or testcase.find("failure") is not None or testcase.find("error") is not None:
             outcome = "failed"
         elif testcase.find("skipped") is not None:
             outcome = "skipped"
@@ -466,10 +468,27 @@ def _junit_failure_rows(path: Path | None) -> list[tuple[str, str, str]] | None:
     return rows
 
 
+def _junit_failures_accounted(root: ET.Element) -> bool:
+    """每個 suite 宣告的 failure/error 數都須與其 testcase 元素一致。"""
+    for suite in root.iter("testsuite"):
+        for attribute, tag in (("failures", "failure"), ("errors", "error")):
+            try:
+                declared = int(suite.get(attribute, "0"))
+            except (TypeError, ValueError):
+                return False
+            actual = sum(tc.find(tag) is not None for tc in suite.iter("testcase"))
+            if declared < 0 or declared != actual:
+                return False
+    return True
+
+
 def _suppress_registered_pytest_blanket(
     errors: list[str],
     path: Path | None,
     registry: python_baseline_defects.Registry,
+    ab_cases: dict[str, dict[str, Any]],
+    ab_cases_by_norm: dict[str, list[dict[str, Any]]],
+    ab_platform: str,
 ) -> None:
     """每一筆 JUnit 失敗都符合登記時，才拿掉整份失敗的概括錯誤。屬性有失敗但沒有元素時不拿。"""
     if _PYTEST_JUNIT_FAILURE not in errors:
@@ -477,11 +496,14 @@ def _suppress_registered_pytest_blanket(
     rows = _junit_failure_rows(path)
     if not rows:
         return
-    if not all(
-        registry.match_node(key, "linux", status, message) is not None
-        for key, status, message in rows
-    ):
+    if path is None or not _junit_failures_accounted(ET.parse(path).getroot()):
         return
+    for key, status, message in rows:
+        entry = registry.match_node(key, "linux", status, message)
+        if entry is None or not _ab_allows_pytest_exemption(
+            registry, entry, key, ab_cases, ab_cases_by_norm, ab_platform,
+        ):
+            return
     errors.remove(_PYTEST_JUNIT_FAILURE)
 
 
@@ -499,17 +521,8 @@ def _find_ab_row(
     ab_cases: dict[str, dict[str, Any]],
     ab_cases_by_norm: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any] | None:
-    if nodeid in ab_cases:
-        return ab_cases[nodeid]
-    found: list[dict[str, Any]] = []
-    seen: set[object] = set()
-    for key in (python_baseline_defects.normalize_nodeid(nodeid), _normalize_case_id(nodeid)):
-        for row in ab_cases_by_norm.get(key, []):
-            ident = row.get("id")
-            if ident in seen:
-                continue
-            seen.add(ident)
-            found.append(row)
+    found = [row for row in ab_cases.values() if isinstance(row.get("id"), str)
+             and python_baseline_defects.nodeids_equal(row["id"], nodeid)]
     if len(found) == 1:
         return found[0]
     return None
@@ -524,11 +537,7 @@ def _match_ab_entry(
 ) -> python_baseline_defects.DefectEntry | None:
     if message is None or platform not in ("linux", "windows") or not isinstance(status, str):
         return None
-    for ident in (row.get("id"), row.get("case")):
-        hit = registry.match_node(ident, platform, status, message)
-        if hit is not None:
-            return hit
-    return None
+    return registry.match_node(row.get("id"), platform, status, message)
 
 
 def _ab_allows_pytest_exemption(
@@ -542,7 +551,12 @@ def _ab_allows_pytest_exemption(
     """沒有 A/B 列時，單一訊息符合即可。只有一輪失敗不豁免。兩輪都失敗須同一筆登記同時符合。"""
     row = _find_ab_row(nodeid, ab_cases, ab_cases_by_norm)
     if row is None:
-        return True
+        # 同函式的候選存在卻不能精確對應時，不得把歧義當成沒有 A/B 證據。
+        norm = _normalize_case_id(_pytest_exact_key(nodeid))
+        return not ab_cases_by_norm.get(norm) and not any(
+            _normalize_case_id(_pytest_exact_key(str(r.get("id", "")))) == norm
+            for r in ab_cases.values()
+        )
     out_a = row.get("a")
     out_b = row.get("b")
     a_failed = out_a in _AB_FAIL
@@ -636,10 +650,7 @@ def _classify_baseline_ab(
             entry_a = _match_ab_entry(registry, row, ab_platform, out_a, message_a)
             entry_b = _match_ab_entry(registry, row, ab_platform, out_b, message_b)
             if entry_a is not None and entry_a is entry_b:
-                for ident in (row.get("id"), row.get("case")):
-                    if isinstance(ident, str) and ident:
-                        exempt_ids.add(ident)
-                        exempt_ids.add(python_baseline_defects.normalize_nodeid(ident))
+                exempt_ids.add(row["id"])
                 known.append(_known_defect(
                     entry_a, kind="ab", ident=row.get("id"), platform=ab_platform,
                     status=out_a, message=message_a or "",
@@ -1439,7 +1450,7 @@ def judge_stage1a(
     pytest_cases = _pytest_junit_cases(pytest_junit_path, errors, head)
     # 逐列對帳用（保留參數化 id）；錯誤訊息已由上一次解析記錄，此處不重複加入。
     pytest_cases_exact = _pytest_junit_cases(pytest_junit_path, [], head, exact=True)
-    _suppress_registered_pytest_blanket(errors, pytest_junit_path, registry)
+    _suppress_registered_pytest_blanket(errors, pytest_junit_path, registry, ab_cases, ab_cases_by_norm, ab_platform)
 
     # 5. Windows COM：--windows-com 指向 OutDir；逐項驗證 windows-com.json 與其引用的子證據。
     # OD-15：Windows COM 為可執行 gate，缺席即證據不足（FAIL），不是 BLOCKED-OWNER。
@@ -1657,7 +1668,9 @@ def judge_stage1a(
                 passed = False
                 if _is_rust_pytest_case(c):
                     outcomes = pytest_cases.get(_normalize_case_id(c), [])
-                    passed = bool(outcomes) and all(outcome == "passed" for outcome in outcomes)
+                    # 未分類的全套失敗仍拒收安全不變量；OD-75 完整登記後才依各列結果採信。
+                    passed = (_PYTEST_JUNIT_FAILURE not in errors and bool(outcomes)
+                              and all(outcome == "passed" for outcome in outcomes))
                 elif (c in ab_cases and ab_cases[c].get("class") in ("ok", "rust-only-ok")) or \
                    (c in ab_cases_by_norm and all(r.get("class") in ("ok", "rust-only-ok") for r in ab_cases_by_norm[c])):
                     passed = True
@@ -1807,6 +1820,7 @@ def judge_stage1a(
 
                 judged: dict[str, Any] = {}
                 junit_error: str | None = None
+                junit_row_problems: list[str] = []
                 if judge_mod and hasattr(judge_mod, "judge"):
                     junit_dict = None
                     if subfolder == "blackbox":
@@ -1828,9 +1842,12 @@ def judge_stage1a(
                     strict = set_id == PYTEST_FULL_SET
                     # 逐列對帳：totals 相同的過期報告不得與新 JUnit 湊成 PASS；每個必要 nodeid 須在通過 provenance
                     # 驗證的 JUnit（pytest_cases，已排除 provenance 不符者）中恰出現一次且為 passed。
-                    junit_row_problems: list[str] = []
-                    if strict and v_raw == "PASS" and junit_dict is not None:
-                        junit_row_problems = _pytest_nodes_junit_problems(required_nodes, pytest_cases_exact)
+                    if strict and v_raw in ("PASS", "FAIL") and junit_dict is not None:
+                        # 已登記失敗亦不得遮住其餘必要節點的缺列、重複或非 passed。
+                        failed_nodes = set(judged.get("failed") or []) if v_raw == "FAIL" else set()
+                        passing_required = [n for n in required_nodes if n not in failed_nodes]
+                        if passing_required:
+                            junit_row_problems = _pytest_nodes_junit_problems(passing_required, pytest_cases_exact)
                     if v_raw == "PASS" and junit_error is None and (junit_dict is not None or not strict) and not junit_row_problems:
                         verdict = "PASS"
                     elif v_raw == "FAIL":
@@ -1895,6 +1912,8 @@ def judge_stage1a(
                     ab_cases_by_norm=ab_cases_by_norm,
                     ab_platform=ab_platform,
                 )
+                if junit_row_problems:
+                    baseline_rows = None
                 if baseline_rows is not None:
                     known_defects.extend(baseline_rows)
 
@@ -1923,9 +1942,16 @@ def judge_stage1a(
     )
     known_defects.extend(ab_known)
     known_defects = _dedup_known(known_defects)
-    exempt_ids = l15_exempt | ab_exempt
+    def case_exempt(row: dict[str, Any]) -> bool:
+        if row.get("layer") != "L1":
+            return row.get("id") in l15_exempt
+        evidence = row.get("evidence")
+        rows = evidence if isinstance(evidence, list) else [evidence]
+        failing = [r for r in rows if isinstance(r, dict) and r.get("class") not in _AB_NON_BLOCKING]
+        return bool(failing) and all(r.get("id") in ab_exempt for r in failing)
+
     has_case_fail = any(
-        r["status"] not in _CASE_NON_BLOCKING and r.get("id") not in exempt_ids for r in case_rows
+        r["status"] not in _CASE_NON_BLOCKING and not case_exempt(r) for r in case_rows
     )
     if (
         errors

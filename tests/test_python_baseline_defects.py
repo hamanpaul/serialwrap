@@ -331,16 +331,21 @@ def test_exit_driver_suppresses_registered_windows_l15_failure(monkeypatch, tmp_
 def test_exit_driver_suppresses_registered_linux_l15_producer(monkeypatch, tmp_path):
     _use(monkeypatch, tmp_path, [{
         "defect_id": "B1",
-        "l15_case_id": "brcm-01-login-flow",
+        "l15_case_id": "l15-reboot-min-guard",
         "platform": "linux",
         "allowed_statuses": ["FAIL"],
         "message_regex": re.escape(MARKER),
         "root_cause": "Python daemon 基線已知缺陷",
         "od75_basis": "OD-75 已登記缺陷不擋出口",
     }])
+    report_path = tmp_path / "func-test-scenarios" / "func-test-report.json"
+    report_path.parent.mkdir()
+    report_path.write_text(json.dumps(_windows_l15_report([
+        {"case_id": "l15-reboot-min-guard", "verdict": "FAIL", "message": MARKER},
+    ])), encoding="utf-8")
     unresolved, suppressed = l15_exit_driver.unresolved_steps(
         "l15_linux_bridge_scenarios 1\nstage1a_gate 0\n",
-        _baseline_l15_gate("brcm-01-login-flow", "linux"),
+        _baseline_l15_gate("l15-reboot-min-guard", "linux"), evidence_dir=tmp_path,
     )
     assert unresolved == []
     assert suppressed == [{"step": "l15_linux_bridge_scenarios", "rc": 1}]
