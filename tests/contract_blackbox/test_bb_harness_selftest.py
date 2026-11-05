@@ -298,10 +298,9 @@ def test_standalone_rejects_foreign_platform_before_fixtures(monkeypatch, host, 
         module.pytest_runtest_setup(item)
 
 
-@pytest.mark.posix_only
-def test_ci_sandbox_hides_host_processes_and_runtime(tmp_path):
-    """CI 使用同一個沙箱入口；驗證 PID namespace 與 runtime，並拒絕寫入 worktree 外。"""
-    import os
+@pytest.fixture
+def bubblewrap():
+    """只探測沙箱能力；不接觸 Docker 或宿主執行期。"""
     import shutil
     import subprocess
 
@@ -313,8 +312,32 @@ def test_ci_sandbox_hides_host_processes_and_runtime(tmp_path):
     )
     if capability.returncode != 0:
         pytest.skip(f"cap bubblewrap namespace：{capability.stderr.strip()}")
+    return shutil.which("bwrap")
 
-    root = Path(__file__).resolve().parents[2]
+
+@pytest.fixture
+def clean_sandbox_checkout():
+    """在本 worktree 內建立尚無 target 的最小 checkout，避免依賴先前 Cargo 建置。"""
+    import shutil
+    import tempfile
+
+    source_root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(prefix=".sandbox-probe-", dir=source_root) as directory:
+        root = Path(directory)
+        script = root / "scripts" / "rust" / "blackbox_sandbox.sh"
+        script.parent.mkdir(parents=True)
+        shutil.copyfile(source_root / "scripts" / "rust" / "blackbox_sandbox.sh", script)
+        assert not (root / "target").exists()
+        yield root
+
+
+@pytest.mark.posix_only
+def test_ci_sandbox_hides_host_processes_and_runtime(tmp_path, bubblewrap, clean_sandbox_checkout):
+    """乾淨 checkout 亦須可執行探針，並維持 PID、runtime 與唯讀根目錄防線。"""
+    import os
+    import subprocess
+
+    root = clean_sandbox_checkout
     script = root / "scripts" / "rust" / "blackbox_sandbox.sh"
     probe = tmp_path / "sandbox_probe.py"
     probe.write_text(
@@ -338,6 +361,7 @@ def test_ci_sandbox_hides_host_processes_and_runtime(tmp_path):
     )
     # 外層 /tmp 不會出現在新沙箱；探針以 stdin 傳入，成果只寫 worktree 內。
     writable = root / "target" / f"sandbox-probe-{os.getpid()}.txt"
+    writable.parent.mkdir(parents=True, exist_ok=True)
     child_env = dict(os.environ, SW_SANDBOX_WRITABLE=str(writable))
     try:
         result = subprocess.run(
@@ -348,6 +372,23 @@ def test_ci_sandbox_hides_host_processes_and_runtime(tmp_path):
         assert writable.read_text(encoding="utf-8") == "ok"
     finally:
         writable.unlink(missing_ok=True)
+
+
+@pytest.mark.posix_only
+def test_ci_sandbox_reports_missing_docker_socket(bubblewrap):
+    """缺少 socket 時須回證據不足 exit 3，且不能執行要求的命令。"""
+    import subprocess
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "rust" / "blackbox_sandbox.sh"
+    result = subprocess.run(
+        [bubblewrap, "--ro-bind", "/", "/", "--tmpfs", "/run",
+         "--unshare-pid", "--proc", "/proc", "--die-with-parent",
+         "bash", str(script), "--with-docker", "printf", "forbidden-command"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert result.stderr == "缺少 Docker Unix socket，證據不足\n"
+    assert result.stdout == ""
 
 
 @pytest.mark.core_portable

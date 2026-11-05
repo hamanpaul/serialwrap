@@ -6,8 +6,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 socket_args=()
 if [[ "${1:-}" == "--with-docker" ]]; then
     # 只供 CI 的 L1.5 測試明確啟用；預設不暴露宿主 Docker 或 systemd socket。
-    docker_socket="$(readlink -e /var/run/docker.sock)"
-    [[ -S "$docker_socket" ]] || { echo '缺少 Docker Unix socket，證據不足' >&2; exit 3; }
+    if ! docker_socket="$(readlink -e /var/run/docker.sock)" || [[ ! -S "$docker_socket" ]]; then
+        echo '缺少 Docker Unix socket，證據不足' >&2
+        exit 3
+    fi
     socket_args=(--ro-bind "$docker_socket" /run/docker.sock)
     shift
 fi
