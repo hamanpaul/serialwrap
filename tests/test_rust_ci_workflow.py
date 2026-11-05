@@ -28,9 +28,12 @@ RUST_LINUX_REQUIRED_COMMANDS = [
     "SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py",
     "scripts/rust/mkbundle.sh --dev --out target/dev-bundle",
     (
+        "SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json "
         "SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap "
-        "SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox "
-        "--confcutdir=tests/contract_blackbox -p no:cacheprovider"
+        "SERIALWRAP_AB_LABEL=rust-1a bash scripts/rust/blackbox_sandbox.sh --with-docker "
+        "python3 -m pytest -q tests/contract_blackbox "
+        "--confcutdir=tests/contract_blackbox -p no:cacheprovider "
+        "--junitxml=target/ci-blackbox/junit.xml"
     ),
     (
         "SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap "
@@ -123,6 +126,21 @@ def test_rust_linux_job_ordered_commands():
                 found = True
                 break
         assert found, f"命令 {cmd!r} 未在 rust-linux steps 中依序找到"
+
+
+def test_rust_linux_job_rejects_blackbox_without_sandbox(monkeypatch):
+    """工作流程若改回直接跑黑箱，命令順序檢查必須拒絕，不能丟失隔離要求。"""
+    doc = _load_yaml(RUST_YML)
+    sandbox = "bash scripts/rust/blackbox_sandbox.sh --with-docker "
+    matches = [
+        step for step in doc["jobs"]["rust-linux"]["steps"]
+        if sandbox in step.get("run", "")
+    ]
+    assert len(matches) == 1, "黑箱須只有一個明確的沙箱入口"
+    matches[0]["run"] = matches[0]["run"].replace(sandbox, "", 1)
+    monkeypatch.setitem(globals(), "_load_yaml", lambda path: doc)
+    with pytest.raises(AssertionError, match="未在 rust-linux steps 中出現"):
+        test_rust_linux_job_ordered_commands()
 
 
 def test_rust_windows_hosted_job():

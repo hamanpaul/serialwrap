@@ -51,7 +51,7 @@ jobs:
       - name: "安裝 Windows GNU 連結器（gcc-mingw-w64-x86-64）"
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64
+          sudo apt-get install -y gcc-mingw-w64-x86-64 bubblewrap python3.12 python3.12-venv
       - name: "安裝 Python 相依（PyYAML、pytest、jsonschema）"
         run: python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3
       - name: "架構邊界：cfg 邊界檢查"
@@ -68,11 +68,32 @@ jobs:
         run: python3 scripts/rust/gen_error_codes.py --check
       - name: "Rust 相關 pytest（SW_REQUIRE_CARGO=1：缺 cargo 即 FAIL，不得 SKIP）"
         run: SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence  # P4 證據測試見 tests.yml 註解
+      - name: "準備與 Ubuntu Docker 相同 base 路徑的黑箱 Python"
+        # 與 release／run-upgrade 一致；setup-python 的 /opt/hostedtoolcache 不存在於 systemd 容器。
+        run: |
+          expected="$(python3 -I -c 'import json; print(json.load(open("contracts/cli_help/_meta.json"))["python_version"])')"
+          actual="$(/usr/bin/python3.12 -I -c 'import platform; print(platform.python_version())')"
+          test "$actual" = "$expected"
+          /usr/bin/python3.12 -m venv target/ci-system-python
+          target/ci-system-python/bin/python3 -m pip install --disable-pip-version-check pyyaml==6.0.3 pytest==9.0.3 jsonschema==4.10.3
       - name: "建置 Stage 1A 開發 bundle"
-        run: scripts/rust/mkbundle.sh --dev --out target/dev-bundle
+        run: PATH="$PWD/target/ci-system-python/bin:$PATH" scripts/rust/mkbundle.sh --dev --out target/dev-bundle
       - name: "黑箱契約 harness（Rust CLI 輪，tests/contract_blackbox）"
         run: |
-          SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox --confcutdir=tests/contract_blackbox -p no:cacheprovider
+          # Ubuntu 24.04 hosted runner 的 AppArmor 預設限制非特權 namespace；只在此一次性 VM 開放。
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          mkdir -p target/ci-blackbox
+          export PATH="$PWD/target/ci-system-python/bin:$PATH"
+          SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap SERIALWRAP_AB_LABEL=rust-1a bash scripts/rust/blackbox_sandbox.sh --with-docker python3 -m pytest -q tests/contract_blackbox --confcutdir=tests/contract_blackbox -p no:cacheprovider --junitxml=target/ci-blackbox/junit.xml
+      - name: "保存黑箱 A/B 與 L1.5 systemd 診斷"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-linux-blackbox-diagnostics
+          path: |
+            target/ci-blackbox
+            target/systemd-evidence-kept
+          if-no-files-found: warn
       - name: "L1.5 核心 smoke（sm-01-attach-to-ready，PTY 外部模式）"
         # 依賴 P2 的 func-test/runner.py 外部模式（--mode pty）；P2 未合併前此步驟會因未知參數失敗，
         # 屬「證據不足」缺口，不得以 continue-on-error 放行。

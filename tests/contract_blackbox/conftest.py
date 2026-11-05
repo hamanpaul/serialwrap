@@ -149,6 +149,8 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     # applicability.json 的鍵 "posix_only" 為原因 SKIP，比較器才會判為合法的不適用。
     if item.get_closest_marker("posix_only") and os.name == "nt":
         pytest.skip("posix_only")
+    if item.get_closest_marker("windows_native") and os.name != "nt":
+        pytest.skip("windows_native：須於原生 Windows 執行（證據不足，非 PASS）")
     if item.get_closest_marker("rust_only"):
         from bb_harness import is_rust
         if not is_rust():
