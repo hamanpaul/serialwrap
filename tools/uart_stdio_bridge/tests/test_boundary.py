@@ -54,7 +54,8 @@ def test_import_all_modules_without_product():
         "import sys; sys.path.insert(0, sys.argv[1]);"
         "import pkgutil, importlib, uart_stdio_bridge as p;"
         "[importlib.import_module(m.name) for m in pkgutil.walk_packages(p.__path__, 'uart_stdio_bridge.')"
-        " if not m.name.endswith('.__main__') and (not m.name.endswith('.win_serial') or sys.platform == 'win32')];"
+        " if not m.name.endswith('.__main__') and (not m.name.endswith('.win_serial') or sys.platform == 'win32')"
+        " and (not m.name.endswith('.posix_pty') or sys.platform != 'win32')];"
         "bad=[m for m in sys.modules if m=='sw_core' or m.startswith('sw_core.')];"
         "print(bad); raise SystemExit(1 if bad else 0)"
     )
