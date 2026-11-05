@@ -24,3 +24,12 @@
 | s1x-b-fixes-report-20261029.md §5（既有碼待辦） | S1X-b-X1 | crates/sw-proto/src/pyre | 樣式以單獨 `\` 結尾時 CPython tokenizer 預讀的 `bad escape (end of pattern)` 優先於前一 token 錯誤（如 `[z\A\`、`a\8\`、`(?P<\`），Rust 回報前一 token；影響 `profile test` 的 error 文字 | ★（對外 JSON 欄位） | 待處理 |
 | S1-109f659-2 | Low | sw_core OD-63 佔位：template 已移除且舊板永久離線時，沒有 RPC／CLI 出口可移除佔位 | 候選 (a) `session bind` 目標 by_id 在線時佔位 retire 並交 dynamic；(b) 追認已知限制並寫明處置（加回 template 名後 `device attach`，或停 daemon 改 state.json） | Stage 3 |
 | S1X-a-既有碼-revoke_tx_op | Low | `revoke_tx_op`：取消落在 interactive TX 完成後時一併撤銷 `interactive:<lease_id>`，lease 之後持續回 `SESSION_BUSY` | 先以 Python 實測確認可達性，再定修法或開 issue | Stage 3 |
+| S1-607ea76-1 | Low | `run_upgrade_container.py` 手動降級 stop 等待逾時後仍可能執行後續 pipx／setup | 2026-11-05 自 Stage 1 清單 D10 移入 | 待處理 |
+| S1-607ea76-2 | Low | `release-0.4.0-plan.md` 舊證據取代方向描述文字顛倒 | 同上 | 待處理 |
+| S1-607ea76-3 | Low | `run_upgrade_container.py` 部分 driver 讀取混用固定 `/proc` 與 `proc_root` | 同上 | 待處理 |
+| S1-607ea76-4 | Low | Windows 測試替身以 Timer 刪除目錄，可能遭遇檔案分享競態 | 同上 | 待處理 |
+| S1-ed46551-1 | Low | `run-upgrade.sh` dry-run 在重用 `--bundle` 時仍列出自建步驟 | 同上 | 待處理 |
+| S1-ed46551-2 | Low | 系統 Python 版本與 build venv 基底的 fail-closed 路徑缺少指定回歸測試 | 同上 | 待處理 |
+| S1-ed46551-3 | Low | `require_system_python` 未先檢查 `venv` 與 `ensurepip` 模組可用性 | 同上 | 待處理 |
+| 既有碼-support-imports | Low | `crates/sw-cli/tests/support/mod.rs` 4 處未使用 import 警告 | 審查 78cbc7a3_d929cac4 | 待處理 |
+| 既有碼-win-test-warnings | Low | `crates/sw-pal/tests/osstr.rs`、`process_ctl.rs` Windows 交叉編譯警告 | 審查 f59ce805_b70bb35f | 待處理 |
