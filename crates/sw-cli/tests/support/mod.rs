@@ -401,6 +401,21 @@ impl TestEnv {
         self.push_env_op(Box::new(move |b| b.var(&k, &v)))
     }
 
+    /// 持有 passwd 對照夾具的獨立暫存目錄，直到呼叫端完成路徑／內容斷言。
+    /// Windows 預設 TEMP 在 USERPROFILE 下，runner 因此另給 worktree 根目錄；
+    /// HOME、state 等其他夾具仍使用原生暫存磁碟，不經 WSL UNC 的鎖或 symlink。
+    pub fn passwd_home_fixture(&self) -> tempfile::TempDir {
+        let root = std::env::var_os("SW_TEST_PASSWD_FIXTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.tmp_dir.path().to_path_buf());
+        let fixture = tempfile::Builder::new()
+            .prefix("passwd-home-")
+            .tempdir_in(root)
+            .expect("passwd 對照夾具目錄建立失敗");
+        assert_passwd_home_sandboxed(&fixture.path().join("passwd-home"));
+        fixture
+    }
+
     /// 設定與隔離 `HOME` 不同的 passwd 家目錄，用於驗證 HOME 優先序。
     ///
     /// 拒絕測試行程的真實家目錄及其子路徑。`EventFs` 的寫入落到真實檔案系統；

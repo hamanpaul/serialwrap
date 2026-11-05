@@ -375,13 +375,14 @@ fn s1mx6_supervision_home_precedes_passwd() {
     let base = TestEnv::posix()
         .with_systemd(true)
         .with_config("supervision_mode: on-demand\n");
-    // passwd 家目錄放在測試暫存根下，與隔離 HOME 並列；不得使用行程真實 HOME。
-    let passwd_home = base.home().with_file_name("passwd-home");
+    // passwd 對照檔使用獨立持有的暫存根；不得使用行程真實 HOME。
+    let passwd_fixture = base.passwd_home_fixture();
+    let passwd_home = passwd_fixture.path().join("passwd-home");
     let base = base.with_passwd_home(&passwd_home);
     let isolated_home = base.home();
     assert_ne!(isolated_home, passwd_home, "測試 HOME 必須與 passwd 家目錄不同");
     assert!(
-        passwd_home.starts_with(isolated_home.parent().expect("隔離 HOME 應位於暫存目錄")),
+        passwd_home.starts_with(passwd_fixture.path()),
         "passwd 家目錄必須在測試暫存目錄：{}",
         passwd_home.display()
     );
@@ -540,7 +541,8 @@ fn s1mx6_unit_hold_ignores_xdg() {
             .with_systemd(true)
             .with_var("USER", "alice")
             .with_supervisor_state("systemd-user", true, true);
-        let passwd_home = base.home().with_file_name("passwd-home");
+        let passwd_fixture = base.passwd_home_fixture();
+        let passwd_home = passwd_fixture.path().join("passwd-home");
         let xdg = base.home().with_file_name("xdg-config");
         let base = base.with_passwd_home(&passwd_home);
         let base = if with_xdg {

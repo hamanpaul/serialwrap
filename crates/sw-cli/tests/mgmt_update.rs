@@ -1993,7 +1993,8 @@ fn s1mx6b2_real_systemd_update_hold_recovers_only_owned_dropin() {
 fn s1mx6_unit_snapshot_restore_ignores_xdg() {
     for with_xdg in [false, true] {
         let base = TestEnv::posix();
-        let passwd_home = base.home().with_file_name("passwd-home");
+        let passwd_fixture = base.passwd_home_fixture();
+        let passwd_home = passwd_fixture.path().join("passwd-home");
         let xdg = base.home().with_file_name("xdg-config");
         let base = base.with_passwd_home(&passwd_home);
         let base = if with_xdg {
