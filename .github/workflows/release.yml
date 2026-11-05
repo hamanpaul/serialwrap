@@ -209,10 +209,16 @@ jobs:
           version_dir="$root/versions/${VERSION}"
 
           actual="$("$root/bin/serialwrap" --version)"
-          if [ "$actual" != "serialwrap ${VERSION}" ]; then
-            echo "::error::bin/serialwrap --version printed '${actual}', expected 'serialwrap ${VERSION}'"
-            exit 1
-          fi
+          # 與 Python 基線相同：只接受精確版本，或附帶 12 位小寫十六進位指紋的整行。
+          python3 - "$actual" "$VERSION" <<'PY'
+          import re
+          import sys
+
+          actual, version = sys.argv[1:]
+          pattern = rf"serialwrap {re.escape(version)}(?: \(code [0-9a-f]{{12}}\))?"
+          if re.fullmatch(pattern, actual) is None:
+              raise SystemExit(f"::error::bin/serialwrap --version printed {actual!r}, expected 'serialwrap {version}' or 'serialwrap {version} (code <12 lowercase hex>)'")
+          PY
           "$root/bin/serialwrap" --help > /dev/null
 
           manifest="$version_dir/release-manifest.json"
