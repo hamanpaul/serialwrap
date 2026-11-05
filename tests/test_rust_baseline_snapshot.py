@@ -30,4 +30,3 @@ def test_snapshot_refuses_old_evidence_without_overwriting(tmp_path, existing):
                            "snapshot", str(origin), str(dest)], capture_output=True)
     assert proc.returncode == (0 if existing == "absent" else 1)
     assert (dest / "report.json").read_text() == ("new" if existing == "absent" else "old")
-
