@@ -150,7 +150,7 @@ jobs:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
         run: |
-          cargo test --workspace
+          cargo test --workspace --no-fail-fast
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: "原生 release 建置與匯入 DLL allowlist 檢查"
         shell: pwsh
