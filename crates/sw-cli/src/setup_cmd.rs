@@ -1365,6 +1365,11 @@ fn stop_old(
     Ok(())
 }
 
+/// User unit 固定放在已解析的 HOME 下；一般設定仍依各自的 XDG／SERIALWRAP 覆寫規則。
+pub(crate) fn systemd_user_unit_path(home: &Path) -> PathBuf {
+    home.join(".config/systemd/user/serialwrap.service")
+}
+
 fn start_new(
     ctx: &mut CliCtx<'_>,
     req: &ReconcileRequest,
@@ -1374,7 +1379,7 @@ fn start_new(
     match req.target_mode {
         SupervisionMode::OnDemand => {}
         SupervisionMode::SystemdUser => {
-            let unit = req.home.join(".config/systemd/user/serialwrap.service");
+            let unit = systemd_user_unit_path(&req.home);
             write_asset(
                 ctx,
                 &unit,
@@ -1664,9 +1669,13 @@ fn daemon_code_value(assessment: &DaemonCodeAssessment, action: DaemonRestartAct
 }
 
 /// 驗證 restart 後 daemon 首次可連線時回報的程式碼指紋。
+///
+/// 每一輪都重新解析本機 endpoint，對齊 Python `_verify_daemon_code_after_restart`
+/// 內的 `_resolve_local_endpoint_info`（忽略 `--bench`，`--endpoint`／`--socket` 仍優先）。
+/// reconcile 可能已把 `config.yaml` 的 socket 寫成 canonical；不得沿用 reconcile 前凍結的 endpoint。
 pub fn verify_daemon_code_after_restart(
-    ctx: &CliCtx<'_>,
-    endpoint: &str,
+    ctx: &mut CliCtx<'_>,
+    ns: &Namespace,
     installed_fingerprint: Option<&str>,
 ) -> &'static str {
     const TIMEOUT_NS: u64 = 10_000_000_000;
@@ -1674,20 +1683,33 @@ pub fn verify_daemon_code_after_restart(
 
     let deadline = ctx.p.clock.mono_ns().saturating_add(TIMEOUT_NS);
     loop {
-        if let Some(response) = rpc_response(ctx, endpoint, "health.ping", 0.5) {
-            if response.get_truthy("ok") {
-                let daemon_fingerprint =
-                    response
-                        .get("code_fingerprint")
-                        .and_then(|value| match value {
-                            PyValue::Str(fingerprint) => Some(fingerprint.as_str()),
-                            _ => None,
-                        });
-                return if daemon_fingerprint == installed_fingerprint {
-                    "match"
-                } else {
-                    "mismatch"
-                };
+        let endpoint = match endpoint_resolve::resolve_endpoint_info(
+            ctx,
+            &EndpointArgs {
+                endpoint: ns.str("endpoint"),
+                socket: ns.str("socket"),
+                bench: None,
+            },
+        ) {
+            Ok(resolved) => Some(resolved.endpoint),
+            Err(_) => None,
+        };
+        if let Some(endpoint) = endpoint.as_deref() {
+            if let Some(response) = rpc_response(ctx, endpoint, "health.ping", 0.5) {
+                if response.get_truthy("ok") {
+                    let daemon_fingerprint =
+                        response
+                            .get("code_fingerprint")
+                            .and_then(|value| match value {
+                                PyValue::Str(fingerprint) => Some(fingerprint.as_str()),
+                                _ => None,
+                            });
+                    return if daemon_fingerprint == installed_fingerprint {
+                        "match"
+                    } else {
+                        "mismatch"
+                    };
+                }
             }
         }
         if ctx.p.clock.mono_ns() >= deadline {
@@ -2091,11 +2113,8 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
             DaemonRestartAction::Restart => match setup.get("daemon_restart") {
                 Some(PyValue::Str(outcome)) if outcome == "ran" => {
                     daemon_code.insert("action", PyValue::Str("restarted".into()));
-                    let after = verify_daemon_code_after_restart(
-                        ctx,
-                        &old_endpoint,
-                        installed_fingerprint.as_deref(),
-                    );
+                    let after =
+                        verify_daemon_code_after_restart(ctx, ns, installed_fingerprint.as_deref());
                     daemon_code.insert("after", PyValue::Str(after.into()));
                     if after != "match" {
                         let hint = format!(

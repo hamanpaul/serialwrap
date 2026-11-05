@@ -125,6 +125,136 @@ def test_daemon_prefix_resolution(monkeypatch):
     assert prefix == ["/opt/serialwrapd.exe"]
 
 
+def _run_s1mx6_guard_session(tmp_path: Path, action: str):
+    import os
+    import subprocess
+    import sys
+
+    here = Path(__file__).resolve().parent
+    home = tmp_path / "home-at-session-start"
+    later_home = tmp_path / "home-after-change"
+    unit = home / ".config" / "systemd" / "user" / "serialwrap.service"
+    unit.parent.mkdir(parents=True)
+    later_home.mkdir()
+    if action not in {"add", "add_after_home_change"}:
+        unit.write_bytes(b"unit before session\n")
+    initial_mtime_ns = unit.stat().st_mtime_ns if unit.exists() else 0
+
+    plugin_dir = tmp_path / "plugin"
+    plugin_dir.mkdir()
+    plugin = plugin_dir / "s1mx6_guard_plugin.py"
+    plugin.write_text(
+        r"""import os
+from pathlib import Path
+
+import pytest
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session):
+    Path.home = classmethod(lambda cls: Path(os.environ["HOME"]))
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_call(item):
+    yield
+    if item.name != "test_daemon_prefix_resolution":
+        return
+    unit = Path(os.environ["S1MX6_GUARD_UNIT"])
+    action = os.environ["S1MX6_GUARD_ACTION"]
+    if action == "add":
+        unit.write_bytes(b"new unit\n")
+    elif action == "delete":
+        unit.unlink()
+    elif action == "mtime":
+        st = unit.stat()
+        os.utime(unit, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    elif action == "content_same_mtime":
+        unit.write_bytes(b"unit after session\n")
+        st = unit.stat()
+        os.utime(unit, ns=(st.st_atime_ns, int(os.environ["S1MX6_GUARD_MTIME_NS"])))
+    elif action == "add_after_home_change":
+        os.environ["HOME"] = os.environ["S1MX6_GUARD_LATER_HOME"]
+        unit.write_bytes(b"new unit after HOME change\n")
+    elif action == "read_error":
+        unit.unlink()
+        unit.mkdir()
+""",
+        encoding="utf-8",
+    )
+
+    report = tmp_path / "resource-report.json"
+    child_env = dict(os.environ)
+    child_env.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+            "SERIALWRAP_AB_LABEL": "rust-cli-python-daemon",
+            "SERIALWRAP_CLI_EXE": "/bin/true" if os.name != "nt" else sys.executable,
+            "SW_RESOURCE_REPORT": str(report),
+            "S1MX6_GUARD_UNIT": str(unit),
+            "S1MX6_GUARD_ACTION": action,
+            "S1MX6_GUARD_LATER_HOME": str(later_home),
+            "S1MX6_GUARD_MTIME_NS": str(initial_mtime_ns),
+            "PYTHONPATH": os.pathsep.join(
+                part for part in (str(plugin_dir), os.environ.get("PYTHONPATH", "")) if part
+            ),
+        }
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            f"--confcutdir={here}",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "s1mx6_guard_plugin",
+            str(Path(__file__).resolve()),
+            "-k",
+            "test_daemon_prefix_resolution",
+        ],
+        env=child_env,
+        cwd=str(here.parents[1]),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return proc, report
+
+
+@pytest.mark.core_portable
+@pytest.mark.parametrize(
+    "action",
+    ["add", "delete", "mtime", "content_same_mtime", "add_after_home_change", "read_error"],
+)
+def test_s1mx6_guard_fails_when_unit_changes(tmp_path: Path, action: str):
+    proc, report = _run_s1mx6_guard_session(tmp_path, action)
+    output = proc.stdout + proc.stderr
+    assert report.exists(), output
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert proc.returncode != 0 and data["exit_code"] != 0, {
+        "pytest_exit": proc.returncode,
+        "report_exit": data["exit_code"],
+        "output": output,
+    }
+
+
+@pytest.mark.core_portable
+def test_s1mx6_guard_passes_when_unit_is_unchanged(tmp_path: Path):
+    proc, report = _run_s1mx6_guard_session(tmp_path, "unchanged")
+    output = proc.stdout + proc.stderr
+    assert report.exists(), output
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert proc.returncode == 0 and data["exit_code"] == 0, {
+        "pytest_exit": proc.returncode,
+        "report_exit": data["exit_code"],
+        "output": output,
+    }
+
+
 # P2 Task 13 的 L1 報告 plugin 與獨立執行時的 sessionfinish 斷言；見 plan Task 2 conftest 段落。
 @pytest.mark.core_portable
 @pytest.mark.process_rpc
