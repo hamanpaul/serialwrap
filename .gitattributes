@@ -12,6 +12,9 @@ contracts/** text eol=lf
 # profiles_fixtures 刻意保留 BOM／CRLF 等位元組差異，不做行尾轉換
 contracts/golden/profiles_fixtures/** -text
 crates/*/tests/golden/** text eol=lf
+# Rust 以原始位元組內嵌名稱表與安裝資產；CRLF 會破壞十六進位解析及 stdout 換行契約
+crates/sw-proto/src/pyre/unicode_names.tsv text eol=lf
+sw_core/assets/** text eol=lf
 crates/sw-pal/tests/golden/serialwrap.task.xml -text
 # 證據檔以位元組雜湊登錄（stage0_evidence_index.yaml 之 sha256），跨平台檢出不得做 EOL 轉換（CRLF 原樣保留）
 evidence/** -text

@@ -1,6 +1,7 @@
 //! client 側 RPC transport 與 Python 基線（`oserror.<os>.tsv`）對照（P3-T9）。
 //!
-//! golden 為唯一 oracle：`message`、`errno` 必須逐字相同（Q-10～Q-13）；不得改寫 golden 遷就實作。
+//! golden 鎖定分類與錯誤碼；Windows 系統訊息另以同機 Python WinError 取得語系。
+//! `message` 仍逐字比對（Q-10～Q-13），不得正規化 PAL 的實際輸出。
 mod common;
 
 use std::time::Duration;
@@ -22,6 +23,7 @@ fn golden_case(id: &str) -> common::OsErrCase {
         .into_iter()
         .find(|c| c.id == id && c.op != "resolve_tcp")
         .unwrap_or_else(|| panic!("golden 缺少 case {id}"))
+        .with_native_language()
 }
 
 fn golden_resolve(id: &str) -> common::OsErrCase {
@@ -118,8 +120,8 @@ fn tcp_refused_and_gai_and_timeout0_match_python() {
             .err()
             .unwrap_or_else(|| panic!("{id} 應失敗"));
         assert_eq!(
-            (e.py_message.as_str(), e.os_code),
-            (g.message.as_str(), g.errno),
+            (e.py_message.as_str(), e.os_code, e.winerror),
+            (g.message.as_str(), g.errno, g.winerror),
             "{id}"
         );
     }
