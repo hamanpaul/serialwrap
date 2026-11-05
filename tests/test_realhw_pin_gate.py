@@ -33,7 +33,7 @@ def _make_install(root: Path) -> tuple[Path, Path]:
         exe.write_bytes(cli_bytes)
         daemon.write_bytes(daemon_bytes)
         (bindir / "current-release.json").write_text(
-            json.dumps({"dir": str(bundle)}), encoding="utf-8")
+            json.dumps({"dir": bundle.relative_to(root).as_posix()}), encoding="utf-8")
         manifest = {
             "schema_version": "release-manifest.v1",
             "components": {

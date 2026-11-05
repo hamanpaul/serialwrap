@@ -259,7 +259,7 @@ def _install_layout(tmp_path: Path, tag: str) -> dict:
         cli_file = stable / cli_name
         cli_file.write_bytes(cli_payload)
         (stable / daemon_name).write_bytes(daemon_payload)
-        (stable / "current-release.json").write_text(json.dumps({"dir": str(inst)}), encoding="utf-8")
+        (stable / "current-release.json").write_text(json.dumps({"dir": inst.relative_to(base).as_posix()}), encoding="utf-8")
     else:
         cli_file = bin_dir / cli_name
     return {

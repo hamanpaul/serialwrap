@@ -19,3 +19,6 @@ evidence/** -text
 evidence/stage1/owner/** -text -whitespace
 # Windows 原生產出的 func-test 報告逐字保存（含 CRLF），雜湊登錄於 SHA256SUMS，不做空白檢查（OD-31）
 evidence/stage1/od31-ev01-win/** -text -whitespace
+
+# pyre oracle 明確拒絕 CRLF；Windows checkout 必須維持語料位元組。
+scripts/rust/goldens/pyre_corpus.txt text eol=lf

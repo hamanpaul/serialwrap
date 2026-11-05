@@ -47,7 +47,10 @@ def _probe_posix_branch(mgr: SessionManager, path: str, proc: str) -> dict:
     procfs 比對邏輯，假 /proc 與 stat 替身皆為暫存檔或記憶體物件，不需真實 /proc；因此於呼叫期間
     釘住 os.name，讓 Linux 與 Windows 宿主都走同一條分支。只影響本次呼叫，不 skip、不改斷言。
     """
-    with mock.patch.object(os, "name", "posix"):
+    # uid 與裝置編號皆來自假的 Linux procfs，不依賴宿主是否提供 POSIX API。
+    with mock.patch.object(os, "name", "posix"), \
+         mock.patch.object(os, "getuid", return_value=1000, create=True), \
+         mock.patch.object(os, "major", side_effect=lambda rdev: rdev >> 8, create=True):
         return mgr._probe_external_holder(path, _proc_root=proc)
 
 
@@ -74,7 +77,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         with mock.patch("sw_core.session_manager.os.stat") as mock_stat:
             mock_stat.return_value = StatIdentity(dev=60, ino=17)
@@ -88,7 +91,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/serial/by-path/unrelated", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         def _stat_side_effect(path: str, *args, **kwargs):
             if path == "/dev/ttyUSB0":
@@ -106,7 +109,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/serial/by-id/usb-device-part", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         def _stat_side_effect(path: str, *args, **kwargs):
             return StatIdentity(dev=60, ino=17, rdev=500)
@@ -124,7 +127,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyS0", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
         fd_path = str(proc / "1234" / "fd" / "3")
         rdev = (4 << 8) | 64  # major 4（ttyS），非 devpts
 
@@ -145,7 +148,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/pts/7", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         def _stat_side_effect(path: str, *args, **kwargs):
             if path == "/dev/pts/7":
@@ -164,7 +167,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyUSB1", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         def _stat_side_effect(path: str, *args, **kwargs):
             if path == "/dev/ttyUSB0":
@@ -182,7 +185,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/different_device", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         def _stat_side_effect(path: str, *args, **kwargs):
             return StatResultWithRdev(rdev=0)
@@ -201,9 +204,12 @@ class TestHolderProbePortability(unittest.TestCase):
         dev = Path(self._tmp.name) / "dev" / "ttyUSB0"
         dev.parent.mkdir(parents=True)
         dev.write_bytes(b"")
-        os.symlink(dev, proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
-        res = _probe_posix_branch(mgr, str(dev), str(proc))
+        # fd 替身回傳目標的真實 inode，無需宿主具備建立 symlink 的權限。
+        target_stat = dev.stat()
+        with mock.patch("sw_core.serial_port.os.stat", return_value=target_stat):
+            res = _probe_posix_branch(mgr, str(dev), str(proc))
 
         self.assertEqual(res["pids"], [1234])
         self.assertEqual(res["holder"], 1234)
@@ -213,7 +219,7 @@ class TestHolderProbePortability(unittest.TestCase):
         mgr = self._mgr()
         proc = Path(self._tmp.name) / "proc"
         (proc / "1234" / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyUSB0", proc / "1234" / "fd" / "3")
+        (proc / "1234" / "fd" / "3").touch()
 
         with mock.patch.object(os, "name", "nt"):
             res = mgr._probe_external_holder("/dev/ttyUSB0", _proc_root=str(proc))
@@ -235,7 +241,7 @@ class TestHolderProbePortability(unittest.TestCase):
         my_pid = os.getpid()
         proc = Path(self._tmp.name) / "proc"
         (proc / str(my_pid) / "fd").mkdir(parents=True)
-        os.symlink("/dev/ttyUSB0", proc / str(my_pid) / "fd" / "3")
+        (proc / str(my_pid) / "fd" / "3").touch()
 
         res = _probe_posix_branch(mgr, "/dev/ttyUSB0", str(proc))
         self.assertEqual(res["pids"], [])

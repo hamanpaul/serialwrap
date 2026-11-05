@@ -1,4 +1,5 @@
 import base64
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 from sw_core.wal import WalWriter
 import pytest
 
+# WAL 持有常駐 handle；先關閉 writer 再清理暫存目錄，避免 Windows／UNC 的分享衝突。
 pytestmark = []
 
 
@@ -13,8 +15,7 @@ pytestmark = []
 @pytest.mark.memory_only
 class TestWal(unittest.TestCase):
     def test_append_and_tail(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            wal = WalWriter(wal_dir=td, rotate_bytes=10_000_000)
+        with tempfile.TemporaryDirectory() as td, closing(WalWriter(wal_dir=td, rotate_bytes=10_000_000)) as wal:
             rec = wal.append(com="COM0", direction="TX", source="agent:a", payload=b"echo hi\n", cmd_id="x1")
             self.assertEqual(rec["seq"], 1)
             rows = wal.tail_raw(from_seq=0, com="COM0", limit=10)
@@ -41,22 +42,19 @@ class TestWalTailLatest(unittest.TestCase):
 
     def test_tail_raw_latest_mode_returns_newest(self) -> None:
         """from_seq 省略（None）→ latest 模式：100 筆時 limit=10 回 seq 91-100（升冪）。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = self._make_wal_with_records(td)
+        with tempfile.TemporaryDirectory() as td, closing(self._make_wal_with_records(td)) as wal:
             rows = wal.tail_raw(limit=10)
             self.assertEqual([r["seq"] for r in rows], list(range(91, 101)))
 
     def test_tail_raw_range_mode_unchanged(self) -> None:
         """顯式 from_seq=0 → 舊 range 語意：回 seq 1-10（起點後最舊前 N 筆）。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = self._make_wal_with_records(td)
+        with tempfile.TemporaryDirectory() as td, closing(self._make_wal_with_records(td)) as wal:
             rows = wal.tail_raw(from_seq=0, limit=10)
             self.assertEqual([r["seq"] for r in rows], list(range(1, 11)))
 
     def test_tail_raw_with_meta_truncated_semantics(self) -> None:
         """truncated：latest 模式＝視窗前還有更舊符合紀錄；range 模式＝視窗後還有更新符合紀錄。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = self._make_wal_with_records(td)
+        with tempfile.TemporaryDirectory() as td, closing(self._make_wal_with_records(td)) as wal:
             rows, truncated = wal.tail_raw_with_meta(limit=10)
             self.assertEqual(len(rows), 10)
             self.assertTrue(truncated)
@@ -77,8 +75,7 @@ class TestWalTailLatest(unittest.TestCase):
 
     def test_tail_raw_with_meta_com_filter(self) -> None:
         """latest 模式的 com 過濾與 truncated 只計符合紀錄。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = WalWriter(wal_dir=td, rotate_bytes=10_000_000)
+        with tempfile.TemporaryDirectory() as td, closing(WalWriter(wal_dir=td, rotate_bytes=10_000_000)) as wal:
             for i in range(1, 7):
                 com = "COM0" if i % 2 else "COM1"
                 wal.append(com=com, direction="RX", source="uart", payload=f"line {i}\n".encode())
@@ -91,8 +88,7 @@ class TestWalTailLatest(unittest.TestCase):
 
     def test_tail_raw_with_meta_range_mode_com_filter(self) -> None:
         """range 模式 + com 過濾：起點與 truncated 皆只計符合 com 的紀錄。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = WalWriter(wal_dir=td, rotate_bytes=10_000_000)
+        with tempfile.TemporaryDirectory() as td, closing(WalWriter(wal_dir=td, rotate_bytes=10_000_000)) as wal:
             for i in range(1, 7):
                 com = "COM0" if i % 2 else "COM1"
                 wal.append(com=com, direction="RX", source="uart", payload=f"line {i}\n".encode())
@@ -111,10 +107,9 @@ class TestWalTailLatest(unittest.TestCase):
         latest limit=10 回現行檔**全部**筆數（可少於 limit）且 truncated=False。
         本測試把現狀語意釘死成契約；若未來改為回讀歸檔檔，需同步改文件與本測試。
         """
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory() as td, closing(WalWriter(wal_dir=td, rotate_bytes=600)) as wal:
             # rotate_bytes 調小（每筆 record 約 250 bytes）→ 寫 30 筆期間必然發生多次輪替，
             # 且現行檔累積筆數遠小於 10。
-            wal = WalWriter(wal_dir=td, rotate_bytes=600)
             total = 30
             for i in range(1, total + 1):
                 wal.append(com="COM0", direction="RX", source="uart", payload=f"line {i}\n".encode())
@@ -134,8 +129,7 @@ class TestWalTailLatest(unittest.TestCase):
 
     def test_tail_text_latest_mode_includes_partial_prompt(self) -> None:
         """latest 模式下，無換行結尾的 partial prompt 必須出現在結果尾行（issue #124 動機）。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = self._make_wal_with_records(td)
+        with tempfile.TemporaryDirectory() as td, closing(self._make_wal_with_records(td)) as wal:
             wal.append(com="COM0", direction="RX", source="uart", payload=b"root@host:~# ")
             lines = wal.tail_text(limit=10)
             self.assertEqual(lines[-1], "root@host:~# ")
@@ -143,8 +137,7 @@ class TestWalTailLatest(unittest.TestCase):
 
     def test_tail_text_range_mode_unchanged(self) -> None:
         """顯式 from_seq=0 → tail_text 維持舊 range 語意（最舊起算）。"""
-        with tempfile.TemporaryDirectory() as td:
-            wal = self._make_wal_with_records(td)
+        with tempfile.TemporaryDirectory() as td, closing(self._make_wal_with_records(td)) as wal:
             lines = wal.tail_text(from_seq=0, limit=10)
             self.assertEqual(lines[0], "line 1")
             self.assertEqual(lines[-1], "line 10")
