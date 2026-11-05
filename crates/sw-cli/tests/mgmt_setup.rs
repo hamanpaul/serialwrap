@@ -437,20 +437,24 @@ fn s1m241_setup_system_scope_with_sudo_restarts_after_enable() {
     const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
     let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
     let endpoint = t.default_socket();
+    let system_socket = sw_cli::endpoint_resolve::SYSTEMD_SYSTEM_SOCKET;
     let t = t
         .with_config("supervision_mode: systemd-system\n")
         .with_systemd(true)
         .with_command(&["systemctl", "is-active", "serialwrap"], 0, "active\n", "")
         .with_rpc_ok(&endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
-        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#);
-    t.rpc().respond_seq(
-        &endpoint,
-        "health.ping",
-        &[
+        .with_rpc_ok(&endpoint, "mcu.status", r#"{"ok":true,"flashing":false}"#)
+        .with_rpc_ok(
+            &endpoint,
+            "health.ping",
             &format!(r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#),
+        )
+        .with_rpc_ok(
+            system_socket,
+            "health.ping",
             &format!(r#"{{"ok":true,"code_fingerprint":"{INSTALLED_FINGERPRINT}"}}"#),
-        ],
-    );
+        );
+    // reconcile 會把 systemd-system 的 socket 寫成系統 socket；重啟後的輪詢必須打那裡。
 
     let (rc, out, err) = t.run(&["setup", "--system", "--with-sudo"]);
     assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
@@ -489,7 +493,8 @@ fn s1m241_setup_system_scope_with_sudo_restarts_after_enable() {
         1,
         "sudo restart 必須只執行一次：{calls:?}"
     );
-    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 2);
+    assert_eq!(t.rpc().request_count(&endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(system_socket, "health.ping"), 1);
 }
 
 #[test]
@@ -2655,7 +2660,11 @@ fn s1m241_verify_restart_fingerprint() {
     );
     temporarily_unavailable.with_cli_ctx(|ctx| {
         assert_eq!(
-            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(
+                ctx,
+                &sw_cli::argparse::Namespace::default(),
+                Some(expected),
+            ),
             "match"
         );
     });
@@ -2677,7 +2686,11 @@ fn s1m241_verify_restart_fingerprint() {
     );
     mismatch.with_cli_ctx(|ctx| {
         assert_eq!(
-            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(
+                ctx,
+                &sw_cli::argparse::Namespace::default(),
+                Some(expected),
+            ),
             "mismatch"
         );
     });
@@ -2690,17 +2703,24 @@ fn s1m241_verify_restart_fingerprint() {
         missing_fingerprint.with_rpc_ok(&endpoint, "health.ping", r#"{"ok":true}"#);
     missing_fingerprint.with_cli_ctx(|ctx| {
         assert_eq!(
-            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(
+                ctx,
+                &sw_cli::argparse::Namespace::default(),
+                Some(expected),
+            ),
             "mismatch"
         );
     });
     assert!(missing_fingerprint.clock().sleeps_s().is_empty());
 
     let unreachable = TestEnv::posix();
-    let endpoint = unreachable.default_socket();
     unreachable.with_cli_ctx(|ctx| {
         assert_eq!(
-            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &endpoint, Some(expected)),
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(
+                ctx,
+                &sw_cli::argparse::Namespace::default(),
+                Some(expected),
+            ),
             "unreachable"
         );
     });
@@ -2717,4 +2737,164 @@ fn s1m241_verify_restart_fingerprint() {
         .timeouts_s()
         .iter()
         .all(|timeout| *timeout == 0.5));
+}
+
+/// reconcile 已把 config.yaml 寫成 canonical socket 後，驗證輪詢不得再打呼叫端凍結的舊 endpoint。
+#[test]
+fn s1m_c1_verify_uses_socket_rewritten_by_reconcile() {
+    let expected = "a1b2c3d4e5f6";
+    let t = TestEnv::posix();
+    let old_endpoint = format!("{}/old-custom.sock", t.run_dir().display());
+    let canonical = t.default_socket();
+    let t = t.with_config(&format!(
+        "supervision_mode: systemd-user\nsocket_path: {canonical}\n"
+    ));
+    t.rpc().respond(
+        &old_endpoint,
+        "health.ping",
+        r#"{"ok":true,"code_fingerprint":"stale-old"}"#,
+    );
+    t.rpc().respond(
+        &canonical,
+        "health.ping",
+        &format!(r#"{{"ok":true,"code_fingerprint":"{expected}"}}"#),
+    );
+
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(
+                ctx,
+                &sw_cli::argparse::Namespace::default(),
+                Some(expected),
+            ),
+            "match"
+        );
+    });
+    assert_eq!(t.rpc().request_count(&canonical, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&old_endpoint, "health.ping"), 0);
+}
+
+/// 明示 `--socket` 每一輪都優先於已改寫的 config.yaml，與 Python `_resolve_local_endpoint_info` 相同。
+#[test]
+fn s1m_c1_explicit_socket_overrides_reconciled_config() {
+    let expected = "a1b2c3d4e5f6";
+    let t = TestEnv::posix();
+    let old_endpoint = format!("{}/old-custom.sock", t.run_dir().display());
+    let canonical = t.default_socket();
+    let t = t.with_config(&format!(
+        "supervision_mode: systemd-user\nsocket_path: {canonical}\n"
+    ));
+    t.rpc().respond(
+        &old_endpoint,
+        "health.ping",
+        r#"{"ok":true,"code_fingerprint":"stale-old"}"#,
+    );
+    t.rpc().respond(
+        &canonical,
+        "health.ping",
+        &format!(r#"{{"ok":true,"code_fingerprint":"{expected}"}}"#),
+    );
+    let mut ns = sw_cli::argparse::Namespace::default();
+    ns.vals.insert(
+        "socket".to_string(),
+        sw_cli::argparse::ArgValue::Str(old_endpoint.clone()),
+    );
+
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(ctx, &ns, Some(expected)),
+            "mismatch"
+        );
+    });
+    assert_eq!(t.rpc().request_count(&old_endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&canonical, "health.ping"), 0);
+}
+
+/// 每一輪都重新解析：舊 socket 第一輪仍可連但 ping 未就緒，下一輪起拒絕後改走 canonical。
+#[test]
+fn s1m_c1_verify_reresolves_endpoint_each_poll() {
+    let expected = "a1b2c3d4e5f6";
+    let t = TestEnv::posix();
+    let old_endpoint = format!("{}/old-custom.sock", t.run_dir().display());
+    let canonical = t.default_socket();
+    let t = t.with_config(&format!(
+        "supervision_mode: systemd-user\nsocket_path: {old_endpoint}\n"
+    ));
+    t.rpc()
+        .respond(&old_endpoint, "health.ping", r#"{"ok":false}"#);
+    t.rpc().refuse_from_connect(&old_endpoint, 3);
+    t.rpc().respond(
+        &canonical,
+        "health.ping",
+        &format!(r#"{{"ok":true,"code_fingerprint":"{expected}"}}"#),
+    );
+
+    t.with_cli_ctx(|ctx| {
+        assert_eq!(
+            sw_cli::setup_cmd::verify_daemon_code_after_restart(
+                ctx,
+                &sw_cli::argparse::Namespace::default(),
+                Some(expected),
+            ),
+            "match"
+        );
+    });
+    assert_eq!(t.clock().elapsed(), Duration::from_millis(500));
+    assert_eq!(t.rpc().request_count(&old_endpoint, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&canonical, "health.ping"), 1);
+}
+
+/// setup 前 config 指向可連的自訂 socket；reconcile 寫回 canonical 並重啟後，驗證必須打新 socket。
+#[test]
+fn s1m_c1_setup_verify_polls_reconciled_socket() {
+    const DAEMON_FINGERPRINT: &str = "deadbeef0001";
+    const INSTALLED_FINGERPRINT: &str = "a1b2c3d4e5f6";
+    let t = s1m241_installed_setup_env(Some(INSTALLED_FINGERPRINT));
+    let old_endpoint = format!("{}/old-custom.sock", t.run_dir().display());
+    let canonical = t.default_socket();
+    let t = t
+        .with_config(&format!(
+            "supervision_mode: systemd-user\nsocket_path: {old_endpoint}\n"
+        ))
+        .with_systemd(true)
+        .with_command(
+            &["systemctl", "--user", "is-active", "serialwrap"],
+            0,
+            "active\n",
+            "",
+        )
+        .with_command(&["systemctl", "--user", "daemon-reload"], 0, "", "")
+        .with_command(&["systemctl", "--user", "enable", "serialwrap"], 0, "", "")
+        .with_command(&["systemctl", "--user", "restart", "serialwrap"], 0, "", "")
+        .with_rpc_ok(&old_endpoint, "health.status", r#"{"ok":true,"pid":1234}"#)
+        .with_rpc_ok(
+            &old_endpoint,
+            "mcu.status",
+            r#"{"ok":true,"flashing":false}"#,
+        )
+        .with_rpc_ok(
+            &old_endpoint,
+            "health.ping",
+            &format!(r#"{{"ok":true,"code_fingerprint":"{DAEMON_FINGERPRINT}"}}"#),
+        )
+        .with_rpc_ok(
+            &canonical,
+            "health.ping",
+            &format!(r#"{{"ok":true,"code_fingerprint":"{INSTALLED_FINGERPRINT}"}}"#),
+        );
+
+    let (rc, out, err) = t.run(&["setup", "--user"]);
+    assert_eq!(rc, 0, "setup 失敗：stdout={out:?}, stderr={err:?}");
+    let result = json(&out);
+    let daemon_code = dict_field(&result, "daemon_code");
+    assert_eq!(str_field(&daemon_code, "action"), "restarted");
+    assert_eq!(
+        str_field(&daemon_code, "after"),
+        "match",
+        "重啟後必須重新解析 endpoint；stdout={out} stderr={err} old_pings={} canonical_pings={}",
+        t.rpc().request_count(&old_endpoint, "health.ping"),
+        t.rpc().request_count(&canonical, "health.ping"),
+    );
+    assert_eq!(t.rpc().request_count(&canonical, "health.ping"), 1);
+    assert_eq!(t.rpc().request_count(&old_endpoint, "health.ping"), 1);
 }
