@@ -69,6 +69,7 @@ python3 scripts/rust/l15_exit_driver.py --rejudge <evidence_dir> --assert-same-j
 1. `VERSION`：`0.3.2` → `0.4.0`；`Cargo.toml` 的 `[workspace.package] version` 同步改為 `0.4.0` 並更新 `Cargo.lock`（`cargo update -w`）。`pyproject.toml` 的 dynamic version 由 `VERSION` 讀取。
 2. 收斂 changelog：`python3 -m policy_check.changelog collate --version 0.4.0 --date <發佈日 YYYY-MM-DD>`（把 `changelog.d/*.md` 依 type 收斂成 `CHANGELOG.md` 的 dated 段並清空目錄）。collate 前先修正缺 frontmatter 的既存 fragment（第 3 輪報告列為範圍外的 5 個壞檔），否則分類會錯。
    - 2026-10-29 試跑（暫存 clone、`--date 2026-11-01`，結果未提交）：原始 217 個 fragment 中 5 個缺 frontmatter（`229-late-unlock-prompt.md`、`rust-p4-win-test-l1-set.md`、`st06-command-completion.md`、`st06-smart4-prompt-window.md`、`st06-smart4r-console-unlock.md`），collate 於第一個壞檔即 `FragmentError` 中止且不改任何檔。`feature/release-0.4.0-prep` 已只補 frontmatter／格式（`st06-smart4r-console-unlock.md` 同時含 Added 與 Fixed，依原條目拆為 `-a-profile`／`-b-recovery`／`-c-sysrq-reboot`（feat）與 `-d-prompt-boundary`（fix）四檔，文字不變）；重跑 collate 成功收斂 220 個 fragment（Added 73、Changed 39、Fixed 106、Security 2）。release PR 執行前若再有新 fragment，仍須重跑本步驟確認。
+   - 2026-11-05 於 `feature/s1m-rel040`（起點 `038d8eba`）以 `--version 0.4.0 --date 2026-11-06` 正式收斂：另有 2 個 fragment 缺 frontmatter（`s1m-x6w-windows-passwd-fixtures.md`、`s1mx6b2-user-hold-root.md`），只補 `type: fix` 與原文句子。收斂 289 個 fragment（Added 85、Changed 46、Fixed 156、Security 2），目錄清空，空的 `[Unreleased]` 保留。
 3. 重新產生 bundle（§2）並重跑 §4 升級驗證，證據綁 release HEAD。
 4. `python3 -m policy_check --repo .`、全套測試通過。
 
@@ -164,8 +165,19 @@ while the daemon remains the Python implementation shipped inside the bundle.
 - 修正：pipx 安裝下 on-demand `daemon start` 找不到 `serialwrapd.py`。
 - 升級注意：從 0.3.2 升級時 0.3.2 daemon 可以維持執行；`setup` 會在確認閒置後停止舊 daemon，等它完全結束才切換，再啟動 0.4.0 daemon。舊 daemon 停止後若升級失敗，安裝會還原但舊 daemon 不會自動重啟，請依回應中的啟動指令手動啟動。
 - 升級時請**明確指定目前的監管模式**（`--user`／`--system --with-sudo`／`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇，可能改變模式與 `config.yaml`。
-- 不支援降級回 0.3.2：`setup --rollback` 不能回到 pipx 的 0.3.2（OD-49 已知限制）；文件中的手動程序僅供參考。
+- 不支援以降級功能回到 0.3.2：`setup --rollback` 不能回到 pipx 的 0.3.2（沒有上一版 bundle 時回 `INVALID_ARGS`／`rollback_unavailable`，且不改動現場）。手動步驟見本文件 §5.2，不是受支援的降級路徑。
 - 行為變更清單見 `contracts/behavior_changes.yaml`（BC／SC／DF）與 CHANGELOG。
+
+#### 已知問題
+
+下列是 Python daemon 的既有行為，0.4.0 維持現況，這一版不修改。
+
+- 互動租約還開著時，若取消剛好落在該次輸入已經送出、命令尚未返回的瞬間，同一個租約之後每次互動傳送都回 `SESSION_BUSY`，直到租約逾時。這段時間無法再送互動輸入。
+- `file push` 與 `file pull` 會為每個步驟分開累計已寫出的位元組，傳輸結束後這些步驟帳沒有結清。若要依「這次傳輸總共寫出多少」判斷中斷是否安全，這個總帳可能是空的。請改看目標上的檔案，以及回應裡的 `chunks_sent`／`chunks_total`。
+- 動態偵測到的序列裝置若開埠失敗，而且沒有 passthrough 後備 profile，daemon 不會留下這次失敗。session 清單看不到該裝置，也沒有失敗原因。
+- 裝置釋放後，若原來的 profile template 已不存在，daemon 會留下不能下命令的佔位 session，並繼續占用原來的 COM 編號。佔位只在該裝置再接上並執行 `device attach` 時移除。裝置不再回來時，沒有命令可以刪掉這個佔位。
+- 對這種佔位 session 執行 `session bind`，會直接回覆仍是釋放狀態並建議改做 `device attach`。這個回覆早於「正在燒錄」與「裝置已綁到其他 session」的檢查，所以燒錄中或裝置已被占用時，看到的不是 `FLASHING_BUSY` 或 `DEVICE_ALREADY_BOUND`。
+- `setup --rollback` 不能回到 pipx 安裝的 0.3.2。第一次換成 bundle 時沒有上一個 bundle 版本，命令回 `INVALID_ARGS`（`rollback_unavailable`），而且不改動目前的安裝。手動回到 0.3.2 的步驟與 §5.2 相同：先 `serialwrap daemon stop`，只在 `~/.local/bin/serialwrap` 與 `serialwrapd` 是指向 `~/.local/share/serialwrap/versions/` 的 symlink 時才刪除，再 `pipx uninstall serialwrap && pipx install serialwrap==0.3.2`（或 0.3.2 wheel；只做 `pipx install --force` 不會重建入口），然後 `serialwrap setup`。systemd 用 `serialwrap service start` 啟動；on-demand 的 0.3.2 `serialwrap daemon start` 有既有缺陷，可改直接背景執行 `serialwrapd`。這不是受支援的降級路徑。bundle 與 bundle 之間的 `setup --rollback` 不受此限。
 
 ### English
 - The `serialwrap` CLI is now native Rust (20 command groups); the daemon is still the bundled Python implementation (Stage 1).
@@ -175,7 +187,19 @@ while the daemon remains the Python implementation shipped inside the bundle.
 - Fixed: on-demand `daemon start` could not find `serialwrapd.py` under pipx installs.
 - Upgrade note: the 0.3.2 daemon may keep running while you upgrade; `setup` stops it once it is idle, waits until the old process tree has fully exited, switches, and then starts the 0.4.0 daemon. If the upgrade fails after the old daemon was stopped, the install is restored but the old daemon is not restarted automatically; use the start command printed in the response.
 - Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, or `--on-demand`). Without a flag, `setup` picks a mode automatically exactly like 0.3.2, which may change your mode and `config.yaml`.
-- Downgrading to 0.3.2 is not supported: `setup --rollback` cannot return to a pipx 0.3.2 install (known limitation, OD-49); the documented manual procedure is for reference only.
+- Downgrading to 0.3.2 is not a supported operation: `setup --rollback` cannot return to a pipx 0.3.2 install (with no previous bundle it returns `INVALID_ARGS` / `rollback_unavailable` and leaves the install unchanged). The manual steps are in §5.2 of this document; they are not a supported downgrade.
+- Behavior changes are listed in `contracts/behavior_changes.yaml` (BC / SC / DF) and the changelog.
+
+#### Known issues
+
+The Python daemon already behaved as follows. 0.4.0 keeps that behavior and does not change it.
+
+- If you cancel an interactive command in the moment after its input has been sent but before the command returns, later interactive sends on that same open lease return `SESSION_BUSY` until the lease times out. You cannot send more interactive input during that time.
+- `file push` and `file pull` record transmitted bytes separately for each step, and those step totals are not closed out when the transfer finishes. A later check of "how many bytes this transfer wrote" can therefore come back empty. Look at the file on the target, and at `chunks_sent` / `chunks_total` in the response, before deciding whether a retry is safe.
+- If a newly detected serial device fails to open and there is no passthrough fallback profile, the daemon keeps no record of that failure. The device does not appear in the session list, and there is no failure reason.
+- After a device is released, if its profile template no longer exists, the daemon leaves a placeholder session that accepts no commands and keeps the original COM number. The placeholder is removed only when that device is connected again and you run `device attach`. If the device never comes back, no command deletes the placeholder.
+- `session bind` on that placeholder returns immediately that the session is still released and that you should run `device attach`. This happens before the checks for an in-progress flash and for a device already bound to another session, so you do not see `FLASHING_BUSY` or `DEVICE_ALREADY_BOUND` in those cases.
+- `setup --rollback` cannot return to a pipx 0.3.2 install. The first switch to a bundle has no previous bundle version, so the command returns `INVALID_ARGS` (`rollback_unavailable`) and does not change the installation. A manual return follows §5.2: `serialwrap daemon stop`, delete `~/.local/bin/serialwrap` and `serialwrapd` only when they are symlinks into `~/.local/share/serialwrap/versions/`, then `pipx uninstall serialwrap && pipx install serialwrap==0.3.2` (or the 0.3.2 wheel; `pipx install --force` alone does not recreate the entries), then `serialwrap setup`. Start systemd with `serialwrap service start`. On-demand `serialwrap daemon start` on that pipx 0.3.2 install has a pre-existing defect; start `serialwrapd` in the background instead. That path is not a supported downgrade. `setup --rollback` between bundle versions is unchanged.
 ```
 
 ## 8. PR 政策（release PR）
