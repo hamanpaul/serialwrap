@@ -276,3 +276,131 @@ def test_bb_standalone_writes_l1_report(tmp_path):
     data = json.loads(rpt.read_text(encoding="utf-8"))
     assert data["format"] == "l1-results.v1"
     assert data["finished"] is True
+
+
+@pytest.mark.core_portable
+@pytest.mark.parametrize(
+    ("host", "marker"), [("posix", "windows_native"), ("nt", "posix_only")],
+)
+def test_standalone_rejects_foreign_platform_before_fixtures(monkeypatch, host, marker):
+    """獨立黑箱須在 fixture 啟動前拒絕外平台案例，避免在 Linux 開啟 WinDLL。"""
+    import importlib.util
+    from types import SimpleNamespace
+
+    path = Path(__file__).with_name("conftest.py")
+    spec = importlib.util.spec_from_file_location("standalone_conftest_probe", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name=host))
+    item = SimpleNamespace(get_closest_marker=lambda name: object() if name == marker else None)
+    with pytest.raises(pytest.skip.Exception, match=marker):
+        module.pytest_runtest_setup(item)
+
+
+@pytest.mark.posix_only
+def test_ci_sandbox_hides_host_processes_and_runtime(tmp_path):
+    """CI 使用同一個沙箱入口；驗證 PID namespace 與 runtime，並拒絕寫入 worktree 外。"""
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("bwrap") is None:
+        pytest.skip("cap bubblewrap：宿主未安裝；rust-linux CI 必須先安裝並成功進入沙箱")
+    capability = subprocess.run(
+        ["bwrap", "--ro-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "true"],
+        capture_output=True, text=True, timeout=20,
+    )
+    if capability.returncode != 0:
+        pytest.skip(f"cap bubblewrap namespace：{capability.stderr.strip()}")
+
+    root = Path(__file__).resolve().parents[2]
+    script = root / "scripts" / "rust" / "blackbox_sandbox.sh"
+    probe = tmp_path / "sandbox_probe.py"
+    probe.write_text(
+        "import errno, os\n"
+        "from pathlib import Path\n"
+        "assert os.readlink('/proc/self/ns/pid') != os.environ['SW_PIDNS_OUTER']\n"
+        "assert not list(Path('/run').iterdir())\n"
+        "assert not list(Path('/dev').glob('ttyUSB*'))\n"
+        "current = os.readlink('/proc/self/ns/pid')\n"
+        "for proc in Path('/proc').iterdir():\n"
+        "    if proc.name.isdigit():\n"
+        "        assert os.readlink(proc / 'ns/pid') == current\n"
+        "try:\n"
+        "    Path('/home/.serialwrap-sandbox-write-probe').write_text('forbidden')\n"
+        "except OSError as exc:\n"
+        "    assert exc.errno == errno.EROFS, repr(exc)\n"
+        "else:\n"
+        "    raise AssertionError('worktree 外可寫')\n"
+        "Path(os.environ['SW_SANDBOX_WRITABLE']).write_text('ok')\n",
+        encoding="utf-8",
+    )
+    # 外層 /tmp 不會出現在新沙箱；探針以 stdin 傳入，成果只寫 worktree 內。
+    writable = root / "target" / f"sandbox-probe-{os.getpid()}.txt"
+    child_env = dict(os.environ, SW_SANDBOX_WRITABLE=str(writable))
+    try:
+        result = subprocess.run(
+            ["bash", str(script), sys.executable, "-"], input=probe.read_text(encoding="utf-8"),
+            env=child_env, cwd=root, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert writable.read_text(encoding="utf-8") == "ok"
+    finally:
+        writable.unlink(missing_ok=True)
+
+
+@pytest.mark.core_portable
+def test_systemd_failure_keeps_complete_reason_and_stderr(tmp_path, monkeypatch):
+    """僅驗證診斷工具：合成 INSUFFICIENT 報告仍須失敗，完整原因與 stderr 必須可見。"""
+    import subprocess
+    import test_cli_mgmt_update as update
+
+    reason = "runner-error-detail-" + "x" * 800
+    report = {
+        "evidence_layer": "L1.5-docker", "producer": "run-systemd.sh",
+        "runner_error": reason,
+        "results": [{"case_id": "update-exit1", "verdict": "INSUFFICIENT_EVIDENCE", "reason": reason}],
+    }
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(update, "update_bundles", lambda: (tmp_path / "old", tmp_path / "new"))
+    for bundle, version in ((tmp_path / "old", "0.4.0"), (tmp_path / "new", "0.4.1")):
+        cfg = bundle / "versions" / version / "py" / "pyvenv.cfg"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("home = /usr/bin\ninclude-system-site-packages = false\n", encoding="utf-8")
+
+    def failed_runner(argv, **kwargs):
+        out = Path(argv[argv.index("--out") + 1])
+        out.mkdir(parents=True)
+        (out / "l15-docker-report.json").write_text(json.dumps(report), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 1, "runner-stdout-detail", "runner-stderr-detail")
+
+    monkeypatch.setattr(update.subprocess, "run", failed_runner)
+    with pytest.raises(AssertionError) as failure:
+        update.test_update_systemd_exit1_not_relaunched_l15(tmp_path, {})
+    diagnostic = failure.value.args[0]
+    assert isinstance(diagnostic, str), "直接附 dict 會被 pytest 摘略，無法取得 CI 根因"
+    assert reason in diagnostic and "runner-stderr-detail" in diagnostic and "runner-stdout-detail" in diagnostic
+    saved = list((tmp_path / "target" / "systemd-evidence-kept").glob("*l15-docker-report.json"))
+    assert len(saved) == 1 and json.loads(saved[0].read_text(encoding="utf-8")) == report
+
+
+@pytest.mark.core_portable
+def test_systemd_rejects_toolcache_runtime_before_docker(tmp_path, monkeypatch):
+    """僅驗證啟動前防線：hosted toolcache venv 不能當成 Ubuntu 容器可執行的 runtime。"""
+    import test_cli_mgmt_update as update
+
+    old, new = tmp_path / "old", tmp_path / "new"
+    for bundle, version in ((old, "0.4.0"), (new, "0.4.1")):
+        cfg = bundle / "versions" / version / "py" / "pyvenv.cfg"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("home = /opt/hostedtoolcache/Python/3.12.3/x64/bin\ninclude-system-site-packages = false\n", encoding="utf-8")
+    monkeypatch.setattr(update, "update_bundles", lambda: (old, new))
+    monkeypatch.setattr(update, "repo_root", lambda: tmp_path)
+
+    def forbidden_docker(*args, **kwargs):
+        raise AssertionError("Docker 不得早於 runtime 檢查啟動")
+
+    monkeypatch.setattr(update.subprocess, "run", forbidden_docker)
+    with pytest.raises(AssertionError, match="home = /usr/bin"):
+        update.test_update_systemd_exit1_not_relaunched_l15(tmp_path, {})
