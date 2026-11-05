@@ -67,7 +67,7 @@ jobs:
       - name: "錯誤碼生成檔與 contracts 一致性"
         run: python3 scripts/rust/gen_error_codes.py --check
       - name: "Rust 相關 pytest（SW_REQUIRE_CARGO=1：缺 cargo 即 FAIL，不得 SKIP）"
-        run: SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py
+        run: SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence  # P4 證據測試見 tests.yml 註解
       - name: "建置 Stage 1A 開發 bundle"
         run: scripts/rust/mkbundle.sh --dev --out target/dev-bundle
       - name: "黑箱契約 harness（Rust CLI 輪，tests/contract_blackbox）"
@@ -145,6 +145,10 @@ jobs:
           }
       - name: "免驅動 portable L1（cargo test --workspace）"
         shell: pwsh
+        env:
+          # hosted runner 工作目錄在 D:、預設暫存在 C:，跨磁碟算不出相對路徑
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: |
           cargo test --workspace
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

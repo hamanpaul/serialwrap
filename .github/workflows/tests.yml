@@ -27,16 +27,18 @@ jobs:
         # pyserial：讓 #84 PORT-1 的 pyserial 後端單元測試（_PySerialPort read/write/例外轉譯）
         # 在 Linux CI 亦可執行（生產 Linux 預設走 termios 後端，但 CI 需覆蓋 Windows 後端邏輯）。
         # jsonschema：contracts/ 契約測試（tests/test_contracts_*.py）以 Draft 2020-12 驗證 schema，僅 tests/ 使用。
-        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial jsonschema==4.10.3 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
+        run: python3 -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 pyserial==3.5 jsonschema==4.10.3 setuptools wheel "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: 執行測試套件（預設安裝，無 re2 → fail-closed 拒絕 ReDoS 類）
         # 覆蓋 #91 預設安裝路徑（無 google-re2）：matcher 走標準 re、schema 對指數＋多項式
         # fail-closed 拒絕；re2 專屬測試以 importorskip 自動跳過。
-        run: python3 -m pytest -q tests/
+        # P4 證據測試要讀出口 driver 產生的 target/p4-evidence，CI 沒有；出口 driver 的 pytest_full_junit 步驟照常強制
+        run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
       - name: 安裝 google-re2（[redos] 可選依賴）
         run: python3 -m pip install --disable-pip-version-check google-re2
       - name: 執行測試套件（含 re2 線性引擎）
         # 覆蓋 #91 re2 路徑：matcher 以 re2 線性引擎求值、免疫所有 catastrophic backtracking。
-        run: python3 -m pytest -q tests/
+        # P4 證據測試要讀出口 driver 產生的 target/p4-evidence，CI 沒有；出口 driver 的 pytest_full_junit 步驟照常強制
+        run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
       - name: L1 必要集合鎖只增檢查（對 PR base，P2-T13 R5-F3）
         if: github.event_name == 'pull_request'
         # 基準 rev 的鎖檔中既有的 (set, platform, nodeid) 三元組消失或 selector 改變即失敗；移除須 --allow-removal set_id:platform:nodeid（逐筆）並於 PR 說明。
@@ -629,7 +631,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.3"
       - name: 安裝 bridge 測試相依（含 Windows pyserial）
         run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5
       - name: 執行 uart_stdio_bridge 免驅動 Windows L1 自測
@@ -650,12 +652,13 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.3"
       - name: 安裝免驅動 Windows L1 相依
         run: python -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 jsonschema==4.10.3 pyserial==3.5 "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
       - name: 執行免驅動 Windows L1（含資源報告與 junit）
         env:
           SW_RESOURCE_REPORT: resource-report-windows.json
+          PYTHONUTF8: "1"  # hosted runner 預設 cp1252，測試讀 UTF-8 檔會失敗
         run: python -m pytest -q tests -m "core_portable or windows_native" --junitxml=junit-windows.xml
       - name: 上傳資源報告與 junit
         if: always()
