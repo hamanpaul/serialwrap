@@ -12,7 +12,7 @@ jobs:
   pytest:
     # labeled 事件只為 windows-com-selfhosted 而開，其餘 job 不因加標籤而重跑（P2-T13 審查修正）
     if: github.event.action != 'labeled'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ubuntu-latest 已是 26.04，setup-python 沒有釘死的 3.12.3
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,7 +47,7 @@ jobs:
         # OD-24（2026-10-27）：s1b_cargo 的 5 筆 #[ignore] 列（68d0941 夾帶新增）逐名移除；承擔者見 owner-decisions-2026-10-15.md OD-24 列。
         # 其他移除仍由鎖檢查拒絕；逐列理由見 docs/rust-refactor/owner-decisions-addenda.md。
         run: >-
-          python3 tests/acceptance/regen_lock.py --check --base origin/${{ github.base_ref }} --allow-removal
+          python3 tests/acceptance/regen_lock.py --check --base "origin/$GITHUB_BASE_REF" --allow-removal
           's0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message'
           's0_win_pytest:windows:tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry'
           's0_win_pytest:windows:tests/test_docker_l15.py::test_longrun_and_supervision_isolated'

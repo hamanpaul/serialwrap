@@ -70,7 +70,7 @@ def test_rust_linux_job_toolchain_and_python():
     jobs = doc.get("jobs", {})
     assert "rust-linux" in jobs, "rust.yml 缺少 'rust-linux' job"
     job = jobs["rust-linux"]
-    assert job.get("runs-on") == "ubuntu-latest", f"rust-linux runs-on 必須為 ubuntu-latest: {job.get('runs-on')}"
+    assert job.get("runs-on") == "ubuntu-24.04", f"rust-linux runs-on 必須為 ubuntu-24.04（setup-python 3.12.3）: {job.get('runs-on')}"
 
     steps = job.get("steps", [])
     assert steps, "rust-linux job 缺少 steps"
