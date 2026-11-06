@@ -28,6 +28,7 @@ import zipfile
 
 OWNER_MARKER = ".mkbundle-owner"
 TARGET = "x86_64-pc-windows-gnu"
+SHA256SUMS_LINE = re.compile(r"([0-9a-f]{64})  (.+)")
 TEST_HOOK_MARKERS = (
     b"SERIALWRAP_TEST_",
     b"SW_TEST_UPDATE_PAUSE_AFTER",
@@ -208,6 +209,26 @@ def cmd_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_sha256sums(text: str) -> tuple[dict[str, str], list[str]]:
+    """解析內層 SHA256SUMS；格式錯誤或重複路徑都回報，不靜默覆寫。"""
+    listed: dict[str, str] = {}
+    errors: list[str] = []
+    for line in text.splitlines():
+        matched = SHA256SUMS_LINE.fullmatch(line)
+        if matched is None:
+            errors.append(f"SHA256SUMS 格式不合法：{line!r}")
+            continue
+        digest, relative = matched.groups()
+        if "\\" in relative or relative.startswith("/") or ".." in relative.split("/"):
+            errors.append(f"SHA256SUMS 路徑不合法：{relative}")
+            continue
+        if relative in listed:
+            errors.append(f"SHA256SUMS 路徑重複：{relative}")
+            continue
+        listed[relative] = digest
+    return listed, errors
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     import jsonschema
 
@@ -236,15 +257,11 @@ def cmd_validate(args: argparse.Namespace) -> int:
     if manifest.get("target") != TARGET:
         errors.append(f"manifest target={manifest.get('target')!r}")
 
-    listed: dict[str, str] = {}
     sums_text = (vdir / "SHA256SUMS").read_bytes()
     if b"\r" in sums_text:
         errors.append("內層 SHA256SUMS 含 CR（必須 LF 行尾）")
-    for line in sums_text.decode("utf-8").splitlines():
-        digest, _, relative = line.partition("  ")
-        if "\\" in relative or relative.startswith("/") or ".." in relative.split("/"):
-            errors.append(f"SHA256SUMS 路徑不合法：{relative}")
-        listed[relative] = digest
+    listed, sums_errors = parse_sha256sums(sums_text.decode("utf-8"))
+    errors.extend(sums_errors)
     actual_files = {
         path.relative_to(vdir).as_posix()
         for path in vdir.rglob("*")

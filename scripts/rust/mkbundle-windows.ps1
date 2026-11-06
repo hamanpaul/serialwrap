@@ -123,7 +123,10 @@ try {
     if ($PythonEmbedArchive) {
         Copy-Item -LiteralPath $PythonEmbedArchive -Destination $archive -Force
     } else {
-        Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.3/$archiveName" -OutFile $archive -UseBasicParsing
+        # PowerShell 6 起一律 basic parsing，參數只在 Windows PowerShell 5.1 才有作用。
+        $download = @{ Uri = "https://www.python.org/ftp/python/3.12.3/$archiveName"; OutFile = $archive }
+        if ($PSVersionTable.PSVersion.Major -lt 6) { $download.UseBasicParsing = $true }
+        Invoke-WebRequest @download
     }
     if ((Get-Sha256 $archive) -ne $expectedZipSha) { Fail "CPython embeddable SHA-256 不符（預期 $expectedZipSha）" }
     Expand-Archive -LiteralPath $archive -DestinationPath $PyDir -Force
