@@ -287,7 +287,8 @@ def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, s
     expected_md5, remote = make_push_file(source)
     try:
         update_thread.start()
-        wait_pause(pause_dir, "start_and_verify:started")
+        # 這個暫停點在 handoff、停舊 daemon、啟動新 bundle 之後，hosted runner 要超過預設 20 秒
+        wait_pause(pause_dir, "start_and_verify:started", timeout_s=90.0)
         new_pid = daemon_pid(env)
         assert new_pid != old_pid
         assert wait_session(env)["state"] == "READY"

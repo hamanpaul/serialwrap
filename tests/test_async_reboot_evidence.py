@@ -236,8 +236,9 @@ class TestGraceExpiryDoesNotDeadlock(_AsyncRebootBase):
         deadline = session.ready_reconfirm_deadline
         session.begin_boot_evidence_wait()
         self.assertEqual(session.ready_reconfirm_deadline, deadline)
+        # 浮點相減容許 1 微秒的數值誤差（hosted Windows 實測多 6e-14）
         self.assertLessEqual(
-            session.ready_reconfirm_deadline - time.monotonic(), constants.READY_RECONFIRM_MAX_S
+            session.ready_reconfirm_deadline - time.monotonic(), constants.READY_RECONFIRM_MAX_S + 1e-6
         )
 
     def test_ready_reconfirm_bound_still_terminates_during_wait(self) -> None:
