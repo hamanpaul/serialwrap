@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sw_pal::proc_scan::{ArgvFlavor, DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity};
+use sw_pal::proc_scan::{ArgvFlavor, DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, UninspectableProc};
 use sw_pal::service_ctl::{ServiceAction, SupervisionMode};
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -82,6 +82,8 @@ pub(crate) struct LegacyStopped {
     pub relaunch_count: usize,
     pub stopped: Vec<ProcIdentity>,
     pub holders_unsupported: bool,
+    /// D5.2：穩定窗內整個無法檢查 fd、未能確認沒有持有 UART 的同 uid 行程（報告標註 `holders_status: "partial"`）。
+    pub uninspectable: Vec<UninspectableProc>,
     pub other_uid: Vec<u32>,
     /// 原 daemon 的 argv（D6 on-demand 啟動提示）。
     pub argv: Vec<String>,
@@ -499,6 +501,7 @@ pub(crate) fn stop(
         relaunch_count: waited.relaunch_count,
         stopped: waited.stopped,
         holders_unsupported: waited.holders_unsupported,
+        uninspectable: waited.uninspectable,
         other_uid,
         argv,
         unit_mode,
@@ -509,6 +512,17 @@ struct Waited {
     relaunch_count: usize,
     stopped: Vec<ProcIdentity>,
     holders_unsupported: bool,
+    uninspectable: Vec<UninspectableProc>,
+}
+
+fn holders_status_str(status: HolderScanStatus) -> &'static str {
+    match status {
+        HolderScanStatus::Ok => "ok",
+        HolderScanStatus::Permission => "permission",
+        HolderScanStatus::Unknown => "unknown",
+        HolderScanStatus::Unsupported => "unsupported",
+        HolderScanStatus::Partial => "partial",
+    }
 }
 
 pub(crate) fn legacy_value(daemon: &LegacyDaemon) -> PyValue {
@@ -522,6 +536,8 @@ pub(crate) fn legacy_value(daemon: &LegacyDaemon) -> PyValue {
 
 /// D5：行程樹全部結束、無同 uid 行程持有 UART、且與基準相比沒有新的 serialwrapd，連續維持穩定窗。
 /// 出現新 serialwrapd → 視為重拉：以其自身端點重做 D1＋D3 再停，總停止次數上限 `MAX_HANDOFF_CHAIN`。
+/// D5.2：holder 掃描回 `Partial`（只剩已確認同 uid 的行程整個無法檢查）視同無 holder，但這些行程必須列進
+/// 結果回報；目標 tty 讀不到、同一行程部分 fd 讀不到、uid 未確認或其他失敗仍不算已停。
 fn wait_stopped(
     ctx: &mut CliCtx<'_>,
     mut plan: LegacyPlan,
@@ -538,19 +554,23 @@ fn wait_stopped(
     let mut relaunch_count = 0usize;
     let mut stable_since: Option<u64> = None;
     let mut holders_unsupported = false;
+    // 目前穩定窗內曾無法檢查的行程（窗重新起算時清空）。
+    let mut window_uninspectable = std::collections::BTreeMap::<u32, UninspectableProc>::new();
     let mut chain_pids = vec![plan.daemon.pid];
     loop {
         let now = ctx.p.clock.mono_ns();
         let alive = targets.iter().any(|item| ctx.p.procs.identity_alive(item));
-        let (holders, status) = if plan.attached_paths.is_empty() {
-            (Vec::new(), HolderScanStatus::Ok)
+        let (holders, status, uninspectable) = if plan.attached_paths.is_empty() {
+            (Vec::new(), HolderScanStatus::Ok, Vec::new())
         } else {
-            ctx.p.procs.uart_holders_same_uid(&plan.attached_paths)
+            let scan = ctx.p.procs.uart_holders_same_uid(&plan.attached_paths);
+            (scan.holders, scan.status, scan.uninspectable)
         };
         if status == HolderScanStatus::Unsupported {
             holders_unsupported = true;
         }
-        let holders_clear = holders.is_empty() && matches!(status, HolderScanStatus::Ok | HolderScanStatus::Unsupported);
+        let holders_clear = holders.is_empty()
+            && matches!(status, HolderScanStatus::Ok | HolderScanStatus::Unsupported | HolderScanStatus::Partial);
         let scan = ctx.p.procs.serialwrapd_instances();
         let fresh = match &scan {
             Ok(daemons) => daemons
@@ -598,9 +618,16 @@ fn wait_stopped(
             continue;
         }
         if !alive && holders_clear && scan.is_ok() {
+            if stable_since.is_none() {
+                window_uninspectable.clear();
+            }
+            if status == HolderScanStatus::Partial {
+                window_uninspectable.extend(uninspectable.into_iter().map(|item| (item.pid, item)));
+            }
             let since = *stable_since.get_or_insert(now);
             if now.saturating_sub(since) >= window {
-                return Ok(Waited { relaunch_count, stopped: targets, holders_unsupported });
+                let uninspectable = window_uninspectable.into_values().collect();
+                return Ok(Waited { relaunch_count, stopped: targets, holders_unsupported, uninspectable });
             }
         } else {
             stable_since = None;
@@ -610,6 +637,8 @@ fn wait_stopped(
             detail.insert("legacy_daemon", legacy_value(&plan.daemon));
             detail.insert("alive_pids", pids_value(&targets.iter().filter(|item| ctx.p.procs.identity_alive(item)).map(|item| item.pid).collect::<Vec<_>>()));
             detail.insert("holder_pids", pids_value(&holders));
+            // 最後一次 holder 掃描的狀態：`alive_pids` 與 `holder_pids` 皆空時據此判斷是哪一種讀取失敗擋下。
+            detail.insert("holders_status", str_value(holders_status_str(status)));
             detail.insert("waited_ms", int(now.saturating_sub(started) / 1_000_000));
             return Err(LegacyFailure::AfterStop {
                 code: ErrorCode::Timeout.as_str(),
@@ -683,6 +712,16 @@ impl LegacyStopped {
         if self.holders_unsupported {
             // D5.2：Windows 無 holder 掃描，以行程樹結束推定。
             value.insert("holders_status", str_value("unsupported"));
+        } else if !self.uninspectable.is_empty() {
+            // D5.2：部分同 uid 行程整個無法檢查（例如 `(sd-pam)`、`systemd --user`），以行程樹結束與其餘行程皆未持有 UART 推定。
+            value.insert("holders_status", str_value("partial"));
+        }
+        if !self.uninspectable.is_empty() {
+            value.insert("uninspectable_procs", PyValue::List(self.uninspectable.iter().map(|item| PyValue::Dict(PyDict::from_pairs(vec![
+                ("comm".into(), item.comm.clone().map(PyValue::Str).unwrap_or(PyValue::Null)),
+                ("pid".into(), int(u64::from(item.pid))),
+                ("reason".into(), str_value(item.reason.as_str())),
+            ]))).collect()));
         }
         if !self.other_uid.is_empty() {
             value.insert("other_uid_pids", pids_value(&self.other_uid));

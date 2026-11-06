@@ -130,11 +130,277 @@ fn posix_uart_holder_scan_covers_any_same_uid_process_and_skips_other_uids() {
     fake_proc(tmp.path(), 701, 1, me.wrapping_add(1), &["minicom"], "/usr/bin/minicom");
     std::os::unix::fs::symlink(&tty, tmp.path().join("701/fd/3")).unwrap();
     let scan = PosixProcScan::with_root(tmp.path());
-    let (holders, status) = scan.uart_holders_same_uid(std::slice::from_ref(&tty));
-    assert_eq!(holders, vec![700]);
-    assert_eq!(status, HolderScanStatus::Ok);
+    let result = scan.uart_holders_same_uid(std::slice::from_ref(&tty));
+    assert_eq!(result.holders, vec![700]);
+    assert_eq!(result.status, HolderScanStatus::Ok);
+    assert!(result.uninspectable.is_empty());
     // serialwrapd 專用掃描維持原語意（minicom 不是 serialwrapd）。
     assert!(scan.serialwrapd_tty_holders(std::slice::from_ref(&tty)).0.is_empty());
+}
+
+#[cfg(unix)]
+fn chmod(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// root 可繞過 mode 000，測不到 PermissionDenied。
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: geteuid 無參數、不會失敗。
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// 同 uid、non-dumpable 的行程（systemd user session 的 `(sd-pam)`）：`/proc/<pid>/fd` 屬 root，read_dir 回 PermissionDenied。
+#[cfg(unix)]
+fn fake_uninspectable_proc(root: &std::path::Path, pid: u32, uid: u32, comm: Option<&str>) {
+    fake_proc(root, pid, 1, uid, &["(sd-pam)"], "/usr/lib/systemd/systemd");
+    if let Some(comm) = comm {
+        std::fs::write(root.join(pid.to_string()).join("comm"), format!("{comm}\n")).unwrap();
+    }
+    chmod(&root.join(pid.to_string()).join("fd"), 0o000);
+}
+
+/// 同 uid、fd 目錄列得出但條目全部 PermissionDenied 的行程（`systemd --user` 持有 CAP_WAKE_ALARM，
+/// 核心的 fd 連結存取檢查以整個行程為單位失敗）。替身以指向 `locked`（呼叫端設 mode 000）底下的 symlink 模擬。
+#[cfg(unix)]
+fn fake_entries_denied_proc(root: &std::path::Path, pid: u32, uid: u32, locked: &std::path::Path, entries: u32) {
+    fake_proc(root, pid, 1, uid, &["/usr/lib/systemd/systemd", "--user"], "/usr/lib/systemd/systemd");
+    std::fs::write(root.join(pid.to_string()).join("comm"), "systemd\n").unwrap();
+    std::fs::create_dir_all(locked).unwrap();
+    for fd in 0..entries {
+        let target = locked.join(format!("{pid}-{fd}"));
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, root.join(pid.to_string()).join(format!("fd/{fd}"))).unwrap();
+    }
+}
+
+/// OD-48 D5.2（2026-11-06 實機）：讀得到的同 uid 行程都沒有持有 tty，只剩部分同 uid 行程的 fd 目錄整個讀不到 →
+/// `Partial`，並列出這些行程（讀得到 comm 才附）；不得把整次掃描降成 `Permission`（legacy 停止會一路等到 330 s）。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_reports_uninspectable_same_uid_processes_as_partial() {
+    if running_as_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    let unrelated = tmp.path().join("unrelated.log");
+    std::fs::write(&tty, b"").unwrap();
+    std::fs::write(&unrelated, b"").unwrap();
+    // 讀得到、但沒有持有 tty 的同 uid 行程。
+    fake_proc(tmp.path(), 800, 1, me, &["/usr/bin/bash"], "/usr/bin/bash");
+    std::os::unix::fs::symlink(&unrelated, tmp.path().join("800/fd/3")).unwrap();
+    fake_uninspectable_proc(tmp.path(), 802, me, None);
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    chmod(&tmp.path().join("802/fd"), 0o755);
+    assert!(result.holders.is_empty(), "{result:?}");
+    assert_eq!(result.status, HolderScanStatus::Partial, "{result:?}");
+    assert_eq!(
+        result.uninspectable,
+        vec![
+            UninspectableProc { pid: 801, comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+            UninspectableProc { pid: 802, comm: None, reason: UninspectableReason::FdDirDenied },
+        ]
+    );
+}
+
+/// OD-48 D5.2（2026-11-06 實機：pid 407 `systemd --user` 的 fd 目錄屬使用者、列得出 38 個條目，`stat -L` 全部
+/// PermissionDenied）：fd 目錄讀得到、但沒有任何條目檢查得了的同 uid 行程，與 fd 目錄讀不到同樣列為整個無法檢查。
+/// 目錄可讀但條目數為 0 的行程不是無法檢查（沒開檔），照常視為已檢查。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_treats_all_fd_entries_denied_as_uninspectable() {
+    if running_as_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    std::fs::write(&tty, b"").unwrap();
+    let locked = tmp.path().join("locked");
+    fake_entries_denied_proc(tmp.path(), 407, me, &locked, 3);
+    fake_uninspectable_proc(tmp.path(), 408, me, Some("(sd-pam)"));
+    // 目錄可讀、沒有任何 fd 條目。
+    fake_proc(tmp.path(), 409, 1, me, &["/usr/bin/sleep", "60"], "/usr/bin/sleep");
+    chmod(&locked, 0o000);
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&locked, 0o755);
+    chmod(&tmp.path().join("408/fd"), 0o755);
+    assert!(result.holders.is_empty(), "{result:?}");
+    assert_eq!(result.status, HolderScanStatus::Partial, "{result:?}");
+    assert_eq!(
+        result.uninspectable,
+        vec![
+            UninspectableProc { pid: 407, comm: Some("systemd".into()), reason: UninspectableReason::FdEntriesDenied },
+            UninspectableProc { pid: 408, comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+        ]
+    );
+}
+
+/// D5.2 範圍：讀得到的行程仍持有 tty 時照常列為 holder（狀態 `Partial` 不代表放行）。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_partial_still_lists_readable_holder() {
+    if running_as_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    std::fs::write(&tty, b"").unwrap();
+    fake_proc(tmp.path(), 700, 1, me, &["minicom", "-D", "/dev/ttyUSB0"], "/usr/bin/minicom");
+    std::os::unix::fs::symlink(&tty, tmp.path().join("700/fd/3")).unwrap();
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    assert_eq!(result.holders, vec![700], "{result:?}");
+    assert_eq!(result.status, HolderScanStatus::Partial, "{result:?}");
+}
+
+/// D5.2 範圍（反例）：目標 tty 本身 metadata 回 PermissionDenied（無法比對）→ 維持 `Permission`，
+/// 即使另有只是 fd 目錄讀不到的同 uid 行程。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_target_permission_denied_still_blocks() {
+    if running_as_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let tty = locked.join("ttyUSB0");
+    std::fs::write(&tty, b"").unwrap();
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    chmod(&locked, 0o000);
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&locked, 0o755);
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    assert!(result.holders.is_empty(), "{result:?}");
+    assert_eq!(result.status, HolderScanStatus::Permission, "{result:?}");
+}
+
+/// D5.2 範圍（反例）：同一行程部分 fd 條目可讀、部分回 PermissionDenied（混合）→ 維持 `Permission`，
+/// 即使另有整個無法檢查的同 uid 行程。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_mixed_fd_entry_permission_denied_still_blocks() {
+    if running_as_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    let unrelated = tmp.path().join("unrelated.log");
+    std::fs::write(&tty, b"").unwrap();
+    std::fs::write(&unrelated, b"").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("target"), b"").unwrap();
+    // fd/3 檢查得了；fd/4 跟隨到 mode 000 目錄底下 → metadata 回 PermissionDenied。
+    fake_proc(tmp.path(), 800, 1, me, &["/usr/bin/bash"], "/usr/bin/bash");
+    std::os::unix::fs::symlink(&unrelated, tmp.path().join("800/fd/3")).unwrap();
+    std::os::unix::fs::symlink(locked.join("target"), tmp.path().join("800/fd/4")).unwrap();
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    chmod(&locked, 0o000);
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&locked, 0o755);
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    assert!(result.holders.is_empty(), "{result:?}");
+    assert_eq!(result.status, HolderScanStatus::Permission, "{result:?}");
+}
+
+/// D5.2 範圍（反例）：另有其他原因的讀取失敗（`Unknown` 類）時不降為 `Partial`，沿用原本判定
+/// （任一 PermissionDenied 即 `Permission`）。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_unknown_error_still_blocks() {
+    if running_as_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    std::fs::write(&tty, b"").unwrap();
+    fake_proc(tmp.path(), 800, 1, me, &["/usr/bin/bash"], "/usr/bin/bash");
+    std::fs::remove_dir(tmp.path().join("800/fd")).unwrap();
+    std::fs::write(tmp.path().join("800/fd"), b"not a directory").unwrap();
+    let alone = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    assert_eq!(alone.status, HolderScanStatus::Unknown, "{alone:?}");
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    assert!(result.holders.is_empty(), "{result:?}");
+    assert_eq!(result.status, HolderScanStatus::Permission, "{result:?}");
+}
+
+/// D5.2 範圍（反例）：uid 讀不到（保守納入掃描）的行程整個無法檢查（fd 目錄讀不到，或條目全部讀不到），
+/// 無法確認是同 uid → 維持 `Permission`。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_uninspectable_process_with_unknown_uid_still_blocks() {
+    if running_as_root() {
+        return;
+    }
+    for entries_denied in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = PosixProcScan::new().current_uid().expect("unix uid");
+        let tty = tmp.path().join("ttyUSB0");
+        std::fs::write(&tty, b"").unwrap();
+        let locked = tmp.path().join("locked");
+        if entries_denied {
+            fake_entries_denied_proc(tmp.path(), 801, me, &locked, 2);
+            chmod(&locked, 0o000);
+        } else {
+            fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+        }
+        std::fs::remove_file(tmp.path().join("801/status")).unwrap();
+        let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+        if entries_denied {
+            chmod(&locked, 0o755);
+        } else {
+            chmod(&tmp.path().join("801/fd"), 0o755);
+        }
+        assert!(result.holders.is_empty(), "entries_denied={entries_denied}: {result:?}");
+        assert_eq!(result.status, HolderScanStatus::Permission, "entries_denied={entries_denied}: {result:?}");
+    }
+}
+
+/// 其他呼叫者不受影響：`serialwrapd_tty_holders` 對整個無法檢查的 serialwrapd 仍回 `Permission`（不回 `Partial`）。
+#[cfg(unix)]
+#[test]
+fn posix_serialwrapd_holder_scan_keeps_permission_for_uninspectable_daemon() {
+    if running_as_root() {
+        return;
+    }
+    for entries_denied in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let me = PosixProcScan::new().current_uid().expect("unix uid");
+        let tty = tmp.path().join("ttyUSB0");
+        std::fs::write(&tty, b"").unwrap();
+        let locked = tmp.path().join("locked");
+        fake_proc(tmp.path(), 900, 1, me, &["/usr/bin/python3", "/opt/a/.local/bin/serialwrapd"], "/usr/bin/python3.12");
+        if entries_denied {
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(locked.join("target"), b"").unwrap();
+            std::os::unix::fs::symlink(locked.join("target"), tmp.path().join("900/fd/3")).unwrap();
+            chmod(&locked, 0o000);
+        } else {
+            chmod(&tmp.path().join("900/fd"), 0o000);
+        }
+        let (holders, status) = PosixProcScan::with_root(tmp.path()).serialwrapd_tty_holders(std::slice::from_ref(&tty));
+        if entries_denied {
+            chmod(&locked, 0o755);
+        } else {
+            chmod(&tmp.path().join("900/fd"), 0o755);
+        }
+        assert!(holders.is_empty(), "entries_denied={entries_denied}");
+        assert_eq!(status, HolderScanStatus::Permission, "entries_denied={entries_denied}");
+    }
 }
 
 #[test]

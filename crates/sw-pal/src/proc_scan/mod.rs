@@ -81,6 +81,60 @@ pub enum HolderScanStatus {
     Permission,
     Unknown,
     Unsupported,
+    /// 只由 [`ProcScan::uart_holders_same_uid`] 回傳：目標 tty 身分都取得、讀得到的行程都檢查完畢，
+    /// 只剩部分已確認同 uid 的行程整個無法檢查（見 [`UninspectableReason`]；例如 systemd user session 的
+    /// `(sd-pam)` 與 `systemd --user`），清單見 [`HolderScan::uninspectable`]。不代表這些行程沒有持有 tty；
+    /// 呼叫端要接受時必須把清單回報出來。
+    Partial,
+}
+
+/// 行程整個無法檢查的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninspectableReason {
+    /// `/proc/<pid>/fd` 目錄本身回 PermissionDenied（non-dumpable 行程，例如 `(sd-pam)`）。
+    FdDirDenied,
+    /// fd 目錄列得出，但條目（至少一個）全部回 PermissionDenied、沒有任何條目檢查得了
+    /// （核心以整個行程為單位檢查 fd 連結的存取權，例如持有呼叫端沒有之 capability 的 `systemd --user`）。
+    FdEntriesDenied,
+}
+
+impl UninspectableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FdDirDenied => "fd_dir_denied",
+            Self::FdEntriesDenied => "fd_entries_denied",
+        }
+    }
+}
+
+/// 整個無法檢查 fd 的行程。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninspectableProc {
+    pub pid: u32,
+    /// `/proc/<pid>/comm`（去掉行尾換行）；讀不到為 `None`。
+    pub comm: Option<String>,
+    pub reason: UninspectableReason,
+}
+
+/// [`ProcScan::uart_holders_same_uid`] 的結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HolderScan {
+    pub holders: Vec<u32>,
+    pub status: HolderScanStatus,
+    /// 整個無法檢查的行程（依 pid 排序）。`Partial` 時必定非空；`Permission`／`Unknown` 時也可能非空
+    /// （表示除此之外另有其他讀取失敗，或其中有 uid 未確認的行程）。
+    pub uninspectable: Vec<UninspectableProc>,
+}
+
+impl HolderScan {
+    /// 由舊式 `(holders, status)` 組成（無「無法檢查」清單）。
+    pub fn from_pair((holders, status): (Vec<u32>, HolderScanStatus)) -> Self {
+        Self {
+            holders,
+            status,
+            uninspectable: Vec::new(),
+        }
+    }
 }
 
 /// 行程掃描失敗錯誤。
@@ -293,9 +347,9 @@ pub trait ProcScan: Send + Sync {
         None
     }
     /// OD-48 D5：與目前行程同 uid 的**任何**行程是否仍持有 `paths`（不限 serialwrapd）。
-    /// 預設沿用 serialwrapd holder 掃描；POSIX 實作掃全部同 uid 行程，Windows 回 `Unsupported`。
-    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
-        self.serialwrapd_tty_holders(paths)
+    /// 預設沿用 serialwrapd holder 掃描；POSIX 實作掃全部同 uid 行程（可能回 `Partial`），Windows 回 `Unsupported`。
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> HolderScan {
+        HolderScan::from_pair(self.serialwrapd_tty_holders(paths))
     }
     /// OD-48 OWNER-BATCH #3：`/proc/<pid>/cgroup` 原文（Linux）；行程不存在或平台不支援 → `None`。
     /// 由 [`classify_cgroup`] 判定該行程所屬的監管者。
