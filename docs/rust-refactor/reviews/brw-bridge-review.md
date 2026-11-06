@@ -102,7 +102,7 @@ BRIDGE: APPROVE
 
 審查範圍：`8e1484ca`。CI 的 `bridge-tools` 在第一輪核准後抓到 `_write_once` 提前回 0，修正後兩位審查者分別審查這個 commit，結論都是 `BRIDGE: APPROVE`，沒有 High 或 Medium。
 
-最終核准 tree：`85b55b6c930835b39c49959f103df3d9a70a0a2b270c75c29fa33b382f6d97a1`。上方第一輪的 tree 已被這個值取代。
+第二輪核准 tree：`85b55b6c930835b39c49959f103df3d9a70a0a2b270c75c29fa33b382f6d97a1`。上方第一輪的 tree 已被這個值取代。
 
 編排者另外核對：`tools/uart_stdio_bridge/tests/test_win_serial_endpoint.py` 0 行刪除，新回歸修前紅、修後綠，`test_partial_setter_deadline_consumption_does_not_send_with_stale_timeout` 未改。
 
@@ -173,6 +173,110 @@ BRIDGE: APPROVE
   1. 真實 Windows pySerial 在變更 `write_timeout` 時會透過 `SetCommTimeouts` 系統呼叫更新 COM 參數，setter 耗時即為系統呼叫與核心排程之固有成本，本修法精確對應此真實硬體行為。
   2. 本修法將 `if configured_timeout is None: return 0` 拆成獨立先行判定，避免了後續比較與數值相減時可能發生的型別例外。
   3. 算出的有效 timeout 精度下限固定為 1 ms，不會向 pySerial 傳入 0 或負值，避開了 pySerial Windows overlapped write 在 0 timeout 下的不可測狀態。
+
+---
+
+BRIDGE: APPROVE
+
+## 第三輪：Copilot review 修正
+
+審查範圍：`cbf38479`，只改註解與一處縮排，沒有行為變更。兩位審查者分別確認，結論都是 `BRIDGE: APPROVE`。
+
+Copilot 另外主張 `_mark_progress` 與 `_wait_with_progress` 鎖順序相反會死鎖。兩位審查者與編排者分別讀程式碼，判定不成立：`_mark_progress` 是先放掉 `_progress_lock` 才取 `_progress_changed`，沒有持有一把再等另一把的路徑。
+
+最終核准 tree：`f79f330fe0656c638ce3acfe8c0252c34a4688ed7d739eb94dc66544febbc575`。
+
+### 審查者 A：grok-4.7
+
+我只讀最新一個 commit 與相關程式，確認註解／縮排之外有沒有語意變動，並核對 writer 的鎖順序是否真的會死鎖。Commit 只動 `writer.py`。我接著對照 `_set_failure_locked` 的縮排區塊，以及 `_mark_progress` 與 `_wait_with_progress` 的鎖取得順序。縮排層級我再用原始空白核對一次，確認 `with` 的範圍沒有因為少縮一層而跑掉。這個 commit 只有註解與一處縮排，沒有語意變更。`_set_failure_locked` 仍在 `with self._lock` 內。`_mark_progress` 並未在持有 `_progress_lock` 時去取 `_progress_changed`，這組鎖順序不會死鎖。
+
+`cbf384796` 只改 `tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py`，7 行增、6 行刪。`_ABSOLUTE_WAIT_CAP_S = 300.0` 沒有改值。新增的註解只縮小說明範圍：五分鐘上限只管 close/flush 等待 worker 的那段；其後的 `fsync` 與 `os.close`（`close()` 約 783–795 行）本來就沒有套這個期限。
+
+worker 例外路徑的縮排從 24 格改成 20 格。AST 顯示第 422 行的呼叫仍是第 421 行 `with self._lock` 的直接 body：
+
+```421:426:tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py
+                with self._lock:
+                    self._set_failure_locked(
+                        code,
+                        worker_failed=True,
+                        detail="write_error",
+                    )
+```
+
+下一句 `_best_effort_failure_marker` 維持 16 格，在 `with` 結束之後，與改動前相同。
+
+`_mark_progress` 的兩個 `with` 是前後相接，不是巢狀：先取得並釋放 `_progress_lock`，之後才取得 `_progress_changed` 做 `notify_all()`。
+
+```183:189:tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py
+    def _mark_progress(self, progress_at: float) -> None:
+        # 先記錄時間再通知，避免 waiter 持有 condition lock 時延後可見進度。
+        with self._progress_lock:
+            self._progress_generation += 1
+            self._progress_at = progress_at
+        with self._progress_changed:
+            self._progress_changed.notify_all()
+```
+
+`_wait_with_progress` 才是巢狀：持有 `_progress_changed` 時短暫取得 `_progress_lock`，讀完 generation 與時間後即釋放，然後才 `wait()`。全檔沒有任何路徑在持有 `_progress_lock` 時再去取 `_progress_changed`。`_notify_progress_waiters` 只拿 condition，`_progress_wait_state` 只拿 `_progress_lock`。相反順序要構成死鎖，兩邊都必須同時握著對方下一把鎖；這裡標記端在拿第二把鎖之前已經放下第一把，所以這組鎖不會死鎖。
+
+BRIDGE: APPROVE
+
+### 審查者 B：gemini-3.8-flash-high（agy）
+
+針對最新 commit（`git show HEAD`，commit `cbf38479`）與相關程式碼之獨立審查報告如下：
+
+---
+
+### 一、最新 Commit（HEAD）變更查核
+
+經比對 `git show HEAD` 對 `tools/uart_stdio_bridge/src/uart_stdio_bridge/evidence/writer.py` 的變更：
+
+1. **語意變動查核**：
+   - **註解修訂**（第 47–49 行）：修正與補充說明 `_ABSOLUTE_WAIT_CAP_S`（300.0s）僅涵蓋等待 worker 排空這段時間，不涵蓋收尾時無法設逾時的 `fsync` 與 `os.close`。此處純為註解文字調整。
+   - **縮排修訂**（第 421–426 行）：將原本多縮排一層（24 個空格）的 `self._set_failure_locked(...)` 修正為正規的 20 個空格縮排。
+   - **結論**：除了註解文字與空白縮排外，**沒有任何語意變更或執行邏輯變動**。
+
+2. **`_set_failure_locked` 範圍查核**：
+   - 觀察 `writer.py` 第 420–427 行上下文：
+     ```python
+     code = self._classify_error(exc)
+     with self._lock:
+         self._set_failure_locked(
+             code,
+             worker_failed=True,
+             detail="write_error",
+         )
+     self._best_effort_failure_marker(...)
+     ```
+   - 縮排調整後，`_set_failure_locked` 縮排為 20 格，比 `with self._lock:`（16 格）多 4 格，**依然完全在 `with self._lock` 區塊內部**，確認無誤。
+
+---
+
+### 二、Copilot 死鎖主張之獨立分析
+
+Copilot 主張：`writer.py` 的 `_mark_progress` 與 `_wait_with_progress` 鎖順序相反，會造成死鎖。
+
+1. **`_mark_progress` 是否在持有 `_progress_lock` 時去取 `_progress_changed`**：
+   - **否，並未持有**。
+   - 檢視 `_mark_progress` 原始碼（第 183–190 行）：
+     ```python
+     def _mark_progress(self, progress_at: float) -> None:
+         # 先記錄時間再通知，避免 waiter 持有 condition lock 時延後可見進度。
+         with self._progress_lock:
+             self._progress_generation += 1
+             self._progress_at = progress_at
+         with self._progress_changed:
+             self._progress_changed.notify_all()
+     ```
+   - 程式碼中是兩個**循序獨立**的 `with` 區塊。`_progress_lock` 在第一個區塊結束時即已釋放；進入 `with self._progress_changed:` 嘗試獲取條件變數鎖時，**執行緒手中並未持有 `_progress_lock`**。
+
+2. **死鎖是否可能及理由**：
+   - **死鎖不可能發生**。
+   - **理由**：
+     - 死鎖成立的必要條件之一為「持有並等待（Hold and Wait）」所構成的「循環等待（Circular Wait）」。
+     - 在 `_wait_with_progress` 中，執行緒持有 `_progress_changed` 條件鎖時，會進入 `with self._progress_lock:` 短暫讀取世代與時間戳，隨即釋放 `_progress_lock`；若進入等待，底層 `self._progress_changed.wait(...)` 亦會釋放 `_progress_changed`。
+     - 在 `_mark_progress` 中，執行緒是先獲取並釋放 `_progress_lock` 後，才去獲取 `_progress_changed` 進行通知。它在請求 `_progress_changed` 時手中沒有任何鎖，絕不會發生「持有 A 等待 B」與「持有 B 等待 A」的互相等待情況。
+     - 因此兩者並不存在鎖獲取順序顛倒所導致的死鎖閉環，Copilot 顯然誤將兩個平行的 `with` 視為巢狀持有，該死鎖主張不成立。
 
 ---
 
