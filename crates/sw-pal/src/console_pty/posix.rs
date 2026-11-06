@@ -243,28 +243,189 @@ impl ConsoleIo for PtyMaster {
     fn close(self: Box<Self>) {}
 
     fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>> {
-        todo!("P8-T7")
+        // F_DUPFD_CLOEXEC：新 fd 與 master 共用 open file description（O_NONBLOCK 一併共用）。
+        // SAFETY: self.fd 由本結構持有且仍開啟。
+        let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(PalError::from_errno(errno()));
+        }
+        Ok(Box::new(PtyWriteHalf { fd }))
     }
 
-    fn wait_readable(&mut self, _timeout: Option<Duration>) -> PalResult<Readiness> {
-        todo!("P8-T7")
+    fn wait_readable(&mut self, timeout: Option<Duration>) -> PalResult<Readiness> {
+        let start = Instant::now();
+        loop {
+            let timeout_ms = remaining_timeout_ms(start, timeout);
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake.read_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: fds 是有效的兩個 pollfd 結構。
+            let rc = unsafe {
+                libc::poll(
+                    fds.as_mut_ptr(),
+                    fds.len() as libc::nfds_t,
+                    timeout_ms.unwrap_or(-1),
+                )
+            };
+            if rc == 0 {
+                return Ok(Readiness::TimedOut);
+            }
+            if rc < 0 {
+                let code = errno();
+                if code == libc::EINTR {
+                    continue;
+                }
+                return Err(PalError::from_errno(code));
+            }
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                drain_wake(self.wake.read_fd, self.wake.eventfd);
+                return Ok(Readiness::Woken);
+            }
+            if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Ok(Readiness::Ready);
+            }
+            if fds[0].revents & libc::POLLNVAL != 0 {
+                return Err(PalError::from_errno(libc::EBADF));
+            }
+        }
     }
 }
 
-pub(crate) fn link(_slave_path: &str, _link: &Path) -> PalResult<()> {
-    todo!("P8-T7")
+/// `dup(master)` 的寫入分身；EAGAIN → `Ok(0)`。
+struct PtyWriteHalf {
+    fd: RawFd,
 }
 
-pub(crate) fn unlink(_link: &Path) -> PalResult<()> {
-    todo!("P8-T7")
+impl Drop for PtyWriteHalf {
+    fn drop(&mut self) {
+        // SAFETY: dup 出來的 fd 由本結構獨占持有。
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
 }
 
-pub(crate) fn tty_setraw(_slave: &PtySlaveRef) -> PalResult<()> {
-    todo!("P8-T7")
+impl ConsoleWriteHalf for PtyWriteHalf {
+    fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
+        loop {
+            // SAFETY: data 在同步 write 期間有效，fd 由本結構持有。
+            let n = unsafe { libc::write(self.fd, data.as_ptr().cast(), data.len()) };
+            if n >= 0 {
+                return Ok(n as usize);
+            }
+            let code = errno();
+            if code == libc::EINTR {
+                continue;
+            }
+            if code == libc::EAGAIN || code == libc::EWOULDBLOCK {
+                return Ok(0);
+            }
+            return Err(PalError::from_errno(code));
+        }
+    }
 }
 
-pub(crate) fn tcgetattr_speed(_slave: &PtySlaveRef) -> PalResult<TermSpeed> {
-    todo!("P8-T7")
+fn io_err(e: std::io::Error) -> PalError {
+    PalError::from_errno(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+/// 建立（或取代）端點 symlink：先建父目錄，再以「暫名 symlink + rename」原子取代；目標是目錄時失敗、不動它。
+pub(crate) fn link(slave_path: &str, link: &Path) -> PalResult<()> {
+    if let Some(parent) = link.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    let mut tmp_name = link.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = link.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(slave_path, &tmp).map_err(io_err)?;
+    if let Err(e) = std::fs::rename(&tmp, link) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io_err(e));
+    }
+    Ok(())
+}
+
+/// 移除端點 symlink；不存在視為成功；目錄不動、回錯。
+pub(crate) fn unlink(link: &Path) -> PalResult<()> {
+    match std::fs::remove_file(link) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+/// 開啟 slave（不設 TIOCEXCL、不取為控制終端）；呼叫者負責 close。
+fn open_slave(slave: &PtySlaveRef) -> PalResult<RawFd> {
+    let c = std::ffi::CString::new(slave.path.as_bytes())
+        .map_err(|_| PalError::from_errno(libc::EINVAL))?;
+    // SAFETY: c 為 NUL 結尾路徑。
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(PalError::from_errno(errno()));
+    }
+    Ok(fd)
+}
+
+/// CPython `tty.setraw`（when=TCSAFLUSH）等價。
+pub(crate) fn tty_setraw(slave: &PtySlaveRef) -> PalResult<()> {
+    let fd = open_slave(slave)?;
+    let result = (|| {
+        // SAFETY: attrs 是 tcgetattr 輸出位置，fd 開啟中。
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+            return Err(errno());
+        }
+        t.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        t.c_oflag &= !libc::OPOST;
+        t.c_cflag &= !(libc::CSIZE | libc::PARENB);
+        t.c_cflag |= libc::CS8;
+        t.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        // SAFETY: fd 開啟中，t 為有效 termios。
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &t) } != 0 {
+            return Err(errno());
+        }
+        Ok(())
+    })();
+    // SAFETY: fd 由本函式開啟且只關一次。
+    unsafe { libc::close(fd) };
+    result.map_err(PalError::from_errno)
+}
+
+/// 讀取 slave 的 ispeed／ospeed（原始 `speed_t` 代碼）。
+pub(crate) fn tcgetattr_speed(slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+    let fd = open_slave(slave)?;
+    // SAFETY: attrs 是 tcgetattr 輸出位置，fd 開啟中。
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::tcgetattr(fd, &mut t) };
+    let code = errno();
+    // SAFETY: fd 由本函式開啟且只關一次。
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(PalError::from_errno(code));
+    }
+    // SAFETY: t 為 tcgetattr 填好的有效 termios。
+    let (i, o) = unsafe { (libc::cfgetispeed(&t), libc::cfgetospeed(&t)) };
+    Ok(TermSpeed {
+        ispeed: i as u32,
+        ospeed: o as u32,
+    })
 }
 
 /// 建立 byte-transparent PTY；master 非阻塞，daemon 保留 slave fd 避免閒置 EOF。

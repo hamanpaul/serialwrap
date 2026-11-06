@@ -221,7 +221,7 @@ pub fn native() -> Platform {
                 on_demand_autostart: false,
                 console_kind: ConsoleKind::Pty,
                 native_device: DeviceBackendKind::Posix,
-                flash_endpoint: false,
+                flash_endpoint: true,
             },
         }
     }

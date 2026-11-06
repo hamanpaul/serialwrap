@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::console_pty::{ConsoleIo, ConsoleTransportFactory, ConsoleWriteHalf, PtySlaveRef, Readiness, TermSpeed};
-use crate::traits::{IoWaker, PalResult, ReadOutcome};
+use crate::traits::{IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome};
 use crate::ConsoleKind;
 
 /// 記憶體 console 工廠：記錄 `link`／`unlink`／`tty_setraw`，`tcgetattr_speed` 回預先設定的速率。
@@ -28,6 +28,14 @@ impl FakeConsoleFactory {
             raw: Mutex::new(Vec::new()),
             speeds: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn check(&self, name: &str) -> PalResult<()> {
+        if self.flash {
+            Ok(())
+        } else {
+            Err(crate::console_pty::unsupported_flash(name))
+        }
     }
 
     pub fn set_speed(&self, path: &str, speed: TermSpeed) {
@@ -54,20 +62,32 @@ impl ConsoleTransportFactory for FakeConsoleFactory {
         None
     }
 
-    fn link(&self, _slave_path: &str, _link: &Path) -> PalResult<()> {
-        todo!("P8-T7")
+    fn link(&self, slave_path: &str, link: &Path) -> PalResult<()> {
+        self.check("link")?;
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).insert(link.to_path_buf(), slave_path.to_string());
+        Ok(())
     }
 
-    fn unlink(&self, _link: &Path) -> PalResult<()> {
-        todo!("P8-T7")
+    fn unlink(&self, link: &Path) -> PalResult<()> {
+        self.check("unlink")?;
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).remove(link);
+        Ok(())
     }
 
-    fn tty_setraw(&self, _slave: &PtySlaveRef) -> PalResult<()> {
-        todo!("P8-T7")
+    fn tty_setraw(&self, slave: &PtySlaveRef) -> PalResult<()> {
+        self.check("tty_setraw")?;
+        self.raw.lock().unwrap_or_else(|e| e.into_inner()).push(slave.path.clone());
+        Ok(())
     }
 
-    fn tcgetattr_speed(&self, _slave: &PtySlaveRef) -> PalResult<TermSpeed> {
-        todo!("P8-T7")
+    fn tcgetattr_speed(&self, slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+        self.check("tcgetattr_speed")?;
+        self.speeds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&slave.path)
+            .copied()
+            .ok_or_else(|| PalError::plain(PalErrorKind::Io, "tcgetattr failed"))
     }
 }
 
@@ -86,17 +106,18 @@ pub struct FakeConsoleHandle {
 }
 
 impl FakeConsoleHandle {
-    pub fn push_rx(&self, _bytes: &[u8]) {
-        todo!("P8-T7")
+    pub fn push_rx(&self, bytes: &[u8]) {
+        self.shared.rx.lock().unwrap_or_else(|e| e.into_inner()).extend(bytes);
+        self.shared.cond.notify_all();
     }
 
     pub fn take_tx(&self) -> Vec<u8> {
-        todo!("P8-T7")
+        std::mem::take(&mut *self.shared.tx.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// TX 緩衝上限（預設無限制以外的小值由測試設定）；滿了之後 `try_write` 回 `Ok(0)`。
-    pub fn set_tx_capacity(&self, _cap: usize) {
-        todo!("P8-T7")
+    /// TX 緩衝總容量（預設無限制）；滿了之後 `try_write` 回 `Ok(0)`（模擬 EAGAIN）。
+    pub fn set_tx_capacity(&self, cap: usize) {
+        *self.shared.tx_capacity.lock().unwrap_or_else(|e| e.into_inner()) = cap;
     }
 }
 
@@ -118,13 +139,48 @@ impl FakeConsoleIo {
     }
 }
 
+impl FakeConsoleIo {
+    /// 喚醒優先（與 PTY 實作一致），其次可讀；喚醒旗標被消耗。
+    fn wait(&self, timeout: Option<Duration>) -> Readiness {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut woken = self.shared.woken.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if *woken {
+                *woken = false;
+                return Readiness::Woken;
+            }
+            if !self.shared.rx.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                return Readiness::Ready;
+            }
+            match deadline {
+                None => woken = self.shared.cond.wait(woken).unwrap_or_else(|e| e.into_inner()),
+                Some(d) => {
+                    let now = std::time::Instant::now();
+                    if now >= d {
+                        return Readiness::TimedOut;
+                    }
+                    woken = self.shared.cond.wait_timeout(woken, d - now).unwrap_or_else(|e| e.into_inner()).0;
+                }
+            }
+        }
+    }
+}
+
 struct FakeWriter {
     shared: Arc<Shared>,
 }
 
+fn shared_write(shared: &Shared, data: &[u8]) -> usize {
+    let cap = *shared.tx_capacity.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tx = shared.tx.lock().unwrap_or_else(|e| e.into_inner());
+    let n = cap.saturating_sub(tx.len()).min(data.len());
+    tx.extend_from_slice(&data[..n]);
+    n
+}
+
 impl ConsoleWriteHalf for FakeWriter {
-    fn try_write(&mut self, _data: &[u8]) -> PalResult<usize> {
-        todo!("P8-T7")
+    fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
+        Ok(shared_write(&self.shared, data))
     }
 }
 
@@ -134,16 +190,28 @@ struct FakeWaker {
 
 impl IoWaker for FakeWaker {
     fn wake(&self) {
-        todo!("P8-T7")
+        *self.shared.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.shared.cond.notify_all();
     }
 }
 
 impl ConsoleIo for FakeConsoleIo {
-    fn read(&mut self, _buf: &mut [u8], _timeout: Option<Duration>) -> PalResult<ReadOutcome> {
-        todo!("P8-T7")
+    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+        match self.wait(timeout) {
+            Readiness::Woken => Ok(ReadOutcome::Woken),
+            Readiness::TimedOut => Ok(ReadOutcome::TimedOut),
+            Readiness::Ready => {
+                let mut rx = self.shared.rx.lock().unwrap_or_else(|e| e.into_inner());
+                let n = buf.len().min(rx.len());
+                for slot in buf.iter_mut().take(n) {
+                    *slot = rx.pop_front().unwrap_or(0);
+                }
+                Ok(ReadOutcome::Data(n))
+            }
+        }
     }
-    fn try_write(&mut self, _data: &[u8]) -> PalResult<usize> {
-        todo!("P8-T7")
+    fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
+        Ok(shared_write(&self.shared, data))
     }
     fn waker(&self) -> Arc<dyn IoWaker> {
         Arc::new(FakeWaker { shared: Arc::clone(&self.shared) })
@@ -155,7 +223,7 @@ impl ConsoleIo for FakeConsoleIo {
     fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>> {
         Ok(Box::new(FakeWriter { shared: Arc::clone(&self.shared) }))
     }
-    fn wait_readable(&mut self, _timeout: Option<Duration>) -> PalResult<Readiness> {
-        todo!("P8-T7")
+    fn wait_readable(&mut self, timeout: Option<Duration>) -> PalResult<Readiness> {
+        Ok(self.wait(timeout))
     }
 }

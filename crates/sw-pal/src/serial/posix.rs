@@ -215,11 +215,30 @@ pub fn set_baud_with(ops: &mut dyn TtyTermiosOps, baud: u32) -> PalResult<()> {
 
 /// `mirror_termios_from` 的核心：依 slave 速率讀取結果與 fallback 套用到 serial（純邏輯，測試以錄製替身驗證）。
 pub fn mirror_with(
-    _ops: &mut dyn TtyTermiosOps,
-    _slave: PalResult<crate::console_pty::TermSpeed>,
-    _fallback_baud: Option<u32>,
+    ops: &mut dyn TtyTermiosOps,
+    slave: PalResult<crate::console_pty::TermSpeed>,
+    fallback_baud: Option<u32>,
 ) -> PalResult<()> {
-    todo!("P8-T7")
+    match crate::traits::plan_mirror(&slave, fallback_baud) {
+        crate::traits::MirrorPlan::SetSpeeds { ispeed, ospeed } => {
+            let mut attrs = ops.tcgetattr().map_err(PalError::from_errno)?;
+            // SAFETY: attrs 是 tcgetattr 產生的有效 termios；速率非 B0（plan_mirror 保證）。
+            if unsafe { libc::cfsetispeed(&mut attrs, ispeed as libc::speed_t) } != 0 {
+                return Err(PalError::from_errno(errno()));
+            }
+            // SAFETY: 同上。
+            if unsafe { libc::cfsetospeed(&mut attrs, ospeed as libc::speed_t) } != 0 {
+                return Err(PalError::from_errno(errno()));
+            }
+            ops.tcsetattr(&attrs).map_err(PalError::from_errno)
+        }
+        // fallback 失敗（含未列於 POSIX_BAUD_MAP 的 no-op）一律忽略。
+        crate::traits::MirrorPlan::FallbackBaud(baud) => {
+            let _ = set_baud_with(ops, baud);
+            Ok(())
+        }
+        crate::traits::MirrorPlan::Ignore => Ok(()),
+    }
 }
 
 /// `CloseToken::close` 的系統呼叫序列（記錄順序即為 `CloseOp` 順序）。
@@ -965,14 +984,7 @@ impl SerialHandle for PosixSerialHandle {
     }
 
     fn set_baud(&self, baud: u32) -> PalResult<()> {
-        let fd = self
-            .close
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fd
-            .ok_or_else(|| PalError::from_errno(libc::EBADF))?;
-        let mut ops = LibcTermiosOps { fd };
-        set_baud_with(&mut ops, baud)
+        crate::traits::SerialLineControl::set_baud(&PosixLineControl { close: Arc::clone(&self.close) }, baud)
     }
 
     fn line_control(&self) -> Arc<dyn crate::traits::SerialLineControl> {
@@ -1000,17 +1012,35 @@ struct PosixLineControl {
     close: Arc<Mutex<PosixClose>>,
 }
 
+impl PosixLineControl {
+    fn ops(&self) -> PalResult<LibcTermiosOps> {
+        let fd = self
+            .close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fd
+            .ok_or_else(|| PalError::from_errno(libc::EBADF))?;
+        Ok(LibcTermiosOps { fd })
+    }
+}
+
 impl crate::traits::SerialLineControl for PosixLineControl {
-    fn set_baud(&self, _baud: u32) -> PalResult<()> {
-        todo!("P8-T7")
+    fn set_baud(&self, baud: u32) -> PalResult<()> {
+        let mut ops = self.ops()?;
+        set_baud_with(&mut ops, baud)
     }
 
     fn mirror_termios_from(
         &self,
-        _pty: &crate::console_pty::PtySlaveRef,
-        _fallback_baud: Option<u32>,
+        pty: &crate::console_pty::PtySlaveRef,
+        fallback_baud: Option<u32>,
     ) -> PalResult<()> {
-        todo!("P8-T7")
+        let mut ops = self.ops()?;
+        mirror_with(
+            &mut ops,
+            crate::console_pty::posix::tcgetattr_speed(pty),
+            fallback_baud,
+        )
     }
 }
 

@@ -45,6 +45,7 @@ fn platform(script: Vec<FakeConn>) -> (ClientPlatform, Arc<ScriptedConnector>) {
             on_demand_autostart: false,
             console_kind: sw_pal::ConsoleKind::Pty,
             native_device: DeviceBackendKind::Posix,
+            flash_endpoint: true,
         },
     };
     (p, conn)

@@ -796,8 +796,8 @@ impl SerialHandle for FakeSerialHandle {
         (reader, writer, waker, close_token)
     }
 
-    fn set_baud(&self, _baud: u32) -> PalResult<()> {
-        Ok(())
+    fn set_baud(&self, baud: u32) -> PalResult<()> {
+        crate::traits::SerialLineControl::set_baud(&*self.inner.line, baud)
     }
 
     fn line_control(&self) -> Arc<dyn crate::traits::SerialLineControl> {
@@ -841,16 +841,36 @@ impl FakeLineControl {
 }
 
 impl crate::traits::SerialLineControl for FakeLineControl {
-    fn set_baud(&self, _baud: u32) -> PalResult<()> {
-        todo!("P8-T7")
+    fn set_baud(&self, baud: u32) -> PalResult<()> {
+        self.baud_calls.lock().unwrap_or_else(|e| e.into_inner()).push(baud);
+        if self.fail_baud.load(Ordering::SeqCst) {
+            return Err(PalError::plain(crate::traits::PalErrorKind::Io, "fake set_baud failure"));
+        }
+        Ok(())
     }
 
     fn mirror_termios_from(
         &self,
-        _pty: &crate::console_pty::PtySlaveRef,
-        _fallback_baud: Option<u32>,
+        pty: &crate::console_pty::PtySlaveRef,
+        fallback_baud: Option<u32>,
     ) -> PalResult<()> {
-        todo!("P8-T7")
+        let slave = self
+            .slave_speeds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pty.path)
+            .cloned()
+            .unwrap_or_else(|| Err(PalError::plain(crate::traits::PalErrorKind::Io, "tcgetattr failed")));
+        match crate::traits::plan_mirror(&slave, fallback_baud) {
+            crate::traits::MirrorPlan::SetSpeeds { ispeed, ospeed } => {
+                self.speed_writes.lock().unwrap_or_else(|e| e.into_inner()).push((ispeed, ospeed));
+            }
+            crate::traits::MirrorPlan::FallbackBaud(b) => {
+                let _ = self.set_baud(b);
+            }
+            crate::traits::MirrorPlan::Ignore => {}
+        }
+        Ok(())
     }
 }
 

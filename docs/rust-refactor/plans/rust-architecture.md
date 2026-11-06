@@ -468,8 +468,16 @@ pub enum HolderScanStatus { Ok, Permission, Unknown, Unsupported }
 pub trait SerialHandle: Send {
     fn split(self: Box<Self>) -> (Box<dyn SerialReader>, Box<dyn SerialWriter>, Arc<dyn IoWaker>, CloseToken);
     fn set_baud(&self, baud: u32) -> PalResult<()>;
-    fn mirror_termios_from(&self, pty: &PtySlaveRef, fallback_baud: Option<u32>) -> PalResult<()>; // Windows：Unsupported → 呼叫端只 set_baud
+    fn mirror_termios_from(&self, pty: &PtySlaveRef, fallback_baud: Option<u32>) -> PalResult<()>; // 委派 line_control()；Windows：Unsupported → 呼叫端只 set_baud
+    /// split 前取得，split 後仍可持有（P8-T7）。預設實作全部 Unsupported。
+    fn line_control(&self) -> Arc<dyn SerialLineControl>;
     fn is_alive(&self) -> bool;
+}
+pub trait SerialLineControl: Send + Sync {
+    fn set_baud(&self, baud: u32) -> PalResult<()>;   // 未列於 POSIX_BAUD_MAP → Ok(()) no-op
+    /// POSIX：讀 slave 的 ispeed/ospeed 寫入 serial fd（TCSANOW）。任一方向 B0＝「未設」→ set_baud(fallback)；
+    /// 絕不把 B0 寫到實體 UART（B0 拉低 DTR、可能重置 MCU）。tcgetattr 失敗有 fallback → set_baud(fallback)，再失敗忽略。
+    fn mirror_termios_from(&self, pty: &PtySlaveRef, fallback_baud: Option<u32>) -> PalResult<()>;
 }
 pub enum ReadOutcome { Data(usize), Eof, Woken, TimedOut }
 pub trait SerialReader: Send {
@@ -641,7 +649,15 @@ pub trait ConsoleTransportFactory: Send + Sync {
     fn open_com0com_console(&self, port: &str) -> PalResult<Box<dyn ConsoleIo>>;
     /// /proc 掃描外部持有的 pts 路徑；Windows 或不可讀時回 None
     fn held_slave_paths(&self) -> Option<HashSet<String>>;
+    /// `/dev/ttyMCU` 端點（P8-T7，皆有預設 Unsupported 實作；Windows 全 Unsupported；daemon 絕不對端點 slave 設 TIOCEXCL）
+    fn link(&self, slave_path: &str, link: &Path) -> PalResult<()>;   // makedirs；symlink 原子取代（目標為目錄則失敗）
+    fn unlink(&self, link: &Path) -> PalResult<()>;                   // 不存在視為成功
+    fn tty_setraw(&self, slave: &PtySlaveRef) -> PalResult<()>;       // 等價 CPython tty.setraw（TCSAFLUSH）
+    fn tcgetattr_speed(&self, slave: &PtySlaveRef) -> PalResult<TermSpeed>; // 原始 speed_t 代碼；0＝B0＝未設
 }
+pub struct TermSpeed { pub ispeed: u32, pub ospeed: u32 }
+pub enum Readiness { Ready, TimedOut, Woken }
+pub trait ConsoleWriteHalf: Send { fn try_write(&mut self, data: &[u8]) -> PalResult<usize>; } // EAGAIN → Ok(0)
 pub struct PtyPair { pub master: Box<dyn ConsoleIo>, pub slave_keepalive: KeepAlive, pub slave_path: String, pub slave_ref: PtySlaveRef }
 pub trait ConsoleIo: Send {
     fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
@@ -649,6 +665,9 @@ pub trait ConsoleIo: Send {
     fn waker(&self) -> Arc<dyn IoWaker>;
     fn has_external_peer(&self, held: Option<&HashSet<String>>) -> bool;
     fn close(self: Box<Self>);
+    fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>>;   // POSIX dup(master)、TCP try_clone（P8-T7）
+    /// 只等可讀、不讀；Woken 沿用 waker() 的同一喚醒通道；Err 只代表等待本身失敗
+    fn wait_readable(&mut self, timeout: Option<Duration>) -> PalResult<Readiness>;
 }
 pub trait ConsoleListener: Send {
     fn endpoint(&self) -> String;   // "127.0.0.1:<port>"
@@ -656,7 +675,7 @@ pub trait ConsoleListener: Send {
 }
 ```
 
-`/dev/ttyMCU`（`caps.flash_endpoint`）使用同一個 `create_pty`，另加 `fn link(&self, slave_path, link_path)`、`tty_setraw(slave)`、`tcgetattr_speed(slave)`，皆屬 POSIX-only capability。
+`/dev/ttyMCU`（`caps.flash_endpoint`）使用同一個 `create_pty`，另加 `link`／`unlink`／`tty_setraw`／`tcgetattr_speed`（見上），皆屬 POSIX-only capability（Windows 回 `Unsupported`，flash 工具直接獨占 COM，不走此模型）。
 
 ### 4.8 `ServiceCtl`
 
