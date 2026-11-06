@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -117,7 +118,9 @@ def _good_reports() -> dict[tuple[str, str], dict]:
 
 def _run(tmp_path: Path, reports: dict, lock: dict | None = None, emap: dict | None = None, *,
          cases_lock: dict | None = None, l15: dict | None = None, prereqs_rc: int = 0,
-         parity_doc: str = PARITY_DOC) -> tuple[int, dict]:
+         parity_doc: str = PARITY_DOC, daemon_path: Path | None = None,
+         build_linux_exit: int | None = None, built_daemon_sha256: str | None = None,
+         dry_run: bool = False) -> tuple[int, dict]:
     res = tmp_path / "l1"
     for (section, platform), rep in reports.items():
         out = res / section / platform / "resource-report.json"
@@ -139,11 +142,20 @@ def _run(tmp_path: Path, reports: dict, lock: dict | None = None, emap: dict | N
         l15_path = tmp_path / "l15.json"
         l15_path.write_text(json.dumps(l15), encoding="utf-8")
         extra = ["--l15-results", str(l15_path)]
+    identity_args = []
+    if daemon_path is not None:
+        identity_args += ["--daemon-path", str(daemon_path)]
+    if build_linux_exit is not None:
+        identity_args += ["--build-linux-exit", str(build_linux_exit)]
+    if built_daemon_sha256 is not None:
+        identity_args += ["--built-daemon-sha256", built_daemon_sha256]
+    if dry_run:
+        identity_args += ["--dry-run"]
     out_path = tmp_path / "gate.json"
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), "--l1-results", str(res), "--map", str(map_path), "--lock", str(lock_path),
          "--cases-lock", str(cases_lock_path), "--parity-doc", str(parity_path), "--prereqs-script", str(prereqs),
-         *extra, "--out", str(out_path)],
+         *extra, *identity_args, "--out", str(out_path)],
         capture_output=True, text=True, timeout=60,
     )
     assert out_path.is_file(), proc.stderr
@@ -531,3 +543,83 @@ def test_plan_lists_derived_cargo_collect_commands(tmp_path: Path) -> None:
     rc, entries = plan(bad, "bad")
     entry = next(e for e in entries if e["set_id"] == "s22_gate:console_conformance_pty")
     assert entry["caps"] is None and entry["collect_argv"] is None and rc == 1, entries
+
+
+def test_gate_output_records_identity_without_changing_verdict(tmp_path: Path) -> None:
+    """S22 身分供 P7 綁定先前切片證據；缺少產物時自檢列出缺漏，但不可改寫既有 gate 判定。"""
+    rc, out = _run(tmp_path, _good_reports())
+
+    assert out["result"] == "PASS" and rc == 0, out
+    assert out["dry_run"] is False
+    assert out["identity"]["git_revision"] == subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    assert out["identity"]["daemon_sha256"] is None
+    assert "identity.daemon_sha256" in out["identity_problems"]["missing"]
+
+
+def test_identity_self_check_requires_matching_tested_and_release_daemon_sha(tmp_path: Path) -> None:
+    """缺來源身分或實際受測 artifact 與獨立 release build SHA 不符時，identity 自檢必須明確拒絕。"""
+    mod = _gate_module()
+    missing, mismatch = mod.identity_problems(None, None)
+    assert "identity 缺失" in missing and not mismatch
+
+    daemon = tmp_path / "serialwrapd"
+    daemon.write_bytes(b"release daemon artifact")
+    actual_sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
+    good = {
+        "git_revision": "a" * 40,
+        "daemon_sha256": actual_sha,
+        "build": {"linux_exit": 0, "daemon_sha256_at_build": actual_sha},
+    }
+    missing, mismatch = mod.identity_problems(good, daemon)
+    assert not missing and not mismatch
+
+    wrong_build = {**good, "build": {"linux_exit": 0, "daemon_sha256_at_build": "e" * 64}}
+    missing, mismatch = mod.identity_problems(wrong_build, daemon)
+    assert not missing and any("建置當下" in reason for reason in mismatch), mismatch
+
+    wrong_artifact = {**good, "daemon_sha256": "f" * 64}
+    missing, mismatch = mod.identity_problems(wrong_artifact, daemon)
+    assert not missing and any("實際 sha256" in reason for reason in mismatch), mismatch
+
+
+def test_gate_output_binds_release_sha_and_dry_run_cannot_supply_tested_sha(tmp_path: Path) -> None:
+    """受測 daemon hash 與 build 快照分開輸出；dry-run 有標記且不提供可被 P7 採用的 daemon SHA。"""
+    daemon = tmp_path / "release" / "serialwrapd"
+    daemon.parent.mkdir()
+    daemon.write_bytes(b"release daemon")
+    sha = hashlib.sha256(daemon.read_bytes()).hexdigest()
+
+    rc, out = _run(tmp_path / "run", _good_reports(), daemon_path=daemon, build_linux_exit=0,
+                   built_daemon_sha256=sha)
+    assert out["result"] == "PASS" and rc == 0, out
+    assert out["dry_run"] is False
+    assert out["identity"]["daemon_sha256"] == sha
+    assert out["identity"]["build"]["daemon_sha256_at_build"] == sha
+    assert out["identity"]["build"]["command"] == [
+        "cargo", "build", "--release", "-p", "sw-daemon", "-p", "sw-cli",
+        "--target", "x86_64-unknown-linux-gnu",
+    ]
+    assert out["identity_problems"] == {"missing": [], "mismatch": []}
+
+    rc, out = _run(tmp_path / "mismatch", _good_reports(), daemon_path=daemon, build_linux_exit=0,
+                   built_daemon_sha256="e" * 64)
+    assert out["result"] == "PASS" and rc == 0, out
+    assert out["identity"]["daemon_sha256"] is None, "SHA 不符時 P7 不得拿到可採用的來源 SHA"
+    assert any("建置當下" in reason for reason in out["identity_problems"]["mismatch"]), out
+
+    rc, out = _run(tmp_path / "dry", _good_reports(), daemon_path=daemon, build_linux_exit=0,
+                   built_daemon_sha256=sha, dry_run=True)
+    assert out["result"] == "PASS" and rc == 0, out
+    assert out["dry_run"] is True
+    assert out["identity"]["daemon_sha256"] is None
+    assert "identity.daemon_sha256" in out["identity_problems"]["missing"]
+
+
+def test_plan_passes_actual_release_build_exit_to_identity() -> None:
+    """計畫須傳實際 build exit；失敗後留在 target 的舊 daemon 不得冒充本次產物。"""
+    plan = (ROOT / "docs" / "rust-refactor" / "plans" / "07-slice22-console.md").read_text(encoding="utf-8")
+
+    assert "S22_BUILD_EXIT=$?" in plan
+    assert '--build-linux-exit "$S22_BUILD_EXIT"' in plan
+    assert "--build-linux-exit 0" not in plan

@@ -38,13 +38,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import pathlib
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -70,6 +71,96 @@ PROCESS_EVIDENCE_ROWS = frozenset({"#185"})
 _RANK = {"PASS": 0, "INSUFFICIENT": 1, "EVIDENCE_MISSING": 1, "FAIL": 2, "INVALID": 3}
 CARGO_COLLECTOR = "scripts/rust/cargo_l1_results.py"
 _CAP_FILTER_RE = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_BUILD_COMMAND = [
+    "cargo", "build", "--release", "-p", "sw-daemon", "-p", "sw-cli",
+    "--target", "x86_64-unknown-linux-gnu",
+]
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git_revision() -> str:
+    """回傳目前受測 HEAD；無法取得時保留明確的 unknown。"""
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                              timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else "unknown"
+
+
+def build_identity(*, daemon_path: pathlib.Path | None, build_linux_exit: int | None,
+                   built_daemon_sha256: str | None, dry_run: bool = False) -> dict[str, Any]:
+    """記錄受測 daemon 與獨立 release 建置快照，供 P7 逐來源綁定。"""
+    daemon_sha256 = None
+    if daemon_path is not None and not dry_run:
+        try:
+            if daemon_path.is_file():
+                daemon_sha256 = sha256_file(daemon_path)
+        except OSError:
+            pass
+    return {
+        "git_revision": git_revision(),
+        "daemon_sha256": daemon_sha256,
+        "build": {
+            "command": list(RELEASE_BUILD_COMMAND),
+            "linux_exit": build_linux_exit,
+            "daemon_sha256_at_build": built_daemon_sha256 or None,
+        },
+    }
+
+
+def identity_problems(identity: Any, daemon_path: pathlib.Path | str | None) -> tuple[list[str], list[str]]:
+    """回傳 (缺漏, 不符)，比照 slice21；不參與既有 S22 verdict 計算。"""
+    missing: list[str] = []
+    mismatch: list[str] = []
+    if not isinstance(identity, Mapping):
+        return ["identity 缺失"], []
+
+    revision = identity.get("git_revision")
+    if not isinstance(revision, str) or not revision or revision == "unknown":
+        missing.append("identity.git_revision")
+    elif not _GIT_REVISION_RE.fullmatch(revision):
+        mismatch.append("identity.git_revision 不是 40 位小寫 hex")
+
+    daemon_sha256 = identity.get("daemon_sha256")
+    if not isinstance(daemon_sha256, str) or not daemon_sha256:
+        missing.append("identity.daemon_sha256")
+    elif not _SHA256_RE.fullmatch(daemon_sha256):
+        mismatch.append("identity.daemon_sha256 不是 64 位小寫 hex")
+
+    build = identity.get("build")
+    if not isinstance(build, Mapping):
+        missing.append("identity.build")
+    else:
+        linux_exit = build.get("linux_exit")
+        at_build = build.get("daemon_sha256_at_build")
+        if linux_exit is None:
+            missing.append("identity.build.linux_exit")
+        elif linux_exit != 0:
+            mismatch.append(f"Linux release 建置失敗（exit {linux_exit}）")
+        if not isinstance(at_build, str) or not at_build:
+            missing.append("identity.build.daemon_sha256_at_build")
+        elif not _SHA256_RE.fullmatch(at_build):
+            mismatch.append("identity.build.daemon_sha256_at_build 不是 64 位小寫 hex")
+        elif daemon_sha256 and at_build != daemon_sha256:
+            mismatch.append("identity.daemon_sha256 與建置當下記錄的 sha256 不符")
+
+    if daemon_path is not None:
+        path = pathlib.Path(daemon_path)
+        if not path.is_file():
+            missing.append(f"daemon artifact 不存在：{path}")
+        elif daemon_sha256:
+            try:
+                if sha256_file(path) != daemon_sha256:
+                    mismatch.append(f"identity.daemon_sha256 與 {path} 實際 sha256 不符")
+            except OSError as exc:
+                missing.append(f"daemon artifact 無法讀取：{path}（{exc}）")
+    return missing, mismatch
 
 
 def _load_judge():
@@ -424,6 +515,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--l15-results", type=pathlib.Path, default=None)
     ap.add_argument("--parity-doc", type=pathlib.Path, default=DEFAULT_PARITY_DOC)
     ap.add_argument("--prereqs-script", type=pathlib.Path, default=DEFAULT_PREREQS)
+    ap.add_argument("--daemon-path", type=pathlib.Path, default=None,
+                    help="受測 release serialwrapd 執行檔（identity.daemon_sha256）")
+    ap.add_argument("--build-linux-exit", type=int, default=None,
+                    help="指定 release 建置命令的退出碼")
+    ap.add_argument("--built-daemon-sha256", default=None,
+                    help="release 建置成功當下記錄的 serialwrapd SHA-256")
+    ap.add_argument("--dry-run", action="store_true", help="在輸出標記 dry_run；不改變既有判定")
     ap.add_argument("--out", type=pathlib.Path)
     ap.add_argument("--plan", action="store_true", help="只依 L1 鎖印出 cargo 集合的前置收集命令（OD-53 推導 --caps）")
     args = ap.parse_args(argv)
@@ -451,8 +549,20 @@ def main(argv: list[str] | None = None) -> int:
         result = "FAIL"
     elif result == "EVIDENCE_MISSING":
         result = "INSUFFICIENT"
+    identity = build_identity(daemon_path=args.daemon_path, build_linux_exit=args.build_linux_exit,
+                              built_daemon_sha256=args.built_daemon_sha256, dry_run=args.dry_run)
+    identity_missing, identity_mismatch = identity_problems(identity, args.daemon_path)
+    if args.dry_run or identity_missing or identity_mismatch:
+        # P7 _bind 以 identity.daemon_sha256 決定採用與否；不完整或自檢失敗時清空此鍵，
+        # 避免下游只看見一組可比對的 SHA、卻略過本 gate 的缺漏診斷。
+        identity["daemon_sha256"] = None
+        checked_missing, checked_mismatch = identity_problems(identity, args.daemon_path)
+        identity_missing = sorted(set(identity_missing + checked_missing))
+        identity_mismatch = sorted(set(identity_mismatch + checked_mismatch))
     payload = {"sections": sections, "cases": cases, "map_coverage": coverage, "parity_rows": parity,
-               "prereqs": prereqs, "l15_reasons": l15_reasons, "result": result}
+               "prereqs": prereqs, "l15_reasons": l15_reasons, "result": result,
+               "dry_run": bool(args.dry_run), "identity": identity,
+               "identity_problems": {"missing": identity_missing, "mismatch": identity_mismatch}}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"[s22_gate_check] result={result} → {args.out}")

@@ -2694,11 +2694,18 @@ python3 scripts/rust/cargo_l1_results.py --platform linux --out $G/cargo_workspa
 python3 scripts/rust/cargo_l1_results.py --platform linux --out $G/console_conformance_pty/linux/resource-report.json -- -p sw-pal --features test-fakes --test console_conformance -- --include-ignored cap_posix_pty__
 scripts/rust/win-test.sh --features test-fakes --caps windows_com          # 報告的 l1_results 複製到 $G/win_test/windows/resource-report.json
 python3 scripts/rust/check_cfg_boundary.py
-cargo build --release -p sw-cli -p sw-daemon
+cargo build --release -p sw-daemon -p sw-cli --target x86_64-unknown-linux-gnu
+S22_BUILD_EXIT=$?
+S22_DAEMON_SHA=""
+if [ "$S22_BUILD_EXIT" -eq 0 ]; then
+  S22_DAEMON_SHA="$(sha256sum target/x86_64-unknown-linux-gnu/release/serialwrapd | cut -d' ' -f1)"
+fi
 SERIALWRAP_AB_LABEL=rust SERIALWRAP_CLI_EXE=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrap SERIALWRAP_DAEMON_EXE=$PWD/target/x86_64-unknown-linux-gnu/release/serialwrapd \
   SW_RESOURCE_REPORT=$G/blackbox_rust/linux/resource-report.json \
   python3 -m pytest -q tests/contract_blackbox/slice21 tests/contract_blackbox/slice22 --junitxml=$G/blackbox_rust/linux/junit.xml   # 前一切片黑箱在 2.2 artifact 上重跑
-python3 scripts/rust/s22_gate_check.py --l1-results $G --map tests/acceptance/slice22_evidence_map.yaml --out $G/s22-gate.json
+python3 scripts/rust/s22_gate_check.py --l1-results $G --map tests/acceptance/slice22_evidence_map.yaml \
+  --daemon-path "$PWD/target/x86_64-unknown-linux-gnu/release/serialwrapd" --build-linux-exit "$S22_BUILD_EXIT" \
+  --built-daemon-sha256 "$S22_DAEMON_SHA" --out $G/s22-gate.json
 python3 -m pytest -q tests/
 python3 -m policy_check --repo .
 ```
