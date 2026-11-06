@@ -6,7 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 GOLDEN = ROOT / "contracts" / "golden" / "mcu_patterns.ndjson"
 
 
