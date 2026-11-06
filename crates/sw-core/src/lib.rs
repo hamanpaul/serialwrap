@@ -19,6 +19,7 @@ pub mod alias_registry;
 pub mod arbiter;
 pub mod capture;
 pub mod drain;
+pub mod file_transfer;
 pub mod generations;
 pub mod lease;
 pub mod login_fsm;

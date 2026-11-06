@@ -21,6 +21,7 @@ crossbeam-channel = { version = "=0.5.15" }
 libc = { version = "=0.2.186" }
 windows-sys = { version = "=0.61.2" }
 tempfile = { version = "=3.23.0" }
+md-5 = { version = "=0.10.6" }
 
 [profile.release]
 opt-level = 3
