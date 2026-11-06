@@ -47,14 +47,14 @@ while (($#)); do
         --scenario)
             (($# >= 2)) || { echo "--scenario 需要參數" >&2; exit 2; }
             case "$2" in
-                upgrade|install-sh) SCENARIO="$2" ;;
+                upgrade|install-sh|attached-legacy) SCENARIO="$2" ;;
                 *) echo "不支援的情境：$2" >&2; exit 2 ;;
             esac
             shift 2
             ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help)
-            echo "用法：$0 [--mode systemd-user|on-demand|systemd-system|all] [--scenario upgrade|install-sh] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
+            echo "用法：$0 [--mode systemd-user|on-demand|systemd-system|all] [--scenario upgrade|install-sh|attached-legacy] [--out DIR] [--wheel serialwrap-0.3.2-*.whl] [--bundle DIR] [--dry-run]"
             exit 0
             ;;
         *) echo "不支援的參數：$1" >&2; exit 2 ;;
@@ -76,6 +76,13 @@ if [[ "$SCENARIO" == install-sh && " ${MODES[*]} " == *" systemd-system "* ]]; t
     echo "--scenario install-sh 不支援 systemd-system（該模式只驗 OD-48 直接 setup 成功路徑）" >&2
     exit 2
 fi
+if [[ "$SCENARIO" == attached-legacy && "${MODES[*]}" != "systemd-user" ]]; then
+    # 未明確指定 --mode 時（預設兩模式）改為只跑 systemd-user；明確指定其他模式則拒絕。
+    if [[ "${MODES[*]}" == "systemd-user on-demand" ]]; then MODES=(systemd-user); else
+        echo "--scenario attached-legacy 只支援 systemd-user（需真實 user session 的 systemd --user 與 (sd-pam)）" >&2
+        exit 2
+    fi
+fi
 WORK="$OUT/work"
 IMAGE="serialwrap-upgrade:$RUN_ID"
 TARBALL_NAME="serialwrap-$NEW_VERSION-linux-x86_64.tar.gz"
@@ -86,6 +93,10 @@ if [[ "$SCENARIO" == install-sh ]]; then
     EXTRA_MOUNTS=(-v "$REPO_ROOT/install.sh:/opt/sw-installer/install.sh:ro" -v "$WORK/dist:/opt/sw-dist:ro")
     EXTRA_DRIVER_ARGS=(--scenario install-sh --installer /opt/sw-installer/install.sh
         --bundle-tarball "/opt/sw-dist/$TARBALL_NAME")
+fi
+
+if [[ "$SCENARIO" == attached-legacy ]]; then
+    EXTRA_DRIVER_ARGS=(--scenario attached-legacy)
 fi
 
 print_command() {

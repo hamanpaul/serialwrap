@@ -1222,6 +1222,55 @@ def test_install_sh_scenario_required_checks_and_verdict():
     assert uc.overall_verdict(rows, required=uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM) == "INSUFFICIENT"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_attached_legacy_scenario_required_checks_are_separate():
+    """attached-legacy 另列必要檢查，不影響既有 19／19／13 矩陣。"""
+    assert len(uc.REQUIRED_CHECKS) == 19
+    assert len(uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM) == 13
+    required = uc.REQUIRED_ATTACHED_LEGACY_CHECKS
+    assert required == ("old_install_0_3_2", "attached_session_ready", "user_session_processes",
+                        "holder_scan_permission", "attached_legacy_setup")
+    assert not (set(required) - {"old_install_0_3_2"}) & set(uc.REQUIRED_CHECKS)
+    rows = [{"id": cid, "verdict": "PASS"} for cid in required]
+    assert uc.overall_verdict(rows, required=required) == "PASS"
+    assert uc.overall_verdict(rows[:-1], required=required) == "INSUFFICIENT"
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("kwargs, verdict", [
+    ({}, "PASS"),
+    # 現行 bug：等滿 330 秒回 TIMEOUT（legacy_stop_pending，rc=2）
+    ({"setup_rc": 2, "body": {"ok": False, "error_code": "TIMEOUT", "reason": "legacy_stop_pending"},
+      "elapsed_s": 331.0, "status_after": None, "old_alive_after": [101]}, "FAIL"),
+    ({"elapsed_s": 130.0}, "FAIL"),
+    ({"status_after": {"version": "0.3.2"}}, "FAIL"),
+    ({"old_alive_after": [101]}, "FAIL"),
+])
+def test_judge_attached_legacy_setup(kwargs, verdict):
+    base = dict(setup_rc=0, body={"ok": True}, elapsed_s=8.0, status_after={"version": "0.4.0"},
+                old_pids=[101], old_alive_after=[], new_version="0.4.0")
+    base.update(kwargs)
+    assert uc.judge_attached_legacy_setup("attached_legacy_setup", **base)["verdict"] == verdict
+
+
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
+def test_run_upgrade_dry_run_attached_legacy_scenario(tmp_path):
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "attached-legacy", "--out", str(tmp_path / "ev")],
+                       cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    assert "--network none" in out
+    assert out.count("--scenario attached-legacy") == 1, out
+    assert "--mode systemd-user" in out and "--mode on-demand" not in out
+    assert "/dev/ttyUSB" not in out and "--device" not in out
+    r = subprocess.run(["bash", str(RUN_UPGRADE), "--dry-run", "--scenario", "attached-legacy", "--mode", "on-demand",
+                        "--out", str(tmp_path / "ev2")], cwd=REPO, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
 def _install_body(**install):
     base = {"op": "install", "to_version": "0.4.0"}
     base.update(install)

@@ -73,6 +73,18 @@ REQUIRED_INSTALL_SH_CHECKS: tuple[str, ...] = (
 )
 
 # install.sh 偵測到舊 pipx 安裝時必須印出的提示（不得自動移除）
+# attached-legacy 情境：0.3.x daemon 執行中且 attach 一個裝置（plan.attached_paths 非空）、同 uid 另有
+# `systemd --user` 與 `(sd-pam)`（fd 目錄不可讀）時，0.4.x 的 `setup` 仍須成功切換，不得等滿逾時。
+REQUIRED_ATTACHED_LEGACY_CHECKS: tuple[str, ...] = (
+    "old_install_0_3_2",
+    "attached_session_ready",
+    "user_session_processes",
+    "holder_scan_permission",
+    "attached_legacy_setup",
+)
+# 修正後的 setup 應在數十秒內完成；現行 bug 會等滿 330 秒才回 TIMEOUT。
+ATTACHED_LEGACY_MAX_SETUP_S = 120.0
+
 PIPX_UNINSTALL_HINT = "pipx uninstall serialwrap"
 
 # 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
@@ -501,3 +513,19 @@ def overall_verdict(rows: list[dict[str, Any]], required: Iterable[str] = REQUIR
     if set(required) - set(ids) or any(r.get("verdict") != "PASS" for r in rows):
         return "INSUFFICIENT"
     return "PASS"
+
+
+def judge_attached_legacy_setup(check_id: str, *, setup_rc: int, body: dict[str, Any] | None, elapsed_s: float,
+                                status_after: dict[str, Any] | None, old_pids: list[int], old_alive_after: list[int],
+                                new_version: str) -> dict[str, Any]:
+    """attached-legacy：setup 成功切換、耗時有界、舊 daemon 行程樹結束、新 daemon 為 new_version。"""
+    body = body or {}
+    ok = (setup_rc == 0 and body.get("ok") is True and elapsed_s < ATTACHED_LEGACY_MAX_SETUP_S
+          and not old_alive_after and bool(status_after) and status_after.get("version") == new_version)
+    reason = None if ok else (
+        f"setup rc={setup_rc} error_code={body.get('error_code')} 耗時 {elapsed_s:.1f}s"
+        f"（上限 {ATTACHED_LEGACY_MAX_SETUP_S:.0f}s）；舊行程存活={old_alive_after}")
+    return row(check_id, "PASS" if ok else "FAIL", reason, setup_rc=setup_rc, elapsed_s=round(elapsed_s, 1),
+               error_code=body.get("error_code"), reason_code=body.get("reason"), message=body.get("message"),
+               detail=body.get("detail"), legacy_stop=body.get("legacy_stop"), old_pids=old_pids,
+               old_alive_after=old_alive_after, daemon_version_after=(status_after or {}).get("version"))
