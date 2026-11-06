@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod fake_shell;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
