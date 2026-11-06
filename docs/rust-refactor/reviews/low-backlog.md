@@ -33,3 +33,12 @@
 | S1-ed46551-3 | Low | `require_system_python` 未先檢查 `venv` 與 `ensurepip` 模組可用性 | 同上 | 待處理 |
 | 既有碼-support-imports | Low | `crates/sw-cli/tests/support/mod.rs` 4 處未使用 import 警告 | 審查 78cbc7a3_d929cac4 | 待處理 |
 | 既有碼-win-test-warnings | Low | `crates/sw-pal/tests/osstr.rs`、`process_ctl.rs` Windows 交叉編譯警告 | 審查 f59ce805_b70bb35f | 待處理 |
+| 既有碼-d11-r16-python | Low | policy_check R-16 的 CLI help 比對結果取決於 `python3` 版本（非 3.12 會不同）；Stage 1 的修正已撤回 | stage1-ledger D11 | 待處理 |
+| 既有碼-bridge-close-timeout | Low | bridge EvidenceWriter 的 `close_timeout_s=10` 寫死，慢磁碟加 1 MiB 推送會 `HARNESS_EVIDENCE_WRITE_FAILED`（exit 3）；改 `src/` 需重新核准 bridge 雜湊 | Stage 1 出口 | 待處理（Stage 2） |
+| 既有碼-run-upgrade-dirty | Low | `test_run_upgrade_*` 單元測試對工作樹是否乾淨敏感 | Stage 1 出口 | 待處理 |
+| 既有碼-common-dead-code | Low | `crates/sw-proto/tests/common/mod.rs` 有 `dead_code`／`unused_imports` 警告，與既有碼-support-imports 一併清理 | 審查 5cac8744_62276c32 | 待處理 |
+| 既有碼-fs-lock-once | Low | `sw-pal::fs_lock::file_lock_nonblocking_contention_wouldblock` 曾紅燈一次，單獨與 workspace 重跑皆過，尚無證據定性 | 審查 5cac8744_8572fbbd | 觀察中 |
+| SG-CI3-01 | Low | Windows／UNC 路徑下的 WAL 輪替（`tests/test_wal.py::TestWalTailLatest::test_tail_raw_latest_scope_is_current_file_after_rotation`）與 4 支資源報告（`tests/test_resource_report.py`）在原生 Windows 驗證受阻，本輪依 OD-75 與 brief 停止修改 Python daemon，亦未改動凍結鎖，保留原始 FAIL 狀態登記於 `docs/rust-refactor/reviews/s1m-ci3-round1.md`，待擁有者裁決驗證環境或指派 Python daemon 調查。 | 審查 5cac8744_a634cc75 | 待處理 |
+| 既有碼-config-profiles-escape | Low | `tests/test_config_profiles.py:229` 字串未加 raw，Python 3.12 有 `SyntaxWarning: invalid escape sequence` | 審查 5cac8744_a634cc75 | 待處理 |
+| 既有碼-win-test-stderr | Low | `test_win_test_report_schema` 斷言沒有印 `r.stderr`；負載 47～56 時第 9 個執行檔 `--list` 回 rc=1 失敗一次，原因未知，同範圍重跑 3 次皆 132 支全過 | PR 249 本機測試 | 待處理 |
+| 既有碼-pages-jekyll | Low | `docs/rust-refactor/inventory/02-rpc.md:548` 的 `{%` 讓 GitHub Pages 的 Jekyll 建置失敗，PR 248 合入 main 後 Pages 無法更新 | main 0ea3cc9c | 待處理 |

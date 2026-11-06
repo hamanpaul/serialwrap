@@ -23,8 +23,8 @@ Stage 1 的修正範圍到此凍結。**只剩 bg1、ba3、bc2、bd 這 4 項**�
 |---|---|---|---|---|
 | A1 | release workflow 的 bundle smoke 要求 `--version` 精確等於 `serialwrap ${VERSION}`，但帶 manifest 時 Rust CLI 會印 `(code <指紋>)`，發版必失敗 | `.github/workflows/release.yml:211` | 26d21917_b7e3c0e5、b7e3c0e5_f8088276 | 已修 b9aca3e3 |
 | A2 | 出口 driver 誤判通過：`l15_exit_driver.py` 拋出未捕捉例外時 `rc_fail` 為空字串，`[[ "" -eq 0 ]]` 判真 | `scripts/rust/stage1_exit_driver.sh:424-427` | c4d75325_c84bb999 | 已修 2ae832c8 |
-| A3 | 0.3.2 wheelhouse 用主機 `python3` 下載 PyYAML，wheel 標籤跟著主機版本走（主機 3.13 時容器 3.12 不能用） | `scripts/docker/run-upgrade.sh:226` | b84ee5b_ed46551、407ed7e_ed46551、b84ee5b_407ed7e | 待修 |
-| A4 | 升級報告沒記錄容器內實際用的 driver 雜湊；`mkbundle.sh`／`run-upgrade.sh` 不檢查工作樹是否乾淨（證據完整性） | `scripts/docker/run_upgrade_container.py`、`mkbundle.sh`、`run-upgrade.sh` | ed46551_607ea76 | 待修 |
+| A3 | 0.3.2 wheelhouse 用主機 `python3` 下載 PyYAML，wheel 標籤跟著主機版本走（主機 3.13 時容器 3.12 不能用） | `scripts/docker/run-upgrade.sh:226` | b84ee5b_ed46551、407ed7e_ed46551、b84ee5b_407ed7e | 已修 eede1d45 |
+| A4 | 升級報告沒記錄容器內實際用的 driver 雜湊；`mkbundle.sh`／`run-upgrade.sh` 不檢查工作樹是否乾淨（證據完整性） | `scripts/docker/run_upgrade_container.py`、`mkbundle.sh`、`run-upgrade.sh` | ed46551_607ea76 | 已修 eede1d45 |
 
 ## B. Python daemon 基線的已知缺陷（來自 main 已合入的 PR）——**Stage 1 不修**
 
@@ -43,24 +43,24 @@ Stage 1 的修正範圍到此凍結。**只剩 bg1、ba3、bc2、bd 這 4 項**�
 | # | 項目 | 位置 | 來源審查 | 狀態 |
 |---|---|---|---|---|
 | C1 | `verify_daemon_code_after_restart` 沿用 reconcile 前解析的 `&old_endpoint`；Python 基線每次輪詢都重新呼叫 `_resolve_local_endpoint_info(args)` | `crates/sw-cli/src/setup_cmd.rs:2094`；Python `sw_core/cli.py:1794` | 7d80bcde_ca19dd18 | 已修 9e29b9fe |
-| C2 | `\x4` 錯誤訊息：Python 為 `incomplete escape \x4 at position 0`，Rust `parse_hex_escape` 固定為 `incomplete escape \x at position 0` | `crates/sw-cli/src/pyre/parse.rs` | e028910_b09e6de、f2a23b1_e028910、2a65438_f2a23b1 | 待修 |
-| C3 | 修改 `contracts/cli_schema.json` 時沒有同步遞增 `x-catalog-revision`（S1-e8aa5aa-3，Low） | `contracts/cli_schema.json:5` | e8aa5aa | 待修 |
+| C2 | `\x4` 錯誤訊息：Python 為 `incomplete escape \x4 at position 0`，Rust `parse_hex_escape` 固定為 `incomplete escape \x at position 0` | `crates/sw-cli/src/pyre/parse.rs` | e028910_b09e6de、f2a23b1_e028910、2a65438_f2a23b1 | 已修 1e9e4164 |
+| C3 | 修改 `contracts/cli_schema.json` 時沒有同步遞增 `x-catalog-revision`（S1-e8aa5aa-3，Low） | `contracts/cli_schema.json:5` | e8aa5aa | 已修 1e9e4164 |
 
 ## D. 測試與文件的缺口（會讓回歸漏網，或對使用者寫錯）
 
 | # | 項目 | 位置 | 來源審查 | 狀態 |
 |---|---|---|---|---|
 | D1 | Rust 負路徑測試把 passwd 家目錄指到測試行程的真實 `HOME`，寫檔不在沙箱（S1-068c8e5-1，Low；與 x6 同類，照 Medium 處理） | `crates/sw-cli/tests/mgmt_supervision_switch.rs:323` | 42b3bc13_068c8e54 | 已修 d929cac4 |
-| D2 | `test_rust_mkbundle.py:514` 檢查的是字串 `sw-cli/test-fakes`，但 `mkbundle.sh` 實際傳的是 `--features`、`test-fakes` 兩個參數，正式配方加回該 feature 時斷言仍會通過 | `tests/test_rust_mkbundle.py:514` | 9a0b91d1_7673bb92 | 待修 |
+| D2 | `test_rust_mkbundle.py:514` 檢查的是字串 `sw-cli/test-fakes`，但 `mkbundle.sh` 實際傳的是 `--features`、`test-fakes` 兩個參數，正式配方加回該 feature 時斷言仍會通過 | `tests/test_rust_mkbundle.py:514` | 9a0b91d1_7673bb92 | 已修 b68b87d5 |
 | D3 | `emitted_codes.rs` 寫入原始碼樹下的 `target/emitted_codes.sw-cli.txt`，唯讀 worktree 必失敗；應改用 `CARGO_TARGET_TMPDIR`／`CARGO_TARGET_DIR` | `crates/sw-cli/tests/emitted_codes.rs:394-401` | 0733627d_9e93d4f7、148794de_85a0179b、148794d_0733627 | 已修 b70bb35f |
 | D4 | `exec_delegate.rs` 缺少「子行程在 `exec_or_wait` 前停住、不建立孫行程」的突變案例 | `crates/sw-pal/tests/exec_delegate.rs` | ca19dd18_25ceaff5 | 已修 b70bb35f |
-| D5 | 等待測試沒有證明它等到 LF 才觀測（S1-42b3bc1-2，Low） | `tests/contract_blackbox/test_bb_l15_wire_payloads.py:66` | 42b3bc13 | 待確認（x5b 自報已順手處理） |
-| D6 | `test_changelog_fragments.py` 硬編碼單一 fragment 路徑，只檢查 `---` 分隔線，沒有呼叫 policy_check（S1-a433228-1，Low） | `tests/test_changelog_fragments.py:13` | a433228 | 待修 |
-| D7 | README 的 install.sh「從 0.3.x 升級」段仍寫「升級前請先 `serialwrap daemon stop`（TODO(OD-48)…）」，OD-48 已實作（S1-407ed7e-1，Low，對使用者寫錯） | `README.md:213-215`、`:1790` | 407ed7e | 待修 |
-| D8 | 可觀察變更表第 11、14 列仍寫 Rust `cmd submit` 沒有 `--expect-reboot` | `docs/rust-refactor/reviews/s1-main-sync-observable-changes.md` | a433228f_8df9e665 | 待修 |
+| D5 | 等待測試沒有證明它等到 LF 才觀測（S1-42b3bc1-2，Low） | `tests/contract_blackbox/test_bb_l15_wire_payloads.py:66` | 42b3bc13 | 已修 9ee4e0fd |
+| D6 | `test_changelog_fragments.py` 硬編碼單一 fragment 路徑，只檢查 `---` 分隔線，沒有呼叫 policy_check（S1-a433228-1，Low） | `tests/test_changelog_fragments.py:13` | a433228 | 已修 adbe34a0 |
+| D7 | README 的 install.sh「從 0.3.x 升級」段仍寫「升級前請先 `serialwrap daemon stop`（TODO(OD-48)…）」，OD-48 已實作（S1-407ed7e-1，Low，對使用者寫錯） | `README.md:213-215`、`:1790` | 407ed7e | 已修 c2e171cf |
+| D8 | 可觀察變更表第 11、14 列仍寫 Rust `cmd submit` 沒有 `--expect-reboot` | `docs/rust-refactor/reviews/s1-main-sync-observable-changes.md` | a433228f_8df9e665 | 已修 bce0e418 |
 | D9 | 出口 driver 註解仍寫「任一步 rc 非 0 即以 1 結束」，與實際兩層判定不符 | `scripts/rust/stage1_exit_driver.sh:19` | ef63f21c_6a21235c | 已修 2ae832c8 |
 | D10 | Docker 升級腳本的 Low：S1-607ea76-1～4、S1-ed46551-1～3 | `scripts/docker/run_upgrade_container.py`、`run-upgrade.sh`、`tests/test_docker_upgrade.py` | 607ea76、ed46551 | 移入 low-backlog（審查 Low，依擁有者規則） |
-| D11 | policy_check R-16 的 CLI help 比對結果取決於 `python3` 版本（非 3.12 會不同） | policy／`contracts/cli_help` | 0733627d_9e93d4f7 | 已修 f59ce805 |
+| D11 | policy_check R-16 的 CLI help 比對結果取決於 `python3` 版本（非 3.12 會不同） | policy／`contracts/cli_help` | 0733627d_9e93d4f7 | 撤回：python3.12 在 CI 不存在；實測 R-16 在 3.11、3.12 都通過，移入 low-backlog |
 
 ## E. 依計畫分段或擁有者裁決不在 Stage 1 修（需寫明依據）
 
