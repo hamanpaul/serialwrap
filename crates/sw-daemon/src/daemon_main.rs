@@ -527,6 +527,7 @@ fn caps_for_defaults(defaults: &RuntimePaths) -> Capabilities {
         on_demand_autostart: win,
         console_kind: if win { ConsoleKind::TcpTelnet } else { ConsoleKind::Pty },
         native_device: if win { DeviceBackendKind::Win } else { DeviceBackendKind::Posix },
+        flash_endpoint: !win,
     }
 }
 

@@ -50,3 +50,8 @@ required-features = ["test-fakes"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[[test]]
+name = "flash_pty"
+path = "tests/flash_pty.rs"
+required-features = ["test-fakes"]

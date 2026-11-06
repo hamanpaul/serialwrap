@@ -838,18 +838,62 @@ pub trait SerialHandle: Send {
         CloseToken,
     );
     fn set_baud(&self, baud: u32) -> PalResult<()>;
-    /// arch §4.2：`/dev/ttyMCU`（2.4）專用。本 Phase 兩平台皆回 `Unsupported`（預設實作，不破壞既有替身）。
+    /// arch §4.2：`/dev/ttyMCU`（2.4）專用；委派 `line_control()`。
     fn mirror_termios_from(
         &self,
-        _pty: &crate::console_pty::PtySlaveRef,
-        _fallback_baud: Option<u32>,
+        pty: &crate::console_pty::PtySlaveRef,
+        fallback_baud: Option<u32>,
     ) -> PalResult<()> {
-        Err(PalError::plain(
-            PalErrorKind::Unsupported,
-            "mirror_termios_from 於 Slice 2.1 未支援（/dev/ttyMCU 屬 2.4）",
-        ))
+        self.line_control().mirror_termios_from(pty, fallback_baud)
+    }
+    /// 序列線控制（split 前取得；split 後仍可持有並調整速率）。預設為全部 `Unsupported` 的實作。
+    fn line_control(&self) -> std::sync::Arc<dyn SerialLineControl> {
+        std::sync::Arc::new(UnsupportedLineControl)
     }
     fn is_alive(&self) -> bool;
+}
+
+/// 序列線控制（arch §4.2；`/dev/ttyMCU` 的 baud 鏡射）。可在 `split` 之後繼續持有。
+pub trait SerialLineControl: Send + Sync {
+    /// 未列於 POSIX_BAUD_MAP 的 baud → `Ok(())` no-op。
+    fn set_baud(&self, baud: u32) -> PalResult<()>;
+    /// 把 PTY slave 的速率鏡射到實體 UART：任一方向讀到 B0 視為「未設」→ 走 `fallback_baud`；
+    /// **絕不把 B0 寫到實體 UART**（B0 會拉低 DTR，可能重置 MCU）。
+    fn mirror_termios_from(&self, pty: &PtySlaveRef, fallback_baud: Option<u32>) -> PalResult<()>;
+}
+
+/// `SerialHandle::line_control` 的預設實作：全部 `Unsupported`。
+pub struct UnsupportedLineControl;
+
+impl SerialLineControl for UnsupportedLineControl {
+    fn set_baud(&self, _baud: u32) -> PalResult<()> {
+        Err(PalError::plain(PalErrorKind::Unsupported, "set_baud 於此後端不支援（line_control）"))
+    }
+    fn mirror_termios_from(&self, _pty: &PtySlaveRef, _fallback_baud: Option<u32>) -> PalResult<()> {
+        Err(PalError::plain(PalErrorKind::Unsupported, "mirror_termios_from 於此後端不支援（line_control）"))
+    }
+}
+
+/// `mirror_termios_from` 的決策結果（純函式，POSIX 與替身共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorPlan {
+    /// 把這兩個（皆非 B0 的）速率代碼寫入實體 UART。
+    SetSpeeds { ispeed: u32, ospeed: u32 },
+    /// 走 fallback：`set_baud(baud)`，失敗忽略。
+    FallbackBaud(u32),
+    /// 什麼都不做。
+    Ignore,
+}
+
+/// 依 slave 速率讀取結果與 fallback 決定動作：任一方向 B0、或讀取失敗 → fallback（無 fallback 則忽略）。
+pub fn plan_mirror(slave: &PalResult<TermSpeed>, fallback_baud: Option<u32>) -> MirrorPlan {
+    match slave {
+        Ok(s) if s.ispeed != 0 && s.ospeed != 0 => MirrorPlan::SetSpeeds { ispeed: s.ispeed, ospeed: s.ospeed },
+        _ => match fallback_baud {
+            Some(b) => MirrorPlan::FallbackBaud(b),
+            None => MirrorPlan::Ignore,
+        },
+    }
 }
 
 /// 獨占診斷（arch §4.2）：只供診斷、不是鎖。POSIX 掃 `/proc/*/fd`；Windows 回 `holder_unknown:true`、`status:Unsupported`。
@@ -955,7 +999,10 @@ pub struct WalWriteError {
 // ConsoleTransportFactory（arch §4.7）：完整宣告位於 `crate::console_pty`，此處再匯出以保留既有路徑。
 // ---------------------------------------------------------------------------
 
-pub use crate::console_pty::{ConsoleIo, ConsoleListener, ConsoleTransportFactory, KeepAlive, PtyPair, PtySlaveRef};
+pub use crate::console_pty::{
+    ConsoleIo, ConsoleListener, ConsoleTransportFactory, ConsoleWriteHalf, KeepAlive, PtyPair, PtySlaveRef, Readiness,
+    TermSpeed,
+};
 // 實例鎖型別（arch §4.4）：實際定義於 `crate::lock`，此處再匯出，使 `use sw_pal::*` 可直接取得（Task 4 測試與 Task 19 使用）。
 pub use crate::lock::{InstanceLockError, InstanceLockFactory, InstanceLockGuard};
 

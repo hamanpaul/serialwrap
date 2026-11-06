@@ -40,6 +40,7 @@ pub fn posix_caps() -> Capabilities {
         on_demand_autostart: false,
         console_kind: ConsoleKind::Pty,
         native_device: DeviceBackendKind::Posix,
+        flash_endpoint: false,
     }
 }
 
@@ -55,6 +56,7 @@ pub fn windows_caps() -> Capabilities {
         on_demand_autostart: true,
         console_kind: ConsoleKind::TcpTelnet,
         native_device: DeviceBackendKind::Win,
+        flash_endpoint: false,
     }
 }
 

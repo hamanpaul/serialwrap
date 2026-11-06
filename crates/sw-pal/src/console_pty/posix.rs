@@ -6,7 +6,9 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::console_pty::{ConsoleIo, KeepAlive, PtyPair, PtySlaveRef};
+use std::path::Path;
+
+use crate::console_pty::{ConsoleIo, ConsoleWriteHalf, KeepAlive, PtyPair, PtySlaveRef, Readiness, TermSpeed};
 use crate::traits::{IoWaker, PalError, PalResult, ReadOutcome};
 
 struct OpenPtyGuard {
@@ -239,6 +241,30 @@ impl ConsoleIo for PtyMaster {
     }
 
     fn close(self: Box<Self>) {}
+
+    fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>> {
+        todo!("P8-T7")
+    }
+
+    fn wait_readable(&mut self, _timeout: Option<Duration>) -> PalResult<Readiness> {
+        todo!("P8-T7")
+    }
+}
+
+pub(crate) fn link(_slave_path: &str, _link: &Path) -> PalResult<()> {
+    todo!("P8-T7")
+}
+
+pub(crate) fn unlink(_link: &Path) -> PalResult<()> {
+    todo!("P8-T7")
+}
+
+pub(crate) fn tty_setraw(_slave: &PtySlaveRef) -> PalResult<()> {
+    todo!("P8-T7")
+}
+
+pub(crate) fn tcgetattr_speed(_slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+    todo!("P8-T7")
 }
 
 /// 建立 byte-transparent PTY；master 非阻塞，daemon 保留 slave fd 避免閒置 EOF。

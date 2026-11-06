@@ -99,6 +99,8 @@ pub struct Capabilities {
     pub console_kind: ConsoleKind,
     /// 裝置來源後端（arch §4 `Capabilities.native_device`；Task 5 的 `devices` 工廠與 Task 19 組裝點讀取）。
     pub native_device: DeviceBackendKind,
+    /// `/dev/ttyMCU` flash 端點（PTY symlink、raw、速率鏡射）是否可用：POSIX true、Windows false（P8-T7）。
+    pub flash_endpoint: bool,
 }
 
 /// P3 名稱保留（`ClientCaps` 為 `Capabilities` 的別名）。
@@ -219,6 +221,7 @@ pub fn native() -> Platform {
                 on_demand_autostart: false,
                 console_kind: ConsoleKind::Pty,
                 native_device: DeviceBackendKind::Posix,
+                flash_endpoint: false,
             },
         }
     }
@@ -269,6 +272,7 @@ pub fn native() -> Platform {
                 on_demand_autostart: true,
                 console_kind: ConsoleKind::TcpTelnet,
                 native_device: DeviceBackendKind::Win,
+                flash_endpoint: false,
             },
         }
     }
