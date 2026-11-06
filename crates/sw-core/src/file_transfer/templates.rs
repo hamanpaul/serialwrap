@@ -1,4 +1,4 @@
-//! 檔案傳輸板端命令樣板（逐字承接 `sw_core/file_transfer.py`）。P8-T3 紅燈骨架。
+//! 檔案傳輸板端命令樣板（逐字承接 `sw_core/file_transfer.py`）。
 
 pub const SENTINEL_BEGIN: &str = "===SW_XFER_BEGIN===";
 pub const SENTINEL_END: &str = "===SW_XFER_END===";
@@ -25,48 +25,133 @@ pub enum TemplateError {
     UnknownTool(String),
 }
 
-pub fn runtime_sentinel(_prefix: &str) -> String {
-    todo!("P8-T3")
+use md5::{Digest, Md5};
+use sw_proto::pycompat::{b2a_base64, shlex_quote};
+
+/// `printf '%s\n' '<prefix>'$((6*7))`：只在 target 執行後才出現完整值的 sentinel。
+pub fn runtime_sentinel(prefix: &str) -> String {
+    format!("printf '%s\\n' '{prefix}'$((6*7))")
 }
-pub fn marker_expression(_marker: &str) -> Result<String, TemplateError> {
-    todo!("P8-T3")
+
+/// 以 quote-split 生成 marker，避免完整 marker 出現在 command echo。
+pub fn marker_expression(marker: &str) -> Result<String, TemplateError> {
+    const HEAD: &str = "===SW_XFER_";
+    const TAIL: &str = "===";
+    if !(marker.starts_with(HEAD) && marker.ends_with(TAIL)) {
+        return Err(TemplateError::UnsupportedMarker(marker.to_string()));
+    }
+    // Python 以 `marker[len(HEAD):-3]` 切片；兩端重疊（如 "===SW_XFER_==="之外的短字串）時為空字串。
+    let start = HEAD.len();
+    let end = marker.len().saturating_sub(TAIL.len());
+    let middle = if start <= end { &marker[start..end] } else { "" };
+    Ok(format!("'===SW_XFER_'{middle}'==='"))
 }
+
 pub fn decoder_probe_command() -> String {
-    todo!("P8-T3")
+    format!(
+        "if test \"$(printf '%s' '{TOOL_PROBE_PAYLOAD}' | base64 -d 2>/dev/null)\" = 'sw-probe'; \
+         then {}; \
+         elif test \"$(printf '%s' '{TOOL_PROBE_PAYLOAD}' | openssl enc -base64 -d -A 2>/dev/null)\" = 'sw-probe'; \
+         then {}; fi",
+        runtime_sentinel("SW_XFER_DECODER_B64_"),
+        runtime_sentinel("SW_XFER_DECODER_OPENSSL_"),
+    )
 }
+
 pub fn encoder_probe_command() -> String {
-    todo!("P8-T3")
+    format!(
+        "if test \"$(printf '%s' 'sw-probe' | base64 2>/dev/null)\" = 'c3ctcHJvYmU='; \
+         then {}; \
+         elif test \"$(printf '%s' 'sw-probe' | openssl enc -base64 2>/dev/null)\" = 'c3ctcHJvYmU='; \
+         then {}; fi",
+        runtime_sentinel("SW_XFER_ENCODER_B64_"),
+        runtime_sentinel("SW_XFER_ENCODER_OPENSSL_"),
+    )
 }
-pub fn decoder_command_name(_decoder: &str) -> Result<&'static str, TemplateError> {
-    todo!("P8-T3")
+
+pub fn decoder_command_name(decoder: &str) -> Result<&'static str, TemplateError> {
+    match decoder {
+        "base64" => Ok("base64 -d"),
+        "openssl" => Ok("openssl enc -base64 -d -A"),
+        other => Err(TemplateError::UnknownTool(other.to_string())),
+    }
 }
-pub fn encoder_command_name(_encoder: &str) -> Result<&'static str, TemplateError> {
-    todo!("P8-T3")
+
+pub fn encoder_command_name(encoder: &str) -> Result<&'static str, TemplateError> {
+    match encoder {
+        "base64" => Ok("base64"),
+        // 保留 OpenSSL 的換行，避免大型 pull 輸出變成單一超長 console line。
+        "openssl" => Ok("openssl enc -base64"),
+        other => Err(TemplateError::UnknownTool(other.to_string())),
+    }
 }
-pub fn chunk_command(_encoded: &str, _decoder: &str, _op: &str, _path: &str) -> Result<String, TemplateError> {
-    todo!("P8-T3")
+
+pub fn chunk_command(encoded: &str, decoder: &str, op: &str, path: &str) -> Result<String, TemplateError> {
+    Ok(format!(
+        "printf '%s' {} | {} {op} {} && {}",
+        shlex_quote(encoded),
+        decoder_command_name(decoder)?,
+        shlex_quote(path),
+        runtime_sentinel("SW_XFER_CHUNK_"),
+    ))
 }
-pub fn md5_command(_path: &str) -> String {
-    todo!("P8-T3")
+
+pub fn md5_command(path: &str) -> String {
+    format!("md5sum {} && {}", shlex_quote(path), runtime_sentinel("SW_XFER_MD5_"))
 }
-pub fn mv_command(_source_path: &str, _remote_path: &str) -> String {
-    todo!("P8-T3")
+
+pub fn mv_command(source_path: &str, remote_path: &str) -> String {
+    format!(
+        "mv {} {} && {}",
+        shlex_quote(source_path),
+        shlex_quote(remote_path),
+        runtime_sentinel("SW_XFER_MV_")
+    )
 }
-pub fn cleanup_command(_path: &str) -> String {
-    todo!("P8-T3")
+
+pub fn cleanup_command(path: &str) -> String {
+    format!("rm -f {} && {}", shlex_quote(path), runtime_sentinel("SW_XFER_CLEANUP_"))
 }
-pub fn pull_command(_remote_path: &str, _encoder: &str) -> Result<String, TemplateError> {
-    todo!("P8-T3")
+
+pub fn pull_command(remote_path: &str, encoder: &str) -> Result<String, TemplateError> {
+    // Python 先求值 begin marker（恆成立），再求值 encoder 名稱（未知 → ValueError）。
+    let begin = marker_expression(SENTINEL_BEGIN)?;
+    let end = marker_expression(SENTINEL_END)?;
+    Ok(format!(
+        "printf '%s\\n' {begin} && {} < {} && printf '%s\\n' {end} || {}",
+        encoder_command_name(encoder)?,
+        shlex_quote(remote_path),
+        runtime_sentinel("SW_XFER_ENCODER_FAILED_"),
+    ))
 }
-pub fn split_chunks(_data: &[u8], _chunk_size: usize) -> Vec<&[u8]> {
-    todo!("P8-T3")
+
+/// 切成 `chunk_size` 大小的分段；空資料回傳一段空 bytes。`chunk_size` 必須 > 0（呼叫端先驗證）。
+pub fn split_chunks(data: &[u8], chunk_size: usize) -> Vec<&[u8]> {
+    if data.is_empty() {
+        return vec![data];
+    }
+    data.chunks(chunk_size).collect()
 }
-pub fn line_budget_exceeded(_commands: &[&str], _budget: Option<i128>) -> bool {
-    todo!("P8-T3")
+
+/// 任一命令的 UTF-8 bytes 長度超過 budget 即 true；`None` 表示不限。
+pub fn line_budget_exceeded(commands: &[&str], budget: Option<i128>) -> bool {
+    match budget {
+        None => false,
+        Some(b) => commands.iter().any(|c| (c.len() as i128) > b),
+    }
 }
-pub fn b64encode(_data: &[u8]) -> String {
-    todo!("P8-T3")
+
+/// `base64.b64encode(data).decode()`（無換行）。
+pub fn b64encode(data: &[u8]) -> String {
+    let mut s = b2a_base64(data);
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    s
 }
-pub fn md5_hex(_data: &[u8]) -> String {
-    todo!("P8-T3")
+
+/// `hashlib.md5(data).hexdigest()`。
+pub fn md5_hex(data: &[u8]) -> String {
+    let digest = Md5::digest(data);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
