@@ -1513,7 +1513,7 @@ changes:
   - id: "DF-23"
     kind: "DF"
     title: "interactive TX 完成後的取消不撤銷存活 lease"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-reconciliation"
       date: "2026-11-06"

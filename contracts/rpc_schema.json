@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/hamanpaul/serialwrap/contracts/rpc_schema.json",
   "title": "serialwrap RPC contract",
-  "x-catalog-revision": 16,
+  "x-catalog-revision": 17,
   "x-wire": {
     "framing": "ndjson",
     "line_strip": true,
