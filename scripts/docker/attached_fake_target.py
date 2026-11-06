@@ -26,6 +26,8 @@ def main() -> int:
     with open(tmp, "w", encoding="utf-8") as handle:
         handle.write(os.ttyname(slave))
     os.rename(tmp, sys.argv[1])
+    # 關閉自己的 slave fd：假 target 只留 master，否則它自己會成為 slave 的永久持有者，掩蓋掃描結果。
+    os.close(slave)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     while True:
         ready, _, _ = select.select([master], [], [], 1.0)

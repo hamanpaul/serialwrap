@@ -682,13 +682,16 @@ class Driver:
                         None if ok else "uid 1000 缺 `systemd --user` 或 `(sd-pam)`（真實 user session 行程）",
                         systemd_user=have_user_mgr, sd_pam=have_sd_pam, procs=[p["comm"] + ":" + str(p["pid"]) for p in procs],
                         known=sorted(by_name)))
-        # 以行程名稱確認拒絕確實來自這兩個行程，而非其他原因。
+        # 以行程名稱確認拒絕確實來自 `(sd-pam)`（non-dumpable，fd 目錄讀不到）；`systemd --user` 是否被拒依核心／capability
+        # 而異，只記錄不要求。holders 只允許是仍在執行的舊 daemon 本身（它合法持有 slave），不得有其他持有者。
+        daemon_pids = set(uc.scan_daemon_instances(self.proc_root))
+        holders = scan.get("holders") or []
         ok = scan.get("status") == "Permission" and any(d["comm"] == "(sd-pam)" for d in denied) \
-            and any(d["comm"] == "systemd" for d in denied) and not scan.get("holders")
+            and bool(holders) and set(holders) <= daemon_pids
         self.add(uc.row("holder_scan_permission", "PASS" if ok else "FAIL",
-                        None if ok else "掃描未因 `systemd --user`／`(sd-pam)` 回 Permission",
-                        status=scan.get("status"), holders=scan.get("holders"), denied=denied,
-                        stderr=probe.stderr[-500:]))
+                        None if ok else "掃描未因 `(sd-pam)` 回 Permission，或 slave 有舊 daemon 以外的持有者",
+                        status=scan.get("status"), holders=holders, daemon_pids=sorted(daemon_pids), denied=denied,
+                        systemd_user_denied=any(d["comm"] == "systemd" for d in denied), stderr=probe.stderr[-500:]))
         old_ids = {pid: self._start_ticks(pid) for pid in uc.scan_daemon_instances(self.proc_root)}
         t0 = time.monotonic()
         proc = self.run([str(self.new_cli), "setup", *self.setup_args],
