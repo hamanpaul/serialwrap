@@ -1,7 +1,7 @@
 {
   "schema_version": "bridge-approved.v1",
-  "tree_sha256": "dde967aad257cfebc70d94b0f82b7af635bf15d75a46249dfb3ac57727349196",
-  "reviewer": "Claude Opus 5.5 (pi) + grok-4.7 (non-implementer)",
-  "review_ref": "docs/rust-refactor/reviews/s1x-bridge-review-3.md",
-  "date": "2026-10-27"
+  "tree_sha256": "0021ba6703decf05cea53668060984dbdf1fa3dcee32a84cfa0d2c3ef4704c1c",
+  "reviewer": "grok-4.7 + gemini-3.8-flash-high (non-implementer)",
+  "review_ref": "docs/rust-refactor/reviews/brw-bridge-review.md",
+  "date": "2026-11-06"
 }
