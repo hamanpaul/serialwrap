@@ -118,7 +118,8 @@ def test_observer_windows_excl_probes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(observer, "second_open_probe", fake_probe, raising=False)
     out = tmp_path / "observer.ndjson"
-    _run(observer, sw, out, interval_s=0.05, duration_s=0.3,
+    # 即時性測試：hosted Windows 排程粒度粗，時間窗要留足讓 4 次探測跑完，斷言門檻不變
+    _run(observer, sw, out, interval_s=0.05, duration_s=1.0,
          excl_dir=tmp_path, excl_probe_interval_s=0.05)
     probes = _read_rows(tmp_path / "probes.ndjson")
     assert all(sum(row.get("com") == com and row.get("kind") == "excl_probe" for row in probes) >= 4

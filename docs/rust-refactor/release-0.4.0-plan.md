@@ -168,6 +168,7 @@ while the daemon remains the Python implementation shipped inside the bundle.
 
 ### 繁體中文
 - `serialwrap` CLI 改為 Rust 原生實作（20 個命令群組），daemon 仍為 bundle 內附的 Python 實作（Stage 1）。
+- CLI 反應變快：`daemon status` 往返 p50，Rust CLI 約 16 ms，同版本原始碼的 Python CLI 約 155 ms，快約 10 倍（p95 約 20 對 220 ms；最快一次約 8 對 86 ms）。兩邊連同一個 Python daemon，Rust 用 release build，各 600 個樣本，在 WSL2 開發機（24 執行緒）高背景負載下量測，絕對值只供參考，請看倍數；另一輪同樣條件的 p50 約 9 倍。這不是標準量測環境，Windows 尚未量測。這些數字只涵蓋 CLI，WAL 與 console 延遲要到 Rust daemon（Stage 2）才能比較。量測腳本見 skill 的「CLI 效能比較」一節。
 - `install.sh` 改為安裝 Rust bundle（OD-50）：下載 GitHub release 的 `serialwrap-0.4.0-linux-x86_64.tar.gz` 並以 `SHA256SUMS` 驗證後執行 `bin/serialwrap setup`，或以 `--bundle` 離線安裝；系統需求為 x86_64、glibc ≥ 2.39（Ubuntu 24.04 以上）與 `/usr/bin/python3.12`。pipx 安裝路徑退役（wheel 仍照發）。
 - 新增發佈組合（bundle）安裝：`bin/serialwrap setup` 安裝到 `~/.local/share/serialwrap/versions/<版本>`（Windows：`%LOCALAPPDATA%\Programs\serialwrap`），支援原子更新、`setup --rollback` 與 `doctor` 的 `version_pairing` 檢查。
 - Windows：`windows-task` 監管（免管理員）、可選 com0com 虛擬序列埠（`setup --with-com0com`）。
@@ -190,6 +191,7 @@ while the daemon remains the Python implementation shipped inside the bundle.
 
 ### English
 - The `serialwrap` CLI is now native Rust (20 command groups); the daemon is still the bundled Python implementation (Stage 1).
+- Faster CLI: a `daemon status` round trip takes about 16 ms at p50 with the Rust CLI, versus about 155 ms with the Python CLI from the same source tree, roughly 10x faster (p95 about 20 ms vs 220 ms; fastest run about 8 ms vs 86 ms). Both CLIs talked to the same Python daemon, the Rust CLI was a release build, and each side had 600 samples. This was measured on a WSL2 development machine (24 threads) under heavy background load, so read the ratio rather than the absolute values; a separate run under the same conditions showed about 9x at p50. This is not a standard measurement environment, and Windows has not been measured. These numbers cover the CLI only; WAL and console latency can only be compared once the Rust daemon ships in Stage 2. The measurement script is in the skill's CLI performance comparison section.
 - `install.sh` now installs the Rust bundle (OD-50): it downloads `serialwrap-0.4.0-linux-x86_64.tar.gz` from the GitHub release, verifies it against `SHA256SUMS`, and runs `bin/serialwrap setup`; `--bundle` installs offline. Requirements: x86_64, glibc >= 2.39 (Ubuntu 24.04 or later), and `/usr/bin/python3.12`. The pipx install path is retired (the wheel is still published).
 - New bundle install: `bin/serialwrap setup` installs into `~/.local/share/serialwrap/versions/<version>` (Windows: `%LOCALAPPDATA%\Programs\serialwrap`) with atomic update, `setup --rollback`, and a `version_pairing` doctor check.
 - Windows: `windows-task` supervision (no admin), optional com0com virtual serial pair (`setup --with-com0com`).
