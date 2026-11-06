@@ -1,0 +1,7 @@
+# Windows 正式 bundle 的 Python 執行期依賴（scripts/rust/mkbundle-windows.ps1）。
+# 以 --require-hashes 安裝 cp312 win_amd64 wheel 到 bundle 的 py\Lib\site-packages；版本與雜湊皆釘死。
+# PyYAML 版本與 Linux release job（pyyaml==6.0.3）一致；pyserial 為 Windows COM 後端（pyproject 的 win32 條件依賴）。
+pyyaml==6.0.3 \
+    --hash=sha256:5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b
+pyserial==3.5 \
+    --hash=sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0
