@@ -1,6 +1,7 @@
 """serialwrap_reliability 核心邏輯——不 import testpilot 的薄 adapter。"""
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import subprocess
@@ -160,17 +161,25 @@ def make_skip_result(reason_code: str, comment: str) -> Any:
 def build_ctx(cfg: dict[str, Any], report_dir: Path) -> Any:
     """建 realhw Ctx。"""
     ensure_realhw_importable()
-    from realhw import drivers, harness
+    from realhw import drivers, frontends, harness
+
+    from realhw import preflight
+
+    serialwrap_exe, _identity = preflight.resolve_serialwrap_exe(cfg)
+    sw = drivers.SwCli(exe=serialwrap_exe)
+    tmux = drivers.TmuxCtl(str(cfg.get("tmux_prefix") or "realhw"))
+    human = frontends.make_frontend_factory(cfg, tmux=tmux, sw=sw)
 
     return harness.Ctx(
         cfg=cfg,
         report_dir=report_dir,
         case_dir=report_dir,
-        sw=drivers.SwCli(),
-        tmux=drivers.TmuxCtl(str(cfg.get("tmux_prefix") or "realhw")),
+        sw=sw,
+        tmux=tmux,
         usbipd=drivers.Usbipd(str(cfg.get("usbipd_exe") or "")),
         systemd=drivers.Systemd(),
-        win=drivers.WinSwCli(cfg["win_serialwrap_exe"]),
+        win=drivers.WinSwCli(os.path.expanduser(str(cfg.get("win_serialwrap_exe") or ""))),
+        human=human,
     )
 
 
@@ -295,26 +304,67 @@ class LongrunRunner:
 def run_preflight(cfg: dict[str, Any]) -> dict[str, Any]:
     """realhw preflight gate。"""
     ensure_realhw_importable()
-    from realhw import drivers, preflight
+    from realhw import drivers, frontends, preflight
 
-    sw = drivers.SwCli()
-    win = drivers.WinSwCli(cfg["win_serialwrap_exe"])
-    lock_fd = preflight.acquire_benchlock(preflight.bench_lock_path())
+    serialwrap_exe, _identity = preflight.resolve_serialwrap_exe(cfg)
+    sw = drivers.SwCli(exe=serialwrap_exe)
+    win = drivers.WinSwCli(os.path.expanduser(str(cfg.get("win_serialwrap_exe") or "")))
+    lock_fd = preflight.acquire_benchlock(preflight.bench_lock_path(cfg))
     try:
         checks = preflight.collect(cfg, sw, REPO_ROOT, benchlock_ok=lock_fd is not None, win=win)
+        cross_os_guard, cross_os_detail = preflight.cross_os_holder_check(
+            cfg, [str(board.get("com") or "") for board in cfg.get("boards", [])]
+        )
+        if dataclasses.is_dataclass(checks):
+            checks = dataclasses.replace(
+                checks, cross_os_guard=cross_os_guard, cross_os_detail=cross_os_detail
+            )
+        elif isinstance(checks, dict):
+            checks = dict(checks)
+            checks["cross_os_guard"] = cross_os_guard
+            checks["cross_os_detail"] = cross_os_detail
         ok, problems = preflight.evaluate(checks)
+        cli_version = ""
+        daemon_status: dict[str, Any] = {}
         missing_caps: dict[str, str] = {}
         deployed_version = ""
         if ok:
-            caps = preflight.collect_capabilities(sw)
-            missing_caps = dict(preflight.missing_capabilities(caps))
-            deployed_version = str(caps.deployed_version).strip()
+            try:
+                cli_version = str(sw.run("--version").get("_raw", "")).strip()
+                daemon_status = sw.run("daemon", "status")
+            except (OSError, subprocess.SubprocessError) as exc:
+                ok = False
+                problems.append(f"#154 gate: version probe failed: {exc}")
+            else:
+                version_problem = preflight.version_gate(
+                    cli_version, str(daemon_status.get("version") or "")
+                )
+                if version_problem:
+                    ok = False
+                    problems.append(version_problem)
+            if ok:
+                caps = preflight.collect_capabilities(sw)
+                missing_caps = dict(preflight.missing_capabilities(caps))
+                frontend_ok, _detail = frontends.frontend_capability(cfg)
+                missing_caps.update(preflight.platform_missing_caps(
+                    frontend_ok=frontend_ok, cfg=cfg
+                ))
+                deployed_version = cli_version or str(caps.deployed_version).strip()
+        notes: list[str] = []
+        if cross_os_guard in {"unknown", "unconfigured"}:
+            notes.append(
+                f"跨 OS bench 守衛 {cross_os_guard}：{cross_os_detail or '未設定 probe'}"
+            )
         return {
             "ok": bool(ok),
             "problems": list(problems),
+            "notes": notes,
             "missing_caps": missing_caps,
             "deployed_version": deployed_version,
+            "daemon_pid": daemon_status.get("pid"),
             "benchlock_fd": lock_fd,
+            "cross_os_guard": cross_os_guard,
+            "cross_os_detail": cross_os_detail,
         }
     except Exception:
         if lock_fd is not None:

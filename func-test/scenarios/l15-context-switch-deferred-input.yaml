@@ -1,0 +1,127 @@
+---
+meta:
+  name: l15-context-switch-deferred-input
+  category: l15-scenario
+  severity: critical
+  description: "上下文切換（Recovery、Release、Lease）後未完成 deferred 輸入被清除而不重播（§15.7.1，BC-02）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_stale_context_replay]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.2"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+  plan:
+    schema_version: "dut-plan.v1"
+    seed: 1015
+    triggers:
+      - id: hold-r
+        line_contains: "L15_HOLD_R"
+        action:
+          kind: delay_reply
+          delay_ms: 6000
+      - id: hold-l
+        line_contains: "L15_HOLD_L"
+        action:
+          kind: delay_reply
+          delay_ms: 6000
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  # 段 R：Recovery
+  - action: attach_console
+    selector: COM0
+    label: raw-con-r
+    save_as: rcon
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_HOLD_R", "--cmd-timeout", "10"]
+    save_as: cr
+  - action: wait_wire_marker
+    marker: "echo L15_HOLD_R\n"
+    observation: "serial_read"
+    timeout_s: 10
+  - action: console_write
+    console_id: "{rcon.client_id}"
+    input_raw: "L15_CTX_R"
+  - action: op_begin
+    op_id: op-recover
+  - action: cli
+    argv: ["session", "recover", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: op-recover
+  - action: assert_wire_absent
+    marker: "L15_CTX_R"
+    after_op: op-recover
+  - action: wait_ready
+    timeout_s: 20
+  - action: detach_console
+    console_id: "{rcon.client_id}"
+  # 段 L：Release + Attach
+  - action: attach_console
+    selector: COM0
+    label: raw-con-l
+    save_as: lcon
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_HOLD_L", "--cmd-timeout", "10"]
+    save_as: cl
+  - action: wait_wire_marker
+    marker: "echo L15_HOLD_L\n"
+    observation: "serial_read"
+    timeout_s: 10
+  - action: console_write
+    console_id: "{lcon.client_id}"
+    input_raw: "L15_CTX_L"
+  - action: op_begin
+    op_id: op-release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: op-release
+  - action: assert_wire_absent
+    marker: "L15_CTX_L"
+    after_op: op-release
+  - action: wait_ready
+    timeout_s: 20
+  # 段 S：Lease 切換
+  - action: attach_console
+    selector: COM0
+    label: raw-con-s
+    save_as: scon
+  - action: op_begin
+    op_id: op-lease
+  - action: cli
+    argv: ["session", "interactive-open", "--selector", "COM0", "--owner", "agent:l15"]
+    expect: {ok: true}
+    save_as: lease
+  - action: console_write
+    console_id: "{scon.client_id}"
+    input_raw: "L15_CTX_S"
+  - action: cli
+    argv: ["session", "interactive-close", "--interactive-id", "{lease.interactive_id}"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: op-lease
+  - action: assert_wire_absent
+    marker: "L15_CTX_S"
+    after_op: op-lease
+  - action: wait_ready
+    timeout_s: 20
+  - action: assert_compare

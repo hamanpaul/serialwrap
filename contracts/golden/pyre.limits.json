@@ -1,0 +1,5 @@
+{
+  "baseline": "3.12.3",
+  "parse_depth_limit": 495,
+  "parse_depth_limit_source": "gen_pyre.py 二分搜尋 re.compile('('*n + ')'*n) 首次 RecursionError 的最小 n"
+}

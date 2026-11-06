@@ -1,0 +1,10 @@
+{
+  "test": "cap_interactive_desktop__exec_or_wait_ctrl_c",
+  "exit_code": 0,
+  "exe_sha256": "3607686f1390e88f15fc00c5e86ff19b85987f9e7d64c208552f2665f18efd76",
+  "parent_diag_sha256": "41fabe3954388efdff6aee2af88e2843dab35784821b4cf4fb2c5f39e5e9ff33",
+  "child_ctrl_c_sha256": "00024be237b18ded9f1d13a54295b86eaf477a0c2b625078b8fd9fe4474cb38e",
+  "child_ctrl_break_sha256": "307f3a189f124aaa7453ec4a77f0c17ccc24df1c2036b863a21632465fa16e0d",
+  "finished_utc": "2026-10-27T23:12:01.7150514Z",
+  "host": "9900X"
+}

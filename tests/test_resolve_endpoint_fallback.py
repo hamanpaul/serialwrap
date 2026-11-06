@@ -7,6 +7,9 @@ import unittest
 from unittest import mock
 
 from sw_core import cli
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestResolveEndpointFallback(unittest.TestCase):

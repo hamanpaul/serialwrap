@@ -12,6 +12,9 @@ import tempfile
 import unittest
 import unittest.mock as mock
 from pathlib import Path
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_fake_proc(proc_root: Path, spec: dict) -> None:
@@ -33,25 +36,33 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.proc = Path(self._tmp.name) / "proc"
 
+    def _make_tty(self, name: str) -> Path:
+        """#R2：holder 以 inode 身分判定，故以暫存實體檔案代表 tty（字串相同但不存在於本命名空間者不計）。"""
+        dev = Path(self._tmp.name) / "dev" / name
+        dev.parent.mkdir(parents=True, exist_ok=True)
+        dev.write_bytes(b"")
+        return dev
+
     def test_detect_two_serialwrapd(self) -> None:
         from sw_core.multi_open import detect_multi_open
 
+        tty = self._make_tty("ttyUSB0")
         _make_fake_proc(
             self.proc,
             {
                 "2114": {
                     "cmdline": "python\0serialwrapd.py\0--socket\0/run/serialwrap/serialwrapd.sock\0",
-                    "fd": {"5": "/dev/ttyUSB0"},
+                    "fd": {"5": str(tty)},
                 },
                 "9001": {"cmdline": "python\0serialwrapd.py\0", "fd": {}},
                 # 非 serialwrapd 程序，不應計入
                 "3000": {"cmdline": "bash\0", "fd": {}},
             },
         )
-        res = detect_multi_open(proc_root=str(self.proc), tty_paths=["/dev/ttyUSB0"])
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[str(tty)])
         self.assertTrue(res["multi_open"])
         self.assertEqual({d["pid"] for d in res["daemons"]}, {2114, 9001})
-        self.assertEqual(res["holders"]["/dev/ttyUSB0"], 2114)
+        self.assertEqual(res["holders"][str(tty)], 2114)
         self.assertEqual(res["holders_status"], "ok")
 
     def test_single_daemon_ok(self) -> None:
@@ -69,6 +80,7 @@ class TestDetectMultiOpen(unittest.TestCase):
         而漏掉真正的 prod daemon（實機驗證才現形）。"""
         from sw_core.multi_open import detect_multi_open
 
+        tty = self._make_tty("ttyUSB1")
         _make_fake_proc(
             self.proc,
             {
@@ -77,15 +89,15 @@ class TestDetectMultiOpen(unittest.TestCase):
                     # 為 serialwrapd、無 .py、為路徑）。用 /opt 中性路徑避免 R-21 個人路徑誤判。
                     "cmdline": "/opt/serialwrap-venv/bin/python\0"
                     "/opt/serialwrap-venv/bin/serialwrapd\0--socket\0/run/serialwrap/serialwrapd.sock\0",
-                    "fd": {"7": "/dev/ttyUSB1"},
+                    "fd": {"7": str(tty)},
                 },
                 "1200888": {"cmdline": "python3\0/worktree/serialwrapd.py\0", "fd": {}},
             },
         )
-        res = detect_multi_open(proc_root=str(self.proc), tty_paths=["/dev/ttyUSB1"])
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[str(tty)])
         self.assertTrue(res["multi_open"])
         self.assertEqual({d["pid"] for d in res["daemons"]}, {1095518, 1200888})
-        self.assertEqual(res["holders"]["/dev/ttyUSB1"], 1095518)
+        self.assertEqual(res["holders"][str(tty)], 1095518)
 
     def test_argv0_serialwrapd_py_detected(self) -> None:
         """argv0 直接是 serialwrapd.py（直接 exec shim）也要算（回歸：曾把 .py 判定
@@ -127,6 +139,29 @@ class TestDetectMultiOpen(unittest.TestCase):
         self.assertEqual({d["pid"] for d in res["daemons"]}, {2114})
         # 只有一個真正 daemon → 非多開
         self.assertFalse(res["multi_open"])
+
+    def test_python_m_sw_core_daemon_detected(self) -> None:
+        """DF-05 第 5 順序 `python -m sw_core.daemon`（pipx／安裝佈局）須被偵測為 daemon（P4 Task 1 同步要求）。
+
+        包含帶 `-I -B` 旗標的 bundled runtime 形式；`-m sw_core.cli` 與 `-c "-m sw_core.daemon"`
+        （裸字串）不得誤判。
+        """
+        from sw_core.multi_open import detect_multi_open
+
+        _make_fake_proc(
+            self.proc,
+            {
+                "4001": {"cmdline": "python3\0-m\0sw_core.daemon\0--socket\0/run/a.sock\0", "fd": {}},
+                "4002": {"cmdline": "python3\0-I\0-B\0-m\0sw_core.daemon\0--socket\0/run/b.sock\0", "fd": {}},
+                "4003": {"cmdline": "python3\0-m\0sw_core.cli\0status\0", "fd": {}},
+                "4004": {"cmdline": "python3\0-c\0-m sw_core.daemon\0", "fd": {}},
+            },
+        )
+        res = detect_multi_open(proc_root=str(self.proc), tty_paths=[])
+        self.assertEqual({d["pid"] for d in res["daemons"]}, {4001, 4002})
+        sockets = {d["pid"]: d["socket"] for d in res["daemons"]}
+        self.assertEqual(sockets, {4001: "/run/a.sock", 4002: "/run/b.sock"})
+        self.assertTrue(res["multi_open"])
 
     def test_missing_proc_root_degrades_unknown(self) -> None:
         from sw_core.multi_open import detect_multi_open

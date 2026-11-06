@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/spike1-remaining.v1.json",
+  "title": "Spike 1 剩餘 COM 實測報告",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_layer",
+    "producer",
+    "uart_kind",
+    "tool_revision",
+    "pyserial_version",
+    "results",
+    "generated_at",
+    "host",
+    "pair",
+    "console_pair",
+    "items"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "evidence_layer": {
+      "const": "native-windows"
+    },
+    "producer": {
+      "const": "spike1_remaining.py"
+    },
+    "uart_kind": {
+      "const": "native"
+    },
+    "tool_revision": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "pyserial_version": {
+      "type": ["string", "null"]
+    },
+    "results": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "verdict"],
+        "properties": {
+          "item": {
+            "enum": ["control_lines", "console_pair", "peer_close"]
+          },
+          "verdict": {
+            "enum": ["PASS", "FAIL", "NOT_RUN"]
+          }
+        }
+      }
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "windows_build",
+        "hvci_running",
+        "secure_boot",
+        "com0com_version"
+      ],
+      "properties": {
+        "windows_build": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hvci_running": {
+          "type": ["boolean", "null"]
+        },
+        "secure_boot": {
+          "type": ["boolean", "null"]
+        },
+        "com0com_version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "pair": {
+      "type": "string",
+      "pattern": "^COM[0-9]+:COM[0-9]+$"
+    },
+    "console_pair": {
+      "type": ["string", "null"],
+      "pattern": "^COM[0-9]+:COM[0-9]+$"
+    },
+    "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["control_lines", "console_pair", "peer_close"],
+      "properties": {
+        "control_lines": {
+          "$ref": "#/$defs/item"
+        },
+        "console_pair": {
+          "$ref": "#/$defs/item"
+        },
+        "peer_close": {
+          "$ref": "#/$defs/item"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "item": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["verdict"],
+      "properties": {
+        "verdict": {
+          "enum": ["PASS", "FAIL", "NOT_RUN"]
+        }
+      }
+    }
+  }
+}

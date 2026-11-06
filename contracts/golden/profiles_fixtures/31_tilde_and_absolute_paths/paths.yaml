@@ -1,0 +1,9 @@
+profiles:
+  p:
+    platform: prpl
+    log_dir: "~/b-log/"
+    env_file: "~/secrets/x.env"
+
+targets:
+  - {profile: p, device_by_id: d1, env_file: /abs/path/./e.env, log_dir: "~"}
+  - {profile: p, device_by_id: d2, env_file: "   "}

@@ -31,10 +31,17 @@ policy_version: 1.0.19
   python3 -m unittest discover -s tests -v
   ```
   （注意：unittest 不載入 `tests/conftest.py` 的強制 env 隔離與 live guard 防線，僅 state/WAL/events 維度有 per-file 隔離（`tests/state_iso.py`）；**有 production daemon 的機器一律以 pytest 為準**，#120。）
-- pytest 下的隔離行為（#120）：`tests/conftest.py` 會硬覆寫 9 個 `SERIALWRAP_*` 目錄變數並 pop 5 個高優先變數（外層 shell export 無效），並於 suite 結束執行 live guard（state/WAL/config/daemon 四維快照比對；逃生閥 `SERIALWRAP_LIVE_GATE=warn`，warn 下結構性破壞仍 FAIL——warn 為明知風險的 opt-in：daemon TX/state 變更僅示警，開發者需自行確認；daemon 維度多層探測 system→user systemd→唯讀 RPC on-demand，全不可達才 SKIP，#121）。
-- **目前無已知恆定失敗**（2026-08-11 校正）：本機全套 `python3 -m pytest -q tests/` 為 `1636 passed, 16 skipped`（0 failed）。舊版本檔曾把 `tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`（agent TX count mismatch）列為 pre-existing 失敗，該 case 單獨連跑 5/5 通過、全套亦通過，**該註記已過期並移除**；看到它紅燈請當成真實回歸處理，不要當成既有基線。
+- pytest 下的隔離行為（#120）：`tests/conftest.py` 會硬覆寫 9 個 `SERIALWRAP_*` 目錄變數並 pop 8 個高優先變數（含 `SERIALWRAP_CONFIG`、`SERIALWRAP_TEST_DEVICE_ALLOWLIST`、`SERIALWRAP_RELEASE_MANIFEST`；外層 shell export 無效），並於 suite 結束執行 live guard（state/WAL/config/daemon 四維快照比對；逃生閥 `SERIALWRAP_LIVE_GATE=warn`，warn 下結構性破壞仍 FAIL——warn 為明知風險的 opt-in：daemon TX/state 變更僅示警，開發者需自行確認；daemon 維度多層探測 system→user systemd→唯讀 RPC on-demand，全不可達才 SKIP，#121）。
+- **目前無已知恆定失敗**（2026-10-16 校正）：本機全套 `python3 -m pytest -q tests/` 實測為 `2451 passed, 16 skipped, 2 failed`（P0-T15 收尾時的單次實測；2 failed 皆為 `tests/test_human_agent_coexist.py` 的 setUp READY 等待逾時，同一測試檔於未改動的 HEAD 亦間歇重現，失敗集合每次不同，未歸因於本次文件變更；系統負載峰值約 27–34／24 cores，未能完全排除飽和）。舊版本檔曾把 `tests/test_multiagent_e2e.py::TestMultiAgentE2E::test_five_agents_three_rounds_no_conflict`（agent TX count mismatch）列為 pre-existing 失敗，該 case 單獨連跑 5/5 通過、全套亦通過，**該註記已過期並移除**；看到它紅燈請當成真實回歸處理，不要當成既有基線。
 - **「已知 flaky」不得當作放行理由**：口耳相傳曾把 PTY-heavy 測試（`tests/test_human_agent_coexist.py`、`tests/test_multiagent_e2e.py`、`tests/test_multiagent_stress.py`、`tests/test_flash_pump.py`、`tests/test_flash_service_wiring.py`、`tests/test_agent_defer_tx.py`）在多 suite 併發下的失敗歸因為 `/dev/pts` 競態。2026-08-11 以 host＋worktree 併發度 2／6／12 共 25 次重跑**無法重現**（每次皆 `33 passed`；pty 峰值 63／上限 4096、load 峰值 7.5／20 cores），故此說法**目前無證據支持**。看到這幾支紅燈請**預設當成真實回歸**處理；要主張是環境問題，須提出「同範圍連跑兩次、失敗集合不同」的實測，並先排除洩漏的 throwaway daemon 與系統飽和。
 - 不得引入**新的**測試失敗。
+- **pytest 平台／資源 marker（Rust 重構 P0 T14）**：每個測試 item 必須恰有一個平台 marker（`core_portable`／`posix_only`／`windows_native`）與至少一個資源 marker（`memory_only`／`process_rpc`／`posix_pty`／`windows_com`／`physical_uart`／`supervisor_runtime`／`interactive_desktop`）；`memory_only` 不得與其他資源 marker 並存。marker 定義唯一位於 `tests/conftest.py` 的 `_MARKERS`；逐檔標註與稽核由 `tests/test_resource_markers.py` 強制（漏標、誤標、`core_portable` 平台 SKIP、模組層與子層混用皆 FAIL）。
+  - 選取範例：`python3 -m pytest -q -m "core_portable and memory_only" tests/`、`python3 -m pytest -q -m posix_pty tests/`。
+  - `core_portable` 不得有平台條件 SKIP；平台受限的測試須標 `posix_only` 或 `windows_native`，且不得以改標 `posix_only` 縮小 `core_portable` 分母。
+  - `core_portable` 的正確性不由稽核單獨保證：`core_portable` 集合須以原生 Windows 實跑（`py -3.12 -m pytest -m core_portable`）確認；稽核只能判定標註是否自洽，無法判定測試是否真的可攜。
+  - `windows_com` 只能標在真正以原生 Windows serial backend 開啟 COM 裝置的測試（socket 或記憶體 stream 不算）；`physical_uart` 需實體 USB-UART 與 DUT。本環境不得宣稱任何 `windows_com`／`physical_uart` 證據，P0 稽核斷言兩者使用數為 0。
+  - 新增測試檔須依上述規則帶 `pytestmark`、class 或函式 marker；同檔混合平台時平台 marker 放在 class／函式層，不放模組層。
+- **Windows 原生 pytest runner（Rust 重構 P1 T01，`scripts/stage0/win-pytest.sh`）**：在 WSL 端執行 `scripts/stage0/win-pytest.sh -m windows_native tests/`（其餘參數原樣傳給 pytest）；它把版本庫已追蹤與未忽略的檔案複製到 Windows 本機 `%LOCALAPPDATA%\Temp\sw-stage0\<run>`，在 staging 建立 `.git` 並 fetch 目前 HEAD 的提交歷史（供歷史相關測試使用），再以 `py -3.12` 執行 pytest；`posix_only` 模組由 `tests/conftest.py` 的 collection hook 排除。結束印 `summary.json` 路徑（`collected`／`passed`／`failed`／`skipped`／`rc`／`pytest_exit`／`finished`／`duplicates`）。環境變數：`SW_WIN_TIMEOUT`（秒，預設 900）、`SW_WIN_KEEP=1`（保留 staging）。exit code：`0` 通過；`3` Windows Python 缺 `pytest`／`PyYAML`／`pyserial`／`jsonschema`（安裝需擁有者同意，結果記「證據不足」）；`4` junit 未完成；`5` 以 `-m windows_native`／`windows_com` 執行時有 item 被 skip（被 skip 的原生測試不得計為 PASS）；`124` 逾時（已終止 Windows 行程樹）；`125` runner 本身失敗（取不到 `LOCALAPPDATA`、無法確認 Windows 行程已終止等）。pytest 原生 exit status（1 失敗、2 中斷等）原樣傳回；`summary.json` 的 `passed` 非空不等於 Stage 0 L1 出口 PASS。
 
 ## 回歸 case 政策（#155）
 
@@ -43,6 +50,19 @@ policy_version: 1.0.19
   - **需實機才驗得到**（真板 boot 時序、USB 列舉順序、真實登入、外部工具搶 tty、長時真實負載等）→ 必須在 `regression/`（TestPilot plugin `serialwrap_regression`）新增回歸 case，`issues` 欄掛上對應 issue 編號。
   - **PR 描述須記錄評估結論**（新增了哪個 case，或 pytest 已覆蓋／為何免加）。
 - 新增 case 的 SOP 與 family↔issue 對照見 `docs/regression-plugin.md`；執行方式見 README「TestPilot 回歸測試」章。
+
+## 契約治理政策（Rust 重構 P0）
+
+- **`contracts/` 為單一事實來源與權威（ADR-07）**：Python 基線與 Rust 實作皆以此目錄為對外契約進行測試與驗證。
+- **錯誤碼輸出同步**：改動 `sw_core` 的錯誤輸出時，必須同步更新 `contracts/error_codes.yaml` 或 `contracts/session_last_errors.yaml`，並重新產生 SKILL 說明區段（執行 `python3 -m tools.contracts skill-section --namespace error_code` 與 `python3 -m tools.contracts skill-section --namespace session_last_error`，將 stdout 貼入 `SKILL.md` 與 `SKILL_WINDOWS.md` 對應的 4 個受管區塊）。
+- **驗證命令**：完成任何修改前，必須執行契約檢查器確認全綠：
+  ```bash
+  python3 -m tools.contracts check
+  ```
+- **獨立審閱（§10.4）**：修改 `contracts/`、比較器或哨兵的 PR 必須有獨立審閱；產品與契約同時修改（如狀態推進協定的同一 commit）時，PR 描述須分別呈現變更理由及既有基線對照；不得以刪案例、改分母、放寬正規化或把 FAIL 改 SKIP 取得全綠。
+- **無硬編碼計數**：所有診斷碼計數由資料動態產生，驗證器與測試嚴格禁止硬編碼任何計數常數（OD-06）。
+- **狀態推進協定**：實作行為變更（BC／SC／DF）時，依狀態推進協定在同一 commit 將 `contracts/behavior_changes.yaml` 對應變更項 `status` 改為 `IMPLEMENTED`、將碼狀態改為 `IMPLEMENTED`、`reachable` 設為 `true`、補齊 `contract_tests`，並將 `rpc_schema.json`／`cli_schema.json` 中的 `x-pending` 條目併入正式定義。
+- 詳細治理規範、C01～C19 檢查代號與狀態協定見 `docs/contracts-governance.md`。
 
 ## Policy Check 政策
 
@@ -115,13 +135,17 @@ policy_version: 1.0.19
 
 ## 實際命令
 
-> 開發/操作速查（由 `.github/copilot-instructions.md` 併入，並對齊現行 pipx + systemd + XDG 流程）。
+> 開發/操作速查（由 `.github/copilot-instructions.md` 併入，並對齊現行 bundle（OD-50）+ systemd + XDG 流程）。
 
 執行期依賴：`PyYAML`；`pyserial` 為 **Windows 序列埠後端**（`sw_core/serial_port.py` 的 `_PySerialPort`，#84 PORT-1）依賴，`pyproject` 以 `sys_platform=='win32'` 條件安裝（Linux/WSL 預設走 termios 後端不需要；亦可手動裝以 `SERIALWRAP_SERIAL_BACKEND=pyserial` 覆寫）。human console 路徑另需 `jq`、`minicom`。套件以 `pyproject.toml`（setuptools）打包，console_scripts `serialwrap` / `serialwrapd`，內嵌資產在 `sw_core/assets/`。
 
 ```bash
-# 安裝（pipx 隔離 venv + serialwrap setup；有 systemd → systemd-user，無 → on-demand 降級）
-./install.sh
+# 安裝（OD-50：下載 GitHub release bundle＋SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup；
+#       有 systemd → systemd-user，無 → on-demand 降級；需 x86_64、glibc ≥ 2.39、/usr/bin/python3.12）
+./install.sh [--version X.Y.Z] [--] [setup 參數...]
+# 離線／開發：--bundle 接 bundle 目錄或 tar.gz（開發者先由 checkout 建 bundle）
+scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
+./install.sh --bundle /tmp/sw-bundle
 serialwrap doctor                 # 驗證環境（python/pyyaml/PATH/dialout/systemd/監管模式/裝置）
 
 # 測試（CI 與政策以 pytest 為準）
@@ -178,19 +202,21 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 
 - `ATTACHED`：bridge 已掛上，但 target 還沒確認進入可執行 prompt；這時候 **human console 仍可 attach 進去做手動登入或觀察 boot/log**。
 - `READY`：agent 命令可進入 arbiter。
-- `platform=passthrough` 的 session 會停在 `ATTACHED`，因為它不做 prompt/login/ready gating。
+- 非 passthrough 的 session 是否 probe 由 `ready_probe` 決定（SES-16.6-01）：無 `ready_probe` 者不 probe、停在 `ATTACHED`；有 `ready_probe` 者仍會 probe 進 `READY`。`platform=passthrough` 則不論 `ready_probe` 一律不 login、不 probe（SC-35）：經 explicit target／pin／sticky 選定後 attach 零 TX 停在 `ATTACHED`，連續 30 秒無 RX 自動升 `READY`（`PASSTHROUGH_READY_QUIET_S`）；動態偵測與 `fallback` 的 re-attach 仍先由 PROBE bridge 送一個 `\n` 探測。
 
 ### WAL 與結果擷取
 
 - 權威記錄為 `raw.wal.ndjson`、人類可讀鏡像為 `raw.mirror.log`，預設落在 XDG state home（`~/.local/state/serialwrap/wal/`，可由 `SERIALWRAP_WAL_DIR` 覆寫；舊版為 `/tmp/serialwrap/wal/`）。
 - 每筆 WAL 都有 `seq`、`mono_ts_ns`、`wall_ts`、`source`、`cmd_id`、`crc32`、`payload_b64`。
 - `background` 命令不是直接把所有輸出塞回 `command.get`；需要透過 `command.result_tail` 逐段讀取 capture。
+- **常駐 handle（BC-01，Rust 重構 P1 T02～T05）**：`WalWriter` 對 WAL 與 mirror 各持一個 binary unbuffered 常駐 handle，每筆 append 寫完即 flush；每個 handle 只關閉一次（先解除所有權再 close，任何例外路徑都不重複關閉），daemon 停止時由 `close()` 收尾。輪替順序固定為「`_close_handle_locked(sync=True)` 關閉並 fsync 舊 handle → `rename_noreplace_or_suffix` 改名為 `<path>.<UTC ts>`（目標已存在時依序加數字後綴、不覆蓋，DF-03）→ `sync_dir` → 下一筆 append 才重開新檔」；不可在 handle 仍開啟時改名或刪檔。輪替失敗為 best-effort（告警後續用既有檔案，不殺 RX reader）。
+- **Windows 行尾差異（BC-01 附帶位元組差異）**：舊版 Windows 以文字模式寫入，WAL 行尾與 mirror 換行實際為 `\r\n`；新格式一律只寫 `\n`（POSIX 與現況逐位元組相同）。所有讀取端（`_iter_matching`／`tail_*`、F12／`p0-wal-live` oracle、Rust reader）必須在 `json.loads` 前 `rstrip("\r\n")`，同時接受舊檔的 `\r\n`。
 
 ### Agent 日誌 capture
 
 - Agent 可透過 `session.log_start` / `session.log_stop` 對特定 session 啟停純文字 RX capture。
 - 日誌寫入 `{log_dir}/{COM}_{YYMMDD}-{HHMMSS}.log`，預設 `~/b-log`。
-- `log_dir` 優先序：per-target > per-profile > YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`。
+- `log_dir` 優先序（explicit YAML target）：per-target > per-profile（template）> YAML `defaults.log_dir` > `SERIALWRAP_LOG_DIR` env > `~/b-log`；**動態偵測 session 只用 template `log_dir`，不套用 `defaults.log_dir`**（WAL-D16／EVT-D-D9）。
 - session detach 時自動停止 capture。WAL 是 always-on 審計記錄，agent log 是 on-demand focused capture，兩者互補。
 
 ## 關鍵慣例
@@ -208,10 +234,12 @@ serialwrap 是讓多個 agent 與多個 human console 共用**同一條 UART** �
 
 ### JSON 輸出必須維持緊湊且穩定
 
-- CLI 一律用 `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`。
+- CLI 一律用 `json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"))`（`_print` 同樣帶 `sort_keys=True`，CLI-11.16）。
 - `state.json` 與 WAL 相關輸出會加上 `sort_keys=True`，避免不必要的 diff 與測試波動。
 
 ### human console 預設走 raw interactive 模式
+
+> **BC-04（Rust 重構 P1 T10）**：daemon 持有 UART 時**不可再直接開該 tty／COM**（含 `minicom -D /dev/ttyUSBx`、外部腳本 `open()`）。POSIX 以 `flock`＋`TIOCEXCL` 獨占並於任何 I/O 前重掃 holder；Windows 第二次開啟回 `ERROR_ACCESS_DENIED`。衝突一律回 `DEVICE_STILL_HELD{pids, holder_unknown}`，`holder_unknown: true` 不可視為可收回。人類 console 走 `serialwrap session console-attach`／`serialwrap-minicom`，外部工具獨佔走 `device release`／`device attach`。
 
 `console-attach` 在 `ATTACHED` 或 `READY` 狀態下，會自動授予第一個 human console **raw interactive ownership**：所有 console bytes 透過 `UARTBridge.send_bytes()` 即時透傳到 UART（方向鍵/Tab 等特殊按鍵可用）；第二個以後的 console 仍走 line-buffer 路徑。
 
@@ -234,7 +262,7 @@ POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平�
 - `platform=shell`：generic Linux login，走 prompt → login → ready_probe。
 - `platform=bcm`：Broadcom 原生平台，登入後進入 BCM CLI（`>`），需 `post_login_cmd: "sh"` 切到 Linux shell（`#`），`timeout_s` 建議加大（15s+）。
 - `platform=prpl`：prplOS，prompt_regex 匹配 prefix，不依賴行尾錨點。
-- `platform=passthrough`：不做任何 login/ready gating，停在 `ATTACHED`，適合未知設備觀察。
+- `platform=passthrough`：經 pin／explicit target 選定後不 login、不 probe（即使設 `ready_probe`），attach 零 TX 停在 `ATTACHED`（動態偵測仍先送一個 `\n` 探測），適合未知設備觀察；連續 30 秒無 RX 後自動升 `READY` 並可下命令（完成條件見 `docs/command-completion.md`，建議帶 `--completion-regex`）。
 
 ### 新增能力通常要同步改多個面
 
@@ -248,7 +276,7 @@ POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平�
 
 - `tests/test_multiagent_e2e.py` 會啟動真實 daemon，再用 PTY 假 target 驗證 `READY` 流程與多 agent 序列化，任何跨 `service / arbiter / session_manager / uart_io` 的改動都適合先看這個測試。
 - `tests/test_wal.py`、`tests/test_login_fsm.py`、`tests/test_session_bind.py` 分別對應 WAL、登入狀態機與綁定/持久化行為。
-- 安裝走 `install.sh`（pipx install + `serialwrap setup`），不是單純複製檔案；setup 會物化資產、reconcile 監管模式（先停舊再起新）、並以 `detect_legacy_install` 偵測舊版 `~/.paul_tools` 安裝給退役指引（只指引不刪除）。
+- 安裝走 `install.sh`（下載 bundle tarball＋`SHA256SUMS` 驗證或 `--bundle` 離線，再執行 `<bundle>/bin/serialwrap setup`；pipx 路徑已退役，OD-50），不是單純複製檔案；setup 會物化資產、reconcile 監管模式（先停舊再起新）、並以 `detect_legacy_install` 偵測舊版 `~/.paul_tools` 安裝給退役指引（只指引不刪除）。
 
 ## v1.0.1 新增規則（issue 連結 / docs 對齊 / 語言）
 > 本段於 policy 1.0.1 隨 R-17 / R-18 與語言規範新增。
@@ -265,7 +293,7 @@ POSIX 上 human console 走 PTY（minicom 開 `/dev/pts/N`）；無 PTY 的平�
 
 > **平台範圍（#84）**：`/dev/ttyMCU` PTY-bridge（含 sync-probe、baud 鏡射）為 **POSIX-only**。**Windows 不走此模型也不需要**——Windows 韌體升級工具直接獨佔開啟 UART `COMx` 自行燒錄；serialwrap 在 Windows flash 只需 **detach（release）該 COM port**（關閉自身 handle、燒完 reclaim），對應 **#54 device release/handoff** 語意（非 #55）。底層 `stop()`→`close()` / `start()`→re-open primitive 已可用；完整 `device release`/`attach` 編排待 Windows daemon（#84 PORT-4）。
 
-- **隔離跑法（不動 prod / 人類 minicom）**：prod daemon 不停；用獨立 socket/state/run 的 **throwaway daemon** 跑待測程式碼（`SERIALWRAP_RUN_DIR` / `_STATE_DIR` / `_BY_ID_DIR` 等 env）。關鍵：`SERIALWRAP_BY_ID_DIR` 指向只放「MCU 線（FTDI）by-id symlink」的 sandbox 目錄，否則動態偵測會抓到被人類 minicom 佔住的 DUT console（ttyUSB0）造成 two-reader 衝突。
+- **隔離跑法（不動 prod / 人類 minicom）**：prod daemon 不停；用獨立 socket/state/run 的 **throwaway daemon** 跑待測程式碼（`SERIALWRAP_RUN_DIR` / `_STATE_DIR` / `_BY_ID_DIR` 等 env）。關鍵：`SERIALWRAP_BY_ID_DIR` 指向只放「MCU 線（FTDI）by-id symlink」的 sandbox 目錄，否則動態偵測會抓到被人類 minicom 佔住的 DUT console（ttyUSB0）造成 two-reader 衝突。隔離實例必須**同時**設 `SERIALWRAP_BY_ID_DIR` 與 `SERIALWRAP_BY_PATH_DIR`（只設 `BY_ID_DIR` 仍會掃 `/dev/serial/by-path`，PLT-D-02）。
 - **進 BSL**：DUT console（如 CH340/ttyUSB0）下 GPIO BSL-invoke（unbind `1fbf0300.serial`、GPIO13/14 設 in、GPIO31/54 reset）。**長指令會在 UART console 被截斷 → 必須逐行短指令送**（`tmux send-keys -l` 每行 +Enter +sleep，勿用 `;` 串長行）。
 - **燒錄**：`ocp-mcu-upgrade -d <RUN_DIR>/dev/ttyMCU -b 115200 -t 8 -e -s -i <fw.bin>` → 期望 `Return error code : 0x0`；燒後 session 自動恢復 `ATTACHED`、daemon 不死、其他 COM 不受影響。
 - **三個只有實機才現形的坑（皆已修，列為回歸重點）**：

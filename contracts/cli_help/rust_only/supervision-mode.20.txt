@@ -1,0 +1,30 @@
+usage: serialwrap supervision-mode
+       [-h]
+       [--force]
+       [--with-sudo]
+       [set MODE ...]
+
+印出 config.yaml 中的 
+supervision_mode，未
+設定時預設為 on-demand。供
+shell 腳本（如 minicom
+_router.sh）查詢。
+
+positional arguments:
+  set MODE
+    不帶參數：印出目前監管模式；
+    set MODE：切換並執行
+    reconcile
+
+options:
+  -h, --help
+    show this help
+    message and
+    exit
+  --force
+    相容旗標：不覆寫交接護欄（f
+    lash、傳輸、活躍操作或探
+    測不明時一律拒絕）
+  --with-sudo
+    允許代跑需要 root／系統
+    管理員權限的指令

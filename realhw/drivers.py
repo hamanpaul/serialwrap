@@ -137,10 +137,14 @@ class SwCli:
         return {}
 
     def submit_and_wait(self, com: str, cmd: str, *, cmd_timeout: float = 12.0,
-                        settle_s: float = 1.5, poll_s: float = 0.5) -> dict:
+                        settle_s: float = 1.5, poll_s: float = 0.5,
+                        source: str | None = None) -> dict:
         """cmd submit → 輪詢 cmd status 到 done（坑：submit 後立刻讀有 line race）。"""
-        sub = self.run("cmd", "submit", "--selector", com, "--cmd", cmd,
-                       "--cmd-timeout", str(cmd_timeout))
+        argv = ["cmd", "submit", "--selector", com, "--cmd", cmd,
+                "--cmd-timeout", str(cmd_timeout)]
+        if source:
+            argv.extend(("--source", source))
+        sub = self.run(*argv)
         cmd_id = sub.get("cmd_id")
         if not cmd_id:
             return {"_error": "submit 未回 cmd_id", **sub}
@@ -183,6 +187,25 @@ class TmuxCtl:
 
     def capture(self, session: str) -> str:
         return _run(["tmux", "capture-pane", "-p", "-t", session]).stdout
+
+    def alive(self, session: str) -> bool:
+        return _run(["tmux", "has-session", "-t", session]).returncode == 0
+
+    def pane_pid(self, session: str) -> str:
+        return _run(["tmux", "display-message", "-p", "-t", session,
+                     "#{pane_pid}"]).stdout.strip()
+
+    def capture_history(self, session: str) -> tuple[str, bool]:
+        """含 scrollback 的整段擷取；回傳 (文字, 是否可能被截斷)。
+
+        ``history_size`` 達到 ``history_limit`` 時舊行已被捲出 scrollback，擷取不完整，呼叫端不得據此判 PASS。
+        """
+        text = _run(["tmux", "capture-pane", "-p", "-S", "-", "-t", session]).stdout
+        info = _run(["tmux", "display-message", "-p", "-t", session,
+                     "#{history_size} #{history_limit}"]).stdout.split()
+        truncated = (len(info) != 2 or not info[0].isdigit() or not info[1].isdigit()
+                     or int(info[1]) <= 0 or int(info[0]) >= int(info[1]))
+        return text, truncated
 
     def kill(self, session: str) -> None:
         _run(["tmux", "kill-session", "-t", session])

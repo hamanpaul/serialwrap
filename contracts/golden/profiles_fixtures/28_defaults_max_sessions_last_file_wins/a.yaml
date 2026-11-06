@@ -1,0 +1,5 @@
+defaults:
+  max_sessions: 4
+profiles:
+  alpha:
+    platform: prpl

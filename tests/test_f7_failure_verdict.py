@@ -11,6 +11,9 @@ sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from realhw.harness import CaseResult  # noqa: E402
 from serialwrap_regression.cases import f07_file_transfer as f07
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_checksum_mismatch_is_test_failure_independent_of_tool_probe() -> None:

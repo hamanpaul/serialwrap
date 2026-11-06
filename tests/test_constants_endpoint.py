@@ -5,6 +5,8 @@ import os
 
 import pytest
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 # 測試開始前記錄真實平台值，供 _restore_constants 在 teardown 時使用
 _REAL_PLATFORM: str = sys.platform
 _REAL_OS_NAME: str = os.name

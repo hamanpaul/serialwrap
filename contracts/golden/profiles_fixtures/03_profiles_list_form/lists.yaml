@@ -1,0 +1,13 @@
+profiles:
+  - name: alpha
+    platform: shell
+  - profile_name: beta
+    platform: prpl
+  - platform: prpl
+  - name: "   "
+    platform: prpl
+  - "not a dict"
+
+targets:
+  - profile: beta
+    device_by_id: dev-b

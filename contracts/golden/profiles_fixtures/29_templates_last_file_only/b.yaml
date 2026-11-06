@@ -1,0 +1,5 @@
+profiles:
+  beta:
+    platform: shell
+targets:
+  - {profile: beta, device_by_id: db}

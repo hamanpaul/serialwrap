@@ -1,0 +1,9 @@
+profile_name: 板卡-A
+profiles:
+  板卡-A:
+    platform: shell
+    prompt_regex: "^使用者@板卡 # "
+    post_login_cmd: "sh"
+
+targets:
+  - {device_by_id: "usb-板卡"}

@@ -70,6 +70,9 @@ class SystemEffects:
     run() 以 check=False 執行子行程，不拋 CalledProcessError。
     """
 
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
     def run(self, cmd: List[str], *, timeout_s: Optional[float] = None) -> Tuple[int, str, str]:
         """執行 cmd，回傳 (returncode, stdout, stderr)；非零返回碼不拋例外。
 
@@ -84,6 +87,7 @@ class SystemEffects:
             )
         except subprocess.TimeoutExpired:
             return -1, "", "TIMEOUT"
+        self.calls.append(list(cmd))
         return result.returncode, result.stdout, result.stderr
 
     def has_systemd(self) -> bool:

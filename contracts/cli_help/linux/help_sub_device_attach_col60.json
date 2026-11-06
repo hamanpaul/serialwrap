@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "device",
+    "attach",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap device attach [-h] --selector SELECTOR\n                                [--force]\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n  --force\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -1,0 +1,5 @@
+profiles:
+  ghost:
+    platform: shell
+targets:
+  - {profile: ghost, device_by_id: dghost}

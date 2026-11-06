@@ -31,7 +31,7 @@ def _restore_ready(ctx, com: str, timeout_s: float) -> None:
 @_case("p1-rst-daemon", "systemd restart 後映射／profile 逐板不變（#100/#95）",
        hints=("MainPID 未變＝restart 未生效（NOPASSWD sudo？）",
               "by-id 對調＝#100 startup rank 退化；profile 漂移＝#95 偵測不穩"),
-       requires=("two_boards",))
+       requires=("two_boards", "supervisor_runtime"))
 def p1_rst_daemon(ctx):
     boards = ctx.cfg["boards"]
     before = {b["com"]: ctx.sw.session(b["com"]) for b in boards}
@@ -77,13 +77,16 @@ def p1_rst_daemon(ctx):
 @_case("p1-rst-reboot", "target reboot 後自動恢復 READY＋console 存活＋WAL 連續",
        hints=("reboot status 可能 timeout（prplOS 回 prompt 後才斷）——容忍",
               "console client 應跨 reboot 存活（daemon 保 bridge，走 RECOVERING）"),
-       requires=("two_boards", "deployed_recent"))
+       requires=("two_boards", "deployed_recent", "human_frontend"))
 def p1_rst_reboot(ctx):
-    att = ctx.sw.run("session", "console-attach", "--selector", "COM0", "--label", "realhw")
-    vtty, cid = att.get("vtty"), att.get("client_id")
-    ses = ctx.tmux.name("rstreboot")
-    if vtty:
-        ctx.tmux.new(ses, f"cat {vtty}")
+    human = ctx.human("rstreboot", "reader")
+    try:
+        human.open("COM0")
+    except Exception as exc:
+        human.close()
+        return CaseResult("FAIL", reason=f"console-attach 失敗：{exc}",
+                          category="test", reason_code="console_dropped")
+    cid = human.client_id()
     try:
         start_seq = ctx.sw.run("wal", "current-seq").get("seq") or 0
         rc = ctx.sw.submit_and_wait("COM0", "reboot", cmd_timeout=10)
@@ -106,7 +109,8 @@ def p1_rst_reboot(ctx):
                               category="test", reason_code="reboot_ready_timeout")
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
         ctx.note("console-list.json", str(cl))
-        if cid and not any(c.get("client_id") == cid for c in cl.get("consoles") or []):
+        consoles = cl.get("consoles") or []
+        if (cid and not any(c.get("client_id") == cid for c in consoles)) or (not cid and not consoles):
             return CaseResult("FAIL", reason="reboot 後 console client 未存活",
                               category="test", reason_code="console_dropped")
         if end_seq <= start_seq:
@@ -114,10 +118,7 @@ def p1_rst_reboot(ctx):
                               category="test", reason_code="wal_not_continuous")
         return CaseResult("PASS")
     finally:
-        if vtty:
-            ctx.tmux.kill(ses)
-        if cid:
-            ctx.sw.run("session", "console-detach", "--selector", "COM0", "--client-id", cid)
+        human.close()
         _restore_ready(ctx, "COM0", ctx.cfg["timeouts"]["reboot_wait_s"])
 
 

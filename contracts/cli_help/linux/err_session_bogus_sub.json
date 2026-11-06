@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "session",
+    "bogus"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap session [-h] <command> ...\nserialwrap session: error: argument <command>: invalid choice: 'bogus' (choose from 'list', 'clear', 'bind', 'pin', 'unpin', 'attach', 'self-test', 'activity', 'recover', 'console-attach', 'console-detach', 'console-list', 'interactive-open', 'interactive-send', 'interactive-status', 'interactive-close', 'log-start', 'log-stop', 'log-status')\n",
+  "native": true,
+  "post_parse_effects": false
+}

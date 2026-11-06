@@ -4,6 +4,9 @@ import tempfile
 import unittest
 
 from sw_core.event_engine.counter import Counter, CounterStore
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestCounter(unittest.TestCase):

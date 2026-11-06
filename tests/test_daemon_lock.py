@@ -1,8 +1,17 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from sw_core.daemon_lock import SingletonLock
+import pytest
+
+# POSIX-only：daemon_lock 經 lock_posix.py:4 頂層 import fcntl；非 POSIX 整檔略過、不 import。
+if os.name != "posix":
+    pytest.skip("SingletonLock POSIX 後端依賴 fcntl（lock_posix.py:4）", allow_module_level=True)
+
+from sw_core.daemon_lock import SingletonLock  # noqa: E402
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.memory_only]
 
 
 class TestDaemonLock(unittest.TestCase):

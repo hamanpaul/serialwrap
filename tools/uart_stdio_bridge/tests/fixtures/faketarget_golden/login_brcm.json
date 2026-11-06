@@ -1,0 +1,60 @@
+{
+  "config": {
+    "boot_banner": "\r\nBroadcom platform boot...\r\nLogin: ",
+    "commands": {
+      "default": "{cmd}\r\nRESULT:{cmd}:OK\r\n/ # ",
+      "overrides": {
+        "sh": {
+          "response": "\r\n\r\n/ # "
+        }
+      }
+    },
+    "login_steps": [
+      {
+        "expect": "admin",
+        "respond": "\r\nPassword: "
+      },
+      {
+        "expect": "admin",
+        "respond": "\r\n\r\nCM> "
+      }
+    ],
+    "noise": {
+      "enabled": false
+    },
+    "platform": "bcm"
+  },
+  "source_blob": "93553e6:func-test/lib/fake_target.py",
+  "steps": [
+    {
+      "input_b64": "Ym9ndXMK",
+      "output_b64": "DQpMb2dpbjog",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "YWRtaW4K",
+      "output_b64": "DQpQYXNzd29yZDog",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "d3JvbmcK",
+      "output_b64": "DQpQYXNzd29yZDog",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "YWRtaW4K",
+      "output_b64": "DQoNCkNNPiA=",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "c2gK",
+      "output_b64": "DQoNCi8gIyA=",
+      "wait_ms": 500
+    },
+    {
+      "input_b64": "Cg==",
+      "output_b64": "LyAjIA==",
+      "wait_ms": 500
+    }
+  ]
+}

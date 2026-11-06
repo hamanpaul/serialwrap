@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 def test_walwriter_default_resolves_at_construction(tmp_path, monkeypatch):
     """WalWriter() 的 default wal_dir 須於建構時讀模組層 WAL_DIR，而非 def-time 凍結值。"""

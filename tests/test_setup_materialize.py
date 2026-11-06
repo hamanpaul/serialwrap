@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import os
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_materialize_copies_profiles_and_symlinks_skill(tmp_path, monkeypatch):

@@ -8,19 +8,35 @@ tier: shareable
 secret_scan:
   # R-21 結構偵測器（比對「斜線 home 斜線 使用者名稱 斜線」樣式）誤判：以下檔案內含
   # docker 測試映像內建的 tester 帳號 home 目錄路徑（tools/docker/remote_tunnel_test.sh
-  # 三拓樸驗收用），該帳號僅存在於一次性測試容器內，非任何真人開發者的本機個人路徑，允許放行。
+  # 三拓樸驗收用；tools/docker/systemd.Dockerfile 為 OD-15 systemd 容器的 swtest 帳號），
+  # 該帳號僅存在於一次性測試容器內，非任何真人開發者的本機個人路徑，允許放行。
   allow:
     - "Dockerfile"
     - "tools/docker/remote_tunnel_test.sh"
     - "tools/docker/uart_harness.py"
+    - "tools/docker/systemd.Dockerfile"
+    # 非實作者雲端審查原文（依擁有者裁決逐字複製）記錄雲端 routine 容器預設帳號 home 下的工作樹路徑，
+    # 為一次性雲端容器的預設帳號路徑，非任何真人開發者的本機個人路徑；為保留原文不改寫，允許放行。
+    - "docs/rust-refactor/reviews/s1x-oracle-review-1.md"
+    # OD-33 升級驗證報告原文：容器內 swtest 測試帳號 home 下的 pipx／入口路徑（僅存在於一次性升級容器），
+    # 非真人開發者的本機個人路徑；證據須保留原文供雜湊核對，允許放行。
+    - "evidence/stage1/upgrade-docker/**"
 code_paths:
   - "sw_core/**"
   - "tools/**"
   - "tests/**"
   - "profiles/**"
+  - "contracts/**"
   - "serialwrap"
   - "serialwrapd.py"
   - "install.sh"
+  # Rust 重構（P3-T1）：crate 原始碼、workspace 與工具鏈設定、regen／cfg 邊界腳本
+  - "crates/**"
+  - "scripts/rust/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+  - ".cargo/**"
 cli:
   - command: "./serialwrap"
     help_args: ["--help"]
@@ -43,12 +59,44 @@ cli:
     help_args: ["--help"]
     reflected_in: "README.md"
     marker: "serialwrap-remote-help"
+# OD-06：凡程式會輸出的 error_code 與 session last_error，都必須在 SKILL 有意義與處置。
+# 規則本體為 paulsha-conventions R-27（通用、不內建碼表）；引擎 pin 升級前由
+# tests/test_contracts_policy_decl.py 與 `python3 -m tools.contracts check` 的 C13 以同語意本地強制。
+diagnostic_codes:
+  - namespace: error_code
+    extract: "python3 -m tools.contracts extract --namespace error_code --format lines"
+    docs: ["sw_core/assets/skill/SKILL.md", "sw_core/assets/skill/SKILL_WINDOWS.md"]
+    entry_pattern: '^\| `(?P<code>[^`]+)` \| [^|\n]* \| [^|\n]* \| (?P<meaning>[^|\n]*\S[^|\n]*) \| (?P<action>[^|\n]*\S[^|\n]*) \|$'
+    require_in: all
+  - namespace: session_last_error
+    extract: "python3 -m tools.contracts extract --namespace session_last_error --format lines"
+    docs: ["sw_core/assets/skill/SKILL.md", "sw_core/assets/skill/SKILL_WINDOWS.md"]
+    entry_pattern: '^\| `(?P<code>[^`]+)` \| [^|\n]* \| [^|\n]* \| (?P<meaning>[^|\n]*\S[^|\n]*) \| (?P<action>[^|\n]*\S[^|\n]*) \|$'
+    require_in: all
+# R-26：SKILL 受管區段必須與契約目錄產生結果一致
+generated_facts:
+  - command: "python3 -m tools.contracts skill-section --namespace error_code"
+    reflected_in: "sw_core/assets/skill/SKILL.md"
+    marker: "error-codes"
+  - command: "python3 -m tools.contracts skill-section --namespace session_last_error"
+    reflected_in: "sw_core/assets/skill/SKILL.md"
+    marker: "session-last-errors"
+  - command: "python3 -m tools.contracts skill-section --namespace error_code"
+    reflected_in: "sw_core/assets/skill/SKILL_WINDOWS.md"
+    marker: "error-codes"
+  - command: "python3 -m tools.contracts skill-section --namespace session_last_error"
+    reflected_in: "sw_core/assets/skill/SKILL_WINDOWS.md"
+    marker: "session-last-errors"
 preflight:
   steps:
     - name: openspec
       kind: validation
       argv: ["openspec", "validate", "--all", "--strict"]
       when_path_exists: "openspec"
+      timeout_seconds: 300
+    - name: contracts
+      kind: validation
+      argv: ["python3", "-m", "tools.contracts", "check"]
       timeout_seconds: 300
     - name: tests
       kind: tests

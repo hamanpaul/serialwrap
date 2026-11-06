@@ -32,9 +32,10 @@ steps:
   - action: inject_device_event
     event: remove
 
-  # 等待 daemon 偵測到裝置消失
-  - action: sleep
-    seconds: 3
+  - action: wait_state
+    selector: COM0
+    state: DETACHED
+    timeout_s: 15
 
   # 驗證 session 狀態
   - action: cli
@@ -47,3 +48,8 @@ steps:
     argv: ["daemon", "status"]
     expect:
       ok: true
+
+bridge:
+  applicable: true
+  compare: "until_op:s002-inject_device_event"
+  windows_caps: [by_id_link]

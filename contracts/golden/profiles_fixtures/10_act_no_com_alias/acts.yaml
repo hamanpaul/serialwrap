@@ -1,0 +1,11 @@
+profiles:
+  p:
+    platform: shell
+
+targets:
+  - {profile: p, device_by_id: d1, act_no: 0}
+  - {profile: p, device_by_id: d2, act_no: -3}
+  - {profile: p, device_by_id: d3, act_no: 3}
+  - {profile: p, device_by_id: d4, act_no: 5, com: "  COM9 ", alias: "  custom  "}
+  - {profile: p, device_by_id: d5, act_no: 6, alias: ""}
+  - {profile: p, device_by_id: d6, act_no: "x"}

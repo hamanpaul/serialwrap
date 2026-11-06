@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "file",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap file [-h] <command> ...\n\n透過 UART 在本機與 target 之間推送（push）或拉取（pull）檔案。\n\npositional arguments:\n  <command>\n    push      透過 UART 推送本機檔案到 target\n    pull      透過 UART 從 target 拉取檔案到本機\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

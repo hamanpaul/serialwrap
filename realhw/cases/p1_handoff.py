@@ -31,7 +31,7 @@ def _force_ready(ctx, com: str, timeout_s: float) -> None:
               "收回後回 READY 靠 login FSM 重登：brcm/BDK 板需 credential（#140）——"
               "deployed daemon 缺 #140 修正時可能靜默送空帳密卡 ATTACHED 不回 READY，"
               "FAIL 時先查 daemon 版本與 profile env_file 帳密"),
-       requires=("two_boards",))
+       requires=("two_boards", "tmux"))
 def p1_ho_cycle(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]
     attached = ctx.sw.session("COM1").get("attached_real_path")
@@ -79,7 +79,7 @@ def p1_ho_cycle(ctx):
 
 @_case("p1-ho-persist", "RELEASED 跨 daemon restart 持久（不被搶回）",
        hints=("restart 後 released map 應自 state.json 還原；COM1 保持 RELEASED、COM0 照常 READY",),
-       requires=("two_boards",))
+       requires=("two_boards", "supervisor_runtime"))
 def p1_ho_persist(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]
     reboot_wait = ctx.cfg["timeouts"]["reboot_wait_s"]

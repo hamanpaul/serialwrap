@@ -1,0 +1,12 @@
+profiles:
+  p:
+    platform: shell
+
+targets:
+  - "junk"
+  - 42
+  - profile: p
+    device_by_id: dev-idx
+  - profile: p
+    device_by_id: dev-idx2
+    act_no: "7"

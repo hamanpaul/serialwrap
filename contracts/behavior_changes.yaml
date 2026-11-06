@@ -1,0 +1,1545 @@
+# 行為變更登記（BC／SC／DF）。由 P0-T5 建立，對應 docs/rust-refactor/plans/01-stage0-contracts.md T5 與調和表 spec-reconciliation.md §1。
+# BC-01～BC-05 依 OD-04 核准；SC-01～SC-27（SC-08 已依 OD-14 #3 撤回）與 SC-34～SC-36、SC-39（OD-48）、DF-01～DF-17、DF-19～DF-22 依定稿規格、調和表與相關 OD 推導（DF-18 保留給 P7）。
+# SC-08 依 OD-14 #3 撤回（UDS 維持 0660），編號保留不重用。
+# SC-11 交接排空窗口依 OD-16 (3) 擁有者接受（2026-10-22）：related_decisions、spec_refs、approval_conditions 已載明；owner_confirmation 維持 not_required、owner_item 不指派（擁有者佇列編號未定，見 spec-reconciliation SC-11 列），故不改動 pending 佇列與 tests/test_p1oc_catalog.py 釘定的 confirmed 清單。
+# 登錄時全部為 APPROVED（核准未實作）；實作後依狀態推進協定改為 IMPLEMENTED，VERIFIED 只由擁有者標記。
+# applies_to.python.min_version 為目標 release 版號（不代表 VERSION 已是該版）；rust_only 項目為 null。
+# 檔內不寫 contract_revision（tree SHA 只在 build／capture 時計算）。字串一律以雙引號呈現，避免 YAML 1.1 bool／日期陷阱。
+schema_version: 1
+revision: 8
+changes:
+  - id: "BC-01"
+    kind: "BC"
+    title: "WAL 常駐 handle、每筆 flush、Windows share-delete、自癒與缺口記錄"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-15"
+      decision_ref: "OD-04"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§9.1", "§8.2", "ADR-05"]
+    reconciliation_refs: ["WAL-D5", "WAL-D6", "WAL-1.4b", "UIO-12.4-a"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["bc01-wal-resident-handle", "bc01-wal-flush-per-record", "bc01-wal-rotate-normal", "bc01-wal-external-unlink-meta", "bc01-wal-external-reader-handle", "bc01-wal-recreate-failure-stops-tx", "bc01-f12-oracle-progress"]
+    compatibility_impact: "WAL 改為常駐 handle 並每筆 flush，寫入路徑不再每筆開關檔。Windows 新寫入 WAL 行尾與 mirror 內的換行由文字模式 CRLF 改為 binary 模式 LF；讀取端仍接受既有 WAL CRLF 檔案。health.status.wal 新增 unhealthy_reason 欄位。外部 unlink／替換（含只刪檔、目錄消失）經有界重試重建成功後，先寫首筆 META WAL_RECREATED_AFTER_EXTERNAL_UNLINK（loss_flag:true、potentially_lost_seq_range，不再靜默）；正常 rotate 不寫缺口 META。WAL 重建失敗時有界處置並停止新增自動 UART TX（已完成的 UART 寫入不因 WAL append 失敗而自動重送）。正常 rotate 門檻 67108864 與 WAL 記錄格式不變。Windows 上外部讀取者的 share-delete 相容性改變。對讀取 WAL 的 L2／L3：可能出現 META 缺口事件。"
+    approval_conditions: "同時核准正常 rotate、外部 handle 阻擋、有界失敗處置及 META 語意；F12 oracle 由 OD-13 配套核准"
+    related_decisions: ["OD-04", "OD-05", "OD-13"]
+  - id: "BC-02"
+    kind: "BC"
+    title: "DeferredBuffer 溢位或跨上下文時整段清空"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-15"
+      decision_ref: "OD-04"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 1
+    spec_refs: ["§9.1", "§5.2.6"]
+    reconciliation_refs: ["SES-16.1", "UIO-12.5", "SES-16.4-05", "UIO-12.9-c"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P6", "P8"]
+    case_ids: ["bc02-deferred-overflow-clear", "bc02-deferred-context-switch-clear", "bc02-mailbox-stale-input-not-replayed", "bc02-normal-replay-53"]
+    compatibility_impact: "DeferredBuffer 溢位（原為截頭留尾）或 recovery、release、reboot、Quiet 重新啟動及 flash 認線成功（FlashSyncMatched）時，延後輸入整段清空、不回放。Lease hand-off 的寫入授權由 T20 permit 依 owner_gen 檢查，不觸發 BC-02 清空。未發生失效時的 #53 正常回放不變。對依賴延後輸入保留尾端的 agent：溢位後不再保留尾段。"
+    approval_conditions: "保留未發生失效時的 #53 正常回放；測 mailbox 中尚未處理的舊輸入，避免清空後重新灌回"
+    related_decisions: ["OD-04"]
+  - id: "BC-03"
+    kind: "BC"
+    title: "新增 COMMAND_ABORTED_IN_FLIGHT"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-15"
+      decision_ref: "OD-04"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§9.1", "§5.1.4"]
+    reconciliation_refs: ["SES-16.2", "UIO-12.2-d", "ERR-7.3-9"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["bc03-aborted-in-flight-after-1byte", "bc03-unknown-outcome-send-failed", "bc03-no-auto-resend"]
+    compatibility_impact: "已確認寫出至少 1 byte 後中止的命令改回 COMMAND_ABORTED_IN_FLIGHT（retryable:false）；結果不明時沿用既有 SEND_FAILED 映射。依碼分支的 agent 需新增 COMMAND_ABORTED_IN_FLIGHT 處理；不得因此自動重送。file.push／file.pull（OD-62）：傳輸已寫出至少 1 byte 後因 drain、世代過期或取消中止時，同步回應改為 COMMAND_ABORTED_IN_FLIGHT（push 附 chunks_sent／chunks_total）；0.3.2 的 file.* 用戶端在此情境原本收到 TRANSFER_TIMEOUT（或例外），需新增此碼處理，且不得自動重送；此時比照一般命令寫 command_aborted_in_flight WAL META（cmd_id 為該次傳輸的 cmd_id 前綴 ft-<8hex>，confirmed_tx_bytes 為整段傳輸累計）。"
+    approval_conditions: "已確認寫出至少 1 byte 後中止，`retryable:false`；結果不明須另凍結相容映射，不得混入安全重試"
+    related_decisions: ["OD-04", "OD-62"]
+  - id: "BC-04"
+    kind: "BC"
+    title: "Per-UART 獨占、衝突阻斷與 holder 診斷"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-15"
+      decision_ref: "OD-04"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§9.1", "§6.2"]
+    reconciliation_refs: ["RPC-D-08", "ERR-7.1-h", "UIO-12.1-a", "UIO-12.1-b", "UIO-12.1-c", "UIO-12.1-d", "PLT-D-13"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["bc04-posix-exclusive-tiocexcl-flock", "bc04-posix-close-clears-tiocexcl", "bc04-device-still-held-pids", "bc04-holder-unknown-proc-unreadable", "bc04-windows-access-denied-holder-unknown", "bc04-device-attach-sync-reacquire"]
+    compatibility_impact: "POSIX 以 flock＋TIOCEXCL 取得獨占，並於 TIOCEXCL 後、任何 I/O 前做鎖後 holder 重掃；保證範圍限定為在受控權限、指定裝置存取流程與已驗證的驅動／裝置組合下，避免 serialwrap 實例互相搶讀並拒絕已識別的外部衝突（含 --force）。flock 為 advisory；TIOCEXCL 只阻止後續一般 open、不撤銷既有 handle，且有 CAP_SYS_ADMIN 例外；/proc holder 掃描是診斷快照而非原子鎖，查不到 PID 不代表無 holder。daemon 關閉 tty（release、PROBE 轉正式 bridge、TIOCEXCL 後的失敗路徑）先 TIOCNXCL，PTY master 持續開啟時同一 slave 的一般 open 不得 EBUSY。衝突回 DEVICE_STILL_HELD{pids,holder_unknown}。/proc 不可讀時 holder_unknown:true，不再視為可收回。Windows 占用或原因不明時回 pids:[] 與 holder_unknown:true。人類 console 須經 serialwrap console 連入，不得另開 tty。"
+    approval_conditions: "明列 POSIX 保證範圍、Windows `pids:[]`／`holder_unknown:true`；占用與原因不明的存取失敗不得誤表述"
+    related_decisions: ["OD-04", "OD-05", "OD-08"]
+  - id: "BC-05"
+    kind: "BC"
+    title: "Windows remote -R/-L"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-15"
+      decision_ref: "OD-04"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§9.1"]
+    reconciliation_refs: ["PLT-D-08"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["bc05-windows-remote-reverse", "bc05-windows-remote-local", "bc05-process-lifecycle-stop-restart", "bc05-three-topologies"]
+    compatibility_impact: "Windows 上 remote -R／-L 由 REMOTE_NOT_SUPPORTED 改為可用（以非阻塞轉接實作；範圍以盤點 07 §8.6 的 POSIX-only 依賴清單為準：fcntl registry／bench 鎖、ControlMaster／ControlPath、setsid／killpg、os.kill(pid,0)、/proc starttime；基線實無 pipe（PLT-D-08））；remote 程序的停止與重啟納入生命週期管理。POSIX 行為不變。既有三種拓樸不變。"
+    approval_conditions: "移除 POSIX-only pipe 依賴；驗證非阻塞轉接、程序生命週期、停止、重啟及既有三拓樸"
+    related_decisions: ["OD-04"]
+  - id: "SC-01"
+    kind: "SC"
+    title: "RECOVERING 下 submit 與 open 回 SESSION_RECOVERING"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.3"]
+    reconciliation_refs: ["ERR-7.3-2", "SES-16.4-01"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc01-recovering-submit-open"]
+    compatibility_impact: "RECOVERING 下 CmdSubmit、InteractiveOpen 與 file.push／file.pull 改回 SESSION_RECOVERING（原 SESSION_NOT_READY）；依碼分支的 agent 需新增 SESSION_RECOVERING 處理。file.push／file.pull 依 plan 09 §0.1 與 error_codes.yaml 納入本 SC 範圍（OD-51 補正登記漏項，程式不改）。"
+    approval_conditions: "規格明文"
+    related_decisions: ["OD-51"]
+  - id: "SC-02"
+    kind: "SC"
+    title: "FLASHING 下 submit 與 open 回 FLASHING_BUSY"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.3"]
+    reconciliation_refs: ["SES-16.4-02"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc02-flashing-submit-open"]
+    compatibility_impact: "FLASHING 下 CmdSubmit、InteractiveOpen 與 file.push／file.pull 改回 FLASHING_BUSY（原 SESSION_NOT_READY）；依碼分支的 agent 需新增 FLASHING_BUSY 處理。file.push／file.pull 依 plan 09 §0.1 與 error_codes.yaml 納入本 SC 範圍（OD-51 補正登記漏項，程式不改）。"
+    approval_conditions: "規格明文"
+    related_decisions: ["OD-51"]
+  - id: "SC-03"
+    kind: "SC"
+    title: "execute-time 與 file.* 的 AUTOBOOT_QUIET 附 retry_after_s"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.3"]
+    reconciliation_refs: ["ERR-7.3-8", "SES-16.4-09"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc03-quiet-retry-after-execute-file"]
+    compatibility_impact: "經 manager gate 回 AUTOBOOT_QUIET 時新增 retry_after_s 欄位；既有不讀此欄的 agent 不受影響。"
+    approval_conditions: "只補 `retry_after_s`；`selector` 與 `session` 的差異保留；規格明文"
+    related_decisions: []
+  - id: "SC-04"
+    kind: "SC"
+    title: "drain 可觀測面與 release 回條（drain_stalled）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.2、§5.3、§9.4"
+      basis: "spec_final"
+    owner_confirmation: "confirmed"
+    owner_item: 4
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.2", "§5.3", "§9.4"]
+    reconciliation_refs: ["SES-16.3a", "SES-16.4-04", "SES-16.4-14", "UIO-12.2-a", "UIO-12.2-b", "UIO-12.2-c"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc04-drain-recovering-release-timeout"]
+    compatibility_impact: "斷線、I/O error、release、clear、bind 的 detach 期間可觀測為 RECOVERING；release 在 handle 關閉回條後才回成功；超過 3000 ms 的 release drain 逾時回 DRAIN_STALLED，並附 drain_stalled:true 與 drain_timeout_epoch；SessionPublic 新增 drain_stalled、drain_timeout_epoch 兩欄（位於 capture 之後）。file.push／file.pull（OD-62）：傳輸中遇 drain、世代過期或取消且尚未寫出任何 byte 時，同步回應改為 FLUSHED_BY_RECOVERY（可在 READY 後重送）；0.3.2 的 file.* 用戶端在此情境原本收到 TRANSFER_TIMEOUT（或例外），需新增此碼處理；已寫出者見 BC-03。"
+    approval_conditions: "ADR-06 安全骨架；OD-14 #4 裁決 release drain 逾時回 DRAIN_STALLED；規格明文；改為可喚醒、可取消；fence：授權重驗與 OS 實際提交在同一臨界區（Rust `FenceSubmitGate`、Python `_tx_fence_lock` 臨界區內單次非阻塞 `os.write`，`_state_lock` 只做 pre-check），鎖只跨非阻塞提交、不跨完成等待；禁止「驗證→放鎖→write」（R0-F1，arch §5.4 第 3 點；P1 T20、P5 Task 9 測試）。Python Windows `_PySerialPort` 是唯一例外：每段 ≤64 bytes 的 `serial.write` 在鎖內阻塞（上限 `write_timeout` 5 s），所以 `begin_drain` 取鎖有上限（`DRAIN_FENCE_ACQUIRE_S`），取不到時先凍結、在途段交 Phase 2 背景完成；drain 3,000 ms 期限自請求起算並涵蓋 Phase 1 等鎖（R3-F3，§5.2.5；P1 T07 `test_finish_drain_deadline_counts_from_begin`、T08 `test_release_drain_deadline_includes_lock_wait`、T20 `test_windows_guarded_write_stall_reports_drain_stalled_on_time`）。範圍含自動登入、密碼與 ready／reconfirm probe：Python 不得以 `permit=None`（只查 drain／flash）送出，改帶 `system_probe` permit＋`login_gen`，每次提交重驗 Quiet、世代與 Drain；`_boot_quiet_blocks_probe` 只是 pre-check（R2-F1，§5.2.1；P1 T20 `test_login_probe_quiet_armed_after_precheck_before_submit_zero_tx`、P7 Task 7 `login_probe_authorized_then_quiet_arm_before_os_submit_zero_tx`）"
+    related_decisions: ["OD-14", "OD-62"]
+  - id: "SC-05"
+    kind: "SC"
+    title: "device.attach 同步重新取得獨占"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3、§6.2 交接、§6.2 POSIX「拒絕已識別的外部衝突」"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.3", "§6.2 交接", "§6.2 POSIX「拒絕已識別的外部衝突」"]
+    reconciliation_refs: ["SES-16.4-13"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc05-device-attach-sync-exclusive"]
+    compatibility_impact: "device.attach 失敗改回 DEVICE_STILL_HELD{pids,holder_unknown} 或 DEVICE_NOT_PRESENT，成功才回 ATTACHING；外部 holder 存在時不再宣稱已收回裝置。force 只略過開檔前預檢，不得略過已識別的外部 holder（POSIX 於 TIOCEXCL 後、任何 I/O 前鎖後 holder 重掃，pids 非空即 DEVICE_STILL_HELD、零 TX）；初次／熱插自動 attach 同樣適用（ATTACH_FAILED:DeviceHeldError）。"
+    approval_conditions: "失敗不得宣稱已收回"
+    related_decisions: []
+  - id: "SC-06"
+    kind: "SC"
+    title: "CMD_PENDING_MAX 計入已 cancel 仍執行的命令"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.4"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.4"]
+    reconciliation_refs: ["RPC-D-11"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc06-pending-counts-canceled-running"]
+    compatibility_impact: "CMD_PENDING_MAX 的計數納入已 cancel 但 worker 仍執行的命令；cancel 後立即重送的 agent 可能較早遇到 SESSION_QUEUE_FULL。"
+    approval_conditions: "規格明文"
+    related_decisions: []
+  - id: "SC-07"
+    kind: "SC"
+    title: "TX WAL 只記錄 OS 已確認寫出的 bytes"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §8.1 TX、ADR-05"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§8.1 TX", "ADR-05"]
+    reconciliation_refs: ["SES-16.2", "UIO-12.3-a", "UIO-12.3-b"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc07-tx-wal-os-confirmed-bytes"]
+    compatibility_impact: "TX WAL 只記錄 OS 已確認寫出的 bytes，順序等於實際寫入順序；TX WAL 內容可能短於送出的 payload。"
+    approval_conditions: "TX WAL 只記錄 OS 已確認寫出的 bytes，順序等於實際寫入順序"
+    related_decisions: []
+  - id: "SC-09"
+    kind: "SC"
+    title: "設定探索順序（SERIALWRAP_CONFIG 與系統目錄）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.1"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1a"
+    approved_at_revision: 1
+    spec_refs: ["§6.1"]
+    reconciliation_refs: ["WAL-D11", "PLT-D-01"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P3"]
+    case_ids: ["sc09-config-discovery-order"]
+    compatibility_impact: "設定探索順序為 SERIALWRAP_CONFIG → CONFIG_DIR/config.yaml → 系統目錄唯讀 fallback（/etc/serialwrap/config.yaml 或 %ProgramData%\\serialwrap\\config.yaml）；既有 CONFIG_DIR 行為不變。"
+    approval_conditions: "規格明文"
+    related_decisions: []
+  - id: "SC-10"
+    kind: "SC"
+    title: "lock 與 socket 路徑正規化；Windows 改用 LockFileEx"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.2"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§6.2"]
+    reconciliation_refs: ["RPC-D-06", "RPC-D-07", "PLT-D-10", "PLT-O-05"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4", "P5"]
+    case_ids: ["sc10-lock-path-normalize-lockfileex"]
+    compatibility_impact: "lock 與 socket 路徑比較前先正規化（abspath、normpath、去除 unix:// 前綴）；config.yaml 仍寫入原字串；Windows Tier 1 改用 LockFileEx（與 msvcrt.locking 互斥相容）。"
+    approval_conditions: "改用 LockFileEx（與原鎖互斥相容）；兩平台各自的順序保留；只在比較時正規化；`config.yaml` 仍寫入原字串"
+    related_decisions: []
+  - id: "SC-11"
+    kind: "SC"
+    title: "有序關機與 daemon.handoff_stop 交接停止"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.1 更新流程、§8.1、§12.1 步驟 2～3、BC-01"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§6.1 更新流程", "§8.1", "§12.1 步驟 2～3", "BC-01", "OD-16 (3)"]
+    reconciliation_refs: ["RPC-H-16"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["sc11-ordered-shutdown"]
+    compatibility_impact: "有序關機：drain 所有 worker、關閉 handle、WAL sync 後才 exit；任一步驟收斂失敗時以 serialwrapd: shutdown incomplete 診斷與 exit 1 結束。新增 RPC daemon.handoff_stop（x-methods 54→55）；忙碌回 FLASHING_BUSY 或 SESSION_BUSY。Python 基線此情境 exit code 不改，以 log 與 shutdown_drain().graceful 揭露。交接停止：busy 判定與凍結在同一 AdmissionGate 臨界區內完成；閒置時凍結所有新的有副作用操作，之後的呼叫回 FLUSHED_BY_SHUTDOWN 且 reason:\"handoff_frozen\"、零 TX，ttyMCU 端點保持沉默；回應為 {\"ok\":true,\"stopping\":true,\"handoff_token\"}。忙碌時回 FLASHING_BUSY 或 SESSION_BUSY 並附 busy，不凍結、不停止；若交接凍結後 TX fence 未於期限內收斂，回 SESSION_BUSY，對應 busy[].ops 含 tx.in_flight，不回成功，且只撤銷本次新建的 AdmissionGate／背景凍結，與 daemon stop 並行建立的凍結保留。handoff_stop 在 SessionManager lock 內重查 session 與 bridge，freeze_for_handoff 亦在同一把 lock 內重查並於 TX fence 逾時撤銷本次背景凍結。交接排空窗口（OD-16 (3)，2026-10-22 擁有者接受）：回覆寫出後 RPC 監聽保留 HANDOFF_DRAIN_GRACE_S＝3 秒（sw_core/daemon.py），窗口內有副作用請求回 FLUSHED_BY_SHUTDOWN＋reason:\"handoff_frozen\"（零 TX），health.ping 仍可回應，窗口結束才停止；窗口內 DeviceWatcher 重探、在途 probe 與 console 行零 TX，session 狀態與 state.json 不改寫（SessionManager.freeze_for_handoff）。此為對「回覆後立即停止」字面的已裁決偏離；Rust daemon 於 P8 Task 14 承接相同語意。停止起點依序為 manager stopping gate、停 watcher、關閉事件派工 intake。FLUSHED_BY_SHUTDOWN 介面加 rpc，不新增碼。「shutdown incomplete」exit 1 為 Rust-only、不屬 A/B 比較範圍；ab_participation: diff 不涵蓋此項。"
+    approval_conditions: "規格要求確認 handle 已釋放；OD-16 (3) 接受 Python 基線交接排空窗口（3 秒，窗口零 TX 凍結），Rust 於 P8 Task 14 承接相同語意；真實 daemon＋PTY 背景觸發的 L1.5 證據待補（PENDING-EVID-S1X-HANDOFF-WINDOW-L15）"
+    related_decisions: ["OD-16"]
+  - id: "SC-12"
+    kind: "SC"
+    title: "監管 reconcile 等待舊 daemon 結束"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.1"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§6.1"]
+    reconciliation_refs: ["PLT-O-09"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["sc12-reconcile-wait-old-daemon"]
+    compatibility_impact: "監管 reconcile 必須確認舊 daemon 已結束（ping 不通且行程消失，上限 10 s）才啟動新 daemon；reconcile 時間可能延長至 10 s。"
+    approval_conditions: "監管 reconcile 必須確認舊 daemon 已結束（ping 不通且行程消失，上限 10 s）才啟動新 daemon"
+    related_decisions: []
+  - id: "SC-13"
+    kind: "SC"
+    title: "lease 到期由 1 s tick 主動處理"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.1.3、§5.3"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 1
+    spec_refs: ["§5.1.3", "§5.3"]
+    reconciliation_refs: ["SES-16.4-07"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P6"]
+    case_ids: ["sc13-lease-expiry-tick"]
+    compatibility_impact: "interactive lease 到期除存取時判定外，由 1 s tick 主動處理（還原 human、回放）並保留 tombstone；到期後不再因無人存取而延後還原。"
+    approval_conditions: "到期事件；touch 語意保留"
+    related_decisions: []
+  - id: "SC-14"
+    kind: "SC"
+    title: "flash probe 資格加註 RELEASED／RECOVERING／drain／前景操作"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.4"
+    approved_at_revision: 1
+    spec_refs: ["§5.3"]
+    reconciliation_refs: ["SES-16.4-06", "UIO-12.9-b"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P8"]
+    case_ids: ["sc14-flash-probe-eligibility"]
+    compatibility_impact: "flash probe 的資格新增：不在 RELEASED、RECOVERING 或 drain 中，且無前景操作；不符合時拒絕啟動 probe。"
+    approval_conditions: "規格明文"
+    related_decisions: []
+  - id: "SC-15"
+    kind: "SC"
+    title: "console 出向 ring 1 MiB drop-oldest（Rust-only）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.4"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 1
+    spec_refs: ["§5.4"]
+    reconciliation_refs: ["UIO-12.6"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P6"]
+    case_ids: ["sc15-console-ring-drop-oldest"]
+    compatibility_impact: "每個 console 的出向 ring 為 1 MiB，滿時 drop-oldest；顯示資料可丟、不阻塞。Python 基線無此行為，僅 Rust 承接。"
+    approval_conditions: "顯示資料本就允許丟棄"
+    related_decisions: []
+  - id: "SC-16"
+    kind: "SC"
+    title: "console line buffer 上限與被拒整行 WARNING log"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.3、§5.4"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 1
+    spec_refs: ["§5.3", "§5.4"]
+    reconciliation_refs: ["GAP-G-02"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P6"]
+    case_ids: ["sc16-console-line-reject-log"]
+    compatibility_impact: "console line buffer 上限 16385 B；被拒整行（CMD_TOO_LONG、SESSION_QUEUE_FULL、SESSION_NOT_READY）寫 WARNING log 供診斷；對外錯誤碼不變。"
+    approval_conditions: "以 log 提供診斷，不改 WAL 契約"
+    related_decisions: []
+  - id: "SC-17"
+    kind: "SC"
+    title: "Windows 多開偵測以行程掃描實作（Rust-only）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.2"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§6.2"]
+    reconciliation_refs: ["GAP-G-03"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4", "P5"]
+    case_ids: ["sc17-windows-multi-open-scan"]
+    compatibility_impact: "Windows 的 daemon 多開偵測與 CLI 跨 socket 預檢改以行程掃描實作，holders 一律回 unknown；holder_unknown 為診斷限制而非獨占失敗。Windows 長跑驗收改以原生 COM 獨占開啟證據判定。缺少原生 COM 獨占證據（daemon 持有期間第二次 CreateFileW 被 ERROR_ACCESS_DENIED 拒絕、release 後外部可取得、外部持有時 attach 回 DEVICE_STILL_HELD、關閉後重新取得，並綁定 attached_real_path／bridge_generation 與 daemon pid＋建立時間）仍為 INSUFFICIENT_EVIDENCE，不得 PASS。"
+    approval_conditions: "Python 與 Rust 的 Windows 長跑雙重持有判定改用 P2 Task 15 `winexcl` 獨占開啟證據（不依賴 holder 偵測）"
+    related_decisions: []
+  - id: "SC-18"
+    kind: "SC"
+    title: "Windows on-demand 首次需求啟動（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.1、§12.1"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§6.1", "§12.1"]
+    reconciliation_refs: ["GAP-G-06"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["sc18-windows-ondemand-autostart"]
+    compatibility_impact: "Windows on-demand 本機預設 endpoint 連不上（僅 connect 階段被拒、請求尚未送出，且方法非 health.ping／health.status／daemon.stop）時自動 daemon start 並重送一次；send／recv 階段失敗、TIMEOUT、EMPTY_RESPONSE、PermissionDenied 一律不重送；明確指定 endpoint、bench 或 remote 時不觸發。install-journal.json 存在時（update／rollback 進行中，含中斷未復原）不自動啟動也不重送，stderr 印「serialwrap: on-demand 自動啟動暫停：更新／回滾進行中（install-journal.json 存在），請待 serialwrap setup 完成」，並與交接停止共用 <RUN_DIR>/autostart.lock。Linux 維持現況。"
+    approval_conditions: "Linux 維持現況；update／rollback 進行中不自動啟動也不重送（SC-23 第 3 步的拉起抑制），與交接停止共用 autostart.lock（R5-F1）"
+    related_decisions: []
+  - id: "SC-19"
+    kind: "SC"
+    title: "OD-11 測試裝置 allowlist"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-15"
+      decision_ref: "OD-11"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1a"
+    approved_at_revision: 1
+    spec_refs: ["OD-11", "§9.4"]
+    reconciliation_refs: ["GAP-G-07"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1"]
+    case_ids: ["sc19-test-device-allowlist"]
+    compatibility_impact: "啟用時 health.status 多出 test_device_allowlist:{enabled:true,coms:[...],source:env 或 config}；非隔離實例設定 allowlist 時 daemon 拒絕啟動（TEST_DEVICE_ALLOWLIST_REJECTED，exit 2）；隔離實例下 config.yaml 存在但無法讀取或解析且 env 未提供 allowlist 時同樣拒絕（reason 為 invalid config.yaml: <例外類別名>），非隔離實例維持未設定、啟動行為不變。allowlist 只影響裝置發現與選取，不改變獨占鎖或 backend。"
+    approval_conditions: "OD-11 核准限制：僅對隔離實例生效（SERIALWRAP_STATE_DIR、SERIALWRAP_RUN_DIR、SERIALWRAP_CONFIG_DIR 三者都明確設定且不等於預設路徑）；正式 daemon 設定遇到即拒絕（exit 2）；只接受明確列出的 COM 名稱，不得全域放行；不關閉獨占鎖、不更換 serial backend；啟用時 health.status 必須顯示。定案細節依調和表 GAP-G-07。"
+    related_decisions: ["OD-11"]
+  - id: "SC-20"
+    kind: "SC"
+    title: "新增 daemon restart"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §4.2 #14"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§4.2 #14"]
+    reconciliation_refs: ["CLI-11.04", "PLT-D-03"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["sc20-daemon-restart"]
+    compatibility_impact: "新增子命令 daemon restart：systemd 與 windows 模式轉為 service restart；on-demand 模式執行 stop、等待結束、再 start（同一 endpoint）。既有 daemon 子命令不變。"
+    approval_conditions: "依 §4.2；Python 也加，讓 1A 委派一致並可做 A/B"
+    related_decisions: []
+  - id: "SC-21"
+    kind: "SC"
+    title: "remote stop 作為 remote close 的別名"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §4.2 #17"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§4.2 #17"]
+    reconciliation_refs: ["CLI-11.05", "PLT-D-05"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["sc21-remote-stop-alias"]
+    compatibility_impact: "新增 remote stop <port|all>，為 remote close 的別名；原 remote close 照常可用。"
+    approval_conditions: "名稱不同時做別名，Python 原名保留"
+    related_decisions: []
+  - id: "SC-22"
+    kind: "SC"
+    title: "supervision-mode set（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §4.2 #16、§6.1、§12.1 步驟 2～3（交接條件比照）"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§4.2 #16", "§6.1", "§12.1"]
+    reconciliation_refs: ["CLI-11.07", "PLT-D-04"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["sc22-supervision-mode-set"]
+    compatibility_impact: "新增 supervision-mode set <mode> [--force] [--with-sudo]，輸出 JSON；不帶參數時維持純文字。切換前執行 fail-closed 安全檢查，拒絕時 phase:supervision_set_safety_check；--force 不覆寫，只回 force_ignored:true。停止舊 daemon 只經 daemon.handoff_stop，不支援交接的舊 daemon 無法被切換。"
+    approval_conditions: "依調和表 SC-22 列的交接護欄（R1-F3）：本命令為 Python 沒有的新命令，Python setup 的「探測例外視為 false」「--force 覆寫 flashing」「reconcile 送一般 daemon.stop」不構成豁免；切換前執行與 update 相同的 fail-closed 安全檢查，Flash、FileTransfer、命令、lease、recovering、身分不明或探測失敗／逾時／格式異常一律拒絕（phase:\"supervision_set_safety_check\"，既有碼）；停止舊 daemon 只經 SC-11 daemon.handoff_stop{reason:\"supervision_set\"}，忙碌、不支援或結果不明時還原監管 enabled、不硬停、不寫 config；--force 不覆寫上述任何判定，只在輸出記 force_ignored:true；同模式刷新或只產生 pending_sudo 的路徑不交接。"
+    related_decisions: []
+  - id: "SC-23"
+    kind: "SC"
+    title: "setup --rollback 與 §12.1 七步更新流程（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §4.2 #19、§6.1、§12.1"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§4.2 #19", "§6.1", "§12.1"]
+    reconciliation_refs: ["CLI-11.06", "PLT-D-06", "GAP-G-05b"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["sc23-setup-rollback"]
+    compatibility_impact: "新增 setup --rollback、版本目錄（Current／Previous）與 §12.1 七步更新流程。update／rollback／回退／中斷復原（與 SC-22 supervision-mode set）送 daemon.handoff_stop 前先抑制監管拉起：systemd 模式寫入持久 drop-in serialwrap.service.d/90-serialwrap-update-hold.conf（Restart=no、RefuseManualStart=yes）並 disable，期間外部 systemctl start serialwrap、serialwrap service start、systemd 路由的 daemon start 與 serialwrap-minicom 的 AUTO_START_DAEMON 會被拒絕；完成、拒絕還原或 setup 復原後才撤銷並依原值 enable；updater 中斷時 hold 保留到下一次 serialwrap setup。windows-task 在更新期間維持 disabled（重新註冊的 XML Enabled=false）。偵測到交接後被拉起或手動啟動的實例會對它重新交接，忙碌時拒絕更新且不中止其操作。新增 phase update_autostart_hold、update_autostart_release（不新增碼）。"
+    approval_conditions: "§12.1 必要功能；依賴版本目錄，只有 Rust bundle 有；§6.1 不得讓新舊監管項同時拉起、§12.1 步驟 3 先停止該實例的監管拉起能力；第 2 步交接安全檢查不受 --force 影響；交接 token 只授權發出它的實例（R5-F1）。"
+    related_decisions: []
+  - id: "SC-24"
+    kind: "SC"
+    title: "監管模式 windows-task 與 windows-service（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §6.1、OD-03、OD-12"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["§6.1", "OD-03", "OD-12"]
+    reconciliation_refs: ["WAL-D12", "PLT-D-09", "GAP-G-05b"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["sc24-windows-task-service"]
+    compatibility_impact: "新增 Windows 監管模式 windows-task（ExecutionTimeLimit=PT0S）與 windows-service；Windows 上 supervision-mode 可選用此二者。"
+    approval_conditions: "規格要求；Rust setup 會物化"
+    related_decisions: ["OD-03", "OD-12"]
+  - id: "SC-25"
+    kind: "SC"
+    title: "release manifest 與 doctor version_pairing（Python 僅在 bundle 內偵測到 manifest 時）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §9.5、OD-13"
+      basis: "spec_final"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1a"
+    approved_at_revision: 1
+    spec_refs: ["§9.5", "OD-13"]
+    reconciliation_refs: ["PLT-D-12", "GAP-G-04"]
+    scope: "python_when_manifest_present"
+    ab_participation: "absolute_only"
+    phases: ["P1", "P2", "P3", "P4"]
+    case_ids: ["sc25-release-manifest-version-pairing"]
+    compatibility_impact: "新增 release manifest（artifact 身分與版本配對）與 doctor 的 version_pairing 檢查；CLI 既有版本警告保留。Python 側僅在 bundle 內偵測到 release manifest 時附加 version_pairing（非 advisory）；純 Python 安裝的 doctor 輸出不變。"
+    approval_conditions: "警告保留；新增 manifest 與 doctor 配對檢查"
+    related_decisions: ["OD-13"]
+  - id: "SC-26"
+    kind: "SC"
+    title: "Windows event handler（Rust-only）"
+    status: "APPROVED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md §5.5"
+      basis: "spec_final"
+    owner_confirmation: "confirmed"
+    owner_item: 6
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 1
+    spec_refs: ["§5.5"]
+    reconciliation_refs: ["EVT-D-S6"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P7"]
+    case_ids: ["sc26-windows-event-handler"]
+    compatibility_impact: "Windows event handler：exec 走 CreateProcess 加 Job Object；shell 走 cmd.exe /d /s /c；timeout 以 TerminateJobObject 終止；env 白名單新增 SYSTEMROOT、COMSPEC、PATHEXT、TEMP、TMP、USERPROFILE。POSIX 行為不變。"
+    approval_conditions: "Windows 語意必須定義"
+    related_decisions: ["OD-14"]
+  - id: "SC-27"
+    kind: "SC"
+    title: "BC-05 Windows remote 延伸 connect 與 benches"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-final"
+      date: "2026-10-15"
+      decision_ref: "serialwrap-rust-spec-final.md BC-05"
+      basis: "spec_final"
+    owner_confirmation: "confirmed"
+    owner_item: 7
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["BC-05"]
+    reconciliation_refs: ["PLT-D-08"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["sc27-windows-connect-benches"]
+    compatibility_impact: "BC-05 的 Windows remote 範圍延伸到 connect 與 benches；兩者在 Windows 上移除 REMOTE_NOT_SUPPORTED。"
+    approval_conditions: "依調和表 PLT-D-08（BC-05 範圍）：延伸到 connect 與 benches，移除兩者在 Windows 上的 REMOTE_NOT_SUPPORTED（擁有者確認 #7，預設涵蓋）。"
+    related_decisions: ["OD-14"]
+  - id: "SC-34"
+    kind: "SC"
+    title: "session.attach／recover 的 error_code 與 last_error 分離"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-14"
+      basis: "owner_decision"
+    owner_confirmation: "confirmed"
+    owner_item: 1
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 3
+    spec_refs: ["§9.3", "ADR-07", "OD-14"]
+    reconciliation_refs: ["RPC-D-02", "ERR-7.2-b", "ERR-7.3-1", "SES-16.5-02"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5", "P7"]
+    case_ids: ["sc34-attach-recover-last-error-field"]
+    compatibility_impact: "session.attach 失敗時 error_code 固定為 SESSION_NOT_READY（不再是 last_error 值或 NOT_READY），另以 last_error、last_error_detail 欄位回報；session.recover REPROBE 未恢復時 error_code 固定為 SESSION_NOT_READY 並附同兩欄。依 error_code 比對 last_error 值的 agent 須改讀 last_error 欄位。"
+    approval_conditions: "OD-14 #1：分離；CLI／RPC method 與參數不變"
+    related_decisions: ["OD-14"]
+  - id: "SC-35"
+    kind: "SC"
+    title: "platform=passthrough 30 秒安靜自動 READY 並可送命令"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-14"
+      basis: "owner_decision"
+    owner_confirmation: "confirmed"
+    owner_item: 2
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 3
+    spec_refs: ["§5.3", "§5.2.1", "OD-14"]
+    reconciliation_refs: ["SES-16.4-03", "SES-16.6-01"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5", "P7", "P8"]
+    case_ids: ["sc35-passthrough-quiet-ready", "sc35-passthrough-command-completion"]
+    compatibility_impact: "passthrough session 不再登入或送 ready_probe（含 uboot-template）；ATTACHED 連續 30 秒無 RX 自動轉 READY 並接受 command.submit；ATTACHED 時 submit 由 PROFILE_NOT_COMMAND_CAPABLE 改為 SESSION_NOT_READY＋passthrough_ready_in_s；file.push／file.pull 對 passthrough 回 PROFILE_NOT_COMMAND_CAPABLE；命令未命中完成條件時不送 CTRL_C／CTRL_D、session 維持 READY。"
+    approval_conditions: "OD-14 #2：serialwrap 不介入 passthrough UART；完成條件只用既有機制"
+    related_decisions: ["OD-14"]
+  - id: "SC-36"
+    kind: "SC"
+    title: "Windows 安裝的 com0com 選用元件"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-16"
+      decision_ref: "OD-15"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["OD-15", "§9.5"]
+    reconciliation_refs: ["SC-36"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4", "P8"]
+    case_ids: ["sc36-win-installer-com0com-optional"]
+    compatibility_impact: "Windows bundle 可選附 com0com 3.0.0.0；預設不安裝。基本安裝不需管理員，只有明確安裝或移除此元件時才以 UAC 啟動 bundle helper。UAC 拒絕或 helper 失敗不影響基本安裝；本體 rollback 不移除 driver。元件附 GPLv2 授權與原始碼提供資訊，Spike 1 剩餘項目通過前維持 experimental。"
+    approval_conditions: "依 OD-15：元件為預設不選取的 Windows 選項，helper 單獨提權；基本安裝與更新不提權，rollback 不操作 driver。Spike 1 剩餘項目需於 HVCI 開啟機台全數通過前維持 experimental:true。"
+    related_decisions: ["OD-15", "OD-01", "OD-08"]
+  - id: "SC-39"
+    kind: "SC"
+    title: "0.4.0 setup 遇到 0.3.x 舊 daemon 時改走舊版停止路徑（Rust-only）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "hamanpaul"
+      date: "2026-10-29"
+      decision_ref: "OD-48"
+      basis: "owner_decision"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 7
+    spec_refs: ["§12.1", "OD-48"]
+    reconciliation_refs: ["SC-23"]
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P4"]
+    case_ids: ["sc39-legacy-daemon-handoff"]
+    compatibility_impact: "setup（install／update）對 daemon.handoff_stop 回 METHOD_NOT_FOUND 的 daemon 不再一律 fail-closed：D1 判定全部成立（版本 < 0.4.0，取自拒絕回應、缺漏時 health.status；行程正向辨識為 Python 0.3.x daemon；執行檔、argv[0] 與 script 不在 <install_root>/versions/ 底下）才改走舊版停止路徑，否則維持現行拒絕。停止前檢查其他同 uid daemon、mcu.status flash 與 session.list 忙碌、外部監管者（Linux 以 /proc/<pid>/cgroup 判定：daemon 位於 serialwrap 以外的 systemd service unit 即拒絕；`*.scope` 結尾一律視為一般 session，不因位於 `system.slice` 或 `user.slice` 而判為外部監管者，父行程清單為輔助；Windows 以父行程判定），並先寫 install-journal.legacy.json（不含 env）；0.3.2 沒有 admission freeze，檢查與送出 stop 之間的 TOCTOU 為已接受偏離。停止手段：pid 為 systemd unit 的 MainPID 時在 autostart hold 之下 systemctl stop，否則 RPC daemon.stop；不送 SIGKILL／TerminateProcess。已停判準：行程樹結束、無同 uid 行程持有該 session 的 UART（Windows 以行程樹結束推定並標註 holders_status unsupported）、與基準相比沒有新的 serialwrapd，連續維持 5 s；上限 330 s，逾時回 TIMEOUT／legacy_stop_pending 並保留 hold 與 journal；被重拉時重做判定後再停，總共最多 3 次，超過回 relaunch_loop。舊 daemon 停止後任一步失敗：還原入口、config、unit 註冊、enabled 狀態與 current，不自動重啟任何 daemon，報告附 legacy_daemon_stopped、restored 與啟動指令（OD-48 修訂）。成功報告新增 legacy_stop。還原本身失敗時 revert_pending、保留 journal，並以 unrestored 逐項列出未還原項（entries／config／unit／enabled／current）。範圍：「監管顯示 running 卻無可 RPC daemon → DEVICE_STILL_HELD」只套 systemd-user／systemd-system（0.3.2 沒有 windows-task 模式，windows-task 期望不變）；MainPID 相符的 unit 模式與 config 舊模式不一致時停止前 DEVICE_STILL_HELD（reason supervisor_mode_mismatch），hint 要求以 --user／--system 指定實際模式，不另取第二個模式的 hold。supervision-mode set 維持拒絕。不新增錯誤碼與 phase。"
+    approval_conditions: "依 OD-48（含 2026-10-29 修訂：失敗不自動重啟舊 daemon）與設計 v2 D1～D10；S1X-c-1（依舊／新模式解析 instance endpoint、safety_check 掃到 socket 不符的同 uid serialwrapd fail-closed）一併實作；legacy 專用中斷注入點另立清單，不加進凍結的 CRASH_POINTS 迴圈。"
+    related_decisions: ["OD-48", "OD-49", "OD-51"]
+  - id: "DF-01"
+    kind: "DF"
+    title: "event rule_id 路徑穿越防護"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["RPC-H-01", "EVT-D-E9"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P7"]
+    case_ids: ["df01-rule-id-path-traversal"]
+    compatibility_impact: "event.rule_delete 與 event.reset 的 rule_id 不合規則（^[a-z0-9][a-z0-9-]{0,63}\\.[a-z0-9][a-z0-9-]{0,63}\\Z）時不碰檔案：rule_delete 回 {ok:true,deleted:false}，reset 不計數。"
+    approval_conditions: "安全缺陷；安全"
+    related_decisions: []
+  - id: "DF-02"
+    kind: "DF"
+    title: "RPC 明寫 human: source 以 agent 對待"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-11-03"
+      decision_ref: "OD-74"
+      basis: "reconciliation"
+    owner_confirmation: "confirmed"
+    owner_item: 5
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 8
+    spec_refs: ["§5.2.1"]
+    reconciliation_refs: ["RPC-H-05", "SES-16.6-03"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df02-human-source-spoof"]
+    compatibility_impact: "依 RPC 原始 source 判定：明寫 human:<x>（含 human:cli）於 gate 與逾時升格皆比照 agent；bare human 依 OD-74 正規化為 human:cli，於 gate 與逾時升格皆視為 human。不得由正規化後字串或 source_class 推定權限；daemon 內部 human console 的 trusted_human 路徑不變。"
+    approval_conditions: "依原始 RPC source 分辨 bare human 與明寫 human:<x>；保留 DF-02 防止明寫前綴繞過 gate 與逾時升格的條件"
+    related_decisions: ["OD-14", "OD-74"]
+  - id: "DF-03"
+    kind: "DF"
+    title: "WAL／mirror 歸檔同名不覆蓋"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§8.2"]
+    reconciliation_refs: ["RPC-H-19", "WAL-D8"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df03-archive-name-collision"]
+    compatibility_impact: "WAL 或 mirror 歸檔同名時加 .1、.2… 後綴，不覆蓋既有歸檔（rotate 與 reset 皆適用）。"
+    approval_conditions: "資料遺失；覆蓋屬資料遺失需修；seq 語意以基線凍結"
+    related_decisions: []
+  - id: "DF-04"
+    kind: "DF"
+    title: "動態 session RELEASED 跨重啟保留"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§6.2"]
+    reconciliation_refs: ["WAL-D9", "SES-16.6-06"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df04-released-persist-restarts"]
+    compatibility_impact: "動態 session 的 RELEASED 可跨任意次數重啟保留；裝置離線的 tick 不再把 RELEASED 降為 DETACHED。所屬 template 已不存在的 RELEASED 紀錄（OD-63）實體化為 RELEASED 佔位 session（passthrough、command_capable:false），by_id 維持阻擋；`device attach COMx` 時佔位移除自身並解除 by_id，再交 template 偵測建立正式 session（保留原 COM，不降級 profile；無 template 可匹配時依現行 dynamic 偵測）。`device attach` 開埠遇一般 OSError（如權限不足）時佔位同樣移除自身並交 dynamic 偵測（保留原 COM）；仍開不了埠時依現行 dynamic 開埠失敗語意：有 passthrough fallback template 即在原 COM 留下 `DETACHED`（`last_error=ATTACH_FAILED:<例外名>`）列，無 passthrough fallback template 時不留列（`device attach COMx` 回 `SESSION_NOT_FOUND`）、以 `_pending_com` 保留原 COM 至裝置拔除或 daemon 重啟為止（期間不分配給其他裝置），之後由熱插或重啟重新偵測建立 session，COM 依 dynamic 指派規則重新分配、不保證沿用原 COM（與 dynamic 對新裝置開埠失敗相同，不新增錯誤碼或回應形狀）。對佔位 `session.bind` 比照 `session.attach` 的 RELEASED 早退，回 `ok:true`、`released:true`、`recommended_action:device_attach`，佔位不離開 RELEASED（不解除阻擋、不寫 binding override、不取消在途 attach、不開埠）。0.3.2 只阻擋一輪即丟棄此類紀錄。"
+    approval_conditions: "安全交接缺陷；交接安全；「缺 template 不得實體化」僅於 OD-63 佔位用途放寬，佔位不可下命令、不以佔位 profile attach，不新增 RPC／CLI 表面"
+    related_decisions: ["OD-63"]
+  - id: "DF-05"
+    kind: "DF"
+    title: "daemon start 的 daemon 定位順序"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["CLI-7.4", "PLT-O-02"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df05-daemon-locate-order"]
+    compatibility_impact: "daemon start 的定位順序為 manifest launcher → 與 CLI 同目錄的 serialwrapd → Python -m sw_core.daemon fallback（POSIX 亦然）；不再 spawn 不存在的 serialwrapd.py。"
+    approval_conditions: "確認是缺陷（推論可重現 `DAEMON_EXITED`）。01 §12「POSIX 無 `-m` fallback」併入此列"
+    related_decisions: []
+  - id: "DF-06"
+    kind: "DF"
+    title: "client 非 JSON 回應改回 INVALID_RESPONSE"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1a"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["CLI-12.01"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P3"]
+    case_ids: ["df06-client-non-json-response"]
+    compatibility_impact: "client 收到非 JSON 回應時回 INVALID_RESPONSE，exit 2（原為 traceback）。"
+    approval_conditions: "崩潰改成既有碼"
+    related_decisions: []
+  - id: "DF-07"
+    kind: "DF"
+    title: "config.yaml 壞 YAML 的明確錯誤"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["CLI-12.02", "CLI-12.03", "PLT-O-13"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df07-bad-config-yaml"]
+    compatibility_impact: "config.yaml 壞 YAML：supervision-mode 於 stderr 印一行並 exit 1；service、setup、daemon 印 {error_code:INTERNAL_ERROR,…} 並 exit 1；setup 其餘未預期例外比照辦理。"
+    approval_conditions: "保留 exit 1，改為明確錯誤；同上"
+    related_decisions: []
+  - id: "DF-08"
+    kind: "DF"
+    title: "contains 規則 flags 驗證"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["EVT-D-E5"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P7"]
+    case_ids: ["df08-contains-flags-validate"]
+    compatibility_impact: "contains 規則的 flags 也做驗證（unsupported regex flag: X）；已落盤的非法規則不再使下次 daemon 啟動失敗。"
+    approval_conditions: "可用性缺陷"
+    related_decisions: []
+  - id: "DF-09"
+    kind: "DF"
+    title: "RuleRegistry load_all 的 ValueError／TypeError"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.3"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["EVT-D-E6"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P7"]
+    case_ids: ["df09-registry-load-valueerror"]
+    compatibility_impact: "RuleRegistry.load_all 把 ValueError、TypeError 與溢位驗證錯誤視為 FailedLoad；檔案解碼失敗也列入 failed，engine.start 與 reload 不再因此崩潰。"
+    approval_conditions: "可用性缺陷"
+    related_decisions: []
+  - id: "DF-10"
+    kind: "DF"
+    title: "setup system scope 遷移目標"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["WAL-D17", "PLT-O-01"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df10-system-scope-state-path"]
+    compatibility_impact: "setup 的 system scope 遷移目標改為 daemon 實際使用的 state 路徑。"
+    approval_conditions: "遷移等同無效"
+    related_decisions: []
+  - id: "DF-11"
+    kind: "DF"
+    title: "WSL systemd sudo 閘門"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["PLT-O-06"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df11-wsl-systemd-sudo-gate"]
+    compatibility_impact: "ensure_wsl_systemd 只在目標為 systemd 模式且帶 --with-sudo 時執行 sudo；否則列入 pending_sudo，不再靜默提權。"
+    approval_conditions: "靜默提權"
+    related_decisions: []
+  - id: "DF-12"
+    kind: "DF"
+    title: "setup／reconcile ran 欄位"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["PLT-O-07"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df12-setup-ran-field"]
+    compatibility_impact: "setup 與 reconcile 的 ran 欄位填入實際執行過的命令（原恆為 []）；applied 語意不變。"
+    approval_conditions: "欄位意圖明確（FakeEffects 測試已依此斷言）；`applied` 語意不變"
+    related_decisions: []
+  - id: "DF-13"
+    kind: "DF"
+    title: "serialwrap-minicom-broker 改名引用"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["PLT-O-08"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df13-minicom-broker-rename"]
+    compatibility_impact: "serialwrap-minicom-broker 改找已改名的 serialwrap-minicom（原物化 wrapper 必定 exit 2）。"
+    approval_conditions: "資產缺陷"
+    related_decisions: []
+  - id: "DF-14"
+    kind: "DF"
+    title: "daemon 啟動順序（scan→rank→watch）"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2", "#100"]
+    reconciliation_refs: ["PLT-O-03"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df14-startup-scan-rank-watch-order"]
+    compatibility_impact: "daemon 啟動順序改為 initial scan → prepare_dynamic_rank → watcher.start，消除 #100 殘留的 race；COM 指派更穩定。"
+    approval_conditions: "daemon 啟動順序改為：initial scan → `prepare_dynamic_rank` → watcher.start，消除 #100 殘留的 race"
+    related_decisions: []
+  - id: "DF-15"
+    kind: "DF"
+    title: "RX 精確 WAL seq"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.5"]
+    reconciliation_refs: ["UIO-12.4-b", "EVT-D-S4"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5", "P7"]
+    case_ids: ["df15-rx-exact-wal-seq"]
+    compatibility_impact: "RX observer、event engine、background capture 改用該 RX chunk 的精確 WAL seq（原為全域快照）。"
+    approval_conditions: "改用精確值，且仍落在 Python 可能產生的值域內"
+    related_decisions: []
+  - id: "DF-16"
+    kind: "DF"
+    title: "Windows setup skill 複製目錄"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "stage-1b"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["GAP-G-05c"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P4"]
+    case_ids: ["df16-windows-skill-copy"]
+    compatibility_impact: "Windows setup 的 skill link 在不能建 symlink 時改為複製目錄。"
+    approval_conditions: "Windows `setup` 的 skill link 在不能建 symlink 時改為複製目錄"
+    related_decisions: []
+  - id: "DF-17"
+    kind: "DF"
+    title: "WAL／mirror 寫入失敗重試不重複 seq"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["spec-reconciliation.md §1.2"]
+    reconciliation_refs: ["WAL-1.4a"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df17-wal-mirror-retry-no-dup-seq"]
+    compatibility_impact: "WAL 與 mirror 寫入失敗時只重試失敗的那個檔，不再產生重複 seq 的 WAL 行；部分寫入後只補寫剩餘 bytes，補寫再失敗則於下一筆前以換行終結殘行。"
+    approval_conditions: "資料正確性"
+    related_decisions: []
+  - id: "DF-19"
+    kind: "DF"
+    title: "self-test nonce probe 提交點 quiet 重驗"
+    status: "IMPLEMENTED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-15"
+      decision_ref: "spec-reconciliation.md §1.2"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 1
+    spec_refs: ["§5.2.1", "§5.2.2", "§11.3"]
+    reconciliation_refs: ["SES-16.6-08"]
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5", "P7"]
+    case_ids: ["df19-self-test-probe-quiet-fence"]
+    compatibility_impact: "session.self_test 的 nonce probe 在每次 OS 提交前重驗 boot quiet 與 bridge 世代／epoch；被擋時回與 pre-check 同形的 AUTOBOOT_QUIET（零 TX），不等 nonce、不 confirm_ready。FLASHING 中仍回 TARGET_UNRESPONSIVE。"
+    approval_conditions: "self-test 是 READY_UNCONFIRMED 的建議出口，不受 ready reconfirm 擋；不與 login run 世代掛鉤；pre-check 通過後才 arm 的 quiet 使 probe 零 TX（來源 SES-16.6-08，R5-F2）。"
+    related_decisions: []
+  - id: "DF-20"
+    kind: "DF"
+    title: "失效 interactive context 不回放"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-28"
+      decision_ref: "OD-37"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.2"
+    approved_at_revision: 6
+    spec_refs: ["§11.3"]
+    reconciliation_refs: []
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P6"]
+    case_ids: ["df20-stale-interactive-id-no-replay"]
+    compatibility_impact: "release 後重新 attach，以舊 interactive_id 呼叫 interactive-send 時，Rust 回 INTERACTIVE_NOT_FOUND 且 UART TX 為零；Python 0.4.0 現行行為照送。失效上下文不得回放。"
+    approval_conditions: "涵蓋 release→重新 attach 的舊 interactive_id；拒絕回應須為 INTERACTIVE_NOT_FOUND，且健康 wire 觀測窗口內 TX 為零。"
+    related_decisions: ["OD-37"]
+  - id: "DF-21"
+    kind: "DF"
+    title: "Recovery flush 原子化"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-28"
+      decision_ref: "OD-37"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python:
+        min_version: "0.4.0"
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 6
+    spec_refs: ["§11.3"]
+    reconciliation_refs: []
+    scope: "both"
+    ab_participation: "diff"
+    phases: ["P1", "P5"]
+    case_ids: ["df21-recover-flush-atomic"]
+    compatibility_impact: "Ctrl-C recovery 後，佇列內命令全部回 FLUSHED_BY_RECOVERY 且 UART TX 為零；Rust 將 flush 與提交原子化。Python 0.4.0 現行路徑存在 q0 仍送出的競態。"
+    approval_conditions: "在 recover flush／TX 提交競態下，所有尚未提交的佇列項均為 FLUSHED_BY_RECOVERY，且 UART TX 為零；不得自動重送。"
+    related_decisions: ["OD-37"]
+  - id: "DF-22"
+    kind: "DF"
+    title: "Rust RX 速率視窗合併最舊樣本且不低估"
+    status: "APPROVED"
+    approval:
+      owner: "spec-reconciliation"
+      date: "2026-10-28"
+      decision_ref: "OD-43"
+      basis: "reconciliation"
+    owner_confirmation: "not_required"
+    owner_item: null
+    default_if_pending: null
+    applies_to:
+      python: null
+      rust:
+        stage: "slice-2.1"
+    approved_at_revision: 6
+    spec_refs: ["plans/06-slice21-daemon-core.md Task 10"]
+    reconciliation_refs: []
+    scope: "rust_only"
+    ab_participation: "absolute_only"
+    phases: ["P5"]
+    case_ids: ["df22-rx-window-merge-oldest"]
+    compatibility_impact: "RX 速率視窗達 4096 筆上限時採 merge_oldest，合併最舊兩筆並保留 bytes 總和、使用較新時間戳；高負載下不得低估 RX_FLOOD 判定。"
+    approval_conditions: "10000 個 1-byte chunk 的 capped window 長度不得超過 4096，rx_stats 的有效 bytes 不得低於未設上限時的值。"
+    related_decisions: ["OD-43"]
+pending_owner_confirmations: []
+safety_invariants:
+  - id: zero_tx_on_reject
+    title: "被拒絕且依契約應為零副作用的請求，外部 TX 必須為零"
+    spec_ref: "§11.3"
+    # 注意（待決 plan item，見 01-stage0-contracts.md T3 uart_tx 說明）：SESSION_NOT_READY 於 session.attach／session.recover 的 probe 之後回此碼時，probe 位元組可能已送出，不滿足零 TX。本清單依碼推導並保留此碼，以符合 T5 的資料推導測試；P2 zero-TX oracle 不得僅以碼推導，須以 (碼, method) 排除這兩個 method 的 SESSION_NOT_READY（機器可讀排除需 T1 schema 變更，待擁有者與 plan 決定）。
+    error_codes: ["ALIAS_NOT_FOUND", "AUTOBOOT_QUIET", "CMD_CONTAINS_NEWLINE", "CMD_NOT_CANCELABLE", "CMD_NOT_FOUND", "CMD_TOO_LONG", "CONSOLE_NOT_FOUND", "DEVICE_ALREADY_BOUND", "DEVICE_NOT_BOUND", "DEVICE_NOT_FOUND", "DEVICE_NOT_PRESENT", "DEVICE_STILL_HELD", "ECHO_ACK_UNSUPPORTED", "EXPECT_REBOOT_MODE_UNSUPPORTED", "FLASHING_BUSY", "FLASH_TARGET_IS_CONSOLE", "FLUSHED_BY_RECOVERY", "FLUSHED_BY_SHUTDOWN", "INTERACTIVE_NOT_FOUND", "INVALID_ARGS", "INVALID_COMPLETION_REGEX", "INVALID_EXPECT_REBOOT", "INVALID_RULE_SCHEMA", "LOCAL_FILE_NOT_FOUND", "LOG_OPEN_FAILED", "METHOD_NOT_FOUND", "NOT_READY", "NO_ACTIVE_CAPTURE", "PROFILE_IS_EXPLICIT", "PROFILE_NOT_COMMAND_CAPABLE", "READY_UNCONFIRMED", "RULE_NOT_FOUND", "SESSION_BUSY", "SESSION_INTERACTIVE_BUSY", "SESSION_NOT_FOUND", "SESSION_NOT_READY", "SESSION_QUEUE_FULL", "SESSION_RECOVERING", "SOURCE_RESERVED", "UNKNOWN_PROFILE", "WAL_MISSING"]
+    case_ids: ["sc01-recovering-submit-open", "sc02-flashing-submit-open", "sc03-quiet-retry-after-execute-file", "df19-self-test-probe-quiet-fence"]
+  - id: no_forbidden_interleave
+    title: "不得將不同來源的 bytes 以契約禁止的方式交錯"
+    spec_ref: "§11.3"
+    error_codes: []
+    case_ids: []
+  - id: no_stale_context_replay
+    title: "Recovery／Release／Reboot／Lease 切換不得回放失效上下文的輸入"
+    spec_ref: "§11.3"
+    error_codes: ["FLUSHED_BY_RECOVERY", "FLUSHED_BY_SHUTDOWN"]
+    case_ids: ["bc02-deferred-context-switch-clear", "bc02-mailbox-stale-input-not-replayed"]
+  - id: no_reopen_before_handoff
+    title: "舊 I/O worker 未完成交接前，不得另開同一受管端點，亦不得回覆釋放成功"
+    spec_ref: "§11.3"
+    error_codes: ["DEVICE_STILL_HELD", "DRAIN_STALLED", "SESSION_RECOVERING"]
+    case_ids: ["sc04-drain-recovering-release-timeout", "bc04-device-attach-sync-reacquire", "sc05-device-attach-sync-exclusive"]
+  - id: no_auto_resend
+    title: "已有或可能有裝置副作用的命令不得自動重送"
+    spec_ref: "§11.3"
+    error_codes: ["BASE64_DECODE_FAILED", "CHECKSUM_MISMATCH", "CHECKSUM_VERIFY_FAILED", "COMMAND_ABORTED_IN_FLIGHT", "COMMAND_FAILED", "CONSOLE_LINE_LIMIT_TOO_SMALL", "DRAIN_STALLED", "EMPTY_RESPONSE", "EXCEPTION", "FORCE_RECOVER_TIMEOUT", "INTERACTIVE_EXPIRED", "INVALID_RESPONSE", "MOVE_FAILED", "MOVE_TIMEOUT", "PROMPT_TIMEOUT", "PROMPT_TIMEOUT_FORCE_RECOVERED", "PROMPT_TIMEOUT_RECOVERED", "PULL_PARSE_FAILED", "SEND_FAILED", "SOCKET_ERROR", "STATE_CHANGED", "TARGET_DECODER_FAILED", "TARGET_DECODER_MISSING", "TARGET_ENCODER_FAILED", "TARGET_ENCODER_MISSING", "TIMEOUT", "TRANSFER_ECHO_STALL", "TRANSFER_PROBE_FAILED", "TRANSFER_TIMEOUT"]
+    case_ids: ["bc03-no-auto-resend", "bc03-unknown-outcome-send-failed"]
+  - id: insufficient_evidence_not_pass
+    title: "證據不足、擷取失敗或測試未完成不得轉為 PASS"
+    spec_ref: "§11.3"
+    error_codes: []
+    case_ids: ["bc01-f12-oracle-progress"]

@@ -32,7 +32,7 @@ def _submit_source_wait(ctx, com, cmd, source, *, cmd_timeout=12.0, retries=20):
                          "--source", source, "--cmd-timeout", str(cmd_timeout))
         cmd_id = sub.get("cmd_id")
         if not cmd_id:
-            if sub.get("error_code") in ("SESSION_QUEUE_FULL", "FOREGROUND_BUSY"):
+            if sub.get("error_code") == "SESSION_QUEUE_FULL":
                 time.sleep(0.5)
                 continue
             return {"_error": "submit 未回 cmd_id", **sub}

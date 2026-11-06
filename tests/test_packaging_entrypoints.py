@@ -1,4 +1,7 @@
 import importlib
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_daemon_main_importable_from_package():

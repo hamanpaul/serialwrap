@@ -1,0 +1,352 @@
+# P0 調和表列 → 凍結位置對照（P0-T15，由 spec-reconciliation.md 的 P0 列驅動）
+# 每列的 frozen_in 為該列行為或文件勘誤的凍結位置：
+#   <path>                      檔案（或路徑）必須存在
+#   <path>::<node>              該檔的 AST 節點必須存在（測試函式或類別）
+#   <path>#<anchor>             該檔須有含 anchor 的標題（勘誤節）
+# 列數不得以字面數字斷言；調和表新增 P0 列時 tests/test_contracts_doc_errata.py 立即 FAIL。
+schema_version: 1
+revision: 1
+rows:
+- id: CLI-11.01
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#CLI-11.01
+  - tests/test_contracts_cli_schema.py::test_global_options_match_build_parser
+- id: CLI-11.03
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#CLI-11.03
+  - tests/test_contracts_cli_schema.py::test_retry_methods_match_client
+- id: CLI-11.11
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#CLI-11.11
+  - tests/test_contracts_cli_schema.py::test_every_subcommand_options_match
+- id: CLI-11.13
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#CLI-11.13
+  - tests/test_contracts_rpc_schema.py::test_foreign_holders_includes_self_pid
+- id: CLI-11.14
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: CLI-11.15
+  frozen_in:
+  - tests/test_contracts_cli_schema.py::test_exit_codes_consistent_with_catalog
+  - contracts/cli_schema.json
+- id: CLI-11.16
+  frozen_in:
+  - CLAUDE.md
+  - contracts/cli_schema.json
+  - tests/test_contracts_doc_errata.py::test_claude_md_print_sort_keys
+- id: CLI-11.18
+  frozen_in:
+  - tests/test_contracts_cli_schema.py::test_fixed_timeouts_have_sources
+  - contracts/cli_schema.json
+- id: ERR-7.1-a
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_proc_only_codes
+- id: ERR-7.1-b
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_rec_codes
+- id: ERR-7.1-c
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_unreachable_set
+- id: ERR-7.1-d
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_unreachable_set
+- id: ERR-7.1-e
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_ok_response_codes
+- id: ERR-7.1-f
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_client_codes
+- id: ERR-7.1-g
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_frame_codes
+- id: ERR-7.2-a
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: ERR-7.2-b
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_le_real_promoted_attach_subset
+- id: ERR-7.2-c
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_proc_only_codes
+- id: ERR-7.2-d
+  frozen_in:
+  - contracts/diagnostic_aux.yaml
+  - tests/test_contracts_catalog.py::test_aux_real_warning_not_error_code
+- id: ERR-7.3-1
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_ec_credentials_unresolved_not_an_error_code
+- id: ERR-7.3-3
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#ERR-7.3-3
+  - contracts/error_codes.yaml
+- id: ERR-7.3-4
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_gap_codes.py::TestGapMemory::test_force_recover_timeout
+- id: ERR-7.3-5
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_catalog.py::test_ec_retryable_frozen_values
+- id: ERR-7.3-6
+  frozen_in:
+  - tests/test_contracts_validate.py::test_summary_counts_are_data_derived
+- id: ERR-7.3-7
+  frozen_in:
+  - tests/test_contracts_gap_codes.py::TestGapMemory::test_invalid_rule_schema_uses_error_key
+- id: ERR-7.5-a
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_le_real_user_env_missing_unreachable
+- id: ERR-7.6
+  frozen_in:
+  - sw_core/assets/skill/SKILL.md
+  - tests/test_contracts_skill_section.py::test_skill_md_blocks_in_sync
+- id: EVT-D-C1
+  frozen_in:
+  - tests/test_contracts_keep_baseline.py::test_login_regex_default_double_backslash
+- id: EVT-D-C2
+  frozen_in:
+  - tests/test_contracts_keep_baseline.py::test_templates_last_file_wins
+- id: EVT-D-C3
+  frozen_in:
+  - tests/test_contracts_keep_baseline.py::test_string_false_is_truthy
+- id: EVT-D-D1
+  frozen_in:
+  - sw_core/assets/skill/SKILL.md
+  - tests/test_contracts_doc_errata.py::test_skill_chunk_size_512
+- id: EVT-D-D10
+  frozen_in:
+  - sw_core/file_transfer.py
+  - tests/test_contracts_doc_errata.py::test_file_transfer_comment_updated
+- id: EVT-D-D2
+  frozen_in:
+  - sw_core/assets/skill/SKILL.md
+  - tests/test_contracts_doc_errata.py::test_skill_pull_writes_daemon_cwd
+- id: EVT-D-D3
+  frozen_in:
+  - README.md
+  - tests/test_contracts_doc_errata.py::test_readme_rules_json_only
+- id: EVT-D-D4
+  frozen_in:
+  - README.md
+  - tests/test_contracts_doc_errata.py::test_readme_stdin_fields
+- id: EVT-D-D5
+  frozen_in:
+  - sw_core/assets/skill/SKILL.md
+  - docs/design-event-trigger.md
+  - tests/test_contracts_doc_errata.py::test_skill_events_not_tmpfs
+- id: EVT-D-D6
+  frozen_in:
+  - docs/design-event-trigger.md
+  - tests/test_contracts_doc_errata.py::test_design_event_drop_and_counter_statements
+- id: EVT-D-D7
+  frozen_in:
+  - docs/design-event-trigger.md
+  - tests/test_contracts_doc_errata.py::test_design_event_drop_and_counter_statements
+- id: EVT-D-D8
+  frozen_in:
+  - docs/design-event-trigger.md
+  - tests/test_contracts_doc_errata.py::test_design_event_drop_and_counter_statements
+- id: EVT-D-D9
+  frozen_in:
+  - CLAUDE.md
+  - tests/test_contracts_doc_errata.py::test_claude_md_errata_statements
+- id: EVT-D-S1
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: EVT-D-S14
+  frozen_in:
+  - tests/test_contracts_keep_baseline.py::test_config_error_split
+- id: EVT-D-S2
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#EVT-D-S2
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: EVT-D-S3
+  frozen_in:
+  - sw_core/assets/skill/SKILL.md
+  - tests/test_contracts_skill_section.py::test_skill_rows_match_entry_pattern
+- id: EVT-D-S8
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#EVT-D-S8
+  - contracts/rpc_schema.json
+- id: EVT-D-S9
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#EVT-D-S9
+  - contracts/cli_schema.json
+- id: GAP-G-01
+  frozen_in:
+  - contracts/daemon_logging.yaml
+  - tests/test_contracts_keep_baseline.py::test_daemon_logging_all_calls_listed
+- id: GAP-G-09
+  frozen_in:
+  - contracts/golden/last_error/transport_stall_hint.json
+  - tests/test_contracts_keep_baseline.py::test_transport_stall_hint_golden
+- id: GAP-G-13
+  frozen_in:
+  - tests/test_contracts_rpc_schema.py::test_session_list_ready_reconfirm_not_evaluated
+- id: GAP-X1
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#GAP-X1
+  - tests/test_contracts_keep_baseline.py::test_tcp_port_empty_env_import_fails
+- id: GAP-X2
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#GAP-X2
+- id: GAP-X3
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#GAP-X3
+  - contracts/session_last_errors.yaml
+- id: GAP-X4
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#GAP-X4
+  - tests/test_contracts_rpc_schema.py::test_session_public_order_matches_runtime
+- id: PLT-D-02
+  frozen_in:
+  - CLAUDE.md
+  - tests/test_contracts_doc_errata.py::test_claude_md_errata_statements
+- id: PLT-D-11
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: PLT-O-04
+  frozen_in:
+  - tests/test_contracts_rpc_schema.py::test_foreign_holders_includes_self_pid
+- id: RPC-D-01
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: RPC-D-02
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_rpc_schema.py::test_method_errors_in_catalog
+- id: RPC-D-03
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#RPC-D-03
+  - contracts/rpc_schema.json
+- id: RPC-D-04
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#RPC-D-04
+  - tests/test_contracts_rpc_schema.py::test_methods_equal_dispatch_plus_daemon_stop
+- id: RPC-D-09
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#RPC-D-09
+  - contracts/rpc_schema.json
+- id: RPC-D-10
+  frozen_in:
+  - tests/test_contracts_rpc_schema.py::test_foreign_holders_includes_self_pid
+- id: RPC-D-12
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#RPC-D-12
+  - tests/test_contracts_rpc_schema.py::test_side_effects_declared_for_readonly_whitelist
+- id: RPC-D-14
+  frozen_in:
+  - docs/serialwrap-spec.md
+  - tests/test_contracts_doc_errata.py::test_spec_transport_windows_loopback_tcp
+- id: RPC-D-15
+  frozen_in:
+  - contracts/golden/rpc/line_limit.json
+  - tests/test_contracts_rpc_schema.py::test_line_limit_matches_golden
+- id: RPC-H-02
+  frozen_in:
+  - contracts/golden/rpc/line_limit.json
+  - tests/test_contracts_rpc_schema.py::test_line_limit_capture_reproducible
+- id: SES-16.5-01
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_le_real_not_in_error_code_namespace
+- id: SES-16.5-02
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_le_real_not_in_error_code_namespace
+- id: SES-16.5-03
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_ec_credentials_unresolved_not_an_error_code
+- id: SES-16.5-04
+  frozen_in:
+  - contracts/session_last_errors.yaml
+  - tests/test_contracts_catalog.py::test_le_real_dynamic_prefixes
+- id: SES-16.6-01
+  frozen_in:
+  - CLAUDE.md
+  - tests/test_contracts_doc_errata.py::test_claude_md_errata_statements
+- id: SES-16.6-04
+  frozen_in:
+  - tests/test_contracts_keep_baseline.py::test_login_regex_default_double_backslash
+- id: TST-D-1
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#TST-D-1
+- id: TST-D-15
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: TST-D-18
+  frozen_in:
+  - tests/conftest.py
+  - tests/test_contracts_doc_errata.py::test_conftest_docstring_13_files
+- id: TST-D-2
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#TST-D-2
+- id: TST-D-3
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#TST-D-3
+- id: TST-D-5
+  frozen_in:
+  - CLAUDE.md
+- id: UIO-12.7
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#UIO-12.7
+- id: WAL-D1
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#WAL-D1
+  - contracts/wal_record.schema.json
+  - tests/test_contracts_wal_state_schema.py::test_wal_crc32_uppercase_rejected
+- id: WAL-D10
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: WAL-D13
+  frozen_in:
+  - contracts/error_codes.yaml
+  - tests/test_contracts_validate.py::test_real_repo_contract_check_passes
+- id: WAL-D14
+  frozen_in:
+  - contracts/state_file.schema.json
+  - tests/test_contracts_wal_state_schema.py::test_state_from_manager_validates
+- id: WAL-D15
+  frozen_in:
+  - contracts/state_file.schema.json
+  - tests/test_contracts_wal_state_schema.py::test_state_inventory_example_validates
+- id: WAL-D16
+  frozen_in:
+  - CLAUDE.md
+  - tests/test_contracts_doc_errata.py::test_claude_md_errata_statements
+- id: WAL-D2
+  frozen_in:
+  - contracts/wal_record.schema.json
+  - tests/test_contracts_wal_state_schema.py::test_wal_records_from_writer_validate
+- id: WAL-D3
+  frozen_in:
+  - contracts/wal_record.schema.json
+  - tests/test_contracts_wal_state_schema.py::test_wal_records_from_writer_validate
+- id: WAL-D4
+  frozen_in:
+  - docs/rust-refactor/spec-errata.md#WAL-D4
+  - tests/test_contracts_rpc_schema.py::test_wal_range_to_seq_filters_locally
+- id: WAL-D7
+  frozen_in:
+  - tests/test_contracts_wal_state_schema.py::test_wal_rotate_threshold_matches_constant

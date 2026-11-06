@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 import pytest
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("serialwrap_architecture_review", ROOT/"tools/architecture_review.py")
 REVIEW = importlib.util.module_from_spec(SPEC)

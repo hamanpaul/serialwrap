@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "connect",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap connect [-h] [--close] code\n\n從 benches.yaml 解析 bench 代號，重用既有 remote -L spawn 路徑建立或拆除隧道。\n\npositional arguments:\n  code        benches.yaml 的 bench 代號\n\noptions:\n  -h, --help  show this help message and exit\n  --close     拆除該代號對應 local_port 的隧道，並清除 endpoint 記憶\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

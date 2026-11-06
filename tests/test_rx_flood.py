@@ -19,6 +19,9 @@ from sw_core.login_fsm import ensure_ready, probe_ready
 from sw_core.session_manager import SessionManager, SessionRuntime
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 OVER = constants.RX_FLOOD_BYTES_PER_10S  # 剛好達閾＝超閾（>=）
 UNDER = constants.RX_FLOOD_BYTES_PER_10S - 1

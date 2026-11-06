@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from sw_core.device_source import exclude_bluetooth
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_exclude_bluetooth_real_machine_case():

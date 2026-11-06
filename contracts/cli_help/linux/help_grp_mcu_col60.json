@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "mcu",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap mcu [-h] <command> ...\n\n查詢 MCU flash pattern 清單與目前 flash 端點狀態（候選 COM port 與\nis_flashing）。\n\npositional arguments:\n  <command>\n    patterns  列出所有已知 MCU 家族 flash\n              pattern（family／probe／expect／baud）\n    status    顯示 flash 端點狀態：候選 COM port 清單與目前是否 flashing\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

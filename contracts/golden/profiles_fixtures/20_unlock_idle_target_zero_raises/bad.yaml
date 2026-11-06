@@ -1,0 +1,6 @@
+profiles:
+  p:
+    platform: prpl
+    console_unlock_idle_s: 2.5
+targets:
+  - {profile: p, device_by_id: d1, console_unlock_idle_s: 0}

@@ -1,0 +1,153 @@
+---
+meta:
+  name: l15-multi-source-contention-cli
+  category: l15-scenario
+  severity: critical
+  description: "多來源 CLI 同時競爭提交，TX 輸出連續且被拒命令零 TX（§15.7.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_forbidden_interleave, zero_tx_on_reject]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: parallel
+    steps:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:1", "--cmd", "echo M_1_1"]
+        save_as: m1_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:1", "--cmd", "echo M_1_2"]
+        save_as: m1_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:2", "--cmd", "echo M_2_1"]
+        save_as: m2_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:2", "--cmd", "echo M_2_2"]
+        save_as: m2_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:3", "--cmd", "echo M_3_1"]
+        save_as: m3_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:3", "--cmd", "echo M_3_2"]
+        save_as: m3_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:4", "--cmd", "echo M_4_1"]
+        save_as: m4_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:4", "--cmd", "echo M_4_2"]
+        save_as: m4_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:5", "--cmd", "echo M_5_1"]
+        save_as: m5_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:5", "--cmd", "echo M_5_2"]
+        save_as: m5_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:6", "--cmd", "echo M_6_1"]
+        save_as: m6_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:6", "--cmd", "echo M_6_2"]
+        save_as: m6_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:7", "--cmd", "echo M_7_1"]
+        save_as: m7_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:7", "--cmd", "echo M_7_2"]
+        save_as: m7_2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:8", "--cmd", "echo M_8_1"]
+        save_as: m8_1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:8", "--cmd", "echo M_8_2"]
+        save_as: m8_2
+  - action: wait_command_done
+    cmd_id: "{m1_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m1_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m2_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m2_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m3_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m3_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m4_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m4_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m5_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m5_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m6_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m6_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m7_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m7_2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m8_1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{m8_2.cmd_id}"
+  - action: op_begin
+    op_id: reject-nl
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:bad", "--cmd", "echo bad1\necho bad2"]
+    expect: {ok: false, error_code: CMD_CONTAINS_NEWLINE}
+  - action: op_end
+    op_id: reject-nl
+  - action: assert_zero_tx
+    op_id: reject-nl
+  - action: assert_wire_contiguous
+    payloads: ["echo M_1_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_1_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_2_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_2_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_3_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_3_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_4_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_4_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_5_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_5_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_6_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_6_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_7_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_7_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_8_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_8_2\n"]
+  - action: assert_compare

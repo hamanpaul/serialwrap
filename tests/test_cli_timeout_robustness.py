@@ -41,8 +41,11 @@ from sw_core.cli import (
     build_parser,
     main,
 )
+import pytest
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestEffectiveTimeout(unittest.TestCase):
     """timeout 解析：未指定時長操作拿 floor、一般方法 5.0、顯式指定覆蓋一切。"""
 
@@ -114,6 +117,8 @@ class TestEffectiveTimeout(unittest.TestCase):
         self.assertEqual(_effective_timeout_s(args, "file.push"), DEFAULT_RPC_TIMEOUT_S)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliPassesEffectiveTimeout(unittest.TestCase):
     """CLI main → _run_rpc 實際把 floor / retries 傳進 rpc_call。"""
 
@@ -248,6 +253,8 @@ class _UnixRpcServerMixin(unittest.TestCase):
                 pass
 
 
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 class TestTimeoutEnrichment(_UnixRpcServerMixin):
     """TIMEOUT 錯誤 enrich：附 daemon_reachable（活著 true / 死了 false）。"""
 
@@ -326,6 +333,8 @@ class TestTimeoutEnrichment(_UnixRpcServerMixin):
         self.assertEqual(called_methods, ["health.ping"])  # health.status 未被呼叫
 
 
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 class TestRetryWhitelist(_UnixRpcServerMixin):
     """retry 白名單：非白名單不重試、白名單依 --retries 重試並可中途成功。"""
 
@@ -426,6 +435,8 @@ class TestRetryWhitelist(_UnixRpcServerMixin):
             self.assertEqual(self.method_conns["session.recover"], 1)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestRetryBackoffCap(unittest.TestCase):
     """NIT-7：單次退避 delay 有上限，不會隨 retries 指數爆炸。"""
 

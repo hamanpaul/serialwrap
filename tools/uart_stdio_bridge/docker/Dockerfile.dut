@@ -1,0 +1,6 @@
+FROM python:3.12-slim@sha256:7a8b475003c4fe15a2cd4e55e5cfc2f3560bdc9333d624f24cdd6d4340fd7a17
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY src/uart_stdio_bridge/__init__.py /usr/local/lib/python3.12/site-packages/uart_stdio_bridge/__init__.py
+COPY src/uart_stdio_bridge/dut/ /usr/local/lib/python3.12/site-packages/uart_stdio_bridge/dut/
+USER 65534:65534
+ENTRYPOINT ["python3", "-I", "-m", "uart_stdio_bridge.dut"]

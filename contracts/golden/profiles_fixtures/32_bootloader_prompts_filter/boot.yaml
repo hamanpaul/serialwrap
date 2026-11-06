@@ -1,0 +1,11 @@
+profiles:
+  p:
+    platform: prpl
+    bootloader_prompts: ["^=> $", 5, null, "U-Boot> ", ["nested"]]
+  q:
+    platform: prpl
+    bootloader_prompts: "not-a-list"
+
+targets:
+  - {profile: p, device_by_id: d1, bootloader_prompts: ["target-ignored"]}
+  - {profile: q, device_by_id: d2}

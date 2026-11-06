@@ -4,6 +4,9 @@
 - 無 legacy 安裝時回 None。
 - 偵測到 ~/.paul_tools/serialwrap 時回報 path/serialwrap 與退役指引。
 """
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_detect_legacy_install_none_when_absent(tmp_path):

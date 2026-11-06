@@ -1,0 +1,6 @@
+profiles:
+  a-template:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^.*login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"

@@ -97,7 +97,7 @@ def _attach_with_rescue(ctx, board: dict, log: list[str]) -> tuple[bool, str]:
               "usbipd attach 失敗→自動救援鏈（Windows 端 device release+重試≤2）；"
               "救不回才 FAIL=windows_daemon_holds_device＋attended",
               "config 的 win_serialwrap_exe 為空＝Windows 端不可探測，救援降級裸重試"),
-       requires=("two_boards",))
+       requires=("two_boards", "usbipd"))
 def p1_hp_cycle(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]
     b1 = _board(ctx, "COM1")
@@ -142,7 +142,7 @@ def p1_hp_cycle(ctx):
 @_case("p1-hp-reorder", "兩板反序回插仍各回原 COM，restart 後 rank 不翻轉（#100）",
        hints=("反序 attach 檢驗 DETACHED-rebind 依 by-id 認板、非列舉序",
               "restart 後 startup rank 仍 COM0=AC01QZT0/COM1=AQ00OAQ7 為 #100 核心保證"),
-       requires=("two_boards",))
+       requires=("two_boards", "usbipd", "supervisor_runtime"))
 def p1_hp_reorder(ctx):
     ready_wait = ctx.cfg["timeouts"]["ready_wait_s"]
     reboot_wait = ctx.cfg["timeouts"]["reboot_wait_s"]

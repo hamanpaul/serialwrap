@@ -5,7 +5,11 @@
     "busid 換線會變：每輪跑前 usbipd list 驗證存在（config 只存 serial→期望 COM 映射）。",
     "COM1 現為 brcm/BDK（曾為 prpl，alias 沿用歷史命名）。",
     "本檔為 stdlib json（非 YAML）——維持 realhw stdlib-only 契約，勿引入第三方解析器。",
-    "win_serialwrap_exe：Windows 端 serialwrap.exe 的 /mnt/c 路徑；空字串＝不可用（探測與救援降級 no-op）。"
+    "win_serialwrap_exe：Windows 端 serialwrap.exe 的 /mnt/c 路徑；空字串＝不可用（探測與救援降級 no-op）。",
+    "serialwrap_exe：本輪測試固定使用的 CLI 絕對路徑；空字串才回退 PATH。",
+    "bench_lock_path：跨平台共用 bench lock；Windows 必填，Linux 空字串使用預設位置。",
+    "human_frontend：auto|tmux|telnet；Windows 使用 loopback Telnet console。",
+    "cross_os_probe_argv：可選的另一 OS session list 探測命令；JSON 必須含 sessions 陣列。"
   ],
   "boards": [
     {"com": "COM0", "alias": "dut-prpl", "serial": "AC01QZT0", "busid": "8-1", "platform": "prpl"},
@@ -13,6 +17,10 @@
   ],
   "usbipd_exe": "/mnt/c/Program Files/usbipd-win/usbipd.exe",
   "win_serialwrap_exe": "/mnt/c/serialwrap/serialwrap.exe",
+  "serialwrap_exe": "",
+  "bench_lock_path": "",
+  "human_frontend": "auto",
+  "cross_os_probe_argv": [],
   "tmux_prefix": "realhw",
   "timeouts": {"ready_wait_s": 180, "reboot_wait_s": 300, "human_active_window_s": 60},
   "longrun": {"snapshot_interval_s": 300, "agent_workers": 4}

@@ -134,13 +134,13 @@ sequenceDiagram
 
 ### 4.3 Client ↔ Daemon transport
 
-- daemon 本體仍只 listen **Unix socket**
+- daemon 本體：POSIX 只 listen **Unix socket**；Windows 改 listen `tcp://127.0.0.1:48700`（TCP loopback，`sw_core/rpc_win.py`）
 - CLI client 端可接受：
   - `--socket /tmp/serialwrap/serialwrapd.sock`
   - `--endpoint unix:///tmp/serialwrap/serialwrapd.sock`
   - `--endpoint tcp://host:port`
-- `tcp://...` 的用途是讓 client 經由 **ssh-tunnel / socat / 隔離測試網路** 連到遠端 daemon；**不是**讓 daemon 直接 listen TCP
-- `daemon start` 只支援本機 socket，不支援 `--endpoint`
+- POSIX 上，`tcp://...` 的用途是讓 client 經由 **ssh-tunnel / socat / 隔離測試網路** 連到遠端 daemon；**不是**讓 daemon 直接 listen TCP。Windows daemon 本體直接 listen loopback TCP（預設 48700，`SERIALWRAP_TCP_PORT` 可改）。
+- `daemon start` 只支援本機：POSIX 不支援 `--endpoint`；Windows 僅接受 loopback `tcp://`（127.0.0.1／localhost／::1）作為 bind 位址。
 
 ## 5. Session / Console / Command 狀態
 
@@ -182,7 +182,7 @@ sequenceDiagram
 #### 其他
 
 - 若 session 僅為 `ATTACHED`，`session.console_attach` 仍可使用，且該 console 會自動拿到 raw human ownership，方便手動登入或觀察 boot/log
-- `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測，直接停在 `ATTACHED`，供未知設備走純 bridge/passthrough 路徑
+- `platform=passthrough` 的 session attach 後不做 prompt/login/ready 探測（即使設定 `ready_probe`，SC-35），經 explicit target／pin 選定時零 TX 停在 `ATTACHED`（動態偵測仍先送一個 `\n` 探測），供未知設備走純 bridge/passthrough 路徑；連續 30 秒無 RX 後自動升 `READY` 並可下命令
 
 ### 5.3 Command record
 
@@ -209,17 +209,18 @@ sequenceDiagram
 
 ### 5.3.1 `source` 前綴語意與外部入口驗證
 
-`source`（`command.submit`／`file.push`／`file.pull`／`device.release`）與 `session.interactive_open` 的
-`owner` 以**前綴**決定行為：`human:` 開頭為 human 來源（逾時升級 interactive、不送 CTRL-C／CTRL-D、
-不受 boot quiet gate），其餘一律 agent（逾時送 CTRL-C／CTRL-D）；`system`／`system:*` 為 daemon 內部
-保留（WAL 歸因與 `system:recover` 強制恢復旗標）。外部入口經 `sw_core/source_policy.py` 的 `check_source`：
+外部 `source`（`command.submit`／`file.push`／`file.pull`／`device.release`）的權限依 RPC
+**原始輸入**判定。只有 bare `human`／`human:`（沒名字，不分大小寫）才正規化為 `human:cli`，
+並依 OD-74 享有 human gate 與逾時升格；明寫 `human:<x>`（包括 `human:cli`）依 DF-02 當 agent
+處理，即使 `source_class` 顯示 `human` 也不授權。`session.interactive_open` 的 `owner` 使用
+相同保留前綴驗證，但 `normalize_human=false`：bare `human` 不改寫也不授予 human 命令權限。
+外部入口經 `sw_core/source_policy.py` 的 `check_source`：
 
-- `human`、`human:`（沒名字，前綴不分大小寫）→ 正規化為 `human:cli`，成功回應帶 `source` 與
-  `source_normalized_from`（`session.interactive_open` 的 `owner` 不正規化）。
+- bare `human`、`human:` 成功回應帶正規化後的 `source` 與原始 `source_normalized_from`；CLI 將原字串送到 daemon。
 - `system`、`system:*`（不分大小寫）→ 拒絕，`error_code: SOURCE_RESERVED`（帶 `field`、`value`、
   `reserved_prefix`、`hint`），在 resolve session／入列／送 UART 之前回傳。CLI 於送 RPC 前先預檢。
 - 其餘字串原樣放行（未知前綴維持 agent）。
-- `command.submit` 成功回應帶 `source_class`。
+- `command.submit` 成功回應與 `command.get` record 帶 `source_class` 顯示分類；不得用此欄位判權。
 - 內部路徑（human console 行 `human:<client_id>`、`recover_session`、self-test、login probe）直接進
   arbiter／bridge，不經此驗證。
 
@@ -295,7 +296,7 @@ Agent 收到 sentinel 後應短暫 sleep 後重試，而非視為錯誤。
 5. `session.interactive_status` 讀畫面
 6. `session.interactive_close` 釋放 lease
 
-若 `source=human:*` 的 line command 已送出但後續未回 prompt，daemon 會優先把該 console 升級成 human interactive，而不是直接觸發 recover。這條保護僅套用 human/minicom；agent foreground command 仍保留既有 prompt timeout / recover 路徑。
+若 daemon 內部 human console 路徑送出的 line command（WAL `source=human:*`）未回 prompt，daemon 會優先把該 console 升級成 human interactive，再觸發 recover。這條可信保護只適用於明確標記的內部 console 路徑。RPC 的明寫 `source=human:<x>`（含 `human:cli`）依 DF-02 按 agent 處理；bare RPC `source=human` 則依 OD-74 以原始輸入身分走 human 行為。agent foreground command 仍保留既有 prompt timeout / recover 路徑。
 
 > bootloader recovery lease（`allow_attached=True`）、recovery lease 的 stash/restore、`MAX_RECOVERY_LEASE_S` clamp、`recovery_mode` 欄位語意、idle human lease soft-preempt 與 orphan console liveness 等逐項行為，canonical 規格見 [`openspec/specs/session-interactive/spec.md`](../openspec/specs/session-interactive/spec.md)（#53）。本概覽不再追蹤這些細節。
 
@@ -450,7 +451,7 @@ dynamic 自動偵測 session 的 COM 編號**依裝置 by-id 字典序確定性�
 - **`serialwrap doctor`** → `single_daemon` 檢查項（daemon-less，回 `{check, ok, detail, fix}`）：多開時 `ok=false`。
 - **`serialwrap daemon status`**（RPC `health.status`）→ 回應加欄位：
   - `multi_open`（bool）。
-  - `foreign_holders`（`{tty_real_path: pid}`）：持有目前 attach 中 tty 的 pid。
+  - `foreign_holders`：已識別 holder 的值為 PID；掃描不完整時值為 `{"device": tty_real_path, "holder_unknown": true}`，若另有已收集 PID 則物件含 `pids` 陣列。
   - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`、procfs 不可用時為 `unknown`，此降級資訊本身即為輸出契約的一部分。`socket`（#173）為從各 daemon `--socket` 引數擷取的值（`sw_core/multi_open.py` 的 `_extract_socket_arg`），擷取不到時為 `null`。
 
 ### 8.5a Endpoint 發現與跨進程一致性（#173）
@@ -810,7 +811,7 @@ gate、`REMOTE_NOT_SUPPORTED`、`INVALID_ARGS`）且 exit code 非零時：
 - `log.tail_text`
 - `wal.range`
 
-> **`session.attach` 回傳契約（#94）**：對 command-capable session，未進入 `READY` 的 bridge-present 狀態一律回 `ok:false` + 頂層 `error_code`（開機窗／probe 未成功→`PROMPT_UNAVAILABLE`／`session.last_error`；`FLASHING`→`FLASHING_BUSY`；`RECOVERING`→`SESSION_RECOVERING`；`human:*` interactive lease 佔用而不 probe→`last_error`；其餘→`NOT_READY`），CLI exit code = `2` 並在 stderr 印一行具體錯誤。**回 `ok:true` 的情形**：達 `READY`（可下命令；human lease 下與人交錯）、`ATTACHING`（fresh attach 進行中／async accept）、`RELEASED`（裝置已 release／`released_by_id`，回 `released:true` + `recommended_action=device_attach`，屬保護性 no-op、不建立 bridge，需 `device attach` 重取）、`platform=passthrough`（非 command-capable、`ready_probe` 空、停 `ATTACHED` 即成功）。此為「誠實回報未達 READY、可重試（daemon 有界自動重探）、非致命」契約，供上層 driver 據以 retry/wait。
+> **`session.attach`／`session.recover` 回傳契約（SC-34）**：command-capable session 的 attach 未能達 `READY`，一般拒絕分支固定回 `ok:false`、頂層 `error_code=SESSION_NOT_READY`、`last_error` 與 `last_error_detail`（可為 null）；`FLASHING` 與 `RECOVERING` 仍分別回 `FLASHING_BUSY`、`SESSION_RECOVERING`。recover 的 REPROBE 未恢復時回 `ok:true`、`recovering:false`、`action=REPROBE`、`recovered:false`、`error_code=SESSION_NOT_READY`，並附頂層 `last_error`、`last_error_detail`。依 `last_error` 判斷後續處置；終態值不可盲目重試。CLI 對 attach 失敗回 exit code `2`。**attach 回 `ok:true` 的情形**：達 `READY`、`ATTACHING`（fresh attach 進行中／async accept）、`RELEASED`（裝置已 release／`released_by_id`，回 `released:true` + `recommended_action=device_attach`，需 `device attach` 重取）、`platform=passthrough`（不論 `ready_probe`，停 `ATTACHED` 即成功）。
 
 ## 12. `minicom_router.sh` 行為
 
@@ -895,7 +896,7 @@ targets:
 
 **`platform=prpl`**：prplOS 平台。`prompt_regex` 應匹配 prompt prefix，例如 `(?m)^root@prplOS:.*# `。不依賴行尾錨點，以適應 prompt 後接 driver / kernel log 的情境。`ready_probe` 保持最小 `echo __READY__${nonce}`。
 
-**`platform=passthrough`**：不做 `ready_probe` / login 流程。daemon 只建立 UART bridge 與 console PTY，session 停在 `ATTACHED`，由 human console 或後續人工判斷設備型態。
+**`platform=passthrough`**：不做 `ready_probe` / login 流程（SC-35）。daemon 只建立 UART bridge 與 console PTY，attach 零 TX（已選定的 profile；動態偵測仍先送一個 `\n` 探測）停在 `ATTACHED`，由 human console 觀察設備型態；連續 30 秒沒有 RX 即自動升 `READY`（`PASSTHROUGH_READY_QUIET_S`），之後 `cmd submit` 可用，完成條件見 `docs/command-completion.md`（建議帶 `--completion-regex`）。
 
 ### 13.4 裝置識別
 
@@ -919,7 +920,7 @@ targets:
 **偵測流程**（`login_fsm.detect_template()`）：
 
 1. 用預設 UART 參數（115200/8N1）開啟臨時 probe bridge
-2. `bridge.clear_rx_buffer()` + `bridge.send_command("")`（送 `\r`）
+2. `bridge.clear_rx_buffer()` + `bridge.send_command("")`（送 `\n`）
 3. 等待 `probe_timeout_s`（預設 3 秒）收集 UART 輸出
 4. 取得 `bridge.rx_tail()` snapshot
 5. 依序嘗試各 template（passthrough 排最後）：

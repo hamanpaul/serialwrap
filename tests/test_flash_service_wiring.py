@@ -7,7 +7,10 @@
   4. _BridgeProbe.probe 在無 session 時回傳 False（不 raise）。
 """
 import os
-import pty
+try:  # POSIX-only：原生 Windows 無 pty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import pty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    pty = None
 import threading
 import time
 
@@ -28,6 +31,8 @@ def _iso_state():
         yield
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_on_flash_open_no_candidates_is_silent():
     """沒有任何候選 → detect_mcu_line 回 'none' → 不應 raise、不應進入 flashing 狀態。"""
     svc = SerialwrapService([])
@@ -41,6 +46,8 @@ def test_on_flash_open_no_candidates_is_silent():
         os.close(slave)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flash_rx_observer_fills_probe_buffer():
     """_flash_rx_observer 應把 RX bytes 累積到 _flash_rx_buffers[com]。"""
     svc = SerialwrapService([])
@@ -55,6 +62,8 @@ def test_flash_rx_observer_fills_probe_buffer():
     assert buf == b"\xAA\xBB\xCC"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flash_rx_observer_ignores_unregistered_com():
     """未在 _flash_rx_buffers 中的 com 不應 raise，也不應建立 entry（不記錄多餘狀態）。"""
     svc = SerialwrapService([])
@@ -64,6 +73,8 @@ def test_flash_rx_observer_ignores_unregistered_com():
         assert "/dev/ttyUSB99" not in svc._flash_rx_buffers
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_flash_rx_observer_writes_to_master_when_active():
     """active flash 期間，_flash_rx_observer 應把 RX bytes 寫入 _flash_master_fd。
 
@@ -92,6 +103,8 @@ def test_flash_rx_observer_writes_to_master_when_active():
         os.close(slave)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_bridge_probe_returns_false_when_no_session():
     """_BridgeProbe.probe 在 by_id 無對應 session 時回傳 False，不 raise。"""
     from sw_core.service import _BridgeProbe
@@ -101,6 +114,8 @@ def test_bridge_probe_returns_false_when_no_session():
     assert result is False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flash_rx_buffer_capped_at_4096():
     """_flash_rx_buffers 超過 4096 bytes 時，應截斷保留最後 4096 bytes。"""
     svc = SerialwrapService([])

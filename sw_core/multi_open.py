@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import os
 
+from .serial_port import same_tty, tty_stat
+from .util import normalize_endpoint_path
+
 
 def _iter_pids(proc_root: str):
     """列舉 proc_root 下的數字 pid 目錄。"""
@@ -27,13 +30,15 @@ def _iter_pids(proc_root: str):
 def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     """判定 ``/proc/<pid>`` 是否為 serialwrapd daemon 程序（#101 5a）。
 
-    需涵蓋三種真實啟動形式，同時排除 ``grep serialwrapd`` 這類「裸字串含 serialwrapd」誤判：
+    需涵蓋四種真實啟動形式，同時排除 ``grep serialwrapd`` 這類「裸字串含 serialwrapd」誤判：
 
     - argv0 的 basename 為 ``serialwrapd``（直接 exec console_script，或 pipx 入口），或
     - 某個**路徑型**參數（含 ``/``）的 basename 為 ``serialwrapd``——pipx/venv console_script
       被 python 執行的形式 ``python /path/bin/serialwrapd --socket ...``（argv0=python、
       argv1=可執行檔路徑、basename 無 ``.py``；**這是實機 prod daemon 的形式**），或
-    - 某參數以 ``serialwrapd.py`` 結尾（薄 shim ``python serialwrapd.py``）。
+    - 某參數以 ``serialwrapd.py`` 結尾（薄 shim ``python serialwrapd.py``），或
+    - 連續出現 ``-m sw_core.daemon``（DF-05 第 5 順序，pipx／安裝佈局的 ``python -m`` 啟動；
+      P1 T18 起 ``daemon start`` 會實際 spawn 此形式，故須計入多開偵測，P4 計畫 Task 1 同步要求）。
 
     關鍵：對裸名 ``serialwrapd`` 要求含路徑分隔 ``/`` 才算，以排除 ``grep serialwrapd``
     （arg 為裸字串、無路徑）的誤判；``serialwrapd.py`` 因副檔名特異性高，放寬不要求路徑。
@@ -41,11 +46,20 @@ def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     不在此處做 TGID 去重：``/proc`` 頂層只列 thread group leader（TGID）、不列同 group 的子
     thread，故同一 daemon 不會在頂層重複出現，無需去重。
     """
+    return _serialwrapd_status(proc_root, pid) is True
+
+
+def _serialwrapd_status(proc_root: str, pid: int) -> bool | None:
+    """回報 daemon 身分、非 daemon 或無法讀取的三態結果。"""
+    proc_dir = f"{proc_root}/{pid}"
     try:
-        with open(f"{proc_root}/{pid}/cmdline", "rb") as fh:
+        with open(f"{proc_dir}/cmdline", "rb") as fh:
             raw = fh.read()
+    except FileNotFoundError:
+        procfs_present = os.path.isdir(f"{proc_root}/self")
+        return False if procfs_present and not os.path.exists(proc_dir) else None
     except OSError:
-        return False
+        return None
     parts = [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
     if not parts:
         return False
@@ -59,6 +73,9 @@ def _is_serialwrapd(proc_root: str, pid: int) -> bool:
     for p in parts[1:]:
         if "/" in p and os.path.basename(p) == "serialwrapd":
             return True
+    # python [-I -B ...] -m sw_core.daemon：-m 與模組名必須相鄰，排除 `-c "-m sw_core.daemon"` 等裸字串誤判。
+    if any(a == "-m" and b == "sw_core.daemon" for a, b in zip(parts, parts[1:])):
+        return True
     return False
 
 
@@ -115,7 +132,13 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
 
     holders: dict[str, int] = {}
     status = "ok"
-    tty_set = set(tty_paths)
+    # #R2：以 inode 身分比對（見 serial_port.same_tty），不以 readlink 字串——跨 mount namespace 的同名
+    # /dev/pts/N（例如 docker 容器內獨立 devpts）字串相同卻非同一 tty。holders 的鍵仍為呼叫端給的 tty 路徑。
+    tty_stats: list[tuple[str, os.stat_result]] = []
+    for tty in tty_paths:
+        tty_st = tty_stat(tty)
+        if tty_st is not None:
+            tty_stats.append((tty, tty_st))
     for info in daemons:
         pid = info["pid"]
         fd_dir = f"{proc_root}/{pid}/fd"
@@ -130,11 +153,12 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
             continue
         for fd in fds:
             try:
-                target = os.readlink(f"{fd_dir}/{fd}")
+                fd_stat = os.stat(f"{fd_dir}/{fd}")
             except OSError:
                 continue
-            if target in tty_set:
-                holders[target] = pid
+            for tty, tty_st in tty_stats:
+                if same_tty(fd_stat, tty_st):
+                    holders[tty] = pid
 
     return {
         "multi_open": len(daemons) > 1,
@@ -142,3 +166,79 @@ def detect_multi_open(proc_root: str = "/proc", tty_paths: list[str] | None = No
         "holders": holders,
         "holders_status": status,
     }
+
+
+def daemon_process_alive(
+    pid: int | None,
+    endpoint: str,
+    *,
+    proc_root: str = "/proc",
+) -> bool | None:
+    """以 PID 或正規化 endpoint 判定舊 daemon 是否存活；無法證明時回 None。"""
+    if pid is not None and pid > 0:
+        if os.name == "nt":
+            try:
+                from .remote_tunnel import pid_alive  # noqa: PLC0415
+
+                return pid_alive(pid, None, os_name="nt")
+            except Exception:  # noqa: BLE001 — 無法查詢程序狀態不得視為已停止
+                return None
+        try:
+            with open(f"{proc_root}/{pid}/stat", "r", encoding="ascii") as fh:
+                stat_line = fh.read()
+        except FileNotFoundError:
+            procfs_present = os.path.isdir(f"{proc_root}/self")
+            pid_present = os.path.exists(f"{proc_root}/{pid}")
+            return False if procfs_present and not pid_present else None
+        except OSError:
+            return None
+        try:
+            state = stat_line.rsplit(")", 1)[1].strip().split()[0]
+        except (IndexError, ValueError):
+            return None
+        return state not in {"Z", "X"}
+
+    if os.name == "nt":
+        return None
+    if not os.path.isdir(f"{proc_root}/self"):
+        return None
+    try:
+        pids = list(_iter_pids(proc_root))
+    except OSError:
+        return None
+
+    # S1X-a-5：只看自身 uid 的行程——他人的 daemon 綁不到本使用者的 endpoint，其 cmdline
+    # 不可讀（hidepid 等）也不代表掃描不完整；同 uid 但不帶 --socket 的 daemon（如
+    # systemd-user unit）綁預設 endpoint，以之比對而非直接放棄判定。
+    my_uid = os.getuid()
+    scan_incomplete = False
+    for candidate_pid in pids:
+        owner_uid = _proc_uid(proc_root, candidate_pid)
+        if owner_uid is None:
+            if os.path.exists(f"{proc_root}/{candidate_pid}"):
+                scan_incomplete = True
+            continue
+        if owner_uid != my_uid:
+            continue
+        status = _serialwrapd_status(proc_root, candidate_pid)
+        if status is None:
+            scan_incomplete = True
+            continue
+        if not status:
+            continue
+        socket_path = _extract_socket_arg(proc_root, candidate_pid)
+        if socket_path is None:
+            from .constants import DEFAULT_ENDPOINT  # noqa: PLC0415
+
+            socket_path = DEFAULT_ENDPOINT
+        if normalize_endpoint_path(socket_path) == normalize_endpoint_path(endpoint):
+            return True
+    return None if scan_incomplete else False
+
+
+def _proc_uid(proc_root: str, pid: int) -> int | None:
+    """回傳 ``/proc/<pid>`` 的擁有者 uid；行程已消失或無法 stat 時回 None。"""
+    try:
+        return os.stat(f"{proc_root}/{pid}").st_uid
+    except OSError:
+        return None

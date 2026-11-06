@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from sw_core import platform_backends as pb
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_explicit_posix():

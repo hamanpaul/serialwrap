@@ -7,6 +7,7 @@ import unittest
 
 from sw_core.event_engine.engine import EventEngine, EngineDeps
 from sw_core.event_engine.counter import CounterStore
+import pytest
 
 
 class _FakeBridgeQueries:
@@ -58,6 +59,8 @@ class TestEventEngine(unittest.TestCase):
         self.engine.rule_set(rule)
         return rule
 
+    @pytest.mark.posix_only
+    @pytest.mark.process_rpc
     def test_rule_set_then_fire(self) -> None:
         marker = os.path.join(self.tmp, "fired")
         self._add_rule("o", "n", marker)
@@ -68,6 +71,8 @@ class TestEventEngine(unittest.TestCase):
         self.engine.feed_line("COM0", "Kernel panic - not syncing", wal_seq=1)
         self._wait_for_file(marker, timeout=3.0)
 
+    @pytest.mark.posix_only
+    @pytest.mark.process_rpc
     def test_disable_clears_counter(self) -> None:
         marker = os.path.join(self.tmp, "fired2")
         self._add_rule("o", "x", marker)
@@ -82,6 +87,8 @@ class TestEventEngine(unittest.TestCase):
         self.engine.com_disable("COM0")
         self.assertEqual(store.load("o.x").fires, 0)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_reload_diff_applies(self) -> None:
         marker = os.path.join(self.tmp, "fired3")
         self._add_rule("o", "y", marker)
@@ -102,6 +109,8 @@ class TestEventEngine(unittest.TestCase):
         self.fail(f"file did not appear: {path}")
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestBridgeWiring(unittest.TestCase):
     def test_engine_receives_lines_from_bridge_callback(self) -> None:
         import pty
@@ -148,6 +157,8 @@ class TestBridgeWiring(unittest.TestCase):
                 pass
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestSessionManagerHelpers(unittest.TestCase):
     def test_helpers_exist(self) -> None:
         import threading

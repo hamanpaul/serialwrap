@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 
 from realhw.harness import CaseResult
@@ -49,20 +48,11 @@ _RSS_GROWTH_BUDGET_KB = 30 * 1024  # 30MB，門檻寬鬆防 flaky
 
 
 def _read_vmrss_kb(pid: int) -> int | None:
-    """讀 ``/proc/<pid>/status`` 的 ``VmRSS``（kB）；讀不到（權限或 pid 已消失）回 ``None``。
+    """透過共用平台 adapter 讀 working-set RSS；0 代表無法量測。"""
+    from realhw.procobs import rss_kb
 
-    純檔案系統讀取，不觸碰 daemon RPC 也不 import sw_core。
-    """
-    try:
-        text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        if line.startswith("VmRSS:"):
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                return int(parts[1])
-    return None
+    value = rss_kb(pid)
+    return value if value > 0 else None
 
 
 def _cancel_all(ctx: Any, cmd_ids: list[str]) -> list[dict]:

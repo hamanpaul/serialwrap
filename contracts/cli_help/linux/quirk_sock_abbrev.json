@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--sock",
+    "/x",
+    "session",
+    "list"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "{\"error_code\":\"SOCKET_ERROR\",\"message\":\"[Errno 2] No such file or directory\",\"ok\":false}\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": true
+}

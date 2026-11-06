@@ -1,0 +1,1 @@
+child pid=4488 interactive=true ctrl_c_reenabled=true

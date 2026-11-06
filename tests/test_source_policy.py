@@ -22,6 +22,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
+import pytest
+
 from sw_core import cli
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.service import SerialwrapService
@@ -35,6 +37,8 @@ from sw_core.source_policy import (
     classify_source,
 )
 from sw_core.wal import WalWriter
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path
@@ -62,6 +66,8 @@ class TestCheckSource(unittest.TestCase):
                 self.assertIsNone(check.error)
                 self.assertEqual(check.source, "human:cli")
                 self.assertEqual(check.normalized_from, raw)
+                self.assertEqual(check.raw_source, raw)
+                self.assertTrue(check.is_bare_human)
                 self.assertEqual(classify_source(check.source), SOURCE_CLASS_HUMAN)
 
     def test_human_with_name_kept_and_case_of_prefix_folded(self) -> None:
@@ -70,10 +76,16 @@ class TestCheckSource(unittest.TestCase):
         fold = check_source("Human:Bob", default="agent")
         self.assertEqual(fold.source, "human:Bob")
         self.assertEqual(fold.normalized_from, "Human:Bob")
+        self.assertFalse(fold.is_bare_human)
         colon = check_source("human:a:b", default="agent")
         self.assertEqual((colon.source, colon.normalized_from), ("human:a:b", None))
+        self.assertFalse(colon.is_bare_human)
+        explicit = check_source("human:cli", default="agent")
+        self.assertEqual(explicit.source, "human:cli")
+        self.assertFalse(explicit.is_bare_human)
 
     def test_reserved_prefix_rejected(self) -> None:
+        self.assertEqual(ERROR_SOURCE_RESERVED, "SOURCE_RESERVED")
         for raw in ("system", "system:", "system:recover", "system:self_test", "system:secret",
                     "SYSTEM:recover", "System:x", " system:recover", "system :x"):
             with self.subTest(raw=raw):
@@ -322,6 +334,21 @@ class TestTimeoutBehaviorEndToEnd(_ServiceBase):
         self.assertEqual(rec["status"], "done")
         self.assertEqual(rec["recovery_action"], "CTRL_C")
         self.assertEqual(rec["source_class"], SOURCE_CLASS_AGENT)
+        self.bridge.send_bytes.assert_called_once_with(b"\x03", source="system:recover", cmd_id=None)
+
+    def test_explicit_human_cli_timeout_keeps_agent_recovery(self) -> None:
+        self.bridge.rx_snapshot_len.side_effect = [10, 10, 10, 20]
+        self.bridge.wait_for_regex_from.side_effect = [False, True]
+        self.bridge.rx_text_from.return_value = "# "
+        resp = self.svc.rpc(
+            "command.submit",
+            {"selector": "COM0", "cmd": "printf 'broken", "source": "human:cli", "timeout_s": 0.1},
+        )
+        self.assertTrue(resp["ok"])
+        rec = self._wait_terminal(resp["cmd_id"])
+        self.assertEqual(rec["status"], "done")
+        self.assertEqual(rec["recovery_action"], "CTRL_C")
+        self.assertEqual(rec["source_class"], SOURCE_CLASS_HUMAN)
         self.bridge.send_bytes.assert_called_once_with(b"\x03", source="system:recover", cmd_id=None)
 
     def test_system_recover_cannot_trigger_force_recover_via_submit(self) -> None:

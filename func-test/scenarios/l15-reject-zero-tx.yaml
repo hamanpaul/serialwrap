@@ -1,0 +1,57 @@
+---
+meta:
+  name: l15-reject-zero-tx
+  category: l15-scenario
+  severity: critical
+  description: "含換行或超長命令被拒時，外部 serial_read 與 WAL TX 皆為零（§11.3 不變量 1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [zero_tx_on_reject, insufficient_evidence_not_pass]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: reject-newline
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo a\necho b"]
+    expect: {ok: false, error_code: CMD_CONTAINS_NEWLINE}
+  - action: op_end
+    op_id: reject-newline
+  - action: assert_zero_tx
+    op_id: reject-newline
+  - action: cli
+    argv: ["daemon", "status"]
+    save_as: st
+  - action: op_begin
+    op_id: reject-too-long
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "{st.limits.max_submit_cmd_bytes_plus_one_x}"]
+    expect: {ok: false, error_code: CMD_TOO_LONG}
+  - action: op_end
+    op_id: reject-too-long
+  - action: assert_zero_tx
+    op_id: reject-too-long
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_ACCEPTED"]
+    save_as: ok1
+  - action: wait_command_done
+    cmd_id: "{ok1.cmd_id}"
+  - action: assert_wire_contiguous
+    payloads: ["echo L15_ACCEPTED\n"]

@@ -1,0 +1,242 @@
+{
+  "console_pair": "COM22:COM23",
+  "evidence_layer": "native-windows",
+  "generated_at": "2026-10-22T23:51:26Z",
+  "host": {
+    "com0com_version": "3.0.0.0",
+    "hvci_running": true,
+    "secure_boot": false,
+    "security_services_running": [
+      2,
+      5
+    ],
+    "virtualization_based_security_status": 2,
+    "windows_build": "26200"
+  },
+  "items": {
+    "console_pair": {
+      "endpoints": [
+        {
+          "exclusive_error_access_denied": true,
+          "first_open": "success",
+          "port": "COM22",
+          "reopen_after_close": "success",
+          "second_open": "error",
+          "second_open_error": {
+            "errno": null,
+            "exception_type": "SerialException",
+            "message": "could not open port 'COM22': PermissionError(13, '存取被拒。', None, 5)",
+            "winerror": 5
+          },
+          "verdict": "PASS"
+        },
+        {
+          "exclusive_error_access_denied": true,
+          "first_open": "success",
+          "port": "COM23",
+          "reopen_after_close": "success",
+          "second_open": "error",
+          "second_open_error": {
+            "errno": null,
+            "exception_type": "SerialException",
+            "message": "could not open port 'COM23': PermissionError(13, '存取被拒。', None, 5)",
+            "winerror": 5
+          },
+          "verdict": "PASS"
+        }
+      ],
+      "measured_at": "2026-10-22T23:51:22Z",
+      "verdict": "PASS"
+    },
+    "control_lines": {
+      "console_pair_positive_control": {
+        "dtr_only": {
+          "errors": {},
+          "mapping_consistent": true,
+          "observed": {
+            "cd": true,
+            "cts": false,
+            "dsr": true
+          }
+        },
+        "reverse_dtr_only": {
+          "errors": {},
+          "mapping_consistent": true,
+          "observed": {
+            "cd": true,
+            "cts": false,
+            "dsr": true
+          }
+        },
+        "reverse_rts_only": {
+          "errors": {},
+          "mapping_consistent": true,
+          "observed": {
+            "cd": false,
+            "cts": true,
+            "dsr": false
+          }
+        },
+        "rts_only": {
+          "errors": {},
+          "mapping_consistent": true,
+          "observed": {
+            "cd": false,
+            "cts": true,
+            "dsr": false
+          }
+        }
+      },
+      "console_side_isolation": {
+        "baseline": {
+          "console_a": {
+            "cd": false,
+            "cts": false,
+            "dsr": false
+          },
+          "console_b": {
+            "cd": false,
+            "cts": false,
+            "dsr": false
+          }
+        },
+        "dut_dtr_only": {
+          "console_a": {
+            "cd": false,
+            "cts": false,
+            "dsr": false
+          },
+          "console_b": {
+            "cd": false,
+            "cts": false,
+            "dsr": false
+          }
+        },
+        "dut_rts_only": {
+          "console_a": {
+            "cd": false,
+            "cts": false,
+            "dsr": false
+          },
+          "console_b": {
+            "cd": false,
+            "cts": false,
+            "dsr": false
+          }
+        },
+        "port_a": "COM22",
+        "port_b": "COM23",
+        "tested": true,
+        "unaffected": true
+      },
+      "dut_side": {
+        "baseline": {
+          "cd": false,
+          "cts": false,
+          "dsr": false
+        },
+        "mapping_consistent": true,
+        "phases": {
+          "dtr_only": {
+            "console_a": {
+              "errors": {},
+              "values": {
+                "cd": false,
+                "cts": false,
+                "dsr": false
+              }
+            },
+            "console_b": {
+              "errors": {},
+              "values": {
+                "cd": false,
+                "cts": false,
+                "dsr": false
+              }
+            },
+            "dut_b": {
+              "errors": {},
+              "values": {
+                "cd": true,
+                "cts": false,
+                "dsr": true
+              }
+            }
+          },
+          "rts_only": {
+            "console_a": {
+              "errors": {},
+              "values": {
+                "cd": false,
+                "cts": false,
+                "dsr": false
+              }
+            },
+            "console_b": {
+              "errors": {},
+              "values": {
+                "cd": false,
+                "cts": false,
+                "dsr": false
+              }
+            },
+            "dut_b": {
+              "errors": {},
+              "values": {
+                "cd": false,
+                "cts": true,
+                "dsr": false
+              }
+            }
+          }
+        },
+        "port_a": "COM20",
+        "port_b": "COM21"
+      },
+      "measured_at": "2026-10-22T23:51:18Z",
+      "outputs_cleared_before_baseline": [
+        "COM20",
+        "COM21",
+        "COM22",
+        "COM23"
+      ],
+      "verdict": "PASS"
+    },
+    "peer_close": {
+      "fault_kind": "peer_close",
+      "measured_at": "2026-10-22T23:51:26Z",
+      "read_outcome": {
+        "data_hex": "",
+        "data_len": 0,
+        "result": "returned",
+        "timed_out": true
+      },
+      "transport_disconnect": false,
+      "verdict": "PASS",
+      "write_outcome": {
+        "bytes_written": 1,
+        "result": "success"
+      }
+    }
+  },
+  "pair": "COM20:COM21",
+  "producer": "spike1_remaining.py",
+  "pyserial_version": "3.5",
+  "results": [
+    {
+      "item": "control_lines",
+      "verdict": "PASS"
+    },
+    {
+      "item": "console_pair",
+      "verdict": "PASS"
+    },
+    {
+      "item": "peer_close",
+      "verdict": "PASS"
+    }
+  ],
+  "schema_version": 1,
+  "tool_revision": "sha256:95ee003b4a4bc3f1b4e9bdb9b42b3073b2e6748ebc542dba7a467d8570b32f2f",
+  "uart_kind": "native"
+}

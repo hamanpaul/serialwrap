@@ -12,7 +12,10 @@ from typing import Any
 from serialwrap_reliability.core import ensure_realhw_importable
 
 _BOARD_OPTIONAL_KEYS: tuple[str, ...] = ("alias", "serial", "busid", "platform", "profile")
-_SECTION_KEYS: tuple[str, ...] = ("usbipd_exe", "win_serialwrap_exe", "tmux_prefix", "timeouts")
+_SECTION_KEYS: tuple[str, ...] = (
+    "serialwrap_exe", "bench_lock_path", "human_frontend", "usbipd_exe",
+    "win_serialwrap_exe", "tmux_prefix", "timeouts", "cross_os_probe_argv",
+)
 
 
 def _selector_sort_key(selector: str) -> tuple[str, int]:

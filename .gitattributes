@@ -1,0 +1,27 @@
+# 確保 uart_stdio_bridge 工具原始碼於跨平台檢出時維持 LF 行尾，以維護 tree_sha256 一致性（OD-15）
+tools/uart_stdio_bridge/** text eol=lf
+# Stage 0 承接清單與人工程序的位元組雜湊（test_manual_procedure_not_counted）需跨平台維持 LF（P2-T12）
+realhw/procedures/*.md text eol=lf
+tests/acceptance/** text eol=lf
+# OD-09 凍結門檻檔、候選登記 ledger 與 owner-decisions addenda 的位元組雜湊需跨平台維持 LF（P2-T16）
+realhw/acceptance/longrun_acceptance.yaml text eol=lf
+realhw/acceptance/candidate_longrun_starts.ndjson text eol=lf
+docs/rust-refactor/owner-decisions-addenda.md text eol=lf
+# contracts 與 Rust golden 都以位元組比對；Windows checkout 預設轉 CRLF 會讓比對失敗
+contracts/** text eol=lf
+# profiles_fixtures 刻意保留 BOM／CRLF 等位元組差異，不做行尾轉換
+contracts/golden/profiles_fixtures/** -text
+crates/*/tests/golden/** text eol=lf
+# Rust 以原始位元組內嵌名稱表與安裝資產；CRLF 會破壞十六進位解析及 stdout 換行契約
+crates/sw-proto/src/pyre/unicode_names.tsv text eol=lf
+sw_core/assets/** text eol=lf
+crates/sw-pal/tests/golden/serialwrap.task.xml -text
+# 證據檔以位元組雜湊登錄（stage0_evidence_index.yaml 之 sha256），跨平台檢出不得做 EOL 轉換（CRLF 原樣保留）
+evidence/** -text
+# 擁有者 Windows 原生證據逐字保存（含 CRLF），不做行尾轉換也不做空白檢查（OD-29 (4)）
+evidence/stage1/owner/** -text -whitespace
+# Windows 原生產出的 func-test 報告逐字保存（含 CRLF），雜湊登錄於 SHA256SUMS，不做空白檢查（OD-31）
+evidence/stage1/od31-ev01-win/** -text -whitespace
+
+# pyre oracle 明確拒絕 CRLF；Windows checkout 必須維持語料位元組。
+scripts/rust/goldens/pyre_corpus.txt text eol=lf

@@ -19,6 +19,9 @@ from unittest import mock
 
 from sw_core.service import SerialwrapService
 from sw_core.version import code_fingerprint, resolve_version
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _make_service() -> SerialwrapService:
@@ -54,7 +57,9 @@ def test_rpc_wrapper_adds_version_to_non_health_methods() -> None:
     svc = _make_service()
     ping = svc.rpc("health.ping", {})
     assert ping == {
-        "ok": True, "pong": True, "version": resolve_version(),
+        "ok": True,
+        "pong": True,
+        "version": resolve_version(),
         "code_fingerprint": code_fingerprint(),
     }
     patterns = svc.rpc("mcu.patterns", {})

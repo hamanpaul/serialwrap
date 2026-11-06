@@ -281,6 +281,8 @@ def validate_rule_dict(obj: dict[str, Any]) -> Rule:
                 "量詞單元含 alternation 或巢狀量詞）；無 google-re2 時一律拒絕。請改寫為單一非歧義量詞形式，"
                 "或安裝 google-re2（pip install 'serialwrap[redos]'）以線性引擎免疫此限制",
             )
+    else:
+        _flags_from_string(pflags)
     pattern = Pattern(kind=pkind, value=pvalue, flags=pflags)
 
     scope = str(obj.get("scope", "spontaneous"))

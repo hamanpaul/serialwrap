@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "device",
+    "release",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap device release [-h] --selector SELECTOR [--source SOURCE]\n                                 [--reason REASON]\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n  --source SOURCE      system／system:* 為保留來源並會拒絕；bare human 正規化為 human:cli 並走 human\n                       行為；明寫 human:<名> 依 DF-02 走 agent 行為。\n  --reason REASON\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

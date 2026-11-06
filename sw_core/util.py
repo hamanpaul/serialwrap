@@ -9,6 +9,23 @@ import time
 from typing import Any
 
 
+def normalize_endpoint_path(value: str) -> str:
+    """正規化用於比較的 Unix endpoint 路徑；TCP endpoint 維持原字串。"""
+    if value.startswith("tcp://"):
+        return value
+    path = value[len("unix://"):] if value.startswith("unix://") else value
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def endpoint_path_for_io(value: str) -> str:
+    """去除 endpoint 包裝並展開相對路徑，保留 OS 解析用的 `..` 與 symlink 順序。"""
+    if value.startswith("tcp://"):
+        return value
+    path = value[len("unix://"):] if value.startswith("unix://") else value
+    expanded = os.path.expanduser(path)
+    return expanded if os.path.isabs(expanded) else os.path.join(os.getcwd(), expanded)
+
+
 def now_iso() -> str:
     return _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
 

@@ -1,0 +1,69 @@
+---
+meta:
+  name: l15-transport-disconnect
+  category: l15-scenario
+  severity: critical
+  description: "傳輸層斷線重連，斷線期間命令終態明確且重連後無自動重送（§15.7.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc, transport_disconnect]
+    timeout_s: 60
+    invariants: [no_auto_resend, insufficient_evidence_not_pass]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: op_begin
+    op_id: gen1-end
+  - action: op_end
+    op_id: gen1-end
+  - action: bridge_control
+    action_name: transport_disconnect
+    params: {remove_link: false}
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_DURING_DOWN", "--cmd-timeout", "5"]
+    save_as: down
+  - action: wait_state
+    selector: COM0
+    state: RECOVERING
+    timeout_s: 10
+    accept: [RECOVERING, DETACHED]
+  - action: sleep
+    seconds: 5
+  - action: op_begin
+    op_id: reconnect
+    settle: false
+  - action: bridge_control
+    action_name: transport_reconnect
+  - action: op_end
+    op_id: reconnect
+  - action: wait_ready
+    timeout_s: 40
+  - action: assert_command_resolved
+    from: down
+    timeout_s: 30
+    payload: "echo L15_DURING_DOWN\n"
+  - action: wait_ready
+    timeout_s: 30
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_AFTER_UP"]
+    save_as: up
+  - action: wait_command_done
+    cmd_id: "{up.cmd_id}"
+  - action: assert_wire_contiguous
+    payloads: ["echo L15_AFTER_UP\n"]
+  - action: assert_compare

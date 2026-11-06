@@ -9,6 +9,9 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from sw_core.cli import build_parser, main as cli_main
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class _StubClient:

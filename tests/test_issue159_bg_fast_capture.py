@@ -20,6 +20,9 @@ from sw_core.config import SessionProfile, UartProfile
 from sw_core.session_manager import SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestIssue159BgFastCapture(unittest.TestCase):

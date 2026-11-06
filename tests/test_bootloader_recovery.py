@@ -21,6 +21,9 @@ from sw_core.config import SessionProfile, UartProfile
 from sw_core.session_manager import InteractiveLease, SessionManager, SessionRuntime
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable]
 
 
 # ──────────────────────────────────────────────
@@ -48,6 +51,7 @@ def _make_profile(
 # 1. _matches_any_bootloader_prompt helper 測試
 # ──────────────────────────────────────────────
 
+@pytest.mark.memory_only
 class TestMatchesAnyBootloaderPrompt(unittest.TestCase):
     """測試模組層級 helper _matches_any_bootloader_prompt。"""
 
@@ -112,6 +116,7 @@ class TestMatchesAnyBootloaderPrompt(unittest.TestCase):
 # 2. self_test ATTACHED BOOTLOADER classification 測試
 # ──────────────────────────────────────────────
 
+@pytest.mark.memory_only
 class TestSelfTestBootloaderClassification(unittest.TestCase):
     """測試 SessionManager.self_test 在 ATTACHED 狀態下的 BOOTLOADER 分類。"""
 
@@ -293,6 +298,7 @@ class TestSelfTestBootloaderClassification(unittest.TestCase):
 # 3. Recovery lease 基礎 schema 測試
 # ──────────────────────────────────────────────
 
+@pytest.mark.memory_only
 class TestRecoveryLeaseSchema(unittest.TestCase):
     """測試 InteractiveLease / SessionRuntime 的 recovery_mode / suspended_human schema。"""
 
@@ -406,6 +412,7 @@ class TestRecoveryLeaseSchema(unittest.TestCase):
 # ──────────────────────────────────────────────
 
 
+@pytest.mark.memory_only
 class TestInteractiveOpenAllowAttached(unittest.TestCase):
     """測試 interactive_open(allow_attached=True) bootloader recovery lease 功能。"""
 
@@ -968,6 +975,7 @@ class TestInteractiveOpenAllowAttached(unittest.TestCase):
 # ──────────────────────────────────────────────
 
 
+@pytest.mark.process_rpc
 class TestRpcCliMcpPassthrough(unittest.TestCase):
     """測試 service / CLI / MCP 是否正確傳遞 allow_attached。"""
 

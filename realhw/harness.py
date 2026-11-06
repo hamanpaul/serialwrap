@@ -59,6 +59,10 @@ def select_cases(registry: list[Case], *, tiers: list[str], only: str | None, sk
 _DUR = re.compile(r"^(\d+)([hms])$")
 _CFG_DEFAULTS: dict[str, Any] = {
     "win_serialwrap_exe": "",
+    "serialwrap_exe": "",
+    "bench_lock_path": "",
+    "human_frontend": "auto",
+    "cross_os_probe_argv": [],
     "tmux_prefix": "realhw",
 }
 
@@ -140,6 +144,7 @@ class Ctx:
     usbipd: Any
     systemd: Any
     win: Any = None
+    human: Callable[[str, str], Any] | None = None
 
     def note(self, name: str, content: str) -> str:
         """寫 evidence 檔，回傳相對路徑（進 CaseResult.evidence）。"""

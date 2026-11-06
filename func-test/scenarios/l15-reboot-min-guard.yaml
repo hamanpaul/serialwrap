@@ -1,0 +1,68 @@
+---
+meta:
+  name: l15-reboot-min-guard
+  category: l15-scenario
+  severity: critical
+  description: "開機 Quiet 窗口內拒絕命令且零 TX，窗口結束後恢復 READY（§11.6 Slice 2.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [zero_tx_on_reject, no_auto_resend]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: dut_control
+    action_name: logical_reboot
+    params:
+      pre_text: "\r\nU-Boot 2024.01\r\nHit any key to stop autoboot:  3 \r\n"
+      banner_delay_ms: 4000
+  - action: wait_wire_marker
+    marker: "Hit any key"
+    observation: "serial_write"
+    timeout_s: 10
+  - action: op_begin
+    op_id: quiet-window
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_QUIET_1"]
+    save_as: q1
+    expect: {ok: false}
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_QUIET_2"]
+    save_as: q2
+    expect: {ok: false}
+  - action: wait_state
+    selector: COM0
+    field: boot_quiet_remaining_s
+    value: null
+    timeout_s: 20
+  - action: op_end
+    op_id: quiet-window
+  - action: assert_zero_tx
+    op_id: quiet-window
+  - action: assert_command_resolved
+    from: q1
+    timeout_s: 10
+    payload: "echo L15_QUIET_1\n"
+  - action: assert_command_resolved
+    from: q2
+    timeout_s: 10
+    payload: "echo L15_QUIET_2\n"
+  - action: wait_ready
+    timeout_s: 20
+  - action: assert_compare

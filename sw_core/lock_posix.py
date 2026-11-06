@@ -5,11 +5,13 @@ import fcntl
 import os
 import socket
 
+from .util import endpoint_path_for_io
+
 
 class SingletonLock:
     def __init__(self, lock_path: str, socket_path: str) -> None:
-        self.lock_path = lock_path
-        self.socket_path = socket_path
+        self.lock_path = endpoint_path_for_io(lock_path)
+        self.socket_path = endpoint_path_for_io(socket_path)
         self._fd: int | None = None
 
     def acquire(self) -> None:

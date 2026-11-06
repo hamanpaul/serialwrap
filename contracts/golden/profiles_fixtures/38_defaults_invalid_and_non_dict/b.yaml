@@ -1,0 +1,8 @@
+defaults:
+  max_sessions: "abc"
+  log_dir: ""
+profiles:
+  q:
+    platform: shell
+targets:
+  - {profile: q, device_by_id: dq}

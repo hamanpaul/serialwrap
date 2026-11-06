@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "wal",
+    "export",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap wal export [-h] [--from-seq FROM_SEQ] [--to-seq TO_SEQ] [--limit LIMIT]\n\noptions:\n  -h, --help           show this help message and exit\n  --from-seq FROM_SEQ\n  --to-seq TO_SEQ\n  --limit LIMIT\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

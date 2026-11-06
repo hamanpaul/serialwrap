@@ -2,6 +2,8 @@ import pytest
 
 from sw_core.service import SerialwrapService
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path
 except ImportError:  # python3 -m unittest tests.test_x（repo root 跑法，#120）

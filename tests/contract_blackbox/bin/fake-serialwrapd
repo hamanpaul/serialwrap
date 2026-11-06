@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""P4-T7 黑箱用假 serialwrapd 行程（不接觸 UART、不提供 RPC）。
+
+以 argv[0]＝`serialwrapd` 原地 exec，使 /proc 掃描辨識為 serialwrapd 實例（sw-pal `is_serialwrapd_argv` 規則 1），
+並帶上 `--socket <path>` 供多開預檢取出 socket。行程以長眠代替常駐，由測試端結束。
+"""
+import os
+import sys
+
+if __name__ == "__main__":
+    os.execv(
+        sys.executable,
+        ["serialwrapd", "-c", "import time; time.sleep(600)", *sys.argv[1:]],
+    )

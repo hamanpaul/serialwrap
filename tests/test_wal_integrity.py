@@ -10,6 +10,9 @@ import tempfile
 import unittest
 
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _append_n(wal: WalWriter, n: int, *, com: str = "COM0") -> list[dict]:
