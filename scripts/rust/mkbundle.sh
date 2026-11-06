@@ -14,7 +14,7 @@ usage() {
   --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
                            須使用乾淨 Git 工作樹（含未追蹤檔案），否則 exit 3；--dev 允許開發中來源
   --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
-  --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
+  --target <triple>        指定 Rust target；Windows 正式 bundle 請用 scripts/rust/mkbundle-windows.ps1（OD-78，hosted windows-latest 建置）
   --profile <name>         選擇 debug 或 release，預設為 debug
   --version-override <v>   以同一編譯輸入覆寫 CLI 與 daemon bundle 版本
   --with-com0com <zip>     驗證上游簽章套件雜湊並抽取 x64 driver payload
@@ -163,7 +163,7 @@ if [[ -z "$TARGET" ]]; then
 fi
 case "$TARGET" in
   *-windows-*)
-    echo "mkbundle.sh: Windows bundle 由 P3-T17 承接，拒絕產生不完整的 dev bundle" >&2
+    echo "mkbundle.sh: Windows bundle 由 P3-T17 承接（正式 bundle 請用 scripts/rust/mkbundle-windows.ps1，OD-78），此腳本拒絕產生不完整的 dev bundle" >&2
     exit 2
     ;;
 esac

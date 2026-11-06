@@ -7,7 +7,9 @@
 - bundle runtime 必須以 ubuntu-24.04 系統 `/usr/bin/python3.12` 建立（OD-50；不得用 actions/setup-python 的
   hosted toolcache），smoke 斷言 `py/pyvenv.cfg` 的 `home = /usr/bin`，並在乾淨 ubuntu:24.04 容器
   （`--network none`、只唯讀掛載解開的 bundle）內啟動 on-demand daemon 確認可用（S1-3185c6d-1）。
-Windows bundle 由擁有者 runner 原生建置後附加（release 計畫 §2），workflow 不建。
+Windows bundle（OD-78）由 `publish-windows-bundle` job 在 hosted windows-latest 建置：`needs: publish-linux-bundle`，
+以 `scripts/rust/mkbundle-windows.ps1` 組裝、`scripts/rust/smoke-windows-bundle.ps1` 解開後 smoke，再合併 SHA256SUMS 上傳；
+並支援 workflow_dispatch 對既有 tag 補傳（其餘 job 僅 tag push 執行）。
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import tarfile
@@ -290,17 +293,234 @@ def test_linux_bundle_job_smoke_covers_required_checks():
 
 
 @pytest.mark.memory_only
-def test_workflow_does_not_build_windows_bundle_and_has_no_continue_on_error():
-    doc = _load()
-    text = RELEASE_YML.read_text(encoding="utf-8")
-    assert "windows-x86_64.zip" not in text, "Windows bundle 由擁有者 runner 建置後上傳，workflow 不建"
-    for name, job in doc["jobs"].items():
+def test_no_job_or_step_uses_continue_on_error():
+    for name, job in _load()["jobs"].items():
         assert job.get("continue-on-error") not in (True, "true"), f"job {name} 不得 continue-on-error"
         for step in job.get("steps", []):
             assert step.get("continue-on-error") not in (True, "true"), f"job {name} 步驟不得 continue-on-error"
-        if "windows" in str(job.get("runs-on", "")):
-            runs = "\n".join(step.get("run", "") for step in job.get("steps", []))
-            assert "mkbundle" not in runs, f"job {name} 不得在 workflow 內建 Windows bundle"
+
+
+# ---- Windows bundle job（OD-78） ----
+
+WIN_JOB = "publish-windows-bundle"
+WIN_ZIP = "serialwrap-${VERSION}-windows-x86_64.zip"
+
+
+def _win_job() -> dict[str, Any]:
+    jobs = _load().get("jobs", {})
+    assert WIN_JOB in jobs, f"release.yml 缺少 {WIN_JOB!r} job（OD-78）"
+    return jobs[WIN_JOB]
+
+
+def _win_steps() -> list[dict[str, Any]]:
+    return _win_job()["steps"]
+
+
+def _win_step(step_id: str) -> dict[str, Any]:
+    for step in _win_steps():
+        if step.get("id") == step_id:
+            return step
+    pytest.fail(f"{WIN_JOB} 缺少 id={step_id!r} 的步驟")
+
+
+def _win_step_index(step_id: str) -> int:
+    return [step.get("id") for step in _win_steps()].index(step_id)
+
+
+@pytest.mark.memory_only
+def test_windows_bundle_job_runs_on_hosted_windows_after_linux_bundle():
+    job = _win_job()
+    assert job.get("runs-on") == "windows-latest", "OD-78：以 GitHub hosted windows-latest 建置，不用自架 runner"
+    needs = job.get("needs")
+    needs = [needs] if isinstance(needs, str) else needs
+    assert needs == ["publish-linux-bundle"], f"必須等 Linux bundle job 完成才合併 SHA256SUMS: {needs}"
+    assert job.get("timeout-minutes"), "必須設定 timeout-minutes"
+    assert job["env"]["RUSTUP_TOOLCHAIN"] == "1.96.1-x86_64-pc-windows-gnu", "必須釘 gnu host toolchain（與 rust.yml 相同）"
+    condition = str(job.get("if", ""))
+    assert "workflow_dispatch" in condition and "publish-linux-bundle.result == 'success'" in condition
+    assert "!cancelled()" in condition, "Linux job 被略過（workflow_dispatch）時仍須能執行"
+    uses = [step.get("uses", "") for step in _win_steps()]
+    assert sum(u.startswith("actions/checkout@") for u in uses) == 2, "需要建置腳本與（補傳時）tag 原始碼兩次 checkout"
+
+
+@pytest.mark.memory_only
+def test_workflow_dispatch_backfills_existing_tag_without_republishing_other_artifacts():
+    doc = _load()
+    on = doc.get("on") if "on" in doc else doc.get(True)
+    dispatch = on.get("workflow_dispatch")
+    assert isinstance(dispatch, dict), "OD-78：必須支援 workflow_dispatch 對既有 tag 補傳"
+    tag_input = dispatch["inputs"]["tag"]
+    assert tag_input["required"] is True and tag_input["type"] == "string"
+    for name in ("project-policy", "publish", "publish-windows-exe", JOB):
+        condition = str(doc["jobs"][name].get("if", ""))
+        assert "github.event_name == 'push'" in condition, f"{name} 只能由 tag push 執行，補傳不得重發 wheel／exe／Linux bundle"
+    env = _win_job()["env"]
+    assert "workflow_dispatch" in env["TAG_NAME"] and "inputs.tag" in env["TAG_NAME"]
+    assert "release-src" in env["SOURCE_DIR"]
+    source_checkout = [s for s in _win_steps() if s.get("with", {}).get("path") == "release-src"]
+    assert len(source_checkout) == 1
+    assert source_checkout[0]["if"] == "${{ github.event_name == 'workflow_dispatch' }}"
+    assert source_checkout[0]["with"]["ref"] == "refs/tags/${{ inputs.tag }}"
+
+
+@pytest.mark.memory_only
+def test_windows_bundle_job_step_order_and_build_commands():
+    order = ["verify-version", "mkbundle", "smoke", "upload"]
+    indexes = [_win_step_index(step_id) for step_id in order]
+    assert indexes == sorted(indexes), f"{WIN_JOB} 步驟順序必須為 {order}: {indexes}"
+    steps = _win_steps()
+    assert steps[0]["run"].strip() == "git config --global core.autocrlf false", "checkout 之前須關閉 autocrlf（位元組須與 Linux 一致）"
+    mkbundle = _win_step("mkbundle")["run"]
+    assert "mkbundle-windows.ps1" in mkbundle and "-ZipPath" in mkbundle
+    assert "windows-x86_64" in mkbundle
+    assert "check_win_imports.py" in mkbundle and "serialwrapd.exe" in mkbundle
+    for forbidden in ("-Prebuilt", "-AllowDirty", "test-fakes", "com0com", "signtool", "Authenticode", "win-blackbox", "New-WindowsDevBundle"):
+        assert forbidden not in mkbundle, f"正式 Windows bundle 不得使用 {forbidden}"
+    assert "VERSION=" in _win_step("verify-version")["run"]
+    smoke = _win_step("smoke")["run"]
+    assert "smoke-windows-bundle.ps1" in smoke and "-Zip" in smoke
+    setup_python = [s for s in steps if str(s.get("uses", "")).startswith("actions/setup-python@")]
+    assert len(setup_python) == 1 and setup_python[0]["with"]["python-version"] == "3.12.3"
+
+
+@pytest.mark.memory_only
+def test_windows_bundle_job_uploads_zip_with_merged_sha256sums():
+    upload = _win_step("upload")
+    assert upload.get("shell") == "bash"
+    assert upload.get("env", {}).get("GH_TOKEN") == "${{ secrets.GITHUB_TOKEN }}"
+    run = upload["run"]
+    for needle in (
+        "gh release download",
+        "--pattern SHA256SUMS",
+        "linux-x86_64.tar.gz",
+        'sed -i "/  ${zip_name}$/d"',
+        '"dist/${zip_name}" merge/SHA256SUMS --clobber',
+        "sha256sum -c --ignore-missing SHA256SUMS",
+    ):
+        assert needle in run, f"upload 步驟缺少 {needle!r}"
+    assert "windows-x86_64.zip" in run
+
+
+@pytest.mark.memory_only
+def test_windows_bundle_scripts_enforce_release_invariants():
+    build = (REPO_ROOT / "scripts/rust/mkbundle-windows.ps1").read_text(encoding="utf-8-sig")
+    helper = (REPO_ROOT / "scripts/rust/mkbundle_windows.py").read_text(encoding="utf-8")
+    smoke = (REPO_ROOT / "scripts/rust/smoke-windows-bundle.ps1").read_text(encoding="utf-8-sig")
+    requirements = (REPO_ROOT / "scripts/rust/win-bundle-requirements.txt").read_text(encoding="utf-8")
+    for needle in (
+        "win-python-3.12.3.sha256",
+        "--require-hashes",
+        "win-bundle-requirements.txt",
+        "embedded_code_fingerprint.bin",
+        "SWFP1:000000000000",  # 蓋章後還原占位
+        "'sw_core'",
+        "Lib\\site-packages",
+        "core.autocrlf",
+    ):
+        assert needle in build, f"mkbundle-windows.ps1 缺少 {needle!r}"
+    code = "\n".join(
+        line for line in re.sub(r"<#.*?#>", "", build, flags=re.S).splitlines() if not line.lstrip().startswith("#")
+    )
+    for forbidden in ("win-blackbox", "New-WindowsDevBundle", "test-fakes", "--features", "com0com"):
+        assert forbidden not in code, f"mkbundle-windows.ps1 的程式碼不得使用 {forbidden}（註解除外）"
+    assert '"py/python.exe"' in helper and "bin/serialwrapd.exe" in helper
+    assert "x86_64-pc-windows-gnu" in helper
+    for needle in ("--version", "--help", "validate", "isolation", "setup --on-demand", "daemon start", "daemon stop", "COM999", "doctor"):
+        assert needle in smoke, f"smoke-windows-bundle.ps1 缺少 {needle!r}"
+    assert "pyyaml==6.0.3" in requirements and "pyserial==" in requirements
+    assert requirements.count("--hash=sha256:") == 2
+
+
+def _fake_gh(bin_dir: Path, release_dir: Path, log: Path) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "gh"
+    script.write_text(
+        "#!/bin/bash\n"
+        f'echo "$@" >> "{log}"\n'
+        'sub="$1 $2"; shift 2; tag="$1"; shift\n'
+        'patterns=(); dest=.\n'
+        'files=()\n'
+        'while [ $# -gt 0 ]; do case "$1" in\n'
+        '  --pattern) patterns+=("$2"); shift 2;;\n'
+        '  --dir) dest="$2"; shift 2;;\n'
+        '  --clobber) shift;;\n'
+        '  *) files+=("$1"); shift;; esac; done\n'
+        'mkdir -p "$dest"\n'
+        f'rel="{release_dir}"\n'
+        'if [ "$sub" = "release download" ]; then\n'
+        '  for pat in "${patterns[@]}"; do for f in "$rel"/$pat; do [ -e "$f" ] && cp "$f" "$dest/"; done; done\n'
+        'elif [ "$sub" = "release upload" ]; then\n'
+        '  for f in "${files[@]}"; do cp "$f" "$rel/"; done\n'
+        'else exit 9; fi\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+
+def _run_upload_step(tmp_path: Path, *, linux_row: bool, stale_windows_row: bool) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    version = FAKE_VERSION
+    tag = f"v{version}"
+    release = tmp_path / "release"
+    release.mkdir()
+    work = tmp_path / "work"
+    (work / "dist").mkdir(parents=True)
+    linux_name = f"serialwrap-{version}-linux-x86_64.tar.gz"
+    zip_name = f"serialwrap-{version}-windows-x86_64.zip"
+    linux_bytes = b"linux-bundle"
+    (release / linux_name).write_bytes(linux_bytes)
+    rows = []
+    if linux_row:
+        rows.append(f"{hashlib.sha256(linux_bytes).hexdigest()}  {linux_name}\n")
+    rows.append(f"{'0' * 64}  serialwrap-{version}-py3-none-any.whl\n")
+    if stale_windows_row:
+        rows.append(f"{'f' * 64}  {zip_name}\n")
+    (release / "SHA256SUMS").write_text("".join(rows), encoding="utf-8")
+    zip_bytes = b"windows-bundle-bytes"
+    (work / "dist" / zip_name).write_bytes(zip_bytes)
+    log = tmp_path / "gh.log"
+    _fake_gh(tmp_path / "fakebin", release, log)
+    script = _win_step("upload")["run"]
+    res = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=work,
+        env={
+            "PATH": f"{tmp_path / 'fakebin'}:{os.environ['PATH']}",
+            "VERSION": version,
+            "TAG_NAME": tag,
+            "GH_TOKEN": "x",
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return res, release, log
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("stale", [False, True], ids=["first-upload", "re-upload-replaces-stale-row"])
+def test_windows_upload_step_merges_sha256sums_and_keeps_linux_row(tmp_path, stale):
+    res, release, log = _run_upload_step(tmp_path, linux_row=True, stale_windows_row=stale)
+    assert res.returncode == 0, res.stdout + res.stderr
+    zip_name = f"serialwrap-{FAKE_VERSION}-windows-x86_64.zip"
+    linux_name = f"serialwrap-{FAKE_VERSION}-linux-x86_64.tar.gz"
+    sums = (release / "SHA256SUMS").read_text(encoding="utf-8")
+    assert "\r" not in sums
+    lines = sums.splitlines()
+    assert sum(line.endswith(f"  {zip_name}") for line in lines) == 1, "舊的 Windows 列必須被取代而非重複"
+    assert f"{hashlib.sha256(b'windows-bundle-bytes').hexdigest()}  {zip_name}" in lines
+    assert f"{hashlib.sha256(b'linux-bundle').hexdigest()}  {linux_name}" in lines, "Linux 列必須保留"
+    assert any(line.endswith("-py3-none-any.whl") for line in lines), "其他既有列不得遺失"
+    assert (release / zip_name).read_bytes() == b"windows-bundle-bytes"
+    assert "--clobber" in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.process_rpc
+def test_windows_upload_step_refuses_when_linux_row_missing(tmp_path):
+    res, release, log = _run_upload_step(tmp_path, linux_row=False, stale_windows_row=False)
+    assert res.returncode != 0
+    assert "::error::" in res.stdout + res.stderr
+    assert not (release / f"serialwrap-{FAKE_VERSION}-windows-x86_64.zip").exists(), "缺 Linux 列時不得上傳"
+    assert "release upload" not in log.read_text(encoding="utf-8")
 
 
 # ---- 步驟腳本行為（bash 實際執行） ----
