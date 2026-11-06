@@ -1,3 +1,8 @@
+---
+type: feat
+scope: rust-core
+---
+
 ### Fixed
 
 - DF-15：事件引擎取用該 RX chunk 的精確 WAL seq（reader 於 WAL append 後依序呼叫 RX observer，observer 例外不影響 reader）。

@@ -1,3 +1,8 @@
+---
+type: feat
+scope: rust-core
+---
+
 ### Added
 
 - Rust 重構 P7 Task 13：事件規則註冊表（`RuleRegistry`）、fire counter（`CounterStore`，write-through 快取）與 `events.ndjson`（`EventLogger`，10 MiB×3 輪替、`tail` 過濾與切片語意）的 Rust 承接；`DaemonDirs.events_log_path`（`SERIALWRAP_EVENTS_LOG_PATH`）。
