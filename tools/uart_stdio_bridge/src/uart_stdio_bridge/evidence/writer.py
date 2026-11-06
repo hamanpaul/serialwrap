@@ -44,8 +44,9 @@ class _ProgressWait:
     generation: int
 
 
-# close/flush 的停滯期限可以被持續進度重設，但單次操作最多等待五分鐘。
+# close/flush 等待 worker 時，停滯期限可以被持續進度重設，但這段等待最多五分鐘。
 # 這讓大證據佇列有機會排空，同時避免持續產生工作或異常排程造成無界等待。
+# close 收尾的 fsync 與 os.close 無法設逾時，不在這個上限內。
 _ABSOLUTE_WAIT_CAP_S = 300.0
 
 
@@ -418,11 +419,11 @@ class EvidenceWriter:
             except Exception as exc:
                 code = self._classify_error(exc)
                 with self._lock:
-                        self._set_failure_locked(
-                            code,
-                            worker_failed=True,
-                            detail="write_error",
-                        )
+                    self._set_failure_locked(
+                        code,
+                        worker_failed=True,
+                        detail="write_error",
+                    )
                 self._best_effort_failure_marker(
                     port_id=item.port_id,
                     endpoint_generation=item.endpoint_generation,
