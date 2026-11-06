@@ -15,8 +15,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,8 +33,12 @@ RELEASE_YML = REPO_ROOT / ".github" / "workflows" / "release.yml"
 JOB = "publish-linux-bundle"
 BUNDLE_NAME = "serialwrap-${VERSION}-linux-x86_64"
 TARBALL = f"dist/{BUNDLE_NAME}.tar.gz"
-# 只在 `sw-cli/test-fakes` 編入的故障注入鉤子字串（crates/sw-cli/src/rollback.rs）；正式候選二進位不得含有。
-TEST_FAKE_MARKERS = ("SW_TEST_UPDATE_PAUSE_AFTER", "SW_TEST_UPDATE_FORCE_VERIFY_FAIL")
+# 測試鉤子字串；正式候選二進位不得含有。
+TEST_FAKE_MARKERS = (
+    "SERIALWRAP_TEST_",
+    "SW_TEST_UPDATE_PAUSE_AFTER",
+    "SW_TEST_UPDATE_FORCE_VERIFY_FAIL",
+)
 
 
 def _load() -> dict[str, Any]:
@@ -192,6 +198,20 @@ def _joined_command(script: str, start: str) -> str:
     return matches[0]
 
 
+def _cargo_target_dir(env: dict[str, str]) -> Path:
+    """依 cargo 執行環境解析 target 根目錄；相對路徑以 repo 根目錄為基準。"""
+    configured = Path(env.get("CARGO_TARGET_DIR") or "target")
+    return configured if configured.is_absolute() else REPO_ROOT / configured
+
+
+@pytest.mark.memory_only
+def test_cargo_target_dir_honors_relative_and_absolute_overrides():
+    relative = "target/release-workflow-custom"
+    absolute = REPO_ROOT / relative
+    assert _cargo_target_dir({"CARGO_TARGET_DIR": relative}) == absolute
+    assert _cargo_target_dir({"CARGO_TARGET_DIR": str(absolute)}) == absolute
+
+
 @pytest.mark.memory_only
 def test_linux_bundle_job_step_order():
     order = ["verify-version", "cargo-build", "mkbundle", "package", "smoke", "upload"]
@@ -207,6 +227,46 @@ def test_linux_bundle_job_build_commands():
     assert "--version-override" not in mkbundle, "正式 bundle 不得以 --version-override 改版號（release 計畫 §2）"
     assert "--dev" not in mkbundle and "test-fakes" not in mkbundle
     assert BUNDLE_NAME in mkbundle
+
+
+@pytest.mark.process_rpc
+def test_release_profile_binary_excludes_test_hooks():
+    """正式 release binary 不得包含委派覆寫或故障注入環境變數。"""
+    target_root = REPO_ROOT / "target"
+    target_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="release-workflow-", dir=target_root) as target_dir:
+        build_env = os.environ.copy()
+        build_env["CARGO_TARGET_DIR"] = target_dir
+        build = subprocess.run(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "-p",
+                "sw-cli",
+            ],
+            cwd=REPO_ROOT,
+            env=build_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert build.returncode == 0, f"release profile 建置失敗：{build.stderr}"
+
+        binary = _cargo_target_dir(build_env) / "x86_64-unknown-linux-gnu" / "release" / "serialwrap"
+        assert binary.is_file(), f"release binary 不存在：{binary}"
+        result = subprocess.run(
+            ["strings", str(binary)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"strings 無法讀取 release binary：{result.stderr}"
+        assert "SERIALWRAP_TEST_" not in result.stdout
+        for marker in TEST_FAKE_MARKERS[1:]:
+            assert marker not in result.stdout, f"release binary 含測試鉤子 {marker}"
 
 
 @pytest.mark.memory_only
@@ -437,6 +497,67 @@ def test_package_and_smoke_pass_on_well_formed_bundle(tmp_path):
         assert not any(name.endswith(".mkbundle-owner") for name in names), "owner marker 不得進入發佈 tarball"
         link = archive.getmember(f"{prefix}/bin/serialwrap")
         assert link.issym() and link.linkname == f"../versions/{FAKE_VERSION}/bin/serialwrap"
+
+
+def _cli_version_output(output: str) -> Callable[[Path], None]:
+    """只替換假 CLI 的版本輸出，並更新內層雜湊以隔離版本判定。"""
+    def mutate(vdir: Path) -> None:
+        cli = vdir / "bin" / "serialwrap"
+        cli.write_text(
+            "#!/bin/sh\n"
+            f"case \"$1\" in --version) printf '%s\\n' {shlex.quote(output)};; "
+            '--help) echo "usage: serialwrap";; *) exit 2;; esac\n',
+            encoding="utf-8",
+        )
+        _write_inner_sums(vdir)
+
+    return mutate
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("suffix", ["", " (code 012345abcdef)"], ids=["plain", "fingerprint"])
+def test_smoke_accepts_baseline_version_line(tmp_path, suffix):
+    """A1：直接執行 workflow，兩種 Python 基線整行格式皆須成功。"""
+    _, smoke = _package_and_smoke(tmp_path, mutate=_cli_version_output(f"serialwrap {FAKE_VERSION}{suffix}"))
+    assert smoke.returncode == 0, smoke.stdout + smoke.stderr
+    assert f"smoke passed for serialwrap-{FAKE_VERSION}" in smoke.stdout
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize(
+    "output",
+    [
+        "",
+        "serialwrap 9.8.70",
+        "serialwrap 9x8x7",
+        "serialwrap 0.0.1 (code 012345abcdef)",
+        f"other {FAKE_VERSION}",
+        f" serialwrap {FAKE_VERSION}",
+        f"serialwrap {FAKE_VERSION} ",
+        f"serialwrap {FAKE_VERSION}-dev",
+        f"serialwrap {FAKE_VERSION} (code 012345abcde)",
+        f"serialwrap {FAKE_VERSION} (code 012345abcdef0)",
+        f"serialwrap {FAKE_VERSION} (code 012345ABCDEF)",
+        f"serialwrap {FAKE_VERSION} (code 012345abcdeg)",
+        f"serialwrap {FAKE_VERSION} (code 012345abcdef",
+        f"serialwrap {FAKE_VERSION} (code 012345abcdef) extra",
+        f"serialwrap {FAKE_VERSION} (code  012345abcdef)",
+        f"serialwrap {FAKE_VERSION}\nextra",
+        f"extra\nserialwrap {FAKE_VERSION} (code 012345abcdef)",
+    ],
+    ids=[
+        "empty", "version-prefix", "version-regex-metacharacters", "wrong-version", "wrong-program",
+        "leading-space", "trailing-space", "version-suffix", "short-fingerprint", "long-fingerprint",
+        "uppercase-fingerprint", "non-hex-fingerprint", "missing-parenthesis", "extra-suffix",
+        "extra-space", "extra-line-after", "extra-line-before",
+    ],
+)
+def test_smoke_rejects_non_baseline_version_line(tmp_path, output):
+    """A1：版本須整段相等；指紋與整行格式不符時必須在版本檢查失敗。"""
+    _, smoke = _package_and_smoke(tmp_path, mutate=_cli_version_output(output))
+    assert smoke.returncode != 0, smoke.stdout + smoke.stderr
+    assert "bin/serialwrap --version" in smoke.stdout + smoke.stderr
+    assert "smoke passed" not in smoke.stdout
 
 
 @pytest.mark.process_rpc

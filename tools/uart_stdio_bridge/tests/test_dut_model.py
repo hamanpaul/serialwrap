@@ -127,6 +127,7 @@ def test_model_matches_faketarget_golden(name):
     assert _replay(DutModel(cfg), g) == banner + expected
 
 
+@pytest.mark.posix_pty  # 舊版模組頂層 import pty，原生 Windows 無法載入
 def test_from_yaml_same_semantics_as_legacy():
     _src_on_path()
     from uart_stdio_bridge.dut.model import TargetConfig as NewConfig

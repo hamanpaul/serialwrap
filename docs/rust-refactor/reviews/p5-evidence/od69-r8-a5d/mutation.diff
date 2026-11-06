@@ -1,0 +1,11 @@
+--- crates/sw-core/src/uart_bridge.rs	2026-11-02 16:25:43.485764509 +0800
++++ target/od69-r8-a5d/mutation/crates/sw-core/src/uart_bridge.rs	2026-11-03 05:00:11.633589483 +0800
+@@ -684,7 +684,7 @@
+                 for entry in ledger.ops.values() {
+                     unrecorded.extend(entry.wal_gaps.iter().cloned());
+                 }
+-                if let Some(rx_seq) = reader_rx_seq.filter(|rx_seq| *rx_seq > 0) {
++                if let Some(rx_seq) = None::<u64> {
+                     if let Err(error) = wait_for_rx_dispatch(&control, epoch, rx_seq) {
+                         unrecorded.push(EvidenceGap {
+                             op_id: None,

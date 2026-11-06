@@ -1,0 +1,408 @@
+{
+  "bundle_git_revision": "407ed7e3060c4de5a039acbcab1acc30c1db112c",
+  "bundle_manifest_sha256": "92baa193c41348b60dbb433aa9df98b0d6c6f1a37f511533b6ad4b6173b1acd1",
+  "bundle_version": "0.4.0",
+  "checks": [
+    {
+      "detail": {
+        "cli_version": "serialwrap 0.3.2",
+        "daemon_version": "0.3.2",
+        "entries": {
+          "serialwrap": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrap",
+          "serialwrapd": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrapd"
+        },
+        "pipx_rc": 0,
+        "setup_rc": 0
+      },
+      "id": "old_install_0_3_2",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "aliases": [
+          "pinned",
+          "shellboard+7",
+          "upgbench"
+        ],
+        "config_files": [
+          "config.yaml",
+          "profiles/bench.yaml",
+          "profiles/brcm.env.example",
+          "profiles/default.yaml"
+        ],
+        "rcs": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "sessions": [
+          {
+            "act_no": 7,
+            "activity_classification": "offline",
+            "alias": "upgbench",
+            "attached_real_path": null,
+            "boot_quiet_remaining_s": null,
+            "bridge_generation": 0,
+            "capture": null,
+            "com": "COM7",
+            "command_capable": true,
+            "console_count": 0,
+            "detached_at": "2026-10-29T11:51:14.851584+00:00",
+            "device_by_id": "/dev/serial/by-id/usb-UPGRADE_REBOUND-if00-port0",
+            "fg_cmd_expected_duration_s": null,
+            "foreground_busy": false,
+            "idle_for_ms": null,
+            "interactive_session_id": null,
+            "last_error": "DEVICE_NOT_FOUND",
+            "last_error_detail": null,
+            "last_probe_at": null,
+            "last_ready_at": null,
+            "last_rx_age_s": null,
+            "last_rx_at": null,
+            "last_state_change_at": null,
+            "last_tx_age_s": null,
+            "last_tx_at": null,
+            "next_reprobe_at": null,
+            "outstanding_commands": 0,
+            "platform": "shell",
+            "profile": "shellboard",
+            "profile_source": "yaml-target",
+            "ready_reconfirm_failed": false,
+            "ready_reconfirm_pending": false,
+            "ready_reconfirm_remaining_s": null,
+            "recovering": false,
+            "released_at": null,
+            "released_by": null,
+            "released_reason": null,
+            "reprobe_attempts": 0,
+            "reprobe_exhausted": false,
+            "rx_bytes_last_10s": null,
+            "rx_rate_bps": null,
+            "session_id": "shellboard:COM7",
+            "state": "DETACHED",
+            "vtty": null
+          }
+        ]
+      },
+      "id": "seed_user_data",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "advisory_failed": [
+          "devices"
+        ],
+        "failed": [],
+        "ok": true,
+        "version_pairing": null
+      },
+      "id": "doctor_green_old",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "outcome": "switched"
+      },
+      "id": "upgrade_with_old_daemon_running",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "config": {
+          "added": [],
+          "files": 4,
+          "package_updated": []
+        },
+        "daemon_pid_after": 180,
+        "daemon_version_after": "0.4.0",
+        "error_code": null,
+        "instances_after": [
+          180
+        ],
+        "legacy_stop": {
+          "from_version": "0.3.2",
+          "method": "rpc_daemon_stop",
+          "relaunch_count": 0,
+          "stability_window_ms": 5000,
+          "stopped": [
+            {
+              "pid": 148,
+              "start_ticks": 243105
+            }
+          ],
+          "waited_ms": 5416
+        },
+        "old_alive_after": [],
+        "old_pids": [
+          148
+        ],
+        "op": "install",
+        "overlaps": [],
+        "refusal_reason": null,
+        "setup_rc": 0,
+        "started_by_setup": true,
+        "to_version": "0.4.0"
+      },
+      "id": "legacy_handoff_direct_setup",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "outcome": "not_needed_handoff_succeeded"
+      },
+      "id": "upgrade_after_stop",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "backup_targets": [
+          "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrap",
+          "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrapd"
+        ],
+        "cli_version": "serialwrap 0.4.0",
+        "entries": {
+          "serialwrap": "/home/swtest/.local/share/serialwrap/versions/0.4.0/bin/serialwrap",
+          "serialwrapd": "/home/swtest/.local/share/serialwrap/versions/0.4.0/bin/serialwrapd"
+        },
+        "pipx_venv_left": true
+      },
+      "id": "entries_replaced",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "added": [],
+        "files": 4,
+        "package_updated": []
+      },
+      "id": "config_preserved_upgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "argv": [
+          "/home/swtest/.local/share/serialwrap/versions/0.4.0/py/bin/python3",
+          "-I",
+          "-B",
+          "/home/swtest/.local/share/serialwrap/versions/0.4.0/py/serialwrapd.py",
+          "--profile-dir",
+          "/home/swtest/.config/serialwrap/profiles"
+        ],
+        "instances": [
+          180
+        ],
+        "multi_open": false,
+        "pid": 180,
+        "start_rc": 0,
+        "version": "0.4.0"
+      },
+      "id": "new_daemon_started",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "active": "inactive",
+        "daemon_pid": 180,
+        "dropins": [],
+        "enabled": "not-found",
+        "main_pid": "0",
+        "mode_in_config": true
+      },
+      "id": "supervision_reconciled",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "aliases_added": [],
+        "aliases_missing": [],
+        "bindings_changed": []
+      },
+      "id": "state_compatible_upgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "advisory_failed": [
+          "devices"
+        ],
+        "failed": [],
+        "ok": true,
+        "version_pairing": true
+      },
+      "id": "doctor_green_new",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "kept": [
+          "daemon_pids",
+          "entries",
+          "files"
+        ],
+        "outcome": "refused",
+        "refusal": {
+          "error_code": "INVALID_ARGS",
+          "reason": "rollback_unavailable"
+        }
+      },
+      "id": "rollback_command",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "cli_version": "serialwrap 0.3.2",
+        "daemon_version": "0.3.2",
+        "entries": {
+          "serialwrap": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrap",
+          "serialwrapd": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/serialwrapd"
+        },
+        "old_gone": true,
+        "rcs": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "removed_entries": [
+          "serialwrap",
+          "serialwrapd"
+        ]
+      },
+      "id": "downgrade_manual",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "added": [],
+        "files": 4,
+        "package_updated": []
+      },
+      "id": "config_preserved_downgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "aliases_added": [],
+        "aliases_missing": [],
+        "bindings_changed": []
+      },
+      "id": "state_compatible_downgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "advisory_failed": [
+          "devices"
+        ],
+        "failed": [],
+        "ok": true,
+        "version_pairing": null
+      },
+      "id": "doctor_green_downgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "cli_version": "serialwrap 0.4.0",
+        "daemon_version": "0.4.0",
+        "from_version": "0.4.0",
+        "op": "update",
+        "setup_rc": 0
+      },
+      "id": "reupgrade",
+      "reason": null,
+      "verdict": "PASS"
+    },
+    {
+      "detail": {
+        "instances_seen": [
+          113,
+          119,
+          122,
+          139,
+          145,
+          148,
+          180,
+          255,
+          258,
+          285
+        ],
+        "overlap_count": 0,
+        "overlaps": [],
+        "samples": 1590
+      },
+      "id": "no_two_reader",
+      "reason": null,
+      "verdict": "PASS"
+    }
+  ],
+  "evidence_layer": "L1.5-docker",
+  "finished": "2026-10-29T11:51:29Z",
+  "image": "serialwrap-upgrade:isr2-all",
+  "image_id": "sha256:7b59d66abe1c6da1a348158328099ee277959bd142593424b537e5a59d925b13",
+  "mode": "on-demand",
+  "new_version": "0.4.0",
+  "observations": [
+    {
+      "detail": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/python: can't open file '/home/swtest/.local/share/pipx/venvs/serialwrap/lib/python3.12/site-packages/serialwrapd.py': [Errno 2] No such file or directory",
+      "id": "OBS-0.3.2-ONDEMAND-START",
+      "phase": "0.3.2 start",
+      "workaround": "setsid -f ~/.local/bin/serialwrapd（pipx 入口）"
+    },
+    {
+      "detail": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/python: can't open file '/home/swtest/.local/share/pipx/venvs/serialwrap/lib/python3.12/site-packages/serialwrapd.py': [Errno 2] No such file or directory",
+      "id": "OBS-0.3.2-ONDEMAND-START",
+      "phase": "0.3.2 daemon start",
+      "workaround": "setsid -f ~/.local/bin/serialwrapd（pipx 入口）"
+    },
+    {
+      "error_code": "INVALID_ARGS",
+      "id": "OBS-UPGRADE-ROLLBACK-PIPX",
+      "message": "沒有可回滾的 Previous 版本（未記錄 previous）",
+      "phase": "rollback_command",
+      "reason": "rollback_unavailable"
+    },
+    {
+      "detail": "/home/swtest/.local/share/pipx/venvs/serialwrap/bin/python: can't open file '/home/swtest/.local/share/pipx/venvs/serialwrap/lib/python3.12/site-packages/serialwrapd.py': [Errno 2] No such file or directory",
+      "id": "OBS-0.3.2-ONDEMAND-START",
+      "phase": "0.3.2 start（降級）",
+      "workaround": "setsid -f ~/.local/bin/serialwrapd（pipx 入口）"
+    },
+    {
+      "from_version": "0.4.0",
+      "id": "OBS-UPGRADE-STALE-CURRENT",
+      "note": "手動降級後 current-release.json 仍記 0.4.0，重新升級被記為 0.4.0→0.4.0 update",
+      "op": "update",
+      "phase": "reupgrade"
+    }
+  ],
+  "old_version": "0.3.2",
+  "producer": "scripts/docker/run-upgrade.sh",
+  "scenario": "upgrade",
+  "schema": "serialwrap.upgrade-report.v1",
+  "scope": "full",
+  "started": "2026-10-29T11:50:56Z",
+  "verdict": "PASS",
+  "wheel": "serialwrap-0.3.2-py3-none-any.whl",
+  "wheel_sha256": "c1a53dccbd0101516dd17ff6572f25314de5d7b84d6cb3271a7910a0b66d2d24"
+}

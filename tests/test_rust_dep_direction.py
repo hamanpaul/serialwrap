@@ -64,7 +64,7 @@ def _make_ws(base: Path, layout: dict[str, list[tuple[str, str]]]) -> Path:
 
 
 def _dep_path(dep: str, ext_libc: Path) -> str:
-    return str(ext_libc) if dep == "libc" else f"../{dep}"
+    return ext_libc.as_posix() if dep == "libc" else f"../{dep}"
 
 
 def _run(ws: Path) -> subprocess.CompletedProcess[str]:

@@ -581,6 +581,13 @@ def _record_approved_a_skip_environment(
     return summary
 
 
+def _package_tree_sha256() -> str:
+    """在子行程算 Python 套件樹雜湊：黑箱測試行程不得 import sw_core（conftest 的洩漏哨兵）。"""
+    code = "from sw_core.release_manifest import package_tree_sha256 as f; print(f())"
+    repo_root = Path(__file__).resolve().parents[2]  # 不用 ROOT：測試會把它換成暫存目錄
+    return subprocess.check_output([sys.executable, "-c", code], cwd=repo_root, text=True).strip()
+
+
 def _lock_applicability_sha256() -> str:
     """凍結 lock 與 applicability 檔的雜湊（與設定內容無關，獨立保留於身分）。"""
     return hashlib.sha256(LOCK.read_bytes() + APPLICABILITY.read_bytes()).hexdigest()
@@ -589,14 +596,12 @@ def _lock_applicability_sha256() -> str:
 def _bundle_identity(
     cli: Path, platform: str, cases_sha: str, evidence: list[Path], *, config_digest: str,
 ) -> dict[str, Any]:
-    from sw_core.release_manifest import package_tree_sha256
-
     manifest_path = resolve_manifest(cli)
     manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
     daemon = manifest.get("components", {}).get("daemon", {})
     package = daemon.get("package", {})
     runtime = daemon.get("runtime", {})
-    daemon_tree = package.get("tree_sha256") or package_tree_sha256()
+    daemon_tree = package.get("tree_sha256") or _package_tree_sha256()
     runtime_path = Path(sys.executable).resolve()
     runtime_sha = _sha256_file(runtime_path)
     git_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -632,8 +637,6 @@ def _baseline_identity(
     cli: Path, platform: str, cases_sha: str, evidence: list[Path], *, config_digest: str,
 ) -> dict[str, Any]:
     """A 輪（Python 基線）身分：基線不是 bundle，不要求 release-manifest；git_revision 取 HEAD。"""
-    from sw_core.release_manifest import package_tree_sha256
-
     git_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     contract_revision = subprocess.check_output(
         ["git", "rev-parse", "HEAD:contracts"], cwd=ROOT, text=True
@@ -644,7 +647,7 @@ def _baseline_identity(
         "cli_implementation": "python",
         "daemon_version": (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         "daemon_git_revision": git_head,
-        "daemon_tree_sha256": package_tree_sha256(),
+        "daemon_tree_sha256": _package_tree_sha256(),
         "daemon_runtime_sha256": _sha256_file(Path(sys.executable).resolve()),
         "contract_revision": contract_revision,
         "case_list_sha256": cases_sha,
@@ -885,7 +888,7 @@ def execute(*, cli: Path, out_dir: Path, platform: str, timeout: int) -> int:
     b_result = _run(b_command, env=b_env, timeout=timeout)
     b_status_errors = _junit_required(b_junit, selected_nodes) if b_junit.is_file() else ["B 輪缺少 JUnit"]
 
-    package_tree = __import__("sw_core.release_manifest", fromlist=["package_tree_sha256"]).package_tree_sha256()
+    package_tree = _package_tree_sha256()
     from scripts.rust.ab_compare import _parse_junit
 
     parsed_a, parse_errors_a = _parse_junit(a_junit)

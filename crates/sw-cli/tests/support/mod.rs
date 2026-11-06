@@ -219,6 +219,23 @@ impl IntoSupervisionMode for &str {
     }
 }
 
+/// passwd 家目錄必須落在測試暫存區，不得是行程真實家目錄或落在其下。
+fn assert_passwd_home_sandboxed(home: &Path) {
+    for key in ["HOME", "USERPROFILE"] {
+        let Some(real) = std::env::var_os(key).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let real = PathBuf::from(real);
+        let aliases = home == real || home.starts_with(&real) || real.starts_with(home);
+        assert!(
+            !aliases,
+            "passwd 家目錄不得指向測試行程的真實家目錄：{key}={}，passwd={}",
+            real.display(),
+            home.display()
+        );
+    }
+}
+
 impl TestEnv {
     pub fn posix() -> Self {
         Self::new(false)
@@ -382,6 +399,31 @@ impl TestEnv {
     pub fn with_var(self, k: &str, v: &str) -> Self {
         let (k, v) = (k.to_string(), v.to_string());
         self.push_env_op(Box::new(move |b| b.var(&k, &v)))
+    }
+
+    /// 持有 passwd 對照夾具的獨立暫存目錄，直到呼叫端完成路徑／內容斷言。
+    /// Windows 預設 TEMP 在 USERPROFILE 下，runner 因此另給 worktree 根目錄；
+    /// HOME、state 等其他夾具仍使用原生暫存磁碟，不經 WSL UNC 的鎖或 symlink。
+    pub fn passwd_home_fixture(&self) -> tempfile::TempDir {
+        let root = std::env::var_os("SW_TEST_PASSWD_FIXTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.tmp_dir.path().to_path_buf());
+        let fixture = tempfile::Builder::new()
+            .prefix("passwd-home-")
+            .tempdir_in(root)
+            .expect("passwd 對照夾具目錄建立失敗");
+        assert_passwd_home_sandboxed(&fixture.path().join("passwd-home"));
+        fixture
+    }
+
+    /// 設定與隔離 `HOME` 不同的 passwd 家目錄，用於驗證 HOME 優先序。
+    ///
+    /// 拒絕測試行程的真實家目錄及其子路徑。`EventFs` 的寫入落到真實檔案系統；
+    /// 若家目錄解析退回 passwd，指到真實 `HOME` 會改寫該使用者的 systemd user unit。
+    pub fn with_passwd_home(self, home: &Path) -> Self {
+        assert_passwd_home_sandboxed(home);
+        let home = home.to_path_buf();
+        self.push_env_op(Box::new(move |b| b.passwd_home(&home)))
     }
 
     pub fn with_systemd(self, flag: bool) -> Self {

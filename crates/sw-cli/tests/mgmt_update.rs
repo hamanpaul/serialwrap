@@ -1853,6 +1853,213 @@ fn update_tty_still_held_posix_aborts() {
 }
 
 #[test]
+fn s1mx6b2_real_systemd_update_hold_recovers_only_owned_dropin() {
+    for with_xdg in [false, true] {
+        let base = TestEnv::posix()
+            .with_systemd(true)
+            .with_real_service()
+            .with_install_root()
+            .with_installed("0.4.0")
+            .with_current("0.4.0", None)
+            .with_bundle("0.4.1")
+            .with_config("supervision_mode: systemd-user\n")
+            .with_var("USER", "alice");
+        let xdg = base.home().with_file_name("xdg-config");
+        let base = if with_xdg {
+            base.with_var("XDG_CONFIG_HOME", xdg.to_str().unwrap())
+        } else {
+            base
+        };
+        let mut t = base
+            .with_command(
+                &["systemctl", "--user", "is-active", "serialwrap"],
+                3,
+                "inactive\n",
+                "",
+            )
+            .with_command(
+                &["systemctl", "--user", "is-enabled", "serialwrap"],
+                0,
+                "enabled\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "--value",
+                ],
+                0,
+                "on-failure\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RefuseManualStart",
+                    "-p",
+                    "UnitFileState",
+                ],
+                0,
+                "Restart=no\nRefuseManualStart=yes\nUnitFileState=disabled\n",
+                "",
+            )
+            .with_command(
+                &[
+                    "systemctl",
+                    "--user",
+                    "show",
+                    "serialwrap",
+                    "-p",
+                    "Restart",
+                    "-p",
+                    "RefuseManualStart",
+                ],
+                0,
+                "Restart=on-failure\nRefuseManualStart=no\n",
+                "",
+            )
+            .with_crash_at("stop_supervisor:after_hold");
+        let unit = t.home().join(".config/systemd/user/serialwrap.service");
+        let expected = unit
+            .parent()
+            .unwrap()
+            .join("serialwrap.service.d/90-serialwrap-update-hold.conf");
+        let xdg_hold = xdg.join("systemd/user/serialwrap.service.d/90-serialwrap-update-hold.conf");
+        let other = expected.with_file_name("10-owner.conf");
+        let unit_bytes = b"[Service]\nRestart=on-failure\n";
+        let sentinel = "# 擁有者的既有檔案，不屬於本次更新\n".as_bytes();
+        t.write_file(&unit, unit_bytes);
+        t.write_file(&other, sentinel);
+        let (rc, out, _) = t.run_from_bundle(&["setup"]);
+        assert_eq!(rc, 137, "{out}");
+        let journal = t.journal_json().expect("中斷時 journal 必須已持久化");
+        let planned = std::path::PathBuf::from(
+            journal["original"]["autostart"]["dropin_path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(planned, expected);
+        // 先從磁碟辨識真正寫入的檔案，恢復後檢查它，避免只檢查未曾存在的計畫路徑。
+        let written = if expected.exists() {
+            expected.clone()
+        } else {
+            xdg_hold.clone()
+        };
+        let dropin = std::fs::read_to_string(&written).expect("真實控制器須已寫入 drop-in");
+        assert!(dropin.contains("Restart=no\n") && dropin.contains("RefuseManualStart=yes\n"));
+        // 同名 XDG 檔在本次 hold 之後建立，用來驗證 recovery 不會刪除其他根目錄的檔案。
+        if written != xdg_hold {
+            t.write_file(&xdg_hold, sentinel);
+        }
+        t.clear_crash();
+        let recovered = t.recover().expect("殘留 journal");
+        assert!(recovered.ok, "{recovered:?}");
+        assert!(
+            !written.exists(),
+            "恢復必須移除實際建立的 drop-in：{}",
+            written.display()
+        );
+        assert_eq!(planned, written, "journal 計畫與實際 hold 必須一致");
+        assert_eq!(std::fs::read(&xdg_hold).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&other).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&unit).unwrap(), unit_bytes);
+        assert!(t.journal_json().is_none());
+        assert!(t.calls().iter().any(|call| call
+            == &vec![
+                "systemctl",
+                "--user",
+                "show",
+                "serialwrap",
+                "-p",
+                "Restart",
+                "-p",
+                "RefuseManualStart"
+            ]));
+    }
+}
+
+#[test]
+fn s1mx6_unit_snapshot_restore_ignores_xdg() {
+    for with_xdg in [false, true] {
+        let base = TestEnv::posix();
+        let passwd_fixture = base.passwd_home_fixture();
+        let passwd_home = passwd_fixture.path().join("passwd-home");
+        let xdg = base.home().with_file_name("xdg-config");
+        let base = base.with_passwd_home(&passwd_home);
+        let base = if with_xdg {
+            base.with_var("XDG_CONFIG_HOME", &xdg.to_string_lossy())
+        } else {
+            base
+        };
+        let t = base
+            .with_install_root()
+            .with_installed("0.4.0")
+            .with_current("0.4.0", None)
+            .with_bundle("0.4.1")
+            .with_systemd(true)
+            .with_var("USER", "alice")
+            .with_supervisor_state("systemd-user", true, true)
+            .with_idle_daemon_default(4242)
+            .with_new_daemon_reporting_version("0.4.1")
+            .with_rpc_after_relaunch("health.status", "{\"ok\":false}");
+        let home_unit = t.home().join(".config/systemd/user/serialwrap.service");
+        let xdg_unit = xdg.join("systemd/user/serialwrap.service");
+        let passwd_unit = passwd_home.join(".config/systemd/user/serialwrap.service");
+        let original = b"[Service]\nExecStart=/home-unit-before-update\n";
+        let xdg_bytes = b"[Service]\nExecStart=/xdg-unit-must-not-change\n";
+        let passwd_bytes = b"[Service]\nExecStart=/passwd-unit-must-not-change\n";
+        t.write_file(&home_unit, original);
+        t.write_file(&xdg_unit, xdg_bytes);
+        t.write_file(&passwd_unit, passwd_bytes);
+
+        let (rc, out, _) = t.run_from_bundle(&["setup"]);
+        assert_eq!(rc, 2, "XDG 已設定={with_xdg}：{out}");
+        let response = json(&out);
+        assert_eq!(s(&response, "reason"), "health_failed", "{out}");
+        assert!(b(&dict(&response, "update"), "reverted"), "{out}");
+        let backup = t.backup_dir_of(&response);
+        assert_eq!(
+            std::fs::read(backup.join("registered.unit")).unwrap(),
+            original,
+            "快照必須取自 HOME unit，XDG 已設定={with_xdg}"
+        );
+        assert_eq!(
+            std::fs::read(&home_unit).unwrap(),
+            original,
+            "失敗須還原 HOME unit"
+        );
+        assert_eq!(
+            std::fs::read(&xdg_unit).unwrap(),
+            xdg_bytes,
+            "XDG 同名 unit 不得變更"
+        );
+        assert_eq!(
+            std::fs::read(&passwd_unit).unwrap(),
+            passwd_bytes,
+            "passwd 同名 unit 不得變更"
+        );
+        assert_eq!(t.service().hold_state_now(), HoldState::NotHeld);
+        assert!(!t.state_dir().join("autostart-hold.json").exists());
+        assert!(!home_unit
+            .parent()
+            .unwrap()
+            .join("serialwrap.service.d/90-serialwrap-update-hold.conf")
+            .exists());
+    }
+}
+
+#[test]
 fn update_backup_contains_required_files() {
     let t = TestEnv::windows()
         .with_install_root()
@@ -2843,6 +3050,60 @@ fn revert_deferred_releases_hold() {
     assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.0");
     assert!(!journal_path.exists());
     assert_eq!(t.service().hold_state_now(), HoldState::NotHeld);
+}
+
+#[test]
+fn revert_deferred_on_demand_recovery_waits_for_new_daemon_ordered_shutdown() {
+    // S1 出口 A/B B 輪（2026-10-30）黑箱 test_revert_new_daemon_push_not_aborted_l15 的確定性對應：on-demand 更新驗證失敗，
+    // 回退因 file.push 延後（revert_pending）；push 完成後 recover_journal 對 0.4.1 daemon 交接成功，daemon 於 3 s 排空窗口後
+    // 關閉監聽，SC-11 有序關機使行程於 grant 後 12 s 才結束。舊實作 grant 起 10 s 即回 TIMEOUT／handoff_timeout 並保留 journal。
+    let t = TestEnv::posix()
+        .with_install_root()
+        .with_installed("0.4.0")
+        .with_current("0.4.0", None)
+        .with_bundle("0.4.1")
+        .with_supervisor_state("on-demand", true, true)
+        .with_config("supervision_mode: on-demand\n")
+        .with_idle_daemon_default(4242)
+        .with_new_daemon_reporting_version("0.4.0")
+        .with_new_daemon_handoff_script(&[BUSY_PUSH]);
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--on-demand"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!(j["update"]["revert_pending"], true, "{out}");
+    assert_eq!(j["update"]["revert_error"]["error_code"], "SESSION_BUSY", "{out}");
+    let journal_path = t.root().root.join("install-journal.json");
+    assert!(journal_path.exists());
+    let endpoint = t.isolated_endpoint(&t.default_socket());
+    let new_pid = 5252;
+    t.rpc().respond(&endpoint, "daemon.handoff_stop", "{\"ok\":true,\"stopping\":true,\"handoff_token\":\"0123456789abcdef0123456789abcdef\"}");
+    t.rpc().clear_stop_after_send(&endpoint, "daemon.handoff_stop");
+    let rpc = std::sync::Arc::clone(t.rpc());
+    let clock = std::sync::Arc::clone(t.clock());
+    let gate_endpoint = endpoint.clone();
+    let handoffs_before = t.rpc().request_count(&endpoint, "daemon.handoff_stop");
+    let granted_at = std::sync::Mutex::new(None);
+    let listener_closed = std::sync::atomic::AtomicBool::new(false);
+    t.procs().alive_while(new_pid, std::sync::Arc::new(move || {
+        if rpc.request_count(&gate_endpoint, "daemon.handoff_stop") == handoffs_before {
+            return !rpc.is_stopped(&gate_endpoint);
+        }
+        let now = clock.elapsed();
+        let at = *granted_at.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(now);
+        if now < at + std::time::Duration::from_secs(3) {
+            return true;
+        }
+        if !listener_closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            rpc.stop_endpoint(&gate_endpoint);
+        }
+        // 12 s 前為有序關機中的舊行程；之後只剩復原後重新拉起的實例（endpoint 復活）才算存活。
+        now < at + std::time::Duration::from_secs(12) || !rpc.is_stopped(&gate_endpoint)
+    }));
+    let recovered = t.recover().expect("deferred revert must remain recoverable");
+    assert!(recovered.ok, "{:?} {:?} {:?}", recovered.error_code, recovered.reason, recovered.message);
+    assert_eq!(recovered.restored["daemon_version"], "0.4.0");
+    assert_eq!(sw_cli::install_layout::read_current(&t.root()).unwrap().unwrap().bundle_version, "0.4.0");
+    assert!(!journal_path.exists());
 }
 
 #[test]

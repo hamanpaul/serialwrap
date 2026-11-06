@@ -3,6 +3,77 @@ use std::ffi::OsString;
 
 use sw_pal::traits::PalErrorKind;
 
+// 突變只存在於本測試執行檔：在真正呼叫 exec_or_wait 前停住，絕不建立孫行程。
+fn park_before_delegate_if_requested() {
+    if let Some(path) = std::env::var_os("SW_PAL_EXEC_PARK_BEFORE_DELEGATE") {
+        std::fs::write(path, "停在 exec_or_wait 前").expect("寫入委派前停住標記");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+// 與 Windows Ctrl 事件父測試共用判準；子行程本身仍活著不足以代表委派已發生。
+fn wait_for_delegate_ready(
+    path: &std::path::Path,
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if !text.trim().is_empty() {
+                return Ok(text.trim().to_string());
+            }
+        }
+        if let Some(st) = child.try_wait().unwrap() {
+            return Err(format!("子行程在寫出 ready 標記前已結束：{st:?}"));
+        }
+        if t0.elapsed() >= limit {
+            return Err(format!("{limit:?} 內未出現 ready 標記"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn delegate_ready_rejects_child_stopped_before_exec() {
+    let dir = tempfile::tempdir().expect("建立突變案例目錄");
+    let parked = dir.path().join("before-exec.txt");
+    let ready = dir.path().join("delegated-ready.txt");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exec_or_wait_propagates_exit_code_and_env",
+            "--nocapture",
+        ])
+        .env("SW_PAL_EXEC_CHILD", "1")
+        .env("SW_PAL_EXEC_PARK_BEFORE_DELEGATE", &parked)
+        .env("SW_PAL_CTRLC_DELEGATE_READY", &ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("啟動委派前停住的突變子行程");
+    let reached = wait_for_delegate_ready(&parked, &mut child, std::time::Duration::from_secs(10));
+    let outcome = wait_for_delegate_ready(&ready, &mut child, std::time::Duration::from_millis(200));
+    let still_running = child.try_wait().unwrap().is_none();
+    // 所有斷言前先終止並回收自己建立的子行程，失敗路徑也不得留下行程。
+    if still_running {
+        child.kill().expect("終止突變子行程");
+    }
+    child.wait().expect("回收突變子行程");
+    assert!(
+        reached.is_ok(),
+        "子行程未停在 exec_or_wait 前：{reached:?}"
+    );
+    assert!(still_running, "突變子行程應停住而未退出");
+    assert!(!ready.exists(), "委派前不得出現孫行程 ready 標記");
+    assert!(
+        outcome.as_ref().is_err_and(|reason| reason.contains("內未出現 ready 標記")),
+        "委派前停住必須由相同父測試判準拒絕：{outcome:?}"
+    );
+}
+
 #[cfg(unix)]
 fn exit_with_env_argv() -> Vec<OsString> {
     vec![
@@ -27,6 +98,7 @@ fn exit_with_env_argv() -> Vec<OsString> {
 fn exec_or_wait_propagates_exit_code_and_env() {
     if std::env::var_os("SW_PAL_EXEC_CHILD").is_some() {
         let argv = exit_with_env_argv();
+        park_before_delegate_if_requested();
         let e = sw_pal::native_client()
             .process
             .exec_or_wait(&argv, &[("SW_X".into(), "ok".into())]);
@@ -141,24 +213,6 @@ mod win_ctrl {
         wait == WAIT_TIMEOUT
     }
 
-    pub fn wait_for_file(path: &Path, child: &mut Child, limit: Duration) -> Result<String, String> {
-        let t0 = Instant::now();
-        loop {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                if !text.trim().is_empty() {
-                    return Ok(text.trim().to_string());
-                }
-            }
-            if let Some(st) = child.try_wait().unwrap() {
-                return Err(format!("子行程在寫出 ready 標記前已結束：{st:?}"));
-            }
-            if t0.elapsed() >= limit {
-                return Err(format!("{limit:?} 內未出現 ready 標記"));
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
     pub fn wait_with_timeout(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
         let t0 = Instant::now();
         loop {
@@ -214,6 +268,7 @@ fn cap_interactive_desktop__exec_or_wait_ctrl_c() {
                 .into_iter()
                 .map(OsString::from),
         );
+        park_before_delegate_if_requested();
         let e = probe.process.exec_or_wait(
             &delegated_argv,
             &[(
@@ -253,7 +308,7 @@ fn cap_interactive_desktop__exec_or_wait_ctrl_c() {
         );
         // 此標記由 exec_or_wait 真正啟動的孫行程寫出；只進入父測試子分支不足以通過。
         let marker =
-            match win_ctrl::wait_for_file(&ready, &mut child, std::time::Duration::from_secs(10)) {
+            match wait_for_delegate_ready(&ready, &mut child, std::time::Duration::from_secs(10)) {
                 Ok(marker) => marker,
                 Err(reason) => {
                     let _ = child.kill();

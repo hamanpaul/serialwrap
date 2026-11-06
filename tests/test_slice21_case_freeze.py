@@ -42,6 +42,43 @@ def _effective() -> dict:
     return _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py").load_effective_freeze(FREEZE)
 
 
+def _amendment_chain(tmp_path):
+    base_path = tmp_path / "slice_2.1.json"
+    base_path.write_bytes(FREEZE.read_bytes())
+    amendment_path = tmp_path / "slice_2.1.amendments.json"
+    amendment_path.write_bytes((FREEZE.parent / "slice_2.1.amendments.json").read_bytes())
+    entries = json.loads(amendment_path.read_text(encoding="utf-8"))[:1]
+    _write_amendments(amendment_path, entries)
+    return base_path, amendment_path, entries
+
+
+def _revision_advance_entry(base_path, entries):
+    previous = entries[-1]
+    previous_sha = hashlib.sha256(json.dumps(
+        previous, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")).hexdigest()
+    return {
+        "amendment": len(entries) + 1,
+        "base_freeze_sha256": hashlib.sha256(base_path.read_bytes()).hexdigest(),
+        "prev_amendment_sha256": previous_sha,
+        "kind": "revision_advance",
+        "date": "2026-11-06",
+        "decision": "OD-76",
+        "removed": [],
+        "cases_revision": "2026-11-03.1",
+        "cases_lock_sha256": "a" * 64,
+        "cases_yaml_sha256": "b" * 64,
+        "required_case_ids": previous["required_case_ids"],
+        "denominator": previous["denominator"],
+        "denominator_sha256": previous["denominator_sha256"],
+    }
+
+
+def _write_amendments(path, entries):
+    path.write_text(json.dumps(entries, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n",
+                    encoding="utf-8")
+
+
 def test_freeze_matches_lock():
     """分母以凍結時的 required_case_ids 為準（扣除擁有者逐名核准、記於修訂檔的延後案例），並與
     lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，後續切片只新增 slice_2.1 以外的案例）。
@@ -68,14 +105,101 @@ def test_freeze_matches_lock():
     assert fr["schema_version"] == 1 and fr["slice"] == "2.1" and fr["denominator_set"] == "slice_2.1"
     assert fr["window"] == {"start": fr["frozen_at"], "weeks": 3}
     assert fr["stage2_started_at"] == fr["frozen_at"]
-    # P6 Task 0：後續切片以 add-only 追加案例時 cases.yaml revision 會前進（YYYY-MM-DD.N，字串序即時間序）；
-    # 凍結時的 revision 不得晚於現行值。位元組指紋只在 revision 相同時比對（見下方 if）。
-    assert fr["cases_revision"] <= cases_doc["revision"]
+    assert fr["cases_revision"] == cases_doc["revision"]
     recomputed = _load("regen_lock", "tests/acceptance/regen_lock.py").compute_sets(cases_doc)["slice_2.1"]
     assert fr["required_case_ids"] == recomputed
     if fr["cases_revision"] == lock["cases_revision"]:
         assert fr["cases_lock_sha256"] == hashlib.sha256(LOCK.read_bytes()).hexdigest()
         assert fr["cases_yaml_sha256"] == hashlib.sha256(CASES.read_bytes()).hexdigest()
+
+
+def test_revision_advance_keeps_denominator_and_updates_cases_revision(tmp_path):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    base_path, amendment_path, entries = _amendment_chain(tmp_path)
+    previous = entries[-1]
+    entries.append(_revision_advance_entry(base_path, entries))
+    _write_amendments(amendment_path, entries)
+
+    effective = freeze.load_effective_freeze(base_path)
+
+    assert effective["cases_revision"] == "2026-11-03.1"
+    assert effective["required_case_ids"] == previous["required_case_ids"]
+    assert effective["denominator"] == previous["denominator"]
+    assert effective["denominator_sha256"] == previous["denominator_sha256"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("required_case_ids", []),
+    ("denominator", 47),
+    ("denominator_sha256", "c" * 64),
+])
+def test_revision_advance_rejects_denominator_change(tmp_path, field, value):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    base_path, amendment_path, entries = _amendment_chain(tmp_path)
+    advance = _revision_advance_entry(base_path, entries)
+    advance[field] = value
+    entries.append(advance)
+    _write_amendments(amendment_path, entries)
+
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)
+
+
+@pytest.mark.parametrize("decision", [None, "OD-76x"])
+def test_revision_advance_requires_valid_decision(tmp_path, decision):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    base_path, amendment_path, entries = _amendment_chain(tmp_path)
+    advance = _revision_advance_entry(base_path, entries)
+    if decision is None:
+        advance.pop("decision")
+    else:
+        advance["decision"] = decision
+    entries.append(advance)
+    _write_amendments(amendment_path, entries)
+
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)
+
+
+@pytest.mark.parametrize("revision", [None, "2026-10-28.1"])
+def test_revision_advance_requires_revision_to_advance(tmp_path, revision):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    base_path, amendment_path, entries = _amendment_chain(tmp_path)
+    advance = _revision_advance_entry(base_path, entries)
+    if revision is None:
+        advance.pop("cases_revision")
+    else:
+        advance["cases_revision"] = revision
+    entries.append(advance)
+    _write_amendments(amendment_path, entries)
+
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)
+
+
+def test_revision_advance_rejects_removed_cases(tmp_path):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    base_path, amendment_path, entries = _amendment_chain(tmp_path)
+    advance = _revision_advance_entry(base_path, entries)
+    advance["removed"] = [{"case_id": "l15-delayed-reply", "decision": "OD-76", "to_slice": "2.3"}]
+    entries.append(advance)
+    _write_amendments(amendment_path, entries)
+
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)
+
+
+@pytest.mark.parametrize("field", ["base_freeze_sha256", "prev_amendment_sha256"])
+def test_revision_advance_rejects_broken_hash_chain(tmp_path, field):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    base_path, amendment_path, entries = _amendment_chain(tmp_path)
+    advance = _revision_advance_entry(base_path, entries)
+    advance[field] = "0" * 64
+    entries.append(advance)
+    _write_amendments(amendment_path, entries)
+
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)
 
 
 def test_freeze_precedes_any_gate_run():

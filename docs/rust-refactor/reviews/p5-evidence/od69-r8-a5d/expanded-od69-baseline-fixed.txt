@@ -1,0 +1,33 @@
+   Compiling sw-core v0.3.2 ($WORKTREE/crates/sw-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.10s
+     Running tests/drain_release_e2e.rs (target/debug/deps/drain_release_e2e-9cace3de62f16a73)
+
+running 7 tests
+test drain_receipt_dependency_wait_on_release_within_od64_bound ... ok
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... ok
+test new_bridge_receipt_ignores_old_epoch_rx_progress ...
+thread 'new_bridge_receipt_ignores_old_epoch_rx_progress' (274876) panicked at crates/sw-core/tests/drain_release_e2e.rs:245:5:
+成功路徑必須完成 barrier
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test release_receipt_follows_queued_rx_capture_and_wal ...
+thread 'release_receipt_follows_queued_rx_capture_and_wal' (274888) panicked at crates/sw-core/tests/drain_release_e2e.rs:245:5:
+成功路徑必須完成 barrier
+FAILED
+test release_waits_for_receipt_and_aborts_partial_in_flight ... ok
+test shutdown_and_drain_receipt_handled_within_one_data_item_under_flood ... ok
+test shutdown_receipt_follows_queued_rx_capture_and_wal ...
+thread 'shutdown_receipt_follows_queued_rx_capture_and_wal' (275049) panicked at crates/sw-core/tests/drain_release_e2e.rs:245:5:
+成功路徑必須完成 barrier
+FAILED
+
+failures:
+
+failures:
+    new_bridge_receipt_ignores_old_epoch_rx_progress
+    release_receipt_follows_queued_rx_capture_and_wal
+    shutdown_receipt_follows_queued_rx_capture_and_wal
+
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.90s
+
+error: test failed, to rerun pass `-p sw-core --test drain_release_e2e`

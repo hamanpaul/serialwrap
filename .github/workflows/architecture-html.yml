@@ -11,7 +11,7 @@ permissions:
   contents: read
 jobs:
   native-html:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ubuntu-latest 的新版 Chrome 讓 archify 的 CDP 呼叫逾時
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

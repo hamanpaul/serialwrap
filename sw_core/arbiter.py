@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from .constants import CMD_HISTORY_MAX, CMD_PENDING_MAX
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+from .expect_reboot import expect_reboot_rejection
 from .util import now_iso
 
 CMD_WARN_BYTES = 4096
@@ -34,6 +35,7 @@ class _QueuedCommand:
     expected_duration_s: float | None = dataclasses.field(default=None, compare=False)
     completion_regex: str | None = dataclasses.field(default=None, compare=False)
     trusted_human: bool = dataclasses.field(default=False, compare=False)
+    expect_reboot: bool = dataclasses.field(default=False, compare=False)
 
 
 class CommandArbiter:
@@ -189,9 +191,16 @@ class CommandArbiter:
         admission_com: str | None = None,
         admission_exempt: bool = False,
         trusted_human: bool = False,
+        expect_reboot: bool | None = False,
     ) -> dict[str, Any]:
         if not valid_completion_regex(completion_regex):
             return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
+        rejection = expect_reboot_rejection(
+            expect_reboot, {"fg": "line", "bg": "background"}.get(mode, mode)
+        )
+        if rejection is not None:
+            return rejection
+        expect_reboot = expect_reboot is True
         cmd_len = len(command.encode("utf-8", errors="replace"))
         if cmd_len > CMD_REJECT_BYTES:
             return {
@@ -235,6 +244,7 @@ class CommandArbiter:
             "timeout_s": timeout_s,
             "expected_duration_s": expected_duration_s,
             "completion_regex": completion_regex,
+            "expect_reboot": expect_reboot,
             "priority": priority,
             "status": "accepted",
             "created_at": now,
@@ -290,9 +300,12 @@ class CommandArbiter:
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
                 trusted_human=trusted_human,
+                expect_reboot=expect_reboot,
             )
         )
         result: dict[str, Any] = {"ok": True, "cmd_id": cmd_id, "status": "accepted", "session_id": session_id}
+        if expect_reboot:
+            result["expect_reboot"] = True
         if cmd_warning is not None:
             result["warning"] = cmd_warning
         return result
@@ -399,6 +412,8 @@ class CommandArbiter:
                     options["completion_regex"] = item.completion_regex
                 if item.trusted_human:
                     options["trusted_human"] = True
+                if item.expect_reboot:
+                    options["expect_reboot"] = True
                 previous_arbiter = getattr(self._worker_context, "arbiter", None)
                 previous_cmd_id = getattr(self._worker_context, "cmd_id", None)
                 self._worker_context.arbiter = self

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -50,6 +52,28 @@ REQUIRED_CHECKS_SYSTEMD_SYSTEM: tuple[str, ...] = (
     "doctor_green_new",
     "no_two_reader",
 )
+
+# OD-50 install.sh 情境（`run-upgrade.sh --scenario install-sh`）：0.3.2 pipx 已安裝且 daemon 已停止 →
+# `install.sh --bundle <0.4.0 release 候選 tarball>`。與上列升級情境的必要集合分開判定，不改其語意；
+# 與升級情境同名者沿用同一判定（同 driver phase）。「舊 daemon 執行中直接 setup」由升級情境的
+# legacy_handoff_direct_setup（OD-48）驗證。
+REQUIRED_INSTALL_SH_CHECKS: tuple[str, ...] = (
+    "old_install_0_3_2",
+    "seed_user_data",
+    "doctor_green_old",
+    "old_daemon_stopped",
+    "install_sh_upgrade",
+    "entries_replaced",
+    "config_preserved_upgrade",
+    "new_daemon_started",
+    "supervision_reconciled",
+    "state_compatible_upgrade",
+    "doctor_green_new",
+    "no_two_reader",
+)
+
+# install.sh 偵測到舊 pipx 安裝時必須印出的提示（不得自動移除）
+PIPX_UNINSTALL_HINT = "pipx uninstall serialwrap"
 
 # 容器內沒有序列硬體（OD-15／OD-16 禁止把真實裝置帶進容器），doctor 的 devices advisory 必然為 0；其餘 advisory 須全綠。
 ALLOWED_ADVISORY_FAILURES = frozenset({"devices"})
@@ -115,6 +139,88 @@ def _read_ppid(pid_dir: Path) -> int | None:
         return int(fields[1])
     except (IndexError, ValueError):
         return None
+
+
+def _read_stat_fields(pid_dir: Path) -> list[str] | None:
+    """/proc/<pid>/stat 在 comm 之後的欄位（[0] 為 state、[19] 為啟動時間 starttime）。"""
+    try:
+        text = (pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return text[text.rfind(")") + 1:].split()
+
+
+def _start_ticks(pid_dir: Path) -> str | None:
+    fields = _read_stat_fields(pid_dir)
+    return fields[19] if fields and len(fields) > 19 else None
+
+
+def daemon_process_tree(proc_root: Path = Path("/proc")) -> dict[int, str | None]:
+    """所有 serialwrapd 行程（含 launcher 與其 python 子行程）及其子孫的 PID → 啟動時間（PID 重用以此辨識）。"""
+    try:
+        entries = [e for e in proc_root.iterdir() if e.name.isdigit()]
+    except OSError:
+        return {}
+    parents: dict[int, int | None] = {}
+    tree: set[int] = set()
+    for entry in entries:
+        pid = int(entry.name)
+        parents[pid] = _read_ppid(entry)
+        argv = _read_argv(entry)
+        if argv and is_daemon_argv(argv):
+            tree.add(pid)
+    grown = True
+    while grown:
+        grown = False
+        for pid, ppid in parents.items():
+            if pid not in tree and ppid in tree:
+                tree.add(pid)
+                grown = True
+    return {pid: _start_ticks(proc_root / str(pid)) for pid in sorted(tree)}
+
+
+def daemon_socket_paths(pids: Iterable[int], config_text: str, *, proc_root: Path = Path("/proc")) -> list[str]:
+    """daemon 綁定的 unix socket：各行程 argv 的 `--socket`，加上 config.yaml 的 `socket_path`（daemon 啟動後寫入的
+    有效 endpoint；0.3.2 pipx 入口以預設 endpoint 起時 argv 沒有 --socket）。tcp:// 等非路徑值略過。"""
+    found: set[str] = set()
+    for pid in pids:
+        argv = _read_argv(proc_root / str(pid)) or []
+        for i, arg in enumerate(argv):
+            if arg == "--socket" and i + 1 < len(argv):
+                found.add(argv[i + 1])
+            elif arg.startswith("--socket="):
+                found.add(arg.split("=", 1)[1])
+    for line in config_text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "socket_path":
+            found.add(value.split("#", 1)[0].strip().strip("'\""))
+    return sorted(path for path in found if path.startswith("/"))
+
+
+def wait_daemon_gone(before: dict[int, str | None], sockets: Iterable[str], *, timeout: float, interval: float = 0.1,
+                     proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    """`daemon stop` 之後的有界等待（Docker on-demand 預熱競態裁決）：`before`（停止前的 daemon_process_tree）中每個
+    行程都已結束（同 PID 但啟動時間不同視為已結束、zombie 已釋放資源亦然）、沒有任何 serialwrapd 實例、且 `sockets`
+    的 socket 檔都已移除，才回 gone=True。逾時回 gone=False 並列出殘留項，由呼叫端判 FAIL 並記錄。"""
+    sockets = sorted(set(sockets))
+    t0 = time.monotonic()
+    deadline = t0 + timeout
+    while True:
+        alive = []
+        for pid, ticks in sorted(before.items()):
+            fields = _read_stat_fields(proc_root / str(pid))
+            if fields and fields[0] != "Z" and (ticks is None or len(fields) <= 19 or fields[19] == ticks):
+                alive.append(pid)
+        instances = scan_daemon_instances(proc_root)
+        left = [path for path in sockets if os.path.lexists(path)]
+        gone = not alive and not instances and not left
+        if gone or time.monotonic() >= deadline:
+            detail: dict[str, Any] = {"gone": gone, "waited_ms": int((time.monotonic() - t0) * 1000),
+                                      "timeout_s": timeout, "pids": sorted(before), "sockets": sockets}
+            if not gone:
+                detail.update(alive=alive, instances=instances, sockets_left=left)
+            return detail
+        time.sleep(interval)
 
 
 def scan_daemon_instances(proc_root: Path = Path("/proc")) -> list[int]:
@@ -325,18 +431,70 @@ def judge_seed(check_id: str, *, rcs: list[int], baseline: dict[str, Any], confi
     return row(check_id, "PASS", None, **detail)
 
 
+# 與 sw_core.version.FINGERPRINT_HEX_LEN、release manifest 的 code_fingerprint 相同：12 位小寫十六進位。
+FINGERPRINT_HEX_LEN = 12
+_FINGERPRINT_RE = re.compile(rf"[0-9a-f]{{{FINGERPRINT_HEX_LEN}}}\Z")
+
+
+def cli_version_identifies(text: str | None, version: str) -> bool:
+    """``--version`` 整行是否指認 ``version``。
+
+    Python 基線 ``format_version_with_fingerprint`` 只輸出兩種整行：``serialwrap <version>``，
+    或 ``serialwrap <version> (code <12 位小寫十六進位>)``。版本號必須整段相等；指紋可缺，
+    出現時長度、字元與括號都必須與基線一致。較長版本號、多餘尾碼、大寫或過短指紋都不是該版本。
+    """
+    if not isinstance(text, str) or not isinstance(version, str) or not version:
+        return False
+    if any(ch.isspace() for ch in version) or "(" in version or ")" in version:
+        return False
+    plain = f"serialwrap {version}"
+    if text == plain:
+        return True
+    prefix = plain + " (code "
+    if not text.startswith(prefix) or not text.endswith(")") or text.count(" ") != 3:
+        return False
+    fingerprint = text[len(prefix):-1]
+    return _FINGERPRINT_RE.fullmatch(fingerprint) is not None
+
+
 def judge_rollback_success(check_id: str, *, cli_version: str | None, daemon_version: str | None,
                            cfg_before: dict[str, str], cfg_after: dict[str, str], old_version: str = "0.3.2") -> dict[str, Any]:
     """setup --rollback 成功路徑：CLI 與 daemon 都回到 old_version，且設定逐位元組保留。"""
     preserved = judge_files_preserved(check_id, cfg_before, cfg_after)
     detail = {"outcome": "rolled_back", "cli_version": cli_version, "daemon_version": daemon_version,
               "config": preserved["detail"]}
-    ok = cli_version == f"serialwrap {old_version}" and daemon_version == old_version and preserved["verdict"] == "PASS"
+    ok = (cli_version_identifies(cli_version, old_version) and daemon_version == old_version
+          and preserved["verdict"] == "PASS")
     return row(check_id, "PASS" if ok else "FAIL", None if ok else f"setup --rollback 未完整回到 {old_version}", **detail)
 
 
-def overall_verdict(rows: list[dict[str, Any]], required: tuple[str, ...] = REQUIRED_CHECKS) -> str:
-    """任一 FAIL 或檢查 id 重複 → FAIL；缺必要檢查或任一 INSUFFICIENT → INSUFFICIENT；否則 PASS。"""
+def judge_install_sh(check_id: str, *, rc: int, body: dict[str, Any] | None, output: str, pipx_venv_left: bool,
+                     leftover_tmp: list[str], new_version: str = "0.4.0") -> dict[str, Any]:
+    """install.sh 升級：rc 0、setup 回 install→new_version、印出 pipx 移除提示但未移除 pipx venv、暫存目錄已清除。"""
+    body = body if isinstance(body, dict) else {}
+    install = body.get("install") or {}
+    problems = []
+    if rc != 0:
+        problems.append("rc")
+    if body.get("ok") is not True or install.get("op") != "install" or install.get("to_version") != new_version:
+        problems.append("setup")
+    if PIPX_UNINSTALL_HINT not in output:
+        problems.append("pipx_hint")
+    if not pipx_venv_left:
+        problems.append("pipx_removed")
+    if leftover_tmp:
+        problems.append("tmp_left")
+    detail = {"rc": rc, "op": install.get("op"), "to_version": install.get("to_version"),
+              "error_code": body.get("error_code"), "pipx_venv_left": pipx_venv_left, "leftover_tmp": leftover_tmp,
+              "problems": problems}
+    if problems:
+        return row(check_id, "FAIL", "install.sh 升級未符合 OD-50：" + "、".join(problems), **detail)
+    return row(check_id, "PASS", None, **detail)
+
+
+def overall_verdict(rows: list[dict[str, Any]], required: Iterable[str] = REQUIRED_CHECKS) -> str:
+    """任一 FAIL 或檢查 id 重複 → FAIL；缺必要檢查（預設為升級情境完整集合 REQUIRED_CHECKS）或任一 INSUFFICIENT
+    → INSUFFICIENT；否則 PASS。"""
     ids = [r.get("id") for r in rows]
     if len(ids) != len(set(ids)) or any(r.get("verdict") == "FAIL" for r in rows):
         return "FAIL"

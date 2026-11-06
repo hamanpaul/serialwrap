@@ -17,6 +17,7 @@ pub mod delegate;
 pub mod endpoint_resolve;
 pub mod output;
 pub mod remote_tunnel;
+pub mod source_policy;
 // P4-T1 空殼：以下模組的實作由 Stage 1B 各 Task 承接（見 docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md）。
 pub mod doctor_cmd;
 pub mod graceful_stop;
@@ -70,6 +71,17 @@ impl HomeLookup for PlatformHome<'_> {
     fn user_home(&self, user: &str) -> Option<String> {
         self.0.user_home(user)
     }
+}
+
+/// 測試注入的委派群組。環境變數只在 `test-fakes` 建置讀取；行程內 override 讓未開 feature 的整合測試也能編譯。
+fn injected_delegate_group(ctx: &CliCtx<'_>) -> Option<String> {
+    #[cfg(feature = "test-fakes")]
+    if let Some(group) = ctx.env.get("SERIALWRAP_TEST_DELEGATE_GROUP") {
+        return Some(group.to_string());
+    }
+    #[cfg(not(feature = "test-fakes"))]
+    let _ = ctx;
+    delegate::test_group_override().map(str::to_string)
 }
 
 /// 環境快照：Windows（`PathFlavor` 為 Windows）採大小寫不敏感語意（`os.environ`）。
@@ -129,25 +141,21 @@ pub fn run(
     };
 
     let tail: &[OsString] = argv.get(1..).unwrap_or(&[]);
-    let delegate_route = if let Some(test_group) = ctx.env.get("SERIALWRAP_TEST_DELEGATE_GROUP") {
-        const CANDIDATES: [&'static str; 8] = [
-            "daemon", "service", "supervision-mode", "remote", "connect", "benches", "setup",
-            "doctor",
-        ];
-        if let Some(&matched) = CANDIDATES.iter().find(|g| **g == test_group) {
-            delegate::classify_with_groups(tail, &[matched])
-        } else {
-            delegate::classify(tail)
-        }
-    } else {
-        delegate::classify(tail)
-    };
+    // 環境變數鉤子只在 test-fakes 建置讀取。凍結 selector 的整合測試改走行程內 override，
+    // 正式 release binary 兩者皆不作用，且不含 SERIALWRAP_TEST_ 字串。
+    let injected = injected_delegate_group(&ctx);
+    let delegate_route = delegate::classify_with_test_group(tail, injected.as_deref());
     if let delegate::Route::Delegate { group } = delegate_route {
         return delegate::run_delegate(&mut ctx, tail, group);
     }
 
+    let version_line = install_layout::code_fingerprint(&ctx)
+        .ok()
+        .flatten()
+        .map(|fingerprint| format!("serialwrap {CLI_VERSION} (code {fingerprint})"))
+        .unwrap_or_else(|| format!("serialwrap {CLI_VERSION}"));
     let spec = root_spec(&SpecDefaults {
-        version_line: format!("serialwrap {CLI_VERSION}"),
+        version_line,
         profile_dir: ctx.paths.profile_dir.clone(),
         lock_path: ctx.paths.lock_path.clone(),
     });

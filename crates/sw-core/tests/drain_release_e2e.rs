@@ -88,6 +88,28 @@ fn release_cli() -> SessionRequest {
 /// OD-69：reader 已送入的同 epoch RX 必須先完成 actor capture，再處理 WorkerStopped receipt。
 #[test]
 fn release_receipt_follows_queued_rx_capture_and_wal() {
+    for round in 0..L1_GATE_REPEATS {
+        queued_rx_receipt_round(false, false, round);
+    }
+}
+
+/// OD-69：shutdown 與 release 使用相同成功條件，不能以另一條路徑的綠燈代替。
+#[test]
+fn shutdown_receipt_follows_queued_rx_capture_and_wal() {
+    for round in 0..L1_GATE_REPEATS {
+        queued_rx_receipt_round(true, false, round);
+    }
+}
+
+/// OD-69：重掛後的 reader 從新序號開始，舊 epoch 的大序號不得提前放行新 bridge 的 barrier。
+#[test]
+fn new_bridge_receipt_ignores_old_epoch_rx_progress() {
+    for round in 0..L1_GATE_REPEATS {
+        queued_rx_receipt_round(false, true, round);
+    }
+}
+
+fn queued_rx_receipt_round(shutdown: bool, reattach: bool, round: usize) {
     let tmp = tempfile::tempdir().unwrap();
     let log_dir = tmp.path().join("logs");
     let yaml = format!(
@@ -95,6 +117,27 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
         log_dir.display()
     );
     let h = ActorRig::new(&yaml).ready();
+    let mut old_epoch = None;
+    if reattach {
+        old_epoch = Some(h.rx.watermark().0);
+        assert_eq!(h.request(release_cli()).get("ok"), Some(&PyValue::Bool(true)));
+        h.wait_state("RELEASED");
+        rearm_login_reply(&h);
+        assert_eq!(h.request(SessionRequest::DeviceAttach { force: false }).get("ok"), Some(&PyValue::Bool(true)));
+        h.wait_state("READY");
+        assert!(h.rx.watermark().0 > old_epoch.unwrap(), "重掛必須建立新 epoch");
+    }
+    // release 同時驗 background capture；shutdown 的 actor 會退出，agent log 則可在 receipt 前直接觀測。
+    let background = if shutdown {
+        None
+    } else {
+        h.dev.on_tx_reply(b"bgcmd\n", b"bgcmd\r\nroot@t:/# ");
+        let id = h.submit_with("bgcmd", |req| req.mode = "bg".into());
+        h.wait_done(&id);
+        let tail = h.request(SessionRequest::ResultTail { cmd_id: id.clone(), from_chunk: 0, limit: 200 });
+        assert_eq!(tail["status"], PyValue::from("active"));
+        Some(id)
+    };
     let capture = h.request(SessionRequest::LogStart);
     let log_path = capture["log_path"].as_str().unwrap().to_string();
     let initial_rx_rows = h
@@ -107,24 +150,47 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
 
     let drain_pause = h.pause_next_begin_drain();
     let receipt_pause = h.pause_before_event("WorkerStopped");
-    let release = h.request_async(release_cli());
+    let release = if shutdown {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        h.send_control(ControlEvent::Shutdown { reply });
+        response
+    } else {
+        h.request_async(release_cli())
+    };
     drain_pause
         .before_entered
         .recv_timeout(Duration::from_secs(5))
         .expect("release 應進入 BeginDrain");
+    // 現有探針將 DrainDataBarrier 標為 Control；此時沒有尚待完成的 login／command。
+    let controls_before = h.actor_probe().entries("Control").len();
 
     let idle_deadline = Instant::now() + Duration::from_secs(5);
     while h.data_backlog() != 0 {
         assert!(Instant::now() < idle_deadline, "push RX 前 data lane 應先排空");
         std::thread::sleep(Duration::from_millis(1));
     }
-    h.dev.push_rx(b"OD69-RX\n");
+    if let Some(old_epoch) = old_epoch {
+        h.data_sender().send(DataEvent::UartRxChunk {
+            epoch: old_epoch,
+            rx_seq: u64::MAX,
+            wal_seq: 0,
+            bytes: b"OD69-STALE\n".to_vec(),
+        }).expect("舊 epoch RX 應可入列");
+    }
+    let markers = (0..8).map(|index| format!("OD69-RX-{round}-{index}\n")).collect::<String>();
+    h.dev.push_rx(markers.as_bytes());
     let deadline = Instant::now() + Duration::from_secs(5);
     while h.rx.watermark().1 <= initial_rx_seq || h.data_backlog() == 0 {
         assert!(Instant::now() < deadline, "reader 應把 RX 排入 data lane");
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(h.data_backlog(), 1, "指定 RX 必須是 data lane 唯一既有事件");
+    let stale_count = usize::from(old_epoch.is_some());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.data_backlog() < 1 + stale_count {
+        assert!(Instant::now() < deadline, "指定 RX 必須完成入列");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(h.data_backlog(), 1 + stale_count, "指定 RX 與舊 epoch 事件必須全在 lane 中");
     assert!(
         h.wal_rows()
             .iter()
@@ -148,7 +214,7 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
     }
     assert_eq!(
         h.data_backlog(),
-        129,
+        129 + stale_count,
         "實際 RX 與測試 backlog 須全在 lane 中"
     );
 
@@ -177,6 +243,7 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
         .last()
         .cloned()
         .expect("應記錄 WorkerStopped 探針");
+    assert_eq!(entry.pre_dependency_data, 0, "無依賴等待時 N_pre 必須為 0：{entry:?}");
     assert!(
         entry.data_backlog <= 128,
         "reader watermark dispatch 必須先於 receipt；後續 test data 可留在 lane: {entry:?}"
@@ -187,9 +254,11 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
     );
     let captured = std::fs::read_to_string(&log_path).expect("capture 檔應存在");
     assert!(
-        captured.contains("OD69-RX"),
+        captured.contains(&markers),
         "receipt 處理前 RX 應已進 capture: {captured:?}"
     );
+    assert!(!captured.contains("OD69-STALE"), "舊 epoch RX 不得寫入新 capture");
+    assert_eq!(h.actor_probe().entries("Control").len(), controls_before + 1, "成功路徑必須先完成 barrier");
     assert!(
         h.wal_rows()
             .iter()
@@ -198,6 +267,11 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
             > initial_rx_rows,
         "receipt 處理前 RX 應已在 WAL"
     );
+    let expected_payload = sw_proto::pycompat::b2a_base64(markers.as_bytes());
+    assert!(h.wal_rows().iter().any(|row| {
+        row.get("dir").and_then(PyValue::as_str) == Some("RX")
+            && row.get("payload_b64").and_then(PyValue::as_str) == Some(expected_payload.as_str())
+    }), "receipt 前 WAL 必須含全部指定標記");
 
     receipt_pause.resume.send(()).expect("放行 WorkerStopped");
     let response = release
@@ -205,6 +279,16 @@ fn release_receipt_follows_queued_rx_capture_and_wal() {
         .expect("release 應完成")
         .expect("release 成功");
     assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)));
+    if let Some(id) = background {
+        let tail = h.request(SessionRequest::ResultTail { cmd_id: id, from_chunk: 0, limit: 200 });
+        assert_eq!(tail["status"], PyValue::from("done"));
+        let PyValue::List(chunks) = &tail["chunks"] else { panic!("background chunks 應為串列") };
+        let text = chunks.iter().filter_map(PyValue::as_str).collect::<String>();
+        assert!(text.contains(&markers), "background capture 必須保留 receipt 前全部 RX：{tail:?}");
+        assert!(!text.contains("OD69-STALE"));
+    }
+    assert!(h.stderr_lines().is_empty(), "成功輪次不得有逾時或證據缺口：{:?}", h.stderr_lines());
+    println!("OD69 round={round} shutdown={shutdown} reattach={reattach} markers=8 capture=true wal=true N_pre={} witness={} gaps=0", entry.pre_dependency_data, entry.data_while_waiting);
 }
 
 
@@ -453,14 +537,17 @@ const L1_GATE_REPEATS: usize = 20;
 /// 皆在最多再處理 1 個 data item 後被處理（各重複 `L1_GATE_REPEATS` 次）。
 #[test]
 fn release_handled_within_one_data_item_under_flood() {
-    for _ in 0..L1_GATE_REPEATS {
+    for round in 0..L1_GATE_REPEATS {
         release_flood_round();
+        println!("OD45 flood=release round={round} full=true flowing=200 bound=1");
     }
-    for _ in 0..L1_GATE_REPEATS {
+    for round in 0..L1_GATE_REPEATS {
         cancel_flood_round();
+        println!("OD45 flood=cancel round={round} full=true flowing=200 bound=1");
     }
-    for _ in 0..L1_GATE_REPEATS {
+    for round in 0..L1_GATE_REPEATS {
         lease_flood_round();
+        println!("OD45 flood=lease round={round} full=true flowing=200 bound=1");
     }
 }
 
@@ -534,8 +621,9 @@ fn lease_flood_round() {
 /// `L1_GATE_REPEATS` 次，審閱 2 C4）。
 #[test]
 fn shutdown_and_drain_receipt_handled_within_one_data_item_under_flood() {
-    for _ in 0..L1_GATE_REPEATS {
+    for round in 0..L1_GATE_REPEATS {
         shutdown_flood_round();
+        println!("OD45 flood=shutdown round={round} full=true flowing=200 bound=1");
     }
 }
 
@@ -643,6 +731,7 @@ fn drain_receipt_dependency_wait_on_release_within_od64_bound() {
             ControlEvent::Request { req: release_cli(), reply: crossbeam_channel::bounded(1).0 },
         );
         assert_dependency_receipt_within_od64_bound(&e, backlog);
+        println!("OD64 release round={round} backlog={backlog} N_pre={} witness={} op_finished_before_receipt=true", e.pre_dependency_data, e.data_while_waiting);
     }
 }
 
@@ -653,6 +742,7 @@ fn drain_receipt_dependency_wait_on_shutdown_within_od64_bound() {
         let backlog = 3 + round as u64 % 5;
         let e = receipt_entry_with_dependency_backlog(backlog, ControlEvent::Shutdown { reply: crossbeam_channel::bounded(1).0 });
         assert_dependency_receipt_within_od64_bound(&e, backlog);
+        println!("OD64 shutdown round={round} backlog={backlog} N_pre={} witness={} op_finished_before_receipt=true", e.pre_dependency_data, e.data_while_waiting);
     }
 }
 

@@ -69,7 +69,7 @@ doctor 全綠、testbed 板卡 READY、無殘留 throwaway daemon、無並行 py
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
 | F7 檔案傳輸 | #21 #32 #161 #166 | binary round-trip md5 一致、不靜默截斷；可用 base64 或 OpenSSL 搭配 md5sum，不因只缺 base64 就 SKIP；明確 `CHECKSUM_MISMATCH` 一律為 `FAIL/test/binary_roundtrip_mismatch`，不受工具探測值影響；`PULL_PARSE_FAILED`、`MOVE_FAILED`、逾時等未完成傳輸維持環境 `SKIP`；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
 | F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
-| F9 開機/U-Boot／BRCM 登入 | #69 #130 #139 #44 #14 #20 #224 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console；BRCM 重開後帶前導空白的 BDK prompt 能自動登入、切 `sh` 並回 READY；passthrough 真板 attach 零 TX、靜默 30 秒升 READY 並以 `--completion-regex` 完成（SC-35，`pt-quiet-ready`，見下節待補表） | **是（reboot；pt-quiet-ready 為 throwaway＋release）** |
+| F9 開機/U-Boot／BRCM 登入 | #69 #130 #139 #44 #14 #20 #224 #242 #243 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console；BRCM 重開後帶前導空白的 BDK prompt 能自動登入、切 `sh` 並回 READY；passthrough 真板 attach 零 TX、靜默 30 秒升 READY 並以 `--completion-regex` 完成（SC-35，`pt-quiet-ready`）；`cmd submit --expect-reboot` 的串接 reboot（`sync && reboot`）走 reboot 路徑並等 READY（`f9-expect-reboot-chained`，尚未上板實跑） | **是（reboot；`f9-expect-reboot-chained` 尚未上板實跑）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
 | F10 裝置交接（`f10_device_handoff.py`） | Stage 0 待補（`f10-release-drain-receipt`、`f10-release-aborts-inflight-command`，見下節） | release 的 ok 回條只在 handle 關閉後送出（BC-04／SC-04）；在途命令於 release 後 `COMMAND_ABORTED_IN_FLIGHT` 且 TX 不重送（BC-03） | **是（throwaway＋release）** |
 | F11 RX 洪水/傳輸層 | #153 #150 | 洪水下 probe 失敗分類為 `RX_FLOOD`（等排空、排空後自癒回 READY）、`rx_bytes_last_10s`／`last_rx_age_s`／`last_tx_age_s`／`last_error_detail` 觀測面存在且合理（真 usbip stall 需人工操作、排除自動化，heuristic 由 pytest 覆蓋） | **部分（flood case 佔用 COM0 數十秒）** |
@@ -130,6 +130,7 @@ RX 視窗修剪破壞 offset 語意（絕對偏移記帳根治）：`f2-history-
 （任一輪未 done 即 FAIL），並新增決定性重演 case `f2-rx-window-crossing-prompt`。其餘 issue
 修復後可收緊對應 oracle。
 | `f9-spontaneous-reboot-agent-gated` | 常駐防線（#162 已修，預期綠） | 原 #162 紅燈哨兵：連續重開機後延遲 banner 污染後續命令 stdout（quiet 清空判定過早）。#162 修復＝quiet 清空改綁 READY 再確認（`ready_reconfirm_pending`＋reprobe 確認 probe 消耗 askconsole banner），`_wait_quiet_cleared` 已加等 pending 歸 False；本 case 轉為常駐防線，再紅即回歸 |
+| `f9-reboot-stale-ready` | 寫成後尚未上板跑過 | #162 延伸（非同步 reboot 的 stale-READY）：單獨 `reboot` 後 prompt 立刻回來但板子 shutdown 很慢（IB8 banner 在 +17～26s），舊 shell 會應答確認 probe 的 nonce。case 於 reboot 後以 1 秒週期送 boot_id 讀取：banner 前須被 `AUTOBOOT_QUIET` 擋下，讀到 reboot 前的 boot_id 即 FAIL（`stale_ready_old_boot_id`），最終 boot_id 改變並回真 READY。|
 | （bench 事實）COM1 bcm 板 | — | busybox 映像未編入 `base64` applet——F7 逐板 fallback 的「bcm 實證 #157」客觀上不可行（`target_tool_missing` 為真實板端限制，非探測 bug；`md5sum` 存在）|
 
 

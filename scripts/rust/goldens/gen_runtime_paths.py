@@ -23,27 +23,31 @@ from _tsv import Row, write_tsv
 ROOT = Path(__file__).resolve().parents[3]
 
 POSIX_PROBE = """
-import sys, os, json
+import sys, os, posixpath, json
+import unittest.mock
 sys.path.insert(0, sys.argv[1])
-try:
-    import sw_core.constants as c
-    obj = {
-        "config_dir": c.CONFIG_DIR,
-        "config_yaml": os.path.join(c.CONFIG_DIR, "config.yaml"),
-        "data_dir": c.DATA_DIR,
-        "default_endpoint": c.DEFAULT_ENDPOINT,
-        "default_tcp_port": c.DEFAULT_TCP_PORT,
-        "lock_path": c.LOCK_PATH,
-        "log_dir": c.LOG_DIR,
-        "profile_dir": c.PROFILE_DIR,
-        "run_dir": c.RUN_DIR,
-        "socket_path": c.SOCKET_PATH,
-        "state_dir": c.STATE_DIR,
-        "wal_dir": c.WAL_DIR,
-    }
-    print(json.dumps(obj, sort_keys=True, separators=(",", ":")))
-except ValueError:
-    print("ERR:ValueError")
+with unittest.mock.patch("os.path", posixpath), \\
+     unittest.mock.patch("os.name", "posix"), \\
+     unittest.mock.patch("sys.platform", "linux"):
+    try:
+        import sw_core.constants as c
+        obj = {
+            "config_dir": c.CONFIG_DIR,
+            "config_yaml": os.path.join(c.CONFIG_DIR, "config.yaml"),
+            "data_dir": c.DATA_DIR,
+            "default_endpoint": c.DEFAULT_ENDPOINT,
+            "default_tcp_port": c.DEFAULT_TCP_PORT,
+            "lock_path": c.LOCK_PATH,
+            "log_dir": c.LOG_DIR,
+            "profile_dir": c.PROFILE_DIR,
+            "run_dir": c.RUN_DIR,
+            "socket_path": c.SOCKET_PATH,
+            "state_dir": c.STATE_DIR,
+            "wal_dir": c.WAL_DIR,
+        }
+        print(json.dumps(obj, sort_keys=True, separators=(",", ":")))
+    except ValueError:
+        print("ERR:ValueError")
 """
 
 WINDOWS_PROBE = """
@@ -208,6 +212,9 @@ def run_probe(matrix: list[tuple[str, dict[str, str]]], is_windows: bool) -> lis
             "USERPROFILE": "/golden/pw-home",
             "PATH": os.environ.get("PATH", ""),
         }
+        # Windows 載入 _overlapped／Winsock 需要 SystemRoot；不攜入其餘宿主路徑設定。
+        if "SystemRoot" in os.environ:
+            env["SystemRoot"] = os.environ["SystemRoot"]
         env.update(user_env)
 
         proc = subprocess.run(

@@ -48,6 +48,7 @@ pub const DOCTOR_ADVISORY_CHECKS: &[&str] = &[
     "jq_on_path",
     "minicom_on_path",
     "profile_bootloader_prompts",
+    "daemon_code_current",
 ];
 
 /// Windows advisory 集合（`DOCTOR_ADVISORY_CHECKS_WIN`，逐字對照 Python 基線）。
@@ -59,6 +60,7 @@ pub const DOCTOR_ADVISORY_CHECKS_WIN: &[&str] = &[
     "other_serialwrap_installs",
     "wal_dir",
     "profile_bootloader_prompts",
+    "daemon_code_current",
 ];
 
 /// daemon runtime 無法定位時的修復提示（python／pyyaml／pyserial 共用）。
@@ -67,6 +69,8 @@ const FIX_REINSTALL: &str = "重新安裝發佈組合（serialwrap setup）";
 const FIX_PAIRING: &str = "以同一發佈組合（bundle）重新安裝 CLI 與 daemon，使 release-manifest.json 與各檔案一致（detail 列出不符項）";
 /// 只缺 daemon（`daemon_unreachable`）時的修復提示（逐字照 Python）。
 const FIX_UNREACHABLE: &str = "serialwrap daemon start（或 service start）後重跑 doctor";
+/// `daemon_code_current` 指紋不符或舊 daemon 未回報時的提示（逐字照 Python）。
+const FIX_DAEMON_CODE_CURRENT: &str = "serialwrap service restart（或 serialwrap setup，指紋不符時會自動重啟 systemd 服務；on-demand 模式：serialwrap daemon stop 後 serialwrap daemon start）；serialwrap daemon status 的 code_path 可看 daemon 載入的是哪份安裝";
 /// 本 CLI 目前 Python 3.10 下限（`sys.version_info >= (3, 10)`）。
 const PY_MIN: (i64, i64) = (3, 10);
 /// daemon runtime 的 Python 版本查詢 argv（`-I -c`，逐字）。
@@ -306,6 +310,89 @@ fn health_status(ctx: &CliCtx, endpoint: &str) -> PyDict {
     .unwrap_or_else(|_| PyDict::new())
 }
 
+/// `daemon_code_current`（advisory）：以本機 bundle manifest 指紋比對 daemon `health.ping`。
+fn check_daemon_code_current(ctx: &mut CliCtx, state: &ManifestState) -> Check {
+    // 比照 Python `_resolve_default_endpoint_with_source`：不套用 CLI 的 --bench，並沿用
+    // config socket 失聯時的 canonical fallback 與 Windows 非 TCP endpoint 過濾。
+    let endpoint = endpoint_resolve::resolve_endpoint_info(
+        ctx,
+        &EndpointArgs {
+            endpoint: None,
+            socket: None,
+            bench: None,
+        },
+    )
+    .ok()
+    .map(|resolved| resolved.endpoint);
+    let response = endpoint.and_then(|endpoint| {
+        client::call(
+            ctx,
+            &endpoint,
+            "health.ping",
+            &PyValue::Dict(PyDict::new()),
+            HEALTH_TIMEOUT_S,
+            &PyInt::Small(0),
+        )
+        .ok()
+        .map(|outcome| outcome.resp)
+    });
+    let Some(response) = response.filter(|response| truthy(response.get("ok"))) else {
+        return Check {
+            check: "daemon_code_current",
+            ok: true,
+            detail: "daemon 未在跑或無法連線，略過".to_string(),
+            fix: Some(String::new()),
+            advisory: false,
+            extra: PyDict::new(),
+        };
+    };
+
+    let installed = match state {
+        ManifestState::Valid { manifest, .. } => manifest.code_fingerprint().map(str::to_string),
+        // 執行檔被複製離開 manifest 時，仍用編譯期印入的同一份 bundle 指紋。
+        // 開發建置沒有該指紋，維持「無法計算」。manifest 損壞不改用編譯期值。
+        ManifestState::Missing => install_layout::embedded_bundle_fingerprint(),
+        ManifestState::Invalid { .. } => None,
+    };
+    let Some(installed) = installed.filter(|fingerprint| !fingerprint.is_empty()) else {
+        return Check {
+            check: "daemon_code_current",
+            ok: true,
+            detail: "本行程無法計算程式碼指紋，略過".to_string(),
+            fix: Some(String::new()),
+            advisory: false,
+            extra: PyDict::new(),
+        };
+    };
+
+    let daemon_fingerprint = match response.get("code_fingerprint") {
+        Some(PyValue::Str(fingerprint)) => Some(fingerprint.as_str()),
+        _ => None,
+    };
+    if daemon_fingerprint == Some(installed.as_str()) {
+        return Check {
+            check: "daemon_code_current",
+            ok: true,
+            detail: format!("daemon 與目前安裝的程式碼相同（code {installed}）"),
+            fix: Some(String::new()),
+            advisory: false,
+            extra: PyDict::new(),
+        };
+    }
+
+    let shown = daemon_fingerprint
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .unwrap_or("未回報（升級前的舊版 daemon）");
+    Check {
+        check: "daemon_code_current",
+        ok: false,
+        detail: format!("daemon 載入的程式碼（code {shown}）與目前安裝的（code {installed}）不同"),
+        fix: Some(FIX_DAEMON_CODE_CURRENT.to_string()),
+        advisory: false,
+        extra: PyDict::new(),
+    }
+}
+
 /// 掃描本機 serialwrapd（依 pid 排序；掃描失敗視為無行程，與 `detect_multi_open` 的 OSError 分支一致）。
 fn daemon_instances(ctx: &CliCtx) -> Vec<sw_pal::DaemonProc> {
     let mut daemons = ctx.p.procs.serialwrapd_instances().unwrap_or_default();
@@ -366,6 +453,11 @@ fn parse_only_rejection_key(root: &PyDict) -> String {
     if matches!(state_schema, Some(value) if !matches!(value, PyValue::Str(_))) {
         return "components.daemon.state_schema".to_string();
     }
+    // 與 parse_manifest 相同順序：code_fingerprint 在 task_xml 之前，且只用自己的 dotted key。
+    let fingerprint = lookup(root, "components.daemon.code_fingerprint");
+    if fingerprint_rejected(fingerprint) {
+        return "components.daemon.code_fingerprint".to_string();
+    }
     let task_xml = lookup(root, "components.supervisor.task_xml_template_sha256");
     let task_xml_bad = match task_xml {
         None => false,
@@ -384,6 +476,20 @@ fn is_lower_sha256_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 12 位小寫十六進位；缺欄為合法（舊 manifest），型別錯誤或格式不符才拒絕。
+fn fingerprint_rejected(value: Option<&PyValue>) -> bool {
+    match value {
+        None => false,
+        Some(PyValue::Str(fingerprint)) => {
+            fingerprint.len() != 12
+                || !fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        Some(_) => true,
+    }
 }
 
 fn manifest_dir(path: &Path) -> PathBuf {
@@ -1443,6 +1549,7 @@ pub fn run_doctor(ctx: &mut CliCtx) -> Vec<Check> {
             check_other_installs(ctx),
             check_supervision_mode(ctx),
             check_daemon_endpoint(ctx),
+            check_daemon_code_current(ctx, &state),
             check_wal_dir(ctx),
             check_wal_writable(ctx),
             check_profile_bootloader_prompts(ctx),
@@ -1468,6 +1575,7 @@ pub fn run_doctor(ctx: &mut CliCtx) -> Vec<Check> {
             check_supervision_mode(ctx),
             check_single_daemon(ctx),
             check_endpoint_reachable(ctx),
+            check_daemon_code_current(ctx, &state),
             check_wal_dir(ctx),
             check_wal_writable(ctx),
             check_profile_bootloader_prompts(ctx),

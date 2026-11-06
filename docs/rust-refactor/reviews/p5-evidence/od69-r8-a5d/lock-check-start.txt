@@ -1,0 +1,2 @@
+[regen_lock] OK：鎖檔、案例屬性快照與統計檔與 cases.yaml 一致
+[regen_lock] OK：L1 必要集合鎖結構與基準比對一致

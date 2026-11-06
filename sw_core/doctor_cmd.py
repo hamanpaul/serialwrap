@@ -555,6 +555,53 @@ def _append_version_pairing(report: list[dict]) -> None:
         report.append(_check_version_pairing(manifest_path))
 
 
+def _check_daemon_code_current() -> dict:
+    """以執行中 daemon 指紋比對目前安裝程式碼；結果屬 advisory。"""
+    from sw_core.cli import _resolve_default_endpoint_with_source  # 延遲匯入避免循環
+    from sw_core.client import rpc_call
+    from sw_core.version import code_fingerprint
+
+    try:
+        endpoint, _source = _resolve_default_endpoint_with_source()
+        resp = rpc_call(endpoint, "health.ping", {}, timeout_s=0.5)
+    except Exception:  # noqa: BLE001 — doctor 診斷不得因連線失敗拋例外
+        resp = None
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return {
+            "check": "daemon_code_current",
+            "ok": True,
+            "detail": "daemon 未在跑或無法連線，略過",
+            "fix": "",
+        }
+    installed = code_fingerprint()
+    if not installed:
+        return {
+            "check": "daemon_code_current",
+            "ok": True,
+            "detail": "本行程無法計算程式碼指紋，略過",
+            "fix": "",
+        }
+    daemon_fp = resp.get("code_fingerprint")
+    if isinstance(daemon_fp, str) and daemon_fp == installed:
+        return {
+            "check": "daemon_code_current",
+            "ok": True,
+            "detail": f"daemon 與目前安裝的程式碼相同（code {installed}）",
+            "fix": "",
+        }
+    shown = daemon_fp if isinstance(daemon_fp, str) and daemon_fp else "未回報（升級前的舊版 daemon）"
+    return {
+        "check": "daemon_code_current",
+        "ok": False,
+        "detail": f"daemon 載入的程式碼（code {shown}）與目前安裝的（code {installed}）不同",
+        "fix": (
+            "serialwrap service restart（或 serialwrap setup，指紋不符時會自動重啟 systemd 服務；"
+            "on-demand 模式：serialwrap daemon stop 後 serialwrap daemon start）；"
+            "serialwrap daemon status 的 code_path 可看 daemon 載入的是哪份安裝"
+        ),
+    }
+
+
 def _profile_templates_missing_bootloader_prompts(
     asset_text: str, live_text: str
 ) -> list[str]:
@@ -638,12 +685,12 @@ def _check_profile_bootloader_prompts() -> dict:
 DOCTOR_ADVISORY_CHECKS = frozenset({
     "systemd", "wsl_systemd", "devices", "other_serialwrap_installs", "wal_dir",
     "serialwrap_minicom_on_path", "jq_on_path", "minicom_on_path",
-    "profile_bootloader_prompts",
+    "profile_bootloader_prompts", "daemon_code_current",
 })
 DOCTOR_ADVISORY_CHECKS_WIN = frozenset({
     "serialwrap_on_path", "serialwrapd_on_path", "daemon_endpoint",
     "devices", "other_serialwrap_installs", "wal_dir",
-    "profile_bootloader_prompts",
+    "profile_bootloader_prompts", "daemon_code_current",
 })
 
 
@@ -687,6 +734,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
             _check_other_serialwrap_installs(fx),
             _check_supervision_mode(home),
             _check_daemon_endpoint(),
+            _check_daemon_code_current(),
             _check_wal_dir(),
             _check_wal_writable(),
             _check_profile_bootloader_prompts(),
@@ -718,6 +766,7 @@ def run_doctor(fx=None, home=None, *, platform: str | None = None) -> list[dict]
         _check_supervision_mode(home),
         _check_single_daemon(),
         _check_endpoint_reachable(),
+        _check_daemon_code_current(),
         _check_wal_dir(),
         _check_wal_writable(),
         _check_profile_bootloader_prompts(),

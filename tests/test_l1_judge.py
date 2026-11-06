@@ -929,8 +929,31 @@ def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
             assert name.startswith(f"cap_{cap}__"), nid
             assert any(p == pkg and n == name for p, _t, n in ignored), f"{nid} 不是 ignored 測試"
         moved += len(spec["nodeids"])
-    assert moved == 22, moved          # OD-68 移除 3 Linux 列；新增 own-child PTY 回歸 1 列。
+    assert moved == 24, moved          # OD-68 移除 3 Linux 列；新增 own-child PTY 回歸 1 列；attach/spawn 哨兵 2 列。
     assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_gate:cap_")]
+
+
+@pytest.mark.memory_only
+def test_native_attach_spawn_regressions_registered_in_cap_set() -> None:
+    """attach/spawn 的 ignored PTY 回歸只能由其明確能力集合承擔。"""
+    expected = {
+        "cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_sysenv",
+        "cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_process_tunnel",
+    }
+    lock = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    sets = lock["sets"]
+    cap_set_id = "s21_gate:cap_posix_pty"
+    cap_nodeids = set(sets[cap_set_id]["linux"]["nodeids"])
+    assert expected <= cap_nodeids, sorted(expected - cap_nodeids)
+
+    misplaced = sorted(
+        f"{set_id}:{platform}:{nodeid}"
+        for set_id, platforms in sets.items()
+        for platform, spec in platforms.items()
+        if set_id != cap_set_id
+        for nodeid in expected & set(spec["nodeids"])
+    )
+    assert not misplaced, f"attach/spawn 能力案例重複登記於其他集合：{misplaced}"
 
 
 @pytest.mark.process_rpc
@@ -1268,6 +1291,92 @@ def test_l1_add_only_excludes_ignored_nodeids_od24(tmp_path: Path, platform: str
     got = json.loads(lock_path.read_text(encoding="utf-8"))["sets"]["s1b_cargo"][platform]["nodeids"]
     assert got == sorted([existing, *real_new])
     assert not set(got) & set(ignored)
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize("existing_set", [False, True], ids=["新增集合", "擴充既有集合"])
+def test_l1_add_only_registers_explicit_cap_ignored(tmp_path: Path, existing_set: bool) -> None:
+    """明確以 --ignored cap_<cap>__ 收集時，只登記該能力的 ignored 新節點。"""
+    set_id = "s21_gate:cap_posix_pty"
+    selector = {
+        "argv": ["--workspace", "--features", "test-fakes", "--", "--ignored", "cap_posix_pty__"],
+        "paths": [],
+        "markexpr": "",
+    }
+    ordinary = "cargo:sw-pal::serial_posix::ordinary_test"
+    same_cap = "cargo:sw-pal::serial_posix::cap_posix_pty__new_case"
+    other_cap = "cargo:sw-pal::service_ctl::cap_supervisor_runtime__new_case"
+    helper = "cargo:sw-pal::serial_posix::collector_helper"
+    lock_path = tmp_path / "lock.json"
+    lock = {"schema_version": 1, "sets": {}}
+    if existing_set:
+        lock["sets"][set_id] = {"linux": {"selector": selector, "nodeids": [ordinary]}}
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    selector_path = tmp_path / "selector.json"
+    selector_path.write_text(json.dumps(selector), encoding="utf-8")
+    collect = tmp_path / "collect.json"
+    ignored = [same_cap, other_cap, helper]
+    collect.write_text(json.dumps({"collected": [ordinary, *ignored], "ignored": ignored}), encoding="utf-8")
+
+    regen = [sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+             "--l1-add-only", "--set", set_id, "--platform", "linux", "--collect", str(collect)]
+    if not existing_set:
+        regen.extend(["--selector", str(selector_path)])
+    result = subprocess.run(regen, capture_output=True, text=True, cwd=REPO_ROOT)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    revised = json.loads(lock_path.read_text(encoding="utf-8"))
+    spec = revised["sets"][set_id]["linux"]
+    assert spec["nodeids"] == sorted([ordinary, same_cap])
+    assert spec["selector"] == selector
+
+
+@pytest.mark.process_rpc
+@pytest.mark.parametrize(
+    "after_separator",
+    [
+        pytest.param(["cap_posix_pty__"], id="缺少--ignored"),
+        pytest.param(["--include-ignored", "cap_posix_pty__"], id="include-ignored 不等於 ignored"),
+        pytest.param(["--skip", "cap_"], id="只有 skip cap 前綴"),
+        pytest.param(["--ignored", "cap_sys_admin__"], id="能力前綴不符"),
+        pytest.param(["--ignored", "cap_posix_pty__", "ordinary_test"], id="混入一般正向篩選"),
+    ],
+)
+def test_l1_add_only_does_not_register_ignored_for_nonexplicit_cap_selector(
+    tmp_path: Path, after_separator: list[str],
+) -> None:
+    """能力選擇不明確或混有其他正向篩選時，所有 ignored 新節點仍排除。"""
+    set_id = "s21_gate:cap_posix_pty"
+    selector = {
+        "argv": ["--workspace", "--features", "test-fakes", "--", *after_separator],
+        "paths": [],
+        "markexpr": "",
+    }
+    ordinary = "cargo:sw-pal::serial_posix::ordinary_test"
+    same_cap = "cargo:sw-pal::serial_posix::cap_posix_pty__new_case"
+    other_cap = "cargo:sw-pal::service_ctl::cap_supervisor_runtime__new_case"
+    helper = "cargo:sw-pal::serial_posix::collector_helper"
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text(json.dumps({"schema_version": 1, "sets": {}}), encoding="utf-8")
+    selector_path = tmp_path / "selector.json"
+    selector_path.write_text(json.dumps(selector), encoding="utf-8")
+    collect = tmp_path / "collect.json"
+    ignored = [same_cap, other_cap, helper]
+    collect.write_text(json.dumps({"collected": [ordinary, *ignored], "ignored": ignored}), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, "tests/acceptance/regen_lock.py", "--lock-file", str(lock_path),
+         "--l1-add-only", "--set", set_id, "--platform", "linux", "--collect", str(collect),
+         "--selector", str(selector_path)],
+        capture_output=True, text=True, cwd=REPO_ROOT,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    revised = json.loads(lock_path.read_text(encoding="utf-8"))
+    spec = revised["sets"][set_id]["linux"]
+    assert spec["nodeids"] == [ordinary]
+    assert spec["selector"] == selector
 
 
 @pytest.mark.process_rpc

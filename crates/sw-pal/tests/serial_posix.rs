@@ -8,8 +8,12 @@
 #![allow(non_snake_case)]
 
 use std::{
+    io::{BufRead, BufReader, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{self, Receiver},
     thread,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 use sw_pal::{conformance::posix_pty_pair, *};
@@ -68,19 +72,49 @@ fn cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__external_plain_open_before_daemon_is_held() {
-    let (dev, mut peer) = posix_pty_pair();
-    let child = sw_pal::conformance::spawn_plain_holder(&dev); // 子程序 open(O_RDWR|O_NOCTTY) 後 sleep；不 flock、不 TIOCEXCL
-    let before = sw_pal::conformance::tcgetattr_snapshot(&dev);
-    match sw_pal::native().serial.open_exclusive(&dev, &cfg()) {
-        Err(OpenError::Held(rep)) => {
-            assert_eq!(rep.pids, vec![child.id()]);
-            assert!(!rep.holder_unknown);
+    if let Ok(role) = std::env::var("S21_ROLE") {
+        match role.as_str() {
+            "holder" => run_external_holder_role(),
+            "opener" => run_external_opener_role(),
+            other => panic!("未知 S21_ROLE：{other}"),
         }
-        other => panic!(
-            "expected Held for plain external holder, got {}",
-            show_open(&other)
-        ),
+        return;
     }
+
+    let (dev, mut peer) = posix_pty_pair();
+    let controller_pid = std::process::id();
+    let mut holder = ReenteredTestProcess::spawn("holder", &dev.0, None, controller_pid);
+    let holder_ready = holder.wait_for_marker("S21_HOLDER_READY");
+    let (holder_pid, holder_parent_pid) = parse_pid_pair(&holder_ready, "S21_HOLDER_READY");
+    assert_eq!(
+        holder_pid,
+        holder.id(),
+        "holder READY PID 應與子程序 PID 相同"
+    );
+    assert_eq!(
+        holder_parent_pid, controller_pid,
+        "holder 應由控制程序直接啟動"
+    );
+
+    let before = sw_pal::conformance::tcgetattr_snapshot(&dev);
+    let mut opener =
+        ReenteredTestProcess::spawn("opener", &dev.0, Some(holder_pid), controller_pid);
+    let first_open = opener.wait_for_marker("S21_OPENER_HELD");
+    let (opener_pid, opener_parent_pid) = parse_pid_pair(&first_open, "S21_OPENER_HELD");
+    assert_eq!(
+        opener_pid,
+        opener.id(),
+        "回報 opener 必須是實際開埠的子程序"
+    );
+    assert_ne!(holder_pid, opener_pid, "holder 與 opener 必須是不同 PID");
+    assert_eq!(
+        holder_parent_pid, opener_parent_pid,
+        "holder 與實際呼叫 open_exclusive() 的 opener 必須是同父程序兄弟行程"
+    );
+    assert_eq!(
+        opener_parent_pid, controller_pid,
+        "opener 應由控制程序直接啟動"
+    );
     assert_eq!(
         sw_pal::conformance::tcgetattr_snapshot(&dev),
         before,
@@ -91,12 +125,478 @@ fn cap_posix_pty__external_plain_open_before_daemon_is_held() {
         Vec::<u8>::new(),
         "被拒時 UART 零 TX"
     );
-    drop(child); // kill + wait
-    // peer（PTY master）仍開啟：被拒路徑若只 close(fd) 未 TIOCNXCL，旗標殘留，此處會得 Held(EBUSY)（R0-F3）
-    let _h = sw_pal::native()
+
+    // peer（PTY master）持續開啟；同一 opener 重試可抓出未清除的 TIOCEXCL（R0-F3）。
+    holder.send_line("STOP");
+    holder.wait_for_marker("S21_HOLDER_STOPPED");
+    holder.wait_success("holder");
+    opener.send_line("RETRY");
+    opener.wait_for_marker("S21_OPENER_REOPENED");
+    opener.wait_success("opener");
+}
+
+const REENTERED_HOLDER_TEST: &str = "cap_posix_pty__external_plain_open_before_daemon_is_held";
+const ROLE_IPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct ReenteredTestProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    output: Receiver<String>,
+    output_reader: Option<JoinHandle<()>>,
+}
+
+impl ReenteredTestProcess {
+    fn spawn(role: &str, dev: &str, holder_pid: Option<u32>, controller_pid: u32) -> Self {
+        let executable = std::env::current_exe().expect("current_exe");
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--exact",
+                REENTERED_HOLDER_TEST,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("S21_ROLE", role)
+            .env("S21_DEV", dev)
+            .env("S21_CONTROLLER_PID", controller_pid.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if let Some(pid) = holder_pid {
+            command.env("S21_HOLDER_PID", pid.to_string());
+        }
+
+        let mut child = command.spawn().expect("啟動重入測試程序");
+        let stdin = child.stdin.take().expect("子程序 stdin");
+        let stdout = child.stdout.take().expect("子程序 stdout");
+        let (sender, output) = mpsc::channel();
+        let mut process = Self {
+            child,
+            stdin: Some(stdin),
+            output,
+            output_reader: None,
+        };
+        process.output_reader = Some(thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        if sender.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }));
+        process
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait_for_marker(&self, marker: &str) -> String {
+        let deadline = Instant::now() + ROLE_IPC_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "等待子程序訊息 {marker} 逾時");
+            match self.output.recv_timeout(remaining) {
+                Ok(line) if line.contains(marker) => return line,
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("等待子程序訊息 {marker} 逾時")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("子程序提前結束，未收到訊息 {marker}")
+                }
+            }
+        }
+    }
+
+    fn send_line(&mut self, message: &str) {
+        let stdin = self.stdin.as_mut().expect("子程序 stdin 尚未關閉");
+        writeln!(stdin, "{message}").expect("寫入子程序控制訊息");
+        stdin.flush().expect("flush 子程序控制訊息");
+    }
+
+    fn wait_success(&mut self, role: &str) {
+        let deadline = Instant::now() + ROLE_IPC_TIMEOUT;
+        loop {
+            match self.child.try_wait().expect("等待子程序狀態") {
+                Some(status) => {
+                    assert!(status.success(), "{role} 子程序失敗：{status}");
+                    return;
+                }
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                None => panic!("等待 {role} 子程序結束逾時"),
+            }
+        }
+    }
+}
+
+impl Drop for ReenteredTestProcess {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.output_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn parse_pid_pair(message: &str, marker: &str) -> (u32, u32) {
+    let payload = message
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("訊息缺少 {marker}：{message}"))
+        .1;
+    let mut fields = payload.split_whitespace();
+    let pid = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{marker} 缺少有效 PID：{message}"));
+    let parent_pid = fields
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{marker} 缺少有效 PPID：{message}"));
+    (pid, parent_pid)
+}
+
+fn write_role_message(message: &str) {
+    println!("{message}");
+    std::io::stdout().flush().expect("flush 子程序 IPC 訊息");
+}
+
+fn run_external_holder_role() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dev = std::env::var("S21_DEV").expect("S21_DEV");
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&dev)
+        .expect("holder plain open");
+    write_role_message(&format!(
+        "S21_HOLDER_READY {} {}",
+        std::process::id(),
+        // SAFETY: getppid 不存取指標或呼叫者管理的資源。
+        unsafe { libc::getppid() as u32 }
+    ));
+
+    let mut command = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut command)
+        .expect("讀取 holder 控制訊息");
+    assert_eq!(command.trim(), "STOP", "holder 預期 STOP 釋放握手");
+    drop(holder);
+    write_role_message("S21_HOLDER_STOPPED");
+}
+
+fn run_external_opener_role() {
+    let holder_pid = std::env::var("S21_HOLDER_PID")
+        .expect("S21_HOLDER_PID")
+        .parse::<u32>()
+        .expect("有效 S21_HOLDER_PID");
+    let controller_pid = std::env::var("S21_CONTROLLER_PID")
+        .expect("S21_CONTROLLER_PID")
+        .parse::<u32>()
+        .expect("有效 S21_CONTROLLER_PID");
+    let opener_pid = std::process::id();
+    // SAFETY: getppid 不存取指標或呼叫者管理的資源。
+    let opener_parent_pid = unsafe { libc::getppid() as u32 };
+    assert_ne!(holder_pid, opener_pid, "holder 與 opener 必須是不同 PID");
+    assert_eq!(
+        opener_parent_pid, controller_pid,
+        "opener 必須是控制程序的直接子行程"
+    );
+
+    let dev = DevicePath(std::env::var("S21_DEV").expect("S21_DEV"));
+    match sw_pal::native().serial.open_exclusive(&dev, &cfg()) {
+        Err(OpenError::Held(rep)) => {
+            assert_eq!(rep.pids, vec![holder_pid]);
+            assert!(!rep.holder_unknown);
+        }
+        other => panic!(
+            "expected Held for plain external holder, got {}",
+            show_open(&other)
+        ),
+    }
+    write_role_message(&format!("S21_OPENER_HELD {opener_pid} {opener_parent_pid}"));
+
+    let mut command = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut command)
+        .expect("讀取 opener 控制訊息");
+    assert_eq!(command.trim(), "RETRY", "opener 預期 RETRY 釋放握手");
+    let reopened = sw_pal::native()
         .serial
         .open_exclusive(&dev, &cfg())
-        .expect("holder 結束後可取得");
+        .expect("holder 結束後同一 opener 可重新取得");
+    drop(reopened);
+    write_role_message(&format!("S21_OPENER_REOPENED {opener_pid}"));
+}
+
+#[cfg(target_os = "linux")]
+struct PausedSysenvSpawn<T> {
+    call: sw_pal::conformance::SysenvSpawnPauseCall<T>,
+    child_pid: u32,
+    slave_identity: (u64, u64),
+    _held_slave: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: Send + 'static> PausedSysenvSpawn<T> {
+    fn assert_child_still_holds_slave(&self) {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::mpsc::TryRecvError;
+
+        let child_pid = self.child_pid;
+        assert!(
+            matches!(self.call.try_result(), Err(TryRecvError::Empty)),
+            "pre-exec 放行前 native().env.run() 不得完成；暫停子行程 PID={child_pid}"
+        );
+        // SAFETY: pid 是剛由 SysEnv spawn 回報且仍應停在 pre-exec 的子行程。
+        assert_eq!(
+            unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+            0,
+            "暫停子行程 PID={child_pid} 必須仍存活"
+        );
+
+        let fd_dir = format!("/proc/{child_pid}/fd");
+        let inherited_fds: Vec<String> = std::fs::read_dir(&fd_dir)
+            .unwrap_or_else(|error| panic!("讀取 {fd_dir} 失敗，子行程 PID={child_pid}: {error}"))
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let metadata = std::fs::metadata(entry.path()).ok()?;
+                (metadata.dev() == self.slave_identity.0 && metadata.ino() == self.slave_identity.1)
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        assert!(
+            !inherited_fds.is_empty(),
+            "暫停子行程 PID={child_pid} 的 /proc fd 中必須有與 PTY slave 相同 inode 的描述符"
+        );
+    }
+}
+
+/// 普通開啟 PTY slave 後，透過正式 SysEnv spawn 停在 fork→exec 窗口並確認子行程繼承相同 inode。
+#[cfg(target_os = "linux")]
+fn pause_sysenv_spawn_while_holding_slave<T, F>(dev: &DevicePath, run: F) -> PausedSysenvSpawn<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+
+    let held_slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(&dev.0)
+        .expect("以普通 open 持有 PTY slave");
+    let slave_metadata = held_slave.metadata().expect("取得 PTY slave inode");
+    // SAFETY: held_slave 仍開啟且由本函式持有，是有效 fd。
+    let fd_flags = unsafe { libc::fcntl(held_slave.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0,
+        "普通 open 的 slave fd 必須保留 CLOEXEC（flags={fd_flags}）"
+    );
+
+    let mut call = sw_pal::conformance::SysenvSpawnPauseCall::spawn(Duration::from_secs(5), run)
+        .expect("建立 sysenv spawn 暫停呼叫");
+    let child_pid = call
+        .wait_for_pre_exec(Duration::from_secs(2))
+        .expect("未收到子行程進入 pre-exec 的 PID 通知");
+    let paused = PausedSysenvSpawn {
+        call,
+        child_pid,
+        slave_identity: (slave_metadata.dev(), slave_metadata.ino()),
+        _held_slave: held_slave,
+    };
+    paused.assert_child_still_holds_slave();
+    paused
+}
+
+#[test]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__native_attach_spawn_sysenv() {
+    let (dev, mut peer) = posix_pty_pair();
+    let mut paused = pause_sysenv_spawn_while_holding_slave(&dev, || {
+        sw_pal::native()
+            .env
+            .run(&["/bin/true".to_string()], Some(Duration::from_secs(8)))
+    });
+    let child_pid = paused.child_pid;
+
+    let serial_handle = match sw_pal::native().serial.open_exclusive(&dev, &cfg()) {
+        Ok(handle) => handle,
+        Err(OpenError::Held(report)) => panic!(
+            "暫停的 sysenv 子行程 PID={child_pid} 不得被判為外部 holder；open_exclusive 回 Held(pids={:?}, holder_unknown={})",
+            report.pids, report.holder_unknown
+        ),
+        Err(error) => panic!(
+            "暫停的 sysenv 子行程 PID={child_pid} 期間 open_exclusive 應成功，實際錯誤：{error:?}"
+        ),
+    };
+    paused.assert_child_still_holds_slave();
+    assert_eq!(
+        peer.read_available(Duration::from_millis(100)),
+        Vec::<u8>::new(),
+        "sysenv spawn 與 attach 開埠不得向 PTY 對端送出資料"
+    );
+
+    paused.call.release().expect("放行 pre-exec 子行程");
+    let output = paused
+        .call
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 後 native().env.run() 未完成")
+        .expect("native().env.run() 失敗");
+    assert_eq!(output.rc, 0, "子行程 PID={child_pid} 應以 rc=0 結束");
+    paused.call.join().expect("回收 sysenv 呼叫執行緒");
+    drop(serial_handle);
+    drop(paused);
+
+    assert_eq!(
+        peer.read_available(Duration::from_millis(100)),
+        Vec::<u8>::new(),
+        "關閉 serial handle 後 PTY 對端仍不得有資料"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__native_attach_spawn_process_tunnel() {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let (dev, mut peer) = posix_pty_pair();
+    let inherited_slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&dev.0)
+        .expect("以普通 open 持有非 CLOEXEC PTY slave");
+    let slave_metadata = inherited_slave.metadata().expect("取得 PTY slave inode");
+    let inherited_fd = inherited_slave.as_raw_fd();
+    // SAFETY: inherited_slave 仍開啟且由本測試持有，是有效 fd。
+    let fd_flags = unsafe { libc::fcntl(inherited_fd, libc::F_GETFD) };
+    assert!(
+        fd_flags >= 0,
+        "讀取 inherited slave fd flags 失敗：{fd_flags}"
+    );
+    // SAFETY: inherited_slave 仍開啟；只清除此 fd 的 close-on-exec 旗標。
+    assert_eq!(
+        unsafe { libc::fcntl(inherited_fd, libc::F_SETFD, fd_flags & !libc::FD_CLOEXEC) },
+        0,
+        "清除 inherited slave fd 的 FD_CLOEXEC 失敗"
+    );
+    // SAFETY: inherited_slave 仍開啟且由本測試持有，是有效 fd。
+    let inherited_flags = unsafe { libc::fcntl(inherited_fd, libc::F_GETFD) };
+    assert!(
+        inherited_flags >= 0 && inherited_flags & libc::FD_CLOEXEC == 0,
+        "spawn 前 PTY slave fd 必須非 CLOEXEC（flags={inherited_flags}）"
+    );
+
+    let log_dir = tempfile::tempdir().expect("建立 process_tunnel log 暫存目錄");
+    let log = log_dir.path().join("process-tunnel.log");
+    let argv = vec!["/bin/sleep".to_string(), "30".to_string()];
+    let tunnel = sw_pal::native().tunnel.clone();
+    let spawn_tunnel = tunnel.clone();
+    let (cleanup_sender, cleanup_result) = mpsc::channel();
+    let fixture_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pause_sysenv_spawn_while_holding_slave(&dev, move || {
+            let result = spawn_tunnel.spawn_detached(&argv, &log);
+            let cleanup_copy = result
+                .as_ref()
+                .map(Clone::clone)
+                .map_err(|error| format!("{error:?}"));
+            let _ = cleanup_sender.send(cleanup_copy);
+            result
+        })
+    }));
+
+    let mut paused = match fixture_result {
+        Ok(paused) => paused,
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("暫停夾具發生非字串 panic");
+            let spawn_result = cleanup_result.recv_timeout(Duration::from_secs(2));
+            let cleanup_result = match spawn_result {
+                Ok(Ok(process)) => tunnel
+                    .terminate(&process, Duration::from_millis(100))
+                    .err()
+                    .map(|error| format!("terminate 失敗：{error:?}")),
+                Ok(Err(error)) => Some(format!("spawn_detached 失敗：{error}")),
+                Err(error) => Some(format!("收取 spawn 結果失敗：{error}")),
+            };
+            drop(inherited_slave);
+            panic!(
+                "未取得 process_tunnel pre-exec 通知；暫停接線缺漏紅燈（{reason}）；清理結果：{cleanup_result:?}"
+            );
+        }
+    };
+
+    let child_pid = paused.child_pid;
+    let inherited_fd_path = format!("/proc/{child_pid}/fd/{inherited_fd}");
+    let inherited_fd_check = std::fs::metadata(&inherited_fd_path).map(|metadata| {
+        metadata.dev() == slave_metadata.dev() && metadata.ino() == slave_metadata.ino()
+    });
+    let attach_result = sw_pal::native().serial.open_exclusive(&dev, &cfg());
+    let peer_bytes = peer.read_available(Duration::from_millis(100));
+
+    let release_result = paused.call.release();
+    let spawn_result = paused.call.recv_timeout(Duration::from_secs(8));
+    let join_result = paused.call.join();
+    drop(paused);
+    let cleanup_spawn_result = cleanup_result.recv_timeout(Duration::from_secs(2));
+    let terminate_result = match &cleanup_spawn_result {
+        Ok(Ok(process)) => tunnel.terminate(process, Duration::from_millis(100)),
+        Ok(Err(_)) | Err(_) => Ok(()),
+    };
+    drop(inherited_slave);
+
+    assert!(
+        matches!(&spawn_result, Ok(Ok(_))),
+        "release 後 native().tunnel.spawn_detached() 應成功，實際結果：{spawn_result:?}"
+    );
+    assert!(join_result.is_ok(), "回收 process_tunnel 呼叫執行緒失敗");
+    assert!(
+        release_result.is_ok(),
+        "放行 process_tunnel pre-exec 失敗：{release_result:?}"
+    );
+    assert!(
+        matches!(&inherited_fd_check, Ok(true)),
+        "pre-exec 子行程 PID={child_pid} 必須仍持有同編號、同 inode 的非 CLOEXEC slave fd，實際：{inherited_fd_check:?}"
+    );
+    assert!(
+        matches!(&cleanup_spawn_result, Ok(Ok(_))),
+        "清理通道應收到 process_tunnel spawn 結果：{cleanup_spawn_result:?}"
+    );
+    assert!(
+        terminate_result.is_ok(),
+        "回收 process_tunnel 建立的行程群組失敗：{terminate_result:?}"
+    );
+    assert!(
+        attach_result.is_ok(),
+        "暫停的 process_tunnel 子行程 PID={child_pid} 不得被判為外部 holder；open_exclusive 結果：{}",
+        show_open(&attach_result)
+    );
+    assert!(
+        peer_bytes.is_empty(),
+        "process_tunnel spawn 與 attach 開埠不得向 PTY 對端送出資料：{peer_bytes:?}"
+    );
 }
 
 /// R0-F3：TIOCEXCL 是 tty 物件旗標，不隨 fd 關閉清除；PTY master 持續開啟時，CloseToken 必須先 TIOCNXCL 才關 fd，

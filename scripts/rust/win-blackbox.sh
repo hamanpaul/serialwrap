@@ -28,17 +28,50 @@ fi
 
 run_id="$(date +%y%m%d-%H%M%S)-$$"
 out_dir="$ROOT/target/win-blackbox/$run_id"
-release_exe="$ROOT/target/x86_64-pc-windows-gnu/release/serialwrap.exe"
-mkdir -p "$out_dir"
+# 外層若指定 CARGO_TARGET_DIR，兩次建置與下面的 release 路徑必須同一處，否則字串檢查會掃錯檔。
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  cargo_target="$CARGO_TARGET_DIR"
+  if [[ "$cargo_target" != /* ]]; then
+    cargo_target="$ROOT/$cargo_target"
+  fi
+else
+  cargo_target="$ROOT/target"
+fi
+release_exe="$cargo_target/x86_64-pc-windows-gnu/release/serialwrap.exe"
+# test-fakes 複本放在 cargo 輸出之外，第二輪不含 feature 的 release 才不會把它覆蓋掉。
+fakes_dir="$ROOT/target/win-blackbox-test-fakes"
+fakes_exe="$fakes_dir/serialwrap.exe"
+mkdir -p "$out_dir" "$fakes_dir"
 
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="x86_64-w64-mingw32-gcc"
+# B 輪委派比照 Linux `mkbundle.sh --dev`：只有 test-fakes 建置讀 SERIALWRAP_TEST_DELEGATE_GROUP。
+# 先建並複製走，再以不含該 feature 的 release 覆寫標準路徑，正式產物不得留下測試鉤子。
+if ! cargo build -p sw-cli --release --target x86_64-pc-windows-gnu --features test-fakes; then
+  echo "win-blackbox.sh: Windows GNU test-fakes 交叉建置失敗" >&2
+  exit 1
+fi
+cp -- "$release_exe" "$fakes_exe"
 if ! cargo build -p sw-cli --release --target x86_64-pc-windows-gnu; then
   echo "win-blackbox.sh: Windows GNU release 交叉建置失敗" >&2
   exit 1
 fi
+python3 - "$release_exe" "$fakes_exe" <<'PY'
+import sys
+from pathlib import Path
+
+release = Path(sys.argv[1]).read_bytes()
+fakes = Path(sys.argv[2]).read_bytes()
+for needle in (b"SERIALWRAP_TEST_", b"SW_TEST_UPDATE_"):
+    if needle in release:
+        sys.stderr.write(f"release serialwrap.exe 含測試鉤子 {needle.decode()}\n")
+        raise SystemExit(1)
+if b"SERIALWRAP_TEST_" not in fakes:
+    sys.stderr.write("test-fakes serialwrap.exe 缺少 SERIALWRAP_TEST_ 委派鉤子\n")
+    raise SystemExit(1)
+PY
 
 set +e
-python3 "$ROOT/scripts/rust/check_win_imports.py" "$release_exe" > "$out_dir/imports.json"
+python3 "$ROOT/scripts/rust/check_win_imports.py" "$fakes_exe" > "$out_dir/imports.json"
 imports_rc=$?
 local_appdata="$(cmd.exe /c echo %LOCALAPPDATA% 2>/dev/null | tr -d '\r' | tail -n 1)"
 interop_rc=$?
@@ -76,7 +109,7 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT
 mkdir -p "$stage_root"
-cp -- "$release_exe" "$stage_exe"
+cp -- "$fakes_exe" "$stage_exe"
 chmod +x "$stage_exe"
 
 rust_win="$stage_exe_win"
@@ -111,7 +144,7 @@ set +e
 if [[ "$NO_COMPARE" -eq 0 && -f "$out_dir/a.xml" && -f "$out_dir/b.xml" ]]; then
   # 依 ab_compare.py 介面（P3-T18）產生必要清單與兩邊 identity；daemon tree／runtime sha256
   # 取自 win-blackbox.ps1 匯出的 Windows bundle manifest，缺檔時 identity 欄位留空由比較器判 fail。
-  (cd "$ROOT" && python3 - "$ROOT" "$out_dir" "$release_exe" <<'PY'
+  (cd "$ROOT" && python3 - "$ROOT" "$out_dir" "$fakes_exe" <<'PY'
 import hashlib
 import json
 import subprocess

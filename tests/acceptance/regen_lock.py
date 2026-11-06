@@ -15,8 +15,10 @@
                                                       # L1 必要集合只增（P2-T13，R5-F3）；既有 nodeid 消失即 exit 1 且不寫檔；
                                                       # 經核准替換者須逐筆列 --allow-removal set_id:platform:nodeid，三元組須全部屬於本次 set／平台，
                                                       # 且清單必須與該集合消失集合完全相符；新增 set／平台時必須給 selector（檔案或行內 JSON 皆可）
-                                                      # OD-24：collect JSON 的 ignored 名單（cargo_l1_results.py --list-only）新增時排除；
+                                                      # OD-24：collect JSON 的 ignored 列新增時預設排除；明確 `-- --ignored cap_<cap>__` 僅納入同能力列；
                                                       # 鎖中既有 ignored 列仍屬 collected、不視為消失，只能逐名 --allow-removal 移除
+  python3 tests/acceptance/regen_lock.py --p4-error-codes-add-only --allow-error-code <CODE>...
+                                                      # P4 錯誤碼基線只接受逐名核准的新增；既有碼不得移除
   核准移除格式（收緊，2026-10-23）：`--allow-removal` 僅接受三元組 `set_id:platform:nodeid`（platform ∈ linux|windows）。
   裸 nodeid 不再被接受（舊版只比對 nodeid，Windows 之核准會放行 Linux 必要集合中同名 nodeid 之刪除；sol d82d146）。
 
@@ -51,6 +53,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT_CASES = HERE / "cases.yaml"
 DEFAULT_LOCK = HERE / "cases.lock.json"
 DEFAULT_L1_LOCK = HERE / "l1_required.lock.json"
+DEFAULT_P4_LOCK = HERE / "p4_required.lock.json"
+DEFAULT_ERROR_CODE_CONTRACT = HERE.parents[1] / "contracts" / "error_codes.yaml"
 L1_PLATFORMS = ("linux", "windows")
 SET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_:.-]*$")
 COUNTS_NAME = "cases.counts.json"
@@ -288,6 +292,75 @@ def cmd_add_only(cases_path: pathlib.Path, lock_path: pathlib.Path,
     return 0
 
 
+def cmd_p4_error_codes_add_only(
+    lock_path: pathlib.Path,
+    contract_path: pathlib.Path,
+    allowed_additions: list[str],
+    amendment_commit: str,
+) -> int:
+    """只更新 P4 lock 的 error_codes_at_freeze，保留既有案例與 metadata。"""
+    if not lock_path.exists():
+        print(f"[regen_lock] REFUSED P4 錯誤碼鎖不存在：{lock_path}", file=sys.stderr)
+        return 1
+    if not contract_path.exists():
+        print(f"[regen_lock] REFUSED 錯誤碼契約不存在：{contract_path}", file=sys.stderr)
+        return 1
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        contract = _load_yaml(contract_path)
+    except (json.JSONDecodeError, OSError, yaml.YAMLError) as exc:
+        print(f"[regen_lock] REFUSED 無法讀取 P4 錯誤碼資料：{exc}", file=sys.stderr)
+        return 1
+
+    frozen = lock.get("error_codes_at_freeze") if isinstance(lock, dict) else None
+    entries = contract.get("codes") if isinstance(contract, dict) else None
+    if (
+        not isinstance(frozen, list)
+        or not all(isinstance(code, str) and code for code in frozen)
+        or not isinstance(entries, list)
+        or not all(isinstance(entry, dict) and isinstance(entry.get("code"), str) for entry in entries)
+    ):
+        print("[regen_lock] REFUSED P4 錯誤碼鎖或 contracts/error_codes.yaml 結構錯誤", file=sys.stderr)
+        return 1
+
+    current = [entry["code"] for entry in entries]
+    if len(current) != len(set(current)) or len(frozen) != len(set(frozen)):
+        print("[regen_lock] REFUSED 錯誤碼有重複項目", file=sys.stderr)
+        return 1
+    approved = set(allowed_additions)
+    if not approved or len(approved) != len(allowed_additions) or not amendment_commit:
+        print("[regen_lock] REFUSED 須提供不重複的逐名核准錯誤碼與 amendment commit", file=sys.stderr)
+        return 1
+
+    frozen_set = set(frozen)
+    current_set = set(current)
+    removed = sorted(frozen_set - current_set)
+    added = sorted(current_set - frozen_set)
+    unapproved = sorted(set(added) - approved)
+    unused = sorted(approved - set(added))
+    if removed or unapproved or unused:
+        print(
+            "[regen_lock] REFUSED P4 error_codes_at_freeze 僅允許逐名核准的新增："
+            f"移除={removed}、未核准新增={unapproved}、未使用核准={unused}",
+            file=sys.stderr,
+        )
+        return 1
+
+    amended = lock.get("amended_commits", [])
+    if not isinstance(amended, list) or not all(isinstance(commit, str) for commit in amended):
+        print("[regen_lock] REFUSED amended_commits 結構錯誤", file=sys.stderr)
+        return 1
+    lock["error_codes_at_freeze"] = sorted(current_set)
+    if amendment_commit not in amended:
+        lock["amended_commits"] = [*amended, amendment_commit]
+    _write(lock_path, _dump_json(lock))
+    print(
+        f"[regen_lock] P4 error_codes_at_freeze 新增 {len(added)} 碼；"
+        f"凍結案例與其他 metadata 保留：{lock_path}"
+    )
+    return 0
+
+
 def _load_l1(path: pathlib.Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -467,6 +540,28 @@ def _read_collect(path: pathlib.Path) -> tuple[list[str], set[str]]:
     return ids, set()
 
 
+_CAP_IGNORED_FILTER_RE = re.compile(r"cap_([a-z][a-z0-9]*(?:_[a-z0-9]+)*)__")
+
+
+def _explicit_ignored_capability_nodeids(selector: dict[str, Any] | None, ignored: set[str]) -> set[str]:
+    """只對精確的 `-- --ignored cap_<cap>__` selector 回傳同能力 ignored 列。"""
+    if not isinstance(selector, dict):
+        return set()
+    argv = selector.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+        return set()
+    if argv.count("--") != 1:
+        return set()
+    libtest_args = argv[argv.index("--") + 1:]
+    if len(libtest_args) != 2 or libtest_args[0] != "--ignored":
+        return set()
+    match = _CAP_IGNORED_FILTER_RE.fullmatch(libtest_args[1])
+    if match is None:
+        return set()
+    prefix = f"cap_{match.group(1)}__"
+    return {nid for nid in ignored if nid.rsplit("::", 1)[-1].startswith(prefix)}
+
+
 def _selector_from_args(args: argparse.Namespace) -> tuple[dict[str, Any] | None, str | None]:
     """由 CLI 組出 selector：`--selector <檔>` 或行內 `--argv-json` 等（兩者互斥）。回傳 (selector, 錯誤訊息)。"""
     inline = args.argv_json is not None or args.paths_json is not None or args.markexpr is not None
@@ -521,13 +616,16 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
         if approvals:
             print(f"[regen_lock] REFUSED 新增集合 {set_id}.{platform} 無既有 nodeid 可移除，--allow-removal 須為空，鎖檔未變更", file=sys.stderr)
             return 1
-        # OD-24：#[ignore] 列不由官方 selector 執行，新增時一律排除
-        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored)}
+        # OD-24：預設排除 #[ignore]；明確能力 selector 僅納入同能力列。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(selector, ignored)
+        new_spec = {"selector": selector, "nodeids": sorted(set(collected) - ignored_excluded)}
         added_count = len(new_spec["nodeids"])
     else:
         if selector is not None and selector != spec["selector"]:
             print(f"[regen_lock] REFUSED selector 與鎖檔不同：{set_id}.{platform}", file=sys.stderr)
             return 1
+        # 既有集合的 selector 以鎖內版本為準；未傳 CLI selector 時不可退回「全部 ignored」。
+        ignored_excluded = ignored - _explicit_ignored_capability_nodeids(spec["selector"], ignored)
         allowed = {nid for _s, _p, nid in approvals}
         # 既有 ignored 列仍在 collected 內，不視為消失（plan 04 Task 17）；OD-24 起可逐名核准移除
         removed = sorted((set(spec["nodeids"]) - set(collected)) | (allowed & set(spec["nodeids"]) & ignored))
@@ -541,7 +639,7 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
                 print(f"  - 未消失 {set_id}.{platform} {nid}", file=sys.stderr)
             print("[regen_lock] 每筆移除都須對應已核准的案例／測試替換並於交付說明列明。", file=sys.stderr)
             return 1
-        added = sorted(set(collected) - set(spec["nodeids"]) - ignored)
+        added = sorted(set(collected) - set(spec["nodeids"]) - ignored_excluded)
         if not added and not removed:
             print(f"[regen_lock] {set_id}.{platform} 無新增 nodeid，鎖檔未變更")
             return 0
@@ -569,16 +667,22 @@ def cmd_l1_add_only(lock_path: pathlib.Path, set_id: str, platform: str, collect
 
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
-    parser = argparse.ArgumentParser(description="重算／驗證 Stage 0 案例凍結鎖（P2-T12）與 L1 必要集合鎖（P2-T13）")
+    parser = argparse.ArgumentParser(description="重算／驗證 Stage 0、L1 與 P4 凍結鎖")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="驗證案例鎖（若存在）與 L1 鎖結構")
     mode.add_argument("--add-only", action="store_true", help="重算並寫回；既有 ID 消失或分母屬性改動即拒絕")
     parser.add_argument("--allow-defer", action="append", default=[], metavar="CASE:FROM:TO:OD-NN",
                         help="--add-only：擁有者裁決逐名核准的延後切片（只改 daemon_slice；核准須與實際延後完全相符）")
     mode.add_argument("--l1-add-only", action="store_true", help="L1 必要集合只增登記；核准替換可逐名搭配 --allow-removal")
+    mode.add_argument("--p4-error-codes-add-only", action="store_true", help="P4 錯誤碼基線只新增逐名核准的錯誤碼")
     parser.add_argument("--cases", type=pathlib.Path, default=DEFAULT_CASES, help="cases.yaml 路徑")
     parser.add_argument("--lock", type=pathlib.Path, default=DEFAULT_LOCK, help="cases.lock.json 路徑")
     parser.add_argument("--lock-file", type=pathlib.Path, default=DEFAULT_L1_LOCK, help="l1_required.lock.json 路徑")
+    parser.add_argument("--p4-lock", type=pathlib.Path, default=DEFAULT_P4_LOCK, help="--p4-error-codes-add-only：p4_required.lock.json 路徑")
+    parser.add_argument("--error-code-contract", type=pathlib.Path, default=DEFAULT_ERROR_CODE_CONTRACT,
+                        help="--p4-error-codes-add-only：contracts/error_codes.yaml 路徑")
+    parser.add_argument("--allow-error-code", action="append", default=[], metavar="CODE",
+                        help="--p4-error-codes-add-only：逐名核准一個新增錯誤碼；可重複指定")
     parser.add_argument("--base", default=None, help="--check 時的基準 rev（以其 L1 鎖比對只增）")
     parser.add_argument("--allow-removal", action="extend", nargs="+", default=[], metavar="SET:PLATFORM:NODEID",
                         help="經核准替換而允許移除的三元組 set_id:platform:nodeid（僅接受三元組）；須逐筆列出且於交付說明對應新測試")
@@ -610,6 +714,26 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return cmd_l1_add_only(args.lock_file, args.set_id or "", args.platform or "", args.collect, selector,
                                approvals)
+    if args.p4_error_codes_add_only:
+        if args.allow_removal or not args.allow_error_code:
+            print("[regen_lock] 用法錯誤：--p4-error-codes-add-only 需 --allow-error-code，且不可搭配 --allow-removal", file=sys.stderr)
+            return 2
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=HERE.parents[1],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if head.returncode != 0 or not head.stdout.strip():
+            print(f"[regen_lock] 無法取得 amendment commit：{head.stderr.strip()}", file=sys.stderr)
+            return 1
+        return cmd_p4_error_codes_add_only(
+            args.p4_lock, args.error_code_contract, args.allow_error_code, head.stdout.strip()
+        )
+    if args.allow_error_code:
+        print("[regen_lock] 用法錯誤：--allow-error-code 只能與 --p4-error-codes-add-only 併用", file=sys.stderr)
+        return 2
     if args.check:
         rc = cmd_check(args.cases, args.lock)
         if args.cases_only:

@@ -882,6 +882,14 @@ def test_od68_removed_linux_capability_set_is_evidence_missing(case, cap):
     assert section["l1_verdict"]["verdict"] == "INSUFFICIENT"
     assert any(set_id in reason and "不在 l1_required.lock.json" in reason for reason in section["reasons"])
 
+    # OD-68 的承擔項仍須有 Windows 原生證據；未原生收集時不可因 Linux 列已移除而完成。
+    report = case.report()
+    windows_section = next(item for item in report["sections"] if item["name"] == "windows_native_l1")
+    windows_section["l1_results"] = None
+    windows_out = _judge_mod().judge(report, case.expect())
+    assert _sec(windows_out, "windows_native_l1")["status"] == "EVIDENCE_MISSING"
+    assert windows_out["verdict"] == "INCOMPLETE"
+
 
 def test_gate_script_derives_caps_from_lock():
     text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")

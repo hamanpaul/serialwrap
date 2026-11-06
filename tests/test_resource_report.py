@@ -259,7 +259,7 @@ def _install_layout(tmp_path: Path, tag: str) -> dict:
         cli_file = stable / cli_name
         cli_file.write_bytes(cli_payload)
         (stable / daemon_name).write_bytes(daemon_payload)
-        (stable / "current-release.json").write_text(json.dumps({"dir": str(inst)}), encoding="utf-8")
+        (stable / "current-release.json").write_text(json.dumps({"dir": inst.relative_to(base).as_posix()}), encoding="utf-8")
     else:
         cli_file = bin_dir / cli_name
     return {
@@ -1097,13 +1097,13 @@ def test_workflow_ci_l1_gates() -> None:
     wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
     jobs = wf["jobs"]
     pytest_job = jobs["pytest"]
-    lock_steps = [st for st in pytest_job["steps"] if "regen_lock.py --check --base origin/${{ github.base_ref }}" in str(st.get("run", ""))]
+    lock_steps = [st for st in pytest_job["steps"] if 'regen_lock.py --check --base "origin/$GITHUB_BASE_REF"' in str(st.get("run", ""))]
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))
-    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組、OD-24 的 5 筆 #[ignore] 列與
-    # OD-56 的 2 筆 s21_core.linux 替換
+    # OD-16／OD-17 逐名核准，加上 OD-23（2026-10-27）補授權的 36 個既有移除三元組、OD-24 的 5 筆 #[ignore] 列與 OD-68 三筆 Linux 列
     # （docs/rust-refactor/reviews/s1x-unauthorized-removals.md）；順序與 tests.yml 完全一致。
+    # OD-56（rulings/p7.md P7-BO-1）僅核准 s21_core.linux 兩個舊 nodeid，由替換測試承擔。
     allowed_removals = (
         "s0_win_pytest:windows:tests/test_cli_stderr_full_error.py::TestRunRpcStderrKeepsMessage::test_socket_error_stderr_includes_error_code_and_message",
         "s0_win_pytest:windows:tests/test_contracts_catalog.py::test_ec_passthrough_single_meta_entry",
@@ -1655,7 +1655,9 @@ def test_workflow_ci_l1_gates() -> None:
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_grandchild_entry",
         "s1b_cargo:windows:cargo:sw-pal::exec_delegate::exec_or_wait_tree_launcher_entry",
         "s1b_cargo:windows:cargo:sw-pal::service_ctl::cap_supervisor_runtime__windows_task_roundtrip",
-        # OD-56（2026-10-29，rulings/p7.md P7-BO-1）：s21_core.linux 兩個語意已變的舊 nodeid（只限這兩名）
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
         "s21_core:linux:cargo:sw-core::login_quiet::unsupported_profile_no_auto_tx",
         "s21_core:linux:cargo:sw-core::session_manager::detect_skips_passthrough_console_unlock_and_unsupported",
     )
@@ -1732,3 +1734,32 @@ def test_od24_ignored_removal_triples_are_approved_in_ci() -> None:
     addenda = Path("docs/rust-refactor/owner-decisions-addenda.md").read_text(encoding="utf-8")
     pending = next(line for line in addenda.splitlines() if line.startswith("| PENDING-OD-S1X-L1-IGNORED-READD |"))
     assert "RESOLVED（OD-24" in pending
+
+
+@pytest.mark.memory_only
+def test_od68_removal_triples_are_approved_in_ci() -> None:
+    """OD-68：三筆 windows-only 能力集合 Linux 移除須逐名核准於 CI 參數。"""
+    triples = (
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "s21_gate:cap_windows_native:linux:cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "s21_gate:cap_interactive_desktop:linux:cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+    )
+    wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
+    lock_steps = [
+        st for st in wf["jobs"]["pytest"]["steps"]
+        if "regen_lock.py --check --base" in str(st.get("run", ""))
+    ]
+    assert len(lock_steps) == 1
+    tokens = shlex.split(str(lock_steps[0]["run"]))
+    allowed = tokens[tokens.index("--allow-removal") + 1:]
+    missing = [triple for triple in triples if triple not in allowed]
+    assert not missing, missing
+    windows_nodeids = set(
+        json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]["s21_core"]["windows"]["nodeids"]
+    )
+    carried = (
+        "cargo:sw-daemon::launcher::cap_windows_native__launcher_gui_subsystem",
+        "cargo:sw-daemon::launcher::cap_windows_native__launcher_parent_kill_kills_child",
+        "cargo:sw-pal::exec_delegate::cap_interactive_desktop__exec_or_wait_ctrl_c",
+    )
+    assert not [nodeid for nodeid in carried if nodeid not in windows_nodeids]

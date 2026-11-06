@@ -911,7 +911,7 @@ def test_main_continues_after_runner_exception_and_writes_report(tmp_path, monke
     from lib.yaml_loader import TestCase
 
     def make(name: str) -> TestCase:
-        return TestCase(name=name, category="test", severity="low", target={}, profile={}, env_files={}, steps=[])
+        return TestCase(name=name, category="test", severity="low", target={}, profile={}, env_files={}, steps=[], bridge={"applicable": True})
 
     monkeypatch.setattr(runner, "discover_test_cases", lambda *a, **k: [make("boom-case"), make("ok-case")])
     monkeypatch.setattr(runner.TestRunner, "_write_manifest", lambda self, *a, **k: None)
@@ -924,7 +924,10 @@ def test_main_continues_after_runner_exception_and_writes_report(tmp_path, monke
 
     monkeypatch.setattr(runner.TestRunner, "run", fake_run)
     report_dir = tmp_path / "reports"
-    rc = runner.main(["--report-dir", str(report_dir)])
+    # run 已被替身取代；用兩平台都可選取的 bridge 路徑測報告，不會開啟 COM。
+    rc = runner.main(["--report-dir", str(report_dir), "--mode", "bridge", "--scenarios",
+                      "--daemon-com", "COM20", "--bridge-com", "COM21",
+                      "--transport-mode", "virtual_com0com"])
     report = json.loads((report_dir / "func-test-report.json").read_text(encoding="utf-8"))
     assert [row["verdict"] for row in report["results"]] == ["INSUFFICIENT_EVIDENCE", "PASS"], report
     assert "synthetic crash" in report["results"][0]["message"]

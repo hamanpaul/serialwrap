@@ -41,8 +41,9 @@ materializes profiles, the broker minicom wrapper, and daemon supervision, see
 including diagrams and field validation notes, see [繁體中文](#繁體中文).
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup
+# Linux x86_64, glibc >= 2.39, /usr/bin/python3.12 (Ubuntu 24.04 or later)
+git clone https://github.com/hamanpaul/serialwrap && cd serialwrap
+./install.sh            # download the latest release bundle, verify SHA256SUMS, run bin/serialwrap setup
 serialwrap doctor
 ```
 
@@ -93,9 +94,11 @@ console views, command result capture, and diagnostics.
 
 ### Prerequisites
 
-- **Python 3.10+**
-- **pipx**
-- **PyYAML** — installed automatically by the package metadata
+- **Linux x86_64 with glibc >= 2.39** (Ubuntu 24.04 or later)
+- **`/usr/bin/python3.12`** — the Python daemon runtime shipped in the bundle is
+  tied to this interpreter (the requirement goes away in 0.5.0 with the Rust daemon)
+- **curl** or **wget** — to download the release (not needed with `--bundle`)
+- **PyYAML** — shipped inside the bundle; no separate install
 - **jq** — required by the broker minicom route
 - **minicom** — required for human console workflows on Linux/WSL
 
@@ -123,9 +126,10 @@ setup may select systemd and change supervision modes; see the
 ### Quick Start
 
 ```bash
-# Managed install
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup
+# Managed install: download the release bundle, verify it against SHA256SUMS,
+# then run <bundle>/bin/serialwrap setup (extra arguments go to setup)
+./install.sh                     # latest release
+./install.sh --version 0.4.0     # a specific release
 serialwrap doctor
 
 # Check daemon and sessions
@@ -176,8 +180,76 @@ markers remain available for caller validation. `command.get` and WAL META recor
 setting; reboot continues through its existing recovery flow. See
 [command completion](docs/command-completion.md).
 
-For local development, run `./install.sh`; it performs the same package install
-and `serialwrap setup` flow from the checkout.
+#### Installer details
+
+`install.sh` lives at the repository root (clone the repository or download
+that file). `install.sh [--version X.Y.Z] [--bundle <dir or .tar.gz>] [--] [setup args...]`
+checks the requirements first (x86_64, glibc >= 2.39, `/usr/bin/python3.12`)
+and exits 2 without changing anything when one is not met. Without `--bundle`
+it downloads `serialwrap-<version>-linux-x86_64.tar.gz` and `SHA256SUMS` from
+the [GitHub releases](https://github.com/hamanpaul/serialwrap/releases)
+(latest release unless `--version` is given), refuses to continue on a
+checksum mismatch or a missing `SHA256SUMS` row, unpacks into a temporary
+directory, runs `bin/serialwrap setup`, and returns its exit code. Arguments
+after `--` (and unknown options such as `--user` or `--on-demand`) are passed
+to `setup` unchanged. The Python wheel is still published with each release,
+but the standard install no longer uses pipx.
+
+Offline install: copy the release tarball (verify it yourself with
+`sha256sum -c --ignore-missing SHA256SUMS`; `--bundle` does not download or
+check `SHA256SUMS`), then run
+`./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`. `--bundle` also
+accepts an unpacked bundle directory. For local development, build a bundle
+from the checkout and install it; a bare `./install.sh` installs the published
+release, not the checkout:
+
+```bash
+scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
+./install.sh --bundle /tmp/sw-bundle
+```
+
+#### Upgrading from 0.3.x (pipx)
+
+Run the new `install.sh` directly; no pipx step is needed. You can upgrade
+while the 0.3.x daemon is still running by passing the current supervision
+mode explicitly (`--user`, `--system --with-sudo`, or `--on-demand`). Stopping
+first with `serialwrap daemon stop` is also fine, but setup does not start a
+daemon that was already stopped: start it with `serialwrap service start`
+(systemd) or `serialwrap daemon start` (on-demand), then run
+`serialwrap doctor`. Setup takes over the `~/.local/bin/serialwrap` and
+`serialwrapd` entries and keeps `config.yaml`, profiles and `state.json`.
+When an old pipx install is detected, the installer prints a hint that you may
+run `pipx uninstall serialwrap`; it never removes it automatically.
+
+For chained or self-rebooting commands such as `firstboot -y && reboot` or
+`sysupgrade ...`, use `cmd submit --expect-reboot` (RPC
+`command.submit.expect_reboot: true`). It arms the boot quiet window immediately
+and follows the reboot recovery path. Without the flag, a chained reboot remains
+an ordinary command and the submit response may carry a non-fatal
+`CHAINED_REBOOT_WARNING`. `--mode interactive` with the flag is rejected
+(`EXPECT_REBOOT_MODE_UNSUPPORTED`), non-boolean RPC values return
+`INVALID_EXPECT_REBOOT`, completion regex does not override reboot handling, and
+the flag does not bypass `AUTOBOOT_QUIET`. Set `--cmd-timeout` to cover the work
+before reboot. The submit response echoes `expect_reboot: true` and `command.get`
+reports it. See [explicit reboot](docs/expect-reboot.md).
+
+**Upgrading, and telling which build the daemon runs.** The bundle installer
+runs `serialwrap setup`; after a manual package update, run setup again. The version string
+(`0.4.0`) is the same for a release, a branch build and `main`, so
+`serialwrap --version` also prints a code fingerprint, e.g.
+`serialwrap 0.4.0 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap daemon status` reports the fingerprint of the code the running daemon
+loaded when it started (`code_fingerprint`) and where it loaded it from
+(`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
+every other command prints a one-line warning on stderr (stdout JSON is unchanged);
+`serialwrap doctor` reports it as the advisory check `daemon_code_current`.
+When the systemd service is active and the fingerprints differ, `serialwrap setup`
+restarts the service for you and prints a `daemon_code` field with the result.
+For systemd-system, `setup` only lists `sudo systemctl restart serialwrap` in
+`pending_sudo` unless `--with-sudo` is given; `--no-restart` skips the restart; a
+running flash never triggers it. On-demand mode never stops the daemon on its own:
+run `serialwrap daemon stop` then `serialwrap daemon start`. See
+[spec §8.7](docs/serialwrap-spec.md).
 
 For a human console, use the broker wrapper instead of raw minicom:
 
@@ -228,6 +300,20 @@ or `READY`.
   reach it after a usable prompt and `ready_probe` round-trip; passthrough
   sessions reach it after 30 seconds without RX (see below).
 - `RELEASED` means the real device has been handed off to an external tool.
+  It survives daemon restarts. If the record's template was renamed or removed
+  meanwhile, the daemon keeps a `RELEASED` placeholder (passthrough, not
+  command-capable) for that COM; `device attach` on it removes the placeholder,
+  unblocks the device and lets template detection create the real session on
+  the same COM (OD-63). `session bind` on the placeholder does not unblock it
+  (it answers `released: true`, `recommended_action: device_attach`); if
+  opening the port fails, the device is still handed to dynamic detection on
+  the same COM, whose open-failure handling leaves a retryable `DETACHED` row
+  when a passthrough fallback template exists. Without one, no row is left
+  (`device attach` answers `SESSION_NOT_FOUND`); the COM stays reserved for
+  that device until it is unplugged or the daemon restarts, after which
+  hotplug or restart re-detects it and assigns the COM by the usual dynamic
+  rules (the original COM is not guaranteed), the same as any new device whose
+  port cannot be opened.
 - `FLASHING` means the MCU flash endpoint is currently bridging an external
   flasher.
 
@@ -326,6 +412,33 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 Supported key encodings include `enter`, `tab`, `escape`, `ctrl-c`, `ctrl-d`,
 `up`, `down`, `left`, and `right`.
 
+#### Source labels (`--source`)
+
+`--source` (`cmd submit`, `file push`, `file pull`, `device release`) is not just
+a tracking label: the daemon uses the raw RPC value to decide command timeout
+behavior. `interactive-open --owner` identifies the lease owner; it does not grant
+human command authority.
+
+| Prefix | Class | On command timeout (no prompt came back) |
+|--------|-------|------------------------------------------|
+| `agent:<name>`, or any other string (`agent`, `codex`, ...) | agent | Sends CTRL-C, then CTRL-D, to get a prompt back — CTRL-D **logs out** a console sitting at a shell; no keys inside the boot quiet window |
+| Bare RPC source `human` / `human:` | Normalized to `human:cli`; human per OD-74 | Sends **no keys**; command timeout promotes to an interactive lease; passes the human gate |
+| Explicit `human:<name>` (including `human:cli`) | Display class is human; agent per DF-02 | Agent timeout and boot quiet behavior; `source_class` does not grant permission |
+| `system`, `system:*` | reserved | Internal only (forced recovery, self-test, login probes); external callers get `SOURCE_RESERVED` |
+
+- Only the raw RPC values `human` and `human:` (no name) are **normalized to `human:cli`**
+  and receive the OD-74 human gate and timeout behavior; successful responses carry `source`
+  and `source_normalized_from`. An explicit `human:<name>` (including `human:cli`) follows
+  DF-02 agent behavior even though its display class is human. `source_class` is not authority.
+  `session interactive-open --owner` does not normalize bare `human` or grant human command rights.
+- `system` / `system:*` are rejected by both the CLI and the daemon
+  (`error_code: SOURCE_RESERVED`) before anything is queued or written to the UART.
+  Look-alikes such as `systemd:x` are unaffected.
+- Any other unknown prefix (`codex`, `cli`, `agent`, ...) keeps the agent behavior.
+- `cmd submit` responses and the `command` record of `cmd status` carry `source_class`
+  (`human` or `agent`) for display only; it does not tell whether the raw RPC source received
+  human authorization.
+
 ### Human Console Coexistence
 
 The broker minicom wrapper is `serialwrap-minicom COMx`. The first human console
@@ -404,6 +517,20 @@ derived from the profile's `timeout_s` (`max(profile.timeout_s, 5.0)`, same
 spirit as #157's `chunk_timeout_s`), so boards with a widened `timeout_s` get a
 proportionally wider echo window. It only bounds the failure path: when echo
 arrives normally the wait returns immediately.
+
+If the session is drained (release, recovery, clear, rebind), its bridge
+generation moves on, or the transfer is cancelled while `file push`/`file pull`
+is running, the transfer stops sending and returns (OD-62, mirroring BC-03):
+`FLUSHED_BY_RECOVERY` when no byte of the transfer had reached the UART yet
+(safe to retry once the session is `READY` again), or `COMMAND_ABORTED_IN_FLIGHT`
+once at least one byte was written (do not retry blindly; check the target
+first — a partial `/tmp/.sw_upload_*` may remain). `file push` attaches
+`chunks_sent`/`chunks_total`. Like any command aborted in flight, the WAL then
+gets a `command_aborted_in_flight` META record whose `cmd_id` is the transfer's
+`ft-<8hex>` prefix (each sub-command's TX records use `ft-<8hex>-<step>`) and
+whose `confirmed_tx_bytes` counts the whole transfer. In 0.3.2 these situations ended with
+`TRANSFER_TIMEOUT` instead; a boot quiet window during the transfer still
+returns `AUTOBOOT_QUIET` with `retry_after_s`.
 
 ### MCU Firmware Workflows
 
@@ -1374,7 +1501,7 @@ serialwrap setup --with-com0com
 - **Lifecycle Control**: `daemon restart` provides two-reader-safe daemon recycling (stops the old daemon gracefully, waits up to 10 seconds for process exit and device handle release, and launches the new instance).
 - **Supervision Management**: `supervision-mode set <MODE>` switches active supervision between `on-demand`, `systemd-user`, `systemd-system`, `windows-task`, and `windows-service` (on Windows, `windows-service` outputs `pending_sudo` instructions for operator execution). Switching performs fail-closed safety preflight and atomic handoff (`daemon.handoff_stop`): active flashing, file transfers, in-flight commands, active leases, or unconfirmed probes refuse the switch; `--force` does not override this safety guard (records `force_ignored: true`).
 - **Windows Task Supervision**: `windows-task` operates via Windows Task Scheduler (`schtasks`) with `ExecutionTimeLimit=PT0S`, enabling detached daemon persistence across user sessions with automatic start on user login and restart on failure.
-- **Rollback and Recovery**: `setup --rollback` atomically restores the previous bundle version, CLI binary, Python daemon runtime, and supervisor definitions using `install-journal.json`.
+- **Rollback and Recovery**: `setup --rollback` atomically restores the previous bundle version, CLI binary, Python daemon runtime, and supervisor definitions using `install-journal.json`. The first install that replaces a pipx 0.3.2 install has no previous bundle, so `setup --rollback` cannot return to that pipx install: it returns `INVALID_ARGS` (`rollback_unavailable`) and does not change the installation. A manual return to 0.3.2 is not a supported downgrade.
 - **Upgrading from 0.3.x with the daemon running (OD-48, SC-39)**: a 0.3.x daemon does not support `daemon.handoff_stop`. When `setup` positively identifies it (version below 0.4.0, a pipx Python daemon process outside the bundle `versions/` directory), it refuses while flashing or busy, otherwise records the old process in `install-journal.legacy.json` and stops it with its own supervisor (`systemctl stop` when it is the unit's MainPID, else RPC `daemon.stop`; never a hard kill). It switches only after the old process tree has exited and no process of the same user holds the UART for 5 consecutive seconds (up to 330 s), then starts the new daemon. If a later step fails, the install is restored but the old daemon is **not** restarted; the response carries `legacy_daemon_stopped`, `restored`, and `restart_hint`. Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, `--on-demand`); without a flag `setup` picks one automatically exactly like 0.3.2.
 
 #### First-install and Update Error Handling
@@ -1484,8 +1611,10 @@ for a newly fixed bug" SOP:
 
 ## 依賴
 
-- Python 3.10+
-- `pyyaml`：`pipx install` 會自動帶入，無需手動安裝
+- Linux x86_64，glibc >= 2.39（Ubuntu 24.04 以上）
+- `/usr/bin/python3.12`：bundle 內附的 Python daemon runtime 綁定此直譯器（0.5.0 改 Rust daemon 後此需求消失）
+- `curl` 或 `wget`：下載 release 用（`--bundle` 離線安裝不需要）
+- `pyyaml`：已內附於 bundle，無需另外安裝
 - `jq`：`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）解析 session 狀態需要，不要直接 `minicom -D /dev/ttyUSBx`
 - `minicom`：human console 路徑需要，一律經 `serialwrap-minicom COMx` 呼叫，不要直接 `minicom -D /dev/ttyUSBx`（會與 daemon 搶 tty，two-reader）
 - 以上三項（`serialwrap-minicom`／`jq`／`minicom`）`serialwrap doctor` 皆會檢查是否在 PATH
@@ -1613,7 +1742,7 @@ broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）�
 
 ### `RELEASED` / `FLASHING`
 
-- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。詳見 `openspec/specs/device-handoff/spec.md`。
+- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。所屬 template 已改名或刪除的 released 紀錄，會以 `RELEASED` 佔位 session（passthrough、不可下命令）保留阻擋；對該 COM `device attach` 時佔位移除自身並解除阻擋，由 template 偵測在同一 COM 建立正式 session（OD-63）；對佔位 `session bind` 不解除阻擋（回 `released: true`、`recommended_action: device_attach`），開埠失敗時仍交 dynamic 偵測（保留原 COM），有 passthrough fallback template 時在原 COM 留下可重試的 `DETACHED` 列；沒有時不留列（`device attach` 回 `SESSION_NOT_FOUND`），原 COM 保留給該裝置至拔除或 daemon 重啟為止，之後由熱插或重啟重新偵測，COM 依 dynamic 規則重新分配、不保證沿用原 COM（與任何開不了埠的新裝置相同）。詳見 `openspec/specs/device-handoff/spec.md`。
 - `FLASHING`（#55）：外部 flasher 經 `/dev/ttyMCU` 認線後 session 進入，期間 `cmd submit` 回 `FLASHING_BUSY`、其他 COM 不受影響、daemon 不死；flash 結束自動恢復先前狀態。詳見 `openspec/specs/mcu-flash-broker/spec.md`。
 
 ## Agent / Human Co-work 時序圖
@@ -1732,16 +1861,22 @@ flowchart TD
 ## 快速開始
 
 ```bash
-# 安裝（正式流程）
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
-serialwrap doctor    # 驗證環境
+# 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
+./install.sh                     # 最新 release
+./install.sh --version 0.4.0     # 指定 release
+serialwrap doctor                # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
-- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- `install.sh` 位於 repo 根目錄（clone repo 或單獨下載該檔）。
+- 系統需求：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`。`install.sh` 安裝前先檢查，任一項不符即 exit 2 且不改動任何東西。
+- `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
+- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
+- 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
+- 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.0`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.0 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
@@ -2048,17 +2183,27 @@ prompt 擷取，但只裁切完成標記之後的 prompt，保留早先 prompt r
 與完成標記供呼叫端驗證；`command.get` 與 WAL META 記錄設定，
 reboot 保留既有 recovery 流程。詳見[命令完成條件](docs/command-completion.md)。
 
+broker 只認單獨一條的 reboot（`reboot`、`systemctl reboot`、`shutdown -r`、
+`echo b > /proc/sysrq-trigger`）。`firstboot -y && reboot`、`sysupgrade …` 這類串接或自帶重開機的命令，
+請加 `cmd submit --expect-reboot`（RPC `command.submit` 的布林 `expect_reboot`）：不管命令文字，
+一律走 reboot 路徑（送出當下 arm boot quiet window、不送 Ctrl-C／Ctrl-D、由 recovery 等板子回 `READY`）。
+沒帶旗標時，串接的 reboot 仍當一般命令執行，submit 回應多一則非致命 `CHAINED_REBOOT_WARNING`，
+執行行為不變。`--mode interactive` 帶旗標會被拒絕（`EXPECT_REBOOT_MODE_UNSUPPORTED`），非布林值回
+`INVALID_EXPECT_REBOOT`，同時帶 `--completion-regex` 時 reboot 優先（regex 不使用），旗標不繞過
+`AUTOBOOT_QUIET`。`--cmd-timeout` 要涵蓋 reboot 之前那一段的耗時。submit 回應回聲 `expect_reboot: true`，
+`command.get` 回報此設定。詳見[明示 reboot](docs/expect-reboot.md)。
+
 **命令限制**：命令字串不得含有 `\n` 換行字元，否則回傳 `CMD_CONTAINS_NEWLINE`。命令長度（UTF-8 位元組）> 4 KB 回 warning（`CMD_LENGTH_WARNING`），> 16 KB 拒絕（`CMD_TOO_LONG`）；broker 對命令內容不做截斷。注意這是 **broker 對單一 `--cmd` 參數的上限**，與 **target 端 tty line buffer（常見 4096 bytes）的物理單行限制**是兩回事——即使 broker 接受，過長單行仍可能在 target 端被截斷。上限可由 `serialwrap daemon status` 回應的 `limits` 欄位執行期查詢（`max_submit_cmd_bytes`／`warn_submit_cmd_bytes`／`reject_error_code`／`newline_error_code`／`warning_code`／`newline_forbidden`），client 不需硬編碼（#129）。
 
-**長命令 keepalive**：對於 `apt upgrade`、`make`、`python -m unittest` 等長時間命令，可加 `--expected-duration` 提示 broker 延長等待：
+**長命令與期限**：`--cmd-timeout`（預設 10 秒）是命令在 broker 內的總期限，即使命令一直有輸出，到點仍進恢復流程（先送 Ctrl-C，比不到 prompt 再送 Ctrl-D；Ctrl-D 打在已登入的 shell 等於登出）。另有靜默上限 `min(--cmd-timeout, 30 秒)`：一個等待窗內完全沒有新 RX 即視為靜默，同樣進恢復流程。`--expected-duration` 只把總期限延長為 `max(--cmd-timeout, --expected-duration)`，**不延長靜默上限**，適合 `make`、`python -m unittest` 這類持續有輸出的長命令：
 
 ```bash
 serialwrap cmd submit --selector COM0 --mode line --source agent:ci \
   --cmd "python3 -m unittest discover -s tests -v" \
-  --timeout 300 --expected-duration 120
+  --cmd-timeout 30 --expected-duration 300
 ```
 
-broker 會在命令執行期間監控 UART RX 活動，有輸出時自動延長等待。詳見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
+會靜默的長命令（如 `sleep 60`）請在板上用 `setsid sh -c '…' </dev/null >/dev/null 2>&1 &` 丟背景，再以短命令輪詢結果；`--mode background` 與 `line` 共用同一段期限邏輯，不是長命令的出口。歷史設計記錄見 [`docs/design-heartbeat-keepalive.md`](./docs/design-heartbeat-keepalive.md)。
 
 ### 2. `background`
 
@@ -2087,6 +2232,28 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 ```
 
 `--encoding key` 目前支援：`enter`、`tab`、`escape`、`ctrl-c`、`ctrl-d`、`up`、`down`、`left`、`right`。
+
+#### 來源標籤（`--source`）
+
+`--source`（`cmd submit`／`file push`／`file pull`／`device release`）不只是追蹤標籤：
+daemon 依 RPC 原始來源決定命令逾時（沒等到 prompt）時怎麼處理。
+`session interactive-open --owner` 只標示 lease 擁有者，不授予命令的 human 權限。
+
+| 前綴 | 歸類 | 命令逾時時 |
+|------|------|-----------|
+| `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 先送 CTRL-C、再送 CTRL-D 嘗試把 prompt 叫回來——停在 shell 的 console 會被 CTRL-D **登出**；boot quiet window 內不送按鍵 |
+| RPC 原始來源恰為 bare `human`／`human:` | 正規化為 `human:cli`；依 OD-74 為 human | **不送任何按鍵**，命令逾時升級成 interactive lease；可通過 human gate |
+| 明寫 `human:<名>`（包括 `human:cli`） | 顯示分類為 human；依 DF-02 為 agent | 逾時與 boot quiet gate 照 agent 處理；`source_class` 不授權 |
+| `system`、`system:*` | 保留 | daemon 內部（強制恢復、self-test、登入探測）專用，外部呼叫回 `SOURCE_RESERVED` |
+
+- 只有 RPC 原始輸入恰為 bare `human` 或 `human:`（沒名字）才依 OD-74 **正規化為 `human:cli`**
+  並取得 human gate／逾時行為；成功回應帶 `source`（正規化後的值）與 `source_normalized_from`
+  （原字串）。明寫 `human:<名>`（包括 `human:cli`）依 DF-02 照 agent gate／逾時處理；
+  `source_class` 僅供顯示，不授權。`session interactive-open --owner` 不正規化 bare `human`。
+- `system`／`system:*` 由 CLI 與 daemon 兩端拒絕（`error_code: SOURCE_RESERVED`），在排隊與送 UART 之前就擋下；
+  `systemd:x` 之類只是長得像的字串不受影響。
+- 其他沒見過的前綴（`codex`、`cli`、`agent`…）維持 agent 行為，不報錯。
+- `cmd submit` 的回應與 `cmd status` 的 `command` 記錄帶 `source_class`（`human`／`agent`）供顯示；不能據此判定原始來源是否獲得 human 權限。
 
 #### Bootloader Recovery Lease
 
@@ -2135,6 +2302,8 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 **適用範圍＝小檔**。`file push` 針對設定檔、腳本、探針這類數十 KB 內的檔案。UART 115200 baud 的原始上限約 11 KB/s，再加上下述 echo-ACK 節流會更低——一顆 81 MB 的 firmware image 即使通道完全穩定也要數小時。只要 DUT 有 SSH／TFTP／HTTP 可達，大檔一律走 SCP／TFTP，serialwrap 只負責控制面（以 `cmd submit` 觸發板端的 `scp`／`tftp`／`wget` 並觀察結果）。大檔用 `file push` 只能是**確認 DUT 無任何網路通道後**的明確 fallback，並在紀錄裡說明原因。
 
 長命令可能超過 console 的輸入上限；#166 已分別確認工具缺失及一塊 prpl 板約 505-byte 的行長限制，增加 timeout 不能修復截斷。`file push` 仍預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時該命令未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s`）。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變；不把加大 timeout 當成 #166 的修法。
+
+`file push`／`file pull` 傳輸中若 session 進入 drain（release、recovery、clear、rebind）、bridge 世代前進或傳輸被取消，傳輸即停止送出並回應（OD-62，比照 BC-03）：本次傳輸尚未有任何 byte 寫入 UART → `FLUSHED_BY_RECOVERY`（session 回 `READY` 後可重送）；已寫出至少 1 byte → `COMMAND_ABORTED_IN_FLIGHT`（勿直接重送，先確認目標狀態；目標端可能殘留部分寫入的 `/tmp/.sw_upload_*`）。`file push` 附 `chunks_sent`／`chunks_total`。回 `COMMAND_ABORTED_IN_FLIGHT` 時與一般命令相同，WAL 另寫一筆 `command_aborted_in_flight` META：`cmd_id` 為該次傳輸的 cmd_id 前綴 `ft-<8hex>`（各子命令 TX 紀錄的 cmd_id 為 `ft-<8hex>-<子命令>`），`confirmed_tx_bytes` 為整段傳輸累計。0.3.2 在這些情境回 `TRANSFER_TIMEOUT`；傳輸中進入 boot quiet 仍回 `AUTOBOOT_QUIET`＋`retry_after_s`。
 
 詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 
@@ -2627,7 +2796,7 @@ serialwrap setup --with-com0com
 - **生命週期控制**：`daemon restart` 提供具備 two-reader 安全防護之重啟機制（有序停止舊 daemon、等待行程於 10 秒內完全結束並釋放裝置控制代碼，確認釋放後再啟動新實例）。
 - **監管模式切換**：`supervision-mode set <MODE>` 可在 `on-demand`、`systemd-user`、`systemd-system`、`windows-task` 與 `windows-service` 之間動態切換（Windows 上 `windows-service` 輸出 `pending_sudo` 指令由管理員執行）。切換前執行嚴格之安全預檢與原子交接（`daemon.handoff_stop`）：若有 Flash 燒錄、檔案傳輸、活躍操作或探測不明時一律拒絕切換，且此保護**不受 `--force` 影響**（`--force` 不覆寫交接護欄，只在輸出標記 `force_ignored:true`）。
 - **Windows Task 監管**：`windows-task` 透過 Windows Task Scheduler（`schtasks`）排程工作進行監管，設定 `ExecutionTimeLimit=PT0S`，常駐背景運行並於使用者登入時自動啟動，崩潰時自動重啟（`RestartOnFailure`）。
-- **版本回滾**：`setup --rollback` 透過 `install-journal.json` 原子回滾至上一有效版本之二進位檔、Python runtime 與監管排程設定。
+- **版本回滾**：`setup --rollback` 透過 `install-journal.json` 原子回滾至上一有效版本之二進位檔、Python runtime 與監管排程設定。第一次從 pipx 的 0.3.2 換成 bundle 時沒有上一個 bundle 版本，因此 `setup --rollback` 不能回到該 pipx 安裝：命令回 `INVALID_ARGS`（`rollback_unavailable`），且不改動現場。手動回到 0.3.2 不是受支援的降級。
 - **0.3.x daemon 執行中直接升級（OD-48、SC-39）**：0.3.x daemon 不支援 `daemon.handoff_stop`。`setup` 正向辨識它（版本低於 0.4.0、為 bundle `versions/` 以外的 pipx Python daemon 行程）後，flash 或忙碌時拒絕；否則把舊行程資訊記進 `install-journal.legacy.json`，以原監管手段停止（為 unit 的 MainPID 時 `systemctl stop`，否則 RPC `daemon.stop`；不硬殺）。舊行程樹結束、且沒有同使用者行程持有 UART，連續 5 秒（上限 330 秒）才切換，之後啟動新 daemon。後續步驟失敗時還原安裝，但**不會**重啟舊 daemon；回應附 `legacy_daemon_stopped`、`restored` 與 `restart_hint`。升級時請明確指定目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇。
 
 #### 首次安裝與更新錯誤處置對照表
@@ -3246,18 +3415,19 @@ Windows（Rust daemon）上 handler 置於 Job Object 內，`shell` 規則以 `c
 ## 安裝
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
-serialwrap doctor    # 驗證環境
+# 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
+./install.sh                     # 最新 release
+./install.sh --version 0.4.0     # 指定 release
+serialwrap doctor                # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
-- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
+- 系統需求、`--bundle` 離線安裝、本機開發安裝與 0.3.x 升級說明見[快速開始](#快速開始)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
-依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
+依賴：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`（`pyyaml` 已內附於 bundle）；human console 路徑另需 `jq` 與 `minicom`。
 
 ## 使用方式
 
@@ -3271,7 +3441,7 @@ serialwrap client（支援本機 Unix socket 與遠端 endpoint）
 
 options:
   -h, --help           show this help message and exit
-  --version            顯示版本後離開
+  --version            顯示版本與程式碼指紋後離開
   -v, --verbose        提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）

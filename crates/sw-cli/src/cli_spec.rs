@@ -34,6 +34,8 @@ pub const GROUP_ORDER: [&str; 20] = [
     "skill",
 ];
 
+const SOURCE_HELP: &str = "system／system:* 為保留來源並會拒絕；bare human 正規化為 human:cli 並走 human 行為；明寫 human:<名> 依 DF-02 走 agent 行為。";
+
 fn spec_device() -> ParserSpec {
     ParserSpec {
         prog: "serialwrap device".to_string(),
@@ -77,7 +79,7 @@ fn spec_device() -> ParserSpec {
         actions: vec![
             ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--selector"], dest: "selector", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: None, metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("cli".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("cli".to_string()), choices: None, required: false, help: Some(SOURCE_HELP.to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--reason"], dest: "reason", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: None, metavar: None, version: None },
         ],
         mutex: vec![
@@ -333,7 +335,7 @@ fn spec_session() -> ParserSpec {
         actions: vec![
             ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--selector"], dest: "selector", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: Some("session_id | COMx | alias".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--owner"], dest: "owner", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--owner"], dest: "owner", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: Some(SOURCE_HELP.to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--timeout"], dest: "interactive_timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::Float(60.0), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--command"], dest: "command", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--allow-attached"], dest: "allow_attached", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("允許在 ATTACHED 狀態下開啟 bootloader recovery lease（需通過 bootloader prompt 比對）。 若 session 已有 human interactive lease 則暫停並在 close 時恢復。".to_string()), metavar: None, version: None },
@@ -707,12 +709,13 @@ fn spec_cmd() -> ParserSpec {
             ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--selector"], dest: "selector", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: true, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--cmd"], dest: "command_text", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("".to_string()), choices: None, required: false, help: Some("要執行的單行命令（UTF-8 > 4096 bytes warning、> 16384 bytes 拒絕，詳見上方說明）".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: Some(SOURCE_HELP.to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--mode"], dest: "mode", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("line".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--priority"], dest: "priority", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Int, default: ArgValue::Int(sw_proto::pyjson::PyInt::Small(10)), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--cmd-timeout"], dest: "cmd_timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::Float(10.0), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--expected-duration"], dest: "expected_duration_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::None, choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--completion-regex"], dest: "completion_regex", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("每命令完成 regex（最多 1024 UTF-8 bytes）；省略則等待 profile prompt".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--expect-reboot"], dest: "expect_reboot", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("明示此命令會重開機（如 `firstboot -y && reboot`、`sysupgrade`）：不管命令文字一律走 reboot 路徑；不可與 --mode interactive 併用".to_string()), metavar: None, version: None },
         ],
         mutex: vec![
         ],
@@ -980,7 +983,7 @@ fn spec_file() -> ParserSpec {
             ActionSpec { option_strings: vec!["--chunk-size"], dest: "chunk_size", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Int, default: ArgValue::Int(sw_proto::pyjson::PyInt::Small(512)), choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--chunk-timeout"], dest: "chunk_timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::None, choices: None, required: false, help: Some("單一 chunk 等待 target 回應的逾時秒數（預設：沿用 profile timeout_s，#157）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--ack-mode"], dest: "ack_mode", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("auto".to_string()), choices: Some(vec!["auto", "echo", "none"]), required: false, help: Some("chunk 命令行送出方式（#161）：auto=有 echo-ACK 原語即節流（預設）、echo=強制 echo-ACK、none=legacy 整行送出（急件換吞吐）".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: Some(SOURCE_HELP.to_string()), metavar: None, version: None },
         ],
         mutex: vec![
         ],
@@ -1001,7 +1004,7 @@ fn spec_file() -> ParserSpec {
             ActionSpec { option_strings: vec!["--local"], dest: "local", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: None, metavar: None, version: None },
             ActionSpec { option_strings: vec!["--chunk-timeout"], dest: "chunk_timeout_s", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Float, default: ArgValue::None, choices: None, required: false, help: Some("整段 base64 讀取的逾時秒數（預設：沿用 profile timeout_s，#157）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--ack-mode"], dest: "ack_mode", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("auto".to_string()), choices: Some(vec!["auto", "echo", "none"]), required: false, help: Some("介面對齊 file push（#161）；pull 端目前僅驗證、不影響行為".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: None, metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--source"], dest: "source", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Str("agent".to_string()), choices: None, required: false, help: Some(SOURCE_HELP.to_string()), metavar: None, version: None },
         ],
         mutex: vec![
         ],
@@ -1819,9 +1822,12 @@ on-demand 模式：不可用。",
 fn spec_setup(_d: &SpecDefaults) -> ParserSpec {
     ParserSpec {
         prog: "serialwrap setup".to_string(),
-        description: Some("物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。
-未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。
-system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。"),
+        description: Some(concat!(
+            "物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。\n",
+            "未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。\n",
+            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。\n",
+            "systemd 服務已在跑但 daemon 程式碼指紋過期時，預設自動 restart；--no-restart 可略過。"
+        )),
         epilog: None,
         raw_text: true,
         raw_description: false,
@@ -1834,6 +1840,7 @@ system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo �
             ActionSpec { option_strings: vec!["--on-demand"], dest: "on_demand", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("設為 on-demand 模式（無 systemd 時的降級備援）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--force"], dest: "force", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("覆蓋既有 profiles，並在 flash 進行中仍強制切換".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--with-sudo"], dest: "with_sudo", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）".to_string()), metavar: None, version: None },
+            ActionSpec { option_strings: vec!["--no-restart"], dest: "no_restart", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("daemon 指紋過期時不自動 restart systemd service".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--windows-task"], dest: "windows_task", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以工作排程器登入自啟監管（Windows 預設）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--windows-service"], dest: "windows_service", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("Windows：以 Windows 服務監管（OD-12：只列出待執行指令）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--rollback"], dest: "rollback", kind: ActionKind::StoreTrue, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Bool(false), choices: None, required: false, help: Some("回滾到上一個完整發佈組合（Previous）".to_string()), metavar: None, version: None },
@@ -1892,7 +1899,7 @@ pub fn root_spec(d: &SpecDefaults) -> ParserSpec {
         allow_abbrev: true,
         actions: vec![
             ActionSpec { option_strings: vec!["-h", "--help"], dest: "help", kind: ActionKind::Help, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("show this help message and exit".to_string()), metavar: None, version: None },
-            ActionSpec { option_strings: vec!["--version"], dest: "version", kind: ActionKind::Version, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("顯示版本後離開".to_string()), metavar: None, version: Some(d.version_line.clone()) },
+            ActionSpec { option_strings: vec!["--version"], dest: "version", kind: ActionKind::Version, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("顯示版本與程式碼指紋後離開".to_string()), metavar: None, version: Some(d.version_line.clone()) },
             ActionSpec { option_strings: vec!["-v", "--verbose"], dest: "verbose", kind: ActionKind::Count, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::Count(0), choices: None, required: false, help: Some("提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--socket"], dest: "socket", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）".to_string()), metavar: None, version: None },
             ActionSpec { option_strings: vec!["--endpoint"], dest: "endpoint", kind: ActionKind::Store, nargs: Nargs::One, conv: Conv::Str, default: ArgValue::None, choices: None, required: false, help: Some("遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）".to_string()), metavar: Some(sw_proto::constants::METAVAR_ENDPOINT), version: None },
