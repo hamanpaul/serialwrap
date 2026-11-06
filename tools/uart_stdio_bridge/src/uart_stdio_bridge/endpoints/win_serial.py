@@ -270,7 +270,13 @@ class WinSerialEndpoint:
             configured_timeout = serial_obj.write_timeout
             # 設定 COM timeout 本身也會耗時；若設定後的 timeout 比呼叫剩餘預算多出 driver 解析度，
             # 即使 deadline 尚未完全到期也不得送出，避免把設定前的完整預算帶進 write。
-            if configured_timeout is None or configured_timeout > remaining + 1e-9:
+            if configured_timeout is None:
+                return 0
+            if configured_timeout > remaining + 1e-9:
+                # 本次 setter 成本已記入 reserve；還夠再設定一次就交回外層重試，否則維持不送出。
+                # 直接回 0 會讓呼叫端把「還有期限」誤判成寫不進去。
+                if remaining - self._last_timeout_set_elapsed_s >= _WRITE_TIMEOUT_RESOLUTION_S:
+                    return None
                 return 0
             return self._write_peer_gated_locked(serial_obj, data, deadline)
 

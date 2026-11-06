@@ -1280,6 +1280,40 @@ def test_partial_setter_deadline_consumption_does_not_send_with_stale_timeout(fa
         ep.close()
 
 
+def test_setter_cost_with_budget_left_retries_instead_of_returning_zero(fake_serial_module, monkeypatch):
+    """setter 耗時讓設定值略超過剩餘期限時，只要還夠再設定一次就要重試，不得回 0。
+
+    第一次設定時 reserve 還沒有 setter 成本，1 ms 量化餘裕一旦被搶占吃掉就會走到這裡。
+    回 0 會讓呼叫端把「還有 950 ms」誤判成寫不進去。真的不夠時的不送出語意由
+    test_partial_setter_deadline_consumption_does_not_send_with_stale_timeout 釘住。
+    """
+    from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
+
+    clock = _ControlledClock()
+
+    class CostlySetterSerial(TimedSerial):
+        @property
+        def write_timeout(self) -> float | None:
+            return self._write_timeout
+
+        @write_timeout.setter
+        def write_timeout(self, value: float | None) -> None:
+            TimedSerial.write_timeout.fset(self, value)
+            clock.advance(0.05)
+
+    fake = CostlySetterSerial()
+    ep = WinSerialEndpoint("COMb", serial_factory=RecordingFactory(fake))
+    ep.open()
+    try:
+        with monkeypatch.context() as patch:
+            _patch_endpoint_clock(patch, clock)
+            assert ep.write_some(b"A", 1.0) == 1
+        assert fake.writes == [b"A"]
+        assert fake.write_timeout == pytest.approx(0.9), "第二次須以扣掉 setter 成本後的預算設定"
+    finally:
+        ep.close()
+
+
 def test_write_timeout_quantization_prevents_setter_churn(fake_serial_module, monkeypatch):
     """期限剩餘量的亞毫秒抖動量化後不應每次寫入都重設 COM timeout。"""
     from uart_stdio_bridge.endpoints.win_serial import WinSerialEndpoint
