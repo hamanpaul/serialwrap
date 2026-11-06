@@ -4597,6 +4597,7 @@
         "DEVICE_ALREADY_BOUND",
         "SESSION_RECOVERING"
       ],
+      "x-error-order-note": "OD-63 RELEASED 佔位 session 的早退（回 ok:true、released:true、recommended_action:device_attach）排在 FLASHING_BUSY 之前：INVALID_ARGS、SESSION_NOT_FOUND 之後即判定佔位，佔位 session 不會走到 FLASHING_BUSY、DEVICE_ALREADY_BOUND、SESSION_RECOVERING 檢查（OD-77 B5，只補契約說明、不改行為）",
       "side_effects": [
         {
           "what": "detach（REBOUND）、離開 RELEASED、_binding_overrides[sid]=by_id、_save_state()、spawn attach",
