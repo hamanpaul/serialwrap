@@ -3,7 +3,6 @@
 //! 引擎只依賴 [`TransferPort`]（T5 的 `OpTransferPort` 之後實作它），不直接碰 `OpCtx`／`TxWriter`；
 //! 也不自行判定 RPC 錯誤碼——只回傳 Python 相同鍵序的 `PyDict` 或 [`TransferAbort`]（OD-62）。
 
-#[allow(dead_code, unused_imports)]
 pub mod rx_match;
 pub mod templates;
 
@@ -308,8 +307,168 @@ pub fn push_file(
     ids: &mut dyn TransferIds,
     p: &PushParams,
 ) -> Res<PyDict> {
-    let _ = (port, files, ids, p);
-    todo!("P8-T4")
+    if !t::ACK_MODES.contains(&p.ack_mode.as_str()) {
+        let mut d = err("INVALID_ARGS");
+        d.insert("ack_mode", s(&p.ack_mode));
+        return Ok(d);
+    }
+    if let Some(e) = validate_budget(p.max_console_line_chars) {
+        return Ok(e);
+    }
+    if p.chunk_size <= 0 {
+        let mut d = err("INVALID_ARGS");
+        d.insert("chunk_size", n(p.chunk_size));
+        return Ok(d);
+    }
+    if !files.is_file(&p.local_path) {
+        let mut d = err("LOCAL_FILE_NOT_FOUND");
+        d.insert("local_path", s(&p.local_path));
+        return Ok(d);
+    }
+    let supports = port.supports_echo_paced();
+    let paced = match p.ack_mode.as_str() {
+        "none" => false,
+        "echo" if !supports => return Ok(err("ECHO_ACK_UNSUPPORTED")),
+        _ => supports,
+    };
+
+    let data = files.read_all(&p.local_path).map_err(TransferAbort::LocalIo)?;
+    let md5_expected = t::md5_hex(&data);
+    let tmp = format!("/tmp/.sw_upload_{}", ids.hex(12));
+    let prefix = format!("ft-{}", ids.hex(8));
+    let budget = p.max_console_line_chars;
+
+    let fixed = [t::md5_command(&tmp), t::mv_command(&tmp, &p.remote_path), t::cleanup_command(&tmp)];
+    if t::line_budget_exceeded(&fixed.iter().map(String::as_str).collect::<Vec<_>>(), budget) {
+        return Ok(line_limit_error(budget));
+    }
+    if t::line_budget_exceeded(&[t::decoder_probe_command().as_str()], budget) {
+        return Ok(line_limit_error(budget));
+    }
+
+    let raw_capacity: i128;
+    if let Some(b) = budget {
+        let empties: Vec<String> = t::DECODERS
+            .iter()
+            .flat_map(|d| [">", ">>"].into_iter().map(move |op| (*d, op)))
+            .map(|(d, op)| t::chunk_command("", d, op, &tmp).expect("固定 decoder"))
+            .collect();
+        let max_overhead = empties.iter().map(|c| c.len() as i128).max().unwrap_or(0);
+        raw_capacity = ((b - max_overhead).div_euclid(4) * 3).max(0);
+        // Python 的 `//` 為 floor division；`(b - overhead)` 為負時結果被 max(0) 吸收。
+        if t::line_budget_exceeded(&empties.iter().map(String::as_str).collect::<Vec<_>>(), budget) {
+            return Ok(line_limit_error(budget));
+        }
+        if !data.is_empty() && raw_capacity < 1 {
+            return Ok(line_limit_error(budget));
+        }
+    } else {
+        raw_capacity = p.chunk_size;
+    }
+
+    let mut sess = Session {
+        port,
+        tag: Tag { prefix: &prefix },
+        source: &p.source,
+        timeout: p.timeout,
+        prompt_regex: &p.prompt_regex,
+        re: None,
+    };
+
+    let decoder = match sess.probe(true, &prefix)? {
+        Ok(d) => d,
+        Err(code) => return Ok(err(code)),
+    };
+
+    let effective = p.chunk_size.min(raw_capacity);
+    if !data.is_empty() && effective < 1 {
+        return Ok(line_limit_error(budget));
+    }
+    if budget.is_some() {
+        let probe_size = (effective.max(0) as usize).min(data.len());
+        let probe_chunk = t::b64encode(&vec![0u8; probe_size]);
+        let cmds: Vec<String> = [">", ">>"]
+            .iter()
+            .map(|op| t::chunk_command(&probe_chunk, decoder, op, &tmp).expect("固定 decoder"))
+            .collect();
+        if t::line_budget_exceeded(&cmds.iter().map(String::as_str).collect::<Vec<_>>(), budget) {
+            return Ok(line_limit_error(budget));
+        }
+    }
+
+    let chunks = t::split_chunks(&data, effective.max(1) as usize);
+    let total = chunks.len();
+
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let prog = Some((idx, total));
+        let op = if idx == 0 { ">" } else { ">>" };
+        let cmd = t::chunk_command(&t::b64encode(chunk), decoder, op, &tmp).expect("decoder 已探測");
+        if t::line_budget_exceeded(&[cmd.as_str()], budget) {
+            sess.cleanup(&tmp, &prefix, prog)?;
+            return Ok(line_limit_error(budget));
+        }
+        let pre = sess.port.rx_snapshot_len();
+        let cmd_id = format!("{prefix}-{idx}");
+        if paced {
+            let r = sess
+                .port
+                .send_command_echo_paced(&cmd, &p.source, Some(&cmd_id), p.echo_slice_size, p.echo_timeout)
+                .map_err(|e| sess.tag.with(e, prog))?;
+            if !r.ok {
+                sess.port.cancel_input_line(&p.source).map_err(|e| sess.tag.with(e, prog))?;
+                sess.cleanup(&tmp, &prefix, prog)?;
+                let mut d = err_progress("TRANSFER_ECHO_STALL", idx, total);
+                d.insert("acked_chars", n(r.acked_chars as i128));
+                d.insert("sent_chars", n(r.sent_chars as i128));
+                return Ok(d);
+            }
+        } else {
+            sess.send(&cmd, &cmd_id, prog)?;
+        }
+        if !sess.wait(pre, prog)? {
+            sess.cleanup(&tmp, &prefix, prog)?;
+            return Ok(err_progress("TRANSFER_TIMEOUT", idx, total));
+        }
+        if !m::runtime_sentinel_seen(&sess.port.rx_text_from(pre), t::CHUNK_SENTINEL, Some(&cmd)) {
+            sess.cleanup(&tmp, &prefix, prog)?;
+            return Ok(err_progress("TARGET_DECODER_FAILED", idx, total));
+        }
+    }
+
+    match sess.remote_md5(&tmp, &prefix)? {
+        None => {
+            sess.cleanup(&tmp, &prefix, None)?;
+            return Ok(err("CHECKSUM_VERIFY_FAILED"));
+        }
+        Some(actual) if actual != md5_expected => {
+            sess.cleanup(&tmp, &prefix, None)?;
+            let mut d = err("CHECKSUM_MISMATCH");
+            d.insert("expected", s(&md5_expected));
+            d.insert("actual", s(&actual));
+            return Ok(d);
+        }
+        Some(_) => {}
+    }
+
+    let mv = t::mv_command(&tmp, &p.remote_path);
+    if t::line_budget_exceeded(&[mv.as_str()], budget) {
+        sess.cleanup(&tmp, &prefix, None)?;
+        return Ok(line_limit_error(budget));
+    }
+    let Some(raw) = sess.run(&mv, &format!("{prefix}-mv"), None)? else {
+        return Ok(err("MOVE_TIMEOUT"));
+    };
+    if !m::runtime_sentinel_seen(&raw, t::MV_SENTINEL, Some(&mv)) {
+        return Ok(err("MOVE_FAILED"));
+    }
+
+    let mut d = PyDict::new();
+    d.insert("ok", PyValue::Bool(true));
+    d.insert("bytes", n(data.len() as i128));
+    d.insert("chunks", n(total as i128));
+    d.insert("md5", s(&md5_expected));
+    d.insert("remote_path", s(&p.remote_path));
+    Ok(d)
 }
 
 /// 分段收集 pull 的輸出（OD-80）：不依賴 RX 視窗，逐輪把已到達的完整行搬進本地緩衝。
@@ -355,6 +514,85 @@ pub fn pull_file(
     ids: &mut dyn TransferIds,
     p: &PullParams,
 ) -> Res<PyDict> {
-    let _ = (port, files, ids, p);
-    todo!("P8-T4")
+    let local_path = match &p.local_path {
+        Some(l) => l.clone(),
+        None => basename(p.path_flavor, &p.remote_path),
+    };
+    if let Some(e) = validate_budget(p.max_console_line_chars) {
+        return Ok(e);
+    }
+    let prefix = format!("ft-{}", ids.hex(8));
+    let budget = p.max_console_line_chars;
+
+    let md5_cmd = t::md5_command(&p.remote_path);
+    let probe_cmd = t::encoder_probe_command();
+    if t::line_budget_exceeded(&[probe_cmd.as_str(), md5_cmd.as_str()], budget) {
+        return Ok(line_limit_error(budget));
+    }
+    let candidates: Vec<String> = t::ENCODERS
+        .iter()
+        .map(|e| t::pull_command(&p.remote_path, e).expect("固定 encoder"))
+        .collect();
+    if t::line_budget_exceeded(&candidates.iter().map(String::as_str).collect::<Vec<_>>(), budget) {
+        return Ok(line_limit_error(budget));
+    }
+
+    let mut sess = Session {
+        port,
+        tag: Tag { prefix: &prefix },
+        source: &p.source,
+        timeout: p.timeout,
+        prompt_regex: &p.prompt_regex,
+        re: None,
+    };
+
+    let encoder = match sess.probe(false, &prefix)? {
+        Ok(e) => e,
+        Err(code) => return Ok(err(code)),
+    };
+
+    let cmd = t::pull_command(&p.remote_path, encoder).expect("encoder 已探測");
+    if t::line_budget_exceeded(&[cmd.as_str()], budget) {
+        return Ok(line_limit_error(budget));
+    }
+    let pre = sess.port.rx_snapshot_len();
+    sess.send(&cmd, &format!("{prefix}-b64"), None)?;
+    let Some(raw) = collect_until_prompt(&mut sess, pre)? else {
+        return Ok(err("TRANSFER_TIMEOUT"));
+    };
+
+    let Some(b64) = m::extract_between_sentinels(&raw, Some(&cmd)) else {
+        if m::failure_sentinel_seen(&raw, t::ENCODER_FAILURE_SENTINEL, Some(&cmd)) {
+            return Ok(err("TARGET_ENCODER_FAILED"));
+        }
+        return Ok(err("PULL_PARSE_FAILED"));
+    };
+
+    // `base64.b64decode(str)`：含非 ASCII → ValueError；其餘非字母表字元丟棄，padding 錯誤 → binascii.Error。
+    if !b64.is_ascii() {
+        return Ok(err("BASE64_DECODE_FAILED"));
+    }
+    let Ok(data) = a2b_base64_lenient(b64.as_bytes()) else {
+        return Ok(err("BASE64_DECODE_FAILED"));
+    };
+
+    let md5_local = t::md5_hex(&data);
+    let Some(md5_remote) = sess.remote_md5(&p.remote_path, &prefix)? else {
+        return Ok(err("CHECKSUM_VERIFY_FAILED"));
+    };
+    if md5_remote != md5_local {
+        let mut d = err("CHECKSUM_MISMATCH");
+        d.insert("expected", s(&md5_remote));
+        d.insert("actual", s(&md5_local));
+        return Ok(d);
+    }
+
+    files.write_truncate(&local_path, &data).map_err(TransferAbort::LocalIo)?;
+
+    let mut d = PyDict::new();
+    d.insert("ok", PyValue::Bool(true));
+    d.insert("bytes", n(data.len() as i128));
+    d.insert("md5", s(&md5_local));
+    d.insert("local_path", s(&local_path));
+    Ok(d)
 }
