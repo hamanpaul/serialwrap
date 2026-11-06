@@ -13,10 +13,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use indexmap::IndexMap;
-use sw_core::Mono;
-use sw_core::actor::{ActorHandle, EffectExecutor, spawn_actor};
+use sw_core::actor::{spawn_actor, ActorHandle, EffectExecutor};
 use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
 use sw_core::drain::{StopId, WorkerStoppedReceipt};
 use sw_core::generations::EpochAllocator;
@@ -32,6 +31,7 @@ use sw_core::state_store::StateDelta;
 use sw_core::tx_writer::{Fence, TxLedger, TxLedgerGauge, TxWriterHandle};
 use sw_core::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use sw_core::wal::{WalAppendReq, WalConfig, WalHealthFanout, WalWriter};
+use sw_core::Mono;
 use sw_pal::fakes::clock::FakeClock;
 use sw_pal::fakes::env::FakeEnv;
 use sw_pal::fakes::serial::{FakeDevice, FakeSerialBackend};
@@ -40,9 +40,9 @@ use sw_pal::traits::{
     Clock, DevicePath, FlowControl, OpenError, PalError, Parity, ReadError, SerialBackend,
     SerialConfig,
 };
-use sw_proto::config_types::{ProfileFs, SessionProfile, load_profiles};
+use sw_proto::config_types::{load_profiles, ProfileFs, SessionProfile};
 use sw_proto::pycompat::{PyErr, PyOsError};
-use sw_proto::pyjson::{PyDict, PyValue, loads};
+use sw_proto::pyjson::{loads, PyDict, PyValue};
 use sw_proto::pypath::PathFlavor;
 
 /// 測試用 profile 目錄（只存在於記憶體 ProfileFs）。
@@ -130,6 +130,8 @@ pub struct CoreHarness {
     wal_metas: Vec<PyDict>,
     defer_state_commits: bool,
     pending_state_commits: Vec<(u64, StateDelta)>,
+    /// P6 Task 6：console／human TX 效果記錄。
+    p6: P6HarnessState,
 }
 
 struct HarnessWorkers {
@@ -209,6 +211,7 @@ impl CoreHarness {
         let (finish_tx, finish_rx) = bounded::<ControlEvent>(16);
 
         let wall_for_iso = Arc::clone(&wall_us);
+        let input_epoch_pub = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let deps = CoreDeps {
             fence: fence.clone(),
             registry: reg.clone(),
@@ -230,7 +233,7 @@ impl CoreHarness {
                     .cloned()
                     .map(Ok)
             }),
-            input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_epoch_pub: input_epoch_pub.clone(),
             bg_index: sw_core::capture::BackgroundIndex::new(),
         };
         let core = SessionCore::new(profile, "yaml-target", deps);
@@ -263,6 +266,7 @@ impl CoreHarness {
             wal_metas: Vec::new(),
             defer_state_commits: false,
             pending_state_commits: Vec::new(),
+            p6: P6HarnessState::new(input_epoch_pub),
         }
     }
 
@@ -393,8 +397,9 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: REAL_PATH.into(),
+            sentinel: None,
+            console_endpoint: None,
             rx: self.rx.clone(),
-            vtty: None,
         };
         self.feed(ControlEvent::BridgeOpened {
             epoch_hint: 0,
@@ -485,6 +490,7 @@ impl CoreHarness {
                 data: self.data_tx.clone(),
                 control: self.ctl_tx.clone(),
                 clock: self.clock.clone(),
+                hub: None,
             },
         )
     }
@@ -498,8 +504,9 @@ impl CoreHarness {
             epoch,
             worker,
             real_path: real_path.to_string(),
+            sentinel: None,
+            console_endpoint: None,
             rx: self.rx.clone(),
-            vtty: None,
         }
     }
 
@@ -634,6 +641,10 @@ impl CoreHarness {
         while let Some(item) = pending.pop() {
             let effects = self.core.on_event(item, self.clock.mono_ns()).0;
             for effect in effects {
+                // P6：記錄 console／human TX 效果；auto-complete 的結算排在本批之後投遞。
+                if let Some(ev) = self.record_p6(&effect) {
+                    pending.insert(0, MailboxItem::Control(ev));
+                }
                 match effect {
                     Effect::Reply(tx, result) => {
                         let _ = tx.try_send(result);
@@ -918,6 +929,12 @@ struct RigExec {
     runners: HashMap<u64, OpRunner>,
     /// Task 14：現行 worker 的 TX 入口（`tx_ledger_gauge()` 用）。
     current_tx: Arc<Mutex<Option<TxWriterHandle>>>,
+    /// P6 Task 6：每個 epoch 一條 human TX pump（07 D-15(5)）。
+    pumps: HashMap<u64, sw_core::human_console::human_tx::HumanTxPump>,
+    /// P6 Task 9：ConsoleHub（`ActorRig::new_with_hub`）。
+    hub: Option<Arc<sw_core::human_console::hub::HubHandle>>,
+    /// P6 Task 9／10：RPC thread 預建、等待 `ConsoleAdopt` 的 PtyPair。
+    pending_pty: Arc<Mutex<HashMap<u64, sw_pal::PtyPair>>>,
     /// 與 actor 共用的命令登錄表（op runner 的 abort META 寫入權）。
     registry: Arc<CommandRegistry>,
     /// 測試用：在 BeginDrain 前後暫停 actor，建立可控的 data lane backlog。
@@ -956,6 +973,13 @@ impl Drop for DrainPauseHandle {
     }
 }
 
+impl RigExec {
+    /// P6 Task 9：reader 的 hub tap（未接 hub 時 `None`）。
+    fn hub_tap(&self) -> Option<sw_core::human_console::hub::HubTap> {
+        self.hub.as_ref().map(|h| h.tap())
+    }
+}
+
 /// 測試用 nonce（8 位 hex；每次呼叫遞增，對應 Python `uuid4().hex[:8]`）。
 fn rig_nonce() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x5eed_0000);
@@ -989,14 +1013,16 @@ impl EffectExecutor for RigExec {
                                 data: self.data.clone(),
                                 control: tx.clone(),
                                 clock: self.clock.clone(),
+                                hub: self.hub_tap(),
                             },
                         );
                         Ok(OpenedBridge {
                             epoch,
                             worker,
                             real_path: dev.0.clone(),
+                            sentinel: None,
+                            console_endpoint: None,
                             rx: self.rx.clone(),
-                            vtty: None,
                         })
                     }
                     Err(OpenError::Held(holder)) => Err(OpenFailure::Held(holder)),
@@ -1054,6 +1080,9 @@ impl EffectExecutor for RigExec {
                 });
             }
             Effect::BeginDrain { stop_id, epoch } => {
+                if let Some(pump) = self.pumps.remove(&epoch) {
+                    pump.stop();
+                }
                 let pause = self
                     .drain_pause
                     .lock()
@@ -1160,14 +1189,83 @@ impl EffectExecutor for RigExec {
                     let _ = worker.tx().settle(op_id);
                 }
             }
-            // P6 Task 1：Slice 2.2 新增的 effect 變體（executor 行為由 Task 6／7／9／10 交付）。
-            Effect::ConsoleOut { .. }
-            | Effect::ConsoleClose { .. }
-            | Effect::ConsoleCloseAll
-            | Effect::ConsoleAdopt { .. }
-            | Effect::ConsoleDiscard { .. } => todo!("P6 Task 9"),
-            Effect::HumanTx { .. } => todo!("P6 Task 6"),
-            Effect::LeaseIndex(_) => todo!("P6 Task 7"),
+            // P6 Task 9：console I/O 效果交給 hub（未接 hub 時忽略）；LeaseIndex 屬 SessionManager（06 T15）。
+            Effect::ConsoleOut { client_id, item } => {
+                if let Some(hub) = self.hub.as_ref() {
+                    hub.out(client_id, item);
+                }
+            }
+            Effect::ConsoleClose { client_id } => {
+                if let Some(hub) = self.hub.as_ref() {
+                    hub.close(&client_id);
+                }
+            }
+            Effect::ConsoleCloseAll => {
+                if let Some(hub) = self.hub.as_ref() {
+                    hub.close_all();
+                }
+            }
+            Effect::ConsoleAdopt {
+                token,
+                client_id,
+                client_lifetime,
+                label,
+            } => {
+                let pair = self.pending_pty.lock().unwrap().remove(&token);
+                if let (Some(hub), Some(pair)) = (self.hub.as_ref(), pair) {
+                    if hub
+                        .cmd
+                        .try_send(sw_core::human_console::hub::HubCmd::AdoptPty {
+                            client_id,
+                            client_lifetime,
+                            label,
+                            pair,
+                        })
+                        .is_ok()
+                    {
+                        hub.waker.wake();
+                    }
+                }
+            }
+            Effect::ConsoleDiscard { token } => {
+                self.pending_pty.lock().unwrap().remove(&token);
+            }
+            Effect::LeaseIndex(_) => {}
+            // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）。
+            Effect::HumanTx {
+                tag,
+                permit,
+                payload,
+            } => {
+                let epoch = permit.epoch;
+                if !self.pumps.contains_key(&epoch) {
+                    if let Some(worker) = self.workers.get(&epoch) {
+                        let pump = sw_core::human_console::human_tx::HumanTxPump::spawn(
+                            "COM0",
+                            worker.tx().clone(),
+                            tx.clone(),
+                        );
+                        self.pumps.insert(epoch, pump);
+                    }
+                }
+                let refused = match self.pumps.get(&epoch) {
+                    Some(pump) => pump.try_submit(tag.clone(), permit.clone(), payload).is_err(),
+                    None => true,
+                };
+                if refused {
+                    let report = sw_core::tx_writer::TxReport {
+                        op_id: permit.op_id,
+                        epoch,
+                        result: sw_pal::traits::TxResult {
+                            outcome: sw_pal::traits::TxOutcome::NotSubmitted,
+                            error: None,
+                        },
+                        wal: None,
+                        reject: None,
+                    };
+                    let _ = tx.try_send(ControlEvent::HumanTxCompleted { tag, report });
+                }
+            }
         }
     }
 }
@@ -1190,6 +1288,10 @@ pub struct ActorRig {
     files: Arc<Mutex<BTreeMap<String, String>>>,
     drain_pause: Arc<Mutex<Option<DrainPauseState>>>,
     actor: ActorHandle,
+    /// P6 Task 9：附 hub 時的 PTY 替身工廠與待 adopt 的 PtyPair（executor 的 `pending_pty`）。
+    hub_fake: Option<sw_pal::fakes::console::FakeConsoleFactory>,
+    pending_pty: Arc<Mutex<HashMap<u64, sw_pal::PtyPair>>>,
+    next_token: std::sync::atomic::AtomicU64,
 }
 
 const RIG_WAIT: Duration = Duration::from_secs(5);
@@ -1202,15 +1304,58 @@ impl ActorRig {
         ActorRig::new_with(profile_yaml, |_| {})
     }
 
+    /// P6 Task 9：附 ConsoleHub（PTY 替身工廠）的 actor rig。
+    pub fn new_with_hub(profile_yaml: &str) -> ActorRig {
+        ActorRig::new_inner(profile_yaml, |_| {}, true, sw_core::capture::BackgroundIndex::new())
+    }
+
+    /// P6 Task 9：以 `SessionRequest::ConsoleAttach` 掛上 PTY 替身 console（executor 經 `ConsoleAdopt` 交給 hub）。
+    pub fn attach_pty_console(&self, cid: &str) -> sw_pal::fakes::console::FakeConsoleRef {
+        let fake = self
+            .hub_fake
+            .as_ref()
+            .expect("ActorRig::new_with_hub 才有 hub");
+        let io = sw_pal::fakes::console::FakeIo::unbounded();
+        let r = io.reference();
+        r.set_client_id(cid);
+        let pair = fake.pty_pair_from(io);
+        let slave_path = pair.slave_path.clone();
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst) + 1;
+        self.pending_pty.lock().unwrap().insert(token, pair);
+        let resp = self.request(SessionRequest::ConsoleAttach {
+            label: None,
+            pty: Some(sw_core::session_core::PtyInfo {
+                token,
+                slave_path,
+                client_id: cid.to_string(),
+            }),
+        });
+        assert_eq!(
+            resp.get("ok"),
+            Some(&PyValue::Bool(true)),
+            "console attach：{resp:?}"
+        );
+        r
+    }
+
     /// 同 `new`，但在 actor 啟動前可調整 `SessionCore`（Task 14：capture env、self-test 觀測注入）。
     pub fn new_with(profile_yaml: &str, setup: impl FnOnce(&mut SessionCore)) -> ActorRig {
-        ActorRig::new_with_bg_index(profile_yaml, setup, sw_core::capture::BackgroundIndex::new())
+        ActorRig::new_inner(profile_yaml, setup, false, sw_core::capture::BackgroundIndex::new())
     }
 
     /// 同 `new_with`，並注入共用的 background capture 索引（審查 F28：全域上限）。
     pub fn new_with_bg_index(
         profile_yaml: &str,
         setup: impl FnOnce(&mut SessionCore),
+        bg_index: Arc<sw_core::capture::BackgroundIndex>,
+    ) -> ActorRig {
+        ActorRig::new_inner(profile_yaml, setup, false, bg_index)
+    }
+
+    fn new_inner(
+        profile_yaml: &str,
+        setup: impl FnOnce(&mut SessionCore),
+        with_hub: bool,
         bg_index: Arc<sw_core::capture::BackgroundIndex>,
     ) -> ActorRig {
         let profile = profile_of(profile_yaml);
@@ -1236,6 +1381,7 @@ impl ActorRig {
         let env = Arc::new(FakeEnv::default());
         let files: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let files_for_read = Arc::clone(&files);
+        let input_epoch_pub = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let deps = CoreDeps {
             fence: fence.clone(),
             registry: reg.clone(),
@@ -1256,7 +1402,7 @@ impl ActorRig {
                     .get(p)
                     .map(|t| Ok(t.clone()))
             }),
-            input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            input_epoch_pub: input_epoch_pub.clone(),
             bg_index,
         };
         let exec_profile = profile.clone();
@@ -1265,6 +1411,26 @@ impl ActorRig {
         let current_tx: Arc<Mutex<Option<TxWriterHandle>>> = Arc::new(Mutex::new(None));
         let mailbox = Mailbox::new(256, 1024);
         let data = mailbox.data_sender();
+        let pending_pty: Arc<Mutex<HashMap<u64, sw_pal::PtyPair>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (hub_fake, hub) = if with_hub {
+            let fake = sw_pal::fakes::console::FakeConsoleFactory::new(sw_pal::ConsoleKind::Pty);
+            let platform = sw_pal::fakes::platform::platform()
+                .console(Arc::new(fake.clone()))
+                .clock(clock.clone())
+                .build();
+            let hub = sw_core::human_console::hub::spawn_hub(
+                "COM0".into(),
+                &platform,
+                mailbox.control_sender(),
+                mailbox.data_sender(),
+                clock.clone(),
+                input_epoch_pub.clone(),
+            );
+            (Some(fake), Some(Arc::new(hub)))
+        } else {
+            (None, None)
+        };
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let state_store = FakeStateStore::new();
         let drain_pause = Arc::new(Mutex::new(None));
@@ -1285,6 +1451,9 @@ impl ActorRig {
             env: env.clone(),
             runners: HashMap::new(),
             current_tx: current_tx.clone(),
+            pumps: HashMap::new(),
+            hub,
+            pending_pty: pending_pty.clone(),
             registry: reg.clone(),
             drain_pause: drain_pause.clone(),
         };
@@ -1304,6 +1473,9 @@ impl ActorRig {
             files,
             drain_pause,
             actor,
+            hub_fake,
+            pending_pty,
+            next_token: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1637,13 +1809,13 @@ use std::path::Path;
 use std::sync::Condvar;
 
 use sw_core::session_manager::{ManagerDeps, SessionManager};
-use sw_core::state_store::{LoadedState, StateStore, load_state};
-use sw_pal::ConsoleKind;
+use sw_core::state_store::{load_state, LoadedState, StateStore};
 use sw_pal::traits::{
     CancelToken, CloseImpl, CloseReceipt, CloseToken, ConsoleTransportFactory, DeviceInfo, FsOps,
     FsRead, HolderReport, HolderScanStatus, IoWaker, PalErrorKind, PalResult, ReadOutcome,
     SerialHandle, SerialReader, SerialWriter, SubmitGate, TxResult, UartExclusive,
 };
+use sw_pal::ConsoleKind;
 
 /// 管理者測試的 state.json 路徑（只存在於 RigFs）。
 pub const STATE_PATH: &str = "/fake/state/state.json";
@@ -2483,138 +2655,567 @@ impl ManagerRig {
 // ── P6 Slice 2.2 harness 簽章（07 Task 1；本體由 Task 6／7／9／10 的測試作者補齊）────────────────────────
 pub mod hub;
 
-use sw_core::human_console::{ConsoleTransportKind, ReplayHold};
-use sw_core::session_core::LeaseIndexOp;
+use sw_core::human_console::human_tx::HumanTxTag;
+use sw_core::human_console::{ConsoleScanSnapshot, ConsoleTransportKind, ReplayHold, ScanSource};
+use sw_core::op_runner::OpSpec;
+use sw_core::session_core::{Effects, FgAdmission, LeaseIndexOp, PtyInfo};
 use sw_core::tx_writer::{FenceReject, TxClass, TxPermit, TxReport};
 use sw_pal::traits::TxOutcome;
 
+/// P6 harness 的記錄狀態（`CoreHarness.p6`）。
+pub struct P6HarnessState {
+    auto_complete: bool,
+    human_tx: Vec<(TxClass, String, Vec<u8>)>,
+    last_permit: Option<TxPermit>,
+    unsettled: std::collections::VecDeque<(HumanTxTag, TxPermit)>,
+    tx_order: Vec<(TxClass, Vec<u8>)>,
+    warns: Vec<String>,
+    kinds: Vec<&'static str>,
+    lease_ops: Vec<LeaseIndexOp>,
+    next_token: u64,
+    next_lifetime: u64,
+    peers: std::collections::BTreeSet<String>,
+    input_epoch_pub: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl P6HarnessState {
+    pub fn new(input_epoch_pub: Arc<std::sync::atomic::AtomicU64>) -> P6HarnessState {
+        P6HarnessState {
+            auto_complete: true,
+            human_tx: Vec::new(),
+            last_permit: None,
+            unsettled: std::collections::VecDeque::new(),
+            tx_order: Vec::new(),
+            warns: Vec::new(),
+            kinds: Vec::new(),
+            lease_ops: Vec::new(),
+            next_token: 0,
+            next_lifetime: 1000,
+            peers: std::collections::BTreeSet::new(),
+            input_epoch_pub,
+        }
+    }
+}
+
+fn effect_kind(e: &Effect) -> &'static str {
+    match e {
+        Effect::Reply(..) => "Reply",
+        Effect::AdoptBridge { .. } => "AdoptBridge",
+        Effect::OpenBridge { .. } => "OpenBridge",
+        Effect::BeginDrain { .. } => "BeginDrain",
+        Effect::StartLogin { .. } => "StartLogin",
+        Effect::StartOp { .. } => "StartOp",
+        Effect::Schedule { .. } => "Schedule",
+        Effect::WalMeta { .. } => "WalMeta",
+        Effect::Persist { .. } => "Persist",
+        Effect::Notify(_) => "Notify",
+        Effect::Warn(_) => "Warn",
+        Effect::SettleTx { .. } => "SettleTx",
+        Effect::ConsoleOut { .. } => "ConsoleOut",
+        Effect::ConsoleClose { .. } => "ConsoleClose",
+        Effect::ConsoleCloseAll => "ConsoleCloseAll",
+        Effect::ConsoleAdopt { .. } => "ConsoleAdopt",
+        Effect::ConsoleDiscard { .. } => "ConsoleDiscard",
+        Effect::HumanTx { .. } => "HumanTx",
+        Effect::LeaseIndex(_) => "LeaseIndex",
+        Effect::Reattach { .. } => "Reattach",
+    }
+}
+
+/// StartOp 會送 UART 的 (class, 預定 bytes)。
+fn start_op_tx(spec: &OpSpec) -> Option<(TxClass, Vec<u8>)> {
+    let line = |s: &str| {
+        let mut b = s.as_bytes().to_vec();
+        if !s.ends_with('\n') {
+            b.push(b'\n');
+        }
+        b
+    };
+    match spec {
+        OpSpec::Command(q) => Some((TxClass::Command, line(&q.req.command))),
+        OpSpec::InteractiveOpenCmd { command, .. } => {
+            Some((TxClass::InteractiveOpenCmd, line(command)))
+        }
+        OpSpec::InteractiveSend { payload, .. } => Some((TxClass::LeaseOwner, payload.clone())),
+        OpSpec::SelfTestProbe { probe, .. } => Some((TxClass::SelfTestProbe, line(probe))),
+        OpSpec::Recover { .. } => Some((TxClass::SystemRecoverKey, Vec::new())),
+        _ => None,
+    }
+}
+
 impl CoreHarness {
-    /// `SessionRequest::ConsoleAttach`（harness 配 `PtyInfo` token；cid 由固定 rng 決定時以回傳值為準）＋`ConsoleScan`。
-    pub fn attach_pty_console(&mut self, _cid: &str, _peer: bool) -> PyDict {
-        todo!("P6 Task 6")
+    /// 記錄 P6 效果；回傳需要投遞的後續事件（auto-complete 的 `HumanTxCompleted`）。
+    fn record_p6(&mut self, effect: &Effect) -> Option<ControlEvent> {
+        self.p6.kinds.push(effect_kind(effect));
+        match effect {
+            Effect::Warn(w) => self.p6.warns.push(w.clone()),
+            Effect::LeaseIndex(op) => self.p6.lease_ops.push(op.clone()),
+            Effect::StartOp { spec, .. } => {
+                if let Some(tx) = start_op_tx(spec) {
+                    self.p6.tx_order.push(tx);
+                }
+            }
+            Effect::HumanTx {
+                tag,
+                permit,
+                payload,
+            } => {
+                self.p6
+                    .human_tx
+                    .push((permit.class, permit.source.clone(), payload.clone()));
+                self.p6.tx_order.push((permit.class, payload.clone()));
+                self.p6.last_permit = Some(permit.clone());
+                if self.p6.auto_complete {
+                    // 以提交當下的 fence 狀態判定（等價 FenceSubmitGate），通過即 Completed(len)。
+                    let reject = self.fence.with(|st| Fence::admit(st, permit).err());
+                    let outcome = match reject {
+                        None => TxOutcome::Completed(payload.len()),
+                        Some(_) => TxOutcome::NotSubmitted,
+                    };
+                    return Some(ControlEvent::HumanTxCompleted {
+                        tag: tag.clone(),
+                        report: human_report(permit, outcome, reject),
+                    });
+                }
+                self.p6.unsettled.push_back((tag.clone(), permit.clone()));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// 直接呼叫 core 方法所得的效果，比照 `deliver` 處理並回傳其餘效果。
+    fn handle_direct(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+        let mut rest = Vec::new();
+        let mut follow = Vec::new();
+        for effect in effects {
+            if let Some(ev) = self.record_p6(&effect) {
+                follow.push(ev);
+            }
+            match effect {
+                Effect::Reply(tx, result) => {
+                    let _ = tx.try_send(result);
+                }
+                Effect::Schedule { at, ev } => self.scheduled.push((at, ev)),
+                Effect::SettleTx { epoch, op_id } => {
+                    if let Some(worker) = self.workers.get(&epoch) {
+                        let _ = worker.tx().settle(op_id);
+                    }
+                    rest.push(Effect::SettleTx { epoch, op_id });
+                }
+                Effect::BeginDrain { stop_id, epoch } => {
+                    self.last_stop = Some((epoch, stop_id));
+                    if let Some(worker) = self.workers.get(&epoch) {
+                        worker.begin_stop();
+                    }
+                    rest.push(Effect::BeginDrain { stop_id, epoch });
+                }
+                other => rest.push(other),
+            }
+        }
+        for ev in follow {
+            rest.extend(self.feed(ev));
+        }
+        rest
+    }
+
+    fn console_lifetime(&self, cid: &str) -> u64 {
+        self.core
+            .human_console()
+            .consoles
+            .get(cid)
+            .map(|c| c.client_lifetime)
+            .unwrap_or_default()
+    }
+
+    /// `SessionRequest::ConsoleAttach`（harness 配 `PtyInfo` token 與 client id）＋`ConsoleScan`。
+    pub fn attach_pty_console(&mut self, cid: &str, peer: bool) -> PyDict {
+        self.p6.next_token += 1;
+        let token = self.p6.next_token;
+        let slave_path = format!("/dev/pts/{}", 100 + token);
+        let reply = self
+            .rpc(SessionRequest::ConsoleAttach {
+                label: None,
+                pty: Some(PtyInfo {
+                    token,
+                    slave_path: slave_path.clone(),
+                    client_id: cid.to_string(),
+                }),
+            })
+            .expect("console attach");
+        if peer {
+            self.p6.peers.insert(slave_path);
+        }
+        let held: Vec<String> = self.p6.peers.iter().cloned().collect();
+        let held: Vec<&str> = held.iter().map(String::as_str).collect();
+        self.scan(Some(&held));
+        reply
     }
     /// `ControlEvent::ConsoleConnected`；回 lifetime。
-    pub fn connect_stream_console(&mut self, _cid: &str, _kind: ConsoleTransportKind) -> u64 {
-        todo!("P6 Task 6")
+    pub fn connect_stream_console(&mut self, cid: &str, kind: ConsoleTransportKind) -> u64 {
+        self.p6.next_lifetime += 1;
+        let lifetime = self.p6.next_lifetime;
+        let peer = format!("127.0.0.1:{}", 50000 + lifetime);
+        self.feed(ControlEvent::ConsoleConnected {
+            client_id: cid.into(),
+            client_lifetime: lifetime,
+            label: peer.clone(),
+            vtty: peer,
+            kind,
+            close_gen: self.core.human_console().close_gen,
+        });
+        lifetime
     }
     /// `DataEvent::ConsoleInputBytes`（目前 `input_epoch` 與 lifetime）。
-    pub fn input(&mut self, _cid: &str, _bytes: &[u8]) -> Vec<Effect> {
-        todo!("P6 Task 6")
+    pub fn input(&mut self, cid: &str, bytes: &[u8]) -> Vec<Effect> {
+        let lifetime = self.console_lifetime(cid);
+        let epoch = self.core.generations().input_epoch;
+        self.input_with(cid, lifetime, epoch, bytes)
     }
-    pub fn input_with(&mut self, _cid: &str, _lifetime: u64, _epoch: u64, _bytes: &[u8]) -> Vec<Effect> {
-        todo!("P6 Task 6")
+    pub fn input_with(
+        &mut self,
+        cid: &str,
+        lifetime: u64,
+        epoch: u64,
+        bytes: &[u8],
+    ) -> Vec<Effect> {
+        self.data(DataEvent::ConsoleInputBytes {
+            client_id: cid.into(),
+            client_lifetime: lifetime,
+            input_epoch: epoch,
+            bytes: bytes.to_vec(),
+        })
     }
     /// `DataEvent::ConsoleDisconnected`。
-    pub fn disconnect(&mut self, _cid: &str) -> Vec<Effect> {
-        todo!("P6 Task 6")
+    pub fn disconnect(&mut self, cid: &str) -> Vec<Effect> {
+        let lifetime = self.console_lifetime(cid);
+        self.data(DataEvent::ConsoleDisconnected {
+            client_id: cid.into(),
+            client_lifetime: lifetime,
+        })
     }
     /// `ControlEvent::ConsoleScan{source: Hub}`。
-    pub fn scan(&mut self, _held: Option<&[&str]>) -> Vec<Effect> {
-        todo!("P6 Task 6")
+    pub fn scan(&mut self, held: Option<&[&str]>) -> Vec<Effect> {
+        let now = self.clock.mono_ns();
+        self.feed(ControlEvent::ConsoleScan {
+            scan: ConsoleScanSnapshot {
+                held: held.map(|h| h.iter().map(|s| s.to_string()).collect()),
+                taken_at: now,
+            },
+            source: ScanSource::Hub,
+        })
     }
-    /// true（預設）：每筆 `Effect::HumanTx` 立即回 `Completed(len)`。
-    pub fn set_auto_complete_human_tx(&mut self, _on: bool) {
-        todo!("P6 Task 6")
+    /// true（預設）：每筆 `Effect::HumanTx` 立即回 `Completed(len)`（fence 拒絕者回 `NotSubmitted`）。
+    pub fn set_auto_complete_human_tx(&mut self, on: bool) {
+        self.p6.auto_complete = on;
     }
     /// 對尚未結算的那筆 human TX 回報結果。
-    pub fn complete_human_tx(&mut self, _outcome: TxOutcome, _reject: Option<FenceReject>) -> Vec<Effect> {
-        todo!("P6 Task 6")
+    pub fn complete_human_tx(
+        &mut self,
+        outcome: TxOutcome,
+        reject: Option<FenceReject>,
+    ) -> Vec<Effect> {
+        let (tag, permit) = self
+            .p6
+            .unsettled
+            .pop_front()
+            .expect("沒有未結算的 human TX");
+        self.feed(ControlEvent::HumanTxCompleted {
+            tag,
+            report: human_report(&permit, outcome, reject),
+        })
     }
     /// 已發出的 HumanTx：(class, source, payload)。
     pub fn human_tx(&self) -> Vec<(TxClass, String, Vec<u8>)> {
-        todo!("P6 Task 6")
+        self.p6.human_tx.clone()
     }
     /// 最近一筆 HumanTx 的 permit（斷言 replay_hold／input_epoch）。
     pub fn last_human_permit(&self) -> Option<TxPermit> {
-        todo!("P6 Task 6")
+        self.p6.last_permit.clone()
     }
     /// `SessionCore::foreground_busy()`（07 D-22(2)）。
     pub fn foreground_busy(&self) -> bool {
-        todo!("P6 Task 6")
+        self.core.foreground_busy()
     }
     /// `HumanConsoleState.replay_hold`。
     pub fn replay_hold(&self) -> Option<ReplayHold> {
-        todo!("P6 Task 6")
+        self.core.human_console().replay_hold.clone()
     }
     /// `FenceState.replay_auth`。
     pub fn fence_replay_auth(&self) -> Option<u64> {
-        todo!("P6 Task 6")
+        self.fence.with(|f| f.replay_auth)
     }
     /// 私有 DeferredBuffer 的 `len_for`（test-fakes 讀取器）。
-    pub fn deferred_len(&self, _cid: &str) -> usize {
-        todo!("P6 Task 6")
+    pub fn deferred_len(&self, cid: &str) -> usize {
+        self.core.human_console().deferred_len_for(cid)
     }
     /// 依 effect 發出順序：HumanTx 的 (class, payload) 與 StartOp 會送 UART 的 (class, 預定 bytes)。
     pub fn tx_order(&self) -> Vec<(TxClass, Vec<u8>)> {
-        todo!("P6 Task 6")
+        self.p6.tx_order.clone()
     }
     /// HumanTx＋StartOp 中會送 UART 的 spec 數。
     pub fn tx_effect_count(&self) -> usize {
-        todo!("P6 Task 6")
+        self.p6.tx_order.len()
     }
     /// `Effect::Warn` 的文字。
     pub fn warns(&self) -> Vec<String> {
-        todo!("P6 Task 6")
+        self.p6.warns.clone()
     }
     pub fn lease_index_ops(&self) -> Vec<LeaseIndexOp> {
-        todo!("P6 Task 7")
+        self.p6.lease_ops.clone()
     }
     /// 依序的 Effect 變體名稱（驗證 LeaseIndex 在 Reply 前）。
     pub fn effect_kinds(&self) -> Vec<&'static str> {
-        todo!("P6 Task 7")
+        self.p6.kinds.clone()
     }
     /// `pyjson::dumps(RPC_WIRE)`，不含尾端換行。
-    pub fn wire(&self, _d: &PyDict) -> String {
-        todo!("P6 Task 7")
+    pub fn wire(&self, d: &PyDict) -> String {
+        sw_proto::pyjson::dumps_dict(d, &sw_proto::pyjson::RPC_WIRE)
+            .trim_end_matches('\n')
+            .to_string()
     }
     /// 固定 seed rng 依序產生的 32-hex。
     pub fn ids(&self) -> Vec<String> {
         todo!("P6 Task 7")
     }
     /// `= advance(Duration::from_secs_f64(s))`（投遞 Tick 與到期 timer）。
-    pub fn advance_s(&mut self, _s: f64) -> Vec<Effect> {
-        todo!("P6 Task 7")
+    pub fn advance_s(&mut self, s: f64) -> Vec<Effect> {
+        self.advance(Duration::from_secs_f64(s))
     }
 }
 
-pub fn open_req(owner: &str, timeout_s: f64, command: &str, allow_attached: bool) -> SessionRequest {
-    SessionRequest::InteractiveOpen { owner: owner.into(), timeout_s, command: command.into(), allow_attached }
+fn human_report(permit: &TxPermit, outcome: TxOutcome, reject: Option<FenceReject>) -> TxReport {
+    TxReport {
+        op_id: permit.op_id,
+        epoch: permit.epoch,
+        result: sw_pal::traits::TxResult {
+            outcome,
+            error: None,
+        },
+        wal: None,
+        reject,
+    }
+}
+
+/// P6 Task 6 追加的 harness helper（Task 1 簽章之外；直接呼叫 core 方法並經 harness 處理效果）。
+impl CoreHarness {
+    /// `SessionCore::fg_begin`；回 (admission, 經 harness 處理後的其餘效果)。
+    pub fn fg_begin(&mut self, source_is_agent: bool) -> (FgAdmission, Vec<Effect>) {
+        let mut fx = Effects(Vec::new());
+        let adm = self.core.fg_begin(source_is_agent, &mut fx);
+        (adm, self.handle_direct(fx.0))
+    }
+    pub fn fg_finish(&mut self, adm: FgAdmission) -> Vec<Effect> {
+        let mut fx = Effects(Vec::new());
+        self.core.fg_finish(adm, &mut fx);
+        self.handle_direct(fx.0)
+    }
+    pub fn human_suspend_begin(&mut self) -> (bool, Vec<Effect>) {
+        let mut fx = Effects(Vec::new());
+        let s = self.core.human_suspend_begin(&mut fx);
+        (s, self.handle_direct(fx.0))
+    }
+    pub fn human_suspend_end(&mut self, suspended: bool) -> Vec<Effect> {
+        let mut fx = Effects(Vec::new());
+        self.core.human_suspend_end(suspended, &mut fx);
+        self.handle_direct(fx.0)
+    }
+    /// `SessionCore::invalidate_human_input`。
+    pub fn invalidate(&mut self, reason: sw_core::deferred::InvalidateReason) -> Vec<Effect> {
+        let mut fx = Effects(Vec::new());
+        self.core.invalidate_human_input(reason, &mut fx);
+        self.handle_direct(fx.0)
+    }
+    /// `SessionCore::begin_stop(kind, None, now)`。
+    pub fn begin_stop(&mut self, kind: sw_core::drain::StopKind) -> Vec<Effect> {
+        let now = self.clock.mono_ns();
+        let fx = self.core.begin_stop(kind, None, now);
+        self.handle_direct(fx.0)
+    }
+    /// ATTACHED 救援的 bridge 健康（running／serial_alive／vtty_alive）。
+    pub fn set_bridge_health(&mut self, running: bool, serial_alive: bool, vtty_alive: bool) {
+        self.core.set_worker_health(Arc::new(move || sw_core::uart_bridge::WorkerSnapshot {
+            running,
+            serial_alive,
+        }));
+        self.core.set_self_test_probes(sw_core::self_test::SelfTestProbes {
+            holders: None,
+            vtty_alive: Some(Arc::new(move || Some(vtty_alive))),
+            ..Default::default()
+        });
+    }
+    /// 該 console 目前的 `client_lifetime`。
+    pub fn lifetime(&self, cid: &str) -> u64 {
+        self.console_lifetime(cid)
+    }
+    /// `CoreDeps.input_epoch_pub` 目前值。
+    pub fn input_epoch_pub(&self) -> u64 {
+        self.p6.input_epoch_pub.load(Ordering::Acquire)
+    }
+    /// registry 中最近一筆 source 以 `human:` 開頭的命令紀錄。
+    pub fn last_human_command(&self) -> Option<PyDict> {
+        self.reg.records_for_test().into_iter().rev().find(|r| {
+            r.get("source")
+                .and_then(PyValue::as_str)
+                .is_some_and(|s| s.starts_with("human:"))
+        })
+    }
+    /// 直接在 DeferredBuffer 為該 client 附加 bytes（現值 epoch／lifetime；test-fakes）。
+    pub fn seed_deferred(&mut self, cid: &str, bytes: &[u8]) {
+        self.core.seed_deferred_for_test(cid, bytes);
+    }
+}
+
+pub fn open_req(
+    owner: &str,
+    timeout_s: f64,
+    command: &str,
+    allow_attached: bool,
+) -> SessionRequest {
+    SessionRequest::InteractiveOpen {
+        owner: owner.into(),
+        timeout_s,
+        command: command.into(),
+        allow_attached,
+    }
 }
 
 pub fn status_req(id: &str, screen_chars: i128) -> SessionRequest {
-    SessionRequest::InteractiveStatus { interactive_id: id.into(), screen_chars }
+    SessionRequest::InteractiveStatus {
+        interactive_id: id.into(),
+        screen_chars,
+    }
 }
 
 pub fn send_req(id: &str, data: &str, encoding: &str) -> SessionRequest {
-    SessionRequest::InteractiveSend { interactive_id: id.into(), data: data.into(), encoding: encoding.into() }
+    SessionRequest::InteractiveSend {
+        interactive_id: id.into(),
+        data: data.into(),
+        encoding: encoding.into(),
+    }
 }
 
 pub fn close_req(id: &str) -> SessionRequest {
-    SessionRequest::InteractiveClose { interactive_id: id.into() }
+    SessionRequest::InteractiveClose {
+        interactive_id: id.into(),
+    }
 }
 
 /// TxWriter＋Fence 的 human permit 測試台（06 Task 1 的 FakeDevice；`spawn_tx_writer`＋`FakeWalFs`）。
 pub struct TxRig {
     pub fence: Arc<Fence>,
     pub dev: FakeDevice,
+    handle: TxWriterHandle,
+    wfs: Arc<FakeWalFs>,
+    next_op: std::sync::atomic::AtomicU64,
+    _ctl: Receiver<ControlEvent>,
 }
+
+const TXRIG_EPOCH: u64 = 7;
 
 impl TxRig {
     pub fn new() -> TxRig {
-        todo!("P6 Task 6")
+        let be = FakeSerialBackend::new();
+        let dev = be.add_device("/dev/txrig");
+        let h = be
+            .open_exclusive(
+                &DevicePath("/dev/txrig".into()),
+                &SerialConfig::from_uart_profile(115_200, 8, "N", 1, "none", false),
+            )
+            .expect("fake serial open");
+        let (_r, w, waker, _c) = h.split();
+        let wfs = FakeWalFs::new();
+        let wal = Arc::new(WalWriter::open(
+            WalConfig {
+                dir: PathBuf::from("/w"),
+                rotate_bytes: 1 << 26,
+            },
+            wfs.clone(),
+            FakeClock::at(1, 1),
+        ));
+        let fence = Fence::new();
+        fence.with(|s| s.active_epoch = Some(TXRIG_EPOCH));
+        let cancel = sw_pal::CancelToken::new(waker);
+        let (ctl_tx, ctl_rx) = bounded::<ControlEvent>(1024);
+        let (handle, _stop, _join) = sw_core::tx_writer::spawn_tx_writer(
+            "COM0".into(),
+            w,
+            cancel,
+            fence.clone(),
+            wal,
+            TXRIG_EPOCH,
+            ctl_tx,
+        );
+        std::mem::forget(_stop);
+        TxRig {
+            fence,
+            dev,
+            handle,
+            wfs,
+            next_op: std::sync::atomic::AtomicU64::new(0),
+            _ctl: ctl_rx,
+        }
     }
     /// `replay_hold` 一律 `None`。
-    pub fn permit(&self, _class: TxClass, _owner_gen: u64, _input_epoch: Option<u64>, _source: &str) -> TxPermit {
-        todo!("P6 Task 6")
+    pub fn permit(
+        &self,
+        class: TxClass,
+        owner_gen: u64,
+        input_epoch: Option<u64>,
+        source: &str,
+    ) -> TxPermit {
+        let op = self.next_op.fetch_add(1, Ordering::SeqCst) + 1;
+        TxPermit {
+            op_id: sw_core::tx_writer::OpId(op),
+            epoch: TXRIG_EPOCH,
+            owner_gen,
+            fsm_gen: 0,
+            class,
+            source: source.into(),
+            cmd_id: None,
+            log: true,
+            input_epoch,
+            replay_hold: None,
+        }
     }
     /// class HumanReplay、`input_epoch` Some、`replay_hold` Some(hold)（07 D-22）。
-    pub fn replay_permit(&self, _owner_gen: u64, _input_epoch: u64, _hold: u64, _source: &str) -> TxPermit {
-        todo!("P6 Task 6")
+    pub fn replay_permit(
+        &self,
+        owner_gen: u64,
+        input_epoch: u64,
+        hold: u64,
+        source: &str,
+    ) -> TxPermit {
+        let mut p = self.permit(TxClass::HumanReplay, owner_gen, Some(input_epoch), source);
+        p.replay_hold = Some(hold);
+        p
     }
-    pub fn submit(&self, _p: TxPermit, _payload: &[u8]) -> Receiver<TxReport> {
-        todo!("P6 Task 6")
+    pub fn submit(&self, p: TxPermit, payload: &[u8]) -> Receiver<TxReport> {
+        let (tx, rx) = bounded(1);
+        self.handle
+            .jobs
+            .send(sw_core::tx_writer::TxJob {
+                permit: p,
+                payload: payload.to_vec(),
+                reply: tx,
+            })
+            .expect("TxWriter 接收 job");
+        rx
     }
     pub fn wal_tx(&self) -> Vec<PyDict> {
-        todo!("P6 Task 6")
+        let text = String::from_utf8(
+            self.wfs
+                .contents(std::path::Path::new("/w/raw.wal.ndjson"))
+                .unwrap_or_default(),
+        )
+        .expect("WAL UTF-8");
+        text.lines()
+            .filter_map(|l| match sw_proto::pyjson::loads(l) {
+                Ok(PyValue::Dict(d)) if d.get("dir").and_then(PyValue::as_str) == Some("TX") => {
+                    Some(d)
+                }
+                _ => None,
+            })
+            .collect()
     }
 }

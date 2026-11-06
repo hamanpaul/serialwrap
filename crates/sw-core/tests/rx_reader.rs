@@ -83,6 +83,7 @@ fn reader_ctx(
         data,
         control,
         clock,
+        hub: None,
     }
 }
 
@@ -167,9 +168,9 @@ impl ConsoleIo for TestConsole {
 
     fn close(self: Box<Self>) {}
 
-    /// P6 增補（ConsoleIo::mux_handle）：本測試的 console 不註冊 ConsoleMux，不會被呼叫。
+    // P6（07 Task 2）新增的 trait 方法；本檔的哨兵 console 不進 ConsoleMux。
     fn mux_handle(&self) -> sw_pal::console_mux::MuxHandle {
-        unimplemented!("rx_reader 測試 console 不註冊 ConsoleMux")
+        unreachable!("rx_reader 測試 console 不進 ConsoleMux")
     }
 }
 
@@ -278,7 +279,7 @@ fn rx_is_in_wal_before_actor_sees_it_with_exact_seq() {
             (epoch, rx_seq, wal_seq, bytes.as_slice()),
             (3, 1, 2, &b"login: "[..])
         ),
-        other => panic!("非預期的 data 事件：{other:?}"),
+        other => panic!("reader 只應送出 UartRxChunk：{other:?}"),
     }
     let text = String::from_utf8(
         wfs.contents(Path::new("/w/raw.wal.ndjson"))
@@ -940,5 +941,72 @@ fn rx_observer_panic_isolated_reader_continues() {
         ["WARNING uart reader RX handler 例外（com=COM0），略過此塊、reader 續行"]
     );
     assert!(control_rx.try_recv().is_err());
+    let _ = stop_and_join(&stop, &port.waker, worker);
+}
+
+// ---------------------------------------------------------------- P6 Task 9（增補 #21）：reader → ConsoleHub
+
+/// hub tap：容量 `cap` 的 rx channel 與共用 `HubStatus`。
+fn hub_tap(cap: usize) -> (sw_core::human_console::hub::HubTap, crossbeam_channel::Receiver<Arc<[u8]>>, Arc<sw_core::human_console::hub::HubStatus>) {
+    let (tx, rx) = bounded::<Arc<[u8]>>(cap);
+    let status = Arc::new(sw_core::human_console::hub::HubStatus::new());
+    let tap = sw_core::human_console::hub::HubTap {
+        rx: tx,
+        waker: Arc::new(TestWaker),
+        status: Arc::clone(&status),
+    };
+    (tap, rx, status)
+}
+
+#[test]
+fn reader_sends_to_hub_after_wal() {
+    let port = fake_port();
+    let clock = FakeClock::at(1, 0);
+    let (wal, wfs) = fake_wal(Arc::clone(&clock) as Arc<dyn Clock>);
+    let (tap, hub_rx, _status) = hub_tap(16);
+    let (data_tx, data_rx) = bounded(16);
+    let (control_tx, _control_rx) = bounded(16);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut ctx = reader_ctx(wal, RxShared::new(64, 0), None, data_tx, control_tx, clock);
+    ctx.hub = Some(tap);
+    let worker = spawn_reader(port.reader, ctx, Arc::clone(&stop));
+    for chunk in [&b"one"[..], &b"two"[..]] {
+        port.dev.push_rx(chunk);
+        let got = hub_rx.recv_timeout(Duration::from_secs(1)).expect("hub 收到 RX");
+        assert_eq!(&*got, chunk);
+        // 收到當下，WAL 已有同一 bytes 的 RX 紀錄（WAL→console 順序，06 §4.1）
+        let wal_text = String::from_utf8(wfs.contents(Path::new("/w/raw.wal.ndjson")).unwrap_or_default()).unwrap();
+        let b64 = match chunk {
+            b"one" => "b25l",
+            _ => "dHdv",
+        };
+        assert!(wal_text.contains(b64), "hub 收到前 WAL 已寫入 {chunk:?}");
+        let ev = data_rx.recv_timeout(Duration::from_secs(1)).expect("data lane");
+        assert!(matches!(ev, DataEvent::UartRxChunk { ref bytes, .. } if bytes == chunk));
+    }
+    let _ = stop_and_join(&stop, &port.waker, worker);
+}
+
+#[test]
+fn reader_hub_full_does_not_block() {
+    let port = fake_port();
+    let clock = FakeClock::at(1, 0);
+    let (wal, _wfs) = fake_wal(Arc::clone(&clock) as Arc<dyn Clock>);
+    let (tap, _hub_rx, status) = hub_tap(1);
+    let (data_tx, data_rx) = bounded(16);
+    let (control_tx, _control_rx) = bounded(16);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut ctx = reader_ctx(wal, RxShared::new(64, 0), None, data_tx, control_tx, clock);
+    ctx.hub = Some(tap);
+    let worker = spawn_reader(port.reader, ctx, Arc::clone(&stop));
+    port.dev.push_rx(b"a");
+    data_rx.recv_timeout(Duration::from_secs(1)).expect("第一個 chunk");
+    // hub 不消費：rx channel 已滿
+    let t = Instant::now();
+    port.dev.push_rx(b"b");
+    let ev = data_rx.recv_timeout(Duration::from_secs(1)).expect("第二個 chunk 仍進 data lane");
+    assert!(t.elapsed() < Duration::from_millis(10), "hub 滿時 reader 不阻塞（10 ms 內送進 data lane）：{:?}", t.elapsed());
+    assert!(matches!(ev, DataEvent::UartRxChunk { ref bytes, .. } if bytes == b"b"));
+    assert_eq!(status.rx_dropped_chunks.load(Ordering::Relaxed), 1);
     let _ = stop_and_join(&stop, &port.waker, worker);
 }

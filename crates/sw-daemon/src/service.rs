@@ -1,9 +1,9 @@
-//! RPC 分派器（arch §6.3，P5-T18）：39 個 served method 的平面 `match`；15 個延後 method 落入 `METHOD_NOT_FOUND`。
+//! RPC 分派器（arch §6.3，P5-T18）：平面 `match`；Slice 2.2 承接 console 三個 method（P6 Task 10），其餘延後 method 落入 `METHOD_NOT_FOUND`。
 //!
 //! 對照 Python `sw_core/service.py` 的 `SerialwrapService.rpc()`／`_dispatch()`：
 //! - 分支順序與 `_dispatch` 相同；每個分支的參數轉型逐行照 Python（`str(x or d)`、`int(x or d)`、`float(x or d)`、
 //!   `bool(x)`、`_coerce_rpc_bool(x)`），轉型例外以 `Err(PyErr)` 回傳，由 framing 轉為 `EXCEPTION`（例外不越過 RPC 邊界）。
-//! - Slice 2.1 延後的 15 個 method（console／event／file）不寫分支，落入 `METHOD_NOT_FOUND`，無任何副作用。
+//! - 延後的兩個 file method 不寫分支，落入 `METHOD_NOT_FOUND`，無任何副作用；console 與 event 分支皆保留。
 //! - `rpc()`＝`dispatch()` 後 `setdefault("version", version)`（#154）。
 //!
 //! 與 Python 的分層差異（外部回應不變）：Python 的 `_resolve_session_id`（READY／RECOVERING／FLASHING／
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sw_core::arbiter::{CommandRegistry, SubmitReq};
+use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
@@ -483,6 +483,35 @@ impl Service {
                 }
                 self.route(&selector, SessionRequest::SessionAttach, LONG_ROUTE_TIMEOUT)
             }
+            // P6 Task 10：console 方法（service.py:1071-1089）；查無 selector 回 SESSION_NOT_READY{selector}。
+            "session.console_attach" => {
+                let selector = selector_chain(&p);
+                // `str(label) if label else None`
+                let label = p
+                    .truthy("label")
+                    .then(|| p.raw("label").map(sw_proto::pyfmt::py_str))
+                    .flatten();
+                if selector.is_empty() {
+                    return Ok(invalid_args());
+                }
+                self.manager.console_attach(&selector, label, ROUTE_TIMEOUT)
+            }
+            "session.console_detach" => {
+                let selector = selector_chain(&p);
+                let client_id = p.str_or("client_id", "")?;
+                if selector.is_empty() || client_id.is_empty() {
+                    return Ok(invalid_args());
+                }
+                self.manager
+                    .console_request(&selector, SessionRequest::ConsoleDetach { client_id }, ROUTE_TIMEOUT)
+            }
+            "session.console_list" => {
+                let selector = selector_chain(&p);
+                if selector.is_empty() {
+                    return Ok(invalid_args());
+                }
+                self.manager.console_request(&selector, SessionRequest::ConsoleList, ROUTE_TIMEOUT)
+            }
             "session.interactive_open" => {
                 let selector = selector_chain(&p);
                 let owner = p.str_or("owner", "agent")?;
@@ -492,16 +521,13 @@ impl Service {
                 if selector.is_empty() {
                     return Ok(invalid_args());
                 }
-                // Python `interactive_open`：查無 session 回 SESSION_NOT_READY＋selector（審查 F73）。
-                let Some(sid) = self.manager.resolve(&selector) else {
-                    return Ok(pydict! {
-                        "ok" => false,
-                        "error_code" => "SESSION_NOT_READY",
-                        "selector" => selector,
-                    });
-                };
-                self.manager.route(
-                    &sid,
+                if self.manager.resolve(&selector).is_none() {
+                    // `interactive_open`：`get_session(selector)` 為 None → SESSION_NOT_READY（session_manager.py:6820）。
+                    return Ok(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY", "selector" => selector });
+                }
+                let raw = selector.clone();
+                let mut result = self.route(
+                    &selector,
                     SessionRequest::InteractiveOpen {
                         owner,
                         timeout_s,
@@ -509,7 +535,12 @@ impl Service {
                         allow_attached,
                     },
                     ROUTE_TIMEOUT,
-                )
+                )?;
+                // Python 各 SESSION_NOT_READY 出口皆回原樣 selector；SESSION_BUSY／RECOVERING 維持 COM。
+                if result.get("error_code").and_then(PyValue::as_str) == Some("SESSION_NOT_READY") && result.get("selector").is_some() {
+                    result.insert("selector", PyValue::from(raw));
+                }
+                Ok(result)
             }
             "session.interactive_send" => {
                 let interactive_id = p.str_or("interactive_id", "")?;
@@ -611,8 +642,8 @@ impl Service {
                     priority,
                     expected_duration_s,
                     completion_regex,
-                    // merge P7：P6 增補 #6（07 D-10）：RPC 提交一律 Rpc（OD-14 #5）。
-                    origin: sw_core::arbiter::SubmitOrigin::Rpc,
+                    // D-10（DF-02）：RPC 來源一律以 agent 對待，即使 source 以 `human:` 開頭。
+                    origin: SubmitOrigin::Rpc,
                 };
                 self.manager.route(&sid, SessionRequest::Submit(req), ROUTE_TIMEOUT)
             }

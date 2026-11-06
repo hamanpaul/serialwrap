@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""Slice 2.2 出口判定（07 Task 13，R5-F3）：逐集合 L1 完整性＋逐案 AUTOMATED 證據。
+
+用法：
+  python3 scripts/rust/s22_gate_check.py --l1-results <dir> --map tests/acceptance/slice22_evidence_map.yaml \
+      [--lock tests/acceptance/l1_required.lock.json] [--cases-lock tests/acceptance/cases.lock.json] \
+      [--l15-results <json>] [--parity-doc docs/rust-refactor/plans/parity-amendments-2026-10-26.md] \
+      [--prereqs-script scripts/rust/check_p6_prereqs.py] --out <json>
+
+`<dir>/<section>/<platform>/resource-report.json`（`l1-results.v1`）；`<section>` 為 `s22_gate:<section>` 的後段。
+- 每個 `s22_gate:*` 集合／平台以 P2 `tests/acceptance/l1_judge.judge`（依路徑載入，本檔不另寫判定規則）判定；
+  報告不存在 → INSUFFICIENT。
+- 對照表每個 `AUTOMATED` 條目的每個 `.py`／`.rs` 測試須在任一份報告（集合×平台）中恰一列 `passed`（`.rs` 轉為
+  `cargo:<crate>::<檔名 stem>::<函式>`）；有 failed 列 → FAIL；缺列、非 passed，或**任一份報告內部重複**
+  （不論其他報告是否單列 passed，OD-54）→ INSUFFICIENT。
+  其他來源（func-test、scenario）須在 `--l15-results`（`s22-l15-results.v1`：`{"format","runs":[{"ref","outcome",
+  "exit_code"}]}`）中恰一列 `outcome == "passed"` 且 `exit_code == 0`；未提供或不符 → INSUFFICIENT（審查
+  3317987_d6e3b3c-opus High #1：函式／腳本存在不等於已執行且通過）。
+- 必要集合（`REQUIRED_SECTIONS`，以計畫 07 Task 13 為準）由本檔固定：lock 缺任一集合／平台 → INSUFFICIENT；
+  對照表 `cases` 的鍵集合須等於 `cases.lock.json` 凍結的 `slice_2.2`，否則 INSUFFICIENT（同報告 Medium #2）。
+- 增補 #180：以全表模式執行 `check_p6_prereqs.py --strict`，exit 非 0 → INSUFFICIENT。
+- 增補 #187：`parity-amendments-2026-10-26.md` 中承接 Phase 為 P6 的承接編號逐列輸出於 `parity_rows`；狀態取對照表
+  `parity_rows["#N"].status`（`PASS` 須附 `tests` 並同 AUTOMATED 規則判定；`BLOCKED-OWNER` 須附 `procedure`；
+  `OWNER-DECISION-PENDING` 或未登記 → INSUFFICIENT，result 不得為 PASS）。
+  `PROCESS-EVIDENCE`（rulings/p6.md：#185 流程項的證據形式）只限 `PROCESS_EVIDENCE_ROWS` 逐名列出的承接編號：
+  `report` 檔 `## #N` 段落內的 `json process-evidence` 區塊須有核准 commit 的紅燈（非零退出、failed>0、列出失敗測試）
+  與另一 commit、同一命令的綠燈（退出碼 0、failed==0、passed>0）→ PASS；否則 INSUFFICIENT（sol P6-b64dad9-1）。
+- `BLOCKED-OWNER` 條目回報為 BLOCKED-OWNER（不得標 PASS，也不改變 `result`）；`PENDING` → INSUFFICIENT；
+  `NOT_APPLICABLE` 略過。
+- OD-53 selector 記錄 caps（rulings/p6.md：不改鎖 schema）：收集器 `cargo_l1_results.py --caps` 由 L1 鎖 selector
+  推導（`derive_caps`：test-binary 參數恰為 `--ignored cap_<cap>__…` → `--caps <cap>…`；不含 ignored 篩選 → 不需
+  caps）。推導不出的集合 → EVIDENCE_MISSING（不判報告；其 passed 列不充當逐案證據，failed 列仍判 FAIL）。
+  各集合輸出推導的 `caps` 與 linux cargo 集合的收集命令 `collect_argv`；`--plan` 只依鎖印出這些收集命令（前置收集）。
+輸出 `{"sections":[{set_id,platform,verdict,reasons,caps,collect_argv}],"cases":[{case_id,status,missing_tests,...}],
+"result"}`（`result` 為 PASS／FAIL／INSUFFICIENT；EVIDENCE_MISSING 併入 INSUFFICIENT）；exit 0 只在 `result == "PASS"`。
+只用 stdlib＋PyYAML，不得匯入 sw_core。
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import pathlib
+import re
+import subprocess
+import sys
+from typing import Any, Mapping
+
+import yaml
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+L1_JUDGE = ROOT / "tests" / "acceptance" / "l1_judge.py"
+DEFAULT_LOCK = ROOT / "tests" / "acceptance" / "l1_required.lock.json"
+DEFAULT_CASES_LOCK = ROOT / "tests" / "acceptance" / "cases.lock.json"
+DEFAULT_PARITY_DOC = ROOT / "docs" / "rust-refactor" / "plans" / "parity-amendments-2026-10-26.md"
+DEFAULT_PREREQS = ROOT / "scripts" / "rust" / "check_p6_prereqs.py"
+SET_PREFIX = "s22_gate:"
+# 07 Task 13（R5-F3、增補 #187）：出口必要集合與平台；不得由 lock 內容推導（lock 少登記時會無聲縮小分母）。
+REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
+    "s22_gate:cargo_workspace": ("linux",),
+    "s22_gate:console_conformance_pty": ("linux",),
+    "s22_gate:blackbox_rust": ("linux",),
+    "s22_gate:win_test": ("windows",),
+    "s22_gate:py_parity": ("linux",),
+}
+L15_FORMAT = "s22-l15-results.v1"
+PARITY_STATUSES = ("PASS", "BLOCKED-OWNER", "OWNER-DECISION-PENDING", "PROCESS-EVIDENCE")
+# rulings/p6.md（P6 OWNER-BATCH #4，#185 證據形式）：流程項以出口報告段落為證據，逐名核准，不得擴及其他承接編號。
+PROCESS_EVIDENCE_ROWS = frozenset({"#185"})
+_RANK = {"PASS": 0, "INSUFFICIENT": 1, "EVIDENCE_MISSING": 1, "FAIL": 2, "INVALID": 3}
+CARGO_COLLECTOR = "scripts/rust/cargo_l1_results.py"
+_CAP_FILTER_RE = re.compile(r"^cap_([a-z0-9]+(?:_[a-z0-9]+)*)__$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_BUILD_COMMAND = [
+    "cargo", "build", "--release", "-p", "sw-daemon", "-p", "sw-cli",
+    "--target", "x86_64-unknown-linux-gnu",
+]
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git_revision() -> str:
+    """回傳目前受測 HEAD；無法取得時保留明確的 unknown。"""
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True,
+                              timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else "unknown"
+
+
+def build_identity(*, daemon_path: pathlib.Path | None, build_linux_exit: int | None,
+                   built_daemon_sha256: str | None, dry_run: bool = False) -> dict[str, Any]:
+    """記錄受測 daemon 與獨立 release 建置快照，供 P7 逐來源綁定。"""
+    daemon_sha256 = None
+    if daemon_path is not None and not dry_run:
+        try:
+            if daemon_path.is_file():
+                daemon_sha256 = sha256_file(daemon_path)
+        except OSError:
+            pass
+    return {
+        "git_revision": git_revision(),
+        "daemon_sha256": daemon_sha256,
+        "build": {
+            "command": list(RELEASE_BUILD_COMMAND),
+            "linux_exit": build_linux_exit,
+            "daemon_sha256_at_build": built_daemon_sha256 or None,
+        },
+    }
+
+
+def identity_problems(identity: Any, daemon_path: pathlib.Path | str | None) -> tuple[list[str], list[str]]:
+    """回傳 (缺漏, 不符)，比照 slice21；不參與既有 S22 verdict 計算。"""
+    missing: list[str] = []
+    mismatch: list[str] = []
+    if not isinstance(identity, Mapping):
+        return ["identity 缺失"], []
+
+    revision = identity.get("git_revision")
+    if not isinstance(revision, str) or not revision or revision == "unknown":
+        missing.append("identity.git_revision")
+    elif not _GIT_REVISION_RE.fullmatch(revision):
+        mismatch.append("identity.git_revision 不是 40 位小寫 hex")
+
+    daemon_sha256 = identity.get("daemon_sha256")
+    if not isinstance(daemon_sha256, str) or not daemon_sha256:
+        missing.append("identity.daemon_sha256")
+    elif not _SHA256_RE.fullmatch(daemon_sha256):
+        mismatch.append("identity.daemon_sha256 不是 64 位小寫 hex")
+
+    build = identity.get("build")
+    if not isinstance(build, Mapping):
+        missing.append("identity.build")
+    else:
+        linux_exit = build.get("linux_exit")
+        at_build = build.get("daemon_sha256_at_build")
+        if linux_exit is None:
+            missing.append("identity.build.linux_exit")
+        elif linux_exit != 0:
+            mismatch.append(f"Linux release 建置失敗（exit {linux_exit}）")
+        if not isinstance(at_build, str) or not at_build:
+            missing.append("identity.build.daemon_sha256_at_build")
+        elif not _SHA256_RE.fullmatch(at_build):
+            mismatch.append("identity.build.daemon_sha256_at_build 不是 64 位小寫 hex")
+        elif daemon_sha256 and at_build != daemon_sha256:
+            mismatch.append("identity.daemon_sha256 與建置當下記錄的 sha256 不符")
+
+    if daemon_path is not None:
+        path = pathlib.Path(daemon_path)
+        if not path.is_file():
+            missing.append(f"daemon artifact 不存在：{path}")
+        elif daemon_sha256:
+            try:
+                if sha256_file(path) != daemon_sha256:
+                    mismatch.append(f"identity.daemon_sha256 與 {path} 實際 sha256 不符")
+            except OSError as exc:
+                missing.append(f"daemon artifact 無法讀取：{path}（{exc}）")
+    return missing, mismatch
+
+
+def _load_judge():
+    spec = importlib.util.spec_from_file_location("l1_judge", L1_JUDGE)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _worst(verdicts: list[str]) -> str:
+    return max(verdicts, key=lambda v: _RANK.get(v, 3)) if verdicts else "PASS"
+
+
+def to_nodeid(ref: str) -> str | None:
+    """對照表的 `<檔案>::<函式>` → L1 nodeid；非 `.py`／`.rs` 回 None。"""
+    path, _, name = ref.partition("::")
+    if path.endswith(".py"):
+        return ref
+    if path.endswith(".rs"):
+        parts = pathlib.PurePosixPath(path).parts
+        if len(parts) >= 2 and parts[0] == "crates":
+            return f"cargo:{parts[1]}::{pathlib.PurePosixPath(path).stem}::{name}"
+    return None
+
+
+def derive_caps(selector: dict[str, Any] | None) -> list[str] | None:
+    """OD-53：L1 鎖 selector → 收集器 `cargo_l1_results.py --caps`（rulings/p6.md：不新增 `selector.caps`）。
+
+    收集器只以 `<exe> --ignored cap_<cap>__` 另執行 ignored 能力測試，不轉交 selector 的 test-binary 參數，故：
+    argv 不含 `--ignored`／`--include-ignored` → `[]`（不需 caps）；第一個 `--` 之後恰為 `--ignored` 加一個以上
+    `cap_<cap>__` 篩選 → 依序回傳各 `<cap>`；其餘帶 ignored 意圖者（`--include-ignored`、無篩選、混有非 cap 篩選或
+    其他旗標、出現在 `--` 之前）→ None（推導不出）。
+    """
+    argv = [str(x) for x in ((selector or {}).get("argv") or [])]
+    if not {"--ignored", "--include-ignored"} & set(argv):
+        return []
+    if "--" not in argv:
+        return None
+    tail = argv[argv.index("--") + 1:]
+    filters = [t for t in tail if t != "--ignored"]
+    caps = [m.group(1) for t in filters if (m := _CAP_FILTER_RE.match(t))]
+    if tail.count("--ignored") != 1 or not caps or len(caps) != len(filters):
+        return None
+    return caps
+
+
+def _cargo_set(spec: dict[str, Any]) -> bool:
+    nodeids = list(spec.get("nodeids") or [])
+    return bool(nodeids) and all(str(n).startswith("cargo:") for n in nodeids)
+
+
+def collect_argv(set_id: str, platform: str, spec: dict[str, Any], results_dir: pathlib.Path) -> list[str] | None:
+    """linux cargo 集合的前置收集命令（`--caps` 由 `derive_caps` 推導）；pytest 集合、Windows（win-test.sh 原生收集）
+    與推導不出者回 None。"""
+    caps = derive_caps(spec.get("selector"))
+    if caps is None or platform != "linux" or not _cargo_set(spec):
+        return None
+    out = results_dir / set_id[len(SET_PREFIX):] / platform / "resource-report.json"
+    return ["python3", CARGO_COLLECTOR, "--platform", platform, *(a for cap in caps for a in ("--caps", cap)),
+            "--out", str(out), "--", *[str(x) for x in (spec.get("selector") or {}).get("argv") or []]]
+
+
+def collect_plan(lock: dict[str, Any], results_dir: pathlib.Path) -> list[dict[str, Any]]:
+    plan: list[dict[str, Any]] = []
+    for set_id in sorted(k for k in lock.get("sets", {}) if k.startswith(SET_PREFIX)):
+        for platform, spec in sorted(lock["sets"][set_id].items()):
+            if _cargo_set(spec):
+                plan.append({"set_id": set_id, "platform": platform, "caps": derive_caps(spec.get("selector")),
+                             "collect_argv": collect_argv(set_id, platform, spec, results_dir)})
+    return plan
+
+
+def judge_sections(results_dir: pathlib.Path, lock: dict[str, Any], judge) -> tuple[list[dict], dict[str, list[dict]]]:
+    sections: list[dict] = []
+    rows_by_nodeid: dict[str, list[dict]] = {}
+    sets = lock.get("sets", {})
+    for set_id, platforms in sorted(REQUIRED_SECTIONS.items()):
+        for platform in platforms:
+            if platform not in (sets.get(set_id) or {}):
+                sections.append({"set_id": set_id, "platform": platform, "verdict": "INSUFFICIENT",
+                                 "reasons": ["必要集合未登記於 L1 鎖（REQUIRED_SECTIONS）"]})
+    for set_id in sorted(k for k in sets if k.startswith(SET_PREFIX)):
+        for platform, spec in sorted(lock["sets"][set_id].items()):
+            section = set_id[len(SET_PREFIX):]
+            caps = derive_caps(spec.get("selector"))
+            entry = {"set_id": set_id, "platform": platform, "caps": caps,
+                     "collect_argv": collect_argv(set_id, platform, spec, results_dir)}
+            path = results_dir / section / platform / "resource-report.json"
+            report: dict[str, Any] | None = None
+            if path.is_file():
+                try:
+                    report = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    sections.append({**entry, "verdict": "INVALID", "reasons": [f"report unreadable：{exc}"]})
+                    continue
+            if caps is None:
+                sections.append({**entry, "verdict": "EVIDENCE_MISSING",
+                                 "reasons": ["selector 推導不出收集器 --caps（OD-53：只接受 `--ignored cap_<cap>__`）"]})
+            elif report is None:
+                sections.append({**entry, "verdict": "INSUFFICIENT", "reasons": [f"report missing：{path}"]})
+                continue
+            else:
+                verdict = judge.judge(report, list(spec.get("nodeids") or []), platform=platform,
+                                      selector=spec.get("selector"))
+                sections.append({**entry, "verdict": verdict["verdict"], "reasons": list(verdict.get("reasons") or [])})
+            for row in (report or {}).get("results") or []:
+                if isinstance(row, dict):
+                    rows_by_nodeid.setdefault(str(row.get("nodeid")), []).append(
+                        {**row, "_platform": platform, "_section": set_id, "_evidence": caps is not None})
+    return sections, rows_by_nodeid
+
+
+def _l15_passed(l15: dict[str, list[dict]] | None, ref: str) -> bool:
+    runs = (l15 or {}).get(ref, [])
+    return len(runs) == 1 and runs[0].get("outcome") == "passed" and runs[0].get("exit_code") == 0
+
+
+def judge_tests(tests: list[str], rows_by_nodeid: dict[str, list[dict]],
+                l15: dict[str, list[dict]] | None) -> tuple[str, dict[str, list[str]]]:
+    """一組測試參照 → (PASS|FAIL|INSUFFICIENT, {missing, failed, unchecked})。"""
+    missing: list[str] = []
+    failed: list[str] = []
+    unchecked: list[str] = []
+    for ref in tests:
+        nid = to_nodeid(ref)
+        if nid is None:
+            runs = (l15 or {}).get(ref, [])
+            if any(r.get("outcome") in ("failed", "error") for r in runs):
+                failed.append(ref)
+            elif not _l15_passed(l15, ref):
+                unchecked.append(ref)
+            continue
+        rows = rows_by_nodeid.get(nid, [])
+        if any(r.get("outcome") in ("failed", "error") for r in rows):
+            failed.append(ref)
+            continue
+        # 「恰一列」逐份報告（集合×平台）計算：selector 重疊的集合（例：console_conformance_pty 執行整個
+        # console_conformance binary，其非 cap 測試也在 cargo_workspace）各自恰一列 passed 即可（OD-54）。
+        # 任一份報告內部重複即證據不足，不得被另一份報告的單列 passed 遮蔽（sol P6-c6ddda1-1）。
+        # 推導不出 --caps 的集合（OD-53，EVIDENCE_MISSING）其 passed 列不計入（failed 列已於上方判 FAIL）。
+        per_report: dict[tuple[str, str], list[dict]] = {}
+        for r in rows:
+            if r.get("_evidence", True):
+                per_report.setdefault((r["_platform"], r.get("_section", "")), []).append(r)
+        if any(len(rs) > 1 for rs in per_report.values()) or not any(
+                rs[0].get("outcome") == "passed" for rs in per_report.values()):
+            missing.append(ref)
+    if not tests:
+        status = "INSUFFICIENT"
+    elif failed:
+        status = "FAIL"
+    elif missing or unchecked:
+        status = "INSUFFICIENT"
+    else:
+        status = "PASS"
+    return status, {"missing": missing, "failed": failed, "unchecked": unchecked}
+
+
+def judge_cases(emap: dict[str, Any], rows_by_nodeid: dict[str, list[dict]],
+                l15: dict[str, list[dict]] | None = None) -> list[dict]:
+    out: list[dict] = []
+    for cid, entry in sorted((emap.get("cases") or {}).items()):
+        status = (entry or {}).get("status")
+        if status == "NOT_APPLICABLE":
+            out.append({"case_id": cid, "status": "NOT_APPLICABLE", "missing_tests": []})
+            continue
+        if status == "BLOCKED-OWNER":
+            out.append({"case_id": cid, "status": "BLOCKED-OWNER", "missing_tests": [],
+                        "blocked_item": entry.get("blocked_item")})
+            continue
+        if status != "AUTOMATED":
+            out.append({"case_id": cid, "status": "INSUFFICIENT", "missing_tests": [],
+                        "reasons": [f"status {status!r} 不是 AUTOMATED／BLOCKED-OWNER／NOT_APPLICABLE"]})
+            continue
+        tests = list(entry.get("tests") or [])
+        case_status, detail = judge_tests(tests, rows_by_nodeid, l15)
+        missing, failed, unchecked = detail["missing"], detail["failed"], detail["unchecked"]
+        row = {"case_id": cid, "status": case_status, "missing_tests": missing}
+        if failed:
+            row["failed_tests"] = failed
+        if unchecked:
+            row["unchecked_tests"] = unchecked
+        out.append(row)
+    return out
+
+
+def load_l15(path: pathlib.Path | None) -> tuple[dict[str, list[dict]] | None, list[str]]:
+    """`--l15-results` → {ref: [run…]}；未提供回 None（所有非 nodeid 參照皆 INSUFFICIENT）。"""
+    if path is None:
+        return None, []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, [f"l15 results unreadable：{exc}"]
+    if not isinstance(data, dict) or data.get("format") != L15_FORMAT:
+        return {}, [f"l15 results format 不是 {L15_FORMAT}"]
+    out: dict[str, list[dict]] = {}
+    for run in data.get("runs") or []:
+        if isinstance(run, dict) and isinstance(run.get("ref"), str):
+            out.setdefault(run["ref"], []).append(run)
+    return out, []
+
+
+def map_coverage(emap: dict[str, Any], cases_lock: dict[str, Any]) -> dict[str, Any]:
+    """對照表鍵集合須等於凍結 `slice_2.2`（不得縮小或擴張分母）。"""
+    frozen = set((cases_lock.get("sets") or {}).get("slice_2.2") or [])
+    keys = set((emap.get("cases") or {}).keys())
+    verdict = "PASS" if frozen and keys == frozen else "INSUFFICIENT"
+    return {"verdict": verdict, "missing_cases": sorted(frozen - keys), "extra_cases": sorted(keys - frozen),
+            "frozen_count": len(frozen)}
+
+
+def p6_parity_numbers(text: str) -> list[str]:
+    """`parity-amendments-2026-10-26.md` 中承接 Phase 為 P6 的承接編號（§1 第 5 欄、§2 第 3 欄、§3 P6 小節）。"""
+    nums: set[int] = set()
+    section = None
+    for line in text.splitlines():
+        if line.startswith("## §1"):
+            section = "s1"
+        elif line.startswith("## §2"):
+            section = "s2"
+        elif line.startswith("### `feature/rust-refactor-p6`"):
+            section = "s3p6"
+        elif line.startswith("## ") or line.startswith("### "):
+            section = None if not line.startswith("### §2.") else section
+        if not line.startswith("|") or line.startswith("|---"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if section == "s1" and len(cells) >= 5 and cells[0].isdigit() and "P6" in cells[4]:
+            nums.add(int(cells[0]))
+        elif section == "s2" and len(cells) >= 4 and "P6" in cells[2]:
+            nums.update(int(n) for n in re.findall(r"#(\d+)", cells[3]))
+        elif section == "s3p6" and cells and cells[0].isdigit():
+            nums.add(int(cells[0]))
+    return [f"#{n}" for n in sorted(nums)]
+
+
+_COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
+def _process_evidence_problems(num: str, entry: dict[str, Any]) -> list[str]:
+    """`PROCESS-EVIDENCE` 列的證據檢查；回傳問題清單（空＝通過）。
+
+    證據為 `report` 中 `## #N` 段落內唯一的 ```` ```json process-evidence ```` 區塊（不以說明文字關鍵字判定，
+    sol P6-b64dad9-1）：`red` 須為 `entry.commit`、退出碼非 0、`failed > 0` 且 `failed_tests` 非空；`green` 須為另一個
+    commit、與 `red` 同一 `command`、退出碼 0、`failed == 0`、`passed > 0`。
+    """
+    if num not in PROCESS_EVIDENCE_ROWS:
+        return [f"{num} 未逐名核准以 PROCESS-EVIDENCE 為證據（只限 {sorted(PROCESS_EVIDENCE_ROWS)}）"]
+    report, commit = entry.get("report"), str(entry.get("commit") or "")
+    if not report or not _COMMIT_RE.fullmatch(commit):
+        return ["PROCESS-EVIDENCE 須附 report 與 commit"]
+    path = ROOT / str(report)
+    if not path.is_file():
+        return [f"report 不存在：{report}"]
+    section: list[str] | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            if section is not None:
+                break
+            if re.match(rf"^## {re.escape(num)}(?:\s|$)", line):
+                section = []
+            continue
+        if section is not None:
+            section.append(line)
+    if section is None:
+        return [f"report 缺 `## {num}` 段落"]
+    blocks = re.findall(r"^```json process-evidence\n(.*?)^```", "\n".join(section) + "\n", re.S | re.M)
+    if len(blocks) != 1:
+        return [f"`## {num}` 段落須恰有一個 json process-evidence 區塊（實得 {len(blocks)}）"]
+    try:
+        data = json.loads(blocks[0])
+    except ValueError as exc:
+        return [f"process-evidence 區塊不是合法 JSON：{exc}"]
+    red = data.get("red") if isinstance(data, dict) else None
+    green = data.get("green") if isinstance(data, dict) else None
+    if not isinstance(red, dict) or not isinstance(green, dict):
+        return ["process-evidence 須含 red 與 green 物件"]
+
+    def _int(rec: dict, key: str) -> int | None:
+        value = rec.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    problems: list[str] = []
+    if red.get("commit") != commit:
+        problems.append(f"red.commit 須為核准的 {commit}")
+    if not isinstance(red.get("command"), str) or not red["command"]:
+        problems.append("red.command 缺漏")
+    if (_int(red, "exit_code") or 0) == 0 or (_int(red, "failed") or 0) <= 0:
+        problems.append("red 須為非零退出且 failed > 0")
+    tests = red.get("failed_tests")
+    if not isinstance(tests, list) or not tests or not all(isinstance(t, str) and t for t in tests):
+        problems.append("red.failed_tests 須列出失敗測試")
+    gcommit = green.get("commit")
+    if not isinstance(gcommit, str) or not _COMMIT_RE.fullmatch(gcommit) or gcommit == commit:
+        problems.append("green.commit 須為另一個有效 commit")
+    if green.get("command") != red.get("command"):
+        problems.append("green.command 須與 red 相同")
+    if _int(green, "exit_code") != 0 or _int(green, "failed") != 0 or (_int(green, "passed") or 0) <= 0:
+        problems.append("green 須為退出碼 0、failed == 0、passed > 0")
+    return problems
+
+
+def judge_parity(numbers: list[str], emap: dict[str, Any], rows_by_nodeid: dict[str, list[dict]],
+                 l15: dict[str, list[dict]] | None) -> list[dict]:
+    rows = emap.get("parity_rows") or {}
+    out: list[dict] = []
+    for num in numbers:
+        entry = rows.get(num) or {}
+        status = entry.get("status")
+        row: dict[str, Any] = {"row": num, "status": status or "OWNER-DECISION-PENDING"}
+        if status == "PASS":
+            verdict, detail = judge_tests(list(entry.get("tests") or []), rows_by_nodeid, l15)
+            row.update({"verdict": verdict, "missing_tests": detail["missing"] + detail["unchecked"]})
+            if detail["failed"]:
+                row["failed_tests"] = detail["failed"]
+        elif status == "BLOCKED-OWNER":
+            proc = entry.get("procedure")
+            row["verdict"] = "BLOCKED-OWNER" if proc and (ROOT / str(proc)).is_file() else "INSUFFICIENT"
+        elif status == "PROCESS-EVIDENCE":
+            reasons = _process_evidence_problems(num, entry)
+            row["verdict"] = "INSUFFICIENT" if reasons else "PASS"
+            if reasons:
+                row["reasons"] = reasons
+        else:
+            row["verdict"] = "INSUFFICIENT"
+            if status not in PARITY_STATUSES:
+                row["reasons"] = [f"status {status!r} 未登記或不在 {PARITY_STATUSES}"]
+        out.append(row)
+    return out
+
+
+def run_prereqs(script: pathlib.Path) -> dict[str, Any]:
+    """增補 #180：全表模式（`--strict`），不得以 `--max-task` 局部檢查充當出口。"""
+    try:
+        proc = subprocess.run([sys.executable, str(script), "--strict"], capture_output=True, text=True,
+                              timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"verdict": "INSUFFICIENT", "exit_code": None, "reasons": [str(exc)]}
+    tail = (proc.stdout or "").strip().splitlines()[-1:] or [""]
+    return {"verdict": "PASS" if proc.returncode == 0 else "INSUFFICIENT", "exit_code": proc.returncode,
+            "reasons": tail}
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--l1-results", required=True, type=pathlib.Path)
+    ap.add_argument("--map", type=pathlib.Path)
+    ap.add_argument("--lock", type=pathlib.Path, default=DEFAULT_LOCK)
+    ap.add_argument("--cases-lock", type=pathlib.Path, default=DEFAULT_CASES_LOCK)
+    ap.add_argument("--l15-results", type=pathlib.Path, default=None)
+    ap.add_argument("--parity-doc", type=pathlib.Path, default=DEFAULT_PARITY_DOC)
+    ap.add_argument("--prereqs-script", type=pathlib.Path, default=DEFAULT_PREREQS)
+    ap.add_argument("--daemon-path", type=pathlib.Path, default=None,
+                    help="受測 release serialwrapd 執行檔（identity.daemon_sha256）")
+    ap.add_argument("--build-linux-exit", type=int, default=None,
+                    help="指定 release 建置命令的退出碼")
+    ap.add_argument("--built-daemon-sha256", default=None,
+                    help="release 建置成功當下記錄的 serialwrapd SHA-256")
+    ap.add_argument("--dry-run", action="store_true", help="在輸出標記 dry_run；不改變既有判定")
+    ap.add_argument("--out", type=pathlib.Path)
+    ap.add_argument("--plan", action="store_true", help="只依 L1 鎖印出 cargo 集合的前置收集命令（OD-53 推導 --caps）")
+    args = ap.parse_args(argv)
+
+    lock = json.loads(args.lock.read_text(encoding="utf-8"))
+    if args.plan:
+        plan = collect_plan(lock, args.l1_results)
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return 1 if any(e["caps"] is None for e in plan) else 0
+    if args.map is None or args.out is None:
+        ap.error("判定模式須指定 --map 與 --out")
+    emap = yaml.safe_load(args.map.read_text(encoding="utf-8")) or {}
+    cases_lock = json.loads(args.cases_lock.read_text(encoding="utf-8"))
+    l15, l15_reasons = load_l15(args.l15_results)
+    sections, rows = judge_sections(args.l1_results, lock, _load_judge())
+    cases = judge_cases(emap, rows, l15)
+    coverage = map_coverage(emap, cases_lock)
+    parity = judge_parity(p6_parity_numbers(args.parity_doc.read_text(encoding="utf-8")), emap, rows, l15)
+    prereqs = run_prereqs(args.prereqs_script)
+    case_verdicts = [c["status"] for c in cases if c["status"] in _RANK]
+    parity_verdicts = [r["verdict"] for r in parity if r["verdict"] in _RANK]
+    extra = [coverage["verdict"], prereqs["verdict"]] + (["INSUFFICIENT"] if l15_reasons else [])
+    result = _worst([s["verdict"] for s in sections] + case_verdicts + parity_verdicts + extra)
+    if result == "INVALID":
+        result = "FAIL"
+    elif result == "EVIDENCE_MISSING":
+        result = "INSUFFICIENT"
+    identity = build_identity(daemon_path=args.daemon_path, build_linux_exit=args.build_linux_exit,
+                              built_daemon_sha256=args.built_daemon_sha256, dry_run=args.dry_run)
+    identity_missing, identity_mismatch = identity_problems(identity, args.daemon_path)
+    if args.dry_run or identity_missing or identity_mismatch:
+        # P7 _bind 以 identity.daemon_sha256 決定採用與否；不完整或自檢失敗時清空此鍵，
+        # 避免下游只看見一組可比對的 SHA、卻略過本 gate 的缺漏診斷。
+        identity["daemon_sha256"] = None
+        checked_missing, checked_mismatch = identity_problems(identity, args.daemon_path)
+        identity_missing = sorted(set(identity_missing + checked_missing))
+        identity_mismatch = sorted(set(identity_mismatch + checked_mismatch))
+    payload = {"sections": sections, "cases": cases, "map_coverage": coverage, "parity_rows": parity,
+               "prereqs": prereqs, "l15_reasons": l15_reasons, "result": result,
+               "dry_run": bool(args.dry_run), "identity": identity,
+               "identity_problems": {"missing": identity_missing, "mismatch": identity_mismatch}}
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"[s22_gate_check] result={result} → {args.out}")
+    return 0 if result == "PASS" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

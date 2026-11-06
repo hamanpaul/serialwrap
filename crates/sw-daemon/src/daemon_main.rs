@@ -531,7 +531,7 @@ fn caps_for_defaults(defaults: &RuntimePaths) -> Capabilities {
         on_demand_autostart: win,
         console_kind: if win { ConsoleKind::TcpTelnet } else { ConsoleKind::Pty },
         native_device: if win { DeviceBackendKind::Win } else { DeviceBackendKind::Posix },
-        // merge P7：P6 增補（SC-29）；allowlist 解析只看路徑風格，不涉 console。
+        // P6：與 `sw_pal::native()` 的平台值一致（Windows 宣告 com0com console 可用）。
         com0com_console: win,
     }
 }
@@ -1137,7 +1137,16 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     let mut src = (p.devices)(DeviceSelection {
         by_id_dir: PathBuf::from(&dirs.by_id_dir),
         by_path_dir: PathBuf::from(&dirs.by_path_dir),
-        exclude_coms: cfg.windows_exclude_coms(),
+        exclude_coms: {
+            // D-12：com0com Console-side pair 永不被列舉成受管 UART。
+            let mut coms = cfg.windows_exclude_coms();
+            for port in serial_console_excludes(&cfg, &p.caps, &|m: String| warn(m)) {
+                if !coms.contains(&port) {
+                    coms.push(port);
+                }
+            }
+            coms
+        },
         test_allowlist: allow.enabled.then(|| allow.coms.clone()),
     });
     hooks.trace(Stage::InitialScan);
@@ -1389,4 +1398,28 @@ mod tests {
         assert!(!is_optional_like("-"));
         assert!(!is_optional_like("-a b"));
     }
+}
+
+/// P6 D-12：`windows.serial_console` 的 console／peer 埠（只在 `caps.com0com_console` 時生效）。
+pub fn serial_console_excludes(cfg: &RuntimeConfig, caps: &Capabilities, warn: &dyn Fn(String)) -> Vec<String> {
+    let Some(parsed) = cfg.windows_serial_console() else {
+        return Vec::new();
+    };
+    if !caps.com0com_console {
+        warn("windows.serial_console 在此平台不支援，已忽略".to_string());
+        return Vec::new();
+    }
+    let Ok(map) = parsed else {
+        warn("windows.serial_console 格式不符（須為 <by_id>: {console_port, peer_port} 的 mapping），已忽略".to_string());
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for pair in map.0.values() {
+        for port in [&pair.console_port, &pair.peer_port] {
+            if !out.contains(port) {
+                out.push(port.clone());
+            }
+        }
+    }
+    out
 }

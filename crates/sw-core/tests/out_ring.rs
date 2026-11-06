@@ -72,3 +72,32 @@ fn disp(b: &[u8]) -> OutItem { OutItem::Display { bytes: b.to_vec(), iac_escaped
     r.consume(4);
     assert_eq!(r.control_bytes(), 4);
 }
+
+// parity-amendments-2026-10-26 #178（P6 審查 F7）：保護部分寫出的 front 時，被丟的是剛推入的新項，
+// 回報不得謊稱 DroppedOldest。
+#[test] fn partially_written_front_drops_newest_reported() {
+    let mut r = OutRing::new(8);
+    r.push(disp(b"abcdefgh")); r.consume(3);
+    assert_eq!(r.push(disp(b"ZZZZ")), PushOutcome::DroppedNewest { bytes: 4 });
+    assert_eq!(r.back(), Some(&disp(b"abcdefgh")), "back() 仍為舊項");
+    assert_eq!(r.front(), Some(&b"defgh"[..]));
+    assert_eq!(r.dropped_total(), 4);
+}
+#[test] fn older_dropped_before_newest_still_reports_newest() {
+    // front 部分寫出（剩 5）＋B（2）＋新項 C（4）：先丟較舊的 B 仍超出，再丟新項 C → 以 DroppedNewest 回報合計。
+    let mut r = OutRing::new(8);
+    r.push(disp(b"abcdefgh")); r.consume(3);
+    assert_eq!(r.push(disp(b"BB")), PushOutcome::Queued);
+    assert_eq!(r.push(disp(b"CCCC")), PushOutcome::DroppedNewest { bytes: 6 });
+    assert_eq!(r.back(), Some(&disp(b"abcdefgh")));
+}
+#[test] fn drop_of_older_only_stays_dropped_oldest() {
+    let mut r = OutRing::new(8);
+    r.push(disp(b"abcdefgh")); r.consume(3);
+    r.push(OutItem::Control(b"C".to_vec()));
+    // front 剩 5，新項 3 → 合計 8 不超出
+    assert_eq!(r.push(disp(b"xyz")), PushOutcome::Queued);
+    r.consume(5);
+    // front 現為 Control（未部分寫出）；Display 只剩 xyz（3），再推 8 → 丟最舊的 xyz
+    assert_eq!(r.push(disp(b"12345678")), PushOutcome::DroppedOldest { bytes: 3 });
+}

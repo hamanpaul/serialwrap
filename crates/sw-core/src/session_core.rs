@@ -3,7 +3,7 @@
 //! 型別與公開簽章依 `docs/rust-refactor/plans/06-slice21-daemon-core.md` Task 11「Produces」與 Task 0 骨架凍結；
 //! 事件處理只更新 session 狀態並產生效果，I/O 由 actor executor 執行。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ use sw_proto::pyre::valid_completion_regex;
 
 use crate::Mono;
 use crate::arbiter::{
-    CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitReq,
+    CmdOutcome, CommandRegistry, QueuedCommand, RunDecision, SessionQueue, SubmitOrigin, SubmitReq,
 };
 use crate::capture::{
     AgentLogCapture, BG_CAPTURE_MAX_BYTES, BackgroundCapture, CaptureEnv,
@@ -30,8 +30,7 @@ use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::out_ring::OutItem;
 use crate::lease::{InteractiveLease, Tombstones};
 use crate::login_fsm::{
-    LoginPlan, choose_login_plan, detect_boot_banner,
-    matches_login_or_password,
+    LoginPlan, choose_login_plan, detect_boot_banner, matches_login_or_password,
 };
 use crate::mailbox::{
     ControlEvent, DataEvent, DetachReason, MailboxItem, OpenFailure, OpenedBridge, Reply,
@@ -48,6 +47,11 @@ use crate::state_store::{ReleasedRow, StateDelta};
 use crate::tx_writer::{Fence, FenceReject, FlashMode, OpId, TX_LEDGER_LIVE_MAX, TxPermit};
 use crate::uart_bridge::RxShared;
 use crate::wal::WalWriter;
+
+/// P6 Task 6：human console 狀態機（分檔，見 `session_core/console.rs`）。
+mod console;
+/// P6 Task 7：interactive lease 差量（分檔，見 `session_core/lease_p6.rs`）。
+mod lease_p6;
 
 /// daemon stderr／state.json 相關通知（Task 0 骨架型別）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,8 +369,6 @@ pub struct SessionCore {
     /// `resolve_usb_busid` 來源（transport stall 提示的 busid）；預設原生實作，測試可替換。
     usb: Arc<dyn sw_pal::traits::UsbTopology>,
     console_count: usize,
-    /// 現行 bridge 的哨兵 PTY slave 路徑（`public()["vtty"]`、self-test `attached_vtty`）。
-    vtty: Option<String>,
     queue: SessionQueue,
     foreground: Option<OpGrant>,
     /// 與前景並行的 op（READY recover、self-test probe；審查 F25）：不是 Python 的前景 operation，
@@ -430,6 +432,41 @@ pub struct SessionCore {
     pending_bind: Option<String>,
     #[cfg(feature = "test-fakes")]
     panic_events_remaining: u8,
+    /// P6：human console 狀態（ownership、line editor、DeferredBuffer、human TX lane、回放保留）。
+    human: crate::human_console::HumanConsoleState,
+    /// P6 增補 #11：drain Phase 1 時的 human lease owner 與 timeout（05 §3.1 第 1 步）。
+    retained_human: Option<(String, f64)>,
+    /// P6 Task 6：目前前景命令的 admission（`fg_finish` 依此 resume）。
+    fg_adm: Option<FgAdmission>,
+    /// P6 增補 #12：self-test suspend 的世代（drain Phase 1 重設 ownership 時遞增）；各 probe 的 suspend 旗標
+    /// 記在自己的 `PendingOp::SelfTest`，只有同世代者完成時才 resume（sol P6-e9b5c61-1）。
+    self_test_suspend_gen: u64,
+    /// P6 D-19：輸入丟棄 WARNING 的限速鍵。
+    input_drop_warned: std::collections::HashSet<(String, &'static str, u64)>,
+    /// P6 Task 3／6：human line mode 的 basename 路徑風格（`Pal.caps.path_flavor`；預設 POSIX）。
+    path_flavor: sw_pal::PalPathFlavor,
+    /// P6 Task 7：soft preempt／ATTACHED 救援 stash 的 human lease（`_stashed_human_lease`）。
+    stashed_human: Option<InteractiveLease>,
+    /// P6 Task 7：worker `snapshot()` 的 running／serial_alive（executor 注入；`None` 視為健康）。
+    worker_health: Option<Arc<dyn Fn() -> crate::uart_bridge::WorkerSnapshot + Send + Sync>>,
+    /// P6 Task 7（#56）：tick 到期還原所建立的回放 hold（結算前 lease 類操作回 SESSION_INTERACTIVE_BUSY）。
+    tick_close_hold: Option<u64>,
+    /// lane 刪除回放使 replay hold 釋放（D-22(3)）；事件結尾讓佇列繼續出列。
+    hold_release_kick: bool,
+    /// 前景命令的 `timeout_s`（human 逾時開 lease 的 `max(timeout_s, hard_timeout_s)`）。
+    fg_cmd_timeout_s: f64,
+    /// parity #56：tick 到期還原結算前提交的 interactive 模式命令（出列時回 SESSION_INTERACTIVE_BUSY）。
+    tick_close_interactive: HashSet<String>,
+    /// sol 補審 p6-20261028 High #1：已出列、通過執行期檢查，但其 refresh（lazy expiry）剛建立回放 hold 的命令。
+    /// Python `execute_command` 於送出前同步 `post.execute()`；Rust 回放為非同步，命令停在此槽（registry 已為
+    /// running）待 hold 結算後於 `start_next` 優先送出，不再重做出列檢查。drain／flush 時以 NotSubmitted 結束。
+    replay_parked: Option<QueuedCommand>,
+    /// P6 Task 7：P5 既有函式內產生、於本事件結尾併入的效果（LeaseIndex 一律排在 Reply 之前）。
+    fx_buf: Vec<Effect>,
+    /// P6 Task 7：目前事件的 monotonic 時刻（不帶 `now` 參數的既有 helper 使用）。
+    now_cache: Mono,
+    /// P6 Task 7：目前前景命令的來源（human reboot／逾時升格判定，D-10）。
+    fg_origin: Option<SubmitOrigin>,
     /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
     #[cfg(feature = "test-fakes")]
     last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
@@ -554,7 +591,6 @@ impl SessionCore {
             transport_stall_warned: false,
             usb: Arc::new(sw_pal::device_source::NativeUsbTopology),
             console_count: 0,
-            vtty: None,
             queue: SessionQueue::new(),
             foreground: None,
             side_ops: HashMap::new(),
@@ -598,9 +634,35 @@ impl SessionCore {
             pending_bind: None,
             #[cfg(feature = "test-fakes")]
             panic_events_remaining: 0,
+            human: crate::human_console::HumanConsoleState::new(),
+            retained_human: None,
+            fg_adm: None,
+            self_test_suspend_gen: 0,
+            input_drop_warned: std::collections::HashSet::new(),
+            path_flavor: sw_pal::PalPathFlavor::Posix,
+            stashed_human: None,
+            worker_health: None,
+            tick_close_hold: None,
+            hold_release_kick: false,
+            fg_cmd_timeout_s: 0.0,
+            tick_close_interactive: HashSet::new(),
+            replay_parked: None,
+            fx_buf: Vec::new(),
+            now_cache: 0,
+            fg_origin: None,
             #[cfg(feature = "test-fakes")]
             last_error_observer: None,
         }
+    }
+
+    /// P6：設定 human line mode 的路徑風格（daemon 依 `Pal.caps.path_flavor` 呼叫）。
+    pub fn set_path_flavor(&mut self, flavor: sw_pal::PalPathFlavor) {
+        self.path_flavor = flavor;
+    }
+
+    /// SC-28：TCP console 後端（human console 經 127.0.0.1 Telnet listener；SessionPublic 輸出 `console_endpoint`）。
+    pub fn set_tcp_console(&mut self, on: bool) {
+        self.human.tcp_console = on;
     }
 
     /// 處理一個事件；`now` 為 monotonic（Mono）。
@@ -611,6 +673,7 @@ impl SessionCore {
             panic!("測試注入的 session actor panic");
         }
 
+        self.now_cache = now;
         let mut effects = Effects(Vec::new());
         match ev {
             MailboxItem::Control(ControlEvent::Request { req, reply }) => {
@@ -747,23 +810,65 @@ impl SessionCore {
             }) => {
                 effects.0.extend(self.rx_chunk(epoch, &bytes, wal_seq, now));
             }
-            // P6 Task 1：Slice 2.2 新增的 mailbox 事件（行為由 P6 Task 6／9／10 交付）。
-            ev @ (MailboxItem::Data(DataEvent::ConsoleInputBytes { .. })
-            | MailboxItem::Data(DataEvent::ConsoleDisconnected { .. })
-            | MailboxItem::Control(ControlEvent::ConsoleConnected { .. })
-            | MailboxItem::Control(ControlEvent::ConsoleScan { .. })
-            | MailboxItem::Control(ControlEvent::HumanTxCompleted { .. })
-            | MailboxItem::Control(ControlEvent::ConsoleAttachReq { .. })) => {
-                effects.0.extend(self.console_event(ev, now));
+            // P6 Slice 2.2 console 事件（07 Task 6；`session_core/console.rs`）。
+            MailboxItem::Data(DataEvent::ConsoleInputBytes {
+                client_id,
+                client_lifetime,
+                input_epoch,
+                bytes,
+            }) => {
+                effects.0.extend(self.console_input(
+                    &client_id,
+                    client_lifetime,
+                    input_epoch,
+                    bytes,
+                    now,
+                ));
+            }
+            MailboxItem::Data(DataEvent::ConsoleDisconnected {
+                client_id,
+                client_lifetime,
+            }) => {
+                effects
+                    .0
+                    .extend(self.console_disconnected(&client_id, client_lifetime));
+            }
+            MailboxItem::Control(ControlEvent::ConsoleConnected {
+                client_id,
+                client_lifetime,
+                label,
+                vtty,
+                kind,
+                close_gen,
+            }) => {
+                effects.0.extend(self.console_connected(
+                    client_id,
+                    client_lifetime,
+                    label,
+                    vtty,
+                    kind,
+                    close_gen,
+                    now,
+                ));
+            }
+            MailboxItem::Control(ControlEvent::ConsoleScan { scan, source }) => {
+                effects.0.extend(self.console_scan(scan, source, now));
+            }
+            MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
+                effects.0.extend(self.human_tx_completed(tag, report, now));
             }
         }
+        if std::mem::take(&mut self.hold_release_kick) && !self.fg_slot_busy() {
+            effects.0.extend(self.start_next(now));
+        }
         effects.0.extend(self.release_force_polls(now));
-        // P7 Task 10：reader 端 agent log 的前景 gate（Python `session.foreground_busy`，只計命令，EVT-D-L1）。
+        // P6 Task 7：retained human 還原（READY／ATTACHED）與緩衝效果併入（LeaseIndex 先於 Reply）。
+        self.restore_retained_human(now);
+        self.drain_fx_buf(&mut effects.0);
+        // P7 Task 10／16-wire：發布命令或有效 replay_hold 的忙碌狀態（合併裁決 D8、EVT-D-L1）。
+        // interactive open／send 本身不計前景命令；狀態供 reader agent log 與 EventEngine 共用。
         let busy = self.foreground_busy();
         self.capture_observer.set_foreground_busy(busy);
-        // P7 Task 16-wire：發布 foreground_busy 供 `BridgeQueries::active_cmd_id_for`（不經 actor mailbox）。
-        // 同樣只計命令：interactive open／send 的 TX 也占 `self.foreground`，但 Python 不經
-        // `_begin_foreground_operation_locked`（審查 sol-backfill p7-20261028 #3）。
         if busy != self.published_foreground_busy {
             self.published_foreground_busy = busy;
             self.deps.fence.with(|f| f.foreground_busy = busy);
@@ -1093,6 +1198,8 @@ impl SessionCore {
             }
             return effects;
         }
+        // P6 增補 #11（07 Task 6 Step 3 第 7 點）：回放撤銷、BC-02 失效、ownership 重設與 retained human。
+        self.human_phase1(&kind, &mut effects.0);
         let Some(epoch) = self.generations.conn_epoch else {
             if self.state == SessionState::Attaching
                 || self.open_real_path.is_some()
@@ -1186,6 +1293,7 @@ impl SessionCore {
             "FLUSHED_BY_RECOVERY"
         };
         let _ = self.queue.drain_all();
+        self.abort_parked_command();
         self.deps
             .registry
             .flush_session(&self.sid, code, &self.wall_iso());
@@ -1237,7 +1345,6 @@ impl SessionCore {
             self.queue_registered = false;
             self.foreground = None;
             self.side_ops.clear();
-            self.vtty = None;
             self.console_count = 0;
             self.foreground_reboot = false;
             self.login_run = None;
@@ -1616,16 +1723,6 @@ impl SessionCore {
         }
     }
 
-    /// P6 Task 1：Slice 2.2 console mailbox 事件（P6 Task 6／9／10 交付本體）。
-    fn console_event(&mut self, _ev: MailboxItem, _now: Mono) -> Vec<Effect> {
-        todo!("P6 Task 9")
-    }
-
-    /// P6 增補 #9：console RPC（P6 Task 10 交付本體）。
-    fn console_request(&mut self, _req: SessionRequest, _reply: Reply, _now: Mono) -> Vec<Effect> {
-        todo!("P6 Task 10")
-    }
-
     fn handle_request(&mut self, req: SessionRequest, reply: Reply, now: Mono) -> Vec<Effect> {
         match req {
             SessionRequest::GetState => vec![Effect::Reply(reply, Ok(self.ok_session(now)))],
@@ -1638,10 +1735,6 @@ impl SessionCore {
                 vec![Effect::Reply(reply, Ok(result))]
             }
             SessionRequest::Submit(req) => self.submit(req, reply, now),
-            // P6 增補 #9：console RPC（行為由 P6 Task 10 交付）。
-            req @ (SessionRequest::ConsoleAttach { .. }
-            | SessionRequest::ConsoleDetach { .. }
-            | SessionRequest::ConsoleList) => self.console_request(req, reply, now),
             SessionRequest::Release { source, reason } => {
                 if self.state == SessionState::Released {
                     if self
@@ -1699,7 +1792,8 @@ impl SessionCore {
                 self.pending_release = Some(PendingRelease {
                     source,
                     reason,
-                    closed_consoles: self.console_count as i128,
+                    // 增補 #11：取進入 Phase 1 時的 console 數（human.consoles 含 internal 哨兵）。
+                    closed_consoles: (self.console_count + self.human.consoles.len()) as i128,
                     aborted_cmd: self.foreground_busy(),
                 });
                 self.console_count = 0;
@@ -1726,6 +1820,16 @@ impl SessionCore {
                     self.deps.fence.revoke_ops(&[grant.op_id]);
                 }
                 vec![Effect::Reply(reply, Ok(pydict! { "ok" => true }))]
+            }
+            // P6 Slice 2.2 console 請求（行為由 07 Task 9／10 交付）。
+            SessionRequest::ConsoleAttach { label, pty } => {
+                self.console_attach(label, pty, reply, now)
+            }
+            SessionRequest::ConsoleDetach { client_id } => {
+                vec![Effect::Reply(reply, Ok(self.console_detach_request(&client_id, now)))]
+            }
+            SessionRequest::ConsoleList => {
+                vec![Effect::Reply(reply, Ok(self.console_list_request(now)))]
             }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
             SessionRequest::Recover { timeout_s, force } => {
@@ -1926,6 +2030,7 @@ impl SessionCore {
                     return vec![Effect::Reply(reply, Ok(result))];
                 }
             };
+        self.note_tick_close_interactive(&admitted.queued);
         self.queue.push(admitted.queued, &self.deps.registry);
         let mut effects = vec![Effect::Reply(reply, Ok(admitted.response))];
         effects.extend(self.start_next(now));
@@ -2264,8 +2369,13 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            sentinel,
             ..
         } = opened;
+        if let Some(pty) = sentinel {
+            // bridge 立即進 drain：預建的哨兵 PTY 不登記。
+            self.fx_buf.push(Effect::ConsoleDiscard { token: pty.token });
+        }
         self.generations.conn_epoch = Some(epoch);
         self.attached_real_path = None;
         self.open_real_path = None;
@@ -2371,14 +2481,18 @@ impl SessionCore {
         while self.retired_stops.len() > 32 {
             self.retired_stops.pop_front();
         }
-        vec![
+        let mut fx = vec![
             Effect::AdoptBridge {
                 epoch,
                 worker: opened.worker,
                 real_path: opened.real_path,
             },
             Effect::BeginDrain { stop_id, epoch },
-        ]
+        ];
+        if let Some(pty) = opened.sentinel {
+            fx.push(Effect::ConsoleDiscard { token: pty.token });
+        }
+        fx
     }
 
     fn attach_open_failed(
@@ -2440,19 +2554,21 @@ impl SessionCore {
             epoch,
             worker,
             real_path,
+            sentinel,
+            console_endpoint,
             rx,
-            vtty,
         } = opened;
+        // `uart_io.py` `start()`：listener 與 bridge 同時建立（端點同一事件可見）。
+        self.human.console_endpoint = console_endpoint;
         self.generations.conn_epoch = Some(epoch);
-        // 新 bridge 的 RX 視窗與哨兵（Python 每次 attach 新建 `UARTBridge`；POSIX 哨兵 primary 算 1 個 console）。
+        // 新 bridge 的 RX 視窗（Python 每次 attach 新建 `UARTBridge`；審查 F51）。哨兵 primary 於下方
+        // `register_sentinel` 登記進 human.consoles（P6 Task 9 步驟 5），console 數與 vtty 由 `public_ctx` 計算。
         // agent log 的 reader 端寫入者跟著現行 bridge（detach 時已停止 capture，此處只是防禦性搬移）。
         self.deps.rx.set_capture(None);
         if self.log_capture.is_some() {
             rx.set_capture(Some(self.capture_observer.clone()));
         }
         self.deps.rx = rx;
-        self.console_count = usize::from(vtty.is_some());
-        self.vtty = vtty;
         self.attached_real_path = Some(real_path.clone());
         self.known_real_path = Some(real_path.clone());
         if self.is_passthrough() {
@@ -2477,6 +2593,11 @@ impl SessionCore {
             worker,
             real_path,
         }];
+        // uart_io.py `start()`：沒有保留 console 時以 internal 哨兵為 primary；與 bridge adopt 同一事件登記，
+        // 之後任何 ATTACHED／READY 發布與 console_attach 都看得到它（Python 同一把鎖內完成）。
+        if let Some(pty) = sentinel {
+            effects.extend(self.register_sentinel(pty, now));
+        }
         if quiet_active {
             // 跨 detach 保留的 quiet：為新 epoch 排到期計時器，到期解除 fence（Python 時間式 gate；審查 92e0223_76de0cf bea2d8e-1）。
             effects.push(Effect::Schedule {
@@ -2912,7 +3033,15 @@ impl SessionCore {
         let transition = self.quiet.on_rx_text(&chunk, &self.profile, now);
         self.capture_rx(&chunk, wal_seq, now);
         match transition {
-            QuietTransition::Armed => self.apply_quiet_armed(now),
+            QuietTransition::Armed => {
+                // 增補 #13：banner／quiet arm 為 BC-02 失效點（07 D-02）。
+                let mut fx = Vec::new();
+                self.invalidate_input(InvalidateReason::BootBanner, &mut fx);
+                // DF-20（OD-37 範圍）：重新開機 banner 使既有 agent interactive lease 失效（Rust-only）。
+                self.invalidate_agent_lease_df20();
+                fx.extend(self.apply_quiet_armed(now));
+                fx
+            }
             QuietTransition::Cleared => {
                 // 只解除 TX 靜默維度；reconfirm pending 保留（#162）。
                 self.deps.fence.with(|f| {
@@ -3024,7 +3153,12 @@ impl SessionCore {
         }
         self.foreground_reboot = false;
         self.quiet.arm(now);
-        self.apply_quiet_armed(now)
+        // Python `_handle_reboot_command` 寫入後呼叫 `arm_boot_quiet()`，其內一律 `invalidate_deferred("boot_quiet")`：
+        // 這是出列前 `RebootCommand` 之外的第二個 BC-02 失效點（reboot 在途期間擷取的 human 輸入不得回放）。
+        let mut fx = Vec::new();
+        self.invalidate_input(InvalidateReason::QuietRearm, &mut fx);
+        fx.extend(self.apply_quiet_armed(now));
+        fx
     }
 
     fn timer(&mut self, event: TimerEvent, now: Mono) -> Vec<Effect> {
@@ -3049,9 +3183,9 @@ impl SessionCore {
                 }) && now >= deadline =>
             {
                 // Python `expired()`：`now - last > timeout`（嚴格大於；審查 F36）。恰在期限仍 active，
-                // 於期限後 1 ns 再檢查一次。
+                // 於期限後 1 ns 再檢查一次。P6：到期收回與 tick 同為「tick close」（#56 的 SESSION_INTERACTIVE_BUSY 期間）。
                 if now > deadline {
-                    self.close_lease(true);
+                    self.close_lease_tick();
                     Vec::new()
                 } else {
                     vec![Effect::Schedule {
@@ -3077,7 +3211,7 @@ impl SessionCore {
             .as_ref()
             .is_some_and(|lease| !lease.is_human() && lease.expired(now))
         {
-            self.close_lease(true);
+            self.close_lease_tick();
         }
         effects.extend(self.reboot_recovery_tick(now));
         effects.extend(self.reprobe_tick(now));
@@ -3486,10 +3620,10 @@ impl SessionCore {
         self.attached_real_path = None;
         self.foreground = None;
         self.side_ops.clear();
-        self.vtty = None;
         self.console_count = 0;
         self.queue_registered = false;
         self.queue = SessionQueue::new();
+        self.abort_parked_command();
         self.clear_interactive();
         self.detach_captures();
         // Python detach 不清 boot quiet／READY reconfirm（只有 passthrough 重掛時 `reset_passthrough_boot_gate` 清）：
@@ -3734,6 +3868,43 @@ impl SessionCore {
     // recover／force recover、reboot recovery、self-test、background／agent log capture。
     // -----------------------------------------------------------------------
 
+    /// `to_public_dict` 的 console 三欄（07 Task 10 Step 3 第 3 點）：有 bridge 時 console 數＝哨兵計數＋human
+    /// console；無 bridge 時為保留的 console 數。`vtty` 取 D-20 快取，無快取且無 bridge 時取保留 console 的 primary。
+    /// `console_endpoint` 只在 TCP console 後端或有端點時輸出（PTY 後端不輸出）。
+    fn public_ctx(&self) -> PublicCtx {
+        // Python `len(bridge.list_consoles())` 含 internal 哨兵；`console_count` 為 06 測試替身的哨兵計數。
+        let consoles = self.human.consoles.len();
+        let console_count = if self.generations.conn_epoch.is_some() {
+            self.console_count + consoles
+        } else {
+            consoles
+        };
+        let vtty = self.human.vtty_cache.clone().or_else(|| {
+            if self.generations.conn_epoch.is_some() {
+                return None;
+            }
+            self.human
+                .primary_client_id
+                .as_ref()
+                .and_then(|p| self.human.consoles.get(p))
+                .map(|c| c.vtty.clone())
+        });
+        PublicCtx {
+            console_count: console_count as i128,
+            vtty,
+            // Python `if console_endpoint is not None or not _pty_available()`：TCP 後端恆輸出（無端點為 null）。
+            console_endpoint: (self.human.tcp_console || self.human.console_endpoint.is_some())
+                .then(|| self.human.console_endpoint.clone()),
+        }
+    }
+
+    /// parity #56：記下 tick 還原 hold 期間提交的 interactive 模式命令（Python 於執行時發現 post-close 仍在而拒絕）。
+    fn note_tick_close_interactive(&mut self, queued: &crate::arbiter::QueuedCommand) {
+        if self.tick_close_hold.is_some() && normalized_mode(&queued.req.mode) == "interactive" {
+            self.tick_close_interactive.insert(queued.cmd_id.clone());
+        }
+    }
+
     fn session_value(&self, now: Mono) -> PyValue {
         PyValue::Dict(self.session_dict(now))
     }
@@ -3752,20 +3923,12 @@ impl SessionCore {
 
     /// `_lease_context`：4 個 LeaseContext 鍵（Slice 2.1 無 human 鍵入追蹤，`human_active` 恆 false）。
     fn lease_ctx(&self) -> Vec<(&'static str, PyValue)> {
-        let owner = self.lease.as_ref().map(|lease| lease.owner.clone());
-        let human_attached = owner.as_deref().is_some_and(|o| o.starts_with("human:"));
-        vec![
-            (
-                "interactive_owner",
-                owner.map(PyValue::from).unwrap_or(PyValue::Null),
-            ),
-            ("human_attached", PyValue::Bool(human_attached)),
-            ("human_active", PyValue::Bool(false)),
-            (
-                "recovery_mode",
-                PyValue::Bool(self.lease.as_ref().is_some_and(|lease| lease.recovery_mode)),
-            ),
-        ]
+        // P6 Task 7：`_lease_context`（human_active 依最近 raw 鍵入，#53）。
+        let ctx = self.lease_context_now(self.now_cache);
+        ["interactive_owner", "human_attached", "human_active", "recovery_mode"]
+            .into_iter()
+            .map(|k| (k, ctx.get(k).cloned().unwrap_or(PyValue::Null)))
+            .collect()
     }
 
     fn extend_pairs(out: &mut PyDict, pairs: Vec<(&'static str, PyValue)>) {
@@ -3789,6 +3952,9 @@ impl SessionCore {
         );
         self.lease = Some(lease);
         self.bump_owner_gen();
+        // P6：`_open_interactive_locked` → `bridge.set_interactive_owner(owner)`；全域 LeaseIndex 先於 Reply（07 Task 7）。
+        self.human_set_owner(Some(owner));
+        self.lease_index(LeaseIndexOp::Insert { interactive_id: id.clone() });
         id
     }
 
@@ -3799,29 +3965,19 @@ impl SessionCore {
             .with(|f| f.owner_gen = self.generations.owner_gen);
     }
 
-    /// 關閉目前 lease；`expired` 時留 tombstone（`keep_tombstone=True`）。
+    /// 關閉目前 lease；`expired` 時留 tombstone（`keep_tombstone=True`）。P6：stash 還原與 PostClose（`lease_p6.rs`）。
     fn close_lease(&mut self, expired: bool) {
-        if let Some(lease) = self.lease.take() {
-            if expired {
-                self.tombstones.push(lease.interactive_id, "expired");
-            }
-            self.bump_owner_gen();
-        }
+        self.close_lease_p6(expired);
     }
 
+    /// drain Phase 1：關閉 lease、丟棄 stash（不回放；ownership 由 `human_phase1` 重設）。
     fn clear_interactive(&mut self) {
-        self.close_lease(false);
+        self.clear_interactive_p6();
     }
 
-    /// `_refresh_interactive_locked`：agent lease lazy 到期 → expired tombstone。
+    /// `_refresh_interactive_locked`（P6：human peer grace 與 owner 檢查，`lease_p6.rs`）。
     fn refresh_lease(&mut self, now: Mono) {
-        if self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| !lease.is_human() && lease.expired(now))
-        {
-            self.close_lease(true);
-        }
+        self.refresh_lease_p6(now);
     }
 
     fn lease_expiry_timer(&self) -> Option<Effect> {
@@ -3852,89 +4008,11 @@ impl SessionCore {
         if self.generations.conn_epoch.is_none() {
             return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
         }
-        let mut result;
-        if self.state == SessionState::Ready {
-            if self.foreground.is_some() {
-                return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_BUSY")))];
-            }
-            self.refresh_lease(now);
-            let mut soft_preempted = false;
-            if let Some(existing) = self.lease.as_ref() {
-                // #53 soft preempt：human lease 閒置時 agent 可取得控制權（Slice 2.1 無 human console 回放，直接替換）。
-                if existing.is_human() && !owner.starts_with("human:") {
-                    self.lease = None;
-                    soft_preempted = true;
-                } else {
-                    let mut busy = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
-                    busy.insert(
-                        "interactive_session_id",
-                        PyValue::from(existing.interactive_id.clone()),
-                    );
-                    return vec![Effect::Reply(reply, Ok(busy))];
-                }
-            }
-            let id = self.open_lease(&owner, timeout_s, false, now);
-            result = pydict! {
-                "ok" => true,
-                "interactive_id" => id,
-                "session" => self.session_value(now),
-                "recovery_mode" => false,
-            };
-            if soft_preempted {
-                result.insert("soft_preempted", PyValue::Bool(true));
-            }
-        } else if !allow_attached {
-            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
-        } else if self.state == SessionState::Attached {
-            if self.vtty_alive() == Some(false) {
-                return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
-            }
-            let tail = clean_text(&self.deps.rx.tail(BOOTLOADER_RX_TAIL_CHARS));
-            let matched =
-                matches_any_bootloader_prompt(&tail, &self.profile.template.bootloader_prompts);
-            let mut boot_interrupt = false;
-            let mut login_required = false;
-            if matched.is_none() {
-                if detect_boot_banner(&tail) {
-                    boot_interrupt = true;
-                } else if matches_login_or_password(&tail, &self.profile) {
-                    login_required = true;
-                } else {
-                    let mut out = self.selector_error("SESSION_NOT_READY");
-                    out.insert("error_detail", PyValue::from("NOT_BOOTLOADER"));
-                    return vec![Effect::Reply(reply, Ok(out))];
-                }
-            }
-            self.refresh_lease(now);
-            let clamped = timeout_s.min(MAX_RECOVERY_LEASE_S);
-            if let Some(existing) = self.lease.as_ref() {
-                if existing.is_human() {
-                    self.lease = None;
-                } else {
-                    let mut busy = pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" };
-                    busy.insert(
-                        "interactive_session_id",
-                        PyValue::from(existing.interactive_id.clone()),
-                    );
-                    return vec![Effect::Reply(reply, Ok(busy))];
-                }
-            }
-            let id = self.open_lease(&owner, clamped, true, now);
-            result = pydict! {
-                "ok" => true,
-                "interactive_id" => id,
-                "session" => self.session_value(now),
-                "recovery_mode" => true,
-            };
-            if boot_interrupt {
-                result.insert("boot_interrupt", PyValue::Bool(true));
-            }
-            if login_required {
-                result.insert("login_required", PyValue::Bool(true));
-            }
-        } else {
-            return vec![Effect::Reply(reply, Ok(self.selector_error("SESSION_NOT_READY")))];
-        }
+        // P6 Task 7：READY／ATTACHED 分支（human lease、soft preempt stash、救援、#56）見 `lease_p6.rs`。
+        let result = match self.interactive_open_branches(&owner, timeout_s, allow_attached, now) {
+            Ok(result) => result,
+            Err(refused) => return vec![Effect::Reply(reply, Ok(refused))],
+        };
         let interactive_id = self
             .lease
             .as_ref()
@@ -3966,6 +4044,8 @@ impl SessionCore {
     }
 
     fn new_grant(&mut self, cmd_id: Option<String>) -> OpGrant {
+        // 07 D-22(4)：任一前景 op 取得 ownership 前先撤銷回放授權。
+        self.revoke_replay();
         self.next_op_id = self.next_op_id.saturating_add(1);
         OpGrant {
             op_id: OpId(self.next_op_id),
@@ -4018,7 +4098,8 @@ impl SessionCore {
             Some("SESSION_NOT_READY")
         } else if self.state == SessionState::Flashing {
             Some("FLASHING_BUSY")
-        } else if self.foreground.is_some() {
+        } else if self.fg_slot_busy() {
+            // Python `foreground_busy or _foreground_operation is not None`；P6 另計 replay hold（D-22(2)）。
             Some("SESSION_BUSY")
         } else {
             None
@@ -4072,7 +4153,8 @@ impl SessionCore {
         lease.touch(now);
         let (owner, status, recovery_mode) =
             (lease.owner.clone(), lease.status, lease.recovery_mode);
-        let screen = clean_text(&py_tail(&self.deps.rx.tail(0), screen_chars));
+        // 增補 #19：Python `rx_tail(screen_chars)` 即 `text[-n:]`。
+        let screen = clean_text(&self.deps.rx.tail_py(screen_chars));
         pydict! {
             "ok" => true,
             "interactive_id" => interactive_id,
@@ -4111,7 +4193,8 @@ impl SessionCore {
         if self.state != SessionState::Ready || self.generations.conn_epoch.is_none() {
             return Some(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY" });
         }
-        let human = command.req.source.starts_with("human:");
+        // 07 D-10（DF-02）：只有 line editor 產生的 HumanConsole 視為 human；RPC 的 `human:` source 一律以 agent 對待。
+        let human = matches!(command.req.origin, SubmitOrigin::HumanConsole { .. });
         if !human && !self.is_passthrough() {
             // `_agent_gate_reject_locked`＋SC-03（execute 層）；expire 翻轉時同步 fence。
             let was_failed = self.quiet.failed;
@@ -4143,29 +4226,47 @@ impl SessionCore {
 
     fn start_next(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if self.foreground.is_some() || self.state != SessionState::Ready {
+        // 增補 #26：回放保留（07 D-22）期間同樣不出列。
+        if self.fg_slot_busy() || self.state != SessionState::Ready {
             return effects;
         }
         loop {
-            let Some(command) = self.queue.pop() else {
-                return effects;
+            let command = if let Some(parked) = self.replay_parked.take() {
+                if self.parked_terminal(&parked.cmd_id) {
+                    // 已取消（Python `revoke_tx_op` 使其零 TX）：仍須結算 `mark_running` 登記的在途指標，
+                    // 否則 canceled＋in_flight 永久占用 pending 額度（sol P6-e9b5c61-2）。
+                    self.settle_parked_terminal(&parked.cmd_id);
+                    continue;
+                }
+                parked
+            } else {
+                let Some(command) = self.queue.pop() else {
+                    return effects;
+                };
+                if matches!(
+                    self.deps
+                        .registry
+                        .mark_running(&command.cmd_id, &self.wall_iso()),
+                    RunDecision::Skip
+                ) {
+                    continue;
+                }
+                if let Some(reject) = self.execute_time_reject(&command, now) {
+                    self.deps.registry.complete(
+                        &command.cmd_id,
+                        CmdOutcome::Result(reject),
+                        &self.wall_iso(),
+                    );
+                    continue;
+                }
+                if self.fg_slot_busy() {
+                    // 執行期 refresh 惰性結束過期 lease 並建立回放 hold：回放先上 UART（Python `post.execute()`），
+                    // 命令於 hold 結算後送出，不讓本命令的 `command_fg_begin` 撤銷剛建立的回放。
+                    self.replay_parked = Some(command);
+                    return effects;
+                }
+                command
             };
-            if matches!(
-                self.deps
-                    .registry
-                    .mark_running(&command.cmd_id, &self.wall_iso()),
-                RunDecision::Skip
-            ) {
-                continue;
-            }
-            if let Some(reject) = self.execute_time_reject(&command, now) {
-                self.deps.registry.complete(
-                    &command.cmd_id,
-                    CmdOutcome::Result(reject),
-                    &self.wall_iso(),
-                );
-                continue;
-            }
             let mode = normalized_mode(&command.req.mode).to_string();
             // #45 D-44：同 session 非 background 命令開始前，終結既有 background capture。
             if mode != "background" {
@@ -4177,7 +4278,19 @@ impl SessionCore {
                 }
             }
             let grant_cmd = Some(command.cmd_id.clone());
+            if mode == "interactive" && self.tick_close_interactive.remove(&command.cmd_id) {
+                // Python `_execute_command_inner`：`session_id in _interactive_post_close` → SESSION_INTERACTIVE_BUSY。
+                self.deps.registry.complete(
+                    &command.cmd_id,
+                    CmdOutcome::Result(pydict! { "ok" => false, "error_code" => "SESSION_INTERACTIVE_BUSY" }),
+                    &self.wall_iso(),
+                );
+                continue;
+            }
             if mode == "interactive" {
+                // Python 先 `_begin_foreground_operation_locked`（關 admission）再 `_open_interactive_locked`：
+                // admission 已關時 human owner 只記為 pending，不會搶走現有 raw owner。
+                self.command_fg_begin(&command.req.origin, true);
                 let timeout = command
                     .req
                     .timeout_s
@@ -4201,6 +4314,8 @@ impl SessionCore {
                         CmdOutcome::Result(result),
                         &self.wall_iso(),
                     );
+                    // 空命令同樣成對 begin／finish（finish 時 admission 開放與回放）。
+                    self.command_fg_finish(&mut effects);
                     continue;
                 }
                 let grant = self.new_grant(grant_cmd);
@@ -4227,6 +4342,12 @@ impl SessionCore {
                 self.background_cmd_ids.push(command.cmd_id.clone());
             }
             let reboot = !self.is_passthrough() && is_reboot_command(&command.req.command);
+            self.command_fg_begin(&command.req.origin, false);
+            self.fg_cmd_timeout_s = command.req.timeout_s;
+            if reboot {
+                // 增補 #13：reboot 命令命中點為 BC-02 失效點，送出前失效（`bridge.invalidate_deferred("reboot")`）。
+                self.invalidate_input(InvalidateReason::RebootCommand, &mut effects);
+            }
             let grant = self.new_grant(grant_cmd);
             self.pending_ops.insert(
                 grant.op_id,
@@ -4247,6 +4368,47 @@ impl SessionCore {
                 spec: OpSpec::Command(command),
             });
             return effects;
+        }
+    }
+
+    /// 停在 `replay_parked` 的命令已被其他路徑終結（cancel 等）時不再送出。
+    fn parked_terminal(&self, cmd_id: &str) -> bool {
+        self.deps.registry.get(cmd_id).is_none_or(|record| {
+            record.get("done_at").is_some_and(|value| !value.is_null())
+                || record.get("status").and_then(PyValue::as_str) != Some("running")
+        })
+    }
+
+    /// 已終結（取消）的停放命令：只結算 registry 在途指標。`complete()` 不覆寫 canceled 紀錄；紀錄已淘汰時
+    /// 同樣只清指標（Python worker 收尾 `_running.pop`）。其他終態已由其完成者結算，不重複寫入。
+    fn settle_parked_terminal(&mut self, cmd_id: &str) {
+        let canceled_or_gone = self
+            .deps
+            .registry
+            .get(cmd_id)
+            .is_none_or(|record| record.get("status").and_then(PyValue::as_str) == Some("canceled"));
+        if canceled_or_gone {
+            self.deps.registry.complete(
+                cmd_id,
+                CmdOutcome::Aborted(crate::arbiter::AbortClass::NotSubmitted),
+                &self.wall_iso(),
+            );
+        }
+    }
+
+    /// drain／flush：停在 `replay_parked` 的命令尚未有任何 TX，以 NotSubmitted 結束（同在途前景的中止分類）；
+    /// 已取消者同樣結算在途指標（sol P6-e9b5c61-2）。
+    fn abort_parked_command(&mut self) {
+        if let Some(parked) = self.replay_parked.take() {
+            if self.parked_terminal(&parked.cmd_id) {
+                self.settle_parked_terminal(&parked.cmd_id);
+            } else {
+                self.deps.registry.complete(
+                    &parked.cmd_id,
+                    CmdOutcome::Aborted(crate::arbiter::AbortClass::NotSubmitted),
+                    &self.wall_iso(),
+                );
+            }
         }
     }
 
@@ -4380,8 +4542,11 @@ impl SessionCore {
             return probe();
         }
         // Python `snapshot()["vtty_alive"] = bool(primary and os.path.exists(primary))`。
-        self.current_vtty()
-            .map(|path| std::path::Path::new(path).exists())
+        let exists = self.self_test_probes.path_exists.clone();
+        self.current_vtty().map(|path| match exists.as_ref() {
+            Some(f) => f(path),
+            None => std::path::Path::new(path).exists(),
+        })
     }
 
     /// Python `_suggest_profile_from_rx`：`clean_text(rx_tail(512))` 依序比對非 passthrough template 的
@@ -4405,25 +4570,11 @@ impl SessionCore {
             .map(|tpl| tpl.profile_name.clone())
     }
 
-    /// 現行 bridge 的哨兵 vtty（無 bridge 時為 `None`）。
+    /// 現行 bridge 的哨兵 vtty（Python `snapshot()["vtty"]`：`_create_console_client("primary")` 的 slave 路徑；
+    /// P6 起哨兵登記於 human.consoles（`internal`）。無哨兵（TCP／Windows）或無 bridge 時為 `None`）。
     fn current_vtty(&self) -> Option<&str> {
-        self.generations.conn_epoch.and(self.vtty.as_deref())
-    }
-
-    /// `public()` 的 console 欄位（Python `to_public_dict`：有 bridge 時 `len(list_consoles())` 與 primary vtty）。
-    fn public_ctx(&self) -> PublicCtx {
-        match self.generations.conn_epoch {
-            Some(_) => PublicCtx {
-                console_count: self.console_count as i128,
-                vtty: self.vtty.clone(),
-                console_endpoint: None,
-            },
-            None => PublicCtx {
-                console_count: 0,
-                vtty: None,
-                console_endpoint: None,
-            },
-        }
+        self.generations.conn_epoch?;
+        self.human.consoles.values().find(|c| c.internal).map(|c| c.vtty.as_str())
     }
 
     fn resolve_log_dir(&self) -> String {
@@ -4539,18 +4690,6 @@ impl SessionCore {
 
     // ---------------- OpFinished ----------------
 
-    /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）是前景 operation；recover、self-test、
-    /// interactive send 不設此旗標（審查 F27）。
-    /// merge P5 348eb2f：取代 P6 Task 6（增補 #26）的 `todo!` 骨架；P6 的 `replay_hold` 條件由 P6 合入時補上。
-    pub fn foreground_busy(&self) -> bool {
-        self.foreground.as_ref().is_some_and(|grant| {
-            matches!(
-                self.pending_ops.get(&grant.op_id),
-                Some(PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. })
-            )
-        })
-    }
-
     fn op_finished(
         &mut self,
         op_id: OpId,
@@ -4576,11 +4715,15 @@ impl SessionCore {
         {
             // 並行 op（READY recover／self-test）：不動前景槽。
             self.side_ops.remove(&op_id);
+            let suspended = PendingOp::self_test_suspend_token(pending.as_ref());
             let mut effects = match pending {
                 Some(PendingOp::Recover { reply }) => self.finish_recover(reply, outcome, now),
                 Some(other) => self.answer_op(other, outcome, now, true),
                 None => Vec::new(),
             };
+            // P6 增補 #12：self-test probe 結束時 resume 自己 suspend 的 human（回放於此建立 hold）；
+            // recover 等其他 side op 與未 suspend 的 probe 為 no-op（sol P6-e9b5c61-1）。
+            self.self_test_suspend_end(suspended, &mut effects);
             effects.push(Effect::SettleTx { epoch, op_id });
             effects.extend(self.start_next(now));
             return effects;
@@ -4598,6 +4741,7 @@ impl SessionCore {
         }
         let grant = self.foreground.take().expect("已確認前景");
         self.foreground_reboot = false;
+        let suspended = PendingOp::self_test_suspend_token(pending.as_ref());
         let mut effects = Vec::new();
         match pending {
             Some(PendingOp::Command {
@@ -4637,6 +4781,9 @@ impl SessionCore {
                 }
             }
         }
+        // P6：前景命令 resume／admission 開放與 self-test resume 的回放（07 D-22 hold 建立於此）。
+        self.command_fg_finish(&mut effects);
+        self.self_test_suspend_end(suspended, &mut effects);
         effects.push(Effect::SettleTx { epoch, op_id });
         effects.extend(self.start_next(now));
         effects
@@ -4717,6 +4864,7 @@ impl SessionCore {
                 probe_len,
                 base,
                 lease_ctx,
+                ..
             } => {
                 let result = match outcome {
                     OpOutcome::SelfTestRefused(FenceReject::Quiet | FenceReject::ReconfirmPending) => {
@@ -4782,12 +4930,20 @@ impl SessionCore {
                     "recovery_action" => key,
                 })
             }
+            // DF-02：line editor 來源逾時走 `_recover_after_failure` 的 human 分支（不轉 ATTACHED、不寫 capture）。
+            OpOutcome::PromptTimeout { .. } if self.fg_origin_is_human() => {
+                CmdOutcome::Result(self.human_timeout_promote(self.fg_cmd_timeout_s, now))
+            }
             OpOutcome::PromptTimeout { stdout } => {
                 self.set_terminal_capture(cmd_id, Some(stdout), Some("PROMPT_TIMEOUT"), now);
                 if !self.is_passthrough() {
                     self.transition_to_attached("PROMPT_TIMEOUT", now);
                 }
                 CmdOutcome::Result(prompt_timeout_none())
+            }
+            // P6 Task 7（D-10）：line editor 來源的 reboot 不進自動恢復，改開 human lease（`_execute_command_inner` human 分支）。
+            OpOutcome::RebootExpected if self.fg_origin_is_human() => {
+                CmdOutcome::Result(self.human_reboot_promote(now))
             }
             OpOutcome::RebootExpected => {
                 self.pending_auto_login = true;
@@ -4828,6 +4984,7 @@ impl SessionCore {
     /// `_on_command_flush`／`_on_detached` 的佇列終結（FLUSHED_BY_RECOVERY）。
     fn flush_queue(&mut self) {
         let _ = self.queue.drain_all();
+        self.abort_parked_command();
         self.deps
             .registry
             .flush_session(&self.sid, "FLUSHED_BY_RECOVERY", &self.wall_iso());
@@ -4921,11 +5078,19 @@ impl SessionCore {
                     Effect::Reply(reply, Ok(reattach_reply(self))),
                 ]
             }
-            RecoverPlan::Force => self.start_force_recover(reply, ForceKind::Direct, now),
+            RecoverPlan::Force => {
+                // DF-20／D3：受理的 recover 先使舊 agent lease 失效，再啟動 clear 與 timer 輪詢。
+                self.invalidate_agent_lease_df20();
+                self.start_force_recover(reply, ForceKind::Direct, now)
+            }
             RecoverPlan::Reprobe => {
+                // DF-20／D3：既有 bridge 重探同樣先撤銷舊 agent lease。
+                self.invalidate_agent_lease_df20();
                 self.reprobe_existing_bridge(reply, ReprobeWaiter::Recover { force: false }, now)
             }
             RecoverPlan::ReadyKeys => {
+                // DF-20／D3：READY 救援鍵送出前使舊 agent lease 失效。
+                self.invalidate_agent_lease_df20();
                 // Python `recover_session` READY 分支不看 `foreground_busy`：救援鍵與在途命令並行（審查 F25）。
                 let grant = self.new_grant(None);
                 self.pending_ops
@@ -5378,6 +5543,9 @@ impl SessionCore {
                 self.last_probe_at = Some(self.wall_iso());
                 let probe_len = probe.len() + usize::from(!probe.ends_with('\n'));
                 let grant = self.new_grant(None);
+                // 增補 #12：有 human lease 時只 suspend、不動 admission（`session_manager.py:7430,7454`）。
+                // 旗標隨本 op 保存（Python 為 `self_test` 的區域變數），完成時只結算自己的 suspend。
+                let suspended = self.self_test_suspend_begin();
                 self.pending_ops.insert(
                     grant.op_id,
                     PendingOp::SelfTest {
@@ -5385,6 +5553,7 @@ impl SessionCore {
                         probe_len,
                         base: need.base,
                         lease_ctx: self.lease_ctx(),
+                        suspended,
                     },
                 );
                 self.side_ops.insert(grant.op_id, grant.clone());
@@ -5672,6 +5841,8 @@ enum PendingOp {
         probe_len: usize,
         base: SelfTestBase,
         lease_ctx: Vec<(&'static str, PyValue)>,
+        /// 本 probe 開始時是否 suspend 了 human（`Some(世代)`）；只由本 op 完成時結算。
+        suspended: Option<u64>,
     },
     InteractiveSend {
         reply: Reply,
@@ -5681,6 +5852,16 @@ enum PendingOp {
         reply: Reply,
         result: PyDict,
     },
+}
+
+impl PendingOp {
+    /// self-test probe 的 suspend 憑證（其他 op 為 `None`）。
+    fn self_test_suspend_token(op: Option<&PendingOp>) -> Option<u64> {
+        match op {
+            Some(PendingOp::SelfTest { suspended, .. }) => *suspended,
+            _ => None,
+        }
+    }
 }
 
 /// reboot 後自動恢復的期限（`_spawn_reboot_recovery`：`deadline_cap = start + 180 + timeout`）。
@@ -5763,6 +5944,7 @@ fn lease_refused_command_code(reject: FenceReject) -> &'static str {
 }
 
 /// Python `text[-n:]`（n == 0 → 全部；n < 0 → 去掉前 |n| 字元）。
+#[allow(dead_code)] // P6：status 改用 `RxShared::tail_py`（增補 #19）
 fn py_tail(text: &str, n: i128) -> String {
     let count = text.chars().count() as i128;
     let skip = if n > 0 {
@@ -5888,6 +6070,8 @@ fn append_receipt_warnings(receipt: &WorkerStoppedReceipt, effects: &mut Vec<Eff
 pub struct PtyInfo {
     pub token: u64,
     pub slave_path: String,
+    /// P6 Task 6：RPC thread 建 PTY 時一併產生的 `uuid4().hex[:12]`（Python `_create_console_client` 同時決定 PTY 與 id）。
+    pub client_id: String,
 }
 
 /// P6 增補 #10（07 Task 7）：全域 LeaseIndex 的異動。
@@ -5901,34 +6085,6 @@ pub enum LeaseIndexOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FgAdmission {
     pub suspended_human: bool,
-}
-
-impl SessionCore {
-    /// P6 Task 6：admission 關；agent 且有 human lease 時 suspend；先撤銷 `replay_auth`（07 D-22(4)）。
-    pub fn fg_begin(&mut self, _source_is_agent: bool, _fx: &mut Effects) -> FgAdmission {
-        todo!("P6 Task 6")
-    }
-
-    /// P6 Task 6：resume（若 suspend）→ admission 開；依序回放（建立 07 D-22 hold）。
-    pub fn fg_finish(&mut self, _adm: FgAdmission, _fx: &mut Effects) {
-        todo!("P6 Task 6")
-    }
-
-    /// P6 Task 6：只 suspend（self-test、P8 file transfer）；先撤銷 `replay_auth`（07 D-22(4)）。
-    pub fn human_suspend_begin(&mut self, _fx: &mut Effects) -> bool {
-        todo!("P6 Task 6")
-    }
-
-    /// P6 Task 6：回放時建立 07 D-22 hold。
-    pub fn human_suspend_end(&mut self, _suspended: bool, _fx: &mut Effects) {
-        todo!("P6 Task 6")
-    }
-
-    /// P6 Task 6：BC-02 唯一入口（07 D-02）。
-    pub fn invalidate_human_input(&mut self, _reason: InvalidateReason, _fx: &mut Effects) {
-        todo!("P6 Task 6")
-    }
-
 }
 
 /// login run 結果中「Python 會以例外穿出」者的（例外型別名, `str(exc)`）（`_login_tx_refused` 只認 quiet／stale_login_gen）。

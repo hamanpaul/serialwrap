@@ -87,6 +87,7 @@ fn setup(observers: Vec<Arc<dyn RxObserver>>) -> Setup {
             wal: wal.clone(),
             rx: RxShared::new(131_072, 1),
             sentinel: None,
+            hub: None,
             data: data_tx,
             control: control_tx,
             clock,

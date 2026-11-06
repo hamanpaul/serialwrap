@@ -230,6 +230,16 @@ impl RxShared {
         window.text[byte_index..].to_string()
     }
 
+    /// P6 增補 #19：Python `text[-n:]`（n>0 尾 n 字元、n==0 全窗、n<0 去掉開頭 |n| 字元）。
+    pub fn tail_py(&self, n: i128) -> String {
+        if n >= 0 {
+            return self.tail(n as usize);
+        }
+        let text = self.tail(0);
+        let skip = n.unsigned_abs().min(usize::MAX as u128) as usize;
+        text.chars().skip(skip).collect()
+    }
+
     pub fn rx_stats(&self, now: Mono) -> (u64, u64) {
         let fixed = self.stats_override.load(Ordering::Acquire);
         if fixed != u64::MAX {
@@ -381,6 +391,8 @@ pub struct ReaderCtx {
     pub data: Sender<crate::mailbox::DataEvent>,
     pub control: Sender<crate::mailbox::ControlEvent>,
     pub clock: Arc<dyn Clock>,
+    /// P6 增補 #21：RX 於 WAL 之後 `try_send` 給 ConsoleHub（`None`＝無 hub；P6 起 `sentinel` 一律 `None`）。
+    pub hub: Option<crate::human_console::hub::HubTap>,
 }
 
 /// reader thread 結束時交回的資源（讀取錯誤與 reader 本體，供 IoWorker 收尾）。
@@ -507,6 +519,11 @@ fn spawn_reader_inner(
                                 hook();
                             }
 
+                            // 增補 #21（07 Task 9 Step 3 第 7 點）：WAL → hub `try_send`（滿載只計數）→ data lane。
+                            if let Some(tap) = ctx.hub.as_ref() {
+                                tap.push(data, warning_sink.as_ref());
+                            }
+
                             if let Some(console) = sentinel.as_mut() {
                                 if catch_unwind(AssertUnwindSafe(|| console.try_write(data)))
                                     .is_err()
@@ -616,6 +633,8 @@ pub struct IoWorkerArgs {
     pub data: Sender<DataEvent>,
     pub control: Sender<ControlEvent>,
     pub clock: Arc<dyn Clock>,
+    /// P6 增補 #21：ConsoleHub tap（見 `ReaderCtx.hub`）。
+    pub hub: Option<crate::human_console::hub::HubTap>,
 }
 
 /// 單一 bridge 的 I/O worker（reader thread＋TxWriter thread）。
@@ -664,6 +683,7 @@ impl IoWorker {
                 data: args.data,
                 control: args.control.clone(),
                 clock: args.clock,
+                hub: args.hub,
             },
             reader_stop.clone(),
             observers,

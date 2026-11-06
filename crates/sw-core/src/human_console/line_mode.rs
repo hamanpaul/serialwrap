@@ -1,7 +1,9 @@
 //! human console line 命令的模式判定（P6 Task 3；`service.py` `_human_console_mode`）。
 
+use sw_pal::PalPathFlavor;
 use sw_proto::constants::{HUMAN_INTERACTIVE_COMMANDS, SUDO_VALUE_OPTS};
 use sw_proto::pycompat::shlex_split;
+use sw_proto::pypath::{self, PathFlavor};
 
 /// `line`：一般命令；`interactive`：全螢幕互動程式（開 human lease）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,17 +47,16 @@ fn is_env_assignment(s: &str) -> bool {
     }
 }
 
-/// POSIX `os.path.basename`：最後一個 `/` 之後的部分。
-fn basename(s: &str) -> &str {
-    match s.rfind('/') {
-        Some(i) => &s[i + 1..],
-        None => s,
-    }
-}
-
 /// `_human_console_mode`：shlex 分詞（失敗退回 `strip().split()`）後略過 env 賦值、`--`、`sudo`／`env`／`command`／`builtin`／`exec`
 /// 前綴，第一個實際命令的 basename 在 `HUMAN_INTERACTIVE_COMMANDS` 內即 `Interactive`。
-pub fn human_console_mode(command: &str) -> HumanLineMode {
+///
+/// basename 為 Python 的 `os.path.basename`，依 PAL 路徑風格 `flavor`（`Pal.caps.path_flavor`）取 `posixpath`／`ntpath`
+/// 語意：Windows 另以 `\` 與 drive prefix 分隔（`'C:\bin\vim'`、`'C:vim'` → `vim`；sol 補審 P6 #2）。
+pub fn human_console_mode(command: &str, flavor: PalPathFlavor) -> HumanLineMode {
+    let flavor = match flavor {
+        PalPathFlavor::Posix => PathFlavor::Posix,
+        PalPathFlavor::Windows => PathFlavor::Windows,
+    };
     let tokens: Vec<String> = match shlex_split(command) {
         Ok(t) => t,
         Err(_) => command.trim_matches(py_space).split(py_space).filter(|t| !t.is_empty()).map(str::to_string).collect(),
@@ -67,7 +68,8 @@ pub fn human_console_mode(command: &str) -> HumanLineMode {
             idx += 1;
             continue;
         }
-        let base = basename(token);
+        let base = pypath::basename(flavor, token);
+        let base = base.as_str();
         if base == "sudo" {
             idx += 1;
             while idx < tokens.len() {

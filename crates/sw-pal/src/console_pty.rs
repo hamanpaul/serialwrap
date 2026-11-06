@@ -96,13 +96,19 @@ pub trait ConsoleTransportFactory: Send + Sync {
     fn open_com0com_console(&self, _port: &str) -> PalResult<Box<dyn ConsoleIo>> {
         Err(unsupported("open_com0com_console"))
     }
-    /// /proc 掃描外部持有的 pts 路徑；Windows 或不可讀時回 `None`。2.2 承接，本 Phase 回 `None`。
+    /// /proc 掃描外部持有的 pts 路徑（只收 `(st_dev, st_ino)` 與本 daemon 所見同一 tty 者，#40／#64）；
+    /// Windows 或不可讀時回 `None`。
     fn held_slave_paths(&self) -> Option<HashSet<String>> {
         None
     }
     /// P6（07 D-04，Task 8）：建立此 PAL 的 `ConsoleMux`；預設 `Unsupported`（既有只實作 `kind` 的替身仍可編譯）。
     fn new_mux(&self) -> PalResult<Box<dyn ConsoleMux>> {
         Err(unsupported("new_mux"))
+    }
+    /// 哨兵 PTY slave 路徑是否仍存在（Python `snapshot()["vtty_alive"]` 的 `os.path.exists(primary)`）。
+    /// 替身工廠覆寫為「由本工廠發出」判定，使 in-process 測試的假路徑與 Python 實機語意一致。
+    fn slave_path_exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).exists()
     }
 }
 
@@ -153,7 +159,9 @@ impl ConsoleTransportFactory for NativeConsoleFactory {
         crate::console_com0com::open_console_port(port)
     }
 
-    /// `/proc/<pid>/fd/*` 的 readlink 目標（排除自身 pid）；`/proc` 不可讀或 Windows 回 `None`（uart_io.py `_enumerate_all_held_paths`）。
+    /// `/proc/<pid>/fd/*` 中與本 daemon 所見為同一 tty 的 readlink 目標（排除自身 pid；`tty_identity::same_tty`，
+    /// 他 mount namespace 同名 `/dev/pts/N` 不計入，#40／#64）；`/proc` 不可讀或 Windows 回 `None`
+    /// （uart_io.py `_enumerate_all_held_paths` #R2 版）。
     fn held_slave_paths(&self) -> Option<HashSet<String>> {
         #[cfg(unix)]
         {

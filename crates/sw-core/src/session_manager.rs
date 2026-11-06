@@ -152,6 +152,9 @@ struct SessionIo {
     sid: Mutex<String>,
     profile: Mutex<SessionProfile>,
     preopened: Mutex<Option<Preopened>>,
+    /// P6 Task 10：RPC thread 預建、等待 core `ConsoleAdopt`／`ConsoleDiscard` 的 PTY（token → PtyPair）。
+    pending_pty: Mutex<HashMap<u64, sw_pal::PtyPair>>,
+    next_pty_token: AtomicU64,
 }
 
 /// manager 的 session 鏡像（selector 解析、rank、管理操作用；狀態本身以 actor 為準）。
@@ -233,7 +236,7 @@ impl Inner {
 struct Shared {
     serial: Arc<dyn SerialBackend>,
     uart_excl: Arc<dyn UartExclusive>,
-    /// 哨兵 PTY 工廠（bridge 開成時建 internal primary；審查 F43）。
+    /// console 後端：哨兵 PTY 工廠（審查 F43）與 P6 Task 9／10 的 PTY 建立、ConsoleHub 的 mux。
     console: Arc<dyn ConsoleTransportFactory>,
     wal: Arc<WalWriter>,
     registry: Arc<CommandRegistry>,
@@ -259,6 +262,8 @@ struct Shared {
     probe_tx_frozen: AtomicBool,
     /// P7 Task 16-wire：RX 觀察者（Python `add_rx_observer`）；每個 session bridge 的 reader 建立時取快照。
     rx_observers: Mutex<Vec<Arc<dyn crate::uart_bridge::RxObserver>>>,
+    /// P6（sol 補審 #2）：human line mode basename 的路徑風格（`caps.path_flavor`）。
+    path_flavor: sw_pal::PalPathFlavor,
     /// 只供測試（test-fakes）：偵測 PROBE 的 Fence 建立後、交給 TxWriter 提交前呼叫（重現「健康快照之後才發布
     /// WAL unhealthy」的競態；sol-backfill p5 #6）。
     #[cfg(feature = "test-fakes")]
@@ -304,6 +309,19 @@ pub struct SessionManager {
     pump_lock: Arc<Mutex<()>>,
     _console: Arc<dyn ConsoleTransportFactory>,
     _caps: Capabilities,
+}
+
+/// console／interactive_open 查無 session（Python `{"ok":False,"error_code":"SESSION_NOT_READY","selector":selector}`）。
+fn console_not_ready(selector: &str) -> PyDict {
+    pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY", "selector" => selector.to_string() }
+}
+
+/// core 的 `SESSION_NOT_READY` 帶 session 的 COM；Python 回原樣的 RPC selector。
+fn with_raw_selector(mut result: PyDict, selector: &str) -> PyDict {
+    if result.get("error_code").and_then(PyValue::as_str) == Some("SESSION_NOT_READY") && result.get("selector").is_some() {
+        result.insert("selector", PyValue::from(selector.to_string()));
+    }
+    result
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -566,8 +584,25 @@ impl Shared {
         }
     }
 
+    /// 07 D-09：RPC handler thread 取 `/proc` 持有者快照，經同一條 control sender 先於 request 送
+    /// `ConsoleScan{source: Rpc}`（FIFO 保證 core 處理 request 前已更新 peer 判定）。lane 滿時略過。
+    fn send_console_scan(&self, sid: &str) {
+        let Some(actor) = self.actor_of(sid) else {
+            return;
+        };
+        let scan = crate::human_console::ConsoleScanSnapshot {
+            held: self.console.held_slave_paths(),
+            taken_at: self.clock.mono_ns(),
+        };
+        let _ = actor.control.try_send(ControlEvent::ConsoleScan {
+            scan,
+            source: crate::human_console::ScanSource::Rpc,
+        });
+    }
+
     /// actor 的 `session` 公開欄位（GetState）。
     fn session_public(&self, sid: &str) -> Option<PyDict> {
+        self.send_console_scan(sid);
         let actor = self.actor_of(sid)?;
         let r = actor
             .request(SessionRequest::GetState, QUERY_TIMEOUT)
@@ -610,6 +645,7 @@ impl Shared {
         let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.clock.mono_ns());
         let clock = self.clock.clone();
         let fs = self.fs.clone();
+        let input_epoch_pub = Arc::new(AtomicU64::new(0));
         let deps = CoreDeps {
             fence: fence.clone(),
             registry: self.registry.clone(),
@@ -626,11 +662,13 @@ impl Shared {
                     Err(e) => Some(Err(std::io::Error::other(format!("{e:?}")))),
                 }
             }),
-            // merge P7：P6 增補 #2（07 D-02）hub 讀取用 input_epoch；manager 建立的 core 由 actor 內寫入。
-            input_epoch_pub: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // P6（07 D-02）：human console 擷取時讀的 input_epoch（與 ConsoleHub 共用）。
+            input_epoch_pub: input_epoch_pub.clone(),
             bg_index: self.bg_index.clone(),
         };
         let mut core = SessionCore::new(profile.clone(), profile_source, deps);
+        core.set_path_flavor(self.path_flavor);
+        core.set_tcp_console(self.console.kind() == sw_pal::ConsoleKind::TcpTelnet);
         if core.session_id() != sid {
             core.init_session_id(sid.clone());
         }
@@ -660,8 +698,21 @@ impl Shared {
             sid: Mutex::new(sid.clone()),
             profile: Mutex::new(profile.clone()),
             preopened: Mutex::new(preopened),
+            pending_pty: Mutex::new(HashMap::new()),
+            next_pty_token: AtomicU64::new(0),
         });
         let mailbox = Mailbox::new(MAILBOX_CONTROL_CAP, MAILBOX_DATA_CHUNKS_CAP);
+        // P6 Task 9：每 session 一個 ConsoleHub（mux 不可用的平台不建立；Windows WSAPoll 屬 LOCAL-WINDOWS-TODO）。
+        let hub = crate::human_console::hub::spawn_hub_with(
+            profile.com.clone(),
+            self.console.clone(),
+            mailbox.control_sender(),
+            mailbox.data_sender(),
+            self.clock.clone(),
+            input_epoch_pub,
+        )
+        .ok()
+        .map(Arc::new);
         // agent log 檔名以平台 Clock 的本地時間組成（Python `time.strftime` 本地時間；審查 F34）。
         core.set_capture_env(crate::capture::CaptureEnv {
             clock: Some(self.clock.clone()),
@@ -674,6 +725,10 @@ impl Shared {
             core.set_self_test_probes(SelfTestProbes {
                 holders: Some(self.uart_excl.clone()),
                 vtty_alive: None,
+                path_exists: Some({
+                    let console = self.console.clone();
+                    Arc::new(move |path: &str| console.slave_path_exists(path))
+                }),
                 bridge_snapshot: Some(Arc::new(move |epoch: u64| {
                     lock(&snapshot_workers).get(&epoch).map(IoWorker::snapshot)
                 })),
@@ -688,9 +743,13 @@ impl Shared {
             data: mailbox.data_sender(),
             workers,
             runners: HashMap::new(),
+            hub,
+            pumps: HashMap::new(),
+            listener_epoch: None,
             open_jobs: JobQueue::new("open"),
             persist_jobs: JobQueue::new("persist"),
             opened_rx: Arc::new(Mutex::new(HashMap::new())),
+            opened_listener: Arc::new(Mutex::new(HashSet::new())),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
         inner.sessions.insert(
@@ -1735,12 +1794,20 @@ struct ManagerExec {
     /// 各 epoch 的 IoWorker；與 self-test 的 bridge 快照探針共用（審查 F32：`snapshot()` 的 running／serial_alive）。
     workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
     runners: HashMap<u64, OpRunner>,
+    /// P6 Task 9：該 session 的 ConsoleHub（RX 分流、console I/O）。
+    hub: Option<Arc<crate::human_console::hub::HubHandle>>,
+    /// P6 Task 6（07 D-15(5)）：每個 epoch 一條 human TX pump。
+    pumps: HashMap<u64, crate::human_console::human_tx::HumanTxPump>,
+    /// TCP console listener 所屬的 bridge epoch（該 epoch `BeginDrain` 時停止，ephemeral port，UIO-12.8-c）。
+    listener_epoch: Option<u64>,
     /// 開埠工作者：`OpenBridge` 的同步開埠在 actor 外執行，完成以 `BridgeOpened` 回報（sol-backfill p5 #2）。
     open_jobs: JobQueue,
     /// 持久化工作者：`Persist` 的 commit 等待在 actor 外執行，完成以 `StateCommitted` 回報（同上）。
     persist_jobs: JobQueue,
     /// 開埠工作者建立、尚待 `AdoptBridge` 接手的 RX 視窗（epoch → 視窗；接手時成為本 executor 的 `rx`）。
     opened_rx: Arc<Mutex<HashMap<u64, Arc<RxShared>>>>,
+    /// 開埠工作者已綁定 TCP console listener、尚待 `AdoptBridge` 接手的 epoch（P6：listener 與開埠同一工作）。
+    opened_listener: Arc<Mutex<HashSet<u64>>>,
 }
 
 /// actor 外的單執行緒 FIFO 工作者（有界佇列；延遲建立，executor 卸除即結束）。
@@ -1784,9 +1851,74 @@ struct OpenCtx {
     fence: Arc<Fence>,
     data: Sender<DataEvent>,
     com: String,
+    /// P6 Task 9：該 session 的 ConsoleHub（reader tap、哨兵／TCP listener 交給 hub）。
+    hub: Option<Arc<crate::human_console::hub::HubHandle>>,
+    /// 開埠工作者綁定 TCP console listener 的 epoch（與 executor 共用；`AdoptBridge` 接手為 `listener_epoch`）。
+    opened_listener: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl OpenCtx {
+    /// P6 Task 9 步驟 5：PTY 後端且有 hub 時預建哨兵 PTY（隨 `OpenedBridge` 交給 core 同一事件登記；TCP／無 hub 不建，06 §7.2）。
+    fn make_sentinel(&self) -> Option<crate::session_core::PtyInfo> {
+        if self.hub.is_none() || self.shared.console.kind() != sw_pal::ConsoleKind::Pty {
+            return None;
+        }
+        let pair = match self.shared.console.create_pty() {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.shared.warn(format!(
+                    "哨兵 primary console 建立失敗（com={}）：{}",
+                    self.com,
+                    e.py_message
+                ));
+                return None;
+            }
+        };
+        let token = self.io.next_pty_token.fetch_add(1, Ordering::Relaxed) + 1;
+        let slave_path = pair.slave_path.clone();
+        lock(&self.io.pending_pty).insert(token, pair);
+        Some(crate::session_core::PtyInfo {
+            token,
+            slave_path,
+            client_id: SessionCore::new_console_client_id(&fill_random),
+        })
+    }
+
+    /// TCP console 後端：每次開埠綁一個新的 127.0.0.1 ephemeral listener 交給 hub（`uart_io.py` `start()` 於
+    /// `not _pty_available()` 時 `_start_console_listener()`），回端點供 core 在 adopt 同一事件登記。
+    fn bind_console_listener(&self, epoch: u64) -> Option<String> {
+        let hub = self.hub.as_ref()?;
+        if self.shared.console.kind() != sw_pal::ConsoleKind::TcpTelnet {
+            return None;
+        }
+        let listener = match self.shared.console.bind_tcp_console() {
+            Ok(listener) => listener,
+            Err(e) => {
+                self.shared.warn(format!(
+                    "console listener 建立失敗（com={}）：{}",
+                    self.com,
+                    e.py_message
+                ));
+                return None;
+            }
+        };
+        let endpoint = listener.endpoint();
+        if hub
+            .cmd
+            .try_send(crate::human_console::hub::HubCmd::AdoptListener { listener })
+            .is_err()
+        {
+            self.shared.warn(format!(
+                "console listener 交給 hub 失敗（com={}）",
+                self.com
+            ));
+            return None;
+        }
+        hub.waker.wake();
+        lock(&self.opened_listener).insert(epoch);
+        Some(endpoint)
+    }
+
     /// `OpenBridge`：stopping gate → 預開 handle（同路徑則原樣交接，#51）或 `open_exclusive` → IoWorker。
     fn open_bridge(
         &self,
@@ -1842,12 +1974,6 @@ impl OpenCtx {
         let observers = lock(&self.shared.rx_observers).clone();
         // Python 每次 attach 新建 `UARTBridge`：RX 視窗、速率、總量、最後 RX 時刻一律歸零（審查 F51）。
         let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.shared.clock.mono_ns());
-        // POSIX：建 internal 哨兵 primary PTY（keepalive＋RX fan-out；Python `_create_console_client("primary")`）；
-        // 無 PTY 平台（create_pty Unsupported）不建，console_count／vtty 為 0／null（審查 F43／F30）。
-        let (sentinel, sentinel_keepalive, vtty) = match self.shared.console.create_pty() {
-            Ok(pair) => (Some(pair.master), Some(pair.slave_keepalive), Some(pair.slave_path)),
-            Err(_) => (None, None, None),
-        };
         let worker = IoWorker::start_observed(
             handle,
             IoWorkerArgs {
@@ -1856,20 +1982,26 @@ impl OpenCtx {
                 wal: self.shared.wal.clone(),
                 rx: rx.clone(),
                 fence: self.fence.clone(),
-                sentinel,
-                sentinel_keepalive,
+                // P6：哨兵 primary 由 `make_sentinel` 預建並經 hub 登記（取代 2.1 的 reader 哨兵；審查 F43／F30 的
+                // console_count／vtty 由 core 的 human.consoles 計算）。
+                sentinel: None,
+                sentinel_keepalive: None,
+                hub: self.hub.as_ref().map(|h| h.tap()),
                 data: self.data.clone(),
                 control: control.clone(),
                 clock: self.shared.clock.clone(),
             },
             observers,
         );
+        let sentinel = self.make_sentinel();
+        let console_endpoint = self.bind_console_listener(epoch);
         Ok(OpenedBridge {
             epoch,
             worker,
             real_path: dev.0,
+            sentinel,
+            console_endpoint,
             rx,
-            vtty,
         })
     }
 
@@ -1878,6 +2010,50 @@ impl OpenCtx {
 impl ManagerExec {
     fn com(&self) -> String {
         lock(&self.io.profile).com.clone()
+    }
+
+    fn human_tx(
+        &mut self,
+        tag: crate::human_console::human_tx::HumanTxTag,
+        permit: TxPermit,
+        payload: Vec<u8>,
+        control: &Sender<ControlEvent>,
+    ) {
+        let epoch = permit.epoch;
+        if !self.pumps.contains_key(&epoch) {
+            if let Some(worker) = lock(&self.workers).get(&epoch) {
+                let pump = crate::human_console::human_tx::HumanTxPump::spawn(
+                    &self.com(),
+                    worker.tx().clone(),
+                    control.clone(),
+                );
+                self.pumps.insert(epoch, pump);
+            }
+        }
+        let refused = match self.pumps.get(&epoch) {
+            Some(pump) => pump.try_submit(tag.clone(), permit.clone(), payload).is_err(),
+            None => true,
+        };
+        if refused {
+            if self.pumps.contains_key(&epoch) {
+                // core 保證同時最多一筆在途；PumpFull 屬不變式違反（07 Task 6 Step 3 第 9 點）。
+                self.shared.warn(format!(
+                    "human TX pump 已滿（不變式違反），以 NotSubmitted 回報（com={}）",
+                    self.com()
+                ));
+            }
+            let report = crate::tx_writer::TxReport {
+                op_id: permit.op_id,
+                epoch,
+                result: TxResult {
+                    outcome: TxOutcome::NotSubmitted,
+                    error: None,
+                },
+                wal: None,
+                reject: None,
+            };
+            let _ = control.try_send(ControlEvent::HumanTxCompleted { tag, report });
+        }
     }
 
     /// `StartOp`：交給該 epoch 的 `OpRunner`（Task 14）；無法啟動時以 `SendFailed` 結束 op，避免 actor 永久等待。
@@ -1987,9 +2163,12 @@ impl EffectExecutor for ManagerExec {
                     fence: self.fence.clone(),
                     data: self.data.clone(),
                     com: self.com(),
+                    hub: self.hub.clone(),
+                    opened_listener: self.opened_listener.clone(),
                 };
                 let control = tx.clone();
                 let opened_rx = self.opened_rx.clone();
+                let opened_listener = self.opened_listener.clone();
                 let submitted = self.open_jobs.submit(Box::new(move || {
                     let result = ctx.open_bridge(dev, cfg, precheck_holders, &control);
                     if let Ok(opened) = &result {
@@ -2006,6 +2185,7 @@ impl EffectExecutor for ManagerExec {
                     })) = sent
                     {
                         lock(&opened_rx).remove(&opened.epoch);
+                        lock(&opened_listener).remove(&opened.epoch);
                         opened
                             .worker
                             .finish_async(crate::drain::StopId(0), control.clone());
@@ -2025,14 +2205,40 @@ impl EffectExecutor for ManagerExec {
                 if let Some(rx) = lock(&self.opened_rx).remove(&epoch) {
                     self.rx = rx;
                 }
+                if lock(&self.opened_listener).remove(&epoch) {
+                    self.listener_epoch = Some(epoch);
+                }
                 lock(&self.workers).insert(epoch, worker);
             }
             Effect::BeginDrain { stop_id, epoch } => {
                 lock(&self.opened_rx).remove(&epoch);
+                // 未被接手即排空的 epoch 也要停掉開埠時綁定的 listener。
+                if lock(&self.opened_listener).remove(&epoch) {
+                    self.listener_epoch = Some(epoch);
+                }
                 self.runners.remove(&epoch);
+                if let Some(pump) = self.pumps.remove(&epoch) {
+                    pump.stop();
+                }
                 let worker = lock(&self.workers).remove(&epoch);
                 if let Some(worker) = worker {
                     worker.finish_async(stop_id, safety.clone());
+                }
+                if self.listener_epoch == Some(epoch) {
+                    self.listener_epoch = None;
+                    if let Some(hub) = &self.hub {
+                        if hub
+                            .cmd
+                            .try_send(crate::human_console::hub::HubCmd::StopListener)
+                            .is_err()
+                        {
+                            self.shared.warn(format!(
+                                "console listener 停止命令送不進 hub（com={}）",
+                                self.com()
+                            ));
+                        }
+                        hub.waker.wake();
+                    }
                 }
             }
             Effect::StartLogin {
@@ -2085,14 +2291,86 @@ impl EffectExecutor for ManagerExec {
                     let _ = worker.tx().settle(op_id);
                 }
             }
-            // merge P7：P6 增補（07 Task 9 ConsoleHub）效果；P6 合入前 SessionCore 不產生（同 tests/support）。
-            Effect::ConsoleOut { .. }
-            | Effect::ConsoleClose { .. }
-            | Effect::ConsoleCloseAll
-            | Effect::ConsoleAdopt { .. }
-            | Effect::ConsoleDiscard { .. } => todo!("P6 Task 9"),
-            Effect::HumanTx { .. } => todo!("P6 Task 6"),
-            Effect::LeaseIndex(_) => todo!("P6 Task 7"),
+            // P6 Task 10：全域 LeaseIndex（含 human lease、tombstone）；在 Reply 之前同步更新（core 保證排序）。
+            Effect::LeaseIndex(op) => {
+                let sid = lock(&self.io.sid).clone();
+                let mut inner = lock(&self.shared.inner);
+                match op {
+                    crate::session_core::LeaseIndexOp::Insert { interactive_id } => {
+                        inner.interactive.insert(interactive_id, sid);
+                    }
+                    crate::session_core::LeaseIndexOp::Remove { interactive_id } => {
+                        if inner.interactive.get(&interactive_id) == Some(&sid) {
+                            inner.interactive.remove(&interactive_id);
+                        }
+                    }
+                }
+            }
+            // P6 Task 9：console I/O 交給 hub（未建 hub 的平台忽略）。
+            Effect::ConsoleOut { client_id, item } => {
+                if let Some(hub) = self.hub.as_ref() {
+                    hub.out(client_id, item);
+                }
+            }
+            Effect::ConsoleClose { client_id } => {
+                if let Some(hub) = self.hub.as_ref() {
+                    hub.close(&client_id);
+                }
+            }
+            Effect::ConsoleCloseAll => {
+                if let Some(hub) = self.hub.as_ref() {
+                    hub.close_all();
+                }
+            }
+            Effect::ConsoleAdopt {
+                token,
+                client_id,
+                client_lifetime,
+                label,
+            } => {
+                let pair = lock(&self.io.pending_pty).remove(&token);
+                let adopted = match (self.hub.as_ref(), pair) {
+                    (Some(hub), Some(pair)) => {
+                        let sent = hub
+                            .cmd
+                            .try_send(crate::human_console::hub::HubCmd::AdoptPty {
+                                client_id: client_id.clone(),
+                                client_lifetime,
+                                label,
+                                pair,
+                            })
+                            .is_ok();
+                        if sent {
+                            hub.waker.wake();
+                        }
+                        sent
+                    }
+                    _ => false,
+                };
+                if !adopted {
+                    // PTY 已不在（RPC 逾時已丟棄）或 hub 佇列滿：讓 core 移除這個沒有 fd 的 console（含其 owner／lease），
+                    // 不留下幽靈 console（審查 1fb9612 Medium）。以 detach 語意（ERR-7.5-b：一併關閉自己的 human lease）
+                    // 送 control lane；斷線語意（`ConsoleDisconnected`）會保留 lease，使之後 attach 的 console 取不到
+                    // lease 與 raw ownership。此 console 從未交給 hub，data lane 上沒有它的輸入可被超車。
+                    self.shared.warn(format!(
+                        "console 註冊失敗（com={} client_id={client_id}）：PTY 不存在或 hub 佇列已滿",
+                        self.com()
+                    ));
+                    let (reply, _ignored) = crossbeam_channel::bounded(1);
+                    let detach = ControlEvent::Request {
+                        req: SessionRequest::ConsoleDetach { client_id: client_id.clone() },
+                        reply,
+                    };
+                    if tx.try_send(detach).is_err() {
+                        let _ = self.data.try_send(DataEvent::ConsoleDisconnected { client_id, client_lifetime });
+                    }
+                }
+            }
+            Effect::ConsoleDiscard { token } => {
+                lock(&self.io.pending_pty).remove(&token);
+            }
+            // P6 Task 6（07 D-15(5)）：交給 per-epoch pump（try_send，actor 永不阻塞）；送不出去以 NotSubmitted 回報。
+            Effect::HumanTx { tag, permit, payload } => self.human_tx(tag, permit, payload, tx),
         }
     }
 }
@@ -2160,6 +2438,7 @@ impl SessionManager {
             persist_observer: Mutex::new(None),
             probe_tx_frozen: AtomicBool::new(false),
             rx_observers: Mutex::new(Vec::new()),
+            path_flavor: caps.path_flavor,
             #[cfg(feature = "test-fakes")]
             probe_pre_submit_hook: Mutex::new(None),
         });
@@ -2316,6 +2595,13 @@ impl SessionManager {
         }
         let is_open = matches!(req, SessionRequest::InteractiveOpen { .. });
         let is_release = matches!(req, SessionRequest::Release { .. });
+        if matches!(
+            req,
+            SessionRequest::GetState | SessionRequest::Activity | SessionRequest::InteractiveOpen { .. }
+        ) {
+            // 07 D-09：session 摘要與 interactive_open（Python `_refresh_interactive_locked` 即時掃 peer）前先更新 console peer 判定。
+            self.shared.send_console_scan(sid);
+        }
         let result = self.shared.request(sid, req, timeout)?;
         if is_open && is_ok(&result) {
             if let Some(iid) = str_of(&result, "interactive_id") {
@@ -2694,6 +2980,66 @@ impl SessionManager {
         Ok(pydict! { "ok" => true, "alias" => alias.to_string() })
     }
 
+    /// P6 Task 10：RPC thread 預建、尚未被 core `ConsoleAdopt`／`ConsoleDiscard` 結算的 PTY 數（全部 session）。
+    pub fn pending_pty_count(&self) -> usize {
+        lock(&self.shared.inner)
+            .sessions
+            .values()
+            .map(|e| lock(&e.io.pending_pty).len())
+            .sum()
+    }
+
+    /// `attach_console`（`session_manager.py:6740-6773`）：PTY 後端先在 RPC thread 建 PTY（`create_pty`），
+    /// 以 token 暫存後送 `ConsoleAttach{pty: Some(PtyInfo)}`；core 回 `ConsoleAdopt` 時交給 hub、`ConsoleDiscard`
+    /// 時丟棄。request 失敗（逾時等）時 PTY 仍在暫存區者於此丟棄，不洩漏 fd。
+    pub fn console_attach(&self, selector: &str, label: Option<String>, timeout: Duration) -> Result<PyDict, PyErr> {
+        self.pump();
+        let found = {
+            let inner = lock(&self.shared.inner);
+            inner.resolve(selector).map(|e| (e.sid.clone(), e.io.clone()))
+        };
+        let Some((sid, io)) = found else {
+            return Ok(console_not_ready(selector));
+        };
+        let mut token = None;
+        let pty = if self.shared.console.kind() == sw_pal::ConsoleKind::Pty {
+            let pair = self
+                .shared
+                .console
+                .create_pty()
+                .map_err(|e| PyErr::value_error(e.py_message.clone()))?;
+            let t = io.next_pty_token.fetch_add(1, Ordering::Relaxed) + 1;
+            let info = crate::session_core::PtyInfo {
+                token: t,
+                slave_path: pair.slave_path.clone(),
+                client_id: SessionCore::new_console_client_id(&fill_random),
+            };
+            lock(&io.pending_pty).insert(t, pair);
+            token = Some(t);
+            Some(info)
+        } else {
+            None
+        };
+        self.shared.send_console_scan(&sid);
+        let result = self
+            .shared
+            .request(&sid, SessionRequest::ConsoleAttach { label, pty }, timeout);
+        if let Some(t) = token {
+            lock(&io.pending_pty).remove(&t);
+        }
+        Ok(with_raw_selector(result?, selector))
+    }
+
+    /// `detach_console`／`list_consoles`：查無 session 一律 `SESSION_NOT_READY{selector}`（Python `get_session` 為 None）。
+    pub fn console_request(&self, selector: &str, req: SessionRequest, timeout: Duration) -> Result<PyDict, PyErr> {
+        self.pump();
+        let Some(sid) = self.resolve(selector) else {
+            return Ok(console_not_ready(selector));
+        };
+        self.shared.send_console_scan(&sid);
+        Ok(with_raw_selector(self.shared.request(&sid, req, timeout)?, selector))
+    }
+
     /// interactive_send／status／close 只帶 interactive_id，以 manager 的索引路由；查無 → `INTERACTIVE_NOT_FOUND`。
     pub fn route_interactive(
         &self,
@@ -2717,6 +3063,8 @@ impl SessionManager {
             return Ok(not_found());
         };
         let is_close = matches!(req, SessionRequest::InteractiveClose { .. });
+        // 07 D-09：Python `_refresh_interactive_locked`／close 的 `console_has_external_peer` 皆即時掃描。
+        self.shared.send_console_scan(&sid);
         let result = self.shared.request(&sid, req, timeout)?;
         if str_of(&result, "error_code").as_deref() == Some("INTERACTIVE_NOT_FOUND") {
             lock(&self.shared.inner).interactive.remove(interactive_id);

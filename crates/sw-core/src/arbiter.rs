@@ -415,6 +415,18 @@ impl CommandRegistry {
             .cloned()
     }
 
+    /// 測試用：依建立順序的全部命令紀錄（P6 harness 查 human console 命令）。
+    #[cfg(feature = "test-fakes")]
+    pub fn records_for_test(&self) -> Vec<PyDict> {
+        self.inner
+            .lock()
+            .expect("命令登錄表鎖 poisoned")
+            .records
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// 全部命令的 `(cmd_id, error_code)`（依 admission 順序；無 error_code 為 `None`）。
     /// daemon 停機診斷用（P5-T19：停機前後比對 `FLUSHED_BY_SHUTDOWN` 的命令）。
     pub fn error_codes(&self) -> Vec<(String, Option<String>)> {

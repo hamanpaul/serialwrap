@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import sys
 
 import pytest
@@ -79,6 +80,172 @@ def _write_amendments(path, entries):
                     encoding="utf-8")
 
 
+def _attr_update_fixture(tmp_path):
+    """用暫存鎖模擬沒有逐案指紋的舊 2.3 凍結；案例鎖一律經 regen 建立。"""
+    freeze = _load("freeze_attr_update", "scripts/rust/freeze_slice_cases.py")
+    regen = _load("regen_attr_update", "tests/acceptance/regen_lock.py")
+    cases = {"revision": "2026-10-29.1", "cases": [
+        {"case_id": "case-a", "necessity": "required", "daemon_slice": "2.1", "expected": "PASS"},
+        {"case_id": "case-b", "necessity": "required", "daemon_slice": "2.2", "expected": "PASS"},
+    ]}
+    yaml_path, lock_path = tmp_path / "cases.yaml", tmp_path / "cases.lock.json"
+    yaml_path.write_text(yaml.safe_dump(cases), encoding="utf-8")
+    assert regen.main(["--add-only", "--cases", str(yaml_path), "--lock", str(lock_path)]) == 0
+    base = freeze.build_freeze(slice_id="2.3", date="2026-10-29", stage2_started_at="2026-10-21",
+                               lock_path=lock_path, yaml_path=yaml_path)
+    base.pop("case_fingerprints")
+    base_path = tmp_path / "slice_2.3.json"
+    freeze.write_once(base_path, base)
+    cases["revision"] = "2026-11-07.1"
+    for case in cases["cases"]:
+        case["daemon_slice"] = "2.3"
+    yaml_path.write_text(yaml.safe_dump(cases), encoding="utf-8")
+    assert regen.main(["--add-only", "--cases", str(yaml_path), "--lock", str(lock_path),
+                       "--authorize-deferral", "case-a:OD-34", "--authorize-deferral", "case-b:OD-34"]) == 0
+    argv = ["--amend", "--slice", "2.3", "--date", "2026-11-07", "--out", str(base_path),
+            "--lock", str(lock_path), "--cases", str(yaml_path),
+            "--attr-update", "case-a:daemon_slice:2.1:2.3:OD-34",
+            "--attr-update", "case-b:daemon_slice:2.2:2.3:OD-34"]
+    return freeze, base_path, lock_path, argv
+
+
+def test_attr_update_accepts_named_changes_without_rewriting_base(tmp_path):
+    freeze, base_path, lock_path, argv = _attr_update_fixture(tmp_path)
+    original = base_path.read_bytes()
+    assert freeze.main(argv) == 0
+    eff = freeze.load_effective_freeze(base_path)
+    base = json.loads(original)
+    assert base_path.read_bytes() == original
+    for field in ("required_case_ids", "denominator", "window", "frozen_at", "stage2_started_at"):
+        assert eff[field] == base[field]
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert eff["denominator_sha256"] == freeze.denominator_sha256(lock, eff["required_case_ids"])
+    assert eff["denominator_sha256"] != base["denominator_sha256"]
+    assert eff["cases_revision"] == lock["cases_revision"] == "2026-11-07.1"
+    entry = eff["amendments"][-1]
+    assert entry["kind"] == "attr_update" and entry["removed"] == []
+    assert entry["attr_updates"] == [
+        {"case_id": "case-a", "field": "daemon_slice", "old": "2.1", "new": "2.3", "decision": "OD-34"},
+        {"case_id": "case-b", "field": "daemon_slice", "old": "2.2", "new": "2.3", "decision": "OD-34"},
+    ]
+    # 重複修訂不得寫入第二筆或破壞已驗證的鏈。
+    assert freeze.main([*argv, "--attr-update", "case-a:daemon_slice:2.1:2.3:OD-34"]) == 2
+    assert len(freeze.load_effective_freeze(base_path)["amendments"]) == 1
+
+
+def test_attr_update_preserves_chain_across_revision_advance(tmp_path):
+    freeze, base_path, lock_path, argv = _attr_update_fixture(tmp_path)
+    assert freeze.main(argv) == 0
+    first = freeze.load_effective_freeze(base_path)
+    yaml_path = tmp_path / "cases.yaml"
+    cases = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    cases["revision"] = "2026-11-07.2"
+    yaml_path.write_text(yaml.safe_dump(cases), encoding="utf-8")
+    regen = _load("regen_attr_chain", "tests/acceptance/regen_lock.py")
+    assert regen.main(["--add-only", "--cases", str(yaml_path), "--lock", str(lock_path)]) == 0
+    assert freeze.main(["--revision-advance", "--decision", "OD-76", "--slice", "2.3", "--date", "2026-11-07",
+                        "--out", str(base_path), "--lock", str(lock_path), "--cases", str(yaml_path)]) == 0
+    eff = freeze.load_effective_freeze(base_path)
+    assert eff["amendments"][0] == first["amendments"][0]
+    assert eff["amendments"][1]["prev_amendment_sha256"] == freeze._canon_sha(first["amendments"][0])
+    assert eff["denominator_sha256"] == first["denominator_sha256"]
+    assert eff["required_case_ids"] == first["required_case_ids"]
+    assert eff["cases_revision"] == "2026-11-07.2"
+
+
+@pytest.mark.parametrize("extra", [["--defer", "case-a:2.3:OD-34"],
+                                   ["--fingerprint-update", "case-a:OD-34"],
+                                   ["--revision-advance", "--decision", "OD-76"]])
+def test_attr_update_rejects_mixed_amendment_kinds(tmp_path, extra):
+    freeze, base_path, _, argv = _attr_update_fixture(tmp_path)
+    assert freeze.main([*argv, *extra]) == 2
+    assert not freeze.amendments_path(base_path).exists()
+
+
+def test_slice23_effective_freeze_matches_current_lock():
+    """SG-P76-S23-REVISION：正式 2.3 修訂只改具名屬性；分母、順序及觀測窗口沿用原凍結。"""
+    freeze = _load("freeze_slice23_attrs", "scripts/rust/freeze_slice_cases.py")
+    base_path = ACC / "breaker" / "slice_2.3.json"
+    base = json.loads(base_path.read_text(encoding="utf-8"))
+    eff = freeze.load_effective_freeze(base_path)
+    lock = json.loads(LOCK.read_text(encoding="utf-8"))
+    for field in ("required_case_ids", "denominator", "window", "frozen_at", "stage2_started_at"):
+        assert eff[field] == base[field]
+    assert eff["required_case_ids"] == lock["sets"]["slice_2.3"]
+    assert eff["denominator_sha256"] == freeze.denominator_sha256(lock, eff["required_case_ids"])
+    assert eff["cases_revision"] == lock["cases_revision"] == yaml.safe_load(CASES.read_text(encoding="utf-8"))["revision"]
+    assert eff["cases_lock_sha256"] == hashlib.sha256(LOCK.read_bytes()).hexdigest()
+    assert eff["cases_yaml_sha256"] == hashlib.sha256(CASES.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("change", ["unlisted_field", "remove_id", "add_id", "reorder_ids", "old_mismatch"])
+def test_attr_update_writer_rejects_unapproved_changes(tmp_path, change):
+    freeze, base_path, lock_path, argv = _attr_update_fixture(tmp_path)
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if change == "unlisted_field":
+        lock["case_attrs"]["case-a"]["expected"] = "XFAIL"
+    elif change == "remove_id":
+        lock["sets"]["slice_2.3"].pop()
+    elif change == "add_id":
+        lock["sets"]["slice_2.3"].append("case-c")
+    elif change == "reorder_ids":
+        lock["sets"]["slice_2.3"].reverse()
+    else:
+        argv[-3] = "case-a:daemon_slice:2.0:2.3:OD-34"
+    # 故意竄改暫存測試輸入；實際 acceptance 鎖不由測試改寫。
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    assert freeze.main(argv) == 2
+    assert not freeze.amendments_path(base_path).exists()
+
+
+@pytest.mark.parametrize("token", ["case-a:daemon_slice:2.1:2.3", "case-a:daemon_slice:2.1:2.3:",
+                                   "case-a:daemon_slice:2.1:2.3:OD-34x"])
+def test_attr_update_requires_valid_owner_decision(tmp_path, token):
+    freeze, base_path, _, argv = _attr_update_fixture(tmp_path)
+    argv[-3] = token
+    assert freeze.main(argv) == 2
+    assert not freeze.amendments_path(base_path).exists()
+
+
+@pytest.mark.parametrize("change", ["unlisted_field", "remove_id", "add_id", "reorder_ids", "removed",
+                                   "old_mismatch", "new_mismatch", "duplicate", "fingerprint", "base_hash", "prev_hash",
+                                   "missing_case_id", "missing_field", "missing_old", "missing_new", "missing_decision", "bad_od"])
+def test_attr_update_reader_rejects_tampering(tmp_path, change):
+    freeze, base_path, _, argv = _attr_update_fixture(tmp_path)
+    assert freeze.main(argv) == 0
+    apath = freeze.amendments_path(base_path)
+    entries = json.loads(apath.read_text(encoding="utf-8"))
+    entry = entries[-1]
+    if change == "unlisted_field":
+        entry["case_attrs"]["case-a"]["expected"] = "XFAIL"
+        entry["denominator_sha256"] = freeze.denominator_sha256(entry, entry["required_case_ids"])
+    elif change in ("remove_id", "add_id", "reorder_ids"):
+        if change == "remove_id":
+            entry["required_case_ids"].pop()
+        elif change == "add_id":
+            entry["required_case_ids"].append("case-c")
+        else:
+            entry["required_case_ids"].reverse()
+        entry["denominator"] = len(entry["required_case_ids"])
+    elif change == "removed":
+        entry["removed"] = [{"case_id": "case-a", "decision": "OD-34"}]
+    elif change in ("old_mismatch", "new_mismatch"):
+        entry["attr_updates"][0][change.split("_")[0]] = "2.0"
+    elif change == "duplicate":
+        entry["attr_updates"].append(dict(entry["attr_updates"][0]))
+    elif change == "fingerprint":
+        entry["denominator_sha256"] = "0" * 64
+    elif change in ("base_hash", "prev_hash"):
+        entry[{"base_hash": "base_freeze_sha256", "prev_hash": "prev_amendment_sha256"}[change]] = "0" * 64
+    elif change.startswith("missing_"):
+        entry["attr_updates"][0].pop(change.removeprefix("missing_"))
+    else:
+        entry["attr_updates"][0]["decision"] = "OD-34x"
+    _write_amendments(apath, entries)
+    with pytest.raises(ValueError):
+        freeze.load_effective_freeze(base_path)
+
+
 def test_freeze_matches_lock():
     """分母以凍結時的 required_case_ids 為準（扣除擁有者逐名核准、記於修訂檔的延後案例），並與
     lock["sets"]["slice_2.1"] 嚴格相等（lock 為 add-only，後續切片只新增 slice_2.1 以外的案例）。
@@ -105,12 +272,81 @@ def test_freeze_matches_lock():
     assert fr["schema_version"] == 1 and fr["slice"] == "2.1" and fr["denominator_set"] == "slice_2.1"
     assert fr["window"] == {"start": fr["frozen_at"], "weeks": 3}
     assert fr["stage2_started_at"] == fr["frozen_at"]
+    # P6 Task 0：後續切片以 add-only 追加案例時 cases.yaml revision 會前進（YYYY-MM-DD.N）；凍結時的 revision 不得晚於現行值。
+    # parity-amendments-2026-10-26 #183（P6 審查 F4）：以 (YYYY,MM,DD,N) 整數 tuple 比較（字串序在 N≥10 時錯：".10" < ".9"）。
+    # 位元組指紋只在 revision 相同時比對（見下方 if）；revision 前進後改由 case_fingerprints 逐案驗證。
+    assert _revision_key(fr["cases_revision"]) <= _revision_key(cases_doc["revision"])
     assert fr["cases_revision"] == cases_doc["revision"]
     recomputed = _load("regen_lock", "tests/acceptance/regen_lock.py").compute_sets(cases_doc)["slice_2.1"]
     assert fr["required_case_ids"] == recomputed
     if fr["cases_revision"] == lock["cases_revision"]:
         assert fr["cases_lock_sha256"] == hashlib.sha256(LOCK.read_bytes()).hexdigest()
         assert fr["cases_yaml_sha256"] == hashlib.sha256(CASES.read_bytes()).hexdigest()
+
+
+def _revision_key(rev: str) -> tuple[int, int, int, int]:
+    """cases.yaml revision ``YYYY-MM-DD.N`` → (YYYY, MM, DD, N)；格式不符即 AssertionError。"""
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\.(\d+)", str(rev))
+    assert m, f"revision 格式必須為 YYYY-MM-DD.N：{rev!r}"
+    return tuple(int(g) for g in m.groups())  # type: ignore[return-value]
+
+
+def test_revision_key_orders_numerically():
+    assert _revision_key("2026-10-24.9") < _revision_key("2026-10-24.10")
+    assert _revision_key("2026-10-24.10") < _revision_key("2026-10-25.1")
+    assert _revision_key("2026-09-30.99") < _revision_key("2026-10-01.1")
+    for bad in ("2026-10-24", "2026-10-24.x", "20261024.1", "2026-10-24.1 "):
+        with pytest.raises(AssertionError):
+            _revision_key(bad)
+
+
+def _case_fingerprint(case: dict) -> str:
+    return hashlib.sha256(json.dumps(case, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                          .encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("slice_id", ["2.1", "2.2"])
+def test_freeze_case_fingerprints_match_current_cases(slice_id):
+    """parity-amendments-2026-10-26 #183（P6 審查 F4）：revision 前進後整檔位元組指紋（cases_yaml_sha256）不再比對，
+    必要案例的非 case_attrs 欄位（source_ref、title、implemented_by…）被改動會無聲通過；凍結檔因此記錄每個必要案例
+    完整 YAML 映射的 sha256（canonical JSON），此處逐案重算比對（補強，非削弱）。"""
+    base_path = ACC / "breaker" / f"slice_{slice_id}.json"
+    fr = json.loads(base_path.read_text(encoding="utf-8"))
+    cases = {c["case_id"]: c for c in yaml.safe_load(CASES.read_text(encoding="utf-8"))["cases"]}
+    fps = fr.get("case_fingerprints")
+    if fps is None:
+        # 凍結本體早於 #183（Slice 2.1）：本體不改寫（OD-34 修訂鏈以本體雜湊為錨），指紋記於旁置檔，
+        # 數值即 #183 當時（c2924a5）寫入本體者。
+        side = base_path.with_name(f"slice_{slice_id}.case_fingerprints.json")
+        assert side.exists(), f"slice_{slice_id}.json 缺 case_fingerprints，且無旁置檔 {side.name}"
+        fps = json.loads(side.read_text(encoding="utf-8"))
+    assert isinstance(fps, dict), f"slice_{slice_id} 的 case_fingerprints 必須為物件"
+    assert sorted(fps) == sorted(fr["required_case_ids"])
+    # 有效分母（扣除擁有者逐名核准、記於 `slice_<X>.amendments.json` 的延後案例，OD-34）逐案比對；
+    # 被延後者已不在本切片分母內，其 daemon_slice 依裁決改變。
+    effective = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py").load_effective_freeze(base_path)
+    assert set(effective["required_case_ids"]) <= set(fr["required_case_ids"])
+    # OD-52：擁有者逐名核准的凍結後欄位變更以「指紋更新」修訂記錄（舊指紋須等於前一版有效指紋，見
+    # `load_effective_freeze`）；有效指紋只換掉被逐名核准的案例，其餘仍以凍結時的指紋比對。
+    eff_fps = effective["case_fingerprints"]
+    updated = {u["case_id"] for a in effective["amendments"] for u in a.get("fingerprint_updates", [])}
+    assert {cid for cid in fps if eff_fps[cid] != fps[cid]} == updated
+    for amendment in effective["amendments"]:
+        decisions = amendment.get("decisions")
+        if decisions is None:
+            decisions = [amendment.get("decision")]
+        assert decisions and all(isinstance(od, str) and od.startswith("OD-") for od in decisions)
+    changed = [cid for cid in effective["required_case_ids"] if _case_fingerprint(cases[cid]) != eff_fps[cid]]
+    assert not changed, f"凍結後必要案例內容被改動：{changed}"
+
+
+def test_freeze_writes_case_fingerprints(tmp_path):
+    freeze = _load("freeze_slice_cases", "scripts/rust/freeze_slice_cases.py")
+    out = tmp_path / "slice_2.1.json"
+    assert freeze.main(["--slice", "2.1", "--date", "2026-10-21", "--out", str(out)]) == 0
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    cases = {c["case_id"]: c for c in yaml.safe_load(CASES.read_text(encoding="utf-8"))["cases"]}
+    assert doc["case_fingerprints"] == {cid: _case_fingerprint(cases[cid]) for cid in doc["required_case_ids"]}
 
 
 def test_revision_advance_keeps_denominator_and_updates_cases_revision(tmp_path):

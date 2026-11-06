@@ -30,7 +30,11 @@ impl OutItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushOutcome {
     Queued,
+    /// 丟掉的全是較舊的 Display 元素（或單一超大元素的頭端）。
     DroppedOldest { bytes: usize },
+    /// 已部分寫出的 front 受保護、為守住上限而丟掉了剛推入的新項（parity-amendments-2026-10-26 #178，P6 審查 F7）；
+    /// `bytes` 為本次 push 丟棄的合計（含先丟的較舊元素）。hub 的 WARNING 文字須註明丟的是最新輸出。
+    DroppedNewest { bytes: usize },
 }
 
 /// 每 console 一個的出向 ring。
@@ -83,17 +87,21 @@ impl OutRing {
                 };
                 self.display_bytes += bytes.len();
                 self.q.push_back(OutItem::Display { bytes, iac_escaped });
+                let mut dropped_newest = false;
                 while self.display_bytes > self.cap {
                     // 已部分寫出的 front 受保護：從 index 1 起找。
                     let from = usize::from(self.front_off > 0);
                     let Some(idx) = (from..self.q.len()).find(|&i| self.q[i].is_display()) else { break };
+                    dropped_newest |= idx == self.q.len() - 1;
                     let removed = self.q.remove(idx).expect("index 在範圍內");
                     let n = removed.bytes().len();
                     self.display_bytes -= n;
                     dropped += n;
                 }
                 self.dropped_total += dropped as u64;
-                if dropped > 0 {
+                if dropped_newest {
+                    PushOutcome::DroppedNewest { bytes: dropped }
+                } else if dropped > 0 {
                     PushOutcome::DroppedOldest { bytes: dropped }
                 } else {
                     PushOutcome::Queued

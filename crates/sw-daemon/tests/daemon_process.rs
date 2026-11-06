@@ -308,18 +308,27 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
         let s1 = socket.clone();
         let fg = thread::spawn(move || submit(&s1, "COM0", "blk"));
         thread::sleep(Duration::from_millis(300));
-        // 另排隊兩筆。
+        // 另排兩筆；先等 q2 admission 回覆，再送 q3，固定 flush trace 的 admission 順序。
         let s2 = socket.clone();
         let q2 = thread::spawn(move || submit(&s2, "COM0", "q2"));
-        // P5-T19 修正：q2／q3 原為背靠背並行送出，admission 順序不定；間隔 150 ms 使 q2 先 admission，flushed 依序比對。
-        thread::sleep(Duration::from_millis(150));
+        let c2 = q2
+            .join()
+            .expect("q2")["cmd_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let s3 = socket.clone();
         let q3 = thread::spawn(move || submit(&s3, "COM0", "q3"));
+        let c3 = q3
+            .join()
+            .expect("q3")["cmd_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // 讓 BlockUntilCancel 前景命令確實進入 writer，再送停機；保留原測試的排程窗口。
         thread::sleep(Duration::from_millis(300));
         rpc_once(&socket, STOP);
         let _ = fg.join();
-        let c2 = q2.join().expect("q2")["cmd_id"].as_str().unwrap_or_default().to_string();
-        let c3 = q3.join().expect("q3")["cmd_id"].as_str().unwrap_or_default().to_string();
         (c2, c3)
     });
     let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, trace_hooks(sink.clone()));

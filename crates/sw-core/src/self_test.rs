@@ -51,6 +51,9 @@ pub struct SelfTestProbes {
     pub holders: Option<Arc<dyn UartExclusive>>,
     /// 哨兵 PTY slave 是否仍存在（`snapshot()["vtty_alive"]`；`None` 表示無哨兵）。未設定時依現行 vtty 路徑是否存在判定。
     pub vtty_alive: Option<Arc<dyn Fn() -> Option<bool> + Send + Sync>>,
+    /// `vtty_alive` 未設定時判定哨兵路徑存在的函式（manager 注入 console 工廠的 `slave_path_exists`）；
+    /// `None` 時以 `std::path::Path::exists` 判定。
+    pub path_exists: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     /// 指定 epoch 的 IoWorker 快照（`snapshot()["running"]`／`["serial_alive"]`；審查 F32）；`None`＝無此 worker。
     pub bridge_snapshot: Option<Arc<dyn Fn(u64) -> Option<crate::uart_bridge::WorkerSnapshot> + Send + Sync>>,
     /// `_suggest_profile_from_rx` 的候選 template（manager 的全部 template，依載入順序；審查 F31）。

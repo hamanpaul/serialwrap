@@ -10,6 +10,11 @@ P5-T15a（測試資產變更，規格 §10.4）向後相容擴充；既有參數
   `pause_responding(seconds)`（期間收到的輸入照常記錄，但所有回應延到暫停結束後才送出）。
 - 行內命令：`sleep N`（N 秒後送 prompt）、`yes | head -c N`（恰送 N bytes 的 `y\\n` 後送 prompt）、
   `printf M<a>..M<b>`（分 10 個 chunk 送出 `M<a>`～`M<b>` 各一行後送 prompt，供 F4 背景分頁）。
+P6 Task 11（07 計畫；測試資產變更，規格 §10.4 需獨立審閱）再追加 keyword-only 選用能力，預設行為不變：
+- `scripts`：`{命令行 bytes: (延遲秒, 回覆 bytes[, 是否補 prompt])}`；收到該行時先回顯，延遲後送回覆，
+  第三欄省略或為 True 時接著送 prompt（False 時不回 prompt，模擬 `bootcmd` 之類卡在 boot 的命令）。
+- `ready=False`：不回應含 `__READY__` 的行（不回顯、不送 prompt），ready nonce 永遠等不到，session 停在 ATTACHED。
+- `hold_reply(on)`：True 時暫停所有回應（輸入照常記錄），False 時解除並送出累積的回應。
 回應一律依排程佇列送出（FIFO、命令間序列化，如同真實 shell 依序執行）；`^C` 會取消尚未送出的
 命令輸出並立即回 `^C` 與 prompt。
 
@@ -74,6 +79,8 @@ class FakeTarget:
         console_lock: dict | None = None,
         boot_on_start: list[tuple[float, str]] | None = None,
         release_slave: bool = False,
+        scripts: dict[bytes, tuple] | None = None,
+        ready: bool = True,
     ) -> None:
         self.workdir = Path(workdir)
         self.prompt = prompt
@@ -98,6 +105,11 @@ class FakeTarget:
         self._last_tx = 0.0
         self._boot_gen = 0
         self._aux_threads: list[threading.Thread] = []
+        self.scripts: dict[bytes, tuple] = dict(scripts or {})
+        for key, spec in self.scripts.items():
+            if not isinstance(key, bytes) or not isinstance(spec, tuple) or len(spec) not in (2, 3):
+                raise ValueError("scripts 格式為 {bytes: (延遲秒, 回覆 bytes[, 是否補 prompt])}")
+        self.ready = bool(ready)
         self.master_fd: int | None = None
         self.slave_fd: int | None = None
         self.slave_path: str | None = None
@@ -114,6 +126,7 @@ class FakeTarget:
         self._seq = 0
         self._tail_due = 0.0  # 最後一筆回應的排程時刻（維持 FIFO 與命令序列化）
         self._pause_until = 0.0
+        self._hold = False  # hold_reply(True)；與 pause_responding 的期限各自獨立、可疊加
         self._noise_count = 0
         self._wake_r: int | None = None
         self._wake_w: int | None = None
@@ -159,6 +172,7 @@ class FakeTarget:
             self._sched.clear()
             self._tail_due = 0.0
             self._pause_until = 0.0
+            self._hold = False
         self._stop.clear()
         self._reset_login_state()
         self._thread = threading.Thread(target=self._reader_main, daemon=True)
@@ -241,6 +255,15 @@ class FakeTarget:
     def rx_log_since(self, mark: int) -> bytes:
         return self.rx_log()[mark:]
 
+    def hold_reply(self, on: bool) -> None:
+        """True：暫停所有回應直到以 False 解除（輸入照常讀取與記錄）；False：解除並送出累積的回應。
+
+        與 `pause_responding(seconds)` 可疊加：兩者以獨立旗標／期限判定（任一生效即暫停），
+        `hold_reply(False)` 不會取消尚未到期的 `pause_responding`（審查 3317987_d6e3b3c-opus Low）。"""
+        with self._sched_lock:
+            self._hold = bool(on)
+        self._wake()
+
     def rx_log(self, timeout_s: float = 1.0) -> bytes:
         if self._thread_exc is not None:
             raise RuntimeError(f"FakeTarget reader thread died: {self._thread_exc}")
@@ -322,11 +345,13 @@ class FakeTarget:
         """取出已到期的項目；回傳 (待送資料, 距下一筆到期的秒數或 None)。"""
         out: list[bytes] = []
         with self._sched_lock:
-            paused = now < self._pause_until
+            paused = self._hold or now < self._pause_until
             if not paused:
                 while self._sched and self._sched[0][0] <= now:
                     out.append(heapq.heappop(self._sched)[2])
-            if paused:
+            if self._hold:
+                nxt = None  # 等 hold_reply(False) 的 wake
+            elif paused:
                 nxt = self._pause_until - now
             elif self._sched:
                 nxt = max(0.0, self._sched[0][0] - now)
@@ -564,6 +589,17 @@ class FakeTarget:
         """把一行命令的回顯、輸出與 prompt 排入回應佇列。"""
         echo = (cmd + "\r\n").encode("utf-8")
         d = self.delay_s
+
+        if not self.ready and "__READY__" in cmd:
+            return
+        spec = self.scripts.get(cmd.encode("utf-8"))
+        if spec is not None:
+            delay_s, reply = float(spec[0]), bytes(spec[1])
+            self._schedule(echo)
+            self._schedule(reply, delay_s=delay_s)
+            if len(spec) < 3 or spec[2]:
+                self._schedule(prompt_b)
+            return
 
         m = _SLEEP_RE.match(cmd)
         if m:

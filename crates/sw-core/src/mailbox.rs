@@ -30,7 +30,12 @@ pub type Reply = Sender<Result<PyDict, PyErr>>;
 /// 資料 lane（RX chunk）。
 #[derive(Debug)]
 pub enum DataEvent {
-    UartRxChunk { epoch: u64, rx_seq: u64, wal_seq: u64, bytes: Vec<u8> },
+    UartRxChunk {
+        epoch: u64,
+        rx_seq: u64,
+        wal_seq: u64,
+        bytes: Vec<u8>,
+    },
     /// P6 增補 #7（07 D-02、D-17(5)）：console 輸入；`input_epoch` 為 hub 每輪 `mux.wait` 前取的快照。不帶 `rx_seq`。
     ConsoleInputBytes { client_id: String, client_lifetime: u64, input_epoch: u64, bytes: Vec<u8> },
     /// P6 增補 #7（07 D-17(3)）：與同 client 輸入走同一條 data lane，不得超車尚未處理的輸入。
@@ -107,15 +112,23 @@ pub enum ControlEvent {
         result: Result<(), PalError>,
     },
     Tick,
-    Shutdown { reply: Reply },
-    /// P6 增補 #8：stream console（TCP／com0com）accept 或 hub 註冊完成。
-    ConsoleConnected { client_id: String, client_lifetime: u64, label: String, vtty: String, kind: ConsoleTransportKind },
+    Shutdown {
+        reply: Reply,
+    },
+    /// P6 增補 #8：stream console（TCP／com0com）accept 或 hub 註冊完成。`close_gen`＝accept 當下 hub 已處理的
+    /// close-all 次數；小於 core 已送出的 `ConsoleCloseAll` 次數者屬已關閉世代，core 拒收（sol 補審 High #2）。
+    ConsoleConnected {
+        client_id: String,
+        client_lifetime: u64,
+        label: String,
+        vtty: String,
+        kind: ConsoleTransportKind,
+        close_gen: u64,
+    },
     /// P6 增補 #8（07 D-09）：actor thread 之外取得的 `/proc` 掃描快照。
     ConsoleScan { scan: ConsoleScanSnapshot, source: ScanSource },
     /// P6 增補 #8（07 D-15(5)）：human TX pump 的結算。
     HumanTxCompleted { tag: HumanTxTag, report: TxReport },
-    /// P6 增補 #8（07 Task 10）：actor 層 envelope；`PtyPair` 由 executor 保管，不進 `SessionCore`。
-    ConsoleAttachReq { label: Option<String>, pty: Option<sw_pal::PtyPair>, reply: Reply },
 }
 
 /// 到期 timer（`Effect::Schedule` 的內容）。
@@ -140,10 +153,13 @@ pub struct OpenedBridge {
     pub epoch: u64,
     pub worker: IoWorker,
     pub real_path: String,
+    /// P6 Task 9 步驟 5：executor 於開埠成功時一併預建的哨兵 primary PTY（PTY 後端；`PtyPair` 留在 executor）。
+    pub sentinel: Option<crate::session_core::PtyInfo>,
+    /// TCP console 後端（SC-28 tcp／Windows）：executor 於開埠成功時一併綁定的 listener 端點（`"127.0.0.1:<port>"`）；
+    /// PTY 後端或綁定失敗為 None（`uart_io.py` `_start_console_listener`）。
+    pub console_endpoint: Option<String>,
     /// 本 bridge 專屬的 RX 視窗（Python 每次 attach 新建 `UARTBridge`，視窗／速率／總量歸零；審查 F51）。
     pub rx: Arc<RxShared>,
-    /// POSIX 哨兵 primary PTY 的 slave 路徑（Python `snapshot()["vtty"]`）；無哨兵（Windows）為 `None`。
-    pub vtty: Option<String>,
 }
 
 /// bridge 開啟失敗的分類。
@@ -345,15 +361,15 @@ impl Mailbox {
                 for w in self.witness.stopped.iter_mut() {
                     *w += 1;
                 }
-                // OD-64：data lane 為 FIFO，依賴等待開始時已在 lane 中的筆數即其後最先回傳的那幾筆。console 輸入等
-                // 非 UART data 同樣佔 FIFO 位置，但不屬任何 UART epoch（不計入同 epoch 筆數）。
-                let epoch = match data {
+                // OD-64：data lane 為 FIFO，依賴等待開始時已在 lane 中的筆數即其後最先回傳的那幾筆。
+                // P6 console 事件（ConsoleInputBytes／ConsoleDisconnected）同走 data lane：佔 FIFO 位置，但不是同 epoch RX data。
+                let rx_epoch = match data {
                     DataEvent::UartRxChunk { epoch, .. } => Some(*epoch),
                     _ => None,
                 };
                 for pre in self.witness.stopped_pre.iter_mut().filter(|p| p.remaining > 0) {
                     pre.remaining -= 1;
-                    if Some(pre.epoch) == epoch {
+                    if rx_epoch == Some(pre.epoch) {
                         pre.same_epoch += 1;
                     }
                 }

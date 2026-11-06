@@ -132,10 +132,9 @@ impl SimpleRegex {
                     idx += 1;
                     match esc {
                         'd' => Atom::Class(vec![('0', '9')], false),
-                        'w' => Atom::Class(
-                            vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
-                            false,
-                        ),
+                        'w' => {
+                            Atom::Class(vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], false)
+                        }
                         's' => Atom::Class(
                             vec![(' ', ' '), ('\t', '\t'), ('\r', '\r'), ('\n', '\n')],
                             false,
@@ -308,6 +307,10 @@ pub(crate) struct FakeDeviceInner {
     writes: AtomicUsize,
     os_submits: AtomicUsize,
     blocked_release: AtomicBool,
+    /// P6 Task 6：`BlockForever` 正在 gate 外阻塞（`wait_blocked` 讀取）。
+    blocked_now: AtomicBool,
+    /// P6 Task 9：loopback 游標（`Some(已回送的 tx 長度)`＝開啟）。
+    loopback: Mutex<Option<usize>>,
     /// 下一次 close 於暫停點（`wait_paused`／`release_pause`）停住（審查 F46）。
     pause_close: AtomicBool,
     close_err: Mutex<Option<PalError>>,
@@ -344,6 +347,8 @@ impl FakeDeviceInner {
             writes: AtomicUsize::new(0),
             os_submits: AtomicUsize::new(0),
             blocked_release: AtomicBool::new(false),
+            blocked_now: AtomicBool::new(false),
+            loopback: Mutex::new(None),
             pause_close: AtomicBool::new(false),
             close_err: Mutex::new(None),
             removed: AtomicBool::new(false),
@@ -380,7 +385,22 @@ fn check_tx_triggers_and_matches(inner: &FakeDeviceInner) {
             }
         }
 
-        let mut cursor = inner.tx_match_cursor.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = inner
+            .loopback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            if *pos < tx.len() {
+                to_push.extend_from_slice(&tx[*pos..]);
+                *pos = tx.len();
+            }
+        }
+
+        let mut cursor = inner
+            .tx_match_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if *cursor < tx.len() {
             let uninspected = &tx[*cursor..];
             if let Some(last_nl) = uninspected.iter().rposition(|&b| b == b'\n') {
@@ -617,10 +637,48 @@ impl FakeDevice {
         out
     }
 
+    /// 已「確認寫出」的 bytes 長度（不清空、不動 loopback／tx_match 游標；P6 審查 sol 補審 Medium）。
+    pub fn tx_len(&self) -> usize {
+        self.inner.tx.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// 已「確認寫出」bytes 中 `from` 之後的副本（不清空）。
+    pub fn tx_since(&self, from: usize) -> Vec<u8> {
+        let tx = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner());
+        tx.get(from..).map(<[u8]>::to_vec).unwrap_or_default()
+    }
+
     /// 依序消耗寫入腳本；耗盡後恢復 `Accept(全部)`。
     pub fn script_write(&self, steps: Vec<FakeWriteStep>) {
         let mut s = self.inner.steps.lock().unwrap_or_else(|e| e.into_inner());
         s.extend(steps);
+    }
+
+    /// P6 Task 9：loopback——之後確認寫出的每個 byte 立即回送為 RX。
+    pub fn set_loopback(&self, on: bool) {
+        let tx_len = self
+            .inner
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        *self
+            .inner
+            .loopback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = on.then_some(tx_len);
+    }
+
+    /// P6 Task 6：等到 `BlockForever` 的 job 已經 gate 提交 OS、在 gate 外阻塞（上限 2 s）。
+    pub fn wait_blocked(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !self.inner.blocked_now.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wait_blocked：2 s 內沒有 BlockForever 寫入進入阻塞"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     pub fn release_block(&self) {
@@ -722,11 +780,7 @@ impl FakeDevice {
     }
 
     /// `pattern` 對每個已確認 TX 行比對；`reply` 取得命中的行（random nonce probe 用）。
-    pub fn on_tx_match(
-        &self,
-        pattern: &str,
-        reply: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>,
-    ) {
+    pub fn on_tx_match(&self, pattern: &str, reply: Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>) {
         let regex = SimpleRegex::parse(pattern);
         self.inner
             .tx_matches
@@ -925,7 +979,12 @@ struct FakeSerialWriter {
 }
 
 impl SerialWriter for FakeSerialWriter {
-    fn write_gated(&mut self, data: &[u8], cancel: &CancelToken, gate: &dyn SubmitGate) -> TxResult {
+    fn write_gated(
+        &mut self,
+        data: &[u8],
+        cancel: &CancelToken,
+        gate: &dyn SubmitGate,
+    ) -> TxResult {
         self.inner.writes.fetch_add(1, Ordering::SeqCst);
 
         if cancel.is_cancelled() {
@@ -1314,6 +1373,7 @@ impl SerialWriter for FakeSerialWriter {
                         error: None,
                     };
                 }
+                self.inner.blocked_now.store(true, Ordering::SeqCst);
                 let mut guard = self
                     .inner
                     .cond_mutex
@@ -1328,6 +1388,7 @@ impl SerialWriter for FakeSerialWriter {
                         .0;
                 }
                 self.inner.blocked_release.store(false, Ordering::SeqCst);
+                self.inner.blocked_now.store(false, Ordering::SeqCst);
                 TxResult {
                     outcome: TxOutcome::Completed(committed),
                     error: None,

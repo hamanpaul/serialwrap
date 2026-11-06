@@ -61,6 +61,10 @@ fn wait_for(
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__pty_slave_is_raw_and_master_nonblocking() {
+    // D-01：console PTY 不建 symlink。掃 PAL 實際可能落 symlink 的目錄（run dir／XDG runtime／temp／/dev／cwd），
+    // 比對 create_pty 前後的快照，只看「新增且指向 slave_path」者（不受他人既有 symlink 干擾）。
+    let dirs = sw_pal::testutil::d01_scan_dirs();
+    let before = sw_pal::testutil::symlink_snapshot(&dirs);
     let p = sw_pal::native();
     let pair = p.console.create_pty().unwrap();
     assert!(sw_pal::testutil::is_dev_pts_path(&pair.slave_path));
@@ -72,11 +76,36 @@ fn cap_posix_pty__pty_slave_is_raw_and_master_nonblocking() {
     );
     assert_eq!((t.vmin, t.vtime), (1, 0));
     assert!(sw_pal::testutil::master_is_nonblocking(&pair));
-    let run_dir = tempfile_dir("sw-p6-run"); // 測試自建暫存目錄，不依賴外部 env
-    assert!(sw_pal::testutil::no_symlink_points_to(
-        &pair.slave_path,
-        &[run_dir.as_path()]
-    )); // D-01
+    let added = sw_pal::testutil::new_symlinks_to(&pair.slave_path, &dirs, &before);
+    assert!(
+        added.is_empty(),
+        "D-01：PAL 不得為 console 建 symlink：{added:?}"
+    );
+}
+
+/// L4：D-01 掃描必須在違規時紅——在掃描目錄（temp）植入一條指向目標的 symlink，偵測須報出；
+/// 舊斷言只掃測試自建的空目錄，對同一違規恆真。
+#[cfg(unix)]
+#[test]
+fn d01_symlink_scan_detects_planted_violation() {
+    let dirs = sw_pal::testutil::d01_scan_dirs();
+    let tmp = std::env::temp_dir();
+    assert!(
+        dirs.iter().any(|d| d == &tmp),
+        "D-01 掃描須涵蓋 temp 目錄：{dirs:?}"
+    );
+    let work = tempfile_dir("sw-p6-d01");
+    let target = work.join("fake-pts");
+    std::fs::write(&target, b"").unwrap();
+    let target = target.to_string_lossy().into_owned();
+    let before = sw_pal::testutil::symlink_snapshot(&dirs);
+    assert!(sw_pal::testutil::new_symlinks_to(&target, &dirs, &before).is_empty());
+    let planted = tmp.join(format!("sw-p6-d01-link-{}", std::process::id()));
+    let _ = std::fs::remove_file(&planted);
+    std::os::unix::fs::symlink(&target, &planted).unwrap();
+    let added = sw_pal::testutil::new_symlinks_to(&target, &dirs, &before);
+    let _ = std::fs::remove_file(&planted);
+    assert_eq!(added, vec![planted], "植入的 console symlink 必須被偵測到");
 }
 
 #[test]
@@ -245,6 +274,25 @@ fn tcp_console_binds_loopback_ephemeral_and_peer_eof() {
 fn tcp_accepted_socket_has_nodelay() {
     let (_l, _c, io, _peer) = tcp_pair();
     assert!(sw_pal::testutil::nodelay(&*io));
+}
+
+/// parity-amendments-2026-10-26 #109（B:E-15）：accept 設 TCP_NODELAY；PAL 回傳的 peer 字串即 Python
+/// `_accept_console_conn` 的 `label`（`f"{addr[0]}:{addr[1]}"`，client 端位址，非 `tcp://…`），listener
+/// `endpoint()` 即 Python `_console_endpoint`（`f"{host}:{port}"`，hub 以它作 TCP console 的 `vtty`／`slave_path`，
+/// `uart_io.py:1278-1305`）。hub 端的 label／vtty 組裝屬 Task 9。
+#[test]
+fn tcp_accept_sets_nodelay_and_label_shape() {
+    let p = sw_pal::native();
+    let mut l = p.console.bind_tcp_console().unwrap();
+    let ep = l.endpoint();
+    let c = std::net::TcpStream::connect(&ep).unwrap();
+    let (io, peer) = sw_pal::testutil::wait_accept(&mut *l, Duration::from_secs(2));
+    assert!(sw_pal::testutil::nodelay(&*io), "accept 後必須設 TCP_NODELAY");
+    let local = c.local_addr().unwrap();
+    assert_eq!(peer, format!("{}:{}", local.ip(), local.port()), "label 形狀與 Python 相同（client 的 ip:port）");
+    let server = c.peer_addr().unwrap();
+    assert_eq!(ep, format!("127.0.0.1:{}", server.port()), "endpoint 形狀與 Python 相同（host:port，無 scheme）");
+    assert!(!peer.contains("://") && !ep.contains("://"));
 }
 
 #[test]
@@ -598,4 +646,215 @@ fn fake_io_modes_and_refs() {
     f.fail_next_com0com();
     assert!(f.open_com0com_console("COM40").is_err());
     assert!(f.open_com0com_console("COM40").is_ok());
+}
+// ---------------------------------------------------------------------------
+// console reaper 的 holder 身分判定（#40／#64，B:E-109；Python `TestUartBridgeHeldPathsNamespace` 5 案）
+// ---------------------------------------------------------------------------
+//
+// 背景（#R2）：容器內獨立 devpts instance 的 `/dev/pts/N` readlink 字串與主機相同、`st_rdev`（136:N）
+// 亦相同，但 `(st_dev, st_ino)` 不同。`held_slave_paths()` 只在「fd 實際指向的 inode」與「該字串於本
+// daemon 所見的 inode」相同時才計入。以假 `/proc` ＋注入的 readlink／stat 固定此情境（真機依 pty 配號而定）。
+
+#[cfg(unix)]
+mod reaper_ns {
+    use std::collections::HashMap;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use sw_pal::tty_identity::TtyIdentity;
+
+    // 主機 devpts（st_dev=0:60）與容器 devpts（0:140、0:148）：同名 /dev/pts/7 實為不同裝置。
+    pub const HOST_DEV: u64 = 60;
+    pub const CONTAINER_DEV_A: u64 = 140;
+    pub const CONTAINER_DEV_B: u64 = 148;
+    pub const PTS7_RDEV: u64 = (136 << 8) | 7;
+    pub const TTY: &str = "/dev/pts/7";
+
+    pub enum FakeStat {
+        Id(TtyIdentity),
+        /// 被 stat 即 panic（驗證未對該路徑做 stat）。
+        MustNotStat,
+    }
+
+    /// 假 /proc：每條 fd 的 readlink 字串與 stat 身分各自可控（對照 Python `FakeProcNs`）。
+    pub struct FakeProcNs {
+        pub root: PathBuf,
+        links: HashMap<PathBuf, String>,
+        stats: HashMap<PathBuf, FakeStat>,
+    }
+
+    pub fn chr(dev: u64, ino: u64, rdev: u64) -> TtyIdentity {
+        TtyIdentity {
+            dev,
+            ino,
+            rdev,
+            is_char_device: true,
+        }
+    }
+
+    impl FakeProcNs {
+        pub fn new() -> FakeProcNs {
+            let root = super::tempfile_dir("sw-p6-fakeproc").join("proc");
+            std::fs::create_dir_all(&root).unwrap();
+            let mut fake = FakeProcNs {
+                root,
+                links: HashMap::new(),
+                stats: HashMap::new(),
+            };
+            // 主機 tty 的身分（TTY 不存在於 CI 主機，故一律由假表提供）。
+            fake.set_path(TTY, FakeStat::Id(chr(HOST_DEV, 10, PTS7_RDEV)));
+            fake
+        }
+
+        pub fn add_fd(&mut self, pid: u32, fd: u32, link: &str, stat: FakeStat) {
+            let fd_dir = self.root.join(pid.to_string()).join("fd");
+            std::fs::create_dir_all(&fd_dir).unwrap();
+            let path = fd_dir.join(fd.to_string());
+            std::fs::write(&path, b"").unwrap();
+            self.links.insert(path.clone(), link.to_string());
+            self.stats.insert(path, stat);
+        }
+
+        pub fn set_path(&mut self, path: &str, stat: FakeStat) {
+            self.stats.insert(PathBuf::from(path), stat);
+        }
+
+        pub fn held(&self) -> Option<std::collections::HashSet<String>> {
+            let readlink = |p: &Path| -> io::Result<PathBuf> {
+                self.links
+                    .get(p)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            };
+            let stat = |p: &Path| -> io::Result<TtyIdentity> {
+                match self.stats.get(p) {
+                    Some(FakeStat::Id(id)) => Ok(*id),
+                    Some(FakeStat::MustNotStat) => {
+                        panic!(
+                            "stat must not be called for non-/dev links: {}",
+                            p.display()
+                        )
+                    }
+                    None => Err(io::Error::from(io::ErrorKind::NotFound)),
+                }
+            };
+            sw_pal::proc_scan::posix::held_tty_paths_with(&self.root, &readlink, &stat)
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_ignores_other_namespace_same_name_pts() {
+    use reaper_ns::*;
+    let mut ns = FakeProcNs::new();
+    ns.add_fd(
+        4411,
+        3,
+        TTY,
+        FakeStat::Id(chr(CONTAINER_DEV_B, 10, PTS7_RDEV)),
+    );
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(
+        !held.contains(TTY),
+        "他 namespace 同名 pts（rdev 相同、inode 不同）不得計為 peer"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_counts_same_inode_pts() {
+    use reaper_ns::*;
+    let mut ns = FakeProcNs::new();
+    ns.add_fd(4412, 3, TTY, FakeStat::Id(chr(HOST_DEV, 10, PTS7_RDEV)));
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(held.contains(TTY));
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_counts_non_devpts_mknod_alias() {
+    use reaper_ns::*;
+    let uart = "/dev/ttyS0";
+    let uart_rdev = (4 << 8) | 64;
+    let mut ns = FakeProcNs::new();
+    ns.set_path(uart, FakeStat::Id(chr(HOST_DEV, 11, uart_rdev)));
+    ns.add_fd(
+        4413,
+        3,
+        uart,
+        FakeStat::Id(chr(CONTAINER_DEV_A, 55, uart_rdev)),
+    );
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(
+        held.contains(uart),
+        "非 devpts 字元裝置的 mknod 別名（inode 不同、rdev 相同）仍計為 held"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_does_not_stat_non_dev_links() {
+    use reaper_ns::*;
+    let mut ns = FakeProcNs::new();
+    ns.add_fd(4414, 4, "pipe:[12345]", FakeStat::MustNotStat);
+    let held = ns.held().expect("假 /proc 可列舉");
+    assert!(!held.contains("pipe:[12345]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn console_reaper_missing_proc_returns_none() {
+    let root = tempfile_dir("sw-p6-noproc").join("no-such-proc");
+    let readlink = |p: &std::path::Path| std::fs::read_link(p);
+    let stat = |p: &std::path::Path| sw_pal::tty_identity::stat_identity(p);
+    assert!(sw_pal::proc_scan::posix::held_tty_paths_with(&root, &readlink, &stat).is_none());
+}
+
+/// 真實檔案系統：`/dev/` 下但本 namespace 無法 stat 的 link（身分取不到）不計入，
+/// 舊版以 readlink 字串直接收錄（對照 Python #R2：stat 失敗即略過該 fd）。
+#[cfg(unix)]
+#[test]
+fn console_reaper_skips_dev_link_without_identity() {
+    let root = tempfile_dir("sw-p6-realproc");
+    let fd_dir = root.join("4415").join("fd");
+    std::fs::create_dir_all(&fd_dir).unwrap();
+    let ghost = "/dev/pts/987654321";
+    std::os::unix::fs::symlink(ghost, fd_dir.join("3")).unwrap();
+    let held = sw_pal::proc_scan::PosixProcScan::with_root(&root)
+        .held_fd_targets()
+        .expect("假 /proc 可列舉");
+    assert!(!held.contains(ghost), "無身分的同名字串不得計為 peer");
+}
+
+// ---------------------------------------------------------------------------
+// Windows 未實作 backend 不得 panic（sol 補審 P6 #4）
+// ---------------------------------------------------------------------------
+
+/// `NativeConsoleFactory` 在 Windows 接線的 TCP listener／ConsoleMux／com0com 尚未實作（LOCAL-WINDOWS-TODO），
+/// 實作完成前必須回 `Unsupported` 類錯誤，不得落到 `todo!` 而 panic。主機（Linux）上以原始碼掃描守門，
+/// 使 Windows 專屬檔案的回歸在非 Windows CI 也會紅。
+#[test]
+fn windows_console_backends_have_no_panicking_stubs() {
+    let sources = [
+        ("console_tcp/windows.rs", include_str!("../src/console_tcp/windows.rs")),
+        ("console_mux/windows.rs", include_str!("../src/console_mux/windows.rs")),
+        ("console_com0com/windows.rs", include_str!("../src/console_com0com/windows.rs")),
+        ("console_pty/windows.rs", include_str!("../src/console_pty/windows.rs")),
+    ];
+    for (name, src) in sources {
+        for mac in ["todo!(", "unimplemented!(", "panic!(", "s21_todo!("] {
+            assert!(!src.contains(mac), "{name} 含 `{mac}`：Windows factory 呼叫會 panic，須回 Unsupported");
+        }
+    }
+}
+
+/// Windows 原生：factory 的未實作 backend 回 `PalErrorKind::Unsupported`（不 panic）。
+#[cfg(windows)]
+#[test]
+fn windows_unimplemented_console_backends_return_unsupported() {
+    let p = sw_pal::native();
+    assert_eq!(p.console.bind_tcp_console().err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
+    assert_eq!(p.console.new_mux().err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
+    assert_eq!(p.console.open_com0com_console("COM250").err().map(|e| e.kind), Some(PalErrorKind::Unsupported));
 }

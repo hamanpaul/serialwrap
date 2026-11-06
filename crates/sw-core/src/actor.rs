@@ -421,9 +421,6 @@ fn dispatch(
         | MailboxItem::Control(ControlEvent::Shutdown { reply }) => {
             (Some(reply.clone()), "Request")
         }
-        MailboxItem::Control(ControlEvent::ConsoleAttachReq { reply, .. }) => {
-            (Some(reply.clone()), "ConsoleAttachReq")
-        }
         MailboxItem::Control(ControlEvent::ConsoleConnected { .. }) => (None, "ConsoleConnected"),
         MailboxItem::Control(ControlEvent::ConsoleScan { .. }) => (None, "ConsoleScan"),
         MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
@@ -447,6 +444,9 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::Timer(_)) => (None, "Timer"),
         MailboxItem::Control(ControlEvent::StateCommitted { .. }) => (None, "StateCommitted"),
         MailboxItem::Control(ControlEvent::Tick) => (None, "Tick"),
+        MailboxItem::Control(ControlEvent::ConsoleConnected { .. }) => (None, "ConsoleConnected"),
+        MailboxItem::Control(ControlEvent::ConsoleScan { .. }) => (None, "ConsoleScan"),
+        MailboxItem::Control(ControlEvent::HumanTxCompleted { .. }) => (None, "HumanTxCompleted"),
         MailboxItem::Data(_) => (None, "Data"),
     };
 

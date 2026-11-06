@@ -102,6 +102,14 @@ Stage 0 實機程序與腳本（非 TestPilot case，手動執行，各檔首段
 - `scripts/stage0/spike3_win_wal.py --list`：Spike 3 四個 case（`win-wal-av-rotate`、`win-wal-av-unlink`、`win-wal-av-reader-handle`、`win-wal-f12-progress`）；於 Windows host 以 `py -3.12` 執行，證據 JSON 依 `scripts/stage0/spike3_evidence.schema.json` 驗證（EDR 欄位必填）。非 Windows host 執行只產出 `INSUFFICIENT_EVIDENCE`，不得作為證據。
 - `scripts/stage0/drain_timing.py`：Linux 與 Windows 實體 USB-UART 依序量測 release 耗時分佈與 3,000 ms 逾時次數。
 
+### Rust 重構 Slice 2.2（P6，console／lease）#155 評估
+
+本 Phase 修正的行為（human console raw／line 共存、deferred 回放與 BC-02 失效、interactive lease 的 tombstone／soft preempt／
+ATTACHED 救援、TCP Telnet console）皆可由 L1（`crates/*/tests/`）與 L1.5 黑箱（`tests/contract_blackbox/slice22/`，PTY
+FakeTarget）覆蓋，**不新增 `regression/` case**。需要實機的部分已有既有案例承接：autoboot 倒數中斷與實板 reboot 期間鍵入
+不回放由 F5（`f5-deferred-dropped-after-reboot`）、F9 與 realhw `p1_console` 承接；Windows Telnet human frontend
+（Tera Term／PuTTY）屬 Stage 0 §15.8.4 交付，程序見 `docs/rust-refactor/procedures/windows-telnet-frontends.md`。
+
 ## U-Boot 唯讀護欄（F9 硬約束）
 
 由 `guards.UBootConsole` 在 harness 層強制（單測釘死），case 無法繞過：

@@ -41,7 +41,7 @@ fn out(lines: &[&str], echo: &[u8], overflowed: u32) -> LineOutput {
     // contracts/golden/line_editor.tsv：op "line_consume"；input＝以 "," 分隔的 chunk hex；
     // expected＝每 chunk 一組 "<行數>:<line1 hex>+<line2 hex>…/<echo hex>"，以 "," 分隔（行為 UTF-8 hex，可含 U+FFFD）
     let mut n = 0;
-    for r in rows(include_str!("../../../contracts/golden/line_editor.tsv")) {
+    for r in rows(include_str!("../../../contracts/golden/line_editor.tsv")).into_iter().filter(|r| r.op == "line_consume") {
         let mut e = LineEditor::new();
         let chunks: Vec<&str> = if r.input.is_empty() { vec![] } else { r.input.split(',').collect() };
         let outs: Vec<&str> = if r.expected.is_empty() { vec![] } else { r.expected.split(',').collect() };
@@ -85,4 +85,66 @@ fn out(lines: &[&str], echo: &[u8], overflowed: u32) -> LineOutput {
     assert_eq!(o.overflowed_lines, 1);
     assert!(o.lines.is_empty());
     assert_eq!(o.echo, vec![b'a'; 16385]);
+}
+
+// parity-amendments-2026-10-26 #177（P6 審查 F6）：溢位 WARNING 時機與 Python 相同——第 16386 個 byte 到達當下
+// （`uart_io.py:1706-1711`），與之後有無終止字元無關；`take_overflow_started` 回傳自上次取出後 discarding
+// 由 false→true 的次數（同一 chunk 兩行溢位時 Python 寫兩次 WARNING，見 golden `le-ovf-two-lines`）。
+#[test] fn overflow_warning_at_trigger_byte() {
+    let mut e = LineEditor::new();
+    let o = e.consume(&vec![b'a'; 16385]);
+    assert_eq!(o.overflowed_lines, 0);
+    assert_eq!(e.take_overflow_started(), 0, "恰 16385 bytes 尚未溢位");
+    let o = e.consume(b"a");
+    assert_eq!(o.overflowed_lines, 0, "overflowed_lines 仍只在終止字元結束 discarding 時加一（三欄語意不變）");
+    assert_eq!(e.take_overflow_started(), 1, "第 16386 個 byte 到達當下即須回報");
+    assert_eq!(e.take_overflow_started(), 0, "取出後歸零");
+    let o = e.consume(b"\r");
+    assert_eq!(o.overflowed_lines, 1);
+    assert_eq!(e.take_overflow_started(), 0, "終止字元不再回報 WARNING");
+}
+#[test] fn overflow_without_terminator_still_warns() {
+    let mut e = LineEditor::new();
+    let o = e.consume(&vec![b'a'; 16386]);
+    assert!(o.lines.is_empty());
+    assert_eq!(o.overflowed_lines, 0);
+    assert_eq!(e.take_overflow_started(), 1);
+    let _ = e.consume(b"bb\x7fcc");
+    assert_eq!(e.take_overflow_started(), 0, "discarding 期間不重複回報");
+}
+#[test] fn overflow_across_chunks_warns_once() {
+    let mut e = LineEditor::new();
+    let mut total = 0;
+    for chunk in [&vec![b'a'; 16000][..], &vec![b'a'; 385][..], b"ab", b"c", b"\r"] {
+        let _ = e.consume(chunk);
+        total += e.take_overflow_started();
+    }
+    assert_eq!(total, 1);
+    let _ = e.consume(b"ok\r");
+    assert_eq!(e.take_overflow_started(), 0);
+}
+#[test] fn two_overflows_in_one_chunk_warn_twice() {
+    let mut data = vec![b'a'; 16386];
+    data.push(b'\r');
+    data.extend(vec![b'a'; 16386]);
+    data.push(b'\r');
+    let mut e = LineEditor::new();
+    assert_eq!(e.consume(&data).overflowed_lines, 2);
+    assert_eq!(e.take_overflow_started(), 2);
+}
+#[test] fn golden_warn_count_matches_python() {
+    // contracts/golden/line_editor.tsv：op "line_warn"；expected＝每 chunk 的 Python 溢位 WARNING 次數。
+    let mut n = 0;
+    for r in rows(include_str!("../../../contracts/golden/line_editor.tsv")).into_iter().filter(|r| r.op == "line_warn") {
+        let mut e = LineEditor::new();
+        let chunks: Vec<&str> = if r.input.is_empty() { vec![] } else { r.input.split(',').collect() };
+        let want: Vec<u32> = r.expected.split(',').map(|w| w.parse().unwrap()).collect();
+        assert_eq!(chunks.len(), want.len(), "case {}", r.id);
+        for (c, w) in chunks.iter().zip(&want) {
+            let _ = e.consume(&unhex(c));
+            assert_eq!(e.take_overflow_started(), *w, "case {}", r.id);
+        }
+        n += 1;
+    }
+    assert!(n >= 13, "line_warn 案例數 {n}");
 }

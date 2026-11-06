@@ -1409,3 +1409,35 @@ def test_l1_add_only_ignored_existing_rows_kept_unless_approved_od24(tmp_path: P
                              capture_output=True, text=True, cwd=REPO_ROOT)
     assert removed.returncode == 0, removed.stdout + removed.stderr
     assert json.loads(lock_path.read_text(encoding="utf-8"))["sets"]["s1b_cargo"]["windows"]["nodeids"] == [kept]
+
+
+@pytest.mark.memory_only
+def test_l1_lock_ignored_scan_exempts_only_explicit_capability_selectors() -> None:
+    """OD-53（2026-10-29）：selector 在 test-binary 參數以 `--ignored cap_<cap>__` 明確執行 ignored 能力測試的集合
+    （如 `s22_gate:console_conformance_pty`，以 `cargo_l1_results.py --caps posix_pty` 實跑）豁免 OD-24 (2)，
+    但只豁免名稱符合該 cap 前綴的列；其他集合（含 `--skip cap_` 的 s21_core 類）與能力集合內的非 cap ignored 列仍判違規。"""
+    ignored = {("p", "t", "cap_posix_pty__a"), ("p", "t", "plain_ignored"), ("p", None, "cap_posix_pty__u")}
+    cap_sel = {"argv": ["--package", "p", "--test", "t", "--", "--ignored", "cap_posix_pty__"], "paths": [], "markexpr": ""}
+    lock = {"schema_version": 1, "sets": {
+        "x:cap": {"linux": {"selector": cap_sel, "nodeids": [
+            "cargo:p::t::cap_posix_pty__a", "cargo:p::t::plain_ignored", "cargo:p::p::m::cap_posix_pty__u"]}},
+        "x:skip": {"linux": {"selector": {"argv": ["--workspace", "--", "--skip", "cap_"], "paths": [], "markexpr": ""},
+                             "nodeids": ["cargo:p::t::cap_posix_pty__a"]}},
+        "x:other_cap": {"linux": {"selector": {**cap_sel, "argv": [*cap_sel["argv"][:-1], "cap_windows_com__"]},
+                                  "nodeids": ["cargo:p::t::cap_posix_pty__a"]}},
+        "x:include": {"linux": {"selector": {**cap_sel, "argv": [*cap_sel["argv"][:-2], "--include-ignored", "cap_posix_pty__"]},
+                                "nodeids": ["cargo:p::t::cap_posix_pty__a"]}},
+    }}
+    assert _selector_explicit_caps(cap_sel) == ["posix_pty"]
+    assert _selector_explicit_caps(lock["sets"]["x:skip"]["linux"]["selector"]) == []
+    assert sorted(_ignored_lock_rows(lock, ignored)) == [
+        "x:cap:linux:cargo:p::t::plain_ignored",
+        "x:include:linux:cargo:p::t::cap_posix_pty__a",
+        "x:other_cap:linux:cargo:p::t::cap_posix_pty__a",
+        "x:skip:linux:cargo:p::t::cap_posix_pty__a",
+    ]
+    # 現行 L1 鎖：P6 的能力集合實際落在豁免範圍（豁免不是空集合）
+    real = json.loads(Path("tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    cap_spec = real["sets"]["s22_gate:console_conformance_pty"]["linux"]
+    assert _selector_explicit_caps(cap_spec["selector"]) == ["posix_pty"]
+    assert not [r for r in _ignored_lock_rows(real, _rust_ignored_tests()) if r.startswith("s22_gate:")]

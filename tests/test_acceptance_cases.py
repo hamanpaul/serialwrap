@@ -42,15 +42,9 @@ def test_contract_blackbox_cases_match_test_functions():
         and node.name.startswith("test_")
     }
     all_bb = [c for c in _load_cases().get("cases", []) if c.get("suite") == "contract-blackbox"]
-    # P6 Task 0（07-slice22-console.md）：下游切片以 add-only 登記的 contract-blackbox 案例（implemented_by 為該切片計畫）
-    # 不屬 Stage 1A daemon black-box；Stage 1A 案例仍須與 test_bb_daemon_e2e.py 一一對應，切片案例另驗來源路徑。
-    cases = [c for c in all_bb if c.get("implemented_by") == "04-stage1a-rust-cli.md"]
-    later = [c for c in all_bb if c.get("implemented_by") != "04-stage1a-rust-cli.md"]
-    for c in later:
-        assert str(c.get("implemented_by", "")).startswith(("07-slice22-console.md", "08-slice23", "09-slice24")), c["case_id"]
-        assert str(c["source_ref"]).startswith(("tests/contract_blackbox/", "crates/")), c["case_id"]
-        assert "::" in c["source_ref"], c["case_id"]
-    assert len({c["source_ref"] for c in later}) == len(later), "切片 contract-blackbox source_ref 不得重複"
+    # P6 Task 0（07-slice22-console.md）：下游切片以 add-only 登記的 contract-blackbox 案例不屬 Stage 1A daemon black-box；
+    # Stage 1A 案例仍須與 test_bb_daemon_e2e.py 一一對應，切片案例另驗來源路徑。分群見 _split_contract_blackbox。
+    cases, later = _split_contract_blackbox(all_bb)
     expected_refs = {
         f"tests/contract_blackbox/test_bb_daemon_e2e.py::{name}" for name in names
     }
@@ -63,6 +57,55 @@ def test_contract_blackbox_cases_match_test_functions():
     )
     assert len(actual_refs) == len(cases), "contract-blackbox source_ref 不得重複"
     assert {c["case_id"] for c in cases} == expected_ids
+
+
+_STAGE1A_PLAN = "04-stage1a-rust-cli.md"
+_STAGE1A_SOURCE = "tests/contract_blackbox/test_bb_daemon_e2e.py::"
+
+
+def _split_contract_blackbox(all_bb: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """contract-blackbox 案例分成 Stage 1A 與下游切片兩群，並驗證各群的結構不變量。
+
+    parity-amendments-2026-10-26 #184（P6 審查 F5）：分群鍵改為結構欄位（``case_id`` 的 ``bb-`` 前綴或
+    ``source_ref`` 指向 ``test_bb_daemon_e2e.py``），不再依自由文字 ``implemented_by``；任一 Stage 1A 案例的
+    ``implemented_by`` 必須恰為 ``04-stage1a-rust-cli.md``，下游案例不得使用 ``bb-`` 前綴或 Stage 1A 來源。
+    """
+    stage1a = [c for c in all_bb
+               if c["case_id"].startswith("bb-") or str(c.get("source_ref", "")).startswith(_STAGE1A_SOURCE)]
+    later = [c for c in all_bb if c not in stage1a]
+    for c in stage1a:
+        assert c["case_id"].startswith("bb-"), f"{c['case_id']}：source_ref 屬 Stage 1A，case_id 必須以 bb- 開頭"
+        assert c.get("implemented_by") == _STAGE1A_PLAN, f"{c['case_id']}：Stage 1A 案例 implemented_by 必須為 {_STAGE1A_PLAN}"
+        assert str(c.get("source_ref", "")).startswith(_STAGE1A_SOURCE), f"{c['case_id']}：Stage 1A 案例來源必須為 {_STAGE1A_SOURCE}"
+    for c in later:
+        assert c.get("implemented_by") != _STAGE1A_PLAN, f"{c['case_id']}：非 bb- 案例不得標為 Stage 1A"
+        assert str(c.get("implemented_by", "")).startswith(("07-slice22-console.md", "08-slice23", "09-slice24")), c["case_id"]
+        assert str(c["source_ref"]).startswith(("tests/contract_blackbox/", "crates/")), c["case_id"]
+        assert "::" in c["source_ref"], c["case_id"]
+    assert len({c["source_ref"] for c in later}) == len(later), "切片 contract-blackbox source_ref 不得重複"
+    return stage1a, later
+
+
+@pytest.mark.memory_only
+@pytest.mark.parametrize("bad", [
+    # bb- 案例被標成切片計畫（舊邏輯會把它歸入切片群而無聲通過）
+    {"case_id": "bb-new-case", "implemented_by": "07-slice22-console.md",
+     "source_ref": "tests/contract_blackbox/slice22/test_x.py::test_new_case"},
+    # Stage 1A 案例 implemented_by 文字漂移
+    {"case_id": "bb-drift", "implemented_by": "04-stage1a-rust-cli.md ",
+     "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_drift"},
+    # 指向 Stage 1A 測試檔、卻不是 bb- 案例
+    {"case_id": "sc99-x", "implemented_by": "07-slice22-console.md",
+     "source_ref": "tests/contract_blackbox/test_bb_daemon_e2e.py::test_x"},
+    # 非 bb- 案例宣稱屬 Stage 1A
+    {"case_id": "sc98-y", "implemented_by": "04-stage1a-rust-cli.md",
+     "source_ref": "tests/contract_blackbox/slice22/test_y.py::test_y"},
+])
+def test_contract_blackbox_grouping_is_structural(bad):
+    ok = {"case_id": "bb-ok", "implemented_by": _STAGE1A_PLAN, "source_ref": _STAGE1A_SOURCE + "test_ok"}
+    assert _split_contract_blackbox([ok]) == ([ok], [])
+    with pytest.raises(AssertionError):
+        _split_contract_blackbox([ok, dict(bad, suite="contract-blackbox")])
 
 
 def _slice_to_tuple(s: str) -> tuple[int, ...]:
@@ -632,6 +675,60 @@ def test_counts_report():
     assert counts.get("by_slice") == by_slice, f"counts by_slice mismatch: {counts.get('by_slice')} vs {by_slice}"
 
 
+@pytest.mark.process_rpc
+def test_regen_lock_authorized_deferral_is_per_name(tmp_path: pathlib.Path):
+    """OD-34（擁有者裁決 2026-10-28）：案例延後切片只能逐名授權（`--authorize-deferral <case_id>:OD-<n>`）。
+    未授權者照舊拒絕；授權只放行該案例的 daemon_slice 往後移，不放行其他分母屬性改動或其他案例；
+    沒有實際延後的授權（過期 token）亦拒絕。"""
+    regen_script = REPO / "tests/acceptance/regen_lock.py"
+    orig_lock = (REPO / "tests/acceptance/cases.lock.json").read_text(encoding="utf-8")
+    counts = (REPO / "tests/acceptance/cases.counts.json").read_text(encoding="utf-8")
+    lock_now = json.loads(orig_lock)
+    cid = next(c for c in lock_now["sets"]["slice_2.2"] if c not in lock_now["sets"]["slice_2.1"]
+               and lock_now["case_attrs"][c]["daemon_slice"] == "2.2")
+
+    def run(tag: str, mutate, *extra: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        d = tmp_path / tag
+        d.mkdir()
+        cases_data = _load_cases()
+        mutate({c["case_id"]: c for c in cases_data["cases"]})
+        (d / "cases.yaml").write_text(yaml.safe_dump(cases_data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        (d / "cases.lock.json").write_text(orig_lock, encoding="utf-8")
+        (d / "cases.counts.json").write_text(counts, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(regen_script), "--add-only", "--cases", str(d / "cases.yaml"),
+             "--lock", str(d / "cases.lock.json"), *extra],
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+        )
+        return proc, d / "cases.lock.json"
+
+    def defer(cases):
+        cases[cid]["daemon_slice"] = "2.3"
+
+    proc, lock = run("unauth", defer)
+    assert proc.returncode == 1 and "被延後切片" in proc.stderr, proc.stderr
+    assert lock.read_text(encoding="utf-8") == orig_lock
+
+    proc, lock = run("auth", defer, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 0, proc.stderr
+    new = json.loads(lock.read_text(encoding="utf-8"))
+    assert cid not in new["sets"]["slice_2.2"] and cid in new["sets"]["slice_2.3"]
+    assert new["case_attrs"][cid]["daemon_slice"] == "2.3"
+    assert f"{cid}" in proc.stdout and "OD-34" in proc.stdout
+
+    def defer_and_shrink(cases):
+        defer(cases)
+        cases[cid]["platforms"] = ["linux"]
+
+    proc, lock = run("attr", defer_and_shrink, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 1 and "分母屬性變更" in proc.stderr, proc.stderr
+    assert lock.read_text(encoding="utf-8") == orig_lock
+
+    proc, lock = run("stale", lambda cases: None, "--authorize-deferral", f"{cid}:OD-34")
+    assert proc.returncode == 1 and "未對應" in proc.stderr, proc.stderr
+
+    proc, lock = run("badref", defer, "--authorize-deferral", f"{cid}:owner")
+    assert proc.returncode == 2, proc.stderr
 def _defer_fixture(tmp_path: pathlib.Path, case_id: str, to_slice: str) -> tuple[pathlib.Path, pathlib.Path, str]:
     cases_data = _load_cases()
     target = next(c for c in cases_data["cases"] if c["case_id"] == case_id)

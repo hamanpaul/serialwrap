@@ -10,6 +10,8 @@
 分母指紋 `denominator_sha256` 為 required 案例的 `case_attrs`（依凍結時原序）canonical JSON 的 sha256。
 lock 為 add-only，後續切片只會新增案例，既有案例屬性不得改動，因此指紋在 P6～P8 重算 lock 後仍成立；
 `cases_lock_sha256` 僅作為 provenance 記錄。
+`case_fingerprints`（parity-amendments-2026-10-26 #183）為 {case_id: 該必要案例完整 YAML 映射之 canonical JSON sha256}；
+revision 前進後整檔指紋 `cases_yaml_sha256` 不再可比，改由此逐案驗證必要案例內容未被改動。
 
 Stage 2 起算日（OD-02 的 24 週上限起點）全案只有一個：Slice 2.1 的 `stage2_started_at`。
 2.1 以開工日（`--date`）為起算日；2.2～2.4 必須沿用 `breaker/slice_2.1.json` 的值（缺檔、不一致或晚於開工日 → exit 2）。
@@ -24,6 +26,16 @@ Stage 2 起算日（OD-02 的 24 週上限起點）全案只有一個：Slice 2.
    觀測窗口、frozen_at 與 Stage 2 起算日沿用凍結檔，不得重設。讀取方一律經 `load_effective_freeze()`。）
   python3 scripts/rust/freeze_slice_cases.py --revision-advance --slice 2.1 --date YYYY-MM-DD --decision OD-NN
   （只更新 cases_revision 與 provenance；必要案例、分母與分母指紋必須和前一版完全相同。）
+  python3 scripts/rust/freeze_slice_cases.py --amend --slice 2.3 --date YYYY-MM-DD \
+      --attr-update <case_id>:<field>:<old>:<new>:<OD-NN> [...]
+  （SG-P76-S23-REVISION：只追加 `kind: attr_update`，逐名記錄 case_attrs 的直接欄位與 OD；CLI 的
+   old／new 為字串。必要案例與順序不變、removed 為空；記錄完整分母屬性快照，讓讀取器亦能將列出欄位
+   還原成 old 後重算前版指紋。任一未核准欄位變動皆拒絕；凍結本體與舊修訂格式不變。）
+  python3 scripts/rust/freeze_slice_cases.py --amend --slice 2.1 --date YYYY-MM-DD \
+      --fingerprint-update <case_id>:<OD-NN> [...] --source-commit <sha> --field <欄位> [...]
+  （OD-52 起：擁有者逐名核准凍結後的案例欄位變更（不改案例本體語意、不改分母）。同樣只追加修訂紀錄
+   （`kind: fingerprint_update`）：逐案記錄舊／新指紋、變更欄位、來源 commit 與 OD；舊指紋必須等於前一版有效指紋，
+   有效分母必須恰等於鎖的 `slice_<X>` 集合。`load_effective_freeze()` 的 `case_fingerprints` 為套用修訂後的有效指紋。）
 
 退出碼：0 寫入成功；1 凍結檔已存在（拒絕覆寫）；2 輸入或寫入錯誤（日期格式、版本不一致、鎖檔與 cases.yaml 不一致、
 起算日缺漏或衝突、目錄不可寫、父路徑不是目錄等）。
@@ -32,6 +44,7 @@ Stage 2 起算日（OD-02 的 24 週上限起點）全案只有一個：Slice 2.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import importlib.util
@@ -54,6 +67,8 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 _OD_RE = re.compile(r"^OD-\d+$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 class AlreadyFrozen(Exception):
@@ -93,6 +108,17 @@ def denominator_sha256(lock: dict, required: list[str]) -> str:
     canon = json.dumps([[cid, lock["case_attrs"][cid]] for cid in required],
                        ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def case_fingerprint(case: dict) -> str:
+    """單一案例完整映射（cases.yaml 的一個元素）之 canonical JSON sha256。"""
+    canon = json.dumps(case, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def case_fingerprints(cases_doc: dict, required: list[str]) -> dict[str, str]:
+    by_id = {c["case_id"]: c for c in cases_doc.get("cases", [])}
+    return {cid: case_fingerprint(by_id[cid]) for cid in required}
 
 
 def resolve_stage2_started_at(slice_id: str, date: str, requested: str | None,
@@ -143,6 +169,7 @@ def build_freeze(*, slice_id: str, date: str, stage2_started_at: str,
         "required_case_ids": required,
         "denominator": len(required),
         "denominator_sha256": denominator_sha256(lock, required),
+        "case_fingerprints": case_fingerprints(cases_doc, required),
         "stage2_started_at": stage2_started_at,
     }
 
@@ -185,6 +212,12 @@ def load_effective_freeze(base_path: pathlib.Path) -> dict:
     base = json.loads(base_bytes.decode("utf-8"))
     eff = dict(base)
     eff["amendments"] = []
+    # 凍結本體早於 #183（Slice 2.1）者，指紋記於旁置檔 `slice_<X>.case_fingerprints.json`（本體不改寫）。
+    fps = base.get("case_fingerprints")
+    side = base_path.with_name(f"{base_path.stem}.case_fingerprints.json")
+    if fps is None and side.exists():
+        fps = json.loads(side.read_text(encoding="utf-8"))
+    eff["case_fingerprints"] = dict(fps) if isinstance(fps, dict) else None
     apath = amendments_path(base_path)
     if not apath.exists():
         return eff
@@ -202,8 +235,13 @@ def load_effective_freeze(base_path: pathlib.Path) -> dict:
             raise ValueError(f"{apath} 第 {i} 筆：編號或凍結檔本體雜湊不符")
         if entry.get("prev_amendment_sha256") != prev_sha:
             raise ValueError(f"{apath} 第 {i} 筆：前一筆修訂雜湊不符（修訂鏈遭改動）")
-        kind = entry.get("kind", "removal")
-        if kind == "revision_advance":
+        kind = entry.get("kind", "defer")
+        if kind == "fingerprint_update":
+            _apply_fingerprint_update(apath, i, entry, required, eff)
+            denominator = entry["denominator"]
+            denominator_sha = entry["denominator_sha256"]
+            cases_revision = entry["cases_revision"]
+        elif kind == "revision_advance":
             decision = entry.get("decision")
             if entry.get("removed") != [] or not _OD_RE.fullmatch(str(decision or "")):
                 raise ValueError(f"{apath} 第 {i} 筆：revision_advance 須 removed 為空且 decision 符合 OD-NN")
@@ -215,7 +253,11 @@ def load_effective_freeze(base_path: pathlib.Path) -> dict:
                     or entry.get("denominator_sha256") != denominator_sha):
                 raise ValueError(f"{apath} 第 {i} 筆：revision_advance 不得變更必要案例、分母或分母指紋")
             cases_revision = next_revision
-        elif kind in ("removal",):
+        elif kind == "attr_update":
+            _validate_attr_update(entry, required, denominator_sha)
+            denominator_sha = entry["denominator_sha256"]
+            cases_revision = entry["cases_revision"]
+        elif kind in ("defer", "removal"):
             removed = entry.get("removed") or []
             if not removed or any(not _OD_RE.match(str(r.get("decision", ""))) for r in removed):
                 raise ValueError(f"{apath} 第 {i} 筆：須逐名列出延後案例並引用 OD-NN")
@@ -229,7 +271,7 @@ def load_effective_freeze(base_path: pathlib.Path) -> dict:
             denominator_sha = entry["denominator_sha256"]
             cases_revision = entry.get("cases_revision", cases_revision)
         else:
-            raise ValueError(f"{apath} 第 {i} 筆：未知修訂類型 {kind!r}")
+            raise ValueError(f"{apath} 第 {i} 筆：未知的修訂種類 {kind!r}")
         prev_sha = _canon_sha(entry)
     last = entries[-1]
     for key in ("required_case_ids", "denominator", "denominator_sha256", "cases_revision",
@@ -239,17 +281,147 @@ def load_effective_freeze(base_path: pathlib.Path) -> dict:
     return eff
 
 
-def _parse_defer(token: str) -> dict:
+def _validate_attr_update(entry: dict, required: list[str], previous_sha: str) -> None:
+    """驗證具名屬性修訂：新快照與新指紋相符，逐欄還原後須恰為前一版分母指紋。"""
+    if entry.get("removed") != []:
+        raise ValueError("attr_update 的 removed 必須為空陣列")
+    if entry.get("required_case_ids") != required or entry.get("denominator") != len(required):
+        raise ValueError("attr_update 不得改變必要案例集合、順序或分母")
+    attrs = entry.get("case_attrs")
+    if (not isinstance(attrs, dict) or set(attrs) != set(required)
+            or not all(isinstance(a, dict) for a in attrs.values())):
+        raise ValueError("attr_update 須記錄全部必要案例的屬性快照，不得增減案例")
+    if denominator_sha256(entry, required) != entry.get("denominator_sha256"):
+        raise ValueError("attr_update 的新分母指紋與屬性快照不符")
+    updates = entry.get("attr_updates")
+    if not isinstance(updates, list) or not updates:
+        raise ValueError("attr_update 須逐名列出屬性變更")
+    restored = copy.deepcopy(attrs)
+    seen: set[tuple[str, str]] = set()
+    for update in updates:
+        if not isinstance(update, dict) or not {"case_id", "field", "old", "new", "decision"} <= update.keys():
+            raise ValueError("attr_update 每筆須有 case_id、field、old、new 與 decision")
+        cid, field = update["case_id"], update["field"]
+        if not isinstance(cid, str) or cid not in attrs or not isinstance(field, str) or not field:
+            raise ValueError("attr_update 的案例或欄位無效")
+        if (cid, field) in seen:
+            raise ValueError(f"attr_update 不得重複指定 {cid}:{field}")
+        seen.add((cid, field))
+        if not _OD_RE.fullmatch(str(update["decision"])):
+            raise ValueError(f"attr_update 的 {cid}:{field} 須引用 OD-NN")
+        if (field not in attrs[cid] or _canon_sha(attrs[cid][field]) != _canon_sha(update["new"])
+                or _canon_sha(update["old"]) == _canon_sha(update["new"])):
+            raise ValueError(f"attr_update 的 {cid}:{field} 新值不符或未變更")
+        restored[cid][field] = update["old"]
+    if entry.get("decisions") != sorted({u["decision"] for u in updates}):
+        raise ValueError("attr_update 的 decisions 與逐欄 OD 不符")
+    if denominator_sha256({"case_attrs": restored}, required) != previous_sha:
+        raise ValueError("attr_update 還原 old 後的分母指紋與前一版不符（old 錯誤或有未列出的欄位變動）")
+
+
+def _parse_attr_update(token: str) -> dict:
     parts = token.split(":")
-    if len(parts) != 3 or not all(parts) or parts[1] not in SLICES or not _OD_RE.match(parts[2]):
-        raise ValueError(f"--defer 須為 case_id:<{'|'.join(SLICES)}>:OD-NN：{token!r}")
-    return {"case_id": parts[0], "to_slice": parts[1], "decision": parts[2]}
+    if len(parts) != 5 or not all(parts) or not _OD_RE.fullmatch(parts[4]):
+        raise ValueError(f"--attr-update 須為 CASE:FIELD:OLD:NEW:OD-NN：{token!r}")
+    return dict(zip(("case_id", "field", "old", "new", "decision"), parts))
 
 
-def _write_amendment(base_path: pathlib.Path, previous: list[dict], entry: dict) -> None:
-    """原子追加修訂並由正式讀取器自驗；輸入不一致時不留下部分 JSON。"""
+def amend_attrs(*, base_path: pathlib.Path, slice_id: str, date: str, updates: list[dict],
+                lock_path: pathlib.Path, yaml_path: pathlib.Path) -> dict:
+    """以現行鎖追加具名屬性修訂；所有驗證成功後才寫入旁置修訂鏈，不改凍結本體。"""
+    eff = load_effective_freeze(base_path)
+    if eff["slice"] != slice_id:
+        raise ValueError("attr_update 的切片與凍結本體不符")
+    lock, cases_doc = _check_lock_matches_yaml(slice_id, lock_path, yaml_path)
+    required = list(eff["required_case_ids"])
+    if lock["sets"][f"slice_{slice_id}"] != required:
+        raise ValueError("attr_update 不得改變必要案例集合或順序")
+    attrs = {cid: lock["case_attrs"][cid] for cid in required}
+    recomputed = _load_regen_lock().compute_attrs(cases_doc)
+    if attrs != {cid: recomputed[cid] for cid in required}:
+        raise ValueError("attr_update 的鎖屬性與 cases.yaml 重算結果不一致")
+    previous = eff["amendments"]
+    entry = {
+        "amendment": len(previous) + 1,
+        "kind": "attr_update",
+        "date": date,
+        "decisions": sorted({u["decision"] for u in updates}),
+        "removed": [],
+        "attr_updates": updates,
+        "case_attrs": attrs,
+        "base_freeze_sha256": _sha256(base_path),
+        "prev_amendment_sha256": _canon_sha(previous[-1]) if previous else None,
+        "cases_revision": cases_doc["revision"],
+        "cases_lock_sha256": _sha256(lock_path),
+        "cases_yaml_sha256": _sha256(yaml_path),
+        "required_case_ids": required,
+        "denominator": len(required),
+        "denominator_sha256": denominator_sha256(lock, required),
+    }
+    _validate_attr_update(entry, required, eff["denominator_sha256"])
+    _write_amendments(base_path, previous + [entry])
+    return entry
+
+
+def _apply_fingerprint_update(apath: pathlib.Path, i: int, entry: dict, required: list[str], eff: dict) -> None:
+    """驗證並套用一筆「指紋更新」修訂（OD-52）：分母不變、逐案引用 OD／來源 commit／欄位，舊指紋須等於前一版有效指紋。"""
+    fps = eff.get("case_fingerprints")
+    if not isinstance(fps, dict):
+        raise ValueError(f"{apath} 第 {i} 筆：凍結檔無 case_fingerprints，不得追加指紋更新")
+    if entry.get("removed"):
+        raise ValueError(f"{apath} 第 {i} 筆：指紋更新不得同時移除案例")
+    updates = entry.get("fingerprint_updates")
+    if not isinstance(updates, list) or not updates:
+        raise ValueError(f"{apath} 第 {i} 筆：指紋更新須逐名列出案例")
+    seen: set[str] = set()
+    for u in updates:
+        cid = u.get("case_id")
+        if cid not in required or cid in seen:
+            raise ValueError(f"{apath} 第 {i} 筆：{cid!r} 不在前一版有效分母內或重複")
+        seen.add(cid)
+        if not _OD_RE.match(str(u.get("decision", ""))):
+            raise ValueError(f"{apath} 第 {i} 筆：{cid} 須引用 OD-NN")
+        if not _COMMIT_RE.match(str(u.get("source_commit", ""))):
+            raise ValueError(f"{apath} 第 {i} 筆：{cid} 須記錄來源 commit")
+        fields = u.get("fields")
+        if not isinstance(fields, list) or not fields or not all(isinstance(f, str) and f for f in fields):
+            raise ValueError(f"{apath} 第 {i} 筆：{cid} 須列出變更欄位")
+        old, new = u.get("old_sha256"), u.get("new_sha256")
+        if old != fps.get(cid):
+            raise ValueError(f"{apath} 第 {i} 筆：{cid} 的舊指紋與前一版有效指紋不符（修訂遭改動）")
+        if not _SHA256_RE.match(str(new)) or new == old:
+            raise ValueError(f"{apath} 第 {i} 筆：{cid} 的新指紋無效或未變更")
+    if entry.get("decisions") != sorted({u["decision"] for u in updates}):
+        raise ValueError(f"{apath} 第 {i} 筆：decisions 與逐案 OD 不符")
+    if entry.get("required_case_ids") != required or entry.get("denominator") != len(required):
+        raise ValueError(f"{apath} 第 {i} 筆：指紋更新不得改變有效分母")
+    for u in updates:
+        fps[u["case_id"]] = u["new_sha256"]
+
+
+def _parse_fingerprint_update(token: str) -> dict:
+    parts = token.split(":")
+    if len(parts) != 2 or not parts[0] or not _OD_RE.match(parts[1]):
+        raise ValueError(f"--fingerprint-update 須為 case_id:OD-NN：{token!r}")
+    return {"case_id": parts[0], "decision": parts[1]}
+
+
+def _check_lock_matches_yaml(slice_id: str, lock_path: pathlib.Path, yaml_path: pathlib.Path) -> tuple[dict, dict]:
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    cases_doc = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    revision = cases_doc["revision"]
+    if lock["cases_revision"] != revision:
+        raise ValueError(f"cases.lock.json（{lock['cases_revision']}）與 cases.yaml（{revision}）版本不一致")
+    set_name = f"slice_{slice_id}"
+    recomputed = _load_regen_lock().compute_sets(cases_doc)[set_name]
+    if list(lock["sets"][set_name]) != recomputed:
+        raise ValueError(f"cases.lock.json 的 {set_name} 與 cases.yaml 重算結果不一致（鎖檔可能遭手改或過期）")
+    return lock, cases_doc
+
+
+def _write_amendments(base_path: pathlib.Path, entries: list[dict]) -> None:
     apath = amendments_path(base_path)
-    text = json.dumps(previous + [entry], ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    text = json.dumps(entries, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(dir=apath.parent, prefix=f".{apath.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -260,7 +432,70 @@ def _write_amendment(base_path: pathlib.Path, previous: list[dict], entry: dict)
         os.replace(tmp_name, apath)
     finally:
         pathlib.Path(tmp_name).unlink(missing_ok=True)
-    load_effective_freeze(base_path)
+    load_effective_freeze(base_path)  # 寫後自驗
+
+
+def amend_fingerprints(*, base_path: pathlib.Path, slice_id: str, date: str, updates: list[dict],
+                       source_commit: str, fields: list[str], lock_path: pathlib.Path,
+                       yaml_path: pathlib.Path) -> dict:
+    """追加一筆「指紋更新」修訂（OD-52，見模組說明）；回傳新的修訂紀錄。輸入不一致即 ValueError，不寫檔。"""
+    if not base_path.exists():
+        raise ValueError(f"凍結檔不存在：{base_path}")
+    if not updates:
+        raise ValueError("--amend --fingerprint-update 須逐名列出案例")
+    if not _COMMIT_RE.match(source_commit or ""):
+        raise ValueError(f"--source-commit 須為 7～40 位小寫十六進位 commit：{source_commit!r}")
+    if not fields or not all(fields):
+        raise ValueError("--fingerprint-update 須以 --field 列出被核准變更的欄位")
+    eff = load_effective_freeze(base_path)
+    fps = eff.get("case_fingerprints")
+    if not isinstance(fps, dict):
+        raise ValueError(f"{base_path} 無 case_fingerprints，不得追加指紋更新")
+    lock, cases_doc = _check_lock_matches_yaml(slice_id, lock_path, yaml_path)
+    set_name = f"slice_{slice_id}"
+    if eff["required_case_ids"] != list(lock["sets"][set_name]):
+        raise ValueError(f"有效分母與鎖的 {set_name} 不符（須先以 --defer 核准延後）")
+    by_id = {c["case_id"]: c for c in cases_doc["cases"]}
+    ids = [u["case_id"] for u in updates]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"--fingerprint-update 重複：{ids}")
+    records = []
+    for u in sorted(updates, key=lambda d: d["case_id"]):
+        cid = u["case_id"]
+        if cid not in eff["required_case_ids"] or cid not in by_id:
+            raise ValueError(f"{cid} 不在 {set_name} 的有效分母內")
+        new = case_fingerprint(by_id[cid])
+        if new == fps[cid]:
+            raise ValueError(f"{cid} 的指紋與有效凍結指紋相同，無需更新")
+        records.append({"case_id": cid, "decision": u["decision"], "fields": sorted(set(fields)),
+                        "source_commit": source_commit, "old_sha256": fps[cid], "new_sha256": new})
+    prev = eff["amendments"]
+    required = list(eff["required_case_ids"])
+    entry = {
+        "amendment": len(prev) + 1,
+        "kind": "fingerprint_update",
+        "date": date,
+        "decisions": sorted({r["decision"] for r in records}),
+        "removed": [],
+        "fingerprint_updates": records,
+        "base_freeze_sha256": _sha256(base_path),
+        "prev_amendment_sha256": _canon_sha(prev[-1]) if prev else None,
+        "cases_revision": cases_doc["revision"],
+        "cases_lock_sha256": _sha256(lock_path),
+        "cases_yaml_sha256": _sha256(yaml_path),
+        "required_case_ids": required,
+        "denominator": len(required),
+        "denominator_sha256": denominator_sha256(lock, required),
+    }
+    _write_amendments(base_path, prev + [entry])
+    return entry
+
+
+def _parse_defer(token: str) -> dict:
+    parts = token.split(":")
+    if len(parts) != 3 or not all(parts) or parts[1] not in SLICES or not _OD_RE.match(parts[2]):
+        raise ValueError(f"--defer 須為 case_id:<{'|'.join(SLICES)}>:OD-NN：{token!r}")
+    return {"case_id": parts[0], "to_slice": parts[1], "decision": parts[2]}
 
 
 def amend_freeze(*, base_path: pathlib.Path, slice_id: str, date: str, defers: list[dict],
@@ -269,15 +504,9 @@ def amend_freeze(*, base_path: pathlib.Path, slice_id: str, date: str, defers: l
     if not base_path.exists():
         raise ValueError(f"凍結檔不存在：{base_path}")
     eff = load_effective_freeze(base_path)
-    lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    cases_doc = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    lock, cases_doc = _check_lock_matches_yaml(slice_id, lock_path, yaml_path)
     revision = cases_doc["revision"]
-    if lock["cases_revision"] != revision:
-        raise ValueError(f"cases.lock.json（{lock['cases_revision']}）與 cases.yaml（{revision}）版本不一致")
     set_name = f"slice_{slice_id}"
-    recomputed = _load_regen_lock().compute_sets(cases_doc)[set_name]
-    if list(lock["sets"][set_name]) != recomputed:
-        raise ValueError(f"cases.lock.json 的 {set_name} 與 cases.yaml 重算結果不一致（鎖檔可能遭手改或過期）")
     if not defers:
         raise ValueError("--amend 須以 --defer 逐名列出核准延後的案例")
     lock_set = list(lock["sets"][set_name])
@@ -307,8 +536,13 @@ def amend_freeze(*, base_path: pathlib.Path, slice_id: str, date: str, defers: l
         "denominator": len(required),
         "denominator_sha256": denominator_sha256(lock, required),
     }
-    _write_amendment(base_path, prev, entry)
+    _write_amendments(base_path, prev + [entry])
     return entry
+
+
+def _write_amendment(base_path: pathlib.Path, previous: list[dict], entry: dict) -> None:
+    """沿用原子修訂寫入器追加單筆修訂，並由讀取器自驗修訂鏈。"""
+    _write_amendments(base_path, previous + [entry])
 
 
 def advance_freeze_revision(*, base_path: pathlib.Path, slice_id: str, date: str, decision: str,
@@ -324,8 +558,6 @@ def advance_freeze_revision(*, base_path: pathlib.Path, slice_id: str, date: str
     revision = cases_doc["revision"]
     if lock["cases_revision"] != revision:
         raise ValueError(f"cases.lock.json（{lock['cases_revision']}）與 cases.yaml（{revision}）版本不一致")
-    if revision == eff["cases_revision"]:
-        raise ValueError(f"cases_revision 未前進：仍為 {revision}")
     set_name = f"slice_{slice_id}"
     recomputed = _load_regen_lock().compute_sets(cases_doc)[set_name]
     lock_set = list(lock["sets"][set_name])
@@ -339,11 +571,11 @@ def advance_freeze_revision(*, base_path: pathlib.Path, slice_id: str, date: str
             or denominator_sha != eff["denominator_sha256"]):
         raise ValueError("revision_advance 的現行 lock 分母或分母指紋與前一版不一致")
 
-    prev = eff["amendments"]
+    previous = eff["amendments"]
     entry = {
-        "amendment": len(prev) + 1,
+        "amendment": len(previous) + 1,
         "base_freeze_sha256": _sha256(base_path),
-        "prev_amendment_sha256": _canon_sha(prev[-1]) if prev else None,
+        "prev_amendment_sha256": _canon_sha(previous[-1]) if previous else None,
         "kind": "revision_advance",
         "date": date,
         "decision": decision,
@@ -355,7 +587,7 @@ def advance_freeze_revision(*, base_path: pathlib.Path, slice_id: str, date: str
         "denominator": eff["denominator"],
         "denominator_sha256": eff["denominator_sha256"],
     }
-    _write_amendment(base_path, prev, entry)
+    _write_amendment(base_path, previous, entry)
     return entry
 
 
@@ -370,11 +602,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="輸出路徑（預設 tests/acceptance/breaker/slice_<X>.json）")
     parser.add_argument("--amend", action="store_true",
                         help="不改寫凍結檔，追加擁有者逐名核准的延後修訂（須搭配 --defer）")
+    parser.add_argument("--defer", action="append", default=[], metavar="CASE:TO:OD-NN",
+                        help="--amend：核准延後的案例、目標切片與擁有者裁決編號")
+    parser.add_argument("--fingerprint-update", action="append", default=[], metavar="CASE:OD-NN",
+                        help="--amend：擁有者逐名核准凍結後欄位變更的案例與裁決編號（OD-52 起；不可與 --defer 混用）")
+    parser.add_argument("--attr-update", action="append", default=[], metavar="CASE:FIELD:OLD:NEW:OD-NN",
+                        help="--amend：逐欄核准分母屬性變更；還原 old 後須與前一版分母指紋相同（可重複）")
+    parser.add_argument("--source-commit", default=None, help="--fingerprint-update：引入該欄位變更的 commit")
+    parser.add_argument("--field", action="append", default=[], help="--fingerprint-update：被核准變更的欄位（可重複）")
     parser.add_argument("--revision-advance", action="store_true",
                         help="不改寫凍結檔，追加 cases_revision 前進且分母不變的修訂（須搭配 --decision）")
     parser.add_argument("--decision", default=None, help="--revision-advance：擁有者裁決編號 OD-NN")
-    parser.add_argument("--defer", action="append", default=[], metavar="CASE:TO:OD-NN",
-                        help="--amend：核准延後的案例、目標切片與擁有者裁決編號")
     parser.add_argument("--lock", type=pathlib.Path, default=ACC / "cases.lock.json", help="cases.lock.json 路徑")
     parser.add_argument("--cases", type=pathlib.Path, default=ACC / "cases.yaml", help="cases.yaml 路徑")
     args = parser.parse_args(argv)
@@ -383,8 +621,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.revision_advance:
         try:
-            if args.defer:
-                raise ValueError("--defer 不適用於 --revision-advance")
+            if args.amend or args.defer or args.fingerprint_update or args.source_commit or args.field or args.attr_update:
+                raise ValueError("--revision-advance 不可搭配 --amend／--defer／--fingerprint-update")
             if args.decision is None:
                 raise ValueError("--revision-advance 須提供 --decision OD-NN")
             date = _parse_date(args.date)
@@ -396,10 +634,43 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"[freeze] 已追加修訂 #{entry['amendment']}（{entry['decision']}；denominator={entry['denominator']}）")
         return 0
+    if args.decision is not None:
+        print("[freeze] 輸入錯誤：--decision 只用於 --revision-advance", file=sys.stderr)
+        return 2
+    if args.attr_update:
+        try:
+            if not args.amend or args.defer or args.fingerprint_update or args.source_commit or args.field:
+                raise ValueError("--attr-update 須搭配 --amend，且不可混用其他修訂種類")
+            date = _parse_date(args.date)
+            updates = [_parse_attr_update(t) for t in args.attr_update]
+            base = args.out or BREAKER_DIR / f"slice_{args.slice}.json"
+            entry = amend_attrs(base_path=base, slice_id=args.slice, date=date, updates=updates,
+                                lock_path=args.lock, yaml_path=args.cases)
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"[freeze] 修訂拒絕：{exc}", file=sys.stderr)
+            return 2
+        print(f"[freeze] 已追加屬性更新修訂 #{entry['amendment']}（{', '.join(entry['decisions'])}；denominator={entry['denominator']}）")
+        return 0
+    if args.amend and args.fingerprint_update:
+        try:
+            if args.defer:
+                raise ValueError("--fingerprint-update 不可與 --defer 混用（分兩筆修訂）")
+            date = _parse_date(args.date)
+            updates = [_parse_fingerprint_update(t) for t in args.fingerprint_update]
+            base = args.out or BREAKER_DIR / f"slice_{args.slice}.json"
+            entry = amend_fingerprints(base_path=base, slice_id=args.slice, date=date, updates=updates,
+                                       source_commit=args.source_commit or "", fields=args.field,
+                                       lock_path=args.lock, yaml_path=args.cases)
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"[freeze] 修訂拒絕：{exc}", file=sys.stderr)
+            return 2
+        print(f"[freeze] 已追加指紋更新修訂 #{entry['amendment']}（{', '.join(entry['decisions'])}）")
+        return 0
+    if args.fingerprint_update or args.source_commit or args.field:
+        print("[freeze] 輸入錯誤：--fingerprint-update／--source-commit／--field 只用於 --amend", file=sys.stderr)
+        return 2
     if args.amend:
         try:
-            if args.decision is not None:
-                raise ValueError("--decision 只用於 --revision-advance")
             date = _parse_date(args.date)
             defers = [_parse_defer(t) for t in args.defer]
             base = args.out or BREAKER_DIR / f"slice_{args.slice}.json"
@@ -412,9 +683,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.defer:
         print("[freeze] 輸入錯誤：--defer 只用於 --amend", file=sys.stderr)
-        return 2
-    if args.decision is not None:
-        print("[freeze] 輸入錯誤：--decision 只用於 --revision-advance", file=sys.stderr)
         return 2
 
     try:

@@ -12,6 +12,12 @@ import pytest
 pytestmark = pytest.mark.cap_posix_pty
 
 SCOPE = Path(__file__).resolve().parents[3] / "tests" / "acceptance" / "slice21_scope.yaml"
+# Rust daemon 目前交付的切片（`sw_core::SLICE`）。
+DELIVERED_SLICE = "2.2"
+
+
+def _slice_key(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in str(text).split("."))
 
 
 def _ab_label() -> str:
@@ -32,9 +38,10 @@ def test_deferred_methods(shell_daemon):
     import yaml
 
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
-    deferred = [row["method"] for row in scope["deferred_methods"]]
-    # P7 Task 16（08 §0.6 退役清單）：event.* 移入 served，deferred 隨 yaml 縮小為 console_*／file.*。
-    assert len(deferred) == 5
+    assert len(scope["deferred_methods"]) == 5
+    # P7←P6 合併 D4：console 已交付、event 已移入 served，只檢查晚於 2.2 的 file method。
+    deferred = [row["method"] for row in scope["deferred_methods"] if _slice_key(row["slice"]) > _slice_key(DELIVERED_SLICE)]
+    assert deferred == ["file.push", "file.pull"]
     unsupported = [row["method"] for row in scope["unsupported_catalog_methods"]]
     methods = deferred + unsupported
     seq0 = shell_daemon.sw("wal", "current-seq")["seq"]
