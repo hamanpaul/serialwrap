@@ -1,0 +1,7 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/drain_release_e2e.rs (target/debug/deps/drain_release_e2e-9cace3de62f16a73)
+
+running 1 test
+test drain_receipt_dependency_wait_on_shutdown_within_od64_bound ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.07s

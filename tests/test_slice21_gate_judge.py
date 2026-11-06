@@ -49,6 +49,8 @@ TEST_SECTIONS = {
     "linux_cap_supervisor_runtime": ("linux", "s21_gate:cap_supervisor_runtime"),
     # SPEC-GAP #1（編排者裁決）：py_parity section 以完整 selector 的新集合判定（舊 s21_gate:py_parity 仍由 pytest_full 承擔）
     "py_parity": ("linux", "s21_gate:py_parity_full"),
+    # P5 第 8 輪 SPEC-GAP #1：計畫 06 Task 0b #76～#80 另以 add-only 新集合承擔。
+    "py_parity_76_80": ("linux", "s21_gate:py_parity_76_80"),
 }
 CAP_OF = {"linux_cap_sys_admin": "sys_admin", "linux_cap_windows_native": "windows_native",
           "linux_cap_interactive_desktop": "interactive_desktop", "linux_cap_supervisor_runtime": "supervisor_runtime"}
@@ -57,7 +59,7 @@ CORE_NODEIDS = ["cargo:sw-core::wal::a", "cargo:sw-core::wal::b", "cargo:sw-core
 GATE_NODEIDS = {  # 每個 gate 集合的凍結 nodeid（測試用，兩個一組）
     name: [f"tests/test_{name}.py::test_{i}" for i in ("alpha", "beta")]
     for name in ("linux_cap_posix_pty", "windows_cap_windows_com", "blackbox_python", "blackbox_rust",
-                 "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity")
+                 "existing_suites_rust", "pytest_full", *CAP_OF, "py_parity", "py_parity_76_80")
 }
 
 
@@ -772,11 +774,40 @@ def test_py_parity_full_has_complete_selector_and_keeps_old_set():
     assert full["selector"]["argv"][-len(paths):] == paths
 
 
+def test_py_parity_76_80_has_additive_plan_scope():
+    """第 8 輪 #76～#80 另立集合；保留被其他 slice 承擔的兩組既有排除案例。"""
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    added = lock["sets"]["s21_gate:py_parity_76_80"]["linux"]
+    ids = added["nodeids"]
+    selector = added["selector"]
+    assert ids and len(ids) == len(set(ids))
+    assert set(ids) == set(selector["paths"])
+    assert selector["argv"][-len(ids):] == ids
+    required_files = {
+        "tests/test_holder_probe_namespace.py", "tests/test_p1oc_drain_stalled.py",
+        "tests/test_p1oc_sc35_state.py", "tests/test_p1oc_sc35_commands.py",
+        "tests/test_p1oc_sc34_last_error.py", "tests/test_p1oc_socket_perm.py",
+        "tests/test_p1oc_pt_quiet_oracle.py", "tests/test_p1oc_catalog.py", "tests/test_p1oc_docs.py",
+        "tests/test_daemon_lock.py", "tests/test_contracts_gap_codes.py",
+        "tests/test_stage0_bridge_drain.py", "tests/test_serial_port.py", "tests/test_wal.py",
+        "tests/test_stage0_platform_mgmt.py", "tests/test_codex_fixes.py",
+        "tests/test_daemon_service_selector.py",
+    }
+    assert required_files == {node.split("::", 1)[0] for node in ids}
+    assert not any("TestUartBridgeHeldPathsNamespace" in node for node in ids)
+    assert not any("test_file_push_pull_passthrough_rejected" in node for node in ids)
+    assert "tests/test_contracts_gap_codes.py::TestGapPosixLock::test_socket_unavailable_lock" in ids
+    assert "tests/test_stage0_bridge_drain.py::test_eagain_writer_is_cancelled_by_drain" in ids
+    assert "tests/test_serial_port.py::TestPosixSerialPortRoundtrip::test_set_baud_runs" in ids
+    assert "tests/test_wal.py::TestWalWindowsDirFsync::test_reset_on_posix_still_fsyncs_directory" in ids
+
+
 def test_gate_script_runs_capability_and_py_parity_sections():
     text = (ROOT / "scripts/rust/slice21_gate.sh").read_text(encoding="utf-8")
-    for name in (*CAP_OF, "py_parity"):
+    for name in (*CAP_OF, "py_parity", "py_parity_76_80"):
         assert f"record {name} " in text, name                  # dry-run／拒絕開跑分支
     assert text.count("record py_parity ") >= 2                 # ＋實跑分支
+    assert text.count("record py_parity_76_80 ") >= 2
     # 實跑分支：四個能力逐一探測，具備才 --caps <cap> 實跑，並把探測結果記入 section
     assert "for cap in sys_admin windows_native interactive_desktop supervisor_runtime; do" in text
     # 第 7 輪（OD-53 推導）：--caps 由 caps_args 依鎖 selector 推導，不再手寫 `--caps "$cap"`
@@ -820,6 +851,11 @@ def test_real_lock_s21_sets_caps_derivable_and_gate_plan():
     assert plan == {"caps": ["posix_pty"], "argv": ["-p", "sw-pal", "--features", "test-fakes"], "caps_only": False}, plan
     for cap in ("sys_admin", "windows_native", "interactive_desktop", "supervisor_runtime"):
         plan = j.caps_plan(f"linux_cap_{cap}", exp, lock)
+        if cap in ("windows_native", "interactive_desktop"):
+            # OD-68 核准移除這兩個 Linux-only 集合；沒有 selector 時 gate 不可建立執行計畫。
+            assert f"s21_gate:cap_{cap}" not in lock["sets"]
+            assert plan is None, plan
+            continue
         assert plan == {"caps": [cap], "argv": lock["sets"][f"s21_gate:cap_{cap}"]["linux"]["selector"]["argv"],
                         "caps_only": True}, plan
 
@@ -832,6 +868,27 @@ def test_underivable_caps_selector_is_evidence_missing(case):
     out = _judge_mod().judge(case.report(), exp)
     sec = _sec(out, "linux_cap_posix_pty")
     assert sec["status"] == "EVIDENCE_MISSING" and any("OD-53" in r for r in sec["reasons"]), sec["reasons"]
+
+
+@pytest.mark.parametrize("cap", ["windows_native", "interactive_desktop"])
+def test_od68_removed_linux_capability_set_is_evidence_missing(case, cap):
+    """OD-68 移除 Linux-only lock 集合後，對應 gate section 必須明確保持 EVIDENCE_MISSING。"""
+    set_id = f"s21_gate:cap_{cap}"
+    expect = case.expect()
+    expect["lock"]["sets"].pop(set_id)
+    out = _judge_mod().judge(case.report(), expect)
+    section = _sec(out, f"linux_cap_{cap}")
+    assert section["status"] == "EVIDENCE_MISSING"
+    assert section["l1_verdict"]["verdict"] == "INSUFFICIENT"
+    assert any(set_id in reason and "不在 l1_required.lock.json" in reason for reason in section["reasons"])
+
+    # OD-68 的承擔項仍須有 Windows 原生證據；未原生收集時不可因 Linux 列已移除而完成。
+    report = case.report()
+    windows_section = next(item for item in report["sections"] if item["name"] == "windows_native_l1")
+    windows_section["l1_results"] = None
+    windows_out = _judge_mod().judge(report, case.expect())
+    assert _sec(windows_out, "windows_native_l1")["status"] == "EVIDENCE_MISSING"
+    assert windows_out["verdict"] == "INCOMPLETE"
 
 
 def test_gate_script_derives_caps_from_lock():

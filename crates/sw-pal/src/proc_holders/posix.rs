@@ -5,7 +5,7 @@
 //! 不以 readlink 字串或 devpts `st_rdev` 判定——跨 mount namespace（docker 容器）的同名 `/dev/pts/N`
 //! 字串相同、rdev 亦同，卻非同一 tty。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -86,9 +86,14 @@ pub fn same_tty(fd: &TtyStat, tty: &TtyStat) -> bool {
     tty.rdev != 0 && fd.rdev == tty.rdev && !is_devpts_major(tty.rdev)
 }
 
-/// 掃描 `proc_root/<pid>/fd/*`，排除自身 PID，並以 inode 身分判斷 holder（真實檔案系統）。
+/// 掃描 `proc_root/<pid>/fd/*`，排除自身行程樹，並以 inode 身分判斷 holder（真實檔案系統）。
 pub fn probe_holders_in(proc_root: &Path, path: &str) -> HolderReport {
-    probe_holders_with(&RealHolderFs, proc_root, path, Some(std::process::id()))
+    probe_holders_excluding(
+        &RealHolderFs,
+        proc_root,
+        path,
+        &process_tree_pids(proc_root, std::process::id()),
+    )
 }
 
 /// `probe_holders` 的可注入版本（Python `serial_port.probe_holders(real_path, proc_root=, exclude_pid=)`）。
@@ -97,6 +102,16 @@ pub fn probe_holders_with(
     proc_root: &Path,
     path: &str,
     exclude_pid: Option<u32>,
+) -> HolderReport {
+    let excluded = exclude_pid.into_iter().collect::<BTreeSet<_>>();
+    probe_holders_excluding(fs, proc_root, path, &excluded)
+}
+
+fn probe_holders_excluding(
+    fs: &dyn HolderFs,
+    proc_root: &Path,
+    path: &str,
+    excluded_pids: &BTreeSet<u32>,
 ) -> HolderReport {
     // 無法取得目標 tty 身分時不得推論為「無 holder」（serial_port.py：target stat 失敗即回 unknown）。
     let target = match fs.stat(Path::new(path)) {
@@ -122,7 +137,7 @@ pub fn probe_holders_with(
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        if exclude_pid == Some(pid) {
+        if excluded_pids.contains(&pid) {
             continue;
         }
         let fd_dir: PathBuf = proc_root.join(&name).join("fd");
@@ -163,6 +178,51 @@ pub fn probe_holders_with(
     }
 
     report(pids, status)
+}
+
+/// 取得 root PID 與其 `/proc` 可見的所有後代。正式 holder 掃描排除自身行程樹，
+/// 避免 daemon 在 fork→exec 窗口 spawn 的 sysenv／process_tunnel 子行程被誤認為外部 holder。
+fn process_tree_pids(proc_root: &Path, root_pid: u32) -> BTreeSet<u32> {
+    let mut children_by_parent = BTreeMap::<u32, Vec<u32>>::new();
+    if let Ok(entries) = fs::read_dir(proc_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            if let Some(ppid) = parse_parent_pid(&stat) {
+                children_by_parent.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+
+    let mut tree = BTreeSet::from([root_pid]);
+    let mut frontier = VecDeque::from([root_pid]);
+    while let Some(parent) = frontier.pop_front() {
+        if let Some(children) = children_by_parent.get(&parent) {
+            for &child in children {
+                if tree.insert(child) {
+                    frontier.push_back(child);
+                }
+            }
+        }
+    }
+    tree
+}
+
+/// `/proc/<pid>/stat` 的 comm 可包含空白與右括號；以最後一個 `)` 後的欄位解析 state、PPID。
+fn parse_parent_pid(stat: &str) -> Option<u32> {
+    let fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    fields.skip(1).next()?.parse().ok()
 }
 
 /// `HolderReport(pids, not pids and status != "ok", status)`（serial_port.py `probe_holders` 尾段）。

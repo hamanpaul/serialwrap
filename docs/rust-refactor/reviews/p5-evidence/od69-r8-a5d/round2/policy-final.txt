@@ -1,0 +1,153 @@
+# Policy Check Report
+
+Engine: policy-check 1.0.19 (installed package)
+
+- pass: 25
+- fail: 0
+- warn: 2
+- skip (exempt): 0
+
+### README
+
+## :white_check_mark: R-01 — pass
+README.md exists and satisfies minimum length.
+
+## :white_check_mark: R-02 — pass
+README has all required sections: ['Install', 'Usage', 'Version']
+
+### CHANGELOG
+
+## :white_check_mark: R-03 — pass
+CHANGELOG.md exists at repository root.
+
+## :white_check_mark: R-04 — pass
+CHANGELOG.md includes the # Changelog header.
+
+## :white_check_mark: R-09 — pass
+No code path files changed.
+
+### VERSION
+
+## :white_check_mark: R-05 — pass
+VERSION exists at repository root.
+
+## :white_check_mark: R-06 — pass
+VERSION format is valid: 0.3.2
+
+## :white_check_mark: R-07 — pass
+VERSION (0.3.2) matches latest tag (v0.3.2).
+
+### CONFIG
+
+## :white_check_mark: R-08 — pass
+.project-policy.yml schema is valid for R-08.
+
+### PR
+
+## :white_check_mark: R-10 — pass
+No PR title provided; treat as non-PR context.
+
+## :white_check_mark: R-11 — pass
+No PR body provided; treat as non-PR context.
+
+## :white_check_mark: R-12 — pass
+Missing PR base/head ref; treat as non-PR context.
+
+## :white_check_mark: R-17 — pass
+No PR body provided; treat as non-PR context.
+
+### AGENT
+
+## :white_check_mark: R-13 — pass
+all agent convention files present
+
+## :white_check_mark: R-14 — pass
+agent files aligned to policy_version 1.0.19
+
+### WORKFLOW
+
+## :white_check_mark: R-15 — pass
+All workflow uses refs are pinned with tag or SHA.
+
+## :white_check_mark: R-20 — pass
+All workflow policy_version declarations match 1.0.19.
+
+## :white_check_mark: R-23 — pass
+engine pin aligned to policy_version 1.0.19
+
+### MARKER-SYNC
+
+## :white_check_mark: R-16 — pass
+All 5 CLI help markers are in sync.
+
+## :white_check_mark: R-26 — pass
+All 4 generated-fact marker(s) are in sync.
+
+### CI
+
+## :warning: R-19 — warn
+R-19 detected a test gate that may be bypassed or was not parsed reliably.
+
+<details><summary>detail</summary>
+
+```
+- architecture-html.yml:native-html/step[3] 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- release.yml:publish/Install test + build dependencies 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- rust.yml:rust-linux/安裝 Python 相依（PyYAML、pytest、jsonschema） 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:pytest/安裝測試相依（預設安裝，不含 [redos] extra） 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:bridge-tools/安裝 bridge 測試相依與 socat 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:bridge-tools-windows/安裝 bridge 測試相依（含 Windows pyserial） 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:pytest-windows/安裝免驅動 Windows L1 相依 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+- tests.yml:windows-com-selfhosted/安裝相依與 bridge 工具 僅命中註解或安裝行，未確認實際測試執行；下一版將轉 FAIL。
+```
+
+</details>
+
+### SECRET
+
+## :white_check_mark: R-21 — pass
+No R-21 confidentiality hits under tier='shareable', visibility='unknown'.
+
+### DOC-ALIGN
+
+## :white_check_mark: R-18 — pass
+No code path files changed.
+
+## :warning: R-22 — warn
+docs contain 2953 pre-existing dangling reference(s) (advisory).
+
+<details><summary>detail</summary>
+
+```
+README.md -> ~/.config/serialwrap/config.yaml
+README.md -> ~/.local/state/serialwrap/state.json
+README.md -> config.yml
+README.md -> ~/.config/serialwrap/config.yaml
+README.md -> benches.yaml
+README.md -> ~/.config/serialwrap/benches.yaml
+README.md -> config.yaml
+README.md -> config.yaml
+README.md -> bench-issue.sh
+README.md -> config.yml
+README.md -> bench-enroll.sh
+README.md -> benches.yaml
+README.md -> install-journal.json
+README.md -> install-journal.legacy.json
+README.md -> config.yaml
+README.md -> config.yaml
+README.md -> regression/serialwrap_regression/testbed.yaml
+README.md -> minicom_router.sh
+README.md -> minicom_router.sh
+README.md -> ~/.config/serialwrap/config.yaml
+```
+
+</details>
+
+## :white_check_mark: R-24 — pass
+No moc declared; R-24 not applicable.
+
+## :white_check_mark: R-25 — pass
+No doc_coverage declared (not applicable).
+
+## :white_check_mark: R-27 — pass
+130 code(s) across 2 namespace(s) documented.

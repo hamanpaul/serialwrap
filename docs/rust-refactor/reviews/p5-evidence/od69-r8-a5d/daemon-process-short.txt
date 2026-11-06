@@ -1,0 +1,39 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/daemon_process.rs (target/debug/deps/daemon_process-7832ed3b7ec94059)
+
+running 33 tests
+test allowlist_rejected_before_runtime_dirs_and_lock ... ok
+test backend_env_checked_where_python_selects_it ... ok
+test bare_double_dash_is_unrecognized_exit_2 ... ok
+test allowlist_rejected_reasons_exact ... ok
+test unknown_arg_exit_2_usage ... ok
+test backend_env_invalid_exit_1 ... ok
+test uncaught_panic_exit_1 ... ok
+test no_args_uses_env_paths ... ok
+test no_profiles_message_and_continue ... ok
+test shutdown_wal_sync_failure_exits_1 ... ok
+test handler_panic_does_not_kill_daemon ... ok
+test second_daemon_same_lock_exits_2_with_stderr ... ok
+test unreadable_config_env_allowlist_wins ... ok
+test endpoint_written_after_bind ... ok
+test unreadable_config_non_isolated_unchanged ... ok
+test unwritable_state_dir_startup_save_exits_1_before_attach ... ok
+test unreadable_state_json_exits_3_and_releases_lock ... ok
+test unreadable_config_isolated_fail_closed ... ok
+test serialwrap_config_env_read_and_write_target ... ok
+test allowlist_env_overrides_config ... ok
+test sigterm_graceful_exit_0_and_flushes_queue ... ok
+test wal_dir_readonly_at_start_blocks_login_probe ... ok
+test startup_order_scan_rank_watch ... ok
+test shutdown_with_stalled_drain_exits_1_with_diagnostic ... ok
+test shutdown_releases_tty_before_exit ... ok
+test non_root_holder_scan_permission_does_not_block_open ... ok
+test wal_fault_after_ready_splits_agent_and_auto_tx ... ok
+test real_sigterm_to_started_daemon_exits_0_after_flush ... ok
+test daemon_stop_during_force_recover_with_client_gone ... ok
+test daemon_stop_from_second_connection_during_force_recover ... ok
+test release_kill_hook_env_isolated_only ... ok
+test sigterm_sigint_orderly_stop ... ok
+test release_pause_hook_env_isolated_only ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.81s

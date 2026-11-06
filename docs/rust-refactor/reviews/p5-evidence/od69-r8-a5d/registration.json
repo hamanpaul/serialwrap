@@ -1,0 +1,16 @@
+{
+  "collected": 1820,
+  "ignored": 29,
+  "collection_sha256": "c565ce5a9f8e734df6d72bbd9b932c98363f80a56dc30f25a42963ffebd3b2f1",
+  "registration_sha256": "8fc9e26761a6f0da7831b4a68c86b6faec5c91ec698011ec9f4400ffec5d922e",
+  "selection": "實際收集交集（既有 s21_core.linux nodeids 聯集本項三列）；所有舊列均存在；不登記其他子項節點。",
+  "before": 1739,
+  "after": 1742,
+  "added": [
+    "cargo:sw-core::drain_release_e2e::new_bridge_receipt_ignores_old_epoch_rx_progress",
+    "cargo:sw-core::drain_release_e2e::release_receipt_follows_queued_rx_capture_and_wal",
+    "cargo:sw-core::drain_release_e2e::shutdown_receipt_follows_queued_rx_capture_and_wal"
+  ],
+  "removed": [],
+  "selectors_changed": false
+}

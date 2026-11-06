@@ -423,3 +423,234 @@ gate 逐 section 判定見 `docs/rust-refactor/reviews/p5-t22-gate-run.md`。
 | F215 | Medium | P5-54dd588-1：`lock_conformance_suite_survives_concurrent_spawns` 在共用行程內連續 spawn，放大同檔 `stale_socket_is_unlinked_then_acquired`（bind→drop）與 `socket_probe_eacces_is_socket_unavailable` 的 fork→exec 時窗（整檔 4/300） | 已於 `8d824b3`（F213）依確切修法的做法一處理：壓力測試改在重入自身的單執行緒子行程（`S21_SPAWN_STRESS_CHILD`）執行，spawner 執行緒只存在於子行程；conformance 公開 `bind_stale_unix_socket`（只 bind 不 listen），`stale_socket_is_unlinked_then_acquired` 改用之；EACCES 斷言一律於子行程執行。驗證：lock 執行檔整檔連跑次數與結果見第 7 輪回報 |
 | F216 | Medium | P5-54dd588-2：能力 section 的收集器命令先跑預設 run，root 下 sw-pal 有 3 支預設測試必紅（`holder_scan_permission` 等）→ `linux_cap_sys_admin` 具備能力時亦必 FAIL，無 PASS 路徑；凍結 selector 只選能力列，與實際命令不一致 | fixed（本組 commit）：`cargo_l1_results.py` 新增 `--caps-only`（須搭配 `--caps`）：略過預設 run，只跑 `--ignored cap_<cap>__ --test-threads=1`，不含所選能力的執行檔不執行，其餘收集列記 deselected（結果與收集一致；必要集合含這些列即 deselected required、不得 PASS）；報告 argv 為呼叫端交付的鎖 selector argv。judge `caps_plan` 新增 `caps_only`（每個必要集合的 selector 都只選 ignored 能力列才為 true），gate 依此帶 `--caps-only`（四個能力 section 為 true；`linux_cap_posix_pty` 的必要集合含預設列，為 false）。`CAPABILITY_SECTIONS.how_to_run`、runbook 單獨執行命令與 expect 命令文字改帶 `--caps-only`。審查附帶指出的 `linux_cap_posix_pty` 以 root 執行同樣必紅：gate 的 F108 降權抽成 `nonroot_cmd`，`linux_l1` 與 `linux_cap_posix_pty` 共用（euid 0 時以 `SW_GATE_L1_USER` 經 setpriv 降權，無法降權即不執行、記 EVIDENCE_MISSING），judge `NON_ROOT_SECTIONS` 加入 `linux_cap_posix_pty`。紅燈：`test_caps_only_skips_default_run_and_deselects_other_rows`、`test_caps_only_target_without_selected_cap_is_not_run`、`test_caps_only_requires_caps`、`test_caps_plan_caps_only_when_every_set_selects_only_ignored_caps`、`test_linux_cap_posix_pty_run_as_root_is_evidence_missing`、`test_capability_how_to_run_uses_caps_only`、`test_gate_script_capability_sections_caps_only_and_posix_pty_non_root`；失敗情境以 `test_caps_without_caps_only_runs_default_tests_and_fails` 固定。**oracle 變更揭露**：`test_real_lock_s21_sets_caps_derivable_and_gate_plan` 的計畫等式加 `caps_only` 欄（擴充，原 caps／argv 不變）；夾具 `linux_cap_posix_pty` 加 `run_euid: 1000`。附帶：假 libtest 改由自身記錄參數（`argv.log`）、Windows `.cmd` 對齊 POSIX 語意（`--ignored` 非 `--list` 時為能力 run），`test_capability_runs_are_single_threaded` 移除 `os.name == "nt"` 的平台條件 SKIP（本檔為 core_portable，不得有平台條件 SKIP；Windows 實跑屬 LOCAL-WINDOWS-TODO） |
 | — | Low | P5-54dd588-3～6 | 不修（收斂規則） |
+
+
+### 第八輪子項 P5-r8-a5d（2026-11-03）：OD-69 整體驗收
+
+起點 `9d8e31bc` 已有 `200c10fd` 的 barrier 接線；依編排者「只做整體驗收」維持產品、mailbox 依賴排空順序與 event_latency 凍結契約不變。actor 在同步 `rx_chunk`／capture 與效果 dispatch 完成後才更新 `(epoch, rx_seq)`，finisher 等該 epoch 的 barrier ack 後送 receipt；bridge／RxShared 採既有正確接線，沒有新增第二套完成介面。
+
+- 補齊 release、shutdown、新 bridge／舊 epoch 隔離各 20 輪；每輪八個標記先完成 agent log／WAL，release 的 background capture 亦保留全部標記。無依賴 N_pre＝0、receipt 後 data ≤1、無逾時／證據缺口。保留原 OD-64 兩支依賴 gate 各 20 輪與 flood 四段各 20 輪的所有前提及斷言，只加逐輪輸出。
+- 起點原 release 與兩支 OD-64 對照逐支重跑皆綠；沒有虛構起點紅燈。隔離 archive 變異略過 barrier 時三條 OD-69 路徑均轉紅（保留原失敗斷言）；正常產品 `drain_release_e2e` 15 passed、mailbox 22 passed、sw-core 560 passed、workspace 1790 passed／4 ignored／26 filtered。
+- workspace 最初 23 支 daemon_process 因隔離 socket 路徑過長失敗；在 866 個 build／test／contract blob 與起點相同的 archive 重現完全相同集合。以本 worktree 根目錄作 TMPDIR 後同組 33 passed、workspace 重跑通過；沒有修改產品或放寬測試。完整失敗 id、建置隔離失誤與作廢結果均留存。
+- regen_lock add-only 登記三列（s21_core.linux 1739 → 1742，無移除／改 selector）。Windows cross-check、cfg 邊界、契約（0 findings）、政策（25 pass／0 fail／2 warn）及本輪基準鎖檢查通過。對 8c0c942 的無核准參數原命令仍為 FAIL（三列已核准 OD-68 移除）；逐名帶既有 OD-68 核准參數後通過，未修改該裁決或鎖分母。
+
+完整 file:line 接線核對、前審 28 條 High／Medium 的 already fixed／裁決延後處置、命令／HEAD／exit code／逐輪原始輸出及 SPEC-GAPS：[OD-69 驗收證據](p5-evidence/od69-r8-a5d/README.md)。未跑全套 pytest、slice gate、Docker 或出口 driver（依專項編排者註另派）；Windows 原生／能力證據未取得，owner／硬體項仍 BLOCKED-OWNER。不宣稱 T22、Slice 2.1 出口、push／PR／merge 或部署完成。
+
+### P5-r8-a5d 第 2 輪（2026-11-03）：起點 3bf93828 的當前驗收
+
+前審 A 段八項（Medium 1／3／4／5／7／8、High 2／6）逐項核對均為 already fixed `25ad3900`；B 段 NO FINDINGS，無本輪需要修正的 High／Medium，沒有不成立主張。保留既有產品接線與測試，沒有新增 nodeid、改凍結契約、改鎖或修其他子項。
+
+- 當前 drain 15 passed、mailbox 22 passed、sw-core 560 passed；OD-69 三路徑各 20 輪（N_pre=0、見證數≤1、480 標記全部先入 capture／WAL、無缺口），OD-64 兩條各 20 輪（N_pre=backlog、見證數=backlog+1、OpFinished 先於 receipt），flood 四段各 20 輪全綠。
+- workspace `--features test-fakes --no-fail-fast` 為 1791 passed／0 failed／29 ignored；預設 `--no-fail-fast` 為 1161 passed／0 failed／29 ignored；兩者皆 0 filtered，未執行 ignored 能力列。Windows cross-check、cfg 與契約通過，政策 25 pass／0 fail／2 warn；未取得 Windows 原生／能力證據。
+- 鎖結構與相對本輪起點檢查通過。相對 `8c0c942` 的原命令仍 exit 1（三筆 OD-68 列），逐名帶既有核准參數後 exit 0；與起點鎖及 regen 程式無差異，並非本輪新失敗。原 FAIL 與核准對照均保留。
+- 全套 pytest **未執行**：`tests/conftest.py:31`～`:41` 在 collection 前讀 production state／WAL／config 並探測 live daemon，與本輪明示嚴格邊界衝突。沒有改 guard 或以隔離變數假稱免探測，也沒有把缺測記成 PASS；Python 產品及測試均未改。Windows／硬體及出口 driver 亦未執行，owner／硬體項維持 BLOCKED-OWNER。
+
+逐項 file:line、當前命令／HEAD／exit code／摘要與 SHA-256、180 輪輸出、原失敗 id 與 SPEC-GAPS：[第 2 輪驗收](p5-evidence/od69-r8-a5d/round2/README.md)。本輪交付僅為 OD-69 局部驗收紀錄，不宣稱 T22、Slice 2.1 出口、push／PR／merge 或部署完成。
+
+### 第八輪子項 P5-r8-d4c（2026-11-03）：holder 重掃接線與整體驗收
+
+起點為 `12de01a8f9f3ff3cec9bd1d75c8ec78c2f3ba0c8`、分支 `feature/rust-refactor-p5`，起始工作樹乾淨。裁決依 `origin/docs/parity-amendments` 的 `reviews/rulings/p5.md:16,40`：attach 權限不足維持 Python 相容；鎖後重掃排除 daemon 自身行程樹，同時保留外部 holder 阻斷。最新前審 `p5-cloud/3bf93828_12de01a8-sol.md:3-18` 的 A 段八項均已修於 `25ad3900`，B 段 `NO FINDINGS`；沒有待處理 High／Medium，也沒有不成立主張。
+
+#### 正式接線核對
+
+| 核對點 | 結果 |
+|---|---|
+| 正式平台組裝 | `crates/sw-pal/src/lib.rs:201-205` 的 `native().serial` 使用 `PosixSerialBackend::new()`，`native().uart_excl` 使用 `PosixUartExclusive`。 |
+| POSIX serial constructor／鎖後掃描 | `crates/sw-pal/src/serial/posix.rs:25-31` 的 constructor 注入 `PosixUartExclusive`；`:308-345` 顯示開啟序列為 open → flock → TIOCEXCL → 鎖後重掃 → termios，外部 holder 被拒絕；`:486-490` 呼叫正式 scanner 並保存原始結果。 |
+| attach 委派 | `crates/sw-core/src/session_manager.rs:1014-1028` 的 `gated_open()` 通過 gate 後呼叫 `self.serial.open_exclusive()`，未繞過正式 serial backend；manager 未重構。 |
+| 自身行程樹與外部衝突契約 | `crates/sw-pal/src/proc_holders/posix.rs:89-96,183-219` 由正式 scanner 排除目前 PID 的後代。`contracts/behavior_changes.yaml:116,278` 仍要求鎖後重掃、拒絕已識別外部 holder、零 TX。以上檔案相對起點均無差異。 |
+
+#### 回歸、鎖與先紅證據
+
+- brief 指定的 `crates/sw-pal/tests/attach_spawn.rs` 與 `cap_posix_pty__native_attach_spawn_wiring` 在起點不存在；初始指定命令退出 101：`no test target named attach_spawn`。既有 `serial_posix.rs:296-372` 有 fork 暫停替身回歸，並以 `with_uart_exclusive` 測 scanner；它不鎖住 `native().serial` 的正式 constructor 接線。起點已有產品修正，故沒有宣稱目前起點的產品回歸轉紅。
+- 曾在限定測試檔建立一支暫存的 native constructor 回歸，直接呼叫 `native().uart_excl` 與 `native().serial.open_exclusive()`；修正該測試自身的 Rust move 編譯錯誤後，測試實跑 `1 passed`。此測試未保留，也未做 20 輪，因為正式鎖程序無法 add-only 登記此新增 `#[ignore]` 能力列：`regen_lock.py:544` 對所有新增列扣除 `ignored`。以實際 collector nodeid 配對現有 `s21_gate:cap_posix_pty.linux` 後，21 列全為 ignored，regen 命令回報「無新增 nodeid」，鎖檔不變。沒有手改鎖、改 selector、改 judge 或使用 `--allow-removal`。
+- 有一次把全 workspace 收集清單誤用於能力集合 regen，造成 regen 暫時新增 1,791 列；立即只還原該次自己產生的鎖檔差異至乾淨起點。最終 `l1_required.lock.json` 相對 `12de01a8` 無差異，`regen_lock.py --check` 與 `--check --base 12de01a` 均通過。此錯誤輸入不作驗收證據。
+- `regen_lock.py --check --base 8c0c942` 保留 FAIL，列出三筆既有消失列（`cap_interactive_desktop` 一筆、`cap_windows_native` 兩筆）；沒有以舊基準上的移除替代本輪 add-only 核對，也未使用 `--allow-removal`。
+
+#### 本輪命令結果
+
+| 命令 | 結果 |
+|---|---|
+| `cargo test -p sw-pal --features test-fakes` | exit 0：354 passed、0 failed、24 ignored。 |
+| `cargo test -p sw-pal --features test-fakes --test serial_posix cap_posix_pty__own_child_inherited_tty_is_not_foreign_holder -- --ignored --exact --test-threads=1 --nocapture` | exit 0：1 passed；輸出 `status=permission` 警告，開埠相容路徑通過。 |
+| `cargo test -p sw-pal --features test-fakes -- --ignored cap_posix_pty__ --test-threads=1` | exit 101：PAL unit 能力列 4 passed；`serial_posix` 9 passed、1 failed。失敗 `cap_posix_pty__external_plain_open_before_daemon_is_held`（`serial_posix.rs:79`）實際得到 `Ok` 而非預期 `Held`；該替身 holder 是 test runner 的子行程，現行 scanner 會排除整個 runner 行程樹。未改斷言或把 FAIL 改成 PASS。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 101；`sw-daemon::daemon_process` 有 31 passed、2 failed：`sigterm_graceful_exit_0_and_flushes_queue`（shutdown event 少一筆 session）及 `wal_dir_readonly_at_start_blocks_login_probe`（30 秒未觀察到 `write_failed`）。執行時 HEAD 仍是起點；兩支 source/test 與起點逐檔相同，依本 brief 列為起點既有失敗。 |
+| `cargo test --workspace` | exit 0，預設 workspace 執行完成，無 failed nodeid。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；sw-pal 有 3 個既有 unused／dead_code warnings；這不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base 12de01a` | 均 exit 0；鎖結構與起點比對通過。 |
+| `python3 tests/acceptance/regen_lock.py --check --base 8c0c942` | exit 1；上述三筆較舊基準列仍列為 FAIL，無豁免。 |
+| `python3 -m pytest -q tests/` | 未執行。`tests/conftest.py:32-41` 會讀 live state/WAL/config 並探測 daemon；`tests/liveguard.py:71-115` 會呼叫 systemd 與 live `session.list` RPC。這會碰觸嚴格禁區中的 production daemon/config/state，故未執行、未停用 guard，也未宣稱 PASS。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow 解析警告、R-22 既有懸空文件引用）。 |
+
+#### SPEC-GAPS
+
+1. 缺少指定的 `attach_spawn` 回歸 target；新能力測試是 ignored PTY nodeid，但既有 `regen_lock.py` add-only 將 ignored 列扣除，無法在不改 generator／不用非正式輸入的前提下登記到凍結能力集合。需擁有者裁決如何允許能力集合新增 ignored nodeid；目前維持 `BLOCKED-OWNER`，不擴改凍結鎖工具或 judge。
+2. 全套 pytest 與嚴格 production 不接觸規則衝突，缺少可在不讀取 live 設定／狀態、不探測 daemon 下執行完整 suite 的核准程序；本輪維持未執行。
+
+#### 既有碼待辦
+
+- `serial_posix.rs::cap_posix_pty__external_plain_open_before_daemon_is_held` 的直接子行程替身與「排除自身整個行程樹」語意衝突，當前能力集合因此有真實 FAIL；需另在允許範圍內用不屬於 scanner root 後代的外部 holder harness 重新驗證，不得放寬 `Held` 斷言。
+- 起點 `12de01a8` 已重現 workspace `daemon_process` 的上述兩項失敗；本輪未修改其 source/test，不以重跑結果改寫狀態。
+
+本輪沒有保留程式碼、測試或鎖檔變更；未使用其他 worktree、production daemon/config/state、實體序列埠、com0com、Docker 或出口 driver。驗收未完成，不宣稱 P5-r8-d4c 通過。
+
+REMAINING: owner 裁決 ignored PTY nodeid 的正式 add-only 登記方式；建立並登記 `cap_posix_pty__native_attach_spawn_wiring` 後執行指定 20 輪；解決或按起點證據追蹤三個 Rust 測試失敗（capability 1 項、workspace 2 項）；在不觸碰 production 資源的核准條件下補全 pytest。
+
+### P5-r8-d4c 第 2 輪（2026-11-03）：起點 d1b41822 的接線與整體驗收
+
+起點為 `d1b41822783cee2f261eb39fc3823aca384d7ad4`，分支 `feature/rust-refactor-p5`，工作樹乾淨。`12de01a8..d1b41822` 在 Rust source、測試、L1 鎖與鎖生成器皆無差異；`d1b41822` 僅新增本報告。依編排者註，本輪只核對本 brief 範圍，不跑全套 pytest、slice gate、Docker 或出口 driver。
+
+#### 前審 High／Medium 處理
+
+前審 A-1～A-8 的 2 項 High 與 6 項 Medium 已在 `25ad3900` 修正；本輪未發現新增 High／Medium，也沒有不成立主張。B 段為 `NO FINDINGS`。處理項目為 interactive lease 的 `cmd_id` 傳遞、manager actor 非阻塞工作佇列、alias actor profile 同步、startup save 錯誤回報、argparse 裸 `--` 相容、WAL unhealthy fence 註冊、capture eviction owner 精確路由，以及 slice21 judge 重載 parity 輸入；逐項回歸與前審說明沿用前一節已存證據。
+
+#### 正式接線核對
+
+| 核對點 | 結果 |
+|---|---|
+| `native()` 組裝 | `crates/sw-pal/src/lib.rs:204-205` 分別以 `PosixSerialBackend::new()` 與 `PosixUartExclusive` 組裝 serial 和 holder scanner。 |
+| 正式 constructor／鎖後重掃 | `crates/sw-pal/src/serial/posix.rs:27-31` constructor 使用 `PosixUartExclusive`；`:308-345` 維持 open → flock → TIOCEXCL → 重掃 → termios，已識別 holder 回 `Held`；`:486-490` 鎖後掃描使用 `self.excl.probe_holders()` 並保存結果。 |
+| attach 委派 | `crates/sw-core/src/session_manager.rs:1014-1028` 的 `gated_open()` 通過有效性 gate 後呼叫 `self.serial.open_exclusive()`；manager 未重構。 |
+| 自身行程樹與外部衝突 | `crates/sw-pal/src/proc_holders/posix.rs:89-96,183-219` 的正式 scanner 排除目前 PID 的後代。`contracts/behavior_changes.yaml:116,278` 仍要求鎖後重掃、拒絕已識別外部 holder 與零 TX；attach 權限不足維持 Python 相容語意（`origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/p5.md:16,40`）。 |
+
+#### 回歸與鎖檔
+
+- 指定命令 `cargo test -p sw-pal --features test-fakes --test attach_spawn -- --ignored --test-threads=1` 實跑 exit 101：`sw-pal` 沒有 `attach_spawn` target。`crates/sw-pal/tests/attach_spawn.rs` 與 `cap_posix_pty__native_attach_spawn_wiring` 在起點均不存在。
+- 本輪未新增替身回歸。現有 `s21_gate:cap_posix_pty.linux` selector 明確含 `--ignored cap_posix_pty__`；但 `tests/acceptance/regen_lock.py:544` 對既有集合的 add-only 差集會扣除所有 ignored nodeid。故新的 PTY 回歸不能依目前工具登記到凍結能力集合。此矛盾超出本 brief 允許的測試檔／鎖檔修改方式，需 owner 補充裁決或擴定生成器的允許變更範圍；維持 `BLOCKED-OWNER`，未手改鎖、未改 selector、未改 generator，也未使用 `--allow-removal`。
+- `cargo test -p sw-pal --features test-fakes -- --ignored cap_posix_pty__ --test-threads=1` exit 101：PAL unit 能力列 4 passed；`serial_posix` 9 passed、1 failed。唯一失敗為 `cap_posix_pty__external_plain_open_before_daemon_is_held`，`crates/sw-pal/tests/serial_posix.rs:70-80` 的 holder 是 test runner 子行程；scanner 排除自身行程樹後沒有可識別 PID，回 `Ok`。此 FAIL 在起點 d1b41822 重現，未改斷言、未把 FAIL 轉 PASS；它與本輪缺少的 attach＋spawn 正式接線回歸分開記錄。
+- 本輪沒有新增 nodeid 或鎖檔變更。`regen_lock.py --check` 與 `--check --base d1b41822` 均 exit 0；`--check --base 8c0c942` exit 1，僅列出既有 OD-68 核准移除的 3 個 Linux 能力列：`cap_interactive_desktop` 1 筆、`cap_windows_native` 2 筆。此舊基準差異不是本輪刪列，未用豁免掩蓋。
+- 指定 20 輪未執行：其 nodeid 尚不存在，不能把其他測試替代為此回歸或宣稱命中兩條 spawn 暫停點。
+
+#### 本輪測試與 gate
+
+| 命令 | 結果 |
+|---|---|
+| `cargo test -p sw-pal --features test-fakes` | exit 0；所有已執行 test target 通過，ignored 能力列未計 PASS。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0；workspace 已選取測試全部通過，0 failed。`daemon_process` 33 passed、0 failed；前輪曾紅的 `sigterm_graceful_exit_0_and_flushes_queue` 與 `wal_dir_readonly_at_start_blocks_login_probe` 本輪均通過，故不列為本輪失敗。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；sw-pal 有 3 個 unused／dead_code warning；僅為 cross-check，不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base d1b41822` | 均 exit 0；鎖結構與本輪起點一致。 |
+| `python3 tests/acceptance/regen_lock.py --check --base 8c0c942` | exit 1；只列上述 3 筆既有 OD-68 核准移除，未變更鎖檔。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow test-gate 解析、R-22 既有懸空文件引用）。 |
+| `python3 -m pytest -q tests/` | 未執行，依本輪編排者註。另 `tests/conftest.py:32-41` 會在 env 隔離前讀取 live state/WAL/config 並探測 daemon，與本訊息嚴格 production 禁區衝突；沒有停用 guard 或宣稱 PASS。未修改 Python source/test，因此沒有觸及的 Python 測試。 |
+
+#### SPEC-GAPS 與既有碼待辦
+
+1. `regen_lock.py:544` 排除 ignored nodeid 與 P5 能力集合要求登記 ignored PTY 回歸不相容。需要 owner 補充正式 add-only 登記方式或明確擴大生成器修改範圍；在此之前無法交付並鎖定指定 `attach_spawn` 測試，20 輪驗收維持 `BLOCKED-OWNER`。
+2. `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍有上述真實 FAIL；需由允許範圍另以 test runner 行程樹以外的 holder harness 驗證，保持 `Held` 斷言。
+3. 全套 pytest、Windows 原生執行與硬體實測未執行；不宣稱其證據或 Slice 2.1／P5 出口通過。
+
+本輪僅完成文件證據更新，未修改 production code、測試、鎖檔或 Python 檔案；未碰 production daemon/config/state、實體序列埠、com0com、Docker、其他 worktree 或 checkout。P5-r8-d4c 尚未完成。
+
+REMAINING: owner 裁決／範圍授權解決 ignored PTY nodeid 的 add-only 登記；新增並登記正式 `attach_spawn` 回歸後，實跑指定 20 輪；修正或以允許範圍處理 `cap_posix_pty__external_plain_open_before_daemon_is_held` 的真實失敗。
+
+### P5-r8-d5e 第 1 輪（2026-11-03）：attach／spawn 接線與整體驗收
+
+起點為 `1ef9a637a32f2f2e3c43b360dfd3aa0dab83096a`，分支 `feature/rust-refactor-p5`。本輪未修改 production code、Python 測試或鎖檔；驗收輸出與逐輪記錄存於 `p5-evidence/p5-r8-d5e-native-attach-spawn/`。
+
+#### 前審 High／Medium 處理
+
+最新前審 `p5-cloud/a68d042d_1ef9a637-sol.md` 的 A-1～A-8 均為 already fixed `25ad3900`；B 段 `NO FINDINGS`。本輪沒有待修 High／Medium，也沒有不成立主張。此處只核對前審處置，未重做其程式審查。
+
+#### 正式接線核對
+
+| 核對點 | 結果 |
+|---|---|
+| `native()` 組裝 | `crates/sw-pal/src/lib.rs:202-205` 仍組裝正式 `NativeProcessTunnel`、`PosixSerialBackend` 與 `PosixUartExclusive`。 |
+| 鎖後 holder 重掃 | `crates/sw-pal/src/serial/posix.rs:308-345,486-490` 仍於 TIOCEXCL 後、termios 前呼叫正式 scanner；已識別外部 holder 仍拒絕開埠。 |
+| attach 委派 | `crates/sw-core/src/session_manager.rs:1014-1028` 的 `gated_open()` 仍委派至 `self.serial.open_exclusive()`。 |
+| 外部 holder 與零 TX 契約 | `contracts/behavior_changes.yaml:116,278` 的外部 holder 阻斷及零 TX 條件不變。 |
+
+#### 能力集合登記
+
+- 起點鎖檔已包含兩個完整 nodeid：`cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_sysenv` 與 `cargo:sw-pal::serial_posix::cap_posix_pty__native_attach_spawn_process_tunnel`，都只出現在 `s21_gate:cap_posix_pty.linux`（`tests/acceptance/l1_required.lock.json:11170-11171`）。一般及其他能力集合均不含這兩列。
+- 實際收集命令：`python3 scripts/rust/cargo_l1_results.py --platform linux --list-only --caps posix_pty --out docs/rust-refactor/reviews/p5-evidence/p5-r8-d5e-native-attach-spawn/cargo-l1-raw.json`。原始報告為 1,193 collected／31 ignored；依最後一段 `cap_posix_pty__` 同步篩選 collected 與 ignored 後為 22／22。原始與篩選報告分別保留為 `cargo-l1-raw.json`、`cargo-l1-cap-posix-pty-filtered.json`，兩個指定 nodeid 都在兩份篩選結果中。
+- 指定 `python3 tests/acceptance/regen_lock.py --l1-add-only --set s21_gate:cap_posix_pty --platform linux --collect docs/rust-refactor/reviews/p5-evidence/p5-r8-d5e-native-attach-spawn/cargo-l1-cap-posix-pty-filtered.json` exit 0，回報「無新增 nodeid，鎖檔未變更」。selector 未變；`--check --base 38525fc8` 與 `--check --base 1ef9a637` 均 exit 0。
+- 因兩列在起點已存在，沒有製造刪列來讓新哨兵先紅；本輪也未新增 `test_native_attach_spawn_regressions_registered_in_cap_set`，因此不宣稱該 Python 哨兵有紅／綠證據。後續狀態列於 SPEC-GAPS。
+
+#### 20 輪回歸
+
+命令依 brief 原樣逐輪執行並保留完整輸出：
+
+```bash
+cargo test -p sw-pal --features test-fakes --test serial_posix cap_posix_pty__native_attach_spawn_ -- --ignored --test-threads=1 --nocapture
+```
+
+20／20 輪皆恰有兩支指定測試 passed，每輪 2 passed、0 failed、0 ignored、15 filtered；累計 40 passed，沒有 `EVIDENCE_MISSING`。逐輪輸出為 `native-attach-spawn-20-rounds.txt`。兩種繼承見證都有斷言且 20 輪均通過：sysenv 子行程在暫停點仍存活，`/proc/<pid>/fd` 中存在與 PTY slave 相同 device／inode 的 fd（`serial_posix.rs:355-385,450`）；process_tunnel 先確認 fd 非 CLOEXEC，再核對子行程同編號 fd 指向相同 inode（`:491-506,551-555,580-582`）。測試只使用自行建立的 PTY，沒有開啟真實序列埠。每輪有 `status=permission` holder 警告；它沒有使測試跳過，兩支測試的開埠與零 TX 斷言均通過。
+
+#### 驗收命令與結果
+
+| 命令 | 結果 |
+|---|---|
+| `cargo test -p sw-pal --features test-fakes` | exit 0：355 passed、0 failed、26 ignored。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0：1,791 passed、0 failed、4 ignored。 |
+| `cargo test --workspace` | exit 0：1,162 passed、0 failed、31 ignored。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；3 個既有 sw-pal unused／dead-code warnings，僅為 cross-check，不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規輸出。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check --base 38525fc8`、`--check --base 1ef9a637` | 均 exit 0；結構及起點比對通過，無移除。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow gate 解析、R-22 文件懸空引用）。 |
+| `python3 -m pytest -q tests/test_l1_judge.py`、`python3 -m pytest -q tests/` | 未執行。`tests/conftest.py:32-41` 在測試隔離前讀 live state／WAL／config 並呼叫 daemon 快照；`tests/liveguard.py:71-115` 會查 systemd 並對候選 live socket 發 `session.list` RPC。這違反本輪「絕不碰 production daemon/config/state」的硬限制；未停用 guard，也沒有宣稱 pytest 通過。 |
+
+#### SPEC-GAPS
+
+1. `test_native_attach_spawn_regressions_registered_in_cap_set` 尚未新增，故不能依實際 pytest 收集輸出把新 Python nodeid add-only 登記至 `s1_pytest_full.linux` 與 `s21_gate:pytest_full.linux`。本輪未執行 pytest 或 collection，因為 conftest 的 live snapshot／daemon probe 會觸及明文禁止的 production 資源；需要擁有者指定可用的隔離驗收方式，或明確解除此唯讀探測限制。此項維持 `BLOCKED-OWNER`。
+2. 起點前已存在的 `cap_posix_pty__external_plain_open_before_daemon_is_held` 拓撲問題依 `origin/docs/parity-amendments:docs/rust-refactor/reviews/rulings/p5.md:48` 由 d3d 承擔；本輪沒有執行該案例、改其拓撲／斷言或把它計入本輪通過數。
+
+#### 既有碼待辦
+
+- `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍依上述裁決由 d3d 處理；本輪不接手。
+- 沒有其他由本輪實際執行命令觀察到的失敗 nodeid。
+
+本輪未完成 Python 哨兵與 Python pytest gates；因此不宣稱 P5-r8-d5e 或 P5 出口全綠，也沒有執行 slice gate、出口證據 driver、Docker、push、PR、部署或實體 UART 操作。
+
+REMAINING: 新增並以 pytest 驗證 `test_native_attach_spawn_regressions_registered_in_cap_set`，依實際收集結果 add-only 登記 Python nodeid；在不觸碰 production daemon/config/state 的方式下完成 `tests/test_l1_judge.py` 與全套 pytest。
+
+### P5-r8-d5e 第 2 輪（2026-11-03）：能力集合哨兵與 Python 鎖列
+
+起點為 `49f572812d56c1af1482a51b5097c60a0ef64912`，分支 `feature/rust-refactor-p5`。僅修改 `tests/test_l1_judge.py`、`tests/acceptance/l1_required.lock.json` 與本回覆文件；未改 production code、合約、selector 或既有 Rust 案例。
+
+#### 前審 High／Medium
+
+- 前審 A-1～A-8 依上一輪審查報告均為 already fixed `25ad3900`；B 段為 `NO FINDINGS`。本輪沒有新的 High／Medium 或不成立主張。
+
+#### 哨兵、收集與鎖檔
+
+- 新增 `test_native_attach_spawn_regressions_registered_in_cap_set`，標記 `memory_only`。它要求 `native_attach_spawn_sysenv` 與 `native_attach_spawn_process_tunnel` 的完整 cargo nodeid 位於 `s21_gate:cap_posix_pty.linux`，且不重複出現在任何其他集合。
+- 49f57281 起點鎖檔已含兩個 Rust nodeid，且只在上述能力集合；因此 brief 預期的真實「先紅」條件不存在。本輪沒有手動移除凍結列或偽造紅燈。新增哨兵直接 pytest 實跑為 `1 passed`。
+- 兩個既有 pytest selector 的 `--collect-only -q tests/` 實際收集均為 5,867 個唯一 nodeid；新哨兵各收集一次，`s1_pytest_full.linux` 原有 15 列、`s21_gate:pytest_full.linux` 原有 5,534 列均在報告中。為保留既有必要集合分母，將各 selector 的實際收集報告與其既有必要列相交，再把完整舊列及新 nodeid 交給 add-only generator。
+- `regen_lock.py --l1-add-only` 分別更新 `s1_pytest_full.linux` 與 `s21_gate:pytest_full.linux`：各新增 1 列、移除 0 列；selector 未變。Rust 能力集合未改動。無 production code 變更，故不需 changelog fragment。
+
+#### 第 1 輪證據沿用
+
+- 正式接線核對仍見 `crates/sw-pal/src/lib.rs:202-205` 組裝 native tunnel、serial backend 與 scanner；`crates/sw-pal/src/serial/posix.rs:308-345,486-490` 在 TIOCEXCL 後、termios 前執行正式 scanner；`crates/sw-core/src/session_manager.rs:1014-1028` 的 attach 委派到 serial backend；`contracts/behavior_changes.yaml:116,278` 的外部 holder 阻斷與零 TX 契約不變。
+- 指定兩條 native attach/spawn 回歸上一輪已逐輪跑 20/20：每輪恰為 2 passed、0 failed、0 ignored，累計 40 passed。完整輸出仍在 `p5-evidence/p5-r8-d5e-native-attach-spawn/native-attach-spawn-20-rounds.txt`；原始與能力篩選收集分別在同目錄 `cargo-l1-raw.json`、`cargo-l1-cap-posix-pty-filtered.json`。本輪沒有重跑這 20 輪。
+
+#### 驗收
+
+| 命令 | 結果 |
+|---|---|
+| `python3 -m pytest -q tests/test_l1_judge.py::test_native_attach_spawn_regressions_registered_in_cap_set` | exit 0：1 passed；live guard 使用工作樹隔離 XDG 與私有不可連線 bus，daemon 維度為 SKIP，未連 production daemon。 |
+| `python3 -m pytest -q tests/test_l1_judge.py` | exit 1：36 passed、3 failed。三個失敗均為起點既存的 `test_l1_lock_frozen_set_excludes_capability_gated`、`test_l1_lock_cargo_sets_exclude_ignored_tests`、`test_s21_core_linux_capability_rows_moved_to_cap_sets_od55`；前兩者仍指出 `s21_core.windows` 的 13 個 ignored 能力列，第三者斷言 22、實際計得 24。49f57281 的斷言／Rust lock 列與本輪相同；本輪 diff 只新增哨兵與兩個 Python nodeid，未改失敗點。 |
+| `python3 -m pytest -q tests/` | exit 1：5,684 passed、158 skipped、1 xfailed、24 failed、98 subtests passed、14 warnings，53:16。首次隔離命令另有 19 個環境設定造成的失敗（daemon 被指向 `.py` shebang、隔離 HOME 未指定 Rustup/Cargo home）；以正確來源 daemon 預設與 `RUSTUP_HOME`／`CARGO_HOME` 重跑相關案例為 `20 passed`。其餘 5 個為上述 3 個起點失敗，以及 P4 evidence 缺失 2 個案例，詳見 SPEC-GAPS。故本命令不記 PASS。 |
+| `cargo test -p sw-pal --features test-fakes` | exit 0：355 passed、0 failed、26 ignored。 |
+| `cargo test --workspace --features test-fakes -- --skip cap_` | exit 0：1,791 passed、0 failed、4 ignored、28 filtered。 |
+| `cargo test --workspace` | exit 0：1,162 passed、0 failed、31 ignored。 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0；3 個 sw-pal unused/dead-code warnings；不是 Windows 原生執行證據。 |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0，無違規。 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、`findings=[]`。 |
+| `python3 tests/acceptance/regen_lock.py --check`、`--check --base 38525fc8` | 均 exit 0；結構與既有起點比對通過。 |
+| `python3 -m policy_check --repo .` | exit 0：25 pass、0 fail、2 warn（R-19 workflow test gate 解析、R-22 既有懸空文件引用）。 |
+
+#### SPEC-GAPS 與既有碼待辦
+
+1. `tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native` 找不到 `target/p4-evidence/l1/windows/cargo/resource-report.json`；`tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence` 回報 28 項 P4 evidence 缺檔。依本輪明令未執行出口證據 driver，未生成或偽造這些文件；兩項保持 evidence-incomplete，不能計 PASS。
+2. 三個 `tests/test_l1_judge.py` 失敗如上，在起點 49f57281 已存在；本輪不改 judge、硬編碼斷言、Windows 能力列或 gate 分母。
+3. `cap_posix_pty__external_plain_open_before_daemon_is_held` 仍由 d3d 依最新 ruling 承擔；本輪未執行、接手或改斷言。
+
+本輪沒有操作 production daemon/config/state、`/dev/ttyUSB*`、真實序列埠、com0com、Docker container、其他 worktree 或 checkout；全套 pytest 使用臨時 Docker stub，Docker 能力仍以 SKIP 計。未跑出口證據 driver、slice gate、部署、push 或 PR。
+
+REMAINING: Windows 原生 L1／P4 evidence artifacts 尚缺且依本 brief 不執行 evidence driver；三個起點既存的 L1 judge 測試失敗待其所屬治理處理；external_plain_open_before_daemon_is_held 由 d3d 承擔。

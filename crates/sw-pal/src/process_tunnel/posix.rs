@@ -33,6 +33,8 @@ impl ProcessTunnel for NativeProcessTunnel {
             .map_err(posix_io_error)?;
         let error = output.try_clone().map_err(posix_io_error)?;
         let fd_limit = max_open_fd().map_err(posix_io_error)?;
+        #[cfg(feature = "test-fakes")]
+        let spawn_pause = crate::conformance::take_sysenv_spawn_pause();
 
         let mut command = Command::new(program);
         command
@@ -40,11 +42,62 @@ impl ProcessTunnel for NativeProcessTunnel {
             .stdin(Stdio::null())
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(error));
-        // SAFETY: 在 exec 前只建立新 session 並關閉額外 fd；不讀寫 Rust heap 或取得任何鎖。
+        // SAFETY: 暫停設定在 parent 取得；fork 後只以 libc 操作原始 fd／純量，
+        // 建立 session、等待測試放行並標記額外 fd；不讀環境、不配置記憶體或取得 Rust 鎖。
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
+                }
+                #[cfg(feature = "test-fakes")]
+                if let Some(pause) = spawn_pause {
+                    let mut failure = 0;
+                    // 只關閉子行程繼承的 parent 管線端點，保留通知與 release 讀端。
+                    let _ = libc::close(pause.notify_read_fd);
+                    let _ = libc::close(pause.release_write_fd);
+                    let _ = libc::close(pause.release_keepalive_fd);
+
+                    let child_pid = libc::getpid();
+                    let written = libc::write(
+                        pause.notify_write_fd,
+                        std::ptr::addr_of!(child_pid).cast(),
+                        std::mem::size_of::<libc::pid_t>(),
+                    );
+                    if written != std::mem::size_of::<libc::pid_t>() as libc::ssize_t {
+                        failure = libc::EIO;
+                    }
+
+                    if failure == 0 {
+                        let mut descriptor = libc::pollfd {
+                            fd: pause.release_read_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let ready = libc::poll(&mut descriptor, 1, pause.child_timeout_ms);
+                        if ready == 0 {
+                            failure = libc::ETIMEDOUT;
+                        } else if ready < 0 || descriptor.revents & libc::POLLIN == 0 {
+                            failure = libc::EIO;
+                        }
+                    }
+
+                    if failure == 0 {
+                        let mut release = 0u8;
+                        let read = libc::read(
+                            pause.release_read_fd,
+                            std::ptr::addr_of_mut!(release).cast(),
+                            std::mem::size_of_val(&release),
+                        );
+                        if read != 1 || release != 1 {
+                            failure = libc::ECANCELED;
+                        }
+                    }
+
+                    let _ = libc::close(pause.notify_write_fd);
+                    let _ = libc::close(pause.release_read_fd);
+                    if failure != 0 {
+                        return Err(io::Error::from_raw_os_error(failure));
+                    }
                 }
                 close_extra_fds(fd_limit)
             });

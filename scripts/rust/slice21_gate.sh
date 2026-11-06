@@ -452,6 +452,17 @@ else
   record py_parity --required-set s21_gate:py_parity_full --reason "l1_required.lock.json 無 s21_gate:py_parity_full.linux selector"
 fi
 
+# 10c. 計畫 06 Task 0b #76～#80 Python 基線 parity（P5 第 8 輪 SPEC-GAP #1）：獨立 add-only 集合，保留兩個既有 py_parity 集合。
+mapfile -t pyp_76_80_argv < <(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["sets"]["s21_gate:py_parity_76_80"]["linux"]["selector"]["argv"]))' \
+  tests/acceptance/l1_required.lock.json 2>/dev/null || true)
+if [[ "${#pyp_76_80_argv[@]}" -gt 0 ]]; then
+  pytest_l1 py_parity_76_80 py_parity_76_80 -- "${pyp_76_80_argv[@]}"
+  record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --command "pytest <s21_gate:py_parity_76_80 selector.argv>" \
+    --exit "$LAST_RC" --log logs/py_parity_76_80.log --l1-results py_parity_76_80/l1-results.json
+else
+  record py_parity_76_80 --required-set s21_gate:py_parity_76_80 --reason "l1_required.lock.json 無 s21_gate:py_parity_76_80.linux selector"
+fi
+
 # 11. 全套 pytest（s21_gate:pytest_full＋s21_gate:py_parity）
 pytest_l1 pytest_full pytest_full -- -q tests/
 record pytest_full --required-set s21_gate:pytest_full --command "SW_RESOURCE_REPORT=… python3 -m pytest -q tests/" \

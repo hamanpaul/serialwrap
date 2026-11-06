@@ -41,6 +41,7 @@ parity:
 #   互動桌面／systemd 監管執行期；P5 第 6 輪 SPEC-GAP #2（編排者裁決）起各有一個 section（linux_cap_<cap>），gate 先探測能力，
 #   具備才以 --caps <cap> 實跑，否則記 EVIDENCE_MISSING 並標所需能力（sys_admin／supervisor_runtime → BLOCKED-OWNER＋實跑方式；
 #   windows_native／interactive_desktop → LOCAL-WINDOWS-TODO），不得記 PASS（judge CAPABILITY_SECTIONS）。
+# OD-68：核准移除 cap_windows_native／cap_interactive_desktop 的 Linux lock 列；在補齊原生 Windows selector 前，兩個 Linux section 因必要集合缺失維持 EVIDENCE_MISSING。
 # SPEC-GAP #1（編排者裁決）：s21_gate:py_parity（凍結，selector 只有 1 筆）不改不刪、仍由 pytest_full 承擔；新集合
 #   s21_gate:py_parity_full（完整 selector＝舊集合全部 nodeid）由 py_parity section 以其 selector 實跑。
 #   s21_core.windows 的能力列待 Windows 原生收集登記 s21_gate:cap_<cap>.windows 後才移除（LOCAL-WINDOWS-TODO）。
@@ -79,6 +80,8 @@ sections:
   - {name: case_uptake, kind: non_test, required_set: null, command: "slice_breaker.acceptance_rate（Task 0b）"}
   - {name: py_parity, kind: test, platform: linux, required_set: "s21_gate:py_parity_full",
      command: "SW_RESOURCE_REPORT=<run>/py_parity/l1-results.json python3 -m pytest <s21_gate:py_parity_full selector.argv>"}
+  - {name: py_parity_76_80, kind: test, platform: linux, required_set: "s21_gate:py_parity_76_80",
+     command: "SW_RESOURCE_REPORT=<run>/py_parity_76_80/l1-results.json python3 -m pytest <s21_gate:py_parity_76_80 selector.argv>"}
   - {name: pytest_full, kind: test, platform: linux, required_set: "s21_gate:pytest_full",
      command: "SW_RESOURCE_REPORT=<run>/pytest_full/resource-report.json python3 -m pytest -q tests/ --junitxml=<run>/pytest_full/junit.xml"}
   - {name: policy_check, kind: non_test, required_set: null, command: "python3 -m policy_check --repo ."}

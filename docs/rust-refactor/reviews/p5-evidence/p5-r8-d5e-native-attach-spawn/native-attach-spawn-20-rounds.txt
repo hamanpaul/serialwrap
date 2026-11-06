@@ -1,0 +1,239 @@
+ROUND=01
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.52s
+
+ROUND=02
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=03
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.52s
+
+ROUND=04
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=05
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.52s
+
+ROUND=06
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.54s
+
+ROUND=07
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=08
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.54s
+
+ROUND=09
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.52s
+
+ROUND=10
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.54s
+
+ROUND=11
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=12
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=13
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=14
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.54s
+
+ROUND=15
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.54s
+
+ROUND=16
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.53s
+
+ROUND=17
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.52s
+
+ROUND=18
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.49s
+
+ROUND=19
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.48s
+
+ROUND=20
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/serial_posix.rs (target/debug/deps/serial_posix-4a1a30735e8765d7)
+
+running 2 tests
+test cap_posix_pty__native_attach_spawn_process_tunnel ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+test cap_posix_pty__native_attach_spawn_sysenv ... serialwrap: 無法確認 /dev/pts/9 的外部 holder（status=permission），BC-04 僅保證 serialwrap 實例互斥
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.49s

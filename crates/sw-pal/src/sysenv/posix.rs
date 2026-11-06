@@ -234,6 +234,85 @@ fn run_bytes(
             .env_clear()
             .envs(env.iter().map(|(key, value)| (key, value)));
     }
+    #[cfg(all(unix, feature = "test-fakes"))]
+    if let Some(pause) = crate::conformance::take_sysenv_spawn_pause() {
+        use std::os::unix::process::CommandExt;
+
+        let notify_read_fd = pause.notify_read_fd;
+        let notify_write_fd = pause.notify_write_fd;
+        let release_read_fd = pause.release_read_fd;
+        let release_write_fd = pause.release_write_fd;
+        let release_keepalive_fd = pause.release_keepalive_fd;
+        let child_timeout_ms = pause.child_timeout_ms;
+        let pre_exec = move || {
+            let mut failure = 0;
+            // SAFETY: these descriptors are inherited pipe ends owned by the parent side.
+            unsafe {
+                let _ = libc::close(notify_read_fd);
+                let _ = libc::close(release_write_fd);
+                let _ = libc::close(release_keepalive_fd);
+            }
+
+            // SAFETY: getpid has no pointer arguments or process-local lock requirements.
+            let child_pid = unsafe { libc::getpid() };
+            // SAFETY: child_pid is a live scalar and the notification fd is a pipe.
+            let written = unsafe {
+                libc::write(
+                    notify_write_fd,
+                    std::ptr::addr_of!(child_pid).cast(),
+                    std::mem::size_of::<libc::pid_t>(),
+                )
+            };
+            if written != std::mem::size_of::<libc::pid_t>() as libc::ssize_t {
+                failure = libc::EIO;
+            }
+
+            if failure == 0 {
+                let mut descriptor = libc::pollfd {
+                    fd: release_read_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: descriptor is a valid single pollfd; timeout is bounded at setup.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, child_timeout_ms) };
+                if ready == 0 {
+                    failure = libc::ETIMEDOUT;
+                } else if ready < 0 || descriptor.revents & libc::POLLIN == 0 {
+                    failure = libc::EIO;
+                }
+            }
+
+            if failure == 0 {
+                let mut release = 0u8;
+                // SAFETY: release points to writable storage and the pipe is readable after poll.
+                let read = unsafe {
+                    libc::read(
+                        release_read_fd,
+                        std::ptr::addr_of_mut!(release).cast(),
+                        std::mem::size_of_val(&release),
+                    )
+                };
+                if read != 1 || release != 1 {
+                    failure = libc::ECANCELED;
+                }
+            }
+
+            // SAFETY: these are the child-side endpoints inherited for this one spawn.
+            unsafe {
+                let _ = libc::close(notify_write_fd);
+                let _ = libc::close(release_read_fd);
+            }
+            if failure == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(failure))
+            }
+        };
+        // SAFETY: pre_exec only performs async-signal-safe libc operations using raw fds/scalars.
+        unsafe {
+            command.pre_exec(pre_exec);
+        }
+    }
     match capture_command(command, timeout).map_err(|error| posix_spawn_error(error, program))? {
         CapturedOutput::TimedOut => Ok((-1, Vec::new(), crate::traits::RUN_TIMEOUT_STDERR.as_bytes().to_vec())),
         CapturedOutput::Exited {

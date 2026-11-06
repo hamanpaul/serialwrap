@@ -6,9 +6,9 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, bounded};
 use sw_pal::traits::{
     CancelToken, Clock, CloseToken, PalError, PalErrorKind, ReadError, ReadOutcome, SerialHandle,
     SerialReader, SerialWriter,
@@ -348,6 +348,7 @@ pub struct ReaderExit {
     pub reader: Box<dyn SerialReader>,
     pub sentinel: Option<Box<dyn ConsoleIo>>,
     pub error: Option<PalError>,
+    /// 最後一筆成功排入 mailbox data lane 的 RX watermark。
     pub rx_seq: u64,
     pub unrecorded: Vec<EvidenceGap>,
 }
@@ -390,6 +391,7 @@ fn spawn_reader_inner(
         .spawn(move || {
             let mut sentinel = ctx.sentinel;
             let mut rx_seq = 0u64;
+            let mut queued_rx_seq = 0u64;
             let mut buf = [0u8; 8192];
             let mut error = None;
             let mut unrecorded = Vec::new();
@@ -475,7 +477,7 @@ fn spawn_reader_inner(
                         }));
                         match should_stop {
                             Ok(true) => break,
-                            Ok(false) => {}
+                            Ok(false) => queued_rx_seq = rx_seq,
                             Err(_) => warn_rx_handler_panic(&ctx.com, warning_sink.as_ref()),
                         }
                     }
@@ -509,7 +511,7 @@ fn spawn_reader_inner(
                 reader,
                 sentinel,
                 error,
-                rx_seq,
+                rx_seq: queued_rx_seq,
                 unrecorded,
             }
         })
@@ -642,7 +644,7 @@ impl IoWorker {
         }
     }
 
-    /// thread：join writer（取 TxLedger）→ join reader → close → `WorkerStopped`。
+    /// thread：join writer（取 TxLedger）→ join reader → close → 等 RX dispatch barrier → `WorkerStopped`。
     pub fn finish_async(self, stop_id: StopId, control: Sender<ControlEvent>) {
         self.begin_stop();
         let Self {
@@ -662,19 +664,19 @@ impl IoWorker {
             .spawn(move || {
                 let writer_result = writer.join();
                 let reader_result = reader.join();
-                let (ledger, reader_exit, close_receipt) = match (writer_result, reader_result) {
+                let (ledger, reader_exit, reader_rx_seq, close_receipt) = match (writer_result, reader_result) {
                     (Ok((writer, ledger)), Ok(reader_exit)) => {
                         let ReaderExit {
                             reader,
                             sentinel,
                             error: _,
-                            rx_seq: _,
+                            rx_seq,
                             unrecorded,
                         } = reader_exit;
                         drop(sentinel);
                         drop(sentinel_keepalive);
                         let close_receipt = close.close(reader, writer);
-                        (ledger, Some(unrecorded), Some(close_receipt))
+                        (ledger, Some(unrecorded), Some(rx_seq), Some(close_receipt))
                     }
                     _ => {
                         let error = PalError::plain(
@@ -702,6 +704,16 @@ impl IoWorker {
                 for entry in ledger.ops.values() {
                     unrecorded.extend(entry.wal_gaps.iter().cloned());
                 }
+                if let Some(rx_seq) = reader_rx_seq.filter(|rx_seq| *rx_seq > 0) {
+                    if let Err(error) = wait_for_rx_dispatch(&control, epoch, rx_seq) {
+                        unrecorded.push(EvidenceGap {
+                            op_id: None,
+                            dir: "RX",
+                            len: 0,
+                            error,
+                        });
+                    }
+                }
                 let close_receipt = close_receipt.expect("成功 join 後必有 close receipt");
                 let health = wal.health();
                 let wal_error = (!health.healthy).then(|| {
@@ -724,5 +736,43 @@ impl IoWorker {
                 let _ = control.send(ControlEvent::WorkerStopped(receipt));
             })
             .expect("建立 UART drain finisher thread");
+    }
+}
+
+/// 等 actor 排空 reader 已成功排入 data lane 的同 epoch RX；到期後保留 receipt 並回報排序證據缺口。
+fn wait_for_rx_dispatch(
+    safety: &Sender<ControlEvent>,
+    epoch: u64,
+    rx_seq: u64,
+) -> Result<(), PalError> {
+    let (reply, ack) = bounded(1);
+    let expired = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + Duration::from_millis(crate::resources::DRAIN_TIMEOUT_MS);
+    if let Err(error) = safety
+        .send_timeout(
+            ControlEvent::DrainDataBarrier {
+                epoch,
+                rx_seq,
+                reply,
+                expired: expired.clone(),
+            },
+            deadline.saturating_duration_since(Instant::now()),
+        )
+    {
+        expired.store(true, Ordering::Release);
+        return Err(PalError::plain(
+            PalErrorKind::Io,
+            format!("RX drain barrier 未能送入 actor：{error:?}"),
+        ));
+    }
+    match ack.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            expired.store(true, Ordering::Release);
+            Err(PalError::plain(
+                PalErrorKind::Io,
+                format!("RX drain barrier 等待逾時，capture 順序未確認：{error}"),
+            ))
+        }
     }
 }
