@@ -17,7 +17,7 @@ jobs:
       policy_engine_ref: 2dcf2f815afeddc477c1cacc33df9beb06ae14fb
 
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # 與 tests.yml 的 pytest job 相同；ubuntu-latest 沒有釘死的 3.12.3
     needs: project-policy
 
     steps:
@@ -29,7 +29,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.3"
 
       - name: Verify tag matches VERSION
         env:
@@ -43,15 +43,16 @@ jobs:
           echo "release tag ${TAG_NAME} matches VERSION ${file_version}"
 
       - name: Install test + build dependencies
-        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial jsonschema==4.10.3 build
+        run: python3 -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 pyserial==3.5 jsonschema==4.10.3 setuptools wheel build "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
 
       - name: Run test suite (default install, no re2 -> fail-closed)
-        run: python3 -m pytest -q tests/
+        # 環境與 deselect 必須跟 tests.yml 的 pytest job 一致；P4 證據測試由出口 driver 強制
+        run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
 
       - name: Install google-re2 and re-run (re2 linear engine)
         run: |
           python3 -m pip install --disable-pip-version-check google-re2
-          python3 -m pytest -q tests/
+          python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
 
       - name: Build wheel
         run: python3 -m build --wheel
