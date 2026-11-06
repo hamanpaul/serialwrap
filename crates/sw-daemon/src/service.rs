@@ -203,7 +203,7 @@ impl Service {
             profile_count: deps.explicit_target_count,
             allowlist: deps.test_device_allowlist.filter(|a| a.enabled),
             pid: deps.pid,
-            mcu: McuPatternRegistry::default(),
+            mcu: McuPatternRegistry::default_registry(),
             running: AtomicBool::new(true),
         }
     }
@@ -299,7 +299,7 @@ impl Service {
             "health.ping" => Ok(pydict! { "ok" => true, "pong" => true }),
             "health.status" => Ok(crate::health::health(self)),
 
-            "mcu.patterns" => Ok(pydict! { "ok" => true, "patterns" => dict_list(self.mcu.to_rpc_rows()) }),
+            "mcu.patterns" => Ok(pydict! { "ok" => true, "patterns" => self.mcu.patterns_rpc() }),
             "mcu.status" => {
                 // Slice 2.1 不承接 flash（2.4）：恆不在 FLASHING、無偵測紀錄。
                 Ok(pydict! {
