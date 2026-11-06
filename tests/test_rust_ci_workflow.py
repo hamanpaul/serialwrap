@@ -28,9 +28,13 @@ RUST_LINUX_REQUIRED_COMMANDS = [
     "SW_REQUIRE_CARGO=1 python3 -m pytest -q tests/test_rust_*.py",
     "scripts/rust/mkbundle.sh --dev --out target/dev-bundle",
     (
+        "SW_RESOURCE_REPORT=$PWD/target/ci-blackbox/resource-report.json "
         "SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap "
-        "SERIALWRAP_AB_LABEL=rust-1a python3 -m pytest -q tests/contract_blackbox "
-        "--confcutdir=tests/contract_blackbox -p no:cacheprovider"
+        "SERIALWRAP_AB_LABEL=rust-1a "
+        "python3 -m pytest -q tests/contract_blackbox "
+        '-m "core_portable or posix_only" '
+        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt "
+        "--junitxml=target/ci-blackbox/junit.xml"
     ),
     (
         "SERIALWRAP_CLI_EXE=$PWD/target/dev-bundle/bin/serialwrap "
@@ -70,7 +74,7 @@ def test_rust_linux_job_toolchain_and_python():
     jobs = doc.get("jobs", {})
     assert "rust-linux" in jobs, "rust.yml 缺少 'rust-linux' job"
     job = jobs["rust-linux"]
-    assert job.get("runs-on") == "ubuntu-latest", f"rust-linux runs-on 必須為 ubuntu-latest: {job.get('runs-on')}"
+    assert job.get("runs-on") == "ubuntu-24.04", f"rust-linux runs-on 必須為 ubuntu-24.04（setup-python 3.12.3）: {job.get('runs-on')}"
 
     steps = job.get("steps", [])
     assert steps, "rust-linux job 缺少 steps"
@@ -207,3 +211,49 @@ def test_tests_workflow_python_version():
         assert py_ver == "3.12.3", (
             f"tests.yml 的 python-version 必須釘為 '3.12.3'（目前為 {py_ver!r}）"
         )
+
+
+def test_pytest_windows_provisions_pinned_cargo():
+    """臨時 workspace 不會繼承 repo override，hosted job 必須明確指定工具鏈並強制 cargo。"""
+    job = _load_yaml(TESTS_YML)["jobs"]["pytest-windows"]
+    assert job["env"]["RUSTUP_TOOLCHAIN"] == "1.96.1"
+    assert job["env"]["SW_REQUIRE_CARGO"] == "1"
+    steps = job["steps"]
+    rust_index = next(i for i, step in enumerate(steps) if step.get("uses", "").startswith("dtolnay/rust-toolchain@"))
+    assert steps[rust_index]["uses"] == "dtolnay/rust-toolchain@1.96.1"
+    assert steps[rust_index]["with"]["toolchain"] == "1.96.1"
+    assert set(steps[rust_index]["with"]["targets"].split(",")) == {
+        "x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu",
+    }
+    pytest_index = next(i for i, step in enumerate(steps) if "python -m pytest" in step.get("run", ""))
+    assert rust_index < pytest_index
+
+
+def test_pytest_windows_excludes_only_exit_driver_integrations():
+    """hosted CI 不生產出口證據；排除名單不得含凍結 Windows 必要節點，出口 driver 仍跑完整集合。"""
+    import json
+    import shlex
+
+    job = _load_yaml(TESTS_YML)["jobs"]["pytest-windows"]
+    command = next(step["run"] for step in job["steps"] if "python -m pytest" in step.get("run", ""))
+    tokens = shlex.split(command)
+    excluded = [tokens[i + 1] for i, token in enumerate(tokens) if token == "--deselect"]
+    assert set(excluded) == {
+        "tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native",
+        "tests/test_rust_bench_tools.py::test_ab_selection_follows_frozen_selector_per_platform",
+        "tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence",
+    }
+    lock = json.loads((REPO_ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))
+    for platforms in lock["sets"].values():
+        assert not set(excluded).intersection(platforms.get("windows", {}).get("nodeids", []))
+    driver = (REPO_ROOT / "scripts/rust/stage1_exit_driver.sh").read_text(encoding="utf-8")
+    full_step = driver.split("step pytest_full_junit ", 1)[1].split("fresh_or_fail", 1)[0]
+    assert "python3 -m pytest -q tests/" in full_step
+    assert "--deselect" not in full_step
+
+
+def test_golden_corpus_checkout_preserves_lf():
+    """pyre oracle 拒絕 CRLF，Git 的 Windows 檢出必須保留原始 LF。"""
+    attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+    rules = [line.split() for line in attributes.splitlines() if line and not line.startswith("#")]
+    assert ["scripts/rust/goldens/pyre_corpus.txt", "text", "eol=lf"] in rules

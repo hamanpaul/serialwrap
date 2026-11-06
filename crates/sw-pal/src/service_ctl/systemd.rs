@@ -55,12 +55,9 @@ impl SystemdCtl {
     fn hold_path(&self, mode: &SupervisionMode, name: &str) -> Option<PathBuf> {
         match mode {
             SupervisionMode::SystemdUser => {
-                let config_home = self
-                    .env
-                    .var("XDG_CONFIG_HOME")
-                    .filter(|path| !path.is_empty())
-                    .map(PathBuf::from)
-                    .or_else(|| self.home().map(|home| home.join(".config")))?;
+                // Python setup 的 user unit 與 CLI 預存 hold 計畫皆固定使用 HOME/.config；
+                // 寫檔也必須同根，才能在實際 hold 尚未回寫 journal 前中斷並安全恢復。
+                let config_home = self.home()?.join(".config");
                 Some(
                     config_home
                         .join("systemd/user")

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-10-29.3",
+  "cases_revision": "2026-11-03.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -159,8 +159,10 @@
       "f7-larger-file-not-truncated",
       "f9-attach-during-boot-reprobes",
       "f9-brcm-spaced-prompt-reboot-login",
+      "f9-expect-reboot-chained",
       "f9-quiet-window-agent-passthrough",
       "f9-reboot-autoboot-unmolested",
+      "f9-reboot-stale-ready",
       "ha-05-concurrent-submit",
       "l15-delayed-reply",
       "l15-dut-silent",
@@ -277,8 +279,10 @@
       "f8-tty-holders-reported",
       "f9-attach-during-boot-reprobes",
       "f9-brcm-spaced-prompt-reboot-login",
+      "f9-expect-reboot-chained",
       "f9-quiet-window-agent-passthrough",
       "f9-reboot-autoboot-unmolested",
+      "f9-reboot-stale-ready",
       "f9-spontaneous-reboot-agent-gated",
       "f9-uboot-readonly-and-console-kept",
       "ha-01-human-then-agent",
@@ -1780,6 +1784,19 @@
       "cli_stage": "1A",
       "stage0_required": false
     },
+    "f9-expect-reboot-chained": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
     "f9-quiet-window-agent-passthrough": {
       "suite": "regression",
       "layer": "L2",
@@ -1794,6 +1811,19 @@
       "stage0_required": false
     },
     "f9-reboot-autoboot-unmolested": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.3",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "f9-reboot-stale-ready": {
       "suite": "regression",
       "layer": "L2",
       "platforms": [

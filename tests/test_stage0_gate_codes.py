@@ -120,6 +120,29 @@ def test_execute_time_quiet_has_retry_after(stage0_service):
     }
 
 
+def test_rpc_bare_human_bypasses_quiet_but_explicit_human_cli_does_not(stage0_service):
+    """OD-74：只把 RPC 原始值 bare ``human`` 視為 human，不以正規化字串授權。"""
+    svc, sess = stage0_service
+    sess.state = "READY"
+    sess.ready_reconfirm_pending = True
+
+    bare = svc.rpc(
+        "command.submit",
+        {"selector": "COM0", "cmd": "ls", "source": "human"},
+    )
+    assert bare["ok"] is True
+    assert bare["source"] == "human:cli"
+    assert bare["source_normalized_from"] == "human"
+    assert bare["source_class"] == "human"
+
+    explicit = svc.rpc(
+        "command.submit",
+        {"selector": "COM0", "cmd": "ls", "source": "human:cli"},
+    )
+    assert explicit["ok"] is False
+    assert explicit["error_code"] == "AUTOBOOT_QUIET"
+
+
 def test_rpc_human_source_is_gated_like_agent(stage0_service):
     """DF-02：RPC 傳入 human: 開頭的偽造 source 時，gate 一律以 agent 對待。"""
     svc, sess = stage0_service

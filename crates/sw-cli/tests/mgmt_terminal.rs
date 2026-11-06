@@ -5,6 +5,7 @@
 //! - `delegated_groups_empty` 斷言 `DELEGATED_GROUPS` 為空（Stage 1B）。
 //! - 承接類案例（console-attach 組包、逾時、passthrough）原樣傳遞與解析。
 //! - `delegate_mechanism_still_guards_recursion` 驗證測試注入委派群組時，遞迴防護（深度≥2）仍有效。
+//!   行程內 override 在未開 `test-fakes` 時也編譯；環境變數鉤子仍只在該 feature 讀取。
 //!
 //! 替身：`TestEnv`（P4-T1，`tests/support/mod.rs`）與 `sw_pal::fakes`；本檔只使用既有公開 API，不引入新 stub。
 //! 規格來源：`docs/rust-refactor/plans/05-stage1b-rust-cli-mgmt.md` Task 14；盤點 `inventory/01-cli.md` §6.11。
@@ -92,6 +93,7 @@ fn delegated_groups_empty() {
 /// 委派機制保留供緊急回退：以測試注入群組時，`SERIALWRAP_DELEGATE_DEPTH=2` 經 `sw_cli::run` 必須拒絕執行並回報遞迴。
 #[test]
 fn delegate_mechanism_still_guards_recursion() {
+    let _group = sw_cli::delegate::override_test_group("doctor");
     let (mut p, _conn, _clock) = fake_platform(vec![]);
     let env = Arc::new(FakeEnv::default());
     {

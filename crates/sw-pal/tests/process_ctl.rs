@@ -42,13 +42,44 @@ fn spawn_daemon_detached_new_session() {
                 std::path::PathBuf::from("/dev/null")
             );
         }
-        let environment = std::fs::read(format!("/proc/{}/environ", child.handle.pid)).unwrap();
+        let environment =
+            read_environ_after_exec(child.handle.pid, std::path::Path::new("/bin/sleep"));
         assert!(environment
             .split(|byte| *byte == 0)
             .any(|entry| entry == b"P4_DETACHED_ENV=supplied"));
         assert!(!environment
             .split(|byte| *byte == 0)
             .any(|entry| entry.starts_with(b"HOME=")));
+    }
+}
+
+/// 確認子行程已完成 exec 後，讀取其 `/proc/<pid>/environ`。
+///
+/// spawn 回傳後立即讀可能讀到 exec 前（fork 自測試行程）的父環境，或核心已切換映像、尚未發布
+/// env 區段時的空內容（`environ_read` 於 `mm->env_end` 為 0 時回 0 byte）。先等 `/proc/<pid>/exe`
+/// 指向目標執行檔（之後開啟的 environ 必屬新映像），再等內容非空；期限到仍未就緒即判失敗，
+/// 不放寬呼叫端對內容的斷言。
+#[cfg(target_os = "linux")]
+fn read_environ_after_exec(pid: u32, target: &std::path::Path) -> Vec<u8> {
+    let target = std::fs::canonicalize(target).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        let mut environ_len = None;
+        if exe.as_deref() == Some(target.as_path()) {
+            let environment = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+            if !environment.is_empty() {
+                return environment;
+            }
+            environ_len = Some(environment.len());
+        }
+        if Instant::now() >= deadline {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            panic!(
+                "子行程 {pid} 未在期限內完成 exec：exe={exe:?}，environ 長度={environ_len:?}，stat={stat:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

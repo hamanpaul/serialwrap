@@ -958,7 +958,8 @@ def test_ec_bc03_status_tracks_change() -> None:
     assert e.retryable == "no"
     assert e.uart_tx == "possible"
     assert "BC-03" in e.behavior_change
-    assert tuple(e.scope.interfaces) == ("rec",)
+    # OD-62：file.push／file.pull 的同步回應亦使用此碼，故介面為 rpc＋rec。
+    assert tuple(e.scope.interfaces) == ("rpc", "rec")
 
 
 def test_ec_sc19_status_tracks_change() -> None:

@@ -588,3 +588,46 @@ def test_no_onefile_extract_step_checks_freshness_and_verdict():
     verdict = _step_index(text, 'echo "verdict_no_onefile_extract 1" >> "$EV/rc.txt"')
     assert step < fresh < verdict
     assert 'onefile_verdict "$EV/no-onefile-extract.json"' in text
+
+
+# ── 出口摘要 fail-closed（S1M-ba2 A2／D9）────────────────────────────────────
+
+def test_driver_header_matches_two_stage_exit_decision():
+    header = _driver_text().split("# 可覆寫環境變數：", 1)[0]
+    assert "最後任一步 rc 非 0 即以 1 結束" not in header
+    assert "l15_exit_driver.py" in header
+    assert "failed_steps" in header
+    assert "win_l15_func_test" in header
+
+
+def test_exit_driver_does_not_compare_failed_steps_numerically():
+    text = _driver_text()
+    assert '[[ "$rc_fail" -eq 0 ]]' not in text
+    assert "parse_failed_steps" in text
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"),
+    [('{"failed_steps":0}', 0), ('{"failed_steps":2,"unresolved":[]}', 2)],
+)
+def test_parse_failed_steps_accepts_non_negative_integers(summary, expected):
+    assert l15_exit_driver.parse_failed_steps(summary) == expected
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "",
+        "not-json",
+        "{}",
+        "[]",
+        "null",
+        '{"failed_steps":true}',
+        '{"failed_steps":"0"}',
+        '{"failed_steps":-1}',
+        '{"failed_steps":0.0}',
+    ],
+)
+def test_parse_failed_steps_rejects_invalid_or_incomplete_summary(summary):
+    with pytest.raises(ValueError):
+        l15_exit_driver.parse_failed_steps(summary)

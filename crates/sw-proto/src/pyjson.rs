@@ -4,10 +4,12 @@
 //!
 //! 已登記非契約差異（arch §3.3、spec §11.3）：
 //! - `RPC-H-03`：孤立 surrogate（lone surrogate，U+D800..=U+DFFF）轉譯為 U+FFFD 替換字元。
+//!   只涵蓋回應端；請求端的檔案內容改用 [`loads_keep_lone_surrogates`] 保留 surrogate（S1X-b-2）。
 //! - `JSON_MAX_DEPTH`：2900（顯式堆疊巢狀深度上限，超過時回傳 `JsonError::Recursion`）。
 //! - 整數字面量長度：CPython 3.12 預設限制 4300 位（CVE-2020-10735 `ValueError`），此處以 `PyInt::Big` 接受大於 i128 的整數。
 
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 /// Python 值（`json.loads` 的產出、`json.dumps` 的輸入）。
@@ -704,8 +706,51 @@ fn parse_hex4(bytes: &[u8]) -> Option<u16> {
     }
 }
 
+/// 保留孤立 surrogate 時（[`loads_keep_lone_surrogates`]）合法 NUL 的表示：[`crate::pyfmt::ESCAPE_MARK`] 連寫兩次。
+///
+/// 孤立 surrogate 為 `ESCAPE_MARK` 加偏移字元。保留模式的字串中 NUL 只出現在這兩種形式裡，由左而右可唯一切分：
+/// 合法內容（如 NUL 後接 U+FD800）不會與 surrogate 跳脫同形，鍵去重與 Python 一致（S1-f2a23b1-1）。
+pub const KEPT_NUL: &str = "\0\0";
+
+/// 孤立 surrogate 跳脫的解碼方式與出現次數。
+struct LoneSurrogates {
+    /// `true`：以 [`crate::pyfmt::escape_surrogate`] 跳脫保留，合法 NUL 寫成 [`KEPT_NUL`]；
+    /// `false`：依 RPC-H-03 換成 U+FFFD。
+    keep: bool,
+    /// 累計解碼出的孤立 surrogate 數；[`loads_with`] 以前後差值得出每個字串的個數。
+    count: usize,
+    /// 累計寫成 [`KEPT_NUL`] 的合法 NUL 數。
+    nul: usize,
+}
+
+impl LoneSurrogates {
+    fn push(&mut self, out: &mut String, cp: u16) {
+        self.count += 1;
+        if self.keep {
+            crate::pyfmt::escape_surrogate(u32::from(cp), out);
+        } else {
+            out.push('\u{FFFD}');
+        }
+    }
+
+    /// 非 surrogate 的 `\uXXXX`。
+    fn push_unit(&mut self, out: &mut String, cp: u16) {
+        if cp == 0 && self.keep {
+            self.nul += 1;
+            out.push_str(KEPT_NUL);
+        } else {
+            out.push(char::from_u32(u32::from(cp)).unwrap());
+        }
+    }
+}
+
 /// 解析 JSON 字串（含跳脫字元與 surrogate pair 轉譯）。
-fn parse_string(s: &str, bytes: &[u8], start_quote: usize) -> Result<(String, usize), JsonError> {
+fn parse_string(
+    s: &str,
+    bytes: &[u8],
+    start_quote: usize,
+    lone: &mut LoneSurrogates,
+) -> Result<(String, usize), JsonError> {
     let mut out = String::new();
     let mut idx = start_quote + 1;
 
@@ -782,17 +827,17 @@ fn parse_string(s: &str, bytes: &[u8], start_quote: usize) -> Result<(String, us
                             } else {
                                 // 接續不是 low surrogate，依 RPC-H-03 當前 high surrogate 為孤立 surrogate
                                 // 不消耗接續的 \uXXXX，留待下一輪作為一般 escape 解析
-                                out.push('\u{FFFD}');
+                                lone.push(&mut out, uni);
                             }
                         } else {
                             // 無接續的 \u，當前 high surrogate 為孤立 surrogate
-                            out.push('\u{FFFD}');
+                            lone.push(&mut out, uni);
                         }
                     } else if (0xDC00..=0xDFFF).contains(&uni) {
                         // 孤立 low surrogate（RPC-H-03）
-                        out.push('\u{FFFD}');
+                        lone.push(&mut out, uni);
                     } else {
-                        out.push(char::from_u32(uni as u32).unwrap());
+                        lone.push_unit(&mut out, uni);
                     }
                 }
                 _ => {
@@ -878,16 +923,84 @@ fn parse_number(s: &str, bytes: &[u8], start: usize) -> Result<(PyValue, usize),
 }
 
 /// 容器堆疊框架（顯式堆疊實作，防止遞迴堆疊溢位）。
+/// 解析中的容器。各值附帶其子樹內孤立 surrogate 的個數，重複鍵覆寫時隨之更新（S1-2a65438-1）。
 enum ContainerFrame {
-    Array(Vec<PyValue>),
+    Array {
+        items: Vec<PyValue>,
+        lone: usize,
+    },
     Object {
         dict: PyDict,
-        pending_key: Option<String>,
+        /// 待填值的 key 與 key 本身的孤立 surrogate 個數。
+        pending_key: Option<(String, usize)>,
+        /// 各 key 目前值的孤立 surrogate 個數。
+        value_lone: HashMap<String, usize>,
+        /// 本物件內（含 key 與最終值）孤立 surrogate 的總數。
+        lone: usize,
     },
 }
 
-/// `json.loads`（strict=True）。
+/// `json.loads`（strict=True）。孤立 surrogate 依 RPC-H-03 換成 U+FFFD。
 pub fn loads(s: &str) -> Result<PyValue, JsonError> {
+    let mut lone = LoneSurrogates {
+        keep: false,
+        count: 0,
+        nul: 0,
+    };
+    loads_with(s, &mut lone).map(|(value, _)| value)
+}
+
+/// 同 [`loads`]，但孤立 surrogate 跳脫比照 Python 保留：以 [`crate::pyfmt::escape_surrogate`]
+/// （`ESCAPE_MARK` 加偏移字元）表示，並回傳最終值是否仍含孤立 surrogate（S1X-b-2）。
+///
+/// 解析期間合法 NUL 寫成 [`KEPT_NUL`]，字串與鍵的表示無碰撞：合法鍵「NUL＋U+FD800」與 `\ud800` 是兩個鍵（S1-f2a23b1-1）。
+/// 重複鍵比照 `json.loads` 以後值覆寫前值；被覆寫掉的值（含其子樹）中的孤立 surrogate 不計（S1-2a65438-1）。
+///
+/// 供請求端的檔案內容使用：Python `json.load` 保留 surrogate，之後 `json.dumps(...).encode("utf-8")`
+/// 送出前失敗；呼叫端據旗標拒送，並以此值計算錯誤位置（合法 NUL 仍為 [`KEPT_NUL`]）。
+/// 旗標為 `false` 時，[`KEPT_NUL`] 已還原為 NUL，回傳值與 [`loads`] 相同。
+pub fn loads_keep_lone_surrogates(s: &str) -> Result<(PyValue, bool), JsonError> {
+    let mut lone = LoneSurrogates {
+        keep: true,
+        count: 0,
+        nul: 0,
+    };
+    let (mut value, remaining) = loads_with(s, &mut lone)?;
+    if remaining == 0 && lone.nul > 0 {
+        restore_kept_nul(&mut value);
+    }
+    Ok((value, remaining > 0))
+}
+
+/// 把值樹內的 [`KEPT_NUL`] 還原為單一 NUL（鍵與字串值）；只用於已無孤立 surrogate 的值樹，
+/// 此時每個 NUL 都屬於一組 [`KEPT_NUL`]。以顯式堆疊走訪，深度不受執行緒堆疊限制。
+fn restore_kept_nul(value: &mut PyValue) {
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            PyValue::Str(text) => {
+                if text.contains(KEPT_NUL) {
+                    *text = text.replace(KEPT_NUL, "\0");
+                }
+            }
+            PyValue::List(items) => stack.extend(items.iter_mut()),
+            PyValue::Dict(dict) => {
+                if dict.0.keys().any(|key| key.contains(KEPT_NUL)) {
+                    // 還原是單射，鍵仍兩兩相異；順序不變。
+                    dict.0 = std::mem::take(&mut dict.0)
+                        .into_iter()
+                        .map(|(key, item)| (key.replace(KEPT_NUL, "\0"), item))
+                        .collect();
+                }
+                stack.extend(dict.0.values_mut());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 解析並回傳值與最終值樹內孤立 surrogate 的個數。
+fn loads_with(s: &str, lone: &mut LoneSurrogates) -> Result<(PyValue, usize), JsonError> {
     if s.starts_with('\u{FEFF}') {
         return Err(JsonError::Decode(JsonDecodeError {
             msg: "Unexpected UTF-8 BOM (decode using utf-8-sig)".to_string(),
@@ -909,7 +1022,8 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
     // 狀態機：要麼解析下一個值，要麼將產出的值送回父容器
     enum Action {
         ScanValue,
-        PassUp(PyValue),
+        /// 產出的值與其子樹內孤立 surrogate 的個數。
+        PassUp(PyValue, usize),
     }
 
     let mut action = Action::ScanValue;
@@ -925,9 +1039,10 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                 let b = bytes[idx];
                 match b {
                     b'"' => {
-                        let (val_str, new_idx) = parse_string(s, bytes, idx)?;
+                        let before = lone.count;
+                        let (val_str, new_idx) = parse_string(s, bytes, idx, lone)?;
                         idx = new_idx;
-                        action = Action::PassUp(PyValue::Str(val_str));
+                        action = Action::PassUp(PyValue::Str(val_str), lone.count - before);
                     }
                     b'[' => {
                         depth += 1;
@@ -939,9 +1054,12 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                         if idx < bytes.len() && bytes[idx] == b']' {
                             idx += 1;
                             depth -= 1;
-                            action = Action::PassUp(PyValue::List(Vec::new()));
+                            action = Action::PassUp(PyValue::List(Vec::new()), 0);
                         } else {
-                            stack.push(ContainerFrame::Array(Vec::new()));
+                            stack.push(ContainerFrame::Array {
+                                items: Vec::new(),
+                                lone: 0,
+                            });
                             action = Action::ScanValue;
                         }
                     }
@@ -955,7 +1073,7 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                         if idx < bytes.len() && bytes[idx] == b'}' {
                             idx += 1;
                             depth -= 1;
-                            action = Action::PassUp(PyValue::Dict(PyDict::new()));
+                            action = Action::PassUp(PyValue::Dict(PyDict::new()), 0);
                         } else {
                             if idx >= bytes.len() || bytes[idx] != b'"' {
                                 return Err(decode_error(
@@ -964,7 +1082,9 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                                     "Expecting property name enclosed in double quotes",
                                 ));
                             }
-                            let (key, new_idx) = parse_string(s, bytes, idx)?;
+                            let before = lone.count;
+                            let (key, new_idx) = parse_string(s, bytes, idx, lone)?;
+                            let key_lone = lone.count - before;
                             idx = skip_ws(bytes, new_idx);
                             if idx >= bytes.len() || bytes[idx] != b':' {
                                 return Err(decode_error(s, idx, "Expecting ':' delimiter"));
@@ -972,69 +1092,79 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                             idx += 1;
                             stack.push(ContainerFrame::Object {
                                 dict: PyDict::new(),
-                                pending_key: Some(key),
+                                pending_key: Some((key, key_lone)),
+                                value_lone: HashMap::new(),
+                                lone: 0,
                             });
                             action = Action::ScanValue;
                         }
                     }
                     b'n' if bytes[idx..].starts_with(b"null") => {
                         idx += 4;
-                        action = Action::PassUp(PyValue::Null);
+                        action = Action::PassUp(PyValue::Null, 0);
                     }
                     b't' if bytes[idx..].starts_with(b"true") => {
                         idx += 4;
-                        action = Action::PassUp(PyValue::Bool(true));
+                        action = Action::PassUp(PyValue::Bool(true), 0);
                     }
                     b'f' if bytes[idx..].starts_with(b"false") => {
                         idx += 5;
-                        action = Action::PassUp(PyValue::Bool(false));
+                        action = Action::PassUp(PyValue::Bool(false), 0);
                     }
                     b'N' if bytes[idx..].starts_with(b"NaN") => {
                         idx += 3;
-                        action = Action::PassUp(PyValue::Float(f64::NAN));
+                        action = Action::PassUp(PyValue::Float(f64::NAN), 0);
                     }
                     b'I' if bytes[idx..].starts_with(b"Infinity") => {
                         idx += 8;
-                        action = Action::PassUp(PyValue::Float(f64::INFINITY));
+                        action = Action::PassUp(PyValue::Float(f64::INFINITY), 0);
                     }
                     b'-' if bytes[idx..].starts_with(b"-Infinity") => {
                         idx += 9;
-                        action = Action::PassUp(PyValue::Float(f64::NEG_INFINITY));
+                        action = Action::PassUp(PyValue::Float(f64::NEG_INFINITY), 0);
                     }
                     b'-' | b'0'..=b'9' => {
                         let (num_val, new_idx) = parse_number(s, bytes, idx)?;
                         idx = new_idx;
-                        action = Action::PassUp(num_val);
+                        action = Action::PassUp(num_val, 0);
                     }
                     _ => {
                         return Err(decode_error(s, idx, "Expecting value"));
                     }
                 }
             }
-            Action::PassUp(val) => {
+            Action::PassUp(val, val_lone) => {
                 if stack.is_empty() {
                     idx = skip_ws(bytes, idx);
                     if idx < bytes.len() {
                         return Err(decode_error(s, idx, "Extra data"));
                     }
-                    return Ok(val);
+                    return Ok((val, val_lone));
                 }
 
                 let top = stack.last_mut().unwrap();
                 match top {
-                    ContainerFrame::Array(items) => {
+                    ContainerFrame::Array {
+                        items,
+                        lone: items_lone,
+                    } => {
                         items.push(val);
+                        *items_lone += val_lone;
                         idx = skip_ws(bytes, idx);
                         if idx >= bytes.len() {
                             return Err(decode_error(s, idx, "Expecting ',' delimiter"));
                         }
                         if bytes[idx] == b']' {
                             idx += 1;
-                            let ContainerFrame::Array(final_items) = stack.pop().unwrap() else {
+                            let ContainerFrame::Array {
+                                items: final_items,
+                                lone: final_lone,
+                            } = stack.pop().unwrap()
+                            else {
                                 unreachable!()
                             };
                             depth -= 1;
-                            action = Action::PassUp(PyValue::List(final_items));
+                            action = Action::PassUp(PyValue::List(final_items), final_lone);
                         } else if bytes[idx] == b',' {
                             idx += 1;
                             action = Action::ScanValue;
@@ -1042,8 +1172,20 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                             return Err(decode_error(s, idx, "Expecting ',' delimiter"));
                         }
                     }
-                    ContainerFrame::Object { dict, pending_key } => {
-                        let key = pending_key.take().expect("pending_key should be set");
+                    ContainerFrame::Object {
+                        dict,
+                        pending_key,
+                        value_lone,
+                        lone: dict_lone,
+                    } => {
+                        let (key, key_lone) =
+                            pending_key.take().expect("pending_key should be set");
+                        // 重複鍵：保留首次的 key（與後來的 key 相等，surrogate 個數相同），值取後者。
+                        // 保留模式下 key 為無碰撞表示（見 KEPT_NUL），相等即 Python 的同一鍵（S1-f2a23b1-1）。
+                        match value_lone.insert(key.clone(), val_lone) {
+                            Some(old) => *dict_lone = *dict_lone - old + val_lone,
+                            None => *dict_lone += key_lone + val_lone,
+                        }
                         dict.insert(&key, val);
                         idx = skip_ws(bytes, idx);
                         if idx >= bytes.len() {
@@ -1051,13 +1193,16 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                         }
                         if bytes[idx] == b'}' {
                             idx += 1;
-                            let ContainerFrame::Object { dict: final_dict, .. } =
-                                stack.pop().unwrap()
+                            let ContainerFrame::Object {
+                                dict: final_dict,
+                                lone: final_lone,
+                                ..
+                            } = stack.pop().unwrap()
                             else {
                                 unreachable!()
                             };
                             depth -= 1;
-                            action = Action::PassUp(PyValue::Dict(final_dict));
+                            action = Action::PassUp(PyValue::Dict(final_dict), final_lone);
                         } else if bytes[idx] == b',' {
                             idx += 1;
                             idx = skip_ws(bytes, idx);
@@ -1068,7 +1213,9 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                                     "Expecting property name enclosed in double quotes",
                                 ));
                             }
-                            let (next_key, new_idx) = parse_string(s, bytes, idx)?;
+                            let before = lone.count;
+                            let (next_key, new_idx) = parse_string(s, bytes, idx, lone)?;
+                            let next_key_lone = lone.count - before;
                             idx = skip_ws(bytes, new_idx);
                             if idx >= bytes.len() || bytes[idx] != b':' {
                                 return Err(decode_error(s, idx, "Expecting ':' delimiter"));
@@ -1078,7 +1225,7 @@ pub fn loads(s: &str) -> Result<PyValue, JsonError> {
                             let ContainerFrame::Object { pending_key, .. } = top_again else {
                                 unreachable!()
                             };
-                            *pending_key = Some(next_key);
+                            *pending_key = Some((next_key, next_key_lone));
                             action = Action::ScanValue;
                         } else {
                             return Err(decode_error(s, idx, "Expecting ',' delimiter"));

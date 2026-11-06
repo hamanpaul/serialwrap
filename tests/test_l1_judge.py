@@ -929,7 +929,7 @@ def test_s21_core_linux_capability_rows_moved_to_cap_sets_od55() -> None:
             assert name.startswith(f"cap_{cap}__"), nid
             assert any(p == pkg and n == name for p, _t, n in ignored), f"{nid} 不是 ignored 測試"
         moved += len(spec["nodeids"])
-    assert moved == 22, moved          # OD-68 移除 3 Linux 列；新增 own-child PTY 回歸 1 列。
+    assert moved == 24, moved          # OD-68 移除 3 Linux 列；新增 own-child PTY 回歸 1 列；attach/spawn 哨兵 2 列。
     assert not [r for r in _ignored_lock_rows(lock, ignored) if r.startswith("s21_gate:cap_")]
 
 

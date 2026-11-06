@@ -192,8 +192,11 @@ fn directory_delegate_entry_is_reported() {
     assert!(message.starts_with("delegate entry not found:"));
 }
 
+// 行程內 override 讓凍結 selector（未開 test-fakes）編譯本測試。
+// 環境變數仍寫入，`--features test-fakes` 時程式庫優先走該鉤子。
 #[test]
 fn run_delegate_increments_depth_and_executes_once_with_three_environment_values() {
+    let _group = sw_cli::delegate::override_test_group("doctor");
     let fixture = Fixture::new(Some("1"));
     fixture
         .env

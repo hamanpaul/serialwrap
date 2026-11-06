@@ -31,6 +31,12 @@ class TestWrappedEchoStrip(unittest.TestCase):
         raw = CMD96[:65] + "\r\r\n" + CMD96[65:] + "\r\nOUT\r\n" + PROMPT
         self.assertEqual(_extract(raw, CMD96), "OUT")
 
+    def test_busybox_wrap_before_twenty_chars_is_kept(self) -> None:
+        """命令前 10 字元處的 BusyBox 換行不足以證明回顯，須保留輸出。"""
+        command = "x" * 60
+        raw = command[:10] + "\r\r\n" + command[10:] + "\r\nOUT\r\n" + PROMPT
+        self.assertEqual(_extract(raw, command), command[:10] + "\n" + command[10:] + "\nOUT")
+
     def test_three_line_wrap_is_stripped(self) -> None:
         raw = (CMD200[:65] + "\r\r\n" + CMD200[65:145] + "\r\r\n" + CMD200[145:]
                + "\r\nOUT\r\n" + PROMPT)
@@ -111,6 +117,22 @@ class TestWrappedEchoStrip(unittest.TestCase):
         """單行回顯已剝掉時，不再把後面恰好拼得出命令的輸出當回顯。"""
         raw = CMD96 + "\r\n" + CMD96[:65] + "\r\n" + CMD96[65:] + "\r\n" + PROMPT
         self.assertEqual(_extract(raw, CMD96), CMD96[:65] + "\n" + CMD96[65:])
+
+    def test_output_equal_to_command_without_spaces_is_kept(self) -> None:
+        """echo 關閉時，輸出剛好等於命令去掉空白（`cat file` → `catfile`）不得被當成回顯。"""
+        raw = "catfile\r\n" + PROMPT
+        self.assertEqual(_extract(raw, "cat file"), "catfile")
+
+    def test_short_output_split_like_command_is_kept(self) -> None:
+        """短命令不會折行：輸出恰好是命令拆成兩行時不得剝掉。"""
+        raw = "ls -la\r\n/tmp\r\n" + PROMPT
+        self.assertEqual(_extract(raw, "ls -la /tmp"), "ls -la\n/tmp")
+
+    def test_long_output_missing_command_space_is_kept(self) -> None:
+        """回顯只會多插換行或空白，不會吃掉命令本身的空白；少了空白的長輸出不是回顯。"""
+        squeezed = CMD96.replace(" ", "")
+        raw = squeezed[:60] + "\r\n" + squeezed[60:] + "\r\n" + PROMPT
+        self.assertEqual(_extract(raw, CMD96), squeezed[:60] + "\n" + squeezed[60:])
 
     def test_helper_handles_empty_inputs(self) -> None:
         self.assertEqual(_strip_wrapped_command_echo([], CMD96), [])

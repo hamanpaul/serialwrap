@@ -17,6 +17,7 @@ use sw_pal::{ConsoleKind, PalPathFlavor, SupervisionMode};
 use sw_proto::config_types::RuntimeConfig;
 use sw_proto::endpoint::{parse_endpoint, Endpoint};
 use sw_proto::error_codes::ErrorCode;
+use sw_proto::pycompat::py_strip;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::runtime_paths::EnvSnapshot;
 use sw_proto::yaml11::{py_str_of, py_truthy_of, YValue};
@@ -891,6 +892,136 @@ fn run_records(ctx: &CliCtx<'_>, argvs: &[Vec<String>]) -> Vec<CmdRecord> {
     argvs.iter().map(|argv| run_command(ctx, argv)).collect()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonCodeAssessment {
+    pub checked: bool,
+    pub stale: bool,
+    pub reason: Option<String>,
+    pub daemon: Option<String>,
+    pub installed: Option<String>,
+}
+
+/// 純函式：依 Python `daemon_code_assessment` 的順序比較兩端指紋。
+pub fn daemon_code_assessment(
+    daemon_running: bool,
+    daemon_fingerprint: Option<&str>,
+    installed_fingerprint: Option<&str>,
+) -> DaemonCodeAssessment {
+    let mut assessment = DaemonCodeAssessment {
+        checked: false,
+        stale: false,
+        reason: None,
+        daemon: daemon_fingerprint
+            .filter(|fingerprint| !fingerprint.is_empty())
+            .map(str::to_string),
+        installed: installed_fingerprint.map(str::to_string),
+    };
+    if !daemon_running {
+        assessment.reason = Some("daemon_unreachable".to_string());
+        return assessment;
+    }
+    if installed_fingerprint.is_none_or(str::is_empty) {
+        assessment.reason = Some("installed_fingerprint_unavailable".to_string());
+        return assessment;
+    }
+
+    assessment.checked = true;
+    if daemon_fingerprint.is_none_or(str::is_empty) {
+        assessment.stale = true;
+        assessment.reason = Some("daemon_no_fingerprint".to_string());
+    } else if daemon_fingerprint != installed_fingerprint {
+        assessment.stale = true;
+        assessment.reason = Some("fingerprint_mismatch".to_string());
+    } else {
+        assessment.reason = Some("match".to_string());
+    }
+    assessment
+}
+
+/// 只在 systemd 模式查詢服務；`active` 必須同時符合成功 rc 與精確狀態字串。
+pub fn service_is_active(ctx: &CliCtx<'_>, mode: &SupervisionMode) -> bool {
+    let argv = match mode {
+        SupervisionMode::SystemdUser => vec![
+            "systemctl".to_string(),
+            "--user".to_string(),
+            "is-active".to_string(),
+            "serialwrap".to_string(),
+        ],
+        SupervisionMode::SystemdSystem => vec![
+            "systemctl".to_string(),
+            "is-active".to_string(),
+            "serialwrap".to_string(),
+        ],
+        _ => return false,
+    };
+    ctx.p
+        .env
+        .run(&argv, None)
+        .is_ok_and(|output| output.rc == 0 && py_strip(&output.stdout) == "active")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonRestartAction {
+    NotChecked,
+    None,
+    SkippedNoRestartFlag,
+    ModeTransition,
+    ManualRestart,
+    SkippedFlashing,
+    ServiceInactive,
+    Restart,
+}
+
+impl DaemonRestartAction {
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::NotChecked => None,
+            Self::None => Some("none"),
+            Self::SkippedNoRestartFlag => Some("skipped_no_restart_flag"),
+            Self::ModeTransition => Some("mode_transition"),
+            Self::ManualRestart => Some("manual_restart"),
+            Self::SkippedFlashing => Some("skipped_flashing"),
+            Self::ServiceInactive => Some("service_inactive"),
+            Self::Restart => Some("restart"),
+        }
+    }
+}
+
+/// 選擇指紋更新動作；除最後一關外不查服務，`force` 不會解除 flash 重啟護欄。
+pub fn select_daemon_restart_action(
+    ctx: &CliCtx<'_>,
+    old_mode: &SupervisionMode,
+    target_mode: &SupervisionMode,
+    assessment: &DaemonCodeAssessment,
+    no_restart: bool,
+    any_flashing: bool,
+    _force: bool,
+) -> DaemonRestartAction {
+    if !assessment.stale {
+        return if assessment.checked {
+            DaemonRestartAction::None
+        } else {
+            DaemonRestartAction::NotChecked
+        };
+    }
+    if no_restart {
+        return DaemonRestartAction::SkippedNoRestartFlag;
+    }
+    if old_mode != target_mode {
+        return DaemonRestartAction::ModeTransition;
+    }
+    if target_mode == &SupervisionMode::OnDemand {
+        return DaemonRestartAction::ManualRestart;
+    }
+    if any_flashing {
+        return DaemonRestartAction::SkippedFlashing;
+    }
+    if !service_is_active(ctx, target_mode) {
+        return DaemonRestartAction::ServiceInactive;
+    }
+    DaemonRestartAction::Restart
+}
+
 fn service_argv(mode: &SupervisionMode, action: ServiceAction, with_sudo: bool) -> Vec<String> {
     match mode {
         SupervisionMode::SystemdUser => vec![
@@ -957,6 +1088,8 @@ pub struct ReconcileRequest {
     pub socket_path: Option<String>,
     pub config_path: PathBuf,
     pub old_stop: OldStop,
+    /// 僅由上層在同模式 systemd 刷新後明確要求時執行 daemon restart。
+    pub restart_daemon: bool,
 }
 
 #[derive(Debug)]
@@ -1069,6 +1202,14 @@ fn pending_privileged(
         );
     }
 
+    let restart_pending = req.restart_daemon
+        && req.old_mode == req.target_mode
+        && req.target_mode == SupervisionMode::SystemdSystem
+        && !req.with_sudo;
+    if restart_pending {
+        pending.push(service_argv(&req.target_mode, ServiceAction::Restart, true));
+    }
+
     if windows_service_transition {
         if req.target_mode == SupervisionMode::WindowsService {
             let def =
@@ -1090,7 +1231,18 @@ fn pending_privileged(
     }
 
     if !pending.is_empty() {
-        return Ok(Some(pending_only(req, &pending, None)));
+        let mut result = pending_only(req, &pending, None);
+        if req.restart_daemon {
+            result.insert(
+                "daemon_restart",
+                if restart_pending {
+                    PyValue::Str("pending_sudo".into())
+                } else {
+                    PyValue::Null
+                },
+            );
+        }
+        return Ok(Some(result));
     }
     Ok(None)
 }
@@ -1213,6 +1365,11 @@ fn stop_old(
     Ok(())
 }
 
+/// User unit 固定放在已解析的 HOME 下；一般設定仍依各自的 XDG／SERIALWRAP 覆寫規則。
+pub(crate) fn systemd_user_unit_path(home: &Path) -> PathBuf {
+    home.join(".config/systemd/user/serialwrap.service")
+}
+
 fn start_new(
     ctx: &mut CliCtx<'_>,
     req: &ReconcileRequest,
@@ -1222,7 +1379,7 @@ fn start_new(
     match req.target_mode {
         SupervisionMode::OnDemand => {}
         SupervisionMode::SystemdUser => {
-            let unit = req.home.join(".config/systemd/user/serialwrap.service");
+            let unit = systemd_user_unit_path(&req.home);
             write_asset(
                 ctx,
                 &unit,
@@ -1423,6 +1580,34 @@ pub fn reconcile(ctx: &mut CliCtx<'_>, req: &ReconcileRequest) -> Result<PyDict,
     }
     start_new(ctx, req, same_mode, &mut ran)?;
 
+    let daemon_restart = if req.restart_daemon {
+        if same_mode
+            && matches!(
+                req.target_mode,
+                SupervisionMode::SystemdUser | SupervisionMode::SystemdSystem
+            )
+        {
+            let restarted =
+                ctx.p
+                    .service
+                    .action(&req.target_mode, ServiceAction::Restart, req.with_sudo);
+            ran.push(service_argv(
+                &req.target_mode,
+                ServiceAction::Restart,
+                req.with_sudo,
+            ));
+            Some(PyValue::Str(if restarted.rc == Some(0) {
+                "ran".into()
+            } else {
+                "failed".into()
+            }))
+        } else {
+            Some(PyValue::Null)
+        }
+    } else {
+        None
+    };
+
     let mut config = endpoint_resolve::load_runtime_config(ctx)
         .map_err(|error| ReconcileError::Config(error.to_string()))?;
     config.set_mode(req.target_mode.as_str(), req.socket_path.as_deref());
@@ -1431,6 +1616,9 @@ pub fn reconcile(ctx: &mut CliCtx<'_>, req: &ReconcileRequest) -> Result<PyDict,
 
     let mut result = result_base(req, &req.target_mode, &ran, &[]);
     result.insert("transitioned", PyValue::Bool(!same_mode));
+    if let Some(outcome) = daemon_restart {
+        result.insert("daemon_restart", outcome);
+    }
     Ok(result)
 }
 
@@ -1445,6 +1633,90 @@ fn rpc_response(ctx: &CliCtx<'_>, endpoint: &str, method: &str, timeout: f64) ->
     )
     .ok()
     .map(|outcome| outcome.resp)
+}
+
+fn daemon_code_value(assessment: &DaemonCodeAssessment, action: DaemonRestartAction) -> PyDict {
+    let mut value = PyDict::new();
+    value.insert("stale", PyValue::Bool(assessment.stale));
+    value.insert(
+        "reason",
+        assessment
+            .reason
+            .as_ref()
+            .map(|reason| PyValue::Str(reason.clone()))
+            .unwrap_or(PyValue::Null),
+    );
+    value.insert(
+        "daemon",
+        assessment
+            .daemon
+            .as_ref()
+            .map(|fingerprint| PyValue::Str(fingerprint.clone()))
+            .unwrap_or(PyValue::Null),
+    );
+    value.insert(
+        "installed",
+        assessment
+            .installed
+            .as_ref()
+            .map(|fingerprint| PyValue::Str(fingerprint.clone()))
+            .unwrap_or(PyValue::Null),
+    );
+    if let Some(action) = action.as_str() {
+        value.insert("action", PyValue::Str(action.to_string()));
+    }
+    value
+}
+
+/// 驗證 restart 後 daemon 首次可連線時回報的程式碼指紋。
+///
+/// 每一輪都重新解析本機 endpoint，對齊 Python `_verify_daemon_code_after_restart`
+/// 內的 `_resolve_local_endpoint_info`（忽略 `--bench`，`--endpoint`／`--socket` 仍優先）。
+/// reconcile 可能已把 `config.yaml` 的 socket 寫成 canonical；不得沿用 reconcile 前凍結的 endpoint。
+pub fn verify_daemon_code_after_restart(
+    ctx: &mut CliCtx<'_>,
+    ns: &Namespace,
+    installed_fingerprint: Option<&str>,
+) -> &'static str {
+    const TIMEOUT_NS: u64 = 10_000_000_000;
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+    let deadline = ctx.p.clock.mono_ns().saturating_add(TIMEOUT_NS);
+    loop {
+        let endpoint = match endpoint_resolve::resolve_endpoint_info(
+            ctx,
+            &EndpointArgs {
+                endpoint: ns.str("endpoint"),
+                socket: ns.str("socket"),
+                bench: None,
+            },
+        ) {
+            Ok(resolved) => Some(resolved.endpoint),
+            Err(_) => None,
+        };
+        if let Some(endpoint) = endpoint.as_deref() {
+            if let Some(response) = rpc_response(ctx, endpoint, "health.ping", 0.5) {
+                if response.get_truthy("ok") {
+                    let daemon_fingerprint =
+                        response
+                            .get("code_fingerprint")
+                            .and_then(|value| match value {
+                                PyValue::Str(fingerprint) => Some(fingerprint.as_str()),
+                                _ => None,
+                            });
+                    return if daemon_fingerprint == installed_fingerprint {
+                        "match"
+                    } else {
+                        "mismatch"
+                    };
+                }
+            }
+        }
+        if ctx.p.clock.mono_ns() >= deadline {
+            return "unreachable";
+        }
+        ctx.p.clock.sleep(POLL_INTERVAL);
+    }
 }
 
 fn emit_error(ctx: &mut CliCtx<'_>, response: &PyDict, context: &str, exit: i32) -> i32 {
@@ -1664,8 +1936,17 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         .as_ref()
         .map(|resolved| resolved.endpoint.clone())
         .unwrap_or_else(|_| endpoint_resolve::local_default_endpoint(ctx));
-    let daemon_running = rpc_response(ctx, &old_endpoint, "health.ping", 0.5)
+    let ping = rpc_response(ctx, &old_endpoint, "health.ping", 0.5);
+    let daemon_running = ping
+        .as_ref()
         .is_some_and(|response| response.get_truthy("ok"));
+    let daemon_fingerprint = ping
+        .as_ref()
+        .and_then(|response| response.get("code_fingerprint"))
+        .and_then(|value| match value {
+            PyValue::Str(fingerprint) if !fingerprint.is_empty() => Some(fingerprint.clone()),
+            _ => None,
+        });
     let any_flashing = rpc_response(ctx, &old_endpoint, "mcu.status", 0.5)
         .is_some_and(|response| response.get_truthy("flashing"));
     if any_flashing && !force {
@@ -1738,13 +2019,29 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         ctx.paths.socket_path.clone()
     };
 
+    let installed_fingerprint = install_layout::code_fingerprint(ctx).ok().flatten();
+    let assessment = daemon_code_assessment(
+        daemon_running,
+        daemon_fingerprint.as_deref(),
+        installed_fingerprint.as_deref(),
+    );
+    let restart_action = select_daemon_restart_action(
+        ctx,
+        &old_mode,
+        &target,
+        &assessment,
+        flag(ns, "no_restart"),
+        any_flashing,
+        force,
+    );
+
     let req = ReconcileRequest {
         old_mode,
         target_mode: target,
         home,
         daemon_running,
         daemon_id,
-        old_endpoint,
+        old_endpoint: old_endpoint.clone(),
         any_flashing,
         with_sudo,
         force,
@@ -1752,6 +2049,7 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         socket_path: Some(socket_path),
         config_path: endpoint_resolve::config_write_path(ctx),
         old_stop: OldStop::Reconcile,
+        restart_daemon: restart_action == DaemonRestartAction::Restart,
     };
     let mut setup = match reconcile(ctx, &req) {
         Ok(result) => result,
@@ -1809,10 +2107,78 @@ pub fn run_setup(ns: &Namespace, ctx: &mut CliCtx<'_>) -> i32 {
         setup.insert("pending_sudo", PyValue::List(pending.clone()));
     }
 
+    let mut daemon_code = daemon_code_value(&assessment, restart_action);
+    if assessment.checked {
+        match restart_action {
+            DaemonRestartAction::Restart => match setup.get("daemon_restart") {
+                Some(PyValue::Str(outcome)) if outcome == "ran" => {
+                    daemon_code.insert("action", PyValue::Str("restarted".into()));
+                    let after =
+                        verify_daemon_code_after_restart(ctx, ns, installed_fingerprint.as_deref());
+                    daemon_code.insert("after", PyValue::Str(after.into()));
+                    if after != "match" {
+                        let hint = format!(
+                            "serialwrap: setup 已重啟 daemon，但它仍未回報與安裝版相同的程式碼指紋（after={after}）；用 `serialwrap daemon status` 看 code_path，確認 systemd unit 的 ExecStart 指向這份安裝"
+                        );
+                        daemon_code.insert("hint", PyValue::Str(hint.clone()));
+                        let _ = ctx.io.err_str(&format!("{hint}\n"));
+                    }
+                }
+                Some(PyValue::Str(outcome)) if outcome == "pending_sudo" => {
+                    daemon_code.insert("action", PyValue::Str("pending_sudo".into()));
+                    daemon_code.insert(
+                        "hint",
+                        PyValue::Str("system scope 需 root：請執行 pending_sudo 內的 restart 指令，或加 --with-sudo 重跑 setup".into()),
+                    );
+                }
+                Some(PyValue::Str(outcome)) if outcome == "failed" => {
+                    daemon_code.insert("action", PyValue::Str("restart_failed".into()));
+                    daemon_code.insert(
+                        "hint",
+                        PyValue::Str("systemctl restart 失敗；請手動執行 `serialwrap service restart` 並查 journalctl".into()),
+                    );
+                }
+                _ => {}
+            },
+            DaemonRestartAction::SkippedNoRestartFlag => {
+                daemon_code.insert(
+                    "hint",
+                    PyValue::Str(
+                        "已依 --no-restart 略過；準備好後執行 `serialwrap service restart`".into(),
+                    ),
+                );
+            }
+            DaemonRestartAction::ManualRestart => {
+                daemon_code.insert(
+                    "hint",
+                    PyValue::Str("on-demand 模式不自動重啟；請執行 `serialwrap daemon stop` 後 `serialwrap daemon start`".into()),
+                );
+            }
+            DaemonRestartAction::SkippedFlashing => {
+                daemon_code.insert(
+                    "hint",
+                    PyValue::Str(
+                        "flash 進行中不重啟 daemon；完成後執行 `serialwrap service restart`".into(),
+                    ),
+                );
+            }
+            DaemonRestartAction::ServiceInactive => {
+                daemon_code.insert(
+                    "hint",
+                    PyValue::Str("在跑的 daemon 不是 systemd 服務啟動的（可能是手動 start 的）；先停掉它，再 `serialwrap service restart`".into()),
+                );
+            }
+            _ => {}
+        }
+    }
+
     let mut response = PyDict::new();
     response.insert("ok", PyValue::Bool(true));
     response.insert("legacy", legacy);
     response.insert("setup", PyValue::Dict(setup));
+    if assessment.checked {
+        response.insert("daemon_code", PyValue::Dict(daemon_code));
+    }
     if let Some(recovered) = recovered_autostart_hold {
         response.insert("recovered_autostart_hold", PyValue::Dict(recovered));
     }

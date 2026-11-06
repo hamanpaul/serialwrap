@@ -273,7 +273,7 @@ ocp-mcu-upgrade -d <RUN_DIR>/dev/ttyMCU -b 115200 -t 8 -e -s -i <fw.bin>   # 期
 ### P2-4 安裝／監管模式轉換
 
 ```bash
-./install.sh                          # pipx 隔離 venv + serialwrap setup（有 systemd→systemd-user，無→on-demand 降級）
+./install.sh                          # 下載 release bundle 並驗 SHA256SUMS + bin/serialwrap setup（有 systemd→systemd-user，無→on-demand 降級；OD-50）
 ./install.sh --system --with-sudo     # 本機系統安裝（systemd-system）
 serialwrap doctor                     # 驗 python/pyyaml/PATH/dialout/systemd/監管模式/裝置
 ```
