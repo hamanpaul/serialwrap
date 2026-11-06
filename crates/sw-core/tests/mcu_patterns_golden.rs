@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 
-use sw_core::mcu_patterns::{bytes_hex_spaced, hex_to_bytes, McuPattern, McuPatternError, McuPatternRegistry};
+use sw_core::mcu_patterns::{
+    bytes_hex_spaced, hex_to_bytes, McuPattern, McuPatternError, McuPatternRegistry,
+};
 use sw_proto::pyjson::{self, PyDict, PyValue, RPC_WIRE};
 
 const GOLDEN: &str = include_str!("../../../contracts/golden/mcu_patterns.ndjson");
@@ -50,7 +52,9 @@ fn golden_rows_match_python() {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for (idx, line) in GOLDEN.lines().enumerate() {
         let lineno = idx + 1;
-        let rec = match pyjson::loads(line).unwrap_or_else(|e| panic!("line {lineno}: 非法 JSON: {e:?}")) {
+        let rec = match pyjson::loads(line)
+            .unwrap_or_else(|e| panic!("line {lineno}: 非法 JSON: {e:?}"))
+        {
             PyValue::Dict(d) => d,
             other => panic!("line {lineno}: 須為物件，實際 {other:?}"),
         };
@@ -58,19 +62,29 @@ fn golden_rows_match_python() {
             Some(PyValue::Str(s)) => s.clone(),
             other => panic!("line {lineno}: fn 缺漏或型別錯誤: {other:?}"),
         };
-        let input = rec.get("in").unwrap_or_else(|| panic!("line {lineno}: 缺 in")).clone();
-        let want = rec.get("out").unwrap_or_else(|| panic!("line {lineno}: 缺 out")).clone();
+        let input = rec
+            .get("in")
+            .unwrap_or_else(|| panic!("line {lineno}: 缺 in"))
+            .clone();
+        let want = rec
+            .get("out")
+            .unwrap_or_else(|| panic!("line {lineno}: 缺 out"))
+            .clone();
 
         let got = match f.as_str() {
             "hex_to_bytes" => {
-                let PyValue::Str(s) = &input else { panic!("line {lineno}: hex_to_bytes 的 in 須為字串") };
+                let PyValue::Str(s) = &input else {
+                    panic!("line {lineno}: hex_to_bytes 的 in 須為字串")
+                };
                 match hex_to_bytes(s) {
                     Ok(b) => PyValue::Str(bytes_hex_spaced(&b)),
                     Err(e) => err(&e),
                 }
             }
             "from_dict" => {
-                let PyValue::Dict(d) = &input else { panic!("line {lineno}: from_dict 的 in 須為 dict") };
+                let PyValue::Dict(d) = &input else {
+                    panic!("line {lineno}: from_dict 的 in 須為 dict")
+                };
                 match McuPattern::from_dict(d) {
                     Ok(p) => PyValue::Str(pattern_str(&p)),
                     Err(e) => err(&e),
@@ -78,7 +92,11 @@ fn golden_rows_match_python() {
             }
             "load" => match McuPatternRegistry::load(rows_of(&input).as_deref()) {
                 Ok(reg) => PyValue::Str(
-                    reg.all().iter().map(|p| pattern_str(p)).collect::<Vec<_>>().join(","),
+                    reg.all()
+                        .iter()
+                        .map(|p| pattern_str(p))
+                        .collect::<Vec<_>>()
+                        .join(","),
                 ),
                 Err(e) => err(&e),
             },
