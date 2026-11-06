@@ -11,12 +11,22 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{mpsc::{self, Receiver}, Mutex, MutexGuard},
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 use sw_pal::{conformance::posix_pty_pair, *};
+
+// 同一 test-binary 的平行 PTY case 可能在 holder 掃描期間改變 `/proc` 行程樹；
+// 逐 case 執行可保留每支回歸的原斷言，同時避免測試彼此成為外部 holder。
+static PTY_CASE_LOCK: Mutex<()> = Mutex::new(());
+
+fn pty_case_guard() -> MutexGuard<'static, ()> {
+    PTY_CASE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn cfg() -> SerialConfig {
     SerialConfig::from_uart_profile(115200, 8, "N", 1, "none", false)
@@ -33,6 +43,7 @@ fn show_open(r: &Result<Box<dyn SerialHandle>, OpenError>) -> String {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__second_open_in_process_is_held() {
+    let _pty_case = pty_case_guard();
     let (dev, _peer) = posix_pty_pair();
     let pal = sw_pal::native();
     let _h = pal.serial.open_exclusive(&dev, &cfg()).expect("first open");
@@ -50,6 +61,7 @@ fn cap_posix_pty__second_open_in_process_is_held() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy() {
+    let _pty_case = pty_case_guard();
     if sw_pal::conformance::has_cap_sys_admin() {
         eprintln!("EVIDENCE_MISSING: TIOCEXCL bypassed under CAP_SYS_ADMIN");
         return;
@@ -72,6 +84,7 @@ fn cap_posix_pty__external_plain_open_after_tiocexcl_is_ebusy() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__external_plain_open_before_daemon_is_held() {
+    let _pty_case = pty_case_guard();
     if let Ok(role) = std::env::var("S21_ROLE") {
         match role.as_str() {
             "holder" => run_external_holder_role(),
@@ -429,6 +442,7 @@ where
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__native_attach_spawn_sysenv() {
+    let _pty_case = pty_case_guard();
     let (dev, mut peer) = posix_pty_pair();
     let mut paused = pause_sysenv_spawn_while_holding_slave(&dev, || {
         sw_pal::native()
@@ -476,6 +490,7 @@ fn cap_posix_pty__native_attach_spawn_sysenv() {
 #[cfg(target_os = "linux")]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__native_attach_spawn_process_tunnel() {
+    let _pty_case = pty_case_guard();
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let (dev, mut peer) = posix_pty_pair();
@@ -604,6 +619,7 @@ fn cap_posix_pty__native_attach_spawn_process_tunnel() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__probe_close_reopen_with_master_open() {
+    let _pty_case = pty_case_guard();
     if sw_pal::conformance::has_cap_sys_admin() {
         eprintln!("EVIDENCE_MISSING: TIOCEXCL bypassed under CAP_SYS_ADMIN");
         return;
@@ -645,6 +661,7 @@ fn cap_posix_pty__probe_close_reopen_with_master_open() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__open_failure_after_tiocexcl_clears_excl() {
+    let _pty_case = pty_case_guard();
     if sw_pal::conformance::has_cap_sys_admin() {
         eprintln!("EVIDENCE_MISSING: TIOCEXCL bypassed under CAP_SYS_ADMIN");
         return;
@@ -676,6 +693,7 @@ fn cap_posix_pty__open_failure_after_tiocexcl_clears_excl() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__blocked_write_cancel_returns_partial_completed() {
+    let _pty_case = pty_case_guard();
     let (dev, mut peer) = posix_pty_pair();
     peer.stop_reading(); // 讓 PTY buffer 塞滿
     let h = sw_pal::native()
@@ -709,6 +727,7 @@ fn cap_posix_pty__blocked_write_cancel_returns_partial_completed() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__reader_woken_within_50ms() {
+    let _pty_case = pty_case_guard();
     let (dev, _peer) = posix_pty_pair();
     let h = sw_pal::native()
         .serial
@@ -732,6 +751,7 @@ fn cap_posix_pty__reader_woken_within_50ms() {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__conformance_suite() {
+    let _pty_case = pty_case_guard();
     sw_pal::conformance::serial_suite(
         sw_pal::native().serial.clone(),
         &|| {
@@ -762,6 +782,7 @@ impl UartExclusive for UnknownStatusHolders {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__accept_unverified_registers_unknown_holder_device() {
+    let _pty_case = pty_case_guard();
     use std::sync::Arc;
     let (dev, _peer) = posix_pty_pair();
     let key = std::fs::canonicalize(&dev.0)
@@ -839,6 +860,7 @@ impl UartExclusive for ForkWindowHolders {
 #[test]
 #[ignore = "cap:posix_pty"]
 fn cap_posix_pty__own_child_inherited_tty_is_not_foreign_holder() {
+    let _pty_case = pty_case_guard();
     use std::os::unix::fs::OpenOptionsExt;
 
     let (dev, _peer) = posix_pty_pair();
