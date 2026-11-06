@@ -226,7 +226,10 @@ def test_supervision_set_flashing_l15(tmp_path: Path, env: dict[str, str]) -> No
 @pytest.mark.process_rpc
 @pytest.mark.pidns_rig
 def test_supervision_set_rust_only_switch(tmp_path: Path, env: dict[str, str]) -> None:
-    """Stubd 交接成功走 systemd-user reconcile；METHOD_NOT_FOUND fail-closed 且不送 daemon.stop。"""
+    """Stubd 交接成功走 systemd-user reconcile；unit 位於隔離 HOME，不在 XDG_CONFIG_HOME。
+
+    METHOD_NOT_FOUND 仍 fail-closed：不改 config、不送一般 daemon.stop、不寫 user unit。
+    """
     cli = _rust_cli()
 
     def run_case(root: Path, *, handoff_ok: bool) -> None:
@@ -322,6 +325,12 @@ def test_supervision_set_rust_only_switch(tmp_path: Path, env: dict[str, str]) -
                 ran = data.get("setup", {}).get("ran", [])
                 assert ["serialwrap", "daemon", "handoff_stop"] in ran, ran
                 assert ["serialwrap", "daemon", "stop"] not in ran, ran
+                home_unit = Path(case_env["HOME"]) / ".config" / "systemd" / "user" / "serialwrap.service"
+                xdg_unit = Path(case_env["XDG_CONFIG_HOME"]) / "systemd" / "user" / "serialwrap.service"
+                assert home_unit.is_file(), f"user unit 應位於隔離 HOME：{home_unit}"
+                assert "ExecStart=%h/.local/bin/serialwrapd" in home_unit.read_text(encoding="utf-8")
+                assert not xdg_unit.exists(), f"user unit 不得位於 XDG_CONFIG_HOME：{xdg_unit}"
+                assert home_unit != Path.home() / ".config" / "systemd" / "user" / "serialwrap.service"
             else:
                 data = json_stdout(result)
                 assert result.returncode == 2, result.stdout + result.stderr
@@ -330,7 +339,12 @@ def test_supervision_set_rust_only_switch(tmp_path: Path, env: dict[str, str]) -
                 assert data.get("handoff_outcome") == "refused", data
                 assert config.read_bytes() == config_before
                 assert not systemctl_log.exists() or systemctl_log.read_text(encoding="utf-8") == ""
+                assert "daemon.stop" not in methods
                 assert holder.poll() is None, "unsupported handoff 不得停止 daemon"
+                home_unit = Path(case_env["HOME"]) / ".config" / "systemd" / "user" / "serialwrap.service"
+                xdg_unit = Path(case_env["XDG_CONFIG_HOME"]) / "systemd" / "user" / "serialwrap.service"
+                assert not home_unit.exists(), home_unit
+                assert not xdg_unit.exists(), xdg_unit
         finally:
             watcher_stop.set()
             if watcher is not None:

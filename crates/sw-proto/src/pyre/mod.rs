@@ -608,4 +608,46 @@ mod review_regression_tests {
             .collect();
         assert_eq!(digits.parse::<usize>().unwrap(), PARSE_DEPTH_LIMIT);
     }
+
+    /// CPython 3.12.3 `re.error`：不完整的 `\x`／`\u`／`\U` 訊息含已讀到的跳脫原文，位置在反斜線。
+    #[test]
+    fn incomplete_hex_escapes_match_cpython_text_and_position() {
+        for (pattern, message) in [
+            (r"\x4", r"incomplete escape \x4 at position 0"),
+            (r"\x", r"incomplete escape \x at position 0"),
+            (r"\x4g", r"incomplete escape \x4 at position 0"),
+            (r"\xg", r"incomplete escape \x at position 0"),
+            (r"ab\x4", r"incomplete escape \x4 at position 2"),
+            (r"[\x4]", r"incomplete escape \x4 at position 1"),
+            (r"\u", r"incomplete escape \u at position 0"),
+            (r"\u12", r"incomplete escape \u12 at position 0"),
+            (r"\u123g", r"incomplete escape \u123 at position 0"),
+            (r"[\u00[", r"incomplete escape \u00 at position 1"),
+            (r"\U", r"incomplete escape \U at position 0"),
+            (r"\U0001", r"incomplete escape \U0001 at position 0"),
+            (r"\U0000000", r"incomplete escape \U0000000 at position 0"),
+            (
+                "a\n\\x4",
+                "incomplete escape \\x4 at position 2 (line 2, column 1)",
+            ),
+            (r"(?x)\x4", r"incomplete escape \x4 at position 4"),
+            (r"(?x) \x4", r"incomplete escape \x4 at position 5"),
+            (r"\x41\x4", r"incomplete escape \x4 at position 4"),
+            (r"\u0041\u12", r"incomplete escape \u12 at position 6"),
+            (r"ab\u1cd", r"incomplete escape \u1cd at position 2"),
+            (r"\xA", r"incomplete escape \xA at position 0"),
+            (r"\u00GG", r"incomplete escape \u00 at position 0"),
+            ("é\\x4", "incomplete escape \\x4 at position 1"),
+            (r"[\x]", r"incomplete escape \x at position 1"),
+            (r"[\u]", r"incomplete escape \u at position 1"),
+            (r"[\U]", r"incomplete escape \U at position 1"),
+            (r"\x0", r"incomplete escape \x0 at position 0"),
+            (
+                "\\u12\n",
+                "incomplete escape \\u12 at position 0 (line 1, column 1)",
+            ),
+        ] {
+            assert_eq!(re_error(pattern), message, "{pattern:?}");
+        }
+    }
 }

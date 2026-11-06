@@ -3,11 +3,13 @@ usage: serialwrap setup
        [--user | --system | --on-demand | --windows-task | --windows-service | --rollback]
        [--force]
        [--with-sudo]
+       [--no-restart]
        [--with-com0com | --remove-com0com]
 
 物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，並 reconcile 監管模式（先停舊、再起新）。
 未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。
 system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。
+systemd 服務已在跑但 daemon 程式碼指紋過期時，預設自動 restart；--no-restart 可略過。
 
 options:
   -h, --help
@@ -22,6 +24,8 @@ options:
     覆蓋既有 profiles，並在 flash 進行中仍強制切換
   --with-sudo
     systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）
+  --no-restart
+    daemon 指紋過期時不自動 restart systemd service
   --windows-task
     Windows：以工作排程器登入自啟監管（Windows 預設）
   --windows-service

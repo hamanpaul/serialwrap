@@ -56,10 +56,21 @@ def f8_tty_holders_reported(ctx):
                 reason=f"{com} 的 tty（{dev}）未出現在 foreign_holders（#101 回歸：持有者掃描失效）",
                 category="test", reason_code="tty_holder_not_reported",
             )
-        if int(holders[dev]) != int(daemon_pid):
+        # S1X-a-6：entry 可能是 0.3.2 的 pid（int），或 BC-04 的
+        # {device, holder_unknown:true, pids?}（比照 realhw/acceptance/gate.py）。
+        entry = holders[dev]
+        pids = list(entry.get("pids") or []) if isinstance(entry, dict) else [entry]
+        if not pids:
             return CaseResult(
                 "FAIL",
-                reason=f"{com} 的 tty 持有者 pid={holders[dev]} ≠ 主 daemon pid={daemon_pid}"
+                reason=f"{com} 的 tty（{dev}）在 foreign_holders 只有 holder_unknown、無持有者 pid"
+                "（#101 回歸：持有者掃描失效）",
+                category="test", reason_code="tty_holder_not_reported",
+            )
+        if any(int(pid) != int(daemon_pid) for pid in pids):
+            return CaseResult(
+                "FAIL",
+                reason=f"{com} 的 tty 持有者 pid={pids} ≠ 主 daemon pid={daemon_pid}"
                 "（#101 回歸：持有者歸屬錯置，或存在未偵測的 two-reader）",
                 category="test", reason_code="tty_holder_wrong_pid",
             )

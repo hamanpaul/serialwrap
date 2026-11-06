@@ -4,6 +4,9 @@ mod common;
 use sw_cli::argparse::{parse_args, ParseResult};
 use sw_cli::cli_spec::{root_spec, SpecDefaults};
 
+/// `contracts/cli_help/linux` 以 Python 基線固定的 daemon 指紋；不是 Rust 執行檔雜湊。
+const PYTHON_BASELINE_FINGERPRINT: &str = "347ea96fa479";
+
 #[derive(Debug)]
 struct Case {
     argv: Vec<String>,
@@ -98,7 +101,10 @@ impl Case {
 fn native_paths_match_python_3_12_golden() {
     let dir = common::data_root().join("contracts/cli_help/linux");
     let spec = root_spec(&SpecDefaults {
-        version_line: sw_proto::version::version_line(),
+        version_line: format!(
+            "serialwrap {} (code {PYTHON_BASELINE_FINGERPRINT})",
+            sw_proto::version::version()
+        ),
         profile_dir: "/golden/config/profiles".into(),
         lock_path: "/golden/run/serialwrapd.lock".into(),
     });
@@ -153,7 +159,10 @@ fn stage1b_group_help_goldens_match_python_at_every_width() {
     const STAGE_1B_GROUPS: [&str; 6] = ["daemon", "remote", "connect", "benches", "service", "doctor"];
     let dir = common::data_root().join("contracts/cli_help/linux");
     let spec = root_spec(&SpecDefaults {
-        version_line: sw_proto::version::version_line(),
+        version_line: format!(
+            "serialwrap {} (code {PYTHON_BASELINE_FINGERPRINT})",
+            sw_proto::version::version()
+        ),
         profile_dir: "/golden/config/profiles".into(),
         lock_path: "/golden/run/serialwrapd.lock".into(),
     });

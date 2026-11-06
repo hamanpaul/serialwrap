@@ -385,20 +385,78 @@ fn emitted_code_extractor_ignores_associated_methods() {
 }
 
 #[test]
+fn emitted_codes_output_uses_cargo_directory_instead_of_data_root() {
+    let dir = tempfile::tempdir().expect("建立唯讀資料根目錄替身");
+    let root = dir.path().join("data");
+    let src = root.join("crates/sw-cli/src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join("contracts")).unwrap();
+    fs::write(
+        src.join("probe.rs"),
+        "fn probe() { ErrorCode::InvalidEndpoint; }",
+    )
+    .unwrap();
+    fs::write(
+        root.join("contracts/error_codes.yaml"),
+        "- code: INVALID_ENDPOINT\n  meaning: 測試端點\n",
+    )
+    .unwrap();
+    // 以普通檔案封住資料樹的 target；即使以 root 執行也無法在其中寫檔。
+    fs::write(root.join("target"), "不得寫入資料樹").unwrap();
+    for key in ["CARGO_TARGET_TMPDIR", "CARGO_TARGET_DIR"] {
+        let output_dir = dir.path().join(format!("輸出 目錄-{key}"));
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "extracted_emitted_codes_documented_and_written_to_target",
+                "--nocapture",
+            ])
+            .env("SW_TEST_DATA_DIR", &root)
+            .env_remove("CARGO_TARGET_TMPDIR")
+            .env_remove("CARGO_TARGET_DIR")
+            .env(key, &output_dir);
+        if key == "CARGO_TARGET_TMPDIR" {
+            // 兩者皆設時，TMPDIR 必須優先於無法寫入的 TARGET_DIR。
+            command.env("CARGO_TARGET_DIR", root.join("target"));
+        }
+        let output = command.output().expect("執行錯誤碼輸出子測試");
+        assert!(
+            output.status.success(),
+            "{key} 輸出失敗：{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(output_dir.join("emitted_codes.sw-cli.txt")).unwrap(),
+            "INVALID_ENDPOINT\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("target")).unwrap(),
+            "不得寫入資料樹"
+        );
+    }
+}
+
+#[test]
 fn extracted_emitted_codes_documented_and_written_to_target() {
-    // 3. 抽出 ErrorCode::([A-Za-z]+) 全部使用處，轉回 UPPER_SNAKE，輸出到 target/emitted_codes.sw-cli.txt
+    // 3. 抽出 ErrorCode::([A-Za-z]+) 全部使用處，轉回 UPPER_SNAKE，輸出至 Cargo 的可寫目錄。
     let root = common::data_root();
     let src_dir = root.join("crates").join("sw-cli").join("src");
     let codes = extract_emitted_codes_from_dir(&src_dir);
 
-    let target_dir = root.join("target");
-    let _ = fs::create_dir_all(&target_dir);
+    // 資料樹可以唯讀；執行期覆寫優先，缺省使用 Cargo 為整合測試提供的編譯期暫存目錄。
+    let target_dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    fs::create_dir_all(&target_dir).expect("建立 Cargo 錯誤碼輸出目錄失敗");
     let out_file = target_dir.join("emitted_codes.sw-cli.txt");
     let mut out_text = codes.join("\n");
     if !out_text.is_empty() {
         out_text.push('\n');
     }
-    fs::write(&out_file, &out_text).expect("寫入 target/emitted_codes.sw-cli.txt 失敗");
+    fs::write(&out_file, &out_text).expect("寫入 Cargo 目錄的 emitted_codes.sw-cli.txt 失敗");
 
     let yaml_p = root.join("contracts").join("error_codes.yaml");
     let skill_p = root

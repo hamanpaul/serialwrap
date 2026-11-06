@@ -36,7 +36,7 @@ fn action_kind(value: &PyValue) -> ActionKind {
         "store_true" => ActionKind::StoreTrue,
         "count" => ActionKind::Count,
         "append" => ActionKind::Append,
-        "version" => ActionKind::Version,
+        "version" | "_VersionAction" => ActionKind::Version,
         other => panic!("schema action 不在 argparse 子集內：{other}"),
     }
 }
@@ -49,6 +49,7 @@ fn action_default_matches(expected: &PyValue, actual: &ArgValue, profile_dir: &s
     }
     match (expected, actual) {
         (PyValue::Null, ArgValue::None) => true,
+        (PyValue::Str(expected), ArgValue::None) if expected == "==SUPPRESS==" => true,
         (PyValue::Bool(expected), ArgValue::Bool(actual)) => expected == actual,
         (PyValue::Str(expected), ArgValue::Str(actual)) => expected == actual,
         (PyValue::Int(PyInt::Small(expected)), ArgValue::Int(PyInt::Small(actual))) => {

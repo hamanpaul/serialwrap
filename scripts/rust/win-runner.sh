@@ -60,11 +60,16 @@ if [[ "$list_only" == "0" ]]; then
 fi
 keep_staging="${SW_WIN_KEEP:-0}"
 print_staging="${SW_WIN_PRINT_STAGING:-0}"
+# passwd 對照夾具不得位於 USERPROFILE 下；只有其普通檔案使用 worktree 路徑。
+# HOME、state 與其他 Windows 夾具仍使用原生磁碟 TMP，保留鎖與 symlink 的原生語意。
+passwd_fixture_dir="$ROOT/target/win-passwd-fixtures/$run_id"
+mkdir -p "$passwd_fixture_dir"
 cleanup() {
   local rc=$?
   trap - EXIT
   if [[ "$keep_staging" != "1" ]]; then
     rm -rf -- "$staging"
+    rm -rf -- "$passwd_fixture_dir"
   fi
   if [[ "$print_staging" == "1" ]]; then
     printf '%s\n' "$staging" >&2
@@ -128,6 +133,7 @@ if [[ -f "$staging/serialwrapd.exe" ]]; then
 fi
 
 export SW_TEST_DATA_DIR="$staging/data"
+export SW_TEST_PASSWD_FIXTURE_DIR="$passwd_fixture_dir"
 export TMP="$staging/tmp"
 export TEMP="$staging/tmp"
 
@@ -156,6 +162,7 @@ while IFS= read -r name; do
   [[ "$name" == SERIALWRAP_* ]] && append_wsl_env "${name}"
 done < <(compgen -e)
 append_wsl_env "SW_TEST_DATA_DIR/p"
+append_wsl_env "SW_TEST_PASSWD_FIXTURE_DIR/p"
 append_wsl_env "TMP/p"
 append_wsl_env "TEMP/p"
 export WSLENV="$wsl_env"

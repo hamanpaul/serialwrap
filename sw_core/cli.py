@@ -41,20 +41,28 @@ from .platform_backends import select_rpc_backend
 from .release_manifest import daemon_launch_argv
 from .runtime_config import RuntimeConfig
 from .service_ctl import service_action
+from .source_policy import check_source
 from .util import normalize_endpoint_path
 from .sysenv import force_utf8_stdio
 from .setup_cmd import (
     SYSTEM_SOCKET,
     FlashingBusy,
+    daemon_code_assessment,
     detect_legacy_install,
     ensure_wsl_systemd,
     materialize_assets,
     reconcile,
+    service_is_active,
     wait_old_daemon_gone,
 )
 # 版本解析（#154：邏輯搬到 sw_core/version.py，daemon 端也能共用；此處保留原名
 # 重新匯出，既有呼叫點（含 --version flag、其餘既有引用）原樣不動）。
-from .version import _repo_version_path, resolve_version as _resolve_version
+from .version import (
+    _repo_version_path,
+    code_fingerprint as _code_fingerprint,
+    format_version_with_fingerprint as _format_version_with_fingerprint,
+    resolve_version as _resolve_version,
+)
 
 _USE_DEFAULT_ENV = object()
 LEGACY_DAEMON_ENV_FILE = "~/OPI.env"
@@ -101,6 +109,10 @@ def _config_path_env() -> dict[str, str]:
 LONG_RPC_TIMEOUT_FLOOR_S = 45.0
 # 一般（非長操作）方法未顯式指定 --timeout 時的預設 RPC timeout，維持既有 5s。
 DEFAULT_RPC_TIMEOUT_S = 5.0
+_SOURCE_HELP = (
+    "system／system:* 為保留來源並會拒絕；bare human 正規化為 human:cli 並走 human 行為；"
+    "明寫 human:<名> 依 DF-02 走 agent 行為。"
+)
 _BENCH_STATE_IO_LOCK = threading.Lock()
 _JSON_BOUNDARY_GLOBAL_OPTIONS = frozenset(
     {"--socket", "--endpoint", "--bench", "--timeout", "--retries"}
@@ -143,6 +155,23 @@ class _EndpointResolutionError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _source_rejected(
+    raw: object,
+    *,
+    default: str,
+    context: str,
+    field: str = "source",
+    normalize_human: bool = True,
+) -> bool:
+    """CLI 端先拒絕保留前綴；權限語意仍由 daemon 依原始 RPC 值判定。"""
+    check = check_source(raw, default=default, field=field, normalize_human=normalize_human)
+    if check.error is None:
+        return False
+    _print(check.error)
+    _mirror_err(check.error, context=context)
+    return True
 
 
 def _print(obj: dict[str, Any]) -> None:
@@ -1031,21 +1060,31 @@ def _effective_timeout_s(args: argparse.Namespace, method: str) -> float:
 
 
 def _warn_version_mismatch(resp: dict[str, Any]) -> None:
-    """client／daemon 版本不一致時在 stderr 印一行警告（#154，勿擋、純副作用）。
+    """client／daemon 版本或程式碼不一致時在 stderr 印警告，不改 RPC 結果。
 
     daemon 端 ``SerialwrapService.rpc()`` wrapper 對每個回應都會 ``setdefault``
     帶上 ``version`` 欄位；本函式在 CLI 收到回應後就地比對。舊版 daemon（本欄位
     加入前部署）回應無此欄位時靜默略過——不是新增的假警報，只是無從比對。
     """
     daemon_version = resp.get("version")
-    if not isinstance(daemon_version, str) or not daemon_version.strip():
+    if isinstance(daemon_version, str) and daemon_version.strip():
+        cli_version = _resolve_version()
+        if cli_version not in ("unknown", daemon_version):
+            sys.stderr.write(
+                f"serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致"
+                "（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+            )
+            return
+    daemon_fp = resp.get("code_fingerprint")
+    if not isinstance(daemon_fp, str) or not daemon_fp:
         return
-    cli_version = _resolve_version()
-    if cli_version in ("unknown", daemon_version):
+    cli_fp = _code_fingerprint()
+    if cli_fp is None or cli_fp == daemon_fp:
         return
     sys.stderr.write(
-        f"serialwrap: client 版本 {cli_version} 與 daemon 版本 {daemon_version} 不一致"
-        "（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+        f"serialwrap: client 程式碼 {cli_fp} 與 daemon 程式碼 {daemon_fp} 不一致"
+        "（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`"
+        "（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n"
     )
 
 
@@ -1736,6 +1775,37 @@ def _resolve_target_mode(args: argparse.Namespace, fx) -> str:
     return "systemd-user" if fx.has_systemd() else "on-demand"
 
 
+_DAEMON_CODE_HINTS = {
+    "skipped_no_restart_flag": "已依 --no-restart 略過；準備好後執行 `serialwrap service restart`",
+    "manual_restart": "on-demand 模式不自動重啟；請執行 `serialwrap daemon stop` 後 `serialwrap daemon start`",
+    "skipped_flashing": "flash 進行中不重啟 daemon；完成後執行 `serialwrap service restart`",
+    "service_inactive": (
+        "在跑的 daemon 不是 systemd 服務啟動的（可能是手動 start 的）；先停掉它，"
+        "再 `serialwrap service restart`"
+    ),
+}
+_RESTART_VERIFY_TIMEOUT_S = 10.0
+_RESTART_VERIFY_INTERVAL_S = 0.5
+
+
+def _verify_daemon_code_after_restart(
+    args: argparse.Namespace, installed_fingerprint: str | None
+) -> str:
+    """重啟後輪詢 health.ping，確認 daemon 已載入安裝版指紋。"""
+    deadline = time.monotonic() + _RESTART_VERIFY_TIMEOUT_S
+    while True:
+        try:
+            resolved = _resolve_local_endpoint_info(args)
+            ping = _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5)
+            if ping.get("ok"):
+                return "match" if ping.get("code_fingerprint") == installed_fingerprint else "mismatch"
+        except Exception:  # noqa: BLE001 — 重啟後連線恢復前繼續輪詢
+            pass
+        if time.monotonic() >= deadline:
+            return "unreachable"
+        time.sleep(_RESTART_VERIFY_INTERVAL_S)
+
+
 def _run_setup(args: argparse.Namespace) -> int:
     """物化資產並 reconcile 監管模式，輸出 legacy 偵測與 setup 結果。"""
     from .sysenv import SystemEffects
@@ -1753,6 +1823,7 @@ def _run_setup(args: argparse.Namespace) -> int:
     #    setup 仍是本機操作，probe 必須忽略 --bench；flash 偵測須在物化「之前」——
     #    否則燒錄中仍會先覆寫 profiles/wrappers/skill 才報錯（Codex #1c）。
     daemon_running = False
+    daemon_fingerprint: str | None = None
     any_flashing = False
     old_endpoint: str | None = None
     old_pid: int | None = None
@@ -1760,11 +1831,13 @@ def _run_setup(args: argparse.Namespace) -> int:
     try:
         resolved = _resolve_local_endpoint_info(args)
         old_endpoint = resolved.endpoint
-        daemon_running = bool(
-            _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5).get("ok")
-        )
+        ping = _rpc_call_traced(args, resolved, "health.ping", {}, timeout_s=0.5)
+        daemon_running = bool(ping.get("ok"))
+        raw_fingerprint = ping.get("code_fingerprint")
+        daemon_fingerprint = raw_fingerprint if isinstance(raw_fingerprint, str) and raw_fingerprint else None
     except Exception:
         daemon_running = False
+        daemon_fingerprint = None
     try:
         mcu_resolved = _resolve_local_endpoint_info(args)
         any_flashing = bool(
@@ -1841,6 +1914,29 @@ def _run_setup(args: argparse.Namespace) -> int:
         else (SYSTEM_SOCKET if target == "systemd-system" else SOCKET_PATH)
     )
 
+    code_state = daemon_code_assessment(
+        daemon_running=daemon_running,
+        daemon_fingerprint=daemon_fingerprint,
+        installed_fingerprint=_code_fingerprint(),
+    )
+    restart_daemon = False
+    if code_state["stale"]:
+        if getattr(args, "no_restart", False):
+            code_state["action"] = "skipped_no_restart_flag"
+        elif old != target:
+            code_state["action"] = "mode_transition"
+        elif target == "on-demand":
+            code_state["action"] = "manual_restart"
+        elif any_flashing:
+            code_state["action"] = "skipped_flashing"
+        elif not service_is_active(fx, target):
+            code_state["action"] = "service_inactive"
+        else:
+            restart_daemon = True
+            code_state["action"] = "restart"
+    elif code_state["checked"]:
+        code_state["action"] = "none"
+
     def ping_old_endpoint(endpoint: str) -> bool:
         try:
             source = resolved.source if resolved is not None else "setup"
@@ -1871,6 +1967,8 @@ def _run_setup(args: argparse.Namespace) -> int:
             with_sudo=args.with_sudo,
             force=args.force,
             socket_path=effective_socket,
+            config_path=os.path.join(CONFIG_DIR, "config.yaml"),
+            restart_daemon=restart_daemon,
         )
     except FlashingBusy as exc:
         resp = {
@@ -1904,6 +2002,29 @@ def _run_setup(args: argparse.Namespace) -> int:
     pending_sudo = result.get("pending_sudo")
     if pending_sudo:
         payload["pending_sudo"] = pending_sudo
+    if restart_daemon:
+        outcome = result.get("daemon_restart")
+        if outcome == "ran":
+            code_state["action"] = "restarted"
+            code_state["after"] = _verify_daemon_code_after_restart(args, code_state["installed"])
+            if code_state["after"] != "match":
+                msg = (
+                    "serialwrap: setup 已重啟 daemon，但它仍未回報與安裝版相同的程式碼指紋"
+                    f"（after={code_state['after']}）；用 `serialwrap daemon status` 看 code_path，"
+                    "確認 systemd unit 的 ExecStart 指向這份安裝"
+                )
+                code_state["hint"] = msg
+                sys.stderr.write(msg + "\n")
+        elif outcome == "pending_sudo":
+            code_state["action"] = "pending_sudo"
+            code_state["hint"] = "system scope 需 root：請執行 pending_sudo 內的 restart 指令，或加 --with-sudo 重跑 setup"
+        elif outcome == "failed":
+            code_state["action"] = "restart_failed"
+            code_state["hint"] = "systemctl restart 失敗；請手動執行 `serialwrap service restart` 並查 journalctl"
+    elif code_state.get("action") in _DAEMON_CODE_HINTS:
+        code_state["hint"] = _DAEMON_CODE_HINTS[code_state["action"]]
+    if code_state["checked"]:
+        payload["daemon_code"] = {key: value for key, value in code_state.items() if key != "checked"}
     _print(payload)
     return 0
 
@@ -2013,6 +2134,17 @@ def _run_profile_test(args: argparse.Namespace) -> int:
     return 0
 
 
+class _VersionAction(argparse.Action):
+    """只在實際使用 --version 時才計算整個套件的程式碼指紋。"""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):  # noqa: A002
+        super().__init__(option_strings=option_strings, dest=dest, default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: ANN001
+        sys.stdout.write(f"serialwrap {_format_version_with_fingerprint()}\n")
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="serialwrap",
@@ -2025,7 +2157,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    p.add_argument("--version", action="version", version=f"serialwrap {_resolve_version()}", help="顯示版本後離開")
+    p.add_argument("--version", action=_VersionAction, help="顯示版本與程式碼指紋後離開")
     p.add_argument("-v", "--verbose", action="count", default=0, help="提高 CLI trace 詳細度（-v=INFO，-vv=DEBUG；優先於 SERIALWRAP_LOG_LEVEL）")
     p.add_argument("--socket", default=None, help="本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）")
     p.add_argument("--endpoint", default=None, metavar="ENDPOINT", help="遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）")
@@ -2119,7 +2251,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回",
     )
     p_drel.add_argument("--selector", required=True)
-    p_drel.add_argument("--source", default="cli")
+    p_drel.add_argument("--source", default="cli", help=_SOURCE_HELP)
     p_drel.add_argument("--reason", default=None)
     p_datt = device_sub.add_parser(
         "attach",
@@ -2172,7 +2304,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scl.add_argument("--selector", required=True, help="session_id | COMx | alias")
     p_sio = sess_sub.add_parser("interactive-open", help="開啟 interactive lease（給全螢幕互動程式用）")
     p_sio.add_argument("--selector", required=True, help="session_id | COMx | alias")
-    p_sio.add_argument("--owner", default="agent")
+    p_sio.add_argument("--owner", default="agent", help=_SOURCE_HELP)
     p_sio.add_argument("--timeout", dest="interactive_timeout_s", type=float, default=60.0)
     p_sio.add_argument("--command", default="")
     p_sio.add_argument(
@@ -2245,12 +2377,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=f"要執行的單行命令（UTF-8 > {CMD_WARN_BYTES} bytes warning、> {CMD_REJECT_BYTES} bytes 拒絕，詳見上方說明）",
     )
-    p_cs.add_argument("--source", default="agent")
+    p_cs.add_argument("--source", default="agent", help=_SOURCE_HELP)
     p_cs.add_argument("--mode", default="line")
     p_cs.add_argument("--priority", type=int, default=10)
     p_cs.add_argument("--cmd-timeout", dest="cmd_timeout_s", type=float, default=10.0)
     p_cs.add_argument("--expected-duration", dest="expected_duration_s", type=float, default=None)
     p_cs.add_argument("--completion-regex", default=None, help="每命令完成 regex（最多 1024 UTF-8 bytes）；省略則等待 profile prompt")
+    p_cs.add_argument(
+        "--expect-reboot",
+        action="store_true",
+        help=(
+            "明示此命令會重開機（如 `firstboot -y && reboot`、`sysupgrade`）：不管命令文字一律走 reboot 路徑；"
+            "不可與 --mode interactive 併用"
+        ),
+    )
     p_cg = cmd_sub.add_parser("status", help="查詢命令狀態與 stdout（line 模式讀這裡）")
     p_cg.add_argument("--cmd-id", required=True)
     p_cr = cmd_sub.add_parser("result-tail", help="增量讀取 background 命令的結果 chunk")
@@ -2316,7 +2456,7 @@ def build_parser() -> argparse.ArgumentParser:
                       default="auto",
                       help="chunk 命令行送出方式（#161）：auto=有 echo-ACK 原語即節流（預設）、"
                            "echo=強制 echo-ACK、none=legacy 整行送出（急件換吞吐）")
-    p_fp.add_argument("--source", default="agent")
+    p_fp.add_argument("--source", default="agent", help=_SOURCE_HELP)
     p_fl = file_sub.add_parser("pull", help="透過 UART 從 target 拉取檔案到本機")
     p_fl.add_argument("--selector", required=True)
     p_fl.add_argument("--remote", required=True)
@@ -2326,7 +2466,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fl.add_argument("--ack-mode", dest="ack_mode", choices=["auto", "echo", "none"],
                       default="auto",
                       help="介面對齊 file push（#161）；pull 端目前僅驗證、不影響行為")
-    p_fl.add_argument("--source", default="agent")
+    p_fl.add_argument("--source", default="agent", help=_SOURCE_HELP)
 
     p_wal = sub.add_parser(
         "wal",
@@ -2495,7 +2635,8 @@ def build_parser() -> argparse.ArgumentParser:
             "物化套件資產（profiles／agent skill／minicom wrappers）到使用者位置，"
             "並 reconcile 監管模式（先停舊、再起新）。\n"
             "未指定模式時自動偵測（有 systemd → systemd-user，否則 on-demand）。\n"
-            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。"
+            "system scope 的特權動作需 --with-sudo，否則只回報待執行的 sudo 指令。\n"
+            "systemd 服務已在跑但 daemon 程式碼指紋過期時，預設自動 restart；--no-restart 可略過。"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -2515,6 +2656,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="systemd-system 模式下允許執行特權 sudo 指令（安裝 unit／enable／start）",
+    )
+    p_setup.add_argument(
+        "--no-restart",
+        dest="no_restart",
+        action="store_true",
+        default=False,
+        help="daemon 指紋過期時不自動 restart systemd service",
     )
 
     sub.add_parser(
@@ -2627,6 +2775,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.device_cmd == "list":
             return _run_rpc(args, "device.list", {})
         if args.device_cmd == "release":
+            if _source_rejected(args.source, default="cli", context="device.release"):
+                return 1
             return _run_rpc(args, "device.release", {"selector": args.selector, "source": args.source, "reason": args.reason})
         if args.device_cmd == "attach":
             return _run_rpc(args, "device.attach", {"selector": args.selector, "force": args.force})
@@ -2668,6 +2818,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.session_cmd == "console-list":
             return _run_rpc(args, "session.console_list", {"selector": args.selector})
         if args.session_cmd == "interactive-open":
+            if _source_rejected(
+                args.owner,
+                default="agent",
+                context="session.interactive_open",
+                field="owner",
+                normalize_human=False,
+            ):
+                return 1
             return _run_rpc(
                 args,
                 "session.interactive_open",
@@ -2716,8 +2874,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cmd":
         if args.cmd_cmd == "submit":
             from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+            from .expect_reboot import expect_reboot_rejection
             if not valid_completion_regex(args.completion_regex):
                 _print({"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX})
+                return 1
+            if _source_rejected(args.source, default="agent", context="command.submit"):
+                return 1
+            rejection = expect_reboot_rejection(args.expect_reboot, args.mode)
+            if rejection is not None:
+                _print(rejection)
                 return 1
             submit_params: dict[str, Any] = {
                 "selector": args.selector,
@@ -2731,6 +2896,8 @@ def main(argv: list[str] | None = None) -> int:
                 submit_params["expected_duration_s"] = args.expected_duration_s
             if args.completion_regex is not None:
                 submit_params["completion_regex"] = args.completion_regex
+            if args.expect_reboot:
+                submit_params["expect_reboot"] = True
             return _run_rpc(args, "command.submit", submit_params)
         if args.cmd_cmd == "status":
             return _run_rpc(args, "command.get", {"cmd_id": args.cmd_id})
@@ -2765,6 +2932,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "file":
         if args.file_cmd == "push":
+            if _source_rejected(args.source, default="agent", context="file.push"):
+                return 1
             params = {
                 "selector": args.selector,
                 "local_path": args.local,
@@ -2778,6 +2947,8 @@ def main(argv: list[str] | None = None) -> int:
                 params["chunk_timeout_s"] = args.chunk_timeout_s
             return _run_rpc(args, "file.push", params)
         if args.file_cmd == "pull":
+            if _source_rejected(args.source, default="agent", context="file.pull"):
+                return 1
             p: dict[str, Any] = {
                 "selector": args.selector,
                 "remote_path": args.remote,

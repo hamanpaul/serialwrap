@@ -225,8 +225,8 @@ def test_submit_attached_passthrough_session_not_ready(tmp_path, monkeypatch):
     svc = _svc_for(mgr)
     monkeypatch.setattr("sw_core.session_manager.time.monotonic", lambda: 1010.0)
     resp = svc.rpc("command.submit", {"selector": "COM0", "cmd": "ls"})
-    # SerialwrapService.rpc 會於回應尾端補 daemon 版本欄位 version（#154），鍵序比對時排除。
-    assert [k for k in resp if k != "version"] == ["ok", "error_code", "passthrough_ready_in_s", "session"]
+    # SerialwrapService.rpc 於回應尾端補版本與啟動時程式碼指紋，鍵序比對時排除這兩個診斷欄位。
+    assert [k for k in resp if k not in {"version", "code_fingerprint"}] == ["ok", "error_code", "passthrough_ready_in_s", "session"]
     assert resp["error_code"] == "SESSION_NOT_READY"
     assert resp["passthrough_ready_in_s"] == 20.0
 

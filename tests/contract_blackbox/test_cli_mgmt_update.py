@@ -287,7 +287,8 @@ def test_revert_new_daemon_push_not_aborted_l15(tmp_path: Path, env: dict[str, s
     expected_md5, remote = make_push_file(source)
     try:
         update_thread.start()
-        wait_pause(pause_dir, "start_and_verify:started")
+        # 這個暫停點在 handoff、停舊 daemon、啟動新 bundle 之後，hosted runner 要超過預設 20 秒
+        wait_pause(pause_dir, "start_and_verify:started", timeout_s=90.0)
         new_pid = daemon_pid(env)
         assert new_pid != old_pid
         assert wait_session(env)["state"] == "READY"
@@ -470,6 +471,19 @@ def test_update_background_triggers_zero_tx_in_drain_window_l15(tmp_path: Path, 
 def test_update_systemd_exit1_not_relaunched_l15(tmp_path: Path, env: dict[str, str]) -> None:
     """經 run-systemd.sh 實跑兩版 bundle：舊 daemon exit 1 時 NRestarts 為零、holder 不重疊且新版本就緒。"""
     old, new = update_bundles()
+    # 比照 release／run-upgrade：容器只有系統 Python，不能使用綁定 hosted toolcache 的 venv。
+    for bundle, version in ((old, "0.4.0"), (new, "0.4.1")):
+        cfg = bundle / "versions" / version / "py" / "pyvenv.cfg"
+        assert cfg.is_file(), f"Docker bundle 缺少 runtime 設定：{cfg}"
+        runtime: dict[str, str] = {}
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                runtime[key.strip()] = value.strip()
+        assert runtime.get("home") == "/usr/bin", f"Docker bundle 必須 home = /usr/bin：{cfg}\n{runtime}"
+        assert runtime.get("include-system-site-packages") == "false", (
+            f"Docker bundle 必須 include-system-site-packages = false：{cfg}\n{runtime}"
+        )
     run_id = f"g5-rust-refactor-{os.getpid()}-{time.time_ns()}"
     out = repo_root() / "target" / "g5-tmp" / f"systemd-evidence-{run_id}"
     script = repo_root() / "scripts" / "docker" / "run-systemd.sh"
@@ -484,11 +498,16 @@ def test_update_systemd_exit1_not_relaunched_l15(tmp_path: Path, env: dict[str, 
         report_path = out / "l15-docker-report.json"
         assert report_path.is_file(), result.stdout + result.stderr
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        assert report.get("evidence_layer") == "L1.5-docker", report
-        assert report.get("producer") == "run-systemd.sh", report
-        assert report.get("results", [{}])[0].get("case_id") == "update-exit1", report
-        assert report.get("results", [{}])[0].get("verdict") == "PASS", report
-        assert result.returncode == 0, result.stdout + result.stderr
+        # 字典的 pytest repr 會省略 runner_error／reason；保留完整 JSON 與 runner 輸出以追查 CI 環境差異。
+        diagnostic = (
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+            + f"\nrunner rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert report.get("evidence_layer") == "L1.5-docker", diagnostic
+        assert report.get("producer") == "run-systemd.sh", diagnostic
+        assert report.get("results", [{}])[0].get("case_id") == "update-exit1", diagnostic
+        assert report.get("results", [{}])[0].get("verdict") == "PASS", diagnostic
+        assert result.returncode == 0, diagnostic
     finally:
         # 報告與 journal 先複製到 worktree 的穩定位置再刪暫存目錄；刪除失敗直接拋出，不靜默吞錯。
         if out.is_dir():

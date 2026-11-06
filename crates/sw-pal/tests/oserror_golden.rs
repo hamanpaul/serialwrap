@@ -11,13 +11,14 @@ fn file_case(id: &str) -> common::OsErrCase {
         .into_iter()
         .find(|c| c.id == id)
         .unwrap_or_else(|| panic!("golden 缺少 case {id}"))
+        .with_native_language()
 }
 
 fn assert_fs_error(id: &str, e: &PalError) {
     let g = file_case(id);
     assert_eq!(
-        (e.strerror.as_str(), e.os_code),
-        (g.strerror.as_str(), g.errno),
+        (e.strerror.as_str(), e.os_code, e.winerror),
+        (g.strerror.as_str(), g.errno, g.winerror),
         "{id}"
     );
 }

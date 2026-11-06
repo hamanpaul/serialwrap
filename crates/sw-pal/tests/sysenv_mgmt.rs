@@ -3,6 +3,8 @@
 //! 執行：`cargo test -p sw-pal --features test-fakes --test sysenv_mgmt`。
 //! 會改動行程環境（PATH／USER／PATHEXT）或會以 PATH 解析子行程的案例，全部持有 `ENV_LOCK`，
 //! 避免平行測試互相污染；`EnvRestore` 在案例結束（含 panic）時還原被改動的變數。
+mod common;
+
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -369,13 +371,24 @@ fn run_invalid_utf8_error_spans_match_python_goldens() {
 #[test]
 fn run_windows_acp_decode_golden() {
     let _g = env_guard();
-    let line = golden_line("windows_acp_echo");
-    let want = golden_str(&line, "stdout").expect("golden stdout");
+    // cmd 的 OEM／console code page 不保證等於 ACP；以同機 Python 的 mbcs 解碼為準。
+    // 仍逐字鎖定完整 stdout／stderr、rc 與 universal newline，不修改或正規化實際輸出。
+    let want = common::python_utf8(
+        r#"import subprocess, sys
+p = subprocess.run(['cmd', '/d', '/c', 'echo \u4e2d\u6587'], capture_output=True, text=True, encoding='mbcs')
+assert p.returncode == 0, p
+assert p.stderr == '', p
+sys.stdout.buffer.write(p.stdout.encode('utf-8'))
+"#,
+        &[],
+    );
 
     let out = native_client()
         .env
-        .run(&argv(&["cmd", "/c", "echo 中文"]), None)
+        .run(&argv(&["cmd", "/d", "/c", "echo 中文"]), None)
         .unwrap();
+    assert_eq!(out.rc, 0);
+    assert_eq!(out.stderr, "");
     assert_eq!(out.stdout, want);
 }
 

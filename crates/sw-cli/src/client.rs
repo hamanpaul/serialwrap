@@ -34,6 +34,9 @@ pub enum ParamOrigin {
     Argv,
     /// 參數來自檔案內容（`event add --file`）。
     Document,
+    /// 參數來自檔案內容且含孤立 surrogate（S1X-b-2）：Python `json.load` 保留 surrogate，
+    /// `json.dumps(...).encode("utf-8")` 於連線成功後、送出前失敗，daemon 收到 0 筆請求行。
+    DocumentLoneSurrogate,
 }
 
 /// NaN／<0／奈秒向上取整後達到 2**63 → InvalidTimeout；0 → NonBlocking；其他 → Blocking。
@@ -381,8 +384,11 @@ fn rpc_call_once_capped_origin_meta(
     };
 
     // Q-19 (b)：argv 衍生參數含非 UTF-8 原文時，連線成功後、送出前以編碼錯誤結束（daemon 收到 0 筆請求行）。
-    // 檔案內容來源（`ParamOrigin::Document`）不檢查：JSON 的 NUL 等碼位是合法內容。
-    if origin == ParamOrigin::Argv && crate::argv::value_is_tainted(params) {
+    // 檔案內容來源（`ParamOrigin::Document`）不檢查：JSON 的 NUL 等碼位是合法內容；
+    // 含孤立 surrogate 的檔案內容（`ParamOrigin::DocumentLoneSurrogate`，S1X-b-2）同樣於此結束。
+    if (origin == ParamOrigin::Argv && crate::argv::value_is_tainted(params))
+        || origin == ParamOrigin::DocumentLoneSurrogate
+    {
         return Err(ClientCrash::EncodeError(
             crate::argv::NOT_UTF8_MESSAGE.to_string(),
         ));

@@ -180,9 +180,9 @@ def test_doctor_ab_shared_checks(tmp_path: Path) -> None:
     assert not any(c.get("check") == "version_pairing" for c in py_checks)
     assert not any(c.get("check") == "version_pairing" for c in cli_checks)
 
-    # Linux 前 18 項逐欄比對（python／pyyaml 的 detail 除外，見上方 SC-25 附註）
-    assert len(py_checks) == 18
-    assert len(cli_checks) == 18
+    # Linux 清單含 daemon_code_current，共 19 項（python／pyyaml 的 detail 除外，見上方 SC-25 附註）
+    assert len(py_checks) == 19
+    assert len(cli_checks) == 19
     assert [c["check"] for c in cli_checks] == [c["check"] for c in py_checks]
 
     for py_item, cli_item in zip(py_checks, cli_checks):

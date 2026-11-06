@@ -21,6 +21,7 @@ from .arbiter import (
 from .admission import AdmissionGate
 from .config import ProfileTemplate, SessionProfile
 from .command_completion import ERROR_INVALID_COMPLETION_REGEX, valid_completion_regex
+from .expect_reboot import add_submit_warning, chained_reboot_warning, expect_reboot_rejection
 from .constants import (
     CONFIG_DIR,
     DEVICE_BY_ID_DIR,
@@ -44,10 +45,15 @@ from .device_watcher import DeviceWatcher
 from .event_engine import EventEngine, EngineDeps
 from .event_engine.line_buffer import LineBuffer
 from .file_transfer import _ACK_MODES, DEFAULT_CHUNK_SIZE
-from .session_manager import SessionManager, passthrough_file_transfer_error
+from .session_manager import (
+    SessionManager,
+    find_chained_reboot_segment,
+    passthrough_file_transfer_error,
+)
+from .source_policy import SourceCheck, check_source, classify_source
 from .test_allowlist import AllowlistDecision, AllowlistDeviceSource
 from .util import now_iso
-from .version import resolve_version
+from .version import code_dir, code_fingerprint, resolve_version
 from .wal import WalWriter, rows_to_text_lines
 
 _HUMAN_INTERACTIVE_COMMANDS = {
@@ -261,6 +267,8 @@ class SerialwrapService:
         self._profile_count = len(profiles)
         # #154：daemon 啟動時算一次、常駐於 instance，避免每次 RPC 都重開 VERSION 檔案。
         self._version = resolve_version()
+        # 指紋代表 daemon 啟動時載入的程式碼；磁碟更新後不隨 RPC 改變。
+        self._code_fingerprint = code_fingerprint()
 
         self._arbiter = CommandArbiter(
             self._send_cb,
@@ -355,6 +363,7 @@ class SerialwrapService:
         completion_regex: str | None = None,
         *,
         trusted_human: bool = False,
+        expect_reboot: bool = False,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "timeout_s": timeout_s,
@@ -364,6 +373,8 @@ class SerialwrapService:
         }
         if completion_regex is not None:
             options["completion_regex"] = completion_regex
+        if expect_reboot:
+            options["expect_reboot"] = True
         return self._sessions.execute_command(session_id, command, source, cmd_id, **options)
 
     def _on_console_line(self, session_id: str, client_id: str, line: str) -> None:
@@ -662,6 +673,8 @@ class SerialwrapService:
                 "ok": True,
                 "pid": os.getpid(),
                 "version": self._version,  # #154：CLI/daemon 版本可診斷性
+                "code_fingerprint": self._code_fingerprint,
+                "code_path": code_dir(),
                 "running": self._running,
                 "started_at": self._started_at,
                 "sessions": len(sessions),
@@ -779,11 +792,11 @@ class SerialwrapService:
                 }
             return None, {"ok": False, "error_code": "SESSION_NOT_READY", "session": session}
         # #139 submit-time gate（第一層）：state 名義上仍 READY 但 boot quiet window 已
-        # arm（疑似板卡自發重開機的過渡態）時，非 human 來源的顯式命令即時拒絕——bytes
+        # arm（疑似板卡自發重開機的過渡態）時，非 trusted human 的顯式命令即時拒絕——bytes
         # 若送出會落入 U-Boot autoboot 倒數窗打斷開機、以 PROMPT_TIMEOUT 吞掉。此拒絕
         # 零 UART 副作用、可重試；session 重新確認 READY 時 quiet 同步解除（session_manager
-        # 各 READY 轉移點 clear_boot_quiet）。只有 daemon 內部 human console 能明確帶入
-        # trusted_human；RPC 的 source 字串不授予 gate 豁免。
+        # 各 READY 轉移點 clear_boot_quiet）。daemon console 與依 RPC 原始 source 判定的
+        # bare human 會明確帶入 trusted_human；source_class 與正規化後字串不授權。
         if not trusted_human and session.get("platform") != "passthrough":
             # #162 有界化（優先於兩個可重試分支）：pending 已逾 READY_RECONFIRM_MAX_S／
             # READY_RECONFIRM_MAX_ATTEMPTS 落終態——daemon 已無自動路徑可解，回**不可
@@ -825,10 +838,22 @@ class SerialwrapService:
                 }
         return str(session["session_id"]), None
 
+    @staticmethod
+    def _annotate_source(result: Any, check: SourceCheck, *, with_class: bool = False) -> Any:
+        """成功回應標註正規化來源；source_class 僅供顯示，不作權限判定。"""
+        if not isinstance(result, dict) or not result.get("ok"):
+            return result
+        if check.normalized_from is not None:
+            result["source"] = check.source
+            result["source_normalized_from"] = check.normalized_from
+        if with_class:
+            result["source_class"] = classify_source(check.source)
+        return result
+
     def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """RPC 平面分派器的薄包裝（#154）：委派 `_dispatch()`，並在回應為 dict 時
-        補上 daemon 版本欄位。`health()` 已顯式帶 `version`，`setdefault` 對它是
-        no-op（同一個 `self._version`）；對其餘所有 method（health.ping／mcu.*／
+        補上 daemon 版本與程式碼指紋欄位。`health()` 已顯式帶這些欄位，`setdefault`
+        對它們是 no-op；對其餘所有 method（health.ping／mcu.*／
         session.*／event.*…）則是唯一補上版本欄位的地方——不需要逐一 handler 加。
         `getattr` 防呆：既有測試會以 `__new__` 繞過 `__init__` 建構輕量 stub 物件
         （如 `tests/test_profile_pin_sticky.py::TestRpc`），此時 `_version` 未設，
@@ -870,6 +895,9 @@ class SerialwrapService:
         version = getattr(self, "_version", None)
         if isinstance(result, dict) and version is not None:
             result.setdefault("version", version)
+        fingerprint = getattr(self, "_code_fingerprint", None)
+        if isinstance(result, dict) and fingerprint:
+            result.setdefault("code_fingerprint", fingerprint)
         return result
 
     def _admission_com(self, params: dict[str, Any]) -> str | None:
@@ -1025,9 +1053,14 @@ class SerialwrapService:
             selector = str(params.get("selector") or "")
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            source = str(params.get("source") or "cli")
+            source_check = check_source(params.get("source"), default="cli")
+            if source_check.error is not None:
+                return source_check.error
             reason = params.get("reason")
-            return self._sessions.release_device(selector, source=source, reason=reason)
+            result = self._sessions.release_device(
+                selector, source=source_check.source, reason=reason
+            )
+            return self._annotate_source(result, source_check)
 
         if method == "device.attach":
             selector = str(params.get("selector") or "")
@@ -1134,7 +1167,12 @@ class SerialwrapService:
 
         if method == "session.interactive_open":
             selector = str(params.get("selector") or params.get("session_id") or params.get("com") or params.get("alias") or "")
-            owner = str(params.get("owner") or "agent")
+            owner_check = check_source(
+                params.get("owner"), default="agent", field="owner", normalize_human=False
+            )
+            if owner_check.error is not None:
+                return owner_check.error
+            owner = owner_check.source
             timeout_s = float(params.get("timeout_s") or 60.0)
             command = str(params.get("command") or "")
             allow_attached = bool(params.get("allow_attached", False))
@@ -1187,10 +1225,20 @@ class SerialwrapService:
             completion_regex = params.get("completion_regex")
             if not valid_completion_regex(completion_regex):
                 return {"ok": False, "error_code": ERROR_INVALID_COMPLETION_REGEX}
+            source_check = check_source(params.get("source"), default="agent")
+            if source_check.error is not None:
+                return source_check.error
+            expect_reboot = params.get("expect_reboot")
             selector = str(params.get("selector") or params.get("com") or params.get("alias") or "")
             cmd = str(params.get("cmd") or params.get("command") or "")
-            source = str(params.get("source") or "agent")
+            source = source_check.source
+            trusted_human = source_check.is_bare_human
             mode = str(params.get("mode") or "line")
+            rejection = expect_reboot_rejection(
+                expect_reboot, {"fg": "line", "bg": "background"}.get(mode, mode)
+            )
+            if rejection is not None:
+                return rejection
             timeout_s = float(params.get("timeout_s") or 10.0)
             priority = int(params.get("priority") or 10)
             raw_ed = params.get("expected_duration_s")
@@ -1198,12 +1246,12 @@ class SerialwrapService:
             if not selector:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(
-                selector, source=source, trusted_human=False
+                selector, source=source, trusted_human=trusted_human
             )
             if err is not None:
                 return err
             assert session_id is not None
-            return self._arbiter.submit(
+            result = self._arbiter.submit(
                 session_id=session_id,
                 command=cmd,
                 source=source,
@@ -1213,11 +1261,22 @@ class SerialwrapService:
                 expected_duration_s=expected_duration_s,
                 completion_regex=completion_regex,
                 admission_com=self._admission_com(params),
+                trusted_human=trusted_human,
+                expect_reboot=expect_reboot is True,
             )
+            if result.get("ok") and expect_reboot is not True and mode != "interactive":
+                segment = find_chained_reboot_segment(cmd)
+                if segment is not None:
+                    add_submit_warning(result, chained_reboot_warning(segment))
+            return self._annotate_source(result, source_check, with_class=True)
 
         if method == "command.get":
             cmd_id = str(params.get("cmd_id") or "")
-            return self._arbiter.get(cmd_id)
+            result = self._arbiter.get(cmd_id)
+            record = result.get("command") if isinstance(result, dict) else None
+            if isinstance(record, dict):
+                record["source_class"] = classify_source(str(record.get("source") or ""))
+            return result
 
         if method == "command.result_tail":
             cmd_id = str(params.get("cmd_id") or "")
@@ -1383,7 +1442,10 @@ class SerialwrapService:
             ack_mode = str(params.get("ack_mode") or "auto")
             if ack_mode not in _ACK_MODES:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            source = str(params.get("source") or "agent")
+            source_check = check_source(params.get("source"), default="agent")
+            if source_check.error is not None:
+                return source_check.error
+            source = source_check.source
             if not selector or not local_path or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(
@@ -1391,7 +1453,7 @@ class SerialwrapService:
             )
             if err is not None:
                 return err
-            return self._sessions.file_push(
+            result = self._sessions.file_push(
                 selector,
                 local_path=local_path,
                 remote_path=remote_path,
@@ -1401,6 +1463,7 @@ class SerialwrapService:
                 source=source,
                 trusted_human=False,
             )
+            return self._annotate_source(result, source_check)
 
         if method == "file.pull":
             selector = str(params.get("selector") or "")
@@ -1417,7 +1480,10 @@ class SerialwrapService:
             # 作用於 push 的 chunk 命令行；pull 單行短命令不走 paced，故不轉傳）。
             if str(params.get("ack_mode") or "auto") not in _ACK_MODES:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
-            source = str(params.get("source") or "agent")
+            source_check = check_source(params.get("source"), default="agent")
+            if source_check.error is not None:
+                return source_check.error
+            source = source_check.source
             if not selector or not remote_path:
                 return {"ok": False, "error_code": "INVALID_ARGS"}
             session_id, err = self._resolve_session_id(
@@ -1425,7 +1491,7 @@ class SerialwrapService:
             )
             if err is not None:
                 return err
-            return self._sessions.file_pull(
+            result = self._sessions.file_pull(
                 selector,
                 remote_path=remote_path,
                 local_path=str(local_path) if local_path else None,
@@ -1433,6 +1499,7 @@ class SerialwrapService:
                 source=source,
                 trusted_human=False,
             )
+            return self._annotate_source(result, source_check)
 
         if method == "event.rule_set":
             try:

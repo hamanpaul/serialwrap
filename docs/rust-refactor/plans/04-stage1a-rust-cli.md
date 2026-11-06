@@ -1692,7 +1692,7 @@ fn cli_codes_used_by_p3_exist_with_cli_interface() {
 `crates/sw-cli/tests/emitted_codes.rs`（型別強制＋掃描雙重把關，OD-06：會輸出的碼必須能由常數傳遞路徑抽出）：
 1. 型別：`sw-cli` 組錯誤回應只有一個入口 `output::error_resp(code: ErrorCode, message: Option<&str>) -> PyDict`；`print_internal_error`、`print_endpoint_resolution_error`、`mirror_err` 的錯誤碼參數型別都是 `ErrorCode`，不收 `&str`。
 2. 掃描 `crates/sw-cli/src/**/*.rs`（剝除註解後），任何符合 `"[A-Z][A-Z0-9_]{3,}"` 的字串常值即失敗——不論是否已在 YAML（已登記的碼必須寫 `ErrorCode::X`；**未登記的新碼**同樣會被抓到）。允許清單只有 env 名稱前綴 `SERIALWRAP_`、`SW_` 與 `UNKNOWN_ERROR`（Q-02 的格式化預設字）。
-3. 抽出 `ErrorCode::([A-Za-z]+)` 的全部使用處，轉回 UPPER_SNAKE，輸出到 `target/emitted_codes.sw-cli.txt`，供 P0 的 OD-06 通用規則設定（「如何抽出會輸出的 code」）引用；本測試另斷言集合中每個碼在 `sw_core/assets/skill/SKILL.md` 或 `contracts/error_codes.yaml` 的 `doc`／說明欄有對應說明（以 P0 設定的文件位置為準）。
+3. 抽出 `ErrorCode::([A-Za-z]+)` 的全部使用處，轉回 UPPER_SNAKE，輸出到 Cargo 可寫目錄下的 `emitted_codes.sw-cli.txt`（執行期 `CARGO_TARGET_TMPDIR` 優先，其次 `CARGO_TARGET_DIR`，未設定時用 Cargo 提供的編譯期 `CARGO_TARGET_TMPDIR`；不得寫入唯讀的原始碼／測試資料樹），供 P0 的 OD-06 通用規則設定（「如何抽出會輸出的 code」）引用；本測試另斷言集合中每個碼在 `sw_core/assets/skill/SKILL.md` 或 `contracts/error_codes.yaml` 的 `doc`／說明欄有對應說明（以 P0 設定的文件位置為準）。
 4. 負向自測（同檔，以暫存目錄假 src 樹呼叫同一掃描函式）：`"NEW_UNKNOWN_CODE"` 常值 → FAIL；`const C: &str = "SOCKET_ERROR";` 常數轉傳 → FAIL；`ErrorCode::SocketError` 使用但文件缺說明 → FAIL。
 
 `tests/test_rust_error_codes_gen.py`：`python3 scripts/rust/gen_error_codes.py --check` exit 0；P0 YAML 不存在時 **FAIL**（訊息 `P0 contracts 未交付，證據不足`），不 SKIP。

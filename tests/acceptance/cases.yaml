@@ -12,7 +12,7 @@
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
 schema_version: 1
-revision: 2026-10-28.1
+revision: 2026-11-03.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -44,6 +44,8 @@ features:
   mcu_flash: '2.4'
   supervision: '2.4'
   remote_cli: 1B
+  expect_reboot: '2.3'
+  async_reboot_evidence: '2.3'
 cases:
 - case_id: f1-limits-queryable
   suite: regression
@@ -771,6 +773,31 @@ cases:
   evidence: [report.json, report.md]
   implemented_by: existing
   cross_slice_reason: null
+- case_id: f9-reboot-stale-ready
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:189
+  family: F9
+  title: 單獨 reboot 後，banner 前舊 shell 應答 nonce 不得讓 READY 提早確認（stale-READY）
+  contract: '#162：非同步 reboot 後，boot banner 前舊 shell 的 nonce 回應不得提前確認 READY；WAL／命令證據不足不得判 PASS。'
+  invariants: [zero_tx_on_reject, insufficient_evidence_not_pass]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 需擁有者提供 Windows 原生序列埠與實板 reboot 證據；本輪只收集案例，未執行硬體測試。
+  capabilities: [physical_uart, uboot_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [quiet_reconfirm, async_reboot_evidence]
+  necessity: conditional
+  issues: ['#162']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
 - case_id: f9-attach-during-boot-reprobes
   suite: regression
   source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:163
@@ -897,6 +924,31 @@ cases:
   implemented_by: existing
   cross_slice_reason: null
   pending_issue: true
+- case_id: f9-expect-reboot-chained
+  suite: regression
+  source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:926
+  family: F9
+  title: cmd submit --expect-reboot：串接 reboot 走 reboot 路徑，不送 Ctrl-C／Ctrl-D、自動回 READY
+  contract: '#242：明示 --expect-reboot 的串接 reboot 不得因一般命令逾時送 Ctrl-C／Ctrl-D；須以 boot ID 改變與 READY 證據確認重啟。'
+  invariants: [insufficient_evidence_not_pass]
+  layer: L2
+  platforms: [linux, windows]
+  windows_status: gap
+  windows_gap_reason: 需擁有者提供 Windows 原生序列埠與實板 reboot 證據；本輪只收集案例，未執行硬體測試。
+  capabilities: [physical_uart, uboot_board]
+  cli_stage: 1A
+  daemon_slice: '2.3'
+  stage0_required: false
+  prerequisites: [expect_reboot, async_reboot_evidence]
+  necessity: conditional
+  issues: ['#130', '#162']
+  behavior_changes: []
+  destructive: true
+  expected: PASS
+  sentinel: null
+  evidence: [report.json, report.md]
+  implemented_by: existing
+  cross_slice_reason: null
 - case_id: f10-unresolved-creds-terminal
   suite: regression
   source_ref: regression/serialwrap_regression/cases/f10_login_creds.py:286
@@ -2419,7 +2471,7 @@ cases:
   platform_capabilities:
     windows: [windows_com, process_rpc]
   cli_stage: 1A
-  daemon_slice: '2.3'  # OD-34（2026-10-28）：依賴 readiness reprobe（P7-T5），自 Slice 2.1 延至 2.3
+  daemon_slice: '2.3'
   stage0_required: true
   prerequisites: [arbiter]
   necessity: required

@@ -3,6 +3,7 @@
 use sw_cli::ctx::TextIo;
 use sw_cli::output::{
     format_err_line, mirror_err, print_internal_error, print_json, warn_version_mismatch,
+    warn_version_mismatch_with_fingerprint,
 };
 use sw_proto::pydict;
 use sw_proto::pyjson::PyValue;
@@ -225,6 +226,168 @@ fn warn_version_mismatch_unknown_cli() {
     };
     warn_version_mismatch(&mut io, &resp, "unknown").unwrap();
     assert!(err.is_empty());
+}
+
+#[test]
+fn s1m241_fingerprint_warning_precedence() {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut io = TextIo::new(&mut out, &mut err, "\n");
+    let resp = pydict! {
+        "version" => "9.9.9",
+        "code_fingerprint" => "bbbbbbbbbbbb",
+    };
+
+    warn_version_mismatch_with_fingerprint(
+        &mut io,
+        &resp,
+        "0.3.2",
+        Some("aaaaaaaaaaaa"),
+    )
+    .unwrap();
+
+    assert!(out.is_empty());
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "serialwrap: client 版本 0.3.2 與 daemon 版本 9.9.9 不一致（建議統一安裝來源或重啟 daemon 對齊版本；serialwrap doctor 可查其他安裝）\n"
+    );
+}
+
+#[test]
+fn s1m241_fingerprint_warning_when_versions_match() {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut io = TextIo::new(&mut out, &mut err, "\n");
+    let resp = pydict! {
+        "version" => "0.3.2",
+        "code_fingerprint" => "bbbbbbbbbbbb",
+    };
+
+    warn_version_mismatch_with_fingerprint(
+        &mut io,
+        &resp,
+        "0.3.2",
+        Some("aaaaaaaaaaaa"),
+    )
+    .unwrap();
+
+    assert!(out.is_empty());
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "serialwrap: client 程式碼 aaaaaaaaaaaa 與 daemon 程式碼 bbbbbbbbbbbb 不一致（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n"
+    );
+}
+
+#[test]
+fn s1m241_fingerprint_warning_same_fingerprint_is_silent() {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut io = TextIo::new(&mut out, &mut err, "\n");
+    let resp = pydict! {
+        "version" => "0.3.2",
+        "code_fingerprint" => "aaaaaaaaaaaa",
+    };
+
+    warn_version_mismatch_with_fingerprint(
+        &mut io,
+        &resp,
+        "0.3.2",
+        Some("aaaaaaaaaaaa"),
+    )
+    .unwrap();
+
+    assert!(out.is_empty());
+    assert!(err.is_empty());
+}
+
+#[test]
+fn s1m241_fingerprint_warning_checks_when_daemon_version_is_invalid() {
+    let responses = [
+        pydict! { "code_fingerprint" => "bbbbbbbbbbbb" },
+        pydict! { "version" => "", "code_fingerprint" => "bbbbbbbbbbbb" },
+        pydict! { "version" => "  ", "code_fingerprint" => "bbbbbbbbbbbb" },
+        pydict! { "version" => 9i64, "code_fingerprint" => "bbbbbbbbbbbb" },
+    ];
+    let expected = "serialwrap: client 程式碼 aaaaaaaaaaaa 與 daemon 程式碼 bbbbbbbbbbbb 不一致（daemon 可能仍在跑升級前的舊碼）；請執行 `serialwrap service restart`（on-demand 模式：`serialwrap daemon stop` 後 `serialwrap daemon start`）\n";
+
+    for resp in responses {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = TextIo::new(&mut out, &mut err, "\n");
+        warn_version_mismatch_with_fingerprint(
+            &mut io,
+            &resp,
+            "0.3.2",
+            Some("aaaaaaaaaaaa"),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(String::from_utf8(err).unwrap(), expected);
+    }
+}
+
+#[test]
+fn s1m241_fingerprint_warning_skips_unavailable_fingerprints() {
+    let responses = [
+        pydict! { "version" => "0.3.2" },
+        pydict! { "version" => "0.3.2", "code_fingerprint" => "" },
+        pydict! { "version" => "0.3.2", "code_fingerprint" => 12i64 },
+    ];
+
+    for resp in responses {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut io = TextIo::new(&mut out, &mut err, "\n");
+        warn_version_mismatch_with_fingerprint(
+            &mut io,
+            &resp,
+            "0.3.2",
+            Some("aaaaaaaaaaaa"),
+        )
+        .unwrap();
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+}
+
+#[test]
+fn s1m241_fingerprint_warning_skips_missing_cli_fingerprint() {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut io = TextIo::new(&mut out, &mut err, "\n");
+    let resp = pydict! {
+        "version" => "0.3.2",
+        "code_fingerprint" => "bbbbbbbbbbbb",
+    };
+
+    warn_version_mismatch_with_fingerprint(&mut io, &resp, "0.3.2", None).unwrap();
+
+    assert!(out.is_empty());
+    assert!(err.is_empty());
+}
+
+#[test]
+fn s1m241_fingerprint_warning_uses_crlf() {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut io = TextIo::new(&mut out, &mut err, "\r\n");
+    let resp = pydict! {
+        "version" => "0.3.2",
+        "code_fingerprint" => "bbbbbbbbbbbb",
+    };
+
+    warn_version_mismatch_with_fingerprint(
+        &mut io,
+        &resp,
+        "0.3.2",
+        Some("aaaaaaaaaaaa"),
+    )
+    .unwrap();
+
+    assert!(out.is_empty());
+    assert!(String::from_utf8(err)
+        .unwrap()
+        .ends_with("`serialwrap daemon start`）\r\n"));
 }
 
 // ==========================================

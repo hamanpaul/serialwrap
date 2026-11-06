@@ -12,6 +12,9 @@ use sw_proto::pyjson::{PyDict, PyValue};
 
 /// 固定修復提示（07 §7.3／Task 13 步驟 1：runtime 無法定位或無法執行）。
 const FIX_REINSTALL: &str = "重新安裝發佈組合（serialwrap setup）";
+const DOCTOR_INSTALLED_FP: &str = "111111111111";
+const DOCTOR_STALE_FP: &str = "222222222222";
+const FIX_DAEMON_CODE_CURRENT: &str = "serialwrap service restart（或 serialwrap setup，指紋不符時會自動重啟 systemd 服務；on-demand 模式：serialwrap daemon stop 後 serialwrap daemon start）；serialwrap daemon status 的 code_path 可看 daemon 載入的是哪份安裝";
 
 /// 測試用 daemon runtime 絕對 argv 首項（與 doctor 執行時一致）。
 fn runtime_path(t: &TestEnv) -> String {
@@ -106,6 +109,51 @@ fn find_check<'a>(doc: &'a PyValue, name: &str) -> &'a PyDict {
         .unwrap_or_else(|| panic!("check {name} not found in output"))
 }
 
+fn doctor_code_current_env(
+    windows: bool,
+    installed_fingerprint: Option<&str>,
+    ping_response: Option<&str>,
+) -> (TestEnv, String) {
+    let t = if windows {
+        TestEnv::windows()
+            .with_fake_registry(FakeRegistry::new(vec![], &[]))
+            .with_doctor_bundle("3.12.7")
+    } else {
+        TestEnv::posix().with_doctor_bundle("3.12.7")
+    };
+    let endpoint = if windows {
+        "tcp://127.0.0.1:48701".to_string()
+    } else {
+        format!("{}/doctor.sock", t.run_dir().display())
+    };
+    let t = t.with_config(&format!("socket_path: {endpoint}\n"));
+    if let Some(fingerprint) = installed_fingerprint {
+        let manifest_path = t.bundle_dir().join("release-manifest.json");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("測試 manifest 應可讀");
+        let marker = "\"state_schema\":\"python-state-v0\"";
+        assert!(manifest.contains(marker), "測試 manifest 欄位形狀改變");
+        let updated = manifest.replace(
+            marker,
+            &format!("{marker},\"code_fingerprint\":\"{fingerprint}\""),
+        );
+        t.write_file(&manifest_path, updated.as_bytes());
+    }
+    let t = match ping_response {
+        Some(response) => t
+            .with_rpc_ok(&endpoint, "health.ping", response)
+            .with_rpc_ok(
+                &endpoint,
+                "health.status",
+                &format!(
+                    r#"{{"ok":true,"pid":1234,"version":"{}"}}"#,
+                    sw_cli::CLI_VERSION
+                ),
+            ),
+        None => t.with_rpc_refused(&endpoint),
+    };
+    (t, endpoint)
+}
+
 #[test]
 fn linux_check_order_and_advisory_stamp() {
     let t = TestEnv::posix().with_doctor_bundle("3.12.7");
@@ -132,6 +180,7 @@ fn linux_check_order_and_advisory_stamp() {
             "supervision_mode",
             "single_daemon",
             "endpoint_reachable",
+            "daemon_code_current",
             "wal_dir",
             "wal_writable",
             "profile_bootloader_prompts",
@@ -194,6 +243,7 @@ fn windows_check_order() {
             "other_serialwrap_installs",
             "supervision_mode",
             "daemon_endpoint",
+            "daemon_code_current",
             "wal_dir",
             "wal_writable",
             "profile_bootloader_prompts",
@@ -213,6 +263,166 @@ fn windows_check_order() {
             assert!(d.contains_key("fix") && d.contains_key("mismatches"));
         }
     }
+}
+
+#[test]
+fn s1m241_doctor_daemon_code_current_matrix() {
+    for windows in [false, true] {
+        let matching_ping = format!(r#"{{"ok":true,"code_fingerprint":"{DOCTOR_INSTALLED_FP}"}}"#);
+        let (t, endpoint) =
+            doctor_code_current_env(windows, Some(DOCTOR_INSTALLED_FP), Some(&matching_ping));
+        let (rc, out, _) = t.run(&["--bench", "must-not-route-doctor", "doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "daemon_code_current");
+        assert!(b(check, "ok"));
+        assert!(b(check, "advisory"));
+        assert_eq!(
+            s(check, "detail"),
+            format!("daemon 與目前安裝的程式碼相同（code {DOCTOR_INSTALLED_FP}）")
+        );
+        assert_eq!(s(check, "fix"), "");
+        assert!(t.rpc().request_count(&endpoint, "health.ping") > 0);
+        // 前兩筆為一般與本項 endpoint resolver 的 0.2 s 探測；health.ping 本身固定 0.5 s。
+        let expected_timeouts = vec![0.2, 0.2, 0.5, 0.5, 0.5, 0.2, 0.5];
+        assert_eq!(
+            t.rpc().timeouts_s(),
+            expected_timeouts,
+            "health.ping 固定逾時並沿用本機 config endpoint"
+        );
+
+        for (daemon_fingerprint, shown) in [
+            (Some(DOCTOR_STALE_FP), DOCTOR_STALE_FP),
+            (None, "未回報（升級前的舊版 daemon）"),
+        ] {
+            let response = match daemon_fingerprint {
+                Some(fingerprint) => {
+                    format!(r#"{{"ok":true,"code_fingerprint":"{fingerprint}"}}"#)
+                }
+                None => r#"{"ok":true}"#.to_string(),
+            };
+            let (t, endpoint) =
+                doctor_code_current_env(windows, Some(DOCTOR_INSTALLED_FP), Some(&response));
+            let (rc, out, _) = t.run(&["--bench", "must-not-route-doctor", "doctor"]);
+            assert_eq!(rc, 0);
+            let doc = json(&out);
+            let check = find_check(&doc, "daemon_code_current");
+            assert!(!b(check, "ok"));
+            assert!(b(check, "advisory"));
+            assert_eq!(
+                s(check, "detail"),
+                format!("daemon 載入的程式碼（code {shown}）與目前安裝的（code {DOCTOR_INSTALLED_FP}）不同")
+            );
+            assert_eq!(s(check, "fix"), FIX_DAEMON_CODE_CURRENT);
+            assert!(t.rpc().request_count(&endpoint, "health.ping") > 0);
+        }
+
+        let (t, endpoint) = doctor_code_current_env(windows, Some(DOCTOR_INSTALLED_FP), None);
+        let (rc, out, _) = t.run(&["--bench", "must-not-route-doctor", "doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "daemon_code_current");
+        assert!(b(check, "ok"));
+        assert!(b(check, "advisory"));
+        assert_eq!(s(check, "detail"), "daemon 未在跑或無法連線，略過");
+        assert_eq!(s(check, "fix"), "");
+        assert!(t.rpc().connect_count(&endpoint) > 0);
+
+        let stale_ping = format!(r#"{{"ok":true,"code_fingerprint":"{DOCTOR_STALE_FP}"}}"#);
+        let (t, endpoint) = doctor_code_current_env(windows, None, Some(&stale_ping));
+        let (rc, out, _) = t.run(&["--bench", "must-not-route-doctor", "doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "daemon_code_current");
+        assert!(b(check, "ok"));
+        assert!(b(check, "advisory"));
+        assert_eq!(s(check, "detail"), "本行程無法計算程式碼指紋，略過");
+        assert_eq!(s(check, "fix"), "");
+        assert!(t.rpc().request_count(&endpoint, "health.ping") > 0);
+    }
+}
+
+#[test]
+fn s1m241_doctor_code_current_uses_resolved_endpoint() {
+    for windows in [false, true] {
+        let t = if windows {
+            TestEnv::windows()
+                .with_fake_registry(FakeRegistry::new(vec![], &[]))
+                .with_doctor_bundle("3.12.7")
+        } else {
+            TestEnv::posix().with_doctor_bundle("3.12.7")
+        };
+        let configured_endpoint = "/tmp/serialwrap-dead.sock";
+        let resolved_endpoint = if windows {
+            TestEnv::win_endpoint().to_string()
+        } else {
+            t.default_socket()
+        };
+        let t = t.with_config(&format!("socket_path: {configured_endpoint}\n"));
+        let manifest_path = t.bundle_dir().join("release-manifest.json");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("測試 manifest 應可讀");
+        let marker = "\"state_schema\":\"python-state-v0\"";
+        assert!(manifest.contains(marker), "測試 manifest 欄位形狀改變");
+        let updated = manifest.replace(
+            marker,
+            &format!("{marker},\"code_fingerprint\":\"{DOCTOR_INSTALLED_FP}\""),
+        );
+        t.write_file(&manifest_path, updated.as_bytes());
+        let stale_ping = format!(r#"{{"ok":true,"code_fingerprint":"{DOCTOR_STALE_FP}"}}"#);
+        let version = format!(r#"{{"ok":true,"version":"{}"}}"#, sw_cli::CLI_VERSION);
+        let t = t
+            .with_rpc_refused(configured_endpoint)
+            .with_rpc_ok(&resolved_endpoint, "health.ping", &stale_ping)
+            .with_rpc_ok(&resolved_endpoint, "health.status", &version);
+
+        let (rc, out, _) = t.run(&["doctor"]);
+        assert_eq!(rc, 0);
+        let doc = json(&out);
+        let check = find_check(&doc, "daemon_code_current");
+        assert!(
+            !b(check, "ok"),
+            "必須從解析後的 canonical endpoint 取得舊指紋"
+        );
+        assert!(b(check, "advisory"));
+        assert_eq!(
+            s(check, "detail"),
+            format!(
+                "daemon 載入的程式碼（code {DOCTOR_STALE_FP}）與目前安裝的（code {DOCTOR_INSTALLED_FP}）不同"
+            )
+        );
+        assert_eq!(s(check, "fix"), FIX_DAEMON_CODE_CURRENT);
+        assert!(t.rpc().request_count(&resolved_endpoint, "health.ping") > 0);
+        assert_eq!(t.rpc().request_count(configured_endpoint, "health.ping"), 0);
+    }
+}
+
+#[test]
+fn s1m241_doctor_code_mismatch_is_advisory() {
+    let t = TestEnv::posix()
+        .with_doctor_bundle("3.12.7")
+        .all_required_ok();
+    let manifest_path = t.bundle_dir().join("release-manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("測試 manifest 應可讀");
+    let marker = "\"state_schema\":\"python-state-v0\"";
+    assert!(manifest.contains(marker), "測試 manifest 欄位形狀改變");
+    let updated = manifest.replace(
+        marker,
+        &format!("{marker},\"code_fingerprint\":\"{DOCTOR_INSTALLED_FP}\""),
+    );
+    t.write_file(&manifest_path, updated.as_bytes());
+    let endpoint = t.default_socket();
+    let stale_ping = format!(r#"{{"ok":true,"code_fingerprint":"{DOCTOR_STALE_FP}"}}"#);
+    let t = t.with_rpc_ok(&endpoint, "health.ping", &stale_ping);
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    assert!(b(&doc, "ok"), "advisory mismatch 不得拉低整體 doctor ok");
+    let check = find_check(&doc, "daemon_code_current");
+    assert!(!b(check, "ok"));
+    assert!(b(check, "advisory"));
+    assert!(list(&doc, "checks")
+        .iter()
+        .all(|item| b(item.as_dict(), "ok") || b(item.as_dict(), "advisory")));
 }
 
 #[test]
@@ -254,7 +464,9 @@ fn other_installs_multi_versions_differ() {
         .map(|(_, timeout)| timeout)
         .collect();
     assert_eq!(version_timeouts.len(), 2);
-    assert!(version_timeouts.iter().all(|timeout| *timeout == Some(Duration::from_secs(2))));
+    assert!(version_timeouts
+        .iter()
+        .all(|timeout| *timeout == Some(Duration::from_secs(2))));
 }
 
 #[test]
@@ -345,7 +557,8 @@ fn endpoint_reachable_unreachable() {
     let doc = json(&out);
     let check = find_check(&doc, "endpoint_reachable");
     assert!(!b(check, "ok"));
-    assert!(s(check, "detail").contains("連不上；目前執行中 daemon 綁在 /run/other1.sock、/run/other2.sock"));
+    assert!(s(check, "detail")
+        .contains("連不上；目前執行中 daemon 綁在 /run/other1.sock、/run/other2.sock"));
 }
 
 #[test]
@@ -431,7 +644,10 @@ fn bootloader_prompts_not_materialized() {
     assert!(b(check, "ok"));
     assert_eq!(
         s(check, "detail"),
-        format!("線上 profile 未物化（{}），略過", posix_flavor_profile_path(&t))
+        format!(
+            "線上 profile 未物化（{}），略過",
+            posix_flavor_profile_path(&t)
+        )
     );
 }
 
@@ -593,7 +809,12 @@ fn pyyaml_import_failure_is_not_installed_with_fix() {
     // runtime 存在、可執行但匯入失敗（rc≠0）：07 §7.3 的 未安裝 與 安裝 PyYAML 提示。
     let t = TestEnv::posix().with_doctor_bundle_except("3.12.7", &[PYYAML_CODE]);
     let rt = runtime_path(&t);
-    let t = t.with_command(&[rt.as_str(), "-I", "-c", PYYAML_CODE], 1, "", "ModuleNotFoundError: yaml");
+    let t = t.with_command(
+        &[rt.as_str(), "-I", "-c", PYYAML_CODE],
+        1,
+        "",
+        "ModuleNotFoundError: yaml",
+    );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -609,7 +830,12 @@ fn windows_pyserial_import_failure_is_not_installed_with_fix() {
         .with_fake_registry(FakeRegistry::new(vec![], &[]))
         .with_doctor_bundle_except("3.12.7", &[PYSERIAL_CODE]);
     let rt = runtime_path(&t);
-    let t = t.with_command(&[rt.as_str(), "-I", "-c", PYSERIAL_CODE], 1, "", "ModuleNotFoundError: serial");
+    let t = t.with_command(
+        &[rt.as_str(), "-I", "-c", PYSERIAL_CODE],
+        1,
+        "",
+        "ModuleNotFoundError: serial",
+    );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -641,7 +867,11 @@ fn runtime_spawn_error_is_unrunnable_not_not_installed() {
     // spawn 失敗屬「無法執行」，不是「未安裝」（後者只指 runtime 有跑且匯入失敗）。
     let t = TestEnv::posix().with_doctor_bundle_except("3.12.7", &[PYYAML_CODE]);
     let rt = runtime_path(&t);
-    let t = t.with_command_err(&[rt.as_str(), "-I", "-c", PYYAML_CODE], PalErrorKind::NotFound, "no such file");
+    let t = t.with_command_err(
+        &[rt.as_str(), "-I", "-c", PYYAML_CODE],
+        PalErrorKind::NotFound,
+        "no such file",
+    );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -661,7 +891,10 @@ fn runtime_timeout_is_unrunnable_not_not_installed() {
     let doc = json(&out);
     let check = find_check(&doc, "pyyaml");
     assert!(!b(check, "ok"));
-    assert_eq!(s(check, "detail"), "無法執行 daemon Python runtime（逾時（5 s））");
+    assert_eq!(
+        s(check, "detail"),
+        "無法執行 daemon Python runtime（逾時（5 s））"
+    );
     assert_eq!(s(check, "fix"), FIX_REINSTALL);
 }
 
@@ -685,6 +918,33 @@ fn version_pairing_unreadable_manifest() {
 }
 
 #[test]
+fn version_pairing_invalid_code_fingerprint_uses_its_own_key() {
+    // 結構驗證通過、僅指紋格式被 sw_proto 拒絕時，必須回報該欄位自己的 key。
+    // 不得落成 unreadable，也不得與其他可選欄位共用一個錯誤鍵。
+    let t = TestEnv::posix();
+    let manifest = manifest_fixture(sw_cli::CLI_VERSION, &"0".repeat(64)).replacen(
+        "\"state_schema\":\"python-state-v0\"",
+        "\"state_schema\":\"python-state-v0\",\"code_fingerprint\":\"ABC\"",
+        1,
+    );
+    assert!(manifest.contains("\"code_fingerprint\":\"ABC\""));
+    t.write_file(
+        &t.bundle_dir().join("release-manifest.json"),
+        manifest.as_bytes(),
+    );
+    let (rc, out, _) = t.run(&["doctor"]);
+    assert_eq!(rc, 0);
+    let doc = json(&out);
+    let check = find_check(&doc, "version_pairing");
+    assert!(!b(check, "ok"));
+    assert_eq!(
+        s(check, "detail"),
+        "invalid release manifest: components.daemon.code_fingerprint"
+    );
+    assert!(list(check, "mismatches").is_empty());
+}
+
+#[test]
 fn version_pairing_parse_only_optional_field_key() {
     // 結構驗證通過、僅 sw_proto 嚴格解析拒絕的可選欄位：回報該欄位 key，不得為 unreadable。
     let t = TestEnv::posix();
@@ -693,7 +953,10 @@ fn version_pairing_parse_only_optional_field_key() {
         "\"task_xml_template_sha256\":\"ZZ",
         1,
     );
-    t.write_file(&t.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+    t.write_file(
+        &t.bundle_dir().join("release-manifest.json"),
+        manifest.as_bytes(),
+    );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -716,7 +979,10 @@ fn version_pairing_schema_version_float_one_is_valid() {
         1,
     );
     assert!(manifest.contains("\"schema_version\":1.0,"));
-    t.write_file(&t.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+    t.write_file(
+        &t.bundle_dir().join("release-manifest.json"),
+        manifest.as_bytes(),
+    );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -734,7 +1000,10 @@ fn runtime_path_outside_bundle_is_not_executed() {
         1,
     );
     assert!(manifest.contains("/usr/bin/python3"));
-    t.write_file(&t.bundle_dir().join("release-manifest.json"), manifest.as_bytes());
+    t.write_file(
+        &t.bundle_dir().join("release-manifest.json"),
+        manifest.as_bytes(),
+    );
     let (rc, out, _) = t.run(&["doctor"]);
     assert_eq!(rc, 0);
     let doc = json(&out);
@@ -758,7 +1027,10 @@ fn doctor_ignores_timeout_and_retries() {
     assert_eq!(rc, 0);
     let rpc = t.rpc().timeouts_s();
     assert!(!rpc.is_empty());
-    assert!(rpc.iter().all(|seconds| (seconds - 0.5).abs() < 1e-9), "health.status 逾時應為 0.5 s：{rpc:?}");
+    assert!(
+        rpc.iter().all(|seconds| (seconds - 0.5).abs() < 1e-9),
+        "health.status 逾時應為 0.5 s：{rpc:?}"
+    );
     let runtime_timeouts: Vec<_> = t
         .calls()
         .iter()
@@ -767,7 +1039,9 @@ fn doctor_ignores_timeout_and_retries() {
         .map(|(_, timeout)| timeout)
         .collect();
     assert!(!runtime_timeouts.is_empty());
-    assert!(runtime_timeouts.iter().all(|timeout| *timeout == Some(Duration::from_secs(5))));
+    assert!(runtime_timeouts
+        .iter()
+        .all(|timeout| *timeout == Some(Duration::from_secs(5))));
 }
 
 #[test]

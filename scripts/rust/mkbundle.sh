@@ -12,6 +12,7 @@ usage() {
 選項：
   --dev                    建立開發 bundle（目前唯一支援的 bundle 類型）
   --release-bundle         建立正式候選 bundle，不編入 sw-cli/test-fakes，並將 PyYAML 納入隔離 runtime
+                           須使用乾淨 Git 工作樹（含未追蹤檔案），否則 exit 3；--dev 允許開發中來源
   --delegate-sentinel      組成與 dev bundle 相同（扁平佈局於 --out 根目錄），僅將委派入口改為 P4 測試 sentinel
   --target <triple>        指定 Rust target；Windows 正式 bundle 由擁有者 runner 建置
   --profile <name>         選擇 debug 或 release，預設為 debug
@@ -120,6 +121,26 @@ if [[ "$SENTINEL" -eq 1 && -n "$COM0COM_ZIP" ]]; then
   exit 2
 fi
 
+# 正式候選以提交作為來源證據；開發 bundle 保留供先紅後綠測試使用。
+SOURCE_REVISION=""
+require_clean_release_source() {
+  [[ "$RELEASE_BUNDLE" -eq 1 ]] || return 0
+  local status revision
+  status="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" || {
+    echo "mkbundle.sh: 正式候選需要可核對的 Git 工作樹" >&2; exit 3;
+  }
+  if [[ -n "$status" ]]; then
+    echo "mkbundle.sh: 正式候選需要乾淨工作樹：請先提交來源變更（含未追蹤檔案）" >&2
+    exit 3
+  fi
+  revision="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if [[ -n "$SOURCE_REVISION" && "$SOURCE_REVISION" != "$revision" ]]; then
+    echo "mkbundle.sh: 建置期間 HEAD 已變更，無法確認來源版本" >&2; exit 3
+  fi
+  SOURCE_REVISION="$revision"
+}
+require_clean_release_source
+
 # 輸出目錄所有權：mkbundle 建立的目錄會寫入 OWNER_MARKER。非空且無該 marker 的目錄一律拒絕，
 # 且在任何寫入前即退出；否則 sentinel（頂層 release-manifest.json／py／bin）與 dev（versions/）佈局會混在同一目錄，
 # 使 bundle 定位取到過期的頂層 manifest。
@@ -156,7 +177,7 @@ fi
 BUILD_ARGS=(build -p sw-cli -p sw-daemon)
 # 更新 race barrier 與安裝故障注入僅編入 `--dev` bundle；正式候選不帶測試 feature。
 if [[ "$DEV" -eq 1 ]]; then
-  BUILD_ARGS+=(--features sw-cli/test-fakes)
+  BUILD_ARGS+=(--features test-fakes)
 fi
 if [[ -n "$COM0COM_ZIP" ]]; then
   BUILD_ARGS+=(-p sw-com0com-helper)
@@ -172,7 +193,42 @@ BUILD_ROOT="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 if [[ "$BUILD_ROOT" != /* ]]; then
   BUILD_ROOT="$REPO_ROOT/$BUILD_ROOT"
 fi
+
+# 編譯期把 bundle 內 Python daemon 的程式碼指紋印進 CLI（#241）。
+# 占位檔在開發建置維持 SWFP1: 加 12 個 0；這裡只在 cargo 期間改寫，結束或失敗都還原，
+# 讓執行檔離開 release-manifest.json 之後仍回報同一份指紋，且工作樹不留下真指紋。
+STAMP_FILE="$REPO_ROOT/crates/sw-cli/src/embedded_code_fingerprint.bin"
+STAMP_PLACEHOLDER='SWFP1:000000000000'
+stamp_active=0
+restore_code_fingerprint_stamp() {
+  if [[ "${stamp_active:-0}" -eq 1 ]]; then
+    printf '%s' "$STAMP_PLACEHOLDER" > "$STAMP_FILE"
+    stamp_active=0
+  fi
+}
+trap restore_code_fingerprint_stamp EXIT
+EARLY_FP="$(python3 -I -B - "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+from sw_core.version import compute_code_fingerprint
+
+print(compute_code_fingerprint(str(root / "sw_core")) or "")
+PY
+)"
+if [[ -n "$EARLY_FP" ]]; then
+  if [[ ! "$EARLY_FP" =~ ^[0-9a-f]{12}$ ]]; then
+    echo "mkbundle.sh: 程式碼指紋格式不符：$EARLY_FP" >&2
+    exit 1
+  fi
+  printf 'SWFP1:%s' "$EARLY_FP" > "$STAMP_FILE"
+  stamp_active=1
+fi
 (cd "$REPO_ROOT" && SW_BUNDLE_VERSION="$VERSION" CARGO_TARGET_DIR="$BUILD_ROOT" cargo "${BUILD_ARGS[@]}" --quiet)
+restore_code_fingerprint_stamp
+require_clean_release_source
 
 BUILD_DIR="$BUILD_ROOT"
 if [[ "$TARGET" != "$HOST_TRIPLE" ]]; then
@@ -192,6 +248,22 @@ fi
 if [[ ! -x "$BIN_SRC" || ! -x "$DAEMON_SRC" ]]; then
   echo "mkbundle.sh: cargo build 後仍找不到 $BIN_SRC" >&2
   exit 1
+fi
+if [[ -n "$EARLY_FP" ]]; then
+  # 複製到沒有 manifest 的目錄再問 --version，確認指紋在執行檔裡，而不是靠旁邊的 manifest。
+  verify_dir="$(mktemp -d)"
+  cp "$BIN_SRC" "$verify_dir/serialwrap"
+  chmod +x "$verify_dir/serialwrap"
+  version_out="$(env -u SERIALWRAP_RELEASE_MANIFEST "$verify_dir/serialwrap" --version 2>"$verify_dir/err" || true)"
+  verify_err="$(cat "$verify_dir/err" 2>/dev/null || true)"
+  rm -rf "$verify_dir"
+  case "$version_out" in
+    *" (code ${EARLY_FP})"*) ;;
+    *)
+      echo "mkbundle.sh: 離開 manifest 的 CLI 未回報程式碼指紋 ${EARLY_FP}：${version_out}${verify_err}" >&2
+      exit 1
+      ;;
+  esac
 fi
 # cargo 建置成功後才動輸出目錄（cargo 失敗時既有輸出不受影響）。再檢一次所有權，通過後清空 mkbundle 自有目錄，
 # 確保每次只留下單一佈局（sentinel 或 dev），不殘留另一種佈局或過期檔案。組裝階段失敗會留下帶 owner marker 的半成品，下次執行會重建。
@@ -374,6 +446,29 @@ for number, line in enumerate(golden_path.read_text(encoding="utf-8").splitlines
 PY
 
   PACKAGE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m; print(m.package_tree_sha256())')"
+  CODE_FINGERPRINT="$("$PYTHON" -I -B - "$PY_DIR/sw_core" "$PY_SITE/sw_core" <<'PY'
+import pathlib
+import sys
+
+import sw_core.version as version
+
+bundled_package, installed_package = (pathlib.Path(value).resolve() for value in sys.argv[1:])
+loaded_package = pathlib.Path(version.__file__).resolve().parent
+if loaded_package != installed_package:
+    raise SystemExit(f"daemon bundle runtime 載入了非預期 sw_core：{loaded_package}")
+fingerprints = [
+    version.compute_code_fingerprint(str(root))
+    for root in (installed_package, bundled_package)
+]
+if fingerprints[0] is None or fingerprints[0] != fingerprints[1]:
+    raise SystemExit(f"bundle 的兩份 sw_core 指紋不一致：{fingerprints}")
+print(fingerprints[0])
+PY
+  )"
+  if [[ "$CODE_FINGERPRINT" != "$EARLY_FP" ]]; then
+    echo "mkbundle.sh: 編譯時嵌入的指紋 ${EARLY_FP} 與 bundle sw_core 指紋 ${CODE_FINGERPRINT} 不一致" >&2
+    exit 1
+  fi
   PROFILE_TREE_SHA="$("$PYTHON" -I -B -c 'import sw_core.release_manifest as m, sys; print(m.tree_sha256(sys.argv[1]))' "$REPO_ROOT/sw_core/assets/profiles")"
   CLI_SHA="$(sha256_file "$VERSION_DIR/bin/$CLI_NAME")"
   LAUNCHER_SHA="$(sha256_file "$VERSION_DIR/bin/$DAEMON_NAME")"
@@ -408,7 +503,8 @@ PY
   python3 - "$MANIFEST" "$VERSION" "$TARGET" "$GIT_REVISION" "$CONTRACT_REVISION" \
     "$CLI_NAME" "$CLI_SHA" "$PACKAGE_TREE_SHA" "$PYTHON_VERSION" "$LAUNCHER_SHA" \
     "$RUNTIME_SHA" "$SKILL_SHA" "$SKILL_WINDOWS_SHA" "$PROFILE_TREE_SHA" "$SUPERVISOR_SHA" \
-    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" <<'PY'
+    "$TASK_XML_TEMPLATE_SHA" "$COM0COM_SHA" "$HELPER_MANIFEST_PATH" "${COM0COM_HELPER_SHA:-}" "$SENTINEL_ENTRY" \
+    "$CODE_FINGERPRINT" <<'PY'
 import datetime
 import json
 import sys
@@ -434,7 +530,8 @@ import sys
     com0com_helper,
     com0com_helper_sha,
     sentinel_entry,
-) = sys.argv[1:21]
+    code_fingerprint,
+) = sys.argv[1:22]
 python_entry = ["py/bin/python3", "-I", "-B", "-m", "sw_core.cli"]
 manifest = {
     "schema_version": 1,
@@ -463,6 +560,7 @@ manifest = {
             "git_revision": revision,
             "entry": ["py/bin/python3", "-I", "-B", "py/serialwrapd.py"],
             "state_schema": "python-state-v0",
+            "code_fingerprint": code_fingerprint,
             "launcher": {"path": "bin/serialwrapd", "sha256": launcher_sha},
             "runtime": {
                 "path": "py/bin/python3",
@@ -590,5 +688,6 @@ PY
 }
 
 assemble_bundle
+require_clean_release_source
 
 printf '%s\n' "$OUT"

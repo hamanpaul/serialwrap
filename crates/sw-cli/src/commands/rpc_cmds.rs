@@ -12,7 +12,9 @@ use crate::ctx::CliCtx;
 use crate::endpoint_resolve::{
     print_endpoint_resolution_error, resolve_endpoint_info, EndpointArgs, ResolveFailure,
 };
-use crate::output::{error_resp, format_err_line, print_json, warn_version_mismatch};
+use crate::output::{
+    error_resp, format_err_line, print_json, warn_version_mismatch_with_fingerprint,
+};
 use sw_proto::constants::{DEFAULT_RPC_TIMEOUT_S, LONG_RPC_METHODS, LONG_RPC_TIMEOUT_FLOOR_S};
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -150,6 +152,9 @@ pub fn request_for(ns: &Namespace) -> Option<(&'static str, PyValue)> {
             }
             if present(ns, "completion_regex") {
                 pairs.push(("completion_regex", text(ns, "completion_regex")));
+            }
+            if matches!(ns.get("expect_reboot"), ArgValue::Bool(true)) {
+                pairs.push(("expect_reboot", PyValue::Bool(true)));
             }
             ("command.submit", obj(pairs))
         }
@@ -352,12 +357,38 @@ pub fn run_rpc(ctx: &mut CliCtx, ns: &Namespace, method: &str, params: PyValue) 
             .io
             .err_str(&format!("{}\n", format_err_line(&resp, Some(method))));
     }
-    let _ = warn_version_mismatch(&mut ctx.io, &resp, ctx.cli_version);
+    let cli_fingerprint = crate::install_layout::code_fingerprint(ctx).ok().flatten();
+    let _ = warn_version_mismatch_with_fingerprint(
+        &mut ctx.io,
+        &resp,
+        ctx.cli_version,
+        cli_fingerprint.as_deref(),
+    );
     if ok {
         0
     } else {
         2
     }
+}
+
+/// 檢查 CLI 外部來源；只拒絕 daemon 保留前綴，合法值仍以原字串送進 RPC。
+pub fn reject_reserved_source(
+    ctx: &mut CliCtx,
+    ns: &Namespace,
+    arg_name: &str,
+    default: &str,
+    field: &str,
+    context: &str,
+    normalize_human: bool,
+) -> bool {
+    let check =
+        crate::source_policy::check_source(ns.str(arg_name), default, field, normalize_human);
+    let Some(response) = check.error else {
+        return false;
+    };
+    let _ = print_json(&mut ctx.io, &response);
+    let _ = crate::output::mirror_err(&mut ctx.io, &response, Some(context));
+    true
 }
 
 /// `cmd submit` 的本地 completion regex 檢查（Q-25）。
@@ -381,6 +412,28 @@ pub fn check_completion_regex(ctx: &mut CliCtx, ns: &Namespace) -> Option<i32> {
         }
         CompletionCheck::Crash(message) => Some(internal_error(ctx, &message)),
     }
+}
+
+/// `cmd submit --expect-reboot` 的本地模式相容檢查（#242）。
+///
+/// `interactive` 是 lease 按鍵通道，不走 reboot 路徑；拒絕時輸出與 Python CLI 相同的 JSON，且不連 daemon。
+pub fn check_expect_reboot(ctx: &mut CliCtx, ns: &Namespace) -> Option<i32> {
+    if !matches!(ns.get("expect_reboot"), ArgValue::Bool(true))
+        || ns.str("mode") != Some("interactive")
+    {
+        return None;
+    }
+
+    let mut response = error_resp(ErrorCode::ExpectRebootModeUnsupported, None);
+    response.insert(
+        "hint",
+        PyValue::Str(
+            "--expect-reboot 只適用 line／background 模式；interactive 是 lease 按鍵通道，不走 reboot 路徑。"
+                .to_string(),
+        ),
+    );
+    let _ = print_json(&mut ctx.io, &response);
+    Some(1)
 }
 
 /// Python 未攔截例外的 stderr 形式（exit 1，stdout 不寫）。

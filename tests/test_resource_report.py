@@ -259,7 +259,7 @@ def _install_layout(tmp_path: Path, tag: str) -> dict:
         cli_file = stable / cli_name
         cli_file.write_bytes(cli_payload)
         (stable / daemon_name).write_bytes(daemon_payload)
-        (stable / "current-release.json").write_text(json.dumps({"dir": str(inst)}), encoding="utf-8")
+        (stable / "current-release.json").write_text(json.dumps({"dir": inst.relative_to(base).as_posix()}), encoding="utf-8")
     else:
         cli_file = bin_dir / cli_name
     return {
@@ -1097,7 +1097,7 @@ def test_workflow_ci_l1_gates() -> None:
     wf = yaml.safe_load(Path(".github/workflows/tests.yml").read_text(encoding="utf-8"))
     jobs = wf["jobs"]
     pytest_job = jobs["pytest"]
-    lock_steps = [st for st in pytest_job["steps"] if "regen_lock.py --check --base origin/${{ github.base_ref }}" in str(st.get("run", ""))]
+    lock_steps = [st for st in pytest_job["steps"] if 'regen_lock.py --check --base "origin/$GITHUB_BASE_REF"' in str(st.get("run", ""))]
     assert len(lock_steps) == 1, "pytest job 須含 regen_lock --check --base 步驟"
     assert "pull_request" in str(lock_steps[0].get("if", ""))
     lock_command = str(lock_steps[0].get("run", ""))

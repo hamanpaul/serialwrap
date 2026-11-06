@@ -120,6 +120,37 @@ pub fn oserror_cases(file: &str) -> Vec<OsErrCase> {
 }
 
 impl OsErrCase {
+    /// 只替換 Windows 系統訊息的語系；分類與數字仍由已凍結 golden 約束。
+    /// Python 的 WinError 為獨立 oracle，禁止用受測 PAL 的格式器計算期望值。
+    pub fn with_native_language(self) -> Self {
+        #[cfg(windows)]
+        {
+            let mut case = self;
+            if let Some(code) = case.winerror {
+                let text = python_utf8(
+                    r#"import ctypes, sys
+e = ctypes.WinError(int(sys.argv[1]))
+# 真實 OSError 由 CPython 去掉結尾空白與句點；ctypes.WinError 不去，要自行對齊
+fields = [type(e).__name__, str(e.errno), str(e.winerror), e.strerror.rstrip(' .\r\n\t')]
+sys.stdout.buffer.write('\0'.join(fields).encode('utf-8'))
+"#,
+                    &[&code.to_string()],
+                );
+                let fields: Vec<_> = text.split('\0').collect();
+                assert_eq!(fields.len(), 4, "Python WinError 欄位數");
+                assert_eq!(fields[0], case.exc, "{} 例外分類", case.id);
+                assert_eq!(fields[1].parse::<i32>().ok(), case.errno, "{} errno", case.id);
+                assert_eq!(fields[2].parse::<i32>().ok(), case.winerror, "{} winerror", case.id);
+                assert!(!fields[3].is_empty(), "{} 系統訊息不得為空", case.id);
+                case.message = case.message.replacen(&case.strerror, fields[3], 1);
+                case.strerror = fields[3].to_string();
+            }
+            case
+        }
+        #[cfg(not(windows))]
+        self
+    }
+
     /// connect 類 case 的端點：`lit:` 路徑或 TCP 位址。`tmp:` 路徑需由測試自行建立 fixture，不在此解析。
     pub fn endpoint(&self) -> EndpointSpec {
         match self.op.as_str() {
@@ -148,4 +179,17 @@ impl OsErrCase {
             ))
         }
     }
+}
+
+/// 原生 Python 3.12 oracle；直接輸出 UTF-8 bytes，避免 stdout 的 ACP／OEM 編碼再介入。
+#[cfg(windows)]
+pub fn python_utf8(script: &str, args: &[&str]) -> String {
+    let out = std::process::Command::new("py")
+        .args(["-3.12", "-I", "-X", "utf8=0", "-c", script])
+        .args(args)
+        .output()
+        .expect("必須可執行原生 Python 3.12 oracle");
+    assert!(out.status.success(), "Python oracle 失敗：{:?}", out);
+    assert!(out.stderr.is_empty(), "Python oracle stderr：{:?}", out.stderr);
+    String::from_utf8(out.stdout).expect("oracle 必須輸出 UTF-8")
 }

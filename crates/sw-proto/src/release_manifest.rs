@@ -16,6 +16,8 @@ pub struct ReleaseManifest {
     pub python_cli_delegate_entry: Vec<String>,
     /// Python daemon 的狀態格式版本；舊 manifest 可省略。
     pub state_schema: Option<String>,
+    /// 同 bundle 內 Python daemon 的 `sw_core` 程式碼指紋；舊 manifest 可省略。
+    pub code_fingerprint: Option<String>,
     /// Task Scheduler XML 未代入樣板的 SHA-256；舊 manifest 可省略。
     pub task_xml_template_sha256: Option<String>,
     /// 頂層物件的完整內容（保留未知欄位）。
@@ -92,6 +94,14 @@ fn is_sha256_hex(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
+fn is_code_fingerprint(value: &str) -> bool {
+    value.len() == 12
+        && value
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+}
+
 /// 解析並驗證 release manifest（JSON 文字）。
 pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
     let root = parse_json_object(text)?;
@@ -117,6 +127,15 @@ pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
         }
     }
     let state_schema = optional_str_path(&root, &["components", "daemon", "state_schema"])?;
+    let code_fingerprint = optional_str_path(&root, &["components", "daemon", "code_fingerprint"])?;
+    if code_fingerprint
+        .as_deref()
+        .is_some_and(|value| !is_code_fingerprint(value))
+    {
+        return Err(schema_err(
+            "欄位 components.daemon.code_fingerprint 必須為 12 位小寫十六進位",
+        ));
+    }
     let task_xml_template_sha256 = optional_str_path(
         &root,
         &["components", "supervisor", "task_xml_template_sha256"],
@@ -179,6 +198,7 @@ pub fn parse_manifest(text: &str) -> Result<ReleaseManifest, ManifestError> {
         git_revision,
         python_cli_delegate_entry,
         state_schema,
+        code_fingerprint,
         task_xml_template_sha256,
         raw: root,
     })
@@ -344,6 +364,11 @@ impl ReleaseManifest {
     /// 取得 `components.daemon.state_schema`；舊 manifest 回傳 `None`。
     pub fn state_schema(&self) -> Option<&str> {
         self.state_schema.as_deref()
+    }
+
+    /// 取得 `components.daemon.code_fingerprint`；舊 manifest 回傳 `None`。
+    pub fn code_fingerprint(&self) -> Option<&str> {
+        self.code_fingerprint.as_deref()
     }
 
     /// 取得 `components.supervisor.task_xml_template_sha256`；舊 manifest 回傳 `None`。

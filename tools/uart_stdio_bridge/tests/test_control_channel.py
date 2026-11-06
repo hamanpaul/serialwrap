@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 _TEST_DIR = Path(__file__).resolve().parent
 if str(_TEST_DIR) not in sys.path:
     sys.path.insert(0, str(_TEST_DIR))
@@ -71,6 +73,7 @@ def test_control_info_file_mode(tmp_path: Path):
     assert data["token"] == "tok_xyz"
 
 
+@pytest.mark.posix_pty
 def test_control_log_requested_and_completed(bridge_proc):
     """呼叫 mark 後 control.ndjson 有同 action_id 的 requested 與 completed 兩筆，wire_seq 單調。"""
     b = bridge_proc()

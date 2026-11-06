@@ -563,6 +563,48 @@ def _start_new(
     # target_mode == "on-demand"：無需啟動，daemon 依需求自生。
 
 
+def daemon_code_assessment(
+    *,
+    daemon_running: bool,
+    daemon_fingerprint: str | None,
+    installed_fingerprint: str | None,
+) -> dict:
+    """比對執行中的 daemon 與目前安裝的 Python 程式碼指紋。"""
+    state = {
+        "checked": False,
+        "stale": False,
+        "reason": None,
+        "daemon": daemon_fingerprint or None,
+        "installed": installed_fingerprint,
+    }
+    if not daemon_running:
+        state["reason"] = "daemon_unreachable"
+        return state
+    if not installed_fingerprint:
+        state["reason"] = "installed_fingerprint_unavailable"
+        return state
+    state["checked"] = True
+    if not daemon_fingerprint:
+        state.update(stale=True, reason="daemon_no_fingerprint")
+    elif daemon_fingerprint != installed_fingerprint:
+        state.update(stale=True, reason="fingerprint_mismatch")
+    else:
+        state["reason"] = "match"
+    return state
+
+
+def service_is_active(fx, mode: str) -> bool:
+    """唯讀確認對應 scope 的 systemd service 為 active。"""
+    if mode == "systemd-user":
+        cmd = ["systemctl", "--user", "is-active", "serialwrap"]
+    elif mode == "systemd-system":
+        cmd = ["systemctl", "is-active", "serialwrap"]
+    else:
+        return False
+    rc, out, _err = fx.run(cmd)
+    return rc == 0 and out.strip() == "active"
+
+
 def reconcile(
     *,
     old_mode,
@@ -579,6 +621,7 @@ def reconcile(
     force: bool = False,
     socket_path=None,
     config_path=None,
+    restart_daemon: bool = False,
 ) -> dict:
     """決定並套用監管模式；模式改變時以「先停舊、再起新」嚴格順序轉換。
 
@@ -649,7 +692,10 @@ def reconcile(
             pending.append(["sudo", "systemctl", "disable", "serialwrap"])
         if _system_target:
             pending.extend(_system_install_cmds(home, include_start=(old_mode != target_mode)))
-        return {
+        restart_pending = restart_daemon and _system_target and old_mode == target_mode
+        if restart_pending:
+            pending.append(["sudo", "systemctl", "restart", "serialwrap"])
+        early = {
             "mode": old_mode,            # 實際生效模式未變（config 不寫）
             "requested_mode": target_mode,
             "transitioned": False,
@@ -657,9 +703,13 @@ def reconcile(
             "ran": [],
             "pending_sudo": pending,
         }
+        if restart_daemon:
+            early["daemon_restart"] = "pending_sudo" if restart_pending else None
+        return early
 
     # ── 情境 A：同模式 → 冪等刷新（不 stop、不啟新、不打斷正在跑的 daemon）──
     if target_mode == old_mode:
+        daemon_restart: str | None = None
         if target_mode == "systemd-user":
             # 只重寫 unit + reload + enable，不 start churn。
             unit_path = home / _USER_UNIT_REL
@@ -667,23 +717,35 @@ def reconcile(
             unit_path.write_text(render_user_unit(_USER_EXEC_START), encoding="utf-8")
             fx.run(["systemctl", "--user", "daemon-reload"])
             fx.run(["systemctl", "--user", "enable", "serialwrap"])
+            if restart_daemon:
+                rc, _out, _err = fx.run(["systemctl", "--user", "restart", "serialwrap"])
+                daemon_restart = "ran" if rc == 0 else "failed"
         elif target_mode == "systemd-system":
             # 同模式刷新：不含 start（已在跑）。未授權路徑已於上游早退。
             cmds = _system_install_cmds(home, include_start=False)
             if with_sudo:
                 for c in cmds:
                     fx.run(c)
+                if restart_daemon:
+                    rc, _out, _err = fx.run(["sudo", "systemctl", "restart", "serialwrap"])
+                    daemon_restart = "ran" if rc == 0 else "failed"
             else:
                 pending_sudo.extend(cmds)
+                if restart_daemon:
+                    pending_sudo.append(["sudo", "systemctl", "restart", "serialwrap"])
+                    daemon_restart = "pending_sudo"
         # on-demand 同模式：無 unit 可刷新，僅寫 config。
         cfg.set_mode(target_mode, socket_path=socket_path)
-        return {
+        refreshed = {
             "mode": target_mode,
             "transitioned": False,
             "applied": True,
             "ran": [list(c) for c in getattr(fx, "calls", [])],
             "pending_sudo": pending_sudo,
         }
+        if restart_daemon:
+            refreshed["daemon_restart"] = daemon_restart
+        return refreshed
 
     # ── 情境 B：模式改變 → 嚴格順序轉換 ────────────────────────────────────
     # a. 先停舊（釋放 tty FD）——務必先於起新，避免 two-reader。
@@ -740,7 +802,7 @@ def reconcile(
             ping=ping,
             alive=alive,
         ):
-            return {
+            timed_out = {
                 "mode": old_mode,
                 "requested_mode": target_mode,
                 "transitioned": False,
@@ -751,6 +813,9 @@ def reconcile(
                 "error_code": "TIMEOUT",
                 "phase": "reconcile_wait_old_exit",
             }
+            if restart_daemon:
+                timed_out["daemon_restart"] = None
+            return timed_out
 
     # b. 跨 scope 才需遷移 state（best-effort、僅 dest 空才搬、絕不拋例外）。
     try:
@@ -779,10 +844,13 @@ def reconcile(
     # d. 寫 config（單一事實來源）。此處必為已實際套用（system-no-sudo 已於上游早退）。
     cfg.set_mode(target_mode, socket_path=socket_path)
 
-    return {
+    transitioned = {
         "mode": target_mode,
         "transitioned": True,
         "applied": True,
         "ran": [list(c) for c in getattr(fx, "calls", [])],
         "pending_sudo": pending_sudo,
     }
+    if restart_daemon:
+        transitioned["daemon_restart"] = None
+    return transitioned

@@ -2,11 +2,63 @@
 
 use crate::ctx::CliCtx;
 use crate::output;
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Stage 1B 後委派集合為空；機制保留僅供緊急回退，回退須另登記 behavior change（arch §7.4、計畫 §0.3）。
 pub const DELEGATED_GROUPS: [&str; 0] = [];
+
+// 行程內注入只供同進程整合測試使用。正式 release binary 沒有呼叫端，不讀
+// SERIALWRAP_TEST_DELEGATE_GROUP（該環境變數只在 test-fakes 建置存在）。
+thread_local! {
+    static TEST_GROUP_OVERRIDE: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// 還原先前的行程內委派群組注入。
+pub struct TestGroupOverrideGuard {
+    previous: Option<&'static str>,
+}
+
+impl Drop for TestGroupOverrideGuard {
+    fn drop(&mut self) {
+        TEST_GROUP_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// 在這個執行緒注入一個委派群組，直到 guard 結束。
+pub fn override_test_group(group: &'static str) -> TestGroupOverrideGuard {
+    let previous = TEST_GROUP_OVERRIDE.with(|slot| slot.replace(Some(group)));
+    TestGroupOverrideGuard { previous }
+}
+
+pub(crate) fn test_group_override() -> Option<&'static str> {
+    TEST_GROUP_OVERRIDE.with(|slot| slot.get())
+}
+
+const TEST_INJECT_CANDIDATES: [&str; 8] = [
+    "daemon",
+    "service",
+    "supervision-mode",
+    "remote",
+    "connect",
+    "benches",
+    "setup",
+    "doctor",
+];
+
+/// 有測試注入群組時只把該群組視為可委派；否則走正式空集合。
+pub(crate) fn classify_with_test_group(argv_tail: &[OsString], test_group: Option<&str>) -> Route {
+    if let Some(test_group) = test_group {
+        if let Some(&matched) = TEST_INJECT_CANDIDATES
+            .iter()
+            .find(|candidate| **candidate == test_group)
+        {
+            return classify_with_groups(argv_tail, &[matched]);
+        }
+    }
+    classify(argv_tail)
+}
 
 /// Stage 1B 後委派集合為空；機制保留僅供緊急回退，回退須另登記 behavior change。
 pub fn maybe_delegate(argv_tail: &[OsString]) -> Option<&'static str> {
@@ -50,11 +102,7 @@ pub fn classify_with_groups(argv_tail: &[OsString], groups: &[&'static str]) -> 
             };
             return if groups.contains(&group) {
                 Route::Delegate {
-                    group: groups
-                        .iter()
-                        .copied()
-                        .find(|item| *item == group)
-                        .unwrap(),
+                    group: groups.iter().copied().find(|item| *item == group).unwrap(),
                 }
             } else {
                 Route::Native
@@ -77,11 +125,7 @@ pub fn classify_with_groups(argv_tail: &[OsString], groups: &[&'static str]) -> 
         }
         return if groups.contains(&token) {
             Route::Delegate {
-                group: groups
-                    .iter()
-                    .copied()
-                    .find(|item| *item == token)
-                    .unwrap(),
+                group: groups.iter().copied().find(|item| *item == token).unwrap(),
             }
         } else {
             Route::Native

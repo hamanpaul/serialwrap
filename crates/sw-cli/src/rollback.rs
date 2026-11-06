@@ -22,7 +22,8 @@ const RELEASED_SESSION_STATE: &[u8] = b"released";
 
 // 中斷注入點（Task 12 R1-F5）：只由整合測試經 `set_test_crash_point`／`set_test_hook` 設定，
 // 產品路徑不設定時 `crash_if` 只做一次 thread-local 讀取、無任何副作用。不以 `debug_assertions`
-// 切換編譯（arch §2.1 cfg 邊界只允許 `test`／`feature = "test-fakes"`；sw-cli 整合測試無法啟用自身 feature）。
+// 切換編譯（arch §2.1 cfg 邊界只允許 `test`／`feature = "test-fakes"`）。
+// 需要環境變數鉤子的整合測試以 `#[cfg(feature = "test-fakes")]` 宣告，不對自身加 dev-dependency。
 thread_local! {
     static TEST_CRASH_POINT: RefCell<Option<String>> = RefCell::new(None);
     static TEST_HOOK: RefCell<Option<(String, Box<dyn FnOnce()>)>> = RefCell::new(None);
@@ -1673,6 +1674,7 @@ fn execute_change_with_restore(
             socket_path: Some(socket_path),
             config_path: endpoint_resolve::config_write_path(ctx),
             old_stop: if legacy_stopped.is_some() { crate::setup_cmd::OldStop::AlreadyStopped } else { crate::setup_cmd::OldStop::Reconcile },
+            restart_daemon: false,
         };
         let setup_result = match crate::setup_cmd::reconcile(ctx, &setup_req) {
             Ok(result) => result,
@@ -2212,7 +2214,8 @@ fn start_and_verify(
     }
     let version_out = ctx.p.env.run(&[cli_path.to_string_lossy().into_owned(), "--version".into()], Some(Duration::from_secs(5)))
         .map_err(|error| OpFailure { code: ErrorCode::InternalError.as_str(), phase: "update_start_and_verify", reason: Some("cli_version_failed"), message: Some(error.py_message), detail: PyDict::new() })?;
-    let cli_version = version_out.stdout.trim().strip_prefix("serialwrap ").unwrap_or("").trim();
+    let raw_version = version_out.stdout.trim().strip_prefix("serialwrap ").unwrap_or("").trim();
+    let cli_version = raw_version.split_whitespace().next().unwrap_or("").trim();
     if version_out.rc != 0 || cli_version.is_empty() {
         let mut detail = PyDict::new();
         detail.insert("returncode", PyValue::Int(PyInt::Small(i128::from(version_out.rc))));
@@ -4043,7 +4046,7 @@ pub fn run_supervision_switch(
     };
     crash_if("supervision_set:after_safety_check");
     let root = install_layout::resolve_install_root(ctx);
-    let home = ctx.p.env.current_user_home().map(PathBuf::from).or_else(|| ctx.env.get("HOME").map(PathBuf::from)).unwrap_or_default();
+    let home = crate::setup_cmd::home_dir(ctx);
     let socket = switch_socket(ctx, target, &crate::endpoint_resolve::target_instance_endpoint(ctx, target, &old, &endpoint));
     let mut request = crate::setup_cmd::ReconcileRequest {
         old_mode: old.clone(),
@@ -4059,6 +4062,7 @@ pub fn run_supervision_switch(
         socket_path: Some(socket),
         config_path: crate::endpoint_resolve::config_write_path(ctx),
         old_stop: crate::setup_cmd::OldStop::Reconcile,
+        restart_daemon: false,
     };
     let must_handoff = old != *target && crate::setup_cmd::reconcile_stops_old(ctx, &request);
     if !must_handoff {
@@ -4251,12 +4255,7 @@ fn configured_mode_checked(ctx: &CliCtx<'_>) -> Result<SupervisionMode, String> 
 }
 
 fn systemd_user_unit_path(ctx: &CliCtx<'_>) -> PathBuf {
-    let config_home = ctx.p.env.var("XDG_CONFIG_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| ctx.p.env.current_user_home().map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from(&ctx.paths.config_dir).parent().unwrap_or_else(|| Path::new(".")).to_path_buf());
-    config_home.join("systemd/user/serialwrap.service")
+    crate::setup_cmd::systemd_user_unit_path(&crate::setup_cmd::home_dir(ctx))
 }
 
 fn switch_socket(ctx: &CliCtx<'_>, target: &SupervisionMode, endpoint: &str) -> String {
