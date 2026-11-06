@@ -413,7 +413,8 @@ class Bridge:
     def _check_writer_failure(self) -> None:
         code = getattr(self.writer, "failure", None)
         if code:
-            self._fail(str(code), "證據 writer 已失效")
+            detail = getattr(self.writer, "failure_detail", None)
+            self._fail(str(code), detail or "證據 writer 已失效")
 
     def _writer_failed(self, exc: BaseException) -> None:
         code = self._exception_code(exc, "HARNESS_EVIDENCE_WRITE_FAILED")
@@ -422,7 +423,10 @@ class Bridge:
         writer_code = getattr(self.writer, "failure", None)
         if writer_code:
             code = str(writer_code)
-        self._fail(code, exc)
+        detail = getattr(exc, "detail", None) or getattr(
+            self.writer, "failure_detail", None
+        )
+        self._fail(code, detail if detail is not None else exc)
 
     @staticmethod
     def _exception_code(exc: BaseException, fallback: str) -> str:
@@ -1182,9 +1186,12 @@ class Bridge:
         if self._failure:
             import sys
 
+            failed = {"code": self._failure, "event": "BRIDGE_FAILED"}
+            if self._failure_detail is not None:
+                failed["detail"] = self._failure_detail
             sys.stderr.write(
                 json.dumps(
-                    {"code": self._failure, "event": "BRIDGE_FAILED"},
+                    failed,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
