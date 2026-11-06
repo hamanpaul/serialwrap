@@ -33,7 +33,7 @@ RUST_LINUX_REQUIRED_COMMANDS = [
         "SERIALWRAP_AB_LABEL=rust-1a "
         "python3 -m pytest -q tests/contract_blackbox "
         '-m "core_portable or posix_only" '
-        "--confcutdir=tests/contract_blackbox -p no:cacheprovider "
+        "--confcutdir=tests/contract_blackbox -p no:cacheprovider --basetemp=/mnt/sw-tmp/pt "
         "--junitxml=target/ci-blackbox/junit.xml"
     ),
     (
