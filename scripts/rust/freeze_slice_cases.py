@@ -22,6 +22,8 @@ Stage 2 起算日（OD-02 的 24 週上限起點）全案只有一個：Slice 2.
    引用的 OD、被延後的案例與目標切片、修訂當下的 lock／cases.yaml provenance 與有效分母。延後須已先以
    `regen_lock.py --add-only --allow-defer` 寫入鎖；有效分母必須恰等於鎖的 `slice_<X>` 集合，未核准的移除或新增一律拒絕。
    觀測窗口、frozen_at 與 Stage 2 起算日沿用凍結檔，不得重設。讀取方一律經 `load_effective_freeze()`。）
+  python3 scripts/rust/freeze_slice_cases.py --revision-advance --slice 2.1 --date YYYY-MM-DD --decision OD-NN
+  （只更新 cases_revision 與 provenance；必要案例、分母與分母指紋必須和前一版完全相同。）
 
 退出碼：0 寫入成功；1 凍結檔已存在（拒絕覆寫）；2 輸入或寫入錯誤（日期格式、版本不一致、鎖檔與 cases.yaml 不一致、
 起算日缺漏或衝突、目錄不可寫、父路徑不是目錄等）。
@@ -192,20 +194,42 @@ def load_effective_freeze(base_path: pathlib.Path) -> dict:
     base_sha = hashlib.sha256(base_bytes).hexdigest()
     prev_sha = None
     required = list(base["required_case_ids"])
+    denominator = base["denominator"]
+    denominator_sha = base["denominator_sha256"]
+    cases_revision = base["cases_revision"]
     for i, entry in enumerate(entries, start=1):
         if entry.get("amendment") != i or entry.get("base_freeze_sha256") != base_sha:
             raise ValueError(f"{apath} 第 {i} 筆：編號或凍結檔本體雜湊不符")
         if entry.get("prev_amendment_sha256") != prev_sha:
             raise ValueError(f"{apath} 第 {i} 筆：前一筆修訂雜湊不符（修訂鏈遭改動）")
-        removed = entry.get("removed") or []
-        if not removed or any(not _OD_RE.match(str(r.get("decision", ""))) for r in removed):
-            raise ValueError(f"{apath} 第 {i} 筆：須逐名列出延後案例並引用 OD-NN")
-        gone = {r["case_id"] for r in removed}
-        if not gone <= set(required):
-            raise ValueError(f"{apath} 第 {i} 筆：延後案例不在前一版有效分母內")
-        required = [c for c in required if c not in gone]
-        if entry.get("required_case_ids") != required or entry.get("denominator") != len(required):
-            raise ValueError(f"{apath} 第 {i} 筆：有效分母與「前一版扣除核准延後」不符")
+        kind = entry.get("kind", "removal")
+        if kind == "revision_advance":
+            decision = entry.get("decision")
+            if entry.get("removed") != [] or not _OD_RE.fullmatch(str(decision or "")):
+                raise ValueError(f"{apath} 第 {i} 筆：revision_advance 須 removed 為空且 decision 符合 OD-NN")
+            next_revision = entry.get("cases_revision")
+            if not isinstance(next_revision, str) or not next_revision or next_revision == cases_revision:
+                raise ValueError(f"{apath} 第 {i} 筆：revision_advance 須更新 cases_revision")
+            if (entry.get("required_case_ids") != required
+                    or entry.get("denominator") != denominator
+                    or entry.get("denominator_sha256") != denominator_sha):
+                raise ValueError(f"{apath} 第 {i} 筆：revision_advance 不得變更必要案例、分母或分母指紋")
+            cases_revision = next_revision
+        elif kind in ("removal",):
+            removed = entry.get("removed") or []
+            if not removed or any(not _OD_RE.match(str(r.get("decision", ""))) for r in removed):
+                raise ValueError(f"{apath} 第 {i} 筆：須逐名列出延後案例並引用 OD-NN")
+            gone = {r["case_id"] for r in removed}
+            if not gone <= set(required):
+                raise ValueError(f"{apath} 第 {i} 筆：延後案例不在前一版有效分母內")
+            required = [c for c in required if c not in gone]
+            if entry.get("required_case_ids") != required or entry.get("denominator") != len(required):
+                raise ValueError(f"{apath} 第 {i} 筆：有效分母與「前一版扣除核准延後」不符")
+            denominator = entry["denominator"]
+            denominator_sha = entry["denominator_sha256"]
+            cases_revision = entry.get("cases_revision", cases_revision)
+        else:
+            raise ValueError(f"{apath} 第 {i} 筆：未知修訂類型 {kind!r}")
         prev_sha = _canon_sha(entry)
     last = entries[-1]
     for key in ("required_case_ids", "denominator", "denominator_sha256", "cases_revision",
@@ -220,6 +244,23 @@ def _parse_defer(token: str) -> dict:
     if len(parts) != 3 or not all(parts) or parts[1] not in SLICES or not _OD_RE.match(parts[2]):
         raise ValueError(f"--defer 須為 case_id:<{'|'.join(SLICES)}>:OD-NN：{token!r}")
     return {"case_id": parts[0], "to_slice": parts[1], "decision": parts[2]}
+
+
+def _write_amendment(base_path: pathlib.Path, previous: list[dict], entry: dict) -> None:
+    """原子追加修訂並由正式讀取器自驗；輸入不一致時不留下部分 JSON。"""
+    apath = amendments_path(base_path)
+    text = json.dumps(previous + [entry], ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=apath.parent, prefix=f".{apath.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, apath)
+    finally:
+        pathlib.Path(tmp_name).unlink(missing_ok=True)
+    load_effective_freeze(base_path)
 
 
 def amend_freeze(*, base_path: pathlib.Path, slice_id: str, date: str, defers: list[dict],
@@ -266,19 +307,55 @@ def amend_freeze(*, base_path: pathlib.Path, slice_id: str, date: str, defers: l
         "denominator": len(required),
         "denominator_sha256": denominator_sha256(lock, required),
     }
-    apath = amendments_path(base_path)
-    text = json.dumps(prev + [entry], ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(dir=apath.parent, prefix=f".{apath.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, apath)
-    finally:
-        pathlib.Path(tmp_name).unlink(missing_ok=True)
-    load_effective_freeze(base_path)  # 寫後自驗
+    _write_amendment(base_path, prev, entry)
+    return entry
+
+
+def advance_freeze_revision(*, base_path: pathlib.Path, slice_id: str, date: str, decision: str,
+                            lock_path: pathlib.Path, yaml_path: pathlib.Path) -> dict:
+    """只追加 cases_revision 與 provenance 前進、分母不變的修訂紀錄。"""
+    if not base_path.exists():
+        raise ValueError(f"凍結檔不存在：{base_path}")
+    if not _OD_RE.fullmatch(decision):
+        raise ValueError("--decision 須符合 OD-NN")
+    eff = load_effective_freeze(base_path)
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    cases_doc = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    revision = cases_doc["revision"]
+    if lock["cases_revision"] != revision:
+        raise ValueError(f"cases.lock.json（{lock['cases_revision']}）與 cases.yaml（{revision}）版本不一致")
+    if revision == eff["cases_revision"]:
+        raise ValueError(f"cases_revision 未前進：仍為 {revision}")
+    set_name = f"slice_{slice_id}"
+    recomputed = _load_regen_lock().compute_sets(cases_doc)[set_name]
+    lock_set = list(lock["sets"][set_name])
+    if lock_set != recomputed:
+        raise ValueError(f"cases.lock.json 的 {set_name} 與 cases.yaml 重算結果不一致（鎖檔可能遭手改或過期）")
+    required = list(eff["required_case_ids"])
+    if lock_set != required:
+        raise ValueError(f"revision_advance 不得變更 {set_name} 必要案例或順序")
+    denominator_sha = denominator_sha256(lock, required)
+    if (eff["denominator"] != len(required)
+            or denominator_sha != eff["denominator_sha256"]):
+        raise ValueError("revision_advance 的現行 lock 分母或分母指紋與前一版不一致")
+
+    prev = eff["amendments"]
+    entry = {
+        "amendment": len(prev) + 1,
+        "base_freeze_sha256": _sha256(base_path),
+        "prev_amendment_sha256": _canon_sha(prev[-1]) if prev else None,
+        "kind": "revision_advance",
+        "date": date,
+        "decision": decision,
+        "removed": [],
+        "cases_revision": revision,
+        "cases_lock_sha256": _sha256(lock_path),
+        "cases_yaml_sha256": _sha256(yaml_path),
+        "required_case_ids": required,
+        "denominator": eff["denominator"],
+        "denominator_sha256": eff["denominator_sha256"],
+    }
+    _write_amendment(base_path, prev, entry)
     return entry
 
 
@@ -293,13 +370,36 @@ def main(argv: list[str] | None = None) -> int:
                         help="輸出路徑（預設 tests/acceptance/breaker/slice_<X>.json）")
     parser.add_argument("--amend", action="store_true",
                         help="不改寫凍結檔，追加擁有者逐名核准的延後修訂（須搭配 --defer）")
+    parser.add_argument("--revision-advance", action="store_true",
+                        help="不改寫凍結檔，追加 cases_revision 前進且分母不變的修訂（須搭配 --decision）")
+    parser.add_argument("--decision", default=None, help="--revision-advance：擁有者裁決編號 OD-NN")
     parser.add_argument("--defer", action="append", default=[], metavar="CASE:TO:OD-NN",
                         help="--amend：核准延後的案例、目標切片與擁有者裁決編號")
     parser.add_argument("--lock", type=pathlib.Path, default=ACC / "cases.lock.json", help="cases.lock.json 路徑")
     parser.add_argument("--cases", type=pathlib.Path, default=ACC / "cases.yaml", help="cases.yaml 路徑")
     args = parser.parse_args(argv)
+    if args.amend and args.revision_advance:
+        print("[freeze] 輸入錯誤：--amend 與 --revision-advance 不可並用", file=sys.stderr)
+        return 2
+    if args.revision_advance:
+        try:
+            if args.defer:
+                raise ValueError("--defer 不適用於 --revision-advance")
+            if args.decision is None:
+                raise ValueError("--revision-advance 須提供 --decision OD-NN")
+            date = _parse_date(args.date)
+            base = args.out or BREAKER_DIR / f"slice_{args.slice}.json"
+            entry = advance_freeze_revision(base_path=base, slice_id=args.slice, date=date,
+                                            decision=args.decision, lock_path=args.lock, yaml_path=args.cases)
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"[freeze] 修訂拒絕：{exc}", file=sys.stderr)
+            return 2
+        print(f"[freeze] 已追加修訂 #{entry['amendment']}（{entry['decision']}；denominator={entry['denominator']}）")
+        return 0
     if args.amend:
         try:
+            if args.decision is not None:
+                raise ValueError("--decision 只用於 --revision-advance")
             date = _parse_date(args.date)
             defers = [_parse_defer(t) for t in args.defer]
             base = args.out or BREAKER_DIR / f"slice_{args.slice}.json"
@@ -312,6 +412,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.defer:
         print("[freeze] 輸入錯誤：--defer 只用於 --amend", file=sys.stderr)
+        return 2
+    if args.decision is not None:
+        print("[freeze] 輸入錯誤：--decision 只用於 --revision-advance", file=sys.stderr)
         return 2
 
     try:
