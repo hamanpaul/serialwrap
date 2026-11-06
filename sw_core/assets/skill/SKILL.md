@@ -290,6 +290,69 @@ serialwrap device attach --selector COM0
 serialwrap mcu status
 ```
 
+## CLI 效能比較（Rust vs Python，僅 Linux／WSL）
+比較 Rust CLI 與 Python CLI 的暖快取往返（`daemon status`）。兩邊連同一個隔離的拋棄式 Python daemon，差距幾乎都來自 CLI 本身。
+
+- **需要 repo checkout**：量測工具 `scripts/rust/bench_cli_roundtrip.py`、Python CLI 與 `serialwrapd.py` 都只在 repo 裡，安裝版沒有。
+- **對外引用的數字用 release build，並標明 build 種類**：`cargo build --release -p sw-cli` 產生的 `target/release/serialwrap`，或正式 bundle 的 `bin/serialwrap`。`mkbundle.sh --dev` 預設是 debug build；交錯實測 p50 只慢約 1.1 倍，但它不是發布版的 binary。
+- **不碰 production**：daemon 與量測都以 `env -i` 執行，state／socket 全部在暫存目錄，by-id 目錄是空的，不會開任何裝置；結束或中斷時關閉 daemon 並刪除暫存目錄。
+- **怎麼讀數字**：有背景負載時絕對值會偏高，看倍數。WSL2 會被工具判為 `NOT_STANDARD_ENV`，只能當開發參考；正式判定（規格 §1.2）要在 Linux 原生環境量。
+- 只量 CLI。WAL、rotate、console 回顯屬於 daemon 效能，這支腳本量不到。
+
+存成 `bench-cli-compare.sh` 後執行 `bash bench-cli-compare.sh <repo> <Rust CLI> [輸出目錄]`；`ROUNDS` 可調輪數（預設 3 輪，每輪每個 CLI 200 次，兩邊交錯）：
+
+```bash
+#!/usr/bin/env bash
+set -u
+repo=$(realpath "$1"); rust=$(realpath "$2"); out=${3:-$(mktemp -d)}; rounds=${ROUNDS:-3}
+mkdir -p "$out"; out=$(realpath "$out")
+base=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/swcmp.XXXXXX"); d=$base/d; pid=  # AF_UNIX 路徑長度有限
+mkdir -p "$d"/{home,state,run,config,blog,events.d,events-rt,by-id,by-path,profile}
+cleanup() {
+  if [ -n "$pid" ]; then kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null; fi
+  rm -rf "$base"
+}
+trap cleanup EXIT; trap 'exit 130' INT TERM HUP
+iso=("PATH=$PATH" "LANG=C.UTF-8" "HOME=$d/home" "SERIALWRAP_STATE_DIR=$d/state"
+  "SERIALWRAP_RUN_DIR=$d/run" "SERIALWRAP_CONFIG_DIR=$d/config" "SERIALWRAP_WAL_DIR=$d/state/wal"
+  "SERIALWRAP_LOG_DIR=$d/blog" "SERIALWRAP_EVENTS_DIR=$d/events.d"
+  "SERIALWRAP_EVENTS_RUNTIME_DIR=$d/events-rt" "SERIALWRAP_BY_ID_DIR=$d/by-id"
+  "SERIALWRAP_BY_PATH_DIR=$d/by-path")
+cd "$repo" || exit 1
+env -i "${iso[@]}" python3 serialwrapd.py --profile-dir "$d/profile" --socket "$d/s.sock" \
+  --lock "$d/s.lock" >"$d/daemon.out" 2>"$d/daemon.err" &
+pid=$!
+for _ in $(seq 1 100); do [ -S "$d/s.sock" ] && break; sleep 0.1; done
+[ -S "$d/s.sock" ] || { echo "daemon 未就緒" >&2; tail -3 "$d/daemon.err" >&2; exit 1; }
+for r in $(seq 1 "$rounds"); do
+  for spec in "rust:$rust" "python:$repo/serialwrap"; do
+    env -i "${iso[@]}" python3 scripts/rust/bench_cli_roundtrip.py --cli "${spec#*:}" \
+      --endpoint "$d/s.sock" --platform linux --json-out "$out/${spec%%:*}-$r.json" >/dev/null 2>&1
+  done
+done
+python3 - "$out" <<'PY'
+import glob, json, math, sys
+stats = {}
+for name in ("rust", "python"):
+    samples, gates = [], set()
+    for path in sorted(glob.glob(f"{sys.argv[1]}/{name}-*.json")):
+        report = json.load(open(path, encoding="utf-8"))
+        if not report.get("ok"):
+            sys.exit(f"{path}: 量測失敗（{report.get('gate')}）")
+        samples += report["samples_ms"]
+        gates.add(report.get("gate"))
+    if not samples:
+        sys.exit(f"{name}: 沒有樣本")
+    samples.sort()
+    rank = lambda p: samples[math.ceil(p / 100 * len(samples)) - 1]
+    stats[name] = (samples[0], rank(50), rank(95))
+    print(f"{name:7} n={len(samples)} min={samples[0]:.1f} p50={rank(50):.1f} p95={rank(95):.1f} ms {sorted(gates)}")
+rust, python = stats["rust"], stats["python"]
+print(f"倍數    min={python[0] / rust[0]:.1f} p50={python[1] / rust[1]:.1f} p95={python[2] / rust[2]:.1f}")
+print(f"原始報告：{sys.argv[1]}")
+PY
+```
+
 ## 錯誤碼與 last_error 處置目錄（自動產生；勿手改）
 
 本節由 `python3 -m tools.contracts skill-section` 依 `contracts/error_codes.yaml` 與 `contracts/session_last_errors.yaml` 產生；`error_code` 與 session `last_error` 是兩個不同命名空間。修改請改 `contracts/` 後重新產生。
