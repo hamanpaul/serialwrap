@@ -25,5 +25,6 @@
   "feature/s1m-ci2": "62276c3",
   "feature/s1m-ci1": "de7b6ad",
   "feature/s1m-ci3": "a634cc7",
-  "fix/bridge-evidence-stall": "d6cf1c9"
+  "fix/bridge-evidence-stall": "d6cf1c9",
+  "feature/p8-t2": "b3af7e6"
 }
