@@ -4593,7 +4593,7 @@ class SessionManager:
         session.last_tx_mono = time.monotonic()
 
     def revoke_tx_op(self, cmd_id: str) -> None:
-        """取消 arbiter 命令時撤銷所有持有中的 bridge permit。"""
+        """取消 arbiter 命令時，只撤銷該命令自己的 bridge permit。"""
         targets: list[tuple[UARTBridge, list[str]]] = []
         with self._lock:
             for session in self._sessions.values():
@@ -4601,8 +4601,8 @@ class SessionManager:
                 if operation is None or operation.cmd_id != cmd_id:
                     continue
                 op_ids = [cmd_id]
-                if session.interactive_session_id is not None:
-                    op_ids.append(f"interactive:{session.interactive_session_id}")
+                # interactive permit 已以 cancel_op_id 檢查原命令的取消；
+                # lease 本身仍可續用，不可連帶撤銷而擋住之後的 interactive_send。
                 targets.append((operation.bridge, op_ids))
             if not targets:
                 self._cancelled_tx_cmd_ids[cmd_id] = None
