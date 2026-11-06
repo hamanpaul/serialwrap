@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use super::rpc::FakeRpcConnector;
 use crate::proc_scan::{
-    DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
+    DaemonProc, HolderScan, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
 };
 use crate::traits::Clock;
 
@@ -52,7 +52,7 @@ pub struct FakeProcScan {
     details: Mutex<BTreeMap<u32, ProcDetails>>,
     alive_fns: Mutex<BTreeMap<u32, AliveFn>>,
     current_uid: Mutex<Option<u32>>,
-    uart_holders: Mutex<Option<Vec<(Vec<u32>, HolderScanStatus)>>>,
+    uart_holders: Mutex<Option<Vec<HolderScan>>>,
     cgroups: Mutex<BTreeMap<u32, String>>,
 }
 
@@ -181,6 +181,11 @@ impl FakeProcScan {
 
     /// OD-48 D5：`uart_holders_same_uid` 的腳本（依序；用盡後保持最後一筆）。未設定時沿用 serialwrapd holder 替身。
     pub fn uart_holders_script(&self, seq: Vec<(Vec<u32>, HolderScanStatus)>) {
+        self.uart_holder_scan_script(seq.into_iter().map(HolderScan::from_pair).collect());
+    }
+
+    /// OD-48 D5.2：同 `uart_holders_script`，但可帶 `Partial` 與無法檢查的行程清單。
+    pub fn uart_holder_scan_script(&self, seq: Vec<HolderScan>) {
         *self.uart_holders.lock().unwrap_or_else(|e| e.into_inner()) = Some(seq);
     }
 
@@ -356,14 +361,14 @@ impl ProcScan for FakeProcScan {
             .cloned()
     }
 
-    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> HolderScan {
         let mut guard = self.uart_holders.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(seq) if seq.len() > 1 => seq.remove(0),
             Some(seq) if !seq.is_empty() => seq[0].clone(),
             _ => {
                 drop(guard);
-                self.serialwrapd_tty_holders(paths)
+                HolderScan::from_pair(self.serialwrapd_tty_holders(paths))
             }
         }
     }

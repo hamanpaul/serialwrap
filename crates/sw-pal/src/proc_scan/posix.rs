@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::proc_scan::{
-    extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScanStatus,
-    ProcDetails, ProcIdentity, ProcScan, ScanFailure,
+    extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScan, HolderScanStatus,
+    ProcDetails, ProcIdentity, ProcScan, ScanFailure, UninspectableProc, UninspectableReason,
 };
 
 /// POSIX `/proc` 檔案系統掃描器。
@@ -142,12 +142,14 @@ impl ProcScan for PosixProcScan {
             .map(|raw| String::from_utf8_lossy(&raw).into_owned())
     }
 
-    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+    fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> HolderScan {
         let Ok(entries) = fs::read_dir(&self.proc_root) else {
-            return (Vec::new(), HolderScanStatus::Unknown);
+            return HolderScan::from_pair((Vec::new(), HolderScanStatus::Unknown));
         };
         let me = self.current_uid();
         let mut pids = Vec::new();
+        // 已確認與目前行程同 uid 者；只有無法檢查的行程全屬此集合時才可能回 `Partial`。
+        let mut same_uid = BTreeSet::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
@@ -156,10 +158,42 @@ impl ProcScan for PosixProcScan {
             // 他 uid 的行程不在掃描範圍（D3.2／D5.2）；uid 讀不到者保守納入。
             match (me, proc_uid(&entry.path())) {
                 (Some(me), Some(uid)) if uid != me => continue,
+                (Some(_), Some(_)) => {
+                    same_uid.insert(pid);
+                    pids.push(pid);
+                }
                 _ => pids.push(pid),
             }
         }
-        scan_fd_holders(&self.proc_root, &pids, paths)
+        let scan = scan_fd(&self.proc_root, &pids, paths);
+        // D5.2：讀不到不得推論為沒有 holder。唯一的例外是「目標 tty 身分都取得、讀得到的行程都檢查完畢，
+        // 只剩已確認同 uid 的行程整個無法檢查」（systemd user session 的 `(sd-pam)`、`systemd --user`）：
+        // 回 `Partial` 並列出這些行程，由呼叫端明確回報後決定是否放行；其餘情況沿用原本的 status。
+        let partial = !scan.other_failure
+            && !scan.uninspectable.is_empty()
+            && scan
+                .uninspectable
+                .iter()
+                .all(|(pid, _)| same_uid.contains(pid));
+        let mut uninspectable = scan
+            .uninspectable
+            .iter()
+            .map(|(pid, reason)| UninspectableProc {
+                pid: *pid,
+                comm: proc_comm(&self.proc_root, *pid),
+                reason: *reason,
+            })
+            .collect::<Vec<_>>();
+        uninspectable.sort_by_key(|item| item.pid);
+        HolderScan {
+            holders: scan.holders,
+            status: if partial {
+                HolderScanStatus::Partial
+            } else {
+                scan.status
+            },
+            uninspectable,
+        }
     }
 
     fn pid_alive(&self, pid: u32) -> bool {
@@ -190,21 +224,41 @@ impl ProcScan for PosixProcScan {
 
 /// 掃描 `pids` 的 fd 是否指向 `paths` 中任一 tty（#R2 同一 tty 判準）。
 fn scan_fd_holders(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
+    let scan = scan_fd(proc_root, pids, paths);
+    (scan.holders, scan.status)
+}
+
+/// [`scan_fd`] 的結果。
+struct FdScan {
+    holders: Vec<u32>,
+    /// 原有判定：任一 PermissionDenied → `Permission`；否則任一其他讀取失敗 → `Unknown`；否則 `Ok`。
+    status: HolderScanStatus,
+    /// 整個無法檢查的行程（已計入 `status`）：fd 目錄回 PermissionDenied，或目錄列得出但條目全部 PermissionDenied。
+    uninspectable: Vec<(u32, UninspectableReason)>,
+    /// 除了 `uninspectable` 之外是否還有任何讀取失敗（目標 tty、混合的 fd 條目或其他錯誤）。
+    other_failure: bool,
+}
+
+fn scan_fd(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> FdScan {
     // #R2：與 Python `sw_core.serial_port.same_tty` 同一判準（見 `same_tty`）。比對依 inode 身分，不以
     // readlink 字串：跨 mount namespace（docker 容器）的同名 `/dev/pts/N` 字串相同卻非同一 tty。
     // 目標身分取不到時不得推論為「無 holder」，status 回報 Permission／Unknown。
     let mut status = HolderScanStatus::Ok;
+    let mut other_failure = false;
+    let mut uninspectable = Vec::new();
     let mut targets = Vec::with_capacity(paths.len());
     for path in paths {
         match fs::metadata(path) {
             Ok(meta) => targets.push(meta),
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 status = HolderScanStatus::Permission;
+                other_failure = true;
             }
             Err(_) => {
                 if status == HolderScanStatus::Ok {
                     status = HolderScanStatus::Unknown;
                 }
+                other_failure = true;
             }
         }
     }
@@ -215,20 +269,25 @@ fn scan_fd_holders(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> (Vec<u3
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 status = HolderScanStatus::Permission;
+                uninspectable.push((pid, UninspectableReason::FdDirDenied));
                 continue;
             }
             Err(_) => {
                 if status == HolderScanStatus::Ok {
                     status = HolderScanStatus::Unknown;
                 }
+                other_failure = true;
                 continue;
             }
         };
+        // 本行程的 fd 條目：檢查得了的數量、PermissionDenied 的數量、是否有其他讀取失敗。
+        let (mut inspected, mut denied, mut pid_failure) = (0usize, 0usize, false);
         for entry in entries {
             let Ok(entry) = entry else {
                 if status == HolderScanStatus::Ok {
                     status = HolderScanStatus::Unknown;
                 }
+                pid_failure = true;
                 continue;
             };
             // `fs::metadata` 跟隨 /proc/<pid>/fd/N 至 fd 實際指向的 inode。
@@ -238,21 +297,43 @@ fn scan_fd_holders(proc_root: &Path, pids: &[u32], paths: &[PathBuf]) -> (Vec<u3
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                     status = HolderScanStatus::Permission;
+                    denied += 1;
                     continue;
                 }
                 Err(_) => {
                     if status == HolderScanStatus::Ok {
                         status = HolderScanStatus::Unknown;
                     }
+                    pid_failure = true;
                     continue;
                 }
             };
+            inspected += 1;
             if targets.iter().any(|tty| same_tty(&fd_meta, tty)) {
                 holders.insert(pid);
             }
         }
+        // 核心以整個行程為單位檢查 fd 連結的存取權（例如 `systemd --user` 持有呼叫端沒有的 capability）：
+        // 目錄列得出、條目卻一個都檢查不到，與 fd 目錄整個讀不到同屬「整個行程無法檢查」。
+        // 部分條目可讀、部分 PermissionDenied 的混合情況，或另有其他讀取失敗，仍算掃描失敗。
+        if denied > 0 && inspected == 0 && !pid_failure {
+            uninspectable.push((pid, UninspectableReason::FdEntriesDenied));
+        } else if denied > 0 || pid_failure {
+            other_failure = true;
+        }
     }
-    (holders.into_iter().collect(), status)
+    FdScan {
+        holders: holders.into_iter().collect(),
+        status,
+        uninspectable,
+        other_failure,
+    }
+}
+
+/// `/proc/<pid>/comm`（去掉行尾換行）；讀不到為 `None`。
+fn proc_comm(root: &Path, pid: u32) -> Option<String> {
+    let comm = fs::read_to_string(root.join(pid.to_string()).join("comm")).ok()?;
+    Some(comm.trim_end_matches('\n').to_string())
 }
 
 struct ProcStat {
