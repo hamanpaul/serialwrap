@@ -1,4 +1,4 @@
-# uart_stdio_bridge 工具 revision 審查：停滯期限修正
+# uart_stdio_bridge 工具 revision 審查：停滯期限與 Windows 寫入重試
 
 審查範圍：`0ea3cc9c..d6cf1c9c`（`fix(bridge): 依寫入進度判定證據停滯`）。兩位審查者皆非實作者，分別獨立進行，結論都是 `BRIDGE: APPROVE`，沒有 High 或 Medium。
 
@@ -93,6 +93,86 @@ BRIDGE: APPROVE
 
 9. **tree 雜湊更新與 Stage 1 證據相容性**：
    - **結論**：`evidence/stage1/od31-ev01-win/` 僅為 OD-31 Windows reproducer 的靜態歷史留存，無任何 gate 腳本或測試會對其交叉校驗核准 tree；更新 `APPROVED_REVISION.json` 為候選 tree（`0021ba6703decf05cea53668060984dbdf1fa3dcee32a84cfa0d2c3ef4704c1c`）後，`test_approved_revision_matches_tool_tree` 將轉綠，且不會造成任何 Stage 1 gate 失敗。
+
+---
+
+BRIDGE: APPROVE
+
+## 第二輪：Windows 寫入在期限內重試
+
+審查範圍：`8e1484ca`。CI 的 `bridge-tools` 在第一輪核准後抓到 `_write_once` 提前回 0，修正後兩位審查者分別審查這個 commit，結論都是 `BRIDGE: APPROVE`，沒有 High 或 Medium。
+
+最終核准 tree：`85b55b6c930835b39c49959f103df3d9a70a0a2b270c75c29fa33b382f6d97a1`。上方第一輪的 tree 已被這個值取代。
+
+編排者另外核對：`tools/uart_stdio_bridge/tests/test_win_serial_endpoint.py` 0 行刪除，新回歸修前紅、修後綠，`test_partial_setter_deadline_consumption_does_not_send_with_stale_timeout` 未改。
+
+### 審查者 A：grok-4.7
+
+我只審最新一個 commit，先把 diff 與寫入路徑的不變量對上，再逐項查「不該送出卻送出」的路徑。Diff 很小，我接著把 `_write_once`、外層重試、peer gate 與既有測試對起來看。數學上重試後的 fast path 可能沿用舊 timeout。我用實際端點把 setter 成本、sleep 與 peer gate 掃過一輪，確認有沒有真的送出。審查 commit `8e1484ca`。不變量仍在：送出前的 `write_timeout` 不會大於當時剩餘期限。六項都沒有 High／Medium。
+
+1. 重試不會用舊的過長 `write_timeout` 送出。要重試，`win_serial.py:275` 的設定值必須已大於當時剩餘時間；重試時 `win_serial.py:260-262` 的 fast path 用更小的剩餘時間做 1 ms 向下量化，兩者不相等，不會直接沿用。即便相等，`win_serial.py:405-410` 在 `write` 前再比一次，超過就回 `None`。以 50 µs 步進掃過 setter、sleep 與 peer 取樣，沒有「相等且仍放行送出」的組合。
+
+2. 外層迴圈會結束，不會空轉。`_write_once` 回 `None` 且剩餘時間大於 0 時，`win_serial.py:153-156` 會 `sleep(min(0.01, remaining))`；deadline 到了回 0。setter 一次比一次慢時，最後一次設定可能在 deadline 之後才返回，但 `win_serial.py:268` 會先擋下，不會呼叫 `write`。
+
+3. peer gate 與 generation 在重試期間仍然有效。每次重試都回到 `win_serial.py:147` 重取 DSR；DSR 變低會清掉 settle 起點，再升高要重新滿 0.2 s 才可寫。generation 在 `win_serial.py:143-144` 變更時回 0。實測低到高之後，寫入時刻比新的 settle 起點晚 0.25 s；sleep 期間 generation 改變則不寫。
+
+4. 回 `None` 時鎖會釋放。該 return 在 `with self._timeout_section` 內，`win_serial.py:339-345` 的 `finally` 釋放寫入鎖；讀取鎖在 yield 前已放。`_last_timeout_set_elapsed_s` 在持雙鎖時寫入（`win_serial.py:315-319`），在仍持寫入鎖時讀取（`win_serial.py:278`）。
+
+5. 既有兩支測試的不送出語意還在，新測試在舊程式上會失敗。setter 吃掉 150/200 ms 時，剩餘 50 ms 減成本後不足 1 ms，仍回 0、只設定一次、不寫。setter 跨過 deadline 時，`win_serial.py:268` 先返回，外層不寫。新測試的 50 ms／1 s 在舊邏輯會於第一次設定後直接回 0，`assert == 1` 失敗。這四支在這個 worktree 實跑為 4 passed。
+
+6. 真實 pySerial 沒有多出一條用更長 timeout 送出的路徑。`serialwin32.py` 把 `WriteTotalTimeoutConstant` 設成 `max(int(write_timeout * 1000), 1)`，multiplier 為 0；1 ms 整數倍到 20 s 的量化值，driver 毫秒數不會長於 Python 值。getter 回傳設進去的 float，fast path 的相等判斷與假 serial 相同。這是 Windows backend 原始碼與數值核對，沒有在真實 COM 上重跑。
+
+BRIDGE: APPROVE
+
+### 審查者 B：gemini-3.8-flash-high（agy）
+
+本審查者已完成對最新候選 commit（`8e1484ca`）的獨立唯讀審查，針對「不得用超過剩餘期限的 timeout 送出 payload」之核心不變量與 6 項檢查項進行逐一驗證，結論如下：
+
+### 檢查項逐項結論與分析
+
+#### 1. 重試路徑沿用舊 write_timeout 風險
+- **結論**：不可能沿用舊的過長 timeout，常態路徑必穿透。
+- **分析**：
+  1. 觸發重試的先決條件是上一輪在 `_timeout_section` 後量測到 `configured_timeout > remaining_prev + 1e-9`。
+  2. 外層迴圈重試進入下一輪時，時鐘（`time.perf_counter`）單調遞增，新一輪剩餘期限必然滿足 `remaining_curr < remaining_prev`。
+  3. 常態路徑以當前剩餘期限向下量化計算 `effective_timeout = _effective_write_timeout(write_timeout, remaining_curr)`，依定義 `effective_timeout <= remaining_curr`。
+  4. 因此 `effective_timeout <= remaining_curr < remaining_prev < configured_timeout`（即 `serial_obj.write_timeout`），判斷式 `serial_obj.write_timeout == effective_timeout` 恆為 `False`，常態路徑絕對不會直接沿用。
+  5. 縱深防禦：即便進入 `_write_peer_gated_locked`，內部在持鎖狀態下仍有第二道防線 `if configured_timeout > remaining + 1e-9: return None`，核心不變量完全守住。
+
+#### 2. 外層迴圈空轉與超過 deadline 風險
+- **結論**：外層迴圈不會無效空轉，亦絕不可能超過 deadline 送出。
+- **分析**：
+  1. 外層迴圈以單調絕對時鐘 `deadline = _clock() + write_timeout` 為準，每輪必經時間消耗（setter 執行、鎖等待或 `time.sleep`），一旦 `remaining <= 0` 立即 `return 0` 結束。
+  2. 若每次 setter 都極慢，第一輪耗時會記入 `self._last_timeout_set_elapsed_s`；第二輪在 `_timeout_section` 內的 `reserve` 即預留該 setter 成本。若 `timeout_budget = remaining - reserve < _WRITE_TIMEOUT_RESOLUTION_S`（1 ms），`_timeout_section` 直接標記 `held = False` 退出。
+  3. 若時間不足以再執行一次 setter，新加入的守衛 `remaining - self._last_timeout_set_elapsed_s >= _WRITE_TIMEOUT_RESOLUTION_S` 會直接判定 `return 0`，及時終止迴圈，不會發生反覆空轉消耗時間。
+
+#### 3. peer gate 與 generation 變更行為
+- **結論**：重試期間 DSR 變低、settle 窗口重開與 generation 變更的行為完全正確。
+- **分析**：
+  1. 外層迴圈每輪迭代開頭皆持 `_lock` 檢驗 `self.generation != start_generation`，若發生斷線或重連，立即 `return 0`。
+  2. 重試期間若對端關閉（DSR 轉低），`_peer_dsr_locked` 在 `_peer_state_lock` 內將 `_peer_on_since` 重設為 `None`，`_peer_writable_locked` 回傳 `False`，外層 `writable` 判定不通過，不進入 `_write_once`。
+  3. 若之後 DSR 再次轉高，`_peer_on_since` 重新取樣為當前時鐘，重新計時 0.2 秒（`_PEER_OPEN_SETTLE_S`）settle 窗口，未達窗口前絕不寫入。
+  4. 進入 `_write_once` 後，`_write_peer_gated_locked` 亦在持寫入鎖下再次驗證 `_peer_writable_locked`，無狀態快照過期問題。
+
+#### 4. 鎖之釋放與變數持鎖範圍
+- **結論**：鎖完全正確釋放，讀取 `_last_timeout_set_elapsed_s` 完全在持鎖保護範圍內。
+- **分析**：
+  1. `_write_once` 於 `with self._timeout_section(...) as held:` 內回傳 `None` 時，Python 保證觸發 context manager 的 `__exit__`，走入 generator 的 `finally` 區塊，無條件執行 `self._write_io_lock.release()`，鎖完全釋放無洩漏。
+  2. `self._last_timeout_set_elapsed_s` 的寫入點均在 `_timeout_section` 內（持有 `_write_io_lock`）；在 `_write_once` 讀取該變數時，處於 `_timeout_section` 的 `yield True` 區塊內，同樣嚴格持有 `_write_io_lock`，無 data race。
+
+#### 5. 既有測試語意保全與新測試有效性
+- **結論**：既有測試語意完全未被繞過，新測試在舊程式上必為失敗。
+- **分析**：
+  1. `test_partial_setter_deadline_consumption_does_not_send_with_stale_timeout`（預算 200 ms，setter 耗 150 ms，剩 50 ms）：`remaining (50ms) - last_setter (150ms) = -100ms < 1ms`，正確走入 `return 0`，斷言全數吻合，既有不送出語意完全維持。
+  2. `test_expired_deadline_after_write_timeout_setter_does_not_send`（setter 耗時直接跨過 deadline）：由 `if not held or _clock() >= deadline: return None` 攔截，外層檢查 `remaining <= 0` 直接 return 0，完全未受影響。
+  3. 新測試 `test_setter_cost_with_budget_left_retries_instead_of_returning_zero`（1.0s 預算，setter 耗 50 ms，剩 950 ms）：在修訂前會因 `1.0 > 0.95` 直接 `return 0` 導致 `assert 0 == 1` 失敗；修訂後能正確觸發重試並以 0.9s 預算寫入成功，精確釘住問題行為。
+
+#### 6. 真實 pySerial 行為相容性
+- **結論**：無真實 pySerial 專屬之風險。
+- **分析**：
+  1. 真實 Windows pySerial 在變更 `write_timeout` 時會透過 `SetCommTimeouts` 系統呼叫更新 COM 參數，setter 耗時即為系統呼叫與核心排程之固有成本，本修法精確對應此真實硬體行為。
+  2. 本修法將 `if configured_timeout is None: return 0` 拆成獨立先行判定，避免了後續比較與數值相減時可能發生的型別例外。
+  3. 算出的有效 timeout 精度下限固定為 1 ms，不會向 pySerial 傳入 0 或負值，避開了 pySerial Windows overlapped write 在 0 timeout 下的不可測狀態。
 
 ---
 
