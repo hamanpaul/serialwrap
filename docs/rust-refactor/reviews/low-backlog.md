@@ -41,4 +41,4 @@
 | SG-CI3-01 | Low | Windows／UNC 路徑下的 WAL 輪替（`tests/test_wal.py::TestWalTailLatest::test_tail_raw_latest_scope_is_current_file_after_rotation`）與 4 支資源報告（`tests/test_resource_report.py`）在原生 Windows 驗證受阻，本輪依 OD-75 與 brief 停止修改 Python daemon，亦未改動凍結鎖，保留原始 FAIL 狀態登記於 `docs/rust-refactor/reviews/s1m-ci3-round1.md`，待擁有者裁決驗證環境或指派 Python daemon 調查。 | 審查 5cac8744_a634cc75 | 待處理 |
 | 既有碼-config-profiles-escape | Low | `tests/test_config_profiles.py:229` 字串未加 raw，Python 3.12 有 `SyntaxWarning: invalid escape sequence` | 審查 5cac8744_a634cc75 | 待處理 |
 | 既有碼-win-test-stderr | Low | `test_win_test_report_schema` 斷言沒有印 `r.stderr`；負載 47～56 時第 9 個執行檔 `--list` 回 rc=1 失敗一次，原因未知，同範圍重跑 3 次皆 132 支全過 | PR 249 本機測試 | 待處理 |
-| 既有碼-pages-jekyll | Low | `docs/rust-refactor/inventory/02-rpc.md:548` 的 `{%` 讓 GitHub Pages 的 Jekyll 建置失敗，PR 248 合入 main 後 Pages 無法更新 | main 0ea3cc9c | 待處理 |
+| 既有碼-pages-jekyll | Low | `docs/rust-refactor/inventory/02-rpc.md:548` 的 `{%` 讓 GitHub Pages 的 Jekyll 建置失敗，PR 248 合入 main 後 Pages 無法更新 | main 0ea3cc9c | 已修（PR 251，d5eaa57b；Pages 已建置成功） |
