@@ -376,6 +376,227 @@ fn wp52_rpc_expect_reboot_false_interactive_allowed() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP5-2 第 5 項：`command.submit` → 佇列 → OpRunner → registry → `command.get` 的旗標接線
+// ---------------------------------------------------------------------------
+
+/// Python `tests/test_expect_reboot.py` 的 `CHAINED`（含 reboot 段的鏈式命令）。
+const WP52_CHAINED: &str = "firstboot -y && reboot";
+
+const WP52_MODES: [(&str, &str); 4] = [
+    ("line", "line"),
+    ("fg", "line"),
+    ("background", "background"),
+    ("bg", "background"),
+];
+
+/// 成功回應：`arbiter.py:307-310` 先依旗標回聲 `expect_reboot`，再由 `_annotate_source` 補 `source_class`。
+fn wp52_submit_echo(r: &ServiceRig, cmd_id: &str, expect_reboot: bool) -> String {
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    let mut expected = sw_proto::pydict! {
+        "ok" => true,
+        "cmd_id" => cmd_id,
+        "status" => "accepted",
+        "session_id" => session_id,
+    };
+    if expect_reboot {
+        expected.insert("expect_reboot", PyValue::Bool(true));
+    }
+    expected.insert("source_class", PyValue::from("agent"));
+    expected.insert("version", PyValue::from(r.version.clone()));
+    j(&expected)
+}
+
+/// 送出假 DUT 會正常回 prompt 的普通命令並等到真正執行完畢；回傳 (submit 回應, `command.get` 的 command, 本命令 UART TX)。
+fn wp52_submit_and_finish(
+    r: &ServiceRig,
+    command: &str,
+    flag: Option<&str>,
+    mode: &str,
+) -> (PyDict, PyDict, Vec<u8>) {
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(
+        format!("{command}\n").as_bytes(),
+        b"\r\nwp52-out\r\nroot@t:/# ",
+    );
+    r.settle();
+    let tx_mark = dev.tx_len();
+    let flag = flag
+        .map(|value| format!(r#","expect_reboot":{value}"#))
+        .unwrap_or_default();
+    let params =
+        format!(r#"{{"selector":"COM0","cmd":"{command}","mode":"{mode}","timeout_s":10{flag}}}"#);
+    let response = r.call("command.submit", &params);
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{params}：{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until("命令真正執行完畢", || {
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    (response, record, dev.tx_since(tx_mark))
+}
+
+/// 已執行完畢命令的共同斷言：回聲、UART TX、終態與 registry／`command.get` 的旗標。
+fn assert_wp52_finished(
+    r: &ServiceRig,
+    case: &str,
+    command: &str,
+    mode: (&str, &str),
+    expect_reboot: bool,
+    finished: &(PyDict, PyDict, Vec<u8>),
+) {
+    let (response, record, tx) = finished;
+    let cmd_id = s(response, "cmd_id");
+    assert_eq!(
+        j(response),
+        wp52_submit_echo(r, cmd_id, expect_reboot),
+        "{case}：submit 回聲"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(tx),
+        format!("{command}\n"),
+        "{case}：UART 只送出本命令一行"
+    );
+    assert_eq!(s(record, "command"), command, "{case}");
+    assert_eq!(s(record, "mode"), mode.0, "{case}：record 保留原始 mode");
+    assert_eq!(s(record, "execution_mode"), mode.1, "{case}：fg／bg 正規化");
+    assert_eq!(s(record, "status"), "done", "{case}：命令真正完成");
+    assert_eq!(
+        record.get("error_code"),
+        Some(&PyValue::Null),
+        "{case}：{}",
+        j(record)
+    );
+    assert_eq!(
+        record.get("expect_reboot"),
+        Some(&PyValue::Bool(expect_reboot)),
+        "{case}：command.get 旗標"
+    );
+    assert_eq!(
+        r.registry
+            .get(cmd_id)
+            .expect("registry 命令紀錄")
+            .get("expect_reboot"),
+        Some(&PyValue::Bool(expect_reboot)),
+        "{case}：registry 旗標"
+    );
+    assert!(
+        record.get("trusted_human").is_none(),
+        "{case}：record 不外露 trusted_human"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_rpc_queue_worker_execute_and_command_get_propagate_flag`：
+/// 明示 true 經 RPC 入口寫進 `SubmitReq`，回聲 `expect_reboot:true`，命令實際送上 UART 並完成，`command.get` 回 true。
+/// 只驗資料面接線；reboot 分支、WAL META 與 G7b 消費端屬後續工作包，故每個 mode 用獨立 rig、不斷言 session 後態。
+#[test]
+fn wp52_end_to_end_flag_record_and_echo() {
+    for (mode, normalized) in WP52_MODES {
+        let r = ServiceRig::ready_shell();
+        let command = format!("echo wp52-true-{mode}");
+        let finished = wp52_submit_and_finish(&r, &command, Some("true"), mode);
+        assert_wp52_finished(
+            &r,
+            &format!("true／{mode}"),
+            &command,
+            (mode, normalized),
+            true,
+            &finished,
+        );
+    }
+}
+
+/// 缺省／null／false：不回聲、record 固定為 false，命令照常執行完畢且 session 維持 READY。
+#[test]
+fn wp52_end_to_end_falsy_flag_not_echoed() {
+    let r = ServiceRig::ready_shell();
+    for (label, flag) in [
+        ("default", None),
+        ("null", Some("null")),
+        ("false", Some("false")),
+    ] {
+        for (mode, normalized) in WP52_MODES {
+            let command = format!("echo wp52-{label}-{mode}");
+            let finished = wp52_submit_and_finish(&r, &command, flag, mode);
+            let case = format!("{label}／{mode}");
+            assert_wp52_finished(&r, &case, &command, (mode, normalized), false, &finished);
+            assert!(
+                finished.0.get("expect_reboot").is_none(),
+                "{case}：false 類型不回聲"
+            );
+            assert_eq!(
+                r.session("COM0")
+                    .and_then(|session| session.get("state").cloned()),
+                Some(PyValue::from("READY")),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// 同一 gate 下，帶 true 與不帶旗標的拒絕回應逐位元組相同，且皆零 UART TX、零命令紀錄、零入列。
+fn assert_wp52_gate_unchanged_by_flag(r: &ServiceRig, case: &str, expected_code: &str) {
+    let plain = format!(r#"{{"selector":"COM0","cmd":"{WP52_CHAINED}","source":"agent:wp52"}}"#);
+    let flagged = format!(
+        r#"{{"selector":"COM0","cmd":"{WP52_CHAINED}","source":"agent:wp52","expect_reboot":true}}"#
+    );
+    r.settle();
+    let before = wp52_rpc_snapshot(r);
+    let baseline = r.call("command.submit", &plain);
+    r.settle();
+    assert_eq!(
+        wp52_rpc_snapshot(r),
+        before,
+        "{case}：無旗標拒絕亦須零副作用"
+    );
+    assert_eq!(
+        s(&baseline, "error_code"),
+        expected_code,
+        "{case}：{}",
+        j(&baseline)
+    );
+    assert!(baseline.get("cmd_id").is_none(), "{case}");
+    assert_wp52_rpc_rejected_without_side_effects(r, &flagged, &j(&baseline));
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_rpc_flag_does_not_bypass_submit_time_quiet_gate`：
+/// agent＋true 在非 READY、boot quiet、READY_UNCONFIRMED 的提交時 gate 維持原錯誤且零 TX。
+#[test]
+fn wp52_end_to_end_flag_does_not_bypass_submit_gates() {
+    use sw_core::session_core::SessionState;
+    for (state, code) in [
+        (SessionState::Attaching, "SESSION_NOT_READY"),
+        (SessionState::Attached, "SESSION_NOT_READY"),
+        (SessionState::Recovering, "SESSION_RECOVERING"),
+        (SessionState::Flashing, "FLASHING_BUSY"),
+    ] {
+        let r = ServiceRig::ready_shell();
+        r.mgr.force_session_state("COM0", state);
+        assert_wp52_gate_unchanged_by_flag(&r, &format!("{state:?}"), code);
+    }
+
+    let r = ServiceRig::ready_shell();
+    // 自發重開機 banner → 武裝 boot quiet 與 Ready Reconfirm（同 `ready_unconfirmed_response_has_session_field`）。
+    r.device(REAL_A).push_rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+    wait_until("boot quiet 武裝", || {
+        r.session("COM0")
+            .and_then(|session| session.get("boot_quiet_remaining_s").cloned())
+            .is_some_and(|value| !value.is_null())
+    });
+    assert_wp52_gate_unchanged_by_flag(&r, "boot quiet", "AUTOBOOT_QUIET");
+    r.clock.advance(Duration::from_secs(301));
+    assert_wp52_gate_unchanged_by_flag(&r, "READY_UNCONFIRMED", "READY_UNCONFIRMED");
+}
+
 fn wp51_source_reserved_response(r: &ServiceRig, raw_source: &str) -> String {
     wp51_reserved_source_response(r, "source", raw_source)
 }
