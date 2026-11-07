@@ -326,11 +326,14 @@ def _case_fingerprint(case: dict) -> str:
 
 def _s24_fingerprint_drift(cases: dict) -> list[str]:
     """回傳 Slice 2.4 有效分母內「現行映射與有效凍結指紋不符」或已自 cases.yaml 消失的案例（依凍結原序）。"""
-    raise NotImplementedError("P8-T1 第 2 輪階段 A：Slice 2.4 逐案指紋比對尚未實作")
+    fr = _effective(FREEZE24)
+    eff_fps = fr["case_fingerprints"]
+    assert isinstance(eff_fps, dict), "Slice 2.4 凍結檔須記錄 case_fingerprints（不得手寫，須由工具產生）"
+    return [cid for cid in fr["required_case_ids"]
+            if cid not in cases or _case_fingerprint(cases[cid]) != eff_fps.get(cid)]
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, raises=NotImplementedError, reason="P8-T1 第 2 輪階段 A")
 def test_s24_freeze_case_fingerprints_match_current_cases():
     """凍結後 Slice 2.4 必要案例的任何欄位都不得無聲改動。要改須先取得擁有者逐名 OD，再以
     `freeze_slice_cases.py --slice 2.4 --amend --fingerprint-update <case_id>:OD-NN --source-commit <sha> --field <欄位>`
@@ -350,7 +353,6 @@ def test_s24_freeze_case_fingerprints_match_current_cases():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, raises=NotImplementedError, reason="P8-T1 第 2 輪階段 A")
 def test_s24_fingerprint_guard_flags_post_freeze_edit():
     """審查 P8X-0aa7457-1 的失敗情境（記憶體內重現，不動檔案）：Task 6 直接補 s24-xfer-session-gates 的 evidence、
     其他 s24 案例改 source_ref、既有回歸案例改 contract 或案例消失，守門都須逐名指出；
