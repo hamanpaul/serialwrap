@@ -397,17 +397,58 @@ def _sample_release(rpc: _Rpc) -> tuple[float, str | None]:
     return ms, None
 
 
+def _accepted_cancel_timeout_error(rpc: _Rpc, cmd_id: str, last_command_response: dict[str, Any],
+                                   elapsed: float) -> RuntimeError:
+    """accepted 等待逾時時補一次有界 session 診斷；保留主要錯誤，不讓診斷失敗取代它。"""
+    session_state: dict[str, Any] = {"state": None, "foreground_busy": None, "recovering": None}
+    diagnostic_error: str | None = None
+    try:
+        response = rpc.call("session.get_state", {"selector": "COM0"})
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise RuntimeError(f"session.get_state 非 ok：{response!r}")
+        session = response.get("session")
+        if not isinstance(session, dict):
+            raise RuntimeError(f"session.get_state 缺少 session：{response!r}")
+        session_state = {key: session.get(key) for key in session_state}
+    except Exception as exc:  # noqa: BLE001 — 診斷失敗只附註，accepted timeout 仍是主要錯誤
+        diagnostic_error = f"{type(exc).__name__}: {exc}"
+
+    message = (
+        f"命令未進入 running（accepted）；stage=wait_running; cmd_id={cmd_id!r}; "
+        f"last_command_response={last_command_response!r}; elapsed={elapsed:.3f}s; "
+        f"session.state={session_state['state']!r}; "
+        f"foreground_busy={session_state['foreground_busy']!r}; "
+        f"recovering={session_state['recovering']!r}"
+    )
+    if diagnostic_error is not None:
+        message += f"; session_state_diagnostic_error={diagnostic_error}"
+    return RuntimeError(message)
+
+
 def _sample_cancel(rpc: _Rpc) -> float:
     r = rpc.call("command.submit", {"selector": "COM0", "cmd": "sleep 0.3", "source": "agent:lat", "timeout_s": 10})
     cmd_id = r.get("cmd_id")
     if r.get("ok") is not True or not cmd_id:
         raise RuntimeError(f"command.submit 非 ok：{r}")
-    deadline = time.monotonic() + 10
+    wait_started_at = time.monotonic()
+    deadline = wait_started_at + 10
     while True:
-        st = (rpc.call("command.get", {"cmd_id": cmd_id}).get("command") or {}).get("status")
+        command_response = rpc.call("command.get", {"cmd_id": cmd_id})
+        if not isinstance(command_response, dict) or command_response.get("ok") is not True:
+            raise RuntimeError(f"command.get 非 ok：{command_response!r}")
+        command = command_response.get("command")
+        if not isinstance(command, dict):
+            raise RuntimeError(f"command.get 缺少 command：{command_response!r}")
+        st = command.get("status")
         if st == "running":
             break
-        if st in ("done", "error", "canceled") or time.monotonic() > deadline:
+        if st in ("done", "error", "canceled"):
+            raise RuntimeError(f"命令於進入 running 前已終止：{command_response!r}")
+        now = time.monotonic()
+        if now > deadline:
+            elapsed = now - wait_started_at
+            if st == "accepted":
+                raise _accepted_cancel_timeout_error(rpc, cmd_id, command_response, elapsed)
             raise RuntimeError(f"命令未進入 running（{st}）")
         time.sleep(0.005)
     ms, r = rpc.timed("command.cancel", {"cmd_id": cmd_id})

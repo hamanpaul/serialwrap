@@ -80,27 +80,124 @@ def test_only_external_events_are_measured():
 
 
 class _FakeRpc:
-    """記憶體替身：`command.get` 依序回 running、done；`command.cancel` 回 `cancel_reply`。"""
+    """記憶體替身：可控制 `command.get`／session 診斷回應，取消回 `cancel_reply`。"""
 
-    def __init__(self, cancel_reply: dict, status_after_cancel: str = "canceled") -> None:
+    def __init__(self, cancel_reply: dict, status_after_cancel: str = "canceled", *,
+                 command_get_replies: list[dict] | None = None, session_reply: dict | None = None,
+                 session_error: Exception | None = None) -> None:
         self.cancel_reply = cancel_reply
         self.status_after_cancel = status_after_cancel
+        self.command_get_replies = command_get_replies
+        self.session_reply = session_reply if session_reply is not None else {"ok": True, "session": {"state": "READY"}}
+        self.session_error = session_error
         self.cancelled = False
+        self.command_get_calls = 0
+        self.session_get_calls = 0
+        self.timed_calls = 0
 
     def call(self, method: str, params: dict) -> dict:
         if method == "command.submit":
             return {"ok": True, "cmd_id": "c1"}
         if method == "command.get":
+            self.command_get_calls += 1
+            if self.command_get_replies is not None:
+                return self.command_get_replies[min(self.command_get_calls - 1, len(self.command_get_replies) - 1)]
             status = self.status_after_cancel if self.cancelled else "running"
             return {"ok": True, "command": {"status": status, "done_at": "t" if self.cancelled else None}}
         if method == "session.get_state":
-            return {"ok": True, "session": {"state": "READY"}}
+            self.session_get_calls += 1
+            if self.session_error is not None:
+                raise self.session_error
+            return self.session_reply
         raise AssertionError(method)
 
     def timed(self, method: str, params: dict) -> tuple[float, dict]:
         assert method == "command.cancel"
+        self.timed_calls += 1
         self.cancelled = True
         return 0.5, dict(self.cancel_reply)
+
+
+class _DeadlineClock:
+    """單次 sleep 就越過 10 秒期限，讓取消樣本逾時測試保持快速且確定。"""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += 10.001
+
+
+def test_cancel_sample_accepted_timeout_reports_stage_and_state(monkeypatch):
+    clock = _DeadlineClock()
+    monkeypatch.setattr(elm, "time", clock)
+    rpc = _FakeRpc(
+        {"ok": True, "cmd_id": "c1", "status": "canceled"},
+        command_get_replies=[{"ok": True, "command": {
+            "cmd_id": "c1", "status": "accepted", "done_at": None,
+        }}],
+        session_reply={"ok": True, "session": {
+            "state": "ATTACHED", "foreground_busy": True, "recovering": False,
+        }},
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "stage=wait_running" in message
+    assert "cmd_id='c1'" in message
+    assert (
+        "last_command_response={'ok': True, 'command': {'cmd_id': 'c1', 'status': 'accepted', 'done_at': None}}"
+        in message
+    )
+    assert "elapsed=10.001s" in message
+    assert "session.state='ATTACHED'" in message
+    assert "foreground_busy=True" in message
+    assert "recovering=False" in message
+    assert "命令未進入 running（accepted）" in message
+    assert rpc.session_get_calls == 1 and rpc.timed_calls == 0
+
+
+def test_cancel_timeout_diagnostic_failure_preserves_original_error(monkeypatch):
+    monkeypatch.setattr(elm, "time", _DeadlineClock())
+    rpc = _FakeRpc(
+        {"ok": True, "cmd_id": "c1", "status": "canceled"},
+        command_get_replies=[{"ok": True, "command": {"status": "accepted"}}],
+        session_error=OSError("狀態診斷 RPC 失敗"),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "命令未進入 running（accepted）" in message
+    assert "stage=wait_running" in message and "cmd_id='c1'" in message
+    assert "elapsed=10.001s" in message
+    assert "session_state_diagnostic_error=OSError: 狀態診斷 RPC 失敗" in message
+    assert rpc.session_get_calls == 1 and rpc.timed_calls == 0
+
+
+def test_cancel_sample_keeps_command_get_failures_distinct(monkeypatch):
+    cases = [
+        ({"ok": False, "error_code": "RPC_FAILED"}, "command.get 非 ok"),
+        ({"ok": True}, "command.get 缺少 command"),
+        ({"ok": True, "command": {"status": "done"}}, "命令於進入 running 前已終止"),
+    ]
+    for response, expected in cases:
+        monkeypatch.setattr(elm, "time", _DeadlineClock())
+        rpc = _FakeRpc(
+            {"ok": True, "cmd_id": "c1", "status": "canceled"},
+            command_get_replies=[response],
+        )
+        with pytest.raises(RuntimeError) as caught:
+            elm._sample_cancel(rpc)
+        assert expected in str(caught.value)
+        assert "命令未進入 running（accepted）" not in str(caught.value)
+        assert rpc.session_get_calls == 0 and rpc.timed_calls == 0
 
 
 def test_cancel_sample_rejects_refused_cancel():
