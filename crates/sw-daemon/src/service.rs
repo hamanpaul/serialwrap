@@ -31,7 +31,7 @@ use sw_proto::pyfmt::py_str;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::valid_completion_regex;
 use sw_proto::rpc_types::Params;
-use sw_proto::source_policy::check_source;
+use sw_proto::source_policy::{classify_source, check_source, SourceCheck};
 
 use crate::framing::RpcHandler;
 
@@ -100,6 +100,19 @@ fn session_not_found(selector: &str) -> PyDict {
 
 fn cmd_not_found(cmd_id: &str) -> PyDict {
     pydict! { "ok" => false, "error_code" => "CMD_NOT_FOUND", "cmd_id" => cmd_id }
+}
+
+/// 對齊 Python `SerialwrapService._annotate_source`：只在成功回應末端追加來源標註。
+fn annotate_source(mut result: PyDict, check: &SourceCheck) -> PyDict {
+    if !result.get("ok").is_some_and(py_truthy) {
+        return result;
+    }
+    if let Some(normalized_from) = check.normalized_from.as_deref() {
+        result.insert("source", PyValue::from(check.source.clone()));
+        result.insert("source_normalized_from", PyValue::from(normalized_from));
+    }
+    result.insert("source_class", PyValue::from(classify_source(&check.source)));
+    result
 }
 
 /// OSError 穿越 → Python `str(exc)`（framing 轉 `EXCEPTION`）。
@@ -652,7 +665,9 @@ impl Service {
                     // D-10（DF-02）：RPC 來源一律以 agent 對待，即使 source 以 `human:` 開頭。
                     origin: SubmitOrigin::Rpc,
                 };
-                self.manager.route(&sid, SessionRequest::Submit(req), ROUTE_TIMEOUT)
+                self.manager
+                    .route(&sid, SessionRequest::Submit(req), ROUTE_TIMEOUT)
+                    .map(|result| annotate_source(result, &source_check))
             }
             "command.get" => {
                 let cmd_id = p.str_or("cmd_id", "")?;

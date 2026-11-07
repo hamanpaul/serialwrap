@@ -278,6 +278,112 @@ fn wp51_submit_reserved_source_rejected_before_queue() {
     );
 }
 
+fn wp51_submit_success_response(
+    r: &ServiceRig,
+    cmd_id: &str,
+    source: Option<&str>,
+    normalized_from: Option<&str>,
+    source_class: &str,
+) -> String {
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    let mut expected = sw_proto::pydict! {
+        "ok" => true,
+        "cmd_id" => cmd_id,
+        "status" => "accepted",
+        "session_id" => session_id,
+    };
+    if let Some(source) = source {
+        expected.insert("source", PyValue::from(source));
+        expected.insert(
+            "source_normalized_from",
+            PyValue::from(normalized_from.expect("正規化來源必有原始值")),
+        );
+    }
+    expected.insert("source_class", PyValue::from(source_class));
+    expected.insert("version", PyValue::from(r.version.clone()));
+    j(&expected)
+}
+
+#[test]
+fn wp51_submit_success_source_annotations() {
+    let r = ServiceRig::ready_shell();
+    for (params, source, normalized_from, source_class) in [
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"human"}"#,
+            Some("human:cli"),
+            Some("human"),
+            "human",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"human:"}"#,
+            Some("human:cli"),
+            Some("human:"),
+            "human",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"human:cli"}"#,
+            None,
+            None,
+            "human",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy"}"#,
+            None,
+            None,
+            "agent",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"vendor:sync"}"#,
+            None,
+            None,
+            "agent",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"Human:Bob"}"#,
+            Some("human:Bob"),
+            Some("Human:Bob"),
+            "human",
+        ),
+    ] {
+        let response = r.call("command.submit", params);
+        assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+        let cmd_id = s(&response, "cmd_id").to_string();
+        assert_eq!(
+            j(&response),
+            wp51_submit_success_response(
+                &r,
+                &cmd_id,
+                source,
+                normalized_from,
+                source_class,
+            ),
+            "成功回應的來源標註或欄位順序錯誤：{params}"
+        );
+    }
+}
+
+#[test]
+fn wp51_submit_failure_has_no_source_annotations() {
+    let r = ServiceRig::ready_shell();
+    let session = sub(
+        &r.call("session.get_state", r#"{"selector":"COM0"}"#),
+        "session",
+    );
+    // 此請求會經 service route → SessionManager actor → SessionCore::submit，並由 CommandRegistry::admit 拒絕。
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"line1\nline2","source":"human"}"#,
+    );
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "CMD_CONTAINS_NEWLINE",
+        "hint" => "Command must not contain embedded newline characters. Split into multiple independent submissions.",
+        "session" => PyValue::Dict(session),
+        "version" => r.version.clone(),
+    };
+    assert_eq!(j(&response), j(&expected));
+}
+
 #[test]
 fn wp51_submit_normalized_source_reaches_registry() {
     let r = ServiceRig::ready_shell();
