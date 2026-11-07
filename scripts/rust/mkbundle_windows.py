@@ -333,7 +333,19 @@ def cmd_zip(args: argparse.Namespace) -> int:
     return 0
 
 
+def _utf8_stdio() -> None:
+    """GitHub hosted Windows runner 的 stdout 是 cp1252，印中文會丟 UnicodeEncodeError。
+
+    腳本以 `python -I` 執行時會忽略 PYTHONIOENCODING，只能在這裡改成 UTF-8。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def main() -> int:
+    _utf8_stdio()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("fingerprint")

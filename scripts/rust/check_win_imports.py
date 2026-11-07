@@ -73,7 +73,19 @@ def _inspect(executable: str, objdump: str | None) -> tuple[dict[str, Any], int]
             0 if ok else 1)
 
 
+def _utf8_stdio() -> None:
+    """GitHub hosted Windows runner 的 stdout 是 cp1252，印中文會丟 UnicodeEncodeError。
+
+    腳本以 `python -I` 執行時會忽略 PYTHONIOENCODING，只能在這裡改成 UTF-8。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _utf8_stdio()
     paths = list(sys.argv[1:] if argv is None else argv)
     if not paths:
         print("用法：check_win_imports.py <exe>…", file=sys.stderr)
