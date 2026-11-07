@@ -1368,14 +1368,24 @@ def test_bc_real_bc_case_ids_frozen() -> None:
     assert "OD-13" in by_id["BC-01"].related_decisions
 
 
+# 整合主線 feature/rust-refactor-p8（2e642648）contracts/behavior_changes.yaml 實際讀檔所得的 SC 集合（35 項，非推算範圍）：
+# SC-01～SC-31 扣 SC-08（OD-14 #3 撤回、編號不重用）；SC-30 由 P7 Task 0 登記（08 §0.5）；SC-34／SC-35 由 P1-OC（02b）登記；
+# SC-36 由 P4 Task 19 登記（OD-15）；SC-37 依 OD-21 登記；SC-39 依 OD-48 登記。SC-33 依擁有者 OD-79 撤回、SC-38 未佔用。
+_MAINLINE_SC_AT_2E642648 = frozenset({
+    "SC-01", "SC-02", "SC-03", "SC-04", "SC-05", "SC-06", "SC-07", "SC-09", "SC-10", "SC-11", "SC-12", "SC-13",
+    "SC-14", "SC-15", "SC-16", "SC-17", "SC-18", "SC-19", "SC-20", "SC-21", "SC-22", "SC-23", "SC-24", "SC-25",
+    "SC-26", "SC-27", "SC-28", "SC-29", "SC-30", "SC-31", "SC-34", "SC-35", "SC-36", "SC-37", "SC-39",
+})
+
+
+@pytest.mark.xfail(strict=True, reason="P8-T1 階段 A：SC-32 尚未登記")
 def test_bc_real_sc_df_ranges() -> None:
-    """SC 範圍合併 OD-14、P4 的 SC-36、P6 的 SC-28／SC-29／SC-31、P7 的 SC-30 與 OD-48 的 SC-39，且撤回 SC-08。"""
+    """SC 集合＝整合主線（2e642648）實際目錄 ∪ P8 Task 1 新增的 SC-32；SC-33（OD-79 撤回）與 SC-08（OD-14 #3）不得出現。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     sc_ids = {c.id for c in changes if c.kind == "SC"}
-    # SC-30 由 P7 Task 0 登記（08 §0.5）；SC-34／SC-35 由 P1-OC（02b）登記；SC-36 由 P4 Task 19 登記（OD-15）；
-    # SC-37 依 OD-21 登記；SC-39 依 OD-48 登記；SC-08 依 OD-14 #3 撤回、編號不重用。
-    assert sc_ids == ({f"SC-{i:02d}" for i in range(1, 32)} | {"SC-34", "SC-35", "SC-36", "SC-37", "SC-39"}) - {"SC-08"}
+    assert sc_ids == _MAINLINE_SC_AT_2E642648 | {"SC-32"}
+    assert "SC-33" not in sc_ids and "SC-08" not in sc_ids
     df_ids = {c.id for c in changes if c.kind == "DF"}
     # DF-19 由 P0 登記、P1 T20 實作（R5-F2）；DF-18 由 P7 Task 0 登記；DF-20～DF-22 依 OD-34～OD-44 登記；
     # DF-23／DF-24 依 OD-57／OD-73（P7）登記；DF-25 依 OD-77 登記。
@@ -1427,14 +1437,16 @@ def test_bc_real_sc_df_ranges() -> None:
     assert "merge_oldest" in df22.compatibility_impact and "不得低估" in df22.compatibility_impact
 
 
+@pytest.mark.xfail(strict=True, reason="P8-T1 階段 A：SC-32 尚未登記")
 def test_bc_real_rust_only_python_null() -> None:
-    """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only（含 P4-T19 的 SC-36）。"""
+    """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only（含 P4-T19 的 SC-36、P8-T1 的 SC-32）。"""
     changes, _, _ = _bc()
     by_id = {c.id: c for c in changes}
     for c in changes:
         if c.scope == "rust_only":
             assert c.applies_python_min is None, f"{c.id} applies_python_min 應為 None"
-    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-28", "SC-29", "SC-30", "SC-31", "SC-36"):
+    for sc_id in ("SC-15", "SC-17", "SC-18", "SC-22", "SC-23", "SC-24", "SC-26", "SC-28", "SC-29", "SC-30", "SC-31", "SC-32", "SC-36"):
+        assert sc_id in by_id, f"{sc_id} 未登記"
         assert by_id[sc_id].scope == "rust_only", f"{sc_id} scope 應為 rust_only"
     assert by_id["SC-25"].scope in {"rust_only", "python_when_manifest_present"}
 
