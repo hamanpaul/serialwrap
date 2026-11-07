@@ -1,5 +1,5 @@
 ---
-type: changed
+type: change
 scope: rust-refactor
 ---
 
