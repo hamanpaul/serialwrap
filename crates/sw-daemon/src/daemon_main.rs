@@ -4,8 +4,10 @@
 //! `_write_config_endpoint`）與 `sw_core/test_allowlist.py`、`sw_core/session_manager.py` 的 Stage 0 測試鉤子：
 //!
 //! - 啟動順序：argv → SC-19 allowlist 判定（零副作用，早於目錄、profile 與鎖）→ `ensure_runtime_dirs` →
-//!   `load_profiles` → 實例鎖 → `state.json` 載入 → SessionManager → 初始掃描 → rank → update → bootstrap attach →
-//!   watcher 啟動（DF-14）→ RPC bind → 寫 `config.yaml` 的 `socket_path`（SC-09，非致命）。
+//!   `load_profiles` → 實例鎖 → `state.json` 載入 → SessionManager → flash 認線協調者（RX observer）→ Event Engine →
+//!   初始掃描 → rank → update → bootstrap attach → watcher 啟動（DF-14）→ `/dev/ttyMCU` 端點（P8 Task 10；失敗 exit 1）→
+//!   RPC bind → 寫 `config.yaml` 的 `socket_path`（SC-09，非致命）。端點以 RAII（`FlashGuard`）持有，任何退出路徑都在
+//!   釋放實例鎖之前 unlink。
 //! - 有序關機（SC-11）：停 server（等進行中的 handler）→ stopping gate → 停 watcher → drain 全部 session
 //!   （含在途 attach，排隊命令 `FLUSHED_BY_SHUTDOWN`）→ WAL flush＋sync＋close → 釋放鎖；未收斂回 exit 1 並寫診斷。
 //! - exit code：0（正常停機、`-h`）、1（未攔截 panic、停機未收斂、環境錯誤）、2（argv 錯誤、allowlist 拒絕、鎖衝突）、
@@ -19,10 +21,12 @@ use std::time::{Duration, Instant};
 
 use sw_core::arbiter::CommandRegistry;
 use sw_core::event_engine::{EngineDeps, EventEngine};
+use sw_core::flash_endpoint::{EndpointShutdown, FlashCoordinator, FlashEndpoint, ENDPOINT_GRACE};
+use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_manager::{ManagerDeps, PersistObserver, SessionManager};
 use sw_core::state_store::{load_state_with_warn, StateStore};
 use sw_core::wal::{WalConfig, WalWriter};
-use sw_pal::traits::{EndpointSpec, FsOps, InstanceLockError, ListenOptions, PalError, PalResult, SysEnv};
+use sw_pal::traits::{EndpointSpec, FsOps, InstanceLockError, IoWaker, ListenOptions, PalError, PalResult, SysEnv};
 use sw_pal::{
     BackendKind, Capabilities, ConsoleKind, DeviceBackendKind, DeviceSelection, DeviceWatcher,
     PalPathFlavor, Platform, SkillPlatform,
@@ -35,7 +39,7 @@ use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::runtime_paths::{resolve_daemon_dirs, DaemonDirs, EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
 
 use crate::framing::RpcServer;
-use crate::service::{Service, ServiceDeps, ServiceHandler};
+use crate::service::{FlashState, Service, ServiceDeps, ServiceHandler};
 
 pub use crate::service::TestAllowlist;
 
@@ -930,6 +934,26 @@ impl Hooks {
     }
 }
 
+/// `EndpointShutdown` 的初始喚醒器（無事可做；端點 master 的 waker 由 `FlashEndpoint::start` 另登記）。
+struct NoWake;
+
+impl IoWaker for NoWake {
+    fn wake(&self) {}
+}
+
+/// P8 Task 10：`/dev/ttyMCU` 端點的 RAII 保底。drop（RPC 綁定失敗、停止序尾端、panic unwind）時取出端點，由
+/// `FlashEndpoint::drop` 設停止旗標並 unlink（不等 thread）。有序的 `FlashEndpoint::stop`（join、`incomplete`）屬 Task 12。
+///
+/// unlink 只看路徑：必須在釋放實例鎖之前 drop，否則可能刪到下一個 daemon 剛建立的同路徑 link（Python 亦於
+/// `service.stop()` 內、`lock.release()` 之前 `_flash_endpoint.stop()`）。panic unwind 依宣告反序，本 guard 先於鎖釋放。
+struct FlashGuard(Arc<FlashState>);
+
+impl Drop for FlashGuard {
+    fn drop(&mut self) {
+        drop(self.0.take_endpoint());
+    }
+}
+
 /// 產品入口：解析 argv、組裝 daemon、回傳 exit code（0／1／2／3）。未攔截 panic → 1（arch §6.1）。
 pub fn run(argv: Vec<String>, platform: Platform) -> i32 {
     run_guarded(argv, platform, Hooks::default())
@@ -1104,6 +1128,17 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         return 1;
     }
 
+    // P8 Task 10：flash 認線協調者（Python `SerialwrapService.__init__` 的 `add_rx_observer(self._flash_rx_observer)`）。
+    // RX observer 於 bridge 建立時取快照，必須在 bootstrap attach 之前建立；順序先於 Event Engine 的 observer（同 Python）。
+    let flash_coord = FlashCoordinator::new(
+        manager.clone(),
+        Arc::new(McuPatternRegistry::default_registry()),
+        p.clock.clone(),
+        p.uart_excl.clone(),
+        p.console.clone(),
+        EndpointShutdown::new(Arc::new(NoWake)),
+    );
+
     // P7 Task 16-wire：Event Engine（Python `SerialwrapService.__init__`／`start`）：engine.start → 註冊 RX observer →
     // initial scan／bootstrap（engine 先於 bootstrap attach，parity #121）。
     let p = Arc::new(p);
@@ -1160,6 +1195,23 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     manager.bootstrap_attach(); // P1 DF-14：bootstrap 在 watcher.start 之前
     hooks.trace(Stage::WatcherStart);
     let watcher = DeviceWatcher::start_with_baseline(src, WATCHER_POLL, manager.watcher_sender(), p.clock.clone(), initial);
+    // P8 Task 10：bootstrap attach 與 watcher 啟動之後才開 `/dev/ttyMCU`（Python `service.start()` 尾端
+    // `_flash_endpoint.start()`）；`caps.flash_endpoint=false` 回 `Ok(None)`。start 失敗（PTY／raw／link）→ exit 1
+    // （Python 例外穿出 `asyncio.run`；finally 照常停 service、釋放鎖）。
+    let flash = match FlashEndpoint::start(&p, Path::new(&paths.ttymcu_path), flash_coord.clone(), ENDPOINT_GRACE) {
+        Ok(endpoint) => FlashGuard(FlashState::new(flash_coord.clone(), endpoint)),
+        Err(e) => {
+            eprintln!("{PROG}: /dev/ttyMCU 端點啟動失敗（{}）: {}", paths.ttymcu_path, e.py_message);
+            manager.begin_shutdown();
+            watcher.stop();
+            engine.close_intake();
+            let _ = manager.shutdown(DRAIN_BUDGET);
+            engine.stop(std::time::Instant::now());
+            let _ = wal.shutdown();
+            lock.release();
+            return 1;
+        }
+    };
     let svc = Arc::new(Service::new(ServiceDeps {
         manager: manager.clone(),
         wal: wal.clone(),
@@ -1172,6 +1224,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         pid: p.env.pid(),
     }));
     svc.attach_engine(engine.clone());
+    svc.attach_flash(flash.0.clone());
     let listener = match p.rpc_listen.bind(&ep, &listen_options(&*p.env)) {
         Ok(l) => l,
         Err(e) => {
@@ -1182,6 +1235,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
             let _ = manager.shutdown(DRAIN_BUDGET);
             engine.stop(std::time::Instant::now());
             let _ = wal.shutdown();
+            drop(flash); // RAII：釋放實例鎖之前移除端點 link
             lock.release();
             return 1;
         }
@@ -1244,6 +1298,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     if let Err(e) = wal_result {
         incomplete.push(format!("WAL sync failed: {}", e.py_message));
     }
+    drop(flash); // RAII 保底：釋放實例鎖之前移除端點 link（有序的 FlashEndpoint::stop 屬 Task 12）
     lock.release(); // ⑤
     hooks.trace(Stage::LockReleased);
     if incomplete.is_empty() {

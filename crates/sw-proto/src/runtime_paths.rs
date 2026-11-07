@@ -281,8 +281,14 @@ impl RuntimePaths {
             &pypath::join(f, &user_home, &["b-log"]),
         );
         let config_yaml = pypath::join(f, &config_dir, &["config.yaml"]);
-        // P8-T10 紅燈：尚未承接 `TTYMCU_PATH`（golden 加欄後斷言失敗）。
-        let ttymcu_path = String::new();
+        // constants.py：`TTYMCU_PATH = _env_path("SERIALWRAP_TTYMCU_PATH", os.path.join(RUN_DIR, "dev", "ttyMCU"))`。
+        let ttymcu_path = env_path(
+            env,
+            f,
+            home,
+            "SERIALWRAP_TTYMCU_PATH",
+            &pypath::join(f, &run_dir, &["dev", "ttyMCU"]),
+        );
 
         Ok(RuntimePaths {
             config_dir,

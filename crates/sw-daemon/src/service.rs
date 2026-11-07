@@ -84,19 +84,24 @@ pub struct FlashState {
 
 impl FlashState {
     pub fn new(coord: Arc<FlashCoordinator>, endpoint: Option<FlashEndpoint>) -> Arc<FlashState> {
-        let _ = (coord, endpoint);
-        todo!("P8-T10")
+        Arc::new(FlashState {
+            coord,
+            endpoint: std::sync::Mutex::new(endpoint),
+        })
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<FlashEndpoint>> {
+        self.endpoint.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Python `FlashEndpoint.is_flashing()`：`on_flash_open` 進行中（含 detection，MCU-STATUS-01）；無端點恆 false。
     pub fn is_flashing(&self) -> bool {
-        let _ = &self.endpoint;
-        todo!("P8-T10")
+        self.slot().as_ref().is_some_and(FlashEndpoint::is_flashing)
     }
 
     /// 取出端點（呼叫端 drop 即 unlink）；之後 `is_flashing` 恆 false。
     pub fn take_endpoint(&self) -> Option<FlashEndpoint> {
-        todo!("P8-T10")
+        self.slot().take()
     }
 
     /// 認線協調者（`mcu.status` 的 `flashing_com`／`last_detect` 來源）。
@@ -273,8 +278,35 @@ impl Service {
 
     /// 掛上 flash 端點狀態（只可一次；回 `false` 表示已掛上）。
     pub fn attach_flash(&self, state: Arc<FlashState>) -> bool {
-        let _ = (&self.flash, state);
-        todo!("P8-T10")
+        self.flash.set(state).is_ok()
+    }
+
+    /// `service.py:1034-1038`：預設 registry 的 rows（T2 `patterns_rpc`：`family`／`probe`／`expect`／`baud`）。
+    fn mcu_patterns(&self) -> Result<PyDict, PyErr> {
+        Ok(pydict! { "ok" => true, "patterns" => self.mcu.patterns_rpc() })
+    }
+
+    /// `service.py:1039-1047`：`last_detect`／`flashing_com` 取 coordinator（Python `_flash_lock` 內讀
+    /// `_flash_last_detect`／`_flash_active_com`），`candidates` 為唯讀快照（`flash_candidates`，不標 flash-critical），
+    /// `flashing`＝`FlashEndpoint::is_flashing()`（probe／偵測期間即為 true，MCU-STATUS-01）。未掛 flash 狀態或無端點
+    /// （`caps.flash_endpoint=false`）時 `flashing:false`、`flashing_com:null`、`last_detect:null`。
+    fn mcu_status(&self) -> Result<PyDict, PyErr> {
+        let flash = self.flash.get();
+        let last_detect = flash
+            .and_then(|f| f.coordinator().last_detect())
+            .map_or(PyValue::Null, |d| PyValue::Dict(d.to_py()));
+        let active_com = flash
+            .and_then(|f| f.coordinator().active_com())
+            .map_or(PyValue::Null, PyValue::from);
+        let candidates = dict_list(self.manager.flash_candidates());
+        let flashing = flash.is_some_and(|f| f.is_flashing());
+        Ok(pydict! {
+            "ok" => true,
+            "candidates" => candidates,
+            "flashing" => flashing,
+            "flashing_com" => active_com,
+            "last_detect" => last_detect,
+        })
     }
 
     /// 掛上 Event Engine（只可一次；回 `false` 表示已掛上）。
@@ -425,17 +457,8 @@ impl Service {
             "health.ping" => Ok(pydict! { "ok" => true, "pong" => true }),
             "health.status" => Ok(crate::health::health(self)),
 
-            "mcu.patterns" => Ok(pydict! { "ok" => true, "patterns" => self.mcu.patterns_rpc() }),
-            "mcu.status" => {
-                // Slice 2.1 不承接 flash（2.4）：恆不在 FLASHING、無偵測紀錄。
-                Ok(pydict! {
-                    "ok" => true,
-                    "candidates" => dict_list(self.manager.flash_candidates()),
-                    "flashing" => false,
-                    "flashing_com" => PyValue::Null,
-                    "last_detect" => PyValue::Null,
-                })
-            }
+            "mcu.patterns" => self.mcu_patterns(),
+            "mcu.status" => self.mcu_status(),
 
             "device.list" => Ok(pydict! { "ok" => true, "devices" => dict_list(self.manager.list_devices()) }),
             "device.release" => {
