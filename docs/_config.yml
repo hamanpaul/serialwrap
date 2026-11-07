@@ -1,0 +1,8 @@
+# GitHub Pages 設定（來源 main:/docs）。
+#
+# inventory 是程式碼盤點，plans 是實作計畫，內容大量引用 strftime、Rust format!、Go template。
+# 其中的 `{%`、`{{` 會被 Liquid 當成語法，不是讓整站建置失敗，就是吃掉內容。
+# 這兩個目錄從未發布過，請直接在 GitHub 上閱讀。
+exclude:
+  - rust-refactor/inventory
+  - rust-refactor/plans

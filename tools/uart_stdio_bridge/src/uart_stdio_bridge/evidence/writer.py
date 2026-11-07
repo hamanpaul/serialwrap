@@ -25,9 +25,29 @@ from uart_stdio_bridge.evidence.records import (
 class EvidenceFailure(RuntimeError):
     """證據寫入重大失敗。"""
 
-    def __init__(self, message: str, code: str = "HARNESS_EVIDENCE_WRITE_FAILED") -> None:
+    def __init__(
+        self,
+        message: str,
+        code: str = "HARNESS_EVIDENCE_WRITE_FAILED",
+        detail: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.detail = detail
+
+
+@dataclass
+class _ProgressWait:
+    """同一次等待中，追蹤最後一次觀察到的 worker 進度。"""
+
+    last_progress_at: float
+    generation: int
+
+
+# close/flush 等待 worker 時，停滯期限可以被持續進度重設，但這段等待最多五分鐘。
+# 這讓大證據佇列有機會排空，同時避免持續產生工作或異常排程造成無界等待。
+# close 收尾的 fsync 與 os.close 無法設逾時，不在這個上限內。
+_ABSOLUTE_WAIT_CAP_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -94,8 +114,13 @@ class EvidenceWriter:
         )
         self._pending_slots = threading.BoundedSemaphore(max_pending_records)
         self._flush_lock = threading.Lock()
+        self._progress_changed = threading.Condition()
+        self._progress_lock = threading.Lock()
+        self._progress_generation = 0
+        self._progress_at = time.monotonic()
         self._thread: threading.Thread | None = None
         self._failure: str | None = None
+        self._failure_detail: str | None = None
         self._worker_failed = False
         self._failure_marker_attempted = False
         self._fd: int | None = None
@@ -110,6 +135,11 @@ class EvidenceWriter:
         with self._lock:
             return self._failure
 
+    @property
+    def failure_detail(self) -> str | None:
+        with self._lock:
+            return self._failure_detail
+
     @staticmethod
     def _classify_error(exc: BaseException) -> str:
         err = getattr(exc, "errno", None)
@@ -117,15 +147,109 @@ class EvidenceWriter:
             return "HARNESS_DISK_FULL"
         return "HARNESS_EVIDENCE_WRITE_FAILED"
 
-    def _set_failure_locked(self, code: str, *, worker_failed: bool = False) -> None:
+    def _set_failure_locked(
+        self,
+        code: str,
+        *,
+        worker_failed: bool = False,
+        detail: str | None = None,
+    ) -> None:
         if self._failure is None:
             self._failure = code
+            self._failure_detail = detail
         if worker_failed:
             self._worker_failed = True
 
     def _raise_failure(self) -> None:
         code = self.failure or "HARNESS_EVIDENCE_WRITE_FAILED"
-        raise EvidenceFailure(f"Evidence writer failed: {code}", code=code)
+        raise EvidenceFailure(
+            f"Evidence writer failed: {code}",
+            code=code,
+            detail=self.failure_detail,
+        )
+
+    def _progress_wait_state(self) -> _ProgressWait:
+        now = time.monotonic()
+        with self._progress_lock:
+            return _ProgressWait(
+                last_progress_at=now,
+                generation=self._progress_generation,
+            )
+
+    def _notify_progress_waiters(self) -> None:
+        with self._progress_changed:
+            self._progress_changed.notify_all()
+
+    def _mark_progress(self, progress_at: float) -> None:
+        # 先記錄時間再通知，避免 waiter 持有 condition lock 時延後可見進度。
+        with self._progress_lock:
+            self._progress_generation += 1
+            self._progress_at = progress_at
+        with self._progress_changed:
+            self._progress_changed.notify_all()
+
+    def _wait_with_progress(
+        self,
+        predicate: Callable[[], bool],
+        *,
+        stall_timeout_s: float,
+        absolute_deadline: float | None,
+        wait_state: _ProgressWait | None = None,
+    ) -> bool:
+        """直到條件成立；只有停滯或抵達絕對期限才回傳 False。"""
+        if wait_state is None:
+            wait_state = self._progress_wait_state()
+        if stall_timeout_s == 0:
+            return predicate()
+        with self._progress_changed:
+            while True:
+                with self._progress_lock:
+                    generation = self._progress_generation
+                    progress_at = self._progress_at
+                if generation != wait_state.generation:
+                    if progress_at - wait_state.last_progress_at > stall_timeout_s:
+                        return False
+                    wait_state.last_progress_at = progress_at
+                    wait_state.generation = generation
+
+                now = time.monotonic()
+                if now - wait_state.last_progress_at >= stall_timeout_s:
+                    return False
+                if absolute_deadline is not None and now >= absolute_deadline:
+                    return False
+                if predicate():
+                    return True
+
+                stall_deadline = wait_state.last_progress_at + stall_timeout_s
+                deadline = stall_deadline
+                if absolute_deadline is not None:
+                    deadline = min(deadline, absolute_deadline)
+                remaining = deadline - now
+
+                # 定期重查 lock、queue、Event 等非 condition 狀態；worker 寫入時則立即通知。
+                self._progress_changed.wait(min(remaining, 0.05))
+
+    def _acquire_with_progress(
+        self,
+        lock: Any,
+        *,
+        stall_timeout_s: float,
+        absolute_deadline: float | None,
+        wait_state: _ProgressWait | None = None,
+    ) -> bool:
+        return self._wait_with_progress(
+            lambda: lock.acquire(blocking=False),
+            stall_timeout_s=stall_timeout_s,
+            absolute_deadline=absolute_deadline,
+            wait_state=wait_state,
+        )
+
+    def _acquire_pending_slot(self) -> bool:
+        return self._wait_with_progress(
+            lambda: self._pending_slots.acquire(blocking=False),
+            stall_timeout_s=self.block_timeout_s,
+            absolute_deadline=None,
+        )
 
     def _require_running_locked(self) -> None:
         if self._state != "running":
@@ -135,7 +259,9 @@ class EvidenceWriter:
             )
         if self._failure is not None:
             raise EvidenceFailure(
-                f"Evidence writer failed: {self._failure}", code=self._failure
+                f"Evidence writer failed: {self._failure}",
+                code=self._failure,
+                detail=self._failure_detail,
             )
 
     def start(self) -> None:
@@ -158,10 +284,12 @@ class EvidenceWriter:
             except OSError as exc:
                 code = self._classify_error(exc)
                 with self._lock:
-                    self._set_failure_locked(code)
+                    self._set_failure_locked(code, detail="write_error")
                     self._state = "closed"
                 raise EvidenceFailure(
-                    f"無法建立證據檔 {self.path}: {exc}", code=code
+                    f"無法建立證據檔 {self.path}: {exc}",
+                    code=code,
+                    detail="write_error",
                 ) from exc
 
             with self._lock:
@@ -175,7 +303,11 @@ class EvidenceWriter:
                 thread.start()
             except Exception as exc:
                 with self._lock:
-                    self._set_failure_locked(self._classify_error(exc), worker_failed=True)
+                    self._set_failure_locked(
+                        self._classify_error(exc),
+                        worker_failed=True,
+                        detail="write_error",
+                    )
                     self._state = "closed"
                     self._fd = None
                 try:
@@ -193,11 +325,14 @@ class EvidenceWriter:
             n = self._os_write(fd, payload[written:])
             if type(n) is not int or n <= 0 or n > len(payload) - written:
                 raise OSError("Evidence write returned an invalid length")
+            progress_at = time.monotonic()
             chunk = payload[written : written + n]
             with self._lock:
                 self._hasher.update(chunk)
                 self._bytes_written += n
             written += n
+            # 短寫每次成功寫出位元組都算進度，避免大筆資料被誤判為停滯。
+            self._mark_progress(progress_at)
         with self._lock:
             self._records_written += 1
 
@@ -237,8 +372,10 @@ class EvidenceWriter:
     def _worker(self) -> None:
         while True:
             item = self._queue.get()
+            self._notify_progress_waiters()
             if item is None:
                 self._queue.task_done()
+                self._notify_progress_waiters()
                 break
             if isinstance(item, _FlushRequest):
                 try:
@@ -252,7 +389,11 @@ class EvidenceWriter:
                 except Exception as exc:
                     code = self._classify_error(exc)
                     with self._lock:
-                        self._set_failure_locked(code, worker_failed=True)
+                        self._set_failure_locked(
+                            code,
+                            worker_failed=True,
+                            detail="write_error",
+                        )
                     item.error_code = code
                     self._best_effort_failure_marker(
                         port_id=item.port_id,
@@ -263,10 +404,12 @@ class EvidenceWriter:
                 finally:
                     item.done.set()
                     self._queue.task_done()
+                    self._notify_progress_waiters()
                 continue
             if item.consumes_slot:
                 # 有界上限計算尚未開始寫出的 queue backlog；目前寫入項目不占佇列容量。
                 self._pending_slots.release()
+                self._notify_progress_waiters()
             try:
                 with self._lock:
                     skip = self._worker_failed
@@ -276,7 +419,11 @@ class EvidenceWriter:
             except Exception as exc:
                 code = self._classify_error(exc)
                 with self._lock:
-                    self._set_failure_locked(code, worker_failed=True)
+                    self._set_failure_locked(
+                        code,
+                        worker_failed=True,
+                        detail="write_error",
+                    )
                 self._best_effort_failure_marker(
                     port_id=item.port_id,
                     endpoint_generation=item.endpoint_generation,
@@ -311,7 +458,7 @@ class EvidenceWriter:
                 loss_flag=True,
             )
             encoded = dumps_record(marker)
-            self._set_failure_locked(code)
+            self._set_failure_locked(code, detail="backpressure_stall")
             self._seq = seq
             try:
                 self._queue.put_nowait(
@@ -325,7 +472,9 @@ class EvidenceWriter:
                 )
             except queue.Full:
                 # 正常項目使用 semaphore 限額，額外位置只留給此 marker；若不變量破裂仍 fail-stop。
-                self._set_failure_locked("HARNESS_EVIDENCE_WRITE_FAILED")
+                self._set_failure_locked(
+                    "HARNESS_EVIDENCE_WRITE_FAILED", detail="write_error"
+                )
                 self._seq = seq - 1
 
     def emit_data(
@@ -362,13 +511,17 @@ class EvidenceWriter:
                     payload=payload,
                 )
             encoded = dumps_record(record)
-            if not self._pending_slots.acquire(timeout=self.block_timeout_s):
+            if not self._acquire_pending_slot():
                 self._enqueue_overflow_marker_locked(
                     port_id=port_id,
                     endpoint_generation=endpoint_generation,
                     dut_generation=dut_generation,
                 )
-                raise EvidenceFailure("Queue full", code="HARNESS_EVIDENCE_OVERFLOW")
+                raise EvidenceFailure(
+                    "Queue full",
+                    code="HARNESS_EVIDENCE_OVERFLOW",
+                    detail="backpressure_stall",
+                )
             try:
                 with self._lock:
                     self._require_running_locked()
@@ -419,13 +572,17 @@ class EvidenceWriter:
                     loss_flag=loss_flag,
                 )
             encoded = dumps_record(record)
-            if not self._pending_slots.acquire(timeout=self.block_timeout_s):
+            if not self._acquire_pending_slot():
                 self._enqueue_overflow_marker_locked(
                     port_id=port_id,
                     endpoint_generation=endpoint_generation,
                     dut_generation=dut_generation,
                 )
-                raise EvidenceFailure("Queue full", code="HARNESS_EVIDENCE_OVERFLOW")
+                raise EvidenceFailure(
+                    "Queue full",
+                    code="HARNESS_EVIDENCE_OVERFLOW",
+                    detail="backpressure_stall",
+                )
             try:
                 with self._lock:
                     self._require_running_locked()
@@ -460,18 +617,33 @@ class EvidenceWriter:
     def flush(self, timeout_s: float = 5.0) -> None:
         if timeout_s < 0:
             raise ValueError("timeout_s 不得為負數")
-        deadline = time.monotonic() + timeout_s
-        if not self._flush_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        wait_state = self._progress_wait_state()
+        absolute_deadline = time.monotonic() + _ABSOLUTE_WAIT_CAP_S
+        if not self._acquire_with_progress(
+            self._flush_lock,
+            stall_timeout_s=timeout_s,
+            absolute_deadline=absolute_deadline,
+            wait_state=wait_state,
+        ):
             with self._lock:
                 self._set_failure_locked(
-                    "HARNESS_EVIDENCE_WRITE_FAILED", worker_failed=True
+                    "HARNESS_EVIDENCE_WRITE_FAILED",
+                    worker_failed=True,
+                    detail="flush_stall",
                 )
             self._raise_failure()
         try:
-            if not self._emit_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            if not self._acquire_with_progress(
+                self._emit_lock,
+                stall_timeout_s=timeout_s,
+                absolute_deadline=absolute_deadline,
+                wait_state=wait_state,
+            ):
                 with self._lock:
                     self._set_failure_locked(
-                        "HARNESS_EVIDENCE_WRITE_FAILED", worker_failed=True
+                        "HARNESS_EVIDENCE_WRITE_FAILED",
+                        worker_failed=True,
+                        detail="flush_stall",
                     )
                 self._raise_failure()
             try:
@@ -484,36 +656,59 @@ class EvidenceWriter:
                         endpoint_generation=context[1],
                         dut_generation=context[2],
                     )
-                remaining = max(0.0, deadline - time.monotonic())
-                try:
-                    self._queue.put(request, timeout=remaining)
-                except queue.Full:
+                def enqueue_flush_request() -> bool:
+                    try:
+                        self._queue.put_nowait(request)
+                    except queue.Full:
+                        return False
+                    return True
+
+                if not self._wait_with_progress(
+                    enqueue_flush_request,
+                    stall_timeout_s=timeout_s,
+                    absolute_deadline=absolute_deadline,
+                    wait_state=wait_state,
+                ):
                     with self._lock:
                         self._set_failure_locked(
-                            "HARNESS_EVIDENCE_WRITE_FAILED", worker_failed=True
+                            "HARNESS_EVIDENCE_WRITE_FAILED",
+                            worker_failed=True,
+                            detail="flush_stall",
                         )
                     self._raise_failure()
             finally:
                 self._emit_lock.release()
 
-            remaining = max(0.0, deadline - time.monotonic())
-            if not request.done.wait(remaining):
+            if not self._wait_with_progress(
+                request.done.is_set,
+                stall_timeout_s=timeout_s,
+                absolute_deadline=absolute_deadline,
+                wait_state=wait_state,
+            ):
                 with self._lock:
                     self._set_failure_locked(
-                        "HARNESS_EVIDENCE_WRITE_FAILED", worker_failed=True
+                        "HARNESS_EVIDENCE_WRITE_FAILED",
+                        worker_failed=True,
+                        detail="flush_stall",
                     )
                 self._raise_failure()
             if request.error_code is not None:
                 raise EvidenceFailure(
                     f"Evidence flush failed: {request.error_code}",
                     code=request.error_code,
+                    detail=self.failure_detail,
                 )
             with self._lock:
                 failure = self._failure
             if failure is not None:
-                raise EvidenceFailure(f"Evidence writer failed: {failure}", code=failure)
+                raise EvidenceFailure(
+                    f"Evidence writer failed: {failure}",
+                    code=failure,
+                    detail=self._failure_detail,
+                )
         finally:
             self._flush_lock.release()
+            self._notify_progress_waiters()
 
     def _summary_locked(self) -> dict[str, Any]:
         return {
@@ -523,7 +718,24 @@ class EvidenceWriter:
         }
 
     def close(self) -> dict[str, Any]:
-        with self._emit_lock:
+        wait_state = self._progress_wait_state()
+        absolute_deadline = time.monotonic() + _ABSOLUTE_WAIT_CAP_S
+        if not self._acquire_with_progress(
+            self._emit_lock,
+            stall_timeout_s=self.close_timeout_s,
+            absolute_deadline=absolute_deadline,
+            wait_state=wait_state,
+        ):
+            with self._lock:
+                self._set_failure_locked(
+                    "HARNESS_EVIDENCE_WRITE_FAILED",
+                    worker_failed=True,
+                    detail="close_stall",
+                )
+                self._state = "closing"
+                return self._summary_locked()
+
+        try:
             with self._lock:
                 if self._state == "closed":
                     return self._summary_locked()
@@ -532,30 +744,37 @@ class EvidenceWriter:
                     return self._summary_locked()
                 self._state = "closing"
                 thread = self._thread
-                should_enqueue_sentinel = thread is not None and not self._sentinel_enqueued
 
-            deadline = time.monotonic() + self.close_timeout_s
-            if should_enqueue_sentinel:
-                try:
-                    remaining = max(0.0, deadline - time.monotonic())
-                    self._queue.put(None, timeout=remaining)
+            def close_worker_finished() -> bool:
+                if thread is None:
+                    return True
+                with self._lock:
+                    sentinel_pending = not self._sentinel_enqueued
+                if sentinel_pending:
+                    try:
+                        self._queue.put_nowait(None)
+                    except queue.Full:
+                        return False
                     with self._lock:
                         self._sentinel_enqueued = True
-                except queue.Full:
-                    with self._lock:
-                        self._set_failure_locked(
-                            "HARNESS_EVIDENCE_WRITE_FAILED", worker_failed=True
-                        )
-                    return self._summary()
+                return not thread.is_alive()
+
+            if not self._wait_with_progress(
+                close_worker_finished,
+                stall_timeout_s=self.close_timeout_s,
+                absolute_deadline=absolute_deadline,
+                wait_state=wait_state,
+            ):
+                with self._lock:
+                    self._set_failure_locked(
+                        "HARNESS_EVIDENCE_WRITE_FAILED",
+                        worker_failed=True,
+                        detail="close_stall",
+                    )
+                return self._summary()
 
             if thread is not None:
-                thread.join(timeout=max(0.0, deadline - time.monotonic()))
-                if thread.is_alive():
-                    with self._lock:
-                        self._set_failure_locked(
-                            "HARNESS_EVIDENCE_WRITE_FAILED", worker_failed=True
-                        )
-                    return self._summary()
+                thread.join()
 
             with self._lock:
                 fd = self._fd
@@ -564,18 +783,25 @@ class EvidenceWriter:
                     self._os_fsync(fd)
                 except Exception as exc:
                     with self._lock:
-                        self._set_failure_locked(self._classify_error(exc))
+                        self._set_failure_locked(
+                            self._classify_error(exc), detail="write_error"
+                        )
                 try:
                     os.close(fd)
                 except OSError as exc:
                     with self._lock:
-                        self._set_failure_locked(self._classify_error(exc))
+                        self._set_failure_locked(
+                            self._classify_error(exc), detail="write_error"
+                        )
                 with self._lock:
                     # close(2) failure leaves descriptor ownership uncertain; never retry it.
                     self._fd = None
             with self._lock:
                 self._state = "closed"
                 return self._summary_locked()
+        finally:
+            self._emit_lock.release()
+            self._notify_progress_waiters()
 
     def _summary(self) -> dict[str, Any]:
         with self._lock:

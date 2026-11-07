@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*"
+  # OD-78：對既有 tag 補傳 Windows bundle zip。只會執行 publish-windows-bundle；其餘 job 僅在 tag push 時執行，
+  # 補傳不會重建 wheel／PyInstaller exe／Linux bundle，也不會建立 release。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 release tag（例如 v0.4.0）；其 GitHub Release 須已含 Linux bundle 與 SHA256SUMS"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   project-policy:
+    if: ${{ github.event_name == 'push' }}
     uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@2dcf2f815afeddc477c1cacc33df9beb06ae14fb # v1.0.19
     with:
       policy_profile: flat
@@ -17,6 +26,7 @@ jobs:
       policy_engine_ref: 2dcf2f815afeddc477c1cacc33df9beb06ae14fb
 
   publish:
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04  # 與 tests.yml 的 pytest job 相同；ubuntu-latest 沒有釘死的 3.12.3
     needs: project-policy
 
@@ -77,6 +87,7 @@ jobs:
   publish-windows-exe:
     # 在 windows-latest 以 PyInstaller 打 one-file exe，附加到同一個 release（#84 PORT-4）。
     # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳 exe。
+    if: ${{ github.event_name == 'push' }}
     runs-on: windows-latest
     needs: publish
 
@@ -122,9 +133,10 @@ jobs:
     # Linux x86_64 Rust bundle（RELEASE-TODO-01；docs/rust-refactor/release-0.4.0-plan.md §2）：
     # cargo build --release＋mkbundle 正式候選（不含 sw-cli/test-fakes）→ tar.gz＋SHA256SUMS → 解開後 smoke → 附加到同一個 release。
     # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳。
-    # Windows bundle 不在此建置：由擁有者 Windows runner 原生建置後以 gh release upload 附加（release 計畫 §2）。
+    # Windows bundle 由 publish-windows-bundle job 建置（OD-78，hosted windows-latest），等本 job 成功後才合併 SHA256SUMS。
     # OD-50：Linux 使用者皆為 Ubuntu 24.04 以上，bundle 內附 Python runtime 綁定 /usr/bin/python3.12；
     # 故釘 ubuntu-24.04 並以系統 Python 建 runtime，不用 actions/setup-python（hosted toolcache 不可搬移，S1-3185c6d-1）。
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
     needs: publish
     timeout-minutes: 60
@@ -352,3 +364,168 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: gh release upload "$TAG_NAME" "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" dist/SHA256SUMS --clobber
+
+  publish-windows-bundle:
+    # Windows x86_64 Rust bundle（OD-78）：hosted windows-latest 以 gnu host toolchain 建置，不需擁有者 runner；
+    # scripts/rust/mkbundle-windows.ps1 組出 CPython 3.12.3 embeddable runtime 的 bundle（不含 com0com、不簽署、不含 test-fakes），
+    # 解開後 smoke，再把 zip 列併入 Linux job 已上傳的 SHA256SUMS 後上傳。
+    # needs: publish-linux-bundle —— 兩個 job 都會改寫同一個 SHA256SUMS，必須序列化。
+    # workflow_dispatch：Linux job 被略過時仍執行，對 inputs.tag 補傳 zip（腳本取自觸發 ref，原始碼取自 tag）。
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish-linux-bundle.result == 'success') }}
+    runs-on: windows-latest
+    needs: publish-linux-bundle
+    timeout-minutes: 60
+    env:
+      # rust-toolchain.toml 只釘 channel；windows-latest 的 rustup 預設 host 為 MSVC，強制 GNU host（與 rust.yml 相同）。
+      RUSTUP_TOOLCHAIN: 1.96.1-x86_64-pc-windows-gnu
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      SOURCE_DIR: ${{ github.event_name == 'workflow_dispatch' && 'release-src' || '.' }}
+
+    steps:
+      - name: Keep LF line endings on checkout
+        # windows runner 的 system autocrlf=true 會讓 sw_core 與資產帶 CRLF，bundle 位元組就與 Linux 不同。
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Check out repository (build scripts)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out release source (workflow_dispatch tag)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: release-src
+          persist-credentials: false
+
+      - name: Verify tag matches VERSION and Cargo workspace version
+        id: verify-version
+        shell: pwsh
+        run: |
+          $fileVersion = (Get-Content (Join-Path $env:SOURCE_DIR 'VERSION') -Raw).Trim()
+          if ($env:TAG_NAME -ne "v$fileVersion") {
+            Write-Error "release tag $env:TAG_NAME does not match v$fileVersion (VERSION file)"
+            exit 1
+          }
+          $cargo = Get-Content (Join-Path $env:SOURCE_DIR 'Cargo.toml') -Raw
+          if ($cargo -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"' -or $Matches[1] -ne $fileVersion) {
+            Write-Error "Cargo.toml [workspace.package] version does not match VERSION $fileVersion"
+            exit 1
+          }
+          Write-Output "release tag $env:TAG_NAME matches VERSION $fileVersion"
+          "VERSION=$fileVersion" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Set up Python 3.12.3 (build host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+
+      - name: Install build host Python dependencies
+        # jsonschema 驗 release-manifest.json（與 Linux job 同版）；bundle 內的依賴由 mkbundle-windows.ps1 以雜湊釘版的 wheel 安裝。
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check jsonschema==4.10.3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Probe MinGW-w64 tools preinstalled on the image
+        id: mingw-probe
+        shell: pwsh
+        run: |
+          $hasAll = $true
+          foreach ($name in @('gcc', 'dlltool')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { $hasAll = $false }
+          }
+          if (-not ((Get-Command x86_64-w64-mingw32-objdump -ErrorAction SilentlyContinue) -or (Get-Command objdump -ErrorAction SilentlyContinue))) {
+            $hasAll = $false
+          }
+          "present=$($hasAll.ToString().ToLower())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+
+      - name: Install MSYS2 MinGW-w64 (only when the image lacks it)
+        id: msys2
+        if: steps.mingw-probe.outputs.present != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+
+      - name: Add MSYS2 MinGW-w64 to PATH (only when installed)
+        if: steps.mingw-probe.outputs.present != 'true'
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_PATH -Value '${{ steps.msys2.outputs.msys2-location }}\mingw64\bin'
+
+      - name: Install Rust 1.96.1 (windows-gnu host) and assert host
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ver = (rustc -vV | Out-String)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output $ver
+          if ($ver -notmatch '(?m)^host: x86_64-pc-windows-gnu\s*$') { throw "rustc host is not x86_64-pc-windows-gnu: $ver" }
+
+      - name: Provide x86_64-w64-mingw32-objdump name (needed by check_win_imports.py)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command x86_64-w64-mingw32-objdump -ErrorAction SilentlyContinue)) {
+            $plain = Get-Command objdump -ErrorAction Stop
+            $shimDir = Join-Path $env:RUNNER_TEMP 'mingw-shim'
+            New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+            Copy-Item -LiteralPath $plain.Source -Destination (Join-Path $shimDir 'x86_64-w64-mingw32-objdump.exe') -Force
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value $shimDir
+          }
+
+      - name: Build Windows release bundle
+        id: mkbundle
+        shell: pwsh
+        env:
+          # hosted runner 工作目錄在 D:、預設暫存在 C:，跨磁碟算不出相對路徑
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $name = "serialwrap-$env:VERSION-windows-x86_64"
+          $out = Join-Path $env:RUNNER_TEMP "bundle\$name"
+          .\scripts\rust\mkbundle-windows.ps1 -Out $out -SourceRoot $env:SOURCE_DIR -HostPython python -ZipPath "dist\$name.zip"
+          if (-not $?) { exit 1 }
+          # 二進位只允許 allowlist 內的系統 DLL（不得帶 MinGW runtime DLL）。
+          python scripts/rust/check_win_imports.py "$out\bin\serialwrap.exe" "$out\bin\serialwrapd.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test extracted bundle
+        id: smoke
+        shell: pwsh
+        run: |
+          # 在 throwaway 根目錄解開實際要發佈的 zip：--version／--help、內層 SHA256SUMS、manifest 版本、._pth 無絕對路徑、
+          # 測試鉤子字串、runtime 隔離（yaml／serial／sw_core 皆由 bundle 載入）、setup／doctor、daemon start／status／stop。
+          # 全程使用隔離目錄與 SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM999，不開任何 COM 埠。
+          .\scripts\rust\smoke-windows-bundle.ps1 -Zip "dist\serialwrap-$env:VERSION-windows-x86_64.zip" -Version $env:VERSION -HostPython python -SourceRoot $env:SOURCE_DIR
+          if (-not $?) { exit 1 }
+
+      - name: Merge SHA256SUMS and upload bundle to release
+        id: upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          zip_name="serialwrap-${VERSION}-windows-x86_64.zip"
+          linux_name="serialwrap-${VERSION}-linux-x86_64.tar.gz"
+          test -f "dist/${zip_name}"
+          mkdir -p merge
+          # 取回 Linux job 已上傳的 SHA256SUMS；沒有 Linux 列代表 Linux bundle 尚未發佈，不能只靠 Windows 列蓋掉它。
+          gh release download "$TAG_NAME" --pattern SHA256SUMS --dir merge --clobber
+          if ! grep -q "  ${linux_name}$" merge/SHA256SUMS; then
+            echo "::error::release ${TAG_NAME} 的 SHA256SUMS 沒有 ${linux_name} 的列；請先完成 Linux bundle"
+            exit 1
+          fi
+          sed -i "/  ${zip_name}$/d" merge/SHA256SUMS
+          # LF 行尾、兩個空白，與 Linux 列同格式（msys 的 sha256sum 可能輸出 ' *' 二進位標記，一律正規化）。
+          (cd dist && sha256sum "${zip_name}") | sed -E 's/^([0-9a-f]{64}) [ *]/\1  /' >> merge/SHA256SUMS
+          cat merge/SHA256SUMS
+          gh release upload "$TAG_NAME" "dist/${zip_name}" merge/SHA256SUMS --clobber
+          # 重新下載實際發佈的 bytes 並核對。
+          rm -rf verify-dl
+          gh release download "$TAG_NAME" --pattern "${linux_name}" --pattern "${zip_name}" --pattern SHA256SUMS --dir verify-dl
+          (cd verify-dl && sha256sum -c --ignore-missing SHA256SUMS)

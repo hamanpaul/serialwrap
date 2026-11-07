@@ -742,3 +742,293 @@ def test_hvci_parser_requires_exact_service_id(monkeypatch, output, expected):
 
     monkeypatch.setattr(manifest, "_powershell", lambda command: output)
     assert manifest._query_hvci() is expected
+
+
+def test_writer_close_slow_progress_exceeds_stall_timeout(tmp_path):
+    """排空時間可超過停滯期限，只要每次寫入都持續前進。"""
+    first_write_entered = threading.Event()
+    release_first_write = threading.Event()
+    close_started = threading.Event()
+    write_calls = {"n": 0}
+    close_result = {}
+
+    def slow_write(fd, data):
+        write_calls["n"] += 1
+        if write_calls["n"] == 1:
+            first_write_entered.set()
+            release_first_write.wait()
+        else:
+            time.sleep(0.01)
+        return os.write(fd, data)
+
+    path = tmp_path / "wire.ndjson"
+    w = _writer(path, os_write=slow_write, close_timeout_s=0.03)
+    w.start()
+    for index in range(8):
+        _emit(w, payload=f"record-{index}".encode())
+    assert first_write_entered.wait(5.0)
+
+    def close_writer():
+        close_started.set()
+        close_result["summary"] = w.close()
+
+    close_thread = threading.Thread(target=close_writer)
+    close_thread.start()
+    assert close_started.wait(1.0)
+    time.sleep(0.01)
+    release_first_write.set()
+    close_thread.join(timeout=3.0)
+    try:
+        assert not close_thread.is_alive(), "close 未在持續進度下完成"
+        assert w.failure is None
+        assert close_result["summary"]["records"] == 8
+        assert len(_lines(path)) == 8
+    finally:
+        release_first_write.set()
+        close_thread.join(timeout=3.0)
+        if w._thread is not None:
+            w._thread.join(timeout=3.0)
+        w.close()
+
+
+def test_writer_flush_slow_progress_exceeds_stall_timeout(tmp_path):
+    """flush 等待佇列時以 writer 進度重設停滯期限。"""
+    first_write_entered = threading.Event()
+    release_first_write = threading.Event()
+    write_calls = {"n": 0}
+    flush_result = {}
+
+    def slow_write(fd, data):
+        write_calls["n"] += 1
+        if write_calls["n"] == 1:
+            first_write_entered.set()
+            release_first_write.wait()
+        else:
+            time.sleep(0.01)
+        return os.write(fd, data)
+
+    path = tmp_path / "wire.ndjson"
+    w = _writer(path, os_write=slow_write, max_pending_records=24)
+    w.start()
+    for index in range(20):
+        _emit(w, payload=f"record-{index}".encode())
+    assert first_write_entered.wait(5.0)
+
+    def flush_writer():
+        try:
+            w.flush(timeout_s=0.08)
+        except Exception as exc:  # noqa: BLE001 - 收集預期失敗以利診斷
+            flush_result["error"] = exc
+
+    flush_thread = threading.Thread(target=flush_writer)
+    flush_thread.start()
+    deadline = time.monotonic() + 1.0
+    while w._queue.qsize() < 20 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert w._queue.qsize() == 20, "flush barrier 未排入 writer 佇列"
+    time.sleep(0.01)
+    release_first_write.set()
+    flush_thread.join(timeout=3.0)
+    try:
+        assert not flush_thread.is_alive(), "flush 未在持續進度下完成"
+        assert "error" not in flush_result
+        assert w.failure is None
+        assert len(_lines(path)) == 20
+    finally:
+        release_first_write.set()
+        flush_thread.join(timeout=3.0)
+        w.close()
+
+
+def test_writer_backpressure_slow_partial_write_progress_exceeds_stall_timeout(tmp_path):
+    """短寫持續前進時，背壓等待不因整筆資料較慢而溢位。"""
+    first_write_entered = threading.Event()
+    emit_result = {}
+
+    def slow_short_write(fd, data):
+        first_write_entered.set()
+        time.sleep(0.01)
+        return os.write(fd, data[:32])
+
+    path = tmp_path / "wire.ndjson"
+    w = _writer(
+        path,
+        os_write=slow_short_write,
+        max_pending_records=1,
+        block_timeout_s=0.03,
+    )
+    w.start()
+    _emit(w, payload=b"first")
+    assert first_write_entered.wait(5.0)
+    _emit(w, payload=b"second")
+
+    def emit_third():
+        try:
+            emit_result["seq"] = _emit(w, payload=b"third")
+        except Exception as exc:  # noqa: BLE001 - 收集預期失敗以利診斷
+            emit_result["error"] = exc
+
+    started_at = time.monotonic()
+    emit_thread = threading.Thread(target=emit_third)
+    emit_thread.start()
+    emit_thread.join(timeout=3.0)
+    try:
+        elapsed = time.monotonic() - started_at
+        assert not emit_thread.is_alive(), "背壓 emit 未在持續進度下完成"
+        assert "error" not in emit_result
+        assert emit_result["seq"] == 3
+        assert elapsed > 0.03
+        assert w.failure is None
+        w.flush(timeout_s=1.0)
+        assert len(_lines(path)) == 3
+    finally:
+        emit_thread.join(timeout=3.0)
+        w.close()
+
+
+def test_writer_close_stall_has_failure_detail(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_write(fd, data):
+        entered.set()
+        release.wait()
+        return os.write(fd, data)
+
+    w = _writer(tmp_path / "wire.ndjson", os_write=blocking_write, close_timeout_s=0.05)
+    w.start()
+    _emit(w)
+    assert entered.wait(5.0)
+    try:
+        w.close()
+        assert w.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+        assert w.failure_detail == "close_stall"
+    finally:
+        release.set()
+        if w._thread is not None:
+            w._thread.join(timeout=3.0)
+        w.close()
+
+
+def test_writer_flush_stall_has_failure_detail(tmp_path):
+    from uart_stdio_bridge.evidence.writer import EvidenceFailure
+
+    entered = threading.Event()
+    release = threading.Event()
+    outcome = {}
+
+    def blocking_write(fd, data):
+        entered.set()
+        release.wait()
+        return os.write(fd, data)
+
+    w = _writer(tmp_path / "wire.ndjson", os_write=blocking_write)
+    w.start()
+    _emit(w)
+    assert entered.wait(5.0)
+
+    def flush_writer():
+        try:
+            w.flush(timeout_s=0.05)
+        except Exception as exc:  # noqa: BLE001 - 收集預期失敗以利診斷
+            outcome["error"] = exc
+
+    flush_thread = threading.Thread(target=flush_writer)
+    flush_thread.start()
+    flush_thread.join(timeout=1.0)
+    try:
+        assert not flush_thread.is_alive()
+        assert isinstance(outcome.get("error"), EvidenceFailure)
+        assert w.failure_detail == "flush_stall"
+    finally:
+        release.set()
+        flush_thread.join(timeout=3.0)
+        w.close()
+
+
+def test_writer_backpressure_stall_has_failure_detail(tmp_path):
+    from uart_stdio_bridge.evidence.writer import EvidenceFailure
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_write(fd, data):
+        entered.set()
+        release.wait()
+        return os.write(fd, data)
+
+    w = _writer(
+        tmp_path / "wire.ndjson",
+        max_pending_records=1,
+        block_timeout_s=0.05,
+        os_write=blocking_write,
+    )
+    w.start()
+    _emit(w, payload=b"first")
+    assert entered.wait(5.0)
+    _emit(w, payload=b"second")
+    try:
+        with pytest.raises(EvidenceFailure) as excinfo:
+            _emit(w, payload=b"third")
+        assert excinfo.value.code == "HARNESS_EVIDENCE_OVERFLOW"
+        assert w.failure_detail == "backpressure_stall"
+    finally:
+        release.set()
+        w.close()
+
+
+def test_writer_os_write_error_has_failure_detail(tmp_path):
+    from uart_stdio_bridge.evidence.writer import EvidenceFailure
+
+    def fail_write(fd, data):
+        raise OSError(errno.EIO, "io")
+
+    w = _writer(tmp_path / "wire.ndjson", os_write=fail_write)
+    w.start()
+    _emit(w)
+    with pytest.raises(EvidenceFailure):
+        w.flush()
+    assert w.failure_detail == "write_error"
+    w.close()
+
+
+def test_bridge_failed_stderr_includes_writer_failure_detail(tmp_path, capsys):
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+
+    class Endpoint:
+        def close(self):
+            pass
+
+        def describe(self):
+            return {"kind": "test"}
+
+    class Dut:
+        def terminate(self, grace_s):
+            pass
+
+        def describe(self):
+            return {}
+
+    class FailedWriter:
+        failure = "HARNESS_EVIDENCE_WRITE_FAILED"
+        failure_detail = "flush_stall"
+
+        def close(self):
+            return {"records": 0, "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    bridge = Bridge(
+        BridgeConfig(run_id="r1", case_id="c1", port_id="COM0", evidence_dir=evidence_dir),
+        Endpoint(),
+        Dut(),
+        FailedWriter(),
+        dut_control=None,
+    )
+    bridge._finish()
+    stderr = capsys.readouterr().err
+    assert json.loads(stderr) == {
+        "code": "HARNESS_EVIDENCE_WRITE_FAILED",
+        "detail": "flush_stall",
+        "event": "BRIDGE_FAILED",
+    }

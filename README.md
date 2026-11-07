@@ -890,10 +890,36 @@ single-user workstation. Optional com0com serial consoles are configured in
 peer_port}}`); both ports are excluded from device enumeration, a malformed
 value is ignored with one WARNING.
 
+#### Windows release bundle (zip)
+
+Each GitHub Release can carry `serialwrap-<version>-windows-x86_64.zip` next to
+the Linux tarball (built on GitHub-hosted `windows-latest`; the `SHA256SUMS`
+asset lists both). It is a Rust CLI plus the Python daemon on a private CPython
+3.12.3 runtime (PyYAML and pyserial included), so no system Python is needed.
+It is **not code-signed** (SmartScreen may warn; verify the SHA-256 instead) and
+does **not** include com0com. Install (PowerShell):
+
+```powershell
+# 1. verify the download against SHA256SUMS
+(Get-FileHash .\serialwrap-<version>-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+# 2. extract anywhere temporary, then run setup from the versioned bin\ directory
+Expand-Archive .\serialwrap-<version>-windows-x86_64.zip -DestinationPath $env:TEMP\swinst
+& $env:TEMP\swinst\serialwrap-<version>-windows-x86_64\versions\<version>\bin\serialwrap.exe setup --on-demand
+# 3. the install root is %LOCALAPPDATA%\Programs\serialwrap; add its bin\ to PATH
+serialwrap.exe --version; serialwrap.exe doctor
+```
+
+Run `setup` from `versions\<version>\bin\serialwrap.exe` (that is the copy that
+sits next to `release-manifest.json`); the top-level `bin\` copy is only a
+stable entry. `setup --windows-task` selects Task Scheduler supervision. The PyInstaller
+`serialwrap.exe` / `serialwrapd.exe` assets are still published for existing
+users. A past tag can be backfilled with the release workflow's
+`workflow_dispatch` (input: tag).
+
 #### Optional com0com component
 
-Windows bundles can include the signed com0com 3.0.0.0 virtual serial driver as
-an optional component. It is not selected by default, and the normal serialwrap
+A Windows bundle can include the signed com0com 3.0.0.0 virtual serial driver as
+an optional component (the published release zip does not, OD-78). It is not selected by default, and the normal serialwrap
 install or update does not require administrator rights. Run
 `serialwrap setup --with-com0com` to install the default COM20/COM21 pair; only
 the bundled helper requests UAC elevation. Run `serialwrap setup
@@ -2703,9 +2729,25 @@ Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 se
   - Device：`PosixDeviceSource`（`/dev/serial/by-id`）↔ `WindowsDeviceSource`（SERIALCOMM registry）
 - POSIX 路徑全程 byte-identical（shim 維持相容）。
 
+### Windows 發佈 zip（`serialwrap-<版本>-windows-x86_64.zip`）
+
+GitHub Release 除 Linux tarball 外，另附 `serialwrap-<版本>-windows-x86_64.zip`（由 GitHub hosted `windows-latest` 建置，`SHA256SUMS` 兩者皆列）。內容為 Rust CLI 加 Python daemon，runtime 為隨 bundle 附帶的 CPython 3.12.3（含 PyYAML、pyserial），不需系統 Python。**未做程式碼簽署**（SmartScreen 可能警告，請以 SHA-256 核對），**不含 com0com**。安裝（PowerShell）：
+
+```powershell
+# 1. 以 SHA256SUMS 核對下載檔
+(Get-FileHash .\serialwrap-<版本>-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+# 2. 解到暫存位置，再從 versions\<版本>\bin 執行 setup
+Expand-Archive .\serialwrap-<版本>-windows-x86_64.zip -DestinationPath $env:TEMP\swinst
+& $env:TEMP\swinst\serialwrap-<版本>-windows-x86_64\versions\<版本>\bin\serialwrap.exe setup --on-demand
+# 3. 安裝根為 %LOCALAPPDATA%\Programs\serialwrap；把其 bin\ 加入 PATH
+serialwrap.exe --version; serialwrap.exe doctor
+```
+
+`setup` 必須由 `versions\<版本>\bin\serialwrap.exe` 執行（只有這份與 `release-manifest.json` 同層）；zip 頂層 `bin\` 的副本只是穩定入口。要用工作排程器監管改下 `setup --windows-task`。PyInstaller 的 `serialwrap.exe`／`serialwrapd.exe` 仍照發供既有使用者。要對既有 tag 補傳 zip，手動觸發 release workflow 的 `workflow_dispatch`（輸入 tag）。
+
 ### Windows 選用元件：com0com
 
-Windows 發佈組合可附 com0com 3.0.0.0 虛擬序列埠 driver，預設不安裝；一般 serialwrap 安裝與更新仍不需要管理員權限。明確執行 `serialwrap setup --with-com0com` 才會由 bundle 內 helper 單獨請求 UAC，並安裝預設 COM20／COM21 pair。執行 `serialwrap setup --remove-com0com` 可移除此 pair。拒絕 UAC 或 helper 失敗不會讓基本安裝失敗，結果會列在 `optional_components.com0com`。Spike 1 剩餘項目在 HVCI 開啟的機台全數通過前仍標示為實驗性。套件附 GPLv2 授權、com0com 3.0.0.0 原始碼連結與書面提供承諾。
+Windows 發佈組合可附 com0com 3.0.0.0 虛擬序列埠 driver（已發佈的 release zip 不含，OD-78），預設不安裝；一般 serialwrap 安裝與更新仍不需要管理員權限。明確執行 `serialwrap setup --with-com0com` 才會由 bundle 內 helper 單獨請求 UAC，並安裝預設 COM20／COM21 pair。執行 `serialwrap setup --remove-com0com` 可移除此 pair。拒絕 UAC 或 helper 失敗不會讓基本安裝失敗，結果會列在 `optional_components.com0com`。Spike 1 剩餘項目在 HVCI 開啟的機台全數通過前仍標示為實驗性。套件附 GPLv2 授權、com0com 3.0.0.0 原始碼連結與書面提供承諾。
 
 #### 建置 Windows 可執行檔（PyInstaller）
 
