@@ -522,10 +522,12 @@ function Invoke-Blackbox([string]$Name, [string]$JunitPath, [string]$CliPath, [s
         Remove-Item Env:SW_RESOURCE_REPORT -ErrorAction SilentlyContinue
     }
     # pytest argv 與凍結的 s1a_blackbox windows selector 完全一致；P7 Task 18A 的 -Tests 只替換路徑段。
-    $testPaths = @('tests/contract_blackbox')
-    if ($Tests) { $testPaths = @($Tests -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    $arguments = @('-3.12', '-m', 'pytest') + $testPaths + @('-m', 'core_portable or windows_native',
+    $arguments = @('-3.12', '-m', 'pytest', 'tests/contract_blackbox', '-m', 'core_portable or windows_native',
                    "--junitxml=$JunitPath")
+    if ($Tests) {
+        $testPaths = @($Tests -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $arguments = @($arguments[0..2]) + $testPaths + @($arguments[4..($arguments.Length - 1)])
+    }
     $stdoutPath = Join-Path $OutDir "$Name.stdout.log"
     $stderrPath = Join-Path $OutDir "$Name.stderr.log"
     $oldErrorActionPreference = $ErrorActionPreference
@@ -977,7 +979,8 @@ try {
     $requiredPaths = @('serialwrap.py', 'serialwrapd.py', 'sw_core', 'tests/contract_blackbox',
                        'tests/ab_env.py', 'VERSION', 'contracts',
                        'scripts/rust/ab_blackbox_1b.py', 'scripts/rust/ab_compare.py', 'scripts/rust/check_p4_cases.py',
-                       'scripts/rust/owner_gated.py')
+                       'scripts/rust/owner_gated.py', 'scripts/rust/event_latency_measure.py',
+                       'scripts/rust/p7_ab_report.py')
     foreach ($relative in $requiredPaths) { $null = Copy-RepoPath $sourceRoot $relative $stagingRepo $true }
     if ($ComPair) { $null = Copy-RepoPath $sourceRoot 'tools/uart_stdio_bridge' $stagingRepo $true }
     # P4-T16：test_cli_mgmt_ab_suite 由凍結鎖讀 AB_CASES 並收集每個凍結 pytest 節點；
