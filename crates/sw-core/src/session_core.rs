@@ -4191,8 +4191,10 @@ impl SessionCore {
         if self.state != SessionState::Ready || self.generations.conn_epoch.is_none() {
             return Some(pydict! { "ok" => false, "error_code" => "SESSION_NOT_READY" });
         }
-        // 07 D-10（DF-02）：只有 line editor 產生的 HumanConsole 視為 human；RPC 的 `human:` source 一律以 agent 對待。
-        let human = matches!(command.req.origin, SubmitOrigin::HumanConsole { .. });
+        // DF-02／OD-74（rulings s2 D5）：可信 human＝RPC 依原始 source 判定的 `trusted_human` OR line editor 的
+        // HumanConsole；永不看 `source` 字首（Python `session_manager.py:6549`，RPC 一律帶明確布林）。
+        // quiet gate 與下方 lease 判斷共用此結果（`:6573-6588`）。
+        let human = command.req.is_trusted_human();
         if !human && !self.is_passthrough() {
             // `_agent_gate_reject_locked`＋SC-03（execute 層）；expire 翻轉時同步 fence。
             let was_failed = self.quiet.failed;

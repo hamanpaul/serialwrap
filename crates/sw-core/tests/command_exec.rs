@@ -2075,3 +2075,202 @@ fn wp52_flag_does_not_bypass_gates() {
     assert!(direct.get("cmd_id").is_none());
     assert!(h.dev.take_tx().is_empty(), "提交時拒絕零 TX");
 }
+
+// ---------------------------------------------------------------------------
+// WP5-5 第 1 項：execute-time 可信來源判定（G7a、OD-74、rulings s2 D5）
+// ---------------------------------------------------------------------------
+
+/// 效果中是否含指定命令的 `Effect::StartOp { spec: OpSpec::Command(..) }`（命令實際進入執行）。
+fn wp55_started(effects: &[Effect], cmd_id: &str) -> bool {
+    use sw_core::op_runner::OpSpec;
+    effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::StartOp { spec: OpSpec::Command(queued), .. } if queued.cmd_id == cmd_id
+        )
+    })
+}
+
+/// 出列決策只看 `SubmitReq::is_trusted_human()`（`trusted_human` 旗標 OR `HumanConsole` 來源），永不看 `source` 字首。
+///
+/// 對照 Python `origin/main:sw_core/session_manager.py:6549`：`human = source.startswith("human:") if trusted_human is
+/// None else trusted_human`，RPC 路徑一律帶明確布林（`arbiter.py:411-416` 只在旗標成立時傳 `trusted_human=True`，
+/// 否則 `service.py` 的 `_send_cb` 帶 False），故 RPC 的 `human:` 字首不授權豁免；`:6573-6588` 的 quiet gate 與
+/// lease 判斷共用同一個 `human`。
+///
+/// (A) quiet：前景佔住時命令入列，banner 才武裝 quiet，前景以正式 `OpFinished` 結束後待測命令出列——
+///     可信者取得 `StartOp`；非可信者被 execute-time gate 以 `AUTOBOOT_QUIET` 終結且無 `StartOp`。
+/// (B) quiet 關閉、已有 human lease：可信者回 `SESSION_INTERACTIVE_BUSY`；非可信者沿用 agent 判斷（Python
+///     `suspend_human_interactive`），照常出列。
+#[test]
+fn wp55_execute_time_trust_matrix() {
+    use sw_core::arbiter::SubmitOrigin;
+
+    let console = || SubmitOrigin::HumanConsole {
+        client_id: "c1".into(),
+    };
+    // (source, trusted_human, origin, 預期可信)
+    let matrix = [
+        // OD-74：RPC 依原始 source 判定的可信 human（`trusted_human=true`）。
+        ("human:cli", true, SubmitOrigin::Rpc, true),
+        // G7a：明寫 `human:` 字首、非可信的 RPC 一律以 agent 對待。
+        ("human:cli", false, SubmitOrigin::Rpc, false),
+        ("agent:x", false, SubmitOrigin::Rpc, false),
+        // D5：HumanConsole 來源即使旗標為 false 仍可信（OR 語意）。
+        ("human:c1", false, console(), true),
+    ];
+
+    for (source, trusted_human, origin, trusted) in matrix.clone() {
+        let case =
+            format!("(A) quiet source={source} trusted_human={trusted_human} origin={origin:?}");
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let hold = h.start_foreground_command("sleep 9");
+        let mut req = agent_submit("echo wp55");
+        req.source = source.into();
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        let resp = resp.expect("submit");
+        assert_eq!(
+            resp["ok"],
+            PyValue::Bool(true),
+            "{case}：quiet 前提交應通過：{resp:?}"
+        );
+        let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+        assert!(
+            !wp55_started(&effects, &cmd_id),
+            "{case}：前景佔用中不得出列"
+        );
+        assert_eq!(
+            h.reg.get(&cmd_id).expect("registry")["status"],
+            PyValue::from("accepted"),
+            "{case}：命令應已入列"
+        );
+
+        h.rx(BANNER);
+        assert!(
+            h.fence.with(|f| f.quiet_active),
+            "{case}：banner 應於命令入列後武裝 quiet"
+        );
+        assert_ne!(
+            pget(&h.public(), "boot_quiet_remaining_s"),
+            PyValue::Null,
+            "{case}"
+        );
+
+        let epoch = h.epoch();
+        let effects = h.feed(ControlEvent::OpFinished {
+            op_id: hold.op_id,
+            epoch,
+            outcome: OpOutcome::CommandResult(sw_proto::pydict! {
+                "ok" => true, "stdout" => "", "partial" => false,
+            }),
+            after_rx_seq: None,
+        });
+        assert_eq!(
+            h.reg.get(&hold.cmd_id).expect("hold")["status"],
+            PyValue::from("done"),
+            "{case}：前景以正式 OpFinished 結束"
+        );
+        let rec = h.reg.get(&cmd_id).expect("registry");
+        if trusted {
+            assert!(
+                wp55_started(&effects, &cmd_id),
+                "{case}：可信 human 出列時應略過 quiet gate 並取得 StartOp：{rec:?}"
+            );
+            assert_eq!(rec["status"], PyValue::from("running"), "{case}：{rec:?}");
+            assert_eq!(
+                rec.get("error_code"),
+                Some(&PyValue::Null),
+                "{case}：{rec:?}"
+            );
+            assert_eq!(rec.get("done_at"), Some(&PyValue::Null), "{case}：{rec:?}");
+        } else {
+            assert!(
+                !wp55_started(&effects, &cmd_id),
+                "{case}：非可信命令不得取得 StartOp"
+            );
+            // Python `arbiter.py:465-467`：ok:false → status "error"＋error_code；`retry_after_s` 不在
+            // `arbiter.py:455-462` 的複製清單，command.get 不含（同 `execute_time_gate_has_retry_after_sc03`）。
+            assert_eq!(rec["status"], PyValue::from("error"), "{case}：{rec:?}");
+            assert_eq!(
+                rec["error_code"],
+                PyValue::from("AUTOBOOT_QUIET"),
+                "{case}：{rec:?}"
+            );
+            assert!(rec.get("retry_after_s").is_none(), "{case}：{rec:?}");
+            // 同 source 直接提交：gate 回應本身帶 `retry_after_s`（SC-03），提交時拒絕不產生命令。
+            let mut again = agent_submit("echo wp55");
+            again.source = source.into();
+            again.trusted_human = trusted_human;
+            again.origin = origin.clone();
+            let (direct, effects) = h.rpc_full(SessionRequest::Submit(again));
+            let direct = direct.expect("submit");
+            assert_eq!(
+                pget(&direct, "error_code"),
+                PyValue::from("AUTOBOOT_QUIET"),
+                "{case}：{direct:?}"
+            );
+            assert!(
+                matches!(pget(&direct, "retry_after_s"), PyValue::Float(_)),
+                "{case}：{direct:?}"
+            );
+            assert!(direct.get("cmd_id").is_none(), "{case}");
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::StartOp { .. })),
+                "{case}：提交時拒絕不得出列"
+            );
+        }
+    }
+
+    for (source, trusted_human, origin, trusted) in matrix {
+        let case = format!(
+            "(B) human lease source={source} trusted_human={trusted_human} origin={origin:?}"
+        );
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let open = h
+            .rpc(SessionRequest::InteractiveOpen {
+                owner: "human:operator".into(),
+                timeout_s: 60.0,
+                command: String::new(),
+                allow_attached: false,
+            })
+            .expect("RPC");
+        assert_eq!(pget(&open, "ok"), PyValue::Bool(true), "{case}：{open:?}");
+        let iid = pget(&open, "interactive_id");
+        assert!(!h.fence.with(|f| f.quiet_active), "{case}：quiet 關閉");
+        let mut req = agent_submit("echo wp55");
+        req.source = source.into();
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        let resp = resp.expect("submit");
+        assert_eq!(resp["ok"], PyValue::Bool(true), "{case}：{resp:?}");
+        let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+        let rec = h.reg.get(&cmd_id).expect("registry");
+        if trusted {
+            // Python `session_manager.py:6584-6588`：human 且 lease 存在 → SESSION_INTERACTIVE_BUSY，
+            // `interactive_session_id` 在 `arbiter.py:455-462` 複製清單內。
+            assert!(
+                !wp55_started(&effects, &cmd_id),
+                "{case}：可信 human 遇 human lease 不得出列執行"
+            );
+            assert_eq!(rec["status"], PyValue::from("error"), "{case}：{rec:?}");
+            assert_eq!(
+                rec["error_code"],
+                PyValue::from("SESSION_INTERACTIVE_BUSY"),
+                "{case}：{rec:?}"
+            );
+            assert_eq!(rec["interactive_session_id"], iid, "{case}：{rec:?}");
+        } else {
+            // Python `:6582-6583`：非 human 遇 human lease → suspend_human_interactive，照常執行。
+            assert!(
+                wp55_started(&effects, &cmd_id),
+                "{case}：非可信命令沿用 agent 判斷照常出列：{rec:?}"
+            );
+            assert_eq!(rec["status"], PyValue::from("running"), "{case}：{rec:?}");
+        }
+    }
+}
