@@ -73,3 +73,19 @@ Python run 均 unset `SERIALWRAP_AB_LABEL`、`SERIALWRAP_CLI_EXE`、`SERIALWRAP_
 本項僅新增此比較報告；未改 production code、測試、契約或凍結鎖，故未執行全套 pytest、Cargo suite、slice gate 或 Docker。
 
 REMAINING: none
+
+---
+
+## 補記：第 4 項取消樣本收尾修正（2026-11-08）
+
+工具修改的內容、修改理由、為何不算放寬判準，以及新回歸的紅燈證據，都記在 `s2-par-fixlat-python.md` 的同名補記節。本節只補 Rust daemon 這一側的證據。上面第 3 項的內容保留原文。
+
+Rust daemon 一律使用第 3 項建好的 bundle `target/s2-par/S2-PAR-fixlat-3/rust-bundle/`。執行前重新核對 hash：CLI 為 `6323e220…f531`、daemon 為 `994978cb…09a`，和上表一致。`2e642648..HEAD` 期間沒有修改 `crates/`。
+
+| 證據 | 位置 | loadavg 1m | 結果 |
+|---|---|---|---|
+| 探針（**修改前**工具） | `target/s2-par/S2-PAR-fixlat-4/probe-rust-1/` | 14.96–17.21 | 200／200 有效。其中 32 筆返回時仍是 `READY`＋`foreground_busy=true`，這 32 筆的下一筆 accepted 等待為 0.255–0.274 s；其餘 167 筆的下一筆只等 0.001–0.003 s。200／200 筆在取消後第一次 `command.get` 就已帶 `done_at` |
+| 探針（修改後工具） | `probe-rust-fixed/` | 23.15–24.04 | 200／200 有效，`errors=[]`；0 筆於忙碌中返回；下一筆 accepted 等待 0.0014–0.0037 s |
+| 原黑箱測試（修改後工具） | `blackbox-rust-fixed/` | 14.69–27.02 | command_cancel 200／200 PASS，max 2.240 ms，`errors=[]`。stop_request 因 host loadavg 峰值 27.02 > 24 CPU，作廢重跑後仍是 `INSUFFICIENT_EVIDENCE`，pytest exit 1。stop 路徑本項沒有修改，這一輪不算有效的 stop 證據 |
+
+**已實測：**Rust 也會在 `CommandRegistry::cancel()` 回覆前寫入 `done_at`（`crates/sw-core/src/arbiter.rs:342-377`），所以原工具的 `done_at` 等待對 Rust 一樣沒有作用。Rust 有 16% 的樣本在 worker 還忙時就結束，Python 則是 100%。**推斷：**比例比 Python 低，可能是 Rust 的 `CancelQueued` 撤銷 TX permit 後，大部分情況下前景 op 很快就結束，只有 TX 已經送出的樣本要等 prompt。這一點本項沒有逐筆核對 TX 時間線。這個差異是取消後的收尾時間，不在 `event_latency` 的契約口徑內，本項不把它列為 Rust 缺陷，也不改 Rust 程式。

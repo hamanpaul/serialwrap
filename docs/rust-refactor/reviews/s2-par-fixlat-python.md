@@ -58,3 +58,62 @@
 四項 gate 的 command、stdout、stderr 與 exit code 保存在 `target/s2-par/S2-PAR-fixlat-2/gates-item2-final/`。本項只有文件變更；沒有執行 Rust crate 測試或全套 pytest。
 
 REMAINING: none
+
+---
+
+## 補記：第 4 項取消樣本收尾修正（2026-11-08）
+
+本節記錄第 4 項對量測工具的修改，以及 Python daemon 的相關證據。上面第 2 項的內容與結論保留原文，不改寫。第 4 項自己的 gate 結果記在本節末尾。
+
+### 啟動依據（已實測）
+
+診斷探針 `target/s2-par/S2-PAR-fixlat-4/probe/probe_cancel_drain.py` 只放在被忽略的 `target/` 下，沒有進版本庫。它照原測試 `_cancel_run` 的流程執行：使用同一個 harness、同一條 ALL 規則、同樣 20000 B/s 的 flood，並呼叫**未修改**的 `_sample_cancel()` 200 次。探針只多做被動觀察：記錄每次 RPC 的送出時刻與回應，並在每次樣本返回後立刻呼叫一次 `session.get_state`。Python daemon 的結果在 `probe-python-1/`，期間 loadavg 1m 為 17.03–19.87（24 CPU）：
+
+- 200／200 筆樣本返回時，session 是 `READY`，但 `foreground_busy=true`。
+- 200／200 筆在取消後第一次 `command.get` 就已帶 `done_at`。所以原本「等 `done_at`」的 15 秒迴圈從來沒有真正等過；錯誤訊息「被取消的在途命令未結束」描述的後置條件實際上沒有檢查。
+- 199 筆後續樣本的 accepted 等待落在 0.289–0.356 s，大致等於前一筆 `sleep 0.3` 剩下的時間。也就是說，下一筆的 accepted 等待把前一筆被取消命令的 worker 收尾時間也算進去了。
+
+程式碼依據：`origin/main:sw_core/arbiter.py:364-380` 在呼叫 cancel callback 之前就寫入 `canceled` 與 `done_at`；`foreground_busy` 要到 `execute_command()` 的 finally 呼叫 `_finish_foreground_operation()` 才會清成 false（`origin/main:sw_core/session_manager.py:1782-1793`）。這屬於 Python 基線既有的行為，取消紀錄本來就可以早於 worker 結束；有缺陷的是量測工具把 `done_at` 當成 worker 已收尾的依據，所以修工具，不改 `sw_core`。
+
+### 修改內容
+
+`_sample_cancel()` 確認取消成功、命令記錄已有 `done_at` 且狀態為 `canceled` 之後，新增 `_wait_cancel_drained()`：必須在同一份 `session.get_state` 快照看到 `state == "READY"` 且 `foreground_busy is False`，樣本才算結束。收尾等待和 `done_at` 迴圈共用原本的 15 秒期限，沒有新增期限。逾時會以 `stage=wait_drain`、cmd_id、經過時間及最後一次的 state／foreground_busy／recovering 記錯。以下情況都會記錯，不算已收尾：`session.get_state` 非 ok 或沒有 session（立即記錯）、缺 `foreground_busy` 欄位、session 已不在 READY。
+
+以下項目都沒有改：計時區間（`command.cancel` 的 RPC 送出→回應）、submit 後 10 秒的 accepted 等待、`judge_run()`、每輪樣本數、flood 有效性判準、100 ms 上限，以及 `contracts/resource_limits.yaml` 的凍結紀錄（`method_revision`、`external_method`）。錯誤仍照舊逐筆計入 errors；只要有錯，整輪就不能 PASS。
+
+### 為何不是放寬判準
+
+修改前，第 N+1 筆實際可用的 accepted 等待只有「10 s 減去第 N 筆的收尾時間」，而它的錯誤又會掛在第 N+1 筆名下。修改後，第 N 筆的收尾在第 N 筆自己的 15 秒期限內完成，超過就算第 N 筆的錯誤；第 N+1 筆則從 worker 閒置時開始計算 10 秒。要說明的是：如果某筆收尾時間落在 10–15 s，修改前會讓下一筆出現 accepted timeout，修改後兩筆都算有效。這是把錯誤歸到正確的樣本，不是延長 accepted 等待：10 s 期限本身沒變，凍結口徑也不包含收尾時間（`external_method` 只定義 RPC 送出→回應）。收尾超過 15 s 一樣會記錯。
+
+### 修改後實測
+
+| 證據 | 位置 | loadavg 1m | 結果 |
+|---|---|---|---|
+| 探針（修改後工具，Python） | `probe-python-fixed/` | 18.26–23.51 | 200／200 有效，`errors=[]`；0 筆於忙碌中返回；下一筆 accepted 等待 0.0004–0.0073 s |
+| 原黑箱測試（Python，修改後工具） | `blackbox-python-fixed/` | 14.49–21.54 | `1 passed`、exit 0；command_cancel 200／200 PASS，max 8.132 ms／p99 1.703 ms |
+
+cancel 計時的最大值在修改前後的探針分別為 1.505 ms 與 6.773 ms。修改後那一輪的 loadavg 比較高，目前的資料不足以把差異歸因於修改；兩者都遠低於 100 ms 上限。
+
+### 已實測與推斷
+
+**已實測：**工具原本沒有等 worker 收尾就進入下一筆；修改後不再發生；新回歸在舊工具上失敗（下節）。**推斷，未證實：**`9d915e84` 的 `command_cancel #41` accepted timeout 可能是因為前一筆被取消命令的 worker 收尾超過 10 s，例如 flood 下沒偵測到 prompt，等到 `timeout_s=10` 後又進入 recovery，結果算到下一筆頭上。但那次失敗沒有留下時間線，本輪的探針也沒有觀察到 0.36 s 以上的收尾，所以不能把這個推斷當成該次失敗的根因。另外，accepted timeout 發生後，工具不會取消那筆留在佇列中的命令，它會讓後續樣本繼續受影響。這一點沒有實測證據證明修正有必要，因此本項沒有處理。
+
+### 新回歸與紅燈
+
+`tests/test_event_latency_measure.py` 新增 5 個測試：`test_cancel_sample_does_not_finish_while_foreground_busy`、`..._errors_when_foreground_busy_outlives_deadline`、`..._drain_requires_reported_idle_ready_session`、`..._drain_rpc_failure_is_distinct`、`..._refused_or_not_canceled_fails_before_drain`。在未修改的工具上跑，前 4 個失敗（`target/s2-par/S2-PAR-fixlat-4/red/`，`4 failed, 20 passed`）；第 5 個在修改前後都通過，用來覆蓋取消被拒與最終非 canceled 的分支。修改後為 `24 passed`（`green/`）。5 個 nodeid 都以 `regen_lock.py --l1-add-only` 登記到 `p7_gate:python3-m-pytest-q-tests` 與 `s21_gate:pytest_full`（linux），兩個集合各新增 5 筆、移除 0 筆。
+
+### 第 4 項驗收
+
+所有命令都在前景執行。command、stdout、stderr 與 exit code 存在 `target/s2-par/S2-PAR-fixlat-4/gates/`。
+
+| 檢查 | 結果 |
+|---|---|
+| `python3 -m pytest -q tests/test_event_latency_measure.py` | exit 0，24 passed |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、findings 0 |
+| `python3 tests/acceptance/regen_lock.py --check` | exit 0，鎖檔與 L1 結構兩項都是 OK |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0 |
+| `python3 -m policy_check --repo .` | exit 0，25 pass、0 fail、2 warn。R-19 是 parser advisory；R-22 共 3243 筆懸空引用，本節只新增 1 筆，即上面提到的 `target/` 探針路徑 |
+| `cargo test --workspace` | exit 0，1542 passed、0 failed、45 ignored。本項沒有改 Rust，這只是確認 |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+
+本項沒有執行全套 pytest、slice gate、Docker 或出口證據 driver。
