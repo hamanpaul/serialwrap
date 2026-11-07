@@ -240,6 +240,7 @@ impl CommandRegistry {
         record.insert("timeout_s", PyValue::from(req.timeout_s));
         record.insert("expected_duration_s", expected_duration);
         record.insert("completion_regex", completion_regex);
+        record.insert("expect_reboot", PyValue::from(req.expect_reboot));
         record.insert("priority", PyValue::from(PyInt::Small(req.priority)));
         record.insert("status", PyValue::from("accepted"));
         record.insert("created_at", PyValue::from(now_iso));
@@ -262,6 +263,9 @@ impl CommandRegistry {
             "status" => "accepted",
             "session_id" => req.session_id.clone(),
         };
+        if req.expect_reboot {
+            response.insert("expect_reboot", PyValue::from(true));
+        }
         if let Some(warning) = warning {
             response.insert("warning", PyValue::Dict(warning));
         }

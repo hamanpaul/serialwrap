@@ -187,6 +187,34 @@ fn submit_priority_zero_becomes_ten() {
     );
 }
 
+#[test]
+fn wp52_default_expect_reboot_flows_through_rpc_record_and_get() {
+    let r = ServiceRig::ready_shell();
+    let response = r.call("command.submit", r#"{"selector":"COM0","cmd":"echo wp52"}"#);
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    assert!(
+        response.get("expect_reboot").is_none(),
+        "false 不應回聲旗標"
+    );
+
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let command = sub(
+        &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+        "command",
+    );
+    assert_eq!(
+        command.get("expect_reboot"),
+        Some(&PyValue::Bool(false)),
+        "RPC submit 建立的 command record 必須保留 false"
+    );
+    assert!(command.get("trusted_human").is_none());
+}
+
 fn wp51_source_reserved_response(r: &ServiceRig, raw_source: &str) -> String {
     wp51_reserved_source_response(r, "source", raw_source)
 }

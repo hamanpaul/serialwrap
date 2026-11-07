@@ -152,6 +152,7 @@ fn record_key_order_matches_python() {
             "timeout_s",
             "expected_duration_s",
             "completion_regex",
+            "expect_reboot",
             "priority",
             "status",
             "created_at",
@@ -166,6 +167,80 @@ fn record_key_order_matches_python() {
             "recovery_action",
         ]
     );
+}
+
+#[test]
+fn wp52_record_expect_reboot_always_present() {
+    let registry = CommandRegistry::new();
+
+    for (id, expected) in [("wp52-record-false", false), ("wp52-record-true", true)] {
+        let mut request = req("reboot");
+        request.expect_reboot = expected;
+        registry
+            .admit(request, true, id.into(), T)
+            .expect("命令應通過 admission");
+
+        let accepted = rec(&registry, id);
+        assert_eq!(
+            field(&accepted, "expect_reboot"),
+            PyValue::from(expected),
+            "accepted record 必須保留布林旗標"
+        );
+        assert!(accepted.get("trusted_human").is_none());
+
+        assert!(matches!(registry.mark_running(id, T), RunDecision::Run));
+        registry.complete(id, CmdOutcome::SendFailed, T);
+
+        let completed = rec(&registry, id);
+        assert_eq!(
+            field(&completed, "expect_reboot"),
+            PyValue::from(expected),
+            "命令完成後 record 仍必須保留布林旗標"
+        );
+        assert_eq!(field(&completed, "status"), PyValue::from("error"));
+    }
+}
+
+#[test]
+fn wp52_submit_expect_reboot_echo_order() {
+    let warning = "{\"code\":\"CMD_LENGTH_WARNING\",\"cmd_length\":4097,\"soft_limit\":4096,\"hint\":\"Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.\"}";
+
+    for (id, expect_reboot) in [("wp52-echo-false", false), ("wp52-echo-true", true)] {
+        let registry = CommandRegistry::new();
+        let mut request = req(&"a".repeat(4097));
+        request.expect_reboot = expect_reboot;
+        let response = registry
+            .admit(request, true, id.into(), T)
+            .expect("長命令應接受並附帶 warning")
+            .response;
+
+        let keys: Vec<&str> = response.0.keys().map(String::as_str).collect();
+        let expected_keys = if expect_reboot {
+            vec![
+                "ok",
+                "cmd_id",
+                "status",
+                "session_id",
+                "expect_reboot",
+                "warning",
+            ]
+        } else {
+            vec!["ok", "cmd_id", "status", "session_id", "warning"]
+        };
+        assert_eq!(keys, expected_keys);
+        assert!(response.get("trusted_human").is_none());
+
+        let expected = if expect_reboot {
+            format!(
+                "{{\"ok\":true,\"cmd_id\":\"{id}\",\"status\":\"accepted\",\"session_id\":\"{SID}\",\"expect_reboot\":true,\"warning\":{warning}}}"
+            )
+        } else {
+            format!(
+                "{{\"ok\":true,\"cmd_id\":\"{id}\",\"status\":\"accepted\",\"session_id\":\"{SID}\",\"warning\":{warning}}}"
+            )
+        };
+        assert_eq!(dumps_dict(&response, &RPC_WIRE), expected);
+    }
 }
 
 // ---------------------------------------------------------------------------
