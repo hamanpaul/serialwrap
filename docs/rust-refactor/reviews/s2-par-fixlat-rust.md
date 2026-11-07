@@ -1,0 +1,75 @@
+# S2-PAR-fixlat：Rust daemon 低負載對照
+
+## 結論
+
+本項分類為**尚無足夠證據**。相同工具、樣本數、判準及低負載條件下，Python daemon 與 Rust daemon 各跑三輪，六輪都沒有 `command_cancel` 的 accepted timeout，測試均 exit 0。沒有證據顯示 10 秒等待太短，也沒有觀察到 Rust worker 未取走命令；同樣不能據此排除原始 `9d915e84` 失敗與負載或取消後的時序有關。
+
+每輪仍維持 `command_cancel=200`、`stop_request=20`、flood 上限 100 ms；沒有調高上限、改變判定或變更 `event_latency_measure.py`。六輪都是 `quick_check_only`，不代表 OD-59 的 500×3 契約量測。
+
+## 範圍與 artifact 身分
+
+分支 `feature/rust-refactor-p8`，來源 HEAD `2e64264872619f7d33ca107ad2a2726527498711`。本項只新增本報告；未改 Rust 產品、`sw_core/`、量測工具、測試或凍結鎖。
+
+`scripts/rust/mkbundle.sh --dev --profile debug` exit 0，產生來源 commit 可追溯的臨時 bundle。建置器原始 `release-manifest.json` 標示 `components.daemon.implementation=python`，原始 manifest 保存在 `target/s2-par/S2-PAR-fixlat-3/bundle-manifest-python-generated.json`。只在忽略的 `target/` 測試 bundle manifest 將 daemon implementation 設為 `rust`、entry 設為 `bin/serialwrapd`；沒有改建置工具或版本庫中的產品檔案。bundle 的 `SHA256SUMS` 已依測試 manifest 重建並逐檔驗證成功。
+
+| 元件 | 來源 commit | SHA-256 |
+|---|---|---|
+| Rust CLI `bin/serialwrap` | `2e64264872619f7d33ca107ad2a2726527498711` | `6323e220295b0754a62d79df46340196707db8c08b9ccd8c4af3a3f34bb9f531` |
+| Rust daemon `bin/serialwrapd` | `2e64264872619f7d33ca107ad2a2726527498711` | `994978cbce3d8b32d33afa1b058c12bf128eba78daea48516f6c8372f6a1309a` |
+| 測試 manifest | 同上 | `4b03ade474cb6defe831f558f5769573aa247db9c6f36a8fc713310ca4cc291b` |
+
+Rust run 的 `SERIALWRAP_CLI_EXE` 與 `SERIALWRAP_DAEMON_EXE` 都指向該 bundle。`bb_harness.py:87-98,101-109` 會由 `AB_ENV` 選出這兩個實際路徑；`tests/ab_env.py` 在 root conftest 清除外層變數前擷取選擇器。此測試透過 `slice21.harness.start_daemon()` 啟動受測 daemon，健康檢查後以 `/proc/<pid>/exe` 核對其 realpath 等於 `daemon_prefix()[0]`（`slice21/harness.py:166-205,335-425`）。三個 Rust run 都通過此身分檢查後才進入量測。`main.rs:11-15` 呼叫 `dispatch_to_rust_daemon()`；該函式在 manifest 的 daemon implementation 為 `rust` 時直接進入 Rust daemon 本體（`launcher.rs:315-330`）。
+
+Rust 與 Python 的 `serialwrapd --help` 輸出刻意對齊 argparse，不能用它區分實作；此處的身分證據是 bundle manifest、binary hash 及 harness 對執行中 `/proc/<pid>/exe` 的檢查，不是 A/B label。
+
+Python run 均 unset `SERIALWRAP_AB_LABEL`、`SERIALWRAP_CLI_EXE`、`SERIALWRAP_DAEMON_EXE`，因此走 Python 基線 CLI／daemon。兩種實作都透過同一 FakeTarget PTY 測試，未使用真實 COM、`/dev/ttyUSB*` 或實體序列埠。
+
+## 低負載三輪比較
+
+順序為 Rust 1、Python 1、Rust 2、Python 2、Rust 3、Python 3。表中 load 範圍是每輪外部逐秒 `/proc/loadavg` 第一欄（1 分鐘 loadavg）；每輪全部低於 8。cancel 的 max 是判準使用的每輪最大值；p99 另列作參考。
+
+| 實作／輪次 | loadavg 1m 範圍 | command_cancel（200 筆）max / p99 ms | stop_request（20 筆）max ms | pytest |
+|---|---:|---:|---:|---:|
+| Rust 1 | 3.48–4.27 | 1.389 / 0.676 | 0.294 | exit 0 |
+| Python 1 | 2.55–3.18 | 1.161 / 1.006 | 0.329 | exit 0 |
+| Rust 2 | 1.92–2.58 | 0.890 / 0.572 | 0.249 | exit 0 |
+| Python 2 | 2.42–2.98 | 1.619 / 0.774 | 0.323 | exit 0 |
+| Rust 3 | 3.05–3.56 | 0.721 / 0.646 | 0.243 | exit 0 |
+| Python 3 | 3.20–4.82 | 1.218 / 0.889 | 0.294 | exit 0 |
+
+六輪的 `command_cancel` 與 `stop_request` verdict 都是 `PASS`、`errors=[]`、`void=false`；最大延遲都遠低於原有 100 ms 上限。flood rule 每輪有比對，`event_dropped` 筆數均在送出行數範圍內且 selector 為 COM0。pytest log 另保留各輪的 internal host monitor 樣本與完整摘要；每輪的 command、JUnit、exit code、逐秒 load 與 pytest 輸出位於 `target/s2-par/S2-PAR-fixlat-3/{rust-run-1,python-run-1,rust-run-2,python-run-2,rust-run-3,python-run-3}/`。
+
+既有 ITEM 2 的 Python 高負載三輪也沒有 accepted timeout，但 loadavg 1m 範圍為 11.24–21.29，不能代替本表低負載對照（詳 `s2-par-fixlat-python.md` 與其 `target/s2-par/S2-PAR-fixlat-2/` 證據）。
+
+## 未修正 Rust 的前置診斷輪
+
+在低負載三輪前，先以同一份未修改的 Rust 產品執行原測試並保存 `target/s2-par/S2-PAR-fixlat-3/rust-baseline-high-1/`。此輪 pytest exit 1，沒有 accepted timeout（`errors=[]`），但 loadavg 1m 外部為 21.53–41.86，內部 cancel/stop peak 分別為 40.84/41.86（24 CPUs）。judge 將兩事件標成 `INSUFFICIENT_EVIDENCE`、`void=true`，故這是保留的高負載紅燈診斷，不算有效 latency 或低負載結果。
+
+## 行為對照與根因判讀
+
+- 量測工具在 `event_latency_measure.py:428-451` submit 後每 5 ms 查 `command.get`，最多等 10 秒見到 `running`；若到期仍是 `accepted`，錯誤表示該命令在觀察窗內沒有進入 running，並非延遲值超標。本項未更動這個 10 秒等待或 100 ms 判準。
+- Rust `CommandRegistry::cancel()` 會立刻把紀錄改成 `canceled` 並寫入 `done_at`，它不會中止正在跑的 worker（`crates/sw-core/src/arbiter.rs:342-377`）。`command.cancel` 路由再 best-effort 送出 `CancelQueued`（`crates/sw-daemon/src/service.rs:715-728`）；actor 移除尚在 queue 的項目，若命令已佔用 foreground 則撤銷其 TX permit（`session_core.rs:1809-1829`）。
+- `start_next()` 在 foreground slot 忙或 session 不是 READY 時不取 queue；取件後才 `mark_running`（`session_core.rs:4225-4250`）。目前前景 op 結束時 `op_finished()` 清理 foreground，再呼叫 `start_next()`（`session_core.rs:4691-4785`）。因此，accepted 若持續存在，可能是前一個 foreground operation 尚未完成；只看 cancel 回應的 `done_at` 不能證明 worker/actor 已排空。
+- Python 基線亦由單一 session worker 從 queue 取件後才設 `running`；`cancel()` 會先寫 `canceled`／`done_at` 再呼叫 cancel callback（`origin/main:sw_core/arbiter.py:364-405`）。先前三次高負載 Python 與本次三次低負載 Python 都沒有重現 accepted timeout。
+
+上述程式碼指出 accepted 的狀態路徑與取消後的同步限制，但六次低負載實跑沒有失敗樣本。它們不能判斷 10 秒是否不足，也不能證明 Rust actor/worker 在原始 host run 真的卡住。取消後以 `done_at` 加 `READY` 作為下一筆樣本的準備條件，也不是 worker drain 確認；這是量測流程可疑的同步假設，尚未由本項的失敗時間線證實為工具缺陷，因此沒有只為變綠而延長等待或修改量測器。
+
+## SPEC-GAPS
+
+提供的 `9d915e84` 證據只有 `command_cancel #41` accepted 錯誤文字，沒有該次 pytest temp、cmd_id 時序、前一命令的 started/done 時間、session foreground/recovering snapshot、FakeTarget TX 記錄或 daemon stderr。當前低負載三輪 Python/Rust 都沒重現；高負載 Rust 診斷輪則因 load 超過 24 CPUs 作廢。因此原始 accepted 的直接根因，以及它是否與負載相關，仍無法確認。
+
+
+## 本項驗收
+
+本項指定的 pytest nodeid 六次均在前景完成並 exit 0：Rust 3/3、Python 3/3。另保存先行 Rust 高負載診斷輪，pytest exit 1，因負載超出可用證據門檻而保留為無效 latency 輪。所有命令、逐秒負載、JUnit、exit code 與 gate 輸出位於 `target/s2-par/S2-PAR-fixlat-3/`。
+
+| 檢查 | 結果 |
+|---|---|
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、findings 0 |
+| `python3 tests/acceptance/regen_lock.py --check` | exit 0，鎖檔與 L1 結構兩項 OK |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0 |
+| `python3 -m policy_check --repo .` | exit 0，25 pass、0 fail、2 warn（R-19 parser advisory、R-22 既有 dangling references） |
+
+本項僅新增此比較報告；未改 production code、測試、契約或凍結鎖，故未執行全套 pytest、Cargo suite、slice gate 或 Docker。
+
+REMAINING: none
