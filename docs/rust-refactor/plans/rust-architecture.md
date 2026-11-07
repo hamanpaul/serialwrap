@@ -845,13 +845,15 @@ pub trait SignalWait: Send + Sync {
 pub struct TxPermit { pub op_id: OpId, pub epoch: u64, pub owner_gen: u64, pub class: TxClass,
                       pub source: String, pub cmd_id: Option<String>, pub log: bool,
                       pub input_epoch: Option<u64> /* 07 D-03：只有 HumanRaw／HumanReplay 為 Some */,
-                      pub replay_hold: Option<u64> /* 07 D-22：只有 HumanReplay 為 Some(hold_id) */ }
+                      pub replay_hold: Option<u64> /* 07 D-22：只有 HumanReplay 為 Some(hold_id) */,
+                      pub probe_id: Option<u64> /* 09 Task 8：只有 FlashProbe 為 Some(probe_id)；不以 op_id 代替 */ }
 pub enum TxClass { Flash, FlashProbe, LeaseOwner, HumanRaw, HumanReplay, LoginProbe, ReadyReconfirm, Command,
                    FileTransfer, SystemRecoverKey, SelfTestProbe, InteractiveOpenCmd }
 pub struct FenceState { pub active_epoch: Option<u64>, pub owner_gen: u64, pub frozen: bool /* drain phase1／release */,
     pub quiet_active: bool, pub reconfirm_pending: bool, pub flash_mode: FlashMode /* Off | Probe(probe_id) | Flashing */,
     pub wal_unhealthy: bool, pub cancelled: SmallSet<OpId>, pub in_flight: Option<InFlight>,
-    pub human_admission_blocked: bool, pub input_epoch: u64, pub replay_auth: Option<u64> /* 07 D-03／D-22 */ }
+    pub human_admission_blocked: bool, pub input_epoch: u64, pub replay_auth: Option<u64> /* 07 D-03／D-22 */,
+    pub flash_critical: bool /* 09 Task 8：manager 的 flash-critical 標記；不影響 admit */ }
 pub enum FenceReject { StaleEpoch, Frozen, Quiet, ReconfirmPending, WalUnhealthy, Flash, OwnerMismatch, Cancelled,
                        HumanAdmissionClosed, InputStale, ReplayRevoked /* 07 D-03 新增 */ }
 pub struct Fence(Mutex<FenceState>);
@@ -878,8 +880,22 @@ TxClass 與 gate 規則（規格 §5.2.1）：
 | `HumanReplay` | 07 D-03／D-22：依序比對 `input_epoch`（不符→`InputStale`）、專屬回放授權 `permit.replay_hold.is_some() && permit.replay_hold == st.replay_auth`（不符→`ReplayRevoked`）；**不**比對 `owner_gen` 與 `human_admission_blocked`（Python `resume_interactive` 的 flush 不帶 raw token，發生在 admission 開放之前）。任何新操作取得 ownership 時於同一次 `Fence::with` 撤銷 `replay_auth`，之後才進 OS 的回放一律 `ReplayRevoked`、零 TX，`restore_front` 回 deferred |
 | `LeaseOwner`／`InteractiveOpenCmd` | 不受 quiet 阻擋；`permit.owner_gen != owner_gen`（lease close／expiry／soft preempt／換手後的舊 lease 世代）→ `OwnerMismatch`。此世代檢查在每次 `gate.submit` 臨界區內重跑（R0-F1） |
 | `Flash` | 只在 `FlashMode::Flashing` 時放行 |
-| `FlashProbe` | 只在對應的 `Probe(probe_id)` 時放行 |
+| `FlashProbe` | 只在對應的 `Probe(probe_id)` 時放行（`permit.probe_id == Some(probe_id)`） |
 | 其他所有 class | `flash_mode != Off` |
+
+`flash_mode` × class 的完整判定（09 Task 8；`Fence::admit` 依此順序，`Err` 一律 `FenceReject::Flash`、零 TX、不記 WAL）：
+
+| `flash_mode` | class | 條件 | 結果 |
+|---|---|---|---|
+| `Probe(id)` | `FlashProbe` | `permit.probe_id == Some(id)` | 放行 |
+| `Probe(id)` | `FlashProbe` | `probe_id` 為 `None` 或不等於 `id`（上一個 probe 的 stale permit；`op_id` 數值相同亦不算） | `Err(Flash)` |
+| `Probe(_)` | 非 `FlashProbe`（含 `Flash`） | — | `Err(Flash)` |
+| `Flashing` | `Flash` | — | 放行 |
+| `Flashing` | 非 `Flash`（含 `FlashProbe`） | — | `Err(Flash)` |
+| `Off` | `Flash`／`FlashProbe` | — | `Err(Flash)` |
+| `Off` | 其他 | — | 依上表其他 gate |
+
+`flash_mode` 由 actor 依 09 Task 8 的 `FlashSyncProbeStart`／`FlashProbeReleased`／`FlashSyncMatched`／`FlashHolderGone` 在 `Fence::with` 內切換（同一 bridge handle 的模式切換，不換 epoch）；所有 flash 結束路徑（未匹配釋放、HolderGone、drain Phase 1 起點含 I/O error 與 shutdown）無條件設回 `Off`（SC-32）。
 
 Python 基線的 gate 順序也須保留：`UARTBridge.send_bytes` 先套用 flash gate；flash 模式不允許該來源時靜默丟棄，之後才檢查 WAL unhealthy 並拒絕自動 TX。這保留 RPC-H-07 的 flash probe timeout 語意。
 

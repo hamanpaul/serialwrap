@@ -946,7 +946,7 @@ changes:
   - id: "SC-32"
     kind: "SC"
     title: "Probe／FLASHING 期間 bridge I/O 失敗進 drain 轉 RECOVERING、裝置消失延後 reconcile（Rust-only）"
-    status: "APPROVED"
+    status: "IMPLEMENTED"
     approval:
       owner: "spec-final"
       date: "2026-11-08"

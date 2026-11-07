@@ -173,7 +173,7 @@ struct Entry {
     profile: SessionProfile,
     profile_source: String,
     actor: Arc<ActorHandle>,
-    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
+    /// 與 actor 共用的 Fence（P8 Task 8：manager 於 `Inner` 鎖內寫入 `flash_critical`）。
     fence: Arc<Fence>,
     io: Arc<SessionIo>,
     #[cfg(feature = "test-fakes")]
@@ -204,6 +204,8 @@ struct Inner {
     interactive: HashMap<String, String>,
     /// 動態偵測當時的 real_path（sticky 的 TOCTOU 比對；#95 HIGH#2）。
     probe_paths: HashMap<String, String>,
+    /// P8 Task 8：flash-critical 的 COM（Python `_flash_critical_coms`；#83 RACE-2 final）。
+    flash_critical: HashSet<String>,
 }
 
 impl Inner {
@@ -651,6 +653,9 @@ impl Shared {
             .map(str::to_string)
             .unwrap_or_else(|| format!("{}:{}", profile.template.profile_name, profile.com));
         let fence = Fence::new();
+        // P8 Task 8：重建的 session 承接該 COM 既有的 flash-critical 標記。
+        let flash_critical = inner.flash_critical.contains(&profile.com);
+        fence.with(|f| f.flash_critical = flash_critical);
         self.fanout.register(fence.clone());
         let rx = RxShared::new(RX_WINDOW_MAX_CHARS, self.clock.mono_ns());
         let clock = self.clock.clone();
@@ -2633,8 +2638,8 @@ impl SessionManager {
             return self.shared.request(sid, SessionRequest::Clear, timeout);
         };
         let by_id = str_of(&public, "device_by_id").unwrap_or_default();
-        if str_of(&public, "state").as_deref() == Some("FLASHING") {
-            // FLASHING 不得 detach bridge（#69 r5）；Python 鍵序 ok／error_code／selector／session。
+        if str_of(&public, "state").as_deref() == Some("FLASHING") || self.flash_critical_sid(sid) {
+            // FLASHING 或 flash probe 臨界區不得 detach bridge（#69 r5；#83 RACE-2 final）；Python 鍵序 ok／error_code／selector／session。
             return Ok(flashing_busy(public));
         }
         if str_of(&public, "state").as_deref() == Some("RELEASED")
@@ -2694,8 +2699,8 @@ impl SessionManager {
         if let Some(sid) = self.resolve(selector) {
             if !lock(&self.shared.inner).stopping {
                 if let Some(public) = self.shared.session_public(&sid) {
-                    if str_of(&public, "state").as_deref() == Some("FLASHING") {
-                        // FLASHING 不得 rebind（Python 於 DEVICE_ALREADY_BOUND 之前判定）。
+                    if str_of(&public, "state").as_deref() == Some("FLASHING") || self.flash_critical_sid(&sid) {
+                        // FLASHING 或 flash probe 臨界區不得 rebind（Python 於 DEVICE_ALREADY_BOUND 之前判定；#83 RACE-2 final）。
                         return Ok(flashing_busy(public));
                     }
                 }
@@ -3145,18 +3150,79 @@ impl SessionManager {
 
     /// P8 Task 8：**原子**收集 flash 偵測候選並標記 flash-critical（Python `collect_flash_candidates_and_mark`，
     /// `session_manager.py:3265`；#83 RACE-2 final）。候選＝非 command_capable、state ∈ {READY, ATTACHED}、無前景操作。
+    ///
+    /// session 狀態由各自的 actor 持有，manager 無法與 Python 一樣在一把鎖內同時讀快照與標記；改為**先標記、後取
+    /// 快照**：每個非 command_capable 的 session 先在 `Inner` 鎖內標 flash-critical（同步寫入該 session 的 Fence），
+    /// 之後到達的 clear／release／bind／recover 一律 `FLASHING_BUSY`；再向 actor 取快照，不符候選條件者撤回本次新增
+    /// 的標記（既有標記屬其他偵測者，不動）。actor 的 `FlashSyncProbeStart` 仍會重驗全部條件（最終授權）。
     pub fn collect_flash_candidates_and_mark(&self) -> Vec<FlashCandidate> {
-        todo!("P8-T8")
+        self.pump();
+        let entries: Vec<(String, String)> = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .filter(|e| !e.profile.template.command_capable())
+            .map(|e| (e.sid.clone(), e.profile.com.clone()))
+            .collect();
+        let mut out = Vec::new();
+        for (sid, com) in entries {
+            let newly = self.mark_flash_critical(&com);
+            let candidate = self.shared.session_public(&sid).filter(|s| {
+                s.get("command_capable") != Some(&PyValue::Bool(true))
+                    && matches!(str_of(s, "state").as_deref(), Some("READY" | "ATTACHED"))
+                    && s.get("foreground_busy") != Some(&PyValue::Bool(true))
+                    && s.get("drain_stalled") != Some(&PyValue::Bool(true))
+            });
+            match candidate {
+                Some(public) => {
+                    let by_id = str_of(&public, "device_by_id").filter(|b| !b.is_empty());
+                    let real_path = by_id.as_ref().and_then(|b| {
+                        lock(&self.shared.inner).devices.get(b).map(|d| d.real_path.clone())
+                    });
+                    out.push(FlashCandidate {
+                        com,
+                        by_id,
+                        real_path,
+                        command_capable: false,
+                    });
+                }
+                None if newly => self.unmark_flash_critical(&com),
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// 標記 COM 為 flash-critical（Python `mark_flash_critical`）；回 true 表示本次新增。
+    fn mark_flash_critical(&self, com: &str) -> bool {
+        let mut inner = lock(&self.shared.inner);
+        let newly = inner.flash_critical.insert(com.to_string());
+        for e in inner.sessions.values().filter(|e| e.profile.com == com) {
+            e.fence.with(|f| f.flash_critical = true);
+        }
+        newly
     }
 
     /// P8 Task 8：解除 COM 的 flash-critical 標記（Python `unmark_flash_critical`）。
-    pub fn unmark_flash_critical(&self, _com: &str) {
-        todo!("P8-T8")
+    pub fn unmark_flash_critical(&self, com: &str) {
+        let mut inner = lock(&self.shared.inner);
+        inner.flash_critical.remove(com);
+        for e in inner.sessions.values().filter(|e| e.profile.com == com) {
+            e.fence.with(|f| f.flash_critical = false);
+        }
     }
 
     /// P8 Task 8：COM 是否在 flash-critical 臨界區（probe 窗口）。
-    pub fn flash_critical(&self, _com: &str) -> bool {
-        todo!("P8-T8")
+    pub fn flash_critical(&self, com: &str) -> bool {
+        lock(&self.shared.inner).flash_critical.contains(com)
+    }
+
+    /// session_id 對應的 COM 是否 flash-critical。
+    fn flash_critical_sid(&self, sid: &str) -> bool {
+        let inner = lock(&self.shared.inner);
+        inner
+            .sessions
+            .get(sid)
+            .is_some_and(|e| inner.flash_critical.contains(&e.profile.com))
     }
 
     /// DeviceWatcher → manager 的事件送端（Delta 轉 `update_devices`、Tick 轉 `on_tick`）。

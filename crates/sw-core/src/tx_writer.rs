@@ -107,6 +107,10 @@ pub struct FenceState {
     /// `Fence::with` 內設 `quiet_active`／`reconfirm_pending` 並清除本欄——對齊 Python `_handle_reboot_command` 在
     /// `_write_lock` 內 arm，下一個 TX job 的出列檢查前 quiet 已生效（審查 F14）。actor 之後只同步 `QuietState`／世代。
     pub reboot_arm_op: Option<OpId>,
+    /// P8 Task 8：manager 的 flash-critical 標記（`collect_flash_candidates_and_mark`，#83 RACE-2 final）。不影響
+    /// `admit`；actor 據此在 probe 前的臨界窗口也擋 destructive 操作、不讓 passthrough 安靜升 READY（Python
+    /// `_flash_busy_locked`）。只由 manager 在其 `Inner` 鎖內寫入。
+    pub flash_critical: bool,
 }
 
 /// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
@@ -191,6 +195,7 @@ impl Fence {
             replay_auth: None,
             foreground_busy: false,
             reboot_arm_op: None,
+            flash_critical: false,
         })))
     }
 
@@ -223,10 +228,11 @@ impl Fence {
             return Err(FenceReject::Cancelled);
         }
 
+        // P8 Task 8（09 計畫 Fence 規則表）：FlashProbe 只在同一 probe（`permit.probe_id == Some(id)`）的 `Probe(id)`
+        // 放行，probe 身分不以 op_id 代替；Flash 只在 Flashing 放行；其他 class 只在 Off 放行。
         match (p.class, st.flash_mode) {
+            (TxClass::FlashProbe, FlashMode::Probe(id)) if p.probe_id == Some(id) => {}
             (TxClass::Flash, FlashMode::Flashing) => {}
-            // TxPermit 尚無獨立 probe_id；Slice 2.1 暫不放行 FlashProbe，不能以 op_id 代替。
-            (TxClass::FlashProbe, FlashMode::Probe(_)) => return Err(FenceReject::Flash),
             (TxClass::Flash | TxClass::FlashProbe, _) => return Err(FenceReject::Flash),
             (_, FlashMode::Off) => {}
             (_, FlashMode::Probe(_) | FlashMode::Flashing) => return Err(FenceReject::Flash),

@@ -505,6 +505,12 @@ pub struct SessionCore {
     /// 只供測試（test-fakes）：`last_error` 每次變更為非 None 時的觀察者（Task 16 `last_error_history`）。
     #[cfg(feature = "test-fakes")]
     last_error_observer: Option<Box<dyn Fn(&str) + Send>>,
+    /// P8 Task 8：目前授權的 flash probe（`FlashSyncProbeStart` 設定；同一 probe 的 Released／HolderGone 清除）。
+    flash_probe_id: Option<ProbeId>,
+    /// P8 Task 8：進 FLASHING 前的狀態（Python `flash_prev_state`；HolderGone 還原，I/O error／停止清除）。
+    flash_prev_state: Option<SessionState>,
+    /// P8 Task 8（SC-32）：Probe／FLASHING 期間延後的 `DeviceDetached` 原因（flash 結束後 reconcile）。
+    pending_detach: Option<DetachReason>,
 }
 
 struct PendingOpenStop {
@@ -687,6 +693,9 @@ impl SessionCore {
             fg_origin: None,
             #[cfg(feature = "test-fakes")]
             last_error_observer: None,
+            flash_probe_id: None,
+            flash_prev_state: None,
+            pending_detach: None,
         }
     }
 
@@ -729,19 +738,9 @@ impl SessionCore {
                     self.device_present = false;
                     self.known_real_path = None;
                 }
-                if by_id == self.profile.device_by_id
-                    && self.state != SessionState::Released
-                    && self.state != SessionState::Detached
-                {
-                    let (kind, error) = match reason {
-                        DetachReason::Removed if self.state == SessionState::Attaching => {
-                            (StopKind::Removed, "DEVICE_REMOVED_DURING_ATTACH")
-                        }
-                        DetachReason::Removed => (StopKind::Removed, "DEVICE_REMOVED"),
-                        DetachReason::Rebound => (StopKind::Rebound, "DEVICE_REBOUND_REQUIRED"),
-                    };
-                    self.set_last_error(Some(error.to_string()), None);
-                    effects.0.extend(self.begin_stop(kind, None, now).0);
+                // P8 Task 8（SC-32）：Probe／FLASHING 期間延後到 flash 結束後再 reconcile（#83 RACE-2）。
+                if by_id != self.profile.device_by_id || !self.flash_defer_detach(reason) {
+                    effects.0.extend(self.device_detached(&by_id, reason, now));
                 }
             }
             MailboxItem::Control(ControlEvent::DeviceMissing) => {
@@ -772,6 +771,8 @@ impl SessionCore {
                     effects
                         .0
                         .extend(self.begin_stop(StopKind::IoError, None, now).0);
+                    // P8 Task 8（SC-32）：begin_stop 已清 flash_mode；Probe／FLASHING 期間延後的 detach 併入本次 drain。
+                    effects.0.extend(self.flash_reconcile_detach(now));
                 }
             }
             MailboxItem::Control(ControlEvent::UartTxCompleted {
@@ -1191,6 +1192,8 @@ impl SessionCore {
     /// Two-Phase Drain 第一階段的發起點（Task 12；SC-04、arch §5.5）：`kind` 與 `waiter` 凍結簽章（P6 07 計畫依此呼叫）。
     pub fn begin_stop(&mut self, kind: StopKind, waiter: Option<Reply>, now: Mono) -> Effects {
         let mut effects = Effects(Vec::new());
+        // P8 Task 8（SC-32）：停止是 flash 結束路徑之一，無條件清 Fence／Ownership 的 flash_mode。
+        self.flash_end_for_stop();
         // 再探進行中被 drain 搶進：等待者照 Python `attach_session` 的 pending drain 分支回 SESSION_RECOVERING。
         if let Some(run) = self.login_run.take() {
             for (waiter, _) in run.waiters {
@@ -1686,6 +1689,25 @@ impl SessionCore {
         }
     }
 
+    /// `DeviceDetached` 的套用（Python `_detach_by_id`）：非 RELEASED／DETACHED 時設 last_error 並進 drain。
+    fn device_detached(&mut self, by_id: &str, reason: DetachReason, now: Mono) -> Vec<Effect> {
+        if by_id != self.profile.device_by_id
+            || self.state == SessionState::Released
+            || self.state == SessionState::Detached
+        {
+            return Vec::new();
+        }
+        let (kind, error) = match reason {
+            DetachReason::Removed if self.state == SessionState::Attaching => {
+                (StopKind::Removed, "DEVICE_REMOVED_DURING_ATTACH")
+            }
+            DetachReason::Removed => (StopKind::Removed, "DEVICE_REMOVED"),
+            DetachReason::Rebound => (StopKind::Rebound, "DEVICE_REBOUND_REQUIRED"),
+        };
+        self.set_last_error(Some(error.to_string()), None);
+        self.begin_stop(kind, None, now).0
+    }
+
     fn set_state(&mut self, state: SessionState, now: Mono) {
         if self.state != state {
             self.last_state_change_at = Some(self.wall_iso());
@@ -1818,10 +1840,9 @@ impl SessionCore {
                     result.insert("already_released", PyValue::from(true));
                     return vec![Effect::Reply(reply, Ok(result))];
                 }
-                if self.state == SessionState::Flashing {
-                    let mut result = self.error_session("FLASHING_BUSY", now);
-                    result.insert("selector", PyValue::from(self.profile.com.clone()));
-                    return vec![Effect::Reply(reply, Ok(result))];
+                if self.flash_busy() {
+                    // P8 Task 8：FLASHING 或 probe 窗口／flash-critical（Python `_flash_busy_locked`）。
+                    return vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))];
                 }
                 let another_drain_is_active = self
                     .stop
@@ -1878,6 +1899,10 @@ impl SessionCore {
             }
             SessionRequest::ConsoleList => {
                 vec![Effect::Reply(reply, Ok(self.console_list_request(now)))]
+            }
+            // P8 Task 8：FLASHING 或 probe 窗口不得 detach bridge（Python `clear_session` 的 `_flash_busy_locked`）。
+            SessionRequest::Clear if self.flash_busy() => {
+                vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))]
             }
             SessionRequest::Clear => self.begin_stop(StopKind::Clear, Some(reply), now).0,
             SessionRequest::Recover { timeout_s, force } => {
@@ -2217,17 +2242,9 @@ impl SessionCore {
     /// P5-T16：`bind_session`（session 層）：同值冪等、有 bridge 先 `StopKind::Bind` drain、否則立即改綁。
     /// 改綁後一律 DETACHED＋`DEVICE_NOT_FOUND`；裝置在線時由 manager 隨後送 `DeviceAttached` 進 ATTACHING。
     fn bind_request(&mut self, by_id: String, reply: Reply, now: Mono) -> Vec<Effect> {
-        if self.state == SessionState::Flashing {
-            // Python `bind_session` 鍵序：ok／error_code／selector／session。
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "FLASHING_BUSY",
-                    "selector" => self.profile.com.clone(),
-                    "session" => self.public(now, &self.public_ctx())
-                }),
-            )];
+        if self.flash_busy() {
+            // Python `bind_session` 鍵序：ok／error_code／selector／session（P8 Task 8：含 probe 窗口）。
+            return vec![Effect::Reply(reply, Ok(self.flash_busy_reply(now)))];
         }
         if self.generations.conn_epoch.is_some()
             && self.profile.device_by_id == by_id
@@ -3263,7 +3280,11 @@ impl SessionCore {
         }
         effects.extend(self.reboot_recovery_tick(now));
         effects.extend(self.reprobe_tick(now));
-        let flash_off = self.deps.fence.with(|f| f.flash_mode == FlashMode::Off);
+        // P8 Task 8（SC-35）：probe 窗口與 manager 標記的 flash-critical 期間都不升 READY（Python `_flash_busy_locked`）。
+        let flash_off = self
+            .deps
+            .fence
+            .with(|f| f.flash_mode == FlashMode::Off && !f.flash_critical);
         if self.is_passthrough()
             && self.state == SessionState::Attached
             && self.generations.conn_epoch.is_some()
@@ -4162,6 +4183,9 @@ impl SessionCore {
             Ok(payload) => payload,
             Err(error) => return vec![Effect::Reply(reply, Err(error))],
         };
+        if let Some(result) = self.flash_silent_interactive_send(id, payload.len(), now) {
+            return vec![Effect::Reply(reply, Ok(result))];
+        }
         let owner = self
             .lease
             .as_ref()
@@ -5066,8 +5090,7 @@ impl SessionCore {
 
     fn recover_request(&mut self, timeout_s: f64, force: bool, reply: Reply, now: Mono) -> Vec<Effect> {
         use crate::recover::{RecoverPlan, RecoverRequest, plan_recover, plan_resets_progress};
-        let flash_busy = self.state == SessionState::Flashing
-            || self.deps.fence.with(|f| f.flash_mode != FlashMode::Off);
+        let flash_busy = self.flash_busy();
         let plan = plan_recover(
             self.state.as_str(),
             self.generations.conn_epoch.is_some(),
