@@ -547,16 +547,32 @@ fn user_session_partial_scan(holders: Vec<u32>) -> sw_pal::proc_scan::HolderScan
     partial_scan(holders, &[])
 }
 
+/// 測試替身的自身 uid。
+const ME: u32 = 1000;
+
+/// 整個無法檢查的行程；`uids` 為 `Uid:` 四欄（real、effective、saved、fs），四 uid 分類由此推得（與 sw-pal 相同規則）。
+fn uninspectable(pid: u32, start_ticks: u64, comm: &str, reason: sw_pal::proc_scan::UninspectableReason, uids: [u32; 4]) -> sw_pal::proc_scan::UninspectableProc {
+    use sw_pal::proc_scan::{UidMatch, UninspectableProc};
+    let uid_match = if uids.iter().all(|uid| *uid == ME) { UidMatch::All } else { UidMatch::Partial };
+    UninspectableProc { pid, start_ticks: Some(start_ticks), comm: Some(comm.into()), reason, uid_match, uids: Some(uids) }
+}
+
 /// `systemd --user`（407）、`(sd-pam)`（408）之外另有 `extra` 這些整個無法檢查的同 uid 行程（pid、start_ticks、comm）。
 fn partial_scan(holders: Vec<u32>, extra: &[(u32, u64, &str)]) -> sw_pal::proc_scan::HolderScan {
-    use sw_pal::proc_scan::{HolderScan, HolderScanOutcome, UninspectableProc, UninspectableReason, UninspectableSet};
+    let extra = extra.iter().map(|(pid, start_ticks, comm)| (*pid, *start_ticks, *comm, [ME; 4])).collect::<Vec<_>>();
+    partial_scan_with_uids(holders, &extra)
+}
+
+/// 同 `partial_scan`，`extra` 另帶 `Uid:` 四欄（例如 setuid 的 `fusermount3` 為 `[1000, 0, 0, 0]`）。
+fn partial_scan_with_uids(holders: Vec<u32>, extra: &[(u32, u64, &str, [u32; 4])]) -> sw_pal::proc_scan::HolderScan {
+    use sw_pal::proc_scan::{HolderScan, HolderScanOutcome, UninspectableReason, UninspectableSet};
     let mut procs = vec![
-        UninspectableProc { pid: 407, start_ticks: Some(1407), comm: Some("systemd".into()), reason: UninspectableReason::FdEntriesDenied },
-        UninspectableProc { pid: 408, start_ticks: Some(1408), comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+        uninspectable(407, 1407, "systemd", UninspectableReason::FdEntriesDenied, [ME; 4]),
+        uninspectable(408, 1408, "(sd-pam)", UninspectableReason::FdDirDenied, [ME; 4]),
     ];
-    for (pid, start_ticks, comm) in extra {
+    for (pid, start_ticks, comm, uids) in extra {
         procs.retain(|item| item.pid != *pid);
-        procs.push(UninspectableProc { pid: *pid, start_ticks: Some(*start_ticks), comm: Some((*comm).into()), reason: UninspectableReason::FdDirDenied });
+        procs.push(uninspectable(*pid, *start_ticks, comm, UninspectableReason::FdDirDenied, *uids));
     }
     HolderScan { holders, outcome: HolderScanOutcome::Partial(UninspectableSet::new(procs).expect("非空")) }
 }
@@ -598,7 +614,7 @@ fn legacy_d5_2_uninspectable_same_uid_process_is_reported_not_blocking() {
     assert!(t.journal_json().is_none());
 }
 
-/// D5.2 範圍：只有「部分同 uid 行程整個無法檢查」才放行。目標 tty 讀不到或同一行程部分 fd 讀不到（Permission）、
+/// D5.2 範圍：只有「停止前就已存在的行程整個無法檢查」才放行。目標 tty 讀不到或同一行程部分 fd 讀不到（Permission）、
 /// 原因不明（Unknown）、或讀得到的行程仍持有 UART 時，維持原本的保守行為，等到上限回 legacy_stop_pending；
 /// 逾時回應以 `holders_status` 標出最後一次 holder 掃描的狀態（`alive_pids`／`holder_pids` 皆空時據此診斷）。
 #[test]
@@ -644,7 +660,8 @@ fn list_of<'a>(value: &'a (impl GetKey + ?Sized), key: &str) -> &'a [PyValue] {
     }
 }
 
-/// PR 250 審查必修 3：放行只限停止舊 daemon 前就已存在、且整個無法檢查的同 uid 行程（停止前快照）。停止後才出現的
+/// PR 250 審查必修 3：放行只限停止舊 daemon 前就已存在、且整個無法檢查的行程（停止前快照；編排者裁決 2026-11-07 起
+/// 不論四 uid 分類）。停止後才出現的
 /// 整個無法檢查行程（例如 `ssh-agent` 這類 non-dumpable 程式，或帶 file capability／`PR_SET_DUMPABLE=0` 的 UART 工具）
 /// 可能正開著 UART，不得放行：維持等待，逾時回 legacy_stop_pending，並在 `uninspectable_procs` 指出是新出現的行程。
 #[test]
@@ -670,8 +687,82 @@ fn legacy_d5_2_uninspectable_process_appearing_after_stop_blocks() {
     assert!(t.journal_json().is_some(), "journal 保留");
 }
 
+/// 編排者裁決 2026-11-07（PR 250 第二輪，放行依據改為停止前快照）：常駐的 setuid 行程（`fusermount3`，`Uid: 1000 0 0 0`）
+/// 停止前就已存在、fd 讀不到 → 放行，並在 `legacy_stop.uninspectable_procs` 以 `uid_match: "partial"` 與 `uids`
+/// 標出它是 uid 部分相同的行程。
+#[test]
+fn legacy_d5_2_preexisting_setuid_uninspectable_process_is_reported_not_blocking() {
+    let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+    t.procs().uart_holder_scan_script(vec![partial_scan_with_uids(Vec::new(), &[(902, 1902, "fusermount3", [ME, 0, 0, 0])])]);
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    let j = json(&out);
+    let legacy = dict(&detail_of(&step(&j, "install", "stop_supervisor")), "legacy_stop").clone();
+    assert_eq!(s(&legacy, "holders_status"), "partial", "{out}");
+    let procs = list_of(&legacy, "uninspectable_procs");
+    let setuid = procs.iter().find(|item| int_of(item, "pid") == 902).unwrap_or_else(|| panic!("{out}"));
+    assert_eq!((s(setuid, "comm"), s(setuid, "uid_match")), ("fusermount3", "partial"), "{out}");
+    assert_eq!(list_of(setuid, "uids"), &[1000, 0, 0, 0].map(|uid| PyValue::Int(PyInt::Small(uid))), "{out}");
+    assert_eq!(setuid.get_key("seen_before_stop"), None, "成功報告不帶逾時診斷欄位：{out}");
+    let same = procs.iter().find(|item| int_of(item, "pid") == 408).unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(s(same, "uid_match"), "all", "{out}");
+    assert!(acts(&t).iter().any(|a| a == "start"), "新 daemon 由 setup 啟動：{:?}", acts(&t));
+}
+
+/// 編排者裁決 2026-11-07：停止後才出現、fd 讀不到的行程不論 uid 都擋下——`fusermount3` 型（`Uid: 1000 0 0 0`）與
+/// 第一輪 setuid `cu` 情境（`Uid: 1000 10 10 10`）停止後才出現時，維持等待到上限，逾時回應以 `seen_before_stop: false`
+/// 與 `uid_match: "partial"` 指出它。
+#[test]
+fn legacy_d5_2_setuid_uninspectable_process_appearing_after_stop_blocks() {
+    for (pid, comm, uids) in [(902, "fusermount3", [ME, 0, 0, 0]), (900, "cu", [ME, 10, 10, 10])] {
+        let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+        t.procs().uart_holder_scan_script(vec![
+            user_session_partial_scan(Vec::new()),
+            partial_scan_with_uids(Vec::new(), &[(pid, 1000 + u64::from(pid), comm, uids)]),
+        ]);
+        let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+        assert_eq!(rc, 2, "{comm}: {out}");
+        let j = json(&out);
+        assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{comm}: {out}");
+        let procs = list_of(&j, "uninspectable_procs");
+        let fresh = procs.iter().filter(|item| item.get_key("seen_before_stop") == Some(&PyValue::Bool(false))).collect::<Vec<_>>();
+        assert_eq!(fresh.len(), 1, "{comm}: {out}");
+        assert_eq!((int_of(fresh[0], "pid"), s(fresh[0], "comm"), s(fresh[0], "uid_match")), (i128::from(pid), comm, "partial"), "{comm}: {out}");
+        assert_eq!(list_of(fresh[0], "uids"), &uids.map(|uid| PyValue::Int(PyInt::Small(i128::from(uid)))), "{comm}: {out}");
+        assert_eq!(list_of(dict(&j, "last_unstable"), "reasons"), &[PyValue::Str("new_uninspectable".into())], "{comm}: {out}");
+        assert!(!acts(&t).iter().any(|a| a == "start" || a == "hard_stop"), "{comm}：不得重啟或硬殺：{:?}", acts(&t));
+    }
+}
+
+/// 編排者裁決 2026-11-07：停止前快照取得失敗（送出 stop 前的掃描另有讀取失敗，`Permission`／`Unknown`）時 fail-closed——
+/// 不得把那次掃描附帶的清單當成快照，也不得因拿不到快照就全部放行：停止後的無法檢查行程一律不放行，等到上限，
+/// 逾時回應以 `before_stop_snapshot: "failed"` 標出。
+#[test]
+fn legacy_d5_2_before_stop_snapshot_failure_admits_nothing() {
+    use sw_pal::proc_scan::{HolderScan, HolderScanOutcome};
+    for name in ["permission", "unknown"] {
+        let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+        let listed = user_session_partial_scan(Vec::new()).uninspectable().to_vec();
+        let failed = HolderScan {
+            holders: Vec::new(),
+            outcome: if name == "permission" { HolderScanOutcome::Permission(listed) } else { HolderScanOutcome::Unknown(listed) },
+        };
+        t.procs().uart_holder_scan_script(vec![failed, user_session_partial_scan(Vec::new())]);
+        let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+        assert_eq!(rc, 2, "{name}: {out}");
+        let j = json(&out);
+        assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{name}: {out}");
+        assert_eq!(s(&j, "before_stop_snapshot"), "failed", "{name}: {out}");
+        let procs = list_of(&j, "uninspectable_procs");
+        assert_eq!(procs.len(), 2, "{name}: {out}");
+        assert!(procs.iter().all(|item| item.get_key("seen_before_stop") == Some(&PyValue::Bool(false))), "{name}: {out}");
+        assert_eq!(list_of(dict(&j, "last_unstable"), "reasons"), &[PyValue::Str("new_uninspectable".into())], "{name}: {out}");
+        assert!(!acts(&t).iter().any(|a| a == "start" || a == "hard_stop"), "{name}：不得重啟或硬殺：{:?}", acts(&t));
+    }
+}
+
 /// PR 250 審查一併處理 6：`Partial` 一定附帶無法檢查的行程清單；組不出（或收到）空清單的 `Partial` 時，
-/// 不得被當成「只剩同 uid 行程無法檢查」而無聲放行。
+/// 不得被當成「只剩停止前就已存在的行程無法檢查」而無聲放行。
 #[test]
 fn legacy_d5_2_partial_without_uninspectable_list_does_not_pass() {
     use sw_pal::proc_scan::{HolderScan, HolderScanStatus};

@@ -1,11 +1,11 @@
 //! POSIX `/proc` 行程掃描（P4-T4）。
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::proc_scan::{
     extract_socket_arg, is_serialwrapd_argv, ArgvFlavor, DaemonProc, HolderScan, HolderScanOutcome,
-    HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure, UninspectableProc,
+    HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure, UidMatch, UninspectableProc,
     UninspectableReason, UninspectableSet,
 };
 
@@ -149,8 +149,8 @@ impl ProcScan for PosixProcScan {
         };
         let me = self.current_uid();
         let mut pids = Vec::new();
-        // 已確認同 uid（四個 uid 都等於自身）者；只有無法檢查的行程全屬此集合時才可能回 `Partial`。
-        let mut same_uid = BTreeSet::new();
+        // 掃描範圍內每個行程的四 uid 分類（只供回報，不決定放行）。
+        let mut uid_info = BTreeMap::new();
         let mut list_failed = false;
         for entry in entries {
             let Ok(entry) = entry else {
@@ -162,25 +162,28 @@ impl ProcScan for PosixProcScan {
             let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
                 continue;
             };
-            // 四個 uid 都不是自身的行程不在掃描範圍（D3.2／D5.2）；uid 讀不到或只有部分相同（setuid 工具）者保守納入。
-            match uid_relation(me, proc_uids(&entry.path())) {
-                UidRelation::Other => continue,
-                UidRelation::Same => {
-                    same_uid.insert(pid);
-                    pids.push(pid);
-                }
-                UidRelation::Unconfirmed => pids.push(pid),
-            }
+            // 四個 uid 都不是自身的行程不在掃描範圍（D3.2／D5.2）；uid 讀不到或只有部分相同（setuid 工具）者照常納入。
+            let uids = proc_uids(&entry.path());
+            let Some(uid_match) = uid_match(me, uids) else {
+                continue;
+            };
+            uid_info.insert(pid, (uid_match, uids));
+            pids.push(pid);
         }
         let mut scan = scan_fd(&self.proc_root, &pids, paths);
         if list_failed {
             scan.findings.push(Finding::ProcListFailed);
         }
-        let outcome = scan.same_uid_outcome(&same_uid, |pid, reason| UninspectableProc {
-            pid,
-            start_ticks: proc_start_ticks(&self.proc_root, pid),
-            comm: proc_comm(&self.proc_root, pid),
-            reason,
+        let outcome = scan.holder_outcome(|pid, reason| {
+            let (uid_match, uids) = uid_info.get(&pid).copied().unwrap_or((UidMatch::Unknown, None));
+            UninspectableProc {
+                pid,
+                start_ticks: proc_start_ticks(&self.proc_root, pid),
+                comm: proc_comm(&self.proc_root, pid),
+                reason,
+                uid_match,
+                uids,
+            }
         });
         HolderScan {
             holders: scan.holders,
@@ -229,7 +232,7 @@ enum ReadFailure {
 }
 
 /// [`scan_fd`] 的每一項發現。這是掃描結果唯一的失敗來源：兩種判定（[`FdScan::strict_status`]、
-/// [`FdScan::same_uid_outcome`]）都以窮舉 `match` 解讀，新增種類時編譯器會要求兩邊都處理，不會因漏設旗標而 fail-open。
+/// [`FdScan::holder_outcome`]）都以窮舉 `match` 解讀，新增種類時編譯器會要求兩邊都處理，不會因漏設旗標而 fail-open。
 #[derive(Debug, Clone, Copy)]
 enum Finding {
     /// 目標 tty 的 metadata 讀不到（節點不存在以外的錯誤）。
@@ -279,11 +282,11 @@ impl FdScan {
     }
 
     /// OD-48 D5.2（`uart_holders_same_uid`）：目標節點不存在與行程在掃描中消失不可能衝突，不算失敗。其餘失敗中，只有
-    /// 「已確認同 uid 的行程整個無法檢查」不擋下；全部失敗都屬此類時回 `Partial`。有任何擋下的失敗時沿用原本的嚴重度判定
-    /// （整個無法檢查的行程也計入，任一 PermissionDenied 即 `Permission`）。
-    fn same_uid_outcome(
+    /// 「行程整個無法檢查」不在這一層擋下（不論四 uid 分類；放不放行由呼叫端以停止前快照決定，編排者裁決 2026-11-07）；
+    /// 全部失敗都屬此類時回 `Partial`。有任何其他失敗時沿用原本的嚴重度判定（整個無法檢查的行程也計入，
+    /// 任一 PermissionDenied 即 `Permission`）。
+    fn holder_outcome(
         &self,
-        same_uid: &BTreeSet<u32>,
         describe: impl Fn(u32, UninspectableReason) -> UninspectableProc,
     ) -> HolderScanOutcome {
         let mut worst = None;
@@ -296,7 +299,7 @@ impl FdScan {
                 Finding::TargetVanished | Finding::ProcVanished => (None, false),
                 Finding::ProcUninspectable(pid, reason) => {
                     uninspectable.push(describe(pid, reason));
-                    (Some(ReadFailure::Permission), !same_uid.contains(&pid))
+                    (Some(ReadFailure::Permission), false)
                 }
             };
             worst = worst.max(severity);
@@ -420,21 +423,15 @@ struct ProcStat {
     start_ticks: Option<u64>,
 }
 
-/// 行程 uid 與自身 uid 的關係（OD-48 D5.2 的掃描範圍）。
-enum UidRelation {
-    /// real、effective、saved、fs 四個 uid 都等於自身。
-    Same,
-    /// 四個 uid 都不是自身（他 uid，不在掃描範圍）。
-    Other,
-    /// uid 讀不到，或只有部分欄位等於自身（例如同使用者執行的 setuid 工具 `Uid: 1000 10 10 10`）。
-    Unconfirmed,
-}
-
-fn uid_relation(me: Option<u32>, uids: Option<[u32; 4]>) -> UidRelation {
+/// 行程 uid 與自身 uid 的關係（OD-48 D5.2 的掃描範圍與四 uid 分類）：四個 uid（real、effective、saved、fs）
+/// 都不是自身 → `None`（他 uid，不在掃描範圍）；都等於自身 → `All`；只有部分等於自身（例如同使用者執行的 setuid
+/// 工具 `Uid: 1000 0 0 0`）→ `Partial`；uid 讀不到或自身 uid 不明 → `Unknown`（照常納入掃描）。
+fn uid_match(me: Option<u32>, uids: Option<[u32; 4]>) -> Option<UidMatch> {
     match (me, uids) {
-        (Some(me), Some(uids)) if uids.iter().all(|uid| *uid == me) => UidRelation::Same,
-        (Some(me), Some(uids)) if uids.iter().all(|uid| *uid != me) => UidRelation::Other,
-        _ => UidRelation::Unconfirmed,
+        (Some(me), Some(uids)) if uids.iter().all(|uid| *uid == me) => Some(UidMatch::All),
+        (Some(me), Some(uids)) if uids.iter().all(|uid| *uid != me) => None,
+        (Some(_), Some(_)) => Some(UidMatch::Partial),
+        _ => Some(UidMatch::Unknown),
     }
 }
 
