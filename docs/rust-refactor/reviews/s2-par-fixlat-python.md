@@ -117,3 +117,15 @@ cancel 計時的最大值在修改前後的探針分別為 1.505 ms 與 6.773 ms
 | `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
 
 本項沒有執行全套 pytest、slice gate、Docker 或出口證據 driver。
+
+---
+
+## 補記：第 6 項接線與整體驗收（2026-11-08）
+
+完整的接線核對、A/B 六次實跑表、逐筆時間線、整體驗收與 SPEC-GAPS，記在 `s2-par-fixlat-rust.md` 的同名補記節。本節只摘錄 Python daemon 這一側。上面第 2、4 項的內容保留原文。
+
+- **接線（程式碼確認）：**原測試直接呼叫工作樹 `scripts/rust/event_latency_measure.py` 的 `_sample_cancel()`，第 4 項的收尾等待已在其中，所以沒有修改測試檔，也沒有新增鎖檔登記。
+- **本輪三次（已實測，HEAD `38a93d97`，unset 三個 A/B 選擇變數）：**外部 loadavg 1m 分別為 5.51–11.55、5.63–8.46、8.96–16.83；command_cancel 200／200 PASS，max 分別為 1.240、1.644、1.358 ms，`errors=[]`；stop_request 20／20 PASS；三次 pytest 都是 exit 0。證據在 `target/s2-par/S2-PAR-fixlat-6/python-run-{1,2,3}/`，全部是 `quick_check_only`。
+- **逐筆時間線（已實測，第 4 項修改前工具的探針 `probe-python-1`）：**199 組相鄰樣本中，前一筆被取消的 `sleep 0.3` 都已送出 TX，prompt 在 TX 後 0.297–0.326 s 回來（mono）。下一筆的 `started_at` 全部晚於這個 prompt，差距 0.5–52.9 ms；下一筆的 TX 也全部晚於它，差距 0.8–53.3 ms（mono）。Python worker 會等前景 op 結束才取下一筆，下一筆停在 accepted 的時間就是前一筆剩下的收尾時間，不是 worker 沒有取件。
+- **基線判讀：**取消回覆早於 worker 收尾是 Python 基線既有的行為（`origin/main:sw_core/arbiter.py:364-380`）。第 4 項已在量測工具中補上收尾等待，判準沒有改變。取消路徑沒有確認出 Python 基線缺陷，因此不提 SPEC-GAP，也不需要讓測試維持失敗。`9d915e84` 原始失敗的成因（前一筆收尾超過 10 s）仍是推斷。
+- **同檔另一支測試：**本輪第 1 次整檔實跑時，`test_login_with_delay_and_noise` 在 Python daemon 上以 `POST_LOGIN_CMD_TIMEOUT` 失敗，第 2 次通過。Python 在這個錯誤碼之後不會自動重探（`sw_core/session_manager.py:2112-2136`）。細節記在 `s2-par-fixlat-rust.md`，列為既有碼待辦；不改 `sw_core`，也不改該測試。

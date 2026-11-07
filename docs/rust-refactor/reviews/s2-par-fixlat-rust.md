@@ -138,3 +138,91 @@ Rust 在每一份證據裡都沒有出現命令停在 accepted 的情況。「�
 | `python3 -m policy_check --repo .` | exit 0，25 pass、0 fail、2 warn（R-19 parser advisory；R-22 3243 筆既有懸空引用，與第 4 項記錄相同，本節沒有新增） |
 
 本項只修改文件；沒有執行全套 pytest、slice gate、Docker 或出口證據 driver。
+
+---
+
+## 補記：第 6 項接線與整體驗收（2026-11-08）
+
+本節記錄第 6 項的接線核對、本輪前景 A/B 六次實跑、逐筆時間線核對與整體驗收。上面第 3～5 項的內容保留原文。執行分支 `feature/rust-refactor-p8`，HEAD `38a93d975cf7fd298d130032c65c61a0287bab64`（本輪起點，工作樹乾淨）；本輪沒有修改任何 production code、測試、契約或凍結鎖。所有實跑都在前景完成，輸出在 `target/s2-par/S2-PAR-fixlat-6/`。
+
+### 接線核對（程式碼確認）
+
+- 原指定測試每次以 `_measure_tool()` 從工作樹載入 `scripts/rust/event_latency_measure.py`（`tests/contract_blackbox/test_p7_latency_noise.py:42-48`），`_cancel_run()` 逐筆直接呼叫該模組的 `tool._sample_cancel(rpc)`（`:85`），沒有第二套取消量測流程。
+- 第 4 項的收尾等待 `_wait_cancel_drained()` 位於 `_sample_cancel()` 內部（`event_latency_measure.py:428-453`，呼叫點 `:499`），所以原測試不需改檔就已經走修正後的流程。`:208` 的結果輸出逐輪保留 `errors`，第 1 項的 `stage=wait_running` 與第 4 項的 `stage=wait_drain` 診斷會原樣出現在 `control_latency_summary`。
+- 因此 `_cancel_run()` 與結果輸出都沒有修改。沒有新增接線邏輯，所以不適用「先用具名回歸證明舊接線會失敗」。沒有新增測試，鎖檔不變（`regen_lock --check` OK）。沒有動到 `code_paths`，不需要 changelog fragment。
+
+### 本輪前景 A/B 六次（目前負載，未等待負載下降）
+
+依 Python 1、Rust 1、Python 2、Rust 2、Python 3、Rust 3 的順序執行原 nodeid `test_control_latency_under_flood_with_events`。loadavg 是每次外部逐秒 `/proc/loadavg` 第一欄的範圍。表中的 peak 是 `judge_run` 內部監測的 1 分鐘 loadavg 峰值。
+
+| 實作／輪次 | 起訖（Asia/Taipei） | 外部 loadavg 1m | command_cancel（200）max／p99 ms，peak | stop_request（20）max ms，peak | pytest |
+|---|---|---:|---:|---:|---:|
+| Python 1 | 00:51:06–00:52:40 | 5.51–11.55 | 1.240／1.123，11.55 | 0.394，6.98 | 1 passed，exit 0 |
+| Rust 1 | 00:52:52–00:53:48 | 4.81–8.95 | 0.661／0.575，8.95 | 0.285，8.76 | 1 passed，exit 0 |
+| Python 2 | 00:53:52–00:55:26 | 5.63–8.46 | 1.644／1.281，7.63 | 0.274，8.46 | 1 passed，exit 0 |
+| Rust 2 | 00:55:26–00:56:21 | 4.66–10.06 | 1.647／0.545，6.54 | 3.872，10.06 | 1 passed，exit 0 |
+| Python 3 | 00:56:24–00:57:58 | 8.96–16.83 | 1.358／1.284，16.83 | 0.432，15.90 | 1 passed，exit 0 |
+| Rust 3 | 00:57:58–00:58:55 | 11.60–20.14 | 4.878／1.460，19.55 | 0.270，20.14 | 1 passed，exit 0 |
+
+六次都是 `verdict=PASS`、`errors=[]`、`void=false`、`load_problems=[]`，沒有作廢重跑；flood 規則每次都有比對，`event_dropped` 只出現在 COM0，原因只有 `per_rule_busy`，筆數都不超過送出的行數。六次都是 `quick_check_only`（200／20×1）。依 OD-59／OD-71，這些只算快速檢查，不是 500×3 契約量測。本輪六次的外部負載都有時段超過 8，不算低負載樣本；低負載三輪對照仍以上面第 3 項的表為準（Python 2.42–4.82、Rust 1.92–4.27）。
+
+每次的 `run.meta`（HEAD、起訖 load、bundle hash）、`command.txt`、`pytest.log`、JUnit、`exit_code`、`load-per-second.tsv` 與 `pytest-tmp/` 都保存在 `target/s2-par/S2-PAR-fixlat-6/{python,rust}-run-{1,2,3}/`。
+
+**環境選擇與 artifact 身分。** Python 輪 unset `SERIALWRAP_AB_LABEL`、`SERIALWRAP_CLI_EXE`、`SERIALWRAP_DAEMON_EXE`，走 `py-serialwrapd`，也就是工作樹的 `serialwrapd.py`。Rust 輪設 `SERIALWRAP_AB_LABEL=rust-fixlat6`，`SERIALWRAP_CLI_EXE`／`SERIALWRAP_DAEMON_EXE` 指向第 3 項建好的 bundle `target/s2-par/S2-PAR-fixlat-3/rust-bundle/`。包裝腳本每次開跑前都重算 hash：CLI `6323e220…f531`、daemon（realpath `versions/0.4.0/bin/serialwrapd`）`994978cb…09a`，不符就拒跑；三次都相符。bundle 建自 `2e642648`；`git diff 2e642648..HEAD -- crates Cargo.toml Cargo.lock scripts/rust/mkbundle.sh` 為空，所以 Rust 二進位對應的原始碼和 HEAD 相同。harness 在健康檢查後會以 `/proc/<pid>/exe` 核對受測 daemon，三次 Rust 輪都通過這項檢查後才進入量測。
+
+**觀察（已實測）：**Python 輪每次約 98 s，Rust 輪每次約 57 s；Python 的 flood 送出約 4,970 行，Rust 約 2,344 行。和第 4 項的探針一致：Python 每筆取消都要等已送出的 `sleep 0.3` 收尾，Rust 大部分樣本在 TX 前就已撤銷。
+
+### 逐筆時間線核對（回應 `2e5f1d9f..38a93d97` 審查的既有碼待辦建議）
+
+第 5 項只從單輪探針的彙總數字推斷「舊前景收尾後才讓下一筆進 running」。本輪改用第 4 項**修改前工具**探針已保存的 WAL 與 RPC 紀錄，逐筆核對（只讀，沒有另起 daemon）：`target/s2-par/S2-PAR-fixlat-6/timeline/timeline.py` 對每筆「舊命令已送出 TX」的樣本，從 WAL 取出舊命令的 TX，以及其後第一筆含 `root@t:/# ` 的 device RX（FakeTarget 執行 `sleep N` 會在 N 秒後送 prompt），再拿下一筆命令首次 `running` 時 `command.get` 帶的 `started_at` 來比對。輸出在 `timeline/{rust,python}-old-tool.json`。
+
+| 探針（修改前工具） | 忙碌中返回 | 舊命令已送 TX 的樣本 | TX→prompt（mono） | prompt→下一筆 started_at（wall） | prompt→下一筆 TX（mono） |
+|---|---:|---:|---:|---:|---:|
+| Rust `probe-rust-1` | 32／200 | 32（全部是忙碌中返回；其餘 168 筆的 WAL 沒有 TX） | 0.3004–0.3027 s | 32／32 為正，7.6–16.3 ms | 21 筆有 TX，全為正，9.3–18.8 ms |
+| Python `probe-python-1` | 200／200 | 199（第 200 筆沒有下一筆可比） | 0.2969–0.3260 s | 199／199 為正，0.5–52.9 ms | 199 筆全為正，0.8–53.3 ms |
+
+探針期間 WAL 的牆鐘曾倒退約 1.7 s（Rust 1 次、Python 2 次，以 wall−mono 偏移偵測），所以 TX→prompt 改用 `mono_ts_ns` 計算。`started_at` 只有牆鐘，因此 prompt→started_at 用牆鐘比較；所有區間都是正值且 ≤ 53 ms，如果區間跨過那次跳動，會出現約 −1.7 s 的值。
+
+**已實測：**在兩種 daemon 中，只要前一筆被取消的命令已經送出 TX，下一筆一定等到前一筆的完成 prompt 回來之後才進入 running，逐筆都沒有例外。也就是說，下一筆停在 `accepted`，是 worker／actor 依單寫入者規則等待前景 op 結束，不是 worker 沒有取件。下一筆的 accepted 等待就是前一筆剩下的收尾時間。修改後的工具把這段收尾歸到前一筆自己的期限內（第 4 項）。
+
+### 三個問題的回答
+
+1. **命令為什麼停在 accepted。**已實測：取消回覆與 `done_at` 都早於 worker 收尾（Python、Rust 皆然，第 4 項），修改前的工具因此在前一筆尚未收尾時就提交下一筆；下一筆會留在 accepted，直到前一筆的前景 op 結束（上節逐筆核對）。這是量測工具的同步假設錯誤，不是 flood 下 worker 不取件；已由第 4 項修正工具，判準不變。推斷，未證實：`9d915e84` 的 `command_cancel #41` 需要前一筆收尾超過 10 s 才會出現，例如 flood 中漏認完成 prompt、等到 `timeout_s=10` 後再進 recovery。第 2～6 項保存的所有實跑都沒有重現，原始失敗也沒有留下時間線，所以這個成因仍是推斷。
+2. **Python 與 Rust 的行為。**已實測：兩者都在取消回覆前寫入 `done_at`；兩者都要等前景 op 結束才讓下一筆 running。差別在取消後的收尾比例：Python 200／200 筆都要等已送出的 `sleep 0.3`；Rust 只有 TX 已送出的 32／200 筆需要等，其餘在 TX 前就撤銷了 permit。本輪修改後工具的 A/B 各三次全部 PASS。Rust 沒有特有缺陷，第 5 項未啟動的結論不變。
+3. **與負載的關係。**已實測：低於 8 的三輪（第 3 項）、本輪 4.66–20.14 的六輪、第 2 項 11.24–21.29 的三輪，都沒有 accepted timeout。峰值超過 24 CPU 的輪次會被負載閘門判 `INSUFFICIENT_EVIDENCE`（第 3、4 項），失敗原因是閘門，不是 accepted。沒有證據顯示 accepted timeout 和負載有關，但也無法排除原始主機在負載峰值 22 時，因收尾變長而觸發。
+
+### 整體驗收
+
+命令、stdout、stderr、exit code 與起訖 loadavg 存在 `target/s2-par/S2-PAR-fixlat-6/gates/`。
+
+| 檢查 | 結果 |
+|---|---|
+| 原 nodeid，Python 三次／Rust 三次 | 6／6 exit 0（上表） |
+| `python3 -m pytest -q tests/test_event_latency_measure.py` | exit 0，24 passed |
+| `python3 -m pytest -q tests/contract_blackbox/test_p7_latency_noise.py`（第 1 次） | **exit 1**：1 failed、1 passed，279.67 s。失敗的是 `test_login_with_delay_and_noise`，見下節；本項目標測試在同一次中通過 |
+| 同上（第 2 次，保留 basetemp） | exit 0，2 passed，180.04 s |
+| `python3 -m pytest -q tests/` | **未執行**：本輪 brief 規定全套 pytest 另派，不記為通過 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、findings 0 |
+| `python3 tests/acceptance/regen_lock.py --check` | exit 0，鎖檔與 L1 結構兩項 OK |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0 |
+| `python3 -m policy_check --repo .` | exit 0，25 pass、0 fail、2 warn（R-19 parser advisory；R-22 3244 筆懸空引用，本節只新增 1 筆，即被忽略的 `target/` 時間線腳本路徑） |
+| `cargo test --workspace` | exit 0，1542 passed、0 failed、45 ignored（173 個 result 行） |
+| `cargo test -p sw-core --features test-fakes` | exit 0，1182 passed、0 failed |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+
+第 5 項沒有啟動，沒有它的 Rust 修改要驗收；第 5 項節中已實跑的 `command_exec`、`arbiter`（test-fakes）結果仍有效，本輪 `sw-core --features test-fakes` 全部通過，已涵蓋這兩支。
+
+### `test_login_with_delay_and_noise` 的失敗（與本項無關，不修）
+
+**已實測：**第 1 次整檔實跑在本輪起點 HEAD（尚無任何修改）、Python daemon 下失敗。該測試期間的外部 loadavg 1m 為 5.39–22.43（開始時 17.52，24 CPU）。session 在 pytest 開始後約 32 s 進入 `DETACHED`，`last_error=POST_LOGIN_CMD_TIMEOUT`、`reprobe_attempts=0`、`next_reprobe_at=None`，`last_error_detail` 的尾段全是 noise 行；之後一直停在 DETACHED，到 180 s 期限為止。重跑前以 `ps` 確認沒有洩漏的拋棄式 daemon。同範圍第 2 次 `2 passed`（loadavg 6.83–24.68）。該次 login 測試在 WAL 中的 system TX 依序是 `\n`（0 s）、`root`（15.0 s）、`\n`（34.1 s）、`sh` 與 ready probe（34.9 s），最後到達 READY；密碼不寫入 WAL，所以無法只靠 WAL 判斷中間有沒有重新 attach。第 1 次的 pytest 暫存在 `/tmp`，已被清除；第 2 次的暫存保存在 `gates/pytest-p7-latency-noise-file-2.tmp/`。
+
+**程式碼確認：**Python `_is_reprobe_prompt_error()`（`sw_core/session_manager.py:2112-2136`）在 DETACHED 時只對 `PROMPT_TIMEOUT`、`*_PROMPT_TIMEOUT`、`RX_FLOOD`、`TRANSPORT_STALL` 自動重探，`POST_LOGIN_CMD_TIMEOUT` 不在其中。測試註解（`test_p7_latency_noise.py:159-160`）假設失敗後會在 DETACHED↔ATTACHING 之間重試，和這個錯誤碼的實際行為不符。先前 P7 全套也記錄過同一支測試出現 `POST_LOGIN_CMD_TIMEOUT`（`docs/rust-refactor/reviews/p7-fix-responses.md:439-440`）。
+
+**推斷：**`sh` 的回應 prompt `# ` 後面每 50 ms 就接一行 noise，高負載下比對可能晚於下一行 noise 到達，因而漏認 prompt。兩次同範圍實跑的失敗集合不同，也已排除洩漏 daemon，但兩次峰值都接近或超過 24 CPU，系統飽和不能排除，所以不主張這是環境問題。這支測試走登入狀態機，和取消／延遲量測無關。依 OD-75 不改 `sw_core`，本項也不改這支測試；列為既有碼待辦，交編排者決定。
+
+### SPEC-GAPS 與待裁決事項
+
+- 取消路徑沒有確認出 Python 基線缺陷，因此不提 `sw_core` 的 SPEC-GAP。原指定測試修正後維持判準不變，並在 A/B 兩邊都通過。
+- `9d915e84` 原始失敗的直接成因仍只是推斷（見問題 1），原因是缺少該次時間線。
+- 審查 Low `P8-2e5f1d9-1`（drain 期限起算點與 `elapsed` 起點不同）、`P8-2e5f1d9-2`（drain 期限 15 s 或 10 s 的取捨）依規定不修，交編排者收進 low-backlog。
+- `test_login_with_delay_and_noise`：Python 基線在 `POST_LOGIN_CMD_TIMEOUT` 後不會自動重探，測試假設與實際行為不符，偶發失敗（見上節）。需由編排者裁決歸屬。
