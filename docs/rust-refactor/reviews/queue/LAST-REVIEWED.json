@@ -31,5 +31,6 @@
   "feature/p8-t7": "1b6840d",
   "feature/rust-refactor-p8": "32f4bb9",
   "fix/legacy-handoff-takeover": "6b36a38",
-  "feature/rust-refactor-p8x": "02fae67"
+  "feature/rust-refactor-p8x": "02fae67",
+  "feature/release-0.4.1": "120cc8a"
 }
