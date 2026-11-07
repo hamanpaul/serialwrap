@@ -597,6 +597,331 @@ fn wp52_end_to_end_flag_does_not_bypass_submit_gates() {
     assert_wp52_gate_unchanged_by_flag(&r, "READY_UNCONFIRMED", "READY_UNCONFIRMED");
 }
 
+// ---------------------------------------------------------------------------
+// WP5-5 第 3 項：可信 human 命令的 TX gate 端到端（G7a、G7b、OD-74、rulings s2 D5）
+//
+// 呼叫路徑：`Service::rpc(command.submit)` → `check_source`／`is_bare_human` → `SessionRequest::Submit` →
+// `SessionCore::submit`（submit-time gate）→ queue → `start_next`／`execute_time_reject` → `OpSpec::Command` →
+// `OpRunner::run_command` → `TxWriter`／`Fence::admit` → FakeDevice＋WAL。
+// ---------------------------------------------------------------------------
+
+const WP55_WAL: &str = "/fake/wal/raw.wal.ndjson";
+/// Python `origin/main:sw_core/service.py:821` 的 quiet 分支 hint（逐字）。
+const WP55_QUIET_HINT: &str =
+    "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送";
+/// 假 DUT 對待測命令的回覆（立即回 prompt）。
+const WP55_REPLY: &[u8] = b"\r\nwp55-out\r\nroot@t:/# ";
+
+/// 自發重開機 banner 武裝 boot quiet 與 Ready Reconfirm；等公開狀態確實進 quiet 後回傳當下的公開 session。
+fn wp55_arm_quiet(r: &ServiceRig) -> PyDict {
+    r.device(REAL_A).push_rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+    wait_until("boot quiet 武裝", || {
+        r.session("COM0")
+            .and_then(|session| session.get("boot_quiet_remaining_s").cloned())
+            .is_some_and(|value| !value.is_null())
+    });
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("state"),
+        Some(&PyValue::from("READY")),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&session)
+    );
+    session
+}
+
+/// 標準 base64（含 `=` 補齊），比對 WAL TX 紀錄的 `payload_b64`。
+fn wp55_b64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// WAL 中屬於 `cmd_id` 的 TX 紀錄：`(source, payload_b64)`，依寫入順序。
+fn wp55_wal_tx(r: &ServiceRig, cmd_id: &str) -> Vec<(String, String)> {
+    let bytes = r.wfs.contents(WP55_WAL.as_ref()).unwrap_or_default();
+    String::from_utf8(bytes)
+        .expect("WAL 應為 UTF-8")
+        .lines()
+        .filter_map(|line| {
+            let PyValue::Dict(record) = sw_proto::pyjson::loads(line).expect("WAL 行應為 JSON")
+            else {
+                panic!("WAL 行應為 object：{line}");
+            };
+            (record.get("dir") == Some(&PyValue::from("TX"))
+                && record.get("cmd_id") == Some(&PyValue::from(cmd_id)))
+            .then(|| {
+                (
+                    s(&record, "source").to_string(),
+                    s(&record, "payload_b64").to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// 等命令進終態（`done_at` 非 null），回傳 `command.get` 的命令紀錄。
+fn wp55_wait_done(r: &ServiceRig, cmd_id: &str) -> PyDict {
+    let mut record = PyDict::default();
+    wait_until(&format!("{cmd_id} 結案"), || {
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    record
+}
+
+/// 可信命令真正送上 UART 並完成：`done`、無錯誤、stdout 取自假 DUT、UART 與 WAL TX 皆恰為本命令一行。
+fn assert_wp55_sent_and_done(
+    r: &ServiceRig,
+    case: &str,
+    cmd_id: &str,
+    command: &str,
+    source: &str,
+    tx_mark: usize,
+) {
+    let record = wp55_wait_done(r, cmd_id);
+    let tx = r.device(REAL_A).tx_since(tx_mark);
+    assert_eq!(s(&record, "status"), "done", "{case}：{}", j(&record));
+    assert_eq!(
+        record.get("error_code"),
+        Some(&PyValue::Null),
+        "{case}：{}",
+        j(&record)
+    );
+    assert_eq!(s(&record, "source"), source, "{case}");
+    assert_eq!(s(&record, "stdout"), "wp55-out", "{case}：{}", j(&record));
+    let line = format!("{command}\n");
+    assert_eq!(
+        String::from_utf8_lossy(&tx),
+        line,
+        "{case}：UART 只送出本命令一行"
+    );
+    assert_eq!(
+        wp55_wal_tx(r, cmd_id),
+        vec![(source.to_string(), wp55_b64(line.as_bytes()))],
+        "{case}：WAL 須有本 cmd_id 的完整 TX"
+    );
+}
+
+/// 對照 `tests/test_stage0_gate_codes.py::test_rpc_bare_human_bypasses_quiet_but_explicit_human_cli_does_not`：
+/// RPC 原始值 bare `human`／空名 `human:`（`source_policy.py:48-64` `is_bare_human`）於 boot quiet 期間提交即時可得
+/// prompt 的命令——admission 成功、回應帶正規化標註，且 TX 經 `human_line` 類 permit 不受 quiet 擋
+/// （`session_manager.py:6603-6607`、`uart_io.py:640`），命令真正送上 UART、WAL 有 TX、紀錄 `done`。
+#[test]
+fn wp55_rpc_bare_human_bypasses_quiet() {
+    for raw in ["human", "human:"] {
+        let r = ServiceRig::ready_shell();
+        let command = "echo wp55-bare";
+        let dev = r.device(REAL_A);
+        dev.on_tx_reply(format!("{command}\n").as_bytes(), WP55_REPLY);
+        wp55_arm_quiet(&r);
+        let tx_mark = dev.tx_len();
+        let params =
+            format!(r#"{{"selector":"COM0","cmd":"{command}","source":"{raw}","timeout_s":10}}"#);
+        let response = r.call("command.submit", &params);
+        assert_eq!(
+            response.get("ok"),
+            Some(&PyValue::Bool(true)),
+            "{raw}：{}",
+            j(&response)
+        );
+        let cmd_id = s(&response, "cmd_id").to_string();
+        assert_eq!(
+            j(&response),
+            wp51_submit_success_response(&r, &cmd_id, Some("human:cli"), Some(raw), "human"),
+            "{raw}：成功回應"
+        );
+        assert_wp55_sent_and_done(&r, raw, &cmd_id, command, "human:cli", tx_mark);
+    }
+}
+
+/// 對照 `tests/test_stage0_gate_codes.py::test_rpc_human_source_is_gated_like_agent` 與
+/// `::test_rpc_bare_human_bypasses_quiet_but_explicit_human_cli_does_not` 的 explicit 段：明寫 `human:cli`、
+/// `human:spoof` 與 `agent:x` 於 quiet 時以 `AUTOBOOT_QUIET` 拒絕（`service.py:800-822`），回應逐位元組等於
+/// Python 分支字面量，UART、WAL、registry、queue 前後完全不變。RPC 參數 `trusted_human:true` 不被讀取
+/// （`service.py:1228-1235` 只取 `source_check.is_bare_human`），不得授權明寫前綴。
+#[test]
+fn wp55_rpc_explicit_human_and_agent_are_gated() {
+    let r = ServiceRig::ready_shell();
+    let command = "echo wp55-gated";
+    // 若被誤放行，假 DUT 會立即回 prompt 讓命令成功；拒絕時此回覆永不觸發。
+    r.device(REAL_A)
+        .on_tx_reply(format!("{command}\n").as_bytes(), WP55_REPLY);
+    let session = wp55_arm_quiet(&r);
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "AUTOBOOT_QUIET",
+        "retry_after_s" => session
+            .get("boot_quiet_remaining_s")
+            .cloned()
+            .expect("boot_quiet_remaining_s"),
+        "hint" => WP55_QUIET_HINT,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    for source in ["human:cli", "human:spoof", "agent:x"] {
+        for extra in ["", r#","trusted_human":true"#] {
+            let params = format!(
+                r#"{{"selector":"COM0","cmd":"{command}","source":"{source}","timeout_s":10{extra}}}"#
+            );
+            assert_wp52_rpc_rejected_without_side_effects(&r, &params, &j(&expected));
+        }
+    }
+    assert_eq!(
+        r.session("COM0").map(|session| j(&session)),
+        Some(j(&session)),
+        "拒絕不改變 session 公開狀態"
+    );
+}
+
+/// 佇列競態案例：(原始 source, 額外參數, 正規化 (source, normalized_from), source_class, 預期可信)。
+type Wp55QueuedCase = (
+    &'static str,
+    &'static str,
+    Option<(&'static str, &'static str)>,
+    &'static str,
+    bool,
+);
+
+/// 佇列競態（G7a）：前景佔住時經 RPC 入列、確認仍在佇列，之後 banner 才武裝 quiet，最後前景以 prompt 正常結束。
+/// 出列時 execute-time gate（`session_manager.py:6573-6577`）與 TX fence 只對可信 human 豁免：bare `human`／`human:`
+/// 真正送出並完成；明寫 `human:` 前綴（含額外 `trusted_human:true` 參數）與 agent 以 `AUTOBOOT_QUIET` 結案、
+/// 待測命令零 TX、WAL 無其 TX 紀錄。
+#[test]
+fn wp55_rpc_queued_source_trust() {
+    let matrix: [Wp55QueuedCase; 6] = [
+        ("human", "", Some(("human:cli", "human")), "human", true),
+        ("human:", "", Some(("human:cli", "human:")), "human", true),
+        ("human:cli", "", None, "human", false),
+        (
+            "human:cli",
+            r#","trusted_human":true"#,
+            None,
+            "human",
+            false,
+        ),
+        ("human:spoof", "", None, "human", false),
+        ("agent:x", "", None, "agent", false),
+    ];
+    for (raw, extra, normalized, source_class, trusted) in matrix {
+        let case = format!("source={raw}{extra}");
+        let r = ServiceRig::ready_shell();
+        let command = "echo wp55-queued";
+        let dev = r.device(REAL_A);
+        dev.on_tx_reply(format!("{command}\n").as_bytes(), WP55_REPLY);
+        let hold = submit_blocking(&r);
+        // 前景須真正佔住 UART：`running` 只代表已出列，OpRunner 送出 TX 尚有毫秒級延遲；banner 若先到，
+        // 佔用命令本身會被 quiet 擋下（與 Python 相同語意），就不是本案要驗的「入列後才進 quiet」。
+        wait_until("佔用命令已送上 UART", || {
+            wp55_wal_tx(&r, &hold) == vec![("agent".to_string(), wp55_b64(b"sleep 100\n"))]
+        });
+        let params = format!(
+            r#"{{"selector":"COM0","cmd":"{command}","source":"{raw}","timeout_s":10{extra}}}"#
+        );
+        let response = r.call("command.submit", &params);
+        assert_eq!(
+            response.get("ok"),
+            Some(&PyValue::Bool(true)),
+            "{case}：quiet 前提交應通過：{}",
+            j(&response)
+        );
+        let cmd_id = s(&response, "cmd_id").to_string();
+        assert_eq!(
+            j(&response),
+            wp51_submit_success_response(
+                &r,
+                &cmd_id,
+                normalized.map(|(source, _)| source),
+                normalized.map(|(_, from)| from),
+                source_class,
+            ),
+            "{case}：成功回應"
+        );
+        let queued = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        assert_eq!(s(&queued, "status"), "accepted", "{case}：{}", j(&queued));
+        assert_eq!(
+            queued.get("started_at"),
+            Some(&PyValue::Null),
+            "{case}：前景佔用中不得出列"
+        );
+        assert_eq!(
+            r.mgr.session_queue_lens("COM0").map(|(len, _)| len),
+            Some(1),
+            "{case}：待測命令在佇列中"
+        );
+
+        wp55_arm_quiet(&r);
+        let tx_mark = dev.tx_len();
+        // 前景以 prompt 正常結束（OpRunner 比對到 prompt → CommandResult），待測命令隨即出列。
+        dev.push_rx(b"\r\nroot@t:/# ");
+        let held = wp55_wait_done(&r, &hold);
+        assert_eq!(
+            s(&held, "status"),
+            "done",
+            "{case}：{} hold TX={:?} UART={:?}",
+            j(&held),
+            wp55_wal_tx(&r, &hold),
+            String::from_utf8_lossy(&dev.tx_since(0))
+        );
+        let expected_source = normalized.map_or(raw, |(source, _)| source);
+        if trusted {
+            assert_wp55_sent_and_done(&r, &case, &cmd_id, command, expected_source, tx_mark);
+        } else {
+            let record = wp55_wait_done(&r, &cmd_id);
+            assert_eq!(s(&record, "status"), "error", "{case}：{}", j(&record));
+            assert_eq!(
+                s(&record, "error_code"),
+                "AUTOBOOT_QUIET",
+                "{case}：{}",
+                j(&record)
+            );
+            let tx = dev.tx_since(tx_mark);
+            assert!(
+                !String::from_utf8_lossy(&tx).contains(command),
+                "{case}：被 gate 擋下的命令不得寫出 TX：{:?}",
+                String::from_utf8_lossy(&tx)
+            );
+            assert!(
+                wp55_wal_tx(&r, &cmd_id).is_empty(),
+                "{case}：WAL 不得有被擋命令的 TX"
+            );
+        }
+        assert_eq!(
+            r.mgr.session_queue_lens("COM0").map(|(len, _)| len),
+            Some(0),
+            "{case}：佇列已清空"
+        );
+    }
+}
+
 fn wp51_source_reserved_response(r: &ServiceRig, raw_source: &str) -> String {
     wp51_reserved_source_response(r, "source", raw_source)
 }
