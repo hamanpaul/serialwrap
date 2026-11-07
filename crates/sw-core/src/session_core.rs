@@ -29,9 +29,7 @@ use crate::generations::{EpochAllocator, Generations};
 use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::out_ring::OutItem;
 use crate::lease::{InteractiveLease, Tombstones};
-use crate::login_fsm::{
-    LoginPlan, choose_login_plan, detect_boot_banner, matches_login_or_password,
-};
+use crate::login_fsm::{LoginPlan, choose_login_plan};
 use crate::mailbox::{
     ControlEvent, DataEvent, DetachReason, MailboxItem, OpenFailure, OpenedBridge, Reply,
     TimerEvent,

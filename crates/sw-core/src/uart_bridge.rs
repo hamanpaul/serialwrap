@@ -917,10 +917,6 @@ impl RxShared {
         self.stats_override
             .store(bytes.unwrap_or(u64::MAX), Ordering::Release);
     }
-    /// 最後一個 append 的 `rx_seq`（`LoginFinished.after_rx_seq` 來源）。
-    pub fn last_rx_seq(&self) -> u64 {
-        todo!("P7 Task 7")
-    }
 }
 
 /// reader 在 WAL append 後依序呼叫的 RX 觀察者（DF-15）；不得阻塞於跨 thread 等待、不得回呼 SessionManager。

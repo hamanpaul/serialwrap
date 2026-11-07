@@ -399,7 +399,13 @@ def _fill_queue(d) -> None:
     # OD-36：前景命令須不會在填滿佇列前自行結束（Python CLI 逐筆 submit 256 筆可能超過 30 s，佇列會開始排出）。
     first = _submit(d, "sleep 3600", "--cmd-timeout", "3700")
     assert "cmd_id" in first, first
+    # daemon 前景等待以 min(timeout, 30 s) 為靜默上限：目標連續 30 s 無任何 RX 即視為卡住並 CTRL_C 結束該命令
+    # （session_manager 的 heartbeat 迴圈），佇列隨即排出。逐筆 submit 在負載下可能超過 30 s，
+    # 故每筆之間由 DUT 端送出一行無 prompt 的 RX 活動，維持「前景命令仍在執行」這個前置條件；
+    # 斷言（必須出現 SESSION_QUEUE_FULL）完全不變。
+    tgt = _tgt(d)
     for i in range(400):
+        tgt.emit(b"holding...\r\n")
         r = _submit(d, f"echo fill{i}")
         if r.get("error_code") == "SESSION_QUEUE_FULL":
             return

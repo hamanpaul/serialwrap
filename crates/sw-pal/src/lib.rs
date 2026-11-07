@@ -5,14 +5,6 @@
 //! P4-T1：`Platform` 為 `ClientPlatform` 的超集（P3 呼叫端不改型別名稱，`ClientPlatform = Platform`、`ClientCaps = Capabilities`）。
 use std::sync::Arc;
 
-/// Slice 2.1 骨架未實作函式的統一 panic（與 `sw_core::s21_todo!` 同格式：`not implemented: slice21 <Task> <symbol>`）。
-#[macro_export]
-macro_rules! s21_todo {
-    ($t:literal, $sym:literal) => {
-        unimplemented!(concat!("slice21 ", $t, " ", $sym))
-    };
-}
-
 pub mod clock;
 pub mod com0com;
 #[cfg(feature = "test-fakes")]

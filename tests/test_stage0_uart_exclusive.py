@@ -777,16 +777,32 @@ class TestAttachProbeDrain:
                 proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return proc, sock, env
 
+        def _poll_sessions(sock, env, ok, timeout_s=30.0):
+            deadline = time.monotonic() + timeout_s
+            while True:
+                c = subprocess.run([sys.executable, "-m", "sw_core.cli", "--socket", sock, "session", "list"], env=env, capture_output=True, text=True)
+                rows = _sessions_from_cli(c.stdout) if c.stdout.strip() else []
+                if ok(rows) or time.monotonic() >= deadline:
+                    return c
+                time.sleep(0.3)
+
         d1, s1, e1 = make_daemon(1)
-        d2, s2, e2 = make_daemon(2, ["--force-spawn"])
+        d2 = None
         try:
-            for s in (s1, s2):
-                t0 = time.monotonic()
-                while time.monotonic() - t0 < 5.0 and not os.path.exists(s):
-                    time.sleep(0.05)
-            time.sleep(1.0)
-            c1 = subprocess.run([sys.executable, "-m", "sw_core.cli", "--socket", s1, "session", "list"], env=e1, capture_output=True, text=True)
-            c2 = subprocess.run([sys.executable, "-m", "sw_core.cli", "--socket", s2, "session", "list"], env=e2, capture_output=True, text=True)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 5.0 and not os.path.exists(s1):
+                time.sleep(0.05)
+            # 前置條件：d1 先確實持有裝置（ATTACHED/READY）再啟動 d2。兩個 daemon 同時啟動時，
+            # flock 勝者的 probe_holders 會掃到敗者瞬間開啟的 fd 而同樣回 DeviceHeldError（雙方皆 DETACHED，
+            # sw_core/serial_port.py open() 的 flock→probe_holders 次序），那是另一個語意，不是本案要驗的
+            # 「force-spawn 不得繞過已持有者的鎖」。
+            _poll_sessions(s1, e1, lambda rows: bool(rows) and rows[0].get("state") in ("ATTACHED", "READY"))
+            d2, s2, e2 = make_daemon(2, ["--force-spawn"])
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 5.0 and not os.path.exists(s2):
+                time.sleep(0.05)
+            c1 = _poll_sessions(s1, e1, lambda rows: bool(rows))
+            c2 = _poll_sessions(s2, e2, lambda rows: bool(rows) and rows[0].get("last_error") == "ATTACH_FAILED:DeviceHeldError")
             s1_list = _sessions_from_cli(c1.stdout)
             s2_list = _sessions_from_cli(c2.stdout)
             st1 = s1_list[0].get("state") if s1_list else None
@@ -799,15 +815,16 @@ class TestAttachProbeDrain:
         finally:
             d1.kill()
             d1.wait()
-            try:
-                os.killpg(d2.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            d2.wait(timeout=5.0)
-            try:
-                os.killpg(d2.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if d2 is not None:
+                try:
+                    os.killpg(d2.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                d2.wait(timeout=5.0)
+                try:
+                    os.killpg(d2.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     @pytest.mark.process_rpc
     def test_release_then_external_plain_open_succeeds(self, pty_shell, tmp_path):
