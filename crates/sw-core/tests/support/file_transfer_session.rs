@@ -312,6 +312,13 @@ impl XferRig {
         XferRig { rig, peer, tmp: TempDir::new("rig") }
     }
 
+    /// 同 [`XferRig::ready`]，但 actor 附 ConsoleHub（PTY 替身 console；human raw ownership 測試用）。
+    pub fn ready_with_hub(profile_yaml: &str, caps: ShellCaps) -> XferRig {
+        let rig = ActorRig::new_with_hub(profile_yaml).ready();
+        let peer = ShellPeer::start(&rig.dev, caps);
+        XferRig { rig, peer, tmp: TempDir::new("hub") }
+    }
+
     /// 送出 FileTransfer 請求並等回覆（`Err` 為 framing `EXCEPTION`）。
     pub fn transfer(&self, req: FileTransferRequest) -> Result<PyDict, PyErr> {
         self.transfer_async(req)

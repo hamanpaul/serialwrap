@@ -16,6 +16,7 @@ use sw_core::file_transfer::templates as t;
 use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};
 use sw_core::session_core::{SessionRequest, SessionState};
 use sw_pal::fakes::serial::FakeWriteStep;
+use sw_pal::traits::Clock;
 use sw_proto::pydict;
 use sw_proto::pyjson::{self, PyDict, PyInt, PyValue};
 
@@ -497,4 +498,89 @@ fn pull_local_write_error_is_exception() {
     assert!(err.message.contains("No such file or directory") && err.message.contains(&bad), "{}", err.message);
     assert!(x.peer.lines_containing("base64 < ") >= 1, "pull 命令已送出（有 TX）");
     assert_eq!(x.rig.get_state().get("foreground_busy"), Some(&PyValue::Bool(false)));
+}
+
+/// 接線驗收（review-convergence-rules §5）：drain 必須經 T5 的傳輸取消（`RunCancel::watching_transfers`）喚醒等待中的
+/// 引擎，而不是等 echo-ACK 逾時（`max(timeout_s, 5.0)`＝5 s）自然結束。ActorRig 的 FakeClock 於等待時自行推進，故以
+/// 「release 到回覆之間的虛擬時間」判定：取消生效時引擎立即返回；取消檢查失效時須耗盡 5 s 的 echo 等待。
+#[test]
+fn drain_midway_wakes_engine_without_waiting_echo_timeout() {
+    let x = XferRig::ready(SHELL_PROFILE, ShellCaps::busybox_base64());
+    let rx = push_held_in_chunk_loop(&x);
+    x.wait_peer_holding();
+    let t0 = x.rig.clock.mono_ns();
+    let rel = release(&x);
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{rel:?}");
+    let r = rx.recv_timeout(XFER_WAIT).expect("回覆").expect("字典");
+    let elapsed_ns = x.rig.clock.mono_ns().saturating_sub(t0);
+    assert_eq!(code(&r).as_deref(), Some("COMMAND_ABORTED_IN_FLIGHT"), "{r:?}");
+    assert!(
+        elapsed_ns < 2_000_000_000,
+        "drain 應立即喚醒引擎（虛擬時間經過 {elapsed_ns} ns，echo 等待上限 5 s）"
+    );
+}
+
+#[test]
+fn attached_not_command_capable_rejected_with_hint_zero_tx() {
+    // 非 passthrough、無 ready_probe 的 profile 停在 ATTACHED：與 command.submit 相同的 PROFILE_NOT_COMMAND_CAPABLE＋hint。
+    let rig = ActorRig::new(support::SHELL_NO_PROBE_PROFILE).attach();
+    rig.wait_state("ATTACHED");
+    let before = rig.dev.tx_len();
+    for req in [push_req("/nonexistent", "/r"), pull_req("/r", None)] {
+        let r = rig.request(SessionRequest::FileTransfer(req));
+        assert_eq!(keys(&r), ["ok", "error_code", "hint", "session"], "{r:?}");
+        assert_eq!(code(&r).as_deref(), Some("PROFILE_NOT_COMMAND_CAPABLE"));
+        let hint = r.get("hint").and_then(PyValue::as_str).unwrap_or("");
+        assert!(hint.starts_with("此 profile 僅支援 console。") && hint.contains("ready_probe"), "{hint}");
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(rig.dev.tx_len(), before, "外部 oracle：零 TX");
+}
+
+/// human raw console 的按鍵在 push 期間進 DeferredBuffer（admission 關），傳輸結束（resume＋admission 開）後才回放；
+/// 外部 byte 序列中按鍵不夾在任何傳輸命令行內（no_forbidden_interleave）。
+#[test]
+fn human_keys_during_push_replayed_after_transfer_not_interleaved() {
+    let x = XferRig::ready_with_hub(SHELL_PROFILE, ShellCaps::busybox_base64());
+    let console = x.rig.attach_pty_console("c1");
+    let rx = push_held_in_chunk_loop(&x);
+    x.wait_peer_holding();
+    assert_eq!(x.rig.get_state().get("foreground_busy"), Some(&PyValue::Bool(true)));
+    console.push_input(b"KEYZ");
+    std::thread::sleep(Duration::from_millis(80));
+    let _ = x.rig.get_state();
+    assert!(
+        !x.peer.dut_bytes().windows(4).any(|w| w == b"KEYZ"),
+        "傳輸期間 human 按鍵不得上 UART（應暫存於 deferred）"
+    );
+    x.peer.release_hold();
+    let r = rx.recv_timeout(XFER_WAIT).expect("回覆").expect("字典");
+    assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)), "{r:?}");
+    wait_real("傳輸結束後回放 human 按鍵", || x.peer.dut_bytes().windows(4).any(|w| w == b"KEYZ"));
+    let dut = x.peer.dut_bytes();
+    let key_at = dut.windows(4).position(|w| w == b"KEYZ").expect("KEYZ");
+    let last_nl = dut.iter().rposition(|b| *b == b'\n').expect("傳輸命令行");
+    assert!(key_at > last_nl, "按鍵必須在最後一個傳輸命令行之後（不夾入 chunk 行）：key_at={key_at} last_nl={last_nl}");
+    assert_eq!(dut.windows(4).filter(|w| *w == b"KEYZ").count(), 1, "回放恰一次");
+    assert_eq!(x.peer.lines_containing("SW_XFER_CHUNK_"), 3);
+}
+
+/// push 期間進 deferred 的 human 按鍵，在傳輸被 `device.release` 中止後永不回放（BC-02 input_epoch；no_stale_context_replay）。
+#[test]
+fn release_during_push_discards_deferred_human_bytes() {
+    let x = XferRig::ready_with_hub(SHELL_PROFILE, ShellCaps::busybox_base64());
+    let console = x.rig.attach_pty_console("c1");
+    let rx = push_held_in_chunk_loop(&x);
+    x.wait_peer_holding();
+    console.push_input(b"KEYZ");
+    std::thread::sleep(Duration::from_millis(80));
+    let _ = x.rig.get_state();
+    let rel = release(&x);
+    assert_eq!(rel.get("ok"), Some(&PyValue::Bool(true)), "{rel:?}");
+    let r = rx.recv_timeout(XFER_WAIT).expect("回覆").expect("字典");
+    assert_eq!(code(&r).as_deref(), Some("COMMAND_ABORTED_IN_FLIGHT"), "{r:?}");
+    let after = x.peer.tx_len();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(x.peer.tx_len(), after, "RELEASED 後 DUT 零新增 bytes");
+    assert!(!x.peer.dut_bytes().windows(4).any(|w| w == b"KEYZ"), "deferred 按鍵不得於 release 後回放");
 }
