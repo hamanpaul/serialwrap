@@ -90,6 +90,34 @@ pub struct CommandRegistry {
     inner: Mutex<RegistryInner>,
 }
 
+/// 驗證原始 `expect_reboot` RPC 值，並拒絕 interactive lease 模式。
+///
+/// 缺省、null 與 bool 合法；其他型別不做 truthy 轉換。`fg`／`bg` 先正規化，
+/// 但呼叫端仍保留原始 mode 供命令紀錄使用。
+pub fn expect_reboot_rejection(value: Option<&PyValue>, mode: &str) -> Option<PyDict> {
+    if !matches!(value, None | Some(PyValue::Null | PyValue::Bool(_))) {
+        return Some(pydict! {
+            "ok" => false,
+            "error_code" => "INVALID_EXPECT_REBOOT",
+        });
+    }
+
+    let normalized_mode = match mode {
+        "fg" => "line",
+        "bg" => "background",
+        other => other,
+    };
+    if matches!(value, Some(PyValue::Bool(true))) && normalized_mode == "interactive" {
+        return Some(pydict! {
+            "ok" => false,
+            "error_code" => "EXPECT_REBOOT_MODE_UNSUPPORTED",
+            "hint" => "--expect-reboot 只適用 line／background 模式；interactive 是 lease 按鍵通道，不走 reboot 路徑。",
+        });
+    }
+
+    None
+}
+
 impl CommandRegistry {
     /// 建立空登錄表。
     pub fn new() -> Arc<CommandRegistry> {
@@ -128,6 +156,11 @@ impl CommandRegistry {
                 "ok" => false,
                 "error_code" => "INVALID_COMPLETION_REGEX",
             });
+        }
+
+        let expect_reboot_value = PyValue::Bool(req.expect_reboot);
+        if let Some(rejection) = expect_reboot_rejection(Some(&expect_reboot_value), &req.mode) {
+            return Err(rejection);
         }
 
         let cmd_len = req.command.len();
