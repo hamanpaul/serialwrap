@@ -434,6 +434,206 @@ fn wp51_submit_normalized_source_reaches_registry() {
 }
 
 #[test]
+fn wp51_source_policy_end_to_end() {
+    let r = ServiceRig::ready_shell();
+    r.settle();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    let dev = r.device(REAL_A);
+
+    let before_effects = r.side_effect_fingerprint();
+    let before_tx = dev.tx_len();
+    let before_registry = r.registry.len();
+    let before_pending = r.registry.pending(&session_id);
+    let before_queue = r.mgr.session_queue_lens("COM0");
+    let rejected = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo rejected","source":"system:recover"}"#,
+    );
+    assert_eq!(
+        j(&rejected),
+        wp51_source_reserved_response(&r, "system:recover")
+    );
+    r.settle();
+    assert_eq!(r.side_effect_fingerprint(), before_effects);
+    assert_eq!(dev.tx_len(), before_tx, "保留來源不得送出任何 UART bytes");
+    assert_eq!(
+        r.registry.len(),
+        before_registry,
+        "保留來源不得建立命令紀錄"
+    );
+    assert_eq!(r.registry.pending(&session_id), before_pending);
+    assert_eq!(r.mgr.session_queue_lens("COM0"), before_queue);
+
+    let human_command = "wp51-human-normalized";
+    let agent_command = "wp51-default-agent";
+    let explicit_human_command = "wp51-explicit-human-cli";
+    for command in [human_command, agent_command, explicit_human_command] {
+        dev.on_tx_reply(format!("{command}\n").as_bytes(), b"\r\nroot@t:/# ");
+    }
+    let tx_mark = dev.tx_len();
+
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"wp51-human-normalized","source":"human"}"#,
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    let human_id = s(&response, "cmd_id").to_string();
+    assert_eq!(
+        j(&response),
+        wp51_submit_success_response(&r, &human_id, Some("human:cli"), Some("human"), "human")
+    );
+    wait_until("human 正規化命令完成", || {
+        r.registry
+            .get(&human_id)
+            .and_then(|record| record.get("done_at").cloned())
+            .is_some_and(|done_at| !done_at.is_null())
+    });
+    let tx = dev.tx_since(tx_mark);
+    assert!(
+        tx.windows(human_command.len())
+            .any(|window| window == human_command.as_bytes()),
+        "fake UART 未收到命令：{:?}",
+        String::from_utf8_lossy(&tx)
+    );
+
+    let fetched = r.call("command.get", &format!(r#"{{"cmd_id":"{human_id}"}}"#));
+    let human_record = sub(&fetched, "command");
+    assert_eq!(s(&human_record, "source"), "human:cli");
+    assert_eq!(s(&human_record, "source_class"), "human");
+    assert!(
+        r.registry
+            .get(&human_id)
+            .expect("registry 命令紀錄")
+            .get("source_class")
+            .is_none(),
+        "service 顯示分類不得污染 arbiter registry"
+    );
+
+    for (command, params, expected_class) in [
+        (
+            agent_command,
+            r#"{"selector":"COM0","cmd":"wp51-default-agent"}"#,
+            "agent",
+        ),
+        (
+            explicit_human_command,
+            r#"{"selector":"COM0","cmd":"wp51-explicit-human-cli","source":"human:cli"}"#,
+            "human",
+        ),
+    ] {
+        let response = r.call("command.submit", params);
+        assert_eq!(
+            response.get("ok"),
+            Some(&PyValue::Bool(true)),
+            "{}",
+            j(&response)
+        );
+        let cmd_id = s(&response, "cmd_id").to_string();
+        let normalized = expected_class == "human";
+        assert_eq!(
+            j(&response),
+            wp51_submit_success_response(&r, &cmd_id, None, None, expected_class,),
+            "提交來源分類：{command}"
+        );
+        wait_until(&format!("{command} 完成"), || {
+            r.registry
+                .get(&cmd_id)
+                .and_then(|record| record.get("done_at").cloned())
+                .is_some_and(|done_at| !done_at.is_null())
+        });
+        let fetched = r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#));
+        let record = sub(&fetched, "command");
+        assert_eq!(s(&record, "source_class"), expected_class);
+        assert_eq!(
+            s(&record, "source"),
+            if normalized { "human:cli" } else { "agent" }
+        );
+        assert!(r
+            .registry
+            .get(&cmd_id)
+            .unwrap()
+            .get("source_class")
+            .is_none());
+    }
+
+    assert_eq!(
+        j(&r.call("command.get", r#"{"cmd_id":"nope"}"#)),
+        format!(
+            "{{\"ok\":false,\"error_code\":\"CMD_NOT_FOUND\",\"cmd_id\":\"nope\",\"version\":\"{}\"}}",
+            r.version
+        )
+    );
+
+    let r = ServiceRig::ready_shell();
+    r.settle();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    for (method, params, field, raw_source) in [
+        (
+            "device.release",
+            r#"{"selector":"COM0","source":"system:recover"}"#,
+            "source",
+            "system:recover",
+        ),
+        (
+            "session.interactive_open",
+            r#"{"selector":"COM0","owner":"system:x"}"#,
+            "owner",
+            "system:x",
+        ),
+    ] {
+        let before_effects = r.side_effect_fingerprint();
+        let before_tx = r.device(REAL_A).tx_len();
+        let before_registry = r.registry.len();
+        let before_pending = r.registry.pending(&session_id);
+        let before_queue = r.mgr.session_queue_lens("COM0");
+        let response = r.call(method, params);
+        r.settle();
+        assert_eq!(
+            j(&response),
+            wp51_reserved_source_response(&r, field, raw_source)
+        );
+        assert_eq!(r.side_effect_fingerprint(), before_effects, "{method}");
+        assert_eq!(r.device(REAL_A).tx_len(), before_tx, "{method} 零 UART TX");
+        assert_eq!(r.registry.len(), before_registry, "{method} 不建立 command");
+        assert_eq!(r.registry.pending(&session_id), before_pending, "{method}");
+        assert_eq!(r.mgr.session_queue_lens("COM0"), before_queue, "{method}");
+    }
+
+    let opened = r.call(
+        "session.interactive_open",
+        r#"{"selector":"COM0","owner":"human"}"#,
+    );
+    let interactive_id = s(&opened, "interactive_id").to_string();
+    let status = r.call(
+        "session.interactive_status",
+        &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+    );
+    assert_eq!(s(&status, "owner"), "human", "interactive owner 不正規化");
+    assert_eq!(
+        r.call(
+            "session.interactive_close",
+            &format!(r#"{{"interactive_id":"{interactive_id}"}}"#)
+        )
+        .get("ok"),
+        Some(&PyValue::Bool(true))
+    );
+    let released = r.call("device.release", r#"{"selector":"COM0","source":"human"}"#);
+    assert_eq!(
+        released.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&released)
+    );
+    assert_eq!(s(&released, "source"), "human:cli");
+    assert_eq!(s(&released, "source_normalized_from"), "human");
+}
+
+#[test]
 fn submit_bad_timeout_raises_before_selector_check() {
     let r = ServiceRig::ready_shell();
     let e = r.call_err(
