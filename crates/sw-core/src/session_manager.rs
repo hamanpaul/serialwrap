@@ -58,6 +58,9 @@ use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 
+/// P8 Task 9：`SessionManager::send_control` 對 control lane 的送出等待上限（lane 有界；滿時不無限阻塞 flash 路徑）。
+const FLASH_CONTROL_SEND_WAIT: Duration = Duration::from_secs(2);
+
 /// P8 Task 8：flash 偵測候選（`collect_flash_candidates_and_mark` 的輸出；Task 9 `detect_mcu_line` 消費）。
 /// 欄位對照 Python 候選 dict `{com, by_id, real_path, command_capable}`；`real_path` 查無裝置時為 `None`。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3222,20 +3225,39 @@ impl SessionManager {
     /// P8 Task 9：COM 目前 bridge（Fence 的 `active_epoch`＝actor 的 `conn_epoch`）的 TxWriter；無 active epoch 或該
     /// epoch 的 worker 已收尾 → `None`。FlashCoordinator 以此送 `FlashProbe`／`Flash` TX（permit 仍由 Fence 驗 epoch）。
     pub fn tx_for(&self, com: &str) -> Option<TxWriterHandle> {
-        let _ = com;
-        todo!("P8-T9")
+        let (epoch, workers) = self.active_workers(com)?;
+        let w = lock(&workers);
+        w.get(&epoch).map(|worker| worker.tx().clone())
     }
 
     /// P8 Task 9：COM 目前 bridge 的序列線控制（`/dev/ttyMCU` baud 鏡射）；取值規則同 [`SessionManager::tx_for`]。
     pub fn line_control_for(&self, com: &str) -> Option<Arc<dyn sw_pal::traits::SerialLineControl>> {
-        let _ = com;
-        todo!("P8-T9")
+        let (epoch, workers) = self.active_workers(com)?;
+        let w = lock(&workers);
+        w.get(&epoch).map(IoWorker::line_control)
     }
 
-    /// P8 Task 9：把 control 事件送進 COM 的 actor（flash 事件）；查無 session 或送出失敗回 false。
+    /// P8 Task 9：把 control 事件送進 COM 的 actor（flash 事件）；查無 session 或送出失敗（含 control lane 滿到
+    /// `FLASH_CONTROL_SEND_WAIT` 仍送不進）回 false。不檢查 epoch：結束事件（Released／HolderGone）在 bridge 失效後仍須
+    /// 送達以清 flash 狀態，epoch／probe_id 由 actor 驗證。
     pub fn send_control(&self, com: &str, ev: ControlEvent) -> bool {
-        let _ = (com, ev);
-        todo!("P8-T9")
+        let actor = lock(&self.shared.inner)
+            .sessions
+            .values()
+            .find(|e| e.profile.com == com)
+            .map(|e| e.actor.clone());
+        match actor {
+            Some(actor) => actor.control.send_timeout(ev, FLASH_CONTROL_SEND_WAIT).is_ok(),
+            None => false,
+        }
+    }
+
+    /// COM 的 Fence `active_epoch`（＝actor 的 `conn_epoch`）與 worker 表；無 active epoch 回 `None`。
+    fn active_workers(&self, com: &str) -> Option<(u64, Arc<Mutex<HashMap<u64, IoWorker>>>)> {
+        let inner = lock(&self.shared.inner);
+        let e = inner.sessions.values().find(|e| e.profile.com == com)?;
+        let epoch = e.fence.with(|f| f.active_epoch)?;
+        Some((epoch, e.workers.clone()))
     }
 
     /// P8 Task 9：經 manager 的 WARNING 出口寫一行（FlashCoordinator／FlashEndpoint 用）。

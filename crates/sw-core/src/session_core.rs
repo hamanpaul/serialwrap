@@ -738,8 +738,11 @@ impl SessionCore {
                     self.device_present = false;
                     self.known_real_path = None;
                 }
+                // P8 Task 9（編排者裁決 2026-11-08）：manager 已標 flash-critical、ProbeStart 尚未到時對齊 Python 略過。
                 // P8 Task 8（SC-32）：Probe／FLASHING 期間延後到 flash 結束後再 reconcile（#83 RACE-2）。
-                if by_id != self.profile.device_by_id || !self.flash_defer_detach(reason) {
+                let own = by_id == self.profile.device_by_id;
+                let skipped = own && self.flash_critical_skips_detach();
+                if !skipped && (!own || !self.flash_defer_detach(reason)) {
                     effects.0.extend(self.device_detached(&by_id, reason, now));
                 }
             }

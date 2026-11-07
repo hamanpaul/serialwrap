@@ -12,6 +12,7 @@
 //!   `flash_mode`；只解除同一 probe（舊 probe 的遲到事件忽略）。
 //! - SC-32（Rust-only）：Probe／FLASHING 期間 `UartIoError` 照常進 Two-Phase Drain（→ RECOVERING）；`DeviceDetached`
 //!   延後到 flash 結束後再 reconcile（等價 Python `_detach_by_id` 對 flash busy 的略過，#83 RACE-2）。
+//! - P8 Task 9（編排者裁決 2026-11-08）：flash-critical 而 probe 窗口尚未開始時的 `DeviceDetached` 與 Python 相同直接略過。
 
 use super::*;
 
@@ -168,6 +169,19 @@ impl SessionCore {
         self.deps.fence.with(|f| f.flash_mode = FlashMode::Off);
         self.human.ownership.flash_mode = false;
         self.flash_prev_state = None;
+    }
+
+    /// 編排者裁決（2026-11-08，rulings/s2.md「P8 T8 的兩項 SPEC-GAP」）：manager 已標 flash-critical
+    /// （`collect_flash_candidates_and_mark` 之後）而 probe 窗口尚未開始時的 `DeviceDetached` 對齊 Python 略過——
+    /// `session_manager.py:4443-4455` `_detach_by_id` 以 `_flash_busy_locked`（含 `_flash_critical_coms`）過濾 target，
+    /// 不 drain、不延後（flash 結束後也不補做；Python 只在下一次裝置變化時才 reconcile）。只對候選狀態（READY／
+    /// ATTACHED）生效：manager「先標記後取快照」期間短暫被標記的非候選 session 不受影響（Python 只標記候選）。
+    pub(super) fn flash_critical_skips_detach(&self) -> bool {
+        matches!(self.state, SessionState::Ready | SessionState::Attached)
+            && self
+                .deps
+                .fence
+                .with(|f| f.flash_critical && f.flash_mode == FlashMode::Off)
     }
 
     /// SC-32：Probe／FLASHING 期間的 `DeviceDetached` 延後（只記原因，不 drain、不改狀態）；回 true 表示已延後。

@@ -45,6 +45,7 @@
 //! }
 //! ```
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 use sw_pal::traits::{Clock, UartExclusive};
@@ -63,6 +64,22 @@ pub fn watch_flasher_disconnect(
     poll: Duration,
     max: Duration,
 ) {
-    let _ = (excl, slave_path, run, clock, poll, max);
-    todo!("P8-T9")
+    let max_ns = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+    let poll_ns = u64::try_from(poll.as_nanos()).unwrap_or(u64::MAX);
+    let deadline = clock.mono_ns().saturating_add(max_ns);
+    let mut armed = false;
+    while !run.is_cancelled() && clock.mono_ns() < deadline {
+        // Python 以 `except Exception: pids = []` 吸收掃描例外。
+        let pids = catch_unwind(AssertUnwindSafe(|| excl.probe_holders(slave_path).pids)).unwrap_or_default();
+        if !pids.is_empty() {
+            armed = true;
+        } else if armed {
+            break; // 曾連上、現在斷了 → flasher 結束
+        }
+        let next = clock.mono_ns().saturating_add(poll_ns);
+        if !run.wait_until(clock, next) {
+            break; // 本次 run 已取消
+        }
+    }
+    run.cancel();
 }

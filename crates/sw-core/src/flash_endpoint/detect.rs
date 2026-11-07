@@ -18,7 +18,11 @@ pub enum DetectStatus {
 impl DetectStatus {
     /// Python `DetectResult.status` 字串（`mcu.status` 的 `last_detect.status`）。
     pub fn as_str(&self) -> &'static str {
-        todo!("P8-T9")
+        match self {
+            DetectStatus::Matched => "matched",
+            DetectStatus::Ambiguous => "ambiguous",
+            DetectStatus::None => "none",
+        }
     }
 }
 
@@ -41,6 +45,32 @@ pub trait ProbeTransport {
 
 /// Python `detect_mcu_line(candidates, registry, transport)`。
 pub fn detect_mcu_line(cands: &[FlashCandidate], reg: &McuPatternRegistry, t: &mut dyn ProbeTransport) -> DetectResult {
-    let _ = (cands, reg, t);
-    todo!("P8-T9")
+    // 步驟 1：排除 command_capable console（例如已被 broker 佔用的 terminal）。
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for c in cands.iter().filter(|c| !c.command_capable) {
+        let Some(by_id) = c.by_id.as_deref() else {
+            continue;
+        };
+        // 步驟 2：逐 pattern 嘗試，首個命中即停止（同一候選不重複計入）。
+        for p in reg.all() {
+            if t.probe(by_id, &p.probe, &p.expect, p.timeout_ms) {
+                hits.push((by_id.to_string(), p.family.clone()));
+                break;
+            }
+        }
+    }
+    // 步驟 3：依命中數回傳結果。
+    match hits.len() {
+        0 => DetectResult { status: DetectStatus::None, by_id: None, family: None, hits: Vec::new() },
+        1 => {
+            let (by_id, family) = hits.remove(0);
+            DetectResult { status: DetectStatus::Matched, by_id: Some(by_id), family: Some(family), hits: Vec::new() }
+        }
+        _ => DetectResult {
+            status: DetectStatus::Ambiguous,
+            by_id: None,
+            family: None,
+            hits: hits.into_iter().map(|(b, _)| b).collect(),
+        },
+    }
 }

@@ -6,7 +6,8 @@
 
 use std::time::Duration;
 
-use sw_pal::console_pty::ConsoleIo;
+use sw_pal::console_pty::{ConsoleIo, Readiness};
+use sw_pal::traits::ReadOutcome;
 
 use super::coordinator::FlashRunCancel;
 
@@ -20,6 +21,27 @@ pub fn pump_endpoint_to_sink(
     chunk: usize,
     select: Duration,
 ) {
-    let _ = (master, sink, run, chunk, select);
-    todo!("P8-T9")
+    let mut buf = vec![0u8; chunk.max(1)];
+    while !run.is_cancelled() {
+        match master.wait_readable(Some(select)) {
+            // 等價 `select` 的 OSError。
+            Err(_) => return,
+            Ok(Readiness::Ready) => {}
+            // 逾時或被本次 run 的取消喚醒：回到迴圈頂端檢查取消。
+            Ok(Readiness::TimedOut | Readiness::Woken) => continue,
+        }
+        match master.read(&mut buf, Some(Duration::ZERO)) {
+            Ok(ReadOutcome::Data(n)) => {
+                if !sink(&buf[..n]) {
+                    return; // NotSubmitted／TX 失敗：bridge 中途掉線，讓上層 exit flashing 收尾
+                }
+            }
+            // EOF：flasher 已關閉端點（daemon 持 slave keepalive 時通常不會發生）。
+            Ok(ReadOutcome::Eof) => return,
+            // 讀與等待之間的喚醒：回到迴圈頂端檢查取消。
+            Ok(ReadOutcome::Woken) => continue,
+            // 可讀卻讀不到（EAGAIN，等價 `BlockingIOError`）或讀取錯誤：Python 一律結束 pump。
+            Ok(ReadOutcome::TimedOut) | Err(_) => return,
+        }
+    }
 }
