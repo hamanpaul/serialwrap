@@ -1281,6 +1281,8 @@ impl SessionCore {
                     f.owner_gen = self.generations.owner_gen;
                     f.fsm_gen = self.generations.fsm_gen;
                 });
+                // P8 Task 5：與 fence 凍結同處喚醒檔案傳輸等待（不動 login run 的取消世代）。
+                self.deps.rx.cancel_transfer_runs();
                 if !already_released {
                     self.set_state(SessionState::Recovering, now);
                 }
@@ -1341,6 +1343,9 @@ impl SessionCore {
             f.owner_gen = self.generations.owner_gen;
             f.fsm_gen = self.generations.fsm_gen;
         });
+        // P8 Task 5（brief 不符 #1）：drain Phase 1 喚醒進行中的檔案傳輸等待（`RunCancel::watching_transfers`），
+        // 其 TX 已由上方凍結擋下；不呼叫 `cancel_login_runs`（P7 login 行為不變）。
+        self.deps.rx.cancel_transfer_runs();
         let code = if kind == StopKind::Shutdown {
             "FLUSHED_BY_SHUTDOWN"
         } else {

@@ -140,7 +140,8 @@ impl RxShared {
     /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
     /// 不動 login run 的取消世代（P7 SC-30 行為不變）。
     pub fn cancel_transfer_runs(&self) {
-        todo!("P8-T5")
+        self.transfer_cancel_gen.fetch_add(1, Ordering::AcqRel);
+        self.wake_all();
     }
 
     /// SC-30：取消本 bridge 上所有既存的 login run（其 `RunCancel::is_triggered` 轉真）並喚醒等待者。
@@ -871,9 +872,17 @@ impl RunCancel {
         }
     }
 
-    /// P8 Task 5：同一取消旗標與 login 世代，另監看 [`RxShared::cancel_transfer_runs`]（自呼叫當下起）。
+    /// P8 Task 5：同一取消旗標與 login 世代，另監看 [`RxShared::cancel_transfer_runs`]（自呼叫當下起；本身已在監看時
+    /// 沿用原起點，不遮蔽已發生的取消）。
     pub fn watching_transfers(&self) -> RunCancel {
-        todo!("P8-T5")
+        RunCancel {
+            flag: Arc::clone(&self.flag),
+            rx: Arc::clone(&self.rx),
+            start_gen: self.start_gen,
+            transfer_gen: self
+                .transfer_gen
+                .or_else(|| Some(self.rx.transfer_cancel_gen.load(Ordering::Acquire))),
+        }
     }
     /// 設旗標並喚醒等待中的 `wait_for_regex_cancellable`（P7 Task 3 先行；Task 7 由 `Effect::CancelLogin` 觸發）。
     pub fn trigger(&self) {
@@ -883,6 +892,9 @@ impl RunCancel {
     pub fn is_triggered(&self) -> bool {
         self.flag.load(Ordering::Acquire)
             || self.rx.run_cancel_gen.load(Ordering::Acquire) != self.start_gen
+            || self
+                .transfer_gen
+                .is_some_and(|start| self.rx.transfer_cancel_gen.load(Ordering::Acquire) != start)
     }
 }
 
