@@ -1205,6 +1205,7 @@ fn boot_banner_invalidates_old_fsm_and_owner_generations() {
                 log: false,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             }
         )),
         Err(FenceReject::OwnerMismatch)

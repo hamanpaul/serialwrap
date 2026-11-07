@@ -444,6 +444,11 @@ fn dispatch(
         MailboxItem::Control(ControlEvent::Timer(_)) => (None, "Timer"),
         MailboxItem::Control(ControlEvent::StateCommitted { .. }) => (None, "StateCommitted"),
         MailboxItem::Control(ControlEvent::Tick) => (None, "Tick"),
+        // P8 Task 8：flash 事件的 `FlashReply` 隨事件移入 core；panic 時被丟棄，呼叫端以通道斷線收斂。
+        MailboxItem::Control(ControlEvent::FlashSyncProbeStart { .. }) => (None, "FlashSyncProbeStart"),
+        MailboxItem::Control(ControlEvent::FlashProbeReleased { .. }) => (None, "FlashProbeReleased"),
+        MailboxItem::Control(ControlEvent::FlashSyncMatched { .. }) => (None, "FlashSyncMatched"),
+        MailboxItem::Control(ControlEvent::FlashHolderGone { .. }) => (None, "FlashHolderGone"),
         MailboxItem::Data(_) => (None, "Data"),
     };
 

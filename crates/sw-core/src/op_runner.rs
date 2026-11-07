@@ -430,6 +430,7 @@ fn send(
         // 07 D-03：06 既有 permit 建構點一律 `None`。
         input_epoch: None,
         replay_hold: None,
+        probe_id: None,
     };
     let frozen = TxReport {
         op_id: grant.op_id,

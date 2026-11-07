@@ -109,6 +109,7 @@ fn job(
                 log,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             },
             payload: payload.to_vec(),
             reply: tx,
@@ -132,6 +133,7 @@ fn send(r: &Rig, class: TxClass, op: u64, epoch: u64, payload: &[u8]) -> TxRepor
                 log: true,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             },
             payload: payload.to_vec(),
             reply: tx,
@@ -586,6 +588,7 @@ fn gate_rules() {
                 log: true,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             };
             let got = f.with(|s| Fence::admit(s, &p));
             assert_eq!(got, row.expect, "列={} class={class:?}", row.name);
@@ -677,6 +680,7 @@ fn unknown_meta_wal_failure_is_recorded_as_evidence_gap() {
     assert_eq!((op.wal_gaps[0].dir, op.wal_gaps[0].len), ("META", 0));
 }
 
+/// P8 Task 8 後：`TxPermit.probe_id` 為 probe 身分；`probe_id: None` 的 FlashProbe 即使 `op_id` 等於 probe id 仍被拒。
 #[test]
 fn flash_probe_does_not_reuse_op_id_as_probe_identity() {
     let fence = Fence::new();
@@ -695,8 +699,150 @@ fn flash_probe_does_not_reuse_op_id_as_probe_identity() {
         log: true,
         input_epoch: None,
         replay_hold: None,
+        probe_id: None,
     };
     assert_eq!(fence.with(|state| Fence::admit(state, &permit)), Err(FenceReject::Flash));
+}
+
+// ---------------------------------------------------------------------------
+// P8 Task 8：Fence 的 flash 規則表（09 計畫 Task 8「Fence 規則」6 列；`TxPermit.probe_id`）
+// ---------------------------------------------------------------------------
+
+/// flash 規則表用 permit（epoch 7、op 1、source "flash"）。
+fn flash_permit(class: TxClass, probe_id: Option<u64>) -> TxPermit {
+    TxPermit {
+        op_id: OpId(1),
+        epoch: 7,
+        owner_gen: 0,
+        fsm_gen: 0,
+        class,
+        source: "flash".into(),
+        cmd_id: None,
+        log: true,
+        input_epoch: None,
+        replay_hold: None,
+        probe_id,
+    }
+}
+
+fn admit_with(mode: FlashMode, p: &TxPermit) -> Result<(), FenceReject> {
+    let fence = Fence::new();
+    fence.with(|s| {
+        s.active_epoch = Some(7);
+        s.flash_mode = mode;
+    });
+    fence.with(|s| Fence::admit(s, p))
+}
+
+/// 經真 TxWriter（FakeDevice＋WAL）送出指定 permit。
+fn send_flash(r: &Rig, op: u64, class: TxClass, probe_id: Option<u64>, payload: &[u8]) -> TxReport {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let mut permit = flash_permit(class, probe_id);
+    permit.op_id = OpId(op);
+    r.h.jobs.send(TxJob { permit, payload: payload.to_vec(), reply: tx }).unwrap();
+    rx.recv_timeout(Duration::from_secs(2)).unwrap()
+}
+
+#[test]
+fn probe_permit_with_matching_id_admitted_in_probe_mode() {
+    // 表列 1：Probe(id)＋FlashProbe＋probe_id == Some(id) → Ok。
+    assert_eq!(admit_with(FlashMode::Probe(5), &flash_permit(TxClass::FlashProbe, Some(5))), Ok(()));
+    // 黑箱：真 TxWriter 送出、DUT 收到 bytes、WAL 記 TX source "flash"。
+    let r = rig();
+    r.fence.with(|s| s.flash_mode = FlashMode::Probe(5));
+    let rep = send_flash(&r, 1, TxClass::FlashProbe, Some(5), b"\x55\x55");
+    assert_eq!(rep.result.outcome, TxOutcome::Completed(2));
+    assert_eq!(rep.reject, None);
+    assert_eq!(r.dev.take_tx(), b"\x55\x55".to_vec());
+    let txs = tx_lens(&r);
+    assert_eq!(txs.len(), 1);
+    assert!(txs[0].contains("\"source\":\"flash\""), "{}", txs[0]);
+}
+
+#[test]
+fn stale_probe_id_rejected() {
+    // 表列 2：Probe(id)＋FlashProbe 但 probe_id 為 None 或不等於 id（上一個 probe 的 stale permit）→ Err(Flash)。
+    assert_eq!(admit_with(FlashMode::Probe(5), &flash_permit(TxClass::FlashProbe, Some(4))), Err(FenceReject::Flash));
+    assert_eq!(admit_with(FlashMode::Probe(5), &flash_permit(TxClass::FlashProbe, None)), Err(FenceReject::Flash));
+    // op_id 與 probe_id 數值相同也不得代替 probe 身分。
+    let mut p = flash_permit(TxClass::FlashProbe, None);
+    p.op_id = OpId(5);
+    assert_eq!(admit_with(FlashMode::Probe(5), &p), Err(FenceReject::Flash));
+    // 黑箱：零 TX、WAL 無紀錄。
+    let r = rig();
+    r.fence.with(|s| s.flash_mode = FlashMode::Probe(5));
+    let rep = send_flash(&r, 1, TxClass::FlashProbe, Some(4), b"\x55\x55");
+    assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+    assert_eq!(rep.reject, Some(FenceReject::Flash));
+    assert!(r.dev.take_tx().is_empty());
+    assert!(tx_lens(&r).is_empty());
+}
+
+#[test]
+fn flash_class_rejected_in_probe() {
+    // 表列 3：Probe(_)＋任何非 FlashProbe（含 Flash）→ Err(Flash)；帶相符 probe_id 也一樣。
+    for &class in ALL_CLASSES.iter().filter(|c| **c != TxClass::FlashProbe) {
+        for probe_id in [None, Some(5)] {
+            assert_eq!(
+                admit_with(FlashMode::Probe(5), &flash_permit(class, probe_id)),
+                Err(FenceReject::Flash),
+                "class={class:?} probe_id={probe_id:?}"
+            );
+        }
+    }
+    let r = rig();
+    r.fence.with(|s| s.flash_mode = FlashMode::Probe(5));
+    let rep = send_flash(&r, 1, TxClass::Flash, Some(5), b"\x01\x02");
+    assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+    assert!(r.dev.take_tx().is_empty());
+    assert!(tx_lens(&r).is_empty());
+}
+
+#[test]
+fn flash_admitted_when_flashing() {
+    // 表列 4：Flashing＋Flash → Ok（P5 既有）。
+    assert_eq!(admit_with(FlashMode::Flashing, &flash_permit(TxClass::Flash, None)), Ok(()));
+    let r = rig();
+    r.fence.with(|s| s.flash_mode = FlashMode::Flashing);
+    let rep = send_flash(&r, 1, TxClass::Flash, None, b"\x01\x02\x03");
+    assert_eq!(rep.result.outcome, TxOutcome::Completed(3));
+    assert_eq!(r.dev.take_tx(), b"\x01\x02\x03".to_vec());
+}
+
+#[test]
+fn flashprobe_rejected_when_flashing() {
+    // 表列 5：Flashing＋非 Flash（含 FlashProbe，即使帶 probe_id）→ Err(Flash)。
+    for probe_id in [None, Some(5)] {
+        assert_eq!(
+            admit_with(FlashMode::Flashing, &flash_permit(TxClass::FlashProbe, probe_id)),
+            Err(FenceReject::Flash),
+            "probe_id={probe_id:?}"
+        );
+    }
+    let r = rig();
+    r.fence.with(|s| s.flash_mode = FlashMode::Flashing);
+    let rep = send_flash(&r, 1, TxClass::FlashProbe, Some(5), b"\x55\x55");
+    assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+    assert!(r.dev.take_tx().is_empty());
+    assert!(tx_lens(&r).is_empty());
+}
+
+#[test]
+fn flash_rejected_when_off() {
+    // 表列 6：Off＋Flash／FlashProbe → Err(Flash)（帶任何 probe_id 皆然）。
+    for class in [TxClass::Flash, TxClass::FlashProbe] {
+        for probe_id in [None, Some(0), Some(5)] {
+            assert_eq!(
+                admit_with(FlashMode::Off, &flash_permit(class, probe_id)),
+                Err(FenceReject::Flash),
+                "class={class:?} probe_id={probe_id:?}"
+            );
+        }
+    }
+    let r = rig();
+    let rep = send_flash(&r, 1, TxClass::FlashProbe, Some(0), b"\x55");
+    assert_eq!(rep.result.outcome, TxOutcome::NotSubmitted);
+    assert!(r.dev.take_tx().is_empty());
 }
 
 #[test]
@@ -1038,6 +1184,7 @@ fn cancelled_ops_bounded_512_fifo() {
         log: true,
         input_epoch: None,
         replay_hold: None,
+        probe_id: None,
     };
     fence.with(|s| {
         assert_eq!(Fence::admit(s, &permit(1)), Ok(()), "最舊者被淘汰");

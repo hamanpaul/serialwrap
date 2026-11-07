@@ -8,6 +8,8 @@
 #![allow(dead_code)]
 
 pub mod fake_shell;
+/// P8 Task 8：FLASHING 仲裁測試 kit（`kit`＝CoreHarness、`bb`＝ActorRig 黑箱零 TX 證據）。
+pub mod flash_core;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -1581,6 +1583,15 @@ impl ActorRig {
     /// Task 14：直接投遞 control 事件（例如另一路徑的 `DeviceAttached`）。
     pub fn send_control(&self, ev: ControlEvent) {
         let _ = self.actor.control.send(ev);
+    }
+
+    /// P8 Task 8：現行 bridge 的 TxWriter handle（模擬 FlashCoordinator 經 `tx_for` 送 FlashProbe／Flash TX）。
+    pub fn tx_handle(&self) -> TxWriterHandle {
+        self.current_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("尚未開出 bridge")
     }
 
     /// Task 14（R1-F8）：現行 worker 的 TX 帳本 gauge。
@@ -3178,6 +3189,7 @@ impl TxRig {
             log: true,
             input_epoch,
             replay_hold: None,
+            probe_id: None,
         }
     }
     /// class HumanReplay、`input_epoch` Some、`replay_hold` Some(hold)（07 D-22）。

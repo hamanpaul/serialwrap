@@ -882,6 +882,7 @@ fn stale_reply_context_rejected_after_release() {
         log: true,
         input_epoch: None,
         replay_hold: None,
+        probe_id: None,
     };
     assert_eq!(
         h.fence

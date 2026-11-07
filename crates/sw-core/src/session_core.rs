@@ -48,8 +48,45 @@ use crate::wal::WalWriter;
 
 /// P6 Task 6：human console 狀態機（分檔，見 `session_core/console.rs`）。
 mod console;
+/// P8 Task 8：FLASHING 仲裁（分檔，見 `session_core/flash.rs`）。
+mod flash;
 /// P6 Task 7：interactive lease 差量（分檔，見 `session_core/lease_p6.rs`）。
 mod lease_p6;
+
+/// P8 Task 8：flash 認線 probe 的身分（FlashCoordinator 單調遞增配號；`TxPermit.probe_id` 與 `FlashMode::Probe` 共用）。
+pub type ProbeId = u64;
+
+/// P8 Task 8：`FlashSyncProbeStart`／`FlashSyncMatched` 的拒絕原因（09 計畫 Task 8 狀態轉移表）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlashReject {
+    /// profile 為 command_capable（非 flash 候選）。
+    CommandCapable,
+    /// 狀態不在 {READY, ATTACHED}。
+    BadState(SessionState),
+    /// RELEASED 轉移中的競態（release 已登記但尚未離開候選態）。
+    Released,
+    /// recovering 旗標為真。
+    Recovering,
+    /// Two-Phase Drain 進行中。
+    DrainInProgress,
+    /// 前景槽占用（SC-14）。
+    ForegroundBusy,
+    /// 已有 probe 或 FLASHING（fence `flash_mode != Off`）。
+    FlashAlreadyActive,
+    /// `FlashSyncMatched` 的 probe_id 與目前 `Probe(id)` 不符。
+    ProbeMismatch,
+}
+
+/// P8 Task 8：probe 授權（`epoch`＝授權當下的 `active_epoch`，TX permit 須帶同一 epoch）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeGrant {
+    pub epoch: u64,
+    pub probe_id: ProbeId,
+}
+
+/// P8 Task 8：flash 事件的回覆通道（P5 `Reply` 固定為 `Result<PyDict, PyErr>`，故另立；容量由呼叫端決定，actor 以
+/// `try_send` 回覆、永不阻塞）。
+pub type FlashReply<T> = crossbeam_channel::Sender<T>;
 
 /// daemon stderr／state.json 相關通知（Task 0 骨架型別）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -854,6 +891,19 @@ impl SessionCore {
             }
             MailboxItem::Control(ControlEvent::HumanTxCompleted { tag, report }) => {
                 effects.0.extend(self.human_tx_completed(tag, report, now));
+            }
+            // P8 Task 8 FLASHING 仲裁（`session_core/flash.rs`）。
+            MailboxItem::Control(ControlEvent::FlashSyncProbeStart { probe_id, reply }) => {
+                effects.0.extend(self.flash_probe_start(probe_id, reply, now));
+            }
+            MailboxItem::Control(ControlEvent::FlashProbeReleased { probe_id }) => {
+                effects.0.extend(self.flash_probe_released(probe_id, now));
+            }
+            MailboxItem::Control(ControlEvent::FlashSyncMatched { probe_id, reply }) => {
+                effects.0.extend(self.flash_sync_matched(probe_id, reply, now));
+            }
+            MailboxItem::Control(ControlEvent::FlashHolderGone { probe_id, reply }) => {
+                effects.0.extend(self.flash_holder_gone(probe_id, reply, now));
             }
         }
         if std::mem::take(&mut self.hold_release_kick) && !self.fg_slot_busy() {

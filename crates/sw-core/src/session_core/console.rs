@@ -397,6 +397,7 @@ impl SessionCore {
             log: true,
             input_epoch: Some(tag.input_epoch),
             replay_hold: hold,
+            probe_id: None,
         };
         self.human.lane.set_in_flight(InFlightJob {
             tag: tag.clone(),

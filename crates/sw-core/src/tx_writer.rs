@@ -61,6 +61,9 @@ pub struct TxPermit {
     pub input_epoch: Option<u64>,
     /// P6 增補 #3（07 D-22）：只有 HumanReplay 為 `Some(hold_id)`，其餘一律 `None`。
     pub replay_hold: Option<u64>,
+    /// P8 Task 8（09 計畫 Fence 規則表）：只有 `FlashProbe` 為 `Some(probe_id)`（認線 probe 的身分，不以 `op_id` 代替），
+    /// 其餘一律 `None`；`Fence::admit` 只在 `flash_mode == Probe(probe_id)` 時放行該 probe 的 TX。
+    pub probe_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

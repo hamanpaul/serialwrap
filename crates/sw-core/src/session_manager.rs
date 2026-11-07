@@ -58,6 +58,16 @@ use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 
+/// P8 Task 8：flash 偵測候選（`collect_flash_candidates_and_mark` 的輸出；Task 9 `detect_mcu_line` 消費）。
+/// 欄位對照 Python 候選 dict `{com, by_id, real_path, command_capable}`；`real_path` 查無裝置時為 `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashCandidate {
+    pub com: String,
+    pub by_id: Option<String>,
+    pub real_path: Option<String>,
+    pub command_capable: bool,
+}
+
 /// `SessionManager::new` 的注入依賴（plan 06 Task 16 Produces）。
 pub struct ManagerDeps {
     pub serial: Arc<dyn SerialBackend>,
@@ -1268,6 +1278,7 @@ impl Shared {
                 log: true,
                 input_epoch: None,
                 replay_hold: None,
+                probe_id: None,
             },
             payload: payload.to_vec(),
             reply: reply_tx,
@@ -3130,6 +3141,22 @@ impl SessionManager {
                 }
             })
             .collect()
+    }
+
+    /// P8 Task 8：**原子**收集 flash 偵測候選並標記 flash-critical（Python `collect_flash_candidates_and_mark`，
+    /// `session_manager.py:3265`；#83 RACE-2 final）。候選＝非 command_capable、state ∈ {READY, ATTACHED}、無前景操作。
+    pub fn collect_flash_candidates_and_mark(&self) -> Vec<FlashCandidate> {
+        todo!("P8-T8")
+    }
+
+    /// P8 Task 8：解除 COM 的 flash-critical 標記（Python `unmark_flash_critical`）。
+    pub fn unmark_flash_critical(&self, _com: &str) {
+        todo!("P8-T8")
+    }
+
+    /// P8 Task 8：COM 是否在 flash-critical 臨界區（probe 窗口）。
+    pub fn flash_critical(&self, _com: &str) -> bool {
+        todo!("P8-T8")
     }
 
     /// DeviceWatcher → manager 的事件送端（Delta 轉 `update_devices`、Tick 轉 `on_tick`）。
