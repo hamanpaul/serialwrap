@@ -30,6 +30,7 @@
   - `uart_stdio_bridge` 核准 tree 依序更新為 `f79f330f…`（兩位非實作者審查皆 `BRIDGE: APPROVE`）與 `fa3c2b4b…`（收尾競態修正）。
 - GitHub Pages 排除 `rust-refactor/inventory` 與 `rust-refactor/plans`，修正其中的 `{%` 造成的建置失敗，並以 pytest 在合併前攔截。
 - release workflow 的測試環境對齊 Tests workflow，避免 tag 發布時才失敗。
+- 修正 Windows bundle 建置腳本在 GitHub hosted Windows runner 上印中文時丟 `UnicodeEncodeError`（runner 的 Python stdout 是 cp1252）；`mkbundle_windows.py` 與 `check_win_imports.py` 改為在入口把 stdout／stderr 設為 UTF-8。對 v0.4.0 預演補傳 Windows zip 時發現並修正，v0.4.0 Release 也已補上 Windows zip。
 - CI 與測試可攜性：
   - hosted Windows pytest 修正測試替身、部署版面與 golden 產生器的可攜性，並補齊固定的 Rust 工具鏈；出口證據整合檢查仍由 driver 強制執行。WAL 測試先關閉常駐 writer 再清理暫存目錄，既有內容與輪替斷言不變。
   - hosted Windows Cargo 測試不再假設語系與 ACP：以同機 Python 3.12 取得 Windows 系統訊息與 mbcs 解碼基線，仍比對完整字串與錯誤碼；固定 Rust 內嵌 Unicode 名稱表與安裝資產的 LF 檢出，並加入 autocrlf 位元組回歸測試。
