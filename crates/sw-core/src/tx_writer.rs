@@ -107,6 +107,11 @@ pub struct FenceState {
     /// `Fence::with` 內設 `quiet_active`／`reconfirm_pending` 並清除本欄——對齊 Python `_handle_reboot_command` 在
     /// `_write_lock` 內 arm，下一個 TX job 的出列檢查前 quiet 已生效（審查 F14）。actor 之後只同步 `QuietState`／世代。
     pub reboot_arm_op: Option<OpId>,
+    /// 目前 bridge 的 profile 是否為 passthrough（WP5-3 第 4 項；SC-35、裁決 s2 D2）：`adopt_opened_bridge` 每次
+    /// adopt 明確覆寫，預設 false。Python `agent_gate_active()`（`session_manager.py:814-826`）對 passthrough 固定回
+    /// False，`_push_tx_gate()`（`:778-785`）以此發布 bridge 的 `_gate_quiet`——故只豁免 `Command` 的
+    /// quiet／reconfirm；`quiet_active`／`reconfirm_pending` 與 reboot arming 照記，其他類別與共同拒絕不受影響。
+    pub bridge_passthrough: bool,
 }
 
 /// 撤銷 op 的 tombstone 上限（Python `uart_io._TX_ACCOUNT_MAX`；parity-amendments-2026-10-26 #38）。
@@ -191,6 +196,7 @@ impl Fence {
             replay_auth: None,
             foreground_busy: false,
             reboot_arm_op: None,
+            bridge_passthrough: false,
         })))
     }
 
@@ -233,6 +239,9 @@ impl Fence {
         }
 
         match p.class {
+            // SC-35／裁決 s2 D2：passthrough 的 agent 命令不受 quiet／reconfirm 擋（Python `_gate_quiet` 發布 False）；
+            // 上方 frozen／epoch／cancelled／flash 與下方共同檢查照舊。`FileTransfer` 不取得此豁免。
+            TxClass::Command if st.bridge_passthrough => {}
             TxClass::Command | TxClass::FileTransfer => {
                 if st.quiet_active {
                     return Err(FenceReject::Quiet);

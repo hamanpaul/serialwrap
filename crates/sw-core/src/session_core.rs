@@ -2580,6 +2580,7 @@ impl SessionCore {
         let quiet_active = self.quiet.quiet_active(now);
         let blocks_probe = boot_quiet_blocks_probe(&self.quiet, &self.profile, now);
         let reconfirm_pending = self.quiet.pending;
+        let passthrough = self.is_passthrough();
         self.deps.fence.with(|f| {
             f.active_epoch = Some(epoch);
             f.fsm_gen = self.generations.fsm_gen;
@@ -2589,6 +2590,9 @@ impl SessionCore {
             f.quiet_active = quiet_active;
             f.probe_quiet_exempt = quiet_active && !blocks_probe;
             f.reconfirm_pending = reconfirm_pending;
+            // WP5-3 第 4 項：每次 adopt 明確覆寫 bridge 的 passthrough 屬性（Python `_push_tx_gate` 以
+            // `agent_gate_active()` 發布 `_gate_quiet`，passthrough 固定 False）；profile 只在無 bridge 時可換。
+            f.bridge_passthrough = passthrough;
         });
         let mut effects = vec![Effect::AdoptBridge {
             epoch,

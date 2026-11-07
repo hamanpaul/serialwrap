@@ -1475,6 +1475,114 @@ fn wp53_arm_flag_invalidates_deferred_and_registers_arm_op() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 4 項：passthrough 旗標命令與 SC-35 的底層 TX gate（G3；裁決 s2 D2）。Python
+// `origin/main:sw_core/session_manager.py:814-826` 的 `agent_gate_active()` 對 passthrough 固定回 False，
+// `_push_tx_gate()`（`:778-785`）以此值發布 bridge 的 `_gate_quiet`（`uart_io.py:640` 只擋 `agent`）：
+// 旗標命令照常走 `_handle_reboot_command` 並 `arm_boot_quiet()`（quiet／`ready_reconfirm_pending` 照記），
+// 但 quiet／pending 不擋 passthrough 後續合法 agent TX。
+// ---------------------------------------------------------------------------
+
+/// U-Boot 的重開命令（`reset`）帶旗標：回 `=> ` 完成後，reboot 的 reconfirm 記錄仍保留（fence 與公開狀態，
+/// 不以清空假裝完成 SC-35）；下一筆合法 agent 命令必須真正寫入 UART 並成功，不只是 submit accepted。
+#[test]
+fn wp53_passthrough_flag_followup_tx_not_gated() {
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    h.dev
+        .on_tx_reply(b"reset\n", b"reset\r\nresetting ...\r\n=> ");
+    let id = h.submit_with("reset", |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    assert!(wal_tx_has(&h, b"reset\n"), "旗標命令本身已寫出");
+    // Python `arm_boot_quiet()` 不分 platform：pending 由 False 翻 True；prompt 回來只 `clear_boot_quiet()`。
+    assert!(
+        h.fence.with(|f| f.reconfirm_pending),
+        "fence 保留 reboot 的 reconfirm 記錄"
+    );
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"), "{s:?}");
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true), "{s:?}");
+
+    let submits = h.dev.os_submits();
+    let _ = h.dev.take_tx();
+    h.dev
+        .on_tx_reply(b"printenv\n", b"printenv\r\nbootcmd=x\r\n=> ");
+    let next = h.submit_ok("printenv");
+    let rec = h.wait_done(&next);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("bootcmd=x"), "{rec:?}");
+    assert!(
+        h.dev.os_submits() > submits,
+        "後續 agent 命令必須真正提交到 OS"
+    );
+    assert_eq!(
+        h.dev.take_tx(),
+        b"printenv\n".to_vec(),
+        "UART 實際寫出後續命令"
+    );
+    assert!(wal_tx_has(&h, b"printenv\n"), "WAL 記錄後續命令 TX");
+    assert!(!wp53_recover_keys_sent(&h), "passthrough 不送救援鍵");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// 文字為 `reboot` 的旗標命令在 passthrough 不屬「猜中」（`guessed_reboot = not passthrough and ...`），
+/// 等待期限為 `max(timeout_s, expected or 0)` = 6 s：prompt 3 s 後才回來仍正常完成，不得套兩秒規則。
+#[test]
+fn wp53_passthrough_plain_reboot_flag_uses_full_wait() {
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    h.dev.on_tx_reply(b"reboot\n", b"reboot\r\n");
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"reboot\n");
+    let early = wp53_step_until(&h, start, 3.0, |h| is_done(h, &id));
+    assert_eq!(
+        early,
+        None,
+        "prompt 未回不得結算（兩秒規則不適用 passthrough）：{:?}",
+        h.command_get(&id)
+    );
+    h.inject_rx(b"\r\n=> ");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    assert!(!wp53_recover_keys_sent(&h), "passthrough 不送救援鍵");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// `adopt_opened_bridge` 每次 adopt 都以目前 profile 明確覆寫 fence 的 `bridge_passthrough`（Python
+/// `_push_tx_gate` 每次發布都重算 `agent_gate_active()`）：passthrough 為 true；shell 即使 fence 殘留 true 也覆寫為 false。
+#[test]
+fn wp53_passthrough_adopt_publishes_bridge_flag() {
+    let mut h = CoreHarness::new(UBOOT_PASSTHROUGH_PROFILE);
+    assert!(!h.fence.with(|f| f.bridge_passthrough), "預設 false");
+    h.attach_device();
+    h.bridge_ok();
+    assert!(
+        h.fence.with(|f| f.bridge_passthrough),
+        "passthrough adopt 發布 true"
+    );
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.fence.with(|f| f.bridge_passthrough = true);
+    h.attach_device();
+    h.bridge_ok();
+    assert!(
+        !h.fence.with(|f| f.bridge_passthrough),
+        "shell adopt 明確覆寫為 false"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // recover
 // ---------------------------------------------------------------------------
 

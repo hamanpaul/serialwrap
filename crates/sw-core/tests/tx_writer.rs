@@ -879,6 +879,227 @@ fn wp55_human_line_reboot_still_arms_quiet() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 4 項：passthrough 的 Command 不受 quiet／reconfirm 擋（G3；裁決 s2 D2、SC-35）
+// ---------------------------------------------------------------------------
+
+/// 對照 Python `origin/main:sw_core/session_manager.py:814-826`：`agent_gate_active()` 對 passthrough 固定回 False，
+/// `_push_tx_gate()`（`:778-785`）以此發布 bridge 的 `_gate_quiet`；`uart_io.py:640` 的 quiet 只擋 `agent`。
+/// 故 `bridge_passthrough` 只豁免 `Command` 的 quiet／reconfirm；frozen、stale epoch、cancelled、flash 等共同拒絕
+/// 仍有效；`FileTransfer`、probe 類、救援鍵不取得豁免；非 passthrough（shell）的 `Command` 照舊被擋。
+#[test]
+fn wp53_passthrough_fence_exempts_only_command_quiet_and_reconfirm() {
+    let rows: Vec<GateRow> = vec![
+        gate_row(
+            "passthrough Command+quiet",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+            },
+            Ok(()),
+        ),
+        gate_row(
+            "passthrough Command+reconfirm",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.reconfirm_pending = true;
+            },
+            Ok(()),
+        ),
+        gate_row(
+            "passthrough Command+quiet+reconfirm",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+                s.reconfirm_pending = true;
+            },
+            Ok(()),
+        ),
+        gate_row(
+            "passthrough Command+frozen",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+                s.frozen = true;
+            },
+            Err(FenceReject::Frozen),
+        ),
+        gate_row(
+            "passthrough Command+epoch 不符",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.reconfirm_pending = true;
+                s.active_epoch = Some(6);
+            },
+            Err(FenceReject::StaleEpoch),
+        ),
+        gate_row(
+            "passthrough Command+active_epoch=None",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+                s.active_epoch = None;
+            },
+            Err(FenceReject::StaleEpoch),
+        ),
+        gate_row(
+            "passthrough Command+op 已取消",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.reconfirm_pending = true;
+                s.cancelled.insert(OpId(1));
+            },
+            Err(FenceReject::Cancelled),
+        ),
+        gate_row(
+            "passthrough Command+Flashing",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+                s.flash_mode = FlashMode::Flashing;
+            },
+            Err(FenceReject::Flash),
+        ),
+        gate_row(
+            "passthrough Command+FlashProbe",
+            &[TxClass::Command],
+            |s| {
+                s.bridge_passthrough = true;
+                s.reconfirm_pending = true;
+                s.flash_mode = FlashMode::Probe(9);
+            },
+            Err(FenceReject::Flash),
+        ),
+        gate_row(
+            "passthrough FileTransfer+quiet",
+            &[TxClass::FileTransfer],
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+            },
+            Err(FenceReject::Quiet),
+        ),
+        gate_row(
+            "passthrough FileTransfer+reconfirm",
+            &[TxClass::FileTransfer],
+            |s| {
+                s.bridge_passthrough = true;
+                s.reconfirm_pending = true;
+            },
+            Err(FenceReject::ReconfirmPending),
+        ),
+        gate_row(
+            "passthrough probe 類+quiet",
+            PROBE_CLASSES,
+            |s| {
+                s.bridge_passthrough = true;
+                s.quiet_active = true;
+            },
+            Err(FenceReject::Quiet),
+        ),
+        // 對照組：非 passthrough（預設 false）的 Command 於相同狀態仍拒絕。
+        gate_row(
+            "shell Command+quiet（對照）",
+            &[TxClass::Command],
+            |s| s.quiet_active = true,
+            Err(FenceReject::Quiet),
+        ),
+        gate_row(
+            "shell Command+reconfirm（對照）",
+            &[TxClass::Command],
+            |s| s.reconfirm_pending = true,
+            Err(FenceReject::ReconfirmPending),
+        ),
+    ];
+    for row in rows {
+        for &class in row.classes {
+            let f = Fence::new();
+            assert!(!f.with(|s| s.bridge_passthrough), "預設 false");
+            f.with(|s| {
+                s.active_epoch = Some(7);
+                (row.setup)(s);
+            });
+            let p = TxPermit {
+                op_id: OpId(1),
+                epoch: 7,
+                owner_gen: row.permit_owner_gen,
+                fsm_gen: row.permit_fsm_gen,
+                class,
+                source: "agent".into(),
+                cmd_id: None,
+                log: true,
+                input_epoch: None,
+                replay_hold: None,
+            };
+            let got = f.with(|s| Fence::admit(s, &p));
+            assert_eq!(got, row.expect, "列={} class={class:?}", row.name);
+        }
+    }
+}
+
+/// TxWriter 端到端：passthrough 的旗標 reboot（`reboot_arm_op`）提交後照常武裝 quiet／reconfirm（記錄保留、
+/// 不以清空假裝完成）；隨後 passthrough `Command` 在武裝狀態下真正寫出並留 WAL TX，`FileTransfer` 與
+/// 非 passthrough 的 `Command` 仍零 OS 提交、零 TX、零 WAL。
+#[test]
+fn wp53_passthrough_tx_writer_submits_command_after_reboot_arm() {
+    let r = rig();
+    r.fence.with(|s| {
+        s.bridge_passthrough = true;
+        s.reboot_arm_op = Some(OpId(5));
+    });
+    let (j, rx) = job(5, TxClass::Command, 0, 0, true, b"reset\n");
+    r.h.jobs.send(j).unwrap();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(6), None));
+    assert_eq!(r.dev.take_tx(), b"reset\n");
+    r.fence.with(|s| {
+        assert!(s.quiet_active, "passthrough reboot 提交後仍武裝 quiet");
+        assert!(s.reconfirm_pending, "passthrough reboot 提交後仍武裝 reconfirm");
+        assert_eq!(s.reboot_arm_op, None);
+    });
+
+    let (j, rx) = job(6, TxClass::Command, 0, 0, true, b"printenv\n");
+    r.h.jobs.send(j).unwrap();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!((rep.result.outcome, rep.reject), (TxOutcome::Completed(9), None));
+    assert_eq!(r.dev.take_tx(), b"printenv\n");
+    let lines = tx_lens(&r);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(payload_b64(&lines[1]), b64(b"printenv\n"));
+
+    let cases: [(u64, &str, TxClass, bool, FenceReject); 2] = [
+        (7, "passthrough FileTransfer", TxClass::FileTransfer, true, FenceReject::Quiet),
+        (8, "shell Command", TxClass::Command, false, FenceReject::Quiet),
+    ];
+    for (op, name, class, passthrough, reason) in cases {
+        r.fence.with(|s| {
+            s.bridge_passthrough = passthrough;
+            s.quiet_active = true;
+            s.reconfirm_pending = true;
+        });
+        let submits = r.dev.os_submits();
+        let (j, rx) = job(op, class, 0, 0, true, b"echo no\n");
+        r.h.jobs.send(j).unwrap();
+        let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (rep.result.outcome, rep.reject),
+            (TxOutcome::NotSubmitted, Some(reason)),
+            "{name}"
+        );
+        assert_eq!(r.dev.os_submits(), submits, "{name}：零 OS 提交");
+        assert!(r.dev.take_tx().is_empty(), "{name}：零 TX");
+        assert_eq!(tx_lens(&r).len(), 2, "{name}：零 WAL TX");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 其他 TX 三態、WAL 證據與帳本上限
 // ---------------------------------------------------------------------------
 
