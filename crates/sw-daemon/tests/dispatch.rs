@@ -188,11 +188,15 @@ fn submit_priority_zero_becomes_ten() {
 }
 
 fn wp51_source_reserved_response(r: &ServiceRig, raw_source: &str) -> String {
+    wp51_reserved_source_response(r, "source", raw_source)
+}
+
+fn wp51_reserved_source_response(r: &ServiceRig, field: &str, raw_source: &str) -> String {
     let hint = "`system` 與 `system:*` 是 daemon 內部保留的來源前綴（WAL 歸因與內部恢復旗標），外部呼叫不可使用。自動化請用 `agent:<名>`，人工操作請用 `human:<名>`；逾時行為差異見 skill「`--source` 的語意」。";
     j(&sw_proto::pydict! {
         "ok" => false,
         "error_code" => "SOURCE_RESERVED",
-        "field" => "source",
+        "field" => field,
         "value" => raw_source,
         "reserved_prefix" => "system",
         "hint" => hint,
@@ -563,6 +567,110 @@ fn device_release_reason_is_raw_json() {
     assert_eq!(s(&session, "state"), "RELEASED");
     assert_eq!(jv(session.get("released_reason").unwrap()), "{\"k\":1}");
     assert_eq!(s(&session, "released_by"), "cli", "source 預設 cli");
+}
+
+#[test]
+fn wp51_release_source_policy() {
+    let r = ServiceRig::ready_shell();
+    r.settle();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+
+    for raw_source in ["system", "system:recover"] {
+        let before_effects = r.side_effect_fingerprint();
+        let before_session = r.session("COM0").expect("session 前態");
+        let before_registry = r.registry.len();
+        let before_pending = r.registry.pending(&session_id);
+        let before_queue = r.mgr.session_queue_lens("COM0");
+        let params = format!(r#"{{"selector":"COM0","source":"{raw_source}"}}"#);
+
+        let response = r.call("device.release", &params);
+        r.settle();
+
+        assert_eq!(
+            j(&response),
+            wp51_source_reserved_response(&r, raw_source),
+            "release 必須在 session route 前拒絕：{raw_source}"
+        );
+        assert_eq!(r.side_effect_fingerprint(), before_effects, "{raw_source}");
+        assert_eq!(r.session("COM0").expect("session 後態"), before_session);
+        assert_eq!(r.registry.len(), before_registry, "registry：{raw_source}");
+        assert_eq!(
+            r.registry.pending(&session_id),
+            before_pending,
+            "pending：{raw_source}"
+        );
+        assert_eq!(
+            r.mgr.session_queue_lens("COM0"),
+            before_queue,
+            "queue：{raw_source}"
+        );
+    }
+
+    let missing_selector = r.call(
+        "device.release",
+        r#"{"selector":"","source":"system:recover"}"#,
+    );
+    assert_eq!(
+        j(&missing_selector),
+        format!(
+            "{{\"ok\":false,\"error_code\":\"INVALID_ARGS\",\"version\":\"{}\"}}",
+            r.version
+        ),
+        "release 空 selector 的 INVALID_ARGS 須先於來源檢查"
+    );
+
+    let r = ServiceRig::ready_shell();
+    let response = r.call(
+        "device.release",
+        r#"{"selector":"COM0","source":"human","reason":[null,3,true,{"k":[2,"x"]}]}"#,
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    assert_eq!(
+        keys(&response),
+        [
+            "ok",
+            "session",
+            "closed_consoles",
+            "aborted_cmd",
+            "source",
+            "source_normalized_from",
+            "version"
+        ]
+    );
+    assert_eq!(s(&response, "source"), "human:cli");
+    assert_eq!(s(&response, "source_normalized_from"), "human");
+    assert!(response.get("source_class").is_none());
+    let released = sub(&response, "session");
+    assert_eq!(s(&released, "state"), "RELEASED");
+    assert_eq!(s(&released, "released_by"), "human:cli");
+    assert_eq!(
+        jv(released.get("released_reason").expect("reason")),
+        r#"[null,3,true,{"k":[2,"x"]}]"#
+    );
+
+    let r = ServiceRig::ready_shell();
+    let response = r.call("device.release", r#"{"selector":"COM0","reason":false}"#);
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    assert!(response.get("source").is_none());
+    assert!(response.get("source_normalized_from").is_none());
+    assert!(response.get("source_class").is_none());
+    let released = r.session("COM0").expect("released session");
+    assert_eq!(s(&released, "released_by"), "cli", "省略來源預設為 cli");
+    assert_eq!(
+        jv(released.get("released_reason").expect("reason")),
+        "false",
+        "任意 JSON reason 原樣保存"
+    );
 }
 
 #[test]
@@ -1102,6 +1210,106 @@ fn interactive_status_routes_by_interactive_id() {
         &format!(r#"{{"interactive_id":"{iid}"}}"#),
     );
     assert_eq!(close.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&close));
+}
+
+#[test]
+fn wp51_interactive_owner_policy() {
+    let r = ServiceRig::ready_shell();
+    r.device(REAL_A)
+        .on_tx_reply(b"wp51-initial-command", b"\r\nroot@t:/# ");
+    r.settle();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+
+    let rejected_params = [
+        r#"{"selector":"COM0","owner":"system:x","command":"wp51-initial-command"}"#,
+        r#"{"owner":"system:x"}"#,
+        r#"{"selector":"COM0","owner":"system:x","timeout_s":"invalid"}"#,
+    ];
+    for params in rejected_params {
+        let before_effects = r.side_effect_fingerprint();
+        let before_session = r.session("COM0").expect("session 前態");
+        let before_registry = r.registry.len();
+        let before_pending = r.registry.pending(&session_id);
+        let before_queue = r.mgr.session_queue_lens("COM0");
+
+        let response = r
+            .call_raw("session.interactive_open", params)
+            .expect("保留 owner 須先於 selector／timeout 回傳 SOURCE_RESERVED");
+        r.settle();
+
+        assert_eq!(
+            j(&response),
+            wp51_reserved_source_response(&r, "owner", "system:x"),
+            "owner 保留前綴必須在 session route 前拒絕：{params}"
+        );
+        assert_eq!(r.side_effect_fingerprint(), before_effects, "{params}");
+        assert_eq!(
+            r.session("COM0").expect("session 後態"),
+            before_session,
+            "{params}"
+        );
+        assert_eq!(r.registry.len(), before_registry, "registry：{params}");
+        assert_eq!(
+            r.registry.pending(&session_id),
+            before_pending,
+            "pending：{params}"
+        );
+        assert_eq!(
+            r.mgr.session_queue_lens("COM0"),
+            before_queue,
+            "queue：{params}"
+        );
+    }
+
+    let r = ServiceRig::ready_shell();
+    let opened = r.call(
+        "session.interactive_open",
+        r#"{"selector":"COM0","owner":"human"}"#,
+    );
+    assert_eq!(
+        opened.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&opened)
+    );
+    assert!(opened.get("source").is_none());
+    assert!(opened.get("source_normalized_from").is_none());
+    assert!(opened.get("source_class").is_none());
+    let interactive_id = s(&opened, "interactive_id").to_string();
+    let status = r.call(
+        "session.interactive_status",
+        &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+    );
+    assert_eq!(
+        s(&status, "owner"),
+        "human",
+        "interactive owner human 保持原值"
+    );
+    let closed = r.call(
+        "session.interactive_close",
+        &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+    );
+    assert_eq!(
+        closed.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&closed)
+    );
+
+    let r = ServiceRig::ready_shell();
+    let opened = r.call("session.interactive_open", r#"{"selector":"COM0"}"#);
+    assert_eq!(
+        opened.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&opened)
+    );
+    let interactive_id = s(&opened, "interactive_id").to_string();
+    let status = r.call(
+        "session.interactive_status",
+        &format!(r#"{{"interactive_id":"{interactive_id}"}}"#),
+    );
+    assert_eq!(s(&status, "owner"), "agent", "未指定 owner 預設為 agent");
 }
 
 #[test]

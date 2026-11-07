@@ -27002,6 +27002,8 @@
           "cargo:sw-daemon::dispatch::wal_range_keys_without_truncated",
           "cargo:sw-daemon::dispatch::wal_range_non_int_from_seq_raises",
           "cargo:sw-daemon::dispatch::wal_reset_shape",
+          "cargo:sw-daemon::dispatch::wp51_interactive_owner_policy",
+          "cargo:sw-daemon::dispatch::wp51_release_source_policy",
           "cargo:sw-daemon::dispatch::wp51_submit_failure_has_no_source_annotations",
           "cargo:sw-daemon::dispatch::wp51_submit_normalized_source_reaches_registry",
           "cargo:sw-daemon::dispatch::wp51_submit_reserved_source_rejected_before_queue",

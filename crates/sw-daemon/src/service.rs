@@ -103,7 +103,7 @@ fn cmd_not_found(cmd_id: &str) -> PyDict {
 }
 
 /// 對齊 Python `SerialwrapService._annotate_source`：只在成功回應末端追加來源標註。
-fn annotate_source(mut result: PyDict, check: &SourceCheck) -> PyDict {
+fn annotate_source(mut result: PyDict, check: &SourceCheck, with_class: bool) -> PyDict {
     if !result.get("ok").is_some_and(py_truthy) {
         return result;
     }
@@ -111,7 +111,12 @@ fn annotate_source(mut result: PyDict, check: &SourceCheck) -> PyDict {
         result.insert("source", PyValue::from(check.source.clone()));
         result.insert("source_normalized_from", PyValue::from(normalized_from));
     }
-    result.insert("source_class", PyValue::from(classify_source(&check.source)));
+    if with_class {
+        result.insert(
+            "source_class",
+            PyValue::from(classify_source(&check.source)),
+        );
+    }
     result
 }
 
@@ -394,10 +399,20 @@ impl Service {
                 if selector.is_empty() {
                     return Ok(invalid_args());
                 }
-                let source = p.str_or("source", "cli")?;
+                let raw_source = p.str_or("source", "cli")?;
+                let source_check = check_source(Some(&raw_source), "cli", "source", true);
+                if let Some(error) = source_check.error.as_ref() {
+                    return Ok(error.clone());
+                }
+                let source = source_check.source.clone();
                 // reason 原樣（任意 JSON）進 released_reason。
                 let reason = p.raw("reason").cloned().unwrap_or(PyValue::Null);
-                self.route(&selector, SessionRequest::Release { source, reason }, ROUTE_TIMEOUT)
+                self.route(
+                    &selector,
+                    SessionRequest::Release { source, reason },
+                    ROUTE_TIMEOUT,
+                )
+                .map(|result| annotate_source(result, &source_check, false))
             }
             "device.attach" => {
                 let selector = p.str_or("selector", "")?;
@@ -529,6 +544,11 @@ impl Service {
             "session.interactive_open" => {
                 let selector = selector_chain(&p);
                 let owner = p.str_or("owner", "agent")?;
+                let owner_check = check_source(Some(&owner), "agent", "owner", false);
+                if let Some(error) = owner_check.error.as_ref() {
+                    return Ok(error.clone());
+                }
+                let owner = owner_check.source;
                 let timeout_s = p.float_or("timeout_s", 60.0)?;
                 let command = p.str_or("command", "")?;
                 let allow_attached = p.truthy("allow_attached");
@@ -667,7 +687,7 @@ impl Service {
                 };
                 self.manager
                     .route(&sid, SessionRequest::Submit(req), ROUTE_TIMEOUT)
-                    .map(|result| annotate_source(result, &source_check))
+                    .map(|result| annotate_source(result, &source_check, true))
             }
             "command.get" => {
                 let cmd_id = p.str_or("cmd_id", "")?;
