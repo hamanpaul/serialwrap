@@ -1255,6 +1255,37 @@ def test_judge_attached_legacy_setup(kwargs, verdict):
     assert uc.judge_attached_legacy_setup("attached_legacy_setup", **base)["verdict"] == verdict
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+@pytest.mark.parametrize("key", ["install", "update"])
+def test_judge_attached_legacy_setup_reads_nested_diagnostics(key):
+    """失敗時 legacy_stop 只在 stop_supervisor 步驟、detail 只在報告內，診斷不得遺失。"""
+    legacy = {"holders_status": "partial", "waited_ms": 330150, "uninspectable_procs": [{"pid": 62}]}
+    report = {"steps": [{"step": "stop_supervisor", "detail": {"legacy_stop": legacy}}],
+              "detail": {"waited_ms": 330150, "alive_pids": []}}
+    body = {"ok": False, "error_code": "TIMEOUT", "reason": "legacy_stop_pending", key: report}
+    result = uc.judge_attached_legacy_setup(
+        "attached_legacy_setup", setup_rc=2, body=body, elapsed_s=331.0, status_after=None,
+        old_pids=[101], old_alive_after=[], new_version="0.4.0")
+    assert result["verdict"] == "FAIL"
+    assert result["detail"]["legacy_stop"] == legacy
+    assert result["detail"]["detail"] == report["detail"]
+
+
+@pytest.mark.core_portable
+@pytest.mark.memory_only
+def test_judge_attached_legacy_setup_prefers_top_level_diagnostics():
+    top = {"holders_status": "partial", "waited_ms": 5118}
+    body = {"ok": True, "legacy_stop": top, "detail": {"note": "top"},
+            "install": {"steps": [{"step": "stop_supervisor", "detail": {"legacy_stop": {"waited_ms": 1}}}]}}
+    result = uc.judge_attached_legacy_setup(
+        "attached_legacy_setup", setup_rc=0, body=body, elapsed_s=6.9, status_after={"version": "0.4.0"},
+        old_pids=[101], old_alive_after=[], new_version="0.4.0")
+    assert result["verdict"] == "PASS"
+    assert result["detail"]["legacy_stop"] == top
+    assert result["detail"]["detail"] == {"note": "top"}
+
+
 @pytest.mark.posix_only
 @pytest.mark.process_rpc
 def test_run_upgrade_dry_run_attached_legacy_scenario(tmp_path):

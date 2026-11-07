@@ -525,7 +525,11 @@ def judge_attached_legacy_setup(check_id: str, *, setup_rc: int, body: dict[str,
     reason = None if ok else (
         f"setup rc={setup_rc} error_code={body.get('error_code')} 耗時 {elapsed_s:.1f}s"
         f"（上限 {ATTACHED_LEGACY_MAX_SETUP_S:.0f}s）；舊行程存活={old_alive_after}")
+    # 失敗時 legacy_stop 只在 stop_supervisor 步驟、detail 只在 install／update 報告內；頂層有就用頂層。
+    report = body.get("install") or body.get("update") or {}
+    legacy_stop = body.get("legacy_stop") or _step_detail(body, "stop_supervisor").get("legacy_stop")
+    detail = body.get("detail") or report.get("detail")
     return row(check_id, "PASS" if ok else "FAIL", reason, setup_rc=setup_rc, elapsed_s=round(elapsed_s, 1),
                error_code=body.get("error_code"), reason_code=body.get("reason"), message=body.get("message"),
-               detail=body.get("detail"), legacy_stop=body.get("legacy_stop"), old_pids=old_pids,
+               detail=detail, legacy_stop=legacy_stop, old_pids=old_pids,
                old_alive_after=old_alive_after, daemon_version_after=(status_after or {}).get("version"))
