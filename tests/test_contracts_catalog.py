@@ -1378,7 +1378,6 @@ _MAINLINE_SC_AT_2E642648 = frozenset({
 })
 
 
-@pytest.mark.xfail(strict=True, reason="P8-T1 階段 A：SC-32 尚未登記")
 def test_bc_real_sc_df_ranges() -> None:
     """SC 集合＝整合主線（2e642648）實際目錄 ∪ P8 Task 1 新增的 SC-32；SC-33（OD-79 撤回）與 SC-08（OD-14 #3）不得出現。"""
     changes, _, _ = _bc()
@@ -1437,7 +1436,6 @@ def test_bc_real_sc_df_ranges() -> None:
     assert "merge_oldest" in df22.compatibility_impact and "不得低估" in df22.compatibility_impact
 
 
-@pytest.mark.xfail(strict=True, reason="P8-T1 階段 A：SC-32 尚未登記")
 def test_bc_real_rust_only_python_null() -> None:
     """scope 為 rust_only 者 applies_python_min 為 None，特定 SC 項目為 rust_only（含 P4-T19 的 SC-36、P8-T1 的 SC-32）。"""
     changes, _, _ = _bc()

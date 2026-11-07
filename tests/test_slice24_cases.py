@@ -29,7 +29,6 @@ ACC = ROOT / "tests" / "acceptance"
 BREAKER = ACC / "breaker"
 FREEZE24 = BREAKER / "slice_2.4.json"
 SNAPSHOTS24 = BREAKER / "slice_2.4.snapshots.ndjson"
-STAGE_A = "P8-T1 階段 A：s24 案例、SC-32 與 Slice 2.4 凍結尚未登記"
 
 # Task 1 案例表（brief 修正後）：case_id → (suite, layer, platforms, capabilities, prerequisites, invariants, behavior_changes)
 TABLE: dict[str, tuple[str, str, set[str], set[str], set[str], set[str], set[str]]] = {
@@ -129,7 +128,6 @@ def _revision_key(rev: str) -> tuple[int, ...]:
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_schema_enums_add_only():
     case = json.loads((ACC / "cases.schema.json").read_text(encoding="utf-8"))["$defs"]["case"]["properties"]
     suites, families = set(case["suite"]["enum"]), set(case["family"]["enum"])
@@ -138,7 +136,6 @@ def test_schema_enums_add_only():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_p8_cases_follow_p2_schema_and_slice():
     by_id = _cases()
     assert not (P8_IDS - by_id.keys()), sorted(P8_IDS - by_id.keys())
@@ -154,7 +151,6 @@ def test_p8_cases_follow_p2_schema_and_slice():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_p8_case_rows_match_task1_table():
     by_id = _p8_cases()
     for cid, (suite, layer, platforms, caps, prereqs, invariants, bcs) in sorted(TABLE.items()):
@@ -165,7 +161,6 @@ def test_p8_case_rows_match_task1_table():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_p8_case_windows_status_and_cli_stage_rules():
     """windows_status：platforms 含 windows → native，否則 gap 並附理由；cli_stage：supervision 前置或
     supervisor_runtime 能力 → 1B，其餘 1A（Task 1 共同欄位規則）。"""
@@ -182,7 +177,6 @@ def test_p8_case_windows_status_and_cli_stage_rules():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_p8_case_sources_are_nodeids():
     """source_ref 為 `<路徑>::<測試名>`；contract-blackbox 案例另須符合下游切片分群規則（tests/contract_blackbox/ 或
     crates/ 開頭、全切片唯一，見 tests/test_acceptance_cases.py::_split_contract_blackbox）。evidence 為 pytest 或
@@ -203,7 +197,6 @@ def test_p8_case_sources_are_nodeids():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_owner_rulings_reflected_in_cases():
     by_id = _p8_cases()
     gates = by_id["s24-xfer-session-gates"]
@@ -231,7 +224,6 @@ def _regen_check() -> subprocess.CompletedProcess:
 
 
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_lock_contains_p8_and_never_shrinks():
     r = _regen_check()
     assert r.returncode == 0, r.stderr
@@ -245,7 +237,6 @@ def test_lock_contains_p8_and_never_shrinks():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_new_behavior_changes_registered_and_keep_items_not():
     doc = _catalog()
     bc = {c["id"]: c for c in doc["changes"]}
@@ -270,7 +261,6 @@ def test_new_behavior_changes_registered_and_keep_items_not():
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_reconciliation_table_updated():
     text = (ROOT / "docs/rust-refactor/plans/spec-reconciliation.md").read_text(encoding="utf-8")
     rows = {line.split("|")[1].strip(): line for line in text.splitlines()
@@ -292,7 +282,6 @@ def _effective(path: Path) -> dict:
 
 
 @pytest.mark.memory_only
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_breaker_freeze_matches_lock():
     assert FREEZE24.exists(), "Slice 2.4 凍結檔須由 freeze_slice_cases.py 產生"
     assert SNAPSHOTS24.exists(), "每週快照檔須與凍結檔一併 check-in"
@@ -343,7 +332,6 @@ def _run_breaker(*args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.mark.process_rpc
-@pytest.mark.xfail(strict=True, reason=STAGE_A)
 def test_breaker_cli_does_not_trip_on_frozen_slice24():
     """新凍結檔＋空快照於窗口起點判定：未觸發、未證據不足、未超過 OD-02 上限（OD-60：stage2_estimate_weeks=6）。"""
     assert FREEZE24.exists()

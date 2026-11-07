@@ -11,8 +11,10 @@
 #     issues 為空，與 regression registry 逐筆對拍。
 #   - f10-release-*：補 posix_throwaway_daemon（經 _run_with_handoff 使用 POSIX-only 的 ThrowawayDaemon），與 f10-creds-* 同族。
 #   - win-wal-av-*：evidence 以 scripts/stage0/spike3_win_wal.py 實際產物 <case-id>.json 為準。
+#   - s24-*（P8 Task 1）：suite 新增 rust-l1、family 新增 S24（schema 列舉只增不改）；SC-33 依 OD-79 撤回，原列 SC-33 的案例改列 SC-03；
+#     s24-xfer-abort-on-release 依 OD-62 比照 BC-03；source_ref／evidence 中尚未建立的節點由承接 Task 依此命名建立。
 schema_version: 1
-revision: 2026-11-07.1
+revision: 2026-11-08.1
 spec: docs/rust-refactor/serialwrap-rust-spec-final.md
 invariant_ids: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay, no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
 features:
@@ -5633,4 +5635,605 @@ cases:
   sentinel: null
   evidence: [manifest.json, cli.ndjson, daemon.log, wal/]
   implemented_by: 07-slice22-console.md
+  cross_slice_reason: null
+# --- P8 Slice 2.4 Task 1：s24-* 案例登記（09-slice24-transfer-flash.md Task 1；add-only）。擁有者裁決修正：SC-33 依 OD-79 撤回，s24-xfer-session-gates 改列 SC-03 並依 OD-74 列 DF-02；s24-xfer-abort-on-release 依 OD-62 比照 BC-03（不以 framing EXCEPTION 為契約）。L2／L3／手動一律引用 P2 個別案例，不另造聚合案例。 ---
+- case_id: s24-xfer-templates-golden
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/file_transfer_golden.rs::every_golden_row_matches_python
+  family: S24
+  title: file transfer 板端命令樣板與 RX 判定 helper 與 Python golden 逐列一致
+  contract: 'Rust file_transfer::templates／rx_match 對 contracts/golden/file_transfer.ndjson（scripts/rust/capture_transfer_golden.py 由 Python 基線 sw_core.file_transfer 擷取）逐列一致：probe／chunk／md5／mv／cleanup 板端命令樣板、chunk 切分（空檔恰產生 1 個空 chunk）、base64 編碼無尾端換行與 RX 判定結果；golden 須與現行 Python 基線同步（新鮮度測試重跑擷取腳本須逐位元組相同）。'
+  invariants: []
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::file_transfer_golden::every_golden_row_matches_python', 'cargo:sw-core::file_transfer_golden::chunk_template_lengths_match_inventory', 'cargo:sw-core::file_transfer_golden::split_chunks_empty_file_yields_one_empty_chunk', 'cargo:sw-core::file_transfer_golden::b64encode_has_no_trailing_newline', 'tests/test_transfer_golden_fresh.py::test_file_transfer_golden_is_fresh']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-push-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_push_then_pull_roundtrip_md5
+  family: S24
+  title: file push 經部署 artifact 傳到 PTY DUT 後內容與 md5 一致、chunk 命令不重送
+  contract: 'READY 的 shell session 以 serialwrap file push 傳 5120 bytes（chunk 512）：回 {ok:true, bytes, chunks:10, md5, remote_path}；外部 oracle 為 shelltarget 端實際檔案位元組相同，且 DUT 收到的 SW_XFER_CHUNK 命令恰為 10 行（不重送）。同一案例先對 Python 基線、再對 Rust artifact 執行（A/B）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身；Windows 實機傳輸由 P2 L2 f7-binary-roundtrip-md5 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_push_then_pull_roundtrip_md5']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-pull-roundtrip
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_pull_roundtrip_md5
+  family: S24
+  title: file pull 自 PTY DUT 取回內容與 md5 一致並寫入本地路徑
+  contract: 'serialwrap file pull --remote <檔> --local <路徑> 回 {ok:true, bytes, md5, local_path}，取回檔與 DUT 端檔案逐位元組相同；未給 local_path 時寫入 daemon cwd 的 basename（EVT-D-S7：本地檔由 daemon 讀寫）。外部 oracle 為 shelltarget 端檔案與取回檔的位元組比對。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身；Windows 實機傳輸由 P2 L2 f7-binary-roundtrip-md5 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_pull_roundtrip_md5']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-error-shapes
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/file_transfer_engine.rs::push_invalid_ack_mode
+  family: S24
+  title: file transfer 引擎錯誤形狀與 Python 逐字一致且參數錯誤零 TX
+  contract: 'push_file／pull_file 對參數錯誤（ack_mode、chunk_size、console 行長上限、本地檔不存在、echo 不支援）回與 Python 相同的 {ok:false,error_code,…} 且 TX 數為 0（zero_tx_on_reject）；probe、decoder／encoder、chunk、md5、move、pull 解析與 base64 解碼各階段的錯誤碼與欄位逐字一致；MOVE_TIMEOUT／MOVE_FAILED 不 cleanup（EVT-D-F3）；傳輸中 TX 被拒依 OD-62 以 TxRejected 帶出進度，不自動重送。'
+  invariants: [zero_tx_on_reject]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::file_transfer_engine::push_invalid_ack_mode', 'cargo:sw-core::file_transfer_engine::push_budget_zero', 'cargo:sw-core::file_transfer_engine::push_chunk_size_zero_direct_api', 'cargo:sw-core::file_transfer_engine::push_local_missing', 'cargo:sw-core::file_transfer_engine::push_echo_unsupported', 'cargo:sw-core::file_transfer_engine::push_budget_fixed_cmds', 'cargo:sw-core::file_transfer_engine::push_budget_raw_capacity_zero', 'cargo:sw-core::file_transfer_engine::push_probe_timeout', 'cargo:sw-core::file_transfer_engine::push_probe_shell_error', 'cargo:sw-core::file_transfer_engine::push_decoder_missing', 'cargo:sw-core::file_transfer_engine::push_chunk_timeout', 'cargo:sw-core::file_transfer_engine::push_decoder_failed', 'cargo:sw-core::file_transfer_engine::push_md5_unavailable', 'cargo:sw-core::file_transfer_engine::push_md5_mismatch', 'cargo:sw-core::file_transfer_engine::push_move_timeout_no_cleanup', 'cargo:sw-core::file_transfer_engine::push_move_failed_no_cleanup', 'cargo:sw-core::file_transfer_engine::push_bad_prompt_regex', 'cargo:sw-core::file_transfer_engine::pull_probe_timeout', 'cargo:sw-core::file_transfer_engine::pull_probe_shell_error', 'cargo:sw-core::file_transfer_engine::pull_encoder_missing', 'cargo:sw-core::file_transfer_engine::pull_timeout', 'cargo:sw-core::file_transfer_engine::pull_encoder_failed', 'cargo:sw-core::file_transfer_engine::pull_parse_failed', 'cargo:sw-core::file_transfer_engine::pull_b64_non_ascii', 'cargo:sw-core::file_transfer_engine::pull_b64_bad_padding', 'cargo:sw-core::file_transfer_engine::pull_md5_mismatch', 'cargo:sw-core::file_transfer_engine::pull_md5_unavailable', 'cargo:sw-core::file_transfer_engine::pull_local_write_error', 'cargo:sw-core::file_transfer_engine::pull_budget_pull_cmd', 'cargo:sw-core::file_transfer_engine::push_tx_rejected_quiet_first_chunk_gives_rejection_without_cleanup', 'cargo:sw-core::file_transfer_engine::push_tx_rejected_in_chunk_loop_carries_progress', 'cargo:sw-core::file_transfer_engine::pull_tx_rejected_has_no_progress']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-echo-stall
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_echo_stall_blackbox
+  family: S24
+  title: file push 的 echo-ACK 停滯只送一次 Ctrl-U 並回 TRANSFER_ECHO_STALL、不重送
+  contract: 'shelltarget 於第 100 個 echo 字元後停止回顯：push 回 {ok:false,error_code:TRANSFER_ECHO_STALL,…}；DUT 端 rx_log 中 \x15\n 恰出現 1 次，已送出的 chunk 不重送（no_auto_resend）。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身；Windows 實機傳輸由 P2 L2 f7-binary-roundtrip-md5 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_echo_stall_blackbox']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-session-gates
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet
+  family: S24
+  title: file.push／file.pull 的 session 閘門與 Python 基線一致且被拒時零 TX
+  contract: 'file.* 經 _resolve_session_id 與 manager gate 的拒絕形狀與 Python 基線一致，每列被拒時 DUT 端零新增 bytes（zero_tx_on_reject）：RECOVERING → SESSION_RECOVERING、FLASHING → FLASHING_BUSY（SC-02）；Quiet／Reconfirm pending → AUTOBOOT_QUIET＋retry_after_s（SC-03；傳輸中途 quiet arm 且被拒的那筆零寫出亦回此碼，push 附 chunks_sent／chunks_total，已部分寫出則為 COMMAND_ABORTED_IN_FLIGHT；原計畫 SC-33 依 OD-79 撤回）；READY_UNCONFIRMED、SESSION_INTERACTIVE_BUSY、SESSION_BUSY；passthrough 任何狀態回 PROFILE_NOT_COMMAND_CAPABLE（SC-35）；RPC 明寫 human:<x> 比照 agent、bare human 依 #240 視為 human（DF-02、OD-74），外部 system 前綴回 SOURCE_RESERVED；傳輸進行中 flash probe 不得授權（SC-14）；human raw lease 下 push 期間按鍵不夾入 chunk 行（no_forbidden_interleave），release 後不回放（no_stale_context_replay）。evidence 由 P8 Task 6 補齊。'
+  invariants: [zero_tx_on_reject, no_forbidden_interleave, no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT 並注入 boot banner（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer, quiet_reconfirm, lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-02, SC-03, SC-14, DF-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_gate_resolve_quiet']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-abort-on-release
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend
+  family: S24
+  title: file push 進行中 device.release 中止傳輸、依 OD-62 回錯誤碼且不重送
+  contract: 'push 進行中（foreground_busy）送 device.release：release 回 ok、aborted_cmd:true、state RELEASED；push 依 OD-62 比照 BC-03 回非成功——尚未寫出任何 byte 為 FLUSHED_BY_RECOVERY，已寫出至少 1 byte 為 COMMAND_ABORTED_IN_FLIGHT（push 附 chunks_sent／chunks_total），並比照一般命令寫 WAL META command_aborted_in_flight（cmd_id 為該次傳輸前綴 ft-<8hex>，confirmed_tx_bytes 為整段累計）；外部 oracle：同一 chunk 命令不出現兩次（no_auto_resend）、RELEASED 後 DUT 端零新增 bytes（no_stale_context_replay）。'
+  invariants: [no_auto_resend, no_stale_context_replay]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 模擬 DUT（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer, drain_release]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-04, BC-03]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_file_transfer.py::test_release_during_push_aborts_without_resend']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-xfer-no-retry-side-effect
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_no_retry.py::test_side_effect_methods_not_retried
+  family: S24
+  title: --retries 不重試 file.push／file.pull／device.release／device.attach
+  contract: 'StubDaemon 於收到請求後直接斷線：serialwrap --retries 3 對 file push、file pull、device release、device attach 各只送出 1 筆請求且 exit 非 0（§4.2：有副作用方法絕不重試）；對照組 mcu status 送出 4 筆（唯讀方法在 11 個重試白名單內）。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [file_transfer, device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_no_retry.py::test_side_effect_methods_not_retried']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-silent-unbridged
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_ttymcu_silent_when_unbridged
+  family: S24
+  title: /dev/ttyMCU 未 bridge 時不主動寫出任何 bytes
+  contract: 'passthrough session ATTACHED 後 RUN_DIR/dev/ttyMCU 存在；外部開啟並 setraw 後 2.5 s 內端點零輸出，MCU 線（fakemcu）rx_log 為空（CLAUDE.md MCU 坑 1：支援清單只經 mcu patterns／mcu status 查詢，不經此端點）。'
+  invariants: [zero_tx_on_reject]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_ttymcu_silent_when_unbridged']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-sync-replay
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone
+  family: S24
+  title: 認線只轉送 flasher 自己的 sync bytes 並回放 MCU ACK 一次
+  contract: 'flasher 開 ttyMCU 送 55 55：MCU 線恰收到一次 55 55（不另注入 sync、不 double-sync），flasher 讀回 00 cc；session 轉 FLASHING，mcu.status 為 flashing:true、flashing_com:COM0；WAL 的 TX 全為 source=flash（CLAUDE.md MCU 坑 2；no_auto_resend）。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-holder-gone
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_two_flashes_same_daemon
+  family: S24
+  title: flasher 關閉端點後以 holder-probe 結束 pump 回 ATTACHED，同一 daemon 可連續燒錄
+  contract: 'flasher 寫入封包後關閉端點：holder-probe armed 後持有者歸零才結束 pump，session 回 ATTACHED、mcu.status 回 flashing:false、flashing_com:null、last_detect 為 matched／COM0／ti-cc26xx；同一 daemon 連續兩次 flash 皆能認線並回放 ACK，結束後端點 link 仍在（CLAUDE.md MCU 坑 3）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_two_flashes_same_daemon', 'tests/contract_blackbox/test_s24_flash_endpoint.py::test_sync_replay_pump_and_holder_gone']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-baud-mirror
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_flash_endpoint.py::test_baud_mirrored_once_from_flasher
+  family: S24
+  title: flash 開始時鏡射 flasher 的 baud 一次、之後不再跟隨
+  contract: 'flasher 以 57600 開端點並送 sync：MCU 線 speed 變為 B57600；之後 flasher 改 9600 並寫入，MCU 線 speed 仍為 B57600（只在 flash 開始時鏡射一次）。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: /dev/ttyMCU PTY 端點為 POSIX-only（#84）；Windows 韌體升級改走 device release／attach 交接（s24-ho-windows-com）
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_flash_endpoint.py::test_baud_mirrored_once_from_flasher']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-arbitration
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/flash_session_core.rs::probe_then_matched_enters_flashing_and_invalidates_human_input
+  family: S24
+  title: SessionCore FLASHING 仲裁：probe 授權、Matched 失效 human 輸入、FLASHING_BUSY 與 fence
+  contract: 'FlashSyncProbeStart 只在候選態、無前景操作且非 RELEASED／RECOVERING／drain 時授權（SC-14）；FlashSyncMatched 以同一 probe_id 轉 FLASHING 並依 BC-02 失效 human 輸入（input_epoch 遞增）；未匹配只解除同一 probe；FLASHING 期間 submit／interactive／release 回 FLASHING_BUSY（SC-02），非 Flash／FlashProbe class 的 TX 一律 NotSubmitted 且不落 WAL（zero_tx_on_reject）；probe 前排入的 console 輸入於 Matched 後不回放（no_stale_context_replay）。'
+  invariants: [zero_tx_on_reject, no_stale_context_replay]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash, deferred_buffer]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-02, SC-14, BC-02]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::flash_session_core::probe_then_matched_enters_flashing_and_invalidates_human_input', 'cargo:sw-core::flash_session_core::probe_rejected_when_foreground_busy_sc14', 'cargo:sw-core::flash_session_core::unmatched_release_only_clears_same_probe']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-flash-ioerror-recovering
+  suite: rust-l1
+  source_ref: crates/sw-core/tests/flash_session_core.rs::io_error_during_flashing_drains_to_recovering
+  family: S24
+  title: Probe／FLASHING 期間 UART I/O 錯誤進 drain 轉 RECOVERING、by-id 消失延後 reconcile（SC-32）
+  contract: 'SC-32（Rust-only）：Probe／FLASHING 期間 UartIoError 進 Phase 1 drain 並轉 RECOVERING，handoff 回條前不重開 UART（no_reopen_before_handoff）；DeviceDetached 延後到 exit flashing 後再 reconcile（等價 Python 於 flash busy 時略過 _handle_bridge_down／_detach_by_id）；所有 flash 結束路徑無條件清 Fence.flash_mode 與 OwnershipState.flash_mode。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash, recovery_min]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-32]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-core::flash_session_core::io_error_during_flashing_drains_to_recovering', 'cargo:sw-core::flash_session_core::device_detached_during_flashing_is_deferred']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-mcu-rpc-shapes
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes
+  family: S24
+  title: mcu.patterns／mcu.status RPC 回應形狀與 Python 一致
+  contract: 'mcu.patterns 回 {ok:true,patterns:[{family:ti-cc26xx,probe:"55 55",expect:"00 cc",baud:115200}]}；mcu.status 回 {ok:true,candidates,flashing,flashing_com,last_detect}：candidates 依 session 順序取非 command_capable 且 READY／ATTACHED 者，real_path 查無為 null；probe 期間 flashing 即為 true（MCU-STATUS-01，KEEP）；無 flash 端點的平台 flashing:false、last_detect:null。兩方法皆在 --retries 唯讀白名單。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_mcu_rpc.py::test_patterns_exact_bytes', 'tests/contract_blackbox/test_s24_mcu_rpc.py::test_status_idle_no_sessions']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-ext-tool
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits
+  family: S24
+  title: release 後外部工具持有 tty 時 attach 回 DEVICE_STILL_HELD，工具退出後才可收回
+  contract: 'device.release 回條後外部工具（ExternalHolder）開啟該 tty：device.attach 回 DEVICE_STILL_HELD{pids,holder_unknown}、不清除 released 保護且零 TX（SC-05、BC-04）；工具退出後 attach 成功並恢復；以 HolderSampler 連續取樣證明 daemon 與外部工具從未同時持有（no_reopen_before_handoff）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 外部 holder 與連續取樣依 POSIX PTY（TIOCEXCL／flock、/proc 掃描）；Windows 交接由 s24-ho-windows-com 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-05, BC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff.py::test_external_tool_blocks_attach_until_it_exits']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-second-daemon
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns
+  family: S24
+  title: 第二個 daemon 接手已 release 的裝置後歸還，原 daemon 再收回
+  contract: 'daemon A release 後，拋棄式 daemon B 取得同一裝置；B 持有期間 A 的 device.attach 回 DEVICE_STILL_HELD（SC-05）；B 停止後 A attach 成功；連續取樣證明兩個 daemon 從未同時持有該 tty（no_reopen_before_handoff）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 外部 holder 與連續取樣依 POSIX PTY（TIOCEXCL／flock、/proc 掃描）；Windows 交接由 s24-ho-windows-com 承接
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-05]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff.py::test_second_daemon_takes_device_then_returns']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-persist-restart
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff.py::test_released_survives_two_restarts_and_replug
+  family: S24
+  title: RELEASED 跨兩次 daemon 重啟與裝置重新插拔仍保留
+  contract: '動態 session release 後 daemon 重啟兩次、裝置 unplug／replug：session 維持 RELEASED、不自動 attach（DF-04），只有明確 device attach 才收回。'
+  invariants: []
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 與 by-id symlink 模擬插拔（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full, state_persistence]
+  necessity: required
+  issues: []
+  behavior_changes: [DF-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff.py::test_released_survives_two_restarts_and_replug']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-ho-windows-com
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown
+  family: S24
+  title: Windows 上 release 後外部程式獨占開 COM 時 attach 回 DEVICE_STILL_HELD（holder_unknown）
+  contract: 'SW_TEST_COM_PAIR 的 COM 經 device release 後，外部程式以 dwShareMode=0 開啟：device.attach 回 DEVICE_STILL_HELD、pids:[]、holder_unknown:true（不可視為可收回，BC-04）；外部關閉後 attach 成功。需原生 Windows COM（windows_com），WSL／記憶體替身不得計為此案例證據。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [windows_com, process_rpc]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [BC-04]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_device_handoff_windows.py::test_windows_access_denied_holder_unknown']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-sup-systemd-runtime
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown
+  family: S24
+  title: systemd 監管下有序停止、on-failure 重啟保留 RELEASED 與 WAL seq
+  contract: 'transient systemd --user unit 監管 daemon：systemctl stop 走有序停止（SC-11）、ExecStopPost 為 exited:0、tty 無殘留 holder、socket 移除、WAL 最後一筆 CRC 正確；FLASHING 或 file push 進行中停止時 ttyMCU link 移除、已收到的 chunk 行都有對應 WAL TX，重啟後 DUT 端零新增（no_auto_resend）；SIGKILL 後 Restart=on-failure 拉起，session 維持 RELEASED、WAL seq 不倒退。'
+  invariants: [no_auto_resend]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: systemd 監管為 Linux-only；Windows 監管由 s24-sup-wintask-runtime 承接
+  capabilities: [supervisor_runtime, posix_pty]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision, file_transfer, mcu_flash]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-11]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_supervision_systemd.py::test_sigterm_ordered_shutdown', 'tests/contract_blackbox/test_s24_supervision_systemd.py::test_restart_on_failure_keeps_released_and_wal_seq']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-sup-wintask-runtime
+  suite: rust-l1
+  source_ref: crates/sw-pal/tests/wintask_runtime.rs::cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop
+  family: S24
+  title: windows-task 監管 Rust daemon：PT0S、失敗重啟與有序停止
+  contract: 'windows-task 排程工作（SC-24）安裝後 XML 為 ExecutionTimeLimit=PT0S、MultipleInstancesPolicy=IgnoreNew、RestartOnFailure PT1M／999；強制終止 daemon 後 150 s 內由排程重新拉起新 pid；P4 graceful_stop 正常結束時不執行 /End，停止後 WAL 最後一筆完整。需擁有者 Windows host 授權（SW_TEST_ALLOW_SCHTASKS=1）執行，cap:supervisor_runtime。'
+  invariants: []
+  layer: L1.5
+  platforms: [windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [supervisor_runtime]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-24]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['cargo:sw-pal::wintask_runtime::cap_supervisor_runtime__task_pt0s_restart_and_graceful_stop']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-upd-guards
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push
+  family: S24
+  title: 更新／回滾守衛在 file push、flash 或 interactive 進行中拒絕且 --force 不覆寫
+  contract: 'Rust daemon 有 file push、FLASHING 或 interactive lease 進行中時，setup --rollback（含 --force）於交接安全檢查回 SESSION_BUSY／FLASHING_BUSY 並拒絕，--force 只記 force_ignored:true（SC-23）；push 完整完成、daemon pid 不變、監管未收到停止；以連續取樣證明新舊版本從未同時持有 UART（no_reopen_before_handoff）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget／fakemcu 製造忙碌狀態（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision, file_transfer, mcu_flash, lease]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-23]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_push', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_flashing', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_push', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_force_refuses_while_flashing', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_refuses_while_interactive_send']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-upd-rollback-cross-stage
+  suite: contract-blackbox
+  source_ref: tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_state_compat_released
+  family: S24
+  title: Rust 與 Stage 1 artifact 之間回滾時 RELEASED 狀態相容且 UART 不被雙方同時持有
+  contract: 'Rust daemon 與 Stage 1 Python artifact 之間 setup --rollback：state.json 的 RELEASED 雙向相容、回滾後仍為 RELEASED；READY session 回滾全程以連續取樣證明新舊 daemon 從未同時持有 UART（no_reopen_before_handoff），停止只經 daemon.handoff_stop 交接（SC-23）。'
+  invariants: [no_reopen_before_handoff]
+  layer: L1.5
+  platforms: [linux]
+  windows_status: gap
+  windows_gap_reason: 黑箱以 POSIX PTY shelltarget 與 /proc holder 取樣（posix_pty），Windows 無對應替身
+  capabilities: [posix_pty, process_rpc]
+  cli_stage: 1B
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: [supervision, device_handoff_full]
+  necessity: required
+  issues: []
+  behavior_changes: [SC-23]
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_state_compat_released', 'tests/contract_blackbox/test_s24_update_rollback.py::test_rollback_cross_stage_ready_never_double_held']
+  implemented_by: 09-slice24-transfer-flash.md
+  cross_slice_reason: null
+- case_id: s24-contract-coverage
+  suite: rust-l1
+  source_ref: tests/test_rust_contract_coverage.py::test_skipped_and_teardown_error_never_count
+  family: S24
+  title: 全部凍結契約的最終覆蓋判定不以 SKIP、證據不足或不完整執行計為通過
+  contract: 'scripts/rust/contract_coverage.py 對 error_code／last_error／rpc_method／cli_cmd／bc／schema／case 各 ID 逐平台判定：skipped、xfailed、setup／teardown error 不算 PASS；每個對應 nodeid 都須恰一列 call passed；未跑完、exit 非 0、重複列或未收集的結果不得滿足任何 ID；身分（artifact／cases／lock 雜湊）不一致即拒絕；需實機或原生 Windows 能力者只能列 blocked_owner，不得計入 covered（insufficient_evidence_not_pass）。'
+  invariants: [insufficient_evidence_not_pass]
+  layer: L1
+  platforms: [linux, windows]
+  windows_status: native
+  windows_gap_reason: null
+  capabilities: [memory_only]
+  cli_stage: 1A
+  daemon_slice: '2.4'
+  stage0_required: false
+  prerequisites: []
+  necessity: required
+  issues: []
+  behavior_changes: []
+  destructive: false
+  expected: PASS
+  sentinel: null
+  evidence: ['tests/test_rust_contract_coverage.py::test_skipped_and_teardown_error_never_count', 'tests/test_rust_contract_coverage.py::test_blocked_owner_cases_are_reported_not_covered', 'tests/test_rust_contract_coverage.py::test_all_mapped_nodeids_required_not_any', 'tests/test_rust_contract_coverage.py::test_incomplete_run_cannot_satisfy', 'tests/test_rust_contract_coverage.py::test_duplicate_result_rows_not_best_of', 'tests/test_rust_contract_coverage.py::test_mapped_nodeid_not_collected_is_missing', 'tests/test_rust_contract_coverage.py::test_identity_mismatch_rejected']
+  implemented_by: 09-slice24-transfer-flash.md
   cross_slice_reason: null

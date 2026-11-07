@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "cases_revision": "2026-11-07.1",
+  "cases_revision": "2026-11-08.1",
   "sets": {
     "stage0": [
       "brcm-01-login-flow",
@@ -222,6 +222,26 @@
       "p7-selftest-recover-selftest-classifications",
       "p7-stall-transport-stall-flip",
       "pt-quiet-ready",
+      "s24-contract-coverage",
+      "s24-flash-arbitration",
+      "s24-flash-baud-mirror",
+      "s24-flash-holder-gone",
+      "s24-flash-ioerror-recovering",
+      "s24-flash-silent-unbridged",
+      "s24-flash-sync-replay",
+      "s24-ho-ext-tool",
+      "s24-ho-persist-restart",
+      "s24-ho-second-daemon",
+      "s24-ho-windows-com",
+      "s24-mcu-rpc-shapes",
+      "s24-xfer-abort-on-release",
+      "s24-xfer-echo-stall",
+      "s24-xfer-error-shapes",
+      "s24-xfer-no-retry-side-effect",
+      "s24-xfer-pull-roundtrip",
+      "s24-xfer-push-roundtrip",
+      "s24-xfer-session-gates",
+      "s24-xfer-templates-golden",
       "sc30-quiet-mid-login-aborts",
       "sc34-attach-recover-last-error-field",
       "sm-01-attach-to-ready",
@@ -418,6 +438,30 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "s24-contract-coverage",
+      "s24-flash-arbitration",
+      "s24-flash-baud-mirror",
+      "s24-flash-holder-gone",
+      "s24-flash-ioerror-recovering",
+      "s24-flash-silent-unbridged",
+      "s24-flash-sync-replay",
+      "s24-ho-ext-tool",
+      "s24-ho-persist-restart",
+      "s24-ho-second-daemon",
+      "s24-ho-windows-com",
+      "s24-mcu-rpc-shapes",
+      "s24-sup-systemd-runtime",
+      "s24-sup-wintask-runtime",
+      "s24-upd-guards",
+      "s24-upd-rollback-cross-stage",
+      "s24-xfer-abort-on-release",
+      "s24-xfer-echo-stall",
+      "s24-xfer-error-shapes",
+      "s24-xfer-no-retry-side-effect",
+      "s24-xfer-pull-roundtrip",
+      "s24-xfer-push-roundtrip",
+      "s24-xfer-session-gates",
+      "s24-xfer-templates-golden",
       "sc13-lease-expiry-tick",
       "sc15-console-ring-drop-oldest",
       "sc16-console-line-reject-log",
@@ -886,6 +930,30 @@
       "rm-topo-dual-nat",
       "rm-topo-gwports",
       "rm-topo-nat-host",
+      "s24-contract-coverage",
+      "s24-flash-arbitration",
+      "s24-flash-baud-mirror",
+      "s24-flash-holder-gone",
+      "s24-flash-ioerror-recovering",
+      "s24-flash-silent-unbridged",
+      "s24-flash-sync-replay",
+      "s24-ho-ext-tool",
+      "s24-ho-persist-restart",
+      "s24-ho-second-daemon",
+      "s24-ho-windows-com",
+      "s24-mcu-rpc-shapes",
+      "s24-sup-systemd-runtime",
+      "s24-sup-wintask-runtime",
+      "s24-upd-guards",
+      "s24-upd-rollback-cross-stage",
+      "s24-xfer-abort-on-release",
+      "s24-xfer-echo-stall",
+      "s24-xfer-error-shapes",
+      "s24-xfer-no-retry-side-effect",
+      "s24-xfer-pull-roundtrip",
+      "s24-xfer-push-roundtrip",
+      "s24-xfer-session-gates",
+      "s24-xfer-templates-golden",
       "sc13-lease-expiry-tick",
       "sc15-console-ring-drop-oldest",
       "sc16-console-line-reject-log",
@@ -3235,6 +3303,301 @@
       "necessity": "required",
       "daemon_slice": "2.3",
       "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-contract-coverage": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-arbitration": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-baud-mirror": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-holder-gone": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-ioerror-recovering": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-silent-unbridged": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-flash-sync-replay": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-ext-tool": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-persist-restart": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-second-daemon": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-ho-windows-com": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-mcu-rpc-shapes": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-sup-systemd-runtime": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-sup-wintask-runtime": {
+      "suite": "rust-l1",
+      "layer": "L1.5",
+      "platforms": [
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-upd-guards": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-upd-rollback-cross-stage": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1B",
+      "stage0_required": false
+    },
+    "s24-xfer-abort-on-release": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-echo-stall": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-error-shapes": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-no-retry-side-effect": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-pull-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-push-roundtrip": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-session-gates": {
+      "suite": "contract-blackbox",
+      "layer": "L1.5",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
+      "stage0_required": false
+    },
+    "s24-xfer-templates-golden": {
+      "suite": "rust-l1",
+      "layer": "L1",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "expected": "PASS",
+      "necessity": "required",
+      "daemon_slice": "2.4",
+      "cli_stage": "1A",
       "stage0_required": false
     },
     "sc13-lease-expiry-tick": {
