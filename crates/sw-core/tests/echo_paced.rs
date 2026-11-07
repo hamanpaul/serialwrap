@@ -87,11 +87,14 @@ fn echo_paced_slices_confirmed_in_order() {
 
 #[test]
 fn echo_stall_sends_one_cancel_line_only() {
-    let rig = PortRig::new("COM0", FakeDut::shell().stall_lines_starting_with("printf '%s' '", 64));
-    let data = b"hello world, echo paced".to_vec();
+    // chunk 命令以 `printf '%s' <shlex_quote(b64)>` 開頭（base64 字元不需引號）。
+    let rig = PortRig::new("COM0", FakeDut::shell().stall_lines_starting_with("printf '%s' ", 64));
+    // 21 bytes → base64 28 字元 → chunk 命令 125 字元：恰兩段（64＋61），停在第二段時全部 slice 已送出。
+    let data = b"hello world, echo pac".to_vec();
     let tmp = "/tmp/.sw_upload_aaaaaaaaaaaa";
     let chunk = t::chunk_command(&t::b64encode(&data), "base64", ">", tmp).unwrap();
     assert!(chunk.chars().count() > 64, "chunk 命令須超過一段");
+    assert!(chunk.chars().count() <= 128, "chunk 命令須恰兩段");
     let task = rig.spawn(move |port| {
         let files = MemFiles::with("/l/f.bin", &data);
         let mut ids = FixedIds::new(&["aaaaaaaaaaaa", "deadbeef"]);
@@ -358,7 +361,7 @@ fn cancel_input_line_bytes_and_wal() {
 #[test]
 fn rx_snapshot_and_text_delegate_to_rx_window() {
     let rig = PortRig::new("COM0", FakeDut::silent());
-    rig.push_rx("前置-# ".as_bytes());
+    rig.push_rx("前置字-# ".as_bytes());
     let port = rig.port();
     assert!(port.supports_echo_paced());
     assert_eq!(port.rx_snapshot_len(), 6, "字元計");
@@ -444,7 +447,8 @@ fn aggregate_flush_wal_failure_listed_unrecorded() {
     let mut rig = PortRig::new("COM0", FakeDut::echo_first_n_chars(128));
     let task = paced(&rig, &"f".repeat(300), "ft-17-0", 64, Duration::from_secs(30));
     rig.dut.wait_bytes(192);
-    rig.wfs.fail_next_writes(&rig.wal.wal_path(), 1, PalError::io(28, "[Errno 28] No space left on device"));
+    // WalWriter 失敗後會重開檔再試一次（同 tests/tx_writer.rs 的 WAL 失敗案例），故注入 2 次才會真的漏記。
+    rig.wfs.fail_next_writes(&rig.wal.wal_path(), 2, PalError::io(28, "[Errno 28] No space left on device"));
     let at = rig.finish_worker();
     let gaps: Vec<_> = at
         .receipt
