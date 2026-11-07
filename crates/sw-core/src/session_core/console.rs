@@ -674,6 +674,8 @@ impl SessionCore {
             priority: 100,
             expected_duration_s: None,
             completion_regex: None,
+            expect_reboot: false,
+            trusted_human: true,
             origin: SubmitOrigin::HumanConsole {
                 client_id: client_id.to_string(),
             },

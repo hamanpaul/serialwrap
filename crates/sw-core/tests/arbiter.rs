@@ -20,7 +20,56 @@ fn req(cmd: &str) -> SubmitReq {
         priority: 10,
         expected_duration_s: None,
         completion_regex: None,
+        expect_reboot: false,
+        trusted_human: false,
         origin: SubmitOrigin::Rpc,
+    }
+}
+
+#[test]
+fn wp52_submit_req_flags_survive_queue() {
+    let registry = CommandRegistry::new();
+    let mut queue = SessionQueue::new();
+    let mut request = req("echo X");
+    request.expect_reboot = true;
+    request.trusted_human = true;
+
+    let admitted = registry
+        .admit(request, true, "wp52-queue".into(), T)
+        .expect("請求應通過 admission");
+    queue.push(admitted.queued, &registry);
+    let queued = queue.pop().expect("請求應保留在佇列");
+
+    assert!(queued.req.expect_reboot);
+    assert!(queued.req.trusted_human);
+}
+
+#[test]
+fn wp52_trusted_human_or_origin() {
+    let cases = [
+        (SubmitOrigin::Rpc, false, false),
+        (SubmitOrigin::Rpc, true, true),
+        (
+            SubmitOrigin::HumanConsole {
+                client_id: "console-1".into(),
+            },
+            false,
+            true,
+        ),
+        (
+            SubmitOrigin::HumanConsole {
+                client_id: "console-1".into(),
+            },
+            true,
+            true,
+        ),
+    ];
+
+    for (origin, trusted_human, expected) in cases {
+        let mut request = req("echo X");
+        request.origin = origin;
+        request.trusted_human = trusted_human;
+        assert_eq!(request.is_trusted_human(), expected);
     }
 }
 

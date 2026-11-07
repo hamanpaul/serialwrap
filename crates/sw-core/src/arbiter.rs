@@ -21,6 +21,8 @@ pub struct SubmitReq {
     pub priority: i128,
     pub expected_duration_s: Option<f64>,
     pub completion_regex: Option<String>,
+    pub expect_reboot: bool,
+    pub trusted_human: bool,
     /// P6 增補 #6（07 D-10，DF-02）：只有 line editor 產生的 `HumanConsole` 會被視為 human；06 既有建構點一律 `Rpc`。
     pub origin: SubmitOrigin,
 }
@@ -30,6 +32,13 @@ pub struct SubmitReq {
 pub enum SubmitOrigin {
     Rpc,
     HumanConsole { client_id: String },
+}
+
+impl SubmitReq {
+    /// 綜合明示信任旗標與 console 入口的可信來源標記。
+    pub fn is_trusted_human(&self) -> bool {
+        self.trusted_human || matches!(&self.origin, SubmitOrigin::HumanConsole { .. })
+    }
 }
 
 /// 已進入佇列的命令；排序鍵為 `(priority, counter)`，數值小者先出列。

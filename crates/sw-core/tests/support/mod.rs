@@ -76,6 +76,8 @@ pub fn agent_submit(cmd: &str) -> SubmitReq {
         priority: 10,
         expected_duration_s: None,
         completion_regex: None,
+        expect_reboot: false,
+        trusted_human: false,
         origin: SubmitOrigin::Rpc,
     }
 }
