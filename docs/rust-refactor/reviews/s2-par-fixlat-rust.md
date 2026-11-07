@@ -89,3 +89,52 @@ Rust daemon 一律使用第 3 項建好的 bundle `target/s2-par/S2-PAR-fixlat-3
 | 原黑箱測試（修改後工具） | `blackbox-rust-fixed/` | 14.69–27.02 | command_cancel 200／200 PASS，max 2.240 ms，`errors=[]`。stop_request 因 host loadavg 峰值 27.02 > 24 CPU，作廢重跑後仍是 `INSUFFICIENT_EVIDENCE`，pytest exit 1。stop 路徑本項沒有修改，這一輪不算有效的 stop 證據 |
 
 **已實測：**Rust 也會在 `CommandRegistry::cancel()` 回覆前寫入 `done_at`（`crates/sw-core/src/arbiter.rs:342-377`），所以原工具的 `done_at` 等待對 Rust 一樣沒有作用。Rust 有 16% 的樣本在 worker 還忙時就結束，Python 則是 100%。**推斷：**比例比 Python 低，可能是 Rust 的 `CancelQueued` 撤銷 TX permit 後，大部分情況下前景 op 很快就結束，只有 TX 已經送出的樣本要等 prompt。這一點本項沒有逐筆核對 TX 時間線。這個差異是取消後的收尾時間，不在 `event_latency` 的契約口徑內，本項不把它列為 Rust 缺陷，也不改 Rust 程式。
+
+---
+
+## 補記：第 5 項啟動條件核對（2026-11-08）
+
+第 5 項的範圍是「Rust 歸因成立時，修正取消後的命令推進」。啟動條件是：第 3 項取得 Rust 特有的失敗，並定位到取消、前景收尾或下一筆出列的責任點。本節只記錄這個條件的核對結果；上面第 3、4 項的內容保留原文。
+
+### 核對結果（已實測：本輪重讀既有 artifact）
+
+本輪重新讀了第 3、4 項保存的全部 Rust 輸出，在其中搜尋 `命令未進入 running`，命中 0 個檔案。
+
+| Rust 證據 | pytest／探針 exit | command_cancel errors | 說明 |
+|---|---:|---|---|
+| `S2-PAR-fixlat-3/rust-run-{1,2,3}/` | 0／0／0 | `[]` | 低負載三輪，全部 PASS |
+| `S2-PAR-fixlat-3/rust-baseline-high-1/` | 1 | `[]` | loadavg 峰值 41.86 > 24 CPU；judge 判 `INSUFFICIENT_EVIDENCE`，`void=true`。失敗原因是負載閘門，不是 accepted timeout |
+| `S2-PAR-fixlat-4/probe-rust-1/`（修改前工具） | 0 | `[]` | 200／200 有效；其中 32 筆返回時 `foreground_busy=true`，下一筆的 accepted 等待為 0.255–0.274 s，遠低於 10 s |
+| `S2-PAR-fixlat-4/probe-rust-fixed/` | 0 | `[]` | 200／200 有效；0 筆在忙碌中返回 |
+| `S2-PAR-fixlat-4/blackbox-rust-fixed/` | 1 | `[]` | command_cancel 200／200 PASS；只有 stop_request 因 loadavg 峰值 27.02 > 24 CPU 判 `INSUFFICIENT_EVIDENCE` |
+
+Rust 在每一份證據裡都沒有出現命令停在 accepted 的情況。「取消回覆早於 worker 收尾」這個行為 Python 也有（Python 100%，Rust 16%），不是 Rust 特有。探針量到，忙碌中返回之後，下一筆的 accepted 等待是 0.255–0.274 s，最大值低於 0.3 s。（推斷）這段時間符合「舊前景收尾後才讓下一筆進 running」的單寫入者行為；不過探針沒有逐筆核對 running 與 `foreground_busy` 清除的先後。所以，第 3 項沒有取得 Rust 特有的失敗，也沒有定位出 Rust 的責任點。
+
+### 處理
+
+依 brief「Rust 沒有重現缺陷時保留比較結論，不製造產品修改」，**第 5 項未啟動**：
+
+- `crates/sw-core/src/session_core.rs`（`CancelQueued` 處理、`start_next()`、`op_finished()`）與 `crates/sw-daemon/src/service.rs` 的 `command.cancel` 路由都沒有修改。
+- 沒有新增回歸 `fixlat_cancelled_foreground_allows_next_command`。它要重播的「第 3 項實際競態」並不存在，這時寫出的測試在現行 Rust 上必然通過。依 brief，舊 Rust 上就通過的回歸不能當成根因證據；為了湊出紅燈去另造情境，等於製造缺陷。
+- 沒有新增 brief 為產品修改預留的 changelog fragment：本項沒有修改 `code_paths`，R-09 不會觸發。
+- 既有回歸 `command_exec.rs::command_cancel_running_revokes_tx_op`（撤銷後 TX 尾段不再交給 OS）在本輪實跑通過，見下表。
+
+**推斷，未證實：**`9d915e84` 那次 `command_cancel #41` 失敗跑的是 Python daemon，比較可能的成因仍是第 4 項記錄的工具同步缺陷：前一筆的收尾時間被算進下一筆的 accepted 等待。原始失敗沒有留下時間線，所以這一點仍然無法證實。
+
+### 第 5 項驗收
+
+所有命令都在前景執行。command、stdout、stderr 與 exit code 存在 `target/s2-par/S2-PAR-fixlat-5/gates/`。開跑前 loadavg 1m 為 2.84。
+
+| 檢查 | 結果 |
+|---|---|
+| `cargo test -p sw-core --features test-fakes --test command_exec -- --test-threads=1` | exit 0，69 passed |
+| `cargo test -p sw-core --test arbiter -- --test-threads=1` | exit 0，但 **0 tests**：`tests/arbiter.rs` 整檔受 `#![cfg(feature = "test-fakes")]` 管制，不開 feature 時這條命令什麼都沒驗 |
+| `cargo test -p sw-core --features test-fakes --test arbiter -- --test-threads=1` | exit 0，26 passed（補跑，用來取代上一列的空跑） |
+| `cargo test --workspace` | exit 0，1542 passed、0 failed、45 ignored（loadavg 1m 4.74→4.60） |
+| `cargo check --workspace --target x86_64-pc-windows-gnu` | exit 0 |
+| `python3 -m tools.contracts check` | exit 0，`ok=true`、findings 0 |
+| `python3 tests/acceptance/regen_lock.py --check` | exit 0，鎖檔與 L1 結構兩項都是 OK |
+| `python3 scripts/rust/check_cfg_boundary.py` | exit 0 |
+| `python3 -m policy_check --repo .` | exit 0，25 pass、0 fail、2 warn（R-19 parser advisory；R-22 3243 筆既有懸空引用，與第 4 項記錄相同，本節沒有新增） |
+
+本項只修改文件；沒有執行全套 pytest、slice gate、Docker 或出口證據 driver。
