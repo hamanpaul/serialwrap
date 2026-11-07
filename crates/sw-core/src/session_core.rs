@@ -4264,6 +4264,12 @@ impl SessionCore {
 
     /// 05 §5.1 execute-time 順序（completion regex → FLASHING → 非 READY → gate → recovering → lease）。
     fn execute_time_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
+        self.execute_time_gate_reject(command, now)
+            .or_else(|| self.execute_time_lease_reject(command, now))
+    }
+
+    /// execute-time 順序前段（completion regex → FLASHING → 非 READY → gate → recovering）。
+    fn execute_time_gate_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
         let completion = command
             .req
             .completion_regex
@@ -4272,7 +4278,6 @@ impl SessionCore {
         if !valid_completion_regex(completion.as_ref()) {
             return Some(pydict! { "ok" => false, "error_code" => "INVALID_COMPLETION_REGEX" });
         }
-        let mode = normalized_mode(&command.req.mode);
         if self.state == SessionState::Flashing {
             return Some(self.selector_error("FLASHING_BUSY"));
         }
@@ -4296,6 +4301,13 @@ impl SessionCore {
         if self.recovering {
             return Some(pydict! { "ok" => false, "error_code" => "SESSION_RECOVERING" });
         }
+        None
+    }
+
+    /// execute-time 順序的 lease 段（`_refresh_interactive_locked` → 非 interactive 遇 lease：agent 遇 human lease 放行）。
+    fn execute_time_lease_reject(&mut self, command: &QueuedCommand, now: Mono) -> Option<PyDict> {
+        let mode = normalized_mode(&command.req.mode);
+        let human = matches!(command.req.origin, SubmitOrigin::HumanConsole { .. });
         self.refresh_lease(now);
         if let Some(lease) = self.lease.as_ref() {
             if mode != "interactive" && !(!human && lease.is_human()) {
@@ -4312,6 +4324,11 @@ impl SessionCore {
 
     fn start_next(&mut self, now: Mono) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // P8 Task 6（審查 P8X-7af8adc-1）：file transfer 占用前景槽時照常出列並以 SESSION_BUSY 結束，不延後。
+        if self.state == SessionState::Ready && self.file_transfer_in_foreground() {
+            self.reject_queued_during_file_transfer(now);
+            return effects;
+        }
         // 增補 #26：回放保留（07 D-22）期間同樣不出列。
         if self.fg_slot_busy() || self.state != SessionState::Ready {
             return effects;

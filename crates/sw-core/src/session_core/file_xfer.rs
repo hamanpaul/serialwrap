@@ -59,6 +59,43 @@ impl SessionCore {
         }]
     }
 
+    /// 前景槽是否由 file transfer 持有（`_foreground_operation.kind == "file"`）。
+    pub(super) fn file_transfer_in_foreground(&self) -> bool {
+        self.foreground.as_ref().is_some_and(|grant| {
+            matches!(self.pending_ops.get(&grant.op_id), Some(PendingOp::FileTransfer { .. }))
+        })
+    }
+
+    /// file transfer 占用前景槽期間的出列（審查 P8X-7af8adc-1）：Python 的 file op 不經 arbiter，worker 照常出列並在
+    /// `execute_command` 結束命令——execute-time gate 與 recovering 照舊先判；interactive 模式在 lease refresh 前、
+    /// 其餘在 lease 判定後（`_begin_foreground_operation_locked`）回 `SESSION_BUSY`＋selector。命令零 TX、不延後執行。
+    pub(super) fn reject_queued_during_file_transfer(&mut self, now: Mono) {
+        while let Some(command) = self.queue.pop() {
+            if matches!(
+                self.deps.registry.mark_running(&command.cmd_id, &self.wall_iso()),
+                RunDecision::Skip
+            ) {
+                continue;
+            }
+            let interactive = normalized_mode(&command.req.mode) == "interactive";
+            let reject = self
+                .execute_time_gate_reject(&command, now)
+                .or_else(|| {
+                    if interactive {
+                        None
+                    } else {
+                        self.execute_time_lease_reject(&command, now)
+                    }
+                })
+                .unwrap_or_else(|| self.selector_error("SESSION_BUSY"));
+            // 本命令不會再出列：tick-close 的 interactive 標記一併結算。
+            self.tick_close_interactive.remove(&command.cmd_id);
+            self.deps
+                .registry
+                .complete(&command.cmd_id, CmdOutcome::Result(reject), &self.wall_iso());
+        }
+    }
+
     /// resolve 層（`_resolve_session_id(file_transfer=True)`）＋manager 層（`file_push`／`file_pull` 的鎖內判定）。
     /// 任一拒絕皆在第一個 TX 之前、零 TX、不占前景槽。
     fn file_transfer_admit(&mut self, now: Mono) -> Result<(), PyDict> {
