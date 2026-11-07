@@ -7,7 +7,7 @@
 #![cfg(feature = "test-fakes")]
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::p7::{b64, golden_rows, rule_json};
@@ -145,11 +145,9 @@ struct Rig {
     emit: RecordingEmit,
 }
 
-fn rig() -> Rig {
+fn rig_with_clock(clock: Arc<FakeClock>) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let counters = Arc::new(CounterStore::new(dir.path().into(), sw_pal::native().fs).unwrap());
-    let clock = FakeClock::new();
-    clock.set_wall_us(1_000_000_000);
     let env = Arc::new(FakeEnv::default());
     env.vars
         .lock()
@@ -162,6 +160,12 @@ fn rig() -> Rig {
         env,
         emit: RecordingEmit::default(),
     }
+}
+
+fn rig() -> Rig {
+    let clock = FakeClock::new();
+    clock.set_wall_us(1_000_000_000);
+    rig_with_clock(clock)
 }
 
 impl Rig {
@@ -193,6 +197,26 @@ fn ok(stdout: &[u8]) -> HandlerOutcome {
 
 fn soon() -> Instant {
     Instant::now() + Duration::from_secs(5)
+}
+
+fn wait_for_clock_wait(
+    clock: &FakeClock,
+    result: &mpsc::Receiver<DispatcherStopReport>,
+    count: usize,
+) {
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        if clock.sleeps.lock().unwrap().len() >= count {
+            return;
+        }
+        match result.try_recv() {
+            Ok(report) => panic!("stop 未使用可控時鐘便已返回：{report:?}"),
+            Err(mpsc::TryRecvError::Disconnected) => panic!("stop 執行緒未回報結果"),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        assert!(Instant::now() < end, "stop 未進入可控時鐘等待");
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -604,23 +628,45 @@ fn inherited_env_only_whitelisted_present() {
     assert!(!names.contains(&"SECRET"));
 }
 
+/// 以 FakeClock 檢查期限前不返回、期限到達後確實 abort；5 s 實時上限只防止測試掛住，不作精度 judge。
 #[test]
 fn stop_deadline_aborts_running_handlers() {
     let _serial = TIMING.lock().unwrap_or_else(|e| e.into_inner());
-    let r = rig();
+    let clock = FakeClock::at(0, 1_000_000_000);
+    let r = rig_with_clock(clock.clone());
     let sp = FakeHandlerSpawner::blocking();
     let d = r.start(8, sp.clone());
     d.dispatch(fire("o.a", "COM0", 1), "x".into());
     while sp.spawn_count() < 1 {
         std::thread::sleep(Duration::from_millis(2));
     }
-    let t0 = Instant::now();
-    let rep = d.stop(Instant::now() + Duration::from_millis(200));
+    let (done_tx, done_rx) = mpsc::channel();
+    let stop_thread = std::thread::spawn(move || {
+        done_tx
+            .send(d.stop(Instant::now() + Duration::from_millis(200)))
+            .unwrap();
+    });
+    wait_for_clock_wait(&clock, &done_rx, 1);
     assert!(
-        t0.elapsed() <= Duration::from_millis(300),
-        "{:?}",
-        t0.elapsed()
+        matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "deadline 尚未推進，stop 不應返回"
     );
+
+    let first_wait = clock.sleeps.lock().unwrap()[0];
+    let before_deadline = first_wait.saturating_sub(Duration::from_millis(1));
+    clock.advance(before_deadline);
+    if before_deadline > Duration::ZERO {
+        wait_for_clock_wait(&clock, &done_rx, 2);
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "deadline 前 stop 不應返回"
+        );
+    }
+    clock.advance(first_wait.saturating_sub(before_deadline));
+    let rep = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("deadline 到期並 abort 後 stop 應完成");
+    stop_thread.join().unwrap();
     assert_eq!(
         rep,
         DispatcherStopReport {

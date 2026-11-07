@@ -2106,7 +2106,7 @@ fn per_rule_busy_then_saturation_drop_new() {
 | `stdout_tail_decoded_replace` | tail 切在多位元組中間 → 解碼以 U+FFFD 取代 |
 | `shell_handler_uses_platform_argv` | `handler.shell` → `spawner.shell_argv(shell)` 的結果被傳入 |
 | `inherited_env_only_whitelisted_present` | SysEnv 有 `PATH`、`SECRET` → env 只含 `PATH` 與 11 個 `SERIALWRAP_EVENT_*` |
-| `stop_deadline_aborts_running_handlers` | `FakeHandlerSpawner::blocking()` 不 release；`stop(now+200ms)` 在 ≤ 300 ms 內返回、回傳 `DispatcherStopReport{aborted:1, unreaped:[]}`、該 handler 的 `HandlerAbort` 已 trigger、WARNING 逐字 |
+| `stop_deadline_aborts_running_handlers` | `FakeHandlerSpawner::blocking()` 不 release；以 `FakeClock` 證明 deadline 前 1 ms 不返回、推進至 `stop(now+200ms)` deadline 後觸發 abort，回傳 `DispatcherStopReport{aborted:1, unreaped:[]}`、該 handler 的 `HandlerAbort` 已 trigger、WARNING 逐字。原 ≤300 ms 為 200 ms deadline＋最多 100 ms `ABORT_GRACE`；測試以虛擬單調時間驗邏輯，不以牆鐘排程時間作 judge。 |
 | `close_intake_rejects_new_dispatch`（R1-F2） | 一個 handler 執行中 → `close_intake()` → 再 `dispatch` 同 rule 與另一 rule 各一次 → `FakeHandlerSpawner.spawn_count()` 不增、`fire_count` 不增；原 handler 不被 abort（`HandlerAbort` 未 trigger），release 後正常完成 |
 | `stop_reports_unreaped_when_run_ignores_abort`（R1-F2） | `FakeHandlerSpawner::ignore_abort()`（本 Task 於 Task 0 的 fake 增補：abort 後 `run` 仍不返回）→ `stop(now+200ms)` 在 ≤ 300 ms 內返回 `{aborted:1, unreaped:["r1"]}`，不無界等待 |
 
