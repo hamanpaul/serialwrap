@@ -234,6 +234,7 @@ impl HumanTxPump {
                         permit: permit.clone(),
                         payload,
                         reply,
+                        aggregate: None,
                     };
                     let report = match tx.jobs.send(job) {
                         Ok(()) => tx

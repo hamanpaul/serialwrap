@@ -704,6 +704,7 @@ impl FlashCoordinator {
             },
             payload: payload.to_vec(),
             reply,
+            aggregate: None,
         };
         if handle.jobs.send(job).is_err() {
             return false;

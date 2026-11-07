@@ -345,6 +345,7 @@ pub fn login_tx_sender(
             },
             payload: payload.to_vec(),
             reply,
+            aggregate: None,
         };
         // TxWriter 已關閉（drain／shutdown）：等同 fence 凍結（Python `_tx_frozen` → `draining`）。
         let not_submitted = TxReport {

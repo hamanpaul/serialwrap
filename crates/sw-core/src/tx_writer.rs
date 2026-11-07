@@ -360,10 +360,38 @@ impl SubmitGate for FenceSubmitGate<'_> {
     }
 }
 
+/// 同一時間可未結的聚合緩衝上限（P8 Task 5）。每個 epoch 只有一個前景傳輸，超過即為程式錯誤，
+/// 新開的 `Append` 一律不提交（零 TX）。
+pub const TX_AGGREGATE_OPEN_MAX: usize = 8;
+
+/// echo-ACK 節流的 TX 證據聚合鍵（P8 Task 5）：同一行命令的各 slice 以同一個鍵累加。
+///
+/// `max_bytes` 是該行命令完整送出時的 byte 數（本文＋換行）；TxWriter 拒絕會讓緩衝超過它的 `Append`
+/// （程式錯誤，零 TX），使緩衝有界。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AggregateKey {
+    pub op_id: OpId,
+    pub source: String,
+    pub cmd_id: Option<String>,
+    pub max_bytes: usize,
+}
+
+/// `TxJob` 的聚合指示（P8 Task 5；Python `send_command_echo_paced` 的「一命令一筆 TX」）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AggregateOp {
+    /// 照常經 Fence 提交；OS 確認的 bytes 累加到該鍵的緩衝，不單獨落 TX WAL（結果不明仍照 SC-07 寫 META）。
+    Append(AggregateKey),
+    /// 不提交任何 bytes（`payload` 必須為空）；把緩衝以一筆 TX（source／cmd_id 取自鍵）寫入 WAL 後清除，
+    /// `TxReport.wal` 回該筆結果。緩衝為空時不寫。
+    Finish(AggregateKey),
+}
+
 pub struct TxJob {
     pub permit: TxPermit,
     pub payload: Vec<u8>,
     pub reply: crossbeam_channel::Sender<TxReport>,
+    /// P8 Task 5：只有 `OpTransferPort` 的 echo-ACK 節流為 `Some`；其餘建構點一律 `None`。
+    pub aggregate: Option<AggregateOp>,
 }
 
 #[derive(Debug, Clone)]

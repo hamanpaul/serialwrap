@@ -36,3 +36,9 @@ required-features = ["test-fakes"]
 name = "flash_coordinator"
 path = "tests/flash_coordinator.rs"
 required-features = ["test-fakes"]
+
+# P8 Task 5：OpTransferPort 的 echo-ACK 節流、TX 證據聚合與中止（PortRig 需 test-fakes）。
+[[test]]
+name = "echo_paced"
+path = "tests/echo_paced.rs"
+required-features = ["test-fakes"]

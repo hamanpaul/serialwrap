@@ -446,6 +446,7 @@ fn send(
         permit,
         payload: payload.to_vec(),
         reply,
+        aggregate: None,
     };
     if ctx.tx.jobs.send(job).is_err() {
         return frozen;

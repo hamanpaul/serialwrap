@@ -1293,6 +1293,7 @@ impl Shared {
             },
             payload: payload.to_vec(),
             reply: reply_tx,
+            aggregate: None,
         };
         let sent = handle.jobs.send(job).is_ok()
             && handle.wait_report(&reply_rx).is_some_and(|report| {

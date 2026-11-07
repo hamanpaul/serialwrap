@@ -65,6 +65,7 @@ fn job(
             },
             payload: bytes.to_vec(),
             reply,
+            aggregate: None,
         })
         .unwrap();
     report

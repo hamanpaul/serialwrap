@@ -345,6 +345,7 @@ pub mod bb {
                 },
                 payload: payload.to_vec(),
                 reply,
+                aggregate: None,
             })
             .expect("TxWriter 接收 job");
         rx.recv_timeout(WAIT).expect("TxReport")

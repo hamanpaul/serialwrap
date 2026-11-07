@@ -115,6 +115,9 @@ pub struct RxShared {
     /// P7 Task 7（SC-30）：login run 取消世代。`RunCancel` 建立時記下當時值，之後遞增即視為已取消
     /// （actor 在 quiet arm 的同一事件內呼叫 `cancel_login_runs`，不需新增 Effect 變體）。
     run_cancel_gen: AtomicU64,
+    /// P8 Task 5：檔案傳輸等待的取消世代。drain Phase 1（`SessionCore::begin_stop`，所有 `StopKind`）遞增；
+    /// 只影響以 [`RunCancel::watching_transfers`] 建立的取消旗標，login run（SC-30）不受影響。
+    transfer_cancel_gen: AtomicU64,
 }
 
 impl RxShared {
@@ -130,7 +133,14 @@ impl RxShared {
             stats_override: AtomicU64::new(u64::MAX),
             capture: Mutex::new(None),
             run_cancel_gen: AtomicU64::new(0),
+            transfer_cancel_gen: AtomicU64::new(0),
         })
+    }
+
+    /// P8 Task 5：取消本 bridge 上進行中的檔案傳輸等待（watching_transfers 的 `RunCancel` 轉真）並喚醒等待者。
+    /// 不動 login run 的取消世代（P7 SC-30 行為不變）。
+    pub fn cancel_transfer_runs(&self) {
+        todo!("P8-T5")
     }
 
     /// SC-30：取消本 bridge 上所有既存的 login run（其 `RunCancel::is_triggered` 轉真）並喚醒等待者。
@@ -847,6 +857,8 @@ pub struct RunCancel {
     rx: Arc<RxShared>,
     /// 建立當下的 `RxShared::run_cancel_gen`；之後 `cancel_login_runs` 使其不符即視為取消。
     start_gen: u64,
+    /// P8 Task 5：`Some(建立當下的 transfer_cancel_gen)` 表示另監看檔案傳輸取消（drain Phase 1）。
+    transfer_gen: Option<u64>,
 }
 
 impl RunCancel {
@@ -855,7 +867,13 @@ impl RunCancel {
             flag: Arc::new(AtomicBool::new(false)),
             rx: Arc::clone(rx),
             start_gen: rx.run_cancel_gen.load(Ordering::Acquire),
+            transfer_gen: None,
         }
+    }
+
+    /// P8 Task 5：同一取消旗標與 login 世代，另監看 [`RxShared::cancel_transfer_runs`]（自呼叫當下起）。
+    pub fn watching_transfers(&self) -> RunCancel {
+        todo!("P8-T5")
     }
     /// 設旗標並喚醒等待中的 `wait_for_regex_cancellable`（P7 Task 3 先行；Task 7 由 `Effect::CancelLogin` 觸發）。
     pub fn trigger(&self) {

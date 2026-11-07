@@ -12,6 +12,8 @@ pub mod fake_shell;
 pub mod flash_core;
 /// P8 Task 9：`/dev/ttyMCU` 端點與認線協調測試台（`FlashRig`／`Mcu`）。
 pub mod flash_rig;
+/// P8 Task 5：`OpTransferPort` 測試台（`PortRig`／`FakeDut`）。
+pub mod transfer_port;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -3216,6 +3218,7 @@ impl TxRig {
                 permit: p,
                 payload: payload.to_vec(),
                 reply: tx,
+                aggregate: None,
             })
             .expect("TxWriter 接收 job");
         rx

@@ -113,6 +113,7 @@ fn job(
             },
             payload: payload.to_vec(),
             reply: tx,
+            aggregate: None,
         },
         rx,
     )
@@ -137,6 +138,7 @@ fn send(r: &Rig, class: TxClass, op: u64, epoch: u64, payload: &[u8]) -> TxRepor
             },
             payload: payload.to_vec(),
             reply: tx,
+            aggregate: None,
         })
         .unwrap();
     rx.recv_timeout(Duration::from_secs(2)).unwrap()
@@ -739,7 +741,7 @@ fn send_flash(r: &Rig, op: u64, class: TxClass, probe_id: Option<u64>, payload: 
     let (tx, rx) = crossbeam_channel::bounded(1);
     let mut permit = flash_permit(class, probe_id);
     permit.op_id = OpId(op);
-    r.h.jobs.send(TxJob { permit, payload: payload.to_vec(), reply: tx }).unwrap();
+    r.h.jobs.send(TxJob { permit, payload: payload.to_vec(), reply: tx, aggregate: None }).unwrap();
     rx.recv_timeout(Duration::from_secs(2)).unwrap()
 }
 

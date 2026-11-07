@@ -1,10 +1,13 @@
 //! Slice 2.4 檔案傳輸（P8）：T3 提供板端命令樣板與 RX 判定 helper，T4 提供 `push_file`／`pull_file` 引擎。
 //!
-//! 引擎只依賴 [`TransferPort`]（T5 的 `OpTransferPort` 之後實作它），不直接碰 `OpCtx`／`TxWriter`；
+//! 引擎只依賴 [`TransferPort`]（T5 的 [`OpTransferPort`] 實作它），不直接碰 `OpCtx`／`TxWriter`；
 //! 也不自行判定 RPC 錯誤碼——只回傳 Python 相同鍵序的 `PyDict` 或 [`TransferAbort`]（OD-62）。
 
+pub mod op_port;
 pub mod rx_match;
 pub mod templates;
+
+pub use op_port::OpTransferPort;
 
 use std::time::Duration;
 
