@@ -19,6 +19,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BASELINE_REF = "origin/main"
 BASELINE_COMMIT = "d453bbf023d21baeb3aa96ced3357854b458ade9"
+BASELINE_LABEL = f"{BASELINE_REF}@{BASELINE_COMMIT}"
 SOURCE_PATH = "sw_core/source_policy.py"
 TEST_PATH = "tests/test_source_policy.py"
 OUTPUT_PATH = ROOT / "contracts/golden/p5/source_policy.ndjson"
@@ -27,7 +28,7 @@ TEST_INPUT_CONSTANTS = {"EXISTING_SOURCE_VALUES", "EXISTING_HUMAN_VALUES"}
 
 def git_show(path: str) -> str:
     return subprocess.run(
-        ["git", "show", f"{BASELINE_REF}:{path}"],
+        ["git", "show", f"{BASELINE_COMMIT}:{path}"],
         cwd=ROOT,
         check=True,
         capture_output=True,
@@ -42,12 +43,12 @@ def load_python_baseline(source: str):
         raise RuntimeError("無法建立 Python 基線模組")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    exec(compile(source, f"{BASELINE_REF}:{SOURCE_PATH}", "exec"), module.__dict__)
+    exec(compile(source, f"{BASELINE_LABEL}:{SOURCE_PATH}", "exec"), module.__dict__)
     return module
 
 
 def test_source_nodes(source: str) -> list[ast.stmt]:
-    tree = ast.parse(source, filename=f"{BASELINE_REF}:{TEST_PATH}")
+    tree = ast.parse(source, filename=f"{BASELINE_LABEL}:{TEST_PATH}")
     selected: list[ast.stmt] = []
     found_constants: set[str] = set()
     found_test_class = False
@@ -155,17 +156,11 @@ def main() -> int:
     parser.add_argument("--check", action="store_true", help="只比對，不覆寫 golden")
     args = parser.parse_args()
 
-    actual_commit = subprocess.run(
-        ["git", "rev-parse", BASELINE_REF],
+    subprocess.run(
+        ["git", "cat-file", "-e", f"{BASELINE_COMMIT}^{{commit}}"],
         cwd=ROOT,
         check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if actual_commit != BASELINE_COMMIT:
-        raise RuntimeError(
-            f"{BASELINE_REF} 基線漂移：預期 {BASELINE_COMMIT}，目前 {actual_commit}"
-        )
+    )
 
     source_module = load_python_baseline(git_show(SOURCE_PATH))
     rows = capture_rows(source_module, git_show(TEST_PATH))
