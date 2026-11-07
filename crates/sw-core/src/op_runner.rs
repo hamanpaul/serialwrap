@@ -551,7 +551,11 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let timeout_s = q.req.timeout_s;
     let completion_regex = q.req.completion_regex.as_deref();
     let passthrough = t.platform == "passthrough";
-    if !passthrough && is_reboot_command(command) {
+    // G3（Python `session_manager.py:6840-6868`）：`expect_reboot` 不看命令文字、也不排除 passthrough，
+    // 一律走 reboot 分支；命令文字猜法只對非 passthrough 生效。分流先於 completion pattern 與
+    // `command_completion` META，故旗標優先於 `completion_regex`。
+    let guessed_reboot = !passthrough && is_reboot_command(command);
+    if q.req.expect_reboot || guessed_reboot {
         return run_reboot(ctx, grant, q, &mode);
     }
     let completion_pattern = if passthrough {

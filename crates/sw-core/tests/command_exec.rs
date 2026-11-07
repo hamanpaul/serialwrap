@@ -902,6 +902,146 @@ fn reboot_flushes_commands_queued_behind_it() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 1 項：`expect_reboot` 執行路由（G3；Python `origin/main:sw_core/session_manager.py:6840-6868`）
+// ---------------------------------------------------------------------------
+
+/// 串接式重開命令：`is_reboot_command()` 不猜中（不擴大猜法），只能靠 `expect_reboot` 旗標分流。
+const WP53_CHAINED: &str = "echo a && reboot";
+
+/// 是否送出過救援鍵（`_recover_after_failure` 的 CTRL_C／CTRL_D；WAL 與 PAL 兩端都查）。
+fn wp53_recover_keys_sent(h: &ActorRig) -> bool {
+    let wal = tx_rows(h).iter().any(|row| {
+        row.get("source").and_then(PyValue::as_str) == Some("system:recover")
+            || matches!(b64(row).as_slice(), b"\x03" | b"\x04")
+    });
+    wal || h.dev.take_tx().iter().any(|b| matches!(b, 0x03 | 0x04))
+}
+
+/// WAL 內帶 `completion_regex` 欄位的 META（Python `test_flag_wins_over_completion_regex` 斷言其不存在）。
+fn wp53_completion_metas(h: &ActorRig) -> Vec<PyDict> {
+    h.wal_meta_events()
+        .into_iter()
+        .filter(|meta| meta.get("completion_regex").is_some())
+        .collect()
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler`：Python
+/// `if expect_reboot or guessed_reboot: return self._handle_reboot_command(...)`——旗標不受命令文字限制。
+/// 短 timeout、DUT 不回 prompt → reboot 分支結算為 `EXPECT_REBOOT`（partial），不得走一般逾時救援送 Ctrl-C／Ctrl-D。
+#[test]
+fn wp53_route_flag_uses_reboot_handler() {
+    assert!(
+        !sw_core::quiet_gate::is_reboot_command(WP53_CHAINED),
+        "串接命令不得被猜中（不擴大猜法）"
+    );
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["execution_mode"], PyValue::from("line"), "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from(""), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(true), "{rec:?}");
+    assert!(
+        !wp53_recover_keys_sent(&h),
+        "旗標命令走 reboot 分支，不得送救援鍵"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_wins_over_completion_regex`：reboot 分流位於 completion pattern
+/// 與 `command_completion` META 之前。假 DUT 只回 `DONE`、不回 prompt：不得因 `DONE` 正常完成，
+/// 也不得寫出帶 `completion_regex` 的 META，結算為 reboot recovery。
+#[test]
+fn wp53_route_flag_wins_over_completion_regex() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\nDONE\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+        r.completion_regex = Some("(?m)^DONE\\r?$".into());
+    });
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(
+        rec["partial"],
+        PyValue::Bool(true),
+        "不得依 completion_regex 正常完成：{rec:?}"
+    );
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(rec["stdout"], PyValue::from(""), "{rec:?}");
+    assert!(
+        wp53_completion_metas(&h).is_empty(),
+        "reboot 分流先於 command_completion META：{:?}",
+        wp53_completion_metas(&h)
+    );
+    assert!(!wp53_recover_keys_sent(&h), "不得送救援鍵");
+}
+
+/// 無旗標對照（`tests/test_expect_reboot.py::test_without_flag_chained_command_keeps_old_behaviour`）：
+/// 串接命令不被猜中 → 維持一般命令路徑；逾時走 `_recover_after_failure` 送 CTRL_C。
+#[test]
+fn wp53_route_without_flag_keeps_timeout_recovery() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with(WP53_CHAINED, |r| r.timeout_s = 1.0);
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(&h, Duration::from_millis(100), "逾時救援收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");
+    assert!(wal_tx_has(&h, b"\x03"), "一般路徑逾時送 CTRL_C");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// 無旗標對照：串接命令帶 `completion_regex` 時仍依 regex 正常完成，並寫出 `command_completion` META。
+#[test]
+fn wp53_route_without_flag_completion_regex_completes() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\nDONE\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.completion_regex = Some("(?m)^DONE\\r?$".into());
+    });
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("a\nDONE"), "{rec:?}");
+    let metas = wp53_completion_metas(&h);
+    assert_eq!(metas.len(), 1, "{metas:?}");
+    assert_eq!(metas[0]["event"], PyValue::from("command_completion"));
+    assert!(!wp53_recover_keys_sent(&h));
+    assert_eq!(state_of(&h), "READY");
+}
+
+// ---------------------------------------------------------------------------
 // recover
 // ---------------------------------------------------------------------------
 
