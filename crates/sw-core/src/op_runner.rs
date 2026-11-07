@@ -533,6 +533,16 @@ fn passthrough_completion_pattern(t: &ProfileTemplate, completion: Option<&str>)
         .then(|| t.prompt_regex.clone())
 }
 
+/// 命令 TX 類別（Python `session_manager.py:6603-6607`、`:6414-6419` 的 `"human_line" if human else "agent"`）：
+/// 只看 `SubmitReq::is_trusted_human()`（RPC 依原始 source 判定的 `trusted_human` OR `HumanConsole`），永不看 source 字首。
+fn command_tx_class(q: &QueuedCommand) -> TxClass {
+    if q.req.is_trusted_human() {
+        TxClass::HumanLine
+    } else {
+        TxClass::Command
+    }
+}
+
 fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
     let t = &ctx.profile.template;
     let mode = normalized_mode(&q.req.mode).to_string();
@@ -569,7 +579,7 @@ fn run_command(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand) -> OpOutcome {
         ctx,
         grant,
         &payload,
-        TxClass::Command,
+        command_tx_class(q),
         &q.req.source,
         Some(cmd_id),
         true,
@@ -666,7 +676,7 @@ fn run_reboot(ctx: &OpCtx, grant: &OpGrant, q: &QueuedCommand, mode: &str) -> Op
         ctx,
         grant,
         &payload,
-        TxClass::Command,
+        command_tx_class(q),
         &q.req.source,
         Some(&q.cmd_id),
         true,

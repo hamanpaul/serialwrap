@@ -594,6 +594,291 @@ fn gate_rules() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-5 第 3 項：可信 human 命令類別 `HumanLine`（Python `human_line`，G7a／G7b、OD-74）
+// ---------------------------------------------------------------------------
+
+/// 以 `human:cli` 來源建立一筆 `HumanLine` job（epoch 固定 7、cmd_id 固定 "c"、log=true）。
+fn human_line_job(op: u64, payload: &[u8]) -> (TxJob, crossbeam_channel::Receiver<TxReport>) {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    (
+        TxJob {
+            permit: TxPermit {
+                op_id: OpId(op),
+                epoch: 7,
+                owner_gen: 0,
+                fsm_gen: 0,
+                class: TxClass::HumanLine,
+                source: "human:cli".into(),
+                cmd_id: Some("c".into()),
+                log: true,
+                input_epoch: None,
+                replay_hold: None,
+            },
+            payload: payload.to_vec(),
+            reply: tx,
+        },
+        rx,
+    )
+}
+
+/// `HumanLine` 只豁免 quiet／reconfirm：對照 Python `origin/main:sw_core/uart_io.py:621-670` `_tx_reject_reason`，
+/// `human_line` 仍受 draining（frozen）、flashing、stale_generation、cancelled 擋；quiet 只擋 `agent`（`:640`）；
+/// 也不比對 owner_gen（只有 `interactive`／`human_raw` 比對，`:642-654`），WAL unhealthy 只擋 system probe
+/// （`:617-620`）。對照組 `Command` 於相同 quiet／reconfirm 狀態仍拒絕。
+#[test]
+fn wp55_human_line_fence_exempts_only_quiet_and_reconfirm() {
+    let rows: Vec<GateRow> = vec![
+        gate_row(
+            "HumanLine+quiet",
+            &[TxClass::HumanLine],
+            |s| s.quiet_active = true,
+            Ok(()),
+        ),
+        gate_row(
+            "HumanLine+reconfirm",
+            &[TxClass::HumanLine],
+            |s| s.reconfirm_pending = true,
+            Ok(()),
+        ),
+        gate_row(
+            "HumanLine+quiet+reconfirm",
+            &[TxClass::HumanLine],
+            |s| {
+                s.quiet_active = true;
+                s.reconfirm_pending = true;
+            },
+            Ok(()),
+        ),
+        gate_row(
+            "HumanLine+wal_unhealthy",
+            &[TxClass::HumanLine],
+            |s| s.wal_unhealthy = true,
+            Ok(()),
+        ),
+        GateRow {
+            name: "HumanLine+owner_gen 不一致",
+            classes: &[TxClass::HumanLine],
+            setup: |s| s.owner_gen = 3,
+            permit_owner_gen: 1,
+            permit_fsm_gen: 0,
+            expect: Ok(()),
+        },
+        gate_row(
+            "HumanLine+frozen",
+            &[TxClass::HumanLine],
+            |s| {
+                s.quiet_active = true;
+                s.frozen = true;
+            },
+            Err(FenceReject::Frozen),
+        ),
+        gate_row(
+            "HumanLine+epoch 不符",
+            &[TxClass::HumanLine],
+            |s| {
+                s.quiet_active = true;
+                s.active_epoch = Some(6);
+            },
+            Err(FenceReject::StaleEpoch),
+        ),
+        gate_row(
+            "HumanLine+active_epoch=None",
+            &[TxClass::HumanLine],
+            |s| {
+                s.reconfirm_pending = true;
+                s.active_epoch = None;
+            },
+            Err(FenceReject::StaleEpoch),
+        ),
+        gate_row(
+            "HumanLine+op 已取消",
+            &[TxClass::HumanLine],
+            |s| {
+                s.quiet_active = true;
+                s.cancelled.insert(OpId(1));
+            },
+            Err(FenceReject::Cancelled),
+        ),
+        gate_row(
+            "HumanLine+Flashing",
+            &[TxClass::HumanLine],
+            |s| {
+                s.quiet_active = true;
+                s.flash_mode = FlashMode::Flashing;
+            },
+            Err(FenceReject::Flash),
+        ),
+        gate_row(
+            "HumanLine+FlashProbe",
+            &[TxClass::HumanLine],
+            |s| {
+                s.reconfirm_pending = true;
+                s.flash_mode = FlashMode::Probe(9);
+            },
+            Err(FenceReject::Flash),
+        ),
+        // 對照組：同狀態下 Command 不受影響（不得借清除 session fence 放行）。
+        gate_row(
+            "Command+quiet（對照）",
+            &[TxClass::Command],
+            |s| s.quiet_active = true,
+            Err(FenceReject::Quiet),
+        ),
+        gate_row(
+            "Command+reconfirm（對照）",
+            &[TxClass::Command],
+            |s| s.reconfirm_pending = true,
+            Err(FenceReject::ReconfirmPending),
+        ),
+    ];
+    for row in rows {
+        for &class in row.classes {
+            let f = Fence::new();
+            f.with(|s| {
+                s.active_epoch = Some(7);
+                (row.setup)(s);
+            });
+            let p = TxPermit {
+                op_id: OpId(1),
+                epoch: 7,
+                owner_gen: row.permit_owner_gen,
+                fsm_gen: row.permit_fsm_gen,
+                class,
+                source: "human:cli".into(),
+                cmd_id: None,
+                log: true,
+                input_epoch: None,
+                replay_hold: None,
+            };
+            let got = f.with(|s| Fence::admit(s, &p));
+            assert_eq!(got, row.expect, "列={} class={class:?}", row.name);
+        }
+    }
+}
+
+/// 共同 fence 拒絕案例：(op_id, 名稱, fence 設定, 預期拒絕原因)。
+type HumanLineFenceCase = (u64, &'static str, fn(&mut FenceState), FenceReject);
+
+/// TxWriter 端到端：quiet＋reconfirm 武裝時 `HumanLine` 真正寫出並留 WAL TX；在出列檢查通過後、OS 提交前才武裝
+/// quiet 也照常提交（提交點重驗同一規則）。frozen、stale epoch、cancelled、flash 仍零 TX、零 WAL。
+#[test]
+fn wp55_human_line_tx_writer_submits_under_quiet_but_keeps_common_fences() {
+    let r = rig();
+    r.fence.with(|s| {
+        s.quiet_active = true;
+        s.reconfirm_pending = true;
+    });
+    let (j, rx) = human_line_job(1, b"echo hi\n");
+    r.h.jobs.send(j).unwrap();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(8), None)
+    );
+    assert_eq!(r.dev.take_tx(), b"echo hi\n");
+    let lines = tx_lens(&r);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("\"source\":\"human:cli\""),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(payload_b64(&lines[0]), b64(b"echo hi\n"));
+
+    // 出列檢查通過後才武裝 quiet：提交點重驗不因 quiet 拒絕。
+    r.fence.with(|s| {
+        s.quiet_active = false;
+        s.reconfirm_pending = false;
+    });
+    r.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let (j, rx) = human_line_job(2, b"ls\n");
+    r.h.jobs.send(j).unwrap();
+    assert!(r.dev.wait_paused(Duration::from_secs(2)));
+    r.fence.with(|s| {
+        s.quiet_active = true;
+        s.reconfirm_pending = true;
+    });
+    r.dev.release_pause();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(3), None)
+    );
+    assert_eq!(r.dev.take_tx(), b"ls\n");
+    assert_eq!(tx_lens(&r).len(), 2);
+
+    // 共同 fence 仍拒絕（quiet 同時武裝，證明拒絕來自共同檢查而非 quiet）。
+    let cases: [HumanLineFenceCase; 4] = [
+        (10, "frozen", |s| s.frozen = true, FenceReject::Frozen),
+        (
+            11,
+            "stale epoch",
+            |s| s.active_epoch = Some(6),
+            FenceReject::StaleEpoch,
+        ),
+        (
+            12,
+            "cancelled",
+            |s| s.cancelled.insert(OpId(12)),
+            FenceReject::Cancelled,
+        ),
+        (
+            13,
+            "flash",
+            |s| s.flash_mode = FlashMode::Flashing,
+            FenceReject::Flash,
+        ),
+    ];
+    for (op, name, setup, reason) in cases {
+        r.fence.with(|s| {
+            s.frozen = false;
+            s.active_epoch = Some(7);
+            s.cancelled.clear();
+            s.flash_mode = FlashMode::Off;
+            s.quiet_active = true;
+            s.reconfirm_pending = true;
+            setup(s);
+        });
+        let submits = r.dev.os_submits();
+        let (j, rx) = human_line_job(op, b"echo no\n");
+        r.h.jobs.send(j).unwrap();
+        let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (rep.result.outcome, rep.reject),
+            (TxOutcome::NotSubmitted, Some(reason)),
+            "{name}"
+        );
+        assert_eq!(r.dev.os_submits(), submits, "{name}：零 OS 提交");
+        assert!(r.dev.take_tx().is_empty(), "{name}：零 TX");
+        assert_eq!(tx_lens(&r).len(), 2, "{name}：零 WAL TX");
+    }
+}
+
+/// reboot 命令以 `HumanLine` 提交時，TxWriter 仍於同一次 `Fence::with` 內武裝 quiet／reconfirm：Python
+/// `_handle_reboot_command`（`session_manager.py:6430-6446`）的 arm 不分 `human_line`／`agent`。
+#[test]
+fn wp55_human_line_reboot_still_arms_quiet() {
+    let r = rig();
+    r.fence.with(|s| s.reboot_arm_op = Some(OpId(5)));
+    let (j, rx) = human_line_job(5, b"reboot\n");
+    r.h.jobs.send(j).unwrap();
+    let rep = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (rep.result.outcome, rep.reject),
+        (TxOutcome::Completed(7), None)
+    );
+    assert_eq!(r.dev.take_tx(), b"reboot\n");
+    r.fence.with(|s| {
+        assert!(s.quiet_active, "HumanLine reboot 提交後應武裝 quiet");
+        assert!(
+            s.reconfirm_pending,
+            "HumanLine reboot 提交後應武裝 reconfirm"
+        );
+        assert_eq!(s.reboot_arm_op, None);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // 其他 TX 三態、WAL 證據與帳本上限
 // ---------------------------------------------------------------------------
 

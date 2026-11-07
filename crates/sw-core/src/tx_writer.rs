@@ -41,6 +41,9 @@ pub enum TxClass {
     LoginProbe,
     ReadyReconfirm,
     Command,
+    /// 可信 human 的命令行（Python `human_line`，OD-74／DF-02）：只由 `SubmitReq::is_trusted_human()` 選用；
+    /// 不受 quiet／reconfirm 擋，frozen、epoch、cancelled、flash 等共同檢查照常（`uart_io.py:621-670`）。
+    HumanLine,
     FileTransfer,
     SystemRecoverKey,
     SelfTestProbe,
@@ -238,6 +241,8 @@ impl Fence {
                     return Err(FenceReject::ReconfirmPending);
                 }
             }
+            // Python `_tx_reject_reason`（`uart_io.py:640`）的 quiet 只擋 `agent`；`human_line` 僅受上方共同檢查。
+            TxClass::HumanLine => {}
             TxClass::LoginProbe | TxClass::ReadyReconfirm => {
                 // P7 Task 4／7：auto_probe_blocked（console unlock 的 quiet 不擋自身登入 run）。
                 if st.quiet_active && !st.probe_quiet_exempt {
@@ -634,8 +639,9 @@ impl TxWriter {
                         {
                             state.in_flight = None;
                         }
+                        // Python `_handle_reboot_command` 的 arm 不分 `human_line`／`agent`（session_manager.py:6430-6446）。
                         if submitted
-                            && job.permit.class == TxClass::Command
+                            && matches!(job.permit.class, TxClass::Command | TxClass::HumanLine)
                             && state.reboot_arm_op == Some(job.permit.op_id)
                         {
                             state.reboot_arm_op = None;
