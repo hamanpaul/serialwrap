@@ -31,6 +31,7 @@ use sw_proto::pyfmt::py_str;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::valid_completion_regex;
 use sw_proto::rpc_types::Params;
+use sw_proto::source_policy::check_source;
 
 use crate::framing::RpcHandler;
 
@@ -616,9 +617,15 @@ impl Service {
                     return Ok(error("INVALID_COMPLETION_REGEX"));
                 }
                 let completion_regex = completion.and_then(PyValue::as_str).map(str::to_string);
+                // 外部來源先於 selector、timeout 與命令 admission 驗證；保留政策結果供後續回應標註。
+                let raw_source = p.str_or("source", "")?;
+                let source_check = check_source(Some(&raw_source), "agent", "source", true);
+                if let Some(source_error) = source_check.error.clone() {
+                    return Ok(source_error);
+                }
+                let source = source_check.source.clone();
                 let selector = first_str(&p, &["selector", "com", "alias"]);
                 let command = first_str(&p, &["cmd", "command"]);
-                let source = p.str_or("source", "agent")?;
                 let mode = p.str_or("mode", "line")?;
                 let timeout_s = p.float_or("timeout_s", 10.0)?;
                 let priority = p.int_or("priority", 10)?;

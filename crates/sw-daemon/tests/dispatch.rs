@@ -187,6 +187,142 @@ fn submit_priority_zero_becomes_ten() {
     );
 }
 
+fn wp51_source_reserved_response(r: &ServiceRig, raw_source: &str) -> String {
+    let hint = "`system` 與 `system:*` 是 daemon 內部保留的來源前綴（WAL 歸因與內部恢復旗標），外部呼叫不可使用。自動化請用 `agent:<名>`，人工操作請用 `human:<名>`；逾時行為差異見 skill「`--source` 的語意」。";
+    j(&sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SOURCE_RESERVED",
+        "field" => "source",
+        "value" => raw_source,
+        "reserved_prefix" => "system",
+        "hint" => hint,
+        "version" => r.version.clone(),
+    })
+}
+
+#[test]
+fn wp51_submit_reserved_source_rejected_before_queue() {
+    let r = ServiceRig::ready_shell();
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+
+    for raw_source in [
+        "system:recover",
+        "system",
+        "SYSTEM:self_test",
+        "system :recover",
+        "ſystem:recover",
+    ] {
+        let before_effects = r.side_effect_fingerprint();
+        let before_registry = r.registry.len();
+        let before_pending = r.registry.pending(&session_id);
+        let before_queue = r.mgr.session_queue_lens("COM0").expect("COM0 佇列");
+        let params =
+            format!(r#"{{"selector":"COM0","cmd":"echo source-policy","source":"{raw_source}"}}"#);
+
+        let response = r.call("command.submit", &params);
+
+        assert_eq!(
+            j(&response),
+            wp51_source_reserved_response(&r, raw_source),
+            "保留來源必須原樣拒絕：{raw_source}"
+        );
+        assert_eq!(r.side_effect_fingerprint(), before_effects, "{raw_source}");
+        assert_eq!(
+            r.registry.len(),
+            before_registry,
+            "不得建立命令紀錄：{raw_source}"
+        );
+        assert_eq!(
+            r.registry.pending(&session_id),
+            before_pending,
+            "不得增加 pending：{raw_source}"
+        );
+        assert_eq!(
+            r.mgr.session_queue_lens("COM0"),
+            Some(before_queue),
+            "不得進入 session queue：{raw_source}"
+        );
+    }
+
+    let invalid_completion = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo source-policy","completion_regex":"[","source":"system:recover"}"#,
+    );
+    assert_eq!(
+        j(&invalid_completion),
+        j(&sw_proto::pydict! {
+            "ok" => false,
+            "error_code" => "INVALID_COMPLETION_REGEX",
+            "version" => r.version.clone(),
+        }),
+        "completion regex 驗證先於來源驗證"
+    );
+
+    let missing_selector = r.call("command.submit", r#"{"source":"system:recover"}"#);
+    assert_eq!(
+        j(&missing_selector),
+        wp51_source_reserved_response(&r, "system:recover"),
+        "來源驗證先於 selector admission"
+    );
+
+    let invalid_timeout = r
+        .call_raw(
+            "command.submit",
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"system:recover","timeout_s":"invalid"}"#,
+        )
+        .expect("來源驗證先於 timeout 轉型");
+    assert_eq!(
+        j(&invalid_timeout),
+        wp51_source_reserved_response(&r, "system:recover"),
+        "來源驗證先於 timeout 轉型"
+    );
+}
+
+#[test]
+fn wp51_submit_normalized_source_reaches_registry() {
+    let r = ServiceRig::ready_shell();
+    for (params, expected_source) in [
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"human"}"#,
+            "human:cli",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"human:"}"#,
+            "human:cli",
+        ),
+        (r#"{"selector":"COM0","cmd":"echo source-policy"}"#, "agent"),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":"vendor:sync"}"#,
+            "vendor:sync",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":42}"#,
+            "42",
+        ),
+        (
+            r#"{"selector":"COM0","cmd":"echo source-policy","source":0}"#,
+            "agent",
+        ),
+    ] {
+        let response = r.call("command.submit", params);
+        assert_eq!(
+            response.get("ok"),
+            Some(&PyValue::Bool(true)),
+            "{}",
+            j(&response)
+        );
+        let record = r
+            .registry
+            .get(s(&response, "cmd_id"))
+            .expect("command.submit 必須建命令紀錄");
+        assert_eq!(
+            record.get("source"),
+            Some(&PyValue::from(expected_source)),
+            "registry source：{params}"
+        );
+    }
+}
+
 #[test]
 fn submit_bad_timeout_raises_before_selector_check() {
     let r = ServiceRig::ready_shell();
