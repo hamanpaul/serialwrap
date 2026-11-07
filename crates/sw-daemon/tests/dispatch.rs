@@ -215,6 +215,170 @@ fn wp52_default_expect_reboot_flows_through_rpc_record_and_get() {
     assert!(command.get("trusted_human").is_none());
 }
 
+#[derive(Debug, PartialEq)]
+struct Wp52RpcSnapshot {
+    uart: Vec<(String, Vec<u8>, usize)>,
+    registry_len: usize,
+    pending: usize,
+    queue_lens: Vec<(&'static str, Option<(i64, i64)>)>,
+    effects: (u64, Vec<u8>, usize),
+}
+
+fn wp52_rpc_snapshot(r: &ServiceRig) -> Wp52RpcSnapshot {
+    let session_id = r.mgr.resolve("COM0").expect("COM0 session");
+    Wp52RpcSnapshot {
+        uart: r
+            .devices
+            .iter()
+            .map(|(path, dev)| (path.clone(), dev.tx_since(0), dev.write_calls()))
+            .collect(),
+        registry_len: r.registry.len(),
+        pending: r.registry.pending(&session_id),
+        queue_lens: ["COM0", "WP52_UNKNOWN"]
+            .into_iter()
+            .map(|selector| (selector, r.mgr.session_queue_lens(selector)))
+            .collect(),
+        effects: r.side_effect_fingerprint(),
+    }
+}
+
+fn wp52_rpc_error(r: &ServiceRig, code: &str) -> PyDict {
+    sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => code,
+        "version" => r.version.clone(),
+    }
+}
+
+fn assert_wp52_rpc_rejected_without_side_effects(
+    r: &ServiceRig,
+    params: &str,
+    expected: &str,
+) {
+    r.settle();
+    let before = wp52_rpc_snapshot(r);
+    let response = r.call("command.submit", params);
+    assert_eq!(j(&response), expected, "request={params}");
+    r.settle();
+    assert_eq!(wp52_rpc_snapshot(r), before, "request={params}");
+}
+
+#[test]
+fn wp52_rpc_expect_reboot_invalid_type_zero_tx() {
+    let r = ServiceRig::ready_shell();
+    let expected = j(&wp52_rpc_error(&r, "INVALID_EXPECT_REBOOT"));
+    for (raw_value, selector) in [
+        (r#""false""#, Some("COM0")),
+        ("1", Some("WP52_UNKNOWN")),
+        (r#""false""#, None),
+        ("1", Some("COM0")),
+        (r#""false""#, Some("WP52_UNKNOWN")),
+        ("1", None),
+    ] {
+        let selector = selector
+            .map(|s| format!(",\"selector\":\"{s}\""))
+            .unwrap_or_default();
+        let params = format!(r#"{{"cmd":"wp52 type check"{selector},"expect_reboot":{raw_value}}}"#);
+        assert_wp52_rpc_rejected_without_side_effects(&r, &params, &expected);
+    }
+}
+
+#[test]
+fn wp52_rpc_expect_reboot_interactive_rejected() {
+    let r = ServiceRig::ready_shell();
+    let expected = j(&sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "EXPECT_REBOOT_MODE_UNSUPPORTED",
+        "hint" => "--expect-reboot 只適用 line／background 模式；interactive 是 lease 按鍵通道，不走 reboot 路徑。",
+        "version" => r.version.clone(),
+    });
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"WP52_UNKNOWN","cmd":"","mode":"interactive","expect_reboot":true}"#,
+        &expected,
+    );
+}
+
+#[test]
+fn wp52_rpc_expect_reboot_validation_order() {
+    let r = ServiceRig::ready_shell();
+    let invalid_completion = j(&sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "INVALID_COMPLETION_REGEX",
+        "version" => r.version.clone(),
+    });
+    let reserved_source = wp51_source_reserved_response(&r, "system:recover");
+    let invalid_expect_reboot = j(&wp52_rpc_error(&r, "INVALID_EXPECT_REBOOT"));
+    let not_found = j(&sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_NOT_FOUND",
+        "selector" => "WP52_UNKNOWN",
+        "version" => r.version.clone(),
+    });
+
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"WP52_UNKNOWN","cmd":"x","completion_regex":"[","source":"system:recover","expect_reboot":"false"}"#,
+        &invalid_completion,
+    );
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"WP52_UNKNOWN","cmd":"x","completion_regex":"x+","source":"system:recover","expect_reboot":"false"}"#,
+        &reserved_source,
+    );
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"WP52_UNKNOWN","cmd":"x","completion_regex":"x+","expect_reboot":"false"}"#,
+        &invalid_expect_reboot,
+    );
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"WP52_UNKNOWN","cmd":"x","completion_regex":"x+","expect_reboot":false}"#,
+        &not_found,
+    );
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"WP52_UNKNOWN","cmd":"x","timeout_s":"invalid","expect_reboot":1}"#,
+        &invalid_expect_reboot,
+    );
+}
+
+#[test]
+fn wp52_rpc_expect_reboot_false_interactive_allowed() {
+    for raw_value in [Some("false"), Some("null"), None] {
+        let r = ServiceRig::ready_shell();
+        let flag = raw_value
+            .map(|value| format!(",\"expect_reboot\":{value}"))
+            .unwrap_or_default();
+        let params = format!(r#"{{"selector":"COM0","cmd":"","mode":"interactive"{flag}}}"#);
+        let response = r.call("command.submit", &params);
+        let cmd_id = s(&response, "cmd_id").to_string();
+        assert_eq!(
+            j(&response),
+            wp51_submit_success_response(&r, &cmd_id, None, None, "agent"),
+            "interactive falsy/default flag must be admitted: {params}"
+        );
+        assert!(response.get("expect_reboot").is_none());
+        wait_until("interactive 空命令建立 lease", || {
+            r.registry
+                .get(&cmd_id)
+                .and_then(|record| record.get("interactive_session_id").cloned())
+                .is_some_and(|value| !value.is_null())
+        });
+        let command = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        assert!(
+            command
+                .get("interactive_session_id")
+                .is_some_and(|value| !value.is_null()),
+            "interactive lease ID 未寫入 command record：{}",
+            j(&command)
+        );
+    }
+}
+
 fn wp51_source_reserved_response(r: &ServiceRig, raw_source: &str) -> String {
     wp51_reserved_source_response(r, "source", raw_source)
 }
