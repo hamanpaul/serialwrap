@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -311,6 +312,62 @@ def test_breaker_freeze_matches_lock():
         assert fr["required_case_ids"] == lock["sets"]["slice_2.4"]
         assert fr["cases_lock_sha256"] == hashlib.sha256(lock_bytes).hexdigest()
         assert fr["cases_yaml_sha256"] == hashlib.sha256((ACC / "cases.yaml").read_bytes()).hexdigest()
+
+
+# 審查 P8X-0aa7457-1（第 2 輪）：lock 的 case_attrs 只含分母屬性（regen_lock 的 ATTR_KEYS），evidence／contract／
+# source_ref 等欄位在凍結後被改動，只要 revision 依 OD-76 前進並追加 revision_advance，regen_lock --check 與上方各測試都維持
+# 綠燈；唯一守門是凍結檔的逐案指紋。比照 tests/test_slice21_case_freeze.py::test_freeze_case_fingerprints_match_current_cases
+# （該測試只涵蓋 2.1／2.2）對 2.4 逐案重算比對。
+def _case_fingerprint(case: dict) -> str:
+    """單一案例完整 YAML 映射的 canonical JSON sha256（與凍結工具同一定義；此處獨立重算，不引用工具實作）。"""
+    return hashlib.sha256(json.dumps(case, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                          .encode("utf-8")).hexdigest()
+
+
+def _s24_fingerprint_drift(cases: dict) -> list[str]:
+    """回傳 Slice 2.4 有效分母內「現行映射與有效凍結指紋不符」或已自 cases.yaml 消失的案例（依凍結原序）。"""
+    raise NotImplementedError("P8-T1 第 2 輪階段 A：Slice 2.4 逐案指紋比對尚未實作")
+
+
+@pytest.mark.memory_only
+@pytest.mark.xfail(strict=True, raises=NotImplementedError, reason="P8-T1 第 2 輪階段 A")
+def test_s24_freeze_case_fingerprints_match_current_cases():
+    """凍結後 Slice 2.4 必要案例的任何欄位都不得無聲改動。要改須先取得擁有者逐名 OD，再以
+    `freeze_slice_cases.py --slice 2.4 --amend --fingerprint-update <case_id>:OD-NN --source-commit <sha> --field <欄位>`
+    追加指紋更新修訂（OD-52 模式）；有效指紋只換掉被逐名核准的案例。"""
+    base = json.loads(FREEZE24.read_text(encoding="utf-8"))
+    fps = base["case_fingerprints"]
+    assert isinstance(fps, dict) and sorted(fps) == sorted(base["required_case_ids"])
+    fr = _effective(FREEZE24)
+    assert set(fr["required_case_ids"]) <= set(base["required_case_ids"])
+    updated = {u["case_id"] for a in fr["amendments"] for u in a.get("fingerprint_updates", [])}
+    assert {cid for cid in fps if fr["case_fingerprints"][cid] != fps[cid]} == updated
+    for amendment in fr["amendments"]:
+        decisions = amendment.get("decisions") or [amendment.get("decision")]
+        assert decisions and all(isinstance(od, str) and od.startswith("OD-") for od in decisions)
+    changed = _s24_fingerprint_drift(_cases())
+    assert not changed, f"凍結後 Slice 2.4 必要案例內容被改動（須擁有者逐名 OD＋指紋更新修訂）：{changed}"
+
+
+@pytest.mark.memory_only
+@pytest.mark.xfail(strict=True, raises=NotImplementedError, reason="P8-T1 第 2 輪階段 A")
+def test_s24_fingerprint_guard_flags_post_freeze_edit():
+    """審查 P8X-0aa7457-1 的失敗情境（記憶體內重現，不動檔案）：Task 6 直接補 s24-xfer-session-gates 的 evidence、
+    其他 s24 案例改 source_ref、既有回歸案例改 contract 或案例消失，守門都須逐名指出；
+    不在 2.4 分母內的案例（conditional 的 f7-binary-roundtrip-md5）改動不屬本守門。"""
+    cases = _cases()
+    before = set(_s24_fingerprint_drift(cases))
+    edited = copy.deepcopy(cases)
+    gates = edited["s24-xfer-session-gates"]
+    gates["evidence"] = [*gates["evidence"], "tests/contract_blackbox/test_s24_file_transfer.py::test_gate_passthrough"]
+    edited["s24-xfer-push-roundtrip"]["source_ref"] += "_renamed"
+    edited["p1-cmd-file"]["contract"] += "（凍結後改寫）"
+    del edited["s24-mcu-rpc-shapes"]
+    edited["f7-binary-roundtrip-md5"]["contract"] += "（不在 2.4 分母）"
+    after = _s24_fingerprint_drift(edited)
+    assert len(after) == len(set(after))
+    assert set(after) - before == {"s24-xfer-session-gates", "s24-xfer-push-roundtrip", "p1-cmd-file",
+                                   "s24-mcu-rpc-shapes"}
 
 
 @pytest.mark.memory_only
