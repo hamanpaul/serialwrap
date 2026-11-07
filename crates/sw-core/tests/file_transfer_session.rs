@@ -399,6 +399,37 @@ fn foreground_busy_returns_session_busy() {
     let _ = x.rig.wait_done(&cmd);
 }
 
+/// P8X-7af8adc-1：傳輸占用前景槽期間送入的 `command.submit`（line／background／interactive），比照 Python——file op
+/// 不經 arbiter，worker 照常出列並在 `execute_command` 以 `SESSION_BUSY` 結束（interactive 模式在 lease refresh 前、
+/// 其餘在 `_begin_foreground_operation_locked`）——於傳輸進行中即成 `status=error`，不延後到傳輸結束才執行；
+/// 外部 oracle：傳輸結束後 DUT 從未收到這些命令。
+#[test]
+fn command_submitted_during_transfer_fails_session_busy_not_deferred() {
+    let x = XferRig::ready(SHELL_PROFILE, ShellCaps::busybox_base64());
+    let rx = push_held_in_chunk_loop(&x);
+    x.wait_peer_holding();
+    let ids: Vec<String> = ["line", "background", "interactive"]
+        .into_iter()
+        .map(|mode| x.rig.submit_with(&format!("echo SWBUSY_{mode}"), |r| r.mode = mode.into()))
+        .collect();
+    for id in &ids {
+        let rec = x.rig.wait_done(id);
+        assert_eq!(rec.get("status"), Some(&PyValue::from("error")), "{rec:?}");
+        assert_eq!(rec.get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "{rec:?}");
+    }
+    assert!(rx.try_recv().is_err(), "命令在傳輸進行中即被拒（不是傳輸結束後才結算）");
+    x.peer.release_hold();
+    let r = rx.recv_timeout(XFER_WAIT).expect("回覆").expect("字典");
+    assert_eq!(r.get("ok"), Some(&PyValue::Bool(true)), "{r:?}");
+    x.wait_foreground_busy(false);
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = x.rig.get_state();
+    assert_eq!(x.peer.lines_containing("SWBUSY_"), 0, "外部 oracle：被拒的命令傳輸結束後也不得上 UART");
+    for id in &ids {
+        assert_eq!(x.rig.command_get(id).get("error_code"), Some(&PyValue::from("SESSION_BUSY")), "終態不被覆寫");
+    }
+}
+
 #[test]
 fn agent_lease_returns_interactive_busy_zero_tx() {
     let x = XferRig::ready(SHELL_PROFILE, ShellCaps::busybox_base64());

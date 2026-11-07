@@ -161,7 +161,7 @@ def test_echo_stall_blackbox(sw_env, shell_target, tmp_path):
 
 GATE_SCENARIOS = [
     "quiet", "quiet_human_explicit", "quiet_human_bare", "rpc_args", "not_found", "passthrough",
-    "agent_lease", "foreground_busy",
+    "agent_lease", "foreground_busy", "command_during_transfer",
 ]
 
 
@@ -258,6 +258,39 @@ def test_gate_resolve_quiet(sw_env, shell_target, tmp_path, scenario):
             assert r == {"ok": False, "error_code": "SESSION_BUSY", "selector": "COM0"}, r
         assert len(shell_target.rx_log()) == before, "SESSION_BUSY 零 TX"
         sw_env.wait_until(lambda: sw_env.session("COM0")["foreground_busy"] is False, timeout=20)
+        return
+
+    if scenario == "command_during_transfer":
+        # 反向（P8X-7af8adc-1）：傳輸占用前景槽期間送入的 command.submit，Python arbiter worker 照常出列並在
+        # `_begin_foreground_operation_locked` 以 SESSION_BUSY 結束（status=error），不延後到傳輸結束才執行；
+        # 外部 oracle：DUT 從未收到該命令（no_forbidden_interleave）。echo 停滯把傳輸固定在 chunk 的 echo-ACK 等待中。
+        src.write_bytes(os.urandom(2048))
+        start = len(shell_target.rx_log())
+        shell_target.arm(echo_stall_after=PROBE_LINE_BYTES + 100)
+        fut = sw_env.rpc_async("file.push", push, timeout_s=120)
+        sw_env.wait_until(lambda: len(shell_target.rx_log()) - start > PROBE_LINE_BYTES + 100, timeout=10)
+        assert sw_env.session("COM0")["foreground_busy"] is True
+        marker = f"SWBUSY_{uuid.uuid4().hex[:8]}"
+        sub = sw_env.rpc("command.submit", {"selector": "COM0", "cmd": f"echo {marker}", "timeout_s": 10})
+        assert sub.get("ok") is True, sub
+        got: dict = {}
+
+        def _cmd_done() -> bool:
+            got.update(sw_env.rpc("command.get", {"cmd_id": sub["cmd_id"]})["command"])
+            return got.get("status") in {"done", "error", "canceled"}
+
+        sw_env.wait_until(_cmd_done, timeout=3)
+        assert not fut.done(), "命令在傳輸進行中即結算（不是傳輸結束後）"
+        assert (got["status"], got.get("error_code")) == ("error", "SESSION_BUSY"), got
+        res = _body(fut.result(timeout=60))
+        assert res.get("ok") is False and res.get("error_code") == "TRANSFER_ECHO_STALL", res
+        sw_env.wait_until(lambda: sw_env.session("COM0")["foreground_busy"] is False, timeout=20)
+        _settled_rx_len(shell_target, quiet_s=0.5)
+        time.sleep(1.0)  # 觀察窗（證明延後執行不存在），不作同步點
+        assert marker.encode() not in shell_target.rx_log(), "外部 oracle：被拒的命令傳輸結束後也不得上 UART"
+        cmd = sw_env.rpc("command.get", {"cmd_id": sub["cmd_id"]})["command"]
+        assert (cmd["status"], cmd.get("error_code")) == ("error", "SESSION_BUSY"), cmd
+        _remove_upload_tmp(shell_target)
         return
 
     raise AssertionError(f"未知情境：{scenario}")
