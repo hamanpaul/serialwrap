@@ -10,6 +10,8 @@
 pub mod fake_shell;
 /// P8 Task 8：FLASHING 仲裁測試 kit（`kit`＝CoreHarness、`bb`＝ActorRig 黑箱零 TX 證據）。
 pub mod flash_core;
+/// P8 Task 9：`/dev/ttyMCU` 端點與認線協調測試台（`FlashRig`／`Mcu`）。
+pub mod flash_rig;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;

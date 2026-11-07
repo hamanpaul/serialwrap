@@ -53,7 +53,7 @@ use crate::session_core::{CoreDeps, Effect, ManagerNote, OpGrant, SessionCore, S
 use crate::state_store::{
     lone_surrogate_encode_error, serialize_state, LoadedState, ReleasedRow, StateDelta, StateModel, StateStore,
 };
-use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, spawn_tx_writer};
+use crate::tx_writer::{Fence, OpId, TxClass, TxJob, TxPermit, TxWriterHandle, spawn_tx_writer};
 use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
@@ -176,6 +176,8 @@ struct Entry {
     /// 與 actor 共用的 Fence（P8 Task 8：manager 於 `Inner` 鎖內寫入 `flash_critical`）。
     fence: Arc<Fence>,
     io: Arc<SessionIo>,
+    /// 與 executor 共用的各 epoch IoWorker（P8 Task 9：`tx_for`／`line_control_for` 以 Fence 的 `active_epoch` 取值）。
+    workers: Arc<Mutex<HashMap<u64, IoWorker>>>,
     #[cfg(feature = "test-fakes")]
     history: Arc<Mutex<Vec<String>>>,
 }
@@ -756,7 +758,7 @@ impl Shared {
             rx,
             fence: fence.clone(),
             data: mailbox.data_sender(),
-            workers,
+            workers: workers.clone(),
             runners: HashMap::new(),
             hub,
             pumps: HashMap::new(),
@@ -776,6 +778,7 @@ impl Shared {
                 actor: Arc::new(actor),
                 fence,
                 io,
+                workers,
                 #[cfg(feature = "test-fakes")]
                 history,
             },
@@ -3214,6 +3217,40 @@ impl SessionManager {
     /// P8 Task 8：COM 是否在 flash-critical 臨界區（probe 窗口）。
     pub fn flash_critical(&self, com: &str) -> bool {
         lock(&self.shared.inner).flash_critical.contains(com)
+    }
+
+    /// P8 Task 9：COM 目前 bridge（Fence 的 `active_epoch`＝actor 的 `conn_epoch`）的 TxWriter；無 active epoch 或該
+    /// epoch 的 worker 已收尾 → `None`。FlashCoordinator 以此送 `FlashProbe`／`Flash` TX（permit 仍由 Fence 驗 epoch）。
+    pub fn tx_for(&self, com: &str) -> Option<TxWriterHandle> {
+        let _ = com;
+        todo!("P8-T9")
+    }
+
+    /// P8 Task 9：COM 目前 bridge 的序列線控制（`/dev/ttyMCU` baud 鏡射）；取值規則同 [`SessionManager::tx_for`]。
+    pub fn line_control_for(&self, com: &str) -> Option<Arc<dyn sw_pal::traits::SerialLineControl>> {
+        let _ = com;
+        todo!("P8-T9")
+    }
+
+    /// P8 Task 9：把 control 事件送進 COM 的 actor（flash 事件）；查無 session 或送出失敗回 false。
+    pub fn send_control(&self, com: &str, ev: ControlEvent) -> bool {
+        let _ = (com, ev);
+        todo!("P8-T9")
+    }
+
+    /// P8 Task 9：經 manager 的 WARNING 出口寫一行（FlashCoordinator／FlashEndpoint 用）。
+    pub fn warn(&self, msg: String) {
+        self.shared.warn(msg);
+    }
+
+    /// 只供測試：COM 的 Fence（斷言 `flash_mode`、注入 freeze）。
+    #[cfg(feature = "test-fakes")]
+    pub fn fence_for_test(&self, com: &str) -> Option<Arc<Fence>> {
+        lock(&self.shared.inner)
+            .sessions
+            .values()
+            .find(|e| e.profile.com == com)
+            .map(|e| e.fence.clone())
     }
 
     /// session_id 對應的 COM 是否 flash-critical。

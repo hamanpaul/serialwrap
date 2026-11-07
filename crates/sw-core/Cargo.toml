@@ -30,3 +30,9 @@ test-fakes = ["sw-pal/test-fakes"]
 name = "flash_session_core"
 path = "tests/flash_session_core.rs"
 required-features = ["test-fakes"]
+
+# P8 Task 9：/dev/ttyMCU 端點、認線協調、pump 與 holder-probe（FlashRig 需 test-fakes）。
+[[test]]
+name = "flash_coordinator"
+path = "tests/flash_coordinator.rs"
+required-features = ["test-fakes"]

@@ -649,6 +649,8 @@ pub struct IoWorker {
     wal: Arc<WalWriter>,
     epoch: u64,
     sentinel_keepalive: Option<sw_pal::traits::KeepAlive>,
+    /// P8 Task 9：序列線控制（`split` 前自 `SerialHandle::line_control()` 取得；`/dev/ttyMCU` 的 baud 鏡射）。
+    line_control: Arc<dyn sw_pal::traits::SerialLineControl>,
 }
 
 /// IoWorker 對外快照（P5-T12 parity-amendments #41）。
@@ -669,6 +671,8 @@ impl IoWorker {
         args: IoWorkerArgs,
         observers: Vec<Arc<dyn RxObserver>>,
     ) -> IoWorker {
+        // P8 Task 9：`split` 會消耗 handle，線控制必須先取出（split 後仍可持有並調整速率）。
+        let line_control = handle.line_control();
         let (reader, writer, waker, close) = handle.split();
         let cancel = CancelToken::new(waker.clone());
         let reader_stop = Arc::new(AtomicBool::new(false));
@@ -710,11 +714,17 @@ impl IoWorker {
             wal,
             epoch,
             sentinel_keepalive: args.sentinel_keepalive,
+            line_control,
         }
     }
 
     pub fn tx(&self) -> &TxWriterHandle {
         &self.tx
+    }
+
+    /// P8 Task 9：本 bridge 實體 UART 的線控制（`SessionManager::line_control_for` 的來源）。
+    pub fn line_control(&self) -> Arc<dyn sw_pal::traits::SerialLineControl> {
+        Arc::clone(&self.line_control)
     }
 
     /// reader stop flag＋TxWriterStop::send＋cancel.cancel()＋waker.wake()。
@@ -746,6 +756,7 @@ impl IoWorker {
             wal,
             epoch,
             sentinel_keepalive,
+            line_control: _,
         } = self;
         std::thread::Builder::new()
             .name(format!("serialwrap-drain-{}", stop_id.0))

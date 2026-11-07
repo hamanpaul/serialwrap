@@ -963,3 +963,55 @@ fn begin_stop_shutdown_clears_flash_modes() {
     assert_eq!(kit::flash_mode(&h), FlashMode::Off);
     assert!(!kit::ownership_flash_mode(&h));
 }
+
+// ---------------------------------------------------------------------------
+// 編排者裁決（2026-11-08，rulings/s2.md「P8 T8 的兩項 SPEC-GAP」）：manager 已標 flash-critical、ProbeStart 尚未到時的
+// DeviceDetached 對齊 Python 略過（`session_manager.py:4443-4455` `_detach_by_id` 以 `_flash_busy_locked` 過濾，含
+// `_flash_critical_coms`）——不 drain、不延後；之後的 ProbeStart 與 Python 相同照常授權、probe TX 照常送出。
+// ---------------------------------------------------------------------------
+
+#[test]
+fn device_detached_while_flash_critical_before_probe_is_skipped() {
+    let yaml = manager_yaml(&[&others("COM0", 1, "/s/by-id/usb-A")]);
+    let m = ManagerRig::with(&yaml, LoadedState::default(), None);
+    let dev = m.add_device_at("/s/by-id/usb-A", "/dev/ttyA");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    m.wait_state("COM0", "ATTACHED");
+    assert_eq!(m.mgr.collect_flash_candidates_and_mark().len(), 1);
+    // BSL／reset 期間 by-id 短暫消失：manager 送出 DeviceDetached（`_detach_by_id`）。
+    m.mgr.update_devices(&[]);
+    let s = m.session("COM0"); // GetState 與 DeviceDetached 同一 control lane：以此為處理完成的屏障
+    assert_eq!(s_of(&s, "state").as_deref(), Some("ATTACHED"), "flash-critical 期間略過 detach：{s:?}");
+    assert_eq!(s.get("last_error"), Some(&PyValue::Null), "略過＝不設 DEVICE_REMOVED");
+    assert_eq!(dev.close_count(), 0, "probe 窗口前不得關閉 bridge");
+    m.mgr.unmark_flash_critical("COM0");
+    let s = m.session("COM0");
+    assert_eq!(s_of(&s, "state").as_deref(), Some("ATTACHED"), "略過不是延後：解除標記後也不補做 detach（Python 不重新 reconcile）");
+    assert_eq!(dev.close_count(), 0);
+}
+
+#[test]
+fn flash_critical_device_detached_then_probe_start_matches_python_blackbox() {
+    let rig = bb::attached(false);
+    // manager 的 collect_flash_candidates_and_mark 只寫 Fence.flash_critical（Inner 鎖內）；此處直接設定等價狀態。
+    rig.fence.with(|f| f.flash_critical = true);
+    rig.send_control(ControlEvent::DeviceDetached { by_id: DEVICE_BY_ID.into(), reason: DetachReason::Removed });
+    bb::settle(&rig);
+    assert_eq!(bb::state(&rig), "ATTACHED", "Python _detach_by_id 對 flash-critical 略過：不 drain");
+    assert_eq!(rig.dev.close_count(), 0);
+    assert_eq!(rig.dev.tx_len(), 0);
+    // 之後的 ProbeStart：Python `_BridgeProbe.probe` 照常在原 bridge 上送 sync（`sess.bridge` 仍在）。
+    let grant = bb::probe_start(&rig, 7).expect("略過 detach 後 ProbeStart 照常授權");
+    assert_eq!(bb::flash_mode(&rig), FlashMode::Probe(7));
+    let rep = bb::tx(&rig, grant.epoch, TxClass::FlashProbe, Some(7), b"\x55\x55");
+    assert_eq!(rep.result.outcome, TxOutcome::Completed(2), "{rep:?}");
+    bb::wait_dut_contains(&rig, 0, b"\x55\x55");
+    assert_eq!(bb::wal_tx(&rig), vec![("flash".to_string(), b"\x55\x55".to_vec())]);
+    bb::released(&rig, 7);
+    rig.fence.with(|f| f.flash_critical = false);
+    bb::settle(&rig);
+    assert_eq!(bb::flash_mode(&rig), FlashMode::Off);
+    assert_eq!(bb::state(&rig), "ATTACHED", "略過不延後：probe 結束後也不補做 detach");
+    assert_eq!(rig.dev.close_count(), 0);
+}

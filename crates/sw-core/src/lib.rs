@@ -14,6 +14,7 @@ pub mod drain;
 pub mod event_engine;
 pub mod deferred;
 pub mod file_transfer;
+pub mod flash_endpoint;
 pub mod generations;
 pub mod human_console;
 pub mod lease;
