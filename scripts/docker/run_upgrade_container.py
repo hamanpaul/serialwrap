@@ -14,6 +14,10 @@ systemd-system（OD-48 SPEC-GAP #10）只跑「0.3.2 daemon 執行中直接 `set
 必要檢查見 upgrade_checks.REQUIRED_INSTALL_SH_CHECKS；只支援 systemd-user 與 on-demand（systemd-system 不在此情境）。
 舊 daemon 執行中直接 setup 由預設升級情境的 legacy_handoff_direct_setup（OD-48）驗證。
 
+`--scenario attached-legacy`（0.4.1 前置）：只支援 systemd-user。0.3.2 daemon 以 passthrough profile attach 一個 PTY 假裝置
+（attached_paths 非空），同 uid 有 `systemd --user` 與 `(sd-pam)`；先確認 fd 掃描回 Permission，再斷言 0.4.x 的 setup
+成功切換且耗時有界。必要檢查見 upgrade_checks.REQUIRED_ATTACHED_LEGACY_CHECKS。
+
 只依賴標準函式庫與同目錄的 upgrade_checks（容器內以系統 python3 執行）。
 """
 from __future__ import annotations
@@ -63,6 +67,60 @@ targets:
     profile: shellboard
     device_by_id: /dev/serial/by-id/usb-UPGRADE_TEST-if00-port0
 """
+
+
+# 以 swtest 身分重現 `uart_holders_same_uid` 的掃描（crates/sw-pal/src/proc_scan/posix.rs scan_fd_holders）：
+# 列舉同 uid 行程，讀 /proc/<pid>/fd 並對每個 fd 做 stat（跟隨連結）；任何 PermissionError 即該行程使掃描回 Permission。
+# 輸出 JSON：每個行程的 comm、cmdline 與 fd 目錄／fd 條目是否被拒，以及持有目標 tty 的 pid。
+SCAN_PROBE = r"""
+import json, os, sys
+targets = [os.stat(p) for p in sys.argv[1:]]
+me = os.getuid()
+out = {"uid": me, "procs": [], "holders": []}
+for name in sorted((n for n in os.listdir("/proc") if n.isdigit()), key=int):
+    pid = int(name)
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != me:
+            continue
+        comm = open(f"/proc/{pid}/comm").read().strip()
+        cmdline = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        continue
+    rec = {"pid": pid, "comm": comm, "cmdline": cmdline, "fd_dir_denied": False, "fd_entries_denied": 0}
+    try:
+        entries = os.listdir(f"/proc/{pid}/fd")
+    except PermissionError:
+        rec["fd_dir_denied"] = True
+        entries = []
+    except OSError:
+        continue
+    for fd in entries:
+        try:
+            st = os.stat(f"/proc/{pid}/fd/{fd}")
+        except PermissionError:
+            rec["fd_entries_denied"] += 1
+            continue
+        except OSError:
+            continue
+        if any(st.st_rdev == t.st_rdev and st.st_ino == t.st_ino and st.st_dev == t.st_dev for t in targets):
+            out["holders"].append(pid)
+    rec["denied"] = rec["fd_dir_denied"] or rec["fd_entries_denied"] > 0
+    out["procs"].append(rec)
+out["status"] = "Permission" if any(r["denied"] for r in out["procs"]) else "Ok"
+print(json.dumps(out))
+"""
+
+ATTACHED_PROFILE = """\
+profiles:
+  passthru:
+    platform: passthrough
+targets:
+  - act_no: 1
+    com: COM1
+    profile: passthru
+    device_by_id: /dev/serial/by-id/usb-UPGRADE_ATTACHED-if00-port0
+"""
+ATTACHED_BY_ID = pathlib.Path("/dev/serial/by-id/usb-UPGRADE_ATTACHED-if00-port0")
 
 
 class Driver:
@@ -575,12 +633,90 @@ class Driver:
         self.sw("daemon", "stop", label="收尾 daemon stop")
         self.wait_no_daemon()
 
+    def phase_attached_legacy(self) -> None:
+        """attached-legacy：0.3.2 daemon 已 attach 假裝置（attached_paths 非空），且 uid 1000 有 `systemd --user` 與
+        `(sd-pam)`（fd 目錄不可讀）。先證明掃描確實回 Permission，再斷言 0.4.x 的 setup 能成功切換。"""
+        # 假 target 以 swtest 身分常駐（pts 才開得了）；root 在 /dev/serial/by-id 建 symlink（daemon 預設掃描位置）。
+        slave_file = HOME / "attached-slave-path"
+        self.run(["rm", "-f", str(slave_file)], label="rm slave path")
+        self.run(["setsid", "-f", "python3", "/opt/sw-driver/attached_fake_target.py", str(slave_file)],
+                 label="啟動 PTY 假 target")
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and not slave_file.is_file():
+            time.sleep(0.2)
+        slave = slave_file.read_text(encoding="utf-8").strip() if slave_file.is_file() else ""
+        ATTACHED_BY_ID.parent.mkdir(parents=True, exist_ok=True)
+        if ATTACHED_BY_ID.is_symlink() or ATTACHED_BY_ID.exists():
+            ATTACHED_BY_ID.unlink()
+        if slave:
+            ATTACHED_BY_ID.symlink_to(slave)
+        (CONFIG / "profiles").mkdir(parents=True, exist_ok=True)
+        profile = CONFIG / "profiles" / "attached.yaml"
+        profile.write_text(ATTACHED_PROFILE, encoding="utf-8")
+        subprocess.run(["chown", "-R", f"{USER}:{USER}", str(CONFIG)], check=True)
+        self.sw("service", "restart", label="0.3.2 service restart（載入 attached profile）")
+        self.wait_daemon(version=OLD_VERSION)
+        attached: list[str] = []
+        deadline = time.monotonic() + 60.0
+        sessions: list[dict[str, Any]] = []
+        while time.monotonic() < deadline and not attached:
+            sessions = (self.parse(self.sw("session", "list", label="session list（等待 attach）")) or {}).get("sessions") or []
+            attached = [s["attached_real_path"] for s in sessions if s.get("attached_real_path")]
+            if not attached:
+                time.sleep(1.0)
+        ok = bool(slave) and bool(attached)
+        self.add(uc.row("attached_session_ready", "PASS" if ok else "FAIL",
+                        None if ok else "0.3.2 daemon 未 attach 假裝置（attached_real_path 為空）",
+                        slave=slave, attached_real_path=attached,
+                        sessions=[{k: s.get(k) for k in ("session_id", "state", "attached_real_path")} for s in sessions]))
+        probe = self.run(["python3", "-c", SCAN_PROBE, *attached], label="fd 掃描探測（重現 uart_holders_same_uid）")
+        scan = self.parse(probe) or {}
+        procs = scan.get("procs") or []
+        by_name = {p["comm"]: p for p in procs}
+        have_user_mgr = any(p["comm"] == "systemd" and "--user" in p["cmdline"] for p in procs)
+        have_sd_pam = any(p["comm"] == "(sd-pam)" for p in procs)
+        denied = [{k: p[k] for k in ("pid", "comm", "cmdline", "fd_dir_denied", "fd_entries_denied")}
+                  for p in procs if p.get("denied")]
+        ok = have_user_mgr and have_sd_pam
+        self.add(uc.row("user_session_processes", "PASS" if ok else "FAIL",
+                        None if ok else "uid 1000 缺 `systemd --user` 或 `(sd-pam)`（真實 user session 行程）",
+                        systemd_user=have_user_mgr, sd_pam=have_sd_pam, procs=[p["comm"] + ":" + str(p["pid"]) for p in procs],
+                        known=sorted(by_name)))
+        # 以行程名稱確認拒絕確實來自 `(sd-pam)`（non-dumpable，fd 目錄讀不到）；`systemd --user` 是否被拒依核心／capability
+        # 而異，只記錄不要求。holders 只允許是仍在執行的舊 daemon 本身（它合法持有 slave），不得有其他持有者。
+        daemon_pids = set(uc.scan_daemon_instances(self.proc_root))
+        holders = scan.get("holders") or []
+        ok = scan.get("status") == "Permission" and any(d["comm"] == "(sd-pam)" for d in denied) \
+            and bool(holders) and set(holders) <= daemon_pids
+        self.add(uc.row("holder_scan_permission", "PASS" if ok else "FAIL",
+                        None if ok else "掃描未因 `(sd-pam)` 回 Permission，或 slave 有舊 daemon 以外的持有者",
+                        status=scan.get("status"), holders=holders, daemon_pids=sorted(daemon_pids), denied=denied,
+                        systemd_user_denied=any(d["comm"] == "systemd" for d in denied), stderr=probe.stderr[-500:]))
+        old_ids = {pid: self._start_ticks(pid) for pid in uc.scan_daemon_instances(self.proc_root)}
+        t0 = time.monotonic()
+        proc = self.run([str(self.new_cli), "setup", *self.setup_args],
+                        label="0.4.x setup（舊 daemon 執行中且 attach 裝置）", timeout=900)
+        elapsed = time.monotonic() - t0
+        body = self.parse(proc) or {}
+        status = self.wait_daemon(version=NEW_VERSION, timeout=20.0) if proc.returncode == 0 else None
+        alive = [pid for pid, ticks in old_ids.items() if ticks is not None and self._start_ticks(pid) == ticks]
+        row = uc.judge_attached_legacy_setup("attached_legacy_setup", setup_rc=proc.returncode, body=body, elapsed_s=elapsed,
+                                             status_after=status, old_pids=sorted(old_ids), old_alive_after=alive,
+                                             new_version=NEW_VERSION)
+        row["detail"]["stdout_tail"] = proc.stdout[-1500:]
+        self.add(row)
+
     def execute(self) -> None:
         self.prepare_user_manager()
         subprocess.run(["chown", "-R", f"{USER}:{USER}", str(HOME)], check=True)
         monitor = threading.Thread(target=self._monitor, daemon=True)
         monitor.start()
         try:
+            if self.scenario == "attached-legacy":
+                self.phase_old_install()
+                self.phase_attached_legacy()
+                self.run(["pkill", "-f", "attached_fake_target.py"], label="收尾：停假 target")
+                return
             if self.scenario == "install-sh":
                 self.phase_old_install()
                 self.phase_seed()
@@ -619,7 +755,7 @@ def main() -> int:
     parser.add_argument("--wheel", required=True)
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--scenario", choices=("upgrade", "install-sh"), default="upgrade")
+    parser.add_argument("--scenario", choices=("upgrade", "install-sh", "attached-legacy"), default="upgrade")
     parser.add_argument("--installer", help="install-sh 情境：容器內 install.sh 路徑")
     parser.add_argument("--bundle-tarball", help="install-sh 情境：0.4.0 release 候選 tarball")
     args = parser.parse_args()
@@ -627,6 +763,8 @@ def main() -> int:
         parser.error("--scenario install-sh 需要 --installer 與 --bundle-tarball")
     if args.scenario == "install-sh" and args.mode == "systemd-system":
         parser.error("--scenario install-sh 不支援 systemd-system（該模式只驗 OD-48 直接 setup 成功路徑）")
+    if args.scenario == "attached-legacy" and args.mode != "systemd-user":
+        parser.error("--scenario attached-legacy 只支援 systemd-user（需真實 user session 的 systemd --user 與 (sd-pam)）")
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     wheel = pathlib.Path(args.wheel)
@@ -672,7 +810,9 @@ def main() -> int:
         "checks": driver.rows,
         "observations": driver.observations,
     }
-    if args.scenario == "install-sh":
+    if args.scenario == "attached-legacy":
+        required, report["scope"] = uc.REQUIRED_ATTACHED_LEGACY_CHECKS, "attached_legacy_setup"
+    elif args.scenario == "install-sh":
         required, report["scope"] = uc.REQUIRED_INSTALL_SH_CHECKS, "install_sh"
     elif args.mode == "systemd-system":
         required, report["scope"] = uc.REQUIRED_CHECKS_SYSTEMD_SYSTEM, "legacy_direct_setup_success_path"

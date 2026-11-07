@@ -268,6 +268,7 @@
       "f6-two-boards-no-starvation",
       "f7-binary-roundtrip-md5",
       "f7-larger-file-not-truncated",
+      "f8-legacy-attached-upgrade",
       "f8-second-daemon-detected",
       "f8-tty-holders-reported",
       "f9-attach-during-boot-reprobes",
@@ -1584,6 +1585,18 @@
       "daemon_slice": "2.4",
       "cli_stage": "1A",
       "stage0_required": true
+    },
+    "f8-legacy-attached-upgrade": {
+      "suite": "regression",
+      "layer": "L2",
+      "platforms": [
+        "linux"
+      ],
+      "expected": "PASS",
+      "necessity": "conditional",
+      "daemon_slice": "2.2",
+      "cli_stage": "1B",
+      "stage0_required": false
     },
     "f8-second-daemon-detected": {
       "suite": "regression",

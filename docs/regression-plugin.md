@@ -68,7 +68,7 @@ doctor 全綠、testbed 板卡 READY、無殘留 throwaway daemon、無並行 py
 | F5 console 共存 | #78 #7 #8 #42 #11 #53；Stage 0 待補（`f5-deferred-dropped-after-reboot`，見下節） | raw ownership 多輪 suspend/resume 不丟、deferred 不丟鍵、對端消失回收、不掛 stale pts；reboot（上下文失效）後舊按鍵不回放（BC-02） | **部分（reboot case）** |
 | F6 RPC 不凍結 | #80 #52 | 長操作中 `daemon status` 往返不凍結、雙板互不餓死 | 否 |
 | F7 檔案傳輸 | #21 #32 #161 #166 | binary round-trip md5 一致、不靜默截斷；可用 base64 或 OpenSSL 搭配 md5sum，不因只缺 base64 就 SKIP；明確 `CHECKSUM_MISMATCH` 一律為 `FAIL/test/binary_roundtrip_mismatch`，不受工具探測值影響；`PULL_PARSE_FAILED`、`MOVE_FAILED`、逾時等未完成傳輸維持環境 `SKIP`；push 預設走 #161 echo-ACK 節流（echo 停滯獨立 reason_code `transfer_echo_stall`） | 否 |
-| F8 daemon 單一性 | #101 #53 | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者 | 否 |
+| F8 daemon 單一性 | #101 #53 #257（`f8-legacy-attached-upgrade`，見下方「需擁有者實跑的 F8 case」） | `multi_open`／`foreign_holders` 正確回報第二 daemon 與 tty 持有者；0.3.x daemon attach 實體 UART 且有 systemd user session 時，0.4.x `setup` 在有界時間內切換、無 two-reader（SC-39 D5.2，PR 250） | **部分（`f8-legacy-attached-upgrade` 替換部署中的安裝）** |
 | F9 開機/U-Boot／BRCM 登入 | #69 #130 #139 #44 #14 #20 #224 #242 #243 | autoboot 窗不被 probe 打斷、quiet window 不擋 human／真 READY 後的 agent 命令、自發重開機過渡態 agent 命令被 `AUTOBOOT_QUIET` 攔下（#139）、開機中 attach 自動 reprobe、U-Boot 停留不踢 console；BRCM 重開後帶前導空白的 BDK prompt 能自動登入、切 `sh` 並回 READY；passthrough 真板 attach 零 TX、靜默 30 秒升 READY 並以 `--completion-regex` 完成（SC-35，`pt-quiet-ready`）；`cmd submit --expect-reboot` 的串接 reboot（`sync && reboot`）走 reboot 路徑並等 READY（`f9-expect-reboot-chained`，尚未上板實跑） | **是（reboot；`f9-expect-reboot-chained` 尚未上板實跑）** |
 | F10 登入帳密 | #140 #19 | 帳密解析空→`CREDENTIALS_UNRESOLVED` 終態不送空帳密、補帳密後恢復 | **是（throwaway＋release）** |
 | F10 裝置交接（`f10_device_handoff.py`） | Stage 0 待補（`f10-release-drain-receipt`、`f10-release-aborts-inflight-command`，見下節） | release 的 ok 回條只在 handle 關閉後送出（BC-04／SC-04）；在途命令於 release 後 `COMMAND_ABORTED_IN_FLIGHT` 且 TX 不重送（BC-03） | **是（throwaway＋release）** |
@@ -93,6 +93,12 @@ Stage 0 行為變更（BC-02、BC-03、BC-04／SC-04、SC-35）的實機 case �
 | `pt-quiet-ready` | F9 | passthrough（真板 U-Boot／MCU 線）attach 至 READY 全程 WAL 零 TX、READY 不早於靜默 30 秒下限，`cmd submit --completion-regex` 完成（SC-35）；板子最後觀測仍有 RX 時判 SKIP `rx_not_quiet`，WAL 證據缺漏判 SKIP `insufficient_evidence` | throwaway（explicit target 釘定 passthrough profile 綁 COM0，sandbox by-id 只放該線；無動態偵測、無 PROBE）＋prod `device release`／`attach` 收尾，`destructive=True` | BLOCKED-OWNER（bench 實跑；OD-14 對應 issue 待擁有者開立，`issues=()` 於 PR 說明） |
 
 執行順序以 case id 排序（`harness.ordered()`）：`f10-release-*` 落在既有 `f10-creds-*` 之後、`f10-unresolved-*` 之前，屬 F10 family 內的 id 排序結果；破壞性 F10 case 彼此皆以 throwaway＋`device release`／`attach` 收尾。
+
+### 需擁有者實跑的 F8 case（#257）
+
+| case id | family | 行為 | 實跑入口 | 狀態 |
+|---|---|---|---|---|
+| `f8-legacy-attached-upgrade` | F8 | 0.3.x daemon 由 systemd --user 監管、attach 實體 UART，且同使用者有真實 `systemd --user` 與 `(sd-pam)` 時，候選 bundle 的 `setup --user` 在 120 s 內成功並帶 `legacy_stop`（不得等滿 330 s 回 `TIMEOUT`／`legacy_stop_pending`）；舊行程樹結束、只剩一個 serialwrapd、新 daemon 為候選版本、原 COM 重新 attach 同一 tty | TestPilot（`allow_destructive: true`，以 `--case` 單獨執行）；前置條件由擁有者備妥：0.3.x pipx 安裝＋`setup --user`、session 已 attach、testbed `legacy_upgrade.bundle` 指向候選 bundle；不符即 SKIP、不改動安裝；case 不還原 0.3.x | BLOCKED-OWNER（接板 Linux／WSL 實跑；issue #257）。Docker `attached-legacy` 情境（PTY 假裝置）是自動化部分，不取代本 case |
 
 Stage 0 實機程序與腳本（非 TestPilot case，手動執行，各檔首段含 `entry`、`revision`、`expected`、`owner`、`evidence_dir`、`rollback`）：
 

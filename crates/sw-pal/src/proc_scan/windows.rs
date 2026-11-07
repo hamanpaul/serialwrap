@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::slice;
 
 use crate::proc_scan::{
-    dedup_launcher_children, is_launcher_image, is_python_image, DaemonProc, HolderScanStatus,
-    ProcDetails, ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
+    dedup_launcher_children, is_launcher_image, is_python_image, DaemonProc, HolderScan,
+    HolderScanOutcome, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
+    WinProcInfo,
 };
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
@@ -159,8 +160,8 @@ impl ProcScan for WindowsProcScan {
         })
     }
 
-    fn uart_holders_same_uid(&self, _paths: &[PathBuf]) -> (Vec<u32>, HolderScanStatus) {
-        (Vec::new(), HolderScanStatus::Unsupported)
+    fn uart_holders_same_uid(&self, _paths: &[PathBuf]) -> HolderScan {
+        HolderScan { holders: Vec::new(), outcome: HolderScanOutcome::Unsupported }
     }
 }
 

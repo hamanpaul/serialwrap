@@ -492,6 +492,16 @@ cases:
   - sw-cli::mgmt_legacy_handoff::legacy_b_version_not_below_040_fails_closed
   - sw-cli::mgmt_legacy_handoff::legacy_c_flashing_at_precheck_refuses_without_stop
   - sw-cli::mgmt_legacy_handoff::legacy_c_session_busy_at_precheck_refuses_without_stop
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_before_stop_snapshot_failure_admits_nothing
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_other_holder_scan_failures_still_block_until_limit
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_partial_without_uninspectable_list_does_not_pass
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_preexisting_setuid_uninspectable_process_is_reported_not_blocking
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_reused_pid_of_uninspectable_process_blocks
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_setuid_uninspectable_process_appearing_after_stop_blocks
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_uninspectable_process_appearing_after_stop_blocks
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_2_uninspectable_same_uid_process_is_reported_not_blocking
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_timeout_reports_daemon_scan_failure
+  - sw-cli::mgmt_legacy_handoff::legacy_d5_timeout_reports_last_stability_break
   - sw-cli::mgmt_legacy_handoff::legacy_d_never_exits_is_pending_without_restart
   - sw-cli::mgmt_legacy_handoff::legacy_e_relaunch_loop_after_three_stops
   - sw-cli::mgmt_legacy_handoff::legacy_e_single_relaunch_is_restopped
@@ -507,6 +517,21 @@ cases:
   - sw-cli::mgmt_legacy_handoff::s1x_c1_first_install_detects_systemd_system_daemon_on_fixed_socket
   - sw-cli::mgmt_legacy_handoff::s1x_c1_supervision_switch_detects_systemd_system_daemon_on_fixed_socket
   - sw-cli::mgmt_legacy_handoff::s1x_c1_update_detects_systemd_system_daemon_on_fixed_socket
+  - sw-pal::legacy_supervision::holder_scan_partial_requires_non_empty_uninspectable_list
+  - sw-pal::legacy_supervision::posix_serialwrapd_holder_scan_keeps_permission_for_uninspectable_daemon
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_mixed_fd_entry_permission_denied_still_blocks
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_mixed_uid_uninspectable_process_still_blocks
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_partial_still_lists_readable_holder
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_process_exiting_during_scan_is_not_a_failure
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_reports_setuid_uninspectable_process_as_partial
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_reports_uninspectable_same_uid_processes_as_partial
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_target_permission_denied_still_blocks
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_treats_all_fd_entries_denied_as_uninspectable
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_uninspectable_process_with_unknown_uid_still_blocks
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_unknown_error_still_blocks
+  - sw-pal::legacy_supervision::posix_uart_holder_scan_vanished_target_is_not_a_failure
+  - sw-pal::legacy_supervision::uninspectable_snapshot_from_failed_scan_admits_nothing
+  - sw-pal::legacy_supervision::uninspectable_snapshot_matches_pid_and_start_ticks_and_fails_closed
   - tests/test_contracts_catalog.py::test_sc39_registered
   evidence: target/p4-evidence/sc39-legacy-daemon-handoff.json
   necessity: required
