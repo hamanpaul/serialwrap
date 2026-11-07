@@ -42,11 +42,11 @@ def _verdict(obs: dict) -> tuple[str, str, str]:
     return result.verdict, result.category, result.reason_code
 
 
-def test_case_is_registered_as_pending_issue_destructive_f8():
+def test_case_is_registered_as_destructive_f8_with_issue_257():
     reg = {c.id: c for c in harness.load_registry()}
     item = reg["f8-legacy-attached-upgrade"]
     assert item.family == "F8"
-    assert item.pending_issue is True and item.issues == (), "擁有者尚未開 issue：不得填假號"
+    assert item.issues == ("#257",) and item.pending_issue is False, "擁有者已開 issue #257，不再是待補 issue"
     assert item.destructive is True, "會替換部署中的安裝"
     assert "supervisor_runtime" in item.requires
 

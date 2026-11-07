@@ -728,7 +728,7 @@ cases:
   source_ref: regression/serialwrap_regression/cases/f08_legacy_upgrade.py:197
   family: F8
   title: 0.3.x daemon attach 實體 UART 且有 systemd user session 時，0.4.x setup 在有界時間內切換、無 two-reader
-  contract: 'SC-39 D5.2（PR 250）實機 oracle：0.3.x daemon 由 systemd --user 監管、已 attach 實體 UART，且同使用者有真實 systemd --user 與 (sd-pam) 時，候選 bundle 的 setup --user 須在 120 s 內成功並帶 legacy_stop，不得等滿 330 s 回 TIMEOUT／legacy_stop_pending；舊行程樹（pid＋start_ticks）結束、之後只剩一個 serialwrapd、新 daemon 為候選版本，升級前已 attach 的 COM 由新 daemon 重新 attach 同一 tty。前置條件（0.3.x pipx 安裝、session 已 attach、testbed legacy_upgrade.bundle）由擁有者備妥，不符即 SKIP。Docker attached-legacy 情境為 PTY 假裝置的自動化部分，不取代本 case。'
+  contract: 'SC-39 D5.2（#257，PR 250）實機 oracle：0.3.x daemon 由 systemd --user 監管、已 attach 實體 UART，且同使用者有真實 systemd --user 與 (sd-pam) 時，候選 bundle 的 setup --user 須在 120 s 內成功並帶 legacy_stop，不得等滿 330 s 回 TIMEOUT／legacy_stop_pending；舊行程樹（pid＋start_ticks）結束、之後只剩一個 serialwrapd、新 daemon 為候選版本，升級前已 attach 的 COM 由新 daemon 重新 attach 同一 tty。前置條件（0.3.x pipx 安裝、session 已 attach、testbed legacy_upgrade.bundle）由擁有者備妥，不符即 SKIP。Docker attached-legacy 情境為 PTY 假裝置的自動化部分，不取代本 case。'
   invariants: [no_reopen_before_handoff]
   layer: L2
   platforms: [linux]
@@ -740,7 +740,7 @@ cases:
   stage0_required: false
   prerequisites: []
   necessity: conditional
-  issues: []
+  issues: ['#257']
   behavior_changes: [SC-39]
   destructive: true
   expected: PASS
@@ -748,7 +748,6 @@ cases:
   evidence: [report.json, report.md]
   implemented_by: existing
   cross_slice_reason: null
-  pending_issue: true
 - case_id: f9-reboot-autoboot-unmolested
   suite: regression
   source_ref: regression/serialwrap_regression/cases/f09_boot_uboot.py:27

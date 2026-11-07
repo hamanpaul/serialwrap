@@ -38,7 +38,7 @@ def _case(id, title, issues, hints=(), requires=(), destructive=False, pending_i
 # evidence_dir: TestPilot report 目錄下的 case 目錄（setup 輸出、升級前後 daemon status／session list、行程快照）
 # rollback: case 不還原 0.3.x。PASS 後主機即為候選版本；要回到升級前狀態，以候選 CLI 執行 ``serialwrap setup --rollback``，
 #   或依 0.3.x 安裝程序重新以 pipx 安裝。setup 失敗時依回應的 ``restart_hint`` 手動重啟舊 daemon（OD-48：失敗不自動重啟）。
-# issue: 擁有者尚未為此缺陷開立 issue（``pending_issue``；不得填假號）。Docker ``attached-legacy`` 情境是自動化部分，
+# issue: #257（PR 250 的缺陷追蹤 issue）。Docker ``attached-legacy`` 情境是自動化部分，
 #   用 PTY 假裝置，不能取代本 case 的真實 UART 與真實登入 session。
 
 _LEGACY_UPGRADE_MAX_S = 120.0  # 與 Docker attached-legacy 判準一致（scripts/docker/upgrade_checks.py ATTACHED_LEGACY_MAX_SETUP_S）
@@ -197,12 +197,11 @@ def _json_or_none(text: str):
 @_case(
     "f8-legacy-attached-upgrade",
     "0.3.x daemon attach 實體 UART 且有 systemd user session 時，0.4.x setup 在有界時間內切換、無 two-reader",
-    issues=(),
-    pending_issue=True,
+    issues=("#257",),
     destructive=True,
     requires=("supervisor_runtime",),
     hints=(
-        "缺陷（PR 250）：同使用者的 (sd-pam) 與 systemd --user 整個無法檢查 fd，0.4.0 把 holder 掃描判為讀取失敗，"
+        "缺陷（#257，PR 250）：同使用者的 (sd-pam) 與 systemd --user 整個無法檢查 fd，0.4.0 把 holder 掃描判為讀取失敗，"
         "setup 等滿 330 s 回 legacy_stop_pending（alive_pids、holder_pids 皆空），舊 daemon 已停且不重啟。",
         "Docker attached-legacy 情境用 PTY 假裝置自動化同一路徑；本 case 補真實 UART、真實登入 session 與外部工具的實機證據。",
         "前置條件由擁有者備妥（0.3.x pipx＋setup --user、session 已 attach）；條件不符一律 SKIP，不改動安裝。",
