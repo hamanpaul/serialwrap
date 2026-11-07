@@ -15,6 +15,7 @@ pub mod release_manifest;
 pub mod rpc_types;
 pub mod runtime_paths;
 pub mod session_last_errors;
+pub mod source_policy;
 pub mod version;
 pub mod wal_types;
 pub mod yaml11;
