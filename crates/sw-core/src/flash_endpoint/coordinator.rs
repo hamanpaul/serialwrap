@@ -600,7 +600,10 @@ impl FlashCoordinator {
                     "serialwrap: /dev/ttyMCU holder watch thread 未在 {:.1}s 內結束（com={com}）",
                     HOLDER_JOIN.as_secs_f64()
                 ));
-                lock(&self.stalled).push("holder");
+                let mut stalled = lock(&self.stalled);
+                if !stalled.contains(&"holder") {
+                    stalled.push("holder"); // 去重：清單有界（stop 時取出）
+                }
             }
         }
         {
