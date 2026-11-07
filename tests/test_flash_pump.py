@@ -52,10 +52,11 @@ def test_pump_forwards_bytes_byte_perfect_and_stops_on_eof():
     os.close(slave)                   # EOF → pump 應結束
     t.join(timeout=2.0)
     assert not t.is_alive(), "pump 執行緒應在 EOF 後結束"
-    assert bytes(sink.got) == b"\x55\x55" + payload, (
+    expected = b"\x55\x55" + payload
+    assert bytes(sink.got) == expected, (
         f"轉送內容必須 byte-perfect（含 first_bytes）\n"
         f"  got: {bytes(sink.got)!r}\n"
-        f"  exp: {b'\\x55\\x55' + payload!r}"
+        f"  exp: {expected!r}"
     )
     stop.set()
     os.close(master)
