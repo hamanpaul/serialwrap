@@ -1955,3 +1955,123 @@ fn wrapped_echo_busybox_newline_replacing_command_space_is_kept() {
     let raw = format!("{}\r\r\n{}\r\nOUT\r\n{WRAP_PROMPT}", &c[..55], &c[56..]);
     assert_eq!(wrap_extract(&raw, &c), format!("{}\n{}\nOUT", &c[..55], &c[56..]));
 }
+
+// ---------------------------------------------------------------------------
+// WP5-2 第 5 項：`expect_reboot`／`trusted_human` 經佇列送進 `OpSpec::Command`，且不繞過 gate
+// ---------------------------------------------------------------------------
+
+/// Python `tests/test_expect_reboot.py` 的 `CHAINED`。
+const WP52_CHAINED: &str = "firstboot -y && reboot";
+
+/// 出列的 `Effect::StartOp { spec: OpSpec::Command(..) }` 保留兩個提交旗標，`is_trusted_human()` 為明示欄位與
+/// `HumanConsole` 來源取 OR（ITEM 1；Python `arbiter.py:411-416` 只在旗標成立時把 `expect_reboot`／`trusted_human`
+/// 交給 `execute_command`）。只驗資料抵達執行入口；reboot 分支與 G7b 消費端屬後續工作包。
+#[test]
+fn wp52_start_op_command_keeps_submit_flags() {
+    use sw_core::arbiter::SubmitOrigin;
+    use sw_core::op_runner::OpSpec;
+
+    let console = || SubmitOrigin::HumanConsole {
+        client_id: "c1".into(),
+    };
+    for (expect_reboot, trusted_human, origin, source, trusted) in [
+        (false, false, SubmitOrigin::Rpc, "agent", false),
+        (true, false, SubmitOrigin::Rpc, "agent", false),
+        (false, true, SubmitOrigin::Rpc, "human:cli", true),
+        (true, true, SubmitOrigin::Rpc, "human:cli", true),
+        (true, false, console(), "human:c1", true),
+        (false, true, console(), "human:c1", true),
+    ] {
+        let case = format!(
+            "expect_reboot={expect_reboot} trusted_human={trusted_human} origin={origin:?}"
+        );
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let mut req = agent_submit("echo wp52");
+        req.source = source.into();
+        req.expect_reboot = expect_reboot;
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        let resp = resp.expect("submit");
+        assert_eq!(resp["ok"], PyValue::Bool(true), "{case}：{resp:?}");
+        assert_eq!(
+            resp.get("expect_reboot").cloned(),
+            expect_reboot.then_some(PyValue::Bool(true)),
+            "{case}：回聲"
+        );
+        let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+        let started: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::StartOp {
+                    spec: OpSpec::Command(queued),
+                    ..
+                } => Some(queued),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 1, "{case}：READY 空佇列應立即出列一次");
+        let queued = started[0];
+        assert_eq!(queued.cmd_id, cmd_id, "{case}");
+        assert_eq!(queued.req.command, "echo wp52", "{case}");
+        assert_eq!(queued.req.expect_reboot, expect_reboot, "{case}");
+        assert_eq!(queued.req.trusted_human, trusted_human, "{case}");
+        assert_eq!(queued.req.origin, origin, "{case}");
+        assert_eq!(
+            queued.req.is_trusted_human(),
+            trusted,
+            "{case}：可信來源 OR 判定"
+        );
+        assert_eq!(
+            h.reg.get(&cmd_id).expect("registry").get("expect_reboot"),
+            Some(&PyValue::Bool(expect_reboot)),
+            "{case}：record 旗標"
+        );
+    }
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_does_not_bypass_autoboot_quiet_gate`：命令已入列（hold 佔住前景）
+/// 後 banner 才武裝 quiet；agent＋true 的鏈式命令出列時仍被 execute-time gate 擋為 AUTOBOOT_QUIET，零 TX、
+/// record 保留 true；提交時 gate 對帶旗標與不帶旗標的請求回應相同（同 `execute_time_gate_has_retry_after_sc03`）。
+#[test]
+fn wp52_flag_does_not_bypass_gates() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let hold = h.submit_with("sleep 60", |r| r.timeout_s = 120.0);
+    h.wait_running(&hold);
+    let queued = h.submit_with(WP52_CHAINED, |r| {
+        r.source = "agent:t".into();
+        r.expect_reboot = true;
+    });
+    h.inject_rx(BANNER);
+    // hold 以 prompt 正常完成（只清 TX 靜默維度、reconfirm pending 保留，#162），queued 出列時仍被 gate 擋下。
+    h.inject_rx(b"root@t:/# ");
+    let _ = h.wait_done(&hold);
+    let done = h.wait_done(&queued);
+    // Python `arbiter.py:465-467`：結果 ok:false → status "error"＋error_code。
+    assert_eq!(done["status"], PyValue::from("error"), "{done:?}");
+    assert_eq!(
+        done["error_code"],
+        PyValue::from("AUTOBOOT_QUIET"),
+        "{done:?}"
+    );
+    assert_eq!(done["expect_reboot"], PyValue::Bool(true));
+    let tx = String::from_utf8_lossy(&h.dev.take_tx()).into_owned();
+    assert!(
+        !tx.contains(WP52_CHAINED),
+        "被 gate 擋下的旗標命令不得寫出 TX：{tx:?}"
+    );
+    assert!(!wal_tx_has(&h, WP52_CHAINED.as_bytes()));
+
+    let flagged = SessionRequest::Submit({
+        let mut req = agent_submit(WP52_CHAINED);
+        req.expect_reboot = true;
+        req
+    });
+    let direct = h.request(flagged);
+    let plain = h.request(SessionRequest::Submit(agent_submit(WP52_CHAINED)));
+    assert_eq!(pget(&direct, "error_code"), PyValue::from("AUTOBOOT_QUIET"));
+    assert_eq!(direct, plain, "旗標不改變提交時 gate 的回應");
+    assert!(direct.get("cmd_id").is_none());
+    assert!(h.dev.take_tx().is_empty(), "提交時拒絕零 TX");
+}
