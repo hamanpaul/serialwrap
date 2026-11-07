@@ -829,6 +829,120 @@ fn wp53_rpc_flag_prompt_wait_uses_timeout_and_expected_duration() {
     );
 }
 
+// WP5-3 第 3 項：旗標命令的 reboot arming 與完成後 gate 端到端（Python `origin/main:sw_core/session_manager.py:6412-6447`、
+// `:6462-6473`；submit-time gate `service.py:831-838`）。呼叫路徑：`Service::rpc(command.submit)` →
+// `SubmitReq.expect_reboot` → `SessionCore::submit` → `start_next`（`reboot = expect_reboot || 猜中`）→
+// `Fence.reboot_arm_op` → `OpRunner::run_command` → `run_reboot` → `TxWriter` 實際提交後於同一 Fence 臨界區 arm
+// quiet／reconfirm → `UartTxCompleted` → `reboot_tx_settled`（actor QuietState）→ prompt 回來 → `finish_command`
+// （只清 quiet，#162）→ 下一筆 `command.submit` 的 submit-time gate。
+
+/// Python `service.py:831-838` pending-only 分支的 hint（逐字）。
+const WP53_RECONFIRM_HINT: &str =
+    "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送";
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery`：
+/// RPC 帶 `expect_reboot:true` 的串接命令 TX 提交後公開狀態即 arm quiet 與 reconfirm；3 s 後 prompt 回來 → 正常完成，
+/// quiet 清除但 `ready_reconfirm_pending` 保留；下一筆 agent 命令以 pending-only `AUTOBOOT_QUIET`（retry 5.0）拒絕，
+/// 回應逐位元組等於 Python 分支字面量，UART／registry／queue 前後不變。無旗標對照：同一命令 prompt 回來後不留 pending，
+/// 下一筆照常送出。
+#[test]
+fn wp53_rpc_flag_arms_reconfirm_and_gates_next_command() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    let (cmd_id, early) = wp53_rpc_step_flagged(&r, WP53_CHAINED, r#","timeout_s":6"#, 3.0);
+    assert_eq!(early, None, "期限 6 s，3 s 內不得結算");
+    let armed = r.session("COM0").expect("COM0 session");
+    assert_ne!(
+        armed.get("boot_quiet_remaining_s"),
+        Some(&PyValue::Null),
+        "TX 提交後 arm quiet：{}",
+        j(&armed)
+    );
+    assert_eq!(
+        armed.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "TX 提交後 arm reconfirm：{}",
+        j(&armed)
+    );
+    dev.push_rx(b"\r\nroot@t:/# ");
+    let record = wp55_wait_done(&r, &cmd_id);
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(false)),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(
+        record.get("recovery_action"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&record)
+    );
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("state"),
+        Some(&PyValue::from("READY")),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("boot_quiet_remaining_s"),
+        Some(&PyValue::Null),
+        "prompt 回來只清 quiet：{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "#162：pending 保留：{}",
+        j(&session)
+    );
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "AUTOBOOT_QUIET",
+        "retry_after_s" => 5.0,
+        "hint" => WP53_RECONFIRM_HINT,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"COM0","cmd":"ls","timeout_s":10}"#,
+        &j(&expected),
+    );
+
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(
+        format!("{WP53_CHAINED}\n").as_bytes(),
+        b"echo a && reboot\r\na\r\nroot@t:/# ",
+    );
+    r.settle();
+    let response = r.call(
+        "command.submit",
+        &format!(r#"{{"selector":"COM0","cmd":"{WP53_CHAINED}","timeout_s":6}}"#),
+    );
+    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    assert_eq!(record.get("partial"), Some(&PyValue::Bool(false)), "{}", j(&record));
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(false)),
+        "無旗標不 arm：{}",
+        j(&session)
+    );
+    dev.on_tx_reply(b"ls\n", b"ls\r\nroot@t:/# ");
+    let tx_mark = dev.tx_len();
+    let response = r.call("command.submit", r#"{"selector":"COM0","cmd":"ls","timeout_s":10}"#);
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "ls\n");
+}
+
 // ---------------------------------------------------------------------------
 // WP5-5 第 3 項：可信 human 命令的 TX gate 端到端（G7a、G7b、OD-74、rulings s2 D5）
 //
