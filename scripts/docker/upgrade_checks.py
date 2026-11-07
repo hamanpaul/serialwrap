@@ -1,4 +1,4 @@
-"""OD-33 R2(b)：0.3.2 → 0.4.0 升級驗證的判定純函式（容器內 driver 與 pytest 共用）。
+"""OD-33 R2(b)：0.3.2 → 新版（driver 的 NEW_VERSION）升級驗證的判定純函式（容器內 driver 與 pytest 共用）。
 
 只用標準函式庫：容器內 driver 以系統 python3 執行，不依賴 repo 套件。
 每個檢查列為 {"id", "verdict": PASS|FAIL|INSUFFICIENT, "reason", "detail"}；整體 verdict 規則見 overall_verdict。
@@ -54,7 +54,7 @@ REQUIRED_CHECKS_SYSTEMD_SYSTEM: tuple[str, ...] = (
 )
 
 # OD-50 install.sh 情境（`run-upgrade.sh --scenario install-sh`）：0.3.2 pipx 已安裝且 daemon 已停止 →
-# `install.sh --bundle <0.4.0 release 候選 tarball>`。與上列升級情境的必要集合分開判定，不改其語意；
+# `install.sh --bundle <新版 release 候選 tarball>`。與上列升級情境的必要集合分開判定，不改其語意；
 # 與升級情境同名者沿用同一判定（同 driver phase）。「舊 daemon 執行中直接 setup」由升級情境的
 # legacy_handoff_direct_setup（OD-48）驗證。
 REQUIRED_INSTALL_SH_CHECKS: tuple[str, ...] = (

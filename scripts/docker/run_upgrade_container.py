@@ -1,16 +1,16 @@
 """OD-33 R2(b)：容器內升級驗證 driver（以 root 執行，產品命令一律以 swtest 身分經 runuser 執行）。
 
 流程（每種監管模式一個全新容器）：pipx 安裝 0.3.2 正式版並 setup → 建立 profile／alias／binding →
-舊 daemon 執行中直接以 0.4.0 bundle setup（不得 two-reader、拒絕時不得動到現場）→ 停舊 daemon 後 setup →
+舊 daemon 執行中直接以新版（`NEW_VERSION`）bundle setup（不得 two-reader、拒絕時不得動到現場）→ 停舊 daemon 後 setup →
 驗證入口取代、設定保留、監管 reconcile、狀態相容與 doctor → `setup --rollback` → 手動降級回 0.3.2 →
 重新升級。全程以 /proc 取樣監看 serialwrapd 實例數。判定見 upgrade_checks.py。
 
 systemd-system（OD-48 SPEC-GAP #10）只跑「0.3.2 daemon 執行中直接 `setup --system --with-sudo`」成功路徑：
 0.3.2 以 `setup --system --with-sudo` 安裝 system unit（swtest 免密碼 sudo）→ 建立 profile／alias／binding →
-0.4.0 直接 setup → 入口、設定、監管與 doctor 驗證；必要檢查見 `REQUIRED_CHECKS_SYSTEMD_SYSTEM`。
+新版直接 setup → 入口、設定、監管與 doctor 驗證；必要檢查見 `REQUIRED_CHECKS_SYSTEMD_SYSTEM`。
 
 `--scenario install-sh`（OD-50）：pipx 安裝 0.3.2 並建立基線 → 停 0.3.2 daemon → 以 swtest 執行新
-`install.sh --bundle <0.4.0 release 候選 tarball> -- <模式旗標>` → 驗證入口、設定、daemon、doctor 與舊 pipx 提示。
+`install.sh --bundle <新版 release 候選 tarball> -- <模式旗標>` → 驗證入口、設定、daemon、doctor 與舊 pipx 提示。
 必要檢查見 upgrade_checks.REQUIRED_INSTALL_SH_CHECKS；只支援 systemd-user 與 on-demand（systemd-system 不在此情境）。
 舊 daemon 執行中直接 setup 由預設升級情境的 legacy_handoff_direct_setup（OD-48）驗證。
 
@@ -49,7 +49,7 @@ UNIT_DIR = HOME / ".config" / "systemd" / "user"
 SYSTEM_UNIT_DIR = pathlib.Path("/etc/systemd/system")
 SYSTEM_PROFILE_DIR = pathlib.Path("/etc/serialwrap/profiles")
 OLD_VERSION = "0.3.2"
-NEW_VERSION = "0.4.0"
+NEW_VERSION = "0.4.1"
 ENTRY_NAMES = ("serialwrap", "serialwrapd")
 RUNUSER = shutil.which("runuser") or "/usr/sbin/runuser"
 # `daemon stop` 之後等舊 daemon 行程樹與 socket 消失的上限（秒）；逾時該步驟判 FAIL（on-demand 預熱競態裁決）。
@@ -249,7 +249,7 @@ class Driver:
         if proc.returncode == 0 or not self.cli_version().endswith(OLD_VERSION):
             return proc
         # 0.3.2 既有缺陷：POSIX `daemon start` 固定以 site-packages 上一層的 serialwrapd.py 啟動，pipx wheel 不含該檔，
-        # on-demand 模式必然 DAEMON_EXITED（與 0.4.0 無關）。以前景模式確認特徵後，改用 pipx 的 serialwrapd 入口背景啟動。
+        # on-demand 模式必然 DAEMON_EXITED（與新版無關）。以前景模式確認特徵後，改用 pipx 的 serialwrapd 入口背景啟動。
         probe = self.run(["timeout", "10", "serialwrap", "daemon", "start", "--foreground"], label=label + "（前景診斷）")
         if "serialwrapd.py" not in probe.stderr:
             return proc
@@ -293,7 +293,7 @@ class Driver:
         if self.mode == "systemd-system":
             # 0.3.2 既有缺陷：system unit 的 UMask=0117 使 daemon 自建的目錄缺 x 位元（0660），接著建立子目錄即
             # PermissionError、unit 反覆重啟。一般使用者先前以 on-demand 用過 serialwrap 時這些目錄已存在；此處以 swtest
-            # 的一般 umask 前景啟動一次 0.3.2 daemon（隔離 socket）讓它自建全部目錄後結束，並記為觀察項（與 0.4.0 無關）。
+            # 的一般 umask 前景啟動一次 0.3.2 daemon（隔離 socket）讓它自建全部目錄後結束，並記為觀察項（與新版無關）。
             # system unit 沒有 XDG_RUNTIME_DIR（RUN_DIR 落在 STATE_DIR/run），暖機須同樣不帶該變數。
             warm = self.run(["env", "-u", "XDG_RUNTIME_DIR", "timeout", "-s", "INT", "8", str(BIN / "serialwrapd"),
                              "--socket", "/tmp/sw-warmup.sock"],
@@ -390,7 +390,7 @@ class Driver:
         legacy = str(old_status.get("version") or OLD_VERSION).startswith("0.3.")
         old_ids = {pid: self._start_ticks(pid) for pid in before["daemon_pids"]}
         t0 = time.monotonic()
-        proc = self.run([str(self.new_cli), "setup", *self.setup_args], label="0.4.0 setup（舊 daemon 執行中）", timeout=600)
+        proc = self.run([str(self.new_cli), "setup", *self.setup_args], label=f"{NEW_VERSION} setup（舊 daemon 執行中）", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
             # OD-48：在 driver 任何啟動動作之前取樣，確認新 daemon 由 setup 自己啟動。
@@ -426,8 +426,8 @@ class Driver:
         else:
             stop, wait = self.stop_daemon("0.3.2 daemon stop")
             gone = wait["gone"]
-            proc = self.run([str(self.new_cli), "setup", *self.setup_args], label="0.4.0 setup", timeout=600) if gone \
-                else self.stop_wait_failed("0.4.0 setup", wait)
+            proc = self.run([str(self.new_cli), "setup", *self.setup_args], label=f"{NEW_VERSION} setup", timeout=600) if gone \
+                else self.stop_wait_failed(f"{NEW_VERSION} setup", wait)
             body = self.parse(proc) or {}
             install = body.get("install") or {}
             ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
@@ -436,14 +436,14 @@ class Driver:
             if (start_step.get("detail") or {}).get("started") is False:
                 self.observations.append({"id": "OBS-UPGRADE-NOT-STARTED", "phase": "upgrade_after_stop",
                                           "detail": start_step.get("detail")})
-            self.add(uc.row("upgrade_after_stop", "PASS" if ok else "FAIL", None if ok else "停舊 daemon 後 0.4.0 setup 失敗",
+            self.add(uc.row("upgrade_after_stop", "PASS" if ok else "FAIL", None if ok else f"停舊 daemon 後 {NEW_VERSION} setup 失敗",
                             stop_rc=stop.returncode, old_gone=gone, setup_rc=proc.returncode,
                             op=install.get("op"), from_version=install.get("from_version"),
                             error_code=body.get("error_code"), backup_dir=install.get("backup_dir"), stop_wait=wait))
         self._judge_entries_and_config()
 
     def _judge_entries_and_config(self) -> None:
-        # 入口：~/.local/bin 兩個入口改指 0.4.0 版本目錄，舊 pipx 入口記錄在備份 entries.json
+        # 入口：~/.local/bin 兩個入口改指新版版本目錄，舊 pipx 入口記錄在備份 entries.json
         entries = self.entries()
         target_dir = str(VERSIONS / NEW_VERSION / "bin")
         switched = all((entries.get(n) or "").startswith(target_dir + "/") for n in ENTRY_NAMES)
@@ -456,7 +456,7 @@ class Driver:
                 pass
         pipx_recorded = any(isinstance(t, str) and "/pipx/venvs/serialwrap/" in t for t in recorded)
         ok = switched and uc.cli_version_identifies(version, NEW_VERSION) and pipx_recorded
-        self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else "入口未切到 0.4.0 或未記錄舊 pipx 入口",
+        self.add(uc.row("entries_replaced", "PASS" if ok else "FAIL", None if ok else f"入口未切到 {NEW_VERSION} 或未記錄舊 pipx 入口",
                         entries=entries, cli_version=version, backup_targets=recorded,
                         pipx_venv_left=(HOME / ".local/share/pipx/venvs/serialwrap").is_dir()))
         cfg = uc.judge_files_preserved("config_preserved_upgrade", self.cfg_before, self.cfg_files(),
@@ -464,7 +464,7 @@ class Driver:
         self.add(cfg)
 
     def phase_install_sh(self) -> None:
-        """OD-50：停 0.3.2 daemon 後以新 install.sh 安裝 0.4.0 bundle tarball（離線 --bundle）。"""
+        """OD-50：停 0.3.2 daemon 後以新 install.sh 安裝新版 bundle tarball（離線 --bundle）。"""
         stop, wait = self.stop_daemon("0.3.2 daemon stop（install.sh 前）")
         gone = wait["gone"]
         ok = stop.returncode == 0 and gone
@@ -477,8 +477,8 @@ class Driver:
         self.env["TMPDIR"] = str(tmpdir)
         try:
             proc = self.run(["bash", str(self.installer), "--bundle", str(self.bundle_tarball), "--", self.flag],
-                            label="install.sh --bundle（0.4.0）", timeout=600) if gone \
-                else self.stop_wait_failed("install.sh --bundle（0.4.0）", wait)
+                            label=f"install.sh --bundle（{NEW_VERSION}）", timeout=600) if gone \
+                else self.stop_wait_failed(f"install.sh --bundle（{NEW_VERSION}）", wait)
         finally:
             del self.env["TMPDIR"]
         body = self.parse(proc) or {}
@@ -495,7 +495,7 @@ class Driver:
         self._judge_entries_and_config()
 
     def phase_new_running(self) -> None:
-        start = self.start_daemon("0.4.0 start")
+        start = self.start_daemon(f"{NEW_VERSION} start")
         status = self.wait_daemon(version=NEW_VERSION) or {}
         pids = uc.scan_daemon_instances(self.proc_root)
         argv = []
@@ -507,12 +507,12 @@ class Driver:
         from_bundle = any(str(VERSIONS / NEW_VERSION) in a for a in argv)
         ok = start.returncode == 0 and status.get("version") == NEW_VERSION and status.get("multi_open") is False \
             and pids == [status.get("pid")] and from_bundle
-        self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else "0.4.0 daemon 未正確啟動",
+        self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else f"{NEW_VERSION} daemon 未正確啟動",
                         start_rc=start.returncode, version=status.get("version"), pid=status.get("pid"),
                         multi_open=status.get("multi_open"), instances=pids, argv=argv[:6]))
         self._check_supervision("supervision_reconciled", status.get("pid"))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
-        self.add(uc.judge_doctor("doctor_green_new", self.doctor("0.4.0 doctor"), require_pairing=True))
+        self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
 
     def phase_new_running_system(self) -> None:
         """systemd-system：新 daemon 已由 setup 啟動（不得由 driver 代啟），驗證來源、監管收斂、狀態與 doctor。"""
@@ -527,7 +527,7 @@ class Driver:
         from_bundle = any(str(VERSIONS / NEW_VERSION) in a for a in argv)
         ok = status.get("version") == NEW_VERSION and status.get("multi_open") is False \
             and pids == [status.get("pid")] and from_bundle
-        self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else "0.4.0 daemon 未由 setup 正確啟動",
+        self.add(uc.row("new_daemon_started", "PASS" if ok else "FAIL", None if ok else f"{NEW_VERSION} daemon 未由 setup 正確啟動",
                         started_by="setup", version=status.get("version"), pid=status.get("pid"),
                         multi_open=status.get("multi_open"), instances=pids, argv=argv[:6]))
         config_text = (CONFIG / "config.yaml").read_text(encoding="utf-8") if (CONFIG / "config.yaml").is_file() else ""
@@ -543,7 +543,7 @@ class Driver:
                         mode_in_config=mode_line, active=active, enabled=enabled, main_pid=main_pid,
                         daemon_pid=status.get("pid"), dropins=dropins))
         self.add(uc.judge_state_compatible(self.baseline, self.state_view(), "state_compatible_upgrade"))
-        self.add(uc.judge_doctor("doctor_green_new", self.doctor("0.4.0 doctor"), require_pairing=True))
+        self.add(uc.judge_doctor("doctor_green_new", self.doctor(f"{NEW_VERSION} doctor"), require_pairing=True))
         self.run(["sudo", "systemctl", "stop", "serialwrap"], label="收尾 sudo systemctl stop")
         self.wait_no_daemon()
 
@@ -565,7 +565,7 @@ class Driver:
 
     def phase_rollback_command(self) -> None:
         before = self._site()
-        proc = self.sw("setup", "--rollback", label="0.4.0 setup --rollback", timeout=600)
+        proc = self.sw("setup", "--rollback", label=f"{NEW_VERSION} setup --rollback", timeout=600)
         body = self.parse(proc) or {}
         if proc.returncode == 0 and body.get("ok"):
             # 回滾成功時 CLI、daemon 都必須回到 0.3.2 且設定保留；之後的手動降級照常執行並另行判定
@@ -583,7 +583,7 @@ class Driver:
 
     def phase_downgrade(self) -> None:
         """release-0.4.0-plan.md 的手動降級程序：停 daemon → 移除指向版本目錄的入口 → pipx 重新安裝 0.3.2 → setup → 啟動。"""
-        stop, wait = self.stop_daemon("0.4.0 daemon stop")
+        stop, wait = self.stop_daemon(f"{NEW_VERSION} daemon stop")
         steps = [stop]
         gone = wait["gone"]
         removed = []
@@ -612,12 +612,12 @@ class Driver:
     def phase_reupgrade(self) -> None:
         stop, wait = self.stop_daemon("0.3.2 daemon stop（重新升級）")
         gone = wait["gone"]
-        proc = self.run([str(self.new_cli), "setup", self.flag], label="0.4.0 setup（重新升級）", timeout=600) if gone \
-            else self.stop_wait_failed("0.4.0 setup（重新升級）", wait)
+        proc = self.run([str(self.new_cli), "setup", self.flag], label=f"{NEW_VERSION} setup（重新升級）", timeout=600) if gone \
+            else self.stop_wait_failed(f"{NEW_VERSION} setup（重新升級）", wait)
         body = self.parse(proc) or {}
         op = (body.get("install") or body.get("update") or {})
-        start = self.start_daemon("0.4.0 start（重新升級）") if gone \
-            else self.stop_wait_failed("0.4.0 start（重新升級）", wait)
+        start = self.start_daemon(f"{NEW_VERSION} start（重新升級）") if gone \
+            else self.stop_wait_failed(f"{NEW_VERSION} start（重新升級）", wait)
         status = self.wait_daemon(version=NEW_VERSION) or {}
         version = self.cli_version()
         ok = stop.returncode == 0 and gone and proc.returncode == 0 and body.get("ok") is True \
@@ -626,7 +626,7 @@ class Driver:
         if op.get("from_version") not in (None, OLD_VERSION):
             self.observations.append({"id": "OBS-UPGRADE-STALE-CURRENT", "phase": "reupgrade",
                                       "op": op.get("op"), "from_version": op.get("from_version"),
-                                      "note": "手動降級後 current-release.json 仍記 0.4.0，重新升級被記為 0.4.0→0.4.0 update"})
+                                      "note": f"手動降級後 current-release.json 仍記 {NEW_VERSION}，重新升級被記為 {NEW_VERSION}→{NEW_VERSION} update"})
         self.add(uc.row("reupgrade", "PASS" if ok else "FAIL", None if ok else "降級後重新升級失敗",
                         setup_rc=proc.returncode, op=op.get("op"), from_version=op.get("from_version"),
                         daemon_version=status.get("version"), cli_version=version, stop_wait=wait))
@@ -757,7 +757,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--scenario", choices=("upgrade", "install-sh", "attached-legacy"), default="upgrade")
     parser.add_argument("--installer", help="install-sh 情境：容器內 install.sh 路徑")
-    parser.add_argument("--bundle-tarball", help="install-sh 情境：0.4.0 release 候選 tarball")
+    parser.add_argument("--bundle-tarball", help="install-sh 情境：新版 release 候選 tarball")
     args = parser.parse_args()
     if args.scenario == "install-sh" and not (args.installer and args.bundle_tarball):
         parser.error("--scenario install-sh 需要 --installer 與 --bundle-tarball")
