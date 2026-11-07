@@ -42,3 +42,8 @@ required-features = ["test-fakes"]
 name = "echo_paced"
 path = "tests/echo_paced.rs"
 required-features = ["test-fakes"]
+
+[[test]]
+name = "file_transfer_session"
+path = "tests/file_transfer_session.rs"
+required-features = ["test-fakes"]

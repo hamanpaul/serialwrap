@@ -11,11 +11,11 @@ const SCOPE: &str = include_str!("../../../tests/acceptance/slice21_scope.yaml")
 #[test]
 fn deferred_methods_excludes_delivered_slices() {
     let all = support::deferred_methods(SCOPE, &["2.1"]);
-    // P7←P6 合併 D4：event 已移入 served；2.1 之後的清單保留 console 三項與 file 兩項。
-    assert_eq!(all, ["session.console_attach", "session.console_detach", "session.console_list", "file.push", "file.pull"]);
+    // P7←P6 合併 D4：event 已移入 served；P8 Task 6：file 兩項已移入 served；2.1 之後的清單只剩 console 三項。
+    assert_eq!(all, ["session.console_attach", "session.console_detach", "session.console_list"]);
 
     let after_22 = support::deferred_methods(SCOPE, &["2.1", "2.2"]);
-    assert_eq!(after_22, ["file.push", "file.pull"]);
+    assert!(after_22.is_empty(), "{after_22:?}");
 
     let after_24 = support::deferred_methods(SCOPE, &["2.1", "2.2", "2.3", "2.4"]);
     assert!(after_24.is_empty(), "{after_24:?}");

@@ -4,10 +4,12 @@
 //! 也不自行判定 RPC 錯誤碼——只回傳 Python 相同鍵序的 `PyDict` 或 [`TransferAbort`]（OD-62）。
 
 pub mod op_port;
+pub mod request;
 pub mod rx_match;
 pub mod templates;
 
 pub use op_port::OpTransferPort;
+pub use request::{FileTransferKind, FileTransferRequest};
 
 use std::time::Duration;
 

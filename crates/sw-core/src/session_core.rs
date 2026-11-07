@@ -52,6 +52,8 @@ mod console;
 mod flash;
 /// P6 Task 7：interactive lease 差量（分檔，見 `session_core/lease_p6.rs`）。
 mod lease_p6;
+/// P8 Task 6：`file.push`／`file.pull` 的閘門、前景槽與結果收斂（分檔，見 `session_core/file_xfer.rs`）。
+mod file_xfer;
 
 /// P8 Task 8：flash 認線 probe 的身分（FlashCoordinator 單調遞增配號；`TxPermit.probe_id` 與 `FlashMode::Probe` 共用）。
 pub type ProbeId = u64;
@@ -239,6 +241,8 @@ pub enum SessionRequest {
         by_id: String,
         real_path: String,
     },
+    /// P8 Task 6：`file.push`／`file.pull`（RPC 層已轉型；閘門、lease、前景槽在 actor 內原子判定）。
+    FileTransfer(crate::file_transfer::FileTransferRequest),
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
@@ -1954,6 +1958,7 @@ impl SessionCore {
                 effects.extend(opened);
                 effects
             }
+            SessionRequest::FileTransfer(req) => self.file_transfer_request(req, reply, now),
             SessionRequest::MarkAttachStalled { epoch } => {
                 self.set_state(SessionState::Recovering, now);
                 self.drain_stalled = true;

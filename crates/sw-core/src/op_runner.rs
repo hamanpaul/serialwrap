@@ -20,6 +20,7 @@ use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::{PyFlags, PyRegex, compile, valid_completion_regex};
 
 use crate::arbiter::{QueuedCommand, SubmitOrigin};
+use crate::file_transfer::{PullParams, PushParams, TransferAbort};
 use crate::login_fsm::LoginOutcome;
 use crate::mailbox::ControlEvent;
 use crate::quiet_gate::is_reboot_command;
@@ -37,6 +38,16 @@ pub enum OpSpec {
     InteractiveSend { payload: Vec<u8>, owner: String },
     RebootRecovery { hard_timeout_s: f64 },
     DetectTemplate { templates: Vec<ProfileTemplate> },
+    /// P8 Task 6：前景檔案傳輸（`file.push`／`file.pull`）；走前景 lane（不是 [`OpSpec::runs_beside_foreground`]）。
+    FileTransfer(FileTransferPlan),
+}
+
+/// P8 Task 6：檔案傳輸 op 的參數。由 actor 依 RPC 請求與 session profile 組成（timeout 推導、`prompt_regex`、
+/// `max_console_line_chars`、`path_flavor` 皆已代入），OpRunner 原樣交給 `push_file`／`pull_file`。
+#[derive(Debug, Clone)]
+pub enum FileTransferPlan {
+    Push(PushParams),
+    Pull(PullParams),
 }
 
 /// op 完成結果（`ControlEvent::OpFinished` 內容）。
@@ -62,6 +73,10 @@ pub enum OpOutcome {
     SendRefused(FenceReject),
     /// Python 例外穿出 manager（framing `EXCEPTION`）。
     Error(PyErr),
+    /// P8 Task 6：檔案傳輸結果。`Ok` 為引擎回應或已依 OD-62 映射的錯誤回應（`COMMAND_ABORTED_IN_FLIGHT`／
+    /// `FLUSHED_BY_RECOVERY`／`TRANSFER_TIMEOUT`，META 已由 OpRunner 寫出）；`Err(TxRejected)` 只留給「quiet 且被拒
+    /// 那筆零寫出」（`retry_after_s` 需 actor 的 quiet 狀態），`Err(LocalIo|BadPromptRegex)` 由 actor 轉 framing `EXCEPTION`。
+    FileTransfer(Result<PyDict, TransferAbort>),
 }
 
 /// `OpRunner` 的依賴（Task 14 Produces）。
@@ -396,7 +411,14 @@ fn execute(ctx: &OpCtx, grant: &OpGrant, spec: OpSpec) -> OpOutcome {
             "reboot recovery 由 session actor 以登入 run 驅動（OpRunner 不承接）",
         )),
         OpSpec::DetectTemplate { .. } => OpOutcome::Detected(None),
+        OpSpec::FileTransfer(plan) => run_file_transfer(ctx, grant, plan),
     }
+}
+
+/// P8 Task 6：檔案傳輸執行體（`session_manager.py::file_push`／`file_pull` 的 I/O 段＋`_file_tx_rejected_result`）。
+fn run_file_transfer(ctx: &OpCtx, grant: &OpGrant, plan: FileTransferPlan) -> OpOutcome {
+    let _ = (ctx, grant, plan);
+    todo!("P8-T6")
 }
 
 fn command_payload(command: &str) -> Vec<u8> {

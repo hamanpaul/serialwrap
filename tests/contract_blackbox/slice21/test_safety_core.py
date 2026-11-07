@@ -524,8 +524,10 @@ def _prepare_reject(row: str, request):
         d = request.getfixturevalue("shell_daemon")
         return d, lambda d: _submit(d, "echo x", "--completion-regex", "("), {"INVALID_COMPLETION_REGEX"}
     if row == "METHOD_NOT_FOUND":
+        # 列 ID 沿用 Slice 2.1 鎖定的節點名；P8 Task 6 承接 file.push 後，依本列原註記改要求與 Python 一致的
+        # INVALID_ARGS（缺 local_path／remote_path，於 session 解析前拒絕、零 TX）。
         d = request.getfixturevalue("shell_daemon")
-        return d, lambda d: d.rpc("file.push", {"selector": "COM0"}), {"METHOD_NOT_FOUND"}
+        return d, lambda d: d.rpc("file.push", {"selector": "COM0"}), {"INVALID_ARGS"}
     raise AssertionError(f"未知拒絕路徑列：{row}")
 
 

@@ -38,10 +38,11 @@ def test_deferred_methods(shell_daemon):
     import yaml
 
     scope = yaml.safe_load(SCOPE.read_text(encoding="utf-8"))
-    assert len(scope["deferred_methods"]) == 5
-    # P7←P6 合併 D4：console 已交付、event 已移入 served，只檢查晚於 2.2 的 file method。
+    assert len(scope["deferred_methods"]) == 3
+    # P7←P6 合併 D4：console 已交付、event 已移入 served；P8 Task 6：file method 亦已移入 served，
+    # 晚於 2.2 的延後 method 已無（下方仍檢查 unsupported_catalog_methods）。
     deferred = [row["method"] for row in scope["deferred_methods"] if _slice_key(row["slice"]) > _slice_key(DELIVERED_SLICE)]
-    assert deferred == ["file.push", "file.pull"]
+    assert deferred == []
     unsupported = [row["method"] for row in scope["unsupported_catalog_methods"]]
     methods = deferred + unsupported
     seq0 = shell_daemon.sw("wal", "current-seq")["seq"]
@@ -56,3 +57,7 @@ def test_deferred_methods(shell_daemon):
     for method in [m for m in scope["served_methods"] if m.startswith("event.")]:
         r = shell_daemon.rpc(method, {})
         assert r.get("error_code") != "METHOD_NOT_FOUND", method
+    # 2.4 承接（P8 Task 6）：file.* 空參數依 service.py 回 INVALID_ARGS。
+    for method in [m for m in scope["served_methods"] if m.startswith("file.")]:
+        r = shell_daemon.rpc(method, {})
+        assert r.get("error_code") == "INVALID_ARGS", (method, r)

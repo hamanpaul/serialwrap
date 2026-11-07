@@ -1,9 +1,9 @@
-//! RPC 分派器（arch §6.3，P5-T18）：平面 `match`；Slice 2.2 承接 console 三個 method（P6 Task 10），其餘延後 method 落入 `METHOD_NOT_FOUND`。
+//! RPC 分派器（arch §6.3，P5-T18）：平面 `match`；Slice 2.2 承接 console 三個 method（P6 Task 10），P8 Task 6 承接 `file.push`／`file.pull`。
 //!
 //! 對照 Python `sw_core/service.py` 的 `SerialwrapService.rpc()`／`_dispatch()`：
 //! - 分支順序與 `_dispatch` 相同；每個分支的參數轉型逐行照 Python（`str(x or d)`、`int(x or d)`、`float(x or d)`、
 //!   `bool(x)`、`_coerce_rpc_bool(x)`），轉型例外以 `Err(PyErr)` 回傳，由 framing 轉為 `EXCEPTION`（例外不越過 RPC 邊界）。
-//! - 延後的兩個 file method 不寫分支，落入 `METHOD_NOT_FOUND`，無任何副作用；console 與 event 分支皆保留。
+//! - `file.push`／`file.pull`（P8 Task 6）：轉型與來源檢查在本層，session 閘門、前景槽與傳輸在 actor／OpRunner。
 //! - `rpc()`＝`dispatch()` 後 `setdefault("version", version)`（#154）。
 //!
 //! 與 Python 的分層差異（外部回應不變）：Python 的 `_resolve_session_id`（READY／RECOVERING／FLASHING／
@@ -19,6 +19,7 @@ use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
+use sw_core::file_transfer::FileTransferKind;
 use sw_core::flash_endpoint::{FlashCoordinator, FlashEndpoint};
 use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_core::SessionRequest;
@@ -451,6 +452,13 @@ impl Service {
         ))
     }
 
+    /// P8 Task 6：`file.push`／`file.pull`（`service.py` 1426～1500）：轉型失敗與 `SOURCE_RESERVED` 直接回；
+    /// 通過者交 `SessionManager::file_transfer`，成功回應依 `_annotate_source` 標註正規化來源。
+    fn file_transfer_rpc(&self, kind: FileTransferKind, params: &PyDict) -> Result<PyDict, PyErr> {
+        let _ = (kind, params);
+        todo!("P8-T6")
+    }
+
     fn dispatch(&self, method: &str, params: &PyDict) -> Result<PyDict, PyErr> {
         let p = Params::new(params);
         match method {
@@ -709,6 +717,10 @@ impl Service {
                 let alias = p.str_or("alias", "")?;
                 self.manager.alias_unassign(&alias)
             }
+
+            // P8 Task 6：file.* 的參數轉型逐行照 `service.py`（`FileTransferRequest::from_rpc`），session 閘門在 actor 內。
+            "file.push" => self.file_transfer_rpc(FileTransferKind::Push, params),
+            "file.pull" => self.file_transfer_rpc(FileTransferKind::Pull, params),
 
             "command.submit" => {
                 // completion_regex 驗證在 selector 解析之前（Python 順序）。

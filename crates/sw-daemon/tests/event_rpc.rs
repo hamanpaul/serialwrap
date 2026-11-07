@@ -249,10 +249,11 @@ fn event_methods_served_not_method_not_found_and_not_retryable() {
         assert!(!matches!(method, Method::Unknown(_)), "{m} 在方法目錄");
         assert!(!method.is_retryable_readonly(), "{m} 不可自動重試");
     }
+    // P8 Task 6：file.* 已承接；空 params 依 `service.py` 回 INVALID_ARGS（不再是 METHOD_NOT_FOUND）。
     for m in ["file.push", "file.pull"] {
         assert_eq!(
             r.rig.call(m, "{}").get("error_code"),
-            Some(&PyValue::from("METHOD_NOT_FOUND"))
+            Some(&PyValue::from("INVALID_ARGS"))
         );
     }
 }

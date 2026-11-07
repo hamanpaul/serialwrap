@@ -8,6 +8,8 @@
 #![allow(dead_code)]
 
 pub mod fake_shell;
+/// P8 Task 6：`file.push`／`file.pull` session 整合測試台（`XferRig`／`ShellPeer`）。
+pub mod file_transfer_session;
 /// P8 Task 8：FLASHING 仲裁測試 kit（`kit`＝CoreHarness、`bb`＝ActorRig 黑箱零 TX 證據）。
 pub mod flash_core;
 /// P8 Task 9：`/dev/ttyMCU` 端點與認線協調測試台（`FlashRig`／`Mcu`）。

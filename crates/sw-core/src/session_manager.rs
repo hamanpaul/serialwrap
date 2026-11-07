@@ -2584,6 +2584,13 @@ impl SessionManager {
             .map(|e| e.sid.clone())
     }
 
+    /// P8 Task 6：`file.push`／`file.pull` 的 session 路由（Python `_resolve_session_id(file_transfer=True)` 之後的
+    /// `file_push`／`file_pull`）。查無 → `SESSION_NOT_FOUND`＋原 selector；其餘閘門在 actor 內原子判定。
+    pub fn file_transfer(&self, req: crate::file_transfer::FileTransferRequest) -> Result<PyDict, PyErr> {
+        let _ = req;
+        todo!("P8-T6")
+    }
+
     /// 將 session 請求路由到對應 actor 並等待回覆。
     pub fn route(
         &self,

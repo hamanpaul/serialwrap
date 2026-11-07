@@ -79,8 +79,9 @@ fn deferred_methods_return_method_not_found_without_side_effects() {
     let r = ServiceRig::ready_shell();
     let scope = std::fs::read_to_string(support::data_root().join("tests/acceptance/slice21_scope.yaml")).unwrap();
     let methods = support::deferred_methods(&scope, &["2.1", sw_core::SLICE]); // 增補 #24：已交付切片之後的延後 method
-    // P7←P6 合併 D4：console 已交付、event 已移入 served，只剩 file.push／file.pull。
-    assert_eq!(methods, ["file.push", "file.pull"]);
+    // P7←P6 合併 D4：console 已交付、event 已移入 served；P8 Task 6：file.push／file.pull 已移入 served，
+    // 已無延後 method（下方迴圈保留，日後新增延後列時仍檢查 METHOD_NOT_FOUND 與零副作用）。
+    assert!(methods.is_empty(), "{methods:?}");
     for m in methods {
         let before = r.side_effect_fingerprint();
         let resp = r.call(
