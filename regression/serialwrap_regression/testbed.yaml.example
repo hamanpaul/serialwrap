@@ -15,6 +15,10 @@ boards:
     alias: com1-brcm
     serial: AQ00OAQ7
     platform: bcm
+# f8-legacy-attached-upgrade（SC-39 D5.2，PR 250）：擁有者備妥 0.3.x bench 後才設定；未設定時該 case SKIP。
+# legacy_upgrade:
+#   bundle: ~/sw-candidate/serialwrap-0.4.1   # 候選 release bundle 目錄（含 bin/serialwrap）
+#   setup_args: [--user]                      # 與 0.3.x 目前的監管模式一致
 timeouts:
   ready_wait_s: 180
   boot_wait_s: 240
