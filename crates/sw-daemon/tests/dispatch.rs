@@ -250,11 +250,7 @@ fn wp52_rpc_error(r: &ServiceRig, code: &str) -> PyDict {
     }
 }
 
-fn assert_wp52_rpc_rejected_without_side_effects(
-    r: &ServiceRig,
-    params: &str,
-    expected: &str,
-) {
+fn assert_wp52_rpc_rejected_without_side_effects(r: &ServiceRig, params: &str, expected: &str) {
     r.settle();
     let before = wp52_rpc_snapshot(r);
     let response = r.call("command.submit", params);
@@ -278,7 +274,8 @@ fn wp52_rpc_expect_reboot_invalid_type_zero_tx() {
         let selector = selector
             .map(|s| format!(",\"selector\":\"{s}\""))
             .unwrap_or_default();
-        let params = format!(r#"{{"cmd":"wp52 type check"{selector},"expect_reboot":{raw_value}}}"#);
+        let params =
+            format!(r#"{{"cmd":"wp52 type check"{selector},"expect_reboot":{raw_value}}}"#);
         assert_wp52_rpc_rejected_without_side_effects(&r, &params, &expected);
     }
 }
