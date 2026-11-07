@@ -7,7 +7,8 @@
   `p7_gate:contract-blackbox-p7-b`（B）／`-p7-a`（A；不含 rust_only SC 節點）裡屬於該案例的完整 nodeid（含 `[參數]`）；
   每個節點須在 junit 恰出現一次，缺漏、重複、凍結集合無節點 → INCOMPLETE（審查 P7-c5f0fc9-5、P7-cd7acf0-1）。
   `--collected`（同一 commit 的 collect-only）只作交叉核對：與凍結 B 集合不同（新增／替代／缺少節點）→ INCOMPLETE。
-- junit 中不屬凍結集合的節點（替代節點）→ INCOMPLETE；屬 rust_only SC 的 A 輪節點（A 集合不含）取 B 集合節點，各恰一次 skip 或 passed。
+- junit 中不屬凍結集合的節點（替代節點）→ INCOMPLETE；slice21 僅 OD-72 逐名移出的 8 個 Linux skip 可不計入，且仍須各恰一次 skip。
+  屬 rust_only SC 的 A 輪節點（A 集合不含）取 B 集合節點，各恰一次 skip 或 passed。
 - PASS：所有必要節點皆通過。
 - FAIL：任一 failure／error。
 - SKIP＋原因：全數 skip，且僅限 cases.yaml 已登記的平台限定——A 輪 skip 只在案例的 behavior_changes 含
@@ -54,6 +55,18 @@ PHASE_SETS: dict[str, str] = {
     "l15-slice21-b": "p7_gate:l15-slice21-b",
     "l15-slice23": "p7_gate:l15-slice23-b",
 }
+# OD-72 逐名移出 slice21 Linux 凍結集合的 8 個節點：7 個交由 Windows native 集合，1 個延至 DF-20 解鎖。
+# 目錄 selector 仍會收集到它們；只有在 Linux 結果各恰一次 skipped 時才可忽略。
+OD72_SLICE21_SKIPPED_EXTRAS = frozenset({
+    "tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_tcp_endpoint_loopback_and_ping",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_second_daemon_exit_2",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_config_yaml_socket_path_written",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_deferred_methods_windows",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_session_public_console_endpoint_null",
+    "tests/contract_blackbox/slice21/test_windows_nocom.py::test_stop_exit_0",
+})
 SET_A, SET_B = "p7_gate:contract-blackbox-p7-a", "p7_gate:contract-blackbox-p7-b"
 DEFAULT_L1_LOCK = ROOT / "tests/acceptance/l1_required.lock.json"
 FUNC_CASES: tuple[str, ...] = ("brcm-01-login-flow", "ev-01-spawn-handler")
@@ -219,8 +232,9 @@ def _read_rc(path: Path) -> int | None:
         return None
 
 
-def judge_phase(d: Path, frozen: list[str] | None) -> tuple[str, str]:
-    """pytest 回歸階段：以凍結集合 `frozen` 逐節點核對（見模組說明）。"""
+def judge_phase(d: Path, frozen: list[str] | None,
+                allowed_skipped_extra: frozenset[str] = frozenset()) -> tuple[str, str]:
+    """pytest 回歸階段：凍結節點逐項核對；額外節點僅可命中明列且單次 skipped 的集合。"""
     blocked = d / "blocked"
     if blocked.is_file():
         return "BLOCKED-UPSTREAM", blocked.read_text(encoding="utf-8").strip()[:200]
@@ -235,13 +249,19 @@ def judge_phase(d: Path, frozen: list[str] | None) -> tuple[str, str]:
         return "INCOMPLETE", "L1 鎖無此階段的凍結必要集合"
     short = lambda xs: ", ".join(x.split("::", 1)[1] for x in xs)[:300]
     missing = [n for n in frozen if len(res.get(n) or []) == 0]
-    dup = [n for n in frozen if len(res.get(n) or []) > 1]
+    dup = sorted(n for n, rows in res.items() if len(rows) > 1)
     extra = sorted(set(res) - set(frozen))
+    unexpected_extra = [
+        n for n in extra
+        if n not in allowed_skipped_extra
+        or len(res.get(n) or []) != 1
+        or res[n][0][0] != "skipped"
+    ]
     skipped = [n for n in frozen if any(o == "skipped" for o, _ in res.get(n) or [])]
     if missing or dup:
         return "INCOMPLETE", f"缺 {len(missing)}／重複 {len(dup)} 個凍結節點：{short(missing + dup)}"
-    if extra:
-        return "INCOMPLETE", f"含凍結集合以外的節點 {len(extra)} 筆：{short(extra)}"
+    if unexpected_extra:
+        return "INCOMPLETE", f"含未授權凍結集合以外節點 {len(unexpected_extra)} 筆：{short(unexpected_extra)}"
     if skipped:
         return "INCOMPLETE", f"skip {len(skipped)} 筆：{short(skipped)}"
     if rc != 0:
@@ -333,7 +353,11 @@ def build(args) -> tuple[str, int]:
             head.append(f"| （{side} 輪 pytest 結束碼） | INCOMPLETE | | rc=1 但 junit 無失敗節點 |")
     if args.regression_dir is not None:
         head += ["", "## 先前切片必要回歸（Rust artifact）", "", "| 階段 | 結果 | 說明 | evidence sha256 |", "|---|---|---|---|"]
-        rows = [(slug, title, judge_phase(args.regression_dir / slug, load_frozen(args.l1_lock, PHASE_SETS[slug])),
+        rows = [(slug, title, judge_phase(
+                    args.regression_dir / slug,
+                    load_frozen(args.l1_lock, PHASE_SETS[slug]),
+                    OD72_SLICE21_SKIPPED_EXTRAS if slug == "slice21-b" else frozenset(),
+                 ),
                  args.regression_dir / slug / "junit.xml") for slug, title in REGRESSION_PHASES]
         rows += [(f"func-{c}", f"func-test {c}（bridge，Rust）", judge_func(args.regression_dir / f"func-{c}"),
                   args.regression_dir / f"func-{c}" / "log") for c in FUNC_CASES]

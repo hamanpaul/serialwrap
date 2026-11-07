@@ -1,8 +1,8 @@
 """P7 Task 18（08-slice23-login-events.md）：`p7_ab_report.py` 的先前切片必要回歸判定與
 `p7_case_coverage.py` 的 slice_2.3 涵蓋判定（合成 fixture，不讀「最新報告」）。
 
-- 回歸階段：以預先凍結的必要集合逐節點核對——junit 任一 failure → FAIL；凍結節點缺漏／重複／skip、含凍結集合以外
-  的節點（替代節點）、無凍結集合、rc 非 0 卻無失敗、缺 junit → INCOMPLETE；`blocked` 標記 → BLOCKED-UPSTREAM；皆不得
+- 回歸階段：以預先凍結的必要集合逐節點核對——junit 任一 failure → FAIL；凍結節點缺漏／重複／skip、未授權額外節點、
+  無凍結集合、rc 非 0 卻無失敗、缺 junit → INCOMPLETE；`blocked` 標記 → BLOCKED-UPSTREAM；皆不得
   PASS（審查 P7-cd7acf0-1）。func-test 階段：comparison verdict PASS 且 rc 0 才 PASS。
 - 涵蓋：contract-blackbox 案例的必要節點取自凍結 A／B 集合，各恰一次 passed（rust_only SC 的 A 輪為 skip）；
   windows-native／realhw／F1～F6、F8～F12 regression → BLOCKED-OWNER＋B 編號；總表沒有 B 編號的 family → 缺漏；
@@ -45,6 +45,40 @@ def _phase(tmp: pathlib.Path, slug: str, rows: dict[str, str] | None, rc: int | 
     if rc is not None:
         (d / "rc").write_text(f"{rc}\n", encoding="utf-8")
     return d
+
+
+def _l1_report(selector: dict, rows: dict[str, str]) -> dict:
+    """符合 l1-results.v1 的 pytest 報告，argv 逐字取自凍結 selector。"""
+    return {
+        "schema_version": 2,
+        "format": "l1-results.v1",
+        "runner": "pytest",
+        "platform": "linux",
+        "argv": ["/python/pytest/__main__.py", *selector["argv"], "--junitxml=target/junit.xml"],
+        "markexpr": selector.get("markexpr", ""),
+        "counts": {},
+        "resources": {},
+        "not_collected_platform": [],
+        "core_portable_platform_skips": [],
+        "collected": list(rows),
+        "deselected": [],
+        "results": [
+            {
+                "nodeid": node,
+                "outcome": outcome,
+                "skip_kind": "platform" if outcome == "skipped" else None,
+                "phases": {
+                    "setup": "passed",
+                    "call": "skipped" if outcome == "skipped" else "passed",
+                    "teardown": "passed",
+                },
+            }
+            for node, outcome in rows.items()
+        ],
+        "exit_code": 0,
+        "finished": True,
+        "deployed_content": None,
+    }
 
 
 FROZEN = ["tests/a.py::t1", "tests/a.py::t2[shell]", "tests/a.py::t2[prpl]"]
@@ -100,13 +134,85 @@ def test_slice22_report_checks_the_registered_frozen_nodes(tmp_path):
     assert ab.judge_phase(_phase(tmp_path, "slice22-b", rows), frozen)[0] == "PASS"
 
 
-def test_run_p7_ab_uses_frozen_slice21_and_merged_slice22_directory():
-    """slice21 不得收整個目錄造成 OD-72 額外節點；slice22 使用已合併的 P6 目錄。"""
+def test_slice21_report_accepts_od72_skips_and_l1_selector_matches(tmp_path):
+    """slice21 的 8 個 OD-72 節點只可作目錄收集的 skip，L1 selector 仍須逐字相同。"""
+    import tests.acceptance.l1_judge as l1_judge
+
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
+    frozen_row = lock["p7_gate:contract-blackbox-slice21-b"]["linux"]
+    frozen = frozen_row["nodeids"]
+    selector = frozen_row["selector"]
+    od72_skips = {
+        "tests/contract_blackbox/slice21/test_safety_core.py::test_stale_context_not_replayed",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_tcp_endpoint_loopback_and_ping",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_second_daemon_exit_2",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_wal_share_delete_while_running",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_config_yaml_socket_path_written",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_deferred_methods_windows",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_session_public_console_endpoint_null",
+        "tests/contract_blackbox/slice21/test_windows_nocom.py::test_stop_exit_0",
+    }
+    rows = {node: "passed" for node in frozen}
+    rows.update({node: "skipped" for node in od72_skips})
+
+    phase = _phase(tmp_path, "slice21-b", rows)
+    assert od72_skips == ab.OD72_SLICE21_SKIPPED_EXTRAS
+    assert ab.judge_phase(phase, frozen, allowed_skipped_extra=od72_skips)[0] == "PASS"
+    verdict = l1_judge.judge(_l1_report(selector, rows), frozen, platform="linux", selector=selector)
+    assert verdict["verdict"] == "PASS", verdict
+
+    # OD-72 不授權忽略其他額外 skip，凍結集合仍然 fail-closed。
+    unknown = {**rows, "tests/unrelated.py::test_skipped": "skipped"}
+    assert ab.judge_phase(_phase(tmp_path, "unknown-extra", unknown), frozen,
+                          allowed_skipped_extra=od72_skips)[0] == "INCOMPLETE"
+
+    duplicate_phase = _phase(tmp_path, "duplicate-extra", rows)
+    xml = (duplicate_phase / "junit.xml").read_text(encoding="utf-8")
+    duplicate = '<testcase classname="tests.contract_blackbox.slice21.test_safety_core" name="test_stale_context_not_replayed"><skipped message="why"/></testcase>'
+    (duplicate_phase / "junit.xml").write_text(xml.replace("</testsuite>", duplicate + "</testsuite>"), encoding="utf-8")
+    assert ab.judge_phase(duplicate_phase, frozen, allowed_skipped_extra=od72_skips)[0] == "INCOMPLETE"
+
+
+def test_slice22_report_uses_locked_selector(tmp_path):
+    """P6 黑箱目錄存在時，slice22 報告與 L1 都以凍結 selector／nodeid 判定。"""
+    import tests.acceptance.l1_judge as l1_judge
+
+    lock_path = ROOT / "tests/acceptance/l1_required.lock.json"
+    set_id = ab.PHASE_SETS["slice22-b"]
+    frozen_row = json.loads(lock_path.read_text(encoding="utf-8"))["sets"][set_id]["linux"]
+    frozen = frozen_row["nodeids"]
+    rows = {node: "passed" for node in frozen}
+    assert ab.judge_phase(_phase(tmp_path, "slice22-b", rows), frozen)[0] == "PASS"
+    verdict = l1_judge.judge(_l1_report(frozen_row["selector"], rows), frozen,
+                             platform="linux", selector=frozen_row["selector"])
+    assert verdict["verdict"] == "PASS", verdict
+
+
+def test_run_p7_ab_passes_relative_slice22_selector():
+    """slice22 必須把 lock 內的相對目錄原樣交給 pytest。"""
     script = (ROOT / "scripts/rust/run_p7_ab.sh").read_text(encoding="utf-8")
-    assert "p7_gate:contract-blackbox-slice21-b" in script
-    assert '"${S21_NODES[@]}"' in script
-    assert 'S22_DIR="$ROOT/tests/contract_blackbox/slice22"' in script
-    assert 'if [[ -d "$S22_DIR" ]]' in script
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
+    selector = lock["p7_gate:contract-blackbox-slice22-b"]["linux"]["selector"]
+    assert selector["argv"] == ["-q", "-p", "no:cacheprovider", "tests/contract_blackbox/slice22/"]
+    assert 'S22_DIR="tests/contract_blackbox/slice22"' in script
+    assert 'if [[ -d "$ROOT/$S22_DIR" ]]' in script
+    assert 'run_phase slice22-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s22 -- "$S22_DIR/"' in script
+
+
+def test_run_p7_ab_uses_locked_directory_selectors_for_slice21_and_slice22():
+    """slice21／22 runner argv 必須與 L1 凍結 selector 一致，且缺少 slice22 目錄才 BLOCKED。"""
+    script = (ROOT / "scripts/rust/run_p7_ab.sh").read_text(encoding="utf-8")
+    lock = json.loads((ROOT / "tests/acceptance/l1_required.lock.json").read_text(encoding="utf-8"))["sets"]
+    for slug, set_id in (("slice21-b", "p7_gate:contract-blackbox-slice21-b"),
+                         ("slice22-b", "p7_gate:contract-blackbox-slice22-b")):
+        selector = lock[set_id]["linux"]["selector"]
+        assert selector["argv"][:3] == ["-q", "-p", "no:cacheprovider"]
+        assert selector["argv"][3:] == selector["paths"]
+        assert f"run_phase {slug} " in script
+    assert 'run_phase slice21-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s21 -- tests/contract_blackbox/slice21/' in script
+    assert "S21_NODES" not in script and "S21_NODEIDS_FILE" not in script
+    assert 'S22_DIR="tests/contract_blackbox/slice22"' in script
+    assert 'if [[ -d "$ROOT/$S22_DIR" ]]' in script
     assert '-- "$S22_DIR/"' in script
     assert "test_console_*.py" not in script and "不 merge P6" not in script
 
