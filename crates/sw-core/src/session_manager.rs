@@ -58,6 +58,10 @@ use crate::self_test::SelfTestProbes;
 use crate::uart_bridge::{IoWorker, IoWorkerArgs, RxShared};
 use crate::wal::{WalAppendReq, WalHealthFanout, WalWriter};
 
+/// P8 Task 6：`file.push`／`file.pull` 的回覆等待上限（arch §6.3 的 600 s）。shutdown 時 drain Phase 1 取消傳輸等待，
+/// 引擎盡快返回，不以此上限阻塞停止序。
+const FILE_TRANSFER_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// P8 Task 9：`SessionManager::send_control` 對 control lane 的送出等待上限（lane 有界；滿時不無限阻塞 flash 路徑）。
 const FLASH_CONTROL_SEND_WAIT: Duration = Duration::from_secs(2);
 
@@ -2587,8 +2591,14 @@ impl SessionManager {
     /// P8 Task 6：`file.push`／`file.pull` 的 session 路由（Python `_resolve_session_id(file_transfer=True)` 之後的
     /// `file_push`／`file_pull`）。查無 → `SESSION_NOT_FOUND`＋原 selector；其餘閘門在 actor 內原子判定。
     pub fn file_transfer(&self, req: crate::file_transfer::FileTransferRequest) -> Result<PyDict, PyErr> {
-        let _ = req;
-        todo!("P8-T6")
+        match self.resolve(&req.selector) {
+            Some(sid) => self.route(&sid, SessionRequest::FileTransfer(req), FILE_TRANSFER_REPLY_TIMEOUT),
+            None => Ok(pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_NOT_FOUND",
+                "selector" => req.selector,
+            }),
+        }
     }
 
     /// 將 session 請求路由到對應 actor 並等待回覆。
@@ -2627,9 +2637,13 @@ impl SessionManager {
         let is_release = matches!(req, SessionRequest::Release { .. });
         if matches!(
             req,
-            SessionRequest::GetState | SessionRequest::Activity | SessionRequest::InteractiveOpen { .. }
+            SessionRequest::GetState
+                | SessionRequest::Activity
+                | SessionRequest::InteractiveOpen { .. }
+                | SessionRequest::FileTransfer(_)
         ) {
             // 07 D-09：session 摘要與 interactive_open（Python `_refresh_interactive_locked` 即時掃 peer）前先更新 console peer 判定。
+            // P8 Task 6：file.* 的 manager 層同樣先 `_refresh_interactive_locked`（human lease 的 peer 判定）。
             self.shared.send_console_scan(sid);
         }
         let result = self.shared.request(sid, req, timeout)?;

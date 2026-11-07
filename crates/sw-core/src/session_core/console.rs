@@ -112,13 +112,13 @@ impl SessionCore {
         self.retained_human.as_ref().map(|(owner, _)| owner.as_str())
     }
 
-    /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）是前景 operation；recover、self-test、
-    /// interactive send 不設此旗標（審查 F27）。增補 #26：另計未撤銷的 `replay_hold`（D-22(2)）。
+    /// Python `foreground_busy`：只有命令（含 mode=interactive 命令）與檔案傳輸（P8 Task 6，`kind="file"`）是前景
+    /// operation；recover、self-test、interactive send 不設此旗標（審查 F27）。增補 #26：另計未撤銷的 `replay_hold`（D-22(2)）。
     pub fn foreground_busy(&self) -> bool {
         let command = self.foreground.as_ref().is_some_and(|grant| {
             matches!(
                 self.pending_ops.get(&grant.op_id),
-                Some(PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. })
+                Some(PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. } | PendingOp::FileTransfer { .. })
             )
         });
         command || self.replay_hold_active()

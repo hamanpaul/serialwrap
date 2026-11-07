@@ -25,6 +25,7 @@ use crate::capture::{
 };
 use crate::deferred::InvalidateReason;
 use crate::drain::{StopId, StopKind, StopOp, WorkerStoppedReceipt};
+use crate::file_transfer::FileTransferRequest;
 use crate::generations::{EpochAllocator, Generations};
 use crate::human_console::human_tx::HumanTxTag;
 use crate::human_console::out_ring::OutItem;
@@ -242,7 +243,7 @@ pub enum SessionRequest {
         real_path: String,
     },
     /// P8 Task 6：`file.push`／`file.pull`（RPC 層已轉型；閘門、lease、前景槽在 actor 內原子判定）。
-    FileTransfer(crate::file_transfer::FileTransferRequest),
+    FileTransfer(FileTransferRequest),
     /// 只供測試（test-fakes）：直接設定狀態（FLASHING／RECOVERING 等無法由 RPC 到達者；Task 16 `force_session_state`）。
     #[cfg(feature = "test-fakes")]
     ForceStateForTest(SessionState),
@@ -4850,6 +4851,12 @@ impl SessionCore {
             Some(PendingOp::Recover { reply }) => {
                 effects.extend(self.finish_recover(reply, outcome, now));
             }
+            Some(PendingOp::FileTransfer { reply }) => {
+                // Python `finally`：resume human → `_finish_foreground_operation`（admission 開、回放）後才回應。
+                let result = self.file_transfer_result(outcome, now);
+                self.command_fg_finish(&mut effects);
+                effects.push(Effect::Reply(reply, result));
+            }
             Some(other) => effects.extend(self.answer_op(other, outcome, now, true)),
             None => {
                 if let Some(cmd_id) = grant.cmd_id {
@@ -4972,6 +4979,8 @@ impl SessionCore {
                 vec![Effect::Reply(reply, result)]
             }
             PendingOp::Recover { reply } => vec![Effect::Reply(reply, Ok(prompt_timeout_none()))],
+            // P8 Task 6：drain／重連已清掉前景（stale）時只回覆，不再套用 session 副作用（ownership 已由 Phase 1 重設）。
+            PendingOp::FileTransfer { reply } => vec![Effect::Reply(reply, self.file_transfer_result(outcome, now))],
             PendingOp::Command { .. } | PendingOp::InteractiveCmd { .. } => Vec::new(),
         }
     }
@@ -5935,6 +5944,10 @@ enum PendingOp {
     InteractiveOpen {
         reply: Reply,
         result: PyDict,
+    },
+    /// P8 Task 6：`file.push`／`file.pull`（Python 前景 operation `kind="file"`：計入 `foreground_busy`）。
+    FileTransfer {
+        reply: Reply,
     },
 }
 

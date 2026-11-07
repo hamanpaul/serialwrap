@@ -19,7 +19,7 @@ use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
-use sw_core::file_transfer::FileTransferKind;
+use sw_core::file_transfer::{FileTransferKind, FileTransferRequest};
 use sw_core::flash_endpoint::{FlashCoordinator, FlashEndpoint};
 use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_core::SessionRequest;
@@ -455,8 +455,13 @@ impl Service {
     /// P8 Task 6：`file.push`／`file.pull`（`service.py` 1426～1500）：轉型失敗與 `SOURCE_RESERVED` 直接回；
     /// 通過者交 `SessionManager::file_transfer`，成功回應依 `_annotate_source` 標註正規化來源。
     fn file_transfer_rpc(&self, kind: FileTransferKind, params: &PyDict) -> Result<PyDict, PyErr> {
-        let _ = (kind, params);
-        todo!("P8-T6")
+        let (req, source_check) = match FileTransferRequest::from_rpc(kind, params)? {
+            Ok(parsed) => parsed,
+            Err(response) => return Ok(response),
+        };
+        self.manager
+            .file_transfer(req)
+            .map(|result| annotate_source(result, &source_check, false))
     }
 
     fn dispatch(&self, method: &str, params: &PyDict) -> Result<PyDict, PyErr> {

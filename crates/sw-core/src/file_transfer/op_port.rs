@@ -29,6 +29,11 @@ pub struct OpTransferPort<'a> {
     cancel: RunCancel,
     /// 「有任何新 RX」的等待條件（echo 進度以新 RX 喚醒後重算）。
     any_rx: PyRegex,
+    /// P8 Task 6：本次傳輸（同一 grant 的 TX operation）累計 OS 確認寫出的 bytes（含聚合的 echo slice；與該 op 的
+    /// `TxOpLedger.confirmed_bytes` 同源——兩者都累加每筆 `TxReport` 的確認 bytes，`Finish` 回報 0）。
+    /// Python `operation_permit` 的 `_operation_tx_confirmed` tally（OD-62：區分 `COMMAND_ABORTED_IN_FLIGHT` 與
+    /// `FLUSHED_BY_RECOVERY`）。
+    confirmed: std::cell::Cell<usize>,
 }
 
 /// fence 拒絕原因 → 傳輸中止分類（brief 不符 #2；Flash／WAL／owner 等一律 `Other`，由 T6 映射）。
@@ -96,7 +101,13 @@ impl<'a> OpTransferPort<'a> {
             grant: grant.clone(),
             cancel: cancel.watching_transfers(),
             any_rx: compile(r"[\s\S]", PyFlags(0)).expect("固定 pattern 必可編譯"),
+            confirmed: std::cell::Cell::new(0),
         }
+    }
+
+    /// P8 Task 6：本次傳輸累計已確認寫出的 bytes（OpRunner 依此做 OD-62 的中止映射）。
+    pub fn confirmed_bytes(&self) -> usize {
+        self.confirmed.get()
     }
 
     fn permit(&self, source: &str, cmd_id: Option<&str>, log: bool) -> TxPermit {
@@ -137,7 +148,9 @@ impl<'a> OpTransferPort<'a> {
         if self.ctx.tx.jobs.send(job).is_err() {
             return frozen;
         }
-        self.ctx.tx.wait_report(&report).unwrap_or(frozen)
+        let report = self.ctx.tx.wait_report(&report).unwrap_or(frozen);
+        self.confirmed.set(self.confirmed.get().saturating_add(confirmed_of(&report)));
+        report
     }
 
     /// 結束該行命令的聚合（緩衝以一筆 TX 落 WAL）；writer 已停止時由其收尾 flush 處理過，不重複寫。
