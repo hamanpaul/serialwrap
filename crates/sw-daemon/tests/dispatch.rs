@@ -689,6 +689,146 @@ fn wp53_rpc_flag_routes_chained_command_to_reboot() {
     );
 }
 
+// WP5-3 第 2 項：reboot prompt 等待時間端到端（Python `origin/main:sw_core/session_manager.py:6394`、`:6448-6449`、
+// `:6860-6864`）。呼叫路徑同上：RPC `timeout_s`／`expected_duration_s` → `SubmitReq` → `OpRunner::run_command`
+// 計算 `prompt_wait_s`（旗標且非猜中 → `max(timeout_s, expected_duration_s or 0)`；猜中 → `None`）→ `run_reboot`
+// 的 prompt 等待期限。
+
+/// 以 RPC 送出帶旗標的命令（假 DUT 不回 prompt），等 UART 送出本命令並讓 OpRunner 進入 prompt 等待，再以 250 ms
+/// FakeClock 步進（每步讓出 80 ms 實時，長於 RX 等待的 50 ms 時鐘切片）直到結案或推進滿 `limit_s`；
+/// 回傳 (cmd_id, 結案時距等待起點的 FakeClock 秒數，未結案為 `None`)。
+fn wp53_rpc_step_flagged(
+    r: &ServiceRig,
+    cmd: &str,
+    extra: &str,
+    limit_s: f64,
+) -> (String, Option<f64>) {
+    let dev = r.device(REAL_A);
+    r.settle();
+    let tx_mark = dev.tx_len();
+    let params = format!(r#"{{"selector":"COM0","cmd":"{cmd}","expect_reboot":true{extra}}}"#);
+    let response = r.call("command.submit", &params);
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{params}：{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let line = format!("{cmd}\n");
+    wait_until("UART 送出本命令", || {
+        dev.tx_since(tx_mark).starts_with(line.as_bytes())
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let start = r.clock.elapsed();
+    loop {
+        let waited = (r.clock.elapsed() - start).as_secs_f64();
+        let record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        if !matches!(record.get("done_at"), None | Some(PyValue::Null)) {
+            return (cmd_id, Some(waited));
+        }
+        if waited >= limit_s {
+            return (cmd_id, None);
+        }
+        r.clock.advance(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler`（`prompt_wait_s ==
+/// max(timeout, expected)`）、`::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery` 與
+/// `::test_flag_with_plain_reboot_keeps_two_second_prompt_wait`：
+/// - 旗標串接命令 `timeout_s:1`、`expected_duration_s:5`：3 s 內不結算；3 s 時 prompt 回來 → 正常完成（partial:false、
+///   無 recovery_action），session 仍 READY，UART 無救援鍵。
+/// - 單獨 `reboot` 帶旗標 `timeout_s:10`、`expected_duration_s:30`：維持 `min(timeout, 2 s)`，約 2 s 結算為 EXPECT_REBOOT。
+#[test]
+fn wp53_rpc_flag_prompt_wait_uses_timeout_and_expected_duration() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    let tx_mark = dev.tx_len();
+    let (cmd_id, early) = wp53_rpc_step_flagged(
+        &r,
+        WP53_CHAINED,
+        r#","timeout_s":1,"expected_duration_s":5"#,
+        3.0,
+    );
+    assert_eq!(early, None, "期限應為 max(1, 5) = 5 s，不得在 3 s 前結算");
+    dev.push_rx(b"\r\nroot@t:/# ");
+    let mut record = PyDict::default();
+    wait_until(&format!("{cmd_id} 結案"), || {
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(false)),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(
+        record.get("recovery_action"),
+        Some(&PyValue::Null),
+        "不得進 EXPECT_REBOOT：{}",
+        j(&record)
+    );
+    assert_eq!(
+        record.get("error_code"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(record.get("expect_reboot"), Some(&PyValue::Bool(true)));
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("state"),
+        Some(&PyValue::from("READY")),
+        "不得進 RECOVERING：{}",
+        j(&session)
+    );
+    let tx = dev.tx_since(tx_mark);
+    assert!(
+        !tx.iter().any(|b| matches!(b, 0x03 | 0x04)),
+        "reboot 分支不得送救援鍵：{:?}",
+        String::from_utf8_lossy(&tx)
+    );
+
+    let r = ServiceRig::ready_shell();
+    let (cmd_id, settled) = wp53_rpc_step_flagged(
+        &r,
+        "reboot",
+        r#","timeout_s":10,"expected_duration_s":30"#,
+        10.0,
+    );
+    let settled = settled.expect("單獨 reboot 應在 10 s 內結算");
+    assert!(
+        (2.0..3.0).contains(&settled),
+        "單獨 reboot 維持 min(timeout, 2 s)，實際 {settled}"
+    );
+    let record = sub(
+        &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+        "command",
+    );
+    assert_eq!(
+        s(&record, "recovery_action"),
+        "EXPECT_REBOOT",
+        "{}",
+        j(&record)
+    );
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&record)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WP5-5 第 3 項：可信 human 命令的 TX gate 端到端（G7a、G7b、OD-74、rulings s2 D5）
 //
