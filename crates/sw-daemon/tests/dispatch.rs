@@ -943,6 +943,93 @@ fn wp53_rpc_flag_arms_reconfirm_and_gates_next_command() {
     assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "ls\n");
 }
 
+// WP5-3 第 4 項：passthrough 旗標命令與 SC-35 的底層 TX gate 端到端（裁決 s2 D2；Python
+// `origin/main:sw_core/session_manager.py:814-826` `agent_gate_active()` 對 passthrough 固定回 False、`:778-785`
+// `_push_tx_gate()` 以此發布 bridge 的 `_gate_quiet`）。呼叫路徑：`Service::rpc(command.submit)` →
+// `SessionCore::submit`（passthrough 不套 submit-time gate）→ `start_next`（`reboot = expect_reboot || 猜中`）→
+// `Fence.reboot_arm_op` → `OpRunner::run_command` → `run_reboot` → `TxWriter` 提交並 arm quiet／reconfirm →
+// prompt 回來 `finish_command` → 下一筆 `command.submit` → `OpRunner::send` → `Fence::admit`（`bridge_passthrough`
+// 由 `SessionCore::adopt_opened_bridge` 發布）→ FakeDevice＋WAL。
+
+/// passthrough target（COM0）：pin 選定後零 TX 停 ATTACHED，連續 30 s 無 RX 升 READY（SC-35）。
+fn wp53_passthrough_ready() -> ServiceRig {
+    let r = ServiceRig::build(support::RigSpec {
+        yaml: format!(
+            "profiles:\n  u:\n    platform: passthrough\n    prompt_regex: '(?m)^=> '\n    ready_probe: ''\n\
+             targets:\n  - {{com: COM0, profile: u, device_by_id: {BY_ID_A}}}\n"
+        ),
+        devices: vec![(BY_ID_A.into(), REAL_A.into())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: vec![],
+    });
+    r.wait_state("COM0", "ATTACHED");
+    assert_eq!(r.device(REAL_A).write_calls(), 0, "passthrough attach 零 TX");
+    wait_until("passthrough 30 s 無 RX 升 READY", || {
+        r.clock.advance(Duration::from_secs(1));
+        r.mgr.on_tick();
+        std::thread::sleep(Duration::from_millis(5));
+        r.session("COM0")
+            .and_then(|s| s.get("state").and_then(PyValue::as_str).map(str::to_string))
+            .as_deref()
+            == Some("READY")
+    });
+    r.settle();
+    r
+}
+
+/// 旗標命令（U-Boot `reset`）經 RPC 走 reboot 路徑、TX 提交後 arm reconfirm，回 `=> ` 完成後 pending 照記
+/// （不以清空假裝完成 SC-35）；下一筆合法 agent 命令經 RPC 提交後真正寫入 UART、WAL 有本 cmd_id 的 TX、紀錄 `done`。
+#[test]
+fn wp53_rpc_passthrough_flag_followup_tx_not_gated() {
+    let r = wp53_passthrough_ready();
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"reset\n", b"reset\r\nresetting ...\r\n=> ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reset","timeout_s":6,"expect_reboot":true}"#,
+    );
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let record = wp55_wait_done(&r, s(&response, "cmd_id"));
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(record.get("partial"), Some(&PyValue::Bool(false)), "{}", j(&record));
+    assert_eq!(record.get("recovery_action"), Some(&PyValue::Null), "{}", j(&record));
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "reset\n");
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(session.get("state"), Some(&PyValue::from("READY")), "{}", j(&session));
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "Python `arm_boot_quiet()` 不分 platform，pending 照記：{}",
+        j(&session)
+    );
+
+    dev.on_tx_reply(b"printenv\n", b"printenv\r\nbootcmd=x\r\n=> ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"printenv","timeout_s":10}"#,
+    );
+    assert_eq!(response.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&response));
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let record = wp55_wait_done(&r, &cmd_id);
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(record.get("error_code"), Some(&PyValue::Null), "{}", j(&record));
+    assert_eq!(s(&record, "stdout"), "bootcmd=x", "{}", j(&record));
+    assert_eq!(
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)),
+        "printenv\n",
+        "UART 實際寫出後續命令"
+    );
+    assert_eq!(
+        wp55_wal_tx(&r, &cmd_id),
+        vec![("agent".to_string(), wp55_b64(b"printenv\n"))],
+        "WAL 須有後續命令的完整 TX"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // WP5-5 第 3 項：可信 human 命令的 TX gate 端到端（G7a、G7b、OD-74、rulings s2 D5）
 //
