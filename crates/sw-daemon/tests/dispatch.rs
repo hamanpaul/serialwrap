@@ -598,6 +598,98 @@ fn wp52_end_to_end_flag_does_not_bypass_submit_gates() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 1 項：`expect_reboot` 執行路由端到端（G3；Python `origin/main:sw_core/session_manager.py:6840-6868`）
+//
+// 呼叫路徑：`Service::rpc(command.submit)` → `expect_reboot_rejection`／`SubmitReq.expect_reboot` →
+// `SessionCore::submit` → queue → `start_next` → `OpSpec::Command` → `OpRunner::run_command`
+// （`expect_reboot || guessed_reboot`）→ `run_reboot` → `OpOutcome::RebootExpected` → `SessionCore::finish_command`
+// → registry → `command.get`；UART 端由 `TxWriter` 寫進 FakeDevice。
+// ---------------------------------------------------------------------------
+
+/// 串接式重開命令：`is_reboot_command()` 不猜中，只能靠旗標分流。
+const WP53_CHAINED: &str = "echo a && reboot";
+
+/// 送出 `WP53_CHAINED`（假 DUT 不回 prompt、timeout 1 s），推進 FakeClock 直到結案；回傳 (命令紀錄, 本命令起的 UART TX)。
+fn wp53_submit_chained(r: &ServiceRig, flag: &str) -> (PyDict, Vec<u8>) {
+    let dev = r.device(REAL_A);
+    r.settle();
+    let tx_mark = dev.tx_len();
+    let params = format!(r#"{{"selector":"COM0","cmd":"{WP53_CHAINED}","timeout_s":1{flag}}}"#);
+    let response = r.call("command.submit", &params);
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{params}：{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let mut record = PyDict::default();
+    wait_until(&format!("{cmd_id} 結案"), || {
+        r.clock.advance(Duration::from_millis(100));
+        record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        !matches!(record.get("done_at"), None | Some(PyValue::Null))
+    });
+    (record, dev.tx_since(tx_mark))
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_routes_chained_command_to_reboot_handler` 與
+/// `::test_without_flag_chained_command_keeps_old_behaviour`：RPC 帶 `expect_reboot:true` 的串接命令在 prompt 未回時
+/// 結算為 `EXPECT_REBOOT`（partial），UART 先送出本命令且全程無 Ctrl-C／Ctrl-D；不帶旗標的同一命令走一般逾時救援，
+/// UART 送出 Ctrl-C。
+#[test]
+fn wp53_rpc_flag_routes_chained_command_to_reboot() {
+    let line = format!("{WP53_CHAINED}\n");
+
+    let r = ServiceRig::ready_shell();
+    let (record, tx) = wp53_submit_chained(&r, r#","expect_reboot":true"#);
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(s(&record, "recovery_action"), "EXPECT_REBOOT", "{}", j(&record));
+    assert_eq!(record.get("error_code"), Some(&PyValue::Null), "{}", j(&record));
+    assert_eq!(record.get("expect_reboot"), Some(&PyValue::Bool(true)));
+    assert!(
+        tx.starts_with(line.as_bytes()),
+        "UART 先送出本命令：{:?}",
+        String::from_utf8_lossy(&tx)
+    );
+    assert!(
+        !tx.iter().any(|b| matches!(b, 0x03 | 0x04)),
+        "旗標命令走 reboot 分支，UART 不得出現救援鍵：{:?}",
+        String::from_utf8_lossy(&tx)
+    );
+
+    let r = ServiceRig::ready_shell();
+    let (record, tx) = wp53_submit_chained(&r, "");
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&record)
+    );
+    assert_ne!(
+        record.get("recovery_action"),
+        Some(&PyValue::from("EXPECT_REBOOT")),
+        "無旗標不得走 reboot 分支：{}",
+        j(&record)
+    );
+    assert_eq!(record.get("expect_reboot"), Some(&PyValue::Bool(false)));
+    assert!(tx.starts_with(line.as_bytes()), "{:?}", String::from_utf8_lossy(&tx));
+    assert!(
+        tx.contains(&0x03),
+        "無旗標逾時走一般救援送 Ctrl-C：{:?}",
+        String::from_utf8_lossy(&tx)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // WP5-5 第 3 項：可信 human 命令的 TX gate 端到端（G7a、G7b、OD-74、rulings s2 D5）
 //
 // 呼叫路徑：`Service::rpc(command.submit)` → `check_source`／`is_bare_human` → `SessionRequest::Submit` →
