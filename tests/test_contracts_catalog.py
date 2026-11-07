@@ -1375,7 +1375,7 @@ def test_bc_real_sc_df_ranges() -> None:
     sc_ids = {c.id for c in changes if c.kind == "SC"}
     assert sc_ids == {f"SC-{i:02d}" for i in range(1, 28)} - {"SC-08"} | {"SC-34", "SC-35", "SC-36", "SC-39"}
     df_ids = {c.id for c in changes if c.kind == "DF"}
-    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20", "DF-21", "DF-22", "DF-23"}
+    assert df_ids == {f"DF-{i:02d}" for i in range(1, 18)} | {"DF-19", "DF-20", "DF-21", "DF-22", "DF-25"}
 
     df19 = by_id["DF-19"]
     assert df19.scope == "both"
