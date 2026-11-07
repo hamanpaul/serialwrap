@@ -141,6 +141,31 @@ def test_sw_env_shell_target_ready_then_clean_stop(sw_env, shell_target):
     assert not sw_env.rpc_ok("health.ping")
 
 
+@pytest.mark.posix_pty
+@pytest.mark.process_rpc
+def test_throwaway_daemon_isolated_and_target_teardown_stops_it(throwaway_daemon, sw_env, tmp_path):
+    from p8_fixtures import _stop_envs_using
+
+    st = ShellTarget(tmp_path / "tw-root").start()
+    try:
+        b = throwaway_daemon(targets={"COM0": st})
+        for attr in ("run_dir", "state_dir", "wal_dir", "by_id_dir", "by_path_dir", "profile_dir", "socket"):
+            assert getattr(b, attr) != getattr(sw_env, attr), f"throwaway 的 {attr} 必須獨立"
+        assert b.isolated_env()["SERIALWRAP_CONFIG_DIR"] != sw_env.isolated_env()["SERIALWRAP_CONFIG_DIR"]
+        b.wait_state("COM0", "READY", timeout=20)
+        link = b.by_id_dir / st.by_id_name
+        b.unplug(st.by_id_name)
+        assert not link.is_symlink()
+        b.replug(st.by_id_name)
+        assert os.readlink(link) == st.slave_path
+        pid = b.daemon_pid
+        _stop_envs_using(st.slave_path)          # target fixture 收尾時先停掉仍開著該 tty 的 daemon
+        assert b.daemon_pid is None and not Path(f"/proc/{pid}").exists()
+        assert scan_holders(st.slave_path) == []
+    finally:
+        st.stop()
+
+
 # ---------------------------------------------------------------- (b) ShellTarget 單獨運作
 @pytest.mark.posix_pty
 @pytest.mark.process_rpc
