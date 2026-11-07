@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.core_portable]
+pytestmark = [pytest.mark.core_portable, pytest.mark.process_rpc]
 
 ROOT = Path(__file__).resolve().parent.parent
 
