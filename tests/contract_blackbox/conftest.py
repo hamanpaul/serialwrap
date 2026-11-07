@@ -25,6 +25,14 @@ from mgmt_fixtures import (  # noqa: E402,F401
     stub_log,
     stub_path,
 )
+# P8 Task 0 黑箱共用 fixture（sw_env／shell_target／fake_mcu／throwaway_daemon）。
+# 非頂層 conftest 不得定義 `pytest_plugins`（完整 suite 由根 conftest 起算時 pytest 直接報錯），故與上方相同以 import 載入。
+from p8_fixtures import (  # noqa: E402,F401
+    fake_mcu,
+    shell_target,
+    sw_env,
+    throwaway_daemon,
+)
 from bb_harness import (  # noqa: E402
     ISOLATED_ROOTS,
     is_rust,
