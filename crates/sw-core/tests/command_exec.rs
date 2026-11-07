@@ -2274,3 +2274,247 @@ fn wp55_execute_time_trust_matrix() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// WP5-5 第 2 項：submit-time 可信來源判定（G7b、OD-74、rulings s2 D5）
+// ---------------------------------------------------------------------------
+
+/// submit-time gate 的三種武裝狀態（Python `service._resolve_session_id` 的三個拒絕分支）。
+#[derive(Clone, Copy, Debug)]
+enum Wp55Gate {
+    /// banner 武裝 boot quiet（`boot_quiet_remaining_s` 非 None）。
+    Quiet,
+    /// prompt 清掉 quiet 但 READY 尚未經 nonce probe 再確認（`ready_reconfirm_pending`）。
+    ReconfirmPending,
+    /// 逾 `READY_RECONFIRM_MAX_S` 落有界化終態（`ready_reconfirm_failed`）。
+    ReconfirmFailed,
+}
+
+/// 以前景命令佔住 worker 後建立指定 gate 狀態；回傳佔用命令的 cmd_id。
+fn wp55_arm_gate(h: &mut CoreHarness, gate: Wp55Gate) -> String {
+    h.to_ready();
+    let hold = h.start_foreground_command("sleep 9");
+    h.rx(BANNER);
+    assert!(
+        h.fence.with(|f| f.quiet_active),
+        "{gate:?}：banner 應武裝 quiet"
+    );
+    match gate {
+        Wp55Gate::Quiet => {}
+        Wp55Gate::ReconfirmPending => {
+            h.rx(b"\r\nroot@t:~# ");
+        }
+        Wp55Gate::ReconfirmFailed => {
+            // 推到逾時前 1 秒（timer／Tick 照常投遞），最後 1 秒只推時鐘、不投 Tick：終態翻轉必定發生在
+            // submit 的 `expire_reconfirm`（Python `get_session_state` 於 gate 前先 `expire_ready_reconfirm`）。
+            h.advance(Duration::from_secs(299));
+            h.clock.advance(Duration::from_secs(1));
+        }
+    }
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"), "{gate:?}：{p:?}");
+    assert_eq!(
+        p["boot_quiet_remaining_s"] != PyValue::Null,
+        matches!(gate, Wp55Gate::Quiet),
+        "{gate:?}：{p:?}"
+    );
+    // 三態武裝當下皆為 pending、尚未落終態（ReconfirmFailed 的翻轉留給 submit，由呼叫端於提交後斷言）。
+    assert_eq!(
+        p["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "{gate:?}：{p:?}"
+    );
+    assert_eq!(
+        p["ready_reconfirm_failed"],
+        PyValue::Bool(false),
+        "{gate:?}：{p:?}"
+    );
+    assert_eq!(
+        h.reg.get(&hold.cmd_id).expect("hold")["status"],
+        PyValue::from("running"),
+        "{gate:?}：佔用命令仍在前景執行"
+    );
+    hold.cmd_id
+}
+
+/// 提交時的 quiet／reconfirm gate 只對非可信者生效：`SubmitReq::is_trusted_human()`（`trusted_human` 旗標 OR
+/// `HumanConsole` 來源），永不看 `source` 字首，也不改 `quiet_gate::submit_gate_reject` 的輸出契約。
+///
+/// 對照 Python `origin/main:sw_core/service.py:1234-1250`（`trusted_human = source_check.is_bare_human` 傳入
+/// `_resolve_session_id`）與 `:800-839`（`if not trusted_human and platform != "passthrough"` 才進三個拒絕分支）；
+/// `tests/test_stage0_gate_codes.py:123-155`：bare `human` 於 reconfirm pending 時 `ok` 為 True，明寫
+/// `human:cli`／`human:spoof` 回 `AUTOBOOT_QUIET`。
+///
+/// (A) 三種 gate 狀態 × 四種來源：可信者 admission 成功、取得 cmd_id 並以 `accepted` 入列（前景佔用中，不宣稱 TX
+///     已放行）；非可信者回應逐鍵等於 Python 分支字面量，且沒有新命令紀錄、沒有入列、沒有 `StartOp`。
+/// (B) 既有前置檢查（非 READY、ATTACHED、RECOVERING、FLASHING）不因可信標記而繞過：可信與非可信回應完全相同。
+#[test]
+fn wp55_submit_time_trust_matrix() {
+    use sw_core::arbiter::SubmitOrigin;
+    use sw_core::quiet_gate::READY_UNCONFIRMED_HINT;
+    use sw_core::session_core::SessionState;
+
+    let console = || SubmitOrigin::HumanConsole {
+        client_id: "c1".into(),
+    };
+    // (source, trusted_human, origin, 預期可信)
+    let matrix = [
+        // OD-74：RPC 原始值 bare `human` 經 `check_source` 正規化為 `human:cli` 並帶 `trusted_human=true`。
+        ("human:cli", true, SubmitOrigin::Rpc, true),
+        // 明寫 `human:cli`（含 DF-02 的 `human:` 偽造字首）非可信，一律以 agent 對待。
+        ("human:cli", false, SubmitOrigin::Rpc, false),
+        ("agent:x", false, SubmitOrigin::Rpc, false),
+        // D5：HumanConsole 來源即使旗標為 false 仍可信（OR 語意）。
+        ("human:c1", false, console(), true),
+    ];
+    let submit = |source: &str, trusted_human: bool, origin: &SubmitOrigin| {
+        let mut req = agent_submit("echo wp55");
+        req.source = source.into();
+        req.trusted_human = trusted_human;
+        req.origin = origin.clone();
+        SessionRequest::Submit(req)
+    };
+
+    for gate in [
+        Wp55Gate::Quiet,
+        Wp55Gate::ReconfirmPending,
+        Wp55Gate::ReconfirmFailed,
+    ] {
+        for (source, trusted_human, origin, trusted) in matrix.clone() {
+            let case = format!(
+                "(A) {gate:?} source={source} trusted_human={trusted_human} origin={origin:?}"
+            );
+            let mut h = CoreHarness::new(SHELL_PROFILE);
+            let hold = wp55_arm_gate(&mut h, gate);
+            let records_before = h.reg.len();
+            let pending_before = h.reg.pending(h.core.session_id());
+            let (resp, effects) = h.rpc_full(submit(source, trusted_human, &origin));
+            let resp = resp.expect("submit");
+            // 拒絕回應的 `session` 為提交當下（含 `expire_reconfirm` 翻轉後）的 public session 原樣。
+            let public = h.public();
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::StartOp { .. })),
+                "{case}：前景佔用中不得出列"
+            );
+            if trusted {
+                assert_eq!(resp["ok"], PyValue::Bool(true), "{case}：{resp:?}");
+                let cmd_id = resp["cmd_id"].as_str().expect("cmd_id").to_string();
+                assert_ne!(cmd_id, hold, "{case}");
+                assert_eq!(h.reg.len(), records_before + 1, "{case}：應新增命令紀錄");
+                assert_eq!(
+                    h.reg.pending(h.core.session_id()),
+                    pending_before + 1,
+                    "{case}：應入列"
+                );
+                let rec = h.reg.get(&cmd_id).expect("registry");
+                assert_eq!(rec["status"], PyValue::from("accepted"), "{case}：{rec:?}");
+                assert_eq!(rec["source"], PyValue::from(source), "{case}：{rec:?}");
+            } else {
+                let (code, retry, hint) = match gate {
+                    Wp55Gate::Quiet => (
+                        "AUTOBOOT_QUIET",
+                        Some(pget(&public, "boot_quiet_remaining_s")),
+                        "boot quiet window 進行中（疑似板卡自發重開機）；等 session 重新確認 READY 後重送",
+                    ),
+                    Wp55Gate::ReconfirmPending => (
+                        "AUTOBOOT_QUIET",
+                        Some(PyValue::Float(5.0)),
+                        "boot quiet window 已結束但 READY 尚未重新確認；等 daemon 重新確認 READY 後重送",
+                    ),
+                    Wp55Gate::ReconfirmFailed => ("READY_UNCONFIRMED", None, READY_UNCONFIRMED_HINT),
+                };
+                let mut expected = sw_proto::pydict! { "ok" => false, "error_code" => code };
+                match retry {
+                    Some(retry) => {
+                        assert!(matches!(retry, PyValue::Float(_)), "{case}：{retry:?}");
+                        expected.insert("retry_after_s", retry);
+                        expected.insert("hint", PyValue::from(hint));
+                    }
+                    None => {
+                        expected.insert("hint", PyValue::from(hint));
+                        expected.insert("recommended_action", PyValue::from("self_test"));
+                    }
+                }
+                expected.insert("session", PyValue::Dict(public.clone()));
+                assert_eq!(keys(&resp), keys(&expected), "{case}：鍵序");
+                assert_eq!(resp, expected, "{case}");
+                assert_eq!(h.reg.len(), records_before, "{case}：不得新增命令紀錄");
+                assert_eq!(
+                    h.reg.pending(h.core.session_id()),
+                    pending_before,
+                    "{case}：不得入列"
+                );
+            }
+            if matches!(gate, Wp55Gate::ReconfirmFailed) {
+                assert_eq!(
+                    public["ready_reconfirm_failed"],
+                    PyValue::Bool(true),
+                    "{case}：submit 時的 expire_reconfirm 不因可信而略過，須落有界化終態：{public:?}"
+                );
+            }
+        }
+    }
+
+    // (B) 前置檢查不因可信標記而繞過。
+    #[derive(Debug)]
+    enum Pre {
+        Detached,
+        Attached,
+        NotCommandCapable,
+        Recovering,
+        Flashing,
+    }
+    for (pre, code) in [
+        (Pre::Detached, "SESSION_NOT_READY"),
+        (Pre::Attached, "SESSION_NOT_READY"),
+        (Pre::NotCommandCapable, "PROFILE_NOT_COMMAND_CAPABLE"),
+        (Pre::Recovering, "SESSION_RECOVERING"),
+        (Pre::Flashing, "FLASHING_BUSY"),
+    ] {
+        let mut h = CoreHarness::new(match pre {
+            Pre::NotCommandCapable => SHELL_NO_PROBE_PROFILE,
+            _ => SHELL_PROFILE,
+        });
+        match pre {
+            Pre::Detached => {}
+            Pre::Attached | Pre::NotCommandCapable => {
+                h.to_attached(None);
+            }
+            Pre::Recovering => {
+                h.to_ready();
+                h.force_state(SessionState::Recovering);
+            }
+            Pre::Flashing => {
+                h.to_ready();
+                h.force_state(SessionState::Flashing);
+            }
+        }
+        let records_before = h.reg.len();
+        let (baseline, _) = h.rpc_full(submit("agent:x", false, &SubmitOrigin::Rpc));
+        let baseline = baseline.expect("submit");
+        assert_eq!(
+            pget(&baseline, "error_code"),
+            PyValue::from(code),
+            "{pre:?}：{baseline:?}"
+        );
+        for (source, trusted_human, origin, _) in matrix.clone() {
+            let case = format!(
+                "(B) {pre:?} source={source} trusted_human={trusted_human} origin={origin:?}"
+            );
+            let (resp, effects) = h.rpc_full(submit(source, trusted_human, &origin));
+            let resp = resp.expect("submit");
+            assert_eq!(keys(&resp), keys(&baseline), "{case}：鍵序");
+            assert_eq!(resp, baseline, "{case}：可信標記不得改變前置檢查回應");
+            assert!(resp.get("cmd_id").is_none(), "{case}");
+            assert!(
+                !effects.iter().any(|e| matches!(e, Effect::StartOp { .. })),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            h.reg.len(),
+            records_before,
+            "{pre:?}：前置檢查拒絕不得新增命令紀錄"
+        );
+    }
+}

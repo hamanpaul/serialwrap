@@ -1996,9 +1996,13 @@ impl SessionCore {
         }
 
         if !self.is_passthrough() {
-            // `service._resolve_session_id` 的 gate 段（RPC 的 `human:` source 一律視同 agent，DF-02）。
+            // `service._resolve_session_id` 的 gate 段：有界化終態照 `get_session_state` 先評估（不論來源），
+            // 三個拒絕分支只對非可信者生效（`if not trusted_human`，`service.py:800`）。可信＝RPC 依原始 source
+            // 判定的 `trusted_human` OR HumanConsole（OD-74、rulings s2 D5）；永不看 `source` 字首（DF-02）。
             self.expire_reconfirm(now);
-            if self.quiet.failed || self.quiet.quiet_active(now) || self.quiet.pending {
+            if !req.is_trusted_human()
+                && (self.quiet.failed || self.quiet.quiet_active(now) || self.quiet.pending)
+            {
                 let public = self.public(now, &self.public_ctx());
                 if let Some(result) = crate::quiet_gate::submit_gate_reject(&public, &req.source) {
                     return vec![Effect::Reply(reply, Ok(result))];
