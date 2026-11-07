@@ -236,7 +236,11 @@ def test_lock_contains_p8_and_never_shrinks():
     r = _regen_check()
     assert r.returncode == 0, r.stderr
     lock = json.loads((ACC / "cases.lock.json").read_text(encoding="utf-8"))
-    assert P8_IDS | {"f7-binary-roundtrip-md5", "p1-cmd-file"} <= set(lock["sets"]["slice_2.4"])
+    # f7-binary-roundtrip-md5 自 P2（4dc3cc6e）即為 necessity: conditional，依 regen_lock.compute_sets 不入切片分母；
+    # 計畫／brief「slice_2.4 含 f7-binary-roundtrip-md5」不成立（改為 required 屬分母屬性變更，需擁有者裁決）。
+    assert P8_IDS | {"p1-cmd-file"} <= set(lock["sets"]["slice_2.4"])
+    by_id = _cases()
+    assert all(by_id[cid]["necessity"] == "required" for cid in lock["sets"]["slice_2.4"])
     assert {cid for cid in lock["sets"]["slice_2.4"] if cid.startswith("s24-")} == P8_IDS
 
 
@@ -307,7 +311,7 @@ def test_breaker_freeze_matches_lock():
     assert fr["denominator"] == len(fr["required_case_ids"]) == len(set(fr["required_case_ids"]))
     # 凍結後新增案例只會讓 lock 變大；分母不得縮小、凍結的必要案例不得自 lock 消失
     assert set(fr["required_case_ids"]) <= set(lock["sets"]["slice_2.4"])
-    assert P8_IDS | {"f7-binary-roundtrip-md5", "p1-cmd-file"} <= set(fr["required_case_ids"])
+    assert P8_IDS | {"p1-cmd-file"} <= set(fr["required_case_ids"])      # f7-binary-roundtrip-md5 為 conditional，見上
     assert set(_effective(BREAKER / "slice_2.3.json")["required_case_ids"]) <= set(fr["required_case_ids"]), \
         "2.1～2.3 回歸須含於 2.4 分母"
     canon = json.dumps([[cid, lock["case_attrs"][cid]] for cid in fr["required_case_ids"]],
