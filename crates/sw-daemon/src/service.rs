@@ -19,6 +19,7 @@ use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
+use sw_core::flash_endpoint::{FlashCoordinator, FlashEndpoint};
 use sw_core::mcu_patterns::McuPatternRegistry;
 use sw_core::session_core::SessionRequest;
 use sw_core::session_manager::SessionManager;
@@ -66,6 +67,42 @@ pub struct Service {
     running: AtomicBool,
     /// P7 Task 16：Event Engine（組裝點以 `attach_engine` 掛上；未掛上時 `event.*` 維持 METHOD_NOT_FOUND）。
     engine: std::sync::OnceLock<Arc<EventEngine>>,
+    /// P8 Task 10：flash 端點狀態（組裝點以 `attach_flash` 掛上；未掛上時 `mcu.status` 視同無端點）。
+    flash: std::sync::OnceLock<Arc<FlashState>>,
+}
+
+/// P8 Task 10：`mcu.status` 的 flash 真值來源（Python `_flash_endpoint.is_flashing()`、`_flash_active_com`、
+/// `_flash_last_detect`）。
+///
+/// 端點由 daemon_main 以 RAII 持有（`take_endpoint` 後 drop 即 unlink；Task 12 的停止序改呼叫
+/// `FlashEndpoint::stop`）；service 只讀。`caps.flash_endpoint=false`（Windows）時端點為 `None`，
+/// `flashing` 恆 false、`last_detect` 恆 null。
+pub struct FlashState {
+    coord: Arc<FlashCoordinator>,
+    endpoint: std::sync::Mutex<Option<FlashEndpoint>>,
+}
+
+impl FlashState {
+    pub fn new(coord: Arc<FlashCoordinator>, endpoint: Option<FlashEndpoint>) -> Arc<FlashState> {
+        let _ = (coord, endpoint);
+        todo!("P8-T10")
+    }
+
+    /// Python `FlashEndpoint.is_flashing()`：`on_flash_open` 進行中（含 detection，MCU-STATUS-01）；無端點恆 false。
+    pub fn is_flashing(&self) -> bool {
+        let _ = &self.endpoint;
+        todo!("P8-T10")
+    }
+
+    /// 取出端點（呼叫端 drop 即 unlink）；之後 `is_flashing` 恆 false。
+    pub fn take_endpoint(&self) -> Option<FlashEndpoint> {
+        todo!("P8-T10")
+    }
+
+    /// 認線協調者（`mcu.status` 的 `flashing_com`／`last_detect` 來源）。
+    pub fn coordinator(&self) -> &Arc<FlashCoordinator> {
+        &self.coord
+    }
 }
 
 /// `Service::new` 的依賴（組裝點由 `daemon_main` 提供）。
@@ -230,7 +267,14 @@ impl Service {
             mcu: McuPatternRegistry::default_registry(),
             running: AtomicBool::new(true),
             engine: std::sync::OnceLock::new(),
+            flash: std::sync::OnceLock::new(),
         }
+    }
+
+    /// 掛上 flash 端點狀態（只可一次；回 `false` 表示已掛上）。
+    pub fn attach_flash(&self, state: Arc<FlashState>) -> bool {
+        let _ = (&self.flash, state);
+        todo!("P8-T10")
     }
 
     /// 掛上 Event Engine（只可一次；回 `false` 表示已掛上）。

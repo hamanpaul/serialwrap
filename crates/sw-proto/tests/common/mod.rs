@@ -319,7 +319,7 @@ pub fn paths_json(p: &sw_proto::runtime_paths::RuntimePaths) -> String {
     };
 
     format!(
-        "{{\"config_dir\":\"{}\",\"config_yaml\":\"{}\",\"data_dir\":\"{}\",\"default_endpoint\":\"{}\",\"default_tcp_port\":{},\"lock_path\":\"{}\",\"log_dir\":\"{}\",\"profile_dir\":\"{}\",\"run_dir\":\"{}\",\"socket_path\":\"{}\",\"state_dir\":\"{}\",\"wal_dir\":\"{}\"}}",
+        "{{\"config_dir\":\"{}\",\"config_yaml\":\"{}\",\"data_dir\":\"{}\",\"default_endpoint\":\"{}\",\"default_tcp_port\":{},\"lock_path\":\"{}\",\"log_dir\":\"{}\",\"profile_dir\":\"{}\",\"run_dir\":\"{}\",\"socket_path\":\"{}\",\"state_dir\":\"{}\",\"ttymcu_path\":\"{}\",\"wal_dir\":\"{}\"}}",
         esc(&p.config_dir),
         esc(&p.config_yaml),
         esc(&p.data_dir),
@@ -331,6 +331,7 @@ pub fn paths_json(p: &sw_proto::runtime_paths::RuntimePaths) -> String {
         esc(&p.run_dir),
         esc(&p.socket_path),
         esc(&p.state_dir),
+        esc(&p.ttymcu_path),
         esc(&p.wal_dir),
     )
 }
