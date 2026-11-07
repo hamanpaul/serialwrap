@@ -1042,6 +1042,247 @@ fn wp53_route_without_flag_completion_regex_completes() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 2 項：reboot prompt 等待時間（G3；Python `origin/main:sw_core/session_manager.py:6394`、
+// `:6448-6449`、`:6860-6864`）。旗標且非猜中 → `max(timeout_s, expected_duration_s or 0.0)`；
+// 其餘（猜中的單獨 reboot）→ `min(timeout_s, 2.0)`。
+// ---------------------------------------------------------------------------
+
+const WP53_PROMPT: &[u8] = b"\r\nroot@t:/# ";
+
+/// 送出命令後讓 OpRunner 進入 prompt 等待（期限以 FakeClock 起算，此期間時鐘不動），回傳等待起點。
+fn wp53_wait_started(h: &ActorRig, tx: &[u8]) -> Duration {
+    wait_tx(h, tx);
+    std::thread::sleep(Duration::from_millis(150));
+    h.clock.elapsed()
+}
+
+/// 以 250 ms FakeClock 步進（每步讓出 80 ms 實時，長於 RX 等待的 50 ms 時鐘切片，確保 OpRunner 觀察到每一步），
+/// 直到 `cond` 成立或自 `start` 起推進滿 `limit_s`；回傳成立時距 `start` 的 FakeClock 秒數（未成立為 `None`）。
+fn wp53_step_until(
+    h: &ActorRig,
+    start: Duration,
+    limit_s: f64,
+    mut cond: impl FnMut(&ActorRig) -> bool,
+) -> Option<f64> {
+    loop {
+        let waited = (h.clock.elapsed() - start).as_secs_f64();
+        if cond(h) {
+            return Some(waited);
+        }
+        if waited >= limit_s {
+            return None;
+        }
+        h.clock.advance(Duration::from_millis(250));
+        h.send_control(ControlEvent::Tick);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+/// 旗標串接命令：前段 3 s 後 prompt 才回來（`timeout_s`／`expected_duration_s` 依參數）→ 正常完成。
+fn wp53_assert_chained_prompt_at_three_seconds(timeout_s: f64, expected_duration_s: Option<f64>) {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = timeout_s;
+        r.expected_duration_s = expected_duration_s;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let early = wp53_step_until(&h, start, 3.0, |h| is_done(h, &id));
+    assert_eq!(
+        early,
+        None,
+        "prompt 等待期限應為 max(timeout {timeout_s}, expected {expected_duration_s:?})，不得在 3 s 前結算：{:?}",
+        h.command_get(&id)
+    );
+    h.inject_rx(WP53_PROMPT);
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::Null,
+        "不得進 EXPECT_REBOOT：{rec:?}"
+    );
+    assert_eq!(rec["error_code"], PyValue::Null, "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("a"), "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(true), "{rec:?}");
+    let s = h.get_state();
+    assert_eq!(
+        s["state"],
+        PyValue::from("READY"),
+        "不得進 RECOVERING：{s:?}"
+    );
+    assert_eq!(s["recovering"], PyValue::Bool(false), "{s:?}");
+    assert!(!wp53_recover_keys_sent(&h), "不得送救援鍵");
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery`
+/// 與 `::test_pty_chained_reboot_with_flag`：timeout 6 s、prompt 3 s 後回來（> 舊的固定 2 s）仍判成功。
+#[test]
+fn wp53_wait_chained_prompt_after_three_seconds() {
+    wp53_assert_chained_prompt_at_three_seconds(6.0, None);
+}
+
+/// `max(timeout_s, expected_duration_s)`：timeout 1 s、expected 5 s → 期限 5 s，3 s 回 prompt 仍成功
+/// （對照 `::test_flag_routes_chained_command_to_reboot_handler` 的 `prompt_wait_s == 30.0`）。
+#[test]
+fn wp53_wait_expected_duration_extends_timeout() {
+    wp53_assert_chained_prompt_at_three_seconds(1.0, Some(5.0));
+}
+
+/// `max(timeout_s, expected_duration_s)`：timeout 5 s、expected 1 s → timeout 為下限，3 s 回 prompt 仍成功。
+#[test]
+fn wp53_wait_timeout_remains_lower_bound() {
+    wp53_assert_chained_prompt_at_three_seconds(5.0, Some(1.0));
+}
+
+/// 超出 `Duration` 範圍的期限（RPC `float(expected_duration_s)` 不設上限）：Python `deadline = monotonic() + 1e300`
+/// 實質無限等待、不拋例外（`uart_io.py:2635-2648`）。Rust 須飽和而非 panic；prompt 回來即正常完成。
+#[test]
+fn wp53_wait_huge_expected_duration_saturates() {
+    for expected in [1e300, f64::INFINITY] {
+        let h = ActorRig::new(SHELL_PROFILE).ready();
+        let id = h.submit_with(WP53_CHAINED, |r| {
+            r.timeout_s = 1.0;
+            r.expected_duration_s = Some(expected);
+            r.expect_reboot = true;
+        });
+        let start = wp53_wait_started(&h, b"echo a && reboot\n");
+        assert_eq!(
+            wp53_step_until(&h, start, 3.0, |h| is_done(h, &id)),
+            None,
+            "expected {expected}：期限飽和為無限，不得提早結算：{:?}",
+            h.command_get(&id)
+        );
+        h.inject_rx(WP53_PROMPT);
+        let rec = h.wait_done(&id);
+        assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+        assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+        assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+        assert_eq!(state_of(&h), "READY");
+    }
+}
+
+/// 單獨 `reboot` 帶旗標、DUT 不回 prompt：等待時間（自 prompt 等待起點起算的 FakeClock 秒數）與結算紀錄。
+fn wp53_plain_reboot_flag_settle_s(timeout_s: f64) -> f64 {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = timeout_s;
+        r.expected_duration_s = Some(30.0);
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"reboot\n");
+    let settled = wp53_step_until(&h, start, 10.0, |h| is_done(h, &id))
+        .expect("單獨 reboot 應在 10 s 內結算");
+    let rec = h.command_get(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(state_of(&h), "RECOVERING");
+    settled
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_flag_with_plain_reboot_keeps_two_second_prompt_wait`：猜中的單獨 reboot
+/// 帶旗標時 `prompt_wait_s is None` → `min(timeout_s, 2.0)`；timeout 10 s、expected 30 s 仍約 2 s 進 recovery。
+#[test]
+fn wp53_wait_plain_reboot_flag_keeps_two_seconds() {
+    let settled = wp53_plain_reboot_flag_settle_s(10.0);
+    assert!(
+        (2.0..3.0).contains(&settled),
+        "單獨 reboot 維持 min(timeout, 2 s)，實際 {settled}"
+    );
+}
+
+/// 同上，timeout 小於 2 s 時取 timeout（`min(1.0, 2.0)`），不受 expected 30 s 影響。
+#[test]
+fn wp53_wait_plain_reboot_flag_short_timeout_uses_timeout() {
+    let settled = wp53_plain_reboot_flag_settle_s(1.0);
+    assert!(
+        (1.0..2.0).contains(&settled),
+        "timeout < 2 s 時取 timeout，實際 {settled}"
+    );
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_without_prompt_still_falls_to_recovery`：旗標串接命令
+/// 一直沒有 prompt → 等滿 `timeout_s`（3 s，`bridge.waits == [3.0]`）才回 `EXPECT_REBOOT`，不送救援鍵。
+#[test]
+fn wp53_wait_chained_without_prompt_waits_full_deadline() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 3.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let settled = wp53_step_until(&h, start, 10.0, |h| is_done(h, &id))
+        .expect("旗標串接命令應在 10 s 內結算");
+    assert!(
+        (3.0..4.0).contains(&settled),
+        "旗標串接命令應等滿 timeout 3 s，實際 {settled}"
+    );
+    let rec = h.command_get(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(state_of(&h), "RECOVERING");
+    assert!(!wp53_recover_keys_sent(&h), "reboot 分支不得送救援鍵");
+}
+
+/// 無旗標對照：串接命令不被猜中 → 一般命令路徑，依一般 timeout（3 s，silence 上限 min(3, 30)）送 CTRL_C，
+/// 不得誤套固定兩秒的 reboot 等待。
+#[test]
+fn wp53_wait_chained_without_flag_uses_command_timeout() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.on_tx_reply(b"\x03", b"^C\r\nroot@t:/# ");
+    let id = h.submit_with(WP53_CHAINED, |r| r.timeout_s = 3.0);
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let rescued = wp53_step_until(&h, start, 10.0, |h| wal_tx_has(h, b"\x03"))
+        .expect("應在 10 s 內送出 CTRL_C");
+    assert!(
+        (3.0..4.0).contains(&rescued),
+        "無旗標串接命令依一般 timeout 3 s 救援，實際 {rescued}"
+    );
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["recovery_action"], PyValue::from("CTRL_C"), "{rec:?}");
+    assert_eq!(rec["expect_reboot"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(state_of(&h), "READY");
+}
+
+/// 裁決 s2 D2：passthrough 1:1 沿用 Python——`guessed_reboot = not passthrough and _is_reboot_command(...)`，
+/// 故 passthrough 的 `reboot` 文字帶旗標屬「旗標且非猜中」，使用完整期限 `max(timeout_s, expected or 0)`（4 s），
+/// 不是單獨 reboot 的兩秒。
+#[test]
+fn wp53_wait_passthrough_reboot_flag_uses_full_deadline() {
+    let h = passthrough_ready(UBOOT_PASSTHROUGH_PROFILE);
+    let id = h.submit_with("reboot", |r| {
+        r.timeout_s = 4.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"reboot\n");
+    let settled = wp53_step_until(&h, start, 10.0, |h| is_done(h, &id))
+        .expect("passthrough 旗標 reboot 應在 10 s 內結算");
+    assert!(
+        (4.0..5.0).contains(&settled),
+        "passthrough 旗標 reboot 應等滿 timeout 4 s，實際 {settled}"
+    );
+    let rec = h.command_get(&id);
+    assert_eq!(rec["partial"], PyValue::Bool(true), "{rec:?}");
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert!(!wp53_recover_keys_sent(&h), "passthrough 不送救援鍵");
+}
+
+// ---------------------------------------------------------------------------
 // recover
 // ---------------------------------------------------------------------------
 
