@@ -907,3 +907,57 @@ def test_pump_actions_rejected_during_closing(tmp_path: Path, action):
     assert bridge.wait() == 0
     res = bridge._handle_action(action, {"dir": "RX"}, "late")
     assert res.get("ok") is False
+
+
+def test_finish_does_not_hang_when_control_write_holds_lock(tmp_path: Path, monkeypatch):
+    """寫入者卡在持鎖的 fsync：wait() 仍須在有限時間回 3，且 manifest 為非乾淨關閉。"""
+    from uart_stdio_bridge.bridge import core
+
+    monkeypatch.setattr(core, "_CONTROL_FILE_LOCK_TIMEOUT_S", 0.3, raising=False)
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    orig_gate = bridge._close_control_gate
+    bridge._close_control_gate = lambda timeout_s=None: orig_gate(0.3)
+    blocked = threading.Event()
+    release = threading.Event()
+    real = bridge._control_file
+
+    class _Stuck:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def fileno(self):
+            blocked.set()
+            release.wait(30)
+            return real.fileno()
+
+    bridge._control_file = _Stuck()
+    writer = threading.Thread(
+        target=bridge.handle_action, args=("status", {}, "a1"), daemon=True
+    )
+    writer.start()
+    assert blocked.wait(5)
+    bridge._done_event.set()
+    result: dict = {}
+    waiter = threading.Thread(
+        target=lambda: result.setdefault("rc", bridge.wait()), daemon=True
+    )
+    waiter.start()
+    waiter.join(10)
+    hung = waiter.is_alive()
+    try:
+        assert not hung, "wait() 被持鎖的寫入卡住"
+        assert result["rc"] == 3
+        assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+        man = json.loads((evidence_dir / "bridge-manifest.json").read_text(encoding="utf-8"))
+        assert man["closed_cleanly"] is False
+    finally:
+        release.set()
+        writer.join(5)
+        waiter.join(5)
+
+
+def test_close_budget_below_blackbox_sigterm_window():
+    """bb_l15 的 process.wait(timeout=10) 之前，gate + 取鎖上限必須留時間寫 manifest。"""
+    from uart_stdio_bridge.bridge import core
+
+    assert core._CONTROL_CLOSE_TIMEOUT_S + core._CONTROL_FILE_LOCK_TIMEOUT_S < 10

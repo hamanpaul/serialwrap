@@ -1,6 +1,6 @@
 {
   "schema_version": "bridge-approved.v1",
-  "tree_sha256": "c0810f29d3a3eee5fb453e106d13edf543d937829f445af574d87ce648b24545",
+  "tree_sha256": "fa3c2b4b4e28fe22964d2a3e3e21643e5ed72602dfb6f8f042d77267a6314208",
   "reviewer": "grok-4.7 + gemini-3.8-flash-high (non-implementer)",
   "review_ref": "docs/rust-refactor/reviews/brw-bridge-review.md",
   "date": "2026-11-06"

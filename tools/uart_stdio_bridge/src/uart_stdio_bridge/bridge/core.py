@@ -50,10 +50,15 @@ class BridgeConfig:
             raise ValueError("stderr_cap_bytes 不得為負數")
 
 
-# 收尾時等進行中 control action 的上限。逾時即 fail-closed（rc=3），故需放寬到不會把
-# 「CI 慢」誤判成失敗：shutdown 的 _evidence_summary 會讀整份 wire 檔、fsync 也可能慢。
-# 等待發生在 shutdown RPC 返回前，呼叫端 control 逾時為 30 秒，足以涵蓋。
-_CONTROL_CLOSE_TIMEOUT_S = 15.0
+# 收尾時等進行中 control action 的上限。逾時即 fail-closed（rc=3），不宜太短以免把「CI 慢」
+# 誤判成失敗（shutdown 的 _evidence_summary 會讀整份 wire 檔、fsync 也可能慢）。
+# 對 shutdown 自己，等待發生在 RPC 返回前，由 30 秒 control 逾時涵蓋；
+# 對其他連線的 action，等待發生在 shutdown RPC 返回之後，呼叫端只再等 process.wait(timeout=10)
+# （tests/contract_blackbox/bb_l15.py）即 SIGTERM，故「gate + 關 control 檔取鎖」上限
+# 之和必須小於 10 秒，留時間寫 manifest。
+_CONTROL_CLOSE_TIMEOUT_S = 7.0
+# 關閉 control 檔時取 _control_lock 的上限；對方卡在持鎖的 fsync 時不得讓 wait() 永不返回。
+_CONTROL_FILE_LOCK_TIMEOUT_S = 1.0
 
 
 class Bridge:
@@ -1210,8 +1215,16 @@ class Bridge:
         for attr in ("_control_file", "_stderr_file"):
             # 關閉 control 檔須持 _control_lock，避免與 _control_phase 並行 close/write。
             lock = self._control_lock if attr == "_control_file" else None
+            locked = False
             if lock is not None:
-                lock.acquire()
+                locked = lock.acquire(timeout=_CONTROL_FILE_LOCK_TIMEOUT_S)
+                if not locked:
+                    # 寫入者卡在持鎖的 I/O：不動 stream（避免並行 close/write），判失敗後繼續寫 manifest。
+                    self._fail(
+                        "HARNESS_EVIDENCE_WRITE_FAILED",
+                        "control 檔仍被卡住的寫入占用",
+                    )
+                    continue
             try:
                 stream = getattr(self, attr)
                 if stream is not None:
@@ -1226,7 +1239,7 @@ class Bridge:
                         pass
                     setattr(self, attr, None)
             finally:
-                if lock is not None:
+                if locked:
                     lock.release()
         try:
             summary = self.writer.close()
