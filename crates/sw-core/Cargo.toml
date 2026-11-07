@@ -12,6 +12,8 @@ sw-pal = { path = "../sw-pal" }
 # Slice 2.1（arch §5.4 TxWriter 通道與 §5.7 TX 帳本）。
 crossbeam-channel = { workspace = true }
 indexmap = { workspace = true }
+# Slice 2.4 檔案傳輸 md5（Python hashlib.md5；arch §1.2）。
+md-5 = { workspace = true }
 
 [dev-dependencies]
 # 測試以 fakes 驅動 sans-IO 核心（Task 0 骨架，arch §9.1）。
