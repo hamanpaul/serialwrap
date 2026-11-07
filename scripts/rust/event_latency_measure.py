@@ -425,6 +425,34 @@ def _accepted_cancel_timeout_error(rpc: _Rpc, cmd_id: str, last_command_response
     return RuntimeError(message)
 
 
+def _wait_cancel_drained(rpc: _Rpc, cmd_id: str, deadline: float, cancel_returned_at: float) -> None:
+    """等被取消命令的 worker 收尾：同一份 session 快照須為 READY 且 `foreground_busy` 為 false。
+
+    取消成功與 `done_at` 只代表命令記錄已終結：Python `CommandArbiter.cancel()` 與 Rust `CommandRegistry::cancel()`
+    都在回覆前寫入 `done_at`，worker 仍可能在等該命令的 prompt（S2-PAR-fixlat 第 4 項實測：Python 200／200、
+    Rust 32／200 筆於忙碌中返回，下一筆的 accepted 等待因而包含前一筆的收尾時間）。沿用呼叫端既有期限，
+    不另加等待；缺 `foreground_busy` 欄位不視為已收尾。"""
+    last: dict[str, Any] = {"state": None, "foreground_busy": None, "recovering": None}
+    while True:
+        response = rpc.call("session.get_state", {"selector": "COM0"})
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise RuntimeError(f"session.get_state 非 ok；stage=wait_drain; cmd_id={cmd_id!r}; response={response!r}")
+        session = response.get("session")
+        if not isinstance(session, dict):
+            raise RuntimeError(f"session.get_state 缺少 session；stage=wait_drain; cmd_id={cmd_id!r}; response={response!r}")
+        last = {key: session.get(key) for key in last}
+        if last["state"] == "READY" and last["foreground_busy"] is False:
+            return
+        now = time.monotonic()
+        if now > deadline:
+            raise RuntimeError(
+                f"被取消的在途命令 worker 未收尾；stage=wait_drain; cmd_id={cmd_id!r}; "
+                f"elapsed={now - cancel_returned_at:.3f}s; session.state={last['state']!r}; "
+                f"foreground_busy={last['foreground_busy']!r}; recovering={last['recovering']!r}"
+            )
+        time.sleep(0.02)
+
+
 def _sample_cancel(rpc: _Rpc) -> float:
     r = rpc.call("command.submit", {"selector": "COM0", "cmd": "sleep 0.3", "source": "agent:lat", "timeout_s": 10})
     cmd_id = r.get("cmd_id")
@@ -456,8 +484,9 @@ def _sample_cancel(rpc: _Rpc) -> float:
     # 或最終不是 canceled 者記為錯誤（該輪 INSUFFICIENT_EVIDENCE），不得把拒絕回應的耗時算成取消延遲。
     if r.get("ok") is not True or r.get("status") != "canceled":
         raise RuntimeError(f"command.cancel 未成功取消在途命令：{r}")
+    cancel_returned_at = time.monotonic()
     _wait_state(rpc, "READY")
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + 15        # 既有期限：命令記錄終結與 worker 收尾共用，不另加
     while True:
         cmd = rpc.call("command.get", {"cmd_id": cmd_id}).get("command") or {}
         if cmd.get("done_at"):
@@ -467,6 +496,7 @@ def _sample_cancel(rpc: _Rpc) -> float:
         time.sleep(0.02)
     if cmd.get("status") != "canceled":
         raise RuntimeError(f"取消後命令最終狀態不是 canceled：{cmd.get('status')}")
+    _wait_cancel_drained(rpc, cmd_id, deadline, cancel_returned_at)
     return ms
 
 

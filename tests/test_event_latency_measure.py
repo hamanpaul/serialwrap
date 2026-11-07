@@ -79,24 +79,35 @@ def test_only_external_events_are_measured():
     assert ext == set(elm.EXTERNAL_EVENTS)
 
 
+_IDLE_SESSION = {"ok": True, "session": {"state": "READY", "foreground_busy": False, "recovering": False}}
+_BUSY_SESSION = {"ok": True, "session": {"state": "READY", "foreground_busy": True, "recovering": False}}
+
+
 class _FakeRpc:
-    """記憶體替身：可控制 `command.get`／session 診斷回應，取消回 `cancel_reply`。"""
+    """記憶體替身：可控制 `command.get`／session 回應，取消回 `cancel_reply`。
+
+    `session_replies` 依序回應 `session.get_state`（用完後重複最後一筆）；未給時固定回 `session_reply`，
+    預設為已收尾的 READY session（`foreground_busy: false`，Python／Rust `session.get_state` 皆提供此欄）。"""
 
     def __init__(self, cancel_reply: dict, status_after_cancel: str = "canceled", *,
                  command_get_replies: list[dict] | None = None, session_reply: dict | None = None,
-                 session_error: Exception | None = None) -> None:
+                 session_replies: list[dict] | None = None, session_error: Exception | None = None) -> None:
         self.cancel_reply = cancel_reply
         self.status_after_cancel = status_after_cancel
         self.command_get_replies = command_get_replies
-        self.session_reply = session_reply if session_reply is not None else {"ok": True, "session": {"state": "READY"}}
+        self.session_reply = session_reply if session_reply is not None else _IDLE_SESSION
+        self.session_replies = session_replies
         self.session_error = session_error
         self.cancelled = False
         self.command_get_calls = 0
         self.session_get_calls = 0
+        self.session_get_calls_after_cancel = 0
         self.timed_calls = 0
+        self.submit_calls = 0
 
     def call(self, method: str, params: dict) -> dict:
         if method == "command.submit":
+            self.submit_calls += 1
             return {"ok": True, "cmd_id": "c1"}
         if method == "command.get":
             self.command_get_calls += 1
@@ -106,8 +117,12 @@ class _FakeRpc:
             return {"ok": True, "command": {"status": status, "done_at": "t" if self.cancelled else None}}
         if method == "session.get_state":
             self.session_get_calls += 1
+            if self.cancelled:
+                self.session_get_calls_after_cancel += 1
             if self.session_error is not None:
                 raise self.session_error
+            if self.session_replies is not None:
+                return self.session_replies[min(self.session_get_calls - 1, len(self.session_replies) - 1)]
             return self.session_reply
         raise AssertionError(method)
 
@@ -208,6 +223,94 @@ def test_cancel_sample_rejects_refused_cancel():
     with pytest.raises(RuntimeError):
         elm._sample_cancel(_FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, "done"))
     assert elm._sample_cancel(_FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"})) == 0.5
+
+
+class _StepClock:
+    """sleep 只推進虛擬時間、不真的等待：收尾屏障在既有 15 秒期限內輪詢時保持快速且確定。"""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_cancel_sample_does_not_finish_while_foreground_busy(monkeypatch):
+    """S2-PAR-fixlat 第 4 項：取消成功與 `done_at` 只代表命令記錄已終結——Python `CommandArbiter.cancel()` 與
+    Rust `CommandRegistry::cancel()` 都在回覆前寫入 `done_at`，worker 仍可能在等該命令的 prompt。session 仍 READY、
+    `foreground_busy` 仍為 true 時不得結束樣本，否則下一筆的 accepted 等待會吃到前一筆的 worker 收尾時間
+    （target/s2-par/S2-PAR-fixlat-4/probe-*：Python 200／200、Rust 32／200 筆於忙碌中返回）。"""
+    monkeypatch.setattr(elm, "time", _StepClock())
+    replies = [_BUSY_SESSION, _BUSY_SESSION, _BUSY_SESSION, _IDLE_SESSION]
+    rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, session_replies=replies)
+
+    assert elm._sample_cancel(rpc) == 0.5            # 計時仍只取 command.cancel 的 RPC 送出 → 回應
+    assert rpc.submit_calls == 1 and rpc.timed_calls == 1
+    # `_wait_state(READY)` 先取第一筆（READY＋忙碌），之後須一路輪詢到 foreground_busy 解除才返回
+    assert rpc.session_get_calls_after_cancel == len(replies)
+
+
+def test_cancel_sample_errors_when_foreground_busy_outlives_deadline(monkeypatch):
+    """既有 15 秒期限內 worker 仍未收尾：該樣本記錯（整輪不得 PASS），不延長期限、不重送、不丟棄。"""
+    monkeypatch.setattr(elm, "time", _DeadlineClock())
+    rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, session_reply=_BUSY_SESSION)
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "被取消的在途命令 worker 未收尾" in message
+    assert "stage=wait_drain" in message and "cmd_id='c1'" in message
+    assert "session.state='READY'" in message and "foreground_busy=True" in message
+    assert "命令未進入 running（accepted）" not in message
+    assert rpc.submit_calls == 1 and rpc.timed_calls == 1
+
+
+def test_cancel_sample_drain_requires_reported_idle_ready_session(monkeypatch):
+    """缺 `foreground_busy` 欄位或 session 已不在 READY，都不能當作 worker 已收尾。"""
+    for reply, state, busy in (
+        ({"ok": True, "session": {"state": "READY"}}, "'READY'", "None"),
+        ({"ok": True, "session": {"state": "RECOVERING", "foreground_busy": False, "recovering": True}},
+         "'RECOVERING'", "False"),
+    ):
+        monkeypatch.setattr(elm, "time", _DeadlineClock())
+        rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, session_replies=[_IDLE_SESSION, reply])
+        with pytest.raises(RuntimeError) as caught:
+            elm._sample_cancel(rpc)
+        message = str(caught.value)
+        assert "stage=wait_drain" in message, reply
+        assert f"session.state={state}" in message and f"foreground_busy={busy}" in message, reply
+
+
+def test_cancel_sample_drain_rpc_failure_is_distinct(monkeypatch):
+    """收尾輪詢的 `session.get_state` 非 ok 立即記錯，不被當成仍忙碌而等到期限。"""
+    monkeypatch.setattr(elm, "time", _StepClock())
+    rpc = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"},
+                   session_replies=[_IDLE_SESSION, {"ok": False, "error_code": "RPC_FAILED"}])
+
+    with pytest.raises(RuntimeError) as caught:
+        elm._sample_cancel(rpc)
+
+    message = str(caught.value)
+    assert "session.get_state 非 ok" in message and "stage=wait_drain" in message
+    assert rpc.session_get_calls_after_cancel == 2
+
+
+def test_cancel_sample_refused_or_not_canceled_fails_before_drain():
+    """取消被拒與最終非 canceled 仍各自明確失敗，不進收尾屏障（也不被屏障的等待取代）。"""
+    refused = _FakeRpc({"ok": False, "error_code": "CMD_NOT_CANCELABLE", "cmd_id": "c1"}, "done",
+                       session_reply=_BUSY_SESSION)
+    with pytest.raises(RuntimeError, match="command.cancel 未成功取消在途命令"):
+        elm._sample_cancel(refused)
+    assert refused.session_get_calls_after_cancel == 0
+
+    finished = _FakeRpc({"ok": True, "cmd_id": "c1", "status": "canceled"}, "done", session_reply=_BUSY_SESSION)
+    with pytest.raises(RuntimeError, match="取消後命令最終狀態不是 canceled"):
+        elm._sample_cancel(finished)
+    assert finished.session_get_calls_after_cancel == 1      # 只有 `_wait_state(READY)`，未進收尾輪詢
 
 
 def test_report_identity_binds_artifact_commit_tool_and_run(tmp_path):
