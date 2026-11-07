@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sw_pal::proc_scan::{ArgvFlavor, DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, UninspectableProc};
+use sw_pal::proc_scan::{ArgvFlavor, DaemonProc, HolderScan, HolderScanOutcome, HolderScanStatus, ProcDetails, ProcIdentity, UninspectableProc};
 use sw_pal::service_ctl::{ServiceAction, SupervisionMode};
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -82,7 +82,7 @@ pub(crate) struct LegacyStopped {
     pub relaunch_count: usize,
     pub stopped: Vec<ProcIdentity>,
     pub holders_unsupported: bool,
-    /// D5.2：穩定窗內整個無法檢查 fd、未能確認沒有持有 UART 的同 uid 行程（報告標註 `holders_status: "partial"`）。
+    /// D5.2：穩定窗內整個無法檢查 fd、未能確認沒有持有 UART 的同 uid 行程（皆在停止前快照內；報告標註 `holders_status: "partial"`）。
     pub uninspectable: Vec<UninspectableProc>,
     pub other_uid: Vec<u32>,
     /// 原 daemon 的 argv（D6 on-demand 啟動提示）。
@@ -474,6 +474,8 @@ pub(crate) fn stop(
         refused(ErrorCode::InternalError, "journal_write_failed", format!("legacy 擷取檔或 journal 寫入失敗：{message}"), PyDict::new())
     })?;
     crate::rollback::legacy_crash_if("legacy_stop:after_capture");
+    // D5.2：停止前快照。停止後只放行此刻就已整個無法檢查的同 uid 行程（pid＋start_ticks）。
+    let before_stop = uninspectable_before_stop(ctx, &plan);
     let started = ctx.p.clock.mono_ns();
     if let Err(message) = send_stop(ctx, &plan, with_sudo) {
         let alive = plan.daemon.tree.iter().any(|item| ctx.p.procs.identity_alive(item));
@@ -488,7 +490,7 @@ pub(crate) fn stop(
         code: ErrorCode::InternalError.as_str(), reason: "journal_write_failed", message, detail: PyDict::new(), pending: true, stopped: false,
     })?;
     crate::rollback::legacy_crash_if("legacy_stop:after_stop_sent");
-    let waited = wait_stopped(ctx, plan, with_sudo, versions_dir, persist)?;
+    let waited = wait_stopped(ctx, plan, &before_stop, with_sudo, versions_dir, persist)?;
     persist.stage(ctx, "stopped").map_err(|message| LegacyFailure::AfterStop {
         code: ErrorCode::InternalError.as_str(), reason: "journal_write_failed", message, detail: PyDict::new(), pending: false, stopped: true,
     })?;
@@ -515,14 +517,37 @@ struct Waited {
     uninspectable: Vec<UninspectableProc>,
 }
 
-fn holders_status_str(status: HolderScanStatus) -> &'static str {
-    match status {
-        HolderScanStatus::Ok => "ok",
-        HolderScanStatus::Permission => "permission",
-        HolderScanStatus::Unknown => "unknown",
-        HolderScanStatus::Unsupported => "unsupported",
-        HolderScanStatus::Partial => "partial",
-    }
+/// D5.2：停止前快照——此刻整個無法檢查 fd 的行程（不限是否已確認同 uid；未確認者本來就會擋下）。
+fn uninspectable_before_stop(ctx: &CliCtx<'_>, plan: &LegacyPlan) -> Vec<ProcIdentity> {
+    ctx.p
+        .procs
+        .uart_holders_same_uid(&plan.attached_paths)
+        .uninspectable()
+        .iter()
+        .map(|item| ProcIdentity { pid: item.pid, start_ticks: item.start_ticks })
+        .collect()
+}
+
+/// `item` 是否為停止前快照中的同一行程。pid 重用：start_ticks 兩邊都要取得且相等，否則視為新出現的行程。
+fn seen_before_stop(before_stop: &[ProcIdentity], item: &UninspectableProc) -> bool {
+    item.start_ticks.is_some()
+        && before_stop.iter().any(|old| old.pid == item.pid && old.start_ticks == item.start_ticks)
+}
+
+/// 報告欄位 `uninspectable_procs`；`before_stop` 有給時逐項標註是否在停止前快照內（逾時診斷用）。
+fn uninspectable_value(items: &[UninspectableProc], before_stop: Option<&[ProcIdentity]>) -> PyValue {
+    PyValue::List(items.iter().map(|item| {
+        let mut value = PyDict::from_pairs(vec![
+            ("comm".into(), item.comm.clone().map(PyValue::Str).unwrap_or(PyValue::Null)),
+            ("pid".into(), int(u64::from(item.pid))),
+            ("reason".into(), str_value(item.reason.as_str())),
+            ("start_ticks".into(), opt_u64(item.start_ticks)),
+        ]);
+        if let Some(before_stop) = before_stop {
+            value.insert("seen_before_stop", PyValue::Bool(seen_before_stop(before_stop, item)));
+        }
+        PyValue::Dict(value)
+    }).collect())
 }
 
 pub(crate) fn legacy_value(daemon: &LegacyDaemon) -> PyValue {
@@ -536,11 +561,13 @@ pub(crate) fn legacy_value(daemon: &LegacyDaemon) -> PyValue {
 
 /// D5：行程樹全部結束、無同 uid 行程持有 UART、且與基準相比沒有新的 serialwrapd，連續維持穩定窗。
 /// 出現新 serialwrapd → 視為重拉：以其自身端點重做 D1＋D3 再停，總停止次數上限 `MAX_HANDOFF_CHAIN`。
-/// D5.2：holder 掃描回 `Partial`（只剩已確認同 uid 的行程整個無法檢查）視同無 holder，但這些行程必須列進
-/// 結果回報；目標 tty 讀不到、同一行程部分 fd 讀不到、uid 未確認或其他失敗仍不算已停。
+/// D5.2：holder 掃描回 `Partial`（只剩已確認同 uid 的行程整個無法檢查）且這些行程都在停止前快照 `before_stop` 內時
+/// 視同無 holder，但必須列進結果回報；停止後才出現的無法檢查行程、目標 tty 讀不到、同一行程部分 fd 讀不到、
+/// uid 未確認或其他失敗仍不算已停。逾時回應附最後一次掃描與最後一次不穩定（`last_unstable`）的原因。
 fn wait_stopped(
     ctx: &mut CliCtx<'_>,
     mut plan: LegacyPlan,
+    before_stop: &[ProcIdentity],
     with_sudo: bool,
     versions_dir: &Path,
     persist: &mut dyn LegacyPersist,
@@ -556,22 +583,42 @@ fn wait_stopped(
     let mut holders_unsupported = false;
     // 目前穩定窗內曾無法檢查的行程（窗重新起算時清空）。
     let mut window_uninspectable = std::collections::BTreeMap::<u32, UninspectableProc>::new();
+    // 最後一次不滿足「已停」條件的輪詢（逾時診斷）。
+    let mut last_unstable: Option<PyDict> = None;
     let mut chain_pids = vec![plan.daemon.pid];
     loop {
         let now = ctx.p.clock.mono_ns();
         let alive = targets.iter().any(|item| ctx.p.procs.identity_alive(item));
-        let (holders, status, uninspectable) = if plan.attached_paths.is_empty() {
-            (Vec::new(), HolderScanStatus::Ok, Vec::new())
+        let holder_scan = if plan.attached_paths.is_empty() {
+            HolderScan { holders: Vec::new(), outcome: HolderScanOutcome::Ok }
         } else {
-            let scan = ctx.p.procs.uart_holders_same_uid(&plan.attached_paths);
-            (scan.holders, scan.status, scan.uninspectable)
+            ctx.p.procs.uart_holders_same_uid(&plan.attached_paths)
         };
+        let status = holder_scan.status();
         if status == HolderScanStatus::Unsupported {
             holders_unsupported = true;
         }
-        let holders_clear = holders.is_empty()
-            && matches!(status, HolderScanStatus::Ok | HolderScanStatus::Unsupported | HolderScanStatus::Partial);
+        let mut reasons: Vec<&'static str> = Vec::new();
+        if alive {
+            reasons.push("legacy_alive");
+        }
+        if !holder_scan.holders.is_empty() {
+            reasons.push("uart_held");
+        }
+        match status {
+            HolderScanStatus::Ok | HolderScanStatus::Unsupported => {}
+            HolderScanStatus::Partial => {
+                if !holder_scan.uninspectable().iter().all(|item| seen_before_stop(before_stop, item)) {
+                    reasons.push("new_uninspectable");
+                }
+            }
+            HolderScanStatus::Permission => reasons.push("holders_permission"),
+            HolderScanStatus::Unknown => reasons.push("holders_unknown"),
+        }
         let scan = ctx.p.procs.serialwrapd_instances();
+        if scan.is_err() {
+            reasons.push("daemon_scan_failed");
+        }
         let fresh = match &scan {
             Ok(daemons) => daemons
                 .iter()
@@ -586,6 +633,8 @@ fn wait_stopped(
         if let Some(relaunched) = fresh.first().cloned() {
             relaunch_count += 1;
             stable_since = None;
+            reasons.push("relaunched");
+            last_unstable = Some(unstable_value(now.saturating_sub(started), &reasons, &holder_scan, before_stop));
             chain_pids.push(relaunched.pid);
             if stops >= MAX_HANDOFF_CHAIN {
                 let mut detail = PyDict::new();
@@ -617,13 +666,11 @@ fn wait_stopped(
             stops += 1;
             continue;
         }
-        if !alive && holders_clear && scan.is_ok() {
+        if reasons.is_empty() {
             if stable_since.is_none() {
                 window_uninspectable.clear();
             }
-            if status == HolderScanStatus::Partial {
-                window_uninspectable.extend(uninspectable.into_iter().map(|item| (item.pid, item)));
-            }
+            window_uninspectable.extend(holder_scan.uninspectable().iter().map(|item| (item.pid, item.clone())));
             let since = *stable_since.get_or_insert(now);
             if now.saturating_sub(since) >= window {
                 let uninspectable = window_uninspectable.into_values().collect();
@@ -631,14 +678,18 @@ fn wait_stopped(
             }
         } else {
             stable_since = None;
+            last_unstable = Some(unstable_value(now.saturating_sub(started), &reasons, &holder_scan, before_stop));
         }
         if now.saturating_sub(started) >= limit {
             let mut detail = PyDict::new();
             detail.insert("legacy_daemon", legacy_value(&plan.daemon));
             detail.insert("alive_pids", pids_value(&targets.iter().filter(|item| ctx.p.procs.identity_alive(item)).map(|item| item.pid).collect::<Vec<_>>()));
-            detail.insert("holder_pids", pids_value(&holders));
-            // 最後一次 holder 掃描的狀態：`alive_pids` 與 `holder_pids` 皆空時據此判斷是哪一種讀取失敗擋下。
-            detail.insert("holders_status", str_value(holders_status_str(status)));
+            // 以下皆為最後一次輪詢的結果；`last_unstable` 為最後一次不滿足「已停」條件的輪詢（最後一次輪詢剛好乾淨時據此診斷）。
+            detail.insert("holder_pids", pids_value(&holder_scan.holders));
+            detail.insert("holders_status", str_value(status.as_str()));
+            detail.insert("uninspectable_procs", uninspectable_value(holder_scan.uninspectable(), Some(before_stop)));
+            detail.insert("daemon_scan", str_value(if scan.is_ok() { "ok" } else { "failed" }));
+            detail.insert("last_unstable", last_unstable.map(PyValue::Dict).unwrap_or(PyValue::Null));
             detail.insert("waited_ms", int(now.saturating_sub(started) / 1_000_000));
             return Err(LegacyFailure::AfterStop {
                 code: ErrorCode::Timeout.as_str(),
@@ -651,6 +702,17 @@ fn wait_stopped(
         }
         ctx.p.clock.sleep(POLL);
     }
+}
+
+/// `last_unstable`：該次輪詢距開始等待的時間、不滿足「已停」的原因與當次 holder 掃描。
+fn unstable_value(waited_ns: u64, reasons: &[&'static str], scan: &HolderScan, before_stop: &[ProcIdentity]) -> PyDict {
+    PyDict::from_pairs(vec![
+        ("holder_pids".into(), pids_value(&scan.holders)),
+        ("holders_status".into(), str_value(scan.status().as_str())),
+        ("reasons".into(), PyValue::List(reasons.iter().map(|reason| str_value(*reason)).collect())),
+        ("uninspectable_procs".into(), uninspectable_value(scan.uninspectable(), Some(before_stop))),
+        ("waited_ms".into(), int(waited_ns / 1_000_000)),
+    ])
 }
 
 /// 對重拉的 daemon 重做 D1＋D3 後再停。Rust daemon（交接成功）回 `None`；交接本身即為停止。
@@ -717,11 +779,7 @@ impl LegacyStopped {
             value.insert("holders_status", str_value("partial"));
         }
         if !self.uninspectable.is_empty() {
-            value.insert("uninspectable_procs", PyValue::List(self.uninspectable.iter().map(|item| PyValue::Dict(PyDict::from_pairs(vec![
-                ("comm".into(), item.comm.clone().map(PyValue::Str).unwrap_or(PyValue::Null)),
-                ("pid".into(), int(u64::from(item.pid))),
-                ("reason".into(), str_value(item.reason.as_str())),
-            ]))).collect()));
+            value.insert("uninspectable_procs", uninspectable_value(&self.uninspectable, None));
         }
         if !self.other_uid.is_empty() {
             value.insert("other_uid_pids", pids_value(&self.other_uid));

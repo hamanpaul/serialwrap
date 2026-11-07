@@ -132,8 +132,8 @@ fn posix_uart_holder_scan_covers_any_same_uid_process_and_skips_other_uids() {
     let scan = PosixProcScan::with_root(tmp.path());
     let result = scan.uart_holders_same_uid(std::slice::from_ref(&tty));
     assert_eq!(result.holders, vec![700]);
-    assert_eq!(result.status, HolderScanStatus::Ok);
-    assert!(result.uninspectable.is_empty());
+    assert_eq!(result.status(), HolderScanStatus::Ok);
+    assert!(result.uninspectable().is_empty());
     // serialwrapd 專用掃描維持原語意（minicom 不是 serialwrapd）。
     assert!(scan.serialwrapd_tty_holders(std::slice::from_ref(&tty)).0.is_empty());
 }
@@ -149,6 +149,21 @@ fn chmod(path: &std::path::Path, mode: u32) {
 fn running_as_root() -> bool {
     // SAFETY: geteuid 無參數、不會失敗。
     unsafe { libc::geteuid() == 0 }
+}
+
+/// PR 250 審查一併處理 8：以 root 執行時 PermissionDenied 情境建立不起來，必須明確標示略過，不得靜默通過。
+/// 直接寫 stderr（不經 libtest 的輸出擷取），`cargo test` 的輸出一定看得到 `SKIPPED` 行；回傳 `true` 時呼叫端立即返回。
+#[cfg(unix)]
+fn skip_as_root(test: &str) -> bool {
+    if !running_as_root() {
+        return false;
+    }
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIPPED legacy_supervision::{test}：以 root 執行，mode 000 擋不住讀取（CAP_DAC_OVERRIDE），PermissionDenied 情境無法建立，以下斷言未執行"
+    );
+    true
 }
 
 /// 同 uid、non-dumpable 的行程（systemd user session 的 `(sd-pam)`）：`/proc/<pid>/fd` 屬 root，read_dir 回 PermissionDenied。
@@ -180,7 +195,7 @@ fn fake_entries_denied_proc(root: &std::path::Path, pid: u32, uid: u32, locked: 
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_reports_uninspectable_same_uid_processes_as_partial() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_reports_uninspectable_same_uid_processes_as_partial") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -198,12 +213,12 @@ fn posix_uart_holder_scan_reports_uninspectable_same_uid_processes_as_partial() 
     chmod(&tmp.path().join("801/fd"), 0o755);
     chmod(&tmp.path().join("802/fd"), 0o755);
     assert!(result.holders.is_empty(), "{result:?}");
-    assert_eq!(result.status, HolderScanStatus::Partial, "{result:?}");
+    assert_eq!(result.status(), HolderScanStatus::Partial, "{result:?}");
     assert_eq!(
-        result.uninspectable,
+        result.uninspectable(),
         vec![
-            UninspectableProc { pid: 801, comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
-            UninspectableProc { pid: 802, comm: None, reason: UninspectableReason::FdDirDenied },
+            UninspectableProc { pid: 801, start_ticks: Some(1801), comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+            UninspectableProc { pid: 802, start_ticks: Some(1802), comm: None, reason: UninspectableReason::FdDirDenied },
         ]
     );
 }
@@ -214,7 +229,7 @@ fn posix_uart_holder_scan_reports_uninspectable_same_uid_processes_as_partial() 
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_treats_all_fd_entries_denied_as_uninspectable() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_treats_all_fd_entries_denied_as_uninspectable") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -231,21 +246,108 @@ fn posix_uart_holder_scan_treats_all_fd_entries_denied_as_uninspectable() {
     chmod(&locked, 0o755);
     chmod(&tmp.path().join("408/fd"), 0o755);
     assert!(result.holders.is_empty(), "{result:?}");
-    assert_eq!(result.status, HolderScanStatus::Partial, "{result:?}");
+    assert_eq!(result.status(), HolderScanStatus::Partial, "{result:?}");
     assert_eq!(
-        result.uninspectable,
+        result.uninspectable(),
         vec![
-            UninspectableProc { pid: 407, comm: Some("systemd".into()), reason: UninspectableReason::FdEntriesDenied },
-            UninspectableProc { pid: 408, comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+            UninspectableProc { pid: 407, start_ticks: Some(1407), comm: Some("systemd".into()), reason: UninspectableReason::FdEntriesDenied },
+            UninspectableProc { pid: 408, start_ticks: Some(1408), comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
         ]
     );
+}
+
+/// 改寫替身行程 `/proc/<pid>/status` 的 `Uid:` 四欄（real、effective、saved、fs）。
+#[cfg(unix)]
+fn set_proc_uids(root: &std::path::Path, pid: u32, uids: [u32; 4]) {
+    let [real, effective, saved, fs] = uids;
+    std::fs::write(
+        root.join(pid.to_string()).join("status"),
+        format!("Name:\tcu\nUid:\t{real}\t{effective}\t{saved}\t{fs}\n"),
+    )
+    .unwrap();
+}
+
+/// PR 250 審查必修 1：同一使用者執行的 setuid UART 工具（例如 `cu -l /dev/ttyUSB0`，`Uid: 1000 10 10 10`）
+/// real uid 與自身相同，但 effective／saved／fs uid 不同；它是 non-dumpable，fd 目錄讀不到。這類行程不是
+/// 「已確認同 uid」，不得併入 `Partial` 放行（新 daemon 會和它搶同一條 UART）。四個 uid 都等於自身才算同 uid；
+/// 只有部分欄位相同（含 real uid 不同、effective uid 相同）時也要納入掃描並保守擋下。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_mixed_uid_uninspectable_process_still_blocks() {
+    if skip_as_root("posix_uart_holder_scan_mixed_uid_uninspectable_process_still_blocks") {
+        return;
+    }
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let other = me.wrapping_add(10);
+    for uids in [[me, other, other, other], [other, me, me, me], [me, me, me, other]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let tty = tmp.path().join("ttyUSB0");
+        std::fs::write(&tty, b"").unwrap();
+        fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+        fake_uninspectable_proc(tmp.path(), 900, me, Some("cu"));
+        set_proc_uids(tmp.path(), 900, uids);
+        let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+        chmod(&tmp.path().join("801/fd"), 0o755);
+        chmod(&tmp.path().join("900/fd"), 0o755);
+        assert!(result.holders.is_empty(), "uids={uids:?}: {result:?}");
+        assert_eq!(result.status(), HolderScanStatus::Permission, "uids={uids:?}: {result:?}");
+    }
+}
+
+/// PR 250 審查必修 2：掃描途中同 uid 行程結束（`/proc/<pid>` 仍列得到、`/proc/<pid>/fd` 已回 NotFound）屬正常競態，
+/// 與條目層的 NotFound 一樣不算讀取失敗；不得把整次掃描降成 `Unknown`（忙碌機器上 5 s 穩定窗會一再重置，等滿 330 s）。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_process_exiting_during_scan_is_not_a_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let tty = tmp.path().join("ttyUSB0");
+    std::fs::write(&tty, b"").unwrap();
+    fake_proc(tmp.path(), 810, 1, me, &["/usr/bin/make"], "/usr/bin/make");
+    std::fs::remove_dir(tmp.path().join("810/fd")).unwrap();
+    let alone = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    assert!(alone.holders.is_empty(), "{alone:?}");
+    assert_eq!(alone.status(), HolderScanStatus::Ok, "{alone:?}");
+    assert!(alone.uninspectable().is_empty(), "{alone:?}");
+    if skip_as_root("posix_uart_holder_scan_process_exiting_during_scan_is_not_a_failure") {
+        return;
+    }
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    assert_eq!(result.status(), HolderScanStatus::Partial, "{result:?}");
+    assert_eq!(result.uninspectable().iter().map(|item| item.pid).collect::<Vec<_>>(), vec![801], "{result:?}");
+}
+
+/// PR 250 審查一併處理 5：等待中拔掉 USB——目標 tty 節點已不存在（metadata 回 NotFound）時不可能與新 daemon 衝突，
+/// 不算讀取失敗；與 PermissionDenied（仍擋，見 `posix_uart_holder_scan_target_permission_denied_still_blocks`）分開。
+#[cfg(unix)]
+#[test]
+fn posix_uart_holder_scan_vanished_target_is_not_a_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let me = PosixProcScan::new().current_uid().expect("unix uid");
+    let unplugged = tmp.path().join("ttyUSB0");
+    let unrelated = tmp.path().join("unrelated.log");
+    std::fs::write(&unrelated, b"").unwrap();
+    fake_proc(tmp.path(), 800, 1, me, &["/usr/bin/bash"], "/usr/bin/bash");
+    std::os::unix::fs::symlink(&unrelated, tmp.path().join("800/fd/3")).unwrap();
+    let alone = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&unplugged));
+    assert!(alone.holders.is_empty(), "{alone:?}");
+    assert_eq!(alone.status(), HolderScanStatus::Ok, "{alone:?}");
+    if skip_as_root("posix_uart_holder_scan_vanished_target_is_not_a_failure") {
+        return;
+    }
+    fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
+    let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&unplugged));
+    chmod(&tmp.path().join("801/fd"), 0o755);
+    assert_eq!(result.status(), HolderScanStatus::Partial, "{result:?}");
 }
 
 /// D5.2 範圍：讀得到的行程仍持有 tty 時照常列為 holder（狀態 `Partial` 不代表放行）。
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_partial_still_lists_readable_holder() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_partial_still_lists_readable_holder") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -258,7 +360,7 @@ fn posix_uart_holder_scan_partial_still_lists_readable_holder() {
     let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
     chmod(&tmp.path().join("801/fd"), 0o755);
     assert_eq!(result.holders, vec![700], "{result:?}");
-    assert_eq!(result.status, HolderScanStatus::Partial, "{result:?}");
+    assert_eq!(result.status(), HolderScanStatus::Partial, "{result:?}");
 }
 
 /// D5.2 範圍（反例）：目標 tty 本身 metadata 回 PermissionDenied（無法比對）→ 維持 `Permission`，
@@ -266,7 +368,7 @@ fn posix_uart_holder_scan_partial_still_lists_readable_holder() {
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_target_permission_denied_still_blocks() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_target_permission_denied_still_blocks") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -281,7 +383,7 @@ fn posix_uart_holder_scan_target_permission_denied_still_blocks() {
     chmod(&locked, 0o755);
     chmod(&tmp.path().join("801/fd"), 0o755);
     assert!(result.holders.is_empty(), "{result:?}");
-    assert_eq!(result.status, HolderScanStatus::Permission, "{result:?}");
+    assert_eq!(result.status(), HolderScanStatus::Permission, "{result:?}");
 }
 
 /// D5.2 範圍（反例）：同一行程部分 fd 條目可讀、部分回 PermissionDenied（混合）→ 維持 `Permission`，
@@ -289,7 +391,7 @@ fn posix_uart_holder_scan_target_permission_denied_still_blocks() {
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_mixed_fd_entry_permission_denied_still_blocks() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_mixed_fd_entry_permission_denied_still_blocks") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -311,7 +413,7 @@ fn posix_uart_holder_scan_mixed_fd_entry_permission_denied_still_blocks() {
     chmod(&locked, 0o755);
     chmod(&tmp.path().join("801/fd"), 0o755);
     assert!(result.holders.is_empty(), "{result:?}");
-    assert_eq!(result.status, HolderScanStatus::Permission, "{result:?}");
+    assert_eq!(result.status(), HolderScanStatus::Permission, "{result:?}");
 }
 
 /// D5.2 範圍（反例）：另有其他原因的讀取失敗（`Unknown` 類）時不降為 `Partial`，沿用原本判定
@@ -319,7 +421,7 @@ fn posix_uart_holder_scan_mixed_fd_entry_permission_denied_still_blocks() {
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_unknown_error_still_blocks() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_unknown_error_still_blocks") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -330,12 +432,12 @@ fn posix_uart_holder_scan_unknown_error_still_blocks() {
     std::fs::remove_dir(tmp.path().join("800/fd")).unwrap();
     std::fs::write(tmp.path().join("800/fd"), b"not a directory").unwrap();
     let alone = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
-    assert_eq!(alone.status, HolderScanStatus::Unknown, "{alone:?}");
+    assert_eq!(alone.status(), HolderScanStatus::Unknown, "{alone:?}");
     fake_uninspectable_proc(tmp.path(), 801, me, Some("(sd-pam)"));
     let result = PosixProcScan::with_root(tmp.path()).uart_holders_same_uid(std::slice::from_ref(&tty));
     chmod(&tmp.path().join("801/fd"), 0o755);
     assert!(result.holders.is_empty(), "{result:?}");
-    assert_eq!(result.status, HolderScanStatus::Permission, "{result:?}");
+    assert_eq!(result.status(), HolderScanStatus::Permission, "{result:?}");
 }
 
 /// D5.2 範圍（反例）：uid 讀不到（保守納入掃描）的行程整個無法檢查（fd 目錄讀不到，或條目全部讀不到），
@@ -343,7 +445,7 @@ fn posix_uart_holder_scan_unknown_error_still_blocks() {
 #[cfg(unix)]
 #[test]
 fn posix_uart_holder_scan_uninspectable_process_with_unknown_uid_still_blocks() {
-    if running_as_root() {
+    if skip_as_root("posix_uart_holder_scan_uninspectable_process_with_unknown_uid_still_blocks") {
         return;
     }
     for entries_denied in [false, true] {
@@ -366,7 +468,7 @@ fn posix_uart_holder_scan_uninspectable_process_with_unknown_uid_still_blocks() 
             chmod(&tmp.path().join("801/fd"), 0o755);
         }
         assert!(result.holders.is_empty(), "entries_denied={entries_denied}: {result:?}");
-        assert_eq!(result.status, HolderScanStatus::Permission, "entries_denied={entries_denied}: {result:?}");
+        assert_eq!(result.status(), HolderScanStatus::Permission, "entries_denied={entries_denied}: {result:?}");
     }
 }
 
@@ -374,7 +476,7 @@ fn posix_uart_holder_scan_uninspectable_process_with_unknown_uid_still_blocks() 
 #[cfg(unix)]
 #[test]
 fn posix_serialwrapd_holder_scan_keeps_permission_for_uninspectable_daemon() {
-    if running_as_root() {
+    if skip_as_root("posix_serialwrapd_holder_scan_keeps_permission_for_uninspectable_daemon") {
         return;
     }
     for entries_denied in [false, true] {
@@ -400,6 +502,33 @@ fn posix_serialwrapd_holder_scan_keeps_permission_for_uninspectable_daemon() {
         }
         assert!(holders.is_empty(), "entries_denied={entries_denied}");
         assert_eq!(status, HolderScanStatus::Permission, "entries_denied={entries_denied}");
+    }
+}
+
+/// PR 250 審查一併處理 6：`Partial` 的清單放在 variant 內，組不出空清單的 `Partial`；舊式 `(holders, status)`
+/// 沒有清單，`Partial` 一律轉為 `Unknown`（fail-closed）。狀態字串收進 sw-pal（一併處理 7）。
+#[test]
+fn holder_scan_partial_requires_non_empty_uninspectable_list() {
+    assert!(UninspectableSet::new(Vec::new()).is_none());
+    let pair = HolderScan::from_pair((Vec::new(), HolderScanStatus::Partial));
+    assert_eq!(pair.status(), HolderScanStatus::Unknown, "{pair:?}");
+    assert!(pair.uninspectable().is_empty());
+    let procs = vec![
+        UninspectableProc { pid: 9, start_ticks: Some(2), comm: None, reason: UninspectableReason::FdDirDenied },
+        UninspectableProc { pid: 3, start_ticks: Some(1), comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+    ];
+    let partial = HolderScan { holders: Vec::new(), outcome: HolderScanOutcome::Partial(UninspectableSet::new(procs).unwrap()) };
+    assert_eq!(partial.status(), HolderScanStatus::Partial);
+    assert_eq!(partial.uninspectable().iter().map(|item| item.pid).collect::<Vec<_>>(), vec![3, 9], "依 pid 排序");
+    let statuses = [
+        (HolderScanStatus::Ok, "ok"),
+        (HolderScanStatus::Permission, "permission"),
+        (HolderScanStatus::Unknown, "unknown"),
+        (HolderScanStatus::Unsupported, "unsupported"),
+        (HolderScanStatus::Partial, "partial"),
+    ];
+    for (status, text) in statuses {
+        assert_eq!(status.as_str(), text);
     }
 }
 

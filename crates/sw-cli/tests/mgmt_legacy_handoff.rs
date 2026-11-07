@@ -544,15 +544,21 @@ fn legacy_k_relaunch_inside_stability_window_is_not_stopped() {
 
 /// 2026-11-06 實機的掃描形狀：`systemd --user`（fd 目錄可讀、條目全部 PermissionDenied）與 `(sd-pam)`（fd 目錄讀不到）。
 fn user_session_partial_scan(holders: Vec<u32>) -> sw_pal::proc_scan::HolderScan {
-    use sw_pal::proc_scan::{HolderScan, HolderScanStatus, UninspectableProc, UninspectableReason};
-    HolderScan {
-        holders,
-        status: HolderScanStatus::Partial,
-        uninspectable: vec![
-            UninspectableProc { pid: 407, comm: Some("systemd".into()), reason: UninspectableReason::FdEntriesDenied },
-            UninspectableProc { pid: 408, comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
-        ],
+    partial_scan(holders, &[])
+}
+
+/// `systemd --user`（407）、`(sd-pam)`（408）之外另有 `extra` 這些整個無法檢查的同 uid 行程（pid、start_ticks、comm）。
+fn partial_scan(holders: Vec<u32>, extra: &[(u32, u64, &str)]) -> sw_pal::proc_scan::HolderScan {
+    use sw_pal::proc_scan::{HolderScan, HolderScanOutcome, UninspectableProc, UninspectableReason, UninspectableSet};
+    let mut procs = vec![
+        UninspectableProc { pid: 407, start_ticks: Some(1407), comm: Some("systemd".into()), reason: UninspectableReason::FdEntriesDenied },
+        UninspectableProc { pid: 408, start_ticks: Some(1408), comm: Some("(sd-pam)".into()), reason: UninspectableReason::FdDirDenied },
+    ];
+    for (pid, start_ticks, comm) in extra {
+        procs.retain(|item| item.pid != *pid);
+        procs.push(UninspectableProc { pid: *pid, start_ticks: Some(*start_ticks), comm: Some((*comm).into()), reason: UninspectableReason::FdDirDenied });
     }
+    HolderScan { holders, outcome: HolderScanOutcome::Partial(UninspectableSet::new(procs).expect("非空")) }
 }
 
 fn systemd_user_legacy_with_linger(linger: std::time::Duration) -> TestEnv {
@@ -582,6 +588,7 @@ fn legacy_d5_2_uninspectable_same_uid_process_is_reported_not_blocking() {
     assert_eq!(procs.len(), 2, "{out}");
     assert_eq!((s(&procs[0], "comm"), s(&procs[0], "reason")), ("systemd", "fd_entries_denied"), "{out}");
     assert_eq!(procs[0].get_key("pid"), Some(&PyValue::Int(PyInt::Small(407))));
+    assert_eq!(procs[0].get_key("start_ticks"), Some(&PyValue::Int(PyInt::Small(1407))));
     assert_eq!((s(&procs[1], "comm"), s(&procs[1], "reason")), ("(sd-pam)", "fd_dir_denied"), "{out}");
     assert_eq!(procs[1].get_key("pid"), Some(&PyValue::Int(PyInt::Small(408))));
     let waited = match legacy.get_key("waited_ms") { Some(PyValue::Int(PyInt::Small(ms))) => *ms, other => panic!("{other:?}") };
@@ -621,6 +628,116 @@ fn legacy_d5_2_other_holder_scan_failures_still_block_until_limit() {
         assert!(!acts(&t).iter().any(|a| a == "start" || a == "hard_stop"), "{name}：不得重啟或硬殺：{:?}", acts(&t));
         assert!(t.journal_json().is_some(), "{name}：journal 保留");
     }
+}
+
+fn int_of(value: &PyValue, key: &str) -> i128 {
+    match value.get_key(key) {
+        Some(PyValue::Int(PyInt::Small(number))) => *number,
+        other => panic!("{key}: {other:?}"),
+    }
+}
+
+fn list_of<'a>(value: &'a (impl GetKey + ?Sized), key: &str) -> &'a [PyValue] {
+    match value.get_key(key) {
+        Some(PyValue::List(items)) => items,
+        other => panic!("{key}: {other:?}"),
+    }
+}
+
+/// PR 250 審查必修 3：放行只限停止舊 daemon 前就已存在、且整個無法檢查的同 uid 行程（停止前快照）。停止後才出現的
+/// 整個無法檢查行程（例如 `ssh-agent` 這類 non-dumpable 程式，或帶 file capability／`PR_SET_DUMPABLE=0` 的 UART 工具）
+/// 可能正開著 UART，不得放行：維持等待，逾時回 legacy_stop_pending，並在 `uninspectable_procs` 指出是新出現的行程。
+#[test]
+fn legacy_d5_2_uninspectable_process_appearing_after_stop_blocks() {
+    let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+    // 第一筆是停止前快照（407、408）；之後的每次等待掃描都多出停止後才出現的 555。
+    t.procs().uart_holder_scan_script(vec![
+        user_session_partial_scan(Vec::new()),
+        partial_scan(Vec::new(), &[(555, 1555, "ssh-agent")]),
+    ]);
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{out}");
+    assert_eq!(s(&j, "holders_status"), "partial", "{out}");
+    let procs = list_of(&j, "uninspectable_procs");
+    let fresh = procs.iter().filter(|item| item.get_key("seen_before_stop") == Some(&PyValue::Bool(false))).collect::<Vec<_>>();
+    assert_eq!(fresh.len(), 1, "{out}");
+    assert_eq!((int_of(fresh[0], "pid"), s(fresh[0], "comm")), (555, "ssh-agent"), "{out}");
+    let reasons = list_of(dict(&j, "last_unstable"), "reasons");
+    assert_eq!(reasons, &[PyValue::Str("new_uninspectable".into())], "{out}");
+    assert!(!acts(&t).iter().any(|a| a == "start" || a == "hard_stop"), "不得重啟或硬殺：{:?}", acts(&t));
+    assert!(t.journal_json().is_some(), "journal 保留");
+}
+
+/// PR 250 審查一併處理 6：`Partial` 一定附帶無法檢查的行程清單；組不出（或收到）空清單的 `Partial` 時，
+/// 不得被當成「只剩同 uid 行程無法檢查」而無聲放行。
+#[test]
+fn legacy_d5_2_partial_without_uninspectable_list_does_not_pass() {
+    use sw_pal::proc_scan::{HolderScan, HolderScanStatus};
+    let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+    // 型別上組不出空清單的 `Partial`；替身或舊介面只給 `(holders, Partial)` 時一律降為 `Unknown`。
+    t.procs().uart_holder_scan_script(vec![HolderScan::from_pair((Vec::new(), HolderScanStatus::Partial))]);
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{out}");
+    assert_eq!(s(&j, "holders_status"), "unknown", "{out}");
+    assert!(!acts(&t).iter().any(|a| a == "start" || a == "hard_stop"), "不得重啟或硬殺：{:?}", acts(&t));
+}
+
+/// PR 250 審查必修 3（pid 重用）：停止前快照以 pid＋start_ticks 辨識；同 pid 但 start_ticks 不同的無法檢查行程是
+/// 停止後才出現的另一個行程，不得因 pid 相同而放行。
+#[test]
+fn legacy_d5_2_reused_pid_of_uninspectable_process_blocks() {
+    let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+    t.procs().uart_holder_scan_script(vec![
+        user_session_partial_scan(Vec::new()),
+        partial_scan(Vec::new(), &[(408, 9408, "cu")]),
+    ]);
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{out}");
+    let procs = list_of(&j, "uninspectable_procs");
+    let fresh = procs.iter().filter(|item| item.get_key("seen_before_stop") == Some(&PyValue::Bool(false))).collect::<Vec<_>>();
+    assert_eq!(fresh.len(), 1, "{out}");
+    assert_eq!((int_of(fresh[0], "pid"), int_of(fresh[0], "start_ticks")), (408, 9408), "{out}");
+    assert!(!acts(&t).iter().any(|a| a == "start" || a == "hard_stop"), "不得重啟或硬殺：{:?}", acts(&t));
+}
+
+/// PR 250 審查一併處理 4：逾時回應要看得出上一次穩定窗被什麼打斷。舊行程到 326 s 才結束、之後的掃描都乾淨，
+/// 330 s 逾時當下 `alive_pids`、`holder_pids` 皆空且 `holders_status` 為 ok；`last_unstable` 須指出最後一次
+/// 不穩定的時間與原因（舊行程仍存活），`uninspectable_procs` 列出最後一次掃描的結果（此處為空）。
+#[test]
+fn legacy_d5_timeout_reports_last_stability_break() {
+    let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(326));
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{out}");
+    assert_eq!(j.get_key("alive_pids"), Some(&list(Vec::new())), "{out}");
+    assert_eq!(s(&j, "holders_status"), "ok", "{out}");
+    assert!(list_of(&j, "uninspectable_procs").is_empty(), "{out}");
+    assert_eq!(s(&j, "daemon_scan"), "ok", "{out}");
+    let last = dict(&j, "last_unstable");
+    assert_eq!(list_of(last, "reasons"), &[PyValue::Str("legacy_alive".into())], "{out}");
+    let at = int_of(last, "waited_ms");
+    assert!((325_000..330_000).contains(&at), "最後一次不穩定在舊行程結束前：{at}");
+}
+
+/// PR 250 審查一併處理 4：停止後 `serialwrapd_instances()` 一直失敗（無法確認沒有重拉）時，逾時回應要看得出來。
+#[test]
+fn legacy_d5_timeout_reports_daemon_scan_failure() {
+    let t = systemd_user_legacy_with_linger(std::time::Duration::from_secs(1));
+    let stopped = t.service().stop_signal();
+    t.procs().fail_instances_while(std::sync::Arc::new(move || stopped.load(std::sync::atomic::Ordering::SeqCst)));
+    let (rc, out, _) = t.run_from_bundle(&["setup", "--user"]);
+    assert_eq!(rc, 2, "{out}");
+    let j = json(&out);
+    assert_eq!((s(&j, "error_code"), s(&j, "reason")), ("TIMEOUT", "legacy_stop_pending"), "{out}");
+    assert_eq!(s(&j, "daemon_scan"), "failed", "{out}");
+    assert_eq!(list_of(dict(&j, "last_unstable"), "reasons"), &[PyValue::Str("daemon_scan_failed".into())], "{out}");
 }
 
 /// D9(l)：legacy 專用中斷注入點（`support::LEGACY_CRASH_POINTS`，不屬凍結的 CRASH_POINTS 迴圈）。

@@ -43,6 +43,7 @@ pub struct FakeProcScan {
     base: Mutex<Vec<DaemonProc>>,
     script: Mutex<Vec<Vec<DaemonProc>>>,
     failing: Mutex<bool>,
+    failing_while: Mutex<Option<AliveFn>>,
     alive: Mutex<BTreeMap<u32, Vec<bool>>>,
     gates: Mutex<BTreeMap<u32, ConnectGate>>,
     holders: Mutex<(Vec<u32>, Option<HolderScanStatus>)>,
@@ -77,6 +78,11 @@ impl FakeProcScan {
     /// 之後的 `serialwrapd_instances` 一律失敗。
     pub fn fail(&self) {
         *self.failing.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// `failing` 成立期間 `serialwrapd_instances` 失敗（例如只在舊 daemon 停止後失敗）。
+    pub fn fail_instances_while(&self, failing: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.failing_while.lock().unwrap_or_else(|e| e.into_inner()) = Some(AliveFn(failing));
     }
 
     /// 將 RPC 監管模型新拉起的 PID 納入 process scan 快照。
@@ -259,6 +265,10 @@ impl ProcScan for FakeProcScan {
     fn serialwrapd_instances(&self) -> Result<Vec<DaemonProc>, ScanFailure> {
         self.apply_replacement();
         if *self.failing.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Err(ScanFailure);
+        }
+        let failing_while = self.failing_while.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if failing_while.is_some_and(|failing| (failing.0)()) {
             return Err(ScanFailure);
         }
         let mut script = self.script.lock().unwrap_or_else(|e| e.into_inner());

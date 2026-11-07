@@ -5,7 +5,8 @@ use std::slice;
 
 use crate::proc_scan::{
     dedup_launcher_children, is_launcher_image, is_python_image, DaemonProc, HolderScan,
-    HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure, WinProcInfo,
+    HolderScanOutcome, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
+    WinProcInfo,
 };
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessCommandLineInformation,
@@ -160,7 +161,7 @@ impl ProcScan for WindowsProcScan {
     }
 
     fn uart_holders_same_uid(&self, _paths: &[PathBuf]) -> HolderScan {
-        HolderScan::from_pair((Vec::new(), HolderScanStatus::Unsupported))
+        HolderScan { holders: Vec::new(), outcome: HolderScanOutcome::Unsupported }
     }
 }
 

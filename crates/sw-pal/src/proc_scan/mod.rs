@@ -81,11 +81,24 @@ pub enum HolderScanStatus {
     Permission,
     Unknown,
     Unsupported,
-    /// 只由 [`ProcScan::uart_holders_same_uid`] 回傳：目標 tty 身分都取得、讀得到的行程都檢查完畢，
-    /// 只剩部分已確認同 uid 的行程整個無法檢查（見 [`UninspectableReason`]；例如 systemd user session 的
-    /// `(sd-pam)` 與 `systemd --user`），清單見 [`HolderScan::uninspectable`]。不代表這些行程沒有持有 tty；
-    /// 呼叫端要接受時必須把清單回報出來。
+    /// 只由 [`ProcScan::uart_holders_same_uid`] 回傳：目標 tty 身分都取得（或節點已不存在）、讀得到的行程都檢查完畢，
+    /// 只剩已確認同 uid（real、effective、saved、fs 四個 uid 都等於自身）的行程整個無法檢查（見 [`UninspectableReason`]；
+    /// 例如 systemd user session 的 `(sd-pam)` 與 `systemd --user`），清單見 [`HolderScanOutcome::Partial`]。
+    /// 不代表這些行程沒有持有 tty；呼叫端要接受時必須自行限定範圍並把清單回報出來。
     Partial,
+}
+
+impl HolderScanStatus {
+    /// 報告欄位 `holders_status` 的字串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Permission => "permission",
+            Self::Unknown => "unknown",
+            Self::Unsupported => "unsupported",
+            Self::Partial => "partial",
+        }
+    }
 }
 
 /// 行程整個無法檢查的原因。
@@ -111,28 +124,81 @@ impl UninspectableReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UninspectableProc {
     pub pid: u32,
+    /// `/proc/<pid>/stat` 的 starttime（與 `pid` 一起辨識行程，避免 pid 重用誤判）；讀不到為 `None`。
+    pub start_ticks: Option<u64>,
     /// `/proc/<pid>/comm`（去掉行尾換行）；讀不到為 `None`。
     pub comm: Option<String>,
     pub reason: UninspectableReason,
+}
+
+/// 非空、依 pid 排序的無法檢查行程清單（[`HolderScanOutcome::Partial`] 必定帶一份，組不出空清單的 `Partial`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninspectableSet(Vec<UninspectableProc>);
+
+impl UninspectableSet {
+    /// 空清單回 `None`。
+    pub fn new(mut procs: Vec<UninspectableProc>) -> Option<Self> {
+        if procs.is_empty() {
+            return None;
+        }
+        procs.sort_by_key(|item| item.pid);
+        Some(Self(procs))
+    }
+
+    pub fn procs(&self) -> &[UninspectableProc] {
+        &self.0
+    }
+}
+
+/// [`HolderScan`] 的判定；無法檢查的行程清單放在 variant 內，狀態由 variant 推導（[`HolderScan::status`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderScanOutcome {
+    Ok,
+    Unsupported,
+    /// 有不得推論為「無 holder」的 PermissionDenied 類讀取失敗；附帶整個無法檢查的行程（可能為空）。
+    Permission(Vec<UninspectableProc>),
+    /// 有其他讀取失敗；附帶整個無法檢查的行程（可能為空）。
+    Unknown(Vec<UninspectableProc>),
+    /// 見 [`HolderScanStatus::Partial`]。
+    Partial(UninspectableSet),
 }
 
 /// [`ProcScan::uart_holders_same_uid`] 的結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderScan {
     pub holders: Vec<u32>,
-    pub status: HolderScanStatus,
-    /// 整個無法檢查的行程（依 pid 排序）。`Partial` 時必定非空；`Permission`／`Unknown` 時也可能非空
-    /// （表示除此之外另有其他讀取失敗，或其中有 uid 未確認的行程）。
-    pub uninspectable: Vec<UninspectableProc>,
+    pub outcome: HolderScanOutcome,
 }
 
 impl HolderScan {
-    /// 由舊式 `(holders, status)` 組成（無「無法檢查」清單）。
+    /// 由舊式 `(holders, status)` 組成（無「無法檢查」清單）。`Partial` 沒有清單即不成立，轉為 `Unknown`（fail-closed）。
     pub fn from_pair((holders, status): (Vec<u32>, HolderScanStatus)) -> Self {
-        Self {
-            holders,
-            status,
-            uninspectable: Vec::new(),
+        let outcome = match status {
+            HolderScanStatus::Ok => HolderScanOutcome::Ok,
+            HolderScanStatus::Unsupported => HolderScanOutcome::Unsupported,
+            HolderScanStatus::Permission => HolderScanOutcome::Permission(Vec::new()),
+            HolderScanStatus::Unknown | HolderScanStatus::Partial => HolderScanOutcome::Unknown(Vec::new()),
+        };
+        Self { holders, outcome }
+    }
+
+    pub fn status(&self) -> HolderScanStatus {
+        match self.outcome {
+            HolderScanOutcome::Ok => HolderScanStatus::Ok,
+            HolderScanOutcome::Unsupported => HolderScanStatus::Unsupported,
+            HolderScanOutcome::Permission(_) => HolderScanStatus::Permission,
+            HolderScanOutcome::Unknown(_) => HolderScanStatus::Unknown,
+            HolderScanOutcome::Partial(_) => HolderScanStatus::Partial,
+        }
+    }
+
+    /// 整個無法檢查的行程（依 pid 排序）。`Partial` 時必定非空；`Permission`／`Unknown` 時也可能非空
+    /// （表示除此之外另有其他讀取失敗，或其中有未確認同 uid 的行程）。
+    pub fn uninspectable(&self) -> &[UninspectableProc] {
+        match &self.outcome {
+            HolderScanOutcome::Ok | HolderScanOutcome::Unsupported => &[],
+            HolderScanOutcome::Permission(procs) | HolderScanOutcome::Unknown(procs) => procs,
+            HolderScanOutcome::Partial(set) => set.procs(),
         }
     }
 }
@@ -347,7 +413,8 @@ pub trait ProcScan: Send + Sync {
         None
     }
     /// OD-48 D5：與目前行程同 uid 的**任何**行程是否仍持有 `paths`（不限 serialwrapd）。
-    /// 預設沿用 serialwrapd holder 掃描；POSIX 實作掃全部同 uid 行程（可能回 `Partial`），Windows 回 `Unsupported`。
+    /// 預設沿用 serialwrapd holder 掃描；POSIX 實作掃所有至少一個 uid（real、effective、saved、fs）等於自身的行程
+    /// （可能回 `Partial`；四個 uid 都不同者不在範圍內），Windows 回 `Unsupported`。
     fn uart_holders_same_uid(&self, paths: &[PathBuf]) -> HolderScan {
         HolderScan::from_pair(self.serialwrapd_tty_holders(paths))
     }
