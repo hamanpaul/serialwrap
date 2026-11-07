@@ -765,3 +765,199 @@ def test_win_serial_peer_gate_holds_banner_until_peer_open(tmp_path: Path):
         r.get("meta", {}).get("event") == "peer_state" and r["meta"].get("open") is True
         for r in lines
     )
+
+
+def _make_close_race_bridge(tmp_path: Path):
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson", run_id="r1", case_id="c1", clock_id="clk1"
+    )
+    bridge = Bridge(
+        BridgeConfig(run_id="r1", case_id="c1", port_id="COM0", evidence_dir=evidence_dir),
+        FakeEndpoint(),
+        StubDutProcess(),
+        writer,
+        dut_control=None,
+    )
+    bridge.start()
+    return bridge, evidence_dir
+
+
+def _control_records(evidence_dir: Path) -> list[dict]:
+    return [
+        json.loads(x)
+        for x in (evidence_dir / "control.ndjson").read_text(encoding="utf-8").splitlines()
+        if x
+    ]
+
+
+def test_shutdown_completed_written_before_control_file_closed(tmp_path: Path):
+    """shutdown 的 completed 先於主執行緒 _finish 關檔寫入，rc 為 0（收尾競態回歸）。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    orig = bridge._control_phase
+    saw_closed = threading.Event()
+    orig_gate = bridge._close_control_gate
+    # gate 上限必須長於下方 1.5 秒輪詢，新程式才不會因等待逾時而失敗。
+    bridge._close_control_gate = lambda timeout_s=None: orig_gate(3.0)
+
+    def gated(**kw):
+        if kw["phase"] == "completed" and kw["action"] == "shutdown":
+            # 舊程式下 _finish 會在此期間關檔；新程式下 _finish 會等本 action 結束，故最多等 1.5 秒。
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                if bridge._control_file is None:
+                    saw_closed.set()
+                    break
+                time.sleep(0.005)
+        return orig(**kw)
+
+    bridge._control_phase = gated
+    t = threading.Thread(target=bridge.handle_action, args=("shutdown", {}, "a1"))
+    t.start()
+    rc = bridge.wait()
+    t.join(5)
+    assert rc == 0, bridge._failure_detail
+    assert not saw_closed.is_set()
+    recs = _control_records(evidence_dir)
+    assert any(
+        r["action"] == "shutdown" and r["phase"] == "completed" for r in recs
+    )
+
+
+def test_action_after_finish_is_rejected_without_evidence(tmp_path: Path):
+    """_finish 之後才到的 status：回 ok False、不寫 control.ndjson、不把 rc 變 3。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    bridge.handle_action("shutdown", {}, "a1")
+    assert bridge.wait() == 0
+    before = (evidence_dir / "control.ndjson").read_bytes()
+    res = bridge.handle_action("status", {}, "late")
+    assert res["ok"] is False and res["error"]
+    assert (evidence_dir / "control.ndjson").read_bytes() == before
+    assert bridge._return_code == 0 and bridge.failure is None
+
+
+def _stuck_shutdown(bridge, gate_s: float):
+    """讓 shutdown 的 completed 卡住；回傳 (release, entered, thread)。"""
+    orig_gate = bridge._close_control_gate
+    bridge._close_control_gate = lambda timeout_s=None: orig_gate(gate_s)
+    release = threading.Event()
+    entered = threading.Event()
+    orig = bridge._control_phase
+
+    def stuck(**kw):
+        if kw["phase"] == "completed" and kw["action"] == "shutdown":
+            entered.set()
+            release.wait(30)
+        return orig(**kw)
+
+    bridge._control_phase = stuck
+    t = threading.Thread(
+        target=bridge.handle_action, args=("shutdown", {}, "a1"), daemon=True
+    )
+    t.start()
+    assert entered.wait(5)
+    return release, t
+
+
+@pytest.mark.parametrize("release_later", [True, False])
+def test_stuck_action_times_out_and_stays_fail_closed(tmp_path: Path, release_later):
+    """action 卡住超過上限：wait() 必回 3，且在放行前 failure 與 manifest 已是非乾淨關閉。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    release, t = _stuck_shutdown(bridge, 0.3)
+    start = time.monotonic()
+    rc = bridge.wait()
+    assert time.monotonic() - start < 5
+    # 此時尚未 release.set()：結果必須已定案。
+    assert rc == 3
+    assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+    man = json.loads((evidence_dir / "bridge-manifest.json").read_text(encoding="utf-8"))
+    assert man["closed_cleanly"] is False
+    assert man["failure"] == "HARNESS_EVIDENCE_WRITE_FAILED"
+    if release_later:
+        release.set()
+        t.join(5)
+        assert bridge._return_code == 3
+    # release_later=False：action 一直不放行（daemon 執行緒隨行程結束），結果仍為 3。
+
+
+def test_control_phase_closed_stream_valueerror_fails_closed(tmp_path: Path):
+    """已關閉的 control stream 寫入丟 ValueError 時，不得逃逸，須走 _fail。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    dead = open(evidence_dir / "dead.ndjson", "ab")
+    dead.close()
+    bridge._control_file = dead
+    bridge._control_phase(
+        action_id="x", action="status", phase="requested", params={}, result=None, error=None
+    )
+    assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+    bridge._control_file = None
+    bridge.handle_action("shutdown", {}, "s")
+    bridge.wait()
+
+
+@pytest.mark.parametrize("action", ["pause_pump", "resume_pump"])
+def test_pump_actions_rejected_during_closing(tmp_path: Path, action):
+    """收尾後泵已停，pause/resume 不得宣稱 paused/running。"""
+    bridge, _ = _make_close_race_bridge(tmp_path)
+    bridge.handle_action("shutdown", {}, "s")
+    assert bridge.wait() == 0
+    res = bridge._handle_action(action, {"dir": "RX"}, "late")
+    assert res.get("ok") is False
+
+
+def test_finish_does_not_hang_when_control_write_holds_lock(tmp_path: Path, monkeypatch):
+    """寫入者卡在持鎖的 fsync：wait() 仍須在有限時間回 3，且 manifest 為非乾淨關閉。"""
+    from uart_stdio_bridge.bridge import core
+
+    monkeypatch.setattr(core, "_CONTROL_FILE_LOCK_TIMEOUT_S", 0.3, raising=False)
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    orig_gate = bridge._close_control_gate
+    bridge._close_control_gate = lambda timeout_s=None: orig_gate(0.3)
+    blocked = threading.Event()
+    release = threading.Event()
+    real = bridge._control_file
+
+    class _Stuck:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def fileno(self):
+            blocked.set()
+            release.wait(30)
+            return real.fileno()
+
+    bridge._control_file = _Stuck()
+    writer = threading.Thread(
+        target=bridge.handle_action, args=("status", {}, "a1"), daemon=True
+    )
+    writer.start()
+    assert blocked.wait(5)
+    bridge._done_event.set()
+    result: dict = {}
+    waiter = threading.Thread(
+        target=lambda: result.setdefault("rc", bridge.wait()), daemon=True
+    )
+    waiter.start()
+    waiter.join(10)
+    hung = waiter.is_alive()
+    try:
+        assert not hung, "wait() 被持鎖的寫入卡住"
+        assert result["rc"] == 3
+        assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+        man = json.loads((evidence_dir / "bridge-manifest.json").read_text(encoding="utf-8"))
+        assert man["closed_cleanly"] is False
+    finally:
+        release.set()
+        writer.join(5)
+        waiter.join(5)
+
+
+def test_close_budget_below_blackbox_sigterm_window():
+    """bb_l15 的 process.wait(timeout=10) 之前，gate + 取鎖上限必須留時間寫 manifest。"""
+    from uart_stdio_bridge.bridge import core
+
+    assert core._CONTROL_CLOSE_TIMEOUT_S + core._CONTROL_FILE_LOCK_TIMEOUT_S < 10
