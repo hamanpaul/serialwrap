@@ -533,6 +533,7 @@ fn caps_for_defaults(defaults: &RuntimePaths) -> Capabilities {
         native_device: if win { DeviceBackendKind::Win } else { DeviceBackendKind::Posix },
         // P6：與 `sw_pal::native()` 的平台值一致（Windows 宣告 com0com console 可用）。
         com0com_console: win,
+        flash_endpoint: !win,
     }
 }
 

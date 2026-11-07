@@ -86,6 +86,7 @@ fn skill_default_windows_outputs_skill_windows() {
         console_kind: sw_pal::ConsoleKind::TcpTelnet,
         native_device: sw_pal::DeviceBackendKind::Win,
         com0com_console: true,
+        flash_endpoint: false,
     };
     let p = sw_pal::ClientPlatform {
         env: std::sync::Arc::new(DummySysEnv),

@@ -65,6 +65,7 @@ fn platform(
             console_kind: sw_pal::ConsoleKind::Pty,
             native_device: sw_pal::DeviceBackendKind::Posix,
             com0com_console: false,
+            flash_endpoint: true,
         },
     };
     (p, conn)

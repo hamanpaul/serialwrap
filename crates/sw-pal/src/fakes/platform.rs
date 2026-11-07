@@ -42,6 +42,7 @@ pub fn posix_caps() -> Capabilities {
         console_kind: ConsoleKind::Pty,
         native_device: DeviceBackendKind::Posix,
         com0com_console: false,
+        flash_endpoint: true,
     }
 }
 
@@ -58,6 +59,7 @@ pub fn windows_caps() -> Capabilities {
         console_kind: ConsoleKind::TcpTelnet,
         native_device: DeviceBackendKind::Win,
         com0com_console: true,
+        flash_endpoint: false,
     }
 }
 

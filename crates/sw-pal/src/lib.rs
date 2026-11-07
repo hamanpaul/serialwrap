@@ -99,6 +99,8 @@ pub struct Capabilities {
     pub native_device: DeviceBackendKind,
     /// OD-01 選配 com0com Serial console（SC-29；只在 Windows native 為 true，arch §4）。
     pub com0com_console: bool,
+    /// `/dev/ttyMCU` flash 端點（PTY symlink、raw、速率鏡射）是否可用：POSIX true、Windows false（P8-T7）。
+    pub flash_endpoint: bool,
 }
 
 /// P3 名稱保留（`ClientCaps` 為 `Capabilities` 的別名）。
@@ -227,6 +229,7 @@ pub fn native() -> Platform {
                 console_kind,
                 native_device: DeviceBackendKind::Posix,
                 com0com_console: false,
+                flash_endpoint: true,
             },
         }
     }
@@ -281,6 +284,7 @@ pub fn native() -> Platform {
                 console_kind,
                 native_device: DeviceBackendKind::Win,
                 com0com_console: true,
+                flash_endpoint: false,
             },
         }
     }

@@ -25,6 +25,7 @@ pub mod wal_fs;
 
 // 測試以 `sw_pal::fakes::<Type>` 直接引用（計畫 Task 1／9／13 的 import 路徑）。
 pub use clock::FakeClock;
+pub use console::{FakeConsoleFactory, FakeConsoleHandle, FakeConsoleIo};
 pub use device::{FakeDeviceScript, FakeDeviceSource};
 pub use env::FakeEnv;
 pub use fs::{FaultFs, MemFs};
@@ -35,7 +36,7 @@ pub use process::{FakeHandlerSpawner, FakeProcessCtl, RecordingProcess};
 pub use realfs::{file_mode, real_fs};
 pub use registry::FakeRegistry;
 pub use rpc::{FakeConn, FakeRpcConnector, ScriptedConnector, StreamStep};
-pub use serial::{FakeDevice, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
+pub use serial::{FakeLineControl, FakeDevice, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
 pub use service::FakeServiceCtl;
 pub use sysenv::{FakeSysEnv, FakeSysEnvBuilder};
 pub use tunnel::FakeTunnel;

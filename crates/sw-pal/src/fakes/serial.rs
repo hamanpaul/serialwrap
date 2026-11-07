@@ -331,6 +331,7 @@ pub(crate) struct FakeDeviceInner {
     tx_replies: Mutex<Vec<(Vec<u8>, Vec<u8>, bool)>>,
     tx_matches: Mutex<Vec<(SimpleRegex, Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>)>>,
     tx_match_cursor: Mutex<usize>,
+    line: Arc<FakeLineControl>,
 }
 
 impl FakeDeviceInner {
@@ -367,6 +368,7 @@ impl FakeDeviceInner {
             tx_replies: Mutex::new(Vec::new()),
             tx_matches: Mutex::new(Vec::new()),
             tx_match_cursor: Mutex::new(0),
+            line: Arc::new(FakeLineControl::default()),
         }
     }
 }
@@ -591,6 +593,11 @@ pub struct FakeDevice {
 }
 
 impl FakeDevice {
+    /// 此裝置的序列線控制替身（與 `SerialHandle::line_control()` 為同一物件）。
+    pub fn line_control_probe(&self) -> Arc<FakeLineControl> {
+        Arc::clone(&self.inner.line)
+    }
+
     /// 注入 RX bytes（reader 可讀）。
     pub fn push_rx(&self, bytes: &[u8]) {
         let _g = self.inner.cond_mutex.lock().unwrap_or_else(|e| e.into_inner());
@@ -843,12 +850,81 @@ impl SerialHandle for FakeSerialHandle {
         (reader, writer, waker, close_token)
     }
 
-    fn set_baud(&self, _baud: u32) -> PalResult<()> {
-        Ok(())
+    fn set_baud(&self, baud: u32) -> PalResult<()> {
+        crate::traits::SerialLineControl::set_baud(&*self.inner.line, baud)
+    }
+
+    fn line_control(&self) -> Arc<dyn crate::traits::SerialLineControl> {
+        Arc::clone(&self.inner.line) as Arc<dyn crate::traits::SerialLineControl>
     }
 
     fn is_alive(&self) -> bool {
         self.inner.open.load(Ordering::SeqCst)
+    }
+}
+
+/// 序列線控制替身：記錄所有寫入實體 UART 的速率（供「絕不寫 B0」斷言）。
+#[derive(Default)]
+pub struct FakeLineControl {
+    slave_speeds: Mutex<HashMap<String, PalResult<crate::console_pty::TermSpeed>>>,
+    speed_writes: Mutex<Vec<(u32, u32)>>,
+    baud_calls: Mutex<Vec<u32>>,
+    fail_baud: AtomicBool,
+}
+
+impl FakeLineControl {
+    /// 設定某 slave 路徑「讀到」的速率（或讀取失敗）。未設定的路徑視為讀取失敗。
+    pub fn set_slave_speed(&self, path: &str, speed: PalResult<crate::console_pty::TermSpeed>) {
+        self.slave_speeds.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_string(), speed);
+    }
+
+    /// 令之後的 `set_baud` 失敗（驗證 fallback 失敗被忽略）。
+    pub fn fail_set_baud(&self, fail: bool) {
+        self.fail_baud.store(fail, Ordering::SeqCst);
+    }
+
+    /// 寫入實體 UART 的 `(ispeed, ospeed)` 紀錄（依序）。
+    pub fn speed_writes(&self) -> Vec<(u32, u32)> {
+        self.speed_writes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `set_baud` 呼叫紀錄（依序，含 mirror 的 fallback 路徑）。
+    pub fn baud_calls(&self) -> Vec<u32> {
+        self.baud_calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl crate::traits::SerialLineControl for FakeLineControl {
+    fn set_baud(&self, baud: u32) -> PalResult<()> {
+        self.baud_calls.lock().unwrap_or_else(|e| e.into_inner()).push(baud);
+        if self.fail_baud.load(Ordering::SeqCst) {
+            return Err(PalError::plain(crate::traits::PalErrorKind::Io, "fake set_baud failure"));
+        }
+        Ok(())
+    }
+
+    fn mirror_termios_from(
+        &self,
+        pty: &crate::console_pty::PtySlaveRef,
+        fallback_baud: Option<u32>,
+    ) -> PalResult<()> {
+        let slave = self
+            .slave_speeds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pty.path)
+            .cloned()
+            .unwrap_or_else(|| Err(PalError::plain(crate::traits::PalErrorKind::Io, "tcgetattr failed")));
+        match crate::traits::plan_mirror(&slave, fallback_baud) {
+            crate::traits::MirrorPlan::SetSpeeds { ispeed, ospeed } => {
+                self.speed_writes.lock().unwrap_or_else(|e| e.into_inner()).push((ispeed, ospeed));
+            }
+            crate::traits::MirrorPlan::FallbackBaud(b) => {
+                let _ = self.set_baud(b);
+            }
+            crate::traits::MirrorPlan::Ignore => {}
+        }
+        Ok(())
     }
 }
 

@@ -213,6 +213,34 @@ pub fn set_baud_with(ops: &mut dyn TtyTermiosOps, baud: u32) -> PalResult<()> {
     ops.tcsetattr(&attrs).map_err(PalError::from_errno)
 }
 
+/// `mirror_termios_from` 的核心：依 slave 速率讀取結果與 fallback 套用到 serial（純邏輯，測試以錄製替身驗證）。
+pub fn mirror_with(
+    ops: &mut dyn TtyTermiosOps,
+    slave: PalResult<crate::console_pty::TermSpeed>,
+    fallback_baud: Option<u32>,
+) -> PalResult<()> {
+    match crate::traits::plan_mirror(&slave, fallback_baud) {
+        crate::traits::MirrorPlan::SetSpeeds { ispeed, ospeed } => {
+            let mut attrs = ops.tcgetattr().map_err(PalError::from_errno)?;
+            // SAFETY: attrs 是 tcgetattr 產生的有效 termios；速率非 B0（plan_mirror 保證）。
+            if unsafe { libc::cfsetispeed(&mut attrs, ispeed as libc::speed_t) } != 0 {
+                return Err(PalError::from_errno(errno()));
+            }
+            // SAFETY: 同上。
+            if unsafe { libc::cfsetospeed(&mut attrs, ospeed as libc::speed_t) } != 0 {
+                return Err(PalError::from_errno(errno()));
+            }
+            ops.tcsetattr(&attrs).map_err(PalError::from_errno)
+        }
+        // fallback 失敗（含未列於 POSIX_BAUD_MAP 的 no-op）一律忽略。
+        crate::traits::MirrorPlan::FallbackBaud(baud) => {
+            let _ = set_baud_with(ops, baud);
+            Ok(())
+        }
+        crate::traits::MirrorPlan::Ignore => Ok(()),
+    }
+}
+
 /// `CloseToken::close` 的系統呼叫序列（記錄順序即為 `CloseOp` 順序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseOp {
@@ -956,14 +984,13 @@ impl SerialHandle for PosixSerialHandle {
     }
 
     fn set_baud(&self, baud: u32) -> PalResult<()> {
-        let fd = self
-            .close
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fd
-            .ok_or_else(|| PalError::from_errno(libc::EBADF))?;
-        let mut ops = LibcTermiosOps { fd };
-        set_baud_with(&mut ops, baud)
+        crate::traits::SerialLineControl::set_baud(&PosixLineControl { close: Arc::clone(&self.close) }, baud)
+    }
+
+    fn line_control(&self) -> Arc<dyn crate::traits::SerialLineControl> {
+        Arc::new(PosixLineControl {
+            close: Arc::clone(&self.close),
+        })
     }
 
     fn is_alive(&self) -> bool {
@@ -977,6 +1004,43 @@ impl SerialHandle for PosixSerialHandle {
         // SAFETY：共用的關閉狀態持有 fd，直到 reader/writer 收斂或 close token 明確關閉。
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         unsafe { libc::fstat(fd, &mut st) == 0 }
+    }
+}
+
+/// `SerialHandle::line_control` 的 POSIX 實作；與 handle 共用關閉狀態，close 後的呼叫回 `EBADF`。
+struct PosixLineControl {
+    close: Arc<Mutex<PosixClose>>,
+}
+
+impl PosixLineControl {
+    fn ops(&self) -> PalResult<LibcTermiosOps> {
+        let fd = self
+            .close
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fd
+            .ok_or_else(|| PalError::from_errno(libc::EBADF))?;
+        Ok(LibcTermiosOps { fd })
+    }
+}
+
+impl crate::traits::SerialLineControl for PosixLineControl {
+    fn set_baud(&self, baud: u32) -> PalResult<()> {
+        let mut ops = self.ops()?;
+        set_baud_with(&mut ops, baud)
+    }
+
+    fn mirror_termios_from(
+        &self,
+        pty: &crate::console_pty::PtySlaveRef,
+        fallback_baud: Option<u32>,
+    ) -> PalResult<()> {
+        let mut ops = self.ops()?;
+        mirror_with(
+            &mut ops,
+            crate::console_pty::posix::tcgetattr_speed(pty),
+            fallback_baud,
+        )
     }
 }
 
@@ -1363,6 +1427,62 @@ mod tests {
             self.tcsetattr_calls += 1;
             Ok(())
         }
+    }
+
+    /// 記錄每次 tcsetattr 寫入的 `(ispeed, ospeed)`。
+    #[derive(Default)]
+    struct SpeedRec {
+        writes: Vec<(libc::speed_t, libc::speed_t)>,
+    }
+
+    impl TtyTermiosOps for SpeedRec {
+        fn tcgetattr(&mut self) -> Result<libc::termios, i32> {
+            Ok(input_termios())
+        }
+        fn tcsetattr(&mut self, t: &libc::termios) -> Result<(), i32> {
+            // SAFETY: t 為有效 termios。
+            self.writes
+                .push(unsafe { (libc::cfgetispeed(t), libc::cfgetospeed(t)) });
+            Ok(())
+        }
+    }
+
+    fn speeds(i: u32, o: u32) -> PalResult<crate::console_pty::TermSpeed> {
+        Ok(crate::console_pty::TermSpeed { ispeed: i, ospeed: o })
+    }
+
+    #[test]
+    fn mirror_with_writes_slave_speeds_to_serial() {
+        let mut ops = SpeedRec::default();
+        mirror_with(&mut ops, speeds(libc::B57600, libc::B57600), Some(115200)).unwrap();
+        assert_eq!(ops.writes, vec![(libc::B57600, libc::B57600)]);
+    }
+
+    #[test]
+    fn mirror_with_never_writes_b0_in_either_direction() {
+        for (i, o) in [(0, libc::B9600), (libc::B9600, 0), (0, 0)] {
+            let mut ops = SpeedRec::default();
+            mirror_with(&mut ops, speeds(i, o), Some(115200)).unwrap();
+            assert_eq!(ops.writes, vec![(libc::B115200, libc::B115200)], "B0({i},{o}) 必須走 fallback");
+            let mut ops = SpeedRec::default();
+            mirror_with(&mut ops, speeds(i, o), None).unwrap();
+            assert!(ops.writes.is_empty(), "無 fallback 時不得寫任何東西");
+        }
+    }
+
+    #[test]
+    fn mirror_with_tcgetattr_failure_uses_fallback_else_ignored() {
+        let err = || Err(PalError::from_errno(libc::EIO));
+        let mut ops = SpeedRec::default();
+        mirror_with(&mut ops, err(), Some(9600)).unwrap();
+        assert_eq!(ops.writes, vec![(libc::B9600, libc::B9600)]);
+        let mut ops = SpeedRec::default();
+        mirror_with(&mut ops, err(), None).unwrap();
+        assert!(ops.writes.is_empty());
+        // 未列於 POSIX_BAUD_MAP 的 fallback → no-op、Ok。
+        let mut ops = SpeedRec::default();
+        mirror_with(&mut ops, err(), Some(1234)).unwrap();
+        assert!(ops.writes.is_empty());
     }
 
     #[test]

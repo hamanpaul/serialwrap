@@ -58,6 +58,7 @@ fn platform(files: &[(&str, Vec<u8>)]) -> (ClientPlatform, Arc<ScriptedConnector
             console_kind: sw_pal::ConsoleKind::Pty,
             native_device: sw_pal::DeviceBackendKind::Posix,
             com0com_console: false,
+            flash_endpoint: true,
         },
     };
     (p, conn)

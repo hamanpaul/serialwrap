@@ -4,13 +4,14 @@
 //! 所有替身 io／listener 以行程內唯一 id 登記於全域表；`MuxHandle::Fake(id)` 只能由替身 mux 解讀（native mux 拒絕）。
 //! 狀態變化一律喚醒全域條件變數，替身 mux／`read`／`accept` 據此等待。
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::console_mux::{ConsoleMux, MuxEntry, MuxEvent, MuxHandle, MuxHandleInner, MuxId};
 use crate::console_pty::{
-    ConsoleIo, ConsoleListener, ConsoleTransportFactory, KeepAlive, PtyPair, PtySlaveRef,
+    ConsoleIo, ConsoleListener, ConsoleTransportFactory, ConsoleWriteHalf, KeepAlive, PtyPair, PtySlaveRef, Readiness, TermSpeed,
 };
 use crate::traits::{IoWaker, PalError, PalErrorKind, PalResult, ReadOutcome};
 use crate::ConsoleKind;
@@ -333,6 +334,10 @@ struct FactoryShared {
 #[derive(Clone)]
 pub struct FakeConsoleFactory {
     kind: ConsoleKind,
+    flash: bool,
+    links: Arc<Mutex<HashMap<PathBuf, String>>>,
+    raw: Arc<Mutex<Vec<String>>>,
+    speeds: Arc<Mutex<HashMap<String, TermSpeed>>>,
     shared: Arc<FactoryShared>,
     next_port: Arc<AtomicU64>,
     next_pty: Arc<AtomicU64>,
@@ -346,8 +351,17 @@ pub struct FakeConsoleFactory {
 impl FakeConsoleFactory {
     /// 指定 `kind` 的替身工廠。
     pub fn new(kind: ConsoleKind) -> FakeConsoleFactory {
+        Self::with_flash(kind, kind == ConsoleKind::Pty)
+    }
+
+    /// 明確指定 flash 能力，保留 P6 單參數建構入口與 P8 平台能力替身。
+    pub fn with_flash(kind: ConsoleKind, flash: bool) -> FakeConsoleFactory {
         FakeConsoleFactory {
             kind,
+            flash,
+            links: Arc::new(Mutex::new(HashMap::new())),
+            raw: Arc::new(Mutex::new(Vec::new())),
+            speeds: Arc::new(Mutex::new(HashMap::new())),
             shared: Arc::new(FactoryShared {
                 pending: Mutex::new(VecDeque::new()),
             }),
@@ -358,6 +372,28 @@ impl FakeConsoleFactory {
             com0com: Arc::new(Mutex::new(Vec::new())),
             mux_wait_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    fn check(&self, name: &str) -> PalResult<()> {
+        if self.flash {
+            Ok(())
+        } else {
+            Err(crate::console_pty::unsupported_flash(name))
+        }
+    }
+
+    pub fn set_speed(&self, path: &str, speed: TermSpeed) {
+        self.speeds.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_string(), speed);
+    }
+
+    /// 目前的 symlink 表（link 路徑 → slave 路徑）。
+    pub fn links(&self) -> HashMap<PathBuf, String> {
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 已呼叫 `tty_setraw` 的 slave 路徑（依序）。
+    pub fn raw_calls(&self) -> Vec<String> {
+        self.raw.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 模擬一個 TCP client 連入 listener（下一次 `accept` 取得；全收寫入）。
@@ -458,6 +494,34 @@ impl ConsoleTransportFactory for FakeConsoleFactory {
             }),
             wait_failures: Arc::clone(&self.mux_wait_failures),
         }))
+    }
+
+    fn link(&self, slave_path: &str, link: &Path) -> PalResult<()> {
+        self.check("link")?;
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).insert(link.to_path_buf(), slave_path.to_string());
+        Ok(())
+    }
+
+    fn unlink(&self, link: &Path) -> PalResult<()> {
+        self.check("unlink")?;
+        self.links.lock().unwrap_or_else(|e| e.into_inner()).remove(link);
+        Ok(())
+    }
+
+    fn tty_setraw(&self, slave: &PtySlaveRef) -> PalResult<()> {
+        self.check("tty_setraw")?;
+        self.raw.lock().unwrap_or_else(|e| e.into_inner()).push(slave.path.clone());
+        Ok(())
+    }
+
+    fn tcgetattr_speed(&self, slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+        self.check("tcgetattr_speed")?;
+        self.speeds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&slave.path)
+            .copied()
+            .ok_or_else(|| PalError::plain(PalErrorKind::Io, "tcgetattr failed"))
     }
 }
 
@@ -678,5 +742,108 @@ impl ConsoleMux for FakeConsoleMux {
 
     fn waker(&self) -> Arc<dyn IoWaker> {
         Arc::clone(&self.waker) as Arc<dyn IoWaker>
+    }
+}
+
+
+/// P8 flash 測試的記憶體 I/O；底層沿用 P6 替身的 mux 登記與喚醒機制。
+pub struct FakeConsoleIo {
+    io: FakeIo,
+}
+
+/// P8 測試端操作面（注入 RX、讀出 TX、限制總寫入容量）。
+#[derive(Clone)]
+pub struct FakeConsoleHandle {
+    shared: Arc<IoShared>,
+}
+
+impl FakeConsoleIo {
+    pub fn new() -> (FakeConsoleIo, FakeConsoleHandle) {
+        let io = FakeIo::unbounded();
+        let handle = FakeConsoleHandle { shared: Arc::clone(&io.shared) };
+        (FakeConsoleIo { io }, handle)
+    }
+
+    /// 只等待可讀，不消耗 RX；喚醒優先於資料。
+    fn wait(&self, timeout: Option<Duration>) -> Readiness {
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            let seen = generation();
+            {
+                let mut st = lock(&self.io.shared.st);
+                if st.woken {
+                    st.woken = false;
+                    return Readiness::Woken;
+                }
+                if !st.input.is_empty() || st.eof {
+                    return Readiness::Ready;
+                }
+            }
+            if !wait_change(seen, deadline) {
+                return Readiness::TimedOut;
+            }
+        }
+    }
+}
+
+impl FakeConsoleHandle {
+    pub fn push_rx(&self, bytes: &[u8]) {
+        lock(&self.shared.st).input.extend(bytes);
+        bump();
+    }
+
+    pub fn take_tx(&self) -> Vec<u8> {
+        let bytes = std::mem::take(&mut lock(&self.shared.st).written);
+        bump();
+        bytes
+    }
+
+    /// 總容量耗盡時回 `Ok(0)`，模擬 EAGAIN。
+    pub fn set_tx_capacity(&self, cap: usize) {
+        lock(&self.shared.st).mode = Mode::AcceptN(cap);
+        bump();
+    }
+}
+
+struct FakeFlashWriter {
+    shared: Arc<IoShared>,
+}
+
+impl ConsoleWriteHalf for FakeFlashWriter {
+    fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
+        // 寫入分身持有自己的狀態參照，原 io drop 後仍可寫入（對齊 dup master）。
+        let mut st = lock(&self.shared.st);
+        let n = match st.mode {
+            Mode::Stalled => 0,
+            Mode::AcceptN(cap) => cap.saturating_sub(st.written.len()).min(data.len()),
+            Mode::Unbounded | Mode::FailingRead => data.len(),
+        };
+        st.written.extend_from_slice(&data[..n]);
+        Ok(n)
+    }
+}
+
+impl ConsoleIo for FakeConsoleIo {
+    fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+        self.io.read(buf, timeout)
+    }
+    fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
+        self.io.try_write(data)
+    }
+    fn waker(&self) -> Arc<dyn IoWaker> {
+        self.io.waker()
+    }
+    fn has_external_peer(&self, _held: Option<&HashSet<String>>) -> bool {
+        false
+    }
+    fn close(self: Box<Self>) {}
+    fn mux_handle(&self) -> MuxHandle {
+        self.io.mux_handle()
+    }
+    fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>> {
+        Ok(Box::new(FakeFlashWriter { shared: Arc::clone(&self.io.shared) }))
+    }
+    fn wait_readable(&mut self, timeout: Option<Duration>) -> PalResult<Readiness> {
+        Ok(self.wait(timeout))
     }
 }

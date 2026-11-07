@@ -4,6 +4,7 @@
 //! TCP console、ConsoleMux、`/proc` 持有者掃描與（Windows）com0com console（P6 Task 8）。
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +49,29 @@ impl KeepAlive {
     }
 }
 
+/// `ConsoleIo::wait_readable` 的結果（arch §4.7；只等可讀、不讀）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// master 可讀（含對端 HUP；讀取會得到資料或 EOF）。
+    Ready,
+    TimedOut,
+    /// `waker().wake()` 喚醒（與 `read` 的 `Woken` 共用同一喚醒通道）。
+    Woken,
+}
+
+/// 由 `tcgetattr_speed` 取得的 termios 速率（原始 `speed_t` 代碼，不是 baud 數值；`0` 即 B0＝「未設」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermSpeed {
+    pub ispeed: u32,
+    pub ospeed: u32,
+}
+
+/// `ConsoleIo::clone_writer` 的寫入分身（POSIX `dup(master)`、TCP `try_clone`）。
+pub trait ConsoleWriteHalf: Send {
+    /// 不阻塞；EAGAIN → `Ok(0)`。
+    fn try_write(&mut self, data: &[u8]) -> PalResult<usize>;
+}
+
 /// PTY master 或 TCP console 的 I/O 端（arch §4.7）。
 pub trait ConsoleIo: Send {
     fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome>;
@@ -58,6 +82,14 @@ pub trait ConsoleIo: Send {
     fn close(self: Box<Self>);
     /// P6（07 D-04）：`ConsoleMux` 用的底層 handle（PAL 私有建構）。
     fn mux_handle(&self) -> MuxHandle;
+    /// 取得寫入分身（讓寫入與讀取可由不同執行緒各持一份）。預設 `Unsupported`，既有替身仍可編譯。
+    fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>> {
+        Err(unsupported_flash("clone_writer"))
+    }
+    /// 只等待可讀，不讀取資料；`Err` 只代表等待本身失敗。預設 `Unsupported`。
+    fn wait_readable(&mut self, _timeout: Option<Duration>) -> PalResult<Readiness> {
+        Err(unsupported_flash("wait_readable"))
+    }
 }
 
 /// `create_pty` 的結果（arch §4.7）。
@@ -110,6 +142,26 @@ pub trait ConsoleTransportFactory: Send + Sync {
     fn slave_path_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
     }
+    /// `/dev/ttyMCU` 端點 symlink：建立父目錄並以 symlink 取代既有同名項目（不得是目錄）。Windows `Unsupported`。
+    fn link(&self, _slave_path: &str, _link: &Path) -> PalResult<()> {
+        Err(unsupported_flash("link"))
+    }
+    /// 移除端點 symlink；不存在視為成功。Windows `Unsupported`。
+    fn unlink(&self, _link: &Path) -> PalResult<()> {
+        Err(unsupported_flash("unlink"))
+    }
+    /// 對 slave 套用 CPython `tty.setraw` 等價設定（開啟 slave 但不設 TIOCEXCL）。Windows `Unsupported`。
+    fn tty_setraw(&self, _slave: &PtySlaveRef) -> PalResult<()> {
+        Err(unsupported_flash("tty_setraw"))
+    }
+    /// 讀取 slave 目前的 ispeed／ospeed（原始 `speed_t` 代碼）。Windows `Unsupported`。
+    fn tcgetattr_speed(&self, _slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+        Err(unsupported_flash("tcgetattr_speed"))
+    }
+}
+
+pub(crate) fn unsupported_flash(name: &str) -> PalError {
+    PalError::plain(PalErrorKind::Unsupported, format!("{name} 於此平台不支援（flash 端點）"))
 }
 
 fn unsupported(name: &str) -> PalError {
@@ -181,6 +233,54 @@ impl ConsoleTransportFactory for NativeConsoleFactory {
         #[cfg(windows)]
         {
             crate::console_mux::windows::WinConsoleMux::create()
+        }
+    }
+
+    fn link(&self, slave_path: &str, link: &Path) -> PalResult<()> {
+        #[cfg(unix)]
+        {
+            posix::link(slave_path, link)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (slave_path, link);
+            Err(unsupported_flash("link"))
+        }
+    }
+
+    fn unlink(&self, link: &Path) -> PalResult<()> {
+        #[cfg(unix)]
+        {
+            posix::unlink(link)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = link;
+            Err(unsupported_flash("unlink"))
+        }
+    }
+
+    fn tty_setraw(&self, slave: &PtySlaveRef) -> PalResult<()> {
+        #[cfg(unix)]
+        {
+            posix::tty_setraw(slave)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = slave;
+            Err(unsupported_flash("tty_setraw"))
+        }
+    }
+
+    fn tcgetattr_speed(&self, slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+        #[cfg(unix)]
+        {
+            posix::tcgetattr_speed(slave)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = slave;
+            Err(unsupported_flash("tcgetattr_speed"))
         }
     }
 }

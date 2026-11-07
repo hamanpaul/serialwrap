@@ -47,6 +47,7 @@ fn platform() -> (ClientPlatform, Arc<ScriptedConnector>) {
             console_kind: sw_pal::ConsoleKind::Pty,
             native_device: DeviceBackendKind::Posix,
             com0com_console: false,
+            flash_endpoint: true,
         },
     };
     (p, conn)
