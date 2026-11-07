@@ -692,7 +692,14 @@ impl Service {
             "command.get" => {
                 let cmd_id = p.str_or("cmd_id", "")?;
                 Ok(match self.registry.get(&cmd_id) {
-                    Some(rec) => pydict! { "ok" => true, "command" => rec },
+                    Some(mut rec) => {
+                        let source = rec.get("source").and_then(PyValue::as_str).unwrap_or("");
+                        rec.insert(
+                            "source_class",
+                            PyValue::from(classify_source(source)),
+                        );
+                        pydict! { "ok" => true, "command" => rec }
+                    }
                     None => cmd_not_found(&cmd_id),
                 })
             }
