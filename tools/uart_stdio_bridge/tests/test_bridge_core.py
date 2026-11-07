@@ -800,11 +800,14 @@ def test_shutdown_completed_written_before_control_file_closed(tmp_path: Path):
     bridge, evidence_dir = _make_close_race_bridge(tmp_path)
     orig = bridge._control_phase
     saw_closed = threading.Event()
+    orig_gate = bridge._close_control_gate
+    # gate 上限必須長於下方 1.5 秒輪詢，新程式才不會因等待逾時而失敗。
+    bridge._close_control_gate = lambda timeout_s=None: orig_gate(3.0)
 
     def gated(**kw):
         if kw["phase"] == "completed" and kw["action"] == "shutdown":
-            # 舊程式下 _finish 會在此期間關檔；新程式下 _finish 會等本 action 結束，故最多等 0.5 秒。
-            deadline = time.monotonic() + 0.5
+            # 舊程式下 _finish 會在此期間關檔；新程式下 _finish 會等本 action 結束，故最多等 1.5 秒。
+            deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline:
                 if bridge._control_file is None:
                     saw_closed.set()
@@ -837,11 +840,10 @@ def test_action_after_finish_is_rejected_without_evidence(tmp_path: Path):
     assert bridge._return_code == 0 and bridge.failure is None
 
 
-def test_stuck_action_times_out_and_stays_fail_closed(tmp_path: Path, monkeypatch):
-    """action 卡住超過上限時 _finish 仍會結束，且其後的證據缺漏維持 fail-closed（rc 3）。"""
-    bridge, _ = _make_close_race_bridge(tmp_path)
+def _stuck_shutdown(bridge, gate_s: float):
+    """讓 shutdown 的 completed 卡住；回傳 (release, entered, thread)。"""
     orig_gate = bridge._close_control_gate
-    monkeypatch.setattr(bridge, "_close_control_gate", lambda timeout_s=2.0: orig_gate(0.3))
+    bridge._close_control_gate = lambda timeout_s=None: orig_gate(gate_s)
     release = threading.Event()
     entered = threading.Event()
     orig = bridge._control_phase
@@ -849,18 +851,59 @@ def test_stuck_action_times_out_and_stays_fail_closed(tmp_path: Path, monkeypatc
     def stuck(**kw):
         if kw["phase"] == "completed" and kw["action"] == "shutdown":
             entered.set()
-            release.wait(10)
+            release.wait(30)
         return orig(**kw)
 
     bridge._control_phase = stuck
-    t = threading.Thread(target=bridge.handle_action, args=("shutdown", {}, "a1"))
+    t = threading.Thread(
+        target=bridge.handle_action, args=("shutdown", {}, "a1"), daemon=True
+    )
     t.start()
     assert entered.wait(5)
+    return release, t
+
+
+@pytest.mark.parametrize("release_later", [True, False])
+def test_stuck_action_times_out_and_stays_fail_closed(tmp_path: Path, release_later):
+    """action 卡住超過上限：wait() 必回 3，且在放行前 failure 與 manifest 已是非乾淨關閉。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    release, t = _stuck_shutdown(bridge, 0.3)
     start = time.monotonic()
     rc = bridge.wait()
     assert time.monotonic() - start < 5
-    release.set()
-    t.join(5)
-    assert rc == 0 or rc == 3
-    assert bridge._return_code == 3
+    # 此時尚未 release.set()：結果必須已定案。
+    assert rc == 3
     assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+    man = json.loads((evidence_dir / "bridge-manifest.json").read_text(encoding="utf-8"))
+    assert man["closed_cleanly"] is False
+    assert man["failure"] == "HARNESS_EVIDENCE_WRITE_FAILED"
+    if release_later:
+        release.set()
+        t.join(5)
+        assert bridge._return_code == 3
+    # release_later=False：action 一直不放行（daemon 執行緒隨行程結束），結果仍為 3。
+
+
+def test_control_phase_closed_stream_valueerror_fails_closed(tmp_path: Path):
+    """已關閉的 control stream 寫入丟 ValueError 時，不得逃逸，須走 _fail。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    dead = open(evidence_dir / "dead.ndjson", "ab")
+    dead.close()
+    bridge._control_file = dead
+    bridge._control_phase(
+        action_id="x", action="status", phase="requested", params={}, result=None, error=None
+    )
+    assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"
+    bridge._control_file = None
+    bridge.handle_action("shutdown", {}, "s")
+    bridge.wait()
+
+
+@pytest.mark.parametrize("action", ["pause_pump", "resume_pump"])
+def test_pump_actions_rejected_during_closing(tmp_path: Path, action):
+    """收尾後泵已停，pause/resume 不得宣稱 paused/running。"""
+    bridge, _ = _make_close_race_bridge(tmp_path)
+    bridge.handle_action("shutdown", {}, "s")
+    assert bridge.wait() == 0
+    res = bridge._handle_action(action, {"dir": "RX"}, "late")
+    assert res.get("ok") is False

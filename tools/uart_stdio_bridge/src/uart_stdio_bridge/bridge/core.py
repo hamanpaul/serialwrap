@@ -50,6 +50,12 @@ class BridgeConfig:
             raise ValueError("stderr_cap_bytes 不得為負數")
 
 
+# 收尾時等進行中 control action 的上限。逾時即 fail-closed（rc=3），故需放寬到不會把
+# 「CI 慢」誤判成失敗：shutdown 的 _evidence_summary 會讀整份 wire 檔、fsync 也可能慢。
+# 等待發生在 shutdown RPC 返回前，呼叫端 control 逾時為 30 秒，足以涵蓋。
+_CONTROL_CLOSE_TIMEOUT_S = 15.0
+
+
 class Bridge:
     """獨立維護 TX、RX、stderr 與控制通道，不解析 UART 文字內容。"""
 
@@ -510,13 +516,13 @@ class Bridge:
         result: dict[str, Any] | None,
         error: str | None,
     ) -> None:
-        stream = self._control_file
-        if stream is None:
-            self._fail("HARNESS_EVIDENCE_WRITE_FAILED", "control.ndjson 未開啟")
-            return
         from uart_stdio_bridge.evidence.clock import clock_id
 
         with self._control_lock:
+            stream = self._control_file
+            if stream is None:
+                self._fail("HARNESS_EVIDENCE_WRITE_FAILED", "control.ndjson 未開啟")
+                return
             self._control_seq += 1
             rec = {
                 "schema_version": "control.v1",
@@ -544,8 +550,12 @@ class Bridge:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            except OSError as exc:
-                code = "HARNESS_DISK_FULL" if exc.errno == errno.ENOSPC else "HARNESS_EVIDENCE_WRITE_FAILED"
+            except (OSError, ValueError) as exc:
+                code = (
+                    "HARNESS_DISK_FULL"
+                    if getattr(exc, "errno", None) == errno.ENOSPC
+                    else "HARNESS_EVIDENCE_WRITE_FAILED"
+                )
                 self._fail(code, exc)
 
     def _barrier(self, params: dict[str, Any], action_id: str) -> dict[str, Any]:
@@ -714,6 +724,9 @@ class Bridge:
         if action in {"pause_pump", "resume_pump"}:
             direction = str(params.get("dir", "")).upper()
             if direction not in {"TX", "RX"}:
+                return {"ok": False, "error": "HARNESS_CONTROL_PROTOCOL_ERROR"}
+            if self._closing or self._stop_event.is_set():
+                # 收尾期間泵已停，不得記下假的 paused/running 狀態。
                 return {"ok": False, "error": "HARNESS_CONTROL_PROTOCOL_ERROR"}
             if action == "pause_pump":
                 try:
@@ -1105,19 +1118,22 @@ class Bridge:
                     self._actions_inflight.pop(ident, None)
                 self._action_cond.notify_all()
 
-    def _close_control_gate(self, timeout_s: float = 2.0) -> None:
+    def _close_control_gate(self, timeout_s: float | None = None) -> bool:
         """等進行中的 control action 寫完證據（有上限），再拒收之後的 action。
 
         逾時不放行：control_file 關閉後卡住的 action 於 _control_phase 看到 None，仍 fail-closed。
-        在 control 執行緒上執行時不等自己所屬的 action。
+        在 control 執行緒上執行時不等自己所屬的 action。回傳 False 表示逾時（仍有 action 未結束）。
         """
+        if timeout_s is None:
+            timeout_s = _CONTROL_CLOSE_TIMEOUT_S
         me = threading.get_ident()
         with self._action_cond:
-            self._action_cond.wait_for(
+            drained = self._action_cond.wait_for(
                 lambda: not any(i != me for i in self._actions_inflight),
                 timeout=timeout_s,
             )
             self._control_closed = True
+        return bool(drained)
 
     def _handle_action_recorded(
         self, action: str, params: dict[str, Any], action_id: str
@@ -1186,20 +1202,32 @@ class Bridge:
         close_pipes = getattr(self.dut, "_close_pipes", None)
         if callable(close_pipes):
             close_pipes()
-        self._close_control_gate()
+        if not self._close_control_gate():
+            # 在 _action_cond 之外呼叫；讓 rc 與 manifest 在 wait() 返回前就判為失敗。
+            self._fail(
+                "HARNESS_EVIDENCE_WRITE_FAILED", "control action 未在收尾期限內結束"
+            )
         for attr in ("_control_file", "_stderr_file"):
-            stream = getattr(self, attr)
-            if stream is not None:
-                try:
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                except OSError:
-                    pass
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-                setattr(self, attr, None)
+            # 關閉 control 檔須持 _control_lock，避免與 _control_phase 並行 close/write。
+            lock = self._control_lock if attr == "_control_file" else None
+            if lock is not None:
+                lock.acquire()
+            try:
+                stream = getattr(self, attr)
+                if stream is not None:
+                    try:
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    except OSError:
+                        pass
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+                    setattr(self, attr, None)
+            finally:
+                if lock is not None:
+                    lock.release()
         try:
             summary = self.writer.close()
             if not isinstance(summary, dict):
