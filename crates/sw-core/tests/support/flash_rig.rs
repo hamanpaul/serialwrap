@@ -1071,12 +1071,15 @@ impl FlashRig {
 
     // ------------------------------------------------------------ 驅動到狀態
 
-    /// 驅動到 `com` 進 FLASHING 且 MCU 的回應已回放給 flasher（master 寫入筆數增加）。
+    /// 驅動到 `com` 進 FLASHING、MCU 的回應已回放給 flasher（master 寫入筆數增加），且 holder watch thread 已登記第一次
+    /// 等待（其 1800 s 期限自 thread 啟動起算；thread 尚未起跑就推進時間會被它錯過）。
     pub fn run_until_flashing(&self, com: &str) {
         let before = self.master_writes().len();
         self.drive_until(&format!("{com} FLASHING＋ACK 回放"), |r| {
             r.state(com) == "FLASHING" && r.master_writes().len() > before
         });
+        wait_real("holder watch thread 登記第一次等待", || self.clock.waiters() > 0);
+        self.settle();
     }
 
     /// 驅動直到下一次 `on_flash_open` 返回。
