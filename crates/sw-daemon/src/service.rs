@@ -682,6 +682,8 @@ impl Service {
                     priority,
                     expected_duration_s,
                     completion_regex,
+                    expect_reboot: false,
+                    trusted_human: false,
                     // D-10（DF-02）：RPC 來源一律以 agent 對待，即使 source 以 `human:` 開頭。
                     origin: SubmitOrigin::Rpc,
                 };
