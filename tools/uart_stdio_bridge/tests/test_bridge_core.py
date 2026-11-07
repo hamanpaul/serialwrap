@@ -765,3 +765,102 @@ def test_win_serial_peer_gate_holds_banner_until_peer_open(tmp_path: Path):
         r.get("meta", {}).get("event") == "peer_state" and r["meta"].get("open") is True
         for r in lines
     )
+
+
+def _make_close_race_bridge(tmp_path: Path):
+    from uart_stdio_bridge.bridge.core import Bridge, BridgeConfig
+    from uart_stdio_bridge.evidence.writer import EvidenceWriter
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    writer = EvidenceWriter(
+        evidence_dir / "wire.ndjson", run_id="r1", case_id="c1", clock_id="clk1"
+    )
+    bridge = Bridge(
+        BridgeConfig(run_id="r1", case_id="c1", port_id="COM0", evidence_dir=evidence_dir),
+        FakeEndpoint(),
+        StubDutProcess(),
+        writer,
+        dut_control=None,
+    )
+    bridge.start()
+    return bridge, evidence_dir
+
+
+def _control_records(evidence_dir: Path) -> list[dict]:
+    return [
+        json.loads(x)
+        for x in (evidence_dir / "control.ndjson").read_text(encoding="utf-8").splitlines()
+        if x
+    ]
+
+
+def test_shutdown_completed_written_before_control_file_closed(tmp_path: Path):
+    """shutdown 的 completed 先於主執行緒 _finish 關檔寫入，rc 為 0（收尾競態回歸）。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    orig = bridge._control_phase
+    saw_closed = threading.Event()
+
+    def gated(**kw):
+        if kw["phase"] == "completed" and kw["action"] == "shutdown":
+            # 舊程式下 _finish 會在此期間關檔；新程式下 _finish 會等本 action 結束，故最多等 0.5 秒。
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if bridge._control_file is None:
+                    saw_closed.set()
+                    break
+                time.sleep(0.005)
+        return orig(**kw)
+
+    bridge._control_phase = gated
+    t = threading.Thread(target=bridge.handle_action, args=("shutdown", {}, "a1"))
+    t.start()
+    rc = bridge.wait()
+    t.join(5)
+    assert rc == 0, bridge._failure_detail
+    assert not saw_closed.is_set()
+    recs = _control_records(evidence_dir)
+    assert any(
+        r["action"] == "shutdown" and r["phase"] == "completed" for r in recs
+    )
+
+
+def test_action_after_finish_is_rejected_without_evidence(tmp_path: Path):
+    """_finish 之後才到的 status：回 ok False、不寫 control.ndjson、不把 rc 變 3。"""
+    bridge, evidence_dir = _make_close_race_bridge(tmp_path)
+    bridge.handle_action("shutdown", {}, "a1")
+    assert bridge.wait() == 0
+    before = (evidence_dir / "control.ndjson").read_bytes()
+    res = bridge.handle_action("status", {}, "late")
+    assert res["ok"] is False and res["error"]
+    assert (evidence_dir / "control.ndjson").read_bytes() == before
+    assert bridge._return_code == 0 and bridge.failure is None
+
+
+def test_stuck_action_times_out_and_stays_fail_closed(tmp_path: Path, monkeypatch):
+    """action 卡住超過上限時 _finish 仍會結束，且其後的證據缺漏維持 fail-closed（rc 3）。"""
+    bridge, _ = _make_close_race_bridge(tmp_path)
+    orig_gate = bridge._close_control_gate
+    monkeypatch.setattr(bridge, "_close_control_gate", lambda timeout_s=2.0: orig_gate(0.3))
+    release = threading.Event()
+    entered = threading.Event()
+    orig = bridge._control_phase
+
+    def stuck(**kw):
+        if kw["phase"] == "completed" and kw["action"] == "shutdown":
+            entered.set()
+            release.wait(10)
+        return orig(**kw)
+
+    bridge._control_phase = stuck
+    t = threading.Thread(target=bridge.handle_action, args=("shutdown", {}, "a1"))
+    t.start()
+    assert entered.wait(5)
+    start = time.monotonic()
+    rc = bridge.wait()
+    assert time.monotonic() - start < 5
+    release.set()
+    t.join(5)
+    assert rc == 0 or rc == 3
+    assert bridge._return_code == 3
+    assert bridge.failure == "HARNESS_EVIDENCE_WRITE_FAILED"

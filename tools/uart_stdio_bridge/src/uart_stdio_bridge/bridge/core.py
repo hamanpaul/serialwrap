@@ -75,6 +75,10 @@ class Bridge:
         self._state_changed = threading.Condition(self._state_lock)
         self._action_lock = threading.RLock()
         self._control_lock = threading.Lock()
+        # 追蹤進行中的 control action（含不取 _action_lock 者），供 _finish 關檔前有上限等待。
+        self._action_cond = threading.Condition(threading.Lock())
+        self._actions_inflight: dict[int, int] = {}
+        self._control_closed = False
         self._finish_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._done_event = threading.Event()
@@ -1081,10 +1085,39 @@ class Bridge:
         if not isinstance(params, dict):
             params = {}
         action_id = action_id or uuid.uuid4().hex
-        if action in {"status", "pause_pump", "resume_pump"}:
-            return self._handle_action_recorded(action, params, action_id)
-        with self._action_lock:
-            return self._handle_action_recorded(action, params, action_id)
+        ident = threading.get_ident()
+        with self._action_cond:
+            if self._control_closed:
+                # control 已關閉：遲到請求不寫證據、不影響 return code。
+                return {"ok": False, "error": "HARNESS_CONTROL_PROTOCOL_ERROR"}
+            self._actions_inflight[ident] = self._actions_inflight.get(ident, 0) + 1
+        try:
+            if action in {"status", "pause_pump", "resume_pump"}:
+                return self._handle_action_recorded(action, params, action_id)
+            with self._action_lock:
+                return self._handle_action_recorded(action, params, action_id)
+        finally:
+            with self._action_cond:
+                left = self._actions_inflight.get(ident, 1) - 1
+                if left > 0:
+                    self._actions_inflight[ident] = left
+                else:
+                    self._actions_inflight.pop(ident, None)
+                self._action_cond.notify_all()
+
+    def _close_control_gate(self, timeout_s: float = 2.0) -> None:
+        """等進行中的 control action 寫完證據（有上限），再拒收之後的 action。
+
+        逾時不放行：control_file 關閉後卡住的 action 於 _control_phase 看到 None，仍 fail-closed。
+        在 control 執行緒上執行時不等自己所屬的 action。
+        """
+        me = threading.get_ident()
+        with self._action_cond:
+            self._action_cond.wait_for(
+                lambda: not any(i != me for i in self._actions_inflight),
+                timeout=timeout_s,
+            )
+            self._control_closed = True
 
     def _handle_action_recorded(
         self, action: str, params: dict[str, Any], action_id: str
@@ -1153,6 +1186,7 @@ class Bridge:
         close_pipes = getattr(self.dut, "_close_pipes", None)
         if callable(close_pipes):
             close_pipes()
+        self._close_control_gate()
         for attr in ("_control_file", "_stderr_file"):
             stream = getattr(self, attr)
             if stream is not None:
