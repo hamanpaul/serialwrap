@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq};
+use sw_core::arbiter::{CommandRegistry, SubmitOrigin, SubmitReq, expect_reboot_rejection};
 use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
@@ -657,9 +657,12 @@ impl Service {
                     return Ok(source_error);
                 }
                 let source = source_check.source.clone();
+                let mode = p.str_or("mode", "line")?;
+                if let Some(rejection) = expect_reboot_rejection(p.raw("expect_reboot"), &mode) {
+                    return Ok(rejection);
+                }
                 let selector = first_str(&p, &["selector", "com", "alias"]);
                 let command = first_str(&p, &["cmd", "command"]);
-                let mode = p.str_or("mode", "line")?;
                 let timeout_s = p.float_or("timeout_s", 10.0)?;
                 let priority = p.int_or("priority", 10)?;
                 // `float(raw_ed) if raw_ed is not None else None`：0 → 0.0（非 None）。
