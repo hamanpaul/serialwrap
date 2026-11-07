@@ -63,3 +63,12 @@ def test_od72_slice21_nodes_keep_their_assigned_owner() -> None:
     assert windows_cases <= windows_nodes, f"Windows 原生集合缺案例：{sorted(windows_cases - windows_nodes)}"
     assert deferred_case not in linux_nodes, "DF-20 deferred 案例仍在 P7 Linux slice21 集合"
     assert deferred_case in full_linux_nodes, "DF-20 案例不得從完整 pytest 分母刪除"
+
+
+def test_od78_replacement_preserves_continue_on_error_coverage() -> None:
+    """OD-78 替換舊 Windows bundle 禁止斷言時，no continue_on_error 仍須由獨立測試涵蓋。"""
+    nodes = set(_lock()["sets"]["p7_gate:python3-m-pytest-q-tests"]["linux"]["nodeids"])
+    assert "tests/test_release_workflow.py::test_windows_bundle_job_runs_on_hosted_windows_after_linux_bundle" in nodes
+    assert "tests/test_release_workflow.py::test_workflow_does_not_build_windows_bundle_and_has_no_continue_on_error" not in nodes
+    source = (ROOT / "tests/test_release_workflow.py").read_text(encoding="utf-8")
+    assert "def test_no_job_or_step_uses_continue_on_error(" in source

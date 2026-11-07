@@ -5,9 +5,9 @@
 #        [--od59-contract]
 #   1. p7-a／p7-b：先跑 Python 基線（A）並確認其 daemon 全數結束，再以新的 FakeTarget 實例跑 Rust（B）。
 #      其中一般 `test_control_latency_under_flood_with_events` 為快速檢查；只有 `--od59-contract` 才另跑契約樣本量 A／B。
-#   2. 先前切片必要回歸（Rust artifact）：slice21-b（tests/contract_blackbox/slice21/）、slice22-b（P6 的
-#      test_console_*.py／test_interactive_lease.py／test_slice22_family_mirrors.py；本分支不 merge P6，檔案不存在時
-#      記為 BLOCKED-UPSTREAM）、l15-slice21-b（test_slice21_l15.py 的 rust 參數＋凍結清單）、l15-slice23
+#   2. 先前切片必要回歸（Rust artifact）：slice21-b（L1 鎖定節點）、slice22-b（P6 的
+#      tests/contract_blackbox/slice22/；目錄不存在時記為 BLOCKED-UPSTREAM）、l15-slice21-b
+#      （test_slice21_l15.py 的 rust 參數＋凍結清單）、l15-slice23
 #      （test_slice23_l15.py；s23 情境含 Python 基線參數）；func-test 外部 bridge 模式 brcm-01-login-flow、ev-01-spawn-handler。
 #   每個 pytest 階段寫 <run>/<slug>/{junit.xml,l1-results.json（SW_RESOURCE_REPORT）,log,rc}；func-test 階段寫
 #   <run>/<slug>/{report/,log,rc}。全部結束後交 scripts/rust/p7_ab_report.py 逐案／逐階段判定並寫出
@@ -44,6 +44,22 @@ cd "$ROOT"
 TESTS=(tests/contract_blackbox/test_p7_*.py)
 PY_D="$ROOT/tests/contract_blackbox/bin/py-serialwrapd"
 RUST_ENV=(SERIALWRAP_DAEMON_EXE="$RUST_D" SERIALWRAP_CLI_EXE="$RUST_CLI")
+
+# slice21 的目錄含依 OD-72 排除的 Windows 與 DF-20 節點；執行時只傳凍結清單中的精確 nodeid。
+S21_NODEIDS_FILE="$RUN_DIR/slice21-nodeids.txt"
+python3 - "$ROOT/tests/acceptance/l1_required.lock.json" "$S21_NODEIDS_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+nodes = lock.get("sets", {}).get("p7_gate:contract-blackbox-slice21-b", {}).get("linux", {}).get("nodeids")
+if not isinstance(nodes, list) or not nodes or any(not isinstance(n, str) or "::" not in n for n in nodes):
+    raise SystemExit("p7_gate:contract-blackbox-slice21-b.linux 凍結 nodeid 清單無效")
+pathlib.Path(sys.argv[2]).write_text("".join(n + "\n" for n in nodes), encoding="utf-8")
+PY
+mapfile -t S21_NODES <"$S21_NODEIDS_FILE"
+[[ ${#S21_NODES[@]} -gt 0 ]] || { echo "run_p7_ab.sh: slice21 凍結 nodeid 清單為空" >&2; exit 2; }
 
 # pytest 階段：run_phase <slug> <env 指派…> -- <pytest 參數…>；env 指派之後以 `--` 分隔。
 run_phase() {
@@ -111,17 +127,13 @@ PY
 fi
 
 # 先前切片必要回歸（Rust artifact）。
-run_phase slice21-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s21 -- tests/contract_blackbox/slice21/
-S22=()
-for f in tests/contract_blackbox/test_console_*.py tests/contract_blackbox/test_interactive_lease.py \
-         tests/contract_blackbox/test_slice22_family_mirrors.py; do
-  [[ -f "$f" ]] && S22+=("$f")
-done
-if [[ ${#S22[@]} -gt 0 ]]; then
-  run_phase slice22-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s22 -- "${S22[@]}"
+run_phase slice21-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s21 -- "${S21_NODES[@]}"
+S22_DIR="$ROOT/tests/contract_blackbox/slice22"
+if [[ -d "$S22_DIR" ]]; then
+  run_phase slice22-b "${RUST_ENV[@]}" SERIALWRAP_AB_LABEL=rust-s22 -- "$S22_DIR/"
 else
   mkdir -p "$RUN_DIR/slice22-b"
-  echo "BLOCKED-UPSTREAM：P6 Slice 2.2 黑箱檔案不在本分支（不 merge P6）" >"$RUN_DIR/slice22-b/blocked"
+  echo "BLOCKED-UPSTREAM：P6 Slice 2.2 黑箱目錄不存在：$S22_DIR" >"$RUN_DIR/slice22-b/blocked"
 fi
 if [[ -z "${SERIALWRAP_L15_SELFTEST_REPORT:-}" ]]; then
   mkdir -p "$RUN_DIR/bridge-selftest"

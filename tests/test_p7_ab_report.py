@@ -90,6 +90,27 @@ def test_regression_phase_blocked_upstream_is_not_pass(tmp_path):
     assert ab.judge_phase(d, FROZEN)[0] == "BLOCKED-UPSTREAM"
 
 
+def test_slice22_report_checks_the_registered_frozen_nodes(tmp_path):
+    """P6 黑箱目錄存在時，A/B 報告須以其 L1 凍結節點逐項判定。"""
+    lock_path = ROOT / "tests/acceptance/l1_required.lock.json"
+    set_id = ab.PHASE_SETS["slice22-b"]
+    frozen = ab.load_frozen(lock_path, set_id, "linux")
+    assert frozen, f"L1 鎖缺少 {set_id}.linux"
+    rows = {node: "passed" for node in frozen}
+    assert ab.judge_phase(_phase(tmp_path, "slice22-b", rows), frozen)[0] == "PASS"
+
+
+def test_run_p7_ab_uses_frozen_slice21_and_merged_slice22_directory():
+    """slice21 不得收整個目錄造成 OD-72 額外節點；slice22 使用已合併的 P6 目錄。"""
+    script = (ROOT / "scripts/rust/run_p7_ab.sh").read_text(encoding="utf-8")
+    assert "p7_gate:contract-blackbox-slice21-b" in script
+    assert '"${S21_NODES[@]}"' in script
+    assert 'S22_DIR="$ROOT/tests/contract_blackbox/slice22"' in script
+    assert 'if [[ -d "$S22_DIR" ]]' in script
+    assert '-- "$S22_DIR/"' in script
+    assert "test_console_*.py" not in script and "不 merge P6" not in script
+
+
 @pytest.mark.parametrize("verdict,rc,want", [("PASS", 0, "PASS"), ("FAIL", 1, "FAIL"), ("PASS", 3, "INCOMPLETE"),
                                              (None, 3, "INCOMPLETE"), (None, 1, "FAIL")])
 def test_func_phase_status(tmp_path, verdict, rc, want):
