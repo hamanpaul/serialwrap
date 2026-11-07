@@ -1283,6 +1283,198 @@ fn wp53_wait_passthrough_reboot_flag_uses_full_deadline() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-3 第 3 項：旗標命令取得 actor reboot arming 與完成後 gate（G3；Python
+// `origin/main:sw_core/session_manager.py:6412-6447`、`:6462-6473`）。`_handle_reboot_command` 不分旗標或猜中：
+// 送出前 `invalidate_deferred("reboot")`；TX 已提交（confirmed > 0 或 unknown）後於同一寫入鎖內 `arm_boot_quiet()`；
+// prompt 回來只 `clear_boot_quiet()`，不 confirm ready（#162）。
+// ---------------------------------------------------------------------------
+
+/// 旗標串接命令的 TX 停在提交前：quiet／reconfirm 不得提前 arm；放行並實際提交後兩者都成立（fence 與公開狀態）。
+#[test]
+fn wp53_arm_flag_after_tx_submission() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    assert!(
+        h.dev.wait_paused(Duration::from_secs(2)),
+        "旗標命令 TX 應進入 PAL"
+    );
+    let s = h.get_state();
+    assert_eq!(
+        s["boot_quiet_remaining_s"],
+        PyValue::Null,
+        "TX 提交前不得 arm quiet：{s:?}"
+    );
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(false),
+        "TX 提交前不得 arm reconfirm：{s:?}"
+    );
+    assert!(!h.fence.with(|f| f.quiet_active || f.reconfirm_pending));
+    h.dev.release_pause();
+    // 審查 F14：fence 由 TxWriter 於提交的同一次 Fence 臨界區設定，actor 隨後同步 QuietState——兩者都要等到。
+    h.wait_for("旗標命令 TX 提交後 arm quiet 與 reconfirm", |h| {
+        let s = h.get_state();
+        h.fence.with(|f| f.quiet_active && f.reconfirm_pending)
+            && s["boot_quiet_remaining_s"] != PyValue::Null
+            && s["ready_reconfirm_pending"] == PyValue::Bool(true)
+    });
+    assert!(wal_tx_has(&h, b"echo a && reboot\n"));
+    advance_until(&h, Duration::from_millis(100), "旗標命令收尾", |h| {
+        is_done(h, &id)
+    });
+    let rec = h.command_get(&id);
+    assert_eq!(
+        rec["recovery_action"],
+        PyValue::from("EXPECT_REBOOT"),
+        "{rec:?}"
+    );
+    assert_eq!(state_of(&h), "RECOVERING");
+}
+
+/// 對照 `tests/test_expect_reboot.py::test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery`：
+/// 旗標串接命令 3 s 後 prompt 回來 → 正常完成，但只清 TX 靜默維度、`ready_reconfirm_pending` 保留（#162）；
+/// 下一筆 shell agent 命令被 gate 擋為 `AUTOBOOT_QUIET`（retry 5.0），零新增 UART TX。
+#[test]
+fn wp53_arm_flag_prompt_keeps_reconfirm() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev
+        .on_tx_reply(b"echo a && reboot\n", b"echo a && reboot\r\na\r\n");
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 6.0;
+        r.expect_reboot = true;
+    });
+    let start = wp53_wait_started(&h, b"echo a && reboot\n");
+    let early = wp53_step_until(&h, start, 3.0, |h| is_done(h, &id));
+    assert_eq!(early, None, "prompt 未回不得結算：{:?}", h.command_get(&id));
+    h.inject_rx(WP53_PROMPT);
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"), "{s:?}");
+    assert_eq!(s["boot_quiet_remaining_s"], PyValue::Null, "quiet 清除：{s:?}");
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "#162：prompt 回來不是 READY 再確認證據，pending 保留：{s:?}"
+    );
+    assert!(!h.fence.with(|f| f.quiet_active), "TX 靜默維度清除");
+    assert!(h.fence.with(|f| f.reconfirm_pending), "fence reconfirm 保留");
+
+    let submits = h.dev.os_submits();
+    let _ = h.dev.take_tx();
+    let next = h.request(SessionRequest::Submit(agent_submit("ls")));
+    assert_eq!(next["error_code"], PyValue::from("AUTOBOOT_QUIET"), "{next:?}");
+    assert_eq!(next["retry_after_s"], PyValue::from(5.0), "{next:?}");
+    assert!(next.get("cmd_id").is_none(), "{next:?}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(h.dev.os_submits(), submits, "被 gate 擋下：零新增 OS 提交");
+    assert!(h.dev.take_tx().is_empty(), "被 gate 擋下：零新增 UART TX");
+    assert!(!wal_tx_has(&h, b"ls\n"));
+}
+
+/// 對照（`reboot_not_submitted_does_not_arm_quiet_e2e` 的旗標版）：旗標串接命令的 TX 在提交點被撤銷、零 OS 提交 →
+/// 不 arm quiet／reconfirm、不進 RECOVERING（Python 只在 `confirmed > 0 or outcome == "unknown"` 時 arm）。
+#[test]
+fn wp53_arm_flag_not_submitted_does_not_arm() {
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.timeout_s = 1.0;
+        r.expect_reboot = true;
+    });
+    assert!(h.dev.wait_paused(Duration::from_secs(2)));
+    let submits = h.dev.os_submits();
+    h.fence.with(|f| {
+        // tombstone 上限 512、FIFO 淘汰（#38）：撤銷全部 rig 內可能的 op id（皆 < 512）。
+        for n in 0..sw_core::tx_writer::CANCELLED_OPS_MAX as u64 {
+            f.cancelled.insert(OpId(n));
+        }
+    });
+    h.dev.release_pause();
+    let rec = h.wait_done(&id);
+    h.fence.with(|f| f.cancelled.clear());
+    assert_eq!(rec["error_code"], PyValue::from("FLUSHED_BY_RECOVERY"), "{rec:?}");
+    assert_eq!(h.dev.os_submits(), submits, "提交點被拒：零 OS 提交");
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"), "{s:?}");
+    assert_eq!(s["boot_quiet_remaining_s"], PyValue::Null, "{s:?}");
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(false), "{s:?}");
+    assert!(!h.fence.with(|f| f.quiet_active || f.reconfirm_pending));
+    assert!(!wal_tx_has(&h, b"echo a && reboot\n"));
+}
+
+/// 出列決策（sans-IO）：旗標串接命令與猜中的 `reboot` 同樣在送出前失效 deferred 輸入（BC-02 `RebootCommand`）、
+/// 登記 `reboot_arm_op`，TX 結算後再失效一次（`QuietRearm`），reboot 在途的 human 按鍵不得回放；
+/// 無旗標的同一命令三者皆不發生。
+#[test]
+fn wp53_arm_flag_invalidates_deferred_and_registers_arm_op() {
+    use sw_core::op_runner::OpSpec;
+
+    for flag in [true, false] {
+        let case = format!("expect_reboot={flag}");
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        h.attach_pty_console("c1", true);
+        let e0 = h.core.generations().input_epoch;
+        let mut req = agent_submit(WP53_CHAINED);
+        req.expect_reboot = flag;
+        let (resp, effects) = h.rpc_full(SessionRequest::Submit(req));
+        assert_eq!(resp.expect("submit")["ok"], PyValue::Bool(true), "{case}");
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StartOp {
+                    grant,
+                    spec: OpSpec::Command(_),
+                } => Some(grant.op_id),
+                _ => None,
+            })
+            .expect("READY 空佇列應立即出列");
+        let bumped = u64::from(flag);
+        assert_eq!(
+            h.core.generations().input_epoch,
+            e0 + bumped,
+            "{case}：送出前失效（RebootCommand）"
+        );
+        assert_eq!(
+            h.fence.with(|f| f.reboot_arm_op),
+            flag.then_some(op_id),
+            "{case}：TxWriter 提交點 arming 登記"
+        );
+        h.input("c1", b"k");
+        assert_eq!(h.deferred_len("c1"), 1, "{case}：agent 命令期間按鍵進 deferred");
+        let epoch = h.epoch();
+        h.feed(ControlEvent::UartTxCompleted {
+            epoch,
+            op_id,
+            confirmed_bytes: WP53_CHAINED.len() + 1,
+            unknown: false,
+        });
+        assert_eq!(
+            h.core.generations().input_epoch,
+            e0 + 2 * bumped,
+            "{case}：TX 結算 arm quiet 為第二個失效點"
+        );
+        assert_eq!(
+            h.deferred_len("c1"),
+            if flag { 0 } else { 1 },
+            "{case}：reboot 在途期間的按鍵被清掉"
+        );
+        assert_eq!(
+            h.public()["ready_reconfirm_pending"],
+            PyValue::Bool(flag),
+            "{case}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // recover
 // ---------------------------------------------------------------------------
 

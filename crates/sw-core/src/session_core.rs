@@ -4345,7 +4345,12 @@ impl SessionCore {
                 self.create_background_capture(&command.cmd_id, now);
                 self.background_cmd_ids.push(command.cmd_id.clone());
             }
-            let reboot = !self.is_passthrough() && is_reboot_command(&command.req.command);
+            // G3（Python `session_manager.py:6840-6868`）：與 `OpRunner::run_command` 相同的 reboot 判定——
+            // `expect_reboot` 不看命令文字、不排除 passthrough；命令文字猜法只對非 passthrough 生效。此值一致流入
+            // 送出前的 deferred 失效、`PendingOp::Command.reboot`（完成後只清 quiet）、`foreground_reboot`
+            // （TX 結算 arm）與 TxWriter 的 `reboot_arm_op`（Python `_handle_reboot_command` 不分旗標或猜中）。
+            let reboot = command.req.expect_reboot
+                || (!self.is_passthrough() && is_reboot_command(&command.req.command));
             self.command_fg_begin(&command.req.origin, false);
             self.fg_cmd_timeout_s = command.req.timeout_s;
             if reboot {
