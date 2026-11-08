@@ -3450,6 +3450,13 @@ impl SessionManager {
         sids
     }
 
+    /// 只供測試（test-fakes）：manager 累計啟動過的 session actor 與 attach worker thread 數（P8 Task 12：
+    /// stopping gate 之後不得再增加，Phase 1 之後的熱插或延後 reconcile 不得新增未納入 drain 的 worker）。
+    #[cfg(feature = "test-fakes")]
+    pub fn spawned_worker_count(&self) -> usize {
+        todo!("P8-T12")
+    }
+
     /// 只供測試（test-fakes）：session 的 fence `wal_unhealthy`（`None`＝查無 session）。
     #[cfg(feature = "test-fakes")]
     pub fn session_fence_wal_unhealthy(&self, selector: &str) -> Option<bool> {

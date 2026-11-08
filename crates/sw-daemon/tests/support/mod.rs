@@ -654,6 +654,9 @@ pub enum Fixture {
     BlockForeverWriter,
     /// WAL sync 每次失敗（FakeWalFs 故障注入）。
     WalSyncFailure,
+    /// `BlockForeverWriter`＋`WalSyncFailure` 同時注入，但不起夾具驅動 thread（P8 Task 12 多重失敗累積：
+    /// 由測試自行等 READY、提交卡住的命令並送 `daemon.stop`）。
+    BlockForeverWriterWalSyncFailure,
 }
 
 /// 建立 in-process 測試用的 `sw_pal::Platform`：環境變數取自 `vars`（不改動行程環境）、裝置來源為 `devices`、夾具為 `fixture`。
@@ -681,6 +684,8 @@ pub struct InProcHandles {
     pub devices: Vec<sw_pal::fakes::serial::FakeDevice>,
     /// daemon 建立裝置來源後才有值（`p.devices` 工廠被呼叫時）；`set` 改寫之後每輪掃描的快照。
     pub script: std::sync::Arc<std::sync::Mutex<Option<sw_pal::fakes::FakeDeviceScript>>>,
+    /// 假序列埠後端本體（另行登錄裝置、例如同一 by_id 改指的新 real_path）。
+    pub serial: std::sync::Arc<sw_pal::fakes::FakeSerialBackend>,
 }
 
 /// 同 `in_process_platform`，另回傳替身控制柄（行為與 `in_process_platform` 完全相同）。
@@ -722,7 +727,7 @@ pub fn in_process_platform_with_handles(
     if let Some(dev) = &first_dev {
         let step = match fixture {
             Fixture::ReadyShellBlockingWithQueue => Some(FakeWriteStep::BlockUntilCancel { accept_before_cancel: 0 }),
-            Fixture::BlockForeverWriter => Some(FakeWriteStep::BlockForever),
+            Fixture::BlockForeverWriter | Fixture::BlockForeverWriterWalSyncFailure => Some(FakeWriteStep::BlockForever),
             _ => None,
         };
         if let Some(step) = step {
@@ -744,7 +749,7 @@ pub fn in_process_platform_with_handles(
     *env.vars.lock().unwrap() = vars.clone();
     let mut p = sw_pal::native();
     p.env = Arc::new(env);
-    p.serial = serial;
+    p.serial = serial.clone();
     p.uart_excl = Arc::new(FakeUartExclusive { report: Default::default() });
     let snapshot = devices.clone();
     let script: Arc<std::sync::Mutex<Option<sw_pal::fakes::FakeDeviceScript>>> = Arc::new(std::sync::Mutex::new(None));
@@ -754,7 +759,7 @@ pub fn in_process_platform_with_handles(
         *script_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Box::new(source)
     });
-    if fixture == Fixture::WalSyncFailure {
+    if matches!(fixture, Fixture::WalSyncFailure | Fixture::BlockForeverWriterWalSyncFailure) {
         p.wal_fs = Arc::new(SyncFailWalFs(p.wal_fs.clone()));
     }
 
@@ -778,7 +783,7 @@ pub fn in_process_platform_with_handles(
         }
         _ => {}
     }
-    (p, InProcHandles { devices: all_devs, script })
+    (p, InProcHandles { devices: all_devs, script, serial })
 }
 
 /// 輪詢 session 狀態（in-process 夾具驅動 thread 用；逾時 panic）。

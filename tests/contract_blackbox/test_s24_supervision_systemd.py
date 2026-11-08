@@ -3,7 +3,8 @@ artifact 同檔各跑一次）。
 
 案例（tests/acceptance/cases.yaml，Slice 2.4 凍結時登記的節點）：
 - `s24-sup-systemd-runtime`：`test_sigterm_ordered_shutdown`、`test_restart_on_failure_keeps_released_and_wal_seq`；
-  計畫表另列 `test_stop_during_push_flushes_wal`（file push 進行中 `systemctl --user stop`）。
+  計畫表另列 `test_stop_during_push_flushes_wal`（file push 進行中 `systemctl --user stop`）與
+  `test_stop_during_flashing_removes_ttymcu`（FLASHING 中 `systemctl --user stop`，fakemcu＋fakeflasher）。
 
 daemon 以 transient `systemd --user` unit 執行（`systemd-run --user`，`Restart=on-failure`、`ExecStopPost` 記錄
 `$EXIT_CODE:$EXIT_STATUS`）；不改動擁有者既有的 `serialwrap` unit。throwaway daemon 的 RUN／STATE／WAL／BY_ID／
@@ -33,12 +34,16 @@ import pytest
 from pathlib import Path
 
 from bb_harness import is_rust
+from p8_fixtures import FakeFlasher
 
 pytestmark = [pytest.mark.posix_only, pytest.mark.supervisor_runtime, pytest.mark.posix_pty]
 
 # 停止序上限：flash join 2.0 s＋步驟 3～5 共用 5 s（計畫 Task 12）。
 STOP_CAP_S = 7.0
 OD62_ABORT_CODES = {"COMMAND_ABORTED_IN_FLIGHT", "FLUSHED_BY_RECOVERY"}
+# fakemcu（ti-cc26xx）的 sync 與 ACK（同 test_s24_flash_endpoint.py）。
+SYNC = b"\x55\x55"
+ACK = b"\x00\xcc"
 
 
 def _systemd_user_ok() -> bool:
@@ -165,3 +170,26 @@ def test_stop_during_push_flushes_wal(sw_env, shell_target, transient_unit, tmp_
         Path(remote).unlink(missing_ok=True)
         for name in set(re.findall(rb"/tmp/\.sw_upload_[0-9a-f]{12}", shell_target.rx_log())):
             Path(name.decode("ascii")).unlink(missing_ok=True)
+
+
+def test_stop_during_flashing_removes_ttymcu(sw_env, fake_mcu, transient_unit):
+    """FLASHING 中 `systemctl --user stop`：exit 0、`ttyMCU` link 已移除；重啟後 session 為 ATTACHED（FLASHING 不持久化）。"""
+    sw_env.prepare(targets={"COM0": fake_mcu}, profile="passthrough")
+    transient_unit.start()
+    sw_env.wait_state("COM0", "ATTACHED", timeout=20)
+    link = sw_env.run_dir / "dev" / "ttyMCU"
+    sw_env.wait_until(link.is_symlink, timeout=10)
+    fl = FakeFlasher(link, baud=115200)
+    try:
+        fl.write(SYNC)
+        assert fl.read_exact(2, timeout=3.0) == ACK, "認線後回放 MCU ACK"
+        assert sw_env.session("COM0")["state"] == "FLASHING"
+        took = transient_unit.stop()               # flasher 仍持有端點
+        assert transient_unit.last_status() == "exited:0", (transient_unit.last_status(), took)
+        assert not link.is_symlink() and not link.exists(), "停止後 ttyMCU link 已移除"
+    finally:
+        fl.close()
+    transient_unit.start()
+    sw_env.wait_state("COM0", "ATTACHED", timeout=20)
+    assert sw_env.rpc("mcu.status", {})["flashing"] is False, "FLASHING 不跨重啟持久化"
+    sw_env.wait_until(link.is_symlink, timeout=10)

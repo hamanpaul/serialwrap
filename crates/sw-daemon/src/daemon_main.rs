@@ -913,7 +913,7 @@ enum Stage {
     FlashStopped { joined: bool, unlinked: bool },
     DrainPhase1,
     HandlersJoined { pending: Vec<String> },
-    DrainPhase2 { stalled: Vec<String> },
+    DrainPhase2 { stalled: Vec<String>, drained: Vec<(String, bool)> },
     SessionsDrained { flushed: Vec<(String, String)>, stalled: Vec<String> },
     EngineStopped { unreaped: Vec<String> },
     WalShutdown { ok: bool },
@@ -930,6 +930,8 @@ struct Hooks {
     trace: Option<Box<dyn Fn(Stage) + Send + Sync>>,
     /// 每筆 RPC 分派前以 method 名呼叫（test-fakes `DaemonHooks::rpc_call`）。
     rpc_call: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// `SessionManager` 建立後呼叫一次（test-fakes `DaemonHooks::on_manager`）。
+    on_manager: Option<Box<dyn Fn(Arc<SessionManager>) + Send + Sync>>,
 }
 
 /// `Hooks::rpc_call` 的分派包裝：先呼叫掛鉤再交給實際 handler（產品 build 不建立）。
@@ -1128,6 +1130,9 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         fs: p.fs.clone(),
         warn: warn.clone(),
     });
+    if let Some(hook) = &hooks.on_manager {
+        hook(manager.clone());
+    }
     if let Some(msg) = manager.startup_error() {
         // Python `SessionManager.__init__` 的 `_save_state` 拋出未捕捉例外（孤立 surrogate 的 UnicodeEncodeError）：
         // 尚未掃描／attach、state.json 不動、rc 1（審查 47c7b25 #1）。
@@ -1322,6 +1327,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     let stalled: Vec<String> = drained.iter().filter(|(_, ok)| !ok).map(|(s, _)| s.clone()).collect();
     hooks.trace(Stage::DrainPhase2 {
         stalled: stalled.clone(),
+        drained: drained.clone(),
     });
     // 5 收尾：Python `service.stop()` 於 drain 後對每個 session `unregister_session(sid, "FLUSHED_BY_SHUTDOWN")`，
     // 終結 Phase 1 之後才登錄、仍為 accepted 的命令。
@@ -1440,8 +1446,9 @@ pub enum TraceEvent {
     DrainPhase1,
     /// 4 `server.join_handlers`：逾時仍在執行的 method（收斂時為空）。
     HandlersJoined { pending: Vec<String> },
-    /// 5 `drain.phase2`：未回條的 drain 目標。
-    DrainPhase2 { stalled: Vec<String> },
+    /// 5 `drain.phase2`：未回條的 drain 目標，與完整回條集合（`(drain 目標, 是否收斂)`，含在途 attach 的
+    /// `attach:<by_id>`）。
+    DrainPhase2 { stalled: Vec<String>, drained: Vec<(String, bool)> },
     /// 5 `flush_shutdown`：本次停機新增的 `FLUSHED_BY_SHUTDOWN` 命令與未回條目標。
     SessionsDrained { flushed: Vec<(String, String)>, stalled: Vec<String> },
     /// 5a `engine.stop`：未回收的 event handler（rule id）。
@@ -1498,7 +1505,7 @@ impl From<Stage> for TraceEvent {
             Stage::FlashStopped { joined, unlinked } => TraceEvent::FlashStopped { joined, unlinked },
             Stage::DrainPhase1 => TraceEvent::DrainPhase1,
             Stage::HandlersJoined { pending } => TraceEvent::HandlersJoined { pending },
-            Stage::DrainPhase2 { stalled } => TraceEvent::DrainPhase2 { stalled },
+            Stage::DrainPhase2 { stalled, drained } => TraceEvent::DrainPhase2 { stalled, drained },
             Stage::SessionsDrained { flushed, stalled } => TraceEvent::SessionsDrained { flushed, stalled },
             Stage::EngineStopped { unreaped } => TraceEvent::EngineStopped { unreaped },
             Stage::WalShutdown { ok } => TraceEvent::WalShutdown { ok },
@@ -1524,6 +1531,8 @@ pub struct DaemonHooks {
     pub trace: Option<Box<dyn Fn(TraceEvent) + Send + Sync>>,
     pub block_flash_endpoint_stop: bool,
     pub rpc_call: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    /// `SessionManager` 建立後（任何掃描／attach 之前）呼叫一次，供停止序測試直接注入 watcher 事件與 control 事件。
+    pub on_manager: Option<Box<dyn Fn(Arc<SessionManager>) + Send + Sync>>,
 }
 
 /// in-process 執行 daemon（僅 `test-fakes` 編譯）；語意與 `run` 相同（含未攔截 panic → 1），另接受測試掛鉤。
@@ -1535,6 +1544,7 @@ pub fn run_with_hooks(argv: Vec<String>, platform: Platform, hooks: DaemonHooks)
         trace,
         block_flash_endpoint_stop,
         rpc_call,
+        on_manager,
     } = hooks;
     let mut platform = platform;
     if block_flash_endpoint_stop {
@@ -1545,6 +1555,7 @@ pub fn run_with_hooks(argv: Vec<String>, platform: Platform, hooks: DaemonHooks)
         after_release_commit: after_state_commit.map(Arc::from),
         trace: trace.map(|t| -> Box<dyn Fn(Stage) + Send + Sync> { Box::new(move |s| t(TraceEvent::from(s))) }),
         rpc_call: rpc_call.map(Arc::from),
+        on_manager,
     };
     run_guarded(argv, platform, inner)
 }

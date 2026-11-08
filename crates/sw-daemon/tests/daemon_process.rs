@@ -350,7 +350,10 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
             TraceEvent::FlashStopped { joined: true, unlinked: true },
             TraceEvent::DrainPhase1,
             TraceEvent::HandlersJoined { pending: vec![] },
-            TraceEvent::DrainPhase2 { stalled: vec![] },
+            TraceEvent::DrainPhase2 {
+                stalled: vec![],
+                drained: vec![("t:COM0".to_string(), true)],
+            },
             TraceEvent::SessionsDrained {
                 flushed: vec![
                     (c2, "FLUSHED_BY_SHUTDOWN".to_string()),
