@@ -1363,6 +1363,164 @@ fn wp56_detach_clears_evidence_wait() {
     assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(false));
 }
 
+/// async reboot（等待 60 s 起算）後以有 worker 的 clear 讓 session 進 Attaching、開埠在途，在此窗口送入 `queue` 的事件
+/// （Rust `pending_open_stop`，即 Python attach op 在途、`session.bridge is None` 的窗口）。排程：暫停在 clear 的 drain
+/// 回條（`WorkerStopped`）前，改掛「下一筆 Control」暫停後放行——`request_reattach` 的 `Effect::Reattach` 由替身回送
+/// `DeviceAttached`，actor 停在它之前時排入 `queue`；放行後 `device_attached` 的 OpenBridge 於 actor thread 同步執行，
+/// `BridgeOpened` 落在 control lane 末端，已排入的事件（safety lane 優先、control lane FIFO）因此在開埠收斂前處理。
+/// `queue` 之後、放行之前呼叫 `before_resume`（例如讓開埠失敗）。回傳暫停前的 open 次數與 TX 計數。
+fn wp56_stop_while_attaching(
+    h: &ActorRig,
+    queue: impl FnOnce(&ActorRig),
+    before_resume: impl FnOnce(&ActorRig),
+) -> (usize, (usize, usize, usize)) {
+    wp56_async_reboot(h, "reboot", false);
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0)
+    );
+    let opens = h.dev.open_count();
+    let tx = wp56_tx_counts(h);
+    let receipt = h.pause_before_event("WorkerStopped");
+    let clear = h.request_async(SessionRequest::Clear);
+    receipt
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("clear 應進入 drain 回條");
+    let attached = h.pause_before_event("Control");
+    receipt.resume.send(()).expect("放行 drain 回條");
+    attached
+        .entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Reattach 應回送 DeviceAttached");
+    queue(h);
+    // 送入的事件須在放行前已入列。
+    std::thread::sleep(Duration::from_millis(30));
+    before_resume(h);
+    attached.resume.send(()).expect("放行 DeviceAttached");
+    let r = clear
+        .recv_timeout(Duration::from_secs(5))
+        .expect("clear 應收斂")
+        .expect("clear 不應丟例外");
+    assert_eq!(r["ok"], PyValue::Bool(true), "{r:?}");
+    (opens, tx)
+}
+
+#[test]
+fn wp56_release_during_attaching_clears_evidence_wait() {
+    // 審查 P8-21072a2-1：Python `_finish_attach_op`（`origin/main:sw_core/session_manager.py:4339-4344`）——attach op 在途
+    // 收到 release，`release_request` 分支以 `_detach_session_locked`（`:2704`）同步 detach、歸零
+    // `boot_evidence_wait_until`；quiet／READY reconfirm 照既有規則保留。Rust 對應：`pending_open_stop`（kind=Release）
+    // 於開埠收斂時——成功走 `drain_opened_bridge`、失敗走 `finish_pending_open_stop`——都要歸零。
+
+    // (1) 開埠成功：bridge 立即進 drain（`drain_opened_bridge`）→ RELEASED。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let release = RefCell::new(None);
+    let (opens, tx) = wp56_stop_while_attaching(
+        &h,
+        |h| {
+            *release.borrow_mut() = Some(h.request_async(SessionRequest::Release {
+                source: "cli".into(),
+                reason: PyValue::Null,
+            }));
+        },
+        |_| {},
+    );
+    let r = release
+        .into_inner()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 應收斂")
+        .expect("release 不應丟例外");
+    assert_eq!(r["ok"], PyValue::Bool(true), "{r:?}");
+    h.wait_state("RELEASED");
+    assert_eq!(
+        h.dev.open_count(),
+        opens + 1,
+        "clear 收斂後確實重開 bridge，release 落在開埠在途窗口（`drain_opened_bridge`）"
+    );
+    let s = h.get_state();
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "開埠在途的 release 同步 detach 歸零等待（`_finish_attach_op` → `_detach_session_locked`）"
+    );
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "只清等待，reconfirm 保存規則不變"
+    );
+    assert_eq!(wp56_tx_counts(&h), tx, "整段零 TX（重開的 bridge 立即 drain、不登入不 probe）");
+
+    // (2) 開埠失敗：`finish_pending_open_stop` → RELEASED。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let release = RefCell::new(None);
+    let (opens, tx) = wp56_stop_while_attaching(
+        &h,
+        |h| {
+            *release.borrow_mut() = Some(h.request_async(SessionRequest::Release {
+                source: "cli".into(),
+                reason: PyValue::Null,
+            }));
+        },
+        |h| h.dev.remove(),
+    );
+    let r = release
+        .into_inner()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(5))
+        .expect("release 應收斂")
+        .expect("release 不應丟例外");
+    assert_eq!(r["ok"], PyValue::Bool(true), "{r:?}");
+    h.wait_state("RELEASED");
+    assert_eq!(h.dev.open_count(), opens, "開埠失敗（NotFound），未接上新 bridge");
+    let s = h.get_state();
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "開埠失敗的收斂同樣歸零等待（`_finish_attach_op` 於 open 例外後亦執行）"
+    );
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true));
+    assert_eq!(wp56_tx_counts(&h), tx, "整段零 TX");
+}
+
+#[test]
+fn wp56_removed_during_attaching_clears_evidence_wait() {
+    // 審查 P8-21072a2-1 同一缺口的拔除面：Python `_detach_by_id`（`origin/main:sw_core/session_manager.py:4462-4470`）
+    // 在 `session.bridge is None`（attach op 在途）時 `_begin_drain_locked` 回 None，改以 `_detach_session_locked`
+    // 同步 detach、歸零 `boot_evidence_wait_until`。Rust 對應：`pending_open_stop`（kind=Removed）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let (opens, tx) = wp56_stop_while_attaching(
+        &h,
+        |h| {
+            h.send_control(ControlEvent::DeviceDetached {
+                by_id: DEVICE_BY_ID.into(),
+                reason: sw_core::mailbox::DetachReason::Removed,
+            })
+        },
+        |_| {},
+    );
+    h.wait_state("DETACHED");
+    assert_eq!(
+        h.dev.open_count(),
+        opens + 1,
+        "拔除落在 clear 重開 bridge 的開埠在途窗口"
+    );
+    let s = h.get_state();
+    assert_eq!(s["last_error"], PyValue::from("DEVICE_REMOVED"));
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "bridge 尚未接上的拔除為同步 detach，歸零等待（`:4470` → `_detach_session_locked`）"
+    );
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "只清等待，reconfirm 保存規則不變"
+    );
+    assert_eq!(wp56_tx_counts(&h), tx, "整段零 TX");
+}
+
 #[test]
 fn wp56_plain_command_no_wait_and_chained_expect_reboot_starts_wait() {
     // `test_non_reboot_command_does_not_start_wait`／`test_execute_command_reboot_path_starts_wait`／

@@ -1242,6 +1242,12 @@ impl SessionCore {
                     self.set_state(SessionState::Recovering, now);
                 }
                 self.phase1_detach(&kind, already_released);
+                // G8（#243）：bridge 尚未接上時 clear（`session_manager.py:3059`）與拔除／重綁（`:4470`，
+                // `_begin_drain_locked` 無 bridge 回 None）都在請求當下以 `_detach_session_locked`（`:2704`）同步
+                // 歸零證據等待；release 改在開埠收斂時歸零（`_finish_attach_op` `:4344`），見 `drain_opened_bridge`。
+                if matches!(kind, StopKind::Clear | StopKind::Removed | StopKind::Rebound) {
+                    self.quiet.boot_evidence_wait_until = 0;
+                }
                 if kind == StopKind::Release {
                     if let Some(pending_attach) = self.pending_attach.take() {
                         effects.push(Effect::Reply(
@@ -1346,9 +1352,11 @@ impl SessionCore {
         let mut effects = Vec::new();
         self.reattach_pending = false;
         // G8（#243）：無 bridge 的同步 detach＝Python `_detach_session_locked`（`session_manager.py:2704`），歸零非同步
-        // reboot 的證據等待；quiet／READY reconfirm 照既有規則保留。呼叫端只有 clear（`:3059`）、release（`:3177`）、
-        // 拔除／重綁（`:4470`）；shutdown（`stop()` 無 bridge 不 detach）、bind 與已 RELEASED 的冪等 release 不清。
-        // 有 worker 的 drain 收斂（`_complete_drain` `:2884-2960`）不碰此欄，見 `worker_stopped`。
+        // reboot 的證據等待；quiet／READY reconfirm 照既有規則保留。呼叫端有 clear（`:3059`）、release（`:3177`）、
+        // 開埠在途的 release（`_finish_attach_op` `:4344`）、拔除／重綁（`:4470`）；shutdown（`stop()` 無 bridge 不
+        // detach）、bind 與已 RELEASED 的冪等 release 不清。開埠在途（`pending_open_stop`）的對應見 `begin_stop`、
+        // `drain_opened_bridge` 與 `finish_pending_open_stop`；有 worker 的 drain 收斂（`_complete_drain`
+        // `:2884-2960`）不碰此欄，見 `worker_stopped`。
         let detaches = match kind {
             StopKind::Clear | StopKind::Removed | StopKind::Rebound => true,
             StopKind::Release => self.state != SessionState::Released,
@@ -2392,6 +2400,12 @@ impl SessionCore {
         let stalled = pending.stalled;
         let already_released = pending.already_released;
         let post_kind = pending.post_kind;
+        // G8（#243）：開埠在途收到的 release＝Python `_finish_attach_op`（`session_manager.py:4339-4344`）的
+        // `release_request` 分支，以 `_detach_session_locked`（`:2704`）同步 detach、歸零證據等待；已 RELEASED 的
+        // 冪等 release 不 detach。之後的 drain 收斂（`worker_stopped`）照 `_complete_drain` 不再碰此欄。
+        if kind == StopKind::Release && !already_released {
+            self.quiet.boot_evidence_wait_until = 0;
+        }
         let OpenedBridge {
             epoch,
             worker,
@@ -2458,6 +2472,9 @@ impl SessionCore {
                     })
                     .collect();
             }
+            // G8（#243）：開埠失敗後同樣走 `_finish_attach_op` 的 release 同步 detach（`session_manager.py:4344`），
+            // 歸零證據等待；clear／拔除／重綁已在 `begin_stop` 建立 pending 時歸零。
+            self.quiet.boot_evidence_wait_until = 0;
             self.finish_release(now);
             return self.persist_release(
                 pending
