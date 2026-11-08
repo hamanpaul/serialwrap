@@ -4748,6 +4748,7 @@ fn wp58_rpc_device_attach_during_release_returns_session_recovering() {
 }
 
 const WP510_PLACEHOLDER_SID: &str = "gone-template:COM3";
+const WP510_PLACEHOLDER_ALIAS: &str = "gone-template+4";
 const WP510_PLACEHOLDER_BY_ID: &str = "/s/by-id/usb-G";
 const WP510_FREE_BY_ID: &str = "/s/by-id/usb-C";
 const WP510_REAL_G: &str = "/fake/tty-G";
@@ -5199,68 +5200,65 @@ fn wp510_rpc_bind_then_device_attach_replaces_placeholder() {
 
 #[test]
 fn wp510_rpc_placeholder_offline_and_held_remain_blocked() {
-    let offline = wp510_b_placeholder_rig();
-    let snapshot: Vec<_> = offline
-        .mgr
-        .list_devices()
-        .into_iter()
-        .filter_map(|row| {
-            let by_id = s(&row, "by_id").to_string();
-            (by_id != WP510_PLACEHOLDER_BY_ID).then(|| {
-                let real_path = s(&row, "real_path").to_string();
-                (by_id.clone(), DeviceInfo { by_id, real_path })
+    for selector in [WP510_PLACEHOLDER_SID, "COM3", WP510_PLACEHOLDER_ALIAS] {
+        let offline = wp510_b_placeholder_rig();
+        let snapshot: Vec<_> = offline
+            .mgr
+            .list_devices()
+            .into_iter()
+            .filter_map(|row| {
+                let by_id = s(&row, "by_id").to_string();
+                (by_id != WP510_PLACEHOLDER_BY_ID).then(|| {
+                    let real_path = s(&row, "real_path").to_string();
+                    (by_id.clone(), DeviceInfo { by_id, real_path })
+                })
             })
-        })
-        .collect();
-    offline.mgr.update_devices(&snapshot);
-    let offline_response = offline.call(
-        "device.attach",
-        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
-    );
-    let offline_expected = sw_proto::pydict! {
-        "ok" => false,
-        "error_code" => "DEVICE_NOT_PRESENT",
-        "selector" => "COM3",
-        "device_by_id" => WP510_PLACEHOLDER_BY_ID,
-        "version" => offline.version.clone(),
-    };
-    assert_eq!(
-        j(&offline_response),
-        j(&offline_expected),
-        "離線 device.attach RPC bytes"
-    );
-    assert_eq!(
-        offline.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
-        Some(true),
-        "離線裝置必須保留佔位"
-    );
-    assert_eq!(offline.device(WP510_REAL_G).open_count(), 0);
+            .collect();
+        offline.mgr.update_devices(&snapshot);
+        let offline_response =
+            offline.call("device.attach", &format!(r#"{{"selector":"{selector}"}}"#));
+        let offline_expected = sw_proto::pydict! {
+            "ok" => false,
+            "error_code" => "DEVICE_NOT_PRESENT",
+            "selector" => selector,
+            "device_by_id" => WP510_PLACEHOLDER_BY_ID,
+            "version" => offline.version.clone(),
+        };
+        assert_eq!(
+            j(&offline_response),
+            j(&offline_expected),
+            "離線 device.attach RPC bytes（selector={selector}）"
+        );
+        assert_eq!(
+            offline.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+            Some(true),
+            "離線裝置必須保留佔位"
+        );
+        assert_eq!(offline.device(WP510_REAL_G).open_count(), 0);
 
-    let held = wp510_b_placeholder_rig();
-    held.excl.hold(WP510_REAL_G, vec![771]);
-    let held_response = held.call(
-        "device.attach",
-        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
-    );
-    let held_expected = sw_proto::pydict! {
-        "ok" => false,
-        "error_code" => "DEVICE_STILL_HELD",
-        "pids" => PyValue::List(vec![PyValue::from(771)]),
-        "holder_unknown" => false,
-        "selector" => "COM3",
-        "version" => held.version.clone(),
-    };
-    assert_eq!(
-        j(&held_response),
-        j(&held_expected),
-        "holder device.attach RPC bytes"
-    );
-    assert_eq!(
-        held.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
-        Some(true),
-        "holder 衝突必須保留佔位"
-    );
-    assert_eq!(held.device(WP510_REAL_G).open_count(), 0);
+        let held = wp510_b_placeholder_rig();
+        held.excl.hold(WP510_REAL_G, vec![771]);
+        let held_response = held.call("device.attach", &format!(r#"{{"selector":"{selector}"}}"#));
+        let held_expected = sw_proto::pydict! {
+            "ok" => false,
+            "error_code" => "DEVICE_STILL_HELD",
+            "pids" => PyValue::List(vec![PyValue::from(771)]),
+            "holder_unknown" => false,
+            "selector" => selector,
+            "version" => held.version.clone(),
+        };
+        assert_eq!(
+            j(&held_response),
+            j(&held_expected),
+            "holder device.attach RPC bytes（selector={selector}）"
+        );
+        assert_eq!(
+            held.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+            Some(true),
+            "holder 衝突必須保留佔位"
+        );
+        assert_eq!(held.device(WP510_REAL_G).open_count(), 0);
+    }
 }
 
 #[test]

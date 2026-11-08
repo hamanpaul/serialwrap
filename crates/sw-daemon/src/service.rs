@@ -317,8 +317,16 @@ impl Service {
     }
 
     /// selector → session 請求；查無 → `SESSION_NOT_FOUND`＋原 selector。
-    fn route(&self, selector: &str, req: SessionRequest, timeout: Duration) -> Result<PyDict, PyErr> {
+    fn route(
+        &self,
+        selector: &str,
+        req: SessionRequest,
+        timeout: Duration,
+    ) -> Result<PyDict, PyErr> {
         match self.manager.resolve(selector) {
+            Some(sid) if matches!(&req, SessionRequest::DeviceAttach { .. }) => self
+                .manager
+                .route_with_selector(&sid, req, timeout, selector),
             Some(sid) => self.manager.route(&sid, req, timeout),
             None => Ok(session_not_found(selector)),
         }

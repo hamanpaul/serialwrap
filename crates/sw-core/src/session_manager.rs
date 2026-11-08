@@ -1235,6 +1235,7 @@ impl Shared {
         self: &Arc<Self>,
         sid: &str,
         force: bool,
+        request_selector: Option<&str>,
     ) -> Result<PyDict, PyErr> {
         let (by_id, real, selector, uart, already_inflight) = {
             let inner = lock(&self.inner);
@@ -1245,18 +1246,20 @@ impl Shared {
                 return Ok(pydict! {
                     "ok" => false,
                     "error_code" => "SESSION_NOT_FOUND",
-                    "selector" => sid.to_string()
+                    "selector" => request_selector.unwrap_or(sid).to_string()
                 });
             };
             if !entry.released_placeholder {
                 return Ok(pydict! {
                     "ok" => false,
                     "error_code" => "SESSION_NOT_FOUND",
-                    "selector" => sid.to_string()
+                    "selector" => request_selector.unwrap_or(sid).to_string()
                 });
             }
             let by_id = entry.profile.device_by_id.clone();
-            let selector = entry.profile.com.clone();
+            let selector = request_selector
+                .unwrap_or(entry.profile.com.as_str())
+                .to_string();
             let Some(real) = inner.device_path(&by_id).map(str::to_string) else {
                 return Ok(device_not_present_reply(&selector, &by_id));
             };
@@ -1272,7 +1275,7 @@ impl Shared {
             return Ok(pydict! {
                 "ok" => false,
                 "error_code" => "SESSION_NOT_FOUND",
-                "selector" => sid.to_string()
+                "selector" => request_selector.unwrap_or(sid).to_string()
             });
         };
         if already_inflight {
@@ -2992,10 +2995,10 @@ impl SessionManager {
     }
 
     /// OD-63：以 manager device snapshot 重新開啟缺失 template 的 RELEASED 佔位，交給 dynamic template 偵測。
-    /// RPC 路由由後續接線項目呼叫；此入口可先由 manager 層回歸直接驗收。
+    /// manager 層直接回歸入口；正式 RPC 透過 `route_with_selector` 保留呼叫者輸入。
     pub fn attach_released_placeholder(&self, sid: &str, force: bool) -> Result<PyDict, PyErr> {
         self.pump();
-        self.shared.attach_released_placeholder(sid, force)
+        self.shared.attach_released_placeholder(sid, force, None)
     }
 
     /// 將 session 請求路由到對應 actor 並等待回覆。
@@ -3005,6 +3008,27 @@ impl SessionManager {
         req: SessionRequest,
         timeout: Duration,
     ) -> Result<PyDict, PyErr> {
+        self.route_inner(sid, req, timeout, None)
+    }
+
+    /// 保留 RPC 原始 selector 供需要回顯 selector 的專用路徑使用；actor 仍以 sid 路由。
+    pub fn route_with_selector(
+        &self,
+        sid: &str,
+        req: SessionRequest,
+        timeout: Duration,
+        selector: &str,
+    ) -> Result<PyDict, PyErr> {
+        self.route_inner(sid, req, timeout, Some(selector))
+    }
+
+    fn route_inner(
+        &self,
+        sid: &str,
+        req: SessionRequest,
+        timeout: Duration,
+        request_selector: Option<&str>,
+    ) -> Result<PyDict, PyErr> {
         self.pump();
         if let SessionRequest::DeviceAttach { force } = &req {
             let is_placeholder = lock(&self.shared.inner)
@@ -3013,7 +3037,9 @@ impl SessionManager {
                 .is_some_and(|entry| entry.released_placeholder);
             if is_placeholder {
                 // OD-63：只讓 RELEASED 佔位的 device.attach 走專用交接；一般 session 仍經 actor 與下方 stopping gate。
-                return self.shared.attach_released_placeholder(sid, *force);
+                return self
+                    .shared
+                    .attach_released_placeholder(sid, *force, request_selector);
             }
         }
         let stopping = lock(&self.shared.inner).stopping;
