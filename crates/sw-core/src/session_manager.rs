@@ -162,6 +162,9 @@ struct Entry {
     sid: String,
     profile: SessionProfile,
     profile_source: String,
+    /// OD-63：原 template 已不存在的 RELEASED session 佔位；不對外公開、不寫入 state.json。
+    #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
+    released_placeholder: bool,
     actor: Arc<ActorHandle>,
     #[cfg_attr(not(feature = "test-fakes"), allow(dead_code))]
     fence: Arc<Fence>,
@@ -632,6 +635,7 @@ impl Shared {
         inner: &mut Inner,
         profile: SessionProfile,
         profile_source: &str,
+        released_placeholder: bool,
         released: Option<&ReleasedRow>,
         detached_error: Option<String>,
         preopened: Option<Preopened>,
@@ -758,6 +762,7 @@ impl Shared {
                 sid: sid.clone(),
                 profile,
                 profile_source: profile_source.to_string(),
+                released_placeholder,
                 actor: Arc::new(actor),
                 fence,
                 io,
@@ -789,6 +794,7 @@ impl Shared {
             inner,
             profile,
             source,
+            false,
             None,
             detached_error,
             preopened,
@@ -1653,6 +1659,7 @@ impl Shared {
                     &mut inner,
                     profile.clone(),
                     "yaml-target",
+                    false,
                     released,
                     None,
                     None,
@@ -1690,18 +1697,23 @@ impl Shared {
                 .clone()
                 .or_else(|| detected.clone())
                 .unwrap_or_else(|| sid_profile.clone());
-            let mut tpl = self
+            let tpl = self
                 .template_by_name(&template_name)
                 .or_else(|| self.template_by_name(&sid_profile));
-            if tpl.is_none() && (sid_profile == "passthrough" || sid_profile == "others-template") {
-                // 舊 state.json 不保存 template 內容；只對無命令能力的通用 passthrough 名稱使用最小 profile。
-                tpl = Some(minimal_passthrough_template(&sid_profile));
-            }
-            let Some(tpl) = tpl else {
-                self.warn(format!(
-                    "released session 的 template 不存在（session={sid}、profile={template_name}），保留持久化阻擋"
-                ));
-                continue;
+            let released_placeholder =
+                tpl.is_none() && sid_profile != "passthrough" && sid_profile != "others-template";
+            let tpl = match tpl {
+                Some(tpl) => tpl,
+                None => {
+                    // 舊 state.json 不保存 template 內容；通用名稱沿用最小 passthrough，其他缺失 template
+                    // 以 RELEASED 佔位保存持久化阻擋，供後續 device.attach 解除（OD-63）。
+                    if released_placeholder {
+                        self.warn(format!(
+                            "released session 的 template 不存在（session={sid}、profile={template_name}），保留持久化阻擋"
+                        ));
+                    }
+                    minimal_passthrough_template(&sid_profile)
+                }
             };
             if sid_com.is_empty() {
                 self.warn(format!(
@@ -1748,6 +1760,7 @@ impl Shared {
                 &mut inner,
                 profile,
                 source,
+                released_placeholder,
                 Some(row),
                 None,
                 None,
@@ -3235,6 +3248,14 @@ impl SessionManager {
         let inner = lock(&self.shared.inner);
         let e = inner.resolve(selector)?;
         Some(e.fence.with(|f| f.wal_unhealthy))
+    }
+
+    /// 只供測試（test-fakes）：讀取 OD-63 RELEASED 佔位標記，不經 RPC 或持久化欄位公開。
+    #[cfg(feature = "test-fakes")]
+    pub fn released_placeholder(&self, selector: &str) -> Option<bool> {
+        lock(&self.shared.inner)
+            .resolve(selector)
+            .map(|e| e.released_placeholder)
     }
 
     /// 只供測試（test-fakes）：session 的 `last_error` 變更歷史（依發生順序）。

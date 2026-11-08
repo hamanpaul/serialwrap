@@ -4089,7 +4089,7 @@ git commit -m "feat(sw-core): SessionManager 裝置排序、動態 session 與�
 
 | # | 稽核來源 | 測試／要求 | 精確斷言或完成條件 |
 |---|---|---|---|
-| #14 | B:B-16 | `released_dynamic_materialize_template_fallback`、`released_dynamic_act_no_and_profile_source` | 重啟後動態 RELEASED session 的 template 後備、`act_no` 推導與 `profile_source` 與 Python 相同（`session_manager.py:952-1008`）；others-template 缺定義時的處理依 Python |
+| #14 | B:B-16 | `released_dynamic_materialize_template_fallback`、`released_dynamic_act_no_and_profile_source`、`wp510_a_orphan_released_record_materializes_placeholder`、`wp510_a_placeholder_persists_across_restarts` | 重啟後 RELEASED session 的 template 後備、`act_no`／alias 推導與 `profile_source` 依 Python（`session_manager.py:1059-1113`）；缺失的非通用 template 實體化為 passthrough RELEASED 佔位並保留阻擋，`passthrough`／`others-template` 維持通用 fallback |
 | #20 | B:B-91 | `com_for_by_id_session_first_then_pending` | 呼叫端需要時提供 `com_for_by_id`：既有 session 優先，否則 `_pending_com`（`:1476-1482`）；若確認無呼叫端，於本 Task 記為不移植（附 grep 證據） |
 | #26 | B:C-34 | `bind_with_inflight_attach_op_cancels_waits_3000ms` | bind 遇舊 by_id attach op：cancel、等 3000 ms；逾時 → `RECOVERING`；期間 release → `SESSION_RECOVERING`；否則重試（`:3484-3530`） |
 | #27 | B:C-53 | `hotplug_invalidates_pending_attach_op_and_closes_unused_port` | `DeviceDetached`／real_path 變更於 `OpenBridge` pending 時使 op 失效、未消費的 port 關閉（`:3846-3868`） |

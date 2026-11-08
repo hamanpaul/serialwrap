@@ -1141,6 +1141,154 @@ fn released_row(by_id: &str) -> ReleasedRow {
     }
 }
 
+#[test]
+fn wp510_a_orphan_released_record_materializes_placeholder() {
+    const ONLY_PRPL: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
+    let yaml = format!(
+        "{ONLY_PRPL}targets:\n  - {{com: COM7, profile: prpl-template, act_no: 1, alias: prpl-template+1, device_by_id: /s/by-id/usb-N}}\n"
+    );
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        "gone-template:COM3".to_string(),
+        released_row("/s/by-id/usb-G"),
+    );
+    loaded.released.insert(
+        "others-template:COM5".to_string(),
+        released_row("/s/by-id/usb-O"),
+    );
+    loaded.released.insert(
+        "passthrough:COM6".to_string(),
+        released_row("/s/by-id/usb-P"),
+    );
+    let m = ManagerRig::with(&yaml, loaded, None);
+
+    let sid = m
+        .mgr
+        .resolve("gone-template:COM3")
+        .expect("缺失 template 的 RELEASED 記錄應可由 session_id selector 找到");
+    assert_eq!(sid, "gone-template:COM3");
+    let placeholder = m.session(&sid);
+    assert_eq!(s_of(&placeholder, "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        s_of(&placeholder, "session_id").as_deref(),
+        Some("gone-template:COM3")
+    );
+    assert_eq!(s_of(&placeholder, "com").as_deref(), Some("COM3"));
+    assert_eq!(
+        s_of(&placeholder, "profile").as_deref(),
+        Some("gone-template")
+    );
+    assert_eq!(
+        s_of(&placeholder, "platform").as_deref(),
+        Some("passthrough")
+    );
+    assert_eq!(
+        placeholder.get("command_capable"),
+        Some(&PyValue::Bool(false))
+    );
+    assert_eq!(
+        s_of(&placeholder, "alias").as_deref(),
+        Some("gone-template+4")
+    );
+    assert_eq!(
+        s_of(&placeholder, "profile_source").as_deref(),
+        Some("fallback")
+    );
+    assert_eq!(
+        s_of(&placeholder, "device_by_id").as_deref(),
+        Some("/s/by-id/usb-G")
+    );
+    assert_eq!(s_of(&placeholder, "released_by").as_deref(), Some("agent"));
+    assert_eq!(
+        s_of(&placeholder, "released_at").as_deref(),
+        Some("2026-10-21T00:00:00")
+    );
+    assert_eq!(
+        s_of(&placeholder, "released_reason").as_deref(),
+        Some("manual")
+    );
+    assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
+    assert_eq!(placeholder.get("released_placeholder"), None);
+
+    // 通用名稱仍依原有規則使用 passthrough；一般 YAML session 也可正常建立。
+    for (sid, profile, com) in [
+        ("others-template:COM5", "others-template", "COM5"),
+        ("passthrough:COM6", "passthrough", "COM6"),
+    ] {
+        let session = m.session(sid);
+        assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"));
+        assert_eq!(s_of(&session, "session_id").as_deref(), Some(sid));
+        assert_eq!(s_of(&session, "profile").as_deref(), Some(profile));
+        assert_eq!(s_of(&session, "com").as_deref(), Some(com));
+        assert_eq!(s_of(&session, "platform").as_deref(), Some("passthrough"));
+        assert_eq!(session.get("command_capable"), Some(&PyValue::Bool(false)));
+        assert_eq!(m.mgr.released_placeholder(sid), Some(false));
+    }
+    assert_eq!(m.mgr.resolve("COM7").as_deref(), Some("prpl-template:COM7"));
+    assert_eq!(m.mgr.released_placeholder("COM7"), Some(false));
+    assert_eq!(m.mgr.counts().0, 4);
+
+    let device_g = m.add_device_at("/s/by-id/usb-G", "/dev/ttyG");
+    let device_o = m.add_device_at("/s/by-id/usb-O", "/dev/ttyO");
+    let device_p = m.add_device_at("/s/by-id/usb-P", "/dev/ttyP");
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    std::thread::sleep(Duration::from_millis(100));
+    for path in ["/dev/ttyG", "/dev/ttyO", "/dev/ttyP"] {
+        assert_eq!(m.serial.open_attempts(path), 0, "RELEASED 不得 open {path}");
+    }
+    for device in [device_g, device_o, device_p] {
+        assert!(device.take_tx().is_empty(), "RELEASED 不得送 UART TX");
+    }
+}
+
+#[test]
+fn wp510_a_placeholder_persists_across_restarts() {
+    const ONLY_PRPL: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        "gone-template:COM3".to_string(),
+        released_row("/s/by-id/usb-G"),
+    );
+    let m = ManagerRig::with(ONLY_PRPL, loaded, None);
+    m.add_device_at("/s/by-id/usb-G", "/dev/ttyG");
+
+    let mut current = m;
+    for restart_no in 0..=2 {
+        let sid = current
+            .mgr
+            .resolve("gone-template:COM3")
+            .unwrap_or_else(|| panic!("第 {restart_no} 次啟動應實體化佔位 session"));
+        assert_eq!(sid, "gone-template:COM3");
+        let session = current.session(&sid);
+        assert_eq!(s_of(&session, "state").as_deref(), Some("RELEASED"));
+        assert_eq!(s_of(&session, "platform").as_deref(), Some("passthrough"));
+        assert_eq!(session.get("command_capable"), Some(&PyValue::Bool(false)));
+        assert_eq!(current.mgr.released_placeholder(&sid), Some(true));
+        assert_eq!(
+            s_of(&session, "device_by_id").as_deref(),
+            Some("/s/by-id/usb-G")
+        );
+        assert!(
+            current
+                .load_state_now()
+                .released
+                .contains_key("gone-template:COM3"),
+            "第 {restart_no} 次啟動後 state.json 仍須保留 RELEASED 阻擋"
+        );
+
+        current.mgr.update_devices(&current.snapshot());
+        current.mgr.bootstrap_attach();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(current.serial.open_attempts("/dev/ttyG"), 0);
+        assert!(current.serial.device("/dev/ttyG").take_tx().is_empty());
+
+        if restart_no < 2 {
+            current = current.restart();
+        }
+    }
+}
+
 /// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。
 fn snapshot_without(m: &ManagerRig, by_id: &str) -> Vec<(String, DeviceInfo)> {
     m.snapshot().into_iter().filter(|(k, _)| k != by_id).collect()
@@ -1163,7 +1311,7 @@ fn fallback_session_then_unplug(m: &ManagerRig, by_id: &str) -> String {
 fn released_dynamic_materialize_template_fallback() {
     // #14：重啟時動態 RELEASED 列的 template 後備（session_manager.py `__init__` released 實體化）：
     // - template 缺定義但名稱為 others-template／passthrough → 最小 passthrough profile 實體化（非 command_capable）；
-    // - 其他缺定義的 template（如 uboot-template）→ 不實體化、WARNING、保留持久化阻擋（裝置上線也不 open）。
+    // - 其他缺定義的 template（如 uboot-template）→ 以 passthrough 佔位實體化、WARNING、保留持久化阻擋（裝置上線也不 open）。
     const ONLY_PRPL: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
     let mut loaded = LoadedState::default();
     loaded
@@ -1181,21 +1329,62 @@ fn released_dynamic_materialize_template_fallback() {
     assert_eq!(s_of(&s, "profile_source").as_deref(), Some("fallback"));
     assert_eq!(s.get("act_no"), Some(&PyValue::Int(PyInt::Small(4))));
     assert_eq!(s_of(&s, "alias").as_deref(), Some("others-template+4"));
-    assert_eq!(m.mgr.resolve("COM4"), None, "uboot-template 缺定義不得降級實體化");
+    assert_eq!(
+        m.mgr.released_placeholder("others-template:COM3"),
+        Some(false)
+    );
+    let uboot = m
+        .mgr
+        .resolve("uboot-template:COM4")
+        .expect("缺失 uboot template 應以 RELEASED 佔位實體化");
+    let uboot_session = m.session(&uboot);
+    assert_eq!(s_of(&uboot_session, "state").as_deref(), Some("RELEASED"));
+    assert_eq!(
+        s_of(&uboot_session, "platform").as_deref(),
+        Some("passthrough")
+    );
+    assert_eq!(
+        uboot_session.get("command_capable"),
+        Some(&PyValue::Bool(false))
+    );
+    assert_eq!(
+        s_of(&uboot_session, "profile_source").as_deref(),
+        Some("fallback")
+    );
+    assert_eq!(
+        s_of(&uboot_session, "alias").as_deref(),
+        Some("uboot-template+5")
+    );
+    assert_eq!(
+        s_of(&uboot_session, "device_by_id").as_deref(),
+        Some("/s/by-id/usb-U")
+    );
+    assert_eq!(s_of(&uboot_session, "released_by").as_deref(), Some("agent"));
+    assert_eq!(
+        s_of(&uboot_session, "released_at").as_deref(),
+        Some("2026-10-21T00:00:00")
+    );
+    assert_eq!(
+        s_of(&uboot_session, "released_reason").as_deref(),
+        Some("manual")
+    );
+    assert_eq!(m.mgr.released_placeholder(&uboot), Some(true));
     assert!(m.warnings().iter().any(|w| w
         == "released session 的 template 不存在（session=uboot-template:COM4、profile=uboot-template），保留持久化阻擋"));
     assert!(
         m.load_state_now().released.contains_key("uboot-template:COM4"),
         "未實體化的 released 列須保留在 state.json"
     );
-    m.add_device_at("/s/by-id/usb-R", "/dev/ttyR");
-    m.add_device_at("/s/by-id/usb-U", "/dev/ttyU");
+    let device_r = m.add_device_at("/s/by-id/usb-R", "/dev/ttyR");
+    let device_u = m.add_device_at("/s/by-id/usb-U", "/dev/ttyU");
     m.mgr.update_devices(&m.snapshot());
     m.mgr.bootstrap_attach();
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(m.serial.open_attempts("/dev/ttyR"), 0);
-    assert_eq!(m.serial.open_attempts("/dev/ttyU"), 0, "未實體化列仍阻擋該 tty");
-    assert_eq!(m.mgr.counts().0, 1);
+    assert_eq!(m.serial.open_attempts("/dev/ttyU"), 0, "佔位仍阻擋該 tty");
+    assert!(device_r.take_tx().is_empty());
+    assert!(device_u.take_tx().is_empty());
+    assert_eq!(m.mgr.counts().0, 2);
 }
 
 #[test]
