@@ -18,7 +18,7 @@ use sw_core::mailbox::{ControlEvent, DataEvent, DetachReason, Mailbox, OpenFailu
 use sw_core::op_runner::{OpOutcome, OpSpec};
 use sw_core::session_core::{Effect, ManagerNote, SessionRequest, SessionState};
 use sw_core::tx_writer::{Fence, FenceReject, OpId, TxClass, TxOpLedger, TxPermit};
-use sw_pal::traits::{Clock, HolderReport};
+use sw_pal::traits::{Clock, HolderReport, TxOutcome};
 use sw_proto::pyjson::{PyDict, PyValue};
 
 // ---------------------------------------------------------------------------
@@ -520,11 +520,15 @@ fn console_disconnect_settles_replay_hold_after_permanent_handoff_freeze() {
     });
     assert!(effects.iter().any(|effect| matches!(effect, Effect::HumanTx { payload, .. } if payload == b"k")));
     assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(true)), "回放 hold 應維持忙碌");
+    h.input("c1", b"q");
 
     h.reg.admission_gate().freeze();
     h.disconnect("c1");
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(true)), "斷線只移除 backlog，不可取消已受理的在途 HumanTx");
 
-    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(false)), "斷線須結算已移除的回放項目");
+    let effects = h.complete_human_tx(TxOutcome::Completed(1), None);
+    assert!(!effects.iter().any(|effect| matches!(effect, Effect::HumanTx { .. })), "斷線已移除尚未送出的 backlog，不得再排 TX");
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(false)), "在途 HumanTx 完成後須結算 replay hold");
 }
 
 #[test]
