@@ -418,6 +418,129 @@ fn auto_reprobe_ready_result_survives_temporary_handoff_freeze() {
     assert!(has_session_ready(&effects), "probe 結果套用後應發布 SessionReady");
 }
 
+#[test]
+fn force_recover_poll_replies_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("SHELL_PROMPT_TIMEOUT"));
+    let (reply, _) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: true,
+    });
+
+    h.advance(Duration::from_millis(12_900));
+    assert!(reply.try_recv().is_err(), "第十次輪詢尚未到期");
+    h.reg.admission_gate().freeze();
+    h.advance(Duration::from_millis(100));
+
+    let result = reply.try_recv().expect("永久凍結期間仍須結算 recover 等待者").expect("回覆字典");
+    assert_eq!(result.get("error_code"), Some(&PyValue::from("FORCE_RECOVER_TIMEOUT")));
+    assert_eq!(result.get("recovered"), Some(&PyValue::Bool(false)));
+}
+
+#[test]
+fn manual_reprobe_result_replies_flushed_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let (reply, effects) = h.rpc_deferred(SessionRequest::Recover {
+        timeout_s: 2.0,
+        force: false,
+    });
+    let (epoch, fsm_gen) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("手動 recover 應啟動既有 bridge probe");
+
+    h.reg.admission_gate().freeze();
+    let effects = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+
+    let result = reply.try_recv().expect("手動 recover 等待者必須收到終態回覆").expect("回覆字典");
+    assert_eq!(result.get("error_code"), Some(&PyValue::from("FLUSHED_BY_SHUTDOWN")));
+    assert_eq!(result.get("reason"), Some(&PyValue::from("handoff_frozen")));
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結後 probe 不得升 READY");
+    assert!(!has_session_ready(&effects), "凍結後不得發布 READY 通知");
+}
+
+#[test]
+fn boot_quiet_deadline_expires_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.rx(b"U-Boot 2024.01\\r\\n");
+    assert!(h.fence.with(|fence| fence.quiet_active), "banner 應啟動 quiet fence");
+
+    h.advance(Duration::from_secs(179));
+    h.reg.admission_gate().freeze();
+    h.advance(Duration::from_secs(2));
+
+    assert!(!h.fence.with(|fence| fence.quiet_active), "已排程 deadline 在永久凍結後仍須到期");
+}
+
+#[test]
+fn lease_expiry_completes_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let opened = h
+        .rpc(SessionRequest::InteractiveOpen {
+            owner: "agent:t14".into(),
+            timeout_s: 1.0,
+            command: String::new(),
+            allow_attached: false,
+        })
+        .expect("interactive_open 回覆");
+    assert!(matches!(opened.get("interactive_id"), Some(PyValue::Str(_))));
+    assert!(matches!(h.public().get("interactive_session_id"), Some(PyValue::Str(_))));
+
+    h.reg.admission_gate().freeze();
+    h.advance(Duration::from_secs(2));
+
+    assert_eq!(h.public().get("interactive_session_id"), Some(&PyValue::Null), "到期 lease 必須收回");
+}
+
+#[test]
+fn console_disconnect_settles_replay_hold_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.attach_pty_console("c1", true);
+    let started = h.start_foreground_command("sleep 9");
+    h.input("c1", b"k");
+    h.set_auto_complete_human_tx(false);
+    let epoch = h.epoch();
+    let effects = h.feed(ControlEvent::OpFinished {
+        op_id: started.op_id,
+        epoch,
+        outcome: OpOutcome::Sent { bytes: 3 },
+        after_rx_seq: None,
+    });
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::HumanTx { payload, .. } if payload == b"k")));
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(true)), "回放 hold 應維持忙碌");
+
+    h.reg.admission_gate().freeze();
+    h.disconnect("c1");
+
+    assert_eq!(h.public().get("foreground_busy"), Some(&PyValue::Bool(false)), "斷線須結算已移除的回放項目");
+}
+
+#[test]
+fn background_bridge_open_does_not_advance_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    assert_eq!(h.core.state(), SessionState::Attaching);
+    h.reg.admission_gate().freeze();
+
+    let effects = h.bridge_ok();
+
+    assert!(!has_start_login(&effects), "背景 bridge 開啟完成不得在凍結後啟動 readiness probe");
+    assert!(!has_start_op(&effects), "凍結後不得排 TX");
+    assert_ne!(h.core.state(), SessionState::Ready, "凍結後不得推進至 READY");
+}
+
 fn start_tentative_handoff(h: &mut CoreHarness) -> String {
     let token = match h.reg.admission_gate().freeze_if_idle("update") {
         sw_core::admission::FreezeOutcome::Frozen { token, created: true } => token,

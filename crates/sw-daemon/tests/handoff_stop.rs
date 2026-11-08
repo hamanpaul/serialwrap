@@ -218,28 +218,45 @@ fn mini_shell(fs: &Fs, cmd: &str) -> String {
 struct XferShell {
     dev: FakeDevice,
     fs: Fs,
+    commands: Arc<Mutex<Vec<String>>>,
     held: Arc<Mutex<Option<Vec<u8>>>>,
+    hold_finalize: Arc<AtomicBool>,
+    held_finalize: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl XferShell {
     fn install(dev: &FakeDevice, prompt: &'static str, hold: bool) -> XferShell {
         let fs: Fs = Arc::new(Mutex::new(BTreeMap::new()));
+        let commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let held: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let armed = Arc::new(AtomicBool::new(hold));
-        let (f, h) = (fs.clone(), held.clone());
+        let hold_finalize = Arc::new(AtomicBool::new(false));
+        let held_finalize: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let (f, c, h, finalize_armed, finalize_held) = (
+            fs.clone(),
+            commands.clone(),
+            held.clone(),
+            hold_finalize.clone(),
+            held_finalize.clone(),
+        );
         dev.on_tx_match(
             "SW_XFER_",
             Box::new(move |line: &[u8]| {
                 let cmd = String::from_utf8_lossy(line).trim_end_matches(['\r', '\n']).to_string();
+                c.lock().unwrap().push(cmd.clone());
                 let reply = format!("{}{prompt}", mini_shell(&f, &cmd)).into_bytes();
                 if cmd.starts_with("printf '%s' ") && armed.swap(false, Ordering::SeqCst) {
                     *h.lock().unwrap() = Some(reply);
                     return Vec::new();
                 }
+                if cmd.starts_with("mv ") && finalize_armed.swap(false, Ordering::SeqCst) {
+                    *finalize_held.lock().unwrap() = Some(reply);
+                    return Vec::new();
+                }
                 reply
             }),
         );
-        XferShell { dev: dev.clone(), fs, held }
+        XferShell { dev: dev.clone(), fs, commands, held, hold_finalize, held_finalize }
     }
 
     fn wait_held(&self) {
@@ -248,6 +265,31 @@ impl XferShell {
 
     fn release(&self) {
         let reply = self.held.lock().unwrap().take().expect("有扣住的 chunk 回應");
+        self.dev.push_rx(&reply);
+    }
+
+    fn arm_finalize_reply(&self) {
+        self.hold_finalize.store(true, Ordering::SeqCst);
+    }
+
+    fn wait_finalize_reply(&self) {
+        let deadline = Instant::now() + SHORT;
+        while self.held_finalize.lock().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            self.held_finalize.lock().unwrap().is_some(),
+            "file.push 完成命令未送達 DUT；已看到命令：{:?}",
+            self.commands()
+        );
+    }
+
+    fn commands(&self) -> Vec<String> {
+        self.commands.lock().unwrap().clone()
+    }
+
+    fn release_finalize_reply(&self) {
+        let reply = self.held_finalize.lock().unwrap().take().expect("有扣住的完成回應");
         self.dev.push_rx(&reply);
     }
 
@@ -464,6 +506,51 @@ fn handoff_service_push_ticket_blocks_until_done() {
     assert_eq!(done.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&done));
     assert_eq!(shell.file("/tmp/svc.bin"), Some(data), "DUT 端檔案內容完整");
     assert_granted(&r.svc.handoff_stop(&reason("update")), "push 完成後交接");
+}
+
+/// file.push 已回覆但 human replay hold 尚未結算時，原 admission ticket 仍須阻擋交接；hold 清空後才放行。
+#[test]
+fn handoff_file_push_ticket_survives_human_replay() {
+    let r = Arc::new(ServiceRig::with_console_backend("tcp"));
+    let console = r.console.as_ref().expect("TCP console fixture").fake.connect();
+    wait_for("TCP console 登記", SHORT, || {
+        matches!(r.call("session.console_list", r#"{"selector":"COM0"}"#).get("consoles"),
+            Some(PyValue::List(rows)) if rows.len() == 1)
+    });
+    let shell = XferShell::install(r.device(REAL_A), "root@t:/# ", true);
+    shell.arm_finalize_reply();
+    let tmp = Tmp::new("svc-push-replay");
+    let local = tmp.write("src.bin", b"payload");
+    let params = push_params(&local, "/tmp/svc-push-replay.bin");
+    let rig = r.clone();
+    let push = thread::spawn(move || rig.call("file.push", &params));
+
+    shell.wait_held();
+    console.push_input(b"k");
+    thread::sleep(Duration::from_millis(200));
+    shell.release();
+    shell.wait_finalize_reply();
+    let dev = r.device(REAL_A).clone();
+    dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let replay_start = dev.tx_len();
+    shell.release_finalize_reply();
+    let replay_paused = dev.wait_paused(SHORT);
+    let done = push.join().expect("file.push thread");
+    assert_eq!(done.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&done));
+
+    let busy = r.svc.handoff_stop(&reason("update"));
+    dev.release_pause();
+    wait_for("human replay hold 結束", SHORT, || {
+        r.session("COM0").and_then(|session| session.get("foreground_busy").cloned())
+            == Some(PyValue::Bool(false))
+    });
+
+    assert!(replay_paused, "file.push 結束後仍須有尚未提交的 human replay");
+    let rows = assert_refused(&busy, "SESSION_BUSY", "human replay 尚未完成");
+    assert_eq!(ops(row_for(&rows, "COM0")), ["file.push"], "票據須涵蓋 replay：{}", wire(&busy));
+    assert!(!r.svc.admission().frozen(), "replay 忙碌時交接不得凍結");
+    assert_eq!(dev.tx_since(replay_start), b"k", "放行後 replay 須完整送出一次");
+    assert_granted(&r.svc.handoff_stop(&reason("update")), "human replay 完成後才交接");
 }
 
 /// Actor 等待期限到達時傳輸仍在 FakeClock 設定的 chunk deadline 內；handoff 不得回收仍屬於傳輸的 admission ticket。
@@ -1085,6 +1172,71 @@ fn handoff_ok_then_sc11_stop_order() {
     assert!(took + Duration::from_millis(500) >= HANDOFF_DRAIN_GRACE, "窗口結束前不得結束：{took:?}");
     assert!(took <= HANDOFF_DRAIN_GRACE + STOP_CAP, "停止有界：{took:?}");
     assert!(trace.contains(&TraceEvent::SessionsDrained { flushed: vec![], stalled: vec![] }), "{trace:?}");
+}
+
+/// force recover 的最後輪詢與一般 daemon.stop 交錯時，仍回 FORCE_RECOVER_TIMEOUT 並讓 daemon exit 0。
+#[test]
+fn shutdown_during_force_recover_poll_finishes_handler_and_exits_zero() {
+    let env = isolated_env();
+    let (platform, handles) = in_process_platform_with_handles(
+        &env.vars,
+        vec![device(BY_ID, REAL)],
+        Fixture::ReadyShell,
+    );
+    let dev = handles.devices[0].clone();
+    let script = handles.script.clone();
+    let manager_slot = Arc::new(Mutex::new(None));
+    let manager_hook = manager_slot.clone();
+    let trace: Arc<Mutex<Vec<TraceEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let trace_hook = trace.clone();
+    let hooks = DaemonHooks {
+        on_manager: Some(Box::new(move |manager| {
+            *manager_hook.lock().unwrap() = Some(manager.clone());
+        })),
+        trace: Some(Box::new(move |event| trace_hook.lock().unwrap().push(event))),
+        ..DaemonHooks::default()
+    };
+    let socket = env.socket.clone();
+    let client = thread::spawn(move || {
+        wait_socket(&socket, LONG);
+        wait_ready(&socket);
+        dev.pause_next_close();
+        let recover_socket = socket.clone();
+        let recover = thread::spawn(move || {
+            rpc_once(
+                &recover_socket,
+                r#"{"id":11,"method":"session.recover","params":{"selector":"COM0","force":true,"timeout_s":2.0}}"#,
+            )
+        });
+
+        assert!(dev.wait_paused(SHORT), "force recover Clear drain 應停在 fake close");
+        script.lock().unwrap().as_ref().expect("裝置來源已建立").set(Vec::new());
+        let deadline = Instant::now() + SHORT;
+        let manager = loop {
+            if let Some(manager) = manager_slot.lock().unwrap().clone() {
+                break manager;
+            }
+            assert!(Instant::now() < deadline, "manager hook 尚未就緒");
+            thread::sleep(Duration::from_millis(5));
+        };
+        manager.update_devices(&[]);
+        dev.release_pause();
+        wait_for("force recover clear 後 DETACHED", LONG, || {
+            get_state(&socket, "COM0")["state"] == "DETACHED"
+        });
+
+        // ForceRecoverPoll 每秒一次；於第 9、10 次輪詢前後進入一般停止序。
+        thread::sleep(Duration::from_millis(8_500));
+        let stop = rpc_once(&socket, STOP);
+        let recover = recover.join().expect("recover RPC thread");
+        (stop, recover)
+    });
+    let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
+    let (stop, recover) = client.join().expect("daemon client thread");
+
+    assert!(!stop.is_empty(), "daemon.stop 應收到 RPC 回覆");
+    assert!(recover.contains("FORCE_RECOVER_TIMEOUT"), "force recover 終態：{recover}");
+    assert_eq!(code, 0, "force recover handler 收斂後 daemon 應 exit 0：{:?}", trace.lock().unwrap());
 }
 
 // ---------------------------------------------------------------------------
