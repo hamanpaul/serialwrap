@@ -405,6 +405,31 @@ fn frozen_submit_validation_errors_precede_admission() {
     }
 }
 
+/// 接線（審查 P8X-ee2b64c-1 修正）：RPC 受理的命令由命令登錄表持有 `command.submit` ticket 到終態，且與 RPC 分派
+/// 共用同一個 gate——命令在途時交接回 `SESSION_BUSY`（`ops` 含 `command.submit`）、不凍結、之後的 submit 照常受理；
+/// 命令完成後交接成立（Python `CommandArbiter._admission_tickets`／`_finish_admission_locked`）。
+#[test]
+fn handoff_busy_while_rpc_command_outstanding() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A).clone();
+    let from = dev.tx_len();
+    let sub = r.call("command.submit", r#"{"selector":"COM0","command":"echo slow"}"#);
+    assert_eq!(sub.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&sub));
+    let cmd_id = s(&sub, "cmd_id").expect("cmd_id").to_string();
+    wait_for("命令寫出", SHORT, || dev.tx_since(from).windows(9).any(|w| w == b"echo slow"));
+    let busy = r.svc.handoff_stop(&reason("update"));
+    let rows = assert_refused(&busy, "SESSION_BUSY", "命令在途");
+    assert!(ops(row_for(&rows, "COM0")).contains(&"command.submit".to_string()), "{}", wire(&busy));
+    assert!(!r.svc.admission().frozen(), "忙碌不得凍結");
+    dev.push_rx(b"slow\r\nroot@t:/# ");
+    let get = format!(r#"{{"cmd_id":"{cmd_id}"}}"#);
+    wait_for("命令完成", SHORT, || {
+        let rec = r.call("command.get", &get);
+        matches!(rec.get("command"), Some(PyValue::Dict(c)) if c.get("done_at").is_some_and(|v| !v.is_null()))
+    });
+    assert_granted(&r.svc.handoff_stop(&reason("update")), "命令終結後交接");
+}
+
 /// 預檢（session.list 閒置）之後才開始的 `file.push`：交接回 `SESSION_BUSY`（`ops:["file.push"]`），不凍結；push 完成且
 /// DUT 端檔案相符後，交接才成立。
 #[test]

@@ -44,16 +44,16 @@ const ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
 /// `session.recover`／`session.attach`／`session.self_test` 的等待上限（含登入／probe）。
 const LONG_ROUTE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// P8 Task 14：有副作用、須先取得 admission ticket 的 RPC 方法（`contracts/rpc_schema.json` 中 `side_effects` 非空且
-/// `retryable_readonly==false` 者，排除 framing 攔截的 `daemon.stop`／`daemon.handoff_stop`；Python `_ADMISSION_METHODS`
-/// 加上 arbiter 自行 admit 的 `command.submit`）。凍結後回 `FLUSHED_BY_SHUTDOWN`＋`reason:"handoff_frozen"`，零副作用。
+/// P8 Task 14：分派前須先取得 admission ticket 的 RPC 方法（Python `_ADMISSION_METHODS`：`contracts/rpc_schema.json` 中
+/// `side_effects` 非空且 `retryable_readonly==false` 者，排除 framing 攔截的 `daemon.stop`／`daemon.handoff_stop`，以及
+/// 由 `CommandRegistry::admit` 於命令驗證之後才取 ticket 的 `command.submit`）。凍結後回 `FLUSHED_BY_SHUTDOWN`＋
+/// `reason:"handoff_frozen"`，零副作用。
 const ADMISSION_METHODS: &[&str] = &[
     "alias.assign",
     "alias.set",
     "alias.unassign",
     "command.cancel",
     "command.result_tail",
-    "command.submit",
     "device.attach",
     "device.release",
     "event.com_disable",
@@ -106,6 +106,17 @@ impl Drop for TicketGuard<'_> {
     }
 }
 
+/// P8 Task 14：`CommandRegistry::admit` 的凍結拒絕經 actor 回覆時會被補上 `session`（actor 對入列錯誤的慣例）；Python
+/// `CommandArbiter.submit` 的凍結回應只有 `ok`／`error_code`／`reason`，與其他有副作用方法的凍結回應同形，故移除。
+fn strip_frozen_session(mut result: PyDict) -> PyDict {
+    let frozen = result.get("error_code").and_then(PyValue::as_str) == Some("FLUSHED_BY_SHUTDOWN")
+        && result.get("reason").and_then(PyValue::as_str) == Some("handoff_frozen");
+    if frozen {
+        result.0.shift_remove("session");
+    }
+    result
+}
+
 fn handoff_frozen_response() -> PyDict {
     pydict! { "ok" => false, "error_code" => "FLUSHED_BY_SHUTDOWN", "reason" => "handoff_frozen" }
 }
@@ -144,9 +155,6 @@ pub struct Service {
     flash: std::sync::OnceLock<Arc<FlashState>>,
     /// P8 Task 14：所有新操作的共同 admission 邊界（arch §6.2 第 7 步）。
     admission: Arc<AdmissionGate>,
-    /// P8 Task 14：`command.submit` 的 ticket 持有到命令紀錄終態（cmd_id → ticket；Python arbiter `_admission_tickets`）。
-    /// 每次 submit 前與交接前回收已終結者，大小以 per-session pending 上限為界。
-    cmd_tickets: Mutex<HashMap<String, Ticket>>,
     /// P8 Task 14：`session.interactive_open` 的 ticket 持有到 lease 關閉／到期（interactive_id → ticket；Python
     /// `_interactive_admission_tickets`）。每次 open／close 與交接前回收已不存在的 lease。
     lease_tickets: Mutex<HashMap<String, Ticket>>,
@@ -342,6 +350,9 @@ fn dict_list(rows: Vec<PyDict>) -> PyValue {
 
 impl Service {
     pub fn new(deps: ServiceDeps) -> Service {
+        // P8 Task 14：`command.submit` 的 ticket 由命令登錄表於驗證之後取得（Python `CommandArbiter.submit`），與 RPC
+        // 分派、flash sync-probe 共用同一個 gate；共用同一登錄表的 Service 亦共用其 gate。
+        let admission = deps.registry.admission_gate();
         Service {
             manager: deps.manager,
             wal: deps.wal,
@@ -356,8 +367,7 @@ impl Service {
             running: AtomicBool::new(true),
             engine: std::sync::OnceLock::new(),
             flash: std::sync::OnceLock::new(),
-            admission: Arc::new(AdmissionGate::new()),
-            cmd_tickets: Mutex::new(HashMap::new()),
+            admission,
             lease_tickets: Mutex::new(HashMap::new()),
             handoff: Mutex::new(BTreeSet::new()),
         }
@@ -384,7 +394,7 @@ impl Service {
             r if r.is_empty() => "update".to_string(),
             r => r,
         };
-        self.reconcile_cmd_tickets();
+        self.registry.reconcile_admission();
         let sessions = self.manager.list_sessions();
         self.reconcile_lease_tickets(&sessions);
         self.publish_flags(&sessions, &mut published);
@@ -492,22 +502,6 @@ impl Service {
         None
     }
 
-    /// 回收已到終態的命令 ticket（Python `_finish_admission_locked`）。
-    fn reconcile_cmd_tickets(&self) {
-        let done: Vec<Ticket> = {
-            let mut map = lock(&self.cmd_tickets);
-            let finished: Vec<String> = map
-                .keys()
-                .filter(|cmd_id| !self.registry.is_outstanding(cmd_id))
-                .cloned()
-                .collect();
-            finished.into_iter().filter_map(|cmd_id| map.remove(&cmd_id)).collect()
-        };
-        for ticket in done {
-            self.admission.done(ticket);
-        }
-    }
-
     /// 回收已不存在之 lease 的 ticket（Python `_reconcile_interactive_admission_tickets`）。
     fn reconcile_lease_tickets(&self, sessions: &[PyDict]) {
         let active: HashSet<&str> = sessions
@@ -524,21 +518,12 @@ impl Service {
         }
     }
 
-    /// 分派成功後把需持有到終態的 ticket 移交（command.submit → 命令紀錄、interactive_open → lease）；其餘於守衛 drop 歸還。
+    /// 分派成功後把需持有到終態的 ticket 移交（interactive_open → lease）；其餘於守衛 drop 歸還。
     fn retain_ticket(&self, method: &str, params: &PyDict, result: &PyDict, guard: TicketGuard<'_>) {
         if !is_ok(result) {
             return;
         }
         match method {
-            "command.submit" => {
-                if let Some(cmd_id) = result.get("cmd_id").and_then(PyValue::as_str).filter(|c| !c.is_empty()) {
-                    if let Some(ticket) = guard.take() {
-                        if let Some(old) = lock(&self.cmd_tickets).insert(cmd_id.to_string(), ticket) {
-                            self.admission.done(old);
-                        }
-                    }
-                }
-            }
             "session.interactive_open" => {
                 let iid = result
                     .get("interactive_id")
@@ -671,12 +656,8 @@ impl Service {
             return Ok(self.handoff_stop(params));
         }
         let guard = if ADMISSION_METHODS.contains(&method) {
-            match method {
-                "command.submit" => self.reconcile_cmd_tickets(),
-                "session.interactive_open" | "session.interactive_close" => {
-                    self.reconcile_lease_tickets(&self.manager.list_sessions())
-                }
-                _ => {}
+            if matches!(method, "session.interactive_open" | "session.interactive_close") {
+                self.reconcile_lease_tickets(&self.manager.list_sessions());
             }
             match self.admission.admit(method, self.admission_com(params).as_deref()) {
                 Some(ticket) => Some(TicketGuard { gate: &self.admission, ticket: Some(ticket) }),
@@ -1096,7 +1077,7 @@ impl Service {
                 };
                 self.manager
                     .route(&sid, SessionRequest::Submit(req), ROUTE_TIMEOUT)
-                    .map(|result| annotate_source(result, &source_check, true))
+                    .map(|result| annotate_source(strip_frozen_session(result), &source_check, true))
             }
             "command.get" => {
                 let cmd_id = p.str_or("cmd_id", "")?;

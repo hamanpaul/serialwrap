@@ -2,13 +2,15 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use indexmap::IndexMap;
 use sw_proto::constants::{CMD_HISTORY_MAX, CMD_PENDING_MAX, CMD_REJECT_BYTES, CMD_WARN_BYTES};
 use sw_proto::pydict;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
 use sw_proto::pyre::valid_completion_regex;
+
+use crate::admission::{AdmissionGate, Ticket};
 
 /// 命令提交請求（對應 Python `CommandArbiter.submit` 的參數）。
 #[derive(Clone, Debug)]
@@ -83,11 +85,16 @@ struct RegistryInner {
     in_flight: HashMap<String, String>,
     /// 已寫出 `command_aborted_in_flight` META 的 cmd_id（FIFO，≤ `CMD_HISTORY_MAX`）。
     abort_meta: indexmap::IndexSet<String>,
+    /// P8 Task 14：受理之 RPC 命令的 `command.submit` ticket（cmd_id → ticket；Python arbiter `_admission_tickets`）。
+    /// 每次 RPC 受理前先回收已終結者，故筆數 ≤ 在途命令數＋1。
+    admission_tickets: HashMap<String, Ticket>,
 }
 
 /// 命令登錄表：保留 admission 順序，並追蹤每個 session 的在途命令。
 pub struct CommandRegistry {
     inner: Mutex<RegistryInner>,
+    /// P8 Task 14：共同 admission 邊界（`Service` 建構時掛上；未掛上則不經 gate）。
+    admission: OnceLock<Arc<AdmissionGate>>,
 }
 
 /// 驗證原始 `expect_reboot` RPC 值，並拒絕 interactive lease 模式。
@@ -123,6 +130,7 @@ impl CommandRegistry {
     pub fn new() -> Arc<CommandRegistry> {
         Arc::new(CommandRegistry {
             inner: Mutex::new(RegistryInner::default()),
+            admission: OnceLock::new(),
         })
     }
 
@@ -191,8 +199,35 @@ impl CommandRegistry {
             });
         }
 
+        // P8 Task 14（審查 P8X-ee2b64c-1）：Python `arbiter.py:230-233`——命令驗證之後、入列檢查之前取 ticket；
+        // human console 行為 `admission_exempt=True`。COM 取 session_id 尾段（Python `session_id.rsplit(":", 1)[-1]`）。
+        let ticket = match self.admission.get() {
+            Some(gate) if !matches!(req.origin, SubmitOrigin::HumanConsole { .. }) => {
+                self.reconcile_admission();
+                let com = req.session_id.rsplit(':').next().unwrap_or_default();
+                match gate.admit("command.submit", Some(com)) {
+                    Some(ticket) => Some(ticket),
+                    None => {
+                        return Err(pydict! {
+                            "ok" => false,
+                            "error_code" => "FLUSHED_BY_SHUTDOWN",
+                            "reason" => "handoff_frozen",
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
+        // 入列失敗即歸還 ticket（Python `self._admission.done(ticket)`）；gate 為葉鎖，可於登錄表鎖內呼叫。
+        let release = |ticket: Option<Ticket>| {
+            if let (Some(ticket), Some(gate)) = (ticket, self.admission.get()) {
+                gate.done(ticket);
+            }
+        };
+
         let mut inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
         if !queue_registered {
+            release(ticket);
             return Err(pydict! {
                 "ok" => false,
                 "error_code" => "SESSION_NOT_READY",
@@ -202,6 +237,7 @@ impl CommandRegistry {
 
         let pending = pending_locked(&inner, &req.session_id);
         if pending >= CMD_PENDING_MAX {
+            release(ticket);
             return Err(pydict! {
                 "ok" => false,
                 "error_code" => "SESSION_QUEUE_FULL",
@@ -254,6 +290,11 @@ impl CommandRegistry {
         record.insert("interactive_session_id", PyValue::Null);
         record.insert("recovery_action", PyValue::Null);
         inner.records.insert(cmd_id.clone(), record);
+        if let Some(ticket) = ticket {
+            if let Some(old) = inner.admission_tickets.insert(cmd_id.clone(), ticket) {
+                release(Some(old));
+            }
+        }
         evict_history_locked(&mut inner);
         drop(inner);
 
@@ -504,32 +545,55 @@ impl CommandRegistry {
 
     /// P8 Task 14（審查 P8X-ee2b64c-1）：掛上共同 admission 邊界（只可一次；回 `false` 表示已掛上）。掛上後 RPC 來源的
     /// `admit` 於命令驗證之後、入列之前取得 `command.submit` ticket（Python `CommandArbiter.submit`）。
-    pub fn set_admission(&self, gate: Arc<crate::admission::AdmissionGate>) -> bool {
-        let _ = gate;
-        todo!("P8-T14")
+    pub fn set_admission(&self, gate: Arc<AdmissionGate>) -> bool {
+        self.admission.set(gate).is_ok()
     }
 
-    /// P8 Task 14：歸還已到終態之命令的 `command.submit` ticket（Python `_finish_admission_locked`）。
+    /// P8 Task 14：登錄表的 admission gate；尚未掛上則建立並掛上（`Service` 建構時取用，使 RPC 分派與命令受理共用）。
+    pub fn admission_gate(&self) -> Arc<AdmissionGate> {
+        self.admission.get_or_init(|| Arc::new(AdmissionGate::new())).clone()
+    }
+
+    /// P8 Task 14：歸還已到終態之命令的 `command.submit` ticket（Python `_finish_admission_locked`；紀錄已淘汰視為終結）。
+    /// 每次 RPC 受理前與交接判定前呼叫。
     pub fn reconcile_admission(&self) {
-        todo!("P8-T14")
+        let Some(gate) = self.admission.get() else {
+            return;
+        };
+        let finished: Vec<Ticket> = {
+            let mut inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
+            let done: Vec<String> = inner
+                .admission_tickets
+                .keys()
+                .filter(|cmd_id| !outstanding_locked(&inner, cmd_id))
+                .cloned()
+                .collect();
+            done.into_iter().filter_map(|cmd_id| inner.admission_tickets.remove(&cmd_id)).collect()
+        };
+        for ticket in finished {
+            gate.done(ticket);
+        }
     }
 
     /// P8 Task 14：命令是否仍未到終態（未結束，或已取消但 worker 尚在執行）。紀錄已淘汰視為已終結。
     /// admission ticket 持有到此為 false（Python `CommandArbiter._finish_admission_locked` 的時點）。
     pub fn is_outstanding(&self, cmd_id: &str) -> bool {
         let inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
-        match inner.records.get(cmd_id) {
-            None => false,
-            Some(record) => {
-                !record.get_truthy("done_at") || inner.in_flight.values().any(|active| active == cmd_id)
-            }
-        }
+        outstanding_locked(&inner, cmd_id)
     }
 
     /// 該 session 的 pending 數，包含已取消但 worker 尚未收尾的命令。
     pub fn pending(&self, session_id: &str) -> usize {
         let inner = self.inner.lock().expect("命令登錄表鎖 poisoned");
         pending_locked(&inner, session_id)
+    }
+}
+
+/// 命令是否仍未到終態（未結束，或已取消但 worker 尚在執行）；紀錄已淘汰視為已終結。
+fn outstanding_locked(inner: &RegistryInner, cmd_id: &str) -> bool {
+    match inner.records.get(cmd_id) {
+        None => false,
+        Some(record) => !record.get_truthy("done_at") || inner.in_flight.values().any(|active| active == cmd_id),
     }
 }
 
