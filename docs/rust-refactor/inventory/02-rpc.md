@@ -301,6 +301,7 @@ key 依下列插入順序：
 | `ready_reconfirm_pending` | bool | |
 | `ready_reconfirm_failed` | bool | |
 | `ready_reconfirm_remaining_s` | float \| null | `round(max(deadline-now,0),1)`；非 pending → null |
+| `boot_evidence_wait_remaining_s` | float \| null | 非同步 reboot 開機證據等待剩餘秒數（#243，`origin/main:sw_core/session_manager.py:897-903`）：`boot_evidence_wait_active(now)`（until > 0 且 `now < until`）時 `round(until - now, 1)`，與同一次投影其他欄位共用 `now_mono`；未開始、已解除或恰好到期 → null。transient，不寫 `state.json`；讀取不清除等待 |
 | `idle_for_ms` | int \| null | `max(last_rx_mono,last_tx_mono)` 為 0 → null |
 | `last_rx_age_s` / `last_tx_age_s` | float \| null | 1 位小數 |
 | `rx_bytes_last_10s` | int \| null | bridge `rx_stats()`；不支援 → null |

@@ -917,6 +917,12 @@ impl SessionCore {
             .reconfirm_remaining_s(now)
             .map(PyValue::from)
             .unwrap_or(PyValue::Null);
+        // `session_manager.py:898-902`：與其他欄位共用同一個 `now_mono`；等待中 `round(until - now, 1)`，否則 None。
+        let boot_evidence_remaining = self
+            .quiet
+            .boot_evidence_wait_remaining_s(now)
+            .map(PyValue::from)
+            .unwrap_or(PyValue::Null);
         // Python：`len(background_cmd_ids) + (1 if foreground_busy else 0)`（審查 F27）。
         let outstanding = self.background_cmd_ids.len() + usize::from(self.foreground_busy());
         let expected_duration = self
@@ -1014,6 +1020,7 @@ impl SessionCore {
             PyValue::from(self.quiet.failed),
         );
         out.insert("ready_reconfirm_remaining_s", reconfirm_remaining);
+        out.insert("boot_evidence_wait_remaining_s", boot_evidence_remaining);
         out.insert("idle_for_ms", idle_for_ms);
         out.insert("last_rx_age_s", age_s(self.last_rx_mono, now));
         out.insert("last_tx_age_s", age_s(self.last_tx_mono, now));
@@ -1102,6 +1109,12 @@ impl SessionCore {
     #[cfg(feature = "test-fakes")]
     pub fn set_boot_quiet_until_for_test(&mut self, deadline: Mono) {
         self.quiet.boot_quiet_until = deadline;
+    }
+
+    /// 只供測試（test-fakes）：直接設定非同步 reboot 的開機證據等待期限（`boot_evidence_wait_until`；0＝未設定）。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_boot_evidence_wait_until_for_test(&mut self, deadline: Mono) {
+        self.quiet.boot_evidence_wait_until = deadline;
     }
 
     /// 只供測試（test-fakes）：`last_error` 變更觀察者（spawn 前設定；Task 16 `last_error_history`）。

@@ -684,6 +684,8 @@ fn public_dict_key_order_with_sc04_fields() {
         "ready_reconfirm_pending",
         "ready_reconfirm_failed",
         "ready_reconfirm_remaining_s",
+        // origin/main `sw_core/session_manager.py:897-903`：緊接 reconfirm 剩餘秒數之後（#243）。
+        "boot_evidence_wait_remaining_s",
         "idle_for_ms",
         "last_rx_age_s",
         "last_tx_age_s",
@@ -701,6 +703,75 @@ fn public_dict_key_order_with_sc04_fields() {
     assert_eq!(keys(&d), expected);
     assert_eq!(pget(&d, "drain_stalled"), PyValue::Bool(false));
     assert_eq!(pget(&d, "drain_timeout_epoch"), PyValue::Null);
+}
+
+#[test]
+fn wp56_public_wait_remaining_matches_python() {
+    // origin/main `sw_core/session_manager.py:897-903`：
+    //   `round(boot_evidence_wait_until - now_mono, 1) if boot_evidence_wait_active(now_mono) else None`；
+    // `boot_evidence_wait_active`（`:808-811`）：until <= 0 → False，否則 `now < until`。
+    // 讀取 public 不清等待，也不動 reconfirm 的 pending／deadline（`to_public_dict` 純投影）。
+    const KEY: &str = "boot_evidence_wait_remaining_s";
+    const S: u64 = 1_000_000_000;
+    fn snap(h: &CoreHarness) -> (u64, bool, u64, u32, bool) {
+        let q = h.core.quiet_for_test();
+        (q.boot_evidence_wait_until, q.pending, q.deadline, q.attempts, q.failed)
+    }
+
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+
+    // 未開始（until = 0）：鍵存在且為 None。
+    let d = h.public();
+    assert!(d.get(KEY).is_some(), "public 必須含 {KEY}");
+    assert_eq!(pget(&d, KEY), PyValue::Null, "未開始等待應為 None");
+
+    // banner 建立 pending／deadline，之後才設等待（banner 本身會 note 解除等待）。
+    h.rx(b"U-Boot 2024.01\r\n");
+    let now = h.clock.mono_ns();
+
+    // 期限已過（until > 0 但 <= now）：None。
+    h.core.set_boot_evidence_wait_until_for_test(now);
+    assert_eq!(pget(&h.public(), KEY), PyValue::Null, "until == now 不算等待中");
+
+    // 整段寬限：`round(60.0, 1)`。
+    let grace_ns = (sw_proto::constants::BOOT_EVIDENCE_GRACE_S * 1e9) as u64;
+    h.core.set_boot_evidence_wait_until_for_test(now + grace_ns);
+    assert_eq!(pget(&h.public(), KEY), PyValue::Float(60.0));
+
+    // 需捨入：12.345678901 s → 12.3；Python 銀行家捨入 0.25 → 0.2、0.35 → 0.3、0.05 → 0.1。
+    for (delta_ns, want) in [
+        (12_345_678_901_u64, 12.3),
+        (250_000_000, 0.2),
+        (350_000_000, 0.3),
+        (50_000_000, 0.1),
+    ] {
+        h.core.set_boot_evidence_wait_until_for_test(now + delta_ns);
+        assert_eq!(
+            pget(&h.public(), KEY),
+            PyValue::Float(want),
+            "delta_ns={delta_ns}"
+        );
+    }
+
+    // 有效期間反覆讀 public 不改動 deadline／pending／attempts／failed 與等待期限本身。
+    let until = now + 12 * S + 340_000_000;
+    h.core.set_boot_evidence_wait_until_for_test(until);
+    let before = snap(&h);
+    assert!(before.1, "banner 後應 pending");
+    assert!(before.2 > 0, "banner 後應有 reconfirm deadline");
+    assert_eq!(pget(&h.public(), KEY), PyValue::Float(12.3));
+    assert_eq!(pget(&h.public(), KEY), PyValue::Float(12.3));
+    assert_eq!(snap(&h), before, "讀 public 不得改動等待或 reconfirm 狀態");
+
+    // 到期前 1 ns 仍有效：`round(1e-9, 1)` = 0.0（非 None）。
+    h.clock.advance(Duration::from_nanos(until - now - 1));
+    assert_eq!(pget(&h.public(), KEY), PyValue::Float(0.0), "到期前 1 ns 仍在等待");
+    // 恰好到期：`now < until` 為假 → None；讀取不清除期限。
+    h.clock.advance(Duration::from_nanos(1));
+    assert_eq!(h.clock.mono_ns(), until);
+    assert_eq!(pget(&h.public(), KEY), PyValue::Null, "恰好到期應為 None");
+    assert_eq!(snap(&h), before, "到期後讀 public 仍不得改動狀態");
 }
 
 #[test]

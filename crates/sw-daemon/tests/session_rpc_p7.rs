@@ -137,7 +137,9 @@ fn session_public_fields_p7() {
             "attached_real_path", "bridge_generation", "recovering", "interactive_session_id", "foreground_busy",
             "fg_cmd_expected_duration_s", "console_count", "last_state_change_at", "last_rx_at", "last_tx_at",
             "last_probe_at", "reprobe_attempts", "next_reprobe_at", "reprobe_exhausted", "boot_quiet_remaining_s",
-            "ready_reconfirm_pending", "ready_reconfirm_failed", "ready_reconfirm_remaining_s", "idle_for_ms",
+            // origin/main `sw_core/session_manager.py:897-903` 於 reconfirm 剩餘秒數後插入證據等待剩餘秒數（#243）。
+            "ready_reconfirm_pending", "ready_reconfirm_failed", "ready_reconfirm_remaining_s",
+            "boot_evidence_wait_remaining_s", "idle_for_ms",
             "last_rx_age_s", "last_tx_age_s", "rx_bytes_last_10s", "rx_rate_bps", "outstanding_commands",
             "activity_classification", "released_by", "released_at", "released_reason", "capture",
             "drain_stalled", "drain_timeout_epoch",
@@ -147,6 +149,8 @@ fn session_public_fields_p7() {
     assert_eq!(s["reprobe_attempts"], PyValue::from(0));
     assert_eq!(s["next_reprobe_at"], PyValue::Null);
     assert_eq!(s["reprobe_exhausted"], PyValue::Bool(false));
+    // 未進非同步 reboot 證據等待：`boot_evidence_wait_active` 為假 → None（`session_manager.py:898-902`）。
+    assert_eq!(s["boot_evidence_wait_remaining_s"], PyValue::Null);
 }
 
 // --- Task 17 剩餘列（Task 7 OD-35 後解除阻擋）：帳密未解析的 attach 回應與再告警（SC-34、#140）。
