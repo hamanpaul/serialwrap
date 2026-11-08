@@ -4,12 +4,13 @@
 #![cfg(feature = "test-fakes")]
 mod support;
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, ServiceRig, wait_until};
+use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
 use sw_pal::proc_scan::{DaemonProc, ProcIdentity};
-use sw_pal::traits::HolderScanStatus;
+use sw_pal::traits::{HolderReport, HolderScanStatus, UartExclusive};
 use sw_proto::pyjson::{PyDict, PyValue, RPC_WIRE, dumps};
 
 /// `foreign_holders` 會讀取行程內共用的 holder_unknown 登錄（#11）；登錄／精確比對 foreign_holders 的測試彼此序列化。
@@ -53,6 +54,47 @@ fn daemon(pid: u32, socket: &str) -> DaemonProc {
             start_ticks: None,
         }],
     }
+}
+
+struct Wp59HolderProbe {
+    report: HolderReport,
+    calls: Arc<AtomicUsize>,
+}
+
+impl UartExclusive for Wp59HolderProbe {
+    fn probe_holders(&self, _real_path: &str) -> HolderReport {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.report.clone()
+    }
+}
+
+fn wp59_posix_rig(path: &str, status: HolderScanStatus) -> (ServiceRig, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let holder_probe: Arc<dyn UartExclusive> = Arc::new(Wp59HolderProbe {
+        report: HolderReport {
+            pids: Vec::new(),
+            holder_unknown: status != HolderScanStatus::PartialOtherUid,
+            status,
+        },
+        calls: Arc::clone(&calls),
+    });
+    let serial = sw_pal::fakes::proc::serial_backend_with_uart_exclusive(holder_probe)
+        .expect("POSIX 測試替身應建立原生序列埠後端");
+    let spec = RigSpec {
+        yaml: "profiles:\n  t:\n    platform: passthrough\ntargets:\n  - {com: COM0, profile: t, device_by_id: /s/by-id/wp59}\n".to_string(),
+        devices: vec![("/s/by-id/wp59".to_string(), path.to_string())],
+        explicit_target_count: 1,
+        allowlist: None,
+        wait_ready: Vec::new(),
+    };
+    (ServiceRig::build_with_serial_backend(spec, Some(serial)), calls)
+}
+
+fn wp59_configure_health_scan(rig: &ServiceRig) {
+    rig.procs
+        .script(vec![vec![daemon(RIG_PID, "/run/wp59.sock")]]);
+    rig.procs
+        .set_multi_open_holders(vec![RIG_PID], HolderScanStatus::Permission);
 }
 
 /// 送出一個會卡住的前景命令（假 DUT 不回 prompt），回傳 cmd_id；等到 running。
@@ -3614,6 +3656,89 @@ fn health_status_foreign_holders_holder_unknown_object() {
     // 移除登記後恢復 path→pid。
     let h = r.call("health.status", "{}");
     assert!(!jv(h.get("foreign_holders").unwrap()).contains("holder_unknown"));
+}
+
+/// WP5-9：真 PTY 經 `device.release`／`device.attach` 重開後，RPC 保留 Python 的 holder 形狀。
+#[test]
+#[ignore = "cap:posix_pty"]
+#[allow(non_snake_case)]
+fn cap_posix_pty__wp59_attach_health_shape() {
+    let _g = holder_lock();
+
+    let partial_pty = sw_pal::fakes::proc::posix_pty_device()
+        .expect("此能力案例須使用 POSIX PTY");
+    let partial_path = partial_pty.device.0.clone();
+    let (partial, partial_probes) =
+        wp59_posix_rig(&partial_path, HolderScanStatus::PartialOtherUid);
+    partial.wait_state("COM0", "ATTACHED");
+    let probes_before_attach = partial_probes.load(Ordering::SeqCst);
+    let released = partial.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    partial.wait_state("COM0", "RELEASED");
+    let attached = partial.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    partial.wait_state("COM0", "ATTACHED");
+    assert_eq!(
+        partial_probes.load(Ordering::SeqCst),
+        probes_before_attach + 1,
+        "device.attach 必須經 POSIX backend 再做一次鎖後 holder 掃描"
+    );
+
+    wp59_configure_health_scan(&partial);
+    let health = partial.call("health.status", "{}");
+    assert_eq!(
+        jv(health.get("foreign_holders").unwrap()),
+        format!("{{\"{partial_path}\":{RIG_PID}}}"),
+        "PartialOtherUid 不應包成 holder_unknown 物件"
+    );
+    assert_eq!(
+        jv(health.get("multi_open_detail").unwrap()),
+        format!(
+            "{{\"daemons\":[{{\"pid\":{RIG_PID},\"socket\":\"/run/wp59.sock\"}}],\"holders_status\":\"permission\"}}"
+        ),
+        "health 自己的 FakeProcScan Permission 必須維持 permission"
+    );
+    let released = partial.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    partial.wait_state("COM0", "RELEASED");
+    assert!(
+        !sw_pal::serial::unknown_holder_devices().contains(&partial_path),
+        "PartialOtherUid 裝置不應殘留 unknown 登記"
+    );
+
+    let permission_pty = sw_pal::fakes::proc::posix_pty_device()
+        .expect("此能力案例須使用 POSIX PTY");
+    let permission_path = permission_pty.device.0.clone();
+    let (permission, _) = wp59_posix_rig(&permission_path, HolderScanStatus::Permission);
+    permission.wait_state("COM0", "ATTACHED");
+    let released = permission.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    permission.wait_state("COM0", "RELEASED");
+    let attached = permission.call("device.attach", r#"{"selector":"COM0"}"#);
+    assert_eq!(attached.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&attached));
+    permission.wait_state("COM0", "ATTACHED");
+    wp59_configure_health_scan(&permission);
+    let health = permission.call("health.status", "{}");
+    assert_eq!(
+        jv(health.get("foreign_holders").unwrap()),
+        format!(
+            "{{\"{permission_path}\":{{\"device\":\"{permission_path}\",\"holder_unknown\":true,\"pids\":[{RIG_PID}]}}}}"
+        ),
+        "Permission 對照組仍須回傳既有 holder_unknown 物件"
+    );
+    assert_eq!(
+        jv(health.get("multi_open_detail").unwrap()),
+        format!(
+            "{{\"daemons\":[{{\"pid\":{RIG_PID},\"socket\":\"/run/wp59.sock\"}}],\"holders_status\":\"permission\"}}"
+        )
+    );
+    let released = permission.call("device.release", r#"{"selector":"COM0"}"#);
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    permission.wait_state("COM0", "RELEASED");
+    assert!(
+        !sw_pal::serial::unknown_holder_devices().contains(&permission_path),
+        "關閉 Permission 對照組後必須清除 unknown 登記"
+    );
 }
 
 /// #69：`READY_UNCONFIRMED` 回應帶 `session`（Python 基線：service 層 `_resolve_session_id` 附 `session`；

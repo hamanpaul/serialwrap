@@ -21680,6 +21680,7 @@
           "cargo:sw-pal::sw_pal::serial::posix::tests::termios_odd",
           "cargo:sw-pal::sw_pal::serial::posix::tests::unknown_baud_falls_back_115200",
           "cargo:sw-pal::sw_pal::serial::posix::tests::vmin_vtime_untouched",
+          "cargo:sw-pal::sw_pal::serial::posix::tests::wp59_open_partial_other_uid_has_no_warning",
           "cargo:sw-pal::sw_pal::serial::posix::tests::write_retries_eintr_without_losing_result",
           "cargo:sw-pal::sw_pal::serial::posix::tests::xonxoff_ignored_on_posix",
           "cargo:sw-pal::sw_pal::signal::posix::tests::failed_signal_thread_spawn_restores_previous_mask",
@@ -22680,6 +22681,7 @@
     "s21_gate:cap_posix_pty": {
       "linux": {
         "nodeids": [
+          "cargo:sw-daemon::dispatch::cap_posix_pty__wp59_attach_health_shape",
           "cargo:sw-pal::serial_posix::cap_posix_pty__accept_unverified_registers_unknown_holder_device",
           "cargo:sw-pal::serial_posix::cap_posix_pty__blocked_write_cancel_returns_partial_completed",
           "cargo:sw-pal::serial_posix::cap_posix_pty__conformance_suite",
@@ -22692,6 +22694,7 @@
           "cargo:sw-pal::serial_posix::cap_posix_pty__probe_close_reopen_with_master_open",
           "cargo:sw-pal::serial_posix::cap_posix_pty__reader_woken_within_50ms",
           "cargo:sw-pal::serial_posix::cap_posix_pty__second_open_in_process_is_held",
+          "cargo:sw-pal::serial_posix::cap_posix_pty__wp59_partial_scan_not_registered_unknown",
           "cargo:sw-pal::serial_posix_process::cap_posix_pty__concurrent_wake_reaches_reader_and_writer",
           "cargo:sw-pal::serial_posix_process::cap_posix_pty__fd_not_inherited_by_child",
           "cargo:sw-pal::serial_posix_process::cap_posix_pty__holder_exit_releases_flock_excl_persists_while_master_open",

@@ -21,7 +21,7 @@ use sw_pal::fakes::serial::{FakeDevice, FakeSerialBackend};
 use sw_pal::fakes::wal_fs::FakeWalFs;
 use sw_pal::traits::{
     ConsoleTransportFactory, DeviceInfo, FsOps, FsRead, HolderReport, HolderScanStatus, PalError,
-    PalErrorKind, PalResult, UartExclusive,
+    PalErrorKind, PalResult, SerialBackend, UartExclusive,
 };
 use sw_proto::config_types::{ProfileFs, load_profiles};
 use sw_proto::pycompat::{PyErr, PyOsError};
@@ -299,7 +299,27 @@ impl ServiceRig {
     }
 
     fn build_with_console(spec: RigSpec, console: Option<Arc<RigPtyFactory>>) -> ServiceRig {
-        ServiceRig::build_with_code_identity(spec, console, None, Some("/fake/bundle".to_string()))
+        ServiceRig::build_with_code_identity(
+            spec,
+            console,
+            None,
+            Some("/fake/bundle".to_string()),
+            None,
+        )
+    }
+
+    /// 以指定序列埠後端建構 rig；`None` 沿用預設 FakeSerialBackend。
+    pub fn build_with_serial_backend(
+        spec: RigSpec,
+        serial_backend: Option<Arc<dyn SerialBackend>>,
+    ) -> ServiceRig {
+        ServiceRig::build_with_code_identity(
+            spec,
+            None,
+            None,
+            Some("/fake/bundle".to_string()),
+            serial_backend,
+        )
     }
 
     fn build_with_code_identity(
@@ -307,6 +327,7 @@ impl ServiceRig {
         console: Option<Arc<RigPtyFactory>>,
         code_fingerprint: Option<String>,
         code_path: Option<String>,
+        serial_backend: Option<Arc<dyn SerialBackend>>,
     ) -> ServiceRig {
         let serial = FakeSerialBackend::new();
         let mut devices = BTreeMap::new();
@@ -338,8 +359,10 @@ impl ServiceRig {
         ));
         let registry = CommandRegistry::new();
         let excl = Arc::new(RigExcl::default());
+        let manager_serial: Arc<dyn SerialBackend> =
+            serial_backend.unwrap_or_else(|| serial.clone());
         let mgr = SessionManager::new(ManagerDeps {
-            serial: serial.clone(),
+            serial: manager_serial,
             uart_excl: excl.clone(),
             console: match &console {
                 Some(f) => f.clone() as Arc<dyn ConsoleTransportFactory>,
@@ -420,6 +443,7 @@ impl ServiceRig {
             None,
             code_fingerprint.map(str::to_string),
             code_path.map(str::to_string),
+            None,
         )
     }
 

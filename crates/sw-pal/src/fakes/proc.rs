@@ -15,7 +15,55 @@ use super::rpc::FakeRpcConnector;
 use crate::proc_scan::{
     DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
 };
-use crate::traits::Clock;
+use crate::traits::{Clock, PalResult, SerialBackend, UartExclusive};
+#[cfg(not(unix))]
+use crate::traits::{PalError, PalErrorKind};
+
+/// 以注入的 holder 掃描建立測試用序列埠後端；非 POSIX 平台明確回報 Unsupported。
+pub fn serial_backend_with_uart_exclusive(
+    excl: Arc<dyn UartExclusive>,
+) -> PalResult<Arc<dyn SerialBackend>> {
+    #[cfg(unix)]
+    {
+        Ok(Arc::new(
+            crate::serial::posix::PosixSerialBackend::with_uart_exclusive(excl),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = excl;
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "POSIX serial backend is unavailable on this platform",
+        ))
+    }
+}
+
+/// 建立 POSIX 測試 PTY，並持有 master 對端直到此 guard 離開作用域。
+pub struct PosixPtyDevice {
+    pub device: crate::traits::DevicePath,
+    #[cfg(unix)]
+    _peer: crate::conformance::PtyPeer,
+}
+
+/// 跨平台 PTY 建構入口；非 POSIX 平台明確回報 Unsupported。
+pub fn posix_pty_device() -> PalResult<PosixPtyDevice> {
+    #[cfg(unix)]
+    {
+        let (device, peer) = crate::conformance::posix_pty_pair();
+        Ok(PosixPtyDevice {
+            device,
+            _peer: peer,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Err(PalError::plain(
+            PalErrorKind::Unsupported,
+            "POSIX PTY is unavailable on this platform",
+        ))
+    }
+}
 
 /// 假 `/proc` 檔案系統：獨立供 POSIX holder probe 注入目錄、stat 與 UID 資訊。
 #[cfg(unix)]

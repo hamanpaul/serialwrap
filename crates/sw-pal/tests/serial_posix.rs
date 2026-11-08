@@ -814,6 +814,48 @@ fn cap_posix_pty__accept_unverified_registers_unknown_holder_device() {
     drop(h);
 }
 
+/// 鎖後掃描只因他 uid 的 fd 目錄不可讀而不完整。
+struct PartialOtherUidHolders;
+
+impl sw_pal::traits::UartExclusive for PartialOtherUidHolders {
+    fn probe_holders(&self, _real_path: &str) -> HolderReport {
+        HolderReport {
+            pids: Vec::new(),
+            holder_unknown: false,
+            status: HolderScanStatus::PartialOtherUid,
+        }
+    }
+}
+
+/// S1X-a-6：真實 POSIX backend 對 PartialOtherUid 正常開埠且不登記 unknown。
+#[test]
+#[ignore = "cap:posix_pty"]
+fn cap_posix_pty__wp59_partial_scan_not_registered_unknown() {
+    let _pty_case = pty_case_guard();
+    let (dev, _peer) = posix_pty_pair();
+    let be = sw_pal::serial::posix::PosixSerialBackend::with_uart_exclusive(std::sync::Arc::new(
+        PartialOtherUidHolders,
+    ));
+
+    let handle = be
+        .open_exclusive(&dev, &cfg())
+        .expect("PartialOtherUid 應接受開埠");
+    assert!(
+        !sw_pal::serial::unknown_holder_devices().contains(&dev.0),
+        "開埠期間不應登記 {} 為 holder_unknown",
+        dev.0
+    );
+
+    let (reader, writer, _waker, close) = handle.split();
+    let receipt = close.close(reader, writer);
+    assert!(receipt.closed, "PTY handle 應成功關閉：{receipt:?}");
+    assert!(
+        !sw_pal::serial::unknown_holder_devices().contains(&dev.0),
+        "關閉後不得殘留 {} 的 holder_unknown 登記",
+        dev.0
+    );
+}
+
 /// 模擬 daemon 在鎖後 holder 重掃期間 spawn 子行程：子行程短暫繼承 daemon 已開啟的 tty fd，
 /// 不應被當成另一個外部 holder。子行程停在 fork 後、exec 前的窗口，確保重掃能穩定觀察到它。
 struct ForkWindowHolders;

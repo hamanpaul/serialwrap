@@ -2122,4 +2122,60 @@ mod tests {
             PostLockVerdict::AcceptUnverified
         );
     }
+
+    #[test]
+    fn wp59_open_partial_other_uid_has_no_warning() {
+        let partial = HolderReport {
+            pids: vec![],
+            holder_unknown: false,
+            status: HolderScanStatus::PartialOtherUid,
+        };
+        let mut ops = RecOpen {
+            probe: Some(partial),
+            ..RecOpen::default()
+        };
+
+        assert!(open_sequence(&mut ops, "/dev/pts/9").is_ok());
+        assert_eq!(
+            ops.ops,
+            vec![
+                OpenOp::Open,
+                OpenOp::Flock,
+                OpenOp::Excl,
+                OpenOp::ProbeHolders,
+                OpenOp::Termios(Ok(())),
+            ],
+            "空 PID 的 PartialOtherUid 必須依序完成鎖後掃描與 termios"
+        );
+        assert!(ops.warns.is_empty(), "不應產生 WARNING：{:?}", ops.warns);
+
+        let mut ops = RecOpen {
+            probe: Some(HolderReport {
+                pids: vec![7391],
+                holder_unknown: false,
+                status: HolderScanStatus::PartialOtherUid,
+            }),
+            ..RecOpen::default()
+        };
+        match open_sequence(&mut ops, "/dev/pts/9") {
+            Err(OpenError::Held(report)) => assert_eq!(report.pids, vec![7391]),
+            other => panic!("非空 PID 的 PartialOtherUid 必須拒絕開埠，實際 {other:?}"),
+        }
+        assert_eq!(
+            ops.ops,
+            vec![
+                OpenOp::Open,
+                OpenOp::Flock,
+                OpenOp::Excl,
+                OpenOp::ProbeHolders,
+                OpenOp::Nxcl,
+                OpenOp::CloseFd,
+            ],
+            "識別出 PID 後必須清除獨占並關閉，且不得進 termios"
+        );
+        assert!(
+            !ops.ops.iter().any(|op| matches!(op, OpenOp::Termios(_))),
+            "Reject 時不得進 termios"
+        );
+    }
 }
