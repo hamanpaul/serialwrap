@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "interactive-status",
+    "--help"
+  ],
+  "columns": 120,
+  "rc": 0,
+  "stdout": "usage: serialwrap session interactive-status [-h] --interactive-id INTERACTIVE_ID [--screen-chars SCREEN_CHARS]\n\noptions:\n  -h, --help            show this help message and exit\n  --interactive-id INTERACTIVE_ID\n  --screen-chars SCREEN_CHARS\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -10,10 +10,16 @@
 from __future__ import annotations
 
 import os
-import pty
+try:  # POSIX-only：原生 Windows 無 pty 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import pty
+except ImportError:  # pragma: no cover -- 原生 Windows
+    pty = None
 import select
 import tempfile
-import termios
+try:  # POSIX-only：原生 Windows 無 termios 模組；僅 POSIX PTY 測試（posix_only + posix_pty）使用
+    import termios
+except ImportError:  # pragma: no cover -- 原生 Windows
+    termios = None
 import threading
 import time
 import unittest
@@ -27,6 +33,7 @@ from sw_core.session_manager import InteractiveLease, SessionManager
 from sw_core.uart_io import ConsoleClient, UARTBridge
 from sw_core.util import now_iso
 from sw_core.wal import WalWriter
+import pytest
 
 
 class FakeTarget:
@@ -79,6 +86,8 @@ def _make_profile(com: str = "COM0", alias: str = "test") -> SessionProfile:
     )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestAttachConsoleInReadyGrantsInteractive(unittest.TestCase):
     """READY 狀態下 console-attach 應自動授予 interactive ownership。"""
 
@@ -159,6 +168,8 @@ class TestAttachConsoleInReadyGrantsInteractive(unittest.TestCase):
         self.assertIsNone(session.interactive_session_id)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestEscapeSequencesPassThrough(unittest.TestCase):
     """方向鍵 / Tab 在 raw interactive mode 下正確透傳到 UART。"""
 
@@ -215,6 +226,8 @@ class TestEscapeSequencesPassThrough(unittest.TestCase):
         self.assertIn(b"\x09", collected, "target 應收到 Tab")
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestAgentSuspendsHumanInteractive(unittest.TestCase):
     """Agent 命令到達時 suspend human interactive，完成後 resume。"""
 
@@ -344,6 +357,8 @@ class TestAgentSuspendsHumanInteractive(unittest.TestCase):
         self.assertEqual(resume_calls, ["resume"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestHumanLeasePeerLossGrace(unittest.TestCase):
     """human lease peer-loss grace 測試（症狀1 觸發B）。
 
@@ -451,6 +466,8 @@ class TestHumanLeasePeerLossGrace(unittest.TestCase):
         self.assertIsNone(session.interactive_session_id, "拆後 session.interactive_session_id 應為 None")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestReconcileReapsOrphanConsole(unittest.TestCase):
     """reconcile_readiness 應週期回收無外部 reader 的孤兒 console（#76）。
 
@@ -523,6 +540,8 @@ class TestReconcileReapsOrphanConsole(unittest.TestCase):
         )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestSelfHealPeriodicGrant(unittest.TestCase):
     """lease-backed 週期自癒重授 raw ownership（症狀1 觸發C、Task 7）。
 

@@ -14,6 +14,8 @@ from sw_core.wal import WalWriter
 from test_refine_ownership import RecordingBridge
 from test_transfer_portability import _LocalShellBridge
 
+pytestmark = []
+
 
 def _ready_manager(tmp_path: Path, budget: int) -> tuple[SessionManager, RecordingBridge]:
     profile = SessionProfile(
@@ -35,6 +37,8 @@ def _ready_manager(tmp_path: Path, budget: int) -> tuple[SessionManager, Recordi
     return manager, bridge
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_profile_budget_rejects_before_tx_and_releases_operation(tmp_path: Path) -> None:
     manager, bridge = _ready_manager(tmp_path, 1)
     source = tmp_path / "source.bin"
@@ -45,6 +49,8 @@ def test_profile_budget_rejects_before_tx_and_releases_operation(tmp_path: Path)
     assert manager.get_session("COM0").foreground_busy is False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_utf8_path_budget_is_checked_before_probe(tmp_path: Path) -> None:
     manager, bridge = _ready_manager(tmp_path, 505)
     source = tmp_path / "source.bin"
@@ -59,6 +65,8 @@ def test_utf8_path_budget_is_checked_before_probe(tmp_path: Path) -> None:
     assert manager.get_session("COM0").foreground_busy is False
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_probe_keeps_competing_transfer_out_until_cleanup(tmp_path: Path) -> None:
     manager, bridge = _ready_manager(tmp_path, 505)
     bridge.block_tx = True
@@ -95,6 +103,8 @@ def test_probe_keeps_competing_transfer_out_until_cleanup(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("payload", [bytes(range(256)) * 16, b""], ids=["multi-chunk", "empty"])
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 def test_openssl_roundtrip_with_505_byte_budget(tmp_path: Path, payload: bytes) -> None:
     """把真 shell fallback 與行長限制合測，不靠 fake 解碼器證明分段正確。"""
     bridge = _LocalShellBridge()

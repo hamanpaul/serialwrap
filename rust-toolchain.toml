@@ -1,0 +1,4 @@
+# 釘定 Rust 工具鏈（arch §1.1）。Windows target 以交叉連結檢查，正式 gate 於擁有者 Windows runner 原生 build。
+[toolchain]
+channel = "1.96.1"
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"]

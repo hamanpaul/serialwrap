@@ -1,0 +1,591 @@
+//! `event add --file` 與 argv 非 UTF-8 攔截的回歸測試（P3-T15 審查修正）。
+//!
+//! - 檔案內容（JSON）的 NUL 等碼位是合法資料，必須原樣送上 wire（`ParamOrigin::Document`）。
+//! - argv 衍生參數的非 UTF-8 原文仍須於送出前攔截（Q-19 (b)），錯誤文字與 CPython `UnicodeEncodeError` 相同（含區間）。
+//! - stdout 寫入失敗時走 Python 的 `except Exception` 路徑（INTERNAL_ERROR、略過版本警告與錯誤行）。
+//!
+//! 期望值取自 Python 3.12.3 基線（`sw_core/cli.py:_dispatch_event`）的實測輸出。
+
+use std::ffi::OsString;
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use sw_pal::fakes::{
+    non_utf8_os_string, FakeClock, FakeConn, FakeEnv, MemFs, RecordingProcess, ScriptedConnector,
+    StreamStep,
+};
+use sw_pal::{
+    BackendKind, ClientCaps, ClientPlatform, Clock, PalPathFlavor, RpcConnector, SkillPlatform,
+};
+
+const SOCKET_ARG: &str = "--socket=/s.sock";
+
+fn platform(
+    files: &[(&str, Vec<u8>)],
+    script: Vec<FakeConn>,
+) -> (ClientPlatform, Arc<ScriptedConnector>) {
+    let fs = MemFs::default();
+    {
+        let mut map = fs.files.lock().unwrap_or_else(|e| e.into_inner());
+        for (path, bytes) in files {
+            map.insert(PathBuf::from(path), Ok(bytes.clone()));
+        }
+    }
+    let clock = Arc::new(FakeClock::default());
+    let conn = Arc::new(ScriptedConnector::new(script, Arc::clone(&clock), true));
+    let p = ClientPlatform {
+        env: Arc::new(FakeEnv::default()),
+        fs: Arc::new(fs),
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        rpc: Arc::clone(&conn) as Arc<dyn RpcConnector>,
+        process: Arc::new(RecordingProcess::default()),
+        procs: sw_pal::fakes::FakeProcScan::new(Vec::new()),
+        tunnel: sw_pal::fakes::FakeTunnel::new(false),
+        service: sw_pal::fakes::FakeServiceCtl::new(Vec::new()),
+        registry: sw_pal::fakes::FakeRegistry::new(Vec::new(), &[]),
+        caps: ClientCaps {
+            path_flavor: PalPathFlavor::Posix,
+            af_unix: true,
+            native_backend: BackendKind::Posix,
+            default_skill: SkillPlatform::Linux,
+            text_newline: "\n",
+            exec_replace: true,
+            on_demand_autostart: false,
+            console_kind: sw_pal::ConsoleKind::Pty,
+        },
+    };
+    (p, conn)
+}
+
+fn ok_reply() -> Vec<FakeConn> {
+    vec![FakeConn::stream(vec![StreamStep::Reply(
+        b"{\"ok\":true}\n".to_vec(),
+    )])]
+}
+
+fn run_cli(args: Vec<OsString>, p: &ClientPlatform) -> (i32, String, String) {
+    let mut argv = vec![OsString::from("serialwrap")];
+    argv.extend(args);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let rc = sw_cli::run(argv, p, &mut out, &mut err);
+    (
+        rc,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+fn args(parts: &[&str]) -> Vec<OsString> {
+    let mut out = vec![OsString::from(SOCKET_ARG)];
+    out.extend(parts.iter().map(OsString::from));
+    out
+}
+
+fn sent_text(conn: &ScriptedConnector) -> Vec<String> {
+    conn.sent()
+        .into_iter()
+        .map(|bytes| String::from_utf8(bytes).unwrap())
+        .collect()
+}
+
+#[test]
+fn add_keeps_nul_in_key_and_value_on_the_wire() {
+    let (p, conn) = platform(
+        &[("/f.json", br#"{"k\u0000":"v\u0000"}"#.to_vec())],
+        ok_reply(),
+    );
+    let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 0, "stderr={err}");
+    assert_eq!(
+        sent_text(&conn),
+        vec![
+            r#"{"id":1,"method":"event.rule_set","params":{"k\u0000":"v\u0000"}}"#.to_string()
+                + "\n"
+        ]
+    );
+    assert_eq!(out, "{\"ok\":true}\n");
+}
+
+#[test]
+fn add_keeps_key_order_nan_and_non_ascii_on_the_wire() {
+    let (p, conn) = platform(
+        &[(
+            "/f.json",
+            "{\"b\":1,\"a\":[1.5,NaN],\"z\":\"é\"}".as_bytes().to_vec(),
+        )],
+        ok_reply(),
+    );
+    let (rc, _, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 0, "stderr={err}");
+    assert_eq!(
+        sent_text(&conn),
+        vec![
+            "{\"id\":1,\"method\":\"event.rule_set\",\"params\":{\"b\":1,\"a\":[1.5,NaN],\"z\":\"é\"}}\n"
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn add_sends_non_object_document_unchanged() {
+    let (p, conn) = platform(&[("/f.json", b"[1,2]".to_vec())], ok_reply());
+    let (rc, _, _) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        sent_text(&conn),
+        vec!["{\"id\":1,\"method\":\"event.rule_set\",\"params\":[1,2]}\n".to_string()]
+    );
+}
+
+#[test]
+fn add_integer_digit_limit_matches_python_boundary() {
+    // CPython 3.12 預設上限 4300 位：4300 位照送，4301 位於送出前以 INTERNAL_ERROR 結束。
+    let ok_doc = format!("{{\"a\":{}}}", "1".repeat(4300));
+    let (p, conn) = platform(&[("/ok.json", ok_doc.into_bytes())], ok_reply());
+    let (rc, _, err) = run_cli(args(&["event", "add", "--file", "/ok.json"]), &p);
+    assert_eq!(rc, 0, "stderr={err}");
+    assert_eq!(sent_text(&conn).len(), 1);
+
+    let too_long = format!("{{\"a\":{}}}", "1".repeat(4301));
+    let (p, conn) = platform(&[("/big.json", too_long.into_bytes())], vec![]);
+    let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/big.json"]), &p);
+    assert_eq!(rc, 1);
+    assert!(conn.sent().is_empty());
+    assert_eq!(
+        out,
+        "{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"Exceeds the limit (4300 digits) for integer string conversion: value has 4301 digits; use sys.set_int_max_str_digits() to increase the limit\",\"ok\":false}\n"
+    );
+    assert!(err.starts_with(
+        "serialwrap: event.rule_set failed: INTERNAL_ERROR: Exceeds the limit (4300 digits)"
+    ));
+}
+
+#[test]
+fn add_document_errors_match_python_text_and_send_nothing() {
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "bom",
+            b"\xef\xbb\xbf{\"a\":1}".to_vec(),
+            "Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)",
+        ),
+        (
+            "badutf",
+            b"{\"a\":\xff}".to_vec(),
+            "'utf-8' codec can't decode byte 0xff in position 5: invalid start byte",
+        ),
+        // CRLF 文字模式（universal newlines）後的位置：第 2 行第 3 欄。
+        (
+            "crlf",
+            b"[1,\r\n2,]\r\n".to_vec(),
+            "Expecting value: line 2 column 3 (char 6)",
+        ),
+    ];
+    for (name, bytes, message) in cases {
+        let path = format!("/{name}.json");
+        let (p, conn) = platform(&[(path.as_str(), bytes)], vec![]);
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", &path]), &p);
+        assert_eq!(rc, 1, "case {name}");
+        assert!(conn.sent().is_empty(), "case {name}");
+        assert_eq!(
+            out,
+            format!(
+                "{{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"{}\",\"ok\":false}}\n",
+                message
+            ),
+            "case {name}"
+        );
+        assert_eq!(
+            err,
+            format!("serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}\n"),
+            "case {name}"
+        );
+    }
+}
+
+#[test]
+fn argv_non_utf8_is_rejected_before_send_with_python_range_text() {
+    // `$'\xff\xfe'`：連續兩個 surrogate → 區間 58-59（Python 實測）。
+    let (p, conn) = platform(&[], vec![FakeConn::stream(vec![])]);
+    let token = non_utf8_os_string(&[0xff, 0xfe]);
+    let (rc, out, _) = run_cli(
+        vec![
+            OsString::from(SOCKET_ARG),
+            "event".into(),
+            "rm".into(),
+            token,
+        ],
+        &p,
+    );
+    assert_eq!(rc, 1);
+    assert!(conn.sent().is_empty());
+    assert_eq!(
+        out,
+        "{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"'utf-8' codec can't encode characters in position 58-59: surrogates not allowed\",\"ok\":false}\n"
+    );
+}
+
+#[test]
+fn argv_single_surrogate_uses_code_point_text() {
+    let (p, conn) = platform(&[], vec![FakeConn::stream(vec![])]);
+    let token = non_utf8_os_string(&[0xff]);
+    let (rc, out, _) = run_cli(
+        vec![
+            OsString::from(SOCKET_ARG),
+            "event".into(),
+            "rm".into(),
+            token,
+        ],
+        &p,
+    );
+    assert_eq!(rc, 1);
+    assert!(conn.sent().is_empty());
+    assert_eq!(
+        out,
+        "{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"'utf-8' codec can't encode character '\\\\udcff' in position 58: surrogates not allowed\",\"ok\":false}\n"
+    );
+}
+
+#[test]
+fn argv_three_surrogate_run_uses_range() {
+    // `\xed\xa0\x80` 解碼為三個 lone surrogate（U+DCED、U+DCA0、U+DC80）→ 區間 58-60（Python 實測）。
+    let (p, conn) = platform(&[], vec![FakeConn::stream(vec![])]);
+    let token = non_utf8_os_string(&[0xed, 0xa0, 0x80]);
+    let (rc, out, _) = run_cli(
+        vec![
+            OsString::from(SOCKET_ARG),
+            "event".into(),
+            "rm".into(),
+            token,
+        ],
+        &p,
+    );
+    assert_eq!(rc, 1);
+    assert!(conn.sent().is_empty());
+    assert!(
+        out.contains("can't encode characters in position 58-60"),
+        "out={out}"
+    );
+}
+
+/// stdout 寫入失敗（Python `_print` 拋例外）：改印 INTERNAL_ERROR、stderr 只出現該行（略過版本警告）、回 1。
+struct BrokenPipeWriter;
+
+impl Write for BrokenPipeWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        // 平台真實的斷管 OS 錯誤（不用 cfg）：POSIX 為 EPIPE（32）；Windows 的 32 是
+        // ERROR_SHARING_VIOLATION，斷管為 ERROR_BROKEN_PIPE（109）／ERROR_NO_DATA（232）。
+        let code = [32, 109, 232]
+            .into_iter()
+            .find(|&c| io::Error::from_raw_os_error(c).kind() == io::ErrorKind::BrokenPipe)
+            .expect("本平台無對應斷管的 OS 錯誤碼");
+        Err(io::Error::from_raw_os_error(code))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn stdout_write_failure_follows_python_except_path() {
+    let padded = format!(
+        "{{\"ok\":true,\"version\":\"other\",\"rules\":[\"{}\"]}}\n",
+        "x".repeat(8000)
+    );
+    let (p, _) = platform(
+        &[],
+        vec![FakeConn::stream(vec![StreamStep::Reply(
+            padded.into_bytes(),
+        )])],
+    );
+    let mut out = BrokenPipeWriter;
+    let mut err = Vec::new();
+    let argv = vec![
+        OsString::from("serialwrap"),
+        OsString::from(SOCKET_ARG),
+        OsString::from("event"),
+        OsString::from("list"),
+    ];
+    let rc = sw_cli::run(argv, &p, &mut out, &mut err);
+    assert_eq!(rc, 1);
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "serialwrap: event.rule_list failed: INTERNAL_ERROR: [Errno 32] Broken pipe\n"
+    );
+}
+
+/// S1X-b-2：`--file` 內含孤立 surrogate 跳脫時，Python `json.load` 保留 surrogate，`json.dumps(...).encode("utf-8")`
+/// 於連線成功後、送出前拋 `UnicodeEncodeError` → INTERNAL_ERROR（context=event.rule_set）、exit 1、daemon 收到 0 筆請求行。
+/// 期望值取自 Python 3.12.3 CLI 對記錄請求行的 echo stub 實測（stub 端連線建立但收到 0 bytes）。
+#[test]
+fn add_lone_surrogate_in_document_fails_after_connect_without_sending() {
+    let cases: [(&str, &str); 7] = [
+        (r#"{"lone":"\udc80"}"#, "character '\\udc80' in position 52"),
+        (r#"{"a":"\ud800"}"#, "character '\\ud800' in position 49"),
+        (r#"{"a":"\ud800A"}"#, "character '\\ud800' in position 49"),
+        (r#"{"a":"x\udc80\udc81y"}"#, "characters in position 50-51"),
+        (r#"{"k\udcff":1}"#, "character '\\udcff' in position 46"),
+        (
+            r#"{"n":"\u0000","a":["é","\udfff"]}"#,
+            "character '\\udfff' in position 67",
+        ),
+        (
+            r#"{"name":"r","pattern":"x","lone":"\udc80"}"#,
+            "character '\\udc80' in position 77",
+        ),
+    ];
+    for (doc, detail) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        let message = format!("'utf-8' codec can't encode {detail}: surrogates not allowed");
+        assert_eq!(rc, 1, "doc={doc} out={out}");
+        assert_eq!(
+            out,
+            format!(
+                "{{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"{}\",\"ok\":false}}\n",
+                message.replace('\\', "\\\\")
+            ),
+            "doc={doc}"
+        );
+        assert_eq!(
+            err,
+            format!("serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}\n"),
+            "doc={doc}"
+        );
+        assert_eq!(conn.connect_count(), 1, "doc={doc}");
+        assert!(
+            sent_text(&conn).is_empty(),
+            "doc={doc} sent={:?}",
+            sent_text(&conn)
+        );
+    }
+}
+
+#[test]
+fn add_lone_surrogate_connect_failure_reports_socket_error_first() {
+    // Python 先連線：連線失敗時回 SOCKET_ERROR（exit 2），不會走到編碼錯誤。
+    let (p, conn) = platform(
+        &[("/f.json", br#"{"lone":"\udc80"}"#.to_vec())],
+        vec![FakeConn::refuse_errno(
+            111,
+            "[Errno 111] Connection refused",
+        )],
+    );
+    let (rc, out, _) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 2, "out={out}");
+    assert!(out.contains("\"error_code\":\"SOCKET_ERROR\""), "out={out}");
+    assert!(sent_text(&conn).is_empty());
+}
+
+#[test]
+fn add_paired_surrogate_escape_is_sent_as_one_code_point() {
+    // 合法的 surrogate pair 仍組成單一碼位送出（回歸防線：不得誤判為孤立 surrogate）。
+    let (p, conn) = platform(
+        &[("/f.json", br#"{"e":"\ud83d\ude00"}"#.to_vec())],
+        ok_reply(),
+    );
+    let (rc, _, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    assert_eq!(rc, 0, "stderr={err}");
+    assert_eq!(
+        sent_text(&conn),
+        vec!["{\"id\":1,\"method\":\"event.rule_set\",\"params\":{\"e\":\"😀\"}}\n".to_string()]
+    );
+}
+
+/// S1-2a65438-1：重複鍵以後值覆寫前值（Python `json.loads` 語意），被覆寫掉的孤立 surrogate 不得讓請求被拒；
+/// 只依最終物件判定。期望請求行取自 Python 3.12.3 `json.dumps` 實測。
+#[test]
+fn add_overwritten_lone_surrogate_by_duplicate_key_is_sent() {
+    let cases: [(&str, &str); 5] = [
+        (r#"{"lone":"\ud800","lone":"ok"}"#, r#"{"lone":"ok"}"#),
+        (
+            r#"{"a":{"x":"\udc80"},"a":{"x":"ok"}}"#,
+            r#"{"a":{"x":"ok"}}"#,
+        ),
+        (r#"{"a":["\udc80"],"b":1,"a":[1]}"#, r#"{"a":[1],"b":1}"#),
+        (
+            r#"{"o":{"a":"\udfff","a":2},"o":{"a":"\ud801","a":3}}"#,
+            r#"{"o":{"a":3}}"#,
+        ),
+        // 合法內容「NUL 後緊接 U+FD800」與 pyfmt 跳脫外形相同，不得被誤認為殘留的孤立 surrogate。
+        (
+            r#"{"a":"\udc80","a":"\u0000\udbb6\udc00"}"#,
+            "{\"a\":\"\\u0000\u{FD800}\"}",
+        ),
+    ];
+    for (doc, params) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        assert_eq!(rc, 0, "doc={doc} out={out} stderr={err}");
+        assert_eq!(
+            sent_text(&conn),
+            vec![format!(
+                "{{\"id\":1,\"method\":\"event.rule_set\",\"params\":{params}}}\n"
+            )],
+            "doc={doc}"
+        );
+    }
+}
+
+/// S1-2a65438-1：最終物件仍含孤立 surrogate（後值帶入，或重複鍵本身含 surrogate）時照樣拒送；位置依最終請求行。
+#[test]
+fn add_lone_surrogate_surviving_duplicate_key_is_rejected() {
+    let cases: [(&str, &str); 3] = [
+        (
+            r#"{"a":"ok","a":"\udc80"}"#,
+            "character '\\udc80' in position 49",
+        ),
+        (
+            r#"{"k\udcff":1,"k\udcff":2}"#,
+            "character '\\udcff' in position 46",
+        ),
+        (
+            r#"{"a":"\ud800","b":"x","a":"y","c":"\udc81"}"#,
+            "character '\\udc81' in position 65",
+        ),
+    ];
+    for (doc, detail) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        let message = format!("'utf-8' codec can't encode {detail}: surrogates not allowed");
+        assert_eq!(rc, 1, "doc={doc} out={out}");
+        assert_eq!(
+            err,
+            format!("serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}\n"),
+            "doc={doc}"
+        );
+        assert!(sent_text(&conn).is_empty(), "doc={doc}");
+    }
+}
+
+/// 連線成功後、送出前以 `UnicodeEncodeError` 拒送：INTERNAL_ERROR、exit 1、零請求行；`detail` 為 Python 3.12.3 實測文字。
+fn assert_rejected_before_send(doc: &str, detail: &str) {
+    let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+    let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+    let message = format!("'utf-8' codec can't encode {detail}: surrogates not allowed");
+    assert_eq!(rc, 1, "doc={doc} out={out}");
+    assert_eq!(
+        out,
+        format!(
+            "{{\"error_code\":\"INTERNAL_ERROR\",\"message\":\"{}\",\"ok\":false}}\n",
+            message.replace('\\', "\\\\")
+        ),
+        "doc={doc}"
+    );
+    assert_eq!(
+        err,
+        format!("serialwrap: event.rule_set failed: INTERNAL_ERROR: {message}\n"),
+        "doc={doc}"
+    );
+    assert_eq!(conn.connect_count(), 1, "doc={doc}");
+    assert!(
+        sent_text(&conn).is_empty(),
+        "doc={doc} sent={:?}",
+        sent_text(&conn)
+    );
+}
+
+/// S1-f2a23b1-1：合法鍵「NUL＋U+FD800」與孤立 surrogate 鍵 `\ud800` 在 Python 是兩個不同的鍵，
+/// 後者留在最終物件，`json.dumps(...).encode("utf-8")` 失敗而拒送；不得合併成同一鍵後照送。
+/// 期望文字取自 Python 3.12.3 CLI 對記錄請求行的 stub 實測（連線 1 次、0 筆請求行）。
+#[test]
+fn add_lone_surrogate_key_colliding_with_legal_key_is_rejected() {
+    let cases: [(&str, &str); 6] = [
+        // 報告反例與交換順序。
+        (
+            r#"{"\u0000\udbb6\udc00":1,"\ud800":2}"#,
+            "character '\\ud800' in position 57",
+        ),
+        (
+            r#"{"\ud800":2,"\u0000\udbb6\udc00":1}"#,
+            "character '\\ud800' in position 45",
+        ),
+        // 合法鍵的值含 surrogate、碰撞鍵的值合法：合併後兩者都會消失。
+        (
+            r#"{"\u0000\udbb6\udc00":"\ud800","\ud800":"x"}"#,
+            "character '\\ud800' in position 55",
+        ),
+        (
+            r#"{"o":{"\u0000\udbb6\udc00":1,"\ud800":2}}"#,
+            "character '\\ud800' in position 62",
+        ),
+        (
+            r#"[{"\ud800":1,"\u0000\udbb6\udc00":2},"\u0000\udbb6\udc00"]"#,
+            "character '\\ud800' in position 46",
+        ),
+        (
+            r#"{"\u0000\udbb6\udc00":1,"\ud800":2,"\u0000\udbb6\udc00":3,"\ud800":4}"#,
+            "character '\\ud800' in position 57",
+        ),
+    ];
+    for (doc, detail) in cases {
+        assert_rejected_before_send(doc, detail);
+    }
+}
+
+/// S1-f2a23b1-1：合法內容（NUL＋U+FD800、跳脫的反斜線後接 `u0000`、連續 NUL）不得被當成孤立 surrogate，
+/// 錯誤位置依 Python 的最終請求行計算。
+#[test]
+fn add_legal_content_resembling_surrogate_escape_keeps_python_position() {
+    let cases: [(&str, &str); 5] = [
+        (
+            r#"{"a":"\u0000\udbb6\udc00","b":"\ud800"}"#,
+            "character '\\ud800' in position 63",
+        ),
+        (
+            r#"{"a":"\\u0000\udbb6\udc00","b":"\ud800"}"#,
+            "character '\\ud800' in position 64",
+        ),
+        (
+            r#"{"a":"\u0000\ud800"}"#,
+            "character '\\ud800' in position 55",
+        ),
+        (
+            r#"{"a":"\u0000\u0000\udc80\udc81\u0000"}"#,
+            "characters in position 61-62",
+        ),
+        (
+            r#"{"\u0000":1,"\u0000":2,"x":"\udc80"}"#,
+            "character '\\udc80' in position 60",
+        ),
+    ];
+    for (doc, detail) in cases {
+        assert_rejected_before_send(doc, detail);
+    }
+}
+
+/// S1-f2a23b1-1：只有合法鍵（含與 surrogate 跳脫外形相同的 NUL＋U+FD800）時照常送出；
+/// 期望請求行取自 Python 3.12.3 stub 實測。
+#[test]
+fn add_legal_key_resembling_surrogate_escape_is_sent() {
+    let cases: [(&str, &str); 4] = [
+        (r#"{"\u0000\udbb6\udc00":1}"#, "{\"\\u0000\u{FD800}\":1}"),
+        (
+            r#"{"\u0000\udbb6\udc00":1,"\u0000\udbb6\udc00":2}"#,
+            "{\"\\u0000\u{FD800}\":2}",
+        ),
+        (
+            r#"{"\u0000\udbb6\udc00":"\ud800","\u0000\udbb6\udc00":"ok"}"#,
+            "{\"\\u0000\u{FD800}\":\"ok\"}",
+        ),
+        (
+            r#"{"\u0000":"\u0000\u0000","a":"\udc80","a":"\u0000"}"#,
+            r#"{"\u0000":"\u0000\u0000","a":"\u0000"}"#,
+        ),
+    ];
+    for (doc, params) in cases {
+        let (p, conn) = platform(&[("/f.json", doc.as_bytes().to_vec())], ok_reply());
+        let (rc, out, err) = run_cli(args(&["event", "add", "--file", "/f.json"]), &p);
+        assert_eq!(rc, 0, "doc={doc} out={out} stderr={err}");
+        assert_eq!(out, "{\"ok\":true}\n", "doc={doc}");
+        assert_eq!(
+            sent_text(&conn),
+            vec![format!(
+                "{{\"id\":1,\"method\":\"event.rule_set\",\"params\":{params}}}\n"
+            )],
+            "doc={doc}"
+        );
+    }
+}

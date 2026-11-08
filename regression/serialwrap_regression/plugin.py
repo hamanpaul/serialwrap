@@ -6,8 +6,6 @@ remediation enabled:true 僅作 FailureSnapshot 通道；retry.max_attempts=1。
 from __future__ import annotations
 
 import datetime as dt
-import os
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -73,6 +71,14 @@ class Plugin(PluginBase):
         if missing:
             raise ValueError(f"未知 case id：{','.join(missing)}")
 
+        from realhw import deployed_content, preflight as realhw_preflight
+
+        exe, _identity = realhw_preflight.resolve_serialwrap_exe(cfg)
+        deployed_start = deployed_content.measure(exe)
+        install = Path(str(deployed_start.get("install_dir") or "")) if deployed_start.get("install_dir") else None
+        pid = pf.get("daemon_pid")
+        live = [deployed_content.live_daemon(int(pid), install)] if pid else []
+
         head = subprocess.run(
             ["git", "-C", str(core.REPO_ROOT), "rev-parse", "--short", "HEAD"],
             check=False,
@@ -85,7 +91,12 @@ class Plugin(PluginBase):
             "tiers": "regression",
             "started_at": dt.datetime.now().strftime("%y%m%d-%H%M%S"),
             "preflight_notes": list(pf["problems"]) + list(pf["notes"]),
+            "cross_os_guard": pf.get("cross_os_guard", "unconfigured"),
+            "cross_os_detail": pf.get("cross_os_detail"),
             "allow_destructive": bool(cfg.get("allow_destructive")),
+            "deployed_content_start": deployed_start,
+            "deployed_content_live": live,
+            "daemon_pid": pid,
             "boards": [
                 {
                     "com": str(b.get("com", "")),
@@ -122,8 +133,6 @@ class Plugin(PluginBase):
             self._broken_by,
             allow_destructive=bool(self._load_cfg().get("allow_destructive")),
         )
-        if os.name == "nt" and case_id != "f9-brcm-spaced-prompt-reboot-login":
-            skip = ("windows_case_unsupported", "此 case 依賴 POSIX 工具／裝置，Windows 只支援 BRCM reboot case")
         if skip is not None:
             reason_code, comment = skip
             result = core.make_skip_result(reason_code, comment)
@@ -173,11 +182,14 @@ class Plugin(PluginBase):
             ((self._plugin_root() / "agent-config.yaml").is_file(), "agent-config.yaml 存在"),
             ((self._plugin_root() / "testbed.yaml.example").is_file(), "testbed.yaml.example 存在"),
         ]
-        if os.name != "nt":
-            checks.extend([
-                (shutil.which("tmux") is not None, "tmux 可用"),
-                (shutil.which("minicom") is not None, "minicom 可用"),
-            ])
+        try:
+            from realhw import frontends
+
+            cfg = self._load_cfg()
+            frontend_ok, frontend_detail = frontends.frontend_capability(cfg)
+            checks.append((frontend_ok, f"human frontend 可用（{frontend_detail}）"))
+        except Exception as exc:
+            checks.append((False, f"human frontend 設定無效：{exc!r}"))
         try:
             cfg = self._load_cfg()
             exe = Path(str(cfg.get("serialwrap_exe", "")))

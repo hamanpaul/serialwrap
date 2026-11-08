@@ -7,6 +7,9 @@ import time
 
 from sw_core.uart_io import UARTBridge
 from sw_core.config import UartProfile
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class _RecordingWal:

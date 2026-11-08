@@ -1,0 +1,14 @@
+{
+  "posix_only": {
+    "applies_to": "windows",
+    "note": "POSIX 專屬測試（PTY、AF_UNIX、/proc、/dev/ptmx）在 Windows 上不適用；Windows 輪出現此原因的 SKIP 視為合法的不適用，POSIX 輪則不得以此原因跳過。"
+  },
+  "windows_native": {
+    "applies_to": "posix",
+    "note": "原生 Windows 專屬測試（檔案分享旗標、msvcrt 鎖、原生行程與排程器）在 POSIX 上不適用；POSIX 輪出現此原因的 SKIP 視為合法的不適用。"
+  },
+  "rust-only contract": {
+    "applies_to": "python",
+    "note": "僅 Rust 受測輪執行的契約（marker rust_only）；Python 基線輪 SKIP 為合法的不適用。"
+  }
+}

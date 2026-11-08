@@ -6,12 +6,21 @@ PTY 注意事項：
   - master fd 設 non-blocking，以便 pump 使用 select 多路等待。
 """
 import os
+import pytest
+
+# POSIX-only：本檔頂層 import pty（→ tty → termios），原生 Windows 無 termios；非 POSIX 整檔略過、不 import。
+if os.name != "posix":
+    pytest.skip("flash pump 測試依賴 POSIX pty／termios", allow_module_level=True)
+
 import pty
 import threading
 import time
 import tty
 
 from sw_core.flash_endpoint import pump_endpoint_to_sink, make_rx_to_endpoint_writer
+import pytest
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.posix_pty]
 
 
 class _Sink:

@@ -9,6 +9,7 @@ from unittest import mock
 from sw_core.config import UartProfile
 from sw_core.uart_io import UARTBridge
 from sw_core.wal import WalWriter
+import pytest
 
 
 def _make_pty_bridge(com: str = "COM0") -> tuple[UARTBridge, int, int, tempfile.TemporaryDirectory]:
@@ -30,6 +31,8 @@ def _make_pty_bridge(com: str = "COM0") -> tuple[UARTBridge, int, int, tempfile.
     return bridge, master_fd, slave_fd, tmpdir
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestUartBridgeConsoleCleanup(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -81,6 +84,8 @@ class TestUartBridgeConsoleCleanup(unittest.TestCase):
         self.assertIn(primary["client_id"], client_ids)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestUartBridgeSuspendResume(unittest.TestCase):
     """suspend_interactive / resume_interactive 的單元測試。"""
 
@@ -204,6 +209,8 @@ class TestUartBridgeSuspendResume(unittest.TestCase):
             self.assertIsNone(self._bridge._interactive_owner)
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestConsoleClientInternalFlag(unittest.TestCase):
     """Task 2：ConsoleClient.internal 旗標——哨兵 primary vs 真實 console。"""
 
@@ -237,6 +244,8 @@ class TestConsoleClientInternalFlag(unittest.TestCase):
             tmpdir.cleanup()
 
 
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestReapStaleConsoles(unittest.TestCase):
     """Task 3：UARTBridge.reap_stale_consoles() 主動回收孤兒 console。"""
 
@@ -331,6 +340,8 @@ class TestReapStaleConsoles(unittest.TestCase):
             tmpdir.cleanup()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestSnapshotDecisionFieldsAndAtomicGrant(unittest.TestCase):
     """Task 6：snapshot() 擴充決策欄位 + try_grant_interactive_if_idle 原子 grant（Codex finding-2）。"""
 
@@ -407,6 +418,8 @@ class TestSnapshotDecisionFieldsAndAtomicGrant(unittest.TestCase):
             tmpdir.cleanup()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestRxOffsetBoundedBuffer(unittest.TestCase):
     """#158：RX 視窗有界修剪不得破壞 offset 語意（絕對串流偏移記帳）。
 
@@ -503,6 +516,8 @@ class TestRxOffsetBoundedBuffer(unittest.TestCase):
         self.assertEqual(bridge.snapshot()["rx_dropped_chars"], 40)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestRxStats(unittest.TestCase):
     """#153：UARTBridge RX 速率統計視窗（rx_stats）。
 
@@ -592,6 +607,8 @@ class TestRxStats(unittest.TestCase):
         self.assertEqual(bridge.snapshot()["rx_total_bytes"], 8)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestSendCommandEchoPaced(unittest.TestCase):
     """#161：send_command_echo_paced／_await_echo_progress／cancel_input_line。
 

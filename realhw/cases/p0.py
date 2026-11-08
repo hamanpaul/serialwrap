@@ -1,10 +1,14 @@
 """P0 煙霧（~15 分鐘）。全部非破壞性。"""
 from __future__ import annotations
 
+import dataclasses
+import json
+import os
 import random
 import time
 from pathlib import Path
 
+from .. import wal_oracle
 from ..drivers import strip_ansi
 from ..harness import Case, CaseResult, register
 
@@ -55,10 +59,10 @@ def p0_cmd_async(ctx):
 @_case("p0-console-raw", "minicom 連線＋raw ownership（Tab 補完）",
        hints=("方向鍵/Tab 失效＝掉回 line-buffer，多半 orphan lease 佔住授予閘（#76/#99）",
               "minicom 顯示 Offline（DCD 未拉）不影響輸入"),
-       requires=("tmux", "two_boards"))
+       requires=("human_frontend", "two_boards"))
 def p0_console_raw(ctx):
-    ses = ctx.tmux.name("p0con")
-    ctx.tmux.new(ses, "serialwrap-minicom COM0")
+    human = ctx.human("p0con", "minicom")
+    human.open("COM0")
     try:
         time.sleep(6)  # 等 console-attach＋minicom 起來
         cl = ctx.sw.run("session", "console-list", "--selector", "COM0")
@@ -67,18 +71,18 @@ def p0_console_raw(ctx):
         if not any(c.get("interactive_owner") for c in consoles):
             return CaseResult("FAIL", reason="第一個 console 未拿到 raw interactive ownership",
                               category="test", reason_code="raw_ownership_not_granted")
-        ctx.tmux.send(ses, "ec", enter=False)
-        ctx.tmux.send_key(ses, "Tab")
+        human.send_text("ec")
+        human.send_key("Tab")
         time.sleep(2)
-        pane = ctx.tmux.capture(ses)
+        pane = human.capture()
         ctx.note("pane.txt", pane)
         if "echo" not in strip_ansi(pane):
             return CaseResult("FAIL", reason="Tab 補完未出現（raw 路徑疑掉回 line-buffer）",
                               category="test", reason_code="raw_fallback_linebuffer")
-        ctx.tmux.send_key(ses, "C-u")  # 清掉半行，還原乾淨 prompt
+        human.send_key("C-u")  # 清掉半行，還原乾淨 prompt
         return CaseResult("PASS")
     finally:
-        ctx.tmux.kill(ses)
+        human.close()
         time.sleep(3)  # 等 router 清理 detach
 
 
@@ -126,21 +130,65 @@ def p0_blog_clean(ctx):
 
 
 @_case("p0-wal-live", "WAL 活性與位置",
-       hints=("live WAL 一律在 ~/.local/state/serialwrap/wal（systemd 不繼承 shell env）；勿讀 stale ~/b-log/raw.*",))
+       hints=("依 daemon status.wal_path 讀取 live WAL 並以 marker／CRC 驗證活性；勿依賴 mtime 或寫死路徑",))
 def p0_wal_live(ctx):
-    mirror = Path.home() / ".local/state/serialwrap/wal/raw.mirror.log"
-    before = mirror.stat().st_mtime if mirror.exists() else 0
+    status = ctx.sw.run("daemon", "status")
+    ctx.note("daemon-status.json", str(status))
+    wal_path = status.get("wal_path")
+    if not (isinstance(wal_path, str) and wal_path.strip()):
+        return CaseResult("FAIL", reason="daemon status 未回報 wal_path",
+                          category="test", reason_code="wal_path_missing")
+    if not os.path.exists(wal_path):
+        return CaseResult("FAIL", reason=f"wal_path={wal_path} 指向不存在的檔案",
+                          category="test", reason_code="wal_path_not_found")
+
+    try:
+        cur = wal_oracle.open_cursor(wal_path)
+    except OSError as exc:
+        return CaseResult(
+            "FAIL",
+            reason=f"WAL 無法開啟游標／讀取（{exc}）：wal_path={wal_path}",
+            category="environment",
+            reason_code="wal_unreadable",
+        )
+
     marker = f"P0WAL_{random.randint(10000, 99999)}"
-    ctx.sw.submit_and_wait("COM0", f"echo {marker}")
-    time.sleep(2)
-    if not mirror.exists() or mirror.stat().st_mtime <= before:
-        return CaseResult("FAIL", reason="live WAL mirror mtime 未跳動",
-                          category="test", reason_code="wal_mirror_stale")
-    tail = mirror.read_text(errors="replace")[-8000:]
-    if marker not in tail:
-        return CaseResult("FAIL", reason="WAL mirror 未見命令 marker",
-                          category="test", reason_code="wal_marker_missing")
-    return CaseResult("PASS")
+    boards = ctx.cfg.get("boards") or []
+    com = boards[0]["com"] if boards else "COM0"
+    cmd = ctx.sw.submit_and_wait(com, f"echo {marker}")
+    ctx.note("submit.json", str(cmd))
+    if (cmd.get("status") or "") != "done":
+        return CaseResult(
+            "FAIL",
+            reason=f"submit 失敗（status={cmd.get('status')}）",
+            category="environment",
+            reason_code="submit_precondition_failed",
+        )
+
+    cmd_id = cmd.get("cmd_id")
+    timeout_s = ctx.cfg.get("timeouts", {}).get("wal_oracle_s", 10.0)
+    res = wal_oracle.wait_for_marker(
+        cur,
+        marker=marker.encode("utf-8"),
+        cmd_id=cmd_id,
+        timeout_s=timeout_s,
+        sleep=time.sleep,
+    )
+    ctx.note(
+        "wal-oracle.json",
+        json.dumps(dataclasses.asdict(res), sort_keys=True, indent=2, ensure_ascii=False),
+    )
+    if res.ok:
+        return CaseResult("PASS")
+
+    category = wal_oracle.reason_category(res.reason_code)
+    return CaseResult(
+        "FAIL",
+        reason=f"WAL oracle 驗證失敗（{res.reason_code}）",
+        category=category,
+        reason_code=res.reason_code,
+        evidence={"wal-oracle.json": "wal-oracle.json"},
+    )
 
 
 @_case("p0-multiopen", "無多開（multi_open 假、無外來 tty 持有者）")
@@ -150,9 +198,15 @@ def p0_multiopen(ctx):
     # 欄位核對（#122）：daemon status 的 foreign_holders 是「所有 serialwrapd 對已 attach
     # tty 的持有者 map（tty→pid）」，健康的單一 daemon 一定含自身 pid（非空）。真正的
     # two-reader 訊號＝multi_open 為真，或 holders 內出現 daemon 自身 pid 以外的 pid。
+    # S1X-a-6：entry 亦可能是 BC-04 的 {device, holder_unknown:true, pids?}；holder_unknown 本身
+    # 只是診斷，只有 pids 含本 daemon 以外的 pid 才算外來持有者（比照 acceptance/gate.py）。
     own_pid = st.get("pid")
     holders = st.get("foreign_holders") or {}
-    foreign = {tty: p for tty, p in holders.items() if p != own_pid}
+    foreign = {}
+    for tty, entry in holders.items():
+        pids = list(entry.get("pids") or []) if isinstance(entry, dict) else [entry]
+        if any(p != own_pid for p in pids):
+            foreign[tty] = entry
     if st.get("multi_open") or foreign:
         return CaseResult("FAIL", reason=f"multi_open={st.get('multi_open')} 外來持有者={foreign}",
                           category="environment", reason_code="foreign_tty_holder")

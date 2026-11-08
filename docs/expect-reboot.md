@@ -37,7 +37,8 @@ serialwrap cmd submit --selector COM0 --source agent:fw \
 | `--mode line`／`background` | 都走 reboot 路徑。與單獨 `reboot` 一樣，background 不建立 capture（沒有 `result-tail`） |
 | 同時帶 `--completion-regex` | reboot 優先：regex 通過驗證但不使用，也不寫 `command_completion` META；`command.get` 兩個欄位照實回報。與單獨 `reboot` 搭配 `--completion-regex` 的既有行為一致 |
 | 開機靜默窗內、或 READY 尚未再確認 | 旗標**不繞過** gate：submit-time／execute-time 照常回可重試的 `AUTOBOOT_QUIET`（或不可重試的 `READY_UNCONFIRMED`），零 TX |
-| `source=human:*` | 沿用既有 reboot 路徑的 `PROMOTE_HUMAN_INTERACTIVE` |
+| RPC 原始 `source` 恰為 bare `human`／`human:` | 依 OD-74 走 human gate；沿用 reboot 路徑的 `PROMOTE_HUMAN_INTERACTIVE` |
+| 明寫 `source=human:<x>`（包括 `human:cli`） | 依 DF-02 走 agent gate 與逾時行為；`source_class` 顯示為 human 不會授予權限 |
 
 ## 串接命令的時序
 

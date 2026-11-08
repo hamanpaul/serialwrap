@@ -1,0 +1,141 @@
+---
+meta:
+  name: l15-slow-reader-backpressure
+  category: l15-scenario
+  severity: critical
+  description: "DUT 停讀時寫入出現背壓且緩衝有界，恢復後命令連續且無自動重送（§15.7.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_forbidden_interleave, no_auto_resend]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge:
+  applicable: true
+  only: true
+  compare: full
+  run_args: ["--max-inflight-bytes", "16384"]
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+  plan:
+    schema_version: "dut-plan.v1"
+    seed: 1015
+    triggers:
+      - id: stop-slow
+        line_contains: "L15_SLOW"
+        action:
+          kind: stop_stdin
+          resume_after_ms: 20000
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_SLOW"]
+    save_as: slow_cmd
+  - action: wait_wire_marker
+    marker: "echo L15_SLOW\n"
+    observation: "dut_stdin_write"
+    timeout_s: 10
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_01_{15980_x}"]
+    save_as: bp01
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_02_{15980_x}"]
+    save_as: bp02
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_03_{15980_x}"]
+    save_as: bp03
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_04_{15980_x}"]
+    save_as: bp04
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_05_{15980_x}"]
+    save_as: bp05
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_06_{15980_x}"]
+    save_as: bp06
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_07_{15980_x}"]
+    save_as: bp07
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_08_{15980_x}"]
+    save_as: bp08
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_09_{15980_x}"]
+    save_as: bp09
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_10_{15980_x}"]
+    save_as: bp10
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_11_{15980_x}"]
+    save_as: bp11
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_BP_12_{15980_x}"]
+    save_as: bp12
+  - action: cli
+    argv: ["daemon", "status"]
+    expect: {ok: true}
+  - action: dut_control
+    action_name: stdin_resume
+  - action: wait_command_done
+    cmd_id: "{bp01.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp02.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp03.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp04.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp05.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp06.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp07.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp08.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp09.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp10.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp11.cmd_id}"
+    timeout_s: 30
+  - action: wait_command_done
+    cmd_id: "{bp12.cmd_id}"
+    timeout_s: 30
+  - action: assert_wire_contiguous
+    payloads:
+      - "echo L15_BP_01_{15980_x}\n"
+      - "echo L15_BP_02_{15980_x}\n"
+      - "echo L15_BP_03_{15980_x}\n"
+      - "echo L15_BP_04_{15980_x}\n"
+      - "echo L15_BP_05_{15980_x}\n"
+      - "echo L15_BP_06_{15980_x}\n"
+      - "echo L15_BP_07_{15980_x}\n"
+      - "echo L15_BP_08_{15980_x}\n"
+      - "echo L15_BP_09_{15980_x}\n"
+      - "echo L15_BP_10_{15980_x}\n"
+      - "echo L15_BP_11_{15980_x}\n"
+      - "echo L15_BP_12_{15980_x}\n"
+  - action: assert_compare

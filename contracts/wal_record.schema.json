@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "serialwrap WAL record contract",
+  "x-catalog-revision": 1,
+  "x-key-order": "sorted",
+  "x-serialization": "DISK_STABLE（ensure_ascii=False, sort_keys=True, separators=(',',':')）＋\\n",
+  "x-rotate": {
+    "threshold_bytes": 67108864,
+    "condition": "size >= R",
+    "checked": "before_write",
+    "applies_to": [
+      "raw.wal.ndjson",
+      "raw.mirror.log"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "cmd_id",
+    "com",
+    "crc32",
+    "dir",
+    "len",
+    "loss_flag",
+    "meta",
+    "mono_ts_ns",
+    "payload_b64",
+    "seq",
+    "source",
+    "wall_ts"
+  ],
+  "properties": {
+    "cmd_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "命令 ID；非命令關聯時為 null"
+    },
+    "com": {
+      "type": "string",
+      "description": "COM 埠名稱（如 COM0；PROBE 為偵測探針）"
+    },
+    "crc32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$",
+      "description": "原始 payload 之 IEEE 802.3 CRC32，8 位小寫十六進位字串"
+    },
+    "dir": {
+      "type": "string",
+      "x-known-values": [
+        "RX",
+        "TX",
+        "META"
+      ],
+      "description": "傳輸方向（已知 RX、TX、META，程式未強制造訪列舉）"
+    },
+    "len": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "原始 payload 位元組長度"
+    },
+    "loss_flag": {
+      "type": "boolean",
+      "description": "寫入失敗或資料可能遺失旗標"
+    },
+    "meta": {
+      "type": "object",
+      "description": "附加詮釋資料物件；dir 為 META 時依 wal_meta_events.schema.json 驗證"
+    },
+    "mono_ts_ns": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "單調時鐘奈秒戳（CLOCK_MONOTONIC）"
+    },
+    "payload_b64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+      "description": "以標準 Base64 編碼之 payload（含 = padding）"
+    },
+    "rotation_failed": {
+      "type": "boolean",
+      "const": true,
+      "description": "輪替失敗時附加的旗標（選填，正常紀錄無此欄位）"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "WAL 序號：每筆 append 遞增 1；rotate 不重設；wal.reset 後自 1 重新起算；daemon 重啟時自現行檔最大有效 seq 續號（無現行檔則自 1 起）；跨歸檔檔不保證唯一"
+    },
+    "source": {
+      "type": "string",
+      "description": "來源識別字（如 device、agent:x、system、flash 等）"
+    },
+    "wall_ts": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{6})?\\+00:00$",
+      "description": "UTC ISO 8601 時間戳（微秒可省略，時區固定為 +00:00）"
+    }
+  },
+  "if": {
+    "properties": {
+      "dir": {
+        "const": "META"
+      }
+    },
+    "required": [
+      "dir"
+    ]
+  },
+  "then": {
+    "properties": {
+      "meta": {
+        "$ref": "wal_meta_events.schema.json"
+      }
+    }
+  }
+}

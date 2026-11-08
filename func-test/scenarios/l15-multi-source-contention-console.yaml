@@ -1,0 +1,67 @@
+---
+meta:
+  name: l15-multi-source-contention-console
+  category: l15-scenario
+  severity: critical
+  description: "CLI 與 console 混合競爭時，命令與輸入不互相切斷且保持連續（§15.7.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_forbidden_interleave]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.2"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: attach_console
+    selector: COM0
+    label: human-con
+    save_as: hc
+  - action: parallel
+    steps:
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:1", "--cmd", "echo M_AGENT_1"]
+        save_as: ag1
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:2", "--cmd", "echo M_AGENT_2"]
+        save_as: ag2
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:3", "--cmd", "echo M_AGENT_3"]
+        save_as: ag3
+      - action: cli
+        argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:4", "--cmd", "echo M_AGENT_4"]
+        save_as: ag4
+      - action: console_write
+        console_id: "{hc.client_id}"
+        input_raw: "echo HUMAN_X\r"
+  - action: wait_command_done
+    cmd_id: "{ag1.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{ag2.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{ag3.cmd_id}"
+  - action: wait_command_done
+    cmd_id: "{ag4.cmd_id}"
+  - action: assert_wire_contiguous
+    payloads: ["echo M_AGENT_1\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_AGENT_2\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_AGENT_3\n"]
+  - action: assert_wire_contiguous
+    payloads: ["echo M_AGENT_4\n"]
+  - action: assert_compare

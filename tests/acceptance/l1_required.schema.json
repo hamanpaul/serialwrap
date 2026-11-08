@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/l1-required-lock.schema.json",
+  "title": "L1 必要案例集合鎖（P2-T13，R5-F3）",
+  "description": "tests/acceptance/l1_required.lock.json 的結構。nodeids 的字典序、不重複與非空另由 regen_lock.py --check 驗證（JSON Schema 無法表達排序）。只允許 --l1-add-only 只增。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sets"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "sets": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9_:.-]*$"},
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "propertyNames": {"enum": ["linux", "windows"]},
+        "additionalProperties": {"$ref": "#/$defs/platformSpec"}
+      }
+    }
+  },
+  "$defs": {
+    "platformSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selector", "nodeids"],
+      "properties": {
+        "selector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argv", "paths", "markexpr"],
+          "properties": {
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "markexpr": {"type": "string"}
+          }
+        },
+        "nodeids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

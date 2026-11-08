@@ -5,6 +5,9 @@ import tempfile
 import unittest
 
 from sw_core.event_engine import EventEngine, EngineDeps
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class _NullBridge:

@@ -1,0 +1,71 @@
+---
+meta:
+  name: l15-dut-reboot-port-alive
+  category: l15-scenario
+  severity: critical
+  description: "DUT 重開機但序列埠保持連線，舊上下文未完成輸入不在重開後重播（§15.7.1）"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_stale_context_replay]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.3"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+  plan:
+    schema_version: "dut-plan.v1"
+    seed: 1015
+    triggers:
+      - id: hold-reb
+        line_contains: "L15_HOLD_REB"
+        action:
+          kind: delay_reply
+          delay_ms: 6000
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: attach_console
+    selector: COM0
+    label: human-1
+    save_as: con1
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_HOLD_REB", "--cmd-timeout", "10"]
+    save_as: crb
+  - action: wait_wire_marker
+    marker: "echo L15_HOLD_REB\n"
+    observation: "serial_read"
+    timeout_s: 10
+  - action: console_write
+    console_id: "{con1.client_id}"
+    input_raw: "echo L15_STALE_HUMAN"
+  - action: op_begin
+    op_id: reboot
+  - action: dut_control
+    action_name: logical_reboot
+    params:
+      banner_delay_ms: 3000
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_DURING_REBOOT"]
+    save_as: reb_cmd
+  - action: op_end
+    op_id: reboot
+  - action: assert_wire_absent
+    marker: "L15_STALE_HUMAN"
+    after_op: reboot
+  - action: wait_ready
+    timeout_s: 25
+  - action: wait_command_done
+    cmd_id: "{reb_cmd.cmd_id}"
+  - action: assert_compare

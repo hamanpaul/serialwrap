@@ -22,10 +22,13 @@ import time
 import unittest
 from unittest import mock
 
+import pytest
+
 from sw_core import constants
 from sw_core.config import SessionProfile, UartProfile
 from sw_core.service import SerialwrapService
 import sw_core.session_manager as sm_mod
+from sw_core.uart_io import TxPermit
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path
@@ -38,6 +41,8 @@ except ImportError:  # pragma: no cover - repo root 跑法
     from tests.test_boot_quiet import FakeBridge, _ManagerMixin
 
 _BOOT_DONE = r"Please press Enter to activate this console"
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class _AsyncRebootBase(_ManagerMixin):
@@ -74,7 +79,8 @@ class TestStaleShellNonceBeforeBanner(_AsyncRebootBase):
         self.assertTrue(session.boot_evidence_wait_active())
         remaining = session.to_public_dict()["boot_evidence_wait_remaining_s"]
         self.assertIsNotNone(remaining)
-        self.assertLessEqual(remaining, constants.BOOT_EVIDENCE_GRACE_S)
+        # remaining 由浮點相減而來，容許 1 微秒的數值誤差（hosted Windows 實測多 6e-14）
+        self.assertLessEqual(remaining, constants.BOOT_EVIDENCE_GRACE_S + 1e-6)
         self.assertGreater(remaining, constants.BOOT_EVIDENCE_GRACE_S - 5.0)
 
     def test_stale_shell_nonce_does_not_confirm_ready(self) -> None:
@@ -230,8 +236,9 @@ class TestGraceExpiryDoesNotDeadlock(_AsyncRebootBase):
         deadline = session.ready_reconfirm_deadline
         session.begin_boot_evidence_wait()
         self.assertEqual(session.ready_reconfirm_deadline, deadline)
+        # 浮點相減容許 1 微秒的數值誤差（hosted Windows 實測多 6e-14）
         self.assertLessEqual(
-            session.ready_reconfirm_deadline - time.monotonic(), constants.READY_RECONFIRM_MAX_S
+            session.ready_reconfirm_deadline - time.monotonic(), constants.READY_RECONFIRM_MAX_S + 1e-6
         )
 
     def test_ready_reconfirm_bound_still_terminates_during_wait(self) -> None:
@@ -303,6 +310,7 @@ class TestUnaffectedPaths(_AsyncRebootBase):
             mgr._execute_command_inner(
                 session, bridge, "echo hi", "agent:test", "cmd-1",
                 timeout_s=1.0, normalized_mode="line", prompt_regex=session.profile.prompt_regex,
+                command_permit=TxPermit("cmd-1", session.bridge_generation, "agent"),
             )
         self.assertEqual(session.boot_evidence_wait_until, 0.0)
 

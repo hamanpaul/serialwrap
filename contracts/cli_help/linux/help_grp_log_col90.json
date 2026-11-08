@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "log",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap log [-h] <command> ...\n\ntail raw 或純文字日誌；raw 含 timestamp／source／seq／crc，可做回放與稽核。\n\npositional arguments:\n  <command>\n    tail-raw  tail raw 日誌（含 timestamp／source／seq／crc）\n    tail-text\n              tail 純文字日誌\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

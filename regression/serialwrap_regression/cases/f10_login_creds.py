@@ -287,11 +287,12 @@ def _reclaim_and_ensure_ready(ctx: Any, com: str) -> CaseResult | None:
     "f10-unresolved-creds-terminal",
     "帳密解析失敗須落終態 CREDENTIALS_UNRESOLVED、不得靜默送空帳密迴圈",
     issues=("#140",),
+    requires=("posix_throwaway_daemon",),
     hints=(
         "prod device release 交出 COM1（bcm）後，sandbox by-id 只放這一條線；profile 照 prod bcm "
         "template 結構複製、只覆寫 env_file 指向不存在路徑，逼出 #140 情境。",
-        "終態斷言涵蓋 attach 回應的頂層 error_code 與其後 session list 的 last_error 兩處（README "
-        "#94：command-capable session 未達 READY 時 attach 會回非零 exit + 頂層 error_code）。",
+        "終態斷言涵蓋 attach 回應的頂層 last_error 與其後 session list 的 last_error 兩處（SC-34："
+        "attach 的 error_code 固定為 SESSION_NOT_READY，診斷值由 last_error 回報）。",
         "不送空帳密驗證為寬鬆判定：等 20s 後狀態需維持穩定終態、且 WAL TX 方向空 payload 計數低於門檻。",
     ),
 )
@@ -354,12 +355,12 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
 
                     poll = _wait_credentials_unresolved(ta, ta_com, timeout_s=60.0)
                     listing_note = ctx.note("ta-session-list-after-attach.json", str(poll["listing"]))
-                    terminal = (attach.get("error_code") == "CREDENTIALS_UNRESOLVED") or poll["found"]
+                    terminal = (attach.get("last_error") == "CREDENTIALS_UNRESOLVED") or poll["found"]
 
                     if not terminal:
                         result = CaseResult(
                             "FAIL",
-                            reason="attach 回應與後續 session list 均未見 CREDENTIALS_UNRESOLVED"
+                            reason="attach 回應與後續 session list 均未見 last_error=CREDENTIALS_UNRESOLVED"
                                    "（#140 回歸：終態未落地）",
                             category="test", reason_code="unresolved_creds_not_terminal",
                             evidence={"attach": attach_note, "listing": listing_note},
@@ -417,6 +418,7 @@ def f10_unresolved_creds_terminal(ctx: Any) -> CaseResult:
     "f10-creds-fixed-then-ready",
     "補上有效帳密後 bcm 登入路徑恢復、session 回 READY",
     issues=("#140",),
+    requires=("posix_throwaway_daemon",),
     hints=(
         "帳密自 prod bcm template 宣告的來源（env_file 或 os.environ fallback）唯讀取得後寫入 "
         "sandbox creds.env；帳密值只落地檔案，evidence／note 只記長度，絕不記實際值。",

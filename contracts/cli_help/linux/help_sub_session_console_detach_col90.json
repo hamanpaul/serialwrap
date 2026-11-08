@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "console-detach",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap session console-detach [-h] --selector SELECTOR --client-id CLIENT_ID\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR   session_id | COMx | alias\n  --client-id CLIENT_ID\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -1,0 +1,9 @@
+{"crc32_variant": "zlib-ieee-802.3 (poly 0xEDB88320 reflected, init 0xFFFFFFFF, xorout 0xFFFFFFFF), 8 lowercase hex",
+ "vectors": [
+  {"payload_hex": "", "crc32": "00000000"},
+  {"payload_hex": "313233343536373839", "crc32": "cbf43926"},
+  {"payload_hex": "00", "crc32": "d202ef8d"},
+  {"payload_hex": "ffffffff", "crc32": "ffffffff"},
+  {"payload_hex": "68656c6c6f0d0a1b5b306d0b7fff", "crc32": "a81bc28c"},
+  {"payload_hex": "RANGE_0_255", "crc32": "29058c73"}
+ ]}

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "event",
+    "rm",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap event rm [-h] rule_id\n\npositional arguments:\n  rule_id\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

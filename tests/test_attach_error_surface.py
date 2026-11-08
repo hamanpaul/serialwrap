@@ -23,6 +23,9 @@ from sw_core.device_watcher import DeviceInfo
 from sw_core.session_manager import SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class _StubClient:
@@ -81,12 +84,13 @@ class TestAttachErrorSurface(unittest.TestCase):
         ):
             result = mgr.attach_session("COM0")
 
-        # 方案 C：未達 READY 應誠實回 ok:False + 頂層具體 error_code（非埋在 session 內）
+        # 方案 C / SC-34：未達 READY 應誠實回 ok:False + 頂層 error_code SESSION_NOT_READY 與 last_error
         self.assertFalse(result["ok"], "attach 同步 probe 失敗不應謊報 ok:True")
         self.assertEqual(
-            result.get("error_code"), "PROMPT_UNAVAILABLE",
-            "頂層應帶具體 error_code，而非 None",
+            result.get("error_code"), "SESSION_NOT_READY",
+            "頂層 error_code 固定為 SESSION_NOT_READY",
         )
+        self.assertEqual(result.get("last_error"), "PROMPT_UNAVAILABLE")
         # 不破壞共用 helper 語意：session 仍應留在 ATTACHED、last_error 保留
         self.assertEqual(result["session"]["state"], "ATTACHED")
         self.assertEqual(result["session"]["last_error"], "PROMPT_UNAVAILABLE")
@@ -177,7 +181,8 @@ class TestAttachErrorSurface(unittest.TestCase):
             result = mgr.attach_session("COM0")
 
         self.assertFalse(result["ok"], "human lease 不應讓 command-capable not-READY 回 ok:True")
-        self.assertEqual(result.get("error_code"), "PROMPT_UNAVAILABLE")
+        self.assertEqual(result.get("error_code"), "SESSION_NOT_READY")
+        self.assertEqual(result.get("last_error"), "PROMPT_UNAVAILABLE")
         self.assertEqual(result["session"]["state"], "ATTACHED")
 
     def _attach_bridge_state(self, state: str):

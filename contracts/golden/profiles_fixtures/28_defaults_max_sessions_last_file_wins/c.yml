@@ -1,0 +1,6 @@
+defaults: {}
+profiles:
+  gamma:
+    platform: shell
+targets:
+  - {profile: gamma, device_by_id: dev-g}

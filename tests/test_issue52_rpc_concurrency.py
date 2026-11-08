@@ -17,8 +17,11 @@ import unittest
 
 from sw_core.client import rpc_call
 from sw_core.rpc import JsonRpcUnixServer
+import pytest
 
 
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 class TestIssue52RpcNotBlockedByTransfer(unittest.TestCase):
     SLOW_S = 3.0
 
@@ -88,6 +91,8 @@ class TestIssue52RpcNotBlockedByTransfer(unittest.TestCase):
         self.assertTrue(slow_done.get("resp", {}).get("ok"))
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestIssue52DaemonDeclaresTransferBlocking(unittest.TestCase):
     """daemon 必須把 file.push/file.pull 宣告為 blocking method（offload 到 executor）。"""
 

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "log",
+    "tail-raw",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap log tail-raw [-h] [--selector SELECTOR]\n                               [--com COM]\n                               [--from-seq FROM_SEQ]\n                               [--limit LIMIT]\n\noptions:\n  -h, --help           show this help message and exit\n  --selector SELECTOR\n  --com COM\n  --from-seq FROM_SEQ  省略＝latest 模式（回傳最新 N 筆）；指定 N（含\n                       0）＝range 模式（自 seq>N 起最舊 N 筆，增量讀取用）\n  --limit LIMIT\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

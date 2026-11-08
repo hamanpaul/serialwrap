@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "event",
+    "rm",
+    "a",
+    "b",
+    "--"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap [-h] [--version] [-v] [--socket SOCKET]\n                  [--endpoint ENDPOINT] [--bench CODE] [--timeout TIMEOUT_S]\n                  [--retries RETRIES]\n                  <group> ...\nserialwrap: error: unrecognized arguments: b --\n",
+  "native": true,
+  "post_parse_effects": false
+}

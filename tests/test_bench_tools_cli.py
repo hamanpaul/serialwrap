@@ -9,6 +9,8 @@ import tempfile
 import pytest
 import yaml
 
+pytestmark = [pytest.mark.posix_only, pytest.mark.process_rpc]
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 

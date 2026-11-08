@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "stream",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap stream [-h] <command> ...\n\n即時 tail session 解析後的文字串流（line 事件）。\n\npositional arguments:\n  <command>\n    tail      即時 tail 解析後的文字串流\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

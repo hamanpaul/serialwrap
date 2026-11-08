@@ -62,3 +62,8 @@ steps:
       min_tx_count:
         gte: 3
       has_source: ["agent:1", "agent:2", "agent:3"]
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]

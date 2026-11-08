@@ -1,6 +1,9 @@
 # serialwrap_regression testbed 範例。
 # 實跑時可在同目錄放 testbed.yaml 覆蓋（如 allow_destructive: true）；缺檔即用本檔。
 serialwrap_exe: ~/.local/bin/serialwrap  # pinned 部署版 CLI（#154 防線；勿走 PATH）
+bench_lock_path: ~/.local/state/serialwrap/bench.lock  # Linux 與 reliability 共用；Windows 必填
+human_frontend: auto  # auto|tmux|telnet；Windows 使用 loopback Telnet console
+cross_os_probe_argv: []                  # 另一 OS 的唯讀 session-list 命令；未設定時由擁有者排程避免重疊
 allow_destructive: false                 # true 才跑 F9（reboot）／F10（throwaway 交接）
 tmux_prefix: swreg
 boards:
@@ -12,7 +15,12 @@ boards:
     alias: com1-brcm
     serial: AQ00OAQ7
     platform: bcm
+# f8-legacy-attached-upgrade（SC-39 D5.2，PR 250）：擁有者備妥 0.3.x bench 後才設定；未設定時該 case SKIP。
+# legacy_upgrade:
+#   bundle: ~/sw-candidate/serialwrap-0.4.1   # 候選 release bundle 目錄（含 bin/serialwrap）
+#   setup_args: [--user]                      # 與 0.3.x 目前的監管模式一致
 timeouts:
   ready_wait_s: 180
   boot_wait_s: 240
   cmd_timeout_s: 12
+  wal_oracle_s: 10.0

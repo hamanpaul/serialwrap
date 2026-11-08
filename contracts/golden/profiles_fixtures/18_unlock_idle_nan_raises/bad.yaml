@@ -1,0 +1,4 @@
+profiles:
+  p:
+    platform: prpl
+    console_unlock_idle_s: .nan

@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "event",
+    "reset"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap event reset [-h] (--rule-id RULE_ID | --selector SELECTOR)\nserialwrap event reset: error: one of the arguments --rule-id --selector is required\n",
+  "native": true,
+  "post_parse_effects": false
+}

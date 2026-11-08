@@ -21,8 +21,11 @@ from unittest import mock
 from sw_core.config import UartProfile
 from sw_core import serial_port as sp
 from sw_core.serial_port import SerialPort, open_serial_port
+import pytest
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestImportability(unittest.TestCase):
     """#84 PORT-1 的核心目標：序列埠模組在無 termios/fcntl 的平台（Windows）仍可 import。"""
 
@@ -64,6 +67,8 @@ class TestImportability(unittest.TestCase):
         self.assertTrue(hasattr(mod, "open_serial_port"))
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestWinDeviceName(unittest.TestCase):
     def test_bare_com_gets_prefix(self) -> None:
         self.assertEqual(sp._win_device_name("COM8"), r"\\.\COM8")
@@ -78,6 +83,8 @@ class TestWinDeviceName(unittest.TestCase):
 
 
 class TestBackendSelection(unittest.TestCase):
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_explicit_posix(self) -> None:
         if os.name == "posix":
             port = open_serial_port("/dev/null", UartProfile(), backend="posix")
@@ -88,6 +95,8 @@ class TestBackendSelection(unittest.TestCase):
             with self.assertRaises(OSError):
                 open_serial_port("COM8", UartProfile(), backend="posix")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_explicit_pyserial(self) -> None:
         port = open_serial_port("COM8", UartProfile(), backend="pyserial")
         self.assertEqual(type(port).__name__, "_PySerialPort")
@@ -95,6 +104,8 @@ class TestBackendSelection(unittest.TestCase):
         # 尚未 open → 無可多工 fd。
         self.assertIsNone(port.fileno())
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_posix_backend_rejected_on_non_posix(self) -> None:
         # 非 POSIX 平台強選 posix 後端 → factory 直接回明確 OSError（#84 review），
         # 而非回傳會在 open()/configure() 才 NameError 的物件。以 patch os.name 在任何平台驗證。
@@ -102,6 +113,8 @@ class TestBackendSelection(unittest.TestCase):
             with self.assertRaises(OSError):
                 open_serial_port("COM8", UartProfile(), backend="posix")
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_env_override(self) -> None:
         old = os.environ.get("SERIALWRAP_SERIAL_BACKEND")
         try:
@@ -115,6 +128,8 @@ class TestBackendSelection(unittest.TestCase):
             else:
                 os.environ["SERIALWRAP_SERIAL_BACKEND"] = old
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_explicit_arg_beats_env(self) -> None:
         old = os.environ.get("SERIALWRAP_SERIAL_BACKEND")
         try:
@@ -126,6 +141,8 @@ class TestBackendSelection(unittest.TestCase):
             else:
                 os.environ["SERIALWRAP_SERIAL_BACKEND"] = old
 
+    @pytest.mark.posix_only
+    @pytest.mark.memory_only
     def test_auto_default_is_posix_on_posix(self) -> None:
         if os.name != "posix":
             self.skipTest("POSIX 平台才驗 auto→posix")
@@ -156,6 +173,8 @@ def _read_until(port: SerialPort, deadline_s: float) -> bytes:
 
 
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "openpty"), "PosixSerialPort 需 POSIX + PTY")
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestPosixSerialPortRoundtrip(unittest.TestCase):
     """以 PTY 當假 device 驗證 termios 後端 open/configure/read/write/close。"""
 
@@ -227,6 +246,9 @@ class TestPosixSerialPortRoundtrip(unittest.TestCase):
     os.environ.get("SERIALWRAP_TEST_SERIAL_PORT"),
     "需設 SERIALWRAP_TEST_SERIAL_PORT 指向 TxRx 短接的真機序列埠",
 )
+# 資源標註暫以 process_rpc 占位：本類需真機 TxRx 短接序列埠（實際屬 physical_uart），P0 稽核禁止 physical_uart，待擁有者裁決後改標。
+@pytest.mark.core_portable
+@pytest.mark.process_rpc
 class TestPySerialLoopback(unittest.TestCase):
     """真機 loopback：對 SERIALWRAP_TEST_SERIAL_PORT（TxRx 短接）驗 pyserial 後端往返。"""
 
@@ -281,6 +303,9 @@ class TestPySerialLoopback(unittest.TestCase):
     os.environ.get("SERIALWRAP_TEST_SERIAL_PORT"),
     "需設 SERIALWRAP_TEST_SERIAL_PORT 指向 TxRx 短接的真機序列埠",
 )
+# 資源標註暫以 process_rpc 占位：本類需真機 TxRx 短接序列埠（實際屬 physical_uart），P0 稽核禁止 physical_uart，待擁有者裁決後改標。
+@pytest.mark.core_portable
+@pytest.mark.process_rpc
 class TestUARTBridgeLoopback(unittest.TestCase):
     """真機 loopback：以完整 UARTBridge 驗證 Windows/pyserial 路徑的 start/RX/TX/WAL/stop。"""
 
@@ -439,6 +464,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
 
         return UARTBridge("COM9", "COM9", UartProfile(), self._wal)
 
+    @pytest.mark.core_portable
+    @pytest.mark.process_rpc
     def test_start_skips_console_and_has_no_selectable_fd(self) -> None:
         b = self._bridge()
         b.start()
@@ -452,6 +479,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
             b.stop()
         self.assertTrue(self._fake.closed)  # stop() 經 port.close()
 
+    @pytest.mark.core_portable
+    @pytest.mark.process_rpc
     def test_loop_windows_branch_routes_rx(self) -> None:
         b = self._bridge()
         b.start()
@@ -461,6 +490,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
         finally:
             b.stop()
 
+    @pytest.mark.core_portable
+    @pytest.mark.process_rpc
     def test_send_bytes_uses_port_write_and_preserves_flash_gate(self) -> None:
         b = self._bridge()
         b.start()
@@ -477,6 +508,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
         finally:
             b.stop()
 
+    @pytest.mark.core_portable
+    @pytest.mark.process_rpc
     def test_snapshot_uses_port_is_alive(self) -> None:
         b = self._bridge()
         b.start()
@@ -488,6 +521,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
         finally:
             b.stop()
 
+    @pytest.mark.core_portable
+    @pytest.mark.process_rpc
     def test_serial_and_serial_fd_paired_and_cleared(self) -> None:
         # 不變式（#84）：_serial 與 _serial_fd 必在同一鎖內成對設定/清除，且 _serial_fd 必派生自
         # _serial.fileno()。Windows 後端 fileno()=None → _serial_fd 必為 None（_loop 才會走 Windows 分支）。
@@ -502,6 +537,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
         self.assertIsNone(b._serial)
         self.assertIsNone(b._serial_fd)
 
+    @pytest.mark.core_portable
+    @pytest.mark.memory_only
     def test_console_send_handles_partial_socket_send(self) -> None:
         # non-blocking socket send() 可能只送部分 bytes；_console_send 必須迴圈送完、不截斷（#84 review）。
         from sw_core.uart_io import ConsoleClient
@@ -526,6 +563,8 @@ class TestUARTBridgeWindowsPath(unittest.TestCase):
 
 
 @unittest.skipUnless(os.name == "posix" and hasattr(os, "openpty"), "需 POSIX + PTY 跑真 UARTBridge")
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 class TestUARTBridgePosixStartStopInvariant(unittest.TestCase):
     """POSIX：真 UARTBridge（PTY 當假 device）驗 _serial 與 _serial_fd 配對不變式（#84）。
 
@@ -570,6 +609,8 @@ def _pyserial_available() -> bool:
 
 
 @unittest.skipUnless(_pyserial_available(), "需安裝 pyserial 才能驗 _PySerialPort 內部行為")
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestPySerialPortUnit(unittest.TestCase):
     """以 fake pyserial Serial 物件驗 _PySerialPort 內部邏輯（read drain / 例外轉譯 / set_baud），免實機。"""
 
@@ -687,6 +728,8 @@ class TestPySerialPortUnit(unittest.TestCase):
         self.assertFalse(p._profile.xonxoff)
 
 
+@pytest.mark.core_portable
+@pytest.mark.process_rpc
 class TestUARTBridgeTcpConsole(unittest.TestCase):
     """Windows TCP human console（#84 PORT-2）端到端：loopback fake serial + 真 localhost socket，
     免 PTY/pyserial/實機，可於 Linux CI 執行。驗 raw ownership、雙向透傳、agent coexistence

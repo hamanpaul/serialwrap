@@ -8,6 +8,9 @@ from __future__ import annotations
 import threading
 
 from sw_core.uart_io import UARTBridge
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _bridge(owner="human:X"):

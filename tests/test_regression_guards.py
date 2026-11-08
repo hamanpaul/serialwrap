@@ -11,6 +11,8 @@ sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression import guards  # noqa: E402
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 @pytest.mark.parametrize("cmd", [
     "saveenv",
@@ -48,7 +50,7 @@ def test_uboot_allowed(cmd):
 
 
 def test_leave_rejects_non_whitelisted_via():
-    con = guards.UBootConsole(ctx=None, com="COM0", tmux_session="s")
+    con = guards.UBootConsole(ctx=None, com="COM0", frontend=None)
     with pytest.raises(guards.UBootGuardError):
         con.leave(via="poweroff")
 

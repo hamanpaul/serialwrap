@@ -16,6 +16,9 @@ from unittest import mock
 from sw_core.auth import SessionAuth
 from sw_core.config import SessionProfile, load_profiles
 from sw_core.login_fsm import detect_template, ensure_ready
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 _ASSETS_PROFILE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

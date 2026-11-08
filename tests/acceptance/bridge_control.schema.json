@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serialwrap.local/schemas/bridge_control.schema.json",
+  "title": "serialwrap control.v1 故障控制紀錄（control.ndjson 單行）",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "seq",
+    "mono_ts_ns",
+    "wall_ts",
+    "clock_id",
+    "action_id",
+    "action",
+    "phase",
+    "params",
+    "result",
+    "error",
+    "endpoint_generation",
+    "dut_generation",
+    "wire_seq"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "control.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "mono_ts_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "wall_ts": {
+      "type": "string",
+      "minLength": 1
+    },
+    "clock_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "enum": [
+        "requested",
+        "completed",
+        "failed"
+      ]
+    },
+    "params": {
+      "type": "object"
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "error": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^HARNESS_[A-Z0-9_]+$"
+        }
+      ]
+    },
+    "endpoint_generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "dut_generation": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "wire_seq": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

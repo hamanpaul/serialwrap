@@ -2,6 +2,9 @@ import unittest
 
 from sw_core.service import SerialwrapService
 from sw_core.util import shell_command_incomplete_reason
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 try:
     import state_iso  # pytest／unittest discover：tests/ 在 sys.path

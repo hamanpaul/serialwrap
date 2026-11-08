@@ -8,6 +8,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "regression"))
 
 from serialwrap_regression import preflight  # noqa: E402
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def test_version_gate_pass_on_match():

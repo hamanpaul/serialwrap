@@ -17,6 +17,8 @@ import pytest
 import sw_core.assets
 from sw_core import cli
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 _ASSET_DIR = Path(sw_core.assets.__file__).parent / "skill"
 
 

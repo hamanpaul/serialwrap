@@ -4,6 +4,9 @@ import unittest
 from pathlib import Path
 
 from sw_core.config import ProfileTemplate, load_profiles
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestBootloaderPrompts(unittest.TestCase):

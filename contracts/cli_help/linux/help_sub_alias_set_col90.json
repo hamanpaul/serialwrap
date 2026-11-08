@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "alias",
+    "set",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap alias set [-h] --session-id SESSION_ID --alias ALIAS\n\noptions:\n  -h, --help            show this help message and exit\n  --session-id SESSION_ID\n  --alias ALIAS\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

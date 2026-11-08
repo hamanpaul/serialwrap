@@ -24,6 +24,7 @@ from unittest import mock
 
 import sw_core.client as client
 from sw_core import cli, cli_trace
+import pytest
 
 
 TRACE_KEYS = {
@@ -98,6 +99,8 @@ class CliDiagnosticsMixin:
         self.assertRegex(value, r"^[0-9a-f]{64}$")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
     def test_default_stdout_stderr_bytes_remain_unchanged(self) -> None:
         with mock.patch(
@@ -357,6 +360,8 @@ class TestCliTraceOutput(CliDiagnosticsMixin, unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "需 AF_UNIX（原生 Windows 無此屬性）")
+@pytest.mark.posix_only
+@pytest.mark.process_rpc
 class TestCliTraceErrno(CliDiagnosticsMixin, unittest.TestCase):
     def test_missing_unix_socket_records_enoent(self) -> None:
         missing = "/tmp/sw171-cli-trace-missing.sock"
@@ -422,6 +427,8 @@ class TestCliTraceErrno(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(trace["errno_name"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
     def test_loopback_tcp_connection_refused_keeps_visible_host_port(self) -> None:
         with mock.patch(
@@ -441,7 +448,9 @@ class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(trace["endpoint_transport"], "tcp")
         self.assertEqual(trace["endpoint_id"], "127.0.0.1:48700")
         self.assertEqual(trace["errno"], errno.ECONNREFUSED)
-        self.assertEqual(trace["errno_name"], "ECONNREFUSED")
+        # errno_name 契約為 errno.errorcode.get(errno)（inventory/01-cli.md）；
+        # Windows 上 ECONNREFUSED == 10061，對應名稱為 WSAECONNREFUSED，不得寫死 POSIX 名稱。
+        self.assertEqual(trace["errno_name"], errno.errorcode.get(errno.ECONNREFUSED))
 
     def test_retry_success_clears_errno_and_reports_retry_count(self) -> None:
         reply_sock = _TcpReplySocket({"ok": True, "sessions": []})
@@ -479,6 +488,8 @@ class TestCliTraceTcpAndRetry(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(trace["errno_name"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
     def test_daemon_start_already_running_success_emits_single_probe_trace(self) -> None:
         with (
@@ -536,6 +547,8 @@ class TestCliTraceDaemonStart(CliDiagnosticsMixin, unittest.TestCase):
         self.assertIsNone(first["errno"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
     def _run_isolated_setup(
         self,
@@ -571,6 +584,8 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
                 trace_sink({"elapsed_ms": 1, "retry_count": 0, "errno": None, "errno_name": None})
             if method == "health.ping":
                 return {"ok": health_ok, **({} if health_ok else {"error_code": "SOCKET_ERROR"})}
+            if method == "health.status":
+                return {"ok": True, "pid": 12345}
             if method == "mcu.status":
                 return {"ok": True, "flashing": flashing}
             raise AssertionError(f"unexpected method: {method}")
@@ -606,7 +621,10 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
 
         quiet_sequence = [(item["method"], item["timeout_s"]) for item in quiet["calls"]]
         verbose_sequence = [(item["method"], item["timeout_s"]) for item in verbose["calls"]]
-        self.assertEqual(quiet_sequence, [("health.ping", 0.5), ("mcu.status", 0.5)])
+        self.assertEqual(
+            quiet_sequence,
+            [("health.ping", 0.5), ("mcu.status", 0.5), ("health.status", 0.5)],
+        )
         self.assertEqual(verbose_sequence, quiet_sequence)
         self.assertEqual(quiet["resolve_count"], 2)
         self.assertEqual(verbose["resolve_count"], 2)
@@ -615,7 +633,7 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
         self.assertEqual(self._stderr_json_lines(quiet["err"]), [])
         self.assertEqual(
             [trace["method"] for trace in self._stderr_json_lines(verbose["err"])],
-            ["health.ping", "mcu.status"],
+            ["health.ping", "mcu.status", "health.status"],
         )
         self.assertEqual(json.loads(quiet["out"])["ok"], True)
         self.assertEqual(json.loads(verbose["out"])["ok"], True)
@@ -653,6 +671,8 @@ class TestCliTraceSetup(CliDiagnosticsMixin, unittest.TestCase):
         )
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.TestCase):
     def test_mutating_rpc_typeerror_after_send_is_not_retried(self) -> None:
         cases = [
@@ -687,11 +707,16 @@ class TestCliTraceNoExtraRpcOnTraceSinkFailure(CliDiagnosticsMixin, unittest.Tes
                         self._invoke_main(argv)
 
                 self.assertEqual(len(calls), 1, "主請求送出後不得因 trace_sink 相關 TypeError 再呼叫第二次 RPC")
-                self.assertEqual(calls[0][0], cli.SOCKET_PATH)
+                expected_endpoint = (
+                    "tcp://127.0.0.1:48700" if cli._rpc_backend_is_win() else cli.SOCKET_PATH
+                )
+                self.assertEqual(calls[0][0], expected_endpoint)
                 self.assertEqual(calls[0][2]["retries"], 0)
                 self.assertIsNotNone(calls[0][2]["trace_sink"])
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestRpcCallTraceSink(unittest.TestCase):
     def test_sink_exception_preserves_success_and_failure_rpc_responses(self) -> None:
         endpoint = "/tmp/sw201-trace-sink.sock"
@@ -768,6 +793,8 @@ class TestRpcCallTraceSink(unittest.TestCase):
                 rpc_call_once.assert_called_once()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 class TestCliTraceLoggerIsolation(CliDiagnosticsMixin, unittest.TestCase):
     def test_trace_logger_does_not_propagate_to_root_or_serialwrap_logger(self) -> None:
         root_stream = io.StringIO()

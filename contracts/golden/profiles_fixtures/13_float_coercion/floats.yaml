@@ -1,0 +1,11 @@
+profiles:
+  p:
+    platform: prpl
+    timeout_s: "7.5"
+    quiet_window_s: true
+    hard_timeout_s: "abc"
+    console_unlock_idle_s: 2
+
+targets:
+  - {profile: p, device_by_id: d1, timeout_s: .inf, quiet_window_s: .nan, hard_timeout_s: null}
+  - {profile: p, device_by_id: d2, timeout_s: " 3 ", quiet_window_s: 1_0.5}

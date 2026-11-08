@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "event",
+    "reset",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap event reset [-h] (--rule-id RULE_ID | --selector SELECTOR)\n\noptions:\n  -h, --help           show this help message and exit\n  --rule-id RULE_ID\n  --selector SELECTOR\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

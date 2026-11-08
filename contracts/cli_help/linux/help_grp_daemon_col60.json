@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "daemon",
+    "--help"
+  ],
+  "columns": 60,
+  "rc": 0,
+  "stdout": "usage: serialwrap daemon [-h] <command> ...\n\n管理 serialwrap daemon 行程：啟動、停止、重啟與查詢執行狀態。\n\npositional arguments:\n  <command>\n    start     啟動 daemon（--foreground 可前景執行；systemd 模式重導\n              service start）\n    stop      停止執行中的 daemon\n    restart   重啟 daemon（systemd 模式重導 service restart）\n    status    顯示 daemon 狀態（pid／sessions／devices／log\n              路徑／多開偵測 multi_open）\n\noptions:\n  -h, --help  show this help message and exit\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

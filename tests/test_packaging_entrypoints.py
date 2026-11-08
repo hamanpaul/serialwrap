@@ -1,4 +1,7 @@
 import importlib
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 import pytest
 

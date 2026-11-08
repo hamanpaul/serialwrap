@@ -10,6 +10,8 @@ import pytest
 
 from sw_core import cli
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 def _write_yaml(path, content: str) -> None:
     path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")

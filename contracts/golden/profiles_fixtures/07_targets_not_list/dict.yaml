@@ -1,0 +1,5 @@
+profiles:
+  p:
+    platform: shell
+targets:
+  device_by_id: x

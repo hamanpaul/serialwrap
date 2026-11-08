@@ -9,7 +9,7 @@ from .counter import Counter, CounterStore
 from .dispatcher import Dispatcher
 from .event_log import EventLogger
 from .matcher import MatcherFire, MatcherWorker
-from .registry import RuleRegistry
+from .registry import RuleRegistry, valid_rule_id
 from .schema import Rule
 
 
@@ -115,6 +115,8 @@ class EventEngine:
         return rule
 
     def rule_delete(self, rule_id: str) -> bool:
+        if not valid_rule_id(rule_id):
+            return False
         ok = self._registry.delete(rule_id)
         if ok:
             self._counters.clear(rule_id)
@@ -223,6 +225,8 @@ class EventEngine:
             }
 
     def reset(self, *, rule_id: str | None = None, selector: str | None = None) -> int:
+        if rule_id is not None and not valid_rule_id(rule_id):
+            return 0
         cleared = 0
         with self._lock:
             target_ids: list[str] = []

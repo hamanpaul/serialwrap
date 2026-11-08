@@ -42,6 +42,9 @@ from sw_core.device_watcher import DeviceInfo
 from sw_core.session_manager import SessionManager
 import sw_core.session_manager as sm_mod
 from sw_core.wal import WalWriter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 # 對應 bench 實測的兩個 by-id（CH340 未插 / XDS110 -if00 已插）。
 ABSENT_BY_ID = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
@@ -110,7 +113,8 @@ class TestExplicitTargetDeviceOwnership(unittest.TestCase):
         mgr2 = self._mgr([target_absent, target_present])
         with mgr2._lock:
             mgr2._devices = {PRESENT_BY_ID: DeviceInfo(by_id=PRESENT_BY_ID, real_path="/dev/ttyACM0")}
-        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge:
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
             MockBridge.return_value.start.return_value = None
             mgr2._attach_by_id(PRESENT_BY_ID)
 
@@ -150,7 +154,8 @@ class TestExplicitTargetDeviceOwnership(unittest.TestCase):
         mgr2 = self._mgr([target_present, target_absent])
         with mgr2._lock:
             mgr2._devices = {PRESENT_BY_ID: DeviceInfo(by_id=PRESENT_BY_ID, real_path="/dev/ttyACM0")}
-        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge:
+        with mock.patch("sw_core.session_manager.UARTBridge") as MockBridge, \
+             mock.patch("sw_core.uart_io.open_serial_port", return_value=mock.MagicMock()):
             MockBridge.return_value.start.return_value = None
             mgr2._attach_by_id(PRESENT_BY_ID)
 

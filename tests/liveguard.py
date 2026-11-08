@@ -4,7 +4,8 @@
 - 頂層 import 不得碰 sw_core（conftest 在覆寫 env 前 import 本模組；提前 import sw_core
   會把 constants 凍結在 live 路徑）。需要 RPC 時於函式內 lazy import。
 - live 路徑一律 XDG 公式並「刻意忽略 SERIALWRAP_*」隔離變數——daemon（systemd）env
-  沒有它們；勿沿用 setup_cmd._state_path_for（systemd-system 回 /var/lib 與實況不符）。
+  沒有它們；勿沿用 setup_cmd._state_path_for，該函式依 reconcile 目標與 run_user 選擇遷移來源／目的，
+  本測試則固定檢查目前呼叫者的 live XDG 路徑。
 - 判定函式為純函式（吃快照、回 (verdict, reason)），失敗模式由 tests/test_liveguard.py 逐一釘住。
 """
 from __future__ import annotations

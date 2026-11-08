@@ -33,6 +33,8 @@ from sw_core.sysenv import FakeEffects
 _REPO_VERSION = (Path(__file__).parent.parent / "VERSION").read_text(encoding="utf-8").strip()
 _FAKE_MULTI_OPEN = {"multi_open": False, "daemons": [], "holders": {}, "holders_status": "ok"}
 
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
+
 
 # ───────────────────────────── A. 指紋本身 ─────────────────────────────
 
@@ -269,6 +271,9 @@ class _RestartingEffects(FakeEffects):
 
     def run(self, cmd, *, timeout_s=None):
         result = super().run(cmd, timeout_s=timeout_s)
+        if cmd == ["serialwrap", "daemon", "stop"]:
+            # 模擬 on-demand stop 後舊 endpoint 不再回應，供 Stage 1 的交接等待驗證。
+            self._state["reachable"] = False
         if "restart" in cmd and cmd[-1] == "serialwrap":
             self._state["restarts"] += 1
             self._state["daemon_fp"] = self._state["fp_after_restart"]
@@ -294,6 +299,8 @@ def setup_env(tmp_path, monkeypatch):
 
     state = {"reachable": True, "flashing": False, "daemon_fp": _STALE_FP,
              "fp_after_restart": _INSTALLED_FP, "restarts": 0}
+    # 行程生命週期也用同一份替身狀態；Windows 無 PID 時的真實探測會回 unknown。
+    monkeypatch.setattr("sw_core.multi_open.daemon_process_alive", lambda pid, endpoint: state["reachable"])
     fx_holder: dict = {}
 
     def make_fx(*, active=("user",), system=True):

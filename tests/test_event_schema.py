@@ -2,6 +2,9 @@ from __future__ import annotations
 import unittest
 
 from sw_core.event_engine.schema import Rule, validate_rule_dict
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestRuleSchema(unittest.TestCase):

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "self-test",
+    "--help"
+  ],
+  "columns": 90,
+  "rc": 0,
+  "stdout": "usage: serialwrap session self-test [-h] --selector SELECTOR\n                                    [--probe-timeout PROBE_TIMEOUT_S]\n                                    [--strict-human-lock]\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR   session_id | COMx | alias\n  --probe-timeout PROBE_TIMEOUT_S\n  --strict-human-lock   嚴格模式：若 human interactive lease 仍在使用中則直接回報 busy；預設模式會先暫停 human\n                        interactive lease 再做 probe\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

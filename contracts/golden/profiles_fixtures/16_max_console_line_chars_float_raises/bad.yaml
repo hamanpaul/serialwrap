@@ -1,0 +1,4 @@
+profiles:
+  p:
+    platform: prpl
+    max_console_line_chars: 5.0

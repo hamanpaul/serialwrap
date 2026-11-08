@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "cmd",
+    "--help"
+  ],
+  "columns": 21,
+  "rc": 0,
+  "stdout": "usage: serialwrap cmd\n       [-h]\n       <command>\n       ...\n\n向 session\n提交命令並取回結果：line 模式看\nstatus，background\n模式用 result-tail。\n\npositional arguments:\n  <command>\n    submit\n    提交命令到\n    session（--mode \n    line|background\n    |interactive）\n    status\n    查詢命令狀態與\n    stdout（line\n    模式讀這裡）\n    result-tail\n    增量讀取 background\n    命令的結果 chunk\n    cancel\n    取消執行中的命令\n\noptions:\n  -h, --help\n    show this help\n    message and\n    exit\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -1,0 +1,1204 @@
+[
+  {
+    "name": "single-pass",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a",
+      "tests/test_1.py::test_b",
+      "tests/test_1.py::test_c"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "required case not satisfied",
+      "missing:"
+    ]
+  },
+  {
+    "name": "required-skip",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "skipped",
+          "skip_kind": "other",
+          "phases": {
+            "setup": "passed",
+            "call": null,
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": {
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 1
+    },
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "required skipped"
+    ]
+  },
+  {
+    "name": "duplicate",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a",
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "duplicate nodeid"
+    ]
+  },
+  {
+    "name": "deselected",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [
+        "tests/test_1.py::test_b"
+      ],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a",
+      "tests/test_1.py::test_b"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "deselected required"
+    ]
+  },
+  {
+    "name": "not-run",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a",
+        "tests/test_1.py::test_c"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a",
+      "tests/test_1.py::test_c"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "not run:",
+      "results do not match collection"
+    ]
+  },
+  {
+    "name": "exit-nonzero",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 5,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "runner exit 5"
+    ]
+  },
+  {
+    "name": "not-finished",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": false,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "runner not finished"
+    ]
+  },
+  {
+    "name": "junit-mismatch",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a",
+        "tests/test_1.py::test_b"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        },
+        {
+          "nodeid": "tests/test_1.py::test_b",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a",
+      "tests/test_1.py::test_b"
+    ],
+    "platform": "linux",
+    "junit": {
+      "tests": 3,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "junit/l1-results mismatch"
+    ]
+  },
+  {
+    "name": "failure-extra",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a",
+        "tests/test_1.py::test_z"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        },
+        {
+          "nodeid": "tests/test_1.py::test_z",
+          "outcome": "failed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "failed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 1,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "FAIL",
+    "reasons_contains": [
+      "failed:"
+    ]
+  },
+  {
+    "name": "all-pass",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a",
+        "tests/test_1.py::test_b"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        },
+        {
+          "nodeid": "tests/test_1.py::test_b",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a",
+      "tests/test_1.py::test_b"
+    ],
+    "platform": "linux",
+    "junit": {
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "verdict": "PASS",
+    "reasons_contains": []
+  },
+  {
+    "name": "selector-mismatch",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "--package",
+        "sw-pal"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "selector": {
+      "argv": [
+        "--workspace",
+        "--all-features"
+      ]
+    },
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "selector mismatch"
+    ]
+  },
+  {
+    "name": "selector-junit-path-ignored",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "--package",
+        "sw-pal",
+        "--junitxml=out.xml"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "selector": {
+      "argv": [
+        "--package",
+        "sw-pal"
+      ]
+    },
+    "verdict": "PASS",
+    "reasons_contains": []
+  },
+  {
+    "name": "empty-required",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "no required set"
+    ]
+  },
+  {
+    "name": "core-portable-platform-skip",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [
+        "tests/test_1.py::test_x"
+      ],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "core_portable platform skip"
+    ]
+  },
+  {
+    "name": "required-xfailed",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "xfailed",
+          "skip_kind": "other",
+          "phases": {
+            "setup": "passed",
+            "call": "skipped",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "required skipped"
+    ]
+  },
+  {
+    "name": "platform-mismatch",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "windows",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "platform 不符"
+    ]
+  },
+  {
+    "name": "format-mismatch",
+    "report": {
+      "format": "l1-results.v0",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "format"
+    ]
+  },
+  {
+    "name": "extra-skip-pass",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "collected": [
+        "tests/test_1.py::test_a",
+        "tests/test_1.py::test_z"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        },
+        {
+          "nodeid": "tests/test_1.py::test_z",
+          "outcome": "skipped",
+          "skip_kind": "other",
+          "phases": {
+            "setup": "passed",
+            "call": null,
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "core_portable_platform_skips": [],
+      "schema_version": 2,
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "PASS",
+    "reasons_contains": []
+  },
+  {
+    "name": "unknown-outcome-invalid",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "schema_version": 2,
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "core_portable_platform_skips": [],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "weird",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "未知 outcome"
+    ]
+  },
+  {
+    "name": "passed-without-call-invalid",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "schema_version": 2,
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "core_portable_platform_skips": [],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": null,
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "outcome passed 與 phases 不一致"
+    ]
+  },
+  {
+    "name": "missing-deployed-content-invalid",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "schema_version": 2,
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "core_portable_platform_skips": [],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INVALID",
+    "reasons_contains": [
+      "缺必填欄位：deployed_content"
+    ]
+  },
+  {
+    "name": "setup-only-not-run",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "schema_version": 2,
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "core_portable_platform_skips": [],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [],
+      "exit_code": 0,
+      "finished": true,
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "INSUFFICIENT",
+    "reasons_contains": [
+      "not run"
+    ]
+  },
+  {
+    "name": "subtest-failed-row",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "schema_version": 2,
+      "argv": [
+        "/x/pytest/__main__.py",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "core_portable_platform_skips": [],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "failed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 1,
+      "finished": true,
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "verdict": "FAIL",
+    "reasons_contains": [
+      "failed:"
+    ]
+  },
+  {
+    "name": "pytest-main-argv-c",
+    "report": {
+      "format": "l1-results.v1",
+      "platform": "linux",
+      "runner": "pytest",
+      "schema_version": 2,
+      "argv": [
+        "-c",
+        "-q",
+        "tests/test_1.py"
+      ],
+      "markexpr": "",
+      "counts": {},
+      "resources": {},
+      "not_collected_platform": [],
+      "core_portable_platform_skips": [],
+      "collected": [
+        "tests/test_1.py::test_a"
+      ],
+      "deselected": [],
+      "results": [
+        {
+          "nodeid": "tests/test_1.py::test_a",
+          "outcome": "passed",
+          "skip_kind": null,
+          "phases": {
+            "setup": "passed",
+            "call": "passed",
+            "teardown": "passed"
+          }
+        }
+      ],
+      "exit_code": 0,
+      "finished": true,
+      "deployed_content": null
+    },
+    "required": [
+      "tests/test_1.py::test_a"
+    ],
+    "platform": "linux",
+    "junit": null,
+    "selector": {
+      "argv": [
+        "-q",
+        "tests/test_1.py"
+      ],
+      "paths": [
+        "tests/test_1.py"
+      ],
+      "markexpr": ""
+    },
+    "verdict": "PASS",
+    "reasons_contains": []
+  }
+]

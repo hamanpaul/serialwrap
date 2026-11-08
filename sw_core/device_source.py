@@ -13,7 +13,7 @@ import os
 import time
 from typing import Protocol
 
-from sw_core.constants import CONFIG_DIR
+from sw_core.constants import CONFIG_DIR, resolve_config_path
 from sw_core.device_watcher import DeviceInfo
 
 
@@ -26,7 +26,9 @@ def _load_exclude_coms() -> set[str]:
     import yaml  # noqa: PLC0415 — 延遲匯入，維持本模組輕量
 
     try:
-        config_path = os.path.join(CONFIG_DIR, "config.yaml")
+        env = dict(os.environ)
+        env["SERIALWRAP_CONFIG_DIR"] = CONFIG_DIR
+        config_path = resolve_config_path(env=env)
         if not os.path.exists(config_path):
             return set()
         with open(config_path, encoding="utf-8") as _fh:

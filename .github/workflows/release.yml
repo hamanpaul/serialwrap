@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "v*"
+  # OD-78：對既有 tag 補傳 Windows bundle zip。只會執行 publish-windows-bundle；其餘 job 僅在 tag push 時執行，
+  # 補傳不會重建 wheel／PyInstaller exe／Linux bundle，也不會建立 release。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 release tag（例如 v0.4.0）；其 GitHub Release 須已含 Linux bundle 與 SHA256SUMS"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   project-policy:
+    if: ${{ github.event_name == 'push' }}
     uses: hamanpaul/paulsha-conventions/.github/workflows/reusable-policy-check.yml@2dcf2f815afeddc477c1cacc33df9beb06ae14fb # v1.0.19
     with:
       policy_profile: flat
@@ -17,7 +26,8 @@ jobs:
       policy_engine_ref: 2dcf2f815afeddc477c1cacc33df9beb06ae14fb
 
   publish:
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04  # 與 tests.yml 的 pytest job 相同；ubuntu-latest 沒有釘死的 3.12.3
     needs: project-policy
 
     steps:
@@ -29,7 +39,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.3"
 
       - name: Verify tag matches VERSION
         env:
@@ -43,15 +53,16 @@ jobs:
           echo "release tag ${TAG_NAME} matches VERSION ${file_version}"
 
       - name: Install test + build dependencies
-        run: python3 -m pip install --disable-pip-version-check pytest pyyaml pyserial build
+        run: python3 -m pip install --disable-pip-version-check pytest==9.0.3 PyYAML==6.0.3 pyserial==3.5 jsonschema==4.10.3 setuptools wheel build "git+https://github.com/hamanpaul/paulsha-conventions.git@2dcf2f815afeddc477c1cacc33df9beb06ae14fb"
 
       - name: Run test suite (default install, no re2 -> fail-closed)
-        run: python3 -m pytest -q tests/
+        # 環境與 deselect 必須跟 tests.yml 的 pytest job 一致；P4 證據測試由出口 driver 強制
+        run: python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
 
       - name: Install google-re2 and re-run (re2 linear engine)
         run: |
           python3 -m pip install --disable-pip-version-check google-re2
-          python3 -m pytest -q tests/
+          python3 -m pytest -q tests/ --deselect tests/test_rust_bench_tools.py::test_cargo_workspace_tests_windows_native --deselect tests/test_rust_stage1b_registration.py::test_p4_required_cases_have_passing_evidence
 
       - name: Build wheel
         run: python3 -m build --wheel
@@ -76,6 +87,7 @@ jobs:
   publish-windows-exe:
     # 在 windows-latest 以 PyInstaller 打 one-file exe，附加到同一個 release（#84 PORT-4）。
     # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳 exe。
+    if: ${{ github.event_name == 'push' }}
     runs-on: windows-latest
     needs: publish
 
@@ -116,3 +128,404 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: gh release upload "$env:TAG_NAME" dist/serialwrap.exe dist/serialwrapd.exe --clobber
+
+  publish-linux-bundle:
+    # Linux x86_64 Rust bundle（RELEASE-TODO-01；docs/rust-refactor/release-0.4.0-plan.md §2）：
+    # cargo build --release＋mkbundle 正式候選（不含 sw-cli/test-fakes）→ tar.gz＋SHA256SUMS → 解開後 smoke → 附加到同一個 release。
+    # needs: publish —— 等 publish job 建好 GitHub Release 後才上傳。
+    # Windows bundle 由 publish-windows-bundle job 建置（OD-78，hosted windows-latest），等本 job 成功後才合併 SHA256SUMS。
+    # OD-50：Linux 使用者皆為 Ubuntu 24.04 以上，bundle 內附 Python runtime 綁定 /usr/bin/python3.12；
+    # 故釘 ubuntu-24.04 並以系統 Python 建 runtime，不用 actions/setup-python（hosted toolcache 不可搬移，S1-3185c6d-1）。
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    needs: publish
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain 1.96.1
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Verify tag matches VERSION and Cargo workspace version
+        id: verify-version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          file_version="$(tr -d ' \n' < VERSION)"
+          if [ "$TAG_NAME" != "v${file_version}" ]; then
+            echo "::error::release tag ${TAG_NAME} does not match v${file_version} (VERSION file)"
+            exit 1
+          fi
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "$cargo_version" != "$file_version" ]; then
+            echo "::error::Cargo.toml [workspace.package] version ${cargo_version} does not match VERSION ${file_version}"
+            exit 1
+          fi
+          echo "release tag ${TAG_NAME} matches VERSION ${file_version}"
+          echo "VERSION=${file_version}" >> "$GITHUB_ENV"
+
+      - name: Prepare system Python 3.12 build venv
+        id: system-python
+        # mkbundle 以 PATH 上的 python3 執行 `python3 -m venv --copies`，pyvenv.cfg 的 home 取自其基底直譯器目錄。
+        # 以 /usr/bin/python3.12 建 build venv，再由它建 bundle runtime：home = /usr/bin，與使用者主機（OD-50）一致；
+        # PyYAML（複製進 bundle runtime）與 jsonschema（驗 release-manifest.json）裝在 build venv，不動系統套件。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3.12 python3.12-venv
+          expected="$(/usr/bin/python3.12 -I -c 'import json; print(json.load(open("contracts/cli_help/_meta.json"))["python_version"])')"
+          actual="$(/usr/bin/python3.12 -I -c 'import platform; print(platform.python_version())')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::/usr/bin/python3.12 is ${actual}, contracts/cli_help/_meta.json expects ${expected}"
+            exit 1
+          fi
+          build_venv="$RUNNER_TEMP/build-venv"
+          /usr/bin/python3.12 -m venv "$build_venv"
+          "$build_venv/bin/python3" -m pip install --disable-pip-version-check pyyaml==6.0.3 jsonschema==4.10.3
+          base="$("$build_venv/bin/python3" -I -c 'import os, sys; print(os.path.dirname(sys._base_executable))')"
+          if [ "$base" != "/usr/bin" ]; then
+            echo "::error::build venv base interpreter is under ${base}, expected /usr/bin"
+            exit 1
+          fi
+          echo "$build_venv/bin" >> "$GITHUB_PATH"
+
+      - name: Build Rust workspace (release)
+        id: cargo-build
+        run: cargo build --release --workspace --locked
+
+      - name: Build release bundle
+        id: mkbundle
+        run: scripts/rust/mkbundle.sh --release-bundle --profile release --out "$RUNNER_TEMP/bundle/serialwrap-${VERSION}-linux-x86_64"
+
+      - name: Package bundle and SHA256SUMS
+        id: package
+        run: |
+          mkdir -p dist
+          # bin/ 內為指向 versions/<V>/bin/ 的相對 symlink，tar 原樣保留；mkbundle 的 owner marker 不屬於發佈內容。
+          tar -C "$RUNNER_TEMP/bundle" --exclude=.mkbundle-owner --owner=0 --group=0 --numeric-owner \
+            -czf "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" "serialwrap-${VERSION}-linux-x86_64"
+          (cd dist && sha256sum "serialwrap-${VERSION}-linux-x86_64.tar.gz" > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Smoke test extracted bundle
+        id: smoke
+        run: |
+          (cd dist && sha256sum -c SHA256SUMS)
+          smoke_dir="$RUNNER_TEMP/smoke"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir"
+          tar -xzf "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" -C "$smoke_dir"
+          root="$smoke_dir/serialwrap-${VERSION}-linux-x86_64"
+          version_dir="$root/versions/${VERSION}"
+
+          actual="$("$root/bin/serialwrap" --version)"
+          # 與 Python 基線相同：只接受精確版本，或附帶 12 位小寫十六進位指紋的整行。
+          python3 - "$actual" "$VERSION" <<'PY'
+          import re
+          import sys
+
+          actual, version = sys.argv[1:]
+          pattern = rf"serialwrap {re.escape(version)}(?: \(code [0-9a-f]{{12}}\))?"
+          if re.fullmatch(pattern, actual) is None:
+              raise SystemExit(f"::error::bin/serialwrap --version printed {actual!r}, expected 'serialwrap {version}' or 'serialwrap {version} (code <12 lowercase hex>)'")
+          PY
+          "$root/bin/serialwrap" --help > /dev/null
+
+          manifest="$version_dir/release-manifest.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::missing versions/${VERSION}/release-manifest.json"
+            exit 1
+          fi
+          python3 - "$manifest" "$VERSION" <<'PY'
+          import json
+          import sys
+
+          path, version = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          values = {
+              "bundle_version": manifest.get("bundle_version"),
+              "components.cli.version": manifest.get("components", {}).get("cli", {}).get("version"),
+              "components.daemon.version": manifest.get("components", {}).get("daemon", {}).get("version"),
+              "pairing.cli_version": manifest.get("pairing", {}).get("cli_version"),
+              "pairing.daemon_version": manifest.get("pairing", {}).get("daemon_version"),
+          }
+          wrong = {key: value for key, value in values.items() if value != version}
+          if wrong:
+              raise SystemExit(f"::error::release-manifest.json version mismatch (expected {version}): {wrong}")
+          if manifest.get("stage") == "rust-1b-dev":
+              raise SystemExit("::error::release-manifest.json is a delegate-sentinel test bundle")
+          PY
+          (cd "$version_dir" && sha256sum -c --quiet SHA256SUMS)
+
+          # bundle runtime 必須綁定使用者主機的 /usr/bin/python3.12（OD-50），不得指向建置機專有路徑（S1-3185c6d-1）。
+          pyvenv_cfg="$version_dir/py/pyvenv.cfg"
+          if [ ! -f "$pyvenv_cfg" ]; then
+            echo "::error::missing versions/${VERSION}/py/pyvenv.cfg"
+            exit 1
+          fi
+          if ! grep -qxF "home = /usr/bin" "$pyvenv_cfg"; then
+            echo "::error::py/pyvenv.cfg must contain 'home = /usr/bin' (OD-50): $(grep '^home' "$pyvenv_cfg" || echo 'no home line')"
+            exit 1
+          fi
+          if ! grep -qxF "include-system-site-packages = false" "$pyvenv_cfg"; then
+            echo "::error::py/pyvenv.cfg must contain 'include-system-site-packages = false'"
+            exit 1
+          fi
+
+          # 正式候選不得編入測試鉤子（crates/sw-cli/src/lib.rs、rollback.rs）。
+          for marker in SERIALWRAP_TEST_ SW_TEST_UPDATE_PAUSE_AFTER SW_TEST_UPDATE_FORCE_VERIFY_FAIL; do
+            if grep -rlaF "$marker" "$version_dir/bin"; then
+              echo "::error::bundle binaries contain test hook ${marker}"
+              exit 1
+            fi
+          done
+          if find "$root" -name 'delegate_sentinel*' | grep -q .; then
+            echo "::error::bundle contains delegate sentinel test entry"
+            exit 1
+          fi
+          echo "smoke passed for serialwrap-${VERSION}-linux-x86_64"
+
+      - name: Smoke test bundle daemon in clean Ubuntu 24.04 container
+        id: container-smoke
+        # 使用者主機模型（OD-50）：乾淨 ubuntu:24.04＋系統 python3.12，無 toolcache、無 PyYAML、無 libpython 共享庫；
+        # --network none，只唯讀掛載 smoke 解開的實際 tarball 內容；以 bundle 自身的 CLI 啟停 on-demand daemon（獨立暫存目錄、不碰裝置）。
+        run: |
+          root="$RUNNER_TEMP/smoke/serialwrap-${VERSION}-linux-x86_64"
+          image="serialwrap-bundle-smoke:ubuntu-24.04"
+          docker build -q -t "$image" - <<'DOCKERFILE'
+          FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends python3.12 \
+              && rm -rf /var/lib/apt/lists/* \
+              && test -x /usr/bin/python3.12 \
+              && test ! -e /usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0
+          DOCKERFILE
+          log="$RUNNER_TEMP/container-smoke.log"
+          status=0
+          docker run --rm -i --network none --user 1000:1000 -e VERSION="$VERSION" \
+            -v "$root:/opt/serialwrap:ro" "$image" bash -s > "$log" 2>&1 <<'CONTAINER' || status=$?
+          set -euo pipefail
+          B=/opt/serialwrap
+          PY="$B/versions/$VERSION/py/bin/python3"
+          T="$(mktemp -d /tmp/sw-smoke.XXXXXX)"
+          export HOME="$T/home" XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" XDG_DATA_HOME="$T/data" XDG_RUNTIME_DIR="$T/xdg-run"
+          export SERIALWRAP_CONFIG_DIR="$T/config/serialwrap" SERIALWRAP_RUN_DIR="$T/sw-run" SERIALWRAP_STATE_DIR="$T/sw-state"
+          export SERIALWRAP_WAL_DIR="$T/sw-wal" SERIALWRAP_LOG_DIR="$T/sw-log" SERIALWRAP_BY_ID_DIR="$T/by-id"
+          mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME" "$SERIALWRAP_CONFIG_DIR" "$SERIALWRAP_BY_ID_DIR"
+          install -d -m 700 "$XDG_RUNTIME_DIR"
+          printf 'supervision_mode: on-demand\n' > "$SERIALWRAP_CONFIG_DIR/config.yaml"
+          "$PY" -I -B -c 'import sw_core.daemon, yaml; print("bundle python runtime ok:", yaml.__file__)'
+          "$B/bin/serialwrap" daemon start
+          "$B/bin/serialwrap" daemon status > "$T/status.json"
+          daemon_pid="$("$PY" -I -B - "$T/status.json" "$VERSION" <<'PY'
+          import json
+          import sys
+
+          path, version = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              status = json.load(handle)
+          if status.get("ok") is not True or status.get("running") is not True or status.get("version") != version:
+              raise SystemExit(f"daemon status is not healthy: {status}")
+          print(status["pid"])
+          PY
+          )"
+          "$B/bin/serialwrap" daemon stop
+          for _ in $(seq 1 100); do
+            kill -0 "$daemon_pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          if kill -0 "$daemon_pid" 2>/dev/null; then
+            echo "daemon pid ${daemon_pid} still running after daemon stop"
+            exit 1
+          fi
+          if "$B/bin/serialwrap" daemon status > /dev/null 2>&1; then
+            echo "daemon status still succeeds after daemon stop"
+            exit 1
+          fi
+          echo "container smoke passed for serialwrap-${VERSION}"
+          CONTAINER
+          cat "$log"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::bundle daemon failed in clean ubuntu:24.04 container (exit ${status})"
+            exit 1
+          fi
+          if ! grep -qF "container smoke passed for serialwrap-${VERSION}" "$log"; then
+            echo "::error::container smoke did not report success"
+            exit 1
+          fi
+
+      - name: Upload bundle to release
+        id: upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release upload "$TAG_NAME" "dist/serialwrap-${VERSION}-linux-x86_64.tar.gz" dist/SHA256SUMS --clobber
+
+  publish-windows-bundle:
+    # Windows x86_64 Rust bundle（OD-78）：hosted windows-latest 以 gnu host toolchain 建置，不需擁有者 runner；
+    # scripts/rust/mkbundle-windows.ps1 組出 CPython 3.12.3 embeddable runtime 的 bundle（不含 com0com、不簽署、不含 test-fakes），
+    # 解開後 smoke，再把 zip 列併入 Linux job 已上傳的 SHA256SUMS 後上傳。
+    # needs: publish-linux-bundle —— 兩個 job 都會改寫同一個 SHA256SUMS，必須序列化。
+    # workflow_dispatch：Linux job 被略過時仍執行，對 inputs.tag 補傳 zip（腳本取自觸發 ref，原始碼取自 tag）。
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish-linux-bundle.result == 'success') }}
+    runs-on: windows-latest
+    needs: publish-linux-bundle
+    timeout-minutes: 60
+    env:
+      # rust-toolchain.toml 只釘 channel；windows-latest 的 rustup 預設 host 為 MSVC，強制 GNU host（與 rust.yml 相同）。
+      RUSTUP_TOOLCHAIN: 1.96.1-x86_64-pc-windows-gnu
+      TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      SOURCE_DIR: ${{ github.event_name == 'workflow_dispatch' && 'release-src' || '.' }}
+
+    steps:
+      - name: Keep LF line endings on checkout
+        # windows runner 的 system autocrlf=true 會讓 sw_core 與資產帶 CRLF，bundle 位元組就與 Linux 不同。
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Check out repository (build scripts)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out release source (workflow_dispatch tag)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: release-src
+          persist-credentials: false
+
+      - name: Verify tag matches VERSION and Cargo workspace version
+        id: verify-version
+        shell: pwsh
+        run: |
+          $fileVersion = (Get-Content (Join-Path $env:SOURCE_DIR 'VERSION') -Raw).Trim()
+          if ($env:TAG_NAME -ne "v$fileVersion") {
+            Write-Error "release tag $env:TAG_NAME does not match v$fileVersion (VERSION file)"
+            exit 1
+          }
+          $cargo = Get-Content (Join-Path $env:SOURCE_DIR 'Cargo.toml') -Raw
+          if ($cargo -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"' -or $Matches[1] -ne $fileVersion) {
+            Write-Error "Cargo.toml [workspace.package] version does not match VERSION $fileVersion"
+            exit 1
+          }
+          Write-Output "release tag $env:TAG_NAME matches VERSION $fileVersion"
+          "VERSION=$fileVersion" | Add-Content -LiteralPath $env:GITHUB_ENV
+
+      - name: Set up Python 3.12.3 (build host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+
+      - name: Install build host Python dependencies
+        # jsonschema 驗 release-manifest.json（與 Linux job 同版）；bundle 內的依賴由 mkbundle-windows.ps1 以雜湊釘版的 wheel 安裝。
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check jsonschema==4.10.3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Probe MinGW-w64 tools preinstalled on the image
+        id: mingw-probe
+        shell: pwsh
+        run: |
+          $hasAll = $true
+          foreach ($name in @('gcc', 'dlltool')) {
+            if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { $hasAll = $false }
+          }
+          if (-not ((Get-Command x86_64-w64-mingw32-objdump -ErrorAction SilentlyContinue) -or (Get-Command objdump -ErrorAction SilentlyContinue))) {
+            $hasAll = $false
+          }
+          "present=$($hasAll.ToString().ToLower())" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+
+      - name: Install MSYS2 MinGW-w64 (only when the image lacks it)
+        id: msys2
+        if: steps.mingw-probe.outputs.present != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+
+      - name: Add MSYS2 MinGW-w64 to PATH (only when installed)
+        if: steps.mingw-probe.outputs.present != 'true'
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_PATH -Value '${{ steps.msys2.outputs.msys2-location }}\mingw64\bin'
+
+      - name: Install Rust 1.96.1 (windows-gnu host) and assert host
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.1-x86_64-pc-windows-gnu --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ver = (rustc -vV | Out-String)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output $ver
+          if ($ver -notmatch '(?m)^host: x86_64-pc-windows-gnu\s*$') { throw "rustc host is not x86_64-pc-windows-gnu: $ver" }
+
+      - name: Provide x86_64-w64-mingw32-objdump name (needed by check_win_imports.py)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command x86_64-w64-mingw32-objdump -ErrorAction SilentlyContinue)) {
+            $plain = Get-Command objdump -ErrorAction Stop
+            $shimDir = Join-Path $env:RUNNER_TEMP 'mingw-shim'
+            New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+            Copy-Item -LiteralPath $plain.Source -Destination (Join-Path $shimDir 'x86_64-w64-mingw32-objdump.exe') -Force
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value $shimDir
+          }
+
+      - name: Build Windows release bundle
+        id: mkbundle
+        shell: pwsh
+        env:
+          # hosted runner 工作目錄在 D:、預設暫存在 C:，跨磁碟算不出相對路徑
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $name = "serialwrap-$env:VERSION-windows-x86_64"
+          $out = Join-Path $env:RUNNER_TEMP "bundle\$name"
+          .\scripts\rust\mkbundle-windows.ps1 -Out $out -SourceRoot $env:SOURCE_DIR -HostPython python -ZipPath "dist\$name.zip"
+          if (-not $?) { exit 1 }
+          # 二進位只允許 allowlist 內的系統 DLL（不得帶 MinGW runtime DLL）。
+          python scripts/rust/check_win_imports.py "$out\bin\serialwrap.exe" "$out\bin\serialwrapd.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test extracted bundle
+        id: smoke
+        shell: pwsh
+        run: |
+          # 在 throwaway 根目錄解開實際要發佈的 zip：--version／--help、內層 SHA256SUMS、manifest 版本、._pth 無絕對路徑、
+          # 測試鉤子字串、runtime 隔離（yaml／serial／sw_core 皆由 bundle 載入）、setup／doctor、daemon start／status／stop。
+          # 全程使用隔離目錄與 SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM999，不開任何 COM 埠。
+          .\scripts\rust\smoke-windows-bundle.ps1 -Zip "dist\serialwrap-$env:VERSION-windows-x86_64.zip" -Version $env:VERSION -HostPython python -SourceRoot $env:SOURCE_DIR
+          if (-not $?) { exit 1 }
+
+      - name: Merge SHA256SUMS and upload bundle to release
+        id: upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          zip_name="serialwrap-${VERSION}-windows-x86_64.zip"
+          linux_name="serialwrap-${VERSION}-linux-x86_64.tar.gz"
+          test -f "dist/${zip_name}"
+          mkdir -p merge
+          # 取回 Linux job 已上傳的 SHA256SUMS；沒有 Linux 列代表 Linux bundle 尚未發佈，不能只靠 Windows 列蓋掉它。
+          gh release download "$TAG_NAME" --pattern SHA256SUMS --dir merge --clobber
+          if ! grep -q "  ${linux_name}$" merge/SHA256SUMS; then
+            echo "::error::release ${TAG_NAME} 的 SHA256SUMS 沒有 ${linux_name} 的列；請先完成 Linux bundle"
+            exit 1
+          fi
+          sed -i "/  ${zip_name}$/d" merge/SHA256SUMS
+          # LF 行尾、兩個空白，與 Linux 列同格式（msys 的 sha256sum 可能輸出 ' *' 二進位標記，一律正規化）。
+          (cd dist && sha256sum "${zip_name}") | sed -E 's/^([0-9a-f]{64}) [ *]/\1  /' >> merge/SHA256SUMS
+          cat merge/SHA256SUMS
+          gh release upload "$TAG_NAME" "dist/${zip_name}" merge/SHA256SUMS --clobber
+          # 重新下載實際發佈的 bytes 並核對。
+          rm -rf verify-dl
+          gh release download "$TAG_NAME" --pattern "${linux_name}" --pattern "${zip_name}" --pattern SHA256SUMS --dir verify-dl
+          (cd verify-dl && sha256sum -c --ignore-missing SHA256SUMS)

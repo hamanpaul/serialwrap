@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "service",
+    "--help"
+  ],
+  "columns": 20,
+  "rc": 0,
+  "stdout": "usage: serialwrap service\n       [-h]\n       [--with-sudo]\n       {start,stop,restart,status}\n\n包裝 systemctl，按\nconfig.yaml 的\nsupervision_mode\n決定呼叫方式。 systemd-\nuser 模式：免 sudo。\nsystemd-system 模式：\nstart/stop/restart\n需 root（加 --with-\nsudo 代跑）。 on-\ndemand 模式：不可用。\n\npositional arguments:\n  {start,stop,restart,status}\n    要執行的 systemctl\n    動作\n\noptions:\n  -h, --help\n    show this help\n    message and\n    exit\n  --with-sudo\n    systemd-system\n    模式的特權動作（start/\n    stop/restart）以\n    sudo 執行\n",
+  "stderr": "",
+  "native": false,
+  "post_parse_effects": false
+}

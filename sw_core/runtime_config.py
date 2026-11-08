@@ -6,13 +6,14 @@ from pathlib import Path
 class RuntimeConfig:
     """讀寫 config.yaml：記錄 supervision_mode 與有效 socket 路徑（單一事實來源）。"""
 
-    def __init__(self, path) -> None:
-        self._path = Path(path)
+    def __init__(self, read_path: str | Path, write_path: str | Path | None = None) -> None:
+        self._read_path = Path(read_path)
+        self._write_path = Path(write_path) if write_path is not None else self._read_path
         self._data: dict = {}
-        if self._path.exists():
+        if self._read_path.exists():
             # 非 dict 內容（合法 YAML 但為純量/list）強制視為空，避免 mode()/socket_path()
             # 對非 dict 呼叫 .get() 而 traceback（#108 對抗審查殘留路徑）。
-            loaded = yaml.safe_load(self._path.read_text(encoding="utf-8"))
+            loaded = yaml.safe_load(self._read_path.read_text(encoding="utf-8"))
             self._data = loaded if isinstance(loaded, dict) else {}
 
     def mode(self) -> str | None:
@@ -25,8 +26,8 @@ class RuntimeConfig:
         self._data["supervision_mode"] = mode
         if socket_path is not None:
             self._data["socket_path"] = socket_path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(yaml.safe_dump(self._data, allow_unicode=True), encoding="utf-8")
+        self._write_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_path.write_text(yaml.safe_dump(self._data, allow_unicode=True), encoding="utf-8")
 
     def set_socket(self, endpoint: str) -> None:
         """更新 config.yaml 的 socket_path，不改動 supervision_mode（#84 PORT-4）。
@@ -34,5 +35,5 @@ class RuntimeConfig:
         daemon 啟動成功後寫入當前 endpoint，使 CLI ``_resolve_endpoint`` 連得上。
         """
         self._data["socket_path"] = endpoint
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(yaml.safe_dump(self._data, allow_unicode=True), encoding="utf-8")
+        self._write_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_path.write_text(yaml.safe_dump(self._data, allow_unicode=True), encoding="utf-8")

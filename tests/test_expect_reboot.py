@@ -10,6 +10,13 @@ from __future__ import annotations
 import io
 import json
 import os
+
+import pytest
+
+# POSIX-only：本檔頂層 import pty、tty（→ termios），原生 Windows 沒有 termios，會在收集階段失敗。
+if os.name == "nt":
+    pytest.skip("expect-reboot 測試依賴 POSIX pty／termios", allow_module_level=True)
+
 import pty
 import select
 import threading
@@ -97,16 +104,22 @@ def _use(session, bridge):
 
 
 @pytest.mark.parametrize("value", [None, True, False])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_valid_values(value):
     assert valid_expect_reboot(value)
 
 
 @pytest.mark.parametrize("value", ["false", "true", "", 0, 1, [], {}])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_non_bool_is_rejected_not_coerced(value):
     assert not valid_expect_reboot(value)
     assert expect_reboot_rejection(value, "line") == {"ok": False, "error_code": ERROR_INVALID_EXPECT_REBOOT}
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_interactive_with_flag_is_rejected_but_false_is_not():
     rejected = expect_reboot_rejection(True, "interactive")
     assert rejected["error_code"] == ERROR_EXPECT_REBOOT_MODE and not rejected["ok"]
@@ -119,6 +132,8 @@ def test_interactive_with_flag_is_rejected_but_false_is_not():
 # --- 執行層：走 reboot 路徑 ------------------------------------------------------------
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flag_routes_chained_command_to_reboot_handler(mgr):
     manager, session, wal = mgr
     _use(session, RecordingBridge())
@@ -133,6 +148,8 @@ def test_flag_routes_chained_command_to_reboot_handler(mgr):
     assert any(e.get("meta", {}).get("event") == "command_expect_reboot" for e in wal.entries)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_without_flag_chained_command_keeps_old_behaviour(mgr):
     manager, session, wal = mgr
     assert not _is_reboot_command(CHAINED)  # 不默默擴大猜法
@@ -146,6 +163,8 @@ def test_without_flag_chained_command_keeps_old_behaviour(mgr):
     assert not any(e.get("meta", {}).get("event") == "command_expect_reboot" for e in wal.entries)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flag_with_plain_reboot_keeps_two_second_prompt_wait(mgr):
     manager, session, wal = mgr
     _use(session, RecordingBridge())
@@ -154,6 +173,8 @@ def test_flag_with_plain_reboot_keeps_two_second_prompt_wait(mgr):
     assert reboot.call_args.kwargs["prompt_wait_s"] is None
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_plain_reboot_without_flag_is_unchanged(mgr):
     manager, session, wal = mgr
     _use(session, RecordingBridge())
@@ -163,7 +184,10 @@ def test_plain_reboot_without_flag_is_unchanged(mgr):
     assert not any(e.get("meta", {}).get("event") == "command_expect_reboot" for e in wal.entries)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flag_in_interactive_mode_rejected_with_zero_tx(mgr):
+    assert ERROR_EXPECT_REBOOT_MODE == "EXPECT_REBOOT_MODE_UNSUPPORTED"
     manager, session, wal = mgr
     bridge = _use(session, RecordingBridge())
     result = manager.execute_command(session.session_id, "reboot", "agent:t", "c1", mode="interactive", expect_reboot=True)
@@ -171,7 +195,10 @@ def test_flag_in_interactive_mode_rejected_with_zero_tx(mgr):
     assert bridge.sent == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_invalid_flag_type_rejected_with_zero_tx(mgr):
+    assert ERROR_INVALID_EXPECT_REBOOT == "INVALID_EXPECT_REBOOT"
     manager, session, wal = mgr
     bridge = _use(session, RecordingBridge())
     result = manager.execute_command(session.session_id, "reboot", "agent:t", "c1", expect_reboot="false")
@@ -179,6 +206,8 @@ def test_invalid_flag_type_rejected_with_zero_tx(mgr):
     assert bridge.sent == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flag_does_not_bypass_autoboot_quiet_gate(mgr):
     manager, session, wal = mgr
     bridge = _use(session, RecordingBridge())
@@ -188,6 +217,8 @@ def test_flag_does_not_bypass_autoboot_quiet_gate(mgr):
     assert bridge.sent == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_flag_wins_over_completion_regex(mgr):
     manager, session, wal = mgr
     _use(session, RecordingBridge())
@@ -202,6 +233,8 @@ def test_flag_wins_over_completion_regex(mgr):
 # --- 串接命令的 prompt 等待（先跑一段才重開）-------------------------------------------
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery(mgr):
     """前段耗時 5s（> 舊的固定 2s）：prompt 回來＝非同步 reboot 的 prompt 回顯，
     與單獨 reboot 同一條路徑（不開 recovery 迴圈、不 confirm_ready、gate 保留）。"""
@@ -218,6 +251,8 @@ def test_chained_command_prompt_after_pre_segment_is_not_treated_as_recovery(mgr
     assert follow["error_code"] == "AUTOBOOT_QUIET"
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_fixed_two_second_wait_would_have_entered_recovery(mgr):
     """對照組：沿用固定 2s（不傳 prompt_wait_s）時，同一段 5s 的前段會誤入 recovery 分支。"""
     manager, session, wal = mgr
@@ -230,6 +265,8 @@ def test_fixed_two_second_wait_would_have_entered_recovery(mgr):
     assert bridge.waits == [2.0]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_chained_command_without_prompt_still_falls_to_recovery(mgr):
     """前段後 shell 不再回 prompt（同步重開、sysupgrade）：等滿 --cmd-timeout 後走既有 recovery。"""
     manager, session, wal = mgr
@@ -280,6 +317,8 @@ class Target:
 
 
 @pytest.mark.parametrize("pre_segment_s", [0.2, 2.4])
+@pytest.mark.posix_only
+@pytest.mark.posix_pty
 def test_pty_chained_reboot_with_flag(tmp_path, pre_segment_s):
     target = Target(pre_segment_s)
     wal = Wal()
@@ -313,6 +352,8 @@ def test_pty_chained_reboot_with_flag(tmp_path, pre_segment_s):
 # --- 傳遞：CLI → RPC → submit-time gate → arbiter → execute ----------------------------
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_cli_transmits_flag_only_when_given():
     with mock.patch("sw_core.cli.rpc_call", return_value={"ok": True}) as rpc, redirect_stdout(io.StringIO()):
         assert main(["--socket", "/tmp/nonexistent-expect-reboot.sock", "cmd", "submit", "--selector", "COM0",
@@ -324,6 +365,8 @@ def test_cli_transmits_flag_only_when_given():
         assert "expect_reboot" not in rpc.call_args.args[2]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_cli_rejects_interactive_with_flag_before_rpc():
     output = io.StringIO()
     with mock.patch("sw_core.cli.rpc_call") as rpc, redirect_stdout(output):
@@ -343,6 +386,8 @@ def _wait_done(service, cmd_id):
     raise AssertionError("command did not finish")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_rpc_queue_worker_execute_and_command_get_propagate_flag():
     service = SerialwrapService([])
     session_id = "fake:COM0"
@@ -366,6 +411,8 @@ def test_rpc_queue_worker_execute_and_command_get_propagate_flag():
         service._arbiter.unregister_session(session_id)
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_arbiter_callback_contract_only_extends_when_flag_is_set():
     callback = mock.Mock(return_value={"ok": True})
     arbiter = CommandArbiter(callback)
@@ -388,6 +435,8 @@ def test_arbiter_callback_contract_only_extends_when_flag_is_set():
 
 
 @pytest.mark.parametrize("bad", ["false", "true", 1, 0, ""])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_rpc_and_arbiter_reject_non_bool_without_enqueue(bad):
     service = SerialwrapService([])
     with mock.patch.object(service, "_resolve_session_id") as resolve:
@@ -402,6 +451,8 @@ def test_rpc_and_arbiter_reject_non_bool_without_enqueue(bad):
     assert arbiter.snapshot() == []
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_rpc_rejects_interactive_with_flag_before_session_resolution():
     service = SerialwrapService([])
     with mock.patch.object(service, "_resolve_session_id") as resolve:
@@ -410,6 +461,8 @@ def test_rpc_rejects_interactive_with_flag_before_session_resolution():
     resolve.assert_not_called()
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_rpc_flag_does_not_bypass_submit_time_quiet_gate():
     service = SerialwrapService([])
     gate = {"ok": False, "error_code": "AUTOBOOT_QUIET", "retry_after_s": 5.0}
@@ -446,6 +499,8 @@ def _submit(cmd, **params):
     ("sleep 1 & reboot -f", "reboot -f"),
     ("sync && echo b > /proc/sysrq-trigger", "echo b > /proc/sysrq-trigger"),
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_chained_reboot_without_flag_gets_non_fatal_warning(cmd, segment):
     result = _submit(cmd)
     assert result["ok"] and result["cmd_id"]  # 命令照常入列
@@ -463,23 +518,31 @@ def test_chained_reboot_without_flag_gets_non_fatal_warning(cmd, segment):
     "a && shutdown -h now",
     "a && 'unterminated",
 ])
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_no_warning_for_commands_without_chained_reboot(cmd):
     result = _submit(cmd)
     assert result["ok"]
     assert "warning" not in result and "warnings" not in result
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_no_warning_when_flag_given_or_interactive():
     assert "warning" not in _submit(CHAINED, expect_reboot=True)
     assert "warning" not in _submit(CHAINED, mode="interactive")
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_length_warning_keeps_its_slot_and_hint_is_added_to_list():
     result = _submit(CHAINED + " # " + "x" * 5000)
     assert result["warning"]["code"] == "CMD_LENGTH_WARNING"
     assert [w["code"] for w in result["warnings"]] == ["CMD_LENGTH_WARNING", WARNING_CHAINED_REBOOT]
 
 
+@pytest.mark.core_portable
+@pytest.mark.memory_only
 def test_guess_is_not_silently_widened():
     assert not _is_reboot_command(CHAINED)
     assert not _is_reboot_command("sync; systemctl reboot")

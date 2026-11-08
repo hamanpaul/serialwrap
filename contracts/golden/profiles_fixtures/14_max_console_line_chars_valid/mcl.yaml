@@ -1,0 +1,12 @@
+profiles:
+  p:
+    platform: prpl
+    max_console_line_chars: 120
+  q:
+    platform: prpl
+    max_console_line_chars: 0x40
+
+targets:
+  - {profile: p, device_by_id: d1}
+  - {profile: p, device_by_id: d2, max_console_line_chars: null}
+  - {profile: q, device_by_id: d3, max_console_line_chars: 8}

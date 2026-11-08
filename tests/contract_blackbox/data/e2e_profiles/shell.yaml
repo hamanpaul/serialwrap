@@ -1,0 +1,16 @@
+# P3-T18 黑箱 E2E 用的 shell 登入 profile（Python daemon 基線）。
+# device_by_id 的佔位值由測試以 FakeTarget 的 by-id symlink 路徑取代；帳密由 daemon env 經
+# user_env／pass_env 提供（SERIALWRAP_E2E_USER、SERIALWRAP_E2E_PASS），不寫入本檔。
+profiles:
+  shell-e2e:
+    platform: shell
+    prompt_regex: ".*[$#] $"
+    login_regex: "(?mi)^.*login:\\s*$"
+    password_regex: "(?mi)^password:\\s*$"
+    user_env: SERIALWRAP_E2E_USER
+    pass_env: SERIALWRAP_E2E_PASS
+    timeout_s: 10
+targets:
+  - profile: shell-e2e
+    com: COM0
+    device_by_id: __DEVICE_BY_ID__

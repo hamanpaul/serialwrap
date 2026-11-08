@@ -36,6 +36,35 @@ broker 的非 partial 完成不代表 target 命令成功或測試通過。
 既有未指定參數的七參數 arbiter callback 維持相容；只有指定完成 regex 時才透過
 新增的可選 keyword 傳到 execute。
 
+## Passthrough 完成條件（SC-35）
+
+`platform=passthrough` 的 session（含 `others-template`）一經 explicit target、`session pin`
+或 sticky 選定，attach 時不 login、不送 `ready_probe`，停在 `ATTACHED`（零 TX）；連續 30 秒
+沒有 RX 自動升 `READY`，之後才可下 `line`／`background` 命令。動態偵測（僅在沒有 template
+匹配時才選中 passthrough）與 `fallback` session 的每次 re-attach 仍會先由獨立的 PROBE bridge
+送一個 `\n` 偵測探測；要避免請 pin 該 profile 或使用 explicit target。passthrough 命令的完成條件依序判定：
+
+1. 有 `completion_regex`（`cmd submit --completion-regex`）→ 以該 regex 完成，即上
+   方的 producer 完成條件。
+2. 否則 profile 的 `prompt_regex` 通過 `valid_completion_regex`（可編譯、非空、不匹配
+   空字串）→ 以 prompt 完成。
+3. 前兩層皆無可用條件（如 `others-template` 的 `.*`），或已指定的 regex／prompt 始終未命中 → 沿用既有等待迴圈：有新 RX 就續等；連續
+   `min(timeout_s, 30)` 秒沒有新 RX，或達到 effective timeout 即停，回傳
+
+   ```json
+   {"ok": false, "error_code": "PROMPT_TIMEOUT", "partial": true, "recovery_action": "NONE"}
+   ```
+
+   已擷取的 RX（經 `clean_text`）保留在 background capture chunks，應以 `command.result_tail`（`serialwrap cmd result-tail --cmd-id`）讀回；`command.get` 的 `stdout` 為空，不含此段輸出。
+
+passthrough 未命中完成條件時，不送 Ctrl-C（`\x03`）與 Ctrl-D（`\x04`）、不轉
+`ATTACHED`、不 force recover，session 維持 `READY`；`reboot` 命令不套用特例。
+`file push`／`file pull` 對 passthrough（任何 state）回 `PROFILE_NOT_COMMAND_CAPABLE`
+且零 TX。`mode=interactive` 行為不變，仍使用 lease 與按鍵契約。
+
+建議：console 不送 prompt 時，每次 `cmd submit` 都帶 `--completion-regex`，不要依賴第 3
+層的逾時判定。
+
 ## 回歸驗證範圍
 
 PTY 測試使用 producer 先回顯命令、再輸出 numeric RC／END 並刻意不送 shell

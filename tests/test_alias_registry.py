@@ -1,6 +1,9 @@
 import unittest
 
 from sw_core.alias_registry import AliasRegistry
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 class TestAliasRegistry(unittest.TestCase):

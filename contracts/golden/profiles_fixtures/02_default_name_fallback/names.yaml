@@ -1,0 +1,11 @@
+profile_name: ghost
+profiles:
+  b-tpl:
+    platform: shell
+  a-tpl:
+    platform: prpl
+
+targets:
+  - device_by_id: dev-1
+  - profile_name: b-tpl
+    device_by_id: dev-2

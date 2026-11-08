@@ -16,8 +16,11 @@ from __future__ import annotations
 import configparser
 import getpass
 import importlib.resources
+import logging
 import os
 import shutil
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from sw_core import assets as _assets
@@ -79,7 +82,12 @@ def _force_symlink(link: Path, target: Path) -> None:
         shutil.rmtree(link)
     elif link.exists():
         link.unlink()
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        if os.name != "nt":
+            raise
+        shutil.copytree(target, link, dirs_exist_ok=True)
 
 
 def _remove_legacy_serialwrap_mcp_link(link: Path) -> None:
@@ -253,6 +261,37 @@ class FlashingBusy(Exception):
     """flash 進行中且未帶 force 時拋出，表示不可在此刻切換監管模式。"""
 
 
+def wait_old_daemon_gone(
+    endpoint: str,
+    pid: int | None,
+    *,
+    timeout_s: float = 10.0,
+    ping: Callable[[str], bool],
+    alive: Callable[[int | None], bool | None],
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> bool:
+    """等候舊 daemon 的 endpoint 不可達且其行程已確認消失。"""
+    sleep_fn = time.sleep if sleep is None else sleep
+    monotonic_fn = time.monotonic if monotonic is None else monotonic
+    deadline = monotonic_fn() + max(0.0, timeout_s)
+    while True:
+        try:
+            endpoint_alive = bool(ping(endpoint))
+        except Exception:  # noqa: BLE001 — 探測失敗視為 endpoint 不可達
+            endpoint_alive = False
+        try:
+            process_alive = alive(pid)
+        except Exception:  # noqa: BLE001 — 無法確認行程狀態時 fail closed
+            process_alive = None
+        if not endpoint_alive and process_alive is False:
+            return True
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            return False
+        sleep_fn(min(0.2, remaining))
+
+
 # systemd user/system scope 的 unit 安裝路徑、固定 socket/profile 與 ExecStart。
 _USER_UNIT_REL = Path(".config") / "systemd" / "user" / "serialwrap.service"
 _USER_EXEC_START = "%h/.local/bin/serialwrapd"
@@ -310,13 +349,19 @@ def _merge_wsl_conf_systemd(existing: str) -> str:
     return buf.getvalue()
 
 
-def ensure_wsl_systemd(fx, home) -> dict:
-    """WSL 上若 systemd 尚未啟用，寫 ``/etc/wsl.conf`` ``[boot] systemd=true``（需 sudo）。
+def ensure_wsl_systemd(
+    fx,
+    home,
+    *,
+    target_mode: str = "on-demand",
+    with_sudo: bool = False,
+) -> dict:
+    """WSL 上 systemd 尚未啟用時，依目標模式與授權處理 ``/etc/wsl.conf``。
 
     - 非 WSL → no-op（``{"wsl": False}``）。
     - 已啟用 systemd（``has_systemd``）→ no-op（``already=True``）。
-    - 需啟用 → staging + ``sudo install`` 寫 ``/etc/wsl.conf``，回報需於 Windows 端
-      ``wsl --shutdown`` 重啟（systemd 須重進 WSL 才生效，當次 setup 無法直接起 systemd 服務）。
+    - 需啟用 → 建立 staging 設定；僅目標為 systemd 模式且帶 ``with_sudo`` 時執行
+      ``sudo install``，其餘情況回傳 ``pending_sudo``。
 
     以 Effects.run 經過 sudo install（非直接 sudo tee，避免空檔）。回傳結果字典供
     cli 決定是否早退並提示使用者重啟。
@@ -334,7 +379,16 @@ def ensure_wsl_systemd(fx, home) -> dict:
     staging = home / ".local" / "share" / "serialwrap" / "wsl.conf"
     staging.parent.mkdir(parents=True, exist_ok=True)
     staging.write_text(merged, encoding="utf-8")
-    rc, _out, _err = fx.run(["sudo", "install", "-m", "0644", str(staging), "/etc/wsl.conf"])
+    cmd = ["sudo", "install", "-m", "0644", str(staging), "/etc/wsl.conf"]
+    if not target_mode.startswith("systemd") or not with_sudo:
+        return {
+            "wsl": True,
+            "already": False,
+            "enabled_now": False,
+            "needs_restart": False,
+            "pending_sudo": [cmd],
+        }
+    rc, _out, _err = fx.run(cmd)
     return {
         "wsl": True,
         "already": False,
@@ -391,12 +445,12 @@ def _system_install_cmds(home: Path, *, include_start: bool) -> list[list[str]]:
     return cmds
 
 
-def _state_path_for(mode: str, home: Path) -> Path:
+def _state_path_for(mode: str, home: Path, *, run_user: str | None = None) -> Path:
     """回傳指定 scope 的 state.json 路徑（用於跨 scope 遷移判斷）。
 
     user scope（``on-demand`` / ``systemd-user``）落在 XDG state home；
-    system scope（``systemd-system``）對應 systemd ``StateDirectory=serialwrap``
-    的 ``/var/lib/serialwrap``。同一 scope 內路徑相同 → 遷移為 no-op。
+    system scope（``systemd-system``）使用 unit 的 ``User=`` 家目錄下 daemon
+    實際採用的 XDG 預設 state 路徑。同一 scope 內路徑相同 → 遷移為 no-op。
 
     Args:
         mode: 監管模式字串。
@@ -406,7 +460,19 @@ def _state_path_for(mode: str, home: Path) -> Path:
         該 scope 對應的 ``state.json`` 路徑。
     """
     if mode == "systemd-system":
-        return Path("/var/lib/serialwrap/state.json")
+        username = run_user or _resolve_run_user()
+        try:
+            import pwd
+
+            state_home = Path(pwd.getpwnam(username).pw_dir)
+        except (ImportError, KeyError, OSError) as exc:
+            logging.getLogger(__name__).warning(
+                "無法解析 systemd system daemon 使用者 %s 的家目錄，遷移路徑退回呼叫者家目錄：%s",
+                username,
+                exc,
+            )
+            state_home = Path(home)
+        return state_home / ".local" / "state" / "serialwrap" / "state.json"
     state_home = os.environ.get("XDG_STATE_HOME") or str(home / ".local" / "state")
     return Path(state_home) / "serialwrap" / "state.json"
 
@@ -497,36 +563,13 @@ def _start_new(
     # target_mode == "on-demand"：無需啟動，daemon 依需求自生。
 
 
-# ═════════════ daemon 載入的程式碼是否過期（build fingerprint）═════════════
-#
-# 問題：``pipx install --force`` 換掉磁碟上的程式碼後，``serialwrap setup`` 的同模式
-# 刷新只重寫 unit／daemon-reload／enable，從不 start；轉換路徑送的 ``systemctl start``
-# 在服務已 active 時也是 no-op。結果是正在跑的 daemon 靜默沿用舊碼，且版本字串不變
-# （0.3.2 → 0.3.2）所以版本比對也看不出來。這裡以程式碼指紋（sw_core/version.py）判定，
-# 判定為舊碼且服務確實由 systemd 管理時，在同模式刷新末端補一個 restart。
-#
-# 注意：與 ``ensure_wsl_systemd`` 回傳的 ``needs_restart`` 無關——那個是「須在 Windows 端
-# ``wsl --shutdown`` 讓 systemd 生效」，這裡是「重啟 serialwrap 服務讓 daemon 換新碼」。
-
-
 def daemon_code_assessment(
     *,
     daemon_running: bool,
     daemon_fingerprint: str | None,
     installed_fingerprint: str | None,
 ) -> dict:
-    """比對正在跑的 daemon 與本行程（＝剛安裝的版本）的程式碼指紋（純函式）。
-
-    Returns:
-        ``{"checked", "stale", "reason", "daemon", "installed"}``：
-
-        - daemon 連不上 → ``checked=False``（維持 setup 既有行為，不做任何判斷）。
-        - 本行程算不出指紋（凍結包）→ ``checked=False``。
-        - daemon 可達但回應沒有 ``code_fingerprint`` → ``stale=True``，
-          ``reason="daemon_no_fingerprint"``：本版本的 daemon 一定會回報，不回報的必然
-          是更舊的 build（升級到第一個帶指紋的版本時，正是這種情況）。
-        - 兩者不同 → ``stale=True``，``reason="fingerprint_mismatch"``。
-    """
+    """比對執行中的 daemon 與目前安裝的 Python 程式碼指紋。"""
     state = {
         "checked": False,
         "stale": False,
@@ -551,11 +594,7 @@ def daemon_code_assessment(
 
 
 def service_is_active(fx, mode: str) -> bool:
-    """systemd 服務目前是否 active（唯讀、免 sudo；非 systemd 模式一律 False）。
-
-    ``is-active`` 的 rc 為 0 且 stdout 為 ``active`` 才算；``activating``／``failed``
-    等狀態都不算——對還沒起來或壞掉的服務補 restart 不是 setup 該做的事。
-    """
+    """唯讀確認對應 scope 的 systemd service 為 active。"""
     if mode == "systemd-user":
         cmd = ["systemctl", "--user", "is-active", "serialwrap"]
     elif mode == "systemd-system":
@@ -573,6 +612,10 @@ def reconcile(
     fx,
     home,
     daemon_running: bool = False,
+    old_endpoint: str | None = None,
+    old_pid: int | None = None,
+    ping: Callable[[str], bool] | None = None,
+    alive: Callable[[int | None], bool | None] | None = None,
     any_flashing: bool = False,
     with_sudo: bool = False,
     force: bool = False,
@@ -593,19 +636,17 @@ def reconcile(
         fx:             effects 介面，所有外部指令（systemctl/loginctl/daemon
                         stop）經此以便單元測試攔截。
         home:           使用者家目錄；unit 檔寫於此目錄下（可在 tmp 測試）。
-        daemon_running: on-demand daemon 是否在跑（決定是否需先停舊）。
+        daemon_running: on-demand daemon 是否可由 RPC 回應（決定是否送停止 RPC）。
         any_flashing:   是否有 flash／傳輸進行中（護欄）。
         with_sudo:      是否允許執行特權 sudo 指令。
         force:          ``True`` 時跳過 flash 護欄。
         socket_path:    寫入 config 的有效 socket 路徑（可為 ``None``）。
-        config_path:    config.yaml 路徑；``None`` 時用
-                        ``home/.config/serialwrap/config.yaml``。
-        restart_daemon: 同模式（systemd-user／systemd-system）刷新末端補一個
-                        ``systemctl restart serialwrap``，讓已在跑的 daemon 載入剛安裝
-                        的程式碼。呼叫端須已確認服務 active 且 daemon 為舊碼（見
-                        :func:`daemon_code_assessment`、:func:`service_is_active`）。
-                        預設 ``False`` ＝ 維持「冪等刷新、不打斷正在跑的 daemon」。
-                        模式轉換路徑本來就會停舊起新，不受此旗標影響。
+        config_path:    明確指定時用作讀寫路徑；省略時依設定探索順序讀取，
+                        寫入一律落在使用者 config.yaml。
+        old_endpoint:   停止前舊 daemon 的 endpoint；省略時由 config 或平台預設推得。
+        old_pid:        停止前從 health.status 取得的 PID。
+        ping:           endpoint 探測替身；省略時使用本機 RPC health.ping。
+        alive:          行程存活探測替身；省略時以平台行程檢查及 systemd 狀態確認。
 
     Returns:
         摘要字典::
@@ -617,10 +658,6 @@ def reconcile(
                 "pending_sudo": [未授權待執行的特權指令清單],
             }
 
-        帶 ``restart_daemon=True`` 時另有 ``"daemon_restart"``：``"ran"``（restart 指令
-        成功）、``"failed"``（rc 非 0）、``"pending_sudo"``（system scope 未帶
-        ``with_sudo``，指令已列入 ``pending_sudo``）、``None``（此路徑不適用，如模式轉換）。
-
     Raises:
         FlashingBusy: ``any_flashing`` 為真且未帶 ``force``。
     """
@@ -631,7 +668,15 @@ def reconcile(
     if any_flashing and not force:
         raise FlashingBusy("flash 進行中，拒絕切換監管模式（可用 force 覆寫）")
 
-    cfg = RuntimeConfig(config_path or (home / ".config" / "serialwrap" / "config.yaml"))
+    if config_path is not None:
+        cfg = RuntimeConfig(config_path)
+    else:
+        from sw_core.constants import resolve_config_path
+
+        cfg = RuntimeConfig(
+            resolve_config_path(),
+            write_path=resolve_config_path(for_write=True),
+        )
 
     # ── 護欄 2：涉及 system scope 的特權操作（裝/起新 system unit、或停舊 system service）都需 root；
     #    未帶 with_sudo → 蒐集 pending 並早退，且「不停舊、不起新、不寫 config」。這同時擋掉兩種半套：
@@ -650,7 +695,7 @@ def reconcile(
         restart_pending = restart_daemon and _system_target and old_mode == target_mode
         if restart_pending:
             pending.append(["sudo", "systemctl", "restart", "serialwrap"])
-        early: dict = {
+        early = {
             "mode": old_mode,            # 實際生效模式未變（config 不寫）
             "requested_mode": target_mode,
             "transitioned": False,
@@ -673,7 +718,6 @@ def reconcile(
             fx.run(["systemctl", "--user", "daemon-reload"])
             fx.run(["systemctl", "--user", "enable", "serialwrap"])
             if restart_daemon:
-                # 呼叫端已確認 daemon 載入的是舊碼：unit 刷新完才 restart，新 unit 一併生效。
                 rc, _out, _err = fx.run(["systemctl", "--user", "restart", "serialwrap"])
                 daemon_restart = "ran" if rc == 0 else "failed"
         elif target_mode == "systemd-system":
@@ -690,9 +734,9 @@ def reconcile(
                 if restart_daemon:
                     pending_sudo.append(["sudo", "systemctl", "restart", "serialwrap"])
                     daemon_restart = "pending_sudo"
-        # on-demand 同模式：無 unit 可刷新，僅寫 config（沒有服務可 restart）。
+        # on-demand 同模式：無 unit 可刷新，僅寫 config。
         cfg.set_mode(target_mode, socket_path=socket_path)
-        refreshed: dict = {
+        refreshed = {
             "mode": target_mode,
             "transitioned": False,
             "applied": True,
@@ -713,15 +757,80 @@ def reconcile(
         pending_sudo=pending_sudo,
     )
 
+    should_wait_for_old = old_mode.startswith("systemd") or old_mode == "on-demand"
+    if should_wait_for_old:
+        if old_endpoint is None:
+            old_endpoint = cfg.socket_path()
+        if old_endpoint is None:
+            from sw_core.constants import DEFAULT_ENDPOINT
+
+            old_endpoint = SYSTEM_SOCKET if old_mode == "systemd-system" else DEFAULT_ENDPOINT
+
+        if ping is None:
+            from sw_core.client import rpc_call
+
+            def ping(endpoint: str) -> bool:
+                try:
+                    return bool(rpc_call(endpoint, "health.ping", {}, timeout_s=0.2).get("ok"))
+                except Exception:  # noqa: BLE001 — RPC 失敗代表 endpoint 不可達
+                    return False
+
+        if alive is None:
+            from sw_core.multi_open import daemon_process_alive
+
+            def alive(pid: int | None) -> bool | None:
+                if pid is not None and pid > 0:
+                    return daemon_process_alive(pid, old_endpoint)
+                if old_mode.startswith("systemd"):
+                    command = ["systemctl", "--user", "is-active", "serialwrap"]
+                    if old_mode == "systemd-system":
+                        command = ["systemctl", "is-active", "serialwrap"]
+                    try:
+                        rc, stdout, _stderr = fx.run(command, timeout_s=1.0)
+                    except Exception:  # noqa: BLE001 — 狀態不可查時退回行程探測
+                        rc, stdout = -1, ""
+                    state = stdout.strip().lower()
+                    if state == "active" and rc == 0:
+                        return True
+                    if state in {"inactive", "failed"}:
+                        return False
+                return daemon_process_alive(pid, old_endpoint)
+
+        if not wait_old_daemon_gone(
+            old_endpoint,
+            old_pid,
+            ping=ping,
+            alive=alive,
+        ):
+            timed_out = {
+                "mode": old_mode,
+                "requested_mode": target_mode,
+                "transitioned": False,
+                "applied": False,
+                "ran": [list(c) for c in getattr(fx, "calls", [])],
+                "pending_sudo": pending_sudo,
+                "ok": False,
+                "error_code": "TIMEOUT",
+                "phase": "reconcile_wait_old_exit",
+            }
+            if restart_daemon:
+                timed_out["daemon_restart"] = None
+            return timed_out
+
     # b. 跨 scope 才需遷移 state（best-effort、僅 dest 空才搬、絕不拋例外）。
-    legacy_state = _state_path_for(old_mode, home)
-    new_state = _state_path_for(target_mode, home)
-    if legacy_state != new_state:
-        try:
+    try:
+        run_user = (
+            _resolve_run_user()
+            if old_mode == "systemd-system" or target_mode == "systemd-system"
+            else None
+        )
+        legacy_state = _state_path_for(old_mode, home, run_user=run_user)
+        new_state = _state_path_for(target_mode, home, run_user=run_user)
+        if legacy_state != new_state:
             migrate_legacy_state(legacy_state, new_state)
-        except Exception:
-            # 遷移屬 best-effort，失敗不可中斷模式轉換。
-            pass
+    except Exception:
+        # 遷移路徑解析與檔案搬移皆屬 best-effort，失敗不可中斷模式轉換。
+        pass
 
     # c. 再起新（必在停舊之後）。
     _start_new(
@@ -735,7 +844,7 @@ def reconcile(
     # d. 寫 config（單一事實來源）。此處必為已實際套用（system-no-sudo 已於上游早退）。
     cfg.set_mode(target_mode, socket_path=socket_path)
 
-    transitioned: dict = {
+    transitioned = {
         "mode": target_mode,
         "transitioned": True,
         "applied": True,
@@ -743,5 +852,5 @@ def reconcile(
         "pending_sudo": pending_sudo,
     }
     if restart_daemon:
-        transitioned["daemon_restart"] = None  # 轉換本身已停舊起新，不另補 restart
+        transitioned["daemon_restart"] = None
     return transitioned

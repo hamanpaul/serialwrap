@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "session",
+    "bind",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap session bind [-h] --selector SELECTOR --device-by-id\n                               DEVICE_BY_ID\n\noptions:\n  -h, --help            show this help message and exit\n  --selector SELECTOR   session_id | COMx | alias\n  --device-by-id DEVICE_BY_ID\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

@@ -41,8 +41,9 @@ materializes profiles, the broker minicom wrapper, and daemon supervision, see
 including diagrams and field validation notes, see [繁體中文](#繁體中文).
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup
+# Linux x86_64, glibc >= 2.39, /usr/bin/python3.12 (Ubuntu 24.04 or later)
+git clone https://github.com/hamanpaul/serialwrap && cd serialwrap
+./install.sh            # download the latest release bundle, verify SHA256SUMS, run bin/serialwrap setup
 serialwrap doctor
 ```
 
@@ -93,9 +94,11 @@ console views, command result capture, and diagnostics.
 
 ### Prerequisites
 
-- **Python 3.10+**
-- **pipx**
-- **PyYAML** — installed automatically by the package metadata
+- **Linux x86_64 with glibc >= 2.39** (Ubuntu 24.04 or later)
+- **`/usr/bin/python3.12`** — the Python daemon runtime shipped in the bundle is
+  tied to this interpreter (the requirement goes away in 0.5.0 with the Rust daemon)
+- **curl** or **wget** — to download the release (not needed with `--bundle`)
+- **PyYAML** — shipped inside the bundle; no separate install
 - **jq** — required by the broker minicom route
 - **minicom** — required for human console workflows on Linux/WSL
 
@@ -123,9 +126,10 @@ setup may select systemd and change supervision modes; see the
 ### Quick Start
 
 ```bash
-# Managed install
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup
+# Managed install: download the release bundle, verify it against SHA256SUMS,
+# then run <bundle>/bin/serialwrap setup (extra arguments go to setup)
+./install.sh                     # latest release
+./install.sh --version 0.4.0     # a specific release
 serialwrap doctor
 
 # Check daemon and sessions
@@ -141,6 +145,29 @@ serialwrap cmd submit --selector COM0 --mode line --source agent:diag --cmd "ifc
 serialwrap cmd status --cmd-id <cmd_id>
 ```
 
+Configuration reads use `SERIALWRAP_CONFIG`, then `~/.config/serialwrap/config.yaml`,
+then `/etc/serialwrap/config.yaml` when present. The system file is read-only;
+writes go to `SERIALWRAP_CONFIG` when set, otherwise to the user config path.
+New runtime directories follow the process umask; Unix sockets use mode `0660`.
+Set `SERIALWRAP_SOCKET_GROUP` explicitly to assign the socket group.
+`daemon restart` uses `service restart` under systemd and stops, verifies exit,
+then starts the same endpoint in on-demand mode.
+While the daemon holds a device, the tty can no longer be opened directly (BC-04:
+POSIX takes `flock` plus `TIOCEXCL` and re-scans holders before any I/O; a
+conflicting open returns `DEVICE_STILL_HELD` with `pids` and `holder_unknown`).
+Use `serialwrap session console-attach` for a human console, or
+`serialwrap device release` to hand the raw device to an external tool.
+`device release` waits up to 3 seconds for the bridge to drain and close the
+handle. On timeout it returns `error_code: DRAIN_STALLED` with
+`drain_stalled: true` and `drain_timeout_epoch`, and the session stays
+`RECOVERING`: do not let an external tool open the device. Poll
+`serialwrap session list` until the state is `RELEASED` before handing off. A
+late successful close receipt still completes the release and persists
+`RELEASED`. Calling `device release` again does not speed this up, and
+`DRAIN_STALLED` is not retryable (`retryable: "no"`). If the state is still
+`RECOVERING` when your polling limit expires, stop polling and have an operator
+check the daemon and the handle.
+
 For noisy consoles that omit the shell prompt, `cmd submit --completion-regex`
 can wait for a command-specific producer marker in `line` or `background` mode.
 Use fresh, anchored markers with a numeric exit code and a separate END line;
@@ -153,28 +180,64 @@ markers remain available for caller validation. `command.get` and WAL META recor
 setting; reboot continues through its existing recovery flow. See
 [command completion](docs/command-completion.md).
 
-The broker recognizes a reboot only when it is a standalone command (`reboot`,
-`systemctl reboot`, `shutdown -r`, `echo b > /proc/sysrq-trigger`). For chained
-or self-rebooting commands such as `firstboot -y && reboot` or `sysupgrade ...`,
-add `cmd submit --expect-reboot` (RPC `command.submit` boolean `expect_reboot`):
-whatever the command text, it takes the reboot path (boot quiet window armed
-immediately, no Ctrl-C/Ctrl-D, recovery waits for READY). Without the flag a
-chained reboot is run as a normal command and the submit response carries a
-non-fatal `CHAINED_REBOOT_WARNING`; execution is unchanged. `--mode interactive`
-with the flag is rejected (`EXPECT_REBOOT_MODE_UNSUPPORTED`), non-boolean values
-return `INVALID_EXPECT_REBOOT`, `--completion-regex` is ignored (reboot wins), and
-the flag does not bypass `AUTOBOOT_QUIET`. Set `--cmd-timeout` to cover the part
-before the reboot. The submit response echoes `expect_reboot: true` and
-`command.get` reports it. See [explicit reboot](docs/expect-reboot.md).
+#### Installer details
 
-For local development, run `./install.sh`; it performs the same package install
-and `serialwrap setup` flow from the checkout.
+`install.sh` lives at the repository root (clone the repository or download
+that file). `install.sh [--version X.Y.Z] [--bundle <dir or .tar.gz>] [--] [setup args...]`
+checks the requirements first (x86_64, glibc >= 2.39, `/usr/bin/python3.12`)
+and exits 2 without changing anything when one is not met. Without `--bundle`
+it downloads `serialwrap-<version>-linux-x86_64.tar.gz` and `SHA256SUMS` from
+the [GitHub releases](https://github.com/hamanpaul/serialwrap/releases)
+(latest release unless `--version` is given), refuses to continue on a
+checksum mismatch or a missing `SHA256SUMS` row, unpacks into a temporary
+directory, runs `bin/serialwrap setup`, and returns its exit code. Arguments
+after `--` (and unknown options such as `--user` or `--on-demand`) are passed
+to `setup` unchanged. The Python wheel is still published with each release,
+but the standard install no longer uses pipx.
 
-**Upgrading, and telling which build the daemon runs.** After
-`pipx install --force ...`, run `serialwrap setup` again. The version string
-(`0.3.2`) is the same for a release, a branch build and `main`, so
+Offline install: copy the release tarball (verify it yourself with
+`sha256sum -c --ignore-missing SHA256SUMS`; `--bundle` does not download or
+check `SHA256SUMS`), then run
+`./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`. `--bundle` also
+accepts an unpacked bundle directory. For local development, build a bundle
+from the checkout and install it; a bare `./install.sh` installs the published
+release, not the checkout:
+
+```bash
+scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle
+./install.sh --bundle /tmp/sw-bundle
+```
+
+#### Upgrading from 0.3.x (pipx)
+
+Run the new `install.sh` directly; no pipx step is needed. You can upgrade
+while the 0.3.x daemon is still running by passing the current supervision
+mode explicitly (`--user`, `--system --with-sudo`, or `--on-demand`). Stopping
+first with `serialwrap daemon stop` is also fine, but setup does not start a
+daemon that was already stopped: start it with `serialwrap service start`
+(systemd) or `serialwrap daemon start` (on-demand), then run
+`serialwrap doctor`. Setup takes over the `~/.local/bin/serialwrap` and
+`serialwrapd` entries and keeps `config.yaml`, profiles and `state.json`.
+When an old pipx install is detected, the installer prints a hint that you may
+run `pipx uninstall serialwrap`; it never removes it automatically.
+
+For chained or self-rebooting commands such as `firstboot -y && reboot` or
+`sysupgrade ...`, use `cmd submit --expect-reboot` (RPC
+`command.submit.expect_reboot: true`). It arms the boot quiet window immediately
+and follows the reboot recovery path. Without the flag, a chained reboot remains
+an ordinary command and the submit response may carry a non-fatal
+`CHAINED_REBOOT_WARNING`. `--mode interactive` with the flag is rejected
+(`EXPECT_REBOOT_MODE_UNSUPPORTED`), non-boolean RPC values return
+`INVALID_EXPECT_REBOOT`, completion regex does not override reboot handling, and
+the flag does not bypass `AUTOBOOT_QUIET`. Set `--cmd-timeout` to cover the work
+before reboot. The submit response echoes `expect_reboot: true` and `command.get`
+reports it. See [explicit reboot](docs/expect-reboot.md).
+
+**Upgrading, and telling which build the daemon runs.** The bundle installer
+runs `serialwrap setup`; after a manual package update, run setup again. The version string
+(`0.4.0`) is the same for a release, a branch build and `main`, so
 `serialwrap --version` also prints a code fingerprint, e.g.
-`serialwrap 0.3.2 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap 0.4.0 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
 `serialwrap daemon status` reports the fingerprint of the code the running daemon
 loaded when it started (`code_fingerprint`) and where it loaded it from
 (`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
@@ -233,15 +296,46 @@ or `READY`.
 
 - `ATTACHED` means the bridge exists and human console access is available, but
   line commands are not guaranteed to be frameable.
-- `READY` means the profile has a usable prompt and `ready_probe`; agent command
-  submission is allowed.
+- `READY` means agent command submission is allowed. Command-capable profiles
+  reach it after a usable prompt and `ready_probe` round-trip; passthrough
+  sessions reach it after 30 seconds without RX (see below).
 - `RELEASED` means the real device has been handed off to an external tool.
+  It survives daemon restarts. If the record's template was renamed or removed
+  meanwhile, the daemon keeps a `RELEASED` placeholder (passthrough, not
+  command-capable) for that COM; `device attach` on it removes the placeholder,
+  unblocks the device and lets template detection create the real session on
+  the same COM (OD-63). `session bind` on the placeholder does not unblock it
+  (it answers `released: true`, `recommended_action: device_attach`); if
+  opening the port fails, the device is still handed to dynamic detection on
+  the same COM, whose open-failure handling leaves a retryable `DETACHED` row
+  when a passthrough fallback template exists. Without one, no row is left
+  (`device attach` answers `SESSION_NOT_FOUND`); the COM stays reserved for
+  that device until it is unplugged or the daemon restarts, after which
+  hotplug or restart re-detects it and assigns the COM by the usual dynamic
+  rules (the original COM is not guaranteed), the same as any new device whose
+  port cannot be opened.
 - `FLASHING` means the MCU flash endpoint is currently bridging an external
   flasher.
 
-Command-capable profiles require a non-empty `ready_probe`. Passthrough-style
-profiles intentionally stay at `ATTACHED` and return
-`PROFILE_NOT_COMMAND_CAPABLE` for `cmd submit`.
+Command-capable profiles require a non-empty `ready_probe`; non-passthrough
+profiles without one stay at `ATTACHED` and return `PROFILE_NOT_COMMAND_CAPABLE`
+for `cmd submit`. A `platform=passthrough` profile (including `others-template`)
+never logs in or probes once it is selected, even when `ready_probe` is set
+(SC-35): its session stays `ATTACHED` with zero TX and moves to `READY`
+automatically after 30 seconds without RX. Because such a console may never print
+a shell prompt, pass `--completion-regex` to `cmd submit` for every command.
+Dynamic auto-detection (which selects passthrough only when no template matches)
+and re-detection on each attach of a `fallback` session still send one `\n`
+probe from a separate PROBE bridge before the session exists; pin the profile or
+use an explicit target (or sticky) to avoid it. While `ATTACHED`, `cmd submit`
+returns `SESSION_NOT_READY` with `passthrough_ready_in_s`, and `file push` /
+`file pull` on a passthrough profile always return `PROFILE_NOT_COMMAND_CAPABLE`.
+A passthrough command completes on `--completion-regex` when given, else on a
+usable `prompt_regex`. When no completion condition matches (none is usable, or
+the given regex or prompt never matches), it returns `PROMPT_TIMEOUT`
+(`recovery_action: NONE`), sends no Ctrl-C or Ctrl-D, and the session stays
+`READY`; read the captured output with `command.result_tail`
+(`serialwrap cmd result-tail --cmd-id`).
 
 ### Profiles and Binding
 
@@ -283,7 +377,7 @@ treated as **provisional** — a session that landed there (typically because th
 board was still spewing boot logs at attach time, so nothing was ever measured)
 gets another detection attempt on its next attach. Sessions resolved from an
 explicit YAML `target`, from sticky, or from a successful detection are
-authoritative and are never re-resolved. Detection sends `\r`, so it is skipped
+authoritative and are never re-resolved. Detection sends `\n`, so it is skipped
 inside the boot quiet window that protects U-Boot autoboot.
 
 Use stable `/dev/serial/by-id/` or `/dev/serial/by-path/` selectors rather than
@@ -320,25 +414,30 @@ Supported key encodings include `enter`, `tab`, `escape`, `ctrl-c`, `ctrl-d`,
 
 #### Source labels (`--source`)
 
-`--source` (`cmd submit`, `file push`, `file pull`, `device release`) and
-`session interactive-open --owner` are not just tracking labels: the daemon decides
-what to do when a command times out from the **prefix**.
+`--source` (`cmd submit`, `file push`, `file pull`, `device release`) is not just
+a tracking label: the daemon uses the raw RPC value to decide command timeout
+behavior. `interactive-open --owner` identifies the lease owner; it does not grant
+human command authority.
 
 | Prefix | Class | On command timeout (no prompt came back) |
 |--------|-------|------------------------------------------|
 | `agent:<name>`, or any other string (`agent`, `codex`, ...) | agent | Sends CTRL-C, then CTRL-D, to get a prompt back — CTRL-D **logs out** a console sitting at a shell; no keys inside the boot quiet window |
-| `human:<name>` | human | Sends **no keys**; the command is promoted to an interactive lease for the human; not subject to the boot quiet gate |
+| Bare RPC source `human` / `human:` | Normalized to `human:cli`; human per OD-74 | Sends **no keys**; command timeout promotes to an interactive lease; passes the human gate |
+| Explicit `human:<name>` (including `human:cli`) | Display class is human; agent per DF-02 | Agent timeout and boot quiet behavior; `source_class` does not grant permission |
 | `system`, `system:*` | reserved | Internal only (forced recovery, self-test, login probes); external callers get `SOURCE_RESERVED` |
 
-- Bare `human` and `human:` (no name) are **normalized to `human:cli`** instead of being
-  silently treated as agent; the response carries `source` and `source_normalized_from`.
-  The prefix is case-insensitive.
+- Only the raw RPC values `human` and `human:` (no name) are **normalized to `human:cli`**
+  and receive the OD-74 human gate and timeout behavior; successful responses carry `source`
+  and `source_normalized_from`. An explicit `human:<name>` (including `human:cli`) follows
+  DF-02 agent behavior even though its display class is human. `source_class` is not authority.
+  `session interactive-open --owner` does not normalize bare `human` or grant human command rights.
 - `system` / `system:*` are rejected by both the CLI and the daemon
   (`error_code: SOURCE_RESERVED`) before anything is queued or written to the UART.
   Look-alikes such as `systemd:x` are unaffected.
 - Any other unknown prefix (`codex`, `cli`, `agent`, ...) keeps the agent behavior.
 - `cmd submit` responses and the `command` record of `cmd status` carry `source_class`
-  (`human` or `agent`) so you can see how a source was classified.
+  (`human` or `agent`) for display only; it does not tell whether the raw RPC source received
+  human authorization.
 
 ### Human Console Coexistence
 
@@ -418,6 +517,20 @@ derived from the profile's `timeout_s` (`max(profile.timeout_s, 5.0)`, same
 spirit as #157's `chunk_timeout_s`), so boards with a widened `timeout_s` get a
 proportionally wider echo window. It only bounds the failure path: when echo
 arrives normally the wait returns immediately.
+
+If the session is drained (release, recovery, clear, rebind), its bridge
+generation moves on, or the transfer is cancelled while `file push`/`file pull`
+is running, the transfer stops sending and returns (OD-62, mirroring BC-03):
+`FLUSHED_BY_RECOVERY` when no byte of the transfer had reached the UART yet
+(safe to retry once the session is `READY` again), or `COMMAND_ABORTED_IN_FLIGHT`
+once at least one byte was written (do not retry blindly; check the target
+first — a partial `/tmp/.sw_upload_*` may remain). `file push` attaches
+`chunks_sent`/`chunks_total`. Like any command aborted in flight, the WAL then
+gets a `command_aborted_in_flight` META record whose `cmd_id` is the transfer's
+`ft-<8hex>` prefix (each sub-command's TX records use `ft-<8hex>-<step>`) and
+whose `confirmed_tx_bytes` counts the whole transfer. In 0.3.2 these situations ended with
+`TRANSFER_TIMEOUT` instead; a boot quiet window during the transfer still
+returns `AUTOBOOT_QUIET` with `retry_after_s`.
 
 ### MCU Firmware Workflows
 
@@ -508,6 +621,18 @@ hot unplug, re-attach — terminate not-yet-started commands with
 the same semantics: the command was never executed and can be resubmitted once
 the session is `READY` again.
 
+#### Attach and recovery errors (SC-34)
+
+For a command-capable session that remains outside `READY` after attach, the
+RPC error code is `SESSION_NOT_READY`; the response also includes top-level
+`last_error` and `last_error_detail` fields (either may be null). A failed
+`session.recover` REPROBE likewise reports `SESSION_NOT_READY` and these fields
+when `recovered` is false. Read `last_error` to identify the cause. Follow the
+session last-error guidance for terminal values such as
+`CREDENTIALS_UNRESOLVED` or `BOOTLOADER_STUCK`; do not retry those blindly.
+Temporary prompt or boot-window failures can be retried after checking session
+state and reprobe progress.
+
 #### Credential resolution (`CREDENTIALS_UNRESOLVED`, #140)
 
 When a profile declares a credential source (`user_env`, `pass_env`, or
@@ -537,10 +662,11 @@ on its own, so a manual attach/recover (or a daemon restart, which re-reads
 
 Callers must handle RPC timeouts themselves — a CLI `TIMEOUT` only means the
 CLI stopped waiting; the daemon-side operation may still complete successfully
-afterwards. `session attach`, `session recover`, `session self-test`, and
-`session console-attach` (its recover-upgrade branch can run synchronously for
-tens of seconds) are long operations executed synchronously on the daemon
-side: when `--timeout` is not given, the CLI automatically applies a fixed
+afterwards. `session attach`, `session recover`, `session self-test`,
+`session console-attach`, `device release`, `device attach`, `session clear`,
+and `session bind` block on the daemon side (`session console-attach` can run
+synchronously for tens of seconds): when `--timeout` is not given, the CLI
+automatically applies a fixed
 45 s floor instead of the general 5 s default. An explicit `--timeout` always
 wins.
 
@@ -748,6 +874,45 @@ serialwrap.exe skill --platform windows   # print the full Windows operating gui
 On Windows, MCU flashing should use `device release` / `device attach`; the
 Linux `/dev/ttyMCU` PTY bridge model is not used.
 
+#### Windows release bundle (zip)
+
+Each GitHub Release can carry `serialwrap-<version>-windows-x86_64.zip` next to
+the Linux tarball (built on GitHub-hosted `windows-latest`; the `SHA256SUMS`
+asset lists both). It is a Rust CLI plus the Python daemon on a private CPython
+3.12.3 runtime (PyYAML and pyserial included), so no system Python is needed.
+It is **not code-signed** (SmartScreen may warn; verify the SHA-256 instead) and
+does **not** include com0com. Install (PowerShell):
+
+```powershell
+# 1. verify the download against SHA256SUMS
+(Get-FileHash .\serialwrap-<version>-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+# 2. extract anywhere temporary, then run setup from the versioned bin\ directory
+Expand-Archive .\serialwrap-<version>-windows-x86_64.zip -DestinationPath $env:TEMP\swinst
+& $env:TEMP\swinst\serialwrap-<version>-windows-x86_64\versions\<version>\bin\serialwrap.exe setup --on-demand
+# 3. the install root is %LOCALAPPDATA%\Programs\serialwrap; add its bin\ to PATH
+serialwrap.exe --version; serialwrap.exe doctor
+```
+
+Run `setup` from `versions\<version>\bin\serialwrap.exe` (that is the copy that
+sits next to `release-manifest.json`); the top-level `bin\` copy is only a
+stable entry. `setup --windows-task` selects Task Scheduler supervision. The PyInstaller
+`serialwrap.exe` / `serialwrapd.exe` assets are still published for existing
+users. A past tag can be backfilled with the release workflow's
+`workflow_dispatch` (input: tag).
+
+#### Optional com0com component
+
+A Windows bundle can include the signed com0com 3.0.0.0 virtual serial driver as
+an optional component (the published release zip does not, OD-78). It is not selected by default, and the normal serialwrap
+install or update does not require administrator rights. Run
+`serialwrap setup --with-com0com` to install the default COM20/COM21 pair; only
+the bundled helper requests UAC elevation. Run `serialwrap setup
+--remove-com0com` to remove that pair. Declining UAC or a helper failure leaves
+the base installation successful and is reported under
+`optional_components.com0com`. The driver remains experimental until the
+remaining Spike 1 checks pass with HVCI enabled. The bundle includes the GPLv2
+license, the com0com 3.0.0.0 source link, and a written source offer.
+
 ### Remote Support
 
 When an FAE engineer overseas (a US/EU telecom customer site) uses serialwrap
@@ -855,8 +1020,8 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 - **Background daemonization**: `ssh` / `--autossh` runs in its own process
   group in the background; the command returns immediately.
 - **flock registry**: state lives under `<run-dir>/remote/` (`<port>.json` +
-  a `cm-<port>` ssh control socket), serialized with an flock so concurrent
-  `remote` / `remote close` calls don't race.
+  a `cm-<port>` ssh control socket), serialized with a cross-process file lock
+  (`flock` on POSIX, `LockFileEx` on Windows) so concurrent tunnel operations don't race.
 - **Readiness confirmation**: returns `status`: `active` = verified and
   ready; `starting` = timed out (default 10s, tunable via `--ready-timeout`)
   but the process is still alive and not yet confirmed — query
@@ -1188,6 +1353,8 @@ in Route A above.
 serialwrap remote                   # list all current tunnels (status)
 serialwrap remote close 7777        # tear down a single tunnel
 serialwrap remote close all         # tear down everything
+serialwrap remote stop 7777         # same as close
+serialwrap remote stop              # stop all tunnels
 ```
 
 #### `--remote-socket` hardening (recommended for shared relays)
@@ -1242,9 +1409,13 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
   first scp/rsync it to the UART host, then have the daemon do the file
   transfer. WAL and mirror-log paths returned by the RPC are likewise
   UART-host paths.
-- **Native Windows does not support `serialwrap remote` in this release**:
-  running it returns `REMOTE_NOT_SUPPORTED` (see the manual equivalent
-  below).
+- **Native Windows supports `serialwrap remote -R/-L`, `connect`, and
+  `benches`**. Windows uses process-tree shutdown and does not use OpenSSH
+  ControlMaster. Run `serialwrap remote stop [port|all]` to stop one or all
+  tunnels; omitting the selector stops all tunnels.
+- **OD-12 trust boundary**: a remote tunnel grants full DUT control to users
+  authenticated by SSH. Use a single-user workstation and a trusted relay; this
+  does not provide same-user isolation on a shared machine.
 - For an isolated two-container check, run `./tools/docker/remote_smoke.sh`
   directly; the full flow is documented in
   [`func-test/README.md`](./func-test/README.md) under the **Remote Support
@@ -1323,6 +1494,76 @@ focused debugging:
 python3 -m unittest discover -s tests -v
 ```
 
+### Rust CLI Build, Bundle, and Lifecycle (Stage 1B)
+
+Stage 1B implements native Rust CLI handling for all 20 CLI groups (`DELEGATED_GROUPS` is empty), native daemon lifecycle, supervision modes, and atomic update/rollback:
+
+- **Native CLI groups (20)**: `device`, `session` (including `console-attach` / `console-detach`), `alias`, `cmd`, `stream`, `log`, `file`, `wal`, `mcu`, `event`, `profile`, `skill`, `remote`, `daemon`, `connect`, `benches`, `supervision-mode`, `service`, `setup`, `doctor`. All 20 groups operate natively without delegation.
+
+#### Build and Bundle
+
+```bash
+# Build Rust workspace
+cargo build --workspace
+
+# Create development bundle under target/mkbundle-dev
+./scripts/rust/mkbundle.sh --dev
+```
+
+#### First Installation
+
+```powershell
+# Windows Task supervision setup (user session, no admin privilege required)
+serialwrap setup --windows-task
+
+# Optional com0com driver setup (requires administrator elevation, SC-36, OD-15)
+serialwrap setup --with-com0com
+```
+
+#### Lifecycle and Supervision Management
+
+- **Lifecycle Control**: `daemon restart` provides two-reader-safe daemon recycling (stops the old daemon gracefully, waits up to 10 seconds for process exit and device handle release, and launches the new instance).
+- **Supervision Management**: `supervision-mode set <MODE>` switches active supervision between `on-demand`, `systemd-user`, `systemd-system`, `windows-task`, and `windows-service` (on Windows, `windows-service` outputs `pending_sudo` instructions for operator execution). Switching performs fail-closed safety preflight and atomic handoff (`daemon.handoff_stop`): active flashing, file transfers, in-flight commands, active leases, or unconfirmed probes refuse the switch; `--force` does not override this safety guard (records `force_ignored: true`).
+- **Windows Task Supervision**: `windows-task` operates via Windows Task Scheduler (`schtasks`) with `ExecutionTimeLimit=PT0S`, enabling detached daemon persistence across user sessions with automatic start on user login and restart on failure.
+- **Rollback and Recovery**: `setup --rollback` atomically restores the previous bundle version, CLI binary, Python daemon runtime, and supervisor definitions using `install-journal.json`. The first install that replaces a pipx 0.3.2 install has no previous bundle, so `setup --rollback` cannot return to that pipx install: it returns `INVALID_ARGS` (`rollback_unavailable`) and does not change the installation. A manual return to 0.3.2 is not a supported downgrade.
+- **Upgrading from 0.3.x with the daemon running (OD-48, SC-39)**: a 0.3.x daemon does not support `daemon.handoff_stop`. When `setup` positively identifies it (version below 0.4.0, a pipx Python daemon process outside the bundle `versions/` directory), it refuses while flashing or busy, otherwise records the old process in `install-journal.legacy.json` and stops it with its own supervisor (`systemctl stop` when it is the unit's MainPID, else RPC `daemon.stop`; never a hard kill). It switches only after the old process tree has exited and no process of the same user holds the UART for 5 consecutive seconds (up to 330 s), then starts the new daemon. Same-user processes that cannot be inspected at all (their `/proc/<pid>/fd` is unreadable, or every fd entry is denied — on hosts with a systemd user session these are `(sd-pam)` and `systemd --user`) do not block the switch when every other same-user process is clear, provided they already existed when the stop was sent (matched by pid and start time), whether or not all four of their uids (real, effective, saved, fs) are yours — a resident setuid `fusermount3` is admitted too; they are listed in `legacy_stop.uninspectable_procs` (pid, start_ticks, comm, reason, plus `uid_match` — `all`, `partial` such as a setuid tool, or `unknown` — and `uids`) with `holders_status: "partial"`. An uninspectable process that appears after the stop (for example a non-dumpable `ssh-agent` or a setuid UART tool), whatever its uids, a failed pre-stop snapshot (then no uninspectable process is admitted), and any other scan failure still wait until the limit; a process exiting during the scan or the device being unplugged while waiting does not count as a failure. Known trade-off: a setuid tool that was already running before the stop and opens the UART during the wait is not caught. The timeout response reports the last poll's `holders_status`, `uninspectable_procs`, `before_stop_snapshot`, `daemon_scan`, and `last_unstable` (when and why the stability window last broke). 0.4.0 itself waits the full 330 s on such hosts; stop the 0.3.x daemon first when upgrading to 0.4.0. If a later step fails, the install is restored but the old daemon is **not** restarted; the response carries `legacy_daemon_stopped`, `restored`, and `restart_hint`. Pass your current supervision mode explicitly (`--user`, `--system --with-sudo`, `--on-demand`); without a flag `setup` picks one automatically exactly like 0.3.2.
+
+#### First-install and Update Error Handling
+
+| Phase | Common Error Codes | Operator Guidance |
+|---|---|---|
+| `update_safety_check` | `SESSION_BUSY`, `FLASHING_BUSY` | Flashing, file transfer, or command in flight; wait for completion before retrying (`--force` does not override) |
+| `update_confirm_released` | `TIMEOUT`, `DEVICE_STILL_HELD` | Old daemon did not terminate within 10 s or device held; verify process exit and retry (no switch made) |
+| `install_lock` | `TIMEOUT` | Lock held by another `setup` instance; verify concurrent operations |
+| `update_verify` / `rollback_verify` | `CHECKSUM_VERIFY_FAILED` | Bundle SHA256 or manifest mismatch; re-acquire or rebuild bundle |
+| `update_start_and_verify` | `DAEMON_EXITED`, `DAEMON_NOT_READY` | New daemon failed health verification; automatically reverted to previous version |
+| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO` | Failed to hold supervisor autostart; check permissions |
+| `revert_pending` / `install_recover` | `SESSION_BUSY`, `TIMEOUT` | Daemon handoff refused during recovery; wait for idle and run `setup` again |
+
+#### Deployment and Verification References
+
+- [Agent Permission Model](docs/rust-refactor/deploy/agent-permission-model.md)
+- [Windows Installation, Update, and Rollback Guide](docs/rust-refactor/deploy/windows-install-update-rollback.md)
+- [Agent Permission Verifier Tool](scripts/rust/verify_agent_perms.py)
+
+#### A/B Blackbox Verification
+
+```bash
+# Linux A/B differential verification against Python baseline
+./scripts/rust/ab_blackbox.sh --profile debug
+
+# Windows native blackbox verification via PowerShell / WSL interop
+./scripts/rust/win-blackbox.sh
+```
+
+### Isolated test-device allowlist (OD-11 / SC-19)
+
+For isolated test instances only (throwaway daemon, com0com or other virtual COM pairs). The allowlist makes the daemon discover and select an explicit list of device names; it does not bypass the per-UART exclusive lock (BC-04), does not change the serial backend, and never bypasses Tier-2 exclusivity or handoff.
+
+- Enable with `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM7,COM8` (comma-separated, matched exactly against `DeviceInfo.by_id`), or with `windows.test_device_allowlist: [COM7, COM8]` in `config.yaml`. The environment variable takes precedence over config.
+- It is accepted only when `SERIALWRAP_STATE_DIR`, `SERIALWRAP_RUN_DIR` and `SERIALWRAP_CONFIG_DIR` are all set explicitly and none of them equals its default path. Otherwise the daemon refuses to start: `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <reason>` on stderr, exit 2, before any state, run or lock file is created. A `windows.test_device_allowlist` that is not a list of strings is refused the same way. If `config.yaml` exists but cannot be read or parsed and the allowlist is not set through the environment, an isolated instance is refused too (`invalid config.yaml: <exception class>`); a non-isolated instance keeps its previous behaviour.
+- While the allowlist is active, `serialwrap daemon status` shows `test_device_allowlist: {"enabled": true, "coms": [...], "source": "env"|"config"}`. While it is inactive the key is absent.
+
 ### Real-hardware stability suite (#122)
 
 After deploying a new build to this machine (a system with a production daemon
@@ -1394,8 +1635,10 @@ for a newly fixed bug" SOP:
 
 ## 依賴
 
-- Python 3.10+
-- `pyyaml`：`pipx install` 會自動帶入，無需手動安裝
+- Linux x86_64，glibc >= 2.39（Ubuntu 24.04 以上）
+- `/usr/bin/python3.12`：bundle 內附的 Python daemon runtime 綁定此直譯器（0.5.0 改 Rust daemon 後此需求消失）
+- `curl` 或 `wget`：下載 release 用（`--bundle` 離線安裝不需要）
+- `pyyaml`：已內附於 bundle，無需另外安裝
 - `jq`：`serialwrap-minicom`（由 `minicom_router.sh` 物化而來）解析 session 狀態需要，不要直接 `minicom -D /dev/ttyUSBx`
 - `minicom`：human console 路徑需要，一律經 `serialwrap-minicom COMx` 呼叫，不要直接 `minicom -D /dev/ttyUSBx`（會與 daemon 搶 tty，two-reader）
 - 以上三項（`serialwrap-minicom`／`jq`／`minicom`）`serialwrap doctor` 皆會檢查是否在 PATH
@@ -1486,6 +1729,7 @@ stateDiagram-v2
     ATTACHED --> READY: login ok
     ATTACHED --> READY: auto re-probe ok
     ATTACHED --> READY: recover ok
+    ATTACHED --> READY: passthrough 靜默 30 秒
     ATTACHED --> DETACHED: detach
     DETACHED --> ATTACHING: auto re-probe
     READY --> ATTACHED: recover fallback
@@ -1510,19 +1754,19 @@ broker 能框出命令的輸出（送出 → 看到 prompt → 取回 stdout）�
 取決於它綁的 profile 是否 **command-capable**：
 
 - **command_capable** = profile 的 `ready_probe` 非空（取代舊的「`platform == passthrough` 就不可用」寫死）。
-- 無 `ready_probe`（如 `others-template` 這種純 console / passthrough profile）→ 維持 `ATTACHED`；
-  對它 `cmd submit` 會回明確的 **`PROFILE_NOT_COMMAND_CAPABLE`**（附 hint），而非語意不清的 `SESSION_NOT_READY`。
+- 無 `ready_probe` 的非 passthrough profile → 維持 `ATTACHED`；對它 `cmd submit` 會回明確的 **`PROFILE_NOT_COMMAND_CAPABLE`**（附 hint），而非語意不清的 `SESSION_NOT_READY`。
+- **`platform=passthrough`（含 `others-template`）一經選定（explicit target、`session pin` 或 sticky）即不 login、不送 `ready_probe`**，即使已設定 `ready_probe` 也一樣（SC-35）。attach 時零 TX 並停在 `ATTACHED`；連續 **30 秒**沒有 RX 即自動升 `READY`。動態偵測（只有在沒有任何 template 匹配時才會選中 passthrough）與 `fallback` session 每次 re-attach 的重新偵測，仍會在 session 建立前由獨立的 PROBE bridge 送出一個 `\n` 探測；要避免，請 pin 該 profile 或使用 explicit target。`ATTACHED` 時 `cmd submit` 回 `SESSION_NOT_READY` 並附 `passthrough_ready_in_s`（剩餘秒數）；`file.push`／`file.pull` 對 passthrough 一律回 `PROFILE_NOT_COMMAND_CAPABLE`。
+  命令完成條件依序為 `cmd submit --completion-regex`（console 不送 prompt 時建議每次都帶）、可用的 profile `prompt_regex`；兩者皆未命中（或皆不可用）則回 `PROMPT_TIMEOUT`（`recovery_action: NONE`），不送 Ctrl-C／Ctrl-D，session 維持 `READY`；擷取到的輸出以 `command.result_tail`（`serialwrap cmd result-tail --cmd-id`）讀回。
 - 有 `ready_probe`（+ 能匹配目標 prompt 的 `prompt_regex`）→ 走正常 probe 進 `READY`，`cmd submit` 可用。
-- `READY` 與底層是 OS shell 或 bootloader **無關**：只要 profile 的 prompt/`ready_probe` 對得上即可。
-  停在 U-Boot 的板子可綁 **`uboot-template`**（`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`，
-  `ready_probe: echo __READY__${nonce}`）進 `READY`，然後 `cmd submit --cmd 'printenv'` 下 U-Boot 命令。
-- `self_test` / get-state 會在最外層回 `command_capable`，呼叫端可據此分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」。
+- `READY` 與底層是 OS shell 或 bootloader **無關**：只要 profile 的 prompt/`ready_probe` 對得上即可。非 passthrough 的 bootloader command profile 亦同。
+  停在 U-Boot 的板子可綁 **`uboot-template`**（`prompt_regex` 匹配 `=>` / `u-boot>` / `CFE>`；其 `ready_probe` 在 passthrough 下不會送出），靜默 30 秒後升 `READY`，然後 `cmd submit --cmd 'printenv'` 下 U-Boot 命令。
+- `self_test` / get-state 會在最外層回 `command_capable`。對非 passthrough 的 session，它可分辨「ATTACHED 但本就不可下命令」與「ATTACHED 應可進 READY」；對 passthrough 不適用：`others-template` 的 `command_capable` 為 `false`，仍會在 30 秒靜默後升 `READY`，判讀時請看 `classification: PASSTHROUGH` 與 `passthrough_ready_in_s`。
 
 > 注意：OS profile（prpl/shell）若板子掉進 U-Boot，OS 的 `prompt_regex` 對不上 → **不會** READY（正確：避免把 Linux 命令送進 bootloader）。
 
 ### `RELEASED` / `FLASHING`
 
-- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。詳見 `openspec/specs/device-handoff/spec.md`。
+- `RELEASED`（#54）：`device release` 把 raw 裝置交給外部工具獨佔（如燒錄），broker 關閉 FD、**不自動搶回**、跨 daemon 重啟保留；`device attach` 收回。所屬 template 已改名或刪除的 released 紀錄，會以 `RELEASED` 佔位 session（passthrough、不可下命令）保留阻擋；對該 COM `device attach` 時佔位移除自身並解除阻擋，由 template 偵測在同一 COM 建立正式 session（OD-63）；對佔位 `session bind` 不解除阻擋（回 `released: true`、`recommended_action: device_attach`），開埠失敗時仍交 dynamic 偵測（保留原 COM），有 passthrough fallback template 時在原 COM 留下可重試的 `DETACHED` 列；沒有時不留列（`device attach` 回 `SESSION_NOT_FOUND`），原 COM 保留給該裝置至拔除或 daemon 重啟為止，之後由熱插或重啟重新偵測，COM 依 dynamic 規則重新分配、不保證沿用原 COM（與任何開不了埠的新裝置相同）。詳見 `openspec/specs/device-handoff/spec.md`。
 - `FLASHING`（#55）：外部 flasher 經 `/dev/ttyMCU` 認線後 session 進入，期間 `cmd submit` 回 `FLASHING_BUSY`、其他 COM 不受影響、daemon 不死；flash 結束自動恢復先前狀態。詳見 `openspec/specs/mcu-flash-broker/spec.md`。
 
 ## Agent / Human Co-work 時序圖
@@ -1641,18 +1885,28 @@ flowchart TD
 ## 快速開始
 
 ```bash
-# 安裝（正式流程）
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
-serialwrap doctor    # 驗證環境
+# 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
+./install.sh                     # 最新 release
+./install.sh --version 0.4.0     # 指定 release
+serialwrap doctor                # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
-- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
-- **升級與確認 daemon 跑的是哪份程式碼**：`pipx install --force ...` 後再跑一次 `serialwrap setup`。版本字串（`0.3.2`）在 release、分支 build、`main` 之間完全相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`（已安裝的 `sw_core/**/*.py` 的雜湊）；`serialwrap daemon status` 的 `code_fingerprint` 是正在跑的 daemon 啟動時載入的那份、`code_path` 是它載入的位置。兩者不同＝daemon 還在跑升級前的舊碼：其他指令的 stderr 會多一行警告（stdout JSON 不變），`serialwrap doctor` 以 advisory 檢查 `daemon_code_current` 回報。systemd 服務 active 且指紋不同時，`serialwrap setup` 會自動 restart 服務並在輸出的 `daemon_code` 欄位說明結果；systemd-system 未帶 `--with-sudo` 時只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`；`--no-restart` 可略過；flash 進行中不會重啟；on-demand 模式不會自動停 daemon，請 `serialwrap daemon stop` 後 `serialwrap daemon start`。細節見[規格 §8.7](docs/serialwrap-spec.md)。
+- `install.sh` 位於 repo 根目錄（clone repo 或單獨下載該檔）。
+- 系統需求：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`。`install.sh` 安裝前先檢查，任一項不符即 exit 2 且不改動任何東西。
+- `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
+- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
+- 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
+- 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.0`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.0 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
+- 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
+- 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
+- `daemon restart` 在 systemd 模式等同 `service restart`；on-demand 模式會先停止並確認舊 daemon 結束，再以相同 endpoint 啟動。
+- daemon 持有裝置時不可再直接開 tty，請走 `serialwrap session console-attach` 或 `device release`（BC-04：POSIX 以 `flock`＋`TIOCEXCL` 獨占並於任何 I/O 前重掃 holder；衝突開啟回 `DEVICE_STILL_HELD`，附 `pids` 與 `holder_unknown`）。
+- `device release` 的 drain 等待上限為 3 秒：逾時仍未收到成功的 handle 關閉回條時，RPC 回 `error_code=DRAIN_STALLED`（附 `drain_stalled: true`、`drain_timeout_epoch`），session 維持 `RECOVERING`，**不要**讓外部工具開啟該裝置。以 `serialwrap session list` 輪詢，只有 `RELEASED` 才交接；上限到期仍為 `RECOVERING` 時停止輪詢，交由操作員檢查 daemon 與 handle。晚到的成功回條仍會完成 release 並持久化；再次 `device release` 不會加速完成，`DRAIN_STALLED` 不可盲目重試（`retryable: "no"`）。
 
 ```bash
 # 啟動 daemon 後快速驗證
@@ -1692,7 +1946,7 @@ target 或 pin 綁定實體 UART；動態偵測會跳過解鎖 profile。解鎖�
 - `session list` 的 `profile_source` 欄位顯示來源：`pin` / `sticky` / `detected` / `fallback` / `yaml-target`。
 - 錯誤碼：`UNKNOWN_PROFILE`（profile 名不存在）、`PROFILE_IS_EXPLICIT`（對 YAML explicit-target 裝置 pin/unpin）、`DEVICE_NOT_FOUND`（selector 解析不到裝置）、`INVALID_ARGS`（缺 selector/profile）。
 - **生效時機（#181 起）**：pin/unpin 寫入後**不主動**重新 attach，但**下一次 attach 就會套用**——對已存在的 session 執行 `serialwrap session clear --selector <COM>` 即可，不必重啟 daemon。pin 命中時繞過偵測（不開 PROBE bridge），session_id 依新 profile 名重算（如 `others-template:COM2` → `prpl-template:COM2`），COM 號、`act_no`、`device_by_id` 與使用者自訂 alias 均保留，掛在該 session 上的 human console 也不會被丟掉。
-- **fallback 是暫時分類（#181）**：掉進 `others-template` 的 session 多半是 attach 當下板子還在噴 boot log、根本沒量測過（`last_probe_at` 為 `null`），而它的空 `ready_probe` 會讓 `command_capable` 永久為 false。因此 `profile_source` 為 `fallback` 的 session 在**下一次 attach 時會再偵測一次**；`yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。偵測會送 `\r`，故 boot quiet window（U-Boot autoboot 保護，#130）內跳過。
+- **fallback 是暫時分類（#181）**：掉進 `others-template` 的 session 多半是 attach 當下板子還在噴 boot log、根本沒量測過（`last_probe_at` 為 `null`），而它的空 `ready_probe` 會讓 `command_capable` 永久為 false。因此 `profile_source` 為 `fallback` 的 session 在**下一次 attach 時會再偵測一次**；`yaml-target` / `sticky` / `detected` 是宣告過或量測過的，一律不重解析。偵測會送 `\n`，故 boot quiet window（U-Boot autoboot 保護，#130）內跳過。
 - **卡在 fallback 時的排查順序**：`serialwrap session self-test --selector <COM>` → 若回 `recommended_action: "pin_profile"` 與 `suggested_profile`，照它給的 `session pin` + `session clear` 兩行套用即可。`command_capable` 純粹由 profile 的 `ready_probe` 決定，**與 session state 或 console 是否被佔用無關**（COM 掛著 console 一樣能下命令），不要往「session 被佔用」的方向排查。
 
 ### COM 編號確定性綁定 by-id（#100）
@@ -1862,7 +2116,7 @@ serialwrap service restart
 
 若 shell device 已經自動登入，`serialwrap` 會直接用 prompt + `ready_probe` 驗證；若先看到 `login:` / `password:`，則會依 `user_env` / `pass_env` 自動登入。像 Orange Pi 常見的 `orangepi3 login:`，建議 `login_regex` 用 `(?mi)^.*login:\\s*$`。
 
-`others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 會停在 `ATTACHED`，適合不認識的設備先用 minicom/human console 觀察。
+`others-template` 使用 `platform=passthrough`。attach 時不做 prompt/login/ready 限制，只建立 broker bridge，讓 `ttyUSB` 與 broker 建出的 `ttyPTS` 直接透傳；這類 session 經 pin／explicit target 選定後 attach 時不 login、不送 probe，零 TX 停在 `ATTACHED`（動態偵測仍會先送一個 `\n` 探測，見「`ATTACHED` vs `READY`」一節），適合不認識的設備先用 minicom/human console 觀察；連續 30 秒無 RX 後會自動升 `READY`，之後可下命令（建議以 `cmd submit --completion-regex` 指定完成條件）。
 
 ### 範例：debug probe（如 TI XDS110）passthrough explicit target（#186）
 
@@ -1913,7 +2167,7 @@ targets:
 當 DeviceWatcher 偵測到新 UART 裝置且沒有任何 explicit binding 匹配時，daemon 會自動執行 template 偵測：
 
 1. 用預設 UART 參數（115200/8N1）開啟臨時 bridge
-2. 送 `\r` 到 UART，等待 3 秒收集輸出
+2. 送 `\n`（空命令）到 UART，等待 3 秒收集輸出
 3. 依 profiles YAML 定義順序（passthrough 排最後），依序嘗試各 template 的 `prompt_regex` → 匹配即選定
 4. 若 prompt 不匹配但 `login_regex` 匹配 → 選為候選
 5. 全不匹配 → fallback 到 passthrough
@@ -2005,21 +2259,25 @@ serialwrap session interactive-close --interactive-id <interactive_id>
 
 #### 來源標籤（`--source`）
 
-`--source`（`cmd submit`／`file push`／`file pull`／`device release`）與 `session interactive-open --owner`
-不只是追蹤標籤：daemon 用**前綴**決定命令逾時（沒等到 prompt）時怎麼處理。
+`--source`（`cmd submit`／`file push`／`file pull`／`device release`）不只是追蹤標籤：
+daemon 依 RPC 原始來源決定命令逾時（沒等到 prompt）時怎麼處理。
+`session interactive-open --owner` 只標示 lease 擁有者，不授予命令的 human 權限。
 
 | 前綴 | 歸類 | 命令逾時時 |
 |------|------|-----------|
 | `agent:<名>`；`agent`、`codex` 等其他任何字串 | agent | 先送 CTRL-C、再送 CTRL-D 嘗試把 prompt 叫回來——停在 shell 的 console 會被 CTRL-D **登出**；boot quiet window 內不送按鍵 |
-| `human:<名>` | human | **不送任何按鍵**，命令升級成 interactive lease 交給人處理；不受 boot quiet gate |
+| RPC 原始來源恰為 bare `human`／`human:` | 正規化為 `human:cli`；依 OD-74 為 human | **不送任何按鍵**，命令逾時升級成 interactive lease；可通過 human gate |
+| 明寫 `human:<名>`（包括 `human:cli`） | 顯示分類為 human；依 DF-02 為 agent | 逾時與 boot quiet gate 照 agent 處理；`source_class` 不授權 |
 | `system`、`system:*` | 保留 | daemon 內部（強制恢復、self-test、登入探測）專用，外部呼叫回 `SOURCE_RESERVED` |
 
-- bare `human`（沒冒號）與 `human:`（沒名字）**正規化為 `human:cli`**，不再默默當成 agent；回應多帶
-  `source`（正規化後的值）與 `source_normalized_from`（原字串）。前綴不分大小寫。
+- 只有 RPC 原始輸入恰為 bare `human` 或 `human:`（沒名字）才依 OD-74 **正規化為 `human:cli`**
+  並取得 human gate／逾時行為；成功回應帶 `source`（正規化後的值）與 `source_normalized_from`
+  （原字串）。明寫 `human:<名>`（包括 `human:cli`）依 DF-02 照 agent gate／逾時處理；
+  `source_class` 僅供顯示，不授權。`session interactive-open --owner` 不正規化 bare `human`。
 - `system`／`system:*` 由 CLI 與 daemon 兩端拒絕（`error_code: SOURCE_RESERVED`），在排隊與送 UART 之前就擋下；
   `systemd:x` 之類只是長得像的字串不受影響。
 - 其他沒見過的前綴（`codex`、`cli`、`agent`…）維持 agent 行為，不報錯。
-- `cmd submit` 的回應與 `cmd status` 的 `command` 記錄帶 `source_class`（`human`／`agent`），可確認一筆來源被歸成哪類。
+- `cmd submit` 的回應與 `cmd status` 的 `command` 記錄帶 `source_class`（`human`／`agent`）供顯示；不能據此判定原始來源是否獲得 human 權限。
 
 #### Bootloader Recovery Lease
 
@@ -2069,6 +2327,8 @@ serialwrap file pull --selector COM0 --remote /etc/config/wireless --local ./wir
 
 長命令可能超過 console 的輸入上限；#166 已分別確認工具缺失及一塊 prpl 板約 505-byte 的行長限制，增加 timeout 不能修復截斷。`file push` 仍預設走 **echo-ACK 節流**（#161）：chunk 命令行拆成短 slice 逐段送出，每段等板端 echo 回讀確認才續送——換行在**全行確認後**才送出，因此 echo 停滯（`TRANSFER_ECHO_STALL`）時該命令未執行、可安全重試。`--ack-mode {auto,echo,none}` 控制此行為：`auto`（預設）＝bridge 支援即節流；`echo`＝強制節流；`none`＝維持 legacy 整行送出；其餘值一律 `INVALID_ARGS`（RPC 層**與** `push_file()` 模組入口各一道，避免未知模式靜默降級成無保護的整行送出）。取捨：節流犧牲吞吐——1MB push 約 10–17 分鐘；急件且鏈路確認有流控時可用 `--ack-mode none` 走快路徑。單一 slice 的 echo 等待逾時**下限 5s**，實際值依 profile `timeout_s` 推導（`max(profile.timeout_s, 5.0)`，比照 #157 `chunk_timeout_s`）。此值只約束**失敗路徑**的等待上限，echo 正常到達時立即返回、成功路徑吞吐不變；不把加大 timeout 當成 #166 的修法。
 
+`file push`／`file pull` 傳輸中若 session 進入 drain（release、recovery、clear、rebind）、bridge 世代前進或傳輸被取消，傳輸即停止送出並回應（OD-62，比照 BC-03）：本次傳輸尚未有任何 byte 寫入 UART → `FLUSHED_BY_RECOVERY`（session 回 `READY` 後可重送）；已寫出至少 1 byte → `COMMAND_ABORTED_IN_FLIGHT`（勿直接重送，先確認目標狀態；目標端可能殘留部分寫入的 `/tmp/.sw_upload_*`）。`file push` 附 `chunks_sent`／`chunks_total`。回 `COMMAND_ABORTED_IN_FLIGHT` 時與一般命令相同，WAL 另寫一筆 `command_aborted_in_flight` META：`cmd_id` 為該次傳輸的 cmd_id 前綴 `ft-<8hex>`（各子命令 TX 紀錄的 cmd_id 為 `ft-<8hex>-<子命令>`），`confirmed_tx_bytes` 為整段傳輸累計。0.3.2 在這些情境回 `TRANSFER_TIMEOUT`；傳輸中進入 boot quiet 仍回 `AUTOBOOT_QUIET`＋`retry_after_s`。
+
 詳見設計文件：[`docs/design-file-transfer.md`](./docs/design-file-transfer.md)。
 
 ## MCU 韌體升級：device handoff
@@ -2080,7 +2340,7 @@ serialwrap 持有 UART 時，外部 flasher（如 `ocp-mcu-upgrade`）無法獨�
 serialwrap device release --selector COM0 --source agent:flash --reason "flash CC2674"
 # serialwrap 關閉該 UART、清空 console，且不會自動搶回
 ocp-mcu-upgrade -d /dev/ttyUSB1 -b 115200 -t 8 -e -s -i fw.bin
-serialwrap device attach --selector COM0   # 收回；外部仍持有時回 DEVICE_STILL_HELD，--force 可強制
+serialwrap device attach --selector COM0   # 收回；--force 只略過預檢，不能搶占已識別的外部持有者
 ```
 
 `serialwrap session self-test --selector COM0` 在 RELEASED 下會回 `external_holder` /
@@ -2189,7 +2449,7 @@ serialwrap session self-test --selector COM0
 - `ATTACHED_NOT_READY`：bridge 已掛，但 prompt probe 失敗（如 boot log 中、前景程式仍在跑）
 - `REBOOTING`：agent 已送出 reboot 類指令，正在等待 target 重開機完畢後自動 relogin
 - `HUMAN_INTERACTIVE_ACTIVE`：human console 目前握有 interactive ownership，不適合 agent 干預
-- `PASSTHROUGH`：platform 設為 passthrough，session 已 ATTACHED，適合透明 bridge 模式
+- `PASSTHROUGH`：platform 設為 passthrough，session 停在 ATTACHED（零 TX），適合透明 bridge 模式；連續 30 秒無 RX 後升 `READY`（SC-35）。READY 後的 passthrough 仍分類為 `PASSTHROUGH`，`recommended_action: none`，不 probe、無 `probe_ok`
 - `AUTOBOOT_QUIET`（#130）：session 名義上是 `READY`，但已進入 boot quiet window（自發重開機的過渡態），不送 nonce probe；等它自己解除或過期，勿反覆呼叫。#139 起同一字串也作為 `cmd submit`／`file push`／`file pull` 在此過渡態的**可重試 `error_code`**——即時拒絕、零 UART 副作用（bytes 不落入 autoboot 倒數窗），session 重新確認 `READY` 後重送即可。#162 起 gate 的解除**綁 READY 再確認**（nonce probe；probe 的 `\n` 順帶消耗 askconsole 啟用 banner）：quiet 過期或 RX prompt 解除都不再直接放行 agent 命令，過渡態可由 `session list` 的 `ready_reconfirm_pending` 欄位觀測；pending-only（quiet 已過期）拒絕的 `retry_after_s` 固定 `5.0`
 - `READY_UNCONFIRMED`（#162 有界化）：READY 再確認逾 `READY_RECONFIRM_MAX_S`（300s）或 `READY_RECONFIRM_MAX_ATTEMPTS`（5 次）仍未成功的**不可重試**終態——不帶 `retry_after_s`、帶 `recommended_action: "self_test"`。收到此碼請**停止重試**，改 `session self-test` 取分類（多半會是 `BOOTLOADER`）再以 `interactive-open --allow-attached` 處理
 - `BOOTLOADER_STUCK`（#162）：readiness probe 失敗且 RX tail 尾行命中 bootloader prompt 的 `last_error`；`self-test`／`recover` 據此回 `classification: "BOOTLOADER"` ＋ `recommended_action: "recover_interactive"`
@@ -2205,7 +2465,7 @@ serialwrap session self-test --selector COM0
 
 若 `session attach` 剛好撞上 DUT 開機窗，target 仍在噴 boot log 或 prompt 尚未出現，session 可能暫時停在非 `READY`：
 
-> **`session attach` 回傳契約（#94）**：command-capable session 未能自動達 `READY` 時，`session attach` 會回**非零 exit（`2`）+ 頂層 `error_code`**（如 `PROMPT_UNAVAILABLE`、`RX_FLOOD`），CLI 並在 stderr 印一行具體錯誤（早期版本一律回 `ok:true`、錯誤只埋在 `session.last_error`，上層因而拿到空 error）。這是「尚未達 READY」的**誠實回報、可重試**——daemon 會有界自動重探、通常數秒內回 `READY`（`RX_FLOOD` 為洪水排空後 3s 內接手，#153）——**非致命**；自動化上層應據此 retry/wait，勿當永久失敗。（仍回 `ok:true` 的例外：`READY`、`ATTACHING`（attach 進行中）、`RELEASED`（裝置已 release、回 `recommended_action=device_attach`、需 `device attach` 重取）、`platform=passthrough`（停 `ATTACHED` 即成功）。）
+> **`session attach`／`session recover` 回傳契約（SC-34）**：command-capable session 的 attach 未能達 `READY`，一般拒絕分支固定回 `error_code=SESSION_NOT_READY`，並在頂層附 `last_error`、`last_error_detail`（可為 null）；`FLASHING` 與 `RECOVERING` 仍分別回 `FLASHING_BUSY`、`SESSION_RECOVERING`。recover 的 REPROBE 未恢復時回 `ok:true`、`recovering:false`、`action=REPROBE`、`recovered:false`、`error_code=SESSION_NOT_READY`，並附相同的頂層診斷欄位。依 `last_error` 判斷下一步：終態值（如 `CREDENTIALS_UNRESOLVED`、`BOOTLOADER_STUCK`）依 Session last_error 處置，不可盲目重試；暫時的 prompt／開機窗失敗則先查看 session 狀態及自動重探進度。CLI 對 attach 失敗仍以 exit code `2` 回報；`ok:true` 的 passthrough、`READY`、`ATTACHING`、`RELEASED` 等情形維持原行為。
 >
 > **stderr 一行具體錯誤的完整形狀（#172）**：`serialwrap: {method 或 context} failed: {error_code}[: {message}][（hint: ...)]`——`error_code` 一定露出，`message`／`hint` 有值才追加在後。修正前 `_run_rpc` 有 `error_code` 時會把 `message` 短路丟掉（`SOCKET_ERROR` 的 `message` 正是 `str(OSError)`，是分辨 socket 路徑算錯／daemon 已死／權限不符的關鍵資訊），且 `daemon start`／`daemon stop`／`event`／`remote`／`setup`／`service` 等非 RPC 錯誤出口原本 exit 非零時 stderr 全空。只讀 stderr 的呼叫端（如 testpilot）現在能拿到完整原因，不再是冒號後空白的字面。
 
@@ -2249,7 +2509,7 @@ serialwrap daemon status   # multi_open / foreign_holders 欄位
 - **`serialwrap doctor`**：新增 `single_daemon` 檢查項，掃 `/proc` 找 `serialwrapd` 程序；多開時 `ok=false`、`detail` 列出在跑的 daemon 數、`fix` 指引「停掉多餘 daemon（`serialwrap service stop`；並檢查 systemd-user 與 system 是否同時在跑）」。doctor 為獨立程序、不碰 socket。
 - **`serialwrap daemon status`**：回應加三個欄位：
   - `multi_open`（bool）：是否偵測到一個以上 `serialwrapd`。
-  - `foreign_holders`（`{tty_real_path: pid}`）：哪個 pid 持有目前 attach 中的 tty。
+  - `foreign_holders`：known holder 的值為 PID；holder 掃描不完整時值為物件 `{"device": tty_real_path, "holder_unknown": true}`，若同時找到 PID 則另含 `pids` 陣列。
   - `multi_open_detail`：`{"daemons": [{"pid": N, "socket": "<path>" | null}, ...], "holders_status": "ok" | "permission" | "unknown"}`。`holders_status` 在跨 uid 讀不到 `/proc/<pid>/fd` 時降級為 `permission`（仍確認另有 daemon 存在，但無法判定持有哪條 tty）；procfs 不可用時為 `unknown`。`socket`（#173）是從各 daemon 的 `--socket` 引數擷取的值，讀不到時為 `null`。
 
 #### 自訂安裝路徑與 config.yaml 同步（#173）
@@ -2283,7 +2543,7 @@ recovery 把 session 降出 `READY`（或 session 重新 attach）時，佇列�
 
 ### Timeout 語意（#123）
 
-呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`（recover 升級分支可同步跑數十秒）屬 daemon 端同步執行的**長操作**：未指定 `--timeout` 時，CLI 對這四個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
+呼叫端必須自行處理 RPC timeout——CLI 回 `TIMEOUT` 只代表「CLI 不再等待」，daemon 端操作可能仍在執行、稍後成功。`session attach`／`session recover`／`session self-test`／`session console-attach`／`device release`／`device attach`／`session clear`／`session bind` 都會在 daemon 端阻塞（`session console-attach` 的 recover 升級分支可同步跑數十秒）：未指定 `--timeout` 時，CLI 對這八個方法自動採固定 45 秒 floor，而非一般方法的預設 5 秒。顯式指定 `--timeout` 時一律照用。
 
 floor 誠實說明：CLI 完全無從得知 daemon 端 profile 的 `timeout_s`（部分平台如 `bcm` 常設 15 秒以上、且可能多階段 login/ready probe）——真正拉長 daemon 端執行時間的其實是這個值，45 秒只是一個寬鬆常數，不是依任何單次呼叫的參數精算出來的上界。（初版曾試著讓 floor 隨 CLI 端 `recover_timeout_s`／`probe_timeout_s` 縮放，但 daemon 端對這兩個參數皆有 2 秒 cap、超過就無作用，該推導已撤回。）若操作仍逾時，可用下方 `TIMEOUT` 錯誤附帶的 `daemon_reachable`／`daemon_busy` 欄位與 `session list` 確認 daemon 是否仍在執行。
 
@@ -2441,14 +2701,34 @@ serialwrap wal current-seq
 Windows daemon 以 **TCP loopback** 取代 AF_UNIX 做 RPC 控制通道，使 serialwrap CLI/agent 在 Windows 擁有完整指令路徑：
 
 - **RPC endpoint**：預設 `tcp://127.0.0.1:48700`，可以 `--socket` 參數或環境變數 `SERIALWRAP_ENDPOINT`（覆寫整個 endpoint，如 `tcp://127.0.0.1:50000`）、`SERIALWRAP_TCP_PORT`（僅覆寫 port 部分）覆寫。daemon 啟動後會把有效 endpoint 寫入 `config.yaml::socket_path`，CLI `_resolve_endpoint` 自動讀取（#173 起 POSIX daemon 亦同，見下方「自訂安裝路徑與 config.yaml 同步」）。
-- **Singleton 鎖**：`msvcrt.locking`（`LK_NBLCK`）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得 msvcrt 檔鎖。
+- **Singleton 鎖**：`LockFileEx`（獨佔且不等待）+ TCP connect 探測（`WindowsSingletonLock`，`sw_core/lock_win.py`）。語意與 POSIX `SingletonLock`（flock + Unix socket probe）對齊：endpoint 可連 → `DAEMON_ALREADY_RUNNING`；stale → 取得檔案鎖。
 - **COM 列舉與藍牙排除**：從 Windows registry `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM` 列舉所有 COM port（`WindowsDeviceSource`，`sw_core/device_source.py`）；雙重排除藍牙——BTHENUM PortName 掃描（主判據）+ `bthmodem` device path 啟發式（兜底），確保藍牙裝置**永不被接管**。額外手動排除清單：`config.yaml::windows.exclude_coms`（如 `["COM3"]`）。
-- **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；需要下命令請先 pin 適當 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
+- **閒置非藍牙 COM 自動接管**：偵測到不在排除清單的 COM 時，daemon 以 `passthrough` profile 自動建立 session（可觀察 UART 輸出；靜默 30 秒後可升 `READY` 並下命令，但仍建議先 pin 有 prompt 的 profile 並 attach）。已持續被外部程序佔用的 COM **不會每輪自動輪詢重試**（與 POSIX dynamic-session 同語意；需拔插或手動 `session bind`/`session clear` 觸發）。
 - **平台 seam 分檔**：三個後端由 `sw_core/platform_backends.py` 的 `select_rpc_backend()` / `select_lock_backend()` / `select_device_backend()` 依 `os.name` 自動選擇，環境變數 `SERIALWRAP_{RPC,LOCK,DEVICE}_BACKEND`（`auto`/`posix`/`win`）可覆寫：
   - RPC：`sw_core/rpc_posix.py`（Unix socket）↔ `sw_core/rpc_win.py`（TCP loopback `TcpRpcServer`）
   - Lock：`sw_core/lock_posix.py`（`SingletonLock` flock）↔ `sw_core/lock_win.py`（`WindowsSingletonLock` msvcrt）
   - Device：`PosixDeviceSource`（`/dev/serial/by-id`）↔ `WindowsDeviceSource`（SERIALCOMM registry）
 - POSIX 路徑全程 byte-identical（shim 維持相容）。
+
+### Windows 發佈 zip（`serialwrap-<版本>-windows-x86_64.zip`）
+
+GitHub Release 除 Linux tarball 外，另附 `serialwrap-<版本>-windows-x86_64.zip`（由 GitHub hosted `windows-latest` 建置，`SHA256SUMS` 兩者皆列）。內容為 Rust CLI 加 Python daemon，runtime 為隨 bundle 附帶的 CPython 3.12.3（含 PyYAML、pyserial），不需系統 Python。**未做程式碼簽署**（SmartScreen 可能警告，請以 SHA-256 核對），**不含 com0com**。安裝（PowerShell）：
+
+```powershell
+# 1. 以 SHA256SUMS 核對下載檔
+(Get-FileHash .\serialwrap-<版本>-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+# 2. 解到暫存位置，再從 versions\<版本>\bin 執行 setup
+Expand-Archive .\serialwrap-<版本>-windows-x86_64.zip -DestinationPath $env:TEMP\swinst
+& $env:TEMP\swinst\serialwrap-<版本>-windows-x86_64\versions\<版本>\bin\serialwrap.exe setup --on-demand
+# 3. 安裝根為 %LOCALAPPDATA%\Programs\serialwrap；把其 bin\ 加入 PATH
+serialwrap.exe --version; serialwrap.exe doctor
+```
+
+`setup` 必須由 `versions\<版本>\bin\serialwrap.exe` 執行（只有這份與 `release-manifest.json` 同層）；zip 頂層 `bin\` 的副本只是穩定入口。要用工作排程器監管改下 `setup --windows-task`。PyInstaller 的 `serialwrap.exe`／`serialwrapd.exe` 仍照發供既有使用者。要對既有 tag 補傳 zip，手動觸發 release workflow 的 `workflow_dispatch`（輸入 tag）。
+
+### Windows 選用元件：com0com
+
+Windows 發佈組合可附 com0com 3.0.0.0 虛擬序列埠 driver（已發佈的 release zip 不含，OD-78），預設不安裝；一般 serialwrap 安裝與更新仍不需要管理員權限。明確執行 `serialwrap setup --with-com0com` 才會由 bundle 內 helper 單獨請求 UAC，並安裝預設 COM20／COM21 pair。執行 `serialwrap setup --remove-com0com` 可移除此 pair。拒絕 UAC 或 helper 失敗不會讓基本安裝失敗，結果會列在 `optional_components.com0com`。Spike 1 剩餘項目在 HVCI 開啟的機台全數通過前仍標示為實驗性。套件附 GPLv2 授權、com0com 3.0.0.0 原始碼連結與書面提供承諾。
 
 #### 建置 Windows 可執行檔（PyInstaller）
 
@@ -2490,7 +2770,7 @@ serialwrap.exe doctor
 serialwrap.exe skill --platform windows
 ```
 
-- `daemon start` 的 spawn 解析（#131）：release exe（PyInstaller 凍結）→ `serialwrap.exe` 同層 `serialwrapd.exe` → PATH 上的 `serialwrapd`；原始碼 checkout → `serialwrapd.py`；pip/pipx 安裝 → `-m sw_core.daemon`。
+- `daemon start` 的 daemon 定位順序（DF-05，P1 T18；POSIX 與 Windows 相同）：發佈組合 `release-manifest.json` 的 `components.daemon.launcher.path`（manifest 由 `SERIALWRAP_RELEASE_MANIFEST` 指定，未指定時取 bundle 根的 `release-manifest.json`）→ release exe（PyInstaller 凍結）同層 `serialwrapd.exe`／PATH 上的 `serialwrapd` → 與 `serialwrap` 同目錄的 `serialwrapd`（Windows 為 `serialwrapd.exe`）→ 原始碼 checkout 的 `serialwrapd.py` → `python -m sw_core.daemon`（pip/pipx 安裝）。偵測到 release manifest 時，`serialwrap doctor` 另附非 advisory 的 `version_pairing` 檢查（SC-25）：CLI 與 daemon 版本須等於 bundle 版本，並比對 launcher／runtime／套件樹與 SKILL 資產雜湊；純 Python 安裝的 doctor 輸出不變。
 - `--endpoint` 在 Windows 的 `daemon start` 開放 **loopback tcp://** 作為本機 bind 位址（非 loopback 照舊 `REMOTE_NOT_SUPPORTED`；POSIX 行為不變）。
 
 > ⚠️ Windows 尚無 systemd 監管（PORT-8）。長期使用建議以 Windows Task Scheduler 或 NSSM 管理 `serialwrapd.exe` 生命週期；`device release` / `device attach` 編排已可用（底層 COM release/reclaim primitive 可用）。
@@ -2524,6 +2804,76 @@ python3 -m pytest tests/test_session_bind.py -v
 python3 -m unittest tests.test_multiagent_e2e -v
 python3 -m unittest tests.test_session_bind -v
 ```
+
+### Rust CLI 建置、Bundle 與生命週期管理（Stage 1B）
+
+Stage 1B 將 20 個 CLI 群組全數以 Rust 原生實作（`DELEGATED_GROUPS` 委派集合為空），並交付原生 daemon 生命週期、監管模式切換與原子更新／回滾：
+
+- **原生群組（20 個）**：`device`、`session`（含 `console-attach`／`console-detach`）、`alias`、`cmd`、`stream`、`log`、`file`、`wal`、`mcu`、`event`、`profile`、`skill`、`remote`、`daemon`、`connect`、`benches`、`supervision-mode`、`service`、`setup`、`doctor`。全部 20 個群組均為原生執行，無委派殘留。
+
+#### 建置與 Bundle
+
+```bash
+# 建置 Rust workspace
+cargo build --workspace
+
+# 建立開發 bundle（輸出至 target/mkbundle-dev）
+./scripts/rust/mkbundle.sh --dev
+```
+
+#### 首次安裝
+
+```powershell
+# 1. 預設使用 Windows Task 排程監管安裝（使用者身分，無須管理員特權）
+serialwrap setup --windows-task
+
+# 2. 選用安裝 com0com 虛擬序列埠驅動（需要系統管理員提權，SC-36，OD-15）
+serialwrap setup --with-com0com
+```
+
+#### 生命週期與監管管理
+
+- **生命週期控制**：`daemon restart` 提供具備 two-reader 安全防護之重啟機制（有序停止舊 daemon、等待行程於 10 秒內完全結束並釋放裝置控制代碼，確認釋放後再啟動新實例）。
+- **監管模式切換**：`supervision-mode set <MODE>` 可在 `on-demand`、`systemd-user`、`systemd-system`、`windows-task` 與 `windows-service` 之間動態切換（Windows 上 `windows-service` 輸出 `pending_sudo` 指令由管理員執行）。切換前執行嚴格之安全預檢與原子交接（`daemon.handoff_stop`）：若有 Flash 燒錄、檔案傳輸、活躍操作或探測不明時一律拒絕切換，且此保護**不受 `--force` 影響**（`--force` 不覆寫交接護欄，只在輸出標記 `force_ignored:true`）。
+- **Windows Task 監管**：`windows-task` 透過 Windows Task Scheduler（`schtasks`）排程工作進行監管，設定 `ExecutionTimeLimit=PT0S`，常駐背景運行並於使用者登入時自動啟動，崩潰時自動重啟（`RestartOnFailure`）。
+- **版本回滾**：`setup --rollback` 透過 `install-journal.json` 原子回滾至上一有效版本之二進位檔、Python runtime 與監管排程設定。第一次從 pipx 的 0.3.2 換成 bundle 時沒有上一個 bundle 版本，因此 `setup --rollback` 不能回到該 pipx 安裝：命令回 `INVALID_ARGS`（`rollback_unavailable`），且不改動現場。手動回到 0.3.2 不是受支援的降級。
+- **0.3.x daemon 執行中直接升級（OD-48、SC-39）**：0.3.x daemon 不支援 `daemon.handoff_stop`。`setup` 正向辨識它（版本低於 0.4.0、為 bundle `versions/` 以外的 pipx Python daemon 行程）後，flash 或忙碌時拒絕；否則把舊行程資訊記進 `install-journal.legacy.json`，以原監管手段停止（為 unit 的 MainPID 時 `systemctl stop`，否則 RPC `daemon.stop`；不硬殺）。舊行程樹結束、且沒有同使用者行程持有 UART，連續 5 秒（上限 330 秒）才切換，之後啟動新 daemon。整個無法檢查的同使用者行程（`/proc/<pid>/fd` 讀不到，或 fd 條目全部被拒；有 systemd user session 的機器上即 `(sd-pam)` 與 `systemd --user`），只要送出 stop 時就已存在（以 pid 與啟動時間比對），不論四個 uid（real、effective、saved、fs）是否都是自己（常駐的 setuid `fusermount3` 也放行），在其餘同使用者行程都未持有 UART 時不擋切換，改列在 `legacy_stop.uninspectable_procs`（pid、start_ticks、comm、reason，以及 `uid_match`〔`all`；`partial`，例如 setuid 工具；`unknown`〕與 `uids`）並標註 `holders_status: "partial"`。stop 後才出現的無法檢查行程（例如 non-dumpable 的 `ssh-agent` 或 setuid UART 工具）不論 uid、停止前快照取得失敗（此時任何無法檢查的行程都不放行）與其他掃描失敗仍會等到上限；掃描中行程結束或等待中拔除裝置不算失敗。已知代價：停止前就已在執行的 setuid 工具若在等待期間才打開 UART，不會被擋。逾時回應附最後一次輪詢的 `holders_status`、`uninspectable_procs`、`before_stop_snapshot`、`daemon_scan`，以及 `last_unstable`（穩定窗最後一次被打斷的時間與原因）。0.4.0 本身在這類機器上會等滿 330 秒，升級到 0.4.0 時請先停止 0.3.x daemon。後續步驟失敗時還原安裝，但**不會**重啟舊 daemon；回應附 `legacy_daemon_stopped`、`restored` 與 `restart_hint`。升級時請明確指定目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）；不加旗標時與 0.3.2 相同會自動選擇。
+
+#### 首次安裝與更新錯誤處置對照表
+
+| 階段 (`phase`) | 常見錯誤碼 (`error_code`) | 操作者處置指南 |
+|---|---|---|
+| `update_safety_check` | `SESSION_BUSY`, `FLASHING_BUSY` | Target 正處於 flash 燒錄、檔案傳輸或命令執行中；等待完成後重試（`--force` 不會覆寫） |
+| `update_confirm_released` | `TIMEOUT`, `DEVICE_STILL_HELD` | 舊 daemon 未能在 10 秒內完全終止或裝置未釋放；確認行程退出後重試（未進行切換） |
+| `install_lock` | `TIMEOUT` | 無法取得 `.install.lock` 鎖；確認是否有並行之 `setup` 實例正在執行 |
+| `update_verify` / `rollback_verify` | `CHECKSUM_VERIFY_FAILED` | 安裝包 SHA256 或 release-manifest 校驗失敗；重新取得或重新打包安裝 bundle |
+| `update_start_and_verify` | `DAEMON_EXITED`, `DAEMON_NOT_READY` | 新版 daemon 啟動或健康檢查失敗；系統已自動回退至原始版本 |
+| `update_autostart_hold` | `INTERNAL_ERROR`, `NEEDS_SUDO` | 抑制排程工作自動重啟失敗；檢查使用者權限（若為 service 需提權） |
+| `revert_pending` / `install_recover` | `SESSION_BUSY`, `TIMEOUT` | 復原時停止目前 daemon 被拒；等待 daemon 閒置後再次執行 `setup` 完成復原 |
+
+#### 部署與驗證參考文件
+
+- [Agent 權限模型與部署規範](docs/rust-refactor/deploy/agent-permission-model.md)
+- [Windows 安裝、更新與回滾作業指南](docs/rust-refactor/deploy/windows-install-update-rollback.md)
+- [Agent 權限驗證工具](scripts/rust/verify_agent_perms.py)
+
+#### A/B 黑箱驗證
+
+```bash
+# Linux A/B 差分黑箱驗證（對照 Python 基線）
+./scripts/rust/ab_blackbox.sh --profile debug
+
+# Windows 原生黑箱驗證（透過 PowerShell / WSL interop）
+./scripts/rust/win-blackbox.sh
+```
+
+### 隔離實例測試裝置 allowlist（OD-11／SC-19）
+
+僅供隔離的測試實例使用（拋棄式 daemon、com0com 等虛擬 COM pair）。allowlist 讓 daemon 只發現與選取明確列出的裝置名稱；它不關閉 per-UART 獨占鎖（BC-04）、不更換 serial backend，也絕不繞過 Tier 2 獨占與交接規則。
+
+- 設定方式：環境變數 `SERIALWRAP_TEST_DEVICE_ALLOWLIST=COM7,COM8`（逗號分隔，逐字比對 `DeviceInfo.by_id`），或 `config.yaml` 的 `windows.test_device_allowlist: [COM7, COM8]`。兩者並存時環境變數優先。
+- 只有 `SERIALWRAP_STATE_DIR`、`SERIALWRAP_RUN_DIR`、`SERIALWRAP_CONFIG_DIR` 三者都明確設定、且都不等於預設路徑時才生效。不符合即拒絕啟動：stderr 輸出 `serialwrapd: TEST_DEVICE_ALLOWLIST_REJECTED: <原因>`、exit 2，且在建立任何 state、run 或 lock 檔之前就結束。`windows.test_device_allowlist` 不是字串 list 時同樣拒絕啟動。若 `config.yaml` 存在但無法讀取或解析、且未以環境變數提供 allowlist，隔離實例同樣拒絕啟動（`invalid config.yaml: <例外類別名>`）；非隔離實例維持原行為。
+- 生效時 `serialwrap daemon status` 會顯示 `test_device_allowlist: {"enabled": true, "coms": [...], "source": "env"|"config"}`；未生效時不輸出此鍵。
 
 ### 實機穩定性測試（#122）
 
@@ -2626,8 +2976,7 @@ CLI（`bind` 只改 device、`recover`/`clear` 沿用舊 profile）。在 produc
    （space）約 30 秒，攔截「Hit any key to stop autoboot」視窗；若是 boot menu，送對應鍵
    （例如 `0` = Exit）掉到 U-Boot console（prompt 例如 `U-Boot> `）。（#130 的 boot quiet
    window 只 gate `source=system` 的自動 probe，**不擋 interactive lease 鍵擊**，此手法不受影響。）
-4. **走完整 serialwrap 路徑驗證**：`session self-test`（期望 `OK`/`probe_ok=True`/`READY`）→
-   `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump）。
+4. **走完整 serialwrap 路徑驗證**：passthrough 不 probe，`session list` 觀察到 `state` 由 `ATTACHED` 在靜默 30 秒後自動升為 `READY`（期間不應有任何 TX）；`session self-test` 期望 `classification: PASSTHROUGH`、`recommended_action: none`（無 `probe_ok`，READY 的 passthrough 不 probe）→ `cmd submit --cmd 'printenv' --mode line`（期望框出 env dump；完成條件由 `uboot-template` 的 `prompt_regex` 提供，板子若不回 prompt 則加 `--completion-regex`）。
 5. **還原**：送 `boot` 回正常 OS → 停 throwaway daemon → `device attach --selector COMx` 收回
    → 等板子開機穩定後（早期 PCIe/kernel 噪音會干擾偵測）重啟 production daemon，讓 detection
    重新綁回原 profile。
@@ -2743,7 +3092,7 @@ serialwrap remote tester@AGENT_OR_RELAY:7777
 `serialwrap remote`（`sw_core/remote_tunnel.py`）行為：
 
 - **background 常駐**：`ssh`／`--autossh` 以獨立 process group 背景執行，指令立即回傳。
-- **flock registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket），以 flock 序列化並發的 `remote` / `remote close` 操作。
+- **跨行程檔案鎖 registry**：狀態落在 `<run-dir>/remote/`（`<port>.json` + `cm-<port>` ssh control socket）；POSIX 使用 `flock`，Windows 使用 `LockFileEx`，避免並發 tunnel 操作互相競爭。
 - **readiness 確認**：回傳 `status`：`active`＝已驗證就緒可用；`starting`＝逾時（預設 10s，`--ready-timeout` 可調）但行程仍存活、尚未確認，需再 `serialwrap remote` 查或重試。
 - **冪等 / 衝突偵測**：同 port 重複執行且 identity（role/target/port/local/remote_socket/via/ssh-opt 等雜湊）相同 → `already_running` no-op；identity 不同 → 拒絕並回 `TUNNEL_CONFLICT`（避免竊佔他人隧道或造成埠位混用）。
 
@@ -2973,6 +3322,8 @@ sudo tools/bench-enroll.sh --bundle /path/to/handoff/eit-test
 serialwrap remote                   # 列目前所有隧道（status）
 serialwrap remote close 7777        # 拆除單一隧道
 serialwrap remote close all         # 拆除全部
+serialwrap remote stop 7777         # 等同 close
+serialwrap remote stop              # 停止全部隧道
 ```
 
 ### `--remote-socket` 硬化（共享 relay 建議必開）
@@ -2996,7 +3347,8 @@ serialwrap remote -L --remote-socket /tmp/sw-relay.sock tester@RELAY:7777
 - **`BatchMode=yes` 為強制、無法覆寫。** readiness／安全預設 `-o` 置於使用者 `--ssh-opt` **之前**，而 OpenSSH 對同一個 key 取第一個出現的值，因此 `BatchMode`、`ExitOnForwardFailure` 與 `ControlPath` 這組設定是刻意設計成權威、使用者蓋不掉的。後果是**不接受任何互動式認證**：開隧道當下認證就必須已經是非互動的。若 reachability provider 的憑證會過期（例如 Cloudflare Access 的 token），過期時 ssh 會直接失敗且**不會給出有用的診斷訊息**——無人值守情境需改用 service token，或事先完成 refresh。
 - `daemon start` **不支援** `--endpoint`（daemon 只能在本機啟動，會回 `REMOTE_NOT_SUPPORTED`）。
 - **`file.push` / `file.pull` 的 `local_path` 是 daemon 端（UART host）的路徑**，不是 agent 本機路徑；agent 若要傳輸本機檔案，需先透過 scp/rsync 傳到 UART host，再由 daemon 執行 file transfer。WAL、mirror log 等路徑回傳值同理。
-- **native Windows 本期不支援** `serialwrap remote`：執行會回 `REMOTE_NOT_SUPPORTED`（見下方手動等價）。
+- **native Windows 支援** `serialwrap remote -R/-L`、`connect` 與 `benches`；Windows 使用整棵行程樹終止，且不使用 OpenSSH ControlMaster。可用 `serialwrap remote stop [port|all]` 停止指定隧道；省略參數時停止全部。
+- **OD-12 信任邊界**：遠端隧道讓通過 SSH 驗證的使用者取得 DUT 完整控制權。僅部署於單人工作站並使用可信 relay；不得宣稱同使用者隔離。
 - 若要做隔離式雙 container 驗證，可直接執行 `./tools/docker/remote_smoke.sh`；完整流程說明在 [`func-test/README.md`](./func-test/README.md) 的 **Remote Support Docker test flow**。
 
 ### 手動 `ssh -R` / `-L` 等價（不透過 `serialwrap remote`）
@@ -3042,7 +3394,7 @@ Event Trigger Engine 讓 daemon 持續監聽每個 COM 的 UART RX 行，當輸�
 
 ### 規則格式
 
-規則為 JSON/YAML 檔，儲存在 `~/.serialwrap/events.d/`：
+規則為 JSON 檔（只讀取 `*.json`），儲存在 `~/.serialwrap/events.d/`：
 
 ```json
 {
@@ -3084,7 +3436,7 @@ serialwrap event tail --rule-id ops.kernel-panic -n 20  # 查看最近 fire 記�
 由 event engine 觸發的 handler script **必須**：
 - 在 `timeout_ms`（預設 10s）內結束；超時會依序收到 SIGTERM（pgid）→ SIGKILL（pgid）
 - **不可呼叫 `setsid()`** 或主動 daemonize，否則子進程會脫離 process group，timeout 無法強制終止
-- 從 stdin 讀取 JSON payload（含 `com`、`rule_id`、`matched_text`、`trigger_ts` 等欄位）
+- 從 stdin 讀取 JSON payload（含 `selector`、`rule_id`、`matched_text`、`matched_at` 等欄位）
 - 以 exit code 0 代表成功，非 0 代表失敗（均記入 events.ndjson）
 
 Handler **建議**：
@@ -3101,19 +3453,19 @@ Handler **建議**：
 ## 安裝
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/serialwrap@v0.3.2"
-serialwrap setup     # 物化 profiles/skill/minicom、設定 daemon（systemd 或 on-demand fallback）
-serialwrap doctor    # 驗證環境
+# 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
+./install.sh                     # 最新 release
+./install.sh --version 0.4.0     # 指定 release
+serialwrap doctor                # 驗證環境
 ```
 
 - dialout：`sudo usermod -aG dialout $USER`（之後重新登入）。
 - **human console 用 `serialwrap-minicom COM0`（`serialwrap setup` 已自動物化到 `~/.local/bin`），不要直接 `minicom -D /dev/ttyUSBx`**（會與 daemon 搶 tty，two-reader）。
 - WSL 啟用 systemd：於 `/etc/wsl.conf` 設 `[boot]\nsystemd=true` 後 `wsl --shutdown`（否則 `serialwrap setup` 退回 on-demand）。
-- 本機開發安裝：`./install.sh`（= `pipx install <repo>` + `serialwrap setup`）。
-- **升級與確認 daemon 跑的是哪份程式碼**：`pipx install --force ...` 後再跑一次 `serialwrap setup`。版本字串（`0.3.2`）在 release、分支 build、`main` 之間完全相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.3.2 (code 1a2b3c4d5e6f)`（已安裝的 `sw_core/**/*.py` 的雜湊）；`serialwrap daemon status` 的 `code_fingerprint` 是正在跑的 daemon 啟動時載入的那份、`code_path` 是它載入的位置。兩者不同＝daemon 還在跑升級前的舊碼：其他指令的 stderr 會多一行警告（stdout JSON 不變），`serialwrap doctor` 以 advisory 檢查 `daemon_code_current` 回報。systemd 服務 active 且指紋不同時，`serialwrap setup` 會自動 restart 服務並在輸出的 `daemon_code` 欄位說明結果；systemd-system 未帶 `--with-sudo` 時只把 `sudo systemctl restart serialwrap` 列入 `pending_sudo`；`--no-restart` 可略過；flash 進行中不會重啟；on-demand 模式不會自動停 daemon，請 `serialwrap daemon stop` 後 `serialwrap daemon start`。細節見[規格 §8.7](docs/serialwrap-spec.md)。
+- 系統需求、`--bundle` 離線安裝、本機開發安裝與 0.3.x 升級說明見[快速開始](#快速開始)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 
-依賴：Python 3.10+（`pipx install` 自動帶入 `pyyaml`）；human console 路徑另需 `jq` 與 `minicom`。
+依賴：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`（`pyyaml` 已內附於 bundle）；human console 路徑另需 `jq` 與 `minicom`。
 
 ## 使用方式
 
@@ -3132,12 +3484,12 @@ options:
   --socket SOCKET      本機 daemon 的 Unix socket 路徑（未指定時依 config.yaml 與 XDG 執行期目錄解析，可用 SERIALWRAP_RUN_DIR 覆寫）
   --endpoint ENDPOINT  遠端 daemon endpoint，例如 tcp://127.0.0.1:7777（優先於 --socket）
   --bench CODE         使用 connect 記住的 bench 代號解析 endpoint（優先序低於 --endpoint/--socket，高於 config fallback）
-  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach 自動採固定 45.0 的 floor，#123）
+  --timeout TIMEOUT_S  RPC timeout 秒數（未指定：一般方法 5.0；長操作 session attach/recover/self-test/console-attach、device release/attach、session clear/bind 自動採固定 45.0 的 floor，#123）
   --retries RETRIES    TIMEOUT／連線失敗時的重試次數，僅作用於冪等唯讀方法白名單（指數退避 0.5s 起、單次上限 5s；預設: 0）
 
 command groups:
   <group>
-    daemon             管理 serialwrap daemon（啟動／停止／狀態）
+    daemon             管理 serialwrap daemon（啟動／停止／重啟／狀態）
     device             實體 UART 裝置列舉與 handoff（release／attach）
     session            session 生命週期、探測、recover、console 與 interactive 操作
     alias              session 別名與 by-id 綁定管理
@@ -3171,12 +3523,13 @@ examples:
 <!-- BEGIN: cli-help marker="serialwrap-daemon-help" -->
 usage: serialwrap daemon [-h] <command> ...
 
-管理 serialwrap daemon 行程：啟動、停止與查詢執行狀態。
+管理 serialwrap daemon 行程：啟動、停止、重啟與查詢執行狀態。
 
 positional arguments:
   <command>
     start     啟動 daemon（--foreground 可前景執行；systemd 模式重導 service start）
     stop      停止執行中的 daemon
+    restart   重啟 daemon（systemd 模式重導 service restart）
     status    顯示 daemon 狀態（pid／sessions／devices／log 路徑／多開偵測 multi_open）
 
 options:
@@ -3231,8 +3584,7 @@ positional arguments:
   <command>
     list      列出實體 UART 裝置（real_path 與 by-id）
     release   釋放 raw 裝置給外部工具獨佔（如 MCU 燒錄），進入 RELEASED 不自動搶回
-    attach    收回先前 release 的裝置並重建 console（外部仍持有時回 DEVICE_STILL_HELD，--force
-              略過）
+    attach    收回先前 release 的裝置並重建 console（--force 只略過開檔前預檢，不會搶占已識別的外部持有者）
 
 options:
   -h, --help  show this help message and exit
@@ -3251,10 +3603,11 @@ serialwrap remote：外包系統 ssh 建立 -R（expose，把本機 daemon 推�
   serialwrap remote -L user@relay:7777    # connect（relay/雙 NAT）
   serialwrap remote                        # 列目前隧道（status）
   serialwrap remote close 7777|all         # 拆除
+  serialwrap remote stop [port|all]        # close 的別名，省略時拆除全部
 安全：只透過 ssh-tunnel、單租戶/可信 relay 或 --remote-socket；不可對網路直接開放。
 
 positional arguments:
-  words                 [user@]host:port ｜ status ｜ close <port|all>
+  words                 [user@]host:port ｜ status ｜ close/stop [port|all]
 
 options:
   -h, --help            show this help message and exit

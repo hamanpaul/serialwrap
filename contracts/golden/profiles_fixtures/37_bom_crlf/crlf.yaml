@@ -1,0 +1,6 @@
+﻿profiles:
+  p:
+    platform: shell
+targets:
+  - profile: p
+    device_by_id: dev-crlf

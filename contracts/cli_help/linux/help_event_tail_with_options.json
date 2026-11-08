@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "event",
+    "tail",
+    "-n5",
+    "--since=7",
+    "--help"
+  ],
+  "columns": 80,
+  "rc": 0,
+  "stdout": "usage: serialwrap event tail [-h] [--rule-id RULE_ID] [--selector SELECTOR]\n                             [-n N] [--since SINCE]\n\noptions:\n  -h, --help           show this help message and exit\n  --rule-id RULE_ID\n  --selector SELECTOR\n  -n N\n  --since SINCE\n",
+  "stderr": "",
+  "native": true,
+  "post_parse_effects": false
+}

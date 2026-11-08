@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "skill",
+    "--platform",
+    "bsd"
+  ],
+  "columns": 80,
+  "rc": 2,
+  "stdout": "",
+  "stderr": "usage: serialwrap skill [-h] [--platform {auto,linux,windows}]\nserialwrap skill: error: argument --platform: invalid choice: 'bsd' (choose from 'auto', 'linux', 'windows')\n",
+  "native": true,
+  "post_parse_effects": false
+}

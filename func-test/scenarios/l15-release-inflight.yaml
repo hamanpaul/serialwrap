@@ -1,0 +1,69 @@
+---
+meta:
+  name: l15-release-inflight
+  category: l15-scenario
+  severity: critical
+  description: "釋放端點時在途命令終態明確且不自動重送，釋放後端點已關閉"
+  scenario:
+    revision: "2026-10-15.1"
+    seed: 1015
+    capabilities: [posix_pty, process_rpc]
+    timeout_s: 60
+    invariants: [no_reopen_before_handoff, no_auto_resend, insufficient_evidence_not_pass]
+    behavior_changes: []
+    expected: PASS
+    daemon_slice: "2.1"
+bridge: {applicable: true, only: true, compare: full}
+target:
+  platform: prpl
+  boot_banner: "boot done\r\nroot@prplOS:/# "
+  noise: {enabled: false}
+  commands:
+    default: "EXEC:{cmd}\r\nRESULT:{cmd}:OK\r\nroot@prplOS:/# "
+  plan:
+    schema_version: "dut-plan.v1"
+    seed: 1015
+    triggers:
+      - id: stop-inflight
+        line_contains: "L15_INFLIGHT"
+        action:
+          kind: delay_reply
+          delay_ms: 6000
+profile:
+  prompt_regex: '(?m)^root@prplOS:.*# '
+  ready_probe: 'echo __READY__${nonce}'
+  timeout_s: 15
+steps:
+  - action: wait_ready
+    timeout_s: 20
+  - action: cli
+    argv: ["cmd", "submit", "--selector", "COM0", "--source", "agent:l15", "--cmd", "echo L15_INFLIGHT", "--cmd-timeout", "30"]
+    save_as: inf
+  - action: wait_wire_marker
+    marker: "echo L15_INFLIGHT\n"
+    observation: "serial_read"
+    timeout_s: 10
+  - action: op_begin
+    op_id: release
+  - action: cli
+    argv: ["device", "release", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: release
+  - action: op_begin
+    op_id: reattach
+  - action: assert_peer_closed
+    at_op: release
+    until_op: reattach
+  - action: assert_command_resolved
+    from: inf
+    timeout_s: 30
+    payload: "echo L15_INFLIGHT\n"
+  - action: cli
+    argv: ["device", "attach", "--selector", "COM0"]
+    expect: {ok: true}
+  - action: op_end
+    op_id: reattach
+  - action: wait_ready
+    timeout_s: 20
+  - action: assert_compare

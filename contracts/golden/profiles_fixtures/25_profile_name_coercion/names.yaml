@@ -1,0 +1,15 @@
+profiles:
+  1: {platform: shell}
+  true: {platform: prpl}
+  " a ": {platform: prpl}
+  a: {platform: shell}
+  "": {platform: prpl}
+  ~: {platform: shell}
+  9.50: {platform: prpl}
+  notmap: 5
+
+targets:
+  - {profile: 1, device_by_id: d1}
+  - {profile: "True", device_by_id: d2}
+  - {profile: 9.5, device_by_id: d3}
+  - {profile: 9.50, device_by_id: d4}

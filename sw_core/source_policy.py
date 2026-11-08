@@ -1,10 +1,14 @@
 """`--source`／interactive `--owner` 來源字串的共用驗證與分類。
 
-背景：命令的「human／agent」身分、以及內部強制恢復旗標，全靠來源字串**前綴**判斷：
+背景：命令的顯示來源分類與權限判定必須分開。`source_class` 只供診斷；RPC 權限依
+保留的原始輸入決定，不能從正規化後的來源字串推回：
 
-- ``source.startswith("human:")``：human 來源——不受 boot quiet gate、命令逾時不送
+- 內部 console 明確傳入 ``trusted_human=True``：不受 boot quiet gate、命令逾時不送
   CTRL-C／CTRL-D 而是升級成 interactive lease（``_recover_after_failure``、
   ``_resolve_session_id``、``execute_command``、``file_push``／``file_pull``）。
+- RPC 原始輸入恰為 bare ``human``（或空名字 ``human:``）：正規化後仍視為 human；
+  明寫 ``human:<名>``（包括 ``human:cli``）依 DF-02 視為 agent。權限不由
+  ``source_class`` 或正規化後字串決定。
 - ``source == "system:recover"``：``_recover_after_failure`` 逾時後額外跑
   ``_force_recover``（clear + reattach）。內部 ``recover_session`` 以這個來源呼叫。
 - ``system``／``system:*``：daemon 內部送 UART 位元組時的 WAL 歸因標籤
@@ -49,6 +53,15 @@ class SourceCheck:
     source: str
     normalized_from: str | None = None
     error: dict[str, Any] | None = None
+    raw_source: str | None = None
+
+    @property
+    def is_bare_human(self) -> bool:
+        """只辨認外部原始輸入的空名 human；不以正規化後 source 推定權限。"""
+        if self.raw_source is None:
+            return False
+        head, separator, tail = self.raw_source.strip().partition(":")
+        return head.casefold() == HUMAN_PREFIX and (not separator or not tail.strip())
 
 
 def classify_source(source: str) -> str:
@@ -72,12 +85,13 @@ def check_source(
     """
     text = str(raw) if raw else ""
     if not text.strip():
-        return SourceCheck(source=default)
+        return SourceCheck(source=default, raw_source=text)
     head, _, tail = text.partition(":")
     token = head.strip().casefold()
     if token in RESERVED_PREFIXES:
         return SourceCheck(
             source=text,
+            raw_source=text,
             error={
                 "ok": False,
                 "error_code": ERROR_SOURCE_RESERVED,
@@ -93,5 +107,9 @@ def check_source(
         )
     if token == HUMAN_PREFIX and normalize_human:
         canonical = f"{HUMAN_PREFIX}:{tail.strip() or DEFAULT_HUMAN_NAME}"
-        return SourceCheck(source=canonical, normalized_from=text if canonical != text else None)
-    return SourceCheck(source=text)
+        return SourceCheck(
+            source=canonical,
+            normalized_from=text if canonical != text else None,
+            raw_source=text,
+        )
+    return SourceCheck(source=text, raw_source=text)

@@ -1,0 +1,23 @@
+defaults:
+  log_dir: logs
+  max_sessions: 4
+
+profiles:
+  prpl-tpl:
+    platform: PRPL
+    prompt_regex: "(?m)^root@prplOS:.*# "
+    user_env: SW_U
+    pass_env: SW_P
+    env_file: creds/a.env
+    timeout_s: 15
+    uart:
+      baud: 115200
+      parity: n
+      flow_control: RTS/CTS
+
+targets:
+  - profile: prpl-tpl
+    com: COM3
+    act_no: 3
+    device_by_id: usb-A-if00
+    alias: board-a

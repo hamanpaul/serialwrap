@@ -59,12 +59,17 @@ steps:
     timeout_s: 10
 
   - action: cli
-    argv: ["cmd", "get", "--cmd-id", "{submit1.cmd_id}"]
+    argv: ["cmd", "status", "--cmd-id", "{submit1.cmd_id}"]
     expect:
-      ok: true
+      command.status: "done"
     save_as: result1
 
   - action: assert_state
     selector: COM0
     expect:
       state: "READY"
+
+bridge:
+  applicable: true
+  compare: full
+  windows_caps: [windows_com]

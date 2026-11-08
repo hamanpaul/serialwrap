@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+from pathlib import Path
+
+stubtool = Path(__file__).resolve().parent.parent / "stubtool.py"
+tool_name = Path(__file__).name
+sys.exit(subprocess.call([sys.executable, str(stubtool), tool_name, *sys.argv[1:]]))

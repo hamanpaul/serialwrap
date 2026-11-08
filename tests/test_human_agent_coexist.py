@@ -12,6 +12,12 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import pytest
+
+# POSIX-only：本檔頂層 import pty（→ tty → termios），原生 Windows 無 termios；非 POSIX 整檔略過、不 import。
+if os.name != "posix":
+    pytest.skip("human／agent 共存測試依賴 POSIX pty／termios", allow_module_level=True)
+
 import pty
 import select
 import shutil
@@ -20,12 +26,49 @@ import tempfile
 import termios
 import threading
 import time
+import sys
 import unittest
 from typing import Any
+import pytest
+
+pytestmark = [pytest.mark.posix_only, pytest.mark.interactive_desktop, pytest.mark.posix_pty, pytest.mark.process_rpc]
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
-SERIALWRAP = str(ROOT_DIR / "serialwrap")
-SERIALWRAPD = str(ROOT_DIR / "serialwrapd.py")
+from ab_env import AB_ENV
+SERIALWRAP = AB_ENV.get("SERIALWRAP_CLI_EXE") or str(ROOT_DIR / "serialwrap")
+SERIALWRAPD_ARGV = [AB_ENV["SERIALWRAP_DAEMON_EXE"]] if AB_ENV.get("SERIALWRAP_DAEMON_EXE") else [sys.executable, str(ROOT_DIR / "serialwrapd.py")]
+
+
+def _external_holders(path: str, *, exclude_pid: int) -> list[str]:
+    """掃 /proc，回傳持有 path 的 pid（排除 exclude_pid）。
+
+    判準為 inode 身分（fd 經 os.stat 跟隨後的 (st_dev, st_ino) 等於 path 的身分；#R2），與 daemon 端
+    `UARTBridge._enumerate_all_held_paths` 使用同一判準，讓測試的等待條件與 daemon 的孤兒回收判準一致。
+    不以 readlink 字串比對：容器內獨立 devpts instance 的 /dev/pts/N 會與本測試的 pty 同名，造成假 holder。
+    """
+    try:
+        target = os.stat(path)
+    except OSError:
+        return []
+    target_id = (target.st_dev, target.st_ino)
+    holders: list[str] = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == exclude_pid:
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for name in names:
+            try:
+                st = os.stat(os.path.join(fd_dir, name))
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == target_id:
+                holders.append(pid)
+                break
+    return holders
 
 
 class FakeTarget:
@@ -49,13 +92,21 @@ class FakeTarget:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
     def start(self) -> None:
-        os.write(self.master_fd, b"boot done\r\nroot@prplOS:/# ")
+        # pytest 行程不得持有 slave fd；BC-04 會把同 tty 的其他 pid 視為外部 holder。
+        # daemon 開啟 slave 後送出的空行 probe 會觸發 _loop 回傳 prompt。
+        try:
+            os.close(self.slave_fd)
+        except OSError:
+            pass
+        self.slave_fd = None
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=3.0)
         for fd in (self.master_fd, self.slave_fd):
+            if fd is None:
+                continue
             try:
                 os.close(fd)
             except OSError:
@@ -72,8 +123,11 @@ class FakeTarget:
                 continue
             try:
                 chunk = os.read(self.master_fd, 4096)
-            except (BlockingIOError, OSError):
-                return
+            except BlockingIOError:
+                continue
+            except OSError:
+                time.sleep(0.05)
+                continue
             if not chunk:
                 return
             buf += chunk
@@ -81,6 +135,14 @@ class FakeTarget:
                 line, buf = buf.split(b"\n", 1)
                 cmd = line.strip()
                 if not cmd:
+                    # 比照真實 shell：空行（daemon 的 prompt probe）要重印 prompt。
+                    # 否則 probe 只能靠開機殘留的 prompt；RX 執行緒若先收進 buffer、
+                    # 再被 `_probe_prompt` 的 `clear_rx_buffer()` 清掉，session 會卡在
+                    # PRPL_PROMPT_TIMEOUT、20s 內到不了 READY（失敗的 case 隨執行而變）。
+                    try:
+                        os.write(self.master_fd, b"root@prplOS:/# ")
+                    except OSError:
+                        return
                     continue
                 if cmd.startswith(b"echo __READY__"):
                     reply = cmd[5:] + b"\r\n"
@@ -165,9 +227,8 @@ targets:
         self._lock = str(self._root / "run" / "serialwrapd.lock")
 
         self._daemon = subprocess.Popen(
-            [
-                os.environ.get("PYTHON", "python3"),
-                SERIALWRAPD,
+            SERIALWRAPD_ARGV
+            + [
                 "--profile-dir", str(self._profile_dir),
                 "--socket", self._socket,
                 "--lock", self._lock,
@@ -237,13 +298,6 @@ targets:
             check=True, timeout=5,
         )
 
-    def _tmux_send(self, keys: str, delay: float = 0.5) -> None:
-        subprocess.run(
-            ["tmux", "send-keys", "-t", self._tmux_session, keys, "Enter"],
-            check=True, timeout=5,
-        )
-        time.sleep(delay)
-
     def _tmux_capture(self) -> str:
         proc = subprocess.run(
             ["tmux", "capture-pane", "-t", self._tmux_session, "-p"],
@@ -251,12 +305,38 @@ targets:
         )
         return proc.stdout
 
+    def _wait_vtty_reader(self, vtty: str, timeout_s: float = 10.0) -> None:
+        """等待條件：vtty 已由 daemon 以外的行程持有（即 tmux 內的讀者已開啟）。
+
+        vtty 已不存在代表 daemon 已回收該 console，立即失敗並指出原因，不空等到逾時。
+        無 /proc 的平台無法觀測持有者；daemon 端在此情況下也保守地不回收（視為仍有 peer），
+        故此時直接回傳。
+        """
+        if not os.path.isdir("/proc"):
+            return
+        daemon_pid = self._daemon.pid
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if _external_holders(vtty, exclude_pid=daemon_pid):
+                return
+            if not os.path.exists(vtty):
+                self.fail(f"vtty {vtty} 在讀者握住前已消失（console 被 daemon 回收）")
+            time.sleep(0.05)
+        self.fail(f"tmux 內的讀者未在 {timeout_s}s 內握住 vtty {vtty}；pane:\n{self._tmux_capture()}")
+
     def _start_minicom_in_tmux(self, vtty: str) -> None:
-        """在 tmux session 內用 cat 讀 vtty（模擬 minicom 的 RX 觀測）。"""
-        self._tmux_new("bash")
-        time.sleep(0.3)
-        # 用 cat 讀 PTY slave 以觀測 RX（比 minicom 更輕量且不需安裝）
-        self._tmux_send(f"cat {vtty}", delay=1.0)
+        """在 tmux session 內用 cat 讀 vtty（模擬 minicom 的 RX 觀測）。
+
+        時序約束：daemon 會回收「建立後 _STALE_CONSOLE_GRACE_S（2.0s）內仍無外部 reader」的
+        非 primary console（sw_core/uart_io.py 的 `_prune_stale_consoles_locked`，由 reconcile tick
+        經 snapshot／list_consoles 觸發）。讀者必須在此窗內握住 vtty，否則 console 會被合法回收，
+        測試即競態失敗。因此：
+        - 直接以 tmux 啟動 cat，不經互動式 bash 啟動（負載下 bash 版實測 1.3～1.6s 才握住 vtty，
+          直接啟動約 0.05s）；cat 結束（例如 C-c）後 exec bash，保留 pane 內的 shell。
+        - 以等待條件取代固定 sleep：vtty 出現 daemon 以外的持有者後才回傳。
+        """
+        self._tmux_new(f"cat {vtty}; exec bash")
+        self._wait_vtty_reader(vtty)
 
     # ---------------------------------------------------------------
     # T1: wal.reset 後 console PTY 仍然有效

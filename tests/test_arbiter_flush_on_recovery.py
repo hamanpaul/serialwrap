@@ -16,6 +16,9 @@ import time
 
 import sw_core.arbiter as arbiter_mod
 from sw_core.arbiter import CommandArbiter
+import pytest
+
+pytestmark = [pytest.mark.core_portable, pytest.mark.memory_only]
 
 
 def _wait_until(pred, timeout_s: float = 5.0, interval_s: float = 0.005) -> bool:
@@ -323,7 +326,17 @@ def _make_mock_service():
 def _mock_exec(release: threading.Event):
     """SessionManager.execute_command 替身：command == "blocking" 卡住直到 release。"""
 
-    def _exec(session_id, command, source, cmd_id, *, timeout_s, mode, expected_duration_s=None):
+    def _exec(
+        session_id,
+        command,
+        source,
+        cmd_id,
+        *,
+        timeout_s,
+        mode,
+        expected_duration_s=None,
+        trusted_human=None,
+    ):
         if command == "blocking":
             release.wait(timeout=10.0)
         return {"ok": True, "stdout": ""}
