@@ -75,6 +75,14 @@ pub struct FlashCandidate {
     pub command_capable: bool,
 }
 
+/// P8 Task 12：drain Phase 1 已送出、等待回條的集合（[`SessionManager::shutdown_phase1`] 的結果，交給
+/// [`SessionManager::shutdown_phase2`]）；`deadline` 為步驟 3～5 共用的期限。
+pub struct ShutdownDrain {
+    deadline: Instant,
+    waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)>,
+    inflight: Vec<String>,
+}
+
 /// `SessionManager::new` 的注入依賴（plan 06 Task 16 Produces）。
 pub struct ManagerDeps {
     pub serial: Arc<dyn SerialBackend>,
@@ -3340,9 +3348,18 @@ impl SessionManager {
 
     /// 先隱含呼叫 `begin_shutdown`；回傳每個 drain 目標是否在 `budget` 內收斂。
     /// drain 集合＝有 bridge（或 attach／drain 進行中）的 session ∪ inflight attach worker（`attach:<by_id>`）。
+    /// 等同 [`SessionManager::shutdown_phase1`] 後立即 [`SessionManager::shutdown_phase2`]（daemon 停止序在兩者之間
+    /// join RPC handler，P8 Task 12）。
     pub fn shutdown(&self, budget: Duration) -> Vec<(String, bool)> {
+        let drain = self.shutdown_phase1(Instant::now() + budget);
+        self.shutdown_phase2(drain)
+    }
+
+    /// 停止序步驟 3（P8 Task 12，arch §6.1）：隱含 `begin_shutdown`、取消 inflight attach，對每個需 drain 的 session
+    /// 送出 Shutdown（actor 內同步執行 Phase 1：fence 凍結、取消進行中的檔案傳輸、排隊命令 `FLUSHED_BY_SHUTDOWN`），
+    /// 再以同一 control lane 的查詢作屏障，返回時 Phase 1 已在每個仍存活的 actor 執行過。等待回條屬 Phase 2。
+    pub fn shutdown_phase1(&self, deadline: Instant) -> ShutdownDrain {
         self.begin_shutdown();
-        let deadline = Instant::now() + budget;
         let (entries, inflight): (Vec<(String, Arc<ActorHandle>)>, Vec<String>) = {
             let inner = lock(&self.shared.inner);
             for op in inner.inflight.values() {
@@ -3358,6 +3375,7 @@ impl SessionManager {
             )
         };
         let mut waits: Vec<(String, Option<Receiver<Result<PyDict, PyErr>>>)> = Vec::new();
+        let mut barriers: Vec<Arc<ActorHandle>> = Vec::new();
         for (sid, actor) in entries {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let state = actor
@@ -3373,8 +3391,30 @@ impl SessionManager {
                 .control
                 .send_timeout(ControlEvent::Shutdown { reply }, remaining)
                 .is_ok();
+            if sent {
+                barriers.push(actor.clone());
+            }
             waits.push((sid, sent.then_some(rx)));
         }
+        // Phase 1 屏障：Shutdown 與查詢同走 control lane（FIFO），查詢有回應（或 actor 已結束）即表示 Phase 1 已執行。
+        for actor in barriers {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = actor.request(SessionRequest::GetState, remaining.min(QUERY_TIMEOUT));
+        }
+        ShutdownDrain {
+            deadline,
+            waits,
+            inflight,
+        }
+    }
+
+    /// 停止序步驟 5（P8 Task 12）：在 Phase 1 的同一期限內等待每個 drain 目標的回條；回傳是否收斂。
+    pub fn shutdown_phase2(&self, drain: ShutdownDrain) -> Vec<(String, bool)> {
+        let ShutdownDrain {
+            deadline,
+            waits,
+            inflight,
+        } = drain;
         let mut out = Vec::new();
         for (sid, rx) in waits {
             let drained = rx.is_some_and(|rx| {
@@ -3401,6 +3441,13 @@ impl SessionManager {
             out.push((format!("attach:{by_id}"), drained));
         }
         out
+    }
+
+    /// 目前全部 session 的 id（排序；不查詢 actor，停機收尾時 actor 可能已結束）。
+    pub fn session_ids(&self) -> Vec<String> {
+        let mut sids: Vec<String> = lock(&self.shared.inner).sessions.keys().cloned().collect();
+        sids.sort();
+        sids
     }
 
     /// 只供測試（test-fakes）：session 的 fence `wal_unhealthy`（`None`＝查無 session）。

@@ -8,8 +8,9 @@
 //!   初始掃描 → rank → update → bootstrap attach → watcher 啟動（DF-14）→ `/dev/ttyMCU` 端點（P8 Task 10；失敗 exit 1）→
 //!   RPC bind → 寫 `config.yaml` 的 `socket_path`（SC-09，非致命）。端點以 RAII（`FlashGuard`）持有，任何退出路徑都在
 //!   釋放實例鎖之前 unlink。
-//! - 有序關機（SC-11）：停 server（等進行中的 handler）→ stopping gate → 停 watcher → drain 全部 session
-//!   （含在途 attach，排隊命令 `FLUSHED_BY_SHUTDOWN`）→ WAL flush＋sync＋close → 釋放鎖；未收斂回 exit 1 並寫診斷。
+//! - 有序關機（SC-11，P8 Task 12 停止序 1～7）：停 accept（不等 handler）→ stopping gate → 停 watcher → 關事件
+//!   intake → 停 `/dev/ttyMCU` 端點 → drain Phase 1（取消長 RPC）→ join handler → Phase 2 回條＋`FLUSHED_BY_SHUTDOWN`
+//!   收尾 → event handler 收斂 → WAL flush＋sync＋close → 釋放鎖；任一步未收斂不跳過後續步驟，累積後 exit 1 並寫一行診斷。
 //! - exit code：0（正常停機、`-h`）、1（未攔截 panic、停機未收斂、環境錯誤）、2（argv 錯誤、allowlist 拒絕、鎖衝突）、
 //!   3（既有 `state.json` 讀取失敗）。
 
@@ -38,7 +39,7 @@ use sw_proto::pyfmt::py_repr_str;
 use sw_proto::pypath::{self, HomeLookup, PathFlavor};
 use sw_proto::runtime_paths::{resolve_daemon_dirs, DaemonDirs, EnvSnapshot, NativeTraits, PathsError, RuntimePaths};
 
-use crate::framing::RpcServer;
+use crate::framing::{RpcHandler, RpcServer};
 use crate::service::{FlashState, Service, ServiceDeps, ServiceHandler};
 
 pub use crate::service::TestAllowlist;
@@ -57,13 +58,10 @@ const INVALID_CONFIG_REASON: &str = "invalid windows.test_device_allowlist";
 const ENV_TEST_KILL_AFTER_SAVE: &str = "SERIALWRAP_TEST_KILL_AFTER_SAVE";
 /// Stage 0 測試鉤子（#4）：release 持久化 commit 前的暫停目錄。
 const ENV_TEST_PAUSE_BEFORE_RELEASE_SAVE: &str = "SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE";
-/// RPC server 停止時等待進行中 handler 的上限（SC-11 ①）。Python `server.stop()`（`wait_closed`）無上限地等
-/// handler 收斂；Rust 以上限換取 SC-11 的 exit 1 診斷，但上限須涵蓋最長的有界 handler：READY 路徑的
-/// `session.recover --force`＝救援鍵（`\x03`／`\x04` 各等 prompt，約 4 s）→ `_force_recover`（clear drain ≤3 s＋
-/// 10 × 1 s 等 READY）≈ 17 s（審查 F87 Python 實測：登入型 DUT 不回 READY 時 handler 約 14 s 才回
-/// FORCE_RECOVER_TIMEOUT，Python exit 0；舊值 10 s 使 Rust exit 1）。
-const SERVER_STOP_BUDGET: Duration = Duration::from_secs(20);
-/// drain 全部 session 的共用期限（Python `shutdown_drain(total_timeout_s=5.0)`）。
+/// 停止序步驟 3～5（含 4 的 handler join）與 5a 共用的期限（SC-11／arch §6.1；Python
+/// `shutdown_drain(total_timeout_s=5.0)`）。P8 Task 12 起 handler join 移到 drain Phase 1 之後：長 RPC（file 傳輸、
+/// force recover 的等待等）先被 Phase 1 取消，join 只等它們寫完回應，不再沿用 P5 時「先等 handler 自然結束」的
+/// 20 s 上限（F100 勘誤針對的舊順序）。
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 /// Python `EngineDeps` 預設（`engine.py`）：matcher 佇列上限與 per-daemon handler 上限。
 const ENGINE_QUEUE_MAX: usize = 1024;
@@ -911,7 +909,13 @@ enum Stage {
     ServerStopAccept,
     ShutdownGate,
     WatcherStopped,
+    EngineIntakeClosed,
+    FlashStopped { joined: bool, unlinked: bool },
+    DrainPhase1,
+    HandlersJoined { pending: Vec<String> },
+    DrainPhase2 { stalled: Vec<String> },
     SessionsDrained { flushed: Vec<(String, String)>, stalled: Vec<String> },
+    EngineStopped { unreaped: Vec<String> },
     WalShutdown { ok: bool },
     LockReleased,
 }
@@ -924,6 +928,24 @@ struct Hooks {
     before_release_commit: Option<Hook>,
     after_release_commit: Option<Hook>,
     trace: Option<Box<dyn Fn(Stage) + Send + Sync>>,
+    /// 每筆 RPC 分派前以 method 名呼叫（test-fakes `DaemonHooks::rpc_call`）。
+    rpc_call: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+/// `Hooks::rpc_call` 的分派包裝：先呼叫掛鉤再交給實際 handler（產品 build 不建立）。
+struct HookedHandler {
+    inner: Arc<dyn RpcHandler>,
+    hook: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl RpcHandler for HookedHandler {
+    fn call(&self, method: &str, params: &sw_proto::pyjson::PyDict) -> Result<sw_proto::pyjson::PyDict, sw_proto::pycompat::PyErr> {
+        (self.hook)(method);
+        self.inner.call(method, params)
+    }
+    fn request_stop(&self) {
+        self.inner.request_stop();
+    }
 }
 
 impl Hooks {
@@ -941,8 +963,9 @@ impl IoWaker for NoWake {
     fn wake(&self) {}
 }
 
-/// P8 Task 10：`/dev/ttyMCU` 端點的 RAII 保底。drop（RPC 綁定失敗、停止序尾端、panic unwind）時取出端點，由
-/// `FlashEndpoint::drop` 設停止旗標並 unlink（不等 thread）。有序的 `FlashEndpoint::stop`（join、`incomplete`）屬 Task 12。
+/// P8 Task 10：`/dev/ttyMCU` 端點的 RAII 保底。drop（RPC 綁定失敗、panic unwind）時取出端點，由
+/// `FlashEndpoint::drop` 設停止旗標並 unlink（不等 thread）。正常停止序在步驟 2 先取出端點並有序 `FlashEndpoint::stop`
+/// （join 2.0 s、未收斂列入 `incomplete`，P8 Task 12），之後 drop 本 guard 不再有事可做。
 ///
 /// unlink 只看路徑：必須在釋放實例鎖之前 drop，否則可能刪到下一個 daemon 剛建立的同路徑 link（Python 亦於
 /// `service.stop()` 內、`lock.release()` 之前 `_flash_endpoint.stop()`）。panic unwind 依宣告反序，本 guard 先於鎖釋放。
@@ -1241,28 +1264,71 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         }
     };
     let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
-    let server = RpcServer::start(listener, Arc::new(ServiceHandler::new(svc.clone(), stop_tx)));
+    let service_handler: Arc<dyn RpcHandler> = Arc::new(ServiceHandler::new(svc.clone(), stop_tx));
+    let handler: Arc<dyn RpcHandler> = match &hooks.rpc_call {
+        Some(hook) => Arc::new(HookedHandler {
+            inner: service_handler,
+            hook: hook.clone(),
+        }),
+        None => service_handler,
+    };
+    let server = RpcServer::start(listener, handler);
     hooks.trace(Stage::Bound);
     write_endpoint(&env, &paths, &p, &args.socket);
     hooks.trace(Stage::EndpointWritten);
 
+    // 只等第一次停止要求；之後的 SIGTERM／SIGINT 由 PAL 只記 log（P8 Task 12），`daemon.stop` 已無 listener 可達。
     p.signals.wait_stop(stop_rx);
 
+    // P8 Task 12 停止序（arch §6.1 的 1～7）：任一步逾時或失敗都不跳過後續步驟，只累積到 `incomplete`。
     let mut incomplete: Vec<String> = Vec::new();
     svc.set_running(false);
-    if !server.stop(SERVER_STOP_BUDGET) {
-        incomplete.push("rpc handlers did not converge".to_string()); // SC-11 ① 停 server（等進行中的 handler 回應）
-    }
+    server.stop_accept(); // 1 只停 accept，不等進行中的 handler（避免 600 s file.push 卡死停止序）
     hooks.trace(Stage::ServerStopAccept);
-    manager.begin_shutdown(); // ①b stopping gate（R1-F2）：之後熱插／bootstrap／recover 不再 open
+    manager.begin_shutdown(); // 1a stopping gate（R1-F2）：之後熱插／bootstrap／recover／SC-32 延後 reconcile 不再 open
     hooks.trace(Stage::ShutdownGate);
-    watcher.stop(); // ② 停 watcher（drain 前，避免 drain 中觸發 attach）
+    watcher.stop(); // 1b 停 watcher；channel 殘留的 Delta 由 1a gate 丟棄
     hooks.trace(Stage::WatcherStopped);
-    // ②b 停止受理事件（R1-F2）：matcher 停、dispatcher 不再 spawn；已在跑的 handler 與 drain 並行。
-    engine.close_intake();
-    let drain_deadline = std::time::Instant::now() + DRAIN_BUDGET;
+    engine.close_intake(); // 1c 停止受理事件：matcher 停、dispatcher 不再 spawn；已在跑的 handler 與 3～5 並行
+    hooks.trace(Stage::EngineIntakeClosed);
+    // 2 `/dev/ttyMCU` 端點：設 EndpointShutdown＋喚醒本次 FlashRunCancel，join 2.0 s，unlink（drain 之前，避免 pump
+    // 與 drain 同時持有 fence）。無端點（Windows／caps.flash_endpoint=false）視為已收斂。
+    let receipt = flash.0.take_endpoint().map(FlashEndpoint::stop);
+    let (flash_joined, flash_unlinked) = receipt.as_ref().map_or((true, true), |r| (r.joined, r.unlinked));
+    hooks.trace(Stage::FlashStopped {
+        joined: flash_joined,
+        unlinked: flash_unlinked,
+    });
+    if let Some(r) = receipt.filter(|r| !r.joined || !r.unlinked) {
+        incomplete.push(format!("flash endpoint stop incomplete: {}", r.stalled_threads.join(",")));
+    }
+    // 3 所有 session Phase 1（fence 凍結、RunCancel、取消進行中的檔案傳輸、排隊命令 FLUSHED_BY_SHUTDOWN）。
+    // 步驟 3～5 與 5a 共用同一個 5 s 期限。
+    let drain_deadline = Instant::now() + DRAIN_BUDGET;
     let before: HashMap<String, Option<String>> = registry.error_codes().into_iter().collect();
-    let drained = manager.shutdown(DRAIN_BUDGET); // ③ drain 全部 session（含在途 attach）、FLUSHED_BY_SHUTDOWN
+    let drain = manager.shutdown_phase1(drain_deadline);
+    hooks.trace(Stage::DrainPhase1);
+    // 4 join handler（剩餘預算）：被取消的 handler 寫完回應後結束；逾時者列出 method，不再等待。
+    let pending = server.join_handlers(drain_deadline);
+    hooks.trace(Stage::HandlersJoined {
+        pending: pending.clone(),
+    });
+    if !pending.is_empty() {
+        eprintln!("serialwrapd: 停止時 RPC handler 未收斂，不再等待：{}", pending.join(","));
+        incomplete.push(format!("rpc handlers did not converge: {}", pending.join(",")));
+    }
+    // 5 Phase 2 回條（含在途 attach）。
+    let drained = manager.shutdown_phase2(drain);
+    let stalled: Vec<String> = drained.iter().filter(|(_, ok)| !ok).map(|(s, _)| s.clone()).collect();
+    hooks.trace(Stage::DrainPhase2 {
+        stalled: stalled.clone(),
+    });
+    // 5 收尾：Python `service.stop()` 於 drain 後對每個 session `unregister_session(sid, "FLUSHED_BY_SHUTDOWN")`，
+    // 終結 Phase 1 之後才登錄、仍為 accepted 的命令。
+    let now_iso = manager.now_iso();
+    for sid in manager.session_ids() {
+        registry.flush_session(&sid, "FLUSHED_BY_SHUTDOWN", &now_iso);
+    }
     let flushed: Vec<(String, String)> = registry
         .error_codes()
         .into_iter()
@@ -1272,7 +1338,6 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
             (code == "FLUSHED_BY_SHUTDOWN" && newly).then_some((cmd_id, code))
         })
         .collect();
-    let stalled: Vec<String> = drained.iter().filter(|(_, ok)| !ok).map(|(s, _)| s.clone()).collect();
     hooks.trace(Stage::SessionsDrained {
         flushed,
         stalled: stalled.clone(),
@@ -1285,21 +1350,24 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
         );
         incomplete.push(format!("drain stalled: {}", stalled.join(",")));
     }
-    // ③b event handler 收尾（SC-11 細化）：與 drain 共用 5 s 期限，逾時終止整個 process group／Job。
+    // 5a event handler 收斂：與 3～5 共用期限，逾時終止整個 process group／Job；必在 WAL close 前返回。
     let report = engine.stop(drain_deadline);
+    hooks.trace(Stage::EngineStopped {
+        unreaped: report.unreaped.clone(),
+    });
     if !report.unreaped.is_empty() {
         incomplete.push(format!(
             "event handlers not reaped: {}",
             report.unreaped.join(",")
         ));
     }
-    let wal_result = wal.shutdown(); // ④ WAL flush＋sync＋close
+    let wal_result = wal.shutdown(); // 6 WAL flush＋sync＋close
     hooks.trace(Stage::WalShutdown { ok: wal_result.is_ok() });
     if let Err(e) = wal_result {
         incomplete.push(format!("WAL sync failed: {}", e.py_message));
     }
-    drop(flash); // RAII 保底：釋放實例鎖之前移除端點 link（有序的 FlashEndpoint::stop 屬 Task 12）
-    lock.release(); // ⑤
+    drop(flash); // 端點已於步驟 2 取出；guard 只剩 RAII 保底，須先於釋放實例鎖
+    lock.release(); // 7
     hooks.trace(Stage::LockReleased);
     if incomplete.is_empty() {
         0
@@ -1426,7 +1494,13 @@ impl From<Stage> for TraceEvent {
             Stage::ServerStopAccept => TraceEvent::ServerStopAccept,
             Stage::ShutdownGate => TraceEvent::ShutdownGate,
             Stage::WatcherStopped => TraceEvent::WatcherStopped,
+            Stage::EngineIntakeClosed => TraceEvent::EngineIntakeClosed,
+            Stage::FlashStopped { joined, unlinked } => TraceEvent::FlashStopped { joined, unlinked },
+            Stage::DrainPhase1 => TraceEvent::DrainPhase1,
+            Stage::HandlersJoined { pending } => TraceEvent::HandlersJoined { pending },
+            Stage::DrainPhase2 { stalled } => TraceEvent::DrainPhase2 { stalled },
             Stage::SessionsDrained { flushed, stalled } => TraceEvent::SessionsDrained { flushed, stalled },
+            Stage::EngineStopped { unreaped } => TraceEvent::EngineStopped { unreaped },
             Stage::WalShutdown { ok } => TraceEvent::WalShutdown { ok },
             Stage::LockReleased => TraceEvent::LockReleased,
         }
@@ -1459,15 +1533,142 @@ pub fn run_with_hooks(argv: Vec<String>, platform: Platform, hooks: DaemonHooks)
         before_state_commit,
         after_state_commit,
         trace,
-        block_flash_endpoint_stop: _,
-        rpc_call: _,
+        block_flash_endpoint_stop,
+        rpc_call,
     } = hooks;
+    let mut platform = platform;
+    if block_flash_endpoint_stop {
+        platform.console = Arc::new(stall::StallConsole(platform.console.clone()));
+    }
     let inner = Hooks {
         before_release_commit: before_state_commit.map(Arc::from),
         after_release_commit: after_state_commit.map(Arc::from),
         trace: trace.map(|t| -> Box<dyn Fn(Stage) + Send + Sync> { Box::new(move |s| t(TraceEvent::from(s))) }),
+        rpc_call: rpc_call.map(Arc::from),
     };
     run_guarded(argv, platform, inner)
+}
+
+/// `DaemonHooks::block_flash_endpoint_stop` 的 console 包裝（僅 test-fakes）：`create_pty` 產生的 master 在
+/// `EndpointShutdown` 喚醒後仍再阻塞 [`stall::STALL_AFTER_WAKE`] 才返回，使 `FlashEndpoint::stop` 的 2.0 s join 逾時
+/// （端點 thread 隨後自行結束，不外洩）。其餘行為全部委派。
+#[cfg(feature = "test-fakes")]
+mod stall {
+    use std::collections::HashSet;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use sw_pal::console_mux::{ConsoleMux, MuxHandle};
+    use sw_pal::console_pty::{
+        ConsoleIo, ConsoleListener, ConsoleTransportFactory, ConsoleWriteHalf, PtyPair, PtySlaveRef, Readiness,
+        TermSpeed,
+    };
+    use sw_pal::traits::{IoWaker, PalResult, ReadOutcome};
+    use sw_pal::ConsoleKind;
+
+    /// 喚醒後的額外阻塞（> `ENDPOINT_JOIN` 2.0 s）。
+    pub(super) const STALL_AFTER_WAKE: Duration = Duration::from_millis(3_000);
+
+    pub(super) struct StallConsole(pub(super) Arc<dyn ConsoleTransportFactory>);
+
+    impl ConsoleTransportFactory for StallConsole {
+        fn kind(&self) -> ConsoleKind {
+            self.0.kind()
+        }
+        fn create_pty(&self) -> PalResult<PtyPair> {
+            let mut pair = self.0.create_pty()?;
+            let woken = Arc::new(Mutex::new(None));
+            pair.master = Box::new(StallMaster {
+                inner: pair.master,
+                woken: woken.clone(),
+                waker: Arc::new(StallWaker(woken)),
+            });
+            Ok(pair)
+        }
+        fn bind_tcp_console(&self) -> PalResult<Box<dyn ConsoleListener>> {
+            self.0.bind_tcp_console()
+        }
+        fn open_com0com_console(&self, port: &str) -> PalResult<Box<dyn ConsoleIo>> {
+            self.0.open_com0com_console(port)
+        }
+        fn held_slave_paths(&self) -> Option<HashSet<String>> {
+            self.0.held_slave_paths()
+        }
+        fn new_mux(&self) -> PalResult<Box<dyn ConsoleMux>> {
+            self.0.new_mux()
+        }
+        fn slave_path_exists(&self, path: &str) -> bool {
+            self.0.slave_path_exists(path)
+        }
+        fn link(&self, slave_path: &str, link: &Path) -> PalResult<()> {
+            self.0.link(slave_path, link)
+        }
+        fn unlink(&self, link: &Path) -> PalResult<()> {
+            self.0.unlink(link)
+        }
+        fn tty_setraw(&self, slave: &PtySlaveRef) -> PalResult<()> {
+            self.0.tty_setraw(slave)
+        }
+        fn tcgetattr_speed(&self, slave: &PtySlaveRef) -> PalResult<TermSpeed> {
+            self.0.tcgetattr_speed(slave)
+        }
+    }
+
+    struct StallWaker(Arc<Mutex<Option<Instant>>>);
+
+    impl IoWaker for StallWaker {
+        fn wake(&self) {
+            let mut at = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if at.is_none() {
+                *at = Some(Instant::now());
+            }
+        }
+    }
+
+    struct StallMaster {
+        inner: Box<dyn ConsoleIo>,
+        woken: Arc<Mutex<Option<Instant>>>,
+        waker: Arc<StallWaker>,
+    }
+
+    impl ConsoleIo for StallMaster {
+        fn read(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> PalResult<ReadOutcome> {
+            self.inner.read(buf, timeout)
+        }
+        fn try_write(&mut self, data: &[u8]) -> PalResult<usize> {
+            self.inner.try_write(data)
+        }
+        fn waker(&self) -> Arc<dyn IoWaker> {
+            self.waker.clone()
+        }
+        fn has_external_peer(&self, held: Option<&HashSet<String>>) -> bool {
+            self.inner.has_external_peer(held)
+        }
+        fn close(self: Box<Self>) {
+            self.inner.close()
+        }
+        fn mux_handle(&self) -> MuxHandle {
+            self.inner.mux_handle()
+        }
+        fn clone_writer(&self) -> PalResult<Box<dyn ConsoleWriteHalf>> {
+            self.inner.clone_writer()
+        }
+        /// 未喚醒前如常逾時（不回報可讀：測試期間沒有 flasher）；喚醒後忽略停止旗標，阻塞到喚醒時刻 + 3 s。
+        fn wait_readable(&mut self, timeout: Option<Duration>) -> PalResult<Readiness> {
+            let start = Instant::now();
+            loop {
+                let woken = *self.woken.lock().unwrap_or_else(|e| e.into_inner());
+                match woken {
+                    Some(at) if Instant::now() >= at + STALL_AFTER_WAKE => return Ok(Readiness::Woken),
+                    Some(_) => {}
+                    None if timeout.is_some_and(|t| start.elapsed() >= t) => return Ok(Readiness::TimedOut),
+                    None => {}
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

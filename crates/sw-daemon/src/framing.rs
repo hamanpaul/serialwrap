@@ -49,6 +49,8 @@ pub struct ConnStop {
     stopping: AtomicBool,
     in_handler: AtomicBool,
     stopped_at: Mutex<Option<Instant>>,
+    /// 目前 handler 處理中的 method（呼叫 handler 到回應寫出為止；`join_handlers` 逾時回報用，P8 Task 12）。
+    method: Mutex<Option<String>>,
 }
 
 impl ConnStop {
@@ -58,6 +60,7 @@ impl ConnStop {
             stopping: AtomicBool::new(false),
             in_handler: AtomicBool::new(false),
             stopped_at: Mutex::new(None),
+            method: Mutex::new(None),
         }
     }
 
@@ -90,6 +93,15 @@ impl ConnStop {
     /// 本連線目前是否正在處理一筆請求（handler 呼叫到回應寫出為止）。
     pub fn in_handler(&self) -> bool {
         self.in_handler.load(Ordering::SeqCst)
+    }
+
+    /// 目前 handler 處理中的 method（無則 `None`）。
+    pub fn current_method(&self) -> Option<String> {
+        self.method.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_method(&self, method: Option<&str>) {
+        *self.method.lock().unwrap_or_else(|e| e.into_inner()) = method.map(str::to_string);
     }
 }
 
@@ -242,13 +254,16 @@ fn handle_line(
         Some(PyValue::Dict(p)) => p.clone(),
         _ => PyDict::new(),
     };
+    stop.set_method(Some(&method));
     let result = match catch_unwind(AssertUnwindSafe(|| handler.call(&method, &params))) {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => exception_result(e.message),
         Err(payload) => exception_result(panic_message(payload.as_ref())),
     };
     resp.update(&result);
-    if write_line(stream, &wire(&resp), stop) {
+    let written = write_line(stream, &wire(&resp), stop);
+    stop.set_method(None);
+    if written {
         LineOutcome::Continue
     } else {
         LineOutcome::Close
@@ -306,12 +321,14 @@ pub fn serve_connection(mut stream: Box<dyn RpcServerStream>, handler: &dyn RpcH
 struct ConnEntry {
     handle: JoinHandle<()>,
     stop: Arc<ConnStop>,
+    /// accept 順序（`join_handlers` 回報依此排序；`reap` 的 swap_remove 會打亂 Vec 順序）。
+    seq: u64,
 }
 
 /// RPC acceptor（連線上限 128；每連線 thread 與停止旗標）。
 pub struct RpcServer {
     stopping: Arc<AtomicBool>,
-    acceptor: Option<JoinHandle<()>>,
+    acceptor: Mutex<Option<JoinHandle<()>>>,
     conns: Arc<Mutex<Vec<ConnEntry>>>,
 }
 
@@ -340,6 +357,7 @@ impl RpcServer {
                 .name("rpc-acceptor".into())
                 .spawn(move || {
                     let mut listener = listener;
+                    let mut seq: u64 = 0;
                     while !stopping.load(Ordering::SeqCst) {
                         reap(&conns);
                         if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -374,11 +392,12 @@ impl RpcServer {
                                 let _release = Release(thread_active);
                                 serve_connection(stream, &*handler, &thread_stop);
                             });
+                        seq += 1;
                         match spawned {
                             Ok(handle) => conns
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .push(ConnEntry { handle, stop }),
+                                .push(ConnEntry { handle, stop, seq }),
                             Err(_) => {
                                 active.fetch_sub(1, Ordering::SeqCst);
                             }
@@ -391,37 +410,31 @@ impl RpcServer {
         };
         RpcServer {
             stopping,
-            acceptor: Some(acceptor),
+            acceptor: Mutex::new(Some(acceptor)),
             conns,
         }
     }
 
-    /// P8 Task 12 停止序步驟 1：停 accept 並 close listener、對全部連線設停止旗標；不等進行中的 handler。
+    /// P8 Task 12 停止序步驟 1（arch §6.2 停止流程 ①②）：停 accept 並 close listener、對全部連線設停止旗標；
+    /// **不等**進行中的 handler（閒置／半行的讀迴圈 100 ms 內醒來結束；handler 內的連線寫完該筆回應後結束）。冪等。
     pub fn stop_accept(&self) {
-        todo!("P8-T12")
-    }
-
-    /// P8 Task 12 停止序步驟 4：在 `deadline` 前 join 全部連線 thread；逾時回仍在 handler 內的 method 清單。
-    pub fn join_handlers(self, _deadline: Instant) -> Vec<String> {
-        todo!("P8-T12")
-    }
-
-    /// 回傳 handler 是否全部收斂（arch §6.2 停止流程 ①～④）。
-    ///
-    /// ① 停 accept 並 close listener；② 對全部連線設停止旗標（讀逾時 100 ms 讓閒置／半行的讀迴圈醒來即結束）；
-    /// ③ handler 內的連線把該筆回應寫完後結束（寫出總期限為停止時刻 + 2 s，逾時放棄；PAL 只設短輪詢 send 逾時）；④ 在 `budget` 內 join 全部連線 thread。
-    /// 逾 `budget` 仍未結束的 thread 不再等待（detach），回傳 `false`。
-    pub fn stop(mut self, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
         self.stopping.store(true, Ordering::SeqCst);
-        if let Some(acceptor) = self.acceptor.take() {
+        let acceptor = self.acceptor.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(acceptor) = acceptor {
             let _ = acceptor.join();
         }
-        let entries: Vec<ConnEntry> = std::mem::take(&mut *self.conns.lock().unwrap_or_else(|e| e.into_inner()));
-        for entry in &entries {
+        // acceptor 已結束：之後不會再有新連線加入清單。
+        for entry in self.conns.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             entry.stop.request();
         }
-        let mut remaining = entries;
+    }
+
+    /// P8 Task 12 停止序步驟 4（arch §6.2 停止流程 ③④）：以 `deadline` 為上限 join 全部連線 thread（隱含
+    /// `stop_accept`）。全部結束回空清單；逾時仍未結束者不再等待（detach），依 accept 順序回傳其 method（不在 handler
+    /// 內者記 `<connection>`）。handler 內的回應寫出期限仍為停止時刻 + [`STOP_WRITE_BUDGET`]。
+    pub fn join_handlers(self, deadline: Instant) -> Vec<String> {
+        self.stop_accept();
+        let mut remaining: Vec<ConnEntry> = std::mem::take(&mut *self.conns.lock().unwrap_or_else(|e| e.into_inner()));
         loop {
             let mut still = Vec::new();
             for entry in remaining {
@@ -433,26 +446,31 @@ impl RpcServer {
             }
             remaining = still;
             if remaining.is_empty() {
-                return true;
+                return Vec::new();
             }
             if Instant::now() >= deadline {
-                return false;
+                remaining.sort_by_key(|e| e.seq);
+                return remaining
+                    .iter()
+                    .map(|e| e.stop.current_method().unwrap_or_else(|| "<connection>".to_string()))
+                    .collect();
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// `stop_accept` 後在 `budget` 內 `join_handlers`；回傳 handler 是否全部收斂（P5 介面，供不需區分步驟的呼叫端）。
+    pub fn stop(self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        self.stop_accept();
+        self.join_handlers(deadline).is_empty()
     }
 }
 
 impl Drop for RpcServer {
     fn drop(&mut self) {
-        // 未呼叫 stop 就被 drop：至少停掉 acceptor 並關閉 listener，避免 thread 外洩持有 socket。
-        self.stopping.store(true, Ordering::SeqCst);
-        if let Some(acceptor) = self.acceptor.take() {
-            let _ = acceptor.join();
-        }
-        for entry in self.conns.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            entry.stop.request();
-        }
+        // 未 join 就被 drop：至少停掉 acceptor 並關閉 listener，避免 thread 外洩持有 socket。
+        self.stop_accept();
     }
 }
 

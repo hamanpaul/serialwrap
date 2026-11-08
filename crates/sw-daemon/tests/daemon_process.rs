@@ -336,15 +336,21 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
     let (c2, c3) = client.join().expect("client thread");
     assert_eq!(code, 0);
 
-    // 停機序列：server → stopping gate → watcher → drain（排隊命令 FLUSHED_BY_SHUTDOWN）→ WAL sync → 釋放鎖。
+    // 停機序列（P8 Task 12 停止序 1～7）：stop_accept → stopping gate → watcher → event intake → ttyMCU 端點 →
+    // drain Phase 1 → join handler → Phase 2 → FLUSHED_BY_SHUTDOWN 收尾（排隊命令）→ engine.stop → WAL sync → 釋放鎖。
     let t = sink.lock().unwrap().clone();
-    let tail = t.len().saturating_sub(6);
+    let tail = t.len().saturating_sub(12);
     assert_eq!(
         t[tail..].to_vec(),
         vec![
             TraceEvent::ServerStopAccept,
             TraceEvent::ShutdownGate,
             TraceEvent::WatcherStopped,
+            TraceEvent::EngineIntakeClosed,
+            TraceEvent::FlashStopped { joined: true, unlinked: true },
+            TraceEvent::DrainPhase1,
+            TraceEvent::HandlersJoined { pending: vec![] },
+            TraceEvent::DrainPhase2 { stalled: vec![] },
             TraceEvent::SessionsDrained {
                 flushed: vec![
                     (c2, "FLUSHED_BY_SHUTDOWN".to_string()),
@@ -352,6 +358,7 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
                 ],
                 stalled: vec![],
             },
+            TraceEvent::EngineStopped { unreaped: vec![] },
             TraceEvent::WalShutdown { ok: true },
             TraceEvent::LockReleased,
         ]
@@ -643,6 +650,8 @@ fn daemon_stop_from_second_connection_during_force_recover() {
     // 2/2 PASS，stop→exit 約 8.2 s）。本 rig 的假 DUT 為登入型：`\x04` 登出後 reattach 停在 login，handler 依
     // Python `_force_recover` 10 × 1 s 逾時（約 14 s）才回 FORCE_RECOVER_TIMEOUT——上限以 SERVER_STOP_BUDGET（20 s）
     // ＋drain 計，不以計畫假設的「約 10 s」。
+    // P8 Task 12 起 Rust 停止序改為 drain Phase 1 先取消 handler 再 join（共用 5 s 期限），不再先等 handler 自然
+    // 結束；本案斷言（exit 0、不報 shutdown incomplete、≤ 25 s、WAL 完整、socket 移除）不變。
     let mut env = isolated_env_with_pty_target();
     let mut d = DaemonProc::spawn(&env, &[]);
     wait_ready(&env, "COM0");

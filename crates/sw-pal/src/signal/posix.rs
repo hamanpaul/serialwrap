@@ -54,18 +54,27 @@ impl SignalWait for PosixSignalWait {
 }
 
 fn wait_for_stop_signal(signals: libc::sigset_t, sender: Sender<()>) {
-    let mut received = 0;
-    let rc = unsafe { libc::sigwait(&signals, &mut received) };
-    if rc == 0 {
-        let _ = sender.send(());
-    }
+    let next = || {
+        let mut received = 0;
+        let rc = unsafe { libc::sigwait(&signals, &mut received) };
+        (rc == 0).then_some(received)
+    };
+    stop_signal_loop(next, &sender, &mut |line| eprintln!("{line}"));
 }
 
 /// 停止訊號迴圈（P8 Task 12）：第一次由 `next()` 取得的訊號送出停止通知；停止序進行中的後續訊號只以 `log`
 /// 記一行、不再通知（不改變停止步驟與結果）。`next()` 回 `None`（`sigwait` 失敗）即結束。
-#[allow(dead_code)]
-fn stop_signal_loop(_next: impl FnMut() -> Option<libc::c_int>, _sender: &Sender<()>, _log: &mut dyn FnMut(String)) {
-    todo!("P8-T12")
+fn stop_signal_loop(mut next: impl FnMut() -> Option<libc::c_int>, sender: &Sender<()>, log: &mut dyn FnMut(String)) {
+    let mut stopping = false;
+    while let Some(signal) = next() {
+        if stopping {
+            let name = if signal == libc::SIGINT { "SIGINT" } else { "SIGTERM" };
+            log(format!("serialwrapd: 停止序進行中，忽略重複的停止訊號 {name}"));
+            continue;
+        }
+        stopping = true;
+        let _ = sender.send(());
+    }
 }
 
 fn stop_signal_set() -> PalResult<libc::sigset_t> {

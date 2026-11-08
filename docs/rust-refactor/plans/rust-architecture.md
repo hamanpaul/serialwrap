@@ -1106,23 +1106,25 @@ SC-19 判定（步驟 1）讀取 config.yaml 時（P5-T19，parity #46／#47）�
 
 Stage 0 測試鉤子（P5-T19，parity #3／#4／#68）：產品 build 亦讀 `SERIALWRAP_TEST_KILL_AFTER_SAVE`／`SERIALWRAP_TEST_PAUSE_BEFORE_RELEASE_SAVE`，經 `SessionManager::set_persist_observer` 掛在 release 持久化 commit 前後；僅 SC-19 隔離判定通過時生效，非隔離實例只寫 `contracts/daemon_logging.yaml` 凍結的 WARNING。test-fakes 的 `DaemonHooks.{before,after}_state_commit` 掛在同一 release 持久化點（非每次 `StateStore` commit：啟動存檔也會 commit）。
 
-停止順序：
+停止順序（P8 Task 12；子步驟 1a～1c、5a 屬 1～7 範圍內）：
 
-1. server.stop（P8 起拆為 `stop_accept`，handler join 移到 Phase 1 之後）。
-   - 1a. `manager.begin_shutdown()`：stopping gate。之後熱插 Delta／Tick reattach、`RequestAttach`、bootstrap、bind／clear／recover／device.attach 重開一律不開 UART、不建 session 或 worker；已越過 gate 的在途 attach 納入第 2 步的 drain 集合（R1-F2）。
-   - 1b. `watcher.stop()`：送停止訊號並最多等待 2 s；thread 收斂則 join，逾時輸出 WARNING 並 detach；channel 殘留的 Delta 由 gate 丟棄（P1 順序：watcher 在 drain 前停止）。
-   - 1c. `engine.close_intake()`：matcher 停止、dispatcher 不再 spawn handler；已在跑的 handler 與 drain 並行（P7 起）。
-   - P8 起 flash endpoint stop 位於 1c 之後、第 2 步之前（P8 Task 12）。
-2. 所有 session 依 Phase 1／2 drain，總上限 5 s（`SC-11`）。
-3. 對所有 session `FLUSHED_BY_SHUTDOWN`。
-   - 3a. `engine.stop(第 2 步的共用期限)`：等仍在跑的 handler；逾時以 `HandlerSpawner` 終止整個 process group／Job，再最多 100 ms 回收；未回收者列入 `unreaped`。必在第 4 步前返回，handler 行程樹不得活過 WAL close 與 lock.release（P7 Task 15／16-wire、P8 Task 12）。
-4. WAL sync 並關閉。
-5. lock.release。
-6. 全部收斂 → exit 0；任一步未收斂（flash endpoint 未 join、RPC handler 逾時未結束、drain stalled、event handler 未回收、WAL sync 失敗）→ stderr `serialwrapd: shutdown incomplete: <原因以 "; " 串接>`，exit 1，不宣稱優雅停止。各步驟皆有界等待，失敗不阻擋後續步驟，只累積到最終 exit code（P5 Task 19、P8 Task 12；SC-11 細化，DF 候選；Python 基線此情境 exit code 不改，不屬 A/B 比較範圍）。
+1. `server.stop_accept()`：停 accept 並 close listener、對全部連線設停止旗標，**不等**進行中的 handler（避免 600 s 的 `file.push` 卡住停止序）；閒置／半行連線 100 ms 內結束，handler 內的連線寫完該筆回應後結束。
+   - 1a. `manager.begin_shutdown()`：stopping gate。之後熱插 Delta／Tick reattach、`RequestAttach`、bootstrap、bind／clear／recover／device.attach 重開一律不開 UART、不建 session 或 worker（RPC 路徑回 EXCEPTION `daemon stopping`）；已越過 gate 的在途 attach 納入第 3 步的 drain 集合；也擋住第 2 步 flash 結束時 SC-32 延後的 DeviceDetached reconcile 重開（R1-F2）。
+   - 1b. `watcher.stop()`：送停止訊號並最多等待 2 s；thread 收斂則 join，逾時輸出 WARNING 並 detach；channel 殘留的 Delta 由 1a gate 丟棄（gate 先於 watcher.stop，watcher 最後一輪送出的 Delta 也被擋下）。
+   - 1c. `engine.close_intake()`：matcher 停止、dispatcher 不再 spawn handler；已在跑的 handler 不中斷，與第 3～5 步並行（P7 Task 15；P1 Python 為 engine.stop → watcher.stop → drain，Rust 把 engine 拆成 1c 關 intake 與 5a 有界收斂，handler 與 drain 並行而不先耗盡 5 s）。
+2. `flash_endpoint.stop()`：設 `EndpointShutdown`（唯一設定點）並喚醒本次 `FlashRunCancel`，join 端點 thread 2.0 s（Python `FlashEndpoint.stop` 的 join 值），pump 結束送 `FlashHolderGone`，unlink `/dev/ttyMCU`。位於 drain 之前，避免 pump 與 drain 同時持有 fence。回條 `joined==false` 或 `unlinked==false` → `incomplete` 記 `flash endpoint stop incomplete: <stalled_threads 以 , 串接>`。無端點（Windows）視為收斂。
+3. 所有 session drain Phase 1（`SessionManager::shutdown_phase1`）：送 Shutdown（fence 凍結、RunCancel、取消進行中的檔案傳輸、排隊命令 `FLUSHED_BY_SHUTDOWN`），並以同一 control lane 的查詢作屏障，返回時 Phase 1 已在每個存活的 actor 執行過。第 3～5 步與 5a 共用 5 s 期限（`SC-11`）。
+4. `server.join_handlers(剩餘期限)`：被第 3 步取消的 handler 寫完回應後結束；期限到仍在執行者不再等待，依 accept 順序回傳其 method，stderr WARNING 並記 `rpc handlers did not converge: <methods 以 , 串接>`。P5 的「先等 handler 自然結束、上限 20 s」（F100 勘誤）屬舊順序，P8 起不再使用。
+5. Phase 2 回條（`SessionManager::shutdown_phase2`，TxWriter 先 flush 聚合 TX，P8 Task 5）；未回條的目標記 `drain stalled: <session_id 以 , 串接>`。回條後對每個 session 再以 `FLUSHED_BY_SHUTDOWN` 終結仍為 accepted 的命令（Python `unregister_session`）。
+   - 5a. `engine.stop(第 3 步的共用期限)`：等仍在跑的 handler；逾時以 `HandlerSpawner` 終止整個 process group／Job，再最多 100 ms 回收；未回收者記 `event handlers not reaped: <rule_id 以 , 串接>`。必在第 6 步前返回，handler 行程樹不得活過 WAL close 與 lock.release（P7 Task 15／16-wire、P8 Task 12）。
+6. WAL flush＋sync＋close；失敗記 `WAL sync failed: <py_message>`。
+7. lock.release；Unix socket 檔移除。全部收斂 → exit 0；否則 stderr 一行 `serialwrapd: shutdown incomplete: <incomplete 依停止序以 "; " 串接>`，exit 1，不宣稱優雅停止。各步驟皆有界等待，失敗不阻擋後續步驟（必走完 1～7），只累積到最終 exit code（P5 Task 19、P8 Task 12；SC-11 細化，DF 候選；Python 基線此情境 exit code 不改，不屬 A/B 比較範圍）。
+
+停止序進行中的第二次 SIGTERM／SIGINT 只寫一行 log（POSIX sigwait thread：`serialwrapd: 停止序進行中，忽略重複的停止訊號 <名稱>`），不改變上述步驟與結果。
 
 其他規定：
 
-- 未攔截的 panic：exit 1（P5-T19 panic 政策：`main.rs` 的 panic hook 只把 thread 名、位置與訊息寫 stderr，不 exit；各工作 thread 以 `catch_unwind` 隔離——RPC handler 轉 `EXCEPTION` 回應、actor 事件／RX chunk／watcher tick 記 WARNING；`daemon_main::run` 外層 `catch_unwind` 攔下主流程 panic 回 1）。停機未收斂亦 exit 1（見停止順序第 6 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。由 `daemon.handoff_stop` 觸發的停機同樣可能 exit 1；update／rollback／回退／復原／`supervision-mode set` 的 CLI 在交接前已 `hold_autostart`（§4.8、§10.2，R5-F1），因此不會在切換期間被監管器拉起；daemon 端不為交接改變 exit code。
+- 未攔截的 panic：exit 1（P5-T19 panic 政策：`main.rs` 的 panic hook 只把 thread 名、位置與訊息寫 stderr，不 exit；各工作 thread 以 `catch_unwind` 隔離——RPC handler 轉 `EXCEPTION` 回應、actor 事件／RX chunk／watcher tick 記 WARNING；`daemon_main::run` 外層 `catch_unwind` 攔下主流程 panic 回 1）。停機未收斂亦 exit 1（見停止順序第 7 步），讓 `Restart=on-failure`／Task Scheduler RestartOnFailure 能辨識異常停機。由 `daemon.handoff_stop` 觸發的停機同樣可能 exit 1；update／rollback／回退／復原／`supervision-mode set` 的 CLI 在交接前已 `hold_autostart`（§4.8、§10.2，R5-F1），因此不會在切換期間被監管器拉起；daemon 端不為交接改變 exit code。
 - logging 輸出到 stderr，格式 `%(message)s`，只輸出 WARNING 以上，訊息模板逐字照 10 §G-01（`GAP-G-01`）。
 - 無參數執行時，所有路徑都由 env 決定（regression ThrowawayDaemon 依賴此行為）。
 - 執行檔名固定為 `serialwrapd`，以符合 multi_open 的偵測規則。
