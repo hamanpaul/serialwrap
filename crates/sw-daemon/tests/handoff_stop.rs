@@ -352,6 +352,59 @@ fn handoff_busy_lease_and_recovering() {
     assert_eq!(sub.get("ok"), Some(&PyValue::Bool(true)), "recovering 解除後 submit 照常受理：{}", wire(&sub));
 }
 
+/// 審查 P8X-ee2b64c-1：`command.submit` 的 admission 在 selector 解析、session 狀態閘門與命令驗證之後、入列之前
+/// （Python `command.submit` 不在 `service._ADMISSION_METHODS`；ticket 於 `CommandArbiter.submit()` 的
+/// `CMD_CONTAINS_NEWLINE` 檢查之後取得，`sw_core/arbiter.py:230-233`）。交接或 shutdown 凍結期間，參數／狀態錯誤照
+/// Python 回原錯誤碼（不帶 `reason`），只有通過全部驗證者才回 `FLUSHED_BY_SHUTDOWN`＋`handoff_frozen`（形狀與其他
+/// 有副作用方法相同）；每次呼叫零 UART 寫入、WAL 無新紀錄、不留 ticket。
+#[test]
+fn frozen_submit_validation_errors_precede_admission() {
+    for freeze in ["handoff", "shutdown"] {
+        let r = ServiceRig::ready_shell();
+        if freeze == "handoff" {
+            assert_granted(&r.svc.handoff_stop(&reason("update")), "閒置交接");
+        } else {
+            r.svc.shutdown_freeze();
+        }
+        assert!(r.svc.admission().frozen(), "{freeze}：admission 已凍結");
+        let submit = |params: &str| {
+            let before = r.side_effect_fingerprint();
+            let resp = r.call("command.submit", params);
+            assert_eq!(r.side_effect_fingerprint(), before, "{freeze}：{params:.80} 不得有副作用");
+            assert_eq!(r.svc.admission().live_tickets(), 0, "{freeze}：{params:.80} 不得留下 ticket");
+            resp
+        };
+        let long = format!(r#"{{"selector":"COM0","command":"{}"}}"#, "x".repeat(16_385));
+        let cases = [
+            (r#"{"selector":"COM9","command":"echo 1"}"#, "SESSION_NOT_FOUND"),
+            (r#"{"command":"echo 1"}"#, "INVALID_ARGS"),
+            (r#"{"selector":"COM0","command":"echo 1","completion_regex":"("}"#, "INVALID_COMPLETION_REGEX"),
+            (r#"{"selector":"COM0","command":"echo 1","expect_reboot":"yes"}"#, "INVALID_EXPECT_REBOOT"),
+            (r#"{"selector":"COM0","command":"a\nb"}"#, "CMD_CONTAINS_NEWLINE"),
+            (long.as_str(), "CMD_TOO_LONG"),
+        ];
+        for (params, code) in cases {
+            let resp = submit(params);
+            assert_eq!(s(&resp, "error_code"), Some(code), "{freeze}：{params:.80}：{:.300}", wire(&resp));
+            assert!(resp.get("reason").is_none(), "{freeze}：{params:.80} 不得帶 handoff_frozen：{:.300}", wire(&resp));
+        }
+        for (state, code) in [
+            (SessionState::Recovering, "SESSION_RECOVERING"),
+            (SessionState::Flashing, "FLASHING_BUSY"),
+            (SessionState::Detached, "SESSION_NOT_READY"),
+        ] {
+            r.mgr.force_session_state("COM0", state);
+            let resp = submit(r#"{"selector":"COM0","command":"echo 1"}"#);
+            assert_eq!(s(&resp, "error_code"), Some(code), "{freeze}：{state:?}：{}", wire(&resp));
+            assert!(resp.get("reason").is_none(), "{freeze}：{state:?}：{}", wire(&resp));
+        }
+        r.mgr.force_session_state("COM0", SessionState::Ready);
+        let resp = submit(r#"{"selector":"COM0","command":"echo 1"}"#);
+        assert_eq!(keys(&resp), ["ok", "error_code", "reason", "version"], "{freeze}：{}", wire(&resp));
+        assert!(flushed_frozen(&resp), "{freeze}：{}", wire(&resp));
+    }
+}
+
 /// 預檢（session.list 閒置）之後才開始的 `file.push`：交接回 `SESSION_BUSY`（`ops:["file.push"]`），不凍結；push 完成且
 /// DUT 端檔案相符後，交接才成立。
 #[test]

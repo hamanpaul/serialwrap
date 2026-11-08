@@ -263,3 +263,140 @@ fn tickets_carry_kind_com_and_increasing_seq() {
     gate.done(b);
     assert_eq!(gate.live_tickets(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// 審查 P8X-ee2b64c-1：`command.submit` 的 admission 位於 `CommandRegistry::admit` 的命令驗證之後、入列之前
+// （Python `command.submit` 不在 `service._ADMISSION_METHODS`；ticket 於 `CommandArbiter.submit()` 的
+// `CMD_CONTAINS_NEWLINE` 檢查之後、`SESSION_NOT_READY`／`SESSION_QUEUE_FULL` 檢查之前取得，`sw_core/arbiter.py:230-233`）。
+// ---------------------------------------------------------------------------
+
+mod registry_admission {
+    use std::sync::Arc;
+
+    use sw_core::admission::{AdmissionGate, FreezeOutcome};
+    use sw_core::arbiter::{CmdOutcome, CommandRegistry, SubmitOrigin, SubmitReq};
+    use sw_proto::pydict;
+    use sw_proto::pyjson::{dumps_dict, PyDict, PyValue, RPC_WIRE};
+
+    const T: &str = "2026-11-08T03:06:17.663778+00:00";
+    const FROZEN: &str = "{\"ok\":false,\"error_code\":\"FLUSHED_BY_SHUTDOWN\",\"reason\":\"handoff_frozen\"}";
+
+    fn req(cmd: &str) -> SubmitReq {
+        SubmitReq {
+            session_id: "shell:COM0".into(),
+            command: cmd.into(),
+            source: "agent".into(),
+            mode: "line".into(),
+            timeout_s: 10.0,
+            priority: 10,
+            expected_duration_s: None,
+            completion_regex: None,
+            expect_reboot: false,
+            trusted_human: false,
+            origin: SubmitOrigin::Rpc,
+        }
+    }
+
+    fn code(e: &PyDict) -> Option<&str> {
+        e.get("error_code").and_then(PyValue::as_str)
+    }
+
+    fn with_gate(frozen: bool) -> (Arc<CommandRegistry>, Arc<AdmissionGate>) {
+        let gate = Arc::new(AdmissionGate::new());
+        if frozen {
+            gate.freeze();
+        }
+        let registry = CommandRegistry::new();
+        assert!(registry.set_admission(gate.clone()), "首次掛上 admission");
+        (registry, gate)
+    }
+
+    /// 凍結後：命令驗證錯誤（completion regex、expect_reboot、CMD_TOO_LONG、CMD_CONTAINS_NEWLINE）照 Python 先回；
+    /// 通過驗證者才回 `handoff_frozen`，且 admission 早於 `SESSION_NOT_READY`（queue 未註冊）判定；皆不建立紀錄、不留 ticket。
+    #[test]
+    fn frozen_submit_validation_precedes_admission() {
+        let (registry, gate) = with_gate(true);
+        let mut bad_regex = req("echo 1");
+        bad_regex.completion_regex = Some("(".into());
+        let mut reboot_interactive = req("echo 1");
+        reboot_interactive.expect_reboot = true;
+        reboot_interactive.mode = "interactive".into();
+        let cases = [
+            (bad_regex, true, "INVALID_COMPLETION_REGEX"),
+            (reboot_interactive, true, "EXPECT_REBOOT_MODE_UNSUPPORTED"),
+            (req(&"x".repeat(16_385)), true, "CMD_TOO_LONG"),
+            (req("a\nb"), true, "CMD_CONTAINS_NEWLINE"),
+        ];
+        for (i, (r, registered, expected)) in cases.into_iter().enumerate() {
+            let e = registry.admit(r, registered, format!("c{i}"), T).err().expect("凍結期間仍須拒絕");
+            assert_eq!(code(&e), Some(expected), "{}", dumps_dict(&e, &RPC_WIRE));
+            assert!(e.get("reason").is_none(), "驗證錯誤不得帶 handoff_frozen：{}", dumps_dict(&e, &RPC_WIRE));
+        }
+        for registered in [true, false] {
+            let e = registry
+                .admit(req("echo 1"), registered, format!("ok-{registered}"), T)
+                .err()
+                .expect("合法命令於凍結期間回 handoff_frozen");
+            assert_eq!(dumps_dict(&e, &RPC_WIRE), FROZEN, "queue_registered={registered}");
+        }
+        assert_eq!(registry.len(), 0, "被拒的 submit 不得建立命令紀錄");
+        assert_eq!(gate.live_tickets(), 0, "被拒的 submit 不得留下 ticket");
+    }
+
+    /// 受理的 RPC 命令持有 `command.submit` ticket（COM 取自 session_id 尾段）直到終態；終態後 `reconcile_admission`
+    /// 歸還，交接即可成立。
+    #[test]
+    fn rpc_submit_holds_ticket_until_terminal() {
+        let (registry, gate) = with_gate(false);
+        registry.admit(req("echo 1"), true, "c1".into(), T).expect("受理");
+        assert_eq!(gate.live_tickets(), 1);
+        let FreezeOutcome::Busy(busy) = gate.freeze_if_idle("update") else {
+            panic!("在途命令必忙碌");
+        };
+        assert_eq!(busy.by_com["COM0"].ops, vec!["command.submit".to_string()]);
+        registry.reconcile_admission();
+        assert_eq!(gate.live_tickets(), 1, "命令未終結前不得歸還 ticket");
+        registry.complete("c1", CmdOutcome::Result(pydict! { "ok" => true }), T);
+        registry.reconcile_admission();
+        assert_eq!(gate.live_tickets(), 0, "終態後歸還 ticket");
+        assert!(matches!(gate.freeze_if_idle("update"), FreezeOutcome::Frozen { created: true, .. }));
+    }
+
+    /// 取得 ticket 後的入列失敗（queue 未註冊、per-session 上限）立即歸還 ticket（Python `done(ticket)`）。
+    #[test]
+    fn rejected_after_admission_releases_ticket() {
+        let (registry, gate) = with_gate(false);
+        let e = registry.admit(req("echo 1"), false, "c1".into(), T).err().expect("queue 未註冊");
+        assert_eq!(code(&e), Some("SESSION_NOT_READY"));
+        assert_eq!(gate.live_tickets(), 0);
+        let mut accepted = 0usize;
+        let full = loop {
+            match registry.admit(req("echo 1"), true, format!("q{accepted}"), T) {
+                Ok(_) => accepted += 1,
+                Err(e) => break e,
+            }
+            assert!(accepted <= 10_000, "per-session pending 上限須有界");
+        };
+        assert_eq!(code(&full), Some("SESSION_QUEUE_FULL"));
+        assert_eq!(gate.live_tickets(), accepted, "只有受理的命令持有 ticket");
+    }
+
+    /// human console 行與 Python `admission_exempt=True` 對等：不取 ticket，凍結期間照常受理。
+    #[test]
+    fn human_console_submit_is_admission_exempt() {
+        let (registry, gate) = with_gate(true);
+        let mut line = req("ls");
+        line.source = "human:c1".into();
+        line.trusted_human = true;
+        line.origin = SubmitOrigin::HumanConsole { client_id: "c1".into() };
+        registry.admit(line, true, "h1".into(), T).expect("console 行不經 admission");
+        assert_eq!(gate.live_tickets(), 0);
+    }
+
+    /// 只可掛上一次（與 flash 協調器的 `set_admission` 同語意）。
+    #[test]
+    fn set_admission_only_once() {
+        let (registry, _gate) = with_gate(false);
+        assert!(!registry.set_admission(Arc::new(AdmissionGate::new())), "第二次掛上回 false");
+    }
+}

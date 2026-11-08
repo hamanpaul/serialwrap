@@ -502,6 +502,18 @@ impl CommandRegistry {
             .len()
     }
 
+    /// P8 Task 14（審查 P8X-ee2b64c-1）：掛上共同 admission 邊界（只可一次；回 `false` 表示已掛上）。掛上後 RPC 來源的
+    /// `admit` 於命令驗證之後、入列之前取得 `command.submit` ticket（Python `CommandArbiter.submit`）。
+    pub fn set_admission(&self, gate: Arc<crate::admission::AdmissionGate>) -> bool {
+        let _ = gate;
+        todo!("P8-T14")
+    }
+
+    /// P8 Task 14：歸還已到終態之命令的 `command.submit` ticket（Python `_finish_admission_locked`）。
+    pub fn reconcile_admission(&self) {
+        todo!("P8-T14")
+    }
+
     /// P8 Task 14：命令是否仍未到終態（未結束，或已取消但 worker 尚在執行）。紀錄已淘汰視為已終結。
     /// admission ticket 持有到此為 false（Python `CommandArbiter._finish_admission_locked` 的時點）。
     pub fn is_outstanding(&self, cmd_id: &str) -> bool {
