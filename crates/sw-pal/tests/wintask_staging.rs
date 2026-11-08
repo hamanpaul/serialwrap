@@ -229,8 +229,20 @@ fn runtime_test_only_uses_named_task_apis() {
     let first_check = runtime.find("checked(pid0").expect("首次啟動後必須先驗隔離");
     let kill = runtime.find("taskkill_force(").expect("必須強制終止以驗證失敗重啟");
     let second_check = runtime.find("checked(pid1").expect("重啟後必須再驗隔離");
-    let stop = runtime.rfind("graceful_stop_for_test(").expect("必須有序停止");
+    let stop = runtime.rfind("formal_service_stop(").expect("必須經正式 serialwrap service stop（P4 graceful_stop）有序停止");
     assert!(guard < install && install < first_check && first_check < kill && kill < second_check && second_check < stop);
+    // 停止序只能來自正式 sw-cli 路徑（harness 行程）；support 不得再有自行重寫的停止流程。
+    for (file, text) in [("wintask_runtime.rs", runtime), ("support/wintask.rs", support)] {
+        assert!(!text.contains("graceful_stop_for_test"), "{file} 不得自行實作停止序");
+        assert!(!text.contains("\"/End\""), "{file} 不得自行組 /End（只有正式路徑與收尾守衛的 /End）");
+    }
+    // harness 在 install 前就位（缺檔即證據不足，不建立工作）；WAL 證據在收尾確認之後才判定。
+    let harness = runtime.find("locate_harness(").expect("必須先找到正式停止路徑 harness");
+    assert!(harness < install, "harness 必須在 install 前確認存在");
+    let finish = runtime.find("guard.finish(").expect("必須確認收尾");
+    let wal = runtime.find("wal_evidence(").expect("必須以嚴格 WAL 證據判定");
+    assert!(stop < finish && finish < wal, "WAL 證據在有序停止與收尾確認之後");
+    assert!(!runtime.contains("wal_last_line_crc_ok("), "實跑不得用寬鬆判定");
 }
 
 #[test]
@@ -302,6 +314,115 @@ fn support_wal_tail_detects_torn_and_crc_mismatch() {
     assert!(!wal_last_line_crc_ok(dir.path()));
     std::fs::write(&wal, format!("{}\n", rec(3, b"ok", crc32(b"ok") ^ 1))).unwrap();
     assert!(matches!(wal_tail_state(dir.path()), WalTail::Torn(_)), "crc 不符必須判 Torn");
+}
+
+#[test]
+fn wal_without_records_is_insufficient_evidence() {
+    // 審查 P8X-e66ed8d-1：沒有 WAL 或 WAL 為空時沒有「最後一筆」可驗，不得判完整（證據不足，不得計為 PASS）。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal = dir.path().join("raw.wal.ndjson");
+    assert!(!wal_last_line_crc_ok(dir.path()), "沒有 raw.wal.ndjson 不得判最後一筆完整");
+    let absent = wal_evidence(dir.path()).expect_err("沒有 WAL 必須回證據不足");
+    assert!(absent.contains("證據不足"), "{absent}");
+    std::fs::write(&wal, b"").unwrap();
+    assert!(!wal_last_line_crc_ok(dir.path()), "空 WAL 不得判最後一筆完整");
+    let empty = wal_evidence(dir.path()).expect_err("空 WAL 必須回證據不足");
+    assert!(empty.contains("證據不足"), "{empty}");
+    let rec = |seq: u32, payload: &[u8], crc: u32| {
+        format!(r#"{{"seq":{seq},"payload_b64":"{}","crc32":"{crc:08x}"}}"#, b64(payload))
+    };
+    let good = format!("{}\n{}\n", rec(1, b"ls\n", crc32(b"ls\n")), rec(7, b"ok", crc32(b"ok")));
+    std::fs::write(&wal, &good).unwrap();
+    assert_eq!(wal_evidence(dir.path()), Ok((2, 7)));
+    assert!(wal_last_line_crc_ok(dir.path()));
+    std::fs::write(&wal, &good[..good.len() - 5]).unwrap();
+    let torn = wal_evidence(dir.path()).expect_err("截斷的最後一行必須失敗");
+    assert!(!torn.contains("證據不足"), "截斷是失敗、不是證據不足：{torn}");
+    assert!(!wal_last_line_crc_ok(dir.path()));
+}
+
+/// sw-cli `ScopedStopReport::to_json` 的實際輸出（`crates/sw-cli/tests/wintask_scoped_stop.rs` 以同一字串驗證產生端）。
+const REPORT_JSON: &str = r#"{"ran":[{"argv":["schtasks","/Change","/TN","sw-p8-test-4242","/DISABLE"],"rc":0},{"argv":["schtasks","/Change","/TN","sw-p8-test-4242","/ENABLE"],"rc":0}],"rc":0,"refused":[],"rpc":["health.status","daemon.stop","health.ping"],"stderr":"","stdout":"{\"action\":\"stop\",\"graceful\":true,\"mode\":\"windows-task\",\"ok\":true}\n"}"#;
+
+#[test]
+fn harness_output_parses_formal_stop_report() {
+    let r = parse_harness_output(&format!("{REPORT_JSON}\r\n")).expect("harness 輸出可解析");
+    assert_eq!(r.cli_rc, 0);
+    assert!(r.ok);
+    assert_eq!(r.graceful, Some(true));
+    assert!(r.sent_stop, "daemon.stop 已送出");
+    assert!(!r.ran_end, "正常結束時沒有 /End");
+    assert!(r.refused.is_empty());
+    let name = |v: &str| vec!["schtasks".to_string(), "/Change".into(), "/TN".into(), "sw-p8-test-4242".into(), v.into()];
+    assert_eq!(r.ran, vec![(name("/DISABLE"), 0), (name("/ENABLE"), 0)]);
+    assert_eq!(r.rpc, vec!["health.status".to_string(), "daemon.stop".into(), "health.ping".into()]);
+    assert_eq!(r.cli_stdout, "{\"action\":\"stop\",\"graceful\":true,\"mode\":\"windows-task\",\"ok\":true}\n");
+
+    // 執行了 /End、CLI 失敗、harness 拒絕過命令：逐項反映，不得被當成正常停止。
+    let hard = REPORT_JSON
+        .replace(r#""rc":0,"refused":[]"#, r#""rc":2,"refused":["sc.exe stop serialwrap"]"#)
+        .replace(r#"{"argv":["schtasks","/Change","/TN","sw-p8-test-4242","/ENABLE"],"rc":0}"#, r#"{"argv":["schtasks","/End","/TN","sw-p8-test-4242"],"rc":1}"#)
+        .replace(r#"\"graceful\":true"#, r#"\"graceful\":false"#)
+        .replace(r#"\"ok\":true"#, r#"\"ok\":false"#)
+        .replace(r#""daemon.stop","#, "");
+    let r = parse_harness_output(&hard).expect("harness 輸出可解析");
+    assert_eq!(r.cli_rc, 2);
+    assert!(!r.ok);
+    assert_eq!(r.graceful, Some(false));
+    assert!(r.ran_end);
+    assert!(!r.sent_stop);
+    assert_eq!(r.refused, vec!["sc.exe stop serialwrap".to_string()]);
+    // exit 0 但回應 ok:false 仍不是成功；ok:true 但 exit≠0 亦然。
+    let mixed = REPORT_JSON.replace(r#""rc":0,"refused""#, r#""rc":2,"refused""#);
+    assert!(!parse_harness_output(&mixed).unwrap().ok);
+    for bad in ["", "\r\n", "not json", r#"{"rc":0}"#, r#"{"ran":[],"rc":0,"refused":[],"rpc":[],"stderr":"","stdout":"not json"}"#] {
+        assert!(parse_harness_output(bad).is_err(), "不完整的 harness 輸出必須拒絕：{bad:?}");
+    }
+}
+
+#[test]
+fn harness_argv_scopes_cli_to_staging_and_test_port() {
+    let s = spec();
+    assert_eq!(s.render_cli_config(), CLI_CONFIG);
+    assert_eq!(CLI_CONFIG, "supervision_mode: windows-task\n", "正式 service stop 必須走 windows-task 分支");
+    assert!(under_root(&s.cli_config_path()), "{}", s.cli_config_path());
+    let cli_dir = s.cli_config_path().rsplit_once('\\').map(|(d, _)| d.to_string()).unwrap();
+    assert!(s.dirs().contains(&cli_dir), "CLI config 目錄必須事先建立：{cli_dir}");
+    assert_ne!(s.cli_config_path(), s.config_yaml(), "daemon 的 staging config 不變");
+
+    let harness = format!(r"{ROOT}\bin\{HARNESS_EXE}");
+    let argv = s.harness_argv(&harness, "sw-p8-test-4242");
+    assert_eq!(argv[..5], [harness.clone(), "--task".into(), "sw-p8-test-4242".into(), "--port".into(), PORT.to_string()]);
+    let rest = &argv[5..];
+    assert_eq!(rest.len() % 2, 0, "{rest:?}");
+    let vars: Vec<(String, String)> = rest
+        .chunks(2)
+        .map(|c| {
+            assert_eq!(c[0], "--var", "{rest:?}");
+            let (k, v) = c[1].split_once('=').expect("K=V");
+            (k.to_string(), v.to_string())
+        })
+        .collect();
+    assert_eq!(vars, s.harness_vars());
+    let get = |k: &str| vars.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    assert_eq!(get("SERIALWRAP_CONFIG"), Some(s.cli_config_path()));
+    for key in ["SERIALWRAP_CONFIG_DIR", "SERIALWRAP_STATE_DIR", "SERIALWRAP_RUN_DIR", "SERIALWRAP_WAL_DIR", "SERIALWRAP_LOG_DIR"] {
+        let v = get(key).unwrap_or_else(|| panic!("缺 {key}"));
+        assert!(under_root(&v), "{key}={v}");
+    }
+    for (k, v) in &vars {
+        assert!(k.starts_with("SERIALWRAP_"), "只傳 SERIALWRAP_* 給 harness：{k}");
+        assert!(under_root(v), "{k}={v} 必須落在 staging");
+        assert!(!v.contains("48700"), "{k}={v}");
+    }
+    for reserved in ["SERIALWRAP_TCP_PORT", "SERIALWRAP_SOCKET", "SERIALWRAP_TEST_DEVICE_ALLOWLIST"] {
+        assert_eq!(get(reserved), None, "{reserved} 不得由 support 指定");
+    }
+    for bad in ["serialwrap", "Serialwrap", "sw-p8-test-x"] {
+        let s = s.clone();
+        let h = harness.clone();
+        assert!(std::panic::catch_unwind(move || s.harness_argv(&h, bad)).is_err(), "{bad} 必須拒絕");
+    }
 }
 
 fn b64(data: &[u8]) -> String {

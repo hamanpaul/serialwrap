@@ -43,6 +43,11 @@ pub const SERIALCOMM_KEY: &str = r"HKLM\HARDWARE\DEVICEMAP\SERIALCOMM";
 pub const BATCH_CLEAR_LINE: &str = r#"for /f "delims==" %%V in ('set SERIALWRAP_ 2^>nul') do set "%%V=""#;
 /// staging 內 daemon 執行檔名稱（行程比對以完整路徑為準，不以映像名稱比對，避免碰到正式 daemon）。
 pub const DAEMON_EXE: &str = "serialwrapd.exe";
+/// 正式停止路徑 harness 執行檔（sw-cli `wintask_stop_harness`，`--features test-fakes`；由 `SW_WIN_EXTRA_FILES`
+/// 帶到實跑測試執行檔旁）。sw-pal 不得依賴 sw-cli（arch §1.3），故以獨立行程執行正式 `serialwrap service stop`。
+pub const HARNESS_EXE: &str = "wintask_stop_harness.exe";
+/// harness 的 CLI config：只讓正式 `service stop` 走 windows-task 監管分支（daemon 的 staging config 不變）。
+pub const CLI_CONFIG: &str = "supervision_mode: windows-task\n";
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -209,6 +214,23 @@ impl StagingSpec {
     }
     pub fn endpoint(&self) -> String {
         format!("tcp://127.0.0.1:{}", self.port)
+    }
+    /// harness（正式 `serialwrap service stop`）讀取的 CLI config（`SERIALWRAP_CONFIG`）。
+    pub fn cli_config_path(&self) -> String {
+        todo!("P8-T13: StagingSpec::cli_config_path")
+    }
+    /// CLI config 內容（[`CLI_CONFIG`]）。
+    pub fn render_cli_config(&self) -> String {
+        todo!("P8-T13: StagingSpec::render_cli_config")
+    }
+    /// harness 的 `--var`：daemon 的 staging 目錄（不含 daemon 專用的 allowlist）＋ `SERIALWRAP_CONFIG`；
+    /// 埠由 harness 依 `--port` 自行設定，不在此列。
+    pub fn harness_vars(&self) -> Vec<(String, String)> {
+        todo!("P8-T13: StagingSpec::harness_vars")
+    }
+    /// harness 命令列：`<harness> --task <task> --port <port> --var K=V …`（只允許測試工作名稱）。
+    pub fn harness_argv(&self, harness: &str, task: &str) -> Vec<String> {
+        todo!("P8-T13: StagingSpec::harness_argv {harness} {task}")
     }
 
     /// 批次檔設定的完整 env（清掉繼承的 `SERIALWRAP_*` 之後依序設定）。
@@ -984,6 +1006,44 @@ pub fn graceful_stop_for_test(
     report
 }
 
+/// harness（正式 `serialwrap service stop`）的結果。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FormalStopReport {
+    /// 正式 CLI 的 exit code。
+    pub cli_rc: i32,
+    pub cli_stdout: String,
+    pub cli_stderr: String,
+    /// CLI exit 0 且回應 `ok:true`。
+    pub ok: bool,
+    /// 回應的 `graceful`（缺欄位為 `None`）。
+    pub graceful: Option<bool>,
+    /// harness 實際執行的監管命令（改寫為測試工作後的 argv、rc）。
+    pub ran: Vec<(Vec<String>, i32)>,
+    /// harness 實際送出的 RPC 方法（依序）。
+    pub rpc: Vec<String>,
+    /// harness 拒絕的子行程或連線。
+    pub refused: Vec<String>,
+    /// 是否執行了 `/End`。
+    pub ran_end: bool,
+    /// `daemon.stop` 是否實際送出（連線成功後寫出請求）。
+    pub sent_stop: bool,
+}
+
+/// 解析 harness stdout 的最後一行 JSON（sw-cli `ScopedStopReport::to_json`）。
+pub fn parse_harness_output(stdout: &str) -> Result<FormalStopReport, String> {
+    todo!("P8-T13: parse_harness_output {stdout}")
+}
+
+/// 實跑測試執行檔旁的 harness（win-runner 把 `SW_WIN_EXTRA_FILES` 複製到測試執行檔所在目錄）；缺檔 → `Err`（證據不足）。
+pub fn locate_harness() -> Result<PathBuf, String> {
+    todo!("P8-T13: locate_harness")
+}
+
+/// 以 harness 執行正式 `serialwrap service stop`（P4 `graceful_stop`），只操作測試工作 `task` 與 staging 埠。
+pub fn formal_service_stop(env: &dyn SysEnv, harness: &Path, spec: &StagingSpec, task: &str) -> Result<FormalStopReport, String> {
+    todo!("P8-T13: formal_service_stop {} {} {task} {}", harness.display(), spec.port, env.pid())
+}
+
 /// 測試工作與 staging daemon 的收尾守衛：成功或 panic 都會執行（`Drop`）；`finish` 另檢查無殘留。
 pub struct TaskGuard {
     env: Arc<dyn SysEnv>,
@@ -1105,6 +1165,12 @@ pub fn wal_tail_state(dir: &Path) -> WalTail {
         _ => return WalTail::Torn("最後一行缺 seq".into()),
     };
     WalTail::Complete { records: lines.len(), last_seq }
+}
+
+/// 停止後 WAL 最後一筆完整的證據：只接受至少一筆紀錄且最後一筆可解析、CRC 相符（`Complete`），回傳（筆數, 最後 seq）。
+/// 沒有 WAL 或 WAL 為空 → `Err`（證據不足，不得計為 PASS）；最後一筆不完整 → `Err`（失敗）。
+pub fn wal_evidence(dir: &Path) -> Result<(usize, u64), String> {
+    todo!("P8-T13: wal_evidence {}", dir.display())
 }
 
 /// plan API：最後一筆完整（`Torn` 以外皆為 true；零紀錄時沒有可截斷的紀錄）。

@@ -26801,6 +26801,51 @@
         }
       }
     },
+    "s2_p8_t13:t13b-regressions": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-cli::wintask_scoped_stop::formal_stop_normal_exit_targets_only_test_task_and_never_ends",
+          "cargo:sw-cli::wintask_scoped_stop::formal_stop_unreachable_running_task_ends_only_test_task",
+          "cargo:sw-cli::wintask_scoped_stop::harness_args_and_report_json_contract",
+          "cargo:sw-cli::wintask_scoped_stop::harness_rejects_unsafe_requests_without_running_anything",
+          "cargo:sw-cli::wintask_scoped_stop::scoped_env_rewrites_production_name_and_refuses_everything_else",
+          "cargo:sw-cli::wintask_scoped_stop::scoped_rpc_only_connects_to_test_port",
+          "cargo:sw-pal::wintask_staging::batch_clears_inherited_env_then_isolates_every_dir",
+          "cargo:sw-pal::wintask_staging::batch_runs_staging_daemon_on_test_port_only",
+          "cargo:sw-pal::wintask_staging::config_excludes_every_registry_com_and_allowlists_com250",
+          "cargo:sw-pal::wintask_staging::harness_argv_scopes_cli_to_staging_and_test_port",
+          "cargo:sw-pal::wintask_staging::harness_output_parses_formal_stop_report",
+          "cargo:sw-pal::wintask_staging::pick_free_port_never_returns_production_port",
+          "cargo:sw-pal::wintask_staging::registry_query_failure_is_fail_closed",
+          "cargo:sw-pal::wintask_staging::runtime_test_only_uses_named_task_apis",
+          "cargo:sw-pal::wintask_staging::simulated_batch_env_drops_inherited_serialwrap_vars",
+          "cargo:sw-pal::wintask_staging::staging_pid_match_uses_full_exe_path_only",
+          "cargo:sw-pal::wintask_staging::staging_refuses_production_port",
+          "cargo:sw-pal::wintask_staging::support_json_parser_reads_health_status",
+          "cargo:sw-pal::wintask_staging::support_wal_tail_detects_torn_and_crc_mismatch",
+          "cargo:sw-pal::wintask_staging::support_xml_parser_reads_task_xml_by_element_path",
+          "cargo:sw-pal::wintask_staging::task_name_guard_only_accepts_test_names",
+          "cargo:sw-pal::wintask_staging::wal_without_records_is_insufficient_evidence",
+          "cargo:sw-pal::wintask_staging::win_runner_forwards_schtasks_authorization"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-cli",
+            "--test",
+            "wintask_scoped_stop",
+            "--package",
+            "sw-pal",
+            "--test",
+            "wintask_staging",
+            "--features",
+            "test-fakes"
+          ],
+          "markexpr": "",
+          "paths": []
+        }
+      }
+    },
     "s2_par_wp51:cargo": {
       "linux": {
         "nodeids": [
