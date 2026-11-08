@@ -902,6 +902,496 @@ fn reboot_flushes_commands_queued_behind_it() {
 }
 
 // ---------------------------------------------------------------------------
+// WP5-6 第 5 項：非同步 reboot 開機證據等待的 reboot 接線與清除生命週期（G8，#243）
+// Python：`origin/main:sw_core/session_manager.py:6409-6411`（新一輪 reboot 於送出前歸零舊期限）、
+// `:6463-6466`（2 s 內 prompt 回來：只 `clear_boot_quiet()`＋`begin_boot_evidence_wait()`，不 `confirm_ready()`）、
+// `:2704`（無 bridge 的 `_detach_session_locked` 歸零）。情境對照 `tests/test_async_reboot_evidence.py:74-372`
+// 與 `tests/test_boot_quiet.py:735-758`。負向路徑一律以 PAL 寫入次數、OS 提交次數與 WAL TX 筆數三者斷言。
+// ---------------------------------------------------------------------------
+
+const WP56_PROMPT: &[u8] = b"\r\nroot@t:/# ";
+
+/// PAL 寫入呼叫數、OS 提交數、WAL TX 筆數（零 TX 斷言用）。
+fn wp56_tx_counts(h: &ActorRig) -> (usize, usize, usize) {
+    (h.dev.write_calls(), h.dev.os_submits(), tx_rows(h).len())
+}
+
+/// 重新掛上「舊 shell」的 `\n`→prompt 應答（`on_tx_reply` 為一次性、比對累積 TX，故先 `take_tx` 清緩衝）。
+/// 搭配 `ready()` 常駐的 nonce 應答替身，等同 Python `FakeBridge(prompt_within_2s=True)`：daemon 一旦送出確認
+/// probe，舊 shell 就會成功應答——pending 能否被清完全取決於 daemon 有沒有送 probe。
+fn wp56_arm_stale_shell(h: &ActorRig) {
+    let _ = h.dev.take_tx();
+    h.dev.on_tx_reply(b"\n", WP56_PROMPT);
+}
+
+/// READY session 送出 reboot 類命令，替身立即重印 prompt（非同步 reboot，實機 TX 後 11 ms 即回 prompt）；
+/// 回傳後 quiet 已清、pending 保留（#139／#162 不變），並預掛舊 shell 應答（`wp56_arm_stale_shell`）。
+fn wp56_async_reboot(h: &ActorRig, cmd: &str, expect_reboot: bool) {
+    wp56_async_reboot_unarmed(h, cmd, expect_reboot);
+    wp56_arm_stale_shell(h);
+}
+
+/// 同 `wp56_async_reboot`，但不預掛 `\n` 應答（下一筆含 `\n` 的 TX 不會得到 prompt）。
+fn wp56_async_reboot_unarmed(h: &ActorRig, cmd: &str, expect_reboot: bool) {
+    let mut tx = cmd.as_bytes().to_vec();
+    tx.push(b'\n');
+    let mut reply = cmd.as_bytes().to_vec();
+    reply.extend_from_slice(WP56_PROMPT);
+    h.dev.on_tx_reply(&tx, &reply);
+    let id = h.submit_with(cmd, |r| r.expect_reboot = expect_reboot);
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["partial"], PyValue::Bool(false), "{rec:?}");
+    assert_eq!(rec["recovery_action"], PyValue::Null, "{rec:?}");
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"));
+    assert_eq!(
+        s["boot_quiet_remaining_s"],
+        PyValue::Null,
+        "TX 靜默維度已解除（#139）"
+    );
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "#162 pending 保留"
+    );
+}
+
+fn wp56_pending(h: &ActorRig) -> bool {
+    h.get_state()["ready_reconfirm_pending"] == PyValue::Bool(true)
+}
+
+fn wp56_tx_contains(h: &ActorRig, needle: &[u8]) -> bool {
+    h.wal_tx_payloads()
+        .iter()
+        .any(|p| p.windows(needle.len()).any(|w| w == needle))
+}
+
+/// 確認 READY 後 agent 命令實際送出並完成（`test_banner_then_boot_done_confirms_ready` 的 follow 段）。
+fn wp56_follow_command_runs(h: &ActorRig) {
+    h.dev
+        .on_tx_reply(b"echo hi\n", b"echo hi\r\nhi\r\nroot@t:/# ");
+    let id = h.submit_ok("echo hi");
+    let rec = h.wait_done(&id);
+    assert_eq!(rec["status"], PyValue::from("done"), "{rec:?}");
+    assert_eq!(rec["stdout"], PyValue::from("hi"), "{rec:?}");
+    assert!(wal_tx_has(h, b"echo hi\n"), "命令必須實際寫到 UART");
+}
+
+#[test]
+fn wp56_async_reboot_stale_shell_cannot_confirm_ready() {
+    // `test_wait_started_by_async_reboot`／`test_stale_shell_nonce_does_not_confirm_ready`／
+    // `test_agent_command_gets_autoboot_quiet_before_banner`（`tests/test_async_reboot_evidence.py:74-104`）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot(&h, "reboot", false);
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0),
+        "2 s 內 prompt 回來即起算 BOOT_EVIDENCE_GRACE_S（`:6466`）"
+    );
+    let before = wp56_tx_counts(&h);
+
+    // RX 閒置超過 REPROBE_RX_IDLE_S（3 s）：實機 +3.1～+6.3 s 正是此刻送出 `\n`＋nonce，舊 shell 會應答。
+    h.advance(Duration::from_secs(10));
+    assert_eq!(
+        wp56_tx_counts(&h),
+        before,
+        "banner 前不得送確認 probe（PAL 寫入／OS 提交／WAL TX 皆零新增）"
+    );
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"));
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "pending 不得被舊 shell 的 nonce 清掉"
+    );
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Float(50.0),
+        "等待仍有效"
+    );
+    assert_eq!(s["reprobe_attempts"], PyValue::from(0));
+    assert_eq!(s["next_reprobe_at"], PyValue::Null);
+    assert_eq!(s["last_error"], PyValue::Null);
+
+    // stale-READY 窗：agent 命令回 AUTOBOOT_QUIET（可重試），零 TX。
+    let resp = h.request(SessionRequest::Submit(agent_submit(
+        "cat /proc/sys/kernel/random/boot_id",
+    )));
+    assert_eq!(resp["ok"], PyValue::Bool(false));
+    assert_eq!(resp["error_code"], PyValue::from("AUTOBOOT_QUIET"));
+    assert_eq!(resp["retry_after_s"], PyValue::from(5.0));
+    assert!(resp.get("cmd_id").is_none(), "gate 拒絕不配 cmd_id");
+    match &resp["session"] {
+        PyValue::Dict(session) => assert_eq!(
+            session["boot_evidence_wait_remaining_s"],
+            PyValue::Float(50.0),
+            "回應帶出剩餘寬限（`TestSubmitTimeGateDuringWait`）"
+        ),
+        other => panic!("session 不是 object：{other:?}"),
+    }
+    assert_eq!(wp56_tx_counts(&h), before, "gate 拒絕必須零 TX 副作用");
+}
+
+#[test]
+fn wp56_banner_then_prompt_restores_ready() {
+    // `TestBannerReleasesWait`（`tests/test_async_reboot_evidence.py:144-187`）與
+    // `test_confirm_probe_after_reboot_restores_execute`（`tests/test_boot_quiet.py:735-758`）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot(&h, "reboot", false);
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0)
+    );
+
+    // shutdown 訊息（含平台字串）不是開機證據：等待維持。
+    h.inject_rx(b"EXT4-fs (flash-data): unmounting filesystem\r\nSMCOS: rebooting system...\r\n");
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0)
+    );
+
+    // banner：解除等待、重臂 quiet（#130 不變），pending 仍在。
+    h.inject_rx(BANNER);
+    let s = h.get_state();
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "banner 即解除證據等待"
+    );
+    assert_eq!(
+        s["boot_quiet_remaining_s"],
+        PyValue::Float(180.0),
+        "banner 重臂 quiet"
+    );
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true));
+    let before = wp56_tx_counts(&h);
+    h.advance(Duration::from_secs(5));
+    assert_eq!(
+        wp56_tx_counts(&h),
+        before,
+        "banner 後仍在 quiet：不送 probe"
+    );
+    assert!(wp56_pending(&h));
+
+    // 開機完成（prompt）解除 quiet → RX 閒置後送確認 probe → nonce 實證 → confirm_ready。
+    h.inject_rx(WP56_PROMPT);
+    assert_eq!(
+        h.get_state()["boot_quiet_remaining_s"],
+        PyValue::Null,
+        "prompt 解除 quiet"
+    );
+    advance_until(&h, Duration::from_millis(500), "確認 probe 成功", |h| {
+        !wp56_pending(h)
+    });
+    assert!(wp56_tx_counts(&h).0 > before.0, "確認 probe 必須實際送出");
+    assert!(
+        wp56_tx_contains(&h, b"__READY__"),
+        "WAL 記到 nonce probe TX"
+    );
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"));
+    assert_eq!(s["boot_evidence_wait_remaining_s"], PyValue::Null);
+    assert_eq!(s["last_error"], PyValue::Null);
+    wp56_follow_command_runs(&h);
+}
+
+#[test]
+fn wp56_no_banner_resumes_after_sixty_seconds() {
+    // `TestGraceExpiryDoesNotDeadlock::test_no_banner_confirms_after_grace`／
+    // `test_grace_does_not_extend_ready_reconfirm_deadline`（`tests/test_async_reboot_evidence.py:190-232`）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot(&h, "reboot", false);
+    let s = h.get_state();
+    assert_eq!(s["ready_reconfirm_remaining_s"], PyValue::Float(300.0));
+    let before = wp56_tx_counts(&h);
+
+    // 寬限內（59.9 s）零 probe；reconfirm 期限照原 deadline 遞減（寬限不延長 READY_RECONFIRM_MAX_S）。
+    h.advance(Duration::from_secs(59));
+    assert_eq!(wp56_tx_counts(&h), before, "寬限內零 probe");
+    let s = h.get_state();
+    assert_eq!(s["boot_evidence_wait_remaining_s"], PyValue::Float(1.0));
+    assert_eq!(
+        s["ready_reconfirm_remaining_s"],
+        PyValue::Float(241.0),
+        "原 deadline 不延長"
+    );
+    h.advance(Duration::from_millis(900));
+    assert_eq!(wp56_tx_counts(&h), before, "59.9 s 仍在寬限內");
+    assert!(wp56_pending(&h));
+
+    // 到期（now >= until）後下一個 tick 照常送確認 probe，成功確認、不卡死。
+    advance_until(
+        &h,
+        Duration::from_millis(100),
+        "寬限到期後確認",
+        |h| !wp56_pending(h),
+    );
+    assert!(
+        wp56_tx_counts(&h).0 > before.0,
+        "到期後確認 probe 必須實際送出"
+    );
+    assert!(wp56_tx_contains(&h, b"__READY__"));
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("READY"));
+    assert_eq!(s["boot_evidence_wait_remaining_s"], PyValue::Null);
+    assert_eq!(s["ready_reconfirm_remaining_s"], PyValue::Null);
+    assert_eq!(s["last_error"], PyValue::Null);
+    wp56_follow_command_runs(&h);
+}
+
+#[test]
+fn wp56_wait_ticks_preserve_reprobe_budget() {
+    // `test_wait_does_not_burn_reprobe_attempts`（`tests/test_async_reboot_evidence.py:106-115`）：等待期間
+    // 不排 probe——不累加 attempts、不排 backoff、不耗盡（`session_manager.py:2218-2223`）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot(&h, "reboot", false);
+    let before = wp56_tx_counts(&h);
+    for round in 1..=5u32 {
+        h.advance(Duration::from_secs(10));
+        let s = h.get_state();
+        assert_eq!(
+            s["reprobe_attempts"],
+            PyValue::from(0),
+            "第 {round} 輪：不加 attempts"
+        );
+        assert_eq!(
+            s["next_reprobe_at"],
+            PyValue::Null,
+            "第 {round} 輪：不排 backoff"
+        );
+        assert_eq!(
+            s["reprobe_exhausted"],
+            PyValue::Bool(false),
+            "第 {round} 輪"
+        );
+        assert_eq!(
+            s["ready_reconfirm_failed"],
+            PyValue::Bool(false),
+            "第 {round} 輪"
+        );
+        assert_eq!(
+            s["ready_reconfirm_pending"],
+            PyValue::Bool(true),
+            "第 {round} 輪"
+        );
+        assert_eq!(
+            s["boot_evidence_wait_remaining_s"],
+            PyValue::Float(60.0 - 10.0 * f64::from(round)),
+            "第 {round} 輪"
+        );
+    }
+    assert_eq!(wp56_tx_counts(&h), before, "50 s 內 50 個 tick 皆零 TX");
+}
+
+#[test]
+fn wp56_spontaneous_reboot_has_no_evidence_wait() {
+    // `TestUnaffectedPaths::test_spontaneous_reboot_is_not_delayed`（`tests/test_async_reboot_evidence.py:264-277`）：
+    // daemon 沒送 reboot → 沒有證據等待，banner → prompt → RX 閒置後立即確認（不等 60 s）。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_arm_stale_shell(&h);
+    h.inject_rx(BANNER);
+    let s = h.get_state();
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true));
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "自發重開機不起等待"
+    );
+    h.inject_rx(WP56_PROMPT);
+    let before = wp56_tx_counts(&h);
+    let start = h.clock.elapsed();
+    advance_until(
+        &h,
+        Duration::from_millis(500),
+        "自發重開機確認",
+        |h| !wp56_pending(h),
+    );
+    let waited = (h.clock.elapsed() - start).as_secs_f64();
+    assert!(
+        waited < 10.0,
+        "無證據等待：RX 閒置後即確認，實際 {waited} s"
+    );
+    assert!(wp56_tx_counts(&h).0 > before.0, "確認 probe 實際送出");
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Null
+    );
+}
+
+#[test]
+fn wp56_recovery_branch_clears_old_wait_without_starting_new_wait() {
+    // `TestUnaffectedPaths::test_recovery_branch_does_not_start_wait`／`test_human_source_recovery_path_unchanged`
+    // （`tests/test_async_reboot_evidence.py:279-302`）。
+
+    // (1) agent reboot 2 s 內沒有 prompt → recovery 迴圈（EXPECT_REBOOT）：全程不起證據等待，恢復後仍無等待。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    let id = h.submit_ok("reboot");
+    wait_tx(&h, b"reboot\n");
+    advance_until(&h, Duration::from_millis(200), "reboot 收尾", |h| {
+        is_done(h, &id)
+    });
+    assert_eq!(
+        h.command_get(&id)["recovery_action"],
+        PyValue::from("EXPECT_REBOOT")
+    );
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("RECOVERING"));
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "recovery 分支不起等待"
+    );
+    wp56_arm_stale_shell(&h);
+    h.inject_rx(BANNER);
+    h.inject_rx(WP56_PROMPT);
+    advance_until(&h, Duration::from_millis(500), "恢復 READY", |h| {
+        state_of(h) == "READY"
+    });
+    let s = h.get_state();
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(false));
+    assert_eq!(s["boot_evidence_wait_remaining_s"], PyValue::Null);
+
+    // (2) 上一輪非同步 reboot 殘留等待時，新一輪 reboot 於送出命令前即歸零（`:6409-6411`），不延後到 TX 結算；
+    // 2 s 內沒有 prompt 也不起新等待。等待期間 pending 擋 agent，故以可信 human（不受 agent gate 擋）送第二輪；
+    // 不預掛 `\n` 應答，第二輪命令得不到 prompt。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot_unarmed(&h, "reboot", false);
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0)
+    );
+    h.dev.script_write(vec![FakeWriteStep::PauseBeforeSubmit]);
+    let submits = h.dev.os_submits();
+    let id = h.submit_with(WP53_CHAINED, |r| {
+        r.expect_reboot = true;
+        r.trusted_human = true;
+        r.source = "human:cid-7".into();
+    });
+    assert!(
+        h.dev.wait_paused(Duration::from_secs(2)),
+        "第二輪 reboot TX 應停在提交前"
+    );
+    assert_eq!(h.dev.os_submits(), submits, "尚未 OS 提交");
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "送出前即歸零舊等待"
+    );
+    h.dev.release_pause();
+    wait_tx(&h, b"echo a && reboot\n");
+    advance_until(
+        &h,
+        Duration::from_millis(200),
+        "第二輪 reboot 收尾",
+        |h| is_done(h, &id),
+    );
+    let rec = h.command_get(&id);
+    assert_eq!(
+        rec["partial"],
+        PyValue::Bool(true),
+        "走 2 s 無 prompt 的 recovery 分支：{rec:?}"
+    );
+    assert!(rec["recovery_action"].as_str().is_some(), "{rec:?}");
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "recovery 分支不起新等待"
+    );
+}
+
+#[test]
+fn wp56_detach_clears_evidence_wait() {
+    // `TestUnaffectedPaths::test_detach_clears_wait`（`tests/test_async_reboot_evidence.py:338-343`）：
+    // 無 bridge 的 `_detach_session_locked`（`session_manager.py:2704`）歸零等待；quiet／reconfirm 照既有規則保留。
+    // 有 bridge 的 drain 收斂 `_complete_drain`（`:2884-2960`）不碰 `boot_evidence_wait_until`：保留到重掛後
+    // 登入確認 `confirm_ready()`（`:718`）才清；新 attach 的 probe gate 只看 quiet（`_attach_by_id` `:5032`）。
+
+    // (1) 有 worker：拔除 → drain 收斂 DETACHED，等待保留；接著無 worker 的 clear → 歸零。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot(&h, "reboot", false);
+    h.send_control(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: sw_core::mailbox::DetachReason::Removed,
+    });
+    h.wait_state("DETACHED");
+    let s = h.get_state();
+    assert_eq!(s["last_error"], PyValue::from("DEVICE_REMOVED"));
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0),
+        "有 worker 的 drain 收斂不清等待（`_complete_drain`）"
+    );
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(true));
+    let r = h.request(SessionRequest::Clear);
+    assert_eq!(r["ok"], PyValue::Bool(true), "{r:?}");
+    let s = h.get_state();
+    assert_eq!(s["state"], PyValue::from("DETACHED"));
+    assert_eq!(s["last_error"], PyValue::from("CLEARED"));
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "無 worker 的 detach 歸零等待（`_detach_session_locked`）"
+    );
+    assert_eq!(
+        s["ready_reconfirm_pending"],
+        PyValue::Bool(true),
+        "只清等待，reconfirm 保存規則不變"
+    );
+
+    // (2) 有 worker：drain 後重插 → 新 attach 照常送登入 probe（等待不擋），成功 confirm_ready 歸零。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_async_reboot(&h, "reboot", false);
+    h.send_control(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: sw_core::mailbox::DetachReason::Removed,
+    });
+    h.wait_state("DETACHED");
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0)
+    );
+    let before = wp56_tx_counts(&h);
+    let h = h.attach();
+    h.wait_state("READY");
+    assert!(
+        wp56_tx_counts(&h).0 > before.0,
+        "新 attach 實際送出登入 probe"
+    );
+    let s = h.get_state();
+    assert_eq!(s["boot_evidence_wait_remaining_s"], PyValue::Null);
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(false));
+}
+
+#[test]
+fn wp56_plain_command_no_wait_and_chained_expect_reboot_starts_wait() {
+    // `test_non_reboot_command_does_not_start_wait`／`test_execute_command_reboot_path_starts_wait`／
+    // `test_chained_reboot_via_handler_starts_wait`（`tests/test_async_reboot_evidence.py:304-336`）：判定掛在 reboot
+    // handler，`expect_reboot` 串接命令（命令文字猜不到）與單獨 `reboot` 走同一入口。
+    let h = ActorRig::new(SHELL_PROFILE).ready();
+    wp56_follow_command_runs(&h);
+    let s = h.get_state();
+    assert_eq!(
+        s["boot_evidence_wait_remaining_s"],
+        PyValue::Null,
+        "一般命令不起等待"
+    );
+    assert_eq!(s["ready_reconfirm_pending"], PyValue::Bool(false));
+
+    assert!(!sw_core::quiet_gate::is_reboot_command("sync && reboot"));
+    wp56_async_reboot(&h, "sync && reboot", true);
+    assert_eq!(
+        h.get_state()["boot_evidence_wait_remaining_s"],
+        PyValue::Float(60.0),
+        "expect_reboot 串接命令同樣起算等待"
+    );
+    let before = wp56_tx_counts(&h);
+    h.advance(Duration::from_secs(10));
+    assert_eq!(wp56_tx_counts(&h), before, "串接命令後同樣不送確認 probe");
+    assert!(wp56_pending(&h));
+}
+
+// ---------------------------------------------------------------------------
 // WP5-3 第 1 項：`expect_reboot` 執行路由（G3；Python `origin/main:sw_core/session_manager.py:6840-6868`）
 // ---------------------------------------------------------------------------
 

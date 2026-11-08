@@ -1345,6 +1345,18 @@ impl SessionCore {
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         self.reattach_pending = false;
+        // G8（#243）：無 bridge 的同步 detach＝Python `_detach_session_locked`（`session_manager.py:2704`），歸零非同步
+        // reboot 的證據等待；quiet／READY reconfirm 照既有規則保留。呼叫端只有 clear（`:3059`）、release（`:3177`）、
+        // 拔除／重綁（`:4470`）；shutdown（`stop()` 無 bridge 不 detach）、bind 與已 RELEASED 的冪等 release 不清。
+        // 有 worker 的 drain 收斂（`_complete_drain` `:2884-2960`）不碰此欄，見 `worker_stopped`。
+        let detaches = match kind {
+            StopKind::Clear | StopKind::Removed | StopKind::Rebound => true,
+            StopKind::Release => self.state != SessionState::Released,
+            _ => false,
+        };
+        if detaches {
+            self.quiet.boot_evidence_wait_until = 0;
+        }
         if kind == StopKind::Release {
             self.finish_release(now);
             effects.extend(
@@ -3649,7 +3661,8 @@ impl SessionCore {
         // Python detach 不清 boot quiet／READY reconfirm（只有 passthrough 重掛時 `reset_passthrough_boot_gate` 清）：
         // DUT reboot 期間 re-enumerate 的重插仍受 quiet 保護（#130）。fence 隨 epoch 失效，重開時依現況同步。
         // boot quiet／reconfirm 掛在 session 而非 bridge（Python `SessionRuntime.boot_quiet_until`；`_complete_drain`
-        // 只 `reset_reprobe_progress`）：drain 不清，新 bridge adopt 時再推回 fence（審查 F63）。
+        // 只 `reset_reprobe_progress`）：drain 不清，新 bridge adopt 時再推回 fence（審查 F63）。非同步 reboot 的
+        // 證據等待同理（`_complete_drain` `:2884-2960` 不清 `boot_evidence_wait_until`），重掛後登入確認才清。
         self.login_run = None;
         self.foreground_reboot = false;
         self.deps.fence.with(|f| {
@@ -4372,6 +4385,9 @@ impl SessionCore {
             self.command_fg_begin(&command.req.origin, false);
             self.fg_cmd_timeout_s = command.req.timeout_s;
             if reboot {
+                // G8（#243，`origin/main:sw_core/session_manager.py:6409-6411`）：新一輪 reboot 不承接舊的非同步 reboot
+                // 證據期限，於送出命令前（不延後到 TX 結算）歸零；prompt 很快回來時由 `finish_command` 自該時刻重新起算。
+                self.quiet.boot_evidence_wait_until = 0;
                 // 增補 #13：reboot 命令命中點為 BC-02 失效點，送出前失效（`bridge.invalidate_deferred("reboot")`）。
                 self.invalidate_input(InvalidateReason::RebootCommand, &mut effects);
             }
@@ -4937,6 +4953,9 @@ impl SessionCore {
                         f.quiet_active = false;
                         f.probe_quiet_exempt = false;
                     });
+                    // G8（#243，`session_manager.py:6463-6466`）：非同步 reboot 的 prompt 回顯不是 READY 實證，緊接
+                    // `begin_boot_evidence_wait()`；確認 probe 等 boot banner 或寬限到期，不得 `confirm_ready()`。
+                    self.quiet.begin_boot_evidence_wait(now);
                 }
                 CmdOutcome::Result(result)
             }
