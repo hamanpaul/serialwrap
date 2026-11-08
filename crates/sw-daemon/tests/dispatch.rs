@@ -3429,3 +3429,188 @@ fn command_submit_line_mode_wrapped_echo_end_to_end() {
         assert_eq!(got.get("stdout"), Some(&PyValue::from(want.as_str())), "{}", j(&got));
     }
 }
+
+// ---------------------------------------------------------------------------
+// WP5-6 第 5 項：非同步 reboot 開機證據等待的 RPC 端到端（G8，#243；Python
+// `origin/main:sw_core/session_manager.py:6409-6411`、`:6463-6466`、`:2218-2223`、`service.py` submit gate）。
+//
+// 呼叫路徑：`Service::rpc(command.submit)` → `SubmitReq` → `SessionRequest::Submit` → `SessionCore::submit` → queue →
+// `start_next`（reboot 判定成立：送出前歸零舊等待）→ `OpSpec::Command` → `OpRunner::run_command` → `run_reboot`
+// （2 s 內 prompt 回來 → `OpOutcome::CommandResult(ok)`）→ `SessionCore::finish_command`（`clear_quiet`＋
+// `begin_boot_evidence_wait`）→ registry；之後 actor 依 FakeClock 每秒 Tick → `reprobe_tick` → `reprobe::prepare`
+// （等待有效 → 不排確認 probe）；`session.get`／submit gate 的 session 由 `SessionCore::public` 投影剩餘寬限。
+// ---------------------------------------------------------------------------
+
+/// 逐秒推進 FakeClock，讓 actor 的 1 s Tick 逐一觸發（一次跳多秒只會合併成一個 Tick）。
+fn wp56_advance_secs(r: &ServiceRig, secs: u64) {
+    for _ in 0..secs {
+        r.clock.advance(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    r.settle();
+}
+
+/// 對照 `tests/test_async_reboot_evidence.py` 的 `TestStaleShellNonceBeforeBanner`、`TestGraceExpiryDoesNotDeadlock`
+/// 與 `TestSubmitTimeGateDuringWait`：RPC 提交 `reboot`，假 DUT 立即重印 prompt（非同步 reboot）→ `command.get` 正常
+/// 完成、session `boot_evidence_wait_remaining_s=60.0`；舊 shell 持續能應答 `\n` 與 nonce，但 10 s 內 UART 零 TX；
+/// 後續 agent 命令以可重試 `AUTOBOOT_QUIET` 拒絕且 UART／WAL／registry／queue 不變；60 s 寬限到期後確認 probe
+/// 實際送出並清 pending，後續命令經 RPC 真正寫到 UART。
+#[test]
+fn wp56_rpc_async_reboot_holds_confirm_until_grace() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(b"reboot\n", b"reboot\r\nroot@t:/# ");
+    r.settle();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":10}"#,
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let record = wp55_wait_done(&r, &cmd_id);
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(
+        record.get("partial"),
+        Some(&PyValue::Bool(false)),
+        "{}",
+        j(&record)
+    );
+    assert_eq!(
+        record.get("recovery_action"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&record)
+    );
+    r.settle();
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("state"),
+        Some(&PyValue::from("READY")),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("boot_quiet_remaining_s"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("boot_evidence_wait_remaining_s"),
+        Some(&PyValue::Float(60.0)),
+        "2 s 內 prompt 回來即起算寬限：{}",
+        j(&session)
+    );
+
+    // 舊 shell 仍活著：每個空行都回 prompt、nonce 照常回顯（`install_shell_replies` 的 nonce 應答常駐）。
+    dev.on_tx_match("^$", Box::new(|_line: &[u8]| b"root@t:/# ".to_vec()));
+    let calls = dev.write_calls();
+    let tx_mark = dev.tx_len();
+    wp56_advance_secs(&r, 10);
+    assert_eq!(
+        dev.write_calls(),
+        calls,
+        "banner 前不得送確認 probe（PAL 寫入零新增）"
+    );
+    assert!(dev.tx_since(tx_mark).is_empty(), "UART 零 TX");
+    let session = r.session("COM0").expect("COM0 session");
+    assert_eq!(
+        session.get("ready_reconfirm_pending"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("boot_evidence_wait_remaining_s"),
+        Some(&PyValue::Float(50.0)),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("reprobe_attempts"),
+        Some(&PyValue::from(0)),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("next_reprobe_at"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&session)
+    );
+    let expected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "AUTOBOOT_QUIET",
+        "retry_after_s" => 5.0,
+        "hint" => WP53_RECONFIRM_HINT,
+        "session" => PyValue::Dict(session.clone()),
+        "version" => r.version.clone(),
+    };
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"COM0","cmd":"cat /proc/sys/kernel/random/boot_id","timeout_s":10}"#,
+        &j(&expected),
+    );
+
+    // 49 s 後（共 59 s）仍在寬限內：零 TX；第 60 s 起照常確認。
+    wp56_advance_secs(&r, 49);
+    assert_eq!(dev.write_calls(), calls, "59 s 仍在寬限內");
+    let mut session = PyDict::default();
+    wait_until("寬限到期後確認 READY", || {
+        r.clock.advance(Duration::from_millis(250));
+        session = r.session("COM0").expect("COM0 session");
+        session.get("ready_reconfirm_pending") == Some(&PyValue::Bool(false))
+    });
+    assert!(dev.write_calls() > calls, "到期後確認 probe 實際送出");
+    assert!(
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)).contains("__READY__"),
+        "UART 送出 nonce probe"
+    );
+    assert_eq!(
+        session.get("state"),
+        Some(&PyValue::from("READY")),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("boot_evidence_wait_remaining_s"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&session)
+    );
+    assert_eq!(
+        session.get("last_error"),
+        Some(&PyValue::Null),
+        "{}",
+        j(&session)
+    );
+
+    dev.on_tx_reply(b"echo hi\n", b"echo hi\r\nhi\r\nroot@t:/# ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo hi","timeout_s":10}"#,
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    let next_id = s(&response, "cmd_id").to_string();
+    let record = wp55_wait_done(&r, &next_id);
+    assert_eq!(s(&record, "status"), "done", "{}", j(&record));
+    assert_eq!(s(&record, "stdout"), "hi", "{}", j(&record));
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo hi\n");
+}
