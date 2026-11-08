@@ -409,7 +409,7 @@ pub fn push_file(
         let op = if idx == 0 { ">" } else { ">>" };
         let cmd = t::chunk_command(&t::b64encode(chunk), decoder, op, &tmp).expect("decoder 已探測");
         if t::line_budget_exceeded(&[cmd.as_str()], budget) {
-            sess.cleanup(&tmp, &prefix, prog)?;
+            sess.cleanup(&tmp, &prefix, None)?;
             return Ok(line_limit_error(budget));
         }
         let pre = sess.port.rx_snapshot_len();
@@ -431,11 +431,12 @@ pub fn push_file(
             sess.send(&cmd, &cmd_id, prog)?;
         }
         if !sess.wait(pre, prog)? {
-            sess.cleanup(&tmp, &prefix, prog)?;
+            // Python 這條 cleanup 拒絕路徑不在 chunk TX 的例外處理器內，不附 chunk 進度。
+            sess.cleanup(&tmp, &prefix, None)?;
             return Ok(err_progress("TRANSFER_TIMEOUT", idx, total));
         }
         if !m::runtime_sentinel_seen(&sess.port.rx_text_from(pre), t::CHUNK_SENTINEL, Some(&cmd)) {
-            sess.cleanup(&tmp, &prefix, prog)?;
+            sess.cleanup(&tmp, &prefix, None)?;
             return Ok(err_progress("TARGET_DECODER_FAILED", idx, total));
         }
     }
