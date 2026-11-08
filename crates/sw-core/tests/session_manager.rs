@@ -1443,6 +1443,155 @@ fn wp510_a_placeholder_rejects_commands() {
     wp510_a_assert_no_attach_io(&m, &[REAL]);
 }
 
+/// WP5-10b：建立缺失 template 的佔位，並附上舊 sid 的持久化 alias／binding。
+fn wp510_b_placeholder_rig(with_slot: bool, keep_profile_records: bool) -> ManagerRig {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(SID.to_string(), released_row(BY_ID));
+    loaded
+        .bindings
+        .insert(SID.to_string(), "/s/by-id/old-override".to_string());
+    let mut alias = PyDict::new();
+    alias.insert("session_id", PyValue::from(SID));
+    loaded.aliases.insert("retired-alias".to_string(), alias);
+    if keep_profile_records {
+        loaded
+            .profile_pins
+            .insert(BY_ID.to_string(), "removed-pin-template".to_string());
+        loaded
+            .profile_detected
+            .insert(BY_ID.to_string(), "removed-detected-template".to_string());
+    }
+    let yaml = if with_slot {
+        manager_yaml(&[&t_target("COM0", 1, "/s/by-id/offline-slot")])
+    } else {
+        manager_yaml(&[])
+    };
+    let m = ManagerRig::with(&yaml, loaded, None);
+    m.add_device_at(BY_ID, "/dev/ttyG");
+    install_shell_replies(&m.device("/dev/ttyG"));
+    m
+}
+
+#[test]
+fn wp510_b_handoff_reuses_preopened_handle() {
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線裝置：{response:?}"
+    );
+    wait_until("t:COM3 正式 session", || {
+        m.mgr.resolve("t:COM3").is_some()
+    });
+    assert_eq!(
+        m.mgr.resolve("t:COM3").as_deref(),
+        Some("t:COM3"),
+        "成功 handoff 應以原 COM 建立真正 template session"
+    );
+    wait_until("COM3 正式 bridge", || {
+        matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
+    });
+    let formal = m.session("COM3");
+    assert_eq!(s_of(&formal, "session_id").as_deref(), Some("t:COM3"));
+    assert_eq!(s_of(&formal, "profile").as_deref(), Some("t"));
+    assert_eq!(s_of(&formal, "profile_source").as_deref(), Some("detected"));
+    assert_eq!(s_of(&formal, "com").as_deref(), Some("COM3"));
+    assert_eq!(
+        m.serial.open_attempts("/dev/ttyG"),
+        1,
+        "偵測與正式 bridge 必須共用同一 handle"
+    );
+}
+
+#[test]
+fn wp510_b_handoff_skips_detached_slot_rebind() {
+    let m = wp510_b_placeholder_rig(true, false);
+    let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線裝置：{response:?}"
+    );
+    wait_until("t:COM3 正式 session", || {
+        m.mgr.resolve("t:COM3").is_some()
+    });
+    assert_eq!(
+        m.mgr.resolve("t:COM3").as_deref(),
+        Some("t:COM3"),
+        "dynamic-only handoff 應建立 COM3 正式 session"
+    );
+    wait_until("COM3 正式 bridge", || {
+        matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
+    });
+    let slot = m.session("COM0");
+    assert_eq!(
+        s_of(&slot, "device_by_id").as_deref(),
+        Some("/s/by-id/offline-slot")
+    );
+    assert_eq!(m.serial.open_attempts("/dev/ttyG"), 1);
+}
+
+#[test]
+fn wp510_b_handoff_cleans_old_identity_and_restart_block() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    let m = wp510_b_placeholder_rig(false, true);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    assert!(
+        is_ok(&response),
+        "device.attach 應接受在線裝置：{response:?}"
+    );
+    wait_until("t:COM3 正式 session", || {
+        m.mgr.resolve("t:COM3").is_some()
+    });
+    assert_eq!(
+        m.mgr.resolve("t:COM3").as_deref(),
+        Some("t:COM3"),
+        "handoff 應建立正式 session"
+    );
+    wait_until("COM3 正式 bridge", || {
+        matches!(m.state_of("COM3").as_deref(), Some("ATTACHED" | "READY"))
+    });
+
+    let state = m.load_state_now();
+    assert!(!state.released.contains_key(SID), "舊 RELEASED 列必須移除");
+    assert!(
+        !state.bindings.contains_key(SID),
+        "舊 binding override 必須移除"
+    );
+    assert!(
+        state
+            .aliases
+            .values()
+            .all(|row| row.get("session_id").and_then(PyValue::as_str) != Some(SID)),
+        "所有指向舊 sid 的 alias 都必須移除"
+    );
+    assert_eq!(
+        state.profile_pins.get(BY_ID).map(String::as_str),
+        Some("removed-pin-template")
+    );
+    assert_eq!(
+        state.profile_detected.get(BY_ID).map(String::as_str),
+        Some("removed-detected-template"),
+        "handoff 必須保留 pin／detected 記錄"
+    );
+    assert!(m.mgr.resolve(SID).is_none(), "舊 sid 應在 handoff 後立即退休");
+    let restarted = m.restart();
+    assert!(restarted.mgr.resolve(SID).is_none(), "重啟不得復活舊佔位");
+    assert!(!restarted.load_state_now().released.contains_key(SID));
+    assert_eq!(restarted.mgr.released_placeholder(BY_ID), None);
+}
+
 /// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。
 fn snapshot_without(m: &ManagerRig, by_id: &str) -> Vec<(String, DeviceInfo)> {
     m.snapshot().into_iter().filter(|(k, _)| k != by_id).collect()

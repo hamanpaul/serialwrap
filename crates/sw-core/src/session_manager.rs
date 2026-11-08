@@ -180,6 +180,31 @@ struct AttachOp {
     /// clear 收尾的再 attach（`Effect::Reattach`）：session 已是 ATTACHING 但未開埠，仍須再解析（審查 F62）。
     /// 在途 op 與 clear 重疊時由 `spawn_attach_with` OR 進來，避免該次再解析遺失（審查 F98）。
     after_clear: Arc<AtomicBool>,
+    /// OD-63：佔位交接略過 DETACHED-rebind，只走 template 動態偵測。
+    dynamic_only: bool,
+    /// PROBE／device.attach 已獨占開啟的 handle；交給偵測後再由正式 bridge 接手。
+    preopened: Arc<Mutex<Option<Preopened>>>,
+}
+
+impl AttachOp {
+    fn new(after_clear: bool, dynamic_only: bool, preopened: Option<Preopened>) -> AttachOp {
+        AttachOp {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            after_clear: Arc::new(AtomicBool::new(after_clear)),
+            dynamic_only,
+            preopened: Arc::new(Mutex::new(preopened)),
+        }
+    }
+
+    fn take_preopened(&self) -> Option<Preopened> {
+        lock(&self.preopened).take()
+    }
+
+    fn close_preopened(&self) {
+        if let Some(pre) = self.take_preopened() {
+            let _ = pre.parts.close();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -404,6 +429,28 @@ fn open_failure(e: OpenError) -> OpenFailure {
         OpenError::AccessDenied { holder, .. } => OpenFailure::AccessDenied(holder),
         OpenError::NotFound(_) => OpenFailure::NotFound,
         OpenError::Other(err) => OpenFailure::Other(err),
+    }
+}
+
+/// Python `attach_device` 對不可見裝置的回應。
+fn device_not_present_reply(selector: &str, by_id: &str) -> PyDict {
+    pydict! {
+        "ok" => false,
+        "error_code" => "DEVICE_NOT_PRESENT",
+        "selector" => selector.to_string(),
+        "device_by_id" => by_id.to_string()
+    }
+}
+
+/// Python `attach_device` 對外部 holder／OS 拒絕獨占的回應。
+fn device_still_held_reply(selector: &str, pids: Vec<u32>) -> PyDict {
+    let holder_unknown = pids.is_empty();
+    pydict! {
+        "ok" => false,
+        "error_code" => "DEVICE_STILL_HELD",
+        "pids" => PyValue::List(pids.into_iter().map(|pid| PyValue::Int(PyInt::Small(pid as i128))).collect()),
+        "holder_unknown" => holder_unknown,
+        "selector" => selector.to_string()
     }
 }
 
@@ -923,16 +970,25 @@ impl Shared {
 
     /// `_spawn_attach`：stopping gate、released／inflight 去重；需要再解析或尚無 session 時起 attach worker。
     fn spawn_attach(self: &Arc<Self>, by_id: &str) {
-        self.spawn_attach_with(by_id, false);
+        self.spawn_attach_with(by_id, false, false, None);
     }
 
     /// `spawn_attach` 本體；`after_clear` 見 `AttachOp::after_clear`。
-    fn spawn_attach_with(self: &Arc<Self>, by_id: &str, after_clear: bool) {
+    fn spawn_attach_with(
+        self: &Arc<Self>,
+        by_id: &str,
+        after_clear: bool,
+        dynamic_only: bool,
+        preopened: Option<Preopened>,
+    ) {
         let released = self.released_by_ids();
         let pins = self.model_snapshot().profile_pins;
         let mut inner = lock(&self.inner);
         if inner.stopping {
             drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
             self.warn(format!("shutdown 中，略過 attach {by_id}"));
             return;
         }
@@ -941,18 +997,34 @@ impl Shared {
             .session_by_id(by_id)
             .is_some_and(|e| e.released_placeholder)
         {
+            drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
             return;
         }
         if released.contains(by_id) {
+            drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
             return;
         }
         if let Some(op) = inner.inflight.get(by_id) {
             if after_clear {
                 op.after_clear.store(true, Ordering::SeqCst);
             }
+            drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
             return;
         }
         let Some(real) = inner.device_path(by_id).map(str::to_string) else {
+            drop(inner);
+            if let Some(pre) = preopened {
+                let _ = pre.parts.close();
+            }
             return;
         };
         if let Some(e) = inner.session_by_id(by_id) {
@@ -965,6 +1037,9 @@ impl Shared {
             if !needs_reresolve {
                 let actor = e.actor.clone();
                 drop(inner);
+                if let Some(pre) = preopened {
+                    let _ = pre.parts.close();
+                }
                 let _ = actor.control.send(ControlEvent::DeviceAttached {
                     by_id: by_id.to_string(),
                     real_path: real,
@@ -972,23 +1047,50 @@ impl Shared {
                 return;
             }
         }
-        let op = AttachOp {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            after_clear: Arc::new(AtomicBool::new(after_clear)),
-        };
+        let op = AttachOp::new(
+            after_clear,
+            dynamic_only,
+            preopened.map(|pre| Preopened {
+                real_path: real.clone(),
+                parts: pre.parts,
+            }),
+        );
         inner.inflight.insert(by_id.to_string(), op.clone());
         drop(inner);
+        self.spawn_attach_worker(by_id, op);
+    }
+
+    /// 啟動已登錄於 `inflight` 的 attach op；placeholder handoff 先同步開埠再呼叫。
+    fn spawn_attach_worker(self: &Arc<Self>, by_id: &str, op: AttachOp) {
         let me = self.clone();
         let key = by_id.to_string();
-        let spawned = std::thread::Builder::new()
-            .name(format!("serialwrap-attach-{by_id}"))
-            .spawn(move || {
-                let _ = catch_unwind(AssertUnwindSafe(|| me.attach_worker(&key, &op)));
-                lock(&me.inner).inflight.remove(&key);
-                me.cv.notify_all();
-            });
+        let worker_op = op.clone();
+        let spawned =
+            std::thread::Builder::new()
+                .name(format!("serialwrap-attach-{by_id}"))
+                .spawn(move || {
+                    let _ = catch_unwind(AssertUnwindSafe(|| me.attach_worker(&key, &worker_op)));
+                    worker_op.close_preopened();
+                    let mut inner = lock(&me.inner);
+                    if inner.inflight.get(&key).is_some_and(|current| {
+                        Arc::ptr_eq(&current.cancelled, &worker_op.cancelled)
+                    }) {
+                        inner.inflight.remove(&key);
+                    }
+                    drop(inner);
+                    me.cv.notify_all();
+                });
         if spawned.is_err() {
-            lock(&self.inner).inflight.remove(by_id);
+            op.close_preopened();
+            let mut inner = lock(&self.inner);
+            if inner
+                .inflight
+                .get(by_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
+            {
+                inner.inflight.remove(by_id);
+            }
+            drop(inner);
             self.cv.notify_all();
         }
     }
@@ -1007,30 +1109,34 @@ impl Shared {
             self.reattach_existing(&sid, by_id, op);
             return;
         }
-        // DETACHED-rebind fallback：DETACHED 且其 by_id 離線的 session，取 act_no 最小者。
-        let candidates: Vec<(String, i128)> = {
-            let inner = lock(&self.inner);
-            inner
-                .sessions
-                .values()
-                .filter(|e| {
-                    !e.released_placeholder && !inner.devices.contains_key(&e.profile.device_by_id)
-                })
-                .map(|e| (e.sid.clone(), pyint_i128(&e.profile.act_no)))
-                .collect()
-        };
-        let mut detached: Vec<(String, i128)> = candidates
-            .into_iter()
-            .filter(|(sid, _)| self.session_state(sid).as_deref() == Some("DETACHED"))
-            .collect();
-        detached.sort_by_key(|(_, act)| *act);
-        if let Some((sid, _)) = detached.into_iter().next() {
-            if !op.cancelled.load(Ordering::SeqCst) {
-                self.rebind_detached(&sid, by_id);
+        if !op.dynamic_only {
+            // DETACHED-rebind fallback：DETACHED 且其 by_id 離線的 session，取 act_no 最小者。
+            let candidates: Vec<(String, i128)> = {
+                let inner = lock(&self.inner);
+                inner
+                    .sessions
+                    .values()
+                    .filter(|e| {
+                        !e.released_placeholder
+                            && !inner.devices.contains_key(&e.profile.device_by_id)
+                    })
+                    .map(|e| (e.sid.clone(), pyint_i128(&e.profile.act_no)))
+                    .collect()
+            };
+            let mut detached: Vec<(String, i128)> = candidates
+                .into_iter()
+                .filter(|(sid, _)| self.session_state(sid).as_deref() == Some("DETACHED"))
+                .collect();
+            detached.sort_by_key(|(_, act)| *act);
+            if let Some((sid, _)) = detached.into_iter().next() {
+                if !op.cancelled.load(Ordering::SeqCst) {
+                    self.rebind_detached(&sid, by_id);
+                }
+                return;
             }
-            return;
         }
         if self.templates.is_empty() {
+            op.close_preopened();
             return;
         }
         if lock(&self.inner).sessions.len() >= self.max_sessions {
@@ -1038,6 +1144,7 @@ impl Shared {
                 "已達 max_sessions={}，忽略裝置 {by_id}",
                 self.max_sessions
             ));
+            op.close_preopened();
             return;
         }
         self.attach_dynamic(by_id, op);
@@ -1123,6 +1230,240 @@ impl Shared {
             && inner.device_path(by_id) == Some(real)
     }
 
+    /// OD-63：以 device.attach 的獨占開埠取得佔位裝置，再將同一 handle 交給 dynamic 偵測與正式 bridge。
+    fn attach_released_placeholder(
+        self: &Arc<Self>,
+        sid: &str,
+        force: bool,
+    ) -> Result<PyDict, PyErr> {
+        let (by_id, real, selector, uart, already_inflight) = {
+            let inner = lock(&self.inner);
+            if inner.stopping {
+                return Err(stopping_error());
+            }
+            let Some(entry) = inner.sessions.get(sid) else {
+                return Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_NOT_FOUND",
+                    "selector" => sid.to_string()
+                });
+            };
+            if !entry.released_placeholder {
+                return Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_NOT_FOUND",
+                    "selector" => sid.to_string()
+                });
+            }
+            let by_id = entry.profile.device_by_id.clone();
+            let selector = entry.profile.com.clone();
+            let Some(real) = inner.device_path(&by_id).map(str::to_string) else {
+                return Ok(device_not_present_reply(&selector, &by_id));
+            };
+            (
+                by_id.clone(),
+                real,
+                selector,
+                entry.profile.template.uart.clone(),
+                inner.inflight.contains_key(&by_id),
+            )
+        };
+        let Some(mut public) = self.session_public(sid) else {
+            return Ok(pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_NOT_FOUND",
+                "selector" => sid.to_string()
+            });
+        };
+        if already_inflight {
+            return Ok(pydict! { "ok" => true, "session" => public });
+        }
+
+        if !force {
+            let holder = self.uart_excl.probe_holders(&real);
+            if !holder.pids.is_empty() {
+                return Ok(device_still_held_reply(&selector, holder.pids));
+            }
+        }
+
+        let op = AttachOp::new(false, true, None);
+        {
+            let mut inner = lock(&self.inner);
+            if inner.stopping {
+                return Err(stopping_error());
+            }
+            let still_placeholder = inner.sessions.get(sid).is_some_and(|entry| {
+                entry.released_placeholder && entry.profile.device_by_id == by_id
+            });
+            if !still_placeholder {
+                return Ok(pydict! {
+                    "ok" => false,
+                    "error_code" => "SESSION_NOT_FOUND",
+                    "selector" => selector
+                });
+            }
+            if inner.inflight.contains_key(&by_id) {
+                return Ok(pydict! { "ok" => true, "session" => public });
+            }
+            if inner.device_path(&by_id) != Some(real.as_str()) {
+                return Ok(device_not_present_reply(&selector, &by_id));
+            }
+            inner.inflight.insert(by_id.clone(), op.clone());
+        }
+
+        let handle = match self
+            .serial
+            .open_exclusive(&DevicePath(real.clone()), &serial_config(&uart))
+        {
+            Ok(handle) => handle,
+            Err(OpenError::Held(holder)) | Err(OpenError::AccessDenied { holder, .. }) => {
+                self.finish_attach_op(&by_id, &op);
+                return Ok(device_still_held_reply(&selector, holder.pids));
+            }
+            Err(OpenError::NotFound(_)) => {
+                self.finish_attach_op(&by_id, &op);
+                return Ok(device_not_present_reply(&selector, &by_id));
+            }
+            Err(OpenError::Other(error)) => {
+                self.finish_attach_op(&by_id, &op);
+                return Err(PyErr::value_error(error.py_message));
+            }
+        };
+        let mut parts = Some(HandleParts::split(handle));
+        let retired = {
+            let mut inner = lock(&self.inner);
+            Self::retire_released_placeholder_locked(
+                &mut inner,
+                sid,
+                &by_id,
+                &real,
+                &op,
+                &mut parts,
+            )
+        };
+        let Some(retired) = retired else {
+            if let Some(parts) = parts {
+                let _ = parts.close();
+            }
+            self.finish_attach_op(&by_id, &op);
+            let inner = lock(&self.inner);
+            if inner.device_path(&by_id) != Some(real.as_str()) {
+                return Ok(device_not_present_reply(&selector, &by_id));
+            }
+            return Ok(pydict! {
+                "ok" => false,
+                "error_code" => "SESSION_RECOVERING",
+                "session" => public
+            });
+        };
+
+        public.insert("state", PyValue::from("ATTACHING"));
+        public.insert("last_error", PyValue::Null);
+        public.insert("released_by", PyValue::Null);
+        public.insert("released_at", PyValue::Null);
+        public.insert("released_reason", PyValue::Null);
+
+        self.persist_placeholder_retirement(sid);
+        self.stop_retired_placeholder_actor(sid, &retired);
+
+        self.spawn_attach_worker(&by_id, op);
+        Ok(pydict! { "ok" => true, "session" => public })
+    }
+
+    /// 結束指定 attach op；不會移除同一 by_id 後續登錄的新 op。
+    fn finish_attach_op(&self, by_id: &str, op: &AttachOp) {
+        let mut inner = lock(&self.inner);
+        if inner
+            .inflight
+            .get(by_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
+        {
+            inner.inflight.remove(by_id);
+        }
+        drop(inner);
+        self.cv.notify_all();
+    }
+
+    /// 鎖內退休已獨占開埠的佔位，將同一 handle 留給 dynamic-only attach worker。
+    fn retire_released_placeholder_locked(
+        inner: &mut Inner,
+        sid: &str,
+        by_id: &str,
+        real: &str,
+        op: &AttachOp,
+        parts: &mut Option<HandleParts>,
+    ) -> Option<Entry> {
+        let valid = !inner.stopping
+            && !op.cancelled.load(Ordering::SeqCst)
+            && inner.device_path(by_id) == Some(real)
+            && inner
+                .inflight
+                .get(by_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
+            && inner.sessions.get(sid).is_some_and(|entry| {
+                entry.released_placeholder && entry.profile.device_by_id == by_id
+            });
+        if !valid {
+            return None;
+        }
+
+        let entry = inner.sessions.shift_remove(sid).expect("已驗證佔位 entry");
+        inner
+            .pending_com
+            .insert(by_id.to_string(), entry.profile.com.clone());
+        inner.probe_paths.remove(sid);
+        inner.interactive.retain(|_, owner| owner != sid);
+        *lock(&op.preopened) = Some(Preopened {
+            real_path: real.to_string(),
+            parts: parts.take().expect("成功開埠後須交付預開 handle"),
+        });
+        Some(entry)
+    }
+
+    /// 持久化移除舊佔位的 released、binding 與 aliases，保留 pin／detected。
+    fn persist_placeholder_retirement(&self, sid: &str) {
+        let old_sid = sid.to_string();
+        if let Err(error) = self.commit_sync(|model| {
+            model.apply(StateDelta::Unreleased {
+                sid: old_sid.clone(),
+            });
+            model.apply(StateDelta::Binding {
+                sid: old_sid.clone(),
+                by_id: None,
+            });
+            let old_aliases: Vec<String> = model
+                .snapshot()
+                .aliases
+                .into_iter()
+                .filter(|(_, row)| {
+                    row.get("session_id").and_then(PyValue::as_str) == Some(old_sid.as_str())
+                })
+                .map(|(alias, _)| alias)
+                .collect();
+            for alias in old_aliases {
+                model.apply(StateDelta::AliasSet { alias, row: None });
+            }
+        }) {
+            self.warn(format!(
+                "state.json 寫入失敗（retire RELEASED placeholder {sid}）：{error:?}"
+            ));
+        }
+    }
+
+    /// 舊 actor 已自 manager 索引退休；只在 manager 鎖外通知並等待它退出。
+    fn stop_retired_placeholder_actor(&self, sid: &str, entry: &Entry) {
+        let (reply, rx) = crossbeam_channel::bounded(1);
+        if entry
+            .actor
+            .control
+            .send_timeout(ControlEvent::Shutdown { reply }, QUERY_TIMEOUT)
+            .is_err()
+            || rx.recv_timeout(QUERY_TIMEOUT).is_err()
+        {
+            self.warn(format!("RELEASED 佔位 actor 未能及時停止（session={sid}）"));
+        }
+    }
+
     /// `_attach_by_id_dynamic`：pin > sticky > detect > fallback；PROBE 與正式 bridge 共用同一預開 handle。
     fn attach_dynamic(self: &Arc<Self>, by_id: &str, op: &AttachOp) {
         let Some(real) = lock(&self.inner).device_path(by_id).map(str::to_string) else {
@@ -1149,15 +1490,24 @@ impl Shared {
                 source = "sticky";
             }
         }
-        let handle = match self.gated_open(by_id, &real, op) {
-            None => return,
-            Some(Ok(h)) => h,
-            Some(Err(e)) => {
-                self.record_dynamic_open_failure(by_id, &real, &e, tpl.as_ref(), source);
+        let mut parts = match op.take_preopened() {
+            Some(pre) if pre.real_path == real => pre.parts,
+            Some(pre) => {
+                let _ = pre.parts.close();
                 return;
             }
+            None => {
+                let handle = match self.gated_open(by_id, &real, op) {
+                    None => return,
+                    Some(Ok(h)) => h,
+                    Some(Err(e)) => {
+                        self.record_dynamic_open_failure(by_id, &real, &e, tpl.as_ref(), source);
+                        return;
+                    }
+                };
+                HandleParts::split(handle)
+            }
         };
-        let mut parts = HandleParts::split(handle);
         if !self.still_valid(by_id, &real, op) {
             // 已越過 gate、open 返回時已 stopping／取消：立即關閉（零 TX）。
             let _ = parts.close();
@@ -2323,7 +2673,9 @@ impl EffectExecutor for ManagerExec {
                 let _ = self.shared.note_tx.send(note);
             }
             Effect::Warn(msg) => self.shared.warn(msg),
-            Effect::Reattach { by_id, .. } => self.shared.spawn_attach_with(&by_id, true),
+            Effect::Reattach { by_id, .. } => {
+                self.shared.spawn_attach_with(&by_id, true, false, None)
+            }
             Effect::SettleTx { epoch, op_id } => {
                 if let Some(worker) = lock(&self.workers).get(&epoch) {
                     let _ = worker.tx().settle(op_id);
@@ -2597,6 +2949,13 @@ impl SessionManager {
         lock(&self.shared.inner)
             .resolve(selector)
             .map(|e| e.sid.clone())
+    }
+
+    /// OD-63：以 manager device snapshot 重新開啟缺失 template 的 RELEASED 佔位，交給 dynamic template 偵測。
+    /// RPC 路由由後續接線項目呼叫；此入口可先由 manager 層回歸直接驗收。
+    pub fn attach_released_placeholder(&self, sid: &str, force: bool) -> Result<PyDict, PyErr> {
+        self.pump();
+        self.shared.attach_released_placeholder(sid, force)
     }
 
     /// 將 session 請求路由到對應 actor 並等待回覆。
@@ -3315,14 +3674,11 @@ impl SessionManager {
     /// 只供測試（test-fakes）：注入可觀察的在途 attach 標記，驗證早退不取消也不等待。
     #[cfg(feature = "test-fakes")]
     pub fn insert_inflight_attach_for_test(&self, by_id: &str) -> Arc<AtomicBool> {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        lock(&self.shared.inner).inflight.insert(
-            by_id.to_string(),
-            AttachOp {
-                cancelled: Arc::clone(&cancelled),
-                after_clear: Arc::new(AtomicBool::new(false)),
-            },
-        );
+        let op = AttachOp::new(false, false, None);
+        let cancelled = Arc::clone(&op.cancelled);
+        lock(&self.shared.inner)
+            .inflight
+            .insert(by_id.to_string(), op);
         cancelled
     }
 
