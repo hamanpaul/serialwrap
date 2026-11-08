@@ -5,6 +5,14 @@
       "linux": {
         "nodeids": [
           "cargo:sw-cli::rollback_holders_p7::update_confirm_released_stays_fail_closed_when_multi_open_scan_says_ok",
+          "cargo:sw-cli::service_wintask::daemon_stop_cli_routes_to_service_in_wintask",
+          "cargo:sw-cli::service_wintask::restart_is_graceful_stop_then_run",
+          "cargo:sw-cli::service_wintask::stop_daemon_unreachable_task_not_running_no_end",
+          "cargo:sw-cli::service_wintask::stop_daemon_unreachable_task_query_failed_reports_failure",
+          "cargo:sw-cli::service_wintask::stop_daemon_unreachable_task_running_ends",
+          "cargo:sw-cli::service_wintask::stop_sends_rpc_before_end",
+          "cargo:sw-cli::service_wintask::stop_wait_timeout_then_end",
+          "cargo:sw-cli::service_wintask::systemd_modes_unchanged",
           "cargo:sw-cli::update_guard::guard_background_capture_alone_does_not_block",
           "cargo:sw-cli::update_guard::guard_daemon_absent_force_same_as_without",
           "cargo:sw-cli::update_guard::guard_daemon_absent_passes",
@@ -480,6 +488,10 @@
           "cargo:sw-daemon::shutdown_order::shutdown_hotplug_after_phase1_never_opens_uart",
           "cargo:sw-daemon::shutdown_order::shutdown_inflight_attach_drained_before_wal_close",
           "cargo:sw-daemon::shutdown_order::stopping_gate_before_watcher_stop",
+          "cargo:sw-daemon::wintask_staging_isolation::every_isolation_var_comes_from_the_batch",
+          "cargo:sw-daemon::wintask_staging_isolation::staging_batch_env_makes_daemon_isolation_hold_and_allowlist_effective",
+          "cargo:sw-daemon::wintask_staging_isolation::staging_config_parsed_by_daemon_excludes_registry_coms",
+          "cargo:sw-daemon::wintask_staging_isolation::without_staging_batch_daemon_rejects_allowlist",
           "cargo:sw-pal::fs_ops_p7::create_truncate_overwrites_stale_tmp",
           "cargo:sw-pal::fs_ops_p7::create_truncate_text_uses_platform_newline",
           "cargo:sw-pal::fs_ops_p7::file_size_none_when_missing",
@@ -508,6 +520,19 @@
           "cargo:sw-pal::usb_topology::busid_follows_dangling_device_symlink",
           "cargo:sw-pal::usb_topology::busid_from_sysfs_tempdir",
           "cargo:sw-pal::usb_topology::busid_resolves_existing_prefix_when_device_link_missing",
+          "cargo:sw-pal::wintask_staging::batch_clears_inherited_env_then_isolates_every_dir",
+          "cargo:sw-pal::wintask_staging::batch_runs_staging_daemon_on_test_port_only",
+          "cargo:sw-pal::wintask_staging::config_excludes_every_registry_com_and_allowlists_com250",
+          "cargo:sw-pal::wintask_staging::pick_free_port_never_returns_production_port",
+          "cargo:sw-pal::wintask_staging::registry_query_failure_is_fail_closed",
+          "cargo:sw-pal::wintask_staging::runtime_test_only_uses_named_task_apis",
+          "cargo:sw-pal::wintask_staging::simulated_batch_env_drops_inherited_serialwrap_vars",
+          "cargo:sw-pal::wintask_staging::staging_refuses_production_port",
+          "cargo:sw-pal::wintask_staging::support_json_parser_reads_health_status",
+          "cargo:sw-pal::wintask_staging::support_wal_tail_detects_torn_and_crc_mismatch",
+          "cargo:sw-pal::wintask_staging::support_xml_parser_reads_task_xml_by_element_path",
+          "cargo:sw-pal::wintask_staging::task_name_guard_only_accepts_test_names",
+          "cargo:sw-pal::wintask_staging::win_runner_forwards_schtasks_authorization",
           "cargo:sw-proto::runtime_paths_golden::events_log_path_env_override"
         ],
         "selector": {
@@ -26750,6 +26775,28 @@
             "tests/test_refine_ownership.py",
             "tests/test_stage0_bridge_drain.py"
           ]
+        }
+      }
+    },
+    "s2_p8_t13:flash_endpoint_cap_posix_pty": {
+      "linux": {
+        "nodeids": [
+          "cargo:sw-core::flash_coordinator::cap_posix_pty__endpoint_slave_never_exclusive"
+        ],
+        "selector": {
+          "argv": [
+            "--package",
+            "sw-core",
+            "--features",
+            "test-fakes",
+            "--test",
+            "flash_coordinator",
+            "--",
+            "--ignored",
+            "cap_posix_pty__"
+          ],
+          "markexpr": "",
+          "paths": []
         }
       }
     },
