@@ -26288,6 +26288,7 @@
           "cargo:sw-core::session_core_console::console_disconnect_drops_owner_and_deferred",
           "cargo:sw-core::session_core_console::drain_phase1_resets_console_state_keeps_consoles",
           "cargo:sw-core::session_core_console::empty_interactive_command_reopens_admission",
+          "cargo:sw-core::session_core_console::file_transfer_busy_during_replay_hold_not_queued",
           "cargo:sw-core::session_core_console::flash_drops_input_diagnosed",
           "cargo:sw-core::session_core_console::foreground_busy_tracks_foreground_without_hold",
           "cargo:sw-core::session_core_console::gate_closed_input_replayed_on_finish",
