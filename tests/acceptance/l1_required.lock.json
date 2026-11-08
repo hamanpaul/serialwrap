@@ -26902,6 +26902,7 @@
           "cargo:sw-core::session_core::credentials_warning_uses_python_missing_path_placeholder",
           "cargo:sw-core::session_core::detached_device_attached_opens_and_attaching",
           "cargo:sw-core::session_core::detached_submit_not_ready",
+          "cargo:sw-core::session_core::device_detached_drains_after_permanent_handoff_freeze",
           "cargo:sw-core::session_core::device_detached_starts_drain_removed",
           "cargo:sw-core::session_core::device_removed_during_attach_uses_python_last_error",
           "cargo:sw-core::session_core::empty_env_file_values_remain_unresolved",

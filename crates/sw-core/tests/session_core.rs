@@ -541,6 +541,22 @@ fn background_bridge_open_does_not_advance_after_permanent_handoff_freeze() {
     assert_ne!(h.core.state(), SessionState::Ready, "凍結後不得推進至 READY");
 }
 
+#[test]
+fn device_detached_drains_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.reg.admission_gate().freeze();
+
+    let effects = h.feed(ControlEvent::DeviceDetached {
+        by_id: DEVICE_BY_ID.into(),
+        reason: DetachReason::Removed,
+    });
+
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::BeginDrain { .. })),
+        "凍結後的已受理裝置移除仍須啟動 drain 收尾");
+    assert_eq!(h.core.state(), SessionState::Recovering, "移除事件須收斂 session 狀態");
+}
+
 fn start_tentative_handoff(h: &mut CoreHarness) -> String {
     let token = match h.reg.admission_gate().freeze_if_idle("update") {
         sw_core::admission::FreezeOutcome::Frozen { token, created: true } => token,
