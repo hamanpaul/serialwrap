@@ -61,6 +61,13 @@ fn wait_for_stop_signal(signals: libc::sigset_t, sender: Sender<()>) {
     }
 }
 
+/// 停止訊號迴圈（P8 Task 12）：第一次由 `next()` 取得的訊號送出停止通知；停止序進行中的後續訊號只以 `log`
+/// 記一行、不再通知（不改變停止步驟與結果）。`next()` 回 `None`（`sigwait` 失敗）即結束。
+#[allow(dead_code)]
+fn stop_signal_loop(_next: impl FnMut() -> Option<libc::c_int>, _sender: &Sender<()>, _log: &mut dyn FnMut(String)) {
+    todo!("P8-T12")
+}
+
 fn stop_signal_set() -> PalResult<libc::sigset_t> {
     let mut signals: libc::sigset_t = unsafe { std::mem::zeroed() };
     let mut rc = unsafe { libc::sigemptyset(&mut signals) };
@@ -102,6 +109,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_stop_signal_only_logs() {
+        let mut seq = vec![Some(libc::SIGTERM), Some(libc::SIGINT), Some(libc::SIGTERM), None].into_iter();
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let mut logs = Vec::new();
+        stop_signal_loop(|| seq.next().flatten(), &tx, &mut |m| logs.push(m));
+        assert_eq!(rx.try_iter().count(), 1, "只有第一次訊號觸發停止");
+        assert_eq!(
+            logs,
+            vec![
+                "serialwrapd: 停止序進行中，忽略重複的停止訊號 SIGINT".to_string(),
+                "serialwrapd: 停止序進行中，忽略重複的停止訊號 SIGTERM".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn failed_signal_thread_spawn_restores_previous_mask() {

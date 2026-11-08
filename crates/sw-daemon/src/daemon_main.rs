@@ -908,7 +908,7 @@ enum Stage {
     WatcherStart,
     Bound,
     EndpointWritten,
-    ServerStopped,
+    ServerStopAccept,
     ShutdownGate,
     WatcherStopped,
     SessionsDrained { flushed: Vec<(String, String)>, stalled: Vec<String> },
@@ -1253,7 +1253,7 @@ fn run_inner(argv: Vec<String>, p: Platform, hooks: &Hooks) -> i32 {
     if !server.stop(SERVER_STOP_BUDGET) {
         incomplete.push("rpc handlers did not converge".to_string()); // SC-11 ① 停 server（等進行中的 handler 回應）
     }
-    hooks.trace(Stage::ServerStopped);
+    hooks.trace(Stage::ServerStopAccept);
     manager.begin_shutdown(); // ①b stopping gate（R1-F2）：之後熱插／bootstrap／recover 不再 open
     hooks.trace(Stage::ShutdownGate);
     watcher.stop(); // ② 停 watcher（drain 前，避免 drain 中觸發 attach）
@@ -1346,6 +1346,8 @@ fn write_endpoint(env: &EnvSnapshot, paths: &RuntimePaths, p: &Platform, endpoin
 ///
 /// 計畫原列的變體表缺 `ShutdownGate`，但 `sigterm_graceful_exit_0_and_flushes_queue` 的停機序列斷言需要它
 /// （stopping gate 先於 watcher 停止，R1-F2），故於此補上。
+///
+/// P8 Task 12：停止序（arch §6.1 的 1～7）每一步各對應一個事件，[`TraceEvent::shutdown_step`] 回計畫的步驟名。
 #[cfg(feature = "test-fakes")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraceEvent {
@@ -1356,12 +1358,58 @@ pub enum TraceEvent {
     WatcherStart,
     Bound,
     EndpointWritten,
-    ServerStopped,
+    /// 1 `server.stop_accept`：只停 accept，不等進行中的 handler。
+    ServerStopAccept,
+    /// 1a `manager.begin_shutdown`（stopping gate）。
     ShutdownGate,
+    /// 1b `watcher.stop`。
     WatcherStopped,
+    /// 1c `engine.close_intake`。
+    EngineIntakeClosed,
+    /// 2 `flash.stop`（`EndpointStopReceipt` 的 `joined`／`unlinked`；無端點時兩者皆 true）。
+    FlashStopped { joined: bool, unlinked: bool },
+    /// 3 `drain.phase1`：全部 session 已送出 Shutdown 並越過 Phase 1。
+    DrainPhase1,
+    /// 4 `server.join_handlers`：逾時仍在執行的 method（收斂時為空）。
+    HandlersJoined { pending: Vec<String> },
+    /// 5 `drain.phase2`：未回條的 drain 目標。
+    DrainPhase2 { stalled: Vec<String> },
+    /// 5 `flush_shutdown`：本次停機新增的 `FLUSHED_BY_SHUTDOWN` 命令與未回條目標。
     SessionsDrained { flushed: Vec<(String, String)>, stalled: Vec<String> },
+    /// 5a `engine.stop`：未回收的 event handler（rule id）。
+    EngineStopped { unreaped: Vec<String> },
+    /// 6 `wal.sync_close`。
     WalShutdown { ok: bool },
+    /// 7 `lock.release`。
     LockReleased,
+}
+
+#[cfg(feature = "test-fakes")]
+impl TraceEvent {
+    /// 停止序事件 → 計畫 Task 12 的步驟名（啟動序事件回 `None`）。
+    pub fn shutdown_step(&self) -> Option<&'static str> {
+        Some(match self {
+            TraceEvent::ServerStopAccept => "server.stop_accept",
+            TraceEvent::ShutdownGate => "manager.begin_shutdown",
+            TraceEvent::WatcherStopped => "watcher.stop",
+            TraceEvent::EngineIntakeClosed => "engine.close_intake",
+            TraceEvent::FlashStopped { .. } => "flash.stop",
+            TraceEvent::DrainPhase1 => "drain.phase1",
+            TraceEvent::HandlersJoined { .. } => "server.join_handlers",
+            TraceEvent::DrainPhase2 { .. } => "drain.phase2",
+            TraceEvent::SessionsDrained { .. } => "flush_shutdown",
+            TraceEvent::EngineStopped { .. } => "engine.stop",
+            TraceEvent::WalShutdown { .. } => "wal.sync_close",
+            TraceEvent::LockReleased => "lock.release",
+            TraceEvent::InitialScan
+            | TraceEvent::Rank
+            | TraceEvent::UpdateDevices
+            | TraceEvent::BootstrapAttach
+            | TraceEvent::WatcherStart
+            | TraceEvent::Bound
+            | TraceEvent::EndpointWritten => return None,
+        })
+    }
 }
 
 #[cfg(feature = "test-fakes")]
@@ -1375,7 +1423,7 @@ impl From<Stage> for TraceEvent {
             Stage::WatcherStart => TraceEvent::WatcherStart,
             Stage::Bound => TraceEvent::Bound,
             Stage::EndpointWritten => TraceEvent::EndpointWritten,
-            Stage::ServerStopped => TraceEvent::ServerStopped,
+            Stage::ServerStopAccept => TraceEvent::ServerStopAccept,
             Stage::ShutdownGate => TraceEvent::ShutdownGate,
             Stage::WatcherStopped => TraceEvent::WatcherStopped,
             Stage::SessionsDrained { flushed, stalled } => TraceEvent::SessionsDrained { flushed, stalled },
@@ -1390,11 +1438,18 @@ impl From<Stage> for TraceEvent {
 /// 兩個 commit hook 掛在 **release 持久化**的 commit 前後（與 Python Stage 0 鉤子 `_save_release_state` 同一點），
 /// 而非 `StateStore` 的每一次 commit：Rust 與 Python 一樣在啟動時（建構子尾端）就寫一次 `state.json`，
 /// 若掛在每次 commit，`restart_after_commit` 的子程序會在收到 release 請求前就於啟動存檔中止。
+///
+/// P8 Task 12：`block_flash_endpoint_stop` 使 `serialwrap-ttyMCU` thread 自停止要求起忽略 `EndpointShutdown`
+/// （超過 `FlashEndpoint::stop` 的 2.0 s join 上限才結束）；`rpc_call` 於每筆 RPC 分派前以 method 名呼叫
+/// （測試以此注入不回應取消的 handler）。
 #[cfg(feature = "test-fakes")]
+#[derive(Default)]
 pub struct DaemonHooks {
     pub before_state_commit: Option<Box<dyn Fn() + Send + Sync>>,
     pub after_state_commit: Option<Box<dyn Fn() + Send + Sync>>,
     pub trace: Option<Box<dyn Fn(TraceEvent) + Send + Sync>>,
+    pub block_flash_endpoint_stop: bool,
+    pub rpc_call: Option<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// in-process 執行 daemon（僅 `test-fakes` 編譯）；語意與 `run` 相同（含未攔截 panic → 1），另接受測試掛鉤。
@@ -1404,6 +1459,8 @@ pub fn run_with_hooks(argv: Vec<String>, platform: Platform, hooks: DaemonHooks)
         before_state_commit,
         after_state_commit,
         trace,
+        block_flash_endpoint_stop: _,
+        rpc_call: _,
     } = hooks;
     let inner = Hooks {
         before_release_commit: before_state_commit.map(Arc::from),

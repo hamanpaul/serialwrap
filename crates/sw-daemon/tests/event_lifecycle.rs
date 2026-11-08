@@ -32,6 +32,7 @@ fn no_hooks() -> DaemonHooks {
         before_state_commit: None,
         after_state_commit: None,
         trace: None,
+        ..DaemonHooks::default()
     }
 }
 
@@ -164,6 +165,7 @@ fn shutdown_aborts_long_handler_within_budget() {
                     *ws.lock().unwrap() = Some(Instant::now());
                 }
             })),
+            ..DaemonHooks::default()
         };
         let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
         let end = Instant::now();
@@ -308,6 +310,7 @@ fn shutdown_closes_event_intake_before_drain_behavior() {
                     g.store(false, Ordering::SeqCst);
                 });
             })),
+            ..DaemonHooks::default()
         };
         let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
         std::process::exit(code);

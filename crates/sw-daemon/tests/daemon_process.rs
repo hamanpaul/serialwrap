@@ -34,6 +34,7 @@ fn trace_hooks(sink: Arc<Mutex<Vec<TraceEvent>>>) -> DaemonHooks {
         before_state_commit: None,
         after_state_commit: None,
         trace: Some(Box::new(move |ev| sink.lock().unwrap().push(ev))),
+        ..DaemonHooks::default()
     }
 }
 
@@ -341,7 +342,7 @@ fn sigterm_graceful_exit_0_and_flushes_queue() {
     assert_eq!(
         t[tail..].to_vec(),
         vec![
-            TraceEvent::ServerStopped,
+            TraceEvent::ServerStopAccept,
             TraceEvent::ShutdownGate,
             TraceEvent::WatcherStopped,
             TraceEvent::SessionsDrained {
@@ -766,6 +767,7 @@ fn uncaught_panic_exit_1() {
                     panic!("slice21 T19 injected panic");
                 }
             })),
+            ..DaemonHooks::default()
         };
         let code = run_with_hooks(vec!["serialwrapd".to_string()], sw_pal::native(), hooks);
         std::process::exit(code);

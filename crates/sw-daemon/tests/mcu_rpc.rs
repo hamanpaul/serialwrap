@@ -250,6 +250,7 @@ fn link_trace(console: Arc<RigFlashConsole>, sink: Arc<Mutex<Vec<(TraceEvent, us
             let n = console.links().len();
             sink.lock().unwrap().push((ev, n));
         })),
+        ..DaemonHooks::default()
     }
 }
 
@@ -301,6 +302,7 @@ fn daemon_ttymcu_path_env_override() {
         before_state_commit: None,
         after_state_commit: None,
         trace: None,
+        ..DaemonHooks::default()
     };
     let (code, during) = run_and_stop(&env, platform, hooks, console.clone());
     assert_eq!(code, 0);
@@ -386,6 +388,7 @@ fn child_panic_after_flash_start() -> ! {
                 panic!("{PANIC_MSG}");
             }
         })),
+        ..DaemonHooks::default()
     };
     let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
     if console.links().is_empty() {
@@ -417,6 +420,7 @@ fn ttymcu_unlinked_after_daemon_exit_all_paths() {
             before_state_commit: None,
             after_state_commit: None,
             trace: None,
+            ..DaemonHooks::default()
         };
         let code = run_with_hooks(vec!["serialwrapd".to_string()], platform, hooks);
         assert_eq!(code, 1, "RPC 綁定失敗 exit 1");
@@ -433,6 +437,7 @@ fn ttymcu_unlinked_after_daemon_exit_all_paths() {
             before_state_commit: None,
             after_state_commit: None,
             trace: None,
+            ..DaemonHooks::default()
         };
         let (code, during) = run_and_stop(&env, platform, hooks, console.clone());
         assert_eq!(code, 0);

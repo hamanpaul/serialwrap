@@ -672,6 +672,23 @@ pub fn in_process_platform(
     devices: Vec<(String, DeviceInfo)>,
     fixture: Fixture,
 ) -> sw_pal::Platform {
+    in_process_platform_with_handles(vars, devices, fixture).0
+}
+
+/// `in_process_platform` 的替身控制柄（P8 Task 12 停止序測試：觀察假裝置、於停止序中途改寫裝置快照）。
+pub struct InProcHandles {
+    /// 依 `devices` 順序的假裝置（`real_path` 對應）。
+    pub devices: Vec<sw_pal::fakes::serial::FakeDevice>,
+    /// daemon 建立裝置來源後才有值（`p.devices` 工廠被呼叫時）；`set` 改寫之後每輪掃描的快照。
+    pub script: std::sync::Arc<std::sync::Mutex<Option<sw_pal::fakes::FakeDeviceScript>>>,
+}
+
+/// 同 `in_process_platform`，另回傳替身控制柄（行為與 `in_process_platform` 完全相同）。
+pub fn in_process_platform_with_handles(
+    vars: &BTreeMap<String, String>,
+    devices: Vec<(String, DeviceInfo)>,
+    fixture: Fixture,
+) -> (sw_pal::Platform, InProcHandles) {
     use sw_pal::fakes::{FakeDeviceSource, FakeEnv, FakeSerialBackend, FakeUartExclusive, FakeWriteStep};
     use std::sync::Arc;
 
@@ -690,8 +707,10 @@ pub fn in_process_platform(
 
     let serial = FakeSerialBackend::new();
     let mut first_dev = None;
+    let mut all_devs = Vec::new();
     for (_, info) in &devices {
         let dev = serial.add_device(&info.real_path);
+        all_devs.push(dev.clone());
         if fixture != Fixture::None {
             install_shell_replies(&dev);
             if first_dev.is_none() {
@@ -728,8 +747,12 @@ pub fn in_process_platform(
     p.serial = serial;
     p.uart_excl = Arc::new(FakeUartExclusive { report: Default::default() });
     let snapshot = devices.clone();
+    let script: Arc<std::sync::Mutex<Option<sw_pal::fakes::FakeDeviceScript>>> = Arc::new(std::sync::Mutex::new(None));
+    let script_slot = script.clone();
     p.devices = Box::new(move |_sel: sw_pal::traits::DeviceSelection| -> Box<dyn sw_pal::traits::DeviceSource> {
-        Box::new(FakeDeviceSource::new(snapshot.clone()).0)
+        let (source, handle) = FakeDeviceSource::new(snapshot.clone());
+        *script_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        Box::new(source)
     });
     if fixture == Fixture::WalSyncFailure {
         p.wal_fs = Arc::new(SyncFailWalFs(p.wal_fs.clone()));
@@ -755,7 +778,7 @@ pub fn in_process_platform(
         }
         _ => {}
     }
-    p
+    (p, InProcHandles { devices: all_devs, script })
 }
 
 /// 輪詢 session 狀態（in-process 夾具驅動 thread 用；逾時 panic）。
@@ -834,6 +857,7 @@ pub fn child_daemon_abort_after_commit() {
         before_state_commit: None,
         after_state_commit: Some(Box::new(|| std::process::abort())),
         trace: None,
+        ..DaemonHooks::default()
     };
     let code = run_with_hooks(vec!["serialwrapd".to_string()], sw_pal::native(), hooks);
     std::process::exit(code)
@@ -845,6 +869,7 @@ pub fn child_daemon_abort_before_commit() {
         before_state_commit: Some(Box::new(|| std::process::abort())),
         after_state_commit: None,
         trace: None,
+        ..DaemonHooks::default()
     };
     let code = run_with_hooks(vec!["serialwrapd".to_string()], sw_pal::native(), hooks);
     std::process::exit(code)

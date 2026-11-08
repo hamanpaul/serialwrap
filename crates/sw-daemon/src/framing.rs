@@ -396,6 +396,16 @@ impl RpcServer {
         }
     }
 
+    /// P8 Task 12 停止序步驟 1：停 accept 並 close listener、對全部連線設停止旗標；不等進行中的 handler。
+    pub fn stop_accept(&self) {
+        todo!("P8-T12")
+    }
+
+    /// P8 Task 12 停止序步驟 4：在 `deadline` 前 join 全部連線 thread；逾時回仍在 handler 內的 method 清單。
+    pub fn join_handlers(self, _deadline: Instant) -> Vec<String> {
+        todo!("P8-T12")
+    }
+
     /// 回傳 handler 是否全部收斂（arch §6.2 停止流程 ①～④）。
     ///
     /// ① 停 accept 並 close listener；② 對全部連線設停止旗標（讀逾時 100 ms 讓閒置／半行的讀迴圈醒來即結束）；
