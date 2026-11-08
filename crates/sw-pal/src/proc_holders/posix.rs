@@ -164,7 +164,16 @@ fn probe_holders_excluding(
         let fds = match fs.list_dir(&fd_dir) {
             Ok(fds) => fds,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                status = HolderScanStatus::Permission;
+                // 只有已確認他 uid 的權限限制可降為局部不可讀；同 uid 或 owner 未知仍維持保守分類。
+                let owner_uid = fs.process_uid(proc_root, pid);
+                if current_uid
+                    .zip(owner_uid)
+                    .is_some_and(|(current, owner)| current != owner)
+                {
+                    other_uid_unreadable = true;
+                } else {
+                    status = HolderScanStatus::Permission;
+                }
                 continue;
             }
             Err(_) => {

@@ -1,4 +1,4 @@
-//! WP5-9 ITEM 1：fd stat 權限錯誤依行程 owner UID 分類，並接到開埠判定。
+//! WP5-9：fd 權限錯誤依行程 owner UID 分類，並接到開埠判定。
 #![cfg(all(unix, feature = "test-fakes"))]
 
 use std::io;
@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use sw_pal::fakes::FakeHolderFs;
 use sw_pal::proc_holders::posix::{probe_holders_with, TtyStat};
+use sw_pal::proc_scan::posix::tty_holders_with;
 use sw_pal::serial::posix::{open_sequence, TtyOpenOps};
 use sw_pal::{HolderReport, HolderScanStatus};
 
@@ -34,6 +35,10 @@ fn non_tty_stat() -> TtyStat {
 
 fn fd_path(pid: u32) -> PathBuf {
     Path::new(PROC).join(pid.to_string()).join("fd/3")
+}
+
+fn fd_dir_path(pid: u32) -> PathBuf {
+    Path::new(PROC).join(pid.to_string()).join("fd")
 }
 
 fn proc_with_pids(pids: &[u32]) -> FakeHolderFs {
@@ -96,6 +101,90 @@ fn wp59_unknown_owner_unreadable_fd_stays_permission() {
     assert!(report.pids.is_empty());
     assert_eq!(report.status, HolderScanStatus::Permission);
     assert!(report.holder_unknown);
+}
+
+#[test]
+fn wp59_other_uid_fd_dir_unlistable_is_partial_not_unknown() {
+    let mut fs = proc_with_pids(&[7301, 7302]);
+    fs.set_process_uid(7301, Some(OTHER_UID));
+    fs.fail_dir(fd_dir_path(7301), io::ErrorKind::PermissionDenied);
+    fs.set_stat(fd_path(7302), non_tty_stat());
+
+    let report = probe_holders_with(&fs, Path::new(PROC), TTY, None);
+
+    assert!(report.pids.is_empty());
+    assert_eq!(report.status, HolderScanStatus::PartialOtherUid);
+    assert!(!report.holder_unknown);
+}
+
+#[test]
+fn wp59_unknown_owner_fd_dir_unlistable_stays_permission() {
+    let mut fs = proc_with_pids(&[7311]);
+    fs.fail_dir(fd_dir_path(7311), io::ErrorKind::PermissionDenied);
+
+    let report = probe_holders_with(&fs, Path::new(PROC), TTY, None);
+
+    assert!(report.pids.is_empty());
+    assert_eq!(report.status, HolderScanStatus::Permission);
+    assert!(report.holder_unknown);
+}
+
+#[test]
+fn wp59_same_uid_and_other_uid_fd_dir_denials_are_permission_in_any_order() {
+    for pids in [[7321, 7322], [7322, 7321]] {
+        let mut fs = proc_with_pids(&pids);
+        fs.set_process_uid(7321, Some(OTHER_UID));
+        fs.set_process_uid(7322, Some(SELF_UID));
+        fs.fail_dir(fd_dir_path(7321), io::ErrorKind::PermissionDenied);
+        fs.fail_dir(fd_dir_path(7322), io::ErrorKind::PermissionDenied);
+
+        let report = probe_holders_with(&fs, Path::new(PROC), TTY, None);
+
+        assert!(report.pids.is_empty());
+        assert_eq!(report.status, HolderScanStatus::Permission);
+        assert!(report.holder_unknown);
+    }
+}
+
+#[test]
+fn wp59_other_uid_denial_and_other_io_error_are_unknown_in_any_order() {
+    for pids in [[7331, 7332], [7332, 7331]] {
+        let mut fs = proc_with_pids(&pids);
+        fs.set_process_uid(7331, Some(OTHER_UID));
+        fs.fail_dir(fd_dir_path(7331), io::ErrorKind::PermissionDenied);
+        fs.fail_dir(fd_dir_path(7332), io::ErrorKind::Other);
+
+        let report = probe_holders_with(&fs, Path::new(PROC), TTY, None);
+
+        assert!(report.pids.is_empty());
+        assert_eq!(report.status, HolderScanStatus::Unknown);
+        assert!(report.holder_unknown);
+    }
+}
+
+#[test]
+fn wp59_identified_holder_is_retained_with_other_uid_fd_dir_denial() {
+    let mut fs = proc_with_pids(&[7341, 7342]);
+    fs.set_stat(fd_path(7341), tty_stat());
+    fs.set_process_uid(7342, Some(OTHER_UID));
+    fs.fail_dir(fd_dir_path(7342), io::ErrorKind::PermissionDenied);
+
+    let report = probe_holders_with(&fs, Path::new(PROC), TTY, None);
+
+    assert_eq!(report.pids, vec![7341]);
+    assert_eq!(report.status, HolderScanStatus::PartialOtherUid);
+    assert!(!report.holder_unknown);
+}
+
+#[test]
+fn wp59_health_scan_keeps_fd_dir_permission_classification() {
+    let mut fs = proc_with_pids(&[7351]);
+    fs.fail_dir(fd_dir_path(7351), io::ErrorKind::PermissionDenied);
+
+    let (pids, status) = tty_holders_with(&fs, Path::new(PROC), &[7351], &[PathBuf::from(TTY)]);
+
+    assert!(pids.is_empty());
+    assert_eq!(status, HolderScanStatus::Permission);
 }
 
 #[derive(Default)]
