@@ -1700,6 +1700,38 @@ fn wp510_b_open_error_without_fallback_reserves_com_until_unplug() {
 }
 
 #[test]
+fn wp510_b_no_fallback_com_reservation_does_not_survive_restart() {
+    const SID: &str = "gone-template:COM3";
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_no_fallback_placeholder_rig();
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.serial.fail_next_open(REAL, wp510_b_permission_error());
+    m.mgr.update_devices(&m.snapshot());
+
+    let response = rpc(m.mgr.attach_released_placeholder(&sid, false));
+
+    assert!(is_ok(&response), "一般開埠錯誤應交給 dynamic：{response:?}");
+    wait_until("無 fallback handoff 的第二次 dynamic 開埠", || {
+        m.serial.open_attempts(REAL) == 2 && m.mgr.resolve(SID).is_none()
+    });
+    assert_eq!(m.mgr.resolve("COM3"), None);
+    assert_eq!(m.mgr.com_for_by_id(BY_ID).as_deref(), Some("COM3"));
+
+    // OD-63 編排者裁決：預留只存在於裝置仍在線且 daemon 未重啟的期間。
+    m.mgr.begin_shutdown();
+    let restarted = m.restart();
+    assert_eq!(restarted.mgr.com_for_by_id(BY_ID), None);
+    restarted.mgr.prepare_dynamic_rank(&[BY_ID.to_string()]);
+    assert_eq!(
+        restarted.mgr.com_for_by_id(BY_ID).as_deref(),
+        Some("COM0"),
+        "重啟後應按 dynamic 規則重配，不沿用舊佔位 COM3"
+    );
+}
+
+#[test]
 fn wp510_b_missing_or_held_keeps_placeholder() {
     const SID: &str = "gone-template:COM3";
     const BY_ID: &str = "/s/by-id/usb-G";

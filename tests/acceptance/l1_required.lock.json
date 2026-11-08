@@ -20891,6 +20891,7 @@
           "cargo:sw-core::session_manager::wp510_b_handoff_reuses_preopened_handle",
           "cargo:sw-core::session_manager::wp510_b_handoff_skips_detached_slot_rebind",
           "cargo:sw-core::session_manager::wp510_b_missing_or_held_keeps_placeholder",
+          "cargo:sw-core::session_manager::wp510_b_no_fallback_com_reservation_does_not_survive_restart",
           "cargo:sw-core::session_manager::wp510_b_open_error_with_fallback_stays_reattachable",
           "cargo:sw-core::session_manager::wp510_b_open_error_without_fallback_reserves_com_until_unplug",
           "cargo:sw-core::slice21_prereqs::prereq_symbols_exist",
