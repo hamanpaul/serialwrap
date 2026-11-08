@@ -430,6 +430,7 @@
           "cargo:sw-daemon::framing::join_handlers_returns_running_methods_at_deadline",
           "cargo:sw-daemon::framing::stop_accept_does_not_wait_for_handlers",
           "cargo:sw-daemon::handoff_stop::handoff_busy_lease_and_recovering",
+          "cargo:sw-daemon::handoff_stop::handoff_drain_window_background_triggers_zero_tx",
           "cargo:sw-daemon::handoff_stop::handoff_file_push_after_last_probe",
           "cargo:sw-daemon::handoff_stop::handoff_flash_races_prepare",
           "cargo:sw-daemon::handoff_stop::handoff_flash_races_prepare_handoff_first",

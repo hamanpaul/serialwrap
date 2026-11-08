@@ -915,3 +915,72 @@ fn handoff_then_successor_never_double_held() {
     drop(new);
 }
 
+
+fn rpc_handoff(socket: &Path) -> PyDict {
+    let text = rpc_once(socket, r#"{"id":3,"method":"daemon.handoff_stop","params":{"reason":"update"}}"#);
+    match pyjson::loads(text.trim_end()) {
+        Ok(PyValue::Dict(mut d)) => {
+            d.0.shift_remove("id");
+            d
+        }
+        other => panic!("handoff 回應：{other:?}"),
+    }
+}
+
+/// 以外部行程對 tty 寫一行（`O_NOCTTY`，不讓測試行程取得控制終端）。
+fn write_tty_line(path: &str, line: &str) {
+    let status = std::process::Command::new("python3")
+        .arg("-I")
+        .arg("-c")
+        .arg("import os,sys; fd=os.open(sys.argv[1], os.O_WRONLY|os.O_NOCTTY); os.write(fd, sys.argv[2].encode()); os.close(fd)")
+        .arg(path)
+        .arg(line)
+        .status()
+        .expect("執行 python3 寫 vtty");
+    assert!(status.success(), "寫入 vtty 失敗：{path}");
+}
+
+/// SC-11 排空窗口的 L1.5 證據（真 daemon 行程＋PTY 假 DUT；owner-decisions-addenda `PENDING-EVID-S1X-HANDOFF-WINDOW-L15`
+/// 的 Rust 承接）：交接成立後、窗口內以背景來源驅動 TX——DeviceWatcher（移除 by-id 連結一個輪詢週期後加回）與 console 行
+/// （對 session 的 vtty 寫一行）——DUT 自交接回覆起至 daemon 結束零新增 bytes；窗口內 `health.ping` 仍回應、daemon 未退出，
+/// 窗口結束後有序停止（exit 0）。
+#[test]
+fn handoff_drain_window_background_triggers_zero_tx() {
+    let mut env = isolated_env_with_pty_target();
+    let mut d = DaemonProc::spawn(&env, &[]);
+    support::wait_ready(&env, "COM0");
+    let vtty = get_state(&env.socket, "COM0")["vtty"].as_str().unwrap_or_default().to_string();
+    assert!(!vtty.is_empty(), "COM0 有 vtty");
+    let link = env.by_id_dir.join(TARGET_BY_ID);
+    let link_target = std::fs::read_link(&link).expect("by-id 連結");
+    assert_granted(&rpc_handoff(&env.socket), "行程層閒置交接");
+    let replied = Instant::now();
+    let rx_at_reply = env.target_rx();
+    // DeviceWatcher：移除連結一個輪詢週期（1.0 s）後加回。
+    std::fs::remove_file(&link).expect("移除 by-id 連結");
+    thread::sleep(Duration::from_millis(1_100));
+    let relinked = std::process::Command::new("ln")
+        .arg("-s")
+        .arg(&link_target)
+        .arg(&link)
+        .status()
+        .expect("執行 ln -s");
+    assert!(relinked.success(), "加回 by-id 連結");
+    // console 行。
+    write_tty_line(&vtty, "echo HANDOFF_WINDOW_MARK\n");
+    thread::sleep(Duration::from_millis(300));
+    assert!(replied.elapsed() < HANDOFF_DRAIN_GRACE, "背景觸發須落在排空窗口內：{:?}", replied.elapsed());
+    assert!(d.try_alive(), "窗口內 daemon 未退出");
+    let pong = rpc_value(&env.socket, "health.ping", "{}");
+    assert_eq!(pong["ok"], true, "窗口內 health.ping 仍回應：{pong:?}");
+    let status = d.wait(HANDOFF_DRAIN_GRACE + STOP_CAP + Duration::from_secs(2));
+    assert_eq!(status.code(), Some(0), "{}", d.stderr());
+    assert!(replied.elapsed() + Duration::from_millis(500) >= HANDOFF_DRAIN_GRACE, "窗口結束前不得退出");
+    let rx_after = env.target_rx();
+    assert_eq!(
+        String::from_utf8_lossy(&rx_after[rx_at_reply.len().min(rx_after.len())..]),
+        "",
+        "交接回覆起 DUT 零新增 bytes（重探、re-attach 與 console 行皆零 TX）"
+    );
+    assert_eq!(rx_after.len(), rx_at_reply.len());
+}
