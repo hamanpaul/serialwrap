@@ -6,9 +6,9 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::io;
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use super::rpc::FakeRpcConnector;

@@ -261,7 +261,10 @@ fn report(pids: BTreeSet<u32>, status: HolderScanStatus) -> HolderReport {
     let pids = pids.into_iter().collect::<Vec<_>>();
     HolderReport {
         holder_unknown: pids.is_empty()
-            && !matches!(status, HolderScanStatus::Ok | HolderScanStatus::PartialOtherUid),
+            && !matches!(
+                status,
+                HolderScanStatus::Ok | HolderScanStatus::PartialOtherUid
+            ),
         pids,
         status,
     }

@@ -5,8 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use sw_pal::fakes::FakeHolderFs;
-use sw_pal::proc_holders::posix::{TtyStat, probe_holders_with};
-use sw_pal::serial::posix::{TtyOpenOps, open_sequence};
+use sw_pal::proc_holders::posix::{probe_holders_with, TtyStat};
+use sw_pal::serial::posix::{open_sequence, TtyOpenOps};
 use sw_pal::{HolderReport, HolderScanStatus};
 
 const PROC: &str = "/fakeproc";
@@ -40,10 +40,7 @@ fn proc_with_pids(pids: &[u32]) -> FakeHolderFs {
     let mut fs = FakeHolderFs::default();
     fs.set_stat(TTY, tty_stat());
     fs.set_current_uid(Some(SELF_UID));
-    fs.set_dir(
-        PROC,
-        pids.iter().map(u32::to_string).collect(),
-    );
+    fs.set_dir(PROC, pids.iter().map(u32::to_string).collect());
     for pid in pids {
         fs.set_dir(
             Path::new(PROC).join(pid.to_string()).join("fd"),
