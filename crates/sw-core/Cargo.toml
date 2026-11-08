@@ -47,3 +47,9 @@ required-features = ["test-fakes"]
 name = "file_transfer_session"
 path = "tests/file_transfer_session.rs"
 required-features = ["test-fakes"]
+
+# P8 Task 11：外部工具裝置交接 × file transfer／flash 的整合（ActorRig／XferRig 需 test-fakes）。
+[[test]]
+name = "handoff"
+path = "tests/handoff.rs"
+required-features = ["test-fakes"]

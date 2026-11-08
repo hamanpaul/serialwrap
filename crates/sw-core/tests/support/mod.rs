@@ -14,6 +14,8 @@ pub mod file_transfer_session;
 pub mod flash_core;
 /// P8 Task 9：`/dev/ttyMCU` 端點與認線協調測試台（`FlashRig`／`Mcu`）。
 pub mod flash_rig;
+/// P8 Task 11：外部工具裝置交接整合測試台（release／attach × file transfer／flash）。
+pub mod handoff;
 /// P8 Task 5：`OpTransferPort` 測試台（`PortRig`／`FakeDut`）。
 pub mod transfer_port;
 
