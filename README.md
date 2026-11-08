@@ -129,7 +129,7 @@ setup may select systemd and change supervision modes; see the
 # Managed install: download the release bundle, verify it against SHA256SUMS,
 # then run <bundle>/bin/serialwrap setup (extra arguments go to setup)
 ./install.sh                     # latest release
-./install.sh --version 0.4.0     # a specific release
+./install.sh --version 0.4.1     # a specific release
 serialwrap doctor
 
 # Check daemon and sessions
@@ -198,7 +198,7 @@ but the standard install no longer uses pipx.
 Offline install: copy the release tarball (verify it yourself with
 `sha256sum -c --ignore-missing SHA256SUMS`; `--bundle` does not download or
 check `SHA256SUMS`), then run
-`./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`. `--bundle` also
+`./install.sh --bundle serialwrap-0.4.1-linux-x86_64.tar.gz`. `--bundle` also
 accepts an unpacked bundle directory. For local development, build a bundle
 from the checkout and install it; a bare `./install.sh` installs the published
 release, not the checkout:
@@ -235,9 +235,9 @@ reports it. See [explicit reboot](docs/expect-reboot.md).
 
 **Upgrading, and telling which build the daemon runs.** The bundle installer
 runs `serialwrap setup`; after a manual package update, run setup again. The version string
-(`0.4.0`) is the same for a release, a branch build and `main`, so
+(`0.4.1`) is the same for a release, a branch build and `main`, so
 `serialwrap --version` also prints a code fingerprint, e.g.
-`serialwrap 0.4.0 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
+`serialwrap 0.4.1 (code 1a2b3c4d5e6f)` (a hash of the installed `sw_core/**/*.py`).
 `serialwrap daemon status` reports the fingerprint of the code the running daemon
 loaded when it started (`code_fingerprint`) and where it loaded it from
 (`code_path`). If the two differ, the daemon is still running pre-upgrade code, and
@@ -1887,7 +1887,7 @@ flowchart TD
 ```bash
 # 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
 ./install.sh                     # 最新 release
-./install.sh --version 0.4.0     # 指定 release
+./install.sh --version 0.4.1     # 指定 release
 serialwrap doctor                # 驗證環境
 ```
 
@@ -1897,10 +1897,10 @@ serialwrap doctor                # 驗證環境
 - `install.sh` 位於 repo 根目錄（clone repo 或單獨下載該檔）。
 - 系統需求：x86_64、glibc >= 2.39（Ubuntu 24.04 以上）、`/usr/bin/python3.12`。`install.sh` 安裝前先檢查，任一項不符即 exit 2 且不改動任何東西。
 - `install.sh [--version X.Y.Z] [--bundle <目錄或 .tar.gz>] [--] [setup 參數...]`：未給 `--bundle` 時從 [GitHub releases](https://github.com/hamanpaul/serialwrap/releases) 下載 `serialwrap-<版本>-linux-x86_64.tar.gz` 與 `SHA256SUMS`（未給 `--version` 取最新 release），雜湊不符或 `SHA256SUMS` 缺列即失敗、不執行 setup；解到暫存目錄後執行 `bin/serialwrap setup`，回傳 setup 的 exit code。`--` 之後的參數（以及 `--user`、`--on-demand` 等未知選項）原樣轉給 setup。Python wheel 仍隨 release 發佈，但標準安裝流程不再使用 pipx。
-- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.0-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
+- 離線安裝：把 release tarball 帶到目標機（請自行以 `sha256sum -c --ignore-missing SHA256SUMS` 驗證；`--bundle` 不下載也不檢查 `SHA256SUMS`），執行 `./install.sh --bundle serialwrap-0.4.1-linux-x86_64.tar.gz`；`--bundle` 也接受已解開的 bundle 目錄。
 - 本機開發安裝：先由 checkout 建 bundle 再安裝——`scripts/rust/mkbundle.sh --release-bundle --profile release --out /tmp/sw-bundle && ./install.sh --bundle /tmp/sw-bundle`；單純 `./install.sh` 安裝的是已發佈的 release，不是 checkout。
 - 舊版 0.3.x（pipx）使用者升級：直接執行新的 `install.sh` 即可，不需 pipx 步驟。可在 0.3.x daemon 仍在執行時升級，並明確帶入目前的監管模式（`--user`、`--system --with-sudo`、`--on-demand`）。先以 `serialwrap daemon stop` 停止再升級亦可，但 setup 不會代為啟動原本已停止的 daemon：請以 `serialwrap service start`（systemd）或 `serialwrap daemon start`（on-demand）啟動後執行 `serialwrap doctor`。setup 會接管 `~/.local/bin/serialwrap` 與 `serialwrapd` 入口，保留 `config.yaml`、profiles 與 `state.json`。偵測到舊 pipx 安裝時，安裝程式會提示可執行 `pipx uninstall serialwrap`，不會自動移除。
-- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.0`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.0 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
+- **升級與確認 daemon 跑的是哪份程式碼**：bundle 安裝會執行 `serialwrap setup`；版本字串（例如 `0.4.1`）在 release 與分支 build 間相同，所以 `serialwrap --version` 另印程式碼指紋，例如 `serialwrap 0.4.1 (code 1a2b3c4d5e6f)`。`serialwrap daemon status` 的 `code_fingerprint` 與 `code_path` 說明 daemon 啟動時載入的程式碼及位置。指紋不一致時，CLI 於 stderr 警告，`doctor` 回報 advisory `daemon_code_current`。systemd 服務 active 且指紋不同時，setup 依狀態自動 restart，輸出 `daemon_code`；systemd-system 未帶 `--with-sudo` 時把指令列入 `pending_sudo`。`--no-restart`、flash、模式轉換、service inactive 與 on-demand 條件不會觸發自動 restart。細節見[規格 §8.7](docs/serialwrap-spec.md)。
 - 既有 on-demand TCP 客戶端請用 `serialwrap setup --on-demand` 或 `./install.sh --on-demand` 保存 endpoint；auto 安裝可能切換至 systemd，詳見[適用範圍與限制](docs/setup-tcp-endpoint.md)。
 - 設定讀取順序為 `SERIALWRAP_CONFIG` → `~/.config/serialwrap/config.yaml` → 存在時的 `/etc/serialwrap/config.yaml`；系統設定檔唯讀，寫入落在 `SERIALWRAP_CONFIG` 或使用者設定檔。
 - 新建執行期目錄權限依 process umask 決定；Unix socket 維持 `0660`，可設定 `SERIALWRAP_SOCKET_GROUP` 指定 socket 群組。
@@ -3455,7 +3455,7 @@ Handler **建議**：
 ```bash
 # 安裝（正式流程）：下載 release bundle、以 SHA256SUMS 驗證後執行 <bundle>/bin/serialwrap setup（額外參數轉給 setup）
 ./install.sh                     # 最新 release
-./install.sh --version 0.4.0     # 指定 release
+./install.sh --version 0.4.1     # 指定 release
 serialwrap doctor                # 驗證環境
 ```
 

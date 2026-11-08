@@ -4,7 +4,7 @@
   ],
   "columns": 80,
   "rc": 0,
-  "stdout": "serialwrap 0.4.0 (code 469f55aa5ccf)\n",
+  "stdout": "serialwrap 0.4.1 (code 469f55aa5ccf)\n",
   "stderr": "",
   "native": true,
   "post_parse_effects": false
