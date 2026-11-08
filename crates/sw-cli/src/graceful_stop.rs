@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use sw_pal::proc_scan::ProcIdentity;
-use sw_pal::service_ctl::{AutostartHoldRecord, ServiceResult, SupervisionMode};
+use sw_pal::service_ctl::{AutostartHoldRecord, ServiceResult, SupervisionMode, TaskQuery};
 use sw_pal::traits::PalErrorKind;
 use sw_proto::error_codes::ErrorCode;
 use sw_proto::pyjson::{PyDict, PyInt, PyValue};
@@ -219,20 +219,42 @@ pub fn graceful_stop_with_existing_hold(
     }
 
     if rpc == StopRpc::Plain {
-        let _ = call_stop(ctx, endpoint, "daemon.stop", &PyDict::new());
+        let reach = call_stop(ctx, endpoint, "daemon.stop", &PyDict::new());
         ran.push(vec!["serialwrap".into(), "daemon".into(), "stop".into()]);
-        if !crate::commands::daemon_cmd::wait_daemon_gone(
+        let gone = crate::commands::daemon_cmd::wait_daemon_gone(
             ctx,
             endpoint,
             &id,
             Duration::from_secs(10),
-        ) {
-            if !matches!(
+        );
+        if !gone
+            && !matches!(
                 mode,
                 SupervisionMode::WindowsTask | SupervisionMode::WindowsService
-            ) {
-                return Err(StopFailure::Timeout { phase, id, ran });
+            )
+        {
+            return Err(StopFailure::Timeout { phase, id, ran });
+        }
+        // P8 Task 13（`/End` 規則）：windows-task 只在等待逾時，或 RPC 不可達（`daemon.stop` 連線階段失敗，daemon
+        // 收不到停止要求）且排程工作查詢仍為 Running 時才 `/End`。daemon 已正常結束時不執行 `/End`：無執行中實例
+        // 時 `/End` 回非 0 rc，會讓健康的 stop 報 `ok:false`。查詢失敗永不視為已停止（`TaskQuery::QueryFailed`）。
+        let hard_needed = if !gone {
+            true
+        } else if reach == StopReach::Unreachable && matches!(mode, SupervisionMode::WindowsTask) {
+            match ctx.p.service.query(mode) {
+                TaskQuery::Running => true,
+                TaskQuery::NotRunning(_) | TaskQuery::NotFound => false,
+                TaskQuery::QueryFailed(detail) => {
+                    if !keep_disabled {
+                        restore_enabled(ctx, mode, with_sudo, &mut ran)?;
+                    }
+                    return Err(StopFailure::Service(task_state_unknown(mode, &detail)));
+                }
             }
+        } else {
+            false
+        };
+        if hard_needed {
             let hard = ctx.p.service.hard_stop(mode, with_sudo);
             record_hard_stop(&mut ran, mode, with_sudo, &hard);
             rc = hard.rc;
@@ -854,24 +876,44 @@ fn valid_handoff_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn call_stop(
-    ctx: &CliCtx<'_>,
-    endpoint: &str,
-    method: &str,
-    params: &PyDict,
-) -> Result<(), ClientCrash> {
-    let outcome = client::call(
+/// 一般停止 RPC 是否送達 daemon（P8 Task 13 `/End` 規則用）：只有 connect 階段失敗才算不可達；送出後的接收
+/// 失敗、回 `ok:false` 或 client 例外都可能已觸發停止，一律視為可達（之後仍由等待逾時決定是否硬停）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReach {
+    Reached,
+    Unreachable,
+}
+
+fn call_stop(ctx: &CliCtx<'_>, endpoint: &str, method: &str, params: &PyDict) -> StopReach {
+    // 連不上不算失敗（05 Task 7 第 3 步）；回應內容不影響停止序。
+    match client::call_with_failure(
         ctx,
         endpoint,
         method,
         &PyValue::Dict(params.clone()),
         2.0,
         &PyInt::Small(0),
-    )?;
-    if outcome.resp.get_truthy("ok") {
-        Ok(())
-    } else {
-        Ok(())
+    ) {
+        Ok((_, Some(failure))) if failure.phase == client::FailPhase::Connect => StopReach::Unreachable,
+        _ => StopReach::Reached,
+    }
+}
+
+/// RPC 不可達且排程工作狀態查不到（`TaskQuery::QueryFailed`）：不得 `/End`，也不得回報健康的 stop。
+/// 形狀沿用 P4 `ServiceResult`（不新增欄位、不新增錯誤碼）。
+fn task_state_unknown(mode: &SupervisionMode, detail: &str) -> ServiceResult {
+    ServiceResult {
+        ok: false,
+        mode: mode.as_str().to_string(),
+        action: "stop".to_string(),
+        rc: None,
+        stdout: None,
+        stderr: None,
+        error_code: Some(ErrorCode::InternalError.as_str()),
+        hint: Some(format!(
+            "daemon RPC 不可達且無法確認排程工作狀態（{detail}）；請以 schtasks /Query /TN serialwrap 確認工作已停止"
+        )),
+        phase: None,
     }
 }
 
