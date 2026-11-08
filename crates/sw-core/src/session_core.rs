@@ -3807,8 +3807,12 @@ impl SessionCore {
                     _ => Vec::new(),
                 };
                 effects.extend(open_effects);
-                // Clear：回應帶 Python `_complete_drain` 的 `ATTACHING`＋`CLEARED`；`last_error` 於再解析後接受
-                // `DeviceAttached`（開埠前，Python `_attach_by_id`）才清除（審查 F97）。
+                // Clear：Python `_complete_drain`（`session_manager.py:2939-2953`，S1X-a-7）裝置在場時於回應前即
+                // `ATTACHING`＋`last_error=None`，不在場維持 DETACHED＋`CLEARED`；與無 worker 的
+                // `finish_stop_without_worker` 同規則（裁決 D6，取代審查 F97）。
+                if kind == StopKind::Clear && self.state == SessionState::Attaching {
+                    self.set_last_error(None, None);
+                }
                 for waiter in stop.waiters {
                     effects.push(Effect::Reply(waiter, Ok(self.ok_session(now))));
                 }

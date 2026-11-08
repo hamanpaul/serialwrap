@@ -4127,3 +4127,37 @@ fn wp58_g13_rpc_device_attach_during_login_returns_ok_session() {
     r.wait_state("COM0", "READY");
     assert_eq!(dev.open_count(), opens + 1);
 }
+
+/// WP5-8 第 3 項（G14，S1X-a-7）：RPC `session.clear` 在 READY（有 bridge）且裝置在場時回 `{"ok":true,"session"}`
+/// （＋RPC 層 `version`），session 為 `ATTACHING`＋`last_error:null`，不帶 `CLEARED`（裁決 D6，取代審查 F97；
+/// `origin/main:sw_core/session_manager.py:2939-2953`、`:3065-3082`；Python `tests/test_s1x_a7_drain_fields.py::
+/// test_clear_with_device_present_clears_last_error`）。呼叫路徑：`Service::rpc("session.clear")` →
+/// `route(SessionRequest::Clear)` → `SessionCore` clear 請求 → `begin_stop(Clear)`（`BeginDrain`）→ IoWorker 停止後
+/// `WorkerStopped` 回條 → `worker_stopped` Clear 分支（`request_reattach` 發 `Effect::Reattach`、裝置在場清
+/// `last_error`）→ 回覆 waiter；之後 manager 再解析、送 `DeviceAttached` → 重新開埠並登入回 READY。
+#[test]
+fn wp58_g14_rpc_clear_ready_with_device_returns_null_last_error() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    r.settle();
+    let opens = dev.open_count();
+    let gen0 = r.session("COM0").expect("COM0").get("bridge_generation").cloned();
+    let tx_mark = dev.tx_len();
+
+    let cleared = r.call("session.clear", r#"{"selector":"COM0"}"#);
+    assert_eq!(keys(&cleared), vec!["ok", "session", "version"], "{}", j(&cleared));
+    assert_eq!(cleared.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&cleared));
+    let session = sub(&cleared, "session");
+    assert_eq!(s(&session, "com"), "COM0");
+    assert_eq!(s(&session, "state"), "ATTACHING", "{}", j(&cleared));
+    assert_eq!(session.get("last_error"), Some(&PyValue::Null), "{}", j(&cleared));
+
+    // 再解析後重新開埠並登入：一次性 `\n` 應答已在啟動登入時用掉，等登入 probe 送出後補 prompt。
+    wait_until("clear 後重新開埠", || dev.open_count() > opens);
+    wait_until("重新 attach 的登入 probe", || dev.tx_since(tx_mark).contains(&b'\n'));
+    dev.push_rx(b"root@t:/# ");
+    r.wait_state("COM0", "READY");
+    let state = r.session("COM0").expect("COM0");
+    assert_eq!(state.get("last_error"), Some(&PyValue::Null), "{}", j(&state));
+    assert_ne!(state.get("bridge_generation").cloned(), gen0, "以新 bridge 重建");
+}

@@ -1532,6 +1532,108 @@ mod wp58_g13_inflight_attach_after_removal_returns_not_present {
     }
 }
 
+// ---- WP5-8 第 3 項（G14，S1X-a-7）：clear 收尾在裝置在場時立即回報 `last_error=null` ----
+//
+// Python 基線（`origin/main:sw_core/session_manager.py`）：
+// - 有 bridge（drain）：`_begin_drain_locked` `:2778-2779` 於 drain 進行中設 RECOVERING＋`last_error="CLEARED"`；
+//   `_complete_drain` `:2939-2953` 先設 DETACHED＋`CLEARED`，`job.kind == "clear"` 且 by_id 在 `_devices` 時改為
+//   `state="ATTACHING"`、`last_error=None`，再 `_spawn_attach`；`clear_session` `:3065-3082` 於 `_await_drain` 後
+//   組回應，所以回應與即時狀態都是 ATTACHING＋null，不必等新的 `DeviceAttached`（裁決 D6，取代審查 F97）。
+// - 無 bridge：`clear_session` `:3059-3064`，裝置在場 ATTACHING＋None，不在場 DETACHED＋`CLEARED`。
+// 對應 Python `tests/test_s1x_a7_drain_fields.py:64-93`；該檔要求的 reprobe 歸零由 WP5-8 第 4 項承接。
+
+/// clear 回應＝Python `{"ok": True, "session": session.to_public_dict()}`（同一時點逐位元組相同），並核對即時狀態。
+fn g14_assert_clear(reply: &PyDict, h: &CoreHarness, state: &str, last_error: PyValue) {
+    assert_eq!(g13_wire(reply), g13_ok_session(h), "clear 回應須為 ok＋同一時點公開欄位");
+    let public = h.public();
+    assert_eq!(public["state"], PyValue::from(state), "{}", g13_wire(&public));
+    assert_eq!(public["last_error"], last_error, "{}", g13_wire(&public));
+}
+
+fn g14_has_reattach(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Reattach { .. }))
+}
+
+fn g14_has_open_bridge(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::OpenBridge { .. }))
+}
+
+#[test]
+fn wp58_g14_clear_present_returns_null_before_reattach() {
+    // Python `test_clear_with_device_present_clears_last_error`：READY（有 bridge）→ clear → drain 收尾後回應與
+    // 即時狀態為 ATTACHING＋null。此處完成 drain receipt，但不投遞 manager 再解析後的 `DeviceAttached`。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(rx.try_recv().is_err(), "drain 回條前不得回覆 clear");
+    let during = h.public();
+    assert_eq!(during["state"], PyValue::from("RECOVERING"));
+    assert_eq!(
+        during["last_error"],
+        PyValue::from("CLEARED"),
+        "drain 進行中維持 CLEARED（`_begin_drain_locked`）"
+    );
+    let (epoch, stop) = h.pending_stop();
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(g14_has_reattach(&effects), "裝置在場需交 manager 再解析後 attach");
+    assert!(!g14_has_open_bridge(&effects), "再解析前不得直接開埠");
+    let reply = rx.try_recv().expect("drain 收尾後回覆 clear").expect("ok");
+    g14_assert_clear(&reply, &h, "ATTACHING", PyValue::Null);
+
+    // 再解析後的 DeviceAttached 仍被接受並開埠，last_error 維持 null。
+    let effects = h.feed(ControlEvent::DeviceAttached {
+        by_id: DEVICE_BY_ID.into(),
+        real_path: REAL_PATH.into(),
+    });
+    assert!(g14_has_open_bridge(&effects), "ATTACHING（等待再 attach）須接受 DeviceAttached 並開埠");
+    assert_eq!(h.public()["last_error"], PyValue::Null);
+}
+
+#[test]
+fn wp58_g14_clear_absent_keeps_cleared() {
+    // Python `test_clear_without_device_keeps_cleared`：READY（有 bridge）時裝置已不在 `_devices`（tick 只記錄、
+    // 不動有 bridge 的 session）→ clear → drain 收尾後 DETACHED＋CLEARED，不 `_spawn_attach`。
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.feed(ControlEvent::DeviceMissing);
+    assert_eq!(h.public()["state"], PyValue::from("READY"), "有 bridge 時 tick 不動 session");
+    let (rx, _) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(rx.try_recv().is_err(), "drain 回條前不得回覆 clear");
+    let (epoch, stop) = h.pending_stop();
+    let effects = h.receipt(epoch, stop).feed();
+    assert!(!g14_has_reattach(&effects) && !g14_has_open_bridge(&effects), "裝置不在不得再 attach");
+    let reply = rx.try_recv().expect("drain 收尾後回覆 clear").expect("ok");
+    g14_assert_clear(&reply, &h, "DETACHED", PyValue::from("CLEARED"));
+}
+
+#[test]
+fn wp58_g14_clear_present_without_worker_returns_null() {
+    // 無 worker 對照（Python `clear_session` `:3059-3064`）：DETACHED、裝置在場、沒有 bridge → 立即回覆
+    // ATTACHING＋null，交 manager 再解析、不直接開埠。
+    let mut h = g13_detached_with_device();
+    assert_ne!(h.public()["last_error"], PyValue::Null, "前置：開埠失敗留有錯誤");
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(g14_has_reattach(&effects), "裝置在場需交 manager 再解析後 attach");
+    assert!(!g14_has_open_bridge(&effects), "再解析前不得直接開埠");
+    let reply = rx.try_recv().expect("無 bridge 立即回覆").expect("ok");
+    g14_assert_clear(&reply, &h, "ATTACHING", PyValue::Null);
+}
+
+#[test]
+fn wp58_g14_clear_absent_without_worker_keeps_cleared() {
+    // 無 worker 對照：DETACHED、沒有 bridge、裝置已不在 → 立即回覆 DETACHED＋CLEARED，不再 attach。
+    let mut h = g13_detached_with_device();
+    h.feed(ControlEvent::DeviceMissing);
+    let (rx, effects) = h.rpc_deferred(SessionRequest::Clear);
+    assert!(!g14_has_reattach(&effects) && !g14_has_open_bridge(&effects), "裝置不在不得再 attach");
+    let reply = rx.try_recv().expect("無 bridge 立即回覆").expect("ok");
+    g14_assert_clear(&reply, &h, "DETACHED", PyValue::from("CLEARED"));
+}
+
 #[test]
 fn stale_bridge_opened_after_real_path_change_closed() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
@@ -2157,21 +2259,20 @@ fn clear_reopen_attaching_clears_last_error() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::Reattach { .. })));
-    // 審查 F97（多輪 Medium）：Python `_complete_drain` 於鎖內設 `ATTACHING`＋`last_error="CLEARED"` 後才
-    // `_spawn_attach`，`clear_session` 在 `_await_drain` 後立即組回應 → 回應為 `CLEARED`（黑箱 Python 3/3）；
-    // `_attach_by_id` 開埠前才 `last_error = None`。先前「ATTACHING 期間不帶 CLEARED」的 P5-T20 觀察是回應之後的
-    // get_state，不是 clear 回應本身。
+    // 裁決 D6（S1X-a-7，取代審查 F97）：`origin/main:sw_core/session_manager.py:2939-2953` 的 `_complete_drain`
+    // 在 clear 且裝置在場時，鎖內即設 `ATTACHING`＋`last_error=None` 後才 `_spawn_attach`；`clear_session` 在
+    // `_await_drain` 後組回應 → 回應與即時狀態皆為 null，不必等再解析後的 `DeviceAttached`。
     let reply = rx.try_recv().unwrap().expect("clear 回應");
     match reply.get("session") {
         Some(PyValue::Dict(session)) => {
             assert_eq!(session.get("state"), Some(&PyValue::from("ATTACHING")));
-            assert_eq!(session.get("last_error"), Some(&PyValue::from("CLEARED")));
+            assert_eq!(session.get("last_error"), Some(&PyValue::Null));
         }
         other => panic!("缺 session：{other:?}"),
     }
     let s = h.public();
     assert_eq!(s["state"], PyValue::from("ATTACHING"));
-    assert_eq!(s["last_error"], PyValue::from("CLEARED"));
+    assert_eq!(s["last_error"], PyValue::Null);
     let effects = h.feed(ControlEvent::DeviceAttached {
         by_id: DEVICE_BY_ID.into(),
         real_path: REAL_PATH.into(),
