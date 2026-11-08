@@ -297,6 +297,9 @@ struct Shared {
     /// WAL unhealthy」的競態；sol-backfill p5 #6）。
     #[cfg(feature = "test-fakes")]
     probe_pre_submit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// 只供測試（test-fakes）：累計啟動過的 session actor 與 attach worker thread 數（`spawned_worker_count`）。
+    #[cfg(feature = "test-fakes")]
+    spawned_workers: std::sync::atomic::AtomicUsize,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -784,6 +787,8 @@ impl Shared {
             opened_listener: Arc::new(Mutex::new(HashSet::new())),
         };
         let actor = spawn_actor(core, mailbox, Box::new(exec), self.clock.clone());
+        #[cfg(feature = "test-fakes")]
+        self.spawned_workers.fetch_add(1, Ordering::SeqCst);
         inner.sessions.insert(
             sid.clone(),
             Entry {
@@ -1000,6 +1005,8 @@ impl Shared {
         drop(inner);
         let me = self.clone();
         let key = by_id.to_string();
+        #[cfg(feature = "test-fakes")]
+        self.spawned_workers.fetch_add(1, Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name(format!("serialwrap-attach-{by_id}"))
             .spawn(move || {
@@ -2476,6 +2483,8 @@ impl SessionManager {
             path_flavor: caps.path_flavor,
             #[cfg(feature = "test-fakes")]
             probe_pre_submit_hook: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            spawned_workers: std::sync::atomic::AtomicUsize::new(0),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -3454,7 +3463,7 @@ impl SessionManager {
     /// stopping gate 之後不得再增加，Phase 1 之後的熱插或延後 reconcile 不得新增未納入 drain 的 worker）。
     #[cfg(feature = "test-fakes")]
     pub fn spawned_worker_count(&self) -> usize {
-        todo!("P8-T12")
+        self.shared.spawned_workers.load(Ordering::SeqCst)
     }
 
     /// 只供測試（test-fakes）：session 的 fence `wal_unhealthy`（`None`＝查無 session）。
