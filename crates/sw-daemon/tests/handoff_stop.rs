@@ -532,12 +532,21 @@ fn handoff_session_query_timeout_preserves_lease_ticket() {
 /// 經 COM 目前 bridge 的 TxWriter 以 `SelfTestProbe` 類別送出（epoch 取 Fence 的 `active_epoch`，permit 由 Fence 重驗）。
 /// 回傳 TxWriter 的回條通道。
 fn inject_background_tx(r: &ServiceRig, payload: &[u8], op: u64) -> crossbeam_channel::Receiver<TxReport> {
-    let handle = r.mgr.tx_for("COM0").expect("COM0 有 TxWriter");
+    inject_background_tx_on(r, "COM0", payload, op)
+}
+
+fn inject_background_tx_on(
+    r: &ServiceRig,
+    com: &str,
+    payload: &[u8],
+    op: u64,
+) -> crossbeam_channel::Receiver<TxReport> {
+    let handle = r.mgr.tx_for(com).unwrap_or_else(|| panic!("{com} 有 TxWriter"));
     let epoch = r
         .mgr
-        .fence_for_test("COM0")
+        .fence_for_test(com)
         .and_then(|f| f.with(|st| st.active_epoch))
-        .expect("COM0 有 active epoch");
+        .unwrap_or_else(|| panic!("{com} 有 active epoch"));
     let (reply, report) = crossbeam_channel::bounded(1);
     let job = TxJob {
         permit: TxPermit {
@@ -627,6 +636,102 @@ fn handoff_tx_fence_timeout_thaws_without_stop() {
     assert_eq!(confirmed(&late), 0, "交接成功回覆後背景 TX 被 fence 拒絕");
     thread::sleep(Duration::from_millis(100));
     assert_eq!(dev.tx_len(), at_reply, "交接成功回覆後零 TX");
+}
+
+/// COM1 背景 TX 讓交接的 TX fence 逾時；COM0 的自動重探成功結果在暫時凍結中抵達，撤銷後仍須回填 READY。
+#[test]
+fn auto_reprobe_ready_result_survives_failed_handoff_tx_fence() {
+    let yaml = format!(
+        "profiles:\n  t:\n    platform: shell\n    prompt_regex: '(?m)^root@t:.*# '\n    timeout_s: 1.0\n  reprobe:\n    platform: shell\n    prompt_regex: '(?m)^root@ready:.*# '\n    ready_probe: 'echo __HANDOFF__${{nonce}}'\n    timeout_s: 1.0\ntargets:\n  - {{com: COM1, profile: t, device_by_id: {BY_ID_B}}}\n  - {{com: COM0, profile: reprobe, device_by_id: {BY_ID_A}}}\n"
+    );
+    let r = ServiceRig::build(RigSpec {
+        yaml,
+        devices: vec![
+            (BY_ID_B.into(), REAL_B.into()),
+            (BY_ID_A.into(), REAL_A.into()),
+        ],
+        explicit_target_count: 2,
+        allowlist: None,
+        wait_ready: vec!["COM1".into()],
+    });
+    r.wait_state("COM0", "ATTACHED");
+    wait_for("COM0 初始 nonce probe 失敗", LONG, || {
+        r.session("COM0").is_some_and(|session| {
+            s(&session, "last_error") == Some("PROMPT_UNAVAILABLE")
+        })
+    });
+
+    let com0 = r.device(REAL_A).clone();
+    com0.on_tx_match("^$", Box::new(|_| b"root@ready:/# ".to_vec()));
+    let (nonce_tx, nonce_rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    com0.on_tx_match(
+        r"__HANDOFF__[0-9a-f]+",
+        Box::new(move |line: &[u8]| {
+            let _ = nonce_tx.send(line.to_vec());
+            Vec::new()
+        }),
+    );
+
+    // 讓自動重探先進入 nonce 等待，避免凍結後才由 tick 啟動；這裡只推 FakeClock。
+    let (login_entered, login_resume) = r
+        .mgr
+        .pause_next_login_finished_for_test("COM0")
+        .expect("COM0 actor");
+    r.clock.advance(Duration::from_secs(3));
+    let command = nonce_rx
+        .recv_timeout(LONG)
+        .expect("COM0 自動重探應送出 nonce probe");
+    let command = String::from_utf8_lossy(&command);
+    let nonce = command
+        .split("__HANDOFF__")
+        .nth(1)
+        .unwrap_or_default()
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect::<String>();
+    assert!(!nonce.is_empty(), "nonce command: {command:?}");
+
+    let com1 = r.device(REAL_B).clone();
+    com1.script_write(vec![FakeWriteStep::PauseInsideSubmit]);
+    let tx_report = inject_background_tx_on(&r, "COM1", b"probe\n", 1);
+    assert!(com1.wait_paused(SHORT), "COM1 TX 未進入 fence");
+
+    // 以較長的 test-fakes fence 等待保留確定性窗口；產品預設仍是 50 ms。
+    r.svc
+        .set_handoff_tx_fence_timeout_for_test(Duration::from_millis(800));
+    let svc = r.svc.clone();
+    let handoff = thread::spawn(move || svc.handoff_stop(&reason("update")));
+    let deadline = Instant::now() + SHORT;
+    while !r.svc.admission().frozen() {
+        if handoff.is_finished() {
+            let result = handoff.join().expect("提前結束的 handoff_stop");
+            panic!("handoff 在凍結 admission 前拒絕：{}", wire(&result));
+        }
+        assert!(Instant::now() < deadline, "handoff admission 凍結逾時");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // LoginFinished 在 actor dispatch 暫停點等候；此時 handoff 的 admission 凍結已成立。
+    com0.push_rx(format!("__HANDOFF__{nonce}\r\nroot@ready:/# ").as_bytes());
+    login_entered
+        .recv_timeout(SHORT)
+        .expect("成功的自動重探結果應抵達 actor");
+    login_resume.send(()).expect("交接窗口內放行 LoginFinished");
+    let during_freeze = r.session("COM0").expect("凍結期間 session query");
+    assert_eq!(s(&during_freeze, "state"), Some("ATTACHED"));
+
+    let handoff = handoff.join().expect("handoff_stop thread");
+    release_inflight(&com1, true);
+    assert_eq!(confirmed(&tx_report), b"probe\n".len());
+    let rows = assert_refused(&handoff, "SESSION_BUSY", "COM1 TX fence 未收斂");
+    assert!(ops(row_for(&rows, "COM1")).contains(&"tx.in_flight".to_string()));
+    assert!(!r.svc.admission().frozen(), "交接失敗須撤銷暫時凍結");
+
+    // 真實手動交接結果已拒絕，FakeClock tick 應回填凍結期間成功的 probe。
+    r.clock.advance(Duration::from_secs(1));
+    wait_for("交接撤銷後 COM0 probe 回填 READY", SHORT, || {
+        state_of(&r, "COM0").as_deref() == Some("READY")
+    });
 }
 
 /// shutdown 凍結（admission `freeze()`、stopping gate、bridge fence frozen）已建立時，交接遇 TX fence 未收斂：

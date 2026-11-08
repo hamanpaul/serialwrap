@@ -199,6 +199,14 @@ fn probe_label(item: &MailboxItem) -> Option<&'static str> {
 }
 
 #[cfg(feature = "test-fakes")]
+fn probe_pause_label(item: &MailboxItem) -> Option<&'static str> {
+    match item {
+        MailboxItem::Control(ControlEvent::LoginFinished { .. }) => Some("LoginFinished"),
+        _ => probe_label(item),
+    }
+}
+
+#[cfg(feature = "test-fakes")]
 fn timer_label(ev: &TimerEvent) -> &'static str {
     match ev {
         TimerEvent::LeaseExpiry { .. } => "LeaseExpiry",
@@ -346,12 +354,17 @@ pub fn spawn_actor(
                 #[cfg(feature = "test-fakes")]
                 let label = probe_label(&item);
                 #[cfg(feature = "test-fakes")]
+                let pause_label = probe_pause_label(&item);
+                #[cfg(feature = "test-fakes")]
                 let data_started = clock.mono_ns();
                 #[cfg(feature = "test-fakes")]
                 if let Some(label) = label {
                     let witness = mailbox.take_control_witness().unwrap_or(0);
                     let pre = mailbox.take_control_pre_dependency_data().unwrap_or(0);
                     thread_probe.before_other(label, mailbox.data_backlog(), witness, pre);
+                }
+                #[cfg(feature = "test-fakes")]
+                if let Some(label) = pause_label {
                     thread_probe.pause_before_dispatch(label);
                 }
                 let data_mark = match &item {

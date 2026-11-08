@@ -379,6 +379,46 @@ fn passthrough_quiet_tick_does_not_advance_after_handoff_freeze() {
 }
 
 #[test]
+fn auto_reprobe_ready_result_survives_temporary_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let (epoch, fsm_gen) = h
+        .advance(Duration::from_secs(1))
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin {
+                epoch,
+                fsm_gen,
+                plan: sw_core::login_fsm::LoginPlan::Probe,
+            } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("ATTACHED/PROMPT_UNAVAILABLE 應啟動自動重探");
+
+    let token = match h.reg.admission_gate().freeze_if_idle("update") {
+        sw_core::admission::FreezeOutcome::Frozen { token, created: true } => token,
+        outcome => panic!("交接應建立暫時 admission 凍結：{outcome:?}"),
+    };
+    h.fence.with(|fence| fence.handoff_frozen = true);
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結期間不得推進 session 狀態");
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::from("PROMPT_UNAVAILABLE"));
+
+    // 模擬另一個 session 的 TX fence 超時：交接撤銷 fence 與 admission 凍結。
+    h.fence.with(|fence| fence.handoff_frozen = false);
+    assert!(h.reg.admission_gate().thaw(&token), "交接失敗後應撤銷暫時凍結");
+    let effects = h.advance(Duration::from_secs(1));
+    assert_eq!(h.core.state(), SessionState::Ready, "凍結撤銷後應套用已成功的 probe 結果");
+    assert_eq!(pget(&h.public(), "last_error"), PyValue::Null);
+    assert!(has_session_ready(&effects), "probe 結果套用後應發布 SessionReady");
+}
+
+#[test]
 fn passthrough_rx_restarts_quiet_window() {
     // quiet_since = max(進入 ATTACHED, 最後 RX)；TX 不重算視窗。
     let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);

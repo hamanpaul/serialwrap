@@ -3719,6 +3719,17 @@ impl SessionManager {
         Some(actor.probe.pause_before_next("Request"))
     }
 
+    /// 只供測試（test-fakes）：暫停下一個自動登入結果 dispatch，確定性安排交接凍結與結果回填的交錯。
+    #[cfg(feature = "test-fakes")]
+    pub fn pause_next_login_finished_for_test(
+        &self,
+        selector: &str,
+    ) -> Option<(crossbeam_channel::Receiver<()>, crossbeam_channel::Sender<()>)> {
+        let sid = self.resolve(selector)?;
+        let actor = self.shared.actor_of(&sid)?;
+        Some(actor.probe.pause_before_next("LoginFinished"))
+    }
+
     /// 只供測試（test-fakes）：覆寫 file.push／file.pull actor 回覆期限。
     #[cfg(feature = "test-fakes")]
     pub fn set_file_transfer_timeout_for_test(&self, timeout: Duration) {

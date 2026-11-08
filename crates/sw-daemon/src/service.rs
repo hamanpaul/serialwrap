@@ -166,6 +166,9 @@ pub struct Service {
     lease_tickets: Mutex<HashMap<String, Ticket>>,
     /// P8 Task 14：交接判定串行化（Python 在 manager lock 內完成整個判定）；內容為上次發布過旗標的 COM（下次先清除）。
     handoff: Mutex<BTreeSet<String>>,
+    /// 測試用（test-fakes）：拉長 TX fence 等待，穩定安排重探結果與失敗交接的交錯。
+    #[cfg(feature = "test-fakes")]
+    handoff_tx_fence_timeout_override: Mutex<Option<Duration>>,
 }
 
 /// P8 Task 10：`mcu.status` 的 flash 真值來源（Python `_flash_endpoint.is_flashing()`、`_flash_active_com`、
@@ -376,7 +379,15 @@ impl Service {
             admission,
             lease_tickets: Mutex::new(HashMap::new()),
             handoff: Mutex::new(BTreeSet::new()),
+            #[cfg(feature = "test-fakes")]
+            handoff_tx_fence_timeout_override: Mutex::new(None),
         }
+    }
+
+    /// 只供測試（test-fakes）：覆寫交接 TX fence 等待上限。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_handoff_tx_fence_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.handoff_tx_fence_timeout_override) = Some(timeout);
     }
 
     /// P8 Task 14：共同 admission 邊界（flash 端點的 sync-probe 與 RPC 分派共用同一個 gate）。
@@ -426,7 +437,14 @@ impl Service {
                 return handoff_busy(&busy, &fresh);
             }
         }
-        let unconverged = self.manager.freeze_for_handoff(HANDOFF_TX_FENCE_TIMEOUT);
+        #[cfg(feature = "test-fakes")]
+        let tx_fence_timeout = lock(&self.handoff_tx_fence_timeout_override)
+            .as_ref()
+            .copied()
+            .unwrap_or(HANDOFF_TX_FENCE_TIMEOUT);
+        #[cfg(not(feature = "test-fakes"))]
+        let tx_fence_timeout = HANDOFF_TX_FENCE_TIMEOUT;
+        let unconverged = self.manager.freeze_for_handoff(tx_fence_timeout);
         if !unconverged.is_empty() {
             // fail-closed：仍有已通過提交檢查的寫入段在進行中，交接不得成立。只撤銷本次新建的 admission 凍結；
             // shutdown 或先前交接建立的凍結（created=false）不在此撤銷。
