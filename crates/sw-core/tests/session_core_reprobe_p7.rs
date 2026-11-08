@@ -299,3 +299,42 @@ fn reprobe_tick_while_manual_probe_busy_advances_next_reprobe_at() {
         "prepare 照常排程 next_reprobe_at"
     );
 }
+
+#[test]
+fn wp56_reprobe_tick_holds_confirm_probe_during_boot_evidence_wait() {
+    // WP5-6 第 3 項（G8，#243）接線：1 s tick（`reprobe_tick`）→ `reprobe::prepare` 傳入同一份 `QuietState`。
+    // `origin/main:sw_core/session_manager.py:2218-2223`：等待中不排確認 probe、不排 backoff、不增加 attempts；
+    // 寬限到期（`now >= boot_evidence_wait_until`）後下一個 tick 恢復原規劃（`test_no_banner_confirms_after_grace`）。
+    // 本項尚未接 reboot 路徑的 `begin`（後續子項），等待期限以 test-fakes hook 直接設定。
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_ready();
+    h.rx(b"\r\nU-Boot 2024.04\r\n");
+    h.rx(b"root@prplOS:~# "); // prompt 解除 quiet、保留 pending（等同非同步 reboot 後的過渡態）
+    assert_eq!(h.public()["ready_reconfirm_pending"], PyValue::Bool(true));
+    let deadline = h.core.quiet_for_test().deadline;
+    let until = h.clock.mono_ns() + 60_000_000_000;
+    h.core.set_boot_evidence_wait_until_for_test(until);
+
+    // RX 閒置 ≥3 s 後，寬限內每個 tick 都不得起確認 probe。
+    let fx = advance_collect(&mut h, 59);
+    assert!(
+        start_login(&fx).is_none(),
+        "等待中 tick 不得送確認 probe"
+    );
+    assert!(h.clock.mono_ns() < until);
+    let p = h.public();
+    assert_eq!(p["state"], PyValue::from("READY"));
+    assert_eq!(p["ready_reconfirm_pending"], PyValue::Bool(true));
+    assert_eq!(p["reprobe_attempts"], PyValue::from(0), "不增加 attempts");
+    assert_eq!(p["next_reprobe_at"], PyValue::Null, "不排 backoff");
+    assert_eq!(p["reprobe_exhausted"], PyValue::Bool(false));
+    assert_eq!(p["boot_evidence_wait_remaining_s"], PyValue::Float(1.0));
+    assert_eq!(h.core.quiet_for_test().attempts, 0, "不增加 reconfirm attempts");
+
+    // 恰好到期的 tick 恢復確認 probe；reconfirm deadline 不因等待延長。
+    let fx = advance_collect(&mut h, 1);
+    assert_eq!(h.clock.mono_ns(), until);
+    assert!(start_login(&fx).is_some(), "寬限到期後照常排確認 probe");
+    assert_eq!(h.public()["boot_evidence_wait_remaining_s"], PyValue::Null);
+    assert_eq!(h.core.quiet_for_test().deadline, deadline);
+}

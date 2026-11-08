@@ -399,3 +399,200 @@ fn bootloader_evidence_falls_back_to_uboot_prompts() {
         Some("^CFE> $")
     );
 }
+
+// ── WP5-6 第 3 項（G8，#243）：非同步 reboot 開機證據等待的 reprobe 守衛。
+// 依據 `origin/main:sw_core/session_manager.py`：`_prepare_reprobe_locked` 於 quiet 守衛（`:2216-2217`）之後
+// `if session.boot_evidence_wait_active(now): return None`（`:2218-2223`，不排 backoff、不增加 attempts）；
+// `_reprobe_target_still_valid_locked` 於 quiet 守衛（`:2335-2338`）之後同樣重驗（`:2339-2340`）。
+// 對照 `tests/test_async_reboot_evidence.py` 的 `test_wait_does_not_burn_reprobe_attempts`、
+// `test_still_valid_recheck_blocks_probe_when_wait_starts_after_collection`、`test_no_banner_confirms_after_grace`。
+
+/// 與 golden `setup` 同形的輸入（`Owned`）；prpl-template、裝置在場、有 bridge、RX 已閒置 3.5 s。
+fn wp56_owned(state: &str, last_error: Option<&str>, now: f64) -> Owned {
+    let profile = session_profile_for("prpl-template");
+    Owned {
+        state: state.to_string(),
+        by_id: profile.device_by_id.clone(),
+        released: false,
+        device_present: true,
+        last_error: last_error.map(str::to_string),
+        last_rx_mono: Some(t(now - 3.5)),
+        human_active: false,
+        has_bridge: true,
+        tail: String::new(),
+        profile,
+    }
+}
+
+/// Python `arm_boot_quiet()`＋`clear_boot_quiet()`：quiet 已解除、reconfirm pending 留著（確認 probe 原本合法）。
+fn wp56_pending_quiet(arm_at: f64) -> QuietState {
+    let mut q = QuietState::default();
+    q.arm(t(arm_at));
+    q.clear_quiet();
+    q
+}
+
+/// `QuietState` 未實作 `PartialEq`；逐欄位快照（含 `ready_reconfirm_attempts`＝`attempts` 與等待期限）。
+fn wp56_quiet_snapshot(q: &QuietState) -> (Mono, String, bool, Mono, u32, bool, Mono) {
+    (
+        q.boot_quiet_until,
+        q.boot_banner_tail.clone(),
+        q.pending,
+        q.deadline,
+        q.attempts,
+        q.failed,
+        q.boot_evidence_wait_until,
+    )
+}
+
+#[test]
+fn wp56_wait_does_not_burn_reprobe_attempts() {
+    // (名稱, state, last_error, 未等待時的既有規劃)：READY＋pending、ATTACHED＋可重探錯誤，
+    // 以及 DETACHED（Python 的等待守衛在 state 分派之前，Attach 分支的 `_record_reprobe_attempt_locked` 也不得執行）。
+    let cases: [(&str, &str, Option<&str>, ReprobeAction); 3] = [
+        ("READY+pending", "READY", None, ReprobeAction::Probe),
+        (
+            "ATTACHED+PROMPT_UNAVAILABLE",
+            "ATTACHED",
+            Some("PROMPT_UNAVAILABLE"),
+            ReprobeAction::Probe,
+        ),
+        (
+            "DETACHED+SHELL_PROMPT_TIMEOUT",
+            "DETACHED",
+            Some("SHELL_PROMPT_TIMEOUT"),
+            ReprobeAction::Attach,
+        ),
+    ];
+    for (name, state, last_error, planned) in cases {
+        // 非預設的既有進度：attempts=2、next_reprobe_at 已過、未 exhausted、無 inflight；pending 時另有 1 次再確認失敗。
+        let r0 = ReprobeState {
+            attempts: 2,
+            next_reprobe_at: Some(t(1005.0)),
+            exhausted: false,
+            inflight: false,
+        };
+        let mut q0 = if state == "READY" {
+            wp56_pending_quiet(1000.0)
+        } else {
+            QuietState::default()
+        };
+        q0.attempts = if state == "READY" { 1 } else { 0 };
+
+        // 對照組：同一輸入、未進等待 → 既有規劃照常成立（證明下方的 None 來自等待守衛）。
+        {
+            let o = wp56_owned(state, last_error, 1010.0);
+            let (mut r, mut q) = (r0.clone(), q0.clone());
+            assert_eq!(
+                prepare(&mut r, &mut q, &o.input(), t(1010.0)),
+                Some(planned),
+                "{name}：未等待時應照既有規劃"
+            );
+        }
+
+        let mut r = r0.clone();
+        let mut q = q0.clone();
+        q.begin_boot_evidence_wait(t(1001.0)); // until = 1061 s
+        let q_before = wp56_quiet_snapshot(&q);
+        for now in [1010.0, 1020.0, 1030.0] {
+            let o = wp56_owned(state, last_error, now);
+            assert_eq!(
+                prepare(&mut r, &mut q, &o.input(), t(now)),
+                None,
+                "{name} @{now}：等待中不得規劃 probe／attach"
+            );
+            assert_eq!(
+                r, r0,
+                "{name} @{now}：attempts／next_reprobe_at／exhausted／inflight 不得因等待變動"
+            );
+            assert_eq!(
+                wp56_quiet_snapshot(&q),
+                q_before,
+                "{name} @{now}：reconfirm pending／deadline／attempts 與等待期限不得變動"
+            );
+        }
+    }
+}
+
+#[test]
+fn wp56_still_valid_recheck_blocks_probe_when_wait_starts_after_collection() {
+    for (name, state, last_error) in [
+        ("READY+pending", "READY", None),
+        (
+            "ATTACHED+PROMPT_UNAVAILABLE",
+            "ATTACHED",
+            Some("PROMPT_UNAVAILABLE"),
+        ),
+    ] {
+        let now = 1010.0;
+        let o = wp56_owned(state, last_error, now);
+        let mut r = ReprobeState::default();
+        let mut q = if state == "READY" {
+            wp56_pending_quiet(1000.0)
+        } else {
+            QuietState::default()
+        };
+        // job 收集：先取得合法 Probe。
+        assert_eq!(
+            prepare(&mut r, &mut q, &o.input(), t(now)),
+            Some(ReprobeAction::Probe),
+            "{name}：收集時 Probe 合法"
+        );
+        assert!(
+            target_still_valid(&r, &mut q, &o.valid(true), t(now)),
+            "{name}：未等待時最終驗證通過"
+        );
+        // 收集後、worker 寫入前才進入等待（例如 reboot 剛送出）→ 最終驗證擋下。
+        q.begin_boot_evidence_wait(t(now));
+        let q_before = wp56_quiet_snapshot(&q);
+        assert!(
+            !target_still_valid(&r, &mut q, &o.valid(true), t(now)),
+            "{name}：等待開始後最終驗證必須為 false"
+        );
+        assert_eq!(
+            wp56_quiet_snapshot(&q),
+            q_before,
+            "{name}：重驗不得清等待、不得落 reconfirm 終態"
+        );
+    }
+}
+
+#[test]
+fn wp56_probe_planning_resumes_at_grace_expiry() {
+    // READY＋pending：arm 於 1000 s → reconfirm deadline 1300 s；等待於 1001 s 開始 → until 1061 s。
+    let mut r = ReprobeState::default();
+    let mut q = wp56_pending_quiet(1000.0);
+    let deadline = q.deadline;
+    assert_eq!(deadline, t(1300.0));
+    q.begin_boot_evidence_wait(t(1001.0));
+    let until = q.boot_evidence_wait_until;
+    assert_eq!(until, t(1061.0));
+
+    // 寬限到期前 1 ns 仍擋，且不留任何進度痕跡。
+    let o = wp56_owned("READY", None, secs(until - 1));
+    assert_eq!(prepare(&mut r, &mut q, &o.input(), until - 1), None);
+    assert_eq!(r, ReprobeState::default());
+    assert!(!target_still_valid(&r, &mut q, &o.valid(true), until - 1));
+
+    // `boot_evidence_wait_active`：`now < until`；恰好到期即恢復原規劃（backoff(0)=2 s、single-flight）。
+    let o = wp56_owned("READY", None, secs(until));
+    assert!(target_still_valid(&r, &mut q, &o.valid(true), until));
+    assert_eq!(
+        prepare(&mut r, &mut q, &o.input(), until),
+        Some(ReprobeAction::Probe)
+    );
+    assert_eq!(
+        r,
+        ReprobeState {
+            attempts: 0,
+            next_reprobe_at: Some(until + t(2.0)),
+            exhausted: false,
+            inflight: true,
+        }
+    );
+    // 寬限不延長 READY_RECONFIRM_MAX_S：deadline 仍是 arm 時的 1300 s，pending 不變、無再確認失敗。
+    assert_eq!(q.deadline, deadline);
+    assert!(q.pending);
+    assert!(!q.failed);
+    assert_eq!(q.attempts, 0);
+}

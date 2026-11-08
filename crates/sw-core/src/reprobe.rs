@@ -136,6 +136,11 @@ pub fn prepare(
     if blocks {
         return None;
     }
+    // 非同步 reboot 的舊 shell 仍可能回應 nonce：等 banner 或寬限到期（`session_manager.py:2218-2223`）。
+    // 與 quiet 守衛同語意：不排 backoff、不設 inflight、不記 attempt；到期後下一個 tick 恢復原規劃。
+    if q.boot_evidence_wait_active(now) {
+        return None;
+    }
     if !ready_reconfirm && !is_reprobe_prompt_error(inp.state, inp.last_error) {
         return None;
     }
@@ -216,6 +221,10 @@ pub fn target_still_valid(
         return false;
     }
     if boot_quiet_blocks_probe(q, inp.profile, now) {
+        return false;
+    }
+    // 收集後、寫入前才開始的證據等待（例如 reboot 剛送出）同樣擋下（`session_manager.py:2339-2340`）。
+    if q.boot_evidence_wait_active(now) {
         return false;
     }
     !inp.human_active
