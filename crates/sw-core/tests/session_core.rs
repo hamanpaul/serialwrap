@@ -546,6 +546,46 @@ fn background_bridge_open_does_not_advance_after_permanent_handoff_freeze() {
 }
 
 #[test]
+fn attach_login_finished_settles_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    let effects = h.bridge_ok();
+    let (epoch, fsm_gen) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin { epoch, fsm_gen, .. } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("attach bridge open 應啟動 login");
+    h.reg.admission_gate().freeze();
+
+    let effects = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結前接受的 login 完成只結算至 ATTACHED");
+    assert!(!has_session_ready(&effects), "永久凍結後不得發布 READY 通知");
+    assert!(!has_start_op(&effects), "永久凍結後不得排 probe TX");
+}
+
+#[test]
+fn bridge_opened_is_adopted_without_readiness_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.attach_device();
+    h.reg.admission_gate().freeze();
+
+    let effects = h.bridge_ok();
+
+    assert_eq!(h.core.state(), SessionState::Attached, "已受理的 bridge open 必須結算並接手 handle");
+    assert!(h.core.generations().conn_epoch.is_some(), "完成開啟後須記錄 bridge epoch");
+    assert!(!has_start_login(&effects), "永久凍結後不得啟動 readiness probe");
+    assert!(!has_start_op(&effects), "永久凍結後不得排 probe TX");
+}
+
+#[test]
 fn device_detached_drains_after_permanent_handoff_freeze() {
     let mut h = CoreHarness::new(SHELL_PROFILE);
     h.to_ready();
@@ -559,6 +599,68 @@ fn device_detached_drains_after_permanent_handoff_freeze() {
     assert!(effects.iter().any(|effect| matches!(effect, Effect::BeginDrain { .. })),
         "凍結後的已受理裝置移除仍須啟動 drain 收尾");
     assert_eq!(h.core.state(), SessionState::Recovering, "移除事件須收斂 session 狀態");
+}
+
+#[test]
+fn evict_capture_is_applied_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let mut request = agent_submit("dmesg");
+    request.mode = "background".into();
+    let (accepted, effects) = h.rpc_full(SessionRequest::Submit(request));
+    let cmd_id = accepted
+        .expect("背景命令應受理")
+        .get("cmd_id")
+        .and_then(PyValue::as_str)
+        .expect("受理回覆含 cmd_id")
+        .to_string();
+    let op_id = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartOp { grant, .. } => Some(grant.op_id),
+            _ => None,
+        })
+        .expect("背景命令應啟動 op");
+    let epoch = h.epoch();
+    h.feed(ControlEvent::OpFinished {
+        op_id,
+        epoch,
+        outcome: OpOutcome::CommandResult(sw_proto::pydict! { "ok" => true, "stdout" => "line1" }),
+        after_rx_seq: None,
+    });
+    assert_eq!(
+        h.rpc(SessionRequest::BackgroundResult {
+            cmd_id: cmd_id.clone(),
+            from_chunk: 0,
+            limit: 200,
+        })
+        .expect("完成 capture 可讀")["ok"],
+        PyValue::Bool(true)
+    );
+
+    h.reg.admission_gate().freeze();
+    h.feed(ControlEvent::EvictCapture { cmd_id: cmd_id.clone() });
+    let result = h
+        .rpc(SessionRequest::BackgroundResult {
+            cmd_id,
+            from_chunk: 0,
+            limit: 200,
+        })
+        .expect("淘汰後 capture 查詢回覆");
+    assert_eq!(result.get("error_code"), Some(&PyValue::from("CMD_NOT_FOUND")));
+}
+
+#[test]
+fn console_count_changed_is_applied_after_permanent_handoff_freeze() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    h.reg.admission_gate().freeze();
+
+    h.feed(ControlEvent::ConsoleCountChanged { count: 2 });
+
+    let response = h.rpc(SessionRequest::GetState).expect("GetState 回覆");
+    let session = response.get("session").expect("session 快照");
+    assert_eq!(session.get("console_count"), Some(&PyValue::from(2i64)));
 }
 
 fn start_tentative_handoff(h: &mut CoreHarness) -> String {

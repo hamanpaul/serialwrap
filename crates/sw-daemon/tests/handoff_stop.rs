@@ -1200,6 +1200,13 @@ fn shutdown_during_force_recover_poll_finishes_handler_and_exits_zero() {
     let client = thread::spawn(move || {
         wait_socket(&socket, LONG);
         wait_ready(&socket);
+        // READY 的 force recover 依 Python 先送 CTRL_C／CTRL_D；此測試要覆蓋 ATTACHED 的直接 clear＋輪詢路徑。
+        // 無回應命令逾時會依實際恢復流程轉為 ATTACHED，避免把兩種不同終態混在同一案例。
+        let setup = submit(&socket, "COM0", "t14-force-recover-poll-setup");
+        assert_eq!(setup["ok"], PyValue::Bool(true), "建立 ATTACHED 前置狀態：{setup:?}");
+        wait_for("force recover 前置命令轉為 ATTACHED", LONG, || {
+            get_state(&socket, "COM0")["state"] == "ATTACHED"
+        });
         dev.pause_next_close();
         let recover_socket = socket.clone();
         let recover = thread::spawn(move || {
