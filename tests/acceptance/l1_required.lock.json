@@ -19973,6 +19973,7 @@
           "cargo:sw-core::session_core::tick_expires_reconfirm_without_tx",
           "cargo:sw-core::session_core::wall_clock_jump_does_not_move_deadlines",
           "cargo:sw-core::session_core::wall_clock_jump_param",
+          "cargo:sw-core::session_core::wp56_public_wait_remaining_matches_python",
           "cargo:sw-core::session_manager::alias_set_persists_but_not_applied_after_restart",
           "cargo:sw-core::session_manager::alias_set_reaches_actor_profile_for_get_state",
           "cargo:sw-core::session_manager::alias_unassign_saves_before_check",
