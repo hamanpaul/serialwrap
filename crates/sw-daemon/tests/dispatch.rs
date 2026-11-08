@@ -3614,3 +3614,354 @@ fn wp56_rpc_async_reboot_holds_confirm_until_grace() {
     assert_eq!(s(&record, "stdout"), "hi", "{}", j(&record));
     assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo hi\n");
 }
+
+// ---------------------------------------------------------------------------
+// WP5-6 第 6 項：banner 解除路徑與 self-test 的 RPC 端到端（G8，#243；Python
+// `origin/main:sw_core/session_manager.py:6463-6466`（reboot 回 prompt 起算等待）、`:591`／`:800-812`（banner 解除）、
+// `:2218-2223`（reprobe 規劃不送確認 probe）、`:7816`（self-test 回 AUTOBOOT_QUIET）、`service.py:829-838`（submit gate）。
+//
+// 呼叫路徑：`Service::rpc("command.submit")` → submit gate → `SessionManager::route` → `SessionCore::submit` →
+// `start_next` → `OpRunner::run_reboot` → `SessionCore::finish_command`（`clear_quiet`＋`begin_boot_evidence_wait`）；
+// RX：FakeDevice → `SessionCore::rx_chunk` → `QuietState::on_rx_text`（banner → `note_boot_evidence`＋arm quiet；
+// prompt → 解除 quiet）；Tick：`SessionCore::reprobe_tick` → `reprobe::prepare`／送出前重驗 → login probe →
+// `confirm_ready`；`Service::rpc("session.self_test")` → `SessionRequest::SelfTest` → `self_test_pre_probe`。
+// ---------------------------------------------------------------------------
+
+/// FakeClock 的牆鐘起點；`ready_shell` 的 bootstrap 確認都發生在這一刻。
+const WP56_EPOCH: &str = "1970-01-01T00:00:00+00:00";
+
+/// `ready_shell` 的 COM0 於 bootstrap 確認 READY、FakeClock 尚未推進時的完整公開 session，鍵序依 Python
+/// `SessionRuntime.to_public_dict()`（`origin/main:sw_core/session_manager.py:850-925`）。值由 rig 組態推得：
+/// template `t`（shell、無 ready_probe 覆寫 → 預設 nonce probe，command_capable）綁 `/s/by-id/usb-A`
+/// （→ `/fake/tty-A`），alias 為 `<profile>+<act_no>`；bootstrap RX 為 `\n` 的 prompt（10 B）＋nonce 回應
+/// `__READY__<8 hex>\r\nroot@t:/# `（29 B）＝39 B，10 s 速率 3 B/s；mono 0 的 RX／TX 依 Python `> 0.0` 判定視同未設
+/// （idle_for_ms／兩個 age 為 null → `newly-attached`）。`overrides` 只能改既有鍵（打錯鍵即 panic）。
+fn wp56_session(overrides: &[(&str, PyValue)]) -> PyDict {
+    let mut session = sw_proto::pydict! {
+        "session_id" => "t:COM0",
+        "profile" => "t",
+        "com" => "COM0",
+        "alias" => "t+1",
+        "act_no" => 1,
+        "device_by_id" => BY_ID_A,
+        "platform" => "shell",
+        "profile_source" => "yaml-target",
+        "command_capable" => true,
+        "state" => "READY",
+        "last_error" => PyValue::Null,
+        "last_error_detail" => PyValue::Null,
+        "detached_at" => PyValue::Null,
+        "last_ready_at" => WP56_EPOCH,
+        "vtty" => PyValue::Null,
+        "attached_real_path" => REAL_A,
+        "bridge_generation" => 1,
+        "recovering" => false,
+        "interactive_session_id" => PyValue::Null,
+        "foreground_busy" => false,
+        "fg_cmd_expected_duration_s" => PyValue::Null,
+        "console_count" => 0,
+        "last_state_change_at" => WP56_EPOCH,
+        "last_rx_at" => WP56_EPOCH,
+        "last_tx_at" => WP56_EPOCH,
+        "last_probe_at" => WP56_EPOCH,
+        "reprobe_attempts" => 0,
+        "next_reprobe_at" => PyValue::Null,
+        "reprobe_exhausted" => false,
+        "boot_quiet_remaining_s" => PyValue::Null,
+        "ready_reconfirm_pending" => false,
+        "ready_reconfirm_failed" => false,
+        "ready_reconfirm_remaining_s" => PyValue::Null,
+        "boot_evidence_wait_remaining_s" => PyValue::Null,
+        "idle_for_ms" => PyValue::Null,
+        "last_rx_age_s" => PyValue::Null,
+        "last_tx_age_s" => PyValue::Null,
+        "rx_bytes_last_10s" => 39,
+        "rx_rate_bps" => 3,
+        "outstanding_commands" => 0,
+        "activity_classification" => "newly-attached",
+        "released_by" => PyValue::Null,
+        "released_at" => PyValue::Null,
+        "released_reason" => PyValue::Null,
+        "capture" => PyValue::Null,
+        "drain_stalled" => false,
+        "drain_timeout_epoch" => PyValue::Null,
+    };
+    for (key, value) in overrides {
+        assert!(session.get(key).is_some(), "未知 session 欄位 {key}");
+        session.insert(key, value.clone());
+    }
+    session
+}
+
+/// 對照 `tests/test_async_reboot_evidence.py` 的 `TestStaleShellNonceBeforeBanner`、`TestBannerReleasesWait`、
+/// `TestSubmitTimeGateDuringWait` 與 self-test 分類（`session_manager.py:7816`）：RPC 提交 `reboot`，假 DUT 立即重印
+/// prompt → 命令正常完成、session 公開 `boot_evidence_wait_remaining_s=60.0`；舊 shell 持續能應答 `\n` 與 nonce，
+/// 但 5 s 內 UART 零 TX；第二筆 agent 命令以 pending-only `AUTOBOOT_QUIET` 拒絕（無 cmd_id、UART／WAL／registry／
+/// queue／state.json 不變）；self-test 回 `AUTOBOOT_QUIET`／`wait` 且零 TX；RX 見 U-Boot banner 即解除等待並重臂
+/// quiet（仍零 TX），開機完成的 prompt 解除 quiet 後確認 probe 真正送上 UART、舊 shell 應答 nonce → `confirm_ready`，
+/// 後續命令經 RPC 寫到 UART 並完成。各階段回應以完整預期 dict 的 RPC_WIRE 位元組比對；僅確認後由時序決定的
+/// 時間戳／年齡／RX 計數列為動態欄位（取實測並檢查已更新）。
+#[test]
+fn wp56_rpc_async_reboot_evidence_wait() {
+    let r = ServiceRig::ready_shell();
+    let dev = r.device(REAL_A);
+    r.settle();
+    assert_eq!(
+        j(&r.session("COM0").expect("COM0 session")),
+        j(&wp56_session(&[])),
+        "起點：bootstrap 確認後的 READY"
+    );
+
+    // (1) RPC 提交 reboot；假 DUT 在 2 s 內重印 prompt（非同步 reboot：舊 shell 尚未關閉）。
+    dev.on_tx_reply(b"reboot\n", b"reboot\r\nroot@t:/# ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"reboot","timeout_s":10}"#,
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    assert_eq!(
+        j(&response),
+        wp52_submit_echo(&r, &cmd_id, false),
+        "reboot submit 回聲"
+    );
+    let measured = wp55_wait_done(&r, &cmd_id);
+    let fixed = sw_proto::pydict! {
+        "command" => "reboot",
+        "source" => "agent",
+        "mode" => "line",
+        "execution_mode" => "line",
+        "timeout_s" => 10.0,
+        "expected_duration_s" => PyValue::Null,
+        "completion_regex" => PyValue::Null,
+        "expect_reboot" => false,
+        "priority" => 10,
+        "status" => "done",
+        "error_code" => PyValue::Null,
+        "stdout" => "",
+        "partial" => false,
+        "background_capture_id" => PyValue::Null,
+        "interactive_session_id" => PyValue::Null,
+        "recovery_action" => PyValue::Null,
+    };
+    assert_eq!(
+        j(&r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#))),
+        wp53_expected_get(&r, &measured, &fixed),
+        "reboot 正常完成（非 recovery）"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&dev.tx_since(tx_mark)),
+        "reboot\n",
+        "UART 只送出 reboot 一行"
+    );
+    r.settle();
+    // RX 多了 `reboot\r\nroot@t:/# `（18 B）→ 57 B／5 B/s；clear_quiet＋begin：quiet 為 null、pending 保留、寬限 60 s。
+    let waiting = |reconfirm: f64, evidence: f64| {
+        wp56_session(&[
+            ("ready_reconfirm_pending", PyValue::Bool(true)),
+            ("ready_reconfirm_remaining_s", PyValue::Float(reconfirm)),
+            ("boot_evidence_wait_remaining_s", PyValue::Float(evidence)),
+            ("rx_bytes_last_10s", PyValue::from(57)),
+            ("rx_rate_bps", PyValue::from(5)),
+        ])
+    };
+    assert_eq!(
+        j(&r.session("COM0").expect("COM0 session")),
+        j(&waiting(300.0, 60.0)),
+        "reboot 回 prompt：等待欄位可見"
+    );
+
+    // (2) 舊 shell 仍活著：空行回 prompt、nonce 照常回顯（`install_shell_replies` 常駐）——若送出確認 probe 必定被
+    // 舊 shell 應答而誤確認；等待期間 actor 每秒 Tick 都不得送出。
+    dev.on_tx_match("^$", Box::new(|_line: &[u8]| b"root@t:/# ".to_vec()));
+    let calls = dev.write_calls();
+    let tx_mark = dev.tx_len();
+    wp56_advance_secs(&r, 5);
+    assert_eq!(
+        dev.write_calls(),
+        calls,
+        "等待中 reprobe 不送確認 probe（PAL 寫入零新增）"
+    );
+    assert!(dev.tx_since(tx_mark).is_empty(), "等待中 UART 零 TX");
+    assert_eq!(
+        j(&r.session("COM0").expect("COM0 session")),
+        j(&waiting(295.0, 55.0)),
+        "等待不加 attempts、不排 backoff、不延長 reconfirm 期限"
+    );
+
+    // (3) 第二筆 agent 命令：pending-only 分支（`service.py:829-838`），不產生 cmd_id、零副作用。
+    let rejected = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "AUTOBOOT_QUIET",
+        "retry_after_s" => 5.0,
+        "hint" => WP53_RECONFIRM_HINT,
+        "session" => PyValue::Dict(waiting(295.0, 55.0)),
+        "version" => r.version.clone(),
+    };
+    assert_wp52_rpc_rejected_without_side_effects(
+        &r,
+        r#"{"selector":"COM0","cmd":"uname -a","timeout_s":10}"#,
+        &j(&rejected),
+    );
+
+    // (4) self-test：等待中不送 nonce probe，回 AUTOBOOT_QUIET／wait（`session_manager.py:7816`），外層補
+    // `_lease_context(None)` 與 `command_capable`（`:7600-7617`）；UART／WAL／registry／queue／state.json 不變。
+    let before = wp52_rpc_snapshot(&r);
+    let self_test = r.call("session.self_test", r#"{"selector":"COM0"}"#);
+    let expected_self_test = sw_proto::pydict! {
+        "ok" => true,
+        "classification" => "AUTOBOOT_QUIET",
+        "session" => PyValue::Dict(waiting(295.0, 55.0)),
+        "recommended_action" => "wait",
+        "interactive_owner" => PyValue::Null,
+        "human_attached" => false,
+        "human_active" => false,
+        "recovery_mode" => false,
+        "command_capable" => true,
+        "version" => r.version.clone(),
+    };
+    assert_eq!(
+        j(&self_test),
+        j(&expected_self_test),
+        "self-test 於等待中的分類"
+    );
+    r.settle();
+    assert_eq!(wp52_rpc_snapshot(&r), before, "self-test 零 TX、零副作用");
+    assert_eq!(
+        j(&r.session("COM0").expect("COM0 session")),
+        j(&waiting(295.0, 55.0)),
+        "self-test 不更新 last_probe_at"
+    );
+
+    // (5) 新開機 banner（t=5 s）：解除證據等待、重臂 boot quiet（180 s），pending 保留；quiet 中仍零 TX。
+    dev.push_rx(b"\r\nU-Boot 2024.01 (Jan 01)\r\n");
+    wait_until("banner 解除等待", || {
+        r.session("COM0")
+            .and_then(|session| session.get("boot_evidence_wait_remaining_s").cloned())
+            == Some(PyValue::Null)
+    });
+    r.settle();
+    // banner 27 B → 84 B／8 B/s；RX 剛到：idle 0、rx age 0.0、active。
+    assert_eq!(
+        j(&r.session("COM0").expect("COM0 session")),
+        j(&wp56_session(&[
+            ("last_rx_at", PyValue::from("1970-01-01T00:00:05+00:00")),
+            ("boot_quiet_remaining_s", PyValue::Float(180.0)),
+            ("ready_reconfirm_pending", PyValue::Bool(true)),
+            ("ready_reconfirm_remaining_s", PyValue::Float(295.0)),
+            ("idle_for_ms", PyValue::from(0)),
+            ("last_rx_age_s", PyValue::Float(0.0)),
+            ("rx_bytes_last_10s", PyValue::from(84)),
+            ("rx_rate_bps", PyValue::from(8)),
+            ("activity_classification", PyValue::from("active")),
+        ])),
+        "banner 即解除等待並重臂 quiet"
+    );
+    wp56_advance_secs(&r, 3);
+    assert_eq!(dev.write_calls(), calls, "banner 後 quiet 中仍不送 probe");
+
+    // (6) 開機完成的 prompt（t=8 s）：解除 quiet，pending 仍在，尚未送 probe。
+    dev.push_rx(b"\r\nroot@t:/# ");
+    wait_until("prompt 解除 quiet", || {
+        r.session("COM0")
+            .and_then(|session| session.get("boot_quiet_remaining_s").cloned())
+            == Some(PyValue::Null)
+    });
+    r.settle();
+    assert_eq!(
+        j(&r.session("COM0").expect("COM0 session")),
+        j(&wp56_session(&[
+            ("last_rx_at", PyValue::from("1970-01-01T00:00:08+00:00")),
+            ("ready_reconfirm_pending", PyValue::Bool(true)),
+            ("ready_reconfirm_remaining_s", PyValue::Float(292.0)),
+            ("idle_for_ms", PyValue::from(0)),
+            ("last_rx_age_s", PyValue::Float(0.0)),
+            ("rx_bytes_last_10s", PyValue::from(96)),
+            ("rx_rate_bps", PyValue::from(9)),
+            ("activity_classification", PyValue::from("active")),
+        ])),
+        "prompt 解除 quiet"
+    );
+    assert_eq!(
+        dev.write_calls(),
+        calls,
+        "reboot 後到開機完成之間 UART 零 TX"
+    );
+
+    // (7) RX 閒置後 reprobe 送確認 probe：`\n`＋`echo __READY__<nonce>`，舊 shell 回顯 nonce → confirm_ready。
+    let mut session = PyDict::default();
+    wait_until("開機完成後確認 READY", || {
+        r.clock.advance(Duration::from_millis(250));
+        session = r.session("COM0").expect("COM0 session");
+        session.get("ready_reconfirm_pending") == Some(&PyValue::Bool(false))
+    });
+    r.settle();
+    let tx = String::from_utf8_lossy(&dev.tx_since(tx_mark)).into_owned();
+    let nonce = tx
+        .strip_prefix("\necho __READY__")
+        .and_then(|rest| rest.strip_suffix('\n'))
+        .unwrap_or_else(|| panic!("確認 probe 應為 `\\n`＋nonce probe：{tx:?}"));
+    assert!(
+        nonce.len() == 8 && nonce.bytes().all(|b| b.is_ascii_hexdigit()),
+        "nonce 為 8 位 hex：{tx:?}"
+    );
+    let session = r.session("COM0").expect("COM0 session");
+    // 只有確認時刻由輪詢步進決定的欄位取實測；確認點必須已更新 last_ready_at／last_probe_at／last_tx_at。
+    let dynamic = [
+        "last_ready_at",
+        "last_rx_at",
+        "last_tx_at",
+        "last_probe_at",
+        "idle_for_ms",
+        "last_rx_age_s",
+        "last_tx_age_s",
+        "rx_bytes_last_10s",
+        "rx_rate_bps",
+    ];
+    let mut overrides = vec![("activity_classification", PyValue::from("active"))];
+    for key in dynamic {
+        let value = session
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| panic!("缺 {key}：{}", j(&session)));
+        assert!(!value.is_null(), "{key} 應已填值：{}", j(&session));
+        overrides.push((key, value));
+    }
+    for key in ["last_ready_at", "last_tx_at", "last_probe_at"] {
+        assert_ne!(
+            s(&session, key),
+            WP56_EPOCH,
+            "{key} 須於確認時更新：{}",
+            j(&session)
+        );
+    }
+    assert_eq!(
+        j(&session),
+        j(&wp56_session(&overrides)),
+        "確認後 READY：pending／等待／quiet 全清、last_error 為 null"
+    );
+
+    // (8) 確認後放行：後續 agent 命令經 RPC 真正寫到 UART 並完成。
+    dev.on_tx_reply(b"echo hi\n", b"echo hi\r\nhi\r\nroot@t:/# ");
+    let tx_mark = dev.tx_len();
+    let response = r.call(
+        "command.submit",
+        r#"{"selector":"COM0","cmd":"echo hi","timeout_s":10}"#,
+    );
+    let next_id = s(&response, "cmd_id").to_string();
+    assert_eq!(
+        j(&response),
+        wp52_submit_echo(&r, &next_id, false),
+        "後續命令 submit 回聲"
+    );
+    let measured = wp55_wait_done(&r, &next_id);
+    let mut fixed = fixed;
+    fixed.insert("command", PyValue::from("echo hi"));
+    fixed.insert("stdout", PyValue::from("hi"));
+    assert_eq!(
+        j(&r.call("command.get", &format!(r#"{{"cmd_id":"{next_id}"}}"#))),
+        wp53_expected_get(&r, &measured, &fixed),
+        "後續命令完成"
+    );
+    assert_eq!(String::from_utf8_lossy(&dev.tx_since(tx_mark)), "echo hi\n");
+}
