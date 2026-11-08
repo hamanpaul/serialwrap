@@ -27,6 +27,8 @@ const BOOT_QUIET_WINDOW_NS: Mono = 180_000_000_000;
 const READY_RECONFIRM_MAX_NS: Mono = 300_000_000_000;
 /// `READY_RECONFIRM_MAX_ATTEMPTS`。
 pub const READY_RECONFIRM_MAX_ATTEMPTS: u32 = 5;
+/// `BOOT_EVIDENCE_GRACE_S`（60 s）換算 ns。
+const BOOT_EVIDENCE_GRACE_NS: Mono = (sw_proto::constants::BOOT_EVIDENCE_GRACE_S * 1e9) as Mono;
 /// `BOOT_BANNER_TAIL_CHARS`。
 const BOOT_BANNER_TAIL_CHARS: usize = 256;
 
@@ -39,6 +41,9 @@ pub struct QuietState {
     pub deadline: Mono,
     pub attempts: u32,
     pub failed: bool,
+    /// 非同步 reboot 後確認 probe 等待 boot banner 的 transient deadline（`boot_evidence_wait_until`，
+    /// `session_manager.py:591`）；不持久化、不進 `state.json`。
+    pub boot_evidence_wait_until: Mono,
 }
 
 /// `on_rx_text` 的狀態轉移結果。
@@ -85,9 +90,10 @@ impl QuietState {
         self.boot_banner_tail.clear();
     }
 
-    /// Ready 再確認成功：清除 pending、deadline、attempts、failed 與 quiet。
+    /// Ready 再確認成功：清除 pending、deadline、attempts、failed、quiet 與證據等待（`confirm_ready`）。
     pub fn confirm_ready(&mut self) {
         self.clear_quiet();
+        self.boot_evidence_wait_until = 0;
         self.pending = false;
         self.deadline = 0;
         self.attempts = 0;
@@ -95,6 +101,7 @@ impl QuietState {
     }
 
     /// 期限／次數檢查（`expire_ready_reconfirm`）；`force` 表示不依時間、直接判定耗盡。回傳本次是否翻轉。
+    /// 只有真正翻入 failed 終態才清證據等待（`session_manager.py:759`）；未翻轉時不動。
     pub fn expire(&mut self, now: Mono, force: bool) -> bool {
         if !self.pending {
             return false;
@@ -108,6 +115,7 @@ impl QuietState {
         }
         self.pending = false;
         self.failed = true;
+        self.boot_evidence_wait_until = 0;
         true
     }
 
@@ -137,6 +145,32 @@ impl QuietState {
         ))
     }
 
+    /// 非同步 reboot 後暫緩 nonce 確認，直到 banner 或寬限到期（`begin_boot_evidence_wait`）。
+    /// 只設等待欄位：不 arm quiet、不動 pending／deadline／attempts（寬限不延長 300 s 期限）。
+    pub fn begin_boot_evidence_wait(&mut self, now: Mono) {
+        self.boot_evidence_wait_until = now.saturating_add(BOOT_EVIDENCE_GRACE_NS);
+    }
+
+    /// RX 看見 boot banner，解除非同步 reboot 的證據等待（`note_boot_evidence`）。
+    pub fn note_boot_evidence(&mut self) {
+        self.boot_evidence_wait_until = 0;
+    }
+
+    /// 證據等待仍有效（`now < boot_evidence_wait_until`；0＝未設定）。
+    pub fn boot_evidence_wait_active(&self, now: Mono) -> bool {
+        self.boot_evidence_wait_until > 0 && now < self.boot_evidence_wait_until
+    }
+
+    /// public `boot_evidence_wait_remaining_s`：有效時 `round(until - now, 1)`，否則 None（`session_manager.py:898-902`）。
+    pub fn boot_evidence_wait_remaining_s(&self, now: Mono) -> Option<f64> {
+        self.boot_evidence_wait_active(now).then(|| {
+            py_round(
+                (self.boot_evidence_wait_until - now) as f64 / 1_000_000_000.0,
+                1,
+            )
+        })
+    }
+
     /// RX 文字（已 `clean_text`）進入 quiet 判定（05 §7 arm／clear 點；`_update_boot_quiet_locked`）。
     /// passthrough session 不得呼叫（SC-35），由呼叫端過濾。
     pub fn on_rx_text(
@@ -152,6 +186,9 @@ impl QuietState {
         let mut window = last_chars(&self.boot_banner_tail, BOOT_BANNER_TAIL_CHARS).to_string();
         window.push_str(chunk);
         if detect_boot_banner(&window) {
+            // `_update_boot_quiet_locked`（`session_manager.py:4560-4564`）：banner 即開機證據，先解除
+            // 非同步 reboot 的證據等待，再照舊重臂 quiet（`arm` 本身不清等待、不延長 reconfirm deadline）。
+            self.note_boot_evidence();
             self.arm(now);
             return QuietTransition::Armed;
         }

@@ -162,6 +162,7 @@ fn quiet_of(q: &PyDict) -> QuietState {
         deadline: mono("deadline"),
         attempts: g("attempts").as_i64().unwrap() as u32,
         failed: g("failed").as_bool().unwrap(),
+        boot_evidence_wait_until: 0,
     }
 }
 

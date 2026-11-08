@@ -59,6 +59,7 @@ fn quiet_state(row: &Row, key: &str) -> QuietState {
         deadline: mono("deadline"),
         attempts: g("attempts").as_i64().expect("attempts") as u32,
         failed: g("failed").as_bool().expect("failed"),
+        boot_evidence_wait_until: 0,
     }
 }
 
@@ -254,4 +255,177 @@ fn execute_time_quiet_has_retry_after_s() {
         r.get("recommended_action"),
         Some(&PyValue::from("self_test"))
     );
+}
+
+// ── WP5-6 item1：boot evidence wait 狀態（`SessionRuntime.begin_boot_evidence_wait`／`note_boot_evidence`／
+// `boot_evidence_wait_active`，`session_manager.py:800-812`；public 投影 `:898-902`）。預期值為 Python 基線
+// 以相同時間點實算（`SessionRuntime`＋`_update_boot_quiet_locked`，time.monotonic 固定），非手推。
+
+/// `boot_evidence_wait_active(now)` 與 public `boot_evidence_wait_remaining_s` 的組合斷言。
+fn assert_wait(q: &QuietState, now_s: f64, active: bool, remaining: Option<f64>, ctx: &str) {
+    assert_eq!(
+        q.boot_evidence_wait_active(t(now_s)),
+        active,
+        "{ctx} t={now_s} active"
+    );
+    assert_eq!(
+        q.boot_evidence_wait_remaining_s(t(now_s)),
+        remaining,
+        "{ctx} t={now_s} remaining"
+    );
+}
+
+#[test] // 新增（RED）：60 s 寬限邊界、Python 一位小數捨入、begin 不碰 reconfirm、confirm／expire 清除點
+fn wp56_wait_boundaries_and_clearers() {
+    // `constants.py:209`：BOOT_EVIDENCE_GRACE_S＝60.0，且小於 READY_RECONFIRM_MAX_S（300 s）。
+    assert_eq!(sw_proto::constants::BOOT_EVIDENCE_GRACE_S, 60.0);
+
+    // 邊界：未設定（0）不生效；begin(1000) → [1000, 1060) 有效，1060 起失效（`now < until`）。
+    let mut q = QuietState::default();
+    assert_eq!(q.boot_evidence_wait_until, 0);
+    assert_wait(&q, 1000.0, false, None, "未設定");
+    q.begin_boot_evidence_wait(t(1000.0));
+    assert_eq!(q.boot_evidence_wait_until, t(1060.0));
+    for (now, active, remaining) in [
+        (1000.0, true, Some(60.0)),
+        (1022.74, true, Some(37.3)),
+        // 剩 0.25 s：Python `round(0.25, 1)` 半數取偶 → 0.2。
+        (1059.75, true, Some(0.2)),
+        // 59.99 s 仍有效，剩餘 round(0.01, 1)＝0.0（不是 None）。
+        (1059.99, true, Some(0.0)),
+        (1060.0, false, None),
+        (1070.0, false, None),
+    ] {
+        assert_wait(&q, now, active, remaining, "boundaries");
+    }
+    // 再次 begin 以新的 now 重新起算（Python 直接覆寫 until）。
+    q.begin_boot_evidence_wait(t(1010.0));
+    assert_eq!(q.boot_evidence_wait_until, t(1070.0));
+    assert_wait(&q, 1010.0, true, Some(60.0), "rebegin");
+    // begin 只動等待欄位：未 pending 時不 arm quiet、不建 reconfirm。
+    assert!(!q.pending && q.deadline == 0 && !q.quiet_active(t(1010.0)));
+
+    // reboot arm(1000) 後 begin(1001)：不延長 300 s deadline、不動 pending／attempts／quiet。
+    let mut q = QuietState::default();
+    q.arm(t(1000.0));
+    q.begin_boot_evidence_wait(t(1001.0));
+    assert_eq!(q.boot_evidence_wait_until, t(1061.0));
+    assert_eq!((q.pending, q.deadline, q.attempts), (true, t(1300.0), 0));
+    assert_eq!(q.remaining_s(t(1001.0)), Some(179.0));
+    assert_eq!(q.reconfirm_remaining_s(t(1001.0)), Some(299.0));
+    assert_wait(&q, 1001.0, true, Some(60.0), "begin_keeps_deadline");
+
+    // `clear_boot_quiet`（`:706-716`）只清 until／tail：等待與 pending 皆保留。
+    q.clear_quiet();
+    assert!(!q.quiet_active(t(1001.0)));
+    assert_eq!((q.pending, q.deadline), (true, t(1300.0)));
+    assert_eq!(q.boot_evidence_wait_until, t(1061.0));
+    assert_wait(&q, 1001.0, true, Some(60.0), "clear_quiet_keeps");
+
+    // `arm_boot_quiet`（`:663-692`）本身不清等待（reboot 路徑另於 `:6411` 自行歸零）；重臂亦不延長 deadline。
+    q.arm(t(1002.0));
+    assert_eq!(q.boot_evidence_wait_until, t(1061.0));
+    assert_eq!(q.deadline, t(1300.0));
+    assert_wait(&q, 1002.0, true, Some(59.0), "arm_keeps_wait");
+
+    // `expire_ready_reconfirm`（`:740-761`）未翻轉時不清等待。
+    q.attempts = 2;
+    assert!(!q.expire(t(1010.0), false));
+    assert_eq!(q.boot_evidence_wait_until, t(1061.0));
+    assert_wait(&q, 1010.0, true, Some(51.0), "expire_not_hit");
+    // deadline 到 → 翻入 failed 終態，同時清等待（`:759`）。
+    assert!(q.expire(t(1300.0), false));
+    assert!(q.failed && !q.pending);
+    assert_eq!(q.boot_evidence_wait_until, 0);
+    assert_wait(&q, 1300.0, false, None, "expire_flip");
+
+    // 非 pending：force 也不翻轉，等待保留。
+    let mut q = QuietState::default();
+    q.begin_boot_evidence_wait(t(1000.0));
+    assert!(!q.expire(t(1001.0), true));
+    assert_eq!(q.boot_evidence_wait_until, t(1060.0));
+    assert_wait(&q, 1001.0, true, Some(59.0), "expire_not_pending");
+    // force 翻轉同樣清等待；expire 不清 quiet。
+    q.arm(t(1000.0));
+    q.begin_boot_evidence_wait(t(1000.0));
+    assert!(q.expire(t(1001.0), true));
+    assert_eq!(q.boot_evidence_wait_until, 0);
+    assert!(q.quiet_active(t(1001.0)));
+    assert_wait(&q, 1001.0, false, None, "expire_force");
+
+    // `confirm_ready`（`:718-732`）清等待與全部 reconfirm 欄位。
+    let mut q = QuietState::default();
+    q.arm(t(1000.0));
+    q.begin_boot_evidence_wait(t(1001.0));
+    q.confirm_ready();
+    assert_eq!(q.boot_evidence_wait_until, 0);
+    assert_eq!(
+        (q.pending, q.deadline, q.attempts, q.failed),
+        (false, 0, 0, false)
+    );
+    assert_wait(&q, 1001.0, false, None, "confirm");
+}
+
+#[test] // 新增（RED）：banner 解除等待（`_update_boot_quiet_locked` `:4560-4564` 先 note 再 arm），不延長 reconfirm
+fn wp56_banner_releases_wait_without_extending_reconfirm() {
+    let sp = prpl();
+    // reboot 命令 arm(1000) → 2 s 內 prompt 回來：清 quiet＋begin(1001.5)（actor 端 `:6463-6466` 的狀態效果）。
+    let mut q = QuietState::default();
+    q.arm(t(1000.0));
+    q.clear_quiet();
+    q.begin_boot_evidence_wait(t(1001.5));
+    q.attempts = 2;
+
+    // shutdown 雜訊（含平台字串）不是開機證據：等待保留，quiet 維持未 armed。
+    let r = q.on_rx_text(
+        "EXT4-fs (flash-data): unmounting filesystem\r\nSMCOS: rebooting system...\r\n",
+        &sp,
+        t(1005.0),
+    );
+    assert_eq!(r, QuietTransition::None);
+    assert_wait(&q, 1005.0, true, Some(56.5), "shutdown noise");
+    assert!(!q.quiet_active(t(1005.0)));
+
+    // banner 被切在兩個 chunk：前半不解除。
+    let r = q.on_rx_text("...\r\nHit any key to sto", &sp, t(1020.0));
+    assert_eq!(r, QuietTransition::None);
+    assert_wait(&q, 1020.0, true, Some(41.5), "banner 前半");
+
+    // 後半拼回 tail 命中 banner：解除等待並重臂 quiet；pending、原 deadline、attempts 保留。
+    let r = q.on_rx_text("p autoboot:  3 ", &sp, t(1020.5));
+    assert_eq!(r, QuietTransition::Armed);
+    assert_eq!(q.boot_evidence_wait_until, 0);
+    assert_wait(&q, 1020.5, false, None, "banner 後半");
+    assert!(q.quiet_active(t(1020.5)));
+    assert_eq!(q.remaining_s(t(1020.5)), Some(180.0));
+    assert_eq!(
+        (q.pending, q.deadline, q.attempts, q.failed),
+        (true, t(1300.0), 2, false)
+    );
+    assert_eq!(q.reconfirm_remaining_s(t(1020.5)), Some(279.5));
+
+    // 單一 chunk 的 U-Boot 版本行同樣解除。
+    let mut q = QuietState::default();
+    q.arm(t(1000.0));
+    q.clear_quiet();
+    q.begin_boot_evidence_wait(t(1001.5));
+    let r = q.on_rx_text(
+        "U-Boot TPL 2024.04 (Oct 27 2026 - 15:48:00 +0800)\r\n",
+        &sp,
+        t(1017.0),
+    );
+    assert_eq!(r, QuietTransition::Armed);
+    assert_wait(&q, 1017.0, false, None, "banner 單 chunk");
+    assert_eq!((q.pending, q.deadline), (true, t(1300.0)));
+    assert_eq!(q.reconfirm_remaining_s(t(1017.0)), Some(283.0));
+
+    // passthrough：`_update_boot_quiet_locked` 開頭即 return（SC-35），banner 不 note、等待保留。
+    let mut pt = sp.clone();
+    pt.template.platform = "passthrough".into();
+    let mut q = QuietState::default();
+    q.begin_boot_evidence_wait(t(1000.0));
+    let r = q.on_rx_text("U-Boot 2024.04\r\n", &pt, t(1010.0));
+    assert_eq!(r, QuietTransition::None);
+    assert_eq!(q.boot_evidence_wait_until, t(1060.0));
+    assert_wait(&q, 1010.0, true, Some(50.0), "passthrough banner");
 }

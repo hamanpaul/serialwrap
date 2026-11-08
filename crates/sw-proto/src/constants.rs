@@ -179,6 +179,9 @@ pub const INTERACTIVE_KEY_MAP: [(&str, &[u8]); 9] = [
     ("right", b"\x1b[C"),
     ("left", b"\x1b[D"),
 ];
+/// 非同步 reboot 後「等開機證據才接受 READY 再確認」的寬限秒數（`sw_core/constants.py:209`，#162 延伸）。
+/// 自「reboot 命令 2 s 內 prompt 回來」起算；須小於 `READY_RECONFIRM_MAX_S`（300 s），且不延長該期限。
+pub const BOOT_EVIDENCE_GRACE_S: f64 = 60.0;
 /// 哨兵 primary console 的 label。
 pub const CONSOLE_PRIMARY_LABEL: &str = "primary";
 /// console `client_id` 的 hex 長度（`uuid4().hex[:12]`）。
