@@ -4826,6 +4826,7 @@ struct Wp510BlockingOpenBackend {
     path: String,
     entered: crossbeam_channel::Sender<()>,
     gate: Arc<(Mutex<bool>, Condvar)>,
+    error_after_gate: Mutex<Option<OpenError>>,
 }
 
 impl Wp510BlockingOpenBackend {
@@ -4849,12 +4850,31 @@ impl SerialBackend for Wp510BlockingOpenBackend {
             while !*open {
                 open = cv.wait(open).unwrap_or_else(|e| e.into_inner());
             }
+            if let Some(error) = self
+                .error_after_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return Err(error);
+            }
         }
         self.delegate.open_exclusive(dev, cfg)
     }
 }
 
 fn wp510_b_placeholder_blocking_rig() -> (
+    ServiceRig,
+    Arc<Wp510BlockingOpenBackend>,
+    crossbeam_channel::Receiver<()>,
+    FakeDevice,
+) {
+    wp510_b_placeholder_blocking_rig_with_open_error(None)
+}
+
+fn wp510_b_placeholder_blocking_rig_with_open_error(
+    error_after_gate: Option<OpenError>,
+) -> (
     ServiceRig,
     Arc<Wp510BlockingOpenBackend>,
     crossbeam_channel::Receiver<()>,
@@ -4871,6 +4891,7 @@ fn wp510_b_placeholder_blocking_rig() -> (
         path: WP510_REAL_G.to_string(),
         entered: entered_tx,
         gate: Arc::new((Mutex::new(false), Condvar::new())),
+        error_after_gate: Mutex::new(error_after_gate),
     });
     let serial: Arc<dyn SerialBackend> = backend.clone();
     let rig = ServiceRig::build_with_loaded_state_and_serial_backend(
@@ -5613,6 +5634,79 @@ fn wp510_rpc_failed_close_keeps_placeholder_drain_stalled() {
     assert_eq!(repeated_attach.get("drain_timeout_epoch"), Some(&epoch));
     assert_eq!(dev.open_count(), 1, "close 未確認時不得再次開埠");
     assert!(dev.is_open(), "後續 RPC 不得掩蓋未關閉 handle");
+}
+
+/// 正式 RPC 回歸：blocked placeholder open 在 release timeout 後回 Held（未取得 handle），應解除 stall 並可重試。
+#[test]
+fn wp510_rpc_open_error_after_release_settles_without_handle() {
+    let (rig, backend, entered, dev) = wp510_b_placeholder_blocking_rig_with_open_error(Some(
+        OpenError::Held(HolderReport {
+            pids: vec![771],
+            holder_unknown: false,
+            status: HolderScanStatus::Ok,
+        }),
+    ));
+    let rig = Arc::new(rig);
+    let attach_rig = Arc::clone(&rig);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call(
+            "device.attach",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("placeholder open_exclusive 必須進入阻塞點");
+
+    let release_rig = Arc::clone(&rig);
+    let release = std::thread::spawn(move || {
+        release_rig.call(
+            "device.release",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    let stalled = release.join().expect("release RPC thread");
+    assert_eq!(s(&stalled, "error_code"), "DRAIN_STALLED", "{}", j(&stalled));
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    let epoch = stalled
+        .get("drain_timeout_epoch")
+        .cloned()
+        .expect("DRAIN_STALLED 必須帶 timeout epoch");
+    assert!(matches!(epoch, PyValue::Int(_)), "epoch={epoch:?}");
+
+    backend.release();
+    let attached = attach.join().expect("被 release 撤銷的 attach RPC thread");
+    let expected_attached = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "DEVICE_STILL_HELD",
+        "pids" => PyValue::List(vec![PyValue::from(771)]),
+        "holder_unknown" => false,
+        "selector" => WP510_PLACEHOLDER_SID,
+        "version" => rig.version.clone(),
+    };
+    assert_eq!(j(&attached), j(&expected_attached), "開埠回 Held 的 attach RPC bytes");
+    assert_eq!(dev.open_count(), 0, "Held 開埠未取得 handle");
+
+    let state = rig
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("placeholder 仍須可查詢");
+    assert_eq!(s(&state, "state"), "RELEASED");
+    assert_eq!(state.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(state.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert_eq!(rig.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+
+    let repeated_release = rig.call(
+        "device.release",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(repeated_release.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&repeated_release));
+
+    let retry = rig.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(retry.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&retry));
+    wait_until("retry attach opens the device", || dev.open_count() == 1);
 }
 
 /// 正式 RPC 落盤回歸：退休 placeholder 的 state.json 寫入 ENOSPC 時回 EXCEPTION，關閉預開 handle，

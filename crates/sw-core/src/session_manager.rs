@@ -216,10 +216,12 @@ impl AttachOp {
         lock(&self.preopened).take()
     }
 
+    fn close_preopened_with_receipt(&self) -> Option<CloseReceipt> {
+        self.take_preopened().map(|pre| pre.parts.close())
+    }
+
     fn close_preopened(&self) {
-        if let Some(pre) = self.take_preopened() {
-            let _ = pre.parts.close();
-        }
+        let _ = self.close_preopened_with_receipt();
     }
 }
 
@@ -1479,8 +1481,8 @@ impl Shared {
 
         if let Err(error) = self.persist_placeholder_retirement(sid) {
             self.restore_released_placeholder(sid, &by_id, retired);
-            op.close_preopened();
-            self.finish_attach_op(&by_id, &op, None);
+            let close_receipt = op.close_preopened_with_receipt();
+            self.finish_attach_op(&by_id, &op, close_receipt);
             return Err(error);
         }
         self.stop_retired_placeholder_actor(sid, &retired.entry);
@@ -1498,9 +1500,9 @@ impl Shared {
             .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
         {
             if op.release_requested.load(Ordering::SeqCst) {
-                // 佔位 attach 被 release 撤銷時，只有 PAL 明確確認 handle 關閉，才能清除 actor 的
-                // drain stall 並解除 inflight；無回條或 closed:false 都保留阻擋與原 epoch 診斷。
-                if !close_receipt.as_ref().is_some_and(|receipt| receipt.closed) {
+                // 佔位 attach 被 release 撤銷時，未取得 handle 可直接完成；已取得 handle 則必須有
+                // closed:true 回條。closed:false 保留阻擋與原 epoch 診斷。
+                if close_receipt.as_ref().is_some_and(|receipt| !receipt.closed) {
                     return;
                 }
                 if let Some(actor) = inner.session_by_id(by_id).map(|entry| entry.actor.clone()) {
