@@ -53,6 +53,7 @@ pub const CLI_CONFIG: &str = "supervision_mode: windows-task\n";
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+const TASK_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 擁有者授權旗標（`SW_TEST_ALLOW_SCHTASKS=1`）。
 pub fn allowed() -> bool {
@@ -940,6 +941,21 @@ pub fn wait_task_not_running(ctl: &dyn ServiceCtl, name: &str, timeout: Duration
     }
 }
 
+/// 等到具名工作停止或已不存在；查詢失敗不視為停止。
+fn wait_task_stopped_or_absent(ctl: &dyn ServiceCtl, name: &str, timeout: Duration) -> TaskQuery {
+    assert_test_task_name(name);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = ctl.query_named(&SupervisionMode::WindowsTask, name);
+        if matches!(state, TaskQuery::NotRunning(_) | TaskQuery::NotFound)
+            || Instant::now() >= deadline
+        {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// harness（正式 `serialwrap service stop`）的結果。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FormalStopReport {
@@ -1102,12 +1118,57 @@ impl TaskGuard {
 
     fn cleanup(&self) -> Vec<String> {
         let mut errors = Vec::new();
-        for record in self.ctl.uninstall_named(&SupervisionMode::WindowsTask, &self.name, false) {
-            if record.rc != 0 && !matches!(self.ctl.query_named(&SupervisionMode::WindowsTask, &self.name), TaskQuery::NotFound) {
-                errors.push(format!("{:?} rc={}", record.argv, record.rc));
+        let mode = SupervisionMode::WindowsTask;
+        let hold = self.ctl.hold_autostart_named(&mode, &self.name, false);
+        let held = hold.is_ok();
+        let hold_error = hold
+            .err()
+            .map(|error| format!("停用測試工作失敗：{error:?}"));
+
+        // /Delete 不會結束仍在執行的批次檔。先停用具名工作，再 /End 並等到停止，
+        // 避免批次檔稍後才啟動 serialwrapd.exe，逃過後面的 staging 行程掃描。
+        let end_argv = argv(&["schtasks", "/End", "/TN", &self.name]);
+        let end_result = match self.env.run(&end_argv, Some(CMD_TIMEOUT)) {
+            Ok(output) => format!("rc={} stderr={}", output.rc, output.stderr.trim()),
+            Err(error) => format!("執行失敗：{}", error.py_message),
+        };
+        let stopped = wait_task_stopped_or_absent(&*self.ctl, &self.name, TASK_CLEANUP_TIMEOUT);
+        let can_delete = match &stopped {
+            TaskQuery::NotFound => true,
+            TaskQuery::NotRunning(_) if held => true,
+            TaskQuery::NotRunning(_) => {
+                errors.push(format!(
+                    "排程工作未能確認停用；不刪除以免延遲啟動（hold={hold_error:?}, /End={end_result}, state={stopped:?}）"
+                ));
+                false
+            }
+            TaskQuery::Running | TaskQuery::QueryFailed(_) => {
+                errors.push(format!(
+                    "排程工作在 /End 後仍未確認停止；不刪除（hold={hold_error:?}, /End={end_result}, state={stopped:?}）"
+                ));
+                false
+            }
+        };
+
+        if can_delete {
+            for record in self.ctl.uninstall_named(&mode, &self.name, false) {
+                if record.rc != 0
+                    && !matches!(self.ctl.query_named(&mode, &self.name), TaskQuery::NotFound)
+                {
+                    errors.push(format!("{:?} rc={}", record.argv, record.rc));
+                }
+            }
+            match self.ctl.query_named(&mode, &self.name) {
+                TaskQuery::NotFound => {}
+                other => errors.push(format!("測試工作刪除後仍存在：{other:?}")),
             }
         }
         errors.extend(kill_staging_daemons(&*self.env, &self.exe));
+        match staging_exe_pids(&*self.env, &self.exe) {
+            Ok(pids) if pids.is_empty() => {}
+            Ok(pids) => errors.push(format!("收尾後仍有 staging daemon：{pids:?}")),
+            Err(error) => errors.push(error),
+        }
         errors
     }
 

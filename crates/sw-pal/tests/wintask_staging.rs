@@ -212,8 +212,17 @@ fn cleanup_ends_delayed_start_task_before_deleting_it() {
     let disable = ["schtasks", "/Change", "/TN", TASK, "/DISABLE"];
     let end = ["schtasks", "/End", "/TN", TASK];
     let delete = ["schtasks", "/Delete", "/TN", TASK, "/F"];
-    let query = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", STATE_QUERY];
-    let query_owned = query.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+    let query = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        STATE_QUERY,
+    ];
+    let query_owned = query
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
 
     // 模擬排程工作仍在啟動批次檔，但 daemon 尚未建立：/End 後工作短暫仍為 Running，接著回到 Ready。
     // 行程列舉保持空白，重現原 cleanup 只掃現有 daemon 會漏掉稍後啟動者的窗口。
@@ -221,8 +230,16 @@ fn cleanup_ends_delayed_start_task_before_deleting_it() {
         .command_seq(
             &xml_query,
             &[
-                (0, "<Task><Settings><Enabled>true</Enabled></Settings></Task>", ""),
-                (0, "<Task><Settings><Enabled>false</Enabled></Settings></Task>", ""),
+                (
+                    0,
+                    "<Task><Settings><Enabled>true</Enabled></Settings></Task>",
+                    "",
+                ),
+                (
+                    0,
+                    "<Task><Settings><Enabled>false</Enabled></Settings></Task>",
+                    "",
+                ),
             ],
         )
         .command(&disable, 0, "", "")
@@ -314,8 +331,28 @@ fn runtime_test_only_uses_named_task_apis() {
     // 停止序只能來自正式 sw-cli 路徑（harness 行程）；support 不得再有自行重寫的停止流程。
     for (file, text) in [("wintask_runtime.rs", runtime), ("support/wintask.rs", support)] {
         assert!(!text.contains("graceful_stop_for_test"), "{file} 不得自行實作停止序");
-        assert!(!text.contains("\"/End\""), "{file} 不得自行組 /End（只有正式路徑與收尾守衛的 /End）");
     }
+    assert!(!runtime.contains("\"/End\""), "實跑案例不得自行組 /End");
+    let cleanup = support
+        .find("fn cleanup(&self)")
+        .expect("必須有具名收尾守衛");
+    let cleanup_body = &support[cleanup..];
+    let hold = cleanup_body
+        .find(".hold_autostart_named(")
+        .expect("收尾先停用具名工作");
+    let cleanup_end = cleanup_body
+        .find("\"/End\"")
+        .expect("收尾守衛可 /End 具名測試工作");
+    let wait = cleanup_body
+        .find("wait_task_stopped_or_absent(")
+        .expect("/End 後必須確認工作已停止");
+    let uninstall = cleanup_body
+        .find(".uninstall_named(")
+        .expect("停止後才可刪除具名測試工作");
+    assert!(
+        hold < cleanup_end && cleanup_end < wait && wait < uninstall,
+        "cleanup 必須停用、/End、確認停止後再刪除"
+    );
     // harness 在 install 前就位（缺檔即證據不足，不建立工作）；WAL 證據在收尾確認之後才判定。
     let harness = runtime.find("locate_harness(").expect("必須先找到正式停止路徑 harness");
     assert!(harness < install, "harness 必須在 install 前確認存在");
