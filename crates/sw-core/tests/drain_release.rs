@@ -1404,6 +1404,134 @@ mod wp58_g13_inflight_attach_while_draining_keeps_recovering {
     }
 }
 
+/// 審查 P8-140c92e-1：Python `attach_device` 的檢查順序為 drain → `already_attached` → `by_id not in self._devices`
+/// → 在途表（`origin/main:sw_core/session_manager.py:3410-3443`）。`update_devices`（`:4022-4030`）先把
+/// `_devices` 換成新快照，所以在途 attach 期間裝置已拔除時，第二次 `device.attach` 一律回 `DEVICE_NOT_PRESENT`
+/// （先於在途表的 ok／SESSION_RECOVERING 分流，含 RELEASED），且不得重複開埠。
+mod wp58_g13_inflight_attach_after_removal_returns_not_present {
+    use super::*;
+
+    /// Python `{"ok": False, "error_code": "DEVICE_NOT_PRESENT", "selector": selector, "device_by_id": by_id}`（`:3424`）。
+    fn g13_not_present() -> String {
+        let mut expected = PyDict::new();
+        expected.insert("ok", PyValue::Bool(false));
+        expected.insert("error_code", PyValue::from("DEVICE_NOT_PRESENT"));
+        expected.insert("selector", PyValue::from("COM0"));
+        expected.insert("device_by_id", PyValue::from(DEVICE_BY_ID));
+        g13_wire(&expected)
+    }
+
+    /// manager 的拔除順序（`session_manager.rs` 先送 `DeviceMissing` 再送 `DeviceDetached`，對應 Python
+    /// `_mark_missing_devices_locked`，審查 F60）。
+    fn remove_device(h: &mut CoreHarness) {
+        h.feed(ControlEvent::DeviceMissing);
+        h.feed(ControlEvent::DeviceDetached {
+            by_id: DEVICE_BY_ID.into(),
+            reason: DetachReason::Removed,
+        });
+    }
+
+    /// 對 `force` 兩值各呼叫一次（Python 的裝置在場檢查位於 holder 檢查之前，`force` 不影響）：回應逐位元組等於
+    /// `DEVICE_NOT_PRESENT`，且不新增 `OpenBridge`／`StartLogin`／`Persist`／`Reattach`、不改 state。
+    fn assert_not_present(h: &mut CoreHarness, phase: &str) {
+        for force in [false, true] {
+            let opens = h.fake_device.open_count();
+            let state = h.public()["state"].clone();
+            let (response, effects) = h.rpc_full(SessionRequest::DeviceAttach { force });
+            let response = response.unwrap();
+            assert_eq!(
+                g13_wire(&response),
+                g13_not_present(),
+                "{phase}（force={force}）應回 DEVICE_NOT_PRESENT"
+            );
+            assert_eq!(
+                g13_attach_side_effects(&effects),
+                0,
+                "{phase}（force={force}）不得重複開埠或登入"
+            );
+            assert_eq!(h.fake_device.open_count(), opens, "{phase}（force={force}）");
+            assert_eq!(h.public()["state"], state, "{phase}（force={force}）");
+        }
+    }
+
+    #[test]
+    fn manual_opening_device_detached_only() {
+        // 審查原情境：DETACHED、device.attach 開埠中，只收到 `DeviceDetached{Removed}`（state 為 DETACHED，
+        // 不走 begin_stop，`pending_attach` 留著）。
+        let mut h = g13_detached_with_device();
+        let (first_rx, first_effects) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        assert!(first_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+        h.feed(ControlEvent::DeviceDetached {
+            by_id: DEVICE_BY_ID.into(),
+            reason: DetachReason::Removed,
+        });
+        assert!(!h.core.drain_in_progress());
+        assert!(first_rx.try_recv().is_err(), "開埠完成前不回覆第一次 attach");
+        assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+        assert_not_present(&mut h, "device.attach 開埠中拔除（僅 DeviceDetached）");
+    }
+
+    #[test]
+    fn manual_opening() {
+        let mut h = g13_detached_with_device();
+        let (_first_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        remove_device(&mut h);
+        assert!(!h.core.drain_in_progress());
+        assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+        assert_not_present(&mut h, "device.attach 開埠中拔除");
+    }
+
+    #[test]
+    fn hotplug_opening() {
+        // 自動 attach 開埠中拔除：`DeviceMissing` 把 ATTACHING 收回 DETACHED（無 bridge、無 stop），開埠仍在途。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        let effects = h.feed(ControlEvent::DeviceAttached {
+            by_id: DEVICE_BY_ID.into(),
+            real_path: REAL_PATH.into(),
+        });
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenBridge { .. })));
+        remove_device(&mut h);
+        assert!(!h.core.drain_in_progress());
+        assert_eq!(h.public()["state"], PyValue::from("DETACHED"));
+        assert_not_present(&mut h, "自動 attach 開埠中拔除");
+    }
+
+    #[test]
+    fn opened_commit_pending() {
+        // 已開埠等 unreleased 落盤時拔除：對應 Python `_preopened_ports`。
+        let mut h = g13_detached_with_device();
+        h.defer_state_commits();
+        let (_first_rx, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        h.bridge_ok();
+        let commits = h.pending_state_commit_ids();
+        assert_eq!(commits.len(), 1, "開埠後應先落盤 unreleased");
+        remove_device(&mut h);
+        assert!(!h.core.drain_in_progress());
+        assert_not_present(&mut h, "已開埠等落盤時拔除");
+        assert_eq!(h.pending_state_commit_ids(), commits, "第二次 attach 不得再落盤");
+    }
+
+    #[test]
+    fn released_attach_opening() {
+        // 自 RELEASED 發起的 attach 開埠中拔除：Python 的裝置在場檢查先於 `_attach_inflight_draining_locked`
+        // 的 RELEASED 判斷，回 DEVICE_NOT_PRESENT 而非 SESSION_RECOVERING。
+        let mut h = CoreHarness::new(SHELL_PROFILE);
+        h.to_ready();
+        let (_rx, _) = h.rpc_deferred(release());
+        let (epoch, stop) = h.pending_stop();
+        h.receipt(epoch, stop).feed();
+        let (_first, _) = h.rpc_deferred(SessionRequest::DeviceAttach { force: false });
+        remove_device(&mut h);
+        assert!(!h.core.drain_in_progress());
+        assert_eq!(h.public()["state"], PyValue::from("RELEASED"));
+        assert_not_present(&mut h, "RELEASED 開埠中拔除");
+    }
+}
+
 #[test]
 fn stale_bridge_opened_after_real_path_change_closed() {
     let mut h = CoreHarness::new(SHELL_PROFILE);

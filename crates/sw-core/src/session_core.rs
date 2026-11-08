@@ -2139,6 +2139,12 @@ impl SessionCore {
             || (self.state == SessionState::Attaching && self.generations.conn_epoch.is_none())
             || matches!(&self.pending_commit, Some(PendingCommit::Attach { .. }));
         if attach_inflight {
+            // 審查 P8-140c92e-1：Python `attach_device` 先查 `by_id not in self._devices`（`:3423-3424`），才進在途表
+            // 分流（`:3428`）；`update_devices`（`:4022-4030`）拔除時先換掉 `_devices`。在途期間裝置已拔除
+            // （DETACHED／RELEASED 收到 `DeviceDetached` 只清 `device_present`，在途開埠仍留著）→ DEVICE_NOT_PRESENT。
+            if !session_attach && !self.device_present {
+                return vec![Effect::Reply(reply, Ok(self.device_not_present_reply()))];
+            }
             // S1X-a-3（G13）：`device.attach` 遇單純 attach 進行中回 `{"ok":true,"session"}`
             // （`origin/main:sw_core/session_manager.py:3428-3443`、`:3457-3467`）。`_attach_inflight_draining_locked`
             // （`:3384-3398`）的 drain 與在途 release 已由上方分支擋下；剩下 RELEASED（含自 RELEASED 開埠後 unreleased
@@ -2190,15 +2196,7 @@ impl SessionCore {
             )];
         }
         if !self.device_present {
-            return vec![Effect::Reply(
-                reply,
-                Ok(pydict! {
-                    "ok" => false,
-                    "error_code" => "DEVICE_NOT_PRESENT",
-                    "selector" => self.profile.com.clone(),
-                    "device_by_id" => self.profile.device_by_id.clone()
-                }),
-            )];
+            return vec![Effect::Reply(reply, Ok(self.device_not_present_reply()))];
         }
         let real_path = self
             .known_real_path
@@ -2220,6 +2218,17 @@ impl SessionCore {
             cfg: self.serial_config(),
             precheck_holders: !force,
         }]
+    }
+
+    /// Python `attach_device` 裝置不在快照時的回應（`session_manager.py:3423-3424`），鍵序 ok／error_code／selector／
+    /// device_by_id。
+    fn device_not_present_reply(&self) -> PyDict {
+        pydict! {
+            "ok" => false,
+            "error_code" => "DEVICE_NOT_PRESENT",
+            "selector" => self.profile.com.clone(),
+            "device_by_id" => self.profile.device_by_id.clone()
+        }
     }
 
     /// P5-T16：`bind_session`（session 層）：同值冪等、有 bridge 先 `StopKind::Bind` drain、否則立即改綁。
