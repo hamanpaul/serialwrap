@@ -198,6 +198,86 @@ fn task_name_guard_only_accepts_test_names() {
 }
 
 #[test]
+fn cleanup_ends_delayed_start_task_before_deleting_it() {
+    use std::sync::Arc;
+
+    use sw_pal::fakes::{real_fs, FakeClock};
+    use sw_pal::service_ctl::{ServiceCtl, WindowsTaskCtl};
+
+    const TASK: &str = "sw-p8-test-4242";
+    const EXE: &str = r"C:\Users\tester\AppData\Local\Temp\sw-p8-test-4242\bin\serialwrapd.exe";
+    const STATE_QUERY: &str = "try { (Get-ScheduledTask -TaskName 'sw-p8-test-4242' -ErrorAction Stop).State.ToString() } catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotFound' } else { exit 3 } }";
+
+    let xml_query = ["schtasks", "/Query", "/TN", TASK, "/XML"];
+    let disable = ["schtasks", "/Change", "/TN", TASK, "/DISABLE"];
+    let end = ["schtasks", "/End", "/TN", TASK];
+    let delete = ["schtasks", "/Delete", "/TN", TASK, "/F"];
+    let query = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", STATE_QUERY];
+    let query_owned = query.iter().map(|value| value.to_string()).collect::<Vec<_>>();
+
+    // 模擬排程工作仍在啟動批次檔，但 daemon 尚未建立：/End 後工作短暫仍為 Running，接著回到 Ready。
+    // 行程列舉保持空白，重現原 cleanup 只掃現有 daemon 會漏掉稍後啟動者的窗口。
+    let env = FakeSysEnv::builder()
+        .command_seq(
+            &xml_query,
+            &[
+                (0, "<Task><Settings><Enabled>true</Enabled></Settings></Task>", ""),
+                (0, "<Task><Settings><Enabled>false</Enabled></Settings></Task>", ""),
+            ],
+        )
+        .command(&disable, 0, "", "")
+        .command_seq(
+            &query,
+            &[
+                (0, "Running\r\n", ""),
+                (0, "Running\r\n", ""),
+                (0, "Ready\r\n", ""),
+                (0, "NotFound\r\n", ""),
+            ],
+        )
+        .command(&end, 0, "", "")
+        .command(&delete, 0, "", "")
+        .build();
+    let ctl: Arc<dyn ServiceCtl> = Arc::new(WindowsTaskCtl::new(
+        env.clone(),
+        real_fs(),
+        FakeClock::new(),
+    ));
+
+    TaskGuard::new(env.clone(), ctl, TASK, EXE)
+        .finish()
+        .expect("必須先停止延遲啟動中的具名工作，再刪除並確認無殘留 daemon");
+
+    let calls = env.calls();
+    let end_at = calls
+        .iter()
+        .position(|argv| argv == &end)
+        .expect("收尾必須對測試工作執行 /End");
+    let delete_at = calls
+        .iter()
+        .position(|argv| argv == &delete)
+        .expect("收尾必須刪除測試工作");
+    let state_after_end = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, argv)| argv.as_slice() == query_owned.as_slice())
+        .map(|(index, _)| index)
+        .filter(|index| *index > end_at)
+        .collect::<Vec<_>>();
+    assert!(end_at < delete_at, "必須先 /End 再 /Delete：{calls:?}");
+    assert!(
+        state_after_end.iter().any(|index| *index < delete_at),
+        "刪除前必須查到 /End 已讓工作離開 Running：{calls:?}"
+    );
+    assert!(
+        calls.iter().enumerate().all(|(index, argv)| {
+            !argv.first().is_some_and(|program| program == "taskkill") || index > delete_at
+        }),
+        "只可在工作停止並刪除後清理既有 staging daemon：{calls:?}"
+    );
+}
+
+#[test]
 #[should_panic(expected = "正式埠")]
 fn staging_refuses_production_port() {
     let _ = StagingSpec::new(ROOT, PRODUCTION_PORT, Vec::new());

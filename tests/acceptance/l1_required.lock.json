@@ -26812,6 +26812,7 @@
           "cargo:sw-cli::wintask_scoped_stop::scoped_rpc_only_connects_to_test_port",
           "cargo:sw-pal::wintask_staging::batch_clears_inherited_env_then_isolates_every_dir",
           "cargo:sw-pal::wintask_staging::batch_runs_staging_daemon_on_test_port_only",
+          "cargo:sw-pal::wintask_staging::cleanup_ends_delayed_start_task_before_deleting_it",
           "cargo:sw-pal::wintask_staging::config_excludes_every_registry_com_and_allowlists_com250",
           "cargo:sw-pal::wintask_staging::harness_argv_scopes_cli_to_staging_and_test_port",
           "cargo:sw-pal::wintask_staging::harness_output_parses_formal_stop_report",
