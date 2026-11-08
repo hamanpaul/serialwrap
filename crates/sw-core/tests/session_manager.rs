@@ -1289,6 +1289,160 @@ fn wp510_a_placeholder_persists_across_restarts() {
     }
 }
 
+/// 建立缺失 template 的 OD-63 佔位，供 WP5-10a 自動路徑回歸共用。
+fn wp510_a_placeholder_rig() -> ManagerRig {
+    const ONLY_PRPL: &str = "profiles:\n  prpl-template:\n    platform: prpl\n    prompt_regex: '(?m)^root@prpl:.*# '\n    timeout_s: 2.0\n";
+    let mut loaded = LoadedState::default();
+    loaded.released.insert(
+        "gone-template:COM3".to_string(),
+        released_row("/s/by-id/usb-G"),
+    );
+    ManagerRig::with(ONLY_PRPL, loaded, None)
+}
+
+/// 重現 Python 第三輪防線繞過情境：持久化 released 阻擋移除，核心狀態變成 DETACHED，但佔位標記保留。
+fn wp510_a_clear_persisted_block_and_detach(m: &ManagerRig) {
+    const SID: &str = "gone-template:COM3";
+    assert_eq!(m.mgr.released_placeholder(SID), Some(true));
+    assert!(m.mgr.clear_released_block_for_test(SID));
+    assert!(!m.load_state_now().released.contains_key(SID));
+    m.mgr.force_session_state(SID, SessionState::Detached);
+    m.wait_state(SID, "DETACHED");
+    assert_eq!(m.mgr.released_placeholder(SID), Some(true));
+}
+
+/// 佔位自動路徑必須沒有 open、UART 寫入、WAL TX 或正式 bridge。
+fn wp510_a_assert_no_attach_io(m: &ManagerRig, paths: &[&str]) {
+    for path in paths {
+        assert_eq!(m.serial.open_attempts(path), 0, "佔位不得 open {path}");
+        assert!(m.device(path).take_tx().is_empty(), "佔位不得寫入 {path}");
+    }
+    assert!(
+        m.wal_rows()
+            .iter()
+            .all(|row| s_of(row, "dir").as_deref() != Some("TX")),
+        "佔位不得留下 WAL TX：{:?}",
+        m.wal_rows()
+    );
+    let session = m.session("gone-template:COM3");
+    assert_eq!(
+        session.get("attached_real_path"),
+        Some(&PyValue::Null),
+        "佔位不得建立 bridge：{session:?}"
+    );
+    assert_eq!(
+        session.get("bridge_generation").and_then(PyValue::as_i64),
+        Some(0),
+        "佔位不得建立 bridge：{session:?}"
+    );
+}
+
+#[test]
+fn wp510_a_attach_worker_never_opens_placeholder() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_a_placeholder_rig();
+    let _device = m.add_device_at(BY_ID, REAL);
+    wp510_a_clear_persisted_block_and_detach(&m);
+
+    m.mgr.update_devices(&m.snapshot());
+    m.mgr.bootstrap_attach();
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+
+    assert_eq!(m.mgr.released_placeholder("gone-template:COM3"), Some(true));
+    assert_eq!(
+        m.state_of("gone-template:COM3").as_deref(),
+        Some("DETACHED")
+    );
+    wp510_a_assert_no_attach_io(&m, &[REAL]);
+}
+
+#[test]
+fn wp510_a_hotplug_keeps_placeholder_blocked() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const FIRST: &str = "/dev/ttyG-first";
+    const RETARGETED: &str = "/dev/ttyG-retargeted";
+    let m = wp510_a_placeholder_rig();
+    let _first = m.add_device_at(BY_ID, FIRST);
+    wp510_a_clear_persisted_block_and_detach(&m);
+
+    // 上線。
+    m.mgr.update_devices(&m.snapshot());
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    wp510_a_assert_no_attach_io(&m, &[FIRST]);
+
+    // 拔除。
+    m.mgr.update_devices(&[]);
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    wp510_a_assert_no_attach_io(&m, &[FIRST]);
+
+    // 重插同一 by_id。
+    m.mgr.update_devices(&m.snapshot());
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    wp510_a_assert_no_attach_io(&m, &[FIRST]);
+
+    // 同一 by_id 改指到新實體路徑。
+    let _retargeted = m.add_device_at(BY_ID, RETARGETED);
+    m.mgr.update_devices(&m.snapshot());
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+
+    // 啟動掃描及 watcher tick 也不得替佔位重掛。
+    m.mgr.bootstrap_attach();
+    m.mgr
+        .watcher_sender()
+        .send(WatcherEvent::Tick)
+        .expect("watcher tick 應排入");
+    m.mgr.on_tick();
+    assert!(m
+        .mgr
+        .wait_attach_idle_for_test(BY_ID, Duration::from_secs(5)));
+    assert_eq!(m.mgr.released_placeholder("gone-template:COM3"), Some(true));
+    assert_eq!(
+        m.state_of("gone-template:COM3").as_deref(),
+        Some("DETACHED")
+    );
+    wp510_a_assert_no_attach_io(&m, &[FIRST, RETARGETED]);
+}
+
+#[test]
+fn wp510_a_placeholder_rejects_commands() {
+    const BY_ID: &str = "/s/by-id/usb-G";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_a_placeholder_rig();
+    let _device = m.add_device_at(BY_ID, REAL);
+    m.mgr.update_devices(&m.snapshot());
+    assert_eq!(
+        m.state_of("gone-template:COM3").as_deref(),
+        Some("RELEASED")
+    );
+
+    let sid = m.mgr.resolve("gone-template:COM3").expect("佔位 session");
+    let mut req = agent_submit("echo wp510-placeholder");
+    req.session_id = sid.clone();
+    let result = rpc(m.mgr.route(&sid, SessionRequest::Submit(req), RPC));
+
+    // Python command.submit 對 RELEASED 的優先序為 SESSION_NOT_READY；file.push 另在
+    // passthrough profile gate 回 PROFILE_NOT_COMMAND_CAPABLE（由 Python 基線回歸覆核）。
+    assert_eq!(
+        code_of(&result).as_deref(),
+        Some("SESSION_NOT_READY"),
+        "{result:?}"
+    );
+    assert_eq!(m.mgr.session_queue_lens("gone-template:COM3"), Some((0, 0)));
+    assert_eq!(m.mgr.released_placeholder("gone-template:COM3"), Some(true));
+    wp510_a_assert_no_attach_io(&m, &[REAL]);
+}
+
 /// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。
 fn snapshot_without(m: &ManagerRig, by_id: &str) -> Vec<(String, DeviceInfo)> {
     m.snapshot().into_iter().filter(|(k, _)| k != by_id).collect()

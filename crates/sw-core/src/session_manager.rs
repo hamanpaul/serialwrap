@@ -936,6 +936,13 @@ impl Shared {
             self.warn(format!("shutdown 中，略過 attach {by_id}"));
             return;
         }
+        // OD-63：佔位標記是自動 attach 的權威防線；即使 state.json 的 RELEASED 列已遺失也不可重掛。
+        if inner
+            .session_by_id(by_id)
+            .is_some_and(|e| e.released_placeholder)
+        {
+            return;
+        }
         if released.contains(by_id) {
             return;
         }
@@ -988,9 +995,14 @@ impl Shared {
 
     /// attach worker 本體（`_attach_by_id`）：既有 session → #181 再解析；否則 DETACHED-rebind 或動態偵測。
     fn attach_worker(self: &Arc<Self>, by_id: &str, op: &AttachOp) {
-        let existing = lock(&self.inner)
-            .session_by_id(by_id)
-            .map(|e| e.sid.clone());
+        let existing = {
+            let inner = lock(&self.inner);
+            match inner.session_by_id(by_id) {
+                Some(e) if e.released_placeholder => return,
+                Some(e) => Some(e.sid.clone()),
+                None => None,
+            }
+        };
         if let Some(sid) = existing {
             self.reattach_existing(&sid, by_id, op);
             return;
@@ -1001,7 +1013,9 @@ impl Shared {
             inner
                 .sessions
                 .values()
-                .filter(|e| !inner.devices.contains_key(&e.profile.device_by_id))
+                .filter(|e| {
+                    !e.released_placeholder && !inner.devices.contains_key(&e.profile.device_by_id)
+                })
                 .map(|e| (e.sid.clone(), pyint_i128(&e.profile.act_no)))
                 .collect()
         };
@@ -1063,7 +1077,11 @@ impl Shared {
     fn send_attached(&self, by_id: &str) {
         let target = {
             let inner = lock(&self.inner);
-            if inner.stopping {
+            if inner.stopping
+                || inner
+                    .session_by_id(by_id)
+                    .is_some_and(|e| e.released_placeholder)
+            {
                 None
             } else {
                 match (inner.session_by_id(by_id), inner.device_path(by_id)) {
@@ -1354,6 +1372,13 @@ impl Shared {
 
     /// 既有 session 重新 attach 前的 profile 再解析（#181 `_reresolve_profile_on_reattach`）。
     fn reattach_existing(self: &Arc<Self>, sid: &str, by_id: &str, op: &AttachOp) {
+        if lock(&self.inner)
+            .sessions
+            .get(sid)
+            .is_some_and(|e| e.released_placeholder)
+        {
+            return;
+        }
         let Some(public) = self.session_public(sid) else {
             return;
         };
@@ -3256,6 +3281,37 @@ impl SessionManager {
         lock(&self.shared.inner)
             .resolve(selector)
             .map(|e| e.released_placeholder)
+    }
+
+    /// 只供測試（test-fakes）：移除 selector 對應的持久化 RELEASED 阻擋，保留佔位標記。
+    #[cfg(feature = "test-fakes")]
+    pub fn clear_released_block_for_test(&self, selector: &str) -> bool {
+        let Some(sid) = self.resolve(selector) else {
+            return false;
+        };
+        self.shared
+            .commit_sync(move |m| m.apply(StateDelta::Unreleased { sid }))
+            .is_ok()
+    }
+
+    /// 只供測試（test-fakes）：等待指定 by_id 的 attach worker 結束。
+    #[cfg(feature = "test-fakes")]
+    pub fn wait_attach_idle_for_test(&self, by_id: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut inner = lock(&self.shared.inner);
+        while inner.inflight.contains_key(by_id) {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            inner = self
+                .shared
+                .cv
+                .wait_timeout(inner, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
     }
 
     /// 只供測試（test-fakes）：session 的 `last_error` 變更歷史（依發生順序）。
