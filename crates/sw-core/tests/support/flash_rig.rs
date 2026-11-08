@@ -684,6 +684,8 @@ pub struct FlashRig {
     pub clock: Arc<RigClock>,
     excl: Arc<ScriptedExcl>,
     console: Arc<RigFlashConsole>,
+    /// `Some(link)`：端點改用真 PTY（`NativeConsoleFactory`），symlink 建在真檔案系統的 `link`（`cap_posix_pty`）。
+    real_pty_link: Option<PathBuf>,
     started: OnceLock<Started>,
 }
 
@@ -752,6 +754,7 @@ impl FlashRig {
                 }),
             }),
             console: RigFlashConsole::new(),
+            real_pty_link: None,
             started: OnceLock::new(),
         }
     }
@@ -764,6 +767,16 @@ impl FlashRig {
     /// Windows 能力（`caps.flash_endpoint=false`）。
     pub fn windows_fake() -> FlashRig {
         FlashRig::with_caps(false)
+    }
+
+    /// 真 PTY 端點（P8 Task 13，T9 裁決的 `cap_posix_pty__endpoint_slave_never_exclusive`）：端點的 PTY、raw、symlink
+    /// 走 `NativeConsoleFactory`，symlink 建在真檔案系統的 `link`；flasher 以 `sw_pal::testutil::PlainTty` 一般 open
+    /// `link`。MCU、holder 掃描、Clock 仍為替身。腳本化 master 的觀察／注入函式（`master_writes`、`flasher_write`、
+    /// `pump_once`、`run_until_flashing`、`endpoint_slave_path`、`ttymcu_link_exists` 等）不適用。
+    pub fn posix_real_pty(link: &Path) -> FlashRig {
+        let mut rig = FlashRig::with_caps(true);
+        rig.real_pty_link = Some(link.to_path_buf());
+        rig
     }
 
     /// 偵測候選（純函式測試用）。
@@ -887,8 +900,12 @@ impl FlashRig {
         };
         let mut caps = sw_pal::fakes::posix_caps();
         caps.flash_endpoint = self.flash_caps;
-        let pal = sw_pal::fakes::platform().console(self.console.clone()).caps(caps).build();
-        let endpoint = FlashEndpoint::start(&pal, Path::new(LINK), coord.clone(), ENDPOINT_GRACE)
+        let (console, link): (Arc<dyn ConsoleTransportFactory>, PathBuf) = match &self.real_pty_link {
+            Some(link) => (Arc::new(sw_pal::console_pty::NativeConsoleFactory::new(ConsoleKind::Pty)), link.clone()),
+            None => (self.console.clone(), PathBuf::from(LINK)),
+        };
+        let pal = sw_pal::fakes::platform().console(console).caps(caps).build();
+        let endpoint = FlashEndpoint::start(&pal, &link, coord.clone(), ENDPOINT_GRACE)
             .expect("FlashEndpoint::start");
         Started {
             mgr,

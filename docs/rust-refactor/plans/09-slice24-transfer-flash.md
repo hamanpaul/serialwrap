@@ -1710,7 +1710,7 @@ fn shutdown_at_second_flash_start() {
 | `rx_observer_non_blocking` | master writer `try_write` 回 `Ok(0)` | reader thread 不阻塞、不重試 |
 | `rx_observer_only_active_com` | COM1 RX | 不寫 master |
 | `second_open_while_active_ignored` | flash 中 flasher 再寫 | 不重入 `on_flash_open` |
-| `cap_posix_pty__endpoint_slave_never_exclusive`（`crates/sw-pal/tests/flash_pty.rs`，`posix_pty`；R0-F3 延伸） | `FlashEndpoint::start` 後、完成一次 matched→pump→`FlashHolderGone` 循環後，各以一般 open 開 `ttyMCU` 並 `ioctl(TIOCGEXCL)` | 兩次讀回皆為 `0`（daemon 從未對端點設 TIOCEXCL）；第二次 flasher open 成功、送 `55 55` 仍得 `00 cc` 回放 |
+| `cap_posix_pty__endpoint_slave_never_exclusive`（`crates/sw-core/tests/flash_coordinator.rs`，`posix_pty`；R0-F3 延伸；需 sw-core 的 `FlashEndpoint`，依編排者 T9 裁決自 sw-pal `flash_pty.rs` 移入，由 T13 承接） | `FlashEndpoint::start` 後、完成一次 matched→pump→`FlashHolderGone` 循環後，各以一般 open 開 `ttyMCU` 並 `ioctl(TIOCGEXCL)` | 兩次讀回皆為 `0`（daemon 從未對端點設 TIOCEXCL）；第二次 flasher open 成功、送 `55 55` 仍得 `00 cc` 回放 |
 | `endpoint_reopen_after_flasher_set_excl_recorded`（黑箱，只記錄、不判 PASS／FAIL） | `FakeFlasher(excl=True)` 開端點後設 `TIOCEXCL`、完成 flash、不清除即關閉 → 第二個 `FakeFlasher` 開 link | 記錄第二次 open 的 errno（預期 Python 與 Rust 皆為 `EBUSY`）與 `mcu.status`；結果寫入 gate 報告「待裁決」欄（DF 候選：端點於 `FlashHolderGone` 後以 keepalive fd `TIOCNXCL`） |
 | `endpoint_thread_survives_on_flash_open_panic` | coordinator panic | thread 繼續服務下一次 open（C1） |
 | `windows_caps_no_endpoint` | `caps.flash_endpoint=false` | `FlashEndpoint::start` 回 `Ok(None)`，無 thread |

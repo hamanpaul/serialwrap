@@ -613,3 +613,68 @@ fn drop_without_stop_unlinks() {
     assert!(rig.endpoint_shutdown().is_set());
     wait_real("端點 thread 收尾", || rig.master_closed());
 }
+
+// ---------------------------------------------------------------------------
+// 真 PTY（cap:posix_pty；編排者 T9 裁決由 sw-pal flash_pty.rs 移到此處——需要 sw-core 的 FlashEndpoint）
+// ---------------------------------------------------------------------------
+
+/// 計畫 Task 9「其餘族」表（R0-F3 延伸）：daemon 從未對 `/dev/ttyMCU` 端點設 `TIOCEXCL`。`FlashEndpoint::start` 後、
+/// 完成一次 matched→pump→`FlashHolderGone` 循環後，各以一般 open 開 `ttyMCU` 並 `ioctl(TIOCGEXCL)` 皆讀回 0；第二次
+/// flasher 一般 open 成功，送 `55 55` 仍得 `00 cc` 回放。flasher 每輪讀完 ACK 再關（MCU 坑：未讀的 ACK 會殘留在 tty
+/// 輸入佇列）。端點 PTY／raw／symlink 為真（`NativeConsoleFactory`），MCU、holder 掃描與 Clock 為替身。
+#[test]
+#[ignore = "cap:posix_pty"]
+#[allow(non_snake_case)]
+fn cap_posix_pty__endpoint_slave_never_exclusive() {
+    use sw_pal::testutil::{tty_exclusive, PlainTty};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let link = dir.path().join("run/dev/ttyMCU");
+    let rig = FlashRig::posix_real_pty(&link);
+    rig.add_passthrough("COM0", "by-id/mcu", Mcu::ti_sbl());
+    assert!(rig.endpoint_started(), "caps.flash_endpoint=true 必須啟動端點");
+    assert!(std::fs::symlink_metadata(&link).is_ok(), "ttyMCU symlink 已建立");
+    let excl = |when: &str| match tty_exclusive(&link) {
+        Ok(v) => v,
+        Err(e) => panic!("{when}：一般 open／TIOCGEXCL 失敗（端點被設為 exclusive 時一般 open 會 EBUSY）：{}", e.py_message),
+    };
+    assert!(!excl("start 後"), "start 後端點不得為 exclusive");
+
+    // 第一次 flash：matched → pump → FlashHolderGone。
+    rig.holder_sequence(&[vec![4242], vec![4242], vec![]]);
+    let mut flasher = PlainTty::open(&link).expect("flasher 一般 open");
+    flasher.write_all(SYNC).expect("送 sync");
+    rig.drive_until("COM0 FLASHING", |r| r.state("COM0") == "FLASHING");
+    assert_eq!(flasher.read_within(ACK.len(), Duration::from_secs(5)).expect("讀 ACK"), ACK, "MCU 的 ACK 回放給 flasher");
+    wait_real("holder watch thread 登記第一次等待", || rig.clock.waiters() > 0);
+    rig.settle();
+    flasher.write_all(b"\x03\x10\x20").expect("送封包");
+    wait_real("pump 送到 MCU 線", || rig.device("COM0").tx_since(0).ends_with(b"\x03\x10\x20"));
+    assert_eq!(flasher.read_within(ACK.len(), Duration::from_secs(5)).expect("讀封包 ACK"), ACK, "封包 ACK 轉給 flasher");
+    drop(flasher);
+    rig.advance_secs(1.5);
+    rig.run_until_state("COM0", "ATTACHED");
+    wait_real("第一次 FlashHolderGone", || rig.events_of("COM0", "FlashHolderGone").len() == 1);
+    assert!(!excl("FlashHolderGone 循環後"), "循環後端點仍不得為 exclusive");
+
+    // 第二次 flasher：一般 open 成功，sync 仍得 ACK 回放。
+    rig.holder_sequence(&[vec![4343], vec![4343], vec![]]);
+    let mut second = PlainTty::open(&link).expect("第二次 flasher 一般 open 必須成功");
+    second.write_all(SYNC).expect("第二次 sync");
+    rig.drive_until("COM0 第二次 FLASHING", |r| r.state("COM0") == "FLASHING");
+    assert_eq!(second.read_within(ACK.len(), Duration::from_secs(5)).expect("讀 ACK"), ACK, "第二次 sync 仍得 00 cc 回放");
+    wait_real("第二次 holder watch 登記等待", || rig.clock.waiters() > 0);
+    rig.settle();
+    drop(second);
+    rig.advance_secs(1.5);
+    rig.run_until_state("COM0", "ATTACHED");
+    wait_real("第二次 FlashHolderGone", || rig.events_of("COM0", "FlashHolderGone").len() == 2);
+    assert_eq!(
+        rig.serial_tx("COM0"),
+        vec![SYNC.to_vec(), b"\x03\x10\x20".to_vec(), SYNC.to_vec()],
+        "送到 MCU 的只有兩次 flasher 自己的 sync 與一個封包"
+    );
+    let r = rig.stop_endpoint();
+    assert_eq!((r.joined, r.unlinked), (true, true));
+    assert!(std::fs::symlink_metadata(&link).is_err(), "stop 後 ttyMCU symlink 已移除");
+}
