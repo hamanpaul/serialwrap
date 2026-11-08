@@ -32,6 +32,8 @@ pub use fs::{FaultFs, MemFs};
 pub use mem_stream::MemStream;
 pub use platform::{platform, posix_caps, windows_caps, FakePlatformBuilder};
 pub use proc::FakeProcScan;
+#[cfg(unix)]
+pub use proc::FakeHolderFs;
 pub use process::{FakeHandlerSpawner, FakeProcessCtl, RecordingProcess};
 pub use realfs::{file_mode, real_fs};
 pub use registry::FakeRegistry;

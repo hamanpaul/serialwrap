@@ -18,6 +18,7 @@ use crate::service::{Service, int};
 fn status_str(s: HolderScanStatus) -> &'static str {
     match s {
         HolderScanStatus::Ok => "ok",
+        HolderScanStatus::PartialOtherUid => "permission",
         HolderScanStatus::Permission => "permission",
         HolderScanStatus::Unknown => "unknown",
         HolderScanStatus::Unsupported => "unsupported",
@@ -30,6 +31,7 @@ fn status_rank(s: HolderScanStatus) -> u8 {
         HolderScanStatus::Ok => 0,
         HolderScanStatus::Unknown => 1,
         HolderScanStatus::Unsupported => 2,
+        HolderScanStatus::PartialOtherUid => 3,
         HolderScanStatus::Permission => 3,
     }
 }

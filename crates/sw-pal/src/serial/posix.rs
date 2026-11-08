@@ -142,7 +142,10 @@ pub enum PostLockVerdict {
 pub fn post_lock_holder_verdict(rep: &HolderReport) -> PostLockVerdict {
     if !rep.pids.is_empty() {
         PostLockVerdict::Reject
-    } else if rep.status == HolderScanStatus::Ok {
+    } else if matches!(
+        rep.status,
+        HolderScanStatus::Ok | HolderScanStatus::PartialOtherUid
+    ) {
         PostLockVerdict::Accept
     } else {
         PostLockVerdict::AcceptUnverified

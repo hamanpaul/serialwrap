@@ -4,7 +4,11 @@
 //! 與 `FakeRpcConnector::refuse_from_connect(ep, n)` 同一計數，故「ping 翻為 refused」與「pid 不存活」在同一輪詢翻轉。
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::io;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::rpc::FakeRpcConnector;
@@ -12,6 +16,74 @@ use crate::proc_scan::{
     DaemonProc, HolderScanStatus, ProcDetails, ProcIdentity, ProcScan, ScanFailure,
 };
 use crate::traits::Clock;
+
+/// 假 `/proc` 檔案系統：獨立供 POSIX holder probe 注入目錄、stat 與 UID 資訊。
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct FakeHolderFs {
+    dirs: BTreeMap<PathBuf, Result<Vec<String>, io::ErrorKind>>,
+    stats: BTreeMap<PathBuf, Result<crate::proc_holders::posix::TtyStat, io::ErrorKind>>,
+    current_uid: Option<u32>,
+    process_uids: BTreeMap<u32, Option<u32>>,
+}
+
+#[cfg(unix)]
+impl FakeHolderFs {
+    pub fn set_dir(&mut self, path: impl Into<PathBuf>, entries: Vec<String>) {
+        self.dirs.insert(path.into(), Ok(entries));
+    }
+
+    pub fn fail_dir(&mut self, path: impl Into<PathBuf>, kind: io::ErrorKind) {
+        self.dirs.insert(path.into(), Err(kind));
+    }
+
+    pub fn set_stat(
+        &mut self,
+        path: impl Into<PathBuf>,
+        stat: crate::proc_holders::posix::TtyStat,
+    ) {
+        self.stats.insert(path.into(), Ok(stat));
+    }
+
+    pub fn fail_stat(&mut self, path: impl Into<PathBuf>, kind: io::ErrorKind) {
+        self.stats.insert(path.into(), Err(kind));
+    }
+
+    pub fn set_current_uid(&mut self, uid: Option<u32>) {
+        self.current_uid = uid;
+    }
+
+    pub fn set_process_uid(&mut self, pid: u32, uid: Option<u32>) {
+        self.process_uids.insert(pid, uid);
+    }
+}
+
+#[cfg(unix)]
+impl crate::proc_holders::posix::HolderFs for FakeHolderFs {
+    fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
+        match self.dirs.get(path) {
+            Some(Ok(entries)) => Ok(entries.clone()),
+            Some(Err(kind)) => Err(io::Error::from(*kind)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    fn stat(&self, path: &Path) -> io::Result<crate::proc_holders::posix::TtyStat> {
+        match self.stats.get(path) {
+            Some(Ok(stat)) => Ok(*stat),
+            Some(Err(kind)) => Err(io::Error::from(*kind)),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    fn current_uid(&self) -> Option<u32> {
+        self.current_uid
+    }
+
+    fn process_uid(&self, _proc_root: &Path, pid: u32) -> Option<u32> {
+        self.process_uids.get(&pid).copied().flatten()
+    }
+}
 
 #[derive(Debug, Clone)]
 enum GateKind {

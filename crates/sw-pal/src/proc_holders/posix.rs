@@ -48,6 +48,14 @@ pub trait HolderFs {
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
     /// `stat`（跟隨 symlink；對應 `os.stat`）。
     fn stat(&self, path: &Path) -> io::Result<TtyStat>;
+    /// 呼叫者的 real uid；預設無法確認，既有替身維持保守分類。
+    fn current_uid(&self) -> Option<u32> {
+        None
+    }
+    /// `proc_root/<pid>` 目錄 owner 的 uid；不得由 fd 或目標 tty 推測。
+    fn process_uid(&self, _proc_root: &Path, _pid: u32) -> Option<u32> {
+        None
+    }
 }
 
 /// 真實檔案系統。
@@ -64,6 +72,16 @@ impl HolderFs for RealHolderFs {
 
     fn stat(&self, path: &Path) -> io::Result<TtyStat> {
         fs::metadata(path).map(|meta| TtyStat::from_metadata(&meta))
+    }
+
+    fn current_uid(&self) -> Option<u32> {
+        Some(unsafe { libc::getuid() } as u32)
+    }
+
+    fn process_uid(&self, proc_root: &Path, pid: u32) -> Option<u32> {
+        fs::metadata(proc_root.join(pid.to_string()))
+            .ok()
+            .map(|meta| meta.uid())
     }
 }
 
@@ -123,6 +141,8 @@ fn probe_holders_excluding(
     };
     let mut pids = BTreeSet::new();
     let mut status = HolderScanStatus::Ok;
+    let current_uid = fs.current_uid();
+    let mut other_uid_unreadable = false;
 
     // Python：os.listdir(proc_root) 的 PermissionError 與其他 OSError 皆回 permission。
     let entries = match fs.list_dir(proc_root) {
@@ -160,7 +180,15 @@ fn probe_holders_excluding(
                 // 行程或 fd 在掃描期間消失屬正常競態。
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    status = HolderScanStatus::Permission;
+                    let owner_uid = fs.process_uid(proc_root, pid);
+                    if current_uid
+                        .zip(owner_uid)
+                        .is_some_and(|(current, owner)| current != owner)
+                    {
+                        other_uid_unreadable = true;
+                    } else {
+                        status = HolderScanStatus::Permission;
+                    }
                     continue;
                 }
                 Err(_) => {
@@ -177,6 +205,9 @@ fn probe_holders_excluding(
         }
     }
 
+    if status == HolderScanStatus::Ok && other_uid_unreadable {
+        status = HolderScanStatus::PartialOtherUid;
+    }
     report(pids, status)
 }
 
@@ -229,7 +260,8 @@ fn parse_parent_pid(stat: &str) -> Option<u32> {
 fn report(pids: BTreeSet<u32>, status: HolderScanStatus) -> HolderReport {
     let pids = pids.into_iter().collect::<Vec<_>>();
     HolderReport {
-        holder_unknown: pids.is_empty() && status != HolderScanStatus::Ok,
+        holder_unknown: pids.is_empty()
+            && !matches!(status, HolderScanStatus::Ok | HolderScanStatus::PartialOtherUid),
         pids,
         status,
     }

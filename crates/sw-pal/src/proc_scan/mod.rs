@@ -78,16 +78,18 @@ pub enum ArgvFlavor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HolderScanStatus {
     Ok,
+    PartialOtherUid,
     Permission,
     Unknown,
     Unsupported,
 }
 
 impl HolderScanStatus {
-    /// Python `HolderReport.status` 的字串（`"ok"`／`"permission"`／`"unknown"`／`"unsupported"`）；對外文字一律用此值。
+    /// Python holder probe 的狀態字串；health 掃描另將 `PartialOtherUid` 正規化為 `permission`。
     pub fn py_name(self) -> &'static str {
         match self {
             HolderScanStatus::Ok => "ok",
+            HolderScanStatus::PartialOtherUid => "partial_other_uid",
             HolderScanStatus::Permission => "permission",
             HolderScanStatus::Unknown => "unknown",
             HolderScanStatus::Unsupported => "unsupported",
