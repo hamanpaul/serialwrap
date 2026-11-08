@@ -390,6 +390,184 @@ const WP52_MODES: [(&str, &str); 4] = [
     ("bg", "background"),
 ];
 
+// ---------------------------------------------------------------------------
+// WP5-4：未帶旗標的串接 reboot 提示與 command.submit 接線
+// ---------------------------------------------------------------------------
+
+const WP54_CHAINED_WARNING_HINT: &str = "命令在 &&／||／;／& 之後含 reboot，但未帶 --expect-reboot：broker 只認單獨一條的 reboot，這條會被當一般命令，不會立即 arm 開機靜默窗；shell 不回 prompt 的板子會逾時並送 Ctrl-C／Ctrl-D，shell 立刻重印 prompt 的板子則後續命令可能落進正在 shutdown 的系統。含重開機的串接命令請改用 `cmd submit --expect-reboot`。命令仍照常送出，本提示不改變執行。";
+
+fn wp54_warning(segment: &str) -> PyDict {
+    sw_proto::pydict! {
+        "code" => "CHAINED_REBOOT_WARNING",
+        "segment" => segment,
+        "hint" => WP54_CHAINED_WARNING_HINT,
+    }
+}
+
+#[test]
+fn wp54_chained_warning_is_nonfatal_and_reaches_uart() {
+    let r = ServiceRig::ready_shell();
+    let command = WP52_CHAINED;
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(
+        format!("{command}\n").as_bytes(),
+        b"\r\nwp54-out\r\nroot@t:/# ",
+    );
+    r.settle();
+    let tx_mark = dev.tx_len();
+
+    let response = r.call(
+        "command.submit",
+        &format!(r#"{{"selector":"COM0","cmd":"{command}"}}"#),
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    let cmd_id = s(&response, "cmd_id").to_string();
+    let warning = wp54_warning("reboot");
+    assert_eq!(
+        response.get("warning"),
+        Some(&PyValue::Dict(warning.clone()))
+    );
+    assert_eq!(
+        response.get("warnings"),
+        Some(&PyValue::List(vec![PyValue::Dict(warning.clone())]))
+    );
+
+    let mut expected = sw_proto::pydict! {
+        "ok" => true,
+        "cmd_id" => cmd_id.clone(),
+        "status" => "accepted",
+        "session_id" => r.mgr.resolve("COM0").expect("COM0 session"),
+    };
+    expected.insert(
+        "warnings",
+        PyValue::List(vec![PyValue::Dict(warning.clone())]),
+    );
+    expected.insert("warning", PyValue::Dict(warning));
+    expected.insert("source_class", PyValue::from("agent"));
+    expected.insert("version", PyValue::from(r.version.clone()));
+    assert_eq!(
+        keys(&response),
+        [
+            "ok",
+            "cmd_id",
+            "status",
+            "session_id",
+            "warnings",
+            "warning",
+            "source_class",
+            "version"
+        ]
+    );
+    assert_eq!(j(&response), j(&expected), "command.submit wire bytes");
+
+    wait_until("串接命令照常完成", || {
+        let record = sub(
+            &r.call("command.get", &format!(r#"{{"cmd_id":"{cmd_id}"}}"#)),
+            "command",
+        );
+        record.get("status") == Some(&PyValue::from("done"))
+    });
+    assert_eq!(
+        dev.tx_since(tx_mark),
+        format!("{command}\n").as_bytes(),
+        "警告不可阻止命令實際送上 UART"
+    );
+}
+
+#[test]
+fn wp54_chained_warning_keeps_length_warning_first() {
+    let r = ServiceRig::ready_shell();
+    let command = format!("{WP52_CHAINED} # {}", "x".repeat(5000));
+    let dev = r.device(REAL_A);
+    dev.on_tx_reply(
+        format!("{command}\n").as_bytes(),
+        b"\r\nwp54-long-out\r\nroot@t:/# ",
+    );
+    r.settle();
+    let response = r.call(
+        "command.submit",
+        &format!(r#"{{"selector":"COM0","cmd":"{command}"}}"#),
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+
+    let length_warning = sw_proto::pydict! {
+        "code" => "CMD_LENGTH_WARNING",
+        "cmd_length" => command.len() as i64,
+        "soft_limit" => 4096,
+        "hint" => "Command exceeds 4 KB soft limit. Long commands may cause UART buffer overflow or prompt timeout.",
+    };
+    let chain_warning = wp54_warning(&format!("reboot # {}", "x".repeat(5000)));
+    assert_eq!(
+        response.get("warning"),
+        Some(&PyValue::Dict(length_warning.clone())),
+        "warning 單數相容欄位必須保留既有第一則警告"
+    );
+    assert_eq!(
+        response.get("warnings"),
+        Some(&PyValue::List(vec![
+            PyValue::Dict(length_warning),
+            PyValue::Dict(chain_warning),
+        ]))
+    );
+    assert_eq!(
+        keys(&response),
+        [
+            "ok",
+            "cmd_id",
+            "status",
+            "session_id",
+            "warning",
+            "warnings",
+            "source_class",
+            "version"
+        ]
+    );
+}
+
+#[test]
+fn wp54_chained_warning_is_omitted_when_flagged() {
+    let r = ServiceRig::ready_shell();
+    let response = r.call(
+        "command.submit",
+        &format!(r#"{{"selector":"COM0","cmd":"{WP52_CHAINED}","expect_reboot":true}}"#),
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    assert!(response.get("warning").is_none(), "{}", j(&response));
+    assert!(response.get("warnings").is_none(), "{}", j(&response));
+}
+
+#[test]
+fn wp54_chained_warning_is_omitted_for_interactive_mode() {
+    let r = ServiceRig::ready_shell();
+    let response = r.call(
+        "command.submit",
+        &format!(r#"{{"selector":"COM0","cmd":"{WP52_CHAINED}","mode":"interactive"}}"#),
+    );
+    assert_eq!(
+        response.get("ok"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&response)
+    );
+    assert!(response.get("warning").is_none(), "{}", j(&response));
+    assert!(response.get("warnings").is_none(), "{}", j(&response));
+}
+
 /// 成功回應：`arbiter.py:307-310` 先依旗標回聲 `expect_reboot`，再由 `_annotate_source` 補 `source_class`。
 fn wp52_submit_echo(r: &ServiceRig, cmd_id: &str, expect_reboot: bool) -> String {
     let session_id = r.mgr.resolve("COM0").expect("COM0 session");

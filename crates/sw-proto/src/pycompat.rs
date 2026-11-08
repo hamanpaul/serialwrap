@@ -1244,6 +1244,119 @@ pub fn shlex_split(text: &str) -> Result<Vec<String>, ShlexError> {
     Ok(tokens)
 }
 
+/// `shlex.shlex(..., posix=True, punctuation_chars=True)` 且 `commenters=""`。
+///
+/// Python 預設 punctuation 字元為 `();<>|&`；連續字元會形成單一 token，
+/// 引號與反斜線仍依 POSIX `shlex` 規則處理。
+pub fn shlex_split_punctuation(text: &str) -> Result<Vec<String>, ShlexError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    fn flush_word(tokens: &mut Vec<String>, token: &mut String, started: &mut bool) {
+        if *started {
+            tokens.push(std::mem::take(token));
+            *started = false;
+        }
+    }
+
+    fn flush_punctuation(tokens: &mut Vec<String>, punctuation: &mut String) {
+        if !punctuation.is_empty() {
+            tokens.push(std::mem::take(punctuation));
+        }
+    }
+
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut punctuation = String::new();
+    let mut quote = Quote::None;
+    let mut started = false;
+    let mut escaped = false;
+
+    for ch in text.chars() {
+        if escaped {
+            if quote == Quote::Double {
+                if ch == '\n' {
+                    token.push('\\');
+                    token.push('\n');
+                } else if matches!(ch, '\\' | '"') {
+                    token.push(ch);
+                } else {
+                    token.push('\\');
+                    token.push(ch);
+                }
+            } else {
+                token.push(ch);
+            }
+            started = true;
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    token.push(ch);
+                }
+                started = true;
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => escaped = true,
+                _ => token.push(ch),
+            },
+            Quote::None => match ch {
+                '\'' => {
+                    flush_punctuation(&mut tokens, &mut punctuation);
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    flush_punctuation(&mut tokens, &mut punctuation);
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    flush_punctuation(&mut tokens, &mut punctuation);
+                    escaped = true;
+                }
+                ' ' | '\t' | '\r' | '\n' => {
+                    flush_punctuation(&mut tokens, &mut punctuation);
+                    flush_word(&mut tokens, &mut token, &mut started);
+                }
+                ';' | '(' | ')' | '<' | '>' | '|' | '&' => {
+                    flush_word(&mut tokens, &mut token, &mut started);
+                    punctuation.push(ch);
+                }
+                _ => {
+                    flush_punctuation(&mut tokens, &mut punctuation);
+                    token.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+
+    if escaped {
+        return Err(ShlexError {
+            message: "No escaped character".to_string(),
+        });
+    }
+    if quote != Quote::None {
+        return Err(ShlexError {
+            message: "No closing quotation".to_string(),
+        });
+    }
+    flush_punctuation(&mut tokens, &mut punctuation);
+    flush_word(&mut tokens, &mut token, &mut started);
+    Ok(tokens)
+}
+
 fn uuid4_bytes(rng: &mut dyn FnMut(&mut [u8])) -> [u8; 16] {
     let mut bytes = [0; 16];
     rng(&mut bytes);

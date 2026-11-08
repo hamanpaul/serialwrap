@@ -6,7 +6,7 @@
 //! `Fence::with` 內同步。`valid_completion_regex` 為 P3 已交付的 `sw_proto::pyre` 函式，此處只重新匯出。
 
 use sw_proto::config_types::SessionProfile;
-use sw_proto::pycompat::{py_round, py_strip, shlex_split, splitlines};
+use sw_proto::pycompat::{py_round, py_strip, shlex_split, shlex_split_punctuation, splitlines};
 use sw_proto::pypath::{PathFlavor, basename};
 use sw_proto::pyre::{PyFlags, compile};
 
@@ -230,6 +230,29 @@ pub fn is_reboot_command(cmd: &str) -> bool {
     tokens[1..]
         .iter()
         .any(|t| t == "-r" || t == "--reboot" || t.starts_with("-r"))
+}
+
+/// 找出未帶旗標的串接命令中第一個 reboot 區段，僅用於非致命 RPC 提示。
+pub fn find_chained_reboot_segment(command: &str) -> Option<String> {
+    if is_reboot_command(command) {
+        return None;
+    }
+    let tokens = shlex_split_punctuation(command).ok()?;
+    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
+    for token in tokens {
+        if matches!(token.as_str(), "&&" | "||" | ";" | "&") {
+            segments.push(Vec::new());
+        } else if let Some(segment) = segments.last_mut() {
+            segment.push(token);
+        }
+    }
+    segments.into_iter().skip(1).find_map(|segment| {
+        if segment.is_empty() {
+            return None;
+        }
+        let text = segment.join(" ");
+        is_reboot_command(&text).then_some(text)
+    })
 }
 
 // ── P7 Task 0（08-slice23-login-events.md）凍結的新增公開項；本體由標示的 Task 實作 ──

@@ -20,6 +20,7 @@ use sw_core::event_engine::registry::UpsertError;
 use sw_core::event_engine::schema::RuleError;
 use sw_core::event_engine::EventEngine;
 use sw_core::mcu_patterns::McuPatternRegistry;
+use sw_core::quiet_gate::find_chained_reboot_segment;
 use sw_core::session_core::SessionRequest;
 use sw_core::session_manager::SessionManager;
 use sw_core::wal::{WalHealth, WalWriter, rows_to_text_lines};
@@ -675,6 +676,8 @@ impl Service {
                     None | Some(PyValue::Null) => None,
                     Some(v) => Some(py_float_of(v)?),
                 };
+                let warning_command =
+                    (!expect_reboot && mode != "interactive").then(|| command.clone());
                 if selector.is_empty() {
                     return Ok(invalid_args());
                 }
@@ -698,7 +701,32 @@ impl Service {
                 };
                 self.manager
                     .route(&sid, SessionRequest::Submit(req), ROUTE_TIMEOUT)
-                    .map(|result| annotate_source(result, &source_check, true))
+                    .map(|mut result| {
+                        if result.get("ok").is_some_and(py_truthy) {
+                            if let Some(segment) = warning_command
+                                .as_deref()
+                                .and_then(find_chained_reboot_segment)
+                            {
+                                let warning = pydict! {
+                                    "code" => "CHAINED_REBOOT_WARNING",
+                                    "segment" => segment,
+                                    "hint" => "命令在 &&／||／;／& 之後含 reboot，但未帶 --expect-reboot：broker 只認單獨一條的 reboot，這條會被當一般命令，不會立即 arm 開機靜默窗；shell 不回 prompt 的板子會逾時並送 Ctrl-C／Ctrl-D，shell 立刻重印 prompt 的板子則後續命令可能落進正在 shutdown 的系統。含重開機的串接命令請改用 `cmd submit --expect-reboot`。命令仍照常送出，本提示不改變執行。",
+                                };
+                                let mut warnings = match result.get("warning") {
+                                    Some(PyValue::Dict(existing)) => {
+                                        vec![PyValue::Dict(existing.clone())]
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                warnings.push(PyValue::Dict(warning.clone()));
+                                result.insert("warnings", PyValue::List(warnings));
+                                if result.get("warning").is_none() {
+                                    result.insert("warning", PyValue::Dict(warning));
+                                }
+                            }
+                        }
+                        annotate_source(result, &source_check, true)
+                    })
             }
             "command.get" => {
                 let cmd_id = p.str_or("cmd_id", "")?;
