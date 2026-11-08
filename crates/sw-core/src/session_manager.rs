@@ -315,6 +315,12 @@ struct Shared {
     /// 只供測試（test-fakes）：累計啟動過的 session actor 與 attach worker thread 數（`spawned_worker_count`）。
     #[cfg(feature = "test-fakes")]
     spawned_workers: std::sync::atomic::AtomicUsize,
+    /// 只供測試（test-fakes）：覆寫 session 公開查詢期限，以可控期限重現 handoff 的 actor timeout。
+    #[cfg(feature = "test-fakes")]
+    query_timeout_override: Mutex<Option<Duration>>,
+    /// 只供測試（test-fakes）：覆寫傳檔 RPC 等待期限，驗證 actor timeout 後仍由操作持有 admission。
+    #[cfg(feature = "test-fakes")]
+    file_transfer_timeout_override: Mutex<Option<Duration>>,
     /// 載入的 state.json 含孤立 surrogate（`LoadedState::lone_surrogates`；啟動存檔前檢查）。
     lone_surrogates: bool,
     /// 啟動存檔重現的 Python 未捕捉例外末行（`_save_state` 的 `UnicodeEncodeError`）；daemon 據此 exit 1。
@@ -538,6 +544,22 @@ fn is_ok(d: &PyDict) -> bool {
 }
 
 impl Shared {
+    fn query_timeout(&self) -> Duration {
+        #[cfg(feature = "test-fakes")]
+        if let Some(timeout) = *lock(&self.query_timeout_override) {
+            return timeout;
+        }
+        QUERY_TIMEOUT
+    }
+
+    fn file_transfer_reply_timeout(&self) -> Duration {
+        #[cfg(feature = "test-fakes")]
+        if let Some(timeout) = *lock(&self.file_transfer_timeout_override) {
+            return timeout;
+        }
+        FILE_TRANSFER_REPLY_TIMEOUT
+    }
+
     fn now_iso(&self) -> String {
         iso_utc_now(self.clock.wall_unix_us())
     }
@@ -652,7 +674,7 @@ impl Shared {
         self.send_console_scan(sid);
         let actor = self.actor_of(sid)?;
         let r = actor
-            .request(SessionRequest::GetState, QUERY_TIMEOUT)
+            .request(SessionRequest::GetState, self.query_timeout())
             .ok()?;
         let mut s = session_of(&r)?;
         // alias 以 manager 鏡像為準（`alias.set` 只改 manager 側 profile；重啟後由 YAML／template 重算）。
@@ -2518,6 +2540,10 @@ impl SessionManager {
             probe_pre_submit_hook: Mutex::new(None),
             #[cfg(feature = "test-fakes")]
             spawned_workers: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "test-fakes")]
+            query_timeout_override: Mutex::new(None),
+            #[cfg(feature = "test-fakes")]
+            file_transfer_timeout_override: Mutex::new(None),
         });
         shared.bootstrap_sessions(&load.profiles);
         let mgr = Arc::new(SessionManager {
@@ -2642,7 +2668,7 @@ impl SessionManager {
     /// `file_push`／`file_pull`）。查無 → `SESSION_NOT_FOUND`＋原 selector；其餘閘門在 actor 內原子判定。
     pub fn file_transfer(&self, req: crate::file_transfer::FileTransferRequest) -> Result<PyDict, PyErr> {
         match self.resolve(&req.selector) {
-            Some(sid) => self.route(&sid, SessionRequest::FileTransfer(req), FILE_TRANSFER_REPLY_TIMEOUT),
+            Some(sid) => self.route(&sid, SessionRequest::FileTransfer(req), self.shared.file_transfer_reply_timeout()),
             None => Ok(pydict! {
                 "ok" => false,
                 "error_code" => "SESSION_NOT_FOUND",
@@ -3623,6 +3649,29 @@ impl SessionManager {
                 QUERY_TIMEOUT,
             );
         }
+    }
+
+    /// 只供測試（test-fakes）：覆寫 actor 公開查詢期限。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_query_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.shared.query_timeout_override) = Some(timeout);
+    }
+
+    /// 只供測試（test-fakes）：暫停下一筆 actor request，用來確定性重現 session 查詢逾時。
+    #[cfg(feature = "test-fakes")]
+    pub fn pause_next_request_for_test(
+        &self,
+        selector: &str,
+    ) -> Option<(crossbeam_channel::Receiver<()>, crossbeam_channel::Sender<()>)> {
+        let sid = self.resolve(selector)?;
+        let actor = self.shared.actor_of(&sid)?;
+        Some(actor.probe.pause_before_next("Request"))
+    }
+
+    /// 只供測試（test-fakes）：覆寫 file.push／file.pull actor 回覆期限。
+    #[cfg(feature = "test-fakes")]
+    pub fn set_file_transfer_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.shared.file_transfer_timeout_override) = Some(timeout);
     }
 }
 

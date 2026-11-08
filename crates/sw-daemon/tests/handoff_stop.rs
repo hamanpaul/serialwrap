@@ -27,12 +27,18 @@ use support::*;
 use sw_core::file_transfer::templates as t;
 use sw_core::session_core::SessionState;
 use sw_core::tx_writer::{OpId, TxClass, TxJob, TxPermit, TxReport};
+use sw_cli::ctx::{CliCtx, TextIo};
 use sw_pal::fakes::serial::{FakeDevice, FakeWriteStep};
+use sw_pal::fakes::FakeProcScan;
+use sw_pal::proc_scan::{DaemonProc as ScannedDaemonProc, ProcIdentity as ScannedProcIdentity};
+use sw_pal::service_ctl::SupervisionMode;
 use sw_pal::TxOutcome;
 use sw_pal::traits::DeviceInfo;
 use sw_proto::pycompat::a2b_base64_lenient;
+use sw_proto::pypath::{HomeLookup, PathFlavor};
 use sw_proto::pydict;
 use sw_proto::pyjson::{self, PyDict, PyValue};
+use sw_proto::runtime_paths::{EnvSnapshot, NativeTraits, RuntimePaths};
 
 /// Python `HANDOFF_DRAIN_GRACE_S`（`sw_core/daemon.py:134`）；黑箱不得 import 產品常數，於此重述。
 const HANDOFF_DRAIN_GRACE: Duration = Duration::from_secs(3);
@@ -458,6 +464,68 @@ fn handoff_service_push_ticket_blocks_until_done() {
     assert_eq!(done.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&done));
     assert_eq!(shell.file("/tmp/svc.bin"), Some(data), "DUT 端檔案內容完整");
     assert_granted(&r.svc.handoff_stop(&reason("update")), "push 完成後交接");
+}
+
+/// Actor 等待期限到達時傳輸仍在 FakeClock 設定的 chunk deadline 內；handoff 不得回收仍屬於傳輸的 admission ticket。
+#[test]
+fn handoff_file_push_ticket_survives_rpc_timeout() {
+    let r = Arc::new(ServiceRig::ready_shell());
+    let shell = XferShell::install(r.device(REAL_A), "root@t:/# ", true);
+    r.mgr.set_file_transfer_timeout_for_test(Duration::from_millis(40));
+    let tmp = Tmp::new("svc-push-timeout");
+    let data = payload(700);
+    let local = tmp.write("src.bin", &data);
+    let rig = r.clone();
+    let params = format!(
+        r#"{{"selector":"COM0","local_path":"{local}","remote_path":"/tmp/svc-timeout.bin","ack_mode":"none","chunk_size":256,"chunk_timeout_s":3600}}"#
+    );
+    let push = thread::spawn(move || rig.call_err("file.push", &params));
+    shell.wait_held();
+    r.clock.advance(Duration::from_secs(600));
+    let timeout = push.join().expect("file.push RPC thread");
+    assert_eq!(timeout.message, "internal timeout", "RPC 先逾時但 actor 傳輸仍在途");
+
+    let handoff = r.svc.handoff_stop(&reason("update"));
+    shell.release();
+    wait_until("RPC 逾時後傳輸終結", || {
+        matches!(r.call("session.list", "{}").get("sessions"), Some(PyValue::List(rows))
+            if matches!(rows.first(), Some(PyValue::Dict(session))
+                if session.get("foreground_busy") == Some(&PyValue::Bool(false))))
+    });
+    let rows = assert_refused(&handoff, "SESSION_BUSY", "RPC 逾時後傳輸仍在途");
+    assert_eq!(ops(row_for(&rows, "COM0")), ["file.push"]);
+    assert_eq!(shell.file("/tmp/svc-timeout.bin"), Some(data), "handoff 不得中止傳輸");
+    assert!(!r.svc.admission().frozen(), "在途傳輸不得凍結 admission");
+}
+
+/// 交接查詢持 lease actor 逾時時必須 fail closed，並保留原 lease admission ticket。
+#[test]
+fn handoff_session_query_timeout_preserves_lease_ticket() {
+    let r = Arc::new(ServiceRig::ready_shell());
+    let open = r.call("session.interactive_open", r#"{"selector":"COM0","owner":"agent:t14","timeout_s":60}"#);
+    assert_eq!(open.get("ok"), Some(&PyValue::Bool(true)), "{}", wire(&open));
+    let iid = s(&open, "interactive_id").expect("interactive_id").to_string();
+    assert_eq!(r.svc.admission().live_tickets(), 1, "lease 持有一張 admission ticket");
+    r.mgr.set_query_timeout_for_test(Duration::from_millis(40));
+
+    let (entered, resume) = r.mgr.pause_next_request_for_test("COM0").expect("COM0 actor");
+    let mgr = r.mgr.clone();
+    let incomplete = thread::spawn(move || mgr.list_sessions());
+    entered.recv_timeout(Duration::from_secs(2)).expect("GetState request 進入 actor");
+    let rows = incomplete.join().expect("session.list query");
+    assert!(rows.is_empty(), "actor GetState 逾時應重現 filter_map 遺漏：{rows:?}");
+    resume.send(()).expect("放行 actor");
+
+    let (entered, resume) = r.mgr.pause_next_request_for_test("COM0").expect("COM0 actor");
+    let svc = r.svc.clone();
+    let handoff = thread::spawn(move || svc.handoff_stop(&reason("update")));
+    entered.recv_timeout(Duration::from_secs(2)).expect("handoff GetState request 進入 actor");
+    let result = handoff.join().expect("handoff thread");
+    resume.send(()).expect("放行 actor");
+    let rows = assert_refused(&result, "SESSION_BUSY", "session query 不完整");
+    assert_eq!(s(row_for(&rows, "COM0"), "interactive_session_id"), Some(iid.as_str()));
+    assert_eq!(r.svc.admission().live_tickets(), 1, "查詢不完整不得回收 lease ticket");
+    assert!(!r.svc.admission().frozen(), "查詢不完整不得凍結 admission");
 }
 
 /// 背景 TX（不經 admission、不持 lease；Python `bridge.send_bytes(b"probe\n", source="system:probe")` 的對應）：
@@ -962,7 +1030,67 @@ impl Drop for HolderSampler {
     }
 }
 
-/// 交接成立後舊 daemon 在排空窗口結束、停止序完成後才退出並釋放 UART／socket；繼任者只在舊 daemon 退出後啟動，
+struct IsolatedHome(String);
+
+impl HomeLookup for IsolatedHome {
+    fn current_user_home(&self) -> Option<String> {
+        Some(self.0.clone())
+    }
+
+    fn user_home(&self, _user: &str) -> Option<String> {
+        Some(self.0.clone())
+    }
+}
+
+/// 經 sw-cli update／rollback 共用的正式交接編排等待舊實例退出（`rollback.rs` 的
+/// `ensure_released_or_rehandoff` 呼叫鏈），使用隔離 env 與 endpoint。
+fn update_handoff_before_start(env: &IsolatedEnv, old_pid: u32) -> Vec<sw_cli::graceful_stop::HandoffLink> {
+    let mut p = sw_pal::native_client();
+    let old = ScannedDaemonProc {
+        pid: old_pid,
+        socket: Some(env.socket.display().to_string()),
+        tree: vec![ScannedProcIdentity { pid: old_pid, start_ticks: None }],
+    };
+    let proc_scan = FakeProcScan::new(Vec::new());
+    proc_scan.script(vec![vec![old], vec![], vec![]]);
+    proc_scan.alive_script(old_pid, vec![true, false]);
+    p.procs = proc_scan;
+    let vars: Vec<(String, String)> = env.vars.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+    let env_snapshot = EnvSnapshot::from_pairs(vars);
+    let home = IsolatedHome(env.vars.get("HOME").expect("isolated HOME").clone());
+    let paths = RuntimePaths::resolve(
+        &env_snapshot,
+        NativeTraits { default_endpoint_is_tcp: false, path_flavor: PathFlavor::Posix },
+        &home,
+    )
+    .expect("isolated RuntimePaths");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let io = TextIo::new(&mut out, &mut err, "\n");
+    let mut ctx = CliCtx {
+        p: &p,
+        env: env_snapshot,
+        paths,
+        io,
+        verbose: 0,
+        cli_version: sw_proto::version::version(),
+        autostart_lock: None,
+    };
+    let mut chain = Vec::new();
+    sw_cli::graceful_stop::ensure_released_or_rehandoff(
+        &mut ctx,
+        &SupervisionMode::OnDemand,
+        &env.socket.display().to_string(),
+        false,
+        "update",
+        "update_start_and_verify",
+        &mut chain,
+    )
+    .unwrap_or_else(|failure| panic!("正式 update handoff 編排失敗：{failure:?}"));
+    chain
+}
+
+/// 舊 daemon 存活時繼任者實際競爭實例鎖並失敗；再經正式 update／rollback 交接等待舊 daemon 退出後才啟新版。
 /// 全程 holder 取樣 `max_concurrent()<=1`、pid 依序為「舊 → 新」，最終繼任者 READY。
 #[test]
 fn handoff_then_successor_never_double_held() {
@@ -971,16 +1099,15 @@ fn handoff_then_successor_never_double_held() {
     let mut old = DaemonProc::spawn(&env, &[]);
     support::wait_ready(&env, "COM0");
     let old_pid = old.pid();
-    let granted = match pyjson::loads(rpc_once(&env.socket, r#"{"id":3,"method":"daemon.handoff_stop","params":{"reason":"update"}}"#).trim_end()) {
-        Ok(PyValue::Dict(mut d)) => {
-            d.0.shift_remove("id");
-            d
-        }
-        other => panic!("handoff 回應：{other:?}"),
-    };
-    assert_granted(&granted, "行程層閒置交接");
-    // 舊 daemon 仍在排空窗口：繼任者不得取得實例鎖（不得出現兩個 daemon 同時監聽 socket）。
-    assert!(old.try_alive(), "排空窗口內舊 daemon 仍在");
+    let mut contender = DaemonProc::spawn(&env, &[]);
+    let contended = contender.wait(Duration::from_secs(5));
+    assert!(!contended.success(), "舊 daemon 存活時繼任者不得取得實例鎖");
+    assert!(contender.stderr().contains("DAEMON_ALREADY_RUNNING"), "繼任者必須實際遇到鎖衝突：{}", contender.stderr());
+    assert!(old.try_alive(), "競爭鎖時舊 daemon 仍存活");
+
+    let chain = update_handoff_before_start(&env, old_pid);
+    assert_eq!(chain.len(), 1, "正式編排只交接既有舊實例：{chain:?}");
+    assert_eq!(chain[0].pid, Some(old_pid), "交接記錄需指向舊 daemon");
     let status = old.wait(HANDOFF_DRAIN_GRACE + STOP_CAP + Duration::from_secs(2));
     assert_eq!(status.code(), Some(0), "交接後有序停止：{}", old.stderr());
     assert!(path_holders(&env.pty_slave).iter().all(|(pid, _)| *pid != old_pid), "舊 daemon 已釋放 UART");

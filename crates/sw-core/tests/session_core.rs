@@ -368,6 +368,17 @@ fn passthrough_quiet_tick_ready_at_30s() {
 }
 
 #[test]
+fn passthrough_quiet_tick_does_not_advance_after_handoff_freeze() {
+    let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);
+    h.to_attached(None);
+    h.advance(Duration::from_secs(29));
+    h.reg.admission_gate().freeze();
+    let effects = h.advance(Duration::from_secs(3));
+    assert_eq!(h.core.state(), SessionState::Attached, "交接凍結期間不得升 READY");
+    assert!(!has_session_ready(&effects), "凍結後不得發布 SessionReady");
+}
+
+#[test]
 fn passthrough_rx_restarts_quiet_window() {
     // quiet_since = max(進入 ATTACHED, 最後 RX)；TX 不重算視窗。
     let mut h = CoreHarness::new(PASSTHROUGH_PROFILE);

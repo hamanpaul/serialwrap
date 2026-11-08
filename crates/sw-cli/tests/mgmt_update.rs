@@ -1098,6 +1098,10 @@ fn update_systemd_exit1_after_handoff_not_relaunched() {
             < o.index_of("service:start"),
         "撤銷 hold 後才由 updater 自己啟動新版"
     );
+    assert!(
+        o.index_of("rpc:daemon.handoff_stop#gone") < o.index_of("service:start"),
+        "正式 update 編排必須先確認舊 daemon 退出，才能啟動新版"
+    );
     assert_eq!(
         o.count_prefix("service:relaunch:"),
         0,

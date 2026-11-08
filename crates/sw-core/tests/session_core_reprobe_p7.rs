@@ -63,6 +63,24 @@ fn attached_prompt_error_is_reprobed_after_rx_idle_and_ready_resets_progress() {
 }
 
 #[test]
+fn auto_reprobe_result_does_not_change_state_after_handoff_freeze() {
+    let mut h = CoreHarness::new(PRPL_PROFILE);
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    let effects = advance_collect(&mut h, 4);
+    let (epoch, gen) = start_login(&effects).expect("開始自動重探");
+    h.reg.admission_gate().freeze();
+    let effects = h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen: gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    assert_eq!(h.core.state(), SessionState::Attached, "凍結後的 probe 結果不得升 READY");
+    assert_eq!(h.public()["last_error"], PyValue::from("PROMPT_UNAVAILABLE"));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Notify(_))), "凍結後不得發布狀態推進通知");
+}
+
+#[test]
 fn reprobe_failure_records_attempt_and_backs_off() {
     let mut h = CoreHarness::new(PRPL_PROFILE);
     h.to_attached(Some("PROMPT_UNAVAILABLE"));
