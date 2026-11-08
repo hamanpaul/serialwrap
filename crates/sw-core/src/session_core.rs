@@ -737,6 +737,16 @@ impl SessionCore {
             panic!("測試注入的 session actor panic");
         }
 
+        if self.handoff_freeze_state() == crate::admission::HandoffFreezeState::Pending
+            && !matches!(
+                &ev,
+                MailboxItem::Control(ControlEvent::Request { .. })
+                    | MailboxItem::Control(ControlEvent::Shutdown { .. })
+            )
+        {
+            return self.defer_handoff_event(ev);
+        }
+
         self.now_cache = now;
         let mut effects = Effects(Vec::new());
         match ev {
@@ -946,6 +956,10 @@ impl SessionCore {
             self.deps.fence.with(|f| f.foreground_busy = busy);
         }
         effects
+    }
+
+    fn defer_handoff_event(&mut self, _ev: MailboxItem) -> Effects {
+        todo!("P8-T14")
     }
 
     /// `to_public_dict()` 的 capture 子 dict。計數由 reader 端 `CaptureObserver` 即時累加（Python `_on_bridge_rx` 寫

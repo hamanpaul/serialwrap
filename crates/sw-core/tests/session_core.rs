@@ -418,6 +418,114 @@ fn auto_reprobe_ready_result_survives_temporary_handoff_freeze() {
     assert!(has_session_ready(&effects), "probe 結果套用後應發布 SessionReady");
 }
 
+fn start_tentative_handoff(h: &mut CoreHarness) -> String {
+    let token = match h.reg.admission_gate().freeze_if_idle("update") {
+        sw_core::admission::FreezeOutcome::Frozen { token, created: true } => token,
+        outcome => panic!("交接應建立暫時 admission 凍結：{outcome:?}"),
+    };
+    h.fence.with(|fence| fence.handoff_frozen = true);
+    token
+}
+
+fn rollback_tentative_handoff(h: &mut CoreHarness, token: &str) -> Vec<Effect> {
+    h.fence.with(|fence| fence.handoff_frozen = false);
+    assert!(h.reg.admission_gate().thaw(token), "TX fence 失敗後應撤銷暫時凍結");
+    h.feed(ControlEvent::Tick)
+}
+
+fn start_auto_reprobe(h: &mut CoreHarness) -> (u64, u64) {
+    h.to_attached(Some("PROMPT_UNAVAILABLE"));
+    h.advance(Duration::from_secs(1))
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StartLogin {
+                epoch,
+                fsm_gen,
+                plan: sw_core::login_fsm::LoginPlan::Probe,
+            } => Some((*epoch, *fsm_gen)),
+            _ => None,
+        })
+        .expect("ATTACHED/PROMPT_UNAVAILABLE 應啟動自動重探")
+}
+
+#[test]
+fn tentative_handoff_replays_banner_before_old_ready_result() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, fsm_gen) = start_auto_reprobe(&mut h);
+    let token = start_tentative_handoff(&mut h);
+
+    let effects = h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert!(effects.is_empty(), "Pending 期間 banner 應排隊而不執行");
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let pending = h.public();
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&pending, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&pending, "ready_reconfirm_pending"), PyValue::Bool(false));
+
+    let effects = rollback_tentative_handoff(&mut h, &token);
+    let after = h.public();
+    assert_eq!(h.core.state(), SessionState::Attached, "banner 取消後不可被舊 Ready 推進");
+    assert_ne!(pget(&after, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&after, "ready_reconfirm_pending"), PyValue::Bool(true));
+    assert!(!has_session_ready(&effects), "取消後不得發布 SessionReady");
+    assert!(!has_start_op(&effects), "回放不得送出 agent 命令");
+}
+
+#[test]
+fn tentative_handoff_replays_old_ready_before_later_banner() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    let (epoch, fsm_gen) = start_auto_reprobe(&mut h);
+    let token = start_tentative_handoff(&mut h);
+
+    h.feed(ControlEvent::LoginFinished {
+        epoch,
+        fsm_gen,
+        result: LoginOutcome::Ready,
+        after_rx_seq: None,
+    });
+    let effects = h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert!(effects.is_empty(), "Pending 期間 banner 應排隊而不執行");
+    let pending = h.public();
+    assert_eq!(h.core.state(), SessionState::Attached);
+    assert_eq!(pget(&pending, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&pending, "ready_reconfirm_pending"), PyValue::Bool(false));
+
+    let effects = rollback_tentative_handoff(&mut h, &token);
+    let after = h.public();
+    assert_eq!(h.core.state(), SessionState::Ready, "先完成的 Ready 依序生效");
+    assert_ne!(pget(&after, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&after, "ready_reconfirm_pending"), PyValue::Bool(true));
+    assert!(has_session_ready(&effects), "banner 前完成 Ready 應發布 SessionReady");
+    assert!(!has_start_op(&effects), "回放不得送出 agent 命令");
+}
+
+#[test]
+fn established_handoff_discards_tentative_banner_without_tx() {
+    let mut h = CoreHarness::new(SHELL_PROFILE);
+    h.to_ready();
+    let token = start_tentative_handoff(&mut h);
+
+    let effects = h.rx(b"\r\nU-Boot 2024.04\r\n");
+    assert!(effects.is_empty(), "Pending 期間 banner 應排隊而不執行");
+    let pending = h.public();
+    assert_eq!(pget(&pending, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&pending, "ready_reconfirm_pending"), PyValue::Bool(false));
+
+    assert!(h.reg.admission_gate().commit_handoff(&token), "交接凍結應成立");
+    let effects = h.feed(ControlEvent::Tick);
+    let after = h.public();
+    assert_eq!(h.core.state(), SessionState::Ready);
+    assert_eq!(pget(&after, "boot_quiet_remaining_s"), PyValue::Null);
+    assert_eq!(pget(&after, "ready_reconfirm_pending"), PyValue::Bool(false));
+    assert!(!has_start_login(&effects), "凍結成立後不得啟動登入 TX");
+    assert!(!has_start_op(&effects), "凍結成立後不得啟動命令 TX");
+}
+
 #[test]
 fn passthrough_rx_restarts_quiet_window() {
     // quiet_since = max(進入 ATTACHED, 最後 RX)；TX 不重算視窗。
