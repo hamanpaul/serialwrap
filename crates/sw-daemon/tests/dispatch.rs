@@ -5460,6 +5460,161 @@ fn wp510_rpc_release_cancels_inflight_placeholder_attach() {
     assert!(dev.tx_since(tx_mark).is_empty(), "release 成功後不得啟動偵測或 UART TX");
 }
 
+/// 正式 RPC 回歸：佔位開埠超時後 release 回 DRAIN_STALLED；晚到 handle 的 close 回條為 closed:false 時，
+/// 必須保留原 epoch 的阻擋與診斷，後續 release／attach 不得重新開埠。
+#[test]
+fn wp510_rpc_failed_close_keeps_placeholder_drain_stalled() {
+    let (rig, backend, entered, dev) = wp510_b_placeholder_blocking_rig();
+    let rig = Arc::new(rig);
+    let attach_rig = Arc::clone(&rig);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call(
+            "device.attach",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("placeholder open_exclusive 必須進入阻塞點");
+
+    let release_rig = Arc::clone(&rig);
+    let release = std::thread::spawn(move || {
+        release_rig.call(
+            "device.release",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    let stalled = release.join().expect("第一次 release RPC thread");
+    assert_eq!(
+        s(&stalled, "error_code"),
+        "DRAIN_STALLED",
+        "{}",
+        j(&stalled)
+    );
+    assert_eq!(stalled.get("drain_stalled"), Some(&PyValue::Bool(true)));
+    let epoch = stalled
+        .get("drain_timeout_epoch")
+        .cloned()
+        .expect("DRAIN_STALLED 必須帶原 timeout epoch");
+    assert!(matches!(epoch, PyValue::Int(_)), "epoch={epoch:?}");
+    let stalled_session = sub(&stalled, "session");
+    assert_eq!(
+        stalled_session.get("drain_stalled"),
+        Some(&PyValue::Bool(true))
+    );
+    assert_eq!(stalled_session.get("drain_timeout_epoch"), Some(&epoch));
+    let expected_stalled = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "DRAIN_STALLED",
+        "drain_stalled" => true,
+        "drain_timeout_epoch" => epoch.clone(),
+        "session" => PyValue::Dict(stalled_session),
+        "version" => rig.version.clone(),
+    };
+    assert_eq!(
+        j(&stalled),
+        j(&expected_stalled),
+        "第一次 release RPC bytes"
+    );
+
+    // 在 timeout 後才注入 close 失敗，再放行開埠；FakeDevice 保留 is_open()==true。
+    dev.fail_close(PalError::io(5, "[Errno 5] Input/output error"));
+    backend.release();
+    let attached = attach.join().expect("被 release 撤銷的 attach RPC thread");
+    assert_eq!(
+        s(&attached, "error_code"),
+        "SESSION_RECOVERING",
+        "{}",
+        j(&attached)
+    );
+    assert_eq!(dev.close_count(), 1, "晚到 handle 必須恰好嘗試關閉一次");
+    assert!(dev.is_open(), "closed:false 回條表示 handle 仍開啟");
+    assert_eq!(dev.open_count(), 1, "首次交接只開埠一次");
+
+    let state = rig
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("placeholder 仍須可查詢");
+    assert_eq!(
+        state.get("drain_stalled"),
+        Some(&PyValue::Bool(true)),
+        "{}",
+        j(&state)
+    );
+    assert_eq!(
+        state.get("drain_timeout_epoch"),
+        Some(&epoch),
+        "{}",
+        j(&state)
+    );
+    assert_eq!(s(&state, "state"), "RELEASED", "{}", j(&state));
+    assert_eq!(
+        rig.mgr.released_placeholder(WP510_PLACEHOLDER_SID),
+        Some(true)
+    );
+    let attached_session = sub(&attached, "session");
+    let expected_attach = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_RECOVERING",
+        "drain_stalled" => true,
+        "drain_timeout_epoch" => epoch.clone(),
+        "session" => PyValue::Dict(attached_session),
+        "version" => rig.version.clone(),
+    };
+    assert_eq!(
+        j(&attached),
+        j(&expected_attach),
+        "close 失敗後 attach RPC bytes"
+    );
+
+    let repeated_release = rig.call(
+        "device.release",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(
+        s(&repeated_release, "error_code"),
+        "DRAIN_STALLED",
+        "{}",
+        j(&repeated_release)
+    );
+    assert_eq!(
+        repeated_release.get("drain_stalled"),
+        Some(&PyValue::Bool(true))
+    );
+    assert_eq!(repeated_release.get("drain_timeout_epoch"), Some(&epoch));
+    let repeated_release_session = sub(&repeated_release, "session");
+    let expected_repeated_release = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "DRAIN_STALLED",
+        "drain_stalled" => true,
+        "drain_timeout_epoch" => epoch.clone(),
+        "session" => PyValue::Dict(repeated_release_session),
+        "version" => rig.version.clone(),
+    };
+    assert_eq!(
+        j(&repeated_release),
+        j(&expected_repeated_release),
+        "重複 release RPC bytes"
+    );
+
+    let repeated_attach = rig.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    assert_eq!(
+        s(&repeated_attach, "error_code"),
+        "SESSION_RECOVERING",
+        "{}",
+        j(&repeated_attach)
+    );
+    assert_eq!(
+        repeated_attach.get("drain_stalled"),
+        Some(&PyValue::Bool(true))
+    );
+    assert_eq!(repeated_attach.get("drain_timeout_epoch"), Some(&epoch));
+    assert_eq!(dev.open_count(), 1, "close 未確認時不得再次開埠");
+    assert!(dev.is_open(), "後續 RPC 不得掩蓋未關閉 handle");
+}
+
 /// 正式 RPC 落盤回歸：退休 placeholder 的 state.json 寫入 ENOSPC 時回 EXCEPTION，關閉預開 handle，
 /// 保留 RELEASED placeholder，且不啟動 dynamic worker。
 #[test]

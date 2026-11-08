@@ -1395,11 +1395,11 @@ impl Shared {
         {
             Ok(handle) => handle,
             Err(OpenError::Held(holder)) | Err(OpenError::AccessDenied { holder, .. }) => {
-                self.finish_attach_op(&by_id, &op);
+                self.finish_attach_op(&by_id, &op, None);
                 return Ok(device_still_held_reply(&selector, holder.pids));
             }
             Err(OpenError::NotFound(_)) => {
-                self.finish_attach_op(&by_id, &op);
+                self.finish_attach_op(&by_id, &op, None);
                 return Ok(device_not_present_reply(&selector, &by_id));
             }
             Err(OpenError::Other(error)) => {
@@ -1415,7 +1415,7 @@ impl Shared {
                     )
                 };
                 let Some(retired) = retired else {
-                    self.finish_attach_op(&by_id, &op);
+                    self.finish_attach_op(&by_id, &op, None);
                     let inner = lock(&self.inner);
                     if inner.device_path(&by_id) != Some(real.as_str()) {
                         return Ok(device_not_present_reply(&selector, &by_id));
@@ -1437,7 +1437,7 @@ impl Shared {
 
                 if let Err(error) = self.persist_placeholder_retirement(sid) {
                     self.restore_released_placeholder(sid, &by_id, retired);
-                    self.finish_attach_op(&by_id, &op);
+                    self.finish_attach_op(&by_id, &op, None);
                     return Err(error);
                 }
                 self.stop_retired_placeholder_actor(sid, &retired.entry);
@@ -1460,10 +1460,8 @@ impl Shared {
             )
         };
         let Some(retired) = retired else {
-            if let Some(parts) = parts {
-                let _ = parts.close();
-            }
-            self.finish_attach_op(&by_id, &op);
+            let close_receipt = parts.map(HandleParts::close);
+            self.finish_attach_op(&by_id, &op, close_receipt);
             let inner = lock(&self.inner);
             if inner.device_path(&by_id) != Some(real.as_str()) {
                 return Ok(device_not_present_reply(&selector, &by_id));
@@ -1482,7 +1480,7 @@ impl Shared {
         if let Err(error) = self.persist_placeholder_retirement(sid) {
             self.restore_released_placeholder(sid, &by_id, retired);
             op.close_preopened();
-            self.finish_attach_op(&by_id, &op);
+            self.finish_attach_op(&by_id, &op, None);
             return Err(error);
         }
         self.stop_retired_placeholder_actor(sid, &retired.entry);
@@ -1492,7 +1490,7 @@ impl Shared {
     }
 
     /// 結束指定 attach op；不會移除同一 by_id 後續登錄的新 op。
-    fn finish_attach_op(&self, by_id: &str, op: &AttachOp) {
+    fn finish_attach_op(&self, by_id: &str, op: &AttachOp, close_receipt: Option<CloseReceipt>) {
         let mut inner = lock(&self.inner);
         if inner
             .inflight
@@ -1500,10 +1498,12 @@ impl Shared {
             .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &op.cancelled))
         {
             if op.release_requested.load(Ordering::SeqCst) {
-                if let Some(actor) = inner
-                    .session_by_id(by_id)
-                    .map(|entry| entry.actor.clone())
-                {
+                // 佔位 attach 被 release 撤銷時，只有 PAL 明確確認 handle 關閉，才能清除 actor 的
+                // drain stall 並解除 inflight；無回條或 closed:false 都保留阻擋與原 epoch 診斷。
+                if !close_receipt.as_ref().is_some_and(|receipt| receipt.closed) {
+                    return;
+                }
+                if let Some(actor) = inner.session_by_id(by_id).map(|entry| entry.actor.clone()) {
                     if let Err(error) = enqueue_safety_request(
                         &actor,
                         SessionRequest::PlaceholderAttachSettled { token: op.token },
