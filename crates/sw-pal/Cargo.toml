@@ -57,3 +57,9 @@ tempfile = { workspace = true }
 name = "flash_pty"
 path = "tests/flash_pty.rs"
 required-features = ["test-fakes"]
+
+# P8 Task 13：windows-task 實跑測試的 COM 防線與 support 自測（memory_only；`FakeSysEnv`）。
+[[test]]
+name = "wintask_staging"
+path = "tests/wintask_staging.rs"
+required-features = ["test-fakes"]

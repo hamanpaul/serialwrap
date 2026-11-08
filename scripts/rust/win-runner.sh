@@ -155,7 +155,8 @@ append_wsl_env() {
   wsl_env="${wsl_env//::/:}"
 }
 
-for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_CONSOLE_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD RUST_BACKTRACE RUST_TEST_THREADS; do
+# SW_TEST_ALLOW_SCHTASKS：P8 Task 13 擁有者授權旗標（建立暫時排程工作 sw-p8-test-<pid>），只轉送、不預設。
+for name in SW_TEST_CAPS SW_TEST_COM_PAIR SW_TEST_CONSOLE_PAIR SW_TEST_SEED SW_TEST_SERIALWRAPD SW_TEST_ALLOW_SCHTASKS RUST_BACKTRACE RUST_TEST_THREADS; do
   [[ -v "$name" ]] && append_wsl_env "${name}"
 done
 while IFS= read -r name; do
