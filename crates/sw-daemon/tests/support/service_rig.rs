@@ -77,6 +77,7 @@ impl ProfileFs for MemProfileFs {
 pub struct RigFs {
     files: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
     writes: Mutex<usize>,
+    next_write_error: Mutex<Option<PalError>>,
 }
 
 impl RigFs {
@@ -91,6 +92,13 @@ impl RigFs {
 
     pub fn writes(&self) -> usize {
         *self.writes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn fail_next_atomic_write(&self, error: PalError) {
+        *self
+            .next_write_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(error);
     }
 }
 
@@ -122,6 +130,14 @@ impl FsRead for RigFs {
 
 impl FsOps for RigFs {
     fn atomic_write(&self, p: &Path, data: &[u8], _mode: Option<u32>) -> PalResult<()> {
+        if let Some(error) = self
+            .next_write_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return Err(error);
+        }
         self.files
             .lock()
             .unwrap_or_else(|e| e.into_inner())

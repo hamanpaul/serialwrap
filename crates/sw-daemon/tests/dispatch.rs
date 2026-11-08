@@ -5,7 +5,7 @@
 mod support;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use support::{BY_ID_A, BY_ID_B, REAL_A, REAL_B, RIG_PID, RigSpec, ServiceRig, wait_until};
@@ -4821,6 +4821,66 @@ fn wp510_rpc_open_error_rig(
     (rig, backend, placeholder_device)
 }
 
+struct Wp510BlockingOpenBackend {
+    delegate: Arc<FakeSerialBackend>,
+    path: String,
+    entered: crossbeam_channel::Sender<()>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Wp510BlockingOpenBackend {
+    fn release(&self) {
+        let (released, cv) = &*self.gate;
+        *released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+impl SerialBackend for Wp510BlockingOpenBackend {
+    fn open_exclusive(
+        &self,
+        dev: &DevicePath,
+        cfg: &SerialConfig,
+    ) -> Result<Box<dyn SerialHandle>, OpenError> {
+        if dev.0 == self.path {
+            let _ = self.entered.send(());
+            let (released, cv) = &*self.gate;
+            let mut open = released.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        self.delegate.open_exclusive(dev, cfg)
+    }
+}
+
+fn wp510_b_placeholder_blocking_rig() -> (
+    ServiceRig,
+    Arc<Wp510BlockingOpenBackend>,
+    crossbeam_channel::Receiver<()>,
+    FakeDevice,
+) {
+    let delegate = FakeSerialBackend::new();
+    for path in [REAL_A, REAL_B, WP510_REAL_G, WP510_REAL_C] {
+        wp510_install_shell_replies(&delegate.add_device(path));
+    }
+    let placeholder_device = delegate.add_device(WP510_REAL_G);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let backend = Arc::new(Wp510BlockingOpenBackend {
+        delegate,
+        path: WP510_REAL_G.to_string(),
+        entered: entered_tx,
+        gate: Arc::new((Mutex::new(false), Condvar::new())),
+    });
+    let serial: Arc<dyn SerialBackend> = backend.clone();
+    let rig = ServiceRig::build_with_loaded_state_and_serial_backend(
+        wp510_b_placeholder_spec(false),
+        wp510_b_placeholder_loaded_state(),
+        serial,
+    );
+    (rig, backend, entered_rx, placeholder_device)
+}
+
 /// 建立有缺失 template 佔位、另一個在線未綁定裝置與已綁定裝置的 RPC rig。
 /// 2 個 YAML session 加 14 個 RELEASED 佔位達 max_sessions，故 usb-C 在線但不會被背景偵測搶先實體化。
 fn wp510_b_placeholder_loaded_state() -> LoadedState {
@@ -5324,4 +5384,111 @@ fn wp510_rpc_general_oserror_handoff_with_and_without_fallback() {
             );
         }
     }
+}
+
+/// 正式 RPC 競態：placeholder 開埠停住時，重複 attach 回 SESSION_RECOVERING；release 撤銷並排空開埠，
+/// 之後 placeholder 維持 RELEASED，dynamic 偵測與 UART TX 均不得啟動。
+#[test]
+fn wp510_rpc_release_cancels_inflight_placeholder_attach() {
+    let (r, backend, entered, dev) = wp510_b_placeholder_blocking_rig();
+    let r = Arc::new(r);
+    let before = r
+        .session(WP510_PLACEHOLDER_SID)
+        .expect("release 測試前置佔位");
+    let tx_mark = dev.tx_len();
+    let attach_rig = Arc::clone(&r);
+    let attach = std::thread::spawn(move || {
+        attach_rig.call(
+            "device.attach",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        )
+    });
+    entered
+        .recv_timeout(Duration::from_secs(5))
+        .expect("placeholder open_exclusive 必須進入阻塞點");
+
+    let duplicate = r.call(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    let release_rig = Arc::clone(&r);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let release = std::thread::spawn(move || {
+        let response = release_rig.call(
+            "device.release",
+            &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+        );
+        let _ = release_tx.send(response);
+    });
+    let early_release = release_rx.recv_timeout(Duration::from_millis(100));
+    let release_waited = early_release.is_err();
+    backend.release();
+    let released = match early_release {
+        Ok(response) => response,
+        Err(_) => release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attach 排空後 release 應完成"),
+    };
+    release.join().expect("release RPC thread");
+    let attached = attach.join().expect("attach RPC thread");
+    std::thread::sleep(Duration::from_millis(100));
+
+    let recovering = sw_proto::pydict! {
+        "ok" => false,
+        "error_code" => "SESSION_RECOVERING",
+        "drain_stalled" => false,
+        "drain_timeout_epoch" => PyValue::Null,
+        "session" => PyValue::Dict(before.clone()),
+        "version" => r.version.clone(),
+    };
+    assert!(
+        release_waited,
+        "device.release 必須等待或逾時回 DRAIN_STALLED，不可忽略 manager 開埠：{}",
+        j(&released)
+    );
+    assert_eq!(j(&duplicate), j(&recovering), "重複 attach 須回完整 recovering RPC");
+    assert_eq!(j(&attached), j(&recovering), "被 release 撤銷的 attach 須回完整 recovering RPC");
+    assert_eq!(released.get("ok"), Some(&PyValue::Bool(true)), "{}", j(&released));
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert_eq!(
+        r.mgr.resolve(WP510_PLACEHOLDER_SID).as_deref(),
+        Some(WP510_PLACEHOLDER_SID),
+        "release 成功後佔位身份不得退休"
+    );
+    assert!(r.mgr.resolve("t:COM3").is_none(), "release 成功後不得建立 dynamic session");
+    assert_eq!(dev.open_count(), 1, "撤銷後不得再開埠");
+    assert!(dev.tx_since(tx_mark).is_empty(), "release 成功後不得啟動偵測或 UART TX");
+}
+
+/// 正式 RPC 落盤回歸：退休 placeholder 的 state.json 寫入 ENOSPC 時回 EXCEPTION，關閉預開 handle，
+/// 保留 RELEASED placeholder，且不啟動 dynamic worker。
+#[test]
+fn wp510_rpc_placeholder_retirement_enospc_stops_handoff() {
+    let r = wp510_b_placeholder_rig();
+    let dev = r.device(WP510_REAL_G);
+    r.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+
+    let error = r.call_err(
+        "device.attach",
+        &format!(r#"{{"selector":"{WP510_PLACEHOLDER_SID}"}}"#),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert!(
+        error.message.contains("No space left on device"),
+        "state.json ENOSPC 必須沿 RPC error 路徑傳回：{}",
+        error.message
+    );
+    assert_eq!(r.mgr.released_placeholder(WP510_PLACEHOLDER_SID), Some(true));
+    assert_eq!(
+        r.mgr.resolve(WP510_PLACEHOLDER_SID).as_deref(),
+        Some(WP510_PLACEHOLDER_SID),
+        "落盤失敗後 placeholder 必須留在 manager"
+    );
+    assert_eq!(dev.open_count(), 1);
+    assert_eq!(dev.close_count(), 1, "落盤失敗後須關閉預開 handle");
+    assert!(dev.tx_len() == 0, "落盤失敗不得啟動 dynamic 偵測 TX");
 }

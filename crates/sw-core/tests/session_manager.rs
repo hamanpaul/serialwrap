@@ -1619,6 +1619,63 @@ fn wp510_b_handoff_cleans_old_identity_and_restart_block() {
 }
 
 #[test]
+fn wp510_b_concurrent_placeholder_attach_returns_session_recovering() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+
+    let manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("第一次佔位 attach 停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
+
+    let second = rpc(m.mgr.attach_released_placeholder(&sid, false));
+    m.serial.release_open(REAL);
+    let first = rpc(attach.join().expect("第一次 attach thread"));
+
+    assert_eq!(
+        second.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        "佔位 attach 在途回應須有完整 recovering 欄位：{second:?}"
+    );
+    assert_eq!(code_of(&second).as_deref(), Some("SESSION_RECOVERING"));
+    assert_eq!(second.get("ok"), Some(&PyValue::Bool(false)));
+    assert_eq!(second.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(second.get("drain_timeout_epoch"), Some(&PyValue::Null));
+    assert!(is_ok(&first), "第一個未被取消的 attach 可正常交接：{first:?}");
+}
+
+#[test]
+fn wp510_b_retirement_persist_enospc_keeps_placeholder_and_stops_handoff() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    let device = m.device(REAL);
+    m.mgr.update_devices(&m.snapshot());
+    m.fs.fail_next_atomic_write(PalError::io(
+        28,
+        "[Errno 28] No space left on device",
+    ));
+
+    let response = m.mgr.attach_released_placeholder(&sid, false);
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert!(response.is_err(), "退休落盤 ENOSPC 必須向上回錯：{response:?}");
+    assert_eq!(m.mgr.resolve(SID).as_deref(), Some(SID), "失敗後佔位仍須保留");
+    assert_eq!(m.mgr.released_placeholder(SID), Some(true));
+    assert!(m.load_state_now().released.contains_key(SID), "磁碟 RELEASED 阻擋必須保留");
+    assert_eq!(m.serial.open_attempts(REAL), 1, "不得啟動 dynamic worker 重開埠");
+    assert_eq!(device.close_count(), 1, "落盤失敗後須關閉預開 handle");
+    assert!(device.take_tx().is_empty(), "落盤失敗不得啟動偵測 TX");
+}
+
+#[test]
 fn wp510_b_open_error_with_fallback_stays_reattachable() {
     const SID: &str = "gone-template:COM3";
     const REAL: &str = "/dev/ttyG";
@@ -1848,7 +1905,16 @@ fn wp510_b_handoff_invalidated_during_open_closes_handle() {
         let response = rpc(attach.join().expect("handoff worker 不應 panic"));
         match invalidation {
             "unplug" | "rebind" => assert_eq!(code_of(&response).as_deref(), Some("DEVICE_NOT_PRESENT")),
-            "shutdown" => assert_eq!(code_of(&response).as_deref(), Some("SESSION_RECOVERING")),
+            "shutdown" => {
+                assert_eq!(
+                    response.0.keys().map(String::as_str).collect::<Vec<_>>(),
+                    ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+                    "shutdown 使佔位交接失效時須回完整 recovering 鍵：{response:?}"
+                );
+                assert_eq!(code_of(&response).as_deref(), Some("SESSION_RECOVERING"));
+                assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(false)));
+                assert_eq!(response.get("drain_timeout_epoch"), Some(&PyValue::Null));
+            }
             _ => unreachable!(),
         }
         assert_eq!(old_device.close_count(), 1, "{invalidation} 後 handle 須關閉");
@@ -1857,6 +1923,39 @@ fn wp510_b_handoff_invalidated_during_open_closes_handle() {
         assert_eq!(m.mgr.released_placeholder(&sid), Some(true));
         assert!(old_device.take_tx().is_empty());
     }
+}
+
+#[test]
+fn wp510_b_open_error_invalidated_returns_complete_recovering_response() {
+    const SID: &str = "gone-template:COM3";
+    const REAL: &str = "/dev/ttyG";
+    let m = wp510_b_placeholder_rig(false, false);
+    let sid = m.mgr.resolve(SID).expect("佔位 session");
+    m.mgr.update_devices(&m.snapshot());
+    m.serial.block_open(REAL);
+    m.serial.fail_next_open(
+        REAL,
+        OpenError::Other(PalError::io(13, "[Errno 13] Permission denied")),
+    );
+
+    let manager = m.mgr.clone();
+    let attach_sid = sid.clone();
+    let attach = std::thread::spawn(move || manager.attach_released_placeholder(&attach_sid, false));
+    wait_until("佔位開埠錯誤路徑停在 open_exclusive", || {
+        m.serial.open_attempts(REAL) == 1
+    });
+    m.mgr.begin_shutdown();
+    m.serial.release_open(REAL);
+    let response = rpc(attach.join().expect("attach thread"));
+
+    assert_eq!(
+        response.0.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["ok", "error_code", "drain_stalled", "drain_timeout_epoch", "session"],
+        "一般開埠錯誤遇 shutdown 時須回完整 recovering 鍵：{response:?}"
+    );
+    assert_eq!(code_of(&response).as_deref(), Some("SESSION_RECOVERING"));
+    assert_eq!(response.get("drain_stalled"), Some(&PyValue::Bool(false)));
+    assert_eq!(response.get("drain_timeout_epoch"), Some(&PyValue::Null));
 }
 
 /// 拔除 by_id 後的快照（ManagerRig 的登錄不變，供之後重插）。
