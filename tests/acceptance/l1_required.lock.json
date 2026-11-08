@@ -19691,6 +19691,8 @@
           "cargo:sw-core::command_exec::wp56_no_banner_resumes_after_sixty_seconds",
           "cargo:sw-core::command_exec::wp56_plain_command_no_wait_and_chained_expect_reboot_starts_wait",
           "cargo:sw-core::command_exec::wp56_recovery_branch_clears_old_wait_without_starting_new_wait",
+          "cargo:sw-core::command_exec::wp56_release_during_attaching_clears_evidence_wait",
+          "cargo:sw-core::command_exec::wp56_removed_during_attaching_clears_evidence_wait",
           "cargo:sw-core::command_exec::wp56_spontaneous_reboot_has_no_evidence_wait",
           "cargo:sw-core::command_exec::wp56_wait_ticks_preserve_reprobe_budget",
           "cargo:sw-core::command_exec::wrapped_echo_busybox_insertions_closer_than_20_are_kept",
